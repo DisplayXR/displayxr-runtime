@@ -107,6 +107,27 @@ cbuffer CursorSoftenCB : register(b1)
 };
 #endif
 
+// The D3D11 SERVICE's workspace compose pass (ADR-046 Phase 4) runs under the
+// ADR-021 colour model of that pass: its blits emit scene-linear when the
+// pass's linearize flag (its own constant buffer, bound here at b2 for this
+// draw only) is set. Compiled with `DXR_SVC_LINEARIZE` there and nowhere else;
+// every other build of this shader leaves the colour untouched.
+#ifdef DXR_SVC_LINEARIZE
+cbuffer SvcColorCB : register(b2)
+{
+    float4 svc_color; // x > 0.5: decode display-referred -> linear on output
+};
+float3 svc_out(float3 c)
+{
+    return svc_color.x > 0.5 ? ((c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)) : c;
+}
+#else
+float3 svc_out(float3 c)
+{
+    return c;
+}
+#endif
+
 float4 soft_tap(float2 uv, bool straight)
 {
     float4 s = sprite_sample(uv);
@@ -139,9 +160,15 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     acc /= wsum;
     if (straight) {
         float3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : float3(0.0, 0.0, 0.0);
-        return float4(rgb, acc.a * soften.z);
+        return float4(svc_out(rgb), acc.a * soften.z);
     }
+#ifdef DXR_SVC_LINEARIZE
+    // Premultiplied: transform the straight colour, then re-multiply.
+    float3 prgb = acc.a > 1e-5 ? svc_out(acc.rgb / acc.a) * acc.a : float3(0.0, 0.0, 0.0);
+    return float4(prgb, acc.a) * soften.z;
+#else
     return acc * soften.z;
+#endif
 }
 #else
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
