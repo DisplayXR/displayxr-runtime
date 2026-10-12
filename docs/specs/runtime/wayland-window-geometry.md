@@ -595,6 +595,19 @@ the argument (which must match, or be 0 for "me"): a client may only move its
 own windows. The extension refuses while an interactive grab is running on the
 window — the user is still dragging it — and for fullscreen windows.
 
+**What a move promises is where the CONTENT lands** (#1928). `x`/`y` still
+name the frame, but the consumer asked for a content position: the move is
+`(x, y) − frame` logical px applied to the window, and the runtime judges the
+landing by the content's device position (§7.2, `vk_wayland_phase_snap`), not
+the frame's. On a compositor that places a client-decorated window's frame at
+whole logical px while its buffer sits a fraction below (KWin at 125 % and
+166.67 %: a 58 px title bar is 72.5 device px, painted at 73), a whole-pixel
+frame can leave the buffer one device row off, which reads as a missed snap.
+So a publisher **may adjust the frame** by less than one logical px so the
+buffer lands on `round((buffer + move − monitor) × device_scale)`, the same
+rule its drag table entries follow (§8.6). Mutter places frame and buffer on
+the same whole-px grid, so the GNOME extension never needs to.
+
 Additive schema field for the same reason: every window now carries
 `"moving"`, true while an interactive grab (move or resize) is in progress on
 it. A consumer that repositions windows waits for it to go false. A publisher
