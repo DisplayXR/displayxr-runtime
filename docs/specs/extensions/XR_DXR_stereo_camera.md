@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_stereo_camera` |
-| **Spec Version** | 3 |
+| **Spec Version** | 4 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
 | **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation, Linux V4L2 to follow. Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
@@ -30,8 +30,8 @@ unrectified pair with no calibration attached.
 2. **One capture, many consumers.** The service opens each camera once and fans frames out to
    every authorised stream. Nothing a consumer does can starve the eye tracker or another
    consumer.
-3. **Rectified by default, using the ACTIVE device's calibration.** The plug-in answers for the
-   device it is bound to; the service rectifies with a vendor-neutral routine. A consumer that
+3. **Rectified by default, using each camera's own device calibration.** The plug-in answers,
+   per camera, for the device behind it; the service rectifies with a vendor-neutral routine. A consumer that
    wants raw pixels + calibration can ask for them.
 4. **Frames are privacy-gated by the runtime**, not just by the consumer: authorised peers only,
    visible/foreground clients only, an always-on in-use indicator, and a user kill switch (§7).
@@ -145,6 +145,29 @@ and `XrEventDataStereoCamerasChangedDXR` when the set changes (plug-in hot-plug,
 Re-enumerate on the latter; `cameraId`s of vanished cameras are never reused within a service
 lifetime.
 
+**The list is live (spec v4).** The service re-queries its camera sources (the plug-in, §9, and
+the UVC source, §9a) during its run: on a client's `xrEnumerateStereoCamerasDXR` (at most once a
+second) and every ~2 s while any instance that has enumerated is connected. The result is merged
+so that nothing a client holds moves:
+
+- a camera is matched by its source + device identity (what `persistentId` is derived from), so
+  an unchanged camera keeps its **index, `cameraId` and `persistentId`**;
+- a camera that appears later (an SR tracker that starts after the service, a display plugged
+  in) is **appended** with a new `cameraId`;
+- a camera its source no longer lists **stays in the list, in place, as `UNAVAILABLE`**: no
+  other camera is renumbered, its streams end (`XrEventDataStereoCameraStreamEndedDXR`, reason
+  `SOURCE_LOST`), a new start on it fails with `XR_ERROR_STEREO_CAMERA_BUSY_DXR`, and if it is
+  listed again it comes back with the same `cameraId`;
+- `displayName` / `platformDeviceHint` follow the source (a plug-in that learns which screen a
+  camera belongs to renames it). Geometry, format and flags are fixed at first enumeration for
+  the service's run.
+
+Any of these changes — and the sharing toggle switching the enumerated set to zero or back —
+queues one `XrEventDataStereoCamerasChangedDXR` to every instance that has enumerated (or
+created a stream) and is still connected. A client re-enumerates on it; a browser fires
+`devicechange`. A client that cannot poll events can still call enumerate periodically: the
+throttle makes that cheap, and the ids make a diff trivial.
+
 ## 4. Calibration
 
 ```c
@@ -175,11 +198,12 @@ XrResult xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId,
     XrStereoCameraCalibrationDXR* calibration);
 ```
 
-**Whose calibration.** The plug-in returns the calibration of **the device it is bound to** —
-the same physical unit whose display it weaves for and whose tracker it reads — keyed by that
-device's own identity (serial). It never picks "the first calibration folder" on the machine:
-one field box carried eleven. A plug-in that cannot resolve the active device's calibration
-reports the camera without `CALIBRATED`, and the service offers RAW only.
+**Whose calibration.** For each camera the plug-in returns the calibration of **the device
+behind that camera** — the physical unit whose tracker it reads (a plug-in driving several
+displays lists one camera per device) — keyed by that device's own identity (serial). It never
+picks "the first calibration folder" on the machine: one field box carried eleven. A plug-in
+that cannot resolve a camera's calibration reports that camera without `CALIBRATED`, and the
+service offers RAW only.
 
 **An uncalibrated UVC webcam (§9a)** is the one exception to "RAW only": the service models it
 as an ideal parallel pinhole pair from its configured HFOV and baseline. It is reported without
@@ -504,7 +528,9 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
   off.
 - `XrEventDataStereoCameraStreamEndedDXR` — a stream the service ended (§7.4), with the handle
   and the reason.
-- `XrEventDataStereoCamerasChangedDXR` — reserved (the camera set is fixed for a service run).
+- `XrEventDataStereoCamerasChangedDXR` (spec v4) — the enumerated set changed (§3, "The list
+  is live"): to every connection that has enumerated or created a stream. Coalesced: at most one
+  is pending per connection.
 
 ## 8. Errors
 
@@ -552,7 +578,7 @@ struct xrt_plugin_stereo_camera_info {
 	uint32_t native_format;          // GRAY8 / NV12 / BGRA8 — the plug-in decodes its transport (e.g. JPEG) itself
 };
 
-struct xrt_plugin_stereo_camera_calibration {   // RAW calibration of the ACTIVE device
+struct xrt_plugin_stereo_camera_calibration {   // RAW calibration of THIS camera index's device
 	uint32_t struct_size;
 	uint32_t image_width, image_height;          // per eye
 	double k[2][4];                              // fx fy cx cy
@@ -586,7 +612,14 @@ void         (*stereo_camera_close)(struct xrt_plugin_stereo_camera *cam);
 ```
 
 Rules: `wait_frame` is called from **one runtime-owned camera thread per open camera** and may
-block up to `timeout_ns`; it never throws (C boundary). Enumerate/calibration are cheap and
+block up to `timeout_ns`; it never throws (C boundary). `enumerate` is called again during the
+plug-in's life (spec v4, §3): on a client's enumerate (at most once a second) and every ~2 s
+while a client listens — keep it cheap and log only when the set changes. Indices stay stable
+while a device is listed and are never handed to another device; a device that appears may be
+appended at any time; one that goes away may be dropped from the list (the service reports it
+`UNAVAILABLE` and never opens its index) or kept at its index (an append-only registry; its
+`open` waits / fails). No change counter or callback slot is needed: the service compares by
+`device_identity`. Enumerate/calibration are cheap and
 callable from any thread. `SUSPENDED` from `wait_frame` maps to the camera state (§3). The
 plug-in owns decoding its transport and resolving calibration for its own device; the runtime
 owns threads, fan-out, rectification, format conversion, transport, consent and indicator.
@@ -596,7 +629,8 @@ owns threads, fan-out, rectification, format conversion, transport, consent and 
 | camera thread, open refcount, linger | reading frames from its stack without taking the device |
 | rectification (`u_stereo_rectify`), format conversion, decimation | decoding (JPEG, YUY2 …) to GRAY8/NV12/BGRA8 |
 | rings, wake handles, pinning, GPU transports | frame sequence + best timestamp it has |
-| authorisation, foreground rule, indicator, kill switch | calibration of **its active device**, by device identity |
+| authorisation, foreground rule, indicator, kill switch | calibration of **each camera's own device**, by device identity |
+| re-enumeration, stable ids, the cameras-changed event | listing devices as they come and go |
 | events, stats, CLI | tracker keep-alive while open; shedding camera before tracking |
 
 ## 9a. Service-owned UVC side-by-side source (ADR-043 Amendment 4)
@@ -846,6 +880,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |
 | 3 (Amendment 4) | No API change. The service's own vendor-neutral UVC side-by-side source (§9a): opt-in per device by `stereo-cameras.json`, never a plug-in's camera; an uncalibrated pair is reported without `CALIBRATED`, its RAW calibration is refused, its RECTIFIED output is a pass-through aligned by the online refinement — so RECTIFIED now requires a camera the service can rectify rather than `CALIBRATED \| NATIVELY_RECTIFIED`. `displayxr-cli camera list` shows the source; new `camera uvc-devices` |
 | 3 | Delegation hardening: `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (`0x2`) — a delegating client opts out of row 6 for one instance (§2a); a delegating entry for a user-writable executable path is applied only with a recorded signer its valid Authenticode signature matches (`<valueName>.signer`, Windows; POSIX path-only) and a user-level entry's first use per executable per service run is announced (§7.1.1). Appended; nothing renumbered |
 | 2 (R3) | Consent and privacy as built (§7): `XrStereoCameraClientInfoDXR` + `XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR` (the `CAMERA_CONSUMER` class, §2a); distinct results `XR_ERROR_STEREO_CAMERA_CONSENT_REFUSED_DXR` / `_DISABLED_DXR` / `_BUSY_DXR` / `_STREAM_ENDED_DXR`; `XrEventDataStereoCameraStreamEndedDXR`; the state-changed event is now delivered; `persistentId` keyed with a per-user secret; read-only consumer section on every platform; `DXR_STEREO_CAMERA_DEV_ALLOW` becomes a documented dev override, `DXR_STEREO_CAMERA_PROMPT=0` disables the prompt. Everything appended at `1004999311–316`; nothing renumbered |

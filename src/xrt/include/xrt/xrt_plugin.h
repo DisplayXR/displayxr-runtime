@@ -780,7 +780,9 @@ struct xrt_plugin_host_iface
  * produced by the plug-in from its own stack WITHOUT taking the device from
  * the tracker. The runtime service owns threads, fan-out, rectification,
  * format conversion, transport, consent and the in-use indicator; the plug-in
- * owns reading + decoding frames and the calibration of ITS ACTIVE device.
+ * owns reading + decoding frames and, per camera index, the calibration of
+ * THAT camera's device (one camera per device; several devices = several
+ * cameras, each keyed by its own device_identity).
  * Graphics-API-neutral on purpose: a camera is a sensor, not a weaver, and it
  * must not share a lifetime with a display processor that is recreated on
  * presenter changes. Slots on @ref xrt_plugin_iface (appended, ADR-020).
@@ -856,8 +858,9 @@ struct xrt_plugin_stereo_camera_info
 };
 
 /*!
- * RAW calibration of the ACTIVE device (the one this plug-in weaves for and
- * whose tracker it reads) — never "the first calibration on the machine".
+ * RAW calibration of ONE camera — the device behind that camera index (its
+ * device_identity), never "the first calibration on the machine" and never
+ * another device's.
  */
 struct xrt_plugin_stereo_camera_calibration
 {
@@ -1319,13 +1322,24 @@ struct xrt_plugin_iface
 	 * Fill up to @p capacity entries of @p out (each with struct_size preset
 	 * by the runtime) and return the number of cameras. @p capacity 0 / NULL
 	 * @p out = count query. Stable indices for the plug-in instance's life.
+	 *
+	 * Called again during the plug-in's life (#1961): on a client's enumerate
+	 * (at most once a second) and every ~2 s while a client listens for
+	 * camera events — so keep it cheap and quiet (log only when the set
+	 * changes). The runtime keys cameras by device_identity: a device that
+	 * appears may be appended at any time; one the plug-in stops listing is
+	 * reported UNAVAILABLE and never opened (keeping a gone device's entry at
+	 * its index, as an append-only registry does, is equally fine — its open
+	 * just waits / fails). Never move an identity to another index while it
+	 * is listed, and never give one index to another device.
 	 */
 	uint32_t (*stereo_camera_enumerate)(struct xrt_plugin_instance *inst,
 	                                    uint32_t capacity,
 	                                    struct xrt_plugin_stereo_camera_info *out);
 
 	/*!
-	 * RAW calibration of camera @p index, for the ACTIVE device. Return
+	 * RAW calibration of camera @p index — of THAT camera's device (its
+	 * device_identity), not of whichever device is active. Return
 	 * XRT_ERROR_FEATURE_NOT_SUPPORTED when it cannot be resolved — the camera
 	 * must then not report XRT_PLUGIN_STEREO_CAMERA_CALIBRATED.
 	 */

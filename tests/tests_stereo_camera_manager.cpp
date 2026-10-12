@@ -17,6 +17,13 @@
  *    correction for the fake's 2.4 px vertical misalignment, the calibration
  *    generation moves, and the delivered frames' rows align (<= 0.3 px);
  *  - RAW streams are delivered RAW-flagged with the misalignment intact.
+ *
+ * And (#1961) re-enumeration over a fake display plug-in whose camera list the
+ * test edits: unchanged cameras keep index + id + persistentId, a new one is
+ * appended, a vanished one turns UNAVAILABLE in place (its streams end with
+ * SOURCE_LOST, start is BUSY) and comes back with its id, every change queues
+ * one CAMERAS_CHANGED to a connection that enumerated, and the client-path
+ * rescan is throttled.
  */
 
 #include "catch_amalgamated.hpp"
@@ -224,5 +231,184 @@ TEST_CASE("manager + UVC fake: RECTIFIED stream converges, RAW stays raw", "[ste
 		CHECK(st.refine_state == XRT_STEREO_CAMERA_REFINE_NONE);
 		CHECK(scm_stream_destroy(f, id) == XRT_SUCCESS);
 	}
+	scm_destroy(f);
+}
+
+
+namespace {
+
+struct props_t
+{
+	uint64_t id;
+	std::string pid;
+	std::string name;
+	uint32_t state;
+};
+
+props_t
+props_at(scm_fixture *f, uint32_t index)
+{
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, index, &p) == XRT_SUCCESS);
+	return props_t{p.camera_id, p.persistent_id, p.display_name, p.state};
+}
+
+//! Drain every queued event; count those of @p kind.
+uint32_t
+drain(scm_fixture *f, uint32_t kind)
+{
+	uint32_t n = 0;
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+		n += ev.kind == kind ? 1u : 0u;
+	}
+	return n;
+}
+
+} // namespace
+
+TEST_CASE("re-enumeration: stable ids, appended, vanished in place, event", "[stereo_camera_manager][rescan]")
+{
+	const char *ids_a[] = {"test:A"};
+	const char *names_a[] = {"Camera - Laptop"};
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_fixture *f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1); // also subscribes this connection
+	const props_t a0 = props_at(f, 0);
+	CHECK(a0.name == "Camera - Laptop");
+	CHECK(a0.state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 0);
+
+	// Unchanged: no change, no event.
+	CHECK_FALSE(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 0);
+
+	// A second screen's camera appears: appended, A untouched, ONE event.
+	const char *ids_ab[] = {"test:A", "test:B"};
+	const char *names_ab[] = {"Camera - Laptop", "Camera - DS1"};
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+	CHECK(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_count(f) == 2);
+	const props_t a1 = props_at(f, 0);
+	const props_t b1 = props_at(f, 1);
+	CHECK(a1.id == a0.id);
+	CHECK(a1.pid == a0.pid);
+	CHECK(b1.id != a0.id);
+	CHECK(b1.pid != a0.pid);
+	CHECK(b1.name == "Camera - DS1");
+
+	// A disappears and B moves to the plug-in's index 0: nothing renumbers,
+	// A is UNAVAILABLE in place.
+	const char *ids_b[] = {"test:B"};
+	const char *names_b[] = {"Camera - DS1"};
+	scm_fake_plugin_set(ids_b, names_b, 1);
+	CHECK(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_count(f) == 2);
+	const props_t a2 = props_at(f, 0);
+	const props_t b2 = props_at(f, 1);
+	CHECK(a2.id == a0.id);
+	CHECK(a2.state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	CHECK(b2.id == b1.id);
+	CHECK(b2.pid == b1.pid);
+	CHECK(b2.state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+
+	// A comes back (now at the plug-in's index 1): same slot, same id.
+	const char *ids_ba[] = {"test:B", "test:A"};
+	const char *names_ba[] = {"Camera - DS1", "Camera - Laptop (renamed)"};
+	scm_fake_plugin_set(ids_ba, names_ba, 2);
+	CHECK(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_count(f) == 2);
+	const props_t a3 = props_at(f, 0);
+	CHECK(a3.id == a0.id);
+	CHECK(a3.pid == a0.pid);
+	CHECK(a3.state == XRT_STEREO_CAMERA_STATE_AVAILABLE);
+	CHECK(a3.name == "Camera - Laptop (renamed)"); // labels follow the source
+	CHECK(props_at(f, 1).id == b1.id);
+
+	// The sharing toggle changes the enumerated set too.
+	REQUIRE(scm_set_sharing(f, false) == XRT_SUCCESS);
+	CHECK(scm_count(f) == 0);
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_set_sharing(f, true) == XRT_SUCCESS);
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	CHECK(scm_count(f) == 2);
+	scm_destroy(f);
+}
+
+TEST_CASE("re-enumeration: a vanished camera ends its streams", "[stereo_camera_manager][rescan]")
+{
+	const char *ids_a[] = {"test:A"};
+	const char *names_a[] = {"Camera A"};
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_fixture *f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 1);
+	const props_t a = props_at(f, 0);
+	xrt_stereo_camera_stream_request req = {a.id, XRT_STEREO_CAMERA_OUTPUT_RAW, XRT_STEREO_CAMERA_FORMAT_GRAY8,
+	                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+	uint64_t sid = 0;
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	REQUIRE(scm_stream_start(f, sid) == XRT_SUCCESS);
+	(void)drain(f, 0); // whatever the start queued
+
+	scm_fake_plugin_set(nullptr, nullptr, 0);
+	CHECK(scm_rescan(f));
+	xrt_stereo_camera_event ended = {};
+	uint32_t n_ended = 0, n_changed = 0;
+	xrt_stereo_camera_event ev;
+	while (scm_poll_event(f, &ev)) {
+		if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
+			n_ended++;
+			ended = ev;
+		} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) {
+			n_changed++;
+		}
+	}
+	CHECK(n_ended == 1);
+	CHECK(ended.stream_id == sid);
+	CHECK(ended.value == XRT_STEREO_CAMERA_END_SOURCE_LOST);
+	CHECK(n_changed == 1);
+	bool ready = true;
+	xrt_stereo_camera_frame_info fi;
+	const uint8_t *slot = nullptr;
+	CHECK(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+
+	// Still enumerated (UNAVAILABLE); a new stream on it is BUSY until it is back.
+	REQUIRE(scm_count(f) == 1);
+	CHECK(props_at(f, 0).state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+	CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	CHECK(scm_rescan(f));
+	CHECK(scm_stream_start(f, sid) == XRT_SUCCESS);
+	CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+	scm_destroy(f);
+}
+
+TEST_CASE("re-enumeration: the enumerate path is throttled", "[stereo_camera_manager][rescan]")
+{
+	const char *ids_a[] = {"test:A"};
+	const char *names_a[] = {"Camera A"};
+	scm_fake_plugin_set(ids_a, names_a, 1);
+	scm_fixture *f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	const uint32_t calls = scm_fake_plugin_enumerate_calls();
+	// Within a second of the create-time enumeration, enumerate does not re-query.
+	for (int i = 0; i < 5; i++) {
+		CHECK(scm_count(f) == 1);
+	}
+	CHECK(scm_fake_plugin_enumerate_calls() == calls);
+	// After the window it does, and sees the new camera.
+	const char *ids_ab[] = {"test:A", "test:B"};
+	const char *names_ab[] = {"Camera A", "Camera B"};
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+	os_nanosleep(1100ll * 1000 * 1000);
+	CHECK(scm_count(f) == 2);
+	CHECK(scm_fake_plugin_enumerate_calls() == calls + 1);
 	scm_destroy(f);
 }
