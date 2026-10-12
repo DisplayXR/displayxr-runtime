@@ -1477,5 +1477,14 @@
 		"in": [
 			{"name": "hint", "type": "struct xrt_conv_wire_hint_interest"}
 		]
+	},
+
+	"compositor_set_cursor_draw_request": {
+		"in": [
+			{"name": "request", "type": "struct ipc_cursor_draw_request"}
+		],
+		"out": [
+			{"name": "outcome", "type": "struct ipc_cursor_draw_outcome"}
+		]
 	}
 }

@@ -18,6 +18,7 @@
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 #include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
 #include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: per-screen element views
+#include "util/u_cursor_depth.h"      // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
@@ -3450,6 +3451,39 @@ ipc_handle_compositor_set_view_routing(volatile struct ipc_client_state *ics,
 	(void)routing;
 #endif
 
+	return XRT_SUCCESS;
+}
+
+/*
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). The D3D11 service stores
+ * the request for the commit that follows and answers with the outcome of the
+ * previous one. Every other service answers "refused" (it has no drawer), so
+ * the client's willDraw stays honest and the app keeps its OS cursor.
+ * Per-frame while armed: never log here.
+ */
+static_assert(sizeof(struct ipc_compositor_set_cursor_draw_request_msg) <= IPC_BUF_SIZE,
+              "compositor_set_cursor_draw_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_set_cursor_draw_request(volatile struct ipc_client_state *ics,
+                                              const struct ipc_cursor_draw_request *request,
+                                              struct ipc_cursor_draw_outcome *out_outcome)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_outcome, 0, sizeof(*out_outcome));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		comp_d3d11_service_set_cursor_draw_request((struct xrt_compositor *)ics->xc, request, out_outcome);
+		return XRT_SUCCESS;
+	}
+#endif
+	(void)ics;
+	(void)request;
+	out_outcome->answered = 1;
+	out_outcome->drew = 0;
+	out_outcome->reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS;
 	return XRT_SUCCESS;
 }
 

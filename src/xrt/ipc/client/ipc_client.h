@@ -182,6 +182,25 @@ void
 comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): hand the service this
+ * frame's runtime-drawn cursor request (call it right before the commit it
+ * belongs to). The service answers with the outcome of the PREVIOUS request
+ * (#1952; its draw happens at or after that commit), which this writes into
+ * @p req's report.
+ *
+ * Same gating contract as comp_ipc_client_compositor_get_window_metrics. The
+ * app's own sprite swapchain does not cross yet: such a request is refused
+ * here (SPRITE_UNUSABLE) without IPC traffic.
+ *
+ * @return true when @p req's report was written (an answer exists); false
+ *         before the service has answered anything, or on IPC failure.
+ */
+struct u_cursor_draw_request;
+
+bool
+comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
  * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the per-screen segment table
  * of this present-owner's last weave, every screen's eyes included (count 0 =
  * woven by one display processor). Zeroed on any failure; the result is

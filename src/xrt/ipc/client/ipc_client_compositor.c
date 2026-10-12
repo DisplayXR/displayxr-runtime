@@ -26,6 +26,7 @@
 #include "util/u_limited_unique_id.h"
 #include "util/u_snap_grid.h"
 #include "util/u_logging.h"
+#include "util/u_cursor_depth.h" // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
 
 #ifdef XRT_OS_WINDOWS
 #include "util/u_capture_intent.h"
@@ -320,6 +321,76 @@ comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const str
 		return;
 	}
 	(void)ipc_call_compositor_set_view_routing(icc->ipc_c, routing);
+}
+
+/*
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). Only reached on a frame
+ * whose locate armed the runtime-drawn cursor (the state tracker's one bool
+ * test), so a session that never asks sends nothing (ADR-046 §0).
+ */
+bool
+comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	if (xc == NULL || req == NULL) {
+		return false;
+	}
+	if (req->image != NULL) {
+		// The app's sprite swapchain would have to be resolved to its IPC id
+		// through whichever client compositor wraps it; the service draws
+		// only the default look for now. Refuse honestly: willDraw = false,
+		// the app keeps its OS cursor (ADR-046 Phase 4 follow-up).
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+		return true;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	struct ipc_cursor_draw_request wire;
+	memset(&wire, 0, sizeof(wire));
+	wire.view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < wire.view_count; i++) {
+		wire.view[i][0] = req->view[i].origin[0];
+		wire.view[i][1] = req->view[i].origin[1];
+		wire.view[i][2] = req->view[i].axis_x[0];
+		wire.view[i][3] = req->view[i].axis_x[1];
+		wire.view[i][4] = req->view[i].axis_y[0];
+		wire.view[i][5] = req->view[i].axis_y[1];
+	}
+	wire.hot_u = req->hot_u;
+	wire.hot_v = req->hot_v;
+	wire.size_m = req->size_m;
+	wire.disparity = req->disparity;
+	wire.report_only = req->report_only ? 1 : 0;
+	wire.zone_valid = req->zone_valid ? 1 : 0;
+	wire.zone_id = req->zone_id;
+	wire.zone_rect[0] = req->zone_rect.offset.w;
+	wire.zone_rect[1] = req->zone_rect.offset.h;
+	wire.zone_rect[2] = req->zone_rect.extent.w;
+	wire.zone_rect[3] = req->zone_rect.extent.h;
+
+	struct ipc_cursor_draw_outcome outcome;
+	memset(&outcome, 0, sizeof(outcome));
+	xrt_result_t xret = ipc_call_compositor_set_cursor_draw_request(icc->ipc_c, &wire, &outcome);
+	if (xret != XRT_SUCCESS) {
+		// A dead connection: the commit will fail too. Report it as the
+		// refusal it is rather than leave willDraw true.
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NOT_REACHED);
+		return true;
+	}
+	if (!outcome.answered) {
+		return false; // the service has nothing to report yet (first request)
+	}
+	if (outcome.drew) {
+		u_cursor_draw_report_drew(req);
+	} else {
+		const uint32_t reason = outcome.reason < U_CURSOR_DRAW_REFUSAL_COUNT && outcome.reason != 0
+		                            ? outcome.reason
+		                            : (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		u_cursor_draw_report_refused(req, (enum u_cursor_draw_refusal)reason);
+	}
+	return true;
 }
 
 /*

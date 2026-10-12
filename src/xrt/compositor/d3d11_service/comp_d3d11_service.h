@@ -455,6 +455,22 @@ comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
                                            const struct xrt_segment_view_routing *routing);
 
 /*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): client @p xc's runtime-
+ * drawn cursor request for the commit that follows. A direct client's cursor is
+ * drawn into its atlas at that commit; under the shell the workspace cursor is
+ * lifted onto the window instead. @p out answers the PREVIOUS request (#1952).
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct ipc_cursor_draw_request;
+struct ipc_cursor_draw_outcome;
+
+void
+comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
+                                           const struct ipc_cursor_draw_request *req,
+                                           struct ipc_cursor_draw_outcome *out);
+
+/*!
  * Check if the compositor's window is still valid (not closed by user).
  *
  * This should be checked periodically by the IPC server to detect when

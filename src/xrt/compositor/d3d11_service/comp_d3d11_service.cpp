@@ -76,6 +76,9 @@
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
 #include "util/u_lift_cursor.h"
+#include "util/u_cursor_depth.h"           // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
+#include "util/comp_cursor_look.h"         // the default look, shared with every compositor
+#include "d3d_shared/comp_cursor_shaders.h" // B.7 softening kernel (DXR_SOFTEN)
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -927,6 +930,51 @@ struct d3d11_client_render_resources
 /*!
  * D3D11 service native compositor.
  */
+/*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): one client's runtime-drawn
+ * cursor requests. Zero-initialised and never touched for a client that never
+ * asks (§0: no request, no state).
+ *
+ * A request arrives (`compositor_set_cursor_draw_request`) right before the
+ * commit it belongs to; that commit moves it from @ref pending to @ref frame (a
+ * commit without one clears @ref frame - a request covers one frame). A direct
+ * client's cursor is drawn into its atlas there and then; under the shell the
+ * render thread reads @ref frame to lift the workspace cursor onto the window.
+ * The outcome (#1952) is answered with the NEXT request.
+ */
+struct svc_client_cursor_draw
+{
+	//! Guards everything below except @ref pending / @ref pending_valid, which
+	//! only this client's IPC thread touches. Written by that thread (request +
+	//! commit), read by the render thread (the shell lift). A LEAF.
+	std::mutex mutex;
+
+	bool pending_valid = false;
+	uint64_t pending_seq = 0;
+	struct ipc_cursor_draw_request pending = {};
+
+	//! The request the LAST commit carried (false: it carried none).
+	bool frame_valid = false;
+	uint64_t frame_seq = 0;
+	struct ipc_cursor_draw_request frame = {};
+	uint64_t next_seq = 0;
+
+	//! The latest decision about a request of this client (seq 0 = none yet).
+	uint64_t outcome_seq = 0;
+	bool outcome_drew = false;
+	uint32_t outcome_reason = 0;
+
+	//! One-time notices (never per frame).
+	bool announced = false;
+	bool warned_zone = false;
+	bool warned_lag = false;
+};
+
+//! Phase 4: requests the render thread may leave unanswered before the reply
+//! reports the frame as not drawn (under the shell the lift decision is the
+//! render tick's, which runs at its own rate).
+#define SVC_CURSOR_OUTCOME_MAX_LAG 3u
+
 struct d3d11_service_compositor
 {
 	//! Base native compositor - must be first!
@@ -1484,6 +1532,9 @@ struct d3d11_service_compositor
 	uint32_t wish_watchdog_submits;
 	bool wish_watchdog_armed;
 	bool wish_watchdog_done;
+
+	//! XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4).
+	struct svc_client_cursor_draw cursor_draw;
 };
 
 /*!
@@ -8864,6 +8915,13 @@ compositor_end_session(struct xrt_compositor *xc)
 	// reassigned: the controller's client-list diff picks the successor.
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): an ended session has
+	// no cursor - the shell stops lifting onto its window.
+	{
+		std::lock_guard<std::mutex> clk(c->cursor_draw.mutex);
+		c->cursor_draw.pending_valid = false;
+		c->cursor_draw.frame_valid = false;
+	}
 	if (sys != nullptr && sys->multi_comp != nullptr) {
 		render_mutex_fair_lock lock(sys);
 		struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -33029,6 +33087,60 @@ comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
 	c->seg_route = *routing;
 	if (c->seg_route.count > XRT_MAX_SEGMENTS) {
 		memset(&c->seg_route, 0, sizeof(c->seg_route)); // never index past the arrays
+	}
+}
+
+void
+comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
+                                           const struct ipc_cursor_draw_request *req,
+                                           struct ipc_cursor_draw_outcome *out)
+{
+	if (out != nullptr) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (xc == nullptr || req == nullptr || out == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct svc_client_cursor_draw *cd = &c->cursor_draw;
+	std::lock_guard<std::mutex> lk(cd->mutex);
+
+	if (cd->pending_valid) {
+		// The last request was never consumed: no commit followed it (or the
+		// commit returned before its cursor step). Not drawn.
+		cd->outcome_seq = cd->pending_seq;
+		cd->outcome_drew = false;
+		cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	} else if (cd->frame_valid && cd->frame_seq > cd->outcome_seq + SVC_CURSOR_OUTCOME_MAX_LAG) {
+		// Consumed, but nothing has decided about the last few frames (under
+		// the shell no render tick looked at this client): not drawn.
+		cd->outcome_seq = cd->frame_seq;
+		cd->outcome_drew = false;
+		cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		if (!cd->warned_lag) {
+			cd->warned_lag = true;
+			U_LOG_W("[cursor_draw] client %p: no render pass answered its cursor requests - reporting not drawn "
+			        "(willDraw = false; one-time notice)",
+			        (void *)c);
+		}
+	}
+	if (cd->outcome_seq != 0) {
+		out->answered = 1;
+		out->drew = cd->outcome_drew ? 1 : 0;
+		out->reason = cd->outcome_reason;
+	}
+
+	cd->pending = *req;
+	if (cd->pending.view_count > XRT_MAX_VIEWS) {
+		cd->pending.view_count = XRT_MAX_VIEWS; // never index past the arrays
+	}
+	cd->pending_seq = ++cd->next_seq;
+	cd->pending_valid = true;
+	if (!cd->announced) {
+		cd->announced = true;
+		U_LOG_W("[cursor_draw] client %p: runtime-drawn cursor requested over IPC - the service draws it "
+		        "(ADR-046 Phase 4, one-time notice)",
+		        (void *)c);
 	}
 }
 
