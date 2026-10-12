@@ -119,6 +119,9 @@ endif()
 # exists; everything it drives is the exact function pointer providers get.
 if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
+	# ADR-053 / #1999 -- the conversion-provider loader: manifest + registry row
+	# parsing, ordering, the plug-in-kind router and the ABI gate.
+	list(APPEND tests tests_conversion_loader)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
 	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
@@ -457,6 +460,30 @@ endif()
 
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
+endif()
+if(TARGET tests_conversion_loader)
+	target_link_libraries(tests_conversion_loader PRIVATE target_lists xrt-interfaces aux_util)
+	# Three stub binaries the loader is pointed at by path (never registered):
+	# a well-formed provider, the same provider built against the next ABI
+	# major, and a display-processor-shaped DLL with no conversion entry point.
+	foreach(_stub ok abi dp)
+		add_library(tests_conversion_loader_stub_${_stub} MODULE tests_conversion_loader_stub.c)
+		target_link_libraries(tests_conversion_loader_stub_${_stub} PRIVATE xrt-interfaces)
+		set_target_properties(tests_conversion_loader_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
+		add_dependencies(tests_conversion_loader tests_conversion_loader_stub_${_stub})
+	endforeach()
+	target_compile_definitions(tests_conversion_loader_stub_ok PRIVATE STUB_KIND_CONVERSION)
+	target_compile_definitions(
+		tests_conversion_loader_stub_abi PRIVATE STUB_KIND_CONVERSION
+							 "STUB_PLUGIN_API=(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	target_compile_definitions(tests_conversion_loader_stub_dp PRIVATE STUB_KIND_DISPLAY)
+	target_compile_definitions(
+		tests_conversion_loader
+		PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
+			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
+			"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
+		)
 endif()
 if(TARGET tests_target_backcompat_claim)
 	target_link_libraries(tests_target_backcompat_claim PRIVATE target_lists xrt-interfaces aux_os)
