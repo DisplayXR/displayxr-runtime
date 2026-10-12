@@ -805,11 +805,21 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
-			// Wait for any pending GPU work to complete before cleanup
+			// Wait for any pending GPU work to complete before cleanup —
+			// bounded (#1007). If it never lands (wedged device / hung DP),
+			// LEAK this session's Vulkan objects (vk = NULL skips every
+			// destroy below) instead of freeing memory the GPU may still
+			// read, and instead of parking this IPC thread forever.
 			if (vk != NULL && mc->session_render.fenced_buffer >= 0) {
-				vk->vkWaitForFences(vk->device, 1,
-				                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-				                    VK_TRUE, UINT64_MAX);
+				if (multi_wait_fences_bounded(
+				        vk, 1, &mc->session_render.fences[mc->session_render.fenced_buffer],
+				        MULTI_FENCE_DEADLINE_NS, "end_session") == VK_TIMEOUT) {
+					U_LOG_E(
+					    "end_session: GPU work still pending after %d ms - leaking per-session "
+					    "Vulkan objects (#1007)",
+					    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+					vk = NULL;
+				}
 				mc->session_render.fenced_buffer = -1;
 			}
 
@@ -1496,11 +1506,19 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 
 		struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
-		// Wait for any pending GPU work to complete before cleanup
+		// Wait for any pending GPU work to complete before cleanup —
+		// bounded (#1007); on expiry leak rather than free in-use objects
+		// (vk = NULL skips every Vulkan destroy below).
 		if (vk != NULL && mc->session_render.fenced_buffer >= 0) {
-			vk->vkWaitForFences(vk->device, 1,
-			                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-			                    VK_TRUE, UINT64_MAX);
+			if (multi_wait_fences_bounded(vk, 1,
+			                              &mc->session_render.fences[mc->session_render.fenced_buffer],
+			                              MULTI_FENCE_DEADLINE_NS, "client destroy") == VK_TIMEOUT) {
+				U_LOG_E(
+				    "multi_compositor_destroy: GPU work still pending after %d ms - leaking "
+				    "per-session Vulkan objects (#1007)",
+				    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+				vk = NULL;
+			}
 			mc->session_render.fenced_buffer = -1;
 		}
 
@@ -2056,8 +2074,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			    .out_xdp = &mc->session_render.display_processor,
 			    .result = XRT_SUCCESS,
 			};
-			android_run_on_main_thread_blocking(run_dp_factory_on_main_thread, &ctx);
-			xrt_result_t dp_ret = ctx.result;
+			// Bounded (#1007): this runs on the render thread with
+			// list_and_timing_lock held, so a wedged main Looper must not
+			// freeze every client. On timeout the factory is abandoned (never
+			// run later) and the session continues without a DP.
+			xrt_result_t dp_ret = android_run_on_main_thread_timeout(run_dp_factory_on_main_thread, &ctx,
+			                                                         2000 * U_TIME_1MS_IN_NS);
+			if (dp_ret == XRT_SUCCESS) {
+				dp_ret = ctx.result;
+			}
 #else
 			xrt_result_t dp_ret = factory(
 			    vk,                                          // vk_bundle

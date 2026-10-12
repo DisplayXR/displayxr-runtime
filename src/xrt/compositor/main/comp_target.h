@@ -160,6 +160,15 @@ struct comp_target
 	//! Whether wait_for_present is supported by this comp_target.
 	bool wait_for_present_supported;
 
+	/*!
+	 * Upper bound for one image acquire, in ns. 0 (the zero-init default)
+	 * keeps the historical infinite wait. A swapchain-based target returns
+	 * VK_TIMEOUT / VK_NOT_READY from @ref acquire when it expires; the caller
+	 * skips the frame. Set by callers that must never park their thread on
+	 * one stuck consumer (comp_multi's main loop, #1007).
+	 */
+	uint64_t acquire_timeout_ns;
+
 	/*
 	 *
 	 * Vulkan functions.

@@ -25,6 +25,8 @@
 #include <xrt/xrt_config_os.h>
 #include <xrt/xrt_results.h>
 
+#include <stdint.h>
+
 #ifdef XRT_OS_ANDROID
 
 #ifdef __cplusplus
@@ -54,6 +56,20 @@ android_main_thread_dispatch_init(void);
  */
 xrt_result_t
 android_run_on_main_thread_blocking(void (*fn)(void *), void *data);
+
+/*!
+ * Like @ref android_run_on_main_thread_blocking, but gives up after
+ * @p timeout_ns (#1007) if the main thread has not STARTED the callback by then
+ * (a busy or wedged main Looper). An abandoned callback is never run later.
+ * A callback that has already started cannot be abandoned — it is using
+ * @p data — so the caller keeps waiting for it (with a WARN per period).
+ *
+ * @param timeout_ns 0 or negative = wait forever (same as the blocking form).
+ * @return XRT_SUCCESS once @p fn has run, XRT_TIMEOUT if it was abandoned.
+ * @ingroup aux_android
+ */
+xrt_result_t
+android_run_on_main_thread_timeout(void (*fn)(void *), void *data, int64_t timeout_ns);
 
 #ifdef __cplusplus
 }

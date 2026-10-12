@@ -25,6 +25,7 @@
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
+#include "util/u_time.h"
 
 #include "util/u_hud.h"
 #include "util/u_pacing.h"
@@ -397,6 +398,16 @@ struct multi_compositor
 
 		//! Index of buffer with pending fence (-1 = none)
 		int32_t fenced_buffer;
+
+		//! #1007 per-client stall deadline: set when this client's GPU work
+		//! did not land within @ref MULTI_FENCE_DEADLINE_NS. While set, the
+		//! main loop only POLLS the pending fence (zero timeout) and skips
+		//! this client's frame (stale-frame reuse, #922), so a hung device or
+		//! DP never blocks the other clients. Cleared when the fence lands.
+		bool gpu_stalled;
+
+		//! #1007: when @ref gpu_stalled was set (monotonic ns), for the log.
+		int64_t gpu_stalled_since_ns;
 
 		//! True if swapchain needs recreation (set on VK_SUBOPTIMAL_KHR)
 		bool swapchain_needs_recreate;
@@ -1427,6 +1438,10 @@ struct multi_system_compositor
 	VkFence *shared_fences;
 	uint32_t shared_buffer_count;
 	int shared_fenced_buffer;
+
+	//! #1007: shared-surface counterpart of session_render.gpu_stalled.
+	bool shared_gpu_stalled;
+	int64_t shared_gpu_stalled_since_ns;
 	VkRenderPass shared_render_pass;
 	VkFramebuffer *shared_framebuffers;
 
@@ -1840,6 +1855,41 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
 void
 multi_compositor_set_window_visible_locked(struct multi_compositor *mc, bool visible, const char *reason);
 #endif // XRT_OS_ANDROID
+
+/*!
+ * #1007 bounded waits. One wait slice — the same 100 ms the per-client wait
+ * thread already uses (`wait_fence` / `wait_semaphore`).
+ */
+#define MULTI_FENCE_TIMEOUT_NS (100 * U_TIME_1MS_IN_NS)
+
+/*!
+ * #1007: total budget for one fence wait on the multi main loop, or on a client
+ * teardown path. On expiry the caller SKIPS (keeps the fence pending, reuses the
+ * last frame) instead of blocking every other client behind one dead device.
+ */
+#define MULTI_FENCE_DEADLINE_NS (500 * U_TIME_1MS_IN_NS)
+
+/*!
+ * #1007: the comp_multi swapchain acquire timeout (`comp_target::acquire_timeout_ns`).
+ * A FIFO swapchain whose consumer stopped releasing buffers must not park the
+ * main loop forever inside vkAcquireNextImageKHR.
+ */
+#define MULTI_ACQUIRE_TIMEOUT_NS (500 * U_TIME_1MS_IN_NS)
+
+/*!
+ * Wait for @p count fences (all of them), in @ref MULTI_FENCE_TIMEOUT_NS slices,
+ * for at most @p budget_ns in total (0 = poll once). Logs one WARN per expired
+ * slice, tagged with @p what.
+ *
+ * @return VK_SUCCESS when all fences are signalled, VK_TIMEOUT when the budget
+ *         ran out (the fences are still pending — do NOT reset or reuse them),
+ *         or the Vulkan error (e.g. VK_ERROR_DEVICE_LOST).
+ *
+ * @ingroup comp_multi
+ */
+VkResult
+multi_wait_fences_bounded(
+    struct vk_bundle *vk, uint32_t count, const VkFence *fences, int64_t budget_ns, const char *what);
 
 /*!
  * Get predicted eye positions from the session's display processor.
