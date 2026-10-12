@@ -176,7 +176,7 @@ Each rule must hold in both hostings.
 | `ProbeOrder` | DWORD | no | default 100; bands in §3.3 |
 | `Enabled` | DWORD | no | 0 disables (input-provider precedent) |
 | `Hosting` | REG_SZ | no | `auto` (default) / `in-service` / `satellite`, for plug-in providers. P1 honours `in-service` only; from P2, `auto` = satellite for every out-of-tree DLL. The legacy adapter is always in-service (§4.5) |
-| `Supersedes` | REG_SZ | no | `dp-lift` hides the legacy adapter row (§4.5) |
+| `Supersedes` | REG_SZ | no | `dp-lift` hides the legacy adapter row (§4.5). Hides only the named id; never affects selection among other providers, so a vendor provider whose module is absent still falls through to the next candidate |
 | `Packs` | REG_MULTI_SZ | no | absolute paths of the provider's model-pack manifests (§5) |
 | `Settings\*` | REG_SZ | no | read through `host->get_setting`; replaces per-vendor ad-hoc knob keys and sidesteps the logon-environment trap |
 
@@ -326,6 +326,7 @@ Readiness is per (provider, capability). The runtime keeps the FSM; the provider
 | `READY` / `WARMING` | host crash or watchdog kill | `WARMING` (`restarting`, attempt n); streams survive |
 | any | crash-loop cutoff (5 abnormal exits in 10 min) | `FAILED(crash_loop)` |
 | `WARMING` | licence / platform / network failure | `FAILED(reason)` |
+| `WARMING` | the provider's inference runtime is present but older than the provider's floor | `FAILED(VERSION)`, never `FAILED(MODEL)`: the dashboard must say "too old", not "missing" |
 | any | `conv disable` / `Enabled=0` | `DISABLED` |
 
 **Retry triggers.** A registry change; `displayxr-cli conv warm`; a create for a task whose only candidates failed more than 30 s ago; the backoff timer for network-class failures; 30 min after a crash-loop cutoff.
@@ -377,7 +378,7 @@ A runtime-internal provider with no DLL and no negotiate: a synthetic row at **P
 | `SBS`, `NVIEW` | one `VIEWS_MONO` (3), min 2, max = `caps.max_views` (2 when only `SBS`) | `outputs = VIEWS` (+ `DEPTH` iff `AUX_DEPTH`); aux kind from `aux_depth_semantics` + encoding. `max_views` is now **enforced** |
 | `GAUSSIANS` | none | no shipping plug-in implements the blob slot |
 
-All three capabilities: `licence_class = COMMERCIAL`, `commercial_ok = 1` (a user installed it); `backend` and `model_version` from the caps; `max_streams` from the caps (0 → 4); `import_memory_kinds = CPU | NT_HANDLE`; `EXPLICIT_VIEWPOINTS` + `OFFAXIS_CAMERA` only when the plug-in's `struct_size` covers the ADR-048 policy fields. They share one module state and exclude nothing: depth and views streams run at once, as today.
+All three capabilities: `licence_class = UNKNOWN`, `commercial_ok = 0`, **exempt from the `AllowResearchOnly` gate** (grandfathered: the user installed that module before the gate existed; the module's own licence string from the plug-in's detail text is shown in the dashboard, and a shipping module reads "internal use only", so COMMERCIAL would be a lie); `backend` and `model_version` from the caps; `max_streams` from the caps (0 → 4); `import_memory_kinds = CPU | NT_HANDLE`; `EXPLICIT_VIEWPOINTS` + `OFFAXIS_CAMERA` only when the plug-in's `struct_size` covers the ADR-048 policy fields. They share one module state and exclude nothing: depth and views streams run at once, as today.
 
 **State is a plain copy:** `caps.module_status` when non-zero (values asserted equal); else READY → READY, ACTIVATING → WARMING, UNAVAILABLE → ABSENT. Terminal states are re-polled at 0.1 Hz. Depth metadata maps onto `xrt_conv_depth_info` field by field with `intrinsics_source = ASSUMED`; `range_*` stays 0 because the legacy contract cannot express it.
 
@@ -400,7 +401,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 
 | Thing | Owner | Where / rule |
 |---|---|---|
-| Store root (blobs + stamps) | **the runtime** (service / host); the runtime installer creates it | `HKLM\Software\DisplayXR\Models\Path`. First run adopts `HKLM\Software\DisplayXR\Browser\ModelsPath` if set, so installed blobs are not re-downloaded; else `%ProgramData%\DisplayXR\Models` |
+| Store root (blobs + stamps) | **the runtime** (service / host); the runtime installer creates it | Resolved in order: `HKLM\Software\DisplayXR\Models\Path`, then `HKLM\Software\DisplayXR\Browser\ModelsPath` (so installed blobs are not re-downloaded), then `%ProgramData%\DisplayXR\Models`. The browser installer writes both keys for as long as it ships models. The browser uninstaller must never delete the store once the `Models` key exists (it deletes `blobs\` today); the runtime treats a wiped store as `DOWNLOADING`, never as a latched failure |
 | Layout, write protocol, read check, ACL | unchanged from the browser's model-distribution contract | `blobs/<sha256>`; `<sha256>.<nonce>.part`; `.ok` stamp written **last**; read check = stamp + size; ACL `*S-1-5-32-545:(OI)(CI)(RX)` + `(CI)(WD,AD)` by SID |
 | Load check | **the host** | verifies sha256 on the first load of a blob per process (inside warm-up), and rejects a blob whose stamp owner SID is not the expected writer |
 | Pack manifests | **each provider ships its own** `<pack>.models.json` | registered via `Packs` (registry) / `packs[]` (POSIX manifest) |
@@ -453,7 +454,8 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 
 ### 5.3 Rules
 
-- **Commercial is an AND.** `license.commercial` is the AND over the model and every `dependencies[]` entry. Any `false` or missing value makes the capability `RESEARCH_ONLY`, selectable only with `AllowResearchOnly`.
+- **Commercial is an AND, over the runtime too.** `license.commercial` is the AND over the model, every `dependencies[]` entry and the inference runtime the provider loads. Any `false` or missing value makes the capability `RESEARCH_ONLY`, selectable only with `AllowResearchOnly`.
+- **Trust is the hash, not the stamp.** The host re-hashes a blob on first load per process (cached by file id + mtime + size) before handing it to the inference runtime. The stamp + size check alone is not trusted: the store's inherited ACL lets any local user plant a same-size blob and its stamp.
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`.

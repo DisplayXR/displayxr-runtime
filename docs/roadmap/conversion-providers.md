@@ -437,6 +437,14 @@ the host between submit and signal; the compositor frame rate is unaffected.
 | Service | WARMING(`updating`); sessions and streams untouched |
 | Installer replaces files, writes `Version` last, releases the mutex | — |
 
+**Forced shutdown is the normal case for one shipping module.** The vendor module's own worker
+owns a hidden window that never pumps messages, so `RmShutdown`'s graceful close fails and
+`RmForceShutdown` kills the holder. Today the holder is the service; in a satellite it is only the
+host. The supervisor treats that kill like a crash (§3.4: WARMING(`restarting`), streams survive,
+images re-registered on respawn) and the respawn itself waits for the maintenance mutex as below.
+The idle unload and the shadow-copy load are **not** coming back: the owner rejected the 8–10 s
+reload stalls, and the satellite makes both unnecessary.
+
 **Respawn after exit 20** never happens on a timer. The supervisor respawns only on a registry or
 manifest change, or when the maintenance mutex is free and demand exists. The host never calls
 `RegisterApplicationRestart`.
@@ -798,6 +806,13 @@ identity**: the browser exposes only a coarsened `waiting | ready | unavailable`
 | 2 | 0340 retries *without* `XR_DXR_lift` after 6 × 250 ms | decide "runtime lacks lift" with `xrEnumerateInstanceExtensionProperties`; keep lift in every attempt; backoff to ~10 s | ~40 |
 | 3 | `LiftAvailable()` never re-polls UNAVAILABLE (0329) | re-poll at 2 Hz while not READY; from P4 also take `TaskStateChanged` | ~60 |
 
+**Release cadence makes the fixes land late and unevenly.** Browser releases are near-daily on
+Chromium rebases and the update feed is tagged by hand, so old browsers stay in the field for weeks.
+Therefore: the P3 "wait for READY" **times out to the in-page path** when the runtime is spec 3 or
+older or reports no provider at all; the P4 deletion gates on the runtime floor in `consumer_floors`,
+not on the calendar; and every browser patch PR compiles on every lane (Windows + Android) before
+merge, since a patch-gate pass only proves the patch applies.
+
 **Header adoption.** The browser keeps the spec-3 header and runtime detection until its patches need
 spec-4 behaviour (P4). It then vendors the spec-4 header and raises its minimum runtime in the same
 change (`consumer_floors`). Merge order: runtime → extensions auto-sync → browser.
@@ -898,7 +913,7 @@ A/B unchanged.
 
 | Deliverable | Files | ≈ lines |
 |---|---|---|
-| Host binary (loop, hidden RM window, D3D11 NT-handle registration + fences, in-host minidump, idle exit) | `src/xrt/targets/conversion_host/` | +1,600 |
+| Host binary (loop, hidden RM window, D3D11 NT-handle registration + fences, in-host minidump, idle exit). The host opens its D3D device on the **adapter LUID the service passes on the command line** (the service's render adapter), never the default adapter: on a hybrid box the service renders on the dGPU and weaves on the iGPU, and a cross-adapter shared texture can fail silently (a cross-family copy is dropped with no error) | `src/xrt/targets/conversion_host/` | +1,600 |
 | Host proxy over pipe + rings; CPU-observed fence completion; handle pulling | `conv_host_proxy.c` | +900 |
 | Supervisor: lazy spawn, job object, backoff, exit codes, watchdog kill, maintenance-mutex check, respawn rules | `conv_supervisor.c`, `os_job_object_win.c` | +700 |
 | Hand-written host protocol structs; shm rings | `conv_host_wire.h`, `u_shm_ring.{c,h}` | +550 |
@@ -913,7 +928,11 @@ stream keeps its handle and recovers) and kill between submit and signal (compos
 unaffected); a fence-value test under the D3D11 debug layer; WARP shared-resource coverage per §11.2.
 
 **Exit:** the sim provider in a host produces the same output as in-service; kill tests green;
-`dp-lift` output unchanged from P1.
+`dp-lift` output unchanged from P1; **the per-frame cost of the satellite hop is measured and
+budgeted**: today the vendor module shares the service device in-process, so the satellite adds an
+IPC round trip, an NT-handle open and possibly one copy per video frame. Measure it on the hybrid
+box with the weave-on-scanout split engaged against the in-process number (typical lift latency
+today is about 22 ms end to end) and write the budget into §3.7 before P3 starts.
 
 **Risks:** cross-process GPU sync bugs → a fence value per record, debug layer in CI; WARP lacking
 shared fences → those cases run on hardware only.
@@ -927,6 +946,9 @@ shared fences → those cases run on hardware only.
 | The spec reorganised as one extension; `index.json` note; the v3-observable shifts in its history | `XR_DXR_lift.md`, `index.json` |
 | The vendor conversion provider DLL: separate from the display DLL, `Supersedes = dp-lift`, ProbeOrder 50, **satellite-hosted from day one** | `displayxr-leia-plugin` |
 | **Installer contract:** "close the host, never the service", holding `Global\DisplayXR-ConvMaintenance-<id>` across the RM session; onboarding guide §9 + discovery spec | runtime docs, vendor installer |
+| The vendor provider's **inference-runtime version gate** (today the display plug-in refuses a module older than its floor) reports `FAILED(VERSION)`, never `FAILED(MODEL)`, so the dashboard says "too old", not "missing"; extended entry points (off-axis convert) stay version-gated inside the provider | `displayxr-leia-plugin` |
+| Per-request geometry stays runtime→provider: display dims in metres, resolved viewpoints and the off-axis parameters go in on every call (`xrt_conv_params`), the relief mapping comes back out (`xrt_conv_depth_info.relief_*`); the display plug-in supplies only display geometry to the runtime, as today | ABI (already in the draft); confirm in the provider's tests |
+| Onboarding guide §9 "write a conversion provider" + a sibling `displayxr-conversion-template` repo (model vendors are not display vendors and should not read the weaver half) | runtime docs, new public repo |
 | Browser fallback fixes 1–3, on the spec-3 header | `displayxr-browser-pvt`, `displayxr-web` |
 
 **Tests:** create rules; task events ordered and deduplicated, the opt-in latch for v3-only sessions,
@@ -937,7 +959,11 @@ running.
 
 **Exit:** the vendor provider serves the browser through the satellite with `dp-lift` hidden; a vendor
 update on a live box loses no session (WARMING(`updating`) → READY); ABI gate and repin tracks green.
-This is where the file-lock saga ends.
+This is where the file-lock saga ends. **The common external case is "vendor module absent":** the
+vendor module ships from a separate, internal installer and is in neither the bundle nor the display
+plug-in installer, so for every external user the vendor provider's tasks are `FAILED(MODEL)` and the
+fall-through to the open provider (P4) is the main path, not an edge. `Supersedes = dp-lift` hides
+only the legacy row; it never affects selection among the other providers.
 
 **Risks:** the type-value block taken mid-flight → renumber (spec 4 is unreleased); coupled-PR merge
 order → runtime → extensions → browser; the weaving DP mapping the conversion runtime into the
@@ -948,7 +974,9 @@ service (§11.2) → RM would still list the service.
 | Deliverable | Where |
 |---|---|
 | The open provider (ONNX Runtime; DirectML on Windows), model packs (manifest schema 2 with `defaults`, no schema-1 compatibility block), ProbeOrder 200 | sibling public repo; `versions.json`; `downstream-pins.json` track |
-| Runtime-owned model store: root `HKLM\Software\DisplayXR\Models\Path`, adopting the browser's `Browser\ModelsPath` on first run, else `%ProgramData%\DisplayXR\Models`; the browser's layout, write protocol, ACL and read check; the host downloads; GC manual (`conv models prune`). The host **verifies sha256 on first load per process** (inside warm-up) and rejects a stamp whose owner SID is not the expected writer; installer pre-fetch runs as a SYSTEM writer | runtime installer, host |
+| Runtime-owned model store: root resolved **in this order**: `HKLM\Software\DisplayXR\Models\Path`, then the browser's `HKLM\Software\DisplayXR\Browser\ModelsPath`, then `%ProgramData%\DisplayXR\Models`; the browser installer writes **both** keys until it stops shipping models, or a `/MODELSPATH=` override silently splits the store. The browser's layout and write protocol; the host downloads; GC manual (`conv models prune`). The host **verifies sha256 on first load per process** (inside warm-up, cached by file id + mtime + size, about 1–2 s for a 700 MB blob) because the browser's read check is stamp + size with no re-hash and the store inherits `%ProgramData%`'s default ACL, under which any local user can plant a same-size blob plus its `.ok` stamp; tightening the ACL waits until the browser no longer writes the store in user context. Installer pre-fetch runs as a SYSTEM writer and **skips, never retries**, a stamped blob that is mapped by a running process | runtime installer, host |
+| **Blocker before adoption: the browser uninstaller wipes the store.** `DisplayXRBrowserInstaller.nsi` runs `RMDir /r "<root>\blobs"`; once the runtime adopts the folder, uninstalling the browser deletes every runtime model. The browser fix (never delete when `HKLM\Software\DisplayXR\Models` exists, or an owner marker) ships **before or with** adoption, and the runtime still treats a wiped store as `DOWNLOADING`, never as a latched failure, because older browser installers in the field can still wipe it | browser-pvt, runtime |
+| Website page "conversion providers": what the runtime does for apps, the open defaults and their licences, how a commercial provider is installed, the readiness rules; the open-provider repo joins the ecosystem list through the site's org sync | `displayxr-website` (`/sync-website`) |
 | Bundle-installed provider, models on demand (§11.1 c) | `displayxr-installer` |
 | Browser vendors the spec-4 header, raises its minimum runtime, deletes per §8.1 | browser-pvt, displayxr-web |
 
@@ -1025,9 +1053,9 @@ Also closed in passing:
 |---|---|---|
 | (a) | Ship the satellite host before any out-of-tree provider? | **Yes, in P2**, proven on the sim provider with CI kill tests. The legacy adapter stays in the service; the file-lock saga ends in P3, when the vendor provider DLL is satellite-hosted from day one. This also keeps two inference runtimes out of one process before P4. |
 | (b) | Lift v4/v5, or a new `XR_DXR_conversion`? | **Lift spec 4, then 5** (ADR-053), pending veto. |
-| (c) | Open provider packaging | **A sibling public repo, bundle-installed, models downloaded on demand.** No 1.65 GB pre-fetch by default; signed installers never pre-fetch a non-commercial blob, and any pre-fetch runs as a SYSTEM writer. |
+| (c) | Open provider packaging | **A sibling public repo; the provider DLL bundle-installed unconditionally; models a separate installer component, checked by default, that pre-fetches only the default pack.** Default pack = the small streaming video-depth model (Apache-2.0, ~58 MB), the small still-depth model (Apache-2.0, ~50 MB) and the light inpainter (MIT, ~5 MB): about 113 MB, covering video (the main lift use; its temporal cache is what keeps video from flickering), stills at low quality, and hole fill. The large metric still model (MIT, ~0.7 GB per size) is on demand with a `DOWNLOADING` state, or an unchecked installer option. Only the *small* variants of the depth families are Apache; base/large are CC-BY-NC. The large mono-depth model's "Apache-2.0" in the browser manifest was never independently checked: re-verify upstream before any pack ships it. Signed installers never pre-fetch a non-commercial blob, and any pre-fetch runs as a SYSTEM writer. |
 | (d) | Android providers | **In the runtime APK**, as `libdxrc…`, in one exported, signature-protected `:conversion` service; vendor-separate APKs deferred. |
-| (e) | Licence wording | `dp-lift` = COMMERCIAL; `AllowResearchOnly` gates RESEARCH_ONLY and UNKNOWN; signed installers never write it; a pack's `commercial` = AND over the model and its dependencies. |
+| (e) | Licence wording | A provider declares the licence class of its **inference runtime and models together**: the AND covers the runtime, not only the model files (a vendor module whose detail string reads "internal use only" cannot be advertised as COMMERCIAL by the provider that loads it; the vendor's own installer may set the opt-in for an internal build, since it is not a signed DisplayXR installer). `AllowResearchOnly` gates RESEARCH_ONLY and UNKNOWN; signed DisplayXR installers never write it. The legacy `dp-lift` adapter is **grandfathered**: it reports UNKNOWN with the module's own licence string shown in the dashboard, and is exempt from the gate because the user installed that module before the gate existed. A pack's `commercial` = AND over the model and its dependencies. |
 
 Decided as stated unless the owner objects: `requiredOutputs` is checked against declared (possibly
 provisional) outputs and is otherwise strict — revisit with data; progress events are rate-limited
@@ -1038,6 +1066,9 @@ into separate DLLs where one worker cannot run both lanes.
 ### 11.2 Must verify before coding
 
 - [ ] WARP shared NT-handle textures + shared fences in CI
+- [ ] a shared NT-handle texture opened on the wrong adapter on the hybrid box fails loudly (not a silent drop)
+- [ ] the browser uninstaller's `RMDir /r blobs` and which browser versions in the field still run it
+- [ ] the store's effective ACL on an installed box (inherited `%ProgramData%` default vs anything the browser installer set)
 - [ ] the vendor lift factory without probe (stays in-service, so only for the adapter's static describe)
 - [ ] whether any weaving-DP path maps the conversion runtime into the service (decides whether RmGetList ever lists the service after P3)
 - [ ] the `conv_hint_interest` plumbing
