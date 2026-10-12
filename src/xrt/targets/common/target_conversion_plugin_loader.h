@@ -268,6 +268,23 @@ target_conversion_plugin_apply_kill_switches(struct xrt_conversion_plugin_entry 
 uint32_t
 target_conversion_plugin_parse_hosting(const char *s, bool *out_known);
 
+/*!
+ * Subkeys of the `ConversionProviders` root that hold runtime POLICY, not a
+ * provider row (discovery spec §3.1, "Root values"): `Policy\Lock`,
+ * `PreferredProvider\<task>`, `Prewarm\<task>`. The registry reader skips
+ * them, case-insensitively (registry names are), so they are never listed as
+ * malformed providers -- and a provider can never be registered under one of
+ * these ids. One table, shared with the CLI's `conv` code. NULL-terminated.
+ */
+#define XRT_CONV_RESERVED_SUBKEYS_INIT {"Policy", "PreferredProvider", "Prewarm", NULL}
+
+//! The reserved-subkey table (see XRT_CONV_RESERVED_SUBKEYS_INIT), NULL-terminated.
+extern const char *const target_conversion_plugin_reserved_subkeys[];
+
+//! True when @p name (UTF-8) is a reserved policy subkey, case-insensitively.
+bool
+target_conversion_plugin_is_reserved_subkey(const char *name);
+
 //! Short name of an enum xrt_conversion_plugin_load_status value.
 const char *
 target_conversion_plugin_status_str(uint32_t status);
