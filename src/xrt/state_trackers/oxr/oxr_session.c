@@ -2752,6 +2752,7 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	sess->cursor_draw.position = *position;
 	sess->cursor_draw.orientation = g->orientation;
 	sess->cursor_draw.unit = unit;
+	sess->cursor_draw.disparity = disparity;
 	sess->cursor_draw.view_count = n;
 	sess->cursor_draw.image = image;
 	sess->cursor_draw.hot_u = draw_info->hotSpot.x;

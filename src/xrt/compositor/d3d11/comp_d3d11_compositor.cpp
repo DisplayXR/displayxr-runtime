@@ -3657,8 +3657,32 @@ d3d11_cursor_resolve(struct comp_d3d11_compositor *c,
 	out->req = req_in;
 	out->report_only = req_in->report_only;
 	out->count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	// ADR-046 Amendment 2 B.7: soften the lifted cursor against crosstalk.
+	// The panel px that 0..1 of the (tile-normalised) views span: the window
+	// for a zone request (u_cursor_draw_into_zone re-expressed it there),
+	// else the canvas the views were built for. Both effects are exactly off
+	// on the glass, which then takes the crisp draw unchanged.
+	const float tile_px_w =
+	    (float)(req->zone_valid || !(eff_canvas->valid && eff_canvas->w > 0) ? tgt_width : eff_canvas->w);
+	const float tile_px_h =
+	    (float)(req->zone_valid || !(eff_canvas->valid && eff_canvas->h > 0) ? tgt_height : eff_canvas->h);
+	// The blur cap follows the DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	out->soft = soften.blur_px > 0.0f || soften.alpha < 1.0f;
 	for (uint32_t i = 0; i < out->count; i++) {
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
+		if (out->soft) {
+			struct u_cursor_soften_quad sq;
+			u_cursor_draw_soften_quad(out->corners[i], tile_px_w, tile_px_h, soften.blur_px, &sq);
+			memcpy(out->corners[i], sq.corners, sizeof(sq.corners));
+			memcpy(out->uv[i], sq.uv, sizeof(sq.uv));
+			out->soften[i][0] = sq.radius_uv[0];
+			out->soften[i][1] = sq.radius_uv[1];
+			out->soften[i][2] = soften.alpha;
+			out->soften[i][3] = 0.0f;
+		}
 	}
 	return true;
 }

@@ -204,6 +204,10 @@ struct comp_d3d11_renderer
 		ID3D11VertexShader *vs;
 		ID3D11PixelShader *ps;
 		ID3D11PixelShader *ps_array; //!< layered sprite: samples array layer 0
+		//! ADR-046 B.7 softening variants (DXR_SOFTEN) and their b1 constants.
+		ID3D11PixelShader *ps_soft;
+		ID3D11PixelShader *ps_soft_array;
+		ID3D11Buffer *cb_soft;
 		ID3D11Buffer *cb;
 		ID3D11BlendState *blend;        //!< straight alpha (the app's sprite)
 		ID3D11BlendState *blend_premul; //!< premultiplied (the default look)
@@ -1592,6 +1596,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->cursor.blend_premul);
 	SAFE_RELEASE(r->cursor.blend);
 	SAFE_RELEASE(r->cursor.cb);
+	SAFE_RELEASE(r->cursor.cb_soft);
+	SAFE_RELEASE(r->cursor.ps_soft_array);
+	SAFE_RELEASE(r->cursor.ps_soft);
 	SAFE_RELEASE(r->cursor.ps_array);
 	SAFE_RELEASE(r->cursor.ps);
 	SAFE_RELEASE(r->cursor.vs);
@@ -2245,6 +2252,18 @@ cursor_release_pipeline(struct comp_d3d11_renderer *r)
 		r->cursor.ps_array->Release();
 		r->cursor.ps_array = nullptr;
 	}
+	if (r->cursor.cb_soft != nullptr) {
+		r->cursor.cb_soft->Release();
+		r->cursor.cb_soft = nullptr;
+	}
+	if (r->cursor.ps_soft_array != nullptr) {
+		r->cursor.ps_soft_array->Release();
+		r->cursor.ps_soft_array = nullptr;
+	}
+	if (r->cursor.ps_soft != nullptr) {
+		r->cursor.ps_soft->Release();
+		r->cursor.ps_soft = nullptr;
+	}
 	if (r->cursor.ps != nullptr) {
 		r->cursor.ps->Release();
 		r->cursor.ps = nullptr;
@@ -2297,12 +2316,40 @@ cursor_ensure_pipeline(struct comp_d3d11_renderer *r)
 		blob->Release();
 		blob = nullptr;
 	}
+	// ADR-046 B.7: the softening variants (plain and layered), same source
+	// with DXR_SOFTEN, parameters in b1.
+	if (ok) {
+		static const D3D_SHADER_MACRO soft[] = {{"DXR_SOFTEN", "1"}, {nullptr, nullptr}};
+		ok = compile_shader(device, cursor_quad_ps_source, "main", "ps_5_0", &blob, soft) == XRT_SUCCESS;
+	}
+	if (ok) {
+		ok = SUCCEEDED(device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                         &r->cursor.ps_soft));
+		blob->Release();
+		blob = nullptr;
+	}
+	if (ok) {
+		static const D3D_SHADER_MACRO soft_layered[] = {
+		    {"DXR_SOFTEN", "1"}, {"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+		ok =
+		    compile_shader(device, cursor_quad_ps_source, "main", "ps_5_0", &blob, soft_layered) == XRT_SUCCESS;
+	}
+	if (ok) {
+		ok = SUCCEEDED(device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                         &r->cursor.ps_soft_array));
+		blob->Release();
+		blob = nullptr;
+	}
 	if (ok) {
 		D3D11_BUFFER_DESC bd = {};
 		bd.ByteWidth = sizeof(CursorQuadConstants);
 		bd.Usage = D3D11_USAGE_DEFAULT;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		ok = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &r->cursor.cb));
+		if (ok) {
+			bd.ByteWidth = sizeof(CursorSoftenConstants); // 16 bytes
+			ok = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &r->cursor.cb_soft));
+		}
 	}
 	if (ok) {
 		// Straight alpha for the app's sprite (the spec), premultiplied
@@ -2438,7 +2485,9 @@ cursor_draw(struct comp_d3d11_renderer *r,
 		// A layered swapchain's SRV is a whole-array Texture2DArray: the
 		// spec samples array layer 0.
 		if (comp_d3d11_swapchain_get_array_size(q->xsc) > 1) {
-			ps = r->cursor.ps_array;
+			ps = q->soft ? r->cursor.ps_soft_array : r->cursor.ps_array;
+		} else if (q->soft) {
+			ps = r->cursor.ps_soft;
 		}
 		// Format-honest on the compose path, non-decoding on the fast path:
 		// the same rule as every other layer source (ADR-044).
@@ -2449,6 +2498,9 @@ cursor_draw(struct comp_d3d11_renderer *r,
 			return;
 		}
 		srv = r->compose_active ? r->cursor.look_srv_srgb : r->cursor.look_srv_raw;
+		if (q->soft) {
+			ps = r->cursor.ps_soft;
+		}
 	}
 	if (srv == nullptr) {
 		u_cursor_draw_report_refused(q->req, q->xsc != nullptr ? U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE
@@ -2499,8 +2551,11 @@ cursor_draw(struct comp_d3d11_renderer *r,
 	ctx->PSSetShader(ps, nullptr, 0);
 	ctx->PSSetShaderResources(0, 1, &srv);
 	ctx->PSSetSamplers(0, 1, &r->cursor.sampler);
+	if (q->soft) {
+		ctx->PSSetConstantBuffers(1, 1, &r->cursor.cb_soft);
+	}
 
-	static const float uv[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
+	static const float uv_crisp[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
 	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS; i++) {
 		float tx = 0.0f, ty = 0.0f, tw = 0.0f, th = 0.0f;
@@ -2536,10 +2591,17 @@ cursor_draw(struct comp_d3d11_renderer *r,
 		for (int k = 0; k < 4; k++) {
 			cc.corners[k][0] = q->corners[i][k][0];
 			cc.corners[k][1] = q->corners[i][k][1];
-			cc.corners[k][2] = uv[k][0];
-			cc.corners[k][3] = uv[k][1];
+			cc.corners[k][2] = q->soft ? q->uv[i][k][0] : uv_crisp[k][0];
+			cc.corners[k][3] = q->soft ? q->uv[i][k][1] : uv_crisp[k][1];
 		}
 		ctx->UpdateSubresource(r->cursor.cb, 0, nullptr, &cc, 0, 0);
+		if (q->soft) {
+			// .w: straight alpha for the app's sprite, premultiplied for the
+			// default look - the same split as the blend states.
+			CursorSoftenConstants sc = {
+			    {q->soften[i][0], q->soften[i][1], q->soften[i][2], q->xsc != nullptr ? 1.0f : 0.0f}};
+			ctx->UpdateSubresource(r->cursor.cb_soft, 0, nullptr, &sc, 0, 0);
+		}
 		ctx->Draw(4, 0);
 		drawn++;
 	}
@@ -2552,6 +2614,10 @@ cursor_draw(struct comp_d3d11_renderer *r,
 	// Hand the pipeline back the way the layer passes expect it.
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	ctx->PSSetShaderResources(0, 1, &null_srv);
+	if (q->soft) {
+		ID3D11Buffer *null_cb = nullptr;
+		ctx->PSSetConstantBuffers(1, 1, &null_cb);
+	}
 	ctx->RSSetState(r->rasterizer_state);
 	ctx->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
 }

@@ -100,6 +100,19 @@ struct u_cursor_draw_request;
 bool
 comp_cursor_draw_debug_refuse(const struct u_cursor_draw_request *req);
 
+struct u_cursor_soften_params;
+
+/*!
+ * The crosstalk-softening knobs (ADR-046 Amendment 2 B.7), read from the
+ * environment once, on the first call (one WARN line with the values):
+ * DXR_CURSOR_SOFTEN=off|alpha|blur|both (default both),
+ * DXR_CURSOR_SOFTEN_BLUR_K, DXR_CURSOR_SOFTEN_BLUR_MAX_PX,
+ * DXR_CURSOR_SOFTEN_ALPHA_MIN, DXR_CURSOR_SOFTEN_FULL_D
+ * (u_cursor_soften_params_parse). Called only on a cursor frame.
+ */
+const struct u_cursor_soften_params *
+comp_cursor_soften_params(void);
+
 
 /*
  *
