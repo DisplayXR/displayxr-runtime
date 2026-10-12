@@ -3011,6 +3011,10 @@ struct oxr_locate_segment
 	//! @ref wm already IS the canvas (one part of a zone, XrDisplayZonePartsDXR):
 	//! the zone rebase of a zone-scoped locate is skipped.
 	bool canvas_is_final;
+	//! A zone part the SERVICE frames (a present-owner's element, ADR-047
+	//! Amendment 10): k + 1 rides ipc_view_rig_info::zone_part, and none of
+	//! the canvas / eye fields above are used. 0 = a client-side override.
+	uint32_t ipc_zone_part;
 	//! Publish session-level side effects (#441 tracking edge): only the
 	//! majority segment's call does.
 	bool side_effects;
@@ -3070,6 +3074,10 @@ locate_views_one(struct oxr_logger *log,
 		// One segment's locate: exactly that segment's view set.
 		reported_view_count = seg->view_count;
 	}
+	// The canvas / eye override of a client-side per-segment or per-part locate;
+	// NULL for a zone part the SERVICE frames (ipc_zone_part, ADR-047
+	// Amendment 10), which otherwise runs exactly as the zone's own locate.
+	const struct oxr_locate_segment *cseg = (seg != NULL && seg->ipc_zone_part == 0) ? seg : NULL;
 	// The views the device math below fills: never more than the device has.
 	// Views past it are the multiview tail and are aliased further down.
 	const uint32_t located_view_count = reported_view_count < view_count ? reported_view_count : view_count;
@@ -3318,22 +3326,22 @@ locate_views_one(struct oxr_logger *log,
 	// are handled safely (returns false). In IPC mode, the server handles
 	// eye tracking via ipc_try_get_sr_view_poses.
 	bool got_eye_positions = false;
-	if (seg != NULL) {
-		eye_pos = seg->eyes;
-		got_eye_positions = seg->have_eyes;
+	if (cseg != NULL) {
+		eye_pos = cseg->eyes;
+		got_eye_positions = cseg->have_eyes;
 		if (should_log) {
-			if (seg->have_eyes && seg->eyes.count >= 2) {
+			if (cseg->have_eyes && cseg->eyes.count >= 2) {
 				U_LOG_I(
 				    "Segment 0x%016llx eyes from its DP (%u, tracking=%d): [0]=(%.4f,%.4f,%.4f) "
 				    "[1]=(%.4f,%.4f,%.4f) (reference frame)",
-				    (unsigned long long)seg->screen_id, seg->eyes.count, (int)seg->eyes.is_tracking,
-				    seg->eyes.eyes[0].x, seg->eyes.eyes[0].y, seg->eyes.eyes[0].z, seg->eyes.eyes[1].x,
-				    seg->eyes.eyes[1].y, seg->eyes.eyes[1].z);
+				    (unsigned long long)cseg->screen_id, cseg->eyes.count, (int)cseg->eyes.is_tracking,
+				    cseg->eyes.eyes[0].x, cseg->eyes.eyes[0].y, cseg->eyes.eyes[0].z,
+				    cseg->eyes.eyes[1].x, cseg->eyes.eyes[1].y, cseg->eyes.eyes[1].z);
 			} else {
 				U_LOG_I(
 				    "Segment 0x%016llx eyes: its screen's nominal viewer (no DP eye set covering "
 				    "its views)",
-				    (unsigned long long)seg->screen_id);
+				    (unsigned long long)cseg->screen_id);
 			}
 		}
 	} else {
@@ -3500,8 +3508,8 @@ locate_views_one(struct oxr_logger *log,
 			// or from the bound display (XrSessionDisplayBindingDXR, M1).
 			float nominal_z_m = 0.0f;
 			oxr_session_get_nominal_viewer(sess, NULL, &nominal_z_m);
-			if (seg != NULL) {
-				nominal_z_m = seg->nominal_z_m;
+			if (cseg != NULL) {
+				nominal_z_m = cseg->nominal_z_m;
 			}
 			U_LOG_I("Kooima: nominal_z=%.3f", nominal_z_m);
 			if (nominal_z_m > 0.0f) {
@@ -3519,9 +3527,9 @@ locate_views_one(struct oxr_logger *log,
 				// pair this always was), so an N-view mode never leaves
 				// views with zero FOVs. For a segment: in front of THAT
 				// screen, carried into the reference frame.
-				eye_count = oxr_segment_views_nominal_eyes(ipd_m, nominal_z_m, active_view_count,
-				                                           seg != NULL ? seg->eye_dx : 0.0f,
-				                                           seg != NULL ? seg->eye_dy : 0.0f, adj_eyes);
+				eye_count = oxr_segment_views_nominal_eyes(
+				    ipd_m, nominal_z_m, active_view_count, cseg != NULL ? cseg->eye_dx : 0.0f,
+				    cseg != NULL ? cseg->eye_dy : 0.0f, adj_eyes);
 				have_eye_positions = true;
 				if (should_log) {
 					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
@@ -3610,11 +3618,11 @@ locate_views_one(struct oxr_logger *log,
 
 			struct xrt_window_metrics wm = {0};
 			bool have_wm = false;
-			if (seg != NULL) {
+			if (cseg != NULL) {
 				// Multi-screen M3: the segment (or, stereo, the whole window
 				// framed from the majority screen) instead of the session
 				// DP's window metrics.
-				wm = seg->wm;
+				wm = cseg->wm;
 				have_wm = wm.valid;
 			} else {
 				have_wm = oxr_session_get_window_metrics(sess, &wm);
@@ -3631,7 +3639,7 @@ locate_views_one(struct oxr_logger *log,
 			// composes relative to that rect rather than the client
 			// window; zones frames ignore the output rect at the
 			// compositor in P2 (ADR-027 rule 2).
-			if (zone != NULL && have_wm && wm.valid && (seg == NULL || !seg->canvas_is_final)) {
+			if (zone != NULL && have_wm && wm.valid && (cseg == NULL || !cseg->canvas_is_final)) {
 				struct u_canvas_rect zone_canvas = {
 				    .valid = true,
 				    .x = zone->rect.offset.x,
@@ -3660,9 +3668,9 @@ locate_views_one(struct oxr_logger *log,
 
 				if (should_log) {
 					char seg_tag[40] = "";
-					if (seg != NULL) {
+					if (cseg != NULL) {
 						snprintf(seg_tag, sizeof(seg_tag), " [segment 0x%016llx]",
-						         (unsigned long long)seg->screen_id);
+						         (unsigned long long)cseg->screen_id);
 					}
 					U_LOG_I(
 					    "Window-relative Kooima%s: screen=%.4fx%.4fm, "
@@ -3738,9 +3746,9 @@ locate_views_one(struct oxr_logger *log,
 				// Nominal viewer for view math (parallax lerp target)
 				struct xrt_vec3 nominal = {0, 0, 0};
 				oxr_session_get_nominal_viewer(sess, &nominal.y, &nominal.z);
-				if (seg != NULL) {
-					nominal.y = seg->nominal_y_m;
-					nominal.z = seg->nominal_z_m;
+				if (cseg != NULL) {
+					nominal.y = cseg->nominal_y_m;
+					nominal.z = cseg->nominal_z_m;
 				}
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
@@ -3822,8 +3830,8 @@ locate_views_one(struct oxr_logger *log,
 						dt.virtual_display_height = active_rig->virtual_display_height;
 						// Multi-screen M3: the rig sizes the WINDOW; this
 						// canvas is its share of it (one m2v for all segments).
-						if (seg != NULL && seg->vdh_scale > 0.0f) {
-							dt.virtual_display_height *= seg->vdh_scale;
+						if (cseg != NULL && cseg->vdh_scale > 0.0f) {
+							dt.virtual_display_height *= cseg->vdh_scale;
 						}
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
@@ -3832,10 +3840,10 @@ locate_views_one(struct oxr_logger *log,
 					// Multi-screen M3: a display rig centres the WINDOW on
 					// its pose; this segment's canvas sits m2v x its offset
 					// from the window centre (ref frame -> rig frame).
-					if (seg != NULL && (seg->rig_dx != 0.0f || seg->rig_dy != 0.0f) &&
+					if (cseg != NULL && (cseg->rig_dx != 0.0f || cseg->rig_dy != 0.0f) &&
 					    screen_height_m > 0.0f) {
 						const float m2v = dt.virtual_display_height / screen_height_m;
-						const struct xrt_vec3 off = {seg->rig_dx * m2v, seg->rig_dy * m2v,
+						const struct xrt_vec3 off = {cseg->rig_dx * m2v, cseg->rig_dy * m2v,
 						                             0.0f};
 						struct xrt_vec3 off_rot;
 						math_quat_rotate_vec3(&display_pose.orientation, &off, &off_rot);
@@ -3935,7 +3943,7 @@ locate_views_one(struct oxr_logger *log,
 	// (seg); the server's rig call computes one view set for the whole window
 	// and would overwrite it, so a segment locate never takes it.
 	const bool rig_route_native = (rig_active || view_raw != NULL || zone_chained) && !sess->is_bridge_relay &&
-	                              sess->xcn != NULL && seg == NULL;
+	                              sess->xcn != NULL && cseg == NULL;
 	const bool rig_route_bridge = view_raw != NULL && sess->is_bridge_relay;
 	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
 		struct ipc_view_rig_info rig_info = {0};
@@ -3959,6 +3967,8 @@ locate_views_one(struct oxr_logger *log,
 			rig_info.zone_y_px = zone->rect.offset.y;
 			rig_info.zone_w_px = zone->rect.extent.width;
 			rig_info.zone_h_px = zone->rect.extent.height;
+			// ADR-047 Amendment 10: one part of the zone, framed by the service.
+			rig_info.zone_part = seg != NULL ? seg->ipc_zone_part : 0;
 		}
 #endif
 		// Bridge relays keep rig_type NONE (descriptors inert); only native
@@ -4014,6 +4024,24 @@ locate_views_one(struct oxr_logger *log,
 		if (xret == XRT_SUCCESS) {
 			ipc_rig_done = true;
 			T_xdev_head = reply.head_relation;
+#ifdef OXR_HAVE_DXR_display_zones
+			// ADR-047 Amendment 10: the zone's parts as the service cut them
+			// (the zone's own locate), and which part these views frame.
+			if (zone != NULL && rig_route_native) {
+				if (seg == NULL) {
+					const uint32_t pc =
+					    reply.zone_part_count <= XRT_MAX_SEGMENTS ? reply.zone_part_count : 0;
+					sess->display_zones.ipc_parts.count = pc;
+					sess->display_zones.ipc_parts.generation = reply.zone_parts_generation;
+					for (uint32_t p = 0; p < pc; p++) {
+						sess->display_zones.ipc_parts.display_id[p] =
+						    reply.zone_part_display_id[p];
+						sess->display_zones.ipc_parts.rect[p] = reply.zone_part_rect[p];
+					}
+				}
+				sess->display_zones.ipc_parts.framed = reply.zone_part_framed;
+			}
+#endif
 			for (uint32_t i = 0; i < wire_views; i++) {
 				fovs[i] = reply.fovs[i];
 				poses[i] = reply.poses[i];
@@ -4140,7 +4168,7 @@ locate_views_one(struct oxr_logger *log,
 		// Multi-screen over IPC: a segment's views are computed client-side
 		// from that segment's eyes (the server knows one view set only), so
 		// its Kooima FOVs are the answer, not the device's.
-		const bool seg_ipc_fov = seg != NULL && sess->seg_ipc;
+		const bool seg_ipc_fov = cseg != NULL && sess->seg_ipc;
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
 		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
 		if (have_kooima_fov && (have_view_state || rig_active || seg_ipc_fov)) {
@@ -4973,6 +5001,97 @@ locate_zone_parts(struct oxr_logger *log,
 	}
 	return XR_SUCCESS;
 }
+
+/*!
+ * The present-owner twin of locate_zone_parts (ADR-047 Amendment 10): the
+ * service frames a present-owner's element locates (its bound window's table
+ * lives there), so the zone's own locate came back with the parts the service
+ * cut (display_zones.ipc_parts), and each part's views are one more locate with
+ * ipc_view_rig_info::zone_part = k + 1. A part the service no longer finds (the
+ * window moved between the calls) drops the whole split for this locate.
+ */
+static XrResult
+locate_zone_parts_ipc(struct oxr_logger *log,
+                      struct oxr_session *sess,
+                      const XrViewLocateInfo *viewLocateInfo,
+                      const XrDisplayZoneDXR *zone,
+                      uint32_t per_part,
+                      XrDisplayZonePartsDXR *out)
+{
+	const uint32_t n = sess->display_zones.ipc_parts.count;
+	if (out == NULL || zone == NULL || per_part == 0 || per_part > XRT_MAX_VIEWS || n < 2 || n > XRT_MAX_SEGMENTS ||
+	    !locate_is_display_centric(sess, viewLocateInfo)) {
+		return XR_SUCCESS;
+	}
+	const uint32_t cap = (uint32_t)debug_get_num_option_zone_parts_max();
+	if (!oxr_zone_parts_budget_admit(&sess->display_zones.parts_budget, viewLocateInfo->displayTime, zone->zoneId,
+	                                 cap)) {
+		return XR_SUCCESS;
+	}
+	out->generation = sess->display_zones.ipc_parts.generation;
+	out->partCountOutput = n;
+	out->viewCountOutput = n * per_part;
+	if (out->partCapacityInput < n || out->viewCapacityInput < n * per_part || out->parts == NULL ||
+	    out->views == NULL) {
+		return XR_SUCCESS; // a count query, or too small: the counts only
+	}
+	// The listing is overwritten by nothing below (only the zone's own
+	// locate writes it), but keep this locate's copy.
+	const uint64_t gen = sess->display_zones.ipc_parts.generation;
+	uint64_t ids[XRT_MAX_SEGMENTS];
+	struct xrt_rect rects[XRT_MAX_SEGMENTS];
+	memcpy(ids, sess->display_zones.ipc_parts.display_id, sizeof(ids));
+	memcpy(rects, sess->display_zones.ipc_parts.rect, sizeof(rects));
+
+	for (uint32_t p = 0; p < n; p++) {
+		struct oxr_locate_segment o;
+		memset(&o, 0, sizeof(o));
+		o.ipc_zone_part = p + 1;
+		o.view_count = per_part;
+		o.side_effects = false;
+
+		XrView tmp[XRT_MAX_VIEWS];
+		for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+			tmp[v] = (XrView){.type = XR_TYPE_VIEW, .next = NULL};
+		}
+		XrViewState bare = {.type = XR_TYPE_VIEW_STATE, .next = NULL};
+		uint32_t got = 0;
+		sess->display_zones.ipc_parts.framed = 0;
+		XrResult ret = locate_views_one(log, sess, viewLocateInfo, &bare, XRT_MAX_VIEWS, &got, tmp, &o);
+		if (ret != XR_SUCCESS || sess->display_zones.ipc_parts.framed != p + 1) {
+			out->generation = 0;
+			out->partCountOutput = 0;
+			out->viewCountOutput = 0;
+			return ret;
+		}
+		XrDisplayZonePartDXR *dp = &out->parts[p];
+		dp->displayId = ids[p];
+		dp->rect = (XrRect2Di){{rects[p].offset.w, rects[p].offset.h}, {rects[p].extent.w, rects[p].extent.h}};
+		dp->firstView = p * per_part;
+		dp->viewCount = per_part;
+		for (uint32_t v = 0; v < per_part; v++) {
+			out->views[p * per_part + v].pose = tmp[v].pose;
+			out->views[p * per_part + v].fov = tmp[v].fov;
+		}
+	}
+	out->generation = gen;
+	return XR_SUCCESS;
+}
+
+//! Views per part: the locate's active view count (the mode's, within the session's set).
+static uint32_t
+locate_zone_part_view_count(struct oxr_session *sess, struct xrt_device *xdev)
+{
+	uint32_t per_part = sess->view_config_view_count != 0 ? sess->view_config_view_count : xdev->hmd->view_count;
+	if (per_part > xdev->hmd->view_count) {
+		per_part = xdev->hmd->view_count;
+	}
+	const uint32_t mode = xdev->hmd->active_rendering_mode_index;
+	if (mode < xdev->rendering_mode_count && xdev->rendering_modes[mode].view_count < per_part) {
+		per_part = xdev->rendering_modes[mode].view_count;
+	}
+	return per_part;
+}
 #endif // OXR_HAVE_DXR_display_zones
 
 XrResult
@@ -5001,6 +5120,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 	if (xdev == NULL || xdev->hmd == NULL || !locate_get_segment_metrics(sess, &m)) {
 		// The window is on one screen (or nothing segments it): the
 		// single-screen path, byte for byte.
+#ifdef OXR_HAVE_DXR_display_zones
+		sess->display_zones.ipc_parts.count = 0; // the service lists them afresh
+#endif
 		XrResult ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput,
 		                                viewCountOutput, views, NULL);
 		if (viewCapacityInput > 0 && ret == XR_SUCCESS) {
@@ -5008,6 +5130,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// NOT touched — only a splitting locate writes it.
 			const struct xrt_segment_view_routing none = {0};
 			locate_fill_bindings(sess, viewState, &none);
+#ifdef OXR_HAVE_DXR_display_zones
+			// A present-owner's straddling element: the service framed its one
+			// set and listed its parts (ADR-047 Amendment 10).
+			if (zone_parts != NULL && xdev != NULL && xdev->hmd != NULL &&
+			    sess->display_zones.ipc_parts.count >= 2) {
+				const XrDisplayZoneDXR *zone = OXR_GET_INPUT_FROM_CHAIN(
+				    viewLocateInfo, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+				ret = locate_zone_parts_ipc(log, sess, viewLocateInfo, zone,
+				                            locate_zone_part_view_count(sess, xdev), zone_parts);
+			}
+#endif
 		}
 		return ret;
 	}
@@ -5113,17 +5246,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// A straddling zone: its parts, one view set each, beside XrView[]
 			// (multi-screen § 8.1; PRIMARY_MULTIVIEW_DXR sessions too).
 			if (zone_parts != NULL && zone != NULL) {
-				uint32_t per_part = sess->view_config_view_count != 0 ? sess->view_config_view_count
-				                                                      : xdev->hmd->view_count;
-				if (per_part > xdev->hmd->view_count) {
-					per_part = xdev->hmd->view_count;
-				}
-				const uint32_t mode = xdev->hmd->active_rendering_mode_index;
-				if (mode < xdev->rendering_mode_count &&
-				    xdev->rendering_modes[mode].view_count < per_part) {
-					per_part = xdev->rendering_modes[mode].view_count;
-				}
-				ret = locate_zone_parts(log, sess, viewLocateInfo, &m, zone, per_part, zone_parts);
+				ret = locate_zone_parts(log, sess, viewLocateInfo, &m, zone,
+				                        locate_zone_part_view_count(sess, xdev), zone_parts);
 			}
 #endif
 		}

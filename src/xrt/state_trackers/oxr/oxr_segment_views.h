@@ -31,6 +31,8 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_limits.h"
 
+#include "util/u_segment_layout.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -133,35 +135,13 @@ uint32_t
 oxr_segment_views_majority(const struct xrt_segment_metrics *m);
 
 /*!
- * One segment placed in the reference frame.
- *
- * Frames are display spaces: origin at a screen's centre, +X right, +Y up,
- * metres. "own" is the segment's own screen, "ref" the majority screen's.
+ * The placement types live in aux (util/u_segment_layout.h, `u_segment_place`
+ * / `u_segment_layout`) so the IPC server, which cannot link the state
+ * tracker, frames a present-owner's zone parts with the same math
+ * (multi-screen § 8.1). These names are the state tracker's spelling of them.
  */
-struct oxr_segment_place
-{
-	float own_cx, own_cy; //!< Segment centre in its own screen's display space
-	float ref_cx, ref_cy; //!< Segment centre in the reference (majority) display space
-	float w_m, h_m;       //!< Segment physical size, its own screen's metres
-};
-
-/*!
- * Every segment of a table, placed in one frame.
- */
-struct oxr_segment_layout
-{
-	uint32_t count;
-	uint32_t majority;
-	struct oxr_segment_place seg[XRT_MAX_SEGMENTS];
-	//! Centre of the union of all segments in the reference frame — where the
-	//! whole window's centre sits, so a window-centred rig (XR_DXR_view_rig's
-	//! display rig) can be offset per segment.
-	float window_ref_cx, window_ref_cy;
-	//! Size of that union, reference metres: the whole window's extent. A
-	//! display rig maps the WINDOW's height to its virtual display height, so
-	//! each segment gets that height scaled by its share (one m2v for all).
-	float window_ref_w, window_ref_h;
-};
+#define oxr_segment_place u_segment_place
+#define oxr_segment_layout u_segment_layout
 
 /*!
  * Place every segment of @p m in the majority screen's display space.
@@ -310,10 +290,7 @@ oxr_zone_parts_budget_admit(struct oxr_zone_parts_budget *b, int64_t display_tim
 static inline float
 oxr_segment_views_vdh_scale(const struct oxr_segment_layout *l, uint32_t i)
 {
-	if (l == NULL || i >= l->count || l->window_ref_h <= 0.0f) {
-		return 1.0f;
-	}
-	return l->seg[i].h_m / l->window_ref_h;
+	return u_segment_vdh_scale(l, i);
 }
 
 /*!

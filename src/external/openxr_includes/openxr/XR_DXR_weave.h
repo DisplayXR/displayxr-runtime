@@ -330,7 +330,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 19
+#define XR_DXR_weave_SPEC_VERSION 20
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -373,6 +373,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
 // Spec v19 (#1884): per-screen parts of each weave rect + per-screen eyes.
 #define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR        ((XrStructureType)1004999292)
+// Spec v20 (multi-screen § 8): the screen partition this submit's views were painted with.
+#define XR_TYPE_WEAVE_SUBMIT_PAINTED_PARTITION_DXR ((XrStructureType)1004999293)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -1216,6 +1218,30 @@ typedef struct XrWeaveOutputRectPartsDXR {
     XrWeaveRectPartDXR      parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
     uint64_t                generation; //!< bumped on a segment-geometry change
 } XrWeaveOutputRectPartsDXR;
+
+/*!
+ * @brief The screen partition this submit's views were PAINTED with (spec v20).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. A caller that renders an element of a
+ * window spanning two 3D screens per part (XrDisplayZonePartsDXR from
+ * XR_DXR_display_zones v4: each part from its own screen's views) cut its parts
+ * at the seam of the screen table that locate saw. During a drag the window
+ * moves between that locate and this submit, so the seam the runtime cuts the
+ * weave at NOW sits a few pixels away from where the parts were painted: each
+ * screen's display processor would weave a sliver of the other screen's part.
+ *
+ * Pass the XrDisplayZonePartsDXR::generation the frame was located with: the
+ * runtime then crops each screen's input where the views were painted (its own
+ * record of that table), while still placing each screen's output where the
+ * window is now. 0 (or omitting the struct, or a generation the runtime no
+ * longer holds) crops at the live seam, the pre-v20 behaviour, which is exact
+ * at rest. Windows service; ignored elsewhere.
+ */
+typedef struct XrWeaveSubmitPaintedPartitionDXR {
+    XrStructureType          type;                //!< XR_TYPE_WEAVE_SUBMIT_PAINTED_PARTITION_DXR
+    const void* XR_MAY_ALIAS next;
+    uint64_t                 zonePartsGeneration; //!< XrDisplayZonePartsDXR::generation of the frame's locates
+} XrWeaveSubmitPaintedPartitionDXR;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);

@@ -1506,6 +1506,18 @@ void
 comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
 
 /*!
+ * XR_DXR_weave v20 (XrWeaveSubmitPaintedPartitionDXR): the screen-table
+ * generation the NEXT @ref comp_d3d11_service_weave_submit's per-part views were
+ * painted with (the `generation` of the table its zone-scoped locates saw,
+ * comp_d3d11_service_get_zone_weave_table). A per-screen weave then crops each
+ * screen's input at that table's seam (the #1883 painted partition), and keeps
+ * placing each screen's output at the live one. 0, or a generation no longer
+ * recorded, = the live seam. Per submit: consumed and reset by the submit.
+ */
+void
+comp_d3d11_service_weave_set_painted_generation(struct xrt_compositor *xc, uint64_t generation);
+
+/*!
  * XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): which lift rects of the last
  * @ref comp_d3d11_service_weave_submit got the depth cursor — bit i = the
  * submit's i-th lift binding (XrWeaveSubmitLiftRectsDXR::lifts[i]).
@@ -1576,34 +1588,44 @@ uint32_t
 comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc);
 
 /*!
- * The screen a zone-scoped locate of client @p xc must be framed against
- * (ADR-047 Amendment 4, addendum): when the window @p xc frames its locates
- * against is woven per screen and the screen holding most of the element
- * @p zone (window px; the whole element when it lies on one screen) is a
- * NON-primary screen of it (u_weave_zone_screen_segment, with the live
- * client size @p live_w x @p live_h), @p out is that window's per-screen table
- * and @p out_index the element's segment, whose eyes are predicted now from its
- * segment DP (the table's own, as of that weave, when the DP cannot answer).
+ * The per-screen table a zone-scoped locate of client @p xc is framed against,
+ * and which of its segments frames this locate (ADR-047 Amendment 4 addendum,
+ * Amendment 10).
+ *
+ * When the window @p xc frames its locates against is woven per screen and the
+ * table was cut from a window of the live client size @p live_w x @p live_h,
+ * @p out is that table and the function returns true; the caller can cut the
+ * element @p zone (window px) into its parts from it (u_weave_zone_part_table).
+ * @p out_frame_index is then:
+ *  - for @p zone_part = k + 1, the segment of part k of the zone, when the zone
+ *    straddles a seam and has that part (XrDisplayZonePartsDXR);
+ *  - otherwise the screen holding most of the element when that is a
+ *    NON-primary screen (u_weave_zone_screen_segment);
+ *  - else -1: keep the session's own (primary) framing.
+ * That one segment's eyes are predicted now from its segment DP (the table's
+ * own, as of that weave, when the DP cannot answer); every other segment keeps
+ * the eyes its weave published.
  *
  * The table is this client's own last weave's, else that of any present-owner
  * weaving the same window (the DisplayXR Browser locates from its browser
  * process and weaves from its GPU process: two sessions, one window); only a
  * table published within the last SVC_SEG_PUB_FRESH_NS counts.
  *
- * Cost: clients_mutex only, unless the element is on a non-primary screen
+ * Cost: clients_mutex only, unless a non-primary segment frames the locate
  * (then render_mutex too, for the fresh eyes). A window on one screen never
  * reaches the render thread's lock.
  *
- * @return true when the element is to be framed against out->seg[*out_index].
+ * @return false (no table, a resize in flight): the session's own framing, no parts.
  */
 bool
-comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
-                                         struct xrt_compositor *xc,
-                                         const struct xrt_rect *zone,
-                                         uint32_t live_w,
-                                         uint32_t live_h,
-                                         struct xrt_segment_metrics *out,
-                                         uint32_t *out_index);
+comp_d3d11_service_get_zone_weave_table(struct xrt_system_compositor *xsysc,
+                                        struct xrt_compositor *xc,
+                                        const struct xrt_rect *zone,
+                                        uint32_t live_w,
+                                        uint32_t live_h,
+                                        uint32_t zone_part,
+                                        struct xrt_segment_metrics *out,
+                                        int32_t *out_frame_index);
 
 /*
  * XR_DXR_lift (ADR-042) — 2D→3D conversion streams. SYSTEM-level (a stream is

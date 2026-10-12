@@ -610,5 +610,7 @@ pixels into a handback texture on its own IPC thread. That submit is segmented b
 - **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
   screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
   reported unsegmented (one eye set); a straddling element's one view set is framed from the
-  screen holding most of it (ADR-047 Amendment 10), and its per-part views
-  (`XrDisplayZonePartsDXR`) are not filled server-side yet (`docs/roadmap/multi-screen.md` § 8).
+  screen holding most of it (ADR-047 Amendment 10). Its per-part views
+  (`XrDisplayZonePartsDXR`) are framed here too, one locate per part, and a submit that passes
+  the table generation it was painted with (`XR_DXR_weave` v20) is cropped per screen at that
+  table's seam (`weave_seg_painted`, keyed by generation).

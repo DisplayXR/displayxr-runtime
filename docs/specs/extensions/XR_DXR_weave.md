@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 17 |
+| **Spec Version** | 20 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
@@ -1064,8 +1064,31 @@ window is woven per screen and the zone rect lies wholly on a non-primary screen
 frames the locate from **that screen's** eyes and nominal viewer, with the zone placed on that
 screen's physical rectangle (ADR-047 Amendment 4 addendum). `XrViewDisplayRawDXR` then reports
 that screen's eyes and the zone's `canvasRectPx` relative to that screen. A zone that straddles a
-seam is still located from the primary screen; rendering it per part needs a view set per part,
-which no locate returns today.
+seam is located from the screen holding most of it, and a caller that chains
+`XrDisplayZonePartsDXR` (`XR_DXR_display_zones` v4) also gets one view set per part, each from its
+own screen (ADR-047 Amendment 10). Pass that locate's `generation` back at submit (§5h).
+
+## 5h. The partition a submit was painted with (v20)
+
+```c
+#define XR_TYPE_WEAVE_SUBMIT_PAINTED_PARTITION_DXR ((XrStructureType)1004999293)
+
+typedef struct XrWeaveSubmitPaintedPartitionDXR {  // chained on XrWeaveSubmitInfoDXR::next
+    XrStructureType          type;
+    const void* XR_MAY_ALIAS next;
+    uint64_t                 zonePartsGeneration;  // XrDisplayZonePartsDXR::generation of the frame's locates
+} XrWeaveSubmitPaintedPartitionDXR;
+```
+
+A caller that renders a straddling element per part cuts the parts at the seam of the screen
+table its locate saw. During a drag the window moves between that locate and the submit, so the
+seam the runtime weaves at is a few pixels away from where the parts were painted, and each
+screen's display processor would weave a sliver of the other screen's part (the #1883 sliver, on
+the weave path). With the struct, the Windows service crops each screen's input at the seam of
+the table with that generation (it keeps the last few published tables' partitions), and still
+places each screen's output where the window is now. `0`, an omitted struct, or a generation no
+longer held crops at the live seam: exact at rest, and the pre-v20 behaviour. Ignored off the
+Windows service. No gate is needed to send it: an older runtime skips the struct.
 
 ## 6. Version history
 
@@ -1099,6 +1122,9 @@ it keeps such an overlay off the wire there instead.
 
 **v19 needs no gate to send**: an older runtime skips the struct and it stays zero, which reads as
 "one display processor, use the base eyes".
+| 20 | `XrWeaveSubmitPaintedPartitionDXR` (in, per submit): the screen-table generation a submit's per-part views were painted with, so a per-screen weave crops each screen's input where it was painted (§5h, multi-screen § 8, ADR-047 Amendment 10). Windows service; ignored elsewhere. |
+
+**v20 needs no gate to send**: an older runtime skips the struct and crops at the live seam.
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return

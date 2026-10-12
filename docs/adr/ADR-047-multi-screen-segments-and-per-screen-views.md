@@ -525,5 +525,11 @@ Design and David's decisions: `docs/roadmap/multi-screen.md` § 8 (displayxr-bro
 - **The seam is accepted** as for windows: two viewers, no blending.
 - **Where it runs.** In-process segmenting compositors and direct clients of the D3D11 service
   (Amendment 3) locate the parts client-side from the segment table, so no wire change. A
-  present-owner's element locates are framed server-side (Amendment 4 addendum); its parts, and
-  the weave crop at the painted partition, are the stacked follow-up.
+  present-owner's element locates are framed server-side (Amendment 4 addendum): the zone's
+  locate reply lists the parts, the client asks for each part (`ipc_view_rig_info::zone_part`),
+  and the server frames it in that screen's own space (`u_weave_segment_window_metrics` rebased
+  to the part, that screen's eyes) with the shared `u_segment_layout` rig share and offset. The
+  layout math moved to aux (`util/u_segment_layout.h`) for that.
+- **Painted partition on the weave path.** A present-owner passes the table generation its
+  locates saw at submit (`XR_DXR_weave` v20); the service keeps the last tables' partitions by
+  generation and crops each screen's input there (the #1883 rule for the weave path).

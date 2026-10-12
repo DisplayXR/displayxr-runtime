@@ -77,6 +77,11 @@ struct ipc_client_compositor
 {
 	struct xrt_compositor_native base;
 
+	//! XR_DXR_weave v20: the next weave submit's painted partition (generation),
+	//! set by comp_ipc_client_compositor_weave_set_painted_generation, consumed
+	//! (reset to 0) by that submit.
+	uint64_t weave_painted_generation_next;
+
 	//! Should be turned into its own object.
 	struct xrt_system_compositor system;
 
@@ -740,6 +745,15 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
 	args->overlay_filter_strength = have_overlay ? overlay_filter_strength : -1.0f;
 }
 
+void
+comp_ipc_client_compositor_weave_set_painted_generation(struct xrt_compositor *xc, uint64_t generation)
+{
+	struct ipc_client_compositor *icc = xc != NULL ? ipc_client_compositor(xc) : NULL;
+	if (icc != NULL) {
+		icc->weave_painted_generation_next = generation;
+	}
+}
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,
@@ -802,6 +816,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
 	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
 	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
+	// v20: per submit, no latch.
+	args.painted_generation = icc->weave_painted_generation_next;
+	icc->weave_painted_generation_next = 0;
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;

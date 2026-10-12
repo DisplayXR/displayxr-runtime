@@ -232,10 +232,13 @@ query). Today at most 2 parts (`XRT_MAX_SEGMENTS`) × the per-set view count.
 for every view configuration.
 
 **Where it is filled.** In-process segmenting compositors and direct clients of
-the D3D11 service (the parts are located client-side from the service's segment
-table). For an `XR_DXR_weave` present-owner (the DisplayXR Browser), whose
-element locates are framed by the service, `partCountOutput` stays 0 until the
-service-side parts land (`docs/roadmap/multi-screen.md` § 8.1).
+the D3D11 service locate the parts client-side from the service's segment table.
+An `XR_DXR_weave` present-owner (the DisplayXR Browser), whose element locates are
+framed by the service, gets them from the service: the zone's locate lists the
+parts, then the runtime asks the service for each part's views (one more round
+trip per part, only for a straddling zone). A present-owner passes this struct's
+`generation` back at its weave submit (`XrWeaveSubmitPaintedPartitionDXR`,
+`XR_DXR_weave` v20), so each screen's part is woven where it was painted.
 
 ### 3.4 XrDisplayZonesFrameEndInfoDXR — per-frame wish reference
 
