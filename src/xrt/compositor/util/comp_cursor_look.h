@@ -87,6 +87,19 @@ comp_cursor_look_backing_scale(void);
 void
 comp_cursor_look_fini(struct comp_cursor_look *look);
 
+struct u_cursor_draw_request;
+
+/*!
+ * Verification hook (#1952): should every compositor refuse this request?
+ * DXR_CURSOR_DRAW_REFUSE=1 refuses always; DXR_CURSOR_DRAW_REFUSE_PERIOD_MS=N
+ * refuses during the first half of every N ms (a square wave, to watch
+ * willDraw flip both ways in one run). Both read once. When it refuses it
+ * reports U_CURSOR_DRAW_REFUSAL_FORCED on @p req and returns true: the caller
+ * then draws nothing. Called only for a consumed request (zero cost otherwise).
+ */
+bool
+comp_cursor_draw_debug_refuse(const struct u_cursor_draw_request *req);
+
 
 /*
  *

@@ -496,6 +496,83 @@ u_cursor_draw_should_draw(const struct u_cursor_draw_request *req)
 	return true;
 }
 
+void
+u_cursor_draw_report_drew(const struct u_cursor_draw_request *req)
+{
+	if (req == NULL || req->report == NULL) {
+		return;
+	}
+	req->report->answered = true;
+	req->report->drew = true;
+	req->report->reason = U_CURSOR_DRAW_REFUSAL_NONE;
+}
+
+void
+u_cursor_draw_report_refused(const struct u_cursor_draw_request *req, enum u_cursor_draw_refusal reason)
+{
+	if (req == NULL || req->report == NULL) {
+		return;
+	}
+	req->report->answered = true;
+	req->report->drew = false;
+	req->report->reason = reason == U_CURSOR_DRAW_REFUSAL_NONE ? U_CURSOR_DRAW_REFUSAL_NOT_REACHED : reason;
+}
+
+const char *
+u_cursor_draw_refusal_name(enum u_cursor_draw_refusal reason)
+{
+	switch (reason) {
+	case U_CURSOR_DRAW_REFUSAL_NONE: return "none";
+	case U_CURSOR_DRAW_REFUSAL_NOT_REACHED: return "the frame never reached the cursor pass";
+	case U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST: return "invalid request";
+	case U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH: return "zones frame / zone request mismatch";
+	case U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE: return "the zone cannot be placed in the target";
+	case U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN: return "multi-screen routed frame";
+	case U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO: return "no display size / canvas height";
+	case U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE: return "the sprite swapchain image cannot be sampled";
+	case U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK: return "the default look could not be built or uploaded";
+	case U_CURSOR_DRAW_REFUSAL_NO_PIPELINE: return "the cursor pipeline could not be created";
+	case U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS: return "no compose pass to draw into";
+	case U_CURSOR_DRAW_REFUSAL_NO_TILES: return "no tile to draw into";
+	case U_CURSOR_DRAW_REFUSAL_FORCED: return "forced (DXR_CURSOR_DRAW_REFUSE)";
+	default: return "unknown";
+	}
+}
+
+void
+u_cursor_draw_report_begin(struct u_cursor_draw_report *report)
+{
+	report->answered = false;
+	report->drew = false;
+	report->reason = U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+}
+
+bool
+u_cursor_draw_latch_record(struct u_cursor_draw_latch *latch, const struct u_cursor_draw_report *report)
+{
+	if (report->answered && report->drew) {
+		latch->refused = false;
+		return false;
+	}
+	latch->refused = true;
+	enum u_cursor_draw_refusal reason = report->answered ? report->reason : U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	if (reason <= U_CURSOR_DRAW_REFUSAL_NONE || reason >= U_CURSOR_DRAW_REFUSAL_COUNT) {
+		reason = U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	}
+	const uint32_t bit = 1u << (uint32_t)reason;
+	if ((latch->warned & bit) != 0) {
+		return false;
+	}
+	latch->warned |= bit;
+	return true;
+}
+
+bool
+u_cursor_draw_latch_allows(const struct u_cursor_draw_latch *latch)
+{
+	return !latch->refused;
+}
+
 bool
 u_cursor_draw_project(const struct u_cursor_depth_view *view, const struct xrt_vec3 *p, float out_xy[2])
 {

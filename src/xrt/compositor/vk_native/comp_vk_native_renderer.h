@@ -343,6 +343,8 @@ comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *renderer
  * cursor, resolved by the compositor - where the sprite's corners land in
  * each view's tile and which image to sample. Zero-initialised = no cursor.
  */
+struct u_cursor_draw_request;
+
 struct comp_vk_native_cursor_draw
 {
 	//! Draw at the next comp_vk_native_renderer_draw only.
@@ -368,6 +370,12 @@ struct comp_vk_native_cursor_draw
 	//! The source holds premultiplied alpha (the default look) rather than
 	//! straight (the app's sprite, per the spec).
 	bool premultiplied;
+	//! #1952: the state tracker's request, for the renderer to report what
+	//! it did (u_cursor_draw_report_drew / _refused). Only its report
+	//! fields are used here.
+	const struct u_cursor_draw_request *req;
+	//! #1952: run every check, draw nothing (the request is report-only).
+	bool report_only;
 };
 
 /*!

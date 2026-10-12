@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1509,4 +1510,192 @@ TEST_CASE("cursor_draw: unblend - monochrome AND/XOR cursors, inverted pixels op
 	// MUTANT: taking alpha from GDI's byte 3 (undefined for these cursors)
 	// would make every one of them invisible - byte 3 is 0 in every input.
 	CHECK(out[3] == 255);
+}
+
+
+/*
+ *
+ * #1952: compositor refusals make willDraw false.
+ *
+ */
+
+namespace {
+
+/*!
+ * The state tracker's per-frame flow, reduced to the latch: a locate reports
+ * willDraw from the latch, xrEndFrame hands a request (report-only when the
+ * locate said false), the compositor answers, the answer is folded in.
+ */
+struct LatchSim
+{
+	u_cursor_draw_latch latch{};
+	u_cursor_draw_report report{};
+	int warns = 0;
+
+	//! One frame. @p refuse: what the compositor will do (NONE = draw).
+	//! Returns {willDraw reported by this frame's locate, sprite drawn}.
+	std::pair<bool, bool>
+	frame(u_cursor_draw_refusal refuse)
+	{
+		const bool will_draw = u_cursor_draw_latch_allows(&latch);
+
+		u_cursor_draw_request req{};
+		req.requested = true;
+		req.report_only = !will_draw;
+		u_cursor_draw_report_begin(&report);
+		req.report = &report;
+
+		// The compositor.
+		bool drew_pixels = false;
+		if (refuse != U_CURSOR_DRAW_REFUSAL_NONE) {
+			if (refuse != U_CURSOR_DRAW_REFUSAL_NOT_REACHED) { // NOT_REACHED: says nothing
+				u_cursor_draw_report_refused(&req, refuse);
+			}
+		} else {
+			drew_pixels = !req.report_only;
+			u_cursor_draw_report_drew(&req);
+		}
+
+		if (u_cursor_draw_latch_record(&latch, &report)) {
+			warns++;
+		}
+		return {will_draw, drew_pixels};
+	}
+};
+
+} // namespace
+
+TEST_CASE("cursor_draw: refusal latch - a refusal makes the NEXT willDraw false, a draw restores it")
+{
+	LatchSim s;
+	// A fresh latch allows (no request ever = nothing changes).
+	CHECK(u_cursor_draw_latch_allows(&s.latch));
+
+	auto f0 = s.frame(U_CURSOR_DRAW_REFUSAL_NONE);
+	CHECK(f0.first);
+	CHECK(f0.second);
+
+	// The compositor refuses: THIS frame's locate already said true (the
+	// one-frame lag is inherent - the refusal is only known at the commit),
+	// the next one says false.
+	auto f1 = s.frame(U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+	CHECK(f1.first);
+	CHECK_FALSE(f1.second);
+	CHECK_FALSE(u_cursor_draw_latch_allows(&s.latch));
+
+	// Sustained refusal: stays false, no oscillation, nothing drawn.
+	for (int i = 0; i < 5; i++) {
+		auto f = s.frame(U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+		CHECK_FALSE(f.first);
+		CHECK_FALSE(f.second);
+	}
+
+	// The refusal clears: the report-only probe frame draws NOTHING (the app
+	// is showing its OS cursor - two cursors otherwise) but restores true.
+	auto f7 = s.frame(U_CURSOR_DRAW_REFUSAL_NONE);
+	CHECK_FALSE(f7.first);
+	CHECK_FALSE(f7.second);
+	CHECK(u_cursor_draw_latch_allows(&s.latch));
+
+	auto f8 = s.frame(U_CURSOR_DRAW_REFUSAL_NONE);
+	CHECK(f8.first);
+	CHECK(f8.second);
+
+	// One WARN for the whole episode.
+	CHECK(s.warns == 1);
+}
+
+TEST_CASE("cursor_draw: refusal latch - willDraw follows the previous commit, sprite only while true")
+{
+	// Any refuse/draw pattern: willDraw is exactly the previous commit's
+	// outcome; the sprite is never drawn while willDraw is false (no double
+	// cursor) and always drawn while it is true and the compositor can.
+	LatchSim s;
+	const u_cursor_draw_refusal pattern[] = {
+	    U_CURSOR_DRAW_REFUSAL_NONE, U_CURSOR_DRAW_REFUSAL_FORCED,      U_CURSOR_DRAW_REFUSAL_NONE,
+	    U_CURSOR_DRAW_REFUSAL_NONE, U_CURSOR_DRAW_REFUSAL_NO_TILES,    U_CURSOR_DRAW_REFUSAL_NO_TILES,
+	    U_CURSOR_DRAW_REFUSAL_NONE, U_CURSOR_DRAW_REFUSAL_NOT_REACHED, U_CURSOR_DRAW_REFUSAL_NONE,
+	    U_CURSOR_DRAW_REFUSAL_NONE, U_CURSOR_DRAW_REFUSAL_NONE,        U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK,
+	    U_CURSOR_DRAW_REFUSAL_NONE, U_CURSOR_DRAW_REFUSAL_NONE,
+	};
+	bool prev_refused = false;
+	for (u_cursor_draw_refusal r : pattern) {
+		auto f = s.frame(r);
+		if (!f.first) {
+			CHECK_FALSE(f.second);
+		}
+		if (f.first && r == U_CURSOR_DRAW_REFUSAL_NONE) {
+			CHECK(f.second);
+		}
+		CHECK(f.first == !prev_refused);
+		prev_refused = r != U_CURSOR_DRAW_REFUSAL_NONE;
+	}
+}
+
+TEST_CASE("cursor_draw: refusal latch - a silent commit counts as a refusal (NOT_REACHED)")
+{
+	u_cursor_draw_latch latch{};
+	u_cursor_draw_report report;
+	u_cursor_draw_report_begin(&report);
+	// The compositor never got to its cursor pass and wrote nothing.
+	CHECK(u_cursor_draw_latch_record(&latch, &report));
+	CHECK_FALSE(u_cursor_draw_latch_allows(&latch));
+	CHECK((latch.warned & (1u << U_CURSOR_DRAW_REFUSAL_NOT_REACHED)) != 0);
+}
+
+TEST_CASE("cursor_draw: refusal latch - one WARN per distinct reason, never per frame")
+{
+	u_cursor_draw_latch latch{};
+	u_cursor_draw_report report{};
+	u_cursor_draw_request req{};
+	req.report = &report;
+
+	u_cursor_draw_report_refused(&req, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
+	CHECK(u_cursor_draw_latch_record(&latch, &report));
+	CHECK_FALSE(u_cursor_draw_latch_record(&latch, &report));
+	CHECK_FALSE(u_cursor_draw_latch_record(&latch, &report));
+
+	// A draw in between does not re-arm the WARN for the same reason.
+	u_cursor_draw_report_drew(&req);
+	CHECK_FALSE(u_cursor_draw_latch_record(&latch, &report));
+	u_cursor_draw_report_refused(&req, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
+	CHECK_FALSE(u_cursor_draw_latch_record(&latch, &report));
+
+	// A new reason warns once.
+	u_cursor_draw_report_refused(&req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+	CHECK(u_cursor_draw_latch_record(&latch, &report));
+	CHECK_FALSE(u_cursor_draw_latch_record(&latch, &report));
+}
+
+TEST_CASE("cursor_draw: refusal report - the last word of the commit wins; no listener is a no-op")
+{
+	u_cursor_draw_report report;
+	u_cursor_draw_report_begin(&report);
+	CHECK_FALSE(report.answered);
+	CHECK(report.reason == U_CURSOR_DRAW_REFUSAL_NOT_REACHED);
+
+	u_cursor_draw_request req{};
+	req.report = &report;
+	u_cursor_draw_report_drew(&req);
+	CHECK((report.answered && report.drew));
+	// A later refusal in the same commit (e.g. the renderer after the
+	// compositor resolved the request) overrides.
+	u_cursor_draw_report_refused(&req, U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS);
+	CHECK((report.answered && !report.drew && report.reason == U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS));
+	// Refusing "for no reason" is still a refusal.
+	u_cursor_draw_report_refused(&req, U_CURSOR_DRAW_REFUSAL_NONE);
+	CHECK((!report.drew && report.reason == U_CURSOR_DRAW_REFUSAL_NOT_REACHED));
+
+	// No listener (report == NULL, every zero-initialised request): no-op,
+	// no crash.
+	u_cursor_draw_request quiet{};
+	u_cursor_draw_report_drew(&quiet);
+	u_cursor_draw_report_refused(&quiet, U_CURSOR_DRAW_REFUSAL_FORCED);
+	u_cursor_draw_report_drew(nullptr);
+	CHECK(quiet.report == nullptr);
+
+	// Every reason has a name.
+	for (int r = 0; r < U_CURSOR_DRAW_REFUSAL_COUNT; r++) {
+		CHECK(strcmp(u_cursor_draw_refusal_name((u_cursor_draw_refusal)r), "unknown") != 0);
+	}
 }

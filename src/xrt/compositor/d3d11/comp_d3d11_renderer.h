@@ -222,6 +222,8 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
  * views. A sprite that is not `_SRGB` (scene-linear, owes the encode) makes
  * the frame compose.
  */
+struct u_cursor_draw_request;
+
 struct comp_d3d11_cursor_quads
 {
 	//! Tiles to draw (view i -> tile i); 0 = no cursor this frame.
@@ -241,6 +243,12 @@ struct comp_d3d11_cursor_quads
 	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
 	//! STRAIGHT (the spec). The renderer blends each accordingly.
 	const struct comp_cursor_look *look;
+	//! #1952: the state tracker's request, for the renderer to report what
+	//! it did (u_cursor_draw_report_drew / _refused). Must outlive the
+	//! window-space pass; only its report fields are used here.
+	const struct u_cursor_draw_request *req;
+	//! #1952: run every check, draw nothing (the request is report-only).
+	bool report_only;
 };
 
 /*!

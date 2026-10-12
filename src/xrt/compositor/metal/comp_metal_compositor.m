@@ -4140,20 +4140,25 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 {
 	// #1949: a zone request's views are zone-normalised - re-express them in
 	// the tile the way the zone's own layer is placed, and clip to the zone.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
 	struct u_cursor_draw_request zreq = *req;
 	float clip[4];
 	if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return;
 	}
 	req = &zreq;
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 
 	if (!metal_cursor_ensure_pipelines(c)) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
 		return;
 	}
 	// Panel pixel pitch (metres per backing pixel) and the OS point.
 	if (c->sys_info == NULL || c->sys_info->display_pixel_height == 0 || !(c->sys_info->display_height_m > 0.0f) ||
 	    canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return;
 	}
 	const float m_per_px = c->sys_info->display_height_m / (float)c->sys_info->display_pixel_height;
@@ -4172,6 +4177,7 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		struct comp_metal_swapchain *msc = metal_swapchain(req->image);
 		if (req->image_index >= msc->image_count || msc->images[req->image_index] == nil ||
 		    msc->info.height == 0) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return;
 		}
 		// Sampled as declared on the _sRGB path, non-decoding on the
@@ -4185,6 +4191,7 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		flip_v = c->source_is_gl;
 	} else {
 		if (!metal_cursor_update_default(c, backing_scale)) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return;
 		}
 		src = metal_layer_source_view(c->cursor_draw.default_tex, 0, compose_linear);
@@ -4195,6 +4202,10 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		premul = true; // CGBitmapContext output
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units
+	if (src == nil) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+		return;
+	}
 
 	[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
 	[encoder setDepthStencilState:c->depth_stencil_state_disabled];
@@ -4203,7 +4214,7 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 
 	const uint32_t tiles = atlas_cols * atlas_rows;
 	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
-	if (!c->cursor_draw.announced) {
+	if (!c->cursor_draw.announced && !req->report_only) {
 		c->cursor_draw.announced = true;
 		// The views actually drawn (= atlas tiles in use), not the locate's
 		// view count: a 2-view app on a 4-view-capable display draws 2.
@@ -4213,6 +4224,7 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 	}
 	const uint32_t att_w = (uint32_t)c->atlas_texture.width;
 	const uint32_t att_h = (uint32_t)c->atlas_texture.height;
+	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		const uint32_t ox = (i % atlas_cols) * atlas_view_w;
 		const uint32_t oy = (i / atlas_cols) * atlas_view_h;
@@ -4235,6 +4247,10 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		if (cx1 <= cx0 || cy1 <= cy0) {
 			continue;
 		}
+		drawn++;
+		if (req->report_only) {
+			continue; // #1952: the app shows its OS cursor this frame
+		}
 		MTLScissorRect sr = {ox + cx0, oy + cy0, cx1 - cx0, cy1 - cy0};
 		[encoder setScissorRect:sr];
 
@@ -4255,6 +4271,11 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 	}
 	[src release];
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(req);
+	} else {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+	}
 
 	// Hand the encoder back with a full-attachment scissor.
 	MTLScissorRect full = {0, 0, att_w, att_h};
@@ -4298,7 +4319,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->cursor_draw.req.requested) {
 		cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
-		cursor_pending = u_cursor_draw_should_draw(&cursor_req);
+		// #1952: a refusal is reported (the request's report starts out as
+		// "never reached the cursor pass", so an early-out frame refused too).
+		if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
+			cursor_pending = true;
+		}
 	}
 
 	// Frame timing for HUD
@@ -5419,6 +5446,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// A zones frame draws only a zone request (the state tracker
 			// sends nothing else there) and vice versa; belt and braces.
 			if (zones_frame != cursor_req.zone_valid) {
+				u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
 				if (!c->cursor_draw.warned_zones) {
 					c->cursor_draw.warned_zones = true;
 					U_LOG_W("cursor_draw: zones frame / zone request mismatch - cursor not drawn "

@@ -4709,7 +4709,10 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 {
 	// A routed (multi-screen) frame's tiles are per-segment mosaics; the
 	// per-view map is for whole tiles.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
 	if (c->eff_layout.route_count > 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
 		if (!c->cursor_draw.warned_routed) {
 			c->cursor_draw.warned_routed = true;
 			U_LOG_W("cursor_draw [d3d12]: multi-screen routed frame - cursor not drawn (one-time warning)");
@@ -4721,6 +4724,7 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	// does. Skip only on a mismatch - the state tracker never sends one;
 	// belt and braces.
 	if (c->zones_frame != req_in->zone_valid) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
 		if (!c->cursor_draw.warned_zones) {
 			c->cursor_draw.warned_zones = true;
 			U_LOG_W(
@@ -4735,12 +4739,14 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	// clips to the whole tile.
 	struct u_cursor_draw_request zreq = *req_in;
 	if (!u_cursor_draw_into_zone(&zreq, tgt_width, tgt_height, out->clip)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return false;
 	}
 	const struct u_cursor_draw_request *req = &zreq;
 	// Panel pixel pitch (metres per pixel): every DisplayXR process is per-
 	// monitor DPI aware, so window and panel pixels are the same pixels.
 	if (metrics == nullptr || metrics->display_pixel_height == 0 || !(metrics->display_height_m > 0.0f)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
 	const float m_per_px = metrics->display_height_m / (float)metrics->display_pixel_height;
@@ -4749,6 +4755,7 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	const uint32_t canvas_px_h =
 	    u_cursor_draw_canvas_px_h(req, (eff_canvas->valid && eff_canvas->h > 0) ? eff_canvas->h : tgt_height);
 	if (canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
 	const float canvas_h_m = (float)canvas_px_h * m_per_px;
@@ -4765,6 +4772,7 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 		uint32_t sw = 0, sh = 0;
 		comp_d3d12_swapchain_get_dimensions(req->image, &sw, &sh);
 		if (sw == 0 || sh == 0) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
 			return false;
 		}
 		aspect = (float)sw / (float)sh;
@@ -4779,6 +4787,7 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 		// Shared with every backend (comp_cursor_look): the OS cursor
 		// mirror on Windows, at this window's DPI, else the arrow.
 		if (!comp_cursor_look_update(&c->cursor_draw.look, (float)dpi / 96.0f)) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
 			return false;
 		}
 		const struct comp_cursor_look *look = &c->cursor_draw.look;
@@ -4791,8 +4800,13 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units (canvas heights at t)
 	if (!(height > 0.0f) || !std::isfinite(height)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
 		return false;
 	}
+	// The renderer reports the rest (drew, no pipeline, no sprite view, no
+	// tile) through the caller's request, which outlives the passes.
+	out->req = req_in;
+	out->report_only = req_in->report_only;
 	out->count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
 	for (uint32_t i = 0; i < out->count; i++) {
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
@@ -4839,7 +4853,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->cursor_draw.req.requested) {
 		cursor_req = c->cursor_draw.req;
 		c->cursor_draw.req.requested = false;
-		cursor_pending = u_cursor_draw_should_draw(&cursor_req);
+		// #1952: a refusal is reported (the request's report starts out as
+		// "never reached the cursor pass", so an early-out frame refused too).
+		if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
+			cursor_pending = true;
+		}
 	}
 
 	// Get predicted eye positions

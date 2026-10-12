@@ -475,6 +475,57 @@ u_cursor_depth_point_from_depth_sample(const struct u_cursor_depth_view *view,
 struct xrt_swapchain;
 
 /*!
+ * Why a compositor drew no cursor for a request it was handed (#1952). The
+ * state tracker checks everything it can see before it hands a request over
+ * (u_cursor_draw_placement_drawable); these are the reasons only the
+ * compositor can see.
+ */
+enum u_cursor_draw_refusal
+{
+	U_CURSOR_DRAW_REFUSAL_NONE = 0,
+	//! The commit consumed nothing, or never reached its cursor pass (an
+	//! early-out frame, a path with no cursor pass). The state tracker's
+	//! default, so a compositor that says nothing has refused.
+	U_CURSOR_DRAW_REFUSAL_NOT_REACHED,
+	//! The request failed u_cursor_draw_should_draw() compositor-side.
+	U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST,
+	//! A zones frame with a non-zone request, or the reverse.
+	U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH,
+	//! The zone rect cannot be placed in the target (u_cursor_draw_into_zone).
+	U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE,
+	//! A multi-screen routed frame: a tile is a per-segment mosaic.
+	U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN,
+	//! No panel size / pixel pitch, or no canvas height, to size the sprite.
+	U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO,
+	//! The app's sprite swapchain image cannot be sampled (empty, layered
+	//! where the backend cannot sample layers, or no view of it).
+	U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE,
+	//! The default look could not be built or uploaded.
+	U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK,
+	//! The cursor shaders / pipeline / descriptors could not be created.
+	U_CURSOR_DRAW_REFUSAL_NO_PIPELINE,
+	//! The frame took a path that has no compose pass to draw into
+	//! (zero-copy, or a compose pass that is unavailable).
+	U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS,
+	//! No tile (or no tile area inside the clip) to draw into.
+	U_CURSOR_DRAW_REFUSAL_NO_TILES,
+	//! DXR_CURSOR_DRAW_REFUSE / _PERIOD_MS (verification hook).
+	U_CURSOR_DRAW_REFUSAL_FORCED,
+	U_CURSOR_DRAW_REFUSAL_COUNT,
+};
+
+/*!
+ * A compositor's answer to one request: drew (or, for a report-only request,
+ * would have drawn), or refused and why. Zero-initialised = no answer.
+ */
+struct u_cursor_draw_report
+{
+	bool answered;
+	bool drew;
+	enum u_cursor_draw_refusal reason; //!< meaningful when !drew
+};
+
+/*!
  * One view's map from sprite space to its tile, in tile-normalised
  * coordinates (origin top-left, x right, y DOWN; 0..1 spans the tile).
  */
@@ -527,6 +578,23 @@ struct u_cursor_draw_request
 	//! The zone rect as submitted, client-window pixels, origin top-left -
 	//! the same space every compositor places XRT_LAYER_ZONE_3D layers in.
 	struct xrt_rect zone_rect;
+
+	/*!
+	 * #1952: where the compositor reports what it did with THIS request
+	 * (u_cursor_draw_report_drew / _refused), during the commit that
+	 * consumes it. Owned by the state tracker, which outlives the commit.
+	 * NULL = nobody is listening.
+	 */
+	struct u_cursor_draw_report *report;
+	/*!
+	 * #1952: run every check, report the outcome, but draw nothing. The
+	 * locate already told the app willDraw = false (an earlier frame was
+	 * refused), so the app shows its OS cursor; drawing the sprite too
+	 * would show two cursors. Probing instead of skipping is what lets a
+	 * frame that WOULD draw restore willDraw = true without the report
+	 * oscillating frame to frame.
+	 */
+	bool report_only;
 };
 
 /*!
@@ -535,6 +603,58 @@ struct u_cursor_draw_request
  */
 bool
 u_cursor_draw_should_draw(const struct u_cursor_draw_request *req);
+
+/*!
+ * #1952, compositor side: the request was drawn (or, report-only, would have
+ * been). No-op for a request nobody listens to.
+ */
+void
+u_cursor_draw_report_drew(const struct u_cursor_draw_request *req);
+
+/*!
+ * #1952, compositor side: the request was refused for @p reason. No-op for a
+ * request nobody listens to. A later call for the same request overwrites an
+ * earlier one, so the last word of the commit is what the state tracker sees.
+ */
+void
+u_cursor_draw_report_refused(const struct u_cursor_draw_request *req, enum u_cursor_draw_refusal reason);
+
+//! A short name for @p reason (logs).
+const char *
+u_cursor_draw_refusal_name(enum u_cursor_draw_refusal reason);
+
+/*!
+ * #1952, state-tracker side: the willDraw latch for compositor refusals.
+ * Zero-initialise. A refusal latches it (the next locate reports willDraw =
+ * false); a commit that drew - or, report-only, would have - clears it.
+ */
+struct u_cursor_draw_latch
+{
+	bool refused;
+	//! Reasons already warned about (bit = enum value): one WARN per reason.
+	uint32_t warned;
+};
+
+/*!
+ * Arm @p report before handing a request over: unanswered, and NOT_REACHED
+ * if read as is - a commit that never gets to its cursor pass refused.
+ */
+void
+u_cursor_draw_report_begin(struct u_cursor_draw_report *report);
+
+/*!
+ * Fold one commit's @p report into the latch. An unanswered report counts as
+ * a NOT_REACHED refusal (u_cursor_draw_report_begin).
+ *
+ * @return true if this is the first refusal for its reason: the caller logs
+ *         one WARN (never per frame).
+ */
+bool
+u_cursor_draw_latch_record(struct u_cursor_draw_latch *latch, const struct u_cursor_draw_report *report);
+
+//! May the next locate report willDraw = true, as far as the compositor knows?
+bool
+u_cursor_draw_latch_allows(const struct u_cursor_draw_latch *latch);
 
 /*!
  * Project a point (in the space of the view's pose) into the view's tile.
