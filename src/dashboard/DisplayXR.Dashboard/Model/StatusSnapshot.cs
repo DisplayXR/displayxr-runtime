@@ -28,7 +28,22 @@ public sealed record StatusWarning(string Code, WarningLevel Level, string Text)
         new(e.Str("code", "?"), ParseLevel(e.Str("level", "info")), e.Str("text"));
 }
 
-public sealed record Generation(ulong Topology, ulong Status);
+/// <summary>The snapshot's counters; <c>Conversion</c> (ADR-053) is 0 from a CLI that predates it.</summary>
+public sealed record Generation(ulong Topology, ulong Status, ulong Conversion = 0);
+
+/// <summary>
+/// One conversion provider (ADR-053, <c>conv_providers[]</c>): a 2D→3D provider plug-in or
+/// the built-in adapter over a display plug-in's lift slots. Names are shown verbatim.
+/// </summary>
+public sealed record ConvProvider(string Id, string Name, string Vendor, string Version, string Load, string Hosting,
+                                  string Status, string Hint, bool Enabled, bool Fallback, bool Hidden, bool LicenceExempt,
+                                  int ProbeOrder, int CapCount, int BadDescriptors, string? DescriptorError,
+                                  string Backend, string LicenceClass, long HostPid, int Restarts);
+
+/// <summary>One per-task row (ADR-053, <c>conv_tasks[]</c>), in the task's selection order.</summary>
+public sealed record ConvTask(int? ProviderIndex, string? Provider, string Task, int CapId, bool Composed, string State,
+                              string Reason, double Progress, bool Selected, int? Order, string Verdict, string LicenceClass,
+                              int Streams, int JobsQueued, bool CpuStaging);
 
 public sealed record RuntimeInfo(string Version, string GitTag, int PluginAbi, string? ActiveOpenXrRuntime);
 
@@ -105,8 +120,15 @@ public sealed record Workspace(bool Enabled, string? Controller);
 public sealed record StatusSnapshot(
     int Schema, string Source, Generation Generation, RuntimeInfo Runtime, IReadOnlyList<PluginInfo> Plugins,
     IReadOnlyList<Screen> Screens, IReadOnlyList<Client> Clients, Workspace Workspace,
-    IReadOnlyList<StatusWarning> Warnings, string RawJson)
+    IReadOnlyList<StatusWarning> Warnings, string RawJson,
+    IReadOnlyList<ConvProvider>? ConvProviders = null, IReadOnlyList<ConvTask>? ConvTasks = null, bool ConvKnown = false)
 {
+    /// <summary>Conversion providers (ADR-053); empty from a CLI that predates them (<see cref="ConvKnown"/> false).</summary>
+    public IReadOnlyList<ConvProvider> Providers => ConvProviders ?? Array.Empty<ConvProvider>();
+
+    /// <summary>Per-task conversion rows (ADR-053).</summary>
+    public IReadOnlyList<ConvTask> Tasks => ConvTasks ?? Array.Empty<ConvTask>();
+
     public bool IsService => Source == "service";
 
     public Screen? ScreenById(string? id) =>
@@ -150,15 +172,33 @@ public static class StatusSnapshotParser
         return new StatusSnapshot(
             root.Int("schema"),
             root.Str("source", "headless"),
-            new Generation((ulong)Math.Max(0, gen.Long("topology")), (ulong)Math.Max(0, gen.Long("status"))),
+            new Generation((ulong)Math.Max(0, gen.Long("topology")), (ulong)Math.Max(0, gen.Long("status")),
+                           (ulong)Math.Max(0, gen.Long("conversion"))),
             new RuntimeInfo(rt.Str("version"), rt.Str("git_tag"), rt.Int("plugin_abi"), rt.StrOrNull("active_openxr_runtime")),
             root.Arr("plugins").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadPlugin).ToArray(),
             root.Arr("screens").Where(s => s.ValueKind == JsonValueKind.Object).Select(ReadScreen).ToArray(),
             root.Arr("clients").Where(c => c.ValueKind == JsonValueKind.Object).Select(ReadClient).ToArray(),
             new Workspace(ws.Bool("enabled"), ws.StrOrNull("controller")),
             ReadWarnings(root),
-            raw);
+            raw,
+            root.Arr("conv_providers").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadConvProvider).ToArray(),
+            root.Arr("conv_tasks").Where(t => t.ValueKind == JsonValueKind.Object).Select(ReadConvTask).ToArray(),
+            root.Has("conv_providers"));
     }
+
+    private static ConvProvider ReadConvProvider(JsonElement p) => new(
+        p.Str("id"), p.Str("name"), p.Str("vendor"), p.Str("version"), p.Str("load"), p.Str("hosting", "in_service"),
+        p.Str("status", "UNKNOWN"), p.Str("hint"), p.Bool("enabled", true), p.Bool("fallback"), p.Bool("hidden"),
+        p.Bool("licence_exempt"), p.Int("probe_order"), p.Int("cap_count"), p.Int("bad_descriptors"),
+        p.StrOrNull("descriptor_error"), p.Str("backend"), p.Str("licence_class", "UNKNOWN"), p.Long("host_pid"),
+        p.Int("restarts"));
+
+    private static ConvTask ReadConvTask(JsonElement t) => new(
+        t.Has("provider_index") && t.GetProperty("provider_index").ValueKind == JsonValueKind.Number ? t.Int("provider_index") : null,
+        t.StrOrNull("provider"), t.Str("task"), t.Int("cap_id"), t.Bool("composed"), t.Str("state", "UNKNOWN"),
+        t.Str("reason", "none"), t.Num("progress"), t.Bool("selected"),
+        t.Has("order") && t.GetProperty("order").ValueKind == JsonValueKind.Number ? t.Int("order") : null,
+        t.Str("verdict"), t.Str("licence_class", "UNKNOWN"), t.Int("streams"), t.Int("jobs_queued"), t.Bool("cpu_staging"));
 
     private static IReadOnlyList<StatusWarning> ReadWarnings(JsonElement e) =>
         e.Arr("warnings").Where(w => w.ValueKind == JsonValueKind.Object).Select(StatusWarning.From).ToArray();

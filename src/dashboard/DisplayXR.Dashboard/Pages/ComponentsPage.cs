@@ -135,6 +135,7 @@ public sealed class ComponentsPage : Page
         "present_owners" => "No present owner is connected.",
         "input_providers" => "No input provider reported.",
         "conversion" => "No conversion module reported.",
+        "conversion_providers" => "No conversion provider registered.",
         _ => "None.",
     };
 
