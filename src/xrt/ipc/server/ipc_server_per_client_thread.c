@@ -632,8 +632,21 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	ipc_server_input_queue_drop((void *)ics->xc);
 #endif
 
-	// Cast away volatile.
-	xrt_comp_destroy((struct xrt_compositor **)&ics->xc);
+	// #1988: detach the compositor from ics under global_state.lock BEFORE
+	// destroying it. Other threads walk every client's ics->xc under that lock
+	// (flush_state_to_all_clients_locked -> xrt_syscomp_set_state, the overlay
+	// visibility pushes); destroying through &ics->xc left the pointer
+	// published until after the object was freed, and a focus flush landing
+	// in that window dereferenced a deleted compositor. Destroy stays OUTSIDE
+	// the lock: it takes the compositor's render mutex, and the render side
+	// takes global_state.lock (sync_focus_from_compositor), so nesting would
+	// invert the lock order.
+	os_mutex_lock(&ics->server->global_state.lock);
+	struct xrt_compositor *xc = (struct xrt_compositor *)ics->xc; // Cast away volatile.
+	ics->xc = NULL;
+	os_mutex_unlock(&ics->server->global_state.lock);
+
+	xrt_comp_destroy(&xc);
 
 	// Multiple threads might be looking at these fields.
 	os_mutex_lock(&ics->server->global_state.lock);
