@@ -110,6 +110,23 @@ conv_core_create(const struct conv_core_config *cfg, struct conv_core **out_core
 void
 conv_core_destroy(struct conv_core **core_ptr);
 
+/*! The GPU-side stages the service can only build once its device exists
+ *  (#2003): the core is created at service start, the D3D11 device later. */
+struct conv_core_gpu
+{
+	struct conv_viewsyn_ops viewsyn;         //!< S5; render == NULL = no composed pipelines
+	struct conv_depth_readback_ops readback; //!< S6 / S7 for GPU depth
+	//! The display's nominal viewing distance (S3's straight-on viewer), known
+	//! with the display; ≤ 0 = keep conv_core_config::nominal_z_m.
+	float nominal_z_m;
+};
+
+/*! Install (or, with NULL, remove) the GPU-side stages. Replaces the
+ *  conv_core_config fields of the same names. Call while no stream is alive
+ *  (the dispatchers read them between conversions without a lock). */
+void
+conv_core_set_gpu(struct conv_core *core, const struct conv_core_gpu *gpu);
+
 
 /*
  *

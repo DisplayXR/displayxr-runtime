@@ -51,8 +51,15 @@ fill_outputs(struct conv_pipeline *p, uint32_t required, const struct xrt_conv_c
 		// Ask for what the stream produces; while provisional, the declared set may still grow.
 		p->provider_outputs = p->outputs & (p->provisional ? ~0u : cap->outputs);
 	}
+	// Observer-only depth (#2003): a view stream whose S7 observers need the
+	// same-inference depth asks the provider for it when the capability can
+	// produce it (or may, while provisional); S8 never publishes it.
+	if (p->observer_depth && !p->composed && (p->outputs & XRT_CONV_OUT_VIEWS) != 0 &&
+	    (p->provisional || (cap->outputs & XRT_CONV_OUT_DEPTH) != 0)) {
+		p->provider_outputs |= XRT_CONV_OUT_DEPTH;
+	}
 	p->stages &= ~(CONV_STAGE_S6_DEPTH);
-	if ((p->outputs & XRT_CONV_OUT_DEPTH) != 0 || p->composed) {
+	if ((p->outputs & XRT_CONV_OUT_DEPTH) != 0 || p->composed || (p->provider_outputs & XRT_CONV_OUT_DEPTH) != 0) {
 		p->stages |= CONV_STAGE_S6_DEPTH;
 	}
 }
@@ -106,6 +113,7 @@ conv_pipeline_compose(const struct conv_pipeline_request *req,
 	if (composed) {
 		p.stages |= CONV_STAGE_S5_VIEWSYN;
 	}
+	p.observer_depth = req->observers && conv_task_produces_views(req->task);
 	fill_outputs(&p, req->required_outputs, cap);
 	if (req->observers && (p.stages & CONV_STAGE_S6_DEPTH) != 0) {
 		p.stages |= CONV_STAGE_S7_OBSERVERS;

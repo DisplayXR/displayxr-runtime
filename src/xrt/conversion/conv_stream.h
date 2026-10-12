@@ -66,6 +66,11 @@ struct conv_image_request
 	uint32_t role;         //!< XRT_CONV_OUT_* for outputs; 0 for inputs
 	uint32_t usage;        //!< CONV_IMAGE_USAGE_*
 	uint64_t stream_id;
+	//! What the bound capability imports (xrt_conv_capability::import_*):
+	//! the allocator picks a memory kind / sync the provider accepts (#2003).
+	//! 0 = unknown (any).
+	uint32_t import_memory_kinds;
+	uint32_t import_sync_kinds;
 };
 
 /*! Runtime image allocation: the GPU glue (service) or CPU memory (tests,
@@ -137,6 +142,10 @@ struct conv_result
 	struct xrt_conv_views_info views_info;
 	struct xrt_conv_depth_info depth_info;
 	float active[4];
+	//! ADR-048 echo (#2003): the lifted rect the viewpoints were resolved
+	//! against, as submitted (display space, metres; 0 = unknown).
+	float rect_center[3];
+	float rect_size[2];
 	bool discontinuity;  //!< first result after FRAME_RESET or a rebind
 	bool provisional;    //!< the stream's outputs were not refined yet
 	bool output_realloc; //!< an output target changed since this consumer's last acquire

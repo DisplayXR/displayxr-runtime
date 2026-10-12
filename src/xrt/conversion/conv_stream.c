@@ -89,6 +89,21 @@ free_image(struct conv_core *core, struct xrt_conv_image *img)
 	memset(img, 0, sizeof(*img));
 }
 
+//! The bound capability's import kinds (no lock held on entry).
+static void
+bound_import_kinds(struct conv_core *core, const struct conv_binding *b, uint32_t *mem, uint32_t *sync)
+{
+	*mem = 0;
+	*sync = 0;
+	os_mutex_lock(&core->registry_mtx);
+	struct xrt_conv_capability cap;
+	if (!b->composed && conv_core_row_cap_locked(core, b->provider, b->cap_id, &cap)) {
+		*mem = cap.import_memory_kinds;
+		*sync = cap.import_sync_kinds;
+	}
+	os_mutex_unlock(&core->registry_mtx);
+}
+
 static bool
 alloc_image(struct conv_core *core,
             const struct conv_stream *st,
@@ -113,6 +128,8 @@ alloc_image(struct conv_core *core,
 	req.role = role;
 	req.usage = usage;
 	req.stream_id = st->id;
+	struct conv_binding b = st->bind;
+	bound_import_kinds(core, &b, &req.import_memory_kinds, &req.import_sync_kinds);
 	return core->cfg.alloc.alloc(core->cfg.alloc.ud, &req, out) && out->memory_kind != 0;
 }
 
@@ -482,6 +499,7 @@ struct convert_snapshot
 	bool discont;
 	bool validated;
 	uint32_t cap_flags;
+	bool legacy_units; //!< CONV_PROV_LEGACY_UNITS (the dp-lift adapter)
 };
 
 /*! streams_mtx held on entry and exit. */
@@ -523,6 +541,8 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		s.cap_flags = cap.flags;
 	}
 	s.validated = conv_core_row_validated_locked(core, s.bind.provider, s.bind.cap_id);
+	s.legacy_units = s.bind.provider < core->reg.provider_count &&
+	                 (core->reg.providers[s.bind.provider].flags & CONV_PROV_LEGACY_UNITS) != 0;
 	os_mutex_unlock(&core->registry_mtx);
 	os_mutex_unlock(&core->streams_mtx);
 
@@ -589,6 +609,21 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			cin.hint_allowed = s.validated && (s.cap_flags & XRT_CONV_CAP_SUGGESTS_CONVERGENCE) != 0;
 			cin.last = st->has_last_depth ? &st->last_depth : NULL;
 			conv_policy_convergence(&cin, pa, NULL);
+			if (s.legacy_units) {
+				// The legacy contract's RELATIVE plane, straight through: the
+				// app's, else the observer's, else AUTO (the module's own).
+				if (cin.app_set) {
+					pa->convergence_mode = CONV_CONVERGENCE_MODE_LEGACY_RELATIVE;
+					pa->convergence =
+					    cin.app_rel01 < 0.0f ? 0.0f : (cin.app_rel01 > 1.0f ? 1.0f : cin.app_rel01);
+				} else if (obs_valid) {
+					pa->convergence_mode = CONV_CONVERGENCE_MODE_LEGACY_RELATIVE;
+					pa->convergence = obs < 0.0f ? 0.0f : (obs > 1.0f ? 1.0f : obs);
+				} else {
+					pa->convergence_mode = XRT_CONV_CONVERGENCE_AUTO;
+					pa->convergence = 0.0f;
+				}
+			}
 
 			struct conv_policy_budget_in bin;
 			memset(&bin, 0, sizeof(bin));
@@ -605,6 +640,10 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			pa->strength = bout.strength;
 			pf->budget = bout.budget;
 			pf->rear_cap_m = bout.rear_cap_m;
+			if (s.legacy_units) {
+				// "1 = the module's calibrated budget": the app's strength as is.
+				pa->strength = s.frame.strength > 0.0f ? s.frame.strength : 1.0f;
+			}
 		}
 
 		pf->host = host;
@@ -623,7 +662,8 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			conv_policy_observe(&st->observer, &pf->result.depth_info, &pf->samples, s.frame.active, t0);
 		}
 		conv_pipeline_frame_release(&core->cfg.readback, pf);
-		if (ok && (pf->result.written & XRT_CONV_OUT_DEPTH) != 0) {
+		// The provider's depth, published or observer-only (#2003).
+		if (ok && (pf->provider_out.written & XRT_CONV_OUT_DEPTH) != 0) {
 			st->last_depth = pf->result.depth_info;
 			st->has_last_depth = true;
 		}
@@ -646,6 +686,14 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			o->views_info = pf->result.views_info;
 			o->depth_info = pf->result.depth_info;
 			memcpy(o->active, s.frame.active, sizeof(o->active));
+			if (s.frame.rect_valid) {
+				memcpy(o->rect_center, s.frame.rect_center, sizeof(o->rect_center));
+				o->rect_size[0] = s.frame.rect_w_m;
+				o->rect_size[1] = s.frame.rect_h_m;
+			} else {
+				memset(o->rect_center, 0, sizeof(o->rect_center));
+				memset(o->rect_size, 0, sizeof(o->rect_size));
+			}
 			o->discontinuity = s.discont;
 			o->provisional = s.pipe.provisional;
 			u_lift_mailbox_publish_output(&st->mb, out_slot, &meta, now_ns());
@@ -1236,6 +1284,8 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	out->views_info = o->views_info;
 	out->depth_info = o->depth_info;
 	memcpy(out->active, o->active, sizeof(out->active));
+	memcpy(out->rect_center, o->rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, o->rect_size, sizeof(out->rect_size));
 	out->discontinuity = o->discontinuity;
 	out->provisional = o->provisional;
 	out->output_realloc = o->alloc_gen != st->consumer_alloc_gen;

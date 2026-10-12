@@ -35,10 +35,16 @@ add_library(
 	conv_host_inproc.h
 	conv_job.c
 	conv_job.h
+	conv_observer_autoconv.c
+	conv_observer_autoconv.h
 	conv_pipeline.c
 	conv_pipeline.h
 	conv_policy.c
 	conv_policy.h
+	# #2003: the legacy DP-lift adapter (provider-ABI half; the lift thread is
+	# the D3D11 service's, reached through conv_dp_lift_backend).
+	conv_provider_legacy_dp.cpp
+	conv_provider_legacy_dp.h
 	conv_stage.c
 	conv_stage.h
 	conv_stream.c

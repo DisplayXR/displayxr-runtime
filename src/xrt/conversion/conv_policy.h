@@ -208,6 +208,15 @@ conv_policy_convergence_to_decoded(float rel01, const struct xrt_conv_depth_info
 bool
 conv_policy_convergence_from_decoded(float decoded, const struct xrt_conv_depth_info *last, float *out_rel01);
 
+/*!
+ * xrt_conv_params::convergence_mode for a CONV_PROV_LEGACY_UNITS provider
+ * only (the in-service `dp-lift` adapter, #2003): params.convergence is the
+ * RELATIVE plane of the legacy contract, [0,1], 0 = the nearest content on
+ * the glass. Runtime-internal: never sent to a registered provider (they get
+ * AUTO / DECODED only), so it is not part of the provider ABI.
+ */
+#define CONV_CONVERGENCE_MODE_LEGACY_RELATIVE 0x4C524C31u
+
 /*! @name Convergence source (conv_policy_conv_out::source) @{ */
 #define CONV_CONVERGENCE_SRC_AUTO 0u     //!< nothing given: the provider's own estimate / default
 #define CONV_CONVERGENCE_SRC_APP 1u      //!< the app's explicit plane

@@ -396,7 +396,8 @@ sync_states_locked(struct conv_core *core, uint32_t provider)
 		if (st.state == XRT_CONV_STATE_READY && row->rd.state == XRT_CONV_STATE_INSTALLED) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
 			apply_locked(core, i, &ev);
-		} else if (st.state == XRT_CONV_STATE_ABSENT && row->rd.state == XRT_CONV_STATE_INSTALLED) {
+		} else if (st.state == XRT_CONV_STATE_ABSENT && row->rd.state == XRT_CONV_STATE_INSTALLED &&
+		           !(provider < CONV_REGISTRY_MAX_PROVIDERS && core->retrying[provider])) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_DESCRIBE_FAILED, t);
 			ev.reason = st.failure_reason != 0 ? st.failure_reason : XRT_CONV_FAIL_MODEL;
 			apply_locked(core, i, &ev);
@@ -417,6 +418,9 @@ describe_locked(struct conv_core *core, uint32_t provider)
 	core->status_gen++;
 	if (n >= 0) {
 		sync_states_locked(core, provider);
+	}
+	if (provider < CONV_REGISTRY_MAX_PROVIDERS) {
+		core->retrying[provider] = false;
 	}
 	emit_simple(core, XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED, 0, 0, 0, 0, -1.0f);
 }
@@ -551,6 +555,7 @@ conv_core_provider_changed(struct conv_core *core, const char *provider_id)
 			}
 		}
 		core->redescribe[pi] = true;
+		core->retrying[pi] = true;
 		core->prewarm_after_describe = true;
 		os_cond_signal(&core->ctrl_cond);
 	}
@@ -1096,6 +1101,29 @@ conv_core_create(const struct conv_core_config *cfg, struct conv_core **out_core
 	core->ctrl_started = true;
 	*out_core = core;
 	return XRT_SUCCESS;
+}
+
+void
+conv_core_set_gpu(struct conv_core *core, const struct conv_core_gpu *gpu)
+{
+	if (core == NULL) {
+		return;
+	}
+	os_mutex_lock(&core->streams_mtx);
+	os_mutex_lock(&core->registry_mtx);
+	if (gpu != NULL) {
+		core->cfg.viewsyn = gpu->viewsyn;
+		core->cfg.readback = gpu->readback;
+		if (gpu->nominal_z_m > 0.0f) {
+			core->cfg.nominal_z_m = gpu->nominal_z_m;
+		}
+	} else {
+		memset(&core->cfg.viewsyn, 0, sizeof(core->cfg.viewsyn));
+		memset(&core->cfg.readback, 0, sizeof(core->cfg.readback));
+	}
+	core->conv_gen++; // composed rows appear / disappear with the view synthesis
+	os_mutex_unlock(&core->registry_mtx);
+	os_mutex_unlock(&core->streams_mtx);
 }
 
 void

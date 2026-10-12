@@ -76,6 +76,11 @@ struct conv_pipeline
 	//! Accepted against describe-time outputs while the capability is not
 	//! READY; refined (conv_pipeline_refine) once it is.
 	bool provisional;
+	//! S7 observers asked for (conv_pipeline_request::observers): the
+	//! provider's same-inference depth is requested for them even when the
+	//! app did not ask for it (rt#1978's runtime auto-convergence, #2003) --
+	//! it feeds S6 / S7 but is never published.
+	bool observer_depth;
 };
 
 /*!

@@ -55,6 +55,8 @@ struct conv_ring_slot
 	struct xrt_conv_views_info views_info;
 	struct xrt_conv_depth_info depth_info;
 	float active[4];
+	float rect_center[3]; //!< ADR-048 echo (the frame's rect)
+	float rect_size[2];
 	bool discontinuity;
 	bool provisional;
 };
@@ -196,6 +198,10 @@ struct conv_core
 	bool stop;
 	bool rebind_check;
 	bool redescribe[CONV_REGISTRY_MAX_PROVIDERS];
+	//! A registry change retried this provider's rows (#2003): the re-describe
+	//! it triggers must not demote them back to ABSENT on the provider's
+	//! stale "absent" (a warm is what tries again).
+	bool retrying[CONV_REGISTRY_MAX_PROVIDERS];
 	struct conv_registry reg;
 	uint64_t conv_gen;
 	uint64_t status_gen;
