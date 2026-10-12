@@ -572,17 +572,22 @@ multi_compositor_create_semaphore(struct xrt_compositor *xc,
  *    join a thread that never exits (displayxr-leia-plugin#39), and a hang
  *    there under `list_and_timing_lock` would freeze every client.
  *
- * So unpublish first (pointer NULL + visibility UNKNOWN, under the lock),
- * destroy the private copy after. Safe to call when there is no DP.
+ * So unpublish first (pointer NULL + visibility UNKNOWN, under render_lock +
+ * list_and_timing_lock), destroy the private copy after with neither held.
+ * Safe to call when there is no DP.
  */
 static void
 multi_compositor_detach_and_destroy_dp(struct multi_compositor *mc)
 {
+	// #1005: the render thread uses the DP under render_lock (not
+	// list_and_timing_lock) — take both, in order. Caller must hold neither.
+	os_mutex_lock(&mc->msc->render_lock);
 	os_mutex_lock(&mc->msc->list_and_timing_lock);
 	struct xrt_display_processor *xdp = mc->session_render.display_processor;
 	mc->session_render.display_processor = NULL;
 	mc->session_render.dp_visibility = MULTI_DP_VIS_UNKNOWN;
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+	os_mutex_unlock(&mc->msc->render_lock);
 
 	xrt_display_processor_destroy(&xdp);
 }
@@ -777,9 +782,14 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		// target we are tearing down, racing vkCreateAndroidSurfaceKHR against
 		// the old swapchain's BufferQueue connection (#528,
 		// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm).
+		//
+		// #1005: and under render_lock — the frame no longer runs under
+		// list_and_timing_lock, so this is what waits out a frame in flight.
+		os_mutex_lock(&mc->msc->render_lock);
 		os_mutex_lock(&mc->msc->list_and_timing_lock);
 		mc->state.session_active = false;
 		os_mutex_unlock(&mc->msc->list_and_timing_lock);
+		os_mutex_unlock(&mc->msc->render_lock);
 		multi_system_compositor_update_session_status(mc->msc, false);
 
 		// Clean up per-session render resources
@@ -791,6 +801,9 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// the compositor lock. Both must be cleared atomically so the
 			// compositor thread's has_session_render() returns false and
 			// won't attempt re-initialization during teardown.
+			// #1005: render_lock first, so a frame still rendering this
+			// session finishes before its resources are torn down below.
+			os_mutex_lock(&mc->msc->render_lock);
 			os_mutex_lock(&mc->msc->list_and_timing_lock);
 			mc->session_render.initialized = false;
 			mc->session_render.external_window_handle = NULL;
@@ -802,6 +815,7 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// fields — begin_session re-sets it on the next session.
 			mc->session_render.use_macos_surface = false;
 			os_mutex_unlock(&mc->msc->list_and_timing_lock);
+			os_mutex_unlock(&mc->msc->render_lock);
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
@@ -1472,6 +1486,43 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		mc->state.session_active = false;
 	}
 
+	// #1005: unlist FIRST, under render_lock + list_and_timing_lock. Holding
+	// render_lock means no frame is in flight; once we are off msc->clients
+	// the next frame's snapshot cannot contain us, so everything below runs
+	// with no lock and no frame can touch this client again.
+	os_mutex_lock(&mc->msc->render_lock);
+	os_mutex_lock(&mc->msc->list_and_timing_lock);
+
+	// Remove it from the list of clients.
+	bool was_bridge = mc->xsi.is_bridge_relay;
+	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
+		if (mc->msc->clients[i] == mc) {
+			mc->msc->clients[i] = NULL;
+		}
+	}
+
+	if (was_bridge) {
+		extern bool g_bridge_relay_active;
+		bool any_bridge = false;
+		for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
+			if (mc->msc->clients[i] != NULL && mc->msc->clients[i]->xsi.is_bridge_relay) {
+				any_bridge = true;
+				break;
+			}
+		}
+		g_bridge_relay_active = any_bridge;
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		extern void qwerty_set_bridge_relay_active(bool);
+		qwerty_set_bridge_relay_active(any_bridge);
+#endif
+		if (!any_bridge) {
+			U_LOG_W("Bridge relay session disconnected — legacy sessions revert to compromise scaling");
+		}
+	}
+
+	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+	os_mutex_unlock(&mc->msc->render_lock);
+
 	// The display processor can outlive session_render.initialized: the
 	// Android end_session path deliberately caches it across end->begin
 	// (leia-plugin#39), so a client that ended its session before
@@ -1677,37 +1728,6 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		U_LOG_W("Destroyed self-owned window in compositor destroy");
 	}
 #endif
-
-	os_mutex_lock(&mc->msc->list_and_timing_lock);
-
-	// Remove it from the list of clients.
-	bool was_bridge = mc->xsi.is_bridge_relay;
-	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
-		if (mc->msc->clients[i] == mc) {
-			mc->msc->clients[i] = NULL;
-		}
-	}
-
-	if (was_bridge) {
-		extern bool g_bridge_relay_active;
-		bool any_bridge = false;
-		for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
-			if (mc->msc->clients[i] != NULL && mc->msc->clients[i]->xsi.is_bridge_relay) {
-				any_bridge = true;
-				break;
-			}
-		}
-		g_bridge_relay_active = any_bridge;
-#ifdef XRT_BUILD_DRIVER_QWERTY
-		extern void qwerty_set_bridge_relay_active(bool);
-		qwerty_set_bridge_relay_active(any_bridge);
-#endif
-		if (!any_bridge) {
-			U_LOG_W("Bridge relay session disconnected — legacy sessions revert to compromise scaling");
-		}
-	}
-
-	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 	// Destroy the wait thread, destroy also stops the thread.
 	os_thread_helper_destroy(&mc->wait_thread.oth);
