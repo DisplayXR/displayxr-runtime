@@ -39,6 +39,18 @@ add_library(
 target_include_directories(comp_d3d11_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(comp_d3d11_conv_viewsyn PUBLIC xrt-interfaces aux_util PRIVATE ${D3D11_LIBRARY} d3dcompiler)
 
+# XR_DXR_lift (ADR-042) on the D3D11 service: the lift thread, its device and
+# the vendor module's display processor, plus the conversion core's D3D11 glue
+# (ADR-053 P1a). Its own small library so the WARP golden replay
+# (tests_lift_dp_golden) links it without the whole service compositor.
+add_library(comp_d3d11_lift STATIC d3d11_lift.cpp d3d11_lift.h)
+target_include_directories(comp_d3d11_lift PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(
+	comp_d3d11_lift
+	PUBLIC xrt-interfaces aux_util aux_os
+	PRIVATE ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
+	)
+
 add_library(
 	comp_d3d11_service STATIC
 	../d3d_shared/comp_equirect2_shaders.h
@@ -47,8 +59,6 @@ add_library(
 	d3d11_service_shaders.h
 	d3d11_capture.cpp
 	d3d11_capture.h
-	d3d11_lift.cpp
-	d3d11_lift.h
 	d3d11_icon_loader.cpp
 	d3d11_icon_loader.h
 	displayxr_logo_data.h
@@ -86,6 +96,9 @@ target_link_libraries(
 # this target already hard-requires D3D11 (${D3D11_LIBRARY}, <d3d11_4.h>), so the
 # guard that builds the bridge is satisfied wherever this library builds at all.
 target_link_libraries(comp_d3d11_service PRIVATE comp_xbridge)
+
+# XR_DXR_lift: the lift thread + the conversion core's D3D11 glue (see above).
+target_link_libraries(comp_d3d11_service PRIVATE comp_d3d11_lift)
 
 # Multi-screen M6 on the service path: a direct (non-workspace) IPC client's
 # window spanning monitors is woven per screen by the in-process compositor's
