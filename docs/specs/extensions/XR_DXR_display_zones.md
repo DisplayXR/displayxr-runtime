@@ -127,13 +127,17 @@ typedef struct XrDisplayZoneDXR {
 } XrDisplayZoneDXR;
 ```
 
-**Multi-screen (Windows, `XR_DXR_weave` present-owners).** When the session's
-window is woven per screen (ADR-047 Amendment 4), a zone-scoped locate whose
-`rect` lies wholly on a non-primary screen is framed from that screen: its
-eyes, its nominal viewer, and the zone placed on its physical rectangle
-(Amendment 4 addendum). The raw channel then reports that screen's eyes and the
-zone relative to that screen. A zone that straddles a seam is located from the
-primary screen, as before.
+**Multi-screen.** When the session's window is woven per screen (ADR-047), a
+zone-scoped locate whose `rect` lies wholly on one screen is framed from that
+screen: its eyes, its nominal viewer, and the zone placed on its physical
+rectangle. The raw channel then reports that screen's eyes and the zone relative
+to that screen. A zone that straddles a seam keeps one view set, framed as the
+window's own: from the primary screen for an `XR_DXR_weave` present-owner
+(Amendment 4 addendum), from the screen holding most of the window for a session
+whose own compositor segments it (in-process, or a direct client of the D3D11
+service; Amendment 9). A zone-scoped locate is never split into per-segment
+view sets, under `PRIMARY_MULTIVIEW_DXR` either; rendering a straddling zone per
+part is future work (`docs/roadmap/multi-screen.md` § 8).
 
 `zoneId` exists for locate↔submit pairing (validate mode), debug
 logs/captures, and as the stable referent for the reserved effective-mask

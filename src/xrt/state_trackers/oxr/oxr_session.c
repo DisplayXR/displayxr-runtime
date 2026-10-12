@@ -4888,24 +4888,61 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 * (its eyes, the window relative to it). The compositor crops that set
 	 * per segment, each woven by its own screen's DP or flat 2D (M2). When
 	 * the majority is the primary screen this IS the single-screen path.
+	 *
+	 * A zone-scoped locate (XR_DXR_display_zones; never split, see
+	 * locate_can_split) frames ONE zone, not the window: when that zone lies
+	 * wholly on one screen it is framed from THAT screen (its eyes, the
+	 * window relative to it, then the usual zone rebase), so a zone on the
+	 * second screen of a straddling window looks around from that screen's
+	 * viewer, not the majority's (displayxr-browser-pvt#272; the in-process /
+	 * direct-IPC twin of ADR-047 Amendment 4 addendum). A zone that
+	 * straddles a seam keeps the majority's set (oxr_segment_views_zone_segment).
 	 */
 	if (!is_multiview || !locate_can_split(sess, viewLocateInfo)) {
+		uint32_t fk = mj; // the segment whose screen frames this one view set
+#ifdef OXR_HAVE_DXR_display_zones
+		if (sess->sys->inst->extensions.DXR_display_zones) {
+			const XrDisplayZoneDXR *zone =
+			    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+			if (zone != NULL && zone->rect.extent.width > 0 && zone->rect.extent.height > 0) {
+				struct xrt_rect zr;
+				zr.offset.w = zone->rect.offset.x; // xrt_offset names its fields w/h
+				zr.offset.h = zone->rect.offset.y;
+				zr.extent.w = zone->rect.extent.width;
+				zr.extent.h = zone->rect.extent.height;
+				fk = oxr_segment_views_zone_segment(&m, &zr, mj);
+				// Change-only (never per frame): the last screen a zone was
+				// framed from instead of the majority's. Not logged back: an
+				// app with zones on both screens would flip it every locate.
+				static uint64_t s_zone_screen_logged = 0;
+				if (fk != mj && m.seg[fk].screen_id != s_zone_screen_logged) {
+					s_zone_screen_logged = m.seg[fk].screen_id;
+					U_LOG_W(
+					    "multi-screen: zone %u (%d,%d %dx%d) wholly on screen 0x%016llx - views "
+					    "from that screen's eyes and geometry, not the majority screen's",
+					    zone->zoneId, zone->rect.offset.x, zone->rect.offset.y,
+					    zone->rect.extent.width, zone->rect.extent.height,
+					    (unsigned long long)m.seg[fk].screen_id);
+				}
+			}
+		}
+#endif
 		XrResult ret;
-		if (m.seg[mj].is_primary) {
+		if (m.seg[fk].is_primary) {
 			ret = locate_views_one(log, sess, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
 			                       views, NULL);
 		} else {
 			struct oxr_locate_segment o;
 			memset(&o, 0, sizeof(o));
-			oxr_segment_views_whole_window_metrics(&m, mj, &o.wm);
-			const struct xrt_segment_metric *s = &m.seg[mj];
+			oxr_segment_views_whole_window_metrics(&m, fk, &o.wm);
+			const struct xrt_segment_metric *s = &m.seg[fk];
 			o.nominal_y_m = s->nominal_viewer_y_m;
 			o.nominal_z_m = s->nominal_viewer_z_m;
 			o.have_eyes = oxr_segment_views_segment_eyes(s, 0.0f, 0.0f, 2, &o.eyes);
 			o.screen_id = s->screen_id;
 			o.side_effects = true;
 			if (o.wm.valid) {
-				locate_note_others_tracking(sess, &m, (int32_t)mj);
+				locate_note_others_tracking(sess, &m, (int32_t)fk);
 			}
 			struct oxr_locate_segment_out so = {.measurable = true};
 			o.out = &so;

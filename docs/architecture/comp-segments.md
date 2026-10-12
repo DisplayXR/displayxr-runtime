@@ -493,6 +493,9 @@ views*; API: `XrViewDisplayBindingsDXR` in `XR_DXR_display_info` v22).
 What stays one view set (cropped per segment, as in M2): `PRIMARY_STEREO`/`MONO`
 sessions (framed from the screen holding most of the window), camera-rig and
 zone-scoped locates, a window covering more than `XRT_MAX_SEGMENTS` (2) screens. A
+zone-scoped locate is framed from the **zone's** screen when the zone lies wholly on one
+(`oxr_segment_views_zone_segment`: its eyes, the whole window relative to it, then the zone
+rebase; ADR-047 Amendment 9), from the majority screen when it straddles a seam. A
 frame whose routing no longer matches (the mode changed between the locate and the
 commit) is drawn unrouted for that frame. Under per-segment views, canvas that lies on
 no screen is not covered by any view set and stays black (M2 painted it from the shared
@@ -604,4 +607,5 @@ pixels into a handback texture on its own IPC thread. That submit is segmented b
 - **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
   screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
   reported unsegmented (one eye set); a straddling element's views stay the primary's
-  (per-part views need a view set per part, displayxr-browser-pvt#272).
+  (per-part views need a view set per part, displayxr-browser-pvt#272; proposal:
+  `docs/roadmap/multi-screen.md` § 8).

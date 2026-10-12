@@ -471,3 +471,34 @@ Vulkan manager's `set_screens` are in place. Both: `DXR_DISPLAY_HOTPLUG=1` runs 
 there. The service / IPC path: the service's own registry is rebuilt by the sweep, but the
 generation is not forwarded to clients (macOS IPC sessions do not segment). Detail:
 `docs/architecture/comp-segments.md` § *Display hotplug*.
+
+## Amendment 9 (2026-10-12): a zone is framed from its own screen on every segmenting session
+
+The Amendment 4 addendum re-frames a present-owner's element that lies wholly on a non-primary
+screen. A session whose own compositor segments its window (in-process D3D11 / D3D12 / GL /
+Vulkan / Metal, or a direct client of the D3D11 service, Amendment 3) had the same gap one layer
+up: `oxr_session_locate_views` never splits a zone-scoped locate (`locate_can_split`), and its one
+view set was framed from the majority screen. A zone on the other screen of a straddling window
+(an `XR_DXR_display_zones` app, e.g. a multi-zone Unity app on the in-process D3D12 compositor)
+was therefore rendered from the wrong viewer and framed against the wrong panel, though each
+screen's DP wove its pixels (displayxr-browser-pvt#272 is the browser's face of the same gap).
+Decisions:
+
+- **The zone's screen frames it when the zone lies wholly on one screen.** The locate asks
+  `oxr_segment_views_zone_segment` (the table's segment that holds the whole zone rect, its
+  screen's sizes known) and frames that screen's whole-window metrics
+  (`oxr_segment_views_whole_window_metrics`) with that screen's eyes and nominal viewer, then
+  applies the zone rebase as before. That screen may be the primary: a zone on the primary of a
+  window mostly on screen 2 now takes the single-screen path (the session DP's own eyes and
+  window metrics), where it took screen 2's before. The present-owner rule never needs that
+  case, because a present-owner's single set is already framed from the primary.
+- **A straddling zone keeps the majority screen's set**, exactly as before: one pixel across the
+  seam is enough. Per-part views for a zone need a view set per part
+  (`docs/roadmap/multi-screen.md` § 8, proposed).
+- **Same answer as the server.** Wherever `u_weave_zone_screen_segment` re-frames, the state
+  tracker's rule picks the same segment (swept in `tests/tests_weave_segments.cpp`); the two
+  differ only in what they fall back to (the primary for a present-owner, the majority here).
+- **No routing, no extension revision.** A zone locate still records no
+  `xrt_segment_view_routing`, so the compositor crops the frame per segment as in M2, and the
+  zone's pixels, wholly on one screen, are woven by that screen's DP. The locate API is unchanged;
+  only which screen frames a single-screen zone moves.

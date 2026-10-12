@@ -10,7 +10,8 @@
  *        addendum: the screen whose eyes and geometry frame an element's
  *        zone-scoped locate (u_weave_zone_screen_segment +
  *        u_weave_segment_window_metrics), and the submit reply's cheap split
- *        signal (u_weave_segments_fetch_needed).
+ *        signal (u_weave_segments_fetch_needed). Amendment 9: the in-process /
+ *        direct-IPC twin of that rule (oxr_segment_views_zone_segment).
  */
 
 #include "util/comp_segments.h"
@@ -501,6 +502,159 @@ TEST_CASE("element views: the server's window metrics are the per-segment views'
 			oxr_segment_views_whole_window_metrics(&m, k, &b);
 			REQUIRE(b.valid);
 			CHECK(std::memcmp(&a, &b, sizeof(a)) == 0);
+		}
+	}
+}
+
+/*
+ * The in-process / direct-IPC twin (displayxr-browser-pvt#272): a zone-scoped
+ * locate on a session whose OWN compositor segments its window (in-process
+ * D3D11 / D3D12 / GL / Vulkan, or a direct IPC client of the D3D11 service).
+ * oxr_session_locate_views keeps one view set for it and asks
+ * oxr_segment_views_zone_segment which screen frames it: the zone's own screen
+ * when the zone lies wholly on one, else the majority (the pre-#272 answer).
+ * Unlike the present-owner rule it may answer the PRIMARY screen: an in-process
+ * window's one view set is framed from the majority screen, so a zone on the
+ * primary of a window mostly on screen 2 was framed from screen 2 before.
+ */
+
+TEST_CASE("zone framing: a zone wholly on screen 2 is framed from screen 2, as for a present-owner")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600}; // seam at window x 520
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+	const uint32_t mj = oxr_segment_views_majority(&m);
+	REQUIRE(m.seg[mj].is_primary); // 520 px on the primary, 480 on screen 2
+
+	const xrt_rect zone = xr(800, 300, 150, 120);
+	const uint32_t k = oxr_segment_views_zone_segment(&m, &zone, mj);
+	REQUIRE(k == 1);
+	CHECK(m.seg[k].screen_id == SECOND_ID);
+	// The present-owner rule picks the same screen.
+	CHECK(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == (int32_t)k);
+
+	// The canvas the locate frames: the whole window relative to screen 2,
+	// rebased to the zone - the element where it sits ON screen 2.
+	xrt_window_metrics whole;
+	oxr_segment_views_whole_window_metrics(&m, k, &whole);
+	REQUIRE(whole.valid);
+	const xrt_window_metrics el = zone_canvas(whole, zone);
+	u_weave_rect_part part;
+	REQUIRE(u_weave_rect_parts(&m, &zone, 1, &part, 1) == 1);
+	CHECK(el.window_screen_left - el.display_screen_left == part.screen_rect.offset.w);
+	CHECK(el.window_screen_top - el.display_screen_top == part.screen_rect.offset.h);
+	const float px = PANEL_W_M / 1920.0f;
+	CHECK(el.window_center_offset_x_m == Catch::Approx((280.0f + 75.0f - 960.0f) * px));
+
+	// And screen 2's eyes, which oxr_segment_views_segment_eyes accepts
+	// untranslated (the whole-window canvas is in that screen's own space).
+	xrt_eye_positions eyes;
+	REQUIRE(oxr_segment_views_segment_eyes(&m.seg[k], 0.0f, 0.0f, 2, &eyes));
+	CHECK(eyes.eyes[0].x == Catch::Approx(0.068f));
+	CHECK(eyes.eyes[1].x == Catch::Approx(0.132f));
+}
+
+TEST_CASE("zone framing: a zone on the primary of a window mostly on screen 2 is framed from the primary")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1700, 100, 1000, 600}; // 220 px on the primary, 780 on screen 2
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+	const uint32_t mj = oxr_segment_views_majority(&m);
+	REQUIRE(m.seg[mj].screen_id == SECOND_ID);
+
+	// Wholly on the primary: its screen frames it (the locate's single-screen
+	// path, the session DP's own eyes and window metrics), not the majority.
+	const xrt_rect zone = xr(10, 10, 200, 100);
+	const uint32_t k = oxr_segment_views_zone_segment(&m, &zone, mj);
+	CHECK(k != mj);
+	CHECK(m.seg[k].is_primary);
+	// The present-owner rule leaves this one to the session's framing, which
+	// for a present-owner already IS the primary's.
+	CHECK(u_weave_zone_screen_segment(&m, &zone, win.w, win.h) == -1);
+
+	// A zone wholly on the majority screen is framed from it, as before.
+	const xrt_rect on_major = xr(500, 10, 200, 100);
+	CHECK(oxr_segment_views_zone_segment(&m, &on_major, mj) == mj);
+}
+
+TEST_CASE("zone framing: a straddling, empty or off-window zone keeps the majority's framing")
+{
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect win = {1400, 100, 1000, 600};
+	xrt_segment_metrics m = publish(win, screens, 2);
+	REQUIRE(m.count == 2);
+	with_geometry(m, screens, 2);
+	const uint32_t mj = oxr_segment_views_majority(&m);
+
+	// A temporary zone lives for the whole call it is passed to.
+	auto zs = [mj](const xrt_segment_metrics &t, const xrt_rect &z) {
+		return oxr_segment_views_zone_segment(&t, &z, mj);
+	};
+	// Across the seam at 520 - by one pixel too.
+	CHECK(zs(m, xr(400, 50, 300, 200)) == mj);
+	CHECK(zs(m, xr(420, 50, 101, 200)) == mj);
+	// Flush against the seam: wholly on the primary.
+	CHECK(zs(m, xr(420, 50, 100, 200)) == 0);
+	// Flush on the other side: wholly on screen 2.
+	CHECK(zs(m, xr(520, 50, 100, 200)) == 1);
+	// Empty, and wholly outside the window.
+	CHECK(zs(m, xr(800, 300, 0, 120)) == mj);
+	CHECK(zs(m, xr(2000, 300, 50, 50)) == mj);
+	// No table, or no zone.
+	xrt_segment_metrics none;
+	std::memset(&none, 0, sizeof(none));
+	CHECK(zs(none, xr(10, 10, 10, 10)) == mj);
+	CHECK(oxr_segment_views_zone_segment(&m, nullptr, mj) == mj);
+
+	// A screen of unknown size cannot be framed against: majority.
+	xrt_segment_metrics no_size = m;
+	no_size.seg[1].screen_height_m = 0.0f;
+	CHECK(zs(no_size, xr(800, 300, 150, 120)) == mj);
+	no_size = m;
+	no_size.seg[1].screen_desktop_width = 0;
+	CHECK(zs(no_size, xr(800, 300, 150, 120)) == mj);
+}
+
+TEST_CASE("zone framing: agrees with the present-owner rule wherever that one re-frames")
+{
+	// Sweep zones across a straddling window in both layouts: whenever the
+	// server's rule (u_weave_zone_screen_segment) re-frames an element onto a
+	// non-primary screen, the state tracker's rule picks that screen too, and
+	// whenever the zone straddles, both keep their fallback.
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	for (int layout = 0; layout < 2; layout++) {
+		if (layout == 1) {
+			screens[1].desktop = {-1920, 0, 1920, 1080};
+		}
+		const comp_seg_rect win =
+		    layout == 0 ? comp_seg_rect{1400, 100, 1000, 600} : comp_seg_rect{-300, 40, 1000, 500};
+		xrt_segment_metrics m = publish(win, screens, 2);
+		REQUIRE(m.count == 2);
+		with_geometry(m, screens, 2);
+		const uint32_t mj = oxr_segment_views_majority(&m);
+		for (int x = 0; x < 1000; x += 37) {
+			for (int w = 10; w < 400; w += 61) {
+				const xrt_rect zone = xr(x, 20, w, 80);
+				const int32_t server = u_weave_zone_screen_segment(&m, &zone, win.w, win.h);
+				const int32_t single = u_weave_rect_single_segment(&m, &zone);
+				const uint32_t client = oxr_segment_views_zone_segment(&m, &zone, mj);
+				if (server >= 0) {
+					CHECK(client == (uint32_t)server);
+				}
+				if (single < 0) {
+					CHECK(client == mj);
+				} else {
+					CHECK(client == (uint32_t)single);
+				}
+			}
 		}
 	}
 }

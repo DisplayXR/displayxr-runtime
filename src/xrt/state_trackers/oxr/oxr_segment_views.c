@@ -210,6 +210,48 @@ oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint
 	out->valid = true;
 }
 
+//! Do two rects (half-open, window px) share at least one pixel?
+static bool
+rects_overlap(const struct xrt_rect *a, const struct xrt_rect *b)
+{
+	if (a->extent.w <= 0 || a->extent.h <= 0 || b->extent.w <= 0 || b->extent.h <= 0) {
+		return false;
+	}
+	const int64_t ax1 = (int64_t)a->offset.w + a->extent.w;
+	const int64_t ay1 = (int64_t)a->offset.h + a->extent.h;
+	const int64_t bx1 = (int64_t)b->offset.w + b->extent.w;
+	const int64_t by1 = (int64_t)b->offset.h + b->extent.h;
+	return (int64_t)a->offset.w < bx1 && (int64_t)b->offset.w < ax1 && (int64_t)a->offset.h < by1 &&
+	       (int64_t)b->offset.h < ay1;
+}
+
+uint32_t
+oxr_segment_views_zone_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *zone, uint32_t fallback)
+{
+	if (m == NULL || zone == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+		return fallback;
+	}
+	int32_t found = -1;
+	for (uint32_t k = 0; k < m->count; k++) {
+		if (!rects_overlap(zone, &m->seg[k].window_rect)) {
+			continue;
+		}
+		if (found >= 0) {
+			return fallback; // a second screen: the zone straddles a seam
+		}
+		found = (int32_t)k;
+	}
+	if (found < 0) {
+		return fallback;
+	}
+	const struct xrt_segment_metric *s = &m->seg[found];
+	if (s->screen_width_m <= 0.0f || s->screen_height_m <= 0.0f || s->screen_desktop_width == 0 ||
+	    s->screen_desktop_height == 0) {
+		return fallback;
+	}
+	return (uint32_t)found;
+}
+
 uint32_t
 oxr_segment_views_assign(uint32_t segment_count,
                          uint32_t per_segment,

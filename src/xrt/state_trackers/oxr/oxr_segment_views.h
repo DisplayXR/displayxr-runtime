@@ -20,6 +20,8 @@
  *   - @ref oxr_segment_views_window_metrics — a segment as the window metrics
  *     the existing Kooima block consumes.
  *   - @ref oxr_segment_views_assign — the contiguous view ranges.
+ *   - @ref oxr_segment_views_zone_segment — the screen a zone-scoped locate is
+ *     framed from (ADR-047 Amendment 9).
  */
 
 #pragma once
@@ -196,6 +198,28 @@ oxr_segment_views_window_metrics(const struct xrt_segment_metrics *m,
  */
 void
 oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint32_t i, struct xrt_window_metrics *out);
+
+/*!
+ * Which segment's screen frames a zone-scoped locate (an `XR_DXR_display_zones`
+ * zone, or an inline-3D element) on a window woven per screen, when that locate
+ * keeps ONE view set: the segment whose screen holds the WHOLE @p zone (window
+ * px, the same space as xrt_segment_metric::window_rect), or @p fallback.
+ *
+ * The zone is framed from that screen's eyes and against that screen's
+ * physical rectangle (@ref oxr_segment_views_whole_window_metrics relative to
+ * it, then the usual zone rebase), so an element wholly on the second screen
+ * looks around from that screen's viewer instead of the majority's. The
+ * in-process / direct-IPC twin of the present-owner rule
+ * (u_weave_zone_screen_segment, ADR-047 Amendment 4 addendum).
+ *
+ * @p fallback (the caller passes the majority segment, today's answer) when:
+ *  - the zone is empty, or lands on no segment (off the window);
+ *  - it lands on more than one segment: it straddles a seam, and rendering it
+ *    per part needs a second view set per zone (displayxr-browser-pvt#272);
+ *  - its screen's physical or desktop size is unknown (no Kooima against it).
+ */
+uint32_t
+oxr_segment_views_zone_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *zone, uint32_t fallback);
 
 /*!
  * The factor a window-centred display rig's virtual display height takes for
