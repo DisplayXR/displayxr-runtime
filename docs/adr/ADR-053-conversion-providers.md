@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-10-12
 deciders: David Fattal
 issues: []
@@ -8,7 +8,7 @@ related: [ADR-019, ADR-020, ADR-034, ADR-035, ADR-042, ADR-045, ADR-048, ADR-049
 
 # ADR-053: Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
 
-**Status:** Proposed (2026-10-12) · supersedes the plug-in contract of
+**Status:** Accepted (2026-10-12, owner sign-off on the five packaging decisions after a second lift review) · supersedes the plug-in contract of
 [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) §5 (the display-processor
 lift slots) and its consumer "open default" clause; generalises
 [ADR-049](ADR-049-in-process-lift-rides-the-service.md) to every graphics API · keeps

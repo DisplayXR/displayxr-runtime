@@ -1047,9 +1047,9 @@ Also closed in passing:
 
 ## 11. Open questions and must-verify items
 
-### 11.1 For the owner (with recommendations)
+### 11.1 Decided by the owner 2026-10-12 (recommendations accepted as written)
 
-| | Question | Recommendation |
+| | Question | Decision |
 |---|---|---|
 | (a) | Ship the satellite host before any out-of-tree provider? | **Yes, in P2**, proven on the sim provider with CI kill tests. The legacy adapter stays in the service; the file-lock saga ends in P3, when the vendor provider DLL is satellite-hosted from day one. This also keeps two inference runtimes out of one process before P4. |
 | (b) | Lift v4/v5, or a new `XR_DXR_conversion`? | **Lift spec 4, then 5** (ADR-053), pending veto. |
