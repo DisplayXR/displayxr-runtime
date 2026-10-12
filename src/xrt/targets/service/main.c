@@ -52,6 +52,7 @@ workspace_launch_provider(const char *controller_id)
 
 #include "target_lists.h"
 #include "target_status_snapshot.h" // ADR-051 D3: the status provider
+#include "target_display_hotplug.h" // ADR-051 D6: the display-identity follow-up sink
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -87,6 +88,24 @@ register_status_provider(void)
 	    .change_key = target_status_snapshot_change_key,
 	};
 	ipc_server_set_status_provider(&provider);
+}
+
+/*!
+ * ADR-051 D6: a re-enumeration that kept a monitor's identity across an
+ * unreadable EDID (mid-reseat) asks for one more; the service runs no
+ * in-process hotplug monitor, so it goes to the display re-probe worker.
+ */
+static void
+display_followup_to_reprobe(const char *reason)
+{
+	// Debounced by the worker; a no-op until ipc_server_main started it.
+	ipc_server_request_display_reprobe(reason);
+}
+
+static void
+register_display_followup(void)
+{
+	target_display_hotplug_set_followup_sink(display_followup_to_reprobe);
 }
 
 
@@ -405,6 +424,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// class claims — facts only the service target can check.
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
+	register_display_followup();
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
@@ -559,6 +579,7 @@ main(int argc, char *argv[])
 	// orchestrator entry exists on macOS and desktop Linux).
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
+	register_display_followup();
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =

@@ -42,6 +42,7 @@
 #include "os/os_threading.h"
 #include "os/os_display_edid.h"
 #include "os/os_display_desktop.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_setting.h"
 
@@ -3341,6 +3342,10 @@ static struct
 	uint32_t cand_count;
 	//! @ref cands is from a resolve over every loadable plug-in (not the POSIX active-only shortcut).
 	bool cands_valid;
+	//! When this monitor's EDID was last actually read (os_monotonic_get_ns), ADR-051 D6.
+	uint64_t edid_read_ns;
+	//! @ref mon's EDID identity is carried forward from an earlier read (target_plugin_edid_carry).
+	bool edid_carried;
 } g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_monitor_side_count = 0;
 
@@ -3439,6 +3444,71 @@ monitor_device_name(const struct os_display_edid_monitor *m, char *out, size_t c
 	(void)snprintf(out, cap, "%s", m->output_name[0] != '\0' ? m->output_name : m->connector);
 }
 
+static bool
+edid_triple_zero(const struct os_display_edid_monitor *m)
+{
+	return m->manufacturer_id == 0 && m->product_id == 0 && m->serial_number == 0;
+}
+
+static bool
+same_name(const char *a, const char *b)
+{
+	return a[0] != '\0' && b[0] != '\0' && strcmp(a, b) == 0;
+}
+
+enum target_edid_carry
+target_plugin_edid_carry(const struct os_display_edid_monitor *prev,
+                         uint64_t prev_read_ns,
+                         struct os_display_edid_monitor *cur,
+                         uint64_t now_ns)
+{
+	if (prev == NULL || cur == NULL || !edid_triple_zero(cur) || edid_triple_zero(prev)) {
+		return TARGET_EDID_CARRY_NONE;
+	}
+	// The same output: the RandR output name (or macOS UUID) when both carry
+	// one, else the DRM connector. An unreadable EDID can also lose the
+	// DRM join, so the connector alone is not required.
+	const bool same_output =
+	    same_name(prev->output_name, cur->output_name) || same_name(prev->connector, cur->connector);
+	const bool same_rect = prev->screen_left == cur->screen_left && prev->screen_top == cur->screen_top &&
+	                       prev->pixel_width == cur->pixel_width && prev->pixel_height == cur->pixel_height &&
+	                       !cur->origin_unknown;
+	if (!same_output || !same_rect) {
+		return TARGET_EDID_CARRY_NONE;
+	}
+	if (now_ns < prev_read_ns || now_ns - prev_read_ns > TARGET_EDID_CARRY_WINDOW_NS) {
+		return TARGET_EDID_CARRY_EXPIRED;
+	}
+	cur->manufacturer_id = prev->manufacturer_id;
+	cur->product_id = prev->product_id;
+	cur->serial_number = prev->serial_number;
+	if (cur->connector[0] == '\0') {
+		(void)snprintf(cur->connector, sizeof(cur->connector), "%s", prev->connector);
+	}
+	if (cur->output_name[0] == '\0') {
+		(void)snprintf(cur->output_name, sizeof(cur->output_name), "%s", prev->output_name);
+	}
+	if (cur->display_name[0] == '\0') {
+		(void)snprintf(cur->display_name, sizeof(cur->display_name), "%s", prev->display_name);
+	}
+	if (cur->physical_width_mm == 0 || cur->physical_height_mm == 0) {
+		cur->physical_width_mm = prev->physical_width_mm;
+		cur->physical_height_mm = prev->physical_height_mm;
+	}
+	if (cur->native_width == 0 || cur->native_height == 0) {
+		cur->native_width = prev->native_width;
+		cur->native_height = prev->native_height;
+	}
+	if (cur->preferred_width == 0 || cur->preferred_height == 0) {
+		cur->preferred_width = prev->preferred_width;
+		cur->preferred_height = prev->preferred_height;
+	}
+	if (cur->join == OS_EDID_JOIN_NONE) {
+		cur->join = prev->join;
+	}
+	return TARGET_EDID_CARRY_KEPT;
+}
+
 uint32_t
 target_plugin_build_descriptors(const struct os_display_edid_list *list,
                                 struct xrt_display_descriptor *out,
@@ -3452,8 +3522,70 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	if (n > max) {
 		n = max;
 	}
+	if (n > OS_DISPLAY_EDID_MAX_MONITORS) {
+		n = OS_DISPLAY_EDID_MAX_MONITORS;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct os_display_edid_monitor mons[OS_DISPLAY_EDID_MAX_MONITORS];
+	uint64_t read_ns[OS_DISPLAY_EDID_MAX_MONITORS];
+	bool carried[OS_DISPLAY_EDID_MAX_MONITORS];
+	uint32_t carried_count = 0;
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	// ADR-051 D6: mid-reseat, the compositor can still list an output whose
+	// EDID reads back empty. Keep the identity the previous build read on the
+	// same output and rect, or the screen table publishes a removal plus an
+	// EDID-less "new" screen, then the reverse once the EDID is back.
+	bool prev_used[XRT_DP_REGISTRY_MAX_ENTRIES] = {false};
 	for (uint32_t i = 0; i < n; i++) {
-		const struct os_display_edid_monitor *m = &list->monitors[i];
+		mons[i] = list->monitors[i];
+		read_ns[i] = now_ns;
+		carried[i] = false;
+		if (!edid_triple_zero(&mons[i])) {
+			continue;
+		}
+		for (uint32_t j = 0; j < g_monitor_side_count; j++) {
+			if (prev_used[j]) {
+				continue;
+			}
+			const enum target_edid_carry r = target_plugin_edid_carry(
+			    &g_monitor_side[j].mon, g_monitor_side[j].edid_read_ns, &mons[i], now_ns);
+			if (r == TARGET_EDID_CARRY_NONE) {
+				continue;
+			}
+			prev_used[j] = true;
+			if (r == TARGET_EDID_CARRY_KEPT) {
+				read_ns[i] = g_monitor_side[j].edid_read_ns;
+				carried[i] = true;
+				carried_count++;
+				if (!g_monitor_side[j].edid_carried) {
+					U_LOG_W(
+					    "plugin loader: monitor '%s' at (%d,%d) %ux%u: EDID unreadable — "
+					    "keeping its identity mfr=0x%04x product=0x%04x serial=0x%08x "
+					    "(key '%s') for up to %llu s while it is re-read",
+					    mons[i].output_name[0] != '\0' ? mons[i].output_name : mons[i].connector,
+					    (int)mons[i].screen_left, (int)mons[i].screen_top, mons[i].pixel_width,
+					    mons[i].pixel_height, mons[i].manufacturer_id, mons[i].product_id,
+					    mons[i].serial_number, g_monitor_side[j].key,
+					    (unsigned long long)(TARGET_EDID_CARRY_WINDOW_NS /
+					                         (1000ull * 1000ull * 1000ull)));
+				}
+			} else if (g_monitor_side[j].edid_carried) {
+				U_LOG_W(
+				    "plugin loader: monitor '%s' at (%d,%d): EDID still unreadable after %llu s "
+				    "— treating it as a display without an EDID",
+				    mons[i].output_name[0] != '\0' ? mons[i].output_name : mons[i].connector,
+				    (int)mons[i].screen_left, (int)mons[i].screen_top,
+				    (unsigned long long)(TARGET_EDID_CARRY_WINDOW_NS / (1000ull * 1000ull * 1000ull)));
+			}
+			break;
+		}
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		const struct os_display_edid_monitor *m = &mons[i];
 		struct xrt_display_descriptor *d = &out[i];
 		memset(d, 0, sizeof(*d));
 		d->struct_size = (uint32_t)sizeof(*d);
@@ -3470,22 +3602,20 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		d->flags = m->is_primary ? 1u : 0u;
 	}
 
-	if (g_refresh_mutex_initialized) {
-		os_mutex_lock(&g_refresh_mutex);
-	}
 	g_monitor_side_count = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
 	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 		g_monitor_side[i].monitor_id = out[i].monitor_id;
 		g_monitor_side[i].cand_count = 0;
 		g_monitor_side[i].cands_valid = false;
-		g_monitor_side[i].mon = list->monitors[i];
+		g_monitor_side[i].mon = mons[i];
 		g_monitor_side[i].desc = out[i];
-		monitor_device_name(&list->monitors[i], g_monitor_side[i].device_name,
-		                    sizeof(g_monitor_side[i].device_name));
-		key_in[i].manufacturer_id = list->monitors[i].manufacturer_id;
-		key_in[i].product_id = list->monitors[i].product_id;
-		key_in[i].serial = list->monitors[i].serial_number;
+		g_monitor_side[i].edid_read_ns = read_ns[i];
+		g_monitor_side[i].edid_carried = carried[i];
+		monitor_device_name(&mons[i], g_monitor_side[i].device_name, sizeof(g_monitor_side[i].device_name));
+		key_in[i].manufacturer_id = mons[i].manufacturer_id;
+		key_in[i].product_id = mons[i].product_id;
+		key_in[i].serial = mons[i].serial_number;
 		key_in[i].device_name = g_monitor_side[i].device_name;
 	}
 	// Display dashboard phase 7: the stable key a per-screen preference is
@@ -3497,6 +3627,16 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	}
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
+	}
+
+	// A carried identity is provisional: ask for another enumeration so the
+	// real EDID is read once the kernel has it (the window bounds the series).
+	// Rate-limited, so a status read every second cannot keep re-arming the
+	// service worker's debounce and starve the re-run.
+	static uint64_t s_last_followup_ns = 0;
+	if (carried_count > 0 && now_ns - s_last_followup_ns >= 2ull * 1000ull * 1000ull * 1000ull) {
+		s_last_followup_ns = now_ns;
+		target_display_hotplug_request_followup("EDID unreadable — identity kept, re-reading");
 	}
 	return n;
 }

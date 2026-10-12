@@ -365,12 +365,52 @@ struct os_display_edid_monitor;
  * monitor records (connector, mm, device mode) in a runtime-private side
  * table keyed by monitor id; the descriptor struct (plug-in ABI) is unchanged.
  *
+ * A monitor whose EDID reads back empty on an output and rect the previous
+ * call knew with a real EDID keeps that identity for up to
+ * @ref TARGET_EDID_CARRY_WINDOW_NS (@ref target_plugin_edid_carry), and a
+ * follow-up re-enumeration is requested so the real EDID is read again.
+ *
  * Issue #69 / ADR-015.
  */
 uint32_t
 target_plugin_build_descriptors(const struct os_display_edid_list *list,
                                 struct xrt_display_descriptor *out,
                                 uint32_t max);
+
+/*!
+ * How long a monitor whose EDID reads back empty may keep the identity last
+ * read on the same output and desktop rect (ADR-051 D6). Covers a cable
+ * reseat, where the compositor still lists the output before the kernel's
+ * EDID is readable again; past it the monitor is treated as what it reads
+ * as (a new, EDID-less display).
+ */
+#define TARGET_EDID_CARRY_WINDOW_NS (30ull * 1000ull * 1000ull * 1000ull)
+
+//! What @ref target_plugin_edid_carry decided for one fresh record.
+enum target_edid_carry
+{
+	TARGET_EDID_CARRY_NONE = 0, //!< Not a candidate: real EDID, or another output / rect.
+	TARGET_EDID_CARRY_KEPT,     //!< @p cur borrowed @p prev's identity.
+	TARGET_EDID_CARRY_EXPIRED,  //!< Same output and rect, but the window is over.
+};
+
+/*!
+ * The mid-reseat identity rule (pure; used by
+ * @ref target_plugin_build_descriptors). When @p cur has an all-zero EDID
+ * triple (manufacturer, product, serial) and @p prev -- the record last built
+ * for a monitor -- had a non-zero one on the same output (RandR output name
+ * or DRM connector, whichever both carry) and the same desktop rect, and
+ * @p now_ns is within @ref TARGET_EDID_CARRY_WINDOW_NS of @p prev_read_ns
+ * (when @p prev's EDID was last actually read), copy @p prev's EDID-side
+ * fields into @p cur: the triple, and the connector / mm / device mode /
+ * display name / join where @p cur has none. Its monitor id and screen key
+ * then come out as before. Nothing is copied unless KEPT.
+ */
+enum target_edid_carry
+target_plugin_edid_carry(const struct os_display_edid_monitor *prev,
+                         uint64_t prev_read_ns,
+                         struct os_display_edid_monitor *cur,
+                         uint64_t now_ns);
 
 /*!
  * Build the per-monitor DP factory registry (issue #69 / ADR-015). Loads
