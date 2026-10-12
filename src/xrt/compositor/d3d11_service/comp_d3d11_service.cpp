@@ -16202,6 +16202,90 @@ svc_cursor_draw_direct(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Under the shell (ADR-046 Phase 4): the slot whose window CONTENT the
+ * workspace cursor is over, if that client's last frame carried a runtime-
+ * drawn cursor request (returned in @p out_req / @p out_seq); else -1, and the
+ * workspace cursor stays exactly as it was.
+ *
+ * "Over the content" is the controller's over-window flag plus the focused
+ * slot's content rect - the same rect the service forwards pointer input
+ * through, so the client whose hint follows the pointer is the one lifted.
+ * A display-zones request is not lifted (follow-up).
+ *
+ * Render thread. Zero cost for a workspace whose clients never ask: one
+ * unlocked bool test (frame_valid is written only by that client's commit).
+ */
+static int
+svc_cursor_lift_target(struct d3d11_multi_compositor *mc, struct u_cursor_draw_request *out_req, uint64_t *out_seq)
+{
+	memset(out_req, 0, sizeof(*out_req));
+	*out_seq = 0;
+	if (mc == nullptr || !mc->cursor_over_window) {
+		return -1;
+	}
+	const int32_t f = mc->focused_slot;
+	if (f < 0 || f >= D3D11_MULTI_MAX_CLIENTS) {
+		return -1;
+	}
+	const struct d3d11_multi_client_slot *cs = &mc->clients[f];
+	struct d3d11_service_compositor *fc = cs->compositor;
+	if (!cs->active || !cs->placed || cs->minimized || fc == nullptr || !fc->cursor_draw.frame_valid) {
+		return -1;
+	}
+	const int32_t px = mc->cursor_panel_x, py = mc->cursor_panel_y;
+	if (cs->window_rect_w <= 0 || cs->window_rect_h <= 0 || px < cs->window_rect_x ||
+	    px >= cs->window_rect_x + cs->window_rect_w || py < cs->window_rect_y ||
+	    py >= cs->window_rect_y + cs->window_rect_h) {
+		return -1;
+	}
+	{
+		std::lock_guard<std::mutex> lk(fc->cursor_draw.mutex);
+		if (!fc->cursor_draw.frame_valid) {
+			return -1;
+		}
+		svc_cursor_request_from_wire(&fc->cursor_draw.frame, out_req);
+		*out_seq = fc->cursor_draw.frame_seq;
+	}
+	if (out_req->zone_valid || !u_cursor_draw_should_draw(out_req) || comp_cursor_draw_debug_refuse(out_req)) {
+		return -1;
+	}
+	return f;
+}
+
+/*!
+ * Under the shell: every client whose last frame asked for a runtime-drawn
+ * cursor learns whether it was drawn (lifted onto its window) - #1952 across
+ * the process boundary, so its willDraw stays honest. Render thread.
+ */
+static void
+svc_cursor_record_lift_outcomes(struct d3d11_multi_compositor *mc, int lift_slot, uint64_t lift_seq, bool lift_drew)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+		if (!mc->clients[s].active || oc == nullptr || !oc->cursor_draw.frame_valid) {
+			continue; // never asked (or not this frame): nothing to answer
+		}
+		if (!mc->clients[s].placed) {
+			continue; // not a tile: drawn (and answered) at its own commit
+		}
+		uint64_t seq;
+		{
+			std::lock_guard<std::mutex> lk(oc->cursor_draw.mutex);
+			if (!oc->cursor_draw.frame_valid) {
+				continue;
+			}
+			seq = oc->cursor_draw.frame_seq;
+		}
+		const bool drew = s == lift_slot && lift_drew;
+		svc_cursor_record_outcome(oc, s == lift_slot ? lift_seq : seq, drew, U_CURSOR_DRAW_REFUSAL_NOT_REACHED);
+	}
+}
+
+
+/*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
  *
@@ -18532,6 +18616,17 @@ multi_compositor_compose_pass(struct d3d11_service_system *sys,
 	// eye-disparity rendering with hit-Z math + over-window dimming;
 	// controller owns the sprite content (shape, color, animation,
 	// branding) via xrCreateWorkspaceCursorSwapchainDXR + xrSetWorkspaceCursorDXR.
+	//
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): when the cursor is over
+	// the content of a client whose last frame carried a runtime-drawn cursor
+	// request, the workspace cursor is LIFTED onto that content (the client's
+	// per-view placement offsets on top of the window plane's disparity), and
+	// the ONE-FADE RULE applies: the controller's over-window dim does not, B.7
+	// softening is the only fade. Anywhere else: exactly the flat behaviour.
+	struct u_cursor_draw_request lift_req;
+	uint64_t lift_seq = 0;
+	const int lift_slot = svc_cursor_lift_target(mc, &lift_req, &lift_seq);
+	bool lift_drew = false;
 	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
 		uint32_t ca_w = svc_geom_px_w(sys);
 		uint32_t ca_h = svc_geom_px_h(sys);
@@ -18671,6 +18766,28 @@ multi_compositor_compose_pass(struct d3d11_service_system *sys,
 			// existing window-blit eye-mapping convention; multiview
 			// layouts (col > 1) collapse to one of the two tracked eye
 			// positions the same way windows do.
+			// ADR-046 Phase 4: the lifted cursor's per-eye content offset, in
+			// tile px - the client's view offsets (tile-normalised over its
+			// window) scaled by the window's size in the tile. Eye 0 takes the
+			// client's first view, eye 1 its last (the outermost pair).
+			const bool lifting = lift_slot >= 0 && !lift_req.report_only;
+			float lift_off[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+			if (lift_slot >= 0) {
+				const struct d3d11_multi_client_slot *ls = &mc->clients[lift_slot];
+				const float win_w_tile = (float)ls->window_rect_w * scale_x;
+				const float win_h_tile = (float)ls->window_rect_h * scale_y;
+				const uint32_t nv = lift_req.view_count;
+				float o[2];
+				if (u_cursor_draw_view_offset(&lift_req, 0, o)) {
+					lift_off[0][0] = o[0] * win_w_tile;
+					lift_off[0][1] = o[1] * win_h_tile;
+				}
+				if (nv >= 2 && u_cursor_draw_view_offset(&lift_req, nv - 1, o)) {
+					lift_off[1][0] = o[0] * win_w_tile;
+					lift_off[1][1] = o[1] * win_h_tile;
+				}
+			}
+
 			struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
 			uint32_t quad_count = 0;
 			for (uint32_t row = 0; row < n_rows; row++) {
@@ -18678,9 +18795,14 @@ multi_compositor_compose_pass(struct d3d11_service_system *sys,
 					int eye_idx = (int)(col % 2);
 					float disp_off = (eye_idx == 0) ? +half_disp_tile_px
 					                                : -half_disp_tile_px;
+					float lift_dy = 0.0f;
+					if (lifting) {
+						disp_off += lift_off[eye_idx][0];
+						lift_dy = lift_off[eye_idx][1];
+					}
 					struct svc_cursor_quad *q = &quads[quad_count++];
 					q->x = (float)(col * tile_w) + base_tile_x - hot_x_atlas + disp_off;
-					q->y = (float)(row * tile_h) + base_tile_y - hot_y_atlas;
+					q->y = (float)(row * tile_h) + base_tile_y - hot_y_atlas + lift_dy;
 					q->w = cursor_w_atlas;
 					q->h = cursor_h_atlas;
 					// Tile-local clip — keeps a left-tile cursor with
@@ -18696,17 +18818,53 @@ multi_compositor_compose_pass(struct d3d11_service_system *sys,
 			// per-tile draw relies on it, so the lock spans the whole call. The
 			// keyed-mutex acquire above is deliberately outside it. See
 			// combine_ctx_lock.
-			combine_ctx_lock ctx_lock(sys);
-			// Over-window cosmetic (spec 22/23): multiplicative tint, RGB 1 so the
-			// cursor keeps its colour, alpha = the controller's dim factor, to cut
-			// lenticular crosstalk on its bright pixels over content.
-			svc_draw_cursor_quads(sys, svc_compose_rtv(T), (float)ca_w, (float)ca_h, cursor_srv, sprite_w_px,
-			                      sprite_h_px, quads, quad_count, over_window ? body_tint : nullptr,
-			                      /*convert_srgb*/ false);
+			if (lift_slot >= 0) {
+				// The lift draws (or, report-only, would draw) on every pass;
+				// the outcome is the primary pass's to record (below).
+				lift_drew = quad_count > 0;
+			}
+			if (lifting) {
+				// The ONE-FADE RULE (ADR-046 Phase 4): no controller dim on the
+				// runtime-lifted cursor; B.7 softening is its only fade. The ghost
+				// is the drawn eye-to-eye offset, in panel px; the blur cap follows
+				// the drawn sprite.
+				const float ghost_tile_px = fabsf(2.0f * half_disp_tile_px + lift_off[0][0] - lift_off[1][0]);
+				const float ghost_px = scale_x > 0.0f ? ghost_tile_px / scale_x : 0.0f;
+				const float sprite_px = scale_y > 0.0f ? cursor_h_atlas / scale_y : 0.0f;
+				const struct u_cursor_soften soften = u_cursor_draw_soften_sized(
+				    lift_req.disparity, ghost_px, sprite_px, comp_cursor_soften_params());
+				struct svc_cursor_style style = {};
+				style.premultiplied = false; // the controller's sprite is straight alpha
+				style.shared_shaders = false; // the compose pass's colour model
+				style.alpha = soften.alpha;
+				if (soften.blur_px > 0.0f && cursor_w_atlas > 0.0f && cursor_h_atlas > 0.0f) {
+					style.radius_uv[0] = soften.blur_px * scale_x / cursor_w_atlas;
+					style.radius_uv[1] = soften.blur_px * scale_y / cursor_h_atlas;
+				}
+				combine_ctx_lock ctx_lock(sys);
+				svc_draw_cursor_quads(sys, svc_compose_rtv(T), (float)ca_w, (float)ca_h, cursor_srv,
+				                      sprite_w_px, sprite_h_px, quads, quad_count, /*tint*/ nullptr,
+				                      /*convert_srgb*/ false, &style);
+			} else {
+				combine_ctx_lock ctx_lock(sys);
+				// Over-window cosmetic (spec 22/23): multiplicative tint, RGB 1 so
+				// the cursor keeps its colour, alpha = the controller's dim factor,
+				// to cut lenticular crosstalk on its bright pixels over content.
+				svc_draw_cursor_quads(sys, svc_compose_rtv(T), (float)ca_w, (float)ca_h, cursor_srv,
+				                      sprite_w_px, sprite_h_px, quads, quad_count,
+				                      over_window ? body_tint : nullptr, /*convert_srgb*/ false);
+			}
 		}
 		if (cursor_mutex_held) {
 			cursor_mutex->ReleaseSync(0);
 		}
+	}
+	// ADR-046 Phase 4 (#1952 across IPC): every client whose last frame asked
+	// for a runtime-drawn cursor learns whether it was drawn - lifted onto its
+	// window, or not (the cursor is elsewhere, hidden, or over its chrome).
+	// The primary pass only: one decision per compose tick.
+	if (t_ws_pass == nullptr) {
+		svc_cursor_record_lift_outcomes(mc, lift_slot, lift_seq, lift_drew);
 	}
 
 	out->compose_linear = compose_linear;
