@@ -318,6 +318,16 @@ struct xrt_dp_lift_depth
  * negative value = AUTO: the module picks it. The plug-in maps this to its
  * model's own units and calibrates it on its panel; the runtime never
  * interprets it beyond clamping to [0, 1] (or passing a negative through).
+ *
+ * Runtime auto-convergence (epic #1858, u_lift_autoconv.h): when the APP
+ * leaves it AUTO, the runtime by default picks it itself from the depth of the
+ * conversion (the module's auxiliary depth, which it then requests even if the
+ * app did not) and passes a caller-set value >= 0 here, smoothed over time.
+ * It is computed in the frame's NORMALISED INVERSE-depth range h (0 farthest,
+ * 1 nearest) as convergence = 1 - h(subject). A module that receives a value
+ * >= 0 should not run its own auto-convergence for that conversion.
+ * DXR_LIFT_AUTO_CONVERGENCE=module restores AUTO pass-through. No new field:
+ * an older plug-in already honours a caller-set value.
  */
 struct xrt_dp_lift_params
 {

@@ -14,6 +14,7 @@
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
+#include "util/u_lift_autoconv.h"
 #include "util/u_lift_depth.h"
 #include "util/u_lift_mailbox.h"
 #include "util/u_lift_rig.h"
@@ -369,6 +370,25 @@ struct lift_stream
 	u_lift_letterbox lb = {};
 	lift_lb_readback lb_rb[LB_RING];
 	uint32_t lb_next = 0; //!< next ring entry to issue into
+
+	// Runtime auto-convergence (u_lift_autoconv.h), lift thread only.
+	//! The module was asked for the depth of each conversion for the policy
+	//! (beyond what the app asked for).
+	bool ac_depth = false;
+	u_lift_autoconv_filter ac = {};
+	u_lift_autoconv_estimate ac_last = {}; //!< last measurement (logged)
+	//! One depth readback in flight (lift device, staging).
+	ID3D11Texture2D *ac_staging = nullptr;
+	uint32_t ac_w = 0, ac_h = 0, ac_fmt = 0;
+	bool ac_pending = false;
+	bool ac_inverse = true;
+	float ac_scale = 1.0f, ac_offset = 0.0f;
+	uint64_t ac_issued_ns = 0;
+	std::vector<float> ac_scratch; //!< R16F -> float rows
+	float ac_value = -1.0f;        //!< last delivered convergence; < 0 = none yet
+	uint64_t ac_applied = 0;       //!< conversions that carried the runtime's value
+	bool ac_locked_logged = false;
+	bool ac_nodepth_logged = false;
 };
 
 struct d3d11_lift
@@ -385,6 +405,11 @@ struct d3d11_lift
 	void *eyes_ud = nullptr;
 	//! The display's nominal viewing distance (ADR-048 straight-on viewer).
 	float nominal_z = U_LIFT_NOMINAL_Z_DEFAULT_M;
+	//! DXR_LIFT_AUTO_CONVERGENCE, read once at create: who picks the
+	//! convergence of a stream whose app leaves it AUTO (default: the runtime).
+	u_lift_autoconv_source autoconv = U_LIFT_AUTOCONV_SOURCE_RUNTIME;
+	u_lift_autoconv_params ac_params = {};
+	u_lift_autoconv_filter_params ac_fparams = {};
 	//! DXR_LIFT_RECENTER=off, read once at create: force recentering OFF for
 	//! every stream (A/B against the ADR-048 default ease-back).
 	bool recenter_off = false;
@@ -764,6 +789,8 @@ stream_release_gpu(lift_stream &st)
 		rel(r.staging);
 		r.pending = false;
 	}
+	rel(st.ac_staging);
+	st.ac_pending = false;
 }
 
 
@@ -1119,10 +1146,10 @@ resolve_viewpoints(d3d11_lift *l,
  * Lift thread, no lock held, right after the views were copied into @p o.
  */
 static void
-lift_copy_depth(d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoint_result &vr)
+lift_copy_depth(
+    d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoint_result &vr, const xrt_dp_lift_depth *got)
 {
-	xrt_dp_lift_depth dd;
-	if (!xrt_display_processor_d3d11_lift_get_depth(l->dp, st.dp_id, l->lift_context, &dd)) {
+	if (got == nullptr) {
 		if (!st.depth_missing_logged) {
 			st.depth_missing_logged = true;
 			U_LOG_W("[lift] stream %llu asked for auxiliary depth but the module returned none%s",
@@ -1133,6 +1160,7 @@ lift_copy_depth(d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoin
 		}
 		return;
 	}
+	const xrt_dp_lift_depth &dd = *got;
 	if (dd.format != DXGI_FORMAT_R32_FLOAT && dd.format != DXGI_FORMAT_R16_FLOAT) {
 		if (!st.depth_missing_logged) {
 			st.depth_missing_logged = true;
@@ -1205,6 +1233,143 @@ lift_copy_depth(d3d11_lift *l, lift_stream &st, lift_out_slot &o, const viewpoin
 	}
 }
 
+/*
+ *
+ * Runtime auto-convergence (epic #1858, u_lift_autoconv.h). Lift thread only.
+ *
+ * The depth of a conversion is copied into a staging texture at most every
+ * U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS, mapped (never waited on) before a later
+ * conversion, measured, and fed to the stream's filter; every conversion then
+ * carries the filter's current value as its convergence.
+ *
+ */
+
+//! IEEE half -> float (the depth may be R16_FLOAT).
+static float
+half_to_float(uint16_t h)
+{
+	const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp = (h >> 10) & 0x1fu;
+	uint32_t man = h & 0x3ffu;
+	uint32_t bits;
+	if (exp == 0) {
+		if (man == 0) {
+			bits = sign;
+		} else {
+			// Subnormal: normalise.
+			exp = 127 - 15 + 1;
+			while ((man & 0x400u) == 0) {
+				man <<= 1;
+				exp--;
+			}
+			man &= 0x3ffu;
+			bits = sign | (exp << 23) | (man << 13);
+		}
+	} else if (exp == 0x1f) {
+		bits = sign | 0x7f800000u | (man << 13); // inf / NaN
+	} else {
+		bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+	}
+	float f;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+//! The policy runs for this conversion: runtime source, a view-synthesis
+//! stream, and the app left the convergence AUTO.
+static bool
+autoconv_active(const d3d11_lift *l, const lift_stream &st, const xrt_dp_lift_params &params)
+{
+	return l->autoconv == U_LIFT_AUTOCONV_SOURCE_RUNTIME &&
+	       (st.info.mode == XRT_DP_LIFT_MODE_SBS || st.info.mode == XRT_DP_LIFT_MODE_NVIEW) &&
+	       !(params.convergence >= 0.0f);
+}
+
+//! Map the readback in flight if the GPU is done with it, measure, feed the filter.
+static void
+autoconv_poll(d3d11_lift *l, lift_stream &st, uint64_t now_ns)
+{
+	if (!st.ac_pending || st.ac_staging == nullptr) {
+		return;
+	}
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	HRESULT hr = l->lift_context->Map(st.ac_staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+	if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+		return; // next conversion
+	}
+	st.ac_pending = false;
+	if (FAILED(hr)) {
+		return;
+	}
+	static u_lift_autoconv_grid grid; // ~64 KiB: off the stack; the lift thread is the only user
+	bool ok = false;
+	if (st.ac_fmt == DXGI_FORMAT_R32_FLOAT && (m.RowPitch % sizeof(float)) == 0) {
+		ok = u_lift_autoconv_grid_from_samples((const float *)m.pData, st.ac_w, st.ac_h,
+		                                       m.RowPitch / (uint32_t)sizeof(float), st.ac_inverse, st.ac_scale,
+		                                       st.ac_offset, U_LIFT_AUTOCONV_GRID_MAX_W, &grid);
+	} else if (st.ac_fmt == DXGI_FORMAT_R16_FLOAT) {
+		st.ac_scratch.resize((size_t)st.ac_w * st.ac_h);
+		for (uint32_t y = 0; y < st.ac_h; y++) {
+			const uint16_t *row = (const uint16_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
+			for (uint32_t x = 0; x < st.ac_w; x++) {
+				st.ac_scratch[(size_t)y * st.ac_w + x] = half_to_float(row[x]);
+			}
+		}
+		ok = u_lift_autoconv_grid_from_samples(st.ac_scratch.data(), st.ac_w, st.ac_h, st.ac_w, st.ac_inverse,
+		                                       st.ac_scale, st.ac_offset, U_LIFT_AUTOCONV_GRID_MAX_W, &grid);
+	}
+	l->lift_context->Unmap(st.ac_staging, 0);
+
+	// The depth covers exactly what was converted, and weave-rect snapshots
+	// are letterbox-cropped BEFORE conversion: no bars to exclude here.
+	u_lift_autoconv_estimate e = {};
+	if (ok) {
+		u_lift_autoconv_find_subject(&grid, nullptr, &l->ac_params, &e);
+	}
+	st.ac_last = e;
+	u_lift_autoconv_filter_measure(&st.ac, &l->ac_fparams, &e, now_ns);
+}
+
+//! Start a readback of the depth the module just returned, if one is due.
+static void
+autoconv_issue(d3d11_lift *l, lift_stream &st, const xrt_dp_lift_depth &dd, uint64_t now_ns)
+{
+	if (st.ac_pending || (st.ac_issued_ns != 0 && now_ns - st.ac_issued_ns < U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS)) {
+		return;
+	}
+	if (dd.resource == nullptr || dd.width == 0 || dd.height == 0 ||
+	    (dd.format != DXGI_FORMAT_R32_FLOAT && dd.format != DXGI_FORMAT_R16_FLOAT)) {
+		return;
+	}
+	if (st.ac_staging == nullptr || st.ac_w != dd.width || st.ac_h != dd.height || st.ac_fmt != dd.format) {
+		rel(st.ac_staging);
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = dd.width;
+		td.Height = dd.height;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = (DXGI_FORMAT)dd.format;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(l->lift_device->CreateTexture2D(&td, nullptr, &st.ac_staging))) {
+			st.ac_staging = nullptr;
+			return;
+		}
+		st.ac_w = dd.width;
+		st.ac_h = dd.height;
+		st.ac_fmt = dd.format;
+	}
+	D3D11_BOX box = {0, 0, 0, dd.width, dd.height, 1};
+	l->lift_context->CopySubresourceRegion(st.ac_staging, 0, 0, 0, 0, (ID3D11Resource *)dd.resource, 0, &box);
+	l->lift_context->Flush(); // submitted now, mapped (DO_NOT_WAIT) before a later conversion
+	st.ac_inverse = dd.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+	st.ac_scale = dd.value_scale;
+	st.ac_offset = dd.value_offset;
+	st.ac_pending = true;
+	st.ac_issued_ns = now_ns;
+}
+
 /*!
  * Convert the pending frame of @p st. Called with @p lk HELD; drops it around
  * every GPU / module call and returns with it held.
@@ -1247,11 +1412,60 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	params.nominal_z_m = l->nominal_z;
 	const bool want_depth = (st.info.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0;
 
+	// Runtime auto-convergence (epic #1858): measure the depth that came back
+	// since the last conversion, then hand this one the follower's value as
+	// an ordinary caller-set convergence. Until the first measurement — or
+	// when the module returns no depth — the app's AUTO goes through and the
+	// module's own auto-convergence stays in charge.
+	const bool ac_on = autoconv_active(l, st, params);
+	if (ac_on) {
+		const uint64_t ac_now = os_monotonic_get_ns();
+		autoconv_poll(l, st, ac_now);
+		float c = -1.0f;
+		if (u_lift_autoconv_filter_step(&st.ac, &l->ac_fparams, ac_now, &c)) {
+			params.convergence = c;
+			st.ac_value = c;
+			st.ac_applied++;
+			if (!st.ac_locked_logged) {
+				st.ac_locked_logged = true;
+				U_LOG_W(
+				    "[lift] stream %llu: runtime auto-convergence locked at %.3f (subject h=%.3f, "
+				    "confidence %.2f, %u cells)",
+				    (unsigned long long)st.id, c, st.ac_last.mode_h, st.ac_last.confidence,
+				    st.ac_last.samples);
+			}
+		}
+	} else if (st.ac.have) {
+		// The app set its own convergence: start over (re-lock) if it hands
+		// the choice back.
+		u_lift_autoconv_filter_reset(&st.ac);
+		st.ac_value = -1.0f;
+		st.ac_locked_logged = false;
+	}
+
 	bool ok = true;
 	// 1. The module's own stream, created lazily (module contract: lift thread only).
 	if (!st.dp_created && !st.dp_failed) {
-		if (l->dp->lift_stream_create(l->dp, &st.info, &st.dp_id)) {
+		// Runtime auto-convergence measures the depth of the conversion
+		// itself: ask the module for it (if it can return one) even when the
+		// app did not. The app-facing depth export still follows only what
+		// the APP asked for (st.info). l->caps: written by this thread only.
+		xrt_dp_lift_stream_info mi = st.info;
+		st.ac_depth = l->autoconv == U_LIFT_AUTOCONV_SOURCE_RUNTIME &&
+		              (mi.mode == XRT_DP_LIFT_MODE_SBS || mi.mode == XRT_DP_LIFT_MODE_NVIEW) &&
+		              (l->caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0 &&
+		              (mi.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) == 0;
+		if (st.ac_depth) {
+			mi.aux_outputs |= XRT_DP_LIFT_AUX_DEPTH;
+		}
+		if (l->dp->lift_stream_create(l->dp, &mi, &st.dp_id)) {
 			st.dp_created = true;
+			if (st.ac_depth) {
+				U_LOG_W(
+				    "[lift] stream %llu: module asked for the depth of each conversion (runtime "
+				    "auto-convergence)",
+				    (unsigned long long)st.id);
+			}
 		} else {
 			st.dp_failed = true;
 			U_LOG_W("[lift] module refused stream %llu (mode=%u hint=%u) — its frames will never convert",
@@ -1362,8 +1576,23 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 		// lift_convert on this stream).
 		o.has_depth = false;
 		o.relief_valid = false;
-		if (ok && want_depth) {
-			lift_copy_depth(l, st, o, vr);
+		const bool ac_want = ok && ac_on && (st.ac_depth || want_depth);
+		if (ok && (want_depth || ac_want)) {
+			xrt_dp_lift_depth dd;
+			const bool got =
+			    xrt_display_processor_d3d11_lift_get_depth(l->dp, st.dp_id, l->lift_context, &dd);
+			if (want_depth) {
+				lift_copy_depth(l, st, o, vr, got ? &dd : nullptr);
+			}
+			if (ac_want && got) {
+				autoconv_issue(l, st, dd, os_monotonic_get_ns());
+			} else if (ac_want && !st.ac_nodepth_logged) {
+				st.ac_nodepth_logged = true;
+				U_LOG_W(
+				    "[lift] stream %llu: the module returned no depth — runtime auto-convergence "
+				    "cannot measure; the module's own auto-convergence stays in charge",
+				    (unsigned long long)st.id);
+			}
 		}
 	} else if (ok && is_blob) {
 		lift_out_slot &o = st.out[out_slot];
@@ -1392,6 +1621,15 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 		    (unsigned long long)st.id, (unsigned long long)st.mb.submitted, (unsigned long long)st.mb.converted,
 		    (unsigned long long)st.mb.dropped, (unsigned long long)st.mb.failed, st.mb.lat_last_ns / 1e6,
 		    st.mb.lat_ema_ns / 1e6, st.mb.lat_min_ns / 1e6, st.mb.lat_max_ns / 1e6);
+		if (ac_on) {
+			U_LOG_I(
+			    "[lift] stream %llu auto-convergence (runtime): convergence=%.3f target=%.3f subject "
+			    "h=%.3f "
+			    "median h=%.3f confidence=%.2f cells=%u measured=%u held=%u cuts=%u applied=%llu%s",
+			    (unsigned long long)st.id, st.ac_value, st.ac.target, st.ac_last.mode_h,
+			    st.ac_last.median_h, st.ac_last.confidence, st.ac_last.samples, st.ac.measurements,
+			    st.ac.held, st.ac.cuts, (unsigned long long)st.ac_applied, st.ac.fast ? " (cut ramp)" : "");
+		}
 		if (vp_floats >= 3) {
 			U_LOG_I(
 			    "[lift] stream %llu viewpoints: rect centre=(%.3f, %.3f) m size=%.3fx%.3f m mid=(%.3f, "
@@ -1571,6 +1809,23 @@ d3d11_lift_create(ID3D11Device *svc_device,
 		l->recenter_off = rc != nullptr && (_stricmp(rc, "off") == 0 || strcmp(rc, "0") == 0);
 		if (l->recenter_off) {
 			U_LOG_W("[lift] DXR_LIFT_RECENTER=%s: viewpoint recentering forced OFF for every stream", rc);
+		}
+	}
+	{
+		const char *ac = getenv("DXR_LIFT_AUTO_CONVERGENCE");
+		l->autoconv = u_lift_autoconv_source_parse(ac);
+		u_lift_autoconv_params_default(&l->ac_params);
+		u_lift_autoconv_filter_params_default(&l->ac_fparams);
+		if (l->autoconv == U_LIFT_AUTOCONV_SOURCE_RUNTIME) {
+			U_LOG_W(
+			    "[lift] auto-convergence: RUNTIME policy (DXR_LIFT_AUTO_CONVERGENCE=%s) — centre-weighted "
+			    "foreground mode of each stream's conversion depth, sampled every %llu ms, tau %.2f s "
+			    "(cut %.2f s); applies where the app leaves convergence AUTO",
+			    ac != nullptr ? ac : "(unset)",
+			    (unsigned long long)(U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS / 1000000ull), l->ac_fparams.tau_s,
+			    l->ac_fparams.tau_cut_s);
+		} else {
+			U_LOG_W("[lift] auto-convergence: MODULE's own (DXR_LIFT_AUTO_CONVERGENCE=%s)", ac);
 		}
 	}
 	(void)svc_device->QueryInterface(__uuidof(ID3D11Device1), (void **)&l->svc_device1);

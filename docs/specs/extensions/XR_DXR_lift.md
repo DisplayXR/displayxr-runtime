@@ -119,7 +119,7 @@ module defaults):
 
 | Field | Meaning |
 |---|---|
-| `convergence` | RELATIVE depth placed at the display plane, in [0, 1] over the frame's depth range (0 = nearest content on the glass, 1 = farthest, 0.5 = mid). Negative = AUTO. >1 is clamped. The plug-in maps it to its model's units and calibrates it for its panel. |
+| `convergence` | RELATIVE depth placed at the display plane, in [0, 1] over the frame's depth range (0 = nearest content on the glass, 1 = farthest, 0.5 = mid). Negative = AUTO — on SBS / NVIEW streams the service then picks it (§4.4). >1 is clamped. The plug-in maps it to its model's units and calibrates it for its panel. |
 | `strength` | disparity scale; 1 = the module's calibrated budget, 0 = flat |
 | `inpaint` | fill disocclusions (XR_TRUE) or leave them |
 | `viewpointSource` | TRACKED (the runtime passes the panel's predicted tracked eyes) or EXPLICIT (`viewpoints`, `viewCount` display-space positions in metres) |
@@ -291,6 +291,40 @@ principal point, near / far, `convergence_depth`, `same_inference`, the module's
 runtime copies it into the result's ring slot and then the per-stream depth export texture,
 and derives `depthToDisplay` itself. Capability: `xrt_dp_lift_caps::aux_outputs` /
 `aux_depth_semantics`. An older plug-in (no slot) simply returns no depth.
+
+### 4.4 AUTO convergence is runtime policy (epic #1858)
+
+When an app leaves `convergence` AUTO on an SBS / NVIEW stream, the **service picks it** — no
+API change; an explicit value from the app always wins. The conversion module only maps the
+value into its units (it already honours a caller-set convergence), and the module's own
+auto-convergence no longer runs for that stream.
+
+- **Input:** the depth map of the conversion itself (the auxiliary depth of §4.3). The service
+  requests it from the module for this purpose even when the app did not (the app-facing depth
+  export still follows only what the app asked for). Weave-rect snapshots are letterbox-cropped
+  before conversion (§6), so the depth holds no bars.
+- **Sampling:** at most one depth map every 125 ms (~8 Hz) is copied to a staging texture on the
+  lift device and mapped without waiting before a later conversion; never per frame.
+- **Estimator** (`u_lift_autoconv.h`): inverse depth, box-downsampled to ≤ 128 cells wide and
+  normalised over the frame's range (h = 0 farthest, 1 nearest); a soft centre prior (Gaussian,
+  σ = 0.35 of the width / height) with a bottom damp (weight 0.5 at the bottom row); a weighted
+  64-bin histogram smoothed with σ = 1.5 bins; the peak (range ends included) with the highest
+  weighted mass × (1 + 1.0 · (h − weighted median)). A small near detail is little weighted
+  mass and loses to the subject's coherent cluster; between comparable clusters the nearer one
+  wins. A mode holding < 6 % of the weighted mass (±2 bins), or < 64 valid cells, is not
+  confident: the value is held. Delivered convergence = 1 − h(mode).
+- **Temporal policy (per stream):** median of the last three measurements, a 0.03 dead band,
+  and a critically damped follower with τ = 0.6 s (no overshoot from rest; ~2.3 s to 90 % of a
+  step). A measurement ≥ 0.25 from the target, or a scene-signature (16-bin depth histogram) L1
+  change > 0.6, is a cut candidate; when the next measurement agrees (within 0.1) the follower
+  switches to τ = 0.05 s for up to 0.4 s — ~0.2 s to 90 %, a few converted frames, never a
+  one-frame snap. Until the first confident measurement (and when the module returns no depth)
+  AUTO goes through unchanged.
+- **Switch:** `DXR_LIFT_AUTO_CONVERGENCE=module` (service environment, read once at lift-module
+  create; also `off` / `0`) restores the pre-#1858 behaviour — AUTO reaches the module — for
+  A/B. The choice is logged once (WARN); each stream logs its first lock (WARN) and its
+  convergence / target / subject / confidence / cut count every 5 s (INFO, in the per-stream
+  stats).
 
 ## 5. Acquiring results
 
