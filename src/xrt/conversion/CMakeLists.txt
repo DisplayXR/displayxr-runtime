@@ -9,6 +9,8 @@ add_library(
 	conv_core STATIC
 	conv_readiness.c
 	conv_readiness.h
+	conv_select.c
+	conv_select.h
 	)
 add_library(displayxr::conversion_core ALIAS conv_core)
 # Consumers include "conversion/conv_*.h".
