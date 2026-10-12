@@ -32,7 +32,10 @@
  *
  * Locks: `lock` (this module; held across a read) -> `global_state.lock`
  * (briefly, for the slot table) and -> the service compositor's render mutex
- * (per client, inside `comp_d3d11_service_get_client_status`). The counters
+ * (per client, inside `comp_d3d11_service_get_client_status`); on the
+ * desktop-Linux service -> comp_multi's `list_and_timing_lock` and the
+ * workspace registry's leaf lock, one after the other, never nested (inside
+ * `multi_compositor_status_*`). The counters
  * have their own leaf `counter_lock` so the connect / disconnect / re-probe
  * paths can bump them while holding anything.
  *
@@ -55,6 +58,15 @@
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
+#endif
+
+// COMP_MULTI_SHARED_SURFACE (header-only, safe everywhere): the desktop-Linux
+// service composites every client into the null + comp_multi shared surface.
+#include "multi/comp_multi_interface.h"
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+//! The desktop-Linux arm of the live rows (comp_multi status reads).
+#define STATUS_HAVE_COMP_MULTI_ARM
+#include "multi/comp_multi_private.h"
 #endif
 
 #include <stdlib.h>
@@ -383,13 +395,14 @@ nt_update(struct ipc_server_status *st, const struct xrt_status_live_dp *ld, uin
 }
 
 static void
-push_dp(struct xrt_status_live *live,
-        uint64_t screen_id,
-        uint32_t client_id,
-        enum xrt_status_dp_kind kind,
-        uint32_t backend,
-        bool answered,
-        bool tracking)
+push_dp_api(struct xrt_status_live *live,
+            uint64_t screen_id,
+            uint32_t client_id,
+            enum xrt_status_dp_api api,
+            enum xrt_status_dp_kind kind,
+            uint32_t backend,
+            bool answered,
+            bool tracking)
 {
 	if (live->dp_count >= XRT_STATUS_MAX_LIVE_DPS) {
 		return;
@@ -398,13 +411,47 @@ push_dp(struct xrt_status_live *live,
 	memset(ld, 0, sizeof(*ld));
 	ld->screen_id = screen_id;
 	ld->dp.client_id = client_id;
-	ld->dp.api = XRT_STATUS_DP_API_D3D11;
+	ld->dp.api = api;
 	ld->dp.kind = kind;
 	ld->dp.backend = backend <= (uint32_t)XRT_STATUS_DP_BACKEND_STALE ? (enum xrt_status_dp_backend)backend
 	                                                                  : XRT_STATUS_DP_BACKEND_OK;
 	ld->answered = answered;
 	ld->is_tracking = answered && tracking;
 }
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+//! The D3D11 service's DPs (every Windows call site).
+static void
+push_dp(struct xrt_status_live *live,
+        uint64_t screen_id,
+        uint32_t client_id,
+        enum xrt_status_dp_kind kind,
+        uint32_t backend,
+        bool answered,
+        bool tracking)
+{
+	push_dp_api(live, screen_id, client_id, XRT_STATUS_DP_API_D3D11, kind, backend, answered, tracking);
+}
+#endif
+
+#if defined(STATUS_HAVE_COMP_MULTI_ARM)
+//! The registry screen whose desktop rect contains (@p x, @p y); 0 = none.
+static uint64_t
+screen_at(const struct xrt_screen_list *list, int64_t x, int64_t y)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *sc = &list->screens[i];
+		if (sc->desktop_width == 0 || sc->desktop_height == 0) {
+			continue;
+		}
+		if (x >= sc->desktop_left && x < (int64_t)sc->desktop_left + sc->desktop_width &&
+		    y >= sc->desktop_top && y < (int64_t)sc->desktop_top + sc->desktop_height) {
+			return sc->id;
+		}
+	}
+	return 0;
+}
+#endif
 
 /*!
  * Everything only the service knows, into `st->live` (+ the raw segment tables
@@ -472,6 +519,20 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 	}
 	const uint32_t backend = h->dp_state_known ? h->dp_backend_state : 0u;
 	bool any_primary = false;
+#endif
+
+#if defined(STATUS_HAVE_COMP_MULTI_ARM)
+	// The desktop-Linux service: ONE service-owned shared surface on the panel,
+	// woven by ONE shared DP; XR_DXR_weave present-owners weave their own
+	// windows with their own DPs (comp_multi_weave_linux.c).
+	struct multi_compositor_status_shared_dp sdp;
+	memset(&sdp, 0, sizeof(sdp));
+	const bool have_sdp = s->xsysc != NULL && multi_compositor_status_get_shared_dp(s->xsysc, &sdp);
+	// The registry screen the shared surface covers (its panel's centre).
+	const uint64_t panel_screen = have_sdp && sdp.panel_width > 0 && sdp.panel_height > 0
+	                                  ? screen_at(st->screens, (int64_t)sdp.panel_left + sdp.panel_width / 2,
+	                                              (int64_t)sdp.panel_top + sdp.panel_height / 2)
+	                                  : 0;
 #endif
 
 	for (uint32_t k = 0; k < h->slot_count && live->client_count < XRT_STATUS_MAX_CLIENTS; k++) {
@@ -562,6 +623,66 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 			(void)snprintf(c->integrity.weave_placement, sizeof(c->integrity.weave_placement), "%s",
 			               rd.split_active ? "scanout" : "render");
 		}
+#elif defined(STATUS_HAVE_COMP_MULTI_ARM)
+		struct multi_compositor_status_client mcs;
+		if (xcs[k] == NULL || s->xsysc == NULL || !multi_compositor_status_get_client(s->xsysc, xcs[k], &mcs)) {
+			continue;
+		}
+		// Presenter: a weave present-owner weaves and presents its own window
+		// (SELF); a shared-surface client is presented by the service into its
+		// own full-screen window (SERVICE_WINDOW, as the Windows service reports
+		// a client it presents into a window it owns); nothing delivered = NONE.
+		if (mcs.weave_owner) {
+			c->presenter = XRT_STATUS_PRESENTER_SELF;
+		} else if (mcs.in_composite) {
+			c->presenter = XRT_STATUS_PRESENTER_SERVICE_WINDOW;
+		}
+		if (mcs.window.valid) {
+			c->window.valid = true;
+			c->window.left = mcs.window.window_screen_left;
+			c->window.top = mcs.window.window_screen_top;
+			c->window.width = mcs.window.window_pixel_width;
+			c->window.height = mcs.window.window_pixel_height;
+			// Owner screen: the registry screen holding the window's centre.
+			c->owner_screen = screen_at(st->screens, (int64_t)c->window.left + c->window.width / 2,
+			                            (int64_t)c->window.top + c->window.height / 2);
+		}
+		if (c->owner_screen == 0 && mcs.in_composite) {
+			c->owner_screen = panel_screen;
+		}
+		// One segment = the whole window: comp_multi has no segment manager,
+		// one DP weaves the window (the raw segment table stays empty).
+		const bool presenting = c->presenter != XRT_STATUS_PRESENTER_NONE;
+		if (presenting) {
+			struct xrt_status_segment *it = &c->segments.items[0];
+			c->segments.count = 1;
+			c->segments.split = false;
+			it->screen = c->owner_screen;
+			it->canvas.x = 0;
+			it->canvas.y = 0;
+			it->canvas.w = c->window.width;
+			it->canvas.h = c->window.height;
+			it->has_dp = mcs.has_dp;
+			it->woven = mcs.woven;
+			it->eye_source = mcs.has_dp ? XRT_STATUS_EYE_SOURCE_DP : XRT_STATUS_EYE_SOURCE_NONE;
+		}
+		// A weave present-owner's own DP. Its eyes are not read from here: the
+		// per-client weave DP is torn down before the client leaves the list,
+		// so a cross-thread read could race its destroy (answered = false).
+		if (mcs.weave_owner && mcs.has_dp) {
+			push_dp_api(live, c->owner_screen != 0 ? c->owner_screen : panel_screen, c->id,
+			            XRT_STATUS_DP_API_VK, XRT_STATUS_DP_KIND_PRIMARY, XRT_STATUS_DP_BACKEND_OK, false,
+			            false);
+		}
+
+		c->views.capacity = view_capacity;
+		c->views.active = live->mode.valid ? live->mode.views : 0u;
+		if (mcs.shared_surface && mcs.view_count > 0 && c->views.active == 0) {
+			c->views.active = mcs.view_count;
+		}
+		c->views.reported = presenting ? c->views.active : 0u;
+		// Integrity (#1248): comp_multi keeps no paint / present / skip
+		// counters, so the triple stays zero rather than invented.
 #else
 		(void)xcs;
 		(void)view_capacity;
@@ -577,6 +698,16 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 		if (comp_d3d11_service_get_predicted_eye_positions_full(s->xsysc, &eyes)) {
 			push_dp(live, 0, 0, XRT_STATUS_DP_KIND_PRIMARY, backend, true, eyes.valid && eyes.is_tracking);
 		}
+	}
+#endif
+
+#if defined(STATUS_HAVE_COMP_MULTI_ARM)
+	// The shared surface's DP: the service's own panel DP (client 0, as the
+	// Windows service reports its panel DP when no client binds one).
+	if (have_sdp && sdp.present) {
+		push_dp_api(live, panel_screen, 0, XRT_STATUS_DP_API_VK, XRT_STATUS_DP_KIND_PRIMARY,
+		            sdp.backend_known ? sdp.backend_state : XRT_DP_BACKEND_STATE_OK, sdp.eyes_answered,
+		            sdp.is_tracking);
 	}
 #endif
 
@@ -662,14 +793,15 @@ tick(struct ipc_server *s, struct ipc_server_status *st)
 {
 	const uint64_t now_ns = os_monotonic_get_ns();
 
-	gather_live(s, st, now_ns);
-	const uint64_t lk = live_key(st->live);
-
 	// Topology inputs: the screen list (as apps see it) + the plug-ins' state.
+	// Read first: the live gather maps windows onto these screens.
 	memset(st->screens, 0, sizeof(*st->screens));
 	if (s->xinst == NULL || xrt_instance_enumerate_displays(s->xinst, st->screens) != XRT_SUCCESS) {
 		memset(st->screens, 0, sizeof(*st->screens));
 	}
+
+	gather_live(s, st, now_ns);
+	const uint64_t lk = live_key(st->live);
 	if (s->xsysc != NULL) {
 		// An unlocked copy, as the segments-enable path takes it: claim
 		// serials and per-API factory bits are display-only here.
