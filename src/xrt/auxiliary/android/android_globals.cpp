@@ -105,6 +105,24 @@ android_globals_store_window(struct _ANativeWindow *window)
 	android_globals_set_window(window);
 }
 
+static bool s_workspace_overlay_member = false;
+
+void
+android_globals_set_workspace_overlay_member(bool member)
+{
+	if (member) {
+		U_LOG_W("android_globals: this client is a workspace-overlay member (#1006) - an Activity pause "
+		        "will not stop its session");
+	}
+	s_workspace_overlay_member = member;
+}
+
+bool
+android_globals_get_workspace_overlay_member(void)
+{
+	return s_workspace_overlay_member;
+}
+
 struct _ANativeWindow *
 android_globals_get_window()
 {

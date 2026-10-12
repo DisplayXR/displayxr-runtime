@@ -111,6 +111,18 @@ namespace org::freedesktop::monado::ipc {
 		blockingConnect(android::content::Context const &context, std::string const &packageName);
 
 		/*!
+		 * Wrapper for the isWorkspaceOverlayMember method (#1006)
+		 *
+		 * Java prototype:
+		 * `public boolean isWorkspaceOverlayMember();`
+		 *
+		 * JNI signature: ()Z
+		 *
+		 */
+		bool
+		isWorkspaceOverlayMember();
+
+		/*!
 		 * Initialize the static metadata of this wrapper with a known
 		 * (non-null) Java class.
 		 */
@@ -130,6 +142,7 @@ namespace org::freedesktop::monado::ipc {
 			jni::method_t init;
 			jni::method_t markAsDiscardedByNative;
 			jni::method_t blockingConnect;
+			jni::method_t isWorkspaceOverlayMember;
 
 			/*!
 			 * Singleton accessor

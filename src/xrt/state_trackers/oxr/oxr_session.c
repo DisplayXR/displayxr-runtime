@@ -1627,8 +1627,13 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		s_overlay_mode = (force || android_globals_self_declares_overlay()) ? 1 : 0;
 	}
 
+	// #1006: a client composited into a workspace controller's overlay is on
+	// screen through the controller's surface even while its own Activity is
+	// paused behind it — same exemption as the #558 overlay mode.
+	const bool workspace_member = android_globals_get_workspace_overlay_member();
+
 	// Most recent Android activity lifecycle event was OnPause: move toward stopping
-	if (s_overlay_mode == 0 &&
+	if (s_overlay_mode == 0 && !workspace_member &&
 	    sess->sys->inst->activity_state == XRT_ANDROID_LIVECYCLE_EVENT_ON_PAUSE) {
 		if (sess->state == XR_SESSION_STATE_FOCUSED) {
 			U_LOG_I("Activity paused: changing session state FOCUSED->VISIBLE");

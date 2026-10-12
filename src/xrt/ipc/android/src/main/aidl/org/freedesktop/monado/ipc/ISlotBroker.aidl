@@ -52,4 +52,12 @@ interface ISlotBroker {
 
     /** How many satellite slots this runtime build declares. */
     int getSlotCount();
+
+    /**
+     * True while a verified workspace controller has the overlay mode on (#1006,
+     * ADR-036 D4). A client routed to the main-process service because of it is
+     * composited into the controller's surface, so its session must keep running
+     * when its own Activity is paused behind the controller.
+     */
+    boolean isWorkspaceOverlayActive();
 }

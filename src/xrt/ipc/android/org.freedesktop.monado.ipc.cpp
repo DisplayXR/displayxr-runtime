@@ -16,7 +16,8 @@ namespace org::freedesktop::monado::ipc {
 	    : MetaBase(Client::getTypeName(), clazz), monado(classRef(), "monado"), failed(classRef(), "failed"),
 	      init(classRef().getMethod("<init>", "(J)V")),
 	      markAsDiscardedByNative(classRef().getMethod("markAsDiscardedByNative", "()V")),
-	      blockingConnect(classRef().getMethod("blockingConnect", "(Landroid/content/Context;Ljava/lang/String;)I"))
+	      blockingConnect(classRef().getMethod("blockingConnect", "(Landroid/content/Context;Ljava/lang/String;)I")),
+	      isWorkspaceOverlayMember(classRef().getMethod("isWorkspaceOverlayMember", "()Z"))
 	{}
 	IMonado::Meta::Meta(jni::jclass clazz)
 	    : MetaBase(IMonado::getTypeName(), clazz),

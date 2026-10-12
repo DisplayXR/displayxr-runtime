@@ -50,6 +50,13 @@ namespace org::freedesktop::monado::ipc {
 		assert(!isNull());
 		return object().call<int32_t>(Meta::data().blockingConnect, context.object(), packageName);
 	}
+
+	inline bool
+	Client::isWorkspaceOverlayMember()
+	{
+		assert(!isNull());
+		return object().call<bool>(Meta::data().isWorkspaceOverlayMember);
+	}
 	inline void
 	IMonado::passAppSurface(android::view::Surface const &surface)
 	{

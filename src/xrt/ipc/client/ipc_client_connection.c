@@ -55,6 +55,7 @@
 
 #ifdef XRT_OS_ANDROID
 #include "android/ipc_client_android.h"
+#include "android/android_globals.h"
 #endif // XRT_OS_ANDROID
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
@@ -1014,6 +1015,15 @@ ipc_client_describe_client(struct ipc_connection *ipc_c, const struct xrt_applic
 	struct ipc_client_description desc = {0};
 	desc.info = *a_info;
 	desc.pid = pid; // Extra info.
+#ifdef XRT_OS_ANDROID
+	// #1006: Android has no DISPLAYXR_WORKSPACE_SESSION env from a launching
+	// shell; a client the slot broker admitted into an active workspace overlay
+	// (known only after the connect above) IS a workspace session, so the
+	// controller can enumerate, place and compose it.
+	if (android_globals_get_workspace_overlay_member()) {
+		desc.info.workspace_session = true;
+	}
+#endif
 
 	xrt_result_t xret = ipc_call_instance_describe_client(ipc_c, &desc);
 	if (xret != XRT_SUCCESS) {

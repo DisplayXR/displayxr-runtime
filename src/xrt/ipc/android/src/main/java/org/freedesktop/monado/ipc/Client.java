@@ -113,6 +113,19 @@ public class Client implements ServiceConnection {
      */
     private final IBinder slotToken = new Binder();
 
+    /**
+     * #1006: this client joined the main-process service because a workspace controller's overlay
+     * is active — it is composited into the controller's surface, so its session must keep running
+     * while its own Activity is paused behind the controller. Read by native after connect.
+     */
+    private volatile boolean workspaceOverlayMember = false;
+
+    /** Called from native after {@link #blockingConnect}. */
+    @Keep
+    public boolean isWorkspaceOverlayMember() {
+        return workspaceOverlayMember;
+    }
+
     /** Satellite slot we hold, or -1 when we are on the classic main-process service. */
     private int satelliteSlot = -1;
 
@@ -301,6 +314,15 @@ public class Client implements ServiceConnection {
         } else {
             satelliteSlot = acquireSatelliteSlot(context_, packageName);
             if (satelliteSlot < 0) {
+                ISlotBroker broker = brokerConnection.get();
+                try {
+                    workspaceOverlayMember = broker != null && broker.isWorkspaceOverlayActive();
+                } catch (RemoteException e) {
+                    workspaceOverlayMember = false;
+                }
+                if (workspaceOverlayMember) {
+                    Log.w(TAG, "bind: workspace overlay active — joining it on the main-process service");
+                }
                 // Not fatal: without a satellite the runtime behaves exactly as it did
                 // before slots existed — one client on screen, on the main-process service.
                 intent = new Intent(BuildConfig.SERVICE_ACTION).setPackage(packageName);

@@ -16,6 +16,7 @@
 
 #include "android/android_load_class.hpp"
 #include "android/android_looper.h"
+#include "android/android_globals.h"
 
 #include "wrap/android.app.h"
 
@@ -83,6 +84,11 @@ ipc_client_android_blocking_connect(struct ipc_client_android *ica)
 		JavaVM *vm = ica->vm;
 		android_looper_poll_until_activity_resumed(vm, ica->activity.object().getHandle());
 		int fd = ica->client.blockingConnect(ica->activity, XRT_ANDROID_PACKAGE);
+		// #1006: a client admitted into a workspace overlay keeps its session
+		// running while its Activity is paused behind the controller.
+		if (fd >= 0) {
+			android_globals_set_workspace_overlay_member(ica->client.isWorkspaceOverlayMember());
+		}
 		return fd;
 	} catch (std::exception const &e) {
 		U_LOG_E("Failure while connecting to IPC server: %s", e.what());
