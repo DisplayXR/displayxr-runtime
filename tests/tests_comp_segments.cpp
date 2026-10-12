@@ -434,6 +434,145 @@ feed(comp_segments_owner &o, const comp_segment_table &t, uint64_t &now, uint64_
 
 } // namespace
 
+TEST_CASE("comp_segments: a DP carried across a screen-table change (display hotplug)", "[comp_segments][hotplug]")
+{
+	comp_segments_lifecycle lc;
+	comp_segments_lifecycle_init(&lc, 2, 3);
+	comp_segments_actions act{};
+	const comp_segment_table split = straddle_table();
+	const comp_segment_table single = primary_only_table();
+
+	// A new table that still lists EDP the same way keeps its live DP: no
+	// second CREATE (a vendor weaver is not rebuilt for an unrelated monitor).
+	REQUIRE(comp_segments_lifecycle_adopt(&lc, EDP));
+	CHECK(comp_segments_lifecycle_is_live(&lc, EDP));
+	comp_segments_lifecycle_update(&lc, &split, &act);
+	CHECK(count_action(act, COMP_SEG_ACTION_CREATE, EDP) == 0);
+	comp_segments_lifecycle_update(&lc, &split, &act);
+	CHECK(act.count == 0);
+
+	// ...and it is retired by the ordinary rule once its segment is gone.
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	CHECK(act.count == 0);
+	comp_segments_lifecycle_update(&lc, &single, &act);
+	CHECK(count_action(act, COMP_SEG_ACTION_DESTROY, EDP) == 1);
+	CHECK_FALSE(comp_segments_lifecycle_is_live(&lc, EDP));
+
+	// Out of slots: adopt fails (the caller releases that DP instead).
+	comp_segments_lifecycle full;
+	comp_segments_lifecycle_init(&full, 2, 3);
+	for (uint64_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
+		REQUIRE(comp_segments_lifecycle_adopt(&full, 0x100 + i));
+	}
+	CHECK_FALSE(comp_segments_lifecycle_adopt(&full, 0x999));
+	// Adopting a tracked id again reuses its slot.
+	CHECK(comp_segments_lifecycle_adopt(&full, 0x100));
+}
+
+TEST_CASE("comp_segments: the session DP keeps its screen only while its plug-in owns it (display hotplug)",
+          "[comp_segments][hotplug]")
+{
+	// The session DP: made by leia-sr for the Odyssey, serial "ODY-1", at
+	// 1512,0 2560x1440 pt, CGDirectDisplayID 3.
+	comp_segments_session_dp sd{};
+	sd.valid = true;
+	sd.monitor_id = DS1;
+	std::strcpy(sd.plugin_id, "leia-sr");
+	std::strcpy(sd.serial, "ODY-1");
+	sd.desktop = {1512, 0, 2560, 1440};
+	sd.platform_id = 3;
+
+	auto cand = [](uint64_t id, const char *plugin, const char *serial, comp_seg_rect r, uint64_t pid) {
+		comp_segments_session_candidate c{};
+		c.monitor_id = id;
+		c.plugin_id = plugin;
+		c.serial = serial;
+		c.desktop = r;
+		c.platform_id = pid;
+		return c;
+	};
+	const comp_seg_rect laptop = {0, 0, 1512, 982};
+	const comp_seg_rect ody = {1512, 0, 2560, 1440};
+	comp_segments_session_miss miss = COMP_SEG_SESSION_OWNS;
+
+	// As created.
+	comp_segments_session_candidate as_created[] = {
+	    cand(EDP, "sim-display", "", laptop, 1),
+	    cand(DS1, "leia-sr", "ODY-1", ody, 3),
+	};
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+	CHECK(miss == COMP_SEG_SESSION_OWNS);
+
+	// Unplugged.
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_GONE);
+
+	// Replugged, panel not authenticated yet: sim-display claims it — re-claimed.
+	comp_segments_session_candidate edid_only[] = {
+	    cand(EDP, "sim-display", "", laptop, 1),
+	    cand(DS1, "sim-display", "", ody, 3),
+	};
+	CHECK(comp_segments_session_dp_screen(&sd, edid_only, 2, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_RECLAIMED);
+
+	// Case D, kept: the SAME serial back at the SAME bounds under the SAME OS
+	// handle — the session DP owns it again, its window-bound weaver is kept.
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+	CHECK(miss == COMP_SEG_SESSION_OWNS);
+
+	// Case D, recreated: another serial, a renumbered CGDirectDisplayID, or
+	// moved bounds — re-bound: the panel gets a fresh segment DP instead.
+	comp_segments_session_candidate other_serial[] = {cand(DS1, "leia-sr", "ODY-2", ody, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, other_serial, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate renumbered[] = {cand(DS1, "leia-sr", "ODY-1", ody, 4)};
+	CHECK(comp_segments_session_dp_screen(&sd, renumbered, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate moved[] = {cand(DS1, "leia-sr", "ODY-1", {-2560, 0, 2560, 1440}, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, moved, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	comp_segments_session_candidate remoded[] = {cand(DS1, "leia-sr", "ODY-1", {1512, 0, 1920, 1080}, 3)};
+	CHECK(comp_segments_session_dp_screen(&sd, remoded, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_REBOUND);
+	CHECK(std::strcmp(comp_segments_session_miss_str(COMP_SEG_SESSION_REBOUND), "re-bound") == 0);
+
+	// Replugged under the session DP's own plug-in, which owns the panel but
+	// cannot drive it yet (EDID_ONLY): not ready — the session DP must not
+	// weave it (flat 2D instead), and gets it back once it is ready again.
+	comp_segments_session_candidate not_ready[] = {cand(DS1, "leia-sr", "", ody, 3)};
+	not_ready[0].not_ready = true;
+	CHECK(comp_segments_session_dp_screen(&sd, not_ready, 1, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_NOT_READY);
+	CHECK(comp_segments_session_dp_screen(&sd, as_created, 2, &miss) == 1);
+
+	// Not recorded yet: no answer.
+	comp_segments_session_dp none{};
+	CHECK(comp_segments_session_dp_screen(&none, as_created, 2, &miss) == -1);
+	CHECK(miss == COMP_SEG_SESSION_NOT_RECORDED);
+	CHECK(comp_segments_session_dp_screen(nullptr, as_created, 2, nullptr) == -1);
+}
+
+TEST_CASE("comp_segments: a window on one screen the session DP does not own still splits (display hotplug)",
+          "[comp_segments][hotplug]")
+{
+	// One screen, re-claimed by a hotplugged vendor: not the primary. The
+	// single-segment table must take the split path, so the screen is woven
+	// by its own segment DP and never by the session DP.
+	comp_segments_screen scr = screen(DS1, 0, 0, 3840, 2160, 3840, 2160, false);
+	const comp_seg_rect win = {100, 100, 1280, 720};
+	comp_segment_table t{};
+	comp_segments_compute(&win, nullptr, &scr, 1, &t);
+	REQUIRE(t.count == 1);
+	CHECK_FALSE(t.seg[0].is_primary);
+	CHECK(comp_segments_table_is_split(&t, 1280, 720));
+
+	// The same screen as the session DP's own: the single-DP path, as ever.
+	scr.is_primary = true;
+	comp_segments_compute(&win, nullptr, &scr, 1, &t);
+	CHECK_FALSE(comp_segments_table_is_split(&t, 1280, 720));
+}
+
 TEST_CASE("comp_segments: majority rule", "[comp_segments]")
 {
 	comp_segment_table t = window_at(3840 - 300); // 300 laptop / 700 Acer

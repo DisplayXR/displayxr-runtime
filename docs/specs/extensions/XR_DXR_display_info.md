@@ -1204,7 +1204,15 @@ the panel moves port, or the kernel renumbers the GPU (the connector key include
 card, e.g. `card1-HDMI-A-1`). Where it does not (Windows today) the id also covers the
 desktop position, so rearranging monitors there yields new ids. An app should
 re-enumerate after a topology change and treat an id that is no longer listed as
-gone. Each display's `info` comes from, in order: the system info (for the
+gone. **From v23 the runtime says when**: `XrEventDataDisplaysChangedDXR`
+(`XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR`, `1004999218`; `session`, `displayCount`) is queued
+to every running session once per change — a display plugged in or removed, re-claimed by
+another display processor (a 3D panel whose vendor service came up after the app started),
+or moved / re-moded — after the runtime has already applied it: a window on a newly claimed
+3D panel is woven by that panel's display processor from the next frame, with no restart,
+and one on a removed display is no longer woven for it. `XrSystemProperties`, the view
+configuration counts (ADR-041) and the swapchain sizing stay fixed for the session (ADR-047
+Amendment 8). Each display's `info` comes from, in order: the system info (for the
 system default); the owning vendor plug-in's per-monitor answer
 (`get_display_info_for_monitor`, `docs/reference/xrt_plugin_iface.md`); otherwise
 runtime defaults from EDID — physical size from the EDID millimetres, native pixels
@@ -2564,6 +2572,7 @@ the property) silently ignore the call — graceful degradation.
 | 20 | 2026-09-18 | David Fattal | **The mode floor** (#1499, follow-up to #1486): added `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` (`6`) to `XrDisplayModeDenialReasonDXR`. A session never runs in, or requests, a rendering mode whose `viewCount` exceeds what its primary view configuration reports: `xrBeginSession` moves the display to a fillable mode before the first frame (announced with `XrEventDataRenderingModeChangedDXR`) and `xrRequestDisplayRenderingModeDXR` denies such a request with the new reason, locally, before it reaches the panel-lease holder. A `PRIMARY_MULTIVIEW_DXR` session is never floored or denied; a device that pins its mode and service mode both outrank the floor, and the runtime logs rather than silently clamps. **Enumerant only** — no struct, wire or ABI change. |
 | 21 | 2026-09-18 | David Fattal | **Fixed view count, per-frame activity** (ADR-041 Model E, #1528 / #1486): added `XrViewActivityStateDXR` (`1004999213`, chained on `XrViewState` at `xrLocateViews`). The located view count is fixed for the session (2 under `PRIMARY_STEREO`, the device maximum under `PRIMARY_MULTIVIEW_DXR`); `activeViewCount` says how many carry the active mode's views, the inactive tail is located at view 0's pose and ignored. `xrEndFrame`'s `viewCount` must equal the located count — an app rendering only the active views aliases the tail onto view 0's subimage. The pre-v21 1-view 2D submission stays accepted (deprecated, `DXR_UNDER_SUBMIT`). Additive: new chained struct only. |
 | 22 | 2026-10-07 | David Fattal | **Per-display enumeration** (multi-screen M1, ADR-047): added `XrDisplayDXR` (`1004999214`) + `xrEnumerateDisplaysDXR`, `XrDisplaySpaceCreateInfoDXR` (`1004999215`) + `xrCreateDisplaySpaceDXR`, `XrSessionDisplayBindingDXR` (`1004999216`, chained on `XrSessionCreateInfo`), `XrDisplayFlagsDXR`; multi-screen M3 (same version, append-only) adds `XrViewDisplayBindingsDXR` (`1004999217`, chained on `XrViewState`), per-segment views for `PRIMARY_MULTIVIEW_DXR` sessions and a reported multiview count of device max × the system's view-set capacity (1, or 2 on desktop Linux with two DP-backed screens). Append-only: `XrSystemProperties` keeps describing the system-default display. v22 limits: every DISPLAY space is the session's single display plane; a binding to a non-default display changes the session's display-scoped Kooima inputs only, not which DP weaves. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 22`).** |
+| 23 | 2026-10-10 | David Fattal | **Display hotplug** (ADR-047 Amendment 8): added `XrEventDataDisplaysChangedDXR` (`1004999218`), queued to every running session once per display-list change (a display plugged in or removed, re-claimed by another display processor, or moved), after the runtime applied it. The runtime now keeps the per-monitor claims live: a 3D panel plugged in while an app runs is woven by its own display processor within about a second (two seconds when its vendor service must authenticate it first), with no session restart. Additive: an app that ignores the event is unaffected. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

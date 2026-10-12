@@ -531,6 +531,12 @@ struct comp_metal_compositor
 	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
 	bool seg_rebuild;                         //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
+	//! What the session's own DP was made for, from the first list (display
+	//! hotplug, ADR-047 Amendment 8): it weaves that screen only while that
+	//! plug-in still owns it.
+	struct comp_segments_session_dp seg_session;
+	//! The session DP owned its screen after the last re-table (a regain re-sends the mode).
+	bool seg_session_owned;
 
 	//! M3: the table the last weave took (count 0 = one view set) and the
 	//! routing the last xrLocateViews handed out. Guarded by seg_pub_mutex
@@ -5629,20 +5635,33 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->seg_screens != NULL && c->shared_texture == nil && drawable != nil && !eff_canvas.valid &&
 		    !mask_active && metal_seg_window(c, output_texture, &seg_win)) {
 			if (c->seg_rebuild || c->segments == NULL) {
-				// The app thread reads c->segments for eyes (M3): swap under the lock.
+				// The app thread reads c->segments for eyes (M3): change it under the lock.
+				// A new list (a display hotplug) re-tables the live manager in place,
+				// so a segment DP whose screen is still listed the same way survives.
 				os_mutex_lock(&c->seg_pub_mutex);
-				if (c->seg_rebuild) {
-					comp_metal_segments_destroy(&c->segments);
-					c->seg_rebuild = false;
-				}
-				if (c->segments == NULL) {
+				const bool fresh = c->segments == NULL;
+				if (fresh) {
 					c->segments = comp_metal_segments_create((__bridge void *)c->device,
 					                                         (__bridge void *)c->command_queue);
-					if (c->segments != NULL) {
-						comp_metal_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
-						                                c->seg_pinned_display_id);
-					}
 				}
+				if (c->segments != NULL && (fresh || c->seg_rebuild)) {
+					comp_metal_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+					                                c->seg_pinned_display_id, &c->seg_session);
+					// Display hotplug: the session DP got its panel back unchanged
+					// (same serial, place and OS handle) — its window-bound weaver is
+					// kept, so tell it the session's 2D/3D mode again (the lens of a
+					// replugged panel comes up in its default state).
+					const bool owns = comp_metal_segments_session_owns(c->segments);
+					if (!fresh && owns && !c->seg_session_owned && c->display_processor != NULL) {
+						U_LOG_W("segments: the session DP owns its screen again (same panel replugged) — "
+						        "kept its weaver, re-sent the display mode (3D=%d)",
+						        (int)c->hardware_display_3d);
+						(void)xrt_display_processor_metal_request_display_mode(c->display_processor,
+						                                                       c->hardware_display_3d);
+					}
+					c->seg_session_owned = owns;
+				}
+				c->seg_rebuild = false;
 				os_mutex_unlock(&c->seg_pub_mutex);
 			}
 			if (comp_metal_segments_enabled(c->segments)) {
@@ -6825,6 +6844,32 @@ comp_metal_compositor_set_screens(struct xrt_compositor *xc,
 	*copy = *list;
 	*info_copy = *info;
 
+	// The first list says what the session's own DP was made for: the
+	// system-default screen and the plug-in that won it (ADR-047 Amendment 8).
+	struct comp_segments_session_dp session = c->seg_session;
+	if (!session.valid) {
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && !session.valid; i++) {
+			if ((list->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) == 0) {
+				continue;
+			}
+			for (uint32_t e = 0; e < info->dp_registry.entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				const struct xrt_dp_registry_entry *re = &info->dp_registry.entries[e];
+				if (re->monitor_id == list->screens[i].id) {
+					session.valid = true;
+					session.monitor_id = re->monitor_id;
+					snprintf(session.plugin_id, sizeof(session.plugin_id), "%s", re->plugin_id);
+					snprintf(session.serial, sizeof(session.serial), "%s", re->serial);
+					session.desktop = (struct comp_seg_rect){re->screen_left, re->screen_top,
+					                                         re->pixel_width, re->pixel_height};
+					session.platform_id = re->platform_id;
+					U_LOG_I("segments: the session DP serves screen 0x%016llx ('%s', plug-in '%s')",
+					        (unsigned long long)re->monitor_id, list->screens[i].device_name, re->plugin_id);
+					break;
+				}
+			}
+		}
+	}
+
 	// The weave (layer_commit, app thread) rebuilds the manager on its next
 	// frame, never here. The commit and this setter both run on the app's
 	// thread in practice; the seg_pub lock covers the locate-side readers.
@@ -6835,6 +6880,10 @@ comp_metal_compositor_set_screens(struct xrt_compositor *xc,
 	free(c->seg_sys_info);
 	c->seg_sys_info = info_copy;
 	c->seg_pinned_display_id = pinned_display_id;
+	if (!c->seg_session.valid && session.valid) {
+		c->seg_session_owned = true;
+	}
+	c->seg_session = session;
 	// ...and nothing may frame views from the old table meanwhile.
 	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
 	os_mutex_unlock(&c->seg_pub_mutex);

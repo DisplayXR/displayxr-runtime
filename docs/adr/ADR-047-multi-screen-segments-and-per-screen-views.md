@@ -319,3 +319,155 @@ with his face in front of the DS1: "the app collapses to 2D as if lost face". Th
   collapsing, which is also how the plug-in derives `is_tracking`). Fixing that needs LeiaSR's
   per-display presence (`SR_EVENT_TYPE_DISPLAY_USER_PRESENCE`) or a per-device tracker that does
   not follow the primary's user-lost.
+
+
+## Amendment 8 (2026-10-10): the claims are live — display hotplug
+
+Decision 1 built the screen registry once, at instance create. A 3D panel plugged in while an app
+ran therefore stayed unclaimed (or claimed by the fallback) until the app restarted, and an
+unplugged one stayed listed. Contract rule 4 for a vendor integration says a panel plugged in must
+light up within about 2 s, and an unplugged one must retract cleanly, with no app or service
+restart. On the vendor side this is already live (the Leia SR macOS runtime re-authenticates the
+panel on hotplug, reports it in `srEnumerateDisplays` once it is published, and raises
+`SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED`); a plug-in that **declined** at instance create, because
+there was no panel then, was never asked again. Decisions:
+
+1. **Trigger: the OS, a poll, and the plug-in — one debounced sweep.** A worker thread
+   (`targets/common/target_display_hotplug`) runs the claim sweep when
+   - the OS reports a display reconfiguration (`os_display_hotplug_subscribe`; macOS:
+     `CGDisplayRegisterReconfigurationCallback`, whose callbacks arrive on the main run loop);
+   - a **poll** of a cheap topology signature (the OS monitor list: names, rects, modes, scale)
+     changes — every 500 ms, the safety net for a process whose main thread runs no run loop;
+   - a **plug-in** asks: `xrt_plugin_host_iface::request_display_rescan(reason)`, carved out of the
+     host `reserved[]` block like the Android slots (no ABI bump; announced by
+     `XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN`; callable from any thread, even after the plug-in's
+     `probe()` declined, since the function lives in the runtime). It closes the gap between the OS
+     seeing the monitor and the vendor backend recognising the panel.
+
+   Pacing (`target_hotplug_sched`, unit-tested): 300 ms of quiet after the last event, capped at
+   1 s after the first, so a reconfiguration storm is one sweep. An OS or poll event also arms
+   **follow-up sweeps** at +0.5, 1, 1.5, 2, 3, 4, 6 and 8 s, because a plug-in that cannot say when
+   its backend is ready must still be re-probed after it is; a plug-in's own request arms none (it
+   says it is ready). Vendor-neutral throughout. `DXR_DISPLAY_HOTPLUG=0|1` forces it off / on;
+   the default is on where the OS notification is wired (macOS) and off elsewhere.
+
+2. **The sweep, and copy-on-publish.** First, holding only the loader's lock: load every plug-in
+   that is not a display-claim source yet (`target_plugin_rescan_claim_sources` — a plug-in that
+   declined is probed again; sources that exist are never re-probed or released, because a live
+   segment DP may have been made from their instance; the set stays in ProbeOrder; a
+   PreferredPlugin pinning the active plug-in keeps the #1874 shortcut, loading nothing),
+   re-enumerate the monitors and resolve every monitor's winner into a local registry. That half
+   may wait on a vendor service describing a panel that just came up, so it runs outside the lock
+   every screen-list reader takes (`g_display_info_mutex`). Then, under that lock: install the
+   registry, re-resolve the panel's desktop rect and the per-screen preference, build the screen
+   list, and compare it with the published one (`target_screens_compare`). Only a different list is
+   **published**: copied, and a **display-topology generation** bumped under its own small lock.
+   Nothing hands out pointers into the registry: a session takes one by-value snapshot
+   (`xrt_instance::get_display_snapshot` — the list, the system info with its registry, and their
+   generation, under the sweep's lock) and the compositors copy that. Every session reads the
+   generation once per frame in `xrBeginFrame`, on the app's thread, and on a change re-pushes the
+   snapshot through the existing `set_screens`, so the compositor's threading is unchanged: it
+   re-tables on its next weave. The sweep is stopped from the system compositor's `destroy`
+   (wrapped at create) before the info it rewrites is freed.
+
+3. **Live sessions: the session's DP is never swapped; a re-claimed screen becomes a segment.**
+   The session's own DP was made for one monitor by one plug-in, bound to the app's window, with
+   the head device's mode table and the system's swapchain sizing built around it (ADR-045 D3: no
+   live swap). It now **keeps weaving exactly that monitor while that plug-in still wins it**
+   (`comp_segments_session_dp`, recorded from the first screen list a session sees). Every other
+   screen — including that very monitor once a hotplugged vendor re-claims it (sim-display →
+   leia-sr when the panel that sim-display was standing in for comes up) — is woven by a **segment
+   DP from its own claimant, even as the only segment**: the single-segment split path that
+   already served a window on a non-primary screen, enabled now also for one screen the session DP
+   does not own. Swapping the primary DP instead would re-create a window-bound weaver mid-frame
+   and change the display the head device describes; the segment path is already exercised on
+   every backend, its DPs are windowless with an explicit present origin (exactly what the SR Metal
+   weaver takes), and its lifecycle is hysteresis-gated. The cost is an idle session DP while the
+   window sits on a re-claimed screen. A new screen table re-tables the live segment manager **in
+   place**: a segment DP whose screen is listed again with the same binding, by the same plug-in
+   instance, is kept (`comp_segments_lifecycle_adopt` — a vendor weaver is not torn down because an
+   unrelated monitor came or went); every other one is destroyed on the commit thread between two
+   weaves. **Unplug** is that case: the screen leaves the table, its DP is destroyed (the plug-in's
+   `destroy` is where its weaver goes and its lens is switched off), and the window, which the OS
+   has moved, is woven by whatever owns its new screen.
+
+   Unchanged, by ADR-041: the view counts are fixed for the session, so a session that started on
+   a one-screen system keeps one view set. A window wholly on a hotplugged panel is framed from
+   that panel's eyes and geometry (the majority-segment single set); one straddling it gets the M2
+   crop, not per-segment views, until the next session.
+
+4. **Events: `XR_DXR_display_info` v23.** `XrEventDataDisplaysChangedDXR`
+   (`1004999218`, carrying the new `displayCount`) is queued to each running session once per
+   published change, after it has been applied. The spec already said apps should re-enumerate
+   after a topology change but gave them no signal; nothing else is required of them.
+   `XrSystemProperties`, the view configuration counts and the swapchain sizing do not change.
+
+5. **The active plug-in does not change; rule 3 gets one carve-out.** The active plug-in (the head
+   device, the rendering modes, eye tracking, the system's display info) stays what discovery chose
+   — a new session picks the vendor up through ordinary discovery. But #1521 (the active plug-in
+   wins every monitor it claims, at any confidence) would keep a hotplugged panel on sim-display,
+   which claims every monitor as a FALLBACK. Minimum change: **the active plug-in's claim yields
+   when it is a FALLBACK claim and a source ranked before it (lower ProbeOrder) claims the monitor
+   above FALLBACK** (`TARGET_SCREEN_PICK_BETTER_RANKED`). Such a source cannot exist at instance
+   create — a better-ranked plug-in that probed would be the active one — so nothing changes there;
+   ProbeOrder forcing (`run_cts.ps1 -Plugin sim-display` registers sim ahead of the vendor), a
+   PreferredPlugin, a `DXR_SCREEN_PLUGIN` pin and a per-screen preference all decide exactly as
+   before (unit-tested, with mutants).
+
+**Readiness, the window-bound weaver, and eyes (review by the LeiaSR macOS owner).**
+
+- *A plug-in claims only what its backend vouches for.* SR lists a panel in `srEnumerateDisplays`
+  as soon as its EDID matches (`EDID_ONLY`, no serial), before the service has authenticated the
+  FPC; it turns `FPC_VERIFIED` (with the serial) only once `devices/<serial>/primary` is published.
+  The Leia macOS plug-in treats `EDID_ONLY` as present-not-ready: no `probe()` bind and no
+  `create_dp_metal_for_screen`, so no weaver and no lens touch the panel. It claims the monitor at
+  the new **`XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`** level (20, appended to the claim enum; announced
+  by `XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY`): it outranks the fallback's claim (so sim-display's
+  anaglyph never reaches a 3D panel), and the runtime flags the registry entry `not_ready` and
+  clears its DP factories. Every compositor then shows that screen **flat 2D** (the existing
+  "segment without a DP" path: one view, no weave, lens untouched), and a session DP made for that
+  monitor does not weave it either (`COMP_SEG_SESSION_NOT_READY`). Vendor-neutral: any plug-in whose
+  backend lags can use the level. `DXR_TEST_SCREEN_NOT_READY=<output|connector|id>` forces it for
+  a test.
+  While an `EDID_ONLY` entry is listed, the plug-in polls the enumeration every 500 ms,
+  **open-ended** (the SR service retries a failed authentication with a 1 s → 30 s backoff, so no
+  fixed window is long enough), and on the `EDID_ONLY → FPC_VERIFIED` edge calls
+  `request_display_rescan` whether or not SR raises a topology event. The same race exists at
+  instance create (a panel plugged just before the app starts) and gets the same answer: the
+  plug-in declines, the poll runs, the verified edge starts a sweep. A request that arrives
+  before the sweep thread exists (between discovery and system create) is latched and served by
+  its first sweep. The runtime's own follow-ups now run to +32 s (0.5 … 8, 12, 16, 24, 32 s) for
+  plug-ins that cannot signal. `DXR_LEIA_ACCEPT_EDID_ONLY=1` restores binding at `EDID_ONLY`.
+- *Case D — a panel replugged under a live window-bound weaver.* The session DP keeps its screen
+  only while the monitor id, the winning plug-in, the claim's **vendor serial**, the **desktop
+  rect** and the **OS output handle** (macOS: the `CGDirectDisplayID`, carried as
+  `xrt_dp_registry_entry::platform_id`) all equal what they were when it was made
+  (`comp_segments_session_dp_screen`, with a reason: gone / re-claimed / re-bound). The same
+  serial back at the same bounds under the same handle hands the screen back to the session DP —
+  its weaver is kept, and the compositor re-sends the session's 2D/3D mode to it, since a
+  replugged panel's lens comes up in its default state. A different serial, a renumbered
+  `CGDirectDisplayID` or moved bounds is "re-bound": the panel gets a freshly created segment DP
+  (a new weaver) and the old window-bound one stays idle for the rest of the session — it cannot
+  be destroyed while it is the session DP (ADR-045 D3).
+- *Eyes.* After a replug the tracker must re-acquire its camera; until then the DP reports
+  nominal or last-good eyes, not tracking. The Leia macOS DP logs the edge (`eye tracking
+  ACQUIRED (fresh_raw=1, non-nominal) N ms after …` / `eye tracking LOST`), so the time from a
+  claim or regain to tracked eyes is measurable.
+
+**Scope shipped.** macOS: the CoreGraphics trigger, the poll, the sweep, the Metal compositor
+(Metal apps and Vulkan apps on the VK-via-Metal route, #1900). A Vulkan app that started on
+sim-display takes the `vk_native` route (sim has a Vulkan factory), which does not segment on
+macOS, so it does not pick up a hotplugged panel (force `DXR_MACOS_VK_VIA_METAL=1`, or start with
+the panel attached). Test hook: `DXR_TEST_FAKE_MONITOR_FILE=<path>` — while the file holds a number
+S the main display enumerates as two monitors cut at S points; holding `reid` re-identifies it (the
+session DP's monitor "unplugged" with an unknown one in its place).
+
+**TODO (other boxes).** Windows: `WM_DISPLAYCHANGE` on a message-only window as the trigger, and
+the twin of `target_plugin_rescan_claim_sources` over the registry entries (the Windows claim-source
+set is collected once and keeps declined plug-ins out); the D3D11 / D3D12 / GL / Vulkan managers
+already re-table on `set_screens`, but rebuild their DPs rather than carrying them over. Linux:
+RandR `RRScreenChangeNotify` (or a DRM `change` uevent) as the trigger; the POSIX rescan and the
+Vulkan manager's `set_screens` are in place. Both: `DXR_DISPLAY_HOTPLUG=1` runs the poll, untested
+there. The service / IPC path: the service's own registry is rebuilt by the sweep, but the
+generation is not forwarded to clients (macOS IPC sessions do not segment). Detail:
+`docs/architecture/comp-segments.md` § *Display hotplug*.

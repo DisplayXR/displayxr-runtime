@@ -151,6 +151,10 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataEyeTrackingStateChangedDXR *changed = (XrEventDataEyeTrackingStateChangedDXR *)type;
 		return changed->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR: {
+		XrEventDataDisplaysChangedDXR *changed = (XrEventDataDisplaysChangedDXR *)type;
+		return changed->session == session;
+	}
 	case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR: {
 		XrEventDataDisplayModeRequestDeniedDXR *denied = (XrEventDataDisplayModeRequestDeniedDXR *)type;
 		return denied->session == session;
@@ -463,6 +467,31 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 
 	// One-off lifecycle edge, not per-frame — WARN is the visible tier (#441).
 	U_LOG_W("OXR EVENT: Eye tracking state changed: isTracking=%d mode=%d", isTracking, (int)activeMode);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_session *sess, uint32_t displayCount)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDisplaysChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->displayCount = displayCount;
+	event->result = XR_SUCCESS;
+
+	// One-off topology change (a display plugged or unplugged), not per frame.
+	U_LOG_W("OXR EVENT: Displays changed: %u display(s)", displayCount);
 
 	lock(inst);
 	push(inst, event);

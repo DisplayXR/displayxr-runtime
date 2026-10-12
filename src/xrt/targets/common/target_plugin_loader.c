@@ -22,6 +22,7 @@
 
 #include "target_plugin_loader.h"
 #include "target_screen_pin.h"
+#include "target_display_hotplug.h"
 #include "xrt/xrt_config_have.h"
 
 #ifdef XRT_HAVE_VULKAN
@@ -995,6 +996,8 @@ load_and_probe_one(const struct plugin_entry *e,
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2102,6 +2105,8 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2696,6 +2701,8 @@ load_and_probe_one(const struct plugin_entry *e, struct xrt_plugin_instance **ou
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
+	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -2957,6 +2964,68 @@ collect_display_sources_platform(struct plugin_display_source *out, int max)
 		out[count].iface = g_active_iface;
 		out[count].inst = g_active_instance;
 		out[count].probe_order = g_active_probe_order;
+		count++;
+	}
+	return count;
+}
+
+/*!
+ * Display hotplug (ADR-047 Amendment 8): add to @p out (holding @p count
+ * sources) every manifest plug-in that is not a display-claim source yet — a
+ * vendor plug-in that declined at instance create because its panel was not
+ * attached, or one registered since. Sources already in the set are kept as
+ * they are and never re-probed or destroyed: a live segment DP may have been
+ * made from their instance. The set stays in ascending ProbeOrder (rule 3's
+ * hotplug carve-out reads "ranked before the active plug-in" off that order).
+ * `DXR_PLUGIN_EXCLUSIVE` is honoured exactly as in discovery.
+ *
+ * Caller holds @ref g_refresh_mutex. Returns the new count.
+ */
+static int
+rescan_display_sources_platform(struct plugin_display_source *out, int count, int max)
+{
+	char roots[8][PATH_MAX];
+	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = 0;
+	for (int r = 0; r < n_roots; r++) {
+		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
+	}
+	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
+
+	for (int i = 0; i < n && count < max; i++) {
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
+		bool have = false;
+		for (int k = 0; k < count && !have; k++) {
+			const struct xrt_plugin_iface *sif = out[k].iface;
+			have = sif != NULL && sif->id != NULL && strcmp(sif->id, entries[i].id) == 0;
+		}
+		if (have) {
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // still declines (no panel yet) / failed -> no claims
+		}
+		U_LOG_W(
+		    "plugin loader: display hotplug — '%s' (ProbeOrder=%u) now loads as a display-claim source; it was "
+		    "not one before (declined, failed, or registered since)",
+		    entries[i].id, entries[i].probe_order);
+
+		// Insert in ascending ProbeOrder (after any equal one).
+		int at = count;
+		while (at > 0 && out[at - 1].probe_order > entries[i].probe_order) {
+			out[at] = out[at - 1];
+			at--;
+		}
+		out[at].iface = iface;
+		out[at].inst = inst;
+		out[at].probe_order = entries[i].probe_order;
 		count++;
 	}
 	return count;
@@ -3974,6 +4043,10 @@ screen_ids_equal(const char *a, const char *b)
 	return *a == *b;
 }
 
+//! Monitors the last resolve found "present, not ready" (WARN only on entry). Guarded by g_refresh_mutex.
+static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
+static uint32_t g_not_ready_prev_count = 0;
+
 void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
@@ -4055,6 +4128,10 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		    "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
 		    pins_malformed, pins_malformed == 1 ? "y" : "ies");
 	}
+
+	// Monitors claimed "present, not ready" in this resolve (log edges).
+	uint64_t nr_now[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t nr_count = 0;
 
 	/*
 	 * The winner per monitor (target_screen_pick, unit-tested): a per-screen
@@ -4190,6 +4267,19 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			    "plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
 			    "(forced over EDID confidence)",
 			    (unsigned long long)desc->monitor_id, preferred_id);
+		} else if (reason == TARGET_SCREEN_PICK_BETTER_RANKED) {
+			const char *active_name = "?";
+			for (uint32_t i = 0; i < nc; i++) {
+				if (cands[i].is_active) {
+					active_name = cands[i].plugin_id;
+				}
+			}
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → '%s' (confidence=%u, ProbeOrder=%u, ranked before "
+			    "the active plug-in) — the active plug-in '%s' claims it only as a fallback: a panel "
+			    "that came up after instance create (display hotplug, ADR-047 Amendment 8)",
+			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
+			    cand_src[pick]->probe_order, active_name);
 		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
 			// One-off per monitor, and only when the override changes the outcome.
 			U_LOG_W(
@@ -4205,6 +4295,53 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		}
 		struct xrt_dp_registry_entry *e = &out_registry->entries[out_registry->entry_count++];
 		fill_registry_entry(e, desc, best_src, best_claim);
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				e->platform_id = g_monitor_side[i].mon.platform_id;
+				break;
+			}
+		}
+		// Display hotplug (ADR-047 Amendment 8): "present, not ready" — the
+		// plug-in owns the panel, but no display processor may touch it yet:
+		// no factory, so every compositor shows the screen flat 2D.
+		// DXR_TEST_SCREEN_NOT_READY=<output|connector|id-hex> forces it (test).
+		{
+			struct target_screen_pins nr;
+			char spec[96];
+			const char *t = getenv("DXR_TEST_SCREEN_NOT_READY");
+			(void)snprintf(spec, sizeof(spec), "%s=x", t != NULL ? t : "");
+			const bool forced_nr = t != NULL && t[0] != '\0' &&
+			                       target_screen_pin_parse(spec, &nr, NULL) == 1 &&
+			                       target_screen_pin_find(&nr, desc->monitor_id, out_name, conn_name) == 0;
+			if (best_claim->confidence == (uint32_t)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY || forced_nr) {
+				e->not_ready = true;
+				e->dp_factory_vk = NULL;
+				e->dp_factory_gl = NULL;
+				e->dp_factory_d3d11 = NULL;
+				e->dp_factory_d3d12 = NULL;
+				e->dp_factory_metal = NULL;
+				// WARN when a monitor enters the state; repeats (follow-up sweeps) at INFO.
+				bool was_nr = false;
+				for (uint32_t k = 0; k < g_not_ready_prev_count && !was_nr; k++) {
+					was_nr = g_not_ready_prev[k] == desc->monitor_id;
+				}
+				if (nr_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
+					nr_now[nr_count++] = desc->monitor_id;
+				}
+				if (was_nr) {
+					U_LOG_I(
+					    "plugin loader: monitor 0x%016llx → '%s' still PRESENT, NOT READY (flat "
+					    "2D)",
+					    (unsigned long long)desc->monitor_id, e->plugin_id);
+				} else {
+					U_LOG_W(
+					    "plugin loader: monitor 0x%016llx → '%s' PRESENT, NOT READY%s — no display "
+					    "processor, the screen shows flat 2D until the plug-in claims it for real",
+					    (unsigned long long)desc->monitor_id, e->plugin_id,
+					    forced_nr ? " (DXR_TEST_SCREEN_NOT_READY)" : "");
+				}
+			}
+		}
 		if (have_screen_pref) {
 			(void)snprintf(e->preferred_plugin, sizeof(e->preferred_plugin), "%s", screen_pref);
 			e->preferred_source = (uint32_t)pref_source;
@@ -4223,6 +4360,11 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			    (unsigned long long)e->monitor_id, e->plugin_id);
 		}
 	}
+
+	for (uint32_t i = 0; i < nr_count; i++) {
+		g_not_ready_prev[i] = nr_now[i];
+	}
+	g_not_ready_prev_count = nr_count;
 
 	for (uint32_t i = 0; i < pins.count; i++) {
 		if (!pin_used[i]) {
@@ -4269,5 +4411,50 @@ target_plugin_release_claim_sources(void)
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
+#endif
+}
+
+uint32_t
+target_plugin_rescan_claim_sources(void)
+{
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	(void)target_plugin_get_active();
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	uint32_t added = 0;
+	if (g_display_source_count >= 0) {
+		// A user-pinned active plug-in (PreferredPlugin == active) wins every
+		// monitor it claims (rule 2), and the shortcut set means it claimed
+		// them all: loading the others could change nothing, and #1874 keeps
+		// them (and the vendor service they reach) out of the process. Any
+		// other set loads the rest now — a better-ranked plug-in may have
+		// found a hotplugged panel (rule 3's carve-out).
+		char preferred[64] = {0};
+		const bool pinned_active = target_plugin_get_preferred(preferred, sizeof(preferred)) &&
+		                           g_active_iface != NULL && g_active_iface->id != NULL &&
+		                           strcmp(preferred, g_active_iface->id) == 0;
+		if (!(g_display_sources_active_only && pinned_active)) {
+			const int before = g_display_source_count;
+			g_display_source_count = rescan_display_sources_platform(
+			    g_display_sources, g_display_source_count, TARGET_PLUGIN_MAX_SOURCES);
+			added = (uint32_t)(g_display_source_count - before);
+			// Every loadable plug-in has now been asked: the set is the full one.
+			g_display_sources_active_only = false;
+		}
+	}
+	// g_display_source_count < 0: never collected; the next resolve collects
+	// (and so probes) every plug-in from scratch.
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return added;
+#else
+	// TODO(multi-screen hotplug, Windows): the Windows claim-source set is
+	// collected once and kept, so a vendor plug-in that declined at instance
+	// create is never re-probed. Needs the twin of
+	// rescan_display_sources_platform over the registry entries (ADR-047
+	// Amendment 8). Android: one plug-in, no claim-only sources.
+	return 0;
 #endif
 }

@@ -8,11 +8,17 @@
 
 #include "target_screen_pin.h"
 
+#include "xrt/xrt_plugin.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+
+//! Compile-time check: TARGET_SCREEN_CONFIDENCE_FALLBACK is XRT_DISPLAY_CLAIM_FALLBACK.
+typedef char target_screen_fallback_matches_xrt
+    [(TARGET_SCREEN_CONFIDENCE_FALLBACK == (unsigned)XRT_DISPLAY_CLAIM_FALLBACK) ? 1 : -1];
 
 static void
 copy_trimmed(char *dst, size_t cap, const char *b, const char *e)
@@ -203,13 +209,25 @@ target_screen_pick_ex(const struct target_screen_candidate *cands,
 				reason = TARGET_SCREEN_PICK_PREFERRED;
 			}
 		}
+		bool active_yields = false;
 		if (pick < 0) {
 			for (uint32_t i = 0; i < count; i++) {
-				if (cands[i].is_active) {
+				if (!cands[i].is_active) {
+					continue;
+				}
+				// Display-hotplug carve-out (ADR-047 Amendment 8): a
+				// FALLBACK claim yields to a better-ranked plug-in's real
+				// claim — the plug-in discovery would make active now.
+				if (cands[i].confidence <= TARGET_SCREEN_CONFIDENCE_FALLBACK) {
+					for (uint32_t j = 0; j < i && !active_yields; j++) {
+						active_yields = cands[j].confidence > TARGET_SCREEN_CONFIDENCE_FALLBACK;
+					}
+				}
+				if (!active_yields) {
 					pick = (int)i;
 					reason = TARGET_SCREEN_PICK_ACTIVE;
-					break;
 				}
+				break;
 			}
 		}
 		if (pick < 0) {
@@ -219,7 +237,7 @@ target_screen_pick_ex(const struct target_screen_candidate *cands,
 					pick = (int)i;
 				}
 			}
-			reason = TARGET_SCREEN_PICK_CONFIDENCE;
+			reason = active_yields ? TARGET_SCREEN_PICK_BETTER_RANKED : TARGET_SCREEN_PICK_CONFIDENCE;
 		}
 	} else {
 		pin_unclaimed = have_pin;

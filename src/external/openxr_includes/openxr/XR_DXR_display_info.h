@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 22
+#define XR_DXR_display_info_SPEC_VERSION 23
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -667,7 +667,7 @@ typedef struct XrViewActivityStateDXR {
 // Type values 1004999214-1004999217 (display_info's 210-219 decade, see
 // README.md): 214-216 per-display enumeration (multi-screen M1), 217 the
 // per-view display bindings chained on XrViewState (multi-screen M3);
-// 218-219 are free.
+// 218 is the v23 displays-changed event (below); 219 is free.
 #define XR_TYPE_DISPLAY_DXR                       ((XrStructureType)1004999214)
 #define XR_TYPE_DISPLAY_SPACE_CREATE_INFO_DXR     ((XrStructureType)1004999215)
 #define XR_TYPE_SESSION_DISPLAY_BINDING_DXR       ((XrStructureType)1004999216)
@@ -890,6 +890,37 @@ typedef struct XrViewDisplayBindingsDXR {
     uint32_t                    bindingCountOutput;   //!< Number of bindings (or the required capacity)
     XrViewDisplayBindingDXR*    bindings;             //!< Array of bindingCapacityInput entries; may be NULL when the capacity is 0
 } XrViewDisplayBindingsDXR;
+
+// ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 8) ----
+
+// Type value 1004999218 (display_info's 210-219 decade, see README.md).
+#define XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR ((XrStructureType)1004999218)
+
+/*!
+ * @brief The system's display list changed while the session ran (v23).
+ *
+ * Queued once per change, to every running session, when a display was
+ * plugged in or removed, was re-claimed by another display processor (a 3D
+ * panel whose vendor service came up after the app started), or moved / changed
+ * mode. The runtime has ALREADY applied it: a window on a newly claimed 3D
+ * panel is woven by that panel's display processor from the next frame, with
+ * no session restart; one on a removed display is no longer woven for it.
+ *
+ * Re-enumerate with xrEnumerateDisplaysDXR to see the new list: an id that is
+ * no longer listed is gone, and a listed id's vendorPluginId / flags / info may
+ * differ. Nothing else is required of the app. XrSystemProperties, the view
+ * configuration view counts (ADR-041) and the swapchain sizing stay fixed for
+ * the session; per-segment views (multi-screen M3) follow the new list within
+ * that fixed view count.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataDisplaysChangedDXR {
+    XrStructureType             type;         //!< Must be XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;
+    uint32_t                    displayCount; //!< How many displays xrEnumerateDisplaysDXR lists now
+} XrEventDataDisplaysChangedDXR;
 
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplaysDXR(

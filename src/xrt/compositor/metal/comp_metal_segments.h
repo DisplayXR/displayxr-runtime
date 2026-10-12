@@ -69,15 +69,35 @@ void
 comp_metal_segments_destroy(struct comp_metal_segments **segs_ptr);
 
 /*!
- * Hand over the system's screens and DP registry. Segmentation is enabled only
- * when at least two screens are listed, the registry knows the system-default
- * screen, @p pinned_display_id is 0 and `DXR_SEGMENTS` is not `0`.
+ * Hand over the system's screens and DP registry. Segmentation is enabled when
+ * at least two screens are listed — or one that the session's own DP does not
+ * own — the registry knows the primary screen (or @p session says the session
+ * DP owns none any more), @p pinned_display_id is 0 and `DXR_SEGMENTS` is not
+ * `0`.
+ *
+ * Callable again on a live manager (display hotplug, ADR-047 Amendment 8): a
+ * segment DP whose screen is listed again with the same binding, by the same
+ * plug-in instance, is kept; every other one is destroyed here.
+ *
+ * @param session  What the session's own DP was made for (may be NULL or not
+ *                 valid: then the system-default screen is the primary, as
+ *                 before hotplug existed). When valid, the primary is the
+ *                 screen with its monitor id still won by its plug-in, if any.
  */
 void
 comp_metal_segments_set_screens(struct comp_metal_segments *segs,
                                 const struct xrt_screen_list *list,
                                 const struct xrt_system_compositor_info *info,
-                                uint64_t pinned_display_id);
+                                uint64_t pinned_display_id,
+                                const struct comp_segments_session_dp *session);
+
+/*!
+ * Does the session's own DP own a listed screen after the last set_screens
+ * (display hotplug: false while its panel is unplugged, re-claimed or
+ * re-bound)? True when no identity was recorded.
+ */
+bool
+comp_metal_segments_session_owns(const struct comp_metal_segments *segs);
 
 //! Is segmentation possible at all for this session?
 bool

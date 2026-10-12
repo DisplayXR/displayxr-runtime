@@ -291,9 +291,22 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		m->native_height = desk.native_height;
 		m->refresh_hz = (desk.native_refresh_mhz + 500u) / 1000u;
 		m->is_primary = desk.is_primary;
+		m->platform_id = ids[i];
 		m->physical_width_mm = desk.physical_width_mm;
 		m->physical_height_mm = desk.physical_height_mm;
 		(void)snprintf(m->output_name, sizeof(m->output_name), "%s", desk.device_name);
+
+		if (os_display_macos_is_test_fake(ids[i])) {
+			// Display-hotplug test hook: a synthetic monitor with a fixed,
+			// recognisable identity ("DXT" 0xFA4E, serial 1). Never handed
+			// to CoreGraphics.
+			m->manufacturer_id = os_display_macos_cg_vendor_to_edid_raw(0x1314u); // "DXT"
+			m->product_id = 0xFA4Eu;
+			m->serial_number = 1u;
+			m->join = OS_EDID_JOIN_CG_IDS;
+			(void)snprintf(m->display_name, sizeof(m->display_name), "DisplayXR test monitor");
+			continue;
+		}
 
 		const uint32_t vendor = CGDisplayVendorNumber(did);
 		const uint32_t model = CGDisplayModelNumber(did);

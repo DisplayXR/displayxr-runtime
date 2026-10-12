@@ -2789,6 +2789,14 @@ struct xrt_dp_registry_entry
 	//! The system-default screen, forced to a plug-in other than the active
 	//! one: the primary DP weaves with this entry (set by the instance).
 	bool primary_override;
+	//! The OS's handle for the output this boot (macOS: CGDirectDisplayID; a
+	//! replug renumbers it); 0 = none. Display hotplug (ADR-047 Amendment 8):
+	//! part of what a session's own DP must find unchanged to keep its screen.
+	uint64_t platform_id;
+	//! The winning claim is XRT_DISPLAY_CLAIM_PRESENT_NOT_READY: the plug-in
+	//! owns the panel but cannot drive it yet. Every dp_factory_* is NULL, so
+	//! no display processor is made for it and it shows flat 2D.
+	bool not_ready;
 };
 
 /*!

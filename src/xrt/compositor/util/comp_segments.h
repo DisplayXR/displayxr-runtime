@@ -94,6 +94,81 @@ struct comp_segments_screen
 };
 
 /*!
+ * What the session's own display processor was made for (display hotplug,
+ * ADR-047 Amendment 8): one monitor, by one plug-in. Recorded from the first
+ * screen table a session sees (the system-default screen and the plug-in that
+ * won it then).
+ *
+ * After a display hotplug the screen table can change under a live session:
+ * the system default can move to another monitor, or the monitor the session
+ * DP serves can be re-claimed by another plug-in (sim-display -> a vendor
+ * whose panel just came up). The session DP is never swapped (ADR-045 D3);
+ * instead it keeps weaving exactly that monitor while that plug-in still owns
+ * it, and every other screen — the re-claimed one included — is woven through
+ * a segment DP from its own claimant, even when it is the only segment.
+ */
+struct comp_segments_session_dp
+{
+	bool valid;
+	uint64_t monitor_id;
+	char plugin_id[COMP_SEGMENTS_ID_MAX];
+	//! The winning claim's vendor serial then ("" = none).
+	char serial[COMP_SEGMENTS_ID_MAX];
+	//! The monitor's desktop rect then.
+	struct comp_seg_rect desktop;
+	//! The OS's handle for the output then (macOS: CGDirectDisplayID; 0 = none).
+	uint64_t platform_id;
+};
+
+/*!
+ * One registry screen as @ref comp_segments_session_dp_screen compares it.
+ */
+struct comp_segments_session_candidate
+{
+	uint64_t monitor_id;
+	const char *plugin_id;
+	const char *serial;
+	struct comp_seg_rect desktop;
+	uint64_t platform_id;
+	//! The claim is "present, not ready" (no DP may weave it; flat 2D).
+	bool not_ready;
+};
+
+//! Why the session DP does not own a screen (@ref comp_segments_session_dp_screen).
+enum comp_segments_session_miss
+{
+	COMP_SEG_SESSION_OWNS = 0,     //!< It does.
+	COMP_SEG_SESSION_NOT_RECORDED, //!< No identity recorded (not valid).
+	COMP_SEG_SESSION_GONE,         //!< Its monitor is not listed (unplugged).
+	COMP_SEG_SESSION_RECLAIMED,    //!< Listed, another plug-in wins it.
+	COMP_SEG_SESSION_REBOUND,      //!< Listed, same plug-in, but another serial / place / OS handle.
+	COMP_SEG_SESSION_NOT_READY,    //!< Listed, but its plug-in cannot drive it yet (flat 2D).
+};
+
+/*!
+ * Which listed screen is the session DP's: the one with @p sd's monitor id,
+ * still won by @p sd's plug-in, with the SAME vendor serial, the SAME desktop
+ * rect and the SAME OS output handle as when the session DP was made for it.
+ * A panel replugged unchanged is handed back to the session DP (its
+ * window-bound weaver is kept); one that came back as another panel, at
+ * another place or under a renumbered OS handle is not — its screen is woven
+ * by a freshly created segment DP instead, the policy for a weaver whose
+ * binding may be stale (ADR-047 Amendment 8).
+ *
+ * @param[out] out_miss  (may be NULL) why it does not own one.
+ * @return the index into @p cands, or -1.
+ */
+int
+comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
+                                const struct comp_segments_session_candidate *cands,
+                                uint32_t n,
+                                enum comp_segments_session_miss *out_miss);
+
+//! A short word for @p miss ("owns", "gone", "re-claimed", "re-bound", "not ready", "not recorded").
+const char *
+comp_segments_session_miss_str(enum comp_segments_session_miss miss);
+
+/*!
  * Whether pixels a window draws on a screen reach it unresampled.
  */
 enum comp_seg_1to1
@@ -434,6 +509,18 @@ comp_segments_lifecycle_update(struct comp_segments_lifecycle *lc,
  */
 void
 comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t screen_id, bool ok);
+
+/*!
+ * Carry a live DP over into a fresh lifecycle (display hotplug, ADR-047
+ * Amendment 8): a new screen table that still lists @p screen_id, bound the
+ * same way, keeps that screen's DP instead of rebuilding it. The slot is live
+ * with a full present streak, so no CREATE is issued for it; it is destroyed by
+ * the usual absent-streak rule once its segment is gone.
+ *
+ * @return false when out of slots (the caller then releases the DP).
+ */
+bool
+comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t screen_id);
 
 /*!
  * Does a DP exist for @p screen_id?

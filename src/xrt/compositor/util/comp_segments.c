@@ -438,6 +438,80 @@ comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t
 	s->failed = !ok;
 }
 
+int
+comp_segments_session_dp_screen(const struct comp_segments_session_dp *sd,
+                                const struct comp_segments_session_candidate *cands,
+                                uint32_t n,
+                                enum comp_segments_session_miss *out_miss)
+{
+	enum comp_segments_session_miss miss = COMP_SEG_SESSION_GONE;
+	int found = -1;
+	if (sd == NULL || !sd->valid) {
+		miss = COMP_SEG_SESSION_NOT_RECORDED;
+	} else {
+		for (uint32_t i = 0; cands != NULL && i < n && found < 0; i++) {
+			const struct comp_segments_session_candidate *c = &cands[i];
+			if (c->monitor_id != sd->monitor_id) {
+				continue;
+			}
+			if (c->not_ready) {
+				// Nothing may weave a panel its plug-in cannot drive yet —
+				// not even the session DP that was made for it.
+				miss = COMP_SEG_SESSION_NOT_READY;
+				continue;
+			}
+			if (c->plugin_id == NULL || strcmp(c->plugin_id, sd->plugin_id) != 0) {
+				miss = COMP_SEG_SESSION_RECLAIMED;
+				continue;
+			}
+			const char *serial = c->serial != NULL ? c->serial : "";
+			if (strcmp(serial, sd->serial) != 0 || c->platform_id != sd->platform_id ||
+			    c->desktop.x != sd->desktop.x || c->desktop.y != sd->desktop.y ||
+			    c->desktop.w != sd->desktop.w || c->desktop.h != sd->desktop.h) {
+				miss = COMP_SEG_SESSION_REBOUND;
+				continue;
+			}
+			found = (int)i;
+			miss = COMP_SEG_SESSION_OWNS;
+		}
+	}
+	if (out_miss != NULL) {
+		*out_miss = miss;
+	}
+	return found;
+}
+
+const char *
+comp_segments_session_miss_str(enum comp_segments_session_miss miss)
+{
+	switch (miss) {
+	case COMP_SEG_SESSION_OWNS: return "owns";
+	case COMP_SEG_SESSION_NOT_RECORDED: return "not recorded";
+	case COMP_SEG_SESSION_GONE: return "gone";
+	case COMP_SEG_SESSION_RECLAIMED: return "re-claimed";
+	case COMP_SEG_SESSION_REBOUND: return "re-bound";
+	case COMP_SEG_SESSION_NOT_READY: return "not ready (flat 2D until its plug-in can drive it)";
+	}
+	return "?";
+}
+
+bool
+comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t screen_id)
+{
+	if (lc == NULL) {
+		return false;
+	}
+	struct comp_segments_slot *s = lc_find(lc, screen_id, true);
+	if (s == NULL) {
+		return false;
+	}
+	s->live = true;
+	s->failed = false;
+	s->present_streak = lc->create_after;
+	s->absent_streak = 0;
+	return true;
+}
+
 bool
 comp_segments_lifecycle_is_live(const struct comp_segments_lifecycle *lc, uint64_t screen_id)
 {

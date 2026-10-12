@@ -502,6 +502,23 @@ target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi);
 void
 target_plugin_release_claim_sources(void);
 
+/*!
+ * Display hotplug (ADR-047 Amendment 8): make the next
+ * @ref target_plugin_resolve_displays consult every loadable plug-in, loading
+ * the ones that are not display-claim sources yet — typically a vendor
+ * plug-in whose `probe()` declined at instance create because its panel was
+ * not attached. Existing sources are never re-probed or released (a live
+ * segment DP may come from them). A no-op when PreferredPlugin pins the active
+ * plug-in and it alone decided the last resolve (#1874), and before the first
+ * resolve (which collects from scratch).
+ *
+ * macOS/Linux. Windows and Android: returns 0 (TODO, ADR-047 Amendment 8).
+ *
+ * @return the number of plug-ins newly added as claim sources.
+ */
+uint32_t
+target_plugin_rescan_claim_sources(void);
+
 #ifdef __cplusplus
 }
 #endif

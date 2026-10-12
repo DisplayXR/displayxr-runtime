@@ -92,12 +92,36 @@ enum target_screen_pick_reason
 	TARGET_SCREEN_PICK_ACTIVE = 3,      //!< The active plug-in claims it (#1521).
 	TARGET_SCREEN_PICK_CONFIDENCE = 4,  //!< Highest confidence, ties to the lower ProbeOrder.
 	TARGET_SCREEN_PICK_SCREEN_PREF = 5, //!< Per-screen preference (`dp use <id> --screen <key>`).
+	//! Confidence, because the active plug-in's claim is only a FALLBACK one
+	//! and a plug-in ranked before it (lower ProbeOrder) claims the monitor
+	//! above FALLBACK — the display-hotplug carve-out of rule 3 (ADR-047
+	//! Amendment 8).
+	TARGET_SCREEN_PICK_BETTER_RANKED = 6,
 };
+
+/*!
+ * The confidence at or below which a claim is a fallback ("anything
+ * unclaimed") claim — `XRT_DISPLAY_CLAIM_FALLBACK`, restated so this pure
+ * module needs no plug-in header (a static assert in the .c pins them equal).
+ */
+#define TARGET_SCREEN_CONFIDENCE_FALLBACK 10u
 
 /*!
  * The per-monitor winner: a pin (if its plug-in claims the monitor), then the
  * preferred plug-in, then the active one, then confidence. @p pin_plugin and
  * @p preferred may be NULL.
+ *
+ * Rule 3 (the active plug-in) has one carve-out, for display hotplug (ADR-047
+ * Amendment 8): when the active plug-in's claim on the monitor is a FALLBACK
+ * one (@ref TARGET_SCREEN_CONFIDENCE_FALLBACK) and a candidate listed BEFORE
+ * it — a lower ProbeOrder, since candidates are in source order — claims the
+ * monitor above FALLBACK, the active plug-in yields and confidence decides
+ * (@ref TARGET_SCREEN_PICK_BETTER_RANKED). Such a source exists only when it
+ * declined at discovery (a better-ranked plug-in that probed would BE the
+ * active one) and has since found its display — a 3D panel plugged in while
+ * the fallback ran. ProbeOrder forcing (the fallback registered ahead of the
+ * vendor, `run_cts.ps1 -Plugin`) keeps the fallback first, so it still wins
+ * every monitor (#1521).
  *
  * @param[out] out_pin_unclaimed  Set when a pin was given but its plug-in has
  *                                no claim on this monitor (the caller WARNs).

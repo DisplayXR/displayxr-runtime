@@ -104,6 +104,9 @@ struct os_display_edid_monitor
 	                                //!< OS's); macOS only today; "" = unknown.
 	bool origin_unknown;            //!< screen_left/top are NOT a desktop position (DRM-only record).
 	enum os_display_edid_join join; //!< How the EDID was tied to the placement record.
+	//! The OS's own handle for the output this boot (macOS: the CGDirectDisplayID,
+	//! renumbered on replug); 0 = none. Not part of the monitor id.
+	uint64_t platform_id;
 
 	/*! @} */
 };

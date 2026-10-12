@@ -44,6 +44,7 @@
 
 #include "target_plugin_loader.h"
 #include "target_screens.h"
+#include "target_display_hotplug.h"
 
 #include "target_instance_parts.h"
 
@@ -55,6 +56,7 @@
 #endif
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,18 +169,31 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
  * macOS (CoreGraphics displays joined to IOKit EDID); a no-op (empty
  * registry) on Android, where the EDID enumerator returns no monitors.
  */
+/*!
+ * Enumerate the monitors and resolve every one's winner into @p out — the
+ * work of @ref build_dp_registry without the publish, so a caller may run it
+ * WITHOUT g_display_info_mutex (the display-hotplug sweep does: a vendor
+ * plug-in's probe_displays may wait seconds for its service to describe a
+ * panel that just came up, and readers of the screen list must not wait with
+ * it). Takes only the loader's lock, inside.
+ */
+static void
+resolve_dp_registry(struct xrt_dp_factory_registry *out)
+{
+	struct os_display_edid_list edid = {0};
+	os_display_edid_enumerate(&edid);
+
+	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
+	target_plugin_resolve_displays(descs, dn, out);
+}
+
 static void
 build_dp_registry(struct xrt_system_compositor_info *info)
 {
 	if (info == NULL) {
 		return;
 	}
-	struct os_display_edid_list edid = {0};
-	os_display_edid_enumerate(&edid);
-
-	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
-	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
-
 	// Resolve into a local and publish it in one copy: the resolver zeroes its
 	// output before it takes the loader's lock, so resolving in place would
 	// expose an empty / half-built registry to a concurrent reader. Callers
@@ -186,7 +201,7 @@ build_dp_registry(struct xrt_system_compositor_info *info)
 	// loader's g_refresh_mutex inside the resolver), which is what
 	// t_instance_enumerate_displays reads under (multi-screen M1).
 	struct xrt_dp_factory_registry reg;
-	target_plugin_resolve_displays(descs, dn, &reg);
+	resolve_dp_registry(&reg);
 	info->dp_registry = reg;
 
 	// Resolving the claims loaded every registered plug-in once, so the
@@ -610,6 +625,195 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	apply_default_screen_preference(info);
 	if (locked) {
 		os_mutex_unlock(&g_display_info_mutex);
+	}
+}
+
+/*
+ *
+ * Display hotplug (ADR-047 Amendment 8): the live claim sweep.
+ *
+ * The per-monitor registry was built once, here, at system create. A worker
+ * thread (target_display_hotplug) now re-runs the sweep when the OS reports a
+ * display reconfiguration, when the monitor list's signature changes, or when
+ * a plug-in asks (request_display_rescan): re-enumerate the monitors, load
+ * the plug-ins that are not claim sources yet (a vendor plug-in that declined
+ * at instance create), re-resolve every monitor's winner, re-resolve the panel
+ * desktop rect, and publish. The active plug-in, the head device and the
+ * session's own DP do NOT change (ADR-045 D3, no live swap): a hotplugged
+ * panel reaches a running session as a screen with its own segment DP.
+ *
+ * Publication: the whole rewrite happens under g_display_info_mutex (the lock
+ * t_instance_enumerate_displays / t_instance_get_display_snapshot read under),
+ * and the generation is bumped — under its own small lock, so the per-frame
+ * read in every session never waits on a sweep — only when the screen list a
+ * snapshot would return actually changed. Sessions poll the generation once
+ * per frame and re-push the screens (one snapshot) when it moved.
+ *
+ */
+
+static struct target_display_hotplug *g_hotplug = NULL;
+//! The info the sweep rewrites (the system compositor's own); NULL once it is destroyed.
+static struct xrt_system_compositor_info *g_hotplug_info = NULL;
+//! The screen list last published (what the current generation describes).
+static struct xrt_screen_list g_published_screens;
+//! The display-topology generation: 0 = no system; 1 = as created; +1 per published change.
+static uint64_t g_display_generation = 0;
+static pthread_mutex_t g_generation_lock = PTHREAD_MUTEX_INITIALIZER;
+//! The system compositor's own destroy, wrapped so the sweep stops before the info dies.
+static void (*g_syscomp_destroy_orig)(struct xrt_system_compositor *xsysc) = NULL;
+
+static uint64_t
+display_generation_read(void)
+{
+	pthread_mutex_lock(&g_generation_lock);
+	const uint64_t g = g_display_generation;
+	pthread_mutex_unlock(&g_generation_lock);
+	return g;
+}
+
+/*!
+ * Build the list a snapshot returns now; if it differs from the published one,
+ * publish it and bump the generation. Caller holds g_display_info_mutex.
+ */
+static bool
+publish_screens_locked(const struct xrt_system_compositor_info *info, bool initial)
+{
+	struct xrt_screen_list *now = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (now == NULL) {
+		return false;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(info, &sys);
+	target_screens_build(&info->dp_registry, info->active_plugin_id, &sys, now);
+
+	bool changed = false;
+	if (initial) {
+		g_published_screens = *now;
+		pthread_mutex_lock(&g_generation_lock);
+		g_display_generation = 1;
+		pthread_mutex_unlock(&g_generation_lock);
+	} else {
+		struct target_screens_change c;
+		changed = target_screens_compare(&g_published_screens, now, &c);
+		if (changed) {
+			char line[1024];
+			target_screens_change_format(&g_published_screens, now, line, sizeof(line));
+			pthread_mutex_lock(&g_generation_lock);
+			const uint64_t gen = ++g_display_generation;
+			pthread_mutex_unlock(&g_generation_lock);
+			U_LOG_W(
+			    "display hotplug: screen table generation %llu — %u screen(s) (+%u -%u, %u re-claimed, %u "
+			    "moved): %s",
+			    (unsigned long long)gen, now->count, c.added, c.removed, c.claimant_changed,
+			    c.geometry_changed, line);
+			for (uint32_t i = 0; i < now->count && i < XRT_SCREEN_LIST_MAX; i++) {
+				const struct xrt_screen *sc = &now->screens[i];
+				U_LOG_W(
+				    "display hotplug:   [%u] 0x%016llx '%s' %d,%d %ux%u (native %ux%u, x%.2f) -> '%s' "
+				    "confidence=%u%s",
+				    i, (unsigned long long)sc->id, sc->device_name, sc->desktop_left, sc->desktop_top,
+				    sc->desktop_width, sc->desktop_height, sc->native_width, sc->native_height,
+				    (double)sc->desktop_scale, sc->plugin_id, sc->confidence,
+				    (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0 ? " (system default)" : "");
+			}
+			g_published_screens = *now;
+		}
+	}
+	free(now);
+	return changed;
+}
+
+//! The sweep (worker thread). Returns true when the published list changed.
+static bool
+hotplug_rebuild_cb(void *user, uint32_t sources, bool followup)
+{
+	(void)user;
+	(void)sources;
+	(void)followup;
+	if (!g_display_info_mutex_initialized) {
+		return false;
+	}
+	// The slow half runs WITHOUT g_display_info_mutex: plug-ins that were not
+	// claim sources (declined at instance create: no panel then) are probed
+	// again — existing sources are kept as they are — and every monitor is
+	// resolved into a local registry. A vendor plug-in may wait here for its
+	// service to describe a panel that just came up; screen-list readers do not.
+	const uint32_t added = target_plugin_rescan_claim_sources();
+	if (added > 0) {
+		U_LOG_W("display hotplug: %u plug-in(s) newly loaded as display-claim source(s)", added);
+	}
+	struct xrt_dp_factory_registry *reg = U_TYPED_CALLOC(struct xrt_dp_factory_registry);
+	if (reg == NULL) {
+		return false;
+	}
+	resolve_dp_registry(reg);
+
+	os_mutex_lock(&g_display_info_mutex);
+	struct xrt_system_compositor_info *info = g_hotplug_info;
+	if (info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		free(reg);
+		return false;
+	}
+	// Same order as system create: registry, desktop rect, per-screen preference.
+	info->dp_registry = *reg;
+	free(reg);
+	fill_display_desktop_info(info);
+	apply_default_screen_preference(info);
+	const bool changed = publish_screens_locked(info, false);
+	os_mutex_unlock(&g_display_info_mutex);
+	return changed;
+}
+
+static void
+t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
+{
+	// Stop the sweep before the info it rewrites goes away.
+	target_display_hotplug_stop(&g_hotplug);
+	if (g_display_info_mutex_initialized) {
+		os_mutex_lock(&g_display_info_mutex);
+	}
+	if (xsysc != NULL && g_screens_info == &xsysc->info) {
+		g_screens_info = NULL;
+	}
+	if (xsysc != NULL && g_hotplug_info == &xsysc->info) {
+		g_hotplug_info = NULL;
+	}
+	if (g_display_info_mutex_initialized) {
+		os_mutex_unlock(&g_display_info_mutex);
+	}
+	pthread_mutex_lock(&g_generation_lock);
+	g_display_generation = 0;
+	pthread_mutex_unlock(&g_generation_lock);
+
+	void (*orig)(struct xrt_system_compositor *) = g_syscomp_destroy_orig;
+	g_syscomp_destroy_orig = NULL;
+	if (orig != NULL) {
+		orig(xsysc);
+	}
+}
+
+/*!
+ * Publish the as-created screen table (generation 1) and start the sweep for
+ * @p xsysc. Called once the system's registry and desktop rect are built.
+ */
+static void
+display_hotplug_begin(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == NULL || !g_display_info_mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	g_hotplug_info = &xsysc->info;
+	(void)publish_screens_locked(&xsysc->info, true);
+	os_mutex_unlock(&g_display_info_mutex);
+
+	if (g_hotplug == NULL && g_syscomp_destroy_orig == NULL && xsysc->destroy != NULL) {
+		g_hotplug = target_display_hotplug_start(hotplug_rebuild_cb, NULL);
+		if (g_hotplug != NULL) {
+			g_syscomp_destroy_orig = xsysc->destroy;
+			xsysc->destroy = t_syscomp_destroy_hook;
+		}
 	}
 }
 
@@ -1061,6 +1265,10 @@ out:
 			os_mutex_unlock(&g_display_info_mutex);
 		}
 
+		// Display hotplug (ADR-047 Amendment 8): generation 1 is the table
+		// just built; the sweep keeps it live from here.
+		display_hotplug_begin(xsysc);
+
 		// All display-info + DP factories are sourced from the plug-in
 		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer
 		// link-includes any drv_sim_display symbols.
@@ -1138,6 +1346,58 @@ t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list
 	return XRT_SUCCESS;
 }
 
+/*!
+ * xrt_instance::get_display_generation (ADR-047 Amendment 8) — per frame from
+ * every session; never waits on a claim sweep.
+ */
+static uint64_t
+t_instance_get_display_generation(struct xrt_instance *xinst)
+{
+	(void)xinst;
+	return display_generation_read();
+}
+
+/*!
+ * xrt_instance::get_display_snapshot (ADR-047 Amendment 8) — the screen list,
+ * the system info it was built from, and their generation, all under
+ * g_display_info_mutex (the lock the sweep rewrites them under).
+ */
+static xrt_result_t
+t_instance_get_display_snapshot(struct xrt_instance *xinst,
+                                struct xrt_screen_list *out_list,
+                                struct xrt_system_compositor_info *out_info,
+                                uint64_t *out_generation)
+{
+	(void)xinst;
+	if (out_list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	memset(out_list, 0, sizeof(*out_list));
+	if (out_generation != NULL) {
+		*out_generation = 0;
+	}
+	if (!g_display_info_mutex_initialized) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(g_screens_info, &sys);
+	target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, out_list);
+	if (out_info != NULL) {
+		*out_info = *g_screens_info;
+	}
+	if (out_generation != NULL) {
+		// Bumped only under g_display_info_mutex too: consistent with the list.
+		*out_generation = display_generation_read();
+	}
+	os_mutex_unlock(&g_display_info_mutex);
+	return XRT_SUCCESS;
+}
+
 #ifdef XRT_FEATURE_HYBRID_MODE
 // In hybrid mode, export as native_instance_create to avoid symbol conflict
 // with ipc_instance_create from the IPC client library
@@ -1165,6 +1425,8 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->base.destroy = t_instance_destroy;
 	tinst->base.get_active_plugin = t_instance_get_active_plugin;
 	tinst->base.enumerate_displays = t_instance_enumerate_displays;
+	tinst->base.get_display_generation = t_instance_get_display_generation;
+	tinst->base.get_display_snapshot = t_instance_get_display_snapshot;
 	tinst->xp = xp;
 
 	tinst->base.startup_timestamp = os_monotonic_get_ns();
