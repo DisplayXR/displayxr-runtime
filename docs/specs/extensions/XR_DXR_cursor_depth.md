@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_cursor_depth` |
-| Spec Version | 6 |
+| Spec Version | 7 |
 | Type Values | `XR_TYPE_CURSOR_DEPTH_HINT_DXR` (1004999320) · `XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR` (1004999321) · `XR_TYPE_CURSOR_DEPTH_SOURCE_DXR` (1004999322, v2) · `XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR` (1004999323, v3) · `XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR` (1004999324, v5) · `XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR` (1004999325, v5) · `XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR` (1004999326, v6) · `XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR` (1004999327, v6) |
 | Author | The DisplayXR Project |
 | Platform | All. Works on every graphics API, in-process and over IPC; solved in the state tracker. |
@@ -75,7 +75,7 @@ Chained on `XrCursorDepthHintDXR::next`.
 
 | Field | Meaning |
 |---|---|
-| `source` | `XR_CURSOR_DEPTH_SOURCE_APP_POINT_DXR` (0): v1 behaviour; the same as not chaining the struct. `XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR` (1): the runtime finds the nearest content itself, in the depth the app submits with its projection layer. |
+| `source` | `XR_CURSOR_DEPTH_SOURCE_APP_POINT_DXR` (0): v1 behaviour; the same as not chaining the struct. `XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR` (1): the runtime finds the nearest content itself, in the depth the app submits with its projection layer. `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR` (2, spec v7): the runtime measures the disparity under the cursor from the submitted views. |
 
 With `SUBMITTED_DEPTH`:
 
@@ -103,6 +103,35 @@ display plane, and the runtime logs a one-time warning. None is ever an error.
 3. The session's compositor can read submitted depth. Today that is the in-process **Metal**
    compositor. The Vulkan, D3D11, D3D12 and GL compositors, and the IPC/service path, report no
    content until they are wired.
+
+With `MEASURED_DISPARITY` (spec v7, ADR-046 Amendment 3) — for stereo content that has **no
+depth**: SBS / stereo video, stereo photos, camera pairs, legacy stereo apps:
+
+- The hint's `hasContent` and `nearestPoint` are **ignored**; `cursorUV` and `cursorHeight` apply
+  as above. One frame per request, as with `SUBMITTED_DEPTH`.
+- At that frame's `xrEndFrame` the compositor copies a cursor-sized patch (the cursor footprint
+  dilated by the search range, at most ≈ 64 + 2×65 work px wide, box-downsampled so a 4K-SBS view
+  is matched at ≤ 960 px per view) out of the **two outermost views** of the frame's first
+  projection layer. The copy is read back one or two frames later, never waited on, and
+  block-matched on the CPU with the web stereo-tile cursor's matcher (`displayxr-web`
+  `js/camera/disparity.js`, the same constants): zero-mean NCC, ±64 work px of disparity,
+  ±2 rows, a parabolic sub-pixel fit.
+- A match counts only if it is **confident**: the block has texture (luma std ≥ 6), the best NCC
+  is ≥ 0.8, it beats every rival peak ≥ 3 px away by 0.08 (a repetitive pattern fails), and the
+  **left-right check** passes (the matched block matched back lands within 1 px). The content is
+  the nearest confident match over the cursor footprint (the tip plus a ring of 9 points around
+  the arrow's body). No confident match — blue sky, a flat wall, stripes — means no content: the
+  cursor stays on the display plane, i.e. the plain OS cursor.
+- The measured on-screen disparity is converted with the located views (a point at disparity d
+  shows on the canvas at baseline × d) and the §3 policy applies unchanged: never behind the glass.
+- A frame whose patch is bit-identical to the last measured one at the same pointer (a paused
+  video) reuses the last answer instead of matching again.
+
+Requirements (each, when missing, reports "no content", never an error): the projection layer's
+views frame the canvas the locate framed; the two outer views' sub-images are the same size; a
+colour format the matcher reads (8-bit RGBA/BGRA, RGB10A2, RGBA16F); not a display-zones frame;
+an in-process native compositor (Metal, Vulkan, GL, D3D11, D3D12). The IPC/service path reports
+no content until it is wired.
 
 **Depth conventions.** The runtime turns a depth value into a distance as follows:
 
@@ -327,3 +356,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 5 | **The runtime draws** (ADR-046 Amendment 2 B). New structs only: `XrCursorDepthDrawInfoDXR` (1004999324, on the hint: the sprite swapchain or `XR_NULL_HANDLE` for the default look, hotspot, size in metres, visibility) and `XrCursorDepthDrawStateDXR` (1004999325, on `XrViewState`: `willDraw`, the app's cue to hide its OS cursor). Drawn after the app's layers and before the display processor, per view, with the projection layer's own views (same-space rule). Default look: the current OS cursor shape, else the classic arrow. Metal (in-process) first; other backends report `willDraw = XR_FALSE`. App-drawn placement (v1–v4) unchanged. |
 | 6 | **Lifted content** (ADR-046 Amendment 1, runtime#1907). New structs only: `XrCursorDepthLiftRectDXR` (1004999326, on `XrWeaveRectLiftDXR`: draw the cursor into this lifted rect's views) and `XrCursorDepthLiftStateDXR` (1004999327, on `XrWeaveOutputDXR`: `drawnLiftMask`). Placed from the lift conversion's depth map through the module's relief mapping (`xrt_dp_lift_depth::relief_*`), §3 policy, D3D11 service. §2.7. |
 | 6 (2026-10-11) | No version bump, no struct change; **default margin halved, 0.03 → 0.015** (ADR-046 Amendment 2 A.2) after the Windows Leia panel check: 0.03 (≈2 mm crossed) floated visibly off the content, 0.015 is ≈1 mm. The margin is a default, not a contract (`XrCursorDepthOptionsDXR::margin` still overrides it), so apps need no change; one that wants the old look chains the options struct with `margin = 0.03`. |
+| 7 | **Measured disparity** (ADR-046 Amendment 3, Phase 3b). No new struct: a third `XrCursorDepthSourceDXR` kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR` (2), for stereo content with no depth. The runtime block-matches a cursor-sized patch between the outermost submitted views (confidence-gated; low confidence = the display plane = the OS cursor). In-process Metal, Vulkan, GL, D3D11 and D3D12 compositors; IPC reports no content. §2.3. |

@@ -816,6 +816,48 @@ struct comp_d3d12_compositor
 		bool warned_routed;
 		bool warned_zones;
 	} cursor_draw;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * the measured-disparity source. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the allocators, lists, fence and
+	 * readback buffers are created on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		//! Own fence: the app's queue signals it after each copy; polled, never waited.
+		ID3D12Fence *fence;
+		UINT64 fence_value;
+		struct
+		{
+			ID3D12CommandAllocator *alloc;
+			ID3D12GraphicsCommandList *list;
+			ID3D12Resource *readback;
+			UINT64 readback_size;
+			UINT64 wait_value; //!< fence value that marks this slot's copy done
+			bool in_flight;
+			UINT row_pitch;     //!< both views' footprints share it
+			UINT64 view_offset; //!< offset of view B's footprint
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format mformat;
+		} slot[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		bool failed;
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `result_mutex`.
+		struct u_cursor_measure_result result;
+		std::mutex result_mutex;
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+	} cursor_measure;
 };
 
 /*
@@ -4814,6 +4856,326 @@ d3d12_cursor_resolve(struct comp_d3d12_compositor *c,
 	return true;
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit, before any of the compositor's own work, one small
+ * command list (per slot) copies the two outermost views' footprint patches
+ * out of the app's projection swapchain (RENDER_TARGET -> COPY_SOURCE ->
+ * RENDER_TARGET, the state the renderer also expects) into a READBACK buffer
+ * and is executed on the app's queue, after its render, followed by a Signal
+ * of this feature's own fence. A later commit that finds the fence past the
+ * slot's value (GetCompletedValue, never a wait) maps the buffer, runs the
+ * shared CPU matcher and publishes the answer.
+ *
+ */
+
+static enum u_cursor_measure_format
+d3d12_cursor_measure_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+static void
+d3d12_cursor_measure_destroy(struct comp_d3d12_compositor *c)
+{
+	if (c->cursor_measure.fence != nullptr && c->cursor_measure.in_flight > 0 &&
+	    c->cursor_measure.fence->GetCompletedValue() < c->cursor_measure.fence_value) {
+		// Teardown only: the copies are tiny and already queued.
+		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		if (ev != nullptr) {
+			c->cursor_measure.fence->SetEventOnCompletion(c->cursor_measure.fence_value, ev);
+			WaitForSingleObject(ev, 1000);
+			CloseHandle(ev);
+		}
+	}
+	for (auto &sl : c->cursor_measure.slot) {
+		if (sl.readback != nullptr) {
+			sl.readback->Release();
+			sl.readback = nullptr;
+		}
+		if (sl.list != nullptr) {
+			sl.list->Release();
+			sl.list = nullptr;
+		}
+		if (sl.alloc != nullptr) {
+			sl.alloc->Release();
+			sl.alloc = nullptr;
+		}
+	}
+	if (c->cursor_measure.fence != nullptr) {
+		c->cursor_measure.fence->Release();
+		c->cursor_measure.fence = nullptr;
+	}
+}
+
+static void
+d3d12_cursor_measure_harvest(struct comp_d3d12_compositor *c)
+{
+	const UINT64 done = c->cursor_measure.fence != nullptr ? c->cursor_measure.fence->GetCompletedValue() : 0;
+	for (auto &sl : c->cursor_measure.slot) {
+		if (!sl.in_flight || done < sl.wait_value) {
+			continue; // still in flight: look again next commit
+		}
+		sl.in_flight = false;
+		c->cursor_measure.in_flight--;
+		const D3D12_RANGE range = {0, (SIZE_T)sl.readback_size};
+		void *mapped = nullptr;
+		if (FAILED(sl.readback->Map(0, &range, &mapped)) || mapped == nullptr) {
+			continue;
+		}
+		const uint8_t *base = (const uint8_t *)mapped;
+		const struct u_cursor_measure_patch pa = {base, sl.row_pitch, sl.mformat};
+		const struct u_cursor_measure_patch pb = {base + sl.view_offset, sl.row_pitch, sl.mformat};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		const bool ok = u_cursor_measure_run(&sl.req, &sl.plan, &pa, &pb, &c->cursor_measure.cache, &res);
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+		const D3D12_RANGE written = {0, 0};
+		sl.readback->Unmap(0, &written);
+		if (!ok) {
+			continue;
+		}
+		{
+			std::lock_guard<std::mutex> rl(c->cursor_measure.result_mutex);
+			if (res.tag > c->cursor_measure.result.tag) {
+				c->cursor_measure.result = res;
+			}
+		}
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		if (cpu_ns > c->cursor_measure.stat_cpu_max_ns) {
+			c->cursor_measure.stat_cpu_max_ns = cpu_ns;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			U_LOG_I("cursor_measure [d3d12]: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms; last: %s "
+			        "%.2f px (matched %u, L-R rejected %u)",
+			        c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			        (double)c->cursor_measure.stat_cpu_ns / c->cursor_measure.stat_n * 1e-6,
+			        (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			        res.disparity_px, res.matched, res.lr_rejected);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+		}
+	}
+}
+
+static void
+d3d12_cursor_measure_sample(struct comp_d3d12_compositor *c, const struct u_cursor_measure_request *req)
+{
+	if (c->cursor_measure.failed) {
+		return;
+	}
+	struct comp_layer *layer = nullptr;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == nullptr) {
+		return;
+	}
+	ID3D12Resource *res[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	D3D12_RESOURCE_DESC desc[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count || layer->sc_array[vi] == nullptr) {
+			return;
+		}
+		sub[i] = &layer->data.proj.v[vi].sub;
+		res[i] = static_cast<ID3D12Resource *>(
+		    comp_d3d12_swapchain_get_resource(layer->sc_array[vi], sub[i]->image_index));
+		if (res[i] == nullptr) {
+			return;
+		}
+		desc[i] = res[i]->GetDesc();
+		if (desc[i].Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc[i].SampleDesc.Count != 1 ||
+		    sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (UINT64)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > desc[i].Width ||
+		    (UINT)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > desc[i].Height ||
+		    sub[i]->array_index >= desc[i].DepthOrArraySize) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    desc[0].Format != desc[1].Format) {
+		return;
+	}
+	const enum u_cursor_measure_format mformat = d3d12_cursor_measure_format(desc[0].Format);
+	if (mformat == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure [d3d12]: DXGI format %d is not read by the matcher - no content (one-time "
+			        "warning)",
+			        (int)desc[0].Format);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+	const uint32_t s = c->cursor_measure.next_slot;
+	auto &sl = c->cursor_measure.slot[s];
+	if (sl.in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+
+	// First real request: the only objects this feature creates.
+	if (c->cursor_measure.fence == nullptr &&
+	    FAILED(c->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+	                                  reinterpret_cast<void **>(&c->cursor_measure.fence)))) {
+		c->cursor_measure.fence = nullptr;
+		c->cursor_measure.failed = true;
+		U_LOG_W("cursor_measure [d3d12]: could not create the fence - no content (one-time warning)");
+		return;
+	}
+	if (sl.alloc == nullptr) {
+		if (FAILED(c->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+		                                             reinterpret_cast<void **>(&sl.alloc))) ||
+		    FAILED(c->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sl.alloc, nullptr,
+		                                        __uuidof(ID3D12GraphicsCommandList),
+		                                        reinterpret_cast<void **>(&sl.list)))) {
+			c->cursor_measure.failed = true;
+			U_LOG_W("cursor_measure [d3d12]: could not create a command list - no content (one-time warning)");
+			return;
+		}
+		sl.list->Close();
+	}
+
+	// Both views' footprints in one buffer: same size and format, so one
+	// row pitch; view B starts at the next 512-byte placement boundary.
+	const UINT bpp = u_cursor_measure_format_bytes(mformat);
+	const UINT row_pitch = ((UINT)plan.w * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+	                       ~(UINT)(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+	const UINT64 view_bytes = (UINT64)row_pitch * (UINT64)plan.h;
+	const UINT64 view_offset = (view_bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+	                           ~(UINT64)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+	const UINT64 need = view_offset + view_bytes;
+	if (sl.readback == nullptr || sl.readback_size < need) {
+		if (sl.readback != nullptr) {
+			sl.readback->Release();
+			sl.readback = nullptr;
+		}
+		D3D12_HEAP_PROPERTIES hp = {};
+		hp.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = need;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		if (FAILED(c->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+		                                              nullptr, __uuidof(ID3D12Resource),
+		                                              reinterpret_cast<void **>(&sl.readback)))) {
+			sl.readback = nullptr;
+			return;
+		}
+		sl.readback_size = need;
+	}
+
+	sl.alloc->Reset();
+	sl.list->Reset(sl.alloc, nullptr);
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const UINT src_sub =
+		    (UINT)sub[i]->array_index * (UINT)desc[i].MipLevels; // mip 0, plane 0
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = res[i];
+		b.Transition.Subresource = src_sub;
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		sl.list->ResourceBarrier(1, &b);
+
+		D3D12_TEXTURE_COPY_LOCATION src = {};
+		src.pResource = res[i];
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.SubresourceIndex = src_sub;
+		D3D12_TEXTURE_COPY_LOCATION dst = {};
+		dst.pResource = sl.readback;
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dst.PlacedFootprint.Offset = i == 0 ? 0 : view_offset;
+		dst.PlacedFootprint.Footprint.Format = desc[i].Format;
+		dst.PlacedFootprint.Footprint.Width = (UINT)plan.w;
+		dst.PlacedFootprint.Footprint.Height = (UINT)plan.h;
+		dst.PlacedFootprint.Footprint.Depth = 1;
+		dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
+		D3D12_BOX box = {};
+		box.left = (UINT)(sub[i]->rect.offset.w + plan.x);
+		box.top = (UINT)(sub[i]->rect.offset.h + plan.y);
+		box.front = 0;
+		box.right = box.left + (UINT)plan.w;
+		box.bottom = box.top + (UINT)plan.h;
+		box.back = 1;
+		sl.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		sl.list->ResourceBarrier(1, &b);
+	}
+	if (FAILED(sl.list->Close())) {
+		return;
+	}
+	ID3D12CommandList *lists[] = {sl.list};
+	c->command_queue->ExecuteCommandLists(1, lists);
+	sl.wait_value = ++c->cursor_measure.fence_value;
+	c->command_queue->Signal(c->cursor_measure.fence, sl.wait_value);
+
+	sl.in_flight = true;
+	sl.row_pitch = row_pitch;
+	sl.view_offset = view_offset;
+	sl.req = *req;
+	sl.plan = plan;
+	sl.mformat = mformat;
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % 3;
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure [d3d12]: copying a %dx%d px patch per view for the measured-disparity cursor "
+		        "(ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h);
+	}
+}
+
+void
+comp_d3d12_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req)
+{
+	if (xc == nullptr || req == nullptr) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_d3d12_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> rl(c->cursor_measure.result_mutex);
+	*out = c->cursor_measure.result;
+	return out->valid;
+}
+
 extern "C" void
 comp_d3d12_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
 {
@@ -4860,6 +5222,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
 			cursor_pending = true;
 		}
+	}
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source. Submitted before any of this
+	// commit's own work, so the cursor sprite never reaches the copy.
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		d3d12_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			d3d12_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
 	}
 
 	// Get predicted eye positions
@@ -6195,6 +6569,8 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_fini(&c->mcp_capture);
 	// XR_DXR_cursor_depth v5: the default look's image (NULL unless ever drawn).
 	comp_cursor_look_fini(&c->cursor_draw.look);
+	// XR_DXR_cursor_depth v7 copy resources (NULL unless ever requested).
+	d3d12_cursor_measure_destroy(c);
 
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	// #1264 reroute teardown: the arm first (its consumer holds NT opens of

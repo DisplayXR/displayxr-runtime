@@ -83,6 +83,13 @@
  * for it per rect, @ref XrCursorDepthLiftStateDXR reports which rects got it.
  * Same policy (v4); the depth comes from the conversion's own depth map.
  *
+ * Spec v7 (ADR-046 Amendment 3, Phase 3b) adds a third source kind,
+ * XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR, for stereo content that has
+ * no depth at all (SBS video, stereo photos, camera pairs): the runtime
+ * block-matches a cursor-sized patch between the two outermost submitted
+ * views and uses the nearest CONFIDENT disparity under the cursor. No new
+ * struct; the same per-frame XrCursorDepthSourceDXR request.
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -105,7 +112,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 6
+#define XR_DXR_cursor_depth_SPEC_VERSION 7
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -192,15 +199,47 @@ typedef enum XrCursorDepthSourceKindDXR {
      * placement one or two frames later.
      */
     XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR = 1,
+    /*!
+     * Spec v7 (ADR-046 Amendment 3): for stereo content with NO depth - SBS /
+     * stereo video, stereo photos, camera pairs, legacy stereo apps. The
+     * runtime MEASURES the disparity under the cursor from the views the app
+     * submits: it copies a small patch around the pointer out of the two
+     * outermost views of the frame's first projection layer (a GPU copy,
+     * read back one or two frames later, never waited on) and block-matches
+     * it. The hint's hasContent and nearestPoint are IGNORED; cursorUV and
+     * cursorHeight still apply (the height sizes the footprint).
+     *
+     * A match counts only if it is distinct (it beats every rival match by a
+     * margin), left-right consistent, and the patch has enough texture. The
+     * content is the NEAREST confident match under the cursor footprint. No
+     * confident match (blue sky, a flat wall, a repetitive pattern) means no
+     * content: the cursor stays on the display plane, i.e. the plain OS
+     * cursor. The policy is the usual one (never behind the glass).
+     *
+     * Requires the projection layer's views to frame the canvas the locate
+     * framed (they do for any app that renders the located views), the two
+     * outer views' sub-images to be the same size, and a colour format the
+     * runtime reads (8-bit RGBA/BGRA, RGB10A2, RGBA16F). Otherwise, or while
+     * the compositor cannot measure, the placement behaves as if hasContent
+     * were XR_FALSE - never an error.
+     *
+     * Cost, only on frames that chain the request with the pointer over the
+     * canvas: one small copy per view (tens to a few hundred KB) and a CPU
+     * match of a cursor-sized patch, at most once per submitted frame and
+     * skipped when the patch is unchanged (a paused video).
+     */
+    XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR = 2,
     XR_CURSOR_DEPTH_SOURCE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrCursorDepthSourceKindDXR;
 
 /*!
  * @brief Optional, chained on XrCursorDepthHintDXR::next (spec v2).
  *
- * Chaining it with XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR IS the request
- * for the runtime's depth read, and the request covers THIS frame only: chain
- * it on every frame's hint for as long as you want the service. A frame
+ * Chaining it with XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR (or, spec v7,
+ * XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR) IS the request for the
+ * runtime's depth read (or disparity measurement), and the request covers
+ * THIS frame only: chain it on every frame's hint for as long as you want the
+ * service. A frame
  * without it costs the runtime nothing (ADR-046 section 0) - no GPU copy, no
  * readback, no allocation.
  */

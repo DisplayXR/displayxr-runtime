@@ -1137,6 +1137,15 @@ oxr_session_cursor_draw_supported(struct oxr_session *sess);
  */
 bool
 oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): hand a disparity-measure
+ * request to the session's native compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot measure.
+ */
+bool
+oxr_session_cursor_measure_hand_request(struct oxr_session *sess, const struct u_cursor_measure_request *req);
 #endif
 
 XrResult
@@ -3161,6 +3170,29 @@ struct oxr_session
 		bool warned_space;     //!< one-shot WARN: layer space != locate space
 		bool warned_no_layer;  //!< one-shot WARN: armed frame had no depth layer
 	} cursor_depth_source;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthSourceDXR(MEASURED_DISPARITY) on its hint with the pointer
+	 * over the canvas. One request per armed frame, so at most one
+	 * measurement per submitted frame.
+	 */
+	struct
+	{
+		//! Set by a locate that requested the measurement, cleared by the next xrEndFrame.
+		bool armed;
+		//! Cursor (canvas-normalised) and sprite height (canvas heights) from that locate.
+		float u, v, height;
+		//! Active view count of that locate: the outermost pair is [0] and [n-1].
+		uint32_t active_view_count;
+		//! Tag of the last request; 0 is never used, so a zeroed result never matches.
+		uint64_t next_tag;
+		bool announced;        //!< one-shot WARN on first activation
+		bool warned_no_reader; //!< one-shot WARN: compositor cannot measure
+	} cursor_measure;
 
 	/*!
 	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
