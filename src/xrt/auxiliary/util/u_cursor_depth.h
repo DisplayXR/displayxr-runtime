@@ -765,6 +765,292 @@ u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h);
 void
 u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out);
 
+
+/*
+ *
+ * Spec v7: measured disparity (ADR-046 Amendment 3, Phase 3b).
+ *
+ * Traditional stereo content (SBS video, stereo photos, camera pairs, legacy
+ * stereo apps) has no depth - only the disparity between the views the app
+ * submits. The runtime measures it under the cursor: the compositor copies a
+ * small patch around the pointer out of the two OUTERMOST submitted views
+ * (u_cursor_measure_make_plan picks the rectangle; a blit into a staging buffer,
+ * read back a frame or two later, never waited on), and this module
+ * block-matches it on the CPU (u_cursor_measure_run):
+ *
+ *  - luma, box-downsampled to a "work" resolution at most
+ *    U_CURSOR_MEASURE_WORK_EYE_W wide per view, so the block and the search
+ *    range below mean the same thing for 1080p and 4K SBS;
+ *  - the web stereo-tile cursor's matcher, ported constant for constant
+ *    (displayxr-web js/camera/disparity.js matchBlock + js/camera/pair-cursor.js
+ *    pairFootprintDisparity): zero-mean NCC, a coarse-then-fine search over
+ *    disparity and +-2 rows, a texture floor, a minimum NCC, a uniqueness
+ *    margin against any rival peak >= 3 px away, a parabolic sub-pixel fit;
+ *  - plus the ADR's left-right consistency check (the right block matched
+ *    back into the left view lands within 1 px), which the web matcher lacks;
+ *  - over the web's arrow footprint (the tip, then a ring of 9 points around
+ *    the arrow's body); the content disparity is the NEAREST confident match.
+ *    None confident = no content = the screen plane (= the plain OS cursor).
+ *
+ * The answer is a disparity in SOURCE pixels of the submitted sub-image,
+ * x_B - x_A between the outer views A (index 0) and B (index n-1): < 0 is
+ * crossed, in front of the glass (the ADR's sign, opposite to the web's).
+ * u_cursor_measure_to_baselines() turns that into the placement's units from
+ * the located views (the on-screen separation of a point at disparity d is
+ * baseline * d, exactly), and u_cursor_measure_target_px() is Amendment 3's
+ * pixel policy, which is A.1 in pixels.
+ *
+ * ZERO COST UNLESS REQUESTED (ADR-046 section 0): a zero-initialised request
+ * fails u_cursor_measure_should_sample(), so a compositor allocates, copies
+ * and reads nothing for a session that never chained the request.
+ *
+ */
+
+//! Block side, work px. The arrow at its OS size is ~16-20 work px tall.
+#define U_CURSOR_MEASURE_BLOCK 16
+//! Disparity search, +- work px (both sides: a background must win its own,
+//! uncrossed, match rather than leave a false crossed one standing).
+#define U_CURSOR_MEASURE_RANGE 64
+//! Vertical search, +- work rows (web dyMax: a raw, unrectified pair).
+#define U_CURSOR_MEASURE_DY 2
+//! A block whose luma std (0..255) is below this is too flat to match (web MIN_TEXTURE).
+#define U_CURSOR_MEASURE_MIN_TEXTURE 6.0f
+//! A match must reach this NCC (web MIN_NCC).
+#define U_CURSOR_MEASURE_MIN_NCC 0.8f
+//! ...and beat every rival peak >= U_CURSOR_MEASURE_RIVAL_PX away by this (web UNIQUENESS).
+#define U_CURSOR_MEASURE_UNIQUENESS 0.08f
+#define U_CURSOR_MEASURE_RIVAL_PX 3
+//! Left-right consistency: L->R and R->L disparities agree within this, work px.
+#define U_CURSOR_MEASURE_LR_PX 1.0f
+//! Per-view width the copied patch is box-downsampled to (factor = ceil(sub_w / this), <= 4).
+#define U_CURSOR_MEASURE_WORK_EYE_W 960
+#define U_CURSOR_MEASURE_MAX_FACTOR 4
+//! The footprint box (block centres + half a block each side), work px per axis.
+#define U_CURSOR_MEASURE_FOOTPRINT_MAX 64
+//! Footprint sample points: the tip, then a ring of 9 (the web's cursorArrowFootprint).
+#define U_CURSOR_MEASURE_POINTS 10
+//! Largest work patch: the footprint dilated by the search (+1 for the sub-pixel fit).
+#define U_CURSOR_MEASURE_MAX_WORK_W (U_CURSOR_MEASURE_FOOTPRINT_MAX + 2 * (U_CURSOR_MEASURE_RANGE + 1))
+#define U_CURSOR_MEASURE_MAX_WORK_H (U_CURSOR_MEASURE_FOOTPRINT_MAX + 2 * U_CURSOR_MEASURE_DY)
+
+/*!
+ * What the state tracker asks a compositor to measure at the next commit.
+ * Zero-initialised means "not requested".
+ */
+struct u_cursor_measure_request
+{
+	//! True only for a commit whose frame chained the request.
+	bool requested;
+	//! Echoed in the result so the state tracker can age it.
+	uint64_t tag;
+	//! Cursor hotspot, canvas-normalised (origin top-left, v down).
+	float u, v;
+	//! Sprite height, canvas heights (sizes the footprint; the footprint is
+	//! laid out in pixels, which are square, so no aspect is needed).
+	float height;
+	//! Projection-layer view indices: the outermost active pair, [0] left of [1].
+	uint32_t view_index[U_CURSOR_DEPTH_PATCH_VIEWS];
+};
+
+/*!
+ * The copy: one rectangle, the same offset into each view's sub-image.
+ */
+struct u_cursor_measure_plan
+{
+	//! The rectangle relative to the sub-image origin, in the texture's own
+	//! (storage) rows - bottom-up for a GL texture - source px.
+	int32_t x, y, w, h;
+	//! Box-downsample factor (source px per work px) and the work patch size.
+	int32_t factor;
+	int32_t work_w, work_h;
+	//! The sub-image size the plan was made for (both views must match it).
+	int32_t sub_w, sub_h;
+	//! The texture stores rows bottom-up (GL): the copy is flipped back.
+	bool bottom_up;
+	//! Top-down y of the rectangle's first work row, source px.
+	int32_t top_y;
+};
+
+//! Copied texel formats the matcher reads.
+enum u_cursor_measure_format
+{
+	U_CURSOR_MEASURE_FORMAT_UNKNOWN = 0,
+	U_CURSOR_MEASURE_FORMAT_RGBA8,   //!< 4 x u8, R first (UNORM or _SRGB: the bytes as stored)
+	U_CURSOR_MEASURE_FORMAT_BGRA8,   //!< 4 x u8, B first
+	U_CURSOR_MEASURE_FORMAT_RGBA16F, //!< 4 x half float, R first
+	U_CURSOR_MEASURE_FORMAT_RGB10A2, //!< one u32: R bits 0-9, G 10-19, B 20-29
+};
+
+//! Bytes per texel of @p fmt, 0 if unknown.
+uint32_t
+u_cursor_measure_format_bytes(enum u_cursor_measure_format fmt);
+
+/*!
+ * One view's copy as the compositor read it back: plan.w x plan.h texels,
+ * rows @p row_pitch bytes apart, in storage order.
+ */
+struct u_cursor_measure_patch
+{
+	const void *data;
+	uint32_t row_pitch;
+	enum u_cursor_measure_format format;
+};
+
+/*!
+ * The answer for one measured frame.
+ */
+struct u_cursor_measure_result
+{
+	bool valid;
+	uint64_t tag;
+	//! A confident match exists; false = no content (the screen plane).
+	bool confident;
+	//! The nearest confident disparity, SOURCE px, x_B - x_A: < 0 = crossed (in front).
+	float disparity_px;
+	//! The sub-image width it was measured in (source px).
+	float sub_w;
+	//! Diagnostics: the winning NCC, how many footprint points matched with
+	//! confidence (L->R), and how many of those failed the L-R check.
+	float ncc;
+	uint32_t matched;
+	uint32_t lr_rejected;
+	//! The patch was bit-identical to the last measured one at the same
+	//! pointer (a paused video): the cached answer was reused, nothing matched.
+	bool reused;
+};
+
+/*!
+ * Last measured patch, so an unchanged frame is not re-measured.
+ * Zero-initialise.
+ */
+struct u_cursor_measure_cache
+{
+	bool primed;
+	uint64_t hash;
+	struct u_cursor_measure_result result;
+};
+
+/*!
+ * The compositor-side gate: false for a zero-initialised request, a cursor
+ * off the canvas, or degenerate footprint values - the compositor then does
+ * no work at all.
+ */
+bool
+u_cursor_measure_should_sample(const struct u_cursor_measure_request *req);
+
+/*!
+ * The rectangle to copy out of each view's sub-image (@p sub_w x @p sub_h):
+ * the footprint's blocks, dilated by the disparity search and the vertical
+ * search, clamped to the sub-image.
+ *
+ * @return false if nothing can be measured (empty rectangle, sub-image too small).
+ */
+bool
+u_cursor_measure_make_plan(const struct u_cursor_measure_request *req,
+                           int32_t sub_w,
+                           int32_t sub_h,
+                           bool bottom_up,
+                           struct u_cursor_measure_plan *out);
+
+/*!
+ * One block match (the web's matchBlock), on two work-resolution luma images
+ * of the same size: the block of @p a at (x0, y0) searched in @p b at
+ * x0 - sign * d, d in [d_min, d_max], rows y0 +- dy_max. sign = +1 for A the
+ * left view (d = x_A - x_B, > 0 crossed); -1 for the reverse check.
+ *
+ * @return false if the block is too flat, nothing in range matched, or the
+ *         best match is not unique (a repetitive texture). @p out_ncc is the
+ *         best NCC (filled whenever a match was scored).
+ */
+bool
+u_cursor_measure_match_block(const uint8_t *a,
+                             const uint8_t *b,
+                             int32_t w,
+                             int32_t h,
+                             int32_t x0,
+                             int32_t y0,
+                             int32_t sign,
+                             int32_t d_min,
+                             int32_t d_max,
+                             float *out_d,
+                             int32_t *out_dy,
+                             float *out_ncc);
+
+/*!
+ * The nearest confident disparity of the footprint, on two work-resolution
+ * luma images (A = left view). @p points are block centres, work px.
+ *
+ * @return true with @p out_d (work px, x_A - x_B: > 0 = crossed) if any
+ *         point passed every check; false = no confident content.
+ */
+bool
+u_cursor_measure_footprint(const uint8_t *a,
+                           const uint8_t *b,
+                           int32_t w,
+                           int32_t h,
+                           const float points[][2],
+                           uint32_t point_count,
+                           float *out_d,
+                           struct u_cursor_measure_result *diag);
+
+/*!
+ * The full measurement of one frame: both views' copies -> luma at work
+ * resolution -> the footprint match -> the result in source px.
+ *
+ * @param cache  optional; an unchanged patch at the same pointer reuses the
+ *               last answer instead of matching again.
+ * @return false only on invalid input (the result is then not valid).
+ */
+bool
+u_cursor_measure_run(const struct u_cursor_measure_request *req,
+                     const struct u_cursor_measure_plan *plan,
+                     const struct u_cursor_measure_patch *view_a,
+                     const struct u_cursor_measure_patch *view_b,
+                     struct u_cursor_measure_cache *cache,
+                     struct u_cursor_measure_result *out);
+
+/*!
+ * A measured disparity -> the placement's units (eye baselines, < 0 in
+ * front), from the located views: a point at disparity d shows on the canvas
+ * at x_B - x_A = baseline * d, so d = (measured / sub_w) * canvas_width /
+ * baseline, the baseline taken along the canvas's +X (signed). Also returns
+ * the conversion, source px per baseline - the web pair cursor's
+ * pxPerBaseline (buffer px per metre on the glass x the eye separation),
+ * here read off the views so it holds for any rig and m2v scale.
+ *
+ * @return false if the views or geometry are degenerate.
+ */
+bool
+u_cursor_measure_to_baselines(const struct u_cursor_depth_view *a,
+                              const struct u_cursor_depth_view *b,
+                              const struct u_cursor_depth_geometry *g,
+                              float measured_px,
+                              float sub_w,
+                              float *out_disparity,
+                              float *out_px_per_baseline);
+
+/*!
+ * Amendment 3's policy in pixels: measured < 0 ? max(measured - margin_px,
+ * cap_px) : 0, with margin_px = tuning margin x @p px_per_baseline and cap_px
+ * = the comfort clamp x @p px_per_baseline. Exactly u_cursor_depth_target()
+ * scaled by px_per_baseline; never behind the glass.
+ */
+float
+u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
+                           bool confident,
+                           float measured_px,
+                           float px_per_baseline);
+
+/*!
+ * The footprint's block centres in work px, the web's cursorArrowFootprint:
+ * the tip (u, v), then the centre of the arrow's body (0.3 h right, 0.5 h
+ * down) and 8 points on a ring of 0.75 h around it. Scaled down uniformly if
+ * the box (with half a block each side) would exceed
+ * U_CURSOR_MEASURE_FOOTPRINT_MAX. @p tip_x / @p tip_y are the tip in work px.
+ */
+void
+u_cursor_measure_footprint_points(float tip_x, float tip_y, float height_px, float out_points[][2]);
+
 #ifdef __cplusplus
 }
 #endif

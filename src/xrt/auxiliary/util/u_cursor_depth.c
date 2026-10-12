@@ -10,6 +10,8 @@
 #include "util/u_cursor_depth.h"
 
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 static inline struct xrt_vec3
 v3_sub(struct xrt_vec3 a, struct xrt_vec3 b)
@@ -859,4 +861,783 @@ u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t
 		}
 		o[3] = (uint8_t)a;
 	}
+}
+
+
+/*
+ *
+ * Spec v7: measured disparity (ADR-046 Amendment 3, Phase 3b).
+ *
+ * The matcher is the web stereo-tile cursor's (displayxr-web
+ * js/camera/disparity.js matchBlock), ported line for line so a stereo pair
+ * shown by the page and by a native app gets the same answer; the left-right
+ * check and the footprint's nearest-first order are the runtime's additions.
+ *
+ */
+
+#define UCM_B U_CURSOR_MEASURE_BLOCK
+#define UCM_ND (2 * U_CURSOR_MEASURE_RANGE + 1)
+
+uint32_t
+u_cursor_measure_format_bytes(enum u_cursor_measure_format fmt)
+{
+	switch (fmt) {
+	case U_CURSOR_MEASURE_FORMAT_RGBA8:
+	case U_CURSOR_MEASURE_FORMAT_BGRA8:
+	case U_CURSOR_MEASURE_FORMAT_RGB10A2: return 4;
+	case U_CURSOR_MEASURE_FORMAT_RGBA16F: return 8;
+	default: return 0;
+	}
+}
+
+bool
+u_cursor_measure_should_sample(const struct u_cursor_measure_request *req)
+{
+	if (req == NULL || !req->requested) {
+		return false;
+	}
+	if (!(req->u >= 0.0f && req->u <= 1.0f && req->v >= 0.0f && req->v <= 1.0f)) {
+		return false; // off the canvas (also rejects NaN)
+	}
+	return req->height > 0.0f && isfinite(req->height) && req->view_index[0] != req->view_index[1];
+}
+
+void
+u_cursor_measure_footprint_points(float tip_x, float tip_y, float height_px, float out_points[][2])
+{
+	// The box spans 1.5 h on each axis (ring diameter, plus the tip that
+	// pokes out up-left), plus half a block each side.
+	const float max_h = (float)(U_CURSOR_MEASURE_FOOTPRINT_MAX - UCM_B) / 1.5f;
+	float h = height_px;
+	if (!(h > 0.0f) || !isfinite(h)) {
+		h = 0.0f;
+	}
+	if (h > max_h) {
+		h = max_h;
+	}
+	out_points[0][0] = tip_x;
+	out_points[0][1] = tip_y;
+	// cursorArrowFootprint: a ring around the arrow's BODY, which hangs
+	// down-right of the tip (web: u + 0.3 h / aspect, v + 0.5 h; px are square).
+	const float cx = tip_x + 0.3f * h;
+	const float cy = tip_y + 0.5f * h;
+	const float r = 0.75f * h;
+	out_points[1][0] = cx;
+	out_points[1][1] = cy;
+	for (int k = 0; k < 8; k++) {
+		const float a = (float)k * 0.78539816339f; // pi / 4
+		out_points[2 + k][0] = cx + r * cosf(a);
+		out_points[2 + k][1] = cy + r * sinf(a);
+	}
+}
+
+static int32_t
+ucm_factor(int32_t sub_w)
+{
+	int32_t f = (sub_w + U_CURSOR_MEASURE_WORK_EYE_W - 1) / U_CURSOR_MEASURE_WORK_EYE_W;
+	if (f < 1) {
+		f = 1;
+	}
+	if (f > U_CURSOR_MEASURE_MAX_FACTOR) {
+		f = U_CURSOR_MEASURE_MAX_FACTOR;
+	}
+	return f;
+}
+
+bool
+u_cursor_measure_make_plan(const struct u_cursor_measure_request *req,
+                           int32_t sub_w,
+                           int32_t sub_h,
+                           bool bottom_up,
+                           struct u_cursor_measure_plan *out)
+{
+	if (!u_cursor_measure_should_sample(req) || out == NULL) {
+		return false;
+	}
+	const int32_t f = ucm_factor(sub_w);
+	const int32_t ww = sub_w / f; // work width / height of the whole sub-image
+	const int32_t wh = sub_h / f;
+	if (ww < 2 * UCM_B || wh < UCM_B + 2 * U_CURSOR_MEASURE_DY) {
+		return false;
+	}
+
+	float pts[U_CURSOR_MEASURE_POINTS][2];
+	u_cursor_measure_footprint_points(req->u * (float)sub_w / (float)f, req->v * (float)sub_h / (float)f,
+	                                  req->height * (float)sub_h / (float)f, pts);
+	float minx = pts[0][0], maxx = pts[0][0], miny = pts[0][1], maxy = pts[0][1];
+	for (int i = 1; i < U_CURSOR_MEASURE_POINTS; i++) {
+		minx = fminf(minx, pts[i][0]);
+		maxx = fmaxf(maxx, pts[i][0]);
+		miny = fminf(miny, pts[i][1]);
+		maxy = fmaxf(maxy, pts[i][1]);
+	}
+	// Block top-left corners are round(centre - B/2) (u_cursor_measure_footprint):
+	// cover them, then the search on both sides.
+	int32_t x0 = (int32_t)floorf(minx - (float)UCM_B * 0.5f) - (U_CURSOR_MEASURE_RANGE + 1);
+	int32_t x1 = (int32_t)ceilf(maxx + (float)UCM_B * 0.5f) + 1 + (U_CURSOR_MEASURE_RANGE + 1);
+	int32_t y0 = (int32_t)floorf(miny - (float)UCM_B * 0.5f) - U_CURSOR_MEASURE_DY;
+	int32_t y1 = (int32_t)ceilf(maxy + (float)UCM_B * 0.5f) + 1 + U_CURSOR_MEASURE_DY;
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > ww ? ww : x1;
+	y1 = y1 > wh ? wh : y1;
+	// The rounding slack above can add a texel or two: hold the bound.
+	if (x1 - x0 > U_CURSOR_MEASURE_MAX_WORK_W) {
+		x1 = x0 + U_CURSOR_MEASURE_MAX_WORK_W;
+	}
+	if (y1 - y0 > U_CURSOR_MEASURE_MAX_WORK_H) {
+		y1 = y0 + U_CURSOR_MEASURE_MAX_WORK_H;
+	}
+	if (x1 - x0 < UCM_B + 2 || y1 - y0 < UCM_B) {
+		return false;
+	}
+
+	out->factor = f;
+	out->work_w = x1 - x0;
+	out->work_h = y1 - y0;
+	out->x = x0 * f;
+	out->w = out->work_w * f;
+	out->top_y = y0 * f;
+	out->h = out->work_h * f;
+	out->y = bottom_up ? sub_h - (out->top_y + out->h) : out->top_y;
+	out->sub_w = sub_w;
+	out->sub_h = sub_h;
+	out->bottom_up = bottom_up;
+	return true;
+}
+
+static float
+ucm_half_to_float(uint16_t hv)
+{
+	const uint32_t sign = (hv >> 15) & 1u;
+	const uint32_t exp = (hv >> 10) & 0x1fu;
+	const uint32_t man = hv & 0x3ffu;
+	float v;
+	if (exp == 0) {
+		v = ldexpf((float)man, -24);
+	} else if (exp == 31) {
+		v = man != 0 ? 0.0f : 65504.0f; // NaN reads as black, inf as very bright
+	} else {
+		v = ldexpf((float)(man | 0x400u), (int)exp - 25);
+	}
+	return sign ? -v : v;
+}
+
+// One texel's luma, 0..255 (the web's 77/150/29 weights, on the stored values).
+static float
+ucm_texel_luma(const uint8_t *p, enum u_cursor_measure_format fmt)
+{
+	float r, g, b;
+	switch (fmt) {
+	case U_CURSOR_MEASURE_FORMAT_RGBA8:
+		r = p[0];
+		g = p[1];
+		b = p[2];
+		break;
+	case U_CURSOR_MEASURE_FORMAT_BGRA8:
+		b = p[0];
+		g = p[1];
+		r = p[2];
+		break;
+	case U_CURSOR_MEASURE_FORMAT_RGBA16F: {
+		uint16_t hv[3];
+		memcpy(hv, p, sizeof(hv));
+		r = ucm_half_to_float(hv[0]) * 255.0f;
+		g = ucm_half_to_float(hv[1]) * 255.0f;
+		b = ucm_half_to_float(hv[2]) * 255.0f;
+		break;
+	}
+	case U_CURSOR_MEASURE_FORMAT_RGB10A2: {
+		uint32_t v;
+		memcpy(&v, p, sizeof(v));
+		r = (float)(v & 1023u) * (255.0f / 1023.0f);
+		g = (float)((v >> 10) & 1023u) * (255.0f / 1023.0f);
+		b = (float)((v >> 20) & 1023u) * (255.0f / 1023.0f);
+		break;
+	}
+	default: return 0.0f;
+	}
+	const float l = (77.0f * r + 150.0f * g + 29.0f * b) / 256.0f;
+	return l < 0.0f ? 0.0f : (l > 255.0f ? 255.0f : l);
+}
+
+// A copy -> top-down work-resolution luma (box average of factor^2 texels).
+static bool
+ucm_luma(const struct u_cursor_measure_plan *plan, const struct u_cursor_measure_patch *patch, uint8_t *out)
+{
+	const uint32_t bpp = u_cursor_measure_format_bytes(patch->format);
+	if (patch->data == NULL || bpp == 0 || patch->row_pitch < (uint32_t)plan->w * bpp) {
+		return false;
+	}
+	const int32_t f = plan->factor;
+	const float inv = 1.0f / (float)(f * f);
+	const uint8_t *base = (const uint8_t *)patch->data;
+	if (patch->format == U_CURSOR_MEASURE_FORMAT_RGBA8 || patch->format == U_CURSOR_MEASURE_FORMAT_BGRA8) {
+		// The common case, in integers: same weights, (77 R + 150 G + 29 B) / 256.
+		const bool bgr = patch->format == U_CURSOR_MEASURE_FORMAT_BGRA8;
+		const uint32_t wr = bgr ? 29u : 77u, wb = bgr ? 77u : 29u;
+		const uint32_t div = 256u * (uint32_t)(f * f);
+		for (int32_t j = 0; j < plan->work_h; j++) {
+			for (int32_t i = 0; i < plan->work_w; i++) {
+				uint32_t sum = 0;
+				for (int32_t k = 0; k < f; k++) {
+					const int32_t row = plan->bottom_up ? plan->h - 1 - (j * f + k) : j * f + k;
+					const uint8_t *src = base + (size_t)row * patch->row_pitch + (size_t)i * f * 4;
+					for (int32_t l = 0; l < f; l++, src += 4) {
+						sum += wr * src[0] + 150u * src[1] + wb * src[2];
+					}
+				}
+				out[j * plan->work_w + i] = (uint8_t)(sum / div);
+			}
+		}
+		return true;
+	}
+	for (int32_t j = 0; j < plan->work_h; j++) {
+		for (int32_t i = 0; i < plan->work_w; i++) {
+			float sum = 0.0f;
+			for (int32_t k = 0; k < f; k++) {
+				int32_t row = j * f + k; // top-down row within the copy
+				if (plan->bottom_up) {
+					row = plan->h - 1 - row;
+				}
+				const uint8_t *src = base + (size_t)row * patch->row_pitch + (size_t)i * f * bpp;
+				for (int32_t l = 0; l < f; l++) {
+					sum += ucm_texel_luma(src + (size_t)l * bpp, patch->format);
+				}
+			}
+			out[j * plan->work_w + i] = (uint8_t)(sum * inv);
+		}
+	}
+	return true;
+}
+
+// Summed-area tables of one work image, (w + 1) x (h + 1): every candidate
+// window's sum and sum of squares in four lookups instead of B^2 adds.
+static void
+ucm_integral(const uint8_t *px, int32_t w, int32_t h, uint32_t *s1, uint32_t *s2)
+{
+	const int32_t sw = w + 1;
+	for (int32_t x = 0; x <= w; x++) {
+		s1[x] = s2[x] = 0;
+	}
+	for (int32_t y = 0; y < h; y++) {
+		uint32_t r1 = 0, r2 = 0;
+		s1[(y + 1) * sw] = s2[(y + 1) * sw] = 0;
+		for (int32_t x = 0; x < w; x++) {
+			const uint32_t v = px[y * w + x];
+			r1 += v;
+			r2 += v * v;
+			s1[(y + 1) * sw + x + 1] = s1[y * sw + x + 1] + r1;
+			s2[(y + 1) * sw + x + 1] = s2[y * sw + x + 1] + r2;
+		}
+	}
+}
+
+static inline uint32_t
+ucm_box(const uint32_t *s, int32_t w, int32_t x, int32_t y)
+{
+	const int32_t sw = w + 1;
+	return s[(y + UCM_B) * sw + x + UCM_B] - s[y * sw + x + UCM_B] - s[(y + UCM_B) * sw + x] + s[y * sw + x];
+}
+
+// Normalised cross-correlation of the B x B block of `a` at (ax, ay) (mean
+// ma, std sa) against `b` at (bx, by); -1 when that block leaves `b` or is
+// flat (the web's ncc()). bs1 / bs2: b's summed-area tables.
+static float
+ucm_ncc(const uint8_t *a,
+        const uint8_t *b,
+        const uint32_t *bs1,
+        const uint32_t *bs2,
+        int32_t w,
+        int32_t h,
+        int32_t ax,
+        int32_t ay,
+        int32_t bx,
+        int32_t by,
+        float ma,
+        float sa)
+{
+	if (bx < 0 || bx + UCM_B > w || by < 0 || by + UCM_B > h) {
+		return -1.0f;
+	}
+	const float n = (float)(UCM_B * UCM_B);
+	const float mb = (float)ucm_box(bs1, w, bx, by) / n;
+	const float vb = (float)ucm_box(bs2, w, bx, by) / n - mb * mb;
+	if (vb < 1.0f) {
+		return -1.0f;
+	}
+	int32_t cross = 0;
+	for (int32_t y = 0; y < UCM_B; y++) {
+		const uint8_t *ra = a + (size_t)(ay + y) * w + ax;
+		const uint8_t *rb = b + (size_t)(by + y) * w + bx;
+		for (int32_t x = 0; x < UCM_B; x++) {
+			cross += (int32_t)ra[x] * (int32_t)rb[x];
+		}
+	}
+	return ((float)cross / n - ma * mb) / (sa * sqrtf(vb));
+}
+
+struct ucm_search
+{
+	const uint8_t *a, *b;
+	const uint32_t *bs1, *bs2;
+	int32_t w, h, x0, y0, sign, d_min, d_max;
+	float mean, std;
+	float per_d[UCM_ND];
+	float best;
+	int32_t bd, bdy;
+};
+
+static float
+ucm_score(const struct ucm_search *s, int32_t d, int32_t dy)
+{
+	return ucm_ncc(s->a, s->b, s->bs1, s->bs2, s->w, s->h, s->x0, s->y0, s->x0 - s->sign * d, s->y0 + dy, s->mean, s->std);
+}
+
+static void
+ucm_scan(struct ucm_search *s, int32_t d0, int32_t d1, int32_t step, int32_t dy0, int32_t dy1)
+{
+	for (int32_t dy = dy0; dy <= dy1; dy++) {
+		const int32_t ry = s->y0 + dy;
+		if (ry < 0 || ry + UCM_B > s->h) {
+			continue;
+		}
+		for (int32_t d = d0; d <= d1; d += step) {
+			const float c = ucm_score(s, d, dy);
+			float *pd = &s->per_d[d - s->d_min];
+			if (c > *pd) {
+				*pd = c;
+			}
+			if (c > s->best) {
+				s->best = c;
+				s->bd = d;
+				s->bdy = dy;
+			}
+		}
+	}
+}
+
+static float
+ucm_per_d(const struct ucm_search *s, int32_t d)
+{
+	return (d < s->d_min || d > s->d_max) ? -2.0f : s->per_d[d - s->d_min];
+}
+
+// A rival local maximum seen on the coarse grid, refined to its top (web peakAt).
+static float
+ucm_peak_at(const struct ucm_search *s, int32_t d)
+{
+	float v = -2.0f;
+	for (int32_t dy = -U_CURSOR_MEASURE_DY; dy <= U_CURSOR_MEASURE_DY; dy++) {
+		const int32_t ry = s->y0 + dy;
+		if (ry < 0 || ry + UCM_B > s->h) {
+			continue;
+		}
+		for (int32_t k = d - 1; k <= d + 1; k++) {
+			const float c = ucm_score(s, k, dy);
+			v = c > v ? c : v;
+		}
+	}
+	return v;
+}
+
+static bool
+ucm_match_block(const uint8_t *a,
+                const uint8_t *b,
+                const uint32_t *bs1,
+                const uint32_t *bs2,
+                int32_t w,
+                int32_t h,
+                int32_t x0,
+                int32_t y0,
+                int32_t sign,
+                int32_t d_min,
+                int32_t d_max,
+                float *out_d,
+                int32_t *out_dy,
+                float *out_ncc)
+{
+	if (a == NULL || b == NULL || x0 < 0 || y0 < 0 || x0 + UCM_B > w || y0 + UCM_B > h || d_min > d_max ||
+	    d_max - d_min + 1 > UCM_ND) {
+		return false;
+	}
+	struct ucm_search s;
+	memset(&s, 0, sizeof(s));
+	s.a = a;
+	s.b = b;
+	s.bs1 = bs1;
+	s.bs2 = bs2;
+	s.w = w;
+	s.h = h;
+	s.x0 = x0;
+	s.y0 = y0;
+	s.sign = sign >= 0 ? 1 : -1;
+	s.d_min = d_min;
+	s.d_max = d_max;
+
+	// Block statistics (web blockStats); a flat block cannot be matched.
+	int32_t sum = 0, sum2 = 0;
+	for (int32_t y = 0; y < UCM_B; y++) {
+		const uint8_t *r = a + (size_t)(y0 + y) * w + x0;
+		for (int32_t x = 0; x < UCM_B; x++) {
+			sum += r[x];
+			sum2 += (int32_t)r[x] * r[x];
+		}
+	}
+	const float n = (float)(UCM_B * UCM_B);
+	s.mean = (float)sum / n;
+	const float var = (float)sum2 / n - s.mean * s.mean;
+	s.std = sqrtf(var > 0.0f ? var : 0.0f);
+	if (s.std < U_CURSOR_MEASURE_MIN_TEXTURE) {
+		return false;
+	}
+
+	for (int32_t i = 0; i < UCM_ND; i++) {
+		s.per_d[i] = -2.0f;
+	}
+	s.best = -2.0f;
+
+	// Coarse (every 2nd disparity), then full resolution around the winner.
+	const bool coarse = d_max - d_min > 8;
+	ucm_scan(&s, d_min, d_max, coarse ? 2 : 1, -U_CURSOR_MEASURE_DY, U_CURSOR_MEASURE_DY);
+	if (coarse && s.best > -1.0f) {
+		const int32_t cd = s.bd, cy = s.bdy;
+		ucm_scan(&s, cd - 2 > d_min ? cd - 2 : d_min, cd + 2 < d_max ? cd + 2 : d_max, 1,
+		         cy - 1 > -U_CURSOR_MEASURE_DY ? cy - 1 : -U_CURSOR_MEASURE_DY,
+		         cy + 1 < U_CURSOR_MEASURE_DY ? cy + 1 : U_CURSOR_MEASURE_DY);
+	}
+	if (s.best < -1.0f) {
+		return false; // nothing in range could be scored
+	}
+	if (out_ncc != NULL) {
+		*out_ncc = s.best;
+	}
+
+	// Uniqueness: a repeating texture matches equally well one period away.
+	// Every rival local maximum >= 3 px off the winner is refined to its top
+	// (the coarse grid under-reads it) and must lose by the margin.
+	float second = -2.0f;
+	for (int32_t d = d_min; d <= d_max; d++) {
+		const float c = s.per_d[d - d_min];
+		if (abs(d - s.bd) < U_CURSOR_MEASURE_RIVAL_PX || c <= second) {
+			continue;
+		}
+		const bool local_max = c >= ucm_per_d(&s, d - 2) && c >= ucm_per_d(&s, d + 2);
+		const float v = (local_max && c > 0.0f) ? ucm_peak_at(&s, d) : c;
+		if (v > second) {
+			second = v;
+		}
+	}
+	if (d_max - d_min > 12 && second > -2.0f && s.best - second < U_CURSOR_MEASURE_UNIQUENESS) {
+		return false;
+	}
+
+	// Sub-pixel along d at the best row (parabola).
+	const float cm = ucm_score(&s, s.bd - 1, s.bdy);
+	const float cp = ucm_score(&s, s.bd + 1, s.bdy);
+	float sub = 0.0f;
+	const float den = cm - 2.0f * s.best + cp;
+	if (cm > -1.0f && cp > -1.0f && den < 0.0f) {
+		sub = 0.5f * (cm - cp) / den;
+		sub = sub < -0.5f ? -0.5f : (sub > 0.5f ? 0.5f : sub);
+	}
+	if (out_d != NULL) {
+		*out_d = (float)s.bd + sub;
+	}
+	if (out_dy != NULL) {
+		*out_dy = s.bdy;
+	}
+	return true;
+}
+
+bool
+u_cursor_measure_match_block(const uint8_t *a,
+                             const uint8_t *b,
+                             int32_t w,
+                             int32_t h,
+                             int32_t x0,
+                             int32_t y0,
+                             int32_t sign,
+                             int32_t d_min,
+                             int32_t d_max,
+                             float *out_d,
+                             int32_t *out_dy,
+                             float *out_ncc)
+{
+	if (a == NULL || b == NULL || w <= 0 || h <= 0) {
+		return false;
+	}
+	const size_t n = (size_t)(w + 1) * (size_t)(h + 1);
+	uint32_t *s = (uint32_t *)malloc(2 * n * sizeof(uint32_t));
+	if (s == NULL) {
+		return false;
+	}
+	ucm_integral(b, w, h, s, s + n);
+	const bool ok = ucm_match_block(a, b, s, s + n, w, h, x0, y0, sign, d_min, d_max, out_d, out_dy, out_ncc);
+	free(s);
+	return ok;
+}
+
+struct ucm_cand
+{
+	float d, ncc;
+	int32_t x, y, dy;
+};
+
+bool
+u_cursor_measure_footprint(const uint8_t *a,
+                           const uint8_t *b,
+                           int32_t w,
+                           int32_t h,
+                           const float points[][2],
+                           uint32_t point_count,
+                           float *out_d,
+                           struct u_cursor_measure_result *diag)
+{
+	struct ucm_cand cand[U_CURSOR_MEASURE_POINTS];
+	uint32_t n = 0;
+	if (a == NULL || b == NULL || w <= 0 || h <= 0) {
+		return false;
+	}
+	if (point_count > U_CURSOR_MEASURE_POINTS) {
+		point_count = U_CURSOR_MEASURE_POINTS;
+	}
+	// Both views' summed-area tables, once: shared by every block and both
+	// directions of the left-right check.
+	const size_t area = (size_t)(w + 1) * (size_t)(h + 1);
+	uint32_t *tables = (uint32_t *)malloc(4 * area * sizeof(uint32_t));
+	if (tables == NULL) {
+		return false;
+	}
+	uint32_t *as1 = tables, *as2 = tables + area, *bs1 = tables + 2 * area, *bs2 = tables + 3 * area;
+	ucm_integral(a, w, h, as1, as2);
+	ucm_integral(b, w, h, bs1, bs2);
+	bool found = false;
+	for (uint32_t i = 0; i < point_count; i++) {
+		const int32_t x = (int32_t)lroundf(points[i][0] - (float)UCM_B * 0.5f);
+		const int32_t y = (int32_t)lroundf(points[i][1] - (float)UCM_B * 0.5f);
+		if (x < 0 || x + UCM_B > w || y < 0 || y + UCM_B > h) {
+			continue;
+		}
+		float d = 0.0f, c = -2.0f;
+		int32_t dy = 0;
+		if (!ucm_match_block(a, b, bs1, bs2, w, h, x, y, +1, -U_CURSOR_MEASURE_RANGE, U_CURSOR_MEASURE_RANGE, &d,
+		                     &dy, &c) ||
+		    c < U_CURSOR_MEASURE_MIN_NCC) {
+			continue;
+		}
+		cand[n].d = d;
+		cand[n].ncc = c;
+		cand[n].x = x;
+		cand[n].y = y;
+		cand[n].dy = dy;
+		n++;
+	}
+	if (diag != NULL) {
+		diag->matched = n;
+		diag->lr_rejected = 0;
+	}
+	// Nearest first (largest crossed d), so the first one that survives the
+	// left-right check is the answer and the rest are never matched back.
+	for (uint32_t i = 1; i < n; i++) {
+		for (uint32_t j = i; j > 0 && cand[j].d > cand[j - 1].d; j--) {
+			const struct ucm_cand t = cand[j];
+			cand[j] = cand[j - 1];
+			cand[j - 1] = t;
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		// The block of B where A's block landed, matched back into A.
+		const int32_t bx = cand[i].x - (int32_t)lroundf(cand[i].d);
+		const int32_t by = cand[i].y + cand[i].dy;
+		float d2 = 0.0f, c2 = -2.0f;
+		int32_t dy2 = 0;
+		if (ucm_match_block(b, a, as1, as2, w, h, bx, by, -1, -U_CURSOR_MEASURE_RANGE, U_CURSOR_MEASURE_RANGE, &d2,
+		                    &dy2, &c2) &&
+		    c2 >= U_CURSOR_MEASURE_MIN_NCC && fabsf(d2 - cand[i].d) <= U_CURSOR_MEASURE_LR_PX) {
+			if (out_d != NULL) {
+				*out_d = cand[i].d;
+			}
+			if (diag != NULL) {
+				diag->ncc = cand[i].ncc;
+			}
+			found = true;
+			break;
+		}
+		if (diag != NULL) {
+			diag->lr_rejected++;
+		}
+	}
+	free(tables);
+	return found;
+}
+
+// FNV-1a style, a 64-bit word at a time: only change detection, not security.
+static uint64_t
+ucm_hash(uint64_t h, const void *data, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)data;
+	size_t i = 0;
+	// Four independent lanes (no serial multiply chain), folded at the end.
+	uint64_t l[4] = {h, h ^ 0x9e3779b97f4a7c15ULL, h ^ 0xc2b2ae3d27d4eb4fULL, h ^ 0x165667b19e3779f9ULL};
+	for (; i + 32 <= len; i += 32) {
+		uint64_t w[4];
+		memcpy(w, p + i, sizeof(w));
+		for (int k = 0; k < 4; k++) {
+			l[k] = (l[k] ^ w[k]) * 1099511628211ULL;
+			l[k] ^= l[k] >> 29;
+		}
+	}
+	h = l[0];
+	for (int k = 1; k < 4; k++) {
+		h = (h ^ l[k]) * 1099511628211ULL;
+	}
+	for (; i + 8 <= len; i += 8) {
+		uint64_t w;
+		memcpy(&w, p + i, sizeof(w));
+		h = (h ^ w) * 1099511628211ULL;
+		h ^= h >> 29;
+	}
+	for (; i < len; i++) {
+		h = (h ^ p[i]) * 1099511628211ULL;
+	}
+	return h;
+}
+
+// The copy's rows exactly as read back (only the texels the plan covers).
+static uint64_t
+ucm_hash_patch(uint64_t h, const struct u_cursor_measure_plan *plan, const struct u_cursor_measure_patch *patch)
+{
+	const size_t row_bytes = (size_t)plan->w * u_cursor_measure_format_bytes(patch->format);
+	const uint8_t *base = (const uint8_t *)patch->data;
+	h = ucm_hash(h, &patch->format, sizeof(patch->format));
+	for (int32_t r = 0; r < plan->h; r++) {
+		h = ucm_hash(h, base + (size_t)r * patch->row_pitch, row_bytes);
+	}
+	return h;
+}
+
+bool
+u_cursor_measure_run(const struct u_cursor_measure_request *req,
+                     const struct u_cursor_measure_plan *plan,
+                     const struct u_cursor_measure_patch *view_a,
+                     const struct u_cursor_measure_patch *view_b,
+                     struct u_cursor_measure_cache *cache,
+                     struct u_cursor_measure_result *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!u_cursor_measure_should_sample(req) || plan == NULL || view_a == NULL || view_b == NULL ||
+	    plan->factor < 1 || plan->work_w < 1 || plan->work_h < 1 || plan->work_w > U_CURSOR_MEASURE_MAX_WORK_W ||
+	    plan->work_h > U_CURSOR_MEASURE_MAX_WORK_H || plan->sub_w <= 0 || plan->sub_h <= 0) {
+		return false;
+	}
+	for (int i = 0; i < 2; i++) {
+		const struct u_cursor_measure_patch *pt = i == 0 ? view_a : view_b;
+		const uint32_t bpp = u_cursor_measure_format_bytes(pt->format);
+		if (pt->data == NULL || bpp == 0 || pt->row_pitch < (uint32_t)plan->w * bpp) {
+			return false;
+		}
+	}
+	const int32_t f = plan->factor;
+
+	// The tip and the footprint, in the work patch.
+	const float tip_x = req->u * (float)plan->sub_w / (float)f - (float)(plan->x / f);
+	const float tip_y = req->v * (float)plan->sub_h / (float)f - (float)(plan->top_y / f);
+	const float height_px = req->height * (float)plan->sub_h / (float)f;
+
+	// A paused video re-submits the same pixels: same copy, same pointer,
+	// same answer - do not match it again (ADR-046 Amendment 3 point 4). The
+	// raw copy is hashed before any conversion, so a reused frame costs only
+	// this pass over the bytes.
+	uint64_t hash = 14695981039346656037ULL;
+	const float key[3] = {tip_x, tip_y, height_px};
+	const int32_t dims[4] = {plan->work_w, plan->work_h, plan->factor, plan->bottom_up ? 1 : 0};
+	hash = ucm_hash(hash, key, sizeof(key));
+	hash = ucm_hash(hash, dims, sizeof(dims));
+	hash = ucm_hash_patch(hash, plan, view_a);
+	hash = ucm_hash_patch(hash, plan, view_b);
+	if (cache != NULL && cache->primed && cache->hash == hash) {
+		*out = cache->result;
+		out->tag = req->tag;
+		out->reused = true;
+		return true;
+	}
+
+	uint8_t la[U_CURSOR_MEASURE_MAX_WORK_W * U_CURSOR_MEASURE_MAX_WORK_H];
+	uint8_t lb[U_CURSOR_MEASURE_MAX_WORK_W * U_CURSOR_MEASURE_MAX_WORK_H];
+	if (!ucm_luma(plan, view_a, la) || !ucm_luma(plan, view_b, lb)) {
+		return false;
+	}
+
+	float pts[U_CURSOR_MEASURE_POINTS][2];
+	u_cursor_measure_footprint_points(tip_x, tip_y, height_px, pts);
+	float d = 0.0f;
+	out->confident = u_cursor_measure_footprint(la, lb, plan->work_w, plan->work_h, (const float(*)[2])pts,
+	                                            U_CURSOR_MEASURE_POINTS, &d, out);
+	// Work px, x_A - x_B (> 0 crossed) -> source px, x_B - x_A (< 0 crossed).
+	out->disparity_px = out->confident ? -d * (float)f : 0.0f;
+	out->sub_w = (float)plan->sub_w;
+	out->tag = req->tag;
+	out->valid = true;
+
+	if (cache != NULL) {
+		cache->primed = true;
+		cache->hash = hash;
+		cache->result = *out;
+	}
+	return true;
+}
+
+bool
+u_cursor_measure_to_baselines(const struct u_cursor_depth_view *a,
+                              const struct u_cursor_depth_view *b,
+                              const struct u_cursor_depth_geometry *g,
+                              float measured_px,
+                              float sub_w,
+                              float *out_disparity,
+                              float *out_px_per_baseline)
+{
+	if (a == NULL || b == NULL || g == NULL || !(sub_w > 0.0f) || !isfinite(measured_px)) {
+		return false;
+	}
+	const float tw = tanf(a->fov.angle_right) - tanf(a->fov.angle_left);
+	const float th = tanf(a->fov.angle_up) - tanf(a->fov.angle_down);
+	if (!(tw > 0.0f) || !(th > 0.0f)) {
+		return false;
+	}
+	// Every Kooima view frames the canvas, so its fov aspect is the canvas's.
+	const float canvas_w = g->canvas_height * tw / th;
+	const struct xrt_vec3 right = quat_rotate(g->orientation, (struct xrt_vec3){1.0f, 0.0f, 0.0f});
+	const float baseline = v3_dot(v3_sub(b->pose.position, a->pose.position), right);
+	if (!(canvas_w > 0.0f) || !isfinite(canvas_w) || !(fabsf(baseline) > 1e-9f) || !isfinite(baseline)) {
+		return false;
+	}
+	const float d = (measured_px / sub_w) * canvas_w / baseline;
+	const float ppb = sub_w * fabsf(baseline) / canvas_w;
+	if (!isfinite(d) || !isfinite(ppb)) {
+		return false;
+	}
+	if (out_disparity != NULL) {
+		*out_disparity = d;
+	}
+	if (out_px_per_baseline != NULL) {
+		*out_px_per_baseline = ppb;
+	}
+	return true;
+}
+
+float
+u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
+                           bool confident,
+                           float measured_px,
+                           float px_per_baseline)
+{
+	if (!confident || !(px_per_baseline > 0.0f) || !isfinite(px_per_baseline) || !isfinite(measured_px)) {
+		return 0.0f;
+	}
+	// measured < 0 ? max(measured - margin_px, cap_px) : 0 - A.1 in pixels.
+	return u_cursor_depth_target(t, true, measured_px / px_per_baseline) * px_per_baseline;
 }
