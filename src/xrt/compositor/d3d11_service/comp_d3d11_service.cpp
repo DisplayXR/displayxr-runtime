@@ -2328,6 +2328,41 @@ struct d3d11_service_system
 	//! an in-process or imported-swapchain client, which have no keyed mutex to
 	//! acquire in the first place.
 	std::atomic<uint32_t> render_diag_ui_acq_skip{0};
+
+	/*!
+	 * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): what the service's
+	 * runtime-drawn cursor needs, built on the FIRST request and never before
+	 * (§0: a service whose clients never ask pays nothing).
+	 * @{
+	 */
+	//! Guards the default look and its texture. Taken by the commit of any
+	//! direct client (several IPC threads); a LEAF - never held across a draw.
+	std::mutex cursor_look_mutex;
+	//! The default look (A.6): the mirrored OS cursor, else the classic arrow
+	//! (comp_cursor_look, shared with every in-process compositor).
+	struct comp_cursor_look cursor_look = {};
+	//! The look's pixels, TYPELESS, with a non-decoding and a decoding view (a
+	//! composing commit samples the latter into its `_SRGB` target).
+	wil::com_ptr<ID3D11Texture2D> cursor_look_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> cursor_look_srv;
+	wil::com_ptr<ID3D11ShaderResourceView> cursor_look_srv_srgb;
+	uint64_t cursor_look_generation = 0;
+	//! The shared cursor shaders (d3d_shared/comp_cursor_shaders.h, the ones
+	//! every in-process D3D compositor draws its cursor with): the plain pixel
+	//! shader, the B.7 `DXR_SOFTEN` one, and the latter under the compose pass's
+	//! colour model (`DXR_SVC_LINEARIZE`), plus their two constant buffers.
+	//! Built on the first draw that needs them; `cursor_shaders_tried` keeps a
+	//! failure from retrying every frame.
+	std::mutex cursor_shaders_mutex;
+	bool cursor_shaders_tried = false;
+	bool cursor_shaders_ok = false;
+	wil::com_ptr<ID3D11VertexShader> cursor_vs;
+	wil::com_ptr<ID3D11PixelShader> cursor_ps;          //!< as stored (no colour arithmetic)
+	wil::com_ptr<ID3D11PixelShader> cursor_ps_soft;     //!< B.7 kernel
+	wil::com_ptr<ID3D11PixelShader> cursor_ps_soft_lin; //!< B.7 kernel + the pass's linearize flag (b2)
+	wil::com_ptr<ID3D11Buffer> cursor_cb_quad;          //!< b0: CursorQuadConstants
+	wil::com_ptr<ID3D11Buffer> cursor_cb_soften;        //!< b1: CursorSoftenConstants
+	/*! @} */
 };
 
 /*!
@@ -15524,17 +15559,205 @@ struct svc_cursor_quad
 #define SVC_CURSOR_MAX_QUADS 64
 
 /*!
+ * How svc_draw_cursor_quads draws when it does NOT take its original path
+ * (NULL style = that path, byte for byte).
+ *
+ * - @ref premultiplied: the sprite's alpha convention (blend state and the B.7
+ *   kernel). The default look is premultiplied; app and controller sprites are
+ *   straight.
+ * - @ref shared_shaders: draw through the in-process compositors' own cursor
+ *   shaders (d3d_shared/comp_cursor_shaders.h), which do no colour arithmetic -
+ *   the caller picks the SRV (decoding or not) and the RTV (`_SRGB` or not), as
+ *   every in-process backend does. A runtime-drawn cursor of an IPC client
+ *   (ADR-046 Phase 4) draws this way, crisp or softened.
+ * - @ref radius_uv / @ref alpha: ADR-046 Amendment 2 B.7 crosstalk softening (blur
+ *   radius in sprite uv, opacity). (0, 0, 1) is no softening: the crisp draw.
+ *   A softened draw always uses the shared shaders' `DXR_SOFTEN` kernel; with
+ *   @ref shared_shaders false it runs under the compose pass's ADR-021 colour
+ *   model (`DXR_SVC_LINEARIZE`, the pass's flag at b2), exactly as the
+ *   original path's blit shader does.
+ */
+struct svc_cursor_style
+{
+	bool premultiplied;
+	bool shared_shaders;
+	float radius_uv[2];
+	float alpha;
+};
+
+/*!
+ * Build the shared cursor shaders (once; a failure is not retried). Any thread;
+ * device calls only (no immediate context).
+ */
+static bool
+svc_cursor_shaders_ensure(struct d3d11_service_system *sys)
+{
+	std::lock_guard<std::mutex> lk(sys->cursor_shaders_mutex);
+	if (sys->cursor_shaders_tried) {
+		return sys->cursor_shaders_ok;
+	}
+	sys->cursor_shaders_tried = true;
+
+	ID3DBlob *blob = nullptr;
+	HRESULT hr = compile_shader(cursor_quad_vs_source, "main", "vs_5_0", &blob);
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                     sys->cursor_vs.put());
+		blob->Release();
+	}
+	const D3D_SHADER_MACRO soft_defs[] = {{"DXR_SOFTEN", "1"}, {nullptr, nullptr}};
+	const D3D_SHADER_MACRO soft_lin_defs[] = {{"DXR_SOFTEN", "1"}, {"DXR_SVC_LINEARIZE", "1"}, {nullptr, nullptr}};
+	struct
+	{
+		const D3D_SHADER_MACRO *defs;
+		wil::com_ptr<ID3D11PixelShader> *ps;
+	} variants[] = {
+	    // std::addressof: wil::com_ptr overloads unary & (it yields T **).
+	    {nullptr, std::addressof(sys->cursor_ps)},
+	    {soft_defs, std::addressof(sys->cursor_ps_soft)},
+	    {soft_lin_defs, std::addressof(sys->cursor_ps_soft_lin)},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(variants) && SUCCEEDED(hr); i++) {
+		blob = nullptr;
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &blob, variants[i].defs);
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    variants[i].ps->put());
+			blob->Release();
+		}
+	}
+	if (SUCCEEDED(hr)) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bd.ByteWidth = (UINT)((sizeof(CursorQuadConstants) + 15) & ~15u);
+		hr = sys->device->CreateBuffer(&bd, nullptr, sys->cursor_cb_quad.put());
+		if (SUCCEEDED(hr)) {
+			bd.ByteWidth = (UINT)((sizeof(CursorSoftenConstants) + 15) & ~15u);
+			hr = sys->device->CreateBuffer(&bd, nullptr, sys->cursor_cb_soften.put());
+		}
+	}
+	sys->cursor_shaders_ok = SUCCEEDED(hr);
+	if (!sys->cursor_shaders_ok) {
+		U_LOG_W("[cursor_draw] the cursor shaders could not be built (0x%08lx) - the runtime-drawn cursor is "
+		        "refused / drawn crisp (one-time warning)",
+		        (long)hr);
+	}
+	return sys->cursor_shaders_ok;
+}
+
+//! The style's B.7 softening is on (a crisp style is (0, 0, 1)).
+static inline bool
+svc_cursor_style_softened(const struct svc_cursor_style *s)
+{
+	return s != nullptr && (s->radius_uv[0] > 0.0f || s->radius_uv[1] > 0.0f || s->alpha < 1.0f);
+}
+
+/*!
+ * The shared-shader draw of svc_draw_cursor_quads: one quad per view through
+ * comp_cursor_shaders, padded by the blur radius when softened (the quad grows,
+ * its uv runs outside 0..1 on the pad, the hotspot does not move). Restores the
+ * VS/PS constant-buffer slots it uses: those bindings are sticky across the
+ * threads that share the immediate context.
+ */
+static void
+svc_draw_cursor_quads_shared(struct d3d11_service_system *sys,
+                             float target_w,
+                             float target_h,
+                             ID3D11ShaderResourceView *sprite_srv,
+                             const struct svc_cursor_quad *quads,
+                             uint32_t quad_count,
+                             const struct svc_cursor_style *style)
+{
+	const bool soft = svc_cursor_style_softened(style);
+	ID3D11PixelShader *ps = !soft ? sys->cursor_ps.get()
+	                        : style->shared_shaders ? sys->cursor_ps_soft.get()
+	                                                : sys->cursor_ps_soft_lin.get();
+
+	ID3D11Buffer *saved_vs_b0 = nullptr;
+	ID3D11Buffer *saved_ps_b[3] = {nullptr, nullptr, nullptr};
+	sys->context->VSGetConstantBuffers(0, 1, &saved_vs_b0);
+	sys->context->PSGetConstantBuffers(0, 3, saved_ps_b);
+
+	sys->context->VSSetShader(sys->cursor_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(ps, nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->cursor_cb_quad.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->cursor_cb_quad.addressof());
+	if (soft) {
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (SUCCEEDED(sys->context->Map(sys->cursor_cb_soften.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			CursorSoftenConstants sc = {};
+			sc.soften[0] = style->radius_uv[0];
+			sc.soften[1] = style->radius_uv[1];
+			sc.soften[2] = style->alpha;
+			sc.soften[3] = style->premultiplied ? 0.0f : 1.0f; // 1 = straight
+			memcpy(m.pData, &sc, sizeof(sc));
+			sys->context->Unmap(sys->cursor_cb_soften.get(), 0);
+		}
+		sys->context->PSSetConstantBuffers(1, 1, sys->cursor_cb_soften.addressof());
+		if (!style->shared_shaders) {
+			// The compose pass's own colour model (its linearize flag).
+			sys->context->PSSetConstantBuffers(2, 1, sys->color_linearize_cb.addressof());
+		}
+	}
+	sys->context->PSSetShaderResources(0, 1, &sprite_srv);
+
+	const float ru = soft ? style->radius_uv[0] : 0.0f;
+	const float rv = soft ? style->radius_uv[1] : 0.0f;
+	for (uint32_t i = 0; i < quad_count; i++) {
+		const struct svc_cursor_quad *q = &quads[i];
+		// Padded by the radius on every side (zero when crisp).
+		const float x0 = q->x - ru * q->w, x1 = q->x + q->w * (1.0f + ru);
+		const float y0 = q->y - rv * q->h, y1 = q->y + q->h * (1.0f + rv);
+		const float u0 = -ru, u1 = 1.0f + ru, v0 = -rv, v1 = 1.0f + rv;
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (FAILED(sys->context->Map(sys->cursor_cb_quad.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			continue;
+		}
+		// Strip order TL, BL, TR, BR; target-normalised (the viewport is the target).
+		const CursorQuadConstants qc = {{
+		    {x0 / target_w, y0 / target_h, u0, v0},
+		    {x0 / target_w, y1 / target_h, u0, v1},
+		    {x1 / target_w, y0 / target_h, u1, v0},
+		    {x1 / target_w, y1 / target_h, u1, v1},
+		}};
+		memcpy(m.pData, &qc, sizeof(qc));
+		sys->context->Unmap(sys->cursor_cb_quad.get(), 0);
+		sys->context->RSSetScissorRects(1, &q->clip);
+		sys->context->Draw(4, 0);
+	}
+
+	sys->context->VSSetConstantBuffers(0, 1, &saved_vs_b0);
+	sys->context->PSSetConstantBuffers(0, 3, saved_ps_b);
+	if (saved_vs_b0 != nullptr) {
+		saved_vs_b0->Release();
+	}
+	for (ID3D11Buffer *b : saved_ps_b) {
+		if (b != nullptr) {
+			b->Release();
+		}
+	}
+}
+
+/*!
  * Draw a cursor sprite once per view into an atlas, before the display
- * processor weaves it (ADR-046 Phase 2 drawer). The workspace cursor pass and
- * the lifted-content cursor (ADR-046 Amendment 1) both go through here; the
- * caller computes the per-view positions, which is where disparity lives.
+ * processor weaves it (ADR-046 Phase 2 drawer). The workspace cursor pass, the
+ * lifted-content cursor (ADR-046 Amendment 1) and IPC clients' runtime-drawn
+ * cursor (Phase 4) all go through here; the caller computes the per-view
+ * positions, which is where disparity lives.
  *
  * Binds its own pipeline state and leaves the scissor at the full target.
  * The caller holds the immediate-context lock for the whole call.
  *
  * @param tint_rgba    multiplicative tint (alpha = opacity), or NULL for none.
+ *                     Original path only (a styled draw has no tint: B.7's
+ *                     opacity is its only fade - the one-fade rule).
  * @param convert_srgb true when the target stores linear values (an _SRGB RTV)
- *                     and the sprite is sRGB-encoded.
+ *                     and the sprite is sRGB-encoded. Original path only.
+ * @param style        NULL: the original path, unchanged. Else see
+ *                     svc_cursor_style. A softened style whose shaders cannot
+ *                     be built falls back to the original path, crisp.
  */
 static void
 svc_draw_cursor_quads(struct d3d11_service_system *sys,
@@ -15547,9 +15770,31 @@ svc_draw_cursor_quads(struct d3d11_service_system *sys,
                       const struct svc_cursor_quad *quads,
                       uint32_t quad_count,
                       const float *tint_rgba,
-                      bool convert_srgb)
+                      bool convert_srgb,
+                      const struct svc_cursor_style *style = nullptr)
 {
 	if (rtv == nullptr || sprite_srv == nullptr || sprite_w == 0 || sprite_h == 0 || quad_count == 0) {
+		return;
+	}
+	if (style != nullptr && (style->shared_shaders || svc_cursor_style_softened(style)) &&
+	    svc_cursor_shaders_ensure(sys)) {
+		ID3D11RenderTargetView *rtvs[] = {rtv};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		sys->context->OMSetBlendState(style->premultiplied ? sys->blend_premul.get() : sys->blend_alpha.get(),
+		                              nullptr, 0xFFFFFFFF);
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);
+		D3D11_VIEWPORT vp = {};
+		vp.Width = target_w;
+		vp.Height = target_h;
+		vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &vp);
+		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+		svc_draw_cursor_quads_shared(sys, target_w, target_h, sprite_srv, quads, quad_count, style);
+		D3D11_RECT full = {0, 0, (LONG)target_w, (LONG)target_h};
+		sys->context->RSSetScissorRects(1, &full);
 		return;
 	}
 	sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
@@ -26823,8 +27068,30 @@ svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
 		q->h = spr_h * v->sy;
 		q->clip = v->clip;
 	}
+	// ADR-046 Amendment 2 B.7: soften the lifted cursor against crosstalk. The
+	// ghost is the largest neighbouring-view hotspot distance, in window (=
+	// panel) px; the blur cap follows the drawn sprite. (0 px, 1.0) - which a
+	// drawn lift cursor never is, it is off the glass - would be the crisp draw.
+	float ghost_px = 0.0f;
+	for (uint32_t k = 0; k + 1 < nvp; k++) {
+		const float gx = (xy[2 * (k + 1) + 0] - xy[2 * k + 0]) / pin->rect_size[0] * (float)rect.extent.w;
+		const float gy = (xy[2 * (k + 1) + 1] - xy[2 * k + 1]) / pin->rect_size[1] * (float)rect.extent.h;
+		const float g = sqrtf(gx * gx + gy * gy);
+		if (std::isfinite(g) && g > ghost_px) {
+			ghost_px = g;
+		}
+	}
+	const struct u_cursor_soften soften = u_cursor_draw_soften_sized(d, ghost_px, spr_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = false; // the arrow's texels are opaque or clear: either convention
+	style.shared_shaders = false; // this pass's colour model, as the crisp draw
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && spr_w > 0.0f && spr_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / spr_w;
+		style.radius_uv[1] = soften.blur_px / spr_h;
+	}
 	svc_draw_cursor_quads(sys, rtv, target_w, target_h, sprite, SVC_LIFT_CURSOR_SPRITE_W, SVC_LIFT_CURSOR_SPRITE_H,
-	                      quads, nq, /*tint*/ nullptr, /*convert_srgb*/ false);
+	                      quads, nq, /*tint*/ nullptr, /*convert_srgb*/ false, &style);
 	*why = SVC_LC_DRAWN;
 	return true;
 }
@@ -30432,6 +30699,18 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 	// NOTE: Per-client display processors are cleaned up in fini_client_render_resources()
 	// when each client disconnects. System has no display processor anymore.
+
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4).
+	sys->cursor_look_srv.reset();
+	sys->cursor_look_srv_srgb.reset();
+	sys->cursor_look_tex.reset();
+	comp_cursor_look_fini(&sys->cursor_look);
+	sys->cursor_cb_quad.reset();
+	sys->cursor_cb_soften.reset();
+	sys->cursor_ps.reset();
+	sys->cursor_ps_soft.reset();
+	sys->cursor_ps_soft_lin.reset();
+	sys->cursor_vs.reset();
 
 	// Clean up layer rendering resources
 	sys->depth_test_enabled.reset();
