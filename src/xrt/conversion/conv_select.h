@@ -44,6 +44,15 @@ extern "C" {
 /*! @name Provider flags (conv_select_row::provider_flags, conv_provider_desc::flags) @{ */
 #define CONV_PROV_FALLBACK (1u << 0)       //!< XRT_CONV_PROVIDER_FLAG_FALLBACK: last unless preferred
 #define CONV_PROV_LICENCE_EXEMPT (1u << 1) //!< grandfathered legacy adapter: skips the licence gate
+/*! The legacy adapter (`dp-lift`, #2003): the provider takes the RELATIVE
+ *  convergence of the legacy contract (xrt_dp_lift_params::convergence, [0,1]
+ *  over the frame's own range) and the app's strength unchanged ("1 = the
+ *  module's calibrated budget"). S3 then hands it
+ *  CONV_CONVERGENCE_MODE_LEGACY_RELATIVE and skips the budget rule, so the
+ *  plane the policy picked reaches the module exactly (no decoded-units round
+ *  trip through a range the legacy contract cannot express). Runtime-internal:
+ *  never set from the registry. */
+#define CONV_PROV_LEGACY_UNITS (1u << 2)
 /*! @} */
 
 /*! One candidate: a capability row joined with its provider and readiness. */
