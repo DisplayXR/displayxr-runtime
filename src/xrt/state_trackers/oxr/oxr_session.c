@@ -132,6 +132,12 @@ struct xrt_window_metrics;
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
+// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4) — same linkage pattern.
+// Writes req->report from the service's answer; see ipc_client.h.
+struct u_cursor_draw_request;
+bool
+comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
 // Multi-screen M6/M3 over IPC (ADR-047 Amendment 3) — same linkage pattern.
 // The table / routing travel by value; see ipc_client.h.
 struct xrt_segment_metrics;
@@ -2324,10 +2330,34 @@ oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_c
 }
 
 /*
+ * ADR-046 Phase 4: is this session an IPC client of the D3D11 service (which
+ * draws the runtime-drawn cursor for it)? Same gate as every other IPC-bridge
+ * call here: service mode, no in-process multi-compositor, none of the native
+ * compositors, not a bridge relay. Windows only - the D3D11 service is the
+ * Windows service; another service answers every request "not drawn".
+ */
+static bool
+oxr_session_cursor_draw_via_service(struct oxr_session *sess)
+{
+#ifdef XRT_OS_WINDOWS
+	if (sess->xcn == NULL || sess->is_bridge_relay || sess->sys->xsysc == NULL ||
+	    !sess->sys->xsysc->info.is_service_mode || sess->sys->xsysc->xmcc != NULL) {
+		return false;
+	}
+	return !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
+	       !sess->is_gl_native_compositor && !sess->is_vk_native_compositor && !sess->is_metal_native_compositor;
+#else
+	(void)sess;
+	return false;
+#endif
+}
+
+/*
  * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2
- * B). The in-process Metal, vk_native, GL, D3D11 and D3D12 compositors
- * draw; the service reports "cannot draw", so locates report willDraw =
- * false and the app keeps its flat OS cursor - never no cursor.
+ * B). The in-process Metal, vk_native, GL, D3D11 and D3D12 compositors draw,
+ * and (Phase 4) so does the D3D11 service for its IPC clients. Anything else
+ * reports "cannot draw", so locates report willDraw = false and the app keeps
+ * its flat OS cursor - never no cursor.
  */
 bool
 oxr_session_cursor_draw_supported(struct oxr_session *sess)
@@ -2360,8 +2390,12 @@ oxr_session_cursor_draw_supported(struct oxr_session *sess)
 		return true;
 	}
 #endif
-	// TODO(ADR-046 Amendment 2 B, rollout step 3): the IPC/service path
-	// (svc_draw_cursor_quads).
+	// ADR-046 Phase 4: an IPC client of the D3D11 service - the service draws
+	// it (svc_draw_cursor_quads): into the client's atlas for a direct client,
+	// or by lifting the workspace cursor onto its window under the shell.
+	if (oxr_session_cursor_draw_via_service(sess)) {
+		return true;
+	}
 	return false;
 }
 
@@ -2422,6 +2456,15 @@ oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cu
 	if (sess->is_d3d12_native_compositor) {
 		comp_d3d12_compositor_set_cursor_draw_request(&sess->xcn->base, req);
 		return true;
+	}
+#endif
+#ifdef XRT_OS_WINDOWS
+	// ADR-046 Phase 4: to the D3D11 service, which answers with the outcome of
+	// the PREVIOUS request (its draw happens at or after the commit), written
+	// into req->report here - so the willDraw latch runs one frame later than
+	// in-process. False (nothing to fold) until the service has answered once.
+	if (oxr_session_cursor_draw_via_service(sess)) {
+		return comp_ipc_client_compositor_set_cursor_draw_request(&sess->xcn->base, req);
 	}
 #endif
 	(void)req;

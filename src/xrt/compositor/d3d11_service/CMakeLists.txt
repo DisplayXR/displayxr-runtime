@@ -107,6 +107,12 @@ target_link_libraries(comp_d3d11_service PRIVATE comp_d3d11_lift)
 # this). comp_util carries the backend-agnostic segment math (comp_segments.c).
 target_link_libraries(comp_d3d11_service PRIVATE comp_d3d11_segs comp_util)
 
+# XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): the service draws IPC
+# clients' runtime-drawn cursor with the same default look (the mirrored OS
+# cursor, else the classic arrow) and softening knobs as every in-process
+# compositor.
+target_link_libraries(comp_d3d11_service PRIVATE comp_cursor_look)
+
 target_include_directories(comp_d3d11_service PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/..
 	${CMAKE_CURRENT_SOURCE_DIR}/../d3d11

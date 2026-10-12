@@ -748,6 +748,50 @@ struct ipc_workspace_cursor_info
 };
 
 /*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): one frame's runtime-drawn
+ * cursor request, as the state tracker built it (`u_cursor_draw_request`), sent
+ * by `compositor_set_cursor_draw_request` right before the `layer_commit` it
+ * belongs to. POD mirror; only sent on a frame that armed the request (§0: no
+ * request, no IPC traffic, no service state).
+ *
+ * The app's own sprite swapchain does not cross yet (the default look only);
+ * the client refuses that case itself (`willDraw` = false).
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_draw_request
+{
+	uint32_t view_count; //!< views below, view i is drawn into atlas tile i
+	//! Per view: origin.xy, axis_x.xy, axis_y.xy (`u_cursor_draw_view`,
+	//! tile-normalised, origin top-left, y down).
+	float view[XRT_MAX_VIEWS][6];
+	float hot_u, hot_v; //!< the app sprite's hotspot (unused for the default look)
+	float size_m;       //!< sprite height on the panel, metres; <= 0 = the OS cursor's size
+	float disparity;    //!< the placement's FILTERED disparity (eye baselines; B.7 softening)
+	uint32_t report_only; //!< #1952 probe: run every check, report, draw nothing
+	uint32_t zone_valid;  //!< #1949 zone request (the service refuses these for now)
+	uint32_t zone_id;
+	int32_t zone_rect[4]; //!< x, y, w, h as submitted
+};
+
+/*!
+ * The service's answer to the PREVIOUS `compositor_set_cursor_draw_request` of
+ * this client (#1952 across the process boundary): the outcome of a request is
+ * only known when the frame it rode is drawn, so it comes back with the next
+ * request - one frame later than in-process. `answered` = 0 until the service
+ * has seen a request at all.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_draw_outcome
+{
+	uint32_t answered; //!< 0 = nothing to report yet
+	uint32_t drew;     //!< 1 = drawn (or, report-only, would have been)
+	uint32_t reason;   //!< enum u_cursor_draw_refusal when !drew
+	uint32_t _pad;
+};
+
+/*!
  * spec_version 17: session-global overlay source. The controller renders a
  * display-spanning UI (e.g. taskbar) into a swapchain (allocated via
  * xrCreateWorkspaceOverlaySwapchainDXR) and docks it via xrSetWorkspaceOverlayDXR.
