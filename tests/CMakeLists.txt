@@ -200,6 +200,12 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# keyed mutex, D3D11 + D3D12 open). SKIPs if no WARP device exists.
 	list(APPEND tests tests_comp_d3d11_service_formats)
 endif()
+if(TARGET comp_d3d11_lift)
+	# ADR-053 P1a (#2003) -- the legacy lift path's golden replay on WARP: the
+	# sim_display fake behind d3d11_lift, its output bytes pinned before the
+	# conversion core took over the lift thread. SKIPs without a D3D11 device.
+	list(APPEND tests tests_lift_dp_golden)
+endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	# ADR-053 S5 -- the reference view synthesis on WARP: a synthetic step edge
 	# rendered into 2 and 4 views, parallax checked against u_conv_viewsyn's
@@ -1120,6 +1126,23 @@ target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/com
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
+if(TARGET tests_lift_dp_golden)
+	# The sim_display fake lift + the synthesis it shares with the sim provider,
+	# compiled straight in (the plug-in DLL is not linkable).
+	target_sources(
+		tests_lift_dp_golden
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_lift_d3d11.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c
+		)
+	target_include_directories(
+		tests_lift_dp_golden PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+					     ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion
+		)
+	target_link_libraries(tests_lift_dp_golden PRIVATE comp_d3d11_lift aux_os d3d11 dxgi d3dcompiler)
+	set_target_properties(tests_lift_dp_golden PROPERTIES CXX_STANDARD 17)
 endif()
 
 if(TARGET tests_oxr_lift_startup)
