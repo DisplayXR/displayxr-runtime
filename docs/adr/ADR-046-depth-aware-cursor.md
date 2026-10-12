@@ -141,7 +141,7 @@ the plane leaves the cursor on the plane. A second locate in the same frame
 | 3a (*implemented, Metal; spec v2*) | **Depth-layer source** (`XrCursorDepthSourceDXR`, `XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app chains one struct on the hint and sends no point. The compositor copies a cursor-sized patch (at most 64×64) of the two outermost views' submitted depth, never waiting on the GPU. The state tracker turns the nearest texel into a point through that layer's own view and `nearZ`/`farZ`, and feeds it to the v1 placement. Depth is exact, and the app needs no hit-test code. See §6. | One ≤ 32 KB blit per requested frame, plus a CPU min over ≤ 8 K floats |
 | 3b | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
 | 3c (*Amendment 1*) | **Lifted content** (`XR_DXR_lift` weave rects): the service draws the cursor into the lifted views, placed from the conversion's own depth map and the plug-in's relief mapping. | One ≤ 64×64 depth-patch copy and one quad per view, per opted-in rect under the cursor |
-| 4 | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
+| 4 (*implemented, D3D11 service; see §B as built in the D3D11 service*) | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
 | 5 | **Web** (*started: displayxr-web `DepthCursor` + `./cursor-depth`*): the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
 
 ### 5. Reference adoption and evidence
@@ -618,8 +618,8 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
   kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
   4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
-- **Not yet:** the service (`svc_draw_cursor_quads`) reports
-  `willDraw = XR_FALSE`; display zones (since drawn, runtime#1949, below); multi-screen routed frames draw per tile without the
+- **Not yet:** the service (`svc_draw_cursor_quads`; since drawn on the D3D11 service, Phase 4,
+  below); display zones (since drawn, runtime#1949, below); multi-screen routed frames draw per tile without the
   segment routing on Metal (Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
   (−0.005 is above it on current panels).
 
@@ -901,14 +901,77 @@ are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settin
     from ~575 (crisp) to ~845 (`blur`) and ~1440 (8 px), with the hotspot and the tile-to-tile
     disparity (−14.4 tile px) unchanged.
 
-**Follow-up** (it still draws the crisp cursor and compiles unchanged):
-
-- the D3D11 service drawer `svc_draw_cursor_quads` (the shell, lifted rects and IPC apps).
+**Follow-ups:** none left. The last one, the D3D11 service drawer `svc_draw_cursor_quads`
+(IPC apps, the shell's lifted cursor and lifted rects), landed with Phase 4 (below).
 
 **App opt-out.** An `XrCursorDepthDrawInfoDXR` flag to turn the softening off for a sprite that
 is already soft (or must stay crisp) comes with the next `XR_DXR_cursor_depth` spec bump. This
 change does not bump the extension: the softening is a drawing decision the runtime owns, like
 the default look.
+
+#### §B as built in the D3D11 service (Phase 4; `XR_DXR_cursor_depth` spec v5, unchanged)
+
+IPC clients of the Windows D3D11 service (forced-IPC apps and apps under the shell) get the
+runtime-drawn cursor through the service's one drawer, `svc_draw_cursor_quads` (B.3).
+
+- **Transport.** `compositor_set_cursor_draw_request` carries the frame's `u_cursor_draw_request`
+  (per-view maps, hotspot, `sizeMeters`, filtered disparity, report-only, zone) as a POD
+  (`ipc_cursor_draw_request`), sent right before the `layer_commit` it belongs to, and only on a
+  frame whose locate armed the request: no request, no IPC traffic, no service state (§0). The
+  state tracker's gate is `oxr_session_cursor_draw_via_service()` (service mode, no in-process
+  multi-compositor, no native compositor, not a bridge relay; Windows).
+- **willDraw across the process boundary (#1952).** The service answers each request with the
+  outcome of the **previous** one (`ipc_cursor_draw_outcome`), because a request is only drawn at
+  or after its commit; the client writes it into the request's report and the latch folds it as
+  usual. So the latch runs one frame later than in-process, and the first request of a session
+  has nothing to fold. A request no commit consumed, or one the render thread left unanswered for
+  3 frames (`SVC_CURSOR_OUTCOME_MAX_LAG`), is `NOT_REACHED`. A service with no drawer answers
+  every request "not drawn".
+- **Direct client** (no workspace, or a client that is not a placed workspace tile, such as one
+  running beside the shell under the foreground override). The commit consumes the request (one
+  bool test otherwise) and
+  draws it into the client's own atlas after every layer, before the publish and so before the
+  display processor: the in-process D3D11 semantics through the same shared pieces. Per view:
+  `u_cursor_draw_corners` into the base projection layer's painted tile, as an axis-aligned rect
+  (`u_cursor_draw_quad_rect`; exact, since every Kooima image plane is parallel to the display
+  plane), clipped to the tile. Size: `sizeMeters`, else the OS cursor's size at the client
+  window's DPI, over the client's canvas. Default look: the shared `comp_cursor_look` (mirrored OS
+  cursor, else the arrow), uploaded once per shape into a TYPELESS texture; a composing commit
+  samples it decoded into its private `_SRGB` target, a fast-path one writes the stored bytes into
+  the encoded atlas (ADR-044). The draw goes through the in-process compositors' own
+  `comp_cursor_shaders`. A cursor frame never zero-copies (`[ZC] reason=cursor`).
+- **Under the shell: lift, don't add.** A request never draws a second cursor into a placed
+  workspace window. When the workspace cursor is over a client's **content** (the controller's over-window
+  flag plus the focused slot's content rect, the rect pointer input is forwarded through, so the
+  client whose hint follows the pointer is the one lifted) and that client's last frame carried a
+  request, the workspace cursor is **lifted** onto the content. Each eye's tile takes the client's
+  per-view hotspot offset from its outermost pair's midpoint (`u_cursor_draw_view_offset`; eye 0 =
+  first view, eye 1 = last), scaled by the window's size in the combined atlas, on top of the
+  window plane's disparity (`hit_z`). The cursor keeps its position (the controller's click point),
+  sprite and size. A cursor over a window without a request, over chrome, or hidden is drawn
+  exactly as before.
+- **The one-fade rule.** The controller's over-window dim (`cursor_dim_factor`, spec 23) does not
+  apply to the runtime-lifted cursor; B.7 softening is its only fade (the client's filtered
+  disparity; ghost = the drawn eye-to-eye offset in panel px; blur cap 0.06 × the drawn sprite).
+  Purely service-side: the controller keeps pushing `hit_z`, `over_window` and the dim factor as it
+  does today, and needs no change. Each compose tick answers every requesting client: drawn if the
+  cursor was lifted onto it, else `NOT_REACHED` (its window is hidden under the shell anyway; the
+  answer keeps `willDraw` honest).
+- **B.7 in the drawer.** An optional style on `svc_draw_cursor_quads`: alpha convention, shared
+  shaders, blur radius and opacity. A NULL style is the original blit path byte for byte; a crisp
+  on-glass draw is unchanged. Softened draws use the shared `DXR_SOFTEN` kernel. Under the
+  workspace compose pass they compile with `DXR_SVC_LINEARIZE`, which honours the pass's ADR-021
+  linearize flag exactly as the crisp blit does. The Amendment 1 lifted-rect cursor is softened
+  the same way. The knobs are the same `DXR_CURSOR_SOFTEN*`, read once **from the service's own
+  environment** (as are `DXR_CURSOR_DEFAULT_LOOK` and `DXR_CURSOR_DRAW_REFUSE*`): set them on
+  `displayxr-service.exe`, not on the app.
+- **Not yet (each reports `willDraw = false`, so the app keeps its OS cursor):** the app's own
+  sprite swapchain over IPC (the client refuses it, `SPRITE_UNUSABLE`; resolving it to its IPC id
+  through whichever client compositor wraps it is the follow-up); display-zones requests (refused,
+  `ZONE_UNPLACEABLE`; the zones composite places zone tiles differently); multi-screen routed
+  direct-client frames (refused, `MULTI_SCREEN`, as in-process D3D11); the
+  Amendment 3 measured-disparity source (the IPC path still reports "no content"; the service
+  would run `u_cursor_measure` on the composed atlas around the cursor).
 
 ### Rollout
 
@@ -1002,6 +1065,11 @@ nothing need the runtime to measure it.
    `u_cursor_depth`.
 6. **Where:** every native compositor's cursor pass and the service (IPC / shell clients), so it
    also serves stereo content shown through the service.
+
+   *Service: not yet.* Phase 4 (§B as built in the D3D11 service) draws the cursor for IPC
+   clients, but the measured source still reports "no content" over IPC (the target stays 0, the
+   OS cursor). The follow-up runs `u_cursor_measure` on the client's composed atlas tiles around
+   the cursor, at the same commit step the service draws in.
 
 ### Evidence required before merge
 
