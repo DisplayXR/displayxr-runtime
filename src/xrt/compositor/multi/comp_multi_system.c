@@ -432,7 +432,7 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  */
 // Legacy per-session helper (see the #ifndef block below) — guarded out on macOS,
 // which composites every client into the one shared surface instead.
-#ifndef COMP_MULTI_SHARED_SURFACE
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Composite LOCAL_2D layers (XR_DXR_local_3d_zone, e.g. the avatar speech
  * bubble, #568) into the final per-session target, post-weave, by scale-blitting
@@ -553,7 +553,7 @@ composite_local_2d_layers(struct multi_compositor *mc,
 	}
 	return any;
 }
-#endif // !COMP_MULTI_SHARED_SURFACE
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 static bool
 get_session_layer_view(struct multi_layer_entry *layer,
@@ -681,7 +681,7 @@ multi_drain_main_queue_bounded(struct vk_bundle *vk, int64_t budget_ns, const ch
 // so this whole path is compiled only for the non-macOS OOP service (Android,
 // and Windows where it is unused in favor of the D3D11 monolith). Guarding it out
 // on macOS keeps the macOS binary free of the dead legacy path.
-#ifndef COMP_MULTI_SHARED_SURFACE
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Initialize intermediate composite resources for pre-display-processing layer compositing.
  * Creates a tiled atlas image, per-eye views, render pass, framebuffers,
@@ -2442,7 +2442,7 @@ workspace_blend_layer(struct multi_compositor *mc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_general);
 }
-#endif // !COMP_MULTI_SHARED_SURFACE
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 //! Display dims (meters) for this session, DP-first with system-info fallback
 //! (matches the HUD). Returns false if neither yields valid dims.
@@ -2466,7 +2466,7 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 	return true;
 }
 
-#ifndef COMP_MULTI_SHARED_SURFACE
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
  * display's pixel density is uniform, so window_meters = window_px ÷ display
@@ -2497,7 +2497,7 @@ session_window_dims_m(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h,
 	*out_h_m = (float)fb_h / px_per_m_y;
 	return true;
 }
-#endif // !COMP_MULTI_SHARED_SURFACE
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 /*!
  * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
@@ -2638,7 +2638,7 @@ comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc)
 	return r == XRT_SUCCESS;
 }
 
-#ifndef COMP_MULTI_SHARED_SURFACE
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Composite the workspace controller's chrome (e.g. a title pill) over this
  * client's woven content, post-weave, as a flat alpha-blended 2D overlay (#48).
@@ -3875,7 +3875,7 @@ submit_and_present:
 #endif
 
 }
-#endif // !COMP_MULTI_SHARED_SURFACE
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 #ifdef COMP_MULTI_SHARED_SURFACE
 /*
@@ -6019,7 +6019,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 }
 #endif // COMP_MULTI_SHARED_SURFACE
 
-#ifndef COMP_MULTI_SHARED_SURFACE
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Render all per-session clients to their own targets.
  * Called after xrt_comp_layer_commit() for sessions with external window handles.
@@ -6113,7 +6113,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		msc->render_retire[k] = true;
 	}
 }
-#endif // !COMP_MULTI_SHARED_SURFACE
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 
 
@@ -6147,15 +6147,13 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// old swapchain's BufferQueue connection (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm)
 		// and pointlessly rebuilds a target no layers will reach. begin_session flips
 		// session_active back on and the next pass re-inits from the then-current surface.
-		bool skip_session_render_init = false;
-#ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): every client composites into ONE
 		// service-owned full-screen window, so the per-client NSWindow/target/DP
 		// is never created. The shared surface reads each client's delivered
-		// frames directly (deliver_any_frames below still runs). This is the only
-		// macOS service render path now (the legacy per-NSWindow path is removed).
-		skip_session_render_init = true;
-#endif
+		// frames directly (deliver_any_frames below still runs). On macOS /
+		// desktop Linux this is always the case; on Android only while the
+		// workspace overlay is active (#1006) — otherwise per-session as before.
+		bool skip_session_render_init = multi_shared_surface_active(msc);
 		if (!skip_session_render_init && mc->state.session_active &&
 		    multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
 		    !mc->session_render.window_close_exit_sent) {
@@ -6819,12 +6817,18 @@ multi_main_loop(struct multi_system_compositor *msc)
 		// separately. render_lock only — list_and_timing_lock is NOT held (#1005).
 #ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): composite every client into ONE
-		// full-screen window + combined atlas → one weave → one present. This is
-		// the only macOS service render path (the legacy per-NSWindow path is gone).
-		render_shared_surface_locked(msc, predicted_display_time_ns);
-#else
-		render_per_session_clients_locked(msc, predicted_display_time_ns);
+		// full-screen window + combined atlas → one weave → one present. The
+		// only path on macOS / desktop Linux; Android's workspace overlay mode
+		// (#1006) while a verified controller has it active.
+		if (multi_shared_surface_active(msc)) {
+			render_shared_surface_locked(msc, predicted_display_time_ns);
+		} else
 #endif
+		{
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+			render_per_session_clients_locked(msc, predicted_display_time_ns);
+#endif
+		}
 
 		// Apply the retires the render recorded: they touch each client's
 		// pacer, which list_and_timing_lock guards (#1005).

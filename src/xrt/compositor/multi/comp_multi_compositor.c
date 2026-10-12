@@ -2217,7 +2217,7 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// Without this a tracked panel's locates fell back to the nominal viewer.
 	// shared_dp lives until the system compositor is destroyed (lock-free read,
 	// as above).
-	if (mc->msc != NULL && mc->msc->shared_dp != NULL) {
+	if (mc->msc != NULL && multi_shared_surface_active(mc->msc) && mc->msc->shared_dp != NULL) {
 		return xrt_display_processor_get_predicted_eye_positions(mc->msc->shared_dp, out_eye_pos);
 	}
 #endif
@@ -2604,7 +2604,7 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// applied to the ONE shared display processor by the render thread
 	// (shared_converge_display_mode_locked), which also emits the hardware
 	// state event once the DP accepted it.
-	if (mc != NULL && !mc->session_render.initialized) {
+	if (mc != NULL && multi_shared_surface_active(mc->msc) && !mc->session_render.initialized) {
 		mc->hardware_display_3d = enable_3d;
 		return true;
 	}

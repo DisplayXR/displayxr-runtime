@@ -1469,6 +1469,15 @@ struct multi_system_compositor
 
 	//! #1007: shared-surface counterpart of session_render.gpu_stalled.
 	bool shared_gpu_stalled;
+
+	/*!
+	 * #1006 Android workspace overlay: the mode the render thread has
+	 * APPLIED — the value @ref multi_shared_surface_active reports where the
+	 * per-session path is also compiled in. Written only by the render thread
+	 * (overlay transition at the top of a frame); unused where the shared
+	 * surface is the only path.
+	 */
+	bool shared_mode_active;
 	int64_t shared_gpu_stalled_since_ns;
 	VkRenderPass shared_render_pass;
 	VkFramebuffer *shared_framebuffers;
@@ -1526,6 +1535,37 @@ struct multi_system_compositor
  * @ingroup comp_multi
  * @private @memberof multi_system_compositor
  */
+/*!
+ * Is the shared spatial surface the render path right now? (#1006, see
+ * COMP_MULTI_PER_SESSION_TARGET in comp_multi_interface.h.)
+ *
+ * - macOS / desktop Linux: a compile-time `true` — the shared surface is their
+ *   only service path, so nothing there changes.
+ * - Android: `shared_mode_active`, the workspace-overlay mode the RENDER THREAD
+ *   has applied (it follows `workspace_active` at the top of a frame). False
+ *   unless a verified workspace controller activated the overlay, so the
+ *   default stays today's per-session path.
+ * - Elsewhere (Windows fallback): false.
+ *
+ * Read from IPC threads too: a plain bool, the render thread is its only
+ * writer, and a reader racing a transition sees either side of it.
+ *
+ * @ingroup comp_multi
+ */
+static inline bool
+multi_shared_surface_active(const struct multi_system_compositor *msc)
+{
+#if defined(COMP_MULTI_SHARED_SURFACE) && !defined(COMP_MULTI_PER_SESSION_TARGET)
+	(void)msc;
+	return true;
+#elif defined(COMP_MULTI_SHARED_SURFACE)
+	return msc != NULL && msc->shared_mode_active;
+#else
+	(void)msc;
+	return false;
+#endif
+}
+
 static inline struct multi_system_compositor *
 multi_system_compositor(struct xrt_system_compositor *xsc)
 {

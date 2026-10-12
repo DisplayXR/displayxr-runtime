@@ -77,20 +77,38 @@
 
 /*!
  * @def COMP_MULTI_SHARED_SURFACE
- * Defined when the service renders through the comp_multi SHARED SPATIAL
- * SURFACE (#59): one service-owned full-screen window, every client app
- * composited into one combined stereo atlas at its workspace pose, one
- * display-processor weave, one present (the analogue of the Windows D3D11
- * monolith). It is the only service render path where defined — the
- * per-session target path (render_session_to_own_target, Android's default)
- * is compiled out.
+ * Defined when this build COMPILES the comp_multi SHARED SPATIAL SURFACE
+ * (#59): one service-owned full-screen target, every client app composited
+ * into one combined atlas at its workspace pose, one display-processor weave,
+ * one present (the analogue of the Windows D3D11 monolith). Whether it is the
+ * path a given frame takes is @ref multi_shared_surface_active — see
+ * COMP_MULTI_PER_SESSION_TARGET.
  *
  * - macOS: service-owned NSWindow (comp_window_macos).
  * - Desktop Linux (#710, #967): service-owned X11 window, Xorg or XWayland
  *   (comp_window_linux).
+ * - Android (#1006, ADR-036 D4): the WORKSPACE OVERLAY MODE — the target is
+ *   the verified workspace controller's own fullscreen surface, and the mode
+ *   is entered only while that controller is active.
  */
-#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
 #define COMP_MULTI_SHARED_SURFACE
+#endif
+
+/*!
+ * @def COMP_MULTI_PER_SESSION_TARGET
+ * Defined when this build compiles the per-session target path
+ * (render_session_to_own_target: one target + one DP per client) — Android's
+ * default (ADR-036 D1/D3) and the unused Windows fallback.
+ *
+ * Where BOTH are defined (Android) the mode is chosen at runtime by
+ * @ref multi_shared_surface_active: per-session unless a verified workspace
+ * controller has activated the overlay. Where only COMP_MULTI_SHARED_SURFACE is
+ * defined (macOS, desktop Linux) the predicate is a compile-time `true`, so
+ * those builds are unchanged.
+ */
+#if !defined(XRT_OS_MACOS) && !defined(XRT_OS_LINUX_DESKTOP)
+#define COMP_MULTI_PER_SESSION_TARGET
 #endif
 
 
