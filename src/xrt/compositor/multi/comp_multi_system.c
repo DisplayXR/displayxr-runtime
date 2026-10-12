@@ -6968,3 +6968,203 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
 	os_mutex_unlock(&msc->list_and_timing_lock);
 	return any;
 }
+
+
+/*
+ *
+ * Display status reads (ADR-051 D3) — desktop-Linux service.
+ *
+ */
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+
+//! @p xsysc is a comp_multi system compositor (not the D3D11 service, not a test double).
+static bool
+status_is_multi_system(const struct xrt_system_compositor *xsysc)
+{
+	// create_native_compositor, not destroy: target_instance may wrap destroy
+	// (the display hotplug sweep's t_syscomp_destroy_hook).
+	return xsysc != NULL && xsysc->create_native_compositor == system_compositor_create_native_compositor;
+}
+
+//! A desktop-absolute window rect into window metrics against @p info's panel.
+static void
+status_fill_window_metrics(const struct xrt_system_compositor_info *info,
+                           int32_t win_x,
+                           int32_t win_y,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           struct xrt_window_metrics *out)
+{
+	U_ZERO(out);
+	if (win_w == 0 || win_h == 0) {
+		return;
+	}
+	out->window_pixel_width = win_w;
+	out->window_pixel_height = win_h;
+	out->window_screen_left = win_x;
+	out->window_screen_top = win_y;
+	out->window_orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+	out->display_pixel_width = info->display_pixel_width;
+	out->display_pixel_height = info->display_pixel_height;
+	out->display_width_m = info->display_width_m;
+	out->display_height_m = info->display_height_m;
+	out->display_screen_left = info->display_screen_left;
+	out->display_screen_top = info->display_screen_top;
+	// Square-pixel pitch from the native dims; unknown size = pixels only (as
+	// multi_compositor_get_window_metrics' weave branch reports it).
+	if (info->display_pixel_width > 0 && info->display_width_m > 0.0f && info->display_pixel_height > 0) {
+		const float pitch = info->display_width_m / (float)info->display_pixel_width;
+		const float cx = (float)(win_x - info->display_screen_left) + (float)win_w * 0.5f;
+		const float cy = (float)(win_y - info->display_screen_top) + (float)win_h * 0.5f;
+		out->window_width_m = (float)win_w * pitch;
+		out->window_height_m = (float)win_h * pitch;
+		out->window_center_offset_x_m = (cx - (float)info->display_pixel_width * 0.5f) * pitch;
+		out->window_center_offset_y_m = -((cy - (float)info->display_pixel_height * 0.5f) * pitch);
+	}
+	out->valid = true;
+}
+
+bool
+multi_compositor_status_get_client(struct xrt_system_compositor *xsysc,
+                                   const struct xrt_compositor *xc,
+                                   struct multi_compositor_status_client *out)
+{
+	U_ZERO(out);
+	if (!status_is_multi_system(xsysc) || xc == NULL) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+
+	bool found = false;
+	bool weave_geom = false;
+	int32_t wx = 0, wy = 0;
+	uint32_t ww = 0, wh = 0;
+	bool shared_dp = false;
+	bool shared_3d = false;
+
+	// Plain fields only, under list_and_timing_lock (the lock the render
+	// thread holds while it latches `delivered` and composites): the client
+	// cannot leave clients[] while we look at it.
+	os_mutex_lock(&msc->list_and_timing_lock);
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL || &mc->base.base != xc) {
+			continue;
+		}
+		found = true;
+
+		// Its delivered projection layer, the same pick render_shared_surface_locked makes.
+		if (mc->delivered.active) {
+			for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
+				const enum xrt_layer_type t = mc->delivered.layers[i].data.type;
+				if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH ||
+				    t == XRT_LAYER_ZONE_3D) {
+					out->view_count = mc->delivered.layers[i].data.view_count;
+					break;
+				}
+			}
+		}
+
+		// XR_DXR_weave present-owner state: written under weave.mutex by the
+		// client's submits; read here unlocked, the same torn-read trade
+		// multi_compositor_get_window_metrics makes (a stale rect for one read).
+		out->weave_owner = mc->weave.window_bound || mc->weave.dp != NULL || mc->weave.have_geometry;
+		if (out->weave_owner) {
+			out->has_dp = mc->weave.dp != NULL;
+			out->woven = out->has_dp && mc->weave.woven_serial > 0 && !mc->weave.hw_2d_confirmed &&
+			             !mc->weave.mono_active;
+			if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0) {
+				weave_geom = true;
+				wx = mc->weave.win_x;
+				wy = mc->weave.win_y;
+				ww = mc->weave.win_w;
+				wh = mc->weave.win_h;
+			}
+		}
+		break;
+	}
+	shared_dp = msc->shared_dp != NULL;
+	shared_3d = msc->shared_hw_3d_applied == 1;
+	os_mutex_unlock(&msc->list_and_timing_lock);
+
+	if (!found) {
+		return false;
+	}
+
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	if (out->weave_owner) {
+		if (weave_geom) {
+			status_fill_window_metrics(info, wx, wy, ww, wh, &out->window);
+		}
+		return true;
+	}
+
+	// A shared-surface client. Placement and minimized state come from the
+	// workspace registry (pointer-keyed, its own leaf lock; read after the
+	// list lock is released, never nested).
+	struct xrt_compositor *key = (struct xrt_compositor *)xc;
+	out->shared_surface = true;
+	out->in_composite = out->view_count > 0 && !comp_multi_workspace_is_window_hidden(key);
+	out->has_dp = out->in_composite && shared_dp;
+	out->woven = out->has_dp && shared_3d;
+	if (out->in_composite) {
+		// The rect render_shared_surface_locked composites the client at:
+		// its placed px rect on the panel, else the whole panel.
+		int32_t px = 0, py = 0, pw = 0, ph = 0;
+		if (!comp_multi_workspace_load_window_px_rect(key, &px, &py, &pw, &ph) || pw <= 0 || ph <= 0) {
+			px = 0;
+			py = 0;
+			pw = (int32_t)info->display_pixel_width;
+			ph = (int32_t)info->display_pixel_height;
+		}
+		if (pw > 0 && ph > 0) {
+			status_fill_window_metrics(info, info->display_screen_left + px, info->display_screen_top + py,
+			                           (uint32_t)pw, (uint32_t)ph, &out->window);
+		}
+	}
+	return true;
+}
+
+bool
+multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
+                                      struct multi_compositor_status_shared_dp *out)
+{
+	U_ZERO(out);
+	if (!status_is_multi_system(xsysc)) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+
+	os_mutex_lock(&msc->list_and_timing_lock);
+	struct xrt_display_processor *dp = msc->shared_dp;
+	out->hardware_3d = msc->shared_hw_3d_applied == 1;
+	os_mutex_unlock(&msc->list_and_timing_lock);
+
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	out->panel_left = info->display_screen_left;
+	out->panel_top = info->display_screen_top;
+	out->panel_width = info->display_pixel_width;
+	out->panel_height = info->display_pixel_height;
+
+	if (dp == NULL) {
+		return true;
+	}
+	out->present = true;
+
+	// Passive vendor reads, outside every compositor lock. shared_dp lives
+	// until the system compositor is destroyed.
+	struct xrt_eye_positions eyes = {0};
+	out->eyes_answered = xrt_display_processor_get_predicted_eye_positions(dp, &eyes);
+	out->is_tracking = out->eyes_answered && eyes.valid && eyes.is_tracking;
+	// shared_dp comes from the Vulkan DP factory (dp_factory_vk): its vtable
+	// is the VK variant, whose struct_size gates the appended slot.
+	uint32_t state = 0;
+	if (xrt_display_processor_vk_get_backend_state((struct xrt_display_processor_vk *)dp, &state)) {
+		out->backend_known = true;
+		out->backend_state = state;
+	}
+	return true;
+}
+
+#endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP

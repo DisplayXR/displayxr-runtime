@@ -4567,6 +4567,21 @@ ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_i
 			         (double)wm.window_center_offset_z_m);
 		}
 	}
+#elif defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop-Linux null + comp_multi service (ADR-051 D3): the rect the
+	// service composites the client at in its shared surface, or a weave
+	// present-owner's published window geometry. The compositor pointer is
+	// only matched against the system's live client list, never dereferenced
+	// unless found there (multi_compositor_status_get_client).
+	struct ipc_server *s = _ics->server;
+	struct xrt_compositor *target_xc = NULL;
+	if (ipc_server_get_client_xc(s, client_id, &target_xc) == XRT_SUCCESS && s->xsysc != NULL &&
+	    target_xc != NULL) {
+		struct multi_compositor_status_client mcs;
+		if (multi_compositor_status_get_client(s->xsysc, target_xc, &mcs)) {
+			wm = mcs.window;
+		}
+	}
 #else
 	(void)_ics;
 	(void)client_id;

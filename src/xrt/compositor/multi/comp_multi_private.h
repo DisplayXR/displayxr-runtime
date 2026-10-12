@@ -1947,6 +1947,87 @@ multi_compositor_set_rendering_mode(struct multi_compositor *mc,
 void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
 
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * @name Display status reads (ADR-051 D3) — desktop-Linux service
+ *
+ * Read-only views the IPC server's status snapshot gathers on a DIAG
+ * consumer's thread. Locking: each takes ONLY
+ * multi_system_compositor::list_and_timing_lock, copies plain fields out and
+ * releases it — no render lock, no GPU wait, no vendor call under it. The
+ * workspace placement (comp_multi_workspace_load_window_px_rect /
+ * _is_window_hidden, pointer-keyed, their own leaf lock) is read after it is
+ * released, never nested. The one vendor call
+ * (@ref multi_compositor_status_get_shared_dp's eye / backend query) runs
+ * after the lock is released, on `shared_dp`, which lives until the system
+ * compositor is destroyed (the same lock-free trade
+ * multi_compositor_get_predicted_eye_positions makes for it). A per-client
+ * weave DP is never called from here: comp_multi_weave_fini() tears it down
+ * before the client leaves `clients[]`.
+ * @{
+ */
+
+//! One client of the desktop-Linux service, as the status snapshot sees it.
+struct multi_compositor_status_client
+{
+	//! Composited into the shared spatial surface (a projection-layer client);
+	//! false for an XR_DXR_weave present-owner (it presents its own window).
+	bool shared_surface;
+	//! In the shared surface's composite: a delivered projection layer, not minimized.
+	bool in_composite;
+	//! Views of the delivered projection layer (0 = nothing delivered).
+	uint32_t view_count;
+	//! XR_DXR_weave present-owner: bound a window or brought up a weave DP.
+	bool weave_owner;
+	//! A display processor weaves this client (the shared DP, or its weave DP).
+	bool has_dp;
+	//! ...and its content is woven 3D (not hardware-2D / mono).
+	bool woven;
+	//! The window rect, desktop-absolute device pixels (+ metres when the panel size is known).
+	struct xrt_window_metrics window;
+};
+
+//! The shared surface's display processor (the one the service presents with).
+struct multi_compositor_status_shared_dp
+{
+	bool present;           //!< shared_dp exists (created lazily with the surface).
+	bool eyes_answered;     //!< get_predicted_eye_positions returned true.
+	bool is_tracking;       //!< ...and reports a tracked viewer.
+	bool backend_known;     //!< The DP exposes get_backend_state.
+	uint32_t backend_state; //!< XRT_DP_BACKEND_STATE_* (valid iff @ref backend_known).
+	bool hardware_3d;       //!< The lens state last applied to it is 3D.
+	int32_t panel_left;     //!< The panel the surface covers, desktop-absolute px.
+	int32_t panel_top;      //!< ...
+	uint32_t panel_width;   //!< ...
+	uint32_t panel_height;  //!< ...
+};
+
+/*!
+ * Fill @p out for client compositor @p xc of system compositor @p xsysc.
+ * @p xc is matched by pointer identity against `msc->clients[]` under
+ * list_and_timing_lock and dereferenced only while found there.
+ *
+ * @return false when @p xsysc is not a comp_multi system or @p xc is not (or
+ *         no longer) one of its clients.
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_status_get_client(struct xrt_system_compositor *xsysc,
+                                   const struct xrt_compositor *xc,
+                                   struct multi_compositor_status_client *out);
+
+/*!
+ * Fill @p out with the shared surface's DP state. False when @p xsysc is not
+ * a comp_multi system; `out->present` is false while no shared DP exists.
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
+                                      struct multi_compositor_status_shared_dp *out);
+
+/*! @} */
+#endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP
+
 
 #ifdef __cplusplus
 }

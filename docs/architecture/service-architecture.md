@@ -375,7 +375,10 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 **Display status snapshot (ADR-051 D3, dashboard phase 2).** The service owns one
 `xrt_status_snapshot` and two generation counters, `topology` (screens + plug-ins) and
 `status` (everything else), in `ipc_server_status.c`. Event sites bump them directly —
-client connect / disconnect (`status`) and the world-event display re-probe (`topology`) —
+client connect / disconnect (`status`) and the world-event display re-probe (`topology`; fed
+by the tray's `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` on Windows and by the service's DRM
+hotplug feeder on desktop Linux, `service_drm_hotplug_linux.c`: kernel `drm` change uevents
+over raw netlink, else a 2 s poll of the connectors' `status`) —
 under a leaf lock, so they are safe from any context. Every other input is compared on the
 reading consumer's own IPC thread: each status read re-gathers the cheap live facts (slot
 table + session flags, presenter, lease, window, segment-table generation, window-handle
@@ -388,7 +391,12 @@ screens) come from the service target's registered `ipc_server_status_provider`
 (`target_status_snapshot_build_service`, targets/common); the live facts come from
 `ipc_server_get_health`, `comp_d3d11_service_get_render_diag` and
 `comp_d3d11_service_get_client_status` (which validates the compositor against the
-live-client registry under `render_mutex` → `clients_mutex` before reading it). Three
+live-client registry under `render_mutex` → `clients_mutex` before reading it); on the
+desktop-Linux null + comp_multi service from `multi_compositor_status_get_client` /
+`multi_compositor_status_get_shared_dp` (the client matched against `msc->clients[]` under
+`list_and_timing_lock` only; presenter `SERVICE_WINDOW` for a shared-surface client, `SELF`
+for an `XR_DXR_weave` present-owner; one segment per window; no integrity triple, because
+comp_multi keeps no paint / present / skip counters). Three
 session-free RPCs, **DIAG class only** (`XRT_ERROR_NOT_AUTHORIZED` otherwise):
 `system_get_status_generation` → `{topology, status}`; `system_get_status_snapshot(screen_index)`
 → the `xrt_status_head` (everything but the rows, plus client ids) and one screen row;
