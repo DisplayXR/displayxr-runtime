@@ -1187,6 +1187,40 @@ void
 u_cursor_draw_soften_quad(
     const float corners[4][2], float tile_px_w, float tile_px_h, float blur_px, struct u_cursor_soften_quad *out);
 
+/*
+ *
+ * ADR-046 Phase 4: the D3D11 SERVICE draws the cursor for IPC clients, through
+ * its one drawer (svc_draw_cursor_quads), whose quads are axis-aligned rects in
+ * target pixels.
+ *
+ */
+
+/*!
+ * One view's sprite quad (@p corners, u_cursor_draw_corners() order, tile-
+ * normalised) as an axis-aligned rect (x, y, w, h) in a target whose view tile
+ * sits at @p tile (x, y, w, h; target px). Every Kooima image plane is parallel
+ * to the display plane, which the sprite lies parallel to, so a placement's
+ * quad IS axis-aligned and this is exact; a sheared quad gets its bounding box.
+ *
+ * @return false for a degenerate (empty) or non-finite quad or tile.
+ */
+bool
+u_cursor_draw_quad_rect(const float corners[4][2], const float tile[4], float out_rect[4]);
+
+/*!
+ * Phase 4, the cursor lifted under the shell: where view @p view's hotspot
+ * sits relative to the midpoint of the request's two OUTERMOST views, tile-
+ * normalised (x right, y down). The workspace cursor keeps its own position
+ * (the controller's click point) and takes only this per-view offset - the
+ * content's on-screen disparity under it - scaled by the window's size in the
+ * combined atlas.
+ *
+ * @return false if @p req has fewer than two views, @p view is out of range,
+ *         or the result is not finite.
+ */
+bool
+u_cursor_draw_view_offset(const struct u_cursor_draw_request *req, uint32_t view, float out_off[2]);
+
 #ifdef __cplusplus
 }
 #endif
