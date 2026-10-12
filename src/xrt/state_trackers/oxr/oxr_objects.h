@@ -2874,8 +2874,11 @@ struct oxr_session
 	/*!
 	 * A Vulkan app presented by the Metal native compositor (macOS):
 	 * sess->xcn is comp_metal, sess->compositor its comp_vk_client wrapper.
-	 * Implies is_metal_native_compositor. Diagnostic/reporting only — every
-	 * compositor dispatch keys on is_metal_native_compositor.
+	 * Implies is_metal_native_compositor. Every compositor dispatch keys on
+	 * is_metal_native_compositor; this flag is read where a SWAPCHAIN is
+	 * handed to comp_metal outside the layer path (the app's are
+	 * client_vk_swapchain wrappers, see oxr_session_cursor_draw_hand_request,
+	 * #1948) and for diagnostics.
 	 */
 	bool is_vk_via_metal;
 
