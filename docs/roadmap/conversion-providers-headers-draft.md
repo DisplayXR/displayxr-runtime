@@ -937,7 +937,7 @@ The two top-level out-structs that embed frozen structs carry explicit padding t
 | `xrt_conv_frame_out` | 0 `struct_size`, 4 `written`, 8 / 136 / 264 / 392 `views` / `depth` / `confidence` / `disparity` (128 each), 520 `views_info` (124), 644 `reserved_pad`, 648 `depth_info` (128) | 776 |
 | `xrt_conv_job_out` | 0 `struct_size`, 4 `written`, 8 `splat_info` (72), 80 `depth_info` (128), 208 `views_info` (124), 332 `reserved_pad` | 336 |
 
-**As landed (P1a-1, #1998).** `src/xrt/include/xrt/xrt_conversion_plugin.h` is this block verbatim apart from house-style section separators, Doxygen groups and the two `reserved_pad` fields above; the `xrt_conv_depth_info` comment that read `sizeof == 120` was a typo for the asserted 128. Pinned by `tests/tests_conversion_abi.cpp`.
+**As landed (P1a-1, #1998).** `src/xrt/include/xrt/xrt_conversion_plugin.h` is this block verbatim apart from house-style section separators, Doxygen groups, clang-format layout (three long trailing comments moved above their `#define`) and the two `reserved_pad` fields above; the `xrt_conv_depth_info` comment that read `sizeof == 120` was a typo for the asserted 128. Pinned by `tests/tests_conversion_abi.cpp`.
 
 ---
 

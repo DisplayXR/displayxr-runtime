@@ -138,8 +138,9 @@ std::vector<range>
 image_local(size_t base)
 {
 	using I = struct xrt_conv_image;
-	std::vector<range> v = {FIELD_RANGE(I, reserved_0), FIELD_RANGE(I, handle),   FIELD_RANGE(I, import_key),
-	                        FIELD_RANGE(I, cpu_ptr),    FIELD_RANGE(I, sync.reserved_0), FIELD_RANGE(I, sync.handle),
+	std::vector<range> v = {FIELD_RANGE(I, reserved_0),      FIELD_RANGE(I, handle),
+	                        FIELD_RANGE(I, import_key),      FIELD_RANGE(I, cpu_ptr),
+	                        FIELD_RANGE(I, sync.reserved_0), FIELD_RANGE(I, sync.handle),
 	                        FIELD_RANGE(I, sync.import_key)};
 	for (range &r : v) {
 		r.first += base;
