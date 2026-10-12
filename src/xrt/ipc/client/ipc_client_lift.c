@@ -42,6 +42,20 @@ params_to_ipc(const struct xrt_dp_lift_params *p,
 }
 
 xrt_result_t
+ipc_client_conv_hint_interest(struct ipc_connection *ipc_c, uint64_t task_mask)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_conv_wire_hint_interest hint;
+	U_ZERO(&hint);
+	hint.struct_size = (uint32_t)sizeof(hint);
+	hint.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	hint.task_mask = task_mask;
+	return ipc_call_conv_hint_interest(ipc_c, &hint);
+}
+
+xrt_result_t
 ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_caps *out_caps)
 {
 	xrt_dp_lift_caps_init(out_caps);

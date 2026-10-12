@@ -23,6 +23,7 @@
 #include "server/ipc_server_peer_creds.h"
 #include "server/ipc_server_interface.h"
 #include "shared/ipc_lift_caps.h"
+#include "server/ipc_server_conv.h"
 #include "util/u_client_class.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
@@ -9036,8 +9037,8 @@ require_lift_client(volatile struct ipc_client_state *ics, const char *what)
 	return XRT_SUCCESS;
 }
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-//! This connection's owner token, taken on first use from a server-wide counter.
+//! This connection's owner token, taken on first use from a server-wide
+//! counter. Also the conversion core's client id (ADR-053, #2005).
 static uint64_t
 lift_owner(volatile struct ipc_client_state *ics)
 {
@@ -9050,6 +9051,23 @@ lift_owner(volatile struct ipc_client_state *ics)
 	return ics->lift_owner;
 }
 
+struct conv_core *
+ipc_server_conv_core(struct ipc_server *server)
+{
+	(void)server; // one conversion core per service process
+	return ipc_server_conv_get_core(ipc_server_get_conv());
+}
+
+/*
+ * ADR-053 (#2005): every v3 lift handler below first asks ipc_server_conv.h's
+ * routing rule whether the call belongs to the conversion core; if not it
+ * falls through, untouched, to the svc_lift path. The rule needs the GPU I/O
+ * glue #2003 installs, so until then nothing routes and v3 is byte-for-byte
+ * what it was. Once #2003 registers `dp-lift` as a core row, DEPTH / SBS /
+ * NVIEW always route and the fall-through is dead (deleted in P1b).
+ */
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 static struct xrt_system_compositor *
 lift_xsysc(volatile struct ipc_client_state *ics)
 {
@@ -9076,6 +9094,8 @@ ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
 	if (ics == NULL || ics->lift_owner == 0) {
 		return;
 	}
+	// The conversion core's streams / jobs of this connection die with it.
+	ipc_server_conv_client_gone(ipc_server_get_conv(), ics->lift_owner);
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL) {
@@ -9093,6 +9113,24 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 	xrt_result_t auth = require_lift_client(ics, "lift_get_properties");
 	if (auth != XRT_SUCCESS) {
 		return auth;
+	}
+	struct ipc_server_conv *sc = ipc_server_get_conv();
+	if (ipc_server_conv_routes_properties(sc)) {
+		struct xrt_dp_lift_caps caps;
+		ipc_server_conv_lift_properties(sc, &caps);
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// GAUSSIANS stays on svc_lift (no photo facade over the job lane yet).
+		struct xrt_system_compositor *gxsysc = lift_xsysc(ics);
+		if (gxsysc != NULL) {
+			struct xrt_dp_lift_caps legacy;
+			comp_d3d11_service_lift_get_caps(gxsysc, &legacy);
+			if (legacy.state == XRT_DP_LIFT_STATE_READY) {
+				caps.modes |= legacy.modes & XRT_DP_LIFT_MODE_GAUSSIANS;
+			}
+		}
+#endif
+		ipc_lift_properties_from_caps(&caps, out_props);
+		return XRT_SUCCESS;
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
@@ -9120,6 +9158,11 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
 	xrt_result_t auth = require_lift_client(ics, "lift_stream_create");
 	if (auth != XRT_SUCCESS) {
 		return auth;
+	}
+	struct ipc_server_conv *sc = ipc_server_get_conv();
+	if (ipc_server_conv_routes_create(sc, mode, content_hint)) {
+		return ipc_server_conv_lift_stream_create(sc, lift_owner(ics), mode, content_hint, input_scale,
+		                                          aux_outputs, aux_depth_format, out_stream_id);
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
@@ -9151,6 +9194,9 @@ ipc_handle_lift_stream_destroy(volatile struct ipc_client_state *ics, uint64_t s
 	if (auth != XRT_SUCCESS) {
 		return auth;
 	}
+	if (ics->lift_owner != 0 && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_stream_destroy(ipc_server_get_conv(), ics->lift_owner, stream_id);
+	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL && ics->lift_owner != 0) {
@@ -9178,6 +9224,22 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 	}
 	if (handle_count < 1) {
 		return XRT_ERROR_IPC_FAILURE; // malformed request: the wire is not trusted
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), args->stream_id)) {
+		// The core route: the glue imports the input (and owns the handle from here).
+		xrt_graphics_buffer_handle_t ch = handles[0];
+		bool ch_is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		if ((size_t)ch & 1) {
+			ch = (HANDLE)((size_t)ch - 1);
+			ch_is_dxgi = true;
+		}
+#endif
+		if (handle_count > 1) {
+			weave_submit_release_handles(handles + 1, handle_count - 1);
+		}
+		return ipc_server_conv_lift_submit(ipc_server_get_conv(), lift_owner(ics), args, ch, ch_is_dxgi,
+		                                   out_frame_id);
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	xrt_graphics_buffer_handle_t in_handle = handles[0];
@@ -9228,6 +9290,10 @@ ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
 	xrt_result_t auth = require_lift_client(ics, "lift_acquire_result");
 	if (auth != XRT_SUCCESS) {
 		return auth;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_acquire(ipc_server_get_conv(), lift_owner(ics), stream_id, out_ready,
+		                                    out_lift_result);
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
@@ -9281,6 +9347,17 @@ ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
 	if (max_handle_count < 1) {
 		return XRT_SUCCESS;
 	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_buffer_handle_t ch = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_output(ipc_server_get_conv(), lift_owner(ics), stream_id, false, &ch,
+		                                       out_width, out_height, out_format)) {
+			// Service-owned: the transport DuplicateHandle's it into the caller.
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_output = true;
+		}
+		return XRT_SUCCESS;
+	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
@@ -9322,6 +9399,17 @@ ipc_handle_lift_get_depth_output(volatile struct ipc_client_state *ics,
 	if (max_handle_count < 1) {
 		return XRT_SUCCESS;
 	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_buffer_handle_t ch = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_output(ipc_server_get_conv(), lift_owner(ics), stream_id, true, &ch,
+		                                       out_width, out_height, out_format)) {
+			// Service-owned: the transport DuplicateHandle's it into the caller.
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_depth = true;
+		}
+		return XRT_SUCCESS;
+	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
@@ -9355,6 +9443,15 @@ ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
 		return auth;
 	}
 	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_sync_handle_t ch = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_fence(ipc_server_get_conv(), lift_owner(ics), stream_id, &ch)) {
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_fence = true;
+		}
 		return XRT_SUCCESS;
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -9438,6 +9535,49 @@ static_assert(sizeof(struct ipc_lift_weave_rect_viewpoints_msg) <= IPC_BUF_SIZE,
               "lift_weave_rect_viewpoints message exceeds IPC_BUF_SIZE");
 static_assert(sizeof(struct ipc_lift_submit_frame_msg) <= IPC_BUF_SIZE,
               "lift_submit_frame message exceeds IPC_BUF_SIZE");
+
+/*
+ * ADR-053 roadmap 11.2 must-verify (#2005): IPC handle capacity per message
+ * and the DIAG row reply size. The generated server receives at most
+ * XRT_MAX_IPC_HANDLES handles per message (proto.py: in_ / out_ handle arrays
+ * are XRT_MAX_IPC_HANDLES long and a larger count is refused).
+ *  - v3 lift_submit_frame: 1 in-handle; lift_get_output / _depth_output /
+ *    _fence: 1 out-handle each.
+ *  - conv_submit (spec 4): XRT_CONV_WIRE_MAX_SUBMIT_IMAGES images, each with
+ *    at most one sync handle -> 2 x 2 = 4 in-handles.
+ *  - conv_acquire_result (spec 4): handles ride the separate get-output calls
+ *    (the v3 pattern); a combined export would need 4 targets + 1 fence = 5.
+ * The status rows cross one per reply, each under the 1 KB DIAG limit, which
+ * IS IPC_BUF_SIZE (the generated row replies are asserted above).
+ */
+static_assert(XRT_CONV_WIRE_MAX_SUBMIT_IMAGES * 2 <= XRT_MAX_IPC_HANDLES,
+              "a conv_submit's image + sync handles exceed XRT_MAX_IPC_HANDLES");
+static_assert(4 + 1 <= XRT_MAX_IPC_HANDLES, "a combined conv result export (4 targets + fence) exceeds the handle cap");
+static_assert(XRT_STATUS_CONV_ROW_REPLY_MAX == IPC_BUF_SIZE, "the DIAG row reply limit must be IPC_BUF_SIZE");
+static_assert(XRT_CONV_WIRE_MSG_MAX_BYTES == IPC_BUF_SIZE, "XRT_CONV_WIRE_MSG_MAX_BYTES != IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_hint_interest_msg) <= IPC_BUF_SIZE, "conv_hint_interest exceeds IPC_BUF_SIZE");
+
+/*!
+ * conv_hint_interest (ADR-053, the prewarm trigger): a lift-capable session's
+ * client sends it once when its instance enabled XR_DXR_lift. The core's
+ * PrewarmOn policy decides (interest: warm now; first-create: wait for the
+ * first create; start: already warm). Never blocks; a malformed struct is an
+ * untrusted-wire failure.
+ */
+xrt_result_t
+ipc_handle_conv_hint_interest(volatile struct ipc_client_state *ics, const struct xrt_conv_wire_hint_interest *hint)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_hint_interest");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (hint->struct_size < sizeof(*hint) || hint->family_version != XRT_CONV_WIRE_FAMILY_VERSION_CURRENT) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	ipc_server_conv_hint_interest(ipc_server_get_conv(), lift_owner(ics), hint->task_mask);
+	return XRT_SUCCESS;
+}
 
 xrt_result_t
 ipc_handle_lift_weave_rect_viewpoints(volatile struct ipc_client_state *ics,
@@ -9530,6 +9670,9 @@ ipc_handle_lift_stream_set_priority(volatile struct ipc_client_state *ics, uint6
 	if (auth != XRT_SUCCESS) {
 		return auth;
 	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_set_priority(ipc_server_get_conv(), lift_owner(ics), stream_id, priority);
+	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL) {
@@ -9552,6 +9695,9 @@ ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
 	xrt_result_t auth = require_lift_client(ics, "lift_stream_stats");
 	if (auth != XRT_SUCCESS) {
 		return auth;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_stats(ipc_server_get_conv(), lift_owner(ics), stream_id, out_stats);
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);

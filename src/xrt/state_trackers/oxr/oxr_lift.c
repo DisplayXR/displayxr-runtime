@@ -162,6 +162,35 @@ lift_link_get(struct oxr_session *sess)
 }
 
 void
+oxr_lift_session_hint_interest(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->sys == NULL || sess->sys->inst == NULL || !sess->sys->inst->extensions.DXR_lift) {
+		return;
+	}
+	if (lift_session_is_ipc(sess)) {
+		struct ipc_connection *c = comp_ipc_client_compositor_lift_connection(&sess->xcn->base);
+		if (c != NULL) {
+			(void)ipc_client_conv_hint_interest(c, 0);
+		}
+		return;
+	}
+	if (!lift_inprocess_eligible(sess)) {
+		return;
+	}
+	// Start the background connect now; it sends the hint once connected.
+	struct ipc_client_lift_link *link = lift_link_get(sess);
+	if (link == NULL) {
+		return;
+	}
+	enum ipc_client_lift_link_state state = IPC_CLIENT_LIFT_LINK_CONNECTING;
+	uint32_t gen = 0;
+	struct ipc_connection *c = ipc_client_lift_link_acquire(link, &state, &gen);
+	if (c != NULL) {
+		ipc_client_lift_link_release(link, gen, false);
+	}
+}
+
+void
 oxr_lift_session_fini(struct oxr_session *sess)
 {
 	if (sess != NULL && sess->lift_link != NULL) {

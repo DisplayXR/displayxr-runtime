@@ -7089,6 +7089,11 @@ oxr_session_create(struct oxr_logger *log,
 	// Publish the session to the MCP server (no-op when MCP is disabled).
 	oxr_mcp_tools_attach_session(sess);
 
+#ifdef OXR_HAVE_DXR_lift
+	// ADR-053 (#2005): conv_hint_interest, the conversion prewarm trigger.
+	oxr_lift_session_hint_interest(sess);
+#endif
+
 	*out_session = sess;
 
 	return ret;

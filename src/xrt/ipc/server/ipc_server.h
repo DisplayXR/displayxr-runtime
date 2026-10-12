@@ -887,6 +887,17 @@ struct ipc_server_conv_status_source
 void
 ipc_server_set_conv_status_source(const struct ipc_server_conv_status_source *source);
 
+struct conv_core;
+
+/*!
+ * ADR-053 (#2005): the service's conversion core, or NULL when none is
+ * registered (`ipc_server_set_conv`, server/ipc_server_conv.h). One per
+ * service process; @p server is accepted for symmetry with the other
+ * accessors.
+ */
+struct conv_core *
+ipc_server_conv_core(struct ipc_server *server);
+
 /*!
  * @name Display status snapshot (ADR-051 D3; `ipc_server_status.c`)
  *

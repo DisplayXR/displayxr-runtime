@@ -415,6 +415,17 @@ ipc_call_lift_stream_create(struct ipc_connection *ipc_c,
 	return XRT_SUCCESS;
 }
 
+// ADR-053 (#2005) conv_hint_interest: sent at xrCreateSession, which this
+// fixture never drives (it hands the entry points a ready session), so the
+// pinned traces never contain it. Present so ipc_client_lift.c links.
+xrt_result_t
+ipc_call_conv_hint_interest(struct ipc_connection *ipc_c, const struct xrt_conv_wire_hint_interest *hint)
+{
+	(void)ipc_c;
+	trace("wire:conv_hint_interest(mask=0x%llx)", (unsigned long long)hint->task_mask);
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_call_lift_stream_destroy(struct ipc_connection *ipc_c, uint64_t stream_id)
 {

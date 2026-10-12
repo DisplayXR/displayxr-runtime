@@ -26,6 +26,7 @@
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_status.h"
+#include "xrt/xrt_conv_wire.h"
 #include "xrt/xrt_stereo_camera.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_config_build.h"
@@ -36,6 +37,10 @@
 
 #define IPC_CRED_SIZE 1    // auth not implemented
 #define IPC_BUF_SIZE 1024  // must be >= largest message length in bytes
+
+// ADR-053 (#2005): the conv_* wire family sizes every message against this
+// (xrt_conv_wire.h asserts each message <= XRT_CONV_WIRE_MSG_MAX_BYTES).
+XRT_CONV_ABI_ASSERT(XRT_CONV_WIRE_MSG_MAX_BYTES == IPC_BUF_SIZE, "XRT_CONV_WIRE_MSG_MAX_BYTES != IPC_BUF_SIZE");
 #define IPC_MAX_VIEWS 8    // max views we will return configs for
 #define IPC_MAX_FORMATS 32 // max formats our server-side compositor supports
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem

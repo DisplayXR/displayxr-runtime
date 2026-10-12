@@ -1449,5 +1449,11 @@
 			{"name": "row", "type": "struct xrt_status_conv_task"},
 			{"name": "generation", "type": "struct xrt_status_generation"}
 		]
+	},
+
+	"conv_hint_interest": {
+		"in": [
+			{"name": "hint", "type": "struct xrt_conv_wire_hint_interest"}
+		]
 	}
 }

@@ -116,6 +116,13 @@ endif()
 ###
 # Server
 
+# ADR-053 (#2005): the XR_DXR_lift v3 handlers' adapter onto the conversion
+# core. Its own target (no generated headers, no compositor) so it is
+# host-testable with a CPU fake provider (tests_ipc_lift_core).
+add_library(ipc_server_conv STATIC server/ipc_server_conv.c server/ipc_server_conv.h)
+target_include_directories(ipc_server_conv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ipc_server_conv PUBLIC conv_runtime xrt-interfaces PRIVATE aux_util aux_os)
+
 add_library(
 	ipc_server STATIC
 	${CMAKE_CURRENT_BINARY_DIR}/ipc_server_generated.c
@@ -137,6 +144,8 @@ target_include_directories(
 	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../compositor  # For d3d11_service headers
 	)
 target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared aux_math)
+# ADR-053 (#2005): the v3 lift handlers route to the conversion core through it.
+target_link_libraries(ipc_server PUBLIC ipc_server_conv)
 # ADR-043 Amendment 4: the UVC side-by-side stereo camera source's capture backend.
 target_link_libraries(ipc_server PRIVATE aux_os_uvc)
 
