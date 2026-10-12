@@ -393,6 +393,27 @@ jobs:
           reg add $inputKey /v Binary /t REG_SZ /d "$inputPlugin" /f | Out-Null
           reg add $inputKey /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
           reg add $inputKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Input" /f | Out-Null
+          # ADR-053 / #1999: register the sim conversion provider too, exactly as
+          # `register_dev_plugin.bat conv sim` does (ProbeOrder 250, FALLBACK
+          # band; Version written last). The DLL is built by #2002, which lands
+          # in parallel -- until then it is absent and this is a no-op.
+          # TODO(#2002, #2006): once #2002 lands, drop the Test-Path guard (a
+          # missing DLL must fail the job), and #2006 makes the selftest require
+          # conversion_providers.count >= 1.
+          $convKey = "HKLM\Software\DisplayXR\ConversionProviders\sim-conversion"
+          $convPlugin = "_package/bin/plugins/DisplayXR-SimConversion.dll"
+          $convRegistered = $false
+          if (Test-Path $convPlugin) {
+            $convPlugin = (Resolve-Path $convPlugin).Path
+            reg add $convKey /v Binary /t REG_SZ /d "$convPlugin" /f | Out-Null
+            reg add $convKey /v ProbeOrder /t REG_DWORD /d 250 /f | Out-Null
+            reg add $convKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Conversion" /f | Out-Null
+            reg add $convKey /v Version /t REG_SZ /d "ci" /f | Out-Null
+            $convRegistered = $true
+            Write-Host "Registered sim-conversion provider: $convPlugin"
+          } else {
+            Write-Host "sim-conversion provider not built yet ($convPlugin absent) -- skipping its registration (#2002)."
+          }
           # Registration is no longer enough: since ADR-034 Amendment 1
           # sim-input's probe() declines unless DXR_SIM_INPUT is set, so that a
           # stray registration on a dev box can't put synthetic controllers in
@@ -516,6 +537,7 @@ jobs:
           } finally {
             reg delete $key /f | Out-Null
             reg delete $inputKey /f | Out-Null
+            if ($convRegistered) { reg delete $convKey /f | Out-Null }
             Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
           }
           if ($code -ne 0) {
