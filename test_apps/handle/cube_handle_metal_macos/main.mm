@@ -2986,6 +2986,16 @@ int main(int argc, char **argv)
     cursor.setWindowCocoa((__bridge void *)g_metalView);
     cursor.setCursorHeight(kCursorHeight);
     cursor.setWantPlacement(true); // the diagnostics below
+    // The OS-cursor hand-off, as the user sees it: hidden exactly while the
+    // runtime reports willDraw (#1952: also false after a compositor
+    // refusal). First 12 transitions only - never per frame.
+    cursor.onDepthCursorShownChanged([](bool shown) {
+        static int logged = 0;
+        if (logged < 12) {
+            logged++;
+            LOG_INFO("cursor_depth: OS cursor %s", shown ? "HIDDEN (depth cursor drawn)" : "SHOWN");
+        }
+    });
     if (!app.cursorDepthRuntimeDraw) {
         cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
         cursor.setFootprintBodyOffset(dxr::kCursorCenteredBodyOffset); // our crosshair is centred
