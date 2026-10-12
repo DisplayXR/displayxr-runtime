@@ -1370,9 +1370,37 @@ struct multi_system_compositor
 
 	/*!
 	 * This mutex protects the list of client compositor
-	 * and the rendering timings on it.
+	 * and the rendering timings on it. Lock order (#1005):
+	 * render_lock -> list_and_timing_lock -> slot_lock — see the "Locking"
+	 * section of comp_multi_interface.h.
 	 */
 	struct os_mutex list_and_timing_lock;
+
+	/*!
+	 * #1005: held by the main loop for the whole transfer + render + present
+	 * of one frame, so GPU work, DP calls and present run WITHOUT
+	 * list_and_timing_lock. Taken BEFORE list_and_timing_lock by everything
+	 * that must not overlap a frame in flight: client destroy (unlist),
+	 * end_session (session-render teardown), the DP detach, and the
+	 * system-wide display-mode request. Never take it while holding
+	 * list_and_timing_lock or a slot_lock.
+	 */
+	struct os_mutex render_lock;
+
+	/*!
+	 * #1005: the clients the current frame renders, snapshotted from
+	 * @ref clients under list_and_timing_lock (with render_lock held, so no
+	 * entry can be destroyed until the frame ends). Render-thread only.
+	 */
+	struct multi_compositor *render_set[MULTI_MAX_CLIENTS];
+
+	/*!
+	 * #1005: per render_set entry, "retire its delivered frame". The render
+	 * pass only records this; the retire itself touches the client's pacer
+	 * (u_pa), which list_and_timing_lock guards, so the main loop applies it
+	 * after the render with that lock re-taken. Render-thread only.
+	 */
+	bool render_retire[MULTI_MAX_CLIENTS];
 
 	struct
 	{

@@ -5200,7 +5200,7 @@ shared_sync_os_cursor(struct multi_system_compositor *msc)
  * client when it is on the surface, else a lone client; with several unfocused
  * clients the lens keeps its state. The wish is mc->hardware_display_3d, set
  * by multi_compositor_request_display_mode from the IPC thread; applying it
- * here, on the render thread under list_and_timing_lock, keeps every DP call on
+ * here, on the render thread under render_lock (#1005), keeps every DP call on
  * the thread that weaves. Once the DP accepts a change the owner is told
  * (XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE carries the REQUESTED state,
  * #961). A DP without the slot is mode-neutral and counts as accepted.
@@ -5269,8 +5269,10 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Collect the clients to composite this frame (active, visible, with content).
 	struct shared_client_render order[MULTI_MAX_CLIENTS];
 	uint32_t order_count = 0;
-	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
-		struct multi_compositor *mc = msc->clients[k];
+	// #1005: the frame's snapshot, not msc->clients (list_and_timing_lock is
+	// not held here; render_lock is).
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
 		if (mc == NULL) {
 			continue;
 		}
@@ -6037,8 +6039,11 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		return;
 	}
 
-	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
-		struct multi_compositor *mc = msc->clients[k];
+	// #1005: render_lock held, list_and_timing_lock NOT held. Iterate the
+	// frame's snapshot (render_set), never msc->clients directly, and only
+	// RECORD retires — the main loop applies them under the lock.
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
 
 		if (mc == NULL || !mc->session_render.initialized) {
 			continue;
@@ -6085,8 +6090,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
 		    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
 			U_LOG_W("[per-session] Client %zu: skipping (window closed)", k);
-			int64_t now_ns = os_monotonic_get_ns();
-			multi_compositor_retire_delivered_locked(mc, now_ns);
+			msc->render_retire[k] = true;
 			continue;
 		}
 #endif
@@ -6095,8 +6099,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		{
 			extern bool oxr_macos_window_closed(void);
 			if (oxr_macos_window_closed()) {
-				int64_t now_ns = os_monotonic_get_ns();
-				multi_compositor_retire_delivered_locked(mc, now_ns);
+				msc->render_retire[k] = true;
 				continue;
 			}
 		}
@@ -6105,9 +6108,9 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		// Render this session to its own target (black canvas + overlays if hidden)
 		render_session_to_own_target(mc, vk, display_time_ns, hidden);
 
-		// Retire the delivered frame for this session
-		int64_t now_ns = os_monotonic_get_ns();
-		multi_compositor_retire_delivered_locked(mc, now_ns);
+		// Retire the delivered frame for this session (applied by the main
+		// loop under list_and_timing_lock, #1005).
+		msc->render_retire[k] = true;
 	}
 }
 #endif // !COMP_MULTI_SHARED_SURFACE
@@ -6684,9 +6687,19 @@ multi_system_compositor_android_visibility_tick(struct xrt_system_compositor *xs
 	if (msc == NULL) {
 		return;
 	}
+	// #1005: the pass calls DP on_pause/on_resume, which must not overlap the
+	// render thread's process_atlas on the same DP — that is render_lock's
+	// job now that the frame no longer runs under list_and_timing_lock. If a
+	// frame is in flight the main loop runs this very pass itself, so a busy
+	// render_lock means "already covered": skip rather than block the IPC
+	// mainloop behind a frame.
+	if (os_mutex_trylock(&msc->render_lock) != 0) {
+		return;
+	}
 	os_mutex_lock(&msc->list_and_timing_lock);
 	android_window_transition_locked(msc);
 	os_mutex_unlock(&msc->list_and_timing_lock);
+	os_mutex_unlock(&msc->render_lock);
 }
 #endif // XRT_OS_ANDROID
 
@@ -6777,19 +6790,33 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		xrt_comp_begin_frame(xc, frame_id);
 
+		// #1005: render_lock covers this whole frame (transfer, commit, render,
+		// DP, present) so no client can be unlisted/destroyed and no session
+		// render torn down while the frame uses it. list_and_timing_lock is
+		// only held for the short bookkeeping sections below, so client
+		// create/destroy, pacing calls and the wait threads no longer wait for
+		// GPU work or present. Order: render_lock -> list_and_timing_lock.
+		os_mutex_lock(&msc->render_lock);
+
 		// Make sure that the clients doesn't go away while we transfer layers.
 		os_mutex_lock(&msc->list_and_timing_lock);
 #ifdef XRT_OS_ANDROID
 		android_window_transition_locked(msc);
 #endif
 		transfer_layers_locked(msc, predicted_display_time_ns, frame_id);
+		// Snapshot the render set (#1005). Entries stay valid until we drop
+		// render_lock: destroy unlists only under render_lock.
+		for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+			msc->render_set[k] = msc->clients[k];
+			msc->render_retire[k] = false;
+		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 
 		// Render per-session clients to their own targets (Phase 4)
-		// These sessions were skipped in transfer_layers_locked and render separately
-		os_mutex_lock(&msc->list_and_timing_lock);
+		// These sessions were skipped in transfer_layers_locked and render
+		// separately. render_lock only — list_and_timing_lock is NOT held (#1005).
 #ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): composite every client into ONE
 		// full-screen window + combined atlas → one weave → one present. This is
@@ -6798,7 +6825,20 @@ multi_main_loop(struct multi_system_compositor *msc)
 #else
 		render_per_session_clients_locked(msc, predicted_display_time_ns);
 #endif
+
+		// Apply the retires the render recorded: they touch each client's
+		// pacer, which list_and_timing_lock guards (#1005).
+		os_mutex_lock(&msc->list_and_timing_lock);
+		for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+			if (msc->render_retire[k] && msc->render_set[k] != NULL) {
+				multi_compositor_retire_delivered_locked(msc->render_set[k], os_monotonic_get_ns());
+			}
+			msc->render_set[k] = NULL;
+			msc->render_retire[k] = false;
+		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
+
+		os_mutex_unlock(&msc->render_lock);
 
 #ifdef XRT_OS_ANDROID
 		// ADPF: close the loop — report how long this frame's work actually took
@@ -7012,6 +7052,7 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	xrt_comp_native_destroy(&msc->xcn);
 
 	os_mutex_destroy(&msc->list_and_timing_lock);
+	os_mutex_destroy(&msc->render_lock);
 
 	free(msc);
 }
@@ -7101,6 +7142,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
 
 	os_mutex_init(&msc->list_and_timing_lock);
+	os_mutex_init(&msc->render_lock);
 
 	//! @todo Make the clients not go from IDLE to READY before we have completed a first frame.
 	// Make sure there is at least some sort of valid frame data here.
@@ -7128,6 +7170,8 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
 	}
 	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
 	bool any = false;
+	// #1005: the DP calls below must not overlap a frame's process_atlas.
+	os_mutex_lock(&msc->render_lock);
 	os_mutex_lock(&msc->list_and_timing_lock);
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
@@ -7152,6 +7196,7 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
 		}
 	}
 	os_mutex_unlock(&msc->list_and_timing_lock);
+	os_mutex_unlock(&msc->render_lock);
 	return any;
 }
 
