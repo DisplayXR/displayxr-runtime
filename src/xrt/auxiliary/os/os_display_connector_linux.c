@@ -75,6 +75,7 @@ struct connector_mode
 	uint32_t w, h;
 	double scale;         // 0 = unknown
 	uint32_t refresh_mhz; // current mode's refresh, 0 = unknown
+	uint32_t pw, ph;      // the preferred mode (`is-preferred`), 0 = unknown
 };
 
 // Local declarations of the libdbus ABI used here (stable since dbus 1.0).
@@ -244,7 +245,8 @@ find_connector(struct connector_mode *cm, uint32_t count, const char *norm)
  *    a{sv} properties)`
  *
  * Monitors give each connector's current mode (the mode whose properties carry
- * `is-current`); logical monitors give the scale each connector is painted at.
+ * `is-current`) and its preferred mode (`is-preferred`); logical monitors give
+ * the scale each connector is painted at.
  */
 static uint32_t
 query_mutter(struct connector_mode *out, uint32_t max)
@@ -297,7 +299,7 @@ query_mutter(struct connector_mode *out, uint32_t max)
 			const char *connector = NULL;
 			if (read_spec_connector(&f, &mon, &connector) && connector != NULL) {
 				f.message_iter_next(&mon); // past the spec, to the modes array
-				uint32_t cw = 0, ch = 0;
+				uint32_t cw = 0, ch = 0, pw = 0, ph = 0;
 				double crefresh = 0.0;
 				if (f.message_iter_get_arg_type(&mon) == OS_DBUS_TYPE_ARRAY) {
 					os_dbus_iter modes;
@@ -319,6 +321,10 @@ query_mutter(struct connector_mode *out, uint32_t max)
 								ch = (uint32_t)h;
 								crefresh = refresh;
 							}
+							if (dict_bool(&f, &m, "is-preferred") && w > 0 && h > 0) {
+								pw = (uint32_t)w;
+								ph = (uint32_t)h;
+							}
 						}
 						f.message_iter_next(&modes);
 					}
@@ -330,6 +336,8 @@ query_mutter(struct connector_mode *out, uint32_t max)
 					c->w = cw;
 					c->h = ch;
 					c->refresh_mhz = crefresh > 0.0 ? (uint32_t)(crefresh * 1000.0 + 0.5) : 0u;
+					c->pw = pw;
+					c->ph = ph;
 				}
 			}
 			f.message_iter_next(&mons);
@@ -498,6 +506,8 @@ os_display_connector_annotate(struct os_display_desktop_info *mons, uint32_t cou
 			m->native_height = mc->h;
 			m->scale = mc->scale;
 			m->native_refresh_mhz = mc->refresh_mhz;
+			m->preferred_width = mc->pw;
+			m->preferred_height = mc->ph;
 			m->native_source = OS_DISPLAY_NATIVE_SOURCE_COMPOSITOR;
 			continue;
 		}

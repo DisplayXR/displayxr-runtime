@@ -10,6 +10,8 @@
 
 #include "catch_amalgamated.hpp"
 
+#include "util/u_openxr_runtime.h"
+#include "util/u_screen_info.h"
 #include "util/u_status_snapshot.h"
 #include "xrt/xrt_display_status.h"
 #include "xrt/xrt_instance.h"
@@ -68,7 +70,7 @@ add_screen(xrt_status_snapshot &s, uint64_t id, const char *plugin, uint32_t con
 	SET(sc.edid.manufacturer, "AUO");
 	SET(sc.edid.product, "B194");
 	sc.desktop = {sc.index == 0 ? 0 : 3840, 0, 3840, 2160, 2.5f};
-	sc.native = {3840, 2160, 60000, true};
+	sc.native = {3840, 2160, 60000, true, XRT_STATUS_NATIVE_BASIS_DESKTOP, 0, 0};
 	sc.physical = {344, 194, XRT_STATUS_MM_SOURCE_PLUGIN};
 	sc.roles.os_main = sc.index == 0;
 	sc.roles.runtime_default = sc.index == 0;
@@ -211,6 +213,63 @@ TEST_CASE("status: NOT_NATIVE fires only on a known, different native mode of a 
 	}
 }
 
+TEST_CASE("status: compositor native rule — scaled GNOME Wayland, current == preferred", "[status][warnings][native]")
+{
+	// ds1-linux: eDP-1 at 167 %. Mutter: current 2880x1800 == preferred; the
+	// desktop rect is XWayland's logical 3456x2160.
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 3456, 2160, 1.6667f};
+	u_status_native_resolve(&s->screens[0].native, 2880, 1800, 2880, 1800, 3456, 2160);
+	CHECK(s->screens[0].native.is_native);
+	CHECK(s->screens[0].native.basis == XRT_STATUS_NATIVE_BASIS_COMPOSITOR);
+	CHECK(s->screens[0].native.width == 2880);
+	CHECK(s->screens[0].native.height == 1800);
+	u_status_warnings_derive(s.get());
+	CHECK(screen_codes(*s, 0).empty());
+}
+
+TEST_CASE("status: compositor native rule — current mode is not the preferred one", "[status][warnings][native]")
+{
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 2304, 1440, 1.0f};
+	u_status_native_resolve(&s->screens[0].native, 2304, 1440, 2880, 1800, 2304, 1440);
+	CHECK_FALSE(s->screens[0].native.is_native);
+	CHECK(s->screens[0].native.width == 2880); // native = the preferred mode
+	u_status_warnings_derive(s.get());
+	REQUIRE(screen_codes(*s, 0) == V{"NOT_NATIVE"});
+	CHECK(std::string(s->screens[0].warnings[0].text).find("native 2880x1800 (now 2304x1440)") !=
+	      std::string::npos);
+	CHECK(s->screens[0].warnings[0].level == XRT_STATUS_LEVEL_CRITICAL);
+
+	SECTION("even when the logical rect happens to equal the preferred mode")
+	{
+		s->screens[0].desktop.width = 2880;
+		s->screens[0].desktop.height = 1800;
+		u_status_native_resolve(&s->screens[0].native, 2304, 1440, 2880, 1800, 2880, 1800);
+		u_status_warnings_derive(s.get());
+		CHECK(screen_codes(*s, 0) == V{"NOT_NATIVE"});
+	}
+}
+
+TEST_CASE("status: no compositor info keeps the desktop-rect rule", "[status][warnings][native]")
+{
+	auto s = healthy();
+	u_status_native_resolve(&s->screens[0].native, 3840, 2160, 0, 0, 3840, 2160);
+	CHECK(s->screens[0].native.is_native);
+	CHECK(s->screens[0].native.basis == XRT_STATUS_NATIVE_BASIS_DESKTOP);
+	u_status_warnings_derive(s.get());
+	CHECK(screen_codes(*s, 0).empty());
+
+	// The same scaled rect with no compositor facts: the old rule fires.
+	s->screens[0].desktop = {0, 0, 3456, 2160, 0.0f};
+	u_status_native_resolve(&s->screens[0].native, 2880, 1800, 0, 0, 3456, 2160);
+	CHECK_FALSE(s->screens[0].native.is_native);
+	u_status_warnings_derive(s.get());
+	REQUIRE(screen_codes(*s, 0) == V{"NOT_NATIVE"});
+	CHECK(std::string(s->screens[0].warnings[0].text).find("native 2880x1800 (now 3456x2160)") !=
+	      std::string::npos);
+}
+
 TEST_CASE("status: CLAIM_FALLBACK needs an unhealthy vendor plug-in", "[status][warnings]")
 {
 	auto s = healthy();
@@ -296,6 +355,156 @@ TEST_CASE("status: NO_PHYSICAL_SIZE is the 0 m trap", "[status][warnings]")
 		s->screens[1].physical = {340, 190, XRT_STATUS_MM_SOURCE_EDID};
 		u_status_warnings_derive(s.get());
 		CHECK(screen_codes(*s, 1).empty());
+	}
+}
+
+TEST_CASE("status: a FALLBACK claim's plug-in mm give way to the EDID's", "[status][physical]")
+{
+	xrt_status_physical p{};
+
+	SECTION("FALLBACK + EDID: the EDID mm")
+	{
+		u_status_physical_pick(XRT_DISPLAY_CLAIM_FALLBACK, 0.344f, 0.194f, 300, 190, &p);
+		CHECK(p.width_mm == 300);
+		CHECK(p.height_mm == 190);
+		CHECK(p.source == XRT_STATUS_MM_SOURCE_EDID);
+	}
+	SECTION("FALLBACK, no EDID size: the plug-in's")
+	{
+		u_status_physical_pick(XRT_DISPLAY_CLAIM_FALLBACK, 0.344f, 0.194f, 0, 0, &p);
+		CHECK(p.width_mm == 344);
+		CHECK(p.source == XRT_STATUS_MM_SOURCE_PLUGIN);
+	}
+	SECTION("EDID and VERIFIED claims: the plug-in's win")
+	{
+		u_status_physical_pick(XRT_DISPLAY_CLAIM_EDID, 0.344f, 0.194f, 300, 190, &p);
+		CHECK(p.width_mm == 344);
+		CHECK(p.source == XRT_STATUS_MM_SOURCE_PLUGIN);
+		u_status_physical_pick(XRT_DISPLAY_CLAIM_VERIFIED, 0.344f, 0.194f, 300, 190, &p);
+		CHECK(p.height_mm == 194);
+		CHECK(p.source == XRT_STATUS_MM_SOURCE_PLUGIN);
+	}
+	SECTION("neither: NONE, and NO_PHYSICAL_SIZE still fires")
+	{
+		u_status_physical_pick(XRT_DISPLAY_CLAIM_FALLBACK, 0.0f, 0.0f, 0, 0, &p);
+		CHECK(p.source == XRT_STATUS_MM_SOURCE_NONE);
+		auto s = healthy();
+		s->screens[1].physical = p;
+		s->screens[1].layout.width_m = 0.0f;
+		s->screens[1].layout.height_m = 0.0f;
+		u_status_warnings_derive(s.get());
+		CHECK(screen_codes(*s, 1) == V{"NO_PHYSICAL_SIZE"});
+	}
+}
+
+TEST_CASE("status: a FALLBACK claim's layout metres follow the EDID", "[status][physical]")
+{
+	xrt_screen_info info{};
+	info.width_m = 0.344f;
+	info.height_m = 0.194f;
+	info.nominal_viewer_z_m = 0.6f;
+	info.source = XRT_SCREEN_INFO_SOURCE_SYSTEM;
+
+	xrt_screen_info a = info;
+	CHECK(u_screen_info_prefer_edid_mm(&a, XRT_DISPLAY_CLAIM_FALLBACK, 300, 190));
+	CHECK(a.width_m == Catch::Approx(0.300f));
+	CHECK(a.height_m == Catch::Approx(0.190f));
+	CHECK(a.nominal_viewer_z_m == Catch::Approx(0.6f)); // the rest stays the plug-in's
+
+	xrt_screen_info b = info;
+	CHECK_FALSE(u_screen_info_prefer_edid_mm(&b, XRT_DISPLAY_CLAIM_VERIFIED, 300, 190));
+	CHECK(b.width_m == Catch::Approx(0.344f));
+
+	xrt_screen_info c = info;
+	CHECK_FALSE(u_screen_info_prefer_edid_mm(&c, XRT_DISPLAY_CLAIM_FALLBACK, 0, 0));
+	CHECK(c.width_m == Catch::Approx(0.344f));
+
+	xrt_screen_info d = info;
+	d.source = XRT_SCREEN_INFO_SOURCE_DERIVED; // already EDID-derived: untouched
+	d.width_m = 0.5f;
+	CHECK_FALSE(u_screen_info_prefer_edid_mm(&d, XRT_DISPLAY_CLAIM_FALLBACK, 300, 190));
+	CHECK(d.width_m == Catch::Approx(0.5f));
+}
+
+namespace {
+
+struct fake_fs
+{
+	std::set<std::string> files;
+};
+
+bool
+fake_exists(const char *path, void *user)
+{
+	return static_cast<fake_fs *>(user)->files.count(path) != 0;
+}
+
+std::string
+resolve(const u_openxr_runtime_env &env, fake_fs &fs)
+{
+	char out[512];
+	if (!u_openxr_active_runtime_resolve(&env, fake_exists, &fs, out, sizeof(out))) {
+		return "<none>";
+	}
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("status: active OpenXR runtime follows the loader's POSIX chain", "[status][runtime]")
+{
+	fake_fs fs;
+	u_openxr_runtime_env env{};
+	env.home = "/home/u";
+	env.arch = "x86_64";
+
+	CHECK(resolve(env, fs) == "<none>");
+
+	SECTION("XR_RUNTIME_JSON wins, even when the file is missing")
+	{
+		fs.files = {"/home/u/.config/openxr/1/active_runtime.json"};
+		env.xr_runtime_json = "/opt/dev/openxr_displayxr-dev.json";
+		CHECK(resolve(env, fs) == "/opt/dev/openxr_displayxr-dev.json");
+	}
+	SECTION("XDG_CONFIG_HOME, defaulting to ~/.config, before the system dirs")
+	{
+		fs.files = {"/home/u/.config/openxr/1/active_runtime.json", "/etc/xdg/openxr/1/active_runtime.json"};
+		CHECK(resolve(env, fs) == "/home/u/.config/openxr/1/active_runtime.json");
+		env.xdg_config_home = "/cfg";
+		CHECK(resolve(env, fs) == "/etc/xdg/openxr/1/active_runtime.json");
+		fs.files.insert("/cfg/openxr/1/active_runtime.json");
+		CHECK(resolve(env, fs) == "/cfg/openxr/1/active_runtime.json");
+	}
+	SECTION("the arch-suffixed name beats the plain one, within one directory")
+	{
+		fs.files = {"/etc/xdg/openxr/1/active_runtime.json", "/etc/xdg/openxr/1/active_runtime.x86_64.json",
+		            "/usr/share/openxr/1/active_runtime.x86_64.json"};
+		CHECK(resolve(env, fs) == "/etc/xdg/openxr/1/active_runtime.x86_64.json");
+		env.arch = nullptr;
+		CHECK(resolve(env, fs) == "/etc/xdg/openxr/1/active_runtime.json");
+	}
+	SECTION("XDG_CONFIG_DIRS in order (Ubuntu puts xdg-ubuntu first), default /etc/xdg")
+	{
+		fs.files = {"/etc/xdg/openxr/1/active_runtime.json"};
+		env.xdg_config_dirs = "/etc/xdg/xdg-ubuntu:/etc/xdg";
+		CHECK(resolve(env, fs) == "/etc/xdg/openxr/1/active_runtime.json");
+		fs.files.insert("/etc/xdg/xdg-ubuntu/openxr/1/active_runtime.json");
+		CHECK(resolve(env, fs) == "/etc/xdg/xdg-ubuntu/openxr/1/active_runtime.json");
+		env.xdg_config_dirs = "/nowhere"; // replaces the default
+		CHECK(resolve(env, fs) == "<none>");
+	}
+	SECTION("then /etc, /usr/local/share, /usr/share")
+	{
+		fs.files = {"/usr/share/openxr/1/active_runtime.json", "/usr/local/share/openxr/1/active_runtime.json"};
+		CHECK(resolve(env, fs) == "/usr/local/share/openxr/1/active_runtime.json");
+		fs.files.insert("/etc/openxr/1/active_runtime.json");
+		CHECK(resolve(env, fs) == "/etc/openxr/1/active_runtime.json");
+	}
+	SECTION("no HOME and no XDG_CONFIG_HOME skips the per-user step")
+	{
+		env.home = nullptr;
+		fs.files = {"/usr/share/openxr/1/active_runtime.json"};
+		CHECK(resolve(env, fs) == "/usr/share/openxr/1/active_runtime.json");
 	}
 }
 

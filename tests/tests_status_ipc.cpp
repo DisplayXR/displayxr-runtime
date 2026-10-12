@@ -60,7 +60,7 @@ two_panel_snapshot()
 		sc.index = i;
 		std::snprintf(sc.device_name, sizeof(sc.device_name), "\\\\.\\DISPLAY%u", i == 0 ? 1u : 5u);
 		sc.desktop = {(int32_t)(i * 3840), 0, 3840, 2160, 2.5f};
-		sc.native = {3840, 2160, 60000, true};
+		sc.native = {3840, 2160, 60000, true, XRT_STATUS_NATIVE_BASIS_DESKTOP, 0, 0};
 		sc.physical = {344, 194, XRT_STATUS_MM_SOURCE_PLUGIN};
 		sc.roles.runtime_default = i == 0;
 		std::snprintf(sc.claim.plugin_id, sizeof(sc.claim.plugin_id), "vendor-a");

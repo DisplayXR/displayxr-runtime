@@ -415,6 +415,8 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 		m->is_primary = r->is_primary;
 		m->native_width = r->native_width;
 		m->native_height = r->native_height;
+		m->preferred_width = r->preferred_width;
+		m->preferred_height = r->preferred_height;
 		m->physical_width_mm = r->physical_width_mm;
 		m->physical_height_mm = r->physical_height_mm;
 		(void)snprintf(m->output_name, sizeof(m->output_name), "%.31s", r->device_name);

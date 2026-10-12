@@ -124,8 +124,8 @@ Field sources, by block:
 
 | Block | Service source | Headless source |
 |---|---|---|
-| `runtime`, `plugins` | `target_plugin_get_status` in the service | same call in the CLI process |
-| `screens[*]` identity, desktop, native, claim, layout, eye-tracking caps | `xrt_screen_list` + `target_plugin_get_monitor_record` | same |
+| `runtime`, `plugins` | `target_plugin_get_status` in the service; `runtime.active_openxr_runtime` = the loader's `ActiveRuntime` (HKLM) on Windows, and off Windows the loader's POSIX chain (`XR_RUNTIME_JSON`, else `active_runtime[.<arch>].json` under `$XDG_CONFIG_HOME` (`~/.config`), each `$XDG_CONFIG_DIRS` (`/etc/xdg`), `/etc`, `/usr/local/share`, `/usr/share` — `+ /openxr/1/`), symlinks resolved (`util/u_openxr_runtime.h`) | same calls in the CLI process |
+| `screens[*]` identity, desktop, native, claim, layout, eye-tracking caps | `xrt_screen_list` + `target_plugin_get_monitor_record`. `native`: on desktop Linux with a compositor that reports modes (Mutter DisplayConfig), its preferred mode, and `is_native` = its current mode equals its preferred mode (never the desktop rect, which is logical on a scaled desktop); else the registry's device mode (Windows: DisplayConfig's preferred mode) against the desktop rect. `physical_mm` and `layout.width_m/height_m`: the claiming plug-in's only under an EDID or VERIFIED claim; under a FALLBACK claim the EDID's (`source: edid`), the plug-in's only when there is no EDID size | same |
 | `screens[*].eye_tracking.state`, `mode`, `dps[]` | the DPs bound to that screen: the service's primary DP and every client's segment DPs (`comp_*_segments_get_eyes`) | `NO_DP` |
 | `screens[*].vendor` | plug-in slot `get_screen_status` (§6) | same slot, from the CLI's instance |
 | `screens[*].warnings` | derived in `u_status_snapshot_build` (§4) | same |
@@ -149,7 +149,7 @@ and `critical` light the panel's tab badge; `info` shows in place. Runtime-deriv
 
 | Code | Level | Condition |
 |---|---|---|
-| `NOT_NATIVE` | critical | the desktop mode of a claimed screen is not its native mode (a lenticular panel at the wrong resolution never weaves right) |
+| `NOT_NATIVE` | critical | the desktop mode of a claimed screen is not its native mode (a lenticular panel at the wrong resolution never weaves right); on Linux, where the compositor reports its modes, the compositor's current mode is not its preferred mode |
 | `CLAIM_FALLBACK` | warn | a 3D-capable monitor is claimed only at FALLBACK confidence (sim_display took it) |
 | `CLAIM_EDID_ONLY` | info | claimed by EDID identity, not verified by the vendor |
 | `NO_PHYSICAL_SIZE` | warn | no millimetres from plug-in or EDID: a segment on this screen gets one view set for the whole window (the 0 m trap) |

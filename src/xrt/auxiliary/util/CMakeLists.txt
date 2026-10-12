@@ -128,6 +128,8 @@ add_library(
 	u_pacing_compositor_fake.c
 	u_pretty_print.c
 	u_pretty_print.h
+	u_openxr_runtime.c
+	u_openxr_runtime.h
 	u_prober.c
 	u_prober.h
 	u_rear_budget.c

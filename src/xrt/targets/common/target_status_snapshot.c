@@ -24,6 +24,7 @@
 #include "os/os_display_desktop.h"
 #include "os/os_display_edid.h"
 #include "util/u_git_tag.h"
+#include "util/u_openxr_runtime.h"
 #include "util/u_screen_info.h"
 #include "util/u_status_snapshot.h"
 
@@ -59,6 +60,12 @@ fill_runtime(struct xrt_status_runtime *rt)
 		WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, rt->active_openxr_runtime,
 		                    (int)sizeof(rt->active_openxr_runtime), NULL, NULL);
 		rt->active_openxr_runtime[sizeof(rt->active_openxr_runtime) - 1] = '\0';
+	}
+#else
+	// Read only: the loader's POSIX chain (XR_RUNTIME_JSON, then the XDG /
+	// system active_runtime[.<arch>].json), symlinks resolved. None leaves "".
+	if (!u_openxr_active_runtime_find(rt->active_openxr_runtime, sizeof(rt->active_openxr_runtime))) {
+		rt->active_openxr_runtime[0] = '\0';
 	}
 #endif
 }
@@ -216,6 +223,8 @@ resolve_system(struct xrt_system_devices *xsysd, struct target_screens_system *s
 		sys->desktop_height = desk.height;
 		sys->native_width = desk.native_width;
 		sys->native_height = desk.native_height;
+		sys->preferred_width = desk.preferred_width;
+		sys->preferred_height = desk.preferred_height;
 		sys->desktop_scale = (float)desk.scale;
 		sys->is_primary = desk.is_primary;
 		(void)snprintf(sys->device_name, sizeof(sys->device_name), "%.*s", (int)(sizeof(sys->device_name) - 1),
@@ -351,20 +360,26 @@ win_preferred_mode(const char *gdi_device_name, uint32_t *out_w, uint32_t *out_h
 static void
 fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
 {
-	s->native.width = in->native_width;
-	s->native.height = in->native_height;
+	uint32_t mode_w = in->native_width;
+	uint32_t mode_h = in->native_height;
+	uint32_t pref_w = 0, pref_h = 0;
 #ifdef XRT_OS_WINDOWS
 	uint32_t w = 0, h = 0, mhz = 0;
 	if (win_preferred_mode(s->device_name, &w, &h, &mhz)) {
-		s->native.width = w;
-		s->native.height = h;
+		mode_w = w;
+		mode_h = h;
 		if (s->native.refresh_mhz == 0) {
 			s->native.refresh_mhz = mhz;
 		}
 	}
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	// The compositor reported its preferred mode (Mutter DisplayConfig):
+	// decide from its current vs preferred mode, never from the desktop rect,
+	// which XWayland reports in logical pixels on a scaled desktop.
+	pref_w = in->preferred_width;
+	pref_h = in->preferred_height;
 #endif
-	s->native.is_native = s->native.width > 0 && s->native.height > 0 && s->native.width == s->desktop.width &&
-	                      s->native.height == s->desktop.height;
+	u_status_native_resolve(&s->native, mode_w, mode_h, pref_w, pref_h, s->desktop.width, s->desktop.height);
 }
 
 static void
@@ -421,19 +436,17 @@ fill_screen(const struct xrt_screen *in,
 
 	fill_native(in, s);
 
-	// Millimetres: the plug-in's metres when it described this screen, else EDID.
-	const bool from_plugin = (in->info.source == XRT_SCREEN_INFO_SOURCE_SYSTEM ||
-	                          in->info.source == XRT_SCREEN_INFO_SOURCE_PLUGIN_MONITOR) &&
-	                         in->info.width_m > 0.0f && in->info.height_m > 0.0f;
-	if (from_plugin) {
-		s->physical.width_mm = (uint32_t)lroundf(in->info.width_m * 1000.0f);
-		s->physical.height_mm = (uint32_t)lroundf(in->info.height_m * 1000.0f);
-		s->physical.source = XRT_STATUS_MM_SOURCE_PLUGIN;
-	} else if (in->physical_width_mm > 0 && in->physical_height_mm > 0) {
-		s->physical.width_mm = in->physical_width_mm;
-		s->physical.height_mm = in->physical_height_mm;
-		s->physical.source = XRT_STATUS_MM_SOURCE_EDID;
-	}
+	// Millimetres: the claiming plug-in's metres only under an EDID or
+	// VERIFIED claim; a FALLBACK claim's give way to the EDID's, and count
+	// only when the monitor reports no size. The layout metres below follow
+	// the same rule (target_screens already applies it to the screen info;
+	// re-applied here for a list that did not come through it).
+	struct xrt_screen_info info = in->info;
+	(void)u_screen_info_prefer_edid_mm(&info, in->confidence, in->physical_width_mm, in->physical_height_mm);
+	const bool from_plugin =
+	    info.source == XRT_SCREEN_INFO_SOURCE_SYSTEM || info.source == XRT_SCREEN_INFO_SOURCE_PLUGIN_MONITOR;
+	u_status_physical_pick(in->confidence, from_plugin ? info.width_m : 0.0f, from_plugin ? info.height_m : 0.0f,
+	                       in->physical_width_mm, in->physical_height_mm, &s->physical);
 
 	s->roles.os_main = (in->flags & XRT_SCREEN_FLAG_PRIMARY) != 0;
 	s->roles.runtime_default = (in->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0;
@@ -458,12 +471,12 @@ fill_screen(const struct xrt_screen *in,
 	// a segment DP the service recreates on its re-probe.
 	s->claim.apply = s->roles.runtime_default ? XRT_STATUS_APPLY_NEXT_SESSION : XRT_STATUS_APPLY_LIVE;
 
-	s->layout.width_m = in->info.width_m;
-	s->layout.height_m = in->info.height_m;
-	s->layout.nominal_viewer_x_m = in->info.nominal_viewer_x_m;
-	s->layout.nominal_viewer_y_m = in->info.nominal_viewer_y_m;
-	s->layout.nominal_viewer_z_m = in->info.nominal_viewer_z_m;
-	s->layout.source = in->info.source;
+	s->layout.width_m = info.width_m;
+	s->layout.height_m = info.height_m;
+	s->layout.nominal_viewer_x_m = info.nominal_viewer_x_m;
+	s->layout.nominal_viewer_y_m = info.nominal_viewer_y_m;
+	s->layout.nominal_viewer_z_m = info.nominal_viewer_z_m;
+	s->layout.source = info.source;
 
 	s->eye_tracking.supported = in->info.supported_eye_tracking_modes;
 	s->eye_tracking.default_mode = in->info.default_eye_tracking_mode;

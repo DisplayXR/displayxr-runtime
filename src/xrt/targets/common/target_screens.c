@@ -111,6 +111,8 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 		s->native_height = mon.native_height;
 		s->physical_width_mm = mon.physical_width_mm;
 		s->physical_height_mm = mon.physical_height_mm;
+		s->preferred_width = mon.preferred_width;
+		s->preferred_height = mon.preferred_height;
 		(void)snprintf(s->device_name, sizeof(s->device_name), "%s",
 		               mon.output_name[0] != '\0' ? mon.output_name : mon.connector);
 		is_primary = mon.is_primary;
@@ -132,6 +134,8 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 	in.is_system_default = is_default;
 	in.system_info = (sys != NULL && sys->info_valid) ? &sys->info : NULL;
 	u_screen_info_resolve(&in, &s->info);
+	// A FALLBACK claim's plug-in metres never override the EDID's (ADR-051).
+	(void)u_screen_info_prefer_edid_mm(&s->info, s->confidence, s->physical_width_mm, s->physical_height_mm);
 
 	// The system-default screen's placement is the one the runtime resolved
 	// for the panel (#1301) — what XrDisplayDesktopInfoDXR reports — but only
@@ -143,6 +147,13 @@ build_from_entry(const struct xrt_dp_registry_entry *e,
 		s->desktop_width = sys->desktop_width;
 		s->desktop_height = sys->desktop_height;
 		if (sys->native_width > 0 && sys->native_height > 0) {
+			// The preferred mode belongs to the mode it came with: keep the
+			// record's only while the system agrees on the current mode.
+			if (sys->native_width != s->native_width || sys->native_height != s->native_height ||
+			    sys->preferred_width > 0) {
+				s->preferred_width = sys->preferred_width;
+				s->preferred_height = sys->preferred_height;
+			}
 			s->native_width = sys->native_width;
 			s->native_height = sys->native_height;
 		}
@@ -228,6 +239,8 @@ target_screens_build(const struct xrt_dp_factory_registry *reg,
 		s->desktop_height = sys->desktop_height;
 		s->native_width = sys->native_width;
 		s->native_height = sys->native_height;
+		s->preferred_width = sys->preferred_width;
+		s->preferred_height = sys->preferred_height;
 		s->desktop_scale = sys->desktop_scale;
 		(void)snprintf(s->plugin_id, sizeof(s->plugin_id), "%s",
 		               active_plugin_id != NULL ? active_plugin_id : "");

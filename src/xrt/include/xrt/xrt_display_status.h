@@ -266,13 +266,30 @@ struct xrt_status_desktop
 	float scale; //!< Desktop compositor scale (e.g. 2.5); 0 = unknown.
 };
 
+//! How @ref xrt_status_native::is_native was decided.
+enum xrt_status_native_basis
+{
+	//! The desktop rect against the native mode (Windows, macOS, X11 without
+	//! a compositor that reports modes).
+	XRT_STATUS_NATIVE_BASIS_DESKTOP = 0,
+	//! The compositor's own facts: its current mode against its preferred
+	//! mode, both device pixels (desktop Linux, Mutter DisplayConfig). The
+	//! desktop rect is logical on a scaled desktop and is not consulted.
+	XRT_STATUS_NATIVE_BASIS_COMPOSITOR = 1,
+};
+
 //! A screen's native mode.
 struct xrt_status_native
 {
 	uint32_t width;       //!< Native width, pixels; 0 = unknown.
 	uint32_t height;      //!< Native height, pixels; 0 = unknown.
 	uint32_t refresh_mhz; //!< Current refresh, milli-Hz; 0 = unknown.
-	bool is_native;       //!< The desktop mode equals the native mode (false when unknown).
+	bool is_native;       //!< The screen runs its native mode (false when unknown); see @ref basis.
+	//! How @ref is_native was decided (`enum xrt_status_native_basis`).
+	uint32_t basis;
+	//! COMPOSITOR basis: the compositor's current mode, device pixels (0 otherwise).
+	uint32_t current_width;
+	uint32_t current_height;
 };
 
 //! A screen's physical size.

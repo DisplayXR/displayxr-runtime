@@ -97,6 +97,9 @@ struct os_display_edid_monitor
 	uint32_t native_width;          //!< The connector's device mode (may differ from pixel_width
 	uint32_t native_height;         //!< under a scaled X screen; macOS: the mode's backing pixels,
 	                                //!< pixel_width being points); 0 = unknown.
+	uint32_t preferred_width;       //!< Desktop Linux: the compositor's preferred mode, when the
+	uint32_t preferred_height;      //!< compositor reports one (native_width is then its CURRENT
+	                                //!< mode); 0 = unknown.
 	char connector[32];             //!< DRM connector, e.g. "card1-HDMI-A-1"; "" = unknown.
 	char output_name[64];           //!< RandR output name, e.g. "HDMI-1"; macOS: the display UUID
 	                                //!< (= os_display_desktop_info::device_name); "" = none.
