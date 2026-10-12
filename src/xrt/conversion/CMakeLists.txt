@@ -18,3 +18,31 @@ add_library(displayxr::conversion_core ALIAS conv_core)
 # Consumers include "conversion/conv_*.h".
 target_include_directories(conv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(conv_core PUBLIC xrt-interfaces)
+
+# ADR-053 P1a (#2001): the conversion core's runtime half - host interface +
+# in-service shim, stream lane (one dispatcher per host), pipeline composer,
+# job lane + result staging, policy stages, and conv_core, the one object the
+# service owns. Threads (os_threading) and logging, so a separate target: the
+# pure modules above stay dependency-free. Graphics-API work is injected
+# (conv_core_config), so this is still host-testable (tests_conv_lanes).
+add_library(
+	conv_runtime STATIC
+	conv_core.c
+	conv_core.h
+	conv_core_internal.h
+	conv_host_iface.h
+	conv_host_inproc.c
+	conv_host_inproc.h
+	conv_job.c
+	conv_job.h
+	conv_pipeline.c
+	conv_pipeline.h
+	conv_policy.c
+	conv_policy.h
+	conv_stage.c
+	conv_stage.h
+	conv_stream.c
+	conv_stream.h
+	)
+add_library(displayxr::conversion_runtime ALIAS conv_runtime)
+target_link_libraries(conv_runtime PUBLIC conv_core aux_util aux_os)
