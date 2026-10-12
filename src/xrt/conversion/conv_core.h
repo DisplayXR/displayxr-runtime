@@ -168,6 +168,24 @@ conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_w
 uint32_t
 conv_core_v3_state(struct conv_core *core, uint32_t v3_modes, bool photo_content);
 
+/*! Every registered provider is described (live or cached) or terminal.
+ *  The v3 adapter (#2005) routes a properties query to the core while this
+ *  is false even before any row exists (cold boot: ACTIVATING, not
+ *  UNAVAILABLE). */
+bool
+conv_core_discovery_settled(struct conv_core *core);
+
+/*! Selection has a candidate for @p task right now (any state; a terminal
+ *  one only when it is the last resort). The v3 adapter's routing rule. */
+bool
+conv_core_task_has_candidate(struct conv_core *core, uint32_t task);
+
+/*! Copy the registry (providers, rows, readiness) for diagnostics: the
+ *  service's status-snapshot source. Pointers in the copy (iface / inst)
+ *  must not be called. */
+void
+conv_core_copy_registry(struct conv_core *core, struct conv_registry *out);
+
 /*! conv_hint_interest: a client enabled XR_DXR_lift (task_mask 0 = default
  *  set). Prewarms per PrewarmOn. */
 void

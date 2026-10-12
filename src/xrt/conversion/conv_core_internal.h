@@ -202,6 +202,7 @@ struct conv_core
 	struct conv_validated validated[CONV_CORE_MAX_VALIDATED];
 	uint32_t validated_count;
 	bool interest_seen;
+	bool prewarm_after_describe; //!< a provider change re-described: apply PrewarmOn again (#2005)
 	bool first_create_seen;
 	bool wake_pending; //!< a row became READY: the control thread wakes the lanes
 

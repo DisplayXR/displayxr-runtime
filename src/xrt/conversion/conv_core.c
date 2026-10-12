@@ -539,7 +539,19 @@ conv_core_provider_changed(struct conv_core *core, const char *provider_id)
 	os_mutex_lock(&core->registry_mtx);
 	const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
 	if (pi >= 0) {
+		// #2005: a change retries the provider's ABSENT and FAILED rows (a
+		// model installed, a binary replaced) -- re-describing alone keeps a
+		// surviving row's readiness, so an ABSENT row stayed UNAVAILABLE
+		// until restart (G5's shape, on the core).
+		const uint64_t t = now_ns();
+		for (uint32_t i = 0; i < core->reg.row_count; i++) {
+			if (core->reg.rows[i].provider == (uint32_t)pi) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_REGISTRY_CHANGED, t);
+				apply_locked(core, i, &ev);
+			}
+		}
 		core->redescribe[pi] = true;
+		core->prewarm_after_describe = true;
 		os_cond_signal(&core->ctrl_cond);
 	}
 	os_mutex_unlock(&core->registry_mtx);
@@ -686,6 +698,36 @@ conv_core_v3_state(struct conv_core *core, uint32_t v3_modes, bool photo_content
 	const bool settled = conv_registry_discovery_settled(&core->reg);
 	os_mutex_unlock(&core->registry_mtx);
 	return conv_legacy_v3_state(states, n, settled);
+}
+
+bool
+conv_core_discovery_settled(struct conv_core *core)
+{
+	os_mutex_lock(&core->registry_mtx);
+	const bool settled = conv_registry_discovery_settled(&core->reg);
+	os_mutex_unlock(&core->registry_mtx);
+	return settled;
+}
+
+bool
+conv_core_task_has_candidate(struct conv_core *core, uint32_t task)
+{
+	if (!conv_task_is_served(task)) {
+		return false;
+	}
+	os_mutex_lock(&core->registry_mtx);
+	struct conv_binding b;
+	const bool ok = select_simple_locked(core, task, &b, NULL);
+	os_mutex_unlock(&core->registry_mtx);
+	return ok;
+}
+
+void
+conv_core_copy_registry(struct conv_core *core, struct conv_registry *out)
+{
+	os_mutex_lock(&core->registry_mtx);
+	memcpy(out, &core->reg, sizeof(*out));
+	os_mutex_unlock(&core->registry_mtx);
 }
 
 void
@@ -980,6 +1022,15 @@ ctrl_main(void *ptr)
 					describe_locked(core, p);
 					core->rebind_check = true;
 				}
+			}
+		}
+		// #2005: rows a change brought back follow PrewarmOn like rows of a
+		// provider added after the first hint (conv_core_add_provider).
+		if (core->prewarm_after_describe) {
+			core->prewarm_after_describe = false;
+			if (core->cfg.prewarm_on == CONV_PREWARM_START ||
+			    (core->cfg.prewarm_on == CONV_PREWARM_INTEREST && core->interest_seen)) {
+				prewarm_locked(core, prewarm_mask(core));
 			}
 		}
 		const bool wake = core->wake_pending;
