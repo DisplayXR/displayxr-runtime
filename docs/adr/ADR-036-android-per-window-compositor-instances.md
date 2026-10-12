@@ -227,7 +227,11 @@ they help every path.
 > Two measured consequences: a content Activity paused behind the controller would have
 > its session stopped (members are now exempt, like #558 overlay apps), and apps that stop
 > rendering without their own window freeze in the overlay — an authoring rule, not a
-> runtime fix.
+> runtime fix. And past both, the OS: a member behind the fullscreen controller is a cached
+> process, and the cached-app freezer freezes it within seconds (measured; every thread in
+> `do_freezer_trap`). That is the "freezer-exposed" cost this ADR already charged to
+> Architecture B, and it applies to the overlay mode the same way: members must stay visible
+> or hold their own foreground service.
 
 ### D5 — Package visibility is a vendor-neutral intent action, not a package name
 
