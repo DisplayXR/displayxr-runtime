@@ -757,6 +757,41 @@ struct comp_gl_compositor
 		bool announced;
 		bool warned_array;
 	} cursor_draw;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * the measured-disparity source. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the read FBO, pixel-pack buffers and
+	 * fences are created on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		GLuint fbo;
+		GLuint pbo[3];
+		GLsizeiptr pbo_size[3];
+		GLsync fence[3];
+		struct
+		{
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			uint32_t pitch;      //!< bytes per row of each view's copy (RGBA8)
+			uint32_t view_bytes; //!< offset of view B's copy
+		} meta[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `cursor_measure_mutex`.
+		struct u_cursor_measure_result result;
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+	} cursor_measure;
+	//! Guards cursor_measure.result (a leaf lock: the locate may run on another thread).
+	struct os_mutex cursor_measure_mutex;
 	//! #1581 XrCompositionLayerQuad — world-placed quad through the per-view
 	//! camera. Straight vs premultiplied alpha is blend STATE in GL, so one
 	//! program covers both; the `_array` twin only exists for arraySize>1
@@ -6241,6 +6276,211 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	return true;
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit (compositor context current, before any of the
+ * frame's drawing) the two outermost views' footprint patches are read with
+ * glReadPixels into a pixel-pack buffer - RGBA8, whatever the swapchain's
+ * format, the driver converts - and a fence is inserted. A later commit that
+ * finds the fence signalled (glClientWaitSync with a zero timeout, never a
+ * wait) maps the buffer, runs the shared CPU matcher and publishes the answer.
+ * GL images are stored bottom-up: the plan counts rows from the bottom.
+ *
+ */
+
+static void
+gl_cursor_measure_harvest(struct comp_gl_compositor *c)
+{
+	for (uint32_t s = 0; s < 3; s++) {
+		if (c->cursor_measure.fence[s] == NULL) {
+			continue;
+		}
+		const GLenum st = glClientWaitSync(c->cursor_measure.fence[s], 0, 0);
+		if (st == GL_TIMEOUT_EXPIRED) {
+			continue; // still in flight: look again next commit
+		}
+		glDeleteSync(c->cursor_measure.fence[s]);
+		c->cursor_measure.fence[s] = NULL;
+		c->cursor_measure.in_flight--;
+		if (st == GL_WAIT_FAILED) {
+			continue;
+		}
+		GLint prev_pack_buf = 0;
+		glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack_buf);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, c->cursor_measure.pbo[s]);
+		const uint8_t *base = (const uint8_t *)glMapBufferRange(
+		    GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)c->cursor_measure.meta[s].view_bytes * 2, GL_MAP_READ_BIT);
+		if (base != NULL) {
+			const struct u_cursor_measure_patch pa = {base, c->cursor_measure.meta[s].pitch,
+			                                          U_CURSOR_MEASURE_FORMAT_RGBA8};
+			const struct u_cursor_measure_patch pb = {base + c->cursor_measure.meta[s].view_bytes,
+			                                          c->cursor_measure.meta[s].pitch,
+			                                          U_CURSOR_MEASURE_FORMAT_RGBA8};
+			struct u_cursor_measure_result res;
+			const uint64_t t0 = os_monotonic_get_ns();
+			const bool ok = u_cursor_measure_run(&c->cursor_measure.meta[s].req, &c->cursor_measure.meta[s].plan,
+			                                     &pa, &pb, &c->cursor_measure.cache, &res);
+			const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+			glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+			if (ok) {
+				os_mutex_lock(&c->cursor_measure_mutex);
+				if (res.tag > c->cursor_measure.result.tag) {
+					c->cursor_measure.result = res;
+				}
+				os_mutex_unlock(&c->cursor_measure_mutex);
+				c->cursor_measure.stat_n++;
+				c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+				c->cursor_measure.stat_cpu_ns += cpu_ns;
+				if (cpu_ns > c->cursor_measure.stat_cpu_max_ns) {
+					c->cursor_measure.stat_cpu_max_ns = cpu_ns;
+				}
+				if (c->cursor_measure.stat_n >= 120) {
+					U_LOG_I("cursor_measure: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms; "
+					        "last: %s %.2f px (matched %u, L-R rejected %u)",
+					        c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+					        (double)c->cursor_measure.stat_cpu_ns / c->cursor_measure.stat_n * 1e-6,
+					        (double)c->cursor_measure.stat_cpu_max_ns * 1e-6,
+					        res.confident ? "confident" : "no content", res.disparity_px, res.matched,
+					        res.lr_rejected);
+					c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+					c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+				}
+			}
+		}
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack_buf);
+	}
+}
+
+static void
+gl_cursor_measure_sample(struct comp_gl_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+	struct comp_gl_swapchain *gsc[U_CURSOR_DEPTH_PATCH_VIEWS];
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count || layer->sc_array[vi] == NULL) {
+			return;
+		}
+		gsc[i] = gl_swapchain(layer->sc_array[vi]);
+		sub[i] = &layer->data.proj.v[vi].sub;
+		if (sub[i]->image_index >= gsc[i]->image_count || gsc[i]->textures[sub[i]->image_index] == 0) {
+			return;
+		}
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (uint32_t)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > gsc[i]->info.width ||
+		    (uint32_t)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > gsc[i]->info.height) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h) {
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, true, &plan)) {
+		return;
+	}
+	const uint32_t s = c->cursor_measure.next_slot;
+	if (c->cursor_measure.fence[s] != NULL) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	const uint32_t pitch = (uint32_t)plan.w * 4;
+	const uint32_t view_bytes = pitch * (uint32_t)plan.h;
+	const GLsizeiptr need = (GLsizeiptr)view_bytes * U_CURSOR_DEPTH_PATCH_VIEWS;
+
+	GLint prev_read_fbo = 0, prev_pack_buf = 0, prev_pack_align = 4, prev_pack_row = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack_buf);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack_align);
+	glGetIntegerv(GL_PACK_ROW_LENGTH, &prev_pack_row);
+
+	if (c->cursor_measure.fbo == 0) {
+		// First real request: the only objects this feature creates.
+		glGenFramebuffers(1, &c->cursor_measure.fbo);
+	}
+	if (c->cursor_measure.pbo[s] == 0) {
+		glGenBuffers(1, &c->cursor_measure.pbo[s]);
+	}
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, c->cursor_measure.pbo[s]);
+	if (c->cursor_measure.pbo_size[s] < need) {
+		glBufferData(GL_PIXEL_PACK_BUFFER, need, NULL, GL_STREAM_READ);
+		c->cursor_measure.pbo_size[s] = need;
+	}
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, c->cursor_measure.fbo);
+	bool ok = true;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS && ok; i++) {
+		const GLuint tex = gsc[i]->textures[sub[i]->image_index];
+		if (gsc[i]->target == GL_TEXTURE_2D_ARRAY) {
+			glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0,
+			                          (GLint)sub[i]->array_index);
+		} else {
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+		}
+		glReadBuffer(GL_COLOR_ATTACHMENT0);
+		if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			ok = false;
+			break;
+		}
+		glReadPixels(sub[i]->rect.offset.w + plan.x, sub[i]->rect.offset.h + plan.y, plan.w, plan.h, GL_RGBA,
+		             GL_UNSIGNED_BYTE, (void *)(uintptr_t)((size_t)i * view_bytes));
+	}
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack_buf);
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack_align);
+	glPixelStorei(GL_PACK_ROW_LENGTH, prev_pack_row);
+	if (!ok) {
+		return;
+	}
+	c->cursor_measure.fence[s] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	if (c->cursor_measure.fence[s] == NULL) {
+		return;
+	}
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % 3;
+	c->cursor_measure.meta[s].req = *req;
+	c->cursor_measure.meta[s].plan = plan;
+	c->cursor_measure.meta[s].pitch = pitch;
+	c->cursor_measure.meta[s].view_bytes = view_bytes;
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure: GL compositor reading a %dx%d px patch per view (%u bytes) for the "
+		        "measured-disparity cursor (ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h, view_bytes);
+	}
+}
+
+void
+comp_gl_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_gl_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	os_mutex_lock(&c->cursor_measure_mutex);
+	*out = c->cursor_measure.result;
+	os_mutex_unlock(&c->cursor_measure_mutex);
+	return out->valid;
+}
+
 void
 comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
 {
@@ -6331,6 +6571,17 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	glDisable(GL_BLEND);
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_SCISSOR_TEST);
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source. Read before any of this frame's
+	// drawing, so the cursor sprite never reaches the copy.
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		gl_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			gl_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
+	}
 	// #1610: the write-side half of the colour decision, and PASS state — the
 	// atlas pass below turns it on for the frames that paint the private
 	// GL_SRGB8_ALPHA8 compose target. Stated here so no individual draw has to
@@ -7485,6 +7736,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	// the display processor, both torn down below.
 	os_thread_helper_destroy(&c->repaint_thread);
 	os_mutex_destroy(&c->mutex);
+	os_mutex_destroy(&c->cursor_measure_mutex);
 
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
@@ -7564,6 +7816,18 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->cursor_draw.default_tex)
 		glDeleteTextures(1, &c->cursor_draw.default_tex);
 	comp_cursor_look_fini(&c->cursor_draw.look);
+	// XR_DXR_cursor_depth v7 copy resources (zero unless ever requested).
+	for (uint32_t s = 0; s < 3; s++) {
+		if (c->cursor_measure.fence[s] != NULL) {
+			glDeleteSync(c->cursor_measure.fence[s]);
+		}
+		if (c->cursor_measure.pbo[s]) {
+			glDeleteBuffers(1, &c->cursor_measure.pbo[s]);
+		}
+	}
+	if (c->cursor_measure.fbo) {
+		glDeleteFramebuffers(1, &c->cursor_measure.fbo);
+	}
 	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
 	if (c->program_quad) glDeleteProgram(c->program_quad);
 	if (c->program_quad_array) glDeleteProgram(c->program_quad_array);
@@ -8519,6 +8783,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// repaint thread and destroys this mutex, so both must be valid even on the
 	// earliest create failure.
 	os_mutex_init(&c->mutex);
+	os_mutex_init(&c->cursor_measure_mutex); // XR_DXR_cursor_depth v7 result (leaf)
 	os_thread_helper_init(&c->repaint_thread);
 	os_mutex_init(&c->dp_swap_mutex); // multi-screen M6 primary-DP swap
 #ifdef XRT_OS_WINDOWS

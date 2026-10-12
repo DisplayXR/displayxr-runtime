@@ -1970,6 +1970,53 @@ cursor_depth_record_layer(struct oxr_session *sess, const XrCompositionLayerProj
 
 #ifdef OXR_HAVE_DXR_cursor_depth
 /*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): this frame's locate asked for
+ * the measured-disparity source with the pointer over the canvas - hand the
+ * compositor its one-frame request. It measures between the two outermost
+ * views of the frame's first projection layer, in that layer's sub-image
+ * pixels; the state tracker converts with the LOCATED views (ratios only, so
+ * no pose or space bookkeeping is needed here).
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test).
+ */
+static void
+cursor_measure_submit(struct oxr_session *sess, bool zones_frame)
+{
+	sess->cursor_measure.armed = false;
+	if (zones_frame) {
+		// The zone layers' sub-images are not the canvas the hint's UV is in.
+		if (!sess->cursor_measure.warned_no_reader) {
+			sess->cursor_measure.warned_no_reader = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: measured disparity is not supported in display-zones frames yet - "
+			    "reporting no content (one-time warning)");
+		}
+		return;
+	}
+	const uint32_t n = sess->cursor_measure.active_view_count;
+	if (n < 2) {
+		return; // 2D: nothing to match, the placement is inactive anyway
+	}
+	struct u_cursor_measure_request req = {0};
+	req.requested = true;
+	req.tag = ++sess->cursor_measure.next_tag;
+	req.u = sess->cursor_measure.u;
+	req.v = sess->cursor_measure.v;
+	req.height = sess->cursor_measure.height;
+	req.view_index[0] = 0;
+	req.view_index[1] = n - 1;
+	if (!u_cursor_measure_should_sample(&req)) {
+		return;
+	}
+	if (!oxr_session_cursor_measure_hand_request(sess, &req) && !sess->cursor_measure.warned_no_reader) {
+		sess->cursor_measure.warned_no_reader = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: this compositor cannot measure disparity yet - the measured source "
+		    "reports no content (cursor on the display plane) (one-time warning)");
+	}
+}
+
+/*!
  * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): this frame's locate said
  * the runtime will draw the cursor. Map the placement into each view of the
  * frame's first projection layer - with the poses and fovs the app submitted,
@@ -3469,6 +3516,17 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		cursor_zones_frame = zones_frame;
 #endif
 		cursor_draw_submit(sess, frameEndInfo, cursor_zones_frame);
+	}
+	// ADR-046 Amendment 3. ZERO COST UNLESS REQUESTED: one bool test, true
+	// only on a frame whose locate chained the measured-disparity source with
+	// the pointer over the canvas. One request per frame: at most one
+	// measurement per submitted frame.
+	if (sess->cursor_measure.armed) {
+		bool measure_zones_frame = false;
+#ifdef OXR_HAVE_DXR_display_zones
+		measure_zones_frame = zones_frame;
+#endif
+		cursor_measure_submit(sess, measure_zones_frame);
 	}
 #endif
 

@@ -746,6 +746,41 @@ struct comp_d3d11_compositor
 		bool warned_routed;
 		bool warned_zones;
 	} cursor_draw;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * the measured-disparity source. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the staging textures are created on
+	 * the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		struct
+		{
+			//! Both views' copies, stacked (view A rows 0..h-1, view B h..2h-1).
+			ID3D11Texture2D *staging;
+			UINT w, h;
+			DXGI_FORMAT format;
+			bool in_flight;
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format mformat;
+		} slot[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `result_mutex`.
+		struct u_cursor_measure_result result;
+		std::mutex result_mutex;
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+	} cursor_measure;
 };
 
 /*
@@ -3628,6 +3663,219 @@ d3d11_cursor_resolve(struct comp_d3d11_compositor *c,
 	return true;
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit, before any of the compositor's own drawing, the two
+ * outermost views' footprint patches are copied (CopySubresourceRegion, on the
+ * app's immediate context, after its render) into one staging texture. A
+ * later commit maps it with D3D11_MAP_FLAG_DO_NOT_WAIT - a copy the GPU has
+ * not finished answers DXGI_ERROR_WAS_STILL_DRAWING and is looked at again
+ * next frame, never waited on - runs the shared CPU matcher and publishes.
+ *
+ */
+
+static enum u_cursor_measure_format
+d3d11_cursor_measure_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+static void
+d3d11_cursor_measure_harvest(struct comp_d3d11_compositor *c)
+{
+	for (uint32_t s = 0; s < 3; s++) {
+		auto &sl = c->cursor_measure.slot[s];
+		if (!sl.in_flight) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		const HRESULT hr = c->context->Map(sl.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			continue; // still in flight: look again next commit
+		}
+		sl.in_flight = false;
+		c->cursor_measure.in_flight--;
+		if (FAILED(hr)) {
+			continue;
+		}
+		const uint8_t *base = (const uint8_t *)m.pData;
+		const struct u_cursor_measure_patch pa = {base, m.RowPitch, sl.mformat};
+		const struct u_cursor_measure_patch pb = {base + (size_t)m.RowPitch * (size_t)sl.plan.h, m.RowPitch,
+		                                          sl.mformat};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		const bool ok = u_cursor_measure_run(&sl.req, &sl.plan, &pa, &pb, &c->cursor_measure.cache, &res);
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+		c->context->Unmap(sl.staging, 0);
+		if (!ok) {
+			continue;
+		}
+		{
+			std::lock_guard<std::mutex> rl(c->cursor_measure.result_mutex);
+			if (res.tag > c->cursor_measure.result.tag) {
+				c->cursor_measure.result = res;
+			}
+		}
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		if (cpu_ns > c->cursor_measure.stat_cpu_max_ns) {
+			c->cursor_measure.stat_cpu_max_ns = cpu_ns;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			U_LOG_I("cursor_measure [d3d11]: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms; last: %s "
+			        "%.2f px (matched %u, L-R rejected %u)",
+			        c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			        (double)c->cursor_measure.stat_cpu_ns / c->cursor_measure.stat_n * 1e-6,
+			        (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			        res.disparity_px, res.matched, res.lr_rejected);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+		}
+	}
+}
+
+static void
+d3d11_cursor_measure_sample(struct comp_d3d11_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct comp_layer *layer = nullptr;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == nullptr) {
+		return;
+	}
+	ID3D11Texture2D *tex[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	D3D11_TEXTURE2D_DESC desc[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count || layer->sc_array[vi] == nullptr) {
+			return;
+		}
+		sub[i] = &layer->data.proj.v[vi].sub;
+		tex[i] = static_cast<ID3D11Texture2D *>(
+		    comp_d3d11_swapchain_get_texture(layer->sc_array[vi], sub[i]->image_index));
+		if (tex[i] == nullptr) {
+			return;
+		}
+		tex[i]->GetDesc(&desc[i]);
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (UINT)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > desc[i].Width ||
+		    (UINT)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > desc[i].Height ||
+		    sub[i]->array_index >= desc[i].ArraySize || desc[i].SampleDesc.Count != 1) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    desc[0].Format != desc[1].Format) {
+		return;
+	}
+	const enum u_cursor_measure_format mformat = d3d11_cursor_measure_format(desc[0].Format);
+	if (mformat == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure [d3d11]: DXGI format %d is not read by the matcher - no content (one-time "
+			        "warning)",
+			        (int)desc[0].Format);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+	const uint32_t s = c->cursor_measure.next_slot;
+	auto &sl = c->cursor_measure.slot[s];
+	if (sl.in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	if (sl.staging == nullptr || sl.w < (UINT)plan.w || sl.h < (UINT)plan.h * 2 || sl.format != desc[0].Format) {
+		// First real request (or a larger patch): the only allocation this feature makes.
+		if (sl.staging != nullptr) {
+			sl.staging->Release();
+			sl.staging = nullptr;
+		}
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = (UINT)plan.w;
+		sd.Height = (UINT)plan.h * 2;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = desc[0].Format;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &sl.staging))) {
+			sl.staging = nullptr;
+			return;
+		}
+		sl.w = sd.Width;
+		sl.h = sd.Height;
+		sl.format = sd.Format;
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		D3D11_BOX box = {};
+		box.left = (UINT)(sub[i]->rect.offset.w + plan.x);
+		box.top = (UINT)(sub[i]->rect.offset.h + plan.y);
+		box.front = 0;
+		box.right = box.left + (UINT)plan.w;
+		box.bottom = box.top + (UINT)plan.h;
+		box.back = 1;
+		const UINT src_sub = (UINT)sub[i]->array_index * desc[i].MipLevels; // mip 0
+		c->context->CopySubresourceRegion(sl.staging, 0, 0, (UINT)plan.h * i, 0, tex[i], src_sub, &box);
+	}
+	sl.in_flight = true;
+	sl.req = *req;
+	sl.plan = plan;
+	sl.mformat = mformat;
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % 3;
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure [d3d11]: copying a %dx%d px patch per view for the measured-disparity cursor "
+		        "(ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h);
+	}
+}
+
+void
+comp_d3d11_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req)
+{
+	if (xc == nullptr || req == nullptr) {
+		return;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_d3d11_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> rl(c->cursor_measure.result_mutex);
+	*out = c->cursor_measure.result;
+	return out->valid;
+}
+
 extern "C" void
 comp_d3d11_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
 {
@@ -3693,6 +3941,18 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
 			cursor_pending = true;
 		}
+	}
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source. Copied before any of this
+	// commit's own drawing, so the cursor sprite never reaches the copy.
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		d3d11_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			d3d11_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
 	}
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
@@ -4528,6 +4788,13 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_fini(&c->mcp_capture);
 	// XR_DXR_cursor_depth v5: the default look's image (NULL unless ever drawn).
 	comp_cursor_look_fini(&c->cursor_draw.look);
+	// XR_DXR_cursor_depth v7 staging textures (NULL unless ever requested).
+	for (auto &sl : c->cursor_measure.slot) {
+		if (sl.staging != nullptr) {
+			sl.staging->Release();
+			sl.staging = nullptr;
+		}
+	}
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Stop debug GUI first (before destroying resources it may reference)

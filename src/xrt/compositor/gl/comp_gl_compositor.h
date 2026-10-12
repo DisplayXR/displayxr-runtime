@@ -173,6 +173,8 @@ comp_gl_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask);
 bool
 comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
 
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
 struct u_cursor_draw_request;
 
 /*!
@@ -187,6 +189,25 @@ struct u_cursor_draw_request;
  */
 void
 comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): at the NEXT layer_commit only,
+ * copy a cursor-sized patch out of the two outermost views of the frame's
+ * first projection layer into a staging buffer; a later commit that finds the
+ * copy finished (polled, never waited on) block-matches it on the CPU
+ * (u_cursor_measure_run) and publishes the result. Called by the state
+ * tracker only on a frame whose locate chained the measured-disparity source;
+ * a compositor never handed a request allocates and copies nothing.
+ */
+void
+comp_gl_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7: the newest finished measurement (thread-safe).
+ * @return out->valid.
+ */
+bool
+comp_gl_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
 
 struct xrt_screen_list;
 struct xrt_segment_metrics;

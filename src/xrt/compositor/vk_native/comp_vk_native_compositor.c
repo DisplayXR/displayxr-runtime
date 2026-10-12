@@ -1564,6 +1564,52 @@ struct comp_vk_native_compositor
 		bool warned_zones;
 		bool warned_routed;
 	} cursor_draw;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * the measured-disparity source. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the command pool, staging buffers,
+	 * fences and query pool are created on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		VkCommandPool pool;
+		VkQueryPool queries; //!< 2 timestamps per slot (GPU cost evidence), or null
+		float ts_period_ns;
+		struct
+		{
+			VkBuffer buf;
+			VkDeviceMemory mem;
+			uint8_t *mapped;
+			VkDeviceSize size;
+			VkCommandBuffer cmd;
+			VkFence fence;
+			bool in_flight;
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format format;
+			uint32_t pitch;      //!< bytes per row of each view's copy
+			uint32_t view_bytes; //!< offset of view B's copy
+		} slot[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		bool failed; //!< setup failed once: stop trying (one-time WARN)
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `cursor_measure_mutex`.
+		struct u_cursor_measure_result result;
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		double stat_gpu_ns, stat_gpu_max_ns;
+	} cursor_measure;
+	//! Guards cursor_measure.result: the locate may run on another thread.
+	//! A leaf lock (c->mutex can stay held across a weave hand-off).
+	struct os_mutex cursor_measure_mutex;
 };
 
 /*
@@ -9727,6 +9773,444 @@ comp_vk_native_compositor_set_cursor_draw_request(struct xrt_compositor *xc, con
 	c->cursor_draw.req = *req;
 }
 
+
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit, before any of the compositor's own work, one small
+ * command buffer copies the footprint patch of the two outermost views out of
+ * the app's projection swapchain (in COLOR_ATTACHMENT_OPTIMAL, the layout the
+ * renderer also expects) into a host-visible buffer, with its own fence. A
+ * later commit that finds the fence signalled (vkGetFenceStatus, never a
+ * wait) runs the shared CPU matcher over the copy and publishes the answer.
+ *
+ */
+
+static enum u_cursor_measure_format
+vk_cursor_measure_format(VkFormat f)
+{
+	switch (f) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+static void
+vk_cursor_measure_free_buffer(struct vk_bundle *vk, struct comp_vk_native_compositor *c, uint32_t s)
+{
+	if (c->cursor_measure.slot[s].mapped != NULL) {
+		vk->vkUnmapMemory(vk->device, c->cursor_measure.slot[s].mem);
+		c->cursor_measure.slot[s].mapped = NULL;
+	}
+	if (c->cursor_measure.slot[s].buf != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, c->cursor_measure.slot[s].buf, NULL);
+		c->cursor_measure.slot[s].buf = VK_NULL_HANDLE;
+	}
+	if (c->cursor_measure.slot[s].mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->cursor_measure.slot[s].mem, NULL);
+		c->cursor_measure.slot[s].mem = VK_NULL_HANDLE;
+	}
+	c->cursor_measure.slot[s].size = 0;
+}
+
+static void
+vk_cursor_measure_destroy(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		if (c->cursor_measure.slot[s].in_flight && c->cursor_measure.slot[s].fence != VK_NULL_HANDLE) {
+			// Teardown only: the copy is tiny and already queued.
+			vk->vkWaitForFences(vk->device, 1, &c->cursor_measure.slot[s].fence, VK_TRUE, UINT64_MAX);
+		}
+		if (c->cursor_measure.slot[s].fence != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, c->cursor_measure.slot[s].fence, NULL);
+			c->cursor_measure.slot[s].fence = VK_NULL_HANDLE;
+		}
+		vk_cursor_measure_free_buffer(vk, c, s);
+	}
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkDestroyQueryPool(vk->device, c->cursor_measure.queries, NULL);
+		c->cursor_measure.queries = VK_NULL_HANDLE;
+	}
+	if (c->cursor_measure.pool != VK_NULL_HANDLE) {
+		// Frees the command buffers too.
+		vk->vkDestroyCommandPool(vk->device, c->cursor_measure.pool, NULL);
+		c->cursor_measure.pool = VK_NULL_HANDLE;
+	}
+}
+
+//! First real request: the command pool, one command buffer + fence per slot, a timestamp pool.
+static bool
+vk_cursor_measure_init(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.pool != VK_NULL_HANDLE) {
+		return true;
+	}
+	VkCommandPoolCreateInfo pci = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+	    .queueFamilyIndex = c->queue_family_index,
+	};
+	if (vk->vkCreateCommandPool(vk->device, &pci, NULL, &c->cursor_measure.pool) != VK_SUCCESS) {
+		c->cursor_measure.pool = VK_NULL_HANDLE;
+		return false;
+	}
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		VkCommandBufferAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = c->cursor_measure.pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkAllocateCommandBuffers(vk->device, &ai, &c->cursor_measure.slot[s].cmd) != VK_SUCCESS ||
+		    vk->vkCreateFence(vk->device, &fci, NULL, &c->cursor_measure.slot[s].fence) != VK_SUCCESS) {
+			vk_cursor_measure_destroy(c);
+			return false;
+		}
+	}
+	// GPU cost evidence: two timestamps per slot, when the queue has them.
+	VkPhysicalDeviceProperties props;
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+	uint32_t qf_count = 0;
+	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, NULL);
+	VkQueueFamilyProperties qf[16];
+	qf_count = qf_count > 16 ? 16 : qf_count;
+	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, qf);
+	if (c->queue_family_index < qf_count && qf[c->queue_family_index].timestampValidBits > 0 &&
+	    props.limits.timestampPeriod > 0.0f) {
+		VkQueryPoolCreateInfo qci = {
+		    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+		    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+		    .queryCount = 2 * ARRAY_SIZE(c->cursor_measure.slot),
+		};
+		if (vk->vkCreateQueryPool(vk->device, &qci, NULL, &c->cursor_measure.queries) != VK_SUCCESS) {
+			c->cursor_measure.queries = VK_NULL_HANDLE;
+		}
+		c->cursor_measure.ts_period_ns = props.limits.timestampPeriod;
+	}
+	return true;
+}
+
+static bool
+vk_cursor_measure_ensure_buffer(struct comp_vk_native_compositor *c, uint32_t s, VkDeviceSize need)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.slot[s].buf != VK_NULL_HANDLE && c->cursor_measure.slot[s].size >= need) {
+		return true;
+	}
+	vk_cursor_measure_free_buffer(vk, c, s);
+	VkBufferCreateInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = need,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bi, NULL, &c->cursor_measure.slot[s].buf) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].buf = VK_NULL_HANDLE;
+		return false;
+	}
+	VkMemoryRequirements mreq;
+	vk->vkGetBufferMemoryRequirements(vk->device, c->cursor_measure.slot[s].buf, &mreq);
+	uint32_t mem_type = 0;
+	if (!vk_native_find_host_visible_memory_type(vk, mreq.memoryTypeBits, &mem_type)) {
+		vk_cursor_measure_free_buffer(vk, c, s);
+		return false;
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mreq.size,
+	    .memoryTypeIndex = mem_type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, &c->cursor_measure.slot[s].mem) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].mem = VK_NULL_HANDLE;
+		vk_cursor_measure_free_buffer(vk, c, s);
+		return false;
+	}
+	if (vk->vkBindBufferMemory(vk->device, c->cursor_measure.slot[s].buf, c->cursor_measure.slot[s].mem, 0) !=
+	        VK_SUCCESS ||
+	    vk->vkMapMemory(vk->device, c->cursor_measure.slot[s].mem, 0, VK_WHOLE_SIZE, 0,
+	                    (void **)&c->cursor_measure.slot[s].mapped) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].mapped = NULL;
+		vk_cursor_measure_free_buffer(vk, c, s);
+		return false;
+	}
+	c->cursor_measure.slot[s].size = need;
+	return true;
+}
+
+//! Harvest every finished copy, match it, publish the newest. Never blocks on the GPU.
+static void
+vk_cursor_measure_harvest(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		if (!c->cursor_measure.slot[s].in_flight) {
+			continue;
+		}
+		const VkResult fs = vk->vkGetFenceStatus(vk->device, c->cursor_measure.slot[s].fence);
+		if (fs == VK_NOT_READY) {
+			continue; // still in flight: look again next commit
+		}
+		vk->vkResetFences(vk->device, 1, &c->cursor_measure.slot[s].fence);
+		c->cursor_measure.slot[s].in_flight = false;
+		c->cursor_measure.in_flight--;
+		if (fs != VK_SUCCESS) {
+			continue;
+		}
+		double gpu_ns = -1.0;
+		if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+			uint64_t ts[2] = {0, 0};
+			if (vk->vkGetQueryPoolResults(vk->device, c->cursor_measure.queries, 2 * s, 2, sizeof(ts), ts,
+			                              sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+			    ts[1] >= ts[0]) {
+				gpu_ns = (double)(ts[1] - ts[0]) * (double)c->cursor_measure.ts_period_ns;
+			}
+		}
+		const uint8_t *base = c->cursor_measure.slot[s].mapped;
+		const struct u_cursor_measure_patch pa = {base, c->cursor_measure.slot[s].pitch,
+		                                          c->cursor_measure.slot[s].format};
+		const struct u_cursor_measure_patch pb = {base + c->cursor_measure.slot[s].view_bytes,
+		                                          c->cursor_measure.slot[s].pitch, c->cursor_measure.slot[s].format};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		if (!u_cursor_measure_run(&c->cursor_measure.slot[s].req, &c->cursor_measure.slot[s].plan, &pa, &pb,
+		                          &c->cursor_measure.cache, &res)) {
+			continue;
+		}
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+
+		os_mutex_lock(&c->cursor_measure_mutex);
+		if (res.tag > c->cursor_measure.result.tag) {
+			c->cursor_measure.result = res;
+		}
+		os_mutex_unlock(&c->cursor_measure_mutex);
+
+		// Cost evidence (ADR-046 Amendment 3), throttled: never per frame.
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		c->cursor_measure.stat_cpu_max_ns =
+		    cpu_ns > c->cursor_measure.stat_cpu_max_ns ? cpu_ns : c->cursor_measure.stat_cpu_max_ns;
+		if (gpu_ns >= 0.0) {
+			c->cursor_measure.stat_gpu_ns += gpu_ns;
+			c->cursor_measure.stat_gpu_max_ns =
+			    gpu_ns > c->cursor_measure.stat_gpu_max_ns ? gpu_ns : c->cursor_measure.stat_gpu_max_ns;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			const double n = (double)c->cursor_measure.stat_n;
+			U_LOG_I(
+			    "cursor_measure: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms, GPU copy avg "
+			    "%.4f ms max %.4f ms; last: %s %.2f px (sub_w %.0f, %ux%u work px x%d, matched %u, L-R "
+			    "rejected %u, ncc %.3f)",
+			    c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			    (double)c->cursor_measure.stat_cpu_ns / n * 1e-6,
+			    (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, c->cursor_measure.stat_gpu_ns / n * 1e-6,
+			    c->cursor_measure.stat_gpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			    res.disparity_px, res.sub_w, c->cursor_measure.slot[s].plan.work_w,
+			    c->cursor_measure.slot[s].plan.work_h, c->cursor_measure.slot[s].plan.factor, res.matched,
+			    res.lr_rejected, res.ncc);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+			c->cursor_measure.stat_gpu_ns = c->cursor_measure.stat_gpu_max_ns = 0.0;
+		}
+	}
+}
+
+//! Record + submit this frame's two patch copies, if a slot is free. Never waits for one.
+static void
+vk_cursor_measure_sample(struct comp_vk_native_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.failed) {
+		return;
+	}
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+	VkImage img[U_CURSOR_DEPTH_PATCH_VIEWS];
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+	VkFormat fmt_vk = VK_FORMAT_UNDEFINED;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		struct xrt_swapchain *xsc = vi < layer->data.view_count ? layer->sc_array[vi] : NULL;
+		if (xsc == NULL) {
+			return;
+		}
+		sub[i] = &layer->data.proj.v[vi].sub;
+		img[i] = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sub[i]->image_index);
+		if (img[i] == VK_NULL_HANDLE) {
+			return;
+		}
+		const VkFormat f = (VkFormat)comp_vk_native_swapchain_get_declared_format(xsc);
+		if (i > 0 && f != fmt_vk) {
+			return;
+		}
+		fmt_vk = f;
+		uint32_t sw = 0, sh = 0;
+		comp_vk_native_swapchain_get_dimensions(xsc, &sw, &sh);
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (uint32_t)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > sw ||
+		    (uint32_t)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > sh) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h) {
+		return;
+	}
+	const enum u_cursor_measure_format fmt = vk_cursor_measure_format(fmt_vk);
+	if (fmt == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure: VkFormat %d is not read by the matcher - no content (one-time warning)",
+			        (int)fmt_vk);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+
+	const uint32_t s = c->cursor_measure.next_slot;
+	if (c->cursor_measure.slot[s].in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	if (!vk_cursor_measure_init(c)) {
+		c->cursor_measure.failed = true;
+		U_LOG_W("cursor_measure: could not create the copy resources - no content (one-time warning)");
+		return;
+	}
+	const uint32_t pitch = (uint32_t)plan.w * u_cursor_measure_format_bytes(fmt);
+	const uint32_t view_bytes = pitch * (uint32_t)plan.h;
+	if (!vk_cursor_measure_ensure_buffer(c, s, (VkDeviceSize)view_bytes * U_CURSOR_DEPTH_PATCH_VIEWS)) {
+		return;
+	}
+
+	VkCommandBuffer cmd = c->cursor_measure.slot[s].cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	if (vk->vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+		return;
+	}
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkCmdResetQueryPool(cmd, c->cursor_measure.queries, 2 * s, 2);
+		vk->vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->cursor_measure.queries, 2 * s);
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		// SBS: both views may be the same image; a second identical
+		// barrier pair is harmless and keeps this simple.
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = img[i],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, sub[i]->array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &b);
+		VkBufferImageCopy region = {
+		    .bufferOffset = (VkDeviceSize)i * view_bytes,
+		    .bufferRowLength = (uint32_t)plan.w,
+		    .bufferImageHeight = (uint32_t)plan.h,
+		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sub[i]->array_index, 1},
+		    .imageOffset = {sub[i]->rect.offset.w + plan.x, sub[i]->rect.offset.h + plan.y, 0},
+		    .imageExtent = {(uint32_t)plan.w, (uint32_t)plan.h, 1},
+		};
+		vk->vkCmdCopyImageToBuffer(cmd, img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->cursor_measure.slot[s].buf,
+		                           1, &region);
+		b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+		                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &b);
+	}
+	VkBufferMemoryBarrier hb = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .buffer = c->cursor_measure.slot[s].buf,
+	    .offset = 0,
+	    .size = VK_WHOLE_SIZE,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &hb, 0,
+	                         NULL);
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->cursor_measure.queries, 2 * s + 1);
+	}
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		return;
+	}
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, c->cursor_measure.slot[s].fence) != VK_SUCCESS) {
+		return;
+	}
+	c->cursor_measure.slot[s].in_flight = true;
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_measure.slot);
+	c->cursor_measure.slot[s].req = *req;
+	c->cursor_measure.slot[s].plan = plan;
+	c->cursor_measure.slot[s].format = fmt;
+	c->cursor_measure.slot[s].pitch = pitch;
+	c->cursor_measure.slot[s].view_bytes = view_bytes;
+
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure: Vulkan compositor copying a %dx%d px patch per view (%u bytes) for the "
+		        "measured-disparity cursor (ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h, view_bytes);
+	}
+}
+
+void
+comp_vk_native_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                     const struct u_cursor_measure_request *req)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_vk_native_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	os_mutex_lock(&c->cursor_measure_mutex);
+	*out = c->cursor_measure.result;
+	os_mutex_unlock(&c->cursor_measure_mutex);
+	return out->valid;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
                                   xrt_graphics_sync_handle_t sync_handle,
@@ -9771,6 +10255,19 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// zones publishes none, which is what "the whole canvas is the 3D zone"
 	// means to the runner.
 	vk_publish_rear_budget_zones(c);
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source. Submitted before any of this
+	// commit's own work: after the app's render on the in-order queue, and
+	// before the cursor sprite is drawn anywhere.
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		vk_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			vk_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
+	}
 
 #ifdef XRT_OS_WINDOWS
 	/*
@@ -11262,6 +11759,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->cmd_pool, NULL);
 	}
+	vk_cursor_measure_destroy(c); // XR_DXR_cursor_depth v7 (nothing unless ever requested)
 
 	// Note: we do NOT destroy the VkDevice — it belongs to the app.
 	// vk_bundle cleanup is minimal (just mutexes).
@@ -11269,6 +11767,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// #868: last, after the repaint thread has been joined above.
 	os_cond_destroy(&c->weave_cond);
 	os_mutex_destroy(&c->mutex);
+	os_mutex_destroy(&c->cursor_measure_mutex);
 	os_cond_destroy(&c->weave_hand.cond);
 	os_mutex_destroy(&c->weave_hand.mutex);
 	os_mutex_destroy(&c->ws_dead.mutex);
@@ -11840,6 +12339,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// even on the earliest create failure. os_thread_helper_init only prepares
 	// the handle; the loop is started later, once the target exists.
 	os_mutex_init(&c->mutex);
+	os_mutex_init(&c->cursor_measure_mutex); // XR_DXR_cursor_depth v7 result (leaf)
 	os_cond_init(&c->weave_cond);
 	// #1394: the hand-off handshake runs on its own leaf lock — see weave_hand.mutex.
 	os_mutex_init(&c->weave_hand.mutex);

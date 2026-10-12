@@ -495,6 +495,44 @@ struct comp_metal_compositor
 	} cursor_depth;
 
 	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained the measured-disparity source. layer_commit tests
+	 * `req.requested` and `in_flight` and does nothing else; the staging
+	 * buffers are allocated on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		//! Shared staging buffers (both views' copies) and the command buffer
+		//! that fills each; polled for completion, never waited on.
+		id<MTLBuffer> buf[3];
+		id<MTLCommandBuffer> cb[3];
+		struct
+		{
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format format;
+			uint32_t pitch;      //!< bytes per row of each view's copy
+			uint32_t view_bytes; //!< offset of view B's copy
+		} meta[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		//! The last measured patch (a paused video is not matched again).
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `mutex`.
+		struct u_cursor_measure_result result;
+		//! Cost diagnostics, logged at INFO every 120 measurements.
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		double stat_gpu_s, stat_gpu_max_s;
+	} cursor_measure;
+
+	/*!
 	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
 	 * Amendment 2 B).
 	 *
@@ -3993,6 +4031,229 @@ comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct 
 
 /*
  *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit the two outermost views' footprint patches are
+ * blitted out of the app's projection swapchain into a shared buffer, on
+ * their own command buffer, encoded on the app's queue after its rendering.
+ * A later commit sees that command buffer completed (a status poll, never a
+ * wait), runs the shared CPU matcher over the copy and publishes the answer.
+ *
+ */
+
+static enum u_cursor_measure_format
+metal_cursor_measure_format(MTLPixelFormat f)
+{
+	switch (f) {
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case MTLPixelFormatRGBA16Float: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case MTLPixelFormatRGB10A2Unorm: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+//! Harvest every finished copy, match it, publish the newest. Never blocks on the GPU.
+static void
+metal_cursor_measure_harvest(struct comp_metal_compositor *c)
+{
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.cb); s++) {
+		id<MTLCommandBuffer> cb = c->cursor_measure.cb[s];
+		if (cb == nil) {
+			continue;
+		}
+		const MTLCommandBufferStatus st = cb.status;
+		if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) {
+			continue; // still in flight: look again next commit
+		}
+		const double gpu_s = cb.GPUEndTime - cb.GPUStartTime;
+		[cb release];
+		c->cursor_measure.cb[s] = nil;
+		c->cursor_measure.in_flight--;
+		if (st != MTLCommandBufferStatusCompleted) {
+			continue;
+		}
+
+		const uint8_t *base = (const uint8_t *)c->cursor_measure.buf[s].contents;
+		const struct u_cursor_measure_patch pa = {base, c->cursor_measure.meta[s].pitch,
+		                                          c->cursor_measure.meta[s].format};
+		const struct u_cursor_measure_patch pb = {base + c->cursor_measure.meta[s].view_bytes,
+		                                          c->cursor_measure.meta[s].pitch, c->cursor_measure.meta[s].format};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		if (!u_cursor_measure_run(&c->cursor_measure.meta[s].req, &c->cursor_measure.meta[s].plan, &pa, &pb,
+		                          &c->cursor_measure.cache, &res)) {
+			continue;
+		}
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+
+		os_mutex_lock(&c->mutex);
+		if (res.tag > c->cursor_measure.result.tag) {
+			c->cursor_measure.result = res;
+		}
+		os_mutex_unlock(&c->mutex);
+
+		// Cost evidence (ADR-046 Amendment 3), throttled: never per frame.
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		c->cursor_measure.stat_cpu_max_ns =
+		    cpu_ns > c->cursor_measure.stat_cpu_max_ns ? cpu_ns : c->cursor_measure.stat_cpu_max_ns;
+		if (gpu_s > 0.0 && gpu_s < 1.0) {
+			c->cursor_measure.stat_gpu_s += gpu_s;
+			c->cursor_measure.stat_gpu_max_s =
+			    gpu_s > c->cursor_measure.stat_gpu_max_s ? gpu_s : c->cursor_measure.stat_gpu_max_s;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			const double n = (double)c->cursor_measure.stat_n;
+			U_LOG_I(
+			    "cursor_measure: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms, GPU copy cb avg "
+			    "%.3f ms max %.3f ms; last: %s %.2f px (sub_w %.0f, %ux%u work px x%d, matched %u, L-R "
+			    "rejected %u, ncc %.3f)",
+			    c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			    (double)c->cursor_measure.stat_cpu_ns / n * 1e-6,
+			    (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, c->cursor_measure.stat_gpu_s / n * 1e3,
+			    c->cursor_measure.stat_gpu_max_s * 1e3, res.confident ? "confident" : "no content",
+			    res.disparity_px, res.sub_w, c->cursor_measure.meta[s].plan.work_w,
+			    c->cursor_measure.meta[s].plan.work_h, c->cursor_measure.meta[s].plan.factor, res.matched,
+			    res.lr_rejected, res.ncc);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+			c->cursor_measure.stat_gpu_s = c->cursor_measure.stat_gpu_max_s = 0.0;
+		}
+	}
+}
+
+//! Encode this frame's two patch copies, if a slot is free. Never waits for one.
+static void
+metal_cursor_measure_sample(struct comp_metal_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+	id<MTLTexture> tex[U_CURSOR_DEPTH_PATCH_VIEWS];
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count || layer->sc_array[vi] == NULL) {
+			return;
+		}
+		struct comp_metal_swapchain *msc = metal_swapchain(layer->sc_array[vi]);
+		sub[i] = &layer->data.proj.v[vi].sub;
+		if (sub[i]->image_index >= msc->image_count || msc->images[sub[i]->image_index] == nil) {
+			return;
+		}
+		tex[i] = msc->images[sub[i]->image_index];
+	}
+	// The two views must be measured in the same pixel grid.
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    tex[0].pixelFormat != tex[1].pixelFormat) {
+		return;
+	}
+	const enum u_cursor_measure_format fmt = metal_cursor_measure_format(tex[0].pixelFormat);
+	if (fmt == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure: Metal swapchain format %lu is not read by the matcher - no content "
+			        "(one-time warning)",
+			        (unsigned long)tex[0].pixelFormat);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, c->source_is_gl, &plan)) {
+		return;
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const int32_t x = sub[i]->rect.offset.w + plan.x;
+		const int32_t y = sub[i]->rect.offset.h + plan.y;
+		if (x < 0 || y < 0 || (NSUInteger)(x + plan.w) > tex[i].width || (NSUInteger)(y + plan.h) > tex[i].height) {
+			return;
+		}
+	}
+
+	const uint32_t s = c->cursor_measure.next_slot;
+	if (c->cursor_measure.cb[s] != nil) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	const uint32_t pitch = (uint32_t)plan.w * u_cursor_measure_format_bytes(fmt);
+	const uint32_t view_bytes = pitch * (uint32_t)plan.h;
+	const NSUInteger need = (NSUInteger)view_bytes * U_CURSOR_DEPTH_PATCH_VIEWS;
+	if (c->cursor_measure.buf[s] == nil || c->cursor_measure.buf[s].length < need) {
+		// First real request (or a larger patch): the only allocation this
+		// feature makes.
+		[c->cursor_measure.buf[s] release];
+		c->cursor_measure.buf[s] = [c->device newBufferWithLength:need options:MTLResourceStorageModeShared];
+		if (c->cursor_measure.buf[s] == nil) {
+			return;
+		}
+	}
+	id<MTLCommandBuffer> cb = [c->command_queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = cb != nil ? [cb blitCommandEncoder] : nil;
+	if (blit == nil) {
+		return; // never seen in practice; the command buffer is not committed
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		[blit copyFromTexture:tex[i]
+		                 sourceSlice:(tex[i].textureType == MTLTextureType2DArray) ? sub[i]->array_index : 0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake((NSUInteger)(sub[i]->rect.offset.w + plan.x),
+		                                           (NSUInteger)(sub[i]->rect.offset.h + plan.y), 0)
+		                  sourceSize:MTLSizeMake((NSUInteger)plan.w, (NSUInteger)plan.h, 1)
+		                    toBuffer:c->cursor_measure.buf[s]
+		           destinationOffset:(NSUInteger)i * view_bytes
+		      destinationBytesPerRow:pitch
+		    destinationBytesPerImage:view_bytes];
+	}
+	[blit endEncoding];
+	[cb commit];
+	c->cursor_measure.cb[s] = [cb retain];
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_measure.cb);
+	c->cursor_measure.meta[s].req = *req;
+	c->cursor_measure.meta[s].plan = plan;
+	c->cursor_measure.meta[s].format = fmt;
+	c->cursor_measure.meta[s].pitch = pitch;
+	c->cursor_measure.meta[s].view_bytes = view_bytes;
+
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure: Metal compositor copying a %dx%d px patch per view (%u bytes) for the "
+		        "measured-disparity cursor (ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h, view_bytes);
+	}
+}
+
+void
+comp_metal_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_metal_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->mutex);
+	*out = c->cursor_measure.result;
+	os_mutex_unlock(&c->mutex);
+	return out->valid;
+}
+
+
+/*
+ *
  * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
  *
  * After the app's layers are composited into the atlas and before the display
@@ -4315,6 +4576,20 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			metal_cursor_depth_sample(c, &c->cursor_depth.req);
 		}
 		c->cursor_depth.req.requested = false;
+	}
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source - no copy, no buffer, no command
+	// buffer. The copy is encoded here, before this commit's own work, on the
+	// app's queue: after the app's rendering into the views, and before the
+	// compositor draws anything (the cursor sprite never reaches the copy).
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		metal_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			metal_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
 	}
 
 	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
@@ -5981,6 +6256,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		c->cursor_depth.cb[s] = nil;
 		[c->cursor_depth.buf[s] release];
 		c->cursor_depth.buf[s] = nil;
+	}
+	// XR_DXR_cursor_depth v7 staging slots (nil unless ever requested).
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.buf); s++) {
+		[c->cursor_measure.cb[s] release];
+		c->cursor_measure.cb[s] = nil;
+		[c->cursor_measure.buf[s] release];
+		c->cursor_measure.buf[s] = nil;
 	}
 	// XR_DXR_cursor_depth v5 draw resources (nil unless ever requested).
 	for (uint32_t p = 0; p < 2; p++) {

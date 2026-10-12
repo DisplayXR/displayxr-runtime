@@ -2422,6 +2422,140 @@ oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cu
 	return false;
 }
 
+/*
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3). Every
+ * in-process native compositor copies the patch; the matcher is the shared
+ * u_cursor_measure_run(). The IPC/service path reports "cannot measure", and
+ * the placement then has no content (cursor on the plane) - never an error.
+ */
+bool
+oxr_session_cursor_measure_hand_request(struct oxr_session *sess, const struct u_cursor_measure_request *req)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		comp_vk_native_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		comp_gl_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+		return true;
+	}
+#endif
+	// TODO(ADR-046 Amendment 3 point 6): the IPC/service path.
+	(void)req;
+	return false;
+}
+
+static bool
+oxr_session_cursor_measure_get_result(struct oxr_session *sess, struct u_cursor_measure_result *out)
+{
+	if (sess->xcn == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		return comp_metal_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		return comp_gl_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+	(void)out;
+	return false;
+}
+
+/*!
+ * The content disparity under the cursor, measured from the submitted views
+ * (spec v7): arm the next xrEndFrame's measurement, and use the newest one
+ * that has come back (one or two frames old).
+ *
+ * Reached only from a hinted locate whose geometry solved - i.e. with the
+ * pointer over the canvas - that chained the measured-disparity source.
+ *
+ * @return true and the content's disparity (eye baselines), or false for "no
+ *         confident content" (the screen plane).
+ */
+static bool
+oxr_session_cursor_depth_measured(struct oxr_session *sess,
+                                  const XrCursorDepthHintDXR *hint,
+                                  const struct u_cursor_depth_view *a,
+                                  const struct u_cursor_depth_view *b,
+                                  const struct u_cursor_depth_geometry *g,
+                                  uint32_t active_view_count,
+                                  float *out_disparity)
+{
+	if (!sess->cursor_measure.announced) {
+		sess->cursor_measure.announced = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: measured-disparity source requested - block-matching a cursor-sized "
+		    "patch of the submitted views from now on (ADR-046 Amendment 3, one-time notice)");
+	}
+	float height = hint->cursorHeight;
+	if (!(height > 0.0f) || !isfinite(height)) {
+		height = U_CURSOR_DEPTH_DEFAULT_HEIGHT;
+	}
+	sess->cursor_measure.armed = true;
+	sess->cursor_measure.u = hint->cursorUV.x;
+	sess->cursor_measure.v = hint->cursorUV.y;
+	sess->cursor_measure.height = height;
+	sess->cursor_measure.active_view_count = active_view_count;
+
+	struct u_cursor_measure_result res;
+	if (!oxr_session_cursor_measure_get_result(sess, &res) || !res.valid) {
+		return false;
+	}
+	// Older than ~8 frames: the measurements stopped coming (pointer left,
+	// compositor stopped answering) - not evidence about this frame.
+	const uint64_t newest = sess->cursor_measure.next_tag;
+	if (res.tag == 0 || res.tag > newest || newest - res.tag >= 8) {
+		return false;
+	}
+	if (!res.confident) {
+		return false; // sky, flat wall, repetitive texture: the screen plane
+	}
+	return u_cursor_measure_to_baselines(a, b, g, res.disparity_px, res.sub_w, out_disparity, NULL);
+}
+
 static bool
 oxr_session_cursor_depth_get_result(struct oxr_session *sess, struct u_cursor_depth_patch_result *out)
 {
@@ -2738,6 +2872,9 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 	if (source != NULL && source->source == XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR) {
 		has_content = oxr_session_cursor_depth_from_layer(sess, viewLocateInfo, hint, &a, &g, active_view_count,
 		                                                  &content);
+	} else if (source != NULL && source->source == XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR) {
+		// Spec v7 (ADR-046 Amendment 3): stereo content with no depth.
+		has_content = oxr_session_cursor_depth_measured(sess, hint, &a, &b, &g, active_view_count, &content);
 	} else {
 		const struct xrt_vec3 nearest = {hint->nearestPoint.x, hint->nearestPoint.y, hint->nearestPoint.z};
 		has_content = hint->hasContent && u_cursor_depth_point_disparity(&g, &nearest, &content);
