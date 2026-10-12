@@ -598,6 +598,9 @@ ipc_open_pipe_busy_retry(struct ipc_connection *ipc_c, const char *pipe_name)
 	}
 }
 
+//! Set by ipc_client_connection_disable_service_launch() (#1966).
+static volatile bool g_service_launch_disabled = false;
+
 #if defined(NO_XRT_SERVICE_LAUNCH) || !defined(XRT_SERVICE_EXECUTABLE)
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -610,6 +613,25 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	return pipe_inst;
 }
 #else
+/*!
+ * Start the service OUTSIDE the caller's job object (#1966). The service is a
+ * long-lived daemon; a launcher that lives in a kill-on-close job (the
+ * dashboard's CLI children, a test harness) would otherwise take the service
+ * down with it when that job closes. A job that forbids breakaway refuses the
+ * flag with ERROR_ACCESS_DENIED, and then the plain launch is the best we can do.
+ */
+static BOOL
+ipc_launch_service_process(char *path, STARTUPINFOA *si, PROCESS_INFORMATION *pi)
+{
+	if (CreateProcessA(NULL, path, NULL, NULL, false, CREATE_BREAKAWAY_FROM_JOB, NULL, NULL, si, pi)) {
+		return TRUE;
+	}
+	if (GetLastError() != ERROR_ACCESS_DENIED) {
+		return FALSE;
+	}
+	return CreateProcessA(NULL, path, NULL, NULL, false, 0, NULL, NULL, si, pi);
+}
+
 // N.B. quality of life fallback to try launch the XRT_SERVICE_EXECUTABLE if pipe is not found
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -622,6 +644,10 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 	if (err != ERROR_FILE_NOT_FOUND) {
 		return INVALID_HANDLE_VALUE;
+	}
+	if (g_service_launch_disabled) {
+		SetLastError(err);
+		return INVALID_HANDLE_VALUE; // #1966: this process never starts the service
 	}
 	IPC_INFO(ipc_c, "Trying to launch " XRT_SERVICE_EXECUTABLE "...");
 	HMODULE hmod;
@@ -643,7 +669,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	strcpy(p + 1, XRT_SERVICE_EXECUTABLE);
 	STARTUPINFOA si = {.cb = sizeof(si)};
 	PROCESS_INFORMATION pi;
-	if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
+	if (!ipc_launch_service_process(service_path, &si, &pi)) {
 		char first_path[MAX_PATH];
 		strcpy(first_path, service_path);
 		*p = 0;
@@ -655,7 +681,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			return INVALID_HANDLE_VALUE;
 		}
 		strcpy(p + 1, "service\\" XRT_SERVICE_EXECUTABLE);
-		if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
+		if (!ipc_launch_service_process(service_path, &si, &pi)) {
 			err = GetLastError();
 			IPC_INFO(ipc_c,
 			         "CreateProcessA failed for both %s and %s: %d %s. "
@@ -1065,6 +1091,14 @@ ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *o
 	    "process must run setup_shm / git-tag / describe_client (browser#103).",
 	    fd);
 	return XRT_SUCCESS;
+#endif
+}
+
+void
+ipc_client_connection_disable_service_launch(void)
+{
+#ifdef XRT_OS_WINDOWS
+	g_service_launch_disabled = true;
 #endif
 }
 

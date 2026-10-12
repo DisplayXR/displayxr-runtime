@@ -32,6 +32,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 
 #include "target_plugin_loader.h"
 #include "target_screen_pin.h"
@@ -273,7 +274,7 @@ poke_service(void)
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 	struct ipc_connection ipc_c;
 	memset(&ipc_c, 0, sizeof(ipc_c));
-	if (ipc_client_connection_init(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
+	if (cli_ipc_connect(&ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS) {
 		const xrt_result_t xret = ipc_call_system_request_display_reprobe(&ipc_c);
 		ipc_client_connection_fini(&ipc_c);
 		if (xret == XRT_SUCCESS) {

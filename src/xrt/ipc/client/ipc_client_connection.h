@@ -150,6 +150,21 @@ xrt_result_t
 ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *out_handle);
 
 /*!
+ * Process-wide: never start displayxr-service from this process (#1966).
+ *
+ * On Windows a connect that finds no pipe falls back to launching the service.
+ * A diagnostic must not do that: the dashboard runs the CLI inside a
+ * kill-on-close job, and a pre-connect "is the pipe there?" check cannot close
+ * the window where the service dies between the check and the connect. With
+ * this set, such a connect fails with the pipe's own error instead. Call once,
+ * before the first connect. No effect on POSIX, whose dial never spawns.
+ *
+ * @ingroup ipc_client
+ */
+void
+ipc_client_connection_disable_service_launch(void);
+
+/*!
  * Set up the basics of the client connection: socket and shared mem
  * @param ipc_c     Empty IPC connection struct
  * @param log_level Log level for IPC messages

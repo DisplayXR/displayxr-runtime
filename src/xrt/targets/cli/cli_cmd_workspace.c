@@ -32,6 +32,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 
 #include "xrt/xrt_config_os.h"
 
@@ -78,36 +79,17 @@
 
 #ifdef CLI_HAVE_IPC
 
-//! Is a service listening? Checked BEFORE connecting, because the IPC client
-//! auto-launches displayxr-service when the pipe is missing — a settings read
-//! (the dashboard polls `workspace list`) must never start the service.
-static bool
-service_pipe_present(void)
-{
-#ifdef XRT_OS_WINDOWS
-	if (WaitNamedPipeA("\\\\.\\pipe\\displayxr\\displayxr_comp_ipc", 1)) {
-		return true;
-	}
-	return GetLastError() != ERROR_FILE_NOT_FOUND; // busy / timeout = it exists
-#else
-	return true; // POSIX dial never spawns (socket activation is the OS's job)
-#endif
-}
-
 //! Connect as a DIAG client. False (and @p ipc_c untouched) when no service is
 //! reachable: none running, an elevated prompt on Windows, a version skew.
 static bool
 diag_connect(struct ipc_connection *ipc_c)
 {
-	if (!service_pipe_present()) {
-		return false;
-	}
 	struct xrt_instance_info ii;
 	memset(&ii, 0, sizeof(ii));
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 	memset(ipc_c, 0, sizeof(*ipc_c));
-	return ipc_client_connection_init(ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS;
+	return cli_ipc_connect(ipc_c, U_LOGGING_RAW, &ii) == XRT_SUCCESS;
 }
 
 //! Executable path of process @p pid, or false.

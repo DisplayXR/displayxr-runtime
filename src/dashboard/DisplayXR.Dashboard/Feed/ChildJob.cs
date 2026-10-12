@@ -43,7 +43,10 @@ internal static class ChildJob
             IntPtr h = CreateJobObjectW(IntPtr.Zero, null);
             if (h == IntPtr.Zero) { _failed = true; return IntPtr.Zero; }
             var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // BREAKAWAY_OK (#1966): a process a child starts with CREATE_BREAKAWAY_FROM_JOB leaves the
+            // job. The IPC client starts displayxr-service that way, so a service a CLI child ever
+            // auto-launches is not killed when the dashboard closes.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             int size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
             IntPtr buf = Marshal.AllocHGlobal(size);
             try
@@ -65,6 +68,7 @@ internal static class ChildJob
 
     private const int JobObjectExtendedLimitInformation = 9;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    private const uint JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct JOBOBJECT_BASIC_LIMIT_INFORMATION

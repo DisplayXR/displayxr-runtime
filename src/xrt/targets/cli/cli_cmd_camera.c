@@ -79,6 +79,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 
 #ifdef CLI_HAVE_IPC
 
@@ -206,7 +207,7 @@ cam_connect(struct ipc_connection *ipc_c, uint32_t client_class, uint64_t client
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = client_class;
 	ii.app_info.stereo_camera_client_flags = client_flags;
-	xrt_result_t xret = ipc_client_connection_init(ipc_c, U_LOGGING_ERROR, &ii);
+	xrt_result_t xret = cli_ipc_connect(ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		printf("displayxr-cli camera: not connected to the service (xrt_result=%d).\n", (int)xret);
 		printf("  Is displayxr-service running? On Windows, run from a NON-elevated prompt.\n");
@@ -229,7 +230,7 @@ cam_sharing_is_off(void)
 	struct xrt_instance_info ii = {0};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
-	if (ipc_client_connection_init(&diag, U_LOGGING_ERROR, &ii) != XRT_SUCCESS) {
+	if (cli_ipc_connect(&diag, U_LOGGING_ERROR, &ii) != XRT_SUCCESS) {
 		return false; // cannot tell: report what the enumeration said
 	}
 	uint32_t value = 0;

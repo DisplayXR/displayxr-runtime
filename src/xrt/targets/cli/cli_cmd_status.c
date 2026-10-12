@@ -23,6 +23,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 #include "cli_query.h" // cli_query_handles + teardown
 
 #include "xrt/xrt_config_os.h"
@@ -83,7 +84,7 @@ status_connect(struct ipc_connection *ipc_c, xrt_result_t *out_xret)
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 	memset(ipc_c, 0, sizeof(*ipc_c));
-	const xrt_result_t xret = ipc_client_connection_init(ipc_c, U_LOGGING_ERROR, &ii);
+	const xrt_result_t xret = cli_ipc_connect(ipc_c, U_LOGGING_ERROR, &ii);
 	if (out_xret != NULL) {
 		*out_xret = xret;
 	}
