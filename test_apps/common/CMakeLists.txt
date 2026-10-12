@@ -61,7 +61,9 @@ FetchContent_Declare(
     # depth cursor (ADR-046 Amendment 2); v2.28.0 brought the shared Vulkan frame ring.
     # v2.30.0: dxr::ModeSwitch::step() (common/mode_switch.h), the one-call smooth
     # 2D<->3D sequencer every platform's apps use (displayxr-common#73).
-    GIT_TAG v2.30.0
+    # v2.30.1: the Wayland geometry payload is read by structure, in any key order
+    # (displayxr-common#76) — a KWin publisher's sorted keys crashed the old parser (#1928).
+    GIT_TAG v2.30.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
