@@ -57,6 +57,32 @@ scm_stats(struct scm_fixture *f, uint64_t id, struct xrt_stereo_camera_stream_st
 xrt_result_t
 scm_stream_destroy(struct scm_fixture *f, uint64_t id);
 
+/*
+ * #1961 re-enumeration: a manager over a FAKE display plug-in whose camera
+ * list the test edits (no UVC camera, no background rescan).
+ */
+
+//! The fake plug-in now lists these cameras, in this order (its indices).
+void
+scm_fake_plugin_set(const char *const *identities, const char *const *names, uint32_t count);
+
+uint32_t
+scm_fake_plugin_enumerate_calls(void);
+
+struct scm_fixture *
+scm_create_fake_plugin(void);
+
+//! Forced re-enumeration; true if the camera set changed.
+bool
+scm_rescan(struct scm_fixture *f);
+
+//! Drain one queued event of the fixture's connection.
+bool
+scm_poll_event(struct scm_fixture *f, struct xrt_stereo_camera_event *out);
+
+xrt_result_t
+scm_set_sharing(struct scm_fixture *f, bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

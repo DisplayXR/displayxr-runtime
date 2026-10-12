@@ -16,7 +16,12 @@
 #include "ipc_server_generated.h"
 
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_instance.h"
+#include "xrt/xrt_plugin.h"
+#include "os/os_time.h"
 #include "util/u_camera_consent.h"
+
+#include <stdio.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -117,20 +122,129 @@ struct scm_fixture
 #endif
 };
 
-struct scm_fixture *
-scm_create(const struct u_stereo_uvc_config *cfg)
+/*
+ * A fake display plug-in whose camera list a test edits between rescans
+ * (#1961): no calibration, GRAY8, frames never arrive (wait_frame times out).
+ */
+
+static struct
+{
+	uint32_t count;
+	char identity[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
+	char name[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
+	uint32_t enumerate_calls;
+} g_fake;
+
+struct xrt_plugin_stereo_camera
+{
+	int dummy;
+};
+
+static uint32_t
+fake_enumerate(struct xrt_plugin_instance *inst, uint32_t capacity, struct xrt_plugin_stereo_camera_info *out)
+{
+	(void)inst;
+	g_fake.enumerate_calls++;
+	for (uint32_t i = 0; i < g_fake.count && i < capacity && out != NULL; i++) {
+		struct xrt_plugin_stereo_camera_info *o = &out[i];
+		snprintf(o->display_name, sizeof(o->display_name), "%s", g_fake.name[i]);
+		snprintf(o->device_identity, sizeof(o->device_identity), "%s", g_fake.identity[i]);
+		o->platform_device_hint[0] = '\0';
+		o->flags = XRT_PLUGIN_STEREO_CAMERA_USER_FACING;
+		o->eye_width = 640;
+		o->eye_height = 480;
+		o->max_frame_rate = 0.0f;
+		o->native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+	}
+	return g_fake.count;
+}
+
+static xrt_result_t
+fake_get_calibration(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera_calibration *out)
+{
+	(void)inst;
+	(void)index;
+	(void)out;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+static xrt_result_t
+fake_open(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera **out_cam)
+{
+	(void)inst;
+	(void)index;
+	*out_cam = (struct xrt_plugin_stereo_camera *)calloc(1, sizeof(struct xrt_plugin_stereo_camera));
+	return *out_cam != NULL ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+}
+
+static uint32_t
+fake_wait_frame(struct xrt_plugin_stereo_camera *cam, int64_t timeout_ns, struct xrt_plugin_stereo_camera_frame *out)
+{
+	(void)cam;
+	(void)out;
+	os_nanosleep(timeout_ns < 10000000 ? timeout_ns : 10000000);
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+}
+
+static void
+fake_release_frame(struct xrt_plugin_stereo_camera *cam)
+{
+	(void)cam;
+}
+
+static void
+fake_close(struct xrt_plugin_stereo_camera *cam)
+{
+	free(cam);
+}
+
+static struct xrt_plugin_iface g_fake_iface;
+static struct xrt_instance g_fake_xinst;
+
+static bool
+fake_get_active_plugin(struct xrt_instance *xinst,
+                       const struct xrt_plugin_iface **out_iface,
+                       struct xrt_plugin_instance **out_inst)
+{
+	(void)xinst;
+	*out_iface = &g_fake_iface;
+	*out_inst = NULL;
+	return true;
+}
+
+void
+scm_fake_plugin_set(const char *const *identities, const char *const *names, uint32_t count)
+{
+	g_fake.count = count > XRT_STEREO_CAMERA_MAX_CAMERAS ? XRT_STEREO_CAMERA_MAX_CAMERAS : count;
+	for (uint32_t i = 0; i < g_fake.count; i++) {
+		snprintf(g_fake.identity[i], sizeof(g_fake.identity[i]), "%s", identities[i]);
+		snprintf(g_fake.name[i], sizeof(g_fake.name[i]), "%s", names[i]);
+	}
+}
+
+uint32_t
+scm_fake_plugin_enumerate_calls(void)
+{
+	return g_fake.enumerate_calls;
+}
+
+static struct scm_fixture *
+create_with(const struct u_stereo_uvc_config *cfg, struct xrt_instance *xinst, int32_t rescan_period_ms)
 {
 	struct scm_fixture *f = (struct scm_fixture *)calloc(1, sizeof(*f));
 	if (f == NULL) {
 		return NULL;
 	}
-	f->cfg = *cfg;
+	if (cfg != NULL) {
+		f->cfg = *cfg;
+	}
 	struct ipc_server_stereo_camera_options o;
 	memset(&o, 0, sizeof(o));
 	o.consent_store = &k_store;
 	o.consent_env = &k_env;
-	o.uvc_config = &f->cfg;
-	f->mgr = ipc_server_stereo_camera_create_ex(NULL, &o);
+	o.uvc_config = &f->cfg; // an empty config (count 0) = no UVC camera
+	o.rescan_period_ms = rescan_period_ms;
+	f->mgr = ipc_server_stereo_camera_create_ex(xinst, &o);
 	f->server.stereo_camera = f->mgr;
 	f->ics.server = &f->server;
 	f->ics.client_state.client_class = XRT_CLIENT_CLASS_CAMERA_CONSUMER;
@@ -142,6 +256,49 @@ scm_create(const struct u_stereo_uvc_config *cfg)
 	f->section = -1;
 #endif
 	return f;
+}
+
+struct scm_fixture *
+scm_create(const struct u_stereo_uvc_config *cfg)
+{
+	return create_with(cfg, NULL, 0);
+}
+
+struct scm_fixture *
+scm_create_fake_plugin(void)
+{
+	memset(&g_fake_iface, 0, sizeof(g_fake_iface));
+	g_fake_iface.struct_size = (uint32_t)sizeof(g_fake_iface);
+	g_fake_iface.stereo_camera_enumerate = fake_enumerate;
+	g_fake_iface.stereo_camera_get_calibration = fake_get_calibration;
+	g_fake_iface.stereo_camera_open = fake_open;
+	g_fake_iface.stereo_camera_wait_frame = fake_wait_frame;
+	g_fake_iface.stereo_camera_release_frame = fake_release_frame;
+	g_fake_iface.stereo_camera_close = fake_close;
+	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
+	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
+	return create_with(NULL, &g_fake_xinst, -1); // the test drives every rescan
+}
+
+bool
+scm_rescan(struct scm_fixture *f)
+{
+	return ipc_server_stereo_camera_rescan(f->mgr);
+}
+
+bool
+scm_poll_event(struct scm_fixture *f, struct xrt_stereo_camera_event *out)
+{
+	bool has = false;
+	ipc_handle_stereo_camera_poll_event(&f->ics, &has, out);
+	return has;
+}
+
+xrt_result_t
+scm_set_sharing(struct scm_fixture *f, bool enabled)
+{
+	(void)f;
+	return ipc_server_stereo_camera_set_sharing(enabled, "test") ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
 static void

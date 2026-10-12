@@ -62,6 +62,12 @@
  * XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR (a consent-delegating
  * client opts out of delegation for one instance); delegating entries for a
  * user-writable executable path require a matching code signer (spec §7.1.1).
+ * 4 = no struct change: the camera set is re-enumerated during a service run
+ * (a camera that appears later is appended with a new cameraId; one that
+ * disappears stays listed, UNAVAILABLE, with its cameraId and index) and
+ * XrEventDataStereoCamerasChangedDXR is now delivered to every instance that
+ * enumerated, whenever the set or a camera's displayName / platformDeviceHint
+ * changes.
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1
@@ -74,7 +80,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_stereo_camera 1
-#define XR_DXR_stereo_camera_SPEC_VERSION 3
+#define XR_DXR_stereo_camera_SPEC_VERSION 4
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -128,7 +134,7 @@ typedef XrFlags64 XrStereoCameraFlagsDXR;
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING_BIT_DXR = 0x00000001;
 //! The camera faces the user (a 3D display's front camera).
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_USER_FACING_BIT_DXR = 0x00000002;
-//! Calibration is available for the ACTIVE device (RECTIFIED supported).
+//! Calibration of THIS camera's device is available (RECTIFIED supported).
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_CALIBRATED_BIT_DXR = 0x00000004;
 //! The source already delivers a rectified pair.
 static const XrStereoCameraFlagsDXR XR_STEREO_CAMERA_NATIVELY_RECTIFIED_BIT_DXR = 0x00000008;
@@ -199,7 +205,9 @@ static const XrStereoCameraTransportFlagsDXR XR_STEREO_CAMERA_TRANSPORT_AHARDWAR
 
 /*!
  * One camera, as enumerated. @c cameraId is valid for the service's lifetime
- * and never reused for another camera within it.
+ * and never reused for another camera within it. Spec v4: a camera keeps its
+ * index and cameraId across re-enumerations; one its source no longer lists
+ * stays in the list as UNAVAILABLE (never renumbering the others).
  */
 typedef struct XrStereoCameraPropertiesDXR {
     XrStructureType type;
@@ -335,6 +343,8 @@ typedef struct XrEventDataStereoCameraStateChangedDXR {
     XrStereoCameraStateDXR state;
 } XrEventDataStereoCameraStateChangedDXR;
 
+//! Spec v4: delivered (to every instance that enumerated) when a camera was
+//! added, disappeared / came back, or changed its labels — re-enumerate.
 typedef struct XrEventDataStereoCamerasChangedDXR {
     XrStructureType type;
     const void* XR_MAY_ALIAS next;
@@ -410,12 +420,14 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetStereoCameraStreamStatsDXR)(
 #ifdef XR_EXTENSION_PROTOTYPES
 
 //! Two-call idiom. An in-process instance, a plug-in with no camera, and the
-//! kill switch all report count 0 — indistinguishable on purpose.
+//! kill switch all report count 0 — indistinguishable on purpose. Each call
+//! may re-query the camera sources (spec v4); listen for
+//! XrEventDataStereoCamerasChangedDXR instead of polling.
 XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateStereoCamerasDXR(
     XrInstance instance, XrSystemId systemId, uint32_t capacityInput, uint32_t* countOutput,
     XrStereoCameraPropertiesDXR* cameras);
 
-//! Calibration of the ACTIVE device. Consent-gated (spec §7.1, §7.5).
+//! Calibration of the camera @p cameraId. Consent-gated (spec §7.1, §7.5).
 XRAPI_ATTR XrResult XRAPI_CALL xrGetStereoCameraCalibrationDXR(
     XrInstance instance, uint64_t cameraId, XrStereoCameraCalibrationDXR* calibration);
 

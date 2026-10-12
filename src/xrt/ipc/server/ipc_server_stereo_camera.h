@@ -62,6 +62,12 @@ struct ipc_server_stereo_camera_options
 	const struct u_stereo_uvc_config *uvc_config;
 	//! UVC capture backend (default: os_uvc_capture_backend()).
 	const struct u_stereo_uvc_backend *uvc_backend;
+	/*!
+	 * #1961: background re-enumeration period while a connection listens,
+	 * ms. 0 = the default (2000); < 0 = none (a test drives
+	 * @ref ipc_server_stereo_camera_rescan itself).
+	 */
+	int32_t rescan_period_ms;
 };
 
 struct ipc_server_stereo_camera *
@@ -70,6 +76,17 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 //! Stop every camera thread, close every source, free every stream.
 void
 ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr);
+
+/*!
+ * #1961: re-query every camera source now (no throttle) and merge the result:
+ * unchanged cameras keep their index and id, new ones are appended, ones no
+ * longer listed turn UNAVAILABLE in place; any change queues
+ * XrEventDataStereoCamerasChangedDXR to every listening connection. The
+ * manager also does this on a client's enumerate (at most once a second) and
+ * periodically while a connection listens. Returns true if the set changed.
+ */
+bool
+ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *mgr);
 
 //! Destroy every stream @p ics created. Called once at client teardown.
 void

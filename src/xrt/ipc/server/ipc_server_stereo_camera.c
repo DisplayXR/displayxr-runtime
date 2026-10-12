@@ -47,6 +47,9 @@
  *    while locked or sharing is off) and XrEventDataStereoCameraStreamEndedDXR
  *    are queued per connection (16 deep, oldest dropped) and drained by the
  *    client from xrPollEvent through stereo_camera_poll_event.
+ *    XrEventDataStereoCamerasChangedDXR (#1961) goes to every connection that
+ *    has enumerated or created a stream, whenever a re-enumeration (see
+ *    "Camera discovery" below) or the sharing toggle changes the list.
  *  - indicator + user kill switch: ipc_server_stereo_camera_get_status() feeds
  *    the tray / menu-bar item ("3D camera in use by <app>"); "Stop camera
  *    sharing" = ipc_server_stereo_camera_stop_all() ends every started stream
@@ -95,7 +98,10 @@
  * src_* dispatch is the only place that tells them apart, so consent, the
  * foreground rule, the indicator, linger, rates, rings and rectification are
  * one code path. Plug-in cameras are enumerated first and their
- * platform_device_hints are never claimed by the UVC source. An uncalibrated
+ * platform_device_hints are never claimed by the UVC source. Both sources are
+ * RE-enumerated after create (#1961, "Camera discovery" below) with stable
+ * camera ids: a camera that appears later is appended, one that disappears
+ * turns UNAVAILABLE in place. An uncalibrated
  * UVC pair gets a NOMINAL model (pinhole from its configured HFOV + baseline,
  * parallel, undistorted): the camera reports no CALIBRATED, RAW calibration is
  * FEATURE_NOT_SUPPORTED, and RECTIFIED is a PASS-THROUGH (no remap, nominal
@@ -180,6 +186,10 @@ DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PR
 #define PROMPT_TIMEOUT_MIN_MS 1000u             //!< DXR_STEREO_CAMERA_PROMPT_TIMEOUT_MS clamp (dev only)
 #define PROMPT_TIMEOUT_MAX_MS 600000u
 #define EVQ_CAP 16                              //!< queued events per connection
+#define RESCAN_MIN_INTERVAL_NS (1000ll * 1000 * 1000) //!< #1961: at most one source re-enumeration per second
+#define RESCAN_PERIOD_DEFAULT_MS 2000                 //!< #1961: background re-enumeration while a client listens
+#define UVC_OBJS_MAX                                                                                                   \
+	(XRT_STEREO_CAMERA_MAX_CAMERAS + 2) //!< live u_stereo_uvc resolutions (one per rescan that changed)
 
 
 /*
@@ -382,7 +392,20 @@ struct scam_camera
 	//! enum xrt_stereo_camera_source: the plug-in's slots or the service's UVC source.
 	uint32_t source;
 	uint32_t source_index; //!< the camera's index inside its source
+	//! UVC only: the source resolution this camera opens from (one of mgr->uvc_objs).
+	struct u_stereo_uvc *uvc;
 	uint64_t camera_id;
+	/*!
+	 * #1961: the camera's source stopped listing it at a re-enumeration. It
+	 * keeps its slot, index and camera_id (nothing is renumbered), reports
+	 * UNAVAILABLE, and is never opened; it comes back, same id, if its
+	 * device_identity is listed again.
+	 */
+	bool gone;
+	//! The camera thread is inside src_open (lock released): a rescan must not repoint the source.
+	bool opening;
+	//! A re-enumeration reported different geometry / format / flags (logged once).
+	bool description_drift_logged;
 	struct xrt_plugin_stereo_camera_info info;
 	bool have_calib;
 	//! Amendment 4: @ref calib is a NOMINAL model (an uncalibrated UVC pair):
@@ -432,13 +455,41 @@ struct ipc_server_stereo_camera
 	bool shutting_down;
 	const struct xrt_plugin_iface *iface;
 	struct xrt_plugin_instance *inst;
-	//! Amendment 4: the service's own UVC side-by-side source (NULL = none configured).
-	struct u_stereo_uvc *uvc;
+	/*!
+	 * Amendment 4: the service's own UVC side-by-side source. Each rescan that
+	 * finds the UVC inputs changed resolves a NEW u_stereo_uvc (an open stream
+	 * keeps the one it was opened from); every object some camera still
+	 * references stays here, the rest are freed (uvc_gc_locked).
+	 */
+	struct u_stereo_uvc *uvc_objs[UVC_OBJS_MAX];
+	//! Hash of what the last UVC resolution saw (config, plug-in hints, device ids).
+	uint64_t uvc_fingerprint;
+	bool uvc_scanned_once;
+	//! Test seams, copied from the create options (NULL fields = the real ones).
+	bool have_uvc_config;
+	struct u_stereo_uvc_config uvc_config;
+	bool have_uvc_backend;
+	struct u_stereo_uvc_backend uvc_backend;
+
 	uint32_t camera_count;
 	struct scam_camera cams[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	struct scam_stream streams[MAX_STREAMS];
 	uint64_t next_stream_id;
 	uint64_t next_owner;
+	uint64_t next_camera_id; //!< camera_ids are never reused within a service lifetime
+
+	/*
+	 * #1961 re-enumeration. rescan_lock serialises rescans (and is the only
+	 * thing that adds cameras); it is taken BEFORE lock, never under it, and
+	 * source enumerate / calibration calls run with only rescan_lock held, so
+	 * a camera thread is never blocked behind a plug-in's enumerate.
+	 */
+	struct os_mutex rescan_lock;
+	int64_t last_rescan_ns;
+	uint64_t rescan_period_ns; //!< 0 = no background rescan
+	bool watch_started;
+	struct os_thread watch;
+	struct os_cond watch_cond;
 
 	// R3 privacy.
 	struct u_camera_consent consent;
@@ -912,18 +963,20 @@ source_str(uint32_t source)
 	return source == XRT_STEREO_CAMERA_SOURCE_UVC ? "uvc" : "plug-in";
 }
 
+//! @p source / @p uvc / @p index are the camera's, captured under the manager
+//! lock by the caller (a rescan may update them while this runs unlocked).
 static xrt_result_t
-src_open(struct ipc_server_stereo_camera *m, const struct scam_camera *cam, void **out)
+src_open(struct ipc_server_stereo_camera *m, uint32_t source, struct u_stereo_uvc *uvc, uint32_t index, void **out)
 {
 	*out = NULL;
-	if (cam->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+	if (source == XRT_STEREO_CAMERA_SOURCE_UVC) {
 		struct u_stereo_uvc_stream *s = NULL;
-		xrt_result_t xret = u_stereo_uvc_open(m->uvc, cam->source_index, &s);
+		xrt_result_t xret = u_stereo_uvc_open(uvc, index, &s);
 		*out = s;
 		return xret;
 	}
 	struct xrt_plugin_stereo_camera *pc = NULL;
-	xrt_result_t xret = m->iface->stereo_camera_open(m->inst, cam->source_index, &pc);
+	xrt_result_t xret = m->iface->stereo_camera_open(m->inst, index, &pc);
 	*out = pc;
 	return xret;
 }
@@ -1652,14 +1705,25 @@ camera_thread(void *ptr)
 		}
 
 		if (cam->src == NULL) {
+			if (cam->gone) {
+				// #1961: its source no longer lists it — never open a stale
+				// index (it may name another device now). Start refuses BUSY.
+				os_cond_wait_timeout_ns(&cam->cond, &m->lock, (uint64_t)REOPEN_BACKOFF_NS);
+				continue;
+			}
 			if (now < cam->retry_after_ns) {
 				os_cond_wait_timeout_ns(&cam->cond, &m->lock, (uint64_t)(cam->retry_after_ns - now));
 				continue;
 			}
 			void *src = NULL;
+			const uint32_t source = cam->source;
+			struct u_stereo_uvc *uvc = cam->uvc;
+			const uint32_t src_index = cam->source_index;
+			cam->opening = true; // a rescan leaves uvc / source_index alone meanwhile
 			os_mutex_unlock(&m->lock);
-			xrt_result_t xret = src_open(m, cam, &src);
+			xrt_result_t xret = src_open(m, source, uvc, src_index, &src);
 			os_mutex_lock(&m->lock);
+			cam->opening = false;
 			if (xret != XRT_SUCCESS || src == NULL) {
 				U_LOG_W("stereo camera %llu: %s source open failed (%d); retrying in 1 s",
 				        (unsigned long long)cam->camera_id, source_str(cam->source), (int)xret);
@@ -1759,42 +1823,76 @@ camera_thread(void *ptr)
  *
  */
 
-/*!
- * Validate + register one camera description @p info from @p source at its
- * source index @p source_index. Manager lock not needed (create time).
+/*
+ *
+ * Camera discovery (#1961): ONE routine runs the first enumeration at create
+ * and every later re-enumeration — on a client's enumerate (at most once per
+ * RESCAN_MIN_INTERVAL_NS) and from the background watch thread while some
+ * connection listens for camera events.
+ *
+ * Stability rules, so a re-enumeration never disturbs what clients hold:
+ *  - a camera is matched by (source, device_identity) — the key persistentId
+ *    is derived from — so an unchanged camera keeps its slot, its index in
+ *    the enumeration and its camera_id;
+ *  - slots are never removed or reordered: a camera its source stops listing
+ *    is marked gone and reported UNAVAILABLE in place (its streams end with
+ *    SOURCE_LOST), and comes back with the same id if it is listed again;
+ *  - a new camera is appended with a fresh camera_id (never reused);
+ *  - every source call (enumerate, calibration, UVC resolution) runs with the
+ *    manager lock RELEASED, so a streaming camera thread never waits on it.
+ * Any change queues XrEventDataStereoCamerasChangedDXR to every listening
+ * connection.
+ *
  */
-static struct scam_camera *
-add_camera(struct ipc_server_stereo_camera *m,
-           uint32_t source,
-           uint32_t source_index,
-           struct xrt_plugin_stereo_camera_info *info)
+
+static void
+stream_end_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, uint32_t reason);
+
+//! One camera as its source lists it, staged outside the manager lock.
+struct scam_candidate
 {
-	if (m->camera_count >= XRT_STEREO_CAMERA_MAX_CAMERAS) {
-		U_LOG_W("stereo camera: more than %d cameras — \"%s\" (%s) skipped", XRT_STEREO_CAMERA_MAX_CAMERAS,
-		        info->display_name, source_str(source));
-		return NULL;
-	}
+	uint32_t source;
+	uint32_t source_index;
+	struct u_stereo_uvc *uvc;
+	struct xrt_plugin_stereo_camera_info info;
+	bool skip;                 //!< malformed, a duplicate, or no room
+	struct scam_camera *match; //!< the existing camera it is, NULL = new
+	//! New cameras: id, calibration and rectifier, built before insertion.
+	uint64_t camera_id;
+	bool have_calib, calib_nominal, baseline_known, hfov_known;
+	struct xrt_plugin_stereo_camera_calibration calib;
+	struct scam_rectifier *rect;
+};
+
+static bool
+info_valid(struct xrt_plugin_stereo_camera_info *info)
+{
 	info->display_name[sizeof(info->display_name) - 1] = '\0';
 	info->device_identity[sizeof(info->device_identity) - 1] = '\0';
 	info->platform_device_hint[sizeof(info->platform_device_hint) - 1] = '\0';
-	if (info->eye_width == 0 || info->eye_height == 0 || (info->eye_width & 1u) || (info->eye_height & 1u) ||
-	    info->native_format < XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 ||
-	    info->native_format > XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8) {
-		U_LOG_W("stereo camera: %s camera %u has a malformed description (%ux%u, format %u) — skipped",
-		        source_str(source), source_index, info->eye_width, info->eye_height, info->native_format);
-		return NULL;
+	return info->eye_width != 0 && info->eye_height != 0 && (info->eye_width & 1u) == 0 &&
+	       (info->eye_height & 1u) == 0 && info->native_format >= XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 &&
+	       info->native_format <= XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8;
+}
+
+/*!
+ * Is the listed camera (@p source, @p info at @p source_index) the camera
+ * @p cam? By device_identity — what persistentId is derived from; a camera
+ * whose source gives no identity can only be keyed by its source index.
+ */
+static bool
+same_camera(const struct scam_camera *cam,
+            uint32_t source,
+            uint32_t source_index,
+            const struct xrt_plugin_stereo_camera_info *info)
+{
+	if (cam->source != source) {
+		return false;
 	}
-	struct scam_camera *cam = &m->cams[m->camera_count];
-	cam->index = m->camera_count;
-	cam->source = source;
-	cam->source_index = source_index;
-	cam->camera_id = (uint64_t)m->camera_count + 1; // never reused in this service lifetime
-	cam->info = *info;
-	cam->mgr = m;
-	cam->state = XRT_STEREO_CAMERA_STATE_AVAILABLE;
-	os_cond_init(&cam->cond);
-	m->camera_count++;
-	return cam;
+	if (info->device_identity[0] != '\0') {
+		return strcmp(cam->info.device_identity, info->device_identity) == 0;
+	}
+	return cam->info.device_identity[0] == '\0' && cam->source_index == source_index;
 }
 
 //! Shared tail of camera registration: rectifier, rate sanity, the WARN line.
@@ -1821,46 +1919,77 @@ finish_camera(struct scam_camera *cam)
 	    cam->calib_nominal ? ", NOMINAL model (uncalibrated)" : "");
 }
 
-static void
-add_plugin_cameras(struct ipc_server_stereo_camera *m, struct xrt_instance *xinst)
+//! The active plug-in's cameras (rescan_lock held, manager lock NOT held).
+static uint32_t
+scan_plugin(struct ipc_server_stereo_camera *m, struct scam_candidate *out, uint32_t cap)
 {
-	const struct xrt_plugin_iface *iface = NULL;
-	struct xrt_plugin_instance *inst = NULL;
-	if (xinst == NULL || xinst->get_active_plugin == NULL || !xinst->get_active_plugin(xinst, &iface, &inst) ||
-	    !xrt_plugin_iface_has_stereo_camera(iface)) {
-		U_LOG_I("stereo camera: the active plug-in provides no camera source");
-		return;
+	if (m->iface == NULL) {
+		return 0;
 	}
-	m->iface = iface;
-	m->inst = inst;
-
 	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	memset(infos, 0, sizeof(infos));
 	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
 		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
 	}
-	uint32_t n = iface->stereo_camera_enumerate(inst, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
-	if (n > XRT_STEREO_CAMERA_MAX_CAMERAS) {
-		n = XRT_STEREO_CAMERA_MAX_CAMERAS;
-	}
+	uint32_t n = m->iface->stereo_camera_enumerate(m->inst, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
+	n = n > XRT_STEREO_CAMERA_MAX_CAMERAS ? XRT_STEREO_CAMERA_MAX_CAMERAS : n;
+	n = n > cap ? cap : n;
 	for (uint32_t i = 0; i < n; i++) {
-		struct scam_camera *cam = add_camera(m, XRT_STEREO_CAMERA_SOURCE_PLUGIN, i, &infos[i]);
-		if (cam == NULL) {
-			continue;
-		}
-		if (cam->info.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
-			cam->calib.struct_size = (uint32_t)sizeof(cam->calib);
-			if (iface->stereo_camera_get_calibration(inst, i, &cam->calib) == XRT_SUCCESS) {
-				cam->have_calib = true;
-			} else {
-				U_LOG_W(
-				    "stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
-				    cam->info.display_name);
-				cam->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
-			}
-		}
-		finish_camera(cam);
+		out[i].source = XRT_STEREO_CAMERA_SOURCE_PLUGIN;
+		out[i].source_index = i;
+		out[i].info = infos[i];
 	}
+	return n;
+}
+
+static uint64_t
+fnv1a(uint64_t h, const void *data, size_t size)
+{
+	const uint8_t *p = (const uint8_t *)data;
+	for (size_t i = 0; i < size; i++) {
+		h = (h ^ p[i]) * 0x100000001b3ull;
+	}
+	return h;
+}
+
+static uint64_t
+fnv1a_str(uint64_t h, const char *s)
+{
+	return fnv1a(h, s, strlen(s) + 1);
+}
+
+//! Field by field (struct padding is not hashed): what a UVC resolution depends on.
+static uint64_t
+uvc_config_hash(uint64_t h, const struct u_stereo_uvc_config *cfg)
+{
+	h = fnv1a(h, &cfg->count, sizeof(cfg->count));
+	h = fnv1a(h, &cfg->fake, sizeof(cfg->fake));
+	if (cfg->fake) {
+		const struct u_stereo_uvc_fake_params *f = &cfg->fake_params;
+		h = fnv1a(h, &f->disparity, sizeof(f->disparity));
+		h = fnv1a(h, &f->dy, sizeof(f->dy));
+		h = fnv1a(h, &f->pixel, sizeof(f->pixel));
+		h = fnv1a(h, &f->fps, sizeof(f->fps));
+	}
+	for (uint32_t i = 0; i < cfg->count && i < U_STEREO_UVC_MAX_ENTRIES; i++) {
+		const struct u_stereo_uvc_entry *e = &cfg->entries[i];
+		h = fnv1a_str(h, e->name_contains);
+		h = fnv1a(h, &e->match_vid_pid, sizeof(e->match_vid_pid));
+		h = fnv1a(h, &e->vid, sizeof(e->vid));
+		h = fnv1a(h, &e->pid, sizeof(e->pid));
+		h = fnv1a_str(h, e->display_name);
+		h = fnv1a(h, &e->layout, sizeof(e->layout));
+		h = fnv1a(h, &e->swap_eyes, sizeof(e->swap_eyes));
+		h = fnv1a(h, &e->mode_width, sizeof(e->mode_width));
+		h = fnv1a(h, &e->mode_height, sizeof(e->mode_height));
+		h = fnv1a(h, &e->mode_fps, sizeof(e->mode_fps));
+		h = fnv1a(h, &e->eye_width, sizeof(e->eye_width));
+		h = fnv1a(h, &e->eye_height, sizeof(e->eye_height));
+		h = fnv1a(h, &e->baseline_mm, sizeof(e->baseline_mm));
+		h = fnv1a(h, &e->hfov_deg, sizeof(e->hfov_deg));
+		h = fnv1a_str(h, e->calibration);
+	}
+	return h;
 }
 
 /*!
@@ -1868,70 +1997,497 @@ add_plugin_cameras(struct ipc_server_stereo_camera *m, struct xrt_instance *xins
  * no config (stereo-cameras.json / DXR_STEREO_CAMERA_UVC_CONFIG) nothing is
  * enumerated and no device is touched. Never claims a device a plug-in camera
  * names as its platform_device_hint (the tracker camera is the plug-in's).
+ *
+ * #1961: the config, the plug-in hints and the OS device list (ids only —
+ * listing never opens a device) are hashed; only when the hash moved is a NEW
+ * u_stereo_uvc resolved (@p out_obj), so an unchanged setup costs one config
+ * read + one device listing per rescan and logs nothing.
+ *
+ * @return false = nothing changed since the last resolution (leave the UVC
+ *         cameras as they are); true = @p out / @p out_obj are the truth.
  */
-static void
-add_uvc_cameras(struct ipc_server_stereo_camera *m, const struct ipc_server_stereo_camera_options *opts)
+static bool
+scan_uvc(struct ipc_server_stereo_camera *m,
+         bool initial,
+         bool room,
+         const struct scam_candidate *plugin,
+         uint32_t plugin_count,
+         struct scam_candidate *out,
+         uint32_t cap,
+         uint32_t *out_count,
+         struct u_stereo_uvc **out_obj)
 {
+	*out_count = 0;
+	*out_obj = NULL;
+
 	struct u_stereo_uvc_config cfg;
-	if (opts != NULL && opts->uvc_config != NULL) {
-		cfg = *opts->uvc_config;
+	memset(&cfg, 0, sizeof(cfg));
+	char path[1024] = {0}, err[256] = {0};
+	enum u_stereo_uvc_config_load_result r = U_STEREO_UVC_CONFIG_OK;
+	if (m->have_uvc_config) {
+		cfg = m->uvc_config;
 	} else {
-		char path[1024], err[256];
-		enum u_stereo_uvc_config_load_result r =
-		    u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
-		if (r == U_STEREO_UVC_CONFIG_INVALID) {
-			U_LOG_W("stereo camera (uvc): config \"%s\" is INVALID (%s) — no UVC camera", path, err);
-			return;
-		}
-		if (r != U_STEREO_UVC_CONFIG_OK) {
-			U_LOG_I("stereo camera (uvc): no UVC stereo camera configured (%s: %s)", path[0] ? path : "-",
-			        err);
-			return;
-		}
-		U_LOG_W("stereo camera (uvc): config \"%s\": %u entr%s%s", path, cfg.count,
-		        cfg.count == 1 ? "y" : "ies",
-		        cfg.fake ? ", FAKE synthetic device (no real camera is considered)" : "");
+		r = u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
 	}
-	if (cfg.count == 0) {
-		return;
-	}
+
 	const char *hints[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	uint32_t nh = 0;
-	for (uint32_t i = 0; i < m->camera_count; i++) {
-		if (m->cams[i].info.platform_device_hint[0] != '\0') {
-			hints[nh++] = m->cams[i].info.platform_device_hint;
+	for (uint32_t i = 0; i < plugin_count && nh < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
+		if (plugin[i].info.platform_device_hint[0] != '\0') {
+			hints[nh++] = plugin[i].info.platform_device_hint;
 		}
 	}
 	struct u_stereo_uvc_backend os_backend;
 	const struct u_stereo_uvc_backend *backend = NULL;
-	if (opts != NULL && opts->uvc_backend != NULL) {
-		backend = opts->uvc_backend;
+	if (m->have_uvc_backend) {
+		backend = &m->uvc_backend;
 	} else if (os_uvc_capture_backend(&os_backend)) {
 		backend = &os_backend;
 	}
-	m->uvc = u_stereo_uvc_create(&cfg, backend, hints, nh);
 
+	uint64_t fp = 0xcbf29ce484222325ull;
+	fp = fnv1a(fp, &r, sizeof(r));
+	const bool configured = r == U_STEREO_UVC_CONFIG_OK && cfg.count > 0;
+	if (configured) {
+		fp = uvc_config_hash(fp, &cfg);
+		for (uint32_t i = 0; i < nh; i++) {
+			fp = fnv1a_str(fp, hints[i]);
+		}
+		if (!cfg.fake && backend != NULL && backend->enumerate != NULL) {
+			struct u_stereo_uvc_device devs[U_STEREO_UVC_MAX_DEVICES];
+			memset(devs, 0, sizeof(devs));
+			uint32_t nd = backend->enumerate(backend->ctx, devs, U_STEREO_UVC_MAX_DEVICES);
+			nd = nd > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : nd;
+			for (uint32_t i = 0; i < nd; i++) {
+				devs[i].id[sizeof(devs[i].id) - 1] = '\0';
+				fp = fnv1a_str(fp, devs[i].id);
+			}
+		}
+	}
+	if (m->uvc_scanned_once && fp == m->uvc_fingerprint) {
+		return false;
+	}
+	if (configured && !room) {
+		// Every resolution slot is held by a camera: try again on a later rescan.
+		return false;
+	}
+	m->uvc_fingerprint = fp;
+	m->uvc_scanned_once = true;
+
+	if (!m->have_uvc_config) {
+		if (r == U_STEREO_UVC_CONFIG_INVALID) {
+			U_LOG_W("stereo camera (uvc): config \"%s\" is INVALID (%s) — no UVC camera", path, err);
+		} else if (r != U_STEREO_UVC_CONFIG_OK) {
+			U_LOG_I("stereo camera (uvc): no UVC stereo camera configured (%s: %s)", path[0] ? path : "-",
+			        err);
+		} else {
+			U_LOG_W("stereo camera (uvc): %sconfig \"%s\": %u entr%s%s", initial ? "" : "re-resolving, ",
+			        path, cfg.count, cfg.count == 1 ? "y" : "ies",
+			        cfg.fake ? ", FAKE synthetic device (no real camera is considered)" : "");
+		}
+	}
+	if (!configured) {
+		return true;
+	}
+
+	struct u_stereo_uvc *obj = u_stereo_uvc_create(&cfg, backend, hints, nh);
 	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	memset(infos, 0, sizeof(infos));
 	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
 		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
 	}
-	uint32_t n = u_stereo_uvc_enumerate(m->uvc, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
+	uint32_t n = u_stereo_uvc_enumerate(obj, XRT_STEREO_CAMERA_MAX_CAMERAS, infos);
 	n = n > XRT_STEREO_CAMERA_MAX_CAMERAS ? XRT_STEREO_CAMERA_MAX_CAMERAS : n;
+	n = n > cap ? cap : n;
 	for (uint32_t i = 0; i < n; i++) {
-		struct scam_camera *cam = add_camera(m, XRT_STEREO_CAMERA_SOURCE_UVC, i, &infos[i]);
-		if (cam == NULL) {
+		out[i].source = XRT_STEREO_CAMERA_SOURCE_UVC;
+		out[i].source_index = i;
+		out[i].uvc = obj;
+		out[i].info = infos[i];
+	}
+	*out_count = n;
+	*out_obj = obj;
+	return true;
+}
+
+//! Free every UVC resolution no camera references (an open stream's camera does).
+static void
+uvc_gc_locked(struct ipc_server_stereo_camera *m)
+{
+	for (uint32_t k = 0; k < UVC_OBJS_MAX; k++) {
+		if (m->uvc_objs[k] == NULL) {
 			continue;
 		}
-		cam->calib.struct_size = (uint32_t)sizeof(cam->calib);
-		bool nominal = true;
-		if (u_stereo_uvc_get_calibration(m->uvc, i, &cam->calib, &nominal, &cam->baseline_known,
-		                                 &cam->hfov_known) == XRT_SUCCESS) {
-			cam->have_calib = true;
-			cam->calib_nominal = nominal;
+		bool used = false;
+		for (uint32_t i = 0; i < m->camera_count; i++) {
+			used |= m->cams[i].uvc == m->uvc_objs[k];
 		}
-		finish_camera(cam);
+		if (!used) {
+			u_stereo_uvc_destroy(&m->uvc_objs[k]);
+		}
 	}
+}
+
+static bool
+uvc_has_room_locked(struct ipc_server_stereo_camera *m)
+{
+	uvc_gc_locked(m);
+	for (uint32_t k = 0; k < UVC_OBJS_MAX; k++) {
+		if (m->uvc_objs[k] == NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Is any connection listening for camera events (it enumerated or created a stream)?
+static bool
+has_listener_locked(const struct ipc_server_stereo_camera *m)
+{
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		if (m->evq[i].owner != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Queue XrEventDataStereoCamerasChangedDXR to every listening connection (coalesced).
+static void
+notify_cameras_changed_locked(struct ipc_server_stereo_camera *m)
+{
+	const struct xrt_stereo_camera_event ev = {.kind = XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED};
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		struct scam_evq *q = &m->evq[i];
+		if (q->owner == 0) {
+			continue;
+		}
+		if (q->count > 0 &&
+		    q->ev[(q->head + q->count - 1) % EVQ_CAP].kind == XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) {
+			continue; // one pending "re-enumerate" is enough
+		}
+		evq_push_locked(m, q->owner, &ev);
+	}
+}
+
+//! A known camera listed again: revive it, follow its source index, refresh its labels.
+static bool
+refresh_camera_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam, const struct scam_candidate *c)
+{
+	(void)m;
+	bool changed = false;
+	if (cam->src == NULL && !cam->opening) {
+		// Where to open it next time. An open (or opening) camera keeps the
+		// source it was opened from; it is repointed after it closes.
+		cam->source_index = c->source_index;
+		if (c->uvc != NULL) {
+			cam->uvc = c->uvc;
+		}
+	}
+	if (cam->gone) {
+		cam->gone = false;
+		cam->retry_after_ns = 0;
+		U_LOG_W("stereo camera %llu \"%s\": listed again by its %s source — back, same id",
+		        (unsigned long long)cam->camera_id, c->info.display_name, source_str(cam->source));
+		if (cam->src == NULL) {
+			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_AVAILABLE);
+		}
+		changed = true;
+	}
+	if (strcmp(cam->info.display_name, c->info.display_name) != 0) {
+		U_LOG_W("stereo camera %llu: display name \"%s\" -> \"%s\"", (unsigned long long)cam->camera_id,
+		        cam->info.display_name, c->info.display_name);
+		snprintf(cam->info.display_name, sizeof(cam->info.display_name), "%s", c->info.display_name);
+		changed = true;
+	}
+	if (strcmp(cam->info.platform_device_hint, c->info.platform_device_hint) != 0) {
+		snprintf(cam->info.platform_device_hint, sizeof(cam->info.platform_device_hint), "%s",
+		         c->info.platform_device_hint);
+		changed = true;
+	}
+	if (c->info.max_frame_rate > 0.0f && c->info.max_frame_rate <= 1000.0f) {
+		cam->info.max_frame_rate = c->info.max_frame_rate; // a rate the source learned since
+	}
+	if ((cam->info.eye_width != c->info.eye_width || cam->info.eye_height != c->info.eye_height ||
+	     cam->info.native_format != c->info.native_format || cam->info.flags != c->info.flags) &&
+	    !cam->description_drift_logged) {
+		// Streams, rings and the rectifier are sized from the first
+		// description; swapping it under them is not safe. Kept until the
+		// service restarts.
+		cam->description_drift_logged = true;
+		U_LOG_W(
+		    "stereo camera %llu \"%s\": its source now describes it as %ux%u format %u flags 0x%x (was %ux%u "
+		    "format %u flags 0x%x) — the first description is kept until the service restarts",
+		    (unsigned long long)cam->camera_id, cam->info.display_name, c->info.eye_width, c->info.eye_height,
+		    c->info.native_format, c->info.flags, cam->info.eye_width, cam->info.eye_height,
+		    cam->info.native_format, cam->info.flags);
+	}
+	return changed;
+}
+
+//! A known camera its source no longer lists: UNAVAILABLE in place, its streams end.
+static void
+vanish_camera_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam)
+{
+	cam->gone = true;
+	uint32_t ended = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		struct scam_stream *s = &m->streams[i];
+		if (s->used && s->camera == cam->index && !s->ended) {
+			stream_end_locked(m, s, XRT_STEREO_CAMERA_END_SOURCE_LOST);
+			ended++;
+		}
+	}
+	U_LOG_W(
+	    "stereo camera %llu \"%s\": no longer listed by its %s source — UNAVAILABLE (id and index kept), %u "
+	    "stream(s) ended",
+	    (unsigned long long)cam->camera_id, cam->info.display_name, source_str(cam->source), ended);
+	set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+}
+
+static void
+insert_camera_locked(struct ipc_server_stereo_camera *m, struct scam_candidate *c)
+{
+	struct scam_camera *cam = &m->cams[m->camera_count];
+	cam->index = m->camera_count;
+	cam->source = c->source;
+	cam->source_index = c->source_index;
+	cam->uvc = c->uvc;
+	cam->camera_id = c->camera_id;
+	cam->info = c->info;
+	cam->have_calib = c->have_calib;
+	cam->calib_nominal = c->calib_nominal;
+	cam->baseline_known = c->baseline_known;
+	cam->hfov_known = c->hfov_known;
+	cam->calib = c->calib;
+	cam->rect = c->rect;
+	c->rect = NULL;
+	cam->mgr = m;
+	cam->state = XRT_STEREO_CAMERA_STATE_AVAILABLE;
+	os_cond_init(&cam->cond);
+	m->camera_count++;
+}
+
+/*!
+ * Re-query every camera source and merge the result into the camera list
+ * (see the block comment above). @p force skips the once-per-second throttle;
+ * @p initial is the create-time enumeration (no event, nobody listens yet).
+ * Takes rescan_lock then the manager lock itself; call with neither held.
+ * @return true if the camera set changed.
+ */
+static bool
+rescan(struct ipc_server_stereo_camera *m, bool force, bool initial)
+{
+	os_mutex_lock(&m->rescan_lock);
+	os_mutex_lock(&m->lock);
+	const int64_t now = os_monotonic_get_ns();
+	bool skip = m->shutting_down || m->consent.kill_switch || (!initial && !m->sharing_enabled) ||
+	            (!force && m->last_rescan_ns != 0 && now - m->last_rescan_ns < RESCAN_MIN_INTERVAL_NS);
+	if (!skip) {
+		m->last_rescan_ns = now;
+	}
+	const bool uvc_room = !skip && uvc_has_room_locked(m);
+	os_mutex_unlock(&m->lock);
+	if (skip) {
+		os_mutex_unlock(&m->rescan_lock);
+		return false;
+	}
+
+	// 1. List (no manager lock): the plug-in, then UVC (it avoids the plug-in's devices).
+	const uint32_t cap = 2 * XRT_STEREO_CAMERA_MAX_CAMERAS;
+	struct scam_candidate *cands = U_TYPED_ARRAY_CALLOC(struct scam_candidate, cap);
+	if (cands == NULL) {
+		os_mutex_unlock(&m->rescan_lock);
+		return false;
+	}
+	const bool plugin_scanned = m->iface != NULL;
+	const uint32_t np = scan_plugin(m, cands, XRT_STEREO_CAMERA_MAX_CAMERAS);
+	uint32_t nu = 0;
+	struct u_stereo_uvc *uvc_obj = NULL;
+	const bool uvc_scanned =
+	    scan_uvc(m, initial, uvc_room, cands, np, cands + np, XRT_STEREO_CAMERA_MAX_CAMERAS, &nu, &uvc_obj);
+	const uint32_t n = np + nu;
+
+	// 2. Match against the known cameras; reserve ids for new ones (locked).
+	os_mutex_lock(&m->lock);
+	uint32_t room = XRT_STEREO_CAMERA_MAX_CAMERAS - m->camera_count;
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_candidate *c = &cands[i];
+		const bool valid = info_valid(&c->info); // also NUL-terminates the strings
+		for (uint32_t k = 0; k < m->camera_count && c->match == NULL; k++) {
+			if (same_camera(&m->cams[k], c->source, c->source_index, &c->info)) {
+				c->match = &m->cams[k];
+			}
+		}
+		if (!valid) {
+			// A known camera listed with a malformed description is still
+			// listed (not gone); it is just not refreshed from this one.
+			c->skip = true;
+			if (initial) {
+				U_LOG_W(
+				    "stereo camera: %s camera %u has a malformed description (%ux%u, format %u) — "
+				    "skipped",
+				    source_str(c->source), c->source_index, c->info.eye_width, c->info.eye_height,
+				    c->info.native_format);
+			}
+			continue;
+		}
+		for (uint32_t k = 0; k < i && !c->skip; k++) {
+			// A source listing one device twice: the first entry wins.
+			const struct scam_candidate *o = &cands[k];
+			c->skip = !o->skip && o->source == c->source && c->info.device_identity[0] != '\0' &&
+			          strcmp(o->info.device_identity, c->info.device_identity) == 0;
+		}
+		if (c->skip || c->match != NULL) {
+			continue;
+		}
+		if (room == 0) {
+			c->skip = true;
+			if (initial) {
+				U_LOG_W("stereo camera: more than %d cameras — \"%s\" (%s) skipped",
+				        XRT_STEREO_CAMERA_MAX_CAMERAS, c->info.display_name, source_str(c->source));
+			}
+			continue;
+		}
+		room--;
+		c->camera_id = ++m->next_camera_id; // never reused in this service lifetime
+	}
+	os_mutex_unlock(&m->lock);
+
+	// 3. Build each NEW camera (calibration, rectifier) — no manager lock.
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_candidate *c = &cands[i];
+		if (c->skip || c->match != NULL) {
+			continue;
+		}
+		c->calib.struct_size = (uint32_t)sizeof(c->calib);
+		if (c->source == XRT_STEREO_CAMERA_SOURCE_UVC) {
+			bool nominal = true;
+			if (u_stereo_uvc_get_calibration(c->uvc, c->source_index, &c->calib, &nominal,
+			                                 &c->baseline_known, &c->hfov_known) == XRT_SUCCESS) {
+				c->have_calib = true;
+				c->calib_nominal = nominal;
+			}
+		} else if (c->info.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
+			if (m->iface->stereo_camera_get_calibration(m->inst, c->source_index, &c->calib) ==
+			    XRT_SUCCESS) {
+				c->have_calib = true;
+			} else {
+				U_LOG_W(
+				    "stereo camera: \"%s\" claims CALIBRATED but returned no calibration — RAW only",
+				    c->info.display_name);
+				c->info.flags &= ~XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
+			}
+		}
+		// finish_camera works on a camera: run it on a scratch one, keep the results.
+		struct scam_camera *tmp = U_TYPED_CALLOC(struct scam_camera);
+		if (tmp == NULL) {
+			c->skip = true;
+			continue;
+		}
+		tmp->source = c->source;
+		tmp->camera_id = c->camera_id;
+		tmp->info = c->info;
+		tmp->have_calib = c->have_calib;
+		tmp->calib_nominal = c->calib_nominal;
+		tmp->calib = c->calib;
+		tmp->mgr = m;
+		finish_camera(tmp);
+		c->info = tmp->info;
+		c->rect = tmp->rect;
+		free(tmp);
+	}
+
+	// 4. Merge (locked).
+	os_mutex_lock(&m->lock);
+	bool changed = false;
+	bool seen[XRT_STEREO_CAMERA_MAX_CAMERAS] = {false};
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_candidate *c = &cands[i];
+		if (c->match != NULL && !c->skip) {
+			seen[c->match->index] = true;
+			changed |= refresh_camera_locked(m, c->match, c);
+		} else if (c->match != NULL) {
+			// A malformed re-listing of a known camera still says "it is there".
+			seen[c->match->index] = true;
+		}
+	}
+	const uint32_t known = m->camera_count;
+	for (uint32_t i = 0; i < n; i++) {
+		struct scam_candidate *c = &cands[i];
+		if (c->skip || c->match != NULL || m->camera_count >= XRT_STEREO_CAMERA_MAX_CAMERAS) {
+			continue;
+		}
+		if (!initial) {
+			U_LOG_W("stereo camera %llu \"%s\": NEW — listed by the %s source since the last enumeration",
+			        (unsigned long long)c->camera_id, c->info.display_name, source_str(c->source));
+		}
+		insert_camera_locked(m, c);
+		changed = true;
+	}
+	for (uint32_t i = 0; i < known; i++) {
+		struct scam_camera *cam = &m->cams[i];
+		const bool scanned = cam->source == XRT_STEREO_CAMERA_SOURCE_UVC ? uvc_scanned : plugin_scanned;
+		if (!seen[i] && !cam->gone && scanned) {
+			vanish_camera_locked(m, cam);
+			changed = true;
+		}
+	}
+	if (uvc_obj != NULL) {
+		for (uint32_t k = 0; k < UVC_OBJS_MAX; k++) {
+			if (m->uvc_objs[k] == NULL) {
+				m->uvc_objs[k] = uvc_obj; // uvc_room said one is free
+				uvc_obj = NULL;
+				break;
+			}
+		}
+	}
+	uvc_gc_locked(m);
+	if (changed && !initial) {
+		notify_cameras_changed_locked(m);
+	}
+	os_mutex_unlock(&m->lock);
+
+	u_stereo_uvc_destroy(&uvc_obj); // only if no slot took it (cannot happen; defensive)
+	for (uint32_t i = 0; i < n; i++) {
+		if (cands[i].rect != NULL) {
+			rectifier_destroy(&cands[i].rect); // built, then out of room
+		}
+	}
+	free(cands);
+	os_mutex_unlock(&m->rescan_lock);
+	if (changed && !initial) {
+		indicator_changed(m); // a vanished camera may have ended streams
+	}
+	return changed;
+}
+
+/*!
+ * #1961: the background half of re-enumeration. While at least one
+ * connection listens for camera events, re-query the sources every
+ * rescan_period_ns so a camera that appears (a tracker that starts late, a
+ * display plugged in) or disappears reaches clients as
+ * XrEventDataStereoCamerasChangedDXR without anyone polling enumerate.
+ */
+static void *
+watch_thread(void *ptr)
+{
+	struct ipc_server_stereo_camera *m = (struct ipc_server_stereo_camera *)ptr;
+	os_mutex_lock(&m->lock);
+	while (!m->shutting_down) {
+		os_cond_wait_timeout_ns(&m->watch_cond, &m->lock, m->rescan_period_ns);
+		if (m->shutting_down) {
+			break;
+		}
+		const bool listening = has_listener_locked(m);
+		os_mutex_unlock(&m->lock);
+		if (listening) {
+			(void)rescan(m, false, false);
+		}
+		os_mutex_lock(&m->lock);
+	}
+	os_mutex_unlock(&m->lock);
+	return NULL;
 }
 
 struct ipc_server_stereo_camera *
@@ -1946,10 +2502,23 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 	struct ipc_server_stereo_camera *m = U_TYPED_CALLOC(struct ipc_server_stereo_camera);
 	os_mutex_init(&m->lock);
 	os_mutex_init(&m->consent_lock);
+	os_mutex_init(&m->rescan_lock);
+	os_cond_init(&m->watch_cond);
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
 		m->streams[i].section = XRT_SHMEM_HANDLE_INVALID;
 		m->streams[i].section_ro = XRT_SHMEM_HANDLE_INVALID;
 	}
+	if (opts != NULL && opts->uvc_config != NULL) {
+		m->have_uvc_config = true;
+		m->uvc_config = *opts->uvc_config;
+	}
+	if (opts != NULL && opts->uvc_backend != NULL) {
+		m->have_uvc_backend = true;
+		m->uvc_backend = *opts->uvc_backend;
+	}
+	int32_t period_ms =
+	    opts != NULL && opts->rescan_period_ms != 0 ? opts->rescan_period_ms : RESCAN_PERIOD_DEFAULT_MS;
+	m->rescan_period_ns = period_ms > 0 ? (uint64_t)period_ms * 1000000ull : 0;
 
 	// R3: the consent policy over the real store; the prompt arrives later
 	// from the host (tray / menu bar) through set_prompt_provider.
@@ -1999,10 +2568,27 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		    "stereo camera: consent prompt disabled (DXR_STEREO_CAMERA_PROMPT=0) — an app without a stored "
 		    "or delegated consent is refused");
 	}
+	const struct xrt_plugin_iface *iface = NULL;
+	struct xrt_plugin_instance *inst = NULL;
+	if (xinst != NULL && xinst->get_active_plugin != NULL && xinst->get_active_plugin(xinst, &iface, &inst) &&
+	    xrt_plugin_iface_has_stereo_camera(iface)) {
+		m->iface = iface;
+		m->inst = inst;
+	} else {
+		U_LOG_I("stereo camera: the active plug-in provides no camera source");
+	}
 	// Plug-in cameras first: their platform_device_hints keep the UVC source
 	// off the devices they own.
-	add_plugin_cameras(m, xinst);
-	add_uvc_cameras(m, opts);
+	(void)rescan(m, true, true);
+	if (m->rescan_period_ns > 0) {
+		os_thread_init(&m->watch);
+		if (os_thread_start(&m->watch, watch_thread, m) == 0) {
+			m->watch_started = true;
+		} else {
+			U_LOG_W(
+			    "stereo camera: re-enumeration thread failed to start — cameras refresh on enumerate only");
+		}
+	}
 	return m;
 }
 
@@ -2015,10 +2601,19 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 	}
 	os_mutex_lock(&m->lock);
 	m->shutting_down = true;
+	os_cond_broadcast(&m->watch_cond);
 	for (uint32_t i = 0; i < m->camera_count; i++) {
 		os_cond_broadcast(&m->cams[i].cond);
 	}
 	os_mutex_unlock(&m->lock);
+	if (m->watch_started) {
+		os_thread_join(&m->watch);
+		os_thread_destroy(&m->watch);
+	}
+	// No rescan can run past this point (shutting_down) or be running (it
+	// holds rescan_lock until it returns).
+	os_mutex_lock(&m->rescan_lock);
+	os_mutex_unlock(&m->rescan_lock);
 	for (uint32_t i = 0; i < m->camera_count; i++) {
 		if (m->cams[i].thread_started) {
 			os_thread_join(&m->cams[i].thread);
@@ -2033,15 +2628,25 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr)
 			stream_free_storage(&m->streams[i]);
 		}
 	}
-	// Every camera thread has closed its source above: the UVC source can go.
-	u_stereo_uvc_destroy(&m->uvc);
+	// Every camera thread has closed its source above: the UVC resolutions can go.
+	for (uint32_t k = 0; k < UVC_OBJS_MAX; k++) {
+		u_stereo_uvc_destroy(&m->uvc_objs[k]);
+	}
 	if (g_mgr == m) {
 		g_mgr = NULL;
 	}
+	os_cond_destroy(&m->watch_cond);
+	os_mutex_destroy(&m->rescan_lock);
 	os_mutex_destroy(&m->consent_lock);
 	os_mutex_destroy(&m->lock);
 	free(m);
 	*mgr_ptr = NULL;
+}
+
+bool
+ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *m)
+{
+	return m != NULL && rescan(m, true, false);
 }
 
 static void
@@ -2133,7 +2738,14 @@ ipc_handle_stereo_camera_count(volatile struct ipc_client_state *ics, uint32_t *
 	if (require_camera_client(ics, "stereo_camera_count") != XRT_SUCCESS || m == NULL) {
 		return XRT_SUCCESS; // zero cameras, indistinguishable from "none" on purpose
 	}
+	// #1961: an enumerate re-queries the sources (throttled to once a second;
+	// source calls run without the manager lock, so streams never wait).
+	(void)rescan(m, false, false);
 	os_mutex_lock(&m->lock);
+	// #1961: a connection that enumerated LISTENS from now on — it is told
+	// XrEventDataStereoCamerasChangedDXR whenever the list changes, and keeps
+	// the background re-enumeration running while it is connected.
+	(void)evq_for_owner_locked(m, owner_of(m, ics), true);
 	// Spec §2 / §7.4: sharing off = zero cameras, indistinguishable from none.
 	*out_count = m->sharing_enabled ? m->camera_count : 0;
 	os_mutex_unlock(&m->lock);
@@ -2502,8 +3114,9 @@ ipc_handle_stereo_camera_stream_start(volatile struct ipc_client_state *ics, uin
 	struct scam_camera *cam = &m->cams[s->camera];
 	// BUSY: the plug-in could not open the source and its retry is still
 	// pending — distinct from "refused", so a browser maps it to NotReadableError.
-	if (cam->state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE && cam->src == NULL &&
-	    os_monotonic_get_ns() < cam->retry_after_ns) {
+	// #1961: so is a camera its source no longer lists (gone, UNAVAILABLE).
+	if (cam->gone || (cam->state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE && cam->src == NULL &&
+	                  os_monotonic_get_ns() < cam->retry_after_ns)) {
 		os_mutex_unlock(&m->lock);
 		U_LOG_W("stereo camera %llu: stream %llu start refused — source unavailable (BUSY), retry later",
 		        (unsigned long long)cam->camera_id, (unsigned long long)s->id);
@@ -2898,6 +3511,8 @@ ipc_server_stereo_camera_set_sharing(bool enabled, const char *why)
 			(void)stop_all_locked(m, XRT_STEREO_CAMERA_END_DISABLED);
 		}
 		notify_all_cameras_locked(m);
+		// The enumerated set goes N -> 0 (off) or 0 -> N (on).
+		notify_cameras_changed_locked(m);
 	}
 	os_mutex_unlock(&m->lock);
 	if (changed) {
