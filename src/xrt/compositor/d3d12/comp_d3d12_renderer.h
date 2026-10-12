@@ -224,6 +224,19 @@ struct comp_d3d12_cursor_quads
 	const struct u_cursor_draw_request *req;
 	//! #1952: run every check, draw nothing (the request is report-only).
 	bool report_only;
+	/*!
+	 * ADR-046 Amendment 2 B.7: crosstalk softening of the lifted cursor
+	 * (the twin of comp_d3d11_cursor_quads'). False = the crisp draw
+	 * (corners as above, uv 0..1). True: @ref soft_corners holds the
+	 * corners padded by the blur radius (u_cursor_draw_soften_quad), @ref uv
+	 * the matching texture coordinates per tile, and @ref soften per tile =
+	 * (blur radius u, v in sprite uv, opacity, unused). @ref corners stay
+	 * crisp, so a renderer that cannot soften draws the unsoftened cursor.
+	 */
+	bool soft;
+	float soft_corners[XRT_MAX_VIEWS][4][2];
+	float uv[XRT_MAX_VIEWS][4][2];
+	float soften[XRT_MAX_VIEWS][4];
 };
 
 /*!
