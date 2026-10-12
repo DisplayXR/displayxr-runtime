@@ -4458,6 +4458,23 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 		return true;
 	}
 	if (msc->shared_atlas_initialized) {
+		// The atlas framebuffers are rebuilt lazily, keyed on the view HANDLE —
+		// but a freshly created view can come back with the very handle value
+		// of the one destroyed below, and then the key matches and the old
+		// framebuffer (old extent, destroyed attachment) is reused: garbage
+		// on screen. Only reachable when the atlas is RESIZED, which the macOS
+		// / Linux fixed window never does and an Android overlay does on
+		// rotation (#1006). So drop both framebuffers explicitly here.
+		if (msc->shared_atlas_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_fb, NULL);
+			msc->shared_atlas_fb = VK_NULL_HANDLE;
+		}
+		msc->shared_atlas_fb_view = VK_NULL_HANDLE;
+		if (msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		}
+		msc->shared_atlas_deco_fb_view = VK_NULL_HANDLE;
 		// The #1795 deco framebuffer is rebuilt lazily, keyed on the deco view
 		// (the same pattern as shared_atlas_fb).
 		if (msc->shared_atlas_deco_view != VK_NULL_HANDLE)
