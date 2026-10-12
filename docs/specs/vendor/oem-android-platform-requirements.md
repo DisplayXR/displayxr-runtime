@@ -1,8 +1,8 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-09-06
-issues: [1038, 1031, 1073, 1087, 1090, 1277]
+updated: 2026-10-11
+issues: [1038, 1031, 1073, 1087, 1090, 1277, 1680, 1905, 1917, 1935]
 adr: ADR-036
 code-paths:
   - src/xrt/auxiliary/android/android_custom_surface.cpp
@@ -80,21 +80,26 @@ Tiering:
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence, **memory-pressure kill ranking**, **wake + bind must be permitted (R8.6)** | REQUIRED | **PLATFORM** | **PARTLY OPEN — MEASURED**: R8.5 (kill ranking) fails on one Android build; R8.1–R8.4 work today, don't regress |
 | **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
 | **R10** | The **mini-window survives an activity launch from inside it** (system file picker, share sheet, permission dialog) | REQUIRED | **PLATFORM** | **OPEN — MEASURED** on the reference device 2026-09-10; no app-side arrangement avoids it |
+| **R11** | The **lens/backlight HAL reports the truth** — the set call carries the panel controller's ack, the get call reads real lens state, and a wedged controller link self-heals | REQUIRED | VENDOR (+ firmware pickup) | **OPEN — root-caused in the shipped HAL** 2026-09-22; no workaround above the HAL, a reboot is the only remedy |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
 | **S2** | **Per-PIXEL** click-through at full opacity (per-region touchability); *plus*, for apps that must keep a foreground Activity, an untrusted-touch exemption + scoping the per-Activity input sink | NICE TO HAVE | **PLATFORM** | **NARROWED** — per-FRAME click-through at full opacity is SOLVED on stock via a tight touchable overlay (#1110); only per-pixel precision and the foreground-Activity case remain |
 | **S3** | ~~Wait-semaphore hook into the vendor interlacer~~ | — | VENDOR | **NOT AN ASK — withdrawn.** The hook already existed; we were passing NULL. Documentation-only PR open |
-| **S4** | **ADPF / PowerHAL hint sessions** (`APerformanceHint_createSession`) | STRONGLY REC. | **PLATFORM** | OPEN — unsupported on the reference device |
+| **S4** | **ADPF / PowerHAL hint sessions** (`APerformanceHint_createSession`) — more broadly, a **sanctioned way to raise GPU/CPU clocks** for a 3D foreground app | STRONGLY REC. | **PLATFORM** | OPEN — unsupported on both reference devices; **every app-reachable clock lever measured dead** (2026-10-10) |
 | **S5** | Ship the **background-capture service** in firmware, auto-started | STRONGLY REC. | VENDOR + firmware | PRs open |
 | **S6** | Window **move is atomic with the buffer**; a drag affordance exists | STRONGLY REC. | **PLATFORM** | OPEN |
 | **S7** | **Per-display** tracking/lens config (multi-panel) | STRONGLY REC. | VENDOR | OPEN |
 | **S8** | A **platform-composed weave** (end state), or — now — a **full-opacity, device-composited privileged overlay** for the runtime's weave satellite | STRONGLY REC. | **PLATFORM** | OPEN — the intermediate form is measured and shipping behind a flag |
 | **S9** | Expose the **container scale + composited on-screen rect** per window (or a manifest opt-out from mini-window scaling) | STRONGLY REC. | **PLATFORM** | **SATISFIED on the reference firmware, de facto** (2026-09-07): a hidden **test-API** on the activity manager returns the post-scale on-screen rect to an ordinary app, and the touch transform recovers the scale exactly; ask = keep it, make it public / stable |
+| **S10** | **Vendor perflocks are finite and inspectable** — no infinite-duration lock that only a HAL restart clears; a documented way to list/release them; the launch boost documented | STRONGLY REC. | **PLATFORM** | **OPEN — MEASURED** on the reference phone 2026-10-10 |
+| **S11** | **Concurrent submission across `VkQueue`s of one device** — per-queue GPU-driver contexts, or a second graphics-capable queue family | STRONGLY REC. | **PLATFORM** (GPU driver) | **OPEN — MEASURED**; routed around with an app-side layer (#1919) |
 | **N1** | Observability: log the applied engine config **and** the client that set it | NICE | VENDOR | PR open |
 | **N2** | Document the **classloader-parent contract**; add an explicit `classLoader` field | NICE | VENDOR | Docs PR open |
 | **N3** | Capture protocol: panel extent in header, configurable width/rate, zero-copy path | NICE | VENDOR | Runtime consumer side landed; vendor producer PR open |
 | **N4** | Do not force `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` | NICE | **PLATFORM** | OPEN |
 | **N5** | GPU headroom: context slots, `VK_KHR_global_priority`, timeline semaphores | NICE | **PLATFORM** | OPEN |
 | **N6** | Clean teardown in the vendor core (no thread join that never returns) | NICE | VENDOR | **Join hang FIXED** upstream 2026-09-06, hardware-proven and in a released SDK; the teardown `vkDestroyImage` SIGSEGV is still open |
+| **N7** | GPU driver: **no per-command-buffer memory allocate-and-zero** while recording copies (pool it, or document it) | NICE | **PLATFORM** (GPU vendor) | **OPEN — MEASURED**; routed around on our side (#1959) |
+| **N8** | **Measurement hooks without root**: GPU busy/clock, cpufreq floors, active perflocks with owner | NICE | **PLATFORM** | OPEN |
 
 ---
 
@@ -790,6 +795,14 @@ a death to platform policy.
      battery exemptions for our packages were pruned **four separate times** in
      one session. A one-shot `adb` whitelist is not durable; only the OEM's own
      Settings entry is, and that is not scriptable.
+   - **Blocked again by every reinstall** (same phone, 2026-10-11). After a
+     runtime APK reinstall, the same `AutoLaunchManagerService` blocks the
+     runtime's broker provider until the runtime has been launched once by hand —
+     so an update, and by extension an OTA that updates the runtime, silently
+     breaks every 3D app until the user performs a step nobody tells them about.
+     **Ask:** an exemption path — an allow-list entry or a permission — for
+     display-service-class apps, so that a reinstall or OTA does not reset them
+     into the blocked state.
 
    Two measurements bound what the platform *does* still permit, and both point
    at the same component. **The activity path is allowed where the service path
@@ -999,6 +1012,66 @@ adb logcat -d | grep -c 'setWindowingMode(freeform to full)'
 
 Expect `mode=freeform` and a count of `0` after the picker is dismissed. On the
 reference device today the mode is `fullscreen` and the count is `1`.
+
+---
+
+### R11 — The lens/backlight HAL must report the truth
+
+**Owner:** vendor (the display vendor's lens/backlight HAL) + OEM firmware pickup
+· **Status:** **OPEN — root-caused in the shipped HAL on the reference tablet
+2026-09-22** · **Traces to:** a "client bound, panel stays 2D" symptom on the
+reference tablet that looked like an R5 writer-arbitration bug and is not one
+(R5's own residual — a bound client cannot *say* 2D — is a separate gap); the
+stuck-3D history in runtime#563; runtime#1680
+
+**Mechanism.** The panel's lens is switched by a small controller on the panel
+side that the vendor HAL drives over a serial link (UART). The HAL must (a)
+return the controller's **acknowledgement** of a set-lens-state command to its
+caller, (b) answer a get-lens-state query by **asking the controller**, and (c)
+**recover** a link that stops answering — retry, re-open the port, re-toggle the
+controller's enable line — instead of giving up.
+
+On the reference tablet the controller can stop answering the HAL. When it does,
+every layer above reports "3D on" while the glass is physically 2D: the HAL, the
+vendor display services, DisplayXR, and the OEM's own 3D viewer. Content weaves,
+tracking runs and reports a face, no other client holds the panel in 2D, and a
+runtime bisect across five releases changes nothing. The only signal any layer
+emits is the HAL service's own log — a `select() timeout` (three 1 s waits)
+followed by `read() failed`, where a healthy round trip completes in ~10–35 ms.
+
+Inspection of the shipped HAL shows why nothing above it can tell: the get call
+hands its callback a **constant** without touching the link, and the set call
+returns the same success whether or not the controller acknowledged — the
+failure path only selects a log line. A service-side read-back would therefore
+always read "on"; the fix can only be in the HAL. Acceptable implementation:
+the set path carries the ack outcome (a HIDL 1.0 `void` return needs a 1.1
+revision or a status callback), the get path queries the controller, and a
+timeout triggers recovery rather than three waits and a silent give-up. The HAL
+is the display vendor's, so the vendor fixes it and the OEM ships it in an OTA.
+
+**Consequence if absent.** A unit whose lens controller wedges is flat 2D with
+every diagnostic reading 3D. Users see "3D stopped working"; integrators chase
+the runtime, the app and the tracker, none of which is at fault. Nothing can
+detect it, so nothing can fall back.
+
+**DisplayXR fallback.** **None** — there is no truthful state to read. The only
+remedy on a wedged unit is a reboot, which power-cycles the HAL and the
+controller. Until the HAL moves, detection is a logcat check for the HAL
+timeout, which our device test bundle now fails on.
+
+**Acceptance test.** Toggle 3D on and off 50 times with a DisplayXR app; then
+force the failure by holding the controller's link unanswered (disconnect, or
+hold its enable line low) and toggle again:
+
+```
+adb logcat -d | grep -E 'select\(\) timeout|read\(\) failed'
+```
+
+PASS requires all of: (1) on a healthy link, every set returns a positive ack
+and every get matches the commanded state; (2) with the link held dead, the set
+call **reports failure** to its caller and the get call does **not** return "on";
+(3) when the link is released, the HAL recovers on its own — no reboot — and the
+next set succeeds.
 
 ---
 
@@ -1464,6 +1537,41 @@ registered at all, and SurfaceFlinger's own `use_adpf_cpu_hint`. If no `ADPF:`
 line is in the log buffer the verdict is INFO, not a guess — run an
 out-of-process (service-compositor) session and re-read.
 
+**2026-10 update — the whole clock surface, not just ADPF.** Re-measured on both
+reference devices (a 3D phone and a 3D tablet, both Android 13, Adreno 740, kgsl
+governor `msm-adreno-tz`, 2026-10-10/11;
+[#1917](https://github.com/DisplayXR/displayxr-runtime/issues/1917)). **No app-
+or runtime-reachable API raises the GPU clock:**
+
+| Lever | Result on both devices |
+|---|---|
+| ADPF hint session | `Power HAL: hint sessions not supported`; `dumpsys performance_hint` → `HAL Support: false`, preferred rate −1 |
+| `Window.setSustainedPerformanceMode` | unsupported |
+| `cmd power set-fixed-performance-mode-enabled true` | accepted, no effect on clocks |
+| `GameManager` performance mode | refused |
+| root write to `/sys/class/kgsl/kgsl-3d0/devfreq/min_freq` | **works** — the only lever that does |
+
+The governor steps up on busy-% alone (above roughly 70–80 % busy). Any app whose
+CPU and GPU work *alternate* — which is every OpenXR app that waits on its
+previous frame's fence before submitting the next — never looks busy enough, and
+sits at **220 of 680 MHz**, about a third of the GPU. Pinning `min_freq` to
+680 MHz took the model viewer from 13.5 to 21.7 fps (+60 %) with the GPU only
+23 % busy; a Unity-built viewer shows the same 220 MHz / ~50 % busy signature.
+
+**What we did on our side** is workload shape, not a knob: the build guide now
+requires ≥ 2 frames in flight (shared `dxr::VkFrameRing` helper), and the
+runtime no longer makes the app wait on the weave in `xrEndFrame`
+([#1905](https://github.com/DisplayXR/displayxr-runtime/issues/1905)). That
+helps our own apps; it does nothing for an engine that keeps a serialized loop.
+
+**The ask, restated.** Either (a) ADPF hint sessions wired through to the **GPU**
+governor as well as the CPU, or (b) a GPU performance lock (a raised
+`min_freq` floor) the platform holds while the lens is in 3D mode — the display
+stack already knows that state. Whichever form: the clock grant still has to
+ship with a **measured** motion-to-photon horizon in the display stack (§S8's
+per-frame scanout prediction); raising the clock alone shortens the real
+horizon and makes a hardcoded predictor overshoot.
+
 ---
 
 ### S5 — Ship the background-capture producer in firmware, auto-started
@@ -1836,6 +1944,76 @@ that satisfies neither it prints:
 
 ---
 
+### S10 — Vendor perflocks must be finite and inspectable
+
+**Owner:** **PLATFORM** · **Status:** OPEN — measured on the reference phone
+2026-10-10
+
+**Mechanism.** Every performance lock the vendor's perf service grants carries a
+**finite** duration (or is released when its owning process dies), and there is a
+documented, adb-reachable way — a `dumpsys` section or a `settings`/`cmd` verb —
+to **list** active locks with their owner, hint id, floors and remaining duration,
+and to **release** one.
+
+**Consequence if absent.** On the reference phone the vendor's `perfservice` held
+a cluster-minimum perflock (hint `0x1086`, **infinite** duration, cluster minimum
+frequencies 1.46 GHz and 1.92 GHz). Writes to the cpufreq sysfs nodes cannot clear
+it; only restarting `perf-hal` drops it. `perf-hal` is SELinux-denied from checking
+whether the owning pid is still alive, so the lock is never garbage-collected.
+Nothing reports it: every CPU measurement on that unit was silently taken at a
+raised floor, and a "fix" measured there can be an artifact of the lock.
+
+**Also document the launch boost.** App launch raises the CPU floors to roughly
+1.1 / 1.9 / 2.0 GHz for ~20 s. That is reasonable behavior, but it must be
+documented (duration, floors, how to observe it) so benchmarks can exclude the
+first 20 s rather than discover it.
+
+**DisplayXR fallback.** None — we can only detect it on a rooted unit and
+restart `perf-hal` by hand before measuring.
+
+**Acceptance test.** Launch and close any app that takes a perf hint; after its
+process is gone, the listing shows no lock owned by it, and the cpufreq
+`scaling_min_freq` of every cluster is back at its idle floor within the
+documented launch-boost window.
+
+---
+
+### S11 — Concurrent submission across `VkQueue`s of one device
+
+**Owner:** **PLATFORM** (GPU driver) · **Status:** OPEN — measured on both
+reference devices; routed around on our side · **Traces to:**
+[#1905](https://github.com/DisplayXR/displayxr-runtime/issues/1905),
+[#1910](https://github.com/DisplayXR/displayxr-runtime/pull/1910),
+[#1919](https://github.com/DisplayXR/displayxr-runtime/issues/1919)
+
+**Mechanism.** Two `VkQueue`s of the same `VkDevice` can be submitted to
+concurrently from different threads without corrupting each other — either each
+queue gets its own GPU-driver context, or the device exposes a **second
+graphics-capable queue family**.
+
+**Consequence if absent.** An in-process runtime compositor repaints the weave at
+panel rate on its own queue while the app renders on another queue of the same
+family. On the reference GPU both queues share one GSL context: an app
+`vkQueueSubmit` that overlaps a runtime submit corrupts the context timestamp
+(`Adreno-GSL ctx N: next client ts … must be greater`) and the **next** submit
+fails with −3. The only other queue family on the device is sparse-binding-only,
+so there is no second graphics queue to move to. Without fills, the weave — and
+the eye positions it carries — refreshes at the app's frame rate (28 Hz measured
+on the phone) instead of the panel's 60 Hz.
+
+**DisplayXR fallback.** A Vulkan layer, `VK_LAYER_DXR_queue_lock`, serializes
+submissions per queue family; it ships inside the DisplayXR client AAR so it lands
+in each app's native library dir (#1919), and mid-frame fills auto-enable only when
+it is live in the app process. With it: face refresh 59.8 Hz at a flat 60 Hz present,
+zero GSL errors. **The gap:** an engine that packages its own Vulkan loading, or an
+app that does not take the AAR, gets weave at app rate.
+
+**Acceptance test.** Two threads, two queues of family 0, each submitting a small
+compute or copy workload in a tight loop for 60 s with no external
+synchronization: zero `Adreno-GSL` timestamp errors in logcat, zero failed submits.
+
+---
+
 ## 4. NICE-TO-HAVE
 
 **N1 — Observability in the tracking service.** Log the **applied** engine config
@@ -1906,6 +2084,31 @@ plug-in release that carries it is named in §7.
 **What remains open** is the other half: an intermittent SIGSEGV in
 `vkDestroyImage` during interlacer release. Architecture C hides it behind
 process death; Architecture A cannot.
+
+**N7 — No per-command-buffer memory allocate-and-zero in the GPU driver.**
+*(Platform / GPU vendor.)* On the reference GPU the driver allocates and zeroes
+fresh GPU memory **while recording** `vkCmdCopyImage`, every frame
+(`kgsl_sharedmem_alloc → kgsl_pool_alloc_page → clear_page`), and the cost scales
+with the **destination image size**, not with the region copied: a copy into a
+3840×2560 image cost ~35 ms of CPU per frame, and shrinking the image to 3840×1600
+only moved the tablet media player from 18 to 26.6 fps. It decays over a run as the
+kernel's pre-zeroed page pool drains (29 → 52 ms/frame in 30 s), and it makes a
+per-frame `vkAllocateCommandBuffers` expensive for the same reason. Ask: pool the
+command memory in the driver, or document the behavior so vendor SDKs and engines
+avoid per-frame copies into large swapchain images. Our side is routed around —
+the sRGB swapchain is now read through its UNORM view instead of copied
+([#1935](https://github.com/DisplayXR/displayxr-runtime/issues/1935) →
+[#1959](https://github.com/DisplayXR/displayxr-runtime/pull/1959): tablet media
+player 18 → 60 fps, phone 30 → 60), and the Gaussian-splat demo presents into an
+UNORM view (displayxr-demo-gaussiansplat #143/#144) — but any app that copies into
+its swapchain still pays it.
+
+**N8 — Measurement hooks without root.** *(Platform.)* S4, S10 and N7 each took days
+to establish because the evidence sits behind root on a userdebug unit. Make readable
+to adb `shell` without root: kgsl `gpubusy` and `gpuclk` (or the devfreq `cur_freq`),
+the cpufreq floors per cluster, and a `dumpsys` surface listing active perflocks with
+their owner (S10). With these, `scripts/android-oem-probe.sh` can gate S4 and S10 the
+way it gates R6.
 
 ---
 
@@ -1983,6 +2186,7 @@ planning a firmware spin should treat those as *available to cherry-pick*, not
 | R3 | PR #698 (+ #713 for N1 observability) | **open** | Aggregate held; recomputed on disconnect |
 | R4 | PR #716 (issue #715) | **MERGED 2026-08-27** | A/B/A validated on device; present from the SDK release that carries it |
 | R5 | PR #714 (issues #702, #703) | **open** | Deprecate legacy tiers; document bind-as-preference |
+| R11 | Issue #740 | open | The HAL fix: return the controller ack from the set call, read real state in the get call, recover a dead link. Explains the "client bound, panel 2D" symptom that was first read as an R5 bug |
 | S3 | PR #720 | **open**, docs only | **No code change.** Specifies the Vulkan post-process semaphore contract that already existed — the correction that withdrew this ask |
 | S5 / S1 producer | PRs #717, #718, #719 | **open** | Capture service, multi-uid composite, protocol v2 (panel extent) |
 | S7 | Issue #704 | open | Per-display config |
@@ -2039,6 +2243,9 @@ vendor asks before committing to a firmware spin.
   (compose-under transparency, closed), [#1087](https://github.com/DisplayXR/displayxr-runtime/issues/1087)
   (WM↔SF desync), [#1090](https://github.com/DisplayXR/displayxr-runtime/issues/1090),
   [#663](https://github.com/DisplayXR/displayxr-runtime/issues/663) (ADPF finding, closed),
+  [#1917](https://github.com/DisplayXR/displayxr-runtime/issues/1917) (every clock lever dead on both devices, closed),
+  [#1905](https://github.com/DisplayXR/displayxr-runtime/issues/1905) (weave at app rate; cross-queue GSL race),
+  [#1935](https://github.com/DisplayXR/displayxr-runtime/issues/1935) (driver allocate-and-zero in `vkCmdCopyImage`, closed),
   [#1110](https://github.com/DisplayXR/displayxr-runtime/issues/1110) (click-through
   trade study, closed), [#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277)
   (weave satellite epic), [#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367)
