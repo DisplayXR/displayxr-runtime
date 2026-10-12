@@ -24,10 +24,12 @@
 #include "os/os_display_edid.h"
 
 #include "target_plugin_loader.h"
+#include "target_screen_pin.h"
 #include "target_screens.h"
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -317,4 +319,175 @@ TEST_CASE("monitor id: survives a rearrangement where the connector is known, se
 	xrt_display_descriptor d[2]{};
 	REQUIRE(target_plugin_build_descriptors(&edid, d, 2) == 2);
 	CHECK(d[0].monitor_id != d[1].monitor_id);
+}
+
+/*
+ * ADR-051 D6: a mid-reseat rebuild sees the output still listed at its rect
+ * but its EDID unreadable. It must keep the identity (monitor id + screen key)
+ * the previous build read there, not publish a removal plus an EDID-less
+ * "new" screen and then the reverse.
+ */
+namespace {
+
+void
+reseat_monitor(os_display_edid_monitor &m, const char *output, const char *connector, int32_t left)
+{
+	std::memset(&m, 0, sizeof(m));
+	m.manufacturer_id = 0x0472;
+	m.product_id = 0x0001;
+	m.serial_number = 0x322EF05E;
+	m.screen_left = left;
+	m.pixel_width = 3840;
+	m.pixel_height = 2160;
+	m.refresh_hz = 60;
+	m.physical_width_mm = 344;
+	m.physical_height_mm = 193;
+	m.native_width = 3840;
+	m.native_height = 2160;
+	m.join = OS_EDID_JOIN_NAME;
+	std::snprintf(m.output_name, sizeof(m.output_name), "%s", output);
+	std::snprintf(m.connector, sizeof(m.connector), "%s", connector);
+}
+
+//! The EDID half of a record gone, as mid-reseat: only the placement is left.
+void
+lose_edid(os_display_edid_monitor &m)
+{
+	m.manufacturer_id = 0;
+	m.product_id = 0;
+	m.serial_number = 0;
+	m.physical_width_mm = 0;
+	m.physical_height_mm = 0;
+	m.connector[0] = '\0';
+	m.join = OS_EDID_JOIN_NONE;
+}
+
+std::string
+key_of(uint64_t monitor_id)
+{
+	char key[TARGET_SCREEN_KEY_MAX] = {};
+	REQUIRE(target_plugin_get_monitor_key(monitor_id, key, sizeof(key), nullptr, 0));
+	return key;
+}
+
+} // namespace
+
+TEST_CASE("EDID unreadable on a known output and rect keeps the monitor id and screen key")
+{
+	os_display_edid_list edid{};
+	edid.count = 1;
+	reseat_monitor(edid.monitors[0], "HDMI-7", "card1-HDMI-A-7", 3456);
+	xrt_display_descriptor a[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, a, 1) == 1);
+	const std::string key_a = key_of(a[0].monitor_id);
+	CHECK(key_a.rfind("???", 0) != 0);
+
+	lose_edid(edid.monitors[0]);
+	xrt_display_descriptor b[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, b, 1) == 1);
+	CHECK(b[0].monitor_id == a[0].monitor_id);
+	CHECK(b[0].edid_manufacturer == a[0].edid_manufacturer);
+	CHECK(key_of(b[0].monitor_id) == key_a);
+	os_display_edid_monitor rec{};
+	REQUIRE(target_plugin_get_monitor_record(b[0].monitor_id, nullptr, &rec));
+	CHECK(rec.physical_width_mm == 344);
+
+	// Still unreadable on the next rebuild (carried from a carried record).
+	xrt_display_descriptor c[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, c, 1) == 1);
+	CHECK(c[0].monitor_id == a[0].monitor_id);
+
+	// The real EDID is back: same identity, nothing moved.
+	reseat_monitor(edid.monitors[0], "HDMI-7", "card1-HDMI-A-7", 3456);
+	xrt_display_descriptor d[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, d, 1) == 1);
+	CHECK(d[0].monitor_id == a[0].monitor_id);
+	CHECK(key_of(d[0].monitor_id) == key_a);
+}
+
+TEST_CASE("EDID unreadable on an output never seen before gets the ??? key")
+{
+	os_display_edid_list edid{};
+	edid.count = 1;
+	reseat_monitor(edid.monitors[0], "DP-8", "card1-DP-8", 7000);
+	lose_edid(edid.monitors[0]);
+	xrt_display_descriptor a[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, a, 1) == 1);
+	CHECK(a[0].edid_manufacturer == 0);
+	CHECK(key_of(a[0].monitor_id) == "???-0000-00000000@DP-8");
+
+	// A known output whose rect moved is not the same monitor either.
+	reseat_monitor(edid.monitors[0], "DP-8", "card1-DP-8", 7000);
+	xrt_display_descriptor b[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, b, 1) == 1);
+	lose_edid(edid.monitors[0]);
+	edid.monitors[0].screen_left = 0;
+	xrt_display_descriptor c[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, c, 1) == 1);
+	CHECK(c[0].monitor_id != b[0].monitor_id);
+	CHECK(key_of(c[0].monitor_id) == "???-0000-00000000@DP-8");
+}
+
+TEST_CASE("a different real EDID on the same output is a real replacement")
+{
+	os_display_edid_list edid{};
+	edid.count = 1;
+	reseat_monitor(edid.monitors[0], "HDMI-6", "card1-HDMI-A-6", 3456);
+	xrt_display_descriptor a[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, a, 1) == 1);
+	const std::string key_a = key_of(a[0].monitor_id);
+
+	edid.monitors[0].manufacturer_id = 0x4C2D;
+	edid.monitors[0].product_id = 0x7155;
+	edid.monitors[0].serial_number = 0x1;
+	xrt_display_descriptor b[1]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, b, 1) == 1);
+	CHECK(b[0].monitor_id != a[0].monitor_id);
+	CHECK(key_of(b[0].monitor_id) != key_a);
+}
+
+TEST_CASE("EDID carry: the pure rule, including the window")
+{
+	os_display_edid_monitor prev{};
+	reseat_monitor(prev, "HDMI-5", "card1-HDMI-A-5", 0);
+	const uint64_t t0 = 1000;
+
+	os_display_edid_monitor cur = prev;
+	lose_edid(cur);
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0 + TARGET_EDID_CARRY_WINDOW_NS) == TARGET_EDID_CARRY_KEPT);
+	CHECK(cur.manufacturer_id == prev.manufacturer_id);
+	CHECK(cur.serial_number == prev.serial_number);
+	CHECK(std::strcmp(cur.connector, prev.connector) == 0);
+	CHECK(cur.physical_width_mm == prev.physical_width_mm);
+
+	cur = prev;
+	lose_edid(cur);
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0 + TARGET_EDID_CARRY_WINDOW_NS + 1) ==
+	      TARGET_EDID_CARRY_EXPIRED);
+	CHECK(cur.manufacturer_id == 0); // nothing copied
+
+	// Matched by the connector alone when the output name is gone too.
+	cur = prev;
+	cur.manufacturer_id = 0;
+	cur.product_id = 0;
+	cur.serial_number = 0;
+	cur.output_name[0] = '\0';
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0) == TARGET_EDID_CARRY_KEPT);
+
+	// Another output, a moved / resized rect, a real EDID, or a previous
+	// record without one: no carry.
+	cur = prev;
+	lose_edid(cur);
+	std::snprintf(cur.output_name, sizeof(cur.output_name), "%s", "HDMI-4");
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0) == TARGET_EDID_CARRY_NONE);
+	cur = prev;
+	lose_edid(cur);
+	cur.pixel_width = 1920;
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0) == TARGET_EDID_CARRY_NONE);
+	cur = prev;
+	CHECK(target_plugin_edid_carry(&prev, t0, &cur, t0) == TARGET_EDID_CARRY_NONE);
+	os_display_edid_monitor blank = prev;
+	lose_edid(blank);
+	cur = blank;
+	CHECK(target_plugin_edid_carry(&blank, t0, &cur, t0) == TARGET_EDID_CARRY_NONE);
 }

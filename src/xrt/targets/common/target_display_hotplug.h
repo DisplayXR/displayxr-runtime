@@ -234,6 +234,27 @@ target_display_hotplug_request(enum target_hotplug_source src, const char *reaso
 void
 target_display_hotplug_plugin_request(const char *reason);
 
+/*!
+ * Where @ref target_display_hotplug_request_followup goes when no monitor runs
+ * in this process: the host's own re-probe (the service sets its display
+ * re-probe worker, ADR-051 D6). Must not block on a re-run.
+ */
+typedef void (*target_display_followup_sink_fn)(const char *reason);
+
+//! Install (or clear, NULL) the follow-up sink. Any thread.
+void
+target_display_hotplug_set_followup_sink(target_display_followup_sink_fn fn);
+
+/*!
+ * Ask for one more re-enumeration soon because the last one was provisional
+ * (a monitor's EDID was unreadable mid-reseat and its identity was carried
+ * forward — target_plugin_build_descriptors). Served by this process's
+ * monitor when one runs, else by the sink, else dropped. Any thread; never
+ * blocks on a re-run.
+ */
+void
+target_display_hotplug_request_followup(const char *reason);
+
 #ifdef __cplusplus
 }
 #endif

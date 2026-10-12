@@ -172,9 +172,13 @@ Three session-free RPCs on the DIAG class, appended to `proto.json`:
 | `system_get_status_snapshot` | the fixed-size head: runtime, plugins[], screens[] (vendor cell included), workspace, client ids | crosses like `xrt_screen_list` does today |
 | `system_get_client_segments(client_id)` | that client's `xrt_segment_metrics` + owner screen + window rect + presenter + lease + integrity counters | read-only; lifts the own-session restriction of `compositor_get_segment_metrics` for DIAG only |
 
-Generation bumps: `topology` on every screen-registry re-probe (the existing
+Generation bumps: `topology` on a screen-registry re-probe (the existing
 `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` / registry-change path, the Linux DRM poll, the
-macOS reconfigure callback) and on a plug-in state change; `status` on any client
+macOS reconfigure callback, the fallback plug-in's 10 s re-probe timer) **only when the
+re-probe changed the screen table** (the instance's display generation moved) **or the
+active plug-in** (its id, or whether it is the fallback) — a re-probe that finds the world
+as it was bumps nothing, so a watcher does not refetch an identical snapshot every 10 s —
+and on a plug-in state change; `status` on any client
 connect / disconnect / focus change, any segment table `generation` move, any owner
 hand-off, any lease change, any `is_tracking` edge, any plug-in `change_counter` move, and
 on a 2 s timer so a missed event costs at most 2 s. The snapshot is rebuilt lazily on the
@@ -184,6 +188,15 @@ a raw `NETLINK_KOBJECT_UEVENT` socket (no libudev), or a 2 s poll of
 `/sys/class/drm/card*-*/status` where the socket is unavailable; either posts
 `ipc_server_request_display_reprobe("drm hotplug")`, whose world-event refresh always
 re-resolves the screen registry.
+
+A cable reseat can be re-probed while the compositor still lists the output at its old
+rect but the kernel's EDID reads back empty. Such a monitor keeps the identity (EDID
+triple, so the same monitor id and screen key) last read on the same output name /
+connector and desktop rect, for up to 30 s (`target_plugin_edid_carry`, one WARN line),
+and a follow-up re-probe is requested so the real EDID is read again — instead of the
+screen table publishing a removal plus an `???-0000-00000000@<output>` screen and then
+the reverse. A monitor with no EDID on an output never seen before still gets the `???`
+key.
 
 The `[HEALTH]` and `[RENDER]` emitters read from the same structs the snapshot reads, so
 the log and the dashboard cannot drift (`emit_health_if_elapsed` becomes a formatter over

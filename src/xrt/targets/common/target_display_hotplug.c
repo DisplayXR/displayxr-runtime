@@ -352,6 +352,8 @@ static struct target_display_hotplug *g_hp = NULL;
 //! A request that arrived while no monitor ran (served by the next start).
 static uint32_t g_latched_sources = 0;
 static char g_latched_reason[96];
+//! Where a follow-up goes when no monitor runs in this process (guarded by g_hp_lock).
+static target_display_followup_sink_fn g_followup_sink = NULL;
 
 static const char *
 sources_str(uint32_t s, char *buf, size_t size)
@@ -411,6 +413,37 @@ void
 target_display_hotplug_plugin_request(const char *reason)
 {
 	target_display_hotplug_request(TARGET_HOTPLUG_SOURCE_PLUGIN, reason != NULL ? reason : "plug-in");
+}
+
+void
+target_display_hotplug_set_followup_sink(target_display_followup_sink_fn fn)
+{
+	pthread_mutex_lock(&g_hp_lock);
+	g_followup_sink = fn;
+	pthread_mutex_unlock(&g_hp_lock);
+}
+
+void
+target_display_hotplug_request_followup(const char *reason)
+{
+	pthread_mutex_lock(&g_hp_lock);
+	struct target_display_hotplug *hp = g_hp;
+	const target_display_followup_sink_fn sink = g_followup_sink;
+	if (hp != NULL) {
+		// A plug-in-class event: one sweep after the settle time, without
+		// re-arming the OS follow-up series.
+		os_mutex_lock(&hp->mutex);
+		event_locked(hp, TARGET_HOTPLUG_SOURCE_PLUGIN, reason);
+		os_mutex_unlock(&hp->mutex);
+	}
+	pthread_mutex_unlock(&g_hp_lock);
+	// No in-process monitor: hand it to the host's re-probe (the service's
+	// worker). Neither: nothing re-reads on its own — not latched, unlike
+	// target_display_hotplug_request, because the next enumeration re-reads
+	// the EDID anyway.
+	if (hp == NULL && sink != NULL) {
+		sink(reason != NULL ? reason : "display identity follow-up");
+	}
 }
 
 static void
