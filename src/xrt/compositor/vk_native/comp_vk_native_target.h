@@ -266,6 +266,18 @@ VkFormat
 comp_vk_native_target_get_format(struct comp_vk_native_target *target);
 
 /*!
+ * True when the current target images (and their views) can be SAMPLED: the
+ * WSI swapchain was created with VK_IMAGE_USAGE_SAMPLED_BIT (only when
+ * DXR_VK_ZONES_COPY_TO_DRAW is on and the surface supports it), or the
+ * images are the DComp bridge's imported ring (always sampled). The Local2D
+ * composite then snapshots the weave target with a draw instead of a copy.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_images_sampled(struct comp_vk_native_target *target);
+
+/*!
  * Get the target's image-set generation (#602). Bumped each time the target
  * image set is (re)created — the compositor forwards it to the display
  * processor so caches keyed by the target VkImage handle can be invalidated

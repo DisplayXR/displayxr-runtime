@@ -166,6 +166,34 @@ comp_vk_native_srgb_mutable_view_enabled(void)
 	return value;
 }
 
+bool
+comp_vk_native_zones_copy_to_draw_enabled(void)
+{
+	static bool cached = false;
+	static bool value = true;
+	if (cached) {
+		return value;
+	}
+	const char *v = getenv("DXR_VK_ZONES_COPY_TO_DRAW");
+#ifdef XRT_OS_ANDROID
+	char sp[PROP_VALUE_MAX] = {0};
+	if ((v == NULL || v[0] == '\0') && __system_property_get("debug.dxr.vk_zones_copy_to_draw", sp) > 0) {
+		v = sp;
+	}
+#endif
+	if (v != NULL && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+	                  (v[0] == 'o' && (v[1] == 'f' || v[1] == 'F')))) {
+		value = false;
+	}
+	cached = true;
+	U_LOG_W(
+	    "zones/Local2D hand-offs %s (DXR_VK_ZONES_COPY_TO_DRAW / debug.dxr.vk_zones_copy_to_draw=0 restores "
+	    "the copies)",
+	    value ? "= draws (compose target -> atlas, weave target -> weave_scratch), no per-frame copy"
+	          : "= vkCmdCopyImage (compose target -> atlas, weave target -> weave_scratch)");
+	return value;
+}
+
 static inline struct comp_vk_native_swapchain *
 vk_sc(struct xrt_swapchain *xsc)
 {

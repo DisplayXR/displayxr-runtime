@@ -316,6 +316,18 @@ struct comp_vk_native_renderer
 		VkImage compose_image;
 		VkDeviceMemory compose_memory;
 		VkImageView compose_view;   //!< _SRGB — the render-pass attachment.
+		/*!
+		 * UNORM view of the same memory, SAMPLED by the hand-off draw
+		 * (DXR_VK_ZONES_COPY_TO_DRAW, default on): the stored ENCODED
+		 * bytes with no decode, written to the UNORM atlas with no
+		 * encode — byte-for-byte what the copy moved. VK_NULL_HANDLE
+		 * when the knob is off or the view could not be made; the
+		 * hand-off then copies.
+		 */
+		VkImageView compose_unorm_view;
+		//! The zone render pass's finalLayout: SHADER_READ_ONLY when it
+		//! is built for the draw hand-off, TRANSFER_SRC for the copy.
+		VkImageLayout compose_final_layout;
 		uint32_t compose_w, compose_h;
 		//! @}
 
@@ -350,6 +362,13 @@ struct comp_vk_native_renderer
 		VkPipeline pipelines[VK_COMPOSE_SAMPLER_COUNT];
 		VkFramebuffer fb[COMP_VK_DEPOSIT_RING];
 		VkImageView fb_view[COMP_VK_DEPOSIT_RING];
+		/*!
+		 * NEAREST, clamp: the zones hand-off draw samples the compose
+		 * target 1:1 (pixel centre to texel centre), and point sampling
+		 * makes that exact by construction rather than by the filter
+		 * weights happening to be 0/1.
+		 */
+		VkSampler nearest;
 		bool ready;
 		bool failed; //!< build failed once — keep the #1559 copy + blit
 	} raw;
@@ -747,6 +766,10 @@ zone_compose_target_destroy(struct comp_vk_native_renderer *r)
 		vk->vkDestroyImageView(vk->device, r->zone.compose_view, NULL);
 		r->zone.compose_view = VK_NULL_HANDLE;
 	}
+	if (r->zone.compose_unorm_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->zone.compose_unorm_view, NULL);
+		r->zone.compose_unorm_view = VK_NULL_HANDLE;
+	}
 	if (r->zone.compose_image != VK_NULL_HANDLE) {
 		vk->vkDestroyImage(vk->device, r->zone.compose_image, NULL);
 		r->zone.compose_image = VK_NULL_HANDLE;
@@ -1050,6 +1073,11 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 
 	destroy_atlas_resources(r);
 	zone_draw_destroy(r);
+	// The private compose target outlives zone_draw_destroy (it is sized to
+	// the atlas, not tied to the pipeline bundle) and nothing else frees it at
+	// teardown — validation reported its image, memory and view(s) leaked at
+	// vkDestroyDevice.
+	zone_compose_target_destroy(r);
 	cursor_destroy(r); // XR_DXR_cursor_depth v5 (all null unless ever requested)
 	// After destroy_atlas_resources — that call drops the borrowed handles
 	// into the deposit's ring, this one frees the ring itself.
@@ -1282,6 +1310,10 @@ raw_destroy(struct comp_vk_native_renderer *r)
 		vk->vkDestroyRenderPass(vk->device, r->raw.render_pass, NULL);
 		r->raw.render_pass = VK_NULL_HANDLE;
 	}
+	if (r->raw.nearest != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, r->raw.nearest, NULL);
+		r->raw.nearest = VK_NULL_HANDLE;
+	}
 	r->raw.ready = false;
 }
 
@@ -1352,8 +1384,22 @@ raw_create(struct comp_vk_native_renderer *r, VkShaderModule vert, VkShaderModul
 	    .pDependencies = dependencies,
 	};
 
+	VkSamplerCreateInfo nearest_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_NEAREST,
+	    .minFilter = VK_FILTER_NEAREST,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .maxLod = 0.25f,
+	};
+
 	r->raw.failed = true; // cleared on full success
 	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->raw.render_pass);
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateSampler(vk->device, &nearest_ci, NULL, &r->raw.nearest);
+	}
 	if (res != VK_SUCCESS ||
 	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag, VK_COMPOSE_BLEND_OFF, NULL,
 	                          &r->raw.pipelines[VK_COMPOSE_SAMPLER_2D]) ||
@@ -1391,9 +1437,14 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	/*
 	 * The attachment is the PRIVATE compose target's _SRGB view, not the
 	 * atlas — so the blender works in linear light (#1610) and the encode
-	 * happens on write. `finalLayout` is TRANSFER_SRC because the pass is
-	 * followed by a raw vkCmdCopyImage into the (UNORM, ENCODED) atlas.
+	 * happens on write. The pass is followed by the hand-off into the
+	 * (UNORM, ENCODED) atlas: a REPLACE draw sampling the target's UNORM view
+	 * (default) — so `finalLayout` is SHADER_READ_ONLY — or, under
+	 * DXR_VK_ZONES_COPY_TO_DRAW=0, a raw vkCmdCopyImage with TRANSFER_SRC.
 	 */
+	const bool draw_handoff = comp_vk_native_zones_copy_to_draw_enabled();
+	r->zone.compose_final_layout =
+	    draw_handoff ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 	VkAttachmentDescription attachment = {
 	    .format = zone_compose_view_format(),
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -1402,7 +1453,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	    .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .finalLayout = r->zone.compose_final_layout,
 	};
 
 	VkAttachmentReference color_ref = {
@@ -1426,12 +1477,17 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    },
 	    {
+	        // To the hand-off: the draw's fragment-shader read, or the copy's
+	        // transfer read (both stages named, so the fallback copy after a
+	        // failed draw setup is covered by the same dependency).
 	        .srcSubpass = 0,
 	        .dstSubpass = VK_SUBPASS_EXTERNAL,
 	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	        .dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT,
+	        .dstStageMask = draw_handoff ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+	                                     : VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .dstAccessMask = draw_handoff ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT)
+	                                      : VK_ACCESS_TRANSFER_READ_BIT,
 	    },
 	};
 
@@ -1545,14 +1601,15 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	// + 1: the runtime-drawn cursor's set (XR_DXR_cursor_depth v5), so a
 	// frame that exhausts the layer budget still has one for the cursor.
+	// + 1: the zones hand-off draw's set (compose target -> atlas).
 	VkDescriptorPoolSize pool_size = {
 	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .descriptorCount = VK_ZONE_MAX_DRAWS + 1,
+	    .descriptorCount = VK_ZONE_MAX_DRAWS + 2,
 	};
 
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-	    .maxSets = VK_ZONE_MAX_DRAWS + 1,
+	    .maxSets = VK_ZONE_MAX_DRAWS + 2,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
 	};
@@ -1777,11 +1834,17 @@ zone_compose_target_ensure(struct comp_vk_native_renderer *r)
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
 	    // TRANSFER_DST: the window-space pass copies the published atlas back
-	    // in to blend over it in linear light (#1795).
-	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-	             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    // in to blend over it in linear light (#1795). SAMPLED (added below
+	    // when the draw hand-off is on): the hand-off reads it through the
+	    // UNORM view instead of vkCmdCopyImage.
+	    .usage =
+	        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
+	const bool draw_handoff = comp_vk_native_zones_copy_to_draw_enabled();
+	if (draw_handoff) {
+		ici.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+	}
 	VkResult res = vk->vkCreateImage(vk->device, &ici, NULL, &r->zone.compose_image);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK compose: failed to create the private compose target: %d", res);
@@ -1822,6 +1885,16 @@ zone_compose_target_ensure(struct comp_vk_native_renderer *r)
 		U_LOG_E("VK compose: failed to create the compose target's _SRGB view: %d", res);
 		zone_compose_target_destroy(r);
 		return false;
+	}
+	if (draw_handoff) {
+		// The NON-decoding view for the hand-off draw. Optional: without it
+		// the hand-off copies, exactly as before.
+		VkImageViewCreateInfo uci = vci;
+		uci.format = VK_FORMAT_B8G8R8A8_UNORM;
+		if (vk->vkCreateImageView(vk->device, &uci, NULL, &r->zone.compose_unorm_view) != VK_SUCCESS) {
+			r->zone.compose_unorm_view = VK_NULL_HANDLE;
+			U_LOG_W("VK compose: no UNORM view of the compose target — the zones hand-off keeps the copy");
+		}
 	}
 	r->zone.compose_w = w;
 	r->zone.compose_h = h;
@@ -2463,6 +2536,108 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 	}
 }
 
+static VkFramebuffer
+raw_framebuffer(struct comp_vk_native_renderer *r);
+
+/*!
+ * Hand the composed zones frame to the atlas with a DRAW, not a copy.
+ *
+ * On Adreno a per-frame vkCmdCopyImage allocates and zeroes driver memory
+ * inside the call (and vkResetCommandBuffer frees it again): the avatar demo
+ * — the only shipped zones + Local2D app — spent ~6 ms of a ~32 ms frame in
+ * this one copy (#1935 / #1959 found the same trap on the sRGB fast path).
+ *
+ * One REPLACE draw over the whole atlas through the #1935 raw-read render
+ * pass (attachment = the UNORM atlas, CLEAR + STORE, ends SHADER_READ_ONLY
+ * exactly as the copy path's barrier leaves it), sampling the compose
+ * target's UNORM view 1:1 with a NEAREST sampler. The UNORM view reads the
+ * stored bytes with no decode and the UNORM atlas stores the shader output
+ * with no encode, and both images are B8G8R8A8: the atlas gets exactly the
+ * bytes the copy moved (memory: the vk_native atlas is ENCODED by
+ * construction — never decode on this hop).
+ *
+ * Returns false WITHOUT recording anything when the draw is unavailable, so
+ * the caller can still copy.
+ */
+static bool
+zones_handoff_draw(struct comp_vk_native_renderer *r, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->zone.compose_final_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+	    r->zone.compose_unorm_view == VK_NULL_HANDLE || !r->raw.ready || r->raw.nearest == VK_NULL_HANDLE ||
+	    r->zone.compose_w != r->atlas_alloc_width || r->zone.compose_h != r->atlas_alloc_height) {
+		return false;
+	}
+	VkFramebuffer fb = raw_framebuffer(r);
+	if (fb == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->zone.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->zone.set_layout,
+	};
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+		return false;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->raw.nearest,
+	    .imageView = r->zone.compose_unorm_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	// The clear is fully overdrawn (compose target == atlas allocation).
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->raw.render_pass,
+	    .framebuffer = fb,
+	    .renderArea = {{0, 0}, {r->atlas_alloc_width, r->atlas_alloc_height}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear_value,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport vp = {
+	    .x = 0.0f,
+	    .y = 0.0f,
+	    .width = (float)r->zone.compose_w,
+	    .height = (float)r->zone.compose_h,
+	    .minDepth = 0.0f,
+	    .maxDepth = 1.0f,
+	};
+	VkRect2D scissor = {{0, 0}, {r->zone.compose_w, r->zone.compose_h}};
+	// Identity: whole source, slice 0, fullscreen path, no scale/bias.
+	struct vk_compose_push push = {
+	    .src_rect = {0.0f, 0.0f, 1.0f, 1.0f},
+	    .params = {0.0f, 0.0f, 0.0f, 0.0f},
+	    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+	    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
+	};
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->raw.pipelines[VK_COMPOSE_SAMPLER_2D]);
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
+	vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	                       0, sizeof(push), &push);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+	return true;
+}
+
 //! Draw-based projection pass for zones frames: clear via loadOp, draw each
 //! zone's view tiles alpha-over in layer-list order, finish in
 //! SHADER_READ_ONLY. Mirrors comp_d3d11_renderer's zone branch.
@@ -3016,37 +3191,62 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	vk->vkCmdEndRenderPass(cmd);
 
 	/*
-	 * Hand the composed frame to the atlas: a RAW COPY, never a blit.
-	 *
-	 * Both images are VK_FORMAT_B8G8R8A8_UNORM, so vkCmdCopyImage moves
-	 * bytes with no conversion of any kind — which is the whole point. The
-	 * private target's _SRGB VIEW already did the encode on write, so the
-	 * atlas receives display-referred bytes exactly as it always has.
-	 * vkCmdBlitImage here would CONVERT between the sRGB and UNORM
-	 * interpretations and apply the encode a second time.
-	 *
-	 * The atlas is unchanged in every respect a consumer can observe:
-	 * same image, same UNORM format, same ENCODED contents, same value
-	 * reported to the display processor. No DP change, no ABI change.
+	 * Hand the composed frame to the atlas. Default: a REPLACE draw through
+	 * the compose target's UNORM view (zones_handoff_draw) — no per-frame
+	 * copy. DXR_VK_ZONES_COPY_TO_DRAW=0, or a draw that could not be set up,
+	 * keeps the raw copy below.
 	 */
-	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_UNDEFINED,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	const bool handoff_drawn = zones_handoff_draw(r, cmd);
+	{
+		static bool handoff_logged = false;
+		if (!handoff_logged) {
+			handoff_logged = true;
+			U_LOG_W("VK zones: compose target -> atlas hand-off = %s",
+			        handoff_drawn ? "draw through the UNORM view (no vkCmdCopyImage)"
+			                      : "vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW=0 or draw unavailable)");
+		}
+	}
+	if (!handoff_drawn) {
+		if (r->zone.compose_final_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+			// The pass was built for the draw; the render pass's external
+			// dependency already made the writes visible to TRANSFER.
+			cmd_image_barrier(vk, cmd, r->zone.compose_image, r->zone.compose_final_layout,
+			                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
+			                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		}
+		/*
+		 * Hand the composed frame to the atlas: a RAW COPY, never a blit.
+		 *
+		 * Both images are VK_FORMAT_B8G8R8A8_UNORM, so vkCmdCopyImage moves
+		 * bytes with no conversion of any kind — which is the whole point. The
+		 * private target's _SRGB VIEW already did the encode on write, so the
+		 * atlas receives display-referred bytes exactly as it always has.
+		 * vkCmdBlitImage here would CONVERT between the sRGB and UNORM
+		 * interpretations and apply the encode a second time.
+		 *
+		 * The atlas is unchanged in every respect a consumer can observe:
+		 * same image, same UNORM format, same ENCODED contents, same value
+		 * reported to the display processor. No DP change, no ABI change.
+		 */
+		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_UNDEFINED,
+		                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-	VkImageCopy copy = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffset = {0, 0, 0},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffset = {0, 0, 0},
-	    .extent = {r->zone.compose_w, r->zone.compose_h, 1},
-	};
-	vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
-	                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		VkImageCopy copy = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .srcOffset = {0, 0, 0},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffset = {0, 0, 0},
+		    .extent = {r->zone.compose_w, r->zone.compose_h, 1},
+		};
+		vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
 
 	// Hand the source images back to the apps' steady-state layout.
 	for (uint32_t t = 0; t < transitioned_count; t++) {

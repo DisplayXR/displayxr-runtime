@@ -1401,6 +1401,11 @@ struct comp_vk_native_compositor
 	bool local2d_initialized;
 	//! #1795 — local2d's `_SRGB` (B8G8R8A8_SRGB) flatten pipelines exist.
 	bool local2d_srgb_flatten_ready;
+	//! The weave snapshot runs as a draw (DXR_VK_ZONES_COPY_TO_DRAW, default
+	//! on): vk_local2d_composite_init_snapshot succeeded for weave_scratch's
+	//! format. Per frame it still needs a SAMPLED target
+	//! (comp_vk_native_target_images_sampled); otherwise the copy.
+	bool local2d_snapshot_ready;
 
 	//! twod flatten scratch (B8G8R8A8_UNORM, COLOR_ATTACHMENT|SAMPLED). The
 	//! frame's OVER Local2D layers (after the projection in list order) are
@@ -1432,12 +1437,15 @@ struct comp_vk_native_compositor
 	//! #1795 — same contract as local2d_scratch_srgb_view.
 	VkImageView backdrop_scratch_srgb_view;
 
-	//! Weave snapshot scratch (target format, TRANSFER_DST|SAMPLED). The DP
-	//! wrote the woven 3D into the target (RT≠SRV), so the lerp reads this
-	//! copy. Lazily (re)allocated to the window region dims.
+	//! Weave snapshot scratch (B8G8R8A8_UNORM, TRANSFER_DST|SAMPLED, plus
+	//! COLOR_ATTACHMENT when the snapshot is a draw). The DP wrote the woven
+	//! 3D into the target (RT≠SRV), so the lerp reads this snapshot. Lazily
+	//! (re)allocated to the window region dims.
 	VkImage weave_scratch;
 	VkDeviceMemory weave_scratch_mem;
 	VkImageView weave_scratch_view;
+	//! Over local2d.snapshot_rp; VK_NULL_HANDLE unless local2d_snapshot_ready.
+	VkFramebuffer weave_scratch_fb;
 	uint32_t weave_scratch_w, weave_scratch_h;
 
 	//! Runtime-owned IMPLICIT zone mask (R8_UNORM, COLOR_ATTACHMENT|SAMPLED),
@@ -13361,6 +13369,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			    "VK Local2D: _SRGB flatten unavailable — Local2D layers flatten byte-passthrough (#1795)");
 		}
 	}
+	// Resolves (and logs, once) DXR_VK_ZONES_COPY_TO_DRAW for the session:
+	// the zones compose hand-off and this weave snapshot both read it.
+	if (c->local2d_initialized && comp_vk_native_zones_copy_to_draw_enabled()) {
+		c->local2d_snapshot_ready =
+		    vk_local2d_composite_init_snapshot(&c->local2d, &c->vk, VK_FORMAT_B8G8R8A8_UNORM);
+		if (!c->local2d_snapshot_ready) {
+			U_LOG_W("VK Local2D: weave snapshot draw unavailable — the snapshot keeps vkCmdCopyImage");
+		}
+	}
 
 	// Populate supported swapchain formats (Vulkan formats)
 	uint32_t format_count = 0;
@@ -17292,10 +17309,15 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		return false;
 	}
 	// Weave snapshot scratch (the lerp reads a copy; dst is RT≠SRV).
-	if (!vk_ensure_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL,
-	                  &c->weave_scratch_w, &c->weave_scratch_h, region_w, region_h, scratch_fmt,
-	                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_NULL_HANDLE,
-	                  "local2d weave")) {
+	// With the snapshot draw it is also a COLOR_ATTACHMENT with a framebuffer
+	// over snapshot_rp; TRANSFER_DST stays so a non-sampled target can still
+	// copy into it.
+	if (!vk_ensure_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view,
+	                  c->local2d_snapshot_ready ? &c->weave_scratch_fb : NULL, &c->weave_scratch_w,
+	                  &c->weave_scratch_h, region_w, region_h, scratch_fmt,
+	                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                      (c->local2d_snapshot_ready ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
+	                  c->local2d_snapshot_ready ? c->local2d.snapshot_rp : VK_NULL_HANDLE, "local2d weave")) {
 		return false;
 	}
 
@@ -17736,55 +17758,112 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		}
 	}
 
-	// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
-	// → COLOR_ATTACHMENT for the composite render pass.
-	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_ACCESS_TRANSFER_READ_BIT, dst_incoming,
-	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            k_color_sub);
-	// #862: snapshot only the clipped sub-rect — the shader samples the scratch
-	// 1:1 in region space and only reads inside the scissor, so the rest of the
-	// scratch is never touched. Same offsets on both sides keeps that 1:1.
-	// #862: snapshot only the rects the composite will actually read. The
-	// shader samples the scratch 1:1 in region space and only inside its
-	// scissor, so untouched scratch is never read. The clip rects are disjoint
-	// by construction, which vkCmdCopyImage requires of its regions.
-	VkImageCopy copies[8];
-	uint32_t copy_count = 0;
-	if (clip_active) {
-		for (uint32_t i = 0; i < clip_count; i++) {
+	/*
+	 * --- weave snapshot: the region (or just the #862 clip rects) of the
+	 * woven target → weave_scratch, then dst → COLOR_ATTACHMENT for the
+	 * composite render pass.
+	 *
+	 * Default: a 1:1 point-sampled REPLACE draw (DXR_VK_ZONES_COPY_TO_DRAW).
+	 * On Adreno a per-frame vkCmdCopyImage allocates and zeroes driver memory
+	 * inside the call; on the repaint thread this copy was ~30% of the
+	 * thread's CPU for the avatar demo, and the app's frame hand-off waits
+	 * on that thread. Same pixels: the draw writes exactly the rects the copy
+	 * wrote, at the same offsets, blending off. One difference, in the draw's
+	 * favour — it samples the target as ITS format and writes the scratch as
+	 * ITS format, so an R8G8B8A8 target (Android) reaches the B8G8R8A8 scratch
+	 * with its channels intact, where the raw copy swapped R and B in the
+	 * weave term (visible only through translucent 2D over the weave; the
+	 * zones band, where M = 0, never reads it).
+	 *
+	 * The copy remains for =0, for a target whose images are not SAMPLED, and
+	 * when the snapshot draw could not be built.
+	 */
+	const bool snapshot_draw = c->local2d_snapshot_ready && c->weave_scratch_fb != VK_NULL_HANDLE &&
+	                           comp_vk_native_target_images_sampled(c->target);
+	{
+		static bool snapshot_logged = false;
+		if (!snapshot_logged) {
+			snapshot_logged = true;
+			U_LOG_W("VK Local2D: weave snapshot = %s",
+			        snapshot_draw ? "point-sampled draw (no vkCmdCopyImage)"
+			                      : "vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW=0, target not SAMPLED, or "
+			                        "draw unavailable)");
+		}
+	}
+	if (snapshot_draw) {
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, dst_incoming,
+		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_local2d_composite_snapshot_draw(&c->local2d, vk, cmd, c->weave_scratch_fb, region_w, region_h,
+		                                   dst_view, dst_w, dst_h, clip_active ? clips : NULL, clip_count);
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, c->weave_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_SHADER_READ_BIT,
+		    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	} else {
+		// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
+		// → COLOR_ATTACHMENT for the composite render pass.
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, dst_incoming,
+		    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            k_color_sub);
+		// #862: snapshot only the clipped sub-rect — the shader samples the scratch
+		// 1:1 in region space and only reads inside the scissor, so the rest of the
+		// scratch is never touched. Same offsets on both sides keeps that 1:1.
+		// #862: snapshot only the rects the composite will actually read. The
+		// shader samples the scratch 1:1 in region space and only inside its
+		// scissor, so untouched scratch is never read. The clip rects are disjoint
+		// by construction, which vkCmdCopyImage requires of its regions.
+		VkImageCopy copies[8];
+		uint32_t copy_count = 0;
+		if (clip_active) {
+			for (uint32_t i = 0; i < clip_count; i++) {
+				copies[copy_count].srcSubresource =
+				    (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				copies[copy_count].srcOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+				copies[copy_count].dstSubresource =
+				    (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				copies[copy_count].dstOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+				copies[copy_count].extent =
+				    (VkExtent3D){clips[i].extent.width, clips[i].extent.height, 1};
+				copy_count++;
+			}
+		} else {
 			copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-			copies[copy_count].srcOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+			copies[copy_count].srcOffset = (VkOffset3D){0, 0, 0};
 			copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-			copies[copy_count].dstOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
-			copies[copy_count].extent =
-			    (VkExtent3D){clips[i].extent.width, clips[i].extent.height, 1};
+			copies[copy_count].dstOffset = (VkOffset3D){0, 0, 0};
+			copies[copy_count].extent = (VkExtent3D){region_w, region_h, 1};
 			copy_count++;
 		}
-	} else {
-		copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-		copies[copy_count].srcOffset = (VkOffset3D){0, 0, 0};
-		copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-		copies[copy_count].dstOffset = (VkOffset3D){0, 0, 0};
-		copies[copy_count].extent = (VkExtent3D){region_w, region_h, 1};
-		copy_count++;
+		vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy_count, copies);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_TRANSFER_READ_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 	}
-	vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy_count, copies);
-	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_TRANSFER_READ_BIT,
-	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 
 	// --- composite target framebuffer (over the rotating dst view).
 	if (c->composite_target_fb_view != dst_view || c->composite_fb_w != dst_w ||
@@ -17911,7 +17990,7 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c)
 	                      &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb);
 	vk_destroy_flatten_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
 	                      &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb);
-	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
+	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, &c->weave_scratch_fb);
 	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
 	              &c->implicit_mask_fb);
 	vk_destroy_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,

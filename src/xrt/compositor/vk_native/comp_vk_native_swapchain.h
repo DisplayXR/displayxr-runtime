@@ -154,6 +154,26 @@ bool
 comp_vk_native_srgb_mutable_view_enabled(void);
 
 /*!
+ * Kill switch for the zones / Local2D per-frame copies (runtime issue on the
+ * avatar's ~35 fps cap). True (the default) when
+ *
+ *  - the zones compose pass hands its private target to the atlas with a
+ *    REPLACE draw sampling the target's UNORM view (renderer), and
+ *  - the post-weave Local2D composite snapshots the weave target into
+ *    `weave_scratch` with a 1:1 point-sampled draw (compositor),
+ *
+ * instead of a vkCmdCopyImage each — on Adreno every such copy allocates and
+ * zeroes driver memory inside the call. `DXR_VK_ZONES_COPY_TO_DRAW=0` /
+ * Android `debug.dxr.vk_zones_copy_to_draw=0` restores both copies. The env,
+ * when set non-empty, wins over the property. Resolved (and logged) once per
+ * process.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_zones_copy_to_draw_enabled(void);
+
+/*!
  * #1559: record a raw copy of a source rect into this swapchain's UNORM
  * scratch image and return that image, so the compose blit reads the app's
  * bytes without an sRGB decode.
