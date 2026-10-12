@@ -291,6 +291,34 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 
 	c->base.base.base.destroy = client_gl_win32_compositor_destroy;
 
+	// #1956: the WGL_NV_DX_interop2 import renders into a device-local STAGING
+	// copy (BIND_SHADER_RESOURCE | BIND_RENDER_TARGET) and CopyResource's it into
+	// the shared image at release — a recipe that cannot be created for a depth
+	// family, and depth registration with wglDXRegisterObjectNV is unverified on
+	// every vendor. So the D3D11 service's depth formats are NOT offered to a GL
+	// app on this path: it sees no depth format (and skips depth) rather than one
+	// that fails xrCreateSwapchain. Follow-up: a depth staging recipe + interop
+	// check on hardware.
+	if (swapchain_create_fn == client_gl_d3d11_swapchain_create) {
+		uint32_t kept = 0;
+		for (uint32_t i = 0; i < c->base.base.base.info.format_count; i++) {
+			int64_t f = c->base.base.base.info.formats[i];
+			switch (f) {
+			case GL_DEPTH_COMPONENT16:
+			case GL_DEPTH_COMPONENT24:
+			case GL_DEPTH_COMPONENT32F:
+			case GL_DEPTH24_STENCIL8:
+			case GL_DEPTH32F_STENCIL8: continue;
+			default: c->base.base.base.info.formats[kept++] = f; break;
+			}
+		}
+		if (kept != c->base.base.base.info.format_count) {
+			U_LOG_W("GL client (WGL_NV_DX_interop2): %u depth format(s) not offered over IPC (#1956)",
+			        c->base.base.base.info.format_count - kept);
+		}
+		c->base.base.base.info.format_count = kept;
+	}
+
 	// #573 — transparent compositing output. If the service created a shared output
 	// texture for this (transparent) client, hand the shared texture + service→client
 	// fence to the render-API-agnostic presenter, which stands up a transparent

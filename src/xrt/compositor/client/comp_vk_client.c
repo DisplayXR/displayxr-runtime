@@ -41,6 +41,7 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
 #include "os/os_time.h" // os_monotonic_get_ns — VK [COMMIT_PROFILE_CLIENT]
 
 #include <stdlib.h> // getenv
+#include <inttypes.h> // PRId64
 
 // Phase 2 — forward decls of the IPC client compositor bridges. Mirrors the
 // pair the D3D11 client uses (see comp_d3d11_client.cpp). Resolved at link
@@ -1134,6 +1135,61 @@ client_vk_swapchain_create(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+static bool
+client_vk_is_depth_stencil_format(int64_t format)
+{
+	switch (format) {
+	case VK_FORMAT_D16_UNORM:
+	case VK_FORMAT_X8_D24_UNORM_PACK32:
+	case VK_FORMAT_D32_SFLOAT:
+	case VK_FORMAT_S8_UINT:
+	case VK_FORMAT_D16_UNORM_S8_UINT:
+	case VK_FORMAT_D24_UNORM_S8_UINT:
+	case VK_FORMAT_D32_SFLOAT_S8_UINT: return true;
+	default: return false;
+	}
+}
+
+/*!
+ * #1956: drop the depth formats this app's VkDevice cannot import from the
+ * Windows service.
+ *
+ * The D3D11 service allocates every image as an NT-handle-shared D3D11 texture
+ * (imported as VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, #1767), and it
+ * can only check that IT can share a depth format — not that the app's driver
+ * can import one (AMD has no D24_UNORM_S8_UINT at all, and D3D11_TEXTURE import
+ * of a depth family is a per-driver capability). Advertising a format the
+ * import then rejects turns "this app gets no depth" into "xrCreateSwapchain
+ * fails". Colour formats are left exactly as before.
+ */
+static void
+client_vk_filter_importable_depth_formats(struct client_vk_compositor *c)
+{
+	struct xrt_image_native probe = {0};
+	probe.is_d3d11_texture = true; // what comp_d3d11_service hands out
+	VkExternalMemoryHandleTypeFlags handle_type = vk_csci_get_image_external_handle_type(&c->vk, &probe);
+
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < c->base.base.info.format_count; i++) {
+		int64_t f = c->base.base.info.formats[i];
+		if (client_vk_is_depth_stencil_format(f)) {
+			bool importable = false;
+			vk_csci_get_image_external_support(&c->vk, (VkFormat)f, XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL,
+			                                   handle_type, &importable, NULL);
+			if (!importable) {
+				U_LOG_W("IPC Vulkan client: depth format %" PRId64
+				        " cannot be imported from the service on this device - not offered (#1956)",
+				        f);
+				continue;
+			}
+		}
+		c->base.base.info.formats[count++] = f;
+	}
+	c->base.base.info.format_count = count;
+}
+#endif
+
 struct client_vk_compositor *
 client_vk_compositor_create(struct xrt_compositor_native *xcn,
                             VkInstance instance,
@@ -1234,6 +1290,8 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		    "cross-process sharing at all).");
 		goto err_free;
 	}
+
+	client_vk_filter_importable_depth_formats(c);
 #endif
 
 	// If the native compositor says no external fence sync, clear the flag

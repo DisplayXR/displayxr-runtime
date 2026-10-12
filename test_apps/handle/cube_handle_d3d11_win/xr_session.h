@@ -39,6 +39,13 @@ extern uint32_t g_cursorDepthSpecVersion;
 // hand-tracking verify vehicle (`--hands` joint markers).
 extern bool g_hasHandTrackingExt;
 
+// #1956 — DXR_SUBMIT_DEPTH_LAYER=1 and the runtime advertises
+// XR_KHR_composition_layer_depth: render the scene's depth into an OpenXR
+// depth swapchain and chain XrCompositionLayerDepthInfoKHR on every projection
+// view. The smoke test for depth swapchains, in-process and over IPC
+// (XRT_FORCE_MODE=ipc / the shell), where the D3D11 service allocates them.
+extern bool g_submitDepthLayer;
+
 // #1488 — XR_EXT_view_configuration_views_change available + enabled on the
 // instance. This app is the reference consumer: it enables the extension and
 // re-enumerates when the recommended view size moves, but NEVER recreates a
