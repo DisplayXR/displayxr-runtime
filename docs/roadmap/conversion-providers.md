@@ -171,8 +171,8 @@ Selection runs per task, at stream or job create, and is deterministic:
 3. **Order.**
    - `PreferredProvider\<task>` first (HKCU over HKLM, unless `Policy\Lock` is set; §6.4).
    - Then ProbeOrder: vendor 50, default 100, `dp-lift` 150, open provider 200, sim 250. FALLBACK
-     providers always sort last.
-   - Then a direct row before a composed pipeline; then a provider-id tie-break, with one WARN.
+     providers sort last within this step; an explicit preference (above) still wins.
+   - Then a direct row before a composed pipeline; then a provider-id tie-break, then `cap_id` within a provider, with one WARN.
 4. **Pick the first, whatever its readiness.** INSTALLED, DOWNLOADING, WARMING and EVICTED are the
    only waited-for states. **Readiness never reorders.** A fall-through is logged once.
 5. **The preferred provider is re-selected at the next create**, never by moving a live stream.
@@ -188,7 +188,7 @@ re-selection.
 
 `displayxr-cli conv list` prints exactly this ordering, with a reason for every kept or dropped row.
 
-### 2.5 Readiness per (provider, task)
+### 2.5 Readiness per (provider, capability)
 
 Plug-in state values 0..7 are numerically equal to today's `XRT_DP_LIFT_MODULE_*`
 (`xrt_dp_lift.h:130-137`); INSTALLED, DOWNLOADING and EVICTED are appended as 8..10. The app enum
@@ -201,12 +201,12 @@ uses the same values (§7.2).
 | INSTALLED / EVICTED | warm, blobs missing, download allowed | DOWNLOADING (bytes/total) | the host downloads |
 | INSTALLED / EVICTED | warm, blobs missing, download forbidden by policy | ABSENT(`policy`) | terminal |
 | INSTALLED / EVICTED / download done | model present | WARMING (progress) | load + engine build + licence |
-| any warm | `est_vram_mb` exceeds the adapter with nothing evictable | FAILED(`RESOURCES`) | terminal until the budget changes |
+| any warm | `est_vram_mb` exceeds the adapter with nothing evictable (raised at warm time from INSTALLED / EVICTED) | FAILED(`RESOURCES`) | terminal until the budget changes |
 | WARMING | provider ready | READY | |
 | READY | idle beyond keep-alive | EVICTED | never while a stream or job is bound |
 | READY / WARMING | host crash or watchdog kill | WARMING (`restarting`, *n*) | streams survive (§3.5) |
-| any | crash-loop cutoff | FAILED(`crashed`) | |
-| WARMING | licence / platform / version / network failure | FAILED (reason) | network: backoff 15 s → 5 min |
+| any | crash-loop cutoff | FAILED(`crash_loop`) | |
+| WARMING | licence / platform / version / network failure | FAILED (reason) | any retryable failure (network, device lost): backoff 15 s doubling to 10 min |
 | any | `conv disable`, `Enabled=0` | DISABLED | |
 
 There is no `activated` boolean. A FAILED provider keeps its own retry triggers (a registry change,
@@ -425,7 +425,7 @@ the host between submit and signal; the compositor frame rate is unaffected.
    keep submitting latest-wins.
 4. After the backoff the dispatcher re-opens provider streams (implicit reset), re-registers images
    and resumes.
-5. A crash-loop cutoff → FAILED(`crashed`) → the stream moves per the §2.4 rebinding rule, or stays
+5. A crash-loop cutoff → FAILED(`crash_loop`) → the stream moves per the §2.4 rebinding rule, or stays
    alive in FAILED if there is no other candidate.
 
 ### 3.6 Restart Manager / update flow (P3)
