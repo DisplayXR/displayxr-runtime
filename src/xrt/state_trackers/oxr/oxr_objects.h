@@ -3249,6 +3249,9 @@ struct oxr_session
 		struct xrt_quat orientation;
 		//! One sprite unit: the canvas height scaled by the placement's t.
 		float unit;
+		//! The placement's filtered disparity (drives the crosstalk
+		//! softening, u_cursor_draw_soften).
+		float disparity;
 		//! That locate's ACTIVE view count. A projection layer may carry more
 		//! views (an app submitting for the worst-case mode under
 		//! PRIMARY_MULTIVIEW_DXR); only the active ones are tiles, so the

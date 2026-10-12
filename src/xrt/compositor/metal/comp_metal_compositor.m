@@ -547,6 +547,8 @@ struct comp_metal_compositor
 		struct u_cursor_draw_request req;
 		//! Built lazily: [premultiplied?][_sRGB target?].
 		id<MTLRenderPipelineState> pipe[2][2];
+		//! The same with the crosstalk-softening fragment (ADR-046 B.7).
+		id<MTLRenderPipelineState> pipe_soft[2][2];
 		bool pipes_failed;
 		//! The default look's sprite (premultiplied, _sRGB, PixelFormatView),
 		//! uploaded from @ref look whenever its generation moves.
@@ -4291,13 +4293,55 @@ static NSString *const metal_cursor_shader_source = @
     "                                texture2d<float> tex [[texture(0)]],\n"
     "                                sampler smp [[sampler(0)]]) {\n"
     "    return tex.sample(smp, in.uv);\n"
+    "}\n"
+    "// ADR-046 Amendment 2 B.7: the lifted cursor, softened against crosstalk.\n"
+    "// p.xy = blur radius in sprite uv, p.z = opacity, p.w = 1 for a STRAIGHT-\n"
+    "// alpha sprite. The quad is padded by the radius; a tap outside 0..1 is\n"
+    "// transparent. 13 taps: centre, 4 at r/2, 8 at r (Gaussian, sigma 0.6 r),\n"
+    "// accumulated premultiplied so a straight sprite's clear texels add no\n"
+    "// colour.\n"
+    "struct CursorSoften {\n"
+    "    float4 p;\n"
+    "};\n"
+    "static float4 cursor_tap(texture2d<float> tex, sampler smp, float2 uv, bool straight) {\n"
+    "    float4 s = tex.sample(smp, uv);\n"
+    "    if (straight) { s.rgb *= s.a; }\n"
+    "    return (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0) ? s : float4(0.0);\n"
+    "}\n"
+    "fragment float4 cursor_fragment_soft(CursorOut in [[stage_in]],\n"
+    "                                     texture2d<float> tex [[texture(0)]],\n"
+    "                                     sampler smp [[sampler(0)]],\n"
+    "                                     constant CursorSoften &cs [[buffer(0)]]) {\n"
+    "    const bool straight = cs.p.w > 0.5;\n"
+    "    const float2 r = cs.p.xy;\n"
+    "    float4 acc = cursor_tap(tex, smp, in.uv, straight);\n"
+    "    float wsum = 1.0;\n"
+    "    if (r.x > 0.0 || r.y > 0.0) {\n"
+    "        const float wi = 0.7066;\n"
+    "        const float wo = 0.2494;\n"
+    "        const float2 inner[4] = {float2(0.5, 0.0), float2(-0.5, 0.0), float2(0.0, 0.5), float2(0.0, -0.5)};\n"
+    "        for (int k = 0; k < 4; k++) {\n"
+    "            acc += wi * cursor_tap(tex, smp, in.uv + inner[k] * r, straight);\n"
+    "        }\n"
+    "        for (int k = 0; k < 8; k++) {\n"
+    "            const float a = 0.3927 + 0.7854 * float(k);\n"
+    "            acc += wo * cursor_tap(tex, smp, in.uv + float2(cos(a), sin(a)) * r, straight);\n"
+    "        }\n"
+    "        wsum += 4.0 * wi + 8.0 * wo;\n"
+    "    }\n"
+    "    acc /= wsum;\n"
+    "    if (straight) {\n"
+    "        const float3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : float3(0.0);\n"
+    "        return float4(rgb, acc.a * cs.p.z);\n"
+    "    }\n"
+    "    return acc * cs.p.z;\n"
     "}\n";
 
 //! Straight vs premultiplied blending, into the UNORM atlas or its _sRGB view.
 static bool
 metal_cursor_ensure_pipelines(struct comp_metal_compositor *c)
 {
-	if (c->cursor_draw.pipe[0][0] != nil) {
+	if (c->cursor_draw.pipe[0][0] != nil && c->cursor_draw.pipe_soft[0][0] != nil) {
 		return true;
 	}
 	if (c->cursor_draw.pipes_failed) {
@@ -4314,6 +4358,7 @@ metal_cursor_ensure_pipelines(struct comp_metal_compositor *c)
 	}
 	id<MTLFunction> vs = [lib newFunctionWithName:@"cursor_vertex"];
 	id<MTLFunction> fs = [lib newFunctionWithName:@"cursor_fragment"];
+	id<MTLFunction> fs_soft = [lib newFunctionWithName:@"cursor_fragment_soft"];
 	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
 	desc.vertexFunction = vs;
 	desc.fragmentFunction = fs;
@@ -4322,23 +4367,29 @@ metal_cursor_ensure_pipelines(struct comp_metal_compositor *c)
 	desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 	desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
 	desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-	bool ok = vs != nil && fs != nil;
-	for (uint32_t premul = 0; ok && premul < 2; premul++) {
-		desc.colorAttachments[0].sourceRGBBlendFactor =
-		    premul ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
-		for (uint32_t srgb = 0; ok && srgb < 2; srgb++) {
-			desc.colorAttachments[0].pixelFormat =
-			    srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
-			c->cursor_draw.pipe[premul][srgb] = [c->device newRenderPipelineStateWithDescriptor:desc
-			                                                                               error:&error];
-			if (c->cursor_draw.pipe[premul][srgb] == nil) {
-				U_LOG_E("cursor_draw: pipeline creation failed: %s",
-				        error != nil ? error.localizedDescription.UTF8String : "?");
-				ok = false;
+	bool ok = vs != nil && fs != nil && fs_soft != nil;
+	for (uint32_t soft = 0; ok && soft < 2; soft++) {
+		desc.fragmentFunction = soft ? fs_soft : fs;
+		for (uint32_t premul = 0; ok && premul < 2; premul++) {
+			desc.colorAttachments[0].sourceRGBBlendFactor =
+			    premul ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
+			for (uint32_t srgb = 0; ok && srgb < 2; srgb++) {
+				desc.colorAttachments[0].pixelFormat =
+				    srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+				id<MTLRenderPipelineState> *slot =
+				    soft ? &c->cursor_draw.pipe_soft[premul][srgb] : &c->cursor_draw.pipe[premul][srgb];
+				[*slot release];
+				*slot = [c->device newRenderPipelineStateWithDescriptor:desc error:&error];
+				if (*slot == nil) {
+					U_LOG_E("cursor_draw: pipeline creation failed: %s",
+					        error != nil ? error.localizedDescription.UTF8String : "?");
+					ok = false;
+				}
 			}
 		}
 	}
 	[desc release];
+	[fs_soft release];
 	[fs release];
 	[vs release];
 	[lib release];
@@ -4401,6 +4452,7 @@ metal_cursor_draw(struct comp_metal_compositor *c,
                   uint32_t atlas_view_w,
                   uint32_t atlas_view_h,
                   bool compose_linear,
+                  uint32_t canvas_px_w,
                   uint32_t canvas_px_h,
                   uint32_t zones_target_w,
                   uint32_t zones_target_h)
@@ -4416,6 +4468,10 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		return;
 	}
 	req = &zreq;
+	// The panel px that 0..1 of the (now tile-normalised) views span: the
+	// window for a zone request, else the canvas (ADR-046 B.7 ghost offset).
+	const float tile_px_w = (float)(req->zone_valid ? zones_target_w : canvas_px_w);
+	const float tile_px_h = (float)(req->zone_valid ? zones_target_h : canvas_px_h);
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 
 	if (!metal_cursor_ensure_pipelines(c)) {
@@ -4474,7 +4530,19 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 		return;
 	}
 
-	[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	// ADR-046 B.7: soften with lift against crosstalk - blur and opacity
+	// both exactly off on the glass (ghost 0, d 0), so an on-glass frame
+	// takes the crisp pipeline, bit-identical to the unsoftened draw.
+	// The blur cap follows the DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	const bool soft = soften.blur_px > 0.0f || soften.alpha < 1.0f;
+	if (soft) {
+		[encoder setRenderPipelineState:c->cursor_draw.pipe_soft[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	} else {
+		[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	}
 	[encoder setDepthStencilState:c->depth_stencil_state_disabled];
 	[encoder setFragmentTexture:src atIndex:0];
 	[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
@@ -4523,18 +4591,24 @@ metal_cursor_draw(struct comp_metal_compositor *c,
 
 		float xy[4][2];
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
-		static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+		// Padded by the blur radius (a no-op at radius 0), hotspot unmoved.
+		struct u_cursor_soften_quad sq;
+		u_cursor_draw_soften_quad(xy, tile_px_w, tile_px_h, soft ? soften.blur_px : 0.0f, &sq);
 		struct
 		{
 			float corners[4][4];
 		} cc;
 		for (int k = 0; k < 4; k++) {
-			cc.corners[k][0] = xy[k][0];
-			cc.corners[k][1] = xy[k][1];
-			cc.corners[k][2] = uv[k][0];
-			cc.corners[k][3] = flip_v ? 1.0f - uv[k][1] : uv[k][1];
+			cc.corners[k][0] = sq.corners[k][0];
+			cc.corners[k][1] = sq.corners[k][1];
+			cc.corners[k][2] = sq.uv[k][0];
+			cc.corners[k][3] = flip_v ? 1.0f - sq.uv[k][1] : sq.uv[k][1];
 		}
 		[encoder setVertexBytes:&cc length:sizeof(cc) atIndex:0];
+		if (soft) {
+			const float p[4] = {sq.radius_uv[0], sq.radius_uv[1], soften.alpha, premul ? 0.0f : 1.0f};
+			[encoder setFragmentBytes:p length:sizeof(p) atIndex:0];
+		}
 		[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 	}
 	[src release];
@@ -5734,14 +5808,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					        "(one-time warning)");
 				}
 			} else {
-				uint32_t canvas_px_h = 0;
-				if (eff_canvas.valid && eff_canvas.h > 0) {
+				uint32_t canvas_px_w = 0, canvas_px_h = 0;
+				if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
+					canvas_px_w = eff_canvas.w;
 					canvas_px_h = eff_canvas.h;
 				} else if (output_texture != nil) {
+					canvas_px_w = (uint32_t)output_texture.width;
 					canvas_px_h = (uint32_t)output_texture.height;
 				}
 				metal_cursor_draw(c, encoder, &cursor_req, atlas_cols, atlas_rows, atlas_view_w, atlas_view_h,
-				                  compose_linear, canvas_px_h, zones_target_w, zones_target_h);
+				                  compose_linear, canvas_px_w, canvas_px_h, zones_target_w, zones_target_h);
 			}
 		}
 
@@ -6269,6 +6345,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		for (uint32_t s = 0; s < 2; s++) {
 			[c->cursor_draw.pipe[p][s] release];
 			c->cursor_draw.pipe[p][s] = nil;
+			[c->cursor_draw.pipe_soft[p][s] release];
+			c->cursor_draw.pipe_soft[p][s] = nil;
 		}
 	}
 	[c->cursor_draw.default_tex release];

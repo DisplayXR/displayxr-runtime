@@ -563,6 +563,10 @@ struct u_cursor_draw_request
 	float hot_u, hot_v;
 	//! Sprite HEIGHT on the panel, metres; <= 0 = the OS cursor's size.
 	float size_m;
+	//! The placement's FILTERED disparity (eye baselines, < 0 = in front of
+	//! the glass) - the lift that drives the crosstalk softening
+	//! (u_cursor_draw_soften). 0 = on the glass.
+	float disparity;
 
 	/*!
 	 * XR_DXR_display_zones (#1949): the hint rode the zone-scoped locate of
@@ -1050,6 +1054,127 @@ u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
  */
 void
 u_cursor_measure_footprint_points(float tip_x, float tip_y, float height_px, float out_points[][2]);
+
+
+/*
+ *
+ * Crosstalk softening of the lifted cursor (ADR-046 Amendment 2 §B.7).
+ *
+ * On a lenticular / multiview panel a little of every view leaks into its
+ * neighbours. A lifted cursor's leaked copy sits one ghost offset away (the
+ * on-screen disparity between the drawn views), and how visible it is scales
+ * with the sprite's contrast times its edge sharpness. On the glass the views
+ * coincide and there is no ghost. So the drawn cursor is softened with lift,
+ * both effects exactly zero on the glass:
+ *
+ * - edge blur, radius = k x |ghost offset| panel px, capped - the multiview
+ *   anti-aliasing rule (low-pass in proportion to the depth offset), which
+ *   reads as natural depth of field;
+ * - opacity, 1 -> alpha_min with a smoothstep over |disparity| up to full_d.
+ *
+ */
+
+//! Panel px of blur per panel px of ghost offset.
+#define U_CURSOR_SOFTEN_DEFAULT_BLUR_K 0.1f
+//! Hard ceiling on the blur radius, panel px (the real cap is blur_max_frac).
+#define U_CURSOR_SOFTEN_DEFAULT_BLUR_MAX_PX 8.0f
+//! Blur radius cap as a fraction of the DRAWN sprite height: proportional, so
+//! it reads the same at 96 and 240 DPI and at accessibility pointer sizes.
+//! 0.06 = ~4 px on a 64 px arrow (240 DPI), the value David chose on the win
+//! SR panel (2026-10-12; 1.5 px absolute was invisible there).
+#define U_CURSOR_SOFTEN_DEFAULT_BLUR_MAX_FRAC 0.06f
+//! Opacity at full lift (David's panel A/B: 0.75 was invisible).
+#define U_CURSOR_SOFTEN_DEFAULT_ALPHA_MIN 0.5f
+//! |disparity| (eye baselines) at which the opacity reaches alpha_min: 0.03 =
+//! the lift over typical content (a cube's front face), so it shows there.
+#define U_CURSOR_SOFTEN_DEFAULT_FULL_D 0.03f
+
+//! The softening knobs (DXR_CURSOR_SOFTEN*, read once by the compositors).
+struct u_cursor_soften_params
+{
+	bool blur;  //!< edge softening on
+	bool alpha; //!< opacity easing on
+	float blur_k;
+	float blur_max_px;   //!< hard ceiling, panel px
+	float blur_max_frac; //!< cap as a fraction of the drawn sprite height (0 = off)
+	float alpha_min;
+	float full_d;
+};
+
+//! One frame's softening: blur radius (panel px) and opacity multiplier.
+struct u_cursor_soften
+{
+	float blur_px;
+	float alpha;
+};
+
+//! The defaults: both effects on, the U_CURSOR_SOFTEN_DEFAULT_* values.
+void
+u_cursor_soften_params_default(struct u_cursor_soften_params *out);
+
+/*!
+ * Parse the DXR_CURSOR_SOFTEN* knobs (each may be NULL = default):
+ * @p mode "off" | "alpha" | "blur" | "both"; the numbers are floats. A value
+ * that does not parse, or is out of range (blur_k < 0, blur_max_px outside
+ * [0, 8], blur_max_frac outside [0, 0.5], alpha_min outside [0, 1],
+ * full_d <= 0), keeps its default.
+ *
+ * @return true if any knob differs from its default (the caller logs once).
+ */
+bool
+u_cursor_soften_params_parse(const char *mode,
+                             const char *blur_k,
+                             const char *blur_max_px,
+                             const char *blur_max_frac,
+                             const char *alpha_min,
+                             const char *full_d,
+                             struct u_cursor_soften_params *out);
+
+/*!
+ * The softening for a cursor drawn at filtered disparity @p d (eye baselines)
+ * whose views sit @p ghost_px panel px apart (u_cursor_draw_ghost_px).
+ * Both effects are 0 / 1 at d = 0 and ghost 0, grow monotonically with lift
+ * and are capped. Non-finite input = no softening.
+ */
+struct u_cursor_soften
+u_cursor_draw_soften(float d, float ghost_px, const struct u_cursor_soften_params *p);
+
+/*!
+ * As u_cursor_draw_soften, with the blur capped at blur_max_frac x
+ * @p sprite_px (the drawn sprite's height, panel px) as well as at
+ * blur_max_px. @p sprite_px <= 0 or non-finite = only the hard ceiling.
+ */
+struct u_cursor_soften
+u_cursor_draw_soften_sized(float d, float ghost_px, float sprite_px, const struct u_cursor_soften_params *p);
+
+/*!
+ * The ghost offset: the largest distance, in panel px, between the hotspot's
+ * positions in two NEIGHBOURING views (i, i + 1) of @p req - what crosstalk
+ * leaks. @p tile_px_w / @p tile_px_h: the panel px that 0..1 of the request's
+ * (tile-normalised, after u_cursor_draw_into_zone) coordinates span - the
+ * canvas, or the window for a zone request.
+ */
+float
+u_cursor_draw_ghost_px(const struct u_cursor_draw_request *req, float tile_px_w, float tile_px_h);
+
+/*!
+ * A softened sprite quad: @p corners (u_cursor_draw_corners order) padded by
+ * the blur radius on every side so the soft edge is not clipped, with the
+ * matching texture coordinates (outside 0..1 on the pad - the shader treats
+ * those taps as transparent) and the radius in sprite UV. The hotspot (and so
+ * the click point) does not move. @p blur_px <= 0, or a degenerate quad,
+ * returns the quad unpadded with radius 0.
+ */
+struct u_cursor_soften_quad
+{
+	float corners[4][2];
+	float uv[4][2];
+	float radius_uv[2];
+};
+
+void
+u_cursor_draw_soften_quad(
+    const float corners[4][2], float tile_px_w, float tile_px_h, float blur_px, struct u_cursor_soften_quad *out);
 
 #ifdef __cplusplus
 }

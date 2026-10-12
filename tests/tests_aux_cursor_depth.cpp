@@ -2370,3 +2370,265 @@ TEST_CASE("cursor_measure: CPU cost per measured frame (1080p / 4K SBS)", "[.ben
 		}
 	}
 }
+
+
+/*
+ *
+ * ADR-046 Amendment 2 B.7: crosstalk softening of the lifted cursor.
+ *
+ */
+
+TEST_CASE("cursor_soften: defaults - both on, the documented values")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	CHECK(p.blur);
+	CHECK(p.alpha);
+	CHECK(p.blur_k == Catch::Approx(0.1f));
+	CHECK(p.blur_max_px == Catch::Approx(8.0f));
+	CHECK(p.blur_max_frac == Catch::Approx(0.06f));
+	CHECK(p.alpha_min == Catch::Approx(0.5f));
+	CHECK(p.full_d == Catch::Approx(0.03f));
+}
+
+TEST_CASE("cursor_soften: on the glass there is no softening at all")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	const u_cursor_soften s = u_cursor_draw_soften(0.0f, 0.0f, &p);
+	CHECK(s.blur_px == 0.0f);
+	CHECK(s.alpha == 1.0f);
+	// A NULL params pointer and non-finite input are "no softening" too.
+	const u_cursor_soften n = u_cursor_draw_soften(-0.05f, 10.0f, nullptr);
+	CHECK((n.blur_px == 0.0f && n.alpha == 1.0f));
+	const u_cursor_soften f = u_cursor_draw_soften(NAN, INFINITY, &p);
+	CHECK((f.blur_px == 0.0f && f.alpha == 1.0f));
+}
+
+TEST_CASE("cursor_soften: blur = k x ghost, capped; monotonic in the ghost offset")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	p.blur_max_px = 1.5f; // the absolute cap (the unsized entry point applies only this)
+	// Below the cap: exactly k x ghost (sign of the offset is irrelevant).
+	CHECK(u_cursor_draw_soften(-0.02f, 5.0f, &p).blur_px == Catch::Approx(0.5f));
+	CHECK(u_cursor_draw_soften(-0.02f, -5.0f, &p).blur_px == Catch::Approx(0.5f));
+	CHECK(u_cursor_draw_soften(-0.02f, 14.0f, &p).blur_px == Catch::Approx(1.4f));
+	// At and beyond the cap.
+	CHECK(u_cursor_draw_soften(-0.02f, 15.0f, &p).blur_px == Catch::Approx(1.5f));
+	CHECK(u_cursor_draw_soften(-0.02f, 200.0f, &p).blur_px == Catch::Approx(1.5f));
+	float prev = -1.0f;
+	for (float g = 0.0f; g <= 40.0f; g += 0.5f) {
+		const float b = u_cursor_draw_soften(-0.02f, g, &p).blur_px;
+		CHECK(b >= prev);
+		CHECK(b <= p.blur_max_px);
+		prev = b;
+	}
+	// The blur depends on the ghost offset only, not on d.
+	CHECK(u_cursor_draw_soften(-0.5f, 5.0f, &p).blur_px == Catch::Approx(0.5f));
+}
+
+TEST_CASE("cursor_soften: opacity eases 1 -> alpha_min by smoothstep over |d|, then holds")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	p.alpha_min = 0.75f; // the numbers below are worked for these
+	p.full_d = 0.1f;
+	// Midpoint of a smoothstep is exactly half way.
+	CHECK(u_cursor_draw_soften(-0.05f, 0.0f, &p).alpha == Catch::Approx(0.875f));
+	// Quarter: smoothstep(0.25) = 0.15625.
+	CHECK(u_cursor_draw_soften(-0.025f, 0.0f, &p).alpha == Catch::Approx(1.0f - 0.25f * 0.15625f));
+	CHECK(u_cursor_draw_soften(-0.1f, 0.0f, &p).alpha == Catch::Approx(0.75f));
+	CHECK(u_cursor_draw_soften(-0.6f, 0.0f, &p).alpha == Catch::Approx(0.75f));
+	// |d|: symmetric (the policy never puts the cursor behind, but the
+	// easing must not go above 1 or below alpha_min for any input).
+	CHECK(u_cursor_draw_soften(0.05f, 0.0f, &p).alpha == Catch::Approx(0.875f));
+	float prev = 2.0f;
+	for (float d = 0.0f; d >= -0.3f; d -= 0.005f) {
+		const float a = u_cursor_draw_soften(d, 0.0f, &p).alpha;
+		CHECK(a <= prev);
+		CHECK(a >= p.alpha_min - 1e-6f);
+		CHECK(a <= 1.0f);
+		prev = a;
+	}
+	// Smooth start: the slope at d = 0 is zero (tiny lift, ~no fade).
+	CHECK(u_cursor_draw_soften(-0.001f, 0.0f, &p).alpha > 0.9999f);
+}
+
+TEST_CASE("cursor_soften: the presets switch each effect independently")
+{
+	u_cursor_soften_params p;
+	CHECK(!u_cursor_soften_params_parse(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &p));
+	CHECK((p.blur && p.alpha));
+	CHECK(!u_cursor_soften_params_parse("both", nullptr, nullptr, nullptr, nullptr, nullptr, &p));
+	CHECK((p.blur && p.alpha));
+
+	CHECK(u_cursor_soften_params_parse("off", nullptr, nullptr, nullptr, nullptr, nullptr, &p));
+	u_cursor_soften s = u_cursor_draw_soften(-0.2f, 30.0f, &p);
+	CHECK((s.blur_px == 0.0f && s.alpha == 1.0f));
+
+	CHECK(u_cursor_soften_params_parse("alpha", nullptr, nullptr, nullptr, nullptr, nullptr, &p));
+	s = u_cursor_draw_soften(-0.2f, 30.0f, &p);
+	CHECK(s.blur_px == 0.0f);
+	CHECK(s.alpha == Catch::Approx(U_CURSOR_SOFTEN_DEFAULT_ALPHA_MIN));
+
+	CHECK(u_cursor_soften_params_parse("blur", nullptr, nullptr, nullptr, nullptr, nullptr, &p));
+	s = u_cursor_draw_soften(-0.2f, 30.0f, &p);
+	CHECK(s.blur_px == Catch::Approx(0.1f * 30.0f)); // k x ghost, under the 8 px ceiling (unsized)
+	CHECK(s.alpha == 1.0f);
+}
+
+TEST_CASE("cursor_soften: numeric knobs parse, and bad values keep the default")
+{
+	u_cursor_soften_params p;
+	CHECK(u_cursor_soften_params_parse(nullptr, "0.2", "2", nullptr, "0.5", "0.05", &p));
+	CHECK(p.blur_k == Catch::Approx(0.2f));
+	CHECK(p.blur_max_px == Catch::Approx(2.0f));
+	CHECK(p.alpha_min == Catch::Approx(0.5f));
+	CHECK(p.full_d == Catch::Approx(0.05f));
+	const u_cursor_soften s = u_cursor_draw_soften(-0.05f, 5.0f, &p);
+	CHECK(s.blur_px == Catch::Approx(1.0f));
+	CHECK(s.alpha == Catch::Approx(0.5f));
+
+	// Out of range / garbage: each falls back on its own.
+	CHECK(!u_cursor_soften_params_parse(nullptr, "-1", "9", "0.9", "1.5", "0", &p));
+	CHECK(p.blur_k == Catch::Approx(0.1f));
+	CHECK(p.blur_max_px == Catch::Approx(8.0f));
+	CHECK(p.blur_max_frac == Catch::Approx(0.06f));
+	CHECK(p.alpha_min == Catch::Approx(0.5f));
+	CHECK(p.full_d == Catch::Approx(0.03f));
+	CHECK(!u_cursor_soften_params_parse(nullptr, "abc", "1x", nullptr, "", "nan", &p));
+	CHECK(p.blur_k == Catch::Approx(0.1f));
+	CHECK(p.full_d == Catch::Approx(0.03f));
+	// Windows cmd's `set X=off && app` leaves a trailing space: still honoured.
+	CHECK(u_cursor_soften_params_parse("off ", nullptr, "2 ", nullptr, nullptr, nullptr, &p));
+	CHECK((!p.blur && !p.alpha));
+	CHECK(p.blur_max_px == Catch::Approx(2.0f));
+	CHECK(u_cursor_soften_params_parse("blurx", nullptr, nullptr, nullptr, nullptr, nullptr, &p) == false);
+	CHECK((p.blur && p.alpha));
+	// Boundaries that are legal: k = 0 and max = 0 disable the blur.
+	CHECK(u_cursor_soften_params_parse(nullptr, "0", nullptr, nullptr, "1", nullptr, &p));
+	CHECK(u_cursor_draw_soften(-0.2f, 30.0f, &p).blur_px == 0.0f);
+	CHECK(u_cursor_draw_soften(-0.2f, 30.0f, &p).alpha == Catch::Approx(1.0f));
+}
+
+TEST_CASE("cursor_soften: ghost offset = largest NEIGHBOUR-view hotspot distance, in panel px")
+{
+	u_cursor_draw_request req{};
+	req.view_count = 2;
+	req.view[0].origin[0] = 0.50f;
+	req.view[0].origin[1] = 0.40f;
+	req.view[1].origin[0] = 0.51f; // 0.01 of a 1920 px canvas = 19.2 px
+	req.view[1].origin[1] = 0.40f;
+	CHECK(u_cursor_draw_ghost_px(&req, 1920.0f, 1080.0f) == Catch::Approx(19.2f));
+	// Same view positions = on the glass: no ghost.
+	req.view[1].origin[0] = 0.50f;
+	CHECK(u_cursor_draw_ghost_px(&req, 1920.0f, 1080.0f) == 0.0f);
+	// Vertical component counts with the tile's height.
+	req.view[1].origin[1] = 0.41f;
+	CHECK(u_cursor_draw_ghost_px(&req, 1920.0f, 1000.0f) == Catch::Approx(10.0f));
+	// Four views: neighbours only (0-3 spans three gaps), the largest wins.
+	req.view_count = 4;
+	for (int i = 0; i < 4; i++) {
+		req.view[i].origin[1] = 0.4f;
+	}
+	req.view[0].origin[0] = 0.50f;
+	req.view[1].origin[0] = 0.51f;
+	req.view[2].origin[0] = 0.53f;
+	req.view[3].origin[0] = 0.54f;
+	CHECK(u_cursor_draw_ghost_px(&req, 1000.0f, 1000.0f) == Catch::Approx(20.0f));
+	// No canvas size, no ghost; one view, no ghost.
+	CHECK(u_cursor_draw_ghost_px(&req, 0.0f, 1000.0f) == 0.0f);
+	req.view_count = 1;
+	CHECK(u_cursor_draw_ghost_px(&req, 1000.0f, 1000.0f) == 0.0f);
+	CHECK(u_cursor_draw_ghost_px(nullptr, 1000.0f, 1000.0f) == 0.0f);
+}
+
+TEST_CASE("cursor_soften: the padded quad grows by the blur radius, hotspot fixed")
+{
+	// A 20 x 40 px sprite in a 1000 x 1000 px tile, hotspot at its top-left.
+	u_cursor_draw_view v{};
+	v.origin[0] = 0.5f;
+	v.origin[1] = 0.5f;
+	v.axis_x[0] = 1.0f;  // one unit = the tile, display right = tile right
+	v.axis_y[1] = -1.0f; // display up = tile up
+	float xy[4][2];
+	u_cursor_draw_corners(&v, 0.04f, 0.5f, 0.0f, 0.0f, xy);
+
+	u_cursor_soften_quad q;
+	// No blur: unpadded, standard uv, radius 0.
+	u_cursor_draw_soften_quad(xy, 1000.0f, 1000.0f, 0.0f, &q);
+	CHECK(q.radius_uv[0] == 0.0f);
+	CHECK(q.radius_uv[1] == 0.0f);
+	for (int k = 0; k < 4; k++) {
+		CHECK(q.corners[k][0] == xy[k][0]);
+		CHECK(q.corners[k][1] == xy[k][1]);
+	}
+	CHECK((q.uv[0][0] == 0.0f && q.uv[0][1] == 0.0f && q.uv[3][0] == 1.0f && q.uv[3][1] == 1.0f));
+
+	// 2 px blur: radius = 2 / 20 in u, 2 / 40 in v; every edge moves 2 px out.
+	u_cursor_draw_soften_quad(xy, 1000.0f, 1000.0f, 2.0f, &q);
+	CHECK(q.radius_uv[0] == Catch::Approx(0.1f));
+	CHECK(q.radius_uv[1] == Catch::Approx(0.05f));
+	CHECK(q.uv[0][0] == Catch::Approx(-0.1f));
+	CHECK(q.uv[0][1] == Catch::Approx(-0.05f));
+	CHECK(q.uv[3][0] == Catch::Approx(1.1f));
+	CHECK(q.uv[3][1] == Catch::Approx(1.05f));
+	// Top-left corner moved 2 px left and 2 px up (tile y down).
+	CHECK(q.corners[0][0] == Catch::Approx(xy[0][0] - 0.002f));
+	CHECK(q.corners[0][1] == Catch::Approx(xy[0][1] - 0.002f));
+	// Bottom-right moved 2 px right and down.
+	CHECK(q.corners[3][0] == Catch::Approx(xy[3][0] + 0.002f));
+	CHECK(q.corners[3][1] == Catch::Approx(xy[3][1] + 0.002f));
+	// The uv -> position map is unchanged: uv (0, 0) - the hotspot here -
+	// still lands on the view's origin (the click point does not move).
+	const float u0 = -q.uv[0][0] / (q.uv[2][0] - q.uv[0][0]);
+	const float v0 = -q.uv[0][1] / (q.uv[1][1] - q.uv[0][1]);
+	const float hx =
+	    q.corners[0][0] + u0 * (q.corners[2][0] - q.corners[0][0]) + v0 * (q.corners[1][0] - q.corners[0][0]);
+	const float hy =
+	    q.corners[0][1] + u0 * (q.corners[2][1] - q.corners[0][1]) + v0 * (q.corners[1][1] - q.corners[0][1]);
+	CHECK(hx == Catch::Approx(0.5f));
+	CHECK(hy == Catch::Approx(0.5f));
+
+	// A degenerate quad is returned unpadded.
+	float flat[4][2] = {{0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}};
+	u_cursor_draw_soften_quad(flat, 1000.0f, 1000.0f, 2.0f, &q);
+	CHECK(q.radius_uv[0] == 0.0f);
+}
+
+TEST_CASE("cursor_soften: the blur cap is proportional to the DRAWN sprite height")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	// A big ghost: the blur sits at its cap.
+	const float ghost = 200.0f;
+	// 0.06 x 64 px (the mirrored arrow at 240 DPI) = 3.84 px - David's ~4 px.
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, 64.0f, &p).blur_px == Catch::Approx(3.84f));
+	// The same cursor at 96 DPI (~25.6 px) gets the same blur RELATIVE to its size.
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, 25.6f, &p).blur_px == Catch::Approx(1.536f));
+	// A huge accessibility pointer is held at the hard ceiling.
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, 256.0f, &p).blur_px == Catch::Approx(p.blur_max_px));
+	// Below the cap it is still k x ghost.
+	CHECK(u_cursor_draw_soften_sized(-0.05f, 20.0f, 64.0f, &p).blur_px == Catch::Approx(2.0f));
+	// Unknown size: only the ceiling (the unsized entry point is exactly that).
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, 0.0f, &p).blur_px == Catch::Approx(p.blur_max_px));
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, NAN, &p).blur_px ==
+	      u_cursor_draw_soften(-0.05f, ghost, &p).blur_px);
+	// frac = 0 turns the proportional cap off.
+	p.blur_max_frac = 0.0f;
+	CHECK(u_cursor_draw_soften_sized(-0.05f, ghost, 64.0f, &p).blur_px == Catch::Approx(p.blur_max_px));
+	// On the glass: nothing, whatever the size.
+	u_cursor_soften_params_default(&p);
+	const u_cursor_soften g = u_cursor_draw_soften_sized(0.0f, 0.0f, 64.0f, &p);
+	CHECK((g.blur_px == 0.0f && g.alpha == 1.0f));
+}
+
+TEST_CASE("cursor_soften: the default opacity reaches 0.5 at the typical lift (0.03)")
+{
+	u_cursor_soften_params p;
+	u_cursor_soften_params_default(&p);
+	CHECK(u_cursor_draw_soften(-0.03f, 0.0f, &p).alpha == Catch::Approx(0.5f));
+	CHECK(u_cursor_draw_soften(-0.015f, 0.0f, &p).alpha == Catch::Approx(0.75f)); // smoothstep midpoint
+	CHECK(u_cursor_draw_soften(-0.2f, 0.0f, &p).alpha == Catch::Approx(0.5f));
+}

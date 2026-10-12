@@ -68,6 +68,29 @@ comp_cursor_draw_debug_refuse(const struct u_cursor_draw_request *req)
 	return true;
 }
 
+const struct u_cursor_soften_params *
+comp_cursor_soften_params(void)
+{
+	static struct u_cursor_soften_params params;
+	static bool read = false;
+	if (!read) {
+		const bool changed = u_cursor_soften_params_parse(
+		    getenv("DXR_CURSOR_SOFTEN"), getenv("DXR_CURSOR_SOFTEN_BLUR_K"),
+		    getenv("DXR_CURSOR_SOFTEN_BLUR_MAX_PX"), getenv("DXR_CURSOR_SOFTEN_BLUR_MAX_FRAC"),
+		    getenv("DXR_CURSOR_SOFTEN_ALPHA_MIN"), getenv("DXR_CURSOR_SOFTEN_FULL_D"), &params);
+		read = true;
+		U_LOG_W(
+		    "cursor_draw: crosstalk softening %s%s%s (blur k %.3f, max %.3f x sprite height, ceiling %.2f px; "
+		    "alpha min %.2f at |d| %.3f)%s "
+		    "(DXR_CURSOR_SOFTEN*, ADR-046 Amendment 2 B.7, one-time notice)",
+		    params.blur || params.alpha ? "" : "OFF", params.blur ? "blur" : "",
+		    params.blur && params.alpha ? "+alpha" : (params.alpha ? "alpha" : ""), params.blur_k,
+		    params.blur_max_frac, params.blur_max_px, params.alpha_min, params.full_d,
+		    changed ? " [env override]" : "");
+	}
+	return &params;
+}
+
 //! The classic arrow (Amendment 2 A.6): 12 x 19, tip = hotspot.
 static bool
 use_arrow(struct comp_cursor_look *look)

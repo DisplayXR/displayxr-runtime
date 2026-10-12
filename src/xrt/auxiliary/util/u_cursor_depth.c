@@ -12,6 +12,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <string.h>
 
 static inline struct xrt_vec3
 v3_sub(struct xrt_vec3 a, struct xrt_vec3 b)
@@ -1640,4 +1642,156 @@ u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
 	}
 	// measured < 0 ? max(measured - margin_px, cap_px) : 0 - A.1 in pixels.
 	return u_cursor_depth_target(t, true, measured_px / px_per_baseline) * px_per_baseline;
+}
+
+
+/*
+ *
+ * Crosstalk softening of the lifted cursor (ADR-046 Amendment 2 B.7).
+ *
+ */
+
+void
+u_cursor_soften_params_default(struct u_cursor_soften_params *out)
+{
+	out->blur = true;
+	out->alpha = true;
+	out->blur_k = U_CURSOR_SOFTEN_DEFAULT_BLUR_K;
+	out->blur_max_px = U_CURSOR_SOFTEN_DEFAULT_BLUR_MAX_PX;
+	out->blur_max_frac = U_CURSOR_SOFTEN_DEFAULT_BLUR_MAX_FRAC;
+	out->alpha_min = U_CURSOR_SOFTEN_DEFAULT_ALPHA_MIN;
+	out->full_d = U_CURSOR_SOFTEN_DEFAULT_FULL_D;
+}
+
+// A finite float in [lo, hi] (hi_open: < hi), else false.
+static bool
+soften_parse_float(const char *s, float lo, float hi, bool lo_open, float *out)
+{
+	if (s == NULL || *s == '\0') {
+		return false;
+	}
+	char *end = NULL;
+	const double v = strtod(s, &end);
+	while (end != NULL && (*end == ' ' || *end == '\t')) {
+		end++; // cmd's `set X=1 && ...` keeps the trailing space
+	}
+	if (end == s || *end != '\0' || !isfinite(v) || v > hi || v < lo || (lo_open && v <= lo)) {
+		return false;
+	}
+	*out = (float)v;
+	return true;
+}
+
+bool
+u_cursor_soften_params_parse(const char *mode,
+                             const char *blur_k,
+                             const char *blur_max_px,
+                             const char *blur_max_frac,
+                             const char *alpha_min,
+                             const char *full_d,
+                             struct u_cursor_soften_params *out)
+{
+	u_cursor_soften_params_default(out);
+	bool changed = false;
+	if (mode != NULL) {
+		// Compare the leading word: cmd's `set X=off && ...` keeps a space.
+		size_t n = strcspn(mode, " \t");
+		if (n == 3 && strncmp(mode, "off", 3) == 0) {
+			out->blur = out->alpha = false;
+		} else if (n == 5 && strncmp(mode, "alpha", 5) == 0) {
+			out->blur = false;
+		} else if (n == 4 && strncmp(mode, "blur", 4) == 0) {
+			out->alpha = false;
+		}
+		// "both" or anything else: the default (both on).
+		changed = !out->blur || !out->alpha;
+	}
+	changed |= soften_parse_float(blur_k, 0.0f, 1000.0f, false, &out->blur_k);
+	changed |= soften_parse_float(blur_max_px, 0.0f, 8.0f, false, &out->blur_max_px);
+	changed |= soften_parse_float(blur_max_frac, 0.0f, 0.5f, false, &out->blur_max_frac);
+	changed |= soften_parse_float(alpha_min, 0.0f, 1.0f, false, &out->alpha_min);
+	changed |= soften_parse_float(full_d, 0.0f, 1000.0f, true, &out->full_d);
+	return changed;
+}
+
+struct u_cursor_soften
+u_cursor_draw_soften(float d, float ghost_px, const struct u_cursor_soften_params *p)
+{
+	return u_cursor_draw_soften_sized(d, ghost_px, 0.0f, p);
+}
+
+struct u_cursor_soften
+u_cursor_draw_soften_sized(float d, float ghost_px, float sprite_px, const struct u_cursor_soften_params *p)
+{
+	struct u_cursor_soften s = {0.0f, 1.0f};
+	if (p == NULL) {
+		return s;
+	}
+	if (p->blur && isfinite(ghost_px) && p->blur_k > 0.0f && p->blur_max_px > 0.0f) {
+		float cap = p->blur_max_px;
+		if (p->blur_max_frac > 0.0f && isfinite(sprite_px) && sprite_px > 0.0f) {
+			const float rel = p->blur_max_frac * sprite_px; // proportional to the drawn cursor
+			cap = rel < cap ? rel : cap;
+		}
+		const float b = p->blur_k * fabsf(ghost_px);
+		s.blur_px = b < cap ? b : cap;
+	}
+	if (p->alpha && isfinite(d) && p->full_d > 0.0f) {
+		float x = fabsf(d) / p->full_d;
+		x = x < 1.0f ? x : 1.0f;
+		const float ease = x * x * (3.0f - 2.0f * x); // smoothstep(0, full_d, |d|)
+		const float amin = p->alpha_min < 0.0f ? 0.0f : (p->alpha_min > 1.0f ? 1.0f : p->alpha_min);
+		s.alpha = 1.0f - (1.0f - amin) * ease;
+	}
+	return s;
+}
+
+float
+u_cursor_draw_ghost_px(const struct u_cursor_draw_request *req, float tile_px_w, float tile_px_h)
+{
+	if (req == NULL || !(tile_px_w > 0.0f) || !(tile_px_h > 0.0f)) {
+		return 0.0f;
+	}
+	const uint32_t n = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	float ghost = 0.0f;
+	for (uint32_t i = 0; i + 1 < n; i++) {
+		const float dx = (req->view[i + 1].origin[0] - req->view[i].origin[0]) * tile_px_w;
+		const float dy = (req->view[i + 1].origin[1] - req->view[i].origin[1]) * tile_px_h;
+		const float g = sqrtf(dx * dx + dy * dy);
+		if (isfinite(g) && g > ghost) {
+			ghost = g;
+		}
+	}
+	return ghost;
+}
+
+void
+u_cursor_draw_soften_quad(
+    const float corners[4][2], float tile_px_w, float tile_px_h, float blur_px, struct u_cursor_soften_quad *out)
+{
+	static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+	memcpy(out->corners, corners, sizeof(out->corners));
+	memcpy(out->uv, uv, sizeof(out->uv));
+	out->radius_uv[0] = out->radius_uv[1] = 0.0f;
+
+	// The quad's u axis (TL -> TR) and v axis (TL -> BL), tile-normalised.
+	const float ux = corners[2][0] - corners[0][0], uy = corners[2][1] - corners[0][1];
+	const float vx = corners[1][0] - corners[0][0], vy = corners[1][1] - corners[0][1];
+	const float w_px = sqrtf(ux * ux * tile_px_w * tile_px_w + uy * uy * tile_px_h * tile_px_h);
+	const float h_px = sqrtf(vx * vx * tile_px_w * tile_px_w + vy * vy * tile_px_h * tile_px_h);
+	if (!(blur_px > 0.0f) || !(w_px > 0.0f) || !(h_px > 0.0f) || !isfinite(w_px) || !isfinite(h_px)) {
+		return;
+	}
+	const float ru = blur_px / w_px;
+	const float rv = blur_px / h_px;
+	out->radius_uv[0] = ru;
+	out->radius_uv[1] = rv;
+	for (int k = 0; k < 4; k++) {
+		const float u = uv[k][0] > 0.5f ? 1.0f + ru : -ru;
+		const float v = uv[k][1] > 0.5f ? 1.0f + rv : -rv;
+		out->uv[k][0] = u;
+		out->uv[k][1] = v;
+		out->corners[k][0] = corners[0][0] + u * ux + v * vx;
+		out->corners[k][1] = corners[0][1] + u * uy + v * vy;
+	}
 }

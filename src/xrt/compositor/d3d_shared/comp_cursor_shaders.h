@@ -63,6 +63,15 @@ VS_OUTPUT main(uint vertex_id : SV_VertexID)
 // is One / InvSrcAlpha either way.
 // Compiled with `DXR_LAYERED` defined for a layered (arraySize > 1) sprite
 // swapchain, whose SRV is a Texture2DArray: the spec samples array layer 0.
+//
+// Compiled with `DXR_SOFTEN` defined (D3D11 only, for now) for the lifted
+// cursor's crosstalk softening (ADR-046 Amendment 2 B.7): a 13-tap Gaussian
+// blur (centre, 4 at r/2, 8 at r; sigma 0.6 r) of the sprite, accumulated
+// premultiplied, times an opacity. The quad is padded by the radius
+// (u_cursor_draw_soften_quad) and a tap outside 0..1 is transparent. Its
+// parameters sit in their OWN constant buffer, b1, so the b0 layout - and
+// D3D12's 16 root constants, which compile this source without DXR_SOFTEN -
+// are unchanged.
 static const char *cursor_quad_ps_source = R"(
 #ifdef DXR_LAYERED
 Texture2DArray sprite_tex : register(t0);
@@ -71,7 +80,7 @@ Texture2D sprite_tex : register(t0);
 #endif
 SamplerState sprite_samp : register(s0);
 
-float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+float4 sprite_sample(float2 uv)
 {
 #ifdef DXR_LAYERED
     return sprite_tex.Sample(sprite_samp, float3(uv, 0.0));
@@ -79,4 +88,61 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     return sprite_tex.Sample(sprite_samp, uv);
 #endif
 }
+
+#ifdef DXR_SOFTEN
+// soften.xy = blur radius in sprite uv, .z = opacity, .w = 1 for a STRAIGHT-
+// alpha sprite (the app's), 0 for a premultiplied one (the default look).
+cbuffer CursorSoftenCB : register(b1)
+{
+    float4 soften;
+};
+
+float4 soft_tap(float2 uv, bool straight)
+{
+    float4 s = sprite_sample(uv);
+    if (straight) {
+        s.rgb *= s.a;
+    }
+    bool inside = uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0;
+    return inside ? s : float4(0.0, 0.0, 0.0, 0.0);
+}
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    const bool straight = soften.w > 0.5;
+    const float2 r = soften.xy;
+    float4 acc = soft_tap(uv, straight);
+    float wsum = 1.0;
+    if (r.x > 0.0 || r.y > 0.0) {
+        const float wi = 0.7066;
+        const float wo = 0.2494;
+        acc += wi * soft_tap(uv + float2(0.5, 0.0) * r, straight);
+        acc += wi * soft_tap(uv + float2(-0.5, 0.0) * r, straight);
+        acc += wi * soft_tap(uv + float2(0.0, 0.5) * r, straight);
+        acc += wi * soft_tap(uv + float2(0.0, -0.5) * r, straight);
+        [unroll] for (int k = 0; k < 8; k++) {
+            float a = 0.3927 + 0.7854 * (float)k;
+            acc += wo * soft_tap(uv + float2(cos(a), sin(a)) * r, straight);
+        }
+        wsum += 4.0 * wi + 8.0 * wo;
+    }
+    acc /= wsum;
+    if (straight) {
+        float3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : float3(0.0, 0.0, 0.0);
+        return float4(rgb, acc.a * soften.z);
+    }
+    return acc * soften.z;
+}
+#else
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    return sprite_sample(uv);
+}
+#endif
 )";
+
+//! The DXR_SOFTEN variant's b1 constants (4 floats; see above).
+struct CursorSoftenConstants
+{
+	float soften[4];
+};

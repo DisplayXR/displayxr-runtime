@@ -2166,6 +2166,7 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 	req.hot_u = sess->cursor_draw.hot_u;
 	req.hot_v = sess->cursor_draw.hot_v;
 	req.size_m = sess->cursor_draw.size_m;
+	req.disparity = sess->cursor_draw.disparity;
 	if (zones_frame) {
 		req.zone_valid = true;
 		req.zone_id = sess->cursor_draw.zone_id;

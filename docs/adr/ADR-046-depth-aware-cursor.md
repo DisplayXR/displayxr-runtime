@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -801,6 +801,70 @@ refusal is only known at the commit).
 - **Verification hook.** `DXR_CURSOR_DRAW_REFUSE=1` makes every compositor refuse (reason
   FORCED); `DXR_CURSOR_DRAW_REFUSE_PERIOD_MS=N` refuses during the first half of every N ms, so a
   single run shows `willDraw` flipping both ways (`compositor/util/comp_cursor_look.c`).
+
+#### §B.7 Crosstalk softening of the lifted cursor (2026-10-11)
+
+**Accepted** (David, 2026-10-11, after the Windows Leia panel check). A lifted runtime-drawn
+cursor with a white fill and sharp edges showed crosstalk ghosting. On a lenticular panel a
+little of each view leaks into its neighbours, so the leaked copy of the cursor sits one ghost
+offset away (the on-screen disparity between neighbouring drawn views). How visible it is scales
+with contrast times edge sharpness. On the glass the views coincide and there is no ghost.
+
+**Decision: soften with lift.** Both effects are exactly zero on the glass and grow with the
+same lift, the drawn cursor's disparity:
+
+- **Edge softening.** Blur radius in panel px = `k_blur` × |ghost offset px|, capped at
+  `blur_max_px`. This is the multiview anti-aliasing rule (low-pass in proportion to the depth
+  offset), and it reads as natural depth of field. The ghost offset is measured from the
+  request's own per-view hotspot positions (`u_cursor_draw_ghost_px`: the largest distance
+  between neighbouring views, in the canvas's panel px), so it is right for every rig, view
+  count and zone.
+- **Opacity.** It eases from 1 to `alpha_min` with a smoothstep over |disparity| up to
+  `full_d`. It is not the shell's 0.3: the cursor must stay the most legible thing on screen.
+- **Any sprite:** the mirrored OS cursor, the classic arrow, or the app's swapchain sprite.
+  The blur accumulates premultiplied, so a straight-alpha sprite's clear texels add no colour.
+- **Hotspot unchanged.** The quad is padded by the blur radius on every side
+  (`u_cursor_draw_soften_quad`) so the soft edge is not clipped. Its texture coordinates run
+  outside 0..1 on the pad, and the shader treats those taps as transparent. The uv → position
+  map, and so the click point, does not move.
+- **Cost.** 13 taps (centre, 4 at r/2, 8 at r; Gaussian, sigma 0.6 r) on one cursor-sized quad
+  per view, on cursor frames only. A frame whose softening is (0 px, 1.0) takes the crisp
+  pipeline, so the result is bit-identical to the unsoftened draw. §0 holds: the knobs are read
+  on the first cursor frame, and a session that never asks pays nothing.
+
+**Defaults, and why:**
+
+| Knob | Default | Why |
+|---|---|---|
+| `DXR_CURSOR_SOFTEN` | `both` | The panel showed the ghost with a default-look cursor; the fix is default-on for every runtime-drawn cursor. `off` / `alpha` / `blur` are the A/B presets. |
+| `DXR_CURSOR_SOFTEN_BLUR_K` | 0.1 | It reaches the cap at a ghost offset of about 15 px. On a ~0.09 mm-pitch Leia panel that is ~1.3 mm of crossed disparity, just past the 0.015-baseline margin (~1 mm). The blur therefore rises over the first millimetre of lift and then holds. |
+| `DXR_CURSOR_SOFTEN_BLUR_MAX_FRAC` | 0.06 × the drawn sprite height | The cap is **proportional to the cursor's drawn size**, so it reads the same at 96 and 240 DPI and with accessibility pointer sizes. 0.06 is ~4 px on the 64 px OS arrow at 240 DPI: David's pick on the Windows SR panel (2026-10-12), where a 1.5 px absolute cap was invisible. |
+| `DXR_CURSOR_SOFTEN_BLUR_MAX_PX` | 8 | A hard ceiling only, in panel px (the proportional cap does the work). |
+| `DXR_CURSOR_SOFTEN_ALPHA_MIN` | 0.5 | Half opacity at full lift. On the panel 0.75 was invisible; 0.5 helps and the cursor stays findable (the shell's 0.3 would not). |
+| `DXR_CURSOR_SOFTEN_FULL_D` | 0.03 baselines | The lift over typical content (a cube's front face is d ≈ −0.03). At 0.1 the fade never showed on the panel (alpha ≈ 0.93 over the cube). |
+
+All five are read once (`comp_cursor_soften_params`, one WARN line with the effective values),
+are parsed by the pure, unit-tested `u_cursor_soften_params_parse` / `u_cursor_draw_soften`, and
+are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settings.md`).
+
+**As built.** The state tracker now carries the placement's filtered disparity on the request
+(`u_cursor_draw_request::disparity`; internal struct, no spec change). Implemented in:
+
+- **Metal:** a `cursor_fragment_soft` function plus `pipe_soft[premul][srgb]`.
+- **D3D11 in-process:** a `DXR_SOFTEN` variant of the shared `comp_cursor_shaders.h` pixel
+  shader, plain and layered. Its parameters go in their own b1 constant buffer, so the b0 layout
+  and D3D12's 16 root constants are unchanged.
+
+**Follow-ups** (they still draw the crisp cursor and compile unchanged):
+
+- D3D12 (needs 4 more root constants, or a second root parameter);
+- vk_native and GL;
+- the D3D11 service drawer `svc_draw_cursor_quads` (the shell, lifted rects and IPC apps).
+
+**App opt-out.** An `XrCursorDepthDrawInfoDXR` flag to turn the softening off for a sprite that
+is already soft (or must stay crisp) comes with the next `XR_DXR_cursor_depth` spec bump. This
+change does not bump the extension: the softening is a drawing decision the runtime owns, like
+the default look.
 
 ### Rollout
 
