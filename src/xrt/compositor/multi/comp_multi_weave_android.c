@@ -368,8 +368,10 @@ weave_create_local(struct vk_bundle *vk,
                    VkImageView *out_view)
 {
 	VkExtent2D extent = {.width = w, .height = h};
+	// COLOR_ATTACHMENT: the rect-scoped un-squeeze draws into the SBS scratch.
 	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
-	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1036): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
@@ -494,6 +496,12 @@ static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	weave_eye_stage_release_all(vk, mc);
+	if (mc->weave.sbs_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, mc->weave.sbs_fb, NULL);
+		mc->weave.sbs_fb = VK_NULL_HANDLE;
+	}
+	mc->weave.sbs_dirty_count = 0;
+	mc->weave.sbs_dirty_full = true;
 	weave_release_local(vk, &mc->weave.sbs_image, &mc->weave.sbs_memory, &mc->weave.sbs_view);
 	mc->weave.sbs_w = 0;
 	mc->weave.sbs_h = 0;
@@ -505,6 +513,125 @@ weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
 	weave_release_local(vk, &mc->weave.crop_image, &mc->weave.crop_memory, &mc->weave.crop_view);
 	mc->weave.crop_w = 0;
 	mc->weave.crop_h = 0;
+}
+
+/*!
+ * Rect-scoped batch weave (the Android browser perf audit, 2026-10-11): the
+ * runtime's per-frame GPU cost was proportional to WINDOW pixels — a whole
+ * 2 x window SBS clear every frame plus a staging copy + blit per eye — while
+ * the content is a few element rects. `debug.dxr.weave_rect_scoped` = 0 restores
+ * the full-clear + copy/blit path (read once per client, logged once).
+ */
+static bool
+weave_rect_scoped_wanted(struct multi_compositor *mc)
+{
+	if (!mc->weave.rect_scoped_checked) {
+		char value[PROP_VALUE_MAX] = {0};
+		const bool set = __system_property_get("debug.dxr.weave_rect_scoped", value) > 0 && value[0] != '\0';
+		mc->weave.rect_scoped = !(set && value[0] == '0');
+		mc->weave.rect_scoped_checked = true;
+		U_LOG_W("weave(#1036): rect-scoped weave %s (debug.dxr.weave_rect_scoped=%s)",
+		        mc->weave.rect_scoped ? "ON: clear only vacated rects, one clamped draw per eye"
+		                              : "OFF: full SBS clear + per-eye staging copy/blit",
+		        set ? value : "unset");
+	}
+	return mc->weave.rect_scoped && !mc->weave.unsqueeze_failed;
+}
+
+/*!
+ * The clamped-copy pipeline + the SBS scratch framebuffer for it, created on
+ * first use / after the scratch is reallocated. false = stay on the copy+blit
+ * path for this frame (and for good, if the pipeline itself failed).
+ */
+static bool
+weave_unsqueeze_ready(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.unsqueeze_initialized) {
+		if (!vk_local2d_composite_init(&mc->weave.unsqueeze, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT) ||
+		    !vk_local2d_composite_init_clamped_copy(&mc->weave.unsqueeze, vk)) {
+			vk_local2d_composite_fini(&mc->weave.unsqueeze, vk);
+			mc->weave.unsqueeze_failed = true;
+			U_LOG_E("weave(#1036): rect-scoped un-squeeze pipeline init failed — copy+blit path");
+			return false;
+		}
+		mc->weave.unsqueeze_initialized = true;
+	}
+	if (mc->weave.sbs_fb == VK_NULL_HANDLE) {
+		if (mc->weave.sbs_view == VK_NULL_HANDLE) {
+			return false;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = mc->weave.unsqueeze.flatten_rp,
+		    .attachmentCount = 1,
+		    .pAttachments = &mc->weave.sbs_view,
+		    .width = mc->weave.sbs_w,
+		    .height = mc->weave.sbs_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &mc->weave.sbs_fb) != VK_SUCCESS) {
+			mc->weave.sbs_fb = VK_NULL_HANDLE;
+			U_LOG_E("weave(#1036): SBS scratch framebuffer failed — copy+blit path");
+			return false;
+		}
+	}
+	return true;
+}
+
+/*!
+ * @p a minus the union of @p b[0..nb): appends up to 4 pieces per subtraction
+ * step to @p out (capacity @p cap). Returns the count, or UINT32_MAX when the
+ * result does not fit (the caller then clears the whole image).
+ */
+static uint32_t
+weave_rect_subtract(VkRect2D a, const VkRect2D *b, uint32_t nb, VkRect2D *out, uint32_t cap)
+{
+	VkRect2D work[64];
+	uint32_t n = 0;
+	work[n++] = a;
+	for (uint32_t j = 0; j < nb && n > 0; j++) {
+		const int32_t bx0 = b[j].offset.x, by0 = b[j].offset.y;
+		const int32_t bx1 = bx0 + (int32_t)b[j].extent.width, by1 = by0 + (int32_t)b[j].extent.height;
+		VkRect2D next[64];
+		uint32_t m = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			const int32_t ax0 = work[i].offset.x, ay0 = work[i].offset.y;
+			const int32_t ax1 = ax0 + (int32_t)work[i].extent.width;
+			const int32_t ay1 = ay0 + (int32_t)work[i].extent.height;
+			if (bx1 <= ax0 || bx0 >= ax1 || by1 <= ay0 || by0 >= ay1) { // disjoint
+				if (m >= 64) {
+					return UINT32_MAX;
+				}
+				next[m++] = work[i];
+				continue;
+			}
+			const int32_t ix0 = bx0 > ax0 ? bx0 : ax0, ix1 = bx1 < ax1 ? bx1 : ax1;
+			const int32_t iy0 = by0 > ay0 ? by0 : ay0, iy1 = by1 < ay1 ? by1 : ay1;
+			// Top band, bottom band (full width), left + right of the overlap row.
+			const VkRect2D pieces[4] = {
+			    {{ax0, ay0}, {(uint32_t)(ax1 - ax0), (uint32_t)(iy0 - ay0)}},
+			    {{ax0, iy1}, {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - iy1)}},
+			    {{ax0, iy0}, {(uint32_t)(ix0 - ax0), (uint32_t)(iy1 - iy0)}},
+			    {{ix1, iy0}, {(uint32_t)(ax1 - ix1), (uint32_t)(iy1 - iy0)}},
+			};
+			for (uint32_t k = 0; k < 4; k++) {
+				if (pieces[k].extent.width == 0 || pieces[k].extent.height == 0) {
+					continue;
+				}
+				if (m >= 64) {
+					return UINT32_MAX;
+				}
+				next[m++] = pieces[k];
+			}
+		}
+		memcpy(work, next, sizeof(VkRect2D) * m);
+		n = m;
+	}
+	if (n > cap) {
+		return UINT32_MAX;
+	}
+	memcpy(out, work, sizeof(VkRect2D) * n);
+	return n;
 }
 
 /*!
@@ -2170,202 +2297,408 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			atlas_view_h = cvh;
 			grid_cols = layout->tile_columns;
 			grid_rows = layout->tile_rows;
-		} else {
+		} else if (weave_rect_scoped_wanted(mc) && weave_unsqueeze_ready(vk, mc)) {
+			// Rect-scoped batch record (debug.dxr.weave_rect_scoped, default ON).
+			// Same scratch contents as the copy+blit path below, bought for the
+			// rects' pixels instead of the window's: (1) the scratch is cleared
+			// only where an earlier frame wrote and this frame does not — it is
+			// otherwise transparent already, which is exactly what the whole-image
+			// firstChunk clear guaranteed; (2) each eye is un-squeezed by ONE
+			// draw sampling the input with the sample point clamped to the half-
+			// rect's outermost texel centres — the clamp the per-eye staging image
+			// existed to provide — so there is no staging copy and no staging
+			// image to reallocate (and vkQueueWaitIdle for) when a rect resizes.
+			struct xrt_rect legacy_rect = {
+			    .offset = {.w = 0, .h = 0},
+			    .extent = {.w = (int)want_w, .h = (int)want_h},
+			};
+			const struct xrt_rect *src_rects = rect_count > 0 ? rects : &legacy_rect;
+			uint32_t src_count = rect_count > 0 ? rect_count : 1;
+			if (src_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
+				src_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
+			}
+			struct vk_local2d_clamped_copy copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkRect2D written[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			uint32_t copy_count = 0;
+			for (uint32_t i = 0; i < src_count; i++) {
+				// xrt_offset names its fields w/h; they hold x/y here.
+				const int32_t rx = src_rects[i].offset.w;
+				const int32_t ry = src_rects[i].offset.h;
+				const int32_t rw = src_rects[i].extent.w;
+				const int32_t rh = src_rects[i].extent.h;
+				if (rw <= 0 || rh <= 0 || rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
+				    (uint32_t)(ry + rh) > mc->weave.in_h) {
+					continue;
+				}
+				const int32_t half = rw / 2;
+				if (half <= 0) {
+					continue;
+				}
+				const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+				const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+				const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+				const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
+				if (dx1 <= dx0 || dy1 <= dy0) {
+					continue;
+				}
+				const int32_t src_x[2] = {rx, rx + half};
+				const int32_t src_w[2] = {half, rw - half};
+				const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w};
+				for (uint32_t e = 0; e < 2; e++) {
+					copies[copy_count] = (struct vk_local2d_clamped_copy){
+					    .dst_x = tile_x[e] + dx0,
+					    .dst_y = dy0,
+					    .dst_w = (uint32_t)(dx1 - dx0),
+					    .dst_h = (uint32_t)(dy1 - dy0),
+					    .src_x = src_x[e],
+					    .src_y = ry,
+					    .src_w = (uint32_t)src_w[e],
+					    .src_h = (uint32_t)rh,
+					};
+					written[copy_count] =
+					    (VkRect2D){{copies[copy_count].dst_x, dy0},
+					               {copies[copy_count].dst_w, copies[copy_count].dst_h}};
+					copy_count++;
+				}
+			}
 
-		// Input: keep GENERAL across frames (UNDEFINED would discard the caller's
-		// pixels); the barrier makes external writes visible.
-		VkImageMemoryBarrier in_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
-		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		    .image = mc->weave.in_image,
-		    .subresourceRange = range,
-		};
-		mc->weave.in_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-		                         NULL, 0, NULL, 1, &in_barrier);
+			// What to clear. A fresh scratch (UNDEFINED contents) is cleared whole
+			// whatever chunk this is; otherwise only the first chunk of a frame
+			// clears — the rects an earlier frame wrote, minus this chunk's.
+			const bool fresh = mc->weave.sbs_first_use;
+			bool full_clear = fresh || (weave_frame_first && mc->weave.sbs_dirty_full);
+			VkRect2D clears[64];
+			uint32_t clear_count = 0;
+			if (weave_frame_first && !full_clear) {
+				for (uint32_t d = 0; d < mc->weave.sbs_dirty_count && !full_clear; d++) {
+					uint32_t n = weave_rect_subtract(mc->weave.sbs_dirty[d], written, copy_count,
+					                                 &clears[clear_count], 64 - clear_count);
+					if (n == UINT32_MAX) {
+						full_clear = true;
+					} else {
+						clear_count += n;
+					}
+				}
+			}
+			if (full_clear) {
+				clear_count = 0;
+			}
+			// Track what the scratch now holds outside "transparent".
+			if (full_clear || weave_frame_first) {
+				mc->weave.sbs_dirty_count = 0;
+				mc->weave.sbs_dirty_full = false;
+			}
+			for (uint32_t k = 0; k < copy_count; k++) {
+				if (mc->weave.sbs_dirty_count >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2) {
+					mc->weave.sbs_dirty_full = true; // Next frame clears it all.
+					break;
+				}
+				mc->weave.sbs_dirty[mc->weave.sbs_dirty_count++] = written[k];
+			}
 
-		// Scratch -> TRANSFER_DST (persists across frames: stale regions from
-		// closed elements re-weave harmlessly; the caller composites back only its
-		// current rects — same contract as the Windows output).
-		VkImageMemoryBarrier sbs_to_dst = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .oldLayout = mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-		                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		mc->weave.sbs_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_dst);
-
-		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
-		// transparent on the first submit of a frame, so regions BETWEEN the woven
-		// tiles come out alpha 0 instead of stale.
-		if (weave_frame_first) {
-			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                         &sbs_transparent, 1, &range);
-			// Order the whole-image clear before the per-rect blits (both TRANSFER
-			// writes to overlapping regions — no implicit ordering within a stage).
-			VkImageMemoryBarrier clear_to_blit = {
+			// Input: GENERAL -> SHADER_READ for the draw (external writes visible).
+			VkImageMemoryBarrier in_to_read = {
 			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.in_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.in_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+			                         &in_to_read);
+
+			// Scratch: (UNDEFINED | SHADER_READ from the last DP sample) ->
+			// [TRANSFER_DST + whole clear] -> COLOR_ATTACHMENT (LOAD keeps the rest).
+			VkImageLayout sbs_layout =
+			    fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			mc->weave.sbs_first_use = false;
+			if (full_clear) {
+				VkImageMemoryBarrier sbs_to_dst = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = sbs_layout,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .image = mc->weave.sbs_image,
+				    .subresourceRange = range,
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &sbs_to_dst);
+				VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+				vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                         &sbs_transparent, 1, &range);
+				sbs_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			}
+			VkImageMemoryBarrier sbs_to_attach = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = full_clear ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT,
+			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = sbs_layout,
+			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .image = mc->weave.sbs_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(
+			    cmd, full_clear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &sbs_to_attach);
+
+			if (copy_count > 0 || clear_count > 0) {
+				vk_local2d_composite_begin_frame(&mc->weave.unsqueeze, vk);
+				if (!vk_local2d_composite_clamped_copy(
+				        &mc->weave.unsqueeze, vk, cmd, mc->weave.sbs_fb, mc->weave.sbs_w,
+				        mc->weave.sbs_h, mc->weave.in_view, mc->weave.in_w, mc->weave.in_h, clears,
+				        clear_count, copies, copy_count)) {
+					static bool logged = false;
+					if (!logged) {
+						logged = true;
+						U_LOG_E(
+						    "weave(#1036): rect-scoped un-squeeze recorded nothing (%u copies, "
+						    "%u clears)",
+						    copy_count, clear_count);
+					}
+					mc->weave.sbs_dirty_full = true;
+				}
+			}
+
+			// Scratch -> SHADER_READ for the DP sample; input back to GENERAL so
+			// the next frame's barrier and the caller's external writes agree.
+			VkImageMemoryBarrier post[2] = {
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			        .image = mc->weave.sbs_image,
+			        .subresourceRange = range,
+			    },
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			        .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			        .image = mc->weave.in_image,
+			        .subresourceRange = range,
+			    },
+			};
+			vk->vkCmdPipelineBarrier(
+			    cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+			    NULL, 2, post);
+		} else {
+			// Copy+blit batch record (debug.dxr.weave_rect_scoped=0, or the clamped
+			// draw is unavailable). The old path's scratch is not tracked by the
+			// rect-scoped dirty list, so the next scoped frame clears it whole.
+			mc->weave.sbs_dirty_full = true;
+
+			// Input: keep GENERAL across frames (UNDEFINED would discard the caller's
+			// pixels); the barrier makes external writes visible.
+			VkImageMemoryBarrier in_barrier = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .image = mc->weave.in_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.in_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &in_barrier);
+
+			// Scratch -> TRANSFER_DST (persists across frames: stale regions from
+			// closed elements re-weave harmlessly; the caller composites back only its
+			// current rects — same contract as the Windows output).
+			VkImageMemoryBarrier sbs_to_dst = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
 			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .oldLayout = mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			    .image = mc->weave.sbs_image,
 			    .subresourceRange = range,
 			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, 1, &clear_to_blit);
-		}
+			mc->weave.sbs_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sbs_to_dst);
 
-		// Un-squeeze each rect's SBS halves into the two atlas tiles: left half ->
-		// left tile at the rect's window position (stretched to full rect width),
-		// right half -> right tile offset by out_w. A LINEAR blit clamps at the
-		// edge of the whole SOURCE IMAGE, not at srcOffsets, so stretching straight
-		// out of the input would read 25 % of the texel beyond each half-rect (the
-		// caller's never-cleared ring on the outer edges = a dark 1-px border; the
-		// other eye at the midline). Each half is therefore first copied 1:1 into
-		// an image of exactly its size and that WHOLE image is stretched: the edge
-		// clamp is then the half-rect's own outermost texel centres. Odd widths
-		// keep the split they always had: left = rw / 2, right = the rest.
-		struct xrt_rect legacy_rect = {
-		    .offset = {.w = 0, .h = 0},
-		    .extent = {.w = (int)want_w, .h = (int)want_h},
-		};
-		const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
-		uint32_t blit_count = rect_count > 0 ? rect_count : 1;
-		if (blit_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
-			blit_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
-		}
-
-		VkImageBlit eye_blits[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImage eye_src[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2]; // VK_NULL_HANDLE = straight from the input.
-		VkImage stage_images[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImageCopy stage_copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		VkImageMemoryBarrier stage_barriers[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
-		uint32_t eye_count = 0;
-		uint32_t staged_count = 0;
-		const VkImageSubresourceLayers color_layer = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1};
-
-		for (uint32_t i = 0; i < blit_count; i++) {
-			// xrt_offset names its fields w/h; they hold x/y here.
-			int32_t rx = blit_rects[i].offset.w;
-			int32_t ry = blit_rects[i].offset.h;
-			int32_t rw = blit_rects[i].extent.w;
-			int32_t rh = blit_rects[i].extent.h;
-			if (rw <= 0 || rh <= 0) {
-				continue;
-			}
-			// Clamp to the input.
-			if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
-			    (uint32_t)(ry + rh) > mc->weave.in_h) {
-				continue;
-			}
-			int32_t half = rw / 2;
-			if (half <= 0) {
-				continue;
-			}
-
-			// Physical-rect mode: content lands in the (physical-sized) atlas
-			// at scaled coordinates; identity when sat_pscale == 1.
-			const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
-			const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
-			const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
-			const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
-			const int32_t src_x[2] = {rx, rx + half};
-			const int32_t src_w[2] = {half, rw - half};
-			const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
-			for (uint32_t e = 0; e < 2; e++) {
-				VkImage stage = weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e], (uint32_t)rh,
-				                                    WEAVE_VK_FORMAT);
-				eye_blits[eye_count] = (VkImageBlit){
-				    .srcSubresource = color_layer,
-				    .srcOffsets = {{src_x[e], ry, 0}, {src_x[e] + src_w[e], ry + rh, 1}},
-				    .dstSubresource = color_layer,
-				    .dstOffsets = {{tile_x[e] + dx0, dy0, 0}, {tile_x[e] + dx1, dy1, 1}},
+			// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
+			// transparent on the first submit of a frame, so regions BETWEEN the woven
+			// tiles come out alpha 0 instead of stale.
+			if (weave_frame_first) {
+				VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+				vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                         &sbs_transparent, 1, &range);
+				// Order the whole-image clear before the per-rect blits (both TRANSFER
+				// writes to overlapping regions — no implicit ordering within a stage).
+				VkImageMemoryBarrier clear_to_blit = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .image = mc->weave.sbs_image,
+				    .subresourceRange = range,
 				};
-				if (stage != VK_NULL_HANDLE) {
-					// Stretch the WHOLE staged image instead of the input sub-rect.
-					eye_blits[eye_count].srcOffsets[0] = (VkOffset3D){0, 0, 0};
-					eye_blits[eye_count].srcOffsets[1] = (VkOffset3D){src_w[e], rh, 1};
-					stage_images[staged_count] = stage;
-					stage_copies[staged_count] = (VkImageCopy){
-					    .srcSubresource = color_layer,
-					    .srcOffset = {src_x[e], ry, 0},
-					    .dstSubresource = color_layer,
-					    .dstOffset = {0, 0, 0},
-					    .extent = {(uint32_t)src_w[e], (uint32_t)rh, 1},
-					};
-					// Fully overwritten by the copy: discard from UNDEFINED. The
-					// TRANSFER src scope orders it after an earlier submit's
-					// stretch read of the same image (WAR — execution only).
-					stage_barriers[staged_count] = (VkImageMemoryBarrier){
-					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-					    .srcAccessMask = 0,
-					    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-					    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-					    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-					    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .image = stage,
-					    .subresourceRange = range,
-					};
-					staged_count++;
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &clear_to_blit);
+			}
+
+			// Un-squeeze each rect's SBS halves into the two atlas tiles: left half ->
+			// left tile at the rect's window position (stretched to full rect width),
+			// right half -> right tile offset by out_w. A LINEAR blit clamps at the
+			// edge of the whole SOURCE IMAGE, not at srcOffsets, so stretching straight
+			// out of the input would read 25 % of the texel beyond each half-rect (the
+			// caller's never-cleared ring on the outer edges = a dark 1-px border; the
+			// other eye at the midline). Each half is therefore first copied 1:1 into
+			// an image of exactly its size and that WHOLE image is stretched: the edge
+			// clamp is then the half-rect's own outermost texel centres. Odd widths
+			// keep the split they always had: left = rw / 2, right = the rest.
+			struct xrt_rect legacy_rect = {
+			    .offset = {.w = 0, .h = 0},
+			    .extent = {.w = (int)want_w, .h = (int)want_h},
+			};
+			const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
+			uint32_t blit_count = rect_count > 0 ? rect_count : 1;
+			if (blit_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
+				blit_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
+			}
+
+			VkImageBlit eye_blits[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImage
+			    eye_src[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2]; // VK_NULL_HANDLE = straight from the input.
+			VkImage stage_images[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImageCopy stage_copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImageMemoryBarrier stage_barriers[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			uint32_t eye_count = 0;
+			uint32_t staged_count = 0;
+			const VkImageSubresourceLayers color_layer = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			                                              .layerCount = 1};
+
+			for (uint32_t i = 0; i < blit_count; i++) {
+				// xrt_offset names its fields w/h; they hold x/y here.
+				int32_t rx = blit_rects[i].offset.w;
+				int32_t ry = blit_rects[i].offset.h;
+				int32_t rw = blit_rects[i].extent.w;
+				int32_t rh = blit_rects[i].extent.h;
+				if (rw <= 0 || rh <= 0) {
+					continue;
 				}
-				eye_src[eye_count] = stage;
-				eye_count++;
-			}
-		}
+				// Clamp to the input.
+				if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
+				    (uint32_t)(ry + rh) > mc->weave.in_h) {
+					continue;
+				}
+				int32_t half = rw / 2;
+				if (half <= 0) {
+					continue;
+				}
 
-		if (staged_count > 0) {
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, staged_count, stage_barriers);
-			for (uint32_t k = 0; k < staged_count; k++) {
-				vk->vkCmdCopyImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL, stage_images[k],
-				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &stage_copies[k]);
+				// Physical-rect mode: content lands in the (physical-sized) atlas
+				// at scaled coordinates; identity when sat_pscale == 1.
+				const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+				const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+				const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+				const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
+				const int32_t src_x[2] = {rx, rx + half};
+				const int32_t src_w[2] = {half, rw - half};
+				const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
+				for (uint32_t e = 0; e < 2; e++) {
+					VkImage stage = weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e],
+					                                    (uint32_t)rh, WEAVE_VK_FORMAT);
+					eye_blits[eye_count] = (VkImageBlit){
+					    .srcSubresource = color_layer,
+					    .srcOffsets = {{src_x[e], ry, 0}, {src_x[e] + src_w[e], ry + rh, 1}},
+					    .dstSubresource = color_layer,
+					    .dstOffsets = {{tile_x[e] + dx0, dy0, 0}, {tile_x[e] + dx1, dy1, 1}},
+					};
+					if (stage != VK_NULL_HANDLE) {
+						// Stretch the WHOLE staged image instead of the input sub-rect.
+						eye_blits[eye_count].srcOffsets[0] = (VkOffset3D){0, 0, 0};
+						eye_blits[eye_count].srcOffsets[1] = (VkOffset3D){src_w[e], rh, 1};
+						stage_images[staged_count] = stage;
+						stage_copies[staged_count] = (VkImageCopy){
+						    .srcSubresource = color_layer,
+						    .srcOffset = {src_x[e], ry, 0},
+						    .dstSubresource = color_layer,
+						    .dstOffset = {0, 0, 0},
+						    .extent = {(uint32_t)src_w[e], (uint32_t)rh, 1},
+						};
+						// Fully overwritten by the copy: discard from UNDEFINED. The
+						// TRANSFER src scope orders it after an earlier submit's
+						// stretch read of the same image (WAR — execution only).
+						stage_barriers[staged_count] = (VkImageMemoryBarrier){
+						    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+						    .srcAccessMask = 0,
+						    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+						    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+						    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+						    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+						    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+						    .image = stage,
+						    .subresourceRange = range,
+						};
+						staged_count++;
+					}
+					eye_src[eye_count] = stage;
+					eye_count++;
+				}
 			}
-			// Copy writes -> stretch reads.
-			for (uint32_t k = 0; k < staged_count; k++) {
-				stage_barriers[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				stage_barriers[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-				stage_barriers[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-				stage_barriers[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+			if (staged_count > 0) {
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+				                         staged_count, stage_barriers);
+				for (uint32_t k = 0; k < staged_count; k++) {
+					vk->vkCmdCopyImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL,
+					                   stage_images[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+					                   &stage_copies[k]);
+				}
+				// Copy writes -> stretch reads.
+				for (uint32_t k = 0; k < staged_count; k++) {
+					stage_barriers[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+					stage_barriers[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+					stage_barriers[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+					stage_barriers[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+				}
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+				                         staged_count, stage_barriers);
 			}
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, staged_count, stage_barriers);
-		}
 
-		// Stretches, in rect order (a later rect still overwrites an overlapping
-		// earlier one).
-		for (uint32_t k = 0; k < eye_count; k++) {
-			const bool staged = eye_src[k] != VK_NULL_HANDLE;
-			VkImage src = staged ? eye_src[k] : mc->weave.in_image;
-			VkImageLayout src_layout =
-			    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
-			vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
-			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k], VK_FILTER_LINEAR);
-		}
+			// Stretches, in rect order (a later rect still overwrites an overlapping
+			// earlier one).
+			for (uint32_t k = 0; k < eye_count; k++) {
+				const bool staged = eye_src[k] != VK_NULL_HANDLE;
+				VkImage src = staged ? eye_src[k] : mc->weave.in_image;
+				VkImageLayout src_layout =
+				    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+				vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
+				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k],
+				                   VK_FILTER_LINEAR);
+			}
 
-		// Scratch -> SHADER_READ for the DP sample.
-		VkImageMemoryBarrier sbs_to_read = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_read);
+			// Scratch -> SHADER_READ for the DP sample.
+			VkImageMemoryBarrier sbs_to_read = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.sbs_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+			                         &sbs_to_read);
 		} // end !nview (legacy/batch SBS record)
 
 		// Output -> COLOR_ATTACHMENT (fully re-rendered every submit, so the
@@ -2781,6 +3114,10 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		if (mc->weave.overlay_blend_initialized) {
 			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 			mc->weave.overlay_blend_initialized = false;
+		}
+		if (mc->weave.unsqueeze_initialized) {
+			vk_local2d_composite_fini(&mc->weave.unsqueeze, vk);
+			mc->weave.unsqueeze_initialized = false;
 		}
 		if (mc->weave.dp != NULL) {
 			xrt_display_processor_destroy(&mc->weave.dp);

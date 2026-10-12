@@ -83,6 +83,12 @@ struct vk_local2d_composite
 	VkPipeline flatten_srgb_premul_pipe;   //!< One / OneMinusSrcAlpha.
 	VkPipeline flatten_srgb_unpremul_pipe; //!< SrcAlpha / OneMinusSrcAlpha.
 
+	//! OPTIONAL clamped copy (see vk_local2d_composite_init_clamped_copy).
+	//! VK_NULL_HANDLE until a caller opts in. Blend OFF, flatten_rp-compatible.
+	VkShaderModule clamped_copy_frag_mod;
+	VkPipelineLayout clamped_copy_layout;
+	VkPipeline clamped_copy_pipe;
+
 	VkDescriptorPool desc_pool; //!< Reset each frame by begin_frame.
 
 	bool initialized;
@@ -120,6 +126,59 @@ vk_local2d_composite_init(struct vk_local2d_composite *lc,
  */
 bool
 vk_local2d_composite_init_srgb_flatten(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat srgb_fmt);
+
+/*!
+ * One draw of vk_local2d_composite_clamped_copy: the source sub-rect
+ * [src_x, src_x + src_w) x [src_y, src_y + src_h) in TEXELS of a
+ * @p src_w_px x @p src_h_px source, written (stretched as needed) into the
+ * destination pixel rect. The sample point is clamped to the sub-rect's
+ * outermost texel centres, so LINEAR filtering never reads a texel outside it.
+ * @ingroup aux_vk
+ */
+struct vk_local2d_clamped_copy
+{
+	int32_t dst_x, dst_y;
+	uint32_t dst_w, dst_h;
+	int32_t src_x, src_y;
+	uint32_t src_w, src_h;
+};
+
+/*!
+ * Opt in to the clamped-copy pipeline (blend OFF, the flatten render pass's
+ * scratch_fmt). Call after vk_local2d_composite_init. Callers that never call
+ * this pay nothing.
+ * @return true when vk_local2d_composite_clamped_copy is usable.
+ * @ingroup aux_vk
+ */
+bool
+vk_local2d_composite_init_clamped_copy(struct vk_local2d_composite *lc, struct vk_bundle *vk);
+
+/*!
+ * ONE render pass over @p fb (a scratch_fmt framebuffer, attachment in
+ * COLOR_ATTACHMENT_OPTIMAL on entry and exit), its render area the bounding box
+ * of every clear + copy rect (a tiler loads/stores only that), which first
+ * clears @p clears to transparent black (vkCmdClearAttachments) and then draws
+ * each copy of @p src_view (SHADER_READ_ONLY_OPTIMAL) in order — a later copy
+ * overwrites an overlapping earlier one. Clears must not overlap copies (no
+ * clear/draw ordering is relied on). Uses one descriptor set from the per-frame
+ * pool (caller resets it with vk_local2d_composite_begin_frame).
+ * @return false if nothing could be recorded (caller falls back).
+ * @ingroup aux_vk
+ */
+bool
+vk_local2d_composite_clamped_copy(struct vk_local2d_composite *lc,
+                                  struct vk_bundle *vk,
+                                  VkCommandBuffer cmd,
+                                  VkFramebuffer fb,
+                                  uint32_t fb_w,
+                                  uint32_t fb_h,
+                                  VkImageView src_view,
+                                  uint32_t src_w_px,
+                                  uint32_t src_h_px,
+                                  const VkRect2D *clears,
+                                  uint32_t clear_count,
+                                  const struct vk_local2d_clamped_copy *copies,
+                                  uint32_t copy_count);
 
 /*!
  * Reset the per-frame descriptor pool. Call once before the frame's flatten /

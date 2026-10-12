@@ -848,6 +848,29 @@ struct multi_compositor
 		//! @}
 
 		/*!
+		 * @name Rect-scoped batch weave (debug.dxr.weave_rect_scoped, default 1)
+		 * The SBS scratch is cleared only where the previous frame wrote and this
+		 * one does not (instead of all 2 x window every frame), and each eye is
+		 * un-squeezed by ONE clamped-sampling draw straight out of the input (no
+		 * per-rect staging copy, no staging image to reallocate — and so no
+		 * vkQueueWaitIdle — when a rect changes size under scroll).
+		 * @c sbs_dirty holds every scratch rect (both eyes) written since the last
+		 * clear; @c sbs_dirty_full forces one whole-image clear (fresh scratch,
+		 * the kill switch flipped, or more rects than the list holds).
+		 * @{
+		 */
+		bool rect_scoped_checked; //!< Prop read once per client.
+		bool rect_scoped;
+		struct vk_local2d_composite unsqueeze; //!< Clamped-copy pipeline.
+		bool unsqueeze_initialized;
+		bool unsqueeze_failed; //!< Init failed once: stay on the copy+blit path.
+		VkFramebuffer sbs_fb;  //!< sbs_view in unsqueeze.flatten_rp.
+		VkRect2D sbs_dirty[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		uint32_t sbs_dirty_count;
+		bool sbs_dirty_full;
+		//! @}
+
+		/*!
 		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
 		 * Android twin of the desktop-Linux fields: per-submit overlay hints set by
 		 * comp_multi_weave_android_set_overlay_hints right before each submit
