@@ -421,11 +421,12 @@ option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_p
 option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" ON)
 
 # Defaults for OpenXR layer support
-# Off: DisplayXR is a flat lightfield display, not a reprojecting HMD, so a
-# submitted depth layer is only ever validated, never used (no timewarp). It is
-# also untestable by the CTS, which hardcodes 2 depth swapchains for stereo while
-# DisplayXR enumerates its multi-view display as PRIMARY_STEREO with >2 views.
-option(XRT_FEATURE_OPENXR_LAYER_DEPTH "Enable XR_KHR_composition_layer_depth" OFF)
+# LAYER_DEPTH: on. It was off (#33) because PRIMARY_STEREO reported >2 views and
+# the CTS depth case submitted depth for views it never released; #1486 made
+# PRIMARY_STEREO exactly 2 views, and the case now passes on every CTS arm. A
+# submitted depth layer feeds the depth-aware cursor (ADR-046 Phase 3a); there
+# is no timewarp. CTS evidence (all 7 hosted arms, zero red): #1956.
+option(XRT_FEATURE_OPENXR_LAYER_DEPTH "Enable XR_KHR_composition_layer_depth" ON)
 option(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS "Enable XR_KHR_composition_layer_color_scale_bias" OFF)
 option(XRT_FEATURE_OPENXR_LAYER_CUBE "Enable XR_KHR_composition_layer_cube" OFF)
 option(XRT_FEATURE_OPENXR_LAYER_CYLINDER "Enable XR_KHR_composition_layer_cylinder" ON)
