@@ -53,6 +53,7 @@
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 #include "cursor_depth.h"    // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 
 // ============================================================================
 // Logging
@@ -1662,6 +1663,11 @@ struct AppXrSession {
     // submits depth (XR_KHR_composition_layer_depth) and lets the runtime
     // find the nearest content under the cursor, instead of the hit test.
     bool cursorDepthFromLayer = false;
+    // XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured shows a synthetic stereo PHOTO instead of the cube and lets the
+    // runtime measure the disparity under the cursor (no hit test, no depth).
+    bool cursorDepthMeasured = false;
+    bool stereoPhoto = false; // the photo, with or without the measured source
     // XR_DXR_cursor_depth v3: DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
     // chains XrCursorDepthOptionsDXR with that anchor mode. Unset: the struct
     // is not chained, and the runtime defaults to HYBRID.
@@ -1832,8 +1838,19 @@ static bool InitializeOpenXR(AppXrSession &app)
                          app.cursorDepthSpecVersion, app.hasLayerDepthExt ? "present" : "absent");
             }
         }
+        if (src != nullptr && strcmp(src, "measured") == 0) {
+            if (app.cursorDepthSpecVersion >= 7) {
+                app.cursorDepthMeasured = true;
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u) - "
+                         "keeping the app hit test",
+                         app.cursorDepthSpecVersion);
+            }
+        }
         LOG_INFO("XR_DXR_cursor_depth source: %s",
-                 app.cursorDepthFromLayer ? "SUBMITTED DEPTH (runtime reads it)" : "app hit test");
+                 app.cursorDepthFromLayer   ? "SUBMITTED DEPTH (runtime reads it)"
+                 : app.cursorDepthMeasured ? "MEASURED DISPARITY (runtime block-matches the views)"
+                                           : "app hit test");
 
         // Opt-in (spec v3): pick the anchor mode explicitly.
         const char *anchor = getenv("DISPLAYXR_CURSOR_DEPTH_ANCHOR");
@@ -2215,6 +2232,76 @@ static id<MTLTexture> AppRenderTarget(id<MTLTexture> tex)
         }
     }
     return tex;
+}
+
+// ============================================================================
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3) test content: a synthetic
+// STEREO PHOTO (test_apps/common/stereo_photo_test.h) in place of the cube -
+// stereo content with no depth, which is what the measured-disparity source is
+// for. DISPLAYXR_CURSOR_DEPTH_SOURCE=measured selects it (and the source);
+// DISPLAYXR_STEREO_PHOTO=1 shows it without the cursor source (a cost
+// baseline); DISPLAYXR_STEREO_PHOTO_ANIMATE=1 pans it a pixel per frame (a
+// playing video: every frame is a new measurement).
+// ============================================================================
+
+struct StereoPhoto
+{
+    uint32_t w = 0, h = 0, pad = 32;
+    int eyes = 0;
+    std::vector<id<MTLTexture>> tex; // (w + pad) x h each, BGRA8Unorm
+};
+static StereoPhoto g_stereoPhoto;
+
+static void EnsureStereoPhoto(id<MTLDevice> dev, uint32_t w, uint32_t h, int eyes)
+{
+    StereoPhoto &sp = g_stereoPhoto;
+    if (sp.w == w && sp.h == h && sp.eyes == eyes && (int)sp.tex.size() == eyes) return;
+    sp.tex.clear();
+    sp.w = w;
+    sp.h = h;
+    sp.eyes = eyes;
+    const uint32_t tw = w + sp.pad;
+    std::vector<uint8_t> px;
+    for (int e = 0; e < eyes; e++) {
+        dxr_test::PhotoFill(e, eyes, w, tw, h, true, px);
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:tw
+                                                                                    height:h
+                                                                                 mipmapped:NO];
+        d.storageMode = MTLStorageModeManaged;
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+        [t replaceRegion:MTLRegionMake2D(0, 0, tw, h) mipmapLevel:0 withBytes:px.data() bytesPerRow:tw * 4];
+        sp.tex.push_back(t);
+    }
+    LOG_INFO("stereo photo: %d views of %ux%u (foreground +%.1f px crossed, ground %.1f px, stripes period %.0f px)",
+             eyes, w, h, dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w,
+             fmaxf(6.0f, roundf(0.0125f * w)));
+}
+
+// Blit each view's photo into its tile of the swapchain image (instead of the cube).
+static void BlitStereoPhoto(MetalRenderer &r, id<MTLTexture> target, const EyeRenderParams *eyes, int eyeCount,
+                            uint32_t scroll)
+{
+    if (eyeCount < 1) return;
+    EnsureStereoPhoto(r.device, eyes[0].width, eyes[0].height, eyeCount);
+    id<MTLCommandBuffer> cb = [r.commandQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    for (int e = 0; e < eyeCount; e++) {
+        const uint32_t w = eyes[e].width < g_stereoPhoto.w ? eyes[e].width : g_stereoPhoto.w;
+        const uint32_t h = eyes[e].height < g_stereoPhoto.h ? eyes[e].height : g_stereoPhoto.h;
+        [blit copyFromTexture:g_stereoPhoto.tex[e]
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(scroll % g_stereoPhoto.pad, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:target
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(eyes[e].viewportX, eyes[e].viewportY, 0)];
+    }
+    [blit endEncoding];
+    [cb commit];
 }
 
 static bool CreateSwapchain(AppXrSession &app)
@@ -3004,10 +3091,41 @@ int main(int argc, char **argv)
     }
     if (app.cursorDepthChainOptions) cursor.setAnchor(app.cursorDepthAnchor);
     cursor.useDepthLayer(app.cursorDepthFromLayer);
-    cursor.setRayCast([&renderer](const dxr::CursorRay &r) -> std::optional<float> {
-        float t;
-        return RayHitCube(r.origin, r.dir, renderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
-    });
+    if (!app.cursorDepthMeasured) {
+        cursor.setRayCast([&renderer](const dxr::CursorRay &r) -> std::optional<float> {
+            float t;
+            return RayHitCube(r.origin, r.dir, renderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+        });
+    }
+    // XR_DXR_cursor_depth v7: the stereo photo (DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured, or DISPLAYXR_STEREO_PHOTO=1 alone as a cost baseline).
+    {
+        const char *sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        app.stereoPhoto = app.cursorDepthMeasured || (sp != nullptr && sp[0] == '1');
+    }
+    const bool stereoPhotoAnimate = []() {
+        const char *e = getenv("DISPLAYXR_STEREO_PHOTO_ANIMATE");
+        return e != nullptr && e[0] == '1';
+    }();
+    // The measured-disparity request: dxr::CursorDepth (displayxr-common
+    // v2.29.0) predates spec v7, so the source struct is chained here, ahead
+    // of the helper: chain() keeps whatever locateInfo.next held as the tail
+    // of the hint's chain, which is where the runtime looks for it.
+    XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+    measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+    // DISPLAYXR_FRAME_STATS=1: frame interval and xrLocateViews / xrEndFrame
+    // CPU time, averaged and logged every 300 frames (the Amendment 3 cost
+    // evidence).
+    const bool frameStats = []() {
+        const char *e = getenv("DISPLAYXR_FRAME_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    struct
+    {
+        uint32_t n = 0;
+        double interval_ms = 0, locate_ms = 0, end_ms = 0, end_max_ms = 0;
+        double last_frame = 0;
+    } fstats;
     if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
         float fu, fv;
         if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
@@ -3285,6 +3403,10 @@ int main(int argc, char **argv)
         // against the previous locate's views (a frame late, which the
         // runtime's filter absorbs), and the hint / draw-request / state
         // structs on both chains. Inert when the extension is off.
+        if (app.cursorDepthMeasured && cursor.enabled()) {
+            measuredSource.next = locateInfo.next;
+            locateInfo.next = &measuredSource;
+        }
         cursor.chain(locateInfo, viewState);
 
         // Multi-screen M3 (XR_DXR_display_info v22): when the window spans
@@ -3300,7 +3422,11 @@ int main(int argc, char **argv)
         viewState.next = &viewActivity;
 
         uint32_t viewCount = 0;
+        const double tLocate0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+        if (frameStats) {
+            fstats.locate_ms += (CFAbsoluteTimeGetCurrent() - tLocate0) * 1e3;
+        }
 
         if (cursor.enabled()) {
             const bool d3 = (app.currentModeIndex < app.renderingModeCount)
@@ -3328,8 +3454,16 @@ int main(int argc, char **argv)
                 }
             }
             static int cursorLogged = 0;
-            const bool cursorHasContent =
-                app.cursorDepthFromLayer ? placement.targetDisparity != 0.0f : cursor.hint().hasContent == XR_TRUE;
+            const bool cursorHasContent = (app.cursorDepthFromLayer || app.cursorDepthMeasured)
+                                              ? placement.targetDisparity != 0.0f
+                                              : cursor.hint().hasContent == XR_TRUE;
+            // Measured source: the answer evolves as readbacks land, so log it
+            // once a second rather than only the first few placements.
+            if (app.cursorDepthMeasured && cursor.pointerInCanvas() && g_frameCounter % 60 == 30) {
+                LOG_INFO("cursor_depth measured: uv=(%.3f,%.3f) target=%.4f disparity=%.4f active=%d willDraw=%d",
+                         cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                         placement.disparity, (int)placement.isActive, (int)cursor.drawState().willDraw);
+            }
             if (placement.isActive && cursorHasContent && cursorLogged < 3) {
                 cursorLogged++;
                 LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
@@ -3493,6 +3627,25 @@ int main(int argc, char **argv)
                 if (renderW > maxTileW) renderW = maxTileW;
                 if (renderH > maxTileH) renderH = maxTileH;
             }
+            // XR_DXR_cursor_depth v7 cost runs: DISPLAYXR_STEREO_PHOTO_VIEW=WxH
+            // submits each view at that size (960x1080 = 1080p SBS, 1920x2160 =
+            // 4K SBS), capped by the swapchain's tile. Same canvas, more pixels.
+            if (app.stereoPhoto && display3D) {
+                static uint32_t forceW = 0, forceH = 0;
+                static bool parsed = false;
+                if (!parsed) {
+                    parsed = true;
+                    const char *e = getenv("DISPLAYXR_STEREO_PHOTO_VIEW");
+                    if (e != nullptr && sscanf(e, "%ux%u", &forceW, &forceH) == 2) {
+                        LOG_INFO("stereo photo: forcing %ux%u per view (tile max %ux%u)", forceW, forceH, maxTileW,
+                                 maxTileH);
+                    }
+                }
+                if (forceW > 0 && forceH > 0) {
+                    renderW = forceW < maxTileW ? forceW : maxTileW;
+                    renderH = forceH < maxTileH ? forceH : maxTileH;
+                }
+            }
             g_renderW = renderW;
             g_renderH = renderH;
 
@@ -3606,7 +3759,12 @@ int main(int argc, char **argv)
                 }
             }
 
-            RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount, depthTarget);
+            if (app.stereoPhoto) {
+                BlitStereoPhoto(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount,
+                                stereoPhotoAnimate ? (uint32_t)g_frameCounter : 0u);
+            } else {
+                RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount, depthTarget);
+            }
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
             // XR_DXR_atlas_capture (W6 of #396) — the runtime does the readback
@@ -3930,7 +4088,25 @@ int main(int argc, char **argv)
             endInfo.layerCount = layerCount;
             endInfo.layers = layers;
 
+            const double tEnd0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
             xrEndFrame(app.session, &endInfo);
+            if (frameStats) {
+                const double now = CFAbsoluteTimeGetCurrent();
+                const double endMs = (now - tEnd0) * 1e3;
+                fstats.end_ms += endMs;
+                fstats.end_max_ms = endMs > fstats.end_max_ms ? endMs : fstats.end_max_ms;
+                if (fstats.last_frame > 0) fstats.interval_ms += (now - fstats.last_frame) * 1e3;
+                fstats.last_frame = now;
+                if (++fstats.n == 300) {
+                    LOG_INFO("frame stats (300 frames): interval %.3f ms, xrLocateViews %.3f ms, xrEndFrame %.3f ms "
+                             "(max %.3f), view %ux%u, photo=%d measured=%d cursorInCanvas=%d",
+                             fstats.interval_ms / 299.0, fstats.locate_ms / 300.0, fstats.end_ms / 300.0,
+                             fstats.end_max_ms, g_renderW, g_renderH, (int)app.stereoPhoto,
+                             (int)app.cursorDepthMeasured, (int)cursor.pointerInCanvas());
+                    fstats = {};
+                    fstats.last_frame = now;
+                }
+            }
         }
 
         g_frameCounter++;
