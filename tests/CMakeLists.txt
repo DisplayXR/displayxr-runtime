@@ -124,6 +124,10 @@ if(TARGET target_lists)
 	# ADR-053 / #1999 -- the conversion-provider loader: manifest + registry row
 	# parsing, ordering, the plug-in-kind router and the ABI gate.
 	list(APPEND tests tests_conversion_loader)
+	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
+	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
+	# headless pass + selftest exit-13 path on stub providers.
+	list(APPEND tests tests_conv_snapshot)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
 	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
@@ -485,6 +489,35 @@ if(TARGET tests_conversion_loader)
 		PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
 			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
 			"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
+		)
+endif()
+if(TARGET tests_conv_snapshot)
+	target_link_libraries(
+		tests_conv_snapshot PRIVATE target_lists displayxr::conversion_core xrt-interfaces aux_util
+					    xrt-external-cjson
+		)
+	# The selftest verdict (cli_query_apply_conversion, exit 13) where the CLI's
+	# query core is built.
+	if(TARGET cli_query)
+		# cli_query.c references xrt_instance_create: link the no-compositor instance too.
+		target_link_libraries(tests_conv_snapshot PRIVATE cli_query target_instance_no_comp)
+		target_compile_definitions(tests_conv_snapshot PRIVATE TESTS_HAVE_CLI_QUERY)
+	endif()
+	# Three stub providers handed to the headless pass by path (never registered).
+	foreach(_stub good malformed bad_state)
+		add_library(tests_conv_snapshot_stub_${_stub} MODULE tests_conv_snapshot_stub.c)
+		target_link_libraries(tests_conv_snapshot_stub_${_stub} PRIVATE xrt-interfaces)
+		set_target_properties(tests_conv_snapshot_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
+		add_dependencies(tests_conv_snapshot tests_conv_snapshot_stub_${_stub})
+	endforeach()
+	target_compile_definitions(tests_conv_snapshot_stub_good PRIVATE STUB_VARIANT_GOOD)
+	target_compile_definitions(tests_conv_snapshot_stub_malformed PRIVATE STUB_VARIANT_MALFORMED)
+	target_compile_definitions(tests_conv_snapshot_stub_bad_state PRIVATE STUB_VARIANT_BAD_STATE)
+	target_compile_definitions(
+		tests_conv_snapshot
+		PRIVATE "CONV_SNAP_STUB_GOOD=\"$<TARGET_FILE:tests_conv_snapshot_stub_good>\""
+			"CONV_SNAP_STUB_MALFORMED=\"$<TARGET_FILE:tests_conv_snapshot_stub_malformed>\""
+			"CONV_SNAP_STUB_BAD_STATE=\"$<TARGET_FILE:tests_conv_snapshot_stub_bad_state>\""
 		)
 endif()
 if(TARGET tests_target_backcompat_claim)
