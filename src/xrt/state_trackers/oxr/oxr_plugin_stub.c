@@ -21,6 +21,8 @@
  */
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_conversion_plugin.h"
 
 #include <stddef.h>
 
@@ -112,3 +114,70 @@ _Static_assert(offsetof(struct xrt_plugin_display_info, struct_size) == 0,
  */
 _Static_assert(offsetof(struct xrt_display_descriptor, struct_size) == 0,
                "xrt_plugin: display_descriptor.struct_size must be the first field");
+
+
+/*
+ * ADR-053 gates (conversion-provider-discovery.md §8 row 1; #2006). The
+ * conversion-provider ABI restates a few legacy value spaces so the dp-lift
+ * adapter can copy them verbatim (§4.5: "state is a plain copy") and so a
+ * provider's status reads like a display plug-in's. Every pair that MUST stay
+ * numerically equal is pinned here, on every build.
+ *
+ * TODO(#ADR-053 P3): when lift spec 4 lands (XR_DXR_lift.h app enums), add
+ * every plug-in <-> spec-4 app enum pair (states, failure reasons, licence
+ * classes, tasks, depth kinds) here. They do not exist yet.
+ */
+
+/* Entry symbol + ABI line. */
+_Static_assert(sizeof(XRT_CONVERSION_PLUGIN_ENTRYPOINT_NAME) == sizeof("xrtConversionPluginNegotiate"),
+               "xrt_conversion_plugin: entry-point symbol name changed");
+_Static_assert(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT == XRT_CONVERSION_PLUGIN_API_VERSION_1,
+               "xrt_conversion_plugin: API version current/v1 drift");
+
+/* Capability state 0..7 == the legacy module status (xrt_dp_lift.h). */
+_Static_assert(XRT_CONV_STATE_UNKNOWN == XRT_DP_LIFT_MODULE_UNKNOWN, "conv state UNKNOWN != DP lift module UNKNOWN");
+_Static_assert(XRT_CONV_STATE_READY == XRT_DP_LIFT_MODULE_READY, "conv state READY != DP lift module READY");
+_Static_assert(XRT_CONV_STATE_WARMING == XRT_DP_LIFT_MODULE_ACTIVATING,
+               "conv state WARMING != DP lift module ACTIVATING");
+_Static_assert(XRT_CONV_STATE_ABSENT == XRT_DP_LIFT_MODULE_ABSENT, "conv state ABSENT != DP lift module ABSENT");
+_Static_assert(XRT_CONV_STATE_INCOMPATIBLE == XRT_DP_LIFT_MODULE_TOO_OLD,
+               "conv state INCOMPATIBLE != DP lift module TOO_OLD");
+_Static_assert(XRT_CONV_STATE_UNLICENSED == XRT_DP_LIFT_MODULE_UNLICENSED,
+               "conv state UNLICENSED != DP lift module UNLICENSED");
+_Static_assert(XRT_CONV_STATE_FAILED == XRT_DP_LIFT_MODULE_LOAD_FAILED,
+               "conv state FAILED != DP lift module LOAD_FAILED");
+_Static_assert(XRT_CONV_STATE_DISABLED == XRT_DP_LIFT_MODULE_DISABLED,
+               "conv state DISABLED != DP lift module DISABLED");
+
+/* Parameter value spaces shared with xrt_dp_lift_params / _stream_info. */
+_Static_assert(XRT_CONV_CONTENT_VIDEO == XRT_DP_LIFT_CONTENT_VIDEO, "conv CONTENT_VIDEO parity");
+_Static_assert(XRT_CONV_CONTENT_PHOTO == XRT_DP_LIFT_CONTENT_PHOTO, "conv CONTENT_PHOTO parity");
+_Static_assert(XRT_CONV_VIEWPOINT_FRAME_DISPLAY == XRT_DP_LIFT_VIEWPOINT_FRAME_DISPLAY, "conv FRAME_DISPLAY parity");
+_Static_assert(XRT_CONV_VIEWPOINT_FRAME_RECT == XRT_DP_LIFT_VIEWPOINT_FRAME_RECT, "conv FRAME_RECT parity");
+_Static_assert(XRT_CONV_AXIS_X == XRT_DP_LIFT_AXIS_X, "conv AXIS_X parity");
+_Static_assert(XRT_CONV_AXIS_XY == XRT_DP_LIFT_AXIS_XY, "conv AXIS_XY parity");
+_Static_assert(XRT_CONV_AXIS_XYZ == XRT_DP_LIFT_AXIS_XYZ, "conv AXIS_XYZ parity");
+_Static_assert(XRT_CONV_VIEWPOINTS_TRACKED == XRT_DP_LIFT_VIEWPOINTS_TRACKED, "conv VIEWPOINTS_TRACKED parity");
+_Static_assert(XRT_CONV_VIEWPOINTS_EXPLICIT == XRT_DP_LIFT_VIEWPOINTS_EXPLICIT, "conv VIEWPOINTS_EXPLICIT parity");
+_Static_assert(XRT_CONV_VIEWPOINTS_DISPLAY_RIG == XRT_DP_LIFT_VIEWPOINTS_DISPLAY_RIG,
+               "conv VIEWPOINTS_DISPLAY_RIG parity");
+_Static_assert(XRT_CONV_VIEWPOINTS_CAMERA_RIG == XRT_DP_LIFT_VIEWPOINTS_CAMERA_RIG,
+               "conv VIEWPOINTS_CAMERA_RIG parity");
+_Static_assert(XRT_CONV_BLOB_PLY_3DGS == XRT_DP_LIFT_BLOB_PLY_3DGS, "conv BLOB_PLY_3DGS parity");
+_Static_assert(XRT_CONV_BLOB_SOG == XRT_DP_LIFT_BLOB_SOG, "conv BLOB_SOG parity");
+
+/* xrt_conv_provider_status restates xrt_plugin_platform_status (layout + state values). */
+_Static_assert(sizeof(struct xrt_conv_provider_status) == sizeof(struct xrt_plugin_platform_status),
+               "conv provider status size != plug-in platform status size");
+_Static_assert(offsetof(struct xrt_conv_provider_status, state) ==
+                   offsetof(struct xrt_plugin_platform_status, state),
+               "conv provider status: state offset");
+_Static_assert(offsetof(struct xrt_conv_provider_status, flags) ==
+                   offsetof(struct xrt_plugin_platform_status, flags),
+               "conv provider status: flags offset");
+_Static_assert(offsetof(struct xrt_conv_provider_status, hint) == offsetof(struct xrt_plugin_platform_status, hint),
+               "conv provider status: hint offset");
+_Static_assert(sizeof(((struct xrt_conv_provider_status *)0)->hint) == XRT_PLUGIN_PLATFORM_HINT_MAX,
+               "conv provider status: hint size");
+_Static_assert(XRT_CONV_PROVIDER_FLAG_FALLBACK == XRT_PLUGIN_PLATFORM_FLAG_FALLBACK,
+               "conv provider FALLBACK flag != plug-in platform FALLBACK flag");
