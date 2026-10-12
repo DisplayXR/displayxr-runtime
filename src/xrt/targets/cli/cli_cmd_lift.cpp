@@ -130,6 +130,28 @@ connect(struct ipc_connection *ipc_c)
 	return true;
 }
 
+//! Drop a trailing incomplete UTF-8 sequence (a fixed-buffer copy of plug-in
+//! text can end mid-character; JSON must stay valid UTF-8).
+void
+dxr_utf8_trim_partial(char *s)
+{
+	size_t n = strlen(s);
+	size_t i = n;
+	size_t back = 0;
+	while (i > 0 && back < 4 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80) {
+		i--;
+		back++;
+	}
+	if (i == 0) {
+		return;
+	}
+	const unsigned char lead = (unsigned char)s[i - 1];
+	const size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+	if (need == 0 || back + 1 < need) {
+		s[i - 1] = '\0';
+	}
+}
+
 //! Poll caps until the module leaves ACTIVATING or @p wait_s passes.
 bool
 wait_caps(struct ipc_connection *ipc_c, double wait_s, struct xrt_dp_lift_caps *caps, bool verbose)
@@ -159,14 +181,41 @@ wait_caps(struct ipc_connection *ipc_c, double wait_s, struct xrt_dp_lift_caps *
 void
 print_caps(const struct xrt_dp_lift_caps &c, bool json)
 {
+	const char *ms = xrt_dp_lift_module_status_str(c.module_status);
+	char ver[sizeof(c.module_version)];
+	char det[sizeof(c.module_detail)];
+	snprintf(ver, sizeof(ver), "%s", c.module_version);
+	snprintf(det, sizeof(det), "%s", c.module_detail);
+	dxr_utf8_trim_partial(ver);
+	dxr_utf8_trim_partial(det);
 	if (json) {
+		std::string module;
+		if (ms != nullptr) {
+			// module_detail is prose from the plug-in: escape it for JSON.
+			std::string d;
+			for (const char *p = det; *p != '\0'; ++p) {
+				if (*p == '"' || *p == '\\') {
+					d += '\\';
+				}
+				d += (unsigned char)*p < 0x20 ? ' ' : *p;
+			}
+			std::string v;
+			for (const char *p = ver; *p != '\0'; ++p) {
+				if (*p == '"' || *p == '\\') {
+					v += '\\';
+				}
+				v += (unsigned char)*p < 0x20 ? ' ' : *p;
+			}
+			module = std::string(", \"module_status\": \"") + ms + "\", \"module_version\": \"" + v +
+			         "\", \"module_detail\": \"" + d + "\"";
+		}
 		printf(
 		    "{\"connected\": true, \"state\": \"%s\", \"modes\": %u, \"modes_str\": \"%s\", "
 		    "\"max_streams\": %u, \"max_views\": %u, \"depth_semantics\": \"%s\", "
-		    "\"typical_latency_ms\": %.2f, \"backend\": \"%s\"}\n",
+		    "\"typical_latency_ms\": %.2f, \"backend\": \"%s\"%s}\n",
 		    state_str(c.state), c.modes, modes_str(c.modes).c_str(), c.max_streams, c.max_views,
 		    c.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
-		    (double)c.typical_latency_ns / 1e6, c.backend);
+		    (double)c.typical_latency_ns / 1e6, c.backend, module.c_str());
 		return;
 	}
 	printf("XR_DXR_lift conversion module:\n");
@@ -177,6 +226,12 @@ print_caps(const struct xrt_dp_lift_caps &c, bool json)
 	printf("  max views:        %u\n", c.max_views);
 	printf("  depth semantics:  %s\n", c.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative");
 	printf("  typical latency:  %.2f ms\n", (double)c.typical_latency_ns / 1e6);
+	if (ms != nullptr) {
+		printf("  module:           %s%s%s\n", ms, ver[0] != '\0' ? " " : "", ver);
+		if (det[0] != '\0') {
+			printf("  module detail:    %s\n", det);
+		}
+	}
 }
 
 /*!

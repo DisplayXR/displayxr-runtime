@@ -8986,6 +8986,11 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 		out_props->backend[sizeof(out_props->backend) - 1] = '\0';
 		out_props->aux_outputs = caps.aux_outputs;
 		out_props->aux_depth_semantics = caps.aux_depth_semantics;
+		out_props->module_status = caps.module_status;
+		memcpy(out_props->module_version, caps.module_version, sizeof(out_props->module_version));
+		out_props->module_version[sizeof(out_props->module_version) - 1] = '\0';
+		memcpy(out_props->module_detail, caps.module_detail, sizeof(out_props->module_detail));
+		out_props->module_detail[sizeof(out_props->module_detail) - 1] = '\0';
 	}
 #endif
 	// Anything else: modes 0, UNAVAILABLE — a successful answer, not an error.

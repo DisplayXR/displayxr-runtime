@@ -1,6 +1,7 @@
 // Copyright 2026, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 
+using System;
 using System.Linq;
 using DisplayXR.Dashboard.Model;
 using Xunit;
@@ -99,6 +100,46 @@ public class ComponentsTests
         Assert.Equal("neurd-directml", Assert.Single(conv.Items).Name); // backend verbatim
         Assert.Equal(1, conv.Count);
         Assert.Contains("modes 0x3 · state 1 · 32 streams · up to 8 views", conv.Items[0].Lines);
+    }
+
+    [Fact]
+    public void ModuleInfo_NewInfo_ShowsWhichNeurD_OldInfo_ShowsNothingNew()
+    {
+        // New runtime + plug-in: lift_caps carries module_status / _version / _detail.
+        var info = Info("info-lift-module.json");
+        Assert.Equal("ready", info.Lift!.ModuleStatus);
+        Assert.Equal("0.4.9-v0.4.9-QA+190.20bf39e", info.Lift.ModuleVersion);
+        var row = Assert.Single(Components.Conversion(info).Items);
+        Assert.Contains(("module ready", Level.Ok), row.Chips);
+        Assert.Equal("Module 0.4.9-v0.4.9-QA+190.20bf39e · License: Leia internal use only", row.Lines[0]);
+
+        // Today's output (no module keys): nothing new — no chip, no line, no "unknown".
+        var old = Info("info.json");
+        Assert.Null(old.Lift!.ModuleStatus);
+        var oldRow = Assert.Single(Components.Conversion(old).Items);
+        Assert.Single(oldRow.Chips);
+        Assert.DoesNotContain(oldRow.Lines, x => x.StartsWith("Module ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ModuleInfo_AbsentAndUnknownStatuses()
+    {
+        Assert.True(InfoResult.TryParse("""
+            { "lift_caps": { "probed": true, "malformed": false, "note": "", "modes": 0, "state": 0, "backend": "",
+                             "module_status": "absent", "module_version": "",
+                             "module_detail": "NeurD is not installed (NeurD.dll not found)" } }
+            """, out var absent, out _));
+        var row = Assert.Single(Components.Conversion(absent!.Components).Items);
+        Assert.Contains(("none", Level.Plain), row.Chips);
+        Assert.Contains(("module not installed", Level.Plain), row.Chips);
+        Assert.Equal("NeurD is not installed (NeurD.dll not found)", row.Lines[0]); // no version: detail alone
+
+        // A status this dashboard does not know: neutral chip, raw text, never a crash.
+        var lift = new LiftModule(true, false, "neurd-directml", 3, 2, 32, 8, "", "quantum", "9.9.9", "from the future");
+        Assert.Equal(("quantum", Level.Plain), lift.ModuleChip);
+        Assert.Contains(("quantum", Level.Plain),
+            Components.Conversion(InfoComponents.Empty with { Lift = lift }).Items[0].Chips);
+        Assert.Equal(("module too old", Level.Warn), (lift with { ModuleStatus = "too_old" }).ModuleChip);
     }
 
     [Fact]

@@ -54,7 +54,10 @@ public sealed record InfoComponents(
 
         LiftModule? lift = root.Obj("lift_caps") is { } lc
             ? new LiftModule(lc.Bool("probed"), lc.Bool("malformed"), lc.StrOrNull("backend"), lc.Long("modes"),
-                             lc.Has("state") ? lc.Long("state") : null, lc.Int("max_streams"), lc.Int("max_views"), lc.Str("note"))
+                             lc.Has("state") ? lc.Long("state") : null, lc.Int("max_streams"), lc.Int("max_views"), lc.Str("note"),
+                             // Which module the plug-in found and why it is (not) usable. Absent keys
+                             // = an older runtime or plug-in: nothing new is shown.
+                             lc.StrOrNull("module_status"), lc.StrOrNull("module_version"), lc.StrOrNull("module_detail"))
             : null;
 
         var cam = root.Obj("stereo_camera") ?? root.Obj("camera");
@@ -123,7 +126,26 @@ public sealed record WorkspaceList(string? ActiveId, IReadOnlyList<RegisteredCon
 public sealed record InputProviderRow(string Name, string Id, bool HardwarePresent, bool Active, string Note);
 public sealed record InputSummary(int Registered, bool HardwarePresent, bool Evaluated, bool ForceQwerty, string? ActiveId, string Note);
 public sealed record RigRole(bool Evaluated, string? Device, string Note);
-public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, long Modes, long? State, int MaxStreams, int MaxViews, string Note);
+public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, long Modes, long? State, int MaxStreams, int MaxViews, string Note,
+                                string? ModuleStatus = null, string? ModuleVersion = null, string? ModuleDetail = null)
+{
+    /// <summary>
+    /// The chip for <see cref="ModuleStatus"/> (a lowercase enum from the plug-in), or null when the
+    /// runtime / plug-in does not report it. An unknown value is shown verbatim, neutral, never an error.
+    /// </summary>
+    public (string Text, Level Level)? ModuleChip => ModuleStatus switch
+    {
+        null or "" => null,
+        "ready" => ("module ready", Level.Ok),
+        "activating" => ("module activating", Level.Info),
+        "absent" => ("module not installed", Level.Plain),
+        "too_old" => ("module too old", Level.Warn),
+        "unlicensed" => ("module unlicensed", Level.Warn),
+        "load_failed" => ("module failed to load", Level.Warn),
+        "disabled" => ("module turned off", Level.Plain),
+        var other => (other, Level.Plain),
+    };
+}
 
 /// <summary>One row of a Components section.</summary>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
@@ -332,11 +354,25 @@ public static class Components
                     l.MaxStreams > 0 ? $"{l.MaxStreams} streams" : "",
                     l.MaxViews > 0 ? $"up to {l.MaxViews} views" : "",
                 }.Where(x => x.Length > 0)));
+            // Which module the plug-in found (its own version string) and, when it is not usable, why.
+            // module_detail is the plug-in's prose: shown as-is, never parsed.
+            if (l.ModuleChip is not null)
+            {
+                string version = l.ModuleVersion is { Length: > 0 } v ? $"Module {v}" : "";
+                string detail = l.ModuleDetail ?? "";
+                string line = string.Join(Sep, new[] { version, detail }.Where(x => x.Length > 0));
+                if (line.Length > 0) lines.Insert(0, line);
+            }
             if (l.Note.Length > 0) lines.Add(l.Note);
+            var chips = new List<(string, Level)>
+            {
+                (l.Malformed ? "malformed" : present ? "available" : l.Probed ? "none" : "not probed",
+                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain),
+            };
+            if (l.ModuleChip is { } mc) chips.Add(mc);
             items.Add(new ComponentItem(l.Backend is { Length: > 0 } b ? b : "Conversion module",
                 l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain,
-                new[] { (l.Malformed ? "malformed" : present ? "available" : l.Probed ? "none" : "not probed",
-                         l.Malformed ? Level.Critical : present ? Level.Ok : Level.Plain) }, lines));
+                chips, lines));
         }
         return new ComponentSection("conversion", "Conversion module",
             "A conversion module turns 2D content into 3D (depth, side-by-side, multi-view) as a service any app can ask for.",
