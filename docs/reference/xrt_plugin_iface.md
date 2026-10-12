@@ -907,7 +907,9 @@ browser's inline-3D weave can return a release `sync_file` instead of blocking (
 - **Drops**: after returning true, wait and signal even on a dropped frame (an early return, a
   failed vendor submit — LeiaInc/CNSDK#734: a failed `vkQueueSubmit` never signals), e.g. with an
   empty submit. The runtime still treats `get_last_frame_dropped` == true as "signal not
-  guaranteed": no GPU wait on `signal_sem` that frame, CPU completion, semaphores recreated.
+  guaranteed": no GPU wait on `signal_sem` that frame, CPU completion, queue drained, and BOTH
+  semaphores destroyed and recreated before any later `process_atlas` — so a DP that cannot tell
+  whether its vendor weaver consumed `wait_sem` on the drop must not wait it a second time.
 - Appended after `set_overlay_2d_filter_strength`, `XRT_DP_VK_HAS_WEAVE_SYNC`, wrapper
   `xrt_display_processor_vk_set_weave_sync`. **Purely additive** — no
   `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020). `sim_display` records into the command buffer

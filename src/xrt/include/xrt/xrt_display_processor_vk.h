@@ -753,8 +753,13 @@ struct xrt_display_processor_vk
 	 *   signals), e.g. with an empty submit that only waits + signals. The runtime
 	 *   nevertheless treats @ref get_last_frame_dropped == true as "signal not
 	 *   guaranteed": for that frame it does not wait @p signal_sem on the GPU,
-	 *   falls back to a CPU wait (queue idle), recreates both semaphores, and
-	 *   reports no release fence to its caller.
+	 *   falls back to a CPU wait, drains the queue, DESTROYS and RECREATES both
+	 *   semaphores before any later process_atlas (so a DP that cannot tell
+	 *   whether its vendor weaver consumed @p wait_sem must NOT wait it again),
+	 *   and reports no release fence to its caller.
+	 * - Queue: the runtime hands the DP factory the bundle whose main_queue is
+	 *   the queue it weaves on; a DP that captures `vk->main_queue` at creation
+	 *   submits where the runtime drains.
 	 * - Queue: the DP may signal on any queue of the runtime's VkDevice; the
 	 *   runtime only waits the semaphore, it assumes nothing about the queue.
 	 *

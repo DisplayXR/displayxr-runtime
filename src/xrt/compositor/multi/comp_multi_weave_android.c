@@ -3404,7 +3404,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 		if (dp_dropped) {
-			mc->weave.sync_dirty = true;
+			// The DP cannot know whether its vendor weaver consumed pre_sem on a
+			// drop (and must not wait it twice), and it signals dp_sem itself
+			// with an empty submit we never wait: destroy and recreate the pair
+			// NOW (queue drained first), before any later weave can reuse them.
+			weave_sync_recreate_sems(vk, mc);
 			static uint32_t dropped_logs = 0;
 			if ((dropped_logs++ % 300) == 0) {
 				U_LOG_W(
