@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5) · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
