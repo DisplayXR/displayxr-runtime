@@ -128,6 +128,13 @@ connect(struct ipc_connection *ipc_c)
 		printf("  Is displayxr-service running? On Windows, run from a NON-elevated prompt.\n");
 		return false;
 	}
+	// ADR-053 (#2007): declare interest like every session does at
+	// xrCreateSession. Under PrewarmOn=interest the core warms the default
+	// tasks only once a client has said so; without this the module stays
+	// INSTALLED (v3: ACTIVATING) for as long as this CLI polls it, `lift caps`
+	// never settles and `lift probe` has nothing to probe. The pre-core path
+	// warmed on the first properties query, so this keeps the CLI's behaviour.
+	(void)ipc_client_conv_hint_interest(ipc_c, 0);
 	return true;
 }
 
