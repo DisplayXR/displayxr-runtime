@@ -31,6 +31,7 @@ set(tests
     tests_lift_mailbox
     tests_conversion_abi
     tests_conv_wire
+    tests_lift_abi
     tests_aux_lift_viewpoint
     tests_aux_lift_rig_depth
     tests_space_overseer_rig
@@ -1032,6 +1033,10 @@ target_link_libraries(tests_conversion_abi PRIVATE xrt-interfaces)
 set_target_properties(tests_conversion_abi PROPERTIES CXX_STANDARD 17)
 target_sources(tests_conv_wire PRIVATE tests_conv_wire_c.c)
 target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
+
+# ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
+# can only append.
+target_link_libraries(tests_lift_abi PRIVATE xrt-external-openxr)
 
 # XR_DXR_lift v3 (ADR-048 Addendum A): the app-rig mapping is checked against the
 # shared displayxr-common rig core xrLocateViews runs.
