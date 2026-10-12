@@ -294,23 +294,30 @@ TEST_CASE("depth_image_shares_across_devices_warp")
 	}
 #endif
 
-	// Every DXGI depth format: the three advertised must pass; D32S8X24 is
-	// reported, not required (it is not advertised).
+	// Every DXGI depth format, through the probe the service advertises by.
+	//
+	// MEASURED on WARP (CI, first run of this test): D32_FLOAT and D16_UNORM
+	// share and round-trip; D24_UNORM_S8_UINT (R24G8_TYPELESS) and
+	// D32_FLOAT_S8X24_UINT (R32G8X24_TYPELESS) are REFUSED for an NT-handle
+	// keyed-mutex resource -- the strict validation SHARED_NTHANDLE turns on
+	// (and what Monado's d3d11 allocator calls "depth formats are not
+	// supported"). That is exactly why the service probes instead of assuming:
+	// on such a device it advertises D32 + D16 and never D24S8. So D32 and D16
+	// are REQUIRED here (one shareable depth format is what the CTS depth test
+	// needs, and WARP is the reference); the stencil families are reported.
+	int shared_count = 0;
 	for (const auto &d : kDepth) {
-		bool advertised = false;
-		for (size_t i = 0; i < D3D11_SERVICE_DEPTH_FORMAT_COUNT; i++) {
-			advertised = advertised || d3d11_service_depth_formats[i] == d.typed;
-		}
-		INFO(d.name << (advertised ? " (advertised)" : " (not advertised)"));
-
 		const bool shareable = d3d11_service_depth_format_shareable(svc, d.typed);
-		UNSCOPED_INFO("probe " << d.name << " shareable=" << shareable);
-		if (advertised) {
+		WARN("probe " << d.name << ": shareable=" << (shareable ? "yes" : "no"));
+		if (d.typed == DXGI_FORMAT_D32_FLOAT || d.typed == DXGI_FORMAT_D16_UNORM) {
+			INFO(d.name);
 			CHECK(shareable);
 		}
 		if (!shareable) {
 			continue;
 		}
+		shared_count++;
+		INFO(d.name);
 
 		// --- service side: the production description, two array slices. ---
 		const D3D11_TEXTURE2D_DESC desc =
@@ -392,6 +399,8 @@ TEST_CASE("depth_image_shares_across_devices_warp")
 		CloseHandle(h);
 		safe_release(tex);
 	}
+
+	CHECK(shared_count >= 2);
 
 #ifdef DXR_TEST_HAVE_D3D12
 	safe_release(d12);

@@ -37,6 +37,11 @@
  *     supported" with NT handles on some drivers. So the service advertises a
  *     depth format only after creating one with the exact production recipe
  *     and getting an NT handle for it (d3d11_service_depth_format_shareable).
+ *     Measured on WARP (tests_comp_d3d11_service_formats): D32_FLOAT and
+ *     D16_UNORM share, open in a second D3D11 device and in D3D12, and the
+ *     depth one device writes is what the other reads; D24_UNORM_S8_UINT and
+ *     D32_FLOAT_S8X24_UINT are refused by the probe. So on such a device
+ *     the service offers D32 + D16 and never enumerates D24S8.
  */
 
 #pragma once

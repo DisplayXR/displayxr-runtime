@@ -244,7 +244,8 @@ CTS-visible decision, deliberately not made here. The evidence below comes from 
 *Update (#1956).* The flag was measured: ON is zero-red on all 7 in-process CTS arms once
 `comp_gl` advertises and allocates depth (#1957). The one prerequisite the CTS can't see was the
 IPC path. The Windows D3D11 service now advertises D24S8/D32/D16, the in-process parity set. It
-advertises each format only after probing that it can share one cross-process. The images are
+advertises each format only after probing that it can share one cross-process. On WARP that
+probe refuses D24S8, so the list is D32 + D16. The images are
 TYPELESS NT-handle textures with a keyed mutex. D3D11 and D3D12 clients open them as-is. The
 Vulkan client offers only the formats its device can import as `D3D11_TEXTURE_BIT`. The GL
 client's WGL interop path does not offer depth yet (#1969). The POSIX service (null compositor
