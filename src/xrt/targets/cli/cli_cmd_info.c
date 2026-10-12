@@ -30,6 +30,8 @@ cli_cmd_info(int argc, const char **argv)
 	// the JSON about one run in ten, with exit code 0.
 	struct cli_query_handles h;
 	cli_query_fill(&r, &h, NULL);
+	// ADR-053 §7.1: live lift caps from the running service, never a second module.
+	cli_query_lift_caps_from_service(&r);
 
 	if (cli_has_flag(argc, argv, "--json")) {
 		cli_query_print_info_json(&r);

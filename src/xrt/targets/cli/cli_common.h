@@ -59,6 +59,25 @@ cli_status_build_headless(struct xrt_status_snapshot *out);
 int
 cli_cmd_clients(int argc, const char **argv);
 
+//! `conv list|status|warm|enable|disable|use|reset|models` — conversion providers (ADR-053).
+int
+cli_cmd_conv(int argc, const char **argv);
+
+struct cli_query_result;
+
+/*!
+ * `lift_caps` from the RUNNING service (ADR-053 §7.1: the CLI never loads a
+ * second model instance): one DIAG `lift_get_properties` when a service is
+ * listening (never launched), recorded with @ref cli_query_set_lift_caps.
+ * No service, or a build without IPC: @p r is left as the headless pass
+ * filled it (the static dp-lift row note).
+ *
+ * TODO(#2003): once the service publishes its `dp-lift` conversion row, read
+ * that row from the snapshot instead (same `lift_caps` JSON shape).
+ */
+void
+cli_query_lift_caps_from_service(struct cli_query_result *r);
+
 //! `workspace list|set|reset|launch` — workspace controllers + launch settings (dashboard phase 8).
 int
 cli_cmd_workspace(int argc, const char **argv);
