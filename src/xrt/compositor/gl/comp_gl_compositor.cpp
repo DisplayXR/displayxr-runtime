@@ -748,6 +748,13 @@ struct comp_gl_compositor
 		bool program_failed;
 		GLint loc_corners;
 		GLint loc_tex;
+		//! ADR-046 Amendment 2 B.7: the crosstalk-softening program, built
+		//! on the first frame that softens (never for an on-glass cursor).
+		GLuint program_soft;
+		bool program_soft_failed;
+		GLint loc_soft_corners;
+		GLint loc_soft_tex;
+		GLint loc_soft_params;
 		//! The default look's sprite (premultiplied, sRGB-encoded bytes).
 		GLuint default_tex;
 		uint64_t default_gen;
@@ -6027,6 +6034,77 @@ static const char *FS_CURSOR =
     "    fragColor = texture(u_texture, v_uv);\n"
     "}\n";
 
+// ADR-046 Amendment 2 B.7: the lifted cursor, softened against crosstalk -
+// the same kernel as the Metal / D3D11 / Vulkan variants. u_soften.xy = blur
+// radius in sprite uv, .z = opacity, .w = 1 for a STRAIGHT-alpha sprite (the
+// app's), 0 for the premultiplied default look. The quad is padded by the
+// radius; a tap outside 0..1 is transparent. 13 taps: centre, 4 at r/2, 8 at
+// r (Gaussian, sigma 0.6 r), accumulated premultiplied so a straight sprite's
+// clear texels add no colour.
+static const char *FS_CURSOR_SOFT =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec4 u_soften;\n"
+    "vec4 soft_tap(vec2 uv, bool straight) {\n"
+    "    vec4 s = texture(u_texture, uv);\n"
+    "    if (straight) { s.rgb *= s.a; }\n"
+    "    bool inside = uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0;\n"
+    "    return inside ? s : vec4(0.0);\n"
+    "}\n"
+    "void main() {\n"
+    "    bool straight = u_soften.w > 0.5;\n"
+    "    vec2 r = u_soften.xy;\n"
+    "    vec4 acc = soft_tap(v_uv, straight);\n"
+    "    float wsum = 1.0;\n"
+    "    if (r.x > 0.0 || r.y > 0.0) {\n"
+    "        const float wi = 0.7066;\n"
+    "        const float wo = 0.2494;\n"
+    "        acc += wi * soft_tap(v_uv + vec2(0.5, 0.0) * r, straight);\n"
+    "        acc += wi * soft_tap(v_uv + vec2(-0.5, 0.0) * r, straight);\n"
+    "        acc += wi * soft_tap(v_uv + vec2(0.0, 0.5) * r, straight);\n"
+    "        acc += wi * soft_tap(v_uv + vec2(0.0, -0.5) * r, straight);\n"
+    "        for (int k = 0; k < 8; k++) {\n"
+    "            float a = 0.3927 + 0.7854 * float(k);\n"
+    "            acc += wo * soft_tap(v_uv + vec2(cos(a), sin(a)) * r, straight);\n"
+    "        }\n"
+    "        wsum += 4.0 * wi + 8.0 * wo;\n"
+    "    }\n"
+    "    acc /= wsum;\n"
+    "    if (straight) {\n"
+    "        vec3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : vec3(0.0);\n"
+    "        fragColor = vec4(rgb, acc.a * u_soften.z);\n"
+    "    } else {\n"
+    "        fragColor = acc * u_soften.z;\n"
+    "    }\n"
+    "}\n";
+
+/*!
+ * The softening program, built on the first frame that softens. A failure is
+ * logged once and the cursor is drawn crisp - softening never refuses it.
+ */
+static bool
+gl_cursor_ensure_soft_program(struct comp_gl_compositor *c)
+{
+	if (c->cursor_draw.program_soft != 0) {
+		return true;
+	}
+	if (c->cursor_draw.program_soft_failed) {
+		return false;
+	}
+	c->cursor_draw.program_soft = create_program(VS_CURSOR, FS_CURSOR_SOFT);
+	if (c->cursor_draw.program_soft == 0) {
+		c->cursor_draw.program_soft_failed = true; // never retried per frame
+		U_LOG_E("cursor_draw: GL softening program build failed - the cursor is drawn crisp (ADR-046 B.7)");
+		return false;
+	}
+	c->cursor_draw.loc_soft_corners = glGetUniformLocation(c->cursor_draw.program_soft, "u_corners");
+	c->cursor_draw.loc_soft_tex = glGetUniformLocation(c->cursor_draw.program_soft, "u_texture");
+	c->cursor_draw.loc_soft_params = glGetUniformLocation(c->cursor_draw.program_soft, "u_soften");
+	return true;
+}
+
 static bool
 gl_cursor_ensure_program(struct comp_gl_compositor *c)
 {
@@ -6123,14 +6201,21 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 	const float backing_scale = comp_cursor_look_backing_scale();
 	const float m_per_pt = m_per_px * backing_scale;
 	// The canvas the Kooima views were built for: the window's client area.
+	uint32_t canvas_px_w = 0;
 	uint32_t canvas_px_h = 0;
 	struct xrt_window_metrics wm;
 	if (comp_gl_compositor_get_window_metrics(&c->base.base, &wm) && wm.valid) {
+		canvas_px_w = wm.window_pixel_width;
 		canvas_px_h = wm.window_pixel_height;
 	}
-	if (canvas_px_h == 0) {
+	if (canvas_px_w == 0 || canvas_px_h == 0) {
+		canvas_px_w = c->eff_cols * c->eff_tile_w;
 		canvas_px_h = c->eff_rows * c->eff_tile_h;
 	}
+	// The panel px that 0..1 of the (now tile-normalised) views span: the
+	// window for a zone request, else the canvas (ADR-046 B.7 ghost offset).
+	const float tile_px_w = (float)(req->zone_valid ? zones_target_w : canvas_px_w);
+	const float tile_px_h = (float)(req->zone_valid ? zones_target_h : canvas_px_h);
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h); // a zone's own height
 	if (canvas_px_h == 0) {
 		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
@@ -6200,23 +6285,31 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 		return false;
 	}
 
+	// ADR-046 B.7: soften with lift against crosstalk - blur and opacity
+	// both exactly off on the glass (ghost 0, d 0), so an on-glass frame
+	// takes the crisp program, bit-identical to the unsoftened draw. The
+	// blur cap follows the DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	const bool soft = (soften.blur_px > 0.0f || soften.alpha < 1.0f) && gl_cursor_ensure_soft_program(c);
+
 	GLint prev_viewport[4];
 	glGetIntegerv(GL_VIEWPORT, prev_viewport);
 	GLint prev_scissor[4];
 	glGetIntegerv(GL_SCISSOR_BOX, prev_scissor);
 
-	glUseProgram(c->cursor_draw.program);
+	glUseProgram(soft ? c->cursor_draw.program_soft : c->cursor_draw.program);
 	glBindVertexArray(c->vao_empty);
 	glActiveTexture(GL_TEXTURE0);
 	gl_bind_layer_source(GL_TEXTURE_2D, tex, c->compose_active);
-	glUniform1i(c->cursor_draw.loc_tex, 0);
+	glUniform1i(soft ? c->cursor_draw.loc_soft_tex : c->cursor_draw.loc_tex, 0);
 	glEnable(GL_BLEND);
 	glBlendFuncSeparate(premul ? GL_ONE : GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	// The scissor is mandatory: a cursor at a tile edge must not spill into
 	// the neighbour view (the DP would weave it into the wrong eye).
 	glEnable(GL_SCISSOR_TEST);
 
-	static const float uv[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
 	uint32_t drawn = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		uint32_t bx = 0, by = 0, bw = cols * c->eff_tile_w, bh = rows * c->eff_tile_h;
@@ -6239,15 +6332,25 @@ gl_cursor_draw(struct comp_gl_compositor *c,
 
 		float xy[4][2];
 		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
+		// Padded by the blur radius (a no-op at radius 0: the corners come
+		// back unchanged and uv spans 0..1), hotspot unmoved.
+		struct u_cursor_soften_quad sq;
+		u_cursor_draw_soften_quad(xy, tile_px_w, tile_px_h, soft ? soften.blur_px : 0.0f, &sq);
 		float corners[4][4];
 		for (int k = 0; k < 4; k++) {
 			// Tile-normalised, y DOWN -> GL NDC, y UP.
-			corners[k][0] = xy[k][0] * 2.0f - 1.0f;
-			corners[k][1] = 1.0f - xy[k][1] * 2.0f;
-			corners[k][2] = uv[k][0];
-			corners[k][3] = flip_v ? 1.0f - uv[k][1] : uv[k][1];
+			corners[k][0] = sq.corners[k][0] * 2.0f - 1.0f;
+			corners[k][1] = 1.0f - sq.corners[k][1] * 2.0f;
+			corners[k][2] = sq.uv[k][0];
+			corners[k][3] = flip_v ? 1.0f - sq.uv[k][1] : sq.uv[k][1];
 		}
-		glUniform4fv(c->cursor_draw.loc_corners, 4, &corners[0][0]);
+		if (soft) {
+			glUniform4fv(c->cursor_draw.loc_soft_corners, 4, &corners[0][0]);
+			glUniform4f(c->cursor_draw.loc_soft_params, sq.radius_uv[0], sq.radius_uv[1], soften.alpha,
+			            premul ? 0.0f : 1.0f);
+		} else {
+			glUniform4fv(c->cursor_draw.loc_corners, 4, &corners[0][0]);
+		}
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		drawn++;
 	}
@@ -7813,6 +7916,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	// XR_DXR_cursor_depth v5 draw resources (zero unless ever requested).
 	if (c->cursor_draw.program)
 		glDeleteProgram(c->cursor_draw.program);
+	if (c->cursor_draw.program_soft)
+		glDeleteProgram(c->cursor_draw.program_soft);
 	if (c->cursor_draw.default_tex)
 		glDeleteTextures(1, &c->cursor_draw.default_tex);
 	comp_cursor_look_fini(&c->cursor_draw.look);
