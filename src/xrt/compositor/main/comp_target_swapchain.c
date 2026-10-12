@@ -1348,10 +1348,12 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 	}
 #endif
 
-	VkResult ret = vk->vkAcquireNextImageKHR(  //
-	    vk->device,                            // device
-	    cts->swapchain.handle,                 // swapchain
-	    UINT64_MAX,                            // timeout
+	VkResult ret = vk->vkAcquireNextImageKHR( //
+	    vk->device,                           // device
+	    cts->swapchain.handle,                // swapchain
+	    cts->base.acquire_timeout_ns != 0     // timeout (#1007: bounded on request)
+	        ? cts->base.acquire_timeout_ns
+	        : UINT64_MAX,
 	    cts->base.semaphores.present_complete, // semaphore
 	    VK_NULL_HANDLE,                        // fence
 	    out_index);                            // pImageIndex

@@ -601,6 +601,79 @@ get_session_layer_view(struct multi_layer_entry *layer,
 	return (*out_image_view != VK_NULL_HANDLE);
 }
 
+/*
+ *
+ * #1007 bounded waits.
+ *
+ */
+
+VkResult
+multi_wait_fences_bounded(
+    struct vk_bundle *vk, uint32_t count, const VkFence *fences, int64_t budget_ns, const char *what)
+{
+	if (vk == NULL || count == 0 || fences == NULL) {
+		return VK_SUCCESS;
+	}
+
+	const int64_t start_ns = os_monotonic_get_ns();
+	for (;;) {
+		const int64_t waited_ns = os_monotonic_get_ns() - start_ns;
+		int64_t slice_ns = budget_ns - waited_ns;
+		if (slice_ns > MULTI_FENCE_TIMEOUT_NS) {
+			slice_ns = MULTI_FENCE_TIMEOUT_NS;
+		}
+		if (slice_ns < 0) {
+			slice_ns = 0;
+		}
+
+		VkResult ret = vk->vkWaitForFences(vk->device, count, fences, VK_TRUE, (uint64_t)slice_ns);
+		if (ret != VK_TIMEOUT) {
+			return ret;
+		}
+		if (slice_ns == 0 || os_monotonic_get_ns() - start_ns >= budget_ns) {
+			return VK_TIMEOUT;
+		}
+		U_LOG_W("multi[#1007]: %s: GPU fence wait > %.0f ms, retrying (budget %.0f ms)", what,
+		        (double)(os_monotonic_get_ns() - start_ns) / 1e6, (double)budget_ns / 1e6);
+	}
+}
+
+/*!
+ * #1007: a bounded stand-in for vkQueueWaitIdle/vkDeviceWaitIdle on the main
+ * queue. An empty submit with a fence signals once every batch submitted to the
+ * queue before it has completed, so waiting on that fence (bounded) drains the
+ * queue without an unbounded device-wide barrier.
+ */
+static VkResult
+multi_drain_main_queue_bounded(struct vk_bundle *vk, int64_t budget_ns, const char *what)
+{
+	VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	VkFence fence = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateFence(vk->device, &fence_info, NULL, &fence);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+
+	vk_queue_lock(vk->main_queue);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 0, NULL, fence);
+	vk_queue_unlock(vk->main_queue);
+
+	if (ret == VK_SUCCESS) {
+		ret = multi_wait_fences_bounded(vk, 1, &fence, budget_ns, what);
+	}
+
+	if (ret == VK_TIMEOUT) {
+		// Still pending: destroying a fence a queue will still signal is
+		// invalid usage. Leak it (one handle per expired drain, which only
+		// happens on a wedged queue).
+		U_LOG_E("multi[#1007]: %s: queue drain did not finish in %.0f ms — leaking its fence", what,
+		        (double)budget_ns / 1e6);
+	} else {
+		vk->vkDestroyFence(vk->device, fence, NULL);
+	}
+	return ret;
+}
+
 // The per-session compositor helpers below (composite-into-atlas, swapchain
 // recreate, HUD, workspace chrome/overlay/cursor, and render_session_to_own_target)
 // implement the legacy one-NSWindow-per-client path. macOS now composites every
@@ -1692,34 +1765,50 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
  * @param mc The multi_compositor with per-session rendering
  * @param vk The Vulkan bundle
  */
-static void
+static bool
 recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 {
 	struct comp_target *ct = mc->session_render.target;
 	if (ct == NULL) {
-		return;
+		return false;
 	}
 
 	U_LOG_W("[per-session] Recreating swapchain (window resized)...");
 
-	// 1. Wait for ALL pending GPU work to complete
-	if (mc->session_render.fenced_buffer >= 0) {
-		vk->vkWaitForFences(vk->device, 1,
-		                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-		                    VK_TRUE, UINT64_MAX);
-		mc->session_render.fenced_buffer = -1;
-	}
-	// Also wait for all fences to ensure no in-flight commands reference old swapchain
-	for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
+	// 1. Wait for ALL pending GPU work to complete — bounded (#1007). Every
+	// per-buffer fence (they are created signalled, so idle ones return at
+	// once) in ONE wait-all; on expiry, leave the old swapchain untouched,
+	// keep the recreate flagged and skip this frame — never park the main
+	// loop (and with it every other client) on one client's GPU work.
+	uint32_t live = 0;
+	VkFence wait_set[16];
+	for (uint32_t i = 0; i < mc->session_render.buffer_count && live < ARRAY_SIZE(wait_set); i++) {
 		if (mc->session_render.fences[i] != VK_NULL_HANDLE) {
-			vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[i], VK_TRUE, UINT64_MAX);
+			wait_set[live++] = mc->session_render.fences[i];
 		}
 	}
+	VkResult wret =
+	    multi_wait_fences_bounded(vk, live, wait_set, MULTI_FENCE_DEADLINE_NS, "per-session recreate (fences)");
+	if (wret == VK_TIMEOUT) {
+		U_LOG_W("[per-session] recreate deferred: GPU work still in flight after %d ms (#1007)",
+		        (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+		mc->session_render.swapchain_needs_recreate = true;
+		return false;
+	}
+	mc->session_render.fenced_buffer = -1;
+
 	// Fences only cover render work; a present (vkQueuePresentKHR) can still be in
-	// flight holding a BufferQueue slot. Drain the whole device so destroying the
-	// old swapchain releases every buffer back to the queue — otherwise the new
-	// swapchain's first vkAcquireNextImageKHR can block forever on Android (#510).
-	vk->vkDeviceWaitIdle(vk->device);
+	// flight holding a BufferQueue slot. Drain the queue so destroying the old
+	// swapchain releases every buffer back to the queue — otherwise the new
+	// swapchain's first vkAcquireNextImageKHR can block forever on Android
+	// (#510). Was vkDeviceWaitIdle; now a bounded fence on an empty submit to
+	// the same queue (#1007) — the presents went to the main queue, so the
+	// fence orders after them.
+	wret = multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "per-session recreate (queue)");
+	if (wret == VK_TIMEOUT) {
+		mc->session_render.swapchain_needs_recreate = true;
+		return false;
+	}
 
 	uint32_t old_image_count = mc->session_render.buffer_count;
 
@@ -1748,7 +1837,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	if (!comp_target_has_images(ct)) {
 		U_LOG_E("[per-session] Failed to recreate swapchain images");
 		mc->session_render.swapchain_needs_recreate = false;
-		return;
+		return false;
 	}
 
 	uint32_t new_image_count = ct->image_count;
@@ -1789,7 +1878,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		if (!mc->session_render.cmd_buffers || !mc->session_render.fences || !mc->session_render.framebuffers) {
 			U_LOG_E("[per-session] Failed to allocate new arrays after resize");
 			mc->session_render.swapchain_needs_recreate = false;
-			return;
+			return false;
 		}
 
 		// Allocate new command buffers
@@ -1803,7 +1892,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		if (vk_ret != VK_SUCCESS) {
 			U_LOG_E("[per-session] Failed to allocate new command buffers: %s", vk_result_string(vk_ret));
 			mc->session_render.swapchain_needs_recreate = false;
-			return;
+			return false;
 		}
 
 		// Create new fences (signaled)
@@ -1850,7 +1939,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.swapchain_needs_recreate = false;
 
 	U_LOG_W("[per-session] Swapchain recreated: %ux%u, %u images", ct->width, ct->height, new_image_count);
-
+	return true;
 }
 
 
@@ -2846,7 +2935,11 @@ render_session_to_own_target(struct multi_compositor *mc,
 			mc->session_render.swapchain_needs_recreate = false;
 			return;
 		}
-		recreate_session_swapchain(mc, vk);
+		if (!recreate_session_swapchain(mc, vk)) {
+			// Deferred (GPU work still in flight, #1007) or failed: skip
+			// this frame; the flag says whether to try again next frame.
+			return;
+		}
 		// Re-read ct since create_images updates it in place
 		ct = mc->session_render.target;
 	}
@@ -3036,17 +3129,6 @@ render_session_to_own_target(struct multi_compositor *mc,
 		return;
 	}
 
-	// Wait for pending fence if exists (from previous frame using same buffer)
-	if (mc->session_render.fenced_buffer >= 0) {
-		VkResult fence_ret = vk->vkWaitForFences(vk->device, 1,
-		                                         &mc->session_render.fences[mc->session_render.fenced_buffer],
-		                                         VK_TRUE, UINT64_MAX);
-		if (fence_ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to wait for fence: %s", vk_result_string(fence_ret));
-		}
-		mc->session_render.fenced_buffer = -1;
-	}
-
 #ifdef XRT_OS_WINDOWS
 	// During drag of self-owned window, synchronize with WM_PAINT cycle.
 	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
@@ -3056,6 +3138,44 @@ render_session_to_own_target(struct multi_compositor *mc,
 #endif
 
 black_canvas:; // force_black (minimized) jumps here, skipping all content/view setup
+
+	// Wait for the previous frame's fence (deferred wait, #663) — BOUNDED, with a
+	// per-client stall deadline (#1007). Placed after the black_canvas label so the
+	// minimized path, which also records into a per-buffer command buffer, honours
+	// it too (it used to jump straight past the wait).
+	//
+	//  - Healthy client: wait up to MULTI_FENCE_DEADLINE_NS in 100 ms slices.
+	//  - Deadline expired: mark the client STALLED, keep the fence pending (its
+	//    command buffer / atlas are still GPU-owned) and skip this frame — the
+	//    panel keeps the last presented image (#922 stale-frame reuse).
+	//  - While stalled: POLL only (zero budget), so one dead device or hung DP
+	//    costs the other clients nothing per frame; un-stall when it lands.
+	if (mc->session_render.fenced_buffer >= 0) {
+		const int64_t budget_ns = mc->session_render.gpu_stalled ? 0 : MULTI_FENCE_DEADLINE_NS;
+		VkResult fence_ret =
+		    multi_wait_fences_bounded(vk, 1, &mc->session_render.fences[mc->session_render.fenced_buffer],
+		                              budget_ns, "per-session previous frame");
+		if (fence_ret == VK_TIMEOUT) {
+			if (!mc->session_render.gpu_stalled) {
+				mc->session_render.gpu_stalled = true;
+				mc->session_render.gpu_stalled_since_ns = os_monotonic_get_ns();
+				U_LOG_W(
+				    "[per-session] client %p STALLED: GPU work not done after %d ms - skipping its "
+				    "frames until it lands (#1007)",
+				    (void *)mc, (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+			}
+			return;
+		}
+		if (mc->session_render.gpu_stalled) {
+			mc->session_render.gpu_stalled = false;
+			U_LOG_W("[per-session] client %p recovered after %.1f s stalled (#1007)", (void *)mc,
+			        (double)(os_monotonic_get_ns() - mc->session_render.gpu_stalled_since_ns) / 1e9);
+		}
+		if (fence_ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to wait for fence: %s", vk_result_string(fence_ret));
+		}
+		mc->session_render.fenced_buffer = -1;
+	}
 
 	// Establish frame pacing so the per-session comp_target_swapchain has a
 	// valid current_frame_id before acquire/present. render_session_to_own_target
@@ -3088,10 +3208,23 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 #ifdef XRT_OS_ANDROID
 	ts_acq0 = os_monotonic_get_ns();
 #endif
+	// #1007: never park the main loop in vkAcquireNextImageKHR on one client's
+	// stuck consumer; VK_TIMEOUT / VK_NOT_READY below skip the frame.
+	ct->acquire_timeout_ns = MULTI_ACQUIRE_TIMEOUT_NS;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
+	if (ret == VK_TIMEOUT || ret == VK_NOT_READY) {
+		static uint32_t acquire_timeouts = 0;
+		if ((acquire_timeouts++ % 60) == 0) {
+			U_LOG_W("[per-session] acquire timed out (%d ms) - skipping frame (#1007, x%u)",
+			        (int)(MULTI_ACQUIRE_TIMEOUT_NS / U_TIME_1MS_IN_NS), acquire_timeouts);
+		}
+		return;
+	}
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
 		U_LOG_W("[per-session] Swapchain out of date, recreating now");
-		recreate_session_swapchain(mc, vk);
+		if (!recreate_session_swapchain(mc, vk)) {
+			return; // deferred (#1007) or failed; flag set as needed
+		}
 		ct = mc->session_render.target;
 		mc->session_render.swapchain_needs_recreate = false;
 
@@ -3672,12 +3805,20 @@ submit_and_present:
 		// Hand the fence to the next frame's top-of-loop deferred wait.
 		mc->session_render.fenced_buffer = (int32_t)buffer_index;
 	} else {
-		ret = vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[buffer_index], VK_TRUE,
-		                          UINT64_MAX);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+		// Bounded (#1007). On expiry, hand the fence to the next frame's
+		// top-of-loop wait (exactly the deferred-by-one form above), which
+		// applies the per-client stall deadline; present still goes ahead -
+		// it is GPU-ordered by render_complete.
+		ret = multi_wait_fences_bounded(vk, 1, &mc->session_render.fences[buffer_index],
+		                                MULTI_FENCE_DEADLINE_NS, "per-session render");
+		if (ret == VK_TIMEOUT) {
+			mc->session_render.fenced_buffer = (int32_t)buffer_index;
+		} else {
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+			}
+			mc->session_render.fenced_buffer = -1; // Fence already waited
 		}
-		mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
 	}
 
 #ifdef XRT_OS_ANDROID
@@ -3928,9 +4069,18 @@ shared_surface_fini(struct multi_system_compositor *msc)
 	struct vk_bundle *vk = (msc->target_service != NULL) ? comp_target_service_get_vk(msc->target_service) : NULL;
 
 	// The render thread is stopped, but the last present's GPU work may still be
-	// in flight; wait before destroying anything it could reference.
+	// in flight; wait before destroying anything it could reference. Bounded
+	// (#1007, was vkDeviceWaitIdle): drain the main queue, which is where every
+	// shared-surface submit and present went. If it does not drain, LEAK the
+	// Vulkan objects (vk = NULL skips every destroy below) rather than free
+	// memory a wedged GPU may still touch.
 	if (vk != NULL) {
-		vk->vkDeviceWaitIdle(vk->device);
+		if (multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "shared_surface_fini") == VK_TIMEOUT) {
+			U_LOG_E(
+			    "[#59] shared_surface_fini: GPU still busy - leaking shared-surface Vulkan objects "
+			    "(#1007)");
+			vk = NULL;
+		}
 	}
 
 	// Display processor first (owns any vendor SDK handles); NULLs the pointer.
@@ -5286,9 +5436,30 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	float px_per_m_x = (float)eye_w / disp_w_m;
 	float px_per_m_y = (float)eye_h / disp_h_m;
 
-	// Wait for the previous frame's fence on whatever buffer we'll reuse.
+	// Wait for the previous frame's fence on whatever buffer we'll reuse —
+	// bounded, with the same stall deadline as the per-session path (#1007): on
+	// expiry skip the frame (the panel keeps the last image) and only poll until
+	// the fence lands.
 	if (msc->shared_fenced_buffer >= 0) {
-		vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[msc->shared_fenced_buffer], VK_TRUE, UINT64_MAX);
+		const int64_t budget_ns = msc->shared_gpu_stalled ? 0 : MULTI_FENCE_DEADLINE_NS;
+		VkResult fret = multi_wait_fences_bounded(vk, 1, &msc->shared_fences[msc->shared_fenced_buffer],
+		                                          budget_ns, "shared previous frame");
+		if (fret == VK_TIMEOUT) {
+			if (!msc->shared_gpu_stalled) {
+				msc->shared_gpu_stalled = true;
+				msc->shared_gpu_stalled_since_ns = os_monotonic_get_ns();
+				U_LOG_W(
+				    "[#59] shared surface STALLED: GPU work not done after %d ms - skipping frames "
+				    "(#1007)",
+				    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+			}
+			return;
+		}
+		if (msc->shared_gpu_stalled) {
+			msc->shared_gpu_stalled = false;
+			U_LOG_W("[#59] shared surface recovered after %.1f s stalled (#1007)",
+			        (double)(os_monotonic_get_ns() - msc->shared_gpu_stalled_since_ns) / 1e9);
+		}
 		msc->shared_fenced_buffer = -1;
 	}
 
@@ -5302,7 +5473,16 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	}
 
 	uint32_t buffer_index = 0;
+	ct->acquire_timeout_ns = MULTI_ACQUIRE_TIMEOUT_NS; // #1007
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
+	if (ret == VK_TIMEOUT || ret == VK_NOT_READY) {
+		static uint32_t shared_acquire_timeouts = 0;
+		if ((shared_acquire_timeouts++ % 60) == 0) {
+			U_LOG_W("[#59] shared acquire timed out - skipping frame (#1007, x%u)",
+			        shared_acquire_timeouts);
+		}
+		return;
+	}
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
 		U_LOG_W("[#59] shared acquire %s, skipping frame", vk_result_string(ret));
 		return;
@@ -5793,8 +5973,14 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 
 	// Cross-device shared memory has no GPU-level sync between app and compositor
 	// devices (same rationale as the per-session path) — wait before present.
-	vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[buffer_index], VK_TRUE, UINT64_MAX);
-	msc->shared_fenced_buffer = -1;
+	// Bounded (#1007): on expiry hand the fence to the next frame's top-of-loop
+	// wait (which applies the stall deadline); present is GPU-ordered anyway.
+	if (multi_wait_fences_bounded(vk, 1, &msc->shared_fences[buffer_index], MULTI_FENCE_DEADLINE_NS,
+	                              "shared render") == VK_TIMEOUT) {
+		msc->shared_fenced_buffer = (int)buffer_index;
+	} else {
+		msc->shared_fenced_buffer = -1;
+	}
 
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
 
