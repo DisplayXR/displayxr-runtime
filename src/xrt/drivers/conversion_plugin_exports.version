@@ -1,0 +1,14 @@
+/*
+ * Single-symbol export filter for conversion-provider plug-in .so files on
+ * Linux/BSD (ADR-053). Mirrors the Mach-O
+ * `-exported_symbol _xrtConversionPluginNegotiate` filter on macOS and the
+ * dllexport-only contract on Windows: the discovery loader resolves only
+ * `xrtConversionPluginNegotiate`; every other symbol (incl. statically
+ * linked aux helpers) stays local so it cannot interpose the runtime's.
+ */
+{
+	global:
+		xrtConversionPluginNegotiate;
+	local:
+		*;
+};

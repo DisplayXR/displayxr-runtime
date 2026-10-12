@@ -523,6 +523,108 @@ if(XRT_HAVE_LINUX AND NOT ANDROID)
 endif()
 
 ####
+# DisplayXR-SimConversion conversion-provider plug-in (ADR-053; discovery
+# spec §6.1). The hardware-free reference provider: every task of the v1
+# vocabulary, CPU compute (D3D11 NT-handle import on Windows only to exercise
+# that transport), scriptable readiness through host->get_setting. FALLBACK at
+# ProbeOrder 250; probe() declines unless setting ENABLE=1, so staging its
+# manifest is harmless. Same build model as sim-input: XRT_USING_RUNTIME_DLL +
+# runtime import lib on Windows/macOS, self-contained static aux + a
+# single-symbol version script on ELF. Android (libdxrc250_sim_conversion.so)
+# lands with the Android conversion loader.
+#
+# sim_conversion_static: the same sources as an OBJECT library WITHOUT
+# XRT_USING_RUNTIME_DLL, so tests link the provider's own entry point
+# statically (no dlopen, no registry) — tests/tests_sim_conversion.cpp.
+if(NOT ANDROID)
+set(SIM_CONVERSION_SOURCES
+	sim_conversion/sim_conv_plugin.c
+	sim_conversion/sim_conv_synth.c
+	sim_conversion/sim_conv_synth.h
+	sim_conversion/sim_conv_fake_ply.c
+	sim_conversion/sim_conv_fake_ply.h
+	)
+if(WIN32)
+	list(APPEND SIM_CONVERSION_SOURCES
+		sim_conversion/sim_conv_d3d11_io.cpp
+		sim_conversion/sim_conv_d3d11_io.h)
+endif()
+
+add_library(sim_conversion_static OBJECT ${SIM_CONVERSION_SOURCES})
+target_link_libraries(sim_conversion_static PUBLIC xrt-interfaces aux_util aux_os)
+target_include_directories(sim_conversion_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
+if(WIN32)
+	target_link_libraries(sim_conversion_static PUBLIC d3d11 dxgi)
+endif()
+
+if(XRT_FEATURE_OPENXR)
+add_library(drv_sim_conversion_plugin SHARED ${SIM_CONVERSION_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_sim_conversion_plugin PRIVATE xrt-interfaces aux_util aux_os)
+else()
+	target_compile_definitions(drv_sim_conversion_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_conversion_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+		)
+	add_dependencies(drv_sim_conversion_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_sim_conversion_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
+if(WIN32)
+	target_link_libraries(drv_sim_conversion_plugin PRIVATE d3d11 dxgi)
+endif()
+# LINKER_LANGUAGE CXX: the D3D11 import path and parts of aux are C++.
+set_target_properties(drv_sim_conversion_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimConversion"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+# Single-symbol export filter: xrtConversionPluginNegotiate only.
+if(APPLE)
+	target_link_options(drv_sim_conversion_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtConversionPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_conversion_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/conversion_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_sim_conversion_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_conversion_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+
+if(XRT_HAVE_LINUX)
+	# Dev staging, as for the other plug-ins (see the _plugins block below).
+	add_custom_command(
+		TARGET drv_sim_conversion_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_sim_conversion_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_sim_conversion_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR
+endif() # NOT ANDROID — DisplayXR-SimConversion block
+
+####
 # DisplayXR-NetInput input-provider plug-in DLL (ADR-034 / #823 Phase 2).
 #
 # Loopback-TCP-fed motion controllers — the integration seam for external
