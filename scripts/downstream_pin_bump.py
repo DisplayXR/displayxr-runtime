@@ -10,7 +10,10 @@ repin to it, and if so, rewrite its pins.
 Each track carries a POLICY (`bump_when` in downstream-pins.json):
 
   abi       repin only when XRT_PLUGIN_API_VERSION_CURRENT changed between the
-            pinned tag and the new tag. A vendor plug-in's installer regex-derives
+            pinned tag and the new tag -- or, for a track that lists more ABI
+            headers in `abi_headers` (e.g. xrt_conversion_plugin.h for a
+            conversion provider, ADR-053), when any of THOSE majors changed.
+            A vendor plug-in's installer regex-derives
             MIN_RUNTIME_VERSION from its runtime pin, so chasing patch releases
             would make it refuse a runtime it works fine against.
   features  repin when the plug-in-facing FEATURE SURFACE changed: a
@@ -58,6 +61,7 @@ RUNTIME_REPO = "DisplayXR/displayxr-runtime"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_plugin_abi import _resolve_api_version_current  # noqa: E402
 from check_plugin_abi import PLUGIN_HEADER_PATH  # noqa: E402
+from check_plugin_abi import ABI_HEADERS  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "downstream-pins.json"
@@ -90,6 +94,18 @@ def track_policy(track: dict) -> str:
     return p
 
 
+def abi_headers(track: dict | None) -> list[str]:
+    """The plug-in ABI headers an `abi` track is gated on. Default: the display
+    ABI only (xrt_plugin.h), which is every existing track's contract. A track
+    whose plug-in also implements another plug-in type lists that type's header
+    too (any key of check_plugin_abi.ABI_HEADERS)."""
+    hdrs = list((track or {}).get("abi_headers") or [PLUGIN_HEADER_PATH])
+    unknown = [h for h in hdrs if h not in ABI_HEADERS]
+    if unknown:
+        raise SystemExit("abi_headers lists non-ABI header(s) %s (want keys of ABI_HEADERS)" % unknown)
+    return hdrs
+
+
 def feature_headers(man: dict, track: dict | None) -> list[str]:
     if track and track.get("feature_headers"):
         return list(track["feature_headers"])
@@ -120,13 +136,14 @@ def header_at(tag: str, path: str) -> str | None:
         raise
 
 
-def abi_at_tag(tag: str):
-    """XRT_PLUGIN_API_VERSION_CURRENT as of a runtime tag, or None."""
+def abi_at_tag(tag: str, header: str = PLUGIN_HEADER_PATH):
+    """`<prefix>_CURRENT` of one plug-in ABI header (default: the display ABI,
+    XRT_PLUGIN_API_VERSION_CURRENT) as of a runtime tag, or None."""
     try:
-        text = header_at(tag, PLUGIN_HEADER_PATH)
+        text = header_at(tag, header)
         if text is None:
-            raise RuntimeError("%s absent at %s" % (PLUGIN_HEADER_PATH, tag))
-        return _resolve_api_version_current(text)
+            raise RuntimeError("%s absent at %s" % (header, tag))
+        return _resolve_api_version_current(text, ABI_HEADERS[header])
     except Exception as e:  # HTTP, parse, or unknown-alias -- all non-fatal here
         print("  ! cannot resolve plug-in ABI at %s: %s" % (tag, e))
         return None
@@ -181,7 +198,10 @@ def surface_of(text: str, header: str) -> dict:
 
 
 def surface_at(tag: str, headers: list[str]) -> dict:
-    out = {"macros": {}, "slots": {}, "abi": None, "text": {}}
+    # "abi" = the display ABI (kept as its own key: every existing caller and
+    # test reads it); "abis" = every OTHER plug-in ABI header in the set
+    # (input, conversion), keyed by its `<prefix>_CURRENT` macro.
+    out = {"macros": {}, "slots": {}, "abi": None, "abis": {}, "text": {}}
     for h in headers:
         text = header_at(tag, h)
         name = Path(h).name
@@ -193,6 +213,8 @@ def surface_at(tag: str, headers: list[str]) -> dict:
         out["slots"].update(s["slots"])
         if h == PLUGIN_HEADER_PATH:
             out["abi"] = _resolve_api_version_current(text)
+        elif h in ABI_HEADERS:
+            out["abis"][ABI_HEADERS[h] + "_CURRENT"] = _resolve_api_version_current(text, ABI_HEADERS[h])
     return out
 
 
@@ -202,6 +224,12 @@ def diff_surfaces(old: dict, new: dict) -> tuple[list[str], list[str]]:
     trig: list[str] = []
     if old.get("abi") is not None and new.get("abi") is not None and old["abi"] != new["abi"]:
         trig.append("plug-in ABI XRT_PLUGIN_API_VERSION_CURRENT %s -> %s" % (old["abi"], new["abi"]))
+    # The other plug-in ABIs (input, conversion). A header that is new at this
+    # tag has no old major to compare -- its macros and slots trigger instead.
+    oa, na = old.get("abis") or {}, new.get("abis") or {}
+    for k in sorted(oa.keys() & na.keys()):
+        if oa[k] is not None and na[k] is not None and oa[k] != na[k]:
+            trig.append("plug-in ABI %s %s -> %s" % (k, oa[k], na[k]))
 
     om, nm = old["macros"], new["macros"]
     for k in sorted(nm.keys() - om.keys()):
@@ -232,8 +260,10 @@ def diff_surfaces(old: dict, new: dict) -> tuple[list[str], list[str]]:
 # --------------------------------------------------------------------------
 # the verdict: one track, one (pinned, new) pair
 # --------------------------------------------------------------------------
-def verdict(policy: str, cur: str, new: str, headers: list[str]) -> dict:
-    """Pure decision given two runtime tags. Returns action/reason/triggers."""
+def verdict(policy: str, cur: str, new: str, headers: list[str], abi_hdrs: list[str] | None = None) -> dict:
+    """Pure decision given two runtime tags. Returns action/reason/triggers.
+    `abi_hdrs` (abi policy only): the ABI headers the track is gated on;
+    default the display ABI alone."""
     d = {"policy": policy, "current_tag": cur, "new_tag": new, "triggers": []}
     if policy == "manual":
         return dict(d, action="skip", reason="track is human-owned (bump_when=manual)")
@@ -247,18 +277,36 @@ def verdict(policy: str, cur: str, new: str, headers: list[str]) -> dict:
         return dict(d, action="skip", reason="pinned %s is newer than %s" % (cur, new))
 
     if policy == "abi":
-        cur_abi, new_abi = abi_at_tag(cur), abi_at_tag(new)
-        d.update(current_abi=cur_abi, new_abi=new_abi)
-        if cur_abi is None or new_abi is None:
-            return dict(d, action="error", reason="could not resolve the plug-in ABI at %s or %s" % (cur, new))
-        if cur_abi == new_abi:
+        hdrs = list(abi_hdrs or [PLUGIN_HEADER_PATH])
+        triggers: list[str] = []
+        for h in hdrs:
+            macro = ABI_HEADERS[h] + "_CURRENT"
+            if h != PLUGIN_HEADER_PATH and header_at(cur, h) is None and header_at(new, h) is not None:
+                # A plug-in type the track opted into first ships at `new`:
+                # the old pin cannot build that half at all.
+                triggers.append("%s first ships at %s" % (Path(h).name, new))
+                continue
+            cur_abi, new_abi = abi_at_tag(cur, h), abi_at_tag(new, h)
+            if h == PLUGIN_HEADER_PATH:
+                d.update(current_abi=cur_abi, new_abi=new_abi)
+            else:
+                d.setdefault("abis", {})[macro] = [cur_abi, new_abi]
+            if cur_abi is None or new_abi is None:
+                return dict(d, action="error",
+                            reason="could not resolve %s at %s or %s" % (macro, cur, new))
+            if cur_abi != new_abi:
+                triggers.append("plug-in ABI %s -> %s" % (cur_abi, new_abi) if h == PLUGIN_HEADER_PATH
+                                else "plug-in ABI %s %s -> %s" % (macro, cur_abi, new_abi))
+        if not triggers:
             # The load-bearing case: a patch release. Repinning would only
             # raise this plug-in's installer MIN_RUNTIME_VERSION floor.
+            shown = d.get("new_abi") if hdrs == [PLUGIN_HEADER_PATH] else ", ".join(
+                Path(h).name for h in hdrs)
             return dict(d, action="skip",
                         reason="ABI unchanged (%s at both %s and %s) -- repinning would raise "
-                               "the installer's minimum-runtime floor for no gain" % (new_abi, cur, new))
-        return dict(d, action="bump", triggers=["plug-in ABI %s -> %s" % (cur_abi, new_abi)],
-                    reason="plug-in ABI changed %s -> %s between %s and %s" % (cur_abi, new_abi, cur, new))
+                               "the installer's minimum-runtime floor for no gain" % (shown, cur, new))
+        return dict(d, action="bump", triggers=triggers,
+                    reason="plug-in ABI changed between %s and %s: %s" % (cur, new, "; ".join(triggers)))
 
     # features
     try:
@@ -385,7 +433,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
                     d = {"policy": policy, "current_tag": None, "new_tag": args.new_tag,
                          "action": "error", "reason": "could not read the current pin", "triggers": []}
                 else:
-                    d = verdict(policy, cur, args.new_tag, feature_headers(man, t))
+                    d = verdict(policy, cur, args.new_tag, feature_headers(man, t), abi_headers(t))
             d.update(repo=repo, track=track_name)
             if d["action"] == "bump":
                 d["pr_title"], d["pr_body"] = pr_text(d, t)
@@ -412,7 +460,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
             print("no such repo/track in the manifest: %s/%s" % (args.repo, args.track))
             return 2
     policy = args.policy or (track_policy(track) if track else "features")
-    d = verdict(policy, args.from_tag, args.to_tag, feature_headers(man, track))
+    d = verdict(policy, args.from_tag, args.to_tag, feature_headers(man, track), abi_headers(track))
     print("%s -> %s  policy=%s  => %s" % (args.from_tag, args.to_tag, policy, d["action"].upper()))
     for t in d.get("triggers") or []:
         print("  trigger: %s" % t)

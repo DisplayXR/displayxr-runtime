@@ -18,7 +18,8 @@
     "runtime_tag_pins.<repo>.tracks.<track>": {
       "bump_when": [
         "The track's repin POLICY -- data, not workflow logic. Required; no default.",
-        "  abi      -- repin when XRT_PLUGIN_API_VERSION_CURRENT changed between the pinned tag and the new tag.",
+        "  abi      -- repin when XRT_PLUGIN_API_VERSION_CURRENT changed between the pinned tag and the new tag",
+        "              (or, with abi_headers, when any listed plug-in ABI major changed).",
         "  features -- repin when the FEATURE SURFACE changed in the track's feature headers: an XRT_*_HAS_*",
         "              feature macro added/removed/redefined, a vtable (function-pointer) slot added/removed/",
         "              re-signed, or the plug-in ABI. Superset of abi. Catches ADR-020's append-only slot +",
@@ -27,6 +28,7 @@
         "Both automatic policies skip a release that would only raise the pin (and so the plug-in's runtime",
         "floor) for no gain, and never move a pin backwards."
       ],
+      "abi_headers": "Optional, abi policy only: the plug-in ABI headers the track is gated on (keys of scripts/check_plugin_abi.py ABI_HEADERS: xrt_plugin.h, xrt_input_plugin.h, xrt_conversion_plugin.h). Default: xrt_plugin.h alone. List xrt_conversion_plugin.h for a repo that ships a conversion provider (ADR-053), so a conversion-ABI major bump repins it.",
       "feature_headers": "Optional, features policy only: the runtime headers whose surface this track compiles against. Defaults to feature_surface.headers. Narrow it to what the track's build actually compiles, or a slot in an API the track never builds raises its floor for nothing.",
       "locations": "EVERY file the track's tag appears in. Written in ONE commit -- see atomicity note below.",
       "locations[].kind": "cmake_set  -> matches set(<key> \"<tag>\"   |  yaml_env -> matches <key>: <tag>"
@@ -72,7 +74,8 @@
       "src/xrt/include/xrt/xrt_display_processor_gl.h",
       "src/xrt/include/xrt/xrt_display_processor_metal.h",
       "src/xrt/include/xrt/xrt_display_processor_vk.h",
-      "src/xrt/include/xrt/xrt_dp_lift.h"
+      "src/xrt/include/xrt/xrt_dp_lift.h",
+      "src/xrt/include/xrt/xrt_conversion_plugin.h"
     ]
   },
 
