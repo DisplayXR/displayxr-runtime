@@ -2299,10 +2299,16 @@ TEST_CASE("cursor_measure: px -> baselines from the views, and the pixel policy 
 	CHECK(u_cursor_measure_target_px(&t, true, 15.0f, ppb) == 0.0f);   // behind the glass: on it
 	CHECK(u_cursor_measure_target_px(&t, true, 0.0f, ppb) == 0.0f);    // on the glass
 	CHECK(u_cursor_measure_target_px(&t, false, -20.0f, ppb) == 0.0f); // not confident: screen plane
+	// Deadband: noise on on-glass content (mediaplayer#103 saw ~-0.0001 baselines,
+	// which the margin pushed past the draw threshold) stays on the glass.
+	CHECK(u_cursor_measure_target_px(&t, true, -0.0001f * ppb, ppb) == 0.0f);
+	CHECK(u_cursor_measure_target_px(&t, true, -0.9f * U_CURSOR_MEASURE_DEADBAND * ppb, ppb) == 0.0f);
+	CHECK(u_cursor_measure_target_px(&t, true, -1.1f * U_CURSOR_MEASURE_DEADBAND * ppb, ppb) ==
+	      Catch::Approx((-1.1f * U_CURSOR_MEASURE_DEADBAND - t.margin) * ppb));
 	for (float m = -300.0f; m <= 300.0f; m += 7.3f) {
 		CHECK(u_cursor_measure_target_px(&t, true, m, ppb) <= 0.0f); // never behind the glass
-		CHECK(u_cursor_measure_target_px(&t, true, m, ppb) / ppb ==
-		      Catch::Approx(u_cursor_depth_target(&t, true, m / ppb)).margin(1e-6));
+		const float want = (m / ppb > -U_CURSOR_MEASURE_DEADBAND) ? 0.0f : u_cursor_depth_target(&t, true, m / ppb);
+		CHECK(u_cursor_measure_target_px(&t, true, m, ppb) / ppb == Catch::Approx(want).margin(1e-6));
 	}
 }
 

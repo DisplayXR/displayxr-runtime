@@ -826,6 +826,15 @@ u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t
 #define U_CURSOR_MEASURE_RIVAL_PX 3
 //! Left-right consistency: L->R and R->L disparities agree within this, work px.
 #define U_CURSOR_MEASURE_LR_PX 1.0f
+/*!
+ * Measurement deadband, in eye baselines of disparity: a confident match nearer
+ * the glass than this counts as ON the glass. Without it, matcher noise over
+ * textured content that sits exactly on the screen plane (a few hundredths of a
+ * px) went through the margin and lifted the cursor ~5 px where the OS cursor
+ * belongs (found by the media player, displayxr-demo-mediaplayer#103). Equal to
+ * the draw threshold, so content the deadband drops was never going to look lifted.
+ */
+#define U_CURSOR_MEASURE_DEADBAND 0.005f
 //! Per-view width the copied patch is box-downsampled to (factor = ceil(sub_w / this), <= 4).
 #define U_CURSOR_MEASURE_WORK_EYE_W 960
 #define U_CURSOR_MEASURE_MAX_FACTOR 4
@@ -1037,7 +1046,9 @@ u_cursor_measure_to_baselines(const struct u_cursor_depth_view *a,
  * Amendment 3's policy in pixels: measured < 0 ? max(measured - margin_px,
  * cap_px) : 0, with margin_px = tuning margin x @p px_per_baseline and cap_px
  * = the comfort clamp x @p px_per_baseline. Exactly u_cursor_depth_target()
- * scaled by px_per_baseline; never behind the glass.
+ * scaled by px_per_baseline, except that a measurement within
+ * U_CURSOR_MEASURE_DEADBAND of the glass counts as on it (matcher noise);
+ * never behind the glass.
  */
 float
 u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
