@@ -495,7 +495,10 @@ sessions (framed from the screen holding most of the window), camera-rig and
 zone-scoped locates, a window covering more than `XRT_MAX_SEGMENTS` (2) screens. A
 zone-scoped locate is framed from the **zone's** screen when the zone lies wholly on one
 (`oxr_segment_views_zone_segment`: its eyes, the whole window relative to it, then the zone
-rebase; ADR-047 Amendment 9), from the majority screen when it straddles a seam. A
+rebase; ADR-047 Amendment 9), from the screen holding most of the ZONE when it straddles a
+seam, and a caller chaining `XrDisplayZonePartsDXR` gets one view set per part on top
+(Amendment 10: the parts are located client-side from this table, the frame stays unrouted and
+is cropped at the live seam). A
 frame whose routing no longer matches (the mode changed between the locate and the
 commit) is drawn unrouted for that frame. Under per-segment views, canvas that lies on
 no screen is not covered by any view set and stays black (M2 painted it from the shared
@@ -606,6 +609,6 @@ pixels into a handback texture on its own IPC thread. That submit is segmented b
   latch since nothing is torn down), and falls back to the panel DP's snap.
 - **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
   screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
-  reported unsegmented (one eye set); a straddling element's views stay the primary's
-  (per-part views need a view set per part, displayxr-browser-pvt#272; proposal:
-  `docs/roadmap/multi-screen.md` § 8).
+  reported unsegmented (one eye set); a straddling element's one view set is framed from the
+  screen holding most of it (ADR-047 Amendment 10), and its per-part views
+  (`XrDisplayZonePartsDXR`) are not filled server-side yet (`docs/roadmap/multi-screen.md` § 8).

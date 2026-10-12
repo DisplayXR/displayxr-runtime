@@ -230,6 +230,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKI
  */
 DEBUG_GET_ONCE_BOOL_OPTION(mode_floor, "DXR_MODE_FLOOR", true)
 
+/*
+ * XrDisplayZonePartsDXR (XR_DXR_display_zones v4, multi-screen § 8.1):
+ * how many zones per display time get a view set per part. A split zone renders
+ * its views once per part, so the budget is capped; beyond it a zone keeps its
+ * one view set. 0 = never split. Clamped to OXR_ZONE_PARTS_MAX_CAP.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(zone_parts_max, "DXR_ZONE_PARTS_MAX", OXR_ZONE_PARTS_DEFAULT_CAP)
+
 bool
 oxr_session_mode_floor_enabled(void)
 {
@@ -3000,6 +3008,9 @@ struct oxr_locate_segment
 	uint64_t screen_id;
 	//! Views this call locates (the per-segment count); 0 = the session's.
 	uint32_t view_count;
+	//! @ref wm already IS the canvas (one part of a zone, XrDisplayZonePartsDXR):
+	//! the zone rebase of a zone-scoped locate is skipped.
+	bool canvas_is_final;
 	//! Publish session-level side effects (#441 tracking edge): only the
 	//! majority segment's call does.
 	bool side_effects;
@@ -3620,7 +3631,7 @@ locate_views_one(struct oxr_logger *log,
 			// composes relative to that rect rather than the client
 			// window; zones frames ignore the output rect at the
 			// compositor in P2 (ADR-027 rule 2).
-			if (zone != NULL && have_wm && wm.valid) {
+			if (zone != NULL && have_wm && wm.valid && (seg == NULL || !seg->canvas_is_final)) {
 				struct u_canvas_rect zone_canvas = {
 				    .valid = true,
 				    .x = zone->rect.offset.x,
@@ -4687,22 +4698,15 @@ locate_get_segment_metrics(struct oxr_session *sess, struct xrt_segment_metrics 
 }
 
 /*!
- * Can this locate be split per segment? Per-segment views are a display-centric
- * notion: each segment is a canvas the eye looks through. A camera-centric
- * locate (a chained XrCameraRigDXR, or the qwerty camera synthesis of a
- * runtime-window session) frames a fixed-FOV camera on the whole window and has
- * no per-canvas meaning, and a zone-scoped locate already names its own canvas;
- * both keep one view set (the compositor then crops it per segment, as in M2).
+ * Is this locate display-centric? Per-segment (and per-part) views are a
+ * display-centric notion: each segment is a canvas the eye looks through. A
+ * camera-centric locate (a chained XrCameraRigDXR, or the qwerty camera
+ * synthesis of a runtime-window session) frames a fixed-FOV camera on the whole
+ * window and has no per-canvas meaning.
  */
 static bool
-locate_can_split(struct oxr_session *sess, const XrViewLocateInfo *info)
+locate_is_display_centric(struct oxr_session *sess, const XrViewLocateInfo *info)
 {
-#ifdef OXR_HAVE_DXR_display_zones
-	if (sess->sys->inst->extensions.DXR_display_zones &&
-	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR) != NULL) {
-		return false;
-	}
-#endif
 #ifdef OXR_HAVE_DXR_view_rig
 	if (sess->sys->inst->extensions.DXR_view_rig) {
 		if (OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_CAMERA_RIG_DXR, XrCameraRigDXR) != NULL) {
@@ -4725,6 +4729,25 @@ locate_can_split(struct oxr_session *sess, const XrViewLocateInfo *info)
 	}
 #endif
 	return true;
+}
+
+/*!
+ * Can this locate be split per segment? Only a display-centric one, and never a
+ * zone-scoped one: it already names its own canvas and keeps one view set in
+ * XrView[] (a straddling zone's per-part sets ride XrDisplayZonePartsDXR,
+ * locate_zone_parts; under PRIMARY_MULTIVIEW_DXR too, multi-screen § 8.1).
+ * The compositor crops a one-set locate per segment, as in M2.
+ */
+static bool
+locate_can_split(struct oxr_session *sess, const XrViewLocateInfo *info)
+{
+#ifdef OXR_HAVE_DXR_display_zones
+	if (sess->sys->inst->extensions.DXR_display_zones &&
+	    OXR_GET_INPUT_FROM_CHAIN(info, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR) != NULL) {
+		return false;
+	}
+#endif
+	return locate_is_display_centric(sess, info);
 }
 
 /*!
@@ -4844,6 +4867,114 @@ oxr_session_take_segment_view_routing(struct oxr_session *sess, struct xrt_segme
 	locate_log_route_change(sess, out);
 }
 
+#ifdef OXR_HAVE_DXR_display_zones
+//! The XrDisplayZonePartsDXR the app chained on this locate's XrViewState, or NULL.
+static XrDisplayZonePartsDXR *
+locate_zone_parts_out(struct oxr_session *sess, XrViewState *viewState)
+{
+	if (!sess->sys->inst->extensions.DXR_display_zones || viewState == NULL) {
+		return NULL;
+	}
+	return OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_DISPLAY_ZONE_PARTS_DXR, XrDisplayZonePartsDXR);
+}
+
+/*!
+ * XrDisplayZonePartsDXR (XR_DXR_display_zones v4, multi-screen § 8.1): a
+ * zone-scoped locate of a zone that straddles a seam of this window's segment
+ * table @p m gets one view set PER PART, each located like a window segment
+ * (locate_segment_override over the parts' own table): that screen's eyes, the
+ * part as the canvas on that screen, and one rig scale for the whole zone. The
+ * app's XrView[] (the zone's one set, already located) is untouched.
+ *
+ * Leaves @p out at "not split" (the caller zeroed it) for a zone on one screen,
+ * a camera-centric locate, a part whose screen cannot be framed, or a spent
+ * per-frame budget (DXR_ZONE_PARTS_MAX).
+ */
+static XrResult
+locate_zone_parts(struct oxr_logger *log,
+                  struct oxr_session *sess,
+                  const XrViewLocateInfo *viewLocateInfo,
+                  const struct xrt_segment_metrics *m,
+                  const XrDisplayZoneDXR *zone,
+                  uint32_t per_part,
+                  XrDisplayZonePartsDXR *out)
+{
+	if (out == NULL || zone == NULL || per_part == 0 || per_part > XRT_MAX_VIEWS ||
+	    !locate_is_display_centric(sess, viewLocateInfo)) {
+		return XR_SUCCESS;
+	}
+	struct xrt_rect zr;
+	zr.offset.w = zone->rect.offset.x; // xrt_offset names its fields w/h
+	zr.offset.h = zone->rect.offset.y;
+	zr.extent.w = zone->rect.extent.width;
+	zr.extent.h = zone->rect.extent.height;
+
+	struct xrt_segment_metrics pm;
+	struct xrt_rect rel[XRT_MAX_SEGMENTS];
+	struct oxr_segment_layout pl;
+	const uint32_t n = oxr_segment_views_zone_parts(m, &zr, &pm, rel, &pl);
+	if (n < 2) {
+		return XR_SUCCESS;
+	}
+	const uint32_t cap = (uint32_t)debug_get_num_option_zone_parts_max();
+	const bool admitted = oxr_zone_parts_budget_admit(&sess->display_zones.parts_budget,
+	                                                  viewLocateInfo->displayTime, zone->zoneId, cap);
+	{
+		// Change-only (never per frame): the split decision for the last zone.
+		const uint32_t sig = 1u + (admitted ? 1u : 0u) + (n << 4) + (per_part << 8) + (cap << 16);
+		if (sig != sess->display_zones.parts_logged_sig) {
+			sess->display_zones.parts_logged_sig = sig;
+			U_LOG_I("zone parts: zone %u straddles %u screens - %s (%u views per part, cap %u per frame)",
+			        zone->zoneId, n, admitted ? "one view set per part" : "budget spent, one view set",
+			        per_part, cap);
+		}
+	}
+	if (!admitted) {
+		return XR_SUCCESS;
+	}
+
+	out->generation = m->generation;
+	out->partCountOutput = n;
+	out->viewCountOutput = n * per_part;
+	if (out->partCapacityInput < n || out->viewCapacityInput < n * per_part || out->parts == NULL ||
+	    out->views == NULL) {
+		return XR_SUCCESS; // a count query, or too small: the counts only
+	}
+
+	for (uint32_t p = 0; p < n; p++) {
+		struct oxr_locate_segment o;
+		locate_segment_override(&pm, &pl, p, per_part, &o);
+		o.view_count = per_part;
+		o.side_effects = false;
+		o.canvas_is_final = true;
+		o.out = NULL;
+
+		XrView tmp[XRT_MAX_VIEWS];
+		for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+			tmp[v] = (XrView){.type = XR_TYPE_VIEW, .next = NULL};
+		}
+		XrViewState bare = {.type = XR_TYPE_VIEW_STATE, .next = NULL};
+		uint32_t got = 0;
+		XrResult ret = locate_views_one(log, sess, viewLocateInfo, &bare, XRT_MAX_VIEWS, &got, tmp, &o);
+		if (ret != XR_SUCCESS) {
+			out->partCountOutput = 0;
+			out->viewCountOutput = 0;
+			return ret;
+		}
+		XrDisplayZonePartDXR *dp = &out->parts[p];
+		dp->displayId = pm.seg[p].screen_id;
+		dp->rect = (XrRect2Di){{rel[p].offset.w, rel[p].offset.h}, {rel[p].extent.w, rel[p].extent.h}};
+		dp->firstView = p * per_part;
+		dp->viewCount = per_part;
+		for (uint32_t v = 0; v < per_part; v++) {
+			out->views[p * per_part + v].pose = tmp[v].pose;
+			out->views[p * per_part + v].fov = tmp[v].fov;
+		}
+	}
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_display_zones
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
@@ -4855,6 +4986,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 {
 	struct xrt_segment_metrics m;
 	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+#ifdef OXR_HAVE_DXR_display_zones
+	// XrDisplayZonePartsDXR: "not split" unless the zone's parts are located below.
+	XrDisplayZonePartsDXR *zone_parts = locate_zone_parts_out(sess, viewState);
+	if (zone_parts != NULL) {
+		zone_parts->generation = 0;
+		zone_parts->partCountOutput = 0;
+		zone_parts->viewCountOutput = 0;
+	}
+#endif
 	// ADR-047 Amendment 7: no other presenting DP unless the table says so.
 	sess->locate_others_tracked = false;
 	sess->locate_others_count = 0;
@@ -4896,15 +5036,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 * second screen of a straddling window looks around from that screen's
 	 * viewer, not the majority's (displayxr-browser-pvt#272; the in-process /
 	 * direct-IPC twin of ADR-047 Amendment 4 addendum). A zone that
-	 * straddles a seam keeps the majority's set (oxr_segment_views_zone_segment).
+	 * straddles a seam is framed from the screen holding most of the ZONE
+	 * (oxr_segment_views_zone_segment; the same rule as the present-owner
+	 * path, multi-screen § 8), and a caller chaining XrDisplayZonePartsDXR
+	 * also gets one view set per part (locate_zone_parts).
 	 */
 	if (!is_multiview || !locate_can_split(sess, viewLocateInfo)) {
 		uint32_t fk = mj; // the segment whose screen frames this one view set
 #ifdef OXR_HAVE_DXR_display_zones
+		const XrDisplayZoneDXR *zone = NULL;
 		if (sess->sys->inst->extensions.DXR_display_zones) {
-			const XrDisplayZoneDXR *zone =
-			    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
-			if (zone != NULL && zone->rect.extent.width > 0 && zone->rect.extent.height > 0) {
+			zone = OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+			if (zone != NULL && (zone->rect.extent.width <= 0 || zone->rect.extent.height <= 0)) {
+				zone = NULL; // ignored, as locate_views_one ignores it
+			}
+			if (zone != NULL) {
 				struct xrt_rect zr;
 				zr.offset.w = zone->rect.offset.x; // xrt_offset names its fields w/h
 				zr.offset.h = zone->rect.offset.y;
@@ -4918,8 +5064,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 				if (fk != mj && m.seg[fk].screen_id != s_zone_screen_logged) {
 					s_zone_screen_logged = m.seg[fk].screen_id;
 					U_LOG_W(
-					    "multi-screen: zone %u (%d,%d %dx%d) wholly on screen 0x%016llx - views "
-					    "from that screen's eyes and geometry, not the majority screen's",
+					    "multi-screen: zone %u (%d,%d %dx%d) mostly on screen 0x%016llx - views "
+					    "from that screen's eyes and geometry, not the window majority's",
 					    zone->zoneId, zone->rect.offset.x, zone->rect.offset.y,
 					    zone->rect.extent.width, zone->rect.extent.height,
 					    (unsigned long long)m.seg[fk].screen_id);
@@ -4963,6 +5109,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// NOT touched — only a splitting locate writes it.
 			const struct xrt_segment_view_routing none = {0};
 			locate_fill_bindings(sess, viewState, &none);
+#ifdef OXR_HAVE_DXR_display_zones
+			// A straddling zone: its parts, one view set each, beside XrView[]
+			// (multi-screen § 8.1; PRIMARY_MULTIVIEW_DXR sessions too).
+			if (zone_parts != NULL && zone != NULL) {
+				uint32_t per_part = sess->view_config_view_count != 0 ? sess->view_config_view_count
+				                                                      : xdev->hmd->view_count;
+				if (per_part > xdev->hmd->view_count) {
+					per_part = xdev->hmd->view_count;
+				}
+				const uint32_t mode = xdev->hmd->active_rendering_mode_index;
+				if (mode < xdev->rendering_mode_count &&
+				    xdev->rendering_modes[mode].view_count < per_part) {
+					per_part = xdev->rendering_modes[mode].view_count;
+				}
+				ret = locate_zone_parts(log, sess, viewLocateInfo, &m, zone, per_part, zone_parts);
+			}
+#endif
 		}
 		return ret;
 	}

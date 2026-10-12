@@ -20,8 +20,10 @@
  *   - @ref oxr_segment_views_window_metrics — a segment as the window metrics
  *     the existing Kooima block consumes.
  *   - @ref oxr_segment_views_assign — the contiguous view ranges.
- *   - @ref oxr_segment_views_zone_segment — the screen a zone-scoped locate is
- *     framed from (ADR-047 Amendment 9).
+ *   - @ref oxr_segment_views_zone_segment — the screen a zone-scoped locate's
+ *     one view set is framed from (ADR-047 Amendment 9; majority rule, § 8).
+ *   - @ref oxr_segment_views_zone_parts — a straddling zone's parts, one view
+ *     set each (XrDisplayZonePartsDXR, multi-screen § 8.1).
  */
 
 #pragma once
@@ -200,26 +202,102 @@ void
 oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint32_t i, struct xrt_window_metrics *out);
 
 /*!
- * Which segment's screen frames a zone-scoped locate (an `XR_DXR_display_zones`
- * zone, or an inline-3D element) on a window woven per screen, when that locate
- * keeps ONE view set: the segment whose screen holds the WHOLE @p zone (window
- * px, the same space as xrt_segment_metric::window_rect), or @p fallback.
+ * Which segment's screen frames a zone-scoped locate's ONE view set (an
+ * `XR_DXR_display_zones` zone, or an inline-3D element) on a window woven per
+ * screen: the segment holding the LARGEST part of @p zone (window px, the same
+ * space as xrt_segment_metric::window_rect; ties to the primary, then the
+ * leftmost), or @p fallback.
  *
- * The zone is framed from that screen's eyes and against that screen's
- * physical rectangle (@ref oxr_segment_views_whole_window_metrics relative to
- * it, then the usual zone rebase), so an element wholly on the second screen
- * looks around from that screen's viewer instead of the majority's. The
- * in-process / direct-IPC twin of the present-owner rule
- * (u_weave_zone_screen_segment, ADR-047 Amendment 4 addendum).
+ * A zone wholly on one screen is framed from that screen; a zone that
+ * straddles a seam from the screen holding most of IT, not of the window
+ * (multi-screen § 8, decided 2026-10-12: one rule with the present-owner path,
+ * u_weave_zone_screen_segment). The zone is framed from that screen's eyes and
+ * against that screen's physical rectangle (@ref
+ * oxr_segment_views_whole_window_metrics relative to it, then the usual zone
+ * rebase). A caller that chains `XrDisplayZonePartsDXR` also gets a view set
+ * per part (@ref oxr_segment_views_zone_parts).
  *
- * @p fallback (the caller passes the majority segment, today's answer) when:
- *  - the zone is empty, or lands on no segment (off the window);
- *  - it lands on more than one segment: it straddles a seam, and rendering it
- *    per part needs a second view set per zone (displayxr-browser-pvt#272);
- *  - its screen's physical or desktop size is unknown (no Kooima against it).
+ * @p fallback (the caller passes the window's majority segment) when the zone
+ * is empty or lands on no segment (off the window), or when its screen's
+ * physical or desktop size is unknown (no Kooima against it).
  */
 uint32_t
 oxr_segment_views_zone_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *zone, uint32_t fallback);
+
+/*!
+ * A straddling zone's parts as a segment table of their own
+ * (u_weave_zone_part_table), placed in ONE frame (@ref oxr_segment_views_layout
+ * of the parts: the frame is the display space of the screen holding most of
+ * the zone, and the union is the zone). Each part is then located exactly like
+ * a window segment: @ref oxr_segment_views_window_metrics for its canvas, its
+ * screen's eyes, and @ref oxr_segment_views_vdh_scale / the union offset for a
+ * display rig, so both parts share ONE m2v and meet at the seam
+ * (multi-screen § 8.1).
+ *
+ * @param[out] parts     The parts' table.
+ * @param[out] zone_rel  Each part relative to the zone's top-left (may be NULL).
+ * @param[out] layout    The parts placed in one frame.
+ * @return the number of parts when the zone straddles a seam and every part
+ *         can be framed (2..XRT_MAX_SEGMENTS); 0 otherwise (one view set).
+ */
+uint32_t
+oxr_segment_views_zone_parts(const struct xrt_segment_metrics *m,
+                             const struct xrt_rect *zone,
+                             struct xrt_segment_metrics *parts,
+                             struct xrt_rect zone_rel[XRT_MAX_SEGMENTS],
+                             struct oxr_segment_layout *layout);
+
+/*!
+ * Default cap on the zones that get a view set per part in one frame
+ * (multi-screen § 8.1): a split zone renders its views once per part.
+ * `DXR_ZONE_PARTS_MAX` overrides it (0 = never split, at most
+ * @ref OXR_ZONE_PARTS_MAX_CAP).
+ */
+#define OXR_ZONE_PARTS_DEFAULT_CAP 4
+//! Upper bound of `DXR_ZONE_PARTS_MAX`.
+#define OXR_ZONE_PARTS_MAX_CAP 16
+
+/*!
+ * The per-frame budget of split zones: the distinct zones split for one
+ * display time, first come first served (an app locates its most important
+ * zones first). A zone located twice in a frame is counted once.
+ */
+struct oxr_zone_parts_budget
+{
+	int64_t display_time;
+	uint32_t count;
+	uint32_t zone_id[OXR_ZONE_PARTS_MAX_CAP];
+};
+
+/*!
+ * May zone @p zone_id be split for @p display_time under @p cap? Admits it
+ * (and counts it) when it was already admitted for that time or the budget
+ * has room. A new display time starts a new frame's budget.
+ */
+static inline bool
+oxr_zone_parts_budget_admit(struct oxr_zone_parts_budget *b, int64_t display_time, uint32_t zone_id, uint32_t cap)
+{
+	if (b == NULL) {
+		return false;
+	}
+	if (cap > OXR_ZONE_PARTS_MAX_CAP) {
+		cap = OXR_ZONE_PARTS_MAX_CAP;
+	}
+	if (b->display_time != display_time) {
+		b->display_time = display_time;
+		b->count = 0;
+	}
+	for (uint32_t i = 0; i < b->count; i++) {
+		if (b->zone_id[i] == zone_id) {
+			return true;
+		}
+	}
+	if (b->count >= cap) {
+		return false;
+	}
+	b->zone_id[b->count++] = zone_id;
+	return true;
+}
 
 /*!
  * The factor a window-centred display rig's virtual display height takes for

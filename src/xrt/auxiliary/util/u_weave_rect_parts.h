@@ -165,6 +165,42 @@ u_weave_rect_single_segment(const struct xrt_segment_metrics *m, const struct xr
 }
 
 /*!
+ * The segment of table @p m holding the LARGEST part of @p rect (window px), or
+ * -1 when the rect lands on no segment. A rect wholly on one segment answers
+ * that segment (@ref u_weave_rect_single_segment). Ties go to the primary
+ * screen, then to the earlier (leftmost) segment, the same rule as the window
+ * majority (oxr_segment_views_majority).
+ *
+ * The screen that frames a straddling zone's ONE view set for every caller that
+ * does not take its parts (multi-screen § 8, decided 2026-10-12): the element
+ * then looks right on most of its area.
+ */
+static inline int32_t
+u_weave_rect_majority_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *rect)
+{
+	if (m == NULL || rect == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+		return -1;
+	}
+	int32_t best = -1;
+	uint64_t best_area = 0;
+	bool best_primary = false;
+	for (uint32_t k = 0; k < m->count; k++) {
+		struct xrt_rect isect;
+		if (!u_weave_rect_intersect(rect, &m->seg[k].window_rect, &isect)) {
+			continue;
+		}
+		const uint64_t area = (uint64_t)isect.extent.w * (uint64_t)isect.extent.h;
+		const bool primary = m->seg[k].is_primary;
+		if (best < 0 || area > best_area || (area == best_area && primary && !best_primary)) {
+			best = (int32_t)k;
+			best_area = area;
+			best_primary = primary;
+		}
+	}
+	return best;
+}
+
+/*!
  * Which screen frames a zone-scoped locate (an inline-3D element) of a
  * present-owner whose bound window is woven per screen (ADR-047 Amendment 4,
  * addendum): the segment index whose screen's eyes and geometry the element's
@@ -176,12 +212,14 @@ u_weave_rect_single_segment(const struct xrt_segment_metrics *m, const struct xr
  *    window wholly on a non-primary screen);
  *  - it was cut from a window of the live size @p live_w x @p live_h (a resize
  *    in flight keeps the old framing for that locate);
- *  - the element lies wholly on ONE segment (@ref u_weave_rect_single_segment)
- *    — an element that straddles a seam keeps the primary's views, because
- *    rendering it per part needs a second view set the page cannot take yet
- *    (displayxr-browser-pvt#272);
- *  - that segment is not the primary screen's (the session's own framing
- *    already is that screen);
+ *  - the screen holding the LARGEST part of the element
+ *    (@ref u_weave_rect_majority_segment) is not the primary screen's (the
+ *    session's own framing already is that screen). An element wholly on one
+ *    screen is framed from that screen; a straddling element is framed from
+ *    the screen holding most of it, the rule every session shares (multi-screen
+ *    § 8, decided 2026-10-12: this path used the primary for a straddling
+ *    element before). A caller that takes the element's parts
+ *    (XrDisplayZonePartsDXR) gets a view set per part on top;
  *  - its screen's physical and desktop sizes are known (the Kooima needs them).
  */
 static inline int32_t
@@ -196,7 +234,7 @@ u_weave_zone_screen_segment(const struct xrt_segment_metrics *m,
 	if (m->window_pixel_width != live_w || m->window_pixel_height != live_h) {
 		return -1;
 	}
-	const int32_t k = u_weave_rect_single_segment(m, zone);
+	const int32_t k = u_weave_rect_majority_segment(m, zone);
 	if (k < 0) {
 		return -1;
 	}
@@ -206,6 +244,61 @@ u_weave_zone_screen_segment(const struct xrt_segment_metrics *m,
 		return -1;
 	}
 	return k;
+}
+
+/*!
+ * The parts of a zone (window px) as a segment table of their own: one entry
+ * per segment the zone overlaps, in table order, each the segment's entry with
+ * its window and screen rects cut down to the zone (the same pixels, so both
+ * shift by the same offset). Everything else (screen geometry, eyes, the
+ * window header, the generation) is copied verbatim, so the per-segment view
+ * math (oxr_segment_views_layout and friends) frames the PARTS exactly as it
+ * frames a window's segments: one reference frame, continuous across the seam,
+ * and one rig scale for the whole zone (multi-screen § 8.1).
+ *
+ * @p out_zone_rel, when not NULL, receives each part relative to the zone's
+ * top-left (`XrDisplayZonePartDXR::rect`).
+ *
+ * @return the number of parts (= @p out->count): 0 for no table, an empty zone
+ *         or one on no segment; 1 for a zone wholly on one screen; 2+ for a
+ *         zone that straddles a seam.
+ */
+static inline uint32_t
+u_weave_zone_part_table(const struct xrt_segment_metrics *m,
+                        const struct xrt_rect *zone,
+                        struct xrt_segment_metrics *out,
+                        struct xrt_rect *out_zone_rel)
+{
+	if (out == NULL) {
+		return 0;
+	}
+	memset(out, 0, sizeof(*out));
+	if (m == NULL || zone == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+		return 0;
+	}
+	*out = *m;
+	out->count = 0;
+	memset(out->seg, 0, sizeof(out->seg));
+	for (uint32_t k = 0; k < m->count; k++) {
+		const struct xrt_segment_metric *s = &m->seg[k];
+		struct xrt_rect isect;
+		if (!u_weave_rect_intersect(zone, &s->window_rect, &isect)) {
+			continue;
+		}
+		struct xrt_segment_metric *p = &out->seg[out->count];
+		*p = *s;
+		p->window_rect = isect;
+		p->screen_rect.offset.w = s->screen_rect.offset.w + (isect.offset.w - s->window_rect.offset.w);
+		p->screen_rect.offset.h = s->screen_rect.offset.h + (isect.offset.h - s->window_rect.offset.h);
+		p->screen_rect.extent = isect.extent;
+		if (out_zone_rel != NULL) {
+			out_zone_rel[out->count].offset.w = isect.offset.w - zone->offset.w;
+			out_zone_rel[out->count].offset.h = isect.offset.h - zone->offset.h;
+			out_zone_rel[out->count].extent = isect.extent;
+		}
+		out->count++;
+	}
+	return out->count;
 }
 
 /*!

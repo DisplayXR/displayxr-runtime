@@ -29779,7 +29779,8 @@ comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
 	}
 
 	// The element's screen, by the table's geometry (u_weave_zone_screen_segment):
-	// a straddling element, one on the primary, a resize in flight -> none.
+	// the screen holding most of it. One mostly on the primary, a resize in
+	// flight -> none (the session's own framing).
 	const int32_t k = u_weave_zone_screen_segment(out, zone, live_w, live_h);
 	if (k < 0) {
 		memset(out, 0, sizeof(*out));

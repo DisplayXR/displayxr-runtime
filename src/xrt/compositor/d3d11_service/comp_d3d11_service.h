@@ -1578,8 +1578,9 @@ comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc);
 /*!
  * The screen a zone-scoped locate of client @p xc must be framed against
  * (ADR-047 Amendment 4, addendum): when the window @p xc frames its locates
- * against is woven per screen and the element @p zone (window px) lies wholly
- * on a NON-primary screen of it (u_weave_zone_screen_segment, with the live
+ * against is woven per screen and the screen holding most of the element
+ * @p zone (window px; the whole element when it lies on one screen) is a
+ * NON-primary screen of it (u_weave_zone_screen_segment, with the live
  * client size @p live_w x @p live_h), @p out is that window's per-screen table
  * and @p out_index the element's segment, whose eyes are predicted now from its
  * segment DP (the table's own, as of that weave, when the DP cannot answer).

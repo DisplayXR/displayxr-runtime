@@ -66,7 +66,13 @@ extern "C" {
 // edge feather, OPT-IN. Zone edges are HARD by default (and the published
 // hardware wish is always binary/un-feathered regardless of this struct);
 // chain a feather on the zone at xrEndFrame to soften the COMPOSITE only.
-#define XR_DXR_display_zones_SPEC_VERSION 3
+// SPEC_VERSION 4 (displayxr-browser-pvt#272, multi-screen § 8): +
+// XrDisplayZonePartsDXR — a zone-scoped locate of a zone that straddles the seam
+// between two screens can return one view set PER PART (each framed from its own
+// screen, one rig scale for the whole zone), chained on XrViewState. A
+// straddling zone's one view set (XrView[]) is now framed from the screen
+// holding most of the zone, for every session.
+#define XR_DXR_display_zones_SPEC_VERSION 4
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
 
 // Extension type-value range (1004999xxx); replace with a Khronos-assigned
@@ -83,6 +89,7 @@ extern "C" {
 // XR_EXT_view_configuration_views_change.
 #define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR ((XrStructureType)1004999153)
 #define XR_TYPE_DISPLAY_ZONE_FEATHER_DXR                    ((XrStructureType)1004999154)
+#define XR_TYPE_DISPLAY_ZONE_PARTS_DXR                      ((XrStructureType)1004999155)
 
 typedef XrFlags64 XrDisplayZonesFrameEndFlagsDXR;
 //! Cross-check zone/locate/mask consistency this frame: zone rects vs wish
@@ -160,6 +167,66 @@ typedef struct XrDisplayZoneFeatherDXR {
     const void* XR_MAY_ALIAS next;
     float                    radiusPx; //!< inward ramp width, client-window px; 0 = hard
 } XrDisplayZoneFeatherDXR;
+
+/*!
+ * @brief One part of a zone that straddles a seam between screens (spec v4).
+ *
+ * The pixels of the zone that land on one screen, and where that part's view
+ * set sits in XrDisplayZonePartsDXR::views.
+ */
+typedef struct XrDisplayZonePartDXR {
+    uint64_t  displayId; //!< the screen (XrDisplayDXR::displayId, XR_DXR_display_info)
+    XrRect2Di rect;      //!< the part, ZONE-relative pixels (top-left origin), cut at the seam
+    uint32_t  firstView; //!< its first view in XrDisplayZonePartsDXR::views
+    uint32_t  viewCount; //!< its view count (= the locate's active view count)
+} XrDisplayZonePartDXR;
+
+/*!
+ * @brief Per-part views of a zone-scoped locate (spec v4, OUTPUT).
+ *
+ * Chained on XrViewState::next of an xrLocateViews whose XrViewLocateInfo
+ * chains an XrDisplayZoneDXR. When the session's window is woven per screen
+ * and the zone STRADDLES a seam, the runtime cuts the zone at the seam and
+ * locates each part from its own screen: that screen's eyes (or its nominal
+ * viewer, untracked), Kooima against that screen with the part as the canvas,
+ * and, under a display rig, ONE metres-to-virtual scale for the whole zone
+ * (the rig's virtual display height maps the zone; each part gets its share
+ * and its offset from the zone centre), so the parts meet at the seam at the
+ * same scale. Every part's view set is in one frame (the base space of the
+ * locate), contiguous in @c views.
+ *
+ * Render part p's views into p.rect of each of the zone's view images (the
+ * view at index v of part p fills that sub-rect of view v's image; scale p.rect
+ * by image size / zone size when they differ). Each part's FOV covers exactly
+ * its rect. The zone's projection layer is submitted as usual: the runtime
+ * weaves each part on its own screen.
+ *
+ * @c partCountOutput is 0 (render XrView[] as before) when the zone lies on one
+ * screen, the window is not woven per screen, the locate is camera-centric
+ * (XrCameraRigDXR), or the runtime's per-frame budget of split zones is spent
+ * (a split zone renders its views once per part; the default budget is 4 zones
+ * per display time, first located first served). The locate's own XrView[]
+ * always carries the zone's ONE view set, framed from the screen holding most
+ * of the zone, so a caller that ignores this struct renders as before.
+ * PRIMARY_MULTIVIEW_DXR sessions get per-part zone views through this struct
+ * only (never through XrView[]).
+ *
+ * Two-call idiom per array, but never an error: @c partCountOutput and
+ * @c viewCountOutput are always written; @c parts and @c views are written only
+ * when BOTH capacities are large enough (a capacity of 0 queries the counts).
+ * At most 2 parts and 2 x the session's per-set view count today.
+ */
+typedef struct XrDisplayZonePartsDXR {
+    XrStructureType       type;              //!< XR_TYPE_DISPLAY_ZONE_PARTS_DXR
+    void* XR_MAY_ALIAS    next;
+    uint64_t              generation;        //!< changes when the screen table the parts are cut from does
+    uint32_t              partCapacityInput;
+    uint32_t              partCountOutput;   //!< 0 = not split: use XrView[] as before
+    XrDisplayZonePartDXR* parts;
+    uint32_t              viewCapacityInput;
+    uint32_t              viewCountOutput;
+    XrView*               views;             //!< every part's set, contiguous (pose + fov written)
+} XrDisplayZonePartsDXR;
 
 /*!
  * @brief Per-frame wish reference. Optional, chained on XrFrameEndInfo::next

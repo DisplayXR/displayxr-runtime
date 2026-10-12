@@ -325,7 +325,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **107 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **108 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -410,6 +410,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_LAZY_TRANSPARENCY` | `compositor/vk_native/comp_vk_native_compositor.c` (`vk_lazy_transparency_setup`) | `DEBUG_GET_ONCE_BOOL` | **on** | App | 4 | Lazy transparency (desktop Linux): a transparency-capable session runs the DP's desktop capture, compose-under and alpha-gate only while its content carries alpha < 1. `=0` keeps them on for the whole session (the pre-slot behaviour), for A/B. Only engages when the DP implements `set_transparency_active` |
 | `DXR_LINUX_DIRECT_SCANOUT` | `compositor/vk_native/comp_vk_native_compositor.c:5845` | `getenv` | off | App | 1 | Opt-in RandR direct-scanout present path on Linux |
 | `DXR_WINDOW_POS` | `compositor/vk_native/comp_vk_native_compositor.c:5248` | `getenv` | plug-in reported | App | 1 | `"x,y"` override for the self-owned window position (#715) |
+| `DXR_ZONE_PARTS_MAX` | `state_trackers/oxr/oxr_session.c` (`DEBUG_GET_ONCE_NUM_OPTION`, read in `locate_zone_parts`) | `DEBUG_GET_ONCE_NUM` | 4 | App | 1 | `XrDisplayZonePartsDXR` budget (multi-screen § 8): how many zones per display time get a view set per part when they straddle a seam; a split zone renders its views once per part, so past the cap a zone keeps its one set. `0` = never split; clamped to 16 |
 | `DXR_WINDOW_FULLSCREEN` | `compositor/vk_native/comp_vk_native_window_xcb.c:273` | `getenv` | on | App | 1 | `=0` opts out of EWMH fullscreen placement (Linux XCB) |
 
 ### Native-Wayland window drag (#1748)

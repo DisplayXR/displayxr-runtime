@@ -492,13 +492,38 @@ Decisions:
   window mostly on screen 2 now takes the single-screen path (the session DP's own eyes and
   window metrics), where it took screen 2's before. The present-owner rule never needs that
   case, because a present-owner's single set is already framed from the primary.
-- **A straddling zone keeps the majority screen's set**, exactly as before: one pixel across the
-  seam is enough. Per-part views for a zone need a view set per part
-  (`docs/roadmap/multi-screen.md` § 8, proposed).
+- **A straddling zone** is superseded by Amendment 10 (its one set is framed from the screen
+  holding most of the zone, and its parts can get a view set each).
 - **Same answer as the server.** Wherever `u_weave_zone_screen_segment` re-frames, the state
-  tracker's rule picks the same segment (swept in `tests/tests_weave_segments.cpp`); the two
-  differ only in what they fall back to (the primary for a present-owner, the majority here).
+  tracker's rule picks the same segment (swept in `tests/tests_weave_segments.cpp`).
 - **No routing, no extension revision.** A zone locate still records no
   `xrt_segment_view_routing`, so the compositor crops the frame per segment as in M2, and the
   zone's pixels, wholly on one screen, are woven by that screen's DP. The locate API is unchanged;
   only which screen frames a single-screen zone moves.
+
+## Amendment 10 (2026-10-12): a straddling zone gets a view set per part
+
+Design and David's decisions: `docs/roadmap/multi-screen.md` § 8 (displayxr-browser-pvt#272).
+
+- **One majority rule for a zone's one view set, on every path.** A zone (or inline-3D element)
+  that straddles a seam is framed from the screen holding the largest part of the ZONE (ties to
+  the primary, then the leftmost): `u_weave_rect_majority_segment`, used by both
+  `u_weave_zone_screen_segment` (present-owners, which used the primary for a straddling element)
+  and `oxr_segment_views_zone_segment` (every other segmenting session, which used the window's
+  majority).
+- **Per-part views: `XrDisplayZonePartsDXR`** (`XR_DXR_display_zones` v4), chained on
+  `XrViewState` of a zone-scoped locate. The runtime cuts the zone at the seam
+  (`u_weave_zone_part_table`) and locates every part like a window segment over the parts' own
+  table (`oxr_segment_views_zone_parts` → `oxr_segment_views_layout`): that screen's eyes carried
+  into the frame of the zone's majority screen, the part as the Kooima canvas on its own screen,
+  and, for a display rig, one m2v for the whole zone (`vdh_scale` and the rig offset with
+  "window" read as "zone"), so the parts meet at the seam. `XrView[]` keeps the one set, so an
+  unaware caller is unchanged; `PRIMARY_MULTIVIEW_DXR` gets per-part zone views only through
+  the struct. Camera-centric locates are never split.
+- **Budget.** At most `DXR_ZONE_PARTS_MAX` (default 4) zones per display time are split, first
+  located first served; past it a zone keeps its one set.
+- **The seam is accepted** as for windows: two viewers, no blending.
+- **Where it runs.** In-process segmenting compositors and direct clients of the D3D11 service
+  (Amendment 3) locate the parts client-side from the segment table, so no wire change. A
+  present-owner's element locates are framed server-side (Amendment 4 addendum); its parts, and
+  the weave crop at the painted partition, are the stacked follow-up.

@@ -8,6 +8,8 @@
 
 #include "oxr_segment_views.h"
 
+#include "util/u_weave_rect_parts.h"
+
 #include <string.h>
 
 
@@ -210,46 +212,40 @@ oxr_segment_views_whole_window_metrics(const struct xrt_segment_metrics *m, uint
 	out->valid = true;
 }
 
-//! Do two rects (half-open, window px) share at least one pixel?
-static bool
-rects_overlap(const struct xrt_rect *a, const struct xrt_rect *b)
-{
-	if (a->extent.w <= 0 || a->extent.h <= 0 || b->extent.w <= 0 || b->extent.h <= 0) {
-		return false;
-	}
-	const int64_t ax1 = (int64_t)a->offset.w + a->extent.w;
-	const int64_t ay1 = (int64_t)a->offset.h + a->extent.h;
-	const int64_t bx1 = (int64_t)b->offset.w + b->extent.w;
-	const int64_t by1 = (int64_t)b->offset.h + b->extent.h;
-	return (int64_t)a->offset.w < bx1 && (int64_t)b->offset.w < ax1 && (int64_t)a->offset.h < by1 &&
-	       (int64_t)b->offset.h < ay1;
-}
-
 uint32_t
 oxr_segment_views_zone_segment(const struct xrt_segment_metrics *m, const struct xrt_rect *zone, uint32_t fallback)
 {
-	if (m == NULL || zone == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS) {
+	const int32_t k = u_weave_rect_majority_segment(m, zone);
+	if (k < 0) {
 		return fallback;
 	}
-	int32_t found = -1;
-	for (uint32_t k = 0; k < m->count; k++) {
-		if (!rects_overlap(zone, &m->seg[k].window_rect)) {
-			continue;
-		}
-		if (found >= 0) {
-			return fallback; // a second screen: the zone straddles a seam
-		}
-		found = (int32_t)k;
-	}
-	if (found < 0) {
-		return fallback;
-	}
-	const struct xrt_segment_metric *s = &m->seg[found];
+	const struct xrt_segment_metric *s = &m->seg[k];
 	if (s->screen_width_m <= 0.0f || s->screen_height_m <= 0.0f || s->screen_desktop_width == 0 ||
 	    s->screen_desktop_height == 0) {
 		return fallback;
 	}
-	return (uint32_t)found;
+	return (uint32_t)k;
+}
+
+uint32_t
+oxr_segment_views_zone_parts(const struct xrt_segment_metrics *m,
+                             const struct xrt_rect *zone,
+                             struct xrt_segment_metrics *parts,
+                             struct xrt_rect zone_rel[XRT_MAX_SEGMENTS],
+                             struct oxr_segment_layout *layout)
+{
+	if (parts == NULL || layout == NULL) {
+		return 0;
+	}
+	const uint32_t n = u_weave_zone_part_table(m, zone, parts, zone_rel);
+	if (n < 2) {
+		return 0;
+	}
+	// Every part needs its screen's size and desktop rect (the layout checks).
+	if (!oxr_segment_views_layout(parts, layout)) {
+		return 0;
+	}
+	return n;
 }
 
 uint32_t
