@@ -17,7 +17,7 @@
 | `sim_display_processor_d3d12.cpp` | D3D12 DP variant |
 | `sim_display_processor_gl.c` | OpenGL DP variant |
 | `sim_display_processor_metal.m` | Metal DP variant |
-| `sim_display_webcam*.{c,h}`, `sim_display_face_estimator*` | Opt-in webcam eye tracking (#1855): geometry + smoothing (`_tracking`), the capture worker (`_tracker`), the process glue (`sim_display_webcam.c`), the estimator slot |
+| `sim_display_webcam*.{c,h}`, `sim_display_face_estimator*` | Opt-in webcam eye tracking (#1855): geometry + smoothing (`_tracking`), the capture worker (`_tracker`), the process glue (`sim_display_webcam.c`), the estimator slot (`_none` by default, `_onnx` + `sim_webcam_onnx.cmake` with `XRT_SIM_WEBCAM_ESTIMATOR=onnx`), YuNet pre/post-processing (`sim_display_face_yunet`) |
 | `shaders/` | Side-by-side / anaglyph compositing shaders |
 
 ## Display modes
@@ -181,13 +181,14 @@ The goal is look-around on an ordinary monitor with no vendor hardware: a worker
 thread reads a webcam, a face estimator finds the two pupils, and sim_display
 reports the viewer's eye positions in the panel's frame.
 
-> **Status: the plumbing has landed but the face estimator has not.** The
-> default build has no estimator, so setting the toggle logs one WARN
-> (`... this build has no face estimator - camera NOT opened ...`) and nothing
-> else changes. No camera is opened and the advertised capability does not
-> change. Which model and inference dependency to ship is the open question
-> on #1855. The estimator is one interface (`sim_display_face_estimator.h`),
-> so landing one is a self-contained change.
+> **Status: the estimator is a developer opt-in.** Default and release builds
+> carry none (`-DXRT_SIM_WEBCAM_ESTIMATOR=stub`), so setting the toggle there
+> logs one WARN (`... this build has no face estimator - camera NOT opened ...`)
+> and nothing else changes: no camera opens and the advertised capability does
+> not change. A build configured with `-DXRT_SIM_WEBCAM_ESTIMATOR=onnx` gets a
+> real one, YuNet run through ONNX Runtime; see *Building the estimator* below.
+> The estimator is one interface (`sim_display_face_estimator.h`), so another
+> one can replace it without touching anything around it.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -197,6 +198,7 @@ reports the viewer's eye positions in the panel's frame.
 | `SIM_DISPLAY_WEBCAM_OFFSET_MM` | `0,0,0` | The camera position relative to the top-centre of the panel's active area, as `x,y,z` in mm (+x right, +y up, +z towards the viewer). A typical bezel camera is about `0,8,0`. |
 | `SIM_DISPLAY_WEBCAM_IPD_MM` | `63` | The inter-pupillary distance prior that the depth estimate uses. |
 | `SIM_DISPLAY_WEBCAM_MIRROR` | unset | `1` if the source delivers a mirrored (selfie) image. Media Foundation does not. |
+| `SIM_DISPLAY_WEBCAM_MODEL` | next to the plug-in | `onnx` builds only: the path of the face model to load instead of the one copied next to the plug-in. It must be a YuNet export with dynamic input dimensions. |
 
 **Pipeline.** The camera is captured through the runtime's existing UVC
 source: Media Foundation on Windows, with the same backend as the
@@ -207,6 +209,46 @@ runs the estimator on every frame on its own thread. Each result is mapped,
 smoothed with a one-euro filter and stored as the latest state. The display
 processors read that state through a mutex that is held only for a
 small-struct update, so they never wait on the camera.
+
+**Building the estimator.** Configure with
+`-DXRT_SIM_WEBCAM_ESTIMATOR=onnx` (for example
+`cmake -B build -DXRT_SIM_WEBCAM_ESTIMATOR=onnx`, or add it to the configure
+line `build_windows.bat` runs). Configure then downloads two pinned files into
+`<build>/_deps/sim_webcam/`, verifying each SHA256, and the plug-in build copies
+the runtime library and the model next to `DisplayXR-SimDisplay` (on Linux,
+into `_plugins/` too; `cmake --install` puts both in the plug-in directory).
+Nothing is committed, and default builds fetch nothing.
+
+| What | Pinned source | Licence | SHA256 |
+|---|---|---|---|
+| ONNX Runtime 1.30.0, CPU, prebuilt | `github.com/microsoft/onnxruntime/releases/download/v1.30.0/`: `onnxruntime-win-x64-1.30.0.zip` / `onnxruntime-linux-x64-1.30.0.tgz` / `onnxruntime-osx-arm64-1.30.0.tgz` | MIT | `c6ba983b…ba949` / `a5ed5a3c…b3fd` / `6ebb5062…a7012` (full values in `sim_display/sim_webcam_onnx.cmake`) |
+| YuNet face detector, `face_detection_yunet_2026may.onnx` (dynamic input shape) | `github.com/opencv/opencv_zoo/raw/26cc381e4d2594bb9f47a26eb8fd96c94a13660d/models/face_detection_yunet/face_detection_yunet_2026may.onnx` (opencv_zoo, from Shiqi Yu's libfacedetection.train) | MIT (`models/face_detection_yunet/LICENSE`) | `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0` |
+
+Only the headers, the one runtime library (`onnxruntime.dll`,
+`libonnxruntime.so.1.30.0` or `libonnxruntime.1.30.0.dylib`) and ONNX Runtime's
+`LICENSE` are extracted. The plug-in does **not** link ONNX Runtime. It loads it
+on the worker's first frame, by full path from its own directory, so the
+plug-in still loads when the library is missing, and Windows' own
+`System32\onnxruntime.dll` (an older Windows ML copy) is never picked up. If the
+library or the model is missing, the estimator reports itself unavailable with
+one WARN, and the camera is not opened. If either fails to load, one WARN is
+logged and every frame then counts as "no face". Inference never logs per
+frame.
+
+YuNet is a face *detector* that also returns five landmarks, two of them the
+eye centres. It does not locate the iris, so the "pupils" are the eye centres.
+For a viewer looking at the screen the difference is a millimetre or two, well
+inside the depth error the IPD prior already adds. The frame's luma is reduced
+to 320 px wide (aspect kept, padded to a multiple of 32) and copied into all
+three input channels. The single most confident face with a score of at least
+0.6 wins. On the win box a 640 x 480 frame takes a few milliseconds on two CPU
+threads. The pre- and post-processing (`sim_display_face_yunet.c`) has no ONNX
+Runtime dependency, so `tests_sim_webcam_tracking` covers it in every build.
+
+Platforms: Windows x64, Linux x64 and macOS arm64 have pinned packages, and any
+other platform fails at configure time. Only Windows has a working camera
+source today, so the Linux and macOS builds compile and load the estimator but
+do not track.
 
 **Geometry.** The model is a pinhole camera mounted at the top-centre of the
 panel (plus the offset) and looking straight out, with no tilt. Depth comes

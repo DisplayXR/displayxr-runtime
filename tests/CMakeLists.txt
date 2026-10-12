@@ -1033,6 +1033,7 @@ target_sources(
 	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_webcam_tracking.c
 		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_webcam_tracker.c
 		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_face_estimator_none.c
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_face_yunet.c
 	)
 target_include_directories(tests_sim_webcam_tracking PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 
