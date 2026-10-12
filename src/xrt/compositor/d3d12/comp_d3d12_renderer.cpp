@@ -611,6 +611,12 @@ struct comp_d3d12_renderer
 		//! look, premultiplied - comp_cursor_look).
 		ID3D12PipelineState *pso[3][2];
 		bool failed; //!< creation failed once: never retried per frame
+		//! ADR-046 Amendment 2 B.7: the same three variants with the
+		//! crosstalk-softening pixel shader (DXR_SOFTEN, its parameters in
+		//! root constants 16..19). Built on the first frame that softens,
+		//! never for an on-glass cursor; a failure draws the cursor crisp.
+		ID3D12PipelineState *pso_soft[3][2];
+		bool soft_failed;
 		//! The default look's texture: TYPELESS storage, read through a UNORM
 		//! (fast path) or `_SRGB` (compose path) SRV. Rests in
 		//! PIXEL_SHADER_RESOURCE once uploaded.
@@ -2844,6 +2850,14 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	// XR_DXR_cursor_depth v5 (all NULL unless a cursor was ever drawn).
 	for (uint32_t l = 0; l < 3; l++) {
 		for (uint32_t rt = 0; rt < 2; rt++) {
+			if (r->cursor.pso_soft[l][rt] != nullptr) {
+				r->cursor.pso_soft[l][rt]->Release();
+				r->cursor.pso_soft[l][rt] = nullptr;
+			}
+		}
+	}
+	for (uint32_t l = 0; l < 3; l++) {
+		for (uint32_t rt = 0; rt < 2; rt++) {
 			if (r->cursor.pso[l][rt] != nullptr) {
 				r->cursor.pso[l][rt]->Release();
 				r->cursor.pso[l][rt] = nullptr;
@@ -3568,19 +3582,6 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
  *
  */
 
-static void
-cursor_release_pipelines(struct comp_d3d12_renderer *r)
-{
-	for (uint32_t l = 0; l < 3; l++) {
-		for (uint32_t rt = 0; rt < 2; rt++) {
-			if (r->cursor.pso[l][rt] != nullptr) {
-				r->cursor.pso[l][rt]->Release();
-				r->cursor.pso[l][rt] = nullptr;
-			}
-		}
-	}
-}
-
 //! The cursor pipeline variants (first index of `cursor.pso`).
 enum
 {
@@ -3589,32 +3590,49 @@ enum
 	CURSOR_PSO_PREMUL = 2,
 };
 
-//! The six pipelines, built on the first cursor frame only.
-static bool
-cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
+//! Release one set of cursor pipelines (crisp or soft).
+static void
+cursor_release_pso_set(ID3D12PipelineState *pso[3][2])
 {
-	if (r->cursor.pso[CURSOR_PSO_PREMUL][1] != nullptr) {
-		return true; // built last: all six exist
+	for (uint32_t l = 0; l < 3; l++) {
+		for (uint32_t rt = 0; rt < 2; rt++) {
+			if (pso[l][rt] != nullptr) {
+				pso[l][rt]->Release();
+				pso[l][rt] = nullptr;
+			}
+		}
 	}
-	if (r->cursor.failed) {
-		return false;
-	}
-	r->cursor.failed = true; // cleared on success; a failure is never retried per frame
+}
 
+/*!
+ * Build one set of six cursor pipelines: the crisp pixel shader, or (@p soft)
+ * its ADR-046 B.7 DXR_SOFTEN variant reading its parameters from root
+ * constants 16..19 (DXR_SOFTEN_ROOT_B0). Same root signature, blend and
+ * targets either way. On failure nothing is left in @p pso.
+ */
+static HRESULT
+cursor_build_pso_set(struct comp_d3d12_renderer *r, bool soft, ID3D12PipelineState *pso[3][2])
+{
 	ID3DBlob *vs = nullptr;
 	ID3DBlob *ps[2] = {nullptr, nullptr};
 	// ps[1]: same source, Texture2DArray - a layered sprite (array layer 0).
+	static const D3D_SHADER_MACRO plain[] = {{nullptr, nullptr}};
 	static const D3D_SHADER_MACRO layered[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+	static const D3D_SHADER_MACRO soft_plain[] = {
+	    {"DXR_SOFTEN", "1"}, {"DXR_SOFTEN_ROOT_B0", "1"}, {nullptr, nullptr}};
+	static const D3D_SHADER_MACRO soft_layered[] = {
+	    {"DXR_SOFTEN", "1"}, {"DXR_SOFTEN_ROOT_B0", "1"}, {"DXR_LAYERED", "1"}, {nullptr, nullptr}};
 	HRESULT hr = compile_shader(cursor_quad_vs_source, "main", "vs_5_0", &vs);
 	if (SUCCEEDED(hr)) {
-		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[0]);
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[0], soft ? soft_plain : plain);
 	}
 	if (SUCCEEDED(hr)) {
-		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[1], layered);
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[1], soft ? soft_layered : layered);
 	}
 	if (SUCCEEDED(hr)) {
 		// The quad root signature: t0 table (param 0), 32 root constants at
-		// b0 (param 1; the cursor reads the first 16), CLAMP linear s0.
+		// b0 (param 1; the cursor reads the first 16, its softening 16..19),
+		// CLAMP linear s0.
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 		d.pRootSignature = r->quad_root_signature;
 		d.VS.pShaderBytecode = vs->GetBufferPointer();
@@ -3647,9 +3665,8 @@ cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
 			    l == CURSOR_PSO_PREMUL ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
 			for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
 				d.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
-				hr = device->CreateGraphicsPipelineState(
-				    &d, __uuidof(ID3D12PipelineState),
-				    reinterpret_cast<void **>(&r->cursor.pso[l][rt]));
+				hr = device->CreateGraphicsPipelineState(&d, __uuidof(ID3D12PipelineState),
+				                                         reinterpret_cast<void **>(&pso[l][rt]));
 			}
 		}
 	}
@@ -3662,13 +3679,58 @@ cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
 		vs->Release();
 	}
 	if (FAILED(hr)) {
+		cursor_release_pso_set(pso);
+	}
+	return hr;
+}
+
+//! The six pipelines, built on the first cursor frame only.
+static bool
+cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
+{
+	if (r->cursor.pso[CURSOR_PSO_PREMUL][1] != nullptr) {
+		return true; // built last: all six exist
+	}
+	if (r->cursor.failed) {
+		return false;
+	}
+	r->cursor.failed = true; // cleared on success; a failure is never retried per frame
+	const HRESULT hr = cursor_build_pso_set(r, false, r->cursor.pso);
+	if (FAILED(hr)) {
 		U_LOG_E(
 		    "cursor_draw [d3d12]: pipeline creation failed (0x%08x) - the runtime-drawn cursor is not drawn",
 		    (unsigned)hr);
-		cursor_release_pipelines(r);
 		return false;
 	}
 	r->cursor.failed = false;
+	return true;
+}
+
+/*!
+ * ADR-046 Amendment 2 B.7: the softening pipelines, built on the first frame
+ * that softens (ADR-046 section 0: an on-glass cursor never builds them). A
+ * failure is logged once and never retried; the cursor is then drawn crisp -
+ * softening never refuses it.
+ */
+static bool
+cursor_ensure_soft_pipeline(struct comp_d3d12_renderer *r)
+{
+	if (r->cursor.pso_soft[CURSOR_PSO_PREMUL][1] != nullptr) {
+		return true; // built last: all six exist
+	}
+	if (r->cursor.soft_failed) {
+		return false;
+	}
+	r->cursor.soft_failed = true;
+	const HRESULT hr = cursor_build_pso_set(r, true, r->cursor.pso_soft);
+	if (FAILED(hr)) {
+		U_LOG_E(
+		    "cursor_draw [d3d12]: softening pipeline creation failed (0x%08x) - the cursor is drawn crisp "
+		    "(ADR-046 B.7)",
+		    (unsigned)hr);
+		return false;
+	}
+	r->cursor.soft_failed = false;
 	return true;
 }
 
@@ -3899,7 +3961,12 @@ cursor_draw(struct comp_d3d12_renderer *r,
 	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
 	const uint32_t variant =
 	    !app_image ? CURSOR_PSO_PREMUL : (layered ? CURSOR_PSO_STRAIGHT_LAYERED : CURSOR_PSO_STRAIGHT);
-	cmd_list->SetPipelineState(r->cursor.pso[variant][r->compose_active ? 1 : 0]);
+	// ADR-046 B.7: a softened frame draws the padded quad with the
+	// softening shader; if that cannot be built it draws the crisp quad
+	// (q->corners, uv 0..1) exactly as an unsoftened frame would.
+	const bool soft = q->soft && cursor_ensure_soft_pipeline(r);
+	cmd_list->SetPipelineState(soft ? r->cursor.pso_soft[variant][r->compose_active ? 1 : 0]
+	                                : r->cursor.pso[variant][r->compose_active ? 1 : 0]);
 	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
 	cmd_list->SetDescriptorHeaps(1, heaps);
 	D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -3943,12 +4010,20 @@ cursor_draw(struct comp_d3d12_renderer *r,
 
 		CursorQuadConstants cc = {};
 		for (int k = 0; k < 4; k++) {
-			cc.corners[k][0] = q->corners[i][k][0];
-			cc.corners[k][1] = q->corners[i][k][1];
-			cc.corners[k][2] = uv[k][0];
-			cc.corners[k][3] = uv[k][1];
+			cc.corners[k][0] = soft ? q->soft_corners[i][k][0] : q->corners[i][k][0];
+			cc.corners[k][1] = soft ? q->soft_corners[i][k][1] : q->corners[i][k][1];
+			cc.corners[k][2] = soft ? q->uv[i][k][0] : uv[k][0];
+			cc.corners[k][3] = soft ? q->uv[i][k][1] : uv[k][1];
 		}
 		cmd_list->SetGraphicsRoot32BitConstants(1, 16, &cc, 0);
+		if (soft) {
+			// .w: straight alpha for the app's sprite, premultiplied for the
+			// default look - the same split as the blend states. Root
+			// constants 16..19 (packoffset c4), after the corners.
+			const CursorSoftenConstants sc = {
+			    {q->soften[i][0], q->soften[i][1], q->soften[i][2], app_image ? 1.0f : 0.0f}};
+			cmd_list->SetGraphicsRoot32BitConstants(1, 4, &sc, kCursorSoftenRootOffset);
+		}
 		cmd_list->DrawInstanced(4, 1, 0, 0);
 		drawn++;
 	}

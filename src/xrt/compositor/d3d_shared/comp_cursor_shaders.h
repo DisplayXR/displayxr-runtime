@@ -64,14 +64,17 @@ VS_OUTPUT main(uint vertex_id : SV_VertexID)
 // Compiled with `DXR_LAYERED` defined for a layered (arraySize > 1) sprite
 // swapchain, whose SRV is a Texture2DArray: the spec samples array layer 0.
 //
-// Compiled with `DXR_SOFTEN` defined (D3D11 only, for now) for the lifted
-// cursor's crosstalk softening (ADR-046 Amendment 2 B.7): a 13-tap Gaussian
-// blur (centre, 4 at r/2, 8 at r; sigma 0.6 r) of the sprite, accumulated
-// premultiplied, times an opacity. The quad is padded by the radius
-// (u_cursor_draw_soften_quad) and a tap outside 0..1 is transparent. Its
-// parameters sit in their OWN constant buffer, b1, so the b0 layout - and
-// D3D12's 16 root constants, which compile this source without DXR_SOFTEN -
-// are unchanged.
+// Compiled with `DXR_SOFTEN` defined for the lifted cursor's crosstalk
+// softening (ADR-046 Amendment 2 B.7): a 13-tap Gaussian blur (centre, 4 at
+// r/2, 8 at r; sigma 0.6 r) of the sprite, accumulated premultiplied, times
+// an opacity. The quad is padded by the radius (u_cursor_draw_soften_quad)
+// and a tap outside 0..1 is transparent. The 16 corner floats (b0 c0..c3)
+// are never touched by the parameters:
+// - D3D11 puts them in their OWN constant buffer, b1.
+// - D3D12 also defines `DXR_SOFTEN_ROOT_B0`: they ride b0 at c4 - root
+//   constants 16..19 of the quad root signature's existing 32-constant
+//   parameter (the cursor's 16 corner constants are unchanged, and the root
+//   signature, shared with every quad pass, gains nothing).
 static const char *cursor_quad_ps_source = R"(
 #ifdef DXR_LAYERED
 Texture2DArray sprite_tex : register(t0);
@@ -92,10 +95,17 @@ float4 sprite_sample(float2 uv)
 #ifdef DXR_SOFTEN
 // soften.xy = blur radius in sprite uv, .z = opacity, .w = 1 for a STRAIGHT-
 // alpha sprite (the app's), 0 for a premultiplied one (the default look).
+#ifdef DXR_SOFTEN_ROOT_B0
+cbuffer CursorSoftenCB : register(b0)
+{
+    float4 soften : packoffset(c4);
+};
+#else
 cbuffer CursorSoftenCB : register(b1)
 {
     float4 soften;
 };
+#endif
 
 float4 soft_tap(float2 uv, bool straight)
 {
@@ -141,8 +151,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 #endif
 )";
 
-//! The DXR_SOFTEN variant's b1 constants (4 floats; see above).
+//! The DXR_SOFTEN variant's constants (4 floats; see above): D3D11's b1,
+//! D3D12's root constants 16..19 (kCursorSoftenRootOffset).
 struct CursorSoftenConstants
 {
 	float soften[4];
 };
+
+//! D3D12: where CursorSoftenConstants start in the quad root signature's b0
+//! root constants (packoffset c4, right after the 16 corner floats).
+static const unsigned int kCursorSoftenRootOffset = 16;
