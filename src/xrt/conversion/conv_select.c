@@ -201,15 +201,18 @@ compare_rank(const struct sort_ctx *ctx, uint32_t ia, uint32_t ib)
 	const struct conv_select_row *a = &ctx->rows[ia];
 	const struct conv_select_row *b = &ctx->rows[ib];
 
-	int fa = (a->provider_flags & CONV_PROV_FALLBACK) != 0;
-	int fb = (b->provider_flags & CONV_PROV_FALLBACK) != 0;
-	if (fa != fb) {
-		return fa - fb; // FALLBACK last, unconditionally
-	}
+	// An explicit per-task preference wins first, even for a FALLBACK
+	// provider: a user who asks for it gets it.
 	int pa = conv_select_preference_matches(ctx->preferred, a) ? 0 : 1;
 	int pb = conv_select_preference_matches(ctx->preferred, b) ? 0 : 1;
 	if (pa != pb) {
 		return pa - pb;
+	}
+	// Inside the ProbeOrder step, FALLBACK providers sort last whatever their ProbeOrder.
+	int fa = (a->provider_flags & CONV_PROV_FALLBACK) != 0;
+	int fb = (b->provider_flags & CONV_PROV_FALLBACK) != 0;
+	if (fa != fb) {
+		return fa - fb;
 	}
 	if (a->probe_order != b->probe_order) {
 		return a->probe_order < b->probe_order ? -1 : 1;

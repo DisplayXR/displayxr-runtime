@@ -8,7 +8,8 @@
  * What must hold (spec conversion-provider-discovery.md §3.4, roadmap §2.4):
  *  - the per-task preference wins, then ProbeOrder, then direct before
  *    composed, then provider id (a cross-provider tie raises tie_warn), then
- *    cap_id; FALLBACK providers sort last unconditionally;
+ *    cap_id; FALLBACK providers sort last inside the ProbeOrder step, but an
+ *    explicit per-task preference wins over that;
  *  - RESEARCH_ONLY and UNKNOWN licence classes need AllowResearchOnly; the
  *    grandfathered legacy adapter is exempt;
  *  - input kind, lane, view range and EXPLICIT_VIEWPOINTS filter;
@@ -173,21 +174,52 @@ TEST_CASE("conv_select: direct before composed at equal ProbeOrder")
 	CHECK_FALSE(r.tie_warn);
 }
 
-TEST_CASE("conv_select: FALLBACK sorts last unconditionally, even when preferred")
+TEST_CASE("conv_select: FALLBACK sorts last inside ProbeOrder; an explicit preference wins over it")
 {
 	std::vector<conv_select_row> rows = {row("sim-conversion", 0, DEPTH),
 	                                     row("open", 200, DEPTH, XRT_CONV_STATE_WARMING)};
 	rows[0].provider_flags = CONV_PROV_FALLBACK;
-	auto r = pick(rows, req(DEPTH), "sim-conversion");
-	CHECK(r.row == 1);
-	CHECK(r.wait);
 
-	SECTION("but it is chosen when it is the only candidate left")
+	SECTION("unpreferred FALLBACK sorts last despite the lowest ProbeOrder")
+	{
+		auto r = pick(rows, req(DEPTH));
+		CHECK(r.row == 1);
+		CHECK(r.wait);
+		CHECK(r.reason == CONV_SEL_OK_ORDER);
+		auto r2 = pick(rows, req(DEPTH), "open");
+		CHECK(r2.row == 1);
+	}
+	SECTION("a preference for another provider still leaves FALLBACK last")
+	{
+		rows.push_back(row("vendor", 50, DEPTH));
+		auto r = pick(rows, req(DEPTH), "open");
+		CHECK(r.row == 1); // preferred open first, then vendor, then the FALLBACK
+		std::vector<uint32_t> order(rows.size());
+		conv_select_policy pol{"open", false};
+		auto q = req(DEPTH);
+		conv_select(rows.data(), (uint32_t)rows.size(), &q, &pol, nullptr, order.data());
+		CHECK(order == std::vector<uint32_t>{1, 2, 0});
+	}
+	SECTION("an explicitly preferred FALLBACK provider wins")
+	{
+		auto r = pick(rows, req(DEPTH), "sim-conversion");
+		CHECK(r.row == 0);
+		CHECK_FALSE(r.wait);
+		CHECK(r.reason == CONV_SEL_OK_PREFERRED);
+	}
+	SECTION("a preferred FALLBACK that is terminal still falls through")
+	{
+		rows[0].state = XRT_CONV_STATE_FAILED;
+		auto r = pick(rows, req(DEPTH), "sim-conversion");
+		CHECK(r.row == 1);
+		CHECK(r.reason == CONV_SEL_OK_FALLTHROUGH);
+	}
+	SECTION("FALLBACK is chosen when it is the only candidate left")
 	{
 		rows[1].state = XRT_CONV_STATE_ABSENT;
-		auto r2 = pick(rows, req(DEPTH));
-		CHECK(r2.row == 0);
-		CHECK(r2.reason == CONV_SEL_OK_FALLTHROUGH);
+		auto r = pick(rows, req(DEPTH));
+		CHECK(r.row == 0);
+		CHECK(r.reason == CONV_SEL_OK_FALLTHROUGH);
 	}
 }
 

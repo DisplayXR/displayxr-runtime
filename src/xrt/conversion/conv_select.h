@@ -17,9 +17,11 @@
  *   1. Candidates: rows with the task, from enabled, usable, non-hidden providers.
  *   2. Filter: licence gate, input kind, lane, min_views ≤ view_count ≤
  *      max_views and EXPLICIT_VIEWPOINTS (VIEWS_* tasks).
- *   3. Order: FALLBACK providers last, unconditionally; then the preferred
- *      provider; then ProbeOrder ascending; then direct before composed; then
- *      provider id (strcmp; a cross-provider tie sets tie_warn); then cap_id.
+ *   3. Order: the preferred provider for this task first (even a FALLBACK
+ *      one); then, inside the ProbeOrder step, FALLBACK providers last
+ *      whatever their ProbeOrder; then ProbeOrder ascending; then direct
+ *      before composed; then provider id (strcmp; a cross-provider tie sets
+ *      tie_warn); then cap_id.
  *   4. Readiness never reorders: the first row that is READY or waited-for
  *      (INSTALLED / DOWNLOADING / WARMING / EVICTED) wins; ABSENT,
  *      INCOMPATIBLE, UNLICENSED, DISABLED and ANY FAILED fall through.
@@ -40,7 +42,7 @@ extern "C" {
 #define CONV_SELECT_MAX_ROWS 512u
 
 /*! @name Provider flags (conv_select_row::provider_flags, conv_provider_desc::flags) @{ */
-#define CONV_PROV_FALLBACK (1u << 0)       //!< XRT_CONV_PROVIDER_FLAG_FALLBACK: always sorts last
+#define CONV_PROV_FALLBACK (1u << 0)       //!< XRT_CONV_PROVIDER_FLAG_FALLBACK: last unless preferred
 #define CONV_PROV_LICENCE_EXEMPT (1u << 1) //!< grandfathered legacy adapter: skips the licence gate
 /*! @} */
 
