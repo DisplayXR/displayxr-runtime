@@ -5327,7 +5327,7 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID, "xrBeginFrame without xrWaitFrame");
 	}
 
-	// Display hotplug (ADR-047 Amendment 7): a changed screen table reaches
+	// Display hotplug (ADR-047 Amendment 8): a changed screen table reaches
 	// the compositor here, on the app's thread, before this frame's commit.
 	oxr_session_poll_display_topology(log, sess);
 
@@ -5639,7 +5639,7 @@ oxr_cocoa_window_placement_app_owned(const XrSessionCreateInfo *createInfo)
  * consistent snapshot (`xrt_instance::get_display_snapshot`), so a display
  * hotplug's claim sweep can never pair one list with another registry. Called
  * at session create and again every time the display-topology generation
- * moves (ADR-047 Amendment 7). The compositors copy both and rebuild their
+ * moves (ADR-047 Amendment 8). The compositors copy both and rebuild their
  * segment manager on their next weave, on the app's thread.
  */
 void
@@ -5733,7 +5733,7 @@ oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool 
 }
 
 /*!
- * Display hotplug (ADR-047 Amendment 7), once per frame on the app's thread:
+ * Display hotplug (ADR-047 Amendment 8), once per frame on the app's thread:
  * when the system's display topology moved since this session last looked,
  * re-push the screens to the compositor and queue XrEventDataDisplaysChangedDXR.
  * One unlocked read of the generation when nothing changed.
@@ -6799,7 +6799,7 @@ oxr_session_create(struct oxr_logger *log,
 
 	// Multi-screen (M2/M6, macOS): hand the in-process compositor the screen
 	// list (and the registry it was built from) so it can weave a window per
-	// screen. Re-run on every display-topology change (ADR-047 Amendment 7).
+	// screen. Re-run on every display-topology change (ADR-047 Amendment 8).
 	oxr_session_push_screens(log, sess, true);
 
 #ifdef XRT_OS_WINDOWS

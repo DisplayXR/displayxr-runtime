@@ -75,7 +75,7 @@ comp_metal_segments_destroy(struct comp_metal_segments **segs_ptr);
  * DP owns none any more), @p pinned_display_id is 0 and `DXR_SEGMENTS` is not
  * `0`.
  *
- * Callable again on a live manager (display hotplug, ADR-047 Amendment 7): a
+ * Callable again on a live manager (display hotplug, ADR-047 Amendment 8): a
  * segment DP whose screen is listed again with the same binding, by the same
  * plug-in instance, is kept; every other one is destroyed here.
  *

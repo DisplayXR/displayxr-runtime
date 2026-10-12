@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Display hotplug — see target_display_hotplug.h (ADR-047 Amendment 7).
+ * @brief  Display hotplug — see target_display_hotplug.h (ADR-047 Amendment 8).
  * @ingroup targets_common
  */
 
@@ -575,7 +575,7 @@ target_display_hotplug_start(target_display_hotplug_rebuild_fn fn, void *user)
 	hp->os_subscribed = os_display_hotplug_subscribe(on_os_reconfigured, NULL);
 	U_LOG_W(
 	    "display hotplug: watching for monitors and panels coming and going (OS notification: %s; poll: %s) — "
-	    "a panel plugged in while this app runs is claimed live (ADR-047 Amendment 7)",
+	    "a panel plugged in while this app runs is claimed live (ADR-047 Amendment 8)",
 	    hp->os_subscribed ? "yes" : "no",
 	    hp->poll_period_ns != 0 ? "every 500 ms or DXR_DISPLAY_HOTPLUG_POLL_MS" : "off");
 	return hp;

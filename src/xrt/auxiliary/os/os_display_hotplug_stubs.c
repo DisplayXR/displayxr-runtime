@@ -6,7 +6,7 @@
  *         platform; the runtime polls the topology signature instead.
  * @ingroup aux_os
  *
- * TODO(display hotplug, ADR-047 Amendment 7): Windows WM_DISPLAYCHANGE on a
+ * TODO(display hotplug, ADR-047 Amendment 8): Windows WM_DISPLAYCHANGE on a
  * message-only window; Linux RandR RRScreenChangeNotify / XCB
  * randr_screen_change_notify (or a udev drm "change" uevent).
  */

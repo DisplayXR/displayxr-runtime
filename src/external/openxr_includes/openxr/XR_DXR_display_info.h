@@ -891,7 +891,7 @@ typedef struct XrViewDisplayBindingsDXR {
     XrViewDisplayBindingDXR*    bindings;             //!< Array of bindingCapacityInput entries; may be NULL when the capacity is 0
 } XrViewDisplayBindingsDXR;
 
-// ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 7) ----
+// ---- v23: Display topology change event (display hotplug, ADR-047 Amendment 8) ----
 
 // Type value 1004999218 (display_info's 210-219 decade, see README.md).
 #define XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR ((XrStructureType)1004999218)

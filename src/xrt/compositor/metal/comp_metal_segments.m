@@ -584,7 +584,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 
 	if (have_session) {
 		// The session DP's own screen: the monitor it was made for, while
-		// the same plug-in still wins it (ADR-047 Amendment 7). The system
+		// the same plug-in still wins it (ADR-047 Amendment 8). The system
 		// default may have moved, or that monitor may have been re-claimed
 		// (sim-display -> a vendor whose panel just came up): then no screen
 		// is the primary, and every screen is woven by its own segment DP.

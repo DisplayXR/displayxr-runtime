@@ -215,7 +215,7 @@ target_screen_pick_ex(const struct target_screen_candidate *cands,
 				if (!cands[i].is_active) {
 					continue;
 				}
-				// Display-hotplug carve-out (ADR-047 Amendment 7): a
+				// Display-hotplug carve-out (ADR-047 Amendment 8): a
 				// FALLBACK claim yields to a better-ranked plug-in's real
 				// claim — the plug-in discovery would make active now.
 				if (cands[i].confidence <= TARGET_SCREEN_CONFIDENCE_FALLBACK) {

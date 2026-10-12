@@ -321,7 +321,7 @@ with his face in front of the DS1: "the app collapses to 2D as if lost face". Th
   not follow the primary's user-lost.
 
 
-## Amendment 7 (2026-10-10): the claims are live — display hotplug
+## Amendment 8 (2026-10-10): the claims are live — display hotplug
 
 Decision 1 built the screen registry once, at instance create. A 3D panel plugged in while an app
 ran therefore stayed unclaimed (or claimed by the fallback) until the app restarted, and an

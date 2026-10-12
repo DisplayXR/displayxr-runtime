@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Display hotplug: keep the per-monitor display-processor claims live
- *         (ADR-047 Amendment 7).
+ *         (ADR-047 Amendment 8).
  * @ingroup targets_common
  *
  * The per-monitor DP registry used to be built once, at instance create, so a
@@ -198,7 +198,7 @@ struct target_display_hotplug;
 /*!
  * Is the monitor enabled in this process? `DXR_DISPLAY_HOTPLUG=0` turns it
  * off, `=1` on; unset = on where the OS notification is wired (macOS), off
- * elsewhere (TODO: Windows / Linux, ADR-047 Amendment 7).
+ * elsewhere (TODO: Windows / Linux, ADR-047 Amendment 8).
  */
 bool
 target_display_hotplug_enabled(void);

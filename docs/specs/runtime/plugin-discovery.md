@@ -565,16 +565,16 @@ comes from that screen's registry entry, mixed vendors included —
 2. the **PreferredPlugin** override (#791, §2.1/§3.3), if that plug-in claims it;
 3. the **active** plug-in, if it claims it (#1521) — unless its claim is `FALLBACK` and a plug-in
    ranked before it (lower ProbeOrder) claims the monitor above `FALLBACK`: then rule 4 decides.
-   That source can only appear after instance create (display hotplug, ADR-047 Amendment 7 — a
+   That source can only appear after instance create (display hotplug, ADR-047 Amendment 8 — a
    better-ranked plug-in that probed at discovery would be the active one), so ProbeOrder forcing
    and every create-time resolve are unchanged;
 4. the highest **confidence**, ties to the lower ProbeOrder.
 
 A winning claim at **`XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`** (20) marks the registry entry
 `not_ready` and clears its DP factories: the plug-in owns the panel, nobody weaves it, and the
-compositors show it flat 2D until the plug-in claims it for real (ADR-047 Amendment 7).
+compositors show it flat 2D until the plug-in claims it for real (ADR-047 Amendment 8).
 
-**Display hotplug (ADR-047 Amendment 7).** The registry is re-resolved while the process runs
+**Display hotplug (ADR-047 Amendment 8).** The registry is re-resolved while the process runs
 (OS display reconfiguration, a monitor-list poll, or a plug-in's `request_display_rescan`). Each
 sweep first calls `target_plugin_rescan_claim_sources`: every manifest plug-in that is not a claim
 source yet is loaded and probed again — a vendor plug-in that declined at instance create because

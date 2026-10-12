@@ -532,7 +532,7 @@ struct comp_metal_compositor
 	bool seg_rebuild;                         //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
 	//! What the session's own DP was made for, from the first list (display
-	//! hotplug, ADR-047 Amendment 7): it weaves that screen only while that
+	//! hotplug, ADR-047 Amendment 8): it weaves that screen only while that
 	//! plug-in still owns it.
 	struct comp_segments_session_dp seg_session;
 	//! The session DP owned its screen after the last re-table (a regain re-sends the mode).
@@ -6845,7 +6845,7 @@ comp_metal_compositor_set_screens(struct xrt_compositor *xc,
 	*info_copy = *info;
 
 	// The first list says what the session's own DP was made for: the
-	// system-default screen and the plug-in that won it (ADR-047 Amendment 7).
+	// system-default screen and the plug-in that won it (ADR-047 Amendment 8).
 	struct comp_segments_session_dp session = c->seg_session;
 	if (!session.valid) {
 		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && !session.valid; i++) {

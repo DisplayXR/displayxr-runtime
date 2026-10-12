@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Display hotplug (ADR-047 Amendment 7): the claim sweep's pure parts.
+ * @brief  Display hotplug (ADR-047 Amendment 8): the claim sweep's pure parts.
  *
  * - the scheduler: debounce, the max-delay cap, the follow-up re-runs an OS
  *   event arms (a vendor backend may recognise a panel seconds after the OS

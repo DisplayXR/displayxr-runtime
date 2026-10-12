@@ -996,7 +996,7 @@ load_and_probe_one(const struct plugin_entry *e,
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
-	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
 	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
@@ -2105,7 +2105,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
-	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
 	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
@@ -2701,7 +2701,7 @@ load_and_probe_one(const struct plugin_entry *e, struct xrt_plugin_instance **ou
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
-	// ADR-047 Amendment 7: a plug-in may ask for the per-monitor claim sweep.
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
 	host.request_display_rescan = target_display_hotplug_plugin_request;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
@@ -2970,7 +2970,7 @@ collect_display_sources_platform(struct plugin_display_source *out, int max)
 }
 
 /*!
- * Display hotplug (ADR-047 Amendment 7): add to @p out (holding @p count
+ * Display hotplug (ADR-047 Amendment 8): add to @p out (holding @p count
  * sources) every manifest plug-in that is not a display-claim source yet — a
  * vendor plug-in that declined at instance create because its panel was not
  * attached, or one registered since. Sources already in the set are kept as
@@ -4277,7 +4277,7 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			U_LOG_W(
 			    "plugin loader: monitor 0x%016llx → '%s' (confidence=%u, ProbeOrder=%u, ranked before "
 			    "the active plug-in) — the active plug-in '%s' claims it only as a fallback: a panel "
-			    "that came up after instance create (display hotplug, ADR-047 Amendment 7)",
+			    "that came up after instance create (display hotplug, ADR-047 Amendment 8)",
 			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
 			    cand_src[pick]->probe_order, active_name);
 		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
@@ -4301,7 +4301,7 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 				break;
 			}
 		}
-		// Display hotplug (ADR-047 Amendment 7): "present, not ready" — the
+		// Display hotplug (ADR-047 Amendment 8): "present, not ready" — the
 		// plug-in owns the panel, but no display processor may touch it yet:
 		// no factory, so every compositor shows the screen flat 2D.
 		// DXR_TEST_SCREEN_NOT_READY=<output|connector|id-hex> forces it (test).
@@ -4454,7 +4454,7 @@ target_plugin_rescan_claim_sources(void)
 	// collected once and kept, so a vendor plug-in that declined at instance
 	// create is never re-probed. Needs the twin of
 	// rescan_display_sources_platform over the registry entries (ADR-047
-	// Amendment 7). Android: one plug-in, no claim-only sources.
+	// Amendment 8). Android: one plug-in, no claim-only sources.
 	return 0;
 #endif
 }

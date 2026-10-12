@@ -630,7 +630,7 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 
 /*
  *
- * Display hotplug (ADR-047 Amendment 7): the live claim sweep.
+ * Display hotplug (ADR-047 Amendment 8): the live claim sweep.
  *
  * The per-monitor registry was built once, here, at system create. A worker
  * thread (target_display_hotplug) now re-runs the sweep when the OS reports a
@@ -1265,7 +1265,7 @@ out:
 			os_mutex_unlock(&g_display_info_mutex);
 		}
 
-		// Display hotplug (ADR-047 Amendment 7): generation 1 is the table
+		// Display hotplug (ADR-047 Amendment 8): generation 1 is the table
 		// just built; the sweep keeps it live from here.
 		display_hotplug_begin(xsysc);
 
@@ -1347,7 +1347,7 @@ t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list
 }
 
 /*!
- * xrt_instance::get_display_generation (ADR-047 Amendment 7) — per frame from
+ * xrt_instance::get_display_generation (ADR-047 Amendment 8) — per frame from
  * every session; never waits on a claim sweep.
  */
 static uint64_t
@@ -1358,7 +1358,7 @@ t_instance_get_display_generation(struct xrt_instance *xinst)
 }
 
 /*!
- * xrt_instance::get_display_snapshot (ADR-047 Amendment 7) — the screen list,
+ * xrt_instance::get_display_snapshot (ADR-047 Amendment 8) — the screen list,
  * the system info it was built from, and their generation, all under
  * g_display_info_mutex (the lock the sweep rewrites them under).
  */

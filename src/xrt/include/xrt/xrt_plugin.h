@@ -303,7 +303,7 @@ enum xrt_display_claim_confidence
 	 * runtime makes NO display processor for it: the screen shows flat 2D (one
 	 * view, no weave, the lens untouched) until the plug-in claims it for real
 	 * and asks for a sweep (`xrt_plugin_host_iface::request_display_rescan`).
-	 * Display hotplug, ADR-047 Amendment 7; announced by
+	 * Display hotplug, ADR-047 Amendment 8; announced by
 	 * XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY. An older runtime treats it as an
 	 * ordinary low claim, so the plug-in must also refuse to make a DP for it.
 	 */
@@ -709,7 +709,7 @@ struct xrt_plugin_host_iface
 	 * have changed — a panel came up or went away on the vendor side (its
 	 * service re-authenticated a hotplugged panel, its topology event fired).
 	 * The runtime then re-runs the per-monitor claim sweep (ADR-047
-	 * Amendment 7): it re-enumerates the monitors, re-probes every plug-in
+	 * Amendment 8): it re-enumerates the monitors, re-probes every plug-in
 	 * that is not a claim source yet (so a plug-in that DECLINED at instance
 	 * create is probed again), calls `probe_displays` on every source and
 	 * publishes the new screen table to live sessions. The request is
@@ -761,14 +761,14 @@ struct xrt_plugin_host_iface
 /*!
  * Defined when this header carries the
  * @ref xrt_plugin_host_iface::request_display_rescan slot (display hotplug,
- * ADR-047 Amendment 7), so a plug-in that must also compile against an older
+ * ADR-047 Amendment 8), so a plug-in that must also compile against an older
  * runtime header can `#ifdef`-guard its use.
  */
 #define XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN 1
 
 /*!
  * Defined when this header carries @ref XRT_DISPLAY_CLAIM_PRESENT_NOT_READY
- * (display hotplug, ADR-047 Amendment 7).
+ * (display hotplug, ADR-047 Amendment 8).
  */
 #define XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY 1
 

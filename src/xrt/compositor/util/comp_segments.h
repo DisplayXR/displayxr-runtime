@@ -95,7 +95,7 @@ struct comp_segments_screen
 
 /*!
  * What the session's own display processor was made for (display hotplug,
- * ADR-047 Amendment 7): one monitor, by one plug-in. Recorded from the first
+ * ADR-047 Amendment 8): one monitor, by one plug-in. Recorded from the first
  * screen table a session sees (the system-default screen and the plug-in that
  * won it then).
  *
@@ -153,7 +153,7 @@ enum comp_segments_session_miss
  * window-bound weaver is kept); one that came back as another panel, at
  * another place or under a renumbered OS handle is not — its screen is woven
  * by a freshly created segment DP instead, the policy for a weaver whose
- * binding may be stale (ADR-047 Amendment 7).
+ * binding may be stale (ADR-047 Amendment 8).
  *
  * @param[out] out_miss  (may be NULL) why it does not own one.
  * @return the index into @p cands, or -1.
@@ -512,7 +512,7 @@ comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t
 
 /*!
  * Carry a live DP over into a fresh lifecycle (display hotplug, ADR-047
- * Amendment 7): a new screen table that still lists @p screen_id, bound the
+ * Amendment 8): a new screen table that still lists @p screen_id, bound the
  * same way, keeps that screen's DP instead of rebuilding it. The slot is live
  * with a full present streak, so no CREATE is issued for it; it is destroyed by
  * the usual absent-streak rule once its segment is gone.

@@ -2790,7 +2790,7 @@ struct xrt_dp_registry_entry
 	//! one: the primary DP weaves with this entry (set by the instance).
 	bool primary_override;
 	//! The OS's handle for the output this boot (macOS: CGDirectDisplayID; a
-	//! replug renumbers it); 0 = none. Display hotplug (ADR-047 Amendment 7):
+	//! replug renumbers it); 0 = none. Display hotplug (ADR-047 Amendment 8):
 	//! part of what a session's own DP must find unchanged to keep its screen.
 	uint64_t platform_id;
 	//! The winning claim is XRT_DISPLAY_CLAIM_PRESENT_NOT_READY: the plug-in

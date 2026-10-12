@@ -328,7 +328,7 @@ buffer, in order). What differs on macOS:
 - Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
   points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
 
-## Display hotplug (ADR-047 Amendment 7)
+## Display hotplug (ADR-047 Amendment 8)
 
 The screen table a compositor segments against is no longer fixed at session create. A worker
 thread (`targets/common/target_display_hotplug`) re-runs the per-monitor claim sweep when the OS

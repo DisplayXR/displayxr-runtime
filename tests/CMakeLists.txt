@@ -112,7 +112,7 @@ if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
 	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
 	list(APPEND tests tests_target_screens)
-	# ADR-047 Amendment 7 -- display hotplug: the claim sweep's scheduler, the
+	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
 	# per-monitor winner across a hotplug, the published-list comparison.
 	list(APPEND tests tests_target_display_hotplug)
 endif()

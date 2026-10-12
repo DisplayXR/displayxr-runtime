@@ -126,7 +126,7 @@ os_display_macos_list_displays(uint32_t *out_ids, uint32_t max_ids)
 
 /*
  *
- * Display-hotplug test hook (ADR-047 Amendment 7).
+ * Display-hotplug test hook (ADR-047 Amendment 8).
  *
  * `DXR_TEST_FAKE_MONITOR_FILE=<path>`: while <path> exists and holds a
  * positive integer S, the MAIN display is enumerated as two monitors — itself

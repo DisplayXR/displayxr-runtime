@@ -95,7 +95,7 @@ enum target_screen_pick_reason
 	//! Confidence, because the active plug-in's claim is only a FALLBACK one
 	//! and a plug-in ranked before it (lower ProbeOrder) claims the monitor
 	//! above FALLBACK — the display-hotplug carve-out of rule 3 (ADR-047
-	//! Amendment 7).
+	//! Amendment 8).
 	TARGET_SCREEN_PICK_BETTER_RANKED = 6,
 };
 
@@ -112,7 +112,7 @@ enum target_screen_pick_reason
  * @p preferred may be NULL.
  *
  * Rule 3 (the active plug-in) has one carve-out, for display hotplug (ADR-047
- * Amendment 7): when the active plug-in's claim on the monitor is a FALLBACK
+ * Amendment 8): when the active plug-in's claim on the monitor is a FALLBACK
  * one (@ref TARGET_SCREEN_CONFIDENCE_FALLBACK) and a candidate listed BEFORE
  * it — a lower ProbeOrder, since candidates are in source order — claims the
  * monitor above FALLBACK, the active plug-in yields and confidence decides

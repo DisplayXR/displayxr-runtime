@@ -295,7 +295,7 @@ struct xrt_instance
 	xrt_result_t (*enumerate_displays)(struct xrt_instance *xinst, struct xrt_screen_list *out_list);
 
 	/*!
-	 * Optional (display hotplug, ADR-047 Amendment 7): the display-topology
+	 * Optional (display hotplug, ADR-047 Amendment 8): the display-topology
 	 * generation — 0 until the system exists, then bumped every time the
 	 * published screen list changes after a display was plugged in, removed,
 	 * re-claimed by another plug-in or moved. Cheap enough to read every frame
@@ -305,7 +305,7 @@ struct xrt_instance
 	uint64_t (*get_display_generation)(struct xrt_instance *xinst);
 
 	/*!
-	 * Optional (display hotplug, ADR-047 Amendment 7): one consistent snapshot
+	 * Optional (display hotplug, ADR-047 Amendment 8): one consistent snapshot
 	 * of the screen list (as @ref enumerate_displays builds it), the system
 	 * compositor info it was built from (its per-monitor DP registry
 	 * included), and the generation they belong to — taken under the lock the

@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  OS display-reconfiguration notification (display hotplug, ADR-047
- *         Amendment 7).
+ *         Amendment 8).
  * @ingroup aux_os
  *
  * A monitor plugged in or unplugged, a mode or arrangement change: the
