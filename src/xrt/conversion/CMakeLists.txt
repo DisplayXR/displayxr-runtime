@@ -9,6 +9,8 @@ add_library(
 	conv_core STATIC
 	conv_readiness.c
 	conv_readiness.h
+	conv_registry.c
+	conv_registry.h
 	conv_select.c
 	conv_select.h
 	)
