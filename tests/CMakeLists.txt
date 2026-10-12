@@ -141,6 +141,11 @@ list(APPEND tests tests_u_mcp_capability)
 if(TARGET target_workspace_config AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	list(APPEND tests tests_service_orchestrator_linux tests_service_hotkey_linux)
 endif()
+# ADR-051 D6: the service's DRM hotplug feeder -- the kernel-uevent parser and
+# the polling fallback's status hash, against recorded uevent payloads.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	list(APPEND tests tests_service_drm_hotplug_linux)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
@@ -801,6 +806,17 @@ if(TARGET tests_service_orchestrator_linux)
 	target_link_libraries(
 		tests_service_hotkey_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
 		)
+endif()
+
+if(TARGET tests_service_drm_hotplug_linux)
+	target_sources(
+		tests_service_drm_hotplug_linux
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_drm_hotplug_linux.c
+		)
+	target_include_directories(
+		tests_service_drm_hotplug_linux PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service
+		)
+	target_link_libraries(tests_service_drm_hotplug_linux PRIVATE xrt-interfaces aux_util xrt-pthreads)
 endif()
 
 # The hotkey worker's GNOME-extension backend against a fake WorkspaceHotkey1

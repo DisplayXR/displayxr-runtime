@@ -3113,6 +3113,17 @@ struct xrt_system_compositor_info
 	 */
 	void (*refresh_display_processors)(struct xrt_system_compositor_info *info);
 
+	/*!
+	 * Optional: the world-event variant of @ref refresh_display_processors
+	 * (ADR-045 R-c, ADR-051 D6). Called by the service's display re-probe
+	 * worker when a display was plugged, unplugged or reconfigured. Same work,
+	 * except it always re-resolves the per-monitor registry and the panel
+	 * desktop rect (the client-event refresh skips both while the active
+	 * plug-in declines its display info) and publishes the screen table. NULL
+	 * = use @ref refresh_display_processors.
+	 */
+	void (*refresh_display_processors_world)(struct xrt_system_compositor_info *info);
+
 	/*! @} */
 
 	/*!

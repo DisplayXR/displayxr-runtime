@@ -32,17 +32,17 @@ the runtime's facts instead of the vendor's.
 
 | Fact | Where it is | Live? | Reachable from outside the service? |
 |---|---|---|---|
-| Screen registry: id, flags, confidence, desktop rect, native mode, scale, mm, plug-in, device name, metres, viewer, eye-tracking caps | `xrt_screen_list` (`target_screens_build`), served by `system_enumerate_displays` | re-probe on hotplug, no counter | yes (DIAG) |
+| Screen registry: id, flags, confidence, desktop rect, native mode, scale, mm, plug-in, device name, metres, viewer, eye-tracking caps | `xrt_screen_list` (`target_screens_build`), served by `system_enumerate_displays` | re-probe on hotplug (Windows: tray `WM_DISPLAYCHANGE`; desktop Linux: the service's DRM uevent feeder), `topology` counter | yes (DIAG) |
 | EDID identity, mm, connector, join diagnostics | `os_display_edid_enumerate` | on demand | in-process only |
 | Claims: plug-in, confidence, APIs, serial | `target_plugin_resolve_displays` | static per probe | `displays --claims` (loads plug-ins) |
 | Plug-in load result, platform state + hint, fallback, ProbeOrder | `target_plugin_get_status` | live in the service | **no** (tray tooltip only) |
 | Rendering mode, `is_tracking` of the one service DP | `system_get_display_status` | live | yes, one DP only |
 | Clients: id, pid, class, name, active / visible / focused, io, primary, z-order | `system_get_clients`, `get_client_info` | live | yes |
-| A client's window rect | `system_get_client_window_metrics` | live | yes |
-| A client's segment table + per-segment eyes, `generation` | `compositor_get_segment_metrics` | live | **own session only** |
-| Window-handle owner, hand-offs | `comp_segments_owner_*` | live | **log only** |
+| A client's window rect | `system_get_client_window_metrics` | live | yes (D3D11 service; desktop-Linux comp_multi service: the shared-surface placement or the weave window geometry) |
+| A client's segment table + per-segment eyes, `generation` | `compositor_get_segment_metrics` | live | own session; any DIAG caller via `system_get_client_segments` (desktop Linux: one segment = the whole window, no raw table) |
+| Window-handle owner, hand-offs | `comp_segments_owner_*` | live | snapshot `owner_screen` (desktop Linux: the screen holding the window centre) |
 | Panel lease holder, device REMOVED, DP backend state, swapchain / space counts | `[HEALTH]` every 10 s | live | **log only** |
-| Present / skip / split decision and reason | `[RENDER]` every 10 s | live | **log only** |
+| Present / skip / split decision and reason | `[RENDER]` every 10 s | live | snapshot `integrity` on Windows; desktop Linux has no counters (comp_multi keeps none) |
 | GPU topology, settings with provenance, ActiveRuntime | `cli_query` headless | next-launch truth | in-process |
 | Vendor per-screen facts: verified, calibrated, tracker alive, lens state, camera paired | vendor process tables / files | live | **vendor dashboard only** |
 
@@ -126,10 +126,10 @@ Field sources, by block:
 |---|---|---|
 | `runtime`, `plugins` | `target_plugin_get_status` in the service; `runtime.active_openxr_runtime` = the loader's `ActiveRuntime` (HKLM) on Windows, and off Windows the loader's POSIX chain (`XR_RUNTIME_JSON`, else `active_runtime[.<arch>].json` under `$XDG_CONFIG_HOME` (`~/.config`), each `$XDG_CONFIG_DIRS` (`/etc/xdg`), `/etc`, `/usr/local/share`, `/usr/share` — `+ /openxr/1/`), symlinks resolved (`util/u_openxr_runtime.h`) | same calls in the CLI process |
 | `screens[*]` identity, desktop, native, claim, layout, eye-tracking caps | `xrt_screen_list` + `target_plugin_get_monitor_record`. `native`: on desktop Linux with a compositor that reports modes (Mutter DisplayConfig), its preferred mode, and `is_native` = its current mode equals its preferred mode (never the desktop rect, which is logical on a scaled desktop); else the registry's device mode (Windows: DisplayConfig's preferred mode) against the desktop rect. `physical_mm` and `layout.width_m/height_m`: the claiming plug-in's only under an EDID or VERIFIED claim; under a FALLBACK claim the EDID's (`source: edid`), the plug-in's only when there is no EDID size | same |
-| `screens[*].eye_tracking.state`, `mode`, `dps[]` | the DPs bound to that screen: the service's primary DP and every client's segment DPs (`comp_*_segments_get_eyes`) | `NO_DP` |
+| `screens[*].eye_tracking.state`, `mode`, `dps[]` | the DPs bound to that screen: the service's primary DP and every client's segment DPs (`comp_*_segments_get_eyes`); desktop Linux: the shared surface's DP (`multi_compositor_status_get_shared_dp`) plus each `XR_DXR_weave` present-owner's own DP (listed, eyes not read) | `NO_DP` |
 | `screens[*].vendor` | plug-in slot `get_screen_status` (§6) | same slot, from the CLI's instance |
 | `screens[*].warnings` | derived in `u_status_snapshot_build` (§4) | same |
-| `clients[*]` | `ipc_app_state`, `system_get_client_window_metrics`, the new `system_get_client_segments`, the `[HEALTH]` / `[RENDER]` structs | empty |
+| `clients[*]` | `ipc_app_state`, `system_get_client_window_metrics`, the new `system_get_client_segments`, the `[HEALTH]` / `[RENDER]` structs; desktop Linux: `multi_compositor_status_get_client` (comp_multi) | empty |
 | `generation` | service counters (§5) | 0 |
 
 ### 3.1 `displays --claims --json` is a contract
@@ -178,7 +178,12 @@ macOS reconfigure callback) and on a plug-in state change; `status` on any clien
 connect / disconnect / focus change, any segment table `generation` move, any owner
 hand-off, any lease change, any `is_tracking` edge, any plug-in `change_counter` move, and
 on a 2 s timer so a missed event costs at most 2 s. The snapshot is rebuilt lazily on the
-first RPC after a bump, not on every bump.
+first RPC after a bump, not on every bump. On desktop Linux the "DRM poll" is the service's
+own feeder (`service_drm_hotplug_linux.c`): kernel `SUBSYSTEM=drm ACTION=change` uevents on
+a raw `NETLINK_KOBJECT_UEVENT` socket (no libudev), or a 2 s poll of
+`/sys/class/drm/card*-*/status` where the socket is unavailable; either posts
+`ipc_server_request_display_reprobe("drm hotplug")`, whose world-event refresh always
+re-resolves the screen registry.
 
 The `[HEALTH]` and `[RENDER]` emitters read from the same structs the snapshot reads, so
 the log and the dashboard cannot drift (`emit_health_if_elapsed` becomes a formatter over

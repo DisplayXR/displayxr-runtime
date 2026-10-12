@@ -475,6 +475,15 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 // launch hotkey (service_hotkey_linux.c). Kept apart from the macOS blocks.
 #include "service_config.h"
 #include "service_orchestrator.h"
+// ADR-051 D6: DRM connector hotplug -> the display re-probe worker.
+#include "service_drm_hotplug_linux.h"
+
+static void
+drm_hotplug_to_reprobe(const char *reason)
+{
+	// Debounced by the worker; a no-op until ipc_server_main started it.
+	ipc_server_request_display_reprobe(reason);
+}
 #endif
 
 int
@@ -539,6 +548,11 @@ main(int argc, char *argv[])
 	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
 	ipc_server_set_workspace_launch_provider(service_orchestrator_request_launch);
 	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
+
+	// ADR-051 D6 / ADR-045 R-c: the Linux twin of the Windows tray's
+	// WM_DISPLAYCHANGE feed — a monitor plugged or unplugged re-probes the
+	// screen registry and bumps the status topology generation.
+	(void)service_drm_hotplug_start(drm_hotplug_to_reprobe);
 #endif
 
 	// #960: class verification (controller manifests are cross-platform; the
@@ -572,6 +586,9 @@ main(int argc, char *argv[])
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
+	// Stop the DRM hotplug feeder (it only posts to the re-probe worker,
+	// which ipc_server_main has already stopped).
+	service_drm_hotplug_stop();
 	// Release the hotkey, terminate the managed controller, join the watcher.
 	service_orchestrator_shutdown();
 #endif
