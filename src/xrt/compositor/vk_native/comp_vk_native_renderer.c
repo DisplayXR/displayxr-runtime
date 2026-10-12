@@ -59,6 +59,8 @@
 #include "shaders/zone_blit.vert.h"
 #include "shaders/zone_blit.frag.h"
 #include "shaders/zone_blit_array.frag.h"
+#include "shaders/zone_blit_soft.frag.h"
+#include "shaders/zone_blit_soft_array.frag.h"
 #include "shaders/equirect2.vert.h"
 #include "shaders/equirect2.frag.h"
 #include "shaders/equirect2_array.frag.h"
@@ -276,6 +278,18 @@ struct comp_vk_native_renderer
 		 * textured rectangle.
 		 */
 		VkPipeline eq2_pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		/*!
+		 * ADR-046 Amendment 2 B.7: the runtime-drawn cursor softened
+		 * against crosstalk (zone_blit_soft{,_array}.frag), same table
+		 * shape, layout and push-constant block. Only the PREMULT and
+		 * UNPREMULT columns are used, the straight-alpha flag being a
+		 * specialization constant of the UNPREMULT one. Built LAZILY on
+		 * the first cursor frame that needs softening (ADR-046 §0), so a
+		 * session that never asks pays nothing.
+		 */
+		VkPipeline pipelines_soft[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		//! The soft pipelines could not be built: crisp cursor from then on.
+		bool soft_failed;
 		VkDescriptorPool descriptor_pool;
 
 		/*!
@@ -380,6 +394,8 @@ struct comp_vk_native_renderer
 		bool default_ready;
 		bool warned_no_pass;
 		bool announced;
+		//! The softened pipelines failed once (ADR-046 B.7); logged.
+		bool warned_soft;
 	} cursor;
 };
 
@@ -760,6 +776,10 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 				vk->vkDestroyPipeline(vk->device, r->zone.eq2_pipelines[b][sm], NULL);
 				r->zone.eq2_pipelines[b][sm] = VK_NULL_HANDLE;
 			}
+			if (r->zone.pipelines_soft[b][sm] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, r->zone.pipelines_soft[b][sm], NULL);
+				r->zone.pipelines_soft[b][sm] = VK_NULL_HANDLE;
+			}
 		}
 	}
 	if (r->zone.descriptor_pool != VK_NULL_HANDLE) {
@@ -783,6 +803,7 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 		r->zone.render_pass = VK_NULL_HANDLE;
 	}
 	r->zone.ready = false;
+	r->zone.soft_failed = false; // the next build may retry them
 }
 
 static void
@@ -1109,12 +1130,18 @@ cmd_image_barrier(struct vk_bundle *vk,
  *
  */
 
+/*!
+ * One compose-pass pipeline. @p frag_spec (NULL for every layer pipeline) is
+ * the fragment stage's specialization - only the softened cursor uses one
+ * (ADR-046 B.7, its straight-alpha flag).
+ */
 static bool
 zone_create_pipeline(struct comp_vk_native_renderer *r,
                      VkRenderPass render_pass,
                      VkShaderModule vert,
                      VkShaderModule frag,
                      enum vk_compose_blend blend,
+                     const VkSpecializationInfo *frag_spec,
                      VkPipeline *out_pipeline)
 {
 	struct vk_bundle *vk = r->vk;
@@ -1131,6 +1158,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 	        .module = frag,
 	        .pName = "main",
+	        .pSpecializationInfo = frag_spec,
 	    },
 	};
 
@@ -1327,9 +1355,9 @@ raw_create(struct comp_vk_native_renderer *r, VkShaderModule vert, VkShaderModul
 	r->raw.failed = true; // cleared on full success
 	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->raw.render_pass);
 	if (res != VK_SUCCESS ||
-	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag, VK_COMPOSE_BLEND_OFF,
+	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag, VK_COMPOSE_BLEND_OFF, NULL,
 	                          &r->raw.pipelines[VK_COMPOSE_SAMPLER_2D]) ||
-	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag_array, VK_COMPOSE_BLEND_OFF,
+	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag_array, VK_COMPOSE_BLEND_OFF, NULL,
 	                          &r->raw.pipelines[VK_COMPOSE_SAMPLER_2D_ARRAY])) {
 		U_LOG_W(
 		    "#1935: could not build the sRGB raw-read draw (%d) — truthful-sRGB swapchains keep the "
@@ -1589,14 +1617,14 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	bool ok = true;
 	for (int b = 0; b < VK_COMPOSE_BLEND_COUNT && ok; b++) {
-		ok = zone_create_pipeline(r, r->zone.render_pass, vert, frag, (enum vk_compose_blend)b,
+		ok = zone_create_pipeline(r, r->zone.render_pass, vert, frag, (enum vk_compose_blend)b, NULL,
 		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
-		     zone_create_pipeline(r, r->zone.render_pass, vert, frag_array, (enum vk_compose_blend)b,
+		     zone_create_pipeline(r, r->zone.render_pass, vert, frag_array, (enum vk_compose_blend)b, NULL,
 		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]) &&
-		     zone_create_pipeline(r, r->zone.render_pass, eq2_vert, eq2_frag, (enum vk_compose_blend)b,
+		     zone_create_pipeline(r, r->zone.render_pass, eq2_vert, eq2_frag, (enum vk_compose_blend)b, NULL,
 		                          &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
 		     zone_create_pipeline(r, r->zone.render_pass, eq2_vert, eq2_frag_array, (enum vk_compose_blend)b,
-		                          &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+		                          NULL, &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
 	}
 	// #1935: the fast path's raw-read draw shares these shaders and layouts.
 	if (ok) {
@@ -2194,6 +2222,87 @@ cursor_prepare(struct comp_vk_native_renderer *r,
 }
 
 /*!
+ * ADR-046 Amendment 2 B.7: build the softened-cursor pipelines on the first
+ * cursor frame that needs them (zero cost otherwise, ADR-046 §0). The PREMULT
+ * column samples a premultiplied sprite (the default look), the UNPREMULT one
+ * a straight-alpha sprite (the app's) - the shader's `straight`
+ * specialization constant. Failure logs once and the caller draws the crisp
+ * cursor instead (never refuses it).
+ */
+static bool
+cursor_ensure_soft_pipelines(struct comp_vk_native_renderer *r)
+{
+	if (r->zone.pipelines_soft[VK_COMPOSE_BLEND_PREMULT][VK_COMPOSE_SAMPLER_2D] != VK_NULL_HANDLE) {
+		return true;
+	}
+	if (r->zone.soft_failed) {
+		return false;
+	}
+	struct vk_bundle *vk = r->vk;
+	VkShaderModule vert = VK_NULL_HANDLE;
+	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModule frag_array = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo sm_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_zone_blit_vert),
+	    .pCode = shaders_zone_blit_vert,
+	};
+	VkResult res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &vert);
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_soft_frag);
+		sm_ci.pCode = shaders_zone_blit_soft_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_soft_array_frag);
+		sm_ci.pCode = shaders_zone_blit_soft_array_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag_array);
+	}
+	bool ok = res == VK_SUCCESS;
+	const VkSpecializationMapEntry entry = {.constantID = 0, .offset = 0, .size = sizeof(VkBool32)};
+	const enum vk_compose_blend cols[2] = {VK_COMPOSE_BLEND_PREMULT, VK_COMPOSE_BLEND_UNPREMULT};
+	for (int k = 0; k < 2 && ok; k++) {
+		const VkBool32 straight = cols[k] == VK_COMPOSE_BLEND_UNPREMULT ? VK_TRUE : VK_FALSE;
+		const VkSpecializationInfo spec = {
+		    .mapEntryCount = 1,
+		    .pMapEntries = &entry,
+		    .dataSize = sizeof(straight),
+		    .pData = &straight,
+		};
+		ok = zone_create_pipeline(r, r->zone.render_pass, vert, frag, cols[k], &spec,
+		                          &r->zone.pipelines_soft[cols[k]][VK_COMPOSE_SAMPLER_2D]) &&
+		     zone_create_pipeline(r, r->zone.render_pass, vert, frag_array, cols[k], &spec,
+		                          &r->zone.pipelines_soft[cols[k]][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+	}
+	VkShaderModule made[] = {vert, frag, frag_array};
+	for (size_t k = 0; k < sizeof(made) / sizeof(made[0]); k++) {
+		if (made[k] != VK_NULL_HANDLE) {
+			vk->vkDestroyShaderModule(vk->device, made[k], NULL);
+		}
+	}
+	if (!ok) {
+		for (int b = 0; b < VK_COMPOSE_BLEND_COUNT; b++) {
+			for (int sm = 0; sm < VK_COMPOSE_SAMPLER_COUNT; sm++) {
+				if (r->zone.pipelines_soft[b][sm] != VK_NULL_HANDLE) {
+					vk->vkDestroyPipeline(vk->device, r->zone.pipelines_soft[b][sm], NULL);
+					r->zone.pipelines_soft[b][sm] = VK_NULL_HANDLE;
+				}
+			}
+		}
+		r->zone.soft_failed = true;
+		if (!r->cursor.warned_soft) {
+			r->cursor.warned_soft = true;
+			U_LOG_W(
+			    "cursor_draw: softened-cursor pipelines failed (%d) - drawing the crisp cursor (ADR-046 "
+			    "B.7, one-time warning)",
+			    res);
+		}
+		return false;
+	}
+	return true;
+}
+
+/*!
  * Inside the pass, after every layer: one quad per view tile.
  *
  * The compose vertex shader's QUAD path maps the unit square's
@@ -2239,7 +2348,16 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
 	const enum vk_compose_blend blend = cur->premultiplied ? VK_COMPOSE_BLEND_PREMULT : VK_COMPOSE_BLEND_UNPREMULT;
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipelines[blend][sampler_kind]);
+	// ADR-046 B.7: soften with lift against crosstalk. Blur and opacity are
+	// both exactly off on the glass, so an on-glass frame takes the crisp
+	// pipeline with the push constants it always had (bit-identical). The
+	// soft pipelines are built on the first frame that needs them; if they
+	// cannot be, the cursor is drawn crisp rather than not at all.
+	const bool soft =
+	    (cur->blur_px > 0.0f || cur->alpha < 1.0f) && !cur->report_only && cursor_ensure_soft_pipelines(r);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                      soft ? r->zone.pipelines_soft[blend][sampler_kind]
+	                           : r->zone.pipelines[blend][sampler_kind]);
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
 
 	// Mono content fills the whole content region (one tile box); otherwise
@@ -2293,19 +2411,34 @@ cursor_record_draws(struct comp_vk_native_renderer *r,
 		    .extent = {(uint32_t)(sx1i - sx0i), (uint32_t)(sy1i - sy0i)},
 		};
 
-		const float(*c)[2] = cur->corners[i];
+		// Padded by the blur radius (a no-op at radius 0: the corners come
+		// back unchanged and the uv span is exactly 0..1), hotspot unmoved.
+		// (The cast below: C before C23 will not add const to a pointer to
+		// an array implicitly.)
+		struct u_cursor_soften_quad sq;
+		u_cursor_draw_soften_quad(cur->corners[i], cur->tile_px_w, cur->tile_px_h, soft ? cur->blur_px : 0.0f,
+		                          &sq);
+		const float (*c)[2] = (const float (*)[2])sq.corners;
 		const float ex[2] = {c[2][0] - c[0][0], c[2][1] - c[0][1]}; // u: (0,0) -> (1,0)
 		const float ey[2] = {c[1][0] - c[0][0], c[1][1] - c[0][1]}; // v: (0,0) -> (0,1)
 		const float mid[2] = {c[0][0] + 0.5f * (ex[0] + ey[0]), c[0][1] + 0.5f * (ex[1] + ey[1])};
 		// Column-major: NDC = 2 * (mid + pos.x * ex - pos.y * ey) - 1.
+		// The 128-byte block has no room to grow, so the softened draw
+		// packs its parameters into it (zone_blit_soft.frag): the radius
+		// in the reserved params.zw, the opacity in color_scale (all four
+		// for a premultiplied sprite, alpha only for a straight one).
+		const float a = soft ? cur->alpha : 1.0f;
 		struct vk_compose_push push = {
 		    .mvp = {2.0f * ex[0], 2.0f * ex[1], 0.0f, 0.0f,   //
 		            -2.0f * ey[0], -2.0f * ey[1], 0.0f, 0.0f, //
 		            0.0f, 0.0f, 1.0f, 0.0f,                   //
 		            2.0f * mid[0] - 1.0f, 2.0f * mid[1] - 1.0f, 0.0f, 1.0f},
-		    .src_rect = {0.0f, 0.0f, 1.0f, 1.0f},
-		    .params = {0.0f, 1.0f, 0.0f, 0.0f}, // array slice 0, QUAD path
-		    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+		    // The quad's uv span: 0..1, or -r..1+r when padded.
+		    .src_rect = {sq.uv[0][0], sq.uv[0][1], sq.uv[3][0] - sq.uv[0][0], sq.uv[3][1] - sq.uv[0][1]},
+		    // array slice 0, QUAD path; zw = blur radius in sprite uv
+		    .params = {0.0f, 1.0f, sq.radius_uv[0], sq.radius_uv[1]},
+		    .color_scale = {cur->premultiplied ? a : 1.0f, cur->premultiplied ? a : 1.0f,
+		                    cur->premultiplied ? a : 1.0f, a},
 		    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
 		};
 		vk->vkCmdSetViewport(cmd, 0, 1, &vp);

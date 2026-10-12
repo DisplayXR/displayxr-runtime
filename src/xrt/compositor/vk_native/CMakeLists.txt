@@ -16,6 +16,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/zone_blit.vert
 		shaders/zone_blit.frag
 		shaders/zone_blit_array.frag
+		shaders/zone_blit_soft.frag
+		shaders/zone_blit_soft_array.frag
 		shaders/equirect2.vert
 		shaders/equirect2.frag
 		shaders/equirect2_array.frag

@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -854,11 +854,37 @@ are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settin
 - **D3D11 in-process:** a `DXR_SOFTEN` variant of the shared `comp_cursor_shaders.h` pixel
   shader, plain and layered. Its parameters go in their own b1 constant buffer, so the b0 layout
   and D3D12's 16 root constants are unchanged.
+- **vk_native:** `zone_blit_soft.frag` / `zone_blit_soft_array.frag`, the same kernel. What
+  differs from Metal and D3D11:
+  - **Push-constant packing.** The compose pass's push-constant block is already 128 bytes, the
+    guaranteed Vulkan maximum, so nothing is added to it. The blur radius in sprite uv rides the
+    reserved `params.zw`, and the opacity rides `color_scale` (all four components for a
+    premultiplied sprite, alpha only for a straight one; the shader ends in the usual
+    `* color_scale + color_bias`). The padded quad's uv span (−r..1+r) goes in `src_rect`.
+  - **Straight vs premultiplied is a specialization constant** (`constant_id = 0`), fixed per
+    blend column when the pipeline is built: the UNPREMULT column is the straight-alpha one.
+    `zone_create_pipeline()` gained an optional `VkSpecializationInfo` (NULL for every layer
+    pipeline).
+  - **Lazy pipelines.** `pipelines_soft[blend][sampler]` (premultiplied and straight, 2D and
+    2D_ARRAY: four pipelines) are built on the first cursor frame that needs softening and
+    destroyed with the compose pass's own. If they cannot be built the runtime logs once and
+    draws the crisp cursor; it never refuses the cursor for it.
+  - An on-glass frame (0 px, 1.0) binds the crisp pipeline with exactly the push constants it
+    had before (`u_cursor_draw_soften_quad` at radius 0 returns the corners unchanged and the uv
+    span 0..1), so it is bit-identical to the unsoftened draw.
+  - **Measured** (Linux, sim-display Anaglyph 2 × 1 tiles of 1440 × 900 on a 2880 × 1800
+    canvas, `cube_handle_vk_linux` with a scripted cursor at 0.5, 0.5 over the cube, d ≈ −0.06
+    to −0.074, ghost ≈ 30–37 canvas px): the default 19 px arrow gets the 0.06 × sprite cap,
+    1.14 px; a 2 cm arrow (186 px) gets 3.0–3.7 px at the defaults and the 8 px ceiling with
+    `BLUR_K=1`. Peak coverage of the white fill falls from 1.00 to 0.74 with the opacity (0.5
+    blended in linear light, then encoded), and the arrow's partially covered edge pixels grow
+    from ~575 (crisp) to ~845 (`blur`) and ~1440 (8 px), with the hotspot and the tile-to-tile
+    disparity (−14.4 tile px) unchanged.
 
 **Follow-ups** (they still draw the crisp cursor and compile unchanged):
 
 - D3D12 (needs 4 more root constants, or a second root parameter);
-- vk_native and GL;
+- GL;
 - the D3D11 service drawer `svc_draw_cursor_quads` (the shell, lifted rects and IPC apps).
 
 **App opt-out.** An `XrCursorDepthDrawInfoDXR` flag to turn the softening off for a sprite that

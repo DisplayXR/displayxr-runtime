@@ -9693,6 +9693,11 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return false;
 	}
+	// The panel px that 0..1 of the (now tile-normalised) views span: the
+	// window for a zone request, else the canvas (ADR-046 B.7 ghost offset).
+	// Both are the target here (the zone rect is scaled against it).
+	const float tile_px_w = (float)target_w;
+	const float tile_px_h = (float)canvas_px_h;
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 	if (c->eff_layout.route_count > 0) {
 		// Multi-screen M3: a tile is a per-segment mosaic, not one view.
@@ -9752,6 +9757,17 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 		out->premultiplied = true; // the look's pixels are premultiplied
 	}
 	const float height = size_m / canvas_h_m; // sprite height, in units
+
+	// ADR-046 B.7: soften with lift against crosstalk - blur and opacity
+	// both exactly off on the glass (ghost 0, d 0). The blur cap follows the
+	// DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	out->blur_px = soften.blur_px;
+	out->alpha = soften.alpha;
+	out->tile_px_w = tile_px_w;
+	out->tile_px_h = tile_px_h;
 
 	memcpy(out->clip, clip, sizeof(out->clip));
 	out->view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
