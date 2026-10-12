@@ -233,18 +233,19 @@ u_lift_autoconv_params_default(struct u_lift_autoconv_params *p)
 	p->center_sigma = 0.35f;
 	p->bottom_damp = 0.5f;
 	p->hist_smooth_bins = 1.5f;
-	// Fitted to professional stereo (5 3D trailers, 119 shots, FoundationStereo
-	// disparity as ground truth, 2026-10-12): stereographers put the screen
-	// plane at the centre-weighted ~76th percentile of nearness (about a quarter
-	// of the frame in front of it), consistently across titles. The best
-	// predictor of that plane from depth alone was the mean of the
-	// centre-weighted 75th percentile and the dominant clump with the far
-	// background excluded (mean error 0.21 in normalised depth per shot, vs
-	// 0.34 for the earlier foreground-biased mode, which latched onto large far
-	// backgrounds and pushed most of the frame out of the screen).
+	// Fitted to professional stereo with FoundationStereo disparity as ground
+	// truth (2026-10-12): 19 titles, 2121 shots (5 full-width 3D trailers and
+	// 14 half-width features). Stereographers put the screen plane at the
+	// centre-weighted ~78th percentile of nearness (about a fifth of the frame
+	// in front of it); per title 59-89. The best predictor of that plane from
+	// depth alone is the mean of the centre-weighted 80th percentile and the
+	// dominant clump with the far background excluded (mean error 0.26 in
+	// normalised depth per shot, vs 0.40 for the earlier foreground-biased
+	// mode, which latched onto large far backgrounds and pushed most of the
+	// frame out of the screen).
 	p->fg_bias = 0.0f;
 	p->far_exclude = 0.15f;
-	p->percentile = 75.0f;
+	p->percentile = 80.0f;
 	p->blend = 0.5f;
 	p->peak_floor = 0.05f;
 	p->min_confidence = 0.06f;

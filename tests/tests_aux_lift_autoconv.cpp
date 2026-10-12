@@ -417,7 +417,7 @@ TEST_CASE("lift autoconv: a large far background never takes the screen plane", 
 
 TEST_CASE("lift autoconv: the percentile puts about a quarter of the weight in front", "[lift_autoconv]")
 {
-	// Two layers, 70 % far / 30 % near (by centre-weighted area): p75 lands in
+	// Two layers, 70 % far / 30 % near (by centre-weighted area): p80 lands in
 	// the near layer, i.e. the near layer sits at (or just in front of) the plane.
 	Map m(512, 288, 0.0f);
 	m.rect(0.0f, 0.0f, 1.0f, 1.0f, 60.0f);
