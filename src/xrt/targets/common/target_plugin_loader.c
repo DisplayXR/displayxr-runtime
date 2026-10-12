@@ -640,6 +640,80 @@ static bool g_display_sources_active_only = false;
 
 /*
  *
+ * Plug-in kind routing (ADR-053) -- platform-neutral, pure.
+ *
+ */
+
+enum target_plugin_manifest_kind
+target_plugin_classify_manifest(const char *filename)
+{
+	static const char json_suffix[] = ".json";
+	static const char ip_suffix[] = "-input-provider.json";
+	static const char cp_suffix[] = "-conversion-provider.json";
+
+	if (filename == NULL) {
+		return TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	const size_t n = strlen(filename);
+	const size_t json_len = sizeof(json_suffix) - 1;
+	const size_t ip_len = sizeof(ip_suffix) - 1;
+	const size_t cp_len = sizeof(cp_suffix) - 1;
+
+	/* A bare suffix is not a manifest: there must be a name in front. */
+	if (n <= json_len || strcmp(filename + n - json_len, json_suffix) != 0) {
+		return TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	if (n >= ip_len && strcmp(filename + n - ip_len, ip_suffix) == 0) {
+		return n > ip_len ? TARGET_PLUGIN_MANIFEST_INPUT : TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	if (n >= cp_len && strcmp(filename + n - cp_len, cp_suffix) == 0) {
+		return n > cp_len ? TARGET_PLUGIN_MANIFEST_CONVERSION : TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	return TARGET_PLUGIN_MANIFEST_DISPLAY;
+}
+
+bool
+target_plugin_parse_android_filename(
+    const char *name, const char *prefix, uint32_t *out_order, char *out_id, size_t id_size)
+{
+	if (name == NULL || prefix == NULL || out_order == NULL || out_id == NULL || id_size == 0) {
+		return false;
+	}
+	const size_t prefix_len = strlen(prefix);
+	const size_t n = strlen(name);
+
+	/* Min plausible: "<prefix>NNN_X.so" = prefix + 3 + 1 + 1 + 3 chars. */
+	if (prefix_len == 0 || n < prefix_len + 8 || strncmp(name, prefix, prefix_len) != 0) {
+		return false;
+	}
+	if (strcmp(name + n - 3, ".so") != 0) {
+		return false;
+	}
+	for (size_t i = 0; i < 3; i++) {
+		if (!(name[prefix_len + i] >= '0' && name[prefix_len + i] <= '9')) {
+			return false;
+		}
+	}
+	if (name[prefix_len + 3] != '_') {
+		return false;
+	}
+
+	const size_t id_start = prefix_len + 4;
+	const size_t id_len = n - 3 - id_start;
+	if (id_len == 0 || id_len >= id_size) {
+		return false;
+	}
+
+	*out_order = (uint32_t)((name[prefix_len + 0] - '0') * 100 + (name[prefix_len + 1] - '0') * 10 +
+	                        (name[prefix_len + 2] - '0'));
+	memcpy(out_id, name + id_start, id_len);
+	out_id[id_len] = '\0';
+	return true;
+}
+
+
+/*
+ *
  * Platform-specific loader.
  *
  */
@@ -1854,38 +1928,10 @@ compare_by_filename(const void *a, const void *b)
 static bool
 parse_plugin_filename(const char *name, uint32_t *out_order, char *out_id, size_t id_size)
 {
-	const char *prefix = "libdxrp";
-	const size_t prefix_len = 7; /* strlen("libdxrp") */
-	size_t n = strlen(name);
-
-	/* Min plausible: "libdxrpNNN_X.so" = 7 + 3 + 1 + 1 + 3 = 15 chars. */
-	if (n < 15 || strncmp(name, prefix, prefix_len) != 0) {
-		return false;
-	}
-	if (strcmp(name + n - 3, ".so") != 0) {
-		return false;
-	}
-	if (!(name[prefix_len + 0] >= '0' && name[prefix_len + 0] <= '9' &&
-	      name[prefix_len + 1] >= '0' && name[prefix_len + 1] <= '9' &&
-	      name[prefix_len + 2] >= '0' && name[prefix_len + 2] <= '9')) {
-		return false;
-	}
-	if (name[prefix_len + 3] != '_') {
-		return false;
-	}
-
-	*out_order = (uint32_t)((name[prefix_len + 0] - '0') * 100 +
-	                        (name[prefix_len + 1] - '0') * 10 +
-	                        (name[prefix_len + 2] - '0'));
-
-	size_t id_start = prefix_len + 4;
-	size_t id_len = n - 3 - id_start;
-	if (id_len == 0 || id_len >= id_size) {
-		return false;
-	}
-	memcpy(out_id, name + id_start, id_len);
-	out_id[id_len] = '\0';
-	return true;
+	/* `libdxrc` (conversion providers, ADR-053) differs in the 7th byte, so
+	 * the DP loader can never claim a conversion provider's file. */
+	return target_plugin_parse_android_filename(name, TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY, out_order, out_id,
+	                                            id_size);
 }
 
 static int
@@ -2004,6 +2050,12 @@ preload_runtime_lib_dir(const char *lib_dir)
 		}
 		/* Skip plug-in candidates — they go through try_load_one. */
 		if (strncmp(name, "libdxrp", 7) == 0) {
+			continue;
+		}
+		/* Skip conversion providers (`libdxrc*`, ADR-053): they live only
+		 * in the runtime APK's `:conversion` process, and the app-side
+		 * runtime never maps one (conversion-provider-discovery.md §3.6). */
+		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION, 7) == 0) {
 			continue;
 		}
 		/* Skip the runtime DLL: already loaded, dlopen of it is
@@ -2501,21 +2553,14 @@ enumerate_dir(const char *root, struct plugin_entry *entries, int start, int max
 			break;
 		}
 		const char *name = de->d_name;
-		size_t n = strlen(name);
-		if (n < 6 || strcmp(name + n - 5, ".json") != 0) {
+		/* Input-provider (ADR-034) and conversion-provider (ADR-053)
+		 * manifests share the discovery roots but belong to the other
+		 * plug-in types — their own loaders own them. The suffix is the
+		 * router: skipping them here keeps the DP path from
+		 * load-attempting a DLL that exports xrtInputPluginNegotiate /
+		 * xrtConversionPluginNegotiate instead of xrtPluginNegotiate. */
+		if (target_plugin_classify_manifest(name) != TARGET_PLUGIN_MANIFEST_DISPLAY) {
 			continue;
-		}
-		/* Input-provider manifests share the discovery roots but belong
-		 * to the second plug-in type (ADR-034) — the input loader owns
-		 * them (target_input_plugin_loader.c). Skipping here keeps the
-		 * DP path from load-attempting a DLL that exports
-		 * xrtInputPluginNegotiate instead of xrtPluginNegotiate. */
-		{
-			static const char ip_suffix[] = "-input-provider.json";
-			const size_t ip_len = sizeof(ip_suffix) - 1;
-			if (n >= ip_len && strcmp(name + n - ip_len, ip_suffix) == 0) {
-				continue;
-			}
 		}
 
 		struct plugin_entry e;

@@ -559,6 +559,40 @@ target_plugin_release_claim_sources(void);
 uint32_t
 target_plugin_rescan_claim_sources(void);
 
+/*!
+ * Which plug-in type a POSIX discovery-root file belongs to (ADR-053:
+ * "the suffix is the router"). All three plug-in types share one
+ * directory, so every loader classifies with this one function:
+ * `NNN-<id>-input-provider.json` is INPUT, `NNN-<id>-conversion-provider.json`
+ * is CONVERSION, any other `*.json` is DISPLAY, anything else is NONE.
+ * Pure, compiled on every platform so it is unit-testable everywhere.
+ */
+enum target_plugin_manifest_kind
+{
+	TARGET_PLUGIN_MANIFEST_NONE = 0,
+	TARGET_PLUGIN_MANIFEST_DISPLAY,
+	TARGET_PLUGIN_MANIFEST_INPUT,
+	TARGET_PLUGIN_MANIFEST_CONVERSION,
+};
+
+enum target_plugin_manifest_kind
+target_plugin_classify_manifest(const char *filename);
+
+//! Android library prefix of a display-processor plug-in (`libdxrp<NNN>_<id>.so`).
+#define TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY "libdxrp"
+//! Android library prefix of a conversion provider (`libdxrc<NNN>_<id>.so`, ADR-053).
+#define TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION "libdxrc"
+
+/*!
+ * Parse an Android plug-in library name `<prefix><NNN>_<id>.so` into its
+ * three-digit ProbeOrder and `<id>`. Returns false (outputs untouched except
+ * possibly @p out_id on success only) on any malformed name, including a
+ * different prefix. Pure; compiled on every platform for unit tests.
+ */
+bool
+target_plugin_parse_android_filename(
+    const char *name, const char *prefix, uint32_t *out_order, char *out_id, size_t id_size);
+
 #ifdef __cplusplus
 }
 #endif
