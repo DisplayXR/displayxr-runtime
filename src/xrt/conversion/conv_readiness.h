@@ -99,6 +99,10 @@ enum conv_readiness_event_type
 	CONV_EV_REGISTRY_CHANGED, //!< the provider's row / manifest changed (retries FAILED + ABSENT)
 	CONV_EV_BUDGET_CHANGED,   //!< adapter memory budget changed (retries FAILED(RESOURCES))
 	CONV_EV_TIMER,            //!< time passed; fires the backoff / crash-loop retry when due
+	//! A READY / WARMING / EVICTED capability failed outside warm (a convert
+	//! or job reported DEVICE_LOST, the provider's get_state turned FAILED, or
+	//! the stall watchdog abandoned it). reason + retryable, as WARM_FAILED.
+	CONV_EV_RUNTIME_FAILED,
 };
 
 /*! @name Event flags (conv_readiness_event::flags) @{ */
