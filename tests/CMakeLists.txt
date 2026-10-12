@@ -257,6 +257,12 @@ if(XRT_FEATURE_OPENXR
 	)
 	list(APPEND tests tests_oxr_lift_startup)
 endif()
+# #2005 -- the v3 lift handlers routed to the conversion core (the adapter
+# the handlers call, server/ipc_server_conv.c), driven with the CPU fake
+# provider. Needs the ipc_server_conv target (built with the IPC subtree).
+if(TARGET ipc_server_conv)
+	list(APPEND tests tests_ipc_lift_core)
+endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
 	# oxr_views_change.c straight into the unit and injects now_ns, so the
@@ -1143,6 +1149,13 @@ if(TARGET tests_oxr_lift_startup)
 		target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-external-renderdoc)
 	endif()
 	add_dependencies(tests_oxr_lift_startup ipc_client ipc_shared)
+endif()
+
+if(TARGET tests_ipc_lift_core)
+	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_ipc_lift_core PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_ipc_lift_core PROPERTIES CXX_STANDARD 17)
 endif()
 
 # ADR-042: the sim_display FAKE lift's splat PLY is pinned host-side next to the
