@@ -1042,6 +1042,21 @@ Also closed in passing:
 - the sim fake's rejection of shorter caller structs, and its ignored viewpoints
   (`sim_display_lift_d3d11.cpp:232, 350`).
 
+**P1a status (2026-10-12, `feat/conv-p1a`):** every row is closed on the core route, each with a
+test that fails on the pre-core path: G1 `tests_oxr_lift_startup` ("every field round-trips", "auxDepthSupported
+reaches the app over IPC") + `tests_conv_wire` ("G1 shape"); G2 `tests_oxr_lift_startup` ("maxViews bounds
+NVIEW", "viewCount past maxViews is VALIDATION_FAILURE") + `tests_ipc_lift_core` ("bounded at submit");
+G3 `tests_ipc_lift_core` ("create while ACTIVATING is accepted and served once READY") +
+`tests_conv_dp_lift` (cold-boot golden replay); G5 `tests_ipc_lift_core` ("cold boot … READY without a
+restart") + `tests_conv_dp_lift` ("no module at first, READY after a registry change"); G7 the core has no
+eyes callback at all — viewpoints come from the published snapshot (`conv_core_eyes_publish`,
+`tests_conv_lanes` "viewpoints — tracked N eyes"), and the lift thread's core branch reads that snapshot
+(`d3d11_lift.cpp` "G7" comment); G8 `tests_conv_lanes` ("lane isolation: a 3 s job costs a VIEWS_MONO
+stream ≤ 10 %") — closed for core-served splats only; GAUSSIANS with no SPLATS_MONO provider still runs
+on the pre-core branch (P1b deletes it with the branch). The "also closed" list: lift-only factory +
+fallback from the same plug-in, the CLI's single module instance, the watchdog bracketing convert calls
+and the sim fake's struct/viewpoint handling are all in `feat/conv-p1a`.
+
 ---
 
 ## 11. Open questions and must-verify items
@@ -1070,13 +1085,22 @@ into separate DLLs where one worker cannot run both lanes.
 - [ ] the store's effective ACL on an installed box (inherited `%ProgramData%` default vs anything the browser installer set)
 - [ ] the vendor lift factory without probe (stays in-service, so only for the adapter's static describe)
 - [ ] whether any weaving-DP path maps the conversion runtime into the service (decides whether RmGetList ever lists the service after P3)
-- [ ] the `conv_hint_interest` plumbing
-- [ ] the current v3 startup sequence pinned by a test
-- [ ] IPC handle capacity per message and the snapshot reply size
+- [x] the `conv_hint_interest` plumbing — sent at `xrCreateSession`, prewarms the default tasks, never
+      warms by itself (`tests_conv_lanes` "conv_hint_interest prewarms", `tests_ipc_lift_core`
+      "the hint does not warm; a create does", `tests_ipc_proto` appended-call check)
+- [x] the current v3 startup sequence pinned by a test — `tests_oxr_lift_startup` ("ACTIVATING -> stream
+      -> submit -> NOT_READY -> READY -> first result", UNAVAILABLE service, dead pipe, lift-only link),
+      written before the core took the route and unchanged by it; `tests_lift_dp_golden` pins the
+      pre-core bytes on WARP and the core-routed `dp-lift` path reproduces them
+- [x] IPC handle capacity per message and the snapshot reply size — every wire message
+      `<= XRT_CONV_WIRE_MSG_MAX_BYTES == IPC_BUF_SIZE` (`tests_conv_wire` static asserts), submit handles
+      `<= XRT_MAX_IPC_HANDLES` (`tests_ipc_lift_core`), DIAG provider / task rows fit the reply with
+      headroom (`tests_conv_snapshot`)
 - [ ] the browser GPU process's integrity level / AppContainer status
 - [ ] measured behaviour of a queue wait on a fence whose signaller died
 - [ ] whether the open provider's inference runtime can write into an externally allocated resource
 - [ ] the model-store write protocol run by the host under the ACL
-- [ ] exit code 13 and type values 340–369 still free at merge
+- [x] exit code 13 and type values 340–369 still free at merge — `CLI_SELFTEST_BAD_CONVERSION = 13` is
+      the only 13 in `cli_query.h`; no `XR_DXR_*` header uses a type value in 340–369 (lift spec 4 is P3)
 - [ ] measured VRAM and warm-up of one vendor model and one open depth model
 - [ ] whether the Android APK ships armeabi-v7a
