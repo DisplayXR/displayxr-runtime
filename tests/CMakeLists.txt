@@ -31,6 +31,7 @@ set(tests
     tests_lift_mailbox
     tests_conversion_abi
     tests_conv_wire
+    tests_conv_readiness
     tests_lift_abi
     tests_conv_viewsyn_math
     tests_aux_lift_viewpoint
@@ -1085,6 +1086,12 @@ target_link_libraries(tests_conversion_abi PRIVATE xrt-interfaces)
 set_target_properties(tests_conversion_abi PROPERTIES CXX_STANDARD 17)
 target_sources(tests_conv_wire PRIVATE tests_conv_wire_c.c)
 target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
+
+# ADR-053 P1a (#2000): the conversion core's pure modules - selection,
+# readiness state machine + spec-3 mapping, registry + describe cache.
+foreach(_conv_test tests_conv_readiness)
+	target_link_libraries(${_conv_test} PRIVATE displayxr::conversion_core)
+endforeach()
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
 # can only append.
