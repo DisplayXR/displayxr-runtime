@@ -776,7 +776,12 @@ participating client composited at controller-supplied poses.
 | Members | A client admitted into an active overlay is a *workspace-overlay member*: an Activity pause does not stop its session (it is on screen through the controller's surface), and its instance counts as a workspace session so the controller can enumerate and place it. |
 | 2D/3D | The controller is the display-mode authority; its `xrRequestDisplayRenderingModeDXR` reaches the shared DP through `workspace_request_display_mode` and every composited client hears the hardware state (#967 D-5). |
 
-Known limits: only clients that join *after* activation are composited (a satellite client
+Known limits: **member apps behind the fullscreen controller get frozen by Android's
+cached-app freezer** (measured on an NP02J: the older member within seconds of losing the
+foreground, the previous app later) — a frozen member shows its last frame, stretched into its
+current rect if the controller re-places it; the runtime cannot raise a client's importance
+from the service side, so members must stay visible (split-screen / freeform) or hold a
+foreground service of their own. Also: only clients that join *after* activation are composited (a satellite client
 stays per-window); nothing feeds pointer input to the workspace input queues on Android yet;
 a content app that stops rendering when it loses its own window shows a frozen last frame;
 the vendor stack's "one core per process" behaviour (R2) is measured for creation only —

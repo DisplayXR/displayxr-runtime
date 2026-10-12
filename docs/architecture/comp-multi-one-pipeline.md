@@ -194,7 +194,15 @@ wish still governs, as before.
 session stopped by the client runtime (ON_PAUSE -> STOPPING) and many apps also stop their
 frame loop without a window. Overlay members are exempt from the former (as #558 overlay
 apps are); the latter is an app rule — keep rendering while the runtime reports the session
-VISIBLE / FOCUSED. R2: a per-session DP was created while the paused shared DP was alive in
+VISIBLE / FOCUSED. **The hard limit is the OS:** a member app behind the controller is not
+visible, so ActivityManager demotes it to a cached process and the **cached-app freezer**
+freezes it (every thread in `do_freezer_trap`, measured). The previous app keeps running for a
+while, older ones stop within seconds; a frozen member's last frame stays on the surface and,
+if the controller re-places it, is stretched into the new rect (it was rendered for the old
+window, so it looks squished or stretched). The runtime cannot fix this from its side: the
+client's binding makes the *service* inherit the *client's* importance, never the reverse.
+Options: members that stay visible (split-screen / freeform where supported), a foreground
+service in the member app (an app or AAR change), or an OEM freezer exemption. R2: a per-session DP was created while the paused shared DP was alive in
 the same process and both vendor cores initialised — creation only, not a long-run test;
 the shared DP itself is held back while any per-session DP is alive in its process.
 R3: macOS was not built (CI covers it). R4: no deadlock seen; the lock audit is in the

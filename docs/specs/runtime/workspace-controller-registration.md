@@ -427,7 +427,11 @@ runtime: `adb shell setprop debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER 1` (loud b
 hands it the main-process service instead of a satellite). Clients already on a satellite stay
 per-window. A joining client keeps its session running while its own Activity is paused behind
 the controller, and should keep rendering while the runtime reports it VISIBLE / FOCUSED even
-with no window of its own — otherwise it shows a frozen frame.
+with no window of its own — otherwise it shows a frozen frame. **And the OS will freeze it
+anyway** once it is a cached background process (the cached-app freezer): a member that must
+keep animating behind the controller needs to stay visible (split-screen / freeform where the
+device supports it) or run a foreground service of its own. The runtime cannot raise a
+client's importance from the service side.
 
 Reference: `test_apps/workspace/workspace_controller_android` (forced IPC, places every client
 side by side; `debug.dxr.test_controller.active|focus|mode` test knobs). Mechanism:
