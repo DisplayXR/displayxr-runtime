@@ -11,6 +11,7 @@
 #include "util/u_misc.h"
 
 #include "shared/ipc_protocol.h"
+#include "shared/ipc_lift_caps.h"
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
 #include "client/ipc_client_lift.h"
@@ -53,19 +54,8 @@ ipc_client_lift_get_properties(struct ipc_connection *ipc_c, struct xrt_dp_lift_
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
-	out_caps->modes = props.modes;
-	out_caps->max_streams = props.max_streams;
-	out_caps->max_views = props.max_views;
-	out_caps->depth_semantics = props.depth_semantics;
-	out_caps->state = props.state;
-	out_caps->typical_latency_ns = props.typical_latency_ns;
-	memcpy(out_caps->backend, props.backend, sizeof(out_caps->backend));
-	out_caps->backend[sizeof(out_caps->backend) - 1] = '\0';
-	out_caps->module_status = props.module_status;
-	memcpy(out_caps->module_version, props.module_version, sizeof(out_caps->module_version));
-	out_caps->module_version[sizeof(out_caps->module_version) - 1] = '\0';
-	memcpy(out_caps->module_detail, props.module_detail, sizeof(out_caps->module_detail));
-	out_caps->module_detail[sizeof(out_caps->module_detail) - 1] = '\0';
+	// One copy, shared with the service (#2005 G1: this used to drop the aux-depth caps).
+	ipc_lift_caps_from_properties(&props, out_caps);
 	return XRT_SUCCESS;
 }
 

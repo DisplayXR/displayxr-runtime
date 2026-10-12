@@ -36,8 +36,12 @@
 
 #include "tests_oxr_lift_startup_fake.h"
 
+#include "shared/ipc_lift_caps.h"
+
 #include "oxr_api_funcs.h"
 
+#include <cstddef>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -404,3 +408,82 @@ TEST_CASE("lift startup, in-process D3D12 session over the ADR-049 lift-only lin
 	                      });
 }
 #endif // XRT_OS_WINDOWS
+
+
+/*
+ *
+ * #2005 G1 -- the aux-depth caps over IPC.
+ *
+ */
+
+TEST_CASE("lift caps: every field round-trips through the wire copy (G1)")
+{
+	// Tripwire: a field appended to either struct must be added to
+	// ipc_lift_caps.h (and to this test) -- the hand copy is how G1 happened.
+	STATIC_REQUIRE(sizeof(struct xrt_dp_lift_caps) == 224);
+	STATIC_REQUIRE(sizeof(struct ipc_lift_properties) == 224);
+
+	struct xrt_dp_lift_caps in;
+	uint8_t *p = (uint8_t *)&in;
+	for (size_t i = 0; i < sizeof(in); i++) {
+		p[i] = (uint8_t)(i * 7 + 3) | 1u; // never 0 inside a string
+	}
+	in.struct_size = (uint32_t)sizeof(in);
+	in.backend[sizeof(in.backend) - 1] = '\0';
+	in.module_version[sizeof(in.module_version) - 1] = '\0';
+	in.module_detail[sizeof(in.module_detail) - 1] = '\0';
+
+	struct ipc_lift_properties wire;
+	std::memset(&wire, 0xAB, sizeof(wire));
+	ipc_lift_properties_from_caps(&in, &wire);
+	CHECK(wire.reserved == 0);
+	CHECK(wire.reserved2 == 0);
+
+	struct xrt_dp_lift_caps out;
+	std::memset(&out, 0xCD, sizeof(out));
+	ipc_lift_caps_from_properties(&wire, &out);
+
+	CHECK(out.struct_size == sizeof(out));
+	CHECK(out.modes == in.modes);
+	CHECK(out.max_streams == in.max_streams);
+	CHECK(out.max_views == in.max_views);
+	CHECK(out.depth_semantics == in.depth_semantics);
+	CHECK(out.state == in.state);
+	CHECK(out.typical_latency_ns == in.typical_latency_ns);
+	CHECK(std::string(out.backend) == std::string(in.backend));
+	CHECK(out.aux_outputs == in.aux_outputs);                 // G1
+	CHECK(out.aux_depth_semantics == in.aux_depth_semantics); // G1
+	CHECK(out.module_status == in.module_status);
+	CHECK(std::string(out.module_version) == std::string(in.module_version));
+	CHECK(std::string(out.module_detail) == std::string(in.module_detail));
+
+	// And byte for byte, up to the end of the last field (tail padding aside).
+	const size_t end = offsetof(struct xrt_dp_lift_caps, module_detail) + sizeof(in.module_detail);
+	CHECK(std::memcmp(&in, &out, end) == 0);
+}
+
+TEST_CASE("lift caps: auxDepthSupported reaches the app over IPC (G1)")
+{
+	lf_reset();
+	XrSession session = lf_session_create(LF_SESSION_IPC, true);
+	lf_set_properties(XRT_DP_LIFT_STATE_READY, XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW, 8,
+	                  XRT_DP_LIFT_AUX_DEPTH, XRT_DP_LIFT_DEPTH_METRIC);
+
+	XrLiftDepthPropertiesDXR dp = {};
+	dp.type = XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR;
+	XrLiftPropertiesDXR props = props_init(&dp);
+	REQUIRE(oxr_xrGetLiftPropertiesDXR(session, &props) == XR_SUCCESS);
+	CHECK(dp.auxDepthSupported == XR_TRUE);
+	CHECK(dp.auxDepthSemantics == XR_LIFT_DEPTH_SEMANTICS_METRIC_DXR);
+
+	// A module without aux depth still reads false.
+	lf_set_properties(XRT_DP_LIFT_STATE_READY, XRT_DP_LIFT_MODE_SBS, 8, 0, 0);
+	dp = {};
+	dp.type = XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR;
+	props = props_init(&dp);
+	REQUIRE(oxr_xrGetLiftPropertiesDXR(session, &props) == XR_SUCCESS);
+	CHECK(dp.auxDepthSupported == XR_FALSE);
+	take_trace();
+	lf_session_destroy();
+}
+

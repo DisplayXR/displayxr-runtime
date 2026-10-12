@@ -22,6 +22,7 @@
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
 #include "server/ipc_server_interface.h"
+#include "shared/ipc_lift_caps.h"
 #include "util/u_client_class.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
@@ -9062,21 +9063,7 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 	if (xsysc != NULL) {
 		struct xrt_dp_lift_caps caps;
 		comp_d3d11_service_lift_get_caps(xsysc, &caps);
-		out_props->modes = caps.modes;
-		out_props->max_streams = caps.max_streams;
-		out_props->max_views = caps.max_views;
-		out_props->depth_semantics = caps.depth_semantics;
-		out_props->state = caps.state;
-		out_props->typical_latency_ns = caps.typical_latency_ns;
-		memcpy(out_props->backend, caps.backend, sizeof(out_props->backend));
-		out_props->backend[sizeof(out_props->backend) - 1] = '\0';
-		out_props->aux_outputs = caps.aux_outputs;
-		out_props->aux_depth_semantics = caps.aux_depth_semantics;
-		out_props->module_status = caps.module_status;
-		memcpy(out_props->module_version, caps.module_version, sizeof(out_props->module_version));
-		out_props->module_version[sizeof(out_props->module_version) - 1] = '\0';
-		memcpy(out_props->module_detail, caps.module_detail, sizeof(out_props->module_detail));
-		out_props->module_detail[sizeof(out_props->module_detail) - 1] = '\0';
+		ipc_lift_properties_from_caps(&caps, out_props);
 	}
 #endif
 	// Anything else: modes 0, UNAVAILABLE — a successful answer, not an error.
