@@ -2359,6 +2359,13 @@ oxr_session_cursor_draw_supported(struct oxr_session *sess)
 	return false;
 }
 
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_HAVE_VULKAN)
+// From compositor/client/comp_vk_client.c (same forward decl as oxr_workspace.c,
+// which keeps the Vulkan headers out of this file).
+struct xrt_swapchain *
+comp_vk_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc);
+#endif
+
 bool
 oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cursor_draw_request *req)
 {
@@ -2367,7 +2374,23 @@ oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cu
 	}
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
-		comp_metal_compositor_set_cursor_draw_request(&sess->xcn->base, req);
+		/*
+		 * #1948: the request goes straight to the NATIVE compositor
+		 * (sess->xcn), bypassing sess->compositor - so a custom sprite
+		 * swapchain must be the native one. On the VK-via-Metal route the
+		 * app's swapchains are client_vk_swapchain wrappers (created
+		 * through the comp_vk_client in sess->compositor), and comp_metal
+		 * casts req->image straight to its own comp_metal_swapchain.
+		 * Unwrap it exactly as comp_vk_client unwraps every layer's
+		 * swapchains before forwarding them to comp_metal.
+		 */
+		struct u_cursor_draw_request native_req = *req;
+#ifdef XRT_HAVE_VULKAN
+		if (sess->is_vk_via_metal && native_req.image != NULL) {
+			native_req.image = comp_vk_client_get_inner_xrt_swapchain(native_req.image);
+		}
+#endif
+		comp_metal_compositor_set_cursor_draw_request(&sess->xcn->base, &native_req);
 		return true;
 	}
 #endif
