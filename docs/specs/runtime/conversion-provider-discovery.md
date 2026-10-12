@@ -229,7 +229,7 @@ Selection runs per task, at stream / job create (ADR-053 decision 2).
    - A direct capability before a composed pipeline.
    - Provider-id `strcmp` tie-break, with one WARN (the #1466 rule).
    - `cap_id` within a provider.
-   - FALLBACK providers sort last, unconditionally.
+   - FALLBACK providers sort last within the ProbeOrder step; an explicit per-task preference (step 1) still wins.
 4. **Readiness never reorders.** The first candidate is selected while it is `INSTALLED`, `DOWNLOADING`, `WARMING` or `EVICTED`, and consumers wait. Every other state — `ABSENT`, `INCOMPATIBLE`, `UNLICENSED`, `DISABLED` and **any** `FAILED`, retryable or not — falls through to the next candidate for new creates, logged as a WARN. The preferred capability is selected again at the next create once it recovers. A READY lower-ranked capability never pre-empts a warming preferred one; that would rebuild the session-long-fallback bug inside the runtime.
 5. **One rebinding rule.** A live stream never moves, except on a terminal failure of its provider or a host binary drain (§4.1). A move is signalled by the result's `discontinuity` flag plus the task-state event; there is no per-stream provider-changed event. A preference change applies to the next create.
 6. **`requiredOutputs`** is checked against the capability's describe-time declared outputs, which may be provisional. A create is refused (`FEATURE_UNSUPPORTED`) only when the capability is READY and still lacks the output; there is no silent re-selection.
@@ -544,7 +544,7 @@ Per [`debug-logging.md`](../../reference/debug-logging.md):
 | Event | Level |
 |---|---|
 | provider discovered / rejected (ABI, missing binary) | WARN, once per change |
-| readiness transition per (provider, task), with reason | WARN per transition, never per poll |
+| readiness transition per (provider, capability), with reason | WARN per transition, never per poll |
 | host spawn / exit (code) / backoff / crash-loop cutoff / idle exit | WARN |
 | selection at create (task → provider, why), fall-through | WARN, once per stream |
 | watchdog breach (names provider, slot, duration) | WARN, once per breach |
