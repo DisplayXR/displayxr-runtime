@@ -15862,6 +15862,345 @@ svc_draw_cursor_quads(struct d3d11_service_system *sys,
 }
 
 
+/*
+ *
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): the service draws an IPC
+ * client's runtime-drawn cursor.
+ *
+ */
+
+//! The default look, as one draw needs it (views AddRef'd: the look may be
+//! re-uploaded by another client's commit meanwhile).
+struct svc_cursor_look_ref
+{
+	wil::com_ptr<ID3D11ShaderResourceView> srv;      //!< non-decoding (stored bytes)
+	wil::com_ptr<ID3D11ShaderResourceView> srv_srgb; //!< decoding
+	uint32_t w, h;
+	float aspect, hot_u, hot_v, height_pt;
+};
+
+/*!
+ * Refresh the default look (comp_cursor_look: the mirrored OS cursor at
+ * @p backing_scale, else the classic arrow) and hand back its views. Uploads
+ * only when the look's generation moves. Any IPC thread; device calls only.
+ */
+static bool
+svc_cursor_look_get(struct d3d11_service_system *sys, float backing_scale, struct svc_cursor_look_ref *out)
+{
+	std::lock_guard<std::mutex> lk(sys->cursor_look_mutex);
+	if (!comp_cursor_look_update(&sys->cursor_look, backing_scale)) {
+		return false;
+	}
+	const struct comp_cursor_look *look = &sys->cursor_look;
+	if (look->rgba == nullptr || look->w == 0 || look->h == 0) {
+		return false;
+	}
+	if (!sys->cursor_look_tex || sys->cursor_look_generation != look->generation) {
+		sys->cursor_look_srv.reset();
+		sys->cursor_look_srv_srgb.reset();
+		sys->cursor_look_tex.reset();
+		// TYPELESS: a composing commit samples it decoded into its `_SRGB`
+		// target, a fast-path one as stored into the encoded atlas - the same
+		// two views the in-process D3D11 renderer makes. Immutable: a new shape
+		// is a new texture, so no immediate-context upload is needed.
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = look->w;
+		td.Height = look->h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_IMMUTABLE;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		D3D11_SUBRESOURCE_DATA init = {};
+		init.pSysMem = look->rgba;
+		init.SysMemPitch = look->w * 4;
+		if (FAILED(sys->device->CreateTexture2D(&td, &init, sys->cursor_look_tex.put()))) {
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		HRESULT hr = sys->device->CreateShaderResourceView(sys->cursor_look_tex.get(), &sd, sys->cursor_look_srv.put());
+		if (SUCCEEDED(hr)) {
+			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+			hr = sys->device->CreateShaderResourceView(sys->cursor_look_tex.get(), &sd,
+			                                           sys->cursor_look_srv_srgb.put());
+		}
+		if (FAILED(hr)) {
+			sys->cursor_look_srv.reset();
+			sys->cursor_look_srv_srgb.reset();
+			sys->cursor_look_tex.reset();
+			return false;
+		}
+		sys->cursor_look_generation = look->generation;
+	}
+	out->srv = sys->cursor_look_srv;
+	out->srv_srgb = sys->cursor_look_srv_srgb;
+	out->w = look->w;
+	out->h = look->h;
+	out->aspect = look->aspect;
+	out->hot_u = look->hot_u;
+	out->hot_v = look->hot_v;
+	out->height_pt = look->height_pt;
+	return true;
+}
+
+//! The wire request back as the shared request (no sprite swapchain, nobody
+//! listening on `report`: the service answers through the client's outcome).
+static void
+svc_cursor_request_from_wire(const struct ipc_cursor_draw_request *w, struct u_cursor_draw_request *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->requested = true;
+	out->view_count = w->view_count < XRT_MAX_VIEWS ? w->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->view_count; i++) {
+		out->view[i].origin[0] = w->view[i][0];
+		out->view[i].origin[1] = w->view[i][1];
+		out->view[i].axis_x[0] = w->view[i][2];
+		out->view[i].axis_x[1] = w->view[i][3];
+		out->view[i].axis_y[0] = w->view[i][4];
+		out->view[i].axis_y[1] = w->view[i][5];
+	}
+	out->hot_u = w->hot_u;
+	out->hot_v = w->hot_v;
+	out->size_m = w->size_m;
+	out->disparity = w->disparity;
+	out->report_only = w->report_only != 0;
+	out->zone_valid = w->zone_valid != 0;
+	out->zone_id = w->zone_id;
+	out->zone_rect.offset.w = w->zone_rect[0];
+	out->zone_rect.offset.h = w->zone_rect[1];
+	out->zone_rect.extent.w = w->zone_rect[2];
+	out->zone_rect.extent.h = w->zone_rect[3];
+}
+
+//! Record the latest decision about request @p seq of client @p c (#1952).
+static void
+svc_cursor_record_outcome(struct d3d11_service_compositor *c, uint64_t seq, bool drew, enum u_cursor_draw_refusal why)
+{
+	std::lock_guard<std::mutex> lk(c->cursor_draw.mutex);
+	if (seq < c->cursor_draw.outcome_seq) {
+		return; // never overwrite a newer answer with an older one
+	}
+	c->cursor_draw.outcome_seq = seq;
+	c->cursor_draw.outcome_drew = drew;
+	c->cursor_draw.outcome_reason = drew ? 0u : (uint32_t)why;
+}
+
+/*!
+ * Is @p c a PLACED workspace tile - composed into the workspace by the render
+ * thread, so its cursor is the lifted workspace cursor and nothing may be drawn
+ * into its window? Any other client (no workspace, or not placed: one running
+ * beside the workspace under the foreground override) is drawn directly. The
+ * same test comp_d3d11_service_get_client_window_metrics uses for its canvas.
+ */
+static bool
+svc_cursor_client_is_tile(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+	const int idx = multi_comp_find_slot(sys->multi_comp, c);
+	return idx >= 0 && sys->multi_comp->clients[idx].placed;
+}
+
+//! Where one view of a direct client's base projection layer was painted in
+//! its atlas (target px), for the cursor.
+struct svc_cursor_tile
+{
+	bool ok;
+	float rect[4]; //!< x, y, w, h
+};
+
+/*!
+ * A DIRECT client's cursor (ADR-046 Phase 4): drawn into the client's own
+ * atlas at its commit, after its layers and before the publish and the display
+ * processor - the in-process D3D11 compositor's semantics, through the same
+ * shared look, placement helpers, softening and shaders.
+ *
+ * @param rtv           this commit's write target: the private `_SRGB` compose
+ *                      target (@p target_decodes) or the encoded atlas itself.
+ * @param tiles         where the base projection layer's views were painted.
+ * @param out_why       the refusal when this returns false.
+ * @return true if drawn (or, report-only, if it would have been).
+ *
+ * Caller holds c->mutex (the commit); takes the immediate-context lock for the
+ * draw only.
+ */
+static bool
+svc_cursor_draw_direct_impl(struct d3d11_service_system *sys,
+                            struct d3d11_service_compositor *c,
+                            const struct ipc_cursor_draw_request *wire,
+                            const struct svc_cursor_tile *tiles,
+                            uint32_t tile_count,
+                            bool routed,
+                            ID3D11RenderTargetView *rtv,
+                            bool target_decodes,
+                            enum u_cursor_draw_refusal *out_why)
+{
+	struct u_cursor_draw_request req;
+	svc_cursor_request_from_wire(wire, &req);
+	if (!u_cursor_draw_should_draw(&req)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST;
+		return false;
+	}
+	if (routed) {
+		// Multi-screen M3: a routed frame's tiles are per-segment mosaics.
+		*out_why = U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN;
+		return false;
+	}
+	// DXR_CURSOR_DRAW_REFUSE(_PERIOD_MS): read from the SERVICE's environment.
+	if (comp_cursor_draw_debug_refuse(&req)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_FORCED;
+		return false;
+	}
+	if (req.zone_valid) {
+		// Display zones through the service (the zones composite's placement
+		// of a zone's tiles) are a follow-up; the client keeps its OS cursor.
+		if (!c->cursor_draw.warned_zone) {
+			c->cursor_draw.warned_zone = true;
+			U_LOG_W("[cursor_draw] client %p: a display-zones cursor is not drawn by the service yet - "
+			        "willDraw = false (one-time warning)",
+			        (void *)c);
+		}
+		*out_why = U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE;
+		return false;
+	}
+	if (rtv == nullptr) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS;
+		return false;
+	}
+
+	// Panel pixel pitch, and the canvas the request's unit was built for (the
+	// client's window, else the display). Every DisplayXR process is per-
+	// monitor DPI aware, so window and panel pixels are the same pixels.
+	const uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	const float disp_h_m = sys->base.info.display_height_m;
+	if (disp_px_h == 0 || !(disp_h_m > 0.0f)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+	const float m_per_px = disp_h_m / (float)disp_px_h;
+	const uint32_t canvas_w = c->canvas_w > 0 ? c->canvas_w : sys->base.info.display_pixel_width;
+	const uint32_t canvas_h = c->canvas_h > 0 ? c->canvas_h : disp_px_h;
+	if (canvas_w == 0 || canvas_h == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+	const float canvas_h_m = (float)canvas_h * m_per_px;
+
+	// The DPI of the client's window sizes the OS cursor (and the arrow).
+	HWND dpi_hwnd = c->app_hwnd != nullptr ? c->app_hwnd : c->render.hwnd;
+	UINT dpi = dpi_hwnd != nullptr ? GetDpiForWindow(dpi_hwnd) : 0;
+	if (dpi == 0) {
+		dpi = 96;
+	}
+	const float scale = (float)dpi / 96.0f;
+
+	struct svc_cursor_look_ref look = {};
+	if (!svc_cursor_look_get(sys, scale, &look)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK;
+		return false;
+	}
+	const float size_m = req.size_m > 0.0f ? req.size_m : look.height_pt * scale * m_per_px;
+	const float height = size_m / canvas_h_m; // sprite height, in units (canvas heights at t)
+	if (!(height > 0.0f) || !std::isfinite(height)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+
+	// B.7: soften the lifted cursor against crosstalk. 0..1 of the views spans
+	// the canvas; the blur cap follows the DRAWN sprite (its panel px).
+	const float sprite_px_h = height * (float)canvas_h;
+	const float sprite_px_w = sprite_px_h * look.aspect;
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req.disparity, u_cursor_draw_ghost_px(&req, (float)canvas_w, (float)canvas_h),
+	                               sprite_px_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = true; // comp_cursor_look
+	style.shared_shaders = true;
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && sprite_px_w > 0.0f && sprite_px_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / sprite_px_w;
+		style.radius_uv[1] = soften.blur_px / sprite_px_h;
+	}
+
+	struct svc_cursor_quad quads[XRT_MAX_VIEWS];
+	uint32_t nq = 0;
+	const uint32_t n = req.view_count < tile_count ? req.view_count : tile_count;
+	for (uint32_t i = 0; i < n; i++) {
+		if (!tiles[i].ok) {
+			continue;
+		}
+		float corners[4][2];
+		u_cursor_draw_corners(&req.view[i], height, look.aspect, look.hot_u, look.hot_v, corners);
+		float r[4];
+		if (!u_cursor_draw_quad_rect(corners, tiles[i].rect, r)) {
+			continue;
+		}
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = r[0];
+		q->y = r[1];
+		q->w = r[2];
+		q->h = r[3];
+		q->clip.left = (LONG)tiles[i].rect[0];
+		q->clip.top = (LONG)tiles[i].rect[1];
+		q->clip.right = (LONG)(tiles[i].rect[0] + tiles[i].rect[2]);
+		q->clip.bottom = (LONG)(tiles[i].rect[1] + tiles[i].rect[3]);
+	}
+	if (nq == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_TILES;
+		return false;
+	}
+	if (!svc_cursor_shaders_ensure(sys)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_PIPELINE;
+		return false;
+	}
+	if (req.report_only) {
+		return true; // every check passed; the app is showing its OS cursor
+	}
+
+	wil::com_ptr<ID3D11Resource> res;
+	rtv->GetResource(res.put());
+	wil::com_ptr<ID3D11Texture2D> tex = res.try_query<ID3D11Texture2D>();
+	D3D11_TEXTURE2D_DESC td = {};
+	if (tex) {
+		tex->GetDesc(&td);
+	}
+	if (td.Width == 0 || td.Height == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_TILES;
+		return false;
+	}
+	// Colour (ADR-044, as in-process): a composing commit decodes the sprite
+	// into its `_SRGB` target; a fast-path one writes it as stored into the
+	// encoded atlas.
+	ID3D11ShaderResourceView *srv = target_decodes ? look.srv_srgb.get() : look.srv.get();
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+	svc_draw_cursor_quads(sys, rtv, (float)td.Width, (float)td.Height, srv, look.w, look.h, quads, nq,
+	                      /*tint*/ nullptr, /*convert_srgb*/ false, &style);
+	return true;
+}
+
+//! svc_cursor_draw_direct_impl + the outcome the client reads with its next request.
+static void
+svc_cursor_draw_direct(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       const struct ipc_cursor_draw_request *wire,
+                       uint64_t seq,
+                       const struct svc_cursor_tile *tiles,
+                       uint32_t tile_count,
+                       bool routed,
+                       ID3D11RenderTargetView *rtv,
+                       bool target_decodes)
+{
+	enum u_cursor_draw_refusal why = U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	const bool drew =
+	    svc_cursor_draw_direct_impl(sys, c, wire, tiles, tile_count, routed, rtv, target_decodes, &why);
+	svc_cursor_record_outcome(c, seq, drew, why);
+}
+
 /*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
@@ -21925,6 +22264,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). ZERO COST UNLESS
+	// REQUESTED: one bool test for a client that never asked. This commit
+	// consumes the request sent right before it (a request covers one frame);
+	// a commit without one clears the last, so the shell stops lifting.
+	// Both flags are only ever WRITTEN on this client's IPC thread (this one).
+	bool cursor_frame = false;
+	uint64_t cursor_seq = 0;
+	struct ipc_cursor_draw_request cursor_req = {};
+	// Drawn here (a direct client), or lifted by the render thread (a placed
+	// workspace tile, see svc_cursor_client_is_tile).
+	bool cursor_direct = false;
+	if (c->cursor_draw.pending_valid || c->cursor_draw.frame_valid) {
+		cursor_direct = c->cursor_draw.pending_valid && !svc_cursor_client_is_tile(sys, c);
+		struct svc_client_cursor_draw *cd = &c->cursor_draw;
+		std::lock_guard<std::mutex> clk(cd->mutex);
+		cd->frame_valid = cd->pending_valid;
+		if (cd->pending_valid) {
+			cd->pending_valid = false;
+			cd->frame = cd->pending;
+			cd->frame_seq = cd->pending_seq;
+			cursor_frame = true;
+			cursor_seq = cd->frame_seq;
+			cursor_req = cd->frame;
+			// A direct client is answered by THIS commit (its cursor step
+			// overwrites this); any way out before that step drew nothing.
+			// A workspace tile is answered by the render tick instead.
+			if (cursor_direct) {
+				cd->outcome_seq = cursor_seq;
+				cd->outcome_drew = false;
+				cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+			}
+		}
+	}
+	// Phase 4: where the base projection layer's views land in the atlas.
+	struct svc_cursor_tile cursor_tiles[XRT_MAX_VIEWS] = {};
+	uint32_t cursor_tile_count = 0;
+	bool cursor_tiles_done = false;
+	bool cursor_routed = false;
+
 	// Phase 5a — per-stage profile of compositor_layer_commit. Stack-local
 	// timestamps; emitted as one [COMMIT_PROFILE_SVC] line at the workspace
 	// branch return, env-gated by DISPLAYXR_LOG_PRESENT_NS=1 (same gate as
@@ -23773,10 +24151,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// builds; the app's image is never it.
 		else if (proj_view_count != packed_view_count)
 			zc_reason = "segment_routed";
+		// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): the cursor is drawn
+		// into the atlas, never into the app's image.
+		else if (cursor_frame)
+			zc_reason = "cursor";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
 		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode && !color_blocks_zc &&
-		    proj_view_count == packed_view_count) {
+		    proj_view_count == packed_view_count && !cursor_frame) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -24058,6 +24440,21 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// — degrade to the whole-atlas publish rather than under-copy.
 				compose_publish_full = true;
 			}
+			// ADR-046 Phase 4: the cursor of a direct client is drawn into
+			// the base layer's view tiles - exactly the rects painted here.
+			if (cursor_frame && !cursor_tiles_done && eye < XRT_MAX_VIEWS) {
+				// Multi-screen M3: a routed frame's tiles are per-segment
+				// mosaics; the per-view map is for whole tiles (as in-process).
+				cursor_routed = cursor_routed || proj_view_count != packed_view_count;
+				cursor_tiles[eye].ok = true;
+				cursor_tiles[eye].rect[0] = tile_x;
+				cursor_tiles[eye].rect[1] = tile_y;
+				cursor_tiles[eye].rect[2] = needs_scale ? dst_w : src_w;
+				cursor_tiles[eye].rect[3] = needs_scale ? dst_h : src_h;
+				if (eye + 1 > cursor_tile_count) {
+					cursor_tile_count = eye + 1;
+				}
+			}
 
 			// #1591: color-space handling is now IDENTICAL in both modes
 			// (`feedback_srgb_blit_paths`). The per-client atlas holds the
@@ -24176,6 +24573,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 		} // !zero_copy
+		// ADR-046 Phase 4: only the BASE projection layer's tiles carry the cursor.
+		if (cursor_tile_count > 0) {
+			cursor_tiles_done = true;
+		}
 
 		// Track actual content dimensions for DP crop and multi-comp slot read.
 		if (bridge_override) {
@@ -25142,6 +25543,27 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	profile_s3 = os_monotonic_get_ns(); // Phase 5a — end of UI-layers block.
+
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): a DIRECT client's
+	// runtime-drawn cursor, drawn last into what this commit painted - after
+	// every layer, before the publish below and so before the display
+	// processor. For a placed workspace tile the render thread lifts the
+	// workspace cursor instead (multi_compositor_render), so nothing is drawn
+	// into the window.
+	if (cursor_direct) {
+		const bool composing = c->render.active_write_rtv != nullptr;
+		ID3D11RenderTargetView *cursor_rtv = composing ? c->render.active_write_rtv : c->render.atlas_rtv.get();
+		if (composing) {
+			// The private compose target: published below under the atlas lock.
+			svc_cursor_draw_direct(sys, c, &cursor_req, cursor_seq, cursor_tiles, cursor_tile_count,
+			                       cursor_routed, cursor_rtv, /*target_decodes*/ true);
+		} else {
+			// Straight into the atlas the render thread crops (#1018).
+			std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
+			svc_cursor_draw_direct(sys, c, &cursor_req, cursor_seq, cursor_tiles, cursor_tile_count,
+			                       cursor_routed, cursor_rtv, /*target_decodes*/ false);
+		}
+	}
 
 	/*
 	 * #1610 — publish the composed result into the atlas.
