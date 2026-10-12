@@ -33,6 +33,121 @@ using wrap::android::view::Surface;
 using namespace std::chrono_literals;
 
 namespace {
+
+/*!
+ * #1006 (ADR-036 D4): the Java half of the Android workspace overlay mode,
+ * org.freedesktop.monado.ipc.WorkspaceControllerPolicy. Resolved ONCE on the
+ * service main thread (nativeStartServer): FindClass on an IPC pthread would
+ * use the system class loader and miss the runtime's own classes.
+ */
+struct WorkspacePolicyJni
+{
+	JavaVM *vm = nullptr;
+	jclass cls = nullptr;            //!< global ref
+	jmethodID is_verified = nullptr; //!< static boolean isVerifiedController(Context, int)
+	jmethodID on_overlay = nullptr;  //!< static void onOverlayChanged(boolean, int)
+	jobject context = nullptr;       //!< global ref to the service context
+} g_ws_policy;
+
+//! Attach the calling thread if needed; *attached says whether to detach after.
+JNIEnv *
+ws_policy_env(bool *attached)
+{
+	*attached = false;
+	if (g_ws_policy.vm == nullptr) {
+		return nullptr;
+	}
+	JNIEnv *env = nullptr;
+	if (g_ws_policy.vm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_OK) {
+		return env;
+	}
+	if (g_ws_policy.vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+		return nullptr;
+	}
+	*attached = true;
+	return env;
+}
+
+bool
+ws_policy_verify_controller(long peer_uid)
+{
+	if (g_ws_policy.cls == nullptr || g_ws_policy.is_verified == nullptr) {
+		return false;
+	}
+	bool attached = false;
+	JNIEnv *env = ws_policy_env(&attached);
+	if (env == nullptr) {
+		return false;
+	}
+	jboolean ok = env->CallStaticBooleanMethod(g_ws_policy.cls, g_ws_policy.is_verified, g_ws_policy.context,
+	                                           (jint)peer_uid);
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+		ok = JNI_FALSE;
+	}
+	if (attached) {
+		g_ws_policy.vm->DetachCurrentThread();
+	}
+	return ok == JNI_TRUE;
+}
+
+void
+ws_policy_overlay_changed(bool active, long controller_uid)
+{
+	if (g_ws_policy.cls == nullptr || g_ws_policy.on_overlay == nullptr) {
+		return;
+	}
+	bool attached = false;
+	JNIEnv *env = ws_policy_env(&attached);
+	if (env == nullptr) {
+		return;
+	}
+	env->CallStaticVoidMethod(g_ws_policy.cls, g_ws_policy.on_overlay, (jboolean)(active ? JNI_TRUE : JNI_FALSE),
+	                          (jint)controller_uid);
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+	}
+	if (attached) {
+		g_ws_policy.vm->DetachCurrentThread();
+	}
+}
+
+void
+ws_policy_init(JNIEnv *env, JavaVM *vm, jobject context)
+{
+	if (g_ws_policy.cls != nullptr) {
+		return;
+	}
+	jclass local = env->FindClass("org/freedesktop/monado/ipc/WorkspaceControllerPolicy");
+	if (local == nullptr || env->ExceptionCheck()) {
+		env->ExceptionClear();
+		U_LOG_E("service: WorkspaceControllerPolicy not found - Android workspace controllers cannot verify");
+		return;
+	}
+	g_ws_policy.vm = vm;
+	g_ws_policy.cls = (jclass)env->NewGlobalRef(local);
+	env->DeleteLocalRef(local);
+	g_ws_policy.is_verified =
+	    env->GetStaticMethodID(g_ws_policy.cls, "isVerifiedController", "(Landroid/content/Context;I)Z");
+	g_ws_policy.on_overlay = env->GetStaticMethodID(g_ws_policy.cls, "onOverlayChanged", "(ZI)V");
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		U_LOG_E("service: WorkspaceControllerPolicy methods not found");
+		g_ws_policy.is_verified = nullptr;
+		g_ws_policy.on_overlay = nullptr;
+		return;
+	}
+	g_ws_policy.context = env->NewGlobalRef(context);
+	ipc_server_set_android_controller_verify_provider(ws_policy_verify_controller);
+	ipc_server_set_android_overlay_hook(ws_policy_overlay_changed);
+	U_LOG_I("service: Android workspace-controller policy registered (#1006)");
+}
+
+} // namespace
+
+namespace {
 struct IpcServerHelper
 {
 public:
@@ -156,6 +271,10 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeStartServer(JNIEnv *env, jobjec
 	// Leia CNSDK) can be marshaled onto it from the comp_multi render worker — that
 	// init must be kicked off from a Looper-bearing thread or it hangs (#510 M2).
 	android_main_thread_dispatch_init();
+
+	// #1006: workspace-controller verification + overlay hook, resolved here on
+	// the main thread (the runtime's class loader is the current one).
+	ws_policy_init(env, jvm, context);
 
 	IpcServerHelper::instance().startServer();
 }

@@ -146,6 +146,32 @@ ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn
 	s_class_verify_provider = fn;
 }
 
+#ifdef XRT_OS_ANDROID
+static ipc_server_android_controller_verify_fn s_android_controller_verify = NULL;
+static ipc_server_android_overlay_fn s_android_overlay_hook = NULL;
+
+void
+ipc_server_set_android_controller_verify_provider(ipc_server_android_controller_verify_fn fn)
+{
+	s_android_controller_verify = fn;
+}
+
+void
+ipc_server_set_android_overlay_hook(ipc_server_android_overlay_fn fn)
+{
+	s_android_overlay_hook = fn;
+}
+
+void
+ipc_server_android_notify_overlay(bool active, long controller_uid)
+{
+	U_LOG_W("[#1006] workspace overlay %s (controller uid %ld)", active ? "ON" : "OFF", controller_uid);
+	if (s_android_overlay_hook != NULL) {
+		s_android_overlay_hook(active, controller_uid);
+	}
+}
+#endif
+
 const char *
 ipc_server_client_class_str(uint32_t client_class)
 {
@@ -208,6 +234,18 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 		if (orch != 0 && (unsigned long)pid == orch) {
 			return declared; // spawned by our orchestrator
 		}
+#ifdef XRT_OS_ANDROID
+		// #1006: an Android controller is a package, identified by the peer UID
+		// (manifest meta-data + the runtime's signing certificate).
+		{
+			long uid = ipc_server_derive_peer_uid(ics->imc.ipc_handle);
+			if (uid >= 0 && s_android_controller_verify != NULL && s_android_controller_verify(uid)) {
+				IPC_WARN(s, "[CLASS] pid %ld uid %ld: verified Android workspace controller (#1006).", pid,
+				         uid);
+				return declared;
+			}
+		}
+#endif
 		if (s_class_verify_provider != NULL && s_class_verify_provider(pid, peer_exe_path, declared)) {
 			return declared; // a registered controller binary
 		}
@@ -218,7 +256,12 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 			         pid, peer_exe_path);
 			return declared;
 		}
+#ifdef XRT_OS_ANDROID
+		why = "not a verified Android workspace controller (needs the com.displayxr.workspace_controller "
+		      "meta-data and the runtime's signing certificate)";
+#else
 		why = "not orchestrator-spawned and not a registered controller binary";
+#endif
 		break;
 	}
 	case XRT_CLIENT_CLASS_DIAG:
@@ -4733,6 +4776,11 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 			// activate: the shared surface must still learn a controller is up.
 			comp_multi_system_set_workspace_active(s->xsysc, true);
 #endif
+#ifdef XRT_OS_ANDROID
+			s->workspace_controller_pid = caller_pid;
+			s->workspace_controller_uid = ipc_server_derive_peer_uid(_ics->imc.ipc_handle);
+			ipc_server_android_notify_overlay(true, s->workspace_controller_uid);
+#endif
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			// Force-reset to 3D on EVERY activate, including this
 			// already-in-workspace-mode path. The service is normally
@@ -4764,8 +4812,14 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		// #61: keep the shared spatial surface rendering (empty backdrop + DXR
 		// splash + launcher band) while the controller is connected, even with no
 		// content app — wakes the render thread (the shared-surface analogue of
-		// eagerly creating the workspace window above).
+		// eagerly creating the workspace window above). On Android this is the
+		// workspace OVERLAY MODE (#1006): the render thread switches every
+		// main-service client into the controller's surface through one DP.
 		comp_multi_system_set_workspace_active(s->xsysc, true);
+#endif
+#ifdef XRT_OS_ANDROID
+		s->workspace_controller_uid = ipc_server_derive_peer_uid(_ics->imc.ipc_handle);
+		ipc_server_android_notify_overlay(true, s->workspace_controller_uid);
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4819,6 +4873,10 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 		ipc_server_input_queue_clear_frame_tick();
 #endif
 	}
+#ifdef XRT_OS_ANDROID
+	s->workspace_controller_uid = -1;
+	ipc_server_android_notify_overlay(false, -1);
+#endif
 
 	return XRT_SUCCESS;
 }

@@ -516,6 +516,11 @@ struct ipc_server
 	//! controller is active.
 	unsigned long workspace_controller_pid;
 
+	//! #1006 Android: UID of that controller (SO_PEERCRED at activate), -1
+	//! when none / unknown. The runtime's Java side keys its surface gate and
+	//! slot broker on it (the workspace overlay mode, ADR-036 D4).
+	long workspace_controller_uid;
+
 	struct ipc_thread threads[IPC_MAX_CLIENTS];
 
 	//! #959: runtime-admitted client cap, <= IPC_MAX_CLIENTS. Set at start from
@@ -735,6 +740,42 @@ typedef bool (*ipc_server_client_class_verify_fn)(long peer_pid, const char *pee
  */
 void
 ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn);
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * #1006 (ADR-036 D4): Android workspace-controller verification. Android has no
+ * orchestrator pid and no controller binary path; a controller is an APP
+ * identified by its UID. The provider (registered by the runtime service) must
+ * return true iff that UID's package declares
+ * `<meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>`
+ * AND is signed with the runtime's own certificate. The
+ * `DXR_ALLOW_UNVERIFIED_CONTROLLER` dev override (`debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER`
+ * on Android) still applies after it. Called from the client's IPC thread.
+ */
+typedef bool (*ipc_server_android_controller_verify_fn)(long peer_uid);
+
+void
+ipc_server_set_android_controller_verify_provider(ipc_server_android_controller_verify_fn fn);
+
+/*!
+ * #1006: told whenever the workspace overlay mode turns on (a verified
+ * controller activated it) or off (deactivate, or the controller went away),
+ * with the controller's UID (-1 when off). The runtime's Java side uses it to
+ * accept app surfaces only from the controller while the overlay is on and to
+ * route new IPC clients to the main-process service. Called from an IPC thread
+ * with no server lock held.
+ */
+typedef void (*ipc_server_android_overlay_fn)(bool active, long controller_uid);
+
+void
+ipc_server_set_android_overlay_hook(ipc_server_android_overlay_fn fn);
+
+/*!
+ * Internal: invoke the overlay hook (no-op without one).
+ */
+void
+ipc_server_android_notify_overlay(bool active, long controller_uid);
+#endif
 
 /*!
  * #960: short upper-case name of an enum xrt_client_class value ("APP",
