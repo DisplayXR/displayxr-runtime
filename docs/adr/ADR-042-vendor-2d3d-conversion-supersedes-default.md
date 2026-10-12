@@ -122,6 +122,24 @@ predicted tracked eyes, or the app's), so the lift DP needs no tracker. A module
 - **−** Windows/D3D11 only in v1. Other platforms advertise the extension and report
   `supportedModes = 0`, which the consumer contract already handles.
 
+## Amendment 1 — AUTO convergence is runtime policy (epic #1858)
+
+Measured on a panel: lifted video left to the module's own auto-convergence shows frequent
+sudden convergence jumps. That value was recomputed only every N frames and held in between,
+reset to a full step by the module's own scene-cut test, shared across streams, and applied one
+conversion late. Which depth sits on the screen plane is a viewing-comfort policy, the same kind
+of decision as the viewpoint policy of ADR-048, so it moves to the runtime: **runtime = policy,
+plug-in = units, module = pixels.**
+
+When the app leaves convergence AUTO, the service measures the centre-weighted foreground mode
+of each SBS / N-view stream's own conversion depth (the auxiliary depth of ADR-048 Addendum A,
+requested for this purpose), smooths it per stream (critically damped, dead band, median of
+three, a fast-but-not-instant ramp on a confirmed scene cut) and passes the result through the
+existing `xrt_dp_lift_params::convergence` as an ordinary caller-set value — no ABI change, no
+new field, and a plug-in that already honours a caller-set convergence needs nothing new beyond
+skipping its own auto pass. Details and parameters: `XR_DXR_lift.md` §4.4;
+`DXR_LIFT_AUTO_CONVERGENCE=module` restores the module's own auto for A/B.
+
 ## Alternatives rejected
 
 - **The module weaves its own output.** Two weavers per panel, calibration duplicated, and a
