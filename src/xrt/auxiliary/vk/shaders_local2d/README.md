@@ -16,3 +16,6 @@ Regenerate (glslangValidator from the Vulkan SDK):
 WIP: the aux_vk pipeline helper (vk_local2d_composite.{h,c}) that consumes these
 + the vk_native zone-mask API + layer_commit wiring are the remaining steps
 (see the D3D11 leg on main as the reference, PR #487).
+- `clamped_copy.frag` → `clamped_copy_frag_spv` — blend-OFF copy of a source
+  sub-rect into the viewport with the sample point clamped to the sub-rect's
+  outermost texel centres (the Android rect-scoped weave's un-squeeze).
