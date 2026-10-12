@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -853,7 +853,27 @@ are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settin
 - **Metal:** a `cursor_fragment_soft` function plus `pipe_soft[premul][srgb]`.
 - **D3D11 in-process:** a `DXR_SOFTEN` variant of the shared `comp_cursor_shaders.h` pixel
   shader, plain and layered. Its parameters go in their own b1 constant buffer, so the b0 layout
-  and D3D12's 16 root constants are unchanged.
+  is unchanged.
+- **D3D12 in-process:** the same shared `DXR_SOFTEN` shader, compiled with
+  `DXR_SOFTEN_ROOT_B0` as well: its four parameters sit at b0 `packoffset(c4)`, which is root
+  constants 16..19 of the quad root signature's existing 32-constant parameter. The cursor's 16
+  corner constants are unchanged, and the root signature (shared with every quad pass) gains no
+  parameter. `pso_soft[variant][target]` (six pipelines) are built on the first frame that
+  softens. If they cannot be built, the runtime logs once and draws the crisp quad: the
+  compositor keeps the crisp corners next to the padded ones (`soft_corners`), so the fallback is
+  the unsoftened draw, never a refusal.
+- **GL:** `FS_CURSOR_SOFT`, the same kernel in GLSL 330, as a second program built on the first
+  frame that softens (a build failure logs once and draws crisp). An on-glass frame keeps the crisp
+  program, with the unpadded quad and uv 0..1. The tile px for the ghost offset are the window's
+  client area (else the effective grid), or the window for a zone request; a GL app sprite is
+  flipped in v after padding, and the pad is symmetric, so the flip does not move the hotspot.
+  **Measured** (macOS, sim-display anaglyph 2 × 1 tiles of 1512 × 823, `cube_handle_gl_macos`
+  with the cube's rotation frozen for a static background, the arrow at UV 0.5, 0.5 over the
+  cube, ~20 tile px of tile-to-tile disparity): the white fill's peak falls from 255 to ~190
+  (`alpha` / `both`), the largest horizontal edge step from 249 to ~120 (`blur`) and ~65–80
+  (`both`), and the touched footprint grows from ~100–116 px to ~172–176 px. `off` and `alpha`
+  touch exactly the same pixels; on the glass (UV 0.2, 0.15, over the background) nothing is
+  drawn in any preset.
 - **vk_native:** `zone_blit_soft.frag` / `zone_blit_soft_array.frag`, the same kernel. What
   differs from Metal and D3D11:
   - **Push-constant packing.** The compose pass's push-constant block is already 128 bytes, the
@@ -881,10 +901,8 @@ are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settin
     from ~575 (crisp) to ~845 (`blur`) and ~1440 (8 px), with the hotspot and the tile-to-tile
     disparity (−14.4 tile px) unchanged.
 
-**Follow-ups** (they still draw the crisp cursor and compile unchanged):
+**Follow-up** (it still draws the crisp cursor and compiles unchanged):
 
-- D3D12 (needs 4 more root constants, or a second root parameter);
-- GL;
 - the D3D11 service drawer `svc_draw_cursor_quads` (the shell, lifted rects and IPC apps).
 
 **App opt-out.** An `XrCursorDepthDrawInfoDXR` flag to turn the softening off for a sprite that
