@@ -268,6 +268,9 @@ endif()
 # provider. Needs the ipc_server_conv target (built with the IPC subtree).
 if(TARGET ipc_server_conv)
 	list(APPEND tests tests_ipc_lift_core)
+	# #2003 -- the legacy DP-lift adapter + the legacy golden replay through the
+	# core and the v3 route, with a scripted lift-thread backend (no GPU).
+	list(APPEND tests tests_conv_dp_lift)
 endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
@@ -1178,6 +1181,12 @@ if(TARGET tests_oxr_lift_startup)
 	add_dependencies(tests_oxr_lift_startup ipc_client ipc_shared)
 endif()
 
+if(TARGET tests_conv_dp_lift)
+	target_sources(tests_conv_dp_lift PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_conv_dp_lift PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_conv_dp_lift PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_conv_dp_lift PROPERTIES CXX_STANDARD 17)
+endif()
 if(TARGET tests_ipc_lift_core)
 	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
 	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
