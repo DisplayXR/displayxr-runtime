@@ -9,6 +9,7 @@
 
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_compositor.h"
+#include "comp_vk_native_swapchain.h"
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -451,6 +452,10 @@ struct comp_vk_native_target
 
 	//! Swapchain image views.
 	VkImageView views[MAX_TARGET_IMAGES];
+
+	//! @ref images carry VK_IMAGE_USAGE_SAMPLED_BIT (see
+	//! comp_vk_native_target_images_sampled).
+	bool images_sampled;
 
 	//! Number of swapchain images.
 	uint32_t image_count;
@@ -917,6 +922,19 @@ create_swapchain(struct comp_vk_native_target *target)
 		}
 	}
 
+	// SAMPLED: the post-weave Local2D composite snapshots the woven target
+	// into its weave scratch with a draw rather than a per-frame
+	// vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW, default on). Only when the
+	// surface allows it; otherwise the snapshot keeps the copy.
+	VkImageUsageFlags image_usage =
+	    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	target->images_sampled = false;
+	if (comp_vk_native_zones_copy_to_draw_enabled() &&
+	    (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) != 0) {
+		image_usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		target->images_sampled = true;
+	}
+
 	VkSwapchainCreateInfoKHR ci = {
 	    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 	    .surface = target->surface,
@@ -925,8 +943,7 @@ create_swapchain(struct comp_vk_native_target *target)
 	    .imageColorSpace = color_space,
 	    .imageExtent = extent,
 	    .imageArrayLayers = 1,
-	    .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-	                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .imageUsage = image_usage,
 	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .preTransform = pre_transform,
 	    .compositeAlpha = composite_alpha,
@@ -1455,6 +1472,7 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		target->images[i] = target->dcomp_vk_image[i];
 		target->views[i] = target->dcomp_vk_view[i];
 	}
+	target->images_sampled = true; // dcomp_import_one creates them SAMPLED
 	target->format = VK_FORMAT_B8G8R8A8_UNORM;
 	target->width = w;
 	target->height = h;
@@ -3678,6 +3696,12 @@ VkFormat
 comp_vk_native_target_get_format(struct comp_vk_native_target *target)
 {
 	return target->format;
+}
+
+bool
+comp_vk_native_target_images_sampled(struct comp_vk_native_target *target)
+{
+	return target != NULL && target->images_sampled;
 }
 
 xrt_result_t

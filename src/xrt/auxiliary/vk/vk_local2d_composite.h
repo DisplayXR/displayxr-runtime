@@ -43,7 +43,7 @@ extern "C" {
 //! Per-frame descriptor sets: 1 composite (3 samplers) + N flatten (1 each).
 //! Bounded by XRT_MAX_LAYERS Local2D layers + a little headroom; the pool is
 //! reset each frame so this is a per-frame, not lifetime, ceiling.
-#define VK_LOCAL2D_MAX_SETS 64
+#define VK_LOCAL2D_MAX_SETS 65 // +1: the weave snapshot draw (DXR_VK_ZONES_COPY_TO_DRAW)
 
 /*!
  * Vulkan resources for the masked 2D-over-3D composite.
@@ -88,6 +88,16 @@ struct vk_local2d_composite
 	VkShaderModule clamped_copy_frag_mod;
 	VkPipelineLayout clamped_copy_layout;
 	VkPipeline clamped_copy_pipe;
+
+	/*!
+	 * OPTIONAL weave snapshot as a DRAW (see vk_local2d_composite_init_snapshot):
+	 * a blend-off, point-sampled 1:1 copy of the weave target into the
+	 * runtime's weave scratch, replacing a per-frame vkCmdCopyImage.
+	 * VK_NULL_HANDLE until a caller opts in.
+	 */
+	VkFormat snapshot_fmt;
+	VkRenderPass snapshot_rp; //!< snapshot_fmt, LOAD_OP_DONT_CARE.
+	VkPipeline snapshot_pipe; //!< flatten shader, blend OFF.
 
 	VkDescriptorPool desc_pool; //!< Reset each frame by begin_frame.
 
@@ -179,6 +189,46 @@ vk_local2d_composite_clamped_copy(struct vk_local2d_composite *lc,
                                   uint32_t clear_count,
                                   const struct vk_local2d_clamped_copy *copies,
                                   uint32_t copy_count);
+
+/*!
+ * Opt in to the weave snapshot DRAW: a render pass over @p fmt (the weave
+ * scratch's format; LOAD_OP_DONT_CARE — only the drawn rects are ever read)
+ * and a blend-OFF pipeline running the flatten shader. Use with
+ * vk_local2d_composite_snapshot_draw in place of a vkCmdCopyImage of the weave
+ * target. Callers that never call this are unchanged. Call after
+ * vk_local2d_composite_init.
+ * @return true when the snapshot draw is usable.
+ * @ingroup aux_vk
+ */
+bool
+vk_local2d_composite_init_snapshot(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat fmt);
+
+/*!
+ * Snapshot @p src_view (the weave target, @p src_w x @p src_h, in
+ * SHADER_READ_ONLY_OPTIMAL) into the scratch behind @p scratch_fb (built over
+ * `snapshot_rp`, region-sized, in COLOR_ATTACHMENT_OPTIMAL; left there) at 1:1
+ * in region space — scratch pixel (x,y) = source texel (x,y), point-sampled,
+ * blending off, so the bytes match a same-format vkCmdCopyImage. Only the
+ * pixels inside @p rects are written; @p rects == NULL means the whole
+ * region. One render pass, one draw per rect.
+ *
+ * The draw samples the source as its own format and writes the scratch as its
+ * own, so a target and scratch of different channel order (RGBA target, BGRA
+ * scratch) keep their channels — where a raw copy would swap R and B.
+ * @ingroup aux_vk
+ */
+void
+vk_local2d_composite_snapshot_draw(struct vk_local2d_composite *lc,
+                                   struct vk_bundle *vk,
+                                   VkCommandBuffer cmd,
+                                   VkFramebuffer scratch_fb,
+                                   uint32_t region_w,
+                                   uint32_t region_h,
+                                   VkImageView src_view,
+                                   uint32_t src_w,
+                                   uint32_t src_h,
+                                   const VkRect2D *rects,
+                                   uint32_t rect_count);
 
 /*!
  * Reset the per-frame descriptor pool. Call once before the frame's flatten /
