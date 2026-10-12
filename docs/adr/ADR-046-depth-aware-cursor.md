@@ -771,3 +771,72 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
 
 - §0 (opt-in, zero cost otherwise), §1 (division of labour) and §2 (geometry from the views).
 - Amendment 1's API. Its policy constants come from A once it calls the shared module.
+
+## Amendment 3 (2026-10-11): measured disparity, an opt-in fallback for stereo content with no depth
+
+**Accepted** (David, 2026-10-11). This is Phase 3b, made concrete.
+
+### Why
+
+Most cursor surfaces have an exact depth source:
+- native, Unity and Unreal apps, and three.js / PlayCanvas / Spark pages have a depth buffer
+  (a hint point or a submitted depth layer);
+- lifted 2D→3D content has the conversion's depth map (Amendment 1).
+
+**Traditional stereo content has none:** SBS / stereo video in the mediaplayer, stereo photos,
+stereo camera tiles and legacy stereo apps. Its only depth cue is the disparity between the views
+the app submits. Some apps already estimate it; Holocall computes a low-res map for
+auto-convergence and can feed it through the hint path (§1) with no runtime work. Apps that have
+nothing need the runtime to measure it.
+
+### Decision
+
+1. **Measure a patch, never a map.** The cursor needs one number: the nearest *confident*
+   disparity under its footprint. The runtime block-matches a small patch around the pointer
+   (≈ 64 × 32 px, the cursor footprint dilated) between the **two outermost views of the
+   submitted atlas**, over a bounded disparity range (crossed side; ≈ ±64 px), on the GPU in the
+   compositor's cursor pass, before the DP. The result is read back asynchronously a frame or two
+   later, the same pattern as Phase 3a and Amendment 1, and **never stalls**.
+
+   Budget: well under 0.1 ms of GPU per measured frame. A full-frame depth map is out of scope:
+   it costs orders of magnitude more and the cursor would discard almost all of it.
+2. **Work in on-screen pixels.** Stereo media has no scene geometry, so none is invented. The
+   measured on-screen disparity (px, panel scale) becomes the content disparity directly, and
+   §A.1 applies in pixels:
+
+   `target = measured < 0 ? max(measured − margin_px, cap_px) : 0`
+
+   `margin_px` is A.2's 0.015 eye baselines converted with the panel's pixel pitch, the same
+   conversion the web stereo-tile cursor uses. Nothing ever goes behind the glass.
+3. **Low confidence ⇒ the screen plane.** A match is used only if it passes all three checks:
+   - a distinct best match (best-to-second-best cost ratio);
+   - left-right consistency (L→R and R→L agree within 1 px);
+   - enough texture in the patch (variance above a floor).
+
+   The content disparity is the nearest **confident** match in the footprint. With no confident
+   match (blue sky, a flat wall, repetitive texture), the target is **0**: the cursor sits on the
+   screen plane, which under §A.3 means the plain OS cursor, with nothing drawn. The existing
+   fast-rise / slow-sink filter smooths the hand-off.
+4. **Opt-in, and only while useful (§0).** It is requested with the existing
+   `XrCursorDepthSourceDXR` and a new kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR`
+   (spec v7, no new struct). The runtime measures only on frames that chain the request, while the
+   pointer is over the 3D content, and at most once per new submitted frame (a paused video is not
+   re-measured). No request means nothing is measured, allocated or read back.
+5. **Same algorithm as the web.** The web stereo-tile cursor (`displayxr-web`
+   `js/camera/pair-cursor.js` and its matcher) already block-matches page-side. The runtime ports
+   its algorithm and constants, so web and native stereo cursors agree. Shared numbers live in
+   `u_cursor_depth`.
+6. **Where:** every native compositor's cursor pass and the service (IPC / shell clients), so it
+   also serves stereo content shown through the service.
+
+### Evidence required before merge
+
+- Cost on the mediaplayer for three cases: cursor off the video, over the video, and extension
+  disabled. Frame time and GPU time per frame, at 1080p and 4K SBS.
+- Correctness on a stereo photo with known disparities: textured foreground (confident, drawn in
+  front), sky (low confidence, OS cursor), and a repetitive pattern (rejected).
+
+### Not changed
+
+§0, §A (front-only, margin, threshold, hybrid anchor) and §B (the runtime draws, the app chooses
+the look). This adds a depth source; it doesn't change policy.
