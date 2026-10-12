@@ -5,7 +5,9 @@
  * @brief  The service's display status snapshot + generation counters
  *         (ADR-051 D3, display dashboard phase 2).
  *
- * The service owns ONE @ref xrt_status_snapshot and two counters:
+ * The service owns ONE @ref xrt_status_snapshot and three counters (the
+ * third, `conversion`, is ADR-053's: the conversion status source's generation
+ * plus local bumps; see `ipc_server_set_conv_status_source`):
  *
  *  - `topology` — screens and plug-ins. Bumped by the world-event re-probe
  *    (`WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` through the re-probe worker), and
@@ -98,6 +100,7 @@ struct ipc_server_status
 	struct os_mutex counter_lock;
 	uint64_t topology;
 	uint64_t status;
+	uint64_t conversion; //!< local bumps; the source's generation is added on read
 
 	// Last read's keys (under @ref lock).
 	bool have_keys;
@@ -126,6 +129,7 @@ struct ipc_server_status
 };
 
 static struct ipc_server_status_provider g_provider;
+static struct ipc_server_conv_status_source g_conv_source;
 
 
 /*
@@ -141,6 +145,16 @@ ipc_server_set_status_provider(const struct ipc_server_status_provider *provider
 		memset(&g_provider, 0, sizeof(g_provider));
 	} else {
 		g_provider = *provider;
+	}
+}
+
+void
+ipc_server_set_conv_status_source(const struct ipc_server_conv_status_source *source)
+{
+	if (source == NULL) {
+		memset(&g_conv_source, 0, sizeof(g_conv_source));
+	} else {
+		g_conv_source = *source;
 	}
 }
 
@@ -168,6 +182,7 @@ ipc_server_status_init(struct ipc_server *s)
 	// Start at 1: a consumer may treat 0/0 as "no service counters" (headless).
 	st->topology = 1;
 	st->status = 1;
+	st->conversion = 1;
 	s->status = st;
 	return;
 
@@ -216,6 +231,18 @@ ipc_server_status_bump(struct ipc_server *s, bool topology)
 	os_mutex_unlock(&st->counter_lock);
 }
 
+void
+ipc_server_status_bump_conversion(struct ipc_server *s)
+{
+	struct ipc_server_status *st = s != NULL ? s->status : NULL;
+	if (st == NULL) {
+		return;
+	}
+	os_mutex_lock(&st->counter_lock);
+	st->conversion++;
+	os_mutex_unlock(&st->counter_lock);
+}
+
 static struct xrt_status_generation
 counters(struct ipc_server_status *st)
 {
@@ -223,7 +250,11 @@ counters(struct ipc_server_status *st)
 	os_mutex_lock(&st->counter_lock);
 	g.topology = st->topology;
 	g.status = st->status;
+	g.conversion = st->conversion;
 	os_mutex_unlock(&st->counter_lock);
+	if (g_conv_source.generation != NULL) {
+		g.conversion += g_conv_source.generation(g_conv_source.userdata);
+	}
 	return g;
 }
 
@@ -801,6 +832,16 @@ tick(struct ipc_server *s, struct ipc_server_status *st)
 	}
 
 	gather_live(s, st, now_ns);
+	// ADR-053: the conversion rows (HOOK #2003 — no source registered = 0 rows).
+	if (g_conv_source.fill != NULL) {
+		g_conv_source.fill(g_conv_source.userdata, st->live);
+		if (st->live->conv_provider_count > XRT_STATUS_MAX_CONV_PROVIDERS) {
+			st->live->conv_provider_count = XRT_STATUS_MAX_CONV_PROVIDERS;
+		}
+		if (st->live->conv_task_count > XRT_STATUS_MAX_CONV_TASKS) {
+			st->live->conv_task_count = XRT_STATUS_MAX_CONV_TASKS;
+		}
+	}
 	const uint64_t lk = live_key(st->live);
 	if (s->xsysc != NULL) {
 		// An unlocked copy, as the segments-enable path takes it: claim
@@ -922,6 +963,56 @@ ipc_server_status_get_client(struct ipc_server *s,
 			xret = XRT_SUCCESS;
 			break;
 		}
+	}
+	os_mutex_unlock(&st->lock);
+	return xret;
+}
+
+xrt_result_t
+ipc_server_status_get_conv_provider(struct ipc_server *s,
+                                    uint32_t index,
+                                    struct xrt_status_conv_provider *out_row,
+                                    struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	struct ipc_server_status *st = s->status;
+	if (st == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	xrt_result_t xret = XRT_ERROR_IPC_FAILURE; // no such row
+	os_mutex_lock(&st->lock);
+	tick(s, st);
+	ensure_built(s, st);
+	*out_generation = st->snap->generation;
+	if (index < st->snap->conv_provider_count && index < XRT_STATUS_MAX_CONV_PROVIDERS) {
+		*out_row = st->snap->conv_providers[index];
+		xret = XRT_SUCCESS;
+	}
+	os_mutex_unlock(&st->lock);
+	return xret;
+}
+
+xrt_result_t
+ipc_server_status_get_conv_task(struct ipc_server *s,
+                                uint32_t index,
+                                struct xrt_status_conv_task *out_row,
+                                struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	struct ipc_server_status *st = s->status;
+	if (st == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	xrt_result_t xret = XRT_ERROR_IPC_FAILURE; // no such row
+	os_mutex_lock(&st->lock);
+	tick(s, st);
+	ensure_built(s, st);
+	*out_generation = st->snap->generation;
+	if (index < st->snap->conv_task_count && index < XRT_STATUS_MAX_CONV_TASKS) {
+		*out_row = st->snap->conv_tasks[index];
+		xret = XRT_SUCCESS;
 	}
 	os_mutex_unlock(&st->lock);
 	return xret;

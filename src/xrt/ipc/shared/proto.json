@@ -1429,5 +1429,25 @@
 			{"name": "info", "type": "struct ipc_workspace_overlay_info"},
 			{"name": "screen_id", "type": "uint64_t"}
 		]
+	},
+
+	"system_get_conv_provider_row": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "row", "type": "struct xrt_status_conv_provider"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"system_get_conv_task_row": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "row", "type": "struct xrt_status_conv_task"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
 	}
 }

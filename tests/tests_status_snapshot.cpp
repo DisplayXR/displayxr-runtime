@@ -707,9 +707,10 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(d.root->child->valuedouble == XRT_STATUS_SCHEMA);
 
 	CHECK(keys(d.root) ==
-	      V{"schema", "source", "generation", "runtime", "plugins", "screens", "clients", "workspace", "warnings"});
+	      V{"schema", "source", "generation", "runtime", "plugins", "screens", "clients", "workspace", "warnings",
+	        "conv_providers", "conv_tasks"}); // ADR-053 (#2006): keys only added, schema stays 1
 	CHECK(str(d.root, "source") == "service");
-	CHECK(keys(cJSON_GetObjectItem(d.root, "generation")) == V{"topology", "status"});
+	CHECK(keys(cJSON_GetObjectItem(d.root, "generation")) == V{"topology", "status", "conversion"});
 	CHECK(keys(cJSON_GetObjectItem(d.root, "runtime")) ==
 	      V{"version", "git_tag", "plugin_abi", "active_openxr_runtime"});
 

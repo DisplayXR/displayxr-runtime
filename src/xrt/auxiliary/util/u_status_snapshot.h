@@ -26,6 +26,10 @@
  * | `DP_DEGRADED`      | warn     | screen |
  * | `DP_STALE`         | critical | screen |
  * | `CLAIM_FORCED`     | info     | screen |
+ * | `CONV_CRASH_LOOP`  | critical | system |
+ * | `CONV_RESEARCH_MODEL_ENABLED` | warn | system |
+ * | `CONV_TASK_UNSERVED` | warn   | system |
+ * | `CONV_CPU_STAGING` | info     | system |
  *
  * @ingroup aux_util
  */
@@ -57,6 +61,14 @@ extern "C" {
 #define U_STATUS_W_DP_DEGRADED "DP_DEGRADED"
 #define U_STATUS_W_DP_STALE "DP_STALE"
 #define U_STATUS_W_CLAIM_FORCED "CLAIM_FORCED"
+//! ADR-053: a conversion capability is FAILED(crash_loop) — 5 abnormal host exits in 10 min.
+#define U_STATUS_W_CONV_CRASH_LOOP "CONV_CRASH_LOOP"
+//! ADR-053: a task is served by a RESEARCH_ONLY / UNKNOWN-licence model (AllowResearchOnly is on).
+#define U_STATUS_W_CONV_RESEARCH_MODEL_ENABLED "CONV_RESEARCH_MODEL_ENABLED"
+//! ADR-053: a task has candidates, but every one is in a terminal state (nothing selected).
+#define U_STATUS_W_CONV_TASK_UNSERVED "CONV_TASK_UNSERVED"
+//! ADR-053: a live stream fell back to CPU staging (no GPU-shared import).
+#define U_STATUS_W_CONV_CPU_STAGING "CONV_CPU_STAGING"
 /*! @} */
 
 //! A screen whose DP has not tracked for longer than this raises TRACKER_DOWN (§4).
@@ -146,7 +158,33 @@ u_status_snapshot_get_head(const struct xrt_status_snapshot *snap, struct xrt_st
 void
 u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_status_head *head);
 
-//! Both counters equal.
+/*!
+ * ADR-053: one conversion provider row as a JSON object (the `conv_providers[]`
+ * element; also what `displayxr-cli conv list --json` prints). Caller owns it.
+ */
+cJSON *
+u_status_conv_provider_to_cjson(const struct xrt_status_conv_provider *p);
+
+/*!
+ * ADR-053: one conversion task row as a JSON object (the `conv_tasks[]` element).
+ * @p providers / @p provider_count resolve the row's provider index to its id.
+ */
+cJSON *
+u_status_conv_task_to_cjson(const struct xrt_status_conv_task *t,
+                            const struct xrt_status_conv_provider *providers,
+                            uint32_t provider_count);
+
+/*!
+ * ADR-053: the `displayxr-cli conv list|status --json` document (also MCP
+ * `get_conversion_status`): `{schema, source, generation, providers[],
+ * tasks[], warnings[]}` where `warnings` keeps only the `CONV_*` codes of
+ * @p snap (derive them first). Same row objects as the snapshot's
+ * `conv_providers[]` / `conv_tasks[]`. Caller owns the tree.
+ */
+cJSON *
+u_status_conv_to_cjson(const struct xrt_status_snapshot *snap);
+
+//! All three counters equal (topology, status, conversion).
 bool
 u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b);
 
@@ -195,6 +233,12 @@ u_status_platform_state_str(uint32_t state);
 //! `enum xrt_client_class` value → "APP", … ("UNVERIFIED" when @p verified is false).
 const char *
 u_status_client_class_str(uint32_t client_class, bool verified);
+//! "in_service" / "satellite" / "android_service".
+const char *
+u_status_conv_hosting_str(enum xrt_status_conv_hosting h);
+//! XRT_CONV_LICENCE_* → "UNKNOWN" / "PERMISSIVE" / "COMMERCIAL" / "RESEARCH_ONLY".
+const char *
+u_status_conv_licence_str(uint32_t licence_class);
 /*! @} */
 
 #ifdef __cplusplus

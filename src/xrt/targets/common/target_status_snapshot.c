@@ -11,6 +11,7 @@
 #endif
 
 #include "target_status_snapshot.h"
+#include "target_conv_status.h"
 #include "target_plugin_loader.h"
 #include "target_screens.h"
 
@@ -611,6 +612,14 @@ target_status_snapshot_build_headless(struct xrt_instance *xi,
 
 	fill_screens(&list, &reg, out);
 
+	// ADR-053: conversion providers, described headless (no model load).
+	struct target_conv_status *conv = calloc(1, sizeof(*conv));
+	if (conv != NULL) {
+		target_conv_status_build_headless(target_plugin_get_active(), conv);
+		target_conv_status_to_snapshot(conv, out);
+		free(conv);
+	}
+
 	u_status_warnings_derive(out);
 }
 
@@ -751,6 +760,15 @@ target_status_snapshot_build_service(struct xrt_instance *xi,
 		out->client_count = nc;
 		merge_live_dps(live, out);
 		out->workspace = live->workspace;
+		// ADR-053: the conversion core's rows, as the service's conversion
+		// status source reported them (none registered yet = 0 rows; #2003).
+		out->conv_provider_count = live->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS
+		                               ? live->conv_provider_count
+		                               : XRT_STATUS_MAX_CONV_PROVIDERS;
+		memcpy(out->conv_providers, live->conv_providers, sizeof(out->conv_providers));
+		out->conv_task_count = live->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? live->conv_task_count
+		                                                                         : XRT_STATUS_MAX_CONV_TASKS;
+		memcpy(out->conv_tasks, live->conv_tasks, sizeof(out->conv_tasks));
 	}
 
 	u_status_warnings_derive(out);

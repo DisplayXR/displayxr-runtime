@@ -863,6 +863,31 @@ void
 ipc_server_set_status_provider(const struct ipc_server_status_provider *provider);
 
 /*!
+ * ADR-053 (#2006): where the service's conversion rows come from. The
+ * conversion core's service object registers it (HOOK for #2003, which lands
+ * the `conv_core` service object + the dp-lift adapter); until then nothing is
+ * registered and the service reports zero conversion rows, which every reader
+ * treats as "no providers" (the headless CLI path still describes them).
+ *
+ * Both callbacks run on the DIAG consumer's IPC thread under the status lock,
+ * at most at the status poll rate; they must answer from memory.
+ */
+struct ipc_server_conv_status_source
+{
+	//! Copy the current rows (provider rows <= XRT_STATUS_MAX_CONV_PROVIDERS,
+	//! task rows <= XRT_STATUS_MAX_CONV_TASKS) into @p live's conv_* fields.
+	void (*fill)(void *userdata, struct xrt_status_live *live);
+	//! The core's conversion generation: moves on every readiness transition
+	//! and provider-table change. Folded into `xrt_status_generation::conversion`.
+	uint64_t (*generation)(void *userdata);
+	void *userdata;
+};
+
+//! Register (or, with NULL, clear) the conversion status source.
+void
+ipc_server_set_conv_status_source(const struct ipc_server_conv_status_source *source);
+
+/*!
  * @name Display status snapshot (ADR-051 D3; `ipc_server_status.c`)
  *
  * The service-side snapshot behind the three session-free DIAG RPCs. The
@@ -900,6 +925,27 @@ ipc_server_status_get_client(struct ipc_server *s,
                              struct xrt_status_client *out_client,
                              struct xrt_segment_metrics *out_metrics,
                              struct xrt_status_generation *out_generation);
+/*!
+ * ADR-053 `system_get_conv_provider_row(index)` / `system_get_conv_task_row(index)`:
+ * one conversion row of the cached snapshot, at its generation (zeroed past the
+ * count; XRT_ERROR_IPC_FAILURE when @p index is out of range).
+ */
+xrt_result_t
+ipc_server_status_get_conv_provider(struct ipc_server *s,
+                                    uint32_t index,
+                                    struct xrt_status_conv_provider *out_row,
+                                    struct xrt_status_generation *out_generation);
+xrt_result_t
+ipc_server_status_get_conv_task(struct ipc_server *s,
+                                uint32_t index,
+                                struct xrt_status_conv_task *out_row,
+                                struct xrt_status_generation *out_generation);
+/*!
+ * Bump the `conversion` counter from an event site (the conversion core calls
+ * it per readiness transition when it has no generation callback). Leaf lock.
+ */
+void
+ipc_server_status_bump_conversion(struct ipc_server *s);
 /*! @} */
 
 /*!

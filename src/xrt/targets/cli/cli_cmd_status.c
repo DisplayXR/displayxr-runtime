@@ -12,7 +12,7 @@
  * what running apps see). Text is design §7, JSON is design §3
  * (`docs/roadmap/display-dashboard.md`).
  *
- * `--watch` keeps ONE DIAG connection, polls the service's two generation
+ * `--watch` keeps ONE DIAG connection, polls the service's three generation
  * counters every `--interval` ms (default 500, floor 100) and fetches + prints
  * the snapshot only when one moved — one NDJSON line per change with `--json`
  * (what the Control Panel reads), else the §7 table redrawn in place. Without
@@ -131,6 +131,31 @@ status_fetch_over(struct ipc_connection *ipc_c, struct xrt_status_snapshot *out)
 			if (xret == XRT_ERROR_IPC_FAILURE) {
 				// The client left between the head and its row (or the
 				// connection broke — the next call says which).
+				consistent = false;
+				break;
+			}
+			if (xret != XRT_SUCCESS) {
+				return xret;
+			}
+			consistent = u_status_generation_equal(&g, &head.generation);
+		}
+		// ADR-053: the conversion rows, one per reply (each under the 1 KB DIAG limit).
+		for (uint32_t i = 0; i < out->conv_provider_count && consistent; i++) {
+			struct xrt_status_generation g;
+			xret = ipc_call_system_get_conv_provider_row(ipc_c, i, &out->conv_providers[i], &g);
+			if (xret == XRT_ERROR_IPC_FAILURE) {
+				consistent = false; // the table shrank under us (or the connection broke)
+				break;
+			}
+			if (xret != XRT_SUCCESS) {
+				return xret;
+			}
+			consistent = u_status_generation_equal(&g, &head.generation);
+		}
+		for (uint32_t i = 0; i < out->conv_task_count && consistent; i++) {
+			struct xrt_status_generation g;
+			xret = ipc_call_system_get_conv_task_row(ipc_c, i, &out->conv_tasks[i], &g);
+			if (xret == XRT_ERROR_IPC_FAILURE) {
 				consistent = false;
 				break;
 			}
@@ -364,7 +389,7 @@ status_watch(uint32_t interval_ms, bool json)
 	struct ipc_connection ipc_c;
 	bool connected = false;
 	bool have_gen = false;
-	struct xrt_status_generation last = {0, 0};
+	struct xrt_status_generation last = {0, 0, 0};
 	uint64_t next_connect_ns = 0;
 	uint64_t lost_ns = 0;     // when the service went away (0 = never had it / still there)
 	bool printed_any = false; // anything printed at all
