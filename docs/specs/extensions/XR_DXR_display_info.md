@@ -978,6 +978,28 @@ override the automatic behavior. Use cases include:
 - Deferring 3D mode activation until the application has finished loading.
 - Implementing a user-facing 2D/3D toggle.
 
+#### Smooth transitions are the application's job
+
+A rendering-mode request takes effect in **one frame**. From the frame the new mode lands, the
+atlas recipe, the display processor's weave-vs-flat choice and the switchable lens or backlight
+follow it (ADR-028). The runtime does **not** ease the stereo disparity on any platform, because
+the disparity is the application's content. Its only transition aid is a one-frame eye-set
+coherence guard on the first frame of a 2D→3D switch (#615). An application that wants a soft
+transition, which is every interactive application, sequences it itself:
+
+- **3D → 2D:** ramp the view rig's `ipdFactor` to 0 first, then request the 2D mode on the frame
+  the ramp lands.
+- **2D → 3D:** request the 3D mode first, so its first frame is flat, then ramp `ipdFactor` back
+  up to the user's value.
+
+The reference implementation is `dxr::ModeSwitch` in
+[displayxr-common](https://github.com/DisplayXR/displayxr-common) (`common/mode_switch.h`,
+header-only; README section *Smooth 2D↔3D transitions*). It is a 0.18 s SmoothStep ramp driven
+by wall-clock time, interruptible, and restores the user-tuned disparity. App-authoring rule:
+`docs/guides/displayxr-app-rules.md` INV-2.9. Mode changes the application did not request
+(a runtime-owned V key in a hosted or legacy application, a workspace controller, an agent)
+reach it only as `XrEventDataRenderingModeChangedDXR` and are not eased.
+
 #### Mono Submission in 2D Mode
 
 > **DEPRECATED as a submission shape (v21, ADR-041).** Rendering ONE full-resolution view in

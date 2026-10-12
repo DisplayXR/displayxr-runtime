@@ -59,7 +59,9 @@ FetchContent_Declare(
     # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
     # v2.29.0: dxr::CursorDepth (common/cursor_depth.h) — the app-side helper for the runtime-drawn
     # depth cursor (ADR-046 Amendment 2); v2.28.0 brought the shared Vulkan frame ring.
-    GIT_TAG v2.29.0
+    # v2.30.0: dxr::ModeSwitch::step() (common/mode_switch.h), the one-call smooth
+    # 2D<->3D sequencer every platform's apps use (displayxr-common#73).
+    GIT_TAG v2.30.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

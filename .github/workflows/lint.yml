@@ -261,3 +261,8 @@ jobs:
         # .cxx/ holds FetchContent'd displayxr-common tests/ that tripped false
         # INV-3.1 errors.
         run: python3 scripts/tests/test_check_displayxr_app_skip_build_trees.py
+
+      - name: App-linter INV-2.9 mode-switch easing unit tests
+        # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
+        # check: the runtime never eases a 2D<->3D switch, the app must.
+        run: python3 scripts/tests/test_check_displayxr_app_mode_switch.py
