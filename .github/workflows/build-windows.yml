@@ -408,6 +408,10 @@ jobs:
             reg add $convKey /v Binary /t REG_SZ /d "$convPlugin" /f | Out-Null
             reg add $convKey /v ProbeOrder /t REG_DWORD /d 250 /f | Out-Null
             reg add $convKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Conversion" /f | Out-Null
+            # #2006: the sim provider's probe declines unless setting ENABLE = 1
+            # (spec §7.2: "CI registers sim-conversion with ENABLE = 1"); without
+            # it the selftest lists the row but never validates a descriptor.
+            reg add "$convKey\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
             reg add $convKey /v Version /t REG_SZ /d "ci" /f | Out-Null
             $convRegistered = $true
             Write-Host "Registered sim-conversion provider: $convPlugin"

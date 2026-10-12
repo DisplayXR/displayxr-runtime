@@ -513,6 +513,12 @@ if(TARGET tests_conv_snapshot)
 	target_compile_definitions(tests_conv_snapshot_stub_good PRIVATE STUB_VARIANT_GOOD)
 	target_compile_definitions(tests_conv_snapshot_stub_malformed PRIVATE STUB_VARIANT_MALFORMED)
 	target_compile_definitions(tests_conv_snapshot_stub_bad_state PRIVATE STUB_VARIANT_BAD_STATE)
+	# The shipped sim provider through the same pass: what CI's selftest gate sees
+	# (#2002). Linked in: its DLL needs the runtime DLLs next to it.
+	if(TARGET sim_conversion_static)
+		target_link_libraries(tests_conv_snapshot PRIVATE sim_conversion_static)
+		target_compile_definitions(tests_conv_snapshot PRIVATE CONV_SNAP_SIM_STATIC)
+	endif()
 	target_compile_definitions(
 		tests_conv_snapshot
 		PRIVATE "CONV_SNAP_STUB_GOOD=\"$<TARGET_FILE:tests_conv_snapshot_stub_good>\""
