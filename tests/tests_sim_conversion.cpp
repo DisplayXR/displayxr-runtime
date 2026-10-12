@@ -104,6 +104,8 @@ make_host(uint32_t flags = 0)
 
 struct xrt_conversion_plugin_host_iface g_host_storage;
 
+using settings = std::map<std::string, std::string>;
+
 //! Negotiate + probe with the given settings (ENABLE=1 and LATENCY_MS=0 added unless present).
 struct provider
 {
@@ -355,7 +357,7 @@ TEST_CASE("sim_conversion: describe_cap is well-formed per the selftest rules", 
 
 TEST_CASE("sim_conversion: LICENCE=research flips the licence class", "[sim_conversion]")
 {
-	provider pv({{"LICENCE", "research"}});
+	provider pv(settings{{"LICENCE", "research"}});
 	struct xrt_conv_capability c;
 	std::memset(&c, 0, sizeof(c));
 	c.struct_size = (uint32_t)sizeof(c);
@@ -463,7 +465,7 @@ TEST_CASE("sim_conversion: scripted state sequence replays", "[sim_conversion]")
 
 TEST_CASE("sim_conversion: in-service crash reports FAILED(CRASH_LOOP)", "[sim_conversion]")
 {
-	provider pv({{"CRASH_AFTER", "2"}});
+	provider pv(settings{{"CRASH_AFTER", "2"}});
 	const uint64_t id = make_views_stream(pv, 2, XRT_CONV_OUT_VIEWS);
 	cpu_img src = column_image(32, 2, 10);
 	cpu_img views(64, 2, 4, XRT_CONV_FMT_RGBA8_UNORM);
@@ -695,7 +697,7 @@ TEST_CASE("sim_conversion: cancel is observed within 100 ms", "[sim_conversion]"
 	}
 
 	// job (SPLATS_MONO), once its capability is READY.
-	provider ready({{"JOB_MS", "5000"}});
+	provider ready(settings{{"JOB_MS", "5000"}});
 	cpu_img src = column_image(16, 16, 3);
 	struct xrt_conv_job_in in;
 	std::memset(&in, 0, sizeof(in));
@@ -734,7 +736,7 @@ TEST_CASE("sim_conversion: cancel is observed within 100 ms", "[sim_conversion]"
 
 TEST_CASE("sim_conversion: splat job writes a PLY through the sink", "[sim_conversion]")
 {
-	provider pv({{"JOB_MS", "0"}});
+	provider pv(settings{{"JOB_MS", "0"}});
 	cpu_img src = column_image(16, 16, 3);
 	struct xrt_conv_job_in in;
 	std::memset(&in, 0, sizeof(in));
