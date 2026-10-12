@@ -124,6 +124,15 @@ ipc_client_lift_stats(struct ipc_connection *ipc_c, uint64_t stream_id, struct x
 xrt_result_t
 ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const struct xrt_lift_weave_rect *rects);
 
+/*!
+ * conv_hint_interest (ADR-053, #2005): this connection belongs to an instance
+ * that enabled XR_DXR_lift. The service's PrewarmOn policy decides whether to
+ * warm the conversion tasks in @p task_mask (bit 1 << XRT_CONV_TASK_*; 0 = the
+ * default set) now. Fire and forget: never blocks on a provider.
+ */
+xrt_result_t
+ipc_client_conv_hint_interest(struct ipc_connection *ipc_c, uint64_t task_mask);
+
 #ifdef __cplusplus
 }
 #endif

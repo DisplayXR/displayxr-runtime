@@ -4730,6 +4730,17 @@ struct oxr_lift_stream_dxr
  */
 void
 oxr_lift_session_fini(struct oxr_session *sess);
+
+/*!
+ * ADR-053 (#2005) conv_hint_interest: a session of an instance that enabled
+ * XR_DXR_lift tells the service once, at xrCreateSession, so the PrewarmOn =
+ * interest policy can warm the conversion tasks before the first lift call.
+ * IPC session: on its own connection. Eligible in-process session (ADR-049):
+ * starts the lift-only link's background connect, which sends the hint once
+ * connected. Never blocks, never fails the session.
+ */
+void
+oxr_lift_session_hint_interest(struct oxr_session *sess);
 #endif // OXR_HAVE_DXR_lift
 
 #ifdef OXR_HAVE_DXR_stereo_camera

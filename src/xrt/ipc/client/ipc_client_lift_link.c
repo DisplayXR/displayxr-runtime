@@ -18,6 +18,7 @@
 
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_lift.h"
 #include "client/ipc_client_lift_link.h"
 
 #ifdef XRT_OS_WINDOWS
@@ -95,6 +96,13 @@ connect_run(void *ptr)
 			ii.app_info.declared_client_class = XRT_CLIENT_CLASS_APP;
 			xret = ipc_client_connection_init(c, U_LOGGING_ERROR, &ii);
 		}
+	}
+
+	if (xret == XRT_SUCCESS) {
+		// ADR-053 (#2005): the lift link exists only for an instance that
+		// enabled XR_DXR_lift, so every new connection carries the prewarm
+		// hint (PrewarmOn = interest). Before publishing: nobody else holds c.
+		(void)ipc_client_conv_hint_interest(c, 0);
 	}
 
 	os_mutex_lock(&link->mtx);
