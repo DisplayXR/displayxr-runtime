@@ -474,6 +474,12 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
   slots per stream), so neither thread ever waits on the other's GPU queue.
 - Never join the render thread under `render_mutex`; never hold
   `global_state.lock` across a compositor call.
+- **comp_multi (macOS / Linux / Android) has its own, separate order** (#1005):
+  `msc->render_lock -> msc->list_and_timing_lock -> mc->slot_lock`. `render_lock` covers one
+  whole frame (transfer, render, DP, present) and is what client destroy, end_session, the
+  session-DP detach and the display-mode request take first; the list lock is held only for
+  bookkeeping and never across GPU work or a DP call. Full statement:
+  `@page comp_multi_locking` in `multi/comp_multi_interface.h`.
 
 ### 3.3 Locks
 
@@ -691,11 +697,11 @@ the #930 signature (no banner) rather than #943's (banner present). See the #943
 |---|---|---|---|---|
 | service | `displayxr-service.exe` | `displayxr-service` + orchestrator (posix_spawn, respawn) | `displayxr-service`, **no orchestrator**; shipped in the `.deb`/tarball and **socket-activated** by a systemd user unit, exits when idle (#1744); runs detached (stdin not required), SIGTERM = clean stop | `libservice_target.so` in a bound **foreground** `Service` (`START_STICKY`), `ipc_server_main_android` on a `std::thread`; **one satellite process per client** (`MonadoServiceSlot0..3`, `android:process=":dxrN"`) brokered by the main process — see §7a |
 | transport | named pipe | AF_UNIX | AF_UNIX | binder for bootstrap only (`IMonado.aidl` 4 methods); per-frame traffic on a socketpair; **connect blocks a binder thread on a condvar until the 50 ms mainloop accepts** (`ipc_server_mainloop_android.c:170-222`); a process that **already holds a connected socket** skips the Java/binder bootstrap entirely — `ipc_client_connection_adopt_fd()` or `DXR_IPC_FD` (#1056, for an embedder like Chromium whose rendering process is not the process that owns its Java world) |
-| system compositor | `comp_d3d11_service` | **null + `comp_multi`** (shared-surface workspace path exists) | null + `comp_multi`, **shared spatial surface** (#710): one service-owned window (`comp_window_linux`: native Wayland 1:1 by default, X11 / XWayland fallback), workspace handler arms + surface input routing as on macOS; headless-verified, panel run pending | null + `comp_multi`, per-session `comp_window_android` |
-| DP | in-process; 1 or N | in-process; **one shared** | in-process; **one shared** (plus one per `XR_DXR_weave` present-owner) | in-process (`dlopen`); **one per client**, `process_atlas` per client per frame |
+| system compositor | `comp_d3d11_service` | **null + `comp_multi`** (shared-surface workspace path exists) | null + `comp_multi`, **shared spatial surface** (#710): one service-owned window (`comp_window_linux`: native Wayland 1:1 by default, X11 / XWayland fallback), workspace handler arms + surface input routing as on macOS; headless-verified, panel run pending | null + `comp_multi`, per-session `comp_window_android` by default; **workspace overlay mode** (shared surface in the controller's own surface) while a verified controller is active — §7b |
+| DP | in-process; 1 or N | in-process; **one shared** | in-process; **one shared** (plus one per `XR_DXR_weave` present-owner) | in-process (`dlopen`); **one per client**, `process_atlas` per client per frame; **one shared** in the overlay mode (§7b) |
 | clients on screen | N | N | N (shared surface) | **N, one per satellite process** (4 slots by default; §7a). Within *one* process it is still 1 — the app surface is a process-global singleton (`android_globals.cpp:21-44`) — which is exactly why each client gets its own process |
 | arbitration | inside `comp_d3d11_service.cpp` | Monado active-client fallthrough only | — | none needed for the on-screen part: the OS is the window manager and each client owns a process. What *is* shared — the panel's 3D lens — is a per-window preference resolved by refcount in the vendor services (#1039), not a display command |
-| #925 S1–S5 | ✔ | ✘ (`list_and_timing_lock` holds the whole per-client render + present; `vkWaitForFences(UINT64_MAX)`; unbounded `process_atlas`) | ✘ | ✘ |
+| #925 S1–S5 | ✔ | partly (#1005/#1007: waits bounded with a per-client stall deadline, GPU work + present under `render_lock` not `list_and_timing_lock`; `process_atlas` itself is still a vendor call without a timeout) | as macOS | as macOS |
 | supervision | orchestrator for children; nothing for the service | orchestrator | systemd user manager (`Restart=on-failure`; the socket re-starts it on the next connect) | the OS (`START_STICKY`, but restart arrives with a null Intent → not re-foregrounded, `MonadoService.kt:63-71`); no client reconnect |
 
 **ADR-025 clarification.** "Out-of-process" there means the *app* is isolated from the vendor
@@ -753,6 +759,28 @@ CI builds the one merged runtime APK (#1031), which carries this path — but do
 CI-validated; there is no eviction policy beyond "first come, and the fifth app degrades to the
 legacy single-window path"; and nothing yet reports slot occupancy through `displayxr-cli` or the
 diag dashboard.
+
+### 7b. Android workspace overlay mode (ADR-036 D4, #1006)
+
+The per-window shape above is the Android default. The **workspace overlay mode** is the
+opt-in alternative a verified workspace controller turns on, exactly as a controller turns
+on the shared surface on Windows / macOS / Linux: one surface, one atlas, **one DP**, every
+participating client composited at controller-supplied poses.
+
+| Piece | What it does |
+|---|---|
+| Controller verification | A CONTROLLER claim on Android is checked by the peer **UID** (`SO_PEERCRED`): the package must declare `<meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>` **and** be signed with the runtime's certificate (`PackageManager.checkSignatures`). `ipc_server_set_android_controller_verify_provider` → `WorkspaceControllerPolicy.isVerifiedController`. Dev override: `debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER=1`. |
+| Routing | `SlotBroker` returns **-1** (main-process service) for a verified controller package and, while the overlay is on, for every new IPC client. Clients that already hold a satellite keep it. |
+| Output surface | The controller's own fullscreen Activity surface, published by its IPC client as any client's is. While the overlay is on, `MonadoImpl` honours `passAppSurface` / `clearAppSurface` only from the controller's UID; other surfaces are remembered and the most recent one is republished when the overlay ends. |
+| Mode switch | `workspace_activate` / `deactivate` / controller loss set `workspace_active`; the render thread applies it at the top of a frame (`msc->shared_mode_active`, read through `multi_shared_surface_active()`). On: the shared target + shared DP are built lazily, every per-session DP releases its lens vote. Off: the shared target is released (the window is process-global), the shared DP is **paused, never destroyed** (leia-plugin#39), per-session rendering resumes. |
+| Members | A client admitted into an active overlay is a *workspace-overlay member*: an Activity pause does not stop its session (it is on screen through the controller's surface), and its instance counts as a workspace session so the controller can enumerate and place it. |
+| 2D/3D | The controller is the display-mode authority; its `xrRequestDisplayRenderingModeDXR` reaches the shared DP through `workspace_request_display_mode` and every composited client hears the hardware state (#967 D-5). |
+
+Known limits: only clients that join *after* activation are composited (a satellite client
+stays per-window); nothing feeds pointer input to the workspace input queues on Android yet;
+a content app that stops rendering when it loses its own window shows a frozen last frame;
+the vendor stack's "one core per process" behaviour (R2) is measured for creation only —
+the shared DP is held back while any per-session DP is alive in the main process.
 
 ---
 

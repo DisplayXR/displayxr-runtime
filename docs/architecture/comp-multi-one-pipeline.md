@@ -1,7 +1,7 @@
 ---
-status: Active (design note for #967; Phase 3/5 of ADR-035, epic #974). D-4/D-5 re-scoped 2026-08-18 as an opt-in Android **workspace overlay mode** by ADR-036 / epic #1031 — the Android default is the per-window path.
+status: Active (design note for #967; Phase 3/5 of ADR-035, epic #974). D-4/D-5 re-scoped 2026-08-18 as an opt-in Android **workspace overlay mode** by ADR-036 / epic #1031 — the Android default is the per-window path. D-2/D-3/D-4/D-5 implemented 2026-10-12 (§5).
 owner: David Fattal
-updated: 2026-08-18
+updated: 2026-10-12
 anchors: main @ 32cd9612d
 code-paths: [src/xrt/compositor/multi/, src/xrt/compositor/null/null_compositor.c, src/xrt/targets/common/target_instance.c]
 ---
@@ -135,3 +135,67 @@ overlay alike — and are no longer blocked on deciding the Android shape.
   does not stall the other's frames; the shared DP accepts mode requests under the panel
   lease. **The per-window default is unaffected** — with no controller active, each client
   still renders to its own target with its own DP, and that path must show no regression.
+
+## 5. Implementation (2026-10-12)
+
+What landed, and how each done-when was shown on an NP02J (Leia CNSDK release build). §1
+describes the code as it was *before*; read this section for the current shape.
+
+**D-2 bounded waits (#1007).** `multi_wait_fences_bounded()` (100 ms slices,
+`MULTI_FENCE_TIMEOUT_NS`, up to `MULTI_FENCE_DEADLINE_NS` = 500 ms) replaces every
+`vkWaitForFences(UINT64_MAX)` on the main loop and the teardown paths. A client whose fence
+misses the deadline is marked `gpu_stalled`, its frame is skipped with the fence kept
+pending (stale-frame reuse, #922), and from then on the fence is only polled, so it costs
+the other clients nothing per frame; the shared surface has the same rule. `vkDeviceWaitIdle`
+in `recreate_session_swapchain` and `shared_surface_fini` became a bounded fence on an empty
+submit to the main queue. `comp_target::acquire_timeout_ns` (0 = infinite, the default for
+every other user) bounds `vkAcquireNextImageKHR` at 500 ms. Teardown that times out leaks
+its Vulkan objects rather than freeing memory a wedged GPU may read.
+`android_run_on_main_thread_timeout()` abandons a main-Looper task that has not started
+within 2 s (heap-refcounted, never run late against a dead stack frame); both DP factory
+calls use it. The session-DP destroy unpublishes the pointer under the locks before
+destroying it with the locks dropped (the old in-place destroy was a use-after-free against
+the Android convergence pass). Not touched: each client's own wait thread, and the macOS
+present-owner weave.
+
+**D-3 GPU work out of `list_and_timing_lock` (#1005).** New `msc->render_lock`; the order is
+`render_lock -> list_and_timing_lock -> slot_lock`, written up as `@page comp_multi_locking`
+in `comp_multi_interface.h`. The main loop holds `render_lock` for the whole frame and takes
+the list lock only to transfer layers and snapshot `msc->clients[]` into `msc->render_set`,
+then again to apply the retires the render recorded (they touch the app pacer). Client
+destroy unlists first under both locks, then tears down with none held.
+
+**D-4 Android workspace overlay mode (#1006).** The gate is split:
+`COMP_MULTI_SHARED_SURFACE` = shared surface compiled (macOS, desktop Linux, Android),
+`COMP_MULTI_PER_SESSION_TARGET` = per-session path compiled (!macOS && !desktop Linux).
+`multi_shared_surface_active(msc)` is a compile-time `true` on macOS / Linux (unchanged
+builds) and `msc->shared_mode_active` on Android, which the render thread flips at the top
+of a frame when a verified controller activates or deactivates (`android_overlay_transition`).
+Entry and target are described in [service-architecture.md §7b](service-architecture.md#7b-android-workspace-overlay-mode-adr-036-d4-1006)
+and the controller contract in
+[workspace-controller-registration.md §Android](../specs/runtime/workspace-controller-registration.md#android-workspace-controllers-1006).
+Measured: one main-service process, one `created shared display processor`, two IPC cubes
+composited side by side in the controller's surface in landscape and portrait; one cube
+force-stopped and the other kept rendering at 60 fps through the surface; deactivate
+released the shared target, paused the shared DP and resumed per-session rendering, and a
+new client got a satellite again. The per-window default (two forced-IPC cubes on `:dxr0`
+/ `:dxr1`, a DP each) shows no change.
+
+**D-5 shared-DP mode channel.** While a controller is active it is the display-mode
+authority (apps see their modes as not requestable — the existing contract), so the channel
+that matters is the controller's: `workspace_request_display_mode` gained a shared-surface
+arm that resolves the mode's hardware flag and hands it to the render thread
+(`comp_multi_system_request_workspace_display_mode` -> `shared_converge_display_mode_locked`),
+which drives the one DP and tells every composited client. Measured: controller mode 0 ->
+the vendor lens off, mode 1 -> on. With no controller wish the focused / lone client's own
+wish still governs, as before.
+
+**Measured risks.** R1: a content Activity paused behind the fullscreen controller has its
+session stopped by the client runtime (ON_PAUSE -> STOPPING) and many apps also stop their
+frame loop without a window. Overlay members are exempt from the former (as #558 overlay
+apps are); the latter is an app rule — keep rendering while the runtime reports the session
+VISIBLE / FOCUSED. R2: a per-session DP was created while the paused shared DP was alive in
+the same process and both vendor cores initialised — creation only, not a long-run test;
+the shared DP itself is held back while any per-session DP is alive in its process.
+R3: macOS was not built (CI covers it). R4: no deadlock seen; the lock audit is in the
+#1005 commit.

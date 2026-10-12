@@ -40,11 +40,17 @@
         <meta-data
             android:name="com.displayxr.force_ipc"
             android:value="true" />
+        <!-- Its surface is the panel-wide output: keep the window rect honest
+             on OEMs that sandbox view bounds (ADR-036 D6). -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+            android:resizeableActivity="true"
             android:launchMode="singleTask">
             <meta-data
                 android:name="android.app.lib_name"

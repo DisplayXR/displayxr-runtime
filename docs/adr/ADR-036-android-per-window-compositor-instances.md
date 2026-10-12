@@ -214,6 +214,21 @@ The two shapes coexist by the same rule Windows already uses: a workspace overla
 (banner truth, bounded waits, GPU work out of `list_and_timing_lock`) are unaffected —
 they help every path.
 
+> **Amendment (2026-10-12) — D4 implemented (#1006).** The overlay mode exists and was
+> run on an NP02J: with a verified controller active, two IPC clients were composited
+> side by side through one DP in the controller's own surface (landscape and portrait),
+> one was killed and the other kept rendering, deactivation returned to per-session
+> rendering, and the per-window default showed no change. Choices made, both David's:
+> the shared target is the **controller's own fullscreen surface** (not a runtime-owned
+> overlay window), and an Android controller is verified as a **package** — the
+> `com.displayxr.workspace_controller` meta-data plus the runtime's signing certificate,
+> checked by UID. Mechanism: [service-architecture.md §7b](../architecture/service-architecture.md#7b-android-workspace-overlay-mode-adr-036-d4-1006);
+> contract: [workspace-controller-registration.md](../specs/runtime/workspace-controller-registration.md#android-workspace-controllers-1006).
+> Two measured consequences: a content Activity paused behind the controller would have
+> its session stopped (members are now exempt, like #558 overlay apps), and apps that stop
+> rendering without their own window freeze in the overlay — an authoring rule, not a
+> runtime fix.
+
 ### D5 — Package visibility is a vendor-neutral intent action, not a package name
 
 Vendor display services advertise themselves with

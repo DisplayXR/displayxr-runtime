@@ -45,7 +45,9 @@ extern "C" {
  * renders an empty backdrop + DXR splash + launcher band while a controller is
  * connected, even with no active content app session (a controller never
  * xrBeginSession's). Called from the IPC workspace activate / deactivate handlers.
- * No-op / unused on other platforms (defined under XRT_OS_MACOS).
+ * Defined wherever COMP_MULTI_SHARED_SURFACE is (macOS, desktop Linux, Android);
+ * on Android it is the request that turns the workspace overlay mode on / off,
+ * applied by the render thread at the top of a frame (#1006).
  *
  * @ingroup comp_multi
  */
