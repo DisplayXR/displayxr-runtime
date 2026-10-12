@@ -29,6 +29,7 @@ set(tests
     tests_dp_vk_snap_window_rect
     tests_weave_snap_grid
     tests_lift_mailbox
+    tests_sim_conversion
     tests_conversion_abi
     tests_conv_wire
     tests_conv_select
@@ -1113,6 +1114,11 @@ target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/
 # DisplayXR-SimConversion provider (src/xrt/drivers/sim_conversion/).
 target_sources(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c)
 target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion)
+
+# ADR-053 P1a: the DisplayXR-SimConversion provider, linked statically through
+# its own entry point (sim_conversion_static): no dlopen, no registry, no GPU.
+target_link_libraries(tests_sim_conversion PRIVATE sim_conversion_static)
+set_target_properties(tests_sim_conversion PROPERTIES CXX_STANDARD 17)
 
 # ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h) and the
 # conv_* wire family (xrt_conv_wire.h). The ABI test builds as C++17 on purpose
