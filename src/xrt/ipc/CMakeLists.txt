@@ -29,6 +29,7 @@ endforeach()
 
 set(IPC_COMMON_SOURCES
     ${CMAKE_CURRENT_BINARY_DIR}/ipc_protocol_generated.h
+    shared/ipc_lift_caps.h
     shared/ipc_message_channel.h
     shared/ipc_shmem.c
     shared/ipc_shmem.h
