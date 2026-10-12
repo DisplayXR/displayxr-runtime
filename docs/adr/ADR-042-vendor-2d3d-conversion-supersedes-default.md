@@ -1,6 +1,6 @@
 # ADR-042: A vendor 2D→3D conversion module supersedes the open default — the runtime exposes it, weaving stays the DP's
 
-**Status:** Accepted (2026-09-25) · introduces
+**Status:** Accepted (2026-09-25) · **amended by [ADR-053](ADR-053-conversion-providers.md) (Proposed 2026-10-12):** §1 ("supersedes the open default") and the consumer contract's open-default rows are superseded (there is no in-app converter; the open models become a provider), and §5 (the display-processor lift slots) is frozen as a legacy adapter and replaced by the conversion-provider plug-in type; §2–§4 stand · introduces
 [`XR_DXR_lift`](../specs/extensions/XR_DXR_lift.md) · appends five optional D3D11
 display-processor slots and one optional plug-in factory under the
 [ADR-020](ADR-020-plugin-abi-compatibility-policy.md) append-at-end rule · related:

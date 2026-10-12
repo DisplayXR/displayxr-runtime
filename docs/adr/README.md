@@ -56,3 +56,4 @@
 - [ADR-050](ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
 - [ADR-051](ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
 - [ADR-052](ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
+- [ADR-053](ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks

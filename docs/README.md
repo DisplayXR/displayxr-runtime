@@ -80,6 +80,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[Vendor Plug-in Onboarding](guides/vendor-plugin-onboarding.md)** — zero-to-shipping guide for a new vendor's external plug-in repo (post-#263 model)
 - **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
 - **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
+- **[Conversion-provider discovery spec](specs/runtime/conversion-provider-discovery.md)** — the third plug-in type (2D→3D models: depth, view synthesis, splats): C ABI summary, registry / manifest formats, selection, readiness, hosting rules, model packs (draft, ADR-053)
 - **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
 - **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoDXR` frozen at v13 (all future per-mode fields chain)
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
@@ -160,6 +161,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-050](adr/ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
 - [ADR-051](adr/ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
 - [ADR-052](adr/ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
+- [ADR-053](adr/ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
 <!-- END ADR INDEX -->
 
 ---
@@ -181,6 +183,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
 - [PR FAQ](roadmap/prfaq.md) — press-release-style framing
 - [Stereo Camera Source](roadmap/stereo-camera-source.md) — a display's (eye-tracking) stereo camera as a plug-in-provided, privacy-gated source for web calls: browser `getUserMedia` integration, Android, phased plan (design, ADR-043)
+- [Conversion Providers](roadmap/conversion-providers.md) — plan for 2D→3D models as a third plug-in type: service-composed pipelines, satellite hosting, transport matrix, lift spec 4/5, consumer migration, phases P0–P6 (ADR-053) · [header drafts](roadmap/conversion-providers-headers-draft.md)
 - [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
 - [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_DXR_spatial_workspace.h` C-level API draft (historical: the separate app-launcher extension sketched there was dropped; launcher tiles ship as `*.displayxr.json` manifests)
 - [Workspace Controller Detection](roadmap/spatial-workspace-controller-detection.md) — Phase 2.0 prep: orchestrator detects installed controller via sidecar `.controller.json` manifest
