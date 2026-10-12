@@ -34,6 +34,10 @@ cli_service_pipe_present(void)
 xrt_result_t
 cli_ipc_connect(struct ipc_connection *ipc_c, enum u_logging_level log_level, const struct xrt_instance_info *ii)
 {
+	// The pre-check keeps a missing service quiet (no "Connect ... failed" ERROR
+	// on every reconnect poll); the flag is what makes it race-free: the
+	// service can die between this check and the connect below.
+	ipc_client_connection_disable_service_launch();
 	if (!cli_service_pipe_present()) {
 		return XRT_ERROR_IPC_FAILURE;
 	}

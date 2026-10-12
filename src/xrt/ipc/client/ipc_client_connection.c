@@ -598,6 +598,9 @@ ipc_open_pipe_busy_retry(struct ipc_connection *ipc_c, const char *pipe_name)
 	}
 }
 
+//! Set by ipc_client_connection_disable_service_launch() (#1966).
+static volatile bool g_service_launch_disabled = false;
+
 #if defined(NO_XRT_SERVICE_LAUNCH) || !defined(XRT_SERVICE_EXECUTABLE)
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -641,6 +644,10 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 	if (err != ERROR_FILE_NOT_FOUND) {
 		return INVALID_HANDLE_VALUE;
+	}
+	if (g_service_launch_disabled) {
+		SetLastError(err);
+		return INVALID_HANDLE_VALUE; // #1966: this process never starts the service
 	}
 	IPC_INFO(ipc_c, "Trying to launch " XRT_SERVICE_EXECUTABLE "...");
 	HMODULE hmod;
@@ -1084,6 +1091,14 @@ ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *o
 	    "process must run setup_shm / git-tag / describe_client (browser#103).",
 	    fd);
 	return XRT_SUCCESS;
+#endif
+}
+
+void
+ipc_client_connection_disable_service_launch(void)
+{
+#ifdef XRT_OS_WINDOWS
+	g_service_launch_disabled = true;
 #endif
 }
 
