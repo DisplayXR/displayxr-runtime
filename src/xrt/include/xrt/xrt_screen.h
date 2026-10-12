@@ -149,6 +149,15 @@ struct xrt_screen
 
 	//! Display info of this screen.
 	struct xrt_screen_info info;
+
+	//! The compositor's PREFERRED mode for this output, when the compositor
+	//! reports one (desktop Linux: Mutter DisplayConfig's `is-preferred`
+	//! mode). @ref native_width / @ref native_height are then the
+	//! compositor's CURRENT mode, so "is this output at its native mode?" is
+	//! current == preferred, both device pixels — never a comparison against
+	//! the desktop rect, which is logical on a scaled desktop. 0 = unknown.
+	uint32_t preferred_width;
+	uint32_t preferred_height;
 };
 
 /*!

@@ -14,6 +14,7 @@
 
 #include <cjson/cJSON.h>
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -321,6 +322,55 @@ plugin_not_ready_text(const struct xrt_status_plugin *p, char *out, size_t cap)
 }
 
 void
+u_status_native_resolve(struct xrt_status_native *n,
+                        uint32_t mode_w,
+                        uint32_t mode_h,
+                        uint32_t preferred_w,
+                        uint32_t preferred_h,
+                        uint32_t desktop_w,
+                        uint32_t desktop_h)
+{
+	n->current_width = 0;
+	n->current_height = 0;
+	if (preferred_w > 0 && preferred_h > 0) {
+		n->basis = XRT_STATUS_NATIVE_BASIS_COMPOSITOR;
+		n->width = preferred_w;
+		n->height = preferred_h;
+		n->current_width = mode_w;
+		n->current_height = mode_h;
+		n->is_native = mode_w == preferred_w && mode_h == preferred_h;
+		return;
+	}
+	n->basis = XRT_STATUS_NATIVE_BASIS_DESKTOP;
+	n->width = mode_w;
+	n->height = mode_h;
+	n->is_native = mode_w > 0 && mode_h > 0 && mode_w == desktop_w && mode_h == desktop_h;
+}
+
+void
+u_status_physical_pick(uint32_t confidence,
+                       float plugin_w_m,
+                       float plugin_h_m,
+                       uint32_t edid_w_mm,
+                       uint32_t edid_h_mm,
+                       struct xrt_status_physical *out)
+{
+	memset(out, 0, sizeof(*out));
+	const bool have_plugin = plugin_w_m > 0.0f && plugin_h_m > 0.0f;
+	const bool have_edid = edid_w_mm > 0 && edid_h_mm > 0;
+	// Plug-in mm win only under an EDID or VERIFIED claim.
+	if (have_plugin && (confidence >= (uint32_t)XRT_DISPLAY_CLAIM_EDID || !have_edid)) {
+		out->width_mm = (uint32_t)lroundf(plugin_w_m * 1000.0f);
+		out->height_mm = (uint32_t)lroundf(plugin_h_m * 1000.0f);
+		out->source = XRT_STATUS_MM_SOURCE_PLUGIN;
+	} else if (have_edid) {
+		out->width_mm = edid_w_mm;
+		out->height_mm = edid_h_mm;
+		out->source = XRT_STATUS_MM_SOURCE_EDID;
+	}
+}
+
+void
 u_status_warnings_derive(struct xrt_status_snapshot *snap)
 {
 	if (snap == NULL) {
@@ -343,14 +393,25 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 		const bool claimed = s->claim.plugin_id[0] != '\0';
 
 		// NOT_NATIVE — only when the native mode is KNOWN; unknown never warns.
-		if (claimed && s->native.width > 0 && s->native.height > 0 && s->desktop.width > 0 &&
-		    s->desktop.height > 0 &&
-		    (s->desktop.width != s->native.width || s->desktop.height != s->native.height)) {
+		// Compositor basis (desktop Linux): its current mode is not its
+		// preferred one. Otherwise: the desktop rect is not the native mode.
+		const bool native_known = s->native.width > 0 && s->native.height > 0;
+		bool not_native = false;
+		uint32_t now_w = s->desktop.width, now_h = s->desktop.height;
+		if (s->native.basis == XRT_STATUS_NATIVE_BASIS_COMPOSITOR) {
+			now_w = s->native.current_width;
+			now_h = s->native.current_height;
+			not_native = native_known && now_w > 0 && now_h > 0 && !s->native.is_native;
+		} else {
+			not_native = native_known && now_w > 0 && now_h > 0 &&
+			             (now_w != s->native.width || now_h != s->native.height);
+		}
+		if (claimed && not_native) {
 			(void)snprintf(
 			    text, sizeof(text),
 			    "Set this screen to its native %ux%u (now %ux%u): a 3D panel weaves correctly only "
 			    "at native resolution.",
-			    s->native.width, s->native.height, s->desktop.width, s->desktop.height);
+			    s->native.width, s->native.height, now_w, now_h);
 			screen_warn(s, U_STATUS_W_NOT_NATIVE, XRT_STATUS_LEVEL_CRITICAL, text);
 		}
 

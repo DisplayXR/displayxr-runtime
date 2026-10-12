@@ -38,6 +38,9 @@ struct target_screens_system
 	uint32_t desktop_height;
 	uint32_t native_width;
 	uint32_t native_height;
+	//! The compositor's preferred mode (see xrt_screen::preferred_width); 0 = unknown.
+	uint32_t preferred_width;
+	uint32_t preferred_height;
 	float desktop_scale;
 	bool is_primary;
 	char device_name[XRT_SCREEN_NAME_MAX];

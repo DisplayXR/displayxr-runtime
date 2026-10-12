@@ -191,6 +191,45 @@ u_screen_info_source_str(uint32_t source)
 	}
 }
 
+/*!
+ * Whose millimetres describe a screen (ADR-051): the claiming plug-in's only
+ * when its claim is EDID or VERIFIED confidence. A FALLBACK (or
+ * PRESENT_NOT_READY, or synthesized) claim is "anything unclaimed": its
+ * metres are a stand-in, so the EDID size wins when the monitor reports one.
+ */
+static inline bool
+u_screen_info_plugin_mm_authoritative(uint32_t confidence)
+{
+	return confidence >= (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+}
+
+/*!
+ * Apply the @ref u_screen_info_plugin_mm_authoritative rule to a resolved
+ * screen-info block: when its metres came from the claiming plug-in (SYSTEM
+ * or PLUGIN_MONITOR source) under a non-authoritative claim and the EDID has
+ * a size, replace the metres with the EDID's. Everything else in the block
+ * (nominal viewer, eye tracking, view scale) stays the plug-in's.
+ *
+ * @return true when the metres were replaced.
+ */
+static inline bool
+u_screen_info_prefer_edid_mm(struct xrt_screen_info *info,
+                             uint32_t confidence,
+                             uint32_t edid_width_mm,
+                             uint32_t edid_height_mm)
+{
+	if (info == NULL || u_screen_info_plugin_mm_authoritative(confidence) || edid_width_mm == 0 ||
+	    edid_height_mm == 0) {
+		return false;
+	}
+	if (info->source != XRT_SCREEN_INFO_SOURCE_SYSTEM && info->source != XRT_SCREEN_INFO_SOURCE_PLUGIN_MONITOR) {
+		return false;
+	}
+	info->width_m = (float)edid_width_mm / 1000.0f;
+	info->height_m = (float)edid_height_mm / 1000.0f;
+	return true;
+}
+
 #ifdef __cplusplus
 }
 #endif

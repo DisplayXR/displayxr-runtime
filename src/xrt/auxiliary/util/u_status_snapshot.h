@@ -72,6 +72,40 @@ void
 u_status_warnings_derive(struct xrt_status_snapshot *snap);
 
 /*!
+ * Decide a screen's native mode and whether it runs it.
+ *
+ * With a compositor-reported preferred mode (@p preferred_w / @p preferred_h
+ * non-zero; desktop Linux under Mutter), @p mode_w / @p mode_h are the
+ * compositor's CURRENT mode: native = the preferred mode, and `is_native` =
+ * current == preferred, never the desktop rect (which is logical on a scaled
+ * desktop: 3456x2160 for a 2880x1800 panel at 167 %). Otherwise @p mode_w /
+ * @p mode_h ARE the native mode and `is_native` = it equals the desktop rect.
+ * `refresh_mhz` is left as the caller set it.
+ */
+void
+u_status_native_resolve(struct xrt_status_native *n,
+                        uint32_t mode_w,
+                        uint32_t mode_h,
+                        uint32_t preferred_w,
+                        uint32_t preferred_h,
+                        uint32_t desktop_w,
+                        uint32_t desktop_h);
+
+/*!
+ * A screen's physical size: the claiming plug-in's metres (@p plugin_w_m /
+ * @p plugin_h_m, 0 when the plug-in did not describe the screen) win only
+ * under an EDID or VERIFIED claim (@p confidence); otherwise the EDID's mm
+ * when present, and the plug-in's only when there is no EDID size.
+ */
+void
+u_status_physical_pick(uint32_t confidence,
+                       float plugin_w_m,
+                       float plugin_h_m,
+                       uint32_t edid_w_mm,
+                       uint32_t edid_h_mm,
+                       struct xrt_status_physical *out);
+
+/*!
  * Append a warning to a fixed array; false when full (the warning is dropped).
  */
 bool

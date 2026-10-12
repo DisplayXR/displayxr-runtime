@@ -227,6 +227,34 @@ TEST_CASE("non-default screens: the owning plug-in's slot, else EDID-derived")
 	CHECK(hdmi->info.nominal_viewer_z_m == Catch::Approx(0.6f)); // same height -> same distance
 }
 
+TEST_CASE("a FALLBACK claim's metres give way to the EDID's, the default screen's too (ADR-051)")
+{
+	fixture f;
+	// The fallback plug-in is the active one and its panel is the laptop, at
+	// its hard-coded 0.344 x 0.194 m; the EDID says 300 x 190 mm.
+	f.sys.info.width_m = 0.344f;
+	f.sys.info.height_m = 0.194f;
+	f.sys.desktop_left = 0;
+	f.sys.desktop_width = 2880;
+	f.sys.desktop_height = 1800;
+	std::snprintf(f.sys.device_name, sizeof(f.sys.device_name), "eDP-1");
+	xrt_screen_list list{};
+	target_screens_build(&f.reg, "fallback", &f.sys, &list);
+
+	REQUIRE(list.count == 3);
+	const xrt_screen &def = list.screens[0];
+	CHECK(def.id == f.descs[0].monitor_id);
+	CHECK(def.info.source == XRT_SCREEN_INFO_SOURCE_SYSTEM);
+	CHECK(def.info.width_m == Catch::Approx(0.300f));
+	CHECK(def.info.height_m == Catch::Approx(0.190f));
+	CHECK(def.info.nominal_viewer_z_m == Catch::Approx(0.6f)); // the rest is the plug-in's
+
+	// The vendor's EDID-confidence screens are not touched.
+	const xrt_screen *hdmi = xrt_screen_list_find(&list, f.descs[1].monitor_id);
+	REQUIRE(hdmi != nullptr);
+	CHECK(hdmi->info.source == XRT_SCREEN_INFO_SOURCE_DERIVED);
+}
+
 TEST_CASE("empty registry: one synthesized system screen, or nothing when the system knows nothing")
 {
 	fixture f;
