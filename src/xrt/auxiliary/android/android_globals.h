@@ -234,6 +234,18 @@ bool
 android_globals_get_overlay_mode(void);
 
 /*!
+ * #1006 (client process): this IPC client joined a workspace controller's
+ * overlay on the main-process service — the controller's surface shows it — so
+ * an Activity pause must not stop its session (the same exemption the #558
+ * overlay mode has). Set once after the IPC connect.
+ */
+void
+android_globals_set_workspace_overlay_member(bool member);
+
+bool
+android_globals_get_workspace_overlay_member(void);
+
+/*!
  * True if THIS process's own package declares
  * `<meta-data android:name="com.displayxr.overlay_mode" android:value="true"/>`.
  * Read in the APP process (the OpenXR client) — e.g. oxr_session keep-alive —

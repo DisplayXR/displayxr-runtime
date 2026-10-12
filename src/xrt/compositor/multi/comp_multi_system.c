@@ -5477,6 +5477,14 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (!should_show && !msc->shared_surface_initialized) {
 		return; // nothing to show yet, never initialized
 	}
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+	// Android overlay (#1006): the target wraps the controller's surface from
+	// android_globals; don't try to build it while that surface is gone (the
+	// controller is backgrounded) — the convergence pass tracks validity.
+	if (!msc->shared_surface_initialized && msc->android_window_valid_state != 1) {
+		return;
+	}
+#endif
 	if (!shared_surface_init(msc, vk)) {
 		return;
 	}
@@ -5609,7 +5617,24 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		return;
 	}
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
-		U_LOG_W("[#59] shared acquire %s, skipping frame", vk_result_string(ret));
+		// Edge-logged, not per frame: a surface that is gone stays gone for
+		// as long as the controller is backgrounded (#1006 device test).
+		static VkResult last_skip = VK_SUCCESS;
+		if (ret != last_skip) {
+			U_LOG_W("[#59] shared acquire %s, skipping frames until it changes", vk_result_string(ret));
+			last_skip = ret;
+		}
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+		// Android overlay (#1006): the controller's surface is reborn on every
+		// background/resume, and the swapchain target asks its caller to
+		// rebuild (OUT_OF_DATE). The shared ring has no in-place recreate, so
+		// release the target and let the next frame rebuild it — and the
+		// framebuffers sized to it — against the surface that is live now.
+		if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+			last_skip = VK_SUCCESS;
+			shared_target_release(msc, vk);
+		}
+#endif
 		return;
 	}
 	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {

@@ -40,6 +40,8 @@ class SlotBroker(private val context: Context, private val slotCount: Int) : ISl
 
     override fun getSlotCount(): Int = slotCount
 
+    override fun isWorkspaceOverlayActive(): Boolean = WorkspaceControllerPolicy.isOverlayActive()
+
     override fun acquireSlot(
         clientPackage: String?,
         clientPid: Int,

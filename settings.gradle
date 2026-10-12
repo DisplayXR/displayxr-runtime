@@ -47,3 +47,6 @@ project(':test_apps:cube_zones_vk_android').projectDir = new File(rootDir, 'test
 
 include ':test_apps:weave_client_vk_android'
 project(':test_apps:weave_client_vk_android').projectDir = new File(rootDir, 'test_apps/weave/weave_client_vk_android')
+
+include ':test_apps:workspace_controller_android'
+project(':test_apps:workspace_controller_android').projectDir = new File(rootDir, 'test_apps/workspace/workspace_controller_android')

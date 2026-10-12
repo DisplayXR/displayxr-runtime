@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, The DisplayXR Project and its contributors
+    SPDX-License-Identifier: BSL-1.0
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- Same runtime-visibility boilerplate as cube_handle_vk_android: the
+         Khronos loader must see the runtime broker + service, and the IPC
+         client binds the runtime's CONNECT service. -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker"
+            tools:replace="android:authorities" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
+    </queries>
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="false"
+        android:label="DisplayXR Workspace Controller (test)">
+        <!--
+            #1006 / ADR-036 D4: the runtime accepts this package's CONTROLLER
+            claim only if it declares this flag AND is signed with the runtime's
+            own certificate (PackageManager.checkSignatures).
+        -->
+        <meta-data
+            android:name="com.displayxr.workspace_controller"
+            android:value="true" />
+        <!-- A controller lives in the runtime's main-process service (the
+             overlay mode composites there), so it is always an IPC client. -->
+        <meta-data
+            android:name="com.displayxr.force_ipc"
+            android:value="true" />
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+            android:launchMode="singleTask">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="workspace_controller_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
