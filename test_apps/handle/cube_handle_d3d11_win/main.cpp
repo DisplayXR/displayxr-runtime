@@ -764,6 +764,99 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
 }
 
 // Performance tracking
+// #1956 — depth swapchain smoke test (DXR_SUBMIT_DEPTH_LAYER=1, see
+// xr_session.h). One depth swapchain shaped exactly like the colour one (same
+// size and arraySize, so every view's subImage rect / array index is reused
+// verbatim), created lazily on the first rendered frame. Under IPC the D3D11
+// service allocates it as a TYPELESS NT-shared texture, so the app builds its
+// own typed DSV — the OpenXR D3D11 binding contract.
+static XrSwapchain g_depthLayerSc = XR_NULL_HANDLE;
+static std::vector<XrSwapchainImageD3D11KHR> g_depthLayerImages;
+static DXGI_FORMAT g_depthLayerFormat = DXGI_FORMAT_UNKNOWN;
+static bool g_depthLayerTried = false;
+
+static bool EnsureDepthLayerSwapchain(XrSessionManager& xr) {
+    if (!g_submitDepthLayer) return false;
+    if (g_depthLayerSc != XR_NULL_HANDLE) return true;
+    if (g_depthLayerTried) return false; // one attempt; the failure was logged
+    g_depthLayerTried = true;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(xr.session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) xrEnumerateSwapchainFormats(xr.session, n, &n, formats.data());
+    const DXGI_FORMAT prefer[] = {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM};
+    for (DXGI_FORMAT want : prefer) {
+        if (std::find(formats.begin(), formats.end(), (int64_t)want) != formats.end()) {
+            g_depthLayerFormat = want;
+            break;
+        }
+    }
+    if (g_depthLayerFormat == DXGI_FORMAT_UNKNOWN) {
+        LOG_ERROR("depth layer: the runtime enumerates no depth swapchain format (%u formats) - "
+                  "not submitting depth (#1956)", n);
+        return false;
+    }
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = (int64_t)g_depthLayerFormat;
+    sci.sampleCount = 1;
+    sci.width = xr.swapchain.width;
+    sci.height = xr.swapchain.height;
+    sci.faceCount = 1;
+    sci.arraySize = xr.swapchain.arraySize > 0 ? xr.swapchain.arraySize : 1;
+    sci.mipCount = 1;
+    XrResult r = xrCreateSwapchain(xr.session, &sci, &g_depthLayerSc);
+    if (XR_FAILED(r)) {
+        LOG_ERROR("depth layer: xrCreateSwapchain(format %d, %ux%u x%u) failed: %d (#1956)",
+                  (int)g_depthLayerFormat, sci.width, sci.height, sci.arraySize, (int)r);
+        g_depthLayerSc = XR_NULL_HANDLE;
+        return false;
+    }
+    n = 0;
+    xrEnumerateSwapchainImages(g_depthLayerSc, 0, &n, nullptr);
+    g_depthLayerImages.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_depthLayerSc, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)g_depthLayerImages.data()))) {
+        LOG_ERROR("depth layer: xrEnumerateSwapchainImages failed (#1956)");
+        xrDestroySwapchain(g_depthLayerSc);
+        g_depthLayerSc = XR_NULL_HANDLE;
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC td = {};
+    g_depthLayerImages[0].texture->GetDesc(&td);
+    LOG_INFO("depth layer: swapchain created, format %d -> texture format %d (%ux%u x%u, %u image(s)) (#1956)",
+             (int)g_depthLayerFormat, (int)td.Format, td.Width, td.Height, td.ArraySize, n);
+    return true;
+}
+
+//! A typed DSV over one array slice (or the whole image when it has one).
+static ID3D11DepthStencilView* MakeDepthLayerDSV(ID3D11Device* dev, ID3D11Texture2D* tex, uint32_t slice) {
+    D3D11_TEXTURE2D_DESC td = {};
+    tex->GetDesc(&td);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd = {};
+    dd.Format = g_depthLayerFormat; // typed: the image may be TYPELESS
+    if (td.ArraySize > 1) {
+        dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dd.Texture2DArray.FirstArraySlice = slice;
+        dd.Texture2DArray.ArraySize = 1;
+    } else {
+        dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    }
+    ID3D11DepthStencilView* dsv = nullptr;
+    if (FAILED(dev->CreateDepthStencilView(tex, &dd, &dsv))) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_ERROR("depth layer: CreateDepthStencilView(format %d, texture format %d) failed (#1956)",
+                      (int)g_depthLayerFormat, (int)td.Format);
+        }
+        return nullptr;
+    }
+    return dsv;
+}
+
 struct PerformanceStats {
     std::chrono::high_resolution_clock::time_point lastTime;
     float deltaTime = 0.0f;
@@ -1322,6 +1415,10 @@ static void RenderOneFrame(RenderState& rs) {
                     eyeCount = (int)locatedCount;
                 std::vector<XrCompositionLayerProjectionView> projectionViews(
                     locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                // #1956: chained on projectionViews[i].next when the depth
+                // layer is submitted; must outlive the EndFrame below.
+                std::vector<XrCompositionLayerDepthInfoKHR> depthInfos(
+                    locatedCount, {XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR});
                 bool hudSubmitted = false;
 
                 if (frameState.shouldRender) {
@@ -1790,6 +1887,29 @@ static void RenderOneFrame(RenderState& rs) {
                     if (AcquireSwapchainImage(xr, imageIndex)) {
                         ID3D11Texture2D* swapchainTexture = (*rs.swapchainImages)[imageIndex].texture;
 
+                        // #1956: the depth swapchain image this frame renders
+                        // into instead of the private depth buffer, when the
+                        // depth layer is submitted.
+                        bool depthAcquired = false;
+                        ID3D11Texture2D* depthLayerTex = nullptr;
+                        if (EnsureDepthLayerSwapchain(xr)) {
+                            uint32_t di = 0;
+                            XrSwapchainImageAcquireInfo dai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                            XrSwapchainImageWaitInfo dwi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                            dwi.timeout = XR_INFINITE_DURATION;
+                            if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_depthLayerSc, &dai, &di)) &&
+                                XR_SUCCEEDED(xrWaitSwapchainImage(g_depthLayerSc, &dwi))) {
+                                depthAcquired = true;
+                                depthLayerTex = g_depthLayerImages[di].texture;
+                            }
+                        }
+                        ID3D11DepthStencilView* frameDSV = rs.depthDSV.Get();
+                        ID3D11DepthStencilView* layerDSV = nullptr; // tiled: whole image
+                        if (depthAcquired) {
+                            layerDSV = MakeDepthLayerDSV(renderer.device.Get(), depthLayerTex, 0);
+                            if (layerDSV != nullptr) frameDSV = layerDSV;
+                        }
+
                         // Transparent mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
                         // RGBA(0,0,0,0) so the Leia DP's compose-under-bg pass
                         // shows the desktop wherever the cube didn't draw.
@@ -1812,7 +1932,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
                             ClearRenderTargetViewDisplayReferred(renderer, rtv, clearColor);
                         }
-                        renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
+                        renderer.context->ClearDepthStencilView(frameDSV,
                             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
                         // Dynamic render dims based on window size, clamped to swapchain capacity
@@ -1885,6 +2005,12 @@ static void RenderOneFrame(RenderState& rs) {
                             // draw into this view's tile of the shared RTV.
                             ID3D11RenderTargetView* viewRtv = rtv;
                             ID3D11RenderTargetView* sliceRtv = nullptr;
+                            ID3D11DepthStencilView* eyeDSV = frameDSV;
+                            ID3D11DepthStencilView* sliceDSV = nullptr; // #1956 array depth slice
+                            if (arrayLayout && layerDSV != nullptr) {
+                                sliceDSV = MakeDepthLayerDSV(renderer.device.Get(), depthLayerTex, (uint32_t)eye);
+                                if (sliceDSV != nullptr) eyeDSV = sliceDSV;
+                            }
                             if (arrayLayout) {
                                 D3D11_RENDER_TARGET_VIEW_DESC rd = {};
                                 rd.Format = static_cast<DXGI_FORMAT>(xr.swapchain.format);
@@ -1905,7 +2031,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 // through (the #613 gotcha). TILED views don't need
                                 // this: their tile viewports occupy disjoint depth
                                 // regions, cleared once before the loop.
-                                renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
+                                renderer.context->ClearDepthStencilView(eyeDSV,
                                     D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
                                 viewRtv = sliceRtv;
                             }
@@ -1939,7 +2065,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 projMatrix = xr.projMatrices[vi];
                             }
 
-                            RenderScene(renderer, viewRtv, rs.depthDSV.Get(),
+                            RenderScene(renderer, viewRtv, eyeDSV,
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
                                 useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
@@ -1967,7 +2093,7 @@ static void RenderOneFrame(RenderState& rs) {
                                     XMMATRIX wvp = world * viewMatrix * zoomM * projMatrix;
                                     XMFLOAT4X4 wvpOut;
                                     XMStoreFloat4x4(&wvpOut, wvp);
-                                    RenderCubeWithMVP(renderer, viewRtv, rs.depthDSV.Get(),
+                                    RenderCubeWithMVP(renderer, viewRtv, eyeDSV,
                                                       &wvpOut.m[0][0]);
                                 }
                             }
@@ -2001,7 +2127,7 @@ static void RenderOneFrame(RenderState& rs) {
                                         XMMATRIX wvp = world * viewMatrix * zoomM * projMatrix;
                                         XMFLOAT4X4 wvpOut;
                                         XMStoreFloat4x4(&wvpOut, wvp);
-                                        RenderCubeWithMVP(renderer, viewRtv, rs.depthDSV.Get(),
+                                        RenderCubeWithMVP(renderer, viewRtv, eyeDSV,
                                                           &wvpOut.m[0][0]);
                                     }
                                 }
@@ -2034,6 +2160,21 @@ static void RenderOneFrame(RenderState& rs) {
                                 stereoViews[monoMode ? 0 : eye].fov :
                                 (monoMode ? monoFov : rawViews[safeIdx].fov);
 
+                            // #1956: the depth this view was rendered into — same
+                            // rect + array index as its colour subimage.
+                            if (layerDSV != nullptr) {
+                                depthInfos[eye].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
+                                depthInfos[eye].next = nullptr;
+                                depthInfos[eye].subImage = projectionViews[eye].subImage;
+                                depthInfos[eye].subImage.swapchain = g_depthLayerSc;
+                                depthInfos[eye].minDepth = 0.0f;
+                                depthInfos[eye].maxDepth = 1.0f;
+                                depthInfos[eye].nearZ = 0.01f; // the cube's clip planes (see above)
+                                depthInfos[eye].farZ = 100.0f;
+                                projectionViews[eye].next = &depthInfos[eye];
+                            }
+
+                            if (sliceDSV) sliceDSV->Release();
                             if (sliceRtv) sliceRtv->Release();
                         }
 
@@ -2043,6 +2184,13 @@ static void RenderOneFrame(RenderState& rs) {
                         // without rendering it.
                         DxrAliasInactiveViews(projectionViews.data(), rawViews,
                                               locatedCount, (uint32_t)eyeCount);
+                        // #1956: depth is all-or-nothing per layer, so the
+                        // aliased tail carries view 0's depth like its colour.
+                        if (layerDSV != nullptr && eyeCount > 0) {
+                            for (uint32_t i = (uint32_t)eyeCount; i < locatedCount; i++) {
+                                projectionViews[i].next = &depthInfos[0];
+                            }
+                        }
 
                         if (rtv) rtv->Release();
 
@@ -2055,6 +2203,11 @@ static void RenderOneFrame(RenderState& rs) {
                         }
 
                         ReleaseSwapchainImage(xr);
+                        if (layerDSV) layerDSV->Release();
+                        if (depthAcquired) {
+                            XrSwapchainImageReleaseInfo dri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                            xrReleaseSwapchainImage(g_depthLayerSc, &dri);
+                        }
                     }
                 }
             }

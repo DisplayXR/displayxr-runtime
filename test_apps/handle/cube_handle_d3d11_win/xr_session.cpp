@@ -17,6 +17,7 @@ bool g_hasCursorDepthExt = false;      // XR_DXR_cursor_depth (ADR-046)
 uint32_t g_cursorDepthSpecVersion = 0;
 bool g_hasHandTrackingExt = false;
 bool g_hasViewsChangeExt = false; // #1488
+bool g_submitDepthLayer = false;  // #1956: DXR_SUBMIT_DEPTH_LAYER=1 + XR_KHR_composition_layer_depth
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
@@ -122,6 +123,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
             g_hasHandTrackingExt = true;
         }
+        if (strcmp(ext.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
+            // #1956 smoke: only when asked for — submitting depth is opt-in.
+            const char* sd = getenv("DXR_SUBMIT_DEPTH_LAYER");
+            g_submitDepthLayer = (sd != nullptr && strcmp(sd, "1") == 0);
+        }
         if (strcmp(ext.extensionName,
                    XR_EXT_VIEW_CONFIGURATION_VIEWS_CHANGE_EXTENSION_NAME) ==
             0) {
@@ -186,6 +192,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
     if (g_hasHandTrackingExt) {
         enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
+    if (g_submitDepthLayer) {
+        enabledExtensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+    }
+    if (getenv("DXR_SUBMIT_DEPTH_LAYER") != nullptr) {
+        LOG_INFO("XR_KHR_composition_layer_depth submit (DXR_SUBMIT_DEPTH_LAYER): %s",
+                 g_submitDepthLayer ? "ENABLED" : "requested but the runtime does not advertise the extension");
     }
     if (g_hasViewsChangeExt) {
         // #1488 reference consumer. Enabling this opts the app into LIVE
