@@ -235,6 +235,16 @@ endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
+# #2005 -- the XR_DXR_lift v3 startup sequence (properties -> stream ->
+# submit -> first result, IPC session and ADR-049 lift-only link), pinned
+# before ADR-053 re-points the handlers. Needs the generated IPC client header
+# and the lift entry points (not built on Android).
+if(XRT_FEATURE_OPENXR
+   AND TARGET ipc_client
+   AND NOT ANDROID
+	)
+	list(APPEND tests tests_oxr_lift_startup)
+endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
 	# oxr_views_change.c straight into the unit and injects now_ns, so the
@@ -1033,6 +1043,33 @@ target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/com
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+if(TARGET tests_oxr_lift_startup)
+	# The REAL entry points (oxr_lift.c) and client (ipc_client_lift.c), plus
+	# the handle and logger code they verify with, compiled straight in; the
+	# wire calls, the lift link and the session bridge under them are faked in
+	# tests_oxr_lift_startup_fake.c. Deliberately NOT linked: st_oxr, ipc_client
+	# and ipc_shared, whose real definitions of those seams would collide with
+	# the fakes. ipc_client is a build dependency only, for its generated
+	# headers.
+	target_sources(
+		tests_oxr_lift_startup
+		PRIVATE tests_oxr_lift_startup_fake.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_lift.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_handle_base.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_logger.c
+			${PROJECT_SOURCE_DIR}/src/xrt/ipc/client/ipc_client_lift.c
+		)
+	target_include_directories(
+		tests_oxr_lift_startup
+		PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+			$<TARGET_PROPERTY:ipc_client,INTERFACE_INCLUDE_DIRECTORIES>
+		)
+	target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-interfaces xrt-external-openxr aux_os)
+	if(XRT_FEATURE_RENDERDOC)
+		target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-external-renderdoc)
+	endif()
+	add_dependencies(tests_oxr_lift_startup ipc_client ipc_shared)
 endif()
 
 # ADR-042: the sim_display FAKE lift's splat PLY is pinned host-side next to the
