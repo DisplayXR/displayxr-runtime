@@ -708,6 +708,67 @@ struct xrt_display_processor_vk
 	 * @param strength  [0,1], or negative for the DP's default.
 	 */
 	void (*set_overlay_2d_filter_strength)(struct xrt_display_processor_vk *xdp, float strength);
+
+	/*!
+	 * GPU synchronisation for the NEXT @ref xrt_display_processor::process_atlas
+	 * only (XR_DXR_weave v20, Android sync_file weave) — how a SELF-SUBMITTING
+	 * DP (one whose process_atlas submits its own work to a queue instead of
+	 * recording into the given command buffer, e.g. the Leia CNSDK weaver) joins
+	 * the runtime's semaphore chain instead of forcing the runtime to wait for it
+	 * on the CPU.
+	 *
+	 * Without this slot the runtime cannot hand a self-submitting DP a wait or a
+	 * signal, so it has to (a) finish its own pre-weave GPU work before the DP's
+	 * first submit can be trusted to see it, and (b) `vkWaitForFences` the whole
+	 * frame before it can tell anyone the woven target is complete. Both turn a
+	 * pipelined GPU frame into a CPU-serialised one.
+	 *
+	 * ## Contract
+	 *
+	 * - **Per call.** Called immediately before process_atlas (after
+	 *   set_target_color_view / set_overlay_2d), and applies to THAT process_atlas
+	 *   only; a process_atlas not preceded by a call carries no semaphores. The DP
+	 *   consumes and clears the pair inside process_atlas.
+	 * - **true** = the DP commits, for that process_atlas, to WAIT @p wait_sem
+	 *   before its first read of the atlas (or of any other runtime-provided
+	 *   image, e.g. the set_overlay_2d layer) and to SIGNAL @p signal_sem after
+	 *   its last write of the target, both on the GPU (in the vkQueueSubmit(s)
+	 *   it issues). Either handle may be VK_NULL_HANDLE, meaning "nothing to
+	 *   wait" / "nothing to signal".
+	 * - **false** (or an absent slot / NULL pointer) = the DP does not take
+	 *   them; the runtime keeps its own CPU waits for that frame. A DP that
+	 *   records into the command buffer (sim_display) has no use for the slot.
+	 * - **Values.** @p wait_value / @p signal_value 0 = BINARY semaphores (the
+	 *   only form used today: each is waited / signalled exactly once per call).
+	 *   Non-zero is reserved for timeline semaphores; a DP that does not support
+	 *   timelines returns false for a non-zero value.
+	 * - **Drops.** A DP that returned true MUST wait @p wait_sem and signal
+	 *   @p signal_sem even when the frame is dropped (an early return, a failed
+	 *   vendor submit — LeiaInc/CNSDK#734: a failed vkQueueSubmit never
+	 *   signals), e.g. with an empty submit that only waits + signals. The runtime
+	 *   nevertheless treats @ref get_last_frame_dropped == true as "signal not
+	 *   guaranteed": for that frame it does not wait @p signal_sem on the GPU,
+	 *   falls back to a CPU wait (queue idle), recreates both semaphores, and
+	 *   reports no release fence to its caller.
+	 * - Queue: the DP may signal on any queue of the runtime's VkDevice; the
+	 *   runtime only waits the semaphore, it assumes nothing about the queue.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ false.
+	 * Appended after @ref set_overlay_2d_filter_strength per ADR-020
+	 * (append-only within a major; no version bump).
+	 *
+	 * @param xdp           Pointer to self.
+	 * @param wait_sem      Semaphore to wait before the first atlas read, or VK_NULL_HANDLE.
+	 * @param wait_value    0 = binary; non-zero reserved (timeline).
+	 * @param signal_sem    Semaphore to signal after the final target write, or VK_NULL_HANDLE.
+	 * @param signal_value  0 = binary; non-zero reserved (timeline).
+	 * @return true when the DP takes both semaphores for the next process_atlas.
+	 */
+	bool (*set_weave_sync)(struct xrt_display_processor_vk *xdp,
+	                       VkSemaphore_XDP wait_sem,
+	                       uint64_t wait_value,
+	                       VkSemaphore_XDP signal_sem,
+	                       uint64_t signal_value);
 };
 
 /*!
@@ -820,7 +881,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)   
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_active)   == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d)            == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_weave_sync)            == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -862,6 +924,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * (XR_DXR_weave v15). Purely additive (ADR-020).
  */
 #define XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_weave_sync slot (XR_DXR_weave v20, the Android
+ * sync_file weave), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_WEAVE_SYNC 1
 // clang-format on
 
 /*!
@@ -1374,6 +1444,33 @@ xrt_display_processor_vk_set_overlay_2d_filter_strength(struct xrt_display_proce
 		return;
 	}
 	xdp->set_overlay_2d_filter_strength(xdp, strength);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_weave_sync
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the runtime then keeps its CPU waits for
+ * that frame. Like the wrappers above, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_weave_sync(struct xrt_display_processor_vk *xdp,
+                                        VkSemaphore_XDP wait_sem,
+                                        uint64_t wait_value,
+                                        VkSemaphore_XDP signal_sem,
+                                        uint64_t signal_value)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_weave_sync + sizeof(xdp->set_weave_sync);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_weave_sync == NULL) {
+		return false;
+	}
+	return xdp->set_weave_sync(xdp, wait_sem, wait_value, signal_sem, signal_value);
 }
 
 #ifdef __cplusplus

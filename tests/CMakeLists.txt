@@ -68,6 +68,7 @@ set(tests
     tests_comp_segments
     tests_comp_lazy_transparency
     tests_comp_overlay_2d_vk
+    tests_dp_vk_weave_sync
     tests_oxr_weave_latch
     tests_oxr_layer_space
     tests_oxr_view_config_rule

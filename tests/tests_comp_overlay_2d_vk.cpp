@@ -89,7 +89,8 @@ TEST_CASE("overlay_2d_vk: both slots are appended after set_transparency_active"
 	const size_t base = sizeof(struct xrt_display_processor);
 	CHECK(offsetof(struct xrt_display_processor_vk, set_overlay_2d) == base + 15 * sizeof(void *));
 	CHECK(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == base + 16 * sizeof(void *));
-	CHECK(sizeof(struct xrt_display_processor_vk) == base + 17 * sizeof(void *));
+	// Later slots append after these (set_weave_sync, tests_dp_vk_weave_sync.cpp).
+	CHECK(sizeof(struct xrt_display_processor_vk) >= base + 17 * sizeof(void *));
 }
 
 TEST_CASE("overlay_2d_vk: an older plug-in is unsupported and never called")
