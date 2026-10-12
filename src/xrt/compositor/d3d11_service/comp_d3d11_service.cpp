@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_service.h"
 #include "comp_eye_dp_policy.h"
+#include "comp_d3d11_service_formats.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
@@ -8442,51 +8443,6 @@ compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
-/*!
- * Convert XRT format to DXGI format.
- */
-static DXGI_FORMAT
-xrt_format_to_dxgi(int64_t format)
-{
-	// Check if this is already a DXGI format (common D3D11 formats are < 130)
-	switch (format) {
-	// Pass through DXGI formats directly
-	case DXGI_FORMAT_R8G8B8A8_UNORM:        // 28
-	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   // 29
-	case DXGI_FORMAT_B8G8R8A8_UNORM:        // 87
-	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   // 91
-	case DXGI_FORMAT_R16G16B16A16_FLOAT:    // 10
-	case DXGI_FORMAT_R16G16B16A16_UNORM:    // 11
-	case DXGI_FORMAT_D24_UNORM_S8_UINT:     // 45
-	case DXGI_FORMAT_D32_FLOAT:             // 40
-	case DXGI_FORMAT_D16_UNORM:             // 55
-	case DXGI_FORMAT_R10G10B10A2_UNORM:     // 24
-		return static_cast<DXGI_FORMAT>(format);
-
-	// Convert VK_FORMAT values to DXGI (for Vulkan compositor interop)
-	case 37: // VK_FORMAT_R8G8B8A8_UNORM
-		return DXGI_FORMAT_R8G8B8A8_UNORM;
-	case 43: // VK_FORMAT_R8G8B8A8_SRGB
-		return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	case 44: // VK_FORMAT_B8G8R8A8_UNORM
-		return DXGI_FORMAT_B8G8R8A8_UNORM;
-	case 50: // VK_FORMAT_B8G8R8A8_SRGB
-		return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-	case 64: // VK_FORMAT_A2B10G10R10_UNORM_PACK32
-		return DXGI_FORMAT_R10G10B10A2_UNORM;
-	case 97: // VK_FORMAT_R16G16B16A16_SFLOAT
-		return DXGI_FORMAT_R16G16B16A16_FLOAT;
-	case 129: // VK_FORMAT_D24_UNORM_S8_UINT
-		return DXGI_FORMAT_D24_UNORM_S8_UINT;
-	case 130: // VK_FORMAT_D32_SFLOAT
-		return DXGI_FORMAT_D32_FLOAT;
-
-	default:
-		U_LOG_W("Unknown format %ld, using RGBA8", format);
-		return DXGI_FORMAT_R8G8B8A8_UNORM;
-	}
-}
-
 static xrt_result_t
 compositor_create_swapchain(struct xrt_compositor *xc,
                              const struct xrt_swapchain_create_info *info,
@@ -8537,36 +8493,24 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	sc->info = *info;
 	sc->service_created = true; // Created by service for client
 
-	// Convert format
-	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
+	// Convert format. The wire format is a VkFormat (#1956): see
+	// comp_d3d11_service_formats.h for why an unknown value now FAILS the
+	// create instead of silently allocating RGBA8.
+	DXGI_FORMAT dxgi_format = d3d11_service_wire_format_to_dxgi(info->format);
+	if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
+		U_LOG_E("create_swapchain: unsupported wire format %lld", (long long)info->format);
+		swapchain_destroy(&sc->base.base);
+		return XRT_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+	}
+	// #1956: a depth image is TYPELESS storage + a typed SRV, like the
+	// in-process D3D11/D3D12 compositors; colour is unchanged (typed texture,
+	// same-format SRV).
+	const struct d3d11_service_image_formats img_fmt = d3d11_service_image_formats_for(dxgi_format);
 
-	// Determine bind flags
-	UINT bind_flags = D3D11_BIND_SHADER_RESOURCE; // Always need SRV for compositor
-	if (info->bits & XRT_SWAPCHAIN_USAGE_COLOR) {
-		bind_flags |= D3D11_BIND_RENDER_TARGET;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) {
-		bind_flags |= D3D11_BIND_DEPTH_STENCIL;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_UNORDERED_ACCESS) {
-		bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
-	}
-
-	// Create texture descriptor with SHARED_KEYEDMUTEX for cross-process sharing
-	D3D11_TEXTURE2D_DESC tex_desc = {};
-	tex_desc.Width = info->width;
-	tex_desc.Height = info->height;
-	tex_desc.MipLevels = info->mip_count > 0 ? info->mip_count : 1;
-	tex_desc.ArraySize = info->array_size > 0 ? info->array_size : 1;
-	tex_desc.Format = dxgi_format;
-	tex_desc.SampleDesc.Count = info->sample_count > 0 ? info->sample_count : 1;
-	tex_desc.SampleDesc.Quality = 0;
-	tex_desc.Usage = D3D11_USAGE_DEFAULT;
-	tex_desc.BindFlags = bind_flags;
-	tex_desc.CPUAccessFlags = 0;
-	// SHARED_KEYEDMUTEX enables cross-process sharing with synchronization
-	// SHARED_NTHANDLE creates real kernel handles that can be DuplicateHandle'd to Chrome
-	tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	// Texture descriptor: NT-handle shared + SHARED_KEYEDMUTEX for
+	// cross-process sharing; NT handles can be DuplicateHandle'd to Chrome.
+	D3D11_TEXTURE2D_DESC tex_desc = d3d11_service_shared_texture_desc(
+	    info->width, info->height, info->mip_count, info->array_size, info->sample_count, dxgi_format, info->bits);
 
 	// Create textures and get shared handles
 	for (uint32_t i = 0; i < image_count; i++) {
@@ -8626,7 +8570,8 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		// Calculate texture memory size for cross-API import validation (VK needs this).
 		// VK's vkGetImageMemoryRequirements adds row pitch and page alignment padding,
 		// so we round up to 1MB to ensure our reported size >= VK's requirements.
-		uint32_t bpp = dxgi_format_bytes_per_pixel(tex_desc.Format);
+		// Typed format: a TYPELESS depth family is not in the bpp table (#1956).
+		uint32_t bpp = dxgi_format_bytes_per_pixel(dxgi_format);
 		uint64_t raw_size = (uint64_t)tex_desc.Width * tex_desc.Height * bpp * tex_desc.ArraySize;
 		sc->base.images[i].size = (raw_size + 0xFFFFF) & ~(uint64_t)0xFFFFF;
 		sc->base.images[i].use_dedicated_allocation = false;
@@ -8641,7 +8586,7 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		// slice 0, so create a whole-array Texture2DArray SRV instead (the
 		// blit reads the requested slice via blit_ps_array).
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = dxgi_format;
+		srv_desc.Format = img_fmt.srv;
 		if (tex_desc.ArraySize > 1) {
 			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
 			srv_desc.Texture2DArray.MostDetailedMip = 0;
@@ -30270,6 +30215,22 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM);
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_R16G16B16A16_FLOAT);
+	// #1956: depth formats, AFTER colour (first-format pickers keep colour),
+	// and only those this device can actually allocate as an NT-handle-shared
+	// typeless depth image — otherwise an app would enumerate a format that
+	// xrCreateSwapchain then fails. XR_KHR_composition_layer_depth needs these
+	// over IPC exactly as it does in-process.
+	for (size_t i = 0; i < D3D11_SERVICE_DEPTH_FORMAT_COUNT; i++) {
+		const DXGI_FORMAT df = d3d11_service_depth_formats[i];
+		if (d3d11_service_depth_format_shareable(sys->device.get(), df)) {
+			c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(df);
+		} else {
+			U_LOG_W(
+			    "D3D11 service compositor: depth format DXGI %u cannot be shared cross-process on "
+			    "this device - not advertised (#1956)",
+			    (unsigned)df);
+		}
+	}
 	c->base.base.info.format_count = format_count;
 
 	// Log the formats being reported

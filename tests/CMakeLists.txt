@@ -168,6 +168,11 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# part of the sphere, and does a layer stay inside its angular extent.
 	# WARP, same as above; SKIPs if no D3D11 device exists at all.
 	list(APPEND tests tests_comp_layer_equirect2_warp)
+	# #1956 — the D3D11 service's swapchain format policy (VkFormat wire map,
+	# typeless depth, bind flags, advertised depth set) plus a WARP check that a
+	# depth image created the production way shares across devices (NT handle,
+	# keyed mutex, D3D11 + D3D12 open). SKIPs if no WARP device exists.
+	list(APPEND tests tests_comp_d3d11_service_formats)
 endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
@@ -894,6 +899,18 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		tests_comp_layer_equirect2_warp PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_layer_equirect2_warp PRIVATE d3dcompiler d3d11)
+
+	# #1956 — header-only policy from the service directory; aux_d3d for
+	# d3d_dxgi_formats.h (+ its Vulkan format constants), xrt-interfaces for the
+	# swapchain usage bits.
+	target_include_directories(
+		tests_comp_d3d11_service_formats PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+		)
+	target_link_libraries(tests_comp_d3d11_service_formats PRIVATE aux_d3d xrt-interfaces d3d11 dxgi)
+	if(XRT_HAVE_D3D12)
+		target_compile_definitions(tests_comp_d3d11_service_formats PRIVATE DXR_TEST_HAVE_D3D12)
+		target_link_libraries(tests_comp_d3d11_service_formats PRIVATE d3d12)
+	endif()
 endif()
 
 if(XRT_HAVE_D3D12)
