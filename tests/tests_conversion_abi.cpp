@@ -350,6 +350,25 @@ TEST_CASE("conversion ABI: top-level structs start with struct_size, no hidden p
 	STATIC_REQUIRE(offsetof(struct xrt_conv_capability, device_luid) == 336);
 	STATIC_REQUIRE(offsetof(struct xrt_conv_state, eta_ns) == 24);
 	STATIC_REQUIRE(offsetof(struct xrt_conv_params, stereo) == 184);
+
+	// The out-structs that embed frozen structs carry explicit padding.
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, written) == 4);
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, splat_info) == 8);
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, depth_info) == 80);
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, views_info) == 208);
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, reserved_pad) == 332);
+	STATIC_REQUIRE(sizeof(struct xrt_conv_job_out) == 336);
+	if (sizeof(void *) == 8) {
+		CHECK(offsetof(struct xrt_conv_frame_out, written) == 4);
+		CHECK(offsetof(struct xrt_conv_frame_out, views) == 8);
+		CHECK(offsetof(struct xrt_conv_frame_out, depth) == 136);
+		CHECK(offsetof(struct xrt_conv_frame_out, confidence) == 264);
+		CHECK(offsetof(struct xrt_conv_frame_out, disparity) == 392);
+		CHECK(offsetof(struct xrt_conv_frame_out, views_info) == 520);
+		CHECK(offsetof(struct xrt_conv_frame_out, reserved_pad) == 644);
+		CHECK(offsetof(struct xrt_conv_frame_out, depth_info) == 648);
+		CHECK(sizeof(struct xrt_conv_frame_out) == 776);
+	}
 }
 
 TEST_CASE("conversion ABI: iface slot order", "[conversion_abi]")
