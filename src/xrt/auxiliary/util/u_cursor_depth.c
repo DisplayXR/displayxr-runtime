@@ -1640,8 +1640,13 @@ u_cursor_measure_target_px(const struct u_cursor_depth_tuning *t,
 	if (!confident || !(px_per_baseline > 0.0f) || !isfinite(px_per_baseline) || !isfinite(measured_px)) {
 		return 0.0f;
 	}
+	const float d = measured_px / px_per_baseline;
+	// Matcher noise on content that sits on the glass is not content in front of it.
+	if (d > -U_CURSOR_MEASURE_DEADBAND) {
+		return 0.0f;
+	}
 	// measured < 0 ? max(measured - margin_px, cap_px) : 0 - A.1 in pixels.
-	return u_cursor_depth_target(t, true, measured_px / px_per_baseline) * px_per_baseline;
+	return u_cursor_depth_target(t, true, d) * px_per_baseline;
 }
 
 

@@ -977,6 +977,11 @@ nothing need the runtime to measure it.
 
    `margin_px` is A.2's 0.015 eye baselines converted with the panel's pixel pitch, the same
    conversion the web stereo-tile cursor uses. Nothing ever goes behind the glass.
+
+   *Deadband (2026-10-12):* a confident match within 0.005 baselines of the glass (the draw
+   threshold) counts as on the glass. The media player found that without it, matcher noise
+   over on-glass texture (about −0.0001 baselines) went through the margin to −0.0151 and
+   lifted the cursor about 5 px where the OS cursor belonged.
 3. **Low confidence ⇒ the screen plane.** A match is used only if it passes all three checks:
    - a distinct best match (best-to-second-best cost ratio);
    - left-right consistency (L→R and R→L agree within 1 px);
