@@ -15,7 +15,9 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -1697,5 +1699,674 @@ TEST_CASE("cursor_draw: refusal report - the last word of the commit wins; no li
 	// Every reason has a name.
 	for (int r = 0; r < U_CURSOR_DRAW_REFUSAL_COUNT; r++) {
 		CHECK(strcmp(u_cursor_draw_refusal_name((u_cursor_draw_refusal)r), "unknown") != 0);
+	}
+}
+
+
+/*
+ *
+ * Spec v7: measured disparity (ADR-046 Amendment 3).
+ *
+ * Synthetic stereo pairs: layers (back to front) of value noise, a flat
+ * gradient ("sky") or vertical stripes, each at a disparity D in SOURCE px
+ * (x_A - x_B, > 0 crossed, the web's sign): view A shows a layer's texture
+ * at x - D/2, view B at x + D/2. The measurement must report x_B - x_A.
+ *
+ */
+
+namespace {
+
+enum class Tex
+{
+	Noise,
+	Sky,
+	Stripes
+};
+
+struct Layer
+{
+	Tex tex;
+	float d;              // disparity, source px, > 0 crossed
+	float x0, y0, x1, y1; // cyclopean rect, source px
+	uint32_t seed;
+	float period = 8.0f; // stripes
+};
+
+float
+hash01(int32_t x, int32_t y, uint32_t seed)
+{
+	uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + seed * 2246822519u;
+	h = (h ^ (h >> 13)) * 1274126177u;
+	h ^= h >> 16;
+	return (float)(h & 0xffffu) / 65535.0f;
+}
+
+// Smooth value noise on a 3 px lattice: texture at a few-px scale, continuous
+// in x so fractional disparities are exact.
+float
+noise(float x, float y, uint32_t seed)
+{
+	const float s = 3.0f;
+	const float fx = x / s, fy = y / s;
+	const int32_t ix = (int32_t)std::floor(fx), iy = (int32_t)std::floor(fy);
+	float tx = fx - (float)ix, ty = fy - (float)iy;
+	tx = tx * tx * (3 - 2 * tx);
+	ty = ty * ty * (3 - 2 * ty);
+	const float a = hash01(ix, iy, seed), b = hash01(ix + 1, iy, seed);
+	const float c = hash01(ix, iy + 1, seed), d = hash01(ix + 1, iy + 1, seed);
+	const float top = a + (b - a) * tx;
+	const float bottom = c + (d - c) * tx;
+	return top + (bottom - top) * ty;
+}
+
+struct Scene
+{
+	std::vector<Layer> layers; // back to front
+
+	// Luma 0..255 of view A (sign +1) or B (sign -1) at source px (x, y).
+	float
+	at(int sign, float x, float y) const
+	{
+		float v = 128.0f;
+		for (const Layer &l : layers) {
+			const float xc = x - (float)sign * l.d * 0.5f;
+			const float yc = y - (float)sign * vertical * 0.5f; // an unrectified pair
+			if (xc < l.x0 || xc >= l.x1 || yc < l.y0 || yc >= l.y1) {
+				continue;
+			}
+			switch (l.tex) {
+			case Tex::Noise: v = 40.0f + 180.0f * noise(xc, yc, l.seed); break;
+			case Tex::Sky: v = 150.0f + 40.0f * (yc - l.y0) / (l.y1 - l.y0); break;
+			case Tex::Stripes: v = 128.0f + 90.0f * std::sin(2.0f * 3.14159265f * xc / l.period); break;
+			}
+		}
+		return v;
+	}
+
+	//! Vertical misalignment between the views, source px (y_A - y_B).
+	float vertical = 0.0f;
+};
+
+struct Measured
+{
+	bool planned = false;
+	u_cursor_measure_plan plan{};
+	u_cursor_measure_result res{};
+};
+
+uint16_t
+to_half(float f)
+{
+	// Positive normal values only (luma / 255): enough for 8-bit steps.
+	if (!(f > 0.0f)) {
+		return 0;
+	}
+	int e = 0;
+	const float mant = std::frexp(f, &e); // f = mant * 2^e, mant in [0.5, 1)
+	const uint32_t he = (uint32_t)(e - 1 + 15);
+	const uint32_t hm = (uint32_t)std::lround((mant * 2.0f - 1.0f) * 1024.0f);
+	return (uint16_t)((he << 10) + hm);
+}
+
+// Copy the plan's rect out of both views of a sub_w x sub_h sub-image in
+// `fmt` (storage order: bottom-up rows if asked), then run the matcher.
+Measured
+measure(const Scene &sc,
+        int32_t sub_w,
+        int32_t sub_h,
+        float u,
+        float v,
+        float height = 0.03f,
+        u_cursor_measure_format fmt = U_CURSOR_MEASURE_FORMAT_RGBA8,
+        bool bottom_up = false,
+        u_cursor_measure_cache *cache = nullptr)
+{
+	Measured m;
+	u_cursor_measure_request req{};
+	req.requested = true;
+	req.tag = 7;
+	req.u = u;
+	req.v = v;
+	req.height = height;
+	req.view_index[0] = 0;
+	req.view_index[1] = 1;
+	m.planned = u_cursor_measure_make_plan(&req, sub_w, sub_h, bottom_up, &m.plan);
+	if (!m.planned) {
+		return m;
+	}
+	const u_cursor_measure_plan &p = m.plan;
+	const uint32_t bpp = u_cursor_measure_format_bytes(fmt);
+	const uint32_t pitch = (uint32_t)p.w * bpp + 12; // padded rows, like a real readback
+	std::vector<uint8_t> buf[2];
+	for (int view = 0; view < 2; view++) {
+		buf[view].assign((size_t)pitch * p.h, 0);
+		for (int32_t r = 0; r < p.h; r++) {
+			const int32_t storage_row = p.y + r;
+			const int32_t top_down_row = bottom_up ? sub_h - 1 - storage_row : storage_row;
+			for (int32_t c = 0; c < p.w; c++) {
+				const float l = sc.at(view == 0 ? +1 : -1, (float)(p.x + c) + 0.5f, (float)top_down_row + 0.5f);
+				const uint8_t g = (uint8_t)std::lround(std::fmin(255.0f, std::fmax(0.0f, l)));
+				uint8_t *t = &buf[view][(size_t)r * pitch + (size_t)c * bpp];
+				switch (fmt) {
+				case U_CURSOR_MEASURE_FORMAT_RGBA8:
+				case U_CURSOR_MEASURE_FORMAT_BGRA8: t[0] = t[1] = t[2] = g, t[3] = 255; break;
+				case U_CURSOR_MEASURE_FORMAT_RGB10A2: {
+					const uint32_t q = (uint32_t)std::lround(g * 1023.0 / 255.0);
+					const uint32_t word = q | (q << 10) | (q << 20) | (3u << 30);
+					memcpy(t, &word, 4);
+					break;
+				}
+				case U_CURSOR_MEASURE_FORMAT_RGBA16F: {
+					const uint16_t hv = to_half((float)g / 255.0f);
+					const uint16_t px[4] = {hv, hv, hv, 0x3c00};
+					memcpy(t, px, 8);
+					break;
+				}
+				default: break;
+				}
+			}
+		}
+	}
+	const u_cursor_measure_patch a{buf[0].data(), pitch, fmt};
+	const u_cursor_measure_patch b{buf[1].data(), pitch, fmt};
+	REQUIRE(u_cursor_measure_run(&req, &m.plan, &a, &b, cache, &m.res));
+	return m;
+}
+
+Scene
+textured(float d, uint32_t seed = 1)
+{
+	Scene s;
+	s.layers.push_back({Tex::Noise, d, -1e4f, -1e4f, 1e4f, 1e4f, seed});
+	return s;
+}
+
+} // namespace
+
+TEST_CASE("cursor_measure: zero request does nothing; plan stays bounded and inside the sub-image")
+{
+	u_cursor_measure_request zero{};
+	CHECK_FALSE(u_cursor_measure_should_sample(&zero));
+	u_cursor_measure_plan p{};
+	CHECK_FALSE(u_cursor_measure_make_plan(&zero, 960, 1080, false, &p));
+
+	u_cursor_measure_request req{};
+	req.requested = true;
+	req.u = 0.5f;
+	req.v = 0.5f;
+	req.height = 0.03f;
+	req.view_index[1] = 1;
+	CHECK(u_cursor_measure_should_sample(&req));
+	// Pointer off the canvas, on every side (and NaN): nothing is measured.
+	for (float uv : {-0.01f, 1.01f, NAN}) {
+		CAPTURE(uv);
+		req.u = uv;
+		CHECK_FALSE(u_cursor_measure_should_sample(&req));
+		req.u = 0.5f;
+		req.v = uv;
+		CHECK_FALSE(u_cursor_measure_should_sample(&req));
+		req.v = 0.5f;
+	}
+	// ...and a sprite with no height.
+	req.height = 0.0f;
+	CHECK_FALSE(u_cursor_measure_should_sample(&req));
+	req.height = 0.03f;
+	// A filled-in request that was not flagged as requested is not one.
+	req.requested = false;
+	CHECK_FALSE(u_cursor_measure_should_sample(&req));
+	req.requested = true;
+	req.view_index[1] = 0;
+	CHECK_FALSE(u_cursor_measure_should_sample(&req)); // one view: nothing to match
+
+	req.view_index[1] = 1;
+	for (float h : {0.01f, 0.03f, 0.2f}) {      // a huge sprite still caps the footprint
+		for (int32_t sw : {960, 1920, 3840}) {  // 1080p SBS, 4K SBS, 8K SBS
+			for (float u : {0.0f, 0.5f, 1.0f}) { // edges clamp
+				CAPTURE(h, sw, u);
+				req.u = u;
+				req.height = h;
+				REQUIRE(u_cursor_measure_make_plan(&req, sw, sw * 9 / 8, false, &p));
+				CHECK(p.work_w <= U_CURSOR_MEASURE_MAX_WORK_W);
+				CHECK(p.work_h <= U_CURSOR_MEASURE_MAX_WORK_H);
+				CHECK(p.x >= 0);
+				CHECK(p.x + p.w <= sw);
+				CHECK(p.y >= 0);
+				CHECK(p.y + p.h <= sw * 9 / 8);
+				CHECK(p.factor == (sw <= 960 ? 1 : sw <= 1920 ? 2 : 4));
+			}
+		}
+	}
+	// Bottom-up storage: the same rows, counted from the other end.
+	req.u = 0.5f;
+	req.v = 0.2f;
+	req.height = 0.03f;
+	u_cursor_measure_plan td{}, bu{};
+	REQUIRE(u_cursor_measure_make_plan(&req, 960, 1080, false, &td));
+	REQUIRE(u_cursor_measure_make_plan(&req, 960, 1080, true, &bu));
+	CHECK(bu.y == 1080 - (td.y + td.h));
+	CHECK(bu.top_y == td.top_y);
+}
+
+TEST_CASE("cursor_measure: a textured shift is found, sub-pixel, crossed < 0")
+{
+	for (float d : {0.0f, 7.0f, 12.5f, 30.0f, 60.0f, -20.0f}) {
+		CAPTURE(d);
+		const Measured m = measure(textured(d), 960, 1080, 0.5f, 0.5f);
+		REQUIRE(m.planned);
+		REQUIRE(m.res.valid);
+		REQUIRE(m.res.confident);
+		CHECK(m.res.disparity_px == Catch::Approx(-d).margin(0.35f)); // x_B - x_A
+		CHECK(m.res.sub_w == 960.0f);
+		CHECK(m.res.ncc >= U_CURSOR_MEASURE_MIN_NCC);
+	}
+	// Beyond the search range there is no confident answer.
+	const Measured beyond = measure(textured(90.0f), 960, 1080, 0.5f, 0.5f);
+	CHECK_FALSE(beyond.res.confident);
+}
+
+TEST_CASE("cursor_measure: 4K SBS (factor 2) reports SOURCE px")
+{
+	const Measured m = measure(textured(40.0f, 3), 1920, 2160, 0.4f, 0.6f);
+	REQUIRE(m.plan.factor == 2);
+	REQUIRE(m.res.confident);
+	CHECK(m.res.disparity_px == Catch::Approx(-40.0f).margin(0.8f));
+}
+
+TEST_CASE("cursor_measure: every texel format and bottom-up storage give the same answer")
+{
+	const Scene s = textured(18.0f, 5);
+	const Measured ref = measure(s, 960, 1080, 0.3f, 0.7f);
+	REQUIRE(ref.res.confident);
+	for (auto fmt : {U_CURSOR_MEASURE_FORMAT_BGRA8, U_CURSOR_MEASURE_FORMAT_RGB10A2, U_CURSOR_MEASURE_FORMAT_RGBA16F}) {
+		CAPTURE((int)fmt);
+		const Measured m = measure(s, 960, 1080, 0.3f, 0.7f, 0.03f, fmt);
+		REQUIRE(m.res.confident);
+		CHECK(m.res.disparity_px == Catch::Approx(ref.res.disparity_px).margin(0.2f));
+	}
+	const Measured bu = measure(s, 960, 1080, 0.3f, 0.7f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, true);
+	REQUIRE(bu.res.confident);
+	CHECK(bu.res.disparity_px == Catch::Approx(ref.res.disparity_px).margin(0.01f));
+}
+
+TEST_CASE("cursor_measure: a GL (bottom-up) texture is read in its own rows")
+{
+	// Foreground only in the bottom 40% of the image; the pointer is near the
+	// top. Reading the copy's rows the wrong way up lands on the foreground.
+	Scene s;
+	s.layers.push_back({Tex::Noise, -10.0f, -1e4f, -1e4f, 1e4f, 1e4f, 51});
+	s.layers.push_back({Tex::Noise, 30.0f, -1e4f, 650.0f, 1e4f, 1e4f, 52});
+	const Measured td = measure(s, 960, 1080, 0.5f, 0.2f);
+	const Measured bu = measure(s, 960, 1080, 0.5f, 0.2f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, true);
+	REQUIRE(td.res.confident);
+	REQUIRE(bu.res.confident);
+	CHECK(td.res.disparity_px == Catch::Approx(10.0f).margin(0.5f));
+	CHECK(bu.res.disparity_px == Catch::Approx(10.0f).margin(0.5f));
+}
+
+TEST_CASE("cursor_measure: BGRA channel order is honoured (red-only texture)")
+{
+	// Texture only in RED: luma std ~10 read right, ~4 (under the floor) if
+	// red were taken for blue.
+	const int32_t sub_w = 960, sub_h = 1080;
+	u_cursor_measure_request req{};
+	req.requested = true;
+	req.u = 0.5f;
+	req.v = 0.5f;
+	req.height = 0.03f;
+	req.view_index[1] = 1;
+	u_cursor_measure_plan p{};
+	REQUIRE(u_cursor_measure_make_plan(&req, sub_w, sub_h, false, &p));
+	std::vector<uint8_t> buf[2];
+	for (int view = 0; view < 2; view++) {
+		buf[view].resize((size_t)p.w * p.h * 4);
+		for (int32_t r = 0; r < p.h; r++) {
+			for (int32_t c = 0; c < p.w; c++) {
+				const float x = (float)(p.x + c) - (view == 0 ? 1.0f : -1.0f) * 6.0f; // d = 12
+				uint8_t *t = &buf[view][((size_t)r * p.w + c) * 4];
+				t[0] = 128;                                                        // B
+				t[1] = 128;                                                        // G
+				t[2] = (uint8_t)(28 + 200 * noise(x, (float)(p.y + r), 61)); // R
+				t[3] = 255;
+			}
+		}
+	}
+	const u_cursor_measure_patch a{buf[0].data(), (uint32_t)p.w * 4, U_CURSOR_MEASURE_FORMAT_BGRA8};
+	const u_cursor_measure_patch b{buf[1].data(), (uint32_t)p.w * 4, U_CURSOR_MEASURE_FORMAT_BGRA8};
+	u_cursor_measure_result res{};
+	REQUIRE(u_cursor_measure_run(&req, &p, &a, &b, nullptr, &res));
+	REQUIRE(res.confident);
+	CHECK(res.disparity_px == Catch::Approx(-12.0f).margin(0.35f));
+}
+
+TEST_CASE("cursor_measure: an unrectified pair (rows off by up to 2) still matches")
+{
+	for (float dy : {-2.0f, 1.0f, 2.0f}) {
+		CAPTURE(dy);
+		Scene s = textured(14.0f, 71);
+		s.vertical = dy;
+		const Measured m = measure(s, 960, 1080, 0.5f, 0.5f);
+		REQUIRE(m.res.confident);
+		CHECK(m.res.disparity_px == Catch::Approx(-14.0f).margin(0.35f));
+	}
+}
+
+TEST_CASE("cursor_measure: flat sky is not confident (texture floor) -> screen plane")
+{
+	Scene s;
+	s.layers.push_back({Tex::Sky, 0.0f, -1e4f, 0.0f, 1e4f, 1080.0f, 1});
+	const Measured m = measure(s, 960, 1080, 0.5f, 0.3f);
+	REQUIRE(m.res.valid);
+	CHECK_FALSE(m.res.confident);
+	CHECK(m.res.matched == 0);
+	CHECK(m.res.disparity_px == 0.0f);
+
+	// Even with a crossed shift, a flat region has nothing to match.
+	Scene s2;
+	s2.layers.push_back({Tex::Sky, 20.0f, -1e4f, 0.0f, 1e4f, 1080.0f, 1});
+	CHECK_FALSE(measure(s2, 960, 1080, 0.5f, 0.3f).res.confident);
+}
+
+TEST_CASE("cursor_measure: faint texture and uncorrelated views are not confident")
+{
+	// Texture std ~3 luma levels: below the floor (web MIN_TEXTURE 6). A
+	// perfect synthetic shift would otherwise match it - real video's noise
+	// and compression would not. Control: the same texture at full contrast.
+	const int32_t w = 200, h = 40;
+	float d = 0, c = 0;
+	int32_t dy = 0;
+	for (float amp : {180.0f, 12.0f}) {
+		CAPTURE(amp);
+		std::vector<uint8_t> a((size_t)w * h), b((size_t)w * h);
+		for (int32_t y = 0; y < h; y++) {
+			for (int32_t x = 0; x < w; x++) {
+				a[(size_t)y * w + x] = (uint8_t)(128 - amp / 2 + amp * noise((float)x - 10.0f, (float)y, 31));
+				b[(size_t)y * w + x] = (uint8_t)(128 - amp / 2 + amp * noise((float)x + 10.0f, (float)y, 31));
+			}
+		}
+		const bool ok = u_cursor_measure_match_block(a.data(), b.data(), w, h, 92, 12, +1, -64, 64, &d, &dy, &c);
+		CHECK(ok == (amp > 100.0f));
+	}
+
+	// Views that do not show the same thing (one eye occluded): whatever
+	// scores best is a coincidence, below the NCC floor or not unique.
+	for (uint32_t seed = 40; seed < 46; seed++) {
+		CAPTURE(seed);
+		std::vector<uint8_t> p((size_t)w * h), q((size_t)w * h);
+		for (int32_t y = 0; y < h; y++) {
+			for (int32_t x = 0; x < w; x++) {
+				p[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x, (float)y, seed));
+				q[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x, (float)y, seed + 100));
+			}
+		}
+		float pts[U_CURSOR_MEASURE_POINTS][2];
+		u_cursor_measure_footprint_points(100.0f, 12.0f, 14.0f, pts);
+		u_cursor_measure_result diag{};
+		CHECK_FALSE(u_cursor_measure_footprint(p.data(), q.data(), w, h, pts, U_CURSOR_MEASURE_POINTS, &d, &diag));
+		CHECK(diag.matched == 0);
+	}
+}
+
+TEST_CASE("cursor_measure: repetitive stripes are rejected (uniqueness)")
+{
+	// Odd periods put the rival peaks between coarse samples: they must be
+	// refined to their top, or an exactly periodic pattern slips through.
+	for (float period : {6.0f, 7.0f, 8.0f, 9.0f, 11.0f, 13.0f, 24.0f}) {
+		for (float d : {0.0f, 5.0f, 10.0f}) {
+			CAPTURE(period, d);
+			Scene s;
+			s.layers.push_back({Tex::Stripes, d, -1e4f, -1e4f, 1e4f, 1e4f, 1, period});
+			const Measured m = measure(s, 960, 1080, 0.5f, 0.5f);
+			REQUIRE(m.res.valid);
+			CHECK_FALSE(m.res.confident);
+			CHECK(m.res.matched == 0); // every block is ambiguous on its own
+		}
+	}
+}
+
+TEST_CASE("cursor_measure: occlusion edge - the nearest confident layer wins, never a blend")
+{
+	// Background behind the glass (uncrossed 10), a crossed (24) textured
+	// foreground whose edge runs through the footprint.
+	for (float edge : {470.0f, 480.0f, 492.0f}) {
+		CAPTURE(edge);
+		Scene s;
+		s.layers.push_back({Tex::Noise, -10.0f, -1e4f, -1e4f, 1e4f, 1e4f, 11});
+		s.layers.push_back({Tex::Noise, 24.0f, -1e4f, -1e4f, edge, 1e4f, 12});
+		const Measured m = measure(s, 960, 1080, 0.5f, 0.5f); // tip at x = 480
+		REQUIRE(m.res.confident);
+		CHECK(m.res.disparity_px == Catch::Approx(-24.0f).margin(0.5f));
+	}
+	// Foreground entirely outside the footprint: the background answers.
+	Scene s;
+	s.layers.push_back({Tex::Noise, -10.0f, -1e4f, -1e4f, 1e4f, 1e4f, 11});
+	s.layers.push_back({Tex::Noise, 24.0f, -1e4f, -1e4f, 300.0f, 1e4f, 12});
+	const Measured m = measure(s, 960, 1080, 0.5f, 0.5f);
+	REQUIRE(m.res.confident);
+	CHECK(m.res.disparity_px == Catch::Approx(10.0f).margin(0.5f)); // uncrossed: behind the glass
+}
+
+TEST_CASE("cursor_measure: left-right check rejects a match the other view cannot confirm")
+{
+	// A (left) shows a textured patch P twice, 30 px apart; B shows it once.
+	// A's left copy finds B's uniquely (d = 10), but B's copy, matched back
+	// into A, has two equal answers - an inconsistent, half-occluded match.
+	const int32_t w = 160, h = 40;
+	std::vector<uint8_t> a((size_t)w * h), b((size_t)w * h);
+	for (int32_t y = 0; y < h; y++) {
+		for (int32_t x = 0; x < w; x++) {
+			a[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x, (float)y, 99));
+			b[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x + 500.0f, (float)y, 77));
+		}
+	}
+	auto stamp = [&](std::vector<uint8_t> &img, int32_t x0) {
+		for (int32_t y = 8; y < 32; y++) {
+			for (int32_t x = 0; x < 24; x++) {
+				img[(size_t)y * w + x0 + x] = (uint8_t)(40 + 180 * noise((float)x, (float)y, 5));
+			}
+		}
+	};
+	stamp(a, 70);
+	stamp(a, 100);
+	stamp(b, 60);
+	// Forward: block at A x=74 -> B at 64 (d = 10), unique in B.
+	float d = 0, c = 0;
+	int32_t dy = 0;
+	REQUIRE(u_cursor_measure_match_block(a.data(), b.data(), w, h, 74, 12, +1, -64, 64, &d, &dy, &c));
+	CHECK(d == Catch::Approx(10.0f).margin(0.3f));
+	// Backward: ambiguous -> the footprint rejects the candidate.
+	CHECK_FALSE(u_cursor_measure_match_block(b.data(), a.data(), w, h, 64, 12, -1, -64, 64, &d, &dy, &c));
+	const float pts[1][2] = {{74.0f + 8.0f, 12.0f + 8.0f}};
+	u_cursor_measure_result diag{};
+	float out = 0;
+	CHECK_FALSE(u_cursor_measure_footprint(a.data(), b.data(), w, h, pts, 1, &out, &diag));
+	CHECK(diag.matched == 1);
+	CHECK(diag.lr_rejected == 1);
+}
+
+TEST_CASE("cursor_measure: left-right check rejects a confident but INCONSISTENT reverse match")
+{
+	// A shows P at 70 and P' (P plus a little unrelated texture) at 100; B
+	// shows only P' at 60. A's P finds B's P' uniquely (d = 10, NCC ~0.86),
+	// but B's P' finds its exact copy in A at 100 (d' = 40) - unique, and
+	// confident, yet 30 px from the forward answer.
+	const int32_t w = 200, h = 40;
+	std::vector<uint8_t> a((size_t)w * h), b((size_t)w * h);
+	for (int32_t y = 0; y < h; y++) {
+		for (int32_t x = 0; x < w; x++) {
+			a[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x, (float)y, 199));
+			b[(size_t)y * w + x] = (uint8_t)(40 + 180 * noise((float)x + 700.0f, (float)y, 177));
+		}
+	}
+	auto p = [](int32_t x, int32_t y) { return 128.0f + 70.0f * (noise((float)x, (float)y, 5) - 0.5f) * 2.0f; };
+	auto pp = [&](int32_t x, int32_t y) { return p(x, y) + 45.0f * (noise((float)x, (float)y, 6) - 0.5f) * 2.0f; };
+	for (int32_t y = 4; y < 36; y++) {
+		for (int32_t x = 0; x < 24; x++) {
+			a[(size_t)y * w + 70 + x] = (uint8_t)p(x, y);
+			a[(size_t)y * w + 100 + x] = (uint8_t)pp(x, y);
+			b[(size_t)y * w + 60 + x] = (uint8_t)pp(x, y);
+		}
+	}
+	float d = 0, c = 0;
+	int32_t dy = 0;
+	REQUIRE(u_cursor_measure_match_block(a.data(), b.data(), w, h, 74, 12, +1, -64, 64, &d, &dy, &c));
+	CHECK(d == Catch::Approx(10.0f).margin(0.3f));
+	CHECK(c >= U_CURSOR_MEASURE_MIN_NCC);
+	REQUIRE(u_cursor_measure_match_block(b.data(), a.data(), w, h, 64, 12, -1, -64, 64, &d, &dy, &c));
+	CHECK(d == Catch::Approx(40.0f).margin(0.3f));
+	const float pts[1][2] = {{74.0f + 8.0f, 12.0f + 8.0f}};
+	u_cursor_measure_result diag{};
+	float out = 0;
+	CHECK_FALSE(u_cursor_measure_footprint(a.data(), b.data(), w, h, pts, 1, &out, &diag));
+	CHECK(diag.matched == 1);
+	CHECK(diag.lr_rejected == 1);
+}
+
+TEST_CASE("cursor_measure: an unchanged frame is not re-measured (paused video)")
+{
+	u_cursor_measure_cache cache{};
+	const Scene s = textured(16.0f, 21);
+	const Measured first = measure(s, 960, 1080, 0.5f, 0.5f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, false, &cache);
+	REQUIRE(first.res.confident);
+	CHECK_FALSE(first.res.reused);
+	const Measured again = measure(s, 960, 1080, 0.5f, 0.5f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, false, &cache);
+	CHECK(again.res.reused);
+	CHECK(again.res.disparity_px == first.res.disparity_px);
+	// New content (the video plays on) or a moved pointer: measured again.
+	const Measured moved = measure(s, 960, 1080, 0.52f, 0.5f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, false, &cache);
+	CHECK_FALSE(moved.res.reused);
+	const Measured next =
+	    measure(textured(30.0f, 21), 960, 1080, 0.52f, 0.5f, 0.03f, U_CURSOR_MEASURE_FORMAT_RGBA8, false, &cache);
+	CHECK_FALSE(next.res.reused);
+	CHECK(next.res.disparity_px == Catch::Approx(-30.0f).margin(0.35f));
+
+	// The same pixels under a different footprint (the pointer moved inside
+	// one copy) are a different question: never answered from the cache.
+	u_cursor_measure_request req{};
+	req.requested = true;
+	req.u = 0.5f;
+	req.v = 0.5f;
+	req.height = 0.03f;
+	req.view_index[1] = 1;
+	u_cursor_measure_plan p{};
+	REQUIRE(u_cursor_measure_make_plan(&req, 960, 1080, false, &p));
+	std::vector<uint8_t> px((size_t)p.w * p.h * 4, 0);
+	for (size_t i = 0; i < px.size(); i += 4) {
+		px[i] = px[i + 1] = px[i + 2] = (uint8_t)(40 + 180 * noise((float)((i / 4) % p.w), (float)((i / 4) / p.w), 3));
+	}
+	const u_cursor_measure_patch a{px.data(), (uint32_t)p.w * 4, U_CURSOR_MEASURE_FORMAT_RGBA8};
+	u_cursor_measure_cache c2{};
+	u_cursor_measure_result r1{}, r2{};
+	REQUIRE(u_cursor_measure_run(&req, &p, &a, &a, &c2, &r1));
+	req.u = 0.505f;
+	REQUIRE(u_cursor_measure_run(&req, &p, &a, &a, &c2, &r2));
+	CHECK_FALSE(r2.reused);
+}
+
+TEST_CASE("cursor_measure: px -> baselines from the views, and the pixel policy is A.1")
+{
+	// Eyes 64 mm apart, 0.6 m from a 0.30 x 0.20 m canvas, 960 px per view.
+	const auto a = kooima({-0.032f, 0.0f, 0.6f});
+	const auto b = kooima({0.032f, 0.0f, 0.6f});
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&a, &b, 0.5f, 0.5f, &g));
+	float d = 0, ppb = 0;
+	// Halfway to the eye is d = -1: on screen x_B - x_A = -64 mm = -204.8 px.
+	REQUIRE(u_cursor_measure_to_baselines(&a, &b, &g, -204.8f, 960.0f, &d, &ppb));
+	CHECK(d == Catch::Approx(-1.0f));
+	CHECK(ppb == Catch::Approx(204.8f));
+	// Same answer under a camera rig (rigid + 12.5x scale): ratios only.
+	Xform x;
+	x.q = {0.0f, 0.38268343f, 0.0f, 0.92387953f};
+	x.t = {1.0f, 2.0f, -3.0f};
+	x.s = 12.5f;
+	const auto a1 = kooima({-0.032f, 0.0f, 0.6f}, x);
+	const auto b1 = kooima({0.032f, 0.0f, 0.6f}, x);
+	u_cursor_depth_geometry g1{};
+	REQUIRE(u_cursor_depth_geometry_solve(&a1, &b1, 0.5f, 0.5f, &g1));
+	float d1 = 0, ppb1 = 0;
+	REQUIRE(u_cursor_measure_to_baselines(&a1, &b1, &g1, -204.8f, 960.0f, &d1, &ppb1));
+	CHECK(d1 == Catch::Approx(-1.0f).epsilon(1e-4));
+	CHECK(ppb1 == Catch::Approx(204.8f).epsilon(1e-4));
+	// Swapped views (B left of A): the sign follows the views, not the index.
+	REQUIRE(u_cursor_measure_to_baselines(&b, &a, &g, 204.8f, 960.0f, &d, &ppb));
+	CHECK(d == Catch::Approx(-1.0f));
+
+	// Pixel policy: measured < 0 ? max(measured - margin_px, cap_px) : 0.
+	const auto t = tuning();
+	const float margin_px = t.margin * ppb;
+	CHECK(u_cursor_measure_target_px(&t, true, -20.0f, ppb) == Catch::Approx(-20.0f - margin_px));
+	CHECK(u_cursor_measure_target_px(&t, true, -500.0f, ppb) == Catch::Approx(t.min_disparity * ppb)); // cap
+	CHECK(u_cursor_measure_target_px(&t, true, 15.0f, ppb) == 0.0f);   // behind the glass: on it
+	CHECK(u_cursor_measure_target_px(&t, true, 0.0f, ppb) == 0.0f);    // on the glass
+	CHECK(u_cursor_measure_target_px(&t, false, -20.0f, ppb) == 0.0f); // not confident: screen plane
+	for (float m = -300.0f; m <= 300.0f; m += 7.3f) {
+		CHECK(u_cursor_measure_target_px(&t, true, m, ppb) <= 0.0f); // never behind the glass
+		CHECK(u_cursor_measure_target_px(&t, true, m, ppb) / ppb ==
+		      Catch::Approx(u_cursor_depth_target(&t, true, m / ppb)).margin(1e-6));
+	}
+}
+
+// Hidden ([.]): CPU cost of one measured frame, for the Amendment 3 evidence.
+// Run a Release build: tests_aux_cursor_depth "[.bench]"
+TEST_CASE("cursor_measure: CPU cost per measured frame (1080p / 4K SBS)", "[.bench]")
+{
+	for (int32_t sw : {960, 1920}) {
+		const int32_t sh = sw * 9 / 8; // a 1080p / 4K SBS eye: 960x1080, 1920x2160
+		const float d = 0.03f * (float)sw;
+		struct Case
+		{
+			const char *name;
+			Scene scene;
+		} cases[3] = {{"textured", textured(d, 81)}, {"sky", {}}, {"stripes", {}}};
+		cases[1].scene.layers.push_back({Tex::Sky, 0.0f, -1e4f, -1e4f, 1e4f, 1e5f, 1});
+		cases[2].scene.layers.push_back({Tex::Stripes, d, -1e4f, -1e4f, 1e4f, 1e4f, 1, 9.0f});
+		for (Case &cs : cases) {
+			// Build the copy once, then time u_cursor_measure_run alone.
+			u_cursor_measure_cache cache{};
+			Measured m = measure(cs.scene, sw, sh, 0.5f, 0.5f, 0.03f, U_CURSOR_MEASURE_FORMAT_BGRA8, false, &cache);
+			u_cursor_measure_request req{};
+			req.requested = true;
+			req.u = 0.5f;
+			req.v = 0.5f;
+			req.height = 0.03f;
+			req.view_index[1] = 1;
+			std::vector<uint8_t> buf[2];
+			const uint32_t pitch = (uint32_t)m.plan.w * 4;
+			for (int v = 0; v < 2; v++) {
+				buf[v].resize((size_t)pitch * m.plan.h);
+				for (int32_t r = 0; r < m.plan.h; r++) {
+					for (int32_t c = 0; c < m.plan.w; c++) {
+						const uint8_t g = (uint8_t)cs.scene.at(v == 0 ? 1 : -1, (float)(m.plan.x + c) + 0.5f,
+						                                       (float)(m.plan.y + r) + 0.5f);
+						uint8_t *t = &buf[v][(size_t)r * pitch + (size_t)c * 4];
+						t[0] = t[1] = t[2] = g;
+						t[3] = 255;
+					}
+				}
+			}
+			const u_cursor_measure_patch a{buf[0].data(), pitch, U_CURSOR_MEASURE_FORMAT_BGRA8};
+			const u_cursor_measure_patch b{buf[1].data(), pitch, U_CURSOR_MEASURE_FORMAT_BGRA8};
+			const int iters = 200;
+			u_cursor_measure_result res{};
+			auto t0 = std::chrono::steady_clock::now();
+			for (int i = 0; i < iters; i++) {
+				REQUIRE(u_cursor_measure_run(&req, &m.plan, &a, &b, nullptr, &res)); // no cache: full match
+			}
+			auto t1 = std::chrono::steady_clock::now();
+			u_cursor_measure_cache warm{};
+			REQUIRE(u_cursor_measure_run(&req, &m.plan, &a, &b, &warm, &res));
+			auto t2 = std::chrono::steady_clock::now();
+			for (int i = 0; i < iters; i++) {
+				REQUIRE(u_cursor_measure_run(&req, &m.plan, &a, &b, &warm, &res)); // paused video: reused
+			}
+			auto t3 = std::chrono::steady_clock::now();
+			const double full_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+			const double reuse_us = std::chrono::duration<double, std::micro>(t3 - t2).count() / iters;
+			printf("cursor_measure bench: eye %dx%d (%s SBS) %-8s copy %dx%d px/view (%u KB both), factor %d: "
+			       "match %.1f us, reused %.1f us, confident=%d %.2f px\n",
+			       sw, sh, sw == 960 ? "1080p" : "4K", cs.name, m.plan.w, m.plan.h,
+			       (unsigned)(2 * pitch * m.plan.h / 1024), m.plan.factor, full_us, reuse_us, (int)res.confident,
+			       res.disparity_px);
+		}
 	}
 }
