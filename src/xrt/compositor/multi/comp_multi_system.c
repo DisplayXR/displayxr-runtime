@@ -2538,6 +2538,46 @@ comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
  * display sub-rect. See the header for the contract. Lives here (not
  * comp_multi_workspace.c) because it needs session_render + the macOS comp_target.
  */
+#ifdef COMP_MULTI_SHARED_SURFACE
+/*!
+ * The panel in its CURRENT orientation, in pixels and metres, for the shared
+ * surface's pose->pixel mapping and atlas tiles (#1006).
+ *
+ * `xrt_system_compositor_info` carries the panel in the vendor's NATURAL
+ * orientation (CNSDK: 2560x1600 / 0.260x0.163 m on an NP02J). On macOS and
+ * desktop Linux that is what the service window shows. On Android the overlay's
+ * target is the controller's surface, which follows device rotation — on the
+ * portrait-native NP02J it is 1600x2560 held portrait — so swap both pairs
+ * whenever the held orientation (published by the window-geometry feed,
+ * android_globals_get_display_landscape) disagrees with the natural one.
+ */
+static void
+shared_panel_dims(
+    const struct multi_system_compositor *msc, int32_t *out_px_w, int32_t *out_px_h, float *out_m_w, float *out_m_h)
+{
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	int32_t px_w = (int32_t)info->display_pixel_width;
+	int32_t px_h = (int32_t)info->display_pixel_height;
+	float m_w = info->display_width_m;
+	float m_h = info->display_height_m;
+#ifdef XRT_OS_ANDROID
+	bool landscape = false;
+	if (px_w > 0 && px_h > 0 && android_globals_get_display_landscape(&landscape) && landscape != (px_w >= px_h)) {
+		int32_t t = px_w;
+		px_w = px_h;
+		px_h = t;
+		float tm = m_w;
+		m_w = m_h;
+		m_h = tm;
+	}
+#endif
+	*out_px_w = px_w;
+	*out_px_h = px_h;
+	*out_m_w = m_w;
+	*out_m_h = m_h;
+}
+#endif // COMP_MULTI_SHARED_SURFACE
+
 bool
 comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
                                             const struct xrt_pose *pose,
@@ -2564,11 +2604,11 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 
 	// Display geometry from the system compositor info (same fallback the D3D11
 	// service's slot_pose_to_pixel_rect uses).
-	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-	float disp_w_m = info->display_width_m;
-	float disp_h_m = info->display_height_m;
-	int32_t disp_px_w = (int32_t)info->display_pixel_width;
-	int32_t disp_px_h = (int32_t)info->display_pixel_height;
+	// The panel in its current orientation (#1006: an Android overlay follows
+	// device rotation; macOS / Linux get info's values unchanged).
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	int32_t disp_px_w = 0, disp_px_h = 0;
+	shared_panel_dims(mc->msc, &disp_px_w, &disp_px_h, &disp_w_m, &disp_h_m);
 	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w <= 0 || disp_px_h <= 0) {
 		disp_px_w = 3024;
 		disp_px_h = 1964;
@@ -5333,6 +5373,35 @@ shared_converge_display_mode_locked(struct multi_system_compositor *msc,
 	if (msc->shared_dp == NULL || order_count == 0) {
 		return;
 	}
+	// The workspace controller is the display-mode authority while it is
+	// active (#967 D-5): its request, when it made one, decides; every
+	// composited client hears the result.
+	const int controller_wish = msc->shared_hw_3d_controller_wish;
+	if (controller_wish >= 0) {
+		const bool want_3d = controller_wish == 1;
+		if (msc->shared_hw_3d_applied == controller_wish) {
+			return;
+		}
+		struct xrt_display_processor *dp = msc->shared_dp;
+		const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+		const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+		msc->shared_hw_3d_applied = controller_wish;
+		U_LOG_W("[#967 D-5] shared surface hardware -> %s on the workspace controller's request (%s)",
+		        want_3d ? "3D" : "2D",
+		        !has_slot ? "mode-neutral DP" : (accepted ? "request_display_mode accepted" : "REJECTED"));
+		if (!accepted) {
+			return;
+		}
+		union xrt_session_event xse = {0};
+		xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+		xse.hardware_display_state_change.hardware_display_3d = want_3d;
+		for (uint32_t i = 0; i < order_count; i++) {
+			order[i].mc->hardware_display_3d = want_3d;
+			(void)multi_compositor_push_event(order[i].mc, &xse);
+		}
+		return;
+	}
+
 	struct multi_compositor *owner = NULL;
 	struct xrt_compositor *focused = comp_multi_workspace_get_focused_client();
 	for (uint32_t i = 0; i < order_count; i++) {
@@ -5452,8 +5521,11 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		    wh <= 0) {
 			wx = 0;
 			wy = 0;
-			ww = msc->base.info.display_pixel_width;
-			wh = msc->base.info.display_pixel_height;
+			float unused_w_m = 0.0f, unused_h_m = 0.0f;
+			int32_t pw = 0, ph = 0;
+			shared_panel_dims(msc, &pw, &ph, &unused_w_m, &unused_h_m);
+			ww = pw;
+			wh = ph;
 		}
 		e->win_x = wx;
 		e->win_y = wy;
@@ -5512,8 +5584,11 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	struct comp_target *ct = msc->shared_target;
 
 	// Per-eye tile = the display; combined atlas = 2 tiles (stereo) side by side.
-	int eye_w = (int)msc->base.info.display_pixel_width;
-	int eye_h = (int)msc->base.info.display_pixel_height;
+	int32_t panel_px_w = 0, panel_px_h = 0;
+	float panel_m_w = 0.0f, panel_m_h = 0.0f;
+	shared_panel_dims(msc, &panel_px_w, &panel_px_h, &panel_m_w, &panel_m_h);
+	int eye_w = (int)panel_px_w;
+	int eye_h = (int)panel_px_h;
 	if (eye_w <= 0 || eye_h <= 0) {
 		eye_w = (int)ct->width;
 		eye_h = (int)ct->height;
@@ -5560,8 +5635,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		eye_pos.count = 2;
 		eye_pos.valid = true;
 	}
-	float disp_w_m = msc->base.info.display_width_m;
-	float disp_h_m = msc->base.info.display_height_m;
+	float disp_w_m = panel_m_w;
+	float disp_h_m = panel_m_h;
 	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
 		disp_w_m = 0.301f;
 		disp_h_m = 0.196f;
@@ -6302,10 +6377,33 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// desktop Linux this is always the case; on Android only while the
 		// workspace overlay is active (#1006) — otherwise per-session as before.
 		bool skip_session_render_init = multi_shared_surface_active(msc);
-		if (!skip_session_render_init && mc->state.session_active &&
-		    multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
-		    !mc->session_render.window_close_exit_sent) {
-			multi_compositor_init_session_render(mc);
+#ifdef XRT_OS_ANDROID
+		// No live output surface in this process: creating the per-session
+		// target cannot succeed (init_post_vulkan has no window), and retrying
+		// it every frame floods the log — seen when a workspace overlay ends
+		// before the main-service client's own surface is back (#1006). The
+		// convergence pass that just ran tracks validity; retry once it is live.
+		if (msc->android_window_valid_state != 1) {
+			skip_session_render_init = true;
+		}
+#endif
+		if (!skip_session_render_init && mc->state.session_active && multi_compositor_has_session_render(mc) &&
+		    !mc->session_render.initialized && !mc->session_render.window_close_exit_sent &&
+		    os_monotonic_get_ns() >= mc->session_render.init_retry_after_ns) {
+			if (!multi_compositor_init_session_render(mc)) {
+				// Back off instead of retrying every frame (#1006): e.g. two
+				// main-service clients after a workspace overlay ends share the
+				// process-global window, and the second one's target creation
+				// fails until the first lets go — at panel rate that was a log
+				// flood and wasted work.
+				uint32_t n =
+				    mc->session_render.init_fail_count < 3 ? mc->session_render.init_fail_count : 3;
+				mc->session_render.init_fail_count++;
+				mc->session_render.init_retry_after_ns =
+				    os_monotonic_get_ns() + ((int64_t)1 << n) * U_TIME_1S_IN_NS; // 1, 2, 4, 8 s
+			} else {
+				mc->session_render.init_fail_count = 0;
+			}
 		}
 
 		// Even if it's not shown, make sure that frames are delivered.
@@ -7325,10 +7423,26 @@ comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool a
 	struct multi_system_compositor *msc = multi_system_compositor(xsc);
 	os_thread_helper_lock(&msc->oth);
 	msc->workspace_active = active;
+	if (!active) {
+		msc->shared_hw_3d_controller_wish = -1; // #967 D-5: authority returns to the clients
+	}
 	// Wake the render thread so it (re)starts the shared-surface session even with
 	// no active content app (#61: empty spatial desktop + DXR splash + launcher).
 	os_thread_helper_signal_locked(&msc->oth);
 	os_thread_helper_unlock(&msc->oth);
+}
+
+bool
+comp_multi_system_request_workspace_display_mode(struct xrt_system_compositor *xsc, bool hardware_3d)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsc);
+	msc->shared_hw_3d_controller_wish = hardware_3d ? 1 : 0;
+	U_LOG_W("[#967 D-5] workspace controller requests hardware %s for the shared display processor",
+	        hardware_3d ? "3D" : "2D");
+	return true;
 }
 #endif
 
@@ -7367,6 +7481,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	// per app. The legacy per-NSWindow path has been removed.
 	msc->shared_fenced_buffer = -1;
 	msc->shared_hw_3d_applied = -1;
+	msc->shared_hw_3d_controller_wish = -1;
 	U_LOG_W("[#59] shared spatial surface (single full-screen window)");
 #endif
 

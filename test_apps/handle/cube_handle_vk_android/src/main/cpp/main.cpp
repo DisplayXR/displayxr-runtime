@@ -3332,21 +3332,39 @@ android_main(struct android_app *app)
 				destroy_instance();
 				return;
 			}
-			// Run the frame loop whenever the session is running (READY..STOPPING)
-			// and we have a live surface. We must drive frames starting in READY:
-			// a CTS-compliant runtime only advances READY->SYNCHRONIZED on the
-			// app's first xrBeginFrame, so gating render on SYNCHRONIZED+ here would
-			// deadlock (the session never leaves READY → black screen). render_frame
-			// honors frame_state.shouldRender, so it submits no layers until the
-			// runtime reports the session visible — the spec-correct bootstrap.
-			//
-			// The app->window guard is the #507 surface gate: on background / card /
-			// split, native_app_glue clears app->window, so we skip the frame loop
-			// (no wait/present on a dead surface) until the surface returns on resume
-			// (APP_CMD_INIT_WINDOW). g_session_running drops on STOPPING (xrEndSession).
-			if (app->window != nullptr && g_session_running) {
-				render_frame();
-			}
-		}
+                        // Run the frame loop whenever the session is running
+                        // (READY..STOPPING) and we have a live surface. We must
+                        // drive frames starting in READY: a CTS-compliant
+                        // runtime only advances READY->SYNCHRONIZED on the
+                        // app's first xrBeginFrame, so gating render on
+                        // SYNCHRONIZED+ here would deadlock (the session never
+                        // leaves READY → black screen). render_frame honors
+                        // frame_state.shouldRender, so it submits no layers
+                        // until the runtime reports the session visible — the
+                        // spec-correct bootstrap.
+                        //
+                        // The app->window guard is the #507 surface gate: on
+                        // background / card / split, native_app_glue clears
+                        // app->window, so we skip the frame loop (no
+                        // wait/present on a dead surface) until the surface
+                        // returns on resume (APP_CMD_INIT_WINDOW).
+                        // g_session_running drops on STOPPING (xrEndSession).
+                        //
+                        // Exception (#1006): with no window of our own but the
+                        // runtime still reporting the session VISIBLE/FOCUSED,
+                        // keep rendering. That is a client composited elsewhere
+                        // — a member of an Android workspace overlay, shown
+                        // through the controller's surface while this Activity
+                        // is paused behind it. A normal background pause drives
+                        // the runtime to STOPPING first, so this never renders
+                        // into a dead surface.
+                        const bool shown_elsewhere =
+                            g_session_state == XR_SESSION_STATE_VISIBLE ||
+                            g_session_state == XR_SESSION_STATE_FOCUSED;
+                        if ((app->window != nullptr || shown_elsewhere) &&
+                            g_session_running) {
+                          render_frame();
+                        }
+                }
 	}
 }

@@ -787,6 +787,9 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 		// is still NULL until the lazy init_session_render) and refuses to take
 		// a lens vote for a session begun while its window is still gone.
 #endif
+		// A new session gets an immediate per-session init attempt (#1006).
+		mc->session_render.init_retry_after_ns = 0;
+		mc->session_render.init_fail_count = 0;
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
 	}
