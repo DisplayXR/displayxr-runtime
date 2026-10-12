@@ -307,6 +307,12 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 		}
 		return CONV_RD_IGNORED;
 
+	case CONV_EV_RUNTIME_FAILED:
+		if (s == XRT_CONV_STATE_READY || s == XRT_CONV_STATE_WARMING || s == XRT_CONV_STATE_EVICTED) {
+			return fail(r, ev->reason, ev->retryable, now);
+		}
+		return CONV_RD_IGNORED;
+
 	case CONV_EV_TIMER:
 		if (s == XRT_CONV_STATE_FAILED && r->retry_due_ns != 0 && now >= r->retry_due_ns) {
 			return retry(r, now) | CONV_RD_ACT_WARM;
