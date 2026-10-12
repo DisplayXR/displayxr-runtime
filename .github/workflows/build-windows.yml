@@ -464,6 +464,21 @@ jobs:
                 } else {
                   Write-Host "PASS: input-provider gate — $($inputCheck.detail)"
                 }
+                # ADR-053 / #2006: with sim-conversion registered, the
+                # conversion_providers check must have SEEN it (enumerate ->
+                # negotiate -> describe, no model load). Same guard as the
+                # registration above.
+                # TODO(#2002): drop the $convRegistered guard once the sim
+                # provider always builds -- then count >= 1 is unconditional.
+                if ($convRegistered) {
+                  $convCount = $selfObj.conversion_providers.count
+                  if ($null -eq $convCount -or [int]$convCount -lt 1) {
+                    Write-Host "::error::conversion_providers.count is '$convCount' with sim-conversion registered (#2006)."
+                    $code = 1
+                  } else {
+                    Write-Host "PASS: conversion-provider gate - count $convCount"
+                  }
+                }
               }
             }
 
