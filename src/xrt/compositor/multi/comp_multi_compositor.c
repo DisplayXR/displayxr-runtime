@@ -556,6 +556,37 @@ multi_compositor_create_semaphore(struct xrt_compositor *xc,
 	return xrt_comp_create_semaphore(&mc->msc->xcn->base, out_handle, out_xcsem);
 }
 
+
+/*!
+ * Take the session-render display processor out of @p mc under
+ * `list_and_timing_lock`, then destroy it with the lock DROPPED (#1007).
+ *
+ * Two constraints meet here:
+ *  - the render thread reads `session_render.display_processor` under the
+ *    lock while @p mc is still in `msc->clients[]` — on Android the
+ *    per-frame convergence pass (`android_window_transition_locked` →
+ *    `multi_compositor_set_window_visible_locked`) calls on_pause/on_resume
+ *    on it. Destroying it in place with the lock dropped was a
+ *    use-after-free: the pointer was freed while still published.
+ *  - the destroy itself must NOT run under the lock: CNSDK core release can
+ *    join a thread that never exits (displayxr-leia-plugin#39), and a hang
+ *    there under `list_and_timing_lock` would freeze every client.
+ *
+ * So unpublish first (pointer NULL + visibility UNKNOWN, under the lock),
+ * destroy the private copy after. Safe to call when there is no DP.
+ */
+static void
+multi_compositor_detach_and_destroy_dp(struct multi_compositor *mc)
+{
+	os_mutex_lock(&mc->msc->list_and_timing_lock);
+	struct xrt_display_processor *xdp = mc->session_render.display_processor;
+	mc->session_render.display_processor = NULL;
+	mc->session_render.dp_visibility = MULTI_DP_VIS_UNKNOWN;
+	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+
+	xrt_display_processor_destroy(&xdp);
+}
+
 #ifdef XRT_OS_ANDROID
 /*
  * #1039. SINGLE WRITER: this is called from exactly one place — the multi main
@@ -807,8 +838,9 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// (this runs on an IPC handler thread with the lock dropped)
 			// — see the note on multi_compositor_set_window_visible_locked.
 #else
-			// Destroy display processor (owns any vendor SDK handles)
-			xrt_display_processor_destroy(&mc->session_render.display_processor);
+			// Destroy display processor (owns any vendor SDK handles).
+			// Unpublished under the lock first (#1007).
+			multi_compositor_detach_and_destroy_dp(mc);
 #endif
 
 			// Destroy fences (generic Vulkan)
@@ -1441,8 +1473,13 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// initialized-gated block below destroys it for the still-initialized
 	// case (xrt_display_processor_destroy NULLs the pointer, so at most one
 	// of the two calls acts).
+	//
+	// #1007: never destroy it in place — mc is still in msc->clients[] here,
+	// and the render thread's convergence pass reads the pointer under
+	// list_and_timing_lock. detach_and_destroy unpublishes it under the lock
+	// and destroys it with the lock dropped (CNSDK release can hang, #39).
 	if (!mc->session_render.initialized && mc->session_render.display_processor != NULL) {
-		xrt_display_processor_destroy(&mc->session_render.display_processor);
+		multi_compositor_detach_and_destroy_dp(mc);
 	}
 
 	// Clean up per-session render resources if still initialized
@@ -1467,8 +1504,9 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.fenced_buffer = -1;
 		}
 
-		// Destroy display processor (owns any vendor SDK handles)
-		xrt_display_processor_destroy(&mc->session_render.display_processor);
+		// Destroy display processor (owns any vendor SDK handles).
+		// Unpublished under the lock first (#1007).
+		multi_compositor_detach_and_destroy_dp(mc);
 
 		// Destroy composite resources (intermediate pre-display-processing targets)
 		if (vk != NULL && mc->session_render.composite_initialized) {
