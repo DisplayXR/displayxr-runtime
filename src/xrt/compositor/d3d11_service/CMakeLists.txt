@@ -47,8 +47,8 @@ add_library(comp_d3d11_lift STATIC d3d11_lift.cpp d3d11_lift.h)
 target_include_directories(comp_d3d11_lift PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(
 	comp_d3d11_lift
-	PUBLIC xrt-interfaces aux_util aux_os
-	PRIVATE ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
+	PUBLIC xrt-interfaces aux_util aux_os conv_runtime
+	PRIVATE comp_d3d11_conv_viewsyn ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
 	)
 
 add_library(
@@ -56,6 +56,7 @@ add_library(
 	../d3d_shared/comp_equirect2_shaders.h
 	comp_d3d11_service.cpp
 	comp_d3d11_service.h
+	comp_d3d11_service_conv.h
 	d3d11_service_shaders.h
 	d3d11_capture.cpp
 	d3d11_capture.h

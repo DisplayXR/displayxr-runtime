@@ -1142,6 +1142,10 @@ if(TARGET tests_lift_dp_golden)
 					     ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion
 		)
 	target_link_libraries(tests_lift_dp_golden PRIVATE comp_d3d11_lift aux_os d3d11 dxgi d3dcompiler)
+	# #2003: the same conversions core-routed (the v3 adapter over the core).
+	if(TARGET ipc_server_conv)
+		target_link_libraries(tests_lift_dp_golden PRIVATE ipc_server_conv displayxr::conversion_runtime)
+	endif()
 	set_target_properties(tests_lift_dp_golden PROPERTIES CXX_STANDARD 17)
 endif()
 

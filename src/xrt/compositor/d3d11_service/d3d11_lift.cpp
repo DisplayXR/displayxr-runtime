@@ -11,8 +11,11 @@
  */
 
 #include "d3d11_lift.h"
+#include "d3d11_conv_viewsyn.h"
 
 #include "xrt/xrt_display_processor_d3d11.h"
+
+#include "conversion/conv_core.h"
 
 #include "util/u_lift_autoconv.h"
 #include "util/u_lift_depth.h"
@@ -33,6 +36,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <thread>
@@ -391,6 +395,107 @@ struct lift_stream
 	bool ac_nodepth_logged = false;
 };
 
+/*
+ *
+ * The dp-lift backend (#2003): commands the provider's exec thread hands to
+ * the lift thread, and the lift thread's own view of runtime images.
+ *
+ */
+
+enum lift_cmd_op
+{
+	LIFT_CMD_ACTIVATE,
+	LIFT_CMD_POLL,
+	LIFT_CMD_STREAM_CREATE,
+	LIFT_CMD_STREAM_DESTROY,
+	LIFT_CMD_CONVERT,
+};
+
+struct lift_cmd
+{
+	lift_cmd_op op = LIFT_CMD_POLL;
+	bool retry = false;
+	const xrt_dp_lift_stream_info *info = nullptr;
+	uint64_t dp_id = 0;
+	conv_dp_lift_convert *io = nullptr;
+	xrt_result_t result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	bool done = false;
+};
+
+//! A runtime image (glue-allocated, shared NT handle) opened on the LIFT device.
+struct lift_open_img
+{
+	ID3D11Texture2D *tex = nullptr;
+	IDXGIKeyedMutex *km = nullptr;
+	ID3D11RenderTargetView *rtv = nullptr;
+};
+
+//! Per module stream of a core-routed conversion (lift thread only).
+struct lift_core_stream
+{
+	ID3D11Texture2D *exact_tex = nullptr;
+	uint32_t exact_w = 0, exact_h = 0;
+	bool depth_logged = false;
+};
+
+//! A glue-allocated image on the SERVICE device.
+struct glue_img
+{
+	ID3D11Texture2D *tex = nullptr;
+	ID3D11ShaderResourceView *srv = nullptr;
+	ID3D11RenderTargetView *rtv = nullptr;
+	IDXGIKeyedMutex *km = nullptr;
+	HANDLE share = nullptr;
+	uint64_t stream_id = 0; //!< core stream
+	uint32_t w = 0, h = 0, layers = 1;
+	DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
+};
+
+//! Per v3 (wire) stream on the core route: the client import cache + exports.
+struct glue_stream
+{
+	// Caller-input import cache (producer thread only).
+	HANDLE imp_handle = nullptr;
+	bool imp_dxgi = false;
+	ID3D11Texture2D *imp_tex = nullptr;
+	ID3D11ShaderResourceView *imp_srv = nullptr;
+	IDXGIKeyedMutex *imp_km = nullptr;
+	uint32_t imp_w = 0, imp_h = 0;
+	// Client export (the weave output pattern).
+	ID3D11Texture2D *exp_tex = nullptr;
+	HANDLE exp_handle = nullptr;
+	ID3D11Fence *exp_fence = nullptr;
+	HANDLE exp_fence_handle = nullptr;
+	uint64_t exp_fence_value = 0;
+	uint32_t exp_w = 0, exp_h = 0, exp_format = 0;
+	ID3D11Texture2D *exp_depth_tex = nullptr;
+	HANDLE exp_depth_handle = nullptr;
+	uint32_t exp_depth_w = 0, exp_depth_h = 0, exp_depth_format = 0;
+};
+
+//! S6 / S7 depth readback of one core stream (dispatcher thread).
+struct glue_rb
+{
+	ID3D11Texture2D *staging = nullptr;
+	uint32_t w = 0, h = 0;
+	DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+	bool pending = false;
+	uint64_t issued_ns = 0;
+	std::vector<float> samples;
+};
+
+//! The weave path's per-rect producer state for a core-routed stream.
+struct core_weave_state
+{
+	uint64_t id = 0; //!< the v3 wire id (logs)
+	u_lift_letterbox lb = {};
+	lift_lb_readback lb_rb[LB_RING];
+	uint32_t lb_next = 0;
+	uint32_t cap_logged_w = 0, cap_logged_h = 0;
+	bool has_last_params = false;
+	xrt_dp_lift_params last_params = {};
+};
+
 struct d3d11_lift
 {
 	// Service side (borrowed).
@@ -399,10 +504,15 @@ struct d3d11_lift
 	ID3D11DeviceContext *svc_context = nullptr;
 	ID3D11DeviceContext4 *svc_context4 = nullptr;
 	std::mutex *svc_ctx_mutex = nullptr;
-	xrt_dp_factory_d3d11_fn_t lift_factory = nullptr;
-	xrt_dp_factory_d3d11_fn_t fallback_factory = nullptr;
-	bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out) = nullptr;
-	void *eyes_ud = nullptr;
+	//! G5: the factory pair, re-resolved at every activation attempt.
+	d3d11_lift_resolve_factories_fn resolve = nullptr;
+	void *resolve_ud = nullptr;
+	//! G7: the panel's eyes, published by the service (never pulled from here).
+	std::mutex eyes_mtx;
+	xrt_eye_positions eyes = {};
+	uint64_t eyes_ns = 0;
+	void (*eyes_refresh)(void *ud) = nullptr;
+	void *eyes_refresh_ud = nullptr;
 	//! The display's nominal viewing distance (ADR-048 straight-on viewer).
 	float nominal_z = U_LIFT_NOMINAL_Z_DEFAULT_M;
 	//! DXR_LIFT_AUTO_CONVERGENCE, read once at create: who picks the
@@ -461,6 +571,41 @@ struct d3d11_lift
 	std::map<uint64_t, std::unique_ptr<lift_stream>> streams;
 	u_lift_sched sched = {}; //!< cross-stream priority scheduling (u_lift_mailbox.h)
 
+	// The dp-lift backend (#2003), under mtx unless noted.
+	std::deque<lift_cmd *> cmds;
+	std::condition_variable cmd_cv;
+	char unavail_detail[96] = {};     //!< why there is no module (the last UNAVAILABLE reason)
+	bool has_depth_slot = false;      //!< the lift DP carries lift_get_depth
+	bool module_alive = false;        //!< the lift DP is up and carries a module
+	uint64_t change_count = 0;        //!< bumps whenever activation / caps changed
+	std::vector<uint64_t> lift_evict; //!< freed image keys the lift thread drops from lift_open
+	// Lift thread only.
+	std::map<uint64_t, lift_open_img> lift_open;       //!< import_key -> lift-device view
+	std::map<uint64_t, lift_core_stream> core_streams; //!< module stream id -> state
+	ID3D11PixelShader *blit_ps = nullptr;
+	ID3D11VertexShader *blit_vs = nullptr;
+	ID3D11SamplerState *blit_samp = nullptr;
+	bool blit_tried = false;
+
+	// The core's D3D11 glue (service device). glue_mtx is a leaf.
+	std::mutex glue_mtx;
+	std::condition_variable glue_cv;
+	uint32_t glue_calls = 0; //!< glue entry points in flight (d3d11_lift_destroy waits)
+	bool glue_closed = false;
+	std::map<uint64_t, glue_img> glue_imgs; //!< import_key ->
+	uint64_t glue_next_key = 0;
+	std::map<uint64_t, glue_stream> glue_streams;    //!< v3 wire id ->
+	std::map<uint64_t, glue_rb> glue_rbs;            //!< core stream id ->
+	std::map<uint64_t, core_weave_state> core_weave; //!< v3 wire id -> (weave producer)
+	uint64_t adapter_luid = 0;
+	std::mutex viewsyn_mtx;
+	d3d11_conv_viewsyn *viewsyn = nullptr;
+	bool viewsyn_tried = false;
+
+	// The weave path's bridge to core-routed streams.
+	std::mutex bridge_mtx;
+	d3d11_lift_core_bridge bridge = {};
+
 	std::thread thread;
 };
 
@@ -469,6 +614,10 @@ caps_set_state(d3d11_lift *l, uint32_t state, const char *why)
 {
 	// Caller holds mtx. WARN once per state CHANGE, never per poll.
 	l->caps.state = state;
+	l->change_count++;
+	if (state == XRT_DP_LIFT_STATE_UNAVAILABLE && why != nullptr) {
+		snprintf(l->unavail_detail, sizeof(l->unavail_detail), "%s", why);
+	}
 	if (l->logged_state != state) {
 		l->logged_state = state;
 		U_LOG_W("[lift] module state -> %s (modes=0x%x backend='%s' max_streams=%u max_views=%u)%s%s",
@@ -800,28 +949,14 @@ stream_release_gpu(lift_stream &st)
  *
  */
 
-//! Bring up the lift device + the vendor module's DP. Lift thread, no lock held.
-static void
-lift_activate(d3d11_lift *l)
+//! The lift device on the service's adapter (shared textures cross between them).
+static HRESULT
+lift_create_device(d3d11_lift *l)
 {
-	const char *kill = getenv("DXR_LIFT");
-	if (kill != nullptr && strcmp(kill, "0") == 0) {
-		std::lock_guard<std::mutex> g(l->mtx);
-		l->activated = true;
-		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "DXR_LIFT=0 (kill switch)");
-		return;
-	}
-	if (l->lift_factory == nullptr && l->fallback_factory == nullptr) {
-		std::lock_guard<std::mutex> g(l->mtx);
-		l->activated = true;
-		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "no D3D11 display-processor factory");
-		return;
-	}
-
-	// Same adapter as the service device: shared textures cross between them.
 	IDXGIDevice *dxgi_dev = nullptr;
 	IDXGIAdapter *adapter = nullptr;
-	HRESULT hr = l->svc_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi_dev);
+	HRESULT hr = S_OK;
+	hr = l->svc_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi_dev);
 	if (SUCCEEDED(hr)) {
 		hr = dxgi_dev->GetAdapter(&adapter);
 	}
@@ -849,6 +984,39 @@ lift_activate(d3d11_lift *l)
 		rel(l->lift_device1);
 		rel(l->lift_context);
 		rel(l->lift_device);
+	}
+	return hr;
+}
+
+//! Bring up the lift device + the vendor module's DP. Lift thread, no lock held.
+static void
+lift_activate(d3d11_lift *l)
+{
+	const char *kill = getenv("DXR_LIFT");
+	if (kill != nullptr && strcmp(kill, "0") == 0) {
+		std::lock_guard<std::mutex> g(l->mtx);
+		l->activated = true;
+		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "DXR_LIFT=0 (kill switch)");
+		return;
+	}
+	// G5: re-resolved at EVERY attempt, from the plug-in that registered the
+	// lift factory (a plug-in swap or a late install is picked up, never latched).
+	void *lift_factory_p = nullptr, *fallback_factory_p = nullptr;
+	if (l->resolve != nullptr) {
+		(void)l->resolve(l->resolve_ud, &lift_factory_p, &fallback_factory_p);
+	}
+	const xrt_dp_factory_d3d11_fn_t lift_factory = (xrt_dp_factory_d3d11_fn_t)lift_factory_p;
+	const xrt_dp_factory_d3d11_fn_t fallback_factory = (xrt_dp_factory_d3d11_fn_t)fallback_factory_p;
+	if (lift_factory == nullptr && fallback_factory == nullptr) {
+		std::lock_guard<std::mutex> g(l->mtx);
+		l->activated = true;
+		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "no D3D11 display-processor factory");
+		return;
+	}
+
+	// Same adapter as the service device: shared textures cross between them.
+	// A retry keeps the device it already made.
+	if (l->lift_device == nullptr && FAILED(lift_create_device(l))) {
 		std::lock_guard<std::mutex> g(l->mtx);
 		l->activated = true;
 		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE, "lift device creation failed");
@@ -858,10 +1026,10 @@ lift_activate(d3d11_lift *l)
 	// The lift DP — never weaves, carries only the module. The plug-in's
 	// explicit lift-only factory when it has one (no weaver, no tracker
 	// session); else its ordinary factory with a NULL window.
-	const bool lift_only = l->lift_factory != nullptr;
+	const bool lift_only = lift_factory != nullptr;
 	lift_vendor_call(l, "display-processor factory");
 	xrt_result_t xret =
-	    (lift_only ? l->lift_factory : l->fallback_factory)(l->lift_device, l->lift_context, nullptr, &l->dp);
+	    (lift_only ? lift_factory : fallback_factory)(l->lift_device, l->lift_context, nullptr, &l->dp);
 	lift_vendor_call(l, nullptr);
 	U_LOG_W("[lift] lift DP %s via the plug-in's %s factory (dedicated device, NULL window)",
 	        xret == XRT_SUCCESS && l->dp != nullptr ? "created" : "REFUSED",
@@ -882,6 +1050,8 @@ lift_activate(d3d11_lift *l)
 
 	std::lock_guard<std::mutex> g(l->mtx);
 	l->activated = true;
+	l->module_alive = have;
+	l->has_depth_slot = have && XRT_DP_HAS_SLOT(l->dp, lift_get_depth) && l->dp->lift_get_depth != nullptr;
 	if (!have) {
 		l->caps = caps;
 		caps_set_state(l, XRT_DP_LIFT_STATE_UNAVAILABLE,
@@ -1039,8 +1209,7 @@ resolve_viewpoints(d3d11_lift *l,
 		viewpoints_mid_baseline(vps, n, r.mid, &r.baseline);
 		return r;
 	}
-	if (l->eyes_fn == nullptr || st.info.mode == XRT_DP_LIFT_MODE_GAUSSIANS ||
-	    st.info.mode == XRT_DP_LIFT_MODE_DEPTH) {
+	if (st.info.mode == XRT_DP_LIFT_MODE_GAUSSIANS || st.info.mode == XRT_DP_LIFT_MODE_DEPTH) {
 		return r;
 	}
 
@@ -1108,8 +1277,16 @@ resolve_viewpoints(d3d11_lift *l,
 		vc.parallax_factor = 1.0f;
 	}
 
+	// G7: the snapshot the service published (no render_mutex on this thread).
 	struct xrt_eye_positions eyes = {};
-	if (!l->eyes_fn(l->eyes_ud, &eyes) || !eyes.valid || eyes.count < 2) {
+	uint64_t eyes_ns = 0;
+	{
+		std::lock_guard<std::mutex> g(l->eyes_mtx);
+		eyes = l->eyes;
+		eyes_ns = l->eyes_ns;
+	}
+	const uint64_t eyes_now = os_monotonic_get_ns();
+	if (eyes_ns == 0 || eyes_now - eyes_ns > 1000ull * 1000ull * 1000ull || !eyes.valid || eyes.count < 2) {
 		u_lift_recenter_reset(&st.recenter); // no eyes: the filter starts over
 		return r;
 	}
@@ -1512,6 +1689,9 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	uint32_t blob_format = 0;
 	const bool is_blob = st.info.mode == XRT_DP_LIFT_MODE_GAUSSIANS;
 	if (ok) {
+		// Bracketed like the factory and lift_get_caps, so the stall WARN can
+		// name a conversion the thread is stuck in (#2003).
+		lift_vendor_call(l, is_blob ? "lift_convert_blob" : "lift_convert");
 		if (is_blob) {
 			ok = xrt_display_processor_d3d11_has_lift_blob(l->dp) &&
 			     l->dp->lift_convert_blob(l->dp, st.dp_id, l->lift_context, st.exact_tex, w, h, &params,
@@ -1522,6 +1702,7 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 			                         vp_floats > 0 ? vps : nullptr, vp_floats, &out_res, &ow, &oh, &of) &&
 			     out_res != nullptr && ow > 0 && oh > 0;
 		}
+		lift_vendor_call(l, nullptr);
 	}
 
 	// 4. Copy the module's output (valid only until its next call) into the ring.
@@ -1646,6 +1827,396 @@ lift_convert_one(d3d11_lift *l, lift_stream &st, std::unique_lock<std::mutex> &l
 	l->cv.notify_all();
 }
 
+/*
+ *
+ * The dp-lift backend on the lift thread (#2003). The provider's exec thread
+ * queues one command per [S] call (lift_cmd_run) and waits; the lift thread
+ * runs it between pre-core conversions. The runtime's images arrive as
+ * shared NT handles (glue-allocated on the service device, keyed mutex) and
+ * are opened on the lift device once per allocation (lift_open).
+ *
+ */
+
+static const char *k_blit_ps = R"(
+Texture2D src : register(t0);
+SamplerState samp : register(s0);
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	return src.SampleLevel(samp, uv, 0);
+}
+)";
+
+//! XRT_CONV_FMT_* -> DXGI_FORMAT (UNKNOWN = not representable).
+static DXGI_FORMAT
+conv_fmt_to_dxgi(uint32_t f)
+{
+	switch (f) {
+	case XRT_CONV_FMT_RGBA8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case XRT_CONV_FMT_RGBA8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	case XRT_CONV_FMT_BGRA8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case XRT_CONV_FMT_BGRA8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	case XRT_CONV_FMT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+	case XRT_CONV_FMT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
+	case XRT_CONV_FMT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+	case XRT_CONV_FMT_RGBA16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case XRT_CONV_FMT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+	default: return DXGI_FORMAT_UNKNOWN;
+	}
+}
+
+//! DXGI_FORMAT -> XRT_CONV_FMT_* (UNKNOWN = none).
+static uint32_t
+dxgi_to_conv_fmt(uint32_t d)
+{
+	switch ((DXGI_FORMAT)d) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return XRT_CONV_FMT_RGBA8_UNORM;
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return XRT_CONV_FMT_RGBA8_SRGB;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return XRT_CONV_FMT_BGRA8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return XRT_CONV_FMT_BGRA8_SRGB;
+	case DXGI_FORMAT_R8_UNORM: return XRT_CONV_FMT_R8_UNORM;
+	case DXGI_FORMAT_R16_FLOAT: return XRT_CONV_FMT_R16_FLOAT;
+	case DXGI_FORMAT_R32_FLOAT: return XRT_CONV_FMT_R32_FLOAT;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return XRT_CONV_FMT_RGBA16_FLOAT;
+	case DXGI_FORMAT_R16_UNORM: return XRT_CONV_FMT_R16_UNORM;
+	default: return XRT_CONV_FMT_UNKNOWN;
+	}
+}
+
+//! A keyed-mutex acquire with the image's sync keys (no mutex = nothing to wait for).
+static bool
+img_acquire(IDXGIKeyedMutex *km, const xrt_conv_image *img, DWORD ms)
+{
+	if (km == nullptr) {
+		return true;
+	}
+	const uint64_t key =
+	    img != nullptr && img->sync.kind == XRT_CONV_SYNC_KEYED_MUTEX ? img->sync.acquire_value : 0;
+	HRESULT hr = km->AcquireSync(key, ms);
+	return SUCCEEDED(hr) && hr != (HRESULT)WAIT_TIMEOUT;
+}
+
+static void
+img_release(IDXGIKeyedMutex *km, const xrt_conv_image *img)
+{
+	if (km != nullptr) {
+		km->ReleaseSync(img != nullptr && img->sync.kind == XRT_CONV_SYNC_KEYED_MUTEX ? img->sync.release_value
+		                                                                              : 0);
+	}
+}
+
+//! Drop lift-device views of images the glue freed. Lift thread.
+static void
+lift_drop_evicted(d3d11_lift *l)
+{
+	std::vector<uint64_t> keys;
+	{
+		std::lock_guard<std::mutex> g(l->mtx);
+		keys.swap(l->lift_evict);
+	}
+	for (uint64_t k : keys) {
+		auto it = l->lift_open.find(k);
+		if (it != l->lift_open.end()) {
+			rel(it->second.rtv);
+			rel(it->second.km);
+			rel(it->second.tex);
+			l->lift_open.erase(it);
+		}
+	}
+}
+
+//! The lift device's view of a runtime image (opened once per allocation). Lift thread.
+static lift_open_img *
+lift_open(d3d11_lift *l, const xrt_conv_image *img, bool want_rtv)
+{
+	if (img == nullptr || img->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || img->handle == 0 ||
+	    l->lift_device1 == nullptr) {
+		return nullptr;
+	}
+	auto it = l->lift_open.find(img->import_key);
+	if (it == l->lift_open.end()) {
+		lift_open_img o;
+		HRESULT hr = l->lift_device1->OpenSharedResource1((HANDLE)(uintptr_t)img->handle,
+		                                                  __uuidof(ID3D11Texture2D), (void **)&o.tex);
+		if (FAILED(hr)) {
+			U_LOG_E("[lift] dp-lift: runtime image open on the lift device failed: 0x%08lx",
+			        (unsigned long)hr);
+			return nullptr;
+		}
+		(void)o.tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&o.km);
+		it = l->lift_open.emplace(img->import_key, o).first;
+	}
+	lift_open_img &o = it->second;
+	if (want_rtv && o.rtv == nullptr) {
+		D3D11_TEXTURE2D_DESC td = {};
+		o.tex->GetDesc(&td);
+		D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+		rd.Format = typed_srv_format(td.Format);
+		rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		(void)l->lift_device->CreateRenderTargetView(o.tex, &rd, &o.rtv);
+	}
+	return &o;
+}
+
+static bool
+lift_blit_init(d3d11_lift *l)
+{
+	if (l->blit_tried) {
+		return l->blit_ps != nullptr && l->blit_vs != nullptr && l->blit_samp != nullptr;
+	}
+	l->blit_tried = true;
+	ID3DBlob *b = nullptr, *err = nullptr;
+	bool ok = SUCCEEDED(D3DCompile(k_snap_vs, strlen(k_snap_vs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0,
+	                               &b, &err)) &&
+	          SUCCEEDED(l->lift_device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr,
+	                                                       &l->blit_vs));
+	rel(b);
+	rel(err);
+	ok = ok &&
+	     SUCCEEDED(D3DCompile(k_blit_ps, strlen(k_blit_ps), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &b,
+	                          &err)) &&
+	     SUCCEEDED(
+	         l->lift_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &l->blit_ps));
+	rel(b);
+	rel(err);
+	if (ok) {
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		ok = SUCCEEDED(l->lift_device->CreateSamplerState(&sd, &l->blit_samp));
+	}
+	if (!ok) {
+		U_LOG_E(
+		    "[lift] dp-lift: output blit init failed — module outputs of another size / format are dropped");
+	}
+	return ok;
+}
+
+/*!
+ * Write the module's output @p src (@p sw x @p sh, DXGI @p sfmt) into the
+ * runtime target @p img: a copy when the shapes match (the usual case: the
+ * provider's output desc predicted them), else a stretch / format-converting
+ * draw. Lift thread.
+ */
+static bool
+lift_write_target(
+    d3d11_lift *l, const xrt_conv_image *img, ID3D11Resource *src, uint32_t sw, uint32_t sh, uint32_t sfmt)
+{
+	if (img == nullptr || img->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || src == nullptr) {
+		return false; // the glue never hands dp-lift a CPU target
+	}
+	const DXGI_FORMAT tf = conv_fmt_to_dxgi(img->format);
+	const bool same =
+	    img->width == sw && img->height == sh && typed_srv_format((DXGI_FORMAT)sfmt) == typed_srv_format(tf);
+	lift_open_img *o = lift_open(l, img, !same);
+	if (o == nullptr || !img_acquire(o->km, img, 100)) {
+		return false;
+	}
+	ID3D11DeviceContext *ctx = l->lift_context;
+	bool ok = true;
+	if (same) {
+		D3D11_BOX box = {0, 0, 0, sw, sh, 1};
+		ctx->CopySubresourceRegion(o->tex, 0, 0, 0, 0, src, 0, &box);
+	} else {
+		ID3D11ShaderResourceView *srv = nullptr;
+		ok = o->rtv != nullptr && lift_blit_init(l);
+		if (ok) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+			sd.Format = typed_srv_format((DXGI_FORMAT)sfmt);
+			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sd.Texture2D.MipLevels = 1;
+			ok = SUCCEEDED(l->lift_device->CreateShaderResourceView(src, &sd, &srv));
+		}
+		if (ok) {
+			D3D11_VIEWPORT vp = {};
+			vp.Width = (float)img->width;
+			vp.Height = (float)img->height;
+			vp.MaxDepth = 1.0f;
+			ctx->RSSetViewports(1, &vp);
+			ctx->RSSetState(nullptr);
+			ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+			ctx->OMSetDepthStencilState(nullptr, 0);
+			ctx->OMSetRenderTargets(1, &o->rtv, nullptr);
+			ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			ctx->IASetInputLayout(nullptr);
+			ctx->VSSetShader(l->blit_vs, nullptr, 0);
+			ctx->GSSetShader(nullptr, nullptr, 0);
+			ctx->PSSetShader(l->blit_ps, nullptr, 0);
+			ctx->PSSetSamplers(0, 1, &l->blit_samp);
+			ctx->PSSetShaderResources(0, 1, &srv);
+			ctx->Draw(4, 0);
+			ID3D11ShaderResourceView *null_srv = nullptr;
+			ctx->PSSetShaderResources(0, 1, &null_srv);
+			ID3D11RenderTargetView *null_rtv = nullptr;
+			ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+		}
+		rel(srv);
+	}
+	img_release(o->km, img);
+	return ok;
+}
+
+//! One core-routed conversion (LIFT_CMD_CONVERT). Lift thread, no lock held.
+static xrt_result_t
+lift_core_convert(d3d11_lift *l, uint64_t dp_id, conv_dp_lift_convert *io)
+{
+	if (l->dp == nullptr || io == nullptr || io->input == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	const xrt_conv_image *in = io->input;
+	const uint32_t w = in->width, h = in->height;
+	lift_core_stream &cs = l->core_streams[dp_id];
+
+	// The module contract: an RGBA8 input of exactly w x h on the lift device,
+	// valid for the call. Copied out of the runtime's slot so its keyed mutex
+	// is held for one copy only (the pre-core path's exact_tex).
+	bool ok = w > 0 && h > 0;
+	if (ok && (cs.exact_tex == nullptr || cs.exact_w != w || cs.exact_h != h)) {
+		rel(cs.exact_tex);
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		ok = SUCCEEDED(l->lift_device->CreateTexture2D(&td, nullptr, &cs.exact_tex));
+		cs.exact_w = ok ? w : 0;
+		cs.exact_h = ok ? h : 0;
+	}
+	if (ok && in->memory_kind == XRT_CONV_MEM_WIN32_NT_HANDLE) {
+		lift_open_img *o = lift_open(l, in, false);
+		ok = o != nullptr && img_acquire(o->km, in, 100);
+		if (ok) {
+			D3D11_BOX box = {0, 0, 0, w, h, 1};
+			l->lift_context->CopySubresourceRegion(cs.exact_tex, 0, 0, 0, 0, o->tex, 0, &box);
+			img_release(o->km, in);
+		}
+	} else if (ok && in->memory_kind == XRT_CONV_MEM_CPU && in->cpu_ptr != nullptr) {
+		l->lift_context->UpdateSubresource(cs.exact_tex, 0, nullptr, in->cpu_ptr,
+		                                   in->row_stride != 0 ? in->row_stride : w * 4u, 0);
+	} else {
+		ok = false;
+	}
+
+	void *out_res = nullptr;
+	uint32_t ow = 0, oh = 0, of = 0;
+	if (ok) {
+		lift_vendor_call(l, "lift_convert");
+		ok = l->dp->lift_convert(l->dp, dp_id, l->lift_context, cs.exact_tex, w, h, io->params, io->viewpoints,
+		                         io->viewpoint_floats, &out_res, &ow, &oh, &of) &&
+		     out_res != nullptr && ow > 0 && oh > 0;
+		lift_vendor_call(l, nullptr);
+	}
+	if (!ok) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // no output this frame: the core keeps the previous one
+	}
+	io->out_w = ow;
+	io->out_h = oh;
+	io->out_format = dxgi_to_conv_fmt(of);
+
+	const xrt_conv_image *primary = io->primary_is_depth ? io->depth_target : io->views_target;
+	const bool pw = primary != nullptr && lift_write_target(l, primary, (ID3D11Resource *)out_res, ow, oh, of);
+	if (io->primary_is_depth) {
+		io->depth_written = pw;
+	} else {
+		io->views_written = pw;
+	}
+	// The auxiliary depth of THIS conversion (the DP's texture is valid only
+	// until its next lift_convert on this stream).
+	if (pw && io->want_depth && io->depth_target != nullptr) {
+		xrt_dp_lift_depth dd;
+		lift_vendor_call(l, "lift_get_depth");
+		const bool got = xrt_display_processor_d3d11_lift_get_depth(l->dp, dp_id, l->lift_context, &dd);
+		lift_vendor_call(l, nullptr);
+		if (got && dd.resource != nullptr &&
+		    (dd.format == DXGI_FORMAT_R32_FLOAT || dd.format == DXGI_FORMAT_R16_FLOAT)) {
+			io->depth_written = lift_write_target(l, io->depth_target, (ID3D11Resource *)dd.resource,
+			                                      dd.width, dd.height, dd.format);
+			io->have_depth_meta = io->depth_written;
+			io->depth = dd;
+			io->depth.resource = nullptr;
+		} else if (!cs.depth_logged) {
+			cs.depth_logged = true;
+			U_LOG_W("[lift] dp-lift stream %llu: depth asked for, the module returned none%s",
+			        (unsigned long long)dp_id, got ? " in R32_FLOAT / R16_FLOAT" : "");
+		}
+	}
+	l->lift_context->Flush();
+	return pw ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+}
+
+//! Run one backend command. Lift thread, no lock held.
+static void
+lift_run_cmd(d3d11_lift *l, lift_cmd *c)
+{
+	lift_drop_evicted(l);
+	switch (c->op) {
+	case LIFT_CMD_ACTIVATE: {
+		bool run;
+		{
+			std::lock_guard<std::mutex> g(l->mtx);
+			l->activate_requested = true;
+			// G5: no latch — a retry after "no module" runs the whole attempt
+			// again, re-resolving the factory pair.
+			run = !l->activated || (c->retry && !l->module_alive);
+			if (run) {
+				l->activated = false;
+			}
+		}
+		if (run) {
+			lift_activate(l);
+		}
+		c->result = XRT_SUCCESS;
+		break;
+	}
+	case LIFT_CMD_POLL:
+		if (l->dp != nullptr) {
+			lift_poll_caps(l);
+		}
+		c->result = XRT_SUCCESS;
+		break;
+	case LIFT_CMD_STREAM_CREATE: {
+		c->result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		if (l->dp == nullptr || c->info == nullptr) {
+			break;
+		}
+		lift_vendor_call(l, "lift_stream_create");
+		const bool ok = l->dp->lift_stream_create(l->dp, c->info, &c->dp_id);
+		lift_vendor_call(l, nullptr);
+		if (ok) {
+			l->core_streams[c->dp_id] = lift_core_stream{};
+			c->result = XRT_SUCCESS;
+			U_LOG_W("[lift] dp-lift: module stream %llu created (mode=%u hint=%u aux=%u)",
+			        (unsigned long long)c->dp_id, c->info->mode, c->info->content_hint,
+			        c->info->aux_outputs);
+		} else {
+			U_LOG_W("[lift] dp-lift: the module refused a stream (mode=%u hint=%u)", c->info->mode,
+			        c->info->content_hint);
+		}
+		break;
+	}
+	case LIFT_CMD_STREAM_DESTROY: {
+		if (l->dp != nullptr) {
+			lift_vendor_call(l, "lift_stream_destroy");
+			l->dp->lift_stream_destroy(l->dp, c->dp_id);
+			lift_vendor_call(l, nullptr);
+		}
+		auto it = l->core_streams.find(c->dp_id);
+		if (it != l->core_streams.end()) {
+			rel(it->second.exact_tex);
+			l->core_streams.erase(it);
+		}
+		c->result = XRT_SUCCESS;
+		break;
+	}
+	case LIFT_CMD_CONVERT: c->result = lift_core_convert(l, c->dp_id, c->io); break;
+	}
+}
+
 static bool
 any_dead(d3d11_lift *l)
 {
@@ -1678,12 +2249,24 @@ lift_thread_main(d3d11_lift *l)
 		l->cv.wait_for(lk, std::chrono::milliseconds(250), [&] {
 			// Frames only count as work once the module is READY (they wait,
 			// latest-wins, until then); dead streams always do (reaping).
-			return l->stop || (l->activate_requested && !l->activated) ||
+			return l->stop || !l->cmds.empty() || (l->activate_requested && !l->activated) ||
 			       (l->activated &&
 			        (any_dead(l) || (l->caps.state == XRT_DP_LIFT_STATE_READY && any_work(l))));
 		});
 		if (l->stop) {
 			break;
+		}
+		// The conversion core's dp-lift commands (#2003) first; the pre-core
+		// path below is a branch of the same thread.
+		if (!l->cmds.empty()) {
+			lift_cmd *c = l->cmds.front();
+			l->cmds.pop_front();
+			lk.unlock();
+			lift_run_cmd(l, c);
+			lk.lock();
+			c->done = true;
+			l->cmd_cv.notify_all();
+			continue;
 		}
 		if (l->activate_requested && !l->activated) {
 			lk.unlock();
@@ -1752,7 +2335,16 @@ lift_thread_main(d3d11_lift *l)
 		}
 	}
 
-	// Shutdown: every stream, then the DP, on this thread.
+	// Shutdown: queued backend commands fail, every stream (pre-core and
+	// core-routed) goes, then the DP, on this thread.
+	while (!l->cmds.empty()) {
+		lift_cmd *c = l->cmds.front();
+		l->cmds.pop_front();
+		c->result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		c->done = true;
+	}
+	l->module_alive = false;
+	l->cmd_cv.notify_all();
 	for (auto &kv : l->streams) {
 		lift_stream &st = *kv.second;
 		if (st.dp_created && l->dp != nullptr) {
@@ -1762,6 +2354,26 @@ lift_thread_main(d3d11_lift *l)
 	}
 	l->streams.clear();
 	lk.unlock();
+	for (auto &kv : l->core_streams) {
+		if (l->dp != nullptr) {
+			l->dp->lift_stream_destroy(l->dp, kv.first);
+		}
+		rel(kv.second.exact_tex);
+	}
+	l->core_streams.clear();
+	{
+		std::lock_guard<std::mutex> g(l->mtx);
+		l->lift_evict.clear();
+	}
+	for (auto &kv : l->lift_open) {
+		rel(kv.second.rtv);
+		rel(kv.second.km);
+		rel(kv.second.tex);
+	}
+	l->lift_open.clear();
+	rel(l->blit_samp);
+	rel(l->blit_ps);
+	rel(l->blit_vs);
 	if (l->dp != nullptr) {
 		xrt_display_processor_d3d11_destroy(&l->dp);
 	}
@@ -1784,14 +2396,50 @@ find_live(d3d11_lift *l, uint64_t owner, uint64_t id)
 	return it->second.get();
 }
 
+// #2003: the glue, the bridge and the core weave branch (defined at the end).
+static bool
+glue_enter(d3d11_lift *l);
+static void
+glue_leave(d3d11_lift *l);
+static void
+glue_close(d3d11_lift *l);
+static void
+glue_release_all(d3d11_lift *l);
+static bool
+bridge_resolve(
+    d3d11_lift *l, uint64_t owner, uint64_t wire_id, conv_core **out_core, uint64_t *out_core_id, uint32_t *out_mode);
+static void
+eyes_refresh_if_stale(d3d11_lift *l);
+static xrt_result_t
+core_weave_submit_locked(d3d11_lift *l,
+                         uint64_t owner,
+                         uint64_t id,
+                         ID3D11ShaderResourceView *src,
+                         uint32_t src_tw,
+                         uint32_t src_th,
+                         uint32_t x,
+                         uint32_t y,
+                         uint32_t w,
+                         uint32_t h,
+                         int64_t source_time,
+                         const xrt_dp_lift_params *params,
+                         const float *viewpoints,
+                         uint32_t viewpoint_floats,
+                         const xrt_lift_view_control *view_control,
+                         const xrt_lift_rig *rig,
+                         const xrt_lift_rect_frame *frame,
+                         uint64_t *out_frame_id);
+static bool
+core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out);
+static void
+core_unpin(d3d11_lift *l, d3d11_lift_pin *pin);
+
 struct d3d11_lift *
 d3d11_lift_create(ID3D11Device *svc_device,
                   ID3D11DeviceContext *svc_context,
                   std::mutex *svc_ctx_mutex,
-                  void *lift_factory,
-                  void *fallback_factory,
-                  bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out),
-                  void *eyes_ud,
+                  d3d11_lift_resolve_factories_fn resolve,
+                  void *resolve_ud,
                   float nominal_z)
 {
 	if (svc_device == nullptr || svc_context == nullptr || svc_ctx_mutex == nullptr) {
@@ -1803,10 +2451,21 @@ d3d11_lift_create(ID3D11Device *svc_device,
 	l->svc_context = svc_context;
 	l->svc_context->AddRef();
 	l->svc_ctx_mutex = svc_ctx_mutex;
-	l->lift_factory = (xrt_dp_factory_d3d11_fn_t)lift_factory;
-	l->fallback_factory = (xrt_dp_factory_d3d11_fn_t)fallback_factory;
-	l->eyes_fn = eyes_fn;
-	l->eyes_ud = eyes_ud;
+	l->resolve = resolve;
+	l->resolve_ud = resolve_ud;
+	{
+		// The adapter the runtime's images live on (xrt_conv_image::adapter_luid).
+		IDXGIDevice *dd = nullptr;
+		IDXGIAdapter *ad = nullptr;
+		DXGI_ADAPTER_DESC desc = {};
+		if (SUCCEEDED(svc_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dd)) &&
+		    SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&desc))) {
+			l->adapter_luid =
+			    ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32) | desc.AdapterLuid.LowPart;
+		}
+		rel(ad);
+		rel(dd);
+	}
 	l->nominal_z = nominal_z > 0.0f ? nominal_z : U_LIFT_NOMINAL_Z_DEFAULT_M;
 	{
 		const char *rc = getenv("DXR_LIFT_RECENTER");
@@ -1945,6 +2604,7 @@ d3d11_lift_destroy(struct d3d11_lift **lift_ptr)
 		return;
 	}
 	d3d11_lift *l = *lift_ptr;
+	glue_close(l);
 	{
 		std::lock_guard<std::mutex> g(l->mtx);
 		l->stop = true;
@@ -1953,6 +2613,7 @@ d3d11_lift_destroy(struct d3d11_lift **lift_ptr)
 	if (l->thread.joinable()) {
 		l->thread.join();
 	}
+	glue_release_all(l);
 	rel(l->lb_cbuf);
 	rel(l->lb_rtv);
 	rel(l->lb_tex);
@@ -2106,6 +2767,12 @@ d3d11_lift_stream_mode(struct d3d11_lift *l, uint64_t owner, uint64_t id)
 	if (l == nullptr) {
 		return 0;
 	}
+	if ((id & D3D11_LIFT_CORE_STREAM_TAG) != 0) {
+		// #2003: a core-routed stream (weave rects resolve it, never refused).
+		uint64_t core_id = 0;
+		uint32_t mode = 0;
+		return bridge_resolve(l, owner, id, nullptr, &core_id, &mode) ? mode : 0;
+	}
 	std::lock_guard<std::mutex> g(l->mtx);
 	lift_stream *st = find_live(l, owner, id);
 	return st != nullptr ? st->info.mode : 0;
@@ -2117,9 +2784,17 @@ d3d11_lift_stream_mode(struct d3d11_lift *l, uint64_t owner, uint64_t id)
  * match, box-filtered down when the snapshot cap shrank them. Caller holds the
  * service context mutex; takes the slot's keyed mutex itself.
  */
+//! A snapshot destination: the pre-core input slot, or a core slot image (#2003).
+struct blit_dst
+{
+	IDXGIKeyedMutex *svc_km;
+	ID3D11RenderTargetView *svc_rtv;
+};
+
+template <typename SLOT>
 static bool
 snapshot_blit(d3d11_lift *l,
-              lift_in_slot &s,
+              SLOT &s,
               ID3D11ShaderResourceView *src,
               uint32_t src_tw,
               uint32_t src_th,
@@ -2203,14 +2878,9 @@ snapshot_blit(d3d11_lift *l,
  * dwarfs anyway. Producer thread (service context mutex held); @p st is not
  * reaped meanwhile (its input slot is WRITING).
  */
+template <typename STATE>
 static void
-letterbox_step(d3d11_lift *l,
-               lift_stream &st,
-               ID3D11ShaderResourceView *src,
-               uint32_t x,
-               uint32_t y,
-               uint32_t w,
-               uint32_t h)
+letterbox_step(d3d11_lift *l, STATE &st, ID3D11ShaderResourceView *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 	ID3D11DeviceContext *ctx = l->svc_context;
 
@@ -2501,6 +3171,11 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
 	if (l == nullptr || !l->snap_ok || src == nullptr || out_frame_id == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	if ((id & D3D11_LIFT_CORE_STREAM_TAG) != 0) {
+		// #2003: a core-routed stream — the same snapshot policy into a core slot.
+		return core_weave_submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params,
+		                                viewpoints, viewpoint_floats, view_control, rig, frame, out_frame_id);
+	}
 	// Weave-rect snapshot: the service's size cap applies. XR_DXR_lift v3: a
 	// lifted rect may carry EXPLICIT viewpoints and an app rig.
 	return submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, viewpoints,
@@ -2545,6 +3220,7 @@ d3d11_lift_submit_handle(struct d3d11_lift *l,
 		}
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream / bad extent: non-fatal
 	}
+	eyes_refresh_if_stale(l);
 
 	// Import cache, per stream (producer thread only — one IPC thread per
 	// connection). A duplicated NT handle is a new value every submit, so the
@@ -2632,6 +3308,9 @@ d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct 
 	if (l == nullptr) {
 		return false;
 	}
+	if ((id & D3D11_LIFT_CORE_STREAM_TAG) != 0) {
+		return core_pin_latest(l, owner, id, out);
+	}
 	int32_t slot = -1;
 	lift_out_slot *o = nullptr;
 	{
@@ -2717,6 +3396,11 @@ d3d11_lift_unpin(struct d3d11_lift_pin *pin)
 	}
 	pin->km->ReleaseSync(0);
 	d3d11_lift *l = pin->lift;
+	if (pin->core) {
+		core_unpin(l, pin);
+		*pin = d3d11_lift_pin{};
+		return;
+	}
 	{
 		std::lock_guard<std::mutex> g(l->mtx);
 		auto it = l->streams.find(pin->stream_id); // dead streams stay mapped until unpinned
@@ -3086,4 +3770,1356 @@ d3d11_lift_get_stats(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct x
 	out->latency_max_ns = st->mb.lat_max_ns;
 	out->rate_hz = u_lift_mailbox_rate_hz(&st->mb);
 	return XRT_SUCCESS;
+}
+
+
+/*
+ *
+ * Eyes (G7), the dp-lift backend, the bridge (#2003).
+ *
+ */
+
+void
+d3d11_lift_publish_eyes(struct d3d11_lift *l, const struct xrt_eye_positions *eyes)
+{
+	if (l == nullptr || eyes == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(l->eyes_mtx);
+	l->eyes = *eyes;
+	l->eyes_ns = os_monotonic_get_ns();
+}
+
+void
+d3d11_lift_set_eyes_refresh(struct d3d11_lift *l, void (*fn)(void *ud), void *ud)
+{
+	if (l == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(l->eyes_mtx);
+	l->eyes_refresh = fn;
+	l->eyes_refresh_ud = ud;
+}
+
+//! Producer side: pull fresh eyes when nothing published them lately.
+static void
+eyes_refresh_if_stale(d3d11_lift *l)
+{
+	void (*fn)(void *) = nullptr;
+	void *ud = nullptr;
+	{
+		std::lock_guard<std::mutex> g(l->eyes_mtx);
+		const uint64_t now = os_monotonic_get_ns();
+		if (l->eyes_ns != 0 && now - l->eyes_ns < 50ull * 1000ull * 1000ull) {
+			return;
+		}
+		fn = l->eyes_refresh;
+		ud = l->eyes_refresh_ud;
+	}
+	if (fn != nullptr) {
+		fn(ud); // publishes through d3d11_lift_publish_eyes
+	}
+}
+
+//! Hand one command to the lift thread and wait for it (the provider's exec thread).
+static xrt_result_t
+lift_cmd_run(d3d11_lift *l, lift_cmd *c)
+{
+	std::unique_lock<std::mutex> lk(l->mtx);
+	if (l->stop) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	l->cmds.push_back(c);
+	l->cv.notify_all();
+	l->cmd_cv.wait(lk, [c] { return c->done; });
+	return c->result;
+}
+
+static void
+be_snapshot(void *ud, conv_dp_lift_snapshot *out)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	memset(out, 0, sizeof(*out));
+	void *lf = nullptr, *ff = nullptr;
+	if (l->resolve != nullptr) {
+		(void)l->resolve(l->resolve_ud, &lf, &ff);
+	}
+	out->factory_present = lf != nullptr || ff != nullptr;
+	std::lock_guard<std::mutex> g(l->mtx);
+	out->attempted = l->activated;
+	out->have_module = l->activated && l->module_alive;
+	out->has_depth_slot = l->has_depth_slot;
+	out->caps = l->caps;
+	snprintf(out->detail, sizeof(out->detail), "%s", l->unavail_detail);
+	out->change_count = l->change_count;
+}
+
+static xrt_result_t
+be_activate(void *ud, bool retry)
+{
+	lift_cmd c;
+	c.op = LIFT_CMD_ACTIVATE;
+	c.retry = retry;
+	return lift_cmd_run((d3d11_lift *)ud, &c);
+}
+
+static void
+be_poll(void *ud)
+{
+	lift_cmd c;
+	c.op = LIFT_CMD_POLL;
+	(void)lift_cmd_run((d3d11_lift *)ud, &c);
+}
+
+static xrt_result_t
+be_stream_create(void *ud, const xrt_dp_lift_stream_info *info, uint64_t *out_dp_id)
+{
+	lift_cmd c;
+	c.op = LIFT_CMD_STREAM_CREATE;
+	c.info = info;
+	const xrt_result_t r = lift_cmd_run((d3d11_lift *)ud, &c);
+	*out_dp_id = c.dp_id;
+	return r;
+}
+
+static void
+be_stream_destroy(void *ud, uint64_t dp_id)
+{
+	lift_cmd c;
+	c.op = LIFT_CMD_STREAM_DESTROY;
+	c.dp_id = dp_id;
+	(void)lift_cmd_run((d3d11_lift *)ud, &c);
+}
+
+static xrt_result_t
+be_convert(void *ud, uint64_t dp_id, conv_dp_lift_convert *io)
+{
+	lift_cmd c;
+	c.op = LIFT_CMD_CONVERT;
+	c.dp_id = dp_id;
+	c.io = io;
+	return lift_cmd_run((d3d11_lift *)ud, &c);
+}
+
+void
+d3d11_lift_get_dp_backend(struct d3d11_lift *l, struct conv_dp_lift_backend *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (l == nullptr) {
+		return;
+	}
+	out->snapshot = be_snapshot;
+	out->activate = be_activate;
+	out->poll = be_poll;
+	out->stream_create = be_stream_create;
+	out->stream_destroy = be_stream_destroy;
+	out->convert = be_convert;
+	out->ud = l;
+}
+
+void
+d3d11_lift_set_core_bridge(struct d3d11_lift *l, const struct d3d11_lift_core_bridge *bridge)
+{
+	if (l == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(l->bridge_mtx);
+	if (bridge != nullptr) {
+		l->bridge = *bridge;
+	} else {
+		l->bridge = d3d11_lift_core_bridge{};
+	}
+}
+
+static bool
+bridge_resolve(
+    d3d11_lift *l, uint64_t owner, uint64_t wire_id, conv_core **out_core, uint64_t *out_core_id, uint32_t *out_mode)
+{
+	d3d11_lift_core_bridge b;
+	{
+		std::lock_guard<std::mutex> g(l->bridge_mtx);
+		b = l->bridge;
+	}
+	if (b.core == nullptr || b.resolve == nullptr || !b.resolve(b.ud, owner, wire_id, out_core_id, out_mode)) {
+		return false;
+	}
+	if (out_core != nullptr) {
+		*out_core = b.core;
+	}
+	return true;
+}
+
+
+/*
+ *
+ * The conversion core's D3D11 glue on the service device (#2003).
+ *
+ * Every entry point is gated (glue_enter / glue_leave): d3d11_lift_destroy
+ * closes the gate and waits for in-flight calls before anything goes away.
+ * glue_mtx guards the tables only and is never held across a GPU wait or the
+ * service context mutex (order: svc_ctx_mutex -> glue_mtx).
+ *
+ */
+
+static bool
+glue_enter(d3d11_lift *l)
+{
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	if (l->glue_closed) {
+		return false;
+	}
+	l->glue_calls++;
+	return true;
+}
+
+static void
+glue_leave(d3d11_lift *l)
+{
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	l->glue_calls--;
+	l->glue_cv.notify_all();
+}
+
+static void
+glue_close(d3d11_lift *l)
+{
+	std::unique_lock<std::mutex> lk(l->glue_mtx);
+	l->glue_closed = true;
+	l->glue_cv.wait(lk, [l] { return l->glue_calls == 0; });
+}
+
+static void
+glue_img_release(glue_img &gi)
+{
+	rel(gi.rtv);
+	rel(gi.srv);
+	rel(gi.km);
+	rel(gi.tex);
+	close_handle(gi.share);
+}
+
+static void
+glue_stream_release(glue_stream &gs)
+{
+	rel(gs.imp_km);
+	rel(gs.imp_srv);
+	rel(gs.imp_tex);
+	if (!gs.imp_dxgi) {
+		close_handle(gs.imp_handle);
+	}
+	gs.imp_handle = nullptr;
+	rel(gs.exp_fence);
+	close_handle(gs.exp_fence_handle);
+	rel(gs.exp_tex);
+	close_handle(gs.exp_handle);
+	rel(gs.exp_depth_tex);
+	close_handle(gs.exp_depth_handle);
+}
+
+static void
+glue_release_all(d3d11_lift *l)
+{
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	for (auto &kv : l->glue_imgs) {
+		glue_img_release(kv.second);
+	}
+	l->glue_imgs.clear();
+	for (auto &kv : l->glue_streams) {
+		glue_stream_release(kv.second);
+	}
+	l->glue_streams.clear();
+	for (auto &kv : l->glue_rbs) {
+		rel(kv.second.staging);
+	}
+	l->glue_rbs.clear();
+	for (auto &kv : l->core_weave) {
+		for (auto &r : kv.second.lb_rb) {
+			rel(r.staging);
+		}
+	}
+	l->core_weave.clear();
+	d3d11_conv_viewsyn_destroy(&l->viewsyn);
+}
+
+//! A glue image by its import key (copied; its COM pointers stay valid while
+//! the caller owns the slot / pin it belongs to). False = not ours (CPU).
+static bool
+glue_find(d3d11_lift *l, uint64_t key, glue_img *out)
+{
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	auto it = l->glue_imgs.find(key);
+	if (it == l->glue_imgs.end()) {
+		return false;
+	}
+	*out = it->second;
+	return true;
+}
+
+static bool
+format_renderable(DXGI_FORMAT f)
+{
+	return f != DXGI_FORMAT_UNKNOWN;
+}
+
+static bool
+glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	// The bound capability must take a shared NT handle with a keyed mutex
+	// (or say nothing); otherwise the service's CPU allocator serves it.
+	if (req->import_memory_kinds != 0 && (req->import_memory_kinds & XRT_CONV_MEM_WIN32_NT_HANDLE) == 0) {
+		return false;
+	}
+	if (req->import_sync_kinds != 0 && (req->import_sync_kinds & (1u << XRT_CONV_SYNC_KEYED_MUTEX)) == 0) {
+		return false;
+	}
+	const DXGI_FORMAT f = conv_fmt_to_dxgi(req->format);
+	if (f == DXGI_FORMAT_UNKNOWN || req->width == 0 || req->height == 0 || !glue_enter(l)) {
+		return false;
+	}
+	glue_img gi;
+	gi.w = req->width;
+	gi.h = req->height;
+	gi.layers = req->array_layers > 0 ? req->array_layers : 1;
+	gi.dxgi = f;
+	gi.stream_id = req->stream_id;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = gi.w;
+	td.Height = gi.h;
+	td.MipLevels = 1;
+	td.ArraySize = gi.layers;
+	td.Format = f;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (format_renderable(f) ? D3D11_BIND_RENDER_TARGET : 0u);
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	HRESULT hr = l->svc_device->CreateTexture2D(&td, nullptr, &gi.tex);
+	if (SUCCEEDED(hr)) {
+		hr = gi.tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&gi.km);
+	}
+	IDXGIResource1 *r1 = nullptr;
+	if (SUCCEEDED(hr)) {
+		hr = gi.tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                            &gi.share);
+	}
+	rel(r1);
+	if (SUCCEEDED(hr)) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = typed_srv_format(f);
+		if (gi.layers > 1) {
+			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			sd.Texture2DArray.MipLevels = 1;
+			sd.Texture2DArray.ArraySize = gi.layers;
+		} else {
+			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sd.Texture2D.MipLevels = 1;
+		}
+		hr = l->svc_device->CreateShaderResourceView(gi.tex, &sd, &gi.srv);
+	}
+	if (SUCCEEDED(hr) && format_renderable(f)) {
+		D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+		rd.Format = typed_srv_format(f);
+		rd.ViewDimension =
+		    D3D11_RTV_DIMENSION_TEXTURE2D; // slice 0 (ROW layouts; ARRAY views render per slice in S5)
+		if (gi.layers > 1) {
+			rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+			rd.Texture2DArray.ArraySize = 1;
+		}
+		hr = l->svc_device->CreateRenderTargetView(gi.tex, &rd, &gi.rtv);
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("[conv] D3D11 glue: image %ux%u fmt=%u create/share failed: 0x%08lx", gi.w, gi.h, req->format,
+		        (unsigned long)hr);
+		glue_img_release(gi);
+		glue_leave(l);
+		return false;
+	}
+	uint64_t key;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		key = ++l->glue_next_key; // never collides with the service CPU allocator's (bit 63 set)
+		l->glue_imgs[key] = gi;
+	}
+	memset(out, 0, sizeof(*out));
+	out->memory_kind = XRT_CONV_MEM_WIN32_NT_HANDLE;
+	out->handle = (uint64_t)(uintptr_t)gi.share;
+	out->import_key = key;
+	out->width = gi.w;
+	out->height = gi.h;
+	out->format = req->format;
+	out->color_space = (req->role == 0 || req->role == XRT_CONV_OUT_VIEWS) ? XRT_CONV_CS_SRGB : XRT_CONV_CS_DATA;
+	out->adapter_luid = l->adapter_luid;
+	out->sync.kind = XRT_CONV_SYNC_KEYED_MUTEX;
+	out->sync.import_key = key;
+	out->sync.acquire_value = 0;
+	out->sync.release_value = 0;
+	glue_leave(l);
+	return true;
+}
+
+static void
+glue_free(void *ud, struct xrt_conv_image *img)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	if (img == nullptr || img->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || !glue_enter(l)) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		auto it = l->glue_imgs.find(img->import_key);
+		if (it != l->glue_imgs.end()) {
+			const uint64_t sid = it->second.stream_id;
+			glue_img_release(it->second);
+			l->glue_imgs.erase(it);
+			bool any = false;
+			for (auto &kv : l->glue_imgs) {
+				any = any || kv.second.stream_id == sid;
+			}
+			if (!any) {
+				auto rb = l->glue_rbs.find(sid);
+				if (rb != l->glue_rbs.end()) {
+					rel(rb->second.staging);
+					l->glue_rbs.erase(rb);
+				}
+			}
+		}
+	}
+	{
+		// The lift thread drops its view of it on its next command.
+		std::lock_guard<std::mutex> g(l->mtx);
+		l->lift_evict.push_back(img->import_key);
+	}
+	glue_leave(l);
+}
+
+void
+d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (l == nullptr) {
+		return;
+	}
+	out->alloc = glue_alloc;
+	out->free = glue_free;
+	out->ud = l;
+}
+
+/*
+ * S6 / S7: depth readback. Never stalls: one staging copy in flight per
+ * stream, issued at most every U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS (the lift
+ * thread's old cadence) and mapped DO_NOT_WAIT on a later conversion. The
+ * samples returned are therefore of an earlier conversion of the same stream
+ * — the lag the pre-core readback had too.
+ */
+static bool
+glue_rb_read(void *ud,
+             const struct xrt_conv_image *depth,
+             const float **out_samples,
+             uint32_t *out_w,
+             uint32_t *out_h,
+             uint32_t *out_stride_floats)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	if (depth == nullptr || depth->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || !glue_enter(l)) {
+		return false;
+	}
+	glue_img gi;
+	glue_rb *rb = nullptr;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		auto it = l->glue_imgs.find(depth->import_key);
+		if (it != l->glue_imgs.end()) {
+			gi = it->second;
+			rb = &l->glue_rbs[gi.stream_id]; // std::map: stable; one dispatcher per stream
+		}
+	}
+	if (rb == nullptr || (gi.dxgi != DXGI_FORMAT_R32_FLOAT && gi.dxgi != DXGI_FORMAT_R16_FLOAT)) {
+		glue_leave(l);
+		return false;
+	}
+	bool fresh = false;
+	const uint64_t now = os_monotonic_get_ns();
+	if (rb->pending && rb->staging != nullptr) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		HRESULT hr = l->svc_context->Map(rb->staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+			rb->pending = false;
+			if (SUCCEEDED(hr)) {
+				rb->samples.resize((size_t)rb->w * rb->h);
+				for (uint32_t y = 0; y < rb->h; y++) {
+					const uint8_t *row = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+					float *dst = &rb->samples[(size_t)y * rb->w];
+					if (rb->fmt == DXGI_FORMAT_R32_FLOAT) {
+						memcpy(dst, row, (size_t)rb->w * sizeof(float));
+					} else {
+						for (uint32_t x = 0; x < rb->w; x++) {
+							dst[x] = half_to_float(((const uint16_t *)row)[x]);
+						}
+					}
+				}
+				l->svc_context->Unmap(rb->staging, 0);
+				fresh = true;
+			}
+		}
+	}
+	if (!rb->pending && (rb->issued_ns == 0 || now - rb->issued_ns >= U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS)) {
+		if (rb->staging == nullptr || rb->w != gi.w || rb->h != gi.h || rb->fmt != gi.dxgi) {
+			rel(rb->staging);
+			D3D11_TEXTURE2D_DESC td = {};
+			td.Width = gi.w;
+			td.Height = gi.h;
+			td.MipLevels = 1;
+			td.ArraySize = 1;
+			td.Format = gi.dxgi;
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_STAGING;
+			td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			if (FAILED(l->svc_device->CreateTexture2D(&td, nullptr, &rb->staging))) {
+				rb->staging = nullptr;
+			}
+			rb->w = gi.w;
+			rb->h = gi.h;
+			rb->fmt = gi.dxgi;
+		}
+		if (rb->staging != nullptr && img_acquire(gi.km, depth, 4)) {
+			{
+				std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+				l->svc_context->CopyResource(rb->staging, gi.tex);
+				l->svc_context->Flush();
+			}
+			img_release(gi.km, depth);
+			rb->pending = true;
+			rb->issued_ns = now;
+		}
+	}
+	if (fresh) {
+		*out_samples = rb->samples.data();
+		*out_w = rb->w;
+		*out_h = rb->h;
+		*out_stride_floats = rb->w;
+	}
+	glue_leave(l);
+	return fresh;
+}
+
+static void
+glue_rb_release(void *ud, const float *samples)
+{
+	(void)ud;
+	(void)samples; // owned by the stream's readback state until its next read
+}
+
+//! S5: the reference view synthesis on the service device.
+static bool
+glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	if (req == nullptr || req->color == nullptr || req->depth == nullptr || req->target == nullptr ||
+	    !glue_enter(l)) {
+		return false;
+	}
+	glue_img c, d, t;
+	bool ok = glue_find(l, req->color->import_key, &c) && glue_find(l, req->depth->import_key, &d) &&
+	          glue_find(l, req->target->import_key, &t);
+	std::lock_guard<std::mutex> vg(l->viewsyn_mtx);
+	if (ok && l->viewsyn == nullptr && !l->viewsyn_tried) {
+		l->viewsyn_tried = true;
+		l->viewsyn = d3d11_conv_viewsyn_create(l->svc_device);
+	}
+	ok = ok && l->viewsyn != nullptr;
+	bool held_c = false, held_d = false, held_t = false;
+	ok = ok && (held_c = img_acquire(c.km, req->color, 4));
+	ok = ok && (held_d = img_acquire(d.km, req->depth, 4));
+	ok = ok && (held_t = img_acquire(t.km, req->target, 4));
+	if (ok) {
+		u_conv_viewsyn_params p;
+		u_conv_viewsyn_params_defaults(&p);
+		p.view_count = req->view_count;
+		for (uint32_t i = 0; i < req->view_count && i < U_CONV_VIEWSYN_MAX_VIEWS; i++) {
+			p.viewpoints_m[i][0] = req->viewpoints_m[i][0];
+			p.viewpoints_m[i][1] = req->viewpoints_m[i][1];
+			p.viewpoints_m[i][2] = req->viewpoints_m[i][2];
+		}
+		p.rect_width_m = req->rect_width_m;
+		p.rect_height_m = req->rect_height_m;
+		if (req->depth_info != nullptr) {
+			p.depth = *req->depth_info;
+		}
+		p.range_near = req->range_near;
+		p.range_far = req->range_far;
+		p.convergence = req->convergence;
+		p.budget = req->budget;
+		p.rear_cap_m = req->rear_cap_m;
+		d3d11_conv_viewsyn_inputs in = {};
+		in.color = c.srv;
+		in.color_width = c.w;
+		in.color_height = c.h;
+		in.depth = d.srv;
+		in.depth_width = d.w;
+		in.depth_height = d.h;
+		in.new_content = req->new_content;
+		d3d11_conv_viewsyn_target tg = {};
+		tg.texture = t.tex;
+		tg.rtv_format = DXGI_FORMAT_UNKNOWN;
+		tg.layout = req->layout;
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		ok = d3d11_conv_viewsyn_render(l->viewsyn, l->svc_context, &in, &p, &tg);
+		l->svc_context->Flush();
+	}
+	if (held_t) {
+		img_release(t.km, req->target);
+	}
+	if (held_d) {
+		img_release(d.km, req->depth);
+	}
+	if (held_c) {
+		img_release(c.km, req->color);
+	}
+	glue_leave(l);
+	return ok;
+}
+
+void
+d3d11_lift_glue_gpu_ops(struct d3d11_lift *l,
+                        struct conv_viewsyn_ops *viewsyn,
+                        struct conv_depth_readback_ops *readback)
+{
+	if (viewsyn != nullptr) {
+		memset(viewsyn, 0, sizeof(*viewsyn));
+		if (l != nullptr) {
+			viewsyn->render = glue_viewsyn_render;
+			viewsyn->ud = l;
+		}
+	}
+	if (readback != nullptr) {
+		memset(readback, 0, sizeof(*readback));
+		if (l != nullptr) {
+			readback->read = glue_rb_read;
+			readback->release = glue_rb_release;
+			readback->ud = l;
+		}
+	}
+}
+
+/*!
+ * Open / reuse the client's shared input for v3 stream @p wire (producer
+ * thread). Takes ownership of @p handle. Returns the cached import.
+ */
+static bool
+glue_import_client(d3d11_lift *l, uint64_t wire, HANDLE handle, bool is_dxgi, glue_stream **out_gs)
+{
+	glue_stream *gs;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		gs = &l->glue_streams[wire]; // std::map: stable; one producer thread per stream
+	}
+	*out_gs = gs;
+	bool reuse = false;
+	if (gs->imp_tex != nullptr && gs->imp_dxgi == is_dxgi) {
+		reuse = is_dxgi ? (gs->imp_handle == handle) : same_kernel_object(gs->imp_handle, handle);
+	}
+	if (reuse) {
+		if (!is_dxgi) {
+			CloseHandle(handle);
+		}
+		return true;
+	}
+	rel(gs->imp_km);
+	rel(gs->imp_srv);
+	rel(gs->imp_tex);
+	if (!gs->imp_dxgi) {
+		close_handle(gs->imp_handle);
+	}
+	gs->imp_handle = nullptr;
+	HRESULT hr;
+	if (is_dxgi) {
+		hr = l->svc_device->OpenSharedResource(handle, __uuidof(ID3D11Texture2D), (void **)&gs->imp_tex);
+	} else {
+		hr = l->svc_device1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&gs->imp_tex);
+	}
+	D3D11_TEXTURE2D_DESC d = {};
+	if (SUCCEEDED(hr)) {
+		gs->imp_tex->GetDesc(&d);
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = typed_srv_format(d.Format);
+		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		hr = l->svc_device->CreateShaderResourceView(gs->imp_tex, &sd, &gs->imp_srv);
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("[conv] v3 input OpenSharedResource(%s) failed: 0x%08lx", is_dxgi ? "DXGI" : "NT",
+		        (unsigned long)hr);
+		rel(gs->imp_srv);
+		rel(gs->imp_tex);
+		if (!is_dxgi) {
+			CloseHandle(handle);
+		}
+		return false;
+	}
+	(void)gs->imp_tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&gs->imp_km);
+	gs->imp_handle = handle; // kept open (NT) for the identity compare
+	gs->imp_dxgi = is_dxgi;
+	gs->imp_w = d.Width;
+	gs->imp_h = d.Height;
+	U_LOG_I("[conv] v3 stream 0x%llx input import cached (%s, %ux%u)", (unsigned long long)wire,
+	        is_dxgi ? "DXGI" : "NT", d.Width, d.Height);
+	return true;
+}
+
+xrt_result_t
+d3d11_lift_glue_import_input(struct d3d11_lift *l,
+                             uint64_t wire,
+                             HANDLE handle,
+                             bool is_dxgi,
+                             uint32_t w,
+                             uint32_t h,
+                             const struct conv_submit_slot *slot)
+{
+	if (l == nullptr || !l->snap_ok || slot == nullptr || slot->image_count < 1 || !glue_enter(l)) {
+		if (handle != nullptr && !is_dxgi) {
+			CloseHandle(handle);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	eyes_refresh_if_stale(l);
+	glue_stream *gs = nullptr;
+	if (!glue_import_client(l, wire, handle, is_dxgi, &gs)) {
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	const xrt_conv_image *img = &slot->images[0];
+	w = w > gs->imp_w ? gs->imp_w : w;
+	h = h > gs->imp_h ? gs->imp_h : h;
+	glue_img gi;
+	const bool gpu = glue_find(l, img->import_key, &gi);
+	if (!gpu &&
+	    (img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == nullptr || img->width != w || img->height != h)) {
+		glue_leave(l);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	// The caller's keyed mutex: 4 ms, the budget every weave-side acquire uses.
+	bool acquired = false;
+	if (gs->imp_km != nullptr) {
+		HRESULT hr = gs->imp_km->AcquireSync(0, 4);
+		if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
+			glue_leave(l);
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+		acquired = true;
+	}
+	bool ok;
+	if (gpu) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		// The pre-core snapshot, into the core's slot: 1:1 (point) at the
+		// submitted size, box-filtered when inputScale shrank the slot.
+		blit_dst dst = {gi.km, gi.rtv};
+		ok = gi.rtv != nullptr &&
+		     snapshot_blit(l, dst, gs->imp_srv, gs->imp_w, gs->imp_h, 0, 0, w, h, gi.w, gi.h);
+		l->svc_context->Flush();
+	} else {
+		// A CPU provider's slot: read the region back (slow path, sim providers only).
+		D3D11_TEXTURE2D_DESC td = {};
+		gs->imp_tex->GetDesc(&td);
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.MiscFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		ID3D11Texture2D *st = nullptr;
+		ok = (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM || td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+		      td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+		     SUCCEEDED(l->svc_device->CreateTexture2D(&td, nullptr, &st));
+		if (ok) {
+			std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+			D3D11_BOX box = {0, 0, 0, w, h, 1};
+			l->svc_context->CopySubresourceRegion(st, 0, 0, 0, 0, gs->imp_tex, 0, &box);
+			D3D11_MAPPED_SUBRESOURCE m = {};
+			ok = SUCCEEDED(l->svc_context->Map(st, 0, D3D11_MAP_READ, 0, &m));
+			if (ok) {
+				const uint32_t stride = img->row_stride != 0 ? img->row_stride : w * 4u;
+				for (uint32_t y = 0; y < h; y++) {
+					memcpy((uint8_t *)img->cpu_ptr + (size_t)y * stride,
+					       (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4u);
+				}
+				l->svc_context->Unmap(st, 0);
+			}
+		}
+		rel(st);
+	}
+	if (acquired) {
+		gs->imp_km->ReleaseSync(0);
+	}
+	glue_leave(l);
+	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
+}
+
+xrt_result_t
+d3d11_lift_glue_import_input_cpu(
+    struct d3d11_lift *l, uint64_t wire, HANDLE handle, bool is_dxgi, uint32_t w, uint32_t h, uint8_t **out_pixels)
+{
+	*out_pixels = nullptr;
+	if (l == nullptr || !l->snap_ok || !glue_enter(l)) {
+		if (handle != nullptr && !is_dxgi) {
+			CloseHandle(handle);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	glue_stream *gs = nullptr;
+	if (!glue_import_client(l, wire, handle, is_dxgi, &gs)) {
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	w = w > gs->imp_w ? gs->imp_w : w;
+	h = h > gs->imp_h ? gs->imp_h : h;
+	// Snapshot into a plain RGBA8 target (any client format), then read it back.
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	ID3D11Texture2D *rt = nullptr, *st = nullptr;
+	ID3D11RenderTargetView *rtv = nullptr;
+	IDXGIKeyedMutex *rkm = nullptr;
+	bool ok = w > 0 && h > 0 && SUCCEEDED(l->svc_device->CreateTexture2D(&td, nullptr, &rt)) &&
+	          SUCCEEDED(l->svc_device->CreateRenderTargetView(rt, nullptr, &rtv)) &&
+	          SUCCEEDED(rt->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&rkm));
+	td.Usage = D3D11_USAGE_STAGING;
+	td.BindFlags = 0;
+	td.MiscFlags = 0;
+	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ok = ok && SUCCEEDED(l->svc_device->CreateTexture2D(&td, nullptr, &st));
+	bool acquired = false;
+	if (ok && gs->imp_km != nullptr) {
+		HRESULT hr = gs->imp_km->AcquireSync(0, 4);
+		ok = SUCCEEDED(hr) && hr != (HRESULT)WAIT_TIMEOUT;
+		acquired = ok;
+	}
+	uint8_t *px = nullptr;
+	if (ok) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		blit_dst dst = {rkm, rtv};
+		ok = snapshot_blit(l, dst, gs->imp_srv, gs->imp_w, gs->imp_h, 0, 0, w, h, w, h);
+		if (ok) {
+			l->svc_context->CopyResource(st, rt);
+			D3D11_MAPPED_SUBRESOURCE m = {};
+			ok = SUCCEEDED(l->svc_context->Map(st, 0, D3D11_MAP_READ, 0, &m));
+			if (ok) {
+				px = (uint8_t *)malloc((size_t)w * h * 4u);
+				ok = px != nullptr;
+				for (uint32_t y = 0; ok && y < h; y++) {
+					memcpy(px + (size_t)y * w * 4u,
+					       (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4u);
+				}
+				l->svc_context->Unmap(st, 0);
+			}
+		}
+	}
+	if (acquired) {
+		gs->imp_km->ReleaseSync(0);
+	}
+	rel(st);
+	rel(rkm);
+	rel(rtv);
+	rel(rt);
+	glue_leave(l);
+	if (!ok) {
+		free(px);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	*out_pixels = px;
+	return XRT_SUCCESS;
+}
+
+void
+d3d11_lift_glue_release_input(HANDLE handle, bool is_dxgi)
+{
+	if (handle != nullptr && !is_dxgi) {
+		CloseHandle(handle);
+	}
+}
+
+//! (Re)create a shared export texture @p w x @p h @p fmt (+ its NT handle).
+static bool
+glue_export_ensure(d3d11_lift *l, ID3D11Texture2D **tex, HANDLE *handle, uint32_t w, uint32_t h, DXGI_FORMAT fmt)
+{
+	rel(*tex);
+	close_handle(*handle);
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = fmt;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+	HRESULT hr = l->svc_device->CreateTexture2D(&td, nullptr, tex);
+	IDXGIResource1 *r1 = nullptr;
+	if (SUCCEEDED(hr)) {
+		hr = (*tex)->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                            handle);
+	}
+	rel(r1);
+	if (FAILED(hr)) {
+		U_LOG_E("[conv] export texture %ux%u fmt=%u create failed: 0x%08lx", w, h, (unsigned)fmt,
+		        (unsigned long)hr);
+		rel(*tex);
+		close_handle(*handle);
+		return false;
+	}
+	return true;
+}
+
+//! Copy runtime image @p img into export @p dst (caller holds the context mutex).
+static bool
+glue_copy_out(d3d11_lift *l, const xrt_conv_image *img, const glue_img *gi, ID3D11Texture2D *dst)
+{
+	if (gi != nullptr) {
+		l->svc_context->CopySubresourceRegion(dst, 0, 0, 0, 0, gi->tex, 0, nullptr);
+		return true;
+	}
+	if (img->memory_kind == XRT_CONV_MEM_CPU && img->cpu_ptr != nullptr) {
+		const uint32_t bpp = img->format == XRT_CONV_FMT_R16_FLOAT ? 2u : 4u;
+		l->svc_context->UpdateSubresource(dst, 0, nullptr, img->cpu_ptr,
+		                                  img->row_stride != 0 ? img->row_stride : img->width * bpp, 0);
+		return true;
+	}
+	return false;
+}
+
+xrt_result_t
+d3d11_lift_glue_publish(struct d3d11_lift *l,
+                        uint64_t wire,
+                        const struct conv_result *res,
+                        struct d3d11_lift_published *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (l == nullptr || res == nullptr || l->svc_context4 == nullptr || !glue_enter(l)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	// The main export: the views, or a DEPTH-mode stream's depth.
+	const bool views = (res->written & XRT_CONV_OUT_VIEWS) != 0;
+	const xrt_conv_image *main =
+	    views ? &res->views : ((res->written & XRT_CONV_OUT_DEPTH) != 0 ? &res->depth : nullptr);
+	const xrt_conv_image *aux = views && (res->written & XRT_CONV_OUT_DEPTH) != 0 ? &res->depth : nullptr;
+	if (main == nullptr) {
+		glue_leave(l);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	glue_img mg, ag;
+	const bool m_gpu = glue_find(l, main->import_key, &mg);
+	const bool a_gpu = aux != nullptr && glue_find(l, aux->import_key, &ag);
+	const DXGI_FORMAT mf = m_gpu ? mg.dxgi : conv_fmt_to_dxgi(main->format);
+	const DXGI_FORMAT af = aux == nullptr ? DXGI_FORMAT_UNKNOWN : (a_gpu ? ag.dxgi : conv_fmt_to_dxgi(aux->format));
+	glue_stream *gs;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		gs = &l->glue_streams[wire];
+	}
+	// Export textures: sized to the result, re-created on size / format change.
+	if (gs->exp_tex == nullptr || gs->exp_w != main->width || gs->exp_h != main->height ||
+	    gs->exp_format != (uint32_t)mf) {
+		if (!glue_export_ensure(l, &gs->exp_tex, &gs->exp_handle, main->width, main->height, mf)) {
+			glue_leave(l);
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+		gs->exp_w = main->width;
+		gs->exp_h = main->height;
+		gs->exp_format = (uint32_t)mf;
+		out->realloc = true;
+		U_LOG_W("[conv] v3 stream 0x%llx export texture %ux%u fmt=%u ready", (unsigned long long)wire,
+		        main->width, main->height, (unsigned)mf);
+	}
+	if (gs->exp_fence == nullptr) {
+		ID3D11Device5 *d5 = nullptr;
+		HRESULT hr = l->svc_device->QueryInterface(__uuidof(ID3D11Device5), (void **)&d5);
+		if (SUCCEEDED(hr)) {
+			hr =
+			    d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **)&gs->exp_fence);
+		}
+		rel(d5);
+		if (SUCCEEDED(hr)) {
+			hr = gs->exp_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &gs->exp_fence_handle);
+		}
+		if (FAILED(hr)) {
+			rel(gs->exp_fence);
+			glue_leave(l);
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+	}
+	bool depth_ok = aux != nullptr && af != DXGI_FORMAT_UNKNOWN;
+	if (depth_ok && (gs->exp_depth_tex == nullptr || gs->exp_depth_w != aux->width ||
+	                 gs->exp_depth_h != aux->height || gs->exp_depth_format != (uint32_t)af)) {
+		depth_ok =
+		    glue_export_ensure(l, &gs->exp_depth_tex, &gs->exp_depth_handle, aux->width, aux->height, af);
+		gs->exp_depth_w = depth_ok ? aux->width : 0;
+		gs->exp_depth_h = depth_ok ? aux->height : 0;
+		gs->exp_depth_format = depth_ok ? (uint32_t)af : 0;
+		out->depth_realloc = depth_ok;
+	}
+
+	const bool held_m = m_gpu ? img_acquire(mg.km, main, 4) : true;
+	if (!held_m) {
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	const bool held_a = depth_ok && a_gpu ? img_acquire(ag.km, aux, 4) : depth_ok;
+	depth_ok = depth_ok && held_a;
+	bool ok;
+	{
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		ok = glue_copy_out(l, main, m_gpu ? &mg : nullptr, gs->exp_tex);
+		if (depth_ok) {
+			depth_ok = glue_copy_out(l, aux, a_gpu ? &ag : nullptr, gs->exp_depth_tex);
+		}
+		// One fence covers the views and the depth (XrLiftDepthResultDXR).
+		gs->exp_fence_value++;
+		l->svc_context4->Signal(gs->exp_fence, gs->exp_fence_value);
+		l->svc_context->Flush();
+	}
+	if (m_gpu) {
+		img_release(mg.km, main);
+	}
+	if (held_a && a_gpu) {
+		img_release(ag.km, aux);
+	}
+	out->fence_value = gs->exp_fence_value;
+	out->width = gs->exp_w;
+	out->height = gs->exp_h;
+	out->format = gs->exp_format;
+	if (depth_ok) {
+		out->depth_width = gs->exp_depth_w;
+		out->depth_height = gs->exp_depth_h;
+		out->depth_format = gs->exp_depth_format;
+	} else {
+		out->depth_realloc = false;
+	}
+	glue_leave(l);
+	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
+}
+
+bool
+d3d11_lift_glue_export_output(struct d3d11_lift *l,
+                              uint64_t wire,
+                              bool depth,
+                              HANDLE *out_handle,
+                              uint32_t *out_w,
+                              uint32_t *out_h,
+                              uint32_t *out_format)
+{
+	if (l == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	auto it = l->glue_streams.find(wire);
+	if (it == l->glue_streams.end()) {
+		return false;
+	}
+	const glue_stream &gs = it->second;
+	HANDLE h = depth ? gs.exp_depth_handle : gs.exp_handle;
+	if (h == nullptr) {
+		return false;
+	}
+	*out_handle = h;
+	*out_w = depth ? gs.exp_depth_w : gs.exp_w;
+	*out_h = depth ? gs.exp_depth_h : gs.exp_h;
+	*out_format = depth ? gs.exp_depth_format : gs.exp_format;
+	return true;
+}
+
+bool
+d3d11_lift_glue_export_fence(struct d3d11_lift *l, uint64_t wire, HANDLE *out_handle)
+{
+	if (l == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> g(l->glue_mtx);
+	auto it = l->glue_streams.find(wire);
+	if (it == l->glue_streams.end() || it->second.exp_fence_handle == nullptr) {
+		return false;
+	}
+	*out_handle = it->second.exp_fence_handle;
+	return true;
+}
+
+void
+d3d11_lift_glue_stream_gone(struct d3d11_lift *l, uint64_t wire)
+{
+	if (l == nullptr || !glue_enter(l)) {
+		return;
+	}
+	{
+		// The weave producer uses core_weave under the context mutex.
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		auto it = l->glue_streams.find(wire);
+		if (it != l->glue_streams.end()) {
+			glue_stream_release(it->second);
+			l->glue_streams.erase(it);
+		}
+		auto cw = l->core_weave.find(wire);
+		if (cw != l->core_weave.end()) {
+			for (auto &r : cw->second.lb_rb) {
+				rel(r.staging);
+			}
+			l->core_weave.erase(cw);
+		}
+	}
+	glue_leave(l);
+}
+
+
+/*
+ *
+ * The weave path on core-routed streams (#2003): the same snapshot policy
+ * (letterbox crop, DXR_LIFT_MAX_INPUT_EDGE cap) into a core slot, and pins of
+ * the core's latest result as d3d11_lift_pin.
+ *
+ */
+
+static xrt_result_t
+core_weave_submit_locked(d3d11_lift *l,
+                         uint64_t owner,
+                         uint64_t id,
+                         ID3D11ShaderResourceView *src,
+                         uint32_t src_tw,
+                         uint32_t src_th,
+                         uint32_t x,
+                         uint32_t y,
+                         uint32_t w,
+                         uint32_t h,
+                         int64_t source_time,
+                         const xrt_dp_lift_params *params,
+                         const float *viewpoints,
+                         uint32_t viewpoint_floats,
+                         const xrt_lift_view_control *view_control,
+                         const xrt_lift_rig *rig,
+                         const xrt_lift_rect_frame *frame,
+                         uint64_t *out_frame_id)
+{
+	*out_frame_id = 0;
+	conv_core *core = nullptr;
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	if (w == 0 || h == 0 || x + w > src_tw || y + h > src_th ||
+	    !bridge_resolve(l, owner, id, &core, &core_id, &mode) || !glue_enter(l)) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream / bad extent: non-fatal
+	}
+	core_weave_state *ws;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		ws = &l->core_weave[id];
+		ws->id = id;
+	}
+	const bool letterbox = l->letterbox && l->lb_ok;
+	uint32_t cx = x, cy = y, cw = w, ch = h;
+	if (letterbox && ws->lb.w == w && ws->lb.h == h && u_lift_crop_active(&ws->lb.committed)) {
+		const u_lift_crop &c = ws->lb.committed;
+		cx = x + c.left;
+		cy = y + c.top;
+		cw = w - c.left - c.right;
+		ch = h - c.top - c.bottom;
+	}
+	uint32_t dw = cw, dh = ch;
+	const bool capped = u_lift_cap_dims(cw, ch, l->max_input_edge, &dw, &dh);
+
+	conv_submit_layout lay = {};
+	lay.image_count = 1;
+	lay.width[0] = dw;
+	lay.height[0] = dh;
+	lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+	lay.color_space[0] = XRT_CONV_CS_SRGB;
+	lay.role[0] = XRT_CONV_IMG_COLOR;
+	conv_submit_slot slot = {};
+	if (conv_core_stream_begin_submit(core, core_id, &lay, &slot) != XRT_SUCCESS) {
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	glue_img gi;
+	bool ok = glue_find(l, slot.images[0].import_key, &gi) && gi.rtv != nullptr;
+	if (ok) {
+		blit_dst dst = {gi.km, gi.rtv};
+		ok = snapshot_blit(l, dst, src, src_tw, src_th, cx, cy, cw, ch, dw, dh);
+	}
+	if (ok && letterbox) {
+		letterbox_step(l, *ws, src, x, y, w, h); // measures the WHOLE rect, bars included
+	}
+	if (!ok) {
+		conv_core_stream_abort_submit(core, core_id, slot.slot);
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	if (capped && (ws->cap_logged_w != dw || ws->cap_logged_h != dh)) {
+		ws->cap_logged_w = dw;
+		ws->cap_logged_h = dh;
+		U_LOG_W("[conv] v3 stream 0x%llx: snapshot %ux%u capped to %ux%u (DXR_LIFT_MAX_INPUT_EDGE=%u)",
+		        (unsigned long long)id, cw, ch, dw, dh, l->max_input_edge);
+	}
+
+	// The rect's options are sticky like the pre-core stream's last params.
+	if (params != nullptr) {
+		ws->last_params = *params;
+		ws->has_last_params = true;
+	}
+	xrt_dp_lift_params p = {};
+	p.convergence = -1.0f;
+	p.strength = 1.0f;
+	p.inpaint = 1;
+	if (ws->has_last_params) {
+		p = ws->last_params;
+	}
+	conv_frame_submit fr = {};
+	fr.source_time = source_time;
+	fr.frame_flags = p.inpaint != 0 ? XRT_CONV_FRAME_INPAINT : 0u;
+	uint32_t n = viewpoint_floats / 3;
+	n = n > XRT_CONV_MAX_VIEWS ? XRT_CONV_MAX_VIEWS : n;
+	if (viewpoints != nullptr && n > 0) {
+		fr.explicit_count = n;
+		memcpy(fr.explicit_xyz, viewpoints, sizeof(float) * 3 * n);
+	}
+	if (view_control != nullptr) {
+		fr.has_view_control = true;
+		u_lift_view_control_default(&fr.vc);
+		fr.vc.ipd_factor = view_control->ipd_factor;
+		fr.vc.parallax_factor = view_control->parallax_factor;
+		fr.vc.axis_mode = view_control->axis_mode;
+		fr.vc.max_offset_m = view_control->max_offset_m;
+		fr.vc.recenter_mode = view_control->recenter_mode;
+		if (view_control->hold_s >= 0.0f) {
+			fr.vc.hold_s = view_control->hold_s;
+		}
+		if (view_control->tau_s > 0.0f) {
+			fr.vc.tau_s = view_control->tau_s;
+		}
+	}
+	if (rig != nullptr && rig->type != XRT_LIFT_RIG_NONE) {
+		fr.rig.type = rig->type;
+		fr.rig.ipd_factor = rig->ipd_factor;
+		fr.rig.parallax_factor = rig->parallax_factor;
+		fr.rig.perspective_factor = rig->perspective_factor;
+		fr.rig.inv_convergence_distance = rig->inv_convergence_distance;
+		fr.rig.half_tan_vfov = rig->half_tan_vfov;
+		fr.rig.m2v = rig->m2v;
+		u_lift_rig_sanitize(&fr.rig);
+	}
+	if (frame != nullptr && frame->valid) {
+		fr.rect_valid = true;
+		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
+		fr.rect_w_m = frame->width_m;
+		fr.rect_h_m = frame->height_m;
+	}
+	fr.active[0] = (float)(cx - x) / (float)w;
+	fr.active[1] = (float)(cy - y) / (float)h;
+	fr.active[2] = (float)(cx - x + cw) / (float)w;
+	fr.active[3] = (float)(cy - y + ch) / (float)h;
+	if (p.convergence >= 0.0f) {
+		fr.convergence_set = true;
+		fr.convergence_rel01 = p.convergence > 1.0f ? 1.0f : p.convergence;
+	}
+	fr.strength = p.strength;
+	fr.focal_px = p.focal_px;
+	if (capped && fr.focal_px > 0.0f) {
+		fr.focal_px *= (float)dw / (float)cw; // focal is in INPUT pixels (a crop keeps the scale)
+	}
+	const xrt_result_t r = conv_core_stream_commit_submit(core, core_id, slot.slot, &fr, out_frame_id);
+	glue_leave(l);
+	return r;
+}
+
+static bool
+core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
+{
+	conv_core *core = nullptr;
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	if (!bridge_resolve(l, owner, id, &core, &core_id, &mode) || !glue_enter(l)) {
+		return false;
+	}
+	conv_result r = {};
+	if (conv_core_stream_acquire(core, core_id, false, &r) != XRT_SUCCESS) {
+		glue_leave(l);
+		return false;
+	}
+	glue_img vg, dg;
+	const bool have_views = (r.written & XRT_CONV_OUT_VIEWS) != 0 && glue_find(l, r.views.import_key, &vg) &&
+	                        vg.srv != nullptr && vg.km != nullptr;
+	if (!have_views || !img_acquire(vg.km, &r.views, 4)) {
+		// No GPU views (a CPU provider's result, or a busy slot): weave it flat.
+		conv_core_stream_release(core, core_id, r.ring_slot);
+		glue_leave(l);
+		return false;
+	}
+	out->lift = l;
+	out->stream_id = id;
+	out->slot = -1;
+	out->km = vg.km;
+	out->srv = vg.srv;
+	out->width = vg.w;
+	out->height = vg.h;
+	out->view_count = r.views_info.view_count != 0 ? r.views_info.view_count : 1;
+	const bool whole = r.active[0] == 0.0f && r.active[1] == 0.0f && r.active[2] == 0.0f && r.active[3] == 0.0f;
+	out->active[0] = whole ? 0.0f : r.active[0];
+	out->active[1] = whole ? 0.0f : r.active[1];
+	out->active[2] = whole ? 1.0f : r.active[2];
+	out->active[3] = whole ? 1.0f : r.active[3];
+	out->vp_count = r.views_info.view_count <= XRT_LIFT_MAX_VIEWS ? r.views_info.view_count : XRT_LIFT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->vp_count; i++) {
+		out->vps[3 * i + 0] = r.views_info.eye_xyz[i][0];
+		out->vps[3 * i + 1] = r.views_info.eye_xyz[i][1];
+		out->vps[3 * i + 2] = r.views_info.eye_xyz[i][2];
+	}
+	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
+	if ((r.written & XRT_CONV_OUT_DEPTH) != 0 && glue_find(l, r.depth.import_key, &dg) && dg.km != nullptr) {
+		const uint32_t k = r.depth_info.kind;
+		out->depth_tex = dg.tex;
+		out->depth_km = dg.km;
+		out->depth_w = dg.w;
+		out->depth_h = dg.h;
+		out->depth_format = (uint32_t)dg.dxgi;
+		out->depth_encoding = (k == XRT_CONV_DEPTH_METRIC_INVERSE || k == XRT_CONV_DEPTH_AFFINE_INVERSE ||
+		                       k == XRT_CONV_DEPTH_AFFINE_DISPARITY || k == XRT_CONV_DEPTH_STEREO_DISPARITY_PX)
+		                          ? XRT_DP_LIFT_DEPTH_ENCODING_INVERSE
+		                          : XRT_DP_LIFT_DEPTH_ENCODING_LINEAR;
+		out->depth_value_scale = r.depth_info.value_scale != 0.0f ? r.depth_info.value_scale : 1.0f;
+		out->depth_value_offset = r.depth_info.value_shift;
+		out->relief_valid = r.depth_info.relief_valid != 0;
+		out->relief_scale = r.depth_info.relief_scale;
+		out->relief_offset = r.depth_info.relief_offset;
+	}
+	out->core = true;
+	out->core_id = core_id;
+	out->core_ring_slot = r.ring_slot;
+	out->valid = true;
+	glue_leave(l);
+	return true;
+}
+
+static void
+core_unpin(d3d11_lift *l, d3d11_lift_pin *pin)
+{
+	d3d11_lift_core_bridge b;
+	{
+		std::lock_guard<std::mutex> g(l->bridge_mtx);
+		b = l->bridge;
+	}
+	if (b.core != nullptr) {
+		conv_core_stream_release(b.core, pin->core_id, pin->core_ring_slot);
+	}
 }

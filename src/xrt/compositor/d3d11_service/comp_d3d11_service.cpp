@@ -71,6 +71,7 @@
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
 #include "d3d11_lift.h" // XR_DXR_lift (ADR-042)
+#include "comp_d3d11_service_conv.h" // ADR-053 P1a (#2003): the conversion core's D3D11 side
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
@@ -30874,6 +30875,45 @@ resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compo
 	}
 }
 
+/*
+ * G7 (ADR-053, #2003): the conversion side never pulls eyes (that took
+ * render_mutex once per conversion). Every eye query this service answers
+ * publishes the result instead: into the lift module's snapshot (the pre-core
+ * branch) and into the conversion core's per-DP snapshot (DP 0, the panel).
+ */
+static std::mutex g_conv_eyes_mtx;
+static void (*g_conv_eyes_fn)(void *ud, const struct xrt_eye_positions *eyes) = nullptr;
+static void *g_conv_eyes_ud = nullptr;
+
+extern "C" void
+comp_d3d11_service_set_conv_eyes_sink(void (*fn)(void *ud, const struct xrt_eye_positions *eyes), void *ud)
+{
+	std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+	g_conv_eyes_fn = fn;
+	g_conv_eyes_ud = ud;
+}
+
+static void
+svc_publish_eyes(struct d3d11_service_system *sys, const struct xrt_eye_positions *eyes)
+{
+	// sys->lift is set once (lift_create_mutex) and destroyed first in
+	// system_destroy, after every client is gone: a plain read is enough here.
+	struct d3d11_lift *l = sys->lift;
+	if (l != nullptr) {
+		d3d11_lift_publish_eyes(l, eyes);
+	}
+	void (*fn)(void *, const struct xrt_eye_positions *);
+	void *ud;
+	{
+		std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+		fn = g_conv_eyes_fn;
+		ud = g_conv_eyes_ud;
+	}
+	if (fn != nullptr) {
+		fn(ud, eyes);
+	}
+}
+
 bool
 comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system_compositor *xsysc,
                                                                 struct xrt_compositor *xc,
@@ -30902,6 +30942,7 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system
 	if (dp != nullptr) {
 		U_ZERO(out_eyes);
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes)) {
+			svc_publish_eyes(sys, out_eyes);
 			return true;
 		}
 	}
@@ -35776,11 +35817,28 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
  *
  */
 
-//! The lift thread's eye source: the panel DP's predicted eyes (display space).
+/*!
+ * G5: the plug-in's factory pair, re-read at every activation attempt. The
+ * fallback is the SAME plug-in's ordinary D3D11 factory (the scalar
+ * dp_factory_d3d11, filled together with dp_factory_d3d11_lift from one
+ * plug-in by fill_dp_factories_from_plugin) — never the per-monitor registry
+ * entry, which may be another plug-in's (roadmap conversion-providers.md §10).
+ */
 static bool
-svc_lift_eyes(void *ud, struct xrt_eye_positions *out)
+svc_lift_resolve(void *ud, void **out_lift, void **out_fallback)
 {
-	return comp_d3d11_service_get_predicted_eye_positions_full((struct xrt_system_compositor *)ud, out);
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt((struct xrt_system_compositor *)ud);
+	*out_lift = sys->base.info.dp_factory_d3d11_lift;
+	*out_fallback = sys->base.info.dp_factory_d3d11;
+	return *out_lift != nullptr || *out_fallback != nullptr;
+}
+
+//! G7, producer side: a submit refreshes stale eyes (publishes as a side effect).
+static void
+svc_lift_eyes_refresh(void *ud)
+{
+	struct xrt_eye_positions eyes = {};
+	(void)comp_d3d11_service_get_predicted_eye_positions_full((struct xrt_system_compositor *)ud, &eyes);
 }
 
 static struct d3d11_lift *
@@ -35795,15 +35853,166 @@ svc_lift(struct xrt_system_compositor *xsysc)
 	}
 	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
 	if (sys->lift == nullptr) {
-		void *lift_factory = sys->base.info.dp_factory_d3d11_lift;
-		void *fallback = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
-		sys->lift =
-		    d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex, lift_factory,
-		                      fallback, svc_lift_eyes, (void *)xsysc, sys->base.info.nominal_viewer_z_m);
-		U_LOG_W("[lift] lift module created (lift-only factory %s, fallback factory %s)",
-		        lift_factory != nullptr ? "present" : "absent", fallback != nullptr ? "present" : "absent");
+		void *lift_factory = nullptr, *fallback = nullptr;
+		(void)svc_lift_resolve((void *)xsysc, &lift_factory, &fallback);
+		sys->lift = d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex,
+		                              svc_lift_resolve, (void *)xsysc, sys->base.info.nominal_viewer_z_m);
+		if (sys->lift != nullptr) {
+			d3d11_lift_set_eyes_refresh(sys->lift, svc_lift_eyes_refresh, (void *)xsysc);
+		}
+		U_LOG_W(
+		    "[lift] lift module created (lift-only factory %s, fallback factory %s, both from the active "
+		    "plug-in; re-resolved at every activation)",
+		    lift_factory != nullptr ? "present" : "absent", fallback != nullptr ? "present" : "absent");
 	}
 	return sys->lift;
+}
+
+/*
+ *
+ * ADR-053 P1a (#2003): the conversion core's D3D11 glue + the dp-lift backend
+ * (comp_d3d11_service_conv.h). Thin: the lift module owns both.
+ *
+ */
+
+static xrt_result_t
+conv_io_import_input(void *ud,
+                     uint64_t stream_id,
+                     xrt_graphics_buffer_handle_t handle,
+                     bool is_dxgi,
+                     uint32_t w,
+                     uint32_t h,
+                     const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_import_input((struct d3d11_lift *)ud, stream_id, (HANDLE)handle, is_dxgi, w, h, slot);
+}
+
+static xrt_result_t
+conv_io_import_input_cpu(void *ud,
+                         uint64_t stream_id,
+                         xrt_graphics_buffer_handle_t handle,
+                         bool is_dxgi,
+                         uint32_t w,
+                         uint32_t h,
+                         uint8_t **out_pixels)
+{
+	return d3d11_lift_glue_import_input_cpu((struct d3d11_lift *)ud, stream_id, (HANDLE)handle, is_dxgi, w, h,
+	                                        out_pixels);
+}
+
+static void
+conv_io_release_input(void *ud, xrt_graphics_buffer_handle_t handle, bool is_dxgi)
+{
+	(void)ud;
+	d3d11_lift_glue_release_input((HANDLE)handle, is_dxgi);
+}
+
+static xrt_result_t
+conv_io_publish(void *ud, uint64_t stream_id, const struct conv_result *res, struct comp_d3d11_conv_published *out)
+{
+	struct d3d11_lift_published p = {};
+	const xrt_result_t r = d3d11_lift_glue_publish((struct d3d11_lift *)ud, stream_id, res, &p);
+	out->fence_value = p.fence_value;
+	out->width = p.width;
+	out->height = p.height;
+	out->format = p.format;
+	out->realloc = p.realloc;
+	out->depth_width = p.depth_width;
+	out->depth_height = p.depth_height;
+	out->depth_format = p.depth_format;
+	out->depth_realloc = p.depth_realloc;
+	return r;
+}
+
+static bool
+conv_io_export_output(void *ud,
+                      uint64_t stream_id,
+                      bool depth,
+                      xrt_graphics_buffer_handle_t *out_handle,
+                      uint32_t *out_w,
+                      uint32_t *out_h,
+                      uint32_t *out_format)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_output((struct d3d11_lift *)ud, stream_id, depth, &h, out_w, out_h, out_format)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
+	return true;
+}
+
+static bool
+conv_io_export_fence(void *ud, uint64_t stream_id, xrt_graphics_sync_handle_t *out_handle)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_fence((struct d3d11_lift *)ud, stream_id, &h)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)h;
+	return true;
+}
+
+static void
+conv_io_stream_gone(void *ud, uint64_t stream_id)
+{
+	d3d11_lift_glue_stream_gone((struct d3d11_lift *)ud, stream_id);
+}
+
+extern "C" bool
+comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3d11_conv_glue *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		return false;
+	}
+	d3d11_lift_glue_alloc_ops(l, &out->alloc);
+	d3d11_lift_glue_gpu_ops(l, &out->viewsyn, &out->readback);
+	d3d11_lift_get_dp_backend(l, &out->dp_lift);
+	out->import_input = conv_io_import_input;
+	out->import_input_cpu = conv_io_import_input_cpu;
+	out->release_input = conv_io_release_input;
+	out->publish_result = conv_io_publish;
+	out->export_output = conv_io_export_output;
+	out->export_fence = conv_io_export_fence;
+	out->stream_gone = conv_io_stream_gone;
+	out->io_ud = l;
+	out->nominal_z_m = d3d11_service_system_from_xrt(xsysc)->base.info.nominal_viewer_z_m;
+	return true;
+}
+
+extern "C" void
+comp_d3d11_service_conv_rect_frame(struct xrt_system_compositor *xsysc,
+                                   struct xrt_compositor *xc,
+                                   struct xrt_lift_rect_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	lift_rect_frame(d3d11_service_system_from_xrt(xsysc), xc, nullptr, 0, 0, out);
+}
+
+extern "C" void
+comp_d3d11_service_conv_set_bridge(struct xrt_system_compositor *xsysc, const struct comp_d3d11_conv_bridge *bridge)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	if (sys->lift == nullptr) {
+		return;
+	}
+	if (bridge == nullptr) {
+		d3d11_lift_set_core_bridge(sys->lift, nullptr);
+		return;
+	}
+	struct d3d11_lift_core_bridge b = {};
+	b.core = bridge->core;
+	b.resolve = bridge->resolve;
+	b.ud = bridge->ud;
+	d3d11_lift_set_core_bridge(sys->lift, &b);
 }
 
 //! Called first thing in system_destroy: joins the lift thread (which calls

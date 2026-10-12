@@ -12,6 +12,8 @@
 #include "xrt/xrt_config_os.h"
 
 #include "conversion/conv_core.h"
+#include "conversion/conv_observer_autoconv.h"
+#include "conversion/conv_provider_legacy_dp.h"
 #include "conversion/conv_registry.h"
 
 #include "server/ipc_server.h"
@@ -23,6 +25,7 @@
 #include "os/os_threading.h"
 #include "util/u_logging.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,7 +54,14 @@ static struct
 
 	//! #2003's allocator (NULL alloc = CPU); guarded by alloc_mtx.
 	struct os_mutex alloc_mtx;
+	struct os_cond alloc_cond;
 	struct conv_image_alloc_ops gpu_alloc;
+	uint32_t gpu_alloc_calls; //!< GPU allocator calls in flight (a removal waits for 0)
+
+	//! The legacy DP-lift adapter (#2003), registered once the GPU side attached.
+	const struct xrt_conversion_plugin_iface *dp_lift_iface;
+	struct xrt_conversion_plugin_instance *dp_lift_inst;
+	bool dp_lift_registered;
 
 	char cache_path[600];
 
@@ -109,15 +119,45 @@ cpu_alloc(const struct conv_image_request *req, struct xrt_conv_image *out)
 	return true;
 }
 
+//! Take the GPU allocator for one call (false = none installed).
+static bool
+gpu_enter(struct conv_image_alloc_ops *out)
+{
+	os_mutex_lock(&g.alloc_mtx);
+	*out = g.gpu_alloc;
+	const bool ok = out->alloc != NULL;
+	if (ok) {
+		g.gpu_alloc_calls++;
+	}
+	os_mutex_unlock(&g.alloc_mtx);
+	return ok;
+}
+
+static void
+gpu_leave(void)
+{
+	os_mutex_lock(&g.alloc_mtx);
+	g.gpu_alloc_calls--;
+	os_cond_broadcast(&g.alloc_cond);
+	os_mutex_unlock(&g.alloc_mtx);
+}
+
 static bool
 tramp_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out)
 {
 	(void)ud;
-	os_mutex_lock(&g.alloc_mtx);
-	struct conv_image_alloc_ops gpu = g.gpu_alloc;
-	os_mutex_unlock(&g.alloc_mtx);
-	if (gpu.alloc != NULL) {
-		return gpu.alloc(gpu.ud, req, out);
+	struct conv_image_alloc_ops gpu;
+	if (gpu_enter(&gpu)) {
+		const bool ok = gpu.alloc(gpu.ud, req, out);
+		gpu_leave();
+		if (ok) {
+			return true;
+		}
+	}
+	// The GPU glue declined (a provider that imports no shared texture with a
+	// keyed mutex) or is not installed: CPU memory, when the provider takes it.
+	if (req->import_memory_kinds != 0 && (req->import_memory_kinds & XRT_CONV_MEM_CPU) == 0) {
+		return false;
 	}
 	return cpu_alloc(req, out);
 }
@@ -131,11 +171,12 @@ tramp_free(void *ud, struct xrt_conv_image *img)
 		img->cpu_ptr = NULL;
 		return;
 	}
-	os_mutex_lock(&g.alloc_mtx);
-	struct conv_image_alloc_ops gpu = g.gpu_alloc;
-	os_mutex_unlock(&g.alloc_mtx);
-	if (gpu.free != NULL) {
-		gpu.free(gpu.ud, img);
+	struct conv_image_alloc_ops gpu;
+	if (gpu_enter(&gpu)) {
+		if (gpu.free != NULL) {
+			gpu.free(gpu.ud, img);
+		}
+		gpu_leave();
 	}
 }
 
@@ -150,8 +191,79 @@ service_conversion_set_gpu_alloc(const struct conv_image_alloc_ops *ops)
 		g.gpu_alloc = *ops;
 	} else {
 		memset(&g.gpu_alloc, 0, sizeof(g.gpu_alloc));
+		// Nothing may still be inside the allocator that is going away.
+		while (g.gpu_alloc_calls > 0) {
+			os_cond_wait(&g.alloc_cond, &g.alloc_mtx);
+		}
 	}
 	os_mutex_unlock(&g.alloc_mtx);
+}
+
+/*
+ *
+ * The GPU side + the legacy DP-lift adapter (#2003).
+ *
+ */
+
+static bool
+dp_lift_enabled_by_policy(void)
+{
+	bool enabled = true;
+	os_mutex_lock(&g.mtx);
+	if (!g.policy.policy_lock) {
+		for (uint32_t i = 0; i < g.policy.override_count; i++) {
+			if (strcmp(g.policy.overrides[i].id, CONV_DP_LIFT_ID) == 0) {
+				enabled = g.policy.overrides[i].enabled;
+			}
+		}
+	}
+	os_mutex_unlock(&g.mtx);
+	return enabled;
+}
+
+//! ipc_server_conv_gpu_hook_fn: the GPU side came (or goes).
+static void
+on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
+{
+	(void)ud;
+	if (g.core == NULL) {
+		return;
+	}
+	if (gpu == NULL) {
+		// The backend goes away with the system compositor: the adapter answers
+		// "no module" from now on (in-flight calls drain first).
+		if (g.dp_lift_inst != NULL) {
+			conv_provider_legacy_dp_detach(g.dp_lift_inst);
+		}
+		service_conversion_set_gpu_alloc(NULL);
+		return;
+	}
+	service_conversion_set_gpu_alloc(&gpu->alloc);
+	if (gpu->dp_lift.snapshot == NULL) {
+		return;
+	}
+	if (g.dp_lift_registered) {
+		conv_provider_legacy_dp_attach(g.dp_lift_inst, &gpu->dp_lift);
+		conv_core_provider_changed(g.core, CONV_DP_LIFT_ID);
+		return;
+	}
+	if (!conv_provider_legacy_dp_create(&gpu->dp_lift, &g.dp_lift_iface, &g.dp_lift_inst)) {
+		return;
+	}
+	struct conv_provider_desc d;
+	memset(&d, 0, sizeof(d));
+	d.id = CONV_DP_LIFT_ID;
+	d.probe_order = CONV_DP_LIFT_PROBE_ORDER;
+	d.hosting = CONV_HOSTING_IN_SERVICE; // always: the display plug-in never leaves the service
+	d.enabled = dp_lift_enabled_by_policy();
+	d.flags = CONV_PROV_LICENCE_EXEMPT | CONV_PROV_LEGACY_UNITS;
+	d.iface = g.dp_lift_iface;
+	d.inst = g.dp_lift_inst;
+	if (conv_core_add_provider(g.core, &d) >= 0) {
+		g.dp_lift_registered = true;
+		U_LOG_W("[conv] dp-lift registered: the display plug-in's lift slots, ProbeOrder %u, in-service%s",
+		        CONV_DP_LIFT_PROBE_ORDER, d.enabled ? "" : " (disabled by policy)");
+	}
 }
 
 
@@ -228,6 +340,119 @@ host_notify_changed(uint32_t cap_id)
 
 static struct xrt_conversion_plugin_host_iface g_host;
 
+/*
+ * Per-provider host context (#2003): get_setting carries no provider
+ * argument (spec §2.1), so every provider is negotiated with its OWN host
+ * iface whose get_setting is a trampoline bound to its slot. It answers
+ * `DXR_CONV_<ID>_<KEY>` from the service's environment, then the provider's
+ * registry `Settings\*` / manifest "settings" — the keys the headless pass
+ * (target_conv_status) serves, so a provider that gates its probe on a
+ * setting (the sim provider's ENABLE) behaves the same in the service.
+ */
+#define HOST_SLOTS XRT_CONV_LOADER_MAX_ENTRIES
+
+static struct
+{
+	bool used;
+	char id[64];
+	uint32_t setting_count;
+	struct xrt_conversion_plugin_setting settings[XRT_CONV_LOADER_MAX_SETTINGS];
+} g_host_slot[HOST_SLOTS];
+
+static struct xrt_conversion_plugin_host_iface g_hosts[HOST_SLOTS];
+
+static bool
+host_get_setting_slot(uint32_t slot, const char *key, char *buf, uint32_t buf_size)
+{
+	if (slot >= HOST_SLOTS || key == NULL || buf == NULL || buf_size == 0 || !g_host_slot[slot].used) {
+		return false;
+	}
+	char env[160];
+	const int n = snprintf(env, sizeof(env), "DXR_CONV_%s_%s", g_host_slot[slot].id, key);
+	if (n < 0 || (size_t)n >= sizeof(env)) {
+		return false;
+	}
+	for (char *c = env; *c != '\0'; c++) {
+		*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
+	}
+	const char *v = getenv(env);
+	if (v != NULL && v[0] != '\0') {
+		(void)snprintf(buf, buf_size, "%s", v);
+		return true;
+	}
+	for (uint32_t i = 0; i < g_host_slot[slot].setting_count && i < XRT_CONV_LOADER_MAX_SETTINGS; i++) {
+#ifdef XRT_OS_WINDOWS
+		if (_stricmp(g_host_slot[slot].settings[i].key, key) == 0) {
+#else
+		if (strcmp(g_host_slot[slot].settings[i].key, key) == 0) {
+#endif
+			(void)snprintf(buf, buf_size, "%s", g_host_slot[slot].settings[i].value);
+			return true;
+		}
+	}
+	return false;
+}
+
+#define HOST_GET_SETTING(i)                                                                                            \
+	static bool host_get_setting_##i(const char *key, char *buf, uint32_t buf_size)                                \
+	{                                                                                                              \
+		return host_get_setting_slot(i, key, buf, buf_size);                                                   \
+	}
+HOST_GET_SETTING(0)
+HOST_GET_SETTING(1)
+HOST_GET_SETTING(2)
+HOST_GET_SETTING(3)
+HOST_GET_SETTING(4)
+HOST_GET_SETTING(5)
+HOST_GET_SETTING(6)
+HOST_GET_SETTING(7)
+HOST_GET_SETTING(8)
+HOST_GET_SETTING(9)
+HOST_GET_SETTING(10)
+HOST_GET_SETTING(11)
+HOST_GET_SETTING(12)
+HOST_GET_SETTING(13)
+HOST_GET_SETTING(14)
+HOST_GET_SETTING(15)
+
+static bool (*const k_host_get_setting[HOST_SLOTS])(const char *, char *, uint32_t) = {
+    host_get_setting_0,  host_get_setting_1,  host_get_setting_2,  host_get_setting_3,
+    host_get_setting_4,  host_get_setting_5,  host_get_setting_6,  host_get_setting_7,
+    host_get_setting_8,  host_get_setting_9,  host_get_setting_10, host_get_setting_11,
+    host_get_setting_12, host_get_setting_13, host_get_setting_14, host_get_setting_15,
+};
+_Static_assert(HOST_SLOTS == 16, "one get_setting trampoline per loader entry");
+
+//! The host iface @p e negotiates with: its own slot (settings copied), or the shared one.
+static const struct xrt_conversion_plugin_host_iface *
+host_for_entry(const struct xrt_conversion_plugin_entry *e)
+{
+	uint32_t slot = HOST_SLOTS;
+	for (uint32_t i = 0; i < HOST_SLOTS; i++) {
+		if (g_host_slot[i].used && strcmp(g_host_slot[i].id, e->id) == 0) {
+			slot = i;
+			break;
+		}
+	}
+	for (uint32_t i = 0; slot == HOST_SLOTS && i < HOST_SLOTS; i++) {
+		if (!g_host_slot[i].used) {
+			slot = i;
+		}
+	}
+	if (slot == HOST_SLOTS) {
+		return &g_host;
+	}
+	// The provider keeps this pointer until process end: slots are never reused.
+	g_host_slot[slot].used = true;
+	(void)snprintf(g_host_slot[slot].id, sizeof(g_host_slot[slot].id), "%s", e->id);
+	g_host_slot[slot].setting_count =
+	    e->setting_count < XRT_CONV_LOADER_MAX_SETTINGS ? e->setting_count : XRT_CONV_LOADER_MAX_SETTINGS;
+	memcpy(g_host_slot[slot].settings, e->settings, sizeof(g_host_slot[slot].settings));
+	g_hosts[slot] = g_host;
+	g_hosts[slot].get_setting = k_host_get_setting[slot];
+	return &g_hosts[slot];
+}
+
 static void
 init_host(void)
 {
@@ -255,7 +480,7 @@ add_entry(struct xrt_conversion_plugin_entry *e)
 		return;
 	}
 	if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
-		(void)target_conversion_plugin_negotiate_one(e, &g_host);
+		(void)target_conversion_plugin_negotiate_one(e, host_for_entry(e));
 	}
 
 	struct conv_provider_desc d;
@@ -529,7 +754,7 @@ service_conversion_start(void)
 	if (g.started) {
 		return;
 	}
-	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0) {
+	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0 || os_cond_init(&g.alloc_cond) != 0) {
 		U_LOG_E("[conv] could not create the conversion core's service locks");
 		return;
 	}
@@ -549,7 +774,17 @@ service_conversion_start(void)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.alloc.alloc = tramp_alloc;
 	cfg.alloc.free = tramp_free;
-	// cfg.viewsyn / cfg.readback / create_convergence_observer: #2003 (D3D11).
+	// cfg.viewsyn / cfg.readback: installed once the D3D11 device exists
+	// (on_gpu, conv_core_set_gpu). The S7 observer needs no device.
+	cfg.create_convergence_observer = conv_observer_autoconv_factory;
+	cfg.observer_ud = NULL;
+	cfg.eyes_max_age_ns = 2ull * 1000ull * 1000ull * 1000ull; // older eyes: the nominal viewer
+	{
+		// DXR_LIFT_RECENTER=off / 0: viewpoint recentering forced OFF (as the lift thread read it).
+		const char *rc = getenv("DXR_LIFT_RECENTER");
+		cfg.recenter_off =
+		    rc != NULL && (strcmp(rc, "0") == 0 || strcmp(rc, "off") == 0 || strcmp(rc, "OFF") == 0);
+	}
 	cfg.on_event = on_event;
 	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST && t < TARGET_CONV_POLICY_TASKS; t++) {
 		cfg.preferred[t] = g.policy.preferred[t][0] != '\0' ? g.policy.preferred[t] : NULL;
@@ -595,6 +830,7 @@ service_conversion_start(void)
 	U_LOG_W("[conv] conversion core up: %d provider(s) registered, PrewarmOn=%u", g.entry_count, cfg.prewarm_on);
 
 	if (ipc_server_conv_create(g.core, &g.sc) == XRT_SUCCESS) {
+		ipc_server_conv_set_gpu_hook(g.sc, on_gpu, NULL);
 		ipc_server_set_conv(g.sc);
 	}
 	static const struct ipc_server_conv_status_source source = {
@@ -654,6 +890,10 @@ service_conversion_stop(void)
 	g.reg_scratch = NULL;
 	g.status_scratch = NULL;
 	g.entry_count = 0;
+	g.dp_lift_iface = NULL;
+	g.dp_lift_inst = NULL; // destroyed by its host with the core
+	g.dp_lift_registered = false;
+	os_cond_destroy(&g.alloc_cond);
 	os_mutex_destroy(&g.alloc_mtx);
 	os_mutex_destroy(&g.mtx);
 	g.started = false;

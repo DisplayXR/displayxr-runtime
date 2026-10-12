@@ -157,6 +157,9 @@ target_link_libraries(ipc_server PRIVATE aux_os_uvc)
 if(WIN32 AND XRT_FEATURE_HYBRID_MODE)
 	target_link_libraries(ipc_server PRIVATE comp_d3d11_service)
 	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	# ADR-053 P1a (#2003): the compositor's GPU glue + the dp-lift backend,
+	# attached to the conversion core once the device exists.
+	target_sources(ipc_server PRIVATE server/ipc_server_conv_d3d11.c)
 endif()
 
 # Qwerty driver stereo state access for camera-centric controls

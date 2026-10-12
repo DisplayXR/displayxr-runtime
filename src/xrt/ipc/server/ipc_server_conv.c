@@ -16,6 +16,7 @@
 
 #include "os/os_threading.h"
 #include "util/u_logging.h"
+#include "util/u_lift_depth.h"
 #include "util/u_lift_mailbox.h"
 
 #include <math.h>
@@ -55,6 +56,18 @@ struct sc_stream
 	uint32_t priority;
 	bool has_last_params;
 	struct ipc_lift_params last_params;
+	float input_scale; //!< (0,1]: the S0 snapshot is downscaled by it (#2003)
+
+	/* GAUSSIANS facade (#2003, G8): a latest-wins photo mailbox over jobs. */
+	uint64_t job_id;       //!< the newest submitted job; 0 = none
+	uint64_t job_frame_id; //!< its frame id
+	int64_t job_source_time;
+	uint64_t next_frame;
+	uint8_t *blob; //!< latched result (two-call idiom)
+	uint64_t blob_size;
+	uint32_t blob_format;
+	uint64_t blob_frame_id;
+	int64_t blob_source_time;
 };
 
 struct ipc_server_conv
@@ -63,6 +76,8 @@ struct ipc_server_conv
 	struct os_mutex mtx; //!< leaf: the table, the io ops copy
 	struct ipc_server_conv_io_ops io;
 	bool io_set;
+	ipc_server_conv_gpu_hook_fn gpu_hook;
+	void *gpu_hook_ud;
 	uint64_t next_wire;
 	struct sc_stream streams[IPC_SERVER_CONV_MAX_STREAMS];
 };
@@ -194,6 +209,16 @@ mode_routable(uint32_t mode)
 	return mode == XRT_DP_LIFT_MODE_DEPTH || mode == XRT_DP_LIFT_MODE_SBS || mode == XRT_DP_LIFT_MODE_NVIEW;
 }
 
+//! The GAUSSIANS facade is possible: the glue reads inputs back to the CPU,
+//! and SPLATS_MONO has a non-terminal candidate (a job lane provider).
+static bool
+gaussians_routable(struct ipc_server_conv *sc, const struct ipc_server_conv_io_ops *io)
+{
+	struct xrt_conv_wire_task_desc d;
+	return io->import_input_cpu != NULL && task_advertised(sc->core, XRT_CONV_TASK_SPLATS_MONO, &d) &&
+	       (d.lanes & XRT_CONV_LANE_JOB) != 0;
+}
+
 static xrt_result_t
 core_create(struct ipc_server_conv *sc, struct sc_stream *st, uint64_t *out_core_id)
 {
@@ -226,6 +251,9 @@ core_create(struct ipc_server_conv *sc, struct sc_stream *st, uint64_t *out_core
 	opts.priority = st->priority != 0 ? st->priority : U_LIFT_PRIORITY_NORMAL;
 	opts.eyes_dp = 0; // the primary display processor's eyes (#2003 publishes them; stale = nominal)
 	opts.source_format = XRT_CONV_FMT_RGBA8_UNORM;
+	// rt#1978's runtime auto-convergence on every view stream whose app leaves
+	// the plane AUTO (the core runs it only when an observer factory is configured).
+	opts.auto_convergence = st->mode != XRT_DP_LIFT_MODE_DEPTH;
 
 	struct xrt_conv_wire_stream_created created;
 	memset(&created, 0, sizeof(created));
@@ -292,6 +320,9 @@ frame_from_params(const struct ipc_lift_params *p, uint32_t view_count, struct c
 	}
 	fr->strength = p->strength;
 	fr->focal_px = p->focal_px;
+	if (p->inpaint != 0) {
+		fr->frame_flags |= XRT_CONV_FRAME_INPAINT;
+	}
 }
 
 
@@ -337,7 +368,13 @@ ipc_server_conv_destroy(struct ipc_server_conv **sc_ptr)
 		if (!s->used) {
 			continue;
 		}
-		(void)conv_core_stream_destroy(sc->core, s->core_id);
+		if (s->core_id != 0) {
+			(void)conv_core_stream_destroy(sc->core, s->core_id);
+		}
+		if (s->job_id != 0) {
+			(void)conv_core_job_destroy(sc->core, s->job_id);
+		}
+		free(s->blob);
 		if (sc->io_set) {
 			sc->io.stream_gone(sc->io.ud, s->wire_id);
 		}
@@ -411,10 +448,92 @@ bool
 ipc_server_conv_routes_create(struct ipc_server_conv *sc, uint32_t mode, uint32_t content_hint)
 {
 	struct ipc_server_conv_io_ops io;
-	if (!mode_routable(mode) || !get_io(sc, &io)) {
+	if (!get_io(sc, &io)) {
+		return false;
+	}
+	if (mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
+		return gaussians_routable(sc, &io);
+	}
+	if (!mode_routable(mode)) {
 		return false;
 	}
 	return conv_core_task_has_candidate(sc->core, mode_task(mode, content_hint));
+}
+
+bool
+ipc_server_conv_resolve_stream(
+    struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id, uint64_t *out_core_id, uint32_t *out_mode)
+{
+	struct sc_stream st;
+	if (!find_stream(sc, client_id, stream_id, &st) || st.core_id == 0) {
+		return false;
+	}
+	*out_core_id = st.core_id;
+	*out_mode = st.mode;
+	return true;
+}
+
+void
+ipc_server_conv_set_gpu_hook(struct ipc_server_conv *sc, ipc_server_conv_gpu_hook_fn fn, void *ud)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->mtx);
+	sc->gpu_hook = fn;
+	sc->gpu_hook_ud = ud;
+	os_mutex_unlock(&sc->mtx);
+}
+
+void
+ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_conv_gpu *gpu)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->mtx);
+	ipc_server_conv_gpu_hook_fn hook = sc->gpu_hook;
+	void *hook_ud = sc->gpu_hook_ud;
+	os_mutex_unlock(&sc->mtx);
+
+	if (gpu != NULL) {
+		struct conv_core_gpu cg;
+		memset(&cg, 0, sizeof(cg));
+		cg.viewsyn = gpu->viewsyn;
+		cg.readback = gpu->readback;
+		cg.nominal_z_m = gpu->nominal_z_m;
+		conv_core_set_gpu(sc->core, &cg);
+		if (hook != NULL) {
+			hook(hook_ud, gpu); // allocator + the dp-lift row
+		}
+		ipc_server_conv_set_io(sc, &gpu->io); // the route engages last
+		U_LOG_W("[conv] GPU glue installed: the v3 lift route goes through the conversion core");
+		return;
+	}
+
+	// Removal: the route first, then every core-routed stream (their images
+	// belong to the GPU side), then the service half and the stages.
+	ipc_server_conv_set_io(sc, NULL);
+	os_mutex_lock(&sc->mtx);
+	for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_STREAMS; i++) {
+		struct sc_stream *s = &sc->streams[i];
+		if (!s->used) {
+			continue;
+		}
+		if (s->core_id != 0) {
+			(void)conv_core_stream_destroy(sc->core, s->core_id);
+		}
+		if (s->job_id != 0) {
+			(void)conv_core_job_destroy(sc->core, s->job_id);
+		}
+		free(s->blob);
+		memset(s, 0, sizeof(*s));
+	}
+	os_mutex_unlock(&sc->mtx);
+	if (hook != NULL) {
+		hook(hook_ud, NULL);
+	}
+	conv_core_set_gpu(sc->core, NULL);
 }
 
 bool
@@ -452,7 +571,14 @@ ipc_server_conv_lift_properties(struct ipc_server_conv *sc, struct xrt_dp_lift_c
 		return;
 	}
 	struct conv_core *core = sc->core;
-	const uint32_t v3_modes = CONV_V3_MODE_DEPTH | CONV_V3_MODE_SBS | CONV_V3_MODE_NVIEW;
+	struct ipc_server_conv_io_ops io;
+	const bool splats = get_io(sc, &io) && gaussians_routable(sc, &io);
+	uint32_t v3_modes = CONV_V3_MODE_DEPTH | CONV_V3_MODE_SBS | CONV_V3_MODE_NVIEW;
+	if (splats) {
+		// "Any", not "all": a splat model downloading never holds back live video.
+		v3_modes |= CONV_V3_MODE_GAUSSIANS;
+		out->modes |= XRT_DP_LIFT_MODE_GAUSSIANS;
+	}
 	out->state = conv_core_v3_state(core, v3_modes, false);
 
 	struct xrt_conv_wire_task_desc views, depth;
@@ -501,10 +627,13 @@ ipc_server_conv_lift_stream_create(struct ipc_server_conv *sc,
                                    uint64_t *out_stream_id)
 {
 	*out_stream_id = 0;
-	(void)input_scale;      // the glue's S0 snapshot may downscale; the core sees the snapshot extent
 	(void)aux_depth_format; // advisory in v3; the provider's depth_output_format wins
 	struct ipc_server_conv_io_ops io;
-	if (!mode_routable(mode) || !get_io(sc, &io)) {
+	if (!get_io(sc, &io)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	const bool gaussians = mode == XRT_DP_LIFT_MODE_GAUSSIANS;
+	if (gaussians ? !gaussians_routable(sc, &io) : !mode_routable(mode)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct sc_stream st;
@@ -512,9 +641,30 @@ ipc_server_conv_lift_stream_create(struct ipc_server_conv *sc,
 	st.used = true;
 	st.client_id = client_id;
 	st.mode = mode;
-	st.content_hint = content_hint;
+	st.content_hint = gaussians ? XRT_CONV_CONTENT_PHOTO : content_hint;
 	st.aux_depth = (aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0;
 	st.priority = U_LIFT_PRIORITY_NORMAL;
+	// inputScale (0,1]: the S0 snapshot is converted at reduced resolution.
+	st.input_scale = input_scale > 0.0f && input_scale <= 1.0f ? input_scale : 1.0f;
+	if (gaussians) {
+		// The photo facade: no core stream; each submit is one job (latest wins).
+		bool stored = false;
+		os_mutex_lock(&sc->mtx);
+		for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_STREAMS; i++) {
+			if (!sc->streams[i].used) {
+				st.wire_id = IPC_SERVER_CONV_STREAM_TAG | sc->next_wire++;
+				sc->streams[i] = st;
+				stored = true;
+				break;
+			}
+		}
+		os_mutex_unlock(&sc->mtx);
+		if (!stored) {
+			return XRT_ERROR_CLIENT_LIMIT_REACHED;
+		}
+		*out_stream_id = st.wire_id;
+		return XRT_SUCCESS;
+	}
 
 	struct xrt_conv_wire_task_desc d;
 	if (!task_candidate(sc->core, mode_task(mode, content_hint), &d)) {
@@ -561,7 +711,13 @@ ipc_server_conv_lift_stream_destroy(struct ipc_server_conv *sc, uint64_t client_
 	if (sc == NULL || !remove_stream(sc, client_id, stream_id, &st)) {
 		return XRT_SUCCESS; // v3: destroy of an unknown stream is a no-op
 	}
-	(void)conv_core_stream_destroy(sc->core, st.core_id);
+	if (st.core_id != 0) {
+		(void)conv_core_stream_destroy(sc->core, st.core_id);
+	}
+	if (st.job_id != 0) {
+		(void)conv_core_job_destroy(sc->core, st.job_id);
+	}
+	free(st.blob);
 	struct ipc_server_conv_io_ops io;
 	if (get_io(sc, &io)) {
 		io.stream_gone(io.ud, stream_id);
@@ -576,6 +732,74 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
                             xrt_graphics_buffer_handle_t handle,
                             bool is_dxgi,
                             uint64_t *out_frame_id)
+{
+	return ipc_server_conv_lift_submit_framed(sc, client_id, args, handle, is_dxgi, NULL, out_frame_id);
+}
+
+/*! GAUSSIANS facade submit: the photo as decoded CPU pixels, one SPLATS_MONO
+ *  job; a newer photo cancels the previous job (latest wins). */
+static xrt_result_t
+gaussians_submit(struct ipc_server_conv *sc,
+                 const struct ipc_server_conv_io_ops *io,
+                 struct sc_stream *st,
+                 const struct ipc_arg_lift_submit *args,
+                 const struct ipc_lift_params *p,
+                 xrt_graphics_buffer_handle_t handle,
+                 bool is_dxgi,
+                 uint64_t *out_frame_id)
+{
+	uint8_t *px = NULL;
+	xrt_result_t xret = io->import_input_cpu(io->ud, st->wire_id, handle, is_dxgi, args->width, args->height, &px);
+	if (xret != XRT_SUCCESS || px == NULL) {
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_WEAVE_REFUSED;
+	}
+	struct conv_job_create_info ji;
+	memset(&ji, 0, sizeof(ji));
+	ji.task = XRT_CONV_TASK_SPLATS_MONO;
+	ji.priority = CONV_JOB_PRIORITY_INTERACTIVE;
+	ji.input_kind = XRT_CONV_INPUT_MONO;
+	ji.requested_outputs = XRT_CONV_OUT_SPLAT_BLOB;
+	ji.requested_blob_format = XRT_CONV_BLOB_PLY_3DGS; // v3 formats only
+	ji.image_count = 1;
+	ji.image_role[0] = XRT_CONV_IMG_COLOR;
+	struct xrt_conv_image *im = &ji.images[0];
+	im->memory_kind = XRT_CONV_MEM_CPU;
+	im->cpu_ptr = px;
+	im->byte_size = (uint64_t)args->width * args->height * 4u;
+	im->width = args->width;
+	im->height = args->height;
+	im->format = XRT_CONV_FMT_RGBA8_UNORM;
+	im->color_space = XRT_CONV_CS_SRGB;
+	im->row_stride = args->width * 4u;
+	ji.params.struct_size = (uint32_t)sizeof(ji.params);
+	ji.params.content_hint = XRT_CONV_CONTENT_PHOTO;
+	ji.params.focal_px = p->focal_px > 0.0f ? p->focal_px : 0.0f;
+	ji.params.source_time_ns = (uint64_t)args->source_time;
+	ji.params.input_scale = 1.0f;
+	uint64_t job_id = 0;
+	xret = conv_core_job_submit(sc->core, st->client_id, &ji, &job_id); // CPU inputs are copied at submit
+	free(px);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (st->job_id != 0) {
+		(void)conv_core_job_destroy(sc->core, st->job_id); // latest wins: cancels a still-running one
+	}
+	st->job_id = job_id;
+	st->job_frame_id = ++st->next_frame;
+	st->job_source_time = args->source_time;
+	*out_frame_id = st->job_frame_id;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
+                                   uint64_t client_id,
+                                   const struct ipc_arg_lift_submit *args,
+                                   xrt_graphics_buffer_handle_t handle,
+                                   bool is_dxgi,
+                                   const struct xrt_lift_rect_frame *frame,
+                                   uint64_t *out_frame_id)
 {
 	*out_frame_id = 0;
 	struct ipc_server_conv_io_ops io;
@@ -600,8 +824,19 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
 	memset(&p, 0, sizeof(p));
 	p.convergence = -1.0f;
 	p.strength = 1.0f;
+	p.inpaint = 1; // svc_lift's stream default
 	if (st.has_last_params) {
 		p = st.last_params;
+	}
+
+	if (st.mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
+		if (io.import_input_cpu == NULL) {
+			io.release_input(io.ud, handle, is_dxgi);
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
+		const xrt_result_t gr = gaussians_submit(sc, &io, &st, args, &p, handle, is_dxgi, out_frame_id);
+		store_stream(sc, &st);
+		return gr;
 	}
 
 	// #2005 G2: the view count is bounded by the TASK's max_views, here too.
@@ -625,11 +860,19 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
 	}
 	store_stream(sc, &st);
 
+	// inputScale: the snapshot is box-filtered down into a smaller slot.
+	uint32_t sw = args->width, sh = args->height;
+	if (st.input_scale < 1.0f) {
+		sw = (uint32_t)((float)args->width * st.input_scale + 0.5f);
+		sh = (uint32_t)((float)args->height * st.input_scale + 0.5f);
+		sw = sw < 1 ? 1 : sw;
+		sh = sh < 1 ? 1 : sh;
+	}
 	struct conv_submit_layout lay;
 	memset(&lay, 0, sizeof(lay));
 	lay.image_count = 1;
-	lay.width[0] = args->width;
-	lay.height[0] = args->height;
+	lay.width[0] = sw;
+	lay.height[0] = sh;
 	lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
 	lay.color_space[0] = XRT_CONV_CS_SRGB;
 	lay.role[0] = XRT_CONV_IMG_COLOR;
@@ -650,6 +893,16 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
 	memset(&fr, 0, sizeof(fr));
 	fr.source_time = args->source_time;
 	frame_from_params(&p, st.view_count, &fr);
+	if (st.input_scale < 1.0f && fr.focal_px > 0.0f) {
+		fr.focal_px *= (float)sw / (float)args->width; // focal is in INPUT pixels
+	}
+	// ADR-048: the session's window is the lifted rect (svc_lift's frame).
+	if (frame != NULL && frame->valid) {
+		fr.rect_valid = true;
+		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
+		fr.rect_w_m = frame->width_m;
+		fr.rect_h_m = frame->height_m;
+	}
 	return conv_core_stream_commit_submit(sc->core, st.core_id, slot.slot, &fr, out_frame_id);
 }
 
@@ -696,6 +949,8 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 	out->height = pub.height;
 	out->format = pub.format;
 	out->output_realloc = (pub.realloc || r.output_realloc) ? 1u : 0u;
+	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
+	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
 	if ((r.written & XRT_CONV_OUT_VIEWS) != 0) {
 		uint32_t n = r.views_info.view_count;
 		if (n > IPC_LIFT_MAX_VIEWS) {
@@ -709,7 +964,9 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 			out->viewpoints[3 * i + 2] = r.views_info.eye_xyz[i][2];
 		}
 	}
-	if ((r.written & XRT_CONV_OUT_DEPTH) != 0) {
+	// A DEPTH-mode stream's depth IS the main export (svc_lift reported no aux
+	// depth for it); aux depth rides SBS / NVIEW only.
+	if ((r.written & XRT_CONV_OUT_DEPTH) != 0 && st.mode != XRT_DP_LIFT_MODE_DEPTH) {
 		const struct xrt_conv_depth_info *di = &r.depth_info;
 		struct xrt_lift_depth_info *d = &out->depth;
 		d->valid = 1;
@@ -725,7 +982,9 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 		d->value_offset = di->value_shift;
 		d->near_depth = di->near_value;
 		d->far_depth = di->far_value;
-		if (di->fx > 0.0f && di->fy > 0.0f) {
+		const bool metric = d->units == XRT_DP_LIFT_DEPTH_METRIC;
+		// RELATIVE depth: no intrinsics, no transform — never a faked scale.
+		if (metric && di->fx > 0.0f && di->fy > 0.0f) {
 			d->intrinsics_valid = 1;
 			d->focal[0] = di->fx;
 			d->focal[1] = di->fy;
@@ -733,6 +992,23 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 			d->principal[1] = di->cy;
 		}
 		d->convergence_depth = (di->suggest_flags & 4u) != 0 ? di->convergence_value : 0.0f;
+		// The depth refers to the source camera = the midpoint of the
+		// synthesised viewpoints (the straight-on viewer when none).
+		const uint32_t vn = out->viewpoint_count;
+		if (vn > 0) {
+			for (uint32_t i = 0; i < vn; i++) {
+				d->viewpoint[0] += out->viewpoints[3 * i + 0] / (float)vn;
+				d->viewpoint[1] += out->viewpoints[3 * i + 1] / (float)vn;
+				d->viewpoint[2] += out->viewpoints[3 * i + 2] / (float)vn;
+			}
+		} else {
+			d->viewpoint[2] = U_LIFT_NOMINAL_Z_DEFAULT_M;
+		}
+		d->transform_valid =
+		    metric && u_lift_depth_to_display(d->viewpoint, r.rect_center, r.rect_size[0], r.rect_size[1],
+		                                      d->convergence_depth, d->depth_to_display)
+		        ? 1u
+		        : 0u;
 	}
 	return XRT_SUCCESS;
 }
@@ -818,6 +1094,86 @@ ipc_server_conv_lift_stats(struct ipc_server_conv *sc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
+                                  uint64_t client_id,
+                                  uint64_t stream_id,
+                                  uint64_t capacity,
+                                  bool *out_ready,
+                                  struct xrt_lift_blob_info *out_info,
+                                  uint8_t **out_bytes)
+{
+	*out_ready = false;
+	memset(out_info, 0, sizeof(*out_info));
+	*out_bytes = NULL;
+	struct sc_stream st;
+	if (sc == NULL || !find_stream(sc, client_id, stream_id, &st)) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	if (st.mode != XRT_DP_LIFT_MODE_GAUSSIANS) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (st.blob == NULL && st.job_id != 0) {
+		// Latch the newest job's blob once it succeeded (chunked read, no cap).
+		struct conv_job_status js;
+		memset(&js, 0, sizeof(js));
+		if (conv_core_job_status(sc->core, st.job_id, &js) == XRT_SUCCESS) {
+			if (js.status == CONV_JOB_SUCCEEDED) {
+				struct xrt_conv_wire_job_result jr;
+				memset(&jr, 0, sizeof(jr));
+				if (conv_core_job_result(sc->core, st.job_id, 0, &jr) == XRT_SUCCESS &&
+				    jr.byte_size > 0 && jr.byte_size <= ((uint64_t)1 << 31)) {
+					uint8_t *buf = (uint8_t *)malloc((size_t)jr.byte_size);
+					uint64_t off = 0;
+					while (buf != NULL && off < jr.byte_size) {
+						uint64_t got = 0, total = 0;
+						if (conv_core_job_read(sc->core, st.job_id, 0, off, buf + off,
+						                       jr.byte_size - off, &got,
+						                       &total) != XRT_SUCCESS ||
+						    got == 0) {
+							break;
+						}
+						off += got;
+					}
+					if (buf != NULL && off == jr.byte_size) {
+						st.blob = buf;
+						st.blob_size = jr.byte_size;
+						st.blob_format = jr.blob_format == XRT_CONV_BLOB_SOG
+						                     ? XRT_DP_LIFT_BLOB_SOG
+						                     : XRT_DP_LIFT_BLOB_PLY_3DGS;
+						st.blob_frame_id = st.job_frame_id;
+						st.blob_source_time = st.job_source_time;
+					} else {
+						free(buf);
+					}
+				}
+				(void)conv_core_job_destroy(sc->core, st.job_id);
+				st.job_id = 0;
+			} else if (js.status == CONV_JOB_FAILED || js.status == CONV_JOB_CANCELLED) {
+				(void)conv_core_job_destroy(sc->core, st.job_id);
+				st.job_id = 0;
+			}
+			store_stream(sc, &st);
+		}
+	}
+	if (st.blob == NULL) {
+		return XRT_SUCCESS; // nothing newer
+	}
+	*out_ready = true;
+	out_info->frame_id = st.blob_frame_id;
+	out_info->source_time = st.blob_source_time;
+	out_info->format = st.blob_format;
+	out_info->byte_count = st.blob_size;
+	if (capacity >= st.blob_size) {
+		// Delivered: the latch is consumed (the caller frees the bytes).
+		*out_bytes = st.blob;
+		st.blob = NULL;
+		st.blob_size = 0;
+		store_stream(sc, &st);
+	}
+	return XRT_SUCCESS;
+}
+
 void
 ipc_server_conv_hint_interest(struct ipc_server_conv *sc, uint64_t client_id, uint64_t task_mask)
 {
@@ -840,6 +1196,7 @@ ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 		struct sc_stream *s = &sc->streams[i];
 		if (s->used && s->client_id == client_id) {
 			gone[n++] = s->wire_id;
+			free(s->blob); // its jobs die with the connection in the core
 			memset(s, 0, sizeof(*s));
 		}
 	}
