@@ -1107,8 +1107,6 @@ endif()
 
 # ADR-042: the sim_display FAKE lift's splat PLY is pinned host-side next to the
 # lift mailbox tests (the module that emits it is Windows/D3D11-only).
-target_sources(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_fake_ply.c)
-target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 # ADR-042: the FAKE lift's splat PLY is pinned host-side next to the lift
 # mailbox tests. Shared by sim_display's deprecated fake and the
 # DisplayXR-SimConversion provider (src/xrt/drivers/sim_conversion/).
