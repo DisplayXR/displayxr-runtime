@@ -167,8 +167,10 @@ _Static_assert(XRT_CONV_BLOB_PLY_3DGS == XRT_DP_LIFT_BLOB_PLY_3DGS, "conv BLOB_P
 _Static_assert(XRT_CONV_BLOB_SOG == XRT_DP_LIFT_BLOB_SOG, "conv BLOB_SOG parity");
 
 /* xrt_conv_provider_status restates xrt_plugin_platform_status (layout + state values). */
-_Static_assert(sizeof(struct xrt_conv_provider_status) == sizeof(struct xrt_plugin_platform_status),
-               "conv provider status size != plug-in platform status size");
+/* The conversion struct restates the platform status WITHOUT its trailing
+ * `uint64_t reserved[8]`, so it is pinned as an exact prefix of it. */
+_Static_assert(sizeof(struct xrt_conv_provider_status) == offsetof(struct xrt_plugin_platform_status, reserved),
+               "conv provider status != the prefix of plug-in platform status (before reserved[])");
 _Static_assert(offsetof(struct xrt_conv_provider_status, state) ==
                    offsetof(struct xrt_plugin_platform_status, state),
                "conv provider status: state offset");
