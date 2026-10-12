@@ -411,6 +411,23 @@ TEST_CASE("conversion loader: DXR_CONV_PROVIDERS / DXR_CONV_EXCLUSIVE suppress r
 	CHECK(v[0].module == nullptr);
 }
 
+TEST_CASE("conversion loader: reserved policy subkeys", "[conversion_loader]")
+{
+	CHECK(target_conversion_plugin_is_reserved_subkey("Policy"));
+	CHECK(target_conversion_plugin_is_reserved_subkey("policy"));
+	CHECK(target_conversion_plugin_is_reserved_subkey("PreferredProvider"));
+	CHECK(target_conversion_plugin_is_reserved_subkey("PREWARM"));
+	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey("Prewarmer"));
+	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey("sim-conversion"));
+	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey(""));
+	CHECK_FALSE(target_conversion_plugin_is_reserved_subkey(nullptr));
+	int n = 0;
+	while (target_conversion_plugin_reserved_subkeys[n] != nullptr) {
+		n++;
+	}
+	CHECK(n == 3);
+}
+
 TEST_CASE("conversion loader: Hosting strings", "[conversion_loader]")
 {
 	bool known = false;
@@ -709,6 +726,20 @@ TEST_CASE("conversion loader: Windows registry rows are read in full", "[convers
 	reg_sz(c, L"Binary", L"C:\\x\\off.dll");
 	reg_dword(c, L"Enabled", 0);
 	RegCloseKey(c);
+
+	// The spec's policy subkeys (§3.1 root values), in odd case: never rows.
+	HKEY pol = reg_create(r, L"Policy");
+	reg_dword(pol, L"Lock", 1);
+	RegCloseKey(pol);
+	HKEY pref = reg_create(r, L"PREFERREDPROVIDER");
+	reg_sz(pref, L"views-mono", L"acme-depth");
+	RegCloseKey(pref);
+	HKEY pw = reg_create(r, L"prewarm");
+	reg_dword(pw, L"depth-video", 0);
+	RegCloseKey(pw);
+	// Root values the spec also names do not show up as subkeys at all.
+	reg_dword(r, L"AllowResearchOnly", 0);
+	reg_dword(r, L"KeepAliveSec", 0);
 	RegCloseKey(r);
 
 	std::vector<Entry> out(XRT_CONV_LOADER_MAX_ENTRIES);

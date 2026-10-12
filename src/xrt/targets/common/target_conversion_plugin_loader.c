@@ -148,6 +148,22 @@ conv_entry_finish(struct xrt_conversion_plugin_entry *e)
  *
  */
 
+const char *const target_conversion_plugin_reserved_subkeys[] = XRT_CONV_RESERVED_SUBKEYS_INIT;
+
+bool
+target_conversion_plugin_is_reserved_subkey(const char *name)
+{
+	if (name == NULL) {
+		return false;
+	}
+	for (int i = 0; target_conversion_plugin_reserved_subkeys[i] != NULL; i++) {
+		if (conv_streq_nocase(name, target_conversion_plugin_reserved_subkeys[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint32_t
 target_conversion_plugin_parse_hosting(const char *s, bool *out_known)
 {
@@ -847,6 +863,12 @@ conv_enumerate_registry(
 		if (count >= max) {
 			U_LOG_I("conversion plugin loader: more than %d registered providers — truncating.", max);
 			break;
+		}
+		// Policy subkeys (§3.1 root values) live beside the provider rows.
+		char name_utf8[256];
+		conv_w2u(name, name_utf8, (int)sizeof(name_utf8));
+		if (target_conversion_plugin_is_reserved_subkey(name_utf8)) {
+			continue;
 		}
 		conv_read_row(root, name, label, &out[count++]);
 	}
