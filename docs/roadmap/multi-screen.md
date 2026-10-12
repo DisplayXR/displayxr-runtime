@@ -305,3 +305,106 @@ that configuration is accepted; it disappears when every screen is tracked.
   ST-5598 → SR-P1; ST-3160 → SR-P3.
 - New: ADR "Multi-screen: segments and per-screen views" (supersedes ADR-015 §3-§4),
   `XR_DXR_display_info` v22 spec section, `comp_segments` design note.
+
+## 8. PROPOSED: per-part views for a zone that straddles a seam (displayxr-browser-pvt#272)
+
+> **Status: proposal. Nothing here is implemented, and nothing should land before David signs
+> off on the open questions at the end.** Runtime half drafted here; the Chromium half is
+> outlined only (browser builds run on the AWS build box, in `displayxr-browser-pvt`).
+
+**Where things stand.** A zone (an `XR_DXR_display_zones` zone, or an inline-3D element, which
+the browser locates as one) gets ONE view set per locate. When the zone lies wholly on one
+screen, that set is now framed from that screen: for a present-owner since the ADR-047
+Amendment 4 addendum, for every other segmenting session since Amendment 9. A zone that
+**straddles** a seam is woven per screen (each screen's DP weaves its part), but both parts are
+rendered from one screen's viewer and framed against one screen's rectangle: the primary's for a
+present-owner, the majority's otherwise. Fixing that needs a view set per part, which nothing
+can carry today: the locate returns one set per zone, and the page renders one per element.
+
+### 8.1 Runtime: the locate returns the parts (recommended)
+
+A zone-scoped `xrLocateViews` gains an optional output, chained on `XrViewState` beside
+`XrViewDisplayRawDXR` (an `XR_DXR_display_zones` revision; new struct type, append-only):
+
+```c
+typedef struct XrDisplayZonePartDXR {
+    uint64_t   displayId;  // the screen (XrDisplayDXR::displayId)
+    XrRect2Di  rect;       // the part, ZONE-relative pixels (cut at the seam)
+    uint32_t   firstView;  // its views in XrDisplayZonePartsDXR::views
+    uint32_t   viewCount;  // = the zone's active view count
+} XrDisplayZonePartDXR;
+
+typedef struct XrDisplayZonePartsDXR {
+    XrStructureType        type;   // XR_TYPE_DISPLAY_ZONE_PARTS_DXR
+    void* XR_MAY_ALIAS     next;
+    uint64_t               generation;  // moves only when the parts' geometry does
+    uint32_t               partCapacityInput;
+    uint32_t               partCountOutput;   // 0 = not split: use XrView[] as today
+    XrDisplayZonePartDXR*  parts;
+    uint32_t               viewCapacityInput;
+    uint32_t               viewCountOutput;
+    XrView*                views;             // every part's set, contiguous
+} XrDisplayZonePartsDXR;
+```
+
+- `xrLocateViews`' own `views[]` keep today's answer (the one set), so an app that does not
+  chain the struct, or ignores it, renders exactly as now. The view-configuration count does
+  not change (ADR-041), which is why the part sets get their own array.
+- **Per part:** that screen's eyes, Kooima against that screen's rectangle with canvas = the
+  part (`oxr_segment_views_window_metrics` on the zone instead of the window), and, for a
+  display rig, ONE m2v for the whole zone: the virtual display height scaled by the part's share
+  of the zone's height, and the canvas offset by (part centre − zone centre) × m2v. That is
+  `oxr_segment_views_vdh_scale` / `rig_dx` with "window" read as "zone", so two parts meet at the
+  seam at the same scale.
+- **One source of truth.** The parts come from the table the locate framed against, not from the
+  weave output, for two reasons: the browser locates in its **browser** process and weaves in
+  its **GPU** process (Amendment 4 addendum), so the weave output's parts
+  (`XrWeaveOutputRectPartsDXR`) never reach the code that renders views; and pairing a locate's
+  views with a weave's parts mixes two tables a frame apart during a drag (the #1883 sliver).
+- **Weave side.** The parts are pixels at fixed positions inside the zone's submission, so the
+  weave must crop each screen's part where it was **painted**, not at the live seam: the
+  present-owner twin of #1883's painted partition. The batch / v6 submit carries the partition
+  the frame was rendered with (zone-relative rects per screen, appended to the rect), and
+  `weave_seg_record` crops with it, as the D3D11 in-process path already does.
+- **Wire.** `ipc_view_rig_info` gains nothing (the zone already crosses); the reply gains a
+  fixed-size parts block (≤ `XRT_MAX_SEGMENTS` parts × the active views of pose + fov, about
+  0.3 KB), appended. The in-process path computes the same thing in `oxr_session_locate_views`.
+
+**Alternative (rejected unless David prefers it): the caller locates each part.** Chain an
+input `XrDisplayZonePartDXR { XrRect2Di partRect; }` beside the zone; the runtime frames the
+sub-rect from the screen holding it with the zone's rig scale. Smaller, and stateless, but the
+caller must know the parts first, which for the browser means shipping the GPU process's weave
+parts to the browser process every frame, one frame late.
+
+### 8.2 Browser and web API (outline, displayxr-browser-pvt)
+
+- Blink installs per element the parts with their views (today: one view pair per element,
+  patch 0036). `GetLatestViews` grows a parts list; an element with zero or one part keeps the
+  current shape and code path.
+- Candidate page-facing shape (issue item 2): each part is an extra view pair, every `XRView`
+  carrying a **sub-viewport**, the part's rect relative to the element, normalised 0..1. The
+  page renders each pair into that sub-rect of each eye's half of the element's side-by-side
+  submission (a part occupies `rect.x / w ÷ 2` inside each half, the existing weave contract,
+  `XR_DXR_weave.md` §5g item 4). A page that reads only the first pair renders today's image;
+  the element's views then come from the default screen (open question 2).
+- The browser's existing weave submit is unchanged apart from the painted partition above.
+
+### 8.3 Open questions for David
+
+1. **Runtime surface**: the locate returns the parts (8.1, recommended), or the caller locates
+   per part (the alternative)?
+2. **Unaware pages and apps**: which screen frames a straddling zone's single set? Today a
+   present-owner uses the primary and every other session the majority. Unify on the majority
+   (a straddling element mostly on screen 2 then looks right on most of its area), or keep both?
+3. **Web API shape**: extra `XRView`s with a sub-viewport each, or an explicit
+   `parts[]` object per element (`{ rect, views }`)? The first keeps the per-view render loop
+   pages already have; the second is easier to feature-detect. And is this a DisplayXR-only
+   API surface, or something to propose upstream with inline 3D?
+4. **The seam**: two viewers make the element visibly discontinuous at the seam when the screens'
+   trackers disagree (or one is untracked, decided 2026-10-07 to keep its own nominal viewer).
+   Accept, as for windows, or blend across a few pixels?
+5. **Cost and budget**: a straddling element renders 2× views. Cap the number of split elements
+   per frame (e.g. the largest N), falling back to one set beyond it?
+6. **Scope**: does `PRIMARY_MULTIVIEW_DXR` (in-process zones apps) also get per-part zone views
+   through its own `views[]` (it already advertises a set per segment), or only via the new
+   struct, so both families share one mechanism?
