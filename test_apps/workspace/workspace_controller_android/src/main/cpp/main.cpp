@@ -16,8 +16,15 @@
  *  3. Twice a second: enumerate the workspace's clients and place them side by
  *     side across the panel (xrSetWorkspaceClientWindowPoseDXR).
  *
- * Test knob: `adb shell setprop debug.dxr.test_controller.active 0` deactivates
- * the overlay (per-window resumes), `1` (or unset) re-activates it.
+ * Test knobs:
+ *  - `adb shell setprop debug.dxr.test_controller.active 0` deactivates the
+ *    overlay (per-window resumes), `1` (or unset) re-activates it.
+ *  - `adb shell setprop debug.dxr.test_controller.focus N` focuses the N-th
+ *    placed client (1-based; 0 or unset = no focus). The focused client owns
+ * the shared display processor's 2D/3D mode (#967 D-5).
+ *  - `adb shell setprop debug.dxr.test_controller.mode N` requests rendering
+ *    mode N as the workspace's display-mode authority (0 = 2D, 1 = 3D on Leia),
+ *    which drives the shared display processor's lens (#967 D-5).
  */
 
 #include <android/log.h>
@@ -58,8 +65,12 @@ struct Controller
 	PFN_xrEnumerateWorkspaceClientsDXR enumerate = nullptr;
 	PFN_xrGetWorkspaceClientInfoDXR info = nullptr;
 	PFN_xrSetWorkspaceClientWindowPoseDXR set_pose = nullptr;
+        PFN_xrSetWorkspaceFocusedClientDXR set_focus = nullptr;
+        PFN_xrRequestDisplayRenderingModeDXR request_mode = nullptr;
+        int focus_applied = -1;
+        int mode_applied = -1;
 
-	std::vector<XrWorkspaceClientId> placed;
+        std::vector<XrWorkspaceClientId> placed;
 };
 
 bool g_window_ready = false;
@@ -81,6 +92,14 @@ now_ms()
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+int want_focus() {
+  char v[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.dxr.test_controller.focus", v) > 0) {
+    return atoi(v);
+  }
+  return 0;
 }
 
 bool
@@ -160,15 +179,23 @@ init(struct android_app *app, Controller &c)
 	}
 	LOGI("display %.3f x %.3f m", (double)c.disp_w_m, (double)c.disp_h_m);
 
-	if (!get_proc(c.instance, "xrActivateSpatialWorkspaceDXR", &c.activate) ||
-	    !get_proc(c.instance, "xrDeactivateSpatialWorkspaceDXR", &c.deactivate) ||
-	    !get_proc(c.instance, "xrEnumerateWorkspaceClientsDXR", &c.enumerate) ||
-	    !get_proc(c.instance, "xrGetWorkspaceClientInfoDXR", &c.info) ||
-	    !get_proc(c.instance, "xrSetWorkspaceClientWindowPoseDXR", &c.set_pose)) {
-		return false;
-	}
+        if (!get_proc(c.instance, "xrActivateSpatialWorkspaceDXR",
+                      &c.activate) ||
+            !get_proc(c.instance, "xrDeactivateSpatialWorkspaceDXR",
+                      &c.deactivate) ||
+            !get_proc(c.instance, "xrEnumerateWorkspaceClientsDXR",
+                      &c.enumerate) ||
+            !get_proc(c.instance, "xrGetWorkspaceClientInfoDXR", &c.info) ||
+            !get_proc(c.instance, "xrSetWorkspaceClientWindowPoseDXR",
+                      &c.set_pose) ||
+            !get_proc(c.instance, "xrSetWorkspaceFocusedClientDXR",
+                      &c.set_focus) ||
+            !get_proc(c.instance, "xrRequestDisplayRenderingModeDXR",
+                      &c.request_mode)) {
+          return false;
+        }
 
-	// A controller session carries no graphics binding (XR_DXR_spatial_workspace).
+        // A controller session carries no graphics binding (XR_DXR_spatial_workspace).
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
 	sci.systemId = c.system;
 	r = xrCreateSession(c.instance, &sci, &c.session);
@@ -196,40 +223,96 @@ set_active(Controller &c, bool on)
 
 // Lay every OpenXR client out side by side across the panel, each a column of
 // the panel's width, 90% of its height (display-centric metres, +y up).
-void
-place_clients(Controller &c)
-{
-	uint32_t n = 0;
-	if (c.enumerate(c.session, 0, &n, nullptr) != XR_SUCCESS) {
-		return;
-	}
-	std::vector<XrWorkspaceClientId> ids(n);
-	if (n > 0 && c.enumerate(c.session, n, &n, ids.data()) != XR_SUCCESS) {
-		return;
-	}
-	std::vector<XrWorkspaceClientId> apps;
-	for (uint32_t i = 0; i < n; i++) {
-		XrWorkspaceClientInfoDXR ci = {XR_TYPE_WORKSPACE_CLIENT_INFO_DXR};
-		if (c.info(c.session, ids[i], &ci) == XR_SUCCESS && ci.clientType == XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_DXR) {
-			apps.push_back(ids[i]);
-		}
-	}
-	if (apps == c.placed) {
-		return;
-	}
-	const uint32_t count = (uint32_t)apps.size();
-	const float col_w = c.disp_w_m / (float)(count > 0 ? count : 1);
-	for (uint32_t i = 0; i < count; i++) {
-		XrPosef pose = {};
-		pose.orientation.w = 1.0f;
-		pose.position.x = -c.disp_w_m * 0.5f + col_w * ((float)i + 0.5f);
-		pose.position.y = 0.0f;
-		pose.position.z = 0.0f;
-		XrResult r = c.set_pose(c.session, apps[i], &pose, col_w * 0.96f, c.disp_h_m * 0.9f);
-		LOGW("place client %u (%u of %u) at x=%.3f w=%.3f h=%.3f -> %d", apps[i], i + 1, count,
-		     (double)pose.position.x, (double)(col_w * 0.96f), (double)(c.disp_h_m * 0.9f), (int)r);
-	}
-	c.placed = apps;
+void place_clients(Controller &c, struct android_app *app) {
+  // XR_DXR_display_info reports the panel in the vendor's natural orientation;
+  // our fullscreen window shows how it is held right now (the NP02J is
+  // portrait-native), so lay out across whichever edge is horizontal.
+  // The window is gone while a client's Activity sits on top of ours, so
+  // remember the last orientation we saw.
+  static int held_portrait = -1;
+  if (app->window != nullptr) {
+    const int32_t ww = ANativeWindow_getWidth(app->window);
+    const int32_t wh = ANativeWindow_getHeight(app->window);
+    if (ww > 0 && wh > 0) {
+      held_portrait = wh > ww ? 1 : 0;
+    }
+  }
+  float pw = c.disp_w_m, ph = c.disp_h_m;
+  if (held_portrait >= 0 && ((held_portrait == 1) != (ph > pw))) {
+    const float t = pw;
+    pw = ph;
+    ph = t;
+  }
+  uint32_t n = 0;
+  if (c.enumerate(c.session, 0, &n, nullptr) != XR_SUCCESS) {
+    return;
+  }
+  std::vector<XrWorkspaceClientId> ids(n);
+  if (n > 0 && c.enumerate(c.session, n, &n, ids.data()) != XR_SUCCESS) {
+    return;
+  }
+  std::vector<XrWorkspaceClientId> apps;
+  for (uint32_t i = 0; i < n; i++) {
+    XrWorkspaceClientInfoDXR ci = {XR_TYPE_WORKSPACE_CLIENT_INFO_DXR};
+    if (c.info(c.session, ids[i], &ci) == XR_SUCCESS &&
+        ci.clientType == XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_DXR) {
+      apps.push_back(ids[i]);
+    }
+  }
+  if (apps == c.placed) {
+    return;
+  }
+  const uint32_t count = (uint32_t)apps.size();
+  const float col_w = pw / (float)(count > 0 ? count : 1);
+  bool all_ok = true;
+  for (uint32_t i = 0; i < count; i++) {
+    XrPosef pose = {};
+    pose.orientation.w = 1.0f;
+    pose.position.x = -pw * 0.5f + col_w * ((float)i + 0.5f);
+    pose.position.y = 0.0f;
+    pose.position.z = 0.0f;
+    XrResult r =
+        c.set_pose(c.session, apps[i], &pose, col_w * 0.96f, ph * 0.9f);
+    LOGW("place client %u (%u of %u) at x=%.3f w=%.3f h=%.3f -> %d", apps[i],
+         i + 1, count, (double)pose.position.x, (double)(col_w * 0.96f),
+         (double)(ph * 0.9f), (int)r);
+    all_ok = all_ok && r == XR_SUCCESS;
+  }
+  if (!all_ok) {
+    return; // a client not ready to be placed yet: retry next tick
+  }
+  c.placed = apps;
+  c.focus_applied = -1; // re-apply focus against the new layout
+}
+
+void apply_mode(Controller &c) {
+  char v[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.dxr.test_controller.mode", v) <= 0 ||
+      v[0] < '0' || v[0] > '9') {
+    return;
+  }
+  const int want = atoi(v);
+  if (want == c.mode_applied) {
+    return;
+  }
+  XrResult r = c.request_mode(c.session, (uint32_t)want);
+  LOGW("request rendering mode %d (workspace display-mode authority) -> %d",
+       want, (int)r);
+  c.mode_applied = want;
+}
+
+void apply_focus(Controller &c) {
+  const int want = want_focus();
+  if (want == c.focus_applied) {
+    return;
+  }
+  XrWorkspaceClientId id = XR_NULL_WORKSPACE_CLIENT_ID;
+  if (want >= 1 && (size_t)want <= c.placed.size()) {
+    id = c.placed[(size_t)want - 1];
+  }
+  XrResult r = c.set_focus(c.session, id);
+  LOGW("focus client #%d (id %u) -> %d", want, id, (int)r);
+  c.focus_applied = want;
 }
 
 void
@@ -277,8 +360,10 @@ android_main(struct android_app *app)
 			next_tick = t + 500;
 			set_active(c, want_active());
 			if (c.active) {
-				place_clients(c);
-			}
+                          place_clients(c, app);
+                          apply_focus(c);
+                          apply_mode(c);
+                        }
 		}
 	}
 

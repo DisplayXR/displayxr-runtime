@@ -53,6 +53,21 @@ void
 comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active);
 
 /*!
+ * #967 D-5 / #1006: the workspace controller's hardware 2D/3D request for the
+ * shared display processor (the controller is the display-mode authority while
+ * it is active — workspace-controller-registration.md "Display mode authority").
+ * Recorded here, applied on the render thread by the shared-DP mode channel,
+ * which tells every composited client once the DP accepted it. Cleared when the
+ * workspace deactivates, so the focused / lone client's own wish governs again.
+ *
+ * @return true when a shared surface exists to take it (always where the shared
+ *         surface is compiled).
+ * @ingroup comp_multi
+ */
+bool
+comp_multi_system_request_workspace_display_mode(struct xrt_system_compositor *xsc, bool hardware_3d);
+
+/*!
  * Compositor-local mirror of the controller's chrome layout — the subset the
  * per-session composite path needs, decoupled from the IPC wire form.
  *

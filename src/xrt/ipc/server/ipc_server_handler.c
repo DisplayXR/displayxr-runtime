@@ -4893,6 +4893,19 @@ ipc_handle_workspace_request_display_mode(volatile struct ipc_client_state *_ics
 		// caller falls back to legacy device-property path on the client.
 		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
+#elif defined(COMP_MULTI_SHARED_SURFACE)
+	// #967 D-5: the shared display processor's hardware 2D/3D, from the mode's
+	// own hardware flag (the same mode table the clients enumerate).
+	{
+		struct xrt_device *head = s->xsysd != NULL ? s->xsysd->static_roles.head : NULL;
+		if (head == NULL || mode_index >= head->rendering_mode_count) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		if (!comp_multi_system_request_workspace_display_mode(
+		        s->xsysc, head->rendering_modes[mode_index].hardware_display_3d)) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+	}
 #else
 	(void)mode_index;
 	return XRT_ERROR_NOT_IMPLEMENTED;

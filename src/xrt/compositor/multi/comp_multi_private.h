@@ -409,6 +409,13 @@ struct multi_compositor
 		//! #1007: when @ref gpu_stalled was set (monotonic ns), for the log.
 		int64_t gpu_stalled_since_ns;
 
+		//! #1006: earliest time the lazy per-session init may be retried
+		//! after a failure (monotonic ns, 0 = now).
+		int64_t init_retry_after_ns;
+
+		//! #1006: consecutive lazy-init failures (drives the 1-2-4-8 s back-off).
+		uint32_t init_fail_count;
+
 		//! True if swapchain needs recreation (set on VK_SUBOPTIMAL_KHR)
 		bool swapchain_needs_recreate;
 
@@ -1464,6 +1471,14 @@ struct multi_system_compositor
 	//! (-1 = never), converged each frame from the lens owner's wish
 	//! (mc->hardware_display_3d of the focused client, or of a lone client).
 	int shared_hw_3d_applied;
+
+	/*!
+	 * #967 D-5: the workspace controller's hardware 2D/3D request (1 = 3D,
+	 * 0 = 2D, -1 = none). When set it overrides the focused / lone client's
+	 * wish in shared_converge_display_mode_locked. Written by the IPC thread,
+	 * read by the render thread (a plain int, last writer wins).
+	 */
+	int shared_hw_3d_controller_wish;
 	//! FRAME_TICK viewer (eye midpoint, display m) last read from shared_dp, and
 	//! how many frames in a row the DP has had no eyes (drops valid after ~0.5 s).
 	float shared_tick_viewer[3];
