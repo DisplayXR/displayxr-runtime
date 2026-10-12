@@ -177,6 +177,14 @@ if(ANDROID)
 	target_sources(
 		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_android.c
 		)
+	# Android compiles the comp_multi shared surface since the workspace overlay
+	# mode (#1006, ADR-036 D4), so the workspace handler arms — and their generic
+	# per-target input queues, shared with macOS / desktop Linux — are linked here
+	# too. Nothing feeds them pointer input on Android yet; the queues stay empty.
+	target_sources(
+		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
+				   ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
+		)
 	target_link_libraries(
 		ipc_shared
 		PUBLIC ${ANDROID_LIBRARY}
