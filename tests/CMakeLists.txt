@@ -32,6 +32,7 @@ set(tests
     tests_conversion_abi
     tests_conv_wire
     tests_lift_abi
+    tests_conv_viewsyn_math
     tests_aux_lift_viewpoint
     tests_aux_lift_rig_depth
     tests_space_overseer_rig
@@ -186,6 +187,12 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# depth image created the production way shares across devices (NT handle,
 	# keyed mutex, D3D11 + D3D12 open). SKIPs if no WARP device exists.
 	list(APPEND tests tests_comp_d3d11_service_formats)
+endif()
+if(TARGET comp_d3d11_conv_viewsyn)
+	# ADR-053 S5 -- the reference view synthesis on WARP: a synthetic step edge
+	# rendered into 2 and 4 views, parallax checked against u_conv_viewsyn's
+	# CPU march. SKIPs if no D3D11 device exists at all.
+	list(APPEND tests tests_conv_viewsyn_d3d11)
 endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
@@ -1019,6 +1026,14 @@ endif()
 add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests_ipc_proto.py
 					 ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared
 	)
+
+# ADR-053 S5: the reference view synthesis' pure math, compiled straight into
+# the unit (no graphics API), like tests_comp_rear_budget.
+target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/u_conv_viewsyn.c)
+target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+if(TARGET comp_d3d11_conv_viewsyn)
+	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
 
 # ADR-042: the sim_display FAKE lift's splat PLY is pinned host-side next to the
 # lift mailbox tests (the module that emits it is Windows/D3D11-only).
