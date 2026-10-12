@@ -36,6 +36,20 @@ GITHUB_RAW = "https://raw.githubusercontent.com"
 RUNTIME_REPO = "DisplayXR/displayxr-runtime"
 LEIA_REPO = "DisplayXR/displayxr-leia-plugin"
 PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_plugin.h"
+INPUT_PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_input_plugin.h"
+CONVERSION_PLUGIN_HEADER_PATH = "src/xrt/include/xrt/xrt_conversion_plugin.h"
+
+# Every plug-in ABI the runtime exposes: header -> the macro family whose
+# `<PREFIX>_CURRENT` is that ABI's major. Three independent majors, one per
+# plug-in type (display processor ADR-019, input provider ADR-034, conversion
+# provider ADR-053); a loader rejects a different major before any dispatch.
+# One table so the release gate (this script) and the downstream repin gate
+# (downstream_pin_bump.py) read the same macros and can never disagree.
+ABI_HEADERS: dict[str, str] = {
+    PLUGIN_HEADER_PATH: "XRT_PLUGIN_API_VERSION",
+    INPUT_PLUGIN_HEADER_PATH: "XRT_INPUT_PLUGIN_API_VERSION",
+    CONVERSION_PLUGIN_HEADER_PATH: "XRT_CONVERSION_PLUGIN_API_VERSION",
+}
 
 
 def _fetch(url: str) -> str:
@@ -48,40 +62,56 @@ def _read_local(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _resolve_api_version_current(plugin_h_text: str) -> int:
+def _resolve_api_version_current(
+    plugin_h_text: str, prefix: str = "XRT_PLUGIN_API_VERSION"
+) -> int:
     """
-    Parse xrt_plugin.h and resolve XRT_PLUGIN_API_VERSION_CURRENT to an int.
+    Parse a plug-in ABI header and resolve `<prefix>_CURRENT` to an int.
 
-    The header defines XRT_PLUGIN_API_VERSION_N constants and then
-    `#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_<N>`.
-    We follow that one alias hop.
+    Each header defines `<prefix>_N` constants and then
+    `#define <prefix>_CURRENT <prefix>_<N>`. We follow that one alias hop.
+    The default prefix is the display-processor ABI (xrt_plugin.h); pass a
+    value from ABI_HEADERS for the input / conversion ABIs. The `^#define`
+    anchor keeps XRT_PLUGIN_API_VERSION from matching inside
+    XRT_INPUT_PLUGIN_API_VERSION / XRT_CONVERSION_PLUGIN_API_VERSION.
     """
+    p = re.escape(prefix)
     consts: dict[str, int] = {}
     for m in re.finditer(
-        r"^\s*#\s*define\s+(XRT_PLUGIN_API_VERSION_\d+)\s+(\d+)\s*$",
+        r"^\s*#\s*define\s+(" + p + r"_\d+)\s+(\d+)\s*$",
         plugin_h_text,
         re.MULTILINE,
     ):
         consts[m.group(1)] = int(m.group(2))
 
     alias = re.search(
-        r"^\s*#\s*define\s+XRT_PLUGIN_API_VERSION_CURRENT\s+(\S+)\s*$",
+        r"^\s*#\s*define\s+" + p + r"_CURRENT\s+(\S+)\s*$",
         plugin_h_text,
         re.MULTILINE,
     )
     if not alias:
-        raise RuntimeError(
-            "XRT_PLUGIN_API_VERSION_CURRENT not found in xrt_plugin.h"
-        )
+        raise RuntimeError(f"{prefix}_CURRENT not found in the header")
     target = alias.group(1)
     if target.isdigit():
         return int(target)
     if target not in consts:
         raise RuntimeError(
-            f"XRT_PLUGIN_API_VERSION_CURRENT aliases unknown {target!r}; "
+            f"{prefix}_CURRENT aliases unknown {target!r}; "
             f"known constants: {sorted(consts)}"
         )
     return consts[target]
+
+
+def tree_abis(tree_root: Path) -> dict[str, int | None]:
+    """Every plug-in ABI major in a runtime checkout: {`<prefix>_CURRENT`: N},
+    None for a header that does not exist in that tree."""
+    out: dict[str, int | None] = {}
+    for header, prefix in ABI_HEADERS.items():
+        path = tree_root / header
+        out[prefix + "_CURRENT"] = (
+            _resolve_api_version_current(_read_local(path), prefix) if path.is_file() else None
+        )
+    return out
 
 
 def _extract_dxr_runtime_git_tag(leia_cmakelists: str) -> str:
@@ -121,8 +151,12 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--leia-tag",
-        required=True,
-        help="leia plug-in tag to check (e.g. v1.0.7)",
+        help="leia plug-in tag to check (e.g. v1.0.7); required unless --print-tree-abis",
+    )
+    p.add_argument(
+        "--print-tree-abis",
+        action="store_true",
+        help="print every plug-in ABI major (display / input / conversion) of --runtime-tree and exit",
     )
     p.add_argument(
         "--runtime-tree",
@@ -134,6 +168,17 @@ def main() -> int:
         help="instead of --runtime-tree, fetch the runtime header at a tag",
     )
     args = p.parse_args()
+
+    if args.print_tree_abis:
+        try:
+            for macro, value in tree_abis(Path(args.runtime_tree)).items():
+                print(f"{macro} = {value if value is not None else '(header absent)'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"ABI read FAILED: {e}", file=sys.stderr)
+            return 2
+        return 0
+    if not args.leia_tag:
+        p.error("--leia-tag is required (or pass --print-tree-abis)")
 
     try:
         if args.runtime_tag:

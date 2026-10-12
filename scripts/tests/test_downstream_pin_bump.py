@@ -138,6 +138,82 @@ class ManifestTests(unittest.TestCase):
         self.assertFalse(missing, "add to downstream-pins.json feature_surface.headers: %s" % sorted(missing))
 
 
+CONV_H = "src/xrt/include/xrt/xrt_conversion_plugin.h"
+INPUT_H = "src/xrt/include/xrt/xrt_input_plugin.h"
+
+
+def conv_header(major: int) -> str:
+    return ("#define XRT_CONVERSION_PLUGIN_API_VERSION_1 1\n"
+            "#define XRT_CONVERSION_PLUGIN_API_VERSION_2 2\n"
+            "#define XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT XRT_CONVERSION_PLUGIN_API_VERSION_%d\n" % major)
+
+
+class PluginAbiTests(unittest.TestCase):
+    """ADR-053: the gate reads every plug-in ABI major, not only the display one."""
+
+    def test_resolver_reads_each_prefix_without_crosstalk(self):
+        text = ("#define XRT_PLUGIN_API_VERSION_5 5\n#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_5\n"
+                + conv_header(2))
+        self.assertEqual(dpb._resolve_api_version_current(text), 5)
+        self.assertEqual(dpb._resolve_api_version_current(text, "XRT_CONVERSION_PLUGIN_API_VERSION"), 2)
+        with self.assertRaises(RuntimeError):  # the display prefix must not match inside the conversion one
+            dpb._resolve_api_version_current(conv_header(1))
+
+    def test_abi_table_covers_the_three_plugin_types_and_the_tree_resolves(self):
+        self.assertEqual(set(dpb.ABI_HEADERS), {dpb.PLUGIN_HEADER_PATH, INPUT_H, CONV_H})
+        for h, prefix in dpb.ABI_HEADERS.items():
+            with self.subTest(header=h):
+                text = (REPO_ROOT / h).read_text(encoding="utf-8")
+                self.assertGreaterEqual(dpb._resolve_api_version_current(text, prefix), 1)
+
+    def test_conversion_abi_change_triggers_features(self):
+        a, b = surf(VK_OLD), surf(VK_OLD)
+        a["abis"] = {"XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT": 1}
+        b["abis"] = {"XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT": 2}
+        trig, _ = dpb.diff_surfaces(a, b)
+        self.assertEqual(trig, ["plug-in ABI XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT 1 -> 2"])
+
+    def test_new_conversion_header_is_not_an_abi_change(self):
+        a, b = surf(VK_OLD), surf(VK_OLD)
+        a["abis"], b["abis"] = {}, {"XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT": 1}
+        self.assertEqual(dpb.diff_surfaces(a, b)[0], [])
+
+    def _with_headers(self, table):
+        real = dpb.header_at
+        dpb.header_at = lambda tag, path: table.get((tag, path))
+        self.addCleanup(setattr, dpb, "header_at", real)
+
+    def test_abi_track_with_conversion_header(self):
+        disp = "#define XRT_PLUGIN_API_VERSION_5 5\n#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_5\n"
+        P = dpb.PLUGIN_HEADER_PATH
+        self._with_headers({
+            ("v9.0.0", P): disp, ("v9.0.1", P): disp, ("v9.1.0", P): disp, ("v9.2.0", P): disp,
+            ("v9.0.1", CONV_H): conv_header(1), ("v9.1.0", CONV_H): conv_header(1),
+            ("v9.2.0", CONV_H): conv_header(2),
+        })
+        hdrs = [P, CONV_H]
+        # Default gate (display ABI only) is blind to the conversion major.
+        self.assertEqual(dpb.verdict("abi", "v9.1.0", "v9.2.0", [])["action"], "skip")
+        # Opted in: the conversion major bump repins ...
+        d = dpb.verdict("abi", "v9.1.0", "v9.2.0", [], hdrs)
+        self.assertEqual(d["action"], "bump")
+        self.assertEqual(d["triggers"], ["plug-in ABI XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT 1 -> 2"])
+        # ... a patch release with no major change does not ...
+        self.assertEqual(dpb.verdict("abi", "v9.0.1", "v9.1.0", [], hdrs)["action"], "skip")
+        # ... and the release that first ships the header does.
+        d = dpb.verdict("abi", "v9.0.0", "v9.0.1", [], hdrs)
+        self.assertEqual(d["action"], "bump")
+        self.assertIn("xrt_conversion_plugin.h first ships at v9.0.1", d["triggers"])
+
+    def test_abi_headers_rejects_a_non_abi_header(self):
+        with self.assertRaises(SystemExit):
+            dpb.abi_headers({"abi_headers": ["src/xrt/include/xrt/xrt_dp_lift.h"]})
+        self.assertEqual(dpb.abi_headers(None), [dpb.PLUGIN_HEADER_PATH])
+
+    def test_default_surface_lists_the_conversion_header(self):
+        self.assertIn(CONV_H, dpb.load_manifest()["feature_surface"]["headers"])
+
+
 def _have_tags(*tags: str) -> bool:
     return all(subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", "--quiet",
                                t + "^{commit}"], capture_output=True).returncode == 0 for t in tags)
