@@ -30,6 +30,7 @@ set(tests
     tests_weave_snap_grid
     tests_lift_mailbox
     tests_conversion_abi
+    tests_conv_wire
     tests_aux_lift_viewpoint
     tests_aux_lift_rig_depth
     tests_space_overseer_rig
@@ -1023,10 +1024,14 @@ add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURC
 target_sources(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_fake_ply.c)
 target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
 
-# ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h). Built as
-# C++17 on purpose (the header promises C11 + C++17).
+# ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h) and the
+# conv_* wire family (xrt_conv_wire.h). The ABI test builds as C++17 on purpose
+# (the header promises C11 + C++17); the wire test carries a C11 TU so both
+# headers also compile as C with every _Static_assert.
 target_link_libraries(tests_conversion_abi PRIVATE xrt-interfaces)
 set_target_properties(tests_conversion_abi PROPERTIES CXX_STANDARD 17)
+target_sources(tests_conv_wire PRIVATE tests_conv_wire_c.c)
+target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
 
 # XR_DXR_lift v3 (ADR-048 Addendum A): the app-rig mapping is checked against the
 # shared displayxr-common rig core xrLocateViews runs.
