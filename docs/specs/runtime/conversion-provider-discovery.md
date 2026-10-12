@@ -533,9 +533,30 @@ New check **`conversion_providers`** (`cli_query.c` check table `:2918-3087`):
 - `lift_caps` / exit 11 stays and reads the `dp-lift` row.
 - CI registers `sim-conversion` with `ENABLE` = 1 and requires `conversion_providers.count ≥ 1` in `selftest --json`.
 
+As built (#2006): the pass is `target_conv_status` (targets/common), shared with `conv
+list|status` and the headless status snapshot. `selftest --json` carries a
+`conversion_providers` object (`evaluated`, `count`, `registered`, `negotiated`,
+`malformed_rows`, `bad_descriptors`, `task_rows`, `dp_lift_declared`, `note`, `providers[]`
+in the §7.3 row shape) next to the `conversion_providers` row of `checks[]`. A malformed
+*registry row* (no `Binary`, bad JSON) and a loader reject (ABI, missing binary) are
+reported, never failed — only a malformed *descriptor* or an out-of-range `get_state` is.
+`lift_caps` no longer instantiates anything headless: it reports the static `dp-lift` row
+and, when a service is listening, the service's live caps over one DIAG
+`lift_get_properties` (`cli_lift_service.c`). The CI gate on `count ≥ 1` runs only when the
+sim provider DLL was built and registered (until #2002 makes that unconditional).
+
 ### 7.3 Status snapshot (ADR-051)
 
 `xrt_status_snapshot` gains `conv_providers[]` (id, name, vendor, version, load, status state + hint, fallback, probe_order, hosting `in_service` / `satellite` / `android_service`, host pid, restarts, last exit code, adapter, backend, VRAM used, licence class) and per-task rows (provider index, task, cap_id, state, reason, progress, selected, licence class, backend, model id for diagnostics, typical latency, streams, queued jobs). Rows are fetched **by index** over DIAG to stay under the 1 KB DIAG limit. Keys are only added, so the schema number stays **1**. A `conversion` generation counter bumps on every readiness transition, so `status --watch` and the dashboard update live. New warning codes: `CONV_CRASH_LOOP`, `CONV_RESEARCH_MODEL_ENABLED`, `CONV_TASK_UNSERVED`, `CONV_CPU_STAGING`.
+
+As built (#2006): the row types are `xrt_status_conv_provider` / `xrt_status_conv_task`
+(`xrt_display_status.h`), fetched with `system_get_conv_provider_row(index)` /
+`system_get_conv_task_row(index)`; the generation counter is
+`xrt_status_generation::conversion`. The JSON shape and warning rules are in
+[`display-dashboard.md`](../../roadmap/display-dashboard.md) §3.2 / §4. The service fills
+the rows from a registered conversion status source (`ipc_server_set_conv_status_source`),
+which the core's service object (#2003) registers; with none registered the service reports
+zero rows and `conv list` falls back to the headless describe, saying so.
 
 ### 7.4 Logging
 

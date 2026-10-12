@@ -131,6 +131,7 @@ Field sources, by block:
 | `screens[*].warnings` | derived in `u_status_snapshot_build` (§4) | same |
 | `clients[*]` | `ipc_app_state`, `system_get_client_window_metrics`, the new `system_get_client_segments`, the `[HEALTH]` / `[RENDER]` structs; desktop Linux: `multi_compositor_status_get_client` (comp_multi) | empty |
 | `generation` | service counters (§5) | 0 |
+| `conv_providers[*]`, `conv_tasks[*]` (§3.2) | the conversion core's status source (`ipc_server_set_conv_status_source`; registered by the core's service object, #2003) | `target_conv_status`: enumerate → negotiate → probe → describe → select, never warm |
 
 ### 3.1 `displays --claims --json` is a contract
 
@@ -140,6 +141,55 @@ is added at the top, every existing key stays, `serial` is filled from the claim
 is empty because the claim's serial is not copied into the JSON), `physical_*_mm` comes
 from the EDID reader on every platform (#1877), and new keys are only ever added. The
 `status` verb does not replace it.
+
+### 3.2 Conversion providers (ADR-053)
+
+Added by ADR-053 (#2006); keys only added, so `schema` stays **1**. `generation` gains
+`conversion` (the conversion core's counter: it moves on every readiness transition and
+provider-table change), and the snapshot gains two arrays, appended after `warnings`:
+
+```json
+"generation": { "topology": 17, "status": 2412, "conversion": 9 },
+"conv_providers": [
+  { "id": "sim-conversion", "name": "DisplayXR Sim Conversion", "vendor": "DisplayXR", "version": "2.40.0",
+    "load": "NEGOTIATED", "binary": "C:\\…\\DisplayXR-SimConversion.dll", "abi": 1, "probe_order": 250,
+    "hosting": "in_service", "status": "READY", "hint": "", "enabled": true, "fallback": true, "hidden": false,
+    "licence_exempt": false, "research_opt_in": false, "described": true, "host_pid": 0, "restarts": 0,
+    "last_exit_code": 0, "adapter_luid": null, "backend": "cpu", "vram_used_mb": 0,
+    "licence_class": "PERMISSIVE", "licence_spdx": "BSL-1.0", "cap_count": 7, "bad_descriptors": 0,
+    "descriptor_error": null }
+],
+"conv_tasks": [
+  { "provider_index": 0, "provider": "sim-conversion", "task": "views-mono", "cap_id": 3, "composed": false,
+    "state": "READY", "reason": "none", "progress": 0, "selected": true, "order": 0, "verdict": "selected",
+    "stream": true, "job": false, "min_views": 2, "max_views": 8, "licence_class": "PERMISSIVE",
+    "backend": "cpu", "model_id": "sim", "typical_latency_ms": 4, "streams": 1, "jobs_queued": 0,
+    "cpu_staging": false }
+]
+```
+
+- `conv_providers[]` (≤ 8): one row per registered provider plus the built-in `dp-lift`
+  adapter row. `load` is the loader outcome upper-cased (`NEGOTIATED`, `ABI_MISMATCH`,
+  `DISABLED`, `PROBE_DECLINED`, …; `BUILT_IN` for the adapter); `status` is the provider's
+  `get_provider_status` platform state. `hidden` = superseded by another provider's
+  `Supersedes`. `bad_descriptors` / `descriptor_error` are the selftest's exit-13 evidence.
+- `conv_tasks[]` (≤ 32): one row per (provider capability or composed pipeline) × task,
+  grouped by task, each group in **selection order** (`order` 0 = first; `null` = dropped by
+  the filter, with the reason in `verdict`: `drop-disabled`, `drop-licence`, …). Exactly one
+  row per served task has `selected: true`. `composed` = a depth capability + the reference
+  view synthesis. `streams`, `jobs_queued`, `cpu_staging` are service-only (0 headless).
+- **Wire.** The head carries only `conv_provider_count` / `conv_task_count`; each row
+  crosses by index in its own DIAG reply — `system_get_conv_provider_row(index)` /
+  `system_get_conv_task_row(index)`, each `{row, generation}` — so every reply stays under
+  the 1 KB DIAG limit (`static_assert` in `ipc_server_handler.c`, `tests_conv_snapshot`).
+  A reader refetches when a row's generation differs from the head's, as for screens.
+- **Headless** (`source: headless`): `displayxr-cli status`, `conv list|status` and
+  `selftest` describe providers in-process (no model load); states are the providers' own
+  `get_state` answers (normally `INSTALLED`). The static `dp-lift` row appears when the
+  active display plug-in exposes the lift-only factory (Windows).
+- `displayxr-cli conv list|status --json` prints the same rows as one document:
+  `{schema, source, generation, providers[], tasks[], warnings[] (CONV_* only), policy}`
+  (MCP `get_conversion_status` reads it).
 
 ## 4. Warnings as data
 
@@ -158,6 +208,10 @@ and `critical` light the panel's tab badge; `info` shows in place. Runtime-deriv
 | `PLUGIN_NOT_READY` | critical | the claiming plug-in's platform state is not READY (text = the plug-in's hint, verbatim) |
 | `SERVICE_HEADLESS` | info | system-level: snapshot built without a service; live rows are absent |
 | `DP_DEGRADED` / `DP_STALE` | warn / critical | a bound DP's backend state |
+| `CONV_CRASH_LOOP` | critical | system-level: a conversion capability is `FAILED(crash_loop)` (5 abnormal host exits in 10 min; retried after 30 min) |
+| `CONV_RESEARCH_MODEL_ENABLED` | warn | system-level: a task is served by a `RESEARCH_ONLY` / `UNKNOWN`-licence model (only reachable with `AllowResearchOnly`; the grandfathered `dp-lift` adapter never raises it) |
+| `CONV_TASK_UNSERVED` | warn | system-level: a task had ordered candidates but every one is terminal (nothing selected) |
+| `CONV_CPU_STAGING` | info | system-level: a live conversion stream copies through the CPU (no GPU-shared import) |
 
 Texts are one sentence each and say what to do, following the vendor dashboard's
 "Title: fix" pattern.
@@ -171,6 +225,7 @@ Three session-free RPCs on the DIAG class, appended to `proto.json`:
 | `system_get_status_generation` | `{topology, status}` | the poll; two `uint64` |
 | `system_get_status_snapshot` | the fixed-size head: runtime, plugins[], screens[] (vendor cell included), workspace, client ids | crosses like `xrt_screen_list` does today |
 | `system_get_client_segments(client_id)` | that client's `xrt_segment_metrics` + owner screen + window rect + presenter + lease + integrity counters | read-only; lifts the own-session restriction of `compositor_get_segment_metrics` for DIAG only |
+| `system_get_conv_provider_row(index)` / `system_get_conv_task_row(index)` | one conversion row + the generation (§3.2) | ADR-053; appended to `proto.json`; one row per reply keeps each under 1 KB |
 
 Generation bumps: `topology` on a screen-registry re-probe (the existing
 `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` / registry-change path, the Linux DRM poll, the
