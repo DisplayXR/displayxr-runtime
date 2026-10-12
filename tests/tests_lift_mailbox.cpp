@@ -24,7 +24,7 @@
 
 #include "util/u_lift_mailbox.h"
 
-#include "sim_display_fake_ply.h"
+#include "sim_conv_fake_ply.h"
 
 #include <algorithm>
 #include <cstring>

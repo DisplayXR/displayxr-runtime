@@ -3,11 +3,18 @@
 /*!
  * @file
  * @brief  sim_display's FAKE lift module (see sim_display_lift_d3d11.h).
+ *
+ * DEPRECATED (ADR-053): a thin DP-slot wrapper over the synthesis shared with
+ * the DisplayXR-SimConversion provider (src/xrt/drivers/sim_conversion/
+ * sim_conv_synth.h). It owns only the per-stream D3D11 textures and the
+ * xrt_dp_lift_* plumbing; the pictures come from sim_conv_d3d11_synth_*.
+ * Deleted once the lift thread runs on the conversion core (#2003).
  * @ingroup drv_sim_display
  */
 
 #include "sim_display_lift_d3d11.h"
-#include "sim_display_fake_ply.h"
+#include "sim_conv_fake_ply.h"
+#include "sim_conv_synth.h"
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
@@ -16,7 +23,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
-#include <d3dcompiler.h>
 
 #include <cstddef>
 #include <cstdlib>
@@ -26,44 +32,13 @@
 DEBUG_GET_ONCE_BOOL_OPTION(sim_display_fake_lift, "SIM_DISPLAY_FAKE_LIFT", false)
 DEBUG_GET_ONCE_NUM_OPTION(sim_display_fake_lift_latency_ms, "SIM_DISPLAY_FAKE_LIFT_LATENCY_MS", 8)
 
+//! Whole-field struct_size coverage: a caller built against an OLDER header
+//! passes a shorter struct, and the fake writes / reads only what it covers
+//! (roadmap conversion-providers.md §10 — the fake used to refuse them).
+#define FAKE_COVERS(PTR, TYPE, FIELD) ((PTR)->struct_size >= offsetof(TYPE, FIELD) + sizeof(((TYPE *)0)->FIELD))
+
 #define SIM_FAKE_LIFT_MAX_STREAMS 8
 #define SIM_FAKE_LIFT_MAX_VIEWS 8
-
-static const char *k_vs = R"(
-struct VS_OUTPUT { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-VS_OUTPUT main(uint id : SV_VertexID) {
-	VS_OUTPUT o;
-	o.uv = float2(id & 1, id >> 1);
-	o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
-	return o;
-}
-)";
-
-// Views side by side; view v samples the input shifted by (v - (n-1)/2) * shift.
-static const char *k_ps_views = R"(
-cbuffer P : register(b0) { float view_count; float shift; float2 pad; };
-Texture2D src : register(t0);
-SamplerState samp : register(s0);
-float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	float v = min(floor(uv.x * view_count), view_count - 1.0);
-	float lu = uv.x * view_count - v;
-	float off = (v - (view_count - 1.0) * 0.5) * shift;
-	float4 c = src.Sample(samp, float2(saturate(lu + off), uv.y));
-	return float4(c.rgb, c.a); // keep the source alpha (runtime#1742: transparent gaps must stay transparent)
-}
-)";
-
-// Relative depth: a plain vertical gradient, 0 (near) at the top.
-static const char *k_ps_depth = R"(
-float main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return uv.y; }
-)";
-
-struct fake_cb
-{
-	float view_count;
-	float shift;
-	float pad[2];
-};
 
 struct fake_stream
 {
@@ -88,28 +63,10 @@ struct fake_stream
 struct sim_fake_lift
 {
 	ID3D11Device *device;
-	ID3D11VertexShader *vs;
-	ID3D11PixelShader *ps_views;
-	ID3D11PixelShader *ps_depth;
-	ID3D11SamplerState *sampler;
-	ID3D11Buffer *cb;
+	struct sim_conv_d3d11_synth *synth;
 	uint64_t next_id;
 	fake_stream streams[SIM_FAKE_LIFT_MAX_STREAMS];
 };
-
-static HRESULT
-compile(const char *src, const char *target, ID3DBlob **out)
-{
-	ID3DBlob *err = nullptr;
-	HRESULT hr = D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "main", target, 0, 0, out, &err);
-	if (FAILED(hr) && err != nullptr) {
-		U_LOG_E("sim_display fake lift: shader compile error: %s", (const char *)err->GetBufferPointer());
-	}
-	if (err != nullptr) {
-		err->Release();
-	}
-	return hr;
-}
 
 template <typename T>
 static void
@@ -169,34 +126,8 @@ sim_fake_lift_create(void *d3d11_device)
 	fl->device = static_cast<ID3D11Device *>(d3d11_device);
 	fl->device->AddRef();
 
-	ID3DBlob *b = nullptr;
-	bool ok =
-	    SUCCEEDED(compile(k_vs, "vs_5_0", &b)) &&
-	    SUCCEEDED(fl->device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->vs));
-	safe_release(b);
-	ok =
-	    ok && SUCCEEDED(compile(k_ps_views, "ps_5_0", &b)) &&
-	    SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_views));
-	safe_release(b);
-	ok =
-	    ok && SUCCEEDED(compile(k_ps_depth, "ps_5_0", &b)) &&
-	    SUCCEEDED(fl->device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &fl->ps_depth));
-	safe_release(b);
-
-	if (ok) {
-		D3D11_SAMPLER_DESC sd = {};
-		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-		sd.MaxLOD = D3D11_FLOAT32_MAX;
-		ok = SUCCEEDED(fl->device->CreateSamplerState(&sd, &fl->sampler));
-	}
-	if (ok) {
-		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = sizeof(fake_cb);
-		bd.Usage = D3D11_USAGE_DEFAULT;
-		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		ok = SUCCEEDED(fl->device->CreateBuffer(&bd, nullptr, &fl->cb));
-	}
+	fl->synth = sim_conv_d3d11_synth_create(d3d11_device);
+	const bool ok = fl->synth != nullptr;
 	if (!ok) {
 		U_LOG_E("sim_display fake lift: init failed — lift stays unavailable");
 		sim_fake_lift_destroy(fl);
@@ -205,6 +136,14 @@ sim_fake_lift_create(void *d3d11_device)
 	U_LOG_W(
 	    "sim_display: FAKE lift module active (SIM_DISPLAY_FAKE_LIFT) — shifted SBS/N-view, gradient "
 	    "depth, two-layer PLY; not a model");
+	static bool s_deprecation_warned = false;
+	if (!s_deprecation_warned) {
+		s_deprecation_warned = true;
+		U_LOG_W(
+		    "sim_display: SIM_DISPLAY_FAKE_LIFT is DEPRECATED and is removed one release after the "
+		    "conversion core lands; use the DisplayXR-SimConversion conversion provider instead "
+		    "(setting ENABLE=1, env DXR_CONV_SIM_CONVERSION_ENABLE=1; ADR-053)");
+	}
 	return fl;
 }
 
@@ -217,11 +156,8 @@ sim_fake_lift_destroy(struct sim_fake_lift *fl)
 	for (auto &s : fl->streams) {
 		stream_release(s);
 	}
-	safe_release(fl->cb);
-	safe_release(fl->sampler);
-	safe_release(fl->ps_depth);
-	safe_release(fl->ps_views);
-	safe_release(fl->vs);
+	sim_conv_d3d11_synth_destroy(fl->synth);
+	fl->synth = nullptr;
 	safe_release(fl->device);
 	delete fl;
 }
@@ -229,7 +165,9 @@ sim_fake_lift_destroy(struct sim_fake_lift *fl)
 extern "C" bool
 sim_fake_lift_get_caps(struct sim_fake_lift *fl, struct xrt_dp_lift_caps *out)
 {
-	if (fl == nullptr || out == nullptr || out->struct_size < sizeof(struct xrt_dp_lift_caps)) {
+	// The original v1 block (through backend) is required; appended fields are
+	// written only when the caller's struct_size covers them.
+	if (fl == nullptr || out == nullptr || !FAKE_COVERS(out, struct xrt_dp_lift_caps, backend)) {
 		return false;
 	}
 	out->modes =
@@ -239,8 +177,10 @@ sim_fake_lift_get_caps(struct sim_fake_lift *fl, struct xrt_dp_lift_caps *out)
 	out->depth_semantics = XRT_DP_LIFT_DEPTH_RELATIVE;
 	out->state = XRT_DP_LIFT_STATE_READY;
 	// The fake's auxiliary depth is a synthetic METRIC ramp (1 m .. 2 m).
-	out->aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
-	out->aux_depth_semantics = XRT_DP_LIFT_DEPTH_METRIC;
+	if (FAKE_COVERS(out, struct xrt_dp_lift_caps, aux_depth_semantics)) {
+		out->aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
+		out->aux_depth_semantics = XRT_DP_LIFT_DEPTH_METRIC;
+	}
 	out->typical_latency_ns = (uint64_t)debug_get_num_option_sim_display_fake_lift_latency_ms() * 1000000ull;
 	snprintf(out->backend, sizeof(out->backend), "sim_display-fake");
 	return true;
@@ -347,7 +287,9 @@ extern "C" bool
 sim_fake_lift_get_depth(struct sim_fake_lift *fl, uint64_t id, void *d3d11_context, struct xrt_dp_lift_depth *out)
 {
 	(void)d3d11_context;
-	if (fl == nullptr || out == nullptr || out->struct_size < sizeof(struct xrt_dp_lift_depth)) {
+	// Everything this writes is in the original block (through vendor_frame_id);
+	// the appended relief fields are left to the caller's zero-fill.
+	if (fl == nullptr || out == nullptr || !FAKE_COVERS(out, struct xrt_dp_lift_depth, vendor_frame_id)) {
 		return false;
 	}
 	fake_stream *s = find_stream(fl, id);
@@ -386,6 +328,8 @@ sim_fake_lift_convert(struct sim_fake_lift *fl,
                       uint32_t w,
                       uint32_t h,
                       const struct xrt_dp_lift_params *p,
+                      const float *viewpoints_xyz,
+                      uint32_t viewpoint_floats,
                       void **out_resource,
                       uint32_t *out_w,
                       uint32_t *out_h,
@@ -427,53 +371,34 @@ sim_fake_lift_convert(struct sim_fake_lift *fl,
 		}
 	}
 
-	// ~2% of the view width per view step at strength 1: visible, obviously fake.
-	fake_cb cb = {};
-	cb.view_count = (float)views;
-	cb.shift = 0.02f * (p != nullptr && p->strength > 0.0f ? p->strength : 1.0f);
-	ctx->UpdateSubresource(fl->cb, 0, nullptr, &cb, 0, 0);
-
-	D3D11_VIEWPORT vp = {};
-	vp.Width = (float)ow;
-	vp.Height = (float)h;
-	vp.MaxDepth = 1.0f;
-	ctx->RSSetViewports(1, &vp);
-	D3D11_RECT sc = {0, 0, (LONG)ow, (LONG)h};
-	ctx->RSSetScissorRects(1, &sc);
-	ctx->OMSetRenderTargets(1, &s->rtv, nullptr);
-	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	ctx->IASetInputLayout(nullptr);
-	ctx->VSSetShader(fl->vs, nullptr, 0);
-	ctx->PSSetShader(depth ? fl->ps_depth : fl->ps_views, nullptr, 0);
-	ctx->PSSetConstantBuffers(0, 1, &fl->cb);
-	ctx->PSSetSamplers(0, 1, &fl->sampler);
-	ctx->PSSetShaderResources(0, 1, &srv);
-	ctx->Draw(4, 0);
-	ID3D11ShaderResourceView *null_srv = nullptr;
-	ctx->PSSetShaderResources(0, 1, &null_srv);
+	// Per-view shifts from THIS view's viewpoint when the runtime sent them and
+	// the rect width is known (roadmap §10: the fake used to ignore them and
+	// draw a fixed ~2 %-per-view fan); the historical fan otherwise.
+	bool ok = true;
+	if (depth) {
+		ok = sim_conv_d3d11_synth_depth(fl->synth, ctx, s->rtv, w, h);
+	} else {
+		const float strength = p != nullptr ? p->strength : 1.0f;
+		const float rect_w =
+		    p != nullptr && FAKE_COVERS(p, struct xrt_dp_lift_params, rect_width_m) ? p->rect_width_m : 0.0f;
+		float shifts[SIM_CONV_SYNTH_MAX_VIEWS];
+		sim_conv_synth_view_shifts(views, strength, viewpoints_xyz, viewpoint_floats / 3u, rect_w, shifts);
+		ok = sim_conv_d3d11_synth_views(fl->synth, ctx, srv, s->rtv, w, h, views, shifts);
+	}
 
 	// XR_DXR_lift v3: the auxiliary depth of the SAME (fake) inference — the
 	// ramp the DEPTH mode draws, at input size, R32F; decoded as 1 + v metres.
 	s->depth_ready = false;
-	if (s->aux_depth && !depth && fake_ensure_depth(fl, *s, w, h)) {
-		D3D11_VIEWPORT dvp = {};
-		dvp.Width = (float)w;
-		dvp.Height = (float)h;
-		dvp.MaxDepth = 1.0f;
-		ctx->RSSetViewports(1, &dvp);
-		D3D11_RECT dsc = {0, 0, (LONG)w, (LONG)h};
-		ctx->RSSetScissorRects(1, &dsc);
-		ctx->OMSetRenderTargets(1, &s->depth_rtv, nullptr);
-		ctx->PSSetShader(fl->ps_depth, nullptr, 0);
-		ctx->Draw(4, 0);
+	if (ok && s->aux_depth && !depth && fake_ensure_depth(fl, *s, w, h) &&
+	    sim_conv_d3d11_synth_depth(fl->synth, ctx, s->depth_rtv, w, h)) {
 		s->depth_ready = true;
 		s->convergence = p != nullptr ? p->convergence : -1.0f;
 		s->frames++;
 	}
-	ID3D11RenderTargetView *null_rtv = nullptr;
-	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
 	safe_release(srv);
+	if (!ok) {
+		return false;
+	}
 
 	fake_latency();
 

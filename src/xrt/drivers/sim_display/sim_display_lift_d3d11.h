@@ -10,13 +10,19 @@
  * the D3D11 DP installs this fake so the whole path — lift thread, mailbox,
  * ring, IPC, weave-rect lifting, blob transport — can run hardware-free:
  *
- *  - SBS / NVIEW: the input, horizontally SHIFTED per view (a constant
- *    parallax, not depth-aware), views side by side.
+ *  - SBS / NVIEW: the input, horizontally SHIFTED per view (not depth-aware),
+ *    views side by side; each view's shift follows its viewpoint
+ *    (sim_conv_synth_view_shifts), the historical fixed fan without them.
  *  - DEPTH: a vertical gradient (R32_FLOAT, 0 at the top, 1 at the bottom).
- *  - GAUSSIANS: a tiny valid two-layer 3DGS PLY (sim_display_fake_ply.h).
+ *  - GAUSSIANS: a tiny valid two-layer 3DGS PLY (sim_conv_fake_ply.h).
  *
  * SIM_DISPLAY_FAKE_LIFT_LATENCY_MS (default 8) sleeps inside each convert so
  * the runtime's asynchrony and latest-wins dropping are observable.
+ *
+ * DEPRECATED (ADR-053): superseded by the DisplayXR-SimConversion conversion
+ * provider (src/xrt/drivers/sim_conversion/), which shares this module's
+ * synthesis code; kept for one release so existing recipes keep working, and
+ * logs a one-time deprecation WARN.
  *
  * @ingroup drv_sim_display
  */
@@ -63,6 +69,8 @@ sim_fake_lift_convert(struct sim_fake_lift *fl,
                       uint32_t w,
                       uint32_t h,
                       const struct xrt_dp_lift_params *p,
+                      const float *viewpoints_xyz,
+                      uint32_t viewpoint_floats,
                       void **out_resource,
                       uint32_t *out_w,
                       uint32_t *out_h,

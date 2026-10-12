@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display's fake Gaussian-splat PLY (see sim_display_fake_ply.h).
- * @ingroup drv_sim_display
+ * @brief  the sim conversion provider's fake Gaussian-splat PLY (see sim_conv_fake_ply.h).
+ * @ingroup drv_sim_conversion
  */
 
-#include "sim_display_fake_ply.h"
+#include "sim_conv_fake_ply.h"
 
 #include <math.h>
 #include <stdio.h>

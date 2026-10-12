@@ -940,11 +940,9 @@ sim_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
                           uint32_t *out_h,
                           uint32_t *out_format)
 {
-	// The fake synthesizes a constant parallax; it has no use for viewpoints.
-	(void)viewpoints_xyz;
-	(void)viewpoint_floats;
+	// The fake derives each view's shift from its viewpoint (roadmap §10).
 	return sim_fake_lift_convert(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h, p,
-	                             out_resource, out_w, out_h, out_format);
+	                             viewpoints_xyz, viewpoint_floats, out_resource, out_w, out_h, out_format);
 }
 
 static bool

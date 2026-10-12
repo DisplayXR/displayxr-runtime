@@ -134,9 +134,13 @@ endif()
 if(WIN32)
 	list(APPEND SIM_DISPLAY_SOURCES
 		sim_display/sim_display_processor_d3d11.cpp
-		# ADR-042: env-gated FAKE lift module (SIM_DISPLAY_FAKE_LIFT=1)
+		# ADR-042: env-gated FAKE lift module (SIM_DISPLAY_FAKE_LIFT=1),
+		# DEPRECATED by DisplayXR-SimConversion (ADR-053): a thin wrapper over
+		# the synthesis shared with that provider (sim_conversion/ below).
 		sim_display/sim_display_lift_d3d11.cpp
-		sim_display/sim_display_fake_ply.c)
+		sim_conversion/sim_conv_fake_ply.c
+		sim_conversion/sim_conv_synth.c
+		sim_conversion/sim_conv_synth.cpp)
 endif()
 
 # D3D12 display processor (HLSL shaders compiled at runtime into PSOs)
@@ -178,7 +182,8 @@ if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
 endif()
 
 # aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
-target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary)
+target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display PRIVATE aux_vk)
@@ -292,6 +297,7 @@ else()
 endif()
 target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_display
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
 
