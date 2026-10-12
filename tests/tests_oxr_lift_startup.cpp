@@ -487,3 +487,104 @@ TEST_CASE("lift caps: auxDepthSupported reaches the app over IPC (G1)")
 	lf_session_destroy();
 }
 
+
+/*
+ *
+ * #2005 G2 -- maxViews enforced.
+ *
+ */
+
+#include "oxr_lift_rules.h"
+
+namespace {
+
+XrLiftOptionsDXR
+options(uint32_t view_count)
+{
+	XrLiftOptionsDXR o = {};
+	o.type = XR_TYPE_LIFT_OPTIONS_DXR;
+	o.convergence = -1.0f;
+	o.strength = 1.0f;
+	o.inpaint = XR_TRUE;
+	o.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+	o.viewCount = view_count;
+	return o;
+}
+
+} // namespace
+
+TEST_CASE("lift view rule: the module's maxViews bounds NVIEW (G2)")
+{
+	// Unknown (0) or over-reported bounds fall back to the constant ceiling.
+	CHECK(oxr_lift_view_bound(0) == XRT_LIFT_MAX_VIEWS);
+	CHECK(oxr_lift_view_bound(4) == 4);
+	CHECK(oxr_lift_view_bound(XRT_LIFT_MAX_VIEWS + 5) == XRT_LIFT_MAX_VIEWS);
+
+	CHECK(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_NVIEW, 4, 4));
+	CHECK_FALSE(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_NVIEW, 5, 4));
+	CHECK(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_NVIEW, 0, 4)); // 0 = module default
+	CHECK(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_NVIEW, XRT_LIFT_MAX_VIEWS, 0));
+	CHECK_FALSE(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_NVIEW, XRT_LIFT_MAX_VIEWS + 1, 0));
+	// maxViews is the NVIEW bound (spec §2); the constant ceiling is everyone's.
+	CHECK(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_SBS, 6, 4));
+	CHECK_FALSE(oxr_lift_view_count_ok(XRT_DP_LIFT_MODE_SBS, XRT_LIFT_MAX_VIEWS + 1, 4));
+}
+
+TEST_CASE("lift submit: viewCount past the module's maxViews is VALIDATION_FAILURE, nothing sent (G2)")
+{
+	lf_reset();
+	XrSession session = lf_session_create(LF_SESSION_IPC, true);
+
+	// A stream created while ACTIVATING (bound not known yet) ...
+	lf_set_properties(XRT_DP_LIFT_STATE_ACTIVATING, 0, 0, 0, 0);
+	XrLiftPropertiesDXR props = props_init();
+	REQUIRE(oxr_xrGetLiftPropertiesDXR(session, &props) == XR_SUCCESS);
+	XrLiftStreamCreateInfoDXR ci = create_info(XR_LIFT_MODE_NVIEW_DXR);
+	XrLiftStreamDXR stream = XR_NULL_HANDLE;
+	REQUIRE(oxr_xrCreateLiftStreamDXR(session, &ci, &stream) == XR_SUCCESS);
+	take_trace();
+
+	// ... is held to the constant ceiling only.
+	XrLiftOptionsDXR o = options(8);
+	XrLiftFrameSubmitInfoDXR si = submit_info(&o);
+	uint64_t frame_id = 0;
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream, &si, &frame_id) == XR_SUCCESS);
+	CHECK(lf_last_submit_view_count() == 8);
+	take_trace();
+
+	// The module comes up READY with maxViews 4: the same stream is now held
+	// to 4.
+	lf_set_properties(XRT_DP_LIFT_STATE_READY, XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW, 4, 0, 0);
+	props = props_init();
+	REQUIRE(oxr_xrGetLiftPropertiesDXR(session, &props) == XR_SUCCESS);
+	CHECK(props.maxViews == 4);
+	take_trace();
+
+	o = options(6);
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream, &si, &frame_id) == XR_ERROR_VALIDATION_FAILURE);
+	CHECK(take_trace().empty()); // caller bug, nothing sent
+	CHECK_FALSE(lf_session_lost());
+
+	o = options(4);
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream, &si, &frame_id) == XR_SUCCESS);
+	CHECK(lf_last_submit_view_count() == 4);
+	take_trace();
+
+	// A stream created after READY latches the bound at create.
+	XrLiftStreamDXR stream2 = XR_NULL_HANDLE;
+	REQUIRE(oxr_xrCreateLiftStreamDXR(session, &ci, &stream2) == XR_SUCCESS);
+	o = options(5);
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream2, &si, &frame_id) == XR_ERROR_VALIDATION_FAILURE);
+
+	// SBS is not bounded by maxViews (only by the constant ceiling).
+	XrLiftStreamCreateInfoDXR sbs = create_info(XR_LIFT_MODE_SBS_DXR);
+	XrLiftStreamDXR stream3 = XR_NULL_HANDLE;
+	REQUIRE(oxr_xrCreateLiftStreamDXR(session, &sbs, &stream3) == XR_SUCCESS);
+	o = options(6);
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream3, &si, &frame_id) == XR_SUCCESS);
+	o = options(9);
+	CHECK(oxr_xrSubmitLiftFrameDXR(stream3, &si, &frame_id) == XR_ERROR_VALIDATION_FAILURE);
+
+	take_trace();
+	lf_session_destroy();
+}
