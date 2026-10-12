@@ -2933,6 +2933,13 @@ struct oxr_session
 	 */
 	struct ipc_client_lift_link *lift_link;
 
+	/*!
+	 * XR_DXR_lift: the conversion module's maxViews as the last successful
+	 * xrGetLiftPropertiesDXR read it (0 = not read yet / not reported). Bounds
+	 * NVIEW viewCount at submit (#2005 G2, oxr_lift_rules.h).
+	 */
+	uint32_t lift_max_views;
+
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
 
@@ -4710,6 +4717,10 @@ struct oxr_lift_stream_dxr
 	//! In-process session (ADR-049): the lift link generation the stream was
 	//! created on. A stream of a dead generation died with that connection.
 	uint32_t link_gen;
+	//! The module's maxViews this stream validates viewCount against: latched
+	//! from the session at create, refreshed at submit once the session has
+	//! read a newer one (0 = unknown, the XR_LIFT_MAX_VIEWS_DXR ceiling).
+	uint32_t max_views;
 };
 
 /*!

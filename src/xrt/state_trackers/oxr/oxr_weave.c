@@ -114,6 +114,7 @@ static_assert(XR_WEAVE_MAX_EYES_DXR <= ARRAY_SIZE(((struct xrt_eye_positions *)0
 #ifdef OXR_HAVE_DXR_lift
 #include "xrt/xrt_lift.h"
 #include "oxr_handle.h"
+#include "oxr_lift_rules.h"
 //! XR_DXR_lift (ADR-042) bridge: latch the lift-flagged rects of the next submit.
 xrt_result_t
 comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
@@ -922,14 +923,20 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			lr[i].rect_index = e->rectIndex;
 			const XrLiftOptionsDXR *o = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
 			if (o != NULL) {
-				if (o->viewCount > XR_LIFT_MAX_VIEWS_DXR ||
+				// #2005 G2: NVIEW viewCount is bounded by the module's maxViews.
+				if (sess->lift_max_views > 0) {
+					ls->max_views = sess->lift_max_views;
+				}
+				if (!oxr_lift_view_count_ok(ls->mode, o->viewCount, ls->max_views) ||
 				    (o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR &&
 				     o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR)) {
 					return oxr_error(
 					    &log, XR_ERROR_VALIDATION_FAILURE,
-					    "xrWeaveSubmitDXR: lifts[%u] options: viewCount <= %u and a valid "
+					    "xrWeaveSubmitDXR: lifts[%u] options: viewCount <= %u (maxViews) and a valid "
 					    "viewpointSource",
-					    i, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+					    i,
+					    ls->mode == XRT_DP_LIFT_MODE_NVIEW ? oxr_lift_view_bound(ls->max_views)
+					                                       : (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
 				}
 				// XR_DXR_lift v3: EXPLICIT viewpoints on a lifted rect, with the
 				// same validation as on a submit.

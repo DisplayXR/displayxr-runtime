@@ -42,6 +42,7 @@
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
 #include "oxr_chain.h"
+#include "oxr_lift_rules.h"
 
 #include "util/u_misc.h"
 #include "util/u_trace_marker.h"
@@ -291,11 +292,18 @@ lift_params_from_xr(const XrLiftOptionsDXR *o, uint32_t mode, struct xrt_dp_lift
 }
 
 static XrResult
-lift_validate_options(struct oxr_logger *log, const XrLiftOptionsDXR *o, bool weave_path)
+lift_validate_options(
+    struct oxr_logger *log, const XrLiftOptionsDXR *o, uint32_t mode, uint32_t module_max_views, bool weave_path)
 {
-	if (o->viewCount > XR_LIFT_MAX_VIEWS_DXR) {
-		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftOptionsDXR::viewCount (%u) > %u",
-		                 o->viewCount, (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+	// #2005 G2: NVIEW is bounded by the module's maxViews, not only the
+	// extension's constant ceiling.
+	if (!oxr_lift_view_count_ok(mode, o->viewCount, module_max_views)) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftOptionsDXR::viewCount (%u) > %u (XrLiftPropertiesDXR::maxViews for this %s stream)",
+		                 o->viewCount,
+		                 mode == XRT_DP_LIFT_MODE_NVIEW ? oxr_lift_view_bound(module_max_views)
+		                                                : (uint32_t)XR_LIFT_MAX_VIEWS_DXR,
+		                 mode == XRT_DP_LIFT_MODE_NVIEW ? "NVIEW" : "non-NVIEW");
 	}
 	if (o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR &&
 	    o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
@@ -441,6 +449,10 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 		if (r != XR_SUCCESS) {
 			return r;
 		}
+		// #2005 G2: remember the module's view bound for validation.
+		if (caps.max_views > 0) {
+			sess->lift_max_views = caps.max_views;
+		}
 	}
 	properties->supportedModes = (XrLiftModeFlagsDXR)caps.modes;
 	properties->maxStreams = caps.max_streams;
@@ -550,6 +562,7 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	st->mode = mode;
 	st->depth_requested = aux_outputs != 0;
 	st->link_gen = gen;
+	st->max_views = sess->lift_max_views; // #2005 G2
 	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
 	return XR_SUCCESS;
 }
@@ -598,7 +611,12 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	const struct xrt_lift_rig *rigp = NULL;
 	const XrLiftOptionsDXR *opt = OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
 	if (opt != NULL) {
-		XrResult vr = lift_validate_options(&log, opt, /*weave_path*/ false);
+		// #2005 G2: a module that became READY after this stream was created
+		// has told the session its real bound since.
+		if (sess->lift_max_views > 0) {
+			st->max_views = sess->lift_max_views;
+		}
+		XrResult vr = lift_validate_options(&log, opt, st->mode, st->max_views, /*weave_path*/ false);
 		if (vr != XR_SUCCESS) {
 			return vr;
 		}

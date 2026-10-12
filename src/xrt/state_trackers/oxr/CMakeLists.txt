@@ -62,6 +62,7 @@ add_library(
 	oxr_views_change.h
 	oxr_weave.c
 	oxr_lift.c
+	oxr_lift_rules.h
 	oxr_stereo_camera.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
