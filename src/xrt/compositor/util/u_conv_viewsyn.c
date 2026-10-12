@@ -32,7 +32,7 @@ void
 u_conv_viewsyn_params_defaults(struct u_conv_viewsyn_params *p)
 {
 	memset(p, 0, sizeof(*p));
-	p->depth.kind = U_CONV_VIEWSYN_DEPTH_AFFINE_DISPARITY;
+	p->depth.kind = XRT_CONV_DEPTH_AFFINE_DISPARITY;
 	p->depth.value_scale = 1.0f;
 	p->depth.value_shift = 0.0f;
 	p->depth.invalid_sample = NAN;
@@ -57,7 +57,7 @@ u_conv_viewsyn_params_defaults(struct u_conv_viewsyn_params *p)
 }
 
 double
-u_conv_viewsyn_decode(const struct u_conv_viewsyn_depth_desc *d, double sample)
+u_conv_viewsyn_decode(const struct xrt_conv_depth_info *d, double sample)
 {
 	double s = d->value_scale == 0.0f ? 1.0 : (double)d->value_scale;
 	return s * sample + (double)d->value_shift;
@@ -67,14 +67,14 @@ double
 u_conv_viewsyn_nearness(uint32_t kind, double decoded)
 {
 	switch (kind) {
-	case U_CONV_VIEWSYN_DEPTH_METRIC: return decoded > 0.0 ? 1.0 / decoded : 0.0;
-	case U_CONV_VIEWSYN_DEPTH_AFFINE: return -decoded;
+	case XRT_CONV_DEPTH_METRIC: return decoded > 0.0 ? 1.0 / decoded : 0.0;
+	case XRT_CONV_DEPTH_AFFINE: return -decoded;
 	default: return decoded;
 	}
 }
 
 double
-u_conv_viewsyn_normalise(const struct u_conv_viewsyn_depth_desc *d, double near_lo, double near_hi, double sample)
+u_conv_viewsyn_normalise(const struct xrt_conv_depth_info *d, double near_lo, double near_hi, double sample)
 {
 	if (!isnan(d->invalid_sample) && sample == (double)d->invalid_sample) {
 		return 0.0;

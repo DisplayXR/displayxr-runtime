@@ -42,7 +42,7 @@ cbuffer Prep : register(b0)
 	float value_shift;
 	float near_lo;
 	float inv_span;
-	uint kind;          // U_CONV_VIEWSYN_DEPTH_*
+	uint kind;          // XRT_CONV_DEPTH_*
 	uint has_invalid;
 	float invalid_sample;
 	float pad0;

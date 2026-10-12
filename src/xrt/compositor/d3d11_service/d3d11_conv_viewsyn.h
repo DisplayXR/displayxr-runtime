@@ -45,7 +45,7 @@ struct d3d11_conv_viewsyn_target
 {
 	ID3D11Texture2D *texture; //!< BIND_RENDER_TARGET
 	DXGI_FORMAT rtv_format;   //!< DXGI_FORMAT_UNKNOWN = the texture's own (must be typed then)
-	uint32_t layout;          //!< U_CONV_VIEWSYN_LAYOUT_ROW (width / N per view) or _ARRAY (slice i)
+	uint32_t layout;          //!< XRT_CONV_VIEWS_ROW (width / N per view) or _ARRAY (slice i)
 };
 
 //! One synthesis' inputs.

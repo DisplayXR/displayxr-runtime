@@ -152,10 +152,10 @@ render(Fixture &f, const u_conv_viewsyn_params &p, uint32_t layout, std::vector<
 {
 	const uint32_t n = p.view_count;
 	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = layout == U_CONV_VIEWSYN_LAYOUT_ROW ? kW * n : kW;
+	td.Width = layout == XRT_CONV_VIEWS_ROW ? kW * n : kW;
 	td.Height = kH;
 	td.MipLevels = 1;
-	td.ArraySize = layout == U_CONV_VIEWSYN_LAYOUT_ROW ? 1 : n;
+	td.ArraySize = layout == XRT_CONV_VIEWS_ROW ? 1 : n;
 	td.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
@@ -198,8 +198,8 @@ render(Fixture &f, const u_conv_viewsyn_params &p, uint32_t layout, std::vector<
 			for (uint32_t y = 0; y < kH; y++) {
 				const uint16_t *row = (const uint16_t *)((const uint8_t *)m.pData + y * m.RowPitch);
 				for (uint32_t x = 0; x < td.Width; x++) {
-					uint32_t vi = layout == U_CONV_VIEWSYN_LAYOUT_ROW ? x / kW : s;
-					uint32_t vx = layout == U_CONV_VIEWSYN_LAYOUT_ROW ? x % kW : x;
+					uint32_t vi = layout == XRT_CONV_VIEWS_ROW ? x / kW : s;
+					uint32_t vx = layout == XRT_CONV_VIEWS_ROW ? x % kW : x;
 					Px &px = views[vi][y * kW + vx];
 					memcpy(px.raw, row + x * 4, 8);
 					px.r = px.raw[0] / 65535.0;
@@ -228,7 +228,7 @@ make_params(const std::vector<double> &eye_x_m)
 		p.viewpoints_m[i][1] = 0.0f;
 		p.viewpoints_m[i][2] = 0.6f;
 	}
-	p.depth.kind = U_CONV_VIEWSYN_DEPTH_AFFINE_DISPARITY;
+	p.depth.kind = XRT_CONV_DEPTH_AFFINE_DISPARITY;
 	p.range_near = 1.0f;
 	p.range_far = 0.0f;
 	p.convergence = 0.5f; // decoded: half-way, so the square pops out and the ground sinks
@@ -335,7 +335,7 @@ TEST_CASE("viewsyn d3d11: 2 views, SBS row, step edge parallax", "[conv_viewsyn]
 	}
 	u_conv_viewsyn_params p = make_params({-0.0315, 0.0315});
 	std::vector<std::vector<Px>> views;
-	REQUIRE(render(f, p, U_CONV_VIEWSYN_LAYOUT_ROW, views));
+	REQUIRE(render(f, p, XRT_CONV_VIEWS_ROW, views));
 	check_views(p, views);
 	CHECK(d3d11_conv_viewsyn_prepass_count(f.vs) == 1);
 }
@@ -348,7 +348,7 @@ TEST_CASE("viewsyn d3d11: 4 views, array slices, step edge parallax", "[conv_vie
 	}
 	u_conv_viewsyn_params p = make_params({-0.063, -0.021, 0.021, 0.063});
 	std::vector<std::vector<Px>> views;
-	REQUIRE(render(f, p, U_CONV_VIEWSYN_LAYOUT_ARRAY, views));
+	REQUIRE(render(f, p, XRT_CONV_VIEWS_ARRAY, views));
 	check_views(p, views);
 }
 
@@ -360,7 +360,7 @@ TEST_CASE("viewsyn d3d11: a view at the source camera is the identity", "[conv_v
 	}
 	u_conv_viewsyn_params p = make_params({0.01});
 	std::vector<std::vector<Px>> views;
-	REQUIRE(render(f, p, U_CONV_VIEWSYN_LAYOUT_ROW, views));
+	REQUIRE(render(f, p, XRT_CONV_VIEWS_ROW, views));
 	double max_err = 0.0;
 	for (uint32_t y = 0; y < kH; y++) {
 		for (uint32_t x = 0; x < kW; x++) {
