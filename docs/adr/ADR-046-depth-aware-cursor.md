@@ -659,15 +659,17 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   on the same app geometry), vk_native −22.0 px in its 1280 × 1440 atlas; nothing drawn at
   0.1,0.1; the arrow's fill reads (255,255,255) and its outline (5,5,8), the custom ring
   (0,220,255) — exactly the authored bytes, so no encode is lost or doubled.
-- **Known issue (GL on macOS, not caused by the draw):** `cube_handle_gl_macos` crashes in
-  roughly 1 of 5 launches once the depth cursor is ACTIVE — in Apple's GL driver, on the #868
-  repaint thread (`gl_repaint_thread` → `glBlitFramebuffer`) or in the app's own draw. It
-  follows the app's `[NSCursor hide]`, not the runtime draw: app-draw mode crashes too; the
-  runtime draw with the OS cursor left visible (0/10), `DXR_WEAVE_REPAINT=0` (0/8) and the
-  extension off (0/20) do not. The GL cube never hid the OS cursor before this adoption, so this
-  is a latent repaint-thread / AppKit race in the GL compositor surfacing — runtime#1947. Until it
-  is fixed the GL cube's depth cursor is **opt-in** (`DISPLAYXR_CURSOR_DEPTH=1`); the Metal and
-  Vulkan cubes stay default-on.
+- **GL on macOS: a crash found here was the repaint thread, not the cursor (fixed).** While
+  this landed, `cube_handle_gl_macos` crashed in roughly 1 of 5 launches once the depth cursor was
+  active, on the #868 repaint thread (`gl_repaint_thread` → `glBlitFramebuffer`) or in the app's
+  own draw. The cause was unrelated to cursors: an app that binds an `NSOpenGLView` hands the
+  runtime that view, and the GL compositor adopted the view's `openGLContext`, which is the
+  context the app renders with. The repaint thread then replayed on it while the app thread drew,
+  so one GL context was in use on two threads. Hiding the OS cursor only changed frame timing
+  enough to open the repaint gate. With `DXR_WEAVE_REPAINT_FORCE=1` the old build crashes 10/10
+  launches even with the extension off. The fix: the GL compositor never starts the repaint
+  thread on an app-owned context (it stays on for the private contexts of the own-window, plain-`NSView` and offscreen
+  paths). The GL cube's depth cursor is default-on again, like the Metal and Vulkan cubes.
 - **Found in passing (Metal, #1941):** on the Vulkan-app-on-Metal fallback a custom sprite is
   handed over as the client swapchain and cast to the native Metal type — runtime#1948.
 

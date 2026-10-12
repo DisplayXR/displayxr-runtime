@@ -89,6 +89,35 @@ void *
 comp_gl_window_macos_get_cgl_context(struct comp_gl_window_macos *win);
 
 /*!
+ * #1947: is the compositor's GL context the APP's own context?
+ *
+ * True when the app bound an NSOpenGLView and the compositor adopted that
+ * view's openGLContext instead of creating a private (share-group) context.
+ * The app keeps rendering with that context on its own thread whenever it
+ * likes, without any lock the runtime could take, so the runtime must not
+ * issue GL on it from any other thread (the #868 repaint thread).
+ *
+ * @param win The window handle.
+ */
+bool
+comp_gl_window_macos_context_is_app_owned(struct comp_gl_window_macos *win);
+
+/*!
+ * CGLLockContext / CGLUnlockContext on the compositor's context — the lock
+ * AppKit itself takes around -[NSOpenGLContext update] when the view's
+ * surface changes on the main thread. Taken by off-app-thread GL work on a
+ * view-attached context so it cannot interleave with that update.
+ *
+ * @param win The window handle.
+ */
+void
+comp_gl_window_macos_lock(struct comp_gl_window_macos *win);
+
+//! @copydoc comp_gl_window_macos_lock
+void
+comp_gl_window_macos_unlock(struct comp_gl_window_macos *win);
+
+/*!
  * Make the compositor's GL context current.
  *
  * @param win The window handle.
