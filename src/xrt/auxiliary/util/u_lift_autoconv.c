@@ -211,23 +211,47 @@ u_lift_autoconv_grid_from_samples(const float *samples,
  *
  */
 
+//! Weighted quantile q in [0,1] of a 64-bin histogram over [0,1], interpolated in its bin.
+static float
+weighted_quantile(const double counts[U_LIFT_AUTOCONV_BINS], double wsum, double q)
+{
+	const double target = q * wsum;
+	double acc = 0.0;
+	for (uint32_t b = 0; b < U_LIFT_AUTOCONV_BINS; b++) {
+		if (acc + counts[b] >= target && counts[b] > 0.0) {
+			const double f = (target - acc) / counts[b];
+			return (float)(((double)b + f) / U_LIFT_AUTOCONV_BINS);
+		}
+		acc += counts[b];
+	}
+	return 1.0f;
+}
+
 void
 u_lift_autoconv_params_default(struct u_lift_autoconv_params *p)
 {
 	p->center_sigma = 0.35f;
 	p->bottom_damp = 0.5f;
 	p->hist_smooth_bins = 1.5f;
-	// The reference estimator's FG_BIAS = 3 is per unit of disparity as a
-	// fraction of the eye width (span ~0.05-0.1, i.e. ~0.3 on a [0,1] range).
-	// The conversion's relative depth is re-stretched to the full [0,1] range
-	// EVERY frame, so a subject in front of a large, coherent background wall
-	// always sits far from the median: 1.0 lets a centred subject win over
-	// that wall (tests_aux_lift_autoconv) while a small near detail, being
-	// little weighted mass, still loses.
-	p->fg_bias = 1.0f;
+	// Fitted to professional stereo (5 3D trailers, 119 shots, FoundationStereo
+	// disparity as ground truth, 2026-10-12): stereographers put the screen
+	// plane at the centre-weighted ~76th percentile of nearness (about a quarter
+	// of the frame in front of it), consistently across titles. The best
+	// predictor of that plane from depth alone was the mean of the
+	// centre-weighted 75th percentile and the dominant clump with the far
+	// background excluded (mean error 0.21 in normalised depth per shot, vs
+	// 0.34 for the earlier foreground-biased mode, which latched onto large far
+	// backgrounds and pushed most of the frame out of the screen).
+	p->fg_bias = 0.0f;
+	p->far_exclude = 0.15f;
+	p->percentile = 75.0f;
+	p->blend = 0.5f;
 	p->peak_floor = 0.05f;
 	p->min_confidence = 0.06f;
 	p->min_samples = 64;
+	p->prefer_h = -1.0f;
+	p->prefer_window = 0.08f;
+	p->switch_ratio = 1.5f;
 }
 
 bool
@@ -317,19 +341,10 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 		out->sig[i] /= (float)n;
 	}
 
-	// Weighted median (interpolated inside its bin).
-	{
-		double acc = 0.0;
-		out->median_h = 0.5f;
-		for (uint32_t b = 0; b < U_LIFT_AUTOCONV_BINS; b++) {
-			if (acc + counts[b] >= 0.5 * wsum && counts[b] > 0.0) {
-				const double f = (0.5 * wsum - acc) / counts[b];
-				out->median_h = (float)(((double)b + f) / U_LIFT_AUTOCONV_BINS);
-				break;
-			}
-			acc += counts[b];
-		}
-	}
+	// Weighted median and the screen-plane percentile (interpolated in their bins).
+	out->median_h = weighted_quantile(counts, wsum, 0.5);
+	const float pct = clampf(p->percentile, 0.0f, 100.0f);
+	out->pct_h = weighted_quantile(counts, wsum, (double)pct / 100.0);
 
 	// Gaussian-smoothed histogram.
 	double sm[U_LIFT_AUTOCONV_BINS];
@@ -358,6 +373,9 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 	// mild foreground bias.
 	int best = -1;
 	double best_score = -1.0;
+	int kept = -1; // the best peak near the subject currently followed
+	double kept_score = -1.0;
+	const bool prefer = p->prefer_h >= 0.0f && p->prefer_h <= 1.0f;
 	for (int b = 0; b < U_LIFT_AUTOCONV_BINS; b++) {
 		const double l = b > 0 ? sm[b - 1] : -1.0;
 		const double r = b < U_LIFT_AUTOCONV_BINS - 1 ? sm[b + 1] : -1.0;
@@ -365,6 +383,9 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 			continue;
 		}
 		const double c = ((double)b + 0.5) / U_LIFT_AUTOCONV_BINS;
+		if (c < (double)p->far_exclude) {
+			continue; // the far background is never the subject
+		}
 		double f = 1.0 + (double)p->fg_bias * (c - (double)out->median_h);
 		if (f < 0.0) {
 			f = 0.0;
@@ -374,9 +395,31 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 			best_score = score;
 			best = b;
 		}
+		if (prefer && fabs(c - (double)p->prefer_h) <= (double)p->prefer_window && score > kept_score) {
+			kept_score = score;
+			kept = b;
+		}
 	}
+	const float blend = clampf(p->blend, 0.0f, 1.0f);
 	if (best < 0) {
-		return false;
+		// Only the far background has a peak (or there is no peak at all): the
+		// percentile alone still places the screen plane sensibly.
+		if (blend <= 0.0f || n < p->min_samples) {
+			return false;
+		}
+		out->peak_h = -1.0f;
+		out->mode_h = out->pct_h;
+		out->convergence = 1.0f - out->mode_h;
+		out->confidence = p->min_confidence > 0.0f ? p->min_confidence : 0.06f; // weak: the follower slows
+		out->valid = true;
+		return true;
+	}
+	// Hysteresis: stay on the followed subject unless another peak clearly
+	// beats it. Without this, two comparable clusters (a face and the wall
+	// behind it) trade places from one sample to the next and the screen
+	// plane oscillates inside a shot.
+	if (kept >= 0 && kept != best && best_score < (double)p->switch_ratio * kept_score) {
+		best = kept;
 	}
 
 	// Sub-bin refinement (parabola through the peak and its neighbours):
@@ -389,7 +432,9 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 			off = off < -0.5 ? -0.5 : (off > 0.5 ? 0.5 : off);
 		}
 	}
-	out->mode_h = clampf((float)(((double)best + 0.5 + off) / U_LIFT_AUTOCONV_BINS), 0.0f, 1.0f);
+	out->peak_h = clampf((float)(((double)best + 0.5 + off) / U_LIFT_AUTOCONV_BINS), 0.0f, 1.0f);
+	// The screen plane: blend of the percentile and the dominant clump.
+	out->mode_h = clampf(blend * out->pct_h + (1.0f - blend) * out->peak_h, 0.0f, 1.0f);
 	out->convergence = 1.0f - out->mode_h;
 
 	double near_mass = 0.0;
@@ -414,13 +459,16 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 void
 u_lift_autoconv_filter_params_default(struct u_lift_autoconv_filter_params *p)
 {
-	p->tau_s = 0.6f;      // 90 % of a step in ~2.3 s: slow drift, no visible pumping
+	p->tau_s = 1.0f;      // 90 % of a step in ~3.9 s: slow drift inside a shot (panel A/B: 0.6 pumped)
 	p->tau_cut_s = 0.05f; // 90 % in ~0.2 s: a few converted frames, never one
-	p->deadband = 0.03f;
+	p->deadband = 0.04f;
 	p->cut_jump = 0.25f;
 	p->cut_hist = 0.6f;
 	p->cut_agree = 0.1f;
 	p->cut_max_s = 0.4f;
+	p->cut_confirms = 2;
+	p->cut_refractory_s = 1.5f;
+	p->conf_full = 0.4f;
 }
 
 static void
@@ -457,6 +505,7 @@ u_lift_autoconv_filter_measure(struct u_lift_autoconv_filter *f,
 		return; // hold
 	}
 	const float c = clampf(e->convergence, 0.0f, 1.0f);
+	f->conf = e->confidence;
 
 	float hist_l1 = 0.0f;
 	for (uint32_t i = 0; i < U_LIFT_AUTOCONV_SIG_BINS; i++) {
@@ -473,23 +522,36 @@ u_lift_autoconv_filter_measure(struct u_lift_autoconv_filter *f,
 		return;
 	}
 
-	// A cut is confirmed by the NEXT measurement agreeing with the candidate:
-	// a one-measurement outlier never moves anything.
+	// A cut is confirmed by the next cut_confirms measurements agreeing with
+	// the candidate: an outlier, or a brief flip between two clusters, never
+	// moves anything fast.
+	const uint32_t need = p->cut_confirms > 0 ? p->cut_confirms : 1;
 	if (f->cut_pending) {
-		f->cut_pending = false;
 		if (fabsf(c - f->cut_value) <= p->cut_agree) {
-			f->target = c;
-			f->fast = true;
-			f->fast_since_ns = now_ns;
-			f->cuts++;
-			med_fill(f, c);
-			return;
+			if (++f->cut_agreed >= need) {
+				f->cut_pending = false;
+				f->target = c;
+				f->fast = true;
+				f->fast_since_ns = now_ns;
+				f->last_cut_ns = now_ns;
+				f->cuts++;
+				med_fill(f, c);
+				return;
+			}
+		} else {
+			f->cut_pending = false;
 		}
 	}
+	// A cut changes BOTH where the subject is and the scene's depth layout.
+	// Either alone happens inside a shot (a subject turning, the per-frame
+	// re-normalisation reshuffling the histogram) and is followed slowly.
 	const float jump = fabsf(c - f->target);
-	if (jump > p->cut_jump || hist_l1 > p->cut_hist) {
+	const bool refractory = f->last_cut_ns != 0 && p->cut_refractory_s > 0.0f &&
+	                        (double)(now_ns - f->last_cut_ns) * 1e-9 < (double)p->cut_refractory_s;
+	if (!f->cut_pending && !refractory && jump > p->cut_jump && hist_l1 > p->cut_hist) {
 		f->cut_pending = true;
 		f->cut_value = c;
+		f->cut_agreed = 0;
 	}
 
 	med_push(f, c);
@@ -514,7 +576,11 @@ u_lift_autoconv_filter_step(struct u_lift_autoconv_filter *f,
 	}
 	f->last_ns = now_ns > f->last_ns ? now_ns : f->last_ns;
 
-	const double tau = f->fast ? (p->tau_cut_s > 0.0f ? p->tau_cut_s : 0.05) : (p->tau_s > 0.0f ? p->tau_s : 0.6);
+	double tau = f->fast ? (p->tau_cut_s > 0.0f ? p->tau_cut_s : 0.05) : (p->tau_s > 0.0f ? p->tau_s : 1.0);
+	if (!f->fast && p->conf_full > 0.0f && f->conf > 0.0f && f->conf < p->conf_full) {
+		double slow = (double)p->conf_full / (double)f->conf;
+		tau *= slow > 3.0 ? 3.0 : slow; // an ambiguous mode moves the plane gently
+	}
 	const double w = 1.0 / tau;
 	// Exact critically damped spring (stable for any dt): y = x − target,
 	// y(t) = (y0 + (v0 + w y0) t) e^{−wt}, v(t) = (v0 − w (v0 + w y0) t) e^{−wt}.

@@ -112,9 +112,18 @@ struct u_lift_autoconv_params
 	float bottom_damp;      //!< weight at the bottom row (1 at the top, linear in between)
 	float hist_smooth_bins; //!< Gaussian σ of the histogram smoothing, in bins
 	float fg_bias;          //!< peak score = mass · (1 + fg_bias · (h − weighted median))
+	float far_exclude;      //!< peaks with h below this (the far background) are never the subject
+	float percentile;       //!< centre-weighted percentile of h that the screen plane tracks (0..100)
+	float blend;            //!< screen h = blend · percentile + (1 − blend) · dominant clump
 	float peak_floor;       //!< a peak must hold this fraction of the highest smoothed bin
 	float min_confidence;   //!< weighted mass within ±2 bins of the mode, fraction of the total
 	uint32_t min_samples;   //!< valid cells needed for any estimate
+	//! Subject hysteresis: the h currently followed (< 0 = none). A peak within
+	//! prefer_window of it is kept unless the best peak scores switch_ratio ×
+	//! higher — two comparable clusters must not trade places every sample.
+	float prefer_h;
+	float prefer_window; //!< |h − prefer_h| that still counts as "the same subject"
+	float switch_ratio;  //!< score ratio a different peak needs to take over
 };
 
 void
@@ -123,8 +132,10 @@ u_lift_autoconv_params_default(struct u_lift_autoconv_params *p);
 //! One measurement.
 struct u_lift_autoconv_estimate
 {
-	bool valid;        //!< a confident mode was found
-	float mode_h;      //!< normalised inverse depth of the subject (1 = nearest)
+	bool valid;        //!< a confident screen plane was found
+	float mode_h;      //!< normalised inverse depth placed at the screen plane (1 = nearest)
+	float peak_h;      //!< the dominant clump (−1 = none outside the far background)
+	float pct_h;       //!< the centre-weighted percentile
 	float convergence; //!< 1 − mode_h: what the DP contract carries
 	float confidence;  //!< weighted mass near the mode / total weighted mass
 	float median_h;    //!< weighted median of h
@@ -158,6 +169,14 @@ struct u_lift_autoconv_filter_params
 	float cut_hist;  //!< …as is a scene-signature L1 change above this (0..2)
 	float cut_agree; //!< the confirming measurement lies within this of the candidate
 	float cut_max_s; //!< the fast follower ends after this long at the latest
+	//! A cut needs BOTH a jump > cut_jump AND a signature change > cut_hist
+	//! (the per-frame re-normalised depth reshuffles its histogram on its own),
+	//! then cut_confirms agreeing measurements, and at most one per refractory.
+	uint32_t cut_confirms;
+	float cut_refractory_s;
+	//! Below this confidence the follower slows (τ × conf_full / confidence,
+	//! up to 3×): a weak, ambiguous mode moves the screen plane gently.
+	float conf_full;
 };
 
 void
@@ -177,6 +196,9 @@ struct u_lift_autoconv_filter
 	float sig[U_LIFT_AUTOCONV_SIG_BINS]; //!< previous scene signature
 	bool cut_pending;
 	float cut_value;
+	uint32_t cut_agreed;  //!< confirming measurements so far for the pending cut
+	uint64_t last_cut_ns; //!< 0 = none yet
+	float conf;           //!< confidence of the last valid measurement
 	bool fast; //!< following a confirmed cut
 	uint64_t fast_since_ns;
 	// Counters (diagnostics).

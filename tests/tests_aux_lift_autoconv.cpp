@@ -63,13 +63,26 @@ struct Map
 	}
 };
 
+//! The clump picker on its own (no percentile, foreground-biased, far end
+//! allowed): what the clump tests below exercise.
+void
+mode_only(u_lift_autoconv_params *p)
+{
+	p->blend = 0.0f;
+	p->fg_bias = 1.0f;
+	p->far_exclude = 0.0f;
+}
+
 u_lift_autoconv_estimate
-estimate(const Map &m, const float *active = nullptr)
+estimate(const Map &m, const float *active = nullptr, bool clump_only = true)
 {
 	static u_lift_autoconv_grid g; // large: keep it off the stack
 	REQUIRE(u_lift_autoconv_grid_from_samples(m.s.data(), m.w, m.h, m.w, true, 1.0f / 255.0f, 0.0f, 128, &g));
 	u_lift_autoconv_params p;
 	u_lift_autoconv_params_default(&p);
+	if (clump_only) {
+		mode_only(&p);
+	}
 	u_lift_autoconv_estimate e;
 	u_lift_autoconv_find_subject(&g, active, &p, &e);
 	return e;
@@ -304,17 +317,17 @@ TEST_CASE("lift autoconv: a confirmed scene cut ramps fast, never in one frame",
 	float first = 0.0f;
 	const double cut_ms = settle_ms(true, &cuts, &first);
 	CHECK(cuts == 1);
-	CHECK(cut_ms < 600.0);      // confirmation (one more sample) + a ~200 ms ramp
+	CHECK(cut_ms < 700.0);      // confirmation (two more samples) + a ~200 ms ramp
 	CHECK(first < 0.6f * 0.6f); // the first moving frame covers well under the jump
 	CHECK(first > 0.0f);
 
-	// The same jump is a cut by size alone (cut_jump), with the scene signature
-	// unchanged; it still needs its confirming measurement.
+	// The same jump with the scene signature unchanged is NOT a cut (a subject
+	// change inside a shot, or two clusters trading places): followed slowly.
 	uint32_t cuts2 = 0;
 	float first2 = 0.0f;
 	const double ms2 = settle_ms(false, &cuts2, &first2);
-	CHECK(cuts2 == 1);
-	CHECK(ms2 < 600.0);
+	CHECK(cuts2 == 0);
+	CHECK(ms2 > 1500.0);
 
 	// Contrast: the normal follower takes seconds for the same step.
 	u_lift_autoconv_filter f;
@@ -325,4 +338,93 @@ TEST_CASE("lift autoconv: a confirmed scene cut ramps fast, never in one frame",
 	float x = 0.0f;
 	u_lift_autoconv_filter_step(&f, &p, 600 * kMs, &x);
 	CHECK(x < 0.8f - 0.06f);
+}
+
+TEST_CASE("lift autoconv: cuts are rate-limited by the refractory period", "[lift_autoconv]")
+{
+	u_lift_autoconv_filter_params p;
+	u_lift_autoconv_filter_params_default(&p);
+	u_lift_autoconv_filter f;
+	u_lift_autoconv_filter_reset(&f);
+	uint64_t t = 0;
+	u_lift_autoconv_estimate e = fake(0.2f, 2.0f);
+	u_lift_autoconv_filter_measure(&f, &p, &e, t);
+	// Scene changes alternating every 4 samples (0.5 s): only cuts at least
+	// cut_refractory_s apart may count.
+	for (int i = 1; i <= 48; i++) {
+		t += 125 * kMs;
+		const bool a = ((i / 4) % 2) == 0;
+		e = a ? fake(0.2f, 2.0f) : fake(0.8f, 12.0f);
+		u_lift_autoconv_filter_measure(&f, &p, &e, t);
+	}
+	// 6 s of input: at most one cut per 1.5 s.
+	CHECK(f.cuts >= 1);
+	CHECK(f.cuts <= 4);
+}
+
+TEST_CASE("lift autoconv: the followed subject is kept against a comparable rival", "[lift_autoconv]")
+{
+	// Two comparable clusters: left half far, right half near (same mass).
+	Map m(512, 288, 0.0f);
+	m.rect(0.0f, 0.0f, 0.5f, 1.0f, 60.0f);
+	m.rect(0.5f, 0.0f, 1.0f, 1.0f, 200.0f);
+	static u_lift_autoconv_grid g;
+	REQUIRE(u_lift_autoconv_grid_from_samples(m.s.data(), m.w, m.h, m.w, true, 1.0f / 255.0f, 0.0f, 128, &g));
+	u_lift_autoconv_params p;
+	u_lift_autoconv_params_default(&p);
+	mode_only(&p);
+	p.fg_bias = 0.0f; // equal scores: which one wins is down to hysteresis alone
+	u_lift_autoconv_estimate e;
+	// Following the near one: it is kept.
+	p.prefer_h = 1.0f;
+	REQUIRE(u_lift_autoconv_find_subject(&g, nullptr, &p, &e));
+	CHECK(e.peak_h == Approx(1.0f).margin(1.0f / 32.0f));
+	// Following the far one: it is kept (the other does not win by switch_ratio).
+	p.prefer_h = 0.0f;
+	REQUIRE(u_lift_autoconv_find_subject(&g, nullptr, &p, &e));
+	CHECK(e.peak_h == Approx(0.0f).margin(1.0f / 32.0f));
+
+	// With a foreground bias the near cluster scores ~3x the far one: a clear
+	// winner takes over even from a followed subject.
+	u_lift_autoconv_params_default(&p);
+	mode_only(&p);
+	p.prefer_h = 0.0f;
+	REQUIRE(u_lift_autoconv_find_subject(&g, nullptr, &p, &e));
+	CHECK(e.peak_h == Approx(1.0f).margin(1.0f / 32.0f));
+}
+
+TEST_CASE("lift autoconv: a large far background never takes the screen plane", "[lift_autoconv]")
+{
+	// The failure seen on the panel: sky / distant scenery fills most of the
+	// frame as one flat far plateau; the old foreground-biased mode put the
+	// screen on it and pushed ~90 % of the frame out.
+	Map m(512, 288, 0.0f);
+	m.rect(0.0f, 0.0f, 1.0f, 1.0f, 20.0f);       // far plateau everywhere...
+	m.rect(0.35f, 0.40f, 0.65f, 0.95f, 140.0f); // ...a centred subject (~16 % of the frame)
+	m.rect(0.05f, 0.80f, 0.12f, 0.95f, 250.0f); // a small near detail
+	const float subject_h = (140.0f - 20.0f) / (250.0f - 20.0f);
+
+	const u_lift_autoconv_estimate old = estimate(m); // foreground-biased mode, far end allowed
+	REQUIRE(old.valid);
+	CHECK(old.mode_h < 0.1f); // the plateau wins: the regression this guards
+
+	const u_lift_autoconv_estimate e = estimate(m, nullptr, false); // the default rule
+	REQUIRE(e.valid);
+	CHECK(e.peak_h == Approx(subject_h).margin(1.0f / 32.0f)); // the far end is excluded
+	CHECK(e.mode_h > 0.25f);                                   // the plane moved off the background
+	CHECK(e.mode_h <= subject_h + 1.0f / 32.0f);              // ...but not in front of the subject
+}
+
+TEST_CASE("lift autoconv: the percentile puts about a quarter of the weight in front", "[lift_autoconv]")
+{
+	// Two layers, 70 % far / 30 % near (by centre-weighted area): p75 lands in
+	// the near layer, i.e. the near layer sits at (or just in front of) the plane.
+	Map m(512, 288, 0.0f);
+	m.rect(0.0f, 0.0f, 1.0f, 1.0f, 60.0f);
+	m.rect(0.0f, 0.0f, 1.0f, 0.30f, 200.0f); // top band near (a bit less centre weight)
+	const u_lift_autoconv_estimate e = estimate(m, nullptr, false);
+	REQUIRE(e.valid);
+	CHECK(e.pct_h > e.median_h);
+	CHECK(e.mode_h > 0.0f);
+	CHECK(e.mode_h <= 1.0f);
 }
