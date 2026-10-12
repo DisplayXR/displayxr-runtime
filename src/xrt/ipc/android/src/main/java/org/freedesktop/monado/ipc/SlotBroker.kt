@@ -25,7 +25,7 @@ import android.util.Log
  * any client holds its broker binding, `BIND_ABOVE_CLIENT` keeps this process at the client's
  * importance, so the table outlives everything that depends on it.
  */
-class SlotBroker(context: Context, private val slotCount: Int) : ISlotBroker.Stub() {
+class SlotBroker(private val context: Context, private val slotCount: Int) : ISlotBroker.Stub() {
 
     private val packageManager = context.packageManager
 
@@ -51,6 +51,23 @@ class SlotBroker(context: Context, private val slotCount: Int) : ISlotBroker.Stu
             return -1
         }
         val pkg = resolveCallerPackage(clientPackage)
+        // ADR-036 D4 / #1006 — the workspace overlay lives in the MAIN-process service: the
+        // controller itself must connect there, and while its overlay is active every new IPC
+        // client joins it too, so the shared surface can composite it. Clients that already
+        // hold a satellite keep it (per-window). Both checks read state in this process (the
+        // native server reports overlay transitions through WorkspaceControllerPolicy).
+        if (WorkspaceControllerPolicy.isVerifiedControllerPackage(context, pkg)) {
+            Log.w(TAG, "acquireSlot: $pkg is a verified workspace controller -> main-process service")
+            return -1
+        }
+        if (WorkspaceControllerPolicy.isOverlayActive()) {
+            Log.w(
+                TAG,
+                "acquireSlot: workspace overlay active -> $pkg joins the main-process service " +
+                    "(composited into the controller's surface)",
+            )
+            return -1
+        }
         synchronized(lock) {
             // 1. Reuse — a relaunch of the same package rebinds to its own satellite rather
             //    than stranding a live one and burning a second slot.

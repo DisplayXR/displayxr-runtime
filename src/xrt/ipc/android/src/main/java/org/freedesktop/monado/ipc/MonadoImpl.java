@@ -22,6 +22,9 @@ import android.view.Surface;
 import androidx.annotation.Keep;
 import androidx.annotation.NonNull;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 
 /**
  * Java implementation of the IMonado IPC interface.
@@ -33,7 +36,7 @@ import java.io.IOException;
  * in service-lib.
  */
 @Keep
-public class MonadoImpl extends IMonado.Stub {
+public class MonadoImpl extends IMonado.Stub implements WorkspaceControllerPolicy.Listener {
 
     private static final String TAG = "MonadoImpl";
 
@@ -54,6 +57,7 @@ public class MonadoImpl extends IMonado.Stub {
         // context made CNSDK throw NoSuchMethodError and tear down (refCount=0). The
         // Service is also process-lived, so holding a global ref to it is fine.
         nativeStartServer(context);
+        WorkspaceControllerPolicy.addListener(this);
     }
 
     @Override
@@ -110,6 +114,16 @@ public class MonadoImpl extends IMonado.Stub {
      */
     private Surface currentSurface = null;
 
+    /**
+     * The last Surface each client uid passed, most recent last (#1006). In workspace overlay mode
+     * the process-global output surface must be the CONTROLLER's — the shared surface composites
+     * every client into it — so a content client's surface is remembered here but not published;
+     * when the overlay ends, the most recent content surface is published again so per-session
+     * rendering finds its window. Strong references, for the same #1040 reason as {@link
+     * #currentSurface}; an entry goes when its client clears it or replaces it.
+     */
+    private final LinkedHashMap<Integer, Surface> surfaceByUid = new LinkedHashMap<>();
+
     @Override
     public void passAppSurface(Surface surface) {
         Log.i(TAG, "passAppSurface");
@@ -117,11 +131,59 @@ public class MonadoImpl extends IMonado.Stub {
             Log.e(TAG, "Received a null Surface from the client!");
             return;
         }
-        // Publish first, THEN swap our strong reference: the previous Surface must stay
-        // reachable until android_globals has adopted the replacement (#1040).
-        nativeAppSurface(surface);
+        final int uid = Binder.getCallingUid();
         synchronized (this) {
+            surfaceByUid.remove(uid);
+            surfaceByUid.put(uid, surface);
+            if (WorkspaceControllerPolicy.isOverlayActive()
+                    && uid != WorkspaceControllerPolicy.getControllerUid()) {
+                // ADR-036 D4 / #1006: the controller owns the output surface.
+                Log.w(
+                        TAG,
+                        "passAppSurface: workspace overlay active — surface from uid "
+                                + uid
+                                + " remembered, NOT published (the controller's surface is the"
+                                + " output)");
+                return;
+            }
+            // Publish first, THEN swap our strong reference: the previous Surface must stay
+            // reachable until android_globals has adopted the replacement (#1040).
+            nativeAppSurface(surface);
             currentSurface = surface;
+        }
+    }
+
+    /** Overlay transition (#1006), from the native IPC server via WorkspaceControllerPolicy. */
+    @Override
+    public void onOverlayChanged(boolean active, int controllerUid) {
+        synchronized (this) {
+            Surface pick = null;
+            if (active) {
+                pick = surfaceByUid.get(controllerUid);
+            } else {
+                // Most recent surface from anyone (the controller included: an overlay
+                // that ends while its controller keeps running leaves it the window).
+                List<Surface> order = new ArrayList<>(surfaceByUid.values());
+                for (int i = order.size() - 1; i >= 0; i--) {
+                    if (order.get(i).isValid()) {
+                        pick = order.get(i);
+                        break;
+                    }
+                }
+            }
+            if (pick != null && pick.isValid()) {
+                if (pick != currentSurface) {
+                    Log.w(TAG, "overlay " + (active ? "ON" : "OFF") + ": publishing the remembered surface");
+                    nativeAppSurface(pick);
+                    currentSurface = pick;
+                }
+            } else if (active) {
+                // No controller surface yet: never let the shared surface render into a
+                // content client's window. It is published when the controller passes it.
+                Log.w(TAG, "overlay ON: controller surface not passed yet — clearing the output");
+                nativeClearAppSurface();
+                currentSurface = null;
+            }
         }
     }
 
@@ -201,10 +263,18 @@ public class MonadoImpl extends IMonado.Stub {
     @Override
     public void clearAppSurface() {
         Log.i(TAG, "clearAppSurface");
-        // Mark the published window invalid first; only once the compositor has been told to
-        // stop presenting into it do we let the Java Surface become collectable (#1040).
-        nativeClearAppSurface();
+        final int uid = Binder.getCallingUid();
         synchronized (this) {
+            surfaceByUid.remove(uid);
+            if (WorkspaceControllerPolicy.isOverlayActive()
+                    && uid != WorkspaceControllerPolicy.getControllerUid()) {
+                // #1006: not the published surface — nothing to tear down.
+                Log.i(TAG, "clearAppSurface: overlay active, uid " + uid + " is not the controller");
+                return;
+            }
+            // Mark the published window invalid first; only once the compositor has been told
+            // to stop presenting into it do we let the Java Surface become collectable (#1040).
+            nativeClearAppSurface();
             currentSurface = null;
         }
     }

@@ -581,6 +581,7 @@ init_server_state(struct ipc_server *s)
 	s->global_state.last_active_client_index = -1;
 	s->global_state.connected_client_count = 0; // No clients connected initially
 	s->current_slot_index = 0;
+	s->workspace_controller_uid = -1; // #1006: 0 would be root's uid
 
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 		volatile struct ipc_client_state *ics = &s->threads[i].ics;

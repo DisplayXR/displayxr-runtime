@@ -44,6 +44,15 @@ long
 ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns);
 
 /*!
+ * The OS-derived UID of the process at the other end of @p handle
+ * (`SO_PEERCRED` on Linux / Android), or -1 when it cannot be derived or the
+ * platform has no such notion. On Android the UID is the app identity the
+ * package manager resolves (#1006 workspace-controller verification).
+ */
+long
+ipc_server_derive_peer_uid(xrt_ipc_handle_t handle);
+
+/*!
  * #960: best-effort absolute executable path of a peer process, for class
  * verification (CONTROLLER = a registered controller binary; DIAG = a binary in
  * the runtime's own directory).

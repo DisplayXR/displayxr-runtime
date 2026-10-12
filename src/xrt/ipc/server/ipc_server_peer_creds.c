@@ -207,6 +207,22 @@ refuse:
 #include <sys/un.h>
 
 long
+ipc_server_derive_peer_uid(xrt_ipc_handle_t handle)
+{
+#if defined(XRT_OS_LINUX)
+	struct ucred cred;
+	socklen_t len = sizeof(cred);
+	if (getsockopt((int)handle, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+		return (long)cred.uid;
+	}
+	return -1;
+#else
+	(void)handle;
+	return -1;
+#endif
+}
+
+long
 ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns)
 {
 	if (out_create_ns != NULL) {

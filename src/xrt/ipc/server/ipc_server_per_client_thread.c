@@ -232,6 +232,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 			ipc_server_input_queue_clear_frame_tick();
 #endif
 		}
+#ifdef XRT_OS_ANDROID
+		// #1006: the overlay ends with its controller.
+		ics->server->workspace_controller_uid = -1;
+		ipc_server_android_notify_overlay(false, -1);
+#endif
 	}
 	// #558 service-overlay teardown is NOT done here: tearing it down on the IPC
 	// client thread races the Android service-shutdown lifecycle and posts an
