@@ -29,6 +29,7 @@ set(tests
     tests_dp_vk_snap_window_rect
     tests_weave_snap_grid
     tests_lift_mailbox
+    tests_conversion_abi
     tests_aux_lift_viewpoint
     tests_aux_lift_rig_depth
     tests_space_overseer_rig
@@ -1021,6 +1022,11 @@ add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURC
 # lift mailbox tests (the module that emits it is Windows/D3D11-only).
 target_sources(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_fake_ply.c)
 target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+
+# ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h). Built as
+# C++17 on purpose (the header promises C11 + C++17).
+target_link_libraries(tests_conversion_abi PRIVATE xrt-interfaces)
+set_target_properties(tests_conversion_abi PROPERTIES CXX_STANDARD 17)
 
 # XR_DXR_lift v3 (ADR-048 Addendum A): the app-rig mapping is checked against the
 # shared displayxr-common rig core xrLocateViews runs.
