@@ -562,7 +562,26 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
  * `target_plugin_refresh_active`.
  */
 static void
+refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool world_event);
+
+static bool
+publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *info);
+
+static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
+{
+	refresh_display_processors_impl(info, false);
+}
+
+/*!
+ * Shared body of @ref refresh_display_processors_cb and
+ * @ref refresh_display_processors_world_cb. A @p world_event refresh (a display
+ * was plugged / unplugged / reconfigured — ADR-045 R-c, ADR-051 D6) always
+ * re-resolves the per-monitor registry and the panel desktop rect and publishes
+ * the screen table; the client-event refresh keeps its cheap path.
+ */
+static void
+refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool world_event)
 {
 	// refresh_active signals a swap through its return value only: it hands
 	// back the unchanged current iface, or the newly loaded one (the previous
@@ -605,7 +624,12 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	// hardware). Declined again with no new plug-in = nothing to re-resolve
 	// against; the registry from instance create still stands. Known geometry
 	// (client connect / compositor create, #342) keeps rebuilding as before.
-	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN) {
+	//
+	// A world event is the exception: the monitor list itself moved, so the
+	// registry (EDID claims) and the desktop rect are re-resolved whatever the
+	// active plug-in answered — otherwise a screen unplugged while the active
+	// plug-in declines keeps its stale claim row in every screen list.
+	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN && !world_event) {
 		// The scalars were just re-filled from the active plug-in.
 		apply_default_screen_preference(info);
 		if (locked) {
@@ -619,10 +643,15 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	build_dp_registry(info);
 	// New geometry means a new panel rect / device name for apps (#1301) —
 	// same order as instance create: apply, registry, then the desktop rect.
-	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED) {
+	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED || world_event) {
 		fill_display_desktop_info(info);
 	}
 	apply_default_screen_preference(info);
+	if (world_event && locked) {
+		// Same publication as the hotplug sweep: bump the display-topology
+		// generation (and log the table) iff the screen list changed.
+		(void)publish_screens_if_hotplug_info_locked(info);
+	}
 	if (locked) {
 		os_mutex_unlock(&g_display_info_mutex);
 	}
@@ -763,6 +792,32 @@ hotplug_rebuild_cb(void *user, uint32_t sources, bool followup)
 	const bool changed = publish_screens_locked(info, false);
 	os_mutex_unlock(&g_display_info_mutex);
 	return changed;
+}
+
+/*!
+ * Publish the screen table for @p info when it is the info the sweep tracks
+ * (the system compositor's own). Caller holds g_display_info_mutex.
+ */
+static bool
+publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *info)
+{
+	if (info == NULL || info != g_hotplug_info) {
+		return false;
+	}
+	return publish_screens_locked(info, false);
+}
+
+/*!
+ * Installed on @ref xrt_system_compositor_info::refresh_display_processors_world:
+ * the service's display re-probe worker calls it for world events (Windows
+ * WM_DISPLAYCHANGE / WM_DEVICECHANGE, desktop-Linux DRM hotplug, the fallback
+ * timer). Debounced by the worker, so the unconditional registry rebuild is
+ * rare.
+ */
+static void
+refresh_display_processors_world_cb(struct xrt_system_compositor_info *info)
+{
+	refresh_display_processors_impl(info, true);
 }
 
 static void
@@ -1215,6 +1270,7 @@ out:
 		g_display_info_head = head;
 		g_display_info_applied_valid = false;
 		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
+		xsysc->info.refresh_display_processors_world = refresh_display_processors_world_cb;
 
 		// Vendor-neutral display-info population through the plug-in
 		// iface (issue #256 / ADR-019). Runs FIRST regardless of whether

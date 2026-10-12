@@ -947,7 +947,7 @@ ipc_server_restart_requested(void)
 }
 
 static void
-reprobe_run(struct ipc_server *s, const char *reason)
+reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 {
 	if (s->xsysc == NULL || s->xsysc->info.refresh_display_processors == NULL) {
 		return;
@@ -958,7 +958,13 @@ reprobe_run(struct ipc_server *s, const char *reason)
 	// written since this process read the stores (`dp use --screen`, the
 	// dashboard) — re-read them before re-resolving.
 	u_setting_per_screen_reload();
-	s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	// The world-event variant re-resolves the screen registry even while the
+	// active plug-in declines its display info (the monitor list itself moved).
+	if (world_event && s->xsysc->info.refresh_display_processors_world != NULL) {
+		s->xsysc->info.refresh_display_processors_world(&s->xsysc->info);
+	} else {
+		s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// ...and hand the re-resolved screens to every client's segment manager:
 	// a screen whose plug-in changed gets its segment DP recreated (the
@@ -992,6 +998,7 @@ reprobe_thread_func(void *ptr)
 	while (!g_reprobe_stop) {
 		const uint64_t now = os_monotonic_get_ns();
 		const char *reason = NULL;
+		bool world_event = false;
 
 		if (g_reprobe_pending) {
 			const uint64_t since = now - g_reprobe_last_request_ns;
@@ -1002,6 +1009,7 @@ reprobe_thread_func(void *ptr)
 			}
 			reason = g_reprobe_reason;
 			g_reprobe_pending = false;
+			world_event = true;
 		} else if (s->xsysc != NULL && s->xsysc->info.active_plugin_is_fallback &&
 		           now - last_fallback_ns >= REPROBE_FALLBACK_PERIOD_NS) {
 			reason = "fallback timer";
@@ -1013,7 +1021,7 @@ reprobe_thread_func(void *ptr)
 		}
 
 		os_mutex_unlock(&g_reprobe_mutex);
-		reprobe_run(s, reason);
+		reprobe_run(s, reason, world_event);
 		last_fallback_ns = os_monotonic_get_ns();
 		os_mutex_lock(&g_reprobe_mutex);
 	}

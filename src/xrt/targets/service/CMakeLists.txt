@@ -88,6 +88,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 		service_orchestrator.h
 		service_hotkey_linux.c
 		service_hotkey_linux.h
+		service_drm_hotplug_linux.c
+		service_drm_hotplug_linux.h
 	)
 	target_link_libraries(displayxr-service PRIVATE aux_os xrt-pthreads)
 	if(XRT_HAVE_DBUS)
