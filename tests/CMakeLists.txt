@@ -1073,6 +1073,8 @@ target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/com
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
+
 if(TARGET tests_oxr_lift_startup)
 	# The REAL entry points (oxr_lift.c) and client (ipc_client_lift.c), plus
 	# the handle and logger code they verify with, compiled straight in; the
