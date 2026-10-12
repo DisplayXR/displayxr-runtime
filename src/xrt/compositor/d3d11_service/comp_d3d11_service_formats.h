@@ -231,6 +231,7 @@ d3d11_service_depth_format_shareable(ID3D11Device *device, DXGI_FORMAT format)
 	if (device == nullptr || !d3d11_service_is_depth_format(format)) {
 		return false;
 	}
+	return true; // MUTANT
 
 	D3D11_TEXTURE2D_DESC desc = d3d11_service_shared_texture_desc(
 	    16, 16, 1, 1, 1, format,
