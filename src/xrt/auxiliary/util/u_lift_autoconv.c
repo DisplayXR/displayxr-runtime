@@ -25,7 +25,7 @@ clampf(float v, float lo, float hi)
 }
 
 static bool
-finitef(float v)
+lift_isfinite(float v)
 {
 	return v == v && v - v == 0.0f; // not NaN, not +-inf
 }
@@ -97,11 +97,11 @@ u_lift_autoconv_source_parse(const char *value)
 static bool
 decode_inverse(float sample, bool encoding_inverse, float scale, float offset, float *out_q)
 {
-	if (!finitef(sample)) {
+	if (!lift_isfinite(sample)) {
 		return false;
 	}
 	const float d = scale * sample + offset;
-	if (!finitef(d)) {
+	if (!lift_isfinite(d)) {
 		return false;
 	}
 	if (encoding_inverse) {
@@ -115,7 +115,7 @@ decode_inverse(float sample, bool encoding_inverse, float scale, float offset, f
 		return false;
 	}
 	*out_q = 1.0f / d;
-	return finitef(*out_q);
+	return lift_isfinite(*out_q);
 }
 
 bool
@@ -132,8 +132,8 @@ u_lift_autoconv_grid_from_samples(const float *samples,
 	if (samples == NULL || out == NULL || sw == 0 || sh == 0 || stride_floats < sw) {
 		return false;
 	}
-	const float scale = (value_scale != 0.0f && finitef(value_scale)) ? value_scale : 1.0f;
-	const float offset = finitef(value_offset) ? value_offset : 0.0f;
+	const float scale = (value_scale != 0.0f && lift_isfinite(value_scale)) ? value_scale : 1.0f;
+	const float offset = lift_isfinite(value_offset) ? value_offset : 0.0f;
 
 	uint32_t gw = max_w > 0 ? max_w : U_LIFT_AUTOCONV_GRID_MAX_W;
 	if (gw > U_LIFT_AUTOCONV_GRID_MAX_W) {
@@ -192,12 +192,12 @@ u_lift_autoconv_grid_from_samples(const float *samples,
 		}
 	}
 	const float range = qmax - qmin;
-	if (valid_cells == 0 || !finitef(range) || !(range > 1e-6f * (fabsf(qmax) > 1.0f ? fabsf(qmax) : 1.0f))) {
+	if (valid_cells == 0 || !lift_isfinite(range) || !(range > 1e-6f * (fabsf(qmax) > 1.0f ? fabsf(qmax) : 1.0f))) {
 		return false; // nothing decodes, or a flat frame: no depth to pick from
 	}
 	const float inv = 1.0f / range;
 	for (uint32_t i = 0; i < gw * gh; i++) {
-		if (finitef(out->v[i])) {
+		if (lift_isfinite(out->v[i])) {
 			out->v[i] = clampf((out->v[i] - qmin) * inv, 0.0f, 1.0f);
 		}
 	}
@@ -271,7 +271,7 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 	float a[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 	if (active != NULL) {
 		for (int i = 0; i < 4; i++) {
-			a[i] = finitef(active[i]) ? clampf(active[i], 0.0f, 1.0f) : a[i];
+			a[i] = lift_isfinite(active[i]) ? clampf(active[i], 0.0f, 1.0f) : a[i];
 		}
 	}
 	// Cells only partly inside the region (a bar's edge) are left out: round
@@ -314,7 +314,7 @@ u_lift_autoconv_find_subject(const struct u_lift_autoconv_grid *g,
 		const float vdamp = 1.0f - (1.0f - damp) * (((float)y + 0.5f - (float)y0) / rh);
 		for (int32_t x = x0; x < x1; x++) {
 			const float h = g->v[(uint32_t)y * g->w + (uint32_t)x];
-			if (!finitef(h)) {
+			if (!lift_isfinite(h)) {
 				continue;
 			}
 			const float hh = clampf(h, 0.0f, 1.0f);
@@ -500,7 +500,7 @@ u_lift_autoconv_filter_measure(struct u_lift_autoconv_filter *f,
 		return;
 	}
 	f->measurements++;
-	if (!e->valid || !finitef(e->convergence)) {
+	if (!e->valid || !lift_isfinite(e->convergence)) {
 		f->held++;
 		f->cut_pending = false;
 		return; // hold
