@@ -876,6 +876,9 @@ struct d3d11_client_render_resources
 	//! XR_DXR_weave v15: the next submit's overlay lens-filter strength [0,1];
 	//! negative = the DP's default. Consumed (reset to -1) by the submit.
 	float                                  weave_overlay_filter_strength_next;
+	//! XR_DXR_weave v20: the screen-table generation the next submit's views
+	//! were painted with; 0 = the live seam. Consumed (reset) by the submit.
+	uint64_t weave_painted_generation_next;
 
 	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B; "2D under
 	//! the lens" P0 instrumentation). Per weave_submit: a disjoint + kWeaveTs
@@ -1091,8 +1094,14 @@ struct d3d11_service_compositor
 	//! When @ref weave_seg_out was last published (monotonic ns). A zone-scoped
 	//! locate frames an element from it only while it is fresh
 	//! (SVC_SEG_PUB_FRESH_NS): a window whose weaves stopped keeps its session's
-	//! own framing (comp_d3d11_service_get_zone_weave_screen).
+	//! own framing (comp_d3d11_service_get_zone_weave_table).
 	int64_t weave_seg_out_ns;
+	//! XR_DXR_weave v20: the partition (screens + window rects) of the last
+	//! few published tables, keyed by generation, so a submit painted against
+	//! an older table is cropped where it was painted (weave_seg_record). Put
+	//! and read under render_mutex (weave_seg_publish / weave_submit).
+	struct comp_segments_content_ring weave_seg_painted;
+	uint64_t weave_seg_painted_last_gen;
 
 	/*!
 	 * ADR-052 D2 — per-screen views of a WORKSPACE tile (a placed slot of the
@@ -27526,6 +27535,15 @@ comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc)
 }
 
 void
+comp_d3d11_service_weave_set_painted_generation(struct xrt_compositor *xc, uint64_t generation)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	d3d11_service_compositor_from_xrt(xc)->render.weave_painted_generation_next = generation;
+}
+
+void
 comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength)
 {
 	if (xc == nullptr || xc->destroy != compositor_destroy) {
@@ -28251,7 +28269,8 @@ weave_seg_record(struct d3d11_service_system *sys,
                  uint32_t cols,
                  uint32_t rows,
                  uint32_t win_w,
-                 uint32_t win_h)
+                 uint32_t win_h,
+                 uint64_t painted_generation)
 {
 	ID3D11DeviceContext *ctx = sys->context.get();
 	// Stateless slot: say "no overlay this frame" so the primary DP does not
@@ -28282,6 +28301,15 @@ weave_seg_record(struct d3d11_service_system *sys,
 	sf.atlas_encoding = (int)service_single_client_atlas_encoding(c);
 	sf.primary_dp = dp;
 	sf.outcomp = c->weave_seg_outcomp;
+	// XR_DXR_weave v20: views painted per part against an older table (a drag
+	// between the locate and this submit) are cropped where they were painted
+	// (#1883); a generation no longer held, or 0, crops at the live seam.
+	struct comp_segments_content painted;
+	if (painted_generation != 0 &&
+	    comp_segments_content_ring_get(&c->weave_seg_painted, painted_generation, &painted) && painted.count > 0 &&
+	    painted.canvas.w == win_w && painted.canvas.h == win_h) {
+		sf.content = &painted;
+	}
 	comp_d3d11_segments_record(c->weave_segs, &sf);
 
 	// Leave exactly the state the single-DP weave leaves: the handback bound,
@@ -28323,6 +28351,15 @@ weave_seg_publish(struct d3d11_service_compositor *c,
 		std::lock_guard<std::mutex> lk(c->seg_mutex);
 		(void)comp_segments_publish(&c->weave_seg_pub, &m);
 		out = c->weave_seg_pub;
+	}
+	// XR_DXR_weave v20: remember each table's partition by generation, once
+	// per generation, for a later submit painted against it.
+	if (out.count > 0 && out.count <= COMP_SEGMENTS_CONTENT_MAX && out.generation != 0 &&
+	    out.generation != c->weave_seg_painted_last_gen) {
+		struct comp_segments_content content;
+		comp_segments_content_from_metrics(&out, &content);
+		comp_segments_content_ring_put(&c->weave_seg_painted, out.generation, &content);
+		c->weave_seg_painted_last_gen = out.generation;
 	}
 	for (uint32_t k = 0; k < out.count && k < XRT_MAX_SEGMENTS; k++) {
 		struct xrt_segment_metric *s = &out.seg[k];
@@ -28433,6 +28470,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	c->render.weave_overlay_unchanged_next = false;
 	const float ov_filter_strength = c->render.weave_overlay_filter_strength_next;
 	c->render.weave_overlay_filter_strength_next = -1.0f;
+	const uint64_t painted_generation = c->render.weave_painted_generation_next;
+	c->render.weave_painted_generation_next = 0;
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
 		return false;
@@ -29169,7 +29208,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		if (seg_split) {
 			weave_seg_record(sys, c, dp, dp_srv, cvw, cvh, layout->tile_columns, layout->tile_rows, win_w,
-			                 win_h);
+			                 win_h, painted_generation);
 		} else {
 			hand_overlay_to_dp();
 			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
@@ -29385,7 +29424,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		if (seg_split) {
 			weave_seg_record(sys, c, dp, c->render.weave_sbs_srv.get(), win_w, win_h, /*cols*/ 2,
-			                 /*rows*/ 1, win_w, win_h);
+			                 /*rows*/ 1, win_w, win_h, painted_generation);
 		} else {
 			hand_overlay_to_dp();
 			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
@@ -29699,19 +29738,20 @@ comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc)
 }
 
 extern "C" bool
-comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
-                                         struct xrt_compositor *xc,
-                                         const struct xrt_rect *zone,
-                                         uint32_t live_w,
-                                         uint32_t live_h,
-                                         struct xrt_segment_metrics *out,
-                                         uint32_t *out_index)
+comp_d3d11_service_get_zone_weave_table(struct xrt_system_compositor *xsysc,
+                                        struct xrt_compositor *xc,
+                                        const struct xrt_rect *zone,
+                                        uint32_t live_w,
+                                        uint32_t live_h,
+                                        uint32_t zone_part,
+                                        struct xrt_segment_metrics *out,
+                                        int32_t *out_frame_index)
 {
-	if (out == nullptr || out_index == nullptr || zone == nullptr) {
+	if (out == nullptr || out_frame_index == nullptr || zone == nullptr) {
 		return false;
 	}
 	memset(out, 0, sizeof(*out));
-	*out_index = 0;
+	*out_frame_index = -1;
 	if (xsysc == nullptr || xc == nullptr || xc->destroy != compositor_destroy ||
 	    !comp_d3d11_service_is_d3d11_service(xsysc)) {
 		return false;
@@ -29778,17 +29818,38 @@ comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
 		return false;
 	}
 
-	// The element's screen, by the table's geometry (u_weave_zone_screen_segment):
-	// the screen holding most of it. One mostly on the primary, a resize in
-	// flight -> none (the session's own framing).
-	const int32_t k = u_weave_zone_screen_segment(out, zone, live_w, live_h);
-	if (k < 0) {
+	// A table cut from a window of another size (a resize in flight) frames
+	// nothing: the session's own framing, no parts.
+	if (out->window_pixel_width != live_w || out->window_pixel_height != live_h) {
 		memset(out, 0, sizeof(*out));
 		return false;
 	}
-	*out_index = (uint32_t)k;
 
-	// Pass 2, only for an element on a non-primary screen: that screen's eyes
+	// The segment framing this locate, by the table's geometry: part k's
+	// screen for a part locate (Amendment 10), else the screen holding most of
+	// the element (u_weave_zone_screen_segment). One mostly on the primary ->
+	// none (the session's own framing), and no render-thread lock below.
+	int32_t k = -1;
+	if (zone_part > 0) {
+		struct xrt_segment_metrics parts;
+		const uint32_t n = u_weave_zone_part_table(out, zone, &parts, nullptr);
+		if (n >= 2 && zone_part <= n) {
+			for (uint32_t i = 0; i < out->count; i++) {
+				if (out->seg[i].screen_id == parts.seg[zone_part - 1].screen_id) {
+					k = (int32_t)i;
+					break;
+				}
+			}
+		}
+	} else {
+		k = u_weave_zone_screen_segment(out, zone, live_w, live_h);
+	}
+	*out_frame_index = k;
+	if (k < 0 || out->seg[k].is_primary) {
+		return true; // the primary's eyes are the session's own, already fresh
+	}
+
+	// Pass 2, only for an element framed on a non-primary screen: that screen's eyes
 	// predicted NOW from its segment DP, like the session's own eyes are for
 	// its locate (the table's own, as of that weave, when the DP cannot
 	// answer). `weave_segs` is swapped by weave_submit under render_mutex, so

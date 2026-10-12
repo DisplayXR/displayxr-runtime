@@ -1004,6 +1004,12 @@ struct ipc_arg_weave_submit
 	//! strength for the overlay, [0,1]; NEGATIVE = not set (the DP's own default).
 	//! Appended: 832 + 4 = 836 B; the dma-buf call is 4 + 836 + 136 = 976 of 1024.
 	float overlay_filter_strength;
+
+	//! XR_DXR_weave v20 (XrWeaveSubmitPaintedPartitionDXR): the screen-table
+	//! generation this submit's per-part views were painted with; 0 = crop at
+	//! the live seam. Windows service only. Appended: 836 + 4 (alignment) + 8 =
+	//! 848 B; the dma-buf call is 4 + 848 + 136 = 988 of 1024.
+	uint64_t painted_generation;
 };
 
 /*!
@@ -1352,6 +1358,19 @@ struct ipc_view_rig_info
 	int32_t zone_y_px; //!< Zone rect top, client-window pixels (y-down)
 	int32_t zone_w_px; //!< Zone rect width in pixels
 	int32_t zone_h_px; //!< Zone rect height in pixels
+
+	/*
+	 * XrDisplayZonePartsDXR (XR_DXR_display_zones v4, multi-screen § 8.1) -
+	 * append-only past this point.
+	 */
+
+	//! 0 = the zone's ONE view set (framed from the screen holding most of
+	//! it). k + 1 = part k of the zone, as the previous locate's reply listed
+	//! it (ipc_info_locate_views_rig::zone_part_*): framed from that part's
+	//! screen, the part as the canvas, one rig scale for the whole zone. A
+	//! part the server can no longer find (the window moved) answers the one
+	//! set and zone_part_count 0. Only with zone_valid.
+	uint32_t zone_part;
 };
 
 /*!
@@ -1414,6 +1433,21 @@ struct ipc_info_locate_views_rig
 	float rear_far_offset_vh; //!< vH; 0 = clip at the ZDP, 1000 = unrestricted
 	uint32_t rear_state;      //!< enum u_rear_budget_state / XrRearDepthBudgetStateDXR
 	float rear_cue;           //!< 0..1 background cue energy; 0 when no source
+
+	/*
+	 * XrDisplayZonePartsDXR (XR_DXR_display_zones v4, multi-screen § 8.1) -
+	 * append-only past this point.
+	 *
+	 * A zone-scoped locate of a present-owner whose bound window is woven per
+	 * screen: the zone's parts when it straddles a seam (the table the views
+	 * were framed against), so the client can ask for each part's views
+	 * (ipc_view_rig_info::zone_part). Fixed size; 0 parts = not split.
+	 */
+	uint32_t zone_part_count;                         //!< 0, or 2..XRT_MAX_SEGMENTS
+	uint64_t zone_parts_generation;                   //!< The table's generation
+	uint64_t zone_part_display_id[XRT_MAX_SEGMENTS];  //!< Each part's screen
+	struct xrt_rect zone_part_rect[XRT_MAX_SEGMENTS]; //!< Each part, ZONE-relative px
+	uint32_t zone_part_framed; //!< The part this reply's views frame (k + 1), 0 = the one set
 };
 
 struct ipc_pcm_haptic_buffer

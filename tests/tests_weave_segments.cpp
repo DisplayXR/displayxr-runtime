@@ -20,8 +20,10 @@
  */
 
 #include "util/comp_segments.h"
+#include "util/comp_segments_route.h"
 #include "util/u_canvas.h"
 #include "util/u_weave_rect_parts.h"
+#include "util/u_segment_layout.h"
 
 #include "oxr_segment_views.h"
 
@@ -924,6 +926,116 @@ TEST_CASE("zone parts: the per-frame budget admits the first N distinct zones of
 	CHECK_FALSE(oxr_zone_parts_budget_admit(nullptr, t0, 1, 4));
 }
 
+TEST_CASE("zone parts: the service frames a present-owner's part exactly as the client frames its own")
+{
+	// ADR-047 Amendment 10: ipc_try_get_sr_view_poses frames part k of an
+	// element in that part's OWN screen space (u_weave_segment_window_metrics,
+	// rebased to the part's window rect, that screen's eyes), plus the rig
+	// share and offset from u_segment_layout over the parts. The client frames
+	// it in the reference frame (oxr_segment_views_window_metrics, eyes carried
+	// over). Same eye-relative canvas, same rig scale.
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	for (int layout = 0; layout < 2; layout++) {
+		if (layout == 1) {
+			screens[1].desktop = {1920, 0, 3840, 2160}; // half the pitch
+			screens[1].native_w = 3840;
+			screens[1].native_h = 2160;
+		}
+		const comp_seg_rect win = {1400, 100, 1000, 600};
+		xrt_segment_metrics m = publish(win, screens, 2);
+		REQUIRE(m.count == 2);
+		with_geometry(m, screens, 2);
+		const xrt_rect zone = xr(300, 100, 400, 300);
+
+		xrt_segment_metrics pm;
+		xrt_rect rel[XRT_MAX_SEGMENTS];
+		u_segment_layout pl;
+		REQUIRE(u_weave_zone_part_table(&m, &zone, &pm, rel) == 2);
+		REQUIRE(u_segment_layout_compute(&pm, &pl));
+		for (uint32_t p = 0; p < 2; p++) {
+			// Service: the whole window on the part's screen, rebased to the part.
+			uint32_t k = 0;
+			while (m.seg[k].screen_id != pm.seg[p].screen_id) {
+				k++;
+			}
+			xrt_window_metrics whole;
+			REQUIRE(u_weave_segment_window_metrics(&m, k, &whole));
+			const xrt_window_metrics svc = zone_canvas(whole, pm.seg[p].window_rect);
+			// Client: the part placed in the reference frame.
+			xrt_window_metrics cli;
+			oxr_segment_views_window_metrics(&pm, &pl, p, &cli);
+			float dx = 0.0f, dy = 0.0f;
+			oxr_segment_views_own_to_ref(&pl, p, &dx, &dy);
+
+			CHECK(svc.window_screen_left - svc.display_screen_left ==
+			      cli.window_screen_left - cli.display_screen_left);
+			CHECK(svc.window_pixel_width == cli.window_pixel_width);
+			CHECK(svc.window_width_m == Catch::Approx(cli.window_width_m));
+			CHECK(svc.window_height_m == Catch::Approx(cli.window_height_m));
+			// eye_own - centre_own == (eye_own + d) - centre_ref
+			CHECK(svc.window_center_offset_x_m ==
+			      Catch::Approx(cli.window_center_offset_x_m - dx).margin(1e-6));
+			CHECK(svc.window_center_offset_y_m ==
+			      Catch::Approx(cli.window_center_offset_y_m - dy).margin(1e-6));
+			// One rig scale, one offset: the shared aux math.
+			CHECK(u_segment_vdh_scale(&pl, p) == oxr_segment_views_vdh_scale(&pl, p));
+		}
+	}
+}
+
+TEST_CASE("zone parts: a weave painted against an older table is cropped where it was painted")
+{
+	// XR_DXR_weave v20: the browser paints an element's parts at the seam of
+	// the table its locate saw (generation g) and passes g back at submit; the
+	// service keeps each published table's partition by generation and crops
+	// with it, while the live table (the window moved 6 px since) places the
+	// output. comp_segments_source_rect then reads each screen's views at the
+	// PAINTED seam.
+	comp_segments_screen screens[2];
+	two_screens(screens);
+	const comp_seg_rect painted_win = {1400, 100, 1000, 600}; // seam at window x 520
+	xrt_segment_metrics painted = publish(painted_win, screens, 2);
+	painted.generation = 41;
+	comp_segments_content content;
+	comp_segments_content_from_metrics(&painted, &content);
+	REQUIRE(content.count == 2);
+	CHECK(content.canvas.w == 1000u);
+	CHECK(content.canvas.h == 600u);
+	CHECK(content.rect[0].w == 520u);
+
+	comp_segments_content_ring ring;
+	std::memset(&ring, 0, sizeof(ring));
+	comp_segments_content_ring_put(&ring, painted.generation, &content);
+	comp_segments_content got;
+	REQUIRE(comp_segments_content_ring_get(&ring, 41, &got));
+	CHECK_FALSE(comp_segments_content_ring_get(&ring, 42, &got)); // not held: live seam
+
+	// The live table: the window dragged 6 px right, seam at window x 514.
+	const comp_seg_rect live_win = {1406, 100, 1000, 600};
+	comp_segment_table t;
+	const comp_seg_rect canvas = {0, 0, live_win.w, live_win.h};
+	comp_segments_compute(&live_win, &canvas, screens, 2, &t);
+	REQUIRE(t.count == 2);
+	REQUIRE(t.seg[0].window_rect.w == 514u);
+
+	// One SBS tile per eye, window-sized.
+	comp_seg_rect src;
+	REQUIRE(comp_segments_source_rect(&t.seg[0], &canvas, 1000, 600, &content, &src));
+	CHECK(src.w == 520u); // the painted seam, not the live 514
+	REQUIRE(comp_segments_source_rect(&t.seg[1], &canvas, 1000, 600, &content, &src));
+	CHECK(src.x == 520);
+	// Without the painted partition, the live seam.
+	REQUIRE(comp_segments_source_rect(&t.seg[0], &canvas, 1000, 600, nullptr, &src));
+	CHECK(src.w == 514u);
+
+	// A table that is not split carries no partition.
+	xrt_segment_metrics none;
+	std::memset(&none, 0, sizeof(none));
+	comp_segments_content_from_metrics(&none, &content);
+	CHECK(content.count == 0);
+}
+
 #ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
 TEST_CASE("element views: weave_submit's reply carries the split signal as a trailing field")
 {
@@ -989,5 +1101,27 @@ TEST_CASE("weave segments: weave_get_segments carries the table and every screen
 	CHECK(left.screen_id == PRIMARY_ID);
 	CHECK(left.eyes.eyes[0].x == Catch::Approx(-0.032f));
 	CHECK(wire.metrics.generation == 9);
+}
+#endif
+
+#ifdef DXR_TESTS_HAVE_IPC_PROTOCOL
+TEST_CASE("zone parts: the rig locate carries the part request and the parts, appended")
+{
+	// ADR-047 Amendment 10: append-only (the u_git_tag gate refuses a skewed
+	// client/service pair; appending keeps every older offset).
+	STATIC_REQUIRE(offsetof(ipc_view_rig_info, zone_part) > offsetof(ipc_view_rig_info, zone_h_px));
+	STATIC_REQUIRE(offsetof(ipc_info_locate_views_rig, zone_part_count) >
+	               offsetof(ipc_info_locate_views_rig, rear_cue));
+	STATIC_REQUIRE(offsetof(ipc_info_locate_views_rig, zone_part_framed) >
+	               offsetof(ipc_info_locate_views_rig, zone_part_rect));
+	STATIC_REQUIRE(sizeof(ipc_session_locate_views_rig_reply) <= IPC_BUF_SIZE);
+	STATIC_REQUIRE(sizeof(ipc_session_locate_views_rig_msg) <= IPC_BUF_SIZE);
+
+	ipc_info_locate_views_rig reply;
+	std::memset(&reply, 0, sizeof(reply));
+	CHECK(reply.zone_part_count == 0); // a zone on one screen: not split
+	ipc_view_rig_info rig;
+	std::memset(&rig, 0, sizeof(rig));
+	CHECK(rig.zone_part == 0); // the zone's one set
 }
 #endif

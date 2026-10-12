@@ -335,15 +335,14 @@ screen's viewer. The fix gives each part its own view set.
   (`DXR_ZONE_PARTS_MAX`, 0 = never split, max 16). Past it a zone keeps its one set.
 - **`PRIMARY_MULTIVIEW_DXR`** gets per-part zone views only through the struct, never through
   `XrView[]`.
-- **Where it runs today.** In-process segmenting compositors and direct D3D11-service clients:
-  the parts are located client-side from the segment table, no wire change; those frames stay
-  unrouted and are cropped at the live seam.
-- **Still to land: present-owners.** Their element locates are framed server-side
-  (`ipc_try_get_sr_view_poses`), so the locate reply gains an appended, fixed-size parts block
-  (≤ `XRT_MAX_SEGMENTS` parts × the active views of pose + fov), versioned by append-only fields
-  under the `u_git_tag` gate. The weave then crops each part where it was **painted**: the batch /
-  v6 submit carries the partition the frame was rendered with (zone-relative rects per screen,
-  appended to the rect), and `weave_seg_record` crops with it.
+- **In-process and direct D3D11-service clients:** the parts are located client-side from the
+  segment table, no wire change; those frames stay unrouted and are cropped at the live seam.
+- **Present-owners** (their element locates are framed server-side, `ipc_try_get_sr_view_poses`):
+  the zone's locate reply lists the parts (appended fields), and the client asks for each part's
+  views with `ipc_view_rig_info::zone_part = k + 1` (appended); append-only under the `u_git_tag`
+  gate. The weave crops each screen's input where it was **painted**: the submit carries the
+  table generation its locates saw (`XrWeaveSubmitPaintedPartitionDXR`, `XR_DXR_weave` v20), the
+  service keeps the last few tables' partitions, and `weave_seg_record` crops with it.
 
 ### 8.2 Browser and web API (displayxr-browser-pvt)
 

@@ -165,6 +165,35 @@ comp_segments_content_from_routing(const struct xrt_segment_view_routing *r, str
 }
 
 /*!
+ * The partition a published segment table @p m cuts its window into, as the
+ * crop reads it (XR_DXR_weave v20): each screen at its window rect, against
+ * the whole window (@p m's client size) as the canvas. A present-owner's
+ * per-part views are painted at this partition when its locates saw @p m, so
+ * a later weave that finds the window moved crops them here (#1883 for the
+ * weave path). count 0 for a table that is not split.
+ */
+static inline void
+comp_segments_content_from_metrics(const struct xrt_segment_metrics *m, struct comp_segments_content *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (m == NULL || m->count == 0 || m->count > XRT_MAX_SEGMENTS || m->count > COMP_SEGMENTS_CONTENT_MAX) {
+		return;
+	}
+	for (uint32_t k = 0; k < m->count; k++) {
+		out->screen_id[k] = m->seg[k].screen_id;
+		out->rect[k].x = m->seg[k].window_rect.offset.w;
+		out->rect[k].y = m->seg[k].window_rect.offset.h;
+		out->rect[k].w = (uint32_t)(m->seg[k].window_rect.extent.w > 0 ? m->seg[k].window_rect.extent.w : 0);
+		out->rect[k].h = (uint32_t)(m->seg[k].window_rect.extent.h > 0 ? m->seg[k].window_rect.extent.h : 0);
+	}
+	out->canvas.x = 0;
+	out->canvas.y = 0;
+	out->canvas.w = m->window_pixel_width;
+	out->canvas.h = m->window_pixel_height;
+	out->count = m->count;
+}
+
+/*!
  * Publish @p next as the segment table readers frame views from, bumping the
  * generation only when the table (generation aside) changed — so a reader can
  * tell "the same table again" from "a new one" without comparing payloads.

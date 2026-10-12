@@ -18,6 +18,7 @@
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 #include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
 #include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: per-screen element views
+#include "util/u_segment_layout.h"   // ADR-047 Amendment 10: an element's parts in one frame
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
@@ -732,6 +733,17 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// against that screen — its eyes, its nominal viewer, its geometry.
 	bool zone_reframed = false;
 	struct xrt_segment_metric zone_screen = {0};
+	// ADR-047 Amendment 10 (XrDisplayZonePartsDXR): a locate of ONE part of a
+	// straddling element (rig->zone_part = k + 1) is framed from that part's
+	// screen with the part as the canvas, and one rig scale for the whole
+	// element: its share of the element's height and its offset from the
+	// element's centre (u_segment_layout over the parts, the per-segment views'
+	// math, so the parts meet at the seam).
+	bool part_framed = false;
+	struct xrt_rect part_rect = {{0, 0}, {0, 0}}; // window px
+	float part_vdh_scale = 1.0f;
+	float part_rig_dx = 0.0f;
+	float part_rig_dy = 0.0f;
 	{
 		struct xrt_window_metrics wm = {0};
 		bool have_wm = false;
@@ -797,29 +809,72 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			zone_rect.extent.w = rig->zone_w_px;
 			zone_rect.extent.h = rig->zone_h_px;
 			struct xrt_segment_metrics wseg;
-			uint32_t k = 0;
-			struct xrt_window_metrics swm;
-			// That screen's DP must have eyes for it (a segment with no DP is
-			// flat 2D anyway): otherwise the element keeps the primary's views.
-			if (comp_d3d11_service_get_zone_weave_screen(s->xsysc, xc, &zone_rect, wm.window_pixel_width,
-			                                             wm.window_pixel_height, &wseg, &k) &&
-			    wseg.seg[k].have_eyes && wseg.seg[k].eyes.valid && wseg.seg[k].eyes.count > 0 &&
-			    u_weave_segment_window_metrics(&wseg, k, &swm)) {
-				wm = swm;
-				zone_reframed = true;
-				zone_screen = wseg.seg[k];
-				// Change-only (never per frame): which screen elements were
-				// last re-framed onto. Not logged back: a page with elements on
-				// both screens would flip it every locate.
-				static uint64_t s_zone_screen_logged = 0;
-				if (zone_screen.screen_id != s_zone_screen_logged) {
-					s_zone_screen_logged = zone_screen.screen_id;
-					IPC_WARN(
-					    s,
-					    "multi-screen: element (%d,%d %dx%d) wholly on screen 0x%016llx - views "
-					    "from that screen's eyes and geometry (ADR-047 Amendment 4 addendum)",
-					    rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px,
-					    (unsigned long long)zone_screen.screen_id);
+			int32_t k = -1;
+			if (comp_d3d11_service_get_zone_weave_table(s->xsysc, xc, &zone_rect, wm.window_pixel_width,
+			                                            wm.window_pixel_height, rig->zone_part, &wseg,
+			                                            &k)) {
+				// The element's parts (Amendment 10), for the reply: the client
+				// asks for each part's views next (rig->zone_part).
+				struct xrt_segment_metrics parts;
+				struct xrt_rect rel[XRT_MAX_SEGMENTS];
+				struct u_segment_layout pl;
+				const uint32_t np = u_weave_zone_part_table(&wseg, &zone_rect, &parts, rel);
+				const bool split = np >= 2 && u_segment_layout_compute(&parts, &pl);
+				if (split && rig_reply != NULL) {
+					rig_reply->zone_part_count = np;
+					rig_reply->zone_parts_generation = wseg.generation;
+					for (uint32_t p = 0; p < np && p < XRT_MAX_SEGMENTS; p++) {
+						rig_reply->zone_part_display_id[p] = parts.seg[p].screen_id;
+						rig_reply->zone_part_rect[p] = rel[p];
+					}
+				}
+				struct xrt_window_metrics swm;
+				if (rig->zone_part > 0) {
+					// One part: its screen's eyes (the session's own on the
+					// primary), the part as the canvas. A camera rig has no
+					// per-canvas meaning: never split.
+					const uint32_t p = rig->zone_part - 1;
+					const struct xrt_segment_metric *g = k >= 0 ? &wseg.seg[k] : NULL;
+					if (split && p < np && g != NULL && rig->rig_type != IPC_VIEW_RIG_CAMERA &&
+					    (g->is_primary || (g->have_eyes && g->eyes.valid && g->eyes.count > 0)) &&
+					    u_weave_segment_window_metrics(&wseg, (uint32_t)k, &swm)) {
+						wm = swm;
+						part_framed = true;
+						part_rect = parts.seg[p].window_rect;
+						part_vdh_scale = u_segment_vdh_scale(&pl, p);
+						part_rig_dx = pl.seg[p].ref_cx - pl.window_ref_cx;
+						part_rig_dy = pl.seg[p].ref_cy - pl.window_ref_cy;
+						if (!g->is_primary) {
+							zone_reframed = true;
+							zone_screen = *g;
+						}
+						if (rig_reply != NULL) {
+							rig_reply->zone_part_framed = rig->zone_part;
+						}
+					}
+				} else if (k >= 0 && wseg.seg[k].have_eyes && wseg.seg[k].eyes.valid &&
+				           wseg.seg[k].eyes.count > 0 &&
+				           u_weave_segment_window_metrics(&wseg, (uint32_t)k, &swm)) {
+					// The element's one set from the screen holding most of it.
+					// That screen's DP must have eyes for it (a segment with no
+					// DP is flat 2D anyway): otherwise the primary's views.
+					wm = swm;
+					zone_reframed = true;
+					zone_screen = wseg.seg[k];
+					// Change-only (never per frame): which screen elements were
+					// last re-framed onto. Not logged back: a page with elements
+					// on both screens would flip it every locate.
+					static uint64_t s_zone_screen_logged = 0;
+					if (zone_screen.screen_id != s_zone_screen_logged) {
+						s_zone_screen_logged = zone_screen.screen_id;
+						IPC_WARN(
+						    s,
+						    "multi-screen: element (%d,%d %dx%d) mostly on screen 0x%016llx - "
+						    "views from that screen's eyes and geometry (ADR-047 Amendment 4 "
+						    "addendum)",
+						    rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px,
+						    (unsigned long long)zone_screen.screen_id);
+					}
 				}
 			}
 		}
@@ -839,12 +894,13 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// there — zones under a workspace are deferred anyway (the
 		// service compositor doesn't consume zone layers yet).
 		if (have_wm && rig != NULL && rig->zone_valid != 0) {
+			// A part locate's canvas is the part (Amendment 10), else the zone.
 			struct u_canvas_rect zone_canvas = {
 			    .valid = true,
-			    .x = rig->zone_x_px,
-			    .y = rig->zone_y_px,
-			    .w = (uint32_t)rig->zone_w_px,
-			    .h = (uint32_t)rig->zone_h_px,
+			    .x = part_framed ? part_rect.offset.w : rig->zone_x_px,
+			    .y = part_framed ? part_rect.offset.h : rig->zone_y_px,
+			    .w = (uint32_t)(part_framed ? part_rect.extent.w : rig->zone_w_px),
+			    .h = (uint32_t)(part_framed ? part_rect.extent.h : rig->zone_h_px),
 			};
 			u_canvas_apply_to_metrics(&wm, &zone_canvas);
 			static bool zone_locate_logged = false;
@@ -1308,8 +1364,25 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			dt.parallax_factor = rig->parallax_factor;
 			dt.perspective_factor = rig->perspective_factor;
 			dt.virtual_display_height = rig->virtual_display_height;
+			// Amendment 10: the rig sizes the ELEMENT; this part is its share.
+			if (part_framed && part_vdh_scale > 0.0f) {
+				dt.virtual_display_height *= part_vdh_scale;
+			}
 		} else {
 			dt.virtual_display_height = screen_height_m; // identity m2v
+		}
+
+		// Amendment 10: an element-centred display plane puts the ELEMENT at
+		// its pose; this part's canvas sits m2v x its offset from the
+		// element's centre (the in-process locate_segment_override twin).
+		if (part_framed && (part_rig_dx != 0.0f || part_rig_dy != 0.0f) && screen_height_m > 0.0f) {
+			const float m2v = dt.virtual_display_height / screen_height_m;
+			const struct xrt_vec3 off = {part_rig_dx * m2v, part_rig_dy * m2v, 0.0f};
+			struct xrt_vec3 off_rot;
+			math_quat_rotate_vec3(&display_pose.orientation, &off, &off_rot);
+			display_pose.position.x += off_rot.x;
+			display_pose.position.y += off_rot.y;
+			display_pose.position.z += off_rot.z;
 		}
 
 		struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
@@ -7343,6 +7416,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	comp_d3d11_service_weave_set_overlay_unchanged(ics->xc, args->overlay_unchanged != 0);
 	// v15: per submit — negative = not set by the app, the DP's own default applies.
 	comp_d3d11_service_weave_set_overlay_filter_strength(ics->xc, args->overlay_filter_strength);
+	// v20: per submit — 0 = crop each screen's input at the live seam.
+	comp_d3d11_service_weave_set_painted_generation(ics->xc, args->painted_generation);
 	bool ok = comp_d3d11_service_weave_submit(                  //
 	    ics->xc, in_handle, in_is_dxgi,                         //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
@@ -8368,6 +8443,11 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	    out_info->fovs,               //
 	    out_info->poses);             //
 }
+
+static_assert(sizeof(struct ipc_session_locate_views_rig_reply) <= IPC_BUF_SIZE,
+              "session_locate_views_rig reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_session_locate_views_rig_msg) <= IPC_BUF_SIZE,
+              "session_locate_views_rig message exceeds IPC_BUF_SIZE");
 
 xrt_result_t
 ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,

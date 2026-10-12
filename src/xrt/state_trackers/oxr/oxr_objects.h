@@ -3327,6 +3327,17 @@ struct oxr_session
 		struct oxr_zone_parts_budget parts_budget;
 		//! Change-only log latch: the last split decision logged.
 		uint32_t parts_logged_sig;
+		//! A present-owner's zone parts as the service listed them in the
+		//! last zone-scoped locate's reply (ADR-047 Amendment 10), and which
+		//! part the last reply's views frame (k + 1, 0 = the one set).
+		struct
+		{
+			uint32_t count;
+			uint64_t generation;
+			uint64_t display_id[XRT_MAX_SEGMENTS];
+			struct xrt_rect rect[XRT_MAX_SEGMENTS];
+			uint32_t framed;
+		} ipc_parts;
 	} display_zones;
 #endif
 

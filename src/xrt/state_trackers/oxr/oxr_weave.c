@@ -151,6 +151,10 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      int32_t display_id,
                                                      const struct xrt_weave_logical_origin *logical);
 
+//! XR_DXR_weave v20: the next submit's painted partition (ipc_client_compositor.c).
+void
+comp_ipc_client_compositor_weave_set_painted_generation(struct xrt_compositor *xc, uint64_t generation);
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,
@@ -1014,6 +1018,13 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	} else
 #endif
 	{
+		// Spec v20: the screen-table generation this submit's per-part views
+		// were painted with (XrDisplayZonePartsDXR), so the Windows service
+		// crops each screen's input there, not at the live seam.
+		const XrWeaveSubmitPaintedPartitionDXR *ppart = OXR_GET_INPUT_FROM_CHAIN(
+		    submitInfo, XR_TYPE_WEAVE_SUBMIT_PAINTED_PARTITION_DXR, XrWeaveSubmitPaintedPartitionDXR);
+		comp_ipc_client_compositor_weave_set_painted_generation(&sess->xcn->base,
+		                                                        ppart != NULL ? ppart->zonePartsGeneration : 0);
 		xret = comp_ipc_client_compositor_weave_submit(
 		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 		    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
