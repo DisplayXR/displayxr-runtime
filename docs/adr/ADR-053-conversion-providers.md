@@ -104,6 +104,10 @@ All registered providers are loaded and described at load; models stay cold unti
 runtime selects one capability per task, deterministically: per-task user preference, then
 ProbeOrder (vendor band before the open band), then a stable tie-break; research-only
 licences are considered only after an explicit opt-in that signed installers never write.
+A provider's licence class covers the inference runtime it loads as well as its models, so
+a provider cannot advertise a commercial class over an internal-use runtime; the legacy
+adapter is grandfathered as unknown and exempt, because its module was installed before the
+gate existed.
 **Readiness never reorders selection**: a first choice that is installed, downloading,
 warming or evicted is waited for; a new stream or job falls through to the next candidate
 only when the first choice is absent, disabled or **failed for any reason** (a download the
@@ -209,7 +213,9 @@ An **open-model provider** ships from its own public repository on a standard in
 runtime, with a model-pack manifest (content-addressed blobs, per-backend variants, SPDX
 licence, a commercial flag that is the AND over the model and its dependencies, size, memory
 and warm-up estimates). The model store becomes runtime-owned, adopting the browser's
-existing store and access rules; the host downloads on demand and reports progress through
+existing store and layout but trusting the content hash rather than the stamp, re-hashing
+each blob once per process before it reaches the inference runtime; a store wiped by an
+older uninstaller is re-downloaded, never a latched failure; the host downloads on demand and reports progress through
 the readiness state.
 
 ### 8. The app API grows in place
