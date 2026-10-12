@@ -464,6 +464,29 @@ the service; the guide recommends separate DLLs.
 | CPU signalling | none | 2 ring writes + 2 wakes + a CPU fence observe ≈ 20–60 µs |
 | **Net** | — | **≈ +0.05 ms CPU, one fewer GPU copy**, against a 20–175 ms conversion |
 
+**Measured 2026-10-12 (P1a acceptance, win box: laptop panel, hybrid iGPU + dGPU, the vendor module
+through `dp-lift`, browser 1.7.1, real media).** Released v2.26.0 (A) against `feat/conv-p1a` (B):
+
+| Quantity | A (v2.26.0) | B (`feat/conv-p1a`) |
+|---|---|---|
+| Vendor module activation (ACTIVATING → READY) | 4.3 s | 3.3 s (run-to-run spread ≈ 1 s) |
+| Whole-card VRAM, activation | +565 MiB | +609 MiB |
+| Whole-card VRAM, idle → after the first stream | +2.0 GiB | +1.9 GiB |
+| First result after stream create (CLI probe, SBS photo) | 662 ms | not measured (CLI gating, see #2007) |
+| Stream create → panel in 3D (browser) | 302–322 ms | 310–478 ms |
+| Browser page fps, video / photo | 35 / 22 | 35 / 22 |
+| Present-to-display p50, p95 | 45 / 52–64 ms | 45 / 52–63 ms |
+| Weave GPU time | 1.8–2.0 ms | 1.8–1.9 ms |
+| Service CPU | 25–30 % of a core | 25–31 % |
+| Open depth model in-page (small streaming video-depth model over WebGPU) | 11.6 s to first depth (9.7 s model load), +1.7 GB in the browser GPU process | — (same page, not re-measured cleanly) |
+
+Streams, fallback, 3D on / off and the weave count matched run for run (1 stream per lift, 0 in-page
+fallbacks, ≈ 2,700–3,000 3D weaves per 30 s window). Two baseline facts carried over unchanged: the
+browser destroys a lift stream only at tab close (≈ 11.5 s after lift-off), and the service's
+per-process `GPU Process Memory \ Dedicated Usage` counter grows at ≈ 550–670 MB/s during a live
+stream on both builds while the card's real usage stays flat — a counter artefact or an accounting
+leak in the lift bridge, to be chased separately.
+
 ### 3.8 Failure domains
 
 | Fault in… | In-service (legacy adapter, escape hatch) | Satellite |
@@ -1102,5 +1125,5 @@ into separate DLLs where one worker cannot run both lanes.
 - [ ] the model-store write protocol run by the host under the ACL
 - [x] exit code 13 and type values 340–369 still free at merge — `CLI_SELFTEST_BAD_CONVERSION = 13` is
       the only 13 in `cli_query.h`; no `XR_DXR_*` header uses a type value in 340–369 (lift spec 4 is P3)
-- [ ] measured VRAM and warm-up of one vendor model and one open depth model
+- [x] measured VRAM and warm-up of one vendor model and one open depth model — §3.7 (2026-10-12 panel A/B)
 - [ ] whether the Android APK ships armeabi-v7a
