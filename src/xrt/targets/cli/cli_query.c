@@ -143,6 +143,29 @@ probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *i
 	         infos[0].flags);
 }
 
+//! Drop a trailing INCOMPLETE UTF-8 sequence, so a string cut to a fixed
+//! buffer is still valid UTF-8 (cJSON / any JSON reader rejects a half
+//! character). Plug-in text is arbitrary; never trust its byte length.
+static inline void
+dxr_utf8_trim_partial(char *s)
+{
+	size_t n = strlen(s);
+	size_t i = n;
+	size_t back = 0;
+	while (i > 0 && back < 4 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80) {
+		i--;
+		back++;
+	}
+	if (i == 0) {
+		return;
+	}
+	const unsigned char lead = (unsigned char)s[i - 1];
+	size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+	if (need == 0 || back + 1 < need) {
+		s[i - 1] = '\0'; // a lone or cut-off lead byte (and its tail)
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
 
 /*!
@@ -239,29 +262,6 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
  * to — then lift_get_caps. ABSENCE NEVER FAILS (sim_display, every plug-in
  * without a module: modes 0 passes); only a malformed answer does.
  */
-//! Drop a trailing INCOMPLETE UTF-8 sequence, so a string cut to a fixed
-//! buffer is still valid UTF-8 (cJSON / any JSON reader rejects a half
-//! character). Plug-in text is arbitrary; never trust its byte length.
-static inline void
-dxr_utf8_trim_partial(char *s)
-{
-	size_t n = strlen(s);
-	size_t i = n;
-	size_t back = 0;
-	while (i > 0 && back < 4 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80) {
-		i--;
-		back++;
-	}
-	if (i == 0) {
-		return;
-	}
-	const unsigned char lead = (unsigned char)s[i - 1];
-	size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
-	if (need == 0 || back + 1 < need) {
-		s[i - 1] = '\0'; // a lone or cut-off lead byte (and its tail)
-	}
-}
-
 //! Bounded wait for a fresh probe DP's module to leave ACTIVATING.
 #define CLI_LIFT_SETTLE_NS (8ull * 1000ull * 1000ull * 1000ull)
 #define CLI_LIFT_SETTLE_POLL_NS (250ll * 1000ll * 1000ll)

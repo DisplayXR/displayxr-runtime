@@ -142,7 +142,7 @@ public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, lo
         "too_old" => ("module too old", Level.Warn),
         "unlicensed" => ("module unlicensed", Level.Warn),
         "load_failed" => ("module failed to load", Level.Warn),
-        "disabled" => ("turned off", Level.Plain),
+        "disabled" => ("module turned off", Level.Plain),
         var other => (other, Level.Plain),
     };
 }
