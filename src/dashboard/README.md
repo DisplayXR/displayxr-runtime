@@ -20,7 +20,9 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 **Components** groups what is plugged into the runtime by ROLE, never by product:
 display processors, the workspace controller (its launch hotkey / mode / "Launch now",
 phase 8, hidden when the CLI has no `launch` block), present owners, input providers and
-the rig role, the 2D->3D conversion module, a stereo camera source (only when `info`
+the rig role, the 2D->3D conversion module (`info --json` `lift_caps`, kept for one release), the conversion
+providers with each task's readiness and selection (the status feed's `conv_providers[]` /
+`conv_tasks[]`, ADR-053; shown only when the CLI reports them), a stereo camera source (only when `info`
 reports one) and diagnostics clients. Names are shown verbatim from the components'
 own registration.
 

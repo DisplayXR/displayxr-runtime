@@ -184,6 +184,8 @@ public static class Components
             InputProviders(info),
             Conversion(info),
         };
+        // ADR-053: only from a CLI whose snapshot carries the conversion rows.
+        if (s is { ConvKnown: true }) list.Add(ConversionProviders(s));
         if (StereoCamera(info) is { } cam) list.Add(cam);
         list.Add(ByClass(s, "diagnostics", "Diagnostics clients", DiagClass,
             "Read-only status readers, such as this dashboard's own status feed and the CLI.", collapsed: true));
@@ -377,6 +379,77 @@ public static class Components
         return new ComponentSection("conversion", "Conversion module",
             "A conversion module turns 2D content into 3D (depth, side-by-side, multi-view) as a service any app can ask for.",
             present ? 1 : 0, present ? 1 : 0, l is null ? "not read yet" : present ? "1 available" : "none available", items);
+    }
+
+    /// <summary>The state chip of one task row: READY green, waited-for states blue, terminal states amber.</summary>
+    public static (string Text, Level Level) TaskChip(ConvTask t) => t.State switch
+    {
+        "READY" => ("ready", Level.Ok),
+        "INSTALLED" => ("installed (cold)", Level.Info),
+        "WARMING" => (t.Progress > 0 ? $"warming {Math.Round(t.Progress * 100)}%" : "warming", Level.Info),
+        "DOWNLOADING" => (t.Progress > 0 ? $"downloading {Math.Round(t.Progress * 100)}%" : "downloading", Level.Info),
+        "EVICTED" => ("evicted (idle)", Level.Info),
+        "DISABLED" => ("disabled", Level.Plain),
+        "ABSENT" => ("absent", Level.Plain),
+        "FAILED" when t.Reason == "crash_loop" => ("crash loop", Level.Critical),
+        "FAILED" => ($"failed ({t.Reason})", Level.Warn),
+        "UNLICENSED" => ("unlicensed", Level.Warn),
+        "INCOMPATIBLE" => ("incompatible", Level.Warn),
+        var other => (other.ToLowerInvariant(), Level.Plain),
+    };
+
+    /// <summary>
+    /// ADR-053 conversion providers, from the status snapshot: one row per provider with its
+    /// load / platform state, and one line per task it declares (its readiness and whether
+    /// selection picked it). Provider names are the providers' own registration, verbatim.
+    /// </summary>
+    public static ComponentSection ConversionProviders(StatusSnapshot s)
+    {
+        var items = new List<ComponentItem>();
+        var providers = s.Providers;
+        for (int i = 0; i < providers.Count; i++)
+        {
+            var p = providers[i];
+            bool malformed = p.BadDescriptors > 0;
+            bool usable = p.Enabled && !p.Hidden && !malformed && p.CapCount > 0;
+            var chips = new List<(string, Level)> { (p.Load.Length > 0 ? p.Load : "UNKNOWN", usable ? Level.Ok : Level.Plain) };
+            if (malformed) chips.Add(("malformed", Level.Critical));
+            if (!p.Enabled) chips.Add(("disabled", Level.Plain));
+            if (p.Hidden) chips.Add(("superseded", Level.Plain));
+            if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
+            var lines = new List<string>
+            {
+                string.Join(Sep, new[]
+                {
+                    p.Vendor, p.Version.Length > 0 ? "version " + p.Version : "", p.Id, $"ProbeOrder {p.ProbeOrder}",
+                    p.Hosting.Replace('_', '-'), p.LicenceExempt ? "licence: grandfathered" : "licence " + p.LicenceClass,
+                }.Where(x => x.Length > 0)),
+            };
+            if (malformed) lines.Add($"{Plural(p.BadDescriptors, "capability", "capabilities")} rejected: {p.DescriptorError}");
+            foreach (var t in s.Tasks.Where(t => t.ProviderIndex == i))
+            {
+                var (text, _) = TaskChip(t);
+                string sel = t.Selected ? "selected" : t.Order is null ? t.Verdict : $"#{t.Order + 1} ({t.Verdict})";
+                string load = t.Streams + t.JobsQueued > 0 ? $"{Sep}{t.Streams} streams, {t.JobsQueued} jobs" : "";
+                lines.Add($"{t.Task}{(t.Composed ? " (depth + view synthesis)" : "")}: {text}{Sep}{sel}{load}"
+                          + (t.CpuStaging ? $"{Sep}CPU staging" : ""));
+            }
+            if (p.Hint.Length > 0) lines.Add(p.Hint);
+            var worst = s.Tasks.Where(t => t.ProviderIndex == i).Select(TaskChip).Select(c => c.Level)
+                         .DefaultIfEmpty(Level.Plain).Max();
+            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
+                malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
+                chips, lines));
+        }
+        var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
+        int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
+        return new ComponentSection("conversion_providers", "Conversion providers",
+            "A conversion provider is a plug-in that turns 2D content into depth, views or splats; the runtime picks one per task and every app shares it.",
+            providers.Count, ready,
+            providers.Count == 0 ? "none registered"
+                : $"{Plural(providers.Count, "registered", "registered")}{Sep}{Plural(served.Length, "task", "tasks")} served{Sep}{ready} ready"
+                  + (s.IsService ? "" : $"{Sep}headless describe"),
+            items);
     }
 
     public static ComponentSection? StereoCamera(InfoComponents info)
