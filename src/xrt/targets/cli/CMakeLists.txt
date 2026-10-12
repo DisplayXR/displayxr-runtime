@@ -11,7 +11,7 @@ add_library(cli_query STATIC cli_query.c cli_query.h)
 target_link_libraries(
 	cli_query
 	PUBLIC xrt-interfaces
-	PRIVATE aux_util aux_os target_lists xrt-external-cjson
+	PRIVATE aux_util aux_os target_lists xrt-external-cjson displayxr::conversion_core
 	)
 target_include_directories(cli_query PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -54,6 +54,8 @@ add_executable(
 	cli_cmd_workspace.c
 	cli_cmd_lift.cpp
 	cli_cmd_camera.c
+	cli_cmd_conv.cpp
+	cli_lift_service.c
 	cli_common.h
 	cli_main.c
 	)
@@ -96,6 +98,9 @@ target_link_libraries(
 		xrt-external-cjson
 		# Display dashboard phase 8: `workspace list|set|reset|launch`.
 		target_workspace_config
+		# ADR-053 (#2006): `conv list|status` runs the conversion core's
+		# selection headless (conv_select.h names, policy resolution).
+		displayxr::conversion_core
 	)
 
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).

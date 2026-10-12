@@ -66,6 +66,10 @@ cli_print_help(int argc, const char **argv)
 	P("  lift <...>        - 2D->3D conversion module (XR_DXR_lift, ADR-042), over IPC (DIAG).\n");
 	P("                      'lift caps [--json]', 'lift probe <image|frames_dir> [--mode depth|sbs|\n");
 	P("                      nview|gaussians] [--n N]' (Windows) — writes lift_out_<i>.png/.ply.\n");
+	P("  conv <...>        - Conversion providers (ADR-053): 'conv list|status [--json]',\n");
+	P("                      'conv status --watch', 'conv warm <task>|<id>[/<cap>]', 'conv enable|disable\n");
+	P("                      <id> [--machine]', 'conv use <task> <id>' / 'conv reset <task>|all',\n");
+	P("                      'conv models list|prune'. Reads the service over DIAG, else headless.\n");
 	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
@@ -130,6 +134,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "lift") == 0) {
 		return cli_cmd_lift(argc, argv);
+	}
+	if (strcmp(argv[1], "conv") == 0) {
+		return cli_cmd_conv(argc, argv);
 	}
 	if (strcmp(argv[1], "camera") == 0) {
 		return cli_cmd_camera(argc, argv);

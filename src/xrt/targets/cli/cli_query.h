@@ -26,6 +26,7 @@
 #include "xrt/xrt_display_zones.h"
 #include "xrt/xrt_dp_lift.h"
 #include "xrt/xrt_screen.h"
+#include "xrt/xrt_display_status.h" // ADR-053 conversion provider rows
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -136,6 +137,19 @@ enum cli_selftest_result
 	 * cameras is the state of almost every box.
 	 */
 	CLI_SELFTEST_BAD_STEREO_CAMERA = 12,
+
+	/*!
+	 * A registered conversion provider (ADR-053) described a MALFORMED
+	 * capability: unknown task, lanes 0 / unknown lane bit, min_views >
+	 * max_views or > 8, VIEWS_* without EXPLICIT_VIEWPOINTS, an unknown
+	 * licence class, a duplicate / zero cap_id, a failing describe_cap, or a
+	 * get_state answer out of range (spec §7.2). ABSENCE NEVER FAILS: no
+	 * provider registered, a provider that declines its probe, or one the
+	 * loader rejects (ABI, missing binary) all pass — they are reported, not
+	 * failed. The check enumerates, negotiates, probes and describes; it never
+	 * warms (no model load).
+	 */
+	CLI_SELFTEST_BAD_CONVERSION = 13,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -316,6 +330,22 @@ struct cli_query_result
 	bool lift_caps_malformed;
 	char lift_probe_note[160];
 	struct xrt_dp_lift_caps lift_caps;
+
+	/* ADR-053 `conversion_providers` check (#2006): enumerate -> negotiate ->
+	 * probe -> describe (target_conv_status), NO model load. Absence never
+	 * fails; only a malformed descriptor does (CLI_SELFTEST_BAD_CONVERSION).
+	 * `conv_count` is the provider rows (registered providers + the static
+	 * dp-lift row when the active plug-in has the lift-only factory). */
+	bool conv_evaluated;
+	uint32_t conv_count;
+	uint32_t conv_registered;
+	uint32_t conv_negotiated;
+	uint32_t conv_malformed_rows;
+	uint32_t conv_bad_descriptors;
+	uint32_t conv_task_count;
+	bool conv_dp_lift_declared;
+	char conv_note[256];
+	struct xrt_status_conv_provider conv_providers[XRT_STATUS_MAX_CONV_PROVIDERS];
 
 	/* Input-provider checks (ADR-034 / #823). Absence never fails: with
 	 * no provider registered — or the ForceQwerty override set, or the
@@ -581,6 +611,35 @@ cli_query_info_to_cjson(const struct cli_query_result *r);
 
 cJSON *
 cli_query_selftest_to_cjson(const struct cli_query_result *r);
+
+/*!
+ * The XR_DXR_lift (ADR-042) caps contract: true when @p caps is malformed
+ * (unknown mode bits, a state out of range, a READY module with no streams,
+ * an NVIEW module with < 2 views, unknown depth semantics).
+ */
+bool
+cli_query_lift_caps_malformed(const struct xrt_dp_lift_caps *caps);
+
+/*!
+ * Record live lift caps in @p r (probed = true, the malformed verdict, a note
+ * naming @p source) and, when malformed and nothing failed before, set
+ * CLI_SELFTEST_BAD_LIFT_CAPS. The CLI calls it with the running service's
+ * caps (a DIAG `lift_get_properties`) -- the headless pass itself never
+ * instantiates a lift module (the WARP probe was retired, ADR-053 §7.1).
+ */
+void
+cli_query_set_lift_caps(struct cli_query_result *r, const struct xrt_dp_lift_caps *caps, const char *source);
+
+struct target_conv_status;
+
+/*!
+ * ADR-053 (#2006): record a conversion pass (target_conv_status) in @p r --
+ * the `conversion_providers` check's counts, rows and note -- and, when it
+ * found a malformed descriptor and nothing failed before, set
+ * CLI_SELFTEST_BAD_CONVERSION (exit 13). Absence never fails.
+ */
+void
+cli_query_apply_conversion(struct cli_query_result *r, const struct target_conv_status *st);
 
 void
 cli_query_print_info_text(const struct cli_query_result *r);

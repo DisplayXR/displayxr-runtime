@@ -32,6 +32,7 @@
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
 #include "util/u_screen_info.h" // multi-screen M1 per-screen info
+#include "util/u_status_snapshot.h" // ADR-053 conversion provider row JSON
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h" // #1201 DPI awareness reporting
 #endif
@@ -41,12 +42,14 @@
 #include "target_input_plugin_loader.h"
 #include "target_builder_input_provider.h"
 #include "target_input_arbiter.h"
+#include "target_conv_status.h" // ADR-053 selftest `conversion_providers` (#2006)
 
 #include <cjson/cJSON.h>
 
 #include <math.h> // #1380 isfinite() over the sampled rig poses
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h> // calloc (conversion status)
 #include <string.h>
 
 #ifdef XRT_OS_WINDOWS
@@ -254,103 +257,105 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 	ID3D11Device_Release(device);
 }
 
-/*!
- * ADR-042 — headless lift-caps probe (XR_DXR_lift). Same shape as the zone
- * probe: a WARP device, the plug-in's LIFT-ONLY factory when it has one
- * (xrt_plugin_iface::create_dp_d3d11_lift, struct_size-gated) — else its
- * ordinary factory with a NULL window, which is what the service falls back
- * to — then lift_get_caps. ABSENCE NEVER FAILS (sim_display, every plug-in
- * without a module: modes 0 passes); only a malformed answer does.
+#endif // XRT_OS_WINDOWS (the zone probe above)
+
+/*
+ * ADR-042 lift caps. The headless WARP probe (`probe_lift_caps_d3d11`, which
+ * instantiated a SECOND copy of the vendor module and waited up to 8 s) is
+ * retired by ADR-053 §7.1: the CLI never loads a second model instance. The
+ * headless pass reports the static `dp-lift` row (target_conv_status); live
+ * caps come from the running service (cli_query_lift_caps_from_service, in the
+ * CLI executable) through the same `lift_caps` shape.
  */
-//! Bounded wait for a fresh probe DP's module to leave ACTIVATING.
-#define CLI_LIFT_SETTLE_NS (8ull * 1000ull * 1000ull * 1000ull)
-#define CLI_LIFT_SETTLE_POLL_NS (250ll * 1000ll * 1000ll)
-
-static void
-probe_lift_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
+bool
+cli_query_lift_caps_malformed(const struct xrt_dp_lift_caps *caps)
 {
-	xrt_dp_factory_d3d11_fn_t factory = iface->create_dp_d3d11;
-	const char *which = "ordinary";
-	if (iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_lift) +
-	                               sizeof(iface->create_dp_d3d11_lift) &&
-	    iface->create_dp_d3d11_lift != NULL) {
-		factory = iface->create_dp_d3d11_lift;
-		which = "lift-only";
-	}
-	if (factory == NULL) {
-		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note), "not probed: no D3D11 DP factory (OK)");
-		return;
-	}
-
-	ID3D11Device *device = NULL;
-	ID3D11DeviceContext *context = NULL;
-	D3D_FEATURE_LEVEL fl;
-	HRESULT hr =
-	    D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &fl, &context);
-	if (FAILED(hr) || device == NULL || context == NULL) {
-		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
-		         "not probed: WARP D3D11 device creation failed (0x%08lx, OK)", (unsigned long)hr);
-		if (context != NULL) {
-			ID3D11DeviceContext_Release(context);
-		}
-		if (device != NULL) {
-			ID3D11Device_Release(device);
-		}
-		return;
-	}
-
-	struct xrt_display_processor_d3d11 *xdp = NULL;
-	xrt_result_t xret = factory(device, context, NULL, &xdp);
-	if (xret != XRT_SUCCESS || xdp == NULL) {
-		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
-		         "not probed: %s D3D11 DP factory declined (xret=%d, OK)", which, (int)xret);
-		ID3D11DeviceContext_Release(context);
-		ID3D11Device_Release(device);
-		return;
-	}
-
-	struct xrt_dp_lift_caps caps;
-	bool got = xrt_display_processor_d3d11_has_lift(xdp) && xrt_display_processor_d3d11_lift_get_caps(xdp, &caps);
-	// This probe's DP is fresh, so a module that loads asynchronously starts out
-	// ACTIVATING here even when the service's copy is long READY. Give it a
-	// bounded moment to settle, or `info` reports a state no app ever sees.
-	const uint64_t settle_t0 = os_monotonic_get_ns();
-	while (got && caps.state == XRT_DP_LIFT_STATE_ACTIVATING &&
-	       os_monotonic_get_ns() - settle_t0 < CLI_LIFT_SETTLE_NS) {
-		os_nanosleep(CLI_LIFT_SETTLE_POLL_NS);
-		got = xrt_display_processor_d3d11_lift_get_caps(xdp, &caps);
-	}
-	if (!got) {
-		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
-		         "no conversion module (modes 0) via the %s factory (OK)", which);
-	} else {
-		r->lift_caps_probed = true;
-		r->lift_caps = caps;
-		const uint32_t known = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW |
-		                       XRT_DP_LIFT_MODE_GAUSSIANS;
-		bool malformed = (caps.modes & ~known) != 0 || caps.state > XRT_DP_LIFT_STATE_READY ||
-		                 (caps.modes != 0 && caps.state == XRT_DP_LIFT_STATE_READY && caps.max_streams == 0) ||
-		                 ((caps.modes & XRT_DP_LIFT_MODE_NVIEW) != 0 && caps.max_views < 2) ||
-		                 caps.depth_semantics > XRT_DP_LIFT_DEPTH_METRIC;
-		r->lift_caps_malformed = malformed;
-		snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
-		         "%smodes=0x%x state=%u streams=%u views=%u depth=%s latency=%.1fms backend='%s' (%s factory)",
-		         malformed ? "MALFORMED caps: " : "", caps.modes, caps.state, caps.max_streams, caps.max_views,
-		         caps.depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
-		         (double)caps.typical_latency_ns / 1e6, caps.backend, which);
-		// Version + detail travel in their own fields (module_version / module_detail);
-		// the note only names the status, so it never truncates mid-sentence.
-		const char *ms = xrt_dp_lift_module_status_str(caps.module_status);
-		if (ms != NULL) {
-			const size_t used = strlen(r->lift_probe_note);
-			snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s", ms);
-		}
-	}
-
-	xrt_display_processor_d3d11_destroy(&xdp);
-	ID3D11DeviceContext_Release(context);
-	ID3D11Device_Release(device);
+	const uint32_t known =
+	    XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW | XRT_DP_LIFT_MODE_GAUSSIANS;
+	return (caps->modes & ~known) != 0 || caps->state > XRT_DP_LIFT_STATE_READY ||
+	       (caps->modes != 0 && caps->state == XRT_DP_LIFT_STATE_READY && caps->max_streams == 0) ||
+	       ((caps->modes & XRT_DP_LIFT_MODE_NVIEW) != 0 && caps->max_views < 2) ||
+	       caps->depth_semantics > XRT_DP_LIFT_DEPTH_METRIC;
 }
+
+void
+cli_query_set_lift_caps(struct cli_query_result *r, const struct xrt_dp_lift_caps *caps, const char *source)
+{
+	r->lift_caps_probed = true;
+	r->lift_caps = *caps;
+	const bool malformed = cli_query_lift_caps_malformed(caps);
+	r->lift_caps_malformed = malformed;
+	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+	         "%smodes=0x%x state=%u streams=%u views=%u depth=%s latency=%.1fms backend='%s' (%s)",
+	         malformed ? "MALFORMED caps: " : "", caps->modes, caps->state, caps->max_streams, caps->max_views,
+	         caps->depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
+	         (double)caps->typical_latency_ns / 1e6, caps->backend, source != NULL ? source : "?");
+	// Version + detail travel in their own fields; the note only names the status.
+	const char *ms = xrt_dp_lift_module_status_str(caps->module_status);
+	if (ms != NULL) {
+		const size_t used = strlen(r->lift_probe_note);
+		snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s", ms);
+	}
+	if (malformed && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_LIFT_CAPS;
+	}
+}
+
+/*!
+ * ADR-053 `conversion_providers` (#2006): the headless pass, then the verdict.
+ * Absence never fails; a malformed descriptor is CLI_SELFTEST_BAD_CONVERSION.
+ */
+static void
+probe_conversion_providers(struct cli_query_result *r, const struct xrt_plugin_iface *active)
+{
+	struct target_conv_status *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "not evaluated: out of memory");
+		return;
+	}
+	target_conv_status_build_headless(active, st);
+	cli_query_apply_conversion(r, st);
+	free(st);
+}
+
+void
+cli_query_apply_conversion(struct cli_query_result *r, const struct target_conv_status *st)
+{
+	r->conv_evaluated = true;
+	r->conv_count = st->provider_count;
+	r->conv_registered = st->registered;
+	r->conv_negotiated = st->negotiated;
+	r->conv_malformed_rows = st->malformed_rows;
+	r->conv_bad_descriptors = st->bad_descriptors;
+	r->conv_task_count = st->task_count;
+	r->conv_dp_lift_declared = st->dp_lift_declared;
+	memcpy(r->conv_providers, st->providers, sizeof(r->conv_providers));
+
+	if (st->bad_descriptors > 0) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "MALFORMED descriptor (%u): %s", st->bad_descriptors,
+		         st->bad_note);
+	} else if (st->registered == 0) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "no conversion provider registered (OK); %s",
+		         st->dp_lift_note);
+	} else {
+		snprintf(r->conv_note, sizeof(r->conv_note),
+		         "%u registered, %u negotiated, %u provider row%s, %u task row%s, %u malformed registry row%s",
+		         st->registered, st->negotiated, st->provider_count, st->provider_count == 1 ? "" : "s",
+		         st->task_count, st->task_count == 1 ? "" : "s", st->malformed_rows,
+		         st->malformed_rows == 1 ? "" : "s");
+	}
+
+	// The lift_caps row reads the dp-lift row headless (no module instantiated).
+	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note), "%s; live caps come from the service",
+	         st->dp_lift_note);
+
+	// Absence never fails; a malformed descriptor does (when nothing failed before).
+	if (r->conv_bad_descriptors > 0 && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_CONVERSION;
+	}
+}
+
+#ifdef XRT_OS_WINDOWS
 
 //! Pack a Windows LUID the way Vulkan reports deviceLUID (raw bytes, LowPart
 //! first) — the same packing @ref d3d_scanout_adapter_luid returns, so the two
@@ -1846,16 +1851,15 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	if (r->zone_caps_malformed) {
 		r->result_code = CLI_SELFTEST_BAD_ZONE_CAPS;
 	}
-	// ADR-042 — lift caps. Absence never fails; only malformed caps do.
-	probe_lift_caps_d3d11(r, iface);
-	if (r->lift_caps_malformed && r->result_code == CLI_SELFTEST_PASS) {
-		r->result_code = CLI_SELFTEST_BAD_LIFT_CAPS;
-	}
 #else
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
-	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
-	         "not probed: the lift module is a D3D11-service feature (Windows-only); modes 0 (OK)");
 #endif
+
+	// ADR-053 (#2006) — conversion providers: enumerate, negotiate, probe,
+	// describe; never warm. Absence never fails; only a malformed descriptor
+	// does. Also fills the headless lift_caps note from the static dp-lift row
+	// (ADR-042 lift_caps / exit 11 now read live caps from the service only).
+	probe_conversion_providers(r, iface);
 
 	// ADR-043 — stereo camera slots. Absence never fails; only a camera the
 	// plug-in describes out of contract flips the verdict.
@@ -2340,9 +2344,19 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 	}
 
-	P(" :: 2D->3D conversion module (XR_DXR_lift / ADR-042, headless D3D11 WARP probe)\n");
+	P(" :: 2D->3D conversion module (XR_DXR_lift / ADR-042; live caps from the service, else the static dp-lift row)\n");
 	PT("%s\n", r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+	P(" :: Conversion providers (ADR-053; headless describe, no model load)\n");
+	PT("%s\n", r->conv_note[0] != '\0' ? r->conv_note : "not evaluated");
+	for (uint32_t i = 0; i < r->conv_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
+		const struct xrt_status_conv_provider *cp = &r->conv_providers[i];
+		PT("  %-16s %-14s order %3u  caps %u%s%s\n", cp->id, cp->load, cp->probe_order, cp->cap_count,
+		   cp->enabled ? "" : "  (disabled)", cp->hidden ? "  (hidden)" : "");
+	}
 }
+
+static void
+add_conversion_providers_json(cJSON *root, const struct cli_query_result *r);
 
 cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
@@ -2672,6 +2686,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		}
 	}
 
+	// ADR-053 (#2006) conversion providers (same object as selftest --json).
+	add_conversion_providers_json(root, r);
+
 	// #224 / ADR-027 P4 zone-caps probe.
 	{
 		cJSON *zc = cJSON_AddObjectToObject(root, "zone_caps");
@@ -2867,6 +2884,29 @@ struct check
 };
 
 /*!
+ * ADR-053 (#2006): `conversion_providers` in `selftest --json` (CI gates on
+ * `count`) and `info --json`. Provider rows use the status snapshot's shape.
+ */
+static void
+add_conversion_providers_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *cp = cJSON_AddObjectToObject(root, "conversion_providers");
+	cJSON_AddBoolToObject(cp, "evaluated", r->conv_evaluated);
+	cJSON_AddNumberToObject(cp, "count", (double)r->conv_count);
+	cJSON_AddNumberToObject(cp, "registered", (double)r->conv_registered);
+	cJSON_AddNumberToObject(cp, "negotiated", (double)r->conv_negotiated);
+	cJSON_AddNumberToObject(cp, "malformed_rows", (double)r->conv_malformed_rows);
+	cJSON_AddNumberToObject(cp, "bad_descriptors", (double)r->conv_bad_descriptors);
+	cJSON_AddNumberToObject(cp, "task_rows", (double)r->conv_task_count);
+	cJSON_AddBoolToObject(cp, "dp_lift_declared", r->conv_dp_lift_declared);
+	cJSON_AddStringToObject(cp, "note", r->conv_note);
+	cJSON *arr = cJSON_AddArrayToObject(cp, "providers");
+	for (uint32_t i = 0; i < r->conv_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
+		cJSON_AddItemToArray(arr, u_status_conv_provider_to_cjson(&r->conv_providers[i]));
+	}
+}
+
+/*!
  * Display dashboard phase 0 (ADR-051 `NO_PHYSICAL_SIZE`): count the screens
  * claimed at VERIFIED confidence and those among them that resolved to 0 m.
  * Returns the number missing metres; pure over @p r, so the check row, the
@@ -3004,6 +3044,14 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->ok = !r->lift_caps_malformed;
 	snprintf(c->detail, sizeof(c->detail), "%s",
 	         r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+
+	// ADR-053 (#2006) — conversion providers. ABSENCE NEVER FAILS: no provider
+	// registered, a declined probe or a loader reject pass; only a malformed
+	// descriptor fails (BAD_CONVERSION, exit 13).
+	c = &out[n++];
+	c->name = "conversion_providers";
+	c->ok = r->conv_bad_descriptors == 0;
+	snprintf(c->detail, sizeof(c->detail), "%s", r->conv_note[0] != '\0' ? r->conv_note : "not evaluated");
 
 	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
 	// stays true with no provider registered, ForceQwerty set, every
@@ -3156,6 +3204,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 	add_plugin_states_json(root, r);
+	add_conversion_providers_json(root, r);
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 
