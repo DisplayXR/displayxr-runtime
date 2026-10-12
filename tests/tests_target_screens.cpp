@@ -421,7 +421,9 @@ TEST_CASE("EDID unreadable on an output never seen before gets the ??? key")
 	xrt_display_descriptor b[1]{};
 	REQUIRE(target_plugin_build_descriptors(&edid, b, 1) == 1);
 	lose_edid(edid.monitors[0]);
-	edid.monitors[0].screen_left = 0;
+	// Not 0: on Windows the key's device suffix is the GDI name of whatever
+	// real monitor sits at the origin, and CI's runner has one at (0,0).
+	edid.monitors[0].screen_left = 9000;
 	xrt_display_descriptor c[1]{};
 	REQUIRE(target_plugin_build_descriptors(&edid, c, 1) == 1);
 	CHECK(c[0].monitor_id != b[0].monitor_id);
