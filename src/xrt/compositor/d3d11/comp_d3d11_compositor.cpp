@@ -2861,8 +2861,31 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 * one-frame lag the single-DP split weave has.
 	 */
 	bool seg_split = false;
+	/*
+	 * #1883: the window placement THIS weave partitions with, read once, here
+	 * — after the late-weave pace, the instant before the DPs weave — and used
+	 * for the whole table, its publish and the canvas. c->seg_window is the
+	 * read at the commit's start (before the pace) or, for a repaint, the last
+	 * app frame's: during a drag the seam it puts in the back buffer is where
+	 * the window was, and the neighbour's woven pixels showed across it. The
+	 * D3D11 service and D3D12 paths already read the live rect at the weave.
+	 */
+	struct comp_seg_rect seg_win = c->seg_window;
 	if (!zero_copy && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
 	    atlas_srv != nullptr) {
+		HWND seg_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		RECT cr = {};
+		POINT origin = {0, 0};
+		struct comp_seg_rect live = {};
+		const bool have_live = seg_hwnd != nullptr && GetClientRect(seg_hwnd, &cr) && cr.right > 0 &&
+		                       cr.bottom > 0 && ClientToScreen(seg_hwnd, &origin);
+		if (have_live) {
+			live.x = origin.x;
+			live.y = origin.y;
+			live.w = (uint32_t)cr.right;
+			live.h = (uint32_t)cr.bottom;
+		}
+		(void)comp_segments_latch_window(&c->seg_window, have_live ? &live : nullptr, &seg_win);
 		if (c->seg_rebuild || c->segments == nullptr) {
 			// The app thread reads c->segments for eyes (M3): swap under the lock.
 			std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -2902,10 +2925,10 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			}
 		}
 		if (comp_d3d11_segments_enabled(c->segments)) {
-			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
+			const struct comp_seg_rect canvas = {0, 0, seg_win.w, seg_win.h};
 			const uint32_t mode_index =
 			    (c->xdev != nullptr && c->xdev->hmd != nullptr) ? c->xdev->hmd->active_rendering_mode_index : 0;
-			seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, d3d11_out_context(c),
+			seg_split = comp_d3d11_segments_update(c->segments, &seg_win, &canvas, d3d11_out_context(c),
 			                                       mode_index);
 			// Every segment DP follows the session's 2D/3D mode, like the primary.
 			comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
@@ -2921,8 +2944,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		struct xrt_segment_metrics m;
 		memset(&m, 0, sizeof(m));
 		if (seg_split) {
-			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
-			(void)comp_d3d11_segments_get_metrics(c->segments, &c->seg_window, &canvas,
+			const struct comp_seg_rect canvas = {0, 0, seg_win.w, seg_win.h};
+			(void)comp_d3d11_segments_get_metrics(c->segments, &seg_win, &canvas,
 			                                      c->display_processor != nullptr, &m);
 		}
 		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -2949,8 +2972,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.target_height = target_height;
 		sf.canvas.x = 0;
 		sf.canvas.y = 0;
-		sf.canvas.w = c->seg_window.w;
-		sf.canvas.h = c->seg_window.h;
+		sf.canvas.w = seg_win.w;
+		sf.canvas.h = seg_win.h;
 		sf.content = weave_content; // #1883: crop where the views were painted
 		sf.transparent_background = c->transparent_background;
 		sf.atlas_encoding = -1; // the in-process D3D11 path declares none to the primary either

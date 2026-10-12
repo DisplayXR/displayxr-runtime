@@ -831,3 +831,19 @@ comp_segments_content_ring_get(const struct comp_segments_content_ring *r,
 	*out = r->content[i];
 	return true;
 }
+
+bool
+comp_segments_latch_window(const struct comp_seg_rect *committed,
+                           const struct comp_seg_rect *live,
+                           struct comp_seg_rect *out)
+{
+	if (out == NULL || committed == NULL) {
+		return false;
+	}
+	if (live == NULL || live->w == 0 || live->h == 0 || live->w != committed->w || live->h != committed->h) {
+		*out = *committed;
+		return false;
+	}
+	*out = *live;
+	return true;
+}
