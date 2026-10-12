@@ -192,7 +192,9 @@ Borrowed from the vendor dashboard and binding on every renderer:
 ### D6 — Topology changes are events on every platform
 
 Windows: the service already re-probes on `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE`; that
-path now also bumps `topology_gen`. Linux: the existing DRM poll. macOS: the CoreGraphics
+path now also bumps `topology_gen` — when the re-probe changed the screen table or the
+active plug-in; a re-probe that finds nothing moved (the fallback plug-in's 10 s timer,
+most of the time) is not a topology event. Linux: the existing DRM poll. macOS: the CoreGraphics
 reconfiguration callback. The vendor plug-in may bump its `change_counter` from its own
 events; the runtime does not depend on it and keeps the 2 s floor, because at least one
 vendor runtime never raises its topology event on Windows today.

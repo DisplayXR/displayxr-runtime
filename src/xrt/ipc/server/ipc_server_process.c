@@ -955,6 +955,10 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 	}
 	U_LOG_I("display re-probe (%s): re-evaluating display-processor selection.", reason != NULL ? reason : "?");
 	const bool was_fallback = s->xsysc->info.active_plugin_is_fallback;
+	// ADR-051 D6: what a topology bump below is judged against.
+	const uint64_t gen_before = xrt_instance_get_display_generation(s->xinst);
+	char plugin_before[sizeof(s->xsysc->info.active_plugin_id)];
+	(void)snprintf(plugin_before, sizeof(plugin_before), "%s", s->xsysc->info.active_plugin_id);
 	// Display dashboard phase 7: a per-screen DP preference may have been
 	// written since this process read the stores (`dp use --screen`, the
 	// dashboard) — re-read them before re-resolving.
@@ -980,9 +984,18 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 		free(list);
 	}
 #endif
-	// ADR-051 D6: a world-event re-probe is a topology event (the next status
-	// read rebuilds the snapshot).
-	ipc_server_status_bump(s, true);
+	// ADR-051 D6: a re-probe is a topology event only when it changed the
+	// topology — the published screen table (its generation moved) or the
+	// active plug-in. The fallback timer re-probes every 10 s while the
+	// fallback plug-in is active; bumping unconditionally made every status
+	// watcher refetch an identical snapshot every 10 s. Anything else a
+	// status read can see move is caught by the status tick's own keys.
+	const bool screens_moved = xrt_instance_get_display_generation(s->xinst) != gen_before;
+	const bool plugin_moved = strncmp(plugin_before, s->xsysc->info.active_plugin_id, sizeof(plugin_before)) != 0 ||
+	                          was_fallback != s->xsysc->info.active_plugin_is_fallback;
+	if (screens_moved || plugin_moved) {
+		ipc_server_status_bump(s, true);
+	}
 	if (was_fallback && !s->xsysc->info.active_plugin_is_fallback) {
 		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",
 		        reason != NULL ? reason : "?", s->xsysc->info.active_plugin_id);
