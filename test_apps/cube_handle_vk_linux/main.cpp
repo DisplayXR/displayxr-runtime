@@ -54,6 +54,11 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
+
+// dxr::CursorDepth - XR_DXR_cursor_depth bookkeeping (ADR-046). Scripted only
+// here (DISPLAYXR_CURSOR_DEPTH_UV), see InitializeOpenXR and the main loop.
+#include "cursor_depth.h"
 
 // displayxr-common: remap GL-convention clip-depth ([-1,1]) to Vulkan's [0,1].
 // mat4_from_xr_fov (== the Windows ProjectionFromXrFov) emits GL depth; without
@@ -2001,6 +2006,11 @@ struct AppXrSession {
     // window handle + display info + view poses), returning render-ready views.
     bool hasViewRig = false;
 
+    // XR_DXR_cursor_depth (ADR-046): enabled only for a scripted cursor
+    // (DISPLAYXR_CURSOR_DEPTH_UV), see InitializeOpenXR.
+    bool hasCursorDepthExt = false;
+    uint32_t cursorDepthSpecVersion = 0;
+
     // Which window backend (and therefore which binding extension) this run
     // resolved to. Set by InitializeOpenXR from --backend / DXR_WINDOW_BACKEND
     // + what the runtime advertises; consumed when the window is created.
@@ -2020,6 +2030,36 @@ struct AppXrSession {
     bool haveCurrentMode = false;
     XrDisplayRenderingModeInfoDXR modes[kMaxModes] = {};
 };
+
+// XR_DXR_cursor_depth (ADR-046): the app owns the depth - "ray -> first cube
+// hit" - and dxr::CursorDepth does the rest (footprint rays from the previous
+// locate's outer views, the hint / draw-request structs on xrLocateViews).
+// Slab test against the cube as the renderer places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+// Same as cube_handle_vk_macos.
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
+{
+    const float size = kVirtualDisplayHeight / 4.0f; // the renderer's cubeSize
+    const float c = cosf(rot), s = sinf(rot), h = size * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
 
 static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend) {
     LOG_INFO("Initializing OpenXR...");
@@ -2054,6 +2094,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         }
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
             hasWeave = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
         }
     }
 
@@ -2129,6 +2172,22 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         LOG_INFO("XR_DXR_weave: AVAILABLE (enabled for the drag-time phase snap)");
     } else {
         LOG_INFO("XR_DXR_weave: NOT FOUND — window drags will not be phase-snapped");
+    }
+
+    // XR_DXR_cursor_depth (ADR-046 Amendment 2 B): the runtime draws a
+    // depth-aware cursor. Linux has no live-pointer adapter in this app yet,
+    // so it is enabled only for a SCRIPTED cursor (DISPLAYXR_CURSOR_DEPTH_UV=u,v,
+    // headless capture of the runtime's cursor draw); DISPLAYXR_CURSOR_DEPTH=0
+    // opts out even then. Spec v5+ (the runtime draws).
+    {
+        const char *uv = getenv("DISPLAYXR_CURSOR_DEPTH_UV");
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (uv != nullptr && !(opt != nullptr && strcmp(opt, "0") == 0) && xr.cursorDepthSpecVersion >= 5) {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+            xr.hasCursorDepthExt = true;
+        }
+        LOG_INFO("XR_DXR_cursor_depth: %s (v%u)",
+                 xr.hasCursorDepthExt ? "ENABLED (scripted cursor, runtime draws)" : "off", xr.cursorDepthSpecVersion);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -3103,6 +3162,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    // XR_DXR_cursor_depth (ADR-046): a scripted cursor the runtime draws in
+    // its default look. enable(0) (extension off) leaves the helper inert: no
+    // structs on xrLocateViews. No platform adapter is set, so the OS cursor
+    // is never touched.
+    dxr::CursorDepth cursor;
+    cursor.enable(xr.hasCursorDepthExt ? xr.cursorDepthSpecVersion : 0);
+    cursor.setCursorHeight(0.04f); // fraction of canvas height, as the macOS cubes
+    cursor.setRayCast([&vkRenderer](const dxr::CursorRay &r) -> std::optional<float> {
+        float t;
+        return RayHitCube(r.origin, r.dir, vkRenderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+    });
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) {
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
+    }
+    // DISPLAYXR_CURSOR_DEPTH_SIZE_M=<metres>: the default look drawn at that
+    // height on the panel instead of the OS cursor's (a bigger arrow for
+    // measuring the draw in a capture).
+    if (const char *sz = getenv("DISPLAYXR_CURSOR_DEPTH_SIZE_M")) {
+        const float m = strtof(sz, nullptr);
+        if (m > 0.0f) cursor.setSprite(XR_NULL_HANDLE, {0.0f, 0.0f}, m);
+    }
+
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
     LOG_INFO("Keys: [V] Mode  [0-8] Mode N%s",
              g_window.backend() == DxrWindowBackend::Wayland ? "  [Esc/Q] Quit" : "");
@@ -3221,8 +3303,19 @@ int main(int argc, char** argv) {
                         locateInfo.next = &displayRig;
                     }
 
+                    // XR_DXR_cursor_depth: the hint / draw request on the
+                    // locate (inert when the extension is off).
+                    cursor.chain(locateInfo, viewState);
+
                     std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
+                    if (cursor.enabled() && XR_SUCCEEDED(locResult)) {
+                        // Remembers the views for next frame's footprint rays.
+                        const uint32_t live = (activity.activeViewCount > 0 && activity.activeViewCount < viewCount)
+                                                  ? activity.activeViewCount
+                                                  : viewCount;
+                        cursor.afterLocate(views.data(), live);
+                    }
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
