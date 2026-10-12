@@ -24,6 +24,27 @@
  *  - per stream, for xrAcquireLiftResultDXR: a client-facing export texture +
  *    fence on the service device (the weave output pattern).
  *
+ * ## The conversion core (ADR-053 P1a, #2003)
+ *
+ * The lift thread is also where the conversion core's `dp-lift` provider
+ * (conversion/conv_provider_legacy_dp.h) runs: the provider's exec thread
+ * hands each of its [S] calls to this thread as a command
+ * (d3d11_lift_get_dp_backend) and waits, so the vendor module keeps its one
+ * thread and there is one module instance per service. The pre-core path
+ * (the streams below) is a branch inside the same thread, kept until P1b for
+ * what the v3 routing rule still lets fall through.
+ *
+ * The same file carries the core's D3D11 GLUE on the service device
+ * (d3d11_lift_glue_*): runtime image allocation (shared NT-handle textures +
+ * keyed mutex), the v3 route's import / export, the depth readback for S6 /
+ * S7 and the reference view synthesis for S5. The weave path's submit / pin
+ * calls below take core-routed stream ids (D3D11_LIFT_CORE_STREAM_TAG) too,
+ * through the bridge the IPC layer installs (d3d11_lift_set_core_bridge).
+ *
+ * Eyes (G7): the lift thread never calls back into the compositor; the
+ * service publishes the panel's predicted eyes (d3d11_lift_publish_eyes) from
+ * where it reads them, and producers refresh a stale snapshot first.
+ *
  * ## Threads and locks
  *
  *  - `mtx` (inside d3d11_lift) guards the stream table and every mailbox. It is
@@ -46,6 +67,10 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_lift.h"
 
+#include "conversion/conv_pipeline.h"
+#include "conversion/conv_provider_legacy_dp.h"
+#include "conversion/conv_stream.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -54,6 +79,10 @@
 #include <stdint.h>
 
 struct d3d11_lift;
+struct conv_core;
+
+//! Set in every v3 stream id the conversion core route minted (== IPC_SERVER_CONV_STREAM_TAG).
+#define D3D11_LIFT_CORE_STREAM_TAG (1ull << 62)
 
 //! One acquired texture result (xrAcquireLiftResultDXR).
 struct d3d11_lift_result_info
@@ -129,7 +158,22 @@ struct d3d11_lift_pin
 	bool relief_valid;
 	float relief_scale;
 	float relief_offset;
+
+	//! #2003: a result of a core-routed stream (its ring slot stays pinned in
+	//! the core until d3d11_lift_unpin).
+	bool core;
+	uint64_t core_id;
+	uint32_t core_ring_slot;
 };
+
+/*!
+ * Re-resolve the plug-in's factory pair (G5): its LIFT-ONLY factory
+ * (xrt_plugin_iface::create_dp_d3d11_lift) and, from the SAME plug-in, its
+ * ordinary D3D11 factory as the fallback (used with a NULL window when there
+ * is no lift-only one). Called at every activation attempt and by the
+ * provider's snapshot; must not block. False / both NULL = no factory.
+ */
+typedef bool (*d3d11_lift_resolve_factories_fn)(void *ud, void **out_lift_factory, void **out_fallback_factory);
 
 /*!
  * Create the lift module for a service. Cheap: the lift device and the vendor
@@ -138,15 +182,10 @@ struct d3d11_lift_pin
  * @param svc_device       the service's render device (ID3D11Device1-capable).
  * @param svc_context      its immediate context.
  * @param svc_ctx_mutex    the service's immediate_ctx_mutex.
- * @param lift_factory     the plug-in's LIFT-ONLY factory
- *                         (xrt_plugin_iface::create_dp_d3d11_lift), or NULL.
- * @param fallback_factory its ordinary D3D11 factory, used with a NULL window
- *                         when @p lift_factory is NULL. Both NULL ⟹ UNAVAILABLE.
- * @param eyes_fn          returns the panel's predicted tracked eyes (display
- *                         space, metres) — the viewpoints the lift thread passes
- *                         to every TRACKED conversion. Called from the lift
- *                         thread with no lift lock held. May be NULL.
- * @param eyes_ud          user data for @p eyes_fn.
+ * @param resolve          re-resolves the plug-in's lift-only factory and its
+ *                         fallback (see d3d11_lift_resolve_factories_fn) at
+ *                         every activation attempt. NULL / nothing ⟹ UNAVAILABLE.
+ * @param resolve_ud       user data for @p resolve.
  * @param nominal_z        the display's nominal viewing distance, metres
  *                         (<= 0 = 0.5 m) — the viewpoint policy's straight-on
  *                         viewer (ADR-048).
@@ -155,11 +194,122 @@ struct d3d11_lift *
 d3d11_lift_create(ID3D11Device *svc_device,
                   ID3D11DeviceContext *svc_context,
                   std::mutex *svc_ctx_mutex,
-                  void *lift_factory,
-                  void *fallback_factory,
-                  bool (*eyes_fn)(void *ud, struct xrt_eye_positions *out),
-                  void *eyes_ud,
+                  d3d11_lift_resolve_factories_fn resolve,
+                  void *resolve_ud,
                   float nominal_z);
+
+/*!
+ * G7: the panel's predicted eyes (display space, metres), published by the
+ * service from wherever it reads them (never pulled by the lift thread, so a
+ * conversion never takes the compositor's render_mutex). TRACKED viewpoints
+ * use the latest snapshot; one older than 1 s counts as no eyes.
+ */
+void
+d3d11_lift_publish_eyes(struct d3d11_lift *lift, const struct xrt_eye_positions *eyes);
+
+/*!
+ * A PRODUCER-side refresh: called (on the submitting thread, never the lift
+ * thread) before a submit when the snapshot is older than 50 ms, so eyes stay
+ * fresh while nothing else queries them. @p fn may take the render_mutex.
+ */
+void
+d3d11_lift_set_eyes_refresh(struct d3d11_lift *lift, void (*fn)(void *ud), void *ud);
+
+/*!
+ * The `dp-lift` provider's backend (conv_provider_legacy_dp.h): every [S] call
+ * is one command on this module's lift thread.
+ */
+void
+d3d11_lift_get_dp_backend(struct d3d11_lift *lift, struct conv_dp_lift_backend *out);
+
+//! The weave path's view of core-routed streams (installed by the IPC layer).
+struct d3d11_lift_core_bridge
+{
+	struct conv_core *core;
+	//! A v3 stream id the route minted -> the core stream and its v3 mode bit.
+	bool (*resolve)(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode);
+	void *ud;
+};
+
+//! Install (or, with NULL, clear) the bridge. Copied.
+void
+d3d11_lift_set_core_bridge(struct d3d11_lift *lift, const struct d3d11_lift_core_bridge *bridge);
+
+
+/*
+ *
+ * The conversion core's D3D11 glue (#2003; d3d11_conv_gpu.cpp after P1b).
+ *
+ */
+
+//! What publishing one result into a stream's export targets produced.
+struct d3d11_lift_published
+{
+	uint64_t fence_value;
+	uint32_t width, height, format; //!< DXGI_FORMAT
+	bool realloc;
+	uint32_t depth_width, depth_height, depth_format;
+	bool depth_realloc;
+};
+
+//! Runtime image allocation on the service device (conv_image_alloc_ops).
+void
+d3d11_lift_glue_alloc_ops(struct d3d11_lift *lift, struct conv_image_alloc_ops *out);
+
+//! S5 / S6 stages on the service device.
+void
+d3d11_lift_glue_gpu_ops(struct d3d11_lift *lift,
+                        struct conv_viewsyn_ops *viewsyn,
+                        struct conv_depth_readback_ops *readback);
+
+/*! S0 for the v3 route: snapshot the client's shared input (@p w x @p h)
+ *  into @p slot's images (downscaled when the slot is smaller: inputScale).
+ *  Takes ownership of @p handle. */
+xrt_result_t
+d3d11_lift_glue_import_input(struct d3d11_lift *lift,
+                             uint64_t stream_id,
+                             HANDLE handle,
+                             bool is_dxgi,
+                             uint32_t w,
+                             uint32_t h,
+                             const struct conv_submit_slot *slot);
+
+/*! The client's input read back as tightly packed RGBA8 (GAUSSIANS facade:
+ *  a job takes decoded CPU pixels). *out_pixels is malloc'd. Takes ownership
+ *  of @p handle. */
+xrt_result_t
+d3d11_lift_glue_import_input_cpu(struct d3d11_lift *lift,
+                                 uint64_t stream_id,
+                                 HANDLE handle,
+                                 bool is_dxgi,
+                                 uint32_t w,
+                                 uint32_t h,
+                                 uint8_t **out_pixels);
+
+void
+d3d11_lift_glue_release_input(HANDLE handle, bool is_dxgi);
+
+//! Copy @p res into the stream's export texture(s), signal its fence.
+xrt_result_t
+d3d11_lift_glue_publish(struct d3d11_lift *lift,
+                        uint64_t stream_id,
+                        const struct conv_result *res,
+                        struct d3d11_lift_published *out);
+
+bool
+d3d11_lift_glue_export_output(struct d3d11_lift *lift,
+                              uint64_t stream_id,
+                              bool depth,
+                              HANDLE *out_handle,
+                              uint32_t *out_w,
+                              uint32_t *out_h,
+                              uint32_t *out_format);
+
+bool
+d3d11_lift_glue_export_fence(struct d3d11_lift *lift, uint64_t stream_id, HANDLE *out_handle);
+
+void
+d3d11_lift_glue_stream_gone(struct d3d11_lift *lift, uint64_t stream_id);
 
 //! Stop the lift thread, destroy every stream and the lift DP/device.
 void

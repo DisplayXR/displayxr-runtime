@@ -314,6 +314,10 @@ teardown_all(struct ipc_server *s)
 	// ADR-051: the status snapshot (no threads; reads only on DIAG RPCs).
 	ipc_server_status_fini(s);
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-053 P1a (#2003): the conversion core lets go of the GPU side first.
+	ipc_server_conv_detach_d3d11();
+#endif
 	xrt_syscomp_destroy(&s->xsysc);
 
 	teardown_idevs(s);
@@ -648,6 +652,12 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 
 	// ADR-051 D3: the display status snapshot + generation counters.
 	ipc_server_status_init(s);
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-053 P1a (#2003): the device exists now — attach its GPU side (and
+	// the dp-lift row) to the conversion core.
+	ipc_server_conv_attach_d3d11(s->xsysc);
+#endif
 
 	// Always succeeds.
 	init_idevs(s);

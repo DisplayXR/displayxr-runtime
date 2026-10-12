@@ -9067,6 +9067,27 @@ ipc_server_conv_core(struct ipc_server *server)
  * NVIEW always route and the fall-through is dead (deleted in P1b).
  */
 
+/*!
+ * #2003 (ADR-053 P1a): with the GPU glue installed the `dp-lift` row serves
+ * DEPTH / SBS / NVIEW, so the svc_lift fall-through below is dead on a box
+ * with the legacy module. It stays until P1b; this says so, once per call
+ * kind, if it is ever taken anyway.
+ */
+static void
+lift_fallthrough_warn(int kind, const char *what, uint32_t mode)
+{
+	static bool s_warned[4];
+	if (kind < 0 || kind >= 4 || s_warned[kind] || ipc_server_get_conv() == NULL ||
+	    mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
+		return;
+	}
+	s_warned[kind] = true;
+	U_LOG_W(
+	    "[conv] v3 %s (mode %u) fell through to the pre-core svc_lift path (no conversion-core candidate or "
+	    "no GPU glue); P1b deletes this path",
+	    what, mode);
+}
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 static struct xrt_system_compositor *
 lift_xsysc(volatile struct ipc_client_state *ics)
@@ -9132,6 +9153,8 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 		ipc_lift_properties_from_caps(&caps, out_props);
 		return XRT_SUCCESS;
 	}
+	// P1b: delete (the pre-core fall-through; dead once dp-lift is a core row).
+	lift_fallthrough_warn(0, "lift_get_properties", 0);
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL) {
@@ -9164,6 +9187,9 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
 		return ipc_server_conv_lift_stream_create(sc, lift_owner(ics), mode, content_hint, input_scale,
 		                                          aux_outputs, aux_depth_format, out_stream_id);
 	}
+	// P1b: delete (the pre-core fall-through; dead for DEPTH / SBS / NVIEW once
+	// dp-lift is a core row — GAUSSIANS without a SPLATS provider still lands here).
+	lift_fallthrough_warn(1, "lift_stream_create", mode);
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 	if (xsysc != NULL) {
@@ -9238,8 +9264,16 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 		if (handle_count > 1) {
 			weave_submit_release_handles(handles + 1, handle_count - 1);
 		}
-		return ipc_server_conv_lift_submit(ipc_server_get_conv(), lift_owner(ics), args, ch, ch_is_dxgi,
-		                                   out_frame_id);
+		// ADR-048: the session's window is the lifted rect, as svc_lift had it.
+		struct xrt_lift_rect_frame frame = {0};
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		struct xrt_system_compositor *fxsysc = lift_xsysc(ics);
+		if (fxsysc != NULL) {
+			comp_d3d11_service_conv_rect_frame(fxsysc, ics->xc, &frame);
+		}
+#endif
+		return ipc_server_conv_lift_submit_framed(ipc_server_get_conv(), lift_owner(ics), args, ch, ch_is_dxgi,
+		                                          &frame, out_frame_id);
 	}
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	xrt_graphics_buffer_handle_t in_handle = handles[0];
@@ -9485,8 +9519,26 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 	reply.result = require_lift_client(ics, "lift_acquire_blob");
 	uint8_t *bytes = NULL;
 
+	if (reply.result == XRT_SUCCESS && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		// #2003: the GAUSSIANS photo facade over the job lane (G8).
+		uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
+		struct xrt_lift_blob_info info = {0};
+		bool ready = false;
+		reply.result = ipc_server_conv_lift_acquire_blob(ipc_server_get_conv(), lift_owner(ics), stream_id, cap,
+		                                                 &ready, &info, &bytes);
+		reply.ready = ready;
+		reply.frame_id = info.frame_id;
+		reply.source_time = info.source_time;
+		reply.format = info.format;
+		reply.byte_count = info.byte_count;
+		if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
+			reply.result = XRT_ERROR_ALLOCATION;
+			free(bytes);
+			bytes = NULL;
+		}
+	} else
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (reply.result == XRT_SUCCESS) {
+	    if (reply.result == XRT_SUCCESS) {
 		struct xrt_system_compositor *xsysc = lift_xsysc(ics);
 		if (xsysc == NULL) {
 			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
@@ -9510,10 +9562,12 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 		}
 	}
 #else
-	(void)stream_id;
-	(void)capacity;
-	if (reply.result == XRT_SUCCESS) {
-		reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	{
+		(void)stream_id;
+		(void)capacity;
+		if (reply.result == XRT_SUCCESS) {
+			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
 	}
 #endif
 

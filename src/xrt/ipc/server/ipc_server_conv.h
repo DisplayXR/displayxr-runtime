@@ -35,14 +35,16 @@
  *         - every per-stream call: the stream id is one this module minted
  *           (IPC_SERVER_CONV_STREAM_TAG set and present in its table) and
  *           the glue is still installed.
- *   GAUSSIANS never routes (no latest-wins photo facade over the job lane
- *   yet); its mode bit and its streams stay on svc_lift.
+ *   GAUSSIANS routes only through the latest-wins PHOTO FACADE over the job
+ *   lane (#2003, G8): when the glue also carries import_input_cpu and
+ *   SPLATS_MONO has a non-terminal candidate. The legacy `dp-lift` adapter
+ *   declares no SPLATS capability, so on a box whose only splat source is the
+ *   display plug-in GAUSSIANS stays on svc_lift.
  *
- * Until #2003 installs the glue, (b) is false on every box, so the shipping
- * v3 behaviour is byte-for-byte unchanged. #2003 registers the legacy module
- * as the `dp-lift` core row and installs the glue; from then on every
+ * #2003 registers the legacy module as the `dp-lift` core row and installs
+ * the glue at service init (ipc_server_conv_install_gpu); from then on every
  * DEPTH / SBS / NVIEW call routes here and the svc_lift fall-through for them
- * is dead code (deleted in P1b).
+ * is dead code (deleted in P1b; the handlers WARN once if it is ever taken).
  *
  * Threading: every function is callable from any IPC client thread. One
  * internal mutex guards the stream table (a leaf, never held across a core
@@ -58,6 +60,10 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_dp_lift.h"
 #include "xrt/xrt_lift.h"
+
+#include "conversion/conv_pipeline.h"
+#include "conversion/conv_provider_legacy_dp.h"
+#include "conversion/conv_stream.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -147,7 +153,65 @@ struct ipc_server_conv_io_ops
 	void (*stream_gone)(void *ud, uint64_t stream_id);
 
 	void *ud;
+
+	/*!
+	 * OPTIONAL (#2003, the GAUSSIANS facade): the client's shared input read
+	 * back as tightly packed RGBA8 CPU pixels (malloc'd, the caller frees), a
+	 * job's decoded input. Takes ownership of @p handle. NULL = GAUSSIANS
+	 * never routes.
+	 */
+	xrt_result_t (*import_input_cpu)(void *ud,
+	                                 uint64_t stream_id,
+	                                 xrt_graphics_buffer_handle_t handle,
+	                                 bool is_dxgi,
+	                                 uint32_t width,
+	                                 uint32_t height,
+	                                 uint8_t **out_pixels);
 };
+
+/*!
+ * Everything the service's GPU side hands the conversion core once its device
+ * exists (#2003): image allocation (the service's allocator trampoline swaps
+ * to it), the S5 / S6 stages (conv_core_set_gpu), the v3 route's I/O, and
+ * the `dp-lift` provider's backend (registered by the service as a core row).
+ */
+struct ipc_server_conv_gpu
+{
+	struct conv_image_alloc_ops alloc;
+	struct conv_viewsyn_ops viewsyn;
+	struct conv_depth_readback_ops readback;
+	struct conv_dp_lift_backend dp_lift;
+	struct ipc_server_conv_io_ops io;
+	float nominal_z_m; //!< the display's nominal viewing distance (S3); ≤ 0 = unknown
+};
+
+/*!
+ * The service target's half of an install (it owns the allocator and the
+ * provider registration): called with the gpu on install, NULL on removal,
+ * BEFORE the I/O glue is installed / AFTER it is removed.
+ */
+typedef void (*ipc_server_conv_gpu_hook_fn)(void *ud, const struct ipc_server_conv_gpu *gpu);
+
+//! Register the service target's hook (set before ipc_server_main).
+void
+ipc_server_conv_set_gpu_hook(struct ipc_server_conv *sc, ipc_server_conv_gpu_hook_fn fn, void *ud);
+
+/*!
+ * Install (or, with NULL, remove) the GPU side: conv_core_set_gpu, the
+ * service hook (allocator + `dp-lift`), then ipc_server_conv_set_io — the
+ * route engages last. Removal runs in the reverse order and destroys every
+ * core-routed stream first (their images belong to the GPU side).
+ */
+void
+ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_conv_gpu *gpu);
+
+/*!
+ * The weave path's resolver (#2003): a v3 stream id this module minted for
+ * @p client_id -> its core stream and v3 mode. False = not ours.
+ */
+bool
+ipc_server_conv_resolve_stream(
+    struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id, uint64_t *out_core_id, uint32_t *out_mode);
 
 
 /*
@@ -238,6 +302,34 @@ ipc_server_conv_lift_submit(struct ipc_server_conv *sc,
                             xrt_graphics_buffer_handle_t handle,
                             bool is_dxgi,
                             uint64_t *out_frame_id);
+
+/*!
+ * ipc_server_conv_lift_submit with the submitting session's window as the
+ * lifted rect (ADR-048: the viewpoints are rebased to it; the result echoes
+ * it). @p frame NULL / invalid = the panel centre, as svc_lift did.
+ */
+xrt_result_t
+ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
+                                   uint64_t client_id,
+                                   const struct ipc_arg_lift_submit *args,
+                                   xrt_graphics_buffer_handle_t handle,
+                                   bool is_dxgi,
+                                   const struct xrt_lift_rect_frame *frame,
+                                   uint64_t *out_frame_id);
+
+/*!
+ * xrAcquireLiftBlobDXR for a core-routed GAUSSIANS stream (the facade): the
+ * newest SUCCEEDED job's blob, with the v3 two-call latch. On delivery
+ * (@p capacity >= byte_count) @p out_bytes receives a malloc'd copy.
+ */
+xrt_result_t
+ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
+                                  uint64_t client_id,
+                                  uint64_t stream_id,
+                                  uint64_t capacity,
+                                  bool *out_ready,
+                                  struct xrt_lift_blob_info *out_info,
+                                  uint8_t **out_bytes);
 
 xrt_result_t
 ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,

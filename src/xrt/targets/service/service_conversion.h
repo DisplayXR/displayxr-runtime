@@ -21,13 +21,17 @@
  *  - the IPC side: ipc_server_set_conv (the v3 lift handlers' adapter) and
  *    the status snapshot's conversion rows (ipc_server_set_conv_status_source).
  *
- * GPU glue: the core is created with CPU image allocation and no view
- * synthesis. HOOK for #2003: `service_conversion_set_gpu_alloc` swaps the
- * image allocator for the D3D11 service's (the CPU one keeps freeing what it
- * allocated); the reference view synthesis and the depth readback are core
- * CONFIG, fixed at create, so #2003 either creates the core after the D3D11
- * device (moving service_conversion_start) or adds a core setter; and the v3
- * route's I/O glue is `ipc_server_conv_set_io` (server/ipc_server_conv.h).
+ * GPU glue (#2003): the core is created at start with CPU image allocation
+ * and no view synthesis (the device does not exist yet). Once init_all made
+ * the system compositor, the IPC layer (ipc_server_conv_d3d11.c) calls the
+ * hook this file registers (ipc_server_conv_set_gpu_hook): it swaps the image
+ * allocator for the D3D11 glue's (service_conversion_set_gpu_alloc; the CPU
+ * allocator still serves providers that cannot import a shared texture) and
+ * registers the legacy DP-lift adapter (`dp-lift`, ProbeOrder 150, hosted
+ * in-service always, licence-exempt) over the lift thread's backend. The
+ * S5 / S6 stages go in with conv_core_set_gpu; the v3 route's I/O last.
+ * The S7 convergence observer (rt#1978's u_lift_autoconv) is core config from
+ * the start: it needs no device.
  *
  * @ingroup targets_service
  */

@@ -887,6 +887,19 @@ struct ipc_server_conv_status_source
 void
 ipc_server_set_conv_status_source(const struct ipc_server_conv_status_source *source);
 
+/*!
+ * ADR-053 P1a (#2003): attach the D3D11 service compositor's GPU side (image
+ * allocation, S5 / S6, the v3 route's I/O, the `dp-lift` backend, the weave
+ * bridge, the eyes sink) to the registered conversion core. Called from
+ * init_all once the system compositor exists; a no-op without a core or on
+ * another compositor. Detach before the system compositor is destroyed.
+ */
+void
+ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc);
+
+void
+ipc_server_conv_detach_d3d11(void);
+
 struct conv_core;
 
 /*!
