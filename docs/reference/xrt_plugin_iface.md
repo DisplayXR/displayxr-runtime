@@ -880,6 +880,39 @@ void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool activ
   logging test double (`SIM TRANSPARENCY ACTIVE/IDLE`), which is how the runtime half
   is verified without vendor hardware.
 
+## Joining the runtime's GPU chain: `set_weave_sync` (Vulkan slot 17)
+
+```c
+bool (*set_weave_sync)(struct xrt_display_processor_vk *xdp,
+                       VkSemaphore_XDP wait_sem, uint64_t wait_value,
+                       VkSemaphore_XDP signal_sem, uint64_t signal_value);
+```
+
+For a **self-submitting** Vulkan DP (`is_self_submitting` true: `process_atlas` submits its own
+batches rather than recording into the given command buffer — the Leia CNSDK weaver). Without it
+the runtime cannot hand such a DP a wait or a signal, so it must CPU-wait the whole frame before
+it can tell anyone the target is complete. First consumer: the Android XR_DXR_weave engine, so the
+browser's inline-3D weave can return a release `sync_file` instead of blocking (XR_DXR_weave v20).
+
+- **Per call.** Called before the `process_atlas` it applies to (only `set_target_color_view` may
+  come between), for that call only. A runtime that armed the pair and could not reach
+  `process_atlas` clears it with a NULL/NULL call.
+- **true** = for that `process_atlas` the DP waits `wait_sem` on the GPU before its first read of
+  the atlas (or the `set_overlay_2d` layer) — with a `dstStageMask` that covers the stage that
+  reads it, not only `COLOR_ATTACHMENT_OUTPUT` — and signals `signal_sem` after its last target
+  write. Either handle may be `VK_NULL_HANDLE`. **false** / absent slot = the runtime keeps its
+  CPU waits for that frame.
+- **Values**: 0 = binary semaphores (the only form used today). Non-zero is reserved for
+  timeline semaphores; return false for a value you do not support.
+- **Drops**: after returning true, wait and signal even on a dropped frame (an early return, a
+  failed vendor submit — LeiaInc/CNSDK#734: a failed `vkQueueSubmit` never signals), e.g. with an
+  empty submit. The runtime still treats `get_last_frame_dropped` == true as "signal not
+  guaranteed": no GPU wait on `signal_sem` that frame, CPU completion, semaphores recreated.
+- Appended after `set_overlay_2d_filter_strength`, `XRT_DP_VK_HAS_WEAVE_SYNC`, wrapper
+  `xrt_display_processor_vk_set_weave_sync`. **Purely additive** — no
+  `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020). `sim_display` records into the command buffer
+  and leaves it NULL.
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and

@@ -725,16 +725,21 @@ struct xrt_display_processor_vk
 	 *
 	 * ## Contract
 	 *
-	 * - **Per call.** Called immediately before process_atlas (after
-	 *   set_target_color_view / set_overlay_2d), and applies to THAT process_atlas
-	 *   only; a process_atlas not preceded by a call carries no semaphores. The DP
-	 *   consumes and clears the pair inside process_atlas.
+	 * - **Per call.** Called before the process_atlas it applies to (only
+	 *   set_target_color_view may come between the two), and applies to THAT
+	 *   process_atlas only; a process_atlas not preceded by a call carries no
+	 *   semaphores. The DP consumes and clears the pair inside process_atlas.
+	 *   A runtime that armed the pair and then could not reach process_atlas
+	 *   clears it with a NULL/NULL call.
 	 * - **true** = the DP commits, for that process_atlas, to WAIT @p wait_sem
 	 *   before its first read of the atlas (or of any other runtime-provided
 	 *   image, e.g. the set_overlay_2d layer) and to SIGNAL @p signal_sem after
 	 *   its last write of the target, both on the GPU (in the vkQueueSubmit(s)
 	 *   it issues). Either handle may be VK_NULL_HANDLE, meaning "nothing to
-	 *   wait" / "nothing to signal".
+	 *   wait" / "nothing to signal". The wait's dstStageMask must cover the
+	 *   stage that first READS the atlas (fragment / compute shader, or
+	 *   transfer) — COLOR_ATTACHMENT_OUTPUT alone lets a sampling pass run
+	 *   ahead of the wait. Signal after all target writes are complete.
 	 * - **false** (or an absent slot / NULL pointer) = the DP does not take
 	 *   them; the runtime keeps its own CPU waits for that frame. A DP that
 	 *   records into the command buffer (sim_display) has no use for the slot.

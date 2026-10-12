@@ -27,14 +27,17 @@
  *    (@ref ahardwarebuffer_image_allocate, GPU_SAMPLED | GPU_FRAMEBUFFER) and
  *    imports into its own VkImage, so one code path serves both directions. It
  *    is handed back to the caller once per (re)allocation over the same socket.
- *  - Input-ready sync: no keyed mutex exists here either. The contract is the
- *    macOS one — the caller completes its GPU writes into the input buffer
- *    before calling xrWeaveSubmitDXR. An `acquire` sync_file fd is a documented
- *    follow-up (a latency optimisation, not a correctness requirement).
- *  - Completion sync: SYNCHRONOUS — the service vkWaitForFences before the IPC
- *    reply returns, so xrWeaveSubmitDXR returning IS the completion signal.
- *    weave_get_fence reports no fence; XrWeaveOutputDXR::fence stays NULL and
- *    fenceValue is a plain monotonic counter.
+ *  - Input-ready sync: no keyed mutex exists here either. By default the
+ *    contract is the macOS one — the caller completes its GPU writes into the
+ *    input buffer before calling xrWeaveSubmitDXR. From spec v20 a caller may
+ *    instead chain an acquire sync_file (XrWeaveSubmitSyncDXR), waited on the
+ *    GPU by the first batch that reads the input (see "sync_file weave").
+ *  - Completion sync: by default SYNCHRONOUS — the service vkWaitForFences
+ *    before the IPC reply returns, so xrWeaveSubmitDXR returning IS the
+ *    completion signal. weave_get_fence reports no fence; XrWeaveOutputDXR::fence
+ *    stays NULL and fenceValue is a plain monotonic counter. From spec v20 a
+ *    caller that chains XrWeaveOutputSyncDXR gets a per-frame release sync_file
+ *    instead, and the reply no longer waits for the weave.
  *  - Window geometry: Android has no HWND, and a SurfaceView's on-screen
  *    position is known only to the app (a pure MOVE raises no resize, so nothing
  *    in the pipeline can observe it). The caller therefore publishes it
@@ -103,6 +106,10 @@ weave_split_enabled(void)
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 /*
  *
@@ -823,6 +830,213 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	mc->weave.engine_initialized = true;
 	mc->weave.engine_failed = false;
 	U_LOG_W("weave(#1036): Android weave engine initialized (RGBA8, AHardwareBuffer, synchronous)");
+	return true;
+}
+
+
+/*
+ *
+ * sync_file weave (XR_DXR_weave v20).
+ *
+ * The caller's acquire sync_file is imported (temporarily) into a binary
+ * semaphore and waited by the first batch that reads the input; the final batch
+ * signals an exportable semaphore whose SYNC_FD export is the caller's release
+ * fence, and the submit then returns without the CPU vkWaitForFences (the next
+ * submit waits that fence before it reuses the command buffers). A
+ * self-submitting DP (CNSDK) sits between the two runtime batches, so it must
+ * join the chain through set_weave_sync: pre_sem (runtime -> DP) and dp_sem
+ * (DP -> runtime). Every path that cannot honour the chain falls back to the
+ * v9 behaviour for that frame — acquire CPU-polled, synchronous completion,
+ * release -1 — which is always correct, only slower.
+ *
+ */
+
+//! Decisions, for the WARN-on-change log (never per frame).
+enum weave_sync_mode
+{
+	WEAVE_SYNC_MODE_NONE = 0,
+	WEAVE_SYNC_MODE_GPU_RECORDING_DP,     //!< one batch: wait acquire, signal release
+	WEAVE_SYNC_MODE_GPU_DP_CHAIN,         //!< pre -> DP (set_weave_sync) -> post
+	WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH,  //!< debug.dxr.weave_sync_fd=0
+	WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD,  //!< device cannot move SYNC_FD semaphores
+	WEAVE_SYNC_MODE_FALLBACK_SATELLITE,   //!< #1277 satellite presents after the fence
+	WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT,    //!< self-submitting DP with DXR_ANDROID_WEAVE_SPLIT=0
+	WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED, //!< DP lacks / declined set_weave_sync
+};
+
+static const char *
+weave_sync_mode_str(enum weave_sync_mode m)
+{
+	switch (m) {
+	case WEAVE_SYNC_MODE_GPU_RECORDING_DP:
+		return "GPU chain (recording DP: one batch waits acquire, signals release)";
+	case WEAVE_SYNC_MODE_GPU_DP_CHAIN: return "GPU chain (self-submitting DP took set_weave_sync)";
+	case WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH: return "FALLBACK: debug.dxr.weave_sync_fd=0 (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD:
+		return "FALLBACK: device has no SYNC_FD semaphores (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_SATELLITE: return "FALLBACK: weave satellite presents (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT:
+		return "FALLBACK: self-submitting DP without the split submit (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED:
+		return "FALLBACK: DP lacks set_weave_sync or declined it (CPU waits, release -1)";
+	default: return "none";
+	}
+}
+
+static void
+weave_sync_log_mode(struct multi_compositor *mc, enum weave_sync_mode m)
+{
+	if (mc->weave.sync_last_mode != (uint8_t)m) {
+		mc->weave.sync_last_mode = (uint8_t)m;
+		U_LOG_W("weave v20 sync_file: %s", weave_sync_mode_str(m));
+	}
+}
+
+/*!
+ * `debug.dxr.weave_sync_fd` (default 1): 0 ignores the chained sync structs —
+ * the acquire fence is CPU-polled, completion is synchronous, the release fence
+ * is -1. Read per request (a property lookup, no I/O) so it can be flipped
+ * live for an A/B; logged on change.
+ */
+static bool
+weave_sync_fd_enabled(void)
+{
+	static int last = -1;
+	char value[PROP_VALUE_MAX] = {0};
+	const bool off = __system_property_get("debug.dxr.weave_sync_fd", value) > 0 && value[0] == '0';
+	const int now = off ? 0 : 1;
+	if (now != last) {
+		last = now;
+		U_LOG_W("weave v20 sync_file: GPU chain %s (debug.dxr.weave_sync_fd=%s)", off ? "DISABLED" : "enabled",
+		        value[0] != '\0' ? value : "<unset>");
+	}
+	return !off;
+}
+
+//! CPU-wait a sync_file (readable once signalled), bounded, and close it.
+static bool
+weave_sync_poll_and_close(int fd)
+{
+	if (fd < 0) {
+		return true;
+	}
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	int r;
+	do {
+		r = poll(&pfd, 1, 1000);
+	} while (r < 0 && errno == EINTR);
+	close(fd);
+	if (r <= 0) {
+		U_LOG_E("weave v20: acquire sync_file not signalled after 1 s (%s) — refusing this submit",
+		        r == 0 ? "timeout" : strerror(errno));
+		return false;
+	}
+	return true;
+}
+
+static void
+weave_sync_destroy_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	VkSemaphore *sems[] = {&mc->weave.sync_acquire_sem, &mc->weave.sync_pre_sem, &mc->weave.sync_dp_sem,
+	                       &mc->weave.sync_release_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (*sems[i] != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, *sems[i], NULL);
+			*sems[i] = VK_NULL_HANDLE;
+		}
+	}
+	mc->weave.sync_sems_ok = false;
+}
+
+//! Create the four semaphores once; false = this device cannot do the GPU chain.
+static bool
+weave_sync_ensure_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.sync_sems_tried) {
+		return mc->weave.sync_sems_ok;
+	}
+	mc->weave.sync_sems_tried = true;
+	mc->weave.sync_sems_ok = false;
+	if (!vk_has_external_semaphore_fd(vk) || !vk->external.binary_semaphore_sync_fd) {
+		U_LOG_W("weave v20: device lacks SYNC_FD binary semaphores (ext=%d, sync_fd=%d) — fences stay CPU-side",
+		        (int)vk_has_external_semaphore_fd(vk), (int)vk->external.binary_semaphore_sync_fd);
+		return false;
+	}
+	VkSemaphoreCreateInfo plain = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	VkExportSemaphoreCreateInfo export_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+	    .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	VkSemaphoreCreateInfo exportable = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export_info};
+	if (vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_acquire_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_pre_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_dp_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &exportable, NULL, &mc->weave.sync_release_sem) != VK_SUCCESS) {
+		U_LOG_W("weave v20: sync semaphore creation failed — fences stay CPU-side");
+		weave_sync_destroy_sems(vk, mc);
+		return false;
+	}
+	mc->weave.sync_sems_ok = true;
+	return true;
+}
+
+/*!
+ * A semaphore may hold a signal nobody will wait (a dropped DP frame, a failed
+ * submit, a failed export) or an unconsumed temporary payload: drain the queue
+ * and start from fresh ones. Rare; never on the steady-state path.
+ */
+static void
+weave_sync_recreate_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	vk_queue_lock(vk->main_queue);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk_queue_unlock(vk->main_queue);
+	weave_sync_destroy_sems(vk, mc);
+	mc->weave.sync_sems_tried = false;
+	mc->weave.sync_dirty = false;
+	(void)weave_sync_ensure_sems(vk, mc);
+}
+
+//! Temporary SYNC_FD import; consumes @p fd on every path.
+static bool
+weave_sync_import(struct vk_bundle *vk, VkSemaphore sem, int fd)
+{
+	VkImportSemaphoreFdInfoKHR info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+	    .semaphore = sem,
+	    .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+	    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	    .fd = fd,
+	};
+	VkResult ret = vk->vkImportSemaphoreFdKHR(vk->device, &info);
+	if (ret != VK_SUCCESS) {
+		// A failed import does not transfer ownership.
+		U_LOG_E("weave v20: vkImportSemaphoreFdKHR(SYNC_FD) failed: %s", vk_result_string(ret));
+		close(fd);
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Wait the previous submit's fence if it returned asynchronously (v20). Must run
+ * before anything reuses the command buffers or releases a resource that frame
+ * may still read. False = still not done after 1 s (the submit is refused; the
+ * fence stays pending and the next submit re-waits it).
+ */
+static bool
+weave_sync_wait_prev(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.fence_pending) {
+		return true;
+	}
+	VkResult ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave v20: previous weave did not complete within 1s: %s", vk_result_string(ret));
+		return false;
+	}
+	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
+	mc->weave.fence_pending = false;
 	return true;
 }
 
@@ -1639,6 +1853,51 @@ comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overl
 	os_mutex_unlock(&mc->weave.mutex);
 }
 
+void
+comp_multi_weave_android_set_sync(struct xrt_compositor *xc, int acquire_fence_fd, bool want_release_fence)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		if (acquire_fence_fd >= 0) {
+			close(acquire_fence_fd);
+		}
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd); // an unconsumed request (never happens: take_sync_result drops it)
+	}
+	mc->weave.sync_requested = true;
+	mc->weave.sync_have_acquire = acquire_fence_fd >= 0;
+	mc->weave.sync_acquire_fd = acquire_fence_fd;
+	mc->weave.sync_want_release = want_release_fence;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+int
+comp_multi_weave_android_take_sync_result(struct xrt_compositor *xc)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || !mc->weave.mutex_initialized) {
+		return -1;
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	// A refused submit may never have reached the request: drop it.
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd);
+	}
+	mc->weave.sync_have_acquire = false;
+	mc->weave.sync_acquire_fd = -1;
+	mc->weave.sync_requested = false;
+	mc->weave.sync_want_release = false;
+	int fd = mc->weave.sync_have_release ? mc->weave.sync_release_fd : -1;
+	mc->weave.sync_have_release = false;
+	mc->weave.sync_release_fd = -1;
+	os_mutex_unlock(&mc->weave.mutex);
+	return fd;
+}
+
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc)
 {
@@ -2005,10 +2264,75 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_weave v20 sync_file state for THIS submit (see "sync_file weave"
+	// above). All false / -1 for a caller that chained nothing, which leaves
+	// every line below exactly as it was before v20.
+	int acquire_fd = -1;           // owned here until imported, polled or closed
+	bool want_release = false;     // the caller chained XrWeaveOutputSyncDXR
+	bool sync_gpu = false;         // this frame runs the GPU chain
+	bool acquire_imported = false; // acquire_fd now lives in sync_acquire_sem
+	bool acquire_consumed = false; // ... and a submitted batch waits it
+	bool dp_sync_armed = false;    // the DP took set_weave_sync for the next process_atlas
+	bool atlas_done = false;       // process_atlas ran (the DP consumed the pair)
+	bool dp_dropped = false;       // ... and reported the frame dropped
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_engine(vk, mc)) {
 			break;
+		}
+
+		// v20: a previous submit that returned without the CPU wait must be
+		// done before anything below reuses its command buffers or releases a
+		// resource it reads. No-op for a caller that never asked for a release
+		// fence (fence_pending is only ever set by one).
+		if (!weave_sync_wait_prev(vk, mc)) {
+			break;
+		}
+		if (mc->weave.sync_dirty) {
+			weave_sync_recreate_sems(vk, mc);
+		}
+
+		// v20: take this submit's sync request and decide how to honour it.
+		if (mc->weave.sync_requested) {
+			mc->weave.sync_requested = false;
+			if (mc->weave.sync_have_acquire) {
+				acquire_fd = mc->weave.sync_acquire_fd;
+				mc->weave.sync_have_acquire = false;
+				mc->weave.sync_acquire_fd = -1;
+			}
+			want_release = mc->weave.sync_want_release;
+			mc->weave.sync_want_release = false;
+			if (acquire_fd >= 0 || want_release) {
+				const bool selfsub = xrt_display_processor_is_self_submitting(mc->weave.dp);
+				enum weave_sync_mode mode;
+				if (!weave_sync_fd_enabled()) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH;
+				} else if (!weave_sync_ensure_sems(vk, mc)) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD;
+				} else if (weave_satellite_wanted(mc)) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_SATELLITE; // presents after the fence
+				} else if (selfsub && !weave_split_enabled()) {
+					// The DP would submit before our pre-weave batch exists.
+					mode = WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT;
+				} else {
+					sync_gpu = true;
+					// A self-submitting DP is confirmed (or not) by set_weave_sync below.
+					mode = selfsub ? WEAVE_SYNC_MODE_NONE : WEAVE_SYNC_MODE_GPU_RECORDING_DP;
+				}
+				if (mode != WEAVE_SYNC_MODE_NONE) {
+					weave_sync_log_mode(mc, mode);
+				}
+				if (!sync_gpu) {
+					// v9 behaviour for this frame: the caller's GPU work is
+					// done before ours starts.
+					const bool signalled = weave_sync_poll_and_close(acquire_fd);
+					acquire_fd = -1;
+					if (!signalled) {
+						break;
+					}
+				}
+			}
 		}
 
 		// (Re)import the input on identity change. NOT pointer identity: every
@@ -2799,6 +3123,48 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		bool weave_split = weave_split_enabled() && xrt_display_processor_is_self_submitting(mc->weave.dp);
+
+		// v20, self-submitting DP: its interlace batch sits between our two
+		// batches, so it has to wait pre_sem (our pre-weave batch, which reads
+		// the input) and signal dp_sem (its last target write) for the chain to
+		// hold without a CPU wait. Armed before the pre-weave submit — only
+		// set_target_color_view lies between here and process_atlas. A DP that
+		// lacks the slot or declines it gets the v9 frame.
+		if (sync_gpu && weave_split) {
+			if (xrt_display_processor_vk_set_weave_sync(dp_vk, (VkSemaphore_XDP)mc->weave.sync_pre_sem, 0,
+			                                            (VkSemaphore_XDP)mc->weave.sync_dp_sem, 0)) {
+				dp_sync_armed = true;
+				weave_sync_log_mode(mc, WEAVE_SYNC_MODE_GPU_DP_CHAIN);
+			} else {
+				sync_gpu = false;
+				weave_sync_log_mode(mc, WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED);
+				const bool signalled = weave_sync_poll_and_close(acquire_fd);
+				acquire_fd = -1;
+				if (!signalled) {
+					break;
+				}
+			}
+		}
+		// v20: the acquire fence goes into a semaphore the FIRST batch of this
+		// frame waits (the pre-weave batch under the split, else the only one).
+		// An import failure CPU-polls it instead and keeps the release chain.
+		if (sync_gpu && acquire_fd >= 0) {
+			const int dup_fd = fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0);
+			if (dup_fd >= 0 && weave_sync_import(vk, mc->weave.sync_acquire_sem, dup_fd)) {
+				close(acquire_fd);
+				acquire_imported = true;
+			} else {
+				U_LOG_W("weave v20: acquire sync_file import failed — CPU-polling it this frame");
+				const bool signalled = weave_sync_poll_and_close(acquire_fd);
+				if (!signalled) {
+					acquire_fd = -1;
+					break;
+				}
+			}
+			acquire_fd = -1;
+		}
+		const VkPipelineStageFlags sync_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
 		if (weave_split) {
 			if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 				U_LOG_E("weave(#1036): vkEndCommandBuffer (pre-weave) failed");
@@ -2806,8 +3172,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 			VkSubmitInfo pre_submit = {
 			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .waitSemaphoreCount = acquire_imported ? 1u : 0u,
+			    .pWaitSemaphores = &mc->weave.sync_acquire_sem,
+			    .pWaitDstStageMask = &sync_wait_stage,
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
+			    .signalSemaphoreCount = dp_sync_armed ? 1u : 0u,
+			    .pSignalSemaphores = &mc->weave.sync_pre_sem,
 			};
 			vk_queue_lock(vk->main_queue);
 			VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
@@ -2816,6 +3187,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				U_LOG_E("weave(#1036): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
 				break;
 			}
+			acquire_consumed = acquire_imported;
 			// Everything after the weave records into the second buffer; the
 			// final submit + fence + wait below then retire BOTH batches (same
 			// queue, in order), so next frame's reset of either is safe.
@@ -2849,6 +3221,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                                    mc->weave.out_w, mc->weave.out_h,       //
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,          //
 		                                    0, 0, 0, 0);
+		atlas_done = true;
+		// v20: a dropped frame may not have signalled dp_sem (the slot contract
+		// asks the DP to signal anyway, but the runtime does not bet a GPU hang
+		// on it): no GPU wait on it, CPU completion, fresh semaphores next time.
+		if (dp_sync_armed) {
+			dp_dropped = xrt_display_processor_vk_get_last_frame_dropped(dp_vk);
+		}
 
 		// v6: restore the input atlas to GENERAL so the next frame's barrier
 		// (oldLayout=GENERAL) is correct and the caller's external writes land into
@@ -2950,11 +3329,33 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			break;
 		}
 
-		// ---- Submit + synchronous completion (the Android/macOS sync contract) ----
+		// ---- Submit + completion ----
+		// v9 (no sync chained): synchronous — the bounded CPU wait below, so the
+		// IPC reply IS the completion signal (the Android/macOS contract).
+		// v20 GPU chain: this batch waits the acquire (no split) and/or the DP's
+		// dp_sem, signals release_sem, and its SYNC_FD export is the caller's
+		// release fence; the CPU wait moves to the top of the next submit.
+		VkSemaphore final_waits[2];
+		VkPipelineStageFlags final_stages[2];
+		uint32_t final_wait_count = 0;
+		if (!weave_split && acquire_imported) {
+			final_waits[final_wait_count] = mc->weave.sync_acquire_sem;
+			final_stages[final_wait_count++] = sync_wait_stage;
+		}
+		if (dp_sync_armed && !dp_dropped) {
+			final_waits[final_wait_count] = mc->weave.sync_dp_sem;
+			final_stages[final_wait_count++] = sync_wait_stage;
+		}
+		const bool signal_release = sync_gpu && want_release && !dp_dropped;
 		VkSubmitInfo submit = {
 		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		    .waitSemaphoreCount = final_wait_count,
+		    .pWaitSemaphores = final_waits,
+		    .pWaitDstStageMask = final_stages,
 		    .commandBufferCount = 1,
 		    .pCommandBuffers = &cmd,
+		    .signalSemaphoreCount = signal_release ? 1u : 0u,
+		    .pSignalSemaphores = &mc->weave.sync_release_sem,
 		};
 		vk_queue_lock(vk->main_queue);
 		VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
@@ -2963,13 +3364,54 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			U_LOG_E("weave(#1036): vkQueueSubmit failed: %s", vk_result_string(ret));
 			break;
 		}
-		// Bounded wait (#967b style): a wedged vendor weaver must not hang the
-		// caller's present thread forever behind a synchronous IPC call.
-		ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
-		vk->vkResetFences(vk->device, 1, &mc->weave.fence);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#1036): weave did not complete within 1s: %s", vk_result_string(ret));
-			break;
+		if (!weave_split) {
+			acquire_consumed = acquire_imported;
+		}
+
+		bool completed_async = false;
+		if (signal_release) {
+			VkSemaphoreGetFdInfoKHR get_info = {
+			    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+			    .semaphore = mc->weave.sync_release_sem,
+			    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+			};
+			int release_fd = -1;
+			VkResult gret = vk->vkGetSemaphoreFdKHR(vk->device, &get_info, &release_fd);
+			if (gret == VK_SUCCESS) {
+				// -1 is a valid "already signalled" sync_file; either way the
+				// caller is answered without our CPU wait.
+				mc->weave.sync_release_fd = release_fd;
+				mc->weave.sync_have_release = true;
+				mc->weave.fence_pending = true;
+				completed_async = true;
+			} else {
+				// release_sem now holds a signal nobody consumes: synchronous
+				// this frame, fresh semaphores next time.
+				U_LOG_E("weave v20: vkGetSemaphoreFdKHR(SYNC_FD) failed: %s — synchronous this frame",
+				        vk_result_string(gret));
+				mc->weave.sync_dirty = true;
+			}
+		}
+		if (!completed_async) {
+			// Bounded wait (#967b style): a wedged vendor weaver must not hang
+			// the caller's present thread forever behind a synchronous IPC call.
+			ret =
+			    vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
+			vk->vkResetFences(vk->device, 1, &mc->weave.fence);
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("weave(#1036): weave did not complete within 1s: %s", vk_result_string(ret));
+				break;
+			}
+		}
+		if (dp_dropped) {
+			mc->weave.sync_dirty = true;
+			static uint32_t dropped_logs = 0;
+			if ((dropped_logs++ % 300) == 0) {
+				U_LOG_W(
+				    "weave v20: DP dropped a sync'd frame (#%u) — CPU completion, release -1, "
+				    "semaphores recreated",
+				    dropped_logs);
+			}
 		}
 
 		mc->weave.fence_value++;
@@ -3006,6 +3448,30 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 		ok = true;
 	} while (false);
+
+	// v20 cleanup for a submit that stopped part-way.
+	if (acquire_fd >= 0) {
+		close(acquire_fd); // never reached a batch
+	}
+	if (dp_sync_armed && !atlas_done) {
+		// The DP holds the pair for a process_atlas that never ran: clear it
+		// (NULL = nothing to wait / signal) so it cannot leak into a later frame.
+		(void)xrt_display_processor_vk_set_weave_sync((struct xrt_display_processor_vk *)mc->weave.dp,
+		                                              (VkSemaphore_XDP)VK_NULL_HANDLE, 0,
+		                                              (VkSemaphore_XDP)VK_NULL_HANDLE, 0);
+		mc->weave.sync_dirty = true; // pre_sem may hold an unwaited signal
+	}
+	if (acquire_imported && !acquire_consumed) {
+		mc->weave.sync_dirty = true; // sync_acquire_sem holds an unconsumed temporary payload
+	}
+	if (!ok && mc->weave.sync_have_release) {
+		// Never hand out a fence for a refused frame.
+		if (mc->weave.sync_release_fd >= 0) {
+			close(mc->weave.sync_release_fd);
+		}
+		mc->weave.sync_have_release = false;
+		mc->weave.sync_release_fd = -1;
+	}
 
 	os_mutex_unlock(&mc->weave.mutex);
 
@@ -3099,8 +3565,8 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	os_mutex_lock(&mc->weave.mutex);
 	if (vk != NULL) {
 		if (mc->weave.engine_initialized) {
-			// Nothing may be in flight (submits are synchronous), but a
-			// belt-and-braces idle keeps teardown safe if that changes.
+			// A v20 submit may have returned with its weave still in flight
+			// (release sync_file instead of the CPU wait): drain first.
 			vk_queue_lock(vk->main_queue);
 			vk->vkQueueWaitIdle(vk->main_queue->queue);
 			vk_queue_unlock(vk->main_queue);
@@ -3126,6 +3592,10 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk->vkDestroyRenderPass(vk->device, mc->weave.render_pass, NULL);
 			mc->weave.render_pass = VK_NULL_HANDLE;
 		}
+		// v20: the queue is idle (above), so no batch still waits or signals these.
+		weave_sync_destroy_sems(vk, mc);
+		mc->weave.sync_sems_tried = false;
+		mc->weave.fence_pending = false;
 		if (mc->weave.fence != VK_NULL_HANDLE) {
 			vk->vkDestroyFence(vk->device, mc->weave.fence, NULL);
 			mc->weave.fence = VK_NULL_HANDLE;
@@ -3135,6 +3605,16 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			mc->weave.cmd_pool = VK_NULL_HANDLE;
 		}
 	}
+	// v20: fds a request or a result still held.
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd);
+	}
+	if (mc->weave.sync_have_release && mc->weave.sync_release_fd >= 0) {
+		close(mc->weave.sync_release_fd);
+	}
+	mc->weave.sync_have_acquire = false;
+	mc->weave.sync_have_release = false;
+	mc->weave.sync_requested = false;
 	mc->weave.engine_initialized = false;
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);

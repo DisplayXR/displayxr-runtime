@@ -7600,7 +7600,7 @@ ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
  *   output fd      one dup per comp_multi_weave_export_output_dmabuf call, owned
  *                  by this handler; same send-then-park rule.
  */
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX // desktop Linux (v10) + Android (v20)
 void
 ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics)
 {
@@ -7639,7 +7639,10 @@ weave_defer_close(volatile struct ipc_client_state *ics, int fd)
 	}
 	ics->weave_deferred_close_fds[ics->weave_deferred_close_count++] = fd;
 }
+#endif // COMP_MULTI_HAVE_WEAVE
+#endif // XRT_OS_LINUX
 
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
 //! DRM_FORMAT_MOD_INVALID, spelled out so the IPC server needs no libdrm header.
 #define WEAVE_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffULL
 
@@ -7666,8 +7669,7 @@ weave_unpack_dmabuf(const struct ipc_weave_dmabuf *src, int fd, struct xrt_weave
 	dst->buffer_id = src->buffer_id;
 	return true;
 }
-#endif // COMP_MULTI_HAVE_WEAVE
-#endif // XRT_OS_LINUX_DESKTOP
+#endif // XRT_OS_LINUX_DESKTOP && COMP_MULTI_HAVE_WEAVE
 
 // The dma-buf submit is the largest message on the wire; keep it honest.
 static_assert(sizeof(struct ipc_weave_submit_dmabuf_msg) <= IPC_BUF_SIZE,
@@ -7835,6 +7837,145 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	(void)dmabuf;
 	(void)max_release_fence_count;
 	(void)out_release_fences;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+/*
+ *
+ * XR_DXR_weave v20: Android sync_file fences.
+ *
+ * Fd ownership, handler by handler:
+ *
+ *   weave_set_acquire_fence  the received fd is parked in
+ *                  ics->weave_pending_acquire_fd (one slot: a newer one closes
+ *                  the older) until the next weave_submit_sync takes it.
+ *   weave_submit_sync  the parked acquire fd passes to the engine
+ *                  (comp_multi_weave_android_set_sync), which owns it from then
+ *                  on — imported into a semaphore, CPU-polled, or closed on a
+ *                  refusal. The release fence the engine produces is owned by
+ *                  this handler, sent as the reply's out handle and parked in
+ *                  ics->weave_deferred_close_fds like the desktop-Linux one.
+ *
+ */
+
+xrt_result_t
+ipc_handle_weave_set_acquire_fence(volatile struct ipc_client_state *ics,
+                                   const xrt_graphics_sync_handle_t *acquire_fences,
+                                   const uint32_t acquire_fence_count)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_OS_ANDROID) && defined(COMP_MULTI_HAVE_WEAVE)
+	// Every fd past the first is malformed; never leak one.
+	for (uint32_t i = 1; i < acquire_fence_count; i++) {
+		if (acquire_fences[i] >= 0) {
+			close(acquire_fences[i]);
+		}
+	}
+	int fd = acquire_fence_count >= 1 ? acquire_fences[0] : -1;
+	xrt_result_t auth = require_present_owner(ics, "weave_set_acquire_fence");
+	if (auth != XRT_SUCCESS || acquire_fence_count != 1 || fd < 0) {
+		if (fd >= 0) {
+			close(fd);
+		}
+		return auth != XRT_SUCCESS ? auth : XRT_ERROR_IPC_FAILURE;
+	}
+	if (ics->weave_have_pending_acquire && ics->weave_pending_acquire_fd >= 0) {
+		close(ics->weave_pending_acquire_fd); // a submit that never came; the newer fence covers it
+	}
+	ics->weave_pending_acquire_fd = fd;
+	ics->weave_have_pending_acquire = true;
+	return XRT_SUCCESS;
+#else
+	// Android only. On an fd platform the received descriptors are live in this
+	// process; close them so a misbehaving client cannot exhaust the table.
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	for (uint32_t i = 0; i < acquire_fence_count; i++) {
+		xrt_graphics_sync_handle_t h = acquire_fences[i];
+		u_graphics_sync_unref(&h);
+	}
+#else
+	(void)acquire_fences;
+	(void)acquire_fence_count;
+#endif
+	(void)ics;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_submit_sync(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_weave_submit *args,
+                             uint32_t want_release_fence,
+                             bool *out_have_output,
+                             uint32_t *out_width,
+                             uint32_t *out_height,
+                             uint64_t *out_fence_value,
+                             struct xrt_eye_positions *out_eyes,
+                             uint32_t *out_segment_count,
+                             uint32_t *out_lift_cursor_mask,
+                             uint32_t max_release_fence_count,
+                             xrt_graphics_sync_handle_t *out_release_fences,
+                             uint32_t *out_release_fence_count,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             const uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_release_fence_count = 0;
+
+#if defined(XRT_OS_ANDROID) && defined(COMP_MULTI_HAVE_WEAVE)
+	// The previous v20 reply is on the wire by now: drop the fence it carried.
+	ipc_server_client_weave_flush_deferred_fds(ics);
+
+	int acquire_fd = -1;
+	if (ics->weave_have_pending_acquire) {
+		acquire_fd = ics->weave_pending_acquire_fd;
+		ics->weave_have_pending_acquire = false;
+		ics->weave_pending_acquire_fd = -1;
+	}
+	if (ics->xc != NULL) {
+		// The engine owns acquire_fd from here, whatever the submit does.
+		comp_multi_weave_android_set_sync(ics->xc, acquire_fd, want_release_fence != 0);
+	} else if (acquire_fd >= 0) {
+		close(acquire_fd);
+	}
+
+	// Everything else — auth, validation, the weave — is the v9 submit's,
+	// byte for byte.
+	xrt_result_t xret =
+	    ipc_handle_weave_submit(ics, args, out_have_output, out_width, out_height, out_fence_value, out_eyes,
+	                            out_segment_count, out_lift_cursor_mask, handles, handle_count);
+
+	// Always collect: also drops a sync request a refused submit never reached.
+	int release_fd = ics->xc != NULL ? comp_multi_weave_android_take_sync_result(ics->xc) : -1;
+	if (xret != XRT_SUCCESS || max_release_fence_count < 1) {
+		if (release_fd >= 0) {
+			close(release_fd); // a refused submit owes the caller no fence
+		}
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_IPC_FAILURE;
+	}
+	if (release_fd >= 0) {
+		out_release_fences[0] = release_fd;
+		*out_release_fence_count = 1;
+		weave_defer_close(ics, release_fd); // closed after this reply is sent
+	}
+	return XRT_SUCCESS;
+#else
+	(void)args;
+	(void)want_release_fence;
+	(void)out_have_output;
+	(void)out_width;
+	(void)out_height;
+	(void)out_fence_value;
+	(void)out_eyes;
+	(void)out_segment_count;
+	(void)out_lift_cursor_mask;
+	(void)max_release_fence_count;
+	(void)out_release_fences;
+	(void)ics;
 	weave_submit_release_handles(handles, handle_count);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif

@@ -255,7 +255,9 @@
  *    already finished, the v9 contract).
  *  - OUT. XrWeaveOutputSyncDXR::releaseFenceFd receives a per-frame sync_file
  *    that signals when THIS submit's woven output is complete, and
- *    xrWeaveSubmitDXR then returns WITHOUT waiting for the weave on the CPU. -1
+ *    xrWeaveSubmitDXR then returns WITHOUT waiting for the weave on the CPU. It
+ *    also marks the end of the runtime's reads of this submit's input and
+ *    overlay: the caller must not write them again before it signals. -1
  *    means the submit completed synchronously (the runtime fell back to its CPU
  *    wait for that frame — a display processor that cannot join the GPU chain,
  *    a dropped frame, the service kill switch): the output is ready now.

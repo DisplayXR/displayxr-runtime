@@ -6196,7 +6196,10 @@ dxr_weave_cadence_trace(void)
  *
  * The DP submits on ONE known queue. `vk_make_dp_vk` creates it with
  * `vk.main_queue->queue` temporarily swapped to `c->repaint_queue`, so that is
- * the queue the vendor's weave goes to. Waiting on that queue therefore gives
+ * the queue the vendor's weave goes to — for a DP that captures the queue it is
+ * given. The Android CNSDK DP does not (it always submits on family-0 index 0,
+ * see the #868 note at the DP factory call), so for it this assumption is
+ * unproven (#2012), not changed here. Waiting on that queue therefore gives
  * the identical ordering guarantee, while a device-wide wait ALSO drains the
  * app's own queue — its scene rendering, which never touches `target_image`.
  * On this device that is the majority of the wait.
@@ -11988,8 +11991,9 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		 * #868: hand the display processor the RUNTIME-OWNED queue, not the
 		 * app's.
 		 *
-		 * The vendor DP reads vk->main_queue->queue ONCE, here at creation, and
-		 * the SR weaver captures it internally for its own submits — the
+		 * NOT TRUE FOR EVERY DP — see the note at the end of this comment. The
+		 * desktop SR weaver reads vk->main_queue->queue ONCE, here at creation,
+		 * and captures it internally for its own submits — the
 		 * correction-texture upload, which vkQueueSubmit()s and waits from
 		 * inside weave(). weave() is called from the repaint thread too, so
 		 * with the app's queue captured, the SDK submits to the APP's queue off
@@ -12008,6 +12012,17 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		 * queue-family ownership transfer, and the weaver vkQueueWaitIdle()s
 		 * its own queue before returning, which CPU-orders those uploads ahead
 		 * of whichever queue we later submit the recorded weave on.
+		 *
+		 * Android CNSDK DP (2026-10-12, CNSDK 0.10.75): this swap does NOT move
+		 * its submits. leia_interlacer_vulkan_initialize takes no queue at all;
+		 * CRendererVulkan::Init picks the first GRAPHICS family and calls
+		 * vkGetDeviceQueue(device, family, 0) — queue index 0, i.e. the APP's
+		 * queue on a two-queue device — and dereferences it live on every weave
+		 * pass, Apply2DEffect and one-time upload. Those submits are serialised
+		 * against the app's only because the per-queue lock layer wraps every
+		 * vkQueueSubmit in the process (#1905). The #837 queue-only post-weave
+		 * drain (dxr_postwait_queue_only) therefore does not cover CNSDK's
+		 * weave on such a device; tracked in #2012, behaviour unchanged.
 		 *
 		 * The app frame keeps submitting on the APP's queue deliberately — that
 		 * is what orders the compositor's work after the app's own rendering

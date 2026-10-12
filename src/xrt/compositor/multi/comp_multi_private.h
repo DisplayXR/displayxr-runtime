@@ -902,6 +902,36 @@ struct multi_compositor
 		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
 		//! @}
 
+		/*!
+		 * @name sync_file weave (XR_DXR_weave v20)
+		 * A caller that chains XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR has
+		 * its acquire sync_file waited on the GPU and gets a release sync_file
+		 * back instead of the CPU vkWaitForFences. The request is set by
+		 * comp_multi_weave_android_set_sync right before a submit and collected
+		 * by comp_multi_weave_android_take_sync_result right after it; nothing is
+		 * sticky. A self-submitting DP joins the chain through the VK DP slot
+		 * set_weave_sync (pre_sem -> DP -> dp_sem); a recording DP needs nothing.
+		 * `debug.dxr.weave_sync_fd=0` disables the GPU chain (acquire CPU-polled,
+		 * release -1).
+		 * @{
+		 */
+		bool sync_requested;    //!< set_sync was called for the next submit
+		bool sync_have_acquire; //!< sync_acquire_fd is engine-owned and unconsumed
+		int sync_acquire_fd;
+		bool sync_want_release;
+		bool sync_have_release; //!< sync_release_fd was produced by the last submit
+		int sync_release_fd;
+		bool fence_pending; //!< the last submit returned without a CPU wait on @c fence
+		bool sync_sems_tried;
+		bool sync_sems_ok;
+		bool sync_dirty;              //!< a semaphore may hold a stale signal/payload: recreate before reuse
+		uint8_t sync_last_mode;       //!< last logged decision (WARN on change only)
+		VkSemaphore sync_acquire_sem; //!< temporary SYNC_FD import target
+		VkSemaphore sync_pre_sem;     //!< runtime pre-weave batch -> self-submitting DP
+		VkSemaphore sync_dp_sem;      //!< self-submitting DP -> runtime post-weave batch
+		VkSemaphore sync_release_sem; //!< exportable SYNC_FD, signalled by the final batch
+		//! @}
+
 		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
 		//! `debug.dxr.weave_satellite=1`: the woven output is blitted onto a
 		//! SERVICE-owned full-panel overlay surface (the #558 machinery) and
@@ -1723,6 +1753,25 @@ comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
  */
 void
 comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * XR_DXR_weave v20 sync_file request for the NEXT comp_multi_weave_submit only.
+ * Takes ownership of @p acquire_fence_fd (-1 = none) on every path — it is
+ * imported into a semaphore, CPU-polled, or closed. @p want_release_fence asks
+ * for a release sync_file instead of the synchronous completion; collect it
+ * with @ref comp_multi_weave_android_take_sync_result after the submit.
+ */
+void
+comp_multi_weave_android_set_sync(struct xrt_compositor *xc, int acquire_fence_fd, bool want_release_fence);
+
+/*!
+ * Collect the release sync_file of the submit that followed
+ * @ref comp_multi_weave_android_set_sync (caller-owned; -1 = the weave completed
+ * synchronously, or the submit was refused) and drop whatever of the request
+ * that submit never consumed. Always call it after a set_sync'd submit.
+ */
+int
+comp_multi_weave_android_take_sync_result(struct xrt_compositor *xc);
 #endif
 
 bool

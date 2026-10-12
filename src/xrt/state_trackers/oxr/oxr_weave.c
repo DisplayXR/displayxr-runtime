@@ -93,7 +93,10 @@
 #include <stdint.h>
 #include <string.h>
 
-#ifdef XRT_OS_LINUX_DESKTOP
+// sync_file fences (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR): desktop Linux
+// from spec v10 (#1699), Android from spec v20.
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
+#define OXR_WEAVE_HAVE_SYNC_FD 1
 #include <errno.h>
 #include <poll.h>
 #include <unistd.h>
@@ -232,6 +235,39 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
                                                    struct xrt_weave_dmabuf_output_desc *out_desc);
 #endif
 
+#ifdef XRT_OS_ANDROID
+// Spec v20 Android sync_file submit, same file + pattern as above.
+xrt_result_t
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+                                             xrt_graphics_buffer_handle_t in_handle,
+                                             int32_t rect_x,
+                                             int32_t rect_y,
+                                             uint32_t rect_w,
+                                             uint32_t rect_h,
+                                             uint32_t rect_count,
+                                             const struct xrt_rect *rects,
+                                             xrt_graphics_buffer_handle_t overlay_handle,
+                                             uint32_t overlay_rect_count,
+                                             const struct xrt_rect *overlay_rects,
+                                             bool weave_frame_first,
+                                             const struct xrt_weave_atlas_layout *layout,
+                                             uint32_t flat_rect_count,
+                                             const struct xrt_rect *flat_rects,
+                                             bool mono_in_2d,
+                                             bool overlay_unchanged,
+                                             float overlay_filter_strength,
+                                             int acquire_fence_fd,
+                                             bool want_release_fence,
+                                             int *out_release_fence_fd,
+                                             bool *out_have_output,
+                                             uint32_t *out_width,
+                                             uint32_t *out_height,
+                                             uint64_t *out_fence_value,
+                                             struct xrt_eye_positions *out_eyes,
+                                             uint32_t *out_segment_count,
+                                             uint32_t *out_lift_cursor_mask);
+#endif
+
 xrt_result_t
 comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
                                                   int32_t origin_x,
@@ -329,7 +365,9 @@ weave_dmabuf_from_xr(const XrWeaveDmabufDescDXR *src, struct xrt_weave_dmabuf_de
 	dst->buffer_id = src->bufferId;
 	return true;
 }
+#endif // XRT_OS_LINUX_DESKTOP
 
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 /*!
  * The v9 contract for a caller that did not chain XrWeaveOutputSyncDXR: the
  * output must be complete when xrWeaveSubmitDXR returns, so wait the release
@@ -359,7 +397,7 @@ weave_wait_and_close_release_fd(int fd)
 	}
 	close(fd);
 }
-#endif // XRT_OS_LINUX_DESKTOP
+#endif // OXR_WEAVE_HAVE_SYNC_FD
 
 //! IPC sessions hold a native-compositor handle (the IPC client compositor) but
 //! none of the in-process native-compositor flags are set. Mirrors oxr_capture.c.
@@ -797,11 +835,29 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR, XrWeaveOutputOriginDXR);
 	struct xrt_weave_woven_origin woven = {0};
 
-#ifndef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_ANDROID)
+	// Spec v20: the sync_file pair rides an AHardwareBuffer submit (no dma-buf
+	// descriptor — the AHardwareBuffer IS the Android transport).
+	if (dmabuf_in != NULL || dmabuf_ov != NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrWeaveSubmitDXR: XrWeaveDmabufDescDXR / XrWeaveOverlayDmabufDescDXR are "
+		                 "desktop-Linux only (spec v10)");
+	}
+	int acquire_fd = -1;
+	if (sync_in != NULL) {
+		if (sync_in->acquireFenceFd < -1) {
+			return oxr_error(
+			    &log, XR_ERROR_VALIDATION_FAILURE,
+			    "xrWeaveSubmitDXR: XrWeaveSubmitSyncDXR::acquireFenceFd (%d) must be >= 0 or -1",
+			    sync_in->acquireFenceFd);
+		}
+		acquire_fd = sync_in->acquireFenceFd;
+	}
+#elif !defined(XRT_OS_LINUX_DESKTOP)
 	if (dmabuf_in != NULL || dmabuf_ov != NULL || sync_in != NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "xrWeaveSubmitDXR: XrWeaveDmabufDescDXR / XrWeaveOverlayDmabufDescDXR / "
-		                 "XrWeaveSubmitSyncDXR are desktop-Linux only (spec v10)");
+		                 "XrWeaveSubmitSyncDXR are desktop-Linux and Android only (spec v10 / v20)");
 	}
 #else
 	struct xrt_weave_dmabuf_desc in_desc = {0};
@@ -1013,6 +1069,23 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    &h, &fence_value, &eyes, &woven);
 	} else
 #endif
+#ifdef XRT_OS_ANDROID
+	    if (acquire_fd >= 0 || out_sync != NULL) {
+		// Spec v20: only a caller that chained a fence takes this path, so a
+		// v9 caller sends exactly the pre-v20 messages. The bridge sends a copy
+		// of the acquire fd (SCM_RIGHTS); the caller's original is closed only
+		// once this call is certain to return XR_SUCCESS (bottom of function).
+		xret = comp_ipc_client_compositor_weave_submit_sync(
+		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
+		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
+		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL, overlay_handle,
+		    overlay_rect_count, overlay_rect_count > 0 ? overlay_rects : NULL,
+		    submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL, flat_rect_count,
+		    flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, overlay_filter_strength,
+		    acquire_fd, out_sync != NULL, &release_fd, &have_out, &w, &h, &fence_value, &eyes,
+		    &submit_segment_count, &lift_cursor_mask);
+	} else
+#endif
 	{
 		xret = comp_ipc_client_compositor_weave_submit(
 		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
@@ -1150,7 +1223,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			uint32_t gw = 0, gh = 0;
 			xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 			xret = comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h);
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 			if (xret != XRT_SUCCESS && release_fd >= 0) {
 				close(release_fd);
 			}
@@ -1175,16 +1248,18 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		bool have_fence = false;
 		xrt_graphics_sync_handle_t fence_h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
 		xret = comp_ipc_client_compositor_weave_get_fence(&sess->xcn->base, &have_fence, &fence_h);
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 		if (xret != XRT_SUCCESS) {
 			// Not handing out this frame: drop what it already produced.
 			if (release_fd >= 0) {
 				close(release_fd);
 			}
+#ifdef XRT_OS_LINUX_DESKTOP
 			if (out_dmabuf != NULL && out_dmabuf->fd >= 0) {
 				close(out_dmabuf->fd);
 				out_dmabuf->fd = -1;
 			}
+#endif
 		}
 #endif
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave fence export failed (xrt_result=%d)",
@@ -1231,14 +1306,27 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
-#ifdef XRT_OS_LINUX_DESKTOP
-	// v10 release fence, PER FRAME: to the caller if it asked for it, otherwise
-	// honour the v9 synchronous contract for it by waiting here.
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
+	// v10 / v20 release fence, PER FRAME: to the caller if it asked for it,
+	// otherwise honour the v9 synchronous contract for it by waiting here. (On
+	// Android the service only produces one when asked, so the wait branch
+	// sees -1 there.)
 	if (out_sync != NULL) {
 		out_sync->releaseFenceFd = release_fd; // caller-owned (or -1 = already complete)
 	} else {
 		weave_wait_and_close_release_fd(release_fd);
 	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// Spec v20, XR_SUCCESS is now certain: the acquire fd the caller passed IN
+	// is ours; the service holds its own copy, so the original is closed.
+	if (acquire_fd >= 0) {
+		close(acquire_fd);
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
 
 	// XR_SUCCESS is now certain: the fds the caller passed IN are ours. The
 	// service holds its own copies, so these originals are simply closed.
@@ -1251,7 +1339,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			close(acquire_fd);
 		}
 	}
-#else
+#elif !defined(OXR_WEAVE_HAVE_SYNC_FD)
 	(void)release_fd;
 #endif
 
