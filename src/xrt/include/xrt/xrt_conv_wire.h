@@ -223,7 +223,7 @@ struct xrt_conv_wire_image
 	uint32_t plane1_offset;
 	uint32_t plane1_stride;
 	uint32_t array_layer;
-	uint32_t sync_kind;   //!< XRT_CONV_SYNC_*
+	uint32_t sync_kind; //!< XRT_CONV_SYNC_*
 	uint32_t reserved_0;
 	uint64_t byte_size;
 	uint64_t drm_modifier;

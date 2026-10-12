@@ -449,8 +449,8 @@ TEST_CASE("conversion ABI: values shared with xrt_dp_lift.h and the frozen vocab
 
 	STATIC_REQUIRE(XRT_CONV_FAIL_NONE == 0u && XRT_CONV_FAIL_LICENCE == 1u && XRT_CONV_FAIL_LOAD == 2u &&
 	               XRT_CONV_FAIL_PLATFORM == 3u && XRT_CONV_FAIL_NETWORK == 4u && XRT_CONV_FAIL_VERSION == 5u &&
-	               XRT_CONV_FAIL_RESOURCES == 6u && XRT_CONV_FAIL_MODEL == 7u &&
-	               XRT_CONV_FAIL_DEVICE_LOST == 8u && XRT_CONV_FAIL_CRASH_LOOP == 9u);
+	               XRT_CONV_FAIL_RESOURCES == 6u && XRT_CONV_FAIL_MODEL == 7u && XRT_CONV_FAIL_DEVICE_LOST == 8u &&
+	               XRT_CONV_FAIL_CRASH_LOOP == 9u);
 
 	STATIC_REQUIRE(XRT_CONV_LICENCE_UNKNOWN == 0u && XRT_CONV_LICENCE_PERMISSIVE == 1u &&
 	               XRT_CONV_LICENCE_COMMERCIAL == 2u && XRT_CONV_LICENCE_RESEARCH_ONLY == 3u);
@@ -482,8 +482,7 @@ negotiate_stub()
 
 	struct xrt_conversion_plugin_iface *iface = nullptr;
 	uint32_t plugin_version = 0;
-	REQUIRE(kNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version) ==
-	        XRT_SUCCESS);
+	REQUIRE(kNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version) == XRT_SUCCESS);
 	REQUIRE(plugin_version == XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT);
 	REQUIRE(iface != nullptr);
 	return iface;
@@ -571,7 +570,8 @@ TEST_CASE("conversion ABI: describe_cap contract", "[conversion_abi]")
 		CHECK((cap.import_memory_kinds & XRT_CONV_MEM_CPU) != 0);
 		CHECK(cap.licence_class <= XRT_CONV_LICENCE_RESEARCH_ONLY);
 		CHECK(cap.commercial_ok <= 1u);
-		if (cap.licence_class == XRT_CONV_LICENCE_RESEARCH_ONLY || cap.licence_class == XRT_CONV_LICENCE_UNKNOWN) {
+		if (cap.licence_class == XRT_CONV_LICENCE_RESEARCH_ONLY ||
+		    cap.licence_class == XRT_CONV_LICENCE_UNKNOWN) {
 			CHECK(cap.commercial_ok == 0u);
 		}
 		// VIEWS_* must honour explicit viewpoints and declare a sane view range.

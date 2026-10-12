@@ -75,10 +75,10 @@ extern "C" {
 #endif
 
 /*! Whole-field struct_size coverage (same rule as XRT_DP_HAS_SLOT). */
-#define XRT_CONV_COVERS(PTR, TYPE, FIELD)                                                          \
+#define XRT_CONV_COVERS(PTR, TYPE, FIELD)                                                                              \
 	((PTR) != NULL && (PTR)->struct_size >= offsetof(TYPE, FIELD) + sizeof(((TYPE *)0)->FIELD))
 /*! Coverage + non-NULL, for an appended iface slot. */
-#define XRT_CONV_IFACE_HAS(IFACE, FIELD)                                                           \
+#define XRT_CONV_IFACE_HAS(IFACE, FIELD)                                                                               \
 	(XRT_CONV_COVERS(IFACE, struct xrt_conversion_plugin_iface, FIELD) && (IFACE)->FIELD != NULL)
 
 #ifndef XRT_CONV_ABI_ASSERT
@@ -90,10 +90,11 @@ extern "C" {
 #endif
 
 /* Ceilings (a provider reports its own, smaller, limits). */
-#define XRT_CONV_MAX_VIEWS 8          //!< == XR_LIFT_MAX_VIEWS_DXR. Never edited: it sizes frozen
-                                      //!< arrays. A higher ceiling is a later slot + tail fields.
-#define XRT_CONV_MAX_CAPABILITIES 32  //!< per provider
-#define XRT_CONV_MAX_FRAME_IMAGES 4   //!< inputs per stream frame / job
+/*! == XR_LIFT_MAX_VIEWS_DXR. Never edited: it sizes frozen arrays. A higher
+ *  ceiling is a later slot + tail fields. */
+#define XRT_CONV_MAX_VIEWS 8
+#define XRT_CONV_MAX_CAPABILITIES 32 //!< per provider
+#define XRT_CONV_MAX_FRAME_IMAGES 4  //!< inputs per stream frame / job
 #define XRT_CONV_NAME_MAX 64
 #define XRT_CONV_DETAIL_MAX 128
 
@@ -128,12 +129,13 @@ struct xrt_conversion_plugin_instance; //!< opaque, provider-defined (may be NUL
 #define XRT_CONV_INPUT_MONO (1u << 0)        //!< one colour image
 #define XRT_CONV_INPUT_STEREO_PAIR (1u << 1) //!< rectified L/R (two images or one SBS) + calibration
 #define XRT_CONV_INPUT_COLOR_DEPTH (1u << 2) //!< colour + depth (VIEWS_FROM_DEPTH)
-#define XRT_CONV_INPUT_ENCODED (1u << 3)     //!< RESERVED — no code in v1 (job lane, encoded bytes; the runtime sends decoded pixels)
+//! RESERVED — no code in v1 (job lane, encoded bytes; the runtime sends decoded pixels)
+#define XRT_CONV_INPUT_ENCODED (1u << 3)
 /*! @} */
 
 /*! @name Output bits @{ */
 #define XRT_CONV_OUT_VIEWS (1u << 0)
-#define XRT_CONV_OUT_DEPTH (1u << 1)      //!< primary for DEPTH_*; same-inference aux for VIEWS_*
+#define XRT_CONV_OUT_DEPTH (1u << 1) //!< primary for DEPTH_*; same-inference aux for VIEWS_*
 #define XRT_CONV_OUT_CONFIDENCE (1u << 2)
 #define XRT_CONV_OUT_DISPARITY (1u << 3)  //!< DISPARITY_STEREO primary
 #define XRT_CONV_OUT_SPLAT_BLOB (1u << 4) //!< SPLATS_* (blob sink)
@@ -151,7 +153,7 @@ struct xrt_conversion_plugin_instance; //!< opaque, provider-defined (may be NUL
 #define XRT_CONV_MEM_WIN32_KMT_HANDLE (1u << 2) //!< legacy D3D11 shared handle (same adapter only)
 #define XRT_CONV_MEM_VK_OPAQUE_FD (1u << 3)
 #define XRT_CONV_MEM_VK_OPAQUE_WIN32 (1u << 4)
-#define XRT_CONV_MEM_DMABUF (1u << 5)           //!< + drm_modifier
+#define XRT_CONV_MEM_DMABUF (1u << 5) //!< + drm_modifier
 #define XRT_CONV_MEM_IOSURFACE (1u << 6)
 #define XRT_CONV_MEM_AHARDWAREBUFFER (1u << 7)
 /*! @} */
@@ -182,12 +184,12 @@ struct xrt_conversion_plugin_instance; //!< opaque, provider-defined (may be NUL
 
 /*! @name Colour space @{ */
 #define XRT_CONV_CS_UNKNOWN 0u
-#define XRT_CONV_CS_SRGB 1u          //!< sRGB-encoded values (in a UNORM or SRGB format)
+#define XRT_CONV_CS_SRGB 1u //!< sRGB-encoded values (in a UNORM or SRGB format)
 #define XRT_CONV_CS_LINEAR 2u
 #define XRT_CONV_CS_BT709_LIMITED 3u //!< YUV video range
 #define XRT_CONV_CS_BT709_FULL 4u
 #define XRT_CONV_CS_BT2020_PQ 5u
-#define XRT_CONV_CS_DATA 6u          //!< not colour (depth / disparity / confidence)
+#define XRT_CONV_CS_DATA 6u //!< not colour (depth / disparity / confidence)
 /*! @} */
 
 /*! A sync primitive attached to an image. The handle is BORROWED for the
@@ -197,9 +199,9 @@ struct xrt_conversion_plugin_instance; //!< opaque, provider-defined (may be NUL
  *  a new slot. sizeof == 40 (asserted). */
 struct xrt_conv_sync
 {
-	uint32_t kind;          //!< XRT_CONV_SYNC_*
-	uint32_t reserved_0;    //!< explicit padding; 0
-	uint64_t handle;        //!< NT HANDLE / fd / port, widened
+	uint32_t kind;       //!< XRT_CONV_SYNC_*
+	uint32_t reserved_0; //!< explicit padding; 0
+	uint64_t handle;     //!< NT HANDLE / fd / port, widened
 	uint64_t import_key;
 	uint64_t acquire_value; //!< wait for ≥ this before access (keyed mutex: acquire key)
 	uint64_t release_value; //!< signal when done (keyed mutex: release key)
@@ -212,11 +214,11 @@ struct xrt_conv_sync
  *  a new slot. sizeof == 128 on 64-bit targets (asserted). */
 struct xrt_conv_image
 {
-	uint32_t memory_kind;   //!< exactly one XRT_CONV_MEM_* bit; 0 = "not present / not requested"
-	uint32_t reserved_0;    //!< explicit padding; 0
-	uint64_t handle;        //!< shareable handle (not CPU), borrowed for the call
-	uint64_t import_key;    //!< runtime-unique per allocation; same key ⇒ same memory
-	void *cpu_ptr;          //!< XRT_CONV_MEM_CPU only, mapped in the calling process
+	uint32_t memory_kind; //!< exactly one XRT_CONV_MEM_* bit; 0 = "not present / not requested"
+	uint32_t reserved_0;  //!< explicit padding; 0
+	uint64_t handle;      //!< shareable handle (not CPU), borrowed for the call
+	uint64_t import_key;  //!< runtime-unique per allocation; same key ⇒ same memory
+	void *cpu_ptr;        //!< XRT_CONV_MEM_CPU only, mapped in the calling process
 	uint64_t byte_size;
 	uint32_t width, height; //!< texels (plane 0)
 	uint32_t format;        //!< XRT_CONV_FMT_*
@@ -224,9 +226,9 @@ struct xrt_conv_image
 	uint32_t row_stride;    //!< bytes for CPU / linear; 0 for opaque GPU textures
 	uint32_t plane1_offset; //!< NV12 chroma (CPU / linear)
 	uint32_t plane1_stride;
-	uint32_t array_layer;   //!< layer of an array image (ADR-032); 0 for flat
-	uint64_t drm_modifier;  //!< DMABUF only
-	uint64_t adapter_luid;  //!< adapter the memory lives on; 0 = CPU / unknown
+	uint32_t array_layer;  //!< layer of an array image (ADR-032); 0 for flat
+	uint64_t drm_modifier; //!< DMABUF only
+	uint64_t adapter_luid; //!< adapter the memory lives on; 0 = CPU / unknown
 	struct xrt_conv_sync sync;
 };
 
@@ -245,11 +247,11 @@ struct xrt_conv_image
 #define XRT_CONV_STATE_ABSENT 3u       //!< its dependency or model is not installed
 #define XRT_CONV_STATE_INCOMPATIBLE 4u //!< installed but unusable (version / OS / GPU / driver)
 #define XRT_CONV_STATE_UNLICENSED 5u
-#define XRT_CONV_STATE_FAILED 6u       //!< failure_reason says which
-#define XRT_CONV_STATE_DISABLED 7u     //!< configuration
-#define XRT_CONV_STATE_INSTALLED 8u    //!< present and cold; warm() makes it READY
-#define XRT_CONV_STATE_DOWNLOADING 9u  //!< model bytes in flight; progress valid
-#define XRT_CONV_STATE_EVICTED 10u     //!< was READY; unloaded (idle)
+#define XRT_CONV_STATE_FAILED 6u      //!< failure_reason says which
+#define XRT_CONV_STATE_DISABLED 7u    //!< configuration
+#define XRT_CONV_STATE_INSTALLED 8u   //!< present and cold; warm() makes it READY
+#define XRT_CONV_STATE_DOWNLOADING 9u //!< model bytes in flight; progress valid
+#define XRT_CONV_STATE_EVICTED 10u    //!< was READY; unloaded (idle)
 /*! @} */
 
 /*! @name failure_reason @{ */
@@ -274,8 +276,8 @@ struct xrt_conv_state
 	uint32_t retryable;      //!< non-zero: a later warm() may succeed
 	float progress;          //!< [0,1] WARMING / DOWNLOADING; < 0 = indeterminate
 	uint32_t reserved_0;
-	uint64_t eta_ns;         //!< 0 = unknown
-	char version[48];        //!< dependency / model version actually resolved
+	uint64_t eta_ns;                  //!< 0 = unknown
+	char version[48];                 //!< dependency / model version actually resolved
 	char detail[XRT_CONV_DETAIL_MAX]; //!< for a human, verbatim, never parsed
 };
 
@@ -322,7 +324,7 @@ struct xrt_conv_state
 #define XRT_CONV_CAP_USES_MODEL_STORE (1u << 5)      //!< resolves models via host->model_resolve (§4)
 #define XRT_CONV_CAP_DETERMINISTIC (1u << 6)         //!< same input ⇒ same bytes (tests)
 #define XRT_CONV_CAP_LANES_CONCURRENT (1u << 7)      //!< job_execute may overlap stream_* calls; else serialised
-#define XRT_CONV_CAP_WARM_CONCURRENT (1u << 8)       //!< warm may overlap converts; else serialised (stall reported in stats)
+#define XRT_CONV_CAP_WARM_CONCURRENT (1u << 8) //!< warm may overlap converts; else serialised (stall reported in stats)
 /*! @} */
 
 /*! One capability = (task × model × backend × device). Top-level: the
@@ -333,12 +335,12 @@ struct xrt_conv_state
 struct xrt_conv_capability
 {
 	uint32_t struct_size;
-	uint32_t cap_id;          //!< provider-chosen, non-zero, stable for the instance's life
-	uint32_t task;            //!< XRT_CONV_TASK_*
-	uint32_t lanes;           //!< XRT_CONV_LANE_*
-	uint32_t input_kinds;     //!< XRT_CONV_INPUT_*
-	uint32_t outputs;         //!< XRT_CONV_OUT_* it CAN produce
-	uint32_t flags;           //!< XRT_CONV_CAP_*
+	uint32_t cap_id;      //!< provider-chosen, non-zero, stable for the instance's life
+	uint32_t task;        //!< XRT_CONV_TASK_*
+	uint32_t lanes;       //!< XRT_CONV_LANE_*
+	uint32_t input_kinds; //!< XRT_CONV_INPUT_*
+	uint32_t outputs;     //!< XRT_CONV_OUT_* it CAN produce
+	uint32_t flags;       //!< XRT_CONV_CAP_*
 
 	/* Transport (the runtime converts / copies for anything not listed). */
 	uint32_t import_memory_kinds; //!< XRT_CONV_MEM_* bits
@@ -354,25 +356,25 @@ struct xrt_conv_capability
 	uint32_t preferred_input_edge; //!< the model's native long edge; 0 = n/a
 
 	/* Output contract (frame D9). */
-	uint32_t depth_kind;           //!< XRT_CONV_DEPTH_* of the primary / aux depth
-	uint32_t depth_measure;        //!< XRT_CONV_MEASURE_*
-	uint32_t intrinsics_source;    //!< what results will carry
-	uint32_t splat_formats;        //!< 1u << XRT_CONV_BLOB_*
+	uint32_t depth_kind;        //!< XRT_CONV_DEPTH_* of the primary / aux depth
+	uint32_t depth_measure;     //!< XRT_CONV_MEASURE_*
+	uint32_t intrinsics_source; //!< what results will carry
+	uint32_t splat_formats;     //!< 1u << XRT_CONV_BLOB_*
 
 	/* Licence + identity (diagnostics; never shown to apps as names). */
-	uint32_t licence_class;        //!< XRT_CONV_LICENCE_*
-	uint32_t commercial_ok;        //!< 1 = model AND every dependency permit commercial use
-	char licence_spdx[48];         //!< "MIT", "Apache-2.0", "LicenseRef-<owner>"
+	uint32_t licence_class; //!< XRT_CONV_LICENCE_*
+	uint32_t commercial_ok; //!< 1 = model AND every dependency permit commercial use
+	char licence_spdx[48];  //!< "MIT", "Apache-2.0", "LicenseRef-<owner>"
 	char model_id[XRT_CONV_NAME_MAX];
 	char model_version[32];
-	char backend[32];              //!< e.g. "onnxruntime-dml", "vendor-native"
+	char backend[32]; //!< e.g. "onnxruntime-dml", "vendor-native"
 	char display_name[XRT_CONV_NAME_MAX];
-	uint32_t reserved_0;           //!< explicit padding before device_luid; 0
+	uint32_t reserved_0; //!< explicit padding before device_luid; 0
 
 	/* Device + cost estimates (0 = unknown). */
-	uint64_t device_luid;          //!< adapter it runs on once warm; 0 = CPU / undecided
+	uint64_t device_luid; //!< adapter it runs on once warm; 0 = CPU / undecided
 	uint32_t est_warmup_ms;
-	uint32_t est_latency_ms;       //!< per convert at preferred_input_edge, or per job
+	uint32_t est_latency_ms; //!< per convert at preferred_input_edge, or per job
 	uint32_t est_vram_mb;
 	uint32_t est_ram_mb;
 };
@@ -413,11 +415,11 @@ struct xrt_conv_capability
  *  a new slot. sizeof == 32 (asserted). */
 struct xrt_conv_stereo_calibration
 {
-	uint32_t eye_order;       //!< 0 = left first, 1 = right first
-	float fx, fy, cx, cy;     //!< px of ONE rectified eye
-	float baseline_m;         //!< 0 = UNKNOWN; never defaulted
-	float infinity_shift_px;  //!< disparity at infinity after rectification
-	uint32_t sbs_packed;      //!< 1 = both eyes in one side-by-side image
+	uint32_t eye_order;      //!< 0 = left first, 1 = right first
+	float fx, fy, cx, cy;    //!< px of ONE rectified eye
+	float baseline_m;        //!< 0 = UNKNOWN; never defaulted
+	float infinity_shift_px; //!< disparity at infinity after rectification
+	uint32_t sbs_packed;     //!< 1 = both eyes in one side-by-side image
 };
 
 /*! Everything the runtime decided (policy is runtime-owned, D10). Top-level:
@@ -425,31 +427,31 @@ struct xrt_conv_stereo_calibration
 struct xrt_conv_params
 {
 	uint32_t struct_size;
-	uint32_t frame_flags;     //!< XRT_CONV_FRAME_*
-	uint64_t source_time_ns;  //!< echoed in results
-	uint64_t frame_id;        //!< per stream, increasing
+	uint32_t frame_flags;    //!< XRT_CONV_FRAME_*
+	uint64_t source_time_ns; //!< echoed in results
+	uint64_t frame_id;       //!< per stream, increasing
 
 	/* Look. */
 	uint32_t convergence_mode; //!< XRT_CONV_CONVERGENCE_*
-	float convergence;        //!< DECODED mode: the zero-parallax plane in the DECODED units of this
-	                          //!< stream's depth output (value = value_scale * sample + value_shift, the
-	                          //!< mirror of depth_info.convergence_value). Polarity follows the depth
-	                          //!< kind: larger = nearer for *_INVERSE / *_DISPARITY, larger = farther
-	                          //!< for METRIC_DEPTH / AFFINE. The runtime maps an app's [0,1]
-	                          //!< "relative depth at glass" onto this using the last result's range;
-	                          //!< the provider never normalises it again. A given plane also means
-	                          //!< "provider auto-convergence OFF".
-	float strength;           //!< 1 = provider budget
-	uint32_t view_count;      //!< VIEWS_*: validated against min/max_views
-	uint32_t content_hint;    //!< XRT_CONV_CONTENT_*
-	float input_scale;        //!< ADVISORY; the runtime already applied max_input_edge
-	float focal_px;           //!< input px; ≤ 0 = unknown (never invented)
+	float convergence;         //!< DECODED mode: the zero-parallax plane in the DECODED units of this
+	                           //!< stream's depth output (value = value_scale * sample + value_shift, the
+	                           //!< mirror of depth_info.convergence_value). Polarity follows the depth
+	                           //!< kind: larger = nearer for *_INVERSE / *_DISPARITY, larger = farther
+	                           //!< for METRIC_DEPTH / AFFINE. The runtime maps an app's [0,1]
+	                           //!< "relative depth at glass" onto this using the last result's range;
+	                           //!< the provider never normalises it again. A given plane also means
+	                           //!< "provider auto-convergence OFF".
+	float strength;            //!< 1 = provider budget
+	uint32_t view_count;       //!< VIEWS_*: validated against min/max_views
+	uint32_t content_hint;     //!< XRT_CONV_CONTENT_*
+	float input_scale;         //!< ADVISORY; the runtime already applied max_input_edge
+	float focal_px;            //!< input px; ≤ 0 = unknown (never invented)
 
 	/* Viewpoint policy (ADR-048), already applied. */
 	uint32_t viewpoint_frame;
 	uint32_t viewpoint_source;
 	uint32_t axis_mode;
-	uint32_t viewpoint_count; //!< == view_count for VIEWS_*; else 0
+	uint32_t viewpoint_count;                    //!< == view_count for VIEWS_*; else 0
 	float viewpoints_xyz[XRT_CONV_MAX_VIEWS][3]; //!< metres, rect-relative, +z toward viewer
 	float rect_width_m, rect_height_m;
 	float baseline_m;
@@ -470,35 +472,38 @@ struct xrt_conv_params
  *  a new slot. sizeof == 128 (asserted). */
 struct xrt_conv_depth_info
 {
-	uint32_t kind;                 //!< XRT_CONV_DEPTH_*
-	uint32_t measure;              //!< XRT_CONV_MEASURE_*
+	uint32_t kind;    //!< XRT_CONV_DEPTH_*
+	uint32_t measure; //!< XRT_CONV_MEASURE_*
 	uint32_t intrinsics_source;
 	float value_scale, value_shift; //!< value = scale * sample + shift (scale 0 read as 1)
-	float near_value, far_value;   //!< decoded; far < near ⇒ infinite far; 0,0 = unknown
-	float invalid_sample;          //!< raw "no data" value; NaN = none
-	float range_min, range_max;    //!< decoded per-frame extent BEFORE any normalisation
-	float range_p05, range_p95;    //!< 0,0 = not computed
-	float fx, fy, cx, cy;          //!< depth-image texels; ≤ 0 = unknown
+	float near_value, far_value;    //!< decoded; far < near ⇒ infinite far; 0,0 = unknown
+	float invalid_sample;           //!< raw "no data" value; NaN = none
+	float range_min, range_max;     //!< decoded per-frame extent BEFORE any normalisation
+	float range_p05, range_p95;     //!< 0,0 = not computed
+	float fx, fy, cx, cy;           //!< depth-image texels; ≤ 0 = unknown
 	uint32_t source_width, source_height;
-	float convergence_value;       //!< decoded value at zero disparity of the paired views; valid iff (suggest_flags & 4)
-	float suggested_convergence;   //!< provider hint, DECODED units (see params.convergence); valid iff (suggest_flags & 1)
-	float suggested_strength;      //!< provider hint for the disparity budget, 1 = its own; valid iff (suggest_flags & 2).
-	                               //!< Both hints are IGNORED by policy unless the provider is validated against the corpus.
-	uint32_t suggest_flags;        //!< bit0 suggested_convergence, bit1 suggested_strength, bit2 convergence_value
-	uint32_t relief_valid;         //!< ADR-046 A1: z_front_m = relief_scale/value + relief_offset
+	float convergence_value; //!< decoded value at zero disparity of the paired views; valid iff (suggest_flags & 4)
+	float suggested_convergence; //!< provider hint, DECODED units (see params.convergence); valid iff
+	                             //!< (suggest_flags & 1)
+	float suggested_strength; //!< provider hint for the disparity budget, 1 = its own; valid iff (suggest_flags &
+	                          //!< 2). Both hints are IGNORED by policy unless the provider is validated against the
+	                          //!< corpus.
+	uint32_t suggest_flags;   //!< bit0 suggested_convergence, bit1 suggested_strength, bit2 convergence_value
+	uint32_t relief_valid;    //!< ADR-046 A1: z_front_m = relief_scale/value + relief_offset
 	float relief_scale, relief_offset;
-	uint32_t temporal;             //!< from a temporal model
-	uint32_t same_inference;       //!< same inference as this frame's views
+	uint32_t temporal;       //!< from a temporal model
+	uint32_t same_inference; //!< same inference as this frame's views
 	uint32_t has_confidence;
 	uint64_t source_time_ns;
-	uint64_t provider_frame_id;    //!< informational
+	uint64_t provider_frame_id; //!< informational
 };
 
 /*! @name Views layout (xrt_conv_stream_info::views_layout, xrt_conv_views_info::layout) @{ */
 #define XRT_CONV_VIEWS_ROW 0u   //!< N views side by side, view 0 leftmost (today's SBS / NVIEW)
 #define XRT_CONV_VIEWS_ARRAY 1u //!< view i in array layer i (ADR-032)
-#define XRT_CONV_VIEWS_ATLAS 2u //!< RESERVED: columns × rows, row-major. The runtime picks ATLAS or
-                                //!< ARRAY when N × w exceeds the texture limit (not reachable at 8 views)
+/*! RESERVED: columns × rows, row-major. The runtime picks ATLAS or ARRAY when
+ *  N × w exceeds the texture limit (not reachable at 8 views). */
+#define XRT_CONV_VIEWS_ATLAS 2u
 /*! @} */
 
 /*! FROZEN: growth goes at the tail of the enclosing top-level struct or into
@@ -506,8 +511,8 @@ struct xrt_conv_depth_info
 struct xrt_conv_views_info
 {
 	uint32_t view_count;
-	uint32_t layout;               //!< must equal the target's layout
-	uint32_t reserved_0;           //!< 0
+	uint32_t layout;                      //!< must equal the target's layout
+	uint32_t reserved_0;                  //!< 0
 	float eye_xyz[XRT_CONV_MAX_VIEWS][3]; //!< viewpoints actually rendered
 	float baseline_m;
 	float hfov_deg;                //!< one view; ≤ 0 = unknown
@@ -532,15 +537,15 @@ struct xrt_conv_views_info
 struct xrt_conv_splat_info
 {
 	uint32_t blob_format;
-	uint32_t coords;              //!< XRT_CONV_COORDS_*
-	uint32_t color_space;         //!< tag honestly
-	uint32_t metric;              //!< 1 = metres are real
+	uint32_t coords;      //!< XRT_CONV_COORDS_*
+	uint32_t color_space; //!< tag honestly
+	uint32_t metric;      //!< 1 = metres are real
 	uint32_t intrinsics_source;
-	float fx, fy, cx, cy;         //!< of the grid actually unprojected through
+	float fx, fy, cx, cy; //!< of the grid actually unprojected through
 	uint32_t grid_width, grid_height;
-	float baseline_m;             //!< 0 = unknown; never defaulted
+	float baseline_m;               //!< 0 = unknown; never defaulted
 	float focus_z_m, near_m, far_m; //!< 0 = unknown
-	uint32_t reserved_0;          //!< explicit padding before splat_count; 0
+	uint32_t reserved_0;            //!< explicit padding before splat_count; 0
 	uint64_t splat_count;
 };
 
@@ -554,11 +559,11 @@ struct xrt_conv_splat_info
 struct xrt_conv_stream_info
 {
 	uint32_t struct_size;
-	uint32_t input_kind;          //!< one XRT_CONV_INPUT_* bit
-	uint32_t outputs;             //!< subset of cap.outputs the runtime will request
+	uint32_t input_kind; //!< one XRT_CONV_INPUT_* bit
+	uint32_t outputs;    //!< subset of cap.outputs the runtime will request
 	uint32_t content_hint;
-	uint32_t view_count;          //!< VIEWS_*: fixed for the stream
-	uint32_t views_layout;        //!< XRT_CONV_VIEWS_*
+	uint32_t view_count;   //!< VIEWS_*: fixed for the stream
+	uint32_t views_layout; //!< XRT_CONV_VIEWS_*
 	uint32_t max_input_width, max_input_height;
 };
 
@@ -600,13 +605,13 @@ struct xrt_conv_frame_in
 struct xrt_conv_frame_out
 {
 	uint32_t struct_size;
-	uint32_t written;             //!< XRT_CONV_OUT_* actually written
+	uint32_t written; //!< XRT_CONV_OUT_* actually written
 	struct xrt_conv_image views;
 	struct xrt_conv_image depth;
 	struct xrt_conv_image confidence;
 	struct xrt_conv_image disparity;
 	struct xrt_conv_views_info views_info;
-	uint32_t reserved_pad;         //!< explicit padding before depth_info (8-aligned); 0
+	uint32_t reserved_pad; //!< explicit padding before depth_info (8-aligned); 0
 	struct xrt_conv_depth_info depth_info;
 };
 
@@ -620,7 +625,7 @@ struct xrt_conv_frame_out
 struct xrt_conv_blob_sink
 {
 	uint32_t struct_size;
-	uint32_t role;                //!< XRT_CONV_OUT_* this sink receives
+	uint32_t role; //!< XRT_CONV_OUT_* this sink receives
 	void *ctx;
 	bool (*begin)(void *ctx, uint32_t blob_format, uint64_t size_hint);
 	bool (*write)(void *ctx, const void *bytes, uint64_t count);
@@ -633,11 +638,11 @@ struct xrt_conv_job_in
 	uint32_t struct_size;
 	uint32_t input_kind;
 	uint32_t image_count;
-	uint32_t encoded_count;       //!< RESERVED (XRT_CONV_INPUT_ENCODED, no code in v1): 0
+	uint32_t encoded_count; //!< RESERVED (XRT_CONV_INPUT_ENCODED, no code in v1): 0
 	uint32_t image_role[XRT_CONV_MAX_FRAME_IMAGES];
 	struct xrt_conv_image images[XRT_CONV_MAX_FRAME_IMAGES];
-	const void *encoded[2];       //!< RESERVED: NULL in v1
-	uint64_t encoded_size[2];     //!< RESERVED: 0 in v1
+	const void *encoded[2];         //!< RESERVED: NULL in v1
+	uint64_t encoded_size[2];       //!< RESERVED: 0 in v1
 	uint32_t requested_blob_format; //!< XRT_CONV_BLOB_*; 0 = provider default
 	uint32_t reserved_0;
 };
@@ -648,7 +653,7 @@ struct xrt_conv_job_control
 	uint32_t struct_size;
 	uint32_t sink_count;
 	struct xrt_conv_blob_sink *sinks;
-	void *ctx;                    //!< passed to progress and is_cancelled
+	void *ctx;                                                      //!< passed to progress and is_cancelled
 	void (*progress)(void *ctx, float fraction, const char *stage); //!< runtime throttles
 	/*! Poll at least every 250 ms; true ⇒ stop and return. Thread-safe,
 	 *  non-blocking, cheap; once true it stays true for the call. In a
@@ -661,11 +666,11 @@ struct xrt_conv_job_control
 struct xrt_conv_job_out
 {
 	uint32_t struct_size;
-	uint32_t written;             //!< XRT_CONV_OUT_* delivered to sinks
+	uint32_t written; //!< XRT_CONV_OUT_* delivered to sinks
 	struct xrt_conv_splat_info splat_info;
 	struct xrt_conv_depth_info depth_info;
 	struct xrt_conv_views_info views_info;
-	uint32_t reserved_pad;         //!< explicit tail padding (8-aligned size); 0
+	uint32_t reserved_pad; //!< explicit tail padding (8-aligned size); 0
 };
 
 /*
@@ -681,8 +686,8 @@ struct xrt_conv_job_out
 struct xrt_conv_provider_status
 {
 	uint32_t struct_size;
-	uint32_t state;   //!< xrt_plugin_platform_state values
-	uint32_t flags;   //!< XRT_CONV_PROVIDER_FLAG_*
+	uint32_t state; //!< xrt_plugin_platform_state values
+	uint32_t flags; //!< XRT_CONV_PROVIDER_FLAG_*
 	uint32_t reserved_0;
 	char hint[128];
 };
@@ -716,10 +721,10 @@ struct xrt_conv_adapter_hint
 struct xrt_conv_model_location
 {
 	uint32_t struct_size;
-	uint32_t state;          //!< READY / DOWNLOADING / ABSENT / FAILED
+	uint32_t state; //!< READY / DOWNLOADING / ABSENT / FAILED
 	float progress;
 	uint32_t failure_reason;
-	char path[512];          //!< UTF-8 absolute path of the verified blob when READY
+	char path[512]; //!< UTF-8 absolute path of the verified blob when READY
 };
 
 /*!
@@ -733,7 +738,7 @@ struct xrt_conversion_plugin_host_iface
 {
 	uint32_t struct_size;
 	uint32_t host_api_version;
-	uint32_t host_flags;     //!< bit0: hosted out of the service (satellite); bit1: headless / CI
+	uint32_t host_flags; //!< bit0: hosted out of the service (satellite); bit1: headless / CI
 	uint32_t reserved_0;
 
 	bool (*get_path)(uint32_t kind, char *buf, uint32_t buf_size);
@@ -794,10 +799,10 @@ struct xrt_conversion_plugin_iface
 {
 	uint32_t struct_size;
 	uint32_t reserved_0;
-	const char *id;           //!< == registry / manifest <id>
+	const char *id; //!< == registry / manifest <id>
 	const char *display_name;
-	const char *vendor;       //!< may be NULL
-	const char *version;      //!< may be NULL
+	const char *vendor;  //!< may be NULL
+	const char *version; //!< may be NULL
 
 	/*! [C], no instance, ≤ 100 ms. Are the provider's dependencies there? */
 	bool (*get_provider_status)(struct xrt_conv_provider_status *out);
