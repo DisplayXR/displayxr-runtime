@@ -115,14 +115,15 @@ client_gl_d3d11_swapchain(struct xrt_swapchain *xsc)
  * Swapchain functions.
  */
 
+/*!
+ * Release every GL/D3D11 object the swapchain holds. Needs the GL context
+ * current (and the compositor's context_mutex held) for the GL and WGL calls;
+ * @p have_context false skips only glDeleteTextures, as destroy always did when
+ * it could not make the context current.
+ */
 static void
-client_gl_d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
+release_interop_resources(struct client_gl_d3d11_swapchain *sc, bool have_context)
 {
-	struct client_gl_d3d11_swapchain *sc = client_gl_d3d11_swapchain(xsc);
-	struct client_gl_compositor *c = sc->base.gl_compositor;
-
-	enum xrt_result xret = client_gl_compositor_context_begin(&c->base.base, CLIENT_GL_CONTEXT_REASON_OTHER);
-
 	for (uint32_t i = 0; i < sc->image_count; i++) {
 		if (sc->dx_interop_objects[i]) {
 			pfn_wglDXUnregisterObjectNV((HANDLE)sc->dx_interop_device,
@@ -146,7 +147,7 @@ client_gl_d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		}
 	}
 
-	if (sc->base.base.base.image_count > 0 && xret == XRT_SUCCESS) {
+	if (sc->base.base.base.image_count > 0 && have_context) {
 		glDeleteTextures(sc->base.base.base.image_count, &sc->base.base.images[0]);
 	}
 
@@ -170,6 +171,17 @@ client_gl_d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		    (ID3D11Device *)sc->dx_device);
 		sc->dx_device = NULL;
 	}
+}
+
+static void
+client_gl_d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
+{
+	struct client_gl_d3d11_swapchain *sc = client_gl_d3d11_swapchain(xsc);
+	struct client_gl_compositor *c = sc->base.gl_compositor;
+
+	enum xrt_result xret = client_gl_compositor_context_begin(&c->base.base, CLIENT_GL_CONTEXT_REASON_OTHER);
+
+	release_interop_resources(sc, xret == XRT_SUCCESS);
 
 	if (xret == XRT_SUCCESS) {
 		client_gl_compositor_context_end(&c->base.base, CLIENT_GL_CONTEXT_REASON_OTHER);
@@ -375,9 +387,10 @@ client_gl_d3d11_swapchain_create(struct xrt_compositor *xc,
 		// Register the STAGING texture (not the shared one) with WGL interop
 		HANDLE interop_obj = pfn_wglDXRegisterObjectNV(
 		    interop_device, staging_tex,
-		    xscgl->images[i], GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+		    xscgl->images[i], tex_target, WGL_ACCESS_READ_WRITE_NV);
 		if (!interop_obj) {
-			U_LOG_E("wglDXRegisterObjectNV failed for image %u: %lu", i, GetLastError());
+			U_LOG_E("wglDXRegisterObjectNV failed for image %u (target 0x%04x, %ux%u x%u layers): %lu", i,
+			        tex_target, desc.Width, desc.Height, desc.ArraySize, GetLastError());
 			goto err_cleanup;
 		}
 		sc->dx_interop_objects[i] = interop_obj;
@@ -401,7 +414,13 @@ client_gl_d3d11_swapchain_create(struct xrt_compositor *xc,
 	return &sc->base.base.base;
 
 err_cleanup:
-	// Clean up on failure — call destroy which handles partial init
-	client_gl_d3d11_swapchain_destroy(&sc->base.base.base);
+	// The caller (client_gl_swapchain_create) holds the compositor's
+	// context_mutex with the context current, and still owns xscn: it drops
+	// that reference itself when we return NULL. So release only what this
+	// function created. Calling destroy here re-entered context_begin on the
+	// non-recursive context_mutex and hung the app (forced-IPC GL CTS), and
+	// would also have dropped xscn a second time.
+	release_interop_resources(sc, true);
+	free(sc);
 	return NULL;
 }
