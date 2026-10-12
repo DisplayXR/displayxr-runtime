@@ -2638,3 +2638,97 @@ TEST_CASE("cursor_soften: the default opacity reaches 0.5 at the typical lift (0
 	CHECK(u_cursor_draw_soften(-0.015f, 0.0f, &p).alpha == Catch::Approx(0.75f)); // smoothstep midpoint
 	CHECK(u_cursor_draw_soften(-0.2f, 0.0f, &p).alpha == Catch::Approx(0.5f));
 }
+
+/*
+ * ADR-046 Phase 4: the D3D11 service draws IPC clients' cursors as axis-aligned
+ * target-pixel rects (svc_draw_cursor_quads).
+ */
+
+TEST_CASE("cursor_service: a view's quad maps into its tile's target pixels")
+{
+	// One unit = the canvas height; a sprite 0.1 units tall, aspect 0.5, hotspot
+	// top-left, landing at the tile's centre with the display's own axes
+	// (x right, y up -> tile y down).
+	u_cursor_draw_view v = {};
+	v.origin[0] = 0.5f;
+	v.origin[1] = 0.5f;
+	v.axis_x[0] = 1.0f;
+	v.axis_y[1] = -1.0f;
+	float corners[4][2];
+	u_cursor_draw_corners(&v, 0.1f, 0.5f, 0.0f, 0.0f, corners);
+	// The right-hand tile of a 2 x 1 atlas whose tiles are 640 x 480 px.
+	const float tile[4] = {640.0f, 0.0f, 640.0f, 480.0f};
+	float r[4];
+	REQUIRE(u_cursor_draw_quad_rect(corners, tile, r));
+	CHECK(r[0] == Catch::Approx(640.0f + 0.5f * 640.0f)); // hotspot = top-left corner
+	CHECK(r[1] == Catch::Approx(0.5f * 480.0f));
+	CHECK(r[2] == Catch::Approx(0.05f * 640.0f)); // 0.1 x 0.5 tile widths
+	CHECK(r[3] == Catch::Approx(0.1f * 480.0f));
+
+	// A centred hotspot moves the rect by half its size, never its size.
+	u_cursor_draw_corners(&v, 0.1f, 0.5f, 0.5f, 0.5f, corners);
+	float rc[4];
+	REQUIRE(u_cursor_draw_quad_rect(corners, tile, rc));
+	CHECK(rc[0] == Catch::Approx(r[0] - 0.5f * r[2]));
+	CHECK(rc[1] == Catch::Approx(r[1] - 0.5f * r[3]));
+	CHECK(rc[2] == Catch::Approx(r[2]));
+	CHECK(rc[3] == Catch::Approx(r[3]));
+}
+
+TEST_CASE("cursor_service: degenerate quads and tiles draw nothing")
+{
+	float flat[4][2] = {{0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}};
+	const float tile[4] = {0.0f, 0.0f, 100.0f, 100.0f};
+	float r[4];
+	CHECK_FALSE(u_cursor_draw_quad_rect(flat, tile, r));
+	float ok[4][2] = {{0.1f, 0.1f}, {0.1f, 0.2f}, {0.2f, 0.1f}, {0.2f, 0.2f}};
+	const float empty[4] = {0.0f, 0.0f, 0.0f, 100.0f};
+	CHECK_FALSE(u_cursor_draw_quad_rect(ok, empty, r));
+	ok[3][0] = NAN;
+	CHECK_FALSE(u_cursor_draw_quad_rect(ok, tile, r));
+}
+
+TEST_CASE("cursor_service: the shell lift takes each view's offset from the outer pair's midpoint")
+{
+	u_cursor_draw_request req = {};
+	req.requested = true;
+	req.view_count = 2;
+	// Crossed disparity: the left view's hotspot sits RIGHT of the right view's.
+	req.view[0].origin[0] = 0.52f;
+	req.view[0].origin[1] = 0.40f;
+	req.view[1].origin[0] = 0.48f;
+	req.view[1].origin[1] = 0.40f;
+	float l[2], rr[2];
+	REQUIRE(u_cursor_draw_view_offset(&req, 0, l));
+	REQUIRE(u_cursor_draw_view_offset(&req, 1, rr));
+	CHECK(l[0] == Catch::Approx(0.02f));
+	CHECK(rr[0] == Catch::Approx(-0.02f));
+	CHECK(l[1] == Catch::Approx(0.0f).margin(1e-6));
+	// Symmetric, so the workspace cursor's own position (the click point) is the
+	// midpoint and only the disparity is added.
+	CHECK(l[0] + rr[0] == Catch::Approx(0.0f).margin(1e-6));
+
+	// N views: offsets are from the OUTERMOST pair's midpoint, inner views between.
+	req.view_count = 4;
+	req.view[0].origin[0] = 0.53f;
+	req.view[1].origin[0] = 0.51f;
+	req.view[2].origin[0] = 0.49f;
+	req.view[3].origin[0] = 0.47f;
+	float o1[2], o3[2];
+	REQUIRE(u_cursor_draw_view_offset(&req, 1, o1));
+	REQUIRE(u_cursor_draw_view_offset(&req, 3, o3));
+	CHECK(o1[0] == Catch::Approx(0.01f));
+	CHECK(o3[0] == Catch::Approx(-0.03f));
+
+	// On the glass every view coincides: no offset, the flat cursor exactly.
+	for (uint32_t i = 0; i < 4; i++) {
+		req.view[i].origin[0] = 0.5f;
+	}
+	REQUIRE(u_cursor_draw_view_offset(&req, 0, l));
+	CHECK(l[0] == 0.0f);
+
+	// Out of range / too few views: nothing.
+	CHECK_FALSE(u_cursor_draw_view_offset(&req, 4, l));
+	req.view_count = 1;
+	CHECK_FALSE(u_cursor_draw_view_offset(&req, 0, l));
+}

@@ -1800,3 +1800,50 @@ u_cursor_draw_soften_quad(
 		out->corners[k][1] = corners[0][1] + u * uy + v * vy;
 	}
 }
+
+bool
+u_cursor_draw_quad_rect(const float corners[4][2], const float tile[4], float out_rect[4])
+{
+	if (corners == NULL || tile == NULL || out_rect == NULL || !(tile[2] > 0.0f) || !(tile[3] > 0.0f) ||
+	    !isfinite(tile[0]) || !isfinite(tile[1]) || !isfinite(tile[2]) || !isfinite(tile[3])) {
+		return false;
+	}
+	for (int k = 0; k < 4; k++) {
+		// A NaN would slip through the min/max below (every comparison is false).
+		if (!isfinite(corners[k][0]) || !isfinite(corners[k][1])) {
+			return false;
+		}
+	}
+	float x0 = corners[0][0], x1 = corners[0][0], y0 = corners[0][1], y1 = corners[0][1];
+	for (int k = 1; k < 4; k++) {
+		x0 = corners[k][0] < x0 ? corners[k][0] : x0;
+		x1 = corners[k][0] > x1 ? corners[k][0] : x1;
+		y0 = corners[k][1] < y0 ? corners[k][1] : y0;
+		y1 = corners[k][1] > y1 ? corners[k][1] : y1;
+	}
+	if (!isfinite(x0) || !isfinite(x1) || !isfinite(y0) || !isfinite(y1) || !(x1 > x0) || !(y1 > y0)) {
+		return false;
+	}
+	out_rect[0] = tile[0] + x0 * tile[2];
+	out_rect[1] = tile[1] + y0 * tile[3];
+	out_rect[2] = (x1 - x0) * tile[2];
+	out_rect[3] = (y1 - y0) * tile[3];
+	return true;
+}
+
+bool
+u_cursor_draw_view_offset(const struct u_cursor_draw_request *req, uint32_t view, float out_off[2])
+{
+	if (req == NULL || out_off == NULL) {
+		return false;
+	}
+	const uint32_t n = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	if (n < 2 || view >= n) {
+		return false;
+	}
+	const float mx = 0.5f * (req->view[0].origin[0] + req->view[n - 1].origin[0]);
+	const float my = 0.5f * (req->view[0].origin[1] + req->view[n - 1].origin[1]);
+	out_off[0] = req->view[view].origin[0] - mx;
+	out_off[1] = req->view[view].origin[1] - my;
+	return isfinite(out_off[0]) && isfinite(out_off[1]);
+}
