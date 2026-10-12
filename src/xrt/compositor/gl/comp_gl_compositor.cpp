@@ -5387,9 +5387,15 @@ gl_repaint_thread(void *ptr)
 		// Release unconditionally — see the note above about wedging the app.
 		wglMakeCurrent(NULL, NULL);
 #elif defined(__APPLE__)
+		// Only ever a compositor-PRIVATE context here: an app-owned one keeps
+		// this thread from starting at all (#1947, see the create path). The
+		// CGL lock is the one AppKit takes around -[NSOpenGLContext update]
+		// when the view's surface changes on the main thread.
+		comp_gl_window_macos_lock(c->macos_window);
 		comp_gl_window_macos_make_current(c->macos_window);
 		rp_start_ns = os_monotonic_get_ns();
 		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
+		comp_gl_window_macos_unlock(c->macos_window);
 #endif
 
 		c->repaint.count++;
@@ -8867,6 +8873,30 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "
 			        "of app rate. Correctness probe; it WILL cost frame rate.");
 		}
+#ifdef __APPLE__
+		/*
+		 * #1947: never repaint on the APP's own GL context.
+		 *
+		 * A handle app that binds an NSOpenGLView hands us that view, and
+		 * comp_gl_window_macos_setup_external adopts the view's openGLContext
+		 * — the same CGL context the app renders with. The app thread uses it
+		 * freely between its xr* calls (RenderScene runs between xrBeginFrame
+		 * and xrEndFrame, outside c->mutex and outside app_frame_in_progress,
+		 * which only spans xrEndFrame), so a repaint replaying on it from this
+		 * thread drives one GLDContextRec from two threads at once. Measured:
+		 * SIGSEGV in GLRResourceList::addResource under the repaint's
+		 * glBlitFramebuffer while the main thread was in RenderScene's
+		 * flushContext, ~1 launch in 5. No lock the runtime takes can cover
+		 * the app's own GL calls, so the replay is off for this configuration;
+		 * the app's frames weave and present exactly as before. Private
+		 * contexts (own window, plain NSView, offscreen texture) keep it.
+		 */
+		if (c->repaint.enabled == 1 && comp_gl_window_macos_context_is_app_owned(c->macos_window)) {
+			c->repaint.enabled = 0;
+			U_LOG_W("#868/#1947: weave repaint OFF — the compositor presents on the app's own "
+			        "NSOpenGLView context, which only the app thread may use");
+		}
+#endif
 		if (c->repaint.enabled == 1) {
 			os_thread_helper_start(&c->repaint_thread, gl_repaint_thread, c);
 		}

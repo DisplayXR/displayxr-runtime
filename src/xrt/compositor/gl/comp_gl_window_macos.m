@@ -45,6 +45,15 @@ struct comp_gl_window_macos
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+	/*!
+	 * #1947: true when gl_context is NOT ours but the app's own: the external
+	 * view is an NSOpenGLView and we adopted its openGLContext — the context
+	 * the app renders with. The runtime may then issue GL on it only from the
+	 * app's thread, inside the app's own xr* calls. See
+	 * comp_gl_window_macos_context_is_app_owned().
+	 */
+	bool context_is_app_owned;
 };
 
 static void
@@ -234,6 +243,10 @@ comp_gl_window_macos_setup_external(void *ns_view,
 		if ([view isKindOfClass:[NSOpenGLView class]]) {
 			NSOpenGLView *glView = (NSOpenGLView *)view;
 			win->gl_context = [glView openGLContext];
+			// #1947: the view's context belongs to the app (it is normally the
+			// very context the app renders with — cube_handle_gl_macos binds
+			// [g_glView openGLContext]). Borrowed, not ours.
+			win->context_is_app_owned = (win->gl_context != nil);
 			if (win->gl_context == nil) {
 				// Create context for the existing NSOpenGLView
 				NSOpenGLContext *share_ctx = nil;
@@ -424,6 +437,26 @@ comp_gl_window_macos_get_cgl_context(struct comp_gl_window_macos *win)
 {
 	if (win == NULL || win->gl_context == nil) return NULL;
 	return (void *)[win->gl_context CGLContextObj];
+}
+
+bool
+comp_gl_window_macos_context_is_app_owned(struct comp_gl_window_macos *win)
+{
+	return win != NULL && win->context_is_app_owned;
+}
+
+void
+comp_gl_window_macos_lock(struct comp_gl_window_macos *win)
+{
+	if (win == NULL || win->gl_context == nil) return;
+	CGLLockContext([win->gl_context CGLContextObj]);
+}
+
+void
+comp_gl_window_macos_unlock(struct comp_gl_window_macos *win)
+{
+	if (win == NULL || win->gl_context == nil) return;
+	CGLUnlockContext([win->gl_context CGLContextObj]);
 }
 
 bool
