@@ -1,0 +1,666 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  The service's conversion core (see service_conversion.h).
+ * @ingroup targets_service
+ */
+
+#include "service_conversion.h"
+#include "service_config.h"
+
+#include "xrt/xrt_config_os.h"
+
+#include "conversion/conv_core.h"
+#include "conversion/conv_registry.h"
+
+#include "server/ipc_server.h"
+#include "server/ipc_server_conv.h"
+
+#include "target_conv_status.h"
+#include "target_conversion_plugin_loader.h"
+
+#include "os/os_threading.h"
+#include "util/u_logging.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#ifdef XRT_OS_WINDOWS
+#include "xrt/xrt_windows.h"
+#endif
+
+#define CACHE_FILENAME "conversion-describe-cache.bin"
+#define CACHE_MAX_BYTES (4u * 1024u * 1024u)
+
+static struct
+{
+	bool started;
+	struct conv_core *core;
+	struct ipc_server_conv *sc;
+
+	//! Guards entries / entry_count / policy and the status scratch below.
+	struct os_mutex mtx;
+	struct xrt_conversion_plugin_entry *entries;
+	int entry_count;
+	struct target_conv_policy policy;
+	struct conv_registry *reg_scratch;
+	struct target_conv_status *status_scratch;
+
+	//! #2003's allocator (NULL alloc = CPU); guarded by alloc_mtx.
+	struct os_mutex alloc_mtx;
+	struct conv_image_alloc_ops gpu_alloc;
+
+	char cache_path[600];
+
+#ifdef XRT_OS_WINDOWS
+	HANDLE watch_thread;
+	HANDLE watch_stop;
+	HANDLE notify_ev; //!< a provider called notify_changed
+#endif
+} g;
+
+
+/*
+ *
+ * Image allocation: CPU until #2003 installs the GPU glue.
+ *
+ */
+
+static uint32_t
+bpp_of(uint32_t fmt)
+{
+	switch (fmt) {
+	case XRT_CONV_FMT_R8_UNORM: return 1;
+	case XRT_CONV_FMT_R16_FLOAT:
+	case XRT_CONV_FMT_R16_UNORM: return 2;
+	case XRT_CONV_FMT_RGBA16_FLOAT: return 8;
+	default: return 4;
+	}
+}
+
+static bool
+cpu_alloc(const struct conv_image_request *req, struct xrt_conv_image *out)
+{
+	static uint64_t s_key = 0;
+	const uint32_t layers = req->array_layers != 0 ? req->array_layers : 1;
+	const uint64_t size = (uint64_t)req->width * req->height * bpp_of(req->format) * layers;
+	if (size == 0 || size > (uint64_t)1 << 31) {
+		return false;
+	}
+	void *p = calloc(1, (size_t)size);
+	if (p == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	out->memory_kind = XRT_CONV_MEM_CPU;
+	out->cpu_ptr = p;
+	out->byte_size = size;
+	out->width = req->width;
+	out->height = req->height;
+	out->format = req->format;
+	out->row_stride = req->width * bpp_of(req->format);
+	os_mutex_lock(&g.alloc_mtx);
+	out->import_key = ++s_key | (1ull << 63); // disjoint from any GPU allocator's keys
+	os_mutex_unlock(&g.alloc_mtx);
+	out->color_space = req->role == 0 ? XRT_CONV_CS_SRGB : XRT_CONV_CS_DATA;
+	return true;
+}
+
+static bool
+tramp_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out)
+{
+	(void)ud;
+	os_mutex_lock(&g.alloc_mtx);
+	struct conv_image_alloc_ops gpu = g.gpu_alloc;
+	os_mutex_unlock(&g.alloc_mtx);
+	if (gpu.alloc != NULL) {
+		return gpu.alloc(gpu.ud, req, out);
+	}
+	return cpu_alloc(req, out);
+}
+
+static void
+tramp_free(void *ud, struct xrt_conv_image *img)
+{
+	(void)ud;
+	if (img->memory_kind == XRT_CONV_MEM_CPU && (img->import_key >> 63) != 0) {
+		free(img->cpu_ptr);
+		img->cpu_ptr = NULL;
+		return;
+	}
+	os_mutex_lock(&g.alloc_mtx);
+	struct conv_image_alloc_ops gpu = g.gpu_alloc;
+	os_mutex_unlock(&g.alloc_mtx);
+	if (gpu.free != NULL) {
+		gpu.free(gpu.ud, img);
+	}
+}
+
+void
+service_conversion_set_gpu_alloc(const struct conv_image_alloc_ops *ops)
+{
+	if (!g.started) {
+		return;
+	}
+	os_mutex_lock(&g.alloc_mtx);
+	if (ops != NULL) {
+		g.gpu_alloc = *ops;
+	} else {
+		memset(&g.gpu_alloc, 0, sizeof(g.gpu_alloc));
+	}
+	os_mutex_unlock(&g.alloc_mtx);
+}
+
+
+/*
+ *
+ * Events and the status snapshot source.
+ *
+ */
+
+static void
+on_event(void *ud, uint64_t client_id, const struct xrt_conv_wire_event *ev)
+{
+	// Called with core locks held: queue only. v3 has no event; the status
+	// snapshot's `conversion` counter follows the core's generations through
+	// conv_status_generation below, so nothing to do here yet (the spec-4
+	// per-session event queue lands with the v4 handlers, P3).
+	(void)ud;
+	(void)client_id;
+	(void)ev;
+}
+
+static uint64_t
+conv_status_generation(void *ud)
+{
+	(void)ud;
+	if (g.core == NULL) {
+		return 0;
+	}
+	struct xrt_conv_wire_generation gen;
+	conv_core_get_generation(g.core, &gen);
+	// Both move: conv_gen on a table change, status_gen on every readiness transition.
+	return gen.conv_gen + gen.status_gen;
+}
+
+static void
+conv_status_fill(void *ud, struct xrt_status_live *live)
+{
+	(void)ud;
+	live->conv_provider_count = 0;
+	live->conv_task_count = 0;
+	if (g.core == NULL || g.reg_scratch == NULL || g.status_scratch == NULL) {
+		return;
+	}
+	os_mutex_lock(&g.mtx);
+	conv_core_copy_registry(g.core, g.reg_scratch);
+	target_conv_status_from_registry(g.reg_scratch, g.entries, g.entry_count, &g.policy, g.status_scratch);
+	const struct target_conv_status *st = g.status_scratch;
+	live->conv_provider_count = st->provider_count;
+	memcpy(live->conv_providers, st->providers, sizeof(live->conv_providers));
+	live->conv_task_count = st->task_count;
+	memcpy(live->conv_tasks, st->tasks, sizeof(live->conv_tasks));
+	os_mutex_unlock(&g.mtx);
+}
+
+
+/*
+ *
+ * Providers.
+ *
+ */
+
+static void
+host_notify_changed(uint32_t cap_id)
+{
+	// Any provider thread, possibly inside a describe that holds the core's
+	// registry lock: only signal; the watch thread re-describes.
+	(void)cap_id;
+#ifdef XRT_OS_WINDOWS
+	if (g.notify_ev != NULL) {
+		SetEvent(g.notify_ev);
+	}
+#endif
+}
+
+static struct xrt_conversion_plugin_host_iface g_host;
+
+static void
+init_host(void)
+{
+	g_host = *target_conversion_plugin_default_host();
+	g_host.notify_changed = host_notify_changed;
+}
+
+//! Is @p id already registered in the core? (g.mtx held)
+static int
+find_entry_locked(const char *id)
+{
+	for (int i = 0; i < g.entry_count; i++) {
+		if (strcmp(g.entries[i].id, id) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+//! Negotiate + probe @p e and add it to the core (no g.mtx: calls a provider).
+static void
+add_entry(struct xrt_conversion_plugin_entry *e)
+{
+	if (target_conv_is_policy_subkey(e->id)) {
+		return;
+	}
+	if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
+		(void)target_conversion_plugin_negotiate_one(e, &g_host);
+	}
+
+	struct conv_provider_desc d;
+	memset(&d, 0, sizeof(d));
+	d.id = e->id;
+	d.probe_order = e->probe_order;
+	d.hosting = e->hosting == XRT_CONV_HOSTING_SATELLITE   ? CONV_HOSTING_SATELLITE
+	            : e->hosting == XRT_CONV_HOSTING_IN_SERVICE ? CONV_HOSTING_IN_SERVICE
+	                                                        : CONV_HOSTING_AUTO;
+	d.supersedes = e->supersedes;
+	d.binary_path = e->binary_path;
+	struct stat sb;
+	if (e->binary_path[0] != '\0' && stat(e->binary_path, &sb) == 0) {
+		d.binary_size = (uint64_t)sb.st_size;
+		d.binary_mtime = (uint64_t)sb.st_mtime;
+	}
+	// Only a negotiated provider is selectable; the others are listed (their
+	// cached rows, if any, stay DISABLED) so `conv list` shows why.
+	d.enabled = e->enabled && e->status == XRT_CONV_LOAD_NEGOTIATED;
+
+	if (e->status == XRT_CONV_LOAD_NEGOTIATED) {
+		struct xrt_conversion_plugin_instance *inst = NULL;
+		xrt_result_t pr = XRT_SUCCESS;
+		if (XRT_CONV_IFACE_HAS(e->iface, probe) && e->iface->probe != NULL) {
+			pr = e->iface->probe(&inst); // [S], <= 100 ms, no model load (spec §2.3)
+		}
+		if (pr == XRT_SUCCESS) {
+			d.iface = e->iface;
+			d.inst = inst;
+		} else {
+			d.enabled = false;
+			(void)snprintf(e->reason, sizeof(e->reason), "probe returned %d", (int)pr);
+			U_LOG_W("[conv] provider %s: probe returned %d; listed, not used", e->id, (int)pr);
+		}
+	}
+	(void)conv_core_add_provider(g.core, &d);
+}
+
+static void
+cache_load(void)
+{
+	FILE *f = fopen(g.cache_path, "rb");
+	if (f == NULL) {
+		return; // first run
+	}
+	uint8_t *buf = malloc(CACHE_MAX_BYTES);
+	size_t n = buf != NULL ? fread(buf, 1, CACHE_MAX_BYTES, f) : 0;
+	fclose(f);
+	if (n > 0) {
+		const int32_t r = conv_core_load_describe_cache(g.core, buf, n);
+		U_LOG_I("[conv] describe cache: %d rows restored from %s", (int)r, g.cache_path);
+	}
+	free(buf);
+}
+
+static void
+cache_save(void)
+{
+	if (g.core == NULL || g.cache_path[0] == '\0') {
+		return;
+	}
+	const size_t need = conv_core_save_describe_cache(g.core, NULL, 0);
+	if (need == 0 || need > CACHE_MAX_BYTES) {
+		return;
+	}
+	uint8_t *buf = malloc(need);
+	if (buf == NULL) {
+		return;
+	}
+	const size_t n = conv_core_save_describe_cache(g.core, buf, need);
+	FILE *f = fopen(g.cache_path, "wb");
+	if (f != NULL) {
+		(void)fwrite(buf, 1, n, f);
+		fclose(f);
+	}
+	free(buf);
+}
+
+//! The registry / manifests changed: re-enumerate and reconcile (watch thread).
+static void
+rescan(void)
+{
+	struct xrt_conversion_plugin_entry *fresh = calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(*fresh));
+	if (fresh == NULL) {
+		return;
+	}
+	const int n = target_conversion_plugin_enumerate(fresh, XRT_CONV_LOADER_MAX_ENTRIES);
+	for (int i = 0; i < n; i++) {
+		struct xrt_conversion_plugin_entry *e = &fresh[i];
+		if (target_conv_is_policy_subkey(e->id)) {
+			continue;
+		}
+		os_mutex_lock(&g.mtx);
+		const int k = find_entry_locked(e->id);
+		const bool known_enabled = k >= 0 ? g.entries[k].enabled : false;
+		os_mutex_unlock(&g.mtx);
+		if (k >= 0) {
+			if (known_enabled != e->enabled) {
+				conv_core_set_provider_enabled(g.core, e->id, e->enabled);
+				os_mutex_lock(&g.mtx);
+				g.entries[k].enabled = e->enabled;
+				os_mutex_unlock(&g.mtx);
+			}
+			conv_core_provider_changed(g.core, e->id);
+			continue;
+		}
+		os_mutex_lock(&g.mtx);
+		const bool room = g.entry_count < XRT_CONV_LOADER_MAX_ENTRIES;
+		os_mutex_unlock(&g.mtx);
+		if (!room) {
+			continue;
+		}
+		add_entry(e); // a newly installed provider (UNAVAILABLE -> READY without a restart)
+		os_mutex_lock(&g.mtx);
+		g.entries[g.entry_count++] = *e;
+		os_mutex_unlock(&g.mtx);
+	}
+	// A row gone from the registry: the in-service provider stays loaded
+	// (spec §4.1: leaked until restart) but is no longer selectable.
+	os_mutex_lock(&g.mtx);
+	for (int k = 0; k < g.entry_count; k++) {
+		bool present = false;
+		for (int i = 0; i < n; i++) {
+			if (strcmp(fresh[i].id, g.entries[k].id) == 0) {
+				present = true;
+				break;
+			}
+		}
+		if (!present && g.entries[k].enabled) {
+			g.entries[k].enabled = false;
+			os_mutex_unlock(&g.mtx);
+			conv_core_set_provider_enabled(g.core, g.entries[k].id, false);
+			os_mutex_lock(&g.mtx);
+		}
+	}
+	os_mutex_unlock(&g.mtx);
+	free(fresh);
+	cache_save();
+}
+
+static void
+redescribe_all(void)
+{
+	os_mutex_lock(&g.mtx);
+	const int n = g.entry_count;
+	char ids[XRT_CONV_LOADER_MAX_ENTRIES][64];
+	for (int i = 0; i < n; i++) {
+		memcpy(ids[i], g.entries[i].id, sizeof(ids[i]));
+	}
+	os_mutex_unlock(&g.mtx);
+	for (int i = 0; i < n; i++) {
+		conv_core_provider_changed(g.core, ids[i]);
+	}
+}
+
+#ifdef XRT_OS_WINDOWS
+static DWORD WINAPI
+watch_thread_body(LPVOID param)
+{
+	(void)param;
+	HANDLE ev_lm = CreateEventW(NULL, FALSE, FALSE, NULL);
+	HANDLE ev_cu = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (ev_lm == NULL || ev_cu == NULL) {
+		if (ev_lm != NULL) {
+			CloseHandle(ev_lm);
+		}
+		if (ev_cu != NULL) {
+			CloseHandle(ev_cu);
+		}
+		return 1;
+	}
+	for (;;) {
+		HKEY lm = NULL, cu = NULL;
+		const DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC;
+		// The root may not exist yet (no provider ever installed): watch its parent.
+		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, TARGET_CONV_REG_ROOT, 0, KEY_NOTIFY | KEY_WOW64_64KEY, &lm) !=
+		    ERROR_SUCCESS) {
+			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\DisplayXR", 0, KEY_NOTIFY | KEY_WOW64_64KEY,
+			                  &lm) != ERROR_SUCCESS) {
+				lm = NULL;
+			}
+		}
+		if (RegOpenKeyExA(HKEY_CURRENT_USER, TARGET_CONV_REG_ROOT, 0, KEY_NOTIFY, &cu) != ERROR_SUCCESS) {
+			if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\DisplayXR", 0, KEY_NOTIFY, &cu) != ERROR_SUCCESS) {
+				cu = NULL;
+			}
+		}
+		if (lm != NULL) {
+			(void)RegNotifyChangeKeyValue(lm, TRUE, filter, ev_lm, TRUE);
+		}
+		if (cu != NULL) {
+			(void)RegNotifyChangeKeyValue(cu, TRUE, filter, ev_cu, TRUE);
+		}
+		HANDLE hs[4] = {g.watch_stop, g.notify_ev, ev_lm, ev_cu};
+		// Nothing to watch: still wake on notify / stop, and re-open slowly.
+		const DWORD w = WaitForMultipleObjects(4, hs, FALSE, (lm == NULL && cu == NULL) ? 10000 : INFINITE);
+		if (lm != NULL) {
+			RegCloseKey(lm);
+		}
+		if (cu != NULL) {
+			RegCloseKey(cu);
+		}
+		if (w == WAIT_OBJECT_0) {
+			break;
+		}
+		if (w == WAIT_OBJECT_0 + 1) {
+			redescribe_all();
+		} else if (w == WAIT_OBJECT_0 + 2 || w == WAIT_OBJECT_0 + 3) {
+			// Debounce an installer's burst of writes (Version is written LAST, §3.8).
+			if (WaitForSingleObject(g.watch_stop, 500) == WAIT_OBJECT_0) {
+				break;
+			}
+			os_mutex_lock(&g.mtx);
+			target_conv_policy_read(&g.policy);
+			os_mutex_unlock(&g.mtx);
+			rescan();
+		}
+	}
+	CloseHandle(ev_lm);
+	CloseHandle(ev_cu);
+	return 0;
+}
+
+//! PrewarmOn: the registry string, else interest on mains / first-create on battery.
+static uint32_t
+read_prewarm_on(void)
+{
+	char v[32] = {0};
+	DWORD sz = sizeof(v);
+	if (RegGetValueA(HKEY_CURRENT_USER, TARGET_CONV_REG_ROOT, "PrewarmOn", RRF_RT_REG_SZ, NULL, v, &sz) !=
+	    ERROR_SUCCESS) {
+		sz = sizeof(v);
+		if (RegGetValueA(HKEY_LOCAL_MACHINE, TARGET_CONV_REG_ROOT, "PrewarmOn",
+		                 RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, v, &sz) != ERROR_SUCCESS) {
+			v[0] = '\0';
+		}
+	}
+	if (_stricmp(v, "interest") == 0) {
+		return CONV_PREWARM_INTEREST;
+	}
+	if (_stricmp(v, "first-create") == 0) {
+		return CONV_PREWARM_FIRST_CREATE;
+	}
+	if (_stricmp(v, "start") == 0) {
+		return CONV_PREWARM_START;
+	}
+	SYSTEM_POWER_STATUS ps;
+	if (GetSystemPowerStatus(&ps) && ps.ACLineStatus == 0) {
+		return CONV_PREWARM_FIRST_CREATE; // on battery
+	}
+	return CONV_PREWARM_INTEREST;
+}
+#else
+static uint32_t
+read_prewarm_on(void)
+{
+	return CONV_PREWARM_INTEREST; // desktop default; POSIX root policy is a later phase
+}
+#endif
+
+
+/*
+ *
+ * Lifetime.
+ *
+ */
+
+void
+service_conversion_start(void)
+{
+	if (g.started) {
+		return;
+	}
+	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0) {
+		U_LOG_E("[conv] could not create the conversion core's service locks");
+		return;
+	}
+	g.started = true;
+	init_host();
+	target_conv_policy_read(&g.policy);
+
+	g.entries = calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(*g.entries));
+	g.reg_scratch = calloc(1, sizeof(*g.reg_scratch));
+	g.status_scratch = calloc(1, sizeof(*g.status_scratch));
+	if (g.entries == NULL || g.reg_scratch == NULL || g.status_scratch == NULL) {
+		U_LOG_E("[conv] out of memory building the conversion core");
+		return;
+	}
+
+	struct conv_core_config cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.alloc.alloc = tramp_alloc;
+	cfg.alloc.free = tramp_free;
+	// cfg.viewsyn / cfg.readback / create_convergence_observer: #2003 (D3D11).
+	cfg.on_event = on_event;
+	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST && t < TARGET_CONV_POLICY_TASKS; t++) {
+		cfg.preferred[t] = g.policy.preferred[t][0] != '\0' ? g.policy.preferred[t] : NULL;
+	}
+	cfg.allow_research_only = g.policy.allow_research_only;
+	cfg.prewarm_on = read_prewarm_on();
+	cfg.rear_cap_m = -1.0f;
+	if (conv_core_create(&cfg, &g.core) != XRT_SUCCESS) {
+		U_LOG_E("[conv] conv_core_create failed; lift stays on the legacy path");
+		g.core = NULL;
+		return;
+	}
+
+	char cfg_path[512];
+	if (service_config_path(cfg_path, sizeof(cfg_path))) {
+		char *sep = strrchr(cfg_path, '/');
+#ifdef XRT_OS_WINDOWS
+		char *bsep = strrchr(cfg_path, '\\');
+		if (bsep != NULL && (sep == NULL || bsep > sep)) {
+			sep = bsep;
+		}
+#endif
+		if (sep != NULL) {
+			sep[1] = '\0';
+			(void)snprintf(g.cache_path, sizeof(g.cache_path), "%s%s", cfg_path, CACHE_FILENAME);
+			cache_load();
+		}
+	}
+
+	const int n = target_conversion_plugin_enumerate(g.entries, XRT_CONV_LOADER_MAX_ENTRIES);
+	g.entry_count = 0;
+	for (int i = 0; i < n; i++) {
+		if (target_conv_is_policy_subkey(g.entries[i].id)) {
+			continue;
+		}
+		add_entry(&g.entries[i]);
+		if (g.entry_count != i) {
+			g.entries[g.entry_count] = g.entries[i];
+		}
+		g.entry_count++;
+	}
+	cache_save();
+	U_LOG_W("[conv] conversion core up: %d provider(s) registered, PrewarmOn=%u", g.entry_count, cfg.prewarm_on);
+
+	if (ipc_server_conv_create(g.core, &g.sc) == XRT_SUCCESS) {
+		ipc_server_set_conv(g.sc);
+	}
+	static const struct ipc_server_conv_status_source source = {
+	    .fill = conv_status_fill,
+	    .generation = conv_status_generation,
+	    .userdata = NULL,
+	};
+	ipc_server_set_conv_status_source(&source);
+
+#ifdef XRT_OS_WINDOWS
+	g.watch_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+	g.notify_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (g.watch_stop != NULL && g.notify_ev != NULL) {
+		g.watch_thread = CreateThread(NULL, 0, watch_thread_body, NULL, 0, NULL);
+	}
+	if (g.watch_thread == NULL) {
+		U_LOG_W("[conv] could not start the conversion-provider registration watcher");
+	}
+#endif
+}
+
+void
+service_conversion_stop(void)
+{
+	if (!g.started) {
+		return;
+	}
+	ipc_server_set_conv_status_source(NULL);
+	ipc_server_set_conv(NULL);
+#ifdef XRT_OS_WINDOWS
+	if (g.watch_stop != NULL) {
+		SetEvent(g.watch_stop);
+	}
+	if (g.watch_thread != NULL) {
+		WaitForSingleObject(g.watch_thread, 5000);
+		CloseHandle(g.watch_thread);
+		g.watch_thread = NULL;
+	}
+	if (g.watch_stop != NULL) {
+		CloseHandle(g.watch_stop);
+		g.watch_stop = NULL;
+	}
+	if (g.notify_ev != NULL) {
+		CloseHandle(g.notify_ev);
+		g.notify_ev = NULL;
+	}
+#endif
+	cache_save();
+	ipc_server_conv_destroy(&g.sc);
+	// Providers die through their hosts; their binaries stay mapped for the
+	// process lifetime (spec §4.1).
+	conv_core_destroy(&g.core);
+	free(g.entries);
+	free(g.reg_scratch);
+	free(g.status_scratch);
+	g.entries = NULL;
+	g.reg_scratch = NULL;
+	g.status_scratch = NULL;
+	g.entry_count = 0;
+	os_mutex_destroy(&g.alloc_mtx);
+	os_mutex_destroy(&g.mtx);
+	g.started = false;
+}
+
+struct conv_core *
+service_conversion_core(void)
+{
+	return g.core;
+}

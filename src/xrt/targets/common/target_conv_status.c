@@ -761,6 +761,51 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 }
 
 void
+target_conv_status_from_registry(const struct conv_registry *reg,
+                                 const struct xrt_conversion_plugin_entry *entries,
+                                 int count,
+                                 const struct target_conv_policy *policy,
+                                 struct target_conv_status *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (policy != NULL) {
+		out->policy = *policy;
+	}
+	struct prov_extra *extra = calloc(CONV_REGISTRY_MAX_PROVIDERS, sizeof(*extra));
+	if (extra == NULL) {
+		return;
+	}
+	uint32_t status_index[CONV_REGISTRY_MAX_PROVIDERS];
+	for (uint32_t pi = 0; pi < reg->provider_count; pi++) {
+		struct prov_extra *x = &extra[pi];
+		x->entry = -1;
+		for (int i = 0; entries != NULL && i < count; i++) {
+			if (strcmp(entries[i].id, reg->providers[pi].id) == 0) {
+				x->entry = i;
+				fill_extra_from_entry(&entries[i], x);
+				break;
+			}
+		}
+		if (x->entry < 0) {
+			x->built_in = true;
+			copy_str(x->name, sizeof(x->name), reg->providers[pi].id);
+			copy_str(x->load, sizeof(x->load), "BUILT_IN");
+		}
+		x->licence_exempt = (reg->providers[pi].flags & CONV_PROV_LICENCE_EXEMPT) != 0;
+		out->registered++;
+		status_index[pi] = XRT_STATUS_CONV_NO_PROVIDER;
+		if (out->provider_count >= XRT_STATUS_MAX_CONV_PROVIDERS) {
+			continue;
+		}
+		status_index[pi] = out->provider_count;
+		fill_provider_row(reg, pi, x, policy, &out->providers[out->provider_count++]);
+		out->bad_descriptors += reg->providers[pi].bad_descriptors;
+	}
+	build_task_rows(reg, status_index, policy, out);
+	free(extra);
+}
+
+void
 target_conv_status_build_headless(const struct xrt_plugin_iface *active_dp, struct target_conv_status *out)
 {
 	struct xrt_conversion_plugin_entry *entries =

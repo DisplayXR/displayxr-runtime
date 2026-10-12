@@ -135,6 +135,23 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 const struct xrt_conversion_plugin_host_iface *
 target_conv_status_headless_host(void);
 
+struct conv_registry;
+
+/*!
+ * ADR-053 (#2005): the service's LIVE rows. Same row builders as the headless
+ * pass, over a copy of the running conversion core's registry
+ * (`conv_core_copy_registry`): its readiness is the core's, not a fresh
+ * get_state. Provider identity (display name, vendor, version, loader status,
+ * ABI) comes from @p entries matched by id (may be NULL / 0; a provider with
+ * no entry reads BUILT_IN). Never calls a provider.
+ */
+void
+target_conv_status_from_registry(const struct conv_registry *reg,
+                                 const struct xrt_conversion_plugin_entry *entries,
+                                 int count,
+                                 const struct target_conv_policy *policy,
+                                 struct target_conv_status *out);
+
 /*!
  * Copy the rows into @p snap (`conv_providers[]`, `conv_tasks[]`). Does not
  * derive warnings: call `u_status_warnings_derive` after.
