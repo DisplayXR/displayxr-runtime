@@ -15,6 +15,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 
 #ifdef CLI_HAVE_IPC
 
@@ -72,7 +73,7 @@ cli_cmd_clients(int argc, const char **argv)
 	ii.app_info.declared_client_class = declare;
 
 	struct ipc_connection ipc_c = {0};
-	xrt_result_t xret = ipc_client_connection_init(&ipc_c, U_LOGGING_ERROR, &ii);
+	xrt_result_t xret = cli_ipc_connect(&ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		if (json) {
 			printf("{\"connected\": false, \"xrt_result\": %d}\n", (int)xret);

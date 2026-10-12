@@ -103,6 +103,8 @@ target_link_libraries(
 if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
 	target_link_libraries(cli PRIVATE ipc_client)
 	target_compile_definitions(cli PRIVATE CLI_HAVE_IPC)
+	# The CLI's one non-launching connect (#1966): every command reaches the service through it.
+	target_sources(cli PRIVATE cli_ipc.c cli_ipc.h)
 endif()
 
 # ADR-042: `displayxr-cli lift probe` loads / writes images (stb, header-only,

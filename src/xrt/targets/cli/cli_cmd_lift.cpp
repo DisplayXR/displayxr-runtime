@@ -27,6 +27,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_ipc.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -121,7 +122,7 @@ connect(struct ipc_connection *ipc_c)
 	struct xrt_instance_info ii = {};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli lift");
 	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
-	xrt_result_t xret = ipc_client_connection_init(ipc_c, U_LOGGING_ERROR, &ii);
+	xrt_result_t xret = cli_ipc_connect(ipc_c, U_LOGGING_ERROR, &ii);
 	if (xret != XRT_SUCCESS) {
 		printf("displayxr-cli lift: not connected to the service (xrt_result=%d).\n", (int)xret);
 		printf("  Is displayxr-service running? On Windows, run from a NON-elevated prompt.\n");
