@@ -606,6 +606,7 @@ struct xrt_conv_frame_out
 	struct xrt_conv_image confidence;
 	struct xrt_conv_image disparity;
 	struct xrt_conv_views_info views_info;
+	uint32_t reserved_pad;         //!< explicit padding before depth_info (8-aligned); 0
 	struct xrt_conv_depth_info depth_info;
 };
 
@@ -664,6 +665,7 @@ struct xrt_conv_job_out
 	struct xrt_conv_splat_info splat_info;
 	struct xrt_conv_depth_info depth_info;
 	struct xrt_conv_views_info views_info;
+	uint32_t reserved_pad;         //!< explicit tail padding (8-aligned size); 0
 };
 
 /*
@@ -950,6 +952,13 @@ XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_splat_info) == 72,
                     "xrt_conv_splat_info is FROZEN (16 x 4 + 8)");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_splat_info, splat_count) == 64,
                     "xrt_conv_splat_info: splat_count at 64");
+XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || offsetof(struct xrt_conv_frame_out, depth_info) == 648,
+                    "xrt_conv_frame_out: explicit reserved_pad, depth_info at 648");
+XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || sizeof(struct xrt_conv_frame_out) == 776,
+                    "xrt_conv_frame_out: no hidden padding (8 + 4 x 128 + 124 + 4 + 128)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_out, views_info) == 208 &&
+                    sizeof(struct xrt_conv_job_out) == 336,
+                    "xrt_conv_job_out: no hidden padding (8 + 72 + 128 + 124 + 4)");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_stereo_calibration) == 32,
                     "xrt_conv_stereo_calibration is FROZEN (8 x 4)");
 // clang-format on

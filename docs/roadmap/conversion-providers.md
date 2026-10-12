@@ -666,7 +666,7 @@ the browser vendors the client side; the v3 handlers become thin adapters onto t
 |---|---|---|
 | `conv_hint_interest` | task list → – (the prewarm trigger, §2.5) | – |
 | `conv_get_generation` | – → `conv_gen`, `status_gen` | – |
-| `conv_enum_provider` / `conv_enum_task` | index → descriptor + readiness (DIAG, for CLI and snapshot) | – |
+| `conv_enum_task` | index → the task's effective capability + readiness, no provider identity (there is no `conv_enum_provider`: provider identity reaches the CLI / snapshot via DIAG) | – |
 | `conv_stream_create` / `destroy` / `reset` | desc → id, resolved pipeline | – |
 | `conv_submit` | submit (params in scratch shm when > 1 KB) → frame id | in: 0–2 images + fence |
 | `conv_acquire_result` | id → views / depth meta | export handles |

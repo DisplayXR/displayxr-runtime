@@ -466,7 +466,7 @@ struct xrt_conv_params
 /* ───────────────────────── Results (frame D9) ────────────────────────────── */
 
 /*! FROZEN: growth goes at the tail of the enclosing top-level struct or into
- *  a new slot. sizeof == 120 (asserted). */
+ *  a new slot. sizeof == 128 (asserted). */
 struct xrt_conv_depth_info
 {
 	uint32_t kind;                 //!< XRT_CONV_DEPTH_*
@@ -591,6 +591,7 @@ struct xrt_conv_frame_out
 	struct xrt_conv_image confidence;
 	struct xrt_conv_image disparity;
 	struct xrt_conv_views_info views_info;
+	uint32_t reserved_pad;         //!< explicit padding before depth_info (8-aligned); 0
 	struct xrt_conv_depth_info depth_info;
 };
 
@@ -640,6 +641,7 @@ struct xrt_conv_job_out
 	struct xrt_conv_splat_info splat_info;
 	struct xrt_conv_depth_info depth_info;
 	struct xrt_conv_views_info views_info;
+	uint32_t reserved_pad;         //!< explicit tail padding (8-aligned size); 0
 };
 
 /* ───────────────────────── Provider status (ADR-045 shape) ───────────────── */
@@ -897,6 +899,13 @@ XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_splat_info) == 72,
                     "xrt_conv_splat_info is FROZEN (16 x 4 + 8)");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_splat_info, splat_count) == 64,
                     "xrt_conv_splat_info: splat_count at 64");
+XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || offsetof(struct xrt_conv_frame_out, depth_info) == 648,
+                    "xrt_conv_frame_out: explicit reserved_pad, depth_info at 648");
+XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || sizeof(struct xrt_conv_frame_out) == 776,
+                    "xrt_conv_frame_out: no hidden padding (8 + 4 x 128 + 124 + 4 + 128)");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_out, views_info) == 208 &&
+                    sizeof(struct xrt_conv_job_out) == 336,
+                    "xrt_conv_job_out: no hidden padding (8 + 72 + 128 + 124 + 4)");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_stereo_calibration) == 32,
                     "xrt_conv_stereo_calibration is FROZEN (8 x 4)");
 // clang-format on
@@ -920,6 +929,15 @@ The threading contract, the hosting-agnosticism rules and the semantics the head
 | `xrt_conv_stereo_calibration` | 0 `eye_order`, 4–16 `fx fy cx cy`, 20 `baseline_m`, 24 `infinity_shift_px`, 28 `sbs_packed` | 32 |
 
 `xrt_conv_capability` (top-level) gains an explicit `reserved_0` before `device_luid`: removing `exclusive_group` would otherwise leave 4 bytes of hidden padding there.
+
+The two top-level out-structs that embed frozen structs carry explicit padding too, so every byte is accounted for and both are pinned (they still grow at the tail, under `struct_size`):
+
+| Struct | Layout (byte offsets, 64-bit) | `sizeof` |
+|---|---|---|
+| `xrt_conv_frame_out` | 0 `struct_size`, 4 `written`, 8 / 136 / 264 / 392 `views` / `depth` / `confidence` / `disparity` (128 each), 520 `views_info` (124), 644 `reserved_pad`, 648 `depth_info` (128) | 776 |
+| `xrt_conv_job_out` | 0 `struct_size`, 4 `written`, 8 `splat_info` (72), 80 `depth_info` (128), 208 `views_info` (124), 332 `reserved_pad` | 336 |
+
+**As landed (P1a-1, #1998).** `src/xrt/include/xrt/xrt_conversion_plugin.h` is this block verbatim apart from house-style section separators, Doxygen groups and the two `reserved_pad` fields above; the `xrt_conv_depth_info` comment that read `sizeof == 120` was a typo for the asserted 128. Pinned by `tests/tests_conversion_abi.cpp`.
 
 ---
 
@@ -1733,31 +1751,50 @@ typedef XrResult (XRAPI_PTR *PFN_xrDestroyLiftJobDXR)(XrLiftJobDXR job);
 
 The v3 `lift_*` messages (`proto.json:838-960`) stay **byte-for-byte**, because the browser vendors the client side. Their handlers become thin adapters onto the conversion core, using the §2.6 `XrLiftPropertiesDXR` mapping (the only spec-3 mapping). The G1 fix ships in passing: `ipc_client_lift_get_properties` (`ipc_client_lift.c:44-70`) copies `aux_outputs` and `aux_depth_semantics`, pinned by a round-trip test.
 
-Spec 4 / 5 ride a new family:
+Spec 4 / 5 ride a new family. Its payloads are defined once, in `src/xrt/include/xrt/xrt_conv_wire.h` (landed in P1a-1, #1998; P1a-8 wires them into `ipc_protocol.h` / `proto.json`). Sizes are exact and asserted (every gap is an explicit `reserved_*` field); `xrt_conv_wire_` is omitted from the struct names below.
 
 | Message | Request | Reply | Handles |
 |---|---|---|---|
-| `conv_hint_interest` | task list (bitmask of `XRT_CONV_TASK_*`) | – | – |
-| `conv_get_generation` | – | `conv_gen`, `status_gen` | – |
-| `conv_enum_task` | task index | `ipc_conv_task_desc` (the selected provider's capability + readiness; no provider identity) | – |
-| `conv_stream_create` | `ipc_conv_stream_desc` | stream id, resolved pipeline | – |
-| `conv_stream_destroy` / `conv_stream_reset` (cut / seek) | id | – | – |
-| `conv_input_ring_get` | id | ring geometry | out: N image handles + fence (the runtime-allocated input ring for GL / VK / Metal). **P5 only**: no code before a real consumer |
-| `conv_submit` | `ipc_conv_submit` (params in scratch shm when > 1 KB) | frame id | in: 0–2 images (mono or stereo pair) + fence |
-| `conv_acquire_result` | id | `ipc_conv_result` (views / depth meta) | none here; export handles come from generalised `lift_get_output`-style calls |
-| `conv_job_submit` | `ipc_conv_job_desc` | job id | in: image / shm blob (decoded pixels) |
-| `conv_job_status` | job id | state, progress, stage | – |
-| `conv_job_fetch` | job id | `ipc_conv_job_result` (inline ≤ 1 MiB / shm section / caller file handle) | out: shm handle |
-| `conv_job_cancel` | job id | – | – |
-| `conv_warm` / `conv_evict` | task | – | – (`conv_warm` also open to DIAG; `conv_evict` only on the CLI's own DIAG connection) |
-| events | the per-session event queue, plus a sessionless per-connection queue drained by `conv_poll_event` | `ProvidersChanged`, `TaskStateChanged`, `JobStateChanged` | – |
+| `conv_hint_interest` | `hint_interest` (16): `task_mask` u64, bit `1 << XRT_CONV_TASK_*`, 0 = the default set | – | – |
+| `conv_get_generation` | – | `generation` (24): `conv_gen`, `status_gen` | – |
+| `conv_enum_task` | task index (u32) | `task_desc` (144): the selected provider's capability (or the composed pipeline's) + readiness; no provider identity | – |
+| `conv_stream_create` | `stream_desc` (56): task, quality hint, export memory kind + every `xrt_conv_stream_info` field | `stream_created` (40): stream id, task, granted outputs, resolved view count + layout, `desc_flags` | – |
+| `conv_stream_destroy` / `conv_stream_reset` (cut / seek) | stream id (u64) | – | – |
+| `conv_input_ring_get` | id | ring geometry | out: N image handles + fence. **P5 only**: no struct before a real consumer |
+| `conv_submit` | `submit` (560): stream id, ≤ 2 `image` descriptors, `params`, `depth_in_info` twin | frame id (u64) | in: image handle (+ sync handle when its kind has one) per descriptor, in descriptor order |
+| `conv_acquire_result` | stream id (u64) | `result` (352): frame id, source time, latency, `written`, `output_realloc`, width / height / format of the views / depth / confidence / disparity targets, `views_info` + `depth_info` twins | none here; export handles come from generalised `lift_get_output`-style calls, only when `output_realloc` says so |
+| `conv_job_submit` | `job_desc` (632): task, quality hint, input kind, ≤ 4 `image` descriptors, requested blob format, `params` | job id (u64) | in: image handles; CPU pixels in the scratch shm |
+| `conv_job_status` | job id (u64) | `job_status` (64): state (`XrLiftJobStateDXR`, spec 5), failure reason, progress, 32-byte stage label | – |
+| `conv_job_fetch` | job id (u64) | `job_result` (368): `written`, blob format, delivery (`NONE` / `INLINE` ≤ 1 MiB in the scratch shm / `SHM` / `FILE`), byte size, `splat_info` + `depth_info` + `views_info` twins | out: shm handle (`SHM`) |
+| `conv_job_cancel` | job id (u64) | – | – |
+| `conv_warm` / `conv_evict` | `task_request` (16) | – | – (`conv_warm` also open to DIAG; `conv_evict` only on the CLI's own DIAG connection) |
+| events | the per-session event queue, plus a sessionless per-connection queue drained by `conv_poll_event` | `event` (40): kind (`PROVIDERS_CHANGED` / `TASK_STATE_CHANGED` / `JOB_STATE_CHANGED`), task, state, previous state, failure reason, progress, job id | – |
+
+There is **no `conv_enum_provider`** on the wire: an app-facing connection sees tasks only, through `conv_enum_task`. Provider identity reaches the CLI and the status snapshot over the existing DIAG / snapshot path, not through this family.
+
+**Frozen sub-blocks** (embedded by value; never grow — a field appended to the ABI struct goes at the tail of the message instead):
+- Wire **twins** of the frozen ABI structs — `depth_info` (128), `views_info` (124), `splat_info` (72), `stereo_calibration` (32) — asserted byte-identical to their `xrt_conv_*` counterparts field by field. They are separate types so a message never embeds a runtime struct, and the pack helpers copy field by field.
+- `image` (96): `xrt_conv_image` minus every process-local field (`handle`, `import_key`, `cpu_ptr`, the sync handle and its `import_key`), plus `role` and `shm_offset` (a CPU image's place in the per-connection scratch shm). The receiver re-materialises the image; an `xrt_conv_image` never crosses.
+- `params` (216): every `xrt_conv_params` field except `struct_size`, in the same order, with the stereo calibration twin at 184.
+
+**Decisions.**
+1. **Internal vocabulary on the wire.** Enumerated fields carry `XRT_CONV_*` values; the state tracker translates the app's `XrLift*DXR` values once, when it fills the struct (that is the one copy).
+2. **No provider identity to apps.** `task_desc` drops `cap_id`, `licence_spdx`, `model_id`, `model_version`, `backend`, `display_name` and the state's `version` / `detail`; licence class and `commercial_ok` do cross.
+3. **Image counts.** A submit carries at most 2 images (mono, a stereo pair, or colour + depth); a job at most 4 (`XRT_CONV_MAX_FRAME_IMAGES`). More is refused by the pack helper, never truncated. The reserved encoded-input fields of `xrt_conv_job_in` have no wire field.
+4. **Small additions.** `XRT_CONV_WIRE_DESC_COMPOSED` (a task served by a runtime-composed pipeline), `XRT_CONV_WIRE_DELIVERY_*` for job results, `XRT_CONV_WIRE_EVENT_*` for the event kinds.
+
+**Receive rule.** `xrt_conv_wire_receive` rejects a header whose `family_version` is not current or whose `struct_size` is below 8 or above what arrived; otherwise it copies `min(struct_size, sizeof)`, zero-extends, and leaves `struct_size` = the bytes actually covered, so `XRT_CONV_COVERS`-style checks see the truth. `family_version` bumps only on an incompatible change; appending at a message's tail does not bump it.
+
+**`XRT_CONV_WIRE_MSG_MAX_BYTES` (1024) must equal `IPC_BUF_SIZE`**; P1a-8 asserts the pair when it adopts these structs.
+
+**Regression test (G1 shape):** `tests/tests_conv_wire.cpp` round-trips every pack / unpack helper from a byte pattern and compares bytewise after zeroing only the fields each helper documents as not carried, and packs every message from two all-bytes-different sources that must differ in every non-reserved wire byte. A C11 translation unit compiles both headers as C.
 
 **`conv_hint_interest` (the prewarm trigger).** The client sends it when an instance enables `XR_DXR_lift`: IPC sessions at `xrCreateInstance`, in-process sessions when their lift link opens. The task list defaults to `views-mono` + `depth-video`. What the service does with it follows the `PrewarmOn` policy: `interest` (default on mains power and on desktops), `first-create` (default on battery), `start` (kiosk opt-in, warms at service start). Readiness stays honestly ACTIVATING / WARMING meanwhile; a hint never blocks the caller.
 
 Auth: the existing `require_lift_client` set (PRESENT_OWNER / APP / DIAG, `ipc_server_handler.c:8904-8914`). Per-connection quotas: ≤ 32 streams, ≤ 16 queued jobs. The 256 MiB `IPC_LIFT_BLOB_MAX_BYTES` cap stays for v3 only.
 
 **One packed struct per family** — this ends the field-by-field copy trap that produced G1:
-1. **One wire struct per message family**, defined once in `src/xrt/include/xrt/xrt_conv_wire.h`. Each starts `uint32_t struct_size; uint32_t family_version;`, uses fixed-width types only, and embeds **no runtime structs** (today `xrt_lift_view_control`, `xrt_lift_rig` and `xrt_lift_depth_info` ride inside wire structs, `ipc_protocol.h:1160-1228`, so any internal change is a wire change).
+1. **One wire struct per message**, defined once in `src/xrt/include/xrt/xrt_conv_wire.h`. Each starts `uint32_t struct_size; uint32_t family_version;`, uses fixed-width types only, and embeds **no runtime structs** (today `xrt_lift_view_control`, `xrt_lift_rig` and `xrt_lift_depth_info` ride inside wire structs, `ipc_protocol.h:1160-1228`, so any internal change is a wire change).
 2. **One copy.** The state tracker fills the wire struct straight from the XR struct (`oxr_conv.c`); the client sends it opaque; the server reads `memcpy(min(struct_size, sizeof))` with zero-extension. Adding a field = appending it to one struct and reading it where it is used.
 3. **Size discipline.** `static_assert(sizeof(msg) <= IPC_BUF_SIZE)` on every message (the pattern at `ipc_server_handler.c:9325-9330`). Variable-sized data (viewpoints × rects, stereo calibration) goes into a per-connection conversion scratch shm, retiring the staged-viewpoints trick (`ipc_protocol.h:1208-1212`).
 4. **Generator lint.** Every field of a `conv` wire struct is either read by the server unpack or listed as reserved — a CI check, not a convention.
