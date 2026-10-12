@@ -853,6 +853,14 @@ nothing need the runtime to measure it.
 
    Budget: well under 0.1 ms of GPU per measured frame. A full-frame depth map is out of scope:
    it costs orders of magnitude more and the cursor would discard almost all of it.
+
+   *As built (#1976, 2026-10-11):* the GPU stage is only an asynchronous copy of the two
+   outer-view patches, which is never waited on. The matching runs on the CPU over that patch
+   (`u_cursor_measure`), because a patch this size is cheaper there than a compute dispatch on
+   five backends. Measured on Metal and Vulkan: 0.21–0.50 ms of CPU per measured frame (0.72 ms
+   max), 0.03–0.05 ms when the patch is unchanged and the cached result is reused, and 0.01–0.33
+   ms for the GPU copy. Frame time showed no measurable change. A GPU matcher stays an option if
+   a profile ever shows the CPU cost.
 2. **Work in on-screen pixels.** Stereo media has no scene geometry, so none is invented. The
    measured on-screen disparity (px, panel scale) becomes the content disparity directly, and
    §A.1 applies in pixels:
