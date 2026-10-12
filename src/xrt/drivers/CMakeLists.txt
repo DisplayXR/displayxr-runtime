@@ -70,6 +70,22 @@ endif()
 add_library(drv_sim_display_includes INTERFACE)
 target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 
+# #1855: the face estimator behind sim_display webcam eye tracking. "stub" (the
+# default, and what every release ships) builds none: the toggle then logs a WARN
+# and never opens a camera. "onnx" is a developer opt-in that fetches ONNX
+# Runtime + the YuNet face model (both pinned by SHA256) and drops the runtime
+# library and the model next to the plug-in; see sim_display/sim_webcam_onnx.cmake.
+set(XRT_SIM_WEBCAM_ESTIMATOR "stub" CACHE STRING
+	"sim_display webcam eye tracking face estimator (#1855): stub | onnx")
+set_property(CACHE XRT_SIM_WEBCAM_ESTIMATOR PROPERTY STRINGS stub onnx)
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	include(${CMAKE_CURRENT_SOURCE_DIR}/sim_display/sim_webcam_onnx.cmake)
+elseif(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "stub")
+	set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_display/sim_display_face_estimator_none.c)
+else()
+	message(FATAL_ERROR "XRT_SIM_WEBCAM_ESTIMATOR must be stub or onnx, not '${XRT_SIM_WEBCAM_ESTIMATOR}'")
+endif()
+
 # Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
@@ -83,7 +99,9 @@ set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_stereo_camera_pattern.h
 	# #1855: opt-in webcam eye tracking (SIM_DISPLAY_WEBCAM_TRACKING=1).
 	sim_display/sim_display_face_estimator.h
-	sim_display/sim_display_face_estimator_none.c
+	${SIM_WEBCAM_ESTIMATOR_SOURCE}
+	sim_display/sim_display_face_yunet.c
+	sim_display/sim_display_face_yunet.h
 	sim_display/sim_display_webcam.c
 	sim_display/sim_display_webcam_tracker.c
 	sim_display/sim_display_webcam_tracker.h
@@ -154,6 +172,9 @@ add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
 target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os aux_os_uvc PUBLIC drv_includes)
 if(NOT ANDROID AND XRT_HAVE_OPENGL)
 	target_link_libraries(drv_sim_display PRIVATE aux_ogl)
+endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	sim_webcam_onnx_configure(drv_sim_display)
 endif()
 
 # aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
@@ -274,6 +295,22 @@ target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
 
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	# #1855 opt-in estimator: the plug-in loads ONNX Runtime and the model from
+	# its OWN directory at run time (never linked), so both travel with it --
+	# into the build output here, and into the plug-in dir by the install rules
+	# below. Default builds take none of this.
+	sim_webcam_onnx_configure(drv_sim_display_plugin)
+	add_custom_command(
+		TARGET drv_sim_display_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+			"$<TARGET_FILE_DIR:drv_sim_display_plugin>/"
+		COMMENT "sim_display webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the plug-in"
+		VERBATIM
+		)
+endif()
+
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display_plugin PRIVATE aux_vk)
 	target_include_directories(drv_sim_display_plugin PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
@@ -354,6 +391,15 @@ elseif(NOT ANDROID)
 		TARGETS drv_sim_display_plugin
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
+endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx" AND NOT ANDROID)
+	if(WIN32)
+		set(_sim_webcam_plugin_dir ${CMAKE_INSTALL_BINDIR}/plugins)
+	else()
+		set(_sim_webcam_plugin_dir ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins)
+	endif()
+	install(FILES "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+		DESTINATION ${_sim_webcam_plugin_dir} COMPONENT Runtime)
 endif()
 endif() # XRT_FEATURE_OPENXR — DisplayXR-SimDisplay plug-in block
 
@@ -458,6 +504,16 @@ if(XRT_HAVE_LINUX AND NOT ANDROID)
 			VERBATIM
 			)
 	endforeach()
+	if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+		# #1855: the opt-in estimator's library + model sit beside the staged plug-in.
+		add_custom_command(
+			TARGET drv_sim_display_plugin
+			POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+				"${CMAKE_BINARY_DIR}/_plugins/"
+			VERBATIM
+			)
+	endif()
 endif()
 
 ####

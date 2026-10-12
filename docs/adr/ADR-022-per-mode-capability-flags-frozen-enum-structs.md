@@ -96,10 +96,10 @@ contract) and it has no hardware 2D/3D switch to hand to an app. Multi-screen
 per-monitor descriptions are unchanged — segment display processors keep their
 nominal viewer, because the camera's pose is known relative to one panel only.
 
-**The default build carries no estimator** (which model and inference
-dependency to ship is #1855's open question), and without one the toggle only
-logs a WARN: no capability changes and no camera opens. Nothing an app sees
-changes until an estimator lands.
+**The default build carries no estimator.** A real one (YuNet via ONNX
+Runtime) is a developer opt-in, `-DXRT_SIM_WEBCAM_ESTIMATOR=onnx`, and release
+builds never enable it. Without an estimator the toggle only logs a WARN: no
+capability changes and no camera opens, so nothing an app sees changes.
 
 ## References
 

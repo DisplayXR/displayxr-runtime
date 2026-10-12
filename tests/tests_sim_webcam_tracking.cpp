@@ -19,12 +19,16 @@
  *  - the WORKER end to end on the synthetic UVC backend with a fake
  *    estimator: frames flow at the camera rate, the known head comes back,
  *    "no face" never tracks, an unknown device never tracks, and destroy
- *    returns promptly. No real camera is ever opened.
+ *    returns promptly. No real camera is ever opened;
+ *  - the YuNet halves of the opt-in ONNX estimator that need no inference:
+ *    frame -> tensor (reduction, luma pick, padding) and synthetic output
+ *    tensors -> eye pixels in the source frame.
  */
 
 #include "catch_amalgamated.hpp"
 
 #include "sim_display_face_estimator.h"
+#include "sim_display_face_yunet.h"
 #include "sim_display_webcam_tracker.h"
 #include "sim_display_webcam_tracking.h"
 
@@ -37,6 +41,7 @@
 #include <cstring>
 #include <functional>
 #include <thread>
+#include <vector>
 
 using Catch::Approx;
 
@@ -440,4 +445,134 @@ TEST_CASE("webcam estimator: the default build ships none, so the camera stays s
 	// flips both of these together.
 	CHECK_FALSE(sim_face_estimator_default_available());
 	CHECK(sim_face_estimator_create_default() == nullptr);
+}
+
+TEST_CASE("webcam YuNet: frame -> tensor", "[sim_webcam]")
+{
+	sim_yunet_plan plan{};
+	REQUIRE(sim_yunet_make_plan(640, 480, SIM_YUNET_NET_WIDTH, &plan));
+	CHECK(plan.net_w == 320);
+	CHECK(plan.net_h == 240);
+	CHECK(plan.pad_w == 320);
+	CHECK(plan.pad_h == 256);
+	CHECK(plan.src_per_net == Approx(2.0f));
+
+	sim_yunet_plan small{};
+	REQUIRE(sim_yunet_make_plan(200, 100, SIM_YUNET_NET_WIDTH, &small));
+	CHECK(small.net_w == 200); // never upscaled
+	CHECK(small.pad_w == 224);
+	CHECK(small.pad_h == 128);
+	CHECK_FALSE(sim_yunet_make_plan(0, 480, SIM_YUNET_NET_WIDTH, &small));
+
+	const size_t plane = (size_t)plan.pad_w * plan.pad_h;
+	REQUIRE(sim_yunet_tensor_floats(&plan) == 3 * plane);
+	std::vector<float> t(sim_yunet_tensor_floats(&plan), -1.0f);
+
+	SECTION("NV12: left half dark, right half bright, padding zero, channels equal")
+	{
+		std::vector<uint8_t> y(640 * 480), uv(640 * 240, 128);
+		for (uint32_t r = 0; r < 480; r++) {
+			for (uint32_t c = 0; c < 640; c++) {
+				y[r * 640 + c] = c < 320 ? 0 : 200;
+			}
+		}
+		u_stereo_uvc_raw_frame f{};
+		f.pixel = U_STEREO_UVC_PIXEL_NV12;
+		f.width = 640;
+		f.height = 480;
+		f.planes[0] = y.data();
+		f.planes[1] = uv.data();
+		f.pitches[0] = f.pitches[1] = 640;
+		REQUIRE(sim_yunet_fill_tensor(&f, &plan, t.data()));
+		CHECK(t[100 * plan.pad_w + 10] == Approx(0.0f));
+		CHECK(t[100 * plan.pad_w + 300] == Approx(200.0f));
+		CHECK(t[250 * plan.pad_w + 300] == 0.0f); // padding row
+		for (size_t i = 0; i < plane; i += 997) {
+			CHECK(t[plane + i] == t[i]);
+			CHECK(t[2 * plane + i] == t[i]);
+		}
+	}
+
+	SECTION("YUY2: luma only, chroma ignored")
+	{
+		std::vector<uint8_t> px(640 * 2 * 480);
+		for (size_t i = 0; i < px.size(); i += 2) {
+			px[i] = 50;      // Y
+			px[i + 1] = 230; // U / V
+		}
+		u_stereo_uvc_raw_frame f{};
+		f.pixel = U_STEREO_UVC_PIXEL_YUY2;
+		f.width = 640;
+		f.height = 480;
+		f.planes[0] = px.data();
+		f.pitches[0] = 640 * 2;
+		REQUIRE(sim_yunet_fill_tensor(&f, &plan, t.data()));
+		CHECK(t[0] == Approx(50.0f));
+		CHECK(t[239 * plan.pad_w + 319] == Approx(50.0f));
+	}
+
+	SECTION("a frame that is not the planned size is refused")
+	{
+		std::vector<uint8_t> y(320 * 240);
+		u_stereo_uvc_raw_frame f{};
+		f.pixel = U_STEREO_UVC_PIXEL_NV12;
+		f.width = 320;
+		f.height = 240;
+		f.planes[0] = y.data();
+		f.pitches[0] = 320;
+		CHECK_FALSE(sim_yunet_fill_tensor(&f, &plan, t.data()));
+	}
+}
+
+TEST_CASE("webcam YuNet: output tensors -> eye pixels", "[sim_webcam]")
+{
+	sim_yunet_plan plan{};
+	REQUIRE(sim_yunet_make_plan(640, 480, SIM_YUNET_NET_WIDTH, &plan));
+
+	// Strides 8, 16, 32 over a 320 x 256 tensor.
+	const uint32_t strides[SIM_YUNET_STRIDES] = {8, 16, 32};
+	std::vector<float> cls[SIM_YUNET_STRIDES], obj[SIM_YUNET_STRIDES], kps[SIM_YUNET_STRIDES];
+	sim_yunet_head heads[SIM_YUNET_STRIDES];
+	for (int h = 0; h < SIM_YUNET_STRIDES; h++) {
+		const size_t rows = (size_t)(plan.pad_w / strides[h]) * (plan.pad_h / strides[h]);
+		cls[h].assign(rows, 0.0f);
+		obj[h].assign(rows, 0.0f);
+		kps[h].assign(rows * 10, 0.0f);
+		heads[h] = {cls[h].data(), obj[h].data(), kps[h].data(), rows};
+	}
+
+	sim_face_landmarks lm{};
+	REQUIRE(sim_yunet_decode(&plan, heads, SIM_YUNET_SCORE_MIN, &lm));
+	CHECK_FALSE(lm.found); // nothing scores
+
+	// A weaker face at stride 8 and a stronger one at stride 16, col 5 row 3.
+	const size_t weak = 7 * (plan.pad_w / 8) + 4;
+	cls[0][weak] = 0.7f;
+	obj[0][weak] = 0.7f;
+	const size_t cell = 3 * (plan.pad_w / 16) + 5;
+	cls[1][cell] = 0.9f;
+	obj[1][cell] = 1.5f; // clamped to 1
+	kps[1][cell * 10 + 0] = 0.25f;
+	kps[1][cell * 10 + 1] = 0.5f;
+	kps[1][cell * 10 + 2] = 1.75f;
+	kps[1][cell * 10 + 3] = 0.5f;
+
+	REQUIRE(sim_yunet_decode(&plan, heads, SIM_YUNET_SCORE_MIN, &lm));
+	REQUIRE(lm.found);
+	CHECK(lm.confidence == Approx(std::sqrt(0.9f)));
+	// Network pixels ((k + col) * 16, (k + row) * 16), times 2 back to the frame.
+	CHECK(lm.eye_px[0][0] == Approx((0.25f + 5) * 16 * 2));
+	CHECK(lm.eye_px[0][1] == Approx((0.5f + 3) * 16 * 2));
+	CHECK(lm.eye_px[1][0] == Approx((1.75f + 5) * 16 * 2));
+	CHECK(lm.eye_px[1][1] == Approx((0.5f + 3) * 16 * 2));
+
+	// Below the threshold is no face.
+	cls[1][cell] = 0.2f;
+	REQUIRE(sim_yunet_decode(&plan, heads, 0.8f, &lm));
+	CHECK_FALSE(lm.found);
+
+	// Outputs shaped for another input size are refused, not misread.
+	heads[2].rows -= 1;
+	CHECK_FALSE(sim_yunet_decode(&plan, heads, SIM_YUNET_SCORE_MIN, &lm));
+	CHECK_FALSE(lm.found);
 }
