@@ -23,7 +23,16 @@ REM                                                       (ProbeOrder 200). Synt
 REM                                                       product path -- it also needs DXR_SIM_INPUT=1 in
 REM                                                       the environment at run time before it will probe.
 REM   scripts\register_dev_plugin.bat unregister-input :: remove the dev sim-input entry
-REM   scripts\register_dev_plugin.bat list             :: show registered DPs + input providers
+REM   scripts\register_dev_plugin.bat conv <dll> [--probe-order N]
+REM                                                    :: register a CONVERSION provider (ADR-053),
+REM                                                       id = DLL basename, ProbeOrder 50 by default
+REM   scripts\register_dev_plugin.bat conv sim [--probe-order N]
+REM                                                    :: register the dev sim-conversion provider
+REM                                                       (ProbeOrder 250, FALLBACK). The runtime
+REM                                                       installer never registers it on user installs.
+REM   scripts\register_dev_plugin.bat unregister-conv [id] :: remove a conversion provider row
+REM                                                       (default: sim-conversion)
+REM   scripts\register_dev_plugin.bat list             :: show registered DPs, input + conversion providers
 REM ============================================================
 
 set "REPO=%~dp0.."
@@ -44,6 +53,8 @@ if /I "%MODE%"=="unregister-sim" goto :unregister_sim
 if /I "%MODE%"=="leia" goto :leia
 if /I "%MODE%"=="input" goto :input
 if /I "%MODE%"=="unregister-input" goto :unregister_input
+if /I "%MODE%"=="conv" goto :conv
+if /I "%MODE%"=="unregister-conv" goto :unregister_conv
 goto :sim
 
 :sim
@@ -136,6 +147,61 @@ reg delete "HKLM\Software\DisplayXR\InputProviders\sim-input" /f >nul 2>&1
 echo Removed sim-input dev registration.
 goto :list
 
+:conv
+REM Register a conversion-provider plug-in (ADR-053 / #1999) under
+REM HKLM\Software\DisplayXR\ConversionProviders\<id>, with the value schema the
+REM installers write (conversion-provider-discovery.md section 3.1). Pass a DLL
+REM path for a vendor / dev provider (id = DLL basename minus extension,
+REM ProbeOrder 50 = the vendor band), or the literal `sim` for the freshly-built
+REM sim-conversion (ProbeOrder 250 = the FALLBACK band). `--probe-order N`
+REM overrides either. Version is written LAST, as installers must (section 3.8):
+REM it is the "row complete" marker the service re-describes on.
+set "DLL=%~2"
+if "%DLL%"=="" (
+    echo ERROR: 'conv' needs a target:
+    echo   scripts\register_dev_plugin.bat conv C:\path\to\Vendor-Conversion.dll [--probe-order N]
+    echo   scripts\register_dev_plugin.bat conv sim [--probe-order N]
+    exit /b 1
+)
+if /I "%DLL%"=="sim" (
+    set "DLL=%REPO%\_package\bin\plugins\DisplayXR-SimConversion.dll"
+    set "CPID=sim-conversion"
+    set "CPNAME=DisplayXR Sim Conversion"
+    set "CPORDER=250"
+) else (
+    for %%F in ("%DLL%") do set "CPID=%%~nF"
+    set "CPNAME=Conversion Provider (dev)"
+    set "CPORDER=50"
+)
+if /I "%~3"=="--probe-order" (
+    if "%~4"=="" (
+        echo ERROR: --probe-order needs a number.
+        exit /b 1
+    )
+    set "CPORDER=%~4"
+)
+if not exist "%DLL%" (
+    echo ERROR: %DLL% not found. Build first: scripts\build_windows.bat build
+    exit /b 1
+)
+REM Absolute path with backslashes: the loader hands it to LoadLibraryExW.
+for %%F in ("%DLL%") do set "DLL=%%~fF"
+set "CPKEY=HKLM\Software\DisplayXR\ConversionProviders\%CPID%"
+reg add "%CPKEY%" /v Binary      /t REG_SZ    /d "%DLL%"    /f >nul || goto :regfail
+reg add "%CPKEY%" /v ProbeOrder  /t REG_DWORD /d %CPORDER%  /f >nul || goto :regfail
+reg add "%CPKEY%" /v DisplayName /t REG_SZ    /d "%CPNAME%" /f >nul || goto :regfail
+reg add "%CPKEY%" /v Version     /t REG_SZ    /d "dev"      /f >nul || goto :regfail
+echo Registered conversion provider '%CPID%' (ProbeOrder %CPORDER%):
+echo   %DLL%
+goto :list
+
+:unregister_conv
+set "CPID=%~2"
+if "%CPID%"=="" set "CPID=sim-conversion"
+reg delete "HKLM\Software\DisplayXR\ConversionProviders\%CPID%" /f >nul 2>&1
+echo Removed conversion provider registration '%CPID%'.
+goto :list
+
 :list
 echo.
 set "CLI=%REPO%\_package\bin\displayxr-cli.exe"
@@ -145,6 +211,10 @@ if exist "%CLI%" (
 ) else (
     echo (displayxr-cli not built yet; skipping dp/input list)
 )
+REM No `displayxr-cli conv list` yet (ADR-053 section 7.1 lands later): show the raw rows.
+echo.
+echo Conversion providers (HKLM\Software\DisplayXR\ConversionProviders):
+reg query "HKLM\Software\DisplayXR\ConversionProviders" /s 2>nul || echo   (none registered)
 exit /b 0
 
 :regfail
