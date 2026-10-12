@@ -13,6 +13,7 @@ add_library(
 			    target_input_arbiter.c target_input_arbiter.h
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
+			    target_conv_status.c target_conv_status.h
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
 			    target_display_hotplug.c target_display_hotplug.h
@@ -23,6 +24,10 @@ add_library(
 			    target_rig_composer.c target_rig_composer.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
+# ADR-053 #2006: target_conv_status.c runs the conversion core's registry +
+# selection headless (selftest `conversion_providers`, `conv list`, the
+# headless status snapshot's conversion rows).
+target_link_libraries(target_lists PRIVATE displayxr::conversion_core)
 # #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
 # aux_vk) to fingerprint-check VK DP plug-ins. Linked here so every consumer
 # of the loader resolves it; guarded because aux_vk only exists with Vulkan.

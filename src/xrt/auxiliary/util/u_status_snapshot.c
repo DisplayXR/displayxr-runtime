@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_instance.h" // enum xrt_client_class
 #include "xrt/xrt_plugin.h"   // enum xrt_display_claim_confidence, xrt_plugin_platform_state
+#include "xrt/xrt_conversion_plugin.h" // XRT_CONV_STATE_* / _FAIL_* / _LICENCE_* (ADR-053 rows)
 
 #include <cjson/cJSON.h>
 
@@ -222,6 +223,29 @@ u_status_client_class_str(uint32_t client_class, bool verified)
 	}
 }
 
+const char *
+u_status_conv_hosting_str(enum xrt_status_conv_hosting h)
+{
+	switch (h) {
+	case XRT_STATUS_CONV_HOSTING_IN_SERVICE: return "in_service";
+	case XRT_STATUS_CONV_HOSTING_SATELLITE: return "satellite";
+	case XRT_STATUS_CONV_HOSTING_ANDROID_SERVICE: return "android_service";
+	default: return "unknown";
+	}
+}
+
+const char *
+u_status_conv_licence_str(uint32_t licence_class)
+{
+	switch (licence_class) {
+	case XRT_CONV_LICENCE_UNKNOWN: return "UNKNOWN";
+	case XRT_CONV_LICENCE_PERMISSIVE: return "PERMISSIVE";
+	case XRT_CONV_LICENCE_COMMERCIAL: return "COMMERCIAL";
+	case XRT_CONV_LICENCE_RESEARCH_ONLY: return "RESEARCH_ONLY";
+	default: return "INVALID";
+	}
+}
+
 
 /*
  *
@@ -318,6 +342,104 @@ plugin_not_ready_text(const struct xrt_status_plugin *p, char *out, size_t cap)
 	} else {
 		(void)snprintf(out, cap, "Plug-in '%s' reports %s: start or repair its platform.", p->id,
 		               u_status_platform_state_str(p->platform_state));
+	}
+}
+
+//! Provider id of a conversion task row ("?" when the index is out of range).
+static const char *
+conv_task_provider_id(const struct xrt_status_snapshot *snap, const struct xrt_status_conv_task *t)
+{
+	if (t->provider < snap->conv_provider_count && t->provider < XRT_STATUS_MAX_CONV_PROVIDERS) {
+		return snap->conv_providers[t->provider].id;
+	}
+	return t->composed ? "composed" : "?";
+}
+
+/*!
+ * ADR-053 conversion warnings (system level; at most one per code, naming the
+ * first offender so the 8-slot array is never flooded by one bad provider).
+ */
+static void
+conv_warnings_derive(struct xrt_status_snapshot *snap)
+{
+	const uint32_t nt =
+	    snap->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? snap->conv_task_count : XRT_STATUS_MAX_CONV_TASKS;
+	char text[XRT_STATUS_TEXT_MAX];
+
+	// CONV_CRASH_LOOP — a capability cut off after 5 abnormal host exits in 10 min.
+	for (uint32_t i = 0; i < nt; i++) {
+		const struct xrt_status_conv_task *t = &snap->conv_tasks[i];
+		if (t->state == XRT_CONV_STATE_FAILED && t->reason == XRT_CONV_FAIL_CRASH_LOOP) {
+			(void)snprintf(text, sizeof(text),
+			               "Conversion provider %s keeps crashing and is cut off for 30 min: update or "
+			               "disable it.",
+			               conv_task_provider_id(snap, t));
+			(void)u_status_warning_push(snap->warnings, &snap->warning_count, XRT_STATUS_MAX_WARNINGS,
+			                            U_STATUS_W_CONV_CRASH_LOOP, XRT_STATUS_LEVEL_CRITICAL, text);
+			break;
+		}
+	}
+
+	// CONV_RESEARCH_MODEL_ENABLED — a selected row whose model is not cleared for
+	// commercial use (only reachable with AllowResearchOnly on; the grandfathered
+	// dp-lift adapter is exempt and never warns).
+	for (uint32_t i = 0; i < nt; i++) {
+		const struct xrt_status_conv_task *t = &snap->conv_tasks[i];
+		if (!t->selected ||
+		    (t->licence_class != XRT_CONV_LICENCE_RESEARCH_ONLY && t->licence_class != XRT_CONV_LICENCE_UNKNOWN)) {
+			continue;
+		}
+		if (t->provider < snap->conv_provider_count && t->provider < XRT_STATUS_MAX_CONV_PROVIDERS &&
+		    snap->conv_providers[t->provider].licence_exempt) {
+			continue;
+		}
+		(void)snprintf(text, sizeof(text), "%s is served by a research-only model (%s): AllowResearchOnly is on.",
+		               t->task_name, conv_task_provider_id(snap, t));
+		(void)u_status_warning_push(snap->warnings, &snap->warning_count, XRT_STATUS_MAX_WARNINGS,
+		                            U_STATUS_W_CONV_RESEARCH_MODEL_ENABLED, XRT_STATUS_LEVEL_WARN, text);
+		break;
+	}
+
+	// CONV_TASK_UNSERVED — a task had ordered candidates but none is selectable.
+	for (uint32_t i = 0; i < nt; i++) {
+		const uint32_t task = snap->conv_tasks[i].task;
+		bool first = true; // only evaluate a task at its first row
+		for (uint32_t k = 0; k < i; k++) {
+			first &= snap->conv_tasks[k].task != task;
+		}
+		if (!first) {
+			continue;
+		}
+		bool ordered = false, selected = false;
+		for (uint32_t k = i; k < nt; k++) {
+			const struct xrt_status_conv_task *t = &snap->conv_tasks[k];
+			if (t->task != task) {
+				continue;
+			}
+			ordered |= t->order != XRT_STATUS_CONV_NOT_ORDERED;
+			selected |= t->selected;
+		}
+		if (ordered && !selected) {
+			(void)snprintf(text, sizeof(text),
+			               "No conversion provider can serve %s now: every candidate failed or is absent.",
+			               snap->conv_tasks[i].task_name);
+			(void)u_status_warning_push(snap->warnings, &snap->warning_count, XRT_STATUS_MAX_WARNINGS,
+			                            U_STATUS_W_CONV_TASK_UNSERVED, XRT_STATUS_LEVEL_WARN, text);
+			break;
+		}
+	}
+
+	// CONV_CPU_STAGING — a live stream copies through the CPU (service only).
+	for (uint32_t i = 0; i < nt; i++) {
+		const struct xrt_status_conv_task *t = &snap->conv_tasks[i];
+		if (t->cpu_staging) {
+			(void)snprintf(text, sizeof(text),
+			               "A %s stream on %s uses CPU staging (no GPU-shared import): expect more latency.",
+			               t->task_name, conv_task_provider_id(snap, t));
+			(void)u_status_warning_push(snap->warnings, &snap->warning_count, XRT_STATUS_MAX_WARNINGS,
+			                            U_STATUS_W_CONV_CPU_STAGING, XRT_STATUS_LEVEL_INFO, text);
+			break;
+		}
 	}
 }
 
@@ -535,6 +657,8 @@ u_status_warnings_derive(struct xrt_status_snapshot *snap)
 			                            U_STATUS_W_PLUGIN_NOT_READY, XRT_STATUS_LEVEL_CRITICAL, text);
 		}
 	}
+
+	conv_warnings_derive(snap);
 }
 
 
@@ -566,6 +690,11 @@ u_status_snapshot_get_head(const struct xrt_status_snapshot *snap, struct xrt_st
 	out->warning_count =
 	    snap->warning_count < XRT_STATUS_MAX_WARNINGS ? snap->warning_count : XRT_STATUS_MAX_WARNINGS;
 	memcpy(out->warnings, snap->warnings, sizeof(out->warnings));
+	out->conv_provider_count = snap->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS
+	                               ? snap->conv_provider_count
+	                               : XRT_STATUS_MAX_CONV_PROVIDERS;
+	out->conv_task_count =
+	    snap->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? snap->conv_task_count : XRT_STATUS_MAX_CONV_TASKS;
 }
 
 void
@@ -590,12 +719,18 @@ u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_st
 	snap->warning_count =
 	    head->warning_count < XRT_STATUS_MAX_WARNINGS ? head->warning_count : XRT_STATUS_MAX_WARNINGS;
 	memcpy(snap->warnings, head->warnings, sizeof(snap->warnings));
+	// The rows themselves are fetched by index (system_get_conv_*_row).
+	snap->conv_provider_count = head->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS
+	                                ? head->conv_provider_count
+	                                : XRT_STATUS_MAX_CONV_PROVIDERS;
+	snap->conv_task_count =
+	    head->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? head->conv_task_count : XRT_STATUS_MAX_CONV_TASKS;
 }
 
 bool
 u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b)
 {
-	return a->topology == b->topology && a->status == b->status;
+	return a->topology == b->topology && a->status == b->status && a->conversion == b->conversion;
 }
 
 
@@ -849,6 +984,112 @@ client_to_cjson(const struct xrt_status_client *c)
 }
 
 cJSON *
+u_status_conv_provider_to_cjson(const struct xrt_status_conv_provider *p)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "id", p->id);
+	cJSON_AddStringToObject(o, "name", p->name);
+	cJSON_AddStringToObject(o, "vendor", p->vendor);
+	cJSON_AddStringToObject(o, "version", p->version);
+	cJSON_AddStringToObject(o, "load", p->load);
+	cJSON_AddStringToObject(o, "binary", p->binary);
+	cJSON_AddNumberToObject(o, "abi", (double)p->abi);
+	cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
+	cJSON_AddStringToObject(o, "hosting", u_status_conv_hosting_str(p->hosting));
+	cJSON_AddStringToObject(o, "status", u_status_platform_state_str(p->platform_state));
+	cJSON_AddStringToObject(o, "hint", p->hint);
+	cJSON_AddBoolToObject(o, "enabled", p->enabled);
+	cJSON_AddBoolToObject(o, "fallback", p->fallback);
+	cJSON_AddBoolToObject(o, "hidden", p->hidden);
+	cJSON_AddBoolToObject(o, "licence_exempt", p->licence_exempt);
+	cJSON_AddBoolToObject(o, "research_opt_in", p->research_opt_in);
+	cJSON_AddBoolToObject(o, "described", p->described);
+	cJSON_AddNumberToObject(o, "host_pid", (double)p->host_pid);
+	cJSON_AddNumberToObject(o, "restarts", (double)p->restarts);
+	cJSON_AddNumberToObject(o, "last_exit_code", (double)p->last_exit_code);
+	add_hex_id(o, "adapter_luid", p->adapter_luid);
+	cJSON_AddStringToObject(o, "backend", p->backend);
+	cJSON_AddNumberToObject(o, "vram_used_mb", (double)p->vram_used_mb);
+	cJSON_AddStringToObject(o, "licence_class", u_status_conv_licence_str(p->licence_class));
+	cJSON_AddStringToObject(o, "licence_spdx", p->licence_spdx);
+	cJSON_AddNumberToObject(o, "cap_count", (double)p->cap_count);
+	cJSON_AddNumberToObject(o, "bad_descriptors", (double)p->bad_descriptors);
+	add_str_or_null(o, "descriptor_error", p->descriptor_error);
+	return o;
+}
+
+cJSON *
+u_status_conv_task_to_cjson(const struct xrt_status_conv_task *t,
+                            const struct xrt_status_conv_provider *providers,
+                            uint32_t provider_count)
+{
+	cJSON *o = cJSON_CreateObject();
+	if (t->provider < provider_count && providers != NULL) {
+		cJSON_AddNumberToObject(o, "provider_index", (double)t->provider);
+		cJSON_AddStringToObject(o, "provider", providers[t->provider].id);
+	} else {
+		cJSON_AddNullToObject(o, "provider_index");
+		cJSON_AddNullToObject(o, "provider");
+	}
+	cJSON_AddStringToObject(o, "task", t->task_name);
+	cJSON_AddNumberToObject(o, "cap_id", (double)t->cap_id);
+	cJSON_AddBoolToObject(o, "composed", t->composed);
+	cJSON_AddStringToObject(o, "state", t->state_name);
+	cJSON_AddStringToObject(o, "reason", t->reason_name);
+	cJSON_AddNumberToObject(o, "progress", (double)t->progress);
+	cJSON_AddBoolToObject(o, "selected", t->selected);
+	if (t->order == XRT_STATUS_CONV_NOT_ORDERED) {
+		cJSON_AddNullToObject(o, "order");
+	} else {
+		cJSON_AddNumberToObject(o, "order", (double)t->order);
+	}
+	cJSON_AddStringToObject(o, "verdict", t->verdict);
+	cJSON_AddBoolToObject(o, "stream", (t->lanes & XRT_CONV_LANE_STREAM) != 0);
+	cJSON_AddBoolToObject(o, "job", (t->lanes & XRT_CONV_LANE_JOB) != 0);
+	cJSON_AddNumberToObject(o, "min_views", (double)t->min_views);
+	cJSON_AddNumberToObject(o, "max_views", (double)t->max_views);
+	cJSON_AddStringToObject(o, "licence_class", u_status_conv_licence_str(t->licence_class));
+	cJSON_AddStringToObject(o, "backend", t->backend);
+	cJSON_AddStringToObject(o, "model_id", t->model_id);
+	cJSON_AddNumberToObject(o, "typical_latency_ms", (double)t->typical_latency_ms);
+	cJSON_AddNumberToObject(o, "streams", (double)t->streams);
+	cJSON_AddNumberToObject(o, "jobs_queued", (double)t->jobs_queued);
+	cJSON_AddBoolToObject(o, "cpu_staging", t->cpu_staging);
+	return o;
+}
+
+cJSON *
+u_status_conv_to_cjson(const struct xrt_status_snapshot *snap)
+{
+	cJSON *root = cJSON_CreateObject();
+	if (snap == NULL) {
+		return root;
+	}
+	cJSON_AddNumberToObject(root, "schema", (double)XRT_STATUS_SCHEMA);
+	cJSON_AddStringToObject(root, "source", u_status_source_str(snap->source));
+	cJSON *gen = cJSON_AddObjectToObject(root, "generation");
+	cJSON_AddNumberToObject(gen, "conversion", (double)snap->generation.conversion);
+	cJSON_AddNumberToObject(gen, "status", (double)snap->generation.status);
+	const uint32_t ncp = snap->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS ? snap->conv_provider_count
+	                                                                               : XRT_STATUS_MAX_CONV_PROVIDERS;
+	cJSON *cp = cJSON_AddArrayToObject(root, "providers");
+	for (uint32_t i = 0; i < ncp; i++) {
+		cJSON_AddItemToArray(cp, u_status_conv_provider_to_cjson(&snap->conv_providers[i]));
+	}
+	cJSON *ct = cJSON_AddArrayToObject(root, "tasks");
+	for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		cJSON_AddItemToArray(ct, u_status_conv_task_to_cjson(&snap->conv_tasks[i], snap->conv_providers, ncp));
+	}
+	cJSON *w = cJSON_AddArrayToObject(root, "warnings");
+	for (uint32_t i = 0; i < snap->warning_count && i < XRT_STATUS_MAX_WARNINGS; i++) {
+		if (strncmp(snap->warnings[i].code, "CONV_", 5) == 0) {
+			cJSON_AddItemToArray(w, warning_to_cjson(&snap->warnings[i]));
+		}
+	}
+	return root;
+}
+
+cJSON *
 u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -861,6 +1102,7 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	cJSON *gen = cJSON_AddObjectToObject(root, "generation");
 	cJSON_AddNumberToObject(gen, "topology", (double)snap->generation.topology);
 	cJSON_AddNumberToObject(gen, "status", (double)snap->generation.status);
+	cJSON_AddNumberToObject(gen, "conversion", (double)snap->generation.conversion);
 
 	cJSON *rt = cJSON_AddObjectToObject(root, "runtime");
 	cJSON_AddStringToObject(rt, "version", snap->runtime.version);
@@ -909,6 +1151,18 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	}
 
 	add_warnings(root, snap->warnings, snap->warning_count);
+
+	// ADR-053: conversion providers + per-task rows (keys only added; schema stays 1).
+	cJSON *cp = cJSON_AddArrayToObject(root, "conv_providers");
+	const uint32_t ncp = snap->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS ? snap->conv_provider_count
+	                                                                               : XRT_STATUS_MAX_CONV_PROVIDERS;
+	for (uint32_t i = 0; i < ncp; i++) {
+		cJSON_AddItemToArray(cp, u_status_conv_provider_to_cjson(&snap->conv_providers[i]));
+	}
+	cJSON *ct = cJSON_AddArrayToObject(root, "conv_tasks");
+	for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		cJSON_AddItemToArray(ct, u_status_conv_task_to_cjson(&snap->conv_tasks[i], snap->conv_providers, ncp));
+	}
 	return root;
 }
 
@@ -1173,8 +1427,8 @@ u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf,
 	tb_printf(&t, "DisplayXR %s (%s)  ·  source: %s", snap->runtime.version, snap->runtime.git_tag,
 	          u_status_source_str(snap->source));
 	if (snap->source == XRT_STATUS_SOURCE_SERVICE) {
-		tb_printf(&t, " (gen %llu/%llu)", (unsigned long long)snap->generation.topology,
-		          (unsigned long long)snap->generation.status);
+		tb_printf(&t, " (gen %llu/%llu/%llu)", (unsigned long long)snap->generation.topology,
+		          (unsigned long long)snap->generation.status, (unsigned long long)snap->generation.conversion);
 	}
 	tb_printf(&t, "  ·  plug-ins: ");
 	if (snap->plugin_count == 0) {
@@ -1225,6 +1479,34 @@ u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf,
 		for (uint32_t i = 0; i < nc; i++) {
 			format_client(&t, snap, &snap->clients[i]);
 		}
+	}
+
+	// ADR-053 conversion providers + the selected row per task.
+	const uint32_t ncp = snap->conv_provider_count < XRT_STATUS_MAX_CONV_PROVIDERS ? snap->conv_provider_count
+	                                                                               : XRT_STATUS_MAX_CONV_PROVIDERS;
+	const uint32_t nct =
+	    snap->conv_task_count < XRT_STATUS_MAX_CONV_TASKS ? snap->conv_task_count : XRT_STATUS_MAX_CONV_TASKS;
+	if (ncp > 0 || nct > 0) {
+		tb_printf(&t, "CONVERSION  %u provider%s", ncp, ncp == 1 ? "" : "s");
+		for (uint32_t i = 0; i < ncp; i++) {
+			const struct xrt_status_conv_provider *p = &snap->conv_providers[i];
+			tb_printf(&t, "%s%s %s%s%s", i > 0 ? ", " : " · ", p->id, p->load,
+			          p->enabled ? "" : " (disabled)", p->hidden ? " (hidden)" : "");
+		}
+		tb_printf(&t, "\n");
+	}
+	for (uint32_t i = 0; i < nct; i++) {
+		const struct xrt_status_conv_task *c = &snap->conv_tasks[i];
+		if (!c->selected) {
+			continue;
+		}
+		const char *pid = c->provider < ncp ? snap->conv_providers[c->provider].id : "?";
+		tb_printf(&t, "  %-18s %s%s/%u  %s", c->task_name, pid, c->composed ? "+viewsyn" : "", c->cap_id,
+		          c->state_name);
+		if (c->streams > 0 || c->jobs_queued > 0) {
+			tb_printf(&t, "  streams %u jobs %u", c->streams, c->jobs_queued);
+		}
+		tb_printf(&t, "\n");
 	}
 
 	// Workspace + system warnings.

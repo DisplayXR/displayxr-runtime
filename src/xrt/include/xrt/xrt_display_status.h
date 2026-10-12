@@ -67,6 +67,16 @@ extern "C" {
 #define XRT_STATUS_TEXT_MAX 128
 //! Size of short identity strings (ids, names, serials), incl. the NUL.
 #define XRT_STATUS_NAME_MAX 64
+//! Conversion providers carried in a snapshot (ADR-053; roadmap §6.1 "<= 8").
+#define XRT_STATUS_MAX_CONV_PROVIDERS 8
+//! Conversion task rows carried in a snapshot (provider x capability, plus composed rows; "<= 32").
+#define XRT_STATUS_MAX_CONV_TASKS 32
+//! Ceiling for ONE conversion row reply over DIAG (the row + its generation + the result code).
+#define XRT_STATUS_CONV_ROW_REPLY_MAX 1024
+//! "No provider" in @ref xrt_status_conv_task::provider.
+#define XRT_STATUS_CONV_NO_PROVIDER 0xFFFFFFFFu
+//! "Not in the selection order" in @ref xrt_status_conv_task::order (dropped by the filter).
+#define XRT_STATUS_CONV_NOT_ORDERED 0xFFFFFFFFu
 
 /*!
  * Bits for @ref xrt_status_claim::apis — the graphics APIs whose DP factory the
@@ -489,7 +499,106 @@ struct xrt_status_generation
 {
 	uint64_t topology; //!< Screens + plug-ins.
 	uint64_t status;   //!< Everything else.
+	//! Conversion providers (ADR-053): bumps on every readiness transition and
+	//! provider-table change, so `status --watch` and the dashboard update live.
+	uint64_t conversion;
 };
+
+/*!
+ * Where a conversion provider runs (ADR-053 §4.4; JSON lower-case
+ * "in_service" / "satellite" / "android_service").
+ */
+enum xrt_status_conv_hosting
+{
+	XRT_STATUS_CONV_HOSTING_IN_SERVICE = 0,      //!< Loaded in the service (P1; the dp-lift adapter always).
+	XRT_STATUS_CONV_HOSTING_SATELLITE = 1,       //!< `displayxr-conversion-host.exe` (P2).
+	XRT_STATUS_CONV_HOSTING_ANDROID_SERVICE = 2, //!< The Android `:conversion` process (P5).
+};
+
+/*!
+ * One conversion provider (ADR-053, `conversion-provider-discovery.md` §7.3).
+ * Crosses by value, one per `system_get_conv_provider_row(index)` reply, so it
+ * stays under @ref XRT_STATUS_CONV_ROW_REPLY_MAX (asserted below).
+ *
+ * Provider identity is fine here: the snapshot is a diagnostics surface (CLI,
+ * dashboard, MCP), never web content.
+ */
+struct xrt_status_conv_provider
+{
+	char id[XRT_STATUS_NAME_MAX];         //!< Registry / manifest id ("dp-lift" for the legacy adapter).
+	char name[XRT_STATUS_NAME_MAX];       //!< DisplayName.
+	char vendor[XRT_STATUS_NAME_MAX];     //!< Registration vendor ("" if unknown).
+	char version[32];                     //!< Registration Version.
+	char load[24];                        //!< Loader outcome: "NEGOTIATED", "ABI_MISMATCH", "BUILT_IN", ...
+	char binary[256];                     //!< Binary path (truncated; "" for the built-in adapter).
+	uint32_t abi;                         //!< ABI the provider reported (0 = never negotiated).
+	uint32_t probe_order;                 //!< ProbeOrder (lower wins).
+	enum xrt_status_conv_hosting hosting; //!< Where it runs.
+	uint32_t platform_state;              //!< `enum xrt_plugin_platform_state` value (get_provider_status).
+	char hint[128];                       //!< The provider's status hint (or the loader's reason), verbatim.
+	bool enabled;                         //!< `Enabled` (after the per-user override).
+	bool fallback;                        //!< FALLBACK provider (sorts last).
+	bool hidden;                          //!< Hidden by another provider's `Supersedes`.
+	bool licence_exempt;                  //!< Grandfathered (the dp-lift adapter): skips the licence gate.
+	bool research_opt_in;                 //!< `AllowResearchOnly` is on (machine-wide; repeated per row).
+	bool described;                       //!< Rows exist (live describe or the describe cache).
+	int64_t host_pid;                     //!< Satellite host pid; 0 in-service / not running.
+	uint32_t restarts;                    //!< Host restarts since service start.
+	int32_t last_exit_code;               //!< Last host exit code (0 = none / orderly).
+	uint64_t adapter_luid;                //!< Adapter it runs on (0 = CPU / undecided / unknown).
+	char backend[32];                     //!< Backend of its first capability ("" = unknown).
+	uint32_t vram_used_mb;                //!< VRAM in use (exact in satellite mode; 0 = unknown).
+	uint32_t licence_class;               //!< XRT_CONV_LICENCE_* of its first capability.
+	char licence_spdx[48];                //!< SPDX of its first capability.
+	uint32_t cap_count;                   //!< Capabilities accepted at the last describe.
+	uint32_t bad_descriptors;             //!< Capabilities rejected at the last describe (selftest exit 13).
+	char descriptor_error[48];            //!< Why the first one was rejected ("" = none).
+};
+
+/*!
+ * One conversion task row: a provider capability (or a composed pipeline) for
+ * one task, with its readiness and where selection put it. One per
+ * `system_get_conv_task_row(index)` reply.
+ */
+struct xrt_status_conv_task
+{
+	uint32_t provider;                  //!< Index into conv_providers[] (@ref XRT_STATUS_CONV_NO_PROVIDER = none).
+	uint32_t task;                      //!< XRT_CONV_TASK_*.
+	char task_name[24];                 //!< "views-mono", "depth-video", ...
+	uint32_t cap_id;                    //!< Provider cap_id (the depth row's, for a composed row).
+	bool composed;                      //!< Depth capability + the reference view-synthesis stage.
+	bool selected;                      //!< Selection's choice for this task right now.
+	bool cpu_staging;                   //!< A live stream on it fell back to CPU staging (service only).
+	uint32_t state;                     //!< XRT_CONV_STATE_*.
+	uint32_t reason;                    //!< XRT_CONV_FAIL_* / core-local reason.
+	char state_name[16];                //!< "READY", "INSTALLED", ...
+	char reason_name[24];               //!< "none", "crash_loop", "policy", ...
+	float progress;                     //!< WARMING / DOWNLOADING, [0,1]; < 0 indeterminate.
+	uint32_t order;                     //!< Rank in the task's selection order (NOT_ORDERED = dropped).
+	char verdict[24];                   //!< "selected", "behind", "fell-through", "drop-licence", ...
+	uint32_t lanes;                     //!< XRT_CONV_LANE_* bits.
+	uint32_t min_views;                 //!< VIEWS_* limits.
+	uint32_t max_views;                 //!< VIEWS_* limits.
+	uint32_t licence_class;             //!< XRT_CONV_LICENCE_*.
+	char backend[32];                   //!< e.g. "onnxruntime-dml".
+	char model_id[XRT_STATUS_NAME_MAX]; //!< For diagnostics only.
+	uint32_t typical_latency_ms;        //!< est_latency_ms, or measured (service); 0 = unknown.
+	uint32_t streams;                   //!< Live streams bound (service only).
+	uint32_t jobs_queued;               //!< Queued jobs (service only).
+};
+
+#ifdef __cplusplus
+#define XRT_STATUS_STATIC_ASSERT(c, m) static_assert(c, m)
+#else
+#define XRT_STATUS_STATIC_ASSERT(c, m) _Static_assert(c, m)
+#endif
+// One row + its generation + a result code (with slack for alignment) must fit one DIAG reply.
+XRT_STATUS_STATIC_ASSERT(sizeof(struct xrt_status_conv_provider) + sizeof(struct xrt_status_generation) + 16 <=
+                             XRT_STATUS_CONV_ROW_REPLY_MAX,
+                         "xrt_status_conv_provider row no longer fits one DIAG reply");
+XRT_STATUS_STATIC_ASSERT(sizeof(struct xrt_status_conv_task) + sizeof(struct xrt_status_generation) + 16 <=
+                             XRT_STATUS_CONV_ROW_REPLY_MAX,
+                         "xrt_status_conv_task row no longer fits one DIAG reply");
 
 //! Max presenter screens in a @ref xrt_status_workspace (= COMP_WS_MAX_SCREENS).
 #define XRT_STATUS_WORKSPACE_MAX_SCREENS 8
@@ -530,6 +639,12 @@ struct xrt_status_snapshot
 	struct xrt_status_workspace workspace;                       //!< Workspace state (phase 2).
 	uint32_t warning_count;                                      //!< Valid entries in @ref warnings.
 	struct xrt_status_warning warnings[XRT_STATUS_MAX_WARNINGS]; //!< System-level warnings.
+	//! ADR-053: conversion providers (registry + describe; live state from the service).
+	uint32_t conv_provider_count;
+	struct xrt_status_conv_provider conv_providers[XRT_STATUS_MAX_CONV_PROVIDERS];
+	//! ADR-053: per-task rows, grouped by task, each group in selection order.
+	uint32_t conv_task_count;
+	struct xrt_status_conv_task conv_tasks[XRT_STATUS_MAX_CONV_TASKS];
 };
 
 /*!
@@ -553,6 +668,10 @@ struct xrt_status_head
 	struct xrt_status_workspace workspace;                       //!< Workspace state.
 	uint32_t warning_count;                                      //!< Valid entries in @ref warnings.
 	struct xrt_status_warning warnings[XRT_STATUS_MAX_WARNINGS]; //!< System-level warnings.
+	//! ADR-053: conversion rows to fetch BY INDEX (`system_get_conv_provider_row` /
+	//! `system_get_conv_task_row`), so the head reply does not grow by ~20 KB.
+	uint32_t conv_provider_count;
+	uint32_t conv_task_count;
 };
 
 //! Live DPs the service reports into one build (one primary per client + its segment DPs + its own).
@@ -586,6 +705,12 @@ struct xrt_status_live
 	struct xrt_status_live_dp dps[XRT_STATUS_MAX_LIVE_DPS];   //!< Bound DPs.
 	struct xrt_status_mode mode;                              //!< The head's current rendering mode.
 	struct xrt_status_workspace workspace;                    //!< Workspace state.
+	//! ADR-053: the conversion core's rows as the service's conversion status
+	//! source reports them (`ipc_server_set_conv_status_source`; none = 0 rows).
+	uint32_t conv_provider_count;
+	struct xrt_status_conv_provider conv_providers[XRT_STATUS_MAX_CONV_PROVIDERS];
+	uint32_t conv_task_count;
+	struct xrt_status_conv_task conv_tasks[XRT_STATUS_MAX_CONV_TASKS];
 };
 
 #ifdef __cplusplus

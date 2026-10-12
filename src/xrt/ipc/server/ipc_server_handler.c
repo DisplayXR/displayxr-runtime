@@ -4398,6 +4398,42 @@ static_assert(sizeof(struct ipc_system_get_status_snapshot_msg) <= IPC_BUF_SIZE,
               "system_get_status_snapshot message exceeds IPC_BUF_SIZE");
 static_assert(sizeof(struct ipc_system_get_client_segments_msg) <= IPC_BUF_SIZE,
               "system_get_client_segments message exceeds IPC_BUF_SIZE");
+// ADR-053 (#2006): each conversion row crosses in its own reply, which stays
+// under the 1 KB DIAG limit -- that is why the rows are fetched by index.
+static_assert(sizeof(struct ipc_system_get_conv_provider_row_reply) <= IPC_BUF_SIZE,
+              "system_get_conv_provider_row reply exceeds the 1 KB DIAG limit");
+static_assert(sizeof(struct ipc_system_get_conv_task_row_reply) <= IPC_BUF_SIZE,
+              "system_get_conv_task_row reply exceeds the 1 KB DIAG limit");
+
+xrt_result_t
+ipc_handle_system_get_conv_provider_row(volatile struct ipc_client_state *ics,
+                                        uint32_t index,
+                                        struct xrt_status_conv_provider *out_row,
+                                        struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_conv_provider_row");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_conv_provider(ics->server, index, out_row, out_generation);
+}
+
+xrt_result_t
+ipc_handle_system_get_conv_task_row(volatile struct ipc_client_state *ics,
+                                    uint32_t index,
+                                    struct xrt_status_conv_task *out_row,
+                                    struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_conv_task_row");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_conv_task(ics->server, index, out_row, out_generation);
+}
 
 xrt_result_t
 ipc_handle_system_get_status_generation(volatile struct ipc_client_state *ics,
