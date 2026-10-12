@@ -35,6 +35,7 @@ set(tests
     tests_conv_select
     tests_conv_readiness
     tests_conv_registry
+    tests_conv_lanes
     tests_lift_abi
     tests_conv_viewsyn_math
     tests_aux_lift_viewpoint
@@ -1132,6 +1133,11 @@ target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
 foreach(_conv_test tests_conv_select tests_conv_readiness tests_conv_registry)
 	target_link_libraries(${_conv_test} PRIVATE displayxr::conversion_core)
 endforeach()
+
+# ADR-053 P1a (#2001): the conversion core's runtime half (hosts, lanes,
+# pipeline, policy, jobs) against a scriptable CPU fake provider.
+target_sources(tests_conv_lanes PRIVATE conv_fake_provider.c)
+target_link_libraries(tests_conv_lanes PRIVATE displayxr::conversion_runtime)
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
 # can only append.
