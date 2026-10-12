@@ -386,6 +386,53 @@ The casing mirrors the controller roots below (per-user `DisplayXR`, system `dis
 The runtime does not scan these; workspace controllers do (the DisplayXR Shell's Linux
 port implements it).
 
+## Android workspace controllers (#1006)
+
+Android has no registry, no manifest directory and no orchestrator: the OS launches apps,
+and the runtime's service is a bound `Service`. A workspace controller there is an ordinary
+APK the user (or a launcher) starts, and the runtime recognises it by **package identity**.
+
+**Registration = two facts about the package, both checked at connect by UID.**
+
+1. The manifest declares
+   ```xml
+   <meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>
+   ```
+2. The APK is signed with **the same certificate as the runtime APK**
+   (`PackageManager.checkSignatures(<runtime>, <controller>) == SIGNATURE_MATCH`).
+
+Both together are what a CONTROLLER claim needs (`XR_DXR_spatial_workspace` enabled at
+`xrCreateInstance`); either alone demotes the client to APP, as on every platform (#960).
+The same-signer rule is deliberate: a controller decides what every app on the panel looks
+like, so a third-party controller needs the runtime vendor's signature, not just a manifest
+flag. Dev override, for a controller signed with a local debug key against a released
+runtime: `adb shell setprop debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER 1` (loud by design).
+
+**What the controller must do.**
+
+- Force the IPC path (`<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>`):
+  the overlay lives in the runtime's main-process service, and the slot broker routes a
+  verified controller there.
+- Own a **fullscreen Activity**. Its IPC client publishes the Activity's surface as any
+  client does; that surface becomes the shared output while the overlay is on.
+- Create a session with **no graphics binding** and call `xrActivateSpatialWorkspaceDXR`;
+  place clients with `xrEnumerateWorkspaceClientsDXR` / `xrSetWorkspaceClientWindowPoseDXR`;
+  drive 2D/3D with `xrRequestDisplayRenderingModeDXR` (the controller is the display-mode
+  authority, below). `xrDeactivateSpatialWorkspaceDXR`, or the controller process dying,
+  ends the overlay.
+- Lay windows out against the panel **as currently held**: `XR_DXR_display_info` reports the
+  vendor's natural orientation, and a device can be portrait-native.
+
+**Which apps join.** Every IPC client that connects while the overlay is on (the slot broker
+hands it the main-process service instead of a satellite). Clients already on a satellite stay
+per-window. A joining client keeps its session running while its own Activity is paused behind
+the controller, and should keep rendering while the runtime reports it VISIBLE / FOCUSED even
+with no window of its own — otherwise it shows a frozen frame.
+
+Reference: `test_apps/workspace/workspace_controller_android` (forced IPC, places every client
+side by side; `debug.dxr.test_controller.active|focus|mode` test knobs). Mechanism:
+[service-architecture.md §7b](../../architecture/service-architecture.md#7b-android-workspace-overlay-mode-adr-036-d4-1006).
+
 ## Service-side discovery
 
 At service startup, the orchestrator (`service_orchestrator.c`):

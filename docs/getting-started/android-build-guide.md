@@ -654,6 +654,29 @@ is the single source of truth: it generates the `MonadoServiceSlotN` classes. Ad
 `AndroidManifest.xml` — `:src:xrt:ipc:checkSatelliteSlotManifest` fails the build if you forget.
 Each extra live satellite costs ~30–60 MB and one GPU context.
 
+### Workspace overlay mode (one shared surface, #1006)
+
+The opt-in alternative to satellites: a verified workspace controller composites every IPC
+client that joins after it into its own fullscreen surface, through one display processor
+(ADR-036 D4; contract in `docs/specs/runtime/workspace-controller-registration.md`). The test
+controller is `test_apps/workspace/workspace_controller_android`; it must be signed with the
+**same key as the runtime** (build both on one box), or set
+`debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER 1`.
+
+```bash
+./gradlew :test_apps:workspace_controller_android:assembleDebug
+adb shell setprop debug.dxr.force_ipc 'com.displayxr.cube_handle_vk_android*'
+adb shell am start -n com.displayxr.workspace_controller_android/android.app.NativeActivity
+adb shell am start -n com.displayxr.cube_handle_vk_android/.MainActivity      # joins the overlay
+adb shell am start -n com.displayxr.workspace_controller_android/android.app.NativeActivity  # back in front
+adb logcat | grep -E '#1006|dxr-workspace|dxr-slot-broker|shared (surface|display processor)'
+adb shell setprop debug.dxr.test_controller.mode 0   # controller asks for 2D (1 = 3D)
+adb shell setprop debug.dxr.test_controller.active 0 # end the overlay; per-window resumes
+```
+
+A Leia device needs the Leia variant built as **release** (the released plug-in is built with
+`NDEBUG`; a debug runtime logs `vk_bundle ABI mismatch` and refuses its DP, so nothing weaves).
+
 ## Troubleshooting
 
 **Before chasing a runtime bug, check the platform underneath it.**
