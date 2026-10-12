@@ -31,6 +31,7 @@ set(tests
     tests_lift_mailbox
     tests_conversion_abi
     tests_conv_wire
+    tests_conv_select
     tests_conv_readiness
     tests_lift_abi
     tests_conv_viewsyn_math
@@ -1089,7 +1090,7 @@ target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
 
 # ADR-053 P1a (#2000): the conversion core's pure modules - selection,
 # readiness state machine + spec-3 mapping, registry + describe cache.
-foreach(_conv_test tests_conv_readiness)
+foreach(_conv_test tests_conv_select tests_conv_readiness)
 	target_link_libraries(${_conv_test} PRIVATE displayxr::conversion_core)
 endforeach()
 
