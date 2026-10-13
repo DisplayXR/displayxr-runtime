@@ -277,6 +277,8 @@ fake_stream_convert(struct xrt_conversion_plugin_instance *inst,
 	const float conv_value = c != NULL ? c->convergence_value : 0.0f;
 	const float relief_scale = c != NULL ? c->relief_scale : 0.0f;
 	const float relief_offset = c != NULL ? c->relief_offset : 0.0f;
+	const float near_value = c != NULL ? c->near_value : 0.0f;
+	const float far_value = c != NULL ? c->far_value : 0.0f;
 	os_mutex_unlock(&f->mtx);
 	if (ms > 0) {
 		sleep_ms(ms);
@@ -303,6 +305,10 @@ fake_stream_convert(struct xrt_conversion_plugin_instance *inst,
 		if (conv_value > 0.0f) {
 			out->depth_info.convergence_value = conv_value;
 			out->depth_info.suggest_flags |= 4u;
+		}
+		if (near_value > 0.0f) {
+			out->depth_info.near_value = near_value;
+			out->depth_info.far_value = far_value;
 		}
 		if (relief_scale != 0.0f) {
 			out->depth_info.relief_valid = 1;

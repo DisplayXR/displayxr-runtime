@@ -473,6 +473,8 @@ TEST_CASE("depth decoding per kind: convergence and relief follow the normative 
 		v->convergence_value = vc;
 		v->relief_scale = 0.08f;
 		v->relief_offset = -0.03f;
+		v->near_value = 0.5f; // depth readings, whatever the kind
+		v->far_value = 20.0f;
 		conv_fake_set_state(&f, 4, XRT_CONV_STATE_READY, 0, false);
 		{
 			Fixture fx;
@@ -496,6 +498,9 @@ TEST_CASE("depth decoding per kind: convergence and relief follow the normative 
 			CHECK(r.depth.convergence_depth == Catch::Approx(row.inverse ? 1.0f / vc : vc));
 			CHECK(r.depth.encoding ==
 			      (row.inverse ? XRT_DP_LIFT_DEPTH_ENCODING_INVERSE : XRT_DP_LIFT_DEPTH_ENCODING_LINEAR));
+			// near / far are depth readings on both sides: never inverted, near < far.
+			CHECK(r.depth.near_depth == Catch::Approx(0.5f));
+			CHECK(r.depth.far_depth == Catch::Approx(20.0f));
 
 			// Spec 4: the decoded value as reported; the relief in q.
 			uint64_t id4 = 0;
@@ -517,6 +522,13 @@ TEST_CASE("depth decoding per kind: convergence and relief follow the normative 
 			CHECK((uint32_t)di.kind == row.kind);
 			CHECK(di.convergenceValid == XR_TRUE);
 			CHECK(di.convergenceValue == Catch::Approx(vc)); // decoded, never inverted
+			CHECK(di.nearZ == Catch::Approx(0.5f));
+			CHECK(di.farZ == Catch::Approx(20.0f));
+			CHECK(di.nearZ < di.farZ); // finite far plane, the same order for every kind
+			// The convergence plane's depth reading lies between them.
+			float dc = 0.0f;
+			REQUIRE(oxr_conv_depth_reading(row.kind, di.convergenceValue, &dc));
+			CHECK(dc == Catch::Approx(r.depth.convergence_depth));
 			XrLiftViewsInfoDXR vi{XR_TYPE_LIFT_VIEWS_INFO_DXR};
 			oxr_conv_views_info_from_wire(&r4.views_info, r4.views_width, r4.views_height, &r4.depth_info,
 			                              &vi);
