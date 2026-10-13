@@ -13,6 +13,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
@@ -97,13 +98,30 @@ lane_open_fence(void *ud, uint64_t handle, void **out_fence)
 	return true;
 }
 
+/*!
+ * A shared fence whose signalling process died reads UINT64_MAX within tens
+ * of milliseconds, in every process that holds it, and every pending
+ * SetEventOnCompletion fires (measured on WARP, an Intel iGPU and an NVIDIA
+ * dGPU: tests_conv_d3d11_xproc). The host's values count up from 1, so this
+ * value means "the host is gone", never "the frame is done".
+ */
+static bool
+lane_fence_reached(ID3D11Fence *f, uint64_t value)
+{
+	const uint64_t c = f->GetCompletedValue();
+	return c != UINT64_MAX && c >= value;
+}
+
 //! THE FENCE RULE: a CPU wait, never a GPU one.
 bool
 lane_observe_fence(void *ud, void *fence, uint64_t value, uint32_t timeout_ms)
 {
 	lane *l = L(ud);
 	auto *f = static_cast<ID3D11Fence *>(fence);
-	if (f->GetCompletedValue() >= value) {
+	if (f->GetCompletedValue() == UINT64_MAX) {
+		return false; // the signaller died: its outputs may be half written
+	}
+	if (lane_fence_reached(f, value)) {
 		return true;
 	}
 	std::lock_guard<std::mutex> lk(l->mtx);
@@ -113,7 +131,7 @@ lane_observe_fence(void *ud, void *fence, uint64_t value, uint32_t timeout_ms)
 	if (WaitForSingleObject(l->event, timeout_ms) != WAIT_OBJECT_0) {
 		return false;
 	}
-	return f->GetCompletedValue() >= value;
+	return lane_fence_reached(f, value);
 }
 
 bool
