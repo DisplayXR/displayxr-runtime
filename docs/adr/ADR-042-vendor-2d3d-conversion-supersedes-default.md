@@ -125,9 +125,7 @@ predicted tracked eyes, or the app's), so the lift DP needs no tracker. A module
 ## Amendment 1 — AUTO convergence is runtime policy (epic #1858)
 
 Measured on a panel: lifted video left to the module's own auto-convergence shows frequent
-sudden convergence jumps. That value was recomputed only every N frames and held in between,
-reset to a full step by the module's own scene-cut test, shared across streams, and applied one
-conversion late. Which depth sits on the screen plane is a viewing-comfort policy, the same kind
+sudden convergence jumps. Which depth sits on the screen plane is a viewing-comfort policy, the same kind
 of decision as the viewpoint policy of ADR-048, so it moves to the runtime: **runtime = policy,
 plug-in = units, module = pixels.**
 
