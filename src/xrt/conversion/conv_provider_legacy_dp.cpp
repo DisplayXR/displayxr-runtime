@@ -238,11 +238,31 @@ state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_
 	}
 }
 
+//! The module answered caps AND reports READY: its modes / views are final.
+//! A module that leaves module_status UNKNOWN is read from its coarse state,
+//! exactly as state_from_snapshot reads it.
+bool
+module_ready(const conv_dp_lift_snapshot &s)
+{
+	if (!s.have_module) {
+		return false;
+	}
+	const uint32_t ms = s.caps.module_status;
+	if (ms == XRT_DP_LIFT_MODULE_UNKNOWN || ms > XRT_DP_LIFT_MODULE_DISABLED) {
+		return s.caps.state == XRT_DP_LIFT_STATE_READY;
+	}
+	return ms == XRT_DP_LIFT_MODULE_READY;
+}
+
 uint32_t
 max_views_of(const conv_dp_lift_snapshot &s)
 {
-	if (!s.have_module) {
-		return XRT_CONV_MAX_VIEWS; // static describe: refined after the first lift_get_caps
+	if (!module_ready(s)) {
+		// Provisional (#2029): SBS only until the READY module says more. A v3
+		// consumer caches the ACTIVATING answer; advertising XRT_CONV_MAX_VIEWS
+		// here (modes 0x7) promised an NVIEW the module may never have (0x3 once
+		// READY). Refined by the generation bump at READY.
+		return 2;
 	}
 	if ((s.caps.modes & XRT_DP_LIFT_MODE_NVIEW) == 0) {
 		return 2;
@@ -278,8 +298,7 @@ fill_cap(const conv_dp_lift_snapshot &s, uint32_t index, xrt_conv_capability *c)
 		// taken during warm-up says "no depth" for a module that will have it.
 		// Describing from that answer latched every VIEWS|DEPTH stream as
 		// unsatisfied for its whole life (#2025, lifted-rect cursor).
-		const bool module_ready = s.have_module && s.caps.module_status == XRT_DP_LIFT_MODULE_READY;
-		if (!module_ready || (s.caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0) {
+		if (!module_ready(s) || (s.caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0) {
 			c->outputs |= XRT_CONV_OUT_DEPTH;
 		}
 		c->depth_kind = s.have_module && s.caps.aux_depth_semantics == XRT_DP_LIFT_DEPTH_METRIC
@@ -374,7 +393,7 @@ dpl_get_generation(xrt_conversion_plugin_instance *inst)
 	key = key * 31u + (s.has_depth_slot ? 1u : 0u);
 	if (s.have_module) {
 		// READY or not decides whether aux depth is still provisional (fill_cap).
-		key = key * 131u + (s.caps.module_status == XRT_DP_LIFT_MODULE_READY ? 1u : 0u);
+		key = key * 131u + (module_ready(s) ? 1u : 0u);
 		key = key * 131u + s.caps.modes;
 		key = key * 131u + s.caps.max_views;
 		key = key * 131u + s.caps.max_streams;

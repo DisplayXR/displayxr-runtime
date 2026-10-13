@@ -24,8 +24,11 @@
  * | 2      | DEPTH_VIDEO | DEPTH        | TEMPORAL; content hint VIDEO           |
  * | 3      | VIEWS_MONO  | SBS / NVIEW  | min 2, max caps.max_views (≤ 8); aux depth iff AUX_DEPTH |
  *
- * INSTALLED while a lift factory resolves and nobody asked yet; refined after
- * the first lift_get_caps (generation bump → the core re-describes). No SPLATS
+ * INSTALLED while a lift factory resolves and nobody asked yet; refined once
+ * the module is READY (generation bump → the core re-describes). Until then
+ * the describe is the CONSERVATIVE set (#2029): max_views 2 (SBS only, so a
+ * v3 caller caching the ACTIVATING answer never sees an NVIEW the module may
+ * not have), 4 streams, aux depth provisional (#2027). No SPLATS
  * capability (no shipping plug-in implements the blob slot). Licence UNKNOWN,
  * commercial_ok 0, exempt from the AllowResearchOnly gate (grandfathered); the
  * module's own detail string is surfaced as the state detail.

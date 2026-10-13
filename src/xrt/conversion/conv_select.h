@@ -16,7 +16,9 @@
  *
  *   1. Candidates: rows with the task, from enabled, usable, non-hidden providers.
  *   2. Filter: licence gate, input kind, lane, min_views ≤ view_count ≤
- *      max_views and EXPLICIT_VIEWPOINTS (VIEWS_* tasks).
+ *      max_views (XRT_CONV_MAX_VIEWS while the row is not READY: its
+ *      describe may still be provisional, #2029) and EXPLICIT_VIEWPOINTS
+ *      (VIEWS_* tasks).
  *   3. Order: the preferred provider for this task first (even a FALLBACK
  *      one); then, inside the ProbeOrder step, FALLBACK providers last
  *      whatever their ProbeOrder; then ProbeOrder ascending; then direct

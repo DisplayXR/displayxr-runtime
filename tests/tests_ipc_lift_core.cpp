@@ -505,6 +505,85 @@ TEST_CASE("UNAVAILABLE -> READY after a provider install, without a restart", "[
 	conv_fake_fini(&f);
 }
 
+TEST_CASE("4-view stream created while ACTIVATING converts once READY on a module that has NVIEW (#2029)",
+          "[ipc_lift_core]")
+{
+	// The dp-lift shape: the describe says 2 views (the conservative set)
+	// until the module is READY, then the refined describe says 6. A 4-view
+	// stream created and fed meanwhile is accepted, waits, and converts.
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *v =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	v->cap.max_views = 2;
+	v->warm_ms = 150;
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(fx.add(f) >= 0);
+		CHECK((fx.properties().modes & XRT_DP_LIFT_MODE_NVIEW) == 0u); // not advertised while provisional
+		uint64_t id = 0;
+		REQUIRE(fx.create(5, XRT_DP_LIFT_MODE_NVIEW, &id) == XRT_SUCCESS);    // ...but accepted
+		CHECK(fx.submit(5, id, 4, true) == XRT_SUCCESS);                      // 4 views > the provisional 2
+		CHECK(fx.submit(5, id, 9, true) == XRT_ERROR_OUTPUT_REQUEST_FAILURE); // the wire's own cap still holds
+
+		// READY on the conservative describe first: the stream waits (unsatisfied,
+		// not latched) until the refined describe brings the views.
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(fx.core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_READY; },
+		    3000));
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		os_mutex_lock(&f.mtx);
+		v->cap.max_views = 6; // the module has NVIEW: the refined describe
+		f.generation++;
+		os_mutex_unlock(&f.mtx);
+
+		bool ready = false;
+		ipc_lift_result r{};
+		REQUIRE(wait_until(
+		    [&] {
+			    fx.submit(5, id, 4, true);
+			    return ipc_server_conv_lift_acquire(fx.sc, 5, id, &ready, &r) == XRT_SUCCESS && ready;
+		    },
+		    3000));
+		CHECK(r.view_count == 4u);
+		CHECK(r.width == 4u * 64u);
+	}
+	conv_fake_fini(&f);
+
+	// A module WITHOUT N-view: the same stream goes unsatisfied at READY (the
+	// #2027 path) -- it never converts, nothing crashes, it is not refused late.
+	conv_fake_provider g;
+	conv_fake_init(&g, "fake2");
+	conv_fake_cap *w =
+	    conv_fake_add_cap(&g, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	w->cap.max_views = 2;
+	w->warm_ms = 50;
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(fx.add(g) >= 0);
+		uint64_t id = 0;
+		REQUIRE(fx.create(6, XRT_DP_LIFT_MODE_NVIEW, &id) == XRT_SUCCESS);
+		REQUIRE(fx.submit(6, id, 4, true) == XRT_SUCCESS);
+		uint64_t core_id = 0;
+		uint32_t mode = 0;
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 6, id, &core_id, &mode));
+		REQUIRE(wait_until(
+		    [&] {
+			    fx.submit(6, id, 4, true);
+			    conv_stream_stats s{};
+			    return conv_core_stream_get_stats(fx.core, core_id, &s) == XRT_SUCCESS && s.unsatisfied;
+		    },
+		    3000));
+		bool ready = false;
+		ipc_lift_result r{};
+		CHECK(ipc_server_conv_lift_acquire(fx.sc, 6, id, &ready, &r) == XRT_SUCCESS);
+		CHECK_FALSE(ready);
+	}
+	conv_fake_fini(&g);
+}
+
 TEST_CASE("G2: NVIEW viewCount is bounded by the task's max_views at submit", "[ipc_lift_core]")
 {
 	conv_fake_provider f;

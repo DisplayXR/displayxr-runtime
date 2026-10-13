@@ -497,7 +497,8 @@ TEST_CASE("dp-lift: static describe, INSTALLED before any module loads, selftest
 		if (c.task == XRT_CONV_TASK_VIEWS_MONO) {
 			CHECK((c.flags & XRT_CONV_CAP_EXPLICIT_VIEWPOINTS) != 0u);
 			CHECK(c.min_views == 2u);
-			CHECK(c.max_views == 8u);                      // static; refined from lift_get_caps
+			CHECK(c.max_views == 2u); // conservative: SBS only until READY (#2029)
+			CHECK(c.max_streams == 4u);
 			CHECK((c.outputs & XRT_CONV_OUT_DEPTH) != 0u); // provisional aux depth
 		}
 		if (c.task == XRT_CONV_TASK_DEPTH_VIDEO) {
@@ -587,12 +588,14 @@ TEST_CASE("legacy golden replay: properties before the first describe => ACTIVAT
 	xrt_dp_lift_caps p = fx.properties();
 	CHECK(p.state == XRT_DP_LIFT_STATE_ACTIVATING); // never UNAVAILABLE on a cold boot
 	CHECK(p.modes == 0u);
-	// Live: described (INSTALLED), modes advertised while still ACTIVATING.
+	// Live: described (INSTALLED), the CONSERVATIVE modes advertised while still
+	// ACTIVATING (#2029): DEPTH + SBS, never an NVIEW the module may not have.
 	REQUIRE(fx.add_dp_lift(&f) >= 0);
 	p = fx.properties();
 	CHECK(p.state == XRT_DP_LIFT_STATE_ACTIVATING);
-	CHECK((p.modes & (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW)) ==
-	      (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW));
+	CHECK(p.modes == (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS));
+	CHECK(p.max_views == 2u);
+	CHECK(p.max_streams == 4u);
 	CHECK(f.activations == 0);
 }
 
@@ -714,6 +717,86 @@ TEST_CASE("dp-lift: a stream latched unsatisfied un-latches when the capability 
 	    6000));
 	CHECK(r.view_count == 2u);
 	CHECK(r.depth.valid != 0u);
+}
+
+TEST_CASE("dp-lift: provisional caps are the conservative set until READY, then refined (#2029)", "[conv_dp_lift]")
+{
+	// The panel shape: modes 0x7 / 4 streams while ACTIVATING, 0x3 / 32 once
+	// READY. A consumer that cached the first answer believed NVIEW existed.
+	FakeLift f;
+	f.polls_until_ready = 2;
+	f.modes = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS; // the module has no NVIEW
+	uint64_t id = 0;
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		REQUIRE(fx.add_dp_lift(&f) >= 0);
+		xrt_dp_lift_caps p = fx.properties();
+		CHECK(p.state == XRT_DP_LIFT_STATE_ACTIVATING);
+		CHECK(p.modes == (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS));
+		CHECK(p.max_views == 2u);
+		CHECK(p.max_streams == 4u);
+		CHECK((p.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0u); // provisional aux depth stays (#2027)
+
+		REQUIRE(fx.create(3, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
+		// While the module answers caps but is still ACTIVATING: still conservative.
+		REQUIRE(wait_until(
+		    [&] {
+			    std::lock_guard<std::mutex> lk(f.m);
+			    return f.activations >= 1;
+		    },
+		    2000));
+		p = fx.properties();
+		if (p.state != XRT_DP_LIFT_STATE_READY) {
+			CHECK(p.modes == (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS));
+			CHECK(p.max_views == 2u);
+		}
+		// READY: refined to the module's own answer -- and it never grew past it.
+		REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 6000));
+		p = fx.properties();
+		CHECK(p.modes == (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS));
+		CHECK(p.max_views == 2u);
+		CHECK(p.max_streams == 4u); // FakeLift's module answers 4
+	}
+
+	// A module that does have NVIEW gains it only at READY.
+	FakeLift g;
+	g.polls_until_ready = 1;
+	g.max_views = 6;
+	Fixture gx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(gx.add_dp_lift(&g) >= 0);
+	CHECK((gx.properties().modes & XRT_DP_LIFT_MODE_NVIEW) == 0u);
+	REQUIRE(gx.create(3, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
+	REQUIRE(wait_until([&] { return gx.properties().max_views == 6u; }, 6000));
+	CHECK(gx.properties().state == XRT_DP_LIFT_STATE_READY);
+	CHECK((gx.properties().modes & XRT_DP_LIFT_MODE_NVIEW) != 0u);
+
+	// A module that never fills module_status is read from its coarse state
+	// (as its readiness is): READY refines, ACTIVATING stays conservative.
+	FakeLift h;
+	h.max_views = 6;
+	conv_dp_lift_backend hb = backend_of(h);
+	const xrt_conversion_plugin_iface *hi = nullptr;
+	xrt_conversion_plugin_instance *hn = nullptr;
+	REQUIRE(conv_provider_legacy_dp_create(&hb, &hi, &hn));
+	REQUIRE(fl_activate(&h, false) == XRT_SUCCESS);
+	auto views_max = [&] {
+		xrt_conv_capability c{};
+		c.struct_size = (uint32_t)sizeof(c);
+		REQUIRE(hi->describe_cap(hn, 2, &c, nullptr) == XRT_SUCCESS);
+		return c.max_views;
+	};
+	{
+		std::lock_guard<std::mutex> lk(h.m);
+		h.caps.module_status = XRT_DP_LIFT_MODULE_UNKNOWN;
+		h.caps.state = XRT_DP_LIFT_STATE_READY;
+	}
+	CHECK(views_max() == 6u);
+	{
+		std::lock_guard<std::mutex> lk(h.m);
+		h.caps.state = XRT_DP_LIFT_STATE_ACTIVATING;
+	}
+	CHECK(views_max() == 2u);
+	hi->destroy(hn);
 }
 
 TEST_CASE("legacy golden replay: no module at first, READY after a registry change, no restart (G5)", "[conv_dp_lift]")
@@ -897,6 +980,8 @@ TEST_CASE("dp-lift: the legacy units reach the module unchanged; N views get the
 	    4000));
 
 	// NVIEW x4: the policy spreads four viewpoints; the module gets the pair.
+	// (NVIEW is advertised once the READY module's caps refined the describe.)
+	REQUIRE(wait_until([&] { return fx.properties().max_views == 8u; }, 2000));
 	uint64_t nid = 0;
 	REQUIRE(fx.create(9, XRT_DP_LIFT_MODE_NVIEW, &nid) == XRT_SUCCESS);
 	REQUIRE(wait_until(

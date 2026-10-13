@@ -197,6 +197,22 @@ task_advertised(struct conv_core *core, uint32_t task, struct xrt_conv_wire_task
 	return task_candidate(core, task, out) && !conv_state_is_terminal(out->state);
 }
 
+/*!
+ * #2029: the view-count bound of a v3 stream. Once the task's capability is
+ * READY it is its max_views; while it is not (the describe may still be the
+ * conservative 2 views), any count up to IPC_LIFT_MAX_VIEWS is accepted and
+ * the READY refine decides (the core stream goes unsatisfied if the module
+ * lacks the views).
+ */
+static uint32_t
+views_bound(const struct xrt_conv_wire_task_desc *d)
+{
+	if (d->state != XRT_CONV_STATE_READY) {
+		return IPC_LIFT_MAX_VIEWS;
+	}
+	return d->max_views > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : d->max_views;
+}
+
 static uint32_t
 mode_task(uint32_t mode, uint32_t content_hint)
 {
@@ -672,7 +688,7 @@ ipc_server_conv_lift_stream_create(struct ipc_server_conv *sc,
 	if (!task_candidate(sc->core, mode_task(mode, content_hint), &d)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	st.max_views = d.max_views > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : d.max_views;
+	st.max_views = views_bound(&d);
 	if (mode == XRT_DP_LIFT_MODE_SBS) {
 		st.view_count = 2;
 	} else if (mode == XRT_DP_LIFT_MODE_NVIEW) {
@@ -841,8 +857,13 @@ ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
 		return gr;
 	}
 
-	// #2005 G2: the view count is bounded by the TASK's max_views, here too.
+	// #2005 G2: the view count is bounded by the TASK's max_views, here too
+	// (#2029: re-read, so a bound taken while provisional is refined).
 	if (st.mode == XRT_DP_LIFT_MODE_NVIEW && p.view_count != 0 && p.view_count != st.view_count) {
+		struct xrt_conv_wire_task_desc vd;
+		if (task_candidate(sc->core, mode_task(st.mode, st.content_hint), &vd)) {
+			st.max_views = views_bound(&vd);
+		}
 		if (p.view_count < 2 || p.view_count > st.max_views) {
 			io.release_input(io.ud, handle, is_dxgi);
 			U_LOG_I("[conv] v3 submit: viewCount %u outside [2, %u] for this NVIEW stream", p.view_count,

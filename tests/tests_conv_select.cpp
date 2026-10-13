@@ -281,6 +281,17 @@ TEST_CASE("conv_select: input kind, lane, view range, explicit viewpoints")
 	CHECK(v[2] == CONV_ROW_DROP_VIEWS);
 	CHECK(v[3] == CONV_ROW_DROP_VIEWPOINTS);
 
+	SECTION("a row not yet READY keeps its provisional max_views open (#2029)")
+	{
+		// dp-lift describes 2 views until its module is up: a 4-view create
+		// selects it anyway and the READY refine decides.
+		rows[2].state = XRT_CONV_STATE_WARMING;
+		std::vector<uint32_t> w;
+		auto r3 = pick(rows, req(VIEWS, 4), nullptr, false, &w);
+		CHECK(r3.row == 2);
+		CHECK(w[2] != CONV_ROW_DROP_VIEWS);
+		CHECK(pick(rows, req(VIEWS, 9)).row == -1); // the ABI's own cap still holds
+	}
 	SECTION("view_count below min_views drops too")
 	{
 		auto r2 = pick(rows, req(VIEWS, 1));
