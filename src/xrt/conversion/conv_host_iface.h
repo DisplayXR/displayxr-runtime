@@ -67,6 +67,9 @@ extern "C" {
 //! Refused at once: the host process is down (backoff, update, maintenance).
 //! Not a failure of the call or the capability: retry after RESTORED.
 #define CONV_CMD_HOST_DOWN (1u << 3)
+//! Failed because the host process died (or its channel broke) under it: the
+//! call may have run partly. Streams re-open on RESTORED; a job retries once.
+#define CONV_CMD_HOST_LOST (1u << 4)
 /*! @} */
 
 /*! One [S] call. Caller-owned until on_complete returns. */
