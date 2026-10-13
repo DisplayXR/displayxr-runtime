@@ -432,7 +432,7 @@ the host between submit and signal; the compositor frame rate is unaffected.
 
 | Step | What happens |
 |---|---|
-| Vendor installer takes `Global\DisplayXR-ConvMaintenance-<id>`, then `RmRegisterResources` → `RmGetList` | lists `displayxr-conversion-host.exe`, not the service (to be verified, §11.2) |
+| Vendor installer takes `Global\DisplayXR-ConvMaintenance-<id>`, then `RmRegisterResources` → `RmGetList` | lists `displayxr-conversion-host.exe` (`RmOtherWindow`, not restartable), not the service — measured by `tests_conv_proxy` "update flow on the real host"; the service is listed only while `dp-lift` has the vendor module loaded (§11.2, discovery spec §3.8) |
 | `RmShutdown` | the host answers `WM_QUERYENDSESSION` on a hidden top-level window and exits 20 |
 | Service | WARMING(`updating`); sessions and streams untouched |
 | Installer replaces files, writes `Version` last, releases the mutex | — |
@@ -1125,7 +1125,11 @@ into separate DLLs where one worker cannot run both lanes.
 - [ ] the browser uninstaller's `RMDir /r blobs` and which browser versions in the field still run it
 - [ ] the store's effective ACL on an installed box (inherited `%ProgramData%` default vs anything the browser installer set)
 - [ ] the vendor lift factory without probe (stays in-service, so only for the adapter's static describe)
-- [ ] whether any weaving-DP path maps the conversion runtime into the service (decides whether RmGetList ever lists the service after P3)
+- [x] whether any weaving-DP path maps the conversion runtime into the service — no weaving path does
+      (per-window DPs never call the lift slots); the `dp-lift` adapter's lift DP does, for the life of the
+      process, once it was activated, so `RmGetList` lists the service until a superseding provider is
+      registered at service start; the v3 GAUSSIANS properties probe no longer activates it (#2056; discovery
+      spec §3.8 "Does the service ever map the files")
 - [x] the `conv_hint_interest` plumbing — sent at `xrCreateSession`, prewarms the default tasks, never
       warms by itself (`tests_conv_lanes` "conv_hint_interest prewarms", `tests_ipc_lift_core`
       "the hint does not warm; a create does", `tests_ipc_proto` appended-call check)
