@@ -85,7 +85,8 @@ fi
 
 # VK_LAYER_DXR_queue_lock manifest (#2036); prune the dirs only if empty.
 rm -f "$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
-rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
+rm -f "$SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"  # #886
+rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan/implicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
 
 # DisplayXR Dashboard menu entry + icon.
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \

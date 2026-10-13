@@ -565,6 +565,21 @@ struct cli_query_result
 	char vk_layer_manifest[512];
 	char vk_layer_library[512];
 	char vk_layer_note[256];
+
+	/*!
+	 * #886 — the IMPLICIT twin of the manifest above (desktop Linux only):
+	 * the same layer for vulkan_enable1 apps, loaded only when the app's
+	 * environment has DXR_VK_QUEUE_LOCK=1. INFORMATIONAL ONLY, like the
+	 * explicit probe. `gated` is the safety property: an implicit manifest
+	 * without that enable_environment would load the layer into every Vulkan
+	 * process on the box.
+	 */
+	bool vk_ilayer_probed;
+	bool vk_ilayer_gated;
+	bool vk_ilayer_library_ok;
+	char vk_ilayer_manifest[512];
+	char vk_ilayer_library[512];
+	char vk_ilayer_note[256];
 };
 
 /*!
