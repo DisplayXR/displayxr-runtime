@@ -5462,6 +5462,10 @@ shared_converge_display_mode_locked(struct multi_system_compositor *msc,
 	}
 }
 
+//! How long the shared surface holds back a client the workspace controller has
+//! not placed yet, before falling back to the full-panel rect.
+#define SHARED_UNPLACED_GRACE_NS (1000LL * 1000LL * 1000LL)
+
 static void
 render_shared_surface_locked(struct multi_system_compositor *msc, int64_t display_time_ns)
 {
@@ -5502,6 +5506,29 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			continue;
 		}
 
+		// Placement: the controller's window pose in meters (set_window_pose)
+		// drives per-eye projection (M2). Fall back to the full display px-rect
+		// for an unplaced lone app (M1 behavior, flat at the panel).
+		struct xrt_pose pose = XRT_POSE_IDENTITY;
+		float wm = 0.0f, hm = 0.0f;
+		const bool placed =
+		    comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm) && wm > 0.0f && hm > 0.0f;
+
+		// Under a workspace controller, a client's first frames can land before
+		// the controller's first set_window_pose; drawn at the M1 full-panel
+		// fallback they flash full screen, then snap into the tile (#2022
+		// follow-up). Hold such a client back until it is placed, bounded so a
+		// controller that never places a client still lets it show.
+		if (msc->workspace_active && !placed) {
+			const int64_t now_ns = os_monotonic_get_ns();
+			if (mc->ws_unplaced_since_ns == 0) {
+				mc->ws_unplaced_since_ns = now_ns;
+			}
+			if (now_ns - mc->ws_unplaced_since_ns < SHARED_UNPLACED_GRACE_NS) {
+				continue;
+			}
+		}
+
 		struct shared_client_render *e = &order[order_count++];
 		e->mc = mc;
 		e->layer = layer;
@@ -5513,12 +5540,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			vc = XRT_MAX_VIEWS;
 		e->view_count = vc;
 
-		// Placement: the controller's window pose in meters (set_window_pose)
-		// drives per-eye projection (M2). Fall back to the full display px-rect
-		// for an unplaced lone app (M1 behavior, flat at the panel).
-		struct xrt_pose pose = XRT_POSE_IDENTITY;
-		float wm = 0.0f, hm = 0.0f;
-		if (comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm) && wm > 0.0f && hm > 0.0f) {
+		if (placed) {
 			e->placed = true;
 			e->pose_x = pose.position.x;
 			e->pose_y = pose.position.y;
