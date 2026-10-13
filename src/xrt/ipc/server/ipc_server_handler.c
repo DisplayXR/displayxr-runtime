@@ -9789,6 +9789,146 @@ ipc_handle_conv_warm(volatile struct ipc_client_state *ics,
 	return ipc_server_conv_warm(ipc_server_get_conv(), request->task, out_prev_state, out_state);
 }
 
+/*
+ * XR_DXR_lift spec 4 (ADR-053 P3, #2054): the conv_* family. Same callers as
+ * the v3 lift calls (require_lift_client), same connection-owned streams
+ * (lift_owner). Spec-4 streams are ordinary core-route streams, so submit /
+ * export / priority / stats / destroy stay the v3 lift_* calls.
+ */
+
+static_assert(sizeof(struct ipc_conv_enum_task_reply) <= IPC_BUF_SIZE, "conv_enum_task reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_stream_create_msg) <= IPC_BUF_SIZE, "conv_stream_create exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_acquire_result_reply) <= IPC_BUF_SIZE,
+              "conv_acquire_result reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_poll_event_reply) <= IPC_BUF_SIZE, "conv_poll_event reply exceeds IPC_BUF_SIZE");
+
+static bool
+conv_header_ok(uint32_t struct_size, uint32_t family_version, size_t min_size)
+{
+	return struct_size >= min_size && family_version == XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+}
+
+xrt_result_t
+ipc_handle_conv_get_generation(volatile struct ipc_client_state *ics, struct xrt_conv_wire_generation *out_generation)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_generation);
+	xrt_result_t auth = require_lift_client(ics, "conv_get_generation");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	ipc_server_conv_v4_get_generation(ipc_server_get_conv(), lift_owner(ics), out_generation);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_conv_enum_task(volatile struct ipc_client_state *ics,
+                          uint32_t task,
+                          struct xrt_conv_wire_task_desc *out_desc,
+                          uint64_t *out_image_kinds,
+                          uint64_t *out_export_kinds)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_enum_task");
+	if (auth != XRT_SUCCESS) {
+		U_ZERO(out_desc);
+		*out_image_kinds = 0;
+		*out_export_kinds = 0;
+		return auth;
+	}
+	return ipc_server_conv_v4_enum_task(ipc_server_get_conv(), lift_owner(ics), task, out_desc, out_image_kinds,
+	                                    out_export_kinds);
+}
+
+xrt_result_t
+ipc_handle_conv_request_warm(volatile struct ipc_client_state *ics, const struct xrt_conv_wire_task_request *request)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_request_warm");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(request->struct_size, request->family_version, sizeof(*request))) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	return ipc_server_conv_v4_warm(ipc_server_get_conv(), lift_owner(ics), request->task);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_create(volatile struct ipc_client_state *ics,
+                              const struct xrt_conv_wire_stream_desc *desc,
+                              uint64_t required_outputs,
+                              uint32_t legacy_mode,
+                              float input_scale,
+                              struct xrt_conv_wire_stream_created *out_created)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_created);
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_create");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(desc->struct_size, desc->family_version, sizeof(*desc))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_server_conv_v4_stream_create(ipc_server_get_conv(), lift_owner(ics), desc, required_outputs,
+	                                        legacy_mode, input_scale, out_created);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_reset(volatile struct ipc_client_state *ics, uint64_t stream_id)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_reset");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	return ipc_server_conv_v4_stream_reset(ipc_server_get_conv(), ics->lift_owner, stream_id);
+}
+
+xrt_result_t
+ipc_handle_conv_acquire_result(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_ready,
+                               bool *out_discontinuity,
+                               struct ipc_lift_result *out_lift_result,
+                               struct xrt_conv_wire_result *out_meta)
+{
+	IPC_TRACE_MARKER();
+	*out_ready = false;
+	*out_discontinuity = false;
+	U_ZERO(out_lift_result);
+	U_ZERO(out_meta);
+	xrt_result_t auth = require_lift_client(ics, "conv_acquire_result");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0 || !ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // only core-route streams carry spec-4 metadata
+	}
+	return ipc_server_conv_v4_acquire(ipc_server_get_conv(), ics->lift_owner, stream_id, out_ready,
+	                                  out_discontinuity, out_lift_result, out_meta);
+}
+
+xrt_result_t
+ipc_handle_conv_poll_event(volatile struct ipc_client_state *ics, bool *out_has_event, struct xrt_conv_wire_event *out_event)
+{
+	IPC_TRACE_MARKER();
+	*out_has_event = false;
+	U_ZERO(out_event);
+	xrt_result_t auth = require_lift_client(ics, "conv_poll_event");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0) {
+		return XRT_SUCCESS; // never latched: no events
+	}
+	return ipc_server_conv_v4_poll_event(ipc_server_get_conv(), ics->lift_owner, out_has_event, out_event);
+}
+
 xrt_result_t
 ipc_handle_lift_weave_rect_viewpoints(volatile struct ipc_client_state *ics,
                                       const struct ipc_arg_lift_rect_viewpoints *args)

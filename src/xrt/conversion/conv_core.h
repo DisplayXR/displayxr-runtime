@@ -202,7 +202,8 @@ conv_core_get_generation(struct conv_core *core, struct xrt_conv_wire_generation
 /*! The EFFECTIVE capability of @p task (selected row, or the composed
  *  pipeline) and its readiness; no provider identity. Returns false for a
  *  task v1 does not serve. With no candidate the state is UNKNOWN while
- *  discovery is unsettled, else ABSENT. */
+ *  discovery is unsettled; else the terminal state + reason of the
+ *  first-ranked provider that declares the task, or ABSENT when none does. */
 bool
 conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_wire_task_desc *out);
 

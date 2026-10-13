@@ -331,6 +331,7 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	struct conv_fake_cap *c = find_cap(f, cap_id);
 	const uint32_t ms = c != NULL ? c->job_ms : 0;
 	const uint64_t bytes = c != NULL ? c->job_bytes : 0;
+	const uint32_t blob_format = c != NULL && c->job_blob_format != 0 ? c->job_blob_format : XRT_CONV_BLOB_SPZ;
 	const uint32_t poll = f->cancel_poll_ms != 0 ? f->cancel_poll_ms : 10;
 	f->jobs++;
 	f->job_running = true;
@@ -360,7 +361,7 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	if (r == XRT_SUCCESS && ctl->sink_count > 0 && bytes > 0) {
 		struct xrt_conv_blob_sink *s = &ctl->sinks[0];
 		uint8_t buf[4096];
-		if (!s->begin(s->ctx, XRT_CONV_BLOB_SPZ, bytes)) {
+		if (!s->begin(s->ctx, blob_format, bytes)) {
 			r = XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 		}
 		for (uint64_t off = 0; r == XRT_SUCCESS && off < bytes; off += sizeof(buf)) {
@@ -373,7 +374,7 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 			}
 		}
 		out->written = XRT_CONV_OUT_SPLAT_BLOB;
-		out->splat_info.blob_format = XRT_CONV_BLOB_SPZ;
+		out->splat_info.blob_format = blob_format;
 		out->splat_info.splat_count = bytes / 32u;
 	}
 	os_mutex_lock(&f->mtx);

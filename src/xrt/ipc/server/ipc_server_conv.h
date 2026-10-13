@@ -78,6 +78,12 @@ struct conv_submit_slot;
 struct ipc_arg_lift_submit;
 struct ipc_lift_result;
 struct ipc_server_conv;
+struct xrt_conv_wire_event;
+struct xrt_conv_wire_generation;
+struct xrt_conv_wire_result;
+struct xrt_conv_wire_stream_created;
+struct xrt_conv_wire_stream_desc;
+struct xrt_conv_wire_task_desc;
 
 //! Bit set in every v3 stream id minted by the core route (svc_lift ids are small counters).
 #define IPC_SERVER_CONV_STREAM_TAG (1ull << 62)
@@ -392,6 +398,142 @@ ipc_server_conv_warm(struct ipc_server_conv *sc, uint32_t task, uint32_t *out_pr
  *  for it) die with it. */
 void
 ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id);
+
+
+/*
+ *
+ * Spec 4 (ADR-053 P3, #2054): the conv_* family.
+ *
+ * A spec-4 stream is an ordinary entry of this module's stream table: its id
+ * carries IPC_SERVER_CONV_STREAM_TAG and its v3 mode is the task's legacy
+ * mode (DEPTH for DEPTH_*, SBS / NVIEW for VIEWS_MONO), so every v3
+ * per-stream call (submit, export, priority, stats, destroy, the weave-rect
+ * resolver) serves it unchanged. On this family a VALIDATION_FAILURE is
+ * XRT_ERROR_INPUT_UNSUPPORTED; FEATURE_UNSUPPORTED and LIMIT_REACHED keep
+ * their v3 codes.
+ *
+ * Events are OPT-IN per connection: a connection is latched by its first
+ * spec-4 call (enum / warm / create / generation) and only then receives
+ * task / provider events. They are ordered and deduplicated on the task's
+ * EFFECTIVE state (the selected provider's): each delivered
+ * TASK_STATE_CHANGED's previous_state is the state last delivered for that
+ * task (or the latch-time baseline), an unchanged state is never repeated, and
+ * progress moves of >= 5 % are reported at most every 500 ms.
+ *
+ */
+
+//! Connections that can be latched for spec-4 events at once.
+#define IPC_SERVER_CONV_MAX_CLIENTS 64u
+
+/*! @name XR_LIFT_OUTPUT_*_BIT_DXR values (the app's requiredOutputs vocabulary; tests assert equality) @{ */
+#define IPC_SERVER_CONV_OUTPUT_AUX_DEPTH 0x01ull
+#define IPC_SERVER_CONV_OUTPUT_METRIC 0x02ull
+#define IPC_SERVER_CONV_OUTPUT_INTRINSICS 0x04ull
+#define IPC_SERVER_CONV_OUTPUT_TEMPORAL 0x08ull
+#define IPC_SERVER_CONV_OUTPUT_EXPLICIT_VIEWPOINTS 0x10ull
+#define IPC_SERVER_CONV_OUTPUT_CONVERGENCE_HINT 0x20ull
+#define IPC_SERVER_CONV_OUTPUT_CONFIDENCE 0x40ull
+#define IPC_SERVER_CONV_OUTPUT_COMPOSED 0x80ull
+/*! @} */
+
+/*! @name XrLiftImageKindDXR values the service's glue takes / gives (masks are 1 << kind) @{ */
+#define IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT 1u
+#define IPC_SERVER_CONV_IMAGE_KIND_D3D11_DXGI 2u
+/*! @} */
+
+/*! Latch @p client_id for events (idempotent; baseline = the effective states now). */
+void
+ipc_server_conv_v4_latch(struct ipc_server_conv *sc, uint64_t client_id);
+
+bool
+ipc_server_conv_v4_latched(struct ipc_server_conv *sc, uint64_t client_id);
+
+/*! conv_core's on_event target (the service wires it): any core thread, core
+ *  locks possibly held; queues only. */
+void
+ipc_server_conv_on_event(struct ipc_server_conv *sc, uint64_t client_id, const struct xrt_conv_wire_event *ev);
+
+/*! conv_poll_event: the connection's next event, or *out_has false. */
+xrt_result_t
+ipc_server_conv_v4_poll_event(struct ipc_server_conv *sc,
+                              uint64_t client_id,
+                              bool *out_has,
+                              struct xrt_conv_wire_event *out);
+
+/*! conv_get_generation (latches). */
+void
+ipc_server_conv_v4_get_generation(struct ipc_server_conv *sc,
+                                  uint64_t client_id,
+                                  struct xrt_conv_wire_generation *out);
+
+/*! The XrLiftImageKindDXR mask (1 << kind) the glue imports (@p export_kinds
+ *  false) or exports; 0 without glue. */
+uint64_t
+ipc_server_conv_v4_image_kinds(struct ipc_server_conv *sc, bool export_kinds);
+
+/*!
+ * conv_enum_task (latches): the effective capability + readiness of @p task
+ * (XRT_CONV_TASK_*), no provider identity. A reserved, spec-5 or unserved
+ * task reads ABSENT. @p out_image_kinds / @p out_export_kinds: what the
+ * service's transport takes / gives for it (0 = not reachable yet).
+ */
+xrt_result_t
+ipc_server_conv_v4_enum_task(struct ipc_server_conv *sc,
+                             uint64_t client_id,
+                             uint32_t task,
+                             struct xrt_conv_wire_task_desc *out,
+                             uint64_t *out_image_kinds,
+                             uint64_t *out_export_kinds);
+
+/*! conv_warm (latches). XRT_ERROR_INPUT_UNSUPPORTED for a non-spec-4 task. */
+xrt_result_t
+ipc_server_conv_v4_warm(struct ipc_server_conv *sc, uint64_t client_id, uint32_t task);
+
+/*! XR_LIFT_OUTPUT_* bits (IPC_SERVER_CONV_OUTPUT_*) @p d offers. */
+uint64_t
+ipc_server_conv_v4_output_flags(const struct xrt_conv_wire_task_desc *d);
+
+/*!
+ * conv_stream_create (latches), roadmap §7.4:
+ *  - XRT_ERROR_INPUT_UNSUPPORTED (VALIDATION_FAILURE): a reserved or spec-5
+ *    task, @p legacy_mode not matching the task, an input kind other than
+ *    MONO, an export kind other than the default / D3D11 NT, a view count
+ *    outside 2..maxViews;
+ *  - XRT_ERROR_FEATURE_NOT_SUPPORTED: no route (glue), no non-terminal
+ *    candidate, a task without a stream lane, or a @p required_outputs bit
+ *    (IPC_SERVER_CONV_OUTPUT_*) missing from a READY provider;
+ *  - XRT_ERROR_CLIENT_LIMIT_REACHED: the provider's max_streams;
+ *  - XRT_ERROR_OUTPUT_REQUEST_FAILURE: discovery has not described any
+ *    provider for the task yet (UNKNOWN: retry).
+ * @p in->outputs & XRT_CONV_OUT_DEPTH asks for ADVISORY aux depth
+ * (XrLiftDepthRequestDXR): granted when the provider declares it.
+ */
+xrt_result_t
+ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
+                                 uint64_t client_id,
+                                 const struct xrt_conv_wire_stream_desc *in,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 struct xrt_conv_wire_stream_created *out);
+
+/*! conv_stream_reset: drop temporal state before the next frame (cut / seek). */
+xrt_result_t
+ipc_server_conv_v4_stream_reset(struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id);
+
+/*!
+ * conv_acquire_result: the v3 acquire (same export rule, same @p out_v3) plus
+ * the result's full metadata (@p out: views / depth info twins) and whether
+ * temporal state was reset before it (@p out_discontinuity).
+ */
+xrt_result_t
+ipc_server_conv_v4_acquire(struct ipc_server_conv *sc,
+                           uint64_t client_id,
+                           uint64_t stream_id,
+                           bool *out_ready,
+                           bool *out_discontinuity,
+                           struct ipc_lift_result *out_v3,
+                           struct xrt_conv_wire_result *out);
 
 #ifdef __cplusplus
 }

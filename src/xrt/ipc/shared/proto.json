@@ -1529,5 +1529,65 @@
 			{"name": "prev_state", "type": "uint32_t"},
 			{"name": "state", "type": "uint32_t"}
 		]
+	},
+
+	"conv_get_generation": {
+		"out": [
+			{"name": "generation", "type": "struct xrt_conv_wire_generation"}
+		]
+	},
+
+	"conv_enum_task": {
+		"in": [
+			{"name": "task", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "desc", "type": "struct xrt_conv_wire_task_desc"},
+			{"name": "image_kinds", "type": "uint64_t"},
+			{"name": "export_kinds", "type": "uint64_t"}
+		]
+	},
+
+	"conv_request_warm": {
+		"in": [
+			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
+		]
+	},
+
+	"conv_stream_create": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_conv_wire_stream_desc"},
+			{"name": "required_outputs", "type": "uint64_t"},
+			{"name": "legacy_mode", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"}
+		],
+		"out": [
+			{"name": "created", "type": "struct xrt_conv_wire_stream_created"}
+		]
+	},
+
+	"conv_stream_reset": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"conv_acquire_result": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "discontinuity", "type": "bool"},
+			{"name": "lift_result", "type": "struct ipc_lift_result"},
+			{"name": "meta", "type": "struct xrt_conv_wire_result"}
+		]
+	},
+
+	"conv_poll_event": {
+		"out": [
+			{"name": "has_event", "type": "bool"},
+			{"name": "event", "type": "struct xrt_conv_wire_event"}
+		]
 	}
 }
