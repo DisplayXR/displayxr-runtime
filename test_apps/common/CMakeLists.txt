@@ -65,7 +65,9 @@ FetchContent_Declare(
     # (displayxr-common#76) — a KWin publisher's sorted keys crashed the old parser (#1928).
     # v2.31.2: u_wayland_geom.h gains u_wl_window_device_rect, the publisher's
     # buffer_device (displayxr-common#81, #1991); the aux guard needs the same bytes.
-    GIT_TAG v2.31.2
+    # v2.32.0: DxrLinuxWindowDesc::start_hidden — the window is never mapped or made
+    # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
+    GIT_TAG v2.32.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
