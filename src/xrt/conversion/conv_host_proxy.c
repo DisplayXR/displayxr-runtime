@@ -274,6 +274,7 @@ struct proxy
 	bool stop;          //!< destroy requested
 	bool breach;        //!< watchdog breach to report
 	bool chan_broken;   //!< reader saw the channel break
+	uint32_t broken_mark; //!< epoch + 1 of the incarnation whose channel broke (0 = none): it is down
 	bool hello_ok;      //!< accepted hello, bring-up pending
 	uint32_t hello_caps;
 	bool ever_lost;     //!< a LOST was raised (RESTORED owed at the next bring-up)
@@ -840,7 +841,8 @@ reader_main(void *ptr)
 			}
 			os_mutex_lock(&p->m);
 			if (!p->reader_stop) {
-				p->chan_broken = true; // closed, desynced or a malformed frame: the peer is gone or hostile
+				p->chan_broken = true;
+				p->broken_mark = p->epoch + 1u; // closed, desynced or a malformed frame: the peer is gone or hostile
 				// No reply can come any more: fail every waiter now, not at its timeout.
 				for (uint32_t i = 0; i < PX_MAX_PENDING; i++) {
 					if (p->pending[i].used && !p->pending[i].done) {
@@ -1030,6 +1032,7 @@ bring_up(struct proxy *p, uint32_t caps)
 		// before killing anything (no exit-30 kill of a host already going).
 		os_mutex_lock(&p->m);
 		p->chan_broken = true;
+		p->broken_mark = p->epoch + 1u;
 		os_cond_broadcast(&p->cond);
 		os_mutex_unlock(&p->m);
 		return;
@@ -1216,8 +1219,8 @@ on_host_gone(struct proxy *p, int32_t code, bool orderly, bool had_demand)
 /*!
  * The host process exited with @p code: classify, tear down, tell the
  * supervisor. An exit 0 is the host's own idle exit (orderly: no accounting,
- * no respawn until demand) ONLY when nothing was bound to it -- a host never
- * idles out with an open stream or a warmed model, and Restart Manager's
+ * no respawn until demand) ONLY when no provider stream was open on it -- a
+ * host never idles out with one, and Restart Manager's
  * forced kill reports 0 (#2056); 20 is closed for update; an exit after our
  * SHUTDOWN is orderly; anything else, and any exit of a host we were killing,
  * is a crash. The core gets the verdict, never a raw 0 / 20 that disagrees
@@ -1236,10 +1239,9 @@ host_exited(struct proxy *p, int32_t code)
 	                      (p->sup.state == CONV_SUP_KILLING && p->sup.kill_reason == CONV_SUP_KILL_LATE_SHUTDOWN);
 	const bool killed = p->sup.state == CONV_SUP_KILLING && !stopping;
 	const bool had_demand = demand_locked(p);
-	bool bound = p->open_streams > 0;
-	for (uint32_t i = 0; i < p->cap_count && !bound; i++) {
-		bound = p->states[i].state == XRT_CONV_STATE_READY || p->states[i].state == XRT_CONV_STATE_WARMING;
-	}
+	// An open provider stream is the proof the host was not idle (it never
+	// idles out with one); its warm pins are not mirrored in the state cache.
+	const bool bound = p->open_streams > 0;
 	// Exit 0 with nothing bound is the host's own orderly (idle) exit, queued
 	// demand or not: a command that raced it is a casualty and re-sent to the
 	// next host, which the demand spawns at once. No crash accounting.
@@ -1582,6 +1584,9 @@ sup_main(void *ptr)
 static bool
 host_down_locked(const struct proxy *p)
 {
+	if (p->broken_mark == p->epoch + 1u) {
+		return true; // its channel broke: it is exiting or about to be killed
+	}
 	if (p->running) {
 		return false;
 	}
@@ -2235,6 +2240,7 @@ exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 	if (u_shm_ring_push(&p->submit_ring, &rec, &wake) != U_SHM_RING_OK) {
 		os_mutex_lock(&p->m);
 		p->chan_broken = true;
+		p->broken_mark = p->epoch + 1u;
 		os_cond_broadcast(&p->cond);
 		os_mutex_unlock(&p->m);
 		return XRT_ERROR_IPC_FAILURE;
@@ -2256,6 +2262,7 @@ exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 		if (rr == U_SHM_RING_CORRUPT) {
 			os_mutex_lock(&p->m);
 			p->chan_broken = true;
+			p->broken_mark = p->epoch + 1u;
 			os_cond_broadcast(&p->cond);
 			os_mutex_unlock(&p->m);
 			return XRT_ERROR_IPC_FAILURE;
@@ -2359,8 +2366,9 @@ worker_main(void *ptr)
 		}
 
 		os_mutex_lock(&p->m);
-		if (p->epoch != epoch && r != XRT_SUCCESS) {
-			r = XRT_ERROR_IPC_FAILURE; // the process it ran in is gone
+		if (r != XRT_SUCCESS && (p->epoch != epoch || p->broken_mark == epoch + 1u)) {
+			r = XRT_ERROR_IPC_FAILURE; // the process it ran in is gone (or going)
+			c->blocked |= CONV_CMD_HOST_LOST;
 		}
 		p->in_flight = false;
 		p->cur_op = 0;

@@ -300,7 +300,8 @@ job_lane_main(void *ptr)
 		// Its host process died under it (satellite): retried ONCE from its
 		// original input after RESTORED, partial output discarded, same id.
 		const bool host_lost = r != XRT_SUCCESS && host->hosting == CONV_HOSTING_SATELLITE &&
-		                       conv_host_get_epoch(host) != epoch && !job_is_cancelled(j);
+		                       ((cmd.blocked & CONV_CMD_HOST_LOST) != 0 || conv_host_get_epoch(host) != epoch) &&
+		                       !job_is_cancelled(j);
 		if (host_lost) {
 			os_mutex_lock(&core->jobs_mtx);
 			j->running = false;
