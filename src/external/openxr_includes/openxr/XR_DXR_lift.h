@@ -1053,6 +1053,10 @@ typedef struct XrLiftImageDmabufDescDXR {
  * struct's inputTexture / inputIsDxgi / extent; inputTexture may then be NULL
  * (a spec-4 runtime relaxes v3's non-NULL check in this case only). 1..3
  * images, at most one per role; a spec-4 runtime accepts the COLOR role only.
+ * The image's kind must be one of the task's imageKinds for the session (on
+ * Windows: D3D11_NT, D3D11_DXGI, D3D12_NT, CPU; the Vulkan, dma-buf,
+ * IOSurface and AHardwareBuffer kinds are listed only once their transports
+ * exist), its region any sub-rect of the image.
  */
 typedef struct XrLiftFrameImagesDXR {
     XrStructureType          type;            //!< XR_TYPE_LIFT_FRAME_IMAGES_DXR
@@ -1078,6 +1082,12 @@ typedef struct XrLiftFrameControlDXR {
  * is then 0 and these fields are authoritative. On a D3D11_NT stream the
  * struct is left untouched. Handles arrive under the v3 rule: only on the
  * first acquire and on reallocation.
+ *
+ * A CPU export: XrLiftResultDXR::outputTexture points at the result's bytes,
+ * tightly packed (extent.width * bytes-per-pixel per row), runtime-owned and
+ * valid until the next acquire on the stream; fence is NULL; @c kind is CPU
+ * and @c syncKind CPU_COMPLETE. An auxiliary depth map keeps its D3D11 NT
+ * export.
  */
 typedef struct XrLiftResultExportDXR {
     XrStructureType          type;            //!< XR_TYPE_LIFT_RESULT_EXPORT_DXR
