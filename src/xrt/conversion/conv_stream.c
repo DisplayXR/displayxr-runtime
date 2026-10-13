@@ -169,13 +169,35 @@ unregister_out(struct conv_ring_slot *o)
 	o->reg_host = NULL;
 }
 
+/*! Drop registrations a dead host incarnation took with it: the indices are
+ *  stale, so they are forgotten, never unregistered (the images stay). */
+static void
+forget_in(struct conv_in_slot *s)
+{
+	for (uint32_t i = 0; i < CONV_STREAM_MAX_SUBMIT_IMAGES; i++) {
+		s->reg_idx[i] = CONV_REG_NONE;
+	}
+	s->reg_host = NULL;
+}
+
+static void
+forget_out(struct conv_ring_slot *o)
+{
+	for (uint32_t i = 0; i < CONV_RING_TARGETS; i++) {
+		o->reg_idx[i] = CONV_REG_NONE;
+	}
+	o->reg_host = NULL;
+}
+
 /*! Destroy the provider-side stream and drop host registrations. Dispatcher
  *  (or shutdown) thread, no lock held. */
 static void
 release_provider_side(struct conv_core *core, struct conv_stream *st)
 {
 	struct conv_host *host = st->pstream_host;
-	if (st->pstream_created && host != NULL && conv_core_host(core, st->bind.provider) == host) {
+	// A stale epoch: the provider stream died with its host process.
+	const bool live = host != NULL && conv_host_get_epoch(host) == st->pstream_epoch;
+	if (st->pstream_created && live && conv_core_host(core, st->bind.provider) == host) {
 		struct conv_host_cmd cmd;
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.op = CONV_OP_STREAM_DESTROY;
@@ -187,9 +209,15 @@ release_provider_side(struct conv_core *core, struct conv_stream *st)
 	st->pstream_failed = false;
 	st->pstream_host = NULL;
 	for (uint32_t i = 0; i < U_LIFT_INPUT_SLOTS; i++) {
+		if (st->in[i].reg_host != NULL && conv_host_get_epoch(st->in[i].reg_host) != st->in[i].reg_epoch) {
+			forget_in(&st->in[i]);
+		}
 		unregister_in(&st->in[i]);
 	}
 	for (uint32_t i = 0; i < U_LIFT_RING_SIZE; i++) {
+		if (st->out[i].reg_host != NULL && conv_host_get_epoch(st->out[i].reg_host) != st->out[i].reg_epoch) {
+			forget_out(&st->out[i]);
+		}
 		unregister_out(&st->out[i]);
 	}
 }
@@ -326,9 +354,10 @@ conv_streams_rebind_check(struct conv_core *core)
  */
 
 static bool
-ensure_pstream(struct conv_core *core, struct conv_stream *st, struct conv_host *host, uint32_t w, uint32_t h)
+ensure_pstream(
+    struct conv_core *core, struct conv_stream *st, struct conv_host *host, uint32_t epoch, uint32_t w, uint32_t h)
 {
-	if (st->pstream_created && st->pstream_host == host) {
+	if (st->pstream_created && st->pstream_host == host && st->pstream_epoch == epoch) {
 		return true;
 	}
 	if (st->pstream_failed) {
@@ -352,7 +381,11 @@ ensure_pstream(struct conv_core *core, struct conv_stream *st, struct conv_host 
 	cmd.stream_info = &info;
 	const xrt_result_t r = conv_host_call(host, &cmd);
 	if (r != XRT_SUCCESS) {
+		if (conv_host_get_epoch(host) != epoch) {
+			return false; // the host died under the create: retried on the next incarnation
+		}
 		st->pstream_failed = true;
+		st->pstream_epoch = epoch;
 		U_LOG_W("[conv] stream %llu: provider refused stream_create (cap %u, result %d)",
 		        (unsigned long long)st->id, st->bind.cap_id, (int)r);
 		return false;
@@ -360,12 +393,20 @@ ensure_pstream(struct conv_core *core, struct conv_stream *st, struct conv_host 
 	st->pstream = cmd.stream;
 	st->pstream_created = true;
 	st->pstream_host = host;
+	st->pstream_epoch = epoch;
 	return true;
 }
 
 static bool
-register_in(struct conv_stream *st, struct conv_in_slot *s, struct conv_host *host, struct xrt_conv_frame_in *fin)
+register_in(struct conv_stream *st,
+            struct conv_in_slot *s,
+            struct conv_host *host,
+            uint32_t epoch,
+            struct xrt_conv_frame_in *fin)
 {
+	if (s->reg_host == host && s->reg_epoch != epoch) {
+		forget_in(s); // registered with a host process that is gone
+	}
 	if (s->reg_host != host) {
 		unregister_in(s);
 		for (uint32_t i = 0; i < s->image_count; i++) {
@@ -375,6 +416,7 @@ register_in(struct conv_stream *st, struct conv_in_slot *s, struct conv_host *ho
 			}
 		}
 		s->reg_host = host;
+		s->reg_epoch = epoch;
 	}
 	fin->image_count = s->image_count;
 	for (uint32_t i = 0; i < s->image_count; i++) {
@@ -393,13 +435,35 @@ ensure_targets(struct conv_core *core,
                struct conv_stream *st,
                struct conv_ring_slot *o,
                struct conv_host *host,
+               uint32_t epoch,
                uint32_t w,
                uint32_t h)
 {
 	const struct conv_pipeline *p = &st->pipe;
 	const uint32_t key = p->outputs | (p->provider_outputs << 8) | (p->view_count << 16) | (p->views_layout << 24);
 	if (o->in_w == w && o->in_h == h && o->reg_host == host && o->sized_key == key) {
-		return true;
+		if (o->reg_epoch == epoch) {
+			return true;
+		}
+		// Same targets, new host process: re-register them in place. The
+		// images (and whatever result they hold) are the service's and stay.
+		forget_out(o);
+		bool ok = true;
+		for (uint32_t k = 0; ok && k < CONV_RING_TARGETS; k++) {
+			if (o->targets[k].memory_kind == 0 || (k == CONV_RING_VIEWS && p->composed)) {
+				continue;
+			}
+			ok = conv_host_register_image(host, &o->targets[k], &o->reg_idx[k]) == XRT_SUCCESS;
+		}
+		o->reg_host = host;
+		o->reg_epoch = epoch;
+		if (!ok) {
+			unregister_out(o);
+		}
+		return ok;
+	}
+	if (o->reg_host == host && o->reg_epoch != epoch) {
+		forget_out(o);
 	}
 	unregister_out(o);
 	for (uint32_t k = 0; k < CONV_RING_TARGETS; k++) {
@@ -467,6 +531,7 @@ ensure_targets(struct conv_core *core,
 		ok = conv_host_register_image(host, &o->targets[k], &o->reg_idx[k]) == XRT_SUCCESS;
 	}
 	o->reg_host = host;
+	o->reg_epoch = epoch;
 	if (!ok) {
 		unregister_out(o);
 		for (uint32_t k = 0; k < CONV_RING_TARGETS; k++) {
@@ -701,6 +766,24 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		os_cond_wait_timeout_ns(&lane->cond, &core->streams_mtx, 5ull * 1000000ull);
 	}
 
+	// A satellite host that restarted took the provider stream with it:
+	// re-open it (implicit reset; the result says discontinuity).
+	struct conv_host *host = conv_core_host(core, st->bind.provider);
+	const uint32_t epoch = host != NULL ? conv_host_get_epoch(host) : 0u;
+	if (st->pstream_created && st->pstream_host == host && st->pstream_epoch != epoch) {
+		st->pstream_created = false;
+		st->pstream_host = NULL;
+		st->reset_pending = true;
+		st->discontinuity_pending = true;
+		st->has_last_depth = false;
+		st->stats.reopens++;
+		U_LOG_W("[conv] stream %llu: provider stream re-opened on the restarted host (epoch %u)",
+		        (unsigned long long)st->id, epoch);
+	}
+	if (st->pstream_failed && st->pstream_epoch != epoch) {
+		st->pstream_failed = false; // a refusal by a dead incarnation is not final
+	}
+
 	struct convert_snapshot s;
 	memset(&s, 0, sizeof(s));
 	s.bind = st->bind;
@@ -728,14 +811,13 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	os_mutex_unlock(&core->streams_mtx);
 
 	const uint64_t t0 = now_ns();
-	struct conv_host *host = conv_core_host(core, s.bind.provider);
 	struct conv_pipeline_frame *pf = (struct conv_pipeline_frame *)calloc(1, sizeof(*pf));
 	xrt_result_t pr = XRT_SUCCESS;
 	ok = ok && host != NULL && pf != NULL;
-	ok = ok && ensure_pstream(core, st, host, meta.width, meta.height);
-	ok = ok && register_in(st, &st->in[in_slot], host, &pf->in);
+	ok = ok && ensure_pstream(core, st, host, epoch, meta.width, meta.height);
+	ok = ok && register_in(st, &st->in[in_slot], host, epoch, &pf->in);
 	struct conv_ring_slot *o = out_slot >= 0 ? &st->out[out_slot] : NULL;
-	ok = ok && o != NULL && ensure_targets(core, st, o, host, meta.width, meta.height);
+	ok = ok && o != NULL && ensure_targets(core, st, o, host, epoch, meta.width, meta.height);
 
 	// Dedupe applies to PHOTO only, and never across a reset / rebind (which
 	// still record what they converted, for the frames after them).
@@ -954,7 +1036,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	os_cond_broadcast(&lane->cond);
 	free(pf);
 
-	if (!ok && pr != XRT_SUCCESS && host != NULL) {
+	// A failure because the host process died is the crash path's (LOST),
+	// never a provider failure of the row.
+	if (!ok && pr != XRT_SUCCESS && host != NULL && conv_host_get_epoch(host) == epoch) {
 		os_mutex_unlock(&core->streams_mtx);
 		conv_core_call_failed(core, s.bind.provider, s.bind.cap_id, pr);
 		os_mutex_lock(&core->streams_mtx);

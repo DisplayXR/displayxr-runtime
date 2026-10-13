@@ -229,12 +229,26 @@ warm_done(struct conv_host_cmd *cmd)
 	memset(&st, 0, sizeof(st));
 	st.struct_size = (uint32_t)sizeof(st);
 	struct conv_host *host = core->hosts[op->provider].host;
-	const bool have_state = host != NULL && conv_host_get_state(host, op->cap_id, &st) == XRT_SUCCESS;
+	// A satellite host that died under the warm completes it as failed AFTER
+	// bumping its epoch: that is the crash path's (WARMING(restarting), re-warm
+	// on RESTORED), never a warm failure of the capability.
+	const bool casualty =
+	    cmd->result != XRT_SUCCESS && host != NULL && conv_host_get_epoch(host) != op->epoch;
+	const bool have_state =
+	    !casualty && host != NULL && conv_host_get_state(host, op->cap_id, &st) == XRT_SUCCESS;
 
 	os_mutex_lock(&core->registry_mtx);
 	op->busy = false;
 	const uint64_t t = now_ns();
-	if (!op->cancel && !core->stop) {
+	if (casualty) {
+		U_LOG_I("[conv] %s cap %u: warm lost with its host process (restart pending)",
+		        core->reg.providers[op->provider].id, op->cap_id);
+		// Completed after the host came back: the RESTORED re-warm skipped
+		// this busy op, so ask again.
+		if (!core->hosts[op->provider].down) {
+			core->hosts[op->provider].rewarm = true;
+		}
+	} else if (!op->cancel && !core->stop) {
 		if (cmd->result == XRT_SUCCESS && (!have_state || st.state == XRT_CONV_STATE_READY)) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
 			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
@@ -271,8 +285,10 @@ start_warm_locked(struct conv_core *core, uint32_t provider, uint32_t cap_id)
 		return;
 	}
 	struct conv_host_slot *hs = &core->hosts[provider];
-	if (hs->host == NULL || hs->hung || core->stop) {
-		return; // cache-only rows warm once their provider is loaded
+	if (hs->host == NULL || hs->hung || hs->down || core->stop) {
+		// Cache-only rows warm once their provider is loaded; a satellite
+		// that is down re-warms its restarting rows on RESTORED.
+		return;
 	}
 	struct conv_warm_op *op = NULL;
 	for (uint32_t i = 0; i < XRT_CONV_MAX_CAPABILITIES; i++) {
@@ -295,6 +311,7 @@ start_warm_locked(struct conv_core *core, uint32_t provider, uint32_t cap_id)
 	op->provider = provider;
 	op->busy = true;
 	op->cancel = false;
+	op->epoch = conv_host_get_epoch(hs->host);
 	op->cmd.op = CONV_OP_WARM;
 	op->cmd.cap_id = cap_id;
 	op->cmd.is_cancelled = warm_is_cancelled;
@@ -303,6 +320,130 @@ start_warm_locked(struct conv_core *core, uint32_t provider, uint32_t cap_id)
 	op->cmd.user = op;
 	if (conv_host_submit(hs->host, &op->cmd) != XRT_SUCCESS) {
 		op->busy = false;
+	}
+}
+
+
+/*
+ *
+ * Satellite host lifecycle (roadmap §3.5: "crash → WARMING; streams survive").
+ *
+ */
+
+//! conv_host::on_event: any host thread, no host lock held. Queue only.
+static void
+conv_core_on_host_event(void *ud, struct conv_host *h, uint32_t ev, int32_t detail)
+{
+	(void)h;
+	struct conv_host_listener *l = (struct conv_host_listener *)ud;
+	if (l == NULL || l->core == NULL) {
+		return;
+	}
+	struct conv_core *core = l->core;
+	os_mutex_lock(&core->evq_mtx);
+	if (core->evq_count < CONV_CORE_HOST_EVQ) {
+		struct conv_host_evq_entry *e = &core->evq[core->evq_count++];
+		e->provider = l->provider;
+		e->ev = ev;
+		e->detail = detail;
+	} else {
+		core->evq_dropped++;
+	}
+	os_mutex_unlock(&core->evq_mtx);
+	// Wake the control thread; it applies the queue under registry_mtx.
+	os_cond_signal(&core->ctrl_cond);
+}
+
+//! Apply one lifecycle event (registry_mtx held).
+static void
+host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, uint64_t t)
+{
+	const uint32_t p = e->provider;
+	if (p >= core->reg.provider_count || core->hosts[p].host == NULL) {
+		return;
+	}
+	struct conv_host_slot *hs = &core->hosts[p];
+	const char *id = core->reg.providers[p].id;
+	switch (e->ev) {
+	case CONV_HOST_EV_LOST: {
+		const bool crash = conv_host_exit_is_crash(e->detail);
+		hs->down = true;
+		hs->rewarm = false;
+		hs->restarts++;
+		U_LOG_W("[conv] provider %s: host process exited (code %d%s); streams stay, outputs keep their last result",
+		        id, (int)e->detail, crash ? ", crash" : "");
+		for (uint32_t i = 0; i < core->reg.row_count; i++) {
+			if (core->reg.rows[i].provider != p) {
+				continue;
+			}
+			if (crash) {
+				// WARMING(restarting, n), or FAILED(crash_loop) at the FSM's own cutoff.
+				struct conv_readiness_event ev = mk_ev(CONV_EV_HOST_CRASH, t);
+				apply_locked(core, i, &ev);
+			} else if (core->reg.rows[i].rd.state == XRT_CONV_STATE_READY) {
+				// Orderly (idle) exit: the model went with the process.
+				struct conv_readiness_event ev = mk_ev(CONV_EV_EVICTED, t);
+				apply_locked(core, i, &ev);
+			}
+		}
+		break;
+	}
+	case CONV_HOST_EV_RESTORED:
+		hs->down = false;
+		hs->rewarm = true;
+		core->redescribe[p] = true; // the fresh process's describe, then the re-warm
+		U_LOG_W("[conv] provider %s: host process back (epoch %u); re-warming", id,
+		        conv_host_get_epoch(hs->host));
+		break;
+	case CONV_HOST_EV_CRASH_LOOP:
+		hs->down = true;
+		hs->rewarm = false;
+		U_LOG_W("[conv] provider %s: host crash loop: FAILED(crash_loop) until a registry change", id);
+		for (uint32_t i = 0; i < core->reg.row_count; i++) {
+			if (core->reg.rows[i].provider == p) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_CRASH_LOOP, t);
+				apply_locked(core, i, &ev);
+			}
+		}
+		break;
+	default: break;
+	}
+}
+
+//! Drain the lifecycle queue (registry_mtx held).
+static void
+host_events_locked(struct conv_core *core, uint64_t t)
+{
+	struct conv_host_evq_entry q[CONV_CORE_HOST_EVQ];
+	os_mutex_lock(&core->evq_mtx);
+	const uint32_t n = core->evq_count;
+	memcpy(q, core->evq, sizeof(q[0]) * n);
+	core->evq_count = 0;
+	const uint32_t dropped = core->evq_dropped;
+	core->evq_dropped = 0;
+	os_mutex_unlock(&core->evq_mtx);
+	if (dropped != 0) {
+		U_LOG_W("[conv] %u host lifecycle event(s) dropped (queue full)", dropped);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		host_event_locked(core, &q[i], t);
+	}
+}
+
+//! After a RESTORED + its re-describe: re-warm what the crash left warming (registry_mtx held).
+static void
+rewarm_locked(struct conv_core *core, uint32_t p)
+{
+	struct conv_host_slot *hs = &core->hosts[p];
+	if (!hs->rewarm || hs->down) {
+		return;
+	}
+	hs->rewarm = false;
+	for (uint32_t i = 0; i < core->reg.row_count; i++) {
+		const struct conv_cap_row *row = &core->reg.rows[i];
+		if (row->provider == p && row->rd.state == XRT_CONV_STATE_WARMING) {
+			start_warm_locked(core, p, row->cap.cap_id);
+		}
 	}
 }
 
@@ -493,6 +634,8 @@ conv_core_add_provider(struct conv_core *core, const struct conv_provider_desc *
 			U_LOG_W("[conv] provider %s: could not create its in-service host", desc->id);
 			return -1;
 		}
+	} else if (desc->host != NULL) {
+		host = desc->host; // a satellite proxy: ours from here on
 	}
 	os_mutex_lock(&core->registry_mtx);
 	const int32_t pi = conv_registry_add(&core->reg, desc);
@@ -504,6 +647,15 @@ conv_core_add_provider(struct conv_core *core, const struct conv_provider_desc *
 	struct conv_host *old = core->hosts[pi].host;
 	core->hosts[pi].host = host;
 	core->hosts[pi].hung = false;
+	core->hosts[pi].down = false;
+	core->hosts[pi].rewarm = false;
+	core->hosts[pi].listener.core = core;
+	core->hosts[pi].listener.provider = (uint32_t)pi;
+	if (host != NULL) {
+		// Before the host's first command (the describe below).
+		host->event_ud = &core->hosts[pi].listener;
+		host->on_event = conv_core_on_host_event;
+	}
 	if (host != NULL) {
 		describe_locked(core, (uint32_t)pi);
 	} else {
@@ -528,7 +680,9 @@ conv_core_add_provider(struct conv_core *core, const struct conv_provider_desc *
 	}
 	os_mutex_unlock(&core->registry_mtx);
 	U_LOG_W("[conv] provider %s registered (%u capability rows, %s)", desc->id, core->reg.row_count,
-	        host != NULL ? "in-service host" : "describe cache only");
+	        host == NULL                                  ? "describe cache only"
+	        : host->hosting == CONV_HOSTING_SATELLITE ? "satellite host"
+	                                                  : "in-service host");
 	return pi;
 }
 
@@ -1010,6 +1164,11 @@ void
 conv_core_call_failed(struct conv_core *core, uint32_t provider, uint32_t cap_id, xrt_result_t r)
 {
 	struct conv_host *host = conv_core_host(core, provider);
+	if (host != NULL && r == XRT_ERROR_IPC_FAILURE && host->hosting == CONV_HOSTING_SATELLITE) {
+		// The host process went away under the call: the crash path owns the
+		// row (CONV_HOST_EV_LOST), not the call's failure.
+		return;
+	}
 	struct xrt_conv_state st;
 	memset(&st, 0, sizeof(st));
 	st.struct_size = (uint32_t)sizeof(st);
@@ -1145,7 +1304,7 @@ watchdog_locked(struct conv_core *core, uint64_t t)
 	    core->cfg.watchdog_stream_ns != 0 ? core->cfg.watchdog_stream_ns : 10ull * CONV_NS_PER_S;
 	for (uint32_t p = 0; p < core->reg.provider_count; p++) {
 		struct conv_host_slot *hs = &core->hosts[p];
-		if (hs->host == NULL || hs->hung) {
+		if (hs->host == NULL || hs->hung || hs->down) {
 			continue;
 		}
 		struct conv_host_heartbeat hb;
@@ -1171,6 +1330,17 @@ watchdog_locked(struct conv_core *core, uint64_t t)
 		default: limit = 0; break; // jobs: judged by progress (conv_job.c)
 		}
 		if (limit == 0 || t - hb.oldest_since_ns <= limit) {
+			continue;
+		}
+		if (hs->host->hosting == CONV_HOSTING_SATELLITE) {
+			// Satellite: kill the host (exit 30); the loss then takes the
+			// crash path (WARMING(restarting), respawn after the backoff).
+			U_LOG_W("[conv] watchdog: provider %s cap %u stuck in %s for %.1f s: killing its host",
+			        core->reg.providers[p].id, hb.oldest_cap_id,
+			        hb.oldest_op == CONV_OP_WARM ? "warm" : "a stream call",
+			        (double)(t - hb.oldest_since_ns) / 1e9);
+			hs->down = true; // once: the LOST event confirms it
+			conv_host_abandon(hs->host);
 			continue;
 		}
 		U_LOG_W("[conv] watchdog: provider %s cap %u stuck in %s for %.1f s: FAILED(hung)",
@@ -1255,6 +1425,7 @@ ctrl_main(void *ptr)
 	os_mutex_lock(&core->registry_mtx);
 	while (!core->stop) {
 		const uint64_t t = now_ns();
+		host_events_locked(core, t);
 		if (t - last_tick >= tick_ns) {
 			last_tick = t;
 			poll_providers_locked(core, t);
@@ -1268,6 +1439,7 @@ ctrl_main(void *ptr)
 					core->rebind_check = true;
 				}
 			}
+			rewarm_locked(core, p);
 		}
 		// #2005: rows a change brought back follow PrewarmOn like rows of a
 		// provider added after the first hint (conv_core_add_provider).
@@ -1327,7 +1499,8 @@ conv_core_create(const struct conv_core_config *cfg, struct conv_core **out_core
 	core->next_job_id = 1;
 	if (os_mutex_init(&core->registry_mtx) != 0 || os_cond_init(&core->ctrl_cond) != 0 ||
 	    os_mutex_init(&core->streams_mtx) != 0 || os_mutex_init(&core->jobs_mtx) != 0 ||
-	    os_mutex_init(&core->eyes_mtx) != 0) {
+	    os_mutex_init(&core->eyes_mtx) != 0 ||
+	    os_mutex_init(&core->evq_mtx) != 0) {
 		free(core);
 		return XRT_ERROR_THREADING_INIT_FAILURE;
 	}
@@ -1415,6 +1588,7 @@ conv_core_destroy(struct conv_core **core_ptr)
 	conv_eyes_slot_fini(&core->eyes_any);
 	os_mutex_destroy(&core->eyes_mtx);
 	os_cond_destroy(&core->ctrl_cond);
+	os_mutex_destroy(&core->evq_mtx);
 	os_mutex_destroy(&core->jobs_mtx);
 	os_mutex_destroy(&core->streams_mtx);
 	os_mutex_destroy(&core->registry_mtx);

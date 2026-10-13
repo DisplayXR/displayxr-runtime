@@ -23,6 +23,15 @@
  *  - Images are registered once per slot lifetime (register_image) and looked
  *    up per frame (lookup_image): a satellite proxy duplicates the handles
  *    into the host process once, an in-service host stores the image as is.
+ *  - A satellite host can die and come back (roadmap §3.5, "crash → WARMING;
+ *    streams survive"). Every incarnation of the host process has an EPOCH
+ *    (get_epoch), bumped the moment the loss is seen and BEFORE any in-flight
+ *    command is completed as failed: a caller that recorded the epoch at
+ *    submit tells a crash casualty from a provider failure by comparing it.
+ *    Image indices and provider stream handles are per epoch; the dispatcher
+ *    re-registers and re-opens on a mismatch. The lifecycle itself is pushed
+ *    to the core through conv_host::on_event (LOST, RESTORED, CRASH_LOOP).
+ *    An in-service host never dies on its own: its epoch stays 0.
  *
  * Locks: a host's own mutex is a leaf. No conversion lock may be held across
  * a completion wait, and on_complete is called with no host lock held.
@@ -94,6 +103,27 @@ struct conv_host_cmd
 	struct conv_host_cmd *next_;
 };
 
+/*! @name Host lifecycle events (conv_host::on_event; satellite hosts only) @{ */
+//! The host process went away. detail = its exit code (conv_host_wire.h
+//! CONV_HOST_EXIT_*; anything unlisted = crash). The epoch was already bumped; in-flight commands
+//! complete as XRT_ERROR_IPC_FAILURE; registrations and provider streams are gone.
+#define CONV_HOST_EV_LOST 1u
+//! A fresh host process is up and described (after the supervisor's backoff):
+//! re-warm, re-open streams, re-register images.
+#define CONV_HOST_EV_RESTORED 2u
+//! The supervisor's crash-loop cutoff: no respawn until a registry change.
+#define CONV_HOST_EV_CRASH_LOOP 3u
+/*! @} */
+
+/*! Does host exit code @p code count toward the crash-loop budget? The
+ *  codes are conv_host_wire.h's CONV_HOST_EXIT_*: 0 (orderly / idle) and 20
+ *  (closed for update) do not; everything else (30 = watchdog kill included) does. */
+static inline bool
+conv_host_exit_is_crash(int32_t code)
+{
+	return code != 0 && code != 20;
+}
+
 /*! Watchdog view of a host (roadmap §5.3: every call is bracketed). */
 struct conv_host_heartbeat
 {
@@ -117,6 +147,9 @@ struct conv_host_ops
 	                             struct xrt_conv_capability *out,
 	                             uint32_t *out_count);
 	uint64_t (*get_generation)(struct conv_host *h);
+	/*! The provider's get_provider_status, as last reported (satellite: from
+	 *  the host's describe). NULL = the registry reads the iface instead. */
+	bool (*get_provider_status)(struct conv_host *h, struct xrt_conv_provider_status *out);
 	xrt_result_t (*get_state)(struct conv_host *h, uint32_t cap_id, struct xrt_conv_state *out);
 	xrt_result_t (*get_output_desc)(
 	    struct conv_host *h, uint64_t stream, uint32_t w, uint32_t hgt, struct xrt_conv_output_desc *out);
@@ -139,8 +172,14 @@ struct conv_host_ops
 
 	/*! Watchdog: the provider hung. Every queued command completes with
 	 *  XRT_ERROR_IPC_FAILURE (host gone), new submits are refused, the busy
-	 *  exec thread is abandoned (in-service: until the service restarts). */
+	 *  exec thread is abandoned (in-service: until the service restarts).
+	 *  A satellite proxy instead kills the host process (exit 30); the loss
+	 *  then follows the crash path (CONV_HOST_EV_LOST, respawn). Never raises
+	 *  an event synchronously (the caller may hold core locks). */
 	void (*abandon)(struct conv_host *h);
+
+	/*! The current host-process incarnation. NULL = in-service (always 0). */
+	uint32_t (*get_epoch)(struct conv_host *h);
 
 	/*! Orderly shutdown: cancel (is_cancelled turns true), drain, destroy the
 	 *  provider instance, join. A hung host is leaked instead. */
@@ -153,7 +192,22 @@ struct conv_host
 	const struct conv_host_ops *ops;
 	char provider_id[64];
 	uint32_t hosting; //!< CONV_HOSTING_* (conv_registry.h)
+
+	/*! Lifecycle listener (CONV_HOST_EV_*), installed by the core before the
+	 *  host's first command. Called on a host thread with no host lock held;
+	 *  the listener only queues (it must not call back into the host). */
+	void (*on_event)(void *ud, struct conv_host *h, uint32_t ev, int32_t detail);
+	void *event_ud;
 };
+
+//! Raise a lifecycle event (host implementations; no host lock held).
+static inline void
+conv_host_raise_event(struct conv_host *h, uint32_t ev, int32_t detail)
+{
+	if (h->on_event != NULL) {
+		h->on_event(h->event_ud, h, ev, detail);
+	}
+}
 
 static inline xrt_result_t
 conv_host_describe_cap(struct conv_host *h, uint32_t index, struct xrt_conv_capability *out, uint32_t *out_count)
@@ -220,6 +274,12 @@ static inline void
 conv_host_abandon(struct conv_host *h)
 {
 	h->ops->abandon(h);
+}
+
+static inline uint32_t
+conv_host_get_epoch(struct conv_host *h)
+{
+	return h->ops->get_epoch != NULL ? h->ops->get_epoch(h) : 0u;
 }
 
 static inline void

@@ -24,6 +24,7 @@
 
 #include "xrt/xrt_conversion_plugin.h"
 
+#include "conv_host_iface.h"
 #include "conv_readiness.h"
 #include "conv_select.h"
 
@@ -66,6 +67,11 @@ struct conv_provider_desc
 	 * rows can still come from the describe cache. */
 	const struct xrt_conversion_plugin_iface *iface;
 	struct xrt_conversion_plugin_instance *inst;
+
+	/* A pre-built host (the satellite proxy, conv_host_proxy.c) in place of
+	 * iface / inst: the provider is NOT loaded in this process; describe goes
+	 * through the host's [C] calls. conv_core_add_provider takes ownership. */
+	struct conv_host *host;
 };
 
 /*! @name Descriptor validation (selftest rules, spec §7.2) @{ */
@@ -100,6 +106,7 @@ struct conv_provider
 
 	const struct xrt_conversion_plugin_iface *iface;
 	struct xrt_conversion_plugin_instance *inst;
+	struct conv_host *host; //!< describe source when iface is NULL (satellite); not owned here
 
 	//! Negotiated at ABI 1, probed OK, platform not ABSENT / INCOMPATIBLE.
 	//! Default true; the loader clears it (conv_registry_set_usable) on a

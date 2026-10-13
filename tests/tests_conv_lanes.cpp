@@ -2069,3 +2069,548 @@ TEST_CASE("core: a live policy change (PreferredProvider, AllowResearchOnly) rea
 	conv_fake_fini(&b);
 	conv_fake_fini(&r);
 }
+
+
+
+/*
+ *
+ * Satellite hosts: crash → WARMING(restarting); streams survive (roadmap §3.5).
+ *
+ */
+
+namespace {
+
+/*!
+ * A satellite-shaped host for the core's crash path, with no process: it
+ * wraps an in-service host and can be told to "die" (the epoch bumps, every
+ * command still in flight completes as XRT_ERROR_IPC_FAILURE, registrations
+ * are dropped, LOST is raised), to come back (RESTORED) or to give up
+ * (CRASH_LOOP), as conv_host_proxy does around a real host process.
+ */
+struct FakeSat
+{
+	conv_host base{};
+	conv_host *inner = nullptr;
+	conv_fake_provider *prov = nullptr;
+	std::mutex m;
+	uint32_t epoch = 0;
+	bool down = false;
+	std::vector<uint32_t> inner_regs; //!< inner indices registered in this epoch
+	uint32_t registers = 0;           //!< register_image calls (all epochs)
+
+	struct Track
+	{
+		FakeSat *sat;
+		void (*orig)(conv_host_cmd *);
+		void *orig_user;
+		uint32_t epoch;
+	};
+
+	static FakeSat *
+	of(conv_host *h)
+	{
+		return reinterpret_cast<FakeSat *>(h);
+	}
+
+	static constexpr uint32_t IDX_BITS = 16;
+
+	void
+	die(int32_t code, bool provider_cold = true)
+	{
+		std::vector<uint32_t> regs;
+		{
+			std::lock_guard<std::mutex> lk(m);
+			epoch++;
+			down = true;
+			regs.swap(inner_regs);
+		}
+		for (uint32_t r : regs) {
+			conv_host_unregister_image(inner, r);
+		}
+		if (provider_cold) {
+			// A fresh process knows nothing: every capability is INSTALLED again.
+			for (uint32_t i = 0; i < prov->cap_count; i++) {
+				conv_fake_set_state(prov, prov->caps[i].cap.cap_id, XRT_CONV_STATE_INSTALLED, 0, false);
+			}
+		}
+		conv_host_raise_event(&base, CONV_HOST_EV_LOST, code);
+	}
+
+	void
+	revive()
+	{
+		{
+			std::lock_guard<std::mutex> lk(m);
+			down = false;
+		}
+		conv_host_raise_event(&base, CONV_HOST_EV_RESTORED, 0);
+	}
+
+	void
+	give_up()
+	{
+		{
+			std::lock_guard<std::mutex> lk(m);
+			epoch++;
+			down = true;
+		}
+		conv_host_raise_event(&base, CONV_HOST_EV_CRASH_LOOP, 0);
+	}
+
+	bool
+	is_down()
+	{
+		std::lock_guard<std::mutex> lk(m);
+		return down;
+	}
+};
+
+void
+sat_track_done(conv_host_cmd *cmd)
+{
+	auto *t = static_cast<FakeSat::Track *>(cmd->user);
+	FakeSat *s = t->sat;
+	{
+		std::lock_guard<std::mutex> lk(s->m);
+		if (t->epoch != s->epoch) {
+			cmd->result = XRT_ERROR_IPC_FAILURE; // the process it ran in is gone
+		}
+	}
+	cmd->on_complete = t->orig;
+	cmd->user = t->orig_user;
+	delete t;
+	cmd->on_complete(cmd);
+}
+
+xrt_result_t
+sat_describe_cap(conv_host *h, uint32_t index, xrt_conv_capability *out, uint32_t *out_count)
+{
+	return conv_host_describe_cap(FakeSat::of(h)->inner, index, out, out_count);
+}
+
+uint64_t
+sat_get_generation(conv_host *h)
+{
+	return conv_host_get_generation(FakeSat::of(h)->inner);
+}
+
+xrt_result_t
+sat_get_state(conv_host *h, uint32_t cap_id, xrt_conv_state *out)
+{
+	FakeSat *s = FakeSat::of(h);
+	if (s->is_down()) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return conv_host_get_state(s->inner, cap_id, out);
+}
+
+xrt_result_t
+sat_get_output_desc(conv_host *h, uint64_t stream, uint32_t w, uint32_t hgt, xrt_conv_output_desc *out)
+{
+	FakeSat *s = FakeSat::of(h);
+	if (s->is_down()) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return conv_host_get_output_desc(s->inner, stream, w, hgt, out);
+}
+
+xrt_result_t
+sat_submit(conv_host *h, conv_host_cmd *cmd)
+{
+	FakeSat *s = FakeSat::of(h);
+	auto *t = new FakeSat::Track{s, cmd->on_complete, cmd->user, 0};
+	{
+		std::lock_guard<std::mutex> lk(s->m);
+		if (s->down) {
+			delete t;
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		t->epoch = s->epoch;
+	}
+	cmd->on_complete = sat_track_done;
+	cmd->user = t;
+	const xrt_result_t r = conv_host_submit(s->inner, cmd);
+	if (r != XRT_SUCCESS) {
+		cmd->on_complete = t->orig;
+		cmd->user = t->orig_user;
+		delete t;
+	}
+	return r;
+}
+
+void
+sat_refresh_caps(conv_host *h)
+{
+	conv_host_refresh_caps(FakeSat::of(h)->inner);
+}
+
+xrt_result_t
+sat_register_image(conv_host *h, const xrt_conv_image *img, uint32_t *out_index)
+{
+	FakeSat *s = FakeSat::of(h);
+	uint32_t ep = 0;
+	{
+		std::lock_guard<std::mutex> lk(s->m);
+		if (s->down) {
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		ep = s->epoch;
+		s->registers++;
+	}
+	uint32_t idx = 0;
+	const xrt_result_t r = conv_host_register_image(s->inner, img, &idx);
+	if (r != XRT_SUCCESS) {
+		return r;
+	}
+	std::lock_guard<std::mutex> lk(s->m);
+	s->inner_regs.push_back(idx);
+	*out_index = (ep << FakeSat::IDX_BITS) | idx;
+	return XRT_SUCCESS;
+}
+
+void
+sat_unregister_image(conv_host *h, uint32_t index)
+{
+	FakeSat *s = FakeSat::of(h);
+	const uint32_t idx = index & ((1u << FakeSat::IDX_BITS) - 1u);
+	{
+		std::lock_guard<std::mutex> lk(s->m);
+		if ((index >> FakeSat::IDX_BITS) != s->epoch) {
+			return; // a dead incarnation's index: nothing to drop
+		}
+		auto it = std::find(s->inner_regs.begin(), s->inner_regs.end(), idx);
+		if (it == s->inner_regs.end()) {
+			return;
+		}
+		s->inner_regs.erase(it);
+	}
+	conv_host_unregister_image(s->inner, idx);
+}
+
+bool
+sat_lookup_image(conv_host *h, uint32_t index, xrt_conv_image *out)
+{
+	FakeSat *s = FakeSat::of(h);
+	{
+		std::lock_guard<std::mutex> lk(s->m);
+		if ((index >> FakeSat::IDX_BITS) != s->epoch) {
+			return false;
+		}
+	}
+	return conv_host_lookup_image(s->inner, index & ((1u << FakeSat::IDX_BITS) - 1u), out);
+}
+
+void
+sat_heartbeat(conv_host *h, conv_host_heartbeat *out)
+{
+	conv_host_get_heartbeat(FakeSat::of(h)->inner, out);
+}
+
+void
+sat_abandon(conv_host *h)
+{
+	(void)h; // the watchdog kill is the proxy's; not exercised with the fake
+}
+
+uint32_t
+sat_get_epoch(conv_host *h)
+{
+	FakeSat *s = FakeSat::of(h);
+	std::lock_guard<std::mutex> lk(s->m);
+	return s->epoch;
+}
+
+void
+sat_destroy(conv_host **hp)
+{
+	FakeSat *s = FakeSat::of(*hp);
+	*hp = nullptr;
+	conv_host_destroy(&s->inner);
+	delete s;
+}
+
+conv_host_ops
+make_sat_ops()
+{
+	conv_host_ops o{};
+	o.describe_cap = sat_describe_cap;
+	o.get_generation = sat_get_generation;
+	o.get_state = sat_get_state;
+	o.get_output_desc = sat_get_output_desc;
+	o.submit = sat_submit;
+	o.refresh_caps = sat_refresh_caps;
+	o.register_image = sat_register_image;
+	o.unregister_image = sat_unregister_image;
+	o.lookup_image = sat_lookup_image;
+	o.heartbeat = sat_heartbeat;
+	o.abandon = sat_abandon;
+	o.get_epoch = sat_get_epoch;
+	o.destroy = sat_destroy;
+	return o;
+}
+
+const conv_host_ops k_sat_ops = make_sat_ops();
+
+//! Register @p f behind a FakeSat (the core owns it); returns it for scripting.
+FakeSat *
+add_satellite(Core &core, conv_fake_provider &f, uint32_t probe_order)
+{
+	auto *s = new FakeSat();
+	s->prov = &f;
+	REQUIRE(conv_host_inproc_create(f.id, &f.iface, conv_fake_inst(&f), &s->inner) == XRT_SUCCESS);
+	s->base.ops = &k_sat_ops;
+	s->base.hosting = CONV_HOSTING_SATELLITE;
+	std::strncpy(s->base.provider_id, f.id, sizeof(s->base.provider_id) - 1);
+	conv_provider_desc d{};
+	d.id = f.id;
+	d.probe_order = probe_order;
+	d.hosting = CONV_HOSTING_SATELLITE;
+	d.enabled = true;
+	d.host = &s->base;
+	REQUIRE(conv_core_add_provider(core.c, &d) >= 0);
+	return s;
+}
+
+xrt_conv_wire_stream_created
+views_stream(Core &core)
+{
+	auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+	xrt_conv_wire_stream_created cr{};
+	REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+	return cr;
+}
+
+bool
+convert_one_frame(Core &core, uint64_t sid, conv_result *r)
+{
+	if (!submit(core.c, sid)) {
+		return false;
+	}
+	return wait_until([&] { return conv_core_stream_acquire(core.c, sid, true, r) == XRT_SUCCESS; }, 3000);
+}
+
+uint32_t
+views_state(Core &core)
+{
+	return conv_core_task_state(core.c, XRT_CONV_TASK_VIEWS_MONO);
+}
+
+//! The row's own state (task state drops terminal rows from selection).
+uint32_t
+row_state(Core &core, uint32_t provider, uint32_t cap_id)
+{
+	static conv_registry reg; // big; tests run serially
+	conv_core_copy_registry(core.c, &reg);
+	const int32_t ri = conv_registry_find_row(&reg, provider, cap_id);
+	return ri < 0 ? XRT_CONV_STATE_ABSENT : reg.rows[ri].rd.state;
+}
+
+} // namespace
+
+TEST_CASE("satellite: a host crash keeps the stream; WARMING(restarting), re-open + re-register", "[conv_lanes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "sat");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	c->state = XRT_CONV_STATE_READY;
+	c->convert_ms = 2;
+	c->warm_ms = 50;
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, f, 100);
+		CHECK(views_state(core) == XRT_CONV_STATE_READY);
+		const auto cr = views_stream(core);
+
+		conv_result r{};
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK_FALSE(r.discontinuity);
+		const uint64_t first_frame = r.frame_id;
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(f.streams_created == 1u);
+		const uint32_t regs_before = sat->registers;
+
+		// The host process dies (a crash, not an orderly exit).
+		sat->die(-1);
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_WARMING; }, 2000));
+		CHECK_FALSE(core.saw_state(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_STATE_FAILED));
+		{
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			REQUIRE(reg.row_count == 1u);
+			CHECK(reg.rows[0].rd.restarting);
+			CHECK(reg.rows[0].rd.restart_attempt == 1u);
+		}
+
+		// The stream handle stays valid; producers keep submitting
+		// (latest-wins); the output ring keeps the last good result.
+		for (int i = 0; i < 3; i++) {
+			REQUIRE(submit(core.c, cr.stream_id));
+		}
+		sleep_ms(50);
+		REQUIRE(conv_core_stream_acquire(core.c, cr.stream_id, false, &r) == XRT_SUCCESS);
+		CHECK(r.frame_id == first_frame);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(stats(core.c, cr.stream_id).row_state == XRT_CONV_STATE_WARMING);
+
+		// After the backoff the host is back: re-warm, re-open, re-register.
+		sat->revive();
+		REQUIRE(wait_until(
+		    [&] { return conv_core_stream_acquire(core.c, cr.stream_id, true, &r) == XRT_SUCCESS; }, 3000));
+		CHECK(r.discontinuity); // implicit reset: no temporal state survived
+		CHECK(r.frame_id != first_frame);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(views_state(core) == XRT_CONV_STATE_READY);
+		CHECK(f.streams_created == 2u);                             // re-opened ...
+		CHECK((f.first_frame_flags & XRT_CONV_FRAME_RESET) != 0u); // ... with FRAME_RESET
+		CHECK(sat->registers > regs_before);                       // images re-registered
+		conv_stream_stats s = stats(core.c, cr.stream_id);
+		CHECK(s.reopens == 1u);
+		CHECK(s.rebinds == 0u); // a restart is not a rebind
+		CHECK(std::string(s.provider_id) == "sat");
+
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK_FALSE(r.discontinuity);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		// A crash in the middle of a warm is a casualty, not a warm failure.
+		c->warm_ms = 300;
+		sat->die(-1);
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_WARMING; }, 2000));
+		sat->revive();
+		sleep_ms(60);
+		sat->die(-1); // dies under the re-warm
+		sleep_ms(400);
+		CHECK(views_state(core) == XRT_CONV_STATE_WARMING);
+		CHECK_FALSE(core.saw_state(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_STATE_FAILED));
+		c->warm_ms = 20;
+		sat->revive();
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_READY; }, 3000));
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK(r.discontinuity);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		s = stats(core.c, cr.stream_id);
+		CHECK(s.reopens == 2u);
+		CHECK(s.rebinds == 0u);
+
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+	}
+	CHECK(g_live_images.load() == 0);
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("satellite: crash-loop cutoff -> FAILED(crash_loop) -> the rebind rule, or the stream stays",
+          "[conv_lanes]")
+{
+	conv_fake_provider fa, fb;
+	conv_fake_init(&fa, "sat-a");
+	conv_fake_init(&fb, "inproc-b");
+	for (conv_fake_provider *f : {&fa, &fb}) {
+		conv_fake_cap *c =
+		    conv_fake_add_cap(f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+		c->state = XRT_CONV_STATE_READY;
+		c->convert_ms = 2;
+		c->warm_ms = 5;
+	}
+	SECTION("supervisor cutoff with another candidate: the stream rebinds")
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, fa, 50);
+		REQUIRE(core.add(fb, 100) >= 0);
+		const auto cr = views_stream(core);
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "sat-a");
+		conv_result r{};
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		sat->give_up();
+		REQUIRE(wait_until([&] { return stats(core.c, cr.stream_id).rebinds == 1u; }, 3000));
+		CHECK(std::string(stats(core.c, cr.stream_id).provider_id) == "inproc-b");
+		{
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			const int32_t ri = conv_registry_find_row(&reg, 0, 4);
+			REQUIRE(ri >= 0);
+			CHECK(reg.rows[ri].rd.state == XRT_CONV_STATE_FAILED);
+			CHECK(reg.rows[ri].rd.reason == XRT_CONV_FAIL_CRASH_LOOP);
+		}
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		CHECK(r.discontinuity);
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+	}
+	SECTION("the readiness machine's own cutoff, no other candidate: the stream stays alive in FAILED")
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, fa, 50);
+		const auto cr = views_stream(core);
+		conv_result r{};
+		REQUIRE(convert_one_frame(core, cr.stream_id, &r));
+		const uint64_t last = r.frame_id;
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		for (uint32_t i = 0; i < CONV_CRASH_LOOP_COUNT; i++) {
+			sat->die(-1);
+			REQUIRE(wait_until(
+			    [&] {
+				    const uint32_t st = row_state(core, 0, 4);
+				    return st == XRT_CONV_STATE_WARMING || st == XRT_CONV_STATE_FAILED;
+			    },
+			    2000));
+			if (i + 1 < CONV_CRASH_LOOP_COUNT) {
+				sat->revive();
+				REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_READY; }, 2000));
+			}
+		}
+		REQUIRE(wait_until([&] { return row_state(core, 0, 4) == XRT_CONV_STATE_FAILED; }, 2000));
+		{
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			CHECK(reg.rows[0].rd.reason == XRT_CONV_FAIL_CRASH_LOOP);
+		}
+		conv_stream_stats s{};
+		REQUIRE(conv_core_stream_get_stats(core.c, cr.stream_id, &s) == XRT_SUCCESS); // still a handle
+		CHECK(s.rebinds == 0u);
+		CHECK(s.row_state == XRT_CONV_STATE_FAILED);
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(conv_core_stream_acquire(core.c, cr.stream_id, false, &r) == XRT_SUCCESS);
+		CHECK(r.frame_id == last); // the last good result stays
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&fa);
+	conv_fake_fini(&fb);
+}
+
+TEST_CASE("satellite: an orderly (idle) exit is not a crash; describe goes through the host", "[conv_lanes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "sat");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	c->state = XRT_CONV_STATE_READY;
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, f, 100);
+		{
+			// No iface in this process: the rows came from the host's describe.
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			REQUIRE(reg.provider_count == 1u);
+			CHECK(reg.providers[0].iface == nullptr);
+			CHECK(reg.providers[0].hosting == CONV_HOSTING_SATELLITE);
+			CHECK(reg.providers[0].described);
+			CHECK(reg.row_count == 1u);
+		}
+		CHECK(conv_core_task_state(core.c, XRT_CONV_TASK_DEPTH_MONO) == XRT_CONV_STATE_READY);
+		sat->die(0); // CONV_HOST_EXIT_ORDERLY
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(core.c, XRT_CONV_TASK_DEPTH_MONO) == XRT_CONV_STATE_EVICTED; },
+		    2000));
+		conv_registry reg;
+		conv_core_copy_registry(core.c, &reg);
+		CHECK(reg.rows[0].rd.crash_count == 0u);
+		CHECK_FALSE(reg.rows[0].rd.restarting);
+	}
+	conv_fake_fini(&f);
+}
