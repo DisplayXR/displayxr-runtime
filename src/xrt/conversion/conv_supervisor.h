@@ -199,6 +199,16 @@ conv_supervisor_heartbeat(struct conv_supervisor *s, uint64_t now_ns);
 void
 conv_supervisor_watchdog_breach(struct conv_supervisor *s, uint64_t now_ns);
 
+/*!
+ * The host left on its OWN idle exit: exit 0 while the owner had no demand
+ * for it (no command, stream, job or pin). Orderly: no backoff, no
+ * crash-loop accounting, IDLE (respawned by the next demand). An exit 0 WITH
+ * demand is still abnormal (a provider calling exit(0) mid-work): report it
+ * through conv_supervisor_exited.
+ */
+void
+conv_supervisor_idle_exited(struct conv_supervisor *s, uint64_t now_ns);
+
 //! The control channel broke or the peer violated the protocol (ring corrupt, bad frame).
 void
 conv_supervisor_channel_broken(struct conv_supervisor *s, uint64_t now_ns);

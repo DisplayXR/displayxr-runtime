@@ -1119,15 +1119,12 @@ TEST_CASE("proxy: close / evict / teardown with the real host NOT running never 
 }
 
 TEST_CASE("proxy: a host's own idle exit is orderly: no crash accounting, no respawn without demand",
-          "[conv_proxy][conv_kill][!mayfail]")
+          "[conv_proxy][conv_kill]")
 {
-	// KNOWN BUG (#2035 report, 2026-10-13), kept visible with [!mayfail]:
-	// the host closes its channel before its exit 0 lands, the proxy reads
-	// the broken channel as a dead peer and TerminateProcess-es it with the
-	// watchdog code (30) while it is still in its orderly exit; the
-	// supervisor then counts a crash, the core re-warms every capability
-	// (WARMING restarting) and the host is respawned with no demand. Five
-	// idle exits in 10 min would end in FAILED(crash_loop).
+	// The host closes its channel before its exit 0 lands: the proxy waits
+	// for the real exit code instead of killing it (exit 30), and an exit 0
+	// with nothing demanding the host is its own idle exit -- orderly, no
+	// crash accounting, no respawn until a warm / create needs it.
 	real_host_env("0");
 	Fixture fx({"--idle-exit-ms", "1500"}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
 	const uint64_t sid = fx.stream(DEPTH, DEPTH);

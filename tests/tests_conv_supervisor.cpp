@@ -166,6 +166,20 @@ TEST_CASE("supervisor: idle exit is orderly", "[conv][supervisor]")
 	CHECK(r.tick() == CONV_SUP_ACTION_SPAWN);
 }
 
+TEST_CASE("supervisor: the host's own idle exit is orderly; an exit 0 with demand is not", "[conv][supervisor]")
+{
+	rig r;
+	r.start();
+	conv_supervisor_set_demand(&r.s, r.now, false);
+	conv_supervisor_idle_exited(&r.s, r.now);
+	CHECK(r.s.state == CONV_SUP_IDLE);
+	CHECK(r.status().restarts == 0);
+	CHECK(r.status().last_exit == CONV_HOST_EXIT_ORDERLY);
+	CHECK(r.tick() == CONV_SUP_ACTION_NONE); // no demand: no respawn
+	conv_supervisor_set_demand(&r.s, r.now, true);
+	CHECK(r.tick() == CONV_SUP_ACTION_SPAWN); // lazily, no backoff
+}
+
 TEST_CASE("supervisor: demand resets the idle timer", "[conv][supervisor]")
 {
 	rig r;

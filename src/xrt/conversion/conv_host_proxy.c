@@ -60,6 +60,7 @@
 #define PX_ACCEPT_TIMEOUT_MS 10000u    //!< the host connecting its channel (a start costs ~4 s on a slow box)
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
+#define PX_CHANNEL_EXIT_GRACE_MS 3000u //!< a closed channel: wait this long for the real exit code
 #define PX_MAINTENANCE_POLL_NS (1000ull * 1000000ull)
 
 static uint64_t
@@ -1078,7 +1079,7 @@ release_outputs(struct proxy *p, struct px_output *outs, uint32_t n, struct px_s
  * Supervisor thread, no lock held.
  */
 static void
-on_host_gone(struct proxy *p, int32_t code)
+on_host_gone(struct proxy *p, int32_t code, bool orderly)
 {
 	struct px_output *outs = (struct px_output *)calloc(PX_MAX_OUTPUTS, sizeof(*outs));
 	struct px_sync *syncs = (struct px_sync *)calloc(PX_MAX_SYNCS, sizeof(*syncs));
@@ -1160,11 +1161,13 @@ on_host_gone(struct proxy *p, int32_t code)
 		p->ever_lost = true;
 		// The core keeps the provider's tasks WARMING(restarting) and re-warms on
 		// RESTORED: the respawn is owed even with nothing queued right now.
-		p->restart_owed = (code != 0 && code != CONV_HOST_EXIT_UPDATE) || p->luid_restart;
+		p->restart_owed = !orderly || p->luid_restart;
 		p->luid_restart = false;
 		p->luid_kill_sent = false;
 		os_mutex_unlock(&p->m);
-		conv_host_raise_event(&p->base, CONV_HOST_EV_LOST, code);
+		// An exit 0 nobody expected (a provider calling exit(0) mid-work) is a
+		// crash for the core too: report it as one.
+		conv_host_raise_event(&p->base, CONV_HOST_EV_LOST, !orderly && code == 0 ? -1 : code);
 	}
 }
 
@@ -1174,6 +1177,36 @@ on_host_gone(struct proxy *p, int32_t code)
  * Supervisor thread.
  *
  */
+
+/*!
+ * The host process exited with @p code: classify, tear down, tell the
+ * supervisor. An exit 0 with no demand is the host's own idle exit (orderly:
+ * no accounting, no respawn until demand); 20 is closed for update; an exit
+ * after our SHUTDOWN is orderly; anything else is a crash.
+ */
+static bool
+demand_locked(const struct proxy *p);
+static void
+report_terminal(struct proxy *p);
+
+static void
+host_exited(struct proxy *p, int32_t code)
+{
+	os_mutex_lock(&p->m);
+	const bool stopping = p->sup.state == CONV_SUP_STOPPING;
+	const bool idle = code == CONV_HOST_EXIT_ORDERLY && !stopping && !demand_locked(p);
+	const bool orderly = stopping || idle || code == CONV_HOST_EXIT_UPDATE;
+	os_mutex_unlock(&p->m);
+	on_host_gone(p, code, orderly);
+	os_mutex_lock(&p->m);
+	if (idle) {
+		conv_supervisor_idle_exited(&p->sup, now_ns());
+	} else {
+		conv_supervisor_exited(&p->sup, now_ns(), code);
+	}
+	os_mutex_unlock(&p->m);
+	report_terminal(p);
+}
 
 /*! Start the host. false: not running; *out_exit_code says how it ended
  *  (CONV_SUP_EXIT_SPAWN_FAILED when it never started, else the exit code of
@@ -1303,8 +1336,10 @@ sup_main(void *ptr)
 			p->breach = false;
 			conv_supervisor_watchdog_breach(&p->sup, t);
 		}
-		if (p->chan_broken) {
-			p->chan_broken = false;
+		const bool broken = p->chan_broken;
+		p->chan_broken = false;
+		struct os_process *broken_proc = broken ? p->proc : NULL;
+		if (broken && broken_proc == NULL) {
 			conv_supervisor_channel_broken(&p->sup, t);
 		}
 		if (p->luid_restart && !p->luid_kill_sent && p->proc != NULL) {
@@ -1321,6 +1356,20 @@ sup_main(void *ptr)
 		}
 		const bool poll_mutex = t >= p->next_maintenance_ns;
 		os_mutex_unlock(&p->m);
+
+		if (broken_proc != NULL) {
+			// A closed channel is how an exiting host looks first (its own idle
+			// exit, exit 20): give it a moment to finish and read its REAL code;
+			// only a host still there after that is killed (exit 30).
+			int32_t code = 0;
+			if (os_process_wait(broken_proc, PX_CHANNEL_EXIT_GRACE_MS, &code) == 1) {
+				host_exited(p, code);
+				continue;
+			}
+			os_mutex_lock(&p->m);
+			conv_supervisor_channel_broken(&p->sup, now_ns());
+			os_mutex_unlock(&p->m);
+		}
 
 #ifdef XRT_OS_WINDOWS
 		if (poll_mutex) {
@@ -1367,7 +1416,7 @@ sup_main(void *ptr)
 			conv_supervisor_spawned(&p->sup, now_ns(), started);
 			os_mutex_unlock(&p->m);
 			if (!ok) {
-				on_host_gone(p, code);
+				on_host_gone(p, code, false);
 				if (started) {
 					os_mutex_lock(&p->m);
 					conv_supervisor_exited(&p->sup, now_ns(), code);
@@ -1404,11 +1453,7 @@ sup_main(void *ptr)
 			int32_t code = 0;
 			const int w = os_process_wait(proc, (uint32_t)(wait_ns / 1000000ull) + 1u, &code);
 			if (w == 1) {
-				on_host_gone(p, code);
-				os_mutex_lock(&p->m);
-				conv_supervisor_exited(&p->sup, now_ns(), code);
-				os_mutex_unlock(&p->m);
-				report_terminal(p);
+				host_exited(p, code);
 			}
 		} else {
 			os_mutex_lock(&p->m);
@@ -2500,7 +2545,7 @@ px_destroy(struct conv_host **h_ptr)
 		(void)os_process_terminate(p->proc, CONV_HOST_EXIT_WATCHDOG);
 		int32_t code = 0;
 		(void)os_process_wait(p->proc, 3000, &code);
-		on_host_gone(p, code);
+		on_host_gone(p, code, true);
 	}
 	if (p->worker_started) {
 		os_thread_join(&p->worker);
