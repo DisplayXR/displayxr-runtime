@@ -224,6 +224,12 @@ if(TARGET comp_d3d11_lift)
 	# conversion core took over the lift thread. SKIPs without a D3D11 device.
 	list(APPEND tests tests_lift_dp_golden)
 endif()
+if(TARGET comp_d3d11_conv_host_lane)
+	# ADR-053 P2 (#2034) -- the satellite's D3D11 lane on WARP (debug layer when
+	# installed): the host fence is observed on the CPU before any copy, and a
+	# host that never signals costs a bounded CPU wait, never a GPU one.
+	list(APPEND tests tests_conv_host_lane_d3d11)
+endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	# ADR-053 S5 -- the reference view synthesis on WARP: a synthetic step edge
 	# rendered into 2 and 4 views, parallax checked against u_conv_viewsyn's
@@ -1252,6 +1258,9 @@ add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURC
 # the unit (no graphics API), like tests_comp_rear_budget.
 target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/u_conv_viewsyn.c)
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+if(TARGET tests_conv_host_lane_d3d11)
+	target_link_libraries(tests_conv_host_lane_d3d11 PRIVATE comp_d3d11_conv_host_lane d3d11 dxgi)
+endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
 endif()

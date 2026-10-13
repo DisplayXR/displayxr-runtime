@@ -115,7 +115,8 @@ struct CoreOps
 	uint64_t
 	stream(uint32_t task = XRT_CONV_TASK_VIEWS_MONO, uint32_t cap_id = 4)
 	{
-		REQUIRE(wait_until([&] { return row_state(cap_id) != XRT_CONV_STATE_UNKNOWN; }, 10000));
+		// A real host start costs seconds (its logger setup), more under a parallel ctest.
+		REQUIRE(wait_until([&] { return row_state(cap_id) != XRT_CONV_STATE_UNKNOWN; }, 40000));
 		xrt_conv_wire_stream_desc d{};
 		d.struct_size = sizeof(d);
 		d.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
@@ -206,7 +207,7 @@ struct Fixture : CoreOps
 		sc.backoff_initial_ns = 50 * MS;
 		sc.backoff_max_ns = 200 * MS;
 		sc.crash_loop_count = crash_loop;
-		sc.hello_timeout_ns = 10000 * MS;
+		sc.hello_timeout_ns = 30000 * MS;
 
 		static std::vector<std::string> keep;
 		keep = extra;
