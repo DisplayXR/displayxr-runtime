@@ -32,9 +32,14 @@
  *
  * State is a plain copy of xrt_dp_lift_caps::module_status (values equal
  * XRT_CONV_STATE_*, asserted); without one: READY → READY, ACTIVATING →
- * WARMING, UNAVAILABLE → ABSENT. "No module" is ABSENT and RETRYABLE: the
- * readiness machine's backoff re-warms, and every warm re-resolves the
- * factory from the plug-in that registered it (G5: no latch).
+ * WARMING, UNAVAILABLE → ABSENT. #2029 keeps three cases apart: the kill
+ * switch (DXR_LIFT=0 / DXR_CONV=0) is DISABLED, not retryable -> terminal
+ * ABSENT(policy); a module that itself answers ABSENT is not retryable ->
+ * terminal ABSENT(model); "the factory found no module" stays ABSENT and
+ * RETRYABLE -> FAILED(model) with the backoff, so a module installed later is
+ * picked up without a restart (G5). Every warm re-resolves the factory from
+ * the plug-in that registered it; a registry change (ConversionProviders or
+ * DisplayProcessors), `conv warm` or a re-attached backend retries at once.
  *
  * @ingroup aux_conversion
  */

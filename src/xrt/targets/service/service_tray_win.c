@@ -7,6 +7,7 @@
  */
 
 #include "service_tray_win.h"
+#include "service_conversion.h"
 #include "service_orchestrator.h"
 #include "service_workspace_registry.h"
 
@@ -1006,6 +1007,9 @@ reg_watch_thread_body(LPVOID param)
 		}
 		if (w == WAIT_OBJECT_0 + 1 && watching_root) {
 			ipc_server_request_display_reprobe("plug-in registration changed");
+			// #2029: a vendor installer (its conversion module with it) touches
+			// only DisplayProcessors: the dp-lift rows retry on it too.
+			service_conversion_display_plugins_changed();
 		}
 	}
 	CloseHandle(ev);

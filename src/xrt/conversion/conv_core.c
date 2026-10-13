@@ -192,6 +192,24 @@ conv_core_request_warm_locked(struct conv_core *core, uint32_t provider, uint32_
 	}
 }
 
+/*! The provider's own answer is "unavailable, and retrying will not help"
+ *  (ABSENT / DISABLED with retryable = 0): a terminal state, not a failure. */
+static bool
+declared_absent(const struct xrt_conv_state *st)
+{
+	return st->retryable == 0 && (st->state == XRT_CONV_STATE_ABSENT || st->state == XRT_CONV_STATE_DISABLED);
+}
+
+//! ABSENT(policy) for a provider-side DISABLED (a kill switch), else the provider's reason (model).
+static uint32_t
+declared_reason(const struct xrt_conv_state *st)
+{
+	if (st->state == XRT_CONV_STATE_DISABLED) {
+		return CONV_REASON_POLICY;
+	}
+	return st->failure_reason != 0 ? st->failure_reason : XRT_CONV_FAIL_MODEL;
+}
+
 static bool
 warm_is_cancelled(void *ctx)
 {
@@ -219,6 +237,18 @@ warm_done(struct conv_host_cmd *cmd)
 	if (!op->cancel && !core->stop) {
 		if (cmd->result == XRT_SUCCESS && (!have_state || st.state == XRT_CONV_STATE_READY)) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
+			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
+		} else if (have_state && declared_absent(&st)) {
+			// #2029: the provider says it is not there and a retry will not
+			// change that: terminal ABSENT, not FAILED + the 15 s backoff loop
+			// that kept a spec-3 caller at ACTIVATING forever. DISABLED (a kill
+			// switch) is policy; ABSENT is the provider's own reason (model).
+			U_LOG_I(
+			    "[conv] %s cap %u: the provider declares it unavailable (%s); terminal until a registry "
+			    "change or `conv warm`",
+			    core->reg.providers[op->provider].id, op->cap_id, st.detail[0] != '\0' ? st.detail : "-");
+			struct conv_readiness_event ev = mk_ev(CONV_EV_DECLARED_ABSENT, t);
+			ev.reason = declared_reason(&st);
 			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
 		} else if (cmd->result != XRT_SUCCESS || st.state == XRT_CONV_STATE_FAILED ||
 		           conv_state_is_terminal(st.state)) {
@@ -396,8 +426,17 @@ sync_states_locked(struct conv_core *core, uint32_t provider)
 		if (st.state == XRT_CONV_STATE_READY && row->rd.state == XRT_CONV_STATE_INSTALLED) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
 			apply_locked(core, i, &ev);
+		} else if (st.state == XRT_CONV_STATE_DISABLED && declared_absent(&st) &&
+		           row->rd.state == XRT_CONV_STATE_INSTALLED &&
+		           !(provider < CONV_REGISTRY_MAX_PROVIDERS && core->retrying[provider])) {
+			// A kill switch the provider reports before any warm: terminal at
+			// once (v3 UNAVAILABLE without first going through a warm).
+			struct conv_readiness_event ev = mk_ev(CONV_EV_DECLARED_ABSENT, t);
+			ev.reason = CONV_REASON_POLICY;
+			apply_locked(core, i, &ev);
 		} else if (st.state == XRT_CONV_STATE_ABSENT && row->rd.state == XRT_CONV_STATE_INSTALLED &&
 		           !(provider < CONV_REGISTRY_MAX_PROVIDERS && core->retrying[provider])) {
+			// Terminal already (no timer); a re-describe that finds it lifts it.
 			struct conv_readiness_event ev = mk_ev(CONV_EV_DESCRIBE_FAILED, t);
 			ev.reason = st.failure_reason != 0 ? st.failure_reason : XRT_CONV_FAIL_MODEL;
 			apply_locked(core, i, &ev);
