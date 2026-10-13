@@ -741,6 +741,10 @@ jobs:
             exit 1
           }
           Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / ABI mismatch rejected and fallen through."
+          # Explicit: the pwsh step otherwise exits with the LAST native command's
+          # code, and the finally block's best-effort `reg delete` of an
+          # already-removed value legitimately returns 1.
+          exit 0
 
       # The DisplayXR Dashboard (src/dashboard, Avalonia/.NET) is published into
       # _package/bin before the installer is packed, so the installer ships it.
