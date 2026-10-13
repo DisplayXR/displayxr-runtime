@@ -73,6 +73,7 @@
 
 #include "oxr_objects.h"
 #include "oxr_session_window_binding.h"
+#include "oxr_workspace_window_linux.h"
 #include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
@@ -6778,6 +6779,43 @@ oxr_session_create(struct oxr_logger *log,
 			ShowWindow(hwnd, SW_HIDE);
 			U_LOG_W("Workspace session: HWND %p hidden (decorations preserved)", hwnd);
 		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Desktop-Linux twin of the SW_HIDE block above, same gate: in a workspace
+	// session the service composites this app, so its own window must not show.
+	// X11 windows are withdrawn here; an app-owned Wayland surface cannot be
+	// unmapped safely from outside the app (see oxr_workspace_window_linux.c),
+	// so that leg only logs and relies on the app not mapping it. A later
+	// standalone session on a window withdrawn here maps it again.
+	{
+		const char *workspace_session = getenv("DISPLAYXR_WORKSPACE_SESSION");
+		bool ws_active = workspace_session != NULL && strcmp(workspace_session, "1") == 0 &&
+		                 sys->xsysc != NULL && sys->xsysc->info.workspace_mode;
+		void *ws_x_display = NULL;
+		unsigned long ws_x_window = 0;
+		bool ws_have_wayland = false;
+#if defined(OXR_HAVE_DXR_xlib_window_binding)
+		const XrXlibWindowBindingCreateInfoDXR *ws_xlib = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR, XrXlibWindowBindingCreateInfoDXR);
+		if (ws_xlib != NULL) {
+			ws_x_display = (void *)ws_xlib->xDisplay;
+			ws_x_window = (unsigned long)ws_xlib->window;
+		}
+#endif
+#if defined(OXR_HAVE_DXR_wayland_surface_binding)
+		const XrWaylandSurfaceBindingCreateInfoDXR *ws_wl = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR, XrWaylandSurfaceBindingCreateInfoDXR);
+		ws_have_wayland = ws_wl != NULL && ws_wl->wlSurface != NULL;
+		if (ws_have_wayland) {
+			// The Wayland binding wins over an (implausible) xlib one,
+			// matching oxr_session_create_impl's precedence.
+			ws_x_display = NULL;
+			ws_x_window = 0;
+		}
+#endif
+		oxr_workspace_linux_app_window_on_session_create(ws_x_display, ws_x_window, ws_have_wayland, ws_active);
 	}
 #endif
 
