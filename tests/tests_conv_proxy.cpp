@@ -136,6 +136,15 @@ struct CoreOps
 		return ri < 0 ? XRT_CONV_STATE_UNKNOWN : reg.rows[ri].rd.state;
 	}
 
+	bool
+	row_restarting(uint32_t cap_id = 4)
+	{
+		static conv_registry reg;
+		conv_core_copy_registry(c, &reg);
+		const int32_t ri = conv_registry_find_row(&reg, 0, cap_id);
+		return ri >= 0 && reg.rows[ri].rd.restarting;
+	}
+
 	uint32_t
 	row_reason(uint32_t cap_id = 4)
 	{
@@ -529,6 +538,8 @@ TEST_CASE("proxy: exit 20 = WARMING(updating); no respawn while the maintenance 
 	CHECK(fx.sup().state == CONV_SUP_UPDATING);
 	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING);
 	CHECK(fx.sup().restarts == 0u); // no crash accounting
+	// (The frame in flight when the host exited is its one casualty.)
+	const uint64_t failed_at_update = fx.stats(sid).failed;
 
 	// Held: the producer keeps submitting on a valid handle; nothing respawns,
 	// for well past the 1 Hz probe and any backoff.
@@ -541,6 +552,28 @@ TEST_CASE("proxy: exit 20 = WARMING(updating); no respawn while the maintenance 
 	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING);
 	conv_stream_stats st0{};
 	CHECK(conv_core_stream_get_stats(fx.c, sid, &st0) == XRT_SUCCESS);
+
+	// No unbounded waits: a command to a host that is down is refused at once
+	// (well under 1 ms), and the frames above stayed pending, never failed.
+	CHECK(conv_host_is_down(fx.host));
+	{
+		conv_host_cmd probe{};
+		probe.op = CONV_OP_WARM;
+		probe.cap_id = 4;
+		probe.on_complete = [](conv_host_cmd *) {};
+		const uint64_t t0 = now_ns();
+		const xrt_result_t pr = fx.host->ops->submit(fx.host, &probe);
+		const uint64_t dt = now_ns() - t0;
+		CHECK(pr != XRT_SUCCESS);
+		CHECK((probe.blocked & CONV_CMD_HOST_DOWN) != 0u);
+		CHECK(dt < 1 * MS);
+	}
+	{
+		const uint64_t t0 = now_ns();
+		CHECK(fx.submit(sid, 0x64));
+		CHECK(now_ns() - t0 < 1 * MS);
+	}
+	CHECK(st0.failed == failed_at_update);
 
 	SECTION("a registration change clears the update gate, the spawn still waits for the mutex")
 	{
@@ -565,6 +598,69 @@ TEST_CASE("proxy: exit 20 = WARMING(updating); no respawn while the maintenance 
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 	std::remove(marker.c_str());
 }
+
+#ifdef _WIN32
+TEST_CASE("proxy: RmForceShutdown of a host that cannot answer is the crash path", "[conv_proxy]")
+{
+	// #2056: a provider dependency's non-pumping window makes Restart Manager
+	// kill the host. Whatever exit code Windows reports for that kill, the core
+	// follows the supervisor's verdict (abnormal: WARMING(restarting)), never the
+	// raw code, and the respawn waits for the maintenance mutex.
+	char id[48];
+	std::snprintf(id, sizeof(id), "sat-rmforce-%lu", (unsigned long)os_process_current_pid());
+	std::string host_copy(CONV_PROXY_HOST);
+	host_copy.replace(host_copy.size() - 4, 4, std::string("-") + id + ".exe");
+	REQUIRE(CopyFileA(CONV_PROXY_HOST, host_copy.c_str(), FALSE));
+	{
+		g_maint_held = false;
+		Fixture fx({"--fake-rm-unresponsive", "1"}, 0, 5, host_copy.c_str(), id, "scripted", true, nullptr, true);
+		const uint64_t sid = fx.stream();
+		conv_result r{};
+		REQUIRE(fx.convert(sid, 0x71, &r));
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		const uint32_t restarts = fx.sup().restarts;
+		conv_supervisor_status sst{};
+		long host_pid = 0;
+		conv_host_proxy_get_status(fx.host, &sst, &host_pid);
+		REQUIRE(host_pid > 0);
+
+		std::wstring wfile(host_copy.begin(), host_copy.end());
+		for (auto &ch : wfile) {
+			ch = ch == L'/' ? L'\\' : ch;
+		}
+		DWORD session = 0;
+		WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
+		REQUIRE(RmStartSession(&session, 0, key) == ERROR_SUCCESS);
+		LPCWSTR files[1] = {wfile.c_str()};
+		REQUIRE(RmRegisterResources(session, 1, files, 0, nullptr, 0, nullptr) == ERROR_SUCCESS);
+		g_maint_held = true; // the installer's session
+		const uint64_t t0 = now_ns();
+		const DWORD rs = RmShutdown(session, RmForceShutdown, nullptr);
+		const uint64_t dt_ms = (now_ns() - t0) / MS;
+		REQUIRE(wait_until([&] { return fx.sup().restarts > restarts; }, 30000));
+		const int32_t raw = fx.sup().last_exit;
+		std::fprintf(stderr, "RmForceShutdown: result %lu after %llu ms; exit code seen by the supervisor %d (0x%x)\n",
+		             (unsigned long)rs, (unsigned long long)dt_ms, (int)raw, (unsigned)raw);
+		UNSCOPED_INFO("RmShutdown(RmForceShutdown) = " << rs << " after " << dt_ms << " ms; exit code " << raw);
+		CHECK(rs == ERROR_SUCCESS);
+		CHECK(fx.sup().state == CONV_SUP_BACKOFF); // abnormal, waiting for the mutex
+		REQUIRE(wait_until([&] { return fx.row_restarting(); }, 5000));
+		CHECK(fx.row_state() == XRT_CONV_STATE_WARMING);
+		CHECK(fx.row_reason() == 0u); // restarting, not updating
+		sleep_ms(1200);
+		CHECK(fx.sup().state == CONV_SUP_BACKOFF); // no respawn while held
+		CHECK(RmEndSession(session) == ERROR_SUCCESS);
+
+		g_maint_held = false;
+		REQUIRE(fx.convert(sid, 0x72, &r, 20000));
+		check_views(r, 0x72);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		CHECK(fx.row_state() == XRT_CONV_STATE_READY);
+		REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	}
+	(void)DeleteFileA(host_copy.c_str());
+}
+#endif
 
 
 #if defined(CONV_REAL_HOST_EXE) && defined(SIM_CONVERSION_PATH)
