@@ -84,6 +84,10 @@ struct comp_vk_native_wl_window_rect
 	 * Mutter's buffer rect when the publisher reports it, else the frame
 	 * (#1654): with client-side decorations the frame includes a title bar
 	 * that is not part of the surface. Undecorated, the two are equal.
+	 *
+	 * When the publisher sends `buffer_device` (#1991), this is that rect
+	 * as sent — where the compositor paints the surface — and no
+	 * conversion is involved (@ref from_buffer_device).
 	 */
 	int32_t left_px, top_px;
 	//! Content size in DEVICE px (same source as the origin).
@@ -97,6 +101,9 @@ struct comp_vk_native_wl_window_rect
 	//! below). The monitor scale in Mutter's LOGICAL layout mode, 1.0 in its
 	//! PHYSICAL mode — where the wire values already are device px.
 	float scale;
+	//! left_px..height_px are the publisher's `buffer_device` (#1991), not
+	//! the conversion of the logical content rect.
+	bool from_buffer_device;
 	//! The committed SURFACE's size in DEVICE px (the compositor's buffer rect
 	//! for the window), or 0 when the publisher does not report it. Differs
 	//! from width_px/height_px when the client's buffer is not mapped to its
@@ -125,7 +132,11 @@ struct comp_vk_native_wl_window_rect
 	 * publisher's global layout. `left_px == u_wl_logical_to_px(
 	 * content_logical_x - mon_logical_x, scale)`: what a logical move of the
 	 * window does in device pixels at ANY scale (#1609), which is what the
-	 * drop-time snap searches over.
+	 * drop-time snap searches over. With @ref from_buffer_device that
+	 * equality can be one pixel off at rest (a compositor that keeps window
+	 * positions fractional), and holds again after a
+	 * @ref comp_vk_native_wl_geom_move_window: the publisher places the frame
+	 * so the content lands on exactly that conversion (spec §7.1).
 	 */
 	int32_t content_logical_x, content_logical_y;
 	int32_t mon_logical_x, mon_logical_y;
