@@ -311,6 +311,11 @@ if(TARGET ipc_server_conv)
 	# #2003 -- the legacy DP-lift adapter + the legacy golden replay through the
 	# core and the v3 route, with a scripted lift-thread backend (no GPU).
 	list(APPEND tests tests_conv_dp_lift)
+	# #2054 -- XR_DXR_lift spec 4 at the conv_* adapter: the create rules, the
+	# opt-in / ordered / deduplicated task events, ProvidersChanged on an
+	# install, the depth-kind contract; and the four v3-observable shifts as
+	# golden tests (spec XR_DXR_lift.md section 14.2).
+	list(APPEND tests tests_ipc_conv_v4 tests_lift_v3_shifts)
 endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
@@ -1361,6 +1366,15 @@ if(TARGET tests_conv_dp_lift)
 	target_link_libraries(tests_conv_dp_lift PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
 	set_target_properties(tests_conv_dp_lift PROPERTIES CXX_STANDARD 17)
 endif()
+foreach(_t tests_ipc_conv_v4 tests_lift_v3_shifts)
+	if(TARGET ${_t})
+		target_sources(${_t} PRIVATE conv_fake_provider.c)
+		target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+		                                          ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+		target_link_libraries(${_t} PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os xrt-external-openxr)
+		set_target_properties(${_t} PROPERTIES CXX_STANDARD 17)
+	endif()
+endforeach()
 if(TARGET tests_ipc_lift_core)
 	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
 	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

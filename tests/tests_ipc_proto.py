@@ -33,6 +33,10 @@ def _load():
     return proto, Proto
 
 
+
+#: XR_DXR_lift spec 4 (#2054): the conv_* family, appended in this order.
+SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm', 'conv_stream_create', 'conv_stream_reset', 'conv_acquire_result', 'conv_poll_event']
+
 class GeneratorMixedHandlesTest(unittest.TestCase):
 
     @classmethod
@@ -165,7 +169,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_window_placement", "workspace_get_window_placement",
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
-                 "conv_warm")
+                 "conv_warm") + tuple(SPEC4_CONV_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -211,7 +215,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # appended, so every earlier command keeps its enum value (only phase
         # 8's three calls, #1884's weave_get_segments and ADR-052's three
         # workspace-screen calls follow it).
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-16], "system_request_display_reprobe")
         call = self._call("system_request_display_reprobe")
         self.assertEqual(call.in_args, [])
@@ -227,7 +231,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # status out), and a hotkey-capture box takes the launch hook out /
         # puts it back (one bool in). Session-free, DIAG only; only #1884's
         # weave_get_segments and ADR-052's workspace-screen calls follow them.
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-15:-12], ["system_reload_service_config", "system_workspace_launch",
                                         "system_workspace_hotkey_suspend"])
         suspend = self._call("system_workspace_hotkey_suspend")
@@ -258,8 +262,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # XrWeaveOutputRectPartsDXR never sends it (weave_submit's reply only
         # gained a trailing count, below). The table is the per-segment views'
         # struct.
-        names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-12], "weave_get_segments")  # ADR-052's four calls, ADR-053's three, ADR-046 Phase 4's, then #2051's and #2029's conv_warm follow it
+        names = self._names_before_spec4()
+        self.assertEqual(names[-12], "weave_get_segments")  # ADR-052's four calls, ADR-053's three, then ADR-046 Phase 4's follow it
         call = self._call("weave_get_segments")
         self.assertEqual(call.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in call.out_args],
@@ -273,9 +277,9 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # the screen enumeration and the per-screen placement pair ride at the
         # END of proto.json, so every earlier command keeps its enum value. A
         # pre-v25 controller sends none of them; set_window_pose is untouched.
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-11:-8], ["workspace_enumerate_screens", "workspace_set_window_placement",
-                                         "workspace_get_window_placement"])
+                                        "workspace_get_window_placement"])
         enum = self._call("workspace_enumerate_screens")
         self.assertEqual(enum.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in enum.out_args],
@@ -301,8 +305,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # screen): a screen-tagged overlay crosses as its own call APPENDED at
         # the end -- the untagged workspace_set_overlay keeps its enum value and
         # its wire form, so a pre-v26 controller sends exactly what it always did.
-        names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-8], "workspace_set_overlay_on_screen")  # ADR-053's three calls, ADR-046 Phase 4's, then #2051's and #2029's conv_warm follow it
+        names = self._names_before_spec4()
+        self.assertEqual(names[-8], "workspace_set_overlay_on_screen")  # ADR-053's three calls, then ADR-046 Phase 4's, follow it
         call = self._call("workspace_set_overlay_on_screen")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("info", "struct ipc_workspace_overlay_info"), ("screen_id", "uint64_t")])
@@ -318,9 +322,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # ADR-053 (#2006): the status snapshot's conversion rows cross one per
         # reply, by index (each under the 1 KB DIAG limit), APPENDED at the end
         # so every earlier command keeps its enum value. Session-free, DIAG only;
-        # the head carries only the two row counts. #2005's conv_hint_interest, ADR-046 Phase 4's calls and
-        # #2051's reselect follow.
-        names = [c.name for c in self.p.calls]
+        # the head carries only the two row counts. #2005's conv_hint_interest and ADR-046 Phase 4's call follow.
+        names = self._names_before_spec4()
         self.assertEqual(names[-7:-5], ["system_get_conv_provider_row", "system_get_conv_task_row"])
         prov = self._call("system_get_conv_provider_row")
         task = self._call("system_get_conv_task_row")
@@ -336,13 +339,43 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
+    def _names_before_spec4(self):
+        """Command names up to the spec-4 conv_* family (#2054), which is
+        appended after conv_hint_interest; the older end-relative pins read
+        against this prefix."""
+        names = [c.name for c in self.p.calls]
+        return names[:names.index("conv_hint_interest") + 1]
+
+    def test_spec4_conv_family_is_appended(self):
+        # XR_DXR_lift spec 4 (#2054): the conv_* family rides at the END,
+        # after conv_hint_interest, so every v3 lift_* message keeps its enum
+        # value and wire form. No handles: spec-4 streams use the v3
+        # submit / export calls.
+        names = [c.name for c in self.p.calls]
+        i = names.index("conv_hint_interest")
+        self.assertEqual(names[i + 1:], SPEC4_CONV_CALLS)
+        for name in SPEC4_CONV_CALLS:
+            call = self._call(name)
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, name)
+        create = self._call("conv_stream_create")
+        self.assertEqual([(a.name, a.typename) for a in create.in_args],
+                         [("desc", "struct xrt_conv_wire_stream_desc"), ("required_outputs", "uint64_t"),
+                          ("legacy_mode", "uint32_t"), ("input_scale", "float")])
+        acquire = self._call("conv_acquire_result")
+        self.assertEqual([(a.name, a.typename) for a in acquire.out_args],
+                         [("ready", "bool"), ("discontinuity", "bool"), ("lift_result", "struct ipc_lift_result"),
+                          ("meta", "struct xrt_conv_wire_result")])
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        for name in SPEC4_CONV_CALLS:
+            self.assertIn("ipc_handle_%s(" % name, text)
+
     def test_conv_hint_interest_is_appended(self):
         # ADR-053 (#2005): the conversion prewarm trigger rides as its own call
         # APPENDED after the two conversion DIAG row calls (#2006), so every
         # earlier command -- every v3 lift_* message among them -- keeps its
         # enum value and wire form. One fixed-size request, no reply payload,
         # no handles.
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-7:-4], ["system_get_conv_provider_row", "system_get_conv_task_row",
                                       "conv_hint_interest"])
         call = self._call("conv_hint_interest")
@@ -359,7 +392,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # only on a frame that armed it - a client that never asks sends nothing.
         # The reply is the service's answer to the PREVIOUS request (#1952).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-4], "compositor_set_cursor_draw_request")  # Amendment 3's call, then #2051's and #2029's conv_warm follow it
+        self.assertEqual(names[-4], "compositor_set_cursor_draw_request")  # Amendment 3's call follows it
         call = self._call("compositor_set_cursor_draw_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("request", "struct ipc_cursor_draw_request")])
@@ -376,7 +409,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # asks sends nothing. The reply is the service's newest finished
         # measurement (one to three frames old).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-3], "compositor_set_cursor_measure_request")  # #2051's reselect, then #2029's conv_warm, follow it
+        self.assertEqual(names[-3], "compositor_set_cursor_measure_request")
         call = self._call("compositor_set_cursor_measure_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("request", "struct ipc_cursor_measure_request")])
@@ -385,21 +418,6 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertFalse(call.in_handles or call.out_handles or call.varlen)
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         self.assertIn("ipc_handle_compositor_set_cursor_measure_request(", text)
-
-    def test_component_reselect_is_appended(self):
-        # ADR-054 N3d (#2051): `dp|input|conv use|reset|enable|disable` asks the
-        # running service to re-read ONE class's Enabled / Preferred policy and
-        # re-select now. One class-id in (TARGET_COMPONENT_CLASS_*), no reply
-        # payload, session-free, DIAG only -- APPENDED at the end so every
-        # earlier command keeps its enum value.
-        names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-2], "system_request_component_reselect")
-        call = self._call("system_request_component_reselect")
-        self.assertEqual([(a.name, a.typename) for a in call.in_args], [("component_class", "uint32_t")])
-        self.assertEqual(call.out_args, [])
-        self.assertFalse(call.in_handles or call.out_handles or call.varlen)
-        text = self._generate("generate_server_c", "ipc_server_generated.c")
-        self.assertIn("ipc_handle_system_request_component_reselect(", text)
 
     def test_weave_submit_split_signal_is_trailing(self):
         # ADR-047 Amendment 4 addendum: weave_submit's reply APPENDS the
@@ -421,17 +439,24 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])
 
 
-    def test_conv_warm_is_appended(self):
-        # #2029: `displayxr-cli conv warm` rides its own DIAG call, APPENDED
-        # at the very end (every earlier command keeps its enum value): after
-        # conv_hint_interest, the two cursor calls (ADR-046) and #2051's
-        # component reselect. The request is the wire's conv_warm struct
-        # (xrt_conv_wire_task_request); the reply is the selected row's readiness
-        # before and right after the request. No handles, nothing variable-length.
-        names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-1], "conv_warm")
+    def test_component_reselect_is_appended(self):
+        # ADR-054 N3d (#2051): the DIAG component re-select rides as its own call
+        # after the two cursor calls; only #2029's DIAG conv_warm and the spec-4
+        # family (appended later) follow it.
+        names = self._names_before_spec4()
         self.assertEqual(names[-2], "system_request_component_reselect")
-        self.assertEqual(names[-5], "conv_hint_interest")
+        call = self._call("system_request_component_reselect")
+        self.assertEqual([(a.name, a.typename) for a in call.in_args], [("component_class", "uint32_t")])
+        self.assertEqual(call.out_args, [])
+        self.assertFalse(call.in_handles or call.out_handles or call.varlen)
+
+    def test_conv_warm_diag_is_appended(self):
+        # #2029: `displayxr-cli conv warm` rides its own DIAG call (the request is
+        # the wire's task request; the reply is the selected row's readiness before
+        # and right after). It is the last call before the spec-4 family, whose own
+        # session warm is conv_request_warm (no reply payload).
+        names = self._names_before_spec4()
+        self.assertEqual(names[-1], "conv_warm")
         call = self._call("conv_warm")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("request", "struct xrt_conv_wire_task_request")])
@@ -440,6 +465,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertFalse(call.in_handles or call.out_handles or call.varlen)
         text = self._generate("generate_server_c", "ipc_server_generated.c")
         self.assertIn("ipc_handle_conv_warm(", text)
+        self.assertIn("ipc_handle_conv_request_warm(", text)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

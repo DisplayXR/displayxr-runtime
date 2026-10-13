@@ -15,6 +15,7 @@
 #include "conversion/conv_select.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_lift_depth.h"
 #include "util/u_lift_mailbox.h"
@@ -68,6 +69,28 @@ struct sc_stream
 	uint32_t blob_format;
 	uint64_t blob_frame_id;
 	int64_t blob_source_time;
+
+	/* Spec 4 (#2054): created by conv_stream_create (a task stream). */
+	bool v4;
+	uint32_t task; //!< XRT_CONV_TASK_*
+};
+
+//! Pending event ids per connection (tasks + the providers pseudo-id, each once).
+#define SC_EV_FIFO_MAX 16u
+
+//! One connection's spec-4 event state (opt-in latch, FIFO, last delivered).
+struct sc_client_ev
+{
+	bool used;
+	bool latched;
+	uint64_t client_id;
+	uint64_t status_gen;
+	uint32_t fifo_count;
+	uint32_t fifo[SC_EV_FIFO_MAX];
+	uint32_t last_state[XRT_CONV_TASK_RESERVED_FIRST];
+	uint32_t last_reason[XRT_CONV_TASK_RESERVED_FIRST];
+	float last_progress[XRT_CONV_TASK_RESERVED_FIRST];
+	uint64_t last_progress_ns[XRT_CONV_TASK_RESERVED_FIRST];
 };
 
 struct ipc_server_conv
@@ -80,6 +103,12 @@ struct ipc_server_conv
 	void *gpu_hook_ud;
 	uint64_t next_wire;
 	struct sc_stream streams[IPC_SERVER_CONV_MAX_STREAMS];
+
+	//! Spec-4 events: a leaf lock of its own, because the core calls
+	//! ipc_server_conv_on_event with its locks held while this module may hold
+	//! mtx across a core call (install / removal).
+	struct os_mutex ev_mtx;
+	struct sc_client_ev ev[IPC_SERVER_CONV_MAX_CLIENTS];
 };
 
 static struct ipc_server_conv *g_sc;
@@ -364,6 +393,11 @@ ipc_server_conv_create(struct conv_core *core, struct ipc_server_conv **out_sc)
 		free(sc);
 		return XRT_ERROR_ALLOCATION;
 	}
+	if (os_mutex_init(&sc->ev_mtx) != 0) {
+		os_mutex_destroy(&sc->mtx);
+		free(sc);
+		return XRT_ERROR_ALLOCATION;
+	}
 	sc->core = core;
 	sc->next_wire = 1;
 	*out_sc = sc;
@@ -398,6 +432,7 @@ ipc_server_conv_destroy(struct ipc_server_conv **sc_ptr)
 		}
 		s->used = false;
 	}
+	os_mutex_destroy(&sc->ev_mtx);
 	os_mutex_destroy(&sc->mtx);
 	free(sc);
 }
@@ -939,12 +974,15 @@ ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
 	return conv_core_stream_commit_submit(sc->core, st.core_id, slot.slot, &fr, out_frame_id);
 }
 
-xrt_result_t
-ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
-                             uint64_t client_id,
-                             uint64_t stream_id,
-                             bool *out_ready,
-                             struct ipc_lift_result *out)
+/*! The v3 acquire; @p keep (optional) receives the result's metadata for the
+ *  spec-4 acquire (its image pointers are stale once this returns). */
+static xrt_result_t
+lift_acquire_common(struct ipc_server_conv *sc,
+                    uint64_t client_id,
+                    uint64_t stream_id,
+                    bool *out_ready,
+                    struct ipc_lift_result *out,
+                    struct conv_result *keep)
 {
 	*out_ready = false;
 	memset(out, 0, sizeof(*out));
@@ -964,6 +1002,9 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 	}
 	if (xret != XRT_SUCCESS) {
 		return xret;
+	}
+	if (keep != NULL) {
+		*keep = r;
 	}
 	struct ipc_server_conv_published pub;
 	memset(&pub, 0, sizeof(pub));
@@ -1044,6 +1085,16 @@ ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
 		        : 0u;
 	}
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_server_conv_lift_acquire(struct ipc_server_conv *sc,
+                             uint64_t client_id,
+                             uint64_t stream_id,
+                             bool *out_ready,
+                             struct ipc_lift_result *out)
+{
+	return lift_acquire_common(sc, client_id, stream_id, out_ready, out, NULL);
 }
 
 bool
@@ -1227,6 +1278,9 @@ ipc_server_conv_warm(struct ipc_server_conv *sc, uint32_t task, uint32_t *out_pr
 	return conv_core_warm_task_explicit(sc->core, task, out_prev_state, out_state);
 }
 
+static void
+v4_client_gone(struct ipc_server_conv *sc, uint64_t client_id);
+
 void
 ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 {
@@ -1253,4 +1307,575 @@ ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 			io.stream_gone(io.ud, gone[i]);
 		}
 	}
+	v4_client_gone(sc, client_id); // its event latch and queue
+}
+
+
+/*
+ *
+ * Spec 4 (ADR-053 P3, #2054): the conv_* family.
+ *
+ */
+
+//! Pseudo-task id of a queued PROVIDERS_CHANGED in a connection's event FIFO.
+#define SC_EV_PROVIDERS 0u
+//! Progress events: at least this much movement, at most this often.
+#define SC_EV_PROGRESS_STEP 0.05f
+#define SC_EV_PROGRESS_MIN_NS (500ull * 1000ull * 1000ull)
+
+static bool
+v4_task_is_stream_task(uint32_t task)
+{
+	return task == XRT_CONV_TASK_DEPTH_MONO || task == XRT_CONV_TASK_DEPTH_VIDEO || task == XRT_CONV_TASK_VIEWS_MONO;
+}
+
+//! Spec-4 tasks an app may name at all (spec-5 and reserved ones are a validation failure).
+static bool
+v4_task_is_spec4(uint32_t task)
+{
+	return v4_task_is_stream_task(task) || task == XRT_CONV_TASK_SPLATS_MONO;
+}
+
+static bool
+v4_state_is_waiting(uint32_t state)
+{
+	return state == XRT_CONV_STATE_WARMING || state == XRT_CONV_STATE_DOWNLOADING;
+}
+
+//! The connection's event slot; @p create makes one. Called with ev_mtx held.
+static struct sc_client_ev *
+ev_slot_locked(struct ipc_server_conv *sc, uint64_t client_id, bool create)
+{
+	struct sc_client_ev *free_slot = NULL;
+	for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_CLIENTS; i++) {
+		struct sc_client_ev *e = &sc->ev[i];
+		if (e->used && e->client_id == client_id) {
+			return e;
+		}
+		if (!e->used && free_slot == NULL) {
+			free_slot = e;
+		}
+	}
+	if (!create || free_slot == NULL) {
+		return NULL;
+	}
+	memset(free_slot, 0, sizeof(*free_slot));
+	free_slot->used = true;
+	free_slot->client_id = client_id;
+	return free_slot;
+}
+
+//! Queue @p id (a task, or SC_EV_PROVIDERS) once: a FIFO without duplicates.
+static void
+ev_queue_locked(struct sc_client_ev *e, uint32_t id)
+{
+	for (uint32_t i = 0; i < e->fifo_count; i++) {
+		if (e->fifo[i] == id) {
+			return; // already pending: the delivery reads the state then, so a repeat adds nothing
+		}
+	}
+	if (e->fifo_count < SC_EV_FIFO_MAX) {
+		e->fifo[e->fifo_count++] = id;
+	}
+}
+
+void
+ipc_server_conv_v4_latch(struct ipc_server_conv *sc, uint64_t client_id)
+{
+	if (sc == NULL || client_id == 0) {
+		return;
+	}
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	const bool latched = e != NULL && e->latched;
+	os_mutex_unlock(&sc->ev_mtx);
+	if (latched) {
+		return;
+	}
+
+	// The baseline: what the app's first spec-4 query sees. Events report
+	// changes FROM it (no core call under ev_mtx).
+	uint32_t state[XRT_CONV_TASK_RESERVED_FIRST];
+	uint32_t reason[XRT_CONV_TASK_RESERVED_FIRST];
+	float progress[XRT_CONV_TASK_RESERVED_FIRST];
+	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
+		struct xrt_conv_wire_task_desc d;
+		state[t] = XRT_CONV_STATE_ABSENT;
+		reason[t] = 0;
+		progress[t] = -1.0f;
+		if (conv_core_get_task_desc(sc->core, t, &d)) {
+			state[t] = d.state;
+			reason[t] = d.failure_reason;
+			progress[t] = d.progress;
+		}
+	}
+	struct xrt_conv_wire_generation gen;
+	conv_core_get_generation(sc->core, &gen);
+
+	os_mutex_lock(&sc->ev_mtx);
+	e = ev_slot_locked(sc, client_id, true);
+	if (e != NULL && !e->latched) {
+		e->latched = true;
+		e->status_gen = gen.status_gen;
+		for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
+			e->last_state[t] = state[t];
+			e->last_reason[t] = reason[t];
+			e->last_progress[t] = progress[t];
+		}
+	} else if (e == NULL) {
+		U_LOG_W("[conv] spec 4: more than %u connections opted into lift events; this one gets none",
+		        IPC_SERVER_CONV_MAX_CLIENTS);
+	}
+	os_mutex_unlock(&sc->ev_mtx);
+}
+
+bool
+ipc_server_conv_v4_latched(struct ipc_server_conv *sc, uint64_t client_id)
+{
+	if (sc == NULL) {
+		return false;
+	}
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	const bool latched = e != NULL && e->latched;
+	os_mutex_unlock(&sc->ev_mtx);
+	return latched;
+}
+
+void
+ipc_server_conv_on_event(struct ipc_server_conv *sc, uint64_t client_id, const struct xrt_conv_wire_event *ev)
+{
+	// Any core thread, core locks possibly held: queue only (ev_mtx is a leaf).
+	if (sc == NULL || ev == NULL) {
+		return;
+	}
+	uint32_t id;
+	if (ev->kind == XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED) {
+		id = SC_EV_PROVIDERS;
+	} else if (ev->kind == XRT_CONV_WIRE_EVENT_TASK_STATE_CHANGED && ev->task > XRT_CONV_TASK_NONE &&
+	           ev->task < XRT_CONV_TASK_RESERVED_FIRST) {
+		id = ev->task;
+	} else {
+		return; // job events are spec 5
+	}
+	os_mutex_lock(&sc->ev_mtx);
+	for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_CLIENTS; i++) {
+		struct sc_client_ev *e = &sc->ev[i];
+		// Opt-in: a connection that never made a spec-4 call never gets one.
+		if (e->used && e->latched && (client_id == 0 || e->client_id == client_id)) {
+			ev_queue_locked(e, id);
+		}
+	}
+	os_mutex_unlock(&sc->ev_mtx);
+}
+
+xrt_result_t
+ipc_server_conv_v4_poll_event(struct ipc_server_conv *sc,
+                              uint64_t client_id,
+                              bool *out_has,
+                              struct xrt_conv_wire_event *out)
+{
+	*out_has = false;
+	memset(out, 0, sizeof(*out));
+	if (sc == NULL) {
+		return XRT_SUCCESS;
+	}
+
+	// Progress moves without a state change: when the readiness generation
+	// moved, re-check every task this connection last saw warming.
+	struct xrt_conv_wire_generation gen;
+	conv_core_get_generation(sc->core, &gen);
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	if (e == NULL || !e->latched) {
+		os_mutex_unlock(&sc->ev_mtx);
+		return XRT_SUCCESS;
+	}
+	if (gen.status_gen != e->status_gen) {
+		e->status_gen = gen.status_gen;
+		for (uint32_t t = 1; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
+			if (v4_state_is_waiting(e->last_state[t])) {
+				ev_queue_locked(e, t);
+			}
+		}
+	}
+	os_mutex_unlock(&sc->ev_mtx);
+
+	for (;;) {
+		os_mutex_lock(&sc->ev_mtx);
+		e = ev_slot_locked(sc, client_id, false);
+		if (e == NULL || e->fifo_count == 0) {
+			os_mutex_unlock(&sc->ev_mtx);
+			return XRT_SUCCESS;
+		}
+		const uint32_t id = e->fifo[0];
+		memmove(&e->fifo[0], &e->fifo[1], (e->fifo_count - 1) * sizeof(e->fifo[0]));
+		e->fifo_count--;
+		os_mutex_unlock(&sc->ev_mtx);
+
+		out->struct_size = (uint32_t)sizeof(*out);
+		out->family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+		out->progress = -1.0f;
+		if (id == SC_EV_PROVIDERS) {
+			out->kind = XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED;
+			*out_has = true;
+			return XRT_SUCCESS;
+		}
+
+		// The EFFECTIVE state now (the selected provider's), never a row's:
+		// one provider's transition behind another's selection is not news.
+		struct xrt_conv_wire_task_desc d;
+		uint32_t state = XRT_CONV_STATE_ABSENT, reason = 0;
+		float progress = -1.0f;
+		if (conv_core_get_task_desc(sc->core, id, &d)) {
+			state = d.state;
+			reason = d.failure_reason;
+			progress = d.progress;
+		}
+		const uint64_t now = os_monotonic_get_ns();
+		bool deliver = false;
+		uint32_t prev = 0;
+		os_mutex_lock(&sc->ev_mtx);
+		e = ev_slot_locked(sc, client_id, false);
+		if (e != NULL) {
+			prev = e->last_state[id];
+			if (state != prev || reason != e->last_reason[id]) {
+				deliver = true;
+			} else if (v4_state_is_waiting(state) && progress >= 0.0f &&
+			           fabsf(progress - e->last_progress[id]) >= SC_EV_PROGRESS_STEP &&
+			           now - e->last_progress_ns[id] >= SC_EV_PROGRESS_MIN_NS) {
+				deliver = true;
+			}
+			if (deliver) {
+				e->last_state[id] = state;
+				e->last_reason[id] = reason;
+				e->last_progress[id] = progress;
+				e->last_progress_ns[id] = now;
+			}
+		}
+		os_mutex_unlock(&sc->ev_mtx);
+		if (!deliver) {
+			continue; // deduplicated: nothing the app has not seen
+		}
+		out->kind = XRT_CONV_WIRE_EVENT_TASK_STATE_CHANGED;
+		out->task = id;
+		out->state = state;
+		out->previous_state = prev;
+		out->failure_reason = reason;
+		out->progress = progress;
+		*out_has = true;
+		return XRT_SUCCESS;
+	}
+}
+
+void
+ipc_server_conv_v4_get_generation(struct ipc_server_conv *sc,
+                                  uint64_t client_id,
+                                  struct xrt_conv_wire_generation *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (sc == NULL) {
+		return;
+	}
+	ipc_server_conv_v4_latch(sc, client_id);
+	conv_core_get_generation(sc->core, out);
+}
+
+uint64_t
+ipc_server_conv_v4_image_kinds(struct ipc_server_conv *sc, bool export_kinds)
+{
+	struct ipc_server_conv_io_ops io;
+	if (!get_io(sc, &io)) {
+		return 0; // no GPU glue: no task is reachable yet
+	}
+	// The v3 glue imports D3D11 NT / legacy DXGI shared textures and exports
+	// D3D11 NT textures + a shared fence: the kinds every spec-4 stream gets.
+	uint64_t kinds = 1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT;
+	if (!export_kinds) {
+		kinds |= 1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D11_DXGI;
+	}
+	return kinds;
+}
+
+xrt_result_t
+ipc_server_conv_v4_enum_task(struct ipc_server_conv *sc,
+                             uint64_t client_id,
+                             uint32_t task,
+                             struct xrt_conv_wire_task_desc *out,
+                             uint64_t *out_image_kinds,
+                             uint64_t *out_export_kinds)
+{
+	memset(out, 0, sizeof(*out));
+	*out_image_kinds = 0;
+	*out_export_kinds = 0;
+	out->struct_size = (uint32_t)sizeof(*out);
+	out->family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	out->task = task;
+	out->state = XRT_CONV_STATE_ABSENT;
+	out->progress = -1.0f;
+	if (sc == NULL) {
+		return XRT_SUCCESS;
+	}
+	ipc_server_conv_v4_latch(sc, client_id);
+	if (!v4_task_is_spec4(task) || !conv_core_get_task_desc(sc->core, task, out)) {
+		return XRT_SUCCESS; // reserved / spec-5 / unserved: ABSENT, never listed
+	}
+	if ((out->lanes & XRT_CONV_LANE_STREAM) == 0) {
+		out->max_streams = 0; // no stream lane: no stream limit to report
+	}
+	if (v4_task_is_stream_task(task) && (out->lanes & XRT_CONV_LANE_STREAM) != 0) {
+		*out_image_kinds = ipc_server_conv_v4_image_kinds(sc, false);
+		*out_export_kinds = ipc_server_conv_v4_image_kinds(sc, true);
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_server_conv_v4_warm(struct ipc_server_conv *sc, uint64_t client_id, uint32_t task)
+{
+	if (sc == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	ipc_server_conv_v4_latch(sc, client_id);
+	if (!v4_task_is_spec4(task)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	return conv_core_warm_task(sc->core, task);
+}
+
+//! XR_LIFT_OUTPUT_* bits a task desc offers (the app's requiredOutputs vocabulary).
+uint64_t
+ipc_server_conv_v4_output_flags(const struct xrt_conv_wire_task_desc *d)
+{
+	uint64_t f = 0;
+	const bool views = d->task == XRT_CONV_TASK_VIEWS_MONO;
+	if (views && (d->outputs & XRT_CONV_OUT_DEPTH) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_AUX_DEPTH;
+	}
+	if ((d->outputs & XRT_CONV_OUT_DEPTH) != 0 &&
+	    (d->depth_kind == XRT_CONV_DEPTH_METRIC || d->depth_kind == XRT_CONV_DEPTH_METRIC_INVERSE)) {
+		f |= IPC_SERVER_CONV_OUTPUT_METRIC;
+	}
+	if ((d->outputs & XRT_CONV_OUT_DEPTH) != 0 && d->intrinsics_source != XRT_CONV_INTRINSICS_NONE) {
+		f |= IPC_SERVER_CONV_OUTPUT_INTRINSICS;
+	}
+	if ((d->flags & XRT_CONV_CAP_TEMPORAL) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_TEMPORAL;
+	}
+	if (views && (d->flags & XRT_CONV_CAP_EXPLICIT_VIEWPOINTS) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_EXPLICIT_VIEWPOINTS;
+	}
+	if ((d->flags & XRT_CONV_CAP_SUGGESTS_CONVERGENCE) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_CONVERGENCE_HINT;
+	}
+	if ((d->outputs & XRT_CONV_OUT_CONFIDENCE) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_CONFIDENCE;
+	}
+	if ((d->desc_flags & XRT_CONV_WIRE_DESC_COMPOSED) != 0) {
+		f |= IPC_SERVER_CONV_OUTPUT_COMPOSED;
+	}
+	return f;
+}
+
+xrt_result_t
+ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
+                                 uint64_t client_id,
+                                 const struct xrt_conv_wire_stream_desc *in,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 struct xrt_conv_wire_stream_created *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (sc == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	ipc_server_conv_v4_latch(sc, client_id);
+
+	/* VALIDATION_FAILURE (XRT_ERROR_INPUT_UNSUPPORTED on this family). */
+	const uint32_t task = in->task;
+	if (!v4_task_is_spec4(task)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // reserved, spec-5 or out of range
+	}
+	const bool views = task == XRT_CONV_TASK_VIEWS_MONO;
+	if (legacy_mode != 0) {
+		const bool match = (legacy_mode == XRT_DP_LIFT_MODE_DEPTH && !views && task != XRT_CONV_TASK_SPLATS_MONO) ||
+		                   ((legacy_mode == XRT_DP_LIFT_MODE_SBS || legacy_mode == XRT_DP_LIFT_MODE_NVIEW) && views) ||
+		                   (legacy_mode == XRT_DP_LIFT_MODE_GAUSSIANS && task == XRT_CONV_TASK_SPLATS_MONO);
+		if (!match) {
+			return XRT_ERROR_INPUT_UNSUPPORTED;
+		}
+	}
+	const uint32_t input_kind = in->input_kind != 0 ? in->input_kind : XRT_CONV_INPUT_MONO;
+	if (input_kind != XRT_CONV_INPUT_MONO) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // stereo / image+depth input is spec 5
+	}
+	if (in->export_memory_kind != 0 && in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // no candidate exports any other kind yet
+	}
+
+	/* FEATURE_UNSUPPORTED: no non-terminal candidate, no stream lane, no route. */
+	struct ipc_server_conv_io_ops io;
+	if (!get_io(sc, &io)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct xrt_conv_wire_task_desc d;
+	if (!conv_core_get_task_desc(sc->core, task, &d)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (!conv_core_task_has_candidate(sc->core, task)) {
+		// UNKNOWN (discovery not settled, nothing described yet) is a waiting
+		// state, but there is nothing to bind a stream to: transient.
+		return d.state == XRT_CONV_STATE_UNKNOWN ? XRT_ERROR_OUTPUT_REQUEST_FAILURE
+		                                         : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if ((d.lanes & XRT_CONV_LANE_STREAM) == 0 || !v4_task_is_stream_task(task)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // a job-lane task (spec 5)
+	}
+	if ((d.input_kinds & input_kind) == 0 && d.input_kinds != 0) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	uint32_t max_views = d.max_views > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : d.max_views;
+	uint32_t view_count = 0;
+	if (views) {
+		view_count = in->view_count != 0 ? in->view_count : 2u;
+		if (view_count < 2 || view_count > max_views) {
+			return XRT_ERROR_INPUT_UNSUPPORTED; // fixes v3's unenforced maxViews
+		}
+	}
+	// requiredOutputs refuse only against a READY provider; before READY the
+	// declared outputs may be provisional, so they are not grounds to refuse.
+	const uint64_t offered = ipc_server_conv_v4_output_flags(&d);
+	if (d.state == XRT_CONV_STATE_READY && (required_outputs & ~offered) != 0) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	struct sc_stream st;
+	memset(&st, 0, sizeof(st));
+	st.used = true;
+	st.client_id = client_id;
+	st.v4 = true;
+	st.task = task;
+	st.content_hint = task == XRT_CONV_TASK_DEPTH_MONO ? XRT_CONV_CONTENT_PHOTO
+	                  : task == XRT_CONV_TASK_DEPTH_VIDEO ? XRT_CONV_CONTENT_VIDEO
+	                                                      : in->content_hint;
+	st.mode = !views ? XRT_DP_LIFT_MODE_DEPTH : (view_count > 2 ? XRT_DP_LIFT_MODE_NVIEW : XRT_DP_LIFT_MODE_SBS);
+	st.view_count = view_count;
+	st.max_views = max_views;
+	st.aux_depth = views && (required_outputs & IPC_SERVER_CONV_OUTPUT_AUX_DEPTH) != 0;
+	st.priority = U_LIFT_PRIORITY_NORMAL;
+	st.input_scale = input_scale > 0.0f && input_scale <= 1.0f ? input_scale : 1.0f;
+
+	struct xrt_conv_wire_stream_desc sd = *in;
+	sd.struct_size = (uint32_t)sizeof(sd);
+	sd.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	sd.input_kind = input_kind;
+	sd.content_hint = st.content_hint;
+	sd.views_layout = XRT_CONV_VIEWS_ROW;
+	sd.view_count = view_count;
+	sd.outputs = views ? XRT_CONV_OUT_VIEWS : XRT_CONV_OUT_DEPTH;
+	if (st.aux_depth) {
+		sd.outputs |= XRT_CONV_OUT_DEPTH; // required: the core refuses a READY provider without it
+	}
+	sd.export_memory_kind = 0;
+
+	struct conv_stream_options opts;
+	memset(&opts, 0, sizeof(opts));
+	opts.priority = U_LIFT_PRIORITY_NORMAL;
+	opts.eyes_dp = 0;
+	opts.source_format = XRT_CONV_FMT_RGBA8_UNORM;
+	opts.auto_convergence = views;
+	struct xrt_conv_wire_stream_created created;
+	memset(&created, 0, sizeof(created));
+	xrt_result_t xret = conv_core_stream_create(sc->core, client_id, &sd, &opts, &created);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	st.core_id = created.stream_id;
+
+	bool stored = false;
+	os_mutex_lock(&sc->mtx);
+	for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_STREAMS; i++) {
+		if (!sc->streams[i].used) {
+			st.wire_id = IPC_SERVER_CONV_STREAM_TAG | sc->next_wire++;
+			sc->streams[i] = st;
+			stored = true;
+			break;
+		}
+	}
+	os_mutex_unlock(&sc->mtx);
+	if (!stored) {
+		(void)conv_core_stream_destroy(sc->core, st.core_id);
+		return XRT_ERROR_CLIENT_LIMIT_REACHED;
+	}
+
+	*out = created;
+	out->struct_size = (uint32_t)sizeof(*out);
+	out->family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	out->stream_id = st.wire_id;
+	out->task = task;
+	out->view_count = view_count;
+	out->views_layout = XRT_CONV_VIEWS_ROW;
+	out->desc_flags |= d.desc_flags & XRT_CONV_WIRE_DESC_COMPOSED;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_server_conv_v4_stream_reset(struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id)
+{
+	struct sc_stream st;
+	if (sc == NULL || !find_stream(sc, client_id, stream_id, &st) || st.core_id == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	return conv_core_stream_reset(sc->core, st.core_id);
+}
+
+xrt_result_t
+ipc_server_conv_v4_acquire(struct ipc_server_conv *sc,
+                           uint64_t client_id,
+                           uint64_t stream_id,
+                           bool *out_ready,
+                           bool *out_discontinuity,
+                           struct ipc_lift_result *out_v3,
+                           struct xrt_conv_wire_result *out)
+{
+	memset(out, 0, sizeof(*out));
+	*out_discontinuity = false;
+	struct conv_result r;
+	memset(&r, 0, sizeof(r));
+	const xrt_result_t xret = lift_acquire_common(sc, client_id, stream_id, out_ready, out_v3, &r);
+	if (xret != XRT_SUCCESS || !*out_ready) {
+		return xret;
+	}
+	xrt_conv_wire_begin(out, (uint32_t)sizeof(*out));
+	out->stream_id = stream_id;
+	out->frame_id = r.frame_id;
+	out->source_time_ns = (uint64_t)r.source_time;
+	out->latency_ns = r.latency_ns;
+	out->written = r.written;
+	out->output_realloc = out_v3->output_realloc;
+	out->views_width = r.views.width;
+	out->views_height = r.views.height;
+	out->views_format = r.views.format;
+	out->depth_width = r.depth.width;
+	out->depth_height = r.depth.height;
+	out->depth_format = r.depth.format;
+	xrt_conv_wire_pack_views_info(&r.views_info, &out->views_info);
+	xrt_conv_wire_pack_depth_info(&r.depth_info, &out->depth_info);
+	*out_discontinuity = r.discontinuity;
+	return XRT_SUCCESS;
+}
+
+static void
+v4_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	if (e != NULL) {
+		memset(e, 0, sizeof(*e));
+	}
+	os_mutex_unlock(&sc->ev_mtx);
 }

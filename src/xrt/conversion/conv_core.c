@@ -895,6 +895,28 @@ conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_w
 	if (!select_simple_locked(core, task, &b, &state)) {
 		out->state =
 		    conv_registry_discovery_settled(&core->reg) ? XRT_CONV_STATE_ABSENT : XRT_CONV_STATE_UNKNOWN;
+		// No candidate, but a provider declares the task: report why it cannot
+		// serve (FAILED(VERSION), UNLICENSED, DISABLED, ...) rather than
+		// ABSENT, which means "nobody can" (spec 4: the reason is app-visible).
+		// The first-ranked such row (lowest ProbeOrder) speaks for the task.
+		int32_t best = -1;
+		for (uint32_t i = 0; i < core->reg.row_count; i++) {
+			const struct conv_cap_row *row = &core->reg.rows[i];
+			if (row->cap.task != task || row->provider >= core->reg.provider_count ||
+			    !conv_state_is_terminal(row->rd.state) || row->rd.state == XRT_CONV_STATE_ABSENT) {
+				continue;
+			}
+			if (best < 0 || core->reg.providers[row->provider].probe_order <
+			                    core->reg.providers[core->reg.rows[best].provider].probe_order) {
+				best = (int32_t)i;
+			}
+		}
+		if (best >= 0 && out->state == XRT_CONV_STATE_ABSENT) {
+			const struct conv_cap_row *row = &core->reg.rows[best];
+			out->state = row->rd.state;
+			out->failure_reason = row->rd.reason < CONV_REASON_LOCAL_BASE ? row->rd.reason : 0;
+			out->retryable = row->rd.retryable ? 1u : 0u;
+		}
 		os_mutex_unlock(&core->registry_mtx);
 		return true;
 	}

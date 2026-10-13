@@ -338,13 +338,12 @@ on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
 static void
 on_event(void *ud, uint64_t client_id, const struct xrt_conv_wire_event *ev)
 {
-	// Called with core locks held: queue only. v3 has no event; the status
-	// snapshot's `conversion` counter follows the core's generations through
-	// conv_status_generation below, so nothing to do here yet (the spec-4
-	// per-session event queue lands with the v4 handlers, P3).
+	// Called with core locks held: queue only. Spec-4 task / provider events
+	// go to the connections that opted in (ipc_server_conv's own leaf lock);
+	// the status snapshot's `conversion` counter follows the core's
+	// generations through conv_status_generation below.
 	(void)ud;
-	(void)client_id;
-	(void)ev;
+	ipc_server_conv_on_event(ipc_server_get_conv(), client_id, ev);
 }
 
 static uint64_t

@@ -37,6 +37,7 @@ struct conv_fake_cap
 	uint32_t convert_ms; //!< stream_convert() duration
 	uint32_t job_ms;     //!< job_execute() duration
 	uint64_t job_bytes;  //!< bytes written to the primary sink
+	uint32_t job_blob_format; //!< XRT_CONV_BLOB_* of the job blob; 0 = SPZ
 	bool fail_converts;  //!< converts fail and the cap turns FAILED(DEVICE_LOST)
 	//! State a successful warm ends in (0 = READY); e.g. ABSENT for a provider
 	//! that declares itself unavailable after trying (#2029). retryable 0.
