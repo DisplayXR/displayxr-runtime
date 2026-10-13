@@ -65,6 +65,7 @@ add_library(
 	oxr_stereo_camera.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
+	oxr_workspace_window_linux.c
 	oxr_workspace_file_dialog.c
 	oxr_xdev.c
 	${CMAKE_CURRENT_BINARY_DIR}/oxr_bindings/b_oxr_generated_bindings.c
@@ -189,6 +190,9 @@ if(ANDROID)
 endif()
 
 if(XRT_HAVE_LINUX AND NOT ANDROID)
+	# oxr_workspace_window_linux.c resolves the app's libX11 with dlopen.
+	target_link_libraries(st_oxr PRIVATE ${CMAKE_DL_LIBS})
+
 	# VK native compositor on desktop Linux (in-process, XCB present path;
 	# comp_vk_native only exists when XRT_HAVE_XCB). Phase 1 landed the
 	# compositor library; this arm makes oxr actually select it in-process

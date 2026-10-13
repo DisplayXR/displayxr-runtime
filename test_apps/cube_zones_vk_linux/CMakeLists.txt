@@ -137,3 +137,13 @@ target_link_libraries(cube_zones_vk_linux PRIVATE
     Vulkan::Vulkan
     X11::X11
 )
+
+# The workspace manifest + icons beside the executable (INV-9.1), so the shell's
+# dev sidecar scan (<repo>/test_apps/*/build) finds the name and the 2D/3D logos.
+add_custom_command(TARGET cube_zones_vk_linux POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/displayxr/cube_zones_vk_linux.displayxr.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/displayxr/icon.png"
+        "${CMAKE_CURRENT_SOURCE_DIR}/displayxr/icon_sbs.png"
+        "$<TARGET_FILE_DIR:cube_zones_vk_linux>/"
+)
