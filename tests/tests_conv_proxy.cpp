@@ -609,4 +609,542 @@ TEST_CASE("proxy: the real displayxr-conversion-host with the sim provider match
 	CHECK(satellite_job == in_service_job);
 }
 
+
+/*
+ *
+ * ADR-053 P2 (#2035): kill tests against the REAL host through the core.
+ *
+ * The scripted host above dies on cue from inside; these kill the real
+ * displayxr-conversion-host from OUTSIDE (TerminateProcess / SIGKILL, the
+ * shape of a crash in a model runtime) while a "compositor" thread keeps
+ * acquiring results on its own cadence, and check what §3.5 promises: the
+ * in-flight completion is reported failed, the stream keeps its handle, the
+ * dispatcher never blocks a producer or a consumer, and a respawned host
+ * serves the next submit. Then the crash-loop cutoff with real kills and the
+ * §2.4 rebind to another candidate, and the hop-cost harness.
+ *
+ */
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <signal.h>
+#include <sys/types.h>
+#endif
+
+#include <algorithm>
+#include <mutex>
+
+namespace {
+
+//! Kill a host the way a crash does: no orderly anything.
+bool
+kill_hard(long pid)
+{
+	if (pid <= 0) {
+		return false;
+	}
+#ifdef _WIN32
+	HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+	if (h == nullptr) {
+		return false;
+	}
+	const BOOL ok = TerminateProcess(h, 0xC0000005u); // what an access violation exits with
+	CloseHandle(h);
+	return ok != FALSE;
+#else
+	return kill((pid_t)pid, SIGKILL) == 0;
+#endif
+}
+
+void
+real_host_env(const char *latency_ms)
+{
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1");
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", latency_ms);
+}
+
+constexpr uint32_t DEPTH = XRT_CONV_TASK_DEPTH_MONO;
+
+long
+host_pid(Fixture &fx)
+{
+	conv_supervisor_status st{};
+	long pid = 0;
+	conv_host_proxy_get_status(fx.host, &st, &pid);
+	return st.state == CONV_SUP_RUNNING ? pid : 0;
+}
+
+conv_readiness
+row_rd(CoreOps &fx, int32_t provider_index, uint32_t cap_id)
+{
+	static conv_registry reg;
+	conv_core_copy_registry(fx.c, &reg);
+	const int32_t ri = conv_registry_find_row(&reg, provider_index, cap_id);
+	conv_readiness rd{};
+	if (ri >= 0) {
+		rd = reg.rows[ri].rd;
+	}
+	return rd;
+}
+
+struct Dist
+{
+	std::vector<double> v;
+	double
+	pct(double p)
+	{
+		if (v.empty()) {
+			return 0.0;
+		}
+		std::sort(v.begin(), v.end());
+		const size_t i = std::min(v.size() - 1, (size_t)(p * (double)(v.size() - 1) + 0.5));
+		return v[i];
+	}
+	double
+	max()
+	{
+		return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end());
+	}
+};
+
+/*!
+ * The compositor's side of a stream: acquire the newest result on a 60 Hz
+ * cadence, never waiting for one. Records how long each acquire took and
+ * the interval between ticks.
+ */
+struct Compositor
+{
+	CoreOps &fx;
+	uint64_t sid;
+	std::atomic<bool> stop{false};
+	std::thread th;
+	std::mutex m;
+	Dist acquire_ms, tick_ms;
+	uint64_t results = 0;
+	std::atomic<bool> saw_discontinuity{false};
+
+	Compositor(CoreOps &f, uint64_t s) : fx(f), sid(s)
+	{
+		th = std::thread([this] { run(); });
+	}
+	~Compositor()
+	{
+		finish();
+	}
+	void
+	finish()
+	{
+		stop = true;
+		if (th.joinable()) {
+			th.join();
+		}
+	}
+	void
+	run()
+	{
+		const uint64_t period = 16666667ull;
+		uint64_t next = now_ns();
+		uint64_t last = 0;
+		while (!stop) {
+			const uint64_t t0 = now_ns();
+			conv_result r{};
+			if (conv_core_stream_acquire(fx.c, sid, true, &r) == XRT_SUCCESS) {
+				if (r.discontinuity) {
+					saw_discontinuity = true;
+				}
+				conv_core_stream_release(fx.c, sid, r.ring_slot);
+				results++;
+			}
+			const uint64_t t1 = now_ns();
+			{
+				std::lock_guard<std::mutex> lk(m);
+				acquire_ms.v.push_back((double)(t1 - t0) / 1e6);
+				if (last != 0) {
+					tick_ms.v.push_back((double)(t0 - last) / 1e6);
+				}
+			}
+			last = t0;
+			next += period;
+			const uint64_t n = now_ns();
+			if (next > n) {
+				std::this_thread::sleep_for(std::chrono::nanoseconds(next - n));
+			} else {
+				next = n;
+			}
+		}
+	}
+};
+
+} // namespace
+
+TEST_CASE("proxy: real host killed between submit and completion: failed, never a hang; the stream recovers",
+          "[conv_proxy][conv_kill]")
+{
+	// 300 ms per convert: the kill lands inside the provider call, after the
+	// submit and before its completion record.
+	real_host_env("300");
+	Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+	const uint64_t sid = fx.stream(DEPTH, DEPTH);
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x40, &r, 20000));
+	const uint64_t frame_before = r.frame_id;
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const conv_stream_stats before = fx.stats(sid);
+
+	Compositor comp(fx, sid);
+	std::this_thread::sleep_for(std::chrono::milliseconds(200)); // a steady cadence first
+
+	const long pid = host_pid(fx);
+	REQUIRE(pid > 0);
+	REQUIRE(fx.submit(sid, 0x41));
+	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // inside the 300 ms convert
+	const uint64_t t_kill = now_ns();
+	REQUIRE(kill_hard(pid));
+
+	// Producers keep submitting through the outage (latest-wins); no submit blocks.
+	Dist submit_ms;
+	bool restarted = false;
+	while (now_ns() - t_kill < 10000 * MS) {
+		const uint64_t t0 = now_ns();
+		(void)fx.submit(sid, 0x42);
+		submit_ms.v.push_back((double)(now_ns() - t0) / 1e6);
+		if (fx.sup().restarts >= 1u) {
+			restarted = true;
+			break;
+		}
+		sleep_ms(16);
+	}
+	REQUIRE(restarted);
+	const double detect_ms = (double)(now_ns() - t_kill) / 1e6;
+	const int32_t observed_exit = fx.sup().last_exit;
+
+	// The same handle serves again once the host is back.
+	REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_RUNNING; }, 30000));
+	const double running_ms = (double)(now_ns() - t_kill) / 1e6;
+	REQUIRE(wait_until([&] { return fx.row_state(DEPTH) == XRT_CONV_STATE_READY; }, 30000));
+	const double ready_ms = (double)(now_ns() - t_kill) / 1e6;
+	REQUIRE(fx.convert(sid, 0x43, &r, 30000));
+	const double recover_ms = (double)(now_ns() - t_kill) / 1e6;
+	CHECK(r.frame_id != frame_before);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	comp.finish();
+	// The first result after the restart is flagged; the compositor thread
+	// may have been the one to acquire it.
+	CHECK((r.discontinuity || comp.saw_discontinuity.load()));
+
+	const conv_stream_stats after = fx.stats(sid);
+	CHECK(after.failed >= before.failed + 1); // the in-flight convert completed as failed
+	CHECK(after.reopens >= 1u);
+	CHECK(after.rebinds == 0u);
+	CHECK(fx.sup().state == CONV_SUP_RUNNING);
+
+	std::printf("kill mid-convert: exit 0x%08x seen after %.0f ms; host RUNNING after %.0f ms, row READY after %.0f "
+	            "ms, served again after %.0f ms; failed %llu -> %llu\n",
+	            (unsigned)observed_exit, detect_ms, running_ms, ready_ms, recover_ms,
+	            (unsigned long long)before.failed, (unsigned long long)after.failed);
+	std::printf("  compositor acquire p50 %.3f / p99 %.3f / max %.3f ms; tick p50 %.1f / p99 %.1f / max %.1f ms "
+	            "(%zu ticks)\n",
+	            comp.acquire_ms.pct(0.5), comp.acquire_ms.pct(0.99), comp.acquire_ms.max(), comp.tick_ms.pct(0.5),
+	            comp.tick_ms.pct(0.99), comp.tick_ms.max(), comp.tick_ms.v.size());
+	std::printf("  producer submit during the outage p50 %.3f / max %.3f ms (%zu submits)\n", submit_ms.pct(0.5),
+	            submit_ms.max(), submit_ms.v.size());
+
+#ifdef _WIN32
+	CHECK((uint32_t)observed_exit == 0xC0000005u); // the supervisor saw the real exit code
+#else
+	CHECK(observed_exit != 0);
+#endif
+	// The dispatcher never blocked the consumer or the producer: an acquire
+	// or a submit is a lock and a copy, never a wait on the host.
+	CHECK(comp.acquire_ms.max() < 20.0);
+	CHECK(submit_ms.max() < 50.0);
+	// The cadence held through the kill (generous for a loaded CI runner).
+	CHECK(comp.tick_ms.pct(0.99) < 50.0);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+}
+
+TEST_CASE("proxy: five real-host kills -> FAILED(crash_loop); the stream rebinds to the in-service candidate",
+          "[conv_proxy][conv_kill]")
+{
+	real_host_env("0");
+	// The satellite first (probe order 100), the same provider in-service as
+	// the other candidate (200): the §2.4 rebinding rule.
+	Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+	static xrt_conversion_plugin_host_iface hostif{};
+	hostif.struct_size = sizeof(hostif);
+	hostif.host_api_version = XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
+	hostif.get_setting = sim_setting;
+	xrt_conversion_plugin_iface *iface = nullptr;
+	uint32_t abi = 0;
+	REQUIRE(xrtConversionPluginNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &hostif, &iface, &abi) ==
+	        XRT_SUCCESS);
+	xrt_conversion_plugin_instance *inst = nullptr;
+	REQUIRE(iface->probe(&inst) == XRT_SUCCESS);
+	conv_provider_desc d{};
+	d.id = "sim-in-service";
+	d.probe_order = 200;
+	d.hosting = CONV_HOSTING_IN_SERVICE;
+	d.enabled = true;
+	d.iface = iface;
+	d.inst = inst;
+	REQUIRE(conv_core_add_provider(fx.c, &d) >= 0);
+
+	const uint64_t sid = fx.stream(DEPTH, DEPTH);
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x60, &r, 20000));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(std::string(fx.stats(sid).provider_id) == "sim-conversion");
+
+	uint32_t kills = 0;
+	std::vector<int32_t> exits;
+	const uint64_t end = now_ns() + 60000 * MS;
+	while (fx.sup().state != CONV_SUP_FAILED && now_ns() < end) {
+		long pid = 0;
+		REQUIRE(wait_until(
+		    [&] {
+			    pid = host_pid(fx);
+			    return pid > 0 || fx.sup().state == CONV_SUP_FAILED;
+		    },
+		    30000));
+		if (fx.sup().state == CONV_SUP_FAILED) {
+			break;
+		}
+		const uint32_t restarts = fx.sup().restarts;
+		REQUIRE(kill_hard(pid));
+		kills++;
+		REQUIRE(wait_until([&] { return fx.sup().restarts > restarts; }, 10000));
+		exits.push_back(fx.sup().last_exit);
+	}
+	CHECK(kills == 5u);
+	REQUIRE(fx.sup().state == CONV_SUP_FAILED);
+	const conv_readiness rd = row_rd(fx, 0, DEPTH);
+	CHECK(rd.state == XRT_CONV_STATE_FAILED);
+	CHECK(rd.reason == XRT_CONV_FAIL_CRASH_LOOP);
+	for (int32_t e : exits) {
+#ifdef _WIN32
+		CHECK((uint32_t)e == 0xC0000005u);
+#else
+		CHECK(e != 0);
+#endif
+	}
+
+	// The handle survives and moves to the other candidate.
+	REQUIRE(fx.convert(sid, 0x61, &r, 20000));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const conv_stream_stats s = fx.stats(sid);
+	CHECK(s.rebinds >= 1u);
+	CHECK(std::string(s.provider_id) == "sim-in-service");
+	std::printf("crash loop: %u kills -> FAILED(crash_loop), rebinds %llu, now on %s\n", kills,
+	            (unsigned long long)s.rebinds, s.provider_id);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	conv_core_destroy(&fx.c);
+}
+
+namespace {
+
+/*!
+ * @p n single submits, each waited for: the core's own submit -> publish
+ * time (conv_result.latency_ns) and the caller's wall time.
+ */
+void
+hop_cost(CoreOps &fx, uint64_t sid, uint32_t n, Dist &core_ms, Dist &wall_ms, uint32_t &lost)
+{
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x70, &r, 20000)); // warm
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	for (uint32_t i = 0; i < n; i++) {
+		const uint64_t t0 = now_ns();
+		REQUIRE(fx.submit(sid, (uint8_t)(0x10 + (i & 0x3f))));
+		bool got = false;
+		while (now_ns() - t0 < 2000 * MS) {
+			if (conv_core_stream_acquire(fx.c, sid, true, &r) == XRT_SUCCESS) {
+				got = true;
+				break;
+			}
+			std::this_thread::yield();
+		}
+		if (!got) {
+			lost++;
+			continue;
+		}
+		wall_ms.v.push_back((double)(now_ns() - t0) / 1e6);
+		core_ms.v.push_back((double)r.latency_ns / 1e6);
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+	}
+}
+
+void
+print_dist(const char *what, Dist &core, Dist &wall)
+{
+	std::printf("%-11s core submit->result p50 %.3f p90 %.3f p99 %.3f max %.3f ms | wall p50 %.3f p99 %.3f ms (n=%zu)\n",
+	            what, core.pct(0.5), core.pct(0.9), core.pct(0.99), core.max(), wall.pct(0.5), wall.pct(0.99),
+	            core.v.size());
+}
+
+} // namespace
+
+TEST_CASE("proxy: hop cost, CPU lane: 200 submits in-host vs in-service (sim provider, 0 ms convert)",
+          "[conv_proxy][hopcost]")
+{
+	// The headless half of the §3.7 budget: what the satellite hop (rings,
+	// wakes, shm copies in and out, the host's own dispatch) adds to one
+	// submit -> result, against the same provider in-service. The GPU half
+	// (NT-handle open, CPU fence observe, the copy into the ring target, the
+	// weave-on-scanout split) needs the panel box: see the #2035 recipe.
+	real_host_env("0");
+	constexpr uint32_t N = 200;
+	Dist host_core, host_wall, svc_core, svc_wall;
+	uint32_t host_lost = 0, svc_lost = 0;
+	{
+		Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+		const uint64_t sid = fx.stream(DEPTH, DEPTH);
+		hop_cost(fx, sid, N, host_core, host_wall, host_lost);
+		REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	}
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = cpu_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		static xrt_conversion_plugin_host_iface hostif{};
+		hostif.struct_size = sizeof(hostif);
+		hostif.host_api_version = XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
+		hostif.get_setting = sim_setting;
+		xrt_conversion_plugin_iface *iface = nullptr;
+		uint32_t abi = 0;
+		REQUIRE(xrtConversionPluginNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &hostif, &iface, &abi) ==
+		        XRT_SUCCESS);
+		xrt_conversion_plugin_instance *inst = nullptr;
+		REQUIRE(iface->probe(&inst) == XRT_SUCCESS);
+		CoreOps view;
+		REQUIRE(conv_core_create(&cfg, &view.c) == XRT_SUCCESS);
+		conv_provider_desc d{};
+		d.id = "sim-conversion";
+		d.probe_order = 100;
+		d.hosting = CONV_HOSTING_IN_SERVICE;
+		d.enabled = true;
+		d.iface = iface;
+		d.inst = inst;
+		REQUIRE(conv_core_add_provider(view.c, &d) >= 0);
+		const uint64_t sid = view.stream(DEPTH, DEPTH);
+		hop_cost(view, sid, N, svc_core, svc_wall, svc_lost);
+		REQUIRE(conv_core_stream_destroy(view.c, sid) == XRT_SUCCESS);
+		conv_core_destroy(&view.c);
+	}
+	print_dist("in-host", host_core, host_wall);
+	print_dist("in-service", svc_core, svc_wall);
+	std::printf("hop (p50 core, in-host - in-service): %.3f ms\n", host_core.pct(0.5) - svc_core.pct(0.5));
+	CHECK(host_lost == 0u);
+	CHECK(svc_lost == 0u);
+	CHECK(host_core.v.size() == N);
+	CHECK(svc_core.v.size() == N);
+}
+
+TEST_CASE("proxy: close / evict / teardown with the real host NOT running never blocks and never spawns",
+          "[conv_proxy][conv_kill]")
+{
+	real_host_env("0");
+	SECTION("the host idle-exited")
+	{
+		Fixture fx({"--idle-exit-ms", "1500"}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+		const uint64_t sid = fx.stream(DEPTH, DEPTH);
+		conv_result r{};
+		REQUIRE(fx.convert(sid, 0x50, &r, 20000));
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+		// The warm row pins the capability in the host; evicting it (host
+		// running) leaves nothing bound, and the host leaves on its own.
+		conv_core_evict_task(fx.c, DEPTH);
+		REQUIRE(wait_until([&] { return fx.sup().last_exit != INT32_MIN; }, 20000)); // gone once
+		REQUIRE(host_pid(fx) == 0);
+		const uint32_t spawns = fx.sup().spawns;
+
+		// Teardown right away, whatever the supervisor does next (it may be
+		// respawning: see the idle-exit accounting case below).
+		uint64_t t0 = now_ns();
+		conv_core_evict_task(fx.c, DEPTH);
+		const double evict_ms = (double)(now_ns() - t0) / 1e6;
+		const conv_supervisor_status before = fx.sup();
+		t0 = now_ns();
+		conv_core_destroy(&fx.c); // frees the proxy: no fx.sup() after this
+		const double destroy_ms = (double)(now_ns() - t0) / 1e6;
+		std::printf("idle-exited host (exit %d, state %s): evict %.3f ms, core teardown %.3f ms, spawns %u -> %u\n",
+		            before.last_exit, conv_supervisor_state_str(before.state), evict_ms, destroy_ms, spawns,
+		            before.spawns);
+		CHECK(evict_ms < 100.0);
+		CHECK(destroy_ms < 2000.0);
+	}
+	SECTION("the host is FAILED (crash loop) with a stream still open")
+	{
+		Fixture fx({}, 0, 1, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+		const uint64_t sid = fx.stream(DEPTH, DEPTH);
+		conv_result r{};
+		REQUIRE(fx.convert(sid, 0x51, &r, 20000));
+		conv_core_stream_release(fx.c, sid, r.ring_slot);
+		long pid = 0;
+		REQUIRE(wait_until([&] { return (pid = host_pid(fx)) > 0; }, 10000));
+		REQUIRE(kill_hard(pid));
+		REQUIRE(wait_until([&] { return fx.sup().state == CONV_SUP_FAILED; }, 10000));
+		const uint32_t spawns = fx.sup().spawns;
+
+		uint64_t t0 = now_ns();
+		CHECK(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+		const double close_ms = (double)(now_ns() - t0) / 1e6;
+		t0 = now_ns();
+		conv_core_evict_task(fx.c, DEPTH);
+		const double evict_ms = (double)(now_ns() - t0) / 1e6;
+		sleep_ms(300);
+		CHECK(fx.sup().spawns == spawns);
+		t0 = now_ns();
+		conv_core_destroy(&fx.c);
+		const double destroy_ms = (double)(now_ns() - t0) / 1e6;
+		std::printf("FAILED host: stream close %.3f ms, evict %.3f ms, core teardown %.3f ms\n", close_ms, evict_ms,
+		            destroy_ms);
+		CHECK(close_ms < 100.0);
+		CHECK(evict_ms < 100.0);
+		CHECK(destroy_ms < 2000.0);
+	}
+}
+
+TEST_CASE("proxy: a host's own idle exit is orderly: no crash accounting, no respawn without demand",
+          "[conv_proxy][conv_kill][!mayfail]")
+{
+	// KNOWN BUG (#2035 report, 2026-10-13), kept visible with [!mayfail]:
+	// the host closes its channel before its exit 0 lands, the proxy reads
+	// the broken channel as a dead peer and TerminateProcess-es it with the
+	// watchdog code (30) while it is still in its orderly exit; the
+	// supervisor then counts a crash, the core re-warms every capability
+	// (WARMING restarting) and the host is respawned with no demand. Five
+	// idle exits in 10 min would end in FAILED(crash_loop).
+	real_host_env("0");
+	Fixture fx({"--idle-exit-ms", "1500"}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+	const uint64_t sid = fx.stream(DEPTH, DEPTH);
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x52, &r, 20000));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	conv_core_evict_task(fx.c, DEPTH);
+	REQUIRE(wait_until([&] { return fx.sup().last_exit != INT32_MIN; }, 20000));
+	sleep_ms(1000);
+	const conv_supervisor_status st = fx.sup();
+	std::printf("idle exit seen as exit %d, state %s, restarts %u, spawns %u\n", st.last_exit,
+	            conv_supervisor_state_str(st.state), st.restarts, st.spawns);
+	CHECK(st.last_exit == CONV_HOST_EXIT_ORDERLY);
+	CHECK(st.restarts == 0u);
+	CHECK(st.state == CONV_SUP_IDLE);
+	CHECK(st.spawns == 1u);
+}
+
 #endif
