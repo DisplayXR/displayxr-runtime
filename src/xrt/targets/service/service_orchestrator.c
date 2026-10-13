@@ -7,6 +7,7 @@
  */
 
 #include "service_orchestrator.h"
+#include "service_spawn.h"
 #include "service_tray_win.h"
 #include "service_workspace_registry.h"
 
@@ -158,36 +159,11 @@ hotkey_label(void)
 	return s_launch.has_hotkey ? s_launch.hotkey_text : "(no hotkey)";
 }
 
-//! Build the path to a sibling executable next to displayxr-service.exe.
-static bool
-sibling_exe_path(const char *exe_name, char *buf, size_t buf_size)
-{
-	char self_path[MAX_PATH];
-	DWORD len = GetModuleFileNameA(NULL, self_path, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		return false;
-	}
-
-	// Strip filename to get directory
-	char *last_sep = strrchr(self_path, '\\');
-	if (!last_sep) {
-		last_sep = strrchr(self_path, '/');
-	}
-	if (!last_sep) {
-		return false;
-	}
-	*(last_sep + 1) = '\0';
-
-	snprintf(buf, buf_size, "%s%s", self_path, exe_name);
-	return true;
-}
-
 //! Existence check that excludes directories.
 static bool
 sibling_file_exists(const char *path)
 {
-	DWORD attrs = GetFileAttributesA(path);
-	return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+	return service_spawn_file_exists(path);
 }
 
 //! Returns true if @p s contains a path separator (\ or /) — used to
@@ -268,92 +244,19 @@ detect_workspace_controller(const struct service_config *cfg)
 	   s_workspace_active.binary);
 }
 
-//! Launch a child process and return its PROCESS_INFORMATION.
-//! If log_path is non-NULL, child's stdout and stderr are redirected to it.
-static bool
-launch_child_with_log(const char *exe_path, const char *args,
-                      const char *log_path, PROCESS_INFORMATION *pi)
-{
-	char cmd[1024];
-	if (args && args[0]) {
-		snprintf(cmd, sizeof(cmd), "\"%s\" %s", exe_path, args);
-	} else {
-		snprintf(cmd, sizeof(cmd), "\"%s\"", exe_path);
-	}
-
-	STARTUPINFOA si;
-	ZeroMemory(&si, sizeof(si));
-	si.cb = sizeof(si);
-	ZeroMemory(pi, sizeof(*pi));
-
-	HANDLE log_h = INVALID_HANDLE_VALUE;
-	BOOL inherit = FALSE;
-	if (log_path && log_path[0]) {
-		SECURITY_ATTRIBUTES sa;
-		ZeroMemory(&sa, sizeof(sa));
-		sa.nLength = sizeof(sa);
-		sa.bInheritHandle = TRUE;
-		log_h = CreateFileA(log_path,
-		                    FILE_APPEND_DATA | SYNCHRONIZE,
-		                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		                    &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (log_h != INVALID_HANDLE_VALUE) {
-			si.dwFlags = STARTF_USESTDHANDLES;
-			si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-			si.hStdOutput = log_h;
-			si.hStdError = log_h;
-			inherit = TRUE;
-		} else {
-			OW("Failed to open log file %s (error %lu)", log_path,
-			   (unsigned long)GetLastError());
-		}
-	}
-
-	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, inherit, CREATE_NO_WINDOW, NULL, NULL, &si, pi);
-	if (log_h != INVALID_HANDLE_VALUE) {
-		CloseHandle(log_h); // our copy; child keeps its own
-	}
-	if (!ok) {
-		OW("Failed to launch: %s (error %lu)", cmd, (unsigned long)GetLastError());
-		return false;
-	}
-
-	// Close the thread handle immediately — we only need the process handle
-	CloseHandle(pi->hThread);
-	pi->hThread = NULL;
-
-	return true;
-}
-
+//! Launch a child process (no console window); the spawn mechanics are shared
+//! with the conversion-host supervisor (service_spawn.c).
 static bool
 launch_child(const char *exe_path, const char *args, PROCESS_INFORMATION *pi)
 {
-	return launch_child_with_log(exe_path, args, NULL, pi);
-}
-
-//! Build %LOCALAPPDATA%\DisplayXR\<basename>.log.
-static bool
-appdata_log_path(const char *basename, char *buf, size_t buf_size)
-{
-	char appdata[MAX_PATH];
-	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", appdata, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		return false;
-	}
-	snprintf(buf, buf_size, "%s\\DisplayXR\\%s.log", appdata, basename);
-	return true;
+	return service_spawn_child(exe_path, args, NULL, 0, pi);
 }
 
 //! Terminate a child process if running.
 static void
 terminate_child(PROCESS_INFORMATION *pi, bool *running_flag)
 {
-	if (pi->hProcess) {
-		TerminateProcess(pi->hProcess, 0);
-		WaitForSingleObject(pi->hProcess, 3000);
-		CloseHandle(pi->hProcess);
-		pi->hProcess = NULL;
-	}
+	service_spawn_terminate(pi, 0, 3000);
 	if (running_flag) {
 		*running_flag = false;
 	}

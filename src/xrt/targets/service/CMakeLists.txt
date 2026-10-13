@@ -32,7 +32,10 @@ target_sources(displayxr-service PRIVATE
 	service_conversion.h
 	# ADR-054 N3d (#2051): the one watch over every class's Enabled / Preferred store.
 	service_component_watch.c
-	service_component_watch.h
+	service_component_watch.h	# Child-process mechanics shared by the orchestrator and the conversion-host
+	# supervisor (ADR-053 P2): sibling paths, spawn, terminate.
+	service_spawn.c
+	service_spawn.h
 )
 target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime ipc_server_conv)
 
