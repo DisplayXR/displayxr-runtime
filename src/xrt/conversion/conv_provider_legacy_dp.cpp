@@ -269,8 +269,14 @@ fill_cap(const conv_dp_lift_snapshot &s, uint32_t index, xrt_conv_capability *c)
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA; // ADR-048 era: rect + nominal z honoured
 		}
 		c->outputs = XRT_CONV_OUT_VIEWS;
-		// Aux depth: provisional until the module answered, then iff AUX_DEPTH.
-		if (!s.have_module || (s.caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0) {
+		// Aux depth: provisional until the module is READY, then iff AUX_DEPTH.
+		// A module answers caps while it is still ACTIVATING, and a shipping
+		// plug-in sets AUX_DEPTH only once its model is up, so a caps answer
+		// taken during warm-up says "no depth" for a module that will have it.
+		// Describing from that answer latched every VIEWS|DEPTH stream as
+		// unsatisfied for its whole life (#2025, lifted-rect cursor).
+		const bool module_ready = s.have_module && s.caps.module_status == XRT_DP_LIFT_MODULE_READY;
+		if (!module_ready || (s.caps.aux_outputs & XRT_DP_LIFT_AUX_DEPTH) != 0) {
 			c->outputs |= XRT_CONV_OUT_DEPTH;
 		}
 		c->depth_kind = s.have_module && s.caps.aux_depth_semantics == XRT_DP_LIFT_DEPTH_METRIC
@@ -364,6 +370,8 @@ dpl_get_generation(xrt_conversion_plugin_instance *inst)
 	key = key * 31u + (s.have_module ? 1u : 0u);
 	key = key * 31u + (s.has_depth_slot ? 1u : 0u);
 	if (s.have_module) {
+		// READY or not decides whether aux depth is still provisional (fill_cap).
+		key = key * 131u + (s.caps.module_status == XRT_DP_LIFT_MODULE_READY ? 1u : 0u);
 		key = key * 131u + s.caps.modes;
 		key = key * 131u + s.caps.max_views;
 		key = key * 131u + s.caps.max_streams;

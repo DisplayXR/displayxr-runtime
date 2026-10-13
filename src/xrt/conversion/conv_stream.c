@@ -756,16 +756,32 @@ gate_locked(struct conv_core *core, struct conv_stream *st)
 	const uint32_t state = conv_core_row_state_locked(core, st->bind.provider, st->bind.cap_id);
 	st->stats.row_state = state;
 	bool ready = state == XRT_CONV_STATE_READY;
-	if (ready && st->pipe.provisional) {
+	// Refine the provisional pipeline against the READY capability. An
+	// unsatisfied stream is re-tried on every gate pass: a provider's describe
+	// is refined asynchronously (the control thread re-describes when the
+	// host's generation moves), so the first READY pass may still see the
+	// pre-READY capability and the row can gain the output a moment later.
+	// Never latch for the stream's life (#2025, lifted-rect cursor).
+	if (ready && (st->pipe.provisional || st->unsatisfied)) {
 		struct xrt_conv_capability cap;
-		if (conv_core_row_cap_locked(core, st->bind.provider, st->bind.cap_id, &cap) &&
-		    !conv_pipeline_refine(&st->pipe, st->req.required_outputs, &cap)) {
-			st->unsatisfied = true;
-			U_LOG_W(
-			    "[conv] stream %llu: capability READY but lacks a required output (0x%x of 0x%x): "
-			    "frames are dropped",
-			    (unsigned long long)st->id, st->req.required_outputs & ~cap.outputs,
-			    st->req.required_outputs);
+		if (conv_core_row_cap_locked(core, st->bind.provider, st->bind.cap_id, &cap)) {
+			const bool was_unsatisfied = st->unsatisfied;
+			if (conv_pipeline_refine(&st->pipe, st->req.required_outputs, &cap)) {
+				st->unsatisfied = false;
+				if (was_unsatisfied) {
+					U_LOG_W("[conv] stream %llu: capability now declares every required output (0x%x): "
+					        "converting",
+					        (unsigned long long)st->id, st->req.required_outputs);
+				}
+			} else {
+				st->unsatisfied = true;
+				if (!was_unsatisfied) {
+					U_LOG_W("[conv] stream %llu: capability READY but lacks a required output (0x%x of "
+					        "0x%x): frames are dropped until the capability is refined",
+					        (unsigned long long)st->id, st->req.required_outputs & ~cap.outputs,
+					        st->req.required_outputs);
+				}
+			}
 		}
 	}
 	os_mutex_unlock(&core->registry_mtx);
