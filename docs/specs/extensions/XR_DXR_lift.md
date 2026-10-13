@@ -3,40 +3,43 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
-| **Spec Version** | 3 |
-| **Extension Type** | Instance extension (conversion in the service — Windows/D3D11; IPC sessions, and in-process D3D11/D3D12 sessions on Windows over a lift-only connection (ADR-049); advertised on every desktop platform, where a service without a module reports `supportedModes = 0`) |
+| **Spec Version** | 4 (one extension; every earlier version's structs, values and behaviour are kept — §14) |
+| **Extension Type** | Instance extension. Conversion runs in the service, on whichever **conversion provider** the runtime selects per task (ADR-053). Reached by IPC sessions, and by in-process D3D11 / D3D12 sessions on Windows over a lift-only connection (ADR-049); advertised on every desktop platform, where a service with no provider reports nothing to convert with |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999270–285` block, pending Khronos registry) |
-| **Decision record** | [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md); viewpoint policy, app rig and auxiliary depth: [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) (+ Addendum A) · in-process: [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) |
-| **Plug-in contract** | `src/xrt/include/xrt/xrt_dp_lift.h` + the lift slots of `xrt_display_processor_d3d11` (`XRT_DP_D3D11_HAS_LIFT`), [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift) |
+| **Status** | Provisional. Type values: `1004999270–285` (spec 1–3), `1004999340–369` (spec 4 and 5), pending Khronos registry |
+| **Decision records** | [ADR-053](../../adr/ADR-053-conversion-providers.md) (conversion providers, tasks, readiness, the consumer contract; amends ADR-042 and ADR-049) · [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) (pre-weave results, the asynchronous mailbox, scheduling) · [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) + Addendum A (viewpoint policy, app rig, auxiliary depth) · [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) (in-process sessions) |
+| **Provider contract** | [`conversion-provider-discovery.md`](../runtime/conversion-provider-discovery.md) + `src/xrt/include/xrt/xrt_conversion_plugin.h` (§11). The display-processor lift slots (`xrt_dp_lift.h`, `XRT_DP_D3D11_HAS_LIFT`) are frozen and reached only through the built-in `dp-lift` adapter |
 
 ## 1. What it is
 
-A display vendor may ship a **2D→3D conversion module** with its plug-in: monocular depth,
-stereo synthesis, N-view synthesis, or photo → Gaussian splats. `XR_DXR_lift` exposes that
-module to apps **generically**, exactly the way `XR_DXR_weave` exposes the vendor's weaver: the
-caller learns what the module can do and what it produced, never which model runs.
+`XR_DXR_lift` turns 2D content into 3D for apps: monocular depth, depth for video, stereo and
+N-view synthesis, and photo → Gaussian splats. The work is done by **conversion providers** —
+plug-ins of their own type, from a display vendor, a model vendor or the open models — that the
+service loads, selects and schedules (ADR-053). The extension exposes them **generically**,
+exactly the way `XR_DXR_weave` exposes the vendor's weaver: the caller learns what a task can
+do, how ready it is and what it produced, never which provider or model ran.
 
 Four ideas carry the whole extension:
 
-1. **A READY vendor module supersedes the open default** (ADR-042). A consumer that ships its
-   own open converter — the DisplayXR Browser's and the web SDK's depth estimator + view
-   generator — uses the runtime's module whenever `xrGetLiftPropertiesDXR` reports it READY for
-   the mode it needs. The vendor module is calibrated for the panel it is plugged into.
+1. **Tasks, chosen by the runtime; a caller waits.** A caller asks for a task (depth, views,
+   splats); the runtime selects one provider per task and never lets readiness reorder that
+   choice. A task that is not READY yet is a reason to **wait**, never a reason to switch to an
+   in-app converter (§2.4, the consumer contract; it replaces ADR-042's "open default").
 2. **Lift never weaves.** Results are pre-weave SBS / N-view pixels, a depth map, or a splat
    blob. Weaving stays the display processor's job on the ordinary weave path (ADR-007).
-3. **Asynchronous, one frame behind.** Conversion runs on a runtime-owned thread. A submit is a
-   snapshot into a latest-wins mailbox; an acquire returns the newest finished result. Nothing
-   on the caller's frame path — and nothing on the service's weave, render or IPC threads —
-   ever waits for the model.
+3. **Asynchronous, one frame behind.** Conversion runs on runtime-owned threads, in the service
+   or in a supervised conversion host. A submit is a snapshot into a latest-wins mailbox; an
+   acquire returns the newest finished result. Nothing on the caller's frame path — and nothing
+   on the service's weave, render or IPC threads — ever waits for a model.
 4. **Geometry comes from the weave rect.** When lifted content is woven
    (`XrWeaveSubmitLiftRectsDXR`), the service weaves the latest result at the rect's *current*
    position every frame. Drag, resize and scroll are exact and real-time; only the depth lags.
 
 ```c
+// Spec 3 shape — still valid, served by the task mapping of §3.1.
 XrLiftPropertiesDXR props = {XR_TYPE_LIFT_PROPERTIES_DXR};
-xrGetLiftPropertiesDXR(session, &props);                 // cheap; kicks activation
-if (props.state == XR_LIFT_STATE_READY_DXR && (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR)) {
+xrGetLiftPropertiesDXR(session, &props);                 // cheap; never waits
+if (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR) {   // READY or still ACTIVATING: create anyway
     XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR, NULL,
                                     XR_LIFT_MODE_SBS_DXR, XR_LIFT_CONTENT_HINT_VIDEO_DXR, 1.0f};
     xrCreateLiftStreamDXR(session, &ci, &stream);
@@ -44,34 +47,149 @@ if (props.state == XR_LIFT_STATE_READY_DXR && (props.supportedModes & XR_LIFT_MO
     xrSubmitLiftFrameDXR(stream, &submit, &frameId);       // never waits for the model
     XrLiftResultDXR res = {XR_TYPE_LIFT_RESULT_DXR};
     if (xrAcquireLiftResultDXR(stream, &res) == XR_SUCCESS) { /* newer result */ }
+    // else XR_LIFT_NOT_READY_DXR: keep showing the 2D source / the previous result
 }
 ```
 
-## 2. Availability, states and discovery
+```c
+// Spec 4 shape — a task stream (§3.2); degrades to the line above on a spec-3 runtime.
+XrLiftTaskStreamCreateInfoDXR task = {XR_TYPE_LIFT_TASK_STREAM_CREATE_INFO_DXR, NULL,
+    XR_LIFT_TASK_VIEWS_MONO_DXR, XR_LIFT_INPUT_KIND_MONO_DXR, XR_LIFT_QUALITY_HINT_DEFAULT_DXR,
+    /*viewCount: match the weave*/ 0, /*requiredOutputs*/ 0, /*exportKind: platform default*/ 0};
+XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR, &task,
+                                XR_LIFT_MODE_SBS_DXR, XR_LIFT_CONTENT_HINT_VIDEO_DXR, 1.0f};
+xrCreateLiftStreamDXR(session, &ci, &stream);
+```
 
-| Situation | `xrGetLiftPropertiesDXR` |
+## 2. Availability, readiness and the consumer contract
+
+### 2.1 Who can call it
+
+| Situation | Spec 3: `xrGetLiftPropertiesDXR` | Spec 4: `xrEnumerateLiftTasksDXR` |
+|---|---|---|
+| IPC session (any platform with a service) | the service's view (§2.3) | one element per task some provider can serve (§2.2) |
+| In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's view, over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection | the same, over the same connection |
+| Any other in-process session (GL, Vulkan, Metal; any non-Windows platform) | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks with `imageKinds` / `exportKinds` = 0: known, not yet reachable from this session (the non-D3D transports land without a spec bump; ADR-053 P5) |
+| A service with no provider (no plug-in registered, or `DXR_LIFT=0`) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` | `countOutput = 0` |
+
+**Readiness starts early.** An instance that enables `XR_DXR_lift` tells the service it is
+interested; on mains power the service then prewarms the selected provider of the default
+tasks (views and video depth), on battery at the first create (`PrewarmOn`, discovery spec
+§4.2). The service persists what every provider described last time, so its task table is
+populated from the first query of a boot. No call of this extension ever waits for a model.
+
+### 2.2 Tasks and readiness (spec 4)
+
+| Task | Value | In → out | Spec-3 equivalent |
+|---|---|---|---|
+| `XR_LIFT_TASK_DEPTH_MONO_DXR` | 1 | one image → depth (no temporal state) | DEPTH + PHOTO |
+| `XR_LIFT_TASK_DEPTH_VIDEO_DXR` | 2 | frames → temporally stable depth; reset on a discontinuity | DEPTH + VIDEO |
+| `XR_LIFT_TASK_DISPARITY_STEREO_DXR` | 3 | rectified pair → disparity (spec 5) | — |
+| `XR_LIFT_TASK_VIEWS_MONO_DXR` | 4 | image / frames → N ≥ 2 views, + same-inference depth | SBS, NVIEW |
+| `XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR` | 5 | image + depth → N views (spec 5) | — |
+| `XR_LIFT_TASK_SPLATS_MONO_DXR` | 6 | photo → 3D Gaussian splats (job lane) | GAUSSIANS |
+| `XR_LIFT_TASK_SPLATS_STEREO_DXR` | 7 | pair → metric splats (spec 5) | — |
+| `SPLATS_VIDEO`, `INPAINT` | 8, 9 | **reserved**: never accepted | — |
+
+**`xrEnumerateLiftTasksDXR(session, capacityInput, &countOutput, tasks)`** (two-call idiom)
+returns one `XrLiftTaskPropertiesDXR` per task that is not `ABSENT`, in ascending task order:
+the **effective** capability of the task on this session — the provider the runtime selected,
+its readiness, and its output contract. The element never grows (extend through `next`).
+
+| Field | Meaning |
 |---|---|
-| In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's module, reached over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects, then the rows below; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection (e.g. a from-source runtime against a different installed service) |
-| Any other in-process session (GL, Vulkan, Metal; any non-Windows platform) | `XR_ERROR_FEATURE_UNSUPPORTED` |
-| Service without a module (macOS, Linux, Android, or a Windows plug-in without lift slots, sim_display) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` |
-| First query on a Windows service with a module | `ACTIVATING` (the service is bringing its lift device + the plug-in's lift DP up in the background) |
-| Module loading (model weights, licence check, engine build) | `ACTIVATING` — poll ≤ 2 Hz, do not fall back permanently |
-| Module up | `READY`, `supportedModes` = the module's bits, `backend` = its name |
-| Module failed / `DXR_LIFT=0` on the service | `UNAVAILABLE` |
+| `state`, `failureReason`, `progress` | readiness (below); `progress` in [0, 1] while `DOWNLOADING` / `WARMING`, < 0 = unknown |
+| `lanes`, `inputKinds`, `outputs` | stream and / or job lane; accepted input shapes; output bits (`AUX_DEPTH`, `METRIC`, `INTRINSICS`, `TEMPORAL`, `EXPLICIT_VIEWPOINTS`, `CONVERGENCE_HINT`, `COMPOSED` = served by a depth provider plus the runtime's reference view synthesis) |
+| `depthKinds`, `blobFormats` | what the task can return (§5.5) |
+| `imageKinds`, `exportKinds` | what **this session** can hand in and take out (§4.5, §5.4). 0 = known, not reachable from this session yet |
+| `maxStreams` | the selected provider's limit **for this task**, runtime-wide; 0 = no stream lane |
+| `maxViews` | `VIEWS_*` tasks; enforced at create |
+| `maxInputExtent` | larger inputs are downscaled by the runtime; 0 = none |
+| `typicalLatency`, `warmEstimate` | per conversion (or per job), and cold → READY; 0 = unknown |
+| `licenceClass` | `PERMISSIVE`, `COMMERCIAL`, `RESEARCH_ONLY` (present only when the **user** opted in) or `UNKNOWN` |
 
-The first `xrGetLiftPropertiesDXR` (or `xrCreateLiftStreamDXR`) of the service's lifetime starts
-activation; the call itself never waits. `typicalLatency` is the module's own estimate
-(submit → result); the measured value per stream is in `xrGetLiftStreamStatsDXR` (§7).
+**States** (`XrLiftTaskStateDXR`; values equal the plug-in ABI's):
 
-`maxStreams` is **service-wide**, not per session. `maxViews` bounds `XrLiftOptionsDXR::viewCount`
-for NVIEW. `depthSemantics` says whether a DEPTH result is relative (larger = farther, no unit)
-or metric (metres).
+| State | Value | For a caller |
+|---|---|---|
+| `UNKNOWN` | 0 | discovery has not settled: **wait** |
+| `READY` | 1 | conversions run now |
+| `WARMING` | 2 | loading, compiling, first inference, or the provider's host restarting or being updated: **wait** |
+| `ABSENT` | 3 | no provider can serve it (never enumerated) |
+| `INCOMPATIBLE` | 4 | installed but unusable here (version / OS / GPU / driver) |
+| `UNLICENSED` | 5 | its licence check refused it |
+| `FAILED` | 6 | see `failureReason` (`LICENCE`, `LOAD`, `PLATFORM`, `NETWORK`, `VERSION`, `RESOURCE`, `MODEL`, `DEVICE_LOST`, `CRASHED`); may recover later, with an event |
+| `DISABLED` | 7 | switched off by the user or policy |
+| `INSTALLED` | 8 | present, model cold; a create or a warm request starts it: **wait** |
+| `DOWNLOADING` | 9 | model bytes being fetched: **wait** |
+| `EVICTED` | 10 | unloaded after long idle; a reload reports `WARMING`: **wait** |
 
-**Streams may be created while ACTIVATING** (their frames wait, latest-wins, until READY). A
-mode not in `supportedModes` of a READY module is `XR_ERROR_FEATURE_UNSUPPORTED`; creating past
-`maxStreams` is `XR_ERROR_LIMIT_REACHED`.
+The **waiting** states (UNKNOWN, INSTALLED, DOWNLOADING, WARMING, EVICTED) accept a create, and
+the stream's frames wait latest-wins until READY. The **terminal** states make selection fall
+through to the next provider at the next create, and the create is refused only when no
+candidate is left (§3.2).
+
+**`xrRequestLiftTaskWarmDXR(session, task)`** asks the runtime to warm the selected provider of
+`task` now (for example when a page shows a "3D" control). It returns at once and is
+idempotent; progress arrives through the state and the events.
+
+**Events** (opt-in per session: sent only to a session that has made a spec-4 call, so a
+spec-3 app never receives an event type it does not know):
+
+- `XrEventDataLiftTaskStateChangedDXR` — a task's effective state changed, or its progress
+  moved by ≥ 5 % (at most 2 Hz). Ordered per task, deduplicated.
+- `XrEventDataLiftProvidersChangedDXR` — the provider set behind the tasks changed (an install,
+  an uninstall, a user preference). Re-enumerate; live streams do not move.
+
+**No provider enumeration.** There is no app-visible provider list, id, model name or vendor:
+provider identity is diagnostics (`displayxr-cli conv`, the status snapshot, §12). A browser
+must not expose provider identity to web content; it exposes at most a coarse
+waiting / ready / unavailable state.
+
+### 2.3 The spec-3 view (`xrGetLiftPropertiesDXR`)
+
+A spec-3 caller is served by a fixed mapping of its four modes onto tasks. Backing tasks:
+DEPTH → `DEPTH_VIDEO` (else `DEPTH_MONO`); SBS and NVIEW → `VIEWS_MONO`; GAUSSIANS →
+`SPLATS_MONO`.
+
+| Field | Value |
+|---|---|
+| `state` | **READY** when any advertised mode's backing task is READY ("any", not "all": a splat model downloading must not hold back live video). **ACTIVATING** otherwise while discovery has not settled (some registered provider is neither described nor terminal) **or** any backing task is in a waiting state — even before any mode bit is set. **UNAVAILABLE** otherwise |
+| `supportedModes` | every mode whose backing task is not terminal, waiting ones included; NVIEW only when `VIEWS_MONO`'s `maxViews > 2` |
+| `maxStreams`, `maxViews`, `backend`, `typicalLatency` | from `VIEWS_MONO`, else the depth task. `maxStreams` is that provider's per-task limit (§14.2 shift 1) |
+| `depthSemantics` | METRIC iff the depth task's preferred kind is metric |
+| `XrLiftDepthPropertiesDXR` | from `VIEWS_MONO`'s auxiliary depth (§4.3) |
+
+"Properties queried on a cold boot before the first describe ⇒ ACTIVATING" is a golden test:
+shipped browsers never re-poll UNAVAILABLE, so the runtime never answers it for a state that
+will become READY.
+
+### 2.4 The consumer contract (replaces ADR-042's "open default")
+
+**A non-READY task is a reason to wait, never a reason to switch paths.**
+
+- While waiting, a consumer **creates its stream or job anyway** (frames wait latest-wins; spec-5
+  jobs wait in `WAITING_FOR_PROVIDER`), polls at ≤ 2 Hz or takes the state event, and **shows the
+  2D source**.
+- It **never caches a non-READY answer** beyond one poll interval. (The failure this closes was
+  seen live: a consumer queried readiness once before the module was ready, cached the answer,
+  and converted in the page at visibly lower quality for the whole session, with no stream in
+  the service log.)
+- It **never runs an in-app converter as a fallback**. The open models are a provider; a
+  machine without a vendor provider is served by them through the same API.
+- The only reasons to stay 2D are a runtime that does not expose the extension (decided with
+  `xrEnumerateInstanceExtensionProperties`), a task with no candidate at all (enumerated
+  `ABSENT`, i.e. not listed; spec 3: `UNAVAILABLE` with `supportedModes = 0`), and a create
+  refused per §3.2.
+
+A consumer that must also run on older runtimes may keep a time-bounded in-app path for a
+runtime of spec 3 or older that reports no provider at all, and removes it once its minimum
+runtime is spec 4 (`consumer_floors`).
 
 ## 3. Streams, modes and result layouts
+
+The spec-3 modes and their layouts (a spec-4 task stream returns the same layouts; §5.5 adds
+the metadata that says how to read them):
 
 | Mode | Result | Acquire with | Layout |
 |---|---|---|---|
@@ -85,7 +203,60 @@ The tile size is the module's inference resolution, not necessarily the input si
 PHOTO asks for quality over latency. GAUSSIANS streams take PHOTO only. `inputScale` in (0, 1]
 asks the module to convert at a reduced resolution — an advisory latency lever.
 
+### 3.1 How a spec-3 mode is served
+
+| Spec-3 request | Served by | Notes |
+|---|---|---|
+| DEPTH + VIDEO | `DEPTH_VIDEO`, mono input | without `XrLiftFrameControlDXR` the runtime's own cut detector drives the temporal resets |
+| DEPTH + PHOTO | `DEPTH_MONO` | |
+| SBS | `VIEWS_MONO`, 2 views | VIDEO keeps temporal state, PHOTO drops it |
+| NVIEW + `XrLiftOptionsDXR::viewCount` | `VIEWS_MONO`, N views | N above the task's `maxViews` is `XR_ERROR_VALIDATION_FAILURE` (spec 3 left it unenforced) |
+| GAUSSIANS (PHOTO) | `SPLATS_MONO` on the job worker, behind a latest-wins photo facade | spec-3 blob formats only (PLY or SOG); advertised only when a provider serves `SPLATS_MONO` |
+| `XrLiftDepthRequestDXR` on SBS / NVIEW | `VIEWS_MONO` + auxiliary depth, advisory | as spec 3 |
+| `focalPx > 0` | intrinsics source GIVEN | |
+
+A stream created for a mode whose task was still warming stays valid if the task later fails
+(its frames count in `framesFailed`; the next properties query drops the mode bit) and resumes
+if the task recovers.
+
+### 3.2 Task streams (spec 4)
+
+Chain `XrLiftTaskStreamCreateInfoDXR` on `XrLiftStreamCreateInfoDXR`:
+
+| Field | Meaning |
+|---|---|
+| `task` | a stream-lane task (§2.2) |
+| `inputKind` | one of the task's `inputKinds` (`MONO` in spec 4; stereo pairs and image + depth arrive with spec 5) |
+| `qualityHint` | `DEFAULT`, `LATENCY`, `BALANCED`, `QUALITY` — the only lever an app has on which variant runs |
+| `viewCount` | `VIEWS_*`: 2..`maxViews`, or **0 = match the weave** (on a lifted weave rect, the active mode's view count, and the service resizes the stream on a mode switch without a new handle; on a plain stream, 2) |
+| `requiredOutputs` | output bits to refuse rather than degrade (e.g. `METRIC`, `AUX_DEPTH`) |
+| `exportKind` | how results leave the runtime (§5.4); 0 = the platform default, D3D11_NT on Windows, i.e. exactly spec 3 |
+
+`XrLiftStreamCreateInfoDXR::mode` is then 0 or the legacy mode that matches the task (DEPTH for
+`DEPTH_*`, SBS / NVIEW for `VIEWS_MONO`, GAUSSIANS for `SPLATS_MONO`); anything else is
+`XR_ERROR_VALIDATION_FAILURE`. Setting the matching legacy mode makes the same create work on a
+spec-3 runtime, which ignores the chained struct. `contentHint` and `inputScale` keep their
+spec-3 meaning. `XrLiftDepthRequestDXR` may sit beside the task struct on a `VIEWS_MONO`
+stream; it is equivalent to `requiredOutputs |= AUX_DEPTH` but advisory.
+
+**Create rules**, after selection has fallen through every terminal candidate:
+
+| Result | When |
+|---|---|
+| `XR_SUCCESS` | the selected provider is READY, or in any waiting state (frames wait latest-wins until READY) |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | the task has no non-terminal candidate; or a `requiredOutputs` bit is missing from a provider that is READY (before READY it is checked against the provider's **declared** outputs, which may be provisional, so a provider is never refused while it warms) |
+| `XR_ERROR_VALIDATION_FAILURE` | `viewCount` > `maxViews`; an input or export kind no candidate offers; a reserved task; a mode / task mismatch |
+| `XR_ERROR_LIMIT_REACHED` | the selected provider's `maxStreams` for the task |
+
+**One rebinding rule.** The provider is chosen when the stream is created. A live stream never
+moves to another provider, except on a terminal failure of its provider or a drain of the
+provider's host binary (update, uninstall); the move is signalled by `discontinuity` on the next
+result (§5.5) plus the task-state event. A preference or install change applies to the next
+create only.
+
 ## 4. Submitting frames
+
+In §4–§8, "the module" means the provider the runtime selected for the stream's task.
 
 ```c
 XrLiftOptionsDXR opt = {XR_TYPE_LIFT_OPTIONS_DXR, NULL,
@@ -119,7 +290,7 @@ module defaults):
 
 | Field | Meaning |
 |---|---|
-| `convergence` | RELATIVE depth placed at the display plane, in [0, 1] over the frame's depth range (0 = nearest content on the glass, 1 = farthest, 0.5 = mid). Negative = AUTO — on SBS / NVIEW streams the service then picks it (§4.4). >1 is clamped. The plug-in maps it to its model's units and calibrates it for its panel. |
+| `convergence` | RELATIVE depth placed at the display plane, in [0, 1] over the frame's depth range (0 = nearest content on the glass, 1 = farthest, 0.5 = mid). Negative = AUTO — on SBS / NVIEW streams the service then picks it (§4.4). >1 is clamped. The runtime hands the provider this plane in the provider's own decoded depth units (the last result's range maps [0, 1] onto them), so the two never disagree on normalisation. |
 | `strength` | disparity scale; 1 = the module's calibrated budget, 0 = flat |
 | `inpaint` | fill disocclusions (XR_TRUE) or leave them |
 | `viewpointSource` | TRACKED (the runtime passes the panel's predicted tracked eyes) or EXPLICIT (`viewpoints`, `viewCount` display-space positions in metres) |
@@ -185,7 +356,10 @@ result was synthesized for (after the policy, same frame), the region's centre i
 and its size — so an app can render matching 3D for the same eyes. `viewpointCountOutput` 0 =
 no viewpoints were known (the module used its defaults) or a DEPTH stream.
 
-**What the module is told.** The DP receives the processed viewpoints plus, in appended
+**What the module is told.** A conversion provider receives the processed viewpoints and the
+same geometry in `xrt_conv_params` (`viewpoints_xyz`, `viewpoint_frame`, `rect_width_m` /
+`rect_height_m`, `baseline_m`, `axis_mode`, `max_offset_m`, `nominal_z_m`). Through the legacy
+`dp-lift` adapter, the DP receives the processed viewpoints plus, in appended
 `xrt_dp_lift_params` fields (`XRT_DP_LIFT_HAS_VIEWPOINT_POLICY`): `viewpoint_frame` (RECT),
 `rect_width_m` / `rect_height_m`, `baseline_m` (first-to-last viewpoint distance, i.e. the eye
 separation after the ipd factor), `axis_mode` and `max_offset_m`. The plug-in only translates
@@ -282,7 +456,9 @@ the two coincide only when the module's field of view equals the rect's angular 
 implementation and tests: `src/xrt/auxiliary/util/u_lift_depth.{h,c}`,
 `tests/tests_aux_lift_rig_depth.cpp`.
 
-**DP side.** The runtime passes the request in `xrt_dp_lift_stream_info::aux_outputs`
+**Provider side.** A conversion provider fills the requested depth target in the same
+`stream_convert` that produces the views, and describes it in `xrt_conv_depth_info` (§5.5 is
+its app-facing twin). **Legacy `dp-lift` side.** The runtime passes the request in `xrt_dp_lift_stream_info::aux_outputs`
 (`XRT_DP_LIFT_AUX_DEPTH`, + `aux_depth_format`), and right after each successful `lift_convert`
 of such a stream calls the appended D3D11 slot **`lift_get_depth`** (`XRT_DP_D3D11_HAS_LIFT_DEPTH`),
 which fills `struct xrt_dp_lift_depth` (`XRT_DP_LIFT_HAS_AUX_DEPTH`): the DP-owned R32F / R16F
@@ -325,6 +501,43 @@ auto-convergence no longer runs for that stream.
   A/B. The choice is logged once (WARN); each stream logs its first lock (WARN) and its
   convergence / target / subject / confidence / cut count every 5 s (INFO, in the per-stream
   stats).
+
+### 4.5 Platform-neutral images and explicit sync (spec 4)
+
+Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
+`XrLiftFrameSubmitInfoDXR`. It **replaces** the base struct's `inputTexture` / `inputIsDxgi` /
+`extent`, and `inputTexture` may then be NULL. `XrLiftOptionsDXR` stays on the same chain.
+
+| `XrLiftImageDXR` field | Meaning |
+|---|---|
+| `role` | `COLOR` (the mono input, or a whole SBS pair); `COLOR_RIGHT` and `DEPTH` arrive with spec 5 |
+| `kind` | `D3D11_NT` (= spec 3 `inputTexture`, keyed mutex key 0), `D3D11_DXGI` (= `inputIsDxgi`), `D3D12_NT`, `VK_OPAQUE_WIN32`, `OPAQUE_FD`, `DMABUF` (+ `XrLiftImageDmabufDescDXR` on `next`), `IOSURFACE`, `AHARDWAREBUFFER`, `CPU`. Values 1–6 equal `XrWeaveHandleKindDXR`'s. Must be one of the task's `imageKinds` for this session |
+| `handle` / `cpuBytes` + `cpuRowPitch` | the image; handles are **borrowed** (the runtime duplicates what it keeps); CPU bytes are copied before the call returns |
+| `format`, `colorSpace` | `XrLiftPixelFormatDXR` (RGBA8 / BGRA8 UNORM or SRGB, NV12, …), `XrLiftColorSpaceDXR` (sRGB, linear, BT.709 limited / full) |
+| `region` | the sub-rect to convert (spec 3: `{0, 0, extent}`) |
+| `syncKind`, `syncHandle`, `syncValue` | how the runtime knows the caller finished writing |
+
+| Sync kind | Meaning |
+|---|---|
+| `NONE` | the kind's default: `KEYED_MUTEX` for `D3D11_*`, `CPU_COMPLETE` otherwise |
+| `KEYED_MUTEX` | key 0 = caller done writing (spec 3) |
+| `D3D_FENCE` | a shared `ID3D11Fence` / `ID3D12Fence` NT handle + value. **This is the D3D12 submit-side fence** ADR-049 left open: a D3D12 caller no longer CPU-waits before submitting |
+| `SYNC_FILE` | a sync_file fd (Linux, Android) |
+| `VK_TIMELINE` | an exported timeline semaphore (fd or NT handle) + value |
+| `SHARED_EVENT` | a macOS shared event + value |
+| `CPU_COMPLETE` | writes completed before the call: the spec-3 D3D12 rule of §5.3 (do not rewrite the image until a later frame; double-buffer) |
+
+As in spec 3 a GPU image is **snapshotted** before the call returns (one copy on the runtime's
+GPU, honouring the sync kind), so the caller may rewrite it afterwards — except under
+`CPU_COMPLETE` on a kind without a keyed mutex.
+
+### 4.6 Discontinuities (spec 4)
+
+Chain `XrLiftFrameControlDXR` with `XR_LIFT_FRAME_CONTROL_DISCONTINUITY_BIT_DXR` on
+`XrLiftFrameSubmitInfoDXR` (or on `XrWeaveRectLiftDXR`, §6.1) when the source jumped — a seek,
+a cut, a source switch. The provider drops its temporal state before converting this frame,
+and the result reports `discontinuity`. Per frame, not sticky. Without it, a `DEPTH_VIDEO` or
+VIDEO-hinted stream is reset by the runtime's own cut detector.
 
 ## 5. Acquiring results
 
@@ -376,12 +589,71 @@ The handles are D3D12-consumable as they are: the export texture is an NT-handle
   `ID3D12CommandQueue::Wait(fence, fenceValue)` before the first read. The rest of §5.1 holds.
 - **Adapter:** results live on the service's ingest adapter (the LUID an IPC D3D session is
   told to use). A device on another adapter cannot open them — treat an `OpenSharedHandle`
-  failure as `UNAVAILABLE` and fall back.
+  failure as "not reachable from this session" and stay 2D. Spec 4 reports this up front:
+  `exportKinds` lists only what the session can open (§5.4).
 - **Input:** create the input with `D3D12_HEAP_FLAG_SHARED` and `ID3D12Device::CreateSharedHandle`
   and pass that NT handle (`inputIsDxgi = XR_FALSE`). D3D12 has no keyed mutex, so the service
   snapshots the texture at submit **without a GPU wait**: complete the writes before
   `xrSubmitLiftFrameDXR` (signal + CPU-wait a fence) and do not rewrite the texture until a later
-  frame — double-buffer the input. A submit-side fence is planned (ADR-049 follow-ups).
+  frame — double-buffer the input. Spec 4 adds the submit-side fence: an `XrLiftImageDXR` of
+  kind `D3D12_NT` with sync kind `D3D_FENCE` (§4.5).
+
+### 5.4 Result export (spec 4)
+
+A stream created with an `exportKind` other than D3D11_NT returns its results through the same
+`outputTexture` / `fence` fields, described by `XrLiftResultExportDXR` chained on
+`XrLiftResultDXR`: `kind` (also the auxiliary depth texture's), `format`, `colorSpace` and the
+fence's `syncKind` (value = `fenceValue`). `XrLiftResultDXR::format` is then 0 and these fields
+are authoritative. Handles still arrive under the §5.1 rule: on the first acquire and on every
+reallocation. On a D3D11_NT stream the struct is left untouched and §5.1–5.3 hold unchanged.
+
+**Adapters.** Results are exported on the service's ingest adapter (the one an IPC D3D session
+is told to use). `exportKinds` lists only kinds this session can open, so a session on another
+adapter, or on an API without a transport yet, sees 0 instead of discovering the mismatch from a
+failed `OpenSharedHandle` (the adapter follow-up of ADR-049). A provider that runs on another
+adapter is served through a CPU copy inside the runtime and never changes what the caller sees.
+
+### 5.5 What a result means: depth and views (spec 4)
+
+**`XrLiftDepthInfoDXR`** describes depth wherever it appears: chained on `XrLiftResultDXR` of a
+`DEPTH_*` stream, on `XrLiftDepthResultDXR` (auxiliary depth, §4.3), and (spec 5) on a depth
+input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShift`, then read
+`v` by `kind`:
+
+| `XrLiftDepthKindDXR` | Value | Meaning | Spec-3 aux reading |
+|---|---|---|---|
+| `METRIC_DEPTH` | 1 | metres | METRIC + LINEAR |
+| `METRIC_INVERSE` | 2 | 1 / metres | METRIC + INVERSE |
+| `AFFINE_INVERSE_DEPTH` | 3 | 1 / depth up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE |
+| `AFFINE_DISPARITY` | 4 | disparity up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE (§14.2 shift 3) |
+| `AFFINE_DEPTH` | 5 | depth up to an unknown scale and shift; larger = farther | RELATIVE + LINEAR |
+| `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 5) | never reaches a spec-3 result |
+
+- `measure`: PLANAR (to the camera plane) or RAY (along the pixel ray).
+- `nearZ` / `farZ`: decoded units; `farZ < nearZ` = infinite far plane; both 0 = unknown.
+- `rangeValid`, `rangeMin` / `rangeMax`, `rangeP05` / `rangeP95`: **this frame's** extent in
+  decoded units, before any normalisation. This is what lets the runtime's depth-budget and
+  convergence policy work on affine depth, whose scale is unknown by definition.
+- `intrinsicsSource` (`UNKNOWN`, `GIVEN` from the caller, `ESTIMATED` by the model, `ASSUMED`
+  provider default — not evidence), `focalLengthPx`, `principalPointPx`, `convention` (OpenCV
+  right-down-forward or right-up-back).
+- `temporallyConsistent`, `discontinuity` (temporal state was reset before this result, or the
+  stream moved provider, §3.2), `baselineMeters` (pixel disparity only; given, never defaulted).
+
+**Units are never invented.** With an affine kind, near / far and the intrinsics are as reported
+or zero; a provider that does not know a field leaves it zero.
+
+**`XrLiftViewsInfoDXR`**, chained on `XrLiftResultDXR` of a `VIEWS_*` stream, says how the views
+were made, in terms that round-trip to stereo-video metadata: `layout` (`ROW` = spec 3, view 0
+leftmost; `ARRAY_LAYERS`; `ATLAS` reserved), `viewCount`, `columns` × `rows`, `viewExtent`,
+per-view `eyeOffsetMeters` (8 entries), `baselineMeters`, `horizontalFovRadians`,
+`disparityAdjust` and the rendered disparity range as fractions of a view's width (positive =
+behind the screen), `cameraModel` (off-axis onto the lifted rect, or parallel + shift),
+`convergenceSource` (app, runtime AUTO, or the provider's own — legacy adapter only),
+`convergenceApplied`, the provider's `suggestedConvergence` / `suggestedStrength` (diagnostics:
+policy ignores them unless the provider is validated against the runtime's stereo ground-truth
+corpus), and the relief mapping (`z = reliefScale / d + reliefOffset`) the cursor uses. The view
+ceiling is 8 at every level (`XR_LIFT_MAX_VIEWS_DXR`).
 
 ## 6. Lifting weave rects
 
@@ -456,10 +728,26 @@ does not own, or a DEPTH/GAUSSIANS stream, is refused (non-fatal) and woven as d
 the rect as whatever the caller drew — flat 2D, never a misread. No version gate is needed; the
 extension being enabled is the gate.
 
+### 6.1 Weave rects with spec 4
+
+Byte-identical: `XrWeaveRectLiftDXR`, `XrWeaveSubmitLiftRectsDXR`, the ≤ 8 rect limit, the IPC
+ordering, the snapshot cap and letterbox crop, "flat until the first result", and the cursor
+chain. What changes:
+
+1. The stream must be a `VIEWS_MONO` stream of the same connection (a spec-3 SBS / NVIEW stream
+   is one). Any other task is refused per rect, non-fatally, and the rect is woven as drawn.
+2. A provider without explicit-viewpoint support is served through the composed path: its
+   depth plus the runtime's reference view synthesis (`COMPOSED` output bit).
+3. `viewCount = 0` means "match the weave": on a 2 → 4 view mode switch the service resizes the
+   stream without a new handle, and view *v* lands in tile *v*.
+4. `XrLiftFrameControlDXR` may be chained on the rect to signal a seek (§4.6).
+5. `XrLiftOptionsDXR::convergence = AUTO` is the runtime's auto-convergence (§4.4).
+
 ## 7. Scheduling, priority and stats
 
-The module converts one frame at a time (one GPU, often one serialised inference queue), so
-concurrent streams share its throughput. The lift thread runs **rounds**; each round converts,
+Each provider converts one frame at a time unless it declares otherwise (one GPU, often one
+serialised inference queue), so concurrent streams on one provider share its throughput;
+streams on different providers are scheduled independently. The lift thread runs **rounds**; each round converts,
 in order:
 
 | Priority | Converted |
@@ -475,8 +763,7 @@ converts every round, the other three rotate one per round.
 
 `xrSetLiftStreamPriorityDXR` is a per-stream setter (one IPC call, effective at the next round),
 because priority changes rarely — when the active speaker changes — and a per-frame field would
-cost nothing extra but invite churn. Scheduling is runtime policy; the vendor module never sees
-it.
+cost nothing extra but invite churn. Scheduling is runtime policy; a provider never sees it.
 
 `xrGetLiftStreamStatsDXR` returns the stream's counters (`framesSubmitted`, `framesConverted`,
 `framesDropped`, `framesFailed`), submit → result latency (last, moving average, min, max) and
@@ -496,26 +783,43 @@ UI rates.
 
 ## 9. Service implementation (for reviewers)
 
-- **One lift thread** per service (`d3d11_lift.cpp`), created on the first lift call. It owns a
-  **dedicated D3D11 device** on the service adapter (`ID3D11Multithread` protection on) and the
-  plug-in's **lift-only display processor** (`xrt_plugin_iface::create_dp_d3d11_lift`; fallback:
-  the ordinary factory with a NULL window). It is the only thread that touches that DP.
-- **Per stream:** a latest-wins mailbox (two input slots) and a two-slot output ring, both
+- **The conversion core** (`src/xrt/conversion/`, ADR-053) owns the provider registry and its
+  persisted describe cache, per-task selection (`conv_select.c`), the readiness state machine
+  (`conv_readiness.c`), one stream dispatcher and one job worker per provider, the pipeline
+  stages (snapshot and crop, viewpoint policy, the provider, the reference view synthesis for a
+  depth-only provider, depth decode and per-frame range, policy observers such as
+  auto-convergence, publish), and the stall watchdog. It is reached by the spec-3 IPC handlers
+  (unchanged wire) and the spec-4 `conv_*` call family.
+- **Providers run behind a host interface** (`conv_host_iface.h`): in the service
+  (`conv_host_inproc.c`; the built-in `dp-lift` adapter always, any provider registered with
+  `Hosting=in-service`) or in a supervised **conversion host**, `displayxr-conversion-host`, one
+  process per provider binary (`conv_host_proxy.c`, `conv_supervisor.c`). A host crash or hang
+  costs WARMING(`restarting`) and a re-opened stream, never a session; an installer update costs
+  WARMING(`updating`) (discovery spec §3.8). The service never queues a GPU wait on a fence the
+  host signals: it observes completion from the CPU first.
+- **The D3D11 glue** (`d3d11_lift.cpp`, `d3d11_conv_host_lane.cpp`, `d3d11_conv_viewsyn.cpp`)
+  owns a dedicated **lift device** on the service adapter (`ID3D11Multithread` protection on).
+  **Per stream:** a latest-wins mailbox (two input slots) and a two-slot output ring, both
   keyed-mutex shared textures crossing between the service device and the lift device; the
-  module's output is copied into the ring before its next call. Consumers **pin** a ring slot for
-  the length of one GPU-copy issue; the worker never overwrites the latest or a pinned slot. The
-  state machine is platform-neutral and unit-tested (`u_lift_mailbox.h`,
+  provider's output is copied into the ring before its next call. Consumers **pin** a ring slot
+  for the length of one GPU-copy issue; the worker never overwrites the latest or a pinned slot.
+  The state machine is platform-neutral and unit-tested (`u_lift_mailbox.h`,
   `tests/tests_lift_mailbox.cpp`), as is the round scheduler.
-- **Locks:** the lift mutex is a leaf, never held across GPU or vendor work. IPC calls take the
+- **Locks:** the lift mutex is a leaf, never held across GPU or provider work. IPC calls take the
   service's `immediate_ctx_mutex` alone, for one blit / copy; the weave path takes the lift mutex
-  under it. The lift thread never takes the service's context or render locks — see
+  under it. No provider call is ever made from a render, compositor or IPC thread or with a
+  conversion lock held — see
   [service-architecture §3](../../architecture/service-architecture.md#3-threads-and-locks).
-- **Logging:** one WARN per module state change and per stream create/destroy; per-stream
-  statistics at INFO, throttled to one line per 5 s.
-- **Kill switch:** `DXR_LIFT=0` in the service's environment → UNAVAILABLE, the vendor DP is
-  never created.
-- **Vendor knobs live in the SERVICE's environment** (e.g. a module's backend selection), not
-  the app's — the conversion runs in `displayxr-service.exe`.
+- **Logging:** one WARN per readiness transition and per stream create / destroy (with the
+  selected provider and why); per-stream statistics at INFO, throttled; a satellite host's WARN
+  lines are forwarded into the service log prefixed `[conv:<id>]`.
+- **Kill switches** (the **service's** environment): `DXR_LIFT=0` → UNAVAILABLE;
+  `DXR_CONV_PROVIDERS=0` → no plug-in providers, only the built-in adapter;
+  `DXR_CONV_EXCLUSIVE=<id>` → that provider only.
+- **Provider settings** are read through the host's `get_setting`
+  (`DXR_CONV_<ID>_<KEY>` in the hosting process's environment, else the provider's registry
+  `Settings` or manifest `settings`), never from the app's environment — conversion runs in
+  `displayxr-service.exe` or its host, not in the app.
 - **Streams belong to the IPC connection**, not the session, and die with it; the calls need no
   compositor session, which is what lets `displayxr-cli lift` drive them headless — and what lets
   an in-process session use lift (ADR-049): it opens a sessionless `APP` connection named
@@ -531,68 +835,97 @@ Mirrors XR_DXR_weave §4b.
 | Result | When | Session still usable? |
 |---|---|---|
 | `XR_LIFT_NOT_READY_DXR` (success) | no result newer than the last acquired | yes |
-| `XR_ERROR_VALIDATION_FAILURE` | a struct out of contract (mode not one bit, bad viewCount, EXPLICIT without viewpoints, `XrLiftDepthRequestDXR` on a DEPTH / GAUSSIANS stream, wrong acquire for the mode, bad `rectIndex`) | yes — caller bug, nothing sent |
-| `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session other than D3D11/D3D12 on Windows; mode not supported by a READY module; no module; in-process: a stream of a lift connection that was lost (destroy it, create a new one) | yes — permanent for that request |
-| `XR_ERROR_LIMIT_REACHED` | `maxStreams` reached | yes |
-| `XR_ERROR_SIZE_INSUFFICIENT` | blob capacity too small (latch kept) | yes |
+| `XR_ERROR_VALIDATION_FAILURE` | a struct out of contract (mode not one bit, bad viewCount or `viewCount` > `maxViews`, EXPLICIT without viewpoints, `XrLiftDepthRequestDXR` on a DEPTH / GAUSSIANS stream, wrong acquire for the mode, bad `rectIndex`; spec 4: a mode / task mismatch, a reserved task, an image or export kind no candidate offers, more than one image per role) | yes — caller bug, nothing sent |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | in-process session other than D3D11/D3D12 on Windows (spec-3 calls); a task or mode with no non-terminal candidate; a `requiredOutputs` bit missing from a READY provider; in-process: a stream of a lift connection that was lost (destroy it, create a new one) | yes — permanent for that request |
+| `XR_ERROR_LIMIT_REACHED` | the selected provider's `maxStreams` for the task | yes |
+| `XR_ERROR_SIZE_INSUFFICIENT` | blob capacity too small (latch kept); `xrEnumerateLiftTasksDXR` capacity too small | yes |
 | `XR_ERROR_RUNTIME_FAILURE` | the service refused this call over a healthy pipe — most commonly the 4 ms input keyed-mutex miss, or a stream the service no longer knows | **yes — retry next frame** |
 | `XR_ERROR_INSTANCE_LOST` | the IPC connection is gone (IPC sessions only — an in-process session's lift connection dying is `XR_ERROR_RUNTIME_FAILURE` on that call; the session renders on, and the next `xrGetLiftPropertiesDXR` reconnects) | no — recover with a new instance (weave §4b) |
 | `XR_ERROR_SESSION_LOST` | any call after that | no |
 
-## 11. Vendor contract, in one table
+A provider crash, hang or update is **not** an error on any call: the task reports WARMING, the
+stream keeps its handle and its last result, and conversions resume when the provider is back.
 
-| Runtime owns | Plug-in owns |
+## 11. Provider contract, in one table
+
+Providers are their own plug-in type (ADR-053): header `xrt/xrt_conversion_plugin.h`, entry
+point `xrtConversionPluginNegotiate`, discovery under `ConversionProviders` — normative in the
+[conversion-provider discovery spec](../runtime/conversion-provider-discovery.md); how to write
+one: [`vendor-plugin-onboarding.md` §9](../../guides/vendor-plugin-onboarding.md#9-conversion-providers--the-third-plug-in-type).
+
+| Runtime owns | Provider owns |
 |---|---|
-| the lift thread, device, DP lifetime | one synchronous conversion per call |
-| latest-wins mailbox, drops, frame ids | the model, its backend, licensing, warm-up (reported as ACTIVATING) |
-| output ring copies, export textures, fences | an output valid until its next call |
-| priority scheduling across streams | nothing about scheduling |
-| tracked eyes → explicit viewpoints, rebased to the lifted rect, with the viewpoint policy applied (ADR-048) — or derived from the app's rig with the `xrLocateViews` math (v3) | honouring explicit viewpoints over any tracker of its own; unit translation only (normalise by `baseline_m`, honour every component sent; rig viewpoints reproduced as given) |
-| copying the auxiliary depth out, exporting it, the display transform (`depthToDisplay`) | returning the depth of the same inference + its metadata (`lift_get_depth`) |
-| weaving SBS / N-view results (ADR-007) | never weaving a lift result |
-| timestamps, latency, stats | reporting `typical_latency_ns` |
+| discovery, selection per task, readiness, events, every thread and queue | one synchronous conversion per call, on runtime threads |
+| latest-wins mailboxes, drops, frame ids, discontinuity flags | per-stream temporal state, reset when told |
+| allocating every input and output image, export textures, fences | importing images (never exporting); an output valid until its next call |
+| priority scheduling across streams, the job lane, progress, cancel | polling the cancel callback; reporting progress and honest state |
+| tracked eyes → explicit viewpoints, rebased to the lifted rect, with the viewpoint policy applied (ADR-048) — or derived from the app's rig with the `xrLocateViews` math (spec 3) | rendering exactly the viewpoints it is given |
+| convergence (app value, or runtime AUTO, handed over in the provider's own decoded units), the depth budget, the cursor's relief mapping | honouring a given convergence exactly; reporting units honestly (depth kind, per-frame range, intrinsics source); suggestions only |
+| copying depth out, exporting it, the display transform (`depthToDisplay`) | returning the depth of the same inference + its metadata |
+| weaving SBS / N-view results (ADR-007) | never weaving |
+| hosting (service or satellite), crash containment, update without lost sessions | following the hosting-agnostic rules (no runtime device, no windows on non-pumping threads, settings only through the host) |
 
-Full slot reference: [`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift).
-sim_display carries an env-gated fake (`SIM_DISPLAY_FAKE_LIFT=1`; `SIM_DISPLAY_FAKE_LIFT_LATENCY_MS`,
-default 8): shifted SBS/N-view, a gradient depth, a two-layer 3DGS PLY — the whole path runs in CI
-without hardware.
+**The legacy path.** A display plug-in that implements the frozen D3D11 lift slots (ADR-042 §5,
+`xrt_dp_lift.h`, `XRT_DP_D3D11_HAS_LIFT`) is served by the built-in `dp-lift` adapter at
+ProbeOrder 150, always in the service. Nothing is ever appended to those slots; they are removed
+at the next display-plug-in ABI major. A vendor's separate provider registered with
+`Supersedes = dp-lift` hides the adapter. Slot reference:
+[`xrt_plugin_iface.md` § lift](../../reference/xrt_plugin_iface.md#turning-2d-into-3d-the-lift-slots-adr-042-xr_dxr_lift).
+
+**Hardware-free.** The in-tree `sim-conversion` provider (`src/xrt/drivers/sim_conversion/`,
+ProbeOrder 250, FALLBACK, enabled by its `ENABLE` setting) serves every task on the CPU with
+scriptable readiness, latency and failures, so the whole path — including the satellite host —
+runs in CI without hardware. `SIM_DISPLAY_FAKE_LIFT=1` remains an alias for one release.
 
 ## 12. Probe and diagnostics
 
 ```
+displayxr-cli conv list   [--json]                    # providers x tasks, selection order, why
+displayxr-cli conv status [--json] [--watch]          # readiness, streams, jobs
+displayxr-cli conv use <task> <id>[/<cap>] [--machine] | conv reset <task>|all
+displayxr-cli conv enable|disable <id> [--machine]
 displayxr-cli lift caps [--json] [--wait S] [--timeout S]
 displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]
                          [--views N] [--strength F] [--convergence F] [--focal PX]
                          [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR]
 ```
 
-Connects over IPC as a DIAG client (non-elevated prompt on Windows), waits through ACTIVATING,
-creates a stream, submits the image(s) through a shared keyed-mutex texture exactly as a
-browser does, reads each result back through the export texture + fence and writes
-`lift_out_<i>.png` (depth normalised to 8-bit grey) or `lift_out_<i>.ply`. It prints per frame
-the submit → acquire latency seen by the caller and the service's own latency, and at the end
-the stream stats and a latency summary. `--pipelined` submits at `--fps` without waiting, to
-measure throughput and drops. `lift caps` polls through ACTIVATING for `--wait` seconds
-(default 8) and is hard-bounded by `--timeout` (default `max(10, wait + 2)` s): a service that
-never answers — wedged, or not accepting connections — prints `TIMEOUT` and exits 4 instead of
-blocking (#1812). The service answers caps from its last-known snapshot and never waits on the
-module, so a module stuck loading reads ACTIVATING, not a hang; the service logs one WARN
-(`[lift] module still ACTIVATING ...`) when that lasts past 30 s. `displayxr-cli selftest` includes a `lift_caps` check (headless
-WARP + the lift-only factory): modes 0 passes; only malformed caps fail
-(`CLI_SELFTEST_BAD_LIFT_CAPS`, exit 11).
+`conv list` / `conv status` read the running service's status snapshot over DIAG; with no
+service they fall back to a headless pass that negotiates, probes and describes every registered
+provider but **never warms one**, and say so (`source: headless`). Provider identity, backend,
+model and licence class are visible here and in the dashboard — never through the app API.
+
+`lift probe` connects over IPC as a DIAG client (non-elevated prompt on Windows), waits through
+ACTIVATING, creates a stream (`--mode depth` asks for video content, served by `DEPTH_VIDEO`),
+submits the image(s) through a shared keyed-mutex texture exactly as a browser does, reads each
+result back through the export texture + fence and writes `lift_out_<i>.png` (depth normalised
+to 8-bit grey) or `lift_out_<i>.ply`. It prints per frame the submit → acquire latency seen by
+the caller and the service's own latency, and at the end the stream stats and a latency summary.
+`--pipelined` submits at `--fps` without waiting, to measure throughput and drops. `lift caps`
+polls through ACTIVATING for `--wait` seconds (default 8) and is hard-bounded by `--timeout`
+(default `max(10, wait + 2)` s): a service that never answers prints `TIMEOUT` and exits 4
+instead of blocking (#1812). The service answers from its last-known state and never waits on a
+provider.
+
+`displayxr-cli selftest` includes a `conversion_providers` check (ABI, well-formed capability
+descriptors, in-range states; a malformed descriptor exits `CLI_SELFTEST_BAD_CONVERSION` = 13;
+no provider passes) and keeps `lift_caps` (exit 11 on malformed caps), which now reports the
+static `dp-lift` row and, when a service is listening, its live caps — it no longer instantiates
+a model headless.
 
 ## 13. Consumers
 
 | Consumer | Path | Uses |
 |---|---|---|
-| DisplayXR Browser (Chromium fork) | GPU process → service | `xrGetLiftPropertiesDXR` to decide vendor vs open default (ADR-042); `XrWeaveSubmitLiftRectsDXR` for inline 2D video/images lifted in place; `xrSubmitLiftFrameDXR` + acquire where the page wants the depth/views itself |
-| DisplayXR web SDK (`@displayxr/inline3d`) | via the browser | the same policy: prefer the runtime module when READY; GAUSSIANS via the blob path supersedes the SDK's open photo → splats lift |
-| 3D calling (up to 4 mono tiles) | app → service | one SBS stream per tile; `xrSetLiftStreamPriorityDXR` HIGH for the active speaker |
-| Engine apps (Unity display provider, D3D12 in-process) | in-process session → lift-only connection → service (ADR-049) | streams + texture acquire (§5.3); no weave rects (the app composes the views itself) |
-| `displayxr-cli lift` | DIAG IPC | caps + the N0 probe (§12) |
+| DisplayXR Browser (Chromium fork) | GPU process → service | `xrGetLiftPropertiesDXR` / task readiness under the §2.4 contract (wait for READY; no session-long fallback); `XrWeaveSubmitLiftRectsDXR` for inline 2D video and images lifted in place; `xrSubmitLiftFrameDXR` + acquire where the page wants the depth or views itself. Pages see only a coarse waiting / ready / unavailable state |
+| DisplayXR web SDK (`@displayxr/inline3d`) | via the browser | the same contract; its in-page model store and converter are removed once its minimum runtime serves the open models as a provider |
+| 3D calling (up to 4 mono tiles) | app → service | one views stream per tile; `xrSetLiftStreamPriorityDXR` HIGH for the active speaker |
+| Engine apps (Unity display provider, D3D12 in-process) | in-process session → lift-only connection → service (ADR-049) | streams + texture acquire (§5.3); spec 4 adds the D3D12 fence sync kind (§4.5); no weave rects (the app composes the views itself) |
+| `displayxr-cli conv` / `lift` | DIAG IPC | provider list, readiness, caps and the probe (§12) |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it — coupled-PR
-order: runtime → extensions auto-sync → consumers.
+order: runtime → extensions auto-sync → consumers. A consumer adopting spec-4 behaviour raises
+its minimum runtime in the same change (`consumer_floors`).
 
 ## 14. Version history
 
@@ -601,14 +934,55 @@ order: runtime → extensions auto-sync → consumers.
 | 1 | Initial: properties + states, streams (DEPTH / SBS / NVIEW / GAUSSIANS), non-blocking latest-wins submit, texture acquire (weave-style handles + fence), blob acquire (two-call latch), weave-rect lift chain, per-stream priority scheduling + stats, `focalPx`. |
 | 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
 | 3 | App camera + metric depth (ADR-048 Addendum A, §4.2–4.3): `XrDisplayRigDXR` / `XrCameraRigDXR` on `XrLiftOptionsDXR` / `XrWeaveRectLiftDXR` drive the TRACKED viewpoints with the `xrLocateViews` rig math; EXPLICIT viewpoints accepted on lifted weave rects; auxiliary depth for SBS / NVIEW streams — `XrLiftDepthRequestDXR`, `XrLiftDepthResultDXR` (texture + shared fence, units, encoding, intrinsics, convergence depth, viewpoint, `depthToDisplay`), `XrLiftDepthPropertiesDXR`. A separate version from 2 because v2 can ship on its own (#1864): an app tests `SPEC_VERSION >= 3` for these. |
+| 4 | Conversion providers (ADR-053, §2.2–2.4, §3.2, §4.5–4.6, §5.4–5.5, §6.1): the task vocabulary (`XrLiftTaskDXR`), input kinds and a quality hint; `xrEnumerateLiftTasksDXR` (the effective capability, readiness and licence class per task) and `xrRequestLiftTaskWarmDXR`; `XrLiftTaskStateDXR` + failure reason; `XrEventDataLiftTaskStateChangedDXR` / `XrEventDataLiftProvidersChangedDXR`, opt-in per session; `XrLiftTaskStreamCreateInfoDXR` (task, input kind, quality hint, `viewCount` 0 = match the weave, `requiredOutputs`, export kind); `XrLiftFrameImagesDXR` / `XrLiftImageDXR` with explicit sync, `XrLiftImageDmabufDescDXR`, `XrLiftFrameControlDXR` (discontinuity); `XrLiftResultExportDXR`, `XrLiftDepthInfoDXR`, `XrLiftViewsInfoDXR`. The consumer contract (§2.4) replaces ADR-042's "open default". Type values `1004999341–351`; enum values equal the plug-in ABI's. An app tests `SPEC_VERSION >= 4`. |
 
-Runtime behaviour, no spec-version change: in-process D3D11 / D3D12 sessions on Windows use lift
-over a lift-only connection (ADR-049). A consumer detects it the same way as before — an older
-runtime answers `xrGetLiftPropertiesDXR` on such a session with `XR_ERROR_FEATURE_UNSUPPORTED`.
+### 14.1 Spec 3 is frozen
 
-## Probing on a Windows box — gotchas (first N0 run, 2026-09-25)
+Every spec-3 struct, enum value, entry point and wire message is unchanged in spec 4, and a
+spec-3 caller is served by the fixed mapping of §2.3 / §3.1. `tests_lift_abi` pins every spec-3
+`sizeof`, `offsetof` and enum value (x64 and arm64); `tests_oxr_lift_startup` pins the spec-3
+startup sequence and is unchanged by spec 4. Spec 4 only appends.
 
-- **Selecting the display processor.** `XRT_PREFERRED_PLUGIN_ID` does *not* switch the active DP when an installed vendor plug-in also probes; `DXR_PLUGIN_EXCLUSIVE=<plugin-id>` in the **service's** environment does (relaunch the service non-elevated from a `.bat` that sets it). `SIM_DISPLAY_FAKE_LIFT=1` alongside `DXR_PLUGIN_EXCLUSIVE=sim-display` exercises the whole path hardware-free (caps modes = DEPTH|SBS|NVIEW|GAUSSIANS).
-- **`displayxr-cli lift …` must run non-elevated** — an elevated prompt reports "not connected to the service" (same integrity-level rule as every other IPC client).
-- **Vendor module version gate.** The Leia plug-in logs the NeurD version it loaded and reports `UNAVAILABLE` when it is outside the supported range (needs 0.4.3+): e.g. a box with Immersity Live's NeurD 0.3.7 shows `state -> ACTIVATING` then `UNAVAILABLE` with the reason in the service log. Upgrade the NeurD runtime; the plug-in never crashes on a mismatch.
-- **Probe timing.** `lift probe` stamps submit→acquire before any readback; use `--no-write` (or `--write-every N`) for throughput runs — encoding a 4K SBS PNG takes seconds and would otherwise cap the pipelined rate.
+### 14.2 What a spec-3 caller can observe
+
+Moving lift onto conversion providers changes four things a spec-3 caller can see. Each is
+pinned by a golden test (`tests/tests_lift_v3_shifts.cpp`, tag `[lift_v3_shift]`):
+
+| # | Shift | Golden test |
+|---|---|---|
+| 1 | `maxStreams` is the **selected provider's per-task** limit, not one runtime-wide number; a depth stream and a views stream on different providers no longer share one budget | `v3 shift 1: maxStreams is the selected provider's per-task limit` |
+| 2 | GAUSSIANS may return SOG with the splat camera block where the sim provider returns PLY; `format` says which, and both are spec-3 formats | `v3 shift 2: GAUSSIANS may return SOG with the camera block` |
+| 3 | Auxiliary depth of kind `AFFINE_DISPARITY` is reported to spec 3 as RELATIVE + INVERSE, so `auxDepthSupported` stays true — and cursor depth keeps working — on boxes without a vendor provider | `v3 shift 3: AFFINE_DISPARITY aux depth reads RELATIVE + INVERSE` |
+| 4 | The mode check at create follows **declared** capabilities: a mode whose task is still warming is accepted (its frames wait), where spec 3 only accepted modes of a READY module | `v3 shift 4: a mode backed by a warming task is accepted at create` |
+
+### 14.3 Runtime behaviour without a spec-version change
+
+- In-process D3D11 / D3D12 sessions on Windows use lift over a lift-only connection (ADR-049).
+  An older runtime answers `xrGetLiftPropertiesDXR` on such a session with
+  `XR_ERROR_FEATURE_UNSUPPORTED`.
+- Lift runs on conversion providers through the conversion core (ADR-053 P1a, the same spec-3
+  wire): readiness never latches UNAVAILABLE until a service restart, a cold boot reads
+  ACTIVATING before the first describe, `maxViews` is enforced at submit, and a vendor provider
+  runs in its own supervised host (P2), so a provider crash or update no longer touches any
+  session.
+- Non-D3D transports (Vulkan external memory, dma-buf, IOSurface, AHardwareBuffer) land without
+  a version bump: availability is the per-task `imageKinds` / `exportKinds`.
+
+## Probing on a Windows box — gotchas
+
+- **Choosing the provider.** `displayxr-cli conv list` shows which provider serves each task and
+  why; `displayxr-cli conv use <task> <id>` pins one per user, and `DXR_CONV_EXCLUSIVE=<id>` in
+  the **service's** environment loads only that one (relaunch the service non-elevated from a
+  `.bat` that sets it). `DXR_CONV_SIM_CONVERSION_ENABLE=1` with `scripts\register_dev_plugin.bat
+  conv sim` exercises the whole path hardware-free.
+- **Choosing the display processor** for the legacy `dp-lift` row: `XRT_PREFERRED_PLUGIN_ID` does
+  *not* switch the active DP when an installed vendor plug-in also probes;
+  `DXR_PLUGIN_EXCLUSIVE=<plugin-id>` in the service's environment does.
+- **`displayxr-cli lift …` and `conv …` must run non-elevated** — an elevated prompt reports "not
+  connected to the service" (same integrity-level rule as every other IPC client).
+- **A provider's dependency too old.** A provider whose inference runtime is installed but older
+  than its floor reports `FAILED` with reason `VERSION` (spec 3: UNAVAILABLE), with the reason in
+  the service log and `conv status`; upgrade that runtime. A missing one reports `ABSENT`.
+- **Probe timing.** `lift probe` stamps submit→acquire before any readback; use `--no-write` (or
+  `--write-every N`) for throughput runs — encoding a 4K SBS PNG takes seconds and would
+  otherwise cap the pipelined rate.
