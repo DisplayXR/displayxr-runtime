@@ -647,7 +647,8 @@ input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShi
 | `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 5) | never reaches a spec-3 result |
 
 - `measure`: PLANAR (to the camera plane) or RAY (along the pixel ray).
-- `nearZ` / `farZ`: decoded units; `farZ < nearZ` = infinite far plane; both 0 = unknown.
+- `nearZ` / `farZ`: **depth readings** `d` (see the decoding table below), so `nearZ < farZ` for
+  every kind; `farZ < nearZ` = infinite far plane; both 0 = unknown.
 - `rangeValid`, `rangeMin` / `rangeMax`, `rangeP05` / `rangeP95`: **this frame's** extent in
   decoded units, before any normalisation. This is what lets the runtime's depth-budget and
   convergence policy work on affine depth, whose scale is unknown by definition.
@@ -660,9 +661,12 @@ input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShi
 **Units are never invented.** With an affine kind, near / far and the intrinsics are as reported
 or zero; a provider that does not know a field leaves it zero.
 
-**Decoding, normatively.** Every value field (`nearZ`, `farZ`, the range fields,
-`convergenceValue`) is in **decoded units** `v = rawScale · s + rawShift`, never inverted. What a
-caller computes from `v` depends on `kind`:
+**Decoding, normatively.** The range fields and `convergenceValue` are in **decoded units**
+`v = rawScale · s + rawShift`, never inverted. `nearZ` / `farZ` are **depth readings** `d` — the
+middle column below, the same quantity as spec 3's `convergenceDepth` — so their order is the
+same for every kind and `farZ < nearZ` keeps meaning an infinite far plane (for an inverse kind
+the nearest content has the largest `v`, `rangeMax`, and the smallest `d`, `nearZ`). What a caller
+computes from `v` depends on `kind`:
 
 | `kind` | depth reading `d` | inverse-depth coordinate `q` | a distance? |
 |---|---|---|---|

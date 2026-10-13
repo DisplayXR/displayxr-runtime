@@ -1104,9 +1104,11 @@ typedef struct XrLiftResultExportDXR {
  * XrLiftDepthResultDXR::next.
  *
  * Decoding (normative). A sample s DECODES to v = rawScale * s + rawShift.
- * Every value field of this struct (nearZ, farZ, the range fields,
- * invalidValue after decoding, convergenceValue) is in these decoded units v,
- * never inverted. From v, per @c kind:
+ * The range fields and convergenceValue are in these decoded units v, never
+ * inverted (invalidValue is a raw sample). nearZ / farZ are DEPTH READINGS d
+ * (the quantity of the table's middle column, and of spec 3's
+ * convergenceDepth), so nearZ < farZ for every kind and farZ < nearZ keeps
+ * meaning an infinite far plane. From v, per @c kind:
  *
  *   kind                  depth reading d        inverse-depth coordinate q
  *   METRIC_DEPTH          d = v (metres)         q = 1 / v  (1/metres)
@@ -1123,7 +1125,8 @@ typedef struct XrLiftResultExportDXR {
  * Units are never invented: with an AFFINE_* kind, near / far and the
  * intrinsics are as reported, or zero. farZ < nearZ means an infinite far
  * plane; both 0 = unknown. The range fields are THIS frame's statistics in
- * decoded units.
+ * decoded units; for an inverse kind their v of the nearest content is the
+ * LARGEST (rangeMax), while nearZ is the smallest d.
  */
 typedef struct XrLiftDepthInfoDXR {
     XrStructureType           type;               //!< XR_TYPE_LIFT_DEPTH_INFO_DXR
@@ -1134,8 +1137,8 @@ typedef struct XrLiftDepthInfoDXR {
     float                     rawShift;
     XrBool32                  invalidValueValid;
     float                     invalidValue;       //!< raw sample meaning "no depth"
-    float                     nearZ;              //!< decoded units; 0 = unknown
-    float                     farZ;               //!< decoded units; < nearZ = infinite; 0 = unknown
+    float                     nearZ;              //!< depth reading d of the nearest content; 0 = unknown
+    float                     farZ;               //!< depth reading d; < nearZ = infinite; 0 = unknown
     XrBool32                  rangeValid;
     float                     rangeMin;           //!< decoded, this frame
     float                     rangeMax;

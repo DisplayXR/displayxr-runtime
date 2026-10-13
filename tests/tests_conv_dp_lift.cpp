@@ -96,6 +96,7 @@ struct FakeLift
 	uint32_t depth_units = XRT_DP_LIFT_DEPTH_RELATIVE;
 	uint32_t depth_encoding = XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
 	float convergence_depth = 0.0f;
+	float near_depth = 0.0f, far_depth = 0.0f; //!< the module's depth range (depths)
 	float relief_scale = 0.0f;
 	float relief_offset = 0.0f;
 
@@ -219,6 +220,8 @@ fl_convert(void *ud, uint64_t, conv_dp_lift_convert *io)
 		io->depth.value_scale = 1.0f;
 		io->depth.same_inference = 1;
 		io->depth.convergence_depth = f->convergence_depth;
+		io->depth.near_depth = f->near_depth;
+		io->depth.far_depth = f->far_depth;
 		if (f->relief_scale != 0.0f) {
 			io->depth.relief_valid = 1;
 			io->depth.relief_scale = f->relief_scale;
@@ -1039,6 +1042,8 @@ TEST_CASE("dp-lift: convergence is the DECODED value; spec 3 and spec 4 read it 
 		f.convergence_depth = 2.0f;
 		f.relief_scale = 0.07f;
 		f.relief_offset = -0.02f;
+		f.near_depth = 0.75f;
+		f.far_depth = 9.0f;
 		Fixture fx(CONV_PREWARM_INTEREST);
 		REQUIRE(fx.add_dp_lift(&f) >= 0);
 		// The create warms the module (FIRST-create semantics of the fixture).
@@ -1075,5 +1080,10 @@ TEST_CASE("dp-lift: convergence is the DECODED value; spec 3 and spec 4 read it 
 		CHECK(r4.depth_info.relief_valid == 1u);
 		CHECK(r4.depth_info.relief_scale == Catch::Approx(0.07f));
 		CHECK(r4.depth_info.relief_offset == Catch::Approx(-0.02f));
+		// near / far are depth readings, copied as the module reports them.
+		CHECK(r4.depth_info.near_value == Catch::Approx(0.75f));
+		CHECK(r4.depth_info.far_value == Catch::Approx(9.0f));
+		CHECK(r.depth.near_depth == Catch::Approx(0.75f));
+		CHECK(r.depth.far_depth == Catch::Approx(9.0f));
 	}
 }

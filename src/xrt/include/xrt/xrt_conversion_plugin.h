@@ -477,7 +477,10 @@ struct xrt_conv_depth_info
 	uint32_t measure; //!< XRT_CONV_MEASURE_*
 	uint32_t intrinsics_source;
 	float value_scale, value_shift; //!< value = scale * sample + shift (scale 0 read as 1)
-	float near_value, far_value;    //!< decoded; far < near ⇒ infinite far; 0,0 = unknown
+	//! The DEPTH READING d of the nearest / farthest content (d = v for a depth
+	//! kind, 1 / v for an inverse kind; v = the decoded value), so near < far
+	//! for every kind; far < near ⇒ infinite far; 0,0 = unknown.
+	float near_value, far_value;
 	float invalid_sample;           //!< raw "no data" value; NaN = none
 	float range_min, range_max;     //!< decoded per-frame extent BEFORE any normalisation
 	float range_p05, range_p95;     //!< 0,0 = not computed
