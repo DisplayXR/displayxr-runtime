@@ -1320,3 +1320,26 @@ if(NOT WIN32 AND NOT ANDROID)
 	target_link_libraries(tests_ipc_input_queue_frame_tick PRIVATE xrt-external-catch2 aux_util aux_os)
 	add_test(NAME tests_ipc_input_queue_frame_tick COMMAND tests_ipc_input_queue_frame_tick --success)
 endif()
+
+# #886 -- VK_LAYER_DXR_queue_lock's activation routes through the REAL Vulkan
+# loader: the explicit + implicit manifests side by side (as the .deb installs
+# them), the enable2 injection unaffected by the implicit twin, the
+# DXR_VK_QUEUE_LOCK=1 opt-in for vulkan_enable1 apps, and the route the layer
+# reports. Desktop Linux only (the implicit manifest ships there); SKIPs (77)
+# without a Vulkan driver.
+if(NOT WIN32
+   AND NOT ANDROID
+   AND NOT APPLE
+   AND TARGET VkLayer_DXR_queue_lock
+   AND TARGET Vulkan::Vulkan
+	)
+	add_executable(tests_vk_queue_lock_activation tests_vk_queue_lock_activation.c)
+	target_link_libraries(tests_vk_queue_lock_activation PRIVATE Vulkan::Vulkan)
+	add_dependencies(tests_vk_queue_lock_activation VkLayer_DXR_queue_lock)
+	add_test(NAME tests_vk_queue_lock_activation
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests_vk_queue_lock_activation.sh
+			 $<TARGET_FILE:tests_vk_queue_lock_activation>
+			 $<TARGET_FILE_DIR:VkLayer_DXR_queue_lock>
+		)
+	set_tests_properties(tests_vk_queue_lock_activation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endif()
