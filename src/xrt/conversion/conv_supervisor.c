@@ -330,6 +330,26 @@ conv_supervisor_exited(struct conv_supervisor *s, uint64_t now_ns, int32_t exit_
 }
 
 void
+conv_supervisor_idle_exited(struct conv_supervisor *s, uint64_t now_ns)
+{
+	(void)now_ns;
+	switch (s->state) {
+	case CONV_SUP_STARTING:
+	case CONV_SUP_RUNNING:
+	case CONV_SUP_STOPPING:
+	case CONV_SUP_KILLING: break;
+	default: return; // stale: no process was alive
+	}
+	s->last_exit = CONV_HOST_EXIT_ORDERLY;
+	s->pending_spawn_report = false;
+	s->terminate_due = false;
+	s->shutdown_due = false;
+	s->kill_reason = CONV_SUP_KILL_NONE;
+	go_down_idle(s);
+	s->running_since_ns = 0;
+}
+
+void
 conv_supervisor_config_changed(struct conv_supervisor *s, uint64_t now_ns)
 {
 	(void)now_ns;
