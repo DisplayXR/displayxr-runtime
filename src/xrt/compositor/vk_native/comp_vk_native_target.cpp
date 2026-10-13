@@ -47,6 +47,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 // Portable (all OSes) — the witness is exactly for paths/platforms the
 // Windows-only latency harness cannot measure.
 #include "util/comp_vblank_grid.h"
+#include "util/comp_residual_window.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -612,6 +613,9 @@ struct comp_vk_native_target
 	uint64_t residual_ns;
 	uint32_t residual_samples;
 	uint64_t residual_last_log_ns;
+	//! #2068: every residual sample of the current 5 s trace window, so the
+	//! trace reports a distribution rather than the last sample.
+	struct comp_residual_window residual_win;
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	/*!
@@ -2399,12 +2403,20 @@ target_log_residual(struct comp_vk_native_target *target)
 		const uint64_t now2 = os_monotonic_get_ns();
 		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
 			target->residual_last_log_ns = now2;
-			U_LOG_W(
-			    "#206: last measured weave->scanout residual %.2f ms "
-			    "(%.2f refresh periods, n=%u)",
-			    target->residual_ns / 1e6,
-			    (double)target->residual_ns / (double)target->vblank_grid.period_ns,
-			    target->residual_samples);
+			// #2068: the window's distribution, not the last sample — an
+			// early transient read as the steady state on a panel A/B.
+			const double per = (double)target->vblank_grid.period_ns;
+			const struct comp_residual_stats st =
+			    comp_residual_window_take(&target->residual_win, target->vblank_grid.period_ns);
+			if (st.n != 0) {
+				U_LOG_W(
+				    "#206: weave->scanout residual over 5 s — n=%llu mean %.2f ms (%.2f periods), "
+				    "p50 %.2f ms (%.2f), p95 %.2f ms (%.2f), max %.2f ms (%.2f), >1.5 periods %.1f%%%s",
+				    (unsigned long long)st.n, st.mean_ns / 1e6, st.mean_ns / per, st.p50_ns / 1e6,
+				    (double)st.p50_ns / per, st.p95_ns / 1e6, (double)st.p95_ns / per, st.max_ns / 1e6,
+				    (double)st.max_ns / per, st.frac_over_1p5 * 100.0,
+				    st.truncated ? " (percentiles over the first 2048)" : "");
+			}
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (target->lw_lead.base_vblanks != 0) {
 				U_LOG_W("#2068: grid late weave — desktop floor %u vblank(s) commit-to-glass; %s lead "
@@ -2538,6 +2550,7 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 				if (res < 200ULL * 1000 * 1000) { // a stalled frame is not a latency
 					target->residual_ns = res;
 					target->residual_samples++;
+					comp_residual_window_add(&target->residual_win, res);
 				}
 			}
 
@@ -2799,6 +2812,7 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		 */
 		target->residual_ns = r;
 		target->residual_samples++;
+		comp_residual_window_add(&target->residual_win, r);
 	}
 
 	target_log_residual(target);
@@ -3703,6 +3717,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					    now_ns - started < 200ULL * 1000 * 1000) {
 						target->residual_ns = now_ns - started;
 						target->residual_samples++;
+						comp_residual_window_add(&target->residual_win, now_ns - started);
 						// No feeder to call the trace (it logs from its pump).
 						target_log_residual(target);
 					}

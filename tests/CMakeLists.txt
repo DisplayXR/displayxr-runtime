@@ -49,6 +49,7 @@ set(tests
     tests_comp_vblank_grid
     tests_comp_present_feedback
     tests_comp_late_weave_adapt
+    tests_comp_residual_window
     tests_comp_zone_tier1
     tests_comp_swapchain_ring
     tests_aux_bg_neutrality
@@ -760,6 +761,8 @@ target_include_directories(tests_comp_vblank_grid PRIVATE ${PROJECT_SOURCE_DIR}/
 target_include_directories(tests_comp_present_feedback PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #2068: self-correcting late-weave deadlines on a composited desktop. Header-only.
 target_include_directories(tests_comp_late_weave_adapt PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2068: windowed #206 residual statistics. Header-only.
+target_include_directories(tests_comp_residual_window PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # #1748 -- the move-sync tag encode is a header-only function in vk_native.
 target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor

@@ -120,7 +120,8 @@ which behind a compositor is every frame: the panel log was `lead 12.17 ms, aime
 4 [OFF]`.) The tier is **opt-in** behind `DXR_LATE_WEAVE_LINUX_GRID=1` until a panel A/B shows it
 holds the present rate. Without the opt-in an enable1 session logs `#902: grid late weave NOT
 engaged — opt-in on desktop Linux …` and the grid is still fed. `DXR_WEAVE_CADENCE_TRACE=1` logs
-the `#206` residual and `#2068: grid late weave — desktop floor N vblank(s) commit-to-glass; …
+the `#206` residual — as per-5 s window statistics (n, mean, p50, p95, max, % above 1.5 periods), not
+a single sample, because early samples are transients — and `#2068: grid late weave — desktop floor N vblank(s) commit-to-glass; …
 lead …, aimed hits …, misses …` every 5 s.
 
 **The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
