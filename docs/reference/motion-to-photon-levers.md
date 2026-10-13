@@ -84,6 +84,21 @@ workspace  29 -> 17 ms
 Late weave depends on present-timing feedback from the swapchain. Where the platform does not
 provide it, it is **dormant** rather than wrong — see the topology table.
 
+**Desktop Linux (Vulkan, #2059).** Two sources, chosen per session, both behind `DXR_LATE_WEAVE`:
+
+| Tier | Source | Covers | Log line when it engages |
+|---|---|---|---|
+| present_wait (#2060) | `VK_KHR_present_wait` — acquire blocks until the previous present hit glass, as on Windows | **enable2 apps** (Unity and anything using `xrCreateVulkanDeviceKHR`: the runtime chains `presentId`/`presentWait` itself) | `#902: late weave on VK_KHR_present_wait — pacing on present id N-0 hitting glass` |
+| measured grid (#2062) | the window system's presentation feedback anchors `comp_vblank_grid.h`: native Wayland `wp_presentation` (`presented`: timestamp, refresh, seq, `vsync`/`hw_clock`), X11 Present `CompleteNotify` (`ust`/`msc`) | **enable1 apps** that did not chain the features, and any session where present_wait never resolves | `#902: late weave on the measured grid — period …, … (grid source: wp_presentation \| x11-present)` |
+
+`VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
+samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in
+`CLOCK_MONOTONIC`, derives the period from the vblank counter when no refresh value is given, and
+logs one `#902: <source> feed — …` line per state change. `DXR_VK_PRESENT_FEEDBACK=0` turns the
+feeder off. Not yet measured on a panel: whether the grid tier's 1.5 ms margin clears the desktop
+compositor's own latch deadline (read the `#206` residual with the cadence trace on — about one
+period or less means the targeted vblank was hit).
+
 **The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
 Every queue level the governor adds moves the flip one whole period later, and #1437's learned
 pipeline offset follows it with ~0.5 s of lag — so every depth change is ~0.5 s of a
@@ -565,7 +580,7 @@ moves the present any more. Re-open it only if a deferred-present mechanism is e
 
 | | dGPU (discrete, multi-queue) | iGPU (integrated) | Hybrid laptop |
 |---|---|---|---|
-| Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
+| Late weave | **on**, fully effective | **on**; on Windows *dormant on VK* where the driver exposes no VK present-timing extensions — on desktop Linux fed by `VK_KHR_present_wait` or the window system (above) | on; effective on whichever adapter owns the present |
 | Repaint | **on**, tier 1 dedicated queue (enable2); enable1 apps: tier 2 only, opt-in `DXR_VK_QUEUE_LOCK=1` (#886) | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) — injected for enable2; enable1 apps opt in with `DXR_VK_QUEUE_LOCK=1` (#886) | on; follows the adapter the session was created on |
 | `DXR_DEFER_PRESENT` | *removed from the code* | *removed* | *removed* |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |

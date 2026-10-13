@@ -344,6 +344,9 @@ target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd,
  * apps do when the runtime advertises the extensions); when the proc is
  * missing the harness stays dormant.
  */
+#endif // XRT_OS_WINDOWS
+
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 /*
  * Late-weave (DXR_LATE_WEAVE=1): pace the frame on the PREVIOUS present
  * hitting glass (vkWaitForPresentKHR in acquire) — the VK equivalent of the
@@ -369,7 +372,9 @@ vk_late_weave_max_latency()
 	}
 	return lat;
 }
+#endif // XRT_OS_WINDOWS || XRT_OS_LINUX_DESKTOP
 
+#ifdef XRT_OS_WINDOWS
 struct wl_harness
 {
 	FILE *f = nullptr;
@@ -620,6 +625,29 @@ struct comp_vk_native_target
 	//! What the samples did to the grid (trust, debounced state, totals).
 	struct comp_present_feedback pf_state;
 	bool pf_period_refused_logged;
+
+	/*!
+	 * #2060 / #902 desktop Linux: the VK_KHR_present_wait late-weave tier —
+	 * the Windows tier's twin, minus the QPC harness. The enable2 path enables
+	 * present_id + present_wait on every device it creates (oxr_vulkan.c), and
+	 * Mesa supports both on Wayland and X11, so enable2 apps pace on the
+	 * previous present hitting glass. Ids are per-swapchain; reset on
+	 * recreate. Where it is absent (enable1 apps that did not chain the
+	 * features) the grid tier above takes over.
+	 */
+	PFN_vkWaitForPresentKHR present_wait_fn;
+	bool present_wait_probed;
+	//! The wait never resolved (features not enabled by an enable1 app):
+	//! the tier stands down for the session, the grid tier takes over.
+	bool present_wait_latched_off;
+	bool present_wait_ever_ok;
+	bool present_wait_logged;
+	uint32_t present_wait_timeouts;
+	uint64_t present_id_counter;
+	uint64_t last_present_id;
+	//! Weave start per present id (id % 8), for the residual at wait return.
+	uint64_t present_weave_ring_id[8];
+	uint64_t present_weave_ring_ns[8];
 #endif
 
 	//! When the refresh period was last re-read (ns). The panel is
@@ -2473,6 +2501,34 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 }
 #endif // XRT_OS_LINUX_DESKTOP
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2060: resolve vkWaitForPresentKHR once per target (Linux twin of the
+ * Windows resolver). NULL when late weave is off, when the app's device did not
+ * enable VK_KHR_present_wait, or once the tier latched off because the wait
+ * never resolved.
+ */
+static PFN_vkWaitForPresentKHR
+target_present_wait_fn(struct comp_vk_native_target *target)
+{
+	if (!dxr_late_weave_enabled() || target->present_wait_latched_off) {
+		return nullptr;
+	}
+	if (!target->present_wait_probed) {
+		struct vk_bundle *vk = target->vk;
+		target->present_wait_probed = true;
+		target->present_wait_fn =
+		    (PFN_vkWaitForPresentKHR)vk->vkGetDeviceProcAddr(vk->device, "vkWaitForPresentKHR");
+		U_LOG_W("#902: VK_KHR_present_wait %s — %s", target->present_wait_fn != nullptr ? "present" : "absent",
+		        target->present_wait_fn != nullptr
+		            ? "late weave paces on the previous present hitting glass (enable2 apps)"
+		            : "late weave uses the measured vblank grid (enable1 apps that did not chain "
+		              "presentId/presentWait)");
+	}
+	return target->present_wait_fn;
+}
+#endif
+
 static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {
@@ -3185,9 +3241,10 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	 * not its competitor.
 	 */
 	bool have_present_wait = false;
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 	// present_wait is the better tier where it exists — a real sync point
-	// rather than a projection — so the grid stands down for it.
+	// rather than a projection — so the grid stands down for it. (Desktop
+	// Linux since #2060.)
 	have_present_wait = (target_present_wait_fn(target) != NULL);
 #endif
 	if (dxr_late_weave_enabled() && !have_present_wait) {
@@ -3467,6 +3524,55 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2060: the same pacing on desktop Linux — block until the previous
+	// present hit glass, so record + weave + present run inside one refresh.
+	if (target->last_present_id != 0) {
+		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
+		if (wait_fn != nullptr) {
+			const uint64_t relax = (uint64_t)(vk_late_weave_max_latency() - 1);
+			const uint64_t wait_id = target->last_present_id > relax ? target->last_present_id - relax : 0;
+			if (wait_id != 0) {
+				const VkResult wres =
+				    wait_fn(vk->device, target->swapchain, wait_id, 100ull * 1000 * 1000);
+				const uint64_t now_ns = os_monotonic_get_ns();
+				if (wres == VK_SUCCESS) {
+					target->present_wait_timeouts = 0;
+					target->present_wait_ever_ok = true;
+					if (!target->present_wait_logged) {
+						target->present_wait_logged = true;
+						U_LOG_W("#902: late weave on VK_KHR_present_wait — pacing on present id N-%llu "
+						        "hitting glass (DXR_LATE_WEAVE_MAX_LATENCY=%d)",
+						        (unsigned long long)relax, vk_late_weave_max_latency());
+					}
+					// #206 residual, only where no window-system feedback
+					// measures it more exactly (wait return = glass + wake-up).
+					const uint64_t started = (target->present_weave_ring_id[wait_id % 8] == wait_id)
+					                             ? target->present_weave_ring_ns[wait_id % 8]
+					                             : 0;
+					if (target->present_fb == NULL && started != 0 && now_ns > started &&
+					    now_ns - started < 200ULL * 1000 * 1000) {
+						target->residual_ns = now_ns - started;
+						target->residual_samples++;
+					}
+				} else if (wres == VK_TIMEOUT && !target->present_wait_ever_ok &&
+				           ++target->present_wait_timeouts >= 3) {
+					// Never resolved once: the entry point exists but the
+					// features were not enabled (an enable1 app), or the
+					// WSI cannot report. Occlusion is not this case — that
+					// only times out AFTER waits have succeeded.
+					target->present_wait_latched_off = true;
+					U_LOG_W("#902: VK_KHR_present_wait never resolved (3 timeouts, 0 successes) — "
+					        "present_wait tier OFF for this session, the measured vblank grid takes over");
+				}
+				// The weave starts now, after the pacing wait: the budget
+				// and the residual measure from here.
+				target->weave_start_ns = os_monotonic_get_ns();
+			}
+		}
+	}
+#endif
+
 	/*
 	 * An image a dropped fill acquired but never presented (see
 	 * comp_vk_native_target_hold_unpresented) is still OURS: hand it out
@@ -3513,6 +3619,8 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		target->refresh_cycle_probed = false;
 #ifdef XRT_OS_LINUX_DESKTOP
 		comp_present_feedback_reset_phase(&target->pf_state);
+		target->present_id_counter = 0; // present ids are per-swapchain (#2060)
+		target->last_present_id = 0;
 #endif
 
 		{
@@ -3725,6 +3833,22 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2060: tag the present with a VkPresentIdKHR for the present_wait tier
+	// (Linux twin of the Windows block above). Never for an uncounted present.
+	uint64_t pw_id = 0;
+	// Captured now: the counted-present block below consumes weave_start_ns.
+	const uint64_t pw_weave_start = target->weave_start_ns;
+	VkPresentIdKHR pw_present_id = {};
+	if (counted && present_info.pNext == NULL && target_present_wait_fn(target) != nullptr) {
+		pw_id = ++target->present_id_counter;
+		pw_present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+		pw_present_id.swapchainCount = 1;
+		pw_present_id.pPresentIds = &pw_id;
+		present_info.pNext = &pw_present_id;
+	}
+#endif
+
 	/*
 	 * #902: tag the present so the driver RECORDS its timing.
 	 *
@@ -3809,6 +3933,14 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 			target->weave_start_ns = 0;
 		}
 	}
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (pw_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+		target->last_present_id = pw_id;
+		target->present_weave_ring_id[pw_id % 8] = pw_id;
+		target->present_weave_ring_ns[pw_id % 8] = pw_weave_start;
+	}
+#endif
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
@@ -4028,6 +4160,8 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	target->refresh_cycle_probed = false;
 #ifdef XRT_OS_LINUX_DESKTOP
 	comp_present_feedback_reset_phase(&target->pf_state);
+	target->present_id_counter = 0; // present ids are per-swapchain (#2060)
+	target->last_present_id = 0;
 #endif
 
 	// The crash this exists to stop: below, target->swapchain is set to
