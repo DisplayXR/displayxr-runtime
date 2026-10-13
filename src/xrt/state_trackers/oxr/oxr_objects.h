@@ -2471,6 +2471,15 @@ struct oxr_system
 	int32_t vulkan_runtime_queue_family;
 	int32_t vulkan_runtime_queue_index;
 
+	/*!
+	 * #886: the runtime itself added VK_LAYER_DXR_queue_lock to the
+	 * VkInstanceCreateInfo at xrCreateVulkanInstanceKHR (vulkan_enable2, the
+	 * app had not named it, and the injected create succeeded). Lets the
+	 * compositor tell the "injected" route from "app-enabled" — the layer
+	 * only sees that it was NAMED, not by whom.
+	 */
+	bool vulkan_queue_lock_injected;
+
 	struct
 	{
 		// No better place to keep this state.

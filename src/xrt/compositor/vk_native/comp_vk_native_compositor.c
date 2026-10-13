@@ -49,6 +49,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_setting.h"
+#include "util/u_vk_queue_lock.h"
 #include "util/u_weave_scope.h"
 #include "util/u_display_mode_hold.h"
 #include "util/u_debug.h"
@@ -883,6 +884,24 @@ struct comp_vk_native_compositor
 	VkQueue repaint_queue;
 	int32_t repaint_queue_family;
 	int32_t repaint_queue_index;
+
+	/*!
+	 * #886: VK_LAYER_DXR_queue_lock as resolved on THIS device at create,
+	 * plus who created the device (set by the state tracker right after
+	 * create, comp_vk_native_compositor_set_vk_device_origin). Read-only
+	 * after that, except the one-shot log flag.
+	 */
+	struct
+	{
+		bool layer_live;             //!< #902 marker resolved
+		uint32_t activation;         //!< enum u_vk_ql_activation from the layer
+		uint32_t family_queue_count; //!< queues in the app's graphics family
+		bool origin_known;           //!< set_vk_device_origin was called
+		bool app_created_device;     //!< vulkan_enable1
+		bool runtime_injected;       //!< the runtime named the layer (enable2)
+		enum u_vk_ql_route route;    //!< resolved at set_vk_device_origin
+		bool serialisation_noted;    //!< one-shot runtime#2039 guard line
+	} ql;
 
 	/*!
 	 * #868: fence and command pool used ONLY by the repaint replay.
@@ -13086,7 +13105,34 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * entry point rather than assume the injection worked.
 		 */
 		bool layer_live = c->vk.vkGetDeviceProcAddr != NULL &&
-		                  c->vk.vkGetDeviceProcAddr(c->vk.device, "vkGetQueueLockMarkerDXR") != NULL;
+		                  c->vk.vkGetDeviceProcAddr(c->vk.device, U_VK_QL_MARKER_FN) != NULL;
+		/*
+		 * #886: and HOW it got there — the layer reports whether it was
+		 * named in the VkInstanceCreateInfo, enabled by its implicit
+		 * manifest, or forced by the loader's env. The route itself is
+		 * logged once the state tracker says who created the device
+		 * (comp_vk_native_compositor_set_vk_device_origin).
+		 */
+		c->ql.layer_live = layer_live;
+		c->ql.activation = U_VK_QL_ACT_UNKNOWN;
+		if (layer_live) {
+			typedef uint32_t(VKAPI_PTR * PFN_ql_activation)(VkDevice device);
+			PFN_ql_activation ql_act =
+			    (PFN_ql_activation)c->vk.vkGetDeviceProcAddr(c->vk.device, U_VK_QL_ACTIVATION_FN);
+			if (ql_act != NULL) {
+				c->ql.activation = ql_act(c->vk.device);
+			}
+		}
+		c->ql.family_queue_count = 0;
+		if (c->vk.vkGetPhysicalDeviceQueueFamilyProperties != NULL) {
+			uint32_t qf_n = 0;
+			c->vk.vkGetPhysicalDeviceQueueFamilyProperties(c->vk.physical_device, &qf_n, NULL);
+			if (c->queue_family_index < qf_n && qf_n <= 64) {
+				VkQueueFamilyProperties qf_props[64];
+				c->vk.vkGetPhysicalDeviceQueueFamilyProperties(c->vk.physical_device, &qf_n, qf_props);
+				c->ql.family_queue_count = qf_props[c->queue_family_index].queueCount;
+			}
+		}
 		/*
 		 * #1905: a live layer must NOT pull a multi-queue device onto the
 		 * shared-queue tier — the repaint_queue == NULL term below is what
@@ -13124,11 +13170,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
 			if (c->repaint.enabled == 1) {
-				U_LOG_W("#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
-				        "family was saturated) and no queue-lock layer (#902 marker %s) — "
-				        "repaint disabled. Sharing the app's queue bare is undefined "
-				        "behaviour and loses the device.",
-				        layer_live ? "resolved but mode excludes it" : "absent");
+				U_LOG_W(
+				    "#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
+				    "family was saturated) and no queue-lock layer (#902 marker %s) — "
+				    "repaint disabled. Sharing the app's queue bare is undefined "
+				    "behaviour and loses the device.%s",
+				    layer_live ? "resolved but mode excludes it" : "absent",
+				    layer_live ? "" : " For a vulkan_enable1 app: " U_VK_QL_ENABLE1_HINT " (#886).");
 			}
 			c->repaint.enabled = 0;
 		} else {
@@ -15495,6 +15543,85 @@ struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c)
 {
 	return &c->vk;
+}
+
+void
+comp_vk_native_compositor_set_vk_device_origin(struct xrt_compositor *xc,
+                                               bool app_created_device,
+                                               bool runtime_injected)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->ql.origin_known = true;
+	c->ql.app_created_device = app_created_device;
+	c->ql.runtime_injected = runtime_injected;
+	c->ql.route = u_vk_ql_route_resolve(c->ql.layer_live, c->ql.activation, runtime_injected);
+
+	const char *how = "";
+	switch (c->ql.route) {
+	case U_VK_QL_ROUTE_ABSENT:
+		how = app_created_device ? "not in the app's chain — " U_VK_QL_ENABLE1_HINT
+		                         : "not in the chain — the injection at xrCreateVulkanInstanceKHR did not take "
+		                           "(see the #902 line there) or DXR_VK_QUEUE_MODE=off|queue";
+		break;
+	case U_VK_QL_ROUTE_INJECTED: how = "the runtime named it at xrCreateVulkanInstanceKHR"; break;
+	case U_VK_QL_ROUTE_APP_ENABLED: how = "the app named it in its own VkInstanceCreateInfo"; break;
+	case U_VK_QL_ROUTE_IMPLICIT: how = "implicit manifest, DXR_VK_QUEUE_LOCK=1"; break;
+	case U_VK_QL_ROUTE_LOADER_ENV:
+		how = "forced by the loader env (VK_INSTANCE_LAYERS / VK_LOADER_LAYERS_ENABLE)";
+		break;
+	case U_VK_QL_ROUTE_UNKNOWN: how = "live, but the layer predates the activation query"; break;
+	}
+	const char *tier = c->repaint.enabled != 1              ? "none (repaint off)"
+	                   : c->repaint_queue != VK_NULL_HANDLE ? "runtime-owned queue"
+	                   : c->repaint.shared_queue == 1       ? "shared app queue (serialised by the layer)"
+	                                                        : "none (repaint off)";
+	U_LOG_W(
+	    "#886: VK_LAYER_DXR_queue_lock route=%s (%s) — %s device, graphics family has %u queue(s), "
+	    "repaint tier: %s",
+	    u_vk_ql_route_str(c->ql.route), how,
+	    app_created_device ? "app-created (vulkan_enable1)" : "runtime-created (vulkan_enable2)",
+	    c->ql.family_queue_count, tier);
+}
+
+bool
+comp_vk_native_compositor_get_queue_lock_state(struct xrt_compositor *xc, bool *out_layer_live, bool *out_repaint)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (out_layer_live != NULL) {
+		*out_layer_live = c->ql.layer_live;
+	}
+	if (out_repaint != NULL) {
+		*out_repaint = c->repaint.enabled == 1;
+	}
+	return c->repaint.shared_queue == 1;
+}
+
+void
+comp_vk_native_compositor_note_app_swapchain(struct comp_vk_native_compositor *c, uint32_t image_count)
+{
+	/*
+	 * #886 / runtime#2039 guard — LOG ONLY. The app's swapchain depth is the
+	 * runtime's only view of how many app frames can be queued on the queue
+	 * the layer now serialises (one image is the one the compositor reads).
+	 * The #2039 collapse was later attributed to a tracked viewer and a low
+	 * GPU clock, not to the layer — so this states the condition and the A/B
+	 * switch, and changes nothing.
+	 */
+	uint32_t fif = image_count > 0 ? image_count - 1 : 0;
+	if (c->ql.serialisation_noted || !c->ql.origin_known || c->ql.family_queue_count != 1 ||
+	    !u_vk_ql_should_note_serialisation(c->ql.app_created_device, c->ql.layer_live, c->repaint.shared_queue == 1,
+	                                       fif)) {
+		return;
+	}
+	c->ql.serialisation_noted = true;
+	U_LOG_W(
+	    "#868: per-call queue serialisation in effect — a vulkan_enable1 app on a single-graphics-queue "
+	    "GPU, VK_LAYER_DXR_queue_lock live (route=%s), the repaint sharing the app's queue, and %u-deep "
+	    "app swapchains (up to %u app frames in flight on that queue). Every vkQueue* call — the app's "
+	    "and the repaint's — now takes the layer's per-queue lock. For an A/B, DXR_WEAVE_REPAINT=0 turns "
+	    "the repaint loop off (the layer stays; DXR_VK_QUEUE_LOCK_DISABLE=1 or not enabling it removes it). "
+	    "Logged, not acted on (runtime#2039).",
+	    u_vk_ql_route_str(c->ql.route), image_count, fif);
 }
 
 void

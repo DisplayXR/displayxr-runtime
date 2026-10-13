@@ -687,6 +687,9 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 
 	*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
 
+	// #886: remember who put the layer there, for the compositor's route log.
+	sys->vulkan_queue_lock_injected = (merged_layers != NULL && *vulkanResult == VK_SUCCESS);
+
 	/*
 	 * #902: the layer is an optimization, never a break. If the FIRST attempt
 	 * failed for ANY reason while our layer was injected — the loader could not
