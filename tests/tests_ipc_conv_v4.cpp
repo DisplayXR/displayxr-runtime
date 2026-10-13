@@ -444,3 +444,101 @@ TEST_CASE("depth-kind contract: task depthKinds, the v3 reading, XrLiftDepthInfo
 	CHECK(o.farZ == 20.0f);
 	CHECK(o.discontinuity == XR_FALSE);
 }
+
+TEST_CASE("depth decoding per kind: convergence and relief follow the normative table", "[ipc_conv_v4]")
+{
+	// XR_DXR_lift.h, XrLiftDepthInfoDXR: every value field is DECODED v; the
+	// depth reading d is v or 1 / v, the inverse-depth coordinate q is 1 / v
+	// or v, per kind. The relief is affine in q; spec 3's convergenceDepth is
+	// d of the convergence value.
+	struct Row
+	{
+		uint32_t kind;
+		bool inverse;
+	};
+	const Row rows[] = {
+	    {XRT_CONV_DEPTH_METRIC, false},        {XRT_CONV_DEPTH_METRIC_INVERSE, true},
+	    {XRT_CONV_DEPTH_AFFINE_INVERSE, true}, {XRT_CONV_DEPTH_AFFINE_DISPARITY, true},
+	    {XRT_CONV_DEPTH_AFFINE, false},
+	};
+	for (const Row &row : rows) {
+		CAPTURE(row.kind);
+		const float vc = 1.25f; // decoded value on the screen plane (inside the fake's 1..2 ramp)
+		conv_fake_provider f;
+		conv_fake_init(&f, "fake");
+		conv_fake_cap *v = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+		                                     XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH, 0);
+		v->cap.depth_kind = row.kind;
+		v->convert_ms = 1;
+		v->convergence_value = vc;
+		v->relief_scale = 0.08f;
+		v->relief_offset = -0.03f;
+		conv_fake_set_state(&f, 4, XRT_CONV_STATE_READY, 0, false);
+		{
+			Fixture fx;
+			fx.install_glue();
+			REQUIRE(fx.add(f) >= 0);
+
+			// Spec 3: convergenceDepth is the depth reading.
+			uint64_t id3 = 0;
+			REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f,
+			                                           XRT_DP_LIFT_AUX_DEPTH, 0, &id3) == XRT_SUCCESS);
+			bool ready = false;
+			ipc_lift_result r{};
+			REQUIRE(wait_until(
+			    [&] {
+				    fx.submit(1, id3);
+				    return ipc_server_conv_lift_acquire(fx.sc, 1, id3, &ready, &r) == XRT_SUCCESS &&
+				           ready;
+			    },
+			    3000));
+			REQUIRE(r.depth.valid == 1u);
+			CHECK(r.depth.convergence_depth == Catch::Approx(row.inverse ? 1.0f / vc : vc));
+			CHECK(r.depth.encoding ==
+			      (row.inverse ? XRT_DP_LIFT_DEPTH_ENCODING_INVERSE : XRT_DP_LIFT_DEPTH_ENCODING_LINEAR));
+
+			// Spec 4: the decoded value as reported; the relief in q.
+			uint64_t id4 = 0;
+			REQUIRE(fx.create_task(1, XRT_CONV_TASK_VIEWS_MONO, &id4, 2,
+			                       IPC_SERVER_CONV_OUTPUT_AUX_DEPTH) == XRT_SUCCESS);
+			bool disc = false;
+			ipc_lift_result r3{};
+			xrt_conv_wire_result r4{};
+			REQUIRE(wait_until(
+			    [&] {
+				    fx.submit(1, id4);
+				    return ipc_server_conv_v4_acquire(fx.sc, 1, id4, &ready, &disc, &r3, &r4) ==
+				               XRT_SUCCESS &&
+				           ready;
+			    },
+			    3000));
+			XrLiftDepthInfoDXR di{XR_TYPE_LIFT_DEPTH_INFO_DXR};
+			oxr_conv_depth_info_from_wire(&r4.depth_info, false, &di);
+			CHECK((uint32_t)di.kind == row.kind);
+			CHECK(di.convergenceValid == XR_TRUE);
+			CHECK(di.convergenceValue == Catch::Approx(vc)); // decoded, never inverted
+			XrLiftViewsInfoDXR vi{XR_TYPE_LIFT_VIEWS_INFO_DXR};
+			oxr_conv_views_info_from_wire(&r4.views_info, r4.views_width, r4.views_height, &r4.depth_info,
+			                              &vi);
+			CHECK(vi.reliefValid == XR_TRUE);
+			CHECK(vi.reliefScale == Catch::Approx(0.08f));
+			CHECK(vi.reliefOffset == Catch::Approx(-0.03f));
+
+			// A texel decoding to v: its depth reading, its q, its display z.
+			const float sample_v = 1.6f;
+			float d = 0.0f, q = 0.0f;
+			REQUIRE(oxr_conv_depth_reading(row.kind, sample_v, &d));
+			REQUIRE(oxr_conv_inverse_coord(row.kind, sample_v, &q));
+			CHECK(d == Catch::Approx(row.inverse ? 1.0f / sample_v : sample_v));
+			CHECK(q == Catch::Approx(1.0f / d));
+			const float z = vi.reliefScale * q + vi.reliefOffset;
+			CHECK(z == Catch::Approx(0.08f * (row.inverse ? sample_v : 1.0f / sample_v) - 0.03f));
+			// The convergence plane's own q: nearer content (larger q) is in front of it.
+			float qc = 0.0f;
+			REQUIRE(oxr_conv_inverse_coord(row.kind, di.convergenceValue, &qc));
+			CHECK((q > qc) == (row.inverse ? sample_v > vc : sample_v < vc));
+			CHECK_FALSE(oxr_conv_inverse_coord(row.kind, 0.0f, &q)); // no data never decodes
+		}
+		conv_fake_fini(&f);
+	}
+}

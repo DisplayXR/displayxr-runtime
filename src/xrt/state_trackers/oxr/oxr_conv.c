@@ -1169,7 +1169,9 @@ lift_fill_v4_info(const struct xrt_conv_wire_result *r4,
 		views_info->type = type;
 		views_info->next = next;
 		if ((r4->written & XRT_CONV_OUT_VIEWS) != 0) {
-			oxr_conv_views_info_from_wire(&r4->views_info, r4->views_width, r4->views_height, views_info);
+			oxr_conv_views_info_from_wire(&r4->views_info, r4->views_width, r4->views_height,
+			                              (r4->written & XRT_CONV_OUT_DEPTH) != 0 ? &r4->depth_info : NULL,
+			                              views_info);
 		}
 	}
 }

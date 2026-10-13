@@ -33,6 +33,39 @@
 extern "C" {
 #endif
 
+/*!
+ * The decoding table of XrLiftDepthInfoDXR (normative, see the header): an
+ * inverse kind's decoded value v is an inverse depth.
+ */
+static inline bool
+oxr_conv_depth_kind_is_inverse(uint32_t kind)
+{
+	return kind == XRT_CONV_DEPTH_METRIC_INVERSE || kind == XRT_CONV_DEPTH_AFFINE_INVERSE ||
+	       kind == XRT_CONV_DEPTH_AFFINE_DISPARITY || kind == XRT_CONV_DEPTH_STEREO_DISPARITY_PX;
+}
+
+//! The depth reading d of a decoded value v (v itself, or 1 / v for an inverse kind); false when v <= 0.
+static inline bool
+oxr_conv_depth_reading(uint32_t kind, float v, float *out_d)
+{
+	if (!(v > 0.0f) || !isfinite(v)) {
+		return false;
+	}
+	*out_d = oxr_conv_depth_kind_is_inverse(kind) ? 1.0f / v : v;
+	return true;
+}
+
+//! The inverse-depth coordinate q of a decoded value v (v for an inverse kind, else 1 / v); false when v <= 0.
+static inline bool
+oxr_conv_inverse_coord(uint32_t kind, float v, float *out_q)
+{
+	if (!(v > 0.0f) || !isfinite(v)) {
+		return false;
+	}
+	*out_q = oxr_conv_depth_kind_is_inverse(kind) ? v : 1.0f / v;
+	return true;
+}
+
 //! The tasks a spec-4 app may name (spec-5 and reserved ones fail validation).
 static inline bool
 oxr_conv_task_is_spec4(XrLiftTaskDXR task)
@@ -168,6 +201,9 @@ oxr_conv_depth_info_from_wire(const struct xrt_conv_wire_depth_info *w, bool dis
 	o->temporallyConsistent = w->temporal != 0 ? XR_TRUE : XR_FALSE;
 	o->discontinuity = discontinuity ? XR_TRUE : XR_FALSE;
 	o->baselineMeters = 0.0f; // PIXEL_DISPARITY is spec 5
+	// Decoded units, as the provider reported (never converted to a depth).
+	o->convergenceValid = (w->suggest_flags & 4u) != 0 && isfinite(w->convergence_value) ? XR_TRUE : XR_FALSE;
+	o->convergenceValue = o->convergenceValid ? w->convergence_value : 0.0f;
 }
 
 /*!
@@ -203,11 +239,16 @@ oxr_conv_depth_kind_to_v3(uint32_t kind, XrLiftDepthSemanticsDXR *units, XrLiftD
 	}
 }
 
-//! A views twin (+ the export extent) -> XrLiftViewsInfoDXR.
+/*!
+ * A views twin (+ the export extent, + the same result's depth twin when it
+ * carries depth: the relief, z = reliefScale * q + reliefOffset, lives there
+ * in the same q convention) -> XrLiftViewsInfoDXR.
+ */
 static inline void
 oxr_conv_views_info_from_wire(const struct xrt_conv_wire_views_info *w,
                               uint32_t views_width,
                               uint32_t views_height,
+                              const struct xrt_conv_wire_depth_info *depth,
                               XrLiftViewsInfoDXR *o)
 {
 	uint32_t n = w->view_count > XR_LIFT_MAX_VIEWS_DXR ? XR_LIFT_MAX_VIEWS_DXR : w->view_count;
@@ -238,9 +279,11 @@ oxr_conv_views_info_from_wire(const struct xrt_conv_wire_views_info *w,
 	o->convergenceApplied = -1.0f;
 	o->suggestedConvergence = -1.0f;
 	o->suggestedStrength = -1.0f;
-	o->reliefValid = XR_FALSE;
-	o->reliefScale = 0.0f;
-	o->reliefOffset = 0.0f;
+	const bool relief = depth != NULL && depth->relief_valid != 0 && isfinite(depth->relief_scale) &&
+	                    isfinite(depth->relief_offset) && depth->relief_scale != 0.0f;
+	o->reliefValid = relief ? XR_TRUE : XR_FALSE;
+	o->reliefScale = relief ? depth->relief_scale : 0.0f;
+	o->reliefOffset = relief ? depth->relief_offset : 0.0f;
 }
 
 #ifdef __cplusplus
