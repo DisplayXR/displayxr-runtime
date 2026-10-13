@@ -44,21 +44,14 @@
 #include "xrt/xrt_conversion_plugin.h"
 #include "xrt/xrt_dp_lift.h"
 
+#include "conv_dp_lift_describe.h" // CONV_DP_LIFT_ID, the cap ids, the static describe
+
 #include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#define CONV_DP_LIFT_ID "dp-lift"
-#define CONV_DP_LIFT_PROBE_ORDER 150u
-
-/*! @name Capability ids (spec §4.5) @{ */
-#define CONV_DP_LIFT_CAP_DEPTH_MONO 1u
-#define CONV_DP_LIFT_CAP_DEPTH_VIDEO 2u
-#define CONV_DP_LIFT_CAP_VIEWS_MONO 3u
-/*! @} */
 
 //! What the lift thread knows right now (answered from memory, never blocks).
 struct conv_dp_lift_snapshot

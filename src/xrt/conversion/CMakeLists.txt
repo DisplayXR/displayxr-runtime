@@ -7,6 +7,10 @@
 # IPC, no registry or file I/O, no logging; host-tested by tests_conv_*.
 add_library(
 	conv_core STATIC
+	# #2030: the dp-lift row's static describe, shared by the in-service
+	# adapter and the headless status (target_conv_status.c).
+	conv_dp_lift_describe.c
+	conv_dp_lift_describe.h
 	conv_readiness.c
 	conv_readiness.h
 	conv_registry.c
