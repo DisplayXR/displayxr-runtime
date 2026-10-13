@@ -324,6 +324,13 @@ struct multi_compositor
 	 */
 	struct multi_layer_slot delivered;
 
+	/*!
+	 * When the shared surface first had content from this client while a
+	 * workspace controller was active but had not placed it yet (0 = not yet).
+	 * Render-loop only. Bounds how long an unplaced client is held back.
+	 */
+	int64_t ws_unplaced_since_ns;
+
 	struct u_pacing_app *upa;
 
 	float current_refresh_rate_hz;
