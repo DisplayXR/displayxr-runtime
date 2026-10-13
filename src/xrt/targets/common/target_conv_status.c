@@ -801,9 +801,38 @@ target_conv_status_fill_activity(struct target_conv_status *st, target_conv_acti
 	}
 }
 
+static bool
+env_is_zero(const char *name)
+{
+	const char *v = getenv(name);
+	return v != NULL && strcmp(v, "0") == 0;
+}
+
+const char *
+target_conv_kill_switch(void)
+{
+	if (env_is_zero("DXR_CONV")) {
+		return "DXR_CONV";
+	}
+	if (env_is_zero("DXR_LIFT")) {
+		return "DXR_LIFT"; // the pre-ADR-053 lift kill switch, kept as the alias
+	}
+	return NULL;
+}
+
 void
 target_conv_status_build_headless(const struct xrt_plugin_iface *active_dp, struct target_conv_status *out)
 {
+	const char *ks = target_conv_kill_switch();
+	if (ks != NULL) {
+		// No conversion service at all (Â§3.2): nothing enumerated, nothing loaded.
+		memset(out, 0, sizeof(*out));
+		target_conv_policy_read(&out->policy);
+		copy_str(out->kill_switch, sizeof(out->kill_switch), ks);
+		(void)snprintf(out->dp_lift_note, sizeof(out->dp_lift_note),
+		               "dp-lift row: none (%s=0, no conversion service)", ks);
+		return;
+	}
 	struct xrt_conversion_plugin_entry *entries =
 	    calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(struct xrt_conversion_plugin_entry));
 	struct target_conv_policy *policy = calloc(1, sizeof(*policy));

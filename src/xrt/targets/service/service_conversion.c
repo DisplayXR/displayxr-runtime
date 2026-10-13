@@ -791,6 +791,26 @@ service_conversion_start(void)
 	if (g.started) {
 		return;
 	}
+	// Discovery spec §3.2 (#2029): DXR_CONV=0 -- or its alias DXR_LIFT=0 -- in
+	// the SERVICE's own environment means no conversion service at all: no
+	// core, no providers, no dp-lift row, no route. The v3 lift calls then
+	// answer modes 0 / UNAVAILABLE. The pre-core lift thread reads only
+	// DXR_LIFT, so DXR_CONV=0 sets that alias for this process too.
+	const char *ks = target_conv_kill_switch();
+	if (ks != NULL) {
+#ifdef XRT_OS_WINDOWS
+		// (The lift thread is the D3D11 service's: Windows only.)
+		if (strcmp(ks, "DXR_CONV") == 0) {
+			const char *lift = getenv("DXR_LIFT");
+			if (lift == NULL || strcmp(lift, "0") != 0) {
+				(void)_putenv_s("DXR_LIFT", "0");
+			}
+		}
+#endif
+		U_LOG_W("[conv] %s=0: no conversion service (kill switch, discovery spec §3.2); lift reports UNAVAILABLE",
+		        ks);
+		return;
+	}
 	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0 || os_cond_init(&g.alloc_cond) != 0) {
 		U_LOG_E("[conv] could not create the conversion core's service locks");
 		return;
