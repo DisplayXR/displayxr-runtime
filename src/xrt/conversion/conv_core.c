@@ -232,8 +232,10 @@ warm_done(struct conv_host_cmd *cmd)
 	// A satellite host that died under the warm completes it as failed AFTER
 	// bumping its epoch: that is the crash path's (WARMING(restarting), re-warm
 	// on RESTORED), never a warm failure of the capability.
-	const bool casualty =
-	    cmd->result != XRT_SUCCESS && host != NULL && conv_host_get_epoch(host) != op->epoch;
+	// A warm refused because the host is down (CONV_CMD_HOST_DOWN) is the same:
+	// RESTORED re-warms the row.
+	const bool casualty = cmd->result != XRT_SUCCESS && host != NULL &&
+	                      (conv_host_get_epoch(host) != op->epoch || (cmd->blocked & CONV_CMD_HOST_DOWN) != 0);
 	const bool have_state =
 	    !casualty && host != NULL && conv_host_get_state(host, op->cap_id, &st) == XRT_SUCCESS;
 
@@ -285,11 +287,16 @@ start_warm_locked(struct conv_core *core, uint32_t provider, uint32_t cap_id)
 		return;
 	}
 	struct conv_host_slot *hs = &core->hosts[provider];
-	if (hs->host == NULL || hs->hung || hs->down || core->stop) {
-		// Cache-only rows warm once their provider is loaded; a satellite
-		// that is down re-warms its restarting rows on RESTORED.
+	if (hs->host == NULL || hs->hung || core->stop) {
+		// Cache-only rows warm once their provider is loaded.
 		return;
 	}
+	if (hs->down && hs->host->hosting != CONV_HOSTING_SATELLITE) {
+		return;
+	}
+	// A satellite that is down refuses the warm at once (CONV_CMD_HOST_DOWN);
+	// the refusal is the demand that respawns it, and RESTORED re-warms every
+	// WARMING row (#2056).
 	struct conv_warm_op *op = NULL;
 	for (uint32_t i = 0; i < XRT_CONV_MAX_CAPABILITIES; i++) {
 		if (hs->warms[i].cap_id == cap_id) {
