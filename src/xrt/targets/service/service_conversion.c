@@ -915,6 +915,16 @@ service_conversion_stop(void)
 	g.started = false;
 }
 
+void
+service_conversion_display_plugins_changed(void)
+{
+	if (!g.started || g.core == NULL || !g.dp_lift_registered) {
+		return;
+	}
+	U_LOG_I("[conv] display plug-in registration changed: retrying dp-lift");
+	conv_core_provider_changed(g.core, CONV_DP_LIFT_ID);
+}
+
 struct conv_core *
 service_conversion_core(void)
 {

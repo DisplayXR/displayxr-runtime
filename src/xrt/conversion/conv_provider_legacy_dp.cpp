@@ -22,6 +22,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -142,10 +143,28 @@ mode_name_of_cap(uint32_t cap_id)
 	return cap_id == CONV_DP_LIFT_CAP_VIEWS_MONO ? "SBS / NVIEW" : "DEPTH";
 }
 
+//! The lift kill switch (discovery spec §3.2): DXR_LIFT=0 or DXR_CONV=0 in the service's environment.
+bool
+kill_switch_engaged(void)
+{
+	const char *l = getenv("DXR_LIFT");
+	const char *c = getenv("DXR_CONV");
+	return (l != nullptr && strcmp(l, "0") == 0) || (c != nullptr && strcmp(c, "0") == 0);
+}
+
 /*!
  * The capability's readiness from a snapshot (spec §4.5: a plain copy of
- * module_status; "not yet asked" is never terminal; "no module" is ABSENT and
- * retryable — the backoff re-warms and re-resolves the factory, G5).
+ * module_status; "not yet asked" is never terminal).
+ *
+ * #2029, three cases the core keeps apart:
+ *  - the kill switch: DISABLED, not retryable -> terminal ABSENT(policy) in
+ *    the core (configuration, not a missing module); no activation at all;
+ *  - a module that itself answers ABSENT (or is up without the mode): ABSENT,
+ *    not retryable -> terminal ABSENT(model);
+ *  - "the factory found no module" (none installed yet, a refusing factory):
+ *    ABSENT, RETRYABLE -> FAILED(model) with the §2.5 backoff, so a vendor
+ *    module installed after the service started comes up without a restart
+ *    (G5). Detached (the service compositor is gone) is retryable too.
  */
 void
 state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_id, xrt_conv_state *out)
@@ -154,6 +173,13 @@ state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_
 	out->failure_reason = XRT_CONV_FAIL_MODEL;
 	out->retryable = 1;
 	out->progress = -1.0f;
+	if (kill_switch_engaged()) {
+		out->state = XRT_CONV_STATE_DISABLED;
+		out->failure_reason = XRT_CONV_FAIL_NONE;
+		out->retryable = 0;
+		copy_str(out->detail, sizeof(out->detail), "DXR_LIFT=0 / DXR_CONV=0 (kill switch)");
+		return;
+	}
 	if (!attached) {
 		copy_str(out->detail, sizeof(out->detail), s.detail);
 		return;
@@ -171,7 +197,7 @@ state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_
 	}
 	if (!s.have_module) {
 		copy_str(out->detail, sizeof(out->detail), s.detail[0] != '\0' ? s.detail : "no conversion module");
-		return;
+		return; // retryable: the backoff re-warms and re-resolves the factory (G5)
 	}
 	const xrt_dp_lift_caps &c = s.caps;
 	uint32_t st = c.module_status;
@@ -188,10 +214,11 @@ state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_
 	switch (st) {
 	case XRT_CONV_STATE_READY:
 		if ((c.modes & mode_bit_of_cap(cap_id)) == 0) {
-			// The module is up but has no such mode: this capability is absent.
+			// The module is up but has no such mode: this capability is absent
+			// (a module that gains it changes the generation: re-described).
 			out->state = XRT_CONV_STATE_ABSENT;
 			out->failure_reason = XRT_CONV_FAIL_MODEL;
-			out->retryable = 1;
+			out->retryable = 0;
 			(void)snprintf(out->detail, sizeof(out->detail), "the conversion module has no %s mode",
 			               mode_name_of_cap(cap_id));
 		}
@@ -199,7 +226,7 @@ state_from_snapshot(bool attached, const conv_dp_lift_snapshot &s, uint32_t cap_
 	case XRT_CONV_STATE_WARMING: break;
 	case XRT_CONV_STATE_ABSENT:
 		out->failure_reason = XRT_CONV_FAIL_MODEL;
-		out->retryable = 1;
+		out->retryable = 0; // the module says so: terminal (#2029)
 		break;
 	case XRT_CONV_STATE_INCOMPATIBLE: out->failure_reason = XRT_CONV_FAIL_VERSION; break;
 	case XRT_CONV_STATE_UNLICENSED: out->failure_reason = XRT_CONV_FAIL_LICENCE; break;
@@ -390,6 +417,9 @@ xrt_result_t
 dpl_warm(xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_cancelled)(void *ctx), void *cancel_ctx)
 {
 	dpl *d = D(inst);
+	if (kill_switch_engaged()) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // get_state: DISABLED -- never activate the module
+	}
 	conv_dp_lift_backend be;
 	if (!enter(d, &be)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // get_state: ABSENT, retryable

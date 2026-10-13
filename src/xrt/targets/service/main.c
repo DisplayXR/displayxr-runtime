@@ -132,6 +132,11 @@ on_display_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
 	ipc_server_request_display_reprobe(reason == SERVICE_COMPONENT_WATCH_POKED
 	                                       ? "display-processor preference changed"
 	                                       : "plug-in registration or policy changed");
+	if (reason != SERVICE_COMPONENT_WATCH_POKED) {
+		// #2029: a vendor installer (its conversion module with it) touches
+		// only DisplayProcessors: the dp-lift rows retry on it too.
+		service_conversion_display_plugins_changed();
+	}
 }
 
 static void

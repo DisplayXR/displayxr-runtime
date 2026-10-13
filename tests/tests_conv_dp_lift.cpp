@@ -247,6 +247,37 @@ row_state(conv_core *core, uint32_t cap_id)
 	return st;
 }
 
+void
+set_env(const char *name, const char *value)
+{
+#ifdef _WIN32
+	_putenv_s(name, value != nullptr ? value : "");
+#else
+	if (value != nullptr) {
+		setenv(name, value, 1);
+	} else {
+		unsetenv(name);
+	}
+#endif
+}
+
+//! The readiness reason + pending retry deadline of one of dp-lift's rows.
+void
+row_reason(conv_core *core, uint32_t cap_id, uint32_t *reason, uint64_t *retry_due_ns)
+{
+	auto *reg = new conv_registry();
+	conv_core_copy_registry(core, reg);
+	*reason = 0;
+	*retry_due_ns = 0;
+	const int32_t pi = conv_registry_find_provider(reg, CONV_DP_LIFT_ID);
+	const int32_t ri = pi >= 0 ? conv_registry_find_row(reg, (uint32_t)pi, cap_id) : -1;
+	if (ri >= 0) {
+		*reason = reg->rows[ri].rd.reason;
+		*retry_due_ns = conv_readiness_next_deadline(&reg->rows[ri].rd);
+	}
+	delete reg;
+}
+
 conv_dp_lift_backend
 backend_of(FakeLift &f)
 {
@@ -693,9 +724,16 @@ TEST_CASE("legacy golden replay: no module at first, READY after a registry chan
 	REQUIRE(fx.add_dp_lift(&f) >= 0);
 	uint64_t id = 0;
 	REQUIRE(fx.create(6, XRT_DP_LIFT_MODE_SBS, &id) == XRT_SUCCESS);
-	// The warm finds no module: FAILED (terminal for selection) but retryable.
+	// The warm finds no module: FAILED(model), RETRYABLE (#2029: none installed
+	// yet is not terminal) with the backoff armed -- the vendor module installs
+	// from its own installer, after the service started.
 	REQUIRE(
 	    wait_until([&] { return row_state(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) == XRT_CONV_STATE_FAILED; }, 4000));
+	uint32_t reason = 0;
+	uint64_t due = 0;
+	row_reason(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO, &reason, &due);
+	CHECK(reason == XRT_CONV_FAIL_MODEL);
+	CHECK(due != 0u);                                              // the 15 s doubling backoff re-warms on its own
 	CHECK(fx.properties().state == XRT_DP_LIFT_STATE_UNAVAILABLE); // honest, while nothing can serve it
 	{
 		std::lock_guard<std::mutex> lk(f.m);
@@ -704,14 +742,88 @@ TEST_CASE("legacy golden replay: no module at first, READY after a registry chan
 	}
 	// (An install takes far longer than the adapter's one-attempt-per-wave window.)
 	std::this_thread::sleep_for(std::chrono::milliseconds(600));
-	// A registry change (a plug-in / module install) retries; the next attempt
-	// re-resolves the factory and finds the module — no service restart.
+	// A registry change (a plug-in / module install) retries at once; the next
+	// attempt re-resolves the factory and finds the module -- no service restart.
 	conv_core_provider_changed(fx.core, CONV_DP_LIFT_ID);
 	uint64_t id2 = 0;
 	REQUIRE(wait_until([&] { return fx.create(6, XRT_DP_LIFT_MODE_SBS, &id2) == XRT_SUCCESS; }, 2000));
 	REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 6000));
 	std::lock_guard<std::mutex> lk(f.m);
 	CHECK(f.activations >= 2);
+}
+
+TEST_CASE("dp-lift: the kill switch is terminal ABSENT(policy) -- v3 UNAVAILABLE, the module never activated (#2029)",
+          "[conv_dp_lift]")
+{
+	// DXR_LIFT=0 in the service env. Before #2029 the lift thread answered "no
+	// module", the core FAILED(model) it and re-warmed every 15-30 s, and
+	// `lift caps` sat at ACTIVATING indefinitely.
+	set_env("DXR_LIFT", "0");
+	FakeLift f;
+	{
+		Fixture fx(CONV_PREWARM_INTEREST);
+		REQUIRE(fx.add_dp_lift(&f) >= 0);
+		ipc_server_conv_hint_interest(fx.sc, 4, 0); // the session's prewarm
+		for (uint32_t cap :
+		     {CONV_DP_LIFT_CAP_DEPTH_MONO, CONV_DP_LIFT_CAP_DEPTH_VIDEO, CONV_DP_LIFT_CAP_VIEWS_MONO}) {
+			REQUIRE(wait_until([&] { return row_state(fx.core, cap) == XRT_CONV_STATE_ABSENT; }, 4000));
+			uint32_t reason = 0;
+			uint64_t due = 0;
+			row_reason(fx.core, cap, &reason, &due);
+			CHECK(reason == CONV_REASON_POLICY); // configuration, not a missing module
+			CHECK(due == 0u);                    // no backoff timer: nothing re-warms on its own
+		}
+		// The adapter's own answer: DISABLED, not retryable.
+		xrt_conv_state st{};
+		st.struct_size = (uint32_t)sizeof(st);
+		REQUIRE(fx.iface->get_state(fx.inst, CONV_DP_LIFT_CAP_VIEWS_MONO, &st) == XRT_SUCCESS);
+		CHECK(st.state == XRT_CONV_STATE_DISABLED);
+		CHECK(st.retryable == 0u);
+
+		CHECK(conv_core_discovery_settled(fx.core));
+		CHECK(fx.properties().state == XRT_DP_LIFT_STATE_UNAVAILABLE);
+		CHECK(conv_core_v3_state(fx.core, 0, false) == CONV_V3_STATE_UNAVAILABLE);
+		uint64_t id = 0;
+		CHECK(fx.create(4, XRT_DP_LIFT_MODE_SBS, &id) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+		std::this_thread::sleep_for(std::chrono::milliseconds(300)); // the control thread ticks every 10 ms
+		CHECK(row_state(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) == XRT_CONV_STATE_ABSENT);
+		{
+			std::lock_guard<std::mutex> lk(f.m);
+			CHECK(f.activations == 0); // the kill switch never instantiates the module
+		}
+
+		// The switch lifted + a registry change: back without a restart.
+		set_env("DXR_LIFT", nullptr);
+		conv_core_provider_changed(fx.core, CONV_DP_LIFT_ID);
+		REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 6000));
+	}
+	set_env("DXR_LIFT", nullptr);
+}
+
+TEST_CASE("dp-lift: a module that itself answers ABSENT is terminal ABSENT(model) (#2029)", "[conv_dp_lift]")
+{
+	FakeLift f;
+	f.module_status = XRT_DP_LIFT_MODULE_ABSENT; // the module is there and says its model is not
+	Fixture fx(CONV_PREWARM_INTEREST);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	ipc_server_conv_hint_interest(fx.sc, 4, 0);
+	REQUIRE(
+	    wait_until([&] { return row_state(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) == XRT_CONV_STATE_ABSENT; }, 4000));
+	uint32_t reason = 0;
+	uint64_t due = 0;
+	row_reason(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO, &reason, &due);
+	CHECK(reason == XRT_CONV_FAIL_MODEL); // never labelled "policy"
+	CHECK(due == 0u);
+	CHECK(fx.properties().state == XRT_DP_LIFT_STATE_UNAVAILABLE);
+	int activations = 0;
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		activations = f.activations;
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(300));
+	CHECK(row_state(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) == XRT_CONV_STATE_ABSENT);
+	std::lock_guard<std::mutex> lk(f.m);
+	CHECK(f.activations == activations); // no retry loop
 }
 
 TEST_CASE("legacy golden replay: splats not ready + SBS READY -> READY", "[conv_dp_lift]")

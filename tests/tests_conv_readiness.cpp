@@ -121,6 +121,13 @@ TEST_CASE("conv_readiness: golden transition table")
 	    {"warm on READY is a no-op",      XRT_CONV_STATE_READY, 0, CONV_EV_WARM_REQUESTED, 0, 0, false, XRT_CONV_STATE_READY, 0, CONV_RD_IGNORED},
 	    {"warm before describe ignored",  XRT_CONV_STATE_UNKNOWN, 0, CONV_EV_WARM_REQUESTED, 0, 0, false, XRT_CONV_STATE_UNKNOWN, 0, CONV_RD_IGNORED},
 	    {"warm failed outside WARMING",   XRT_CONV_STATE_READY, 0, CONV_EV_WARM_FAILED, 0, XRT_CONV_FAIL_LOAD, false, XRT_CONV_STATE_READY, 0, CONV_RD_IGNORED},
+	    {"declared absent while warming", XRT_CONV_STATE_WARMING, 0, CONV_EV_DECLARED_ABSENT, 0, 0, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"module-declared absent is model", XRT_CONV_STATE_WARMING, 0, CONV_EV_DECLARED_ABSENT, 0, XRT_CONV_FAIL_MODEL, false, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_MODEL, CONV_RD_CHANGED},
+	    {"kill switch over absent(model)", XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_MODEL, CONV_EV_DECLARED_ABSENT, 0, CONV_REASON_POLICY, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"declared absent ends a retry loop", XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_MODEL, CONV_EV_DECLARED_ABSENT, 0, 0, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"declared absent at describe",   XRT_CONV_STATE_INSTALLED, 0, CONV_EV_DECLARED_ABSENT, 0, 0, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"declared absent: DISABLED wins",XRT_CONV_STATE_DISABLED, 0, CONV_EV_DECLARED_ABSENT, 0, 0, false, XRT_CONV_STATE_DISABLED, 0, CONV_RD_IGNORED},
+	    {"declared absent: UNLICENSED kept", XRT_CONV_STATE_UNLICENSED, 0, CONV_EV_DECLARED_ABSENT, 0, 0, false, XRT_CONV_STATE_UNLICENSED, 0, CONV_RD_IGNORED},
 	};
 	// clang-format on
 
@@ -422,12 +429,51 @@ TEST_CASE("conv_readiness: retry triggers")
 	}
 }
 
+TEST_CASE("conv_readiness: a kill switch / module-declared ABSENT is terminal, never a retry loop (#2029)")
+{
+	// The panel's DXR_LIFT=0 shape: warm -> the provider says ABSENT, not
+	// retryable. Before #2029 this was FAILED(model) + a 15 s backoff, so the
+	// row cycled failed -> installed -> warming and a spec-3 caller read
+	// ACTIVATING forever.
+	conv_readiness r = at(XRT_CONV_STATE_INSTALLED);
+	fire(r, ev(CONV_EV_WARM_REQUESTED, 1000 * S));
+	REQUIRE(r.state == XRT_CONV_STATE_WARMING);
+	CHECK((fire(r, ev(CONV_EV_DECLARED_ABSENT, 1001 * S)) & CONV_RD_CHANGED) != 0);
+	CHECK(r.state == XRT_CONV_STATE_ABSENT);
+	CHECK(r.reason == CONV_REASON_POLICY);
+	CHECK_FALSE(r.retryable);
+	CHECK(conv_readiness_next_deadline(&r) == 0); // no backoff timer at all
+	CHECK(conv_state_is_terminal(r.state));
+
+	// Nothing but a registry change (or an explicit warm, which the core maps
+	// to one) moves it: not time, not a create, not a re-describe.
+	const uint64_t gen0 = r.generation;
+	const uint32_t idle[] = {CONV_EV_TIMER, CONV_EV_CREATE_REQUESTED, CONV_EV_DESCRIBED, CONV_EV_DECLARED_ABSENT};
+	for (uint32_t e : idle) {
+		CAPTURE(e);
+		fire(r, ev(e, 5000 * S));
+		CHECK(r.state == XRT_CONV_STATE_ABSENT);
+		CHECK(r.generation == gen0);
+	}
+
+	// Spec-3: the only backing task is terminal and discovery settled -> UNAVAILABLE.
+	const uint32_t states[] = {r.state};
+	CHECK(conv_legacy_v3_state(states, 1, true) == CONV_V3_STATE_UNAVAILABLE);
+
+	// A registry change (the switch flipped back, a module installed) tries again.
+	fire(r, ev(CONV_EV_REGISTRY_CHANGED, 5001 * S));
+	CHECK(r.state == XRT_CONV_STATE_INSTALLED);
+	const uint32_t again[] = {r.state};
+	CHECK(conv_legacy_v3_state(again, 1, true) == CONV_V3_STATE_ACTIVATING);
+}
+
 TEST_CASE("conv_readiness: a disabled row ignores everything but enable")
 {
 	conv_readiness r = at(XRT_CONV_STATE_DISABLED);
 	const uint32_t events[] = {CONV_EV_DESCRIBED,        CONV_EV_DESCRIBE_FAILED, CONV_EV_WARM_REQUESTED,
 	                           CONV_EV_CREATE_REQUESTED, CONV_EV_HOST_CRASH,      CONV_EV_CRASH_LOOP,
-	                           CONV_EV_REGISTRY_CHANGED, CONV_EV_TIMER,           CONV_EV_DISABLE};
+	                           CONV_EV_REGISTRY_CHANGED, CONV_EV_TIMER,           CONV_EV_DISABLE,
+	                           CONV_EV_DECLARED_ABSENT};
 	for (uint32_t e : events) {
 		CAPTURE(e);
 		uint64_t gen0 = r.generation;
