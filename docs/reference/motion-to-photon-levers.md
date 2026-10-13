@@ -89,15 +89,27 @@ provide it, it is **dormant** rather than wrong — see the topology table.
 | Tier | Source | Covers | Log line when it engages |
 |---|---|---|---|
 | present_wait (#2060) | `VK_KHR_present_wait` — acquire blocks until the previous present hit glass, as on Windows | **enable2 apps** (Unity and anything using `xrCreateVulkanDeviceKHR`: the runtime chains `presentId`/`presentWait` itself) | `#902: late weave on VK_KHR_present_wait — pacing on present id N-0 hitting glass` |
-| measured grid (#2062) | the window system's presentation feedback anchors `comp_vblank_grid.h`: native Wayland `wp_presentation` (`presented`: timestamp, refresh, seq, `vsync`/`hw_clock`), X11 Present `CompleteNotify` (`ust`/`msc`) | **enable1 apps** that did not chain the features, and any session where present_wait never resolves | `#902: late weave on the measured grid — period …, … (grid source: wp_presentation \| x11-present)` |
+| measured grid (#2062) — **opt-in, `DXR_LATE_WEAVE_LINUX_GRID=1`** (#2068) | the window system's presentation feedback anchors `comp_vblank_grid.h`: native Wayland `wp_presentation` (`presented`: timestamp, refresh, seq, `vsync`/`hw_clock`), X11 Present `CompleteNotify` (`ust`/`msc`) | **enable1 apps** that did not chain the features, and any session where present_wait never resolves | `#902: late weave on the measured grid — period …, … (grid source: wp_presentation \| x11-present)` |
 
 `VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
 samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in
 `CLOCK_MONOTONIC`, derives the period from the vblank counter when no refresh value is given, and
 logs one `#902: <source> feed — …` line per state change. `DXR_VK_PRESENT_FEEDBACK=0` turns the
-feeder off. Not yet measured on a panel: whether the grid tier's 1.5 ms margin clears the desktop
-compositor's own latch deadline (read the `#206` residual with the cadence trace on — about one
-period or less means the targeted vblank was hit).
+feeder off.
+
+**Measured (Intel, GNOME, 60 Hz, window 1:1 on the panel, #2068):** the present_wait tier costs
+nothing (59.2–60.0 presents/s on vs 59.4–60.0 with `DXR_LATE_WEAVE=0`, Unity). The grid tier at
+the fixed 1.5 ms margin cost a quarter of the frames (40.5–43.4 vs 52.9–56.7, native enable1
+app): a composited desktop latches client buffers *before* the vblank, so a weave aimed just
+before it is shown a refresh late. So on desktop Linux the grid tier now **learns the
+compositor's lead** (`util/comp_late_weave_adapt.h`: +2 ms per aimed frame that missed its
+vblank, −0.5 ms after 120 hits in a row, starting at a quarter period, and off for the session
+with `#902: grid late weave OFF for this session — …` when lead + weave + margin no longer fit
+in a period). It is **opt-in** behind `DXR_LATE_WEAVE_LINUX_GRID=1` until a panel A/B shows it
+holds the present rate. Without the opt-in an enable1 session logs `#902: grid late weave NOT
+engaged — opt-in on desktop Linux …` and the grid is still fed. `DXR_WEAVE_CADENCE_TRACE=1`
+logs the `#206` residual and `#2068: grid late weave — compositor lead …, aimed hits …,
+misses …` every 5 s.
 
 **The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
 Every queue level the governor adds moves the flip one whole period later, and #1437's learned
