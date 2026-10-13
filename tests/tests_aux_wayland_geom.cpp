@@ -436,6 +436,58 @@ TEST_CASE("an unmapped device-pixel buffer spills past the frame")
 
 /*
  *
+ * buffer_device: the compositor's own answer wins (#1991).
+ *
+ */
+
+TEST_CASE("buffer_device wins over the conversion, even where they disagree")
+{
+	// The #1928 case on KWin at 166.67 %: the buffer is published at y 191,
+	// which converts to row 318, while KWin paints it on row 319.
+	const struct u_wl_monitor m = laptop_from_shell_extension();
+	const struct u_wl_rect_logical content = {100, 191, 768, 432};
+	const struct u_wl_rect_px painted = {167, 319, 1280, 720};
+	struct u_wl_rect_px out = {};
+	bool used = false;
+	REQUIRE(u_wl_window_device_rect(&m, &content, &painted, &out, &used));
+	REQUIRE(used);
+	REQUIRE(out.x == 167);
+	REQUIRE(out.y == 319);
+	REQUIRE(out.w == 1280);
+	REQUIRE(out.h == 720);
+
+	// The conversion alone is the one-row-off answer.
+	REQUIRE(u_wl_window_device_rect(&m, &content, nullptr, &out, &used));
+	REQUIRE_FALSE(used);
+	REQUIRE(out.y == 318);
+}
+
+TEST_CASE("no buffer_device, or an empty one: today's conversion")
+{
+	const struct u_wl_monitor m = panel_from_shell_extension();
+	const struct u_wl_rect_logical content = {kPanelLogicalX + 100, 50, 640, 360};
+	const struct u_wl_rect_px empty = {5, 5, 0, 0};
+	struct u_wl_rect_px out = {};
+	bool used = true;
+	REQUIRE(u_wl_window_device_rect(&m, &content, &empty, &out, &used));
+	REQUIRE_FALSE(used);
+	REQUIRE(out.x == 200);
+	REQUIRE(out.y == 100);
+	REQUIRE(out.w == 1280);
+	REQUIRE(out.h == 720);
+}
+
+TEST_CASE("buffer_device is the 1:1 test's destination")
+{
+	// A buffer the compositor paints at its own size is 1:1; one it scales is not.
+	const struct u_wl_rect_px painted = {0, 0, 1280, 720};
+	REQUIRE(u_wl_present_is_1to1(1280, 720, (uint32_t)painted.w, (uint32_t)painted.h));
+	const struct u_wl_rect_px scaled = {0, 0, 1281, 720};
+	REQUIRE_FALSE(u_wl_present_is_1to1(1280, 720, (uint32_t)scaled.w, (uint32_t)scaled.h));
+}
+
+/*
+ *
  * Wayland placement quantum (#1609).
  *
  */

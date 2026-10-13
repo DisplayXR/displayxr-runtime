@@ -26,6 +26,8 @@
 
 #include <dbus/dbus.h>
 
+#include <math.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +69,8 @@
 // One entry per published window we care about (own-PID filter is applied at
 // query time, not parse time, so the cache mirrors the full snapshot).
 //
-// EVERY geometry field here is LOGICAL — this is the wire payload, unconverted.
+// EVERY geometry field here is LOGICAL — this is the wire payload, unconverted
+// — except `buffer_device_*`, which the publisher sends already in device px.
 // "Logical" means Mutter's STAGE coordinates, which are device px in Mutter's
 // PHYSICAL layout mode: the factor that converts them is resolved per window
 // at the boundary (u_wl_stage_to_device_scale), never assumed to be mon_scale.
@@ -102,6 +105,13 @@ struct wlg_window
 	int32_t buffer_logical_x, buffer_logical_y;
 	int32_t buffer_logical_w, buffer_logical_h;
 	bool have_buffer;
+	//! Where the compositor PAINTS the main surface, DEVICE px relative to
+	//! the monitor's top-left (`buffer_device`, #1991). The one field here
+	//! that is not logical: the publisher has done the conversion, with the
+	//! compositor's own rounding. False when not published.
+	int32_t buffer_device_x, buffer_device_y;
+	int32_t buffer_device_w, buffer_device_h;
+	bool have_buffer_device;
 	//! An interactive grab is running on this window (publisher v3+).
 	bool moving;
 	bool have_moving;
@@ -142,6 +152,7 @@ struct comp_vk_native_wl_geom
 	bool mutter_layout_stale;
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
 	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
+	bool logged_buffer_device; //!< last logged rect source (INFO on change only)
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
 	//! The last rect get_window_rect returned (#1748, see last_rect).
 	struct comp_vk_native_wl_window_rect last_rect;
@@ -237,6 +248,31 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 			out->buffer_logical_w = (int32_t)cJSON_GetArrayItem(buffer, 2)->valuedouble;
 			out->buffer_logical_h = (int32_t)cJSON_GetArrayItem(buffer, 3)->valuedouble;
 			out->have_buffer = out->buffer_logical_w > 0 && out->buffer_logical_h > 0;
+		}
+
+		// Additive, schema version unchanged (#1991). Device pixels are
+		// whole, so a non-integer or non-positive size is malformed and the
+		// field is ignored: the conversion of `buffer` still applies.
+		const cJSON *buffer_device = u_json_get(win, "buffer_device");
+		if (cJSON_IsArray(buffer_device) && cJSON_GetArraySize(buffer_device) == 4) {
+			int32_t v[4];
+			bool whole = true;
+			for (int i = 0; i < 4; i++) {
+				const cJSON *item = cJSON_GetArrayItem(buffer_device, i);
+				if (!cJSON_IsNumber(item) || item->valuedouble != floor(item->valuedouble) ||
+				    fabs(item->valuedouble) > (double)INT32_MAX) {
+					whole = false;
+					break;
+				}
+				v[i] = (int32_t)item->valuedouble;
+			}
+			if (whole && v[2] > 0 && v[3] > 0) {
+				out->buffer_device_x = v[0];
+				out->buffer_device_y = v[1];
+				out->buffer_device_w = v[2];
+				out->buffer_device_h = v[3];
+				out->have_buffer_device = true;
+			}
 		}
 
 		bool focus = false;
@@ -797,12 +833,27 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	struct u_wl_rect_logical content_logical = frame_logical;
 	u_wl_window_content_rect(&frame_logical, best->have_buffer ? &buffer_logical : NULL, &content_logical);
 
+	/*
+	 * WHERE it is painted (#1991): the publisher's `buffer_device` when it
+	 * sent one — the compositor's own answer — else the conversion of the
+	 * content rect, which guesses the compositor's rounding.
+	 */
+	const struct u_wl_rect_px buffer_device = {best->buffer_device_x, best->buffer_device_y, best->buffer_device_w,
+	                                           best->buffer_device_h};
 	struct u_wl_rect_px win_px = {0, 0, 0, 0};
+	bool used_buffer_device = false;
 	int32_t mon_w_px = 0, mon_h_px = 0;
-	if (!u_wl_window_rect_px_on_monitor(&mon, content_logical.logical_x, content_logical.logical_y,
-	                                    content_logical.logical_w, content_logical.logical_h, &win_px) ||
+	if (!u_wl_window_device_rect(&mon, &content_logical, best->have_buffer_device ? &buffer_device : NULL, &win_px,
+	                             &used_buffer_device) ||
 	    !u_wl_monitor_size_px(&mon, &mon_w_px, &mon_h_px) || win_px.w <= 0 || win_px.h <= 0) {
 		return false;
+	}
+	if (used_buffer_device != g->logged_buffer_device) {
+		g->logged_buffer_device = used_buffer_device;
+		U_LOG_I("wl_geom: content device rect %s",
+		        used_buffer_device ? "is the publisher's buffer_device (where the compositor "
+		                             "paints it, #1991)"
+		                           : "is converted from the logical buffer rect");
 	}
 
 	if (!g->warned_scale) {
@@ -841,6 +892,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->monitor_width_px = (uint32_t)mon_w_px;
 	out_rect->monitor_height_px = (uint32_t)mon_h_px;
 	out_rect->scale = (float)device_scale;
+	out_rect->from_buffer_device = used_buffer_device;
 
 	/*
 	 * The committed SURFACE vs the FRAME. Two different reasons they differ,
@@ -865,8 +917,14 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->surface_within_frame = true;
 	out_rect->frame_inset_top_px = 0;
 	if (best->have_buffer) {
-		out_rect->surface_width_px = (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, device_scale);
-		out_rect->surface_height_px = (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, device_scale);
+		// The painted size is the 1:1 test's destination (#1991); without
+		// it, the converted buffer size.
+		out_rect->surface_width_px = used_buffer_device
+		                                 ? (uint32_t)win_px.w
+		                                 : (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, device_scale);
+		out_rect->surface_height_px = used_buffer_device
+		                                  ? (uint32_t)win_px.h
+		                                  : (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, device_scale);
 		out_rect->surface_within_frame = u_wl_surface_within_frame(&frame_logical, &buffer_logical);
 		const int32_t inset_y = best->buffer_logical_y - best->logical_y;
 		out_rect->frame_inset_top_px = u_wl_logical_to_px(inset_y, device_scale);

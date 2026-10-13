@@ -32,6 +32,9 @@ a runtime-side consumer.
 consumes is DEVICE pixels. The conversion is ours to perform, and it happens
 exactly once, where the geometry crosses into the runtime** — in
 `comp_vk_native_wl_geom.c`, through `auxiliary/util/u_wayland_geom.h` (#1596).
+The one exception is a publisher that sends `buffer_device` (§2, #1991): it has
+already done the conversion with the compositor's own rounding, so the runtime
+takes that rect as it is and converts nothing.
 
 That is not a style preference. The vendor ships the same guarantee from its
 side: every geometry its SDK reports or accepts is device pixels,
@@ -116,6 +119,38 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
   (`org.gnome.Mutter.DisplayConfig.GetCurrentState` → `layout-mode`: 1
   logical, 2 physical). It falls back to `scale` only when none of those
   answers (`u_wl_stage_to_device_scale`).
+
+  **`buffer_device` `[x,y,w,h]` — where the compositor paints the surface**
+  (#1991, additive, schema `version: 1` unchanged). Integer device px,
+  relative to the top-left of the entry's `monitor`, naming the rect at which
+  the compositor paints the window's main surface (the bound surface). A
+  consumer that finds it uses it directly, for the present origin, the Kooima
+  canvas and the 1:1 check (`u_wl_window_device_rect`). A consumer that does
+  not keeps converting `buffer` with `round((buffer − monitor) × device_scale)`,
+  and `buffer` stays as it is, so older consumers are unaffected.
+  - *Why.* The conversion guesses the compositor's rounding. A compositor
+    that keeps window positions fractional (KWin does, after any pointer
+    drag) can paint a surface on a device row no whole logical value names:
+    at 166.67 % a buffer published at y 191 converts to row 318 and is painted
+    on row 319 (#1928). Measured on Stereo KWin 6.7.4 at five scales,
+    `buffer_device` equalled the painted rect 90 times out of 90, and the
+    conversion was one pixel off in 45.
+  - *The 1:1 test.* `w`/`h` against the buffer's own size in pixels. Equal
+    means the buffer reaches the output unscaled at an integer origin, so the
+    published size is the destination the 1:1 gate compares (#1595).
+  - *Under move sync* (§9), `buffer_device` is where the publisher will paint
+    the frame woven for this snapshot. On KWin that is the conversion of
+    `buffer`, so a runtime that weaves for either value gets every frame
+    painted where it wove it.
+  - *When the publisher cannot vouch for the rect* (an effect transforms the
+    window, or the window spans outputs of different scale), it leaves
+    `buffer_device` out, and the consumer falls back to the conversion.
+  - *Malformed is absent.* A non-integer value or a non-positive size is
+    ignored, never rounded.
+  - *Publishers.* The KWin publisher sends it. Mutter paints a surface at
+    `roundf((content − monitor) × scale)` (§7.2), so the GNOME extension's
+    `buffer_device` would equal today's conversion; it may send it, and need
+    not.
 
 - **Consumer** — `comp_vk_native_wl_geom` (`src/xrt/compositor/vk_native/`,
   built when `XRT_HAVE_WAYLAND && XRT_HAVE_DBUS`, libdbus-1). Private
@@ -606,7 +641,9 @@ frame can leave the buffer one device row off, which reads as a missed snap.
 So a publisher **may adjust the frame** by less than one logical px so the
 buffer lands on `round((buffer + move − monitor) × device_scale)`, the same
 rule its drag table entries follow (§8.6). Mutter places frame and buffer on
-the same whole-px grid, so the GNOME extension never needs to.
+the same whole-px grid, so the GNOME extension never needs to. A publisher
+that sends `buffer_device` (§2) reports that landing directly, and the runtime
+judges the snap against it.
 
 Additive schema field for the same reason: every window now carries
 `"moving"`, true while an interactive grab (move or resize) is in progress on

@@ -282,6 +282,52 @@ u_wl_window_rect_px_on_monitor(const struct u_wl_monitor *m,
 }
 
 /*!
+ * The content's DEVICE rect, relative to its monitor's top-left: the
+ * publisher's `buffer_device` when it sent one (#1991), else the conversion of
+ * the logical content rect (@ref u_wl_window_rect_px_on_monitor).
+ *
+ * `buffer_device` is where the compositor actually paints the bound surface.
+ * The conversion is only a guess at the compositor's rounding, and a
+ * compositor that keeps window positions fractional (KWin after a pointer
+ * drag) can paint a surface on a device row no whole logical value names: at
+ * 166.67 % a buffer published at y 191 paints on row 319 while the conversion
+ * says 318 (#1928). So a published rect wins outright; it is never blended
+ * with, or checked against, the conversion. A publisher that cannot vouch for
+ * the rect (an effect transforms the window, or it spans outputs of
+ * different scale) leaves it out, and the conversion stays.
+ *
+ * @param buffer_device NULL, or a rect with a non-positive size, when the
+ *                      publisher did not send one.
+ * @return false when neither source gives a rect; @p out_used_device says
+ *         which one did.
+ *
+ * @ingroup aux_util
+ */
+static inline bool
+u_wl_window_device_rect(const struct u_wl_monitor *m,
+                        const struct u_wl_rect_logical *content,
+                        const struct u_wl_rect_px *buffer_device,
+                        struct u_wl_rect_px *out_px,
+                        bool *out_used_device)
+{
+	if (out_used_device != NULL) {
+		*out_used_device = false;
+	}
+	if (buffer_device != NULL && buffer_device->w > 0 && buffer_device->h > 0) {
+		*out_px = *buffer_device;
+		if (out_used_device != NULL) {
+			*out_used_device = true;
+		}
+		return true;
+	}
+	if (content == NULL) {
+		return false;
+	}
+	return u_wl_window_rect_px_on_monitor(m, content->logical_x, content->logical_y, content->logical_w,
+	                                      content->logical_h, out_px);
+}
+
+/*!
  * Is this output the 3D panel?
  *
  * The comparison the app's fullscreen-on-the-right-monitor match needs, and the
