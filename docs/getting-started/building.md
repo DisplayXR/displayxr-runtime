@@ -147,6 +147,7 @@ per `docs/roadmap/linux-support.md`.
 | `/usr/lib/displayxr/bin/displayxr-cli` (+ `/usr/bin/` link) | `selftest`, `info`, `clients`, … |
 | `/usr/lib/displayxr/bin/displayxr-dashboard` (+ `/usr/bin/` link, menu entry, icon) | The DisplayXR Dashboard (below). |
 | `/usr/lib/displayxr/plugins/` | sim-display fallback DP + its manifest; a vendor plug-in package adds its own. |
+| `/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so` + `/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json` | The Vulkan queue-lock layer (below). |
 | `/usr/lib/systemd/user/displayxr.{socket,service}` | The service's start mechanism (below). |
 | `/etc/xdg/openxr/1/active_runtime.json` | Written by `postinst` — the Khronos loader's ActiveRuntime. |
 | GNOME Shell extension + `/etc/xdg/autostart` entry | See below. |
@@ -168,6 +169,25 @@ hand instead (e.g. with a different plug-in path), stop the socket first
 terminal or detached — it no longer needs a terminal on stdin, and SIGTERM /
 Ctrl+C stop it cleanly. The tarball's `install.sh` installs the same unit pair
 under `~/.config/systemd/user/` (`--system`: `/usr/local/lib/systemd/user/`).
+
+**The Vulkan queue-lock layer (`VK_LAYER_DXR_queue_lock`, #902 / #2036).** On a
+GPU whose graphics family has a single queue (Intel iGPUs), the #868 repaint loop
+can only run by sharing the app's queue, and that needs this layer to serialise
+submits. The runtime enables it by name at `xrCreateVulkanInstanceKHR`; it is an
+*explicit* layer, so no other Vulkan process loads it. The `.deb` installs the
+`.so` beside the runtime and its manifest in `/usr/share/vulkan/explicit_layer.d/`
+with an absolute `library_path`, on the loader's default search path. The tarball's `install.sh` writes the
+manifest to `$XDG_DATA_HOME/vulkan/explicit_layer.d/` (`--system`:
+`/usr/local/share/vulkan/explicit_layer.d/`), pointing into the install. Check it
+with `displayxr-cli info` (section *VK late-weave repaint*: `VK_LAYER_DXR_queue_lock
+reachable (…)`). If an app log says `#902: VK_LAYER_DXR_queue_lock not found by
+the Vulkan loader — retrying without it`, the manifest is missing or not on the
+loader's path. One case causes this even when the package is installed: a process
+that sets `VK_LAYER_PATH` replaces the default directories, whereas
+`VK_ADD_LAYER_PATH` adds to them. The app still runs; on a single-queue GPU the
+compositor then logs `repaint disabled` and the weave rate follows the app's
+present rate. Before #2036 neither package shipped the layer, so every Vulkan app
+on such a GPU ran without repaint.
 
 **Why the release artifacts are built on the oldest supported release
 (#1656).** The published `.deb` and tarball must install and run on **Ubuntu

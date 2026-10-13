@@ -235,6 +235,10 @@ Repaint needs somewhere to submit from. Three tiers, resolved automatically:
 Tier 2 is not assumed to work — the runtime resolves `vkGetQueueLockMarkerDXR` to confirm the
 layer is actually in *this* device's chain. The layer had never been packaged until #917, which
 meant tier 2 was unreachable on every single-queue GPU and those machines silently fell to tier 3.
+On Linux the same gap lasted until #2036: the `.deb` and the tarball built the layer but did not
+install it. They now install it (manifest in `/usr/share/vulkan/explicit_layer.d/`, or
+`$XDG_DATA_HOME/vulkan/explicit_layer.d/` for a user-level tarball install). Run `displayxr-cli info`
+to check that the loader can reach it.
 
 Overrides: `queue` = tier 1 only · `layer` = force tier 2 even where a queue exists, so the layer
 path is testable on multi-queue GPUs · `off` = no layer injection, no repaint.
