@@ -91,6 +91,14 @@ struct FakeLift
 	float last_vps[3 * XRT_CONV_MAX_VIEWS] = {};
 	xrt_dp_lift_stream_info last_info{};
 
+	// The aux depth the module reports (scripted; the defaults are the
+	// shipping module's RELATIVE + INVERSE with no convergence / relief).
+	uint32_t depth_units = XRT_DP_LIFT_DEPTH_RELATIVE;
+	uint32_t depth_encoding = XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+	float convergence_depth = 0.0f;
+	float relief_scale = 0.0f;
+	float relief_offset = 0.0f;
+
 	void
 	set_state(uint32_t st)
 	{
@@ -206,10 +214,16 @@ fl_convert(void *ud, uint64_t, conv_dp_lift_convert *io)
 		xrt_dp_lift_depth_init(&io->depth);
 		io->depth.width = io->depth_target->width;
 		io->depth.height = io->depth_target->height;
-		io->depth.units = XRT_DP_LIFT_DEPTH_RELATIVE;
-		io->depth.encoding = XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+		io->depth.units = f->depth_units;
+		io->depth.encoding = f->depth_encoding;
 		io->depth.value_scale = 1.0f;
 		io->depth.same_inference = 1;
+		io->depth.convergence_depth = f->convergence_depth;
+		if (f->relief_scale != 0.0f) {
+			io->depth.relief_valid = 1;
+			io->depth.relief_scale = f->relief_scale;
+			io->depth.relief_offset = f->relief_offset;
+		}
 	}
 	return XRT_SUCCESS;
 }
@@ -997,4 +1011,69 @@ TEST_CASE("dp-lift: the legacy units reach the module unchanged; N views get the
 	const float dx = f.last_vps[3] - f.last_vps[0];
 	CHECK(f.last_params.baseline_m == Catch::Approx(std::fabs(dx)).margin(1e-5)); // the pair's own distance
 	CHECK(f.last_params.baseline_m > 0.0f);
+}
+
+TEST_CASE("dp-lift: convergence is the DECODED value; spec 3 and spec 4 read it per kind", "[conv_dp_lift]")
+{
+	// The module reports the depth on the screen plane (convergence_depth);
+	// the ABI carries the decoded value (1 / depth for an INVERSE encoding),
+	// spec 3's convergenceDepth is the depth reading of it again, and spec
+	// 4's XrLiftDepthInfoDXR::convergenceValue is the decoded value. Relief
+	// is copied: it is affine in q under both conventions.
+	struct Row
+	{
+		uint32_t units, encoding, kind;
+	};
+	const Row rows[] = {
+	    {XRT_DP_LIFT_DEPTH_METRIC, XRT_DP_LIFT_DEPTH_ENCODING_LINEAR, XRT_CONV_DEPTH_METRIC},
+	    {XRT_DP_LIFT_DEPTH_METRIC, XRT_DP_LIFT_DEPTH_ENCODING_INVERSE, XRT_CONV_DEPTH_METRIC_INVERSE},
+	    {XRT_DP_LIFT_DEPTH_RELATIVE, XRT_DP_LIFT_DEPTH_ENCODING_INVERSE, XRT_CONV_DEPTH_AFFINE_INVERSE},
+	    {XRT_DP_LIFT_DEPTH_RELATIVE, XRT_DP_LIFT_DEPTH_ENCODING_LINEAR, XRT_CONV_DEPTH_AFFINE},
+	};
+	for (const Row &row : rows) {
+		CAPTURE(row.kind);
+		const bool inverse = row.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+		FakeLift f;
+		f.depth_units = row.units;
+		f.depth_encoding = row.encoding;
+		f.convergence_depth = 2.0f;
+		f.relief_scale = 0.07f;
+		f.relief_offset = -0.02f;
+		Fixture fx(CONV_PREWARM_INTEREST);
+		REQUIRE(fx.add_dp_lift(&f) >= 0);
+		// The create warms the module (FIRST-create semantics of the fixture).
+
+		uint64_t id = 0;
+		REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 3, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, XRT_DP_LIFT_AUX_DEPTH, 0,
+		                                           &id) == XRT_SUCCESS);
+		ipc_lift_result r{};
+		REQUIRE(wait_until(
+		    [&] {
+			    fx.submit(3, id);
+			    return fx.acquire(3, id, &r) && r.depth.valid != 0;
+		    },
+		    10000));
+		// Spec 3 is unchanged: the module's own depth comes back.
+		CHECK(r.depth.convergence_depth == Catch::Approx(2.0f));
+		CHECK(r.depth.encoding == row.encoding);
+		CHECK(r.depth.units == row.units);
+
+		// Spec 4: the decoded value and the relief, as the ABI carries them.
+		bool ready = false, disc = false;
+		ipc_lift_result r3{};
+		xrt_conv_wire_result r4{};
+		REQUIRE(wait_until(
+		    [&] {
+			    fx.submit(3, id);
+			    return ipc_server_conv_v4_acquire(fx.sc, 3, id, &ready, &disc, &r3, &r4) == XRT_SUCCESS && ready &&
+			           (r4.written & XRT_CONV_OUT_DEPTH) != 0;
+		    },
+		    4000));
+		CHECK(r4.depth_info.kind == row.kind);
+		CHECK((r4.depth_info.suggest_flags & 4u) != 0u);
+		CHECK(r4.depth_info.convergence_value == Catch::Approx(inverse ? 0.5f : 2.0f));
+		CHECK(r4.depth_info.relief_valid == 1u);
+		CHECK(r4.depth_info.relief_scale == Catch::Approx(0.07f));
+		CHECK(r4.depth_info.relief_offset == Catch::Approx(-0.02f));
+	}
 }
