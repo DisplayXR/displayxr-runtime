@@ -1089,10 +1089,26 @@ typedef struct XrLiftResultExportDXR {
 } XrLiftResultExportDXR;
 
 /*!
- * Everything needed to interpret a depth image. Decode a sample s as
- * v = rawScale * s + rawShift, then interpret v by @c kind. Chain on
- * XrLiftResultDXR::next (a DEPTH_* stream's result, or a VIEWS_* stream's aux
- * depth) or on XrLiftDepthResultDXR::next.
+ * Everything needed to interpret a depth image. Chain on XrLiftResultDXR::next
+ * (a DEPTH_* stream's result, or a VIEWS_* stream's aux depth) or on
+ * XrLiftDepthResultDXR::next.
+ *
+ * Decoding (normative). A sample s DECODES to v = rawScale * s + rawShift.
+ * Every value field of this struct (nearZ, farZ, the range fields,
+ * invalidValue after decoding, convergenceValue) is in these decoded units v,
+ * never inverted. From v, per @c kind:
+ *
+ *   kind                  depth reading d        inverse-depth coordinate q
+ *   METRIC_DEPTH          d = v (metres)         q = 1 / v  (1/metres)
+ *   METRIC_INVERSE        d = 1 / v (metres)     q = v      (1/metres)
+ *   AFFINE_INVERSE_DEPTH  d = 1 / v (relative)   q = v
+ *   AFFINE_DISPARITY      d = 1 / v (relative)   q = v
+ *   AFFINE_DEPTH          d = v (relative)       q = 1 / v
+ *
+ * A metric distance exists only for the METRIC_* kinds; an AFFINE_* d or q is
+ * known only up to an unknown scale and shift (an order, never a distance).
+ * The display relief (XrLiftViewsInfoDXR::reliefScale) is affine in q; the
+ * spec-3 XrLiftDepthResultDXR::convergenceDepth is d of convergenceValue.
  *
  * Units are never invented: with an AFFINE_* kind, near / far and the
  * intrinsics are as reported, or zero. farZ < nearZ means an infinite far
@@ -1122,6 +1138,8 @@ typedef struct XrLiftDepthInfoDXR {
     XrBool32                  temporallyConsistent; //!< produced by a temporal (video) model
     XrBool32                  discontinuity;      //!< temporal state was reset before this result
     float                     baselineMeters;     //!< PIXEL_DISPARITY: the pair's baseline; else 0
+    XrBool32                  convergenceValid;
+    float                     convergenceValue;   //!< decoded v placed at zero disparity (on the screen plane)
 } XrLiftDepthInfoDXR;
 
 /*!
@@ -1150,7 +1168,7 @@ typedef struct XrLiftViewsInfoDXR {
     float                      convergenceApplied;   //!< in v3 convergence units [0,1]; < 0 = unknown
     float                      suggestedConvergence; //!< provider hint, same units; < 0 = none (diagnostics)
     float                      suggestedStrength;    //!< provider hint for the disparity budget; < 0 = none
-    XrBool32                   reliefValid;          //!< display z of a depth d: z = reliefScale / d + reliefOffset
+    XrBool32                   reliefValid;          //!< display z (m, toward the viewer) of a texel: z = reliefScale * q + reliefOffset, q per XrLiftDepthInfoDXR
     float                      reliefScale;
     float                      reliefOffset;
 } XrLiftViewsInfoDXR;

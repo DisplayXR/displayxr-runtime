@@ -38,6 +38,9 @@ struct conv_fake_cap
 	uint32_t job_ms;     //!< job_execute() duration
 	uint64_t job_bytes;  //!< bytes written to the primary sink
 	uint32_t job_blob_format; //!< XRT_CONV_BLOB_* of the job blob; 0 = SPZ
+	float convergence_value;  //!< > 0: reported (decoded units) on every depth result
+	float relief_scale;       //!< != 0: relief reported on every depth result
+	float relief_offset;
 	bool fail_converts;  //!< converts fail and the cap turns FAILED(DEVICE_LOST)
 	//! State a successful warm ends in (0 = READY); e.g. ABSENT for a provider
 	//! that declares itself unavailable after trying (#2029). retryable 0.

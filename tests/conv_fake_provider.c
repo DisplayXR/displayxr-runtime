@@ -274,6 +274,9 @@ fake_stream_convert(struct xrt_conversion_plugin_instance *inst,
 	}
 	const uint32_t task = c != NULL ? c->cap.task : 0;
 	const uint32_t kind = c != NULL ? c->cap.depth_kind : 0;
+	const float conv_value = c != NULL ? c->convergence_value : 0.0f;
+	const float relief_scale = c != NULL ? c->relief_scale : 0.0f;
+	const float relief_offset = c != NULL ? c->relief_offset : 0.0f;
 	os_mutex_unlock(&f->mtx);
 	if (ms > 0) {
 		sleep_ms(ms);
@@ -297,6 +300,15 @@ fake_stream_convert(struct xrt_conversion_plugin_instance *inst,
 		out->depth_info.invalid_sample = -1.0f;
 		out->depth_info.same_inference = task == XRT_CONV_TASK_VIEWS_MONO ? 1u : 0u;
 		out->depth_info.source_time_ns = params->source_time_ns;
+		if (conv_value > 0.0f) {
+			out->depth_info.convergence_value = conv_value;
+			out->depth_info.suggest_flags |= 4u;
+		}
+		if (relief_scale != 0.0f) {
+			out->depth_info.relief_valid = 1;
+			out->depth_info.relief_scale = relief_scale;
+			out->depth_info.relief_offset = relief_offset;
+		}
 	}
 	(void)in;
 	leave_s(f);

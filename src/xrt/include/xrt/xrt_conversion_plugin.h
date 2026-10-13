@@ -483,14 +483,24 @@ struct xrt_conv_depth_info
 	float range_p05, range_p95;     //!< 0,0 = not computed
 	float fx, fy, cx, cy;           //!< depth-image texels; ≤ 0 = unknown
 	uint32_t source_width, source_height;
-	float convergence_value; //!< decoded value at zero disparity of the paired views; valid iff (suggest_flags & 4)
+	//! The DECODED value v (value_scale * sample + value_shift, never inverted)
+	//! at zero disparity of the paired views; valid iff (suggest_flags & 4).
+	//! For an inverse kind (METRIC_INVERSE, AFFINE_INVERSE, AFFINE_DISPARITY,
+	//! STEREO_DISPARITY_PX) that is an inverse depth, not a depth.
+	float convergence_value;
 	float suggested_convergence; //!< provider hint, DECODED units (see params.convergence); valid iff
 	                             //!< (suggest_flags & 1)
 	float suggested_strength; //!< provider hint for the disparity budget, 1 = its own; valid iff (suggest_flags &
 	                          //!< 2). Both hints are IGNORED by policy unless the provider is validated against the
 	                          //!< corpus.
 	uint32_t suggest_flags;   //!< bit0 suggested_convergence, bit1 suggested_strength, bit2 convergence_value
-	uint32_t relief_valid;    //!< ADR-046 A1: z_front_m = relief_scale/value + relief_offset
+	//! ADR-046 A1: z_front_m = relief_scale * q + relief_offset, where q is
+	//! the inverse-depth coordinate of the decoded value v: q = v for an
+	//! inverse kind (METRIC_INVERSE, AFFINE_INVERSE, AFFINE_DISPARITY,
+	//! STEREO_DISPARITY_PX), q = 1 / v for a depth kind (METRIC, AFFINE,
+	//! UNKNOWN). (For METRIC that is relief_scale / v; the legacy display
+	//! plug-in's relief with INVERSE encoding is the same formula.)
+	uint32_t relief_valid;
 	float relief_scale, relief_offset;
 	uint32_t temporal;       //!< from a temporal model
 	uint32_t same_inference; //!< same inference as this frame's views

@@ -1065,7 +1065,14 @@ lift_acquire_common(struct ipc_server_conv *sc,
 			d->principal[0] = di->cx;
 			d->principal[1] = di->cy;
 		}
-		d->convergence_depth = (di->suggest_flags & 4u) != 0 ? di->convergence_value : 0.0f;
+		// convergence_value is DECODED (an inverse depth for an inverse kind);
+		// spec 3's convergenceDepth is the depth reading of it (the ray
+		// fraction d / dc of the display transform), XR_DXR_lift.h's table.
+		d->convergence_depth = 0.0f;
+		if ((di->suggest_flags & 4u) != 0 && di->convergence_value > 0.0f && isfinite(di->convergence_value)) {
+			d->convergence_depth =
+			    depth_kind_is_inverse(di->kind) ? 1.0f / di->convergence_value : di->convergence_value;
+		}
 		// The depth refers to the source camera = the midpoint of the
 		// synthesised viewpoints (the straight-on viewer when none).
 		const uint32_t vn = out->viewpoint_count;

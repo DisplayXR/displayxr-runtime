@@ -643,6 +643,32 @@ input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShi
 **Units are never invented.** With an affine kind, near / far and the intrinsics are as reported
 or zero; a provider that does not know a field leaves it zero.
 
+**Decoding, normatively.** Every value field (`nearZ`, `farZ`, the range fields,
+`convergenceValue`) is in **decoded units** `v = rawScale · s + rawShift`, never inverted. What a
+caller computes from `v` depends on `kind`:
+
+| `kind` | depth reading `d` | inverse-depth coordinate `q` | a distance? |
+|---|---|---|---|
+| `METRIC_DEPTH` | `v` (metres) | `1 / v` | yes, metres |
+| `METRIC_INVERSE` | `1 / v` (metres) | `v` | yes, metres |
+| `AFFINE_INVERSE_DEPTH` | `1 / v` | `v` | no: an order only (unknown scale and shift) |
+| `AFFINE_DISPARITY` | `1 / v` | `v` | no |
+| `AFFINE_DEPTH` | `v` | `1 / v` | no |
+
+- `convergenceValid` / `convergenceValue`: the decoded `v` the conversion put at zero disparity
+  (on the screen plane). Content whose `q` is larger than the plane's `q` is in front of it.
+- The display relief (`XrLiftViewsInfoDXR::reliefValid`, `reliefScale`, `reliefOffset`) is
+  affine in `q`: a texel is presented at `z = reliefScale · q + reliefOffset` metres in front of
+  the screen plane (toward the viewer; behind = negative). For `METRIC_DEPTH` that is
+  `reliefScale / d + reliefOffset`.
+- Spec 3's `XrLiftDepthResultDXR::convergenceDepth` is the depth reading `d` of
+  `convergenceValue` (the ray fraction `d / dc` of §4.3), and its `encoding` is INVERSE exactly for
+  the kinds whose `d = 1 / v`.
+
+The plug-in ABI uses the same convention (`xrt_conv_depth_info::convergence_value` decoded,
+`relief_*` affine in `q`), so the runtime copies these fields and never rescales them.
+`tests_ipc_conv_v4` checks every kind of the table through both the spec-3 and the spec-4 path.
+
 **`XrLiftViewsInfoDXR`**, chained on `XrLiftResultDXR` of a `VIEWS_*` stream, says how the views
 were made, in terms that round-trip to stereo-video metadata: `layout` (`ROW` = spec 3, view 0
 leftmost; `ARRAY_LAYERS`; `ATLAS` reserved), `viewCount`, `columns` × `rows`, `viewExtent`,

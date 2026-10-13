@@ -383,7 +383,7 @@ TEST_CASE("lift ABI v4: struct layouts (64-bit)", "[lift_abi]")
 	PIN_OFF(XrLiftResultExportDXR, colorSpace, 24);
 	PIN_OFF(XrLiftResultExportDXR, syncKind, 28);
 
-	CHECK(sizeof(XrLiftDepthInfoDXR) == 104);
+	CHECK(sizeof(XrLiftDepthInfoDXR) == 112);
 	PIN_OFF(XrLiftDepthInfoDXR, kind, 16);
 	PIN_OFF(XrLiftDepthInfoDXR, measure, 20);
 	PIN_OFF(XrLiftDepthInfoDXR, rawScale, 24);
@@ -400,6 +400,8 @@ TEST_CASE("lift ABI v4: struct layouts (64-bit)", "[lift_abi]")
 	PIN_OFF(XrLiftDepthInfoDXR, temporallyConsistent, 92);
 	PIN_OFF(XrLiftDepthInfoDXR, discontinuity, 96);
 	PIN_OFF(XrLiftDepthInfoDXR, baselineMeters, 100);
+	PIN_OFF(XrLiftDepthInfoDXR, convergenceValid, 104);
+	PIN_OFF(XrLiftDepthInfoDXR, convergenceValue, 108);
 
 	CHECK(sizeof(XrLiftViewsInfoDXR) == 136);
 	PIN_OFF(XrLiftViewsInfoDXR, layout, 16);
