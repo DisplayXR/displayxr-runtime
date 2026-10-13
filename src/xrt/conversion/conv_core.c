@@ -367,7 +367,10 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 	switch (e->ev) {
 	case CONV_HOST_EV_LOST: {
 		const bool crash = conv_host_exit_is_crash(e->detail);
-		hs->down = true;
+		// After a crash the host comes back on its own (backoff) and says
+		// RESTORED; an orderly exit is respawned by the next demand, so the
+		// next warm must be allowed to reach it.
+		hs->down = crash;
 		hs->rewarm = false;
 		hs->restarts++;
 		U_LOG_W("[conv] provider %s: host process exited (code %d%s); streams stay, outputs keep their last result",
@@ -402,6 +405,20 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider == p) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_CRASH_LOOP, t);
+				apply_locked(core, i, &ev);
+			}
+		}
+		break;
+	case CONV_HOST_EV_FAILED:
+		hs->down = true;
+		hs->rewarm = false;
+		U_LOG_W("[conv] provider %s: host failed terminally (%s); FAILED until a registry change", id,
+		        conv_reason_name((uint32_t)e->detail));
+		for (uint32_t i = 0; i < core->reg.row_count; i++) {
+			if (core->reg.rows[i].provider == p) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_RUNTIME_FAILED, t);
+				ev.reason = e->detail != 0 ? (uint32_t)e->detail : XRT_CONV_FAIL_LOAD;
+				ev.retryable = false;
 				apply_locked(core, i, &ev);
 			}
 		}

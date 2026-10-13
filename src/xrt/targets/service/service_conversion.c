@@ -38,7 +38,7 @@
 #include "xrt/xrt_windows.h"
 #endif
 
-#ifdef SERVICE_HAVE_CONV_HOST_PROXY
+#ifdef CONV_HAVE_HOST_PROXY
 #include "conversion/conv_host_proxy.h"
 #endif
 
@@ -538,12 +538,14 @@ satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_h
 		(void)snprintf(why, why_size, "no %s beside the service", CONV_HOST_EXE);
 		return false;
 	}
-#ifdef SERVICE_HAVE_CONV_HOST_PROXY
+#ifdef CONV_HAVE_HOST_PROXY
 	struct conv_host_proxy_config cfg;
-	memset(&cfg, 0, sizeof(cfg));
+	conv_host_proxy_config_defaults(&cfg);
 	cfg.provider_id = e->id;
 	cfg.provider_binary = e->binary_path;
 	cfg.host_exe = host_exe;
+	// The host writes its own log (DisplayXR_conversion-host_<id>.<pid>_<ts>.log).
+	// adapter_luid stays 0 (any) until the GPU lane passes the ingest adapter.
 	const xrt_result_t r = conv_host_proxy_create(&cfg, out);
 	if (r != XRT_SUCCESS) {
 		(void)snprintf(why, why_size, "the host proxy could not be created (%d)", (int)r);

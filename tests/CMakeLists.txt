@@ -336,6 +336,8 @@ endif()
 # (os_process.h) against a real helper child. Windows, desktop Linux, macOS.
 if(WIN32 OR APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
 	list(APPEND tests tests_conv_os_process)
+	# #2034: the satellite host proxy against a scripted host process.
+	list(APPEND tests tests_conv_proxy)
 endif()
 
 foreach(testname ${tests})
@@ -1378,6 +1380,18 @@ if(TARGET tests_conv_os_process)
 		PRIVATE "CONV_OS_PROCESS_HELPER=\"$<TARGET_FILE:tests_conv_os_process_helper>\""
 		)
 	add_dependencies(tests_conv_os_process tests_conv_os_process_helper)
+endif()
+if(TARGET tests_conv_proxy)
+	add_executable(tests_conv_proxy_host tests_conv_proxy_host.c)
+	target_link_libraries(tests_conv_proxy_host PRIVATE aux_os aux_util displayxr::conversion_core)
+	if(NOT WIN32)
+		target_link_libraries(tests_conv_proxy_host PRIVATE xrt-pthreads)
+	endif()
+	target_link_libraries(tests_conv_proxy PRIVATE displayxr::conversion_runtime)
+	target_compile_definitions(
+		tests_conv_proxy PRIVATE "CONV_PROXY_HOST=\"$<TARGET_FILE:tests_conv_proxy_host>\""
+		)
+	add_dependencies(tests_conv_proxy tests_conv_proxy_host)
 endif()
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
