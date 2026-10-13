@@ -175,7 +175,7 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | Payload carries no `monitor` object | Rect **refused**, one WARN; display-scoped. Without it there is no scale to apply and no way to name the space the rect is in. Mutter omits it only for a window on no monitor |
 | The window's monitor is not the 3D panel | Rect **refused**, one WARN; display-scoped — *and* the weave itself degrades to flat 2D (#1595), because a surface on another output cannot be 1:1 with this panel by any phase |
 | The presented buffer ≠ the window's device extent | Geometry is still valid and still served; the **weave** degrades to flat 2D (#1595), one `NOT_1TO1:` WARN, and the present-origin feed is suppressed so no stale phase stays latched |
-| Publisher goes away / comes back (screen lock) | Cache **dropped** on `NameOwnerChanged`, so display-scoped while it is gone; on its return the consumer re-takes `GetWindows` immediately rather than waiting for the next change. One WARN per transition |
+| Publisher goes away / comes back (shell restart, re-enable; screen lock before extension version 14) | Cache **dropped** on `NameOwnerChanged`, so display-scoped while it is gone; on its return the consumer re-takes `GetWindows` immediately rather than waiting for the next change, and the compositor **re-syncs** everything it derived from the old publisher (§3.1, #2071). One WARN per transition |
 
 The scale row has been rewritten twice, and the history is the argument. It
 originally returned the rect with a warning, so the outcome was not pre-#817
@@ -211,10 +211,14 @@ the session is in — so with no publisher there is no destination extent, and
 the session behaves exactly as it did before the gate existed. Degrading on
 ignorance would be its own kind of wrong answer.
 
-The lock-screen row exists because the publisher is **intermittent by design**:
-GNOME disables user extensions whenever the screen shield is up and re-enables
-them on unlock, so the bus name really does disappear and reappear during a
-normal session. Absence was always handled (bounded retry, display-scoped), but
+The lock-screen row exists because the publisher was **intermittent by design**:
+GNOME disables an extension whose `metadata.json` names no `session-modes`
+whenever the screen shield is up and re-enables it on unlock, so up to extension
+version 13 the bus name really did disappear and reappear during a normal
+session — on a laptop at every suspend. Version 14 declares
+`["user", "unlock-dialog"]` and stays up across the lock (§3.1), but a shell
+restart or a re-enable still takes the name away, and an older extension is
+still in the field, so the consumer keeps handling both edges. Absence was always handled (bounded retry, display-scoped), but
 two things about the *edges* were not. On the way out, the last snapshot stayed
 cached and kept anchoring the phase — and a window moved or resized behind the
 shield made that cached origin quietly wrong. On the way back, the publisher
@@ -225,6 +229,55 @@ survived until the user happened to move the window again. Tracking
 gaining one invalidates it *and* re-takes the same bounded `GetWindows` the
 retry path already makes. These are rare lifecycle events, so each transition
 logs exactly one WARN; the per-frame pump still never blocks for anything else.
+
+### 3.1 The lock screen and the publisher re-sync (extension version 14, #2071)
+
+**Observed:** a weaving native-Wayland app kept up across s2idle suspend/resume
+cycles on an SR panel (GNOME 50.1) came back once with exactly inverted 3D — depth
+swapped, tracking fine — while a freshly started app was correct. Its log showed
+the publisher going away at the suspend (the lock screen) and the window having
+no publisher entry until the unlock: the placement / phase anchor, which on
+Wayland only the extension can supply, was lost for the length of the lock and
+re-acquired inconsistently.
+
+**Extension side.** `metadata.json` declares
+`"session-modes": ["user", "unlock-dialog"]` (supported since GNOME 42, the
+extension's floor), so GNOME keeps it enabled on the lock screen instead of
+calling `disable()`. What keeps running there: the geometry snapshot and
+`WindowsChanged`, `CaptureExclusion1` (tearing it down at lock would make every
+excluded window capturable for the length of the lock), `WindowPlacement1` and
+move sync (a client moving its own window), and the `WorkspaceHotkey1` object.
+What does not: the workspace hotkey's **grab** — the extension follows
+`Main.sessionMode` (`isLocked`, via its `updated` signal; not `currentMode`,
+which is `ubuntu` on Ubuntu), releases the accelerator on lock, never acts on a
+press while locked, defers the manifest bootstrap to the unlock, and re-grabs
+on unlock. The extension draws no UI, so it adds none to the lock screen. No
+D-Bus member or capability bit changed; `WorkspaceHotkey1.GetState` gains a
+`locked` field.
+
+**Runtime side.** The provider already dropped its cache on the vanish edge and
+re-took `GetWindows` (and renewed move sync) on the appear edge. Each appear
+edge now also bumps a publisher generation
+(`comp_vk_native_wl_geom_publisher_generation`), and the in-process Vulkan
+compositor, before the 1:1 gate each frame, re-syncs everything it derived from
+the previous publisher when the generation moves: the present-origin baseline is
+forgotten (the DP's `set_present_origin` is re-fed from the fresh snapshot and
+logged), the 1:1 gate re-runs on the fresh snapshot with its one-shot lines
+re-armed, a drop-snap verification in flight is abandoned and the gap is
+treated as a move from the last position seen before it — so the drop path
+re-asks the DP (`snap_window_rect`) and moves the window onto the lattice if
+the gap left it off — and the move-sync frame tag is re-sent with the next
+presented frame. One WARN per event:
+
+```
+wl_geom: publisher reappeared — re-syncing geometry (#2071): present origin re-fed, 1:1 gate re-run, weave phase … , move-sync tag … (publisher generation N)
+```
+
+so a session that lives across a lock never keeps a stale phase, even on an
+extension older than version 14. With version 14 that line should not appear
+across a lock at all; seeing it on lock/unlock means the session still runs an
+older copy (`gnome-extensions info window-geometry@displayxr.org`; a running
+shell keeps the code it loaded until the next login).
 
 ## 4. Packaging contract — the publisher is a shared asset
 
@@ -531,11 +584,13 @@ so a dead app can never leave a window invisible to capture. There is no timer
 and no heartbeat.
 
 **Disable removes everything.** `disable()` removes every effect the extension
-added, whether or not its owner is still registered. GNOME disables user
-extensions whenever the screen shield is up, so this happens routinely: the bus
-name disappears, every window becomes capturable again, and on unlock the name
-returns with **no** registrations. Consumers must watch `NameOwnerChanged` and
-re-register (§6.5).
+added, whether or not its owner is still registered. Up to extension version 13
+GNOME disabled it whenever the screen shield was up, so this happened routinely;
+since version 14 the lock screen no longer disables it (§3.1) and exclusions
+survive a lock, but a shell restart or a re-enable still does: the bus name
+disappears, every window becomes capturable again, and the name returns with
+**no** registrations. Consumers must watch `NameOwnerChanged` and re-register
+(§6.5).
 
 ### 6.4 Detecting it
 
@@ -1072,9 +1127,10 @@ last second, **newest first**, and shows the frame there:
   `UnknownMethod` (an older extension) or `false` → the tag is destroyed and
   the lattice path runs. No answer (no extension yet) → the request is
   remembered.
-- The registration lives with the caller's bus connection. GNOME disables user
-  extensions while the screen shield is up, so the runtime registers again
-  whenever the service name reappears.
+- The registration lives with the caller's bus connection. The service name
+  can disappear (a shell restart, a re-enable, and — before extension version
+  14 — every lock screen), so the runtime registers again whenever it
+  reappears, and re-sends its frame tag (§3.1).
 - Per frame, the runtime trusts the snapshot's `move_sync` for its window: only
   when it is set does it skip the drop-time snap (#1609). Until the extension has
   (re)accepted, the window is a lattice window.

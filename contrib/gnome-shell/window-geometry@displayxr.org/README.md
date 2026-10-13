@@ -216,7 +216,8 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   a window needs no drag lattice (`SetDragLattice*` refuses it), and the
   snapshot gains `move_sync`. The DisplayXR runtime registers by default
   whenever the extension offers it (`DXR_WL_MOVE_SYNC=0` opts out) and
-  registers again when the extension comes back after the lock screen. See
+  registers again whenever the extension comes back (a shell restart, a re-enable;
+  the lock screen too before version 14). See
   the spec, §9. Measurement hook: `DISPLAYXR_STAMP_AUDIT=1` in the shell's
   environment, with the runtime's `DXR_WL_ORIGIN_STAMP=1` (which overwrites
   pixels — never in a real session).
@@ -282,6 +283,30 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   directories, the extension starts the unit once so a freshly installed
   controller is armed without the service having run since. See
   `docs/specs/runtime/workspace-controller-registration.md` § Linux.
+- Version 14, no interface change: the extension **stays enabled on the lock
+  screen** (`"session-modes": ["user", "unlock-dialog"]`, displayxr-runtime#2071).
+  Before it, GNOME disabled the extension at every lock — on a laptop, every
+  suspend — so the bus name vanished and a weaving window that lived across
+  the suspend lost its placement / phase anchor (seen once as inverted 3D
+  after resume). On the lock screen the geometry snapshot, `WindowsChanged`,
+  capture exclusion, window placement / move sync and the `WorkspaceHotkey1`
+  object keep running; the workspace hotkey's **grab** does not — it is
+  released while locked (a press there is never acted on, and the manifest
+  bootstrap waits for the unlock) and re-taken on unlock (`GetState` reports
+  `locked`). The extension draws nothing, so it adds nothing to the lock
+  screen. The runtime additionally re-syncs whenever the bus name reappears
+  (`wl_geom: publisher reappeared — re-syncing geometry (#2071)`), so an
+  older extension still recovers a correct phase after unlock.
+
+Verify the extension survives the lock screen (version 14+): lock from another
+terminal (`loginctl lock-session`) or a remote shell, then
+
+```bash
+gnome-extensions info window-geometry@displayxr.org | grep -E 'State|Version'   # ACTIVE, 14
+gdbus call --session --dest org.displayxr.WindowGeometry \
+  --object-path /org/displayxr/WindowGeometry \
+  --method org.displayxr.WindowGeometry1.GetWindows    # still answers while locked
+```
 
 Verify capture exclusion is live:
 
