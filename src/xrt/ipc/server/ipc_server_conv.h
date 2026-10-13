@@ -126,6 +126,13 @@ struct ipc_server_conv_io_ops
 	void (*release_input)(void *ud, xrt_graphics_buffer_handle_t handle, bool is_dxgi);
 
 	/*!
+	 * Optional (#2030): the content key of the input import_input just put in
+	 * @p slot (conv_frame_submit::content_key; still-image dedupe of PHOTO
+	 * streams). 0 = unknown: the frame converts. NULL = never asked.
+	 */
+	uint64_t (*input_content_key)(void *ud, uint64_t stream_id, const struct conv_submit_slot *slot);
+
+	/*!
 	 * Copy the pinned result @p res into stream @p stream_id's persistent
 	 * export texture(s) (created / resized as needed, SHARED_NTHANDLE, no
 	 * keyed mutex) and signal its shared export fence. The core unpins @p res

@@ -317,6 +317,10 @@ struct d3d11_lift
 	//! the replay touches the shared immediate context. nullptr = the device
 	//! refused one: S5 draws on the immediate context, as before.
 	ID3D11DeviceContext *viewsyn_deferred = nullptr;
+	//! #2030: the still-image content check (its own device; created on the
+	//! first PHOTO submit, under glue_mtx).
+	struct d3d11_conv_content_check *content_check = nullptr;
+	bool content_check_tried = false;
 
 	//! G7, producer side: when the service last published the panel's eyes
 	//! (the conversion core holds the eyes themselves), and how a producer

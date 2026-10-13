@@ -895,6 +895,11 @@ ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
 	memset(&fr, 0, sizeof(fr));
 	fr.source_time = args->source_time;
 	frame_from_params(&p, st.view_count, &fr);
+	// #2030: still-image dedupe for PHOTO streams (the glue's GPU content
+	// check; lift spec 4 will let the client name its frame instead).
+	if (st.content_hint == XRT_CONV_CONTENT_PHOTO && io.input_content_key != NULL) {
+		fr.content_key = io.input_content_key(io.ud, st.wire_id, &slot);
+	}
 	if (st.input_scale < 1.0f && fr.focal_px > 0.0f) {
 		fr.focal_px *= (float)sw / (float)args->width; // focal is in INPUT pixels
 	}
