@@ -109,6 +109,7 @@ conv_registry_add(struct conv_registry *reg, const struct conv_provider_desc *de
 	p->binary_mtime = desc->binary_mtime;
 	p->iface = desc->iface;
 	p->inst = desc->inst;
+	p->host = desc->iface == NULL ? desc->host : NULL;
 	return idx;
 }
 
@@ -295,16 +296,21 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 	}
 	struct conv_provider *p = &reg->providers[pi];
 	const struct xrt_conversion_plugin_iface *iface = p->iface;
-	if (iface == NULL || !XRT_CONV_IFACE_HAS(iface, describe_cap)) {
+	// A satellite provider is not loaded here: its host answers the [C] calls
+	// from the describe it got from the host process.
+	struct conv_host *host = iface == NULL ? p->host : NULL;
+	if (host == NULL && (iface == NULL || !XRT_CONV_IFACE_HAS(iface, describe_cap))) {
 		return -1;
 	}
 
 	// Provider status: FALLBACK flag and platform usability.
-	if (XRT_CONV_IFACE_HAS(iface, get_provider_status)) {
+	const bool has_status = host != NULL ? host->ops->get_provider_status != NULL
+	                                     : XRT_CONV_IFACE_HAS(iface, get_provider_status);
+	if (has_status) {
 		struct xrt_conv_provider_status st;
 		memset(&st, 0, sizeof(st));
 		st.struct_size = (uint32_t)sizeof(st);
-		if (iface->get_provider_status(&st)) {
+		if (host != NULL ? host->ops->get_provider_status(host, &st) : iface->get_provider_status(&st)) {
 			p->platform_state = st.state;
 			if ((st.flags & XRT_CONV_PROVIDER_FLAG_FALLBACK) != 0) {
 				p->flags |= CONV_PROV_FALLBACK;
@@ -316,7 +322,7 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 		}
 	}
 
-	const bool has_gen = XRT_CONV_IFACE_HAS(iface, get_generation);
+	const bool has_gen = host != NULL || XRT_CONV_IFACE_HAS(iface, get_generation);
 	struct xrt_conv_capability caps[XRT_CONV_MAX_CAPABILITIES];
 	uint32_t n = 0;
 	uint64_t gen_after = 0;
@@ -326,10 +332,12 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 		p->first_error = CONV_CAP_OK;
 		n = 0;
 
-		uint64_t gen_before = has_gen ? iface->get_generation(p->inst) : 0;
+		uint64_t gen_before = !has_gen ? 0 : host != NULL ? conv_host_get_generation(host) : iface->get_generation(p->inst);
 
 		uint32_t count = 0;
-		if (iface->describe_cap(p->inst, 0, NULL, &count) != XRT_SUCCESS) {
+		const xrt_result_t cr = host != NULL ? conv_host_describe_cap(host, 0, NULL, &count)
+		                                     : iface->describe_cap(p->inst, 0, NULL, &count);
+		if (cr != XRT_SUCCESS) {
 			return -1;
 		}
 		if (count > XRT_CONV_MAX_CAPABILITIES) {
@@ -340,7 +348,9 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 			struct xrt_conv_capability cap;
 			memset(&cap, 0, sizeof(cap));
 			cap.struct_size = (uint32_t)sizeof(cap);
-			if (iface->describe_cap(p->inst, i, &cap, NULL) != XRT_SUCCESS) {
+			const xrt_result_t dr = host != NULL ? conv_host_describe_cap(host, i, &cap, NULL)
+			                                     : iface->describe_cap(p->inst, i, &cap, NULL);
+			if (dr != XRT_SUCCESS) {
 				note_error(p, CONV_CAP_ERR_DESCRIBE_FAILED);
 				continue;
 			}
@@ -348,7 +358,7 @@ conv_registry_describe(struct conv_registry *reg, uint32_t pi, uint64_t now_ns)
 			accept_cap(p, &cap, caps, &n);
 		}
 
-		gen_after = has_gen ? iface->get_generation(p->inst) : 0;
+		gen_after = !has_gen ? 0 : host != NULL ? conv_host_get_generation(host) : iface->get_generation(p->inst);
 		if (gen_after == gen_before) {
 			break;
 		}

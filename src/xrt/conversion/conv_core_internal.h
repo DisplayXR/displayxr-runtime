@@ -36,6 +36,7 @@ struct conv_in_slot
 	struct xrt_conv_image images[CONV_STREAM_MAX_SUBMIT_IMAGES];
 	uint32_t role[CONV_STREAM_MAX_SUBMIT_IMAGES];
 	struct conv_host *reg_host; //!< host the images are registered with (NULL = none)
+	uint32_t reg_epoch;         //!< the host's epoch at registration (satellite restarts)
 	uint32_t reg_idx[CONV_STREAM_MAX_SUBMIT_IMAGES];
 	struct conv_frame_submit frame; //!< the committed frame's inputs
 };
@@ -45,6 +46,7 @@ struct conv_ring_slot
 	/* Targets (runtime-allocated, exported to clients). */
 	struct xrt_conv_image targets[CONV_RING_TARGETS]; //!< views, depth, confidence, disparity
 	struct conv_host *reg_host;
+	uint32_t reg_epoch; //!< the host's epoch at registration (satellite restarts)
 	uint32_t reg_idx[CONV_RING_TARGETS];
 	uint32_t in_w, in_h; //!< input extent the targets were sized for (0 = none)
 	uint32_t sized_key;  //!< outputs / views the targets were sized for
@@ -96,6 +98,7 @@ struct conv_stream
 	bool pstream_created;
 	bool pstream_failed;
 	struct conv_host *pstream_host;
+	uint32_t pstream_epoch; //!< host epoch the provider stream lives in
 
 	/* Temporal state. */
 	bool reset_pending;         //!< FRAME_RESET on the next conversion
@@ -184,18 +187,42 @@ struct conv_warm_op
 	struct conv_core *core;
 	uint32_t provider;
 	uint32_t cap_id; //!< 0 = free slot
+	uint32_t epoch;  //!< host epoch at submit: a crash casualty is not a warm failure
 	bool busy;
 	bool cancel;
+};
+
+//! conv_host::event_ud of a provider's host.
+struct conv_host_listener
+{
+	struct conv_core *core;
+	uint32_t provider;
 };
 
 struct conv_host_slot
 {
 	struct conv_host *host; //!< NULL = not loaded (cache-only rows)
+	struct conv_host_listener listener;
 	struct conv_stream_lane lane;
 	struct conv_job_lane jlane;
 	struct conv_warm_op warms[XRT_CONV_MAX_CAPABILITIES];
 	bool hung;
+	//! Satellite: the host process is gone (LOST seen, RESTORED not yet).
+	bool down;
+	//! Satellite: RESTORED seen; re-warm the restarting rows after the re-describe.
+	bool rewarm;
+	uint32_t restarts; //!< LOST events seen (diagnostics)
 	uint64_t generation_seen;
+};
+
+//! Host lifecycle events, queued by the listener and applied by the control thread.
+#define CONV_CORE_HOST_EVQ 64u
+
+struct conv_host_evq_entry
+{
+	uint32_t provider;
+	uint32_t ev; //!< CONV_HOST_EV_*
+	int32_t detail;
 };
 
 struct conv_validated
@@ -234,6 +261,12 @@ struct conv_core
 	bool wake_pending; //!< a row became READY: the control thread wakes the lanes
 
 	struct conv_host_slot hosts[CONV_REGISTRY_MAX_PROVIDERS];
+
+	/* evq_mtx (leaf): host lifecycle events, pushed from host threads. */
+	struct os_mutex evq_mtx;
+	struct conv_host_evq_entry evq[CONV_CORE_HOST_EVQ];
+	uint32_t evq_count;
+	uint32_t evq_dropped;
 
 	/* streams_mtx: the stream table (held between commands only). */
 	struct os_mutex streams_mtx;

@@ -186,6 +186,7 @@ struct conv_stream_stats
 	uint64_t blocked_by_job;  //!< converts that waited behind a non-concurrent job
 	uint64_t blocked_by_warm; //!< converts that waited behind a non-concurrent warm
 	uint64_t rebinds;
+	uint64_t reopens; //!< provider stream re-opened after a satellite host restart
 	uint64_t lat_last_ns, lat_ema_ns;
 	float rate_hz;
 	uint32_t row_state; //!< XRT_CONV_STATE_* of the bound capability
