@@ -260,8 +260,25 @@ static bool
 gaussians_routable(struct ipc_server_conv *sc, const struct ipc_server_conv_io_ops *io)
 {
 	struct xrt_conv_wire_task_desc d;
-	return io->import_input_cpu != NULL && task_advertised(sc->core, XRT_CONV_TASK_SPLATS_MONO, &d) &&
-	       (d.lanes & XRT_CONV_LANE_JOB) != 0;
+	if (io->import_input_cpu == NULL || !task_advertised(sc->core, XRT_CONV_TASK_SPLATS_MONO, &d) ||
+	    (d.lanes & XRT_CONV_LANE_JOB) == 0) {
+		return false;
+	}
+	// Spec 3 knows PLY and SOG only: a provider that declares neither (e.g.
+	// SPZ only) is not offered to it. 0 = undeclared (the blob says).
+	const uint32_t v3_formats = (1u << XRT_CONV_BLOB_PLY_3DGS) | (1u << XRT_CONV_BLOB_SOG);
+	return d.splat_formats == 0 || (d.splat_formats & v3_formats) != 0;
+}
+
+//! A blob format spec 3 can name, one to one (XRT_CONV_BLOB_* 1, 2 == XRT_DP_LIFT_BLOB_*); 0 = none.
+static uint32_t
+v3_blob_format(uint32_t conv_format)
+{
+	switch (conv_format) {
+	case XRT_CONV_BLOB_PLY_3DGS: return XRT_DP_LIFT_BLOB_PLY_3DGS;
+	case XRT_CONV_BLOB_SOG: return XRT_DP_LIFT_BLOB_SOG;
+	default: return 0;
+	}
 }
 
 static xrt_result_t
@@ -1226,15 +1243,21 @@ ipc_server_conv_lift_acquire_blob(struct ipc_server_conv *sc,
 						}
 						off += got;
 					}
-					if (buf != NULL && off == jr.byte_size) {
+					const uint32_t v3_format = v3_blob_format(jr.blob_format);
+					if (buf != NULL && off == jr.byte_size && v3_format != 0) {
 						st.blob = buf;
 						st.blob_size = jr.byte_size;
-						st.blob_format = jr.blob_format == XRT_CONV_BLOB_SOG
-						                     ? XRT_DP_LIFT_BLOB_SOG
-						                     : XRT_DP_LIFT_BLOB_PLY_3DGS;
+						st.blob_format = v3_format;
 						st.blob_frame_id = st.job_frame_id;
 						st.blob_source_time = st.job_source_time;
 					} else {
+						if (v3_format == 0) {
+							// Never relabelled: a v3 caller would parse the
+							// bytes as the wrong format. Dropped (NOT READY).
+							U_LOG_W("[conv] GAUSSIANS: the provider returned blob format %u, "
+							        "which spec 3 cannot name; dropped",
+							        jr.blob_format);
+						}
 						free(buf);
 					}
 				}

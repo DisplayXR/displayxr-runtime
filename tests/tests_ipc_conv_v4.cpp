@@ -542,3 +542,66 @@ TEST_CASE("depth decoding per kind: convergence and relief follow the normative 
 		conv_fake_fini(&f);
 	}
 }
+
+TEST_CASE("GAUSSIANS facade: blob formats map one to one; spec 3 never sees SPZ", "[ipc_conv_v4]")
+{
+	// An SPZ-only provider is not offered to spec 3 at all.
+	{
+		conv_fake_provider f;
+		conv_fake_init(&f, "spz-only");
+		conv_fake_cap *s =
+		    conv_fake_add_cap(&f, 6, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+		s->cap.splat_formats = 1u << XRT_CONV_BLOB_SPZ;
+		conv_fake_set_state(&f, 6, XRT_CONV_STATE_READY, 0, false);
+		{
+			Fixture fx;
+			fx.install_glue(/*cpu*/ true);
+			REQUIRE(fx.add(f) >= 0);
+			CHECK((fx.properties().modes & XRT_DP_LIFT_MODE_GAUSSIANS) == 0u);
+			CHECK_FALSE(ipc_server_conv_routes_create(fx.sc, XRT_DP_LIFT_MODE_GAUSSIANS, XRT_CONV_CONTENT_PHOTO));
+		}
+		conv_fake_fini(&f);
+	}
+	// PLY stays PLY, SOG stays SOG; an undeclared SPZ blob is dropped, never
+	// relabelled.
+	const uint32_t formats[] = {XRT_CONV_BLOB_PLY_3DGS, XRT_CONV_BLOB_SOG, XRT_CONV_BLOB_SPZ};
+	for (uint32_t fmt : formats) {
+		CAPTURE(fmt);
+		conv_fake_provider f;
+		conv_fake_init(&f, "splats");
+		conv_fake_cap *s =
+		    conv_fake_add_cap(&f, 6, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+		s->cap.splat_formats = 0; // undeclared: the blob says
+		s->job_ms = 5;
+		s->job_bytes = 1024;
+		s->job_blob_format = fmt;
+		conv_fake_set_state(&f, 6, XRT_CONV_STATE_READY, 0, false);
+		{
+			Fixture fx;
+			fx.install_glue(/*cpu*/ true);
+			REQUIRE(fx.add(f) >= 0);
+			uint64_t id = 0;
+			REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 1, XRT_DP_LIFT_MODE_GAUSSIANS,
+			                                           XRT_CONV_CONTENT_PHOTO, 1.0f, 0, 0, &id) == XRT_SUCCESS);
+			REQUIRE(fx.submit(1, id) == XRT_SUCCESS);
+			bool ready = false;
+			xrt_lift_blob_info info{};
+			uint8_t *bytes = nullptr;
+			const bool got = wait_until(
+			    [&] {
+				    return ipc_server_conv_lift_acquire_blob(fx.sc, 1, id, 1u << 20, &ready, &info, &bytes) ==
+				               XRT_SUCCESS &&
+				           ready;
+			    },
+			    fmt == XRT_CONV_BLOB_SPZ ? 600 : 3000);
+			if (fmt == XRT_CONV_BLOB_SPZ) {
+				CHECK_FALSE(got);
+			} else {
+				REQUIRE(got);
+				CHECK(info.format == (fmt == XRT_CONV_BLOB_SOG ? XRT_DP_LIFT_BLOB_SOG : XRT_DP_LIFT_BLOB_PLY_3DGS));
+			}
+			std::free(bytes);
+		}
+		conv_fake_fini(&f);
+	}
+}
