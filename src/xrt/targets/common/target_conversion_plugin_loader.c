@@ -369,6 +369,46 @@ target_conversion_plugin_parse_hosting(const char *s, bool *out_known)
 	return h;
 }
 
+bool
+target_conversion_plugin_hosting_env_name(const char *id, char *buf, size_t buf_size)
+{
+	if (id == NULL || id[0] == '\0' || buf == NULL || buf_size == 0) {
+		return false;
+	}
+	const int n = snprintf(buf, buf_size, "DXR_CONV_%s_HOSTING", id);
+	if (n < 0 || (size_t)n >= buf_size) {
+		buf[0] = '\0';
+		return false;
+	}
+	for (char *c = buf; *c != '\0'; c++) {
+		if (*c == '-' || *c == '.') {
+			*c = '_';
+		} else if (*c >= 'a' && *c <= 'z') {
+			*c = (char)(*c - 'a' + 'A');
+		}
+	}
+	return true;
+}
+
+uint32_t
+target_conversion_plugin_resolve_hosting(uint32_t registered, const char *env_value, bool *out_from_env)
+{
+	uint32_t h = registered;
+	bool from_env = false;
+	if (env_value != NULL && env_value[0] != '\0') {
+		bool known = false;
+		const uint32_t e = target_conversion_plugin_parse_hosting(env_value, &known);
+		if (known) {
+			h = e;
+			from_env = true;
+		}
+	}
+	if (out_from_env != NULL) {
+		*out_from_env = from_env;
+	}
+	return h == XRT_CONV_HOSTING_IN_SERVICE ? XRT_CONV_HOSTING_IN_SERVICE : XRT_CONV_HOSTING_SATELLITE;
+}
+
 const char *
 target_conversion_plugin_status_str(uint32_t status)
 {

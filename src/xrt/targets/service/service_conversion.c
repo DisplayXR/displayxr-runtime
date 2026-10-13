@@ -9,6 +9,7 @@
 #include "service_conversion.h"
 #include "service_component_watch.h"
 #include "service_config.h"
+#include "service_spawn.h"
 
 #include "xrt/xrt_config_os.h"
 
@@ -36,6 +37,13 @@
 #ifdef XRT_OS_WINDOWS
 #include "xrt/xrt_windows.h"
 #endif
+
+#ifdef SERVICE_HAVE_CONV_HOST_PROXY
+#include "conversion/conv_host_proxy.h"
+#endif
+
+//! The conversion-host satellite (ADR-053 D5), installed beside the service.
+#define CONV_HOST_EXE "displayxr-conversion-host" SERVICE_SPAWN_EXE_SUFFIX
 
 #define CACHE_FILENAME "conversion-describe-cache.bin"
 #define CACHE_MAX_BYTES (4u * 1024u * 1024u)
@@ -500,7 +508,58 @@ effective_enabled(const struct xrt_conversion_plugin_entry *e)
 	return ov < 0 ? e->enabled : ov == 1;
 }
 
-//! Negotiate + probe @p e and add it to the core (no g.mtx: calls a provider).
+/*!
+ * Where @p e runs (roadmap §3.2, §3.4; discovery spec §3.3 `Hosting`):
+ * `DXR_CONV_<ID>_HOSTING` from the SERVICE's environment, then the registered
+ * value; `auto` = satellite. The built-in dp-lift adapter never comes here.
+ */
+static uint32_t
+resolve_hosting(const struct xrt_conversion_plugin_entry *e, bool *out_from_env)
+{
+	char env_name[128];
+	const char *env_value = NULL;
+	if (target_conversion_plugin_hosting_env_name(e->id, env_name, sizeof(env_name))) {
+		env_value = getenv(env_name);
+	}
+	return target_conversion_plugin_resolve_hosting(e->hosting, env_value, out_from_env);
+}
+
+/*!
+ * Build the satellite proxy for @p e: the provider DLL is NOT loaded in the
+ * service; the proxy spawns `displayxr-conversion-host` (lazily) and answers
+ * the describe from it. False, with @p why, when this install cannot host it.
+ */
+static bool
+satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_host **out, char *why, size_t why_size)
+{
+	char host_exe[600];
+	if (!service_spawn_sibling_path(CONV_HOST_EXE, host_exe, sizeof(host_exe)) ||
+	    !service_spawn_file_exists(host_exe)) {
+		(void)snprintf(why, why_size, "no %s beside the service", CONV_HOST_EXE);
+		return false;
+	}
+#ifdef SERVICE_HAVE_CONV_HOST_PROXY
+	struct conv_host_proxy_config cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.provider_id = e->id;
+	cfg.provider_binary = e->binary_path;
+	cfg.host_exe = host_exe;
+	const xrt_result_t r = conv_host_proxy_create(&cfg, out);
+	if (r != XRT_SUCCESS) {
+		(void)snprintf(why, why_size, "the host proxy could not be created (%d)", (int)r);
+		return false;
+	}
+	return true;
+#else
+	(void)e;
+	(void)out;
+	(void)snprintf(why, why_size, "this build has no conversion-host proxy");
+	return false;
+#endif
+}
+
+//! Negotiate + probe @p e (in-service) or build its satellite proxy, and add
+//! it to the core (no g.mtx: may call a provider).
 static void
 add_entry(struct xrt_conversion_plugin_entry *e)
 {
@@ -508,23 +567,47 @@ add_entry(struct xrt_conversion_plugin_entry *e)
 		return;
 	}
 	e->enabled = effective_enabled(e);
-	if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
-		(void)target_conversion_plugin_negotiate_one(e, host_for_entry(e));
-	}
 
 	struct conv_provider_desc d;
 	memset(&d, 0, sizeof(d));
 	d.id = e->id;
 	d.probe_order = e->probe_order;
-	d.hosting = e->hosting == XRT_CONV_HOSTING_SATELLITE   ? CONV_HOSTING_SATELLITE
-	            : e->hosting == XRT_CONV_HOSTING_IN_SERVICE ? CONV_HOSTING_IN_SERVICE
-	                                                        : CONV_HOSTING_AUTO;
 	d.supersedes = e->supersedes;
 	d.binary_path = e->binary_path;
 	struct stat sb;
 	if (e->binary_path[0] != '\0' && stat(e->binary_path, &sb) == 0) {
 		d.binary_size = (uint64_t)sb.st_size;
 		d.binary_mtime = (uint64_t)sb.st_mtime;
+	}
+
+	bool from_env = false;
+	const uint32_t want = resolve_hosting(e, &from_env);
+	const bool loadable = e->status == XRT_CONV_LOAD_NOT_LOADED || e->status == XRT_CONV_LOAD_NEGOTIATED;
+	if (want == XRT_CONV_HOSTING_SATELLITE && e->enabled && loadable) {
+		char why[192] = {0};
+		struct conv_host *host = NULL;
+		if (e->status == XRT_CONV_LOAD_NOT_LOADED && satellite_host_create(e, &host, why, sizeof(why))) {
+			// The host process negotiates (ABI gate: exit 10), probes and
+			// describes; the service never maps the provider binary.
+			d.hosting = CONV_HOSTING_SATELLITE;
+			d.enabled = true;
+			d.host = host;
+			(void)snprintf(e->reason, sizeof(e->reason), "hosted in %s", CONV_HOST_EXE);
+			U_LOG_W("[conv] provider %s: Hosting=satellite%s (%s)", e->id, from_env ? " (from the environment)" : "",
+			        CONV_HOST_EXE);
+			(void)conv_core_add_provider(g.core, &d);
+			return;
+		}
+		if (e->status == XRT_CONV_LOAD_NEGOTIATED) {
+			(void)snprintf(why, sizeof(why), "it is already loaded in the service");
+		}
+		U_LOG_W("[conv] provider %s: Hosting=satellite%s, but %s: hosting it in the service", e->id,
+		        from_env ? " (from the environment)" : "", why);
+	}
+	d.hosting = CONV_HOSTING_IN_SERVICE;
+
+	if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
+		(void)target_conversion_plugin_negotiate_one(e, host_for_entry(e));
 	}
 	// Only a negotiated provider is selectable; the others are listed (their
 	// cached rows, if any, stay DISABLED) so `conv list` shows why.

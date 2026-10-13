@@ -443,6 +443,43 @@ TEST_CASE("conversion loader: Hosting strings", "[conversion_loader]")
 	CHECK(target_conversion_plugin_parse_hosting("satellites", nullptr) == XRT_CONV_HOSTING_AUTO);
 }
 
+TEST_CASE("conversion loader: effective hosting (P2: auto = satellite; env override wins)", "[conversion_loader]")
+{
+	bool from_env = true;
+	// Registered value alone: auto -> satellite for every loader-registered DLL.
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_AUTO, nullptr, &from_env) ==
+	      XRT_CONV_HOSTING_SATELLITE);
+	CHECK_FALSE(from_env);
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_SATELLITE, "", nullptr) ==
+	      XRT_CONV_HOSTING_SATELLITE);
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_IN_SERVICE, nullptr, nullptr) ==
+	      XRT_CONV_HOSTING_IN_SERVICE);
+	// DXR_CONV_<ID>_HOSTING overrides the registry either way.
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_AUTO, "in-service", &from_env) ==
+	      XRT_CONV_HOSTING_IN_SERVICE);
+	CHECK(from_env);
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_IN_SERVICE, "Satellite", &from_env) ==
+	      XRT_CONV_HOSTING_SATELLITE);
+	CHECK(from_env);
+	// "auto" in the env is a real value: back to the default.
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_IN_SERVICE, "auto", &from_env) ==
+	      XRT_CONV_HOSTING_SATELLITE);
+	CHECK(from_env);
+	// An unrecognised env string is ignored.
+	CHECK(target_conversion_plugin_resolve_hosting(XRT_CONV_HOSTING_IN_SERVICE, "inservice", &from_env) ==
+	      XRT_CONV_HOSTING_IN_SERVICE);
+	CHECK_FALSE(from_env);
+
+	char name[64];
+	REQUIRE(target_conversion_plugin_hosting_env_name("sim-conversion", name, sizeof(name)));
+	CHECK(std::string(name) == "DXR_CONV_SIM_CONVERSION_HOSTING");
+	REQUIRE(target_conversion_plugin_hosting_env_name("com.vendor.depth", name, sizeof(name)));
+	CHECK(std::string(name) == "DXR_CONV_COM_VENDOR_DEPTH_HOSTING");
+	char tiny[8];
+	CHECK_FALSE(target_conversion_plugin_hosting_env_name("sim-conversion", tiny, sizeof(tiny)));
+	CHECK_FALSE(target_conversion_plugin_hosting_env_name("", name, sizeof(name)));
+}
+
 
 /*
  *
