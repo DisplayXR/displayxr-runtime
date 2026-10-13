@@ -56,7 +56,9 @@ conv_dp_lift_describe_static(uint32_t index, struct xrt_conv_capability *c)
 
 	if (c->task == XRT_CONV_TASK_VIEWS_MONO) {
 		c->min_views = 2;
-		c->max_views = XRT_CONV_MAX_VIEWS; // refined from lift_get_caps by the live adapter
+		// Conservative: SBS only until the live adapter's READY module says more
+		// (#2029: a v3 caller caching the ACTIVATING answer must not see NVIEW).
+		c->max_views = 2;
 		// The runtime always passes the viewpoints it resolved, and a module
 		// must give them precedence (the lift DP has no tracker session).
 		// Required for every VIEWS_* row by validation.

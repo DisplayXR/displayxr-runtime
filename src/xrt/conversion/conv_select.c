@@ -178,7 +178,12 @@ filter_row(const struct conv_select_row *r, const struct conv_select_request *re
 		return CONV_ROW_DROP_LANE;
 	}
 	if (task_is_views(req->task)) {
-		if (req->view_count < r->min_views || req->view_count > r->max_views) {
+		// #2029: a row that is not READY may still describe a conservative
+		// max_views (dp-lift: 2 until its module is up). Keep it for counts up
+		// to XRT_CONV_MAX_VIEWS; the READY refine decides (the stream goes
+		// unsatisfied if the capability lacks the views).
+		const uint32_t hi = r->composed || r->state == XRT_CONV_STATE_READY ? r->max_views : XRT_CONV_MAX_VIEWS;
+		if (req->view_count < r->min_views || req->view_count > hi) {
 			return CONV_ROW_DROP_VIEWS;
 		}
 		if ((r->flags & XRT_CONV_CAP_EXPLICIT_VIEWPOINTS) == 0) {

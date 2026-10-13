@@ -238,8 +238,8 @@ TEST_CASE("conv snapshot: streams / jobs columns come from the live core per tas
 	st->tasks[1].composed = true;
 	st->tasks[2] = task(0, XRT_CONV_TASK_DEPTH_VIDEO, "depth-video", XRT_CONV_STATE_READY, false, 1);
 	// A row whose provider fell off the provider table: never asked, reads 0.
-	st->tasks[3] = task(XRT_STATUS_CONV_NO_PROVIDER, XRT_CONV_TASK_DEPTH_MONO, "depth-mono",
-	                    XRT_CONV_STATE_READY, false, 0);
+	st->tasks[3] =
+	    task(XRT_STATUS_CONV_NO_PROVIDER, XRT_CONV_TASK_DEPTH_MONO, "depth-mono", XRT_CONV_STATE_READY, false, 0);
 	st->tasks[3].streams = 9; // stale values are cleared
 
 	std::vector<ActivityCall> calls;
@@ -713,7 +713,8 @@ TEST_CASE("conv headless: the shipped sim provider describes cleanly (the CI sel
 }
 #endif
 
-TEST_CASE("conv headless: DXR_CONV=0 (alias DXR_LIFT=0) means no conversion service (#2029)", "[conv_snapshot][selftest]")
+TEST_CASE("conv headless: DXR_CONV=0 (alias DXR_LIFT=0) means no conversion service (#2029)",
+          "[conv_snapshot][selftest]")
 {
 	set_env("DXR_CONV", nullptr);
 	set_env("DXR_LIFT", nullptr);
