@@ -1320,6 +1320,11 @@ endforeach()
 # pipeline, policy, jobs) against a scriptable CPU fake provider.
 target_sources(tests_conv_lanes PRIVATE conv_fake_provider.c)
 target_link_libraries(tests_conv_lanes PRIVATE displayxr::conversion_runtime)
+# #2030: the still-image dedupe measured against the shipped sim provider.
+if(TARGET sim_conversion_static)
+	target_link_libraries(tests_conv_lanes PRIVATE sim_conversion_static)
+	target_compile_definitions(tests_conv_lanes PRIVATE CONV_LANES_SIM_STATIC)
+endif()
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
 # can only append.

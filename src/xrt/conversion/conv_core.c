@@ -887,30 +887,89 @@ conv_core_call_failed(struct conv_core *core, uint32_t provider, uint32_t cap_id
  *
  */
 
-void
-conv_core_eyes_publish(struct conv_core *core, uint32_t dp_index, const struct conv_eyes *eyes)
+static bool
+eyes_key_ok(uint64_t key)
 {
-	if (dp_index < CONV_CORE_MAX_DPS) {
-		conv_eyes_slot_publish(&core->eyes[dp_index], eyes);
+	return key != CONV_EYES_DP_ANY && key != CONV_EYES_DP_NONE;
+}
+
+//! eyes_mtx held. Slot of @p key, or -1.
+static int32_t
+eyes_find_locked(struct conv_core *core, uint64_t key)
+{
+	for (uint32_t i = 0; i < CONV_CORE_MAX_DPS; i++) {
+		if (core->eyes_key[i] == key) {
+			return (int32_t)i;
+		}
 	}
+	return -1;
 }
 
 void
-conv_core_eyes_retire(struct conv_core *core, uint32_t dp_index)
+conv_core_eyes_publish(struct conv_core *core, uint64_t dp_key, const struct conv_eyes *eyes)
 {
-	if (dp_index < CONV_CORE_MAX_DPS) {
-		conv_eyes_slot_retire(&core->eyes[dp_index]);
+	if (core == NULL || eyes == NULL || !eyes_key_ok(dp_key)) {
+		return;
 	}
+	os_mutex_lock(&core->eyes_mtx);
+	int32_t s = eyes_find_locked(core, dp_key);
+	if (s < 0) {
+		// A free slot, else a retired one, else the least recently published.
+		int32_t retired = -1, lru = -1;
+		for (uint32_t i = 0; i < CONV_CORE_MAX_DPS && s < 0; i++) {
+			if (core->eyes_key[i] == 0) {
+				s = (int32_t)i;
+			} else if (!core->eyes[i].live && retired < 0) {
+				retired = (int32_t)i;
+			} else if (lru < 0 || core->eyes_publish_seq[i] < core->eyes_publish_seq[lru]) {
+				lru = (int32_t)i;
+			}
+		}
+		if (s < 0) {
+			s = retired >= 0 ? retired : lru;
+		}
+		core->eyes_key[s] = dp_key;
+	}
+	conv_eyes_slot_publish(&core->eyes[s], eyes);
+	core->eyes_publish_seq[s] = ++core->eyes_seq;
+	conv_eyes_slot_publish(&core->eyes_any, eyes);
+	core->eyes_any_key = dp_key;
+	os_mutex_unlock(&core->eyes_mtx);
+}
+
+void
+conv_core_eyes_retire(struct conv_core *core, uint64_t dp_key)
+{
+	if (core == NULL || !eyes_key_ok(dp_key)) {
+		return;
+	}
+	os_mutex_lock(&core->eyes_mtx);
+	const int32_t s = eyes_find_locked(core, dp_key);
+	if (s >= 0) {
+		// The key stays (its readers must see "gone", not "unknown") until
+		// the slot is reused for another DP.
+		conv_eyes_slot_retire(&core->eyes[s]);
+	}
+	if (core->eyes_any_key == dp_key) {
+		conv_eyes_slot_retire(&core->eyes_any);
+		core->eyes_any_key = 0;
+	}
+	os_mutex_unlock(&core->eyes_mtx);
 }
 
 bool
-conv_core_read_eyes(struct conv_core *core, int32_t dp, uint64_t now, struct conv_eyes *out)
+conv_core_eyes_read(struct conv_core *core, uint64_t dp_key, uint64_t now, struct conv_eyes *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (dp < 0 || dp >= (int32_t)CONV_CORE_MAX_DPS) {
+	if (core == NULL || dp_key == CONV_EYES_DP_NONE) {
 		return false;
 	}
-	return conv_eyes_slot_read(&core->eyes[dp], now, core->cfg.eyes_max_age_ns, out);
+	os_mutex_lock(&core->eyes_mtx);
+	const int32_t s = dp_key == CONV_EYES_DP_ANY ? -1 : eyes_find_locked(core, dp_key);
+	struct conv_eyes_slot *slot = s >= 0 ? &core->eyes[s] : &core->eyes_any;
+	const bool fresh = conv_eyes_slot_read(slot, now, core->cfg.eyes_max_age_ns, out);
+	os_mutex_unlock(&core->eyes_mtx);
+	return fresh;
 }
 
 
@@ -1108,13 +1167,15 @@ conv_core_create(const struct conv_core_config *cfg, struct conv_core **out_core
 	core->next_stream_id = 1;
 	core->next_job_id = 1;
 	if (os_mutex_init(&core->registry_mtx) != 0 || os_cond_init(&core->ctrl_cond) != 0 ||
-	    os_mutex_init(&core->streams_mtx) != 0 || os_mutex_init(&core->jobs_mtx) != 0) {
+	    os_mutex_init(&core->streams_mtx) != 0 || os_mutex_init(&core->jobs_mtx) != 0 ||
+	    os_mutex_init(&core->eyes_mtx) != 0) {
 		free(core);
 		return XRT_ERROR_THREADING_INIT_FAILURE;
 	}
 	for (uint32_t i = 0; i < CONV_CORE_MAX_DPS; i++) {
 		conv_eyes_slot_init(&core->eyes[i]);
 	}
+	conv_eyes_slot_init(&core->eyes_any);
 	if (os_thread_init(&core->ctrl_thread) != 0 || os_thread_start(&core->ctrl_thread, ctrl_main, core) != 0) {
 		struct conv_core *c = core;
 		conv_core_destroy(&c);
@@ -1192,6 +1253,8 @@ conv_core_destroy(struct conv_core **core_ptr)
 	for (uint32_t i = 0; i < CONV_CORE_MAX_DPS; i++) {
 		conv_eyes_slot_fini(&core->eyes[i]);
 	}
+	conv_eyes_slot_fini(&core->eyes_any);
+	os_mutex_destroy(&core->eyes_mtx);
 	os_cond_destroy(&core->ctrl_cond);
 	os_mutex_destroy(&core->jobs_mtx);
 	os_mutex_destroy(&core->streams_mtx);

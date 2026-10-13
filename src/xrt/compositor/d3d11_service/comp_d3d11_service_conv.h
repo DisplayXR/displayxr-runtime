@@ -125,12 +125,18 @@ comp_d3d11_service_conv_rect_frame(struct xrt_system_compositor *xsysc,
                                    struct xrt_lift_rect_frame *out);
 
 /*!
- * G7: where the service publishes the panel's predicted eyes for the
- * conversion core (one snapshot per DP; the D3D11 service publishes DP 0 from
- * every eye query it serves). NULL clears. Process-wide.
+ * G7: where the service publishes predicted eyes for the conversion core, one
+ * snapshot per display processor (roadmap §5.2). Every eye query the service
+ * answers publishes under the key of the DP that answered it (the DP's
+ * address, never dereferenced by the core); @p retire runs when a client's DP
+ * is destroyed. The same key reaches a stream through
+ * xrt_lift_rect_frame::eyes_dp_key, so a stream reads the eyes of the DP that
+ * owns its rect. NULL clears. Process-wide.
  */
 void
-comp_d3d11_service_set_conv_eyes_sink(void (*fn)(void *ud, const struct xrt_eye_positions *eyes), void *ud);
+comp_d3d11_service_set_conv_eyes_sink(void (*publish)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes),
+                                      void (*retire)(void *ud, uint64_t dp_key),
+                                      void *ud);
 
 #ifdef __cplusplus
 }

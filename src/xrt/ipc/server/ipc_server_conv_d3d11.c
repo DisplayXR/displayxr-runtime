@@ -14,8 +14,9 @@
  *    allocation, S5 / S6, the v3 route's I/O and the `dp-lift` backend (the
  *    service target's hook registers the provider row + swaps its allocator);
  *  - the weave path's bridge to core-routed stream ids;
- *  - the per-DP eyes sink (G7): every eye query the compositor answers
- *    publishes DP 0's snapshot into the core.
+ *  - the per-DP eyes sink (G7, roadmap §5.2): every eye query the compositor
+ *    answers publishes the answering DP's snapshot into the core, keyed by
+ *    that DP; a destroyed client DP retires its key.
  *
  * Detach runs in teardown_all BEFORE the system compositor is destroyed.
  *
@@ -72,7 +73,7 @@ bridge_resolve(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id
 }
 
 static void
-eyes_sink(void *ud, const struct xrt_eye_positions *e)
+eyes_sink(void *ud, uint64_t dp_key, const struct xrt_eye_positions *e)
 {
 	struct conv_eyes ce;
 	memset(&ce, 0, sizeof(ce));
@@ -85,7 +86,13 @@ eyes_sink(void *ud, const struct xrt_eye_positions *e)
 		ce.xyz[i][2] = e->eyes[i].z;
 	}
 	ce.timestamp_ns = os_monotonic_get_ns();
-	conv_core_eyes_publish((struct conv_core *)ud, 0, &ce); // DP 0: the panel
+	conv_core_eyes_publish((struct conv_core *)ud, dp_key, &ce);
+}
+
+static void
+eyes_retire(void *ud, uint64_t dp_key)
+{
+	conv_core_eyes_retire((struct conv_core *)ud, dp_key);
 }
 
 void
@@ -118,7 +125,7 @@ ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc)
 	gpu.io.ud = g->io_ud;
 	gpu.nominal_z_m = g->nominal_z_m;
 
-	comp_d3d11_service_set_conv_eyes_sink(eyes_sink, core);
+	comp_d3d11_service_set_conv_eyes_sink(eyes_sink, eyes_retire, core);
 	struct comp_d3d11_conv_bridge b;
 	memset(&b, 0, sizeof(b));
 	b.core = core;
@@ -138,6 +145,6 @@ ipc_server_conv_detach_d3d11(void)
 	}
 	ipc_server_conv_install_gpu(ipc_server_get_conv(), NULL);
 	comp_d3d11_service_conv_set_bridge(g_conv_d3d11.xsysc, NULL);
-	comp_d3d11_service_set_conv_eyes_sink(NULL, NULL);
+	comp_d3d11_service_set_conv_eyes_sink(NULL, NULL, NULL);
 	memset(&g_conv_d3d11, 0, sizeof(g_conv_d3d11));
 }

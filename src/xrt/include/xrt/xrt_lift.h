@@ -103,6 +103,9 @@ struct xrt_lift_rect_frame
 	float width_m;
 	float height_m;
 	bool valid; //!< false = the panel centre, size unknown
+	//! The display processor that owns the rect, as the conversion core's eyes
+	//! key (conv_core_eyes_publish, roadmap §5.2); 0 = unknown (any DP).
+	uint64_t eyes_dp_key;
 };
 
 //! One acquired texture result.

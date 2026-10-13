@@ -1090,6 +1090,11 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! G7 / roadmap §5.2: the conversion eyes key of the DP that last answered
+	//! this client's eye query (its address; 0 = none yet). Written under
+	//! render_mutex by the eye query, read lock-free by the lift submit paths.
+	std::atomic<uint64_t> conv_eyes_key{0};
+
 	//! #1018: serialises this client's ATLAS WRITE SET against readers.
 	//!
 	//! All GPU work goes through the one shared immediate context, so GPU
@@ -7333,6 +7338,10 @@ svc_weave_cursor_release_sprite(struct d3d11_client_render_resources *res)
 	res->wc_look = {};
 }
 
+//! G7 (roadmap §5.2): a destroyed client DP retires its conversion eyes key.
+static void
+svc_conv_eyes_retire(const struct xrt_display_processor_d3d11 *dp);
+
 /*!
  * Clean up per-client render resources.
  */
@@ -7351,6 +7360,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	if (res->display_processor != nullptr) {
 		DP_REQUEST_DISPLAY_MODE(
 		    res->display_processor, false);
+		svc_conv_eyes_retire(res->display_processor);
 	}
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
@@ -27503,6 +27513,9 @@ lift_rect_frame(struct d3d11_service_system *sys,
 	out->width_m = sys->base.info.display_width_m;
 	out->height_m = sys->base.info.display_height_m;
 	struct xrt_window_metrics wm = {};
+	if (xc != nullptr && xc->destroy == compositor_destroy) {
+		out->eyes_dp_key = d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.load(std::memory_order_relaxed);
+	}
 	if (xc == nullptr || xc->destroy != compositor_destroy ||
 	    !comp_d3d11_service_get_client_app_window_metrics(&sys->base, xc, &wm) || !wm.valid ||
 	    wm.window_width_m <= 0.0f || wm.window_height_m <= 0.0f) {
@@ -32867,24 +32880,37 @@ resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compo
 /*
  * G7 (ADR-053, #2003): the conversion side never pulls eyes (that took
  * render_mutex once per conversion). Every eye query this service answers
- * publishes the result instead: into the conversion core's per-DP snapshot
- * (DP 0, the panel), and notes the time in the lift module, whose producers
- * refresh a stale snapshot first (d3d11_lift_publish_eyes).
+ * publishes the result instead: into the conversion core's snapshot of the
+ * DP that answered (roadmap §5.2: one snapshot per DP, keyed by the DP's
+ * address), and notes the time in the lift module, whose producers refresh a
+ * stale snapshot first (d3d11_lift_publish_eyes).
  */
 static std::mutex g_conv_eyes_mtx;
-static void (*g_conv_eyes_fn)(void *ud, const struct xrt_eye_positions *eyes) = nullptr;
+static void (*g_conv_eyes_fn)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes) = nullptr;
+static void (*g_conv_eyes_retire_fn)(void *ud, uint64_t dp_key) = nullptr;
 static void *g_conv_eyes_ud = nullptr;
 
 extern "C" void
-comp_d3d11_service_set_conv_eyes_sink(void (*fn)(void *ud, const struct xrt_eye_positions *eyes), void *ud)
+comp_d3d11_service_set_conv_eyes_sink(void (*publish)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes),
+                                      void (*retire)(void *ud, uint64_t dp_key),
+                                      void *ud)
 {
 	std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
-	g_conv_eyes_fn = fn;
+	g_conv_eyes_fn = publish;
+	g_conv_eyes_retire_fn = retire;
 	g_conv_eyes_ud = ud;
 }
 
+static uint64_t
+svc_conv_eyes_key(const struct xrt_display_processor_d3d11 *dp)
+{
+	return (uint64_t)(uintptr_t)dp;
+}
+
 static void
-svc_publish_eyes(struct d3d11_service_system *sys, const struct xrt_eye_positions *eyes)
+svc_publish_eyes(struct d3d11_service_system *sys,
+                 const struct xrt_display_processor_d3d11 *dp,
+                 const struct xrt_eye_positions *eyes)
 {
 	// sys->lift is set once (lift_create_mutex) and destroyed first in
 	// system_destroy, after every client is gone: a plain read is enough here.
@@ -32892,7 +32918,7 @@ svc_publish_eyes(struct d3d11_service_system *sys, const struct xrt_eye_position
 	if (l != nullptr) {
 		d3d11_lift_publish_eyes(l, eyes);
 	}
-	void (*fn)(void *, const struct xrt_eye_positions *);
+	void (*fn)(void *, uint64_t, const struct xrt_eye_positions *);
 	void *ud;
 	{
 		std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
@@ -32900,7 +32926,23 @@ svc_publish_eyes(struct d3d11_service_system *sys, const struct xrt_eye_position
 		ud = g_conv_eyes_ud;
 	}
 	if (fn != nullptr) {
-		fn(ud, eyes);
+		fn(ud, svc_conv_eyes_key(dp), eyes);
+	}
+}
+
+//! A client's DP is about to be destroyed: streams bound to it go stale.
+static void
+svc_conv_eyes_retire(const struct xrt_display_processor_d3d11 *dp)
+{
+	void (*fn)(void *, uint64_t);
+	void *ud;
+	{
+		std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+		fn = g_conv_eyes_retire_fn;
+		ud = g_conv_eyes_ud;
+	}
+	if (fn != nullptr && dp != nullptr) {
+		fn(ud, svc_conv_eyes_key(dp));
 	}
 }
 
@@ -32931,8 +32973,12 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system
 
 	if (dp != nullptr) {
 		U_ZERO(out_eyes);
+		if (xc != nullptr && xc->destroy == compositor_destroy) {
+			d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.store(svc_conv_eyes_key(dp),
+			                                                            std::memory_order_relaxed);
+		}
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes)) {
-			svc_publish_eyes(sys, out_eyes);
+			svc_publish_eyes(sys, dp, out_eyes);
 			return true;
 		}
 	}
