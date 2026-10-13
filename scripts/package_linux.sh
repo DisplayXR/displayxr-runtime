@@ -17,6 +17,9 @@
 #   lib/libVkLayer_DXR_queue_lock.so + share/vulkan/VkLayer_DXR_queue_lock.json.in
 #       (#902 / #2036: the Vulkan queue-lock layer; install.sh writes its manifest
 #       into the loader's explicit_layer.d with the absolute installed path)
+#   share/vulkan/VkLayer_DXR_queue_lock_implicit.json.in
+#       (#886: its implicit twin, opt-in with DXR_VK_QUEUE_LOCK=1, for
+#       vulkan_enable1 apps; install.sh writes it into implicit_layer.d)
 #   lib/displayxr/plugins/DisplayXR-SimDisplay.so
 #   share/gnome-shell/extensions/window-geometry@displayxr.org/  (GNOME Shell
 #       extension: windowed Wayland weaving + capture exclusion; install.sh
@@ -136,6 +139,7 @@ cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
 cp "$VKLAYER_SO" "$STAGE/lib/"
 cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in" "$STAGE/share/vulkan/"
+cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in" "$STAGE/share/vulkan/"  # #886
 for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"

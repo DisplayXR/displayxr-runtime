@@ -1447,7 +1447,7 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
  * unverified rather than guessed at.
  */
 static bool
-vk_layer_try_dir(struct cli_query_result *r, const char *dir, size_t dir_len, const char *suffix)
+vk_layer_try_dir(char *out, size_t out_size, const char *dir, size_t dir_len, const char *suffix)
 {
 	if (dir_len == 0) {
 		return false;
@@ -1462,25 +1462,27 @@ vk_layer_try_dir(struct cli_query_result *r, const char *dir, size_t dir_len, co
 		return false;
 	}
 	fclose(f);
-	snprintf(r->vk_layer_manifest, sizeof(r->vk_layer_manifest), "%s", path);
+	snprintf(out, out_size, "%s", path);
 	return true;
 }
 
 //! Walk a ':'-separated list (or @p fallback when @p list is unset/empty).
 static bool
-vk_layer_try_list(struct cli_query_result *r, const char *list, const char *fallback, const char *suffix)
+vk_layer_try_list(char *out, size_t out_size, const char *list, const char *fallback, const char *suffix)
 {
 	const char *p = (list != NULL && list[0] != '\0') ? list : fallback;
 	while (p != NULL && *p != '\0') {
 		const char *colon = strchr(p, ':');
 		size_t len = colon != NULL ? (size_t)(colon - p) : strlen(p);
-		if (vk_layer_try_dir(r, p, len, suffix)) {
+		if (vk_layer_try_dir(out, out_size, p, len, suffix)) {
 			return true;
 		}
 		p = colon != NULL ? colon + 1 : NULL;
 	}
 	return false;
 }
+
+#define VKL_OUT r->vk_layer_manifest, sizeof(r->vk_layer_manifest)
 
 static void
 probe_vk_queue_lock_layer(struct cli_query_result *r)
@@ -1499,14 +1501,14 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
 	const char *layer_path = getenv("VK_LAYER_PATH");
 	bool found = false;
 	if (layer_path != NULL && layer_path[0] != '\0') {
-		found = vk_layer_try_list(r, layer_path, NULL, "");
+		found = vk_layer_try_list(VKL_OUT, layer_path, NULL, "");
 	} else {
-		found = vk_layer_try_list(r, getenv("VK_ADD_LAYER_PATH"), NULL, "") ||
-		        vk_layer_try_list(r, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
-		        vk_layer_try_list(r, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
-		        vk_layer_try_list(r, NULL, "/etc", k_sub) ||
-		        vk_layer_try_list(r, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
-		        vk_layer_try_list(r, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
+		found = vk_layer_try_list(VKL_OUT, getenv("VK_ADD_LAYER_PATH"), NULL, "") ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
+		        vk_layer_try_list(VKL_OUT, NULL, "/etc", k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
 	}
 	if (!found) {
 		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
@@ -1575,6 +1577,110 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
 
 	// Not phrased as "repaint is on" — see the Windows probe.
 	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "VK_LAYER_DXR_queue_lock reachable (%s)", resolved);
+}
+#undef VKL_OUT
+
+/*!
+ * #886 — the IMPLICIT twin of the manifest above: the same layer for
+ * vulkan_enable1 apps (they create their own VkInstance, so the runtime cannot
+ * inject it), loaded only when the app's environment has DXR_VK_QUEUE_LOCK=1.
+ * Same contract as the explicit probe — files only, informational — plus the
+ * one property that makes an implicit layer safe to ship: its
+ * enable_environment gate. An UNGATED implicit layer would load into every
+ * Vulkan process on the box, so that is reported loudly.
+ *
+ * Loader search order for implicit layers mirrors the explicit one with
+ * implicit_layer.d, VK_IMPLICIT_LAYER_PATH (replaces) and
+ * VK_ADD_IMPLICIT_LAYER_PATH (prepends).
+ */
+static void
+probe_vk_queue_lock_implicit_layer(struct cli_query_result *r)
+{
+	r->vk_ilayer_probed = true;
+
+	static const char *k_sub = "/vulkan/implicit_layer.d";
+	const char *home = getenv("HOME");
+	char home_config[512] = "";
+	char home_data[512] = "";
+	if (home != NULL && home[0] != '\0') {
+		snprintf(home_config, sizeof(home_config), "%s/.config", home);
+		snprintf(home_data, sizeof(home_data), "%s/.local/share", home);
+	}
+
+	char *m = r->vk_ilayer_manifest;
+	const size_t ms = sizeof(r->vk_ilayer_manifest);
+	const char *ipath = getenv("VK_IMPLICIT_LAYER_PATH");
+	bool found = false;
+	if (ipath != NULL && ipath[0] != '\0') {
+		found = vk_layer_try_list(m, ms, ipath, NULL, "");
+	} else {
+		found = vk_layer_try_list(m, ms, getenv("VK_ADD_IMPLICIT_LAYER_PATH"), NULL, "") ||
+		        vk_layer_try_list(m, ms, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
+		        vk_layer_try_list(m, ms, NULL, "/etc", k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
+	}
+	if (!found) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "NOT found: no implicit VkLayer_DXR_queue_lock.json (vulkan_enable1 apps can only get the "
+		         "layer by naming it themselves)");
+		return;
+	}
+
+	FILE *f = fopen(m, "rb");
+	if (f == NULL) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note), "manifest vanished while reading: %s", m);
+		return;
+	}
+	char json[4096];
+	size_t got = fread(json, 1, sizeof(json) - 1, f);
+	fclose(f);
+	json[got] = '\0';
+
+	cJSON *root = cJSON_Parse(json);
+	cJSON *layer = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, "layer") : NULL;
+	cJSON *name = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "name") : NULL;
+	cJSON *lib = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "library_path") : NULL;
+	cJSON *en = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "enable_environment") : NULL;
+	cJSON *en_v = (en != NULL) ? cJSON_GetObjectItemCaseSensitive(en, "DXR_VK_QUEUE_LOCK") : NULL;
+	if (!cJSON_IsString(name) || strcmp(name->valuestring, "VK_LAYER_DXR_queue_lock") != 0 ||
+	    !cJSON_IsString(lib) || lib->valuestring == NULL || lib->valuestring[0] == '\0') {
+		cJSON_Delete(root);
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest does not parse as VK_LAYER_DXR_queue_lock with a library_path: %s", m);
+		return;
+	}
+	r->vk_ilayer_gated = cJSON_IsString(en_v) && strcmp(en_v->valuestring, "1") == 0;
+	snprintf(r->vk_ilayer_library, sizeof(r->vk_ilayer_library), "%s", lib->valuestring);
+	cJSON_Delete(root);
+
+	if (!r->vk_ilayer_gated) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest is NOT gated by enable_environment DXR_VK_QUEUE_LOCK=1 — the layer loads "
+		         "into EVERY Vulkan process: %s",
+		         m);
+		return;
+	}
+	// The packaged manifests use an absolute library_path; anything else is
+	// reported as unverified rather than re-deriving the loader's rules twice.
+	if (r->vk_ilayer_library[0] != '/') {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest found, library_path '%s' not absolute — not verified (%s)",
+		         r->vk_ilayer_library, m);
+		return;
+	}
+	FILE *so = fopen(r->vk_ilayer_library, "rb");
+	if (so == NULL) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest found but the layer library is MISSING: %s", r->vk_ilayer_library);
+		return;
+	}
+	fclose(so);
+	r->vk_ilayer_library_ok = true;
+	snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+	         "VK_LAYER_DXR_queue_lock implicit twin reachable (%s), opt-in DXR_VK_QUEUE_LOCK=1",
+	         r->vk_ilayer_library);
 }
 #endif
 
@@ -2029,6 +2135,9 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	// cli_query.h for why this must not be fatal.
 #if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 	probe_vk_queue_lock_layer(r);
+#ifdef XRT_OS_LINUX_DESKTOP
+	probe_vk_queue_lock_implicit_layer(r);
+#endif
 #else
 	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
 	         "not probed: the queue-lock layer is registered only on Windows and desktop Linux (OK)");
@@ -2450,6 +2559,13 @@ cli_query_print_info_text(const struct cli_query_result *r)
 			PT("library_path: %s%s\n", r->vk_layer_library, r->vk_layer_library_ok ? "" : "  (UNUSABLE)");
 		}
 	}
+	// #886: the implicit twin for vulkan_enable1 apps (desktop Linux).
+	if (r->vk_ilayer_probed) {
+		PT("%s\n", r->vk_ilayer_note[0] != '\0' ? r->vk_ilayer_note : "implicit: not evaluated");
+		if (r->vk_ilayer_manifest[0] != '\0') {
+			PT("implicit:     %s%s\n", r->vk_ilayer_manifest, r->vk_ilayer_gated ? "" : "  (UNGATED)");
+		}
+	}
 
 	P(" :: Input providers (ADR-034)\n");
 	PT("registered:   %d%s\n", r->input_provider_count,
@@ -2723,6 +2839,14 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(vl, "manifest", r->vk_layer_manifest);
 		cJSON_AddStringToObject(vl, "library_path", r->vk_layer_library);
 		cJSON_AddStringToObject(vl, "note", r->vk_layer_note);
+		// #886: the implicit twin (desktop Linux only; probed=false elsewhere).
+		cJSON *il = cJSON_AddObjectToObject(vl, "implicit");
+		cJSON_AddBoolToObject(il, "probed", r->vk_ilayer_probed);
+		cJSON_AddBoolToObject(il, "gated", r->vk_ilayer_gated);
+		cJSON_AddBoolToObject(il, "library_ok", r->vk_ilayer_library_ok);
+		cJSON_AddStringToObject(il, "manifest", r->vk_ilayer_manifest);
+		cJSON_AddStringToObject(il, "library_path", r->vk_ilayer_library);
+		cJSON_AddStringToObject(il, "note", r->vk_ilayer_note);
 	}
 
 	// #918 GPU topology.

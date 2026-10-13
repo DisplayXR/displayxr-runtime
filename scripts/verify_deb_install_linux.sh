@@ -118,7 +118,32 @@ else
         { echo "error: $QL_JSON library_path is '$QL_LIB', expected $QL_SO" >&2; fail=1; }
     [ -f "$QL_SO" ] || { echo "error: $QL_SO not installed" >&2; fail=1; }
 fi
+# #886: the implicit twin (vulkan_enable1 apps, opt-in with DXR_VK_QUEUE_LOCK=1).
+# Same name and library as the explicit one; it MUST carry the enable_environment
+# gate — an ungated implicit layer would load into every Vulkan process on the box.
+QL_IJSON=/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json
+if [ ! -f "$QL_IJSON" ]; then
+    echo "error: $QL_IJSON not installed" >&2
+    fail=1
+else
+    grep -q '"name": *"VK_LAYER_DXR_queue_lock"' "$QL_IJSON" ||
+        { echo "error: $QL_IJSON does not name VK_LAYER_DXR_queue_lock" >&2; fail=1; }
+    QL_ILIB="$(sed -n 's/.*"library_path": *"\([^"]*\)".*/\1/p' "$QL_IJSON")"
+    [ "$QL_ILIB" = "$QL_SO" ] ||
+        { echo "error: $QL_IJSON library_path is '$QL_ILIB', expected $QL_SO" >&2; fail=1; }
+    grep -A2 '"enable_environment"' "$QL_IJSON" | grep -q '"DXR_VK_QUEUE_LOCK": *"1"' ||
+        { echo "error: $QL_IJSON is not gated by enable_environment DXR_VK_QUEUE_LOCK=1" >&2; fail=1; }
+    grep -A2 '"disable_environment"' "$QL_IJSON" | grep -q '"DXR_VK_QUEUE_LOCK_DISABLE"' ||
+        { echo "error: $QL_IJSON has no disable_environment DXR_VK_QUEUE_LOCK_DISABLE" >&2; fail=1; }
+fi
 out="$(displayxr-cli info 2>&1 || true)"
+if grep -qF "VK_LAYER_DXR_queue_lock implicit twin reachable ($QL_SO), opt-in DXR_VK_QUEUE_LOCK=1" <<<"$out"; then
+    echo "    displayxr-cli: implicit twin reachable, opt-in DXR_VK_QUEUE_LOCK=1"
+else
+    grep -A5 'VK late-weave repaint' <<<"$out" >&2 || true
+    echo "error: displayxr-cli info does not report the implicit queue-lock manifest reachable at $QL_SO" >&2
+    fail=1
+fi
 if grep -qF "VK_LAYER_DXR_queue_lock reachable ($QL_SO)" <<<"$out"; then
     echo "    displayxr-cli: VK_LAYER_DXR_queue_lock reachable ($QL_SO)"
 else
@@ -188,7 +213,8 @@ if [ -n "$TARBALL" ]; then
         fi
     done
     # #2036: the queue-lock layer + the manifest template install.sh fills in.
-    for f in lib/libVkLayer_DXR_queue_lock.so share/vulkan/VkLayer_DXR_queue_lock.json.in; do
+    for f in lib/libVkLayer_DXR_queue_lock.so share/vulkan/VkLayer_DXR_queue_lock.json.in \
+             share/vulkan/VkLayer_DXR_queue_lock_implicit.json.in; do
         [ -n "$(find "$T" -path "*/$f" -type f | head -1)" ] ||
             { echo "error: the tarball has no $f" >&2; fail=1; }
     done

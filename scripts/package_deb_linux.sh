@@ -21,6 +21,11 @@
 #   /usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
 #       its manifest, on the loader's DEFAULT explicit-layer path (no env needed),
 #       with an ABSOLUTE library_path so it does not depend on the manifest dir
+#   /usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json
+#       #886: the SAME layer as an IMPLICIT layer for vulkan_enable1 apps (which
+#       create their own VkInstance, so the runtime cannot inject it). Inert
+#       unless DXR_VK_QUEUE_LOCK=1 is set (enable_environment);
+#       DXR_VK_QUEUE_LOCK_DISABLE=1 vetoes it (disable_environment)
 #   /usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so   (built-in fallback DP)
 #   /usr/lib/displayxr/plugins/200-sim-display.json      (its discovery manifest)
 #   /usr/bin/displayxr-cli -> ../lib/displayxr/bin/displayxr-cli  (PATH symlink;
@@ -214,6 +219,7 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/lib/displayxr/lib" \
          "$STAGE/usr/lib/displayxr/plugins" \
          "$STAGE/usr/share/vulkan/explicit_layer.d" \
+         "$STAGE/usr/share/vulkan/implicit_layer.d" \
          "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID" \
          "$STAGE/usr/lib/systemd/user" \
          "$STAGE/etc/xdg/autostart"
@@ -301,6 +307,17 @@ VKLAYER_JSON_IN="$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in"
 sed 's|@DXR_QL_LIBRARY_PATH@|/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so|' "$VKLAYER_JSON_IN" \
     >"$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
 chmod 0644 "$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+
+# #886: its IMPLICIT twin — same name, same library — for vulkan_enable1 apps.
+# The loader dedupes the two by name, so an enable2 session (runtime-injected,
+# by name) and an enable1 app run with DXR_VK_QUEUE_LOCK=1 both get exactly one
+# copy in the chain; without that env var the implicit manifest is inert
+# (pinned by tests/tests_vk_queue_lock_activation.sh).
+VKLAYER_IMPLICIT_JSON_IN="$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in"
+[ -f "$VKLAYER_IMPLICIT_JSON_IN" ] || { echo "error: missing $VKLAYER_IMPLICIT_JSON_IN" >&2; exit 1; }
+sed 's|@DXR_QL_LIBRARY_PATH@|/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so|' "$VKLAYER_IMPLICIT_JSON_IN" \
+    >"$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
+chmod 0644 "$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
 
 # --- Depends (#1656) ---------------------------------------------------------
 # ONE .deb for Ubuntu 22.04, 24.04 and 26.04. Two things make that true, and
