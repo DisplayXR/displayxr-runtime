@@ -913,8 +913,11 @@ TEST_CASE("proxy: five real-host kills -> FAILED(crash_loop); the stream rebinds
 		long pid = 0;
 		REQUIRE(wait_until(
 		    [&] {
+			    // Up AND brought up (the row is READY again): a kill during
+			    // bring-up is a different case (see the report on #2035).
 			    pid = host_pid(fx);
-			    return pid > 0 || fx.sup().state == CONV_SUP_FAILED;
+			    return (pid > 0 && fx.row_state(DEPTH) == XRT_CONV_STATE_READY) ||
+			           fx.sup().state == CONV_SUP_FAILED;
 		    },
 		    60000));
 		if (fx.sup().state == CONV_SUP_FAILED) {
@@ -926,6 +929,11 @@ TEST_CASE("proxy: five real-host kills -> FAILED(crash_loop); the stream rebinds
 		REQUIRE(wait_until([&] { return fx.sup().restarts > restarts; }, 10000));
 		exits.push_back(fx.sup().last_exit);
 	}
+	std::printf("crash loop: exits seen:");
+	for (int32_t e : exits) {
+		std::printf(" 0x%08x", (unsigned)e);
+	}
+	std::printf("\n");
 	CHECK(kills == 5u);
 	REQUIRE(fx.sup().state == CONV_SUP_FAILED);
 	const conv_readiness rd = row_rd(fx, 0, DEPTH);

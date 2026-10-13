@@ -294,6 +294,40 @@ TEST_CASE("sim_conversion: negotiate, probe gate, provider status", "[sim_conver
 	CHECK(i->destroy != nullptr);
 }
 
+TEST_CASE("sim_conversion: probe meets the 100 ms budget (no device, no model)", "[sim_conversion]")
+{
+	// Spec §2.3: probe validates settings only. The D3D11 I/O device is
+	// created at the first GPU input or output, never here; every satellite
+	// respawn pays for the probe, so it is part of the recovery cost.
+	provider pv({}, /*enable=*/false);
+	g_settings["ENABLE"] = "1";
+	// The first probe of a process is also its first u_log line, which pays
+	// for the file logger's setup (seconds on a box with a large log folder,
+	// #2044): measured and printed, but not the probe's own cost. The host
+	// logs the probe alone ("probe returned 0 in N ms").
+	double first_ms = 0.0;
+	{
+		struct xrt_conversion_plugin_instance *inst = nullptr;
+		const auto t0 = clk::now();
+		REQUIRE(pv.iface->probe(&inst) == XRT_SUCCESS);
+		first_ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+		pv.iface->destroy(inst);
+	}
+	std::printf("sim_conversion probe: first call (incl. logger setup) %.3f ms\n", first_ms);
+	double worst_ms = 0.0;
+	for (int i = 0; i < 5; i++) {
+		struct xrt_conversion_plugin_instance *inst = nullptr;
+		const auto t0 = clk::now();
+		REQUIRE(pv.iface->probe(&inst) == XRT_SUCCESS);
+		const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+		worst_ms = std::max(worst_ms, ms);
+		REQUIRE(inst != nullptr);
+		pv.iface->destroy(inst);
+	}
+	std::printf("sim_conversion probe: worst of 5 = %.3f ms\n", worst_ms);
+	CHECK(worst_ms < 100.0);
+}
+
 TEST_CASE("sim_conversion: describe_cap is well-formed per the selftest rules", "[sim_conversion]")
 {
 	provider pv({});
