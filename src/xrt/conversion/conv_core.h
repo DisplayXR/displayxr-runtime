@@ -388,8 +388,12 @@ conv_core_stream_bind_eyes(struct conv_core *core, uint64_t stream_id, uint64_t 
 /*!
  * Read the eyes a stream bound to @p dp_key would use at @p now_ns. False
  * (out->valid false) = stale: the nominal viewer. An unknown key (the DP never
- * published) reads the "any DP" snapshot, the pre-M6 behaviour; a retired key
- * reads stale. Diagnostics and tests; the dispatchers call it per conversion.
+ * published, or was evicted) reads the "any DP" snapshot -- the pre-M6
+ * behaviour -- only while a single DP has ever published in this core's
+ * lifetime; once a second DP has published it reads stale, never another
+ * screen's eyes. A retired key always reads stale; CONV_EYES_DP_ANY always
+ * reads the newest snapshot of any DP. Diagnostics and tests; the dispatchers
+ * call it per conversion.
  */
 bool
 conv_core_eyes_read(struct conv_core *core, uint64_t dp_key, uint64_t now_ns, struct conv_eyes *out);

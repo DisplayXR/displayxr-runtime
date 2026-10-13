@@ -253,6 +253,8 @@ struct conv_core
 	uint64_t eyes_seq;
 	struct conv_eyes_slot eyes_any; //!< the most recent snapshot of any DP
 	uint64_t eyes_any_key;          //!< who wrote eyes_any
+	uint64_t eyes_first_key;        //!< the first DP that ever published (0 = none yet)
+	bool eyes_multi_dp;             //!< a second DP has published: unknown keys read stale
 };
 
 

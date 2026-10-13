@@ -1654,11 +1654,17 @@ TEST_CASE("policy: per-DP eyes — a stream reads the DP that owns its rect", "[
 		REQUIRE(core.add(f, 100) >= 0);
 		const uint64_t dp_a = 0xA000, dp_b = 0xB000;
 
-		// The core's own read: keyed, ANY = the latest publish, unknown = ANY,
-		// retired = stale, NONE = stale.
+		// The core's own read: keyed, ANY = the latest publish, retired = stale,
+		// NONE = stale; unknown = ANY while one DP ever published, then stale.
 		conv_eyes ea = eyes_pair(0.060f, 0.6f), eb = eyes_pair(0.080f, 0.7f), got{};
 		CHECK_FALSE(conv_core_eyes_read(core.c, CONV_EYES_DP_ANY, now_ns(), &got));
+		CHECK_FALSE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got)); // nothing published yet
 		conv_core_eyes_publish(core.c, dp_a, &ea);
+		// Single screen: a DP that has not published yet reads the panel's eyes.
+		REQUIRE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got));
+		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.060, 1e-6));
+		conv_core_eyes_publish(core.c, dp_a, &ea); // the same DP again: still single
+		REQUIRE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got));
 		conv_core_eyes_publish(core.c, dp_b, &eb);
 		REQUIRE(conv_core_eyes_read(core.c, dp_a, now_ns(), &got));
 		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.060, 1e-6));
@@ -1666,7 +1672,9 @@ TEST_CASE("policy: per-DP eyes — a stream reads the DP that owns its rect", "[
 		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.080, 1e-6));
 		REQUIRE(conv_core_eyes_read(core.c, CONV_EYES_DP_ANY, now_ns(), &got));
 		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.080, 1e-6)); // B published last
-		REQUIRE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got)); // never published: ANY
+		// Two DPs have published: an unknown key never borrows another screen's eyes.
+		CHECK_FALSE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got));
+		CHECK_FALSE(got.valid);
 		CHECK_FALSE(conv_core_eyes_read(core.c, CONV_EYES_DP_NONE, now_ns(), &got));
 
 		// Streams follow their binding into the provider's viewpoints.
