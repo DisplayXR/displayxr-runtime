@@ -101,15 +101,27 @@ feeder off.
 nothing (59.2–60.0 presents/s on vs 59.4–60.0 with `DXR_LATE_WEAVE=0`, Unity). The grid tier at
 the fixed 1.5 ms margin cost a quarter of the frames (40.5–43.4 vs 52.9–56.7, native enable1
 app): a composited desktop latches client buffers *before* the vblank, so a weave aimed just
-before it is shown a refresh late. So on desktop Linux the grid tier now **learns the
-compositor's lead** (`util/comp_late_weave_adapt.h`: +2 ms per aimed frame that missed its
-vblank, −0.5 ms after 120 hits in a row, starting at a quarter period, and off for the session
-with `#902: grid late weave OFF for this session — …` when lead + weave + margin no longer fit
-in a period). It is **opt-in** behind `DXR_LATE_WEAVE_LINUX_GRID=1` until a panel A/B shows it
+before it is shown a refresh late. **Measured on a composited Wayland desktop (GNOME, Intel, 60 Hz, `DXR_WEAVE_CADENCE_TRACE=1`): the
+weave→scanout residual is 46.0 ms — 2.76 refresh periods** (`#206: last measured weave->scanout
+residual 46.01 ms (2.76 refresh periods, n=102)`). That is the real latency budget behind a
+desktop compositor, which composes on one refresh and scans out on a later one, and it is the
+number any late-weave benefit on Linux must be judged against. Late weave can only move the weave
+*within* a period; the whole-vblank pipeline delay is the compositor's.
+
+So on desktop Linux the grid tier **learns the compositor's latch** (`util/comp_late_weave_adapt.h`),
+in units of *vblanks from commit to glass*. The desktop's pipeline sets a floor (the fewest any
+commit has needed); an aimed frame that takes one vblank more committed after the latch and is a
+miss. Before aiming anything the gate watches 30 frames it did not delay, and starts the lead at
+the smallest commit-to-vblank gap that still made the floor (less the wake margin) — a lead known
+to hit — then probes it down 0.5 ms per 120 hits and adds 2 ms per miss. When lead + weave +
+margin no longer fit in a period it turns itself off for the session (`#902: grid late weave OFF
+for this session — …`). (The first cut called every frame landing after its aimed vblank a miss,
+which behind a compositor is every frame: the panel log was `lead 12.17 ms, aimed hits 0, misses
+4 [OFF]`.) The tier is **opt-in** behind `DXR_LATE_WEAVE_LINUX_GRID=1` until a panel A/B shows it
 holds the present rate. Without the opt-in an enable1 session logs `#902: grid late weave NOT
-engaged — opt-in on desktop Linux …` and the grid is still fed. `DXR_WEAVE_CADENCE_TRACE=1`
-logs the `#206` residual and `#2068: grid late weave — compositor lead …, aimed hits …,
-misses …` every 5 s.
+engaged — opt-in on desktop Linux …` and the grid is still fed. `DXR_WEAVE_CADENCE_TRACE=1` logs
+the `#206` residual and `#2068: grid late weave — desktop floor N vblank(s) commit-to-glass; …
+lead …, aimed hits …, misses …` every 5 s.
 
 **The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
 Every queue level the governor adds moves the flip one whole period later, and #1437's learned

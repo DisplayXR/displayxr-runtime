@@ -637,6 +637,8 @@ struct comp_vk_native_target
 		uint64_t seq;
 		uint64_t weave_start_ns;
 		uint64_t aimed_vblank_ns;
+		//! vkQueuePresentKHR return — the WSI's wl_surface.commit is inside it.
+		uint64_t commit_ns;
 	} pf_ring[16];
 	//! Set by the grid gate when it aims a weave, consumed by the request.
 	uint64_t lw_aimed_vblank_ns;
@@ -2404,8 +2406,11 @@ target_log_residual(struct comp_vk_native_target *target)
 			    (double)target->residual_ns / (double)target->vblank_grid.period_ns,
 			    target->residual_samples);
 #ifdef XRT_OS_LINUX_DESKTOP
-			if (target->lw_lead.initialised) {
-				U_LOG_W("#2068: grid late weave — compositor lead %.2f ms, aimed hits %llu, misses %llu%s",
+			if (target->lw_lead.base_vblanks != 0) {
+				U_LOG_W("#2068: grid late weave — desktop floor %u vblank(s) commit-to-glass; %s lead "
+				        "%.2f ms, aimed hits %llu, misses %llu%s",
+				        target->lw_lead.base_vblanks,
+				        target->lw_lead.initialised ? "compositor" : "not aiming yet,",
 				        target->lw_lead.lead_ns / 1e6, (unsigned long long)target->lw_lead.hits,
 				        (unsigned long long)target->lw_lead.misses, target->lw_lead.off ? " [OFF]" : "");
 			}
@@ -2536,17 +2541,21 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 				}
 			}
 
-			// #2068: did the aimed weave make the vblank it was aimed at?
+			// #2068: commit-to-glass in vblanks, against the desktop's own
+			// floor — un-aimed frames teach the floor and the starting lead,
+			// aimed frames that take one vblank more are misses.
 			const uint64_t period = target->vblank_grid.period_ns;
-			if (aimed != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
-				const bool miss = comp_lw_lead_is_miss(aimed, s->present_ns, period);
-				const enum comp_lw_adapt_event e = comp_lw_lead_on_result(
-				    &target->lw_lead, miss, period, target->weave_cost_ns, 1500ULL * 1000);
+			const uint64_t commit = target->pf_ring[tag % 16].commit_ns;
+			if (commit != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
+				const enum comp_lw_adapt_event e =
+				    comp_lw_lead_observe(&target->lw_lead, commit, s->present_ns, aimed != 0, period,
+				                         target->weave_cost_ns, 1500ULL * 1000);
 				if (e == COMP_LW_ADAPT_RAISED && target->lw_raise_logs < 3) {
 					target->lw_raise_logs++;
-					U_LOG_W("#902: grid late weave missed its vblank by %.2f ms — compositor lead now "
-					        "%.2f ms (%s)",
-					        (s->present_ns - aimed) / 1e6, target->lw_lead.lead_ns / 1e6,
+					U_LOG_W("#902: grid late weave — an aimed frame took %u vblanks commit-to-glass "
+					        "(desktop floor %u): compositor lead now %.2f ms (%s)",
+					        comp_lw_lead_vblanks(commit, s->present_ns, period, NULL),
+					        target->lw_lead.base_vblanks, target->lw_lead.lead_ns / 1e6,
 					        target->lw_raise_logs == 3 ? "further changes in the cadence trace"
 					                                   : "learning");
 				} else if (e == COMP_LW_ADAPT_DISABLED) {
@@ -3362,13 +3371,25 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			// millisecond late costs a whole refresh.
 			const uint64_t margin_ns = 1500ULL * 1000;
 			uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+			bool may_aim = true;
 #ifdef XRT_OS_LINUX_DESKTOP
-			// #2068: plus the lead the desktop compositor's latch needs,
-			// learned from where aimed frames actually landed.
-			comp_lw_lead_init(&target->lw_lead, period_ns);
+			// #2068: plus the lead the desktop compositor's latch needs. It
+			// starts from what the desktop has SHOWN — the smallest
+			// commit-to-vblank gap of an un-aimed frame that still made the
+			// pipeline's floor — so nothing is aimed until that is known.
+			if (!target->lw_lead.initialised && comp_lw_lead_primed(&target->lw_lead)) {
+				comp_lw_lead_init(&target->lw_lead, margin_ns);
+				U_LOG_W(
+				    "#902: grid late weave aiming — the desktop shows a commit %u vblank(s) later at "
+				    "best; starting lead %.2f ms (smallest commit-to-vblank gap that made it, %u "
+				    "frames watched)",
+				    target->lw_lead.base_vblanks, target->lw_lead.lead_ns / 1e6,
+				    target->lw_lead.observed);
+			}
+			may_aim = target->lw_lead.initialised;
 			budget_ns += target->lw_lead.lead_ns;
 #endif
-			if (next_vblank > now_ns + budget_ns) {
+			if (may_aim && next_vblank > now_ns + budget_ns) {
 				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
 				// Never sleep past one period, whatever the grid says. A
 				// wrong anchor must cost at most a frame, not a stall — the
@@ -4010,18 +4031,25 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	// wp_presentation.feedback on the commit the WSI makes inside
 	// vkQueuePresentKHR below; X11 reports every present without asking).
 	// Uncounted presents are not tagged, for the same reason as above.
+	uint64_t pf_req_seq = 0;
 	if (counted && target->present_fb != NULL) {
-		const uint64_t seq = ++target->pf_seq;
-		target->pf_ring[seq % 16].seq = seq;
-		target->pf_ring[seq % 16].weave_start_ns = target->weave_start_ns;
-		target->pf_ring[seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
-		comp_vk_native_present_feedback_request(target->present_fb, seq);
+		pf_req_seq = ++target->pf_seq;
+		target->pf_ring[pf_req_seq % 16].seq = pf_req_seq;
+		target->pf_ring[pf_req_seq % 16].weave_start_ns = target->weave_start_ns;
+		target->pf_ring[pf_req_seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
+		target->pf_ring[pf_req_seq % 16].commit_ns = 0;
+		comp_vk_native_present_feedback_request(target->present_fb, pf_req_seq);
 	}
 	target->lw_aimed_vblank_ns = 0;
 #endif
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (pf_req_seq != 0) {
+		target->pf_ring[pf_req_seq % 16].commit_ns = os_monotonic_get_ns();
+	}
+#endif
 
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a
