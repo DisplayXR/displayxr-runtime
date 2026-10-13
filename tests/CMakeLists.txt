@@ -234,6 +234,12 @@ if(TARGET comp_d3d11_conv_host_lane)
 	# host that never signals costs a bounded CPU wait, never a GPU one.
 	list(APPEND tests tests_conv_host_lane_d3d11)
 endif()
+if(WIN32)
+	# ADR-053 P2 (#2035) -- roadmap §11.2: shared NT-handle textures + shared
+	# fences across a process boundary on WARP, a queue wait on a fence whose
+	# signaller died, and the wrong-adapter open (hardware: DXR_TEST_D3D11_HW=1).
+	list(APPEND tests tests_conv_d3d11_xproc)
+endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	# ADR-053 S5 -- the reference view synthesis on WARP: a synthetic step edge
 	# rendered into 2 and 4 views, parallax checked against u_conv_viewsyn's
@@ -1267,6 +1273,16 @@ target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/com
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 if(TARGET tests_conv_host_lane_d3d11)
 	target_link_libraries(tests_conv_host_lane_d3d11 PRIVATE comp_d3d11_conv_host_lane d3d11 dxgi)
+endif()
+if(TARGET tests_conv_d3d11_xproc)
+	add_executable(tests_conv_d3d11_xproc_helper tests_conv_d3d11_xproc_helper.cpp)
+	target_link_libraries(tests_conv_d3d11_xproc_helper PRIVATE d3d11 dxgi)
+	target_link_libraries(tests_conv_d3d11_xproc PRIVATE d3d11 dxgi)
+	target_compile_definitions(
+		tests_conv_d3d11_xproc
+		PRIVATE "CONV_D3D11_XPROC_HELPER=\"$<TARGET_FILE:tests_conv_d3d11_xproc_helper>\""
+		)
+	add_dependencies(tests_conv_d3d11_xproc tests_conv_d3d11_xproc_helper)
 endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
