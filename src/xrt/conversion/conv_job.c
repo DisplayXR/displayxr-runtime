@@ -169,27 +169,48 @@ pick_locked(struct conv_core *core, uint32_t provider)
 	return best;
 }
 
-/*! The job's row is not READY: keep it warming; move a queued job off a
- *  terminal row (it has not started, so nothing is lost). jobs_mtx held. */
-static bool
-gate_locked(struct conv_core *core, struct conv_job *j)
+enum job_gate
+{
+	JOB_GATE_WAIT = 0, //!< WAITING_FOR_PROVIDER: warming, host down, ...
+	JOB_GATE_READY,    //!< run it
+	JOB_GATE_FAIL,     //!< the provider went terminal and nothing else serves the task
+};
+
+/*! The job's row is not READY (or its host is down): keep it warming; move a
+ *  queued job off a terminal row (it has not started, so nothing is lost);
+ *  fail it only when its provider is terminal and no other candidate serves
+ *  the task (§7.4: never for readiness alone). jobs_mtx held. */
+static enum job_gate
+gate_locked(struct conv_core *core, struct conv_job *j, uint32_t *out_reason)
 {
 	os_mutex_lock(&core->registry_mtx);
-	const uint32_t state = conv_core_row_state_locked(core, j->bind.provider, j->bind.cap_id);
-	bool ready = state == XRT_CONV_STATE_READY;
-	if (!ready) {
+	uint32_t state = conv_core_row_state_locked(core, j->bind.provider, j->bind.cap_id);
+	enum job_gate g = state == XRT_CONV_STATE_READY ? JOB_GATE_READY : JOB_GATE_WAIT;
+	if (g == JOB_GATE_READY && conv_host_is_down(conv_core_host(core, j->bind.provider))) {
+		g = JOB_GATE_WAIT; // a satellite between incarnations (#2056): no thread waits on it
+	}
+	if (g != JOB_GATE_READY) {
 		if (conv_state_is_terminal(state)) {
 			struct conv_binding nb;
 			if (conv_core_select_locked(core, j->task, XRT_CONV_LANE_JOB, j->in.input_kind, 0, NULL, &nb,
 			                            NULL) <= CONV_SEL_OK_FALLTHROUGH &&
 			    (nb.provider != j->bind.provider || nb.cap_id != j->bind.cap_id)) {
 				j->bind = nb;
+				state = conv_core_row_state_locked(core, j->bind.provider, j->bind.cap_id);
 			}
 		}
-		conv_core_request_warm_locked(core, j->bind.provider, j->bind.cap_id, CONV_EV_CREATE_REQUESTED);
+		if (conv_state_is_terminal(state)) {
+			const int32_t ri = conv_registry_find_row(&core->reg, j->bind.provider, j->bind.cap_id);
+			*out_reason = ri >= 0 && core->reg.rows[ri].rd.reason < CONV_REASON_LOCAL_BASE
+			                  ? core->reg.rows[ri].rd.reason
+			                  : XRT_CONV_FAIL_LOAD;
+			g = JOB_GATE_FAIL;
+		} else {
+			conv_core_request_warm_locked(core, j->bind.provider, j->bind.cap_id, CONV_EV_CREATE_REQUESTED);
+		}
 	}
 	os_mutex_unlock(&core->registry_mtx);
-	return ready;
+	return g;
 }
 
 static void *
@@ -204,7 +225,24 @@ job_lane_main(void *ptr)
 			os_cond_wait_timeout_ns(&lane->cond, &core->jobs_mtx, CONV_JOB_WAIT_NS);
 			continue;
 		}
-		if (!gate_locked(core, j)) {
+		uint32_t fail_reason = 0;
+		const enum job_gate gate = gate_locked(core, j, &fail_reason);
+		if (gate == JOB_GATE_FAIL) {
+			// The provider went terminal (crash loop, removed, ...) and no other
+			// candidate serves the task: the only way a job fails before it ran.
+			free_inputs(j);
+			j->failure_reason = fail_reason;
+			j->ended_ns = now_ns();
+			set_status_locked(core, j, CONV_JOB_FAILED);
+			U_LOG_W("[conv] job %llu (%s) failed before it ran: its provider is %s", (unsigned long long)j->id,
+			        conv_task_name(j->task), conv_reason_name(fail_reason));
+			if (j->destroyed) {
+				unlink_locked(core, j);
+				job_free(j);
+			}
+			continue;
+		}
+		if (gate != JOB_GATE_READY) {
 			// Never a failure for readiness alone: WAITING_FOR_PROVIDER.
 			set_status_locked(core, j, CONV_JOB_WAITING_FOR_PROVIDER);
 			if (j->bind.provider != lane->provider) {
@@ -250,6 +288,14 @@ job_lane_main(void *ptr)
 		cmd.job_ctl = &ctl;
 		cmd.job_out = &j->out;
 		const xrt_result_t r = conv_host_call(host, &cmd);
+		if (r != XRT_SUCCESS && (cmd.blocked & CONV_CMD_HOST_DOWN) != 0) {
+			// Refused before it started: its host went down in the race with the
+			// gate. Back to WAITING_FOR_PROVIDER; it starts after RESTORED.
+			os_mutex_lock(&core->jobs_mtx);
+			j->running = false;
+			set_status_locked(core, j, CONV_JOB_WAITING_FOR_PROVIDER);
+			continue;
+		}
 		if (r != XRT_SUCCESS && !job_is_cancelled(j)) {
 			conv_core_call_failed(core, provider, cap_id, r);
 		}
