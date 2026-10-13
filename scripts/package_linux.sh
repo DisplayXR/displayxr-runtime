@@ -14,6 +14,9 @@
 #   share/applications/displayxr-dashboard.desktop.in + share/icons/displayxr-dashboard.png
 #       (install.sh writes the menu entry with the installed path)
 #   lib/openxr_displayxr.so
+#   lib/libVkLayer_DXR_queue_lock.so + share/vulkan/VkLayer_DXR_queue_lock.json.in
+#       (#902 / #2036: the Vulkan queue-lock layer; install.sh writes its manifest
+#       into the loader's explicit_layer.d with the absolute installed path)
 #   lib/displayxr/plugins/DisplayXR-SimDisplay.so
 #   share/gnome-shell/extensions/window-geometry@displayxr.org/  (GNOME Shell
 #       extension: windowed Wayland weaving + capture exclusion; install.sh
@@ -67,10 +70,15 @@ CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli
 # instead of reaching the "packaging without it" note below.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
+VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
 done
+[ -n "$VKLAYER_SO" ] || {
+    echo "error: libVkLayer_DXR_queue_lock.so not built (the tarball ships it, #2036)" >&2
+    exit 1
+}
 [ -n "$SERVICE_BIN" ] || {
     echo "error: displayxr-service not built — the tarball ships it (#1744); build with --hybrid" >&2
     exit 1
@@ -113,7 +121,7 @@ STAGE="$DIST_DIR/$NAME"
 echo "==> Staging $NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/lib/displayxr/plugins" "$STAGE/share/gnome-shell/extensions/$EXT_UUID" \
-    "$STAGE/share/systemd/user"
+    "$STAGE/share/systemd/user" "$STAGE/share/vulkan"
 cp "$CLI_BIN" "$STAGE/bin/"
 if [ -n "$DASHBOARD_BIN" ]; then
     install -m 0755 "$DASHBOARD_BIN" "$STAGE/bin/displayxr-dashboard"
@@ -126,6 +134,8 @@ cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/d
     "$STAGE/share/systemd/user/"
 cp "$RUNTIME_SO" "$STAGE/lib/"
 cp "$PLUGIN_SO" "$STAGE/lib/displayxr/plugins/"
+cp "$VKLAYER_SO" "$STAGE/lib/"
+cp "$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in" "$STAGE/share/vulkan/"
 for f in $EXT_FILES; do cp "$EXT_SRC/$f" "$STAGE/share/gnome-shell/extensions/$EXT_UUID/"; done
 install -m 0755 "$ROOT/scripts/linux/displayxr-gnome-extension-enable" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/install.sh" "$ROOT/scripts/linux/uninstall.sh" "$STAGE/"
@@ -141,7 +151,7 @@ echo "$VERSION" > "$STAGE/VERSION"
 # release's; a locally built tarball honestly records the local one.)
 # (`|| true`: objdump exits non-zero on the shell script in bin/, and under
 # pipefail that would abort the script.)
-GLIBC_SYMS="$(objdump -T "$STAGE/bin"/* "$STAGE/lib/openxr_displayxr.so" \
+GLIBC_SYMS="$(objdump -T "$STAGE/bin"/* "$STAGE/lib/openxr_displayxr.so" "$STAGE/lib/libVkLayer_DXR_queue_lock.so" \
     "$STAGE/lib/displayxr/plugins/DisplayXR-SimDisplay.so" 2>/dev/null || true)"
 GLIBC_FLOOR="$(echo "$GLIBC_SYMS" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)"
 if [ -n "$GLIBC_FLOOR" ]; then
