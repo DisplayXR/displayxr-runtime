@@ -103,6 +103,16 @@ enum conv_readiness_event_type
 	//! or job reported DEVICE_LOST, the provider's get_state turned FAILED, or
 	//! the stall watchdog abandoned it). reason + retryable, as WARM_FAILED.
 	CONV_EV_RUNTIME_FAILED,
+	/*!
+	 * The provider itself declared the capability unavailable and NOT
+	 * retryable (get_state ABSENT / DISABLED with retryable = 0). Terminal:
+	 * ABSENT(reason) with no backoff timer, so a spec-3 caller reads
+	 * UNAVAILABLE instead of ACTIVATING forever (#2029, ADR-053 decision 6).
+	 * reason: CONV_REASON_POLICY for a kill switch (the default when 0),
+	 * XRT_CONV_FAIL_MODEL for a module that says it is not there. Only a
+	 * registry change (or an explicit `conv warm`) tries again.
+	 */
+	CONV_EV_DECLARED_ABSENT,
 };
 
 /*! @name Event flags (conv_readiness_event::flags) @{ */

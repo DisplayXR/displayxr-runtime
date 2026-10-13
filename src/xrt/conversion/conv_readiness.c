@@ -319,6 +319,17 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 		}
 		return CONV_RD_IGNORED;
 
+	case CONV_EV_DECLARED_ABSENT:
+		// From any live or retrying state; DISABLED (configuration) and the
+		// other terminal states keep their own reason.
+		if (conv_state_is_waited(s) || s == XRT_CONV_STATE_READY || s == XRT_CONV_STATE_FAILED ||
+		    s == XRT_CONV_STATE_UNKNOWN || (s == XRT_CONV_STATE_ABSENT && r->reason != CONV_REASON_POLICY)) {
+			r->retry_due_ns = 0;
+			r->backoff_ns = 0;
+			return enter(r, XRT_CONV_STATE_ABSENT, ev->reason != 0 ? ev->reason : CONV_REASON_POLICY, now);
+		}
+		return CONV_RD_IGNORED;
+
 	default: return CONV_RD_IGNORED;
 	}
 }
