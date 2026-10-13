@@ -308,6 +308,7 @@ dxr_acquire_timeout_ns(void)
 #include "comp_vk_native_window_xcb.h"
 // #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
 #include "comp_vk_native_present_feedback.h"
+#include "util/comp_late_weave_adapt.h"
 
 struct comp_vk_native_target;
 static void
@@ -625,6 +626,24 @@ struct comp_vk_native_target
 	//! What the samples did to the grid (trust, debounced state, totals).
 	struct comp_present_feedback pf_state;
 	bool pf_period_refused_logged;
+	/*!
+	 * #2068: per-request bookkeeping, keyed by the feedback tag (a sequence
+	 * number): when the weave started (the #206 residual) and which vblank
+	 * the grid gate aimed it at (0 = not aimed — the gate did not sleep).
+	 */
+	uint64_t pf_seq;
+	struct
+	{
+		uint64_t seq;
+		uint64_t weave_start_ns;
+		uint64_t aimed_vblank_ns;
+	} pf_ring[16];
+	//! Set by the grid gate when it aims a weave, consumed by the request.
+	uint64_t lw_aimed_vblank_ns;
+	//! #2068: the compositor lead the grid gate learned (comp_late_weave_adapt.h).
+	struct comp_lw_lead lw_lead;
+	uint32_t lw_raise_logs;
+	bool lw_grid_optin_logged;
 
 	/*!
 	 * #2060 / #902 desktop Linux: the VK_KHR_present_wait late-weave tier —
@@ -2384,6 +2403,13 @@ target_log_residual(struct comp_vk_native_target *target)
 			    target->residual_ns / 1e6,
 			    (double)target->residual_ns / (double)target->vblank_grid.period_ns,
 			    target->residual_samples);
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (target->lw_lead.initialised) {
+				U_LOG_W("#2068: grid late weave — compositor lead %.2f ms, aimed hits %llu, misses %llu%s",
+				        target->lw_lead.lead_ns / 1e6, (unsigned long long)target->lw_lead.hits,
+				        (unsigned long long)target->lw_lead.misses, target->lw_lead.off ? " [OFF]" : "");
+			}
+#endif
 		}
 	}
 }
@@ -2492,13 +2518,44 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 				}
 			}
 
-			// #206: the weave->scanout residual, from the weave start the
-			// request was tagged with (Wayland; X11 cannot correlate, tag 0).
-			if (r.anchored && evs[i].tag != 0 && s->present_ns > evs[i].tag) {
-				const uint64_t res = s->present_ns - evs[i].tag;
+			// Resolve the request this sample answers (Wayland; X11 cannot
+			// correlate, tag 0).
+			const uint64_t tag = evs[i].tag;
+			if (tag == 0 || target->pf_ring[tag % 16].seq != tag) {
+				continue;
+			}
+			const uint64_t started = target->pf_ring[tag % 16].weave_start_ns;
+			const uint64_t aimed = target->pf_ring[tag % 16].aimed_vblank_ns;
+
+			// #206: the weave->scanout residual.
+			if (r.anchored && started != 0 && s->present_ns > started) {
+				const uint64_t res = s->present_ns - started;
 				if (res < 200ULL * 1000 * 1000) { // a stalled frame is not a latency
 					target->residual_ns = res;
 					target->residual_samples++;
+				}
+			}
+
+			// #2068: did the aimed weave make the vblank it was aimed at?
+			const uint64_t period = target->vblank_grid.period_ns;
+			if (aimed != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
+				const bool miss = comp_lw_lead_is_miss(aimed, s->present_ns, period);
+				const enum comp_lw_adapt_event e = comp_lw_lead_on_result(
+				    &target->lw_lead, miss, period, target->weave_cost_ns, 1500ULL * 1000);
+				if (e == COMP_LW_ADAPT_RAISED && target->lw_raise_logs < 3) {
+					target->lw_raise_logs++;
+					U_LOG_W("#902: grid late weave missed its vblank by %.2f ms — compositor lead now "
+					        "%.2f ms (%s)",
+					        (s->present_ns - aimed) / 1e6, target->lw_lead.lead_ns / 1e6,
+					        target->lw_raise_logs == 3 ? "further changes in the cadence trace"
+					                                   : "learning");
+				} else if (e == COMP_LW_ADAPT_DISABLED) {
+					U_LOG_W("#902: grid late weave OFF for this session — the desktop compositor needs "
+					        "%.2f ms of lead + %.2f ms weave + 1.50 ms margin of a %.3f ms period: no "
+					        "slack to weave late into (hits %llu, misses %llu)",
+					        target->lw_lead.lead_ns / 1e6, target->weave_cost_ns / 1e6, period / 1e6,
+					        (unsigned long long)target->lw_lead.hits,
+					        (unsigned long long)target->lw_lead.misses);
 				}
 			}
 		}
@@ -2506,6 +2563,33 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 	target_log_residual(target);
 }
 #endif // XRT_OS_LINUX_DESKTOP
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2068: the grid-paced late-weave tier is OPT-IN on desktop Linux
+ * (DXR_LATE_WEAVE_LINUX_GRID=1).
+ *
+ * Measured on an Intel box, native enable1 app, window 1:1 on a 60 Hz panel
+ * under GNOME: 40.5-43.4 presents/s with the grid tier pacing at the fixed
+ * 1.5 ms margin against 52.9-56.7 with DXR_LATE_WEAVE=0 — the compositor
+ * latches before the vblank the weave is aimed at, so aimed frames land a
+ * refresh late. The adaptive lead (comp_late_weave_adapt.h) is the fix, but it
+ * has no panel A/B yet, and the rule is that default behaviour must not lower
+ * the present rate. The feeder keeps running either way (the #206 residual,
+ * the repaint loop's measured period). The present_wait tier is unaffected:
+ * measured at the panel rate on and off (59.2-60.0 vs 59.4-60.0).
+ */
+static bool
+dxr_late_weave_linux_grid_optin()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_GRID");
+		v = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return v == 1;
+}
+#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 /*!
@@ -3253,7 +3337,21 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// Linux since #2060.)
 	have_present_wait = (target_present_wait_fn(target) != NULL);
 #endif
-	if (dxr_late_weave_enabled() && !have_present_wait) {
+	bool grid_tier_allowed = true;
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2068: opt-in on desktop Linux, and off for the session once the learned
+	// compositor lead leaves no slack (see dxr_late_weave_linux_grid_optin).
+	grid_tier_allowed = dxr_late_weave_linux_grid_optin() && !target->lw_lead.off;
+	if (!dxr_late_weave_linux_grid_optin() && !have_present_wait && dxr_late_weave_enabled() &&
+	    !target->lw_grid_optin_logged &&
+	    comp_vblank_grid_trusted(&target->vblank_grid, os_monotonic_get_ns())) {
+		target->lw_grid_optin_logged = true;
+		U_LOG_W(
+		    "#902: grid late weave NOT engaged — opt-in on desktop Linux (DXR_LATE_WEAVE_LINUX_GRID=1): "
+		    "on a composited desktop it cost presents (#2068). The grid is still fed.");
+	}
+#endif
+	if (dxr_late_weave_enabled() && !have_present_wait && grid_tier_allowed) {
 		const uint64_t now_ns = os_monotonic_get_ns();
 		const uint64_t next_vblank =
 		    comp_vblank_grid_next_vblank_after(&target->vblank_grid, now_ns);
@@ -3263,7 +3361,13 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			// millisecond early costs a millisecond of staleness, being a
 			// millisecond late costs a whole refresh.
 			const uint64_t margin_ns = 1500ULL * 1000;
-			const uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+			uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+#ifdef XRT_OS_LINUX_DESKTOP
+			// #2068: plus the lead the desktop compositor's latch needs,
+			// learned from where aimed frames actually landed.
+			comp_lw_lead_init(&target->lw_lead, period_ns);
+			budget_ns += target->lw_lead.lead_ns;
+#endif
 			if (next_vblank > now_ns + budget_ns) {
 				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
 				// Never sleep past one period, whatever the grid says. A
@@ -3273,6 +3377,10 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					sleep_ns = period_ns;
 				}
 				os_nanosleep((int64_t)sleep_ns);
+#ifdef XRT_OS_LINUX_DESKTOP
+				// Aimed: the feedback for this weave says whether it made it.
+				target->lw_aimed_vblank_ns = next_vblank;
+#endif
 			}
 			if (!target->late_weave_grid_logged) {
 				target->late_weave_grid_logged = true;
@@ -3903,8 +4011,13 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	// vkQueuePresentKHR below; X11 reports every present without asking).
 	// Uncounted presents are not tagged, for the same reason as above.
 	if (counted && target->present_fb != NULL) {
-		comp_vk_native_present_feedback_request(target->present_fb, target->weave_start_ns);
+		const uint64_t seq = ++target->pf_seq;
+		target->pf_ring[seq % 16].seq = seq;
+		target->pf_ring[seq % 16].weave_start_ns = target->weave_start_ns;
+		target->pf_ring[seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
+		comp_vk_native_present_feedback_request(target->present_fb, seq);
 	}
+	target->lw_aimed_vblank_ns = 0;
 #endif
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
