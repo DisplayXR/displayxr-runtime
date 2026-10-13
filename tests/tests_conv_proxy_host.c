@@ -9,6 +9,7 @@
  *
  * Standard arguments (conv_host_wire.h CONV_HOST_ARG_*) plus:
  *   --fake-warm-ms <ms>            warm duration (default 20)
+ *   --fake-describe-ms <ms>        delay every DESCRIBE reply (a slow bring-up)
  *   --fake-crash-after <n>         exit(3) when the n-th convert arrives (never completes it)
  *   --fake-crash-once <file>       ... only when <file> does not exist (it is created first)
  *   --fake-hang-after <n>          stop serving converts at the n-th (the watchdog's case)
@@ -72,6 +73,7 @@ mono_ms(void)
 static struct os_channel *g_ch;
 static char g_provider[64];
 static unsigned g_warm_ms = 20;
+static unsigned g_describe_ms = 0;
 static unsigned g_crash_after = 0;
 static const char *g_crash_once = NULL;
 static unsigned g_hang_after = 0;
@@ -334,6 +336,9 @@ handle(const struct conv_host_wire_frame *f, const uint8_t *payload, const uint6
 	const uint32_t rid = f->request_id;
 	switch (f->type) {
 	case CONV_HOST_MSG_DESCRIBE: {
+		if (g_describe_ms != 0) {
+			sleep_ms(g_describe_ms); // a slow bring-up (a window to kill the host in)
+		}
 		struct conv_host_wire_describe_reply r;
 		conv_host_wire_init(&r, sizeof(r));
 		struct xrt_conv_capability c;
@@ -516,6 +521,8 @@ main(int argc, char **argv)
 			g_luid = strtoull(v, NULL, 16);
 		} else if (strcmp(k, CONV_HOST_ARG_PARENT) == 0) {
 			parent = strtol(v, NULL, 10);
+		} else if (strcmp(k, "--fake-describe-ms") == 0) {
+			g_describe_ms = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-warm-ms") == 0) {
 			g_warm_ms = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-crash-after") == 0) {

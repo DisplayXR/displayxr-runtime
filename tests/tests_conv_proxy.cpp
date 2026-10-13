@@ -15,6 +15,8 @@
 #include "conversion/conv_host_proxy.h"
 #include "conversion/conv_host_wire.h"
 
+#include "os/os_process.h"
+
 #include "os/os_time.h"
 
 #include <atomic>
@@ -1126,6 +1128,38 @@ TEST_CASE("proxy: close / evict / teardown with the real host NOT running never 
 		CHECK(evict_ms < 100.0);
 		CHECK(destroy_ms < 2000.0);
 	}
+}
+
+TEST_CASE("proxy: a kill during bring-up: the next host comes up, no exit-30 kill", "[conv_proxy][conv_kill]")
+{
+	// Every DESCRIBE reply takes 1.5 s: the bring-up (hello accepted, nothing
+	// described yet) is a window to kill the host in.
+	Fixture fx({"--fake-describe-ms", "1500"});
+	long pid = 0;
+	REQUIRE(wait_until(
+	    [&] {
+		    pid = host_pid(fx);
+		    return pid > 0 && fx.sup().state == CONV_SUP_RUNNING;
+	    },
+	    40000));
+	REQUIRE(fx.row_state() == XRT_CONV_STATE_UNKNOWN); // still in bring-up
+	REQUIRE(kill_hard(pid));
+	REQUIRE(wait_until([&] { return fx.sup().restarts >= 1u; }, 20000));
+	const int32_t first_exit = fx.sup().last_exit;
+
+	// The next incarnation (as slow) reaches RUNNING and describes.
+	REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 60000));
+	const conv_supervisor_status st = fx.sup();
+	std::printf("bring-up kill: first exit %d, then state %s, spawns %u, restarts %u, last exit %d\n",
+	            (int)first_exit, conv_supervisor_state_str(st.state), st.spawns, st.restarts, st.last_exit);
+	CHECK(st.state == CONV_SUP_RUNNING);
+	CHECK(st.spawns == 2u);   // no extra kill / respawn
+	CHECK(st.restarts == 1u); // the one kill, nothing more
+#ifdef _WIN32
+	CHECK((uint32_t)first_exit == 0xC0000005u); // the real code, not our 30
+#else
+	CHECK(first_exit == OS_PROCESS_EXIT_SIGNAL_BASE + 9);
+#endif
 }
 
 TEST_CASE("proxy: a host's own idle exit is orderly: no crash accounting, no respawn without demand",

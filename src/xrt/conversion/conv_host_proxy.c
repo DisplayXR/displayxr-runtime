@@ -59,6 +59,7 @@
 #define PX_REQUEST_TIMEOUT_MS 5000u    //!< ordinary control requests
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
+#define PX_SPAWN_EXIT_GRACE_MS 1000u   //!< a host that never connected: did it die on its own?
 #define PX_CHANNEL_EXIT_GRACE_MS 5000u //!< a closed channel: wait this long for the real exit code (a loaded box exits slowly)
 #define PX_MAINTENANCE_POLL_NS (1000ull * 1000000ull)
 
@@ -836,6 +837,14 @@ reader_main(void *ptr)
 			os_mutex_lock(&p->m);
 			if (!p->reader_stop) {
 				p->chan_broken = true; // closed, desynced or a malformed frame: the peer is gone or hostile
+				// No reply can come any more: fail every waiter now, not at its timeout.
+				for (uint32_t i = 0; i < PX_MAX_PENDING; i++) {
+					if (p->pending[i].used && !p->pending[i].done) {
+						p->pending[i].done = true;
+						p->pending[i].result = (int32_t)XRT_ERROR_IPC_FAILURE;
+						p->pending[i].reply_bytes = 0;
+					}
+				}
 			}
 			os_cond_broadcast(&p->cond);
 			os_mutex_unlock(&p->m);
@@ -1012,8 +1021,12 @@ bring_up(struct proxy *p, uint32_t caps)
 {
 	fetch_provider_status(p); // before the describe: the core reads both at the generation bump
 	if (!describe_all(p, caps) || !lane_open(p)) {
+		// Usually the host died under the bring-up (killed, out of memory):
+		// take the broken-channel path, which waits for its REAL exit code
+		// before killing anything (no exit-30 kill of a host already going).
 		os_mutex_lock(&p->m);
-		conv_supervisor_channel_broken(&p->sup, now_ns());
+		p->chan_broken = true;
+		os_cond_broadcast(&p->cond);
 		os_mutex_unlock(&p->m);
 		return;
 	}
@@ -1089,6 +1102,7 @@ on_host_gone(struct proxy *p, int32_t code, bool orderly, bool had_demand)
 	p->running = false;
 	p->hello_ok = false;
 	p->chan_broken = false;
+	p->breach = false;
 	for (uint32_t i = 0; i < PX_MAX_PENDING; i++) {
 		if (p->pending[i].used && !p->pending[i].done) {
 			p->pending[i].done = true;
@@ -1274,7 +1288,9 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 	}
 	if (os_channel_accept_child(ch, proc, child_end, (uint32_t)accept_ms) != 0) {
 		int32_t code = 0;
-		if (os_process_wait(proc, 0, &code) == 1) {
+		// A host that died on its own (out of memory, a crash in its start-up)
+		// reports its real code; only one still there is killed (30).
+		if (os_process_wait(proc, PX_SPAWN_EXIT_GRACE_MS, &code) == 1) {
 			U_LOG_W("[conv:%s] host exited (code %d) before connecting its channel", p->provider_id, (int)code);
 		} else {
 			U_LOG_W("[conv:%s] host pid %ld never connected its channel", p->provider_id,
@@ -1292,6 +1308,11 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 	p->ch = ch;
 	p->host_pid = os_process_pid(proc);
 	p->reader_stop = false;
+	// Per-incarnation state starts clean: nothing a previous host (or a call
+	// that raced its death) left behind may act on this one.
+	p->chan_broken = false;
+	p->hello_ok = false;
+	p->breach = false;
 	os_mutex_unlock(&p->m);
 	if (os_thread_init(&p->reader) == 0 && os_thread_start(&p->reader, reader_main, p) == 0) {
 		p->reader_started = true;
@@ -1446,13 +1467,18 @@ sup_main(void *ptr)
 			(void)px_send(p, CONV_HOST_MSG_SHUTDOWN, 0, &sd, sizeof(sd), NULL, 0);
 			break;
 		}
-		case CONV_SUP_ACTION_TERMINATE:
+		case CONV_SUP_ACTION_TERMINATE: {
+			int32_t gone_code = 0;
+			if (proc != NULL && os_process_wait(proc, 0, &gone_code) == 1) {
+				break; // already gone on its own: its real code is read below, not a 30
+			}
 			if (proc != NULL) {
 				U_LOG_W("[conv:%s] killing host pid %ld (exit %d)", p->provider_id, os_process_pid(proc),
 				        (int)kill_code);
 				(void)os_process_terminate(proc, kill_code);
 			}
 			break;
+		}
 		default: break;
 		}
 
