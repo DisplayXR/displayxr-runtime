@@ -910,6 +910,11 @@ conv_core_eyes_publish(struct conv_core *core, uint64_t dp_key, const struct con
 	}
 	conv_eyes_slot_publish(&core->eyes[s], eyes);
 	core->eyes_publish_seq[s] = ++core->eyes_seq;
+	if (core->eyes_first_key == 0) {
+		core->eyes_first_key = dp_key;
+	} else if (dp_key != core->eyes_first_key) {
+		core->eyes_multi_dp = true; // sticky for the service lifetime
+	}
 	conv_eyes_slot_publish(&core->eyes_any, eyes);
 	core->eyes_any_key = dp_key;
 	os_mutex_unlock(&core->eyes_mtx);
@@ -944,6 +949,12 @@ conv_core_eyes_read(struct conv_core *core, uint64_t dp_key, uint64_t now, struc
 	}
 	os_mutex_lock(&core->eyes_mtx);
 	const int32_t s = dp_key == CONV_EYES_DP_ANY ? -1 : eyes_find_locked(core, dp_key);
+	if (s < 0 && dp_key != CONV_EYES_DP_ANY && core->eyes_multi_dp) {
+		// An unknown key once two DPs exist: another screen's eyes would be in
+		// another display space. Stale: the nominal viewer.
+		os_mutex_unlock(&core->eyes_mtx);
+		return false;
+	}
 	struct conv_eyes_slot *slot = s >= 0 ? &core->eyes[s] : &core->eyes_any;
 	const bool fresh = conv_eyes_slot_read(slot, now, core->cfg.eyes_max_age_ns, out);
 	os_mutex_unlock(&core->eyes_mtx);
