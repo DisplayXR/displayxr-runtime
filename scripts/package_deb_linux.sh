@@ -47,7 +47,7 @@
 #       default alone would not reach most users)
 #
 #   /usr/lib/displayxr/bin/displayxr-dashboard          (the DisplayXR Dashboard:
-#       Avalonia / .NET 9, self-contained single file — no .NET runtime Depends;
+#       Avalonia / .NET 10, self-contained single file — no .NET runtime Depends;
 #       it runs the displayxr-cli beside it)
 #   /usr/bin/displayxr-dashboard -> ../lib/displayxr/bin/displayxr-dashboard
 #   /usr/share/applications/displayxr-dashboard.desktop

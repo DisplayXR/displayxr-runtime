@@ -407,7 +407,7 @@ goto :done
 :build_dashboard
 where dotnet >nul 2>nul
 if errorlevel 1 (
-    echo WARN: dotnet not found - skipping the DisplayXR Dashboard [install the .NET 9 SDK to build it]
+    echo WARN: dotnet not found - skipping the DisplayXR Dashboard [install the .NET 10 SDK to build it]
     exit /b 0
 )
 echo.
