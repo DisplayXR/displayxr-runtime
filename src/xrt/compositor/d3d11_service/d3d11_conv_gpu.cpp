@@ -707,6 +707,7 @@ glue_release_all(d3d11_lift *l)
 	}
 	l->core_weave.clear();
 	d3d11_conv_viewsyn_destroy(&l->viewsyn);
+	rel(l->viewsyn_deferred);
 }
 
 //! A glue image by its import key (copied; its COM pointers stay valid while
@@ -1010,6 +1011,51 @@ glue_rb_release(void *ud, const float *samples)
 	(void)samples; // owned by the stream's readback state until its next read
 }
 
+/*!
+ * #2030: run one S5 synthesis off the shared immediate context. The draws are
+ * recorded on the glue's own deferred context (no service lock held), then
+ * replayed with ExecuteCommandList(list, TRUE): the list starts from the
+ * default state and the immediate context's state is saved and restored
+ * around it, so no binding leaks either way between the synthesis and the
+ * other threads drawing on that context (shared immediate-context state must
+ * be per draw). The images' keyed mutexes are held by the caller across both.
+ * Caller holds viewsyn_mtx; the stage exists.
+ */
+static bool
+glue_viewsyn_draw(d3d11_lift *l,
+                  const d3d11_conv_viewsyn_inputs *in,
+                  const u_conv_viewsyn_params *p,
+                  const d3d11_conv_viewsyn_target *tg)
+{
+	if (l->viewsyn_deferred == nullptr) {
+		static bool logged = false;
+		const HRESULT hr = l->svc_device->CreateDeferredContext(0, &l->viewsyn_deferred);
+		if (FAILED(hr) && !logged) {
+			logged = true;
+			l->viewsyn_deferred = nullptr;
+			U_LOG_W("[conv] S5: no deferred context (0x%08lx): view synthesis draws on the service context",
+			        (unsigned long)hr);
+		}
+	}
+	if (l->viewsyn_deferred == nullptr) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		const bool ok = d3d11_conv_viewsyn_render(l->viewsyn, l->svc_context, in, p, tg);
+		l->svc_context->Flush();
+		return ok;
+	}
+	ID3D11CommandList *list = nullptr;
+	if (!d3d11_conv_viewsyn_record(l->viewsyn, l->viewsyn_deferred, in, p, tg, &list)) {
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		l->svc_context->ExecuteCommandList(list, TRUE);
+		l->svc_context->Flush();
+	}
+	rel(list);
+	return true;
+}
+
 //! S5: the reference view synthesis on the service device.
 static bool
 glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
@@ -1063,9 +1109,7 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		tg.texture = t.tex;
 		tg.rtv_format = DXGI_FORMAT_UNKNOWN;
 		tg.layout = req->layout;
-		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
-		ok = d3d11_conv_viewsyn_render(l->viewsyn, l->svc_context, &in, &p, &tg);
-		l->svc_context->Flush();
+		ok = glue_viewsyn_draw(l, &in, &p, &tg);
 	}
 	if (held_t) {
 		img_release(t.km, req->target);

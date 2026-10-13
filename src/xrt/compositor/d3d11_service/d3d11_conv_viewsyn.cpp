@@ -613,3 +613,30 @@ d3d11_conv_viewsyn_render(struct d3d11_conv_viewsyn *v,
 	unbind(ctx);
 	return true;
 }
+
+bool
+d3d11_conv_viewsyn_record(struct d3d11_conv_viewsyn *v,
+                          ID3D11DeviceContext *deferred,
+                          const struct d3d11_conv_viewsyn_inputs *in,
+                          const struct u_conv_viewsyn_params *p,
+                          const struct d3d11_conv_viewsyn_target *target,
+                          ID3D11CommandList **out_list)
+{
+	if (out_list == nullptr) {
+		return false;
+	}
+	*out_list = nullptr;
+	if (deferred == nullptr || deferred->GetType() != D3D11_DEVICE_CONTEXT_DEFERRED) {
+		return false;
+	}
+	const bool ok = d3d11_conv_viewsyn_render(v, deferred, in, p, target);
+	// Always finish: the next recording must start from the default state.
+	ID3D11CommandList *list = nullptr;
+	const HRESULT hr = deferred->FinishCommandList(FALSE, &list);
+	if (!ok || FAILED(hr) || list == nullptr) {
+		rel(list);
+		return false;
+	}
+	*out_list = list;
+	return true;
+}
