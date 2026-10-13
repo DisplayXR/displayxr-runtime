@@ -44,6 +44,9 @@
 #include "d3d11_lift_internal.h"
 #include "d3d11_conv_gpu.h"
 
+#include "util/u_lift_autoconv.h"
+#include "util/u_lift_viewpoint.h"
+
 
 /*
  *
@@ -370,15 +373,14 @@ snapshot_blit(d3d11_lift *l,
 }
 
 /*!
- * Letterbox: collect finished profile readbacks (never waits) into the stream's
+ * Letterbox: collect finished profile readbacks (never waits) into the rect's
  * crop state, then measure this frame's rect into the next free readback. The
  * crop therefore lags the picture by a few frames, which the settle hysteresis
- * dwarfs anyway. Producer thread (service context mutex held); @p st is not
- * reaped meanwhile (its input slot is WRITING).
+ * dwarfs anyway. The weave's producer thread (service context mutex held).
  */
-template <typename STATE>
-void
-letterbox_step(d3d11_lift *l, STATE &st, ID3D11ShaderResourceView *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static void
+letterbox_step(
+    d3d11_lift *l, core_weave_state &st, ID3D11ShaderResourceView *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 	ID3D11DeviceContext *ctx = l->svc_context;
 
@@ -513,13 +515,6 @@ letterbox_step(d3d11_lift *l, STATE &st, ID3D11ShaderResourceView *src, uint32_t
 }
 
 
-template void
-letterbox_step<lift_stream>(
-    d3d11_lift *l, lift_stream &st, ID3D11ShaderResourceView *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
-template void
-letterbox_step<core_weave_state>(
-    d3d11_lift *l, core_weave_state &st, ID3D11ShaderResourceView *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
-
 bool
 d3d11_lift_pin_depth(struct d3d11_lift_pin *pin)
 {
@@ -537,6 +532,57 @@ d3d11_lift_pin_depth(struct d3d11_lift_pin *pin)
 	}
 	pin->depth_held = true;
 	return true;
+}
+
+/*
+ *
+ * Eyes (G7), producer side: the conversion core reads the panel's eyes from
+ * its own per-DP snapshot; the service publishes there from every eye query.
+ * A producer that finds the last publish older than 50 ms asks the service for
+ * a fresh query first (it may take render_mutex — on the producer's thread,
+ * never on the lift thread or the core's dispatcher).
+ *
+ */
+
+void
+d3d11_lift_publish_eyes(struct d3d11_lift *l, const struct xrt_eye_positions *eyes)
+{
+	if (l == nullptr || eyes == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(l->eyes_mtx);
+	l->eyes_ns = os_monotonic_get_ns();
+}
+
+void
+d3d11_lift_set_eyes_refresh(struct d3d11_lift *l, void (*fn)(void *ud), void *ud)
+{
+	if (l == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(l->eyes_mtx);
+	l->eyes_refresh = fn;
+	l->eyes_refresh_ud = ud;
+}
+
+//! Producer side: pull fresh eyes when nothing published them lately.
+static void
+eyes_refresh_if_stale(d3d11_lift *l)
+{
+	void (*fn)(void *) = nullptr;
+	void *ud = nullptr;
+	{
+		std::lock_guard<std::mutex> g(l->eyes_mtx);
+		const uint64_t now = os_monotonic_get_ns();
+		if (l->eyes_ns != 0 && now - l->eyes_ns < 50ull * 1000ull * 1000ull) {
+			return;
+		}
+		fn = l->eyes_refresh;
+		ud = l->eyes_refresh_ud;
+	}
+	if (fn != nullptr) {
+		fn(ud); // publishes through d3d11_lift_publish_eyes
+	}
 }
 
 void
@@ -829,12 +875,41 @@ d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out
 	out->ud = l;
 }
 
+//! IEEE half -> float (the depth may be R16_FLOAT).
+static float
+half_to_float(uint16_t h)
+{
+	const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp = (h >> 10) & 0x1fu;
+	uint32_t man = h & 0x3ffu;
+	uint32_t bits;
+	if (exp == 0) {
+		if (man == 0) {
+			bits = sign;
+		} else {
+			// Subnormal: normalise.
+			exp = 127 - 15 + 1;
+			while ((man & 0x400u) == 0) {
+				man <<= 1;
+				exp--;
+			}
+			man &= 0x3ffu;
+			bits = sign | (exp << 23) | (man << 13);
+		}
+	} else if (exp == 0x1f) {
+		bits = sign | 0x7f800000u | (man << 13); // inf / NaN
+	} else {
+		bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+	}
+	float f;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
 /*
  * S6 / S7: depth readback. Never stalls: one staging copy in flight per
  * stream, issued at most every U_LIFT_AUTOCONV_SAMPLE_PERIOD_NS (the lift
  * thread's old cadence) and mapped DO_NOT_WAIT on a later conversion. The
- * samples returned are therefore of an earlier conversion of the same stream
- * — the lag the pre-core readback had too.
+ * samples returned are therefore of an earlier conversion of the same stream.
  */
 static bool
 glue_rb_read(void *ud,
@@ -1136,7 +1211,7 @@ d3d11_lift_glue_import_input(struct d3d11_lift *l,
 	bool ok;
 	if (gpu) {
 		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
-		// The pre-core snapshot, into the core's slot: 1:1 (point) at the
+		// The snapshot into the core's slot: 1:1 (point) at the
 		// submitted size, box-filtered when inputScale shrank the slot.
 		blit_dst dst = {gi.km, gi.rtv};
 		ok = gi.rtv != nullptr &&
@@ -1594,7 +1669,7 @@ core_weave_submit_locked(d3d11_lift *l,
 		        (unsigned long long)id, cw, ch, dw, dh, l->max_input_edge);
 	}
 
-	// The rect's options are sticky like the pre-core stream's last params.
+	// The rect's options are sticky (the last ones any submit carried).
 	if (params != nullptr) {
 		ws->last_params = *params;
 		ws->has_last_params = true;
@@ -1744,4 +1819,78 @@ core_unpin(d3d11_lift *l, d3d11_lift_pin *pin)
 	if (b.core != nullptr) {
 		conv_core_stream_release(b.core, pin->core_id, pin->core_ring_slot);
 	}
+}
+
+
+/*
+ *
+ * The weave path's entry points (comp_d3d11_service's lift-rect weave): every
+ * lifted rect is a core-routed v3 stream (D3D11_LIFT_CORE_STREAM_TAG).
+ *
+ */
+
+uint32_t
+d3d11_lift_stream_mode(struct d3d11_lift *l, uint64_t owner, uint64_t id)
+{
+	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		return 0;
+	}
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	return bridge_resolve(l, owner, id, nullptr, &core_id, &mode) ? mode : 0;
+}
+
+xrt_result_t
+d3d11_lift_submit_srv_locked(struct d3d11_lift *l,
+                             uint64_t owner,
+                             uint64_t id,
+                             ID3D11ShaderResourceView *src,
+                             uint32_t src_tw,
+                             uint32_t src_th,
+                             uint32_t x,
+                             uint32_t y,
+                             uint32_t w,
+                             uint32_t h,
+                             int64_t source_time,
+                             const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_floats,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
+                             const struct xrt_lift_rect_frame *frame,
+                             uint64_t *out_frame_id)
+{
+	if (l == nullptr || !l->snap_ok || src == nullptr || out_frame_id == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if ((id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		*out_frame_id = 0;
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // not a stream of this route: non-fatal
+	}
+	return core_weave_submit_locked(l, owner, id, src, src_tw, src_th, x, y, w, h, source_time, params, viewpoints,
+	                                viewpoint_floats, view_control, rig, frame, out_frame_id);
+}
+
+bool
+d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct d3d11_lift_pin *out)
+{
+	*out = d3d11_lift_pin{};
+	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		return false;
+	}
+	return core_pin_latest(l, owner, id, out);
+}
+
+void
+d3d11_lift_unpin(struct d3d11_lift_pin *pin)
+{
+	if (pin == nullptr || !pin->valid || pin->lift == nullptr) {
+		return;
+	}
+	if (pin->depth_held) {
+		pin->depth_km->ReleaseSync(0);
+	}
+	pin->km->ReleaseSync(0);
+	core_unpin(pin->lift, pin);
+	*pin = d3d11_lift_pin{};
 }

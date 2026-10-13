@@ -253,8 +253,7 @@ struct Fixture
 	}
 
 	/*! What ipc_handle_lift_get_properties answers: the core when the rule
-	 *  routes, else the legacy path (here: no display-processor module, the
-	 *  shipping "modes 0, UNAVAILABLE"). */
+	 *  routes, else "modes 0, UNAVAILABLE" (P1b, #2028: no pre-core path). */
 	xrt_dp_lift_caps
 	properties()
 	{
@@ -267,12 +266,12 @@ struct Fixture
 		return caps;
 	}
 
-	//! ipc_handle_lift_stream_create: the core when it routes, else the legacy answer.
+	//! ipc_handle_lift_stream_create: the core when it routes, else FEATURE_UNSUPPORTED.
 	xrt_result_t
 	create(uint64_t client, uint32_t mode, uint64_t *id, uint32_t aux = 0)
 	{
 		if (!ipc_server_conv_routes_create(sc, mode, 0)) {
-			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // svc_lift with no module
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // not routable: refused on the v3 wire
 		}
 		return ipc_server_conv_lift_stream_create(sc, client, mode, 0, 1.0f, aux, 0, id);
 	}
@@ -318,9 +317,13 @@ TEST_CASE("no GPU glue: nothing routes, the shipping v3 path is untouched", "[ip
 		CHECK_FALSE(ipc_server_conv_routes_properties(ipc_server_get_conv()));
 		CHECK_FALSE(ipc_server_conv_owns_stream(ipc_server_get_conv(), IPC_SERVER_CONV_STREAM_TAG | 1));
 		ipc_server_set_conv(fx.sc);
-		// GAUSSIANS never routes, glue or not.
+		// GAUSSIANS without a SPLATS_MONO provider never routes, glue or not: an
+		// honest FEATURE_UNSUPPORTED (P1b deleted the pre-core fall-through).
 		fx.install_glue();
 		CHECK_FALSE(ipc_server_conv_routes_create(fx.sc, XRT_DP_LIFT_MODE_GAUSSIANS, 1));
+		uint64_t gid = 0;
+		CHECK(fx.create(9, XRT_DP_LIFT_MODE_GAUSSIANS, &gid) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+		CHECK(gid == 0u);
 		CHECK(ipc_server_conv_routes_create(fx.sc, XRT_DP_LIFT_MODE_SBS, 0));
 	}
 	conv_fake_fini(&f);
@@ -407,7 +410,7 @@ TEST_CASE("create while ACTIVATING is accepted and served once READY (G3)", "[ip
 		REQUIRE(fx.create(9, XRT_DP_LIFT_MODE_SBS, &id, XRT_DP_LIFT_AUX_DEPTH) == XRT_SUCCESS);
 		CHECK((id & IPC_SERVER_CONV_STREAM_TAG) != 0u);
 		CHECK(ipc_server_conv_owns_stream(fx.sc, id));
-		CHECK_FALSE(ipc_server_conv_owns_stream(fx.sc, 1)); // a svc_lift id falls through
+		CHECK_FALSE(ipc_server_conv_owns_stream(fx.sc, 1)); // an id this route never minted
 
 		// Frames submitted while warming wait (latest-wins); NOT READY meanwhile.
 		REQUIRE(fx.submit(9, id) == XRT_SUCCESS);
