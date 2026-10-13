@@ -28727,6 +28727,7 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 	uint64_t frame_id = 0;
 	struct xrt_lift_rect_frame frame;
 	lift_rect_frame(sys, &c->base.base, &rect, win_w, win_h, &frame);
+	d3d11_lift_rect_match_views(lift, owner, b->stream_id, 2); // the batch layout weaves a pair
 	(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, in_srv, in_w, in_h, (uint32_t)x0, (uint32_t)y0,
 	                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), (int64_t)os_monotonic_get_ns(),
 	                                   b->has_params ? &b->params : nullptr,
@@ -28854,6 +28855,10 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 		uint64_t frame_id = 0;
 		struct xrt_lift_rect_frame frame;
 		lift_rect_frame(sys, &c->base.base, &r, win_w, win_h, &frame);
+		// Spec 4 viewCount 0: the stream follows the active mode's views.
+		d3d11_lift_rect_match_views(lift, owner, b->stream_id,
+		                            layout->view_count != 0 ? layout->view_count
+		                                                    : layout->tile_columns * layout->tile_rows);
 		(void)d3d11_lift_submit_srv_locked(
 		    lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w, h,
 		    (int64_t)os_monotonic_get_ns(), b->has_params ? &b->params : nullptr,
@@ -38194,6 +38199,7 @@ comp_d3d11_service_conv_set_bridge(struct xrt_system_compositor *xsysc, const st
 	struct d3d11_lift_core_bridge b = {};
 	b.core = bridge->core;
 	b.resolve = bridge->resolve;
+	b.match_weave = bridge->match_weave;
 	b.ud = bridge->ud;
 	d3d11_lift_set_core_bridge(sys->lift, &b);
 }

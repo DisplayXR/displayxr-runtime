@@ -590,6 +590,16 @@ ipc_server_conv_v4_cpu_output(struct ipc_server_conv *sc,
                               uint32_t *out_format,
                               uint64_t *out_bytes);
 
+/*!
+ * Spec 4 "viewCount = 0 = match the weave": the weave path tells a lifted
+ * rect's stream how many views the active mode weaves (@p views; the batch
+ * SBS layout is 2). A VIEWS_MONO task stream created with viewCount 0 is
+ * resized to it behind the same handle (view v lands in tile v), within
+ * [2, the task's maxViews]; any other stream is left alone.
+ */
+void
+ipc_server_conv_v4_match_weave(struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id, uint32_t views);
+
 #ifdef __cplusplus
 }
 #endif

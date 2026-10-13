@@ -605,3 +605,69 @@ TEST_CASE("GAUSSIANS facade: blob formats map one to one; spec 3 never sees SPZ"
 		conv_fake_fini(&f);
 	}
 }
+
+TEST_CASE("viewCount 0 follows the weave: resized behind the same handle", "[ipc_conv_v4]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *v = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	v->cap.max_views = 6;
+	v->convert_ms = 1;
+	conv_fake_set_state(&f, 4, XRT_CONV_STATE_READY, 0, false);
+	{
+		Fixture fx;
+		fx.install_glue();
+		REQUIRE(fx.add(f) >= 0);
+		uint64_t follow = 0, fixed = 0;
+		REQUIRE(fx.create_task(1, XRT_CONV_TASK_VIEWS_MONO, &follow, 0) == XRT_SUCCESS);
+		REQUIRE(fx.create_task(1, XRT_CONV_TASK_VIEWS_MONO, &fixed, 2) == XRT_SUCCESS);
+		uint64_t core_a = 0, core_b = 0;
+		uint32_t mode = 0;
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 1, follow, &core_a, &mode));
+		CHECK(mode == XRT_DP_LIFT_MODE_SBS); // a plain stream starts at 2
+
+		auto views_of = [&](uint64_t id) {
+			bool ready = false, disc = false;
+			ipc_lift_result r3{};
+			xrt_conv_wire_result r4{};
+			uint32_t n = 0;
+			REQUIRE(wait_until(
+			    [&] {
+				    fx.submit(1, id);
+				    if (ipc_server_conv_v4_acquire(fx.sc, 1, id, &ready, &disc, &r3, &r4) == XRT_SUCCESS &&
+				        ready) {
+					    n = r3.view_count;
+				    }
+				    return ready;
+			    },
+			    3000));
+			return n;
+		};
+		CHECK(views_of(follow) == 2u);
+
+		// A 2 -> 4 mode switch: same handle, a resized stream behind it.
+		ipc_server_conv_v4_match_weave(fx.sc, 1, follow, 4);
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 1, follow, &core_b, &mode));
+		CHECK(mode == XRT_DP_LIFT_MODE_NVIEW);
+		CHECK(core_b != core_a);
+		CHECK(views_of(follow) == 4u);
+		CHECK(ipc_server_conv_owns_stream(fx.sc, follow));
+
+		// Out of the task's range, another connection, or a fixed stream: ignored.
+		ipc_server_conv_v4_match_weave(fx.sc, 1, follow, 7);
+		ipc_server_conv_v4_match_weave(fx.sc, 2, follow, 2);
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 1, follow, &core_a, &mode));
+		CHECK(core_a == core_b);
+		ipc_server_conv_v4_match_weave(fx.sc, 1, fixed, 4);
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 1, fixed, &core_a, &mode));
+		CHECK(mode == XRT_DP_LIFT_MODE_SBS);
+		CHECK(views_of(fixed) == 2u);
+
+		// Back to 2 (a 4 -> 2 switch).
+		ipc_server_conv_v4_match_weave(fx.sc, 1, follow, 2);
+		REQUIRE(ipc_server_conv_resolve_stream(fx.sc, 1, follow, &core_a, &mode));
+		CHECK(mode == XRT_DP_LIFT_MODE_SBS);
+		CHECK(views_of(follow) == 2u);
+	}
+	conv_fake_fini(&f);
+}

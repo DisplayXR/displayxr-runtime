@@ -111,6 +111,8 @@ struct d3d11_lift_core_bridge
 	struct conv_core *core;
 	//! A v3 stream id the route minted -> the core stream and its v3 mode bit.
 	bool (*resolve)(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode);
+	//! Spec 4: the weave's view count for a lifted rect's stream (may be NULL).
+	void (*match_weave)(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views);
 	void *ud;
 };
 
@@ -222,6 +224,12 @@ d3d11_lift_glue_export_fence(struct d3d11_lift *lift, uint64_t stream_id, HANDLE
 
 void
 d3d11_lift_glue_stream_gone(struct d3d11_lift *lift, uint64_t stream_id);
+
+/*! Spec 4: before a lifted rect is submitted, the view count the active mode
+ *  weaves (2 on the batch SBS layout). A core-routed stream created with
+ *  viewCount 0 follows it; anything else ignores it. Cheap. */
+void
+d3d11_lift_rect_match_views(struct d3d11_lift *lift, uint64_t owner, uint64_t stream_id, uint32_t views);
 
 
 /*
