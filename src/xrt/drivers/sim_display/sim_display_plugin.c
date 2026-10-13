@@ -45,10 +45,17 @@
 
 
 /*!
- * ADR-051: bumped on every probe_displays so the per-screen status
- * change_counter moves when the monitor set is re-probed.
+ * ADR-051: bumped by probe_displays when the monitor SET it was handed
+ * differs from the previous probe's, so the per-screen status change_counter
+ * moves on a topology change and nowhere else. It must not count probes: the
+ * service re-probes every 10 s while the fallback plug-in is active, and a
+ * counter that moved per probe made every status watcher refetch an
+ * identical snapshot on each tick (xrt_plugin_iface: "bump change_counter on
+ * your own device / topology events, never by polling").
  */
-static xrt_atomic_s32_t g_sim_display_probe_count = 0;
+static xrt_atomic_s32_t g_sim_display_topology_count = 0;
+//! FNV-1a of the last probed monitor set (order-independent); 0 = none yet.
+static uint64_t g_sim_display_last_set_key = 0;
 
 
 /*
@@ -224,7 +231,25 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 {
 	(void)inst;
 
-	xrt_atomic_s32_inc_return(&g_sim_display_probe_count);
+	// Order-independent key of the set: the sum of per-descriptor hashes.
+	uint64_t set_key = 1469598103934665603ull ^ display_count;
+	for (uint32_t i = 0; i < display_count; i++) {
+		uint64_t h = 1469598103934665603ull;
+		const unsigned char *b = (const unsigned char *)&displays[i].monitor_id;
+		for (size_t k = 0; k < sizeof(displays[i].monitor_id); k++) {
+			h = (h ^ b[k]) * 1099511628211ull;
+		}
+		set_key += h;
+	}
+	if (set_key == 0) {
+		set_key = 1; // keep 0 as "no probe yet"
+	}
+	// Probes are serialized by the loader's refresh lock; a benign race here
+	// costs one extra bump, never a missed one.
+	if (set_key != g_sim_display_last_set_key) {
+		g_sim_display_last_set_key = set_key;
+		xrt_atomic_s32_inc_return(&g_sim_display_topology_count);
+	}
 
 	/*
 	 * sim_display is the vendor-neutral fallback (#69 / ADR-015): claim
@@ -289,9 +314,10 @@ sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
 
 	out->version = XRT_PLUGIN_SCREEN_STATUS_VERSION;
 	// Both terms are monotonic, so the sum moves on every tracker edge and
-	// every re-probe, and nowhere else. cmpxchg(0, 0) is an atomic load.
-	int32_t probes = xrt_atomic_s32_cmpxchg(&g_sim_display_probe_count, 0, 0);
-	out->change_counter = edges + (uint64_t)(uint32_t)probes;
+	// every change of the probed monitor set, and nowhere else (not per
+	// probe). cmpxchg(0, 0) is an atomic load.
+	int32_t topo = xrt_atomic_s32_cmpxchg(&g_sim_display_topology_count, 0, 0);
+	out->change_counter = edges + (uint64_t)(uint32_t)topo;
 	out->ready = true;
 	out->verified = true;
 	out->calibrated = true;
