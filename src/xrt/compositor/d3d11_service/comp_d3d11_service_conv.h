@@ -75,6 +75,8 @@ struct comp_d3d11_conv_glue
 	                                 uint32_t height,
 	                                 uint8_t **out_pixels);
 	void (*release_input)(void *ud, xrt_graphics_buffer_handle_t handle, bool is_dxgi);
+	//! #2030: the input's content key (PHOTO dedupe); 0 = unknown. Optional.
+	uint64_t (*input_content_key)(void *ud, uint64_t stream_id, const struct conv_submit_slot *slot);
 	xrt_result_t (*publish_result)(void *ud,
 	                               uint64_t stream_id,
 	                               const struct conv_result *res,

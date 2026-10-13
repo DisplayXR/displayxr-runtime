@@ -39,6 +39,13 @@ add_library(
 target_include_directories(comp_d3d11_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(comp_d3d11_conv_viewsyn PUBLIC xrt-interfaces aux_util PRIVATE ${D3D11_LIBRARY} d3dcompiler)
 
+# #2030: the still-image content check (a private device; GenerateMips down to a
+# <= 16x16 block, asynchronous staging readback). Its own library so the WARP
+# test (tests_conv_gpu_dedupe) links it without the service.
+add_library(comp_d3d11_conv_content STATIC d3d11_conv_content_key.cpp d3d11_conv_content_key.h)
+target_include_directories(comp_d3d11_conv_content PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(comp_d3d11_conv_content PUBLIC xrt-interfaces aux_util PRIVATE ${D3D11_LIBRARY} ${DXGI_LIBRARY})
+
 # XR_DXR_lift (ADR-042) on the D3D11 service: the lift thread, its device and
 # the vendor module's display processor (d3d11_lift.cpp), plus the conversion
 # core's D3D11 GPU glue on the service device (d3d11_conv_gpu.cpp, split out in
@@ -56,7 +63,7 @@ target_include_directories(comp_d3d11_lift PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..
 target_link_libraries(
 	comp_d3d11_lift
 	PUBLIC xrt-interfaces aux_util aux_os conv_runtime
-	PRIVATE comp_d3d11_conv_viewsyn ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
+	PRIVATE comp_d3d11_conv_viewsyn comp_d3d11_conv_content ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
 	)
 
 add_library(

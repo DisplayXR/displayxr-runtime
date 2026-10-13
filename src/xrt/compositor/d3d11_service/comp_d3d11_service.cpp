@@ -38021,6 +38021,12 @@ conv_io_import_input(void *ud,
 	return d3d11_lift_glue_import_input((struct d3d11_lift *)ud, stream_id, (HANDLE)handle, is_dxgi, w, h, slot);
 }
 
+static uint64_t
+conv_io_input_content_key(void *ud, uint64_t stream_id, const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_input_content_key((struct d3d11_lift *)ud, stream_id, slot);
+}
+
 static xrt_result_t
 conv_io_import_input_cpu(void *ud,
                          uint64_t stream_id,
@@ -38105,6 +38111,7 @@ comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3
 	d3d11_lift_get_dp_backend(l, &out->dp_lift);
 	out->import_input = conv_io_import_input;
 	out->import_input_cpu = conv_io_import_input_cpu;
+	out->input_content_key = conv_io_input_content_key;
 	out->release_input = conv_io_release_input;
 	out->publish_result = conv_io_publish;
 	out->export_output = conv_io_export_output;

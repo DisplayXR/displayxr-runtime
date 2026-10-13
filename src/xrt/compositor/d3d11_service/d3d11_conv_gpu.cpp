@@ -43,6 +43,7 @@
 
 #include "d3d11_lift_internal.h"
 #include "d3d11_conv_gpu.h"
+#include "d3d11_conv_content_key.h"
 
 #include "util/u_lift_autoconv.h"
 #include "util/u_lift_viewpoint.h"
@@ -708,6 +709,7 @@ glue_release_all(d3d11_lift *l)
 	l->core_weave.clear();
 	d3d11_conv_viewsyn_destroy(&l->viewsyn);
 	rel(l->viewsyn_deferred);
+	d3d11_conv_content_check_destroy(&l->content_check);
 }
 
 //! A glue image by its import key (copied; its COM pointers stay valid while
@@ -840,6 +842,7 @@ glue_free(void *ud, struct xrt_conv_image *img)
 		std::lock_guard<std::mutex> g(l->glue_mtx);
 		auto it = l->glue_imgs.find(img->import_key);
 		if (it != l->glue_imgs.end()) {
+			d3d11_conv_content_check_forget_image(l->content_check, img->import_key);
 			const uint64_t sid = it->second.stream_id;
 			glue_img_release(it->second);
 			l->glue_imgs.erase(it);
@@ -1350,6 +1353,38 @@ d3d11_lift_glue_import_input(struct d3d11_lift *l,
 	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
 }
 
+uint64_t
+d3d11_lift_glue_input_content_key(struct d3d11_lift *l, uint64_t wire, const struct conv_submit_slot *slot)
+{
+	if (l == nullptr || slot == nullptr || slot->image_count < 1 || !glue_enter(l)) {
+		return 0;
+	}
+	glue_img gi;
+	if (!glue_find(l, slot->images[0].import_key, &gi) || gi.share == nullptr) {
+		glue_leave(l); // a CPU slot: the core hashes the pixels itself
+		return 0;
+	}
+	d3d11_conv_content_check *chk;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		if (l->content_check == nullptr && !l->content_check_tried) {
+			l->content_check_tried = true;
+			IDXGIDevice *dd = nullptr;
+			IDXGIAdapter *ad = nullptr;
+			if (SUCCEEDED(l->svc_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dd))) {
+				(void)dd->GetAdapter(&ad);
+			}
+			l->content_check = d3d11_conv_content_check_create(ad);
+			rel(ad);
+			rel(dd);
+		}
+		chk = l->content_check;
+	}
+	const uint64_t key = d3d11_conv_content_check_sample(chk, wire, gi.share, slot->images[0].import_key);
+	glue_leave(l);
+	return key;
+}
+
 xrt_result_t
 d3d11_lift_glue_import_input_cpu(
     struct d3d11_lift *l, uint64_t wire, HANDLE handle, bool is_dxgi, uint32_t w, uint32_t h, uint8_t **out_pixels)
@@ -1663,6 +1698,7 @@ d3d11_lift_glue_stream_gone(struct d3d11_lift *l, uint64_t wire)
 			glue_stream_release(it->second);
 			l->glue_streams.erase(it);
 		}
+		d3d11_conv_content_check_forget_stream(l->content_check, wire);
 		auto cw = l->core_weave.find(wire);
 		if (cw != l->core_weave.end()) {
 			for (auto &r : cw->second.lb_rb) {
