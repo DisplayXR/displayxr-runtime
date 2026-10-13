@@ -310,6 +310,30 @@ uint32_t
 target_conversion_plugin_parse_hosting(const char *s, bool *out_known);
 
 /*!
+ * The environment override for a provider's hosting: `DXR_CONV_<ID>_HOSTING`
+ * (id upper-cased, '-' and '.' as '_'). Written to @p buf; false when it does
+ * not fit. The SERVICE's own environment is what counts (CLAUDE.md: the
+ * service reads its own environment, never a client's).
+ */
+bool
+target_conversion_plugin_hosting_env_name(const char *id, char *buf, size_t buf_size);
+
+/*!
+ * Effective hosting of a loader-registered provider (roadmap §3.2, §3.4;
+ * discovery spec §3.3 `Hosting`): XRT_CONV_HOSTING_IN_SERVICE or
+ * XRT_CONV_HOSTING_SATELLITE, never AUTO.
+ *
+ * @p env_value (the `DXR_CONV_<ID>_HOSTING` value, NULL / "" = unset) wins
+ * over @p registered (XRT_CONV_HOSTING_*); an unrecognised env string is
+ * ignored. `auto` resolves to SATELLITE: from P2 every out-of-tree DLL runs
+ * in a conversion host by default. The built-in legacy adapter never comes
+ * through here (it is in-service, always). @p out_from_env, when non-NULL,
+ * says the override decided.
+ */
+uint32_t
+target_conversion_plugin_resolve_hosting(uint32_t registered, const char *env_value, bool *out_from_env);
+
+/*!
  * Subkeys of the `ConversionProviders` root that hold runtime POLICY, not a
  * provider row (discovery spec §3.1, "Root values"): `Policy\Lock`,
  * `PreferredProvider\<task>`, `Prewarm\<task>`. The registry reader skips
