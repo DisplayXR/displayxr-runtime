@@ -8,6 +8,8 @@
 #
 # Output: dist/displayxr-runtime-linux-<arch>-<version>.tar.gz containing
 #   bin/displayxr-cli bin/displayxr-service
+#   bin/displayxr-conversion-host  (ADR-053 D5: the conversion-provider satellite,
+#       spawned by the service from its own directory)
 #   bin/displayxr-gnome-extension-enable
 #   bin/displayxr-dashboard  (the DisplayXR Dashboard: self-contained .NET single
 #       file, beside the displayxr-cli it runs; from resolve_dashboard_bin.sh)
@@ -72,6 +74,10 @@ CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli
 # non-zero and, under pipefail + set -e, used to abort the script silently here
 # instead of reaching the "packaging without it" note below.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
+# ADR-053 P2: the conversion-host satellite. The service spawns it from its
+# own directory (one process per conversion-provider binary), so it ships
+# beside displayxr-service.
+HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
 VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
 
@@ -84,6 +90,10 @@ done
 }
 [ -n "$SERVICE_BIN" ] || {
     echo "error: displayxr-service not built — the tarball ships it (#1744); build with --hybrid" >&2
+    exit 1
+}
+[ -n "$HOST_BIN" ] || {
+    echo "error: displayxr-conversion-host not built — the tarball ships it beside the service (ADR-053 P2)" >&2
     exit 1
 }
 # Same hybrid-runtime guard as package_deb_linux.sh (here-string: see there).
@@ -133,6 +143,7 @@ if [ -n "$DASHBOARD_BIN" ]; then
     cp "$ROOT/scripts/linux/dashboard/displayxr-dashboard.png" "$STAGE/share/icons/"
 fi
 cp "$SERVICE_BIN" "$STAGE/bin/"
+cp "$HOST_BIN" "$STAGE/bin/"
 cp "$ROOT/scripts/linux/systemd/displayxr.socket" "$ROOT/scripts/linux/systemd/displayxr.service.in" \
     "$STAGE/share/systemd/user/"
 cp "$RUNTIME_SO" "$STAGE/lib/"

@@ -17,6 +17,7 @@ if [ -f "$AGENT" ]; then
     sudo rm -f "$AGENT"
 fi
 pkill -x displayxr-service 2>/dev/null || true
+pkill -x displayxr-conversion-host 2>/dev/null || true
 
 echo "Removing DisplayXR runtime..."
 # This recursive delete covers the runtime dylib, the

@@ -11,6 +11,8 @@
 # in package_linux.sh):
 #   /usr/lib/displayxr/bin/displayxr-cli
 #   /usr/lib/displayxr/bin/displayxr-service             (out-of-process compositor, #1744)
+#   /usr/lib/displayxr/bin/displayxr-conversion-host     (conversion-provider satellite,
+#       ADR-053 D5: spawned by the service from its own directory, one per provider)
 #   /usr/lib/displayxr/lib/openxr_displayxr.so           (the HYBRID runtime: in-process
 #       for ordinary apps, IPC to displayxr-service for XR_DXR_weave present-owners
 #       and workspace controllers — the Windows/macOS shape)
@@ -137,6 +139,10 @@ PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -
 # below turns that into the real error message.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
 VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
+# ADR-053 P2: the conversion-host satellite. The service spawns it from its
+# own directory (one process per conversion-provider binary), so it ships
+# beside displayxr-service.
+HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
@@ -151,6 +157,11 @@ done
 [ -n "$SERVICE_BIN" ] || {
     echo "error: displayxr-service not built — the .deb ships it (#1744). Build with" >&2
     echo "       scripts/build_linux.sh --hybrid (--no-build reuses whatever is in $BUILD_DIR)." >&2
+    exit 1
+}
+[ -n "$HOST_BIN" ] || {
+    echo "error: displayxr-conversion-host not built — the .deb ships it beside the service" >&2
+    echo "       (ADR-053 P2). Build with scripts/build_linux.sh --hybrid." >&2
     exit 1
 }
 
@@ -226,6 +237,7 @@ mkdir -p "$STAGE/DEBIAN" \
 
 install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
 install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
+install -m 0755 "$HOST_BIN"    "$STAGE/usr/lib/displayxr/bin/displayxr-conversion-host"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
 install -m 0644 "$VKLAYER_SO"  "$STAGE/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so"
@@ -356,6 +368,7 @@ STABLE_SONAMES=(
     libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
 ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO" "$VKLAYER_SO")
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$HOST_BIN" "$PLUGIN_SO")
 # The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
 # libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
 # HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor

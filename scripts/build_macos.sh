@@ -367,6 +367,24 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -f "$SERVICE_BIN" ]; then
   echo "Staged displayxr-service (SERVICE build) into _package bin/"
 fi
 
+# ADR-053 P2: the conversion-host satellite ships beside the service (the
+# service spawns it from its own directory). Same rpath treatment.
+HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
+if [ "$SERVICE_MODE" = "ON" ] && [ -n "$HOST_BIN" ]; then
+  cp "$HOST_BIN" "$PKG_DIR/bin/displayxr-conversion-host"
+  chmod u+w "$PKG_DIR/bin/displayxr-conversion-host"
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-conversion-host" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  echo "Staged displayxr-conversion-host into _package bin/"
+fi
+
 # Create MoltenVK ICD manifest
 cat > "$PKG_DIR/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
 {

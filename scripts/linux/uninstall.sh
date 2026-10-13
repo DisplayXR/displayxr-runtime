@@ -94,7 +94,7 @@ rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
 
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
-    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-dashboard" \
+    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-conversion-host" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
         "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
         "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
