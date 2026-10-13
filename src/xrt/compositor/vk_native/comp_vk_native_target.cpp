@@ -3346,6 +3346,17 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// Linux since #2060.)
 	have_present_wait = (target_present_wait_fn(target) != NULL);
 #endif
+	/*
+	 * #2068: stamp the weave start UNCONDITIONALLY, so the #206 weave->scanout
+	 * residual exists in every arm of an A/B — DXR_LATE_WEAVE=0 and the
+	 * grid-not-engaged default included. It was stamped only inside the
+	 * pacing tiers, so the off arm of a panel A/B printed no residual and the
+	 * benefit could not be stated. A pacing tier below re-stamps it after its
+	 * wait/sleep (the weave starts then); without one the weave starts here.
+	 * Also feeds weave_cost_ns, which nothing reads unless a tier engages.
+	 */
+	target->weave_start_ns = os_monotonic_get_ns();
+
 	bool grid_tier_allowed = true;
 #ifdef XRT_OS_LINUX_DESKTOP
 	// #2068: opt-in on desktop Linux, and off for the session once the learned
@@ -3692,6 +3703,8 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					    now_ns - started < 200ULL * 1000 * 1000) {
 						target->residual_ns = now_ns - started;
 						target->residual_samples++;
+						// No feeder to call the trace (it logs from its pump).
+						target_log_residual(target);
 					}
 				} else if (wres == VK_TIMEOUT && !target->present_wait_ever_ok &&
 				           ++target->present_wait_timeouts >= 3) {
