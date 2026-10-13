@@ -40,10 +40,18 @@ target_include_directories(comp_d3d11_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE
 target_link_libraries(comp_d3d11_conv_viewsyn PUBLIC xrt-interfaces aux_util PRIVATE ${D3D11_LIBRARY} d3dcompiler)
 
 # XR_DXR_lift (ADR-042) on the D3D11 service: the lift thread, its device and
-# the vendor module's display processor, plus the conversion core's D3D11 glue
-# (ADR-053 P1a). Its own small library so the WARP golden replay
+# the vendor module's display processor (d3d11_lift.cpp), plus the conversion
+# core's D3D11 GPU glue on the service device (d3d11_conv_gpu.cpp, split out in
+# ADR-053 P1b). Its own small library so the WARP golden replay
 # (tests_lift_dp_golden) links it without the whole service compositor.
-add_library(comp_d3d11_lift STATIC d3d11_lift.cpp d3d11_lift.h)
+add_library(
+	comp_d3d11_lift STATIC
+	d3d11_conv_gpu.cpp
+	d3d11_conv_gpu.h
+	d3d11_lift.cpp
+	d3d11_lift.h
+	d3d11_lift_internal.h
+	)
 target_include_directories(comp_d3d11_lift PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(
 	comp_d3d11_lift
