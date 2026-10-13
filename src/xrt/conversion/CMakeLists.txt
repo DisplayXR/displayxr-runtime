@@ -20,6 +20,8 @@ add_library(
 	# ADR-053 P2 (#2032): the satellite's wire format and the supervisor's
 	# pure lifecycle FSM (no process, no clock: the proxy drives it).
 	conv_host_wire.h
+	conv_supervisor.c
+	conv_supervisor.h
 	)
 add_library(displayxr::conversion_core ALIAS conv_core)
 # Consumers include "conversion/conv_*.h".
