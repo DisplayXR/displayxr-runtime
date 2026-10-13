@@ -55,6 +55,8 @@ extern "C" {
 #define CONV_IMAGE_USAGE_PROVIDER_OUT (1u << 1)  //!< a provider writes it
 #define CONV_IMAGE_USAGE_RENDER_TARGET (1u << 2) //!< the reference view synthesis renders into it
 #define CONV_IMAGE_USAGE_EXPORT (1u << 3)        //!< exported to clients (shared + fence)
+//! #2030: a GPU mirror of a CPU-memory provider result (conv_image_alloc_ops::upload)
+#define CONV_IMAGE_USAGE_MIRROR (1u << 4)
 /*! @} */
 
 //! A runtime-allocated image the core asks the GPU glue for.
@@ -80,6 +82,13 @@ struct conv_image_alloc_ops
 {
 	bool (*alloc)(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out);
 	void (*free)(void *ud, struct xrt_conv_image *img);
+	/*! Optional (#2030): copy CPU-memory image @p src into @p dst, a
+	 *  CONV_IMAGE_USAGE_MIRROR image this allocator made with @p src's extent,
+	 *  format and layer count. A CPU-only provider's views / depth then reach
+	 *  GPU-only consumers (the weave path samples a texture): the dispatcher
+	 *  uploads each result into a per-ring-slot mirror and publishes the
+	 *  mirror. NULL = CPU results are published as they are. */
+	bool (*upload)(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst);
 	void *ud;
 };
 

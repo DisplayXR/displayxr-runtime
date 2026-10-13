@@ -50,6 +50,12 @@ struct conv_ring_slot
 	uint32_t sized_key;  //!< outputs / views the targets were sized for
 	uint64_t alloc_gen;  //!< bumps on every (re)allocation
 
+	/* #2030: GPU mirrors of CPU-memory results (views, depth), published in
+	 * their place; allocated on first need, kept while the extent holds. */
+	struct xrt_conv_image mirror[CONV_RING_TARGETS];
+	uint32_t mirror_layers[CONV_RING_TARGETS];
+	bool mirrored[CONV_RING_TARGETS]; //!< the published result is the mirror
+
 	/* Published result. */
 	uint32_t written;
 	struct xrt_conv_views_info views_info;

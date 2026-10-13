@@ -1717,3 +1717,97 @@ TEST_CASE("stream: still-image dedupe with the sim provider (converted stops gro
 	}
 }
 #endif
+
+
+/*
+ *
+ * #2030: CPU-memory provider results reach GPU-only consumers.
+ *
+ */
+
+namespace {
+
+std::atomic<int> g_mirror_uploads{0};
+
+//! A "GPU" allocator for mirrors: CPU memory tagged as a shared texture.
+bool
+mirror_alloc(void *ud, const conv_image_request *req, xrt_conv_image *out)
+{
+	if (!cpu_alloc(ud, req, out)) {
+		return false;
+	}
+	if ((req->usage & CONV_IMAGE_USAGE_MIRROR) != 0) {
+		out->memory_kind = XRT_CONV_MEM_WIN32_NT_HANDLE; // what the D3D11 glue hands back
+	}
+	return true;
+}
+
+bool
+mirror_upload(void *, const xrt_conv_image *src, const xrt_conv_image *dst)
+{
+	if (src->memory_kind != XRT_CONV_MEM_CPU || dst->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE ||
+	    src->byte_size != dst->byte_size) {
+		return false;
+	}
+	std::memcpy(dst->cpu_ptr, src->cpu_ptr, (size_t)src->byte_size);
+	g_mirror_uploads++;
+	return true;
+}
+
+} // namespace
+
+TEST_CASE("stream: a CPU provider's views and depth are published through a GPU mirror", "[conv_lanes][mirror]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+	                                     XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH, XRT_CONV_CAP_EXPLICIT_VIEWPOINTS);
+	c->convert_ms = 1;
+	for (const bool with_upload : {true, false}) {
+		CAPTURE(with_upload);
+		g_mirror_uploads = 0;
+		conv_core_config cfg{};
+		cfg.alloc.alloc = mirror_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.alloc.upload = with_upload ? mirror_upload : nullptr;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		conv_core *core = nullptr;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		conv_provider_desc d{};
+		d.id = f.id;
+		d.probe_order = 100;
+		d.enabled = true;
+		d.iface = &f.iface;
+		d.inst = conv_fake_inst(&f);
+		REQUIRE(conv_core_add_provider(core, &d) >= 0);
+
+		auto sd = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH, 2);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core, 1, &sd, nullptr, &cr) == XRT_SUCCESS);
+		for (int i = 0; i < 3; i++) {
+			REQUIRE(submit(core, cr.stream_id));
+			REQUIRE(wait_until([&] { return drained(core, cr.stream_id); }, 3000));
+		}
+		conv_result r{};
+		REQUIRE(conv_core_stream_acquire(core, cr.stream_id, false, &r) == XRT_SUCCESS);
+		REQUIRE((r.written & XRT_CONV_OUT_VIEWS) != 0u);
+		REQUIRE((r.written & XRT_CONV_OUT_DEPTH) != 0u);
+		const uint32_t want_kind = with_upload ? XRT_CONV_MEM_WIN32_NT_HANDLE : XRT_CONV_MEM_CPU;
+		CHECK(r.views.memory_kind == want_kind);
+		CHECK(r.depth.memory_kind == want_kind);
+		// The published bytes are this frame's (the fake fills views with the frame id).
+		const auto *px = static_cast<const uint8_t *>(r.views.cpu_ptr);
+		REQUIRE(px != nullptr);
+		CHECK(px[0] == (uint8_t)(r.frame_id & 0xFF));
+		CHECK(px[r.views.byte_size - 1] == (uint8_t)(r.frame_id & 0xFF));
+		CHECK(g_mirror_uploads.load() == (with_upload ? 2 * (int)stats(core, cr.stream_id).converted : 0));
+		conv_core_stream_release(core, cr.stream_id, r.ring_slot);
+		REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
+		conv_core_destroy(&core);
+		CHECK(g_live_images.load() == 0); // mirrors freed with their ring slots
+	}
+	conv_fake_fini(&f);
+}

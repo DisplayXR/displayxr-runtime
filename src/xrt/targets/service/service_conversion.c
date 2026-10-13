@@ -180,6 +180,20 @@ tramp_free(void *ud, struct xrt_conv_image *img)
 	}
 }
 
+//! #2030: a CPU result into a GPU mirror (the GPU allocator made the mirror).
+static bool
+tramp_upload(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	(void)ud;
+	bool ok = false;
+	struct conv_image_alloc_ops gpu;
+	if (gpu_enter(&gpu)) {
+		ok = gpu.upload != NULL && gpu.upload(gpu.ud, src, dst);
+		gpu_leave();
+	}
+	return ok;
+}
+
 void
 service_conversion_set_gpu_alloc(const struct conv_image_alloc_ops *ops)
 {
@@ -774,6 +788,7 @@ service_conversion_start(void)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.alloc.alloc = tramp_alloc;
 	cfg.alloc.free = tramp_free;
+	cfg.alloc.upload = tramp_upload;
 	// cfg.viewsyn / cfg.readback: installed once the D3D11 device exists
 	// (on_gpu, conv_core_set_gpu). The S7 observer needs no device.
 	cfg.create_convergence_observer = conv_observer_autoconv_factory;

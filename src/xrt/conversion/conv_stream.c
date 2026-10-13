@@ -206,6 +206,7 @@ teardown(struct conv_core *core, struct conv_stream *st)
 	for (uint32_t i = 0; i < U_LIFT_RING_SIZE; i++) {
 		for (uint32_t k = 0; k < CONV_RING_TARGETS; k++) {
 			free_image(core, &st->out[i].targets[k]);
+			free_image(core, &st->out[i].mirror[k]);
 		}
 	}
 	if (st->has_observer && st->observer.ops != NULL && st->observer.ops->destroy != NULL) {
@@ -402,6 +403,8 @@ ensure_targets(struct conv_core *core,
 	unregister_out(o);
 	for (uint32_t k = 0; k < CONV_RING_TARGETS; k++) {
 		free_image(core, &o->targets[k]);
+		free_image(core, &o->mirror[k]);
+		o->mirrored[k] = false;
 	}
 
 	struct xrt_conv_output_desc desc;
@@ -476,6 +479,49 @@ ensure_targets(struct conv_core *core,
 	o->sized_key = key;
 	o->alloc_gen++;
 	return true;
+}
+
+/*!
+ * #2030: a CPU-memory views / depth result, uploaded into the slot's GPU
+ * mirror (dispatcher thread, no lock held). False = publish the CPU image.
+ */
+static bool
+upload_mirror(struct conv_core *core,
+              struct conv_stream *st,
+              struct conv_ring_slot *o,
+              uint32_t k,
+              const struct xrt_conv_image *src,
+              uint32_t layers)
+{
+	if (core->cfg.alloc.upload == NULL || src->memory_kind != XRT_CONV_MEM_CPU || src->cpu_ptr == NULL) {
+		return false;
+	}
+	struct xrt_conv_image *m = &o->mirror[k];
+	if (m->memory_kind == 0 || m->width != src->width || m->height != src->height || m->format != src->format ||
+	    o->mirror_layers[k] != layers) {
+		free_image(core, m);
+		struct conv_image_request req;
+		memset(&req, 0, sizeof(req));
+		req.width = src->width;
+		req.height = src->height;
+		req.format = src->format;
+		req.array_layers = layers;
+		req.role = k == CONV_RING_VIEWS ? XRT_CONV_OUT_VIEWS : XRT_CONV_OUT_DEPTH;
+		req.usage = CONV_IMAGE_USAGE_MIRROR | CONV_IMAGE_USAGE_EXPORT;
+		req.stream_id = st->id;
+		// The runtime samples it, not the provider: any GPU kind will do.
+		if (!core->cfg.alloc.alloc(core->cfg.alloc.ud, &req, m) || m->memory_kind == 0) {
+			memset(m, 0, sizeof(*m));
+			return false;
+		}
+		if (m->memory_kind == XRT_CONV_MEM_CPU) {
+			free_image(core, m); // no GPU allocator: nothing to mirror into
+			return false;
+		}
+		o->mirror_layers[k] = layers;
+		o->alloc_gen++;
+	}
+	return core->cfg.alloc.upload(core->cfg.alloc.ud, src, m);
 }
 
 static void
@@ -819,6 +865,18 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		if (ok && (pf->provider_out.written & XRT_CONV_OUT_DEPTH) != 0) {
 			st->last_depth = pf->result.depth_info;
 			st->has_last_depth = true;
+		}
+		// #2030: CPU-memory views / depth reach GPU-only consumers.
+		if (ok) {
+			const uint32_t vl = s.pipe.views_layout == XRT_CONV_VIEWS_ARRAY && s.pipe.view_count > 0
+			                        ? s.pipe.view_count
+			                        : 1u;
+			o->mirrored[CONV_RING_VIEWS] =
+			    (pf->result.written & XRT_CONV_OUT_VIEWS) != 0 &&
+			    upload_mirror(core, st, o, CONV_RING_VIEWS, &pf->result.views, vl);
+			o->mirrored[CONV_RING_DEPTH] =
+			    (pf->result.written & XRT_CONV_OUT_DEPTH) != 0 &&
+			    upload_mirror(core, st, o, CONV_RING_DEPTH, &pf->result.depth, 1u);
 		}
 	}
 
@@ -1479,8 +1537,8 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	out->latency_ns = meta.done_ns > meta.submit_ns ? meta.done_ns - meta.submit_ns : 0;
 	out->ring_slot = (uint32_t)slot;
 	out->written = o->written;
-	out->views = o->targets[CONV_RING_VIEWS];
-	out->depth = o->targets[CONV_RING_DEPTH];
+	out->views = o->mirrored[CONV_RING_VIEWS] ? o->mirror[CONV_RING_VIEWS] : o->targets[CONV_RING_VIEWS];
+	out->depth = o->mirrored[CONV_RING_DEPTH] ? o->mirror[CONV_RING_DEPTH] : o->targets[CONV_RING_DEPTH];
 	out->confidence = o->targets[CONV_RING_CONFIDENCE];
 	out->disparity = o->targets[CONV_RING_DISPARITY];
 	out->views_info = o->views_info;
