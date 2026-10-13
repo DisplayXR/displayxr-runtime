@@ -367,14 +367,17 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 	switch (e->ev) {
 	case CONV_HOST_EV_LOST: {
 		const bool crash = conv_host_exit_is_crash(e->detail);
+		const bool update = conv_host_exit_is_update(e->detail);
 		// After a crash the host comes back on its own (backoff) and says
-		// RESTORED; an orderly exit is respawned by the next demand, so the
-		// next warm must be allowed to reach it.
-		hs->down = crash;
+		// RESTORED; after an update (exit 20) it comes back once the
+		// maintenance mutex is free (or the registry row changes) and says
+		// RESTORED too; an orderly exit is respawned by the next demand, so
+		// the next warm must be allowed to reach it.
+		hs->down = crash || update;
 		hs->rewarm = false;
 		hs->restarts++;
 		U_LOG_W("[conv] provider %s: host process exited (code %d%s); streams stay, outputs keep their last result",
-		        id, (int)e->detail, crash ? ", crash" : "");
+		        id, (int)e->detail, crash ? ", crash" : update ? ", closed for update" : "");
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider != p) {
 				continue;
@@ -382,6 +385,10 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 			if (crash) {
 				// WARMING(restarting, n), or FAILED(crash_loop) at the FSM's own cutoff.
 				struct conv_readiness_event ev = mk_ev(CONV_EV_HOST_CRASH, t);
+				apply_locked(core, i, &ev);
+			} else if (update) {
+				// WARMING(updating): no crash record; RESTORED re-warms it.
+				struct conv_readiness_event ev = mk_ev(CONV_EV_HOST_UPDATING, t);
 				apply_locked(core, i, &ev);
 			} else if (core->reg.rows[i].rd.state == XRT_CONV_STATE_READY) {
 				// Orderly exit (idle, update, adapter change): the model went

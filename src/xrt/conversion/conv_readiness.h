@@ -45,6 +45,8 @@ extern "C" {
 #define CONV_REASON_BINARY_MISSING (CONV_REASON_LOCAL_BASE + 2u) //!< ABSENT: provider binary not found
 #define CONV_REASON_ABI_REJECTED (CONV_REASON_LOCAL_BASE + 3u)   //!< ABSENT: ABI major mismatch / negotiate failed
 #define CONV_REASON_NOT_DECLARED (CONV_REASON_LOCAL_BASE + 4u)   //!< ABSENT: the provider no longer declares it
+//! WARMING(updating): the satellite host closed for an update (exit 20, roadmap §3.6); no crash accounting
+#define CONV_REASON_UPDATING (CONV_REASON_LOCAL_BASE + 5u)
 
 /*
  *
@@ -93,6 +95,9 @@ enum conv_readiness_event_type
 	//! so the event is refused.
 	CONV_EV_EVICTED,
 	CONV_EV_HOST_CRASH,       //!< abnormal host exit or watchdog kill
+	//! The satellite host closed for an update (exit 20): READY / WARMING ->
+	//! WARMING(updating). No crash record, no backoff; the respawn re-warms it.
+	CONV_EV_HOST_UPDATING,
 	CONV_EV_CRASH_LOOP,       //!< supervisor-declared cutoff (the FSM also counts on its own)
 	CONV_EV_DISABLE,          //!< `conv disable`, Enabled = 0
 	CONV_EV_ENABLE,           //!< `conv enable`, Enabled = 1

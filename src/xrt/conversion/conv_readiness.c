@@ -269,6 +269,16 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 		return CONV_RD_IGNORED;
 	}
 
+	case CONV_EV_HOST_UPDATING:
+		// Closed for update (roadmap §3.6): not a crash, nothing recorded. The
+		// tasks report WARMING(updating) until the respawned host re-warms them.
+		if (s == XRT_CONV_STATE_READY || s == XRT_CONV_STATE_WARMING) {
+			const uint32_t res = enter(r, XRT_CONV_STATE_WARMING, CONV_REASON_UPDATING, now);
+			r->restarting = false;
+			return res | CONV_RD_ACT_WARM;
+		}
+		return CONV_RD_IGNORED;
+
 	case CONV_EV_CRASH_LOOP:
 		if (s == XRT_CONV_STATE_DISABLED) {
 			return CONV_RD_IGNORED;
@@ -419,6 +429,7 @@ conv_reason_name(uint32_t reason)
 	case CONV_REASON_BINARY_MISSING: return "binary_missing";
 	case CONV_REASON_ABI_REJECTED: return "abi_rejected";
 	case CONV_REASON_NOT_DECLARED: return "not_declared";
+	case CONV_REASON_UPDATING: return "updating";
 	default: return "unknown";
 	}
 }

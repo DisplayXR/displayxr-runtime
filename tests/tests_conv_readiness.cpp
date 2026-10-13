@@ -237,6 +237,49 @@ TEST_CASE("conv_readiness: spec-3 mapping")
 	}
 }
 
+TEST_CASE("conv_readiness: host closed for update -> WARMING(updating), never a crash")
+{
+	// #2056 (roadmap §3.6): exit 20 is no crash: no record, no backoff, no cutoff.
+	conv_readiness r = at(XRT_CONV_STATE_READY);
+	uint64_t t = 3000 * S;
+	for (int i = 0; i < 10; i++) {
+		CAPTURE(i);
+		uint32_t bits = fire(r, ev(CONV_EV_HOST_UPDATING, t));
+		CHECK(r.state == XRT_CONV_STATE_WARMING);
+		CHECK(r.reason == CONV_REASON_UPDATING);
+		CHECK_FALSE(r.restarting);
+		CHECK((bits & CONV_RD_CHANGED) != 0);
+		CHECK((bits & CONV_RD_ACT_WARM) != 0);
+		CHECK(r.crash_count == 0u);
+		CHECK(conv_readiness_next_deadline(&r) == 0u); // no timer of any kind
+		fire(r, ev(CONV_EV_WARM_OK, t + S));
+		CHECK(r.state == XRT_CONV_STATE_READY);
+		CHECK(r.reason == 0u);
+		t += 10 * S;
+	}
+	CHECK(std::string(conv_reason_name(CONV_REASON_UPDATING)) == "updating");
+
+	SECTION("a crash while updating is the crash path")
+	{
+		fire(r, ev(CONV_EV_HOST_UPDATING, t));
+		fire(r, ev(CONV_EV_HOST_CRASH, t + S));
+		CHECK(r.state == XRT_CONV_STATE_WARMING);
+		CHECK(r.reason == 0u);
+		CHECK(r.restarting);
+		CHECK(r.restart_attempt == 1u);
+	}
+	SECTION("cold, terminal and disabled rows are untouched")
+	{
+		for (uint32_t s0 : {(uint32_t)XRT_CONV_STATE_INSTALLED, (uint32_t)XRT_CONV_STATE_EVICTED,
+		                    (uint32_t)XRT_CONV_STATE_FAILED, (uint32_t)XRT_CONV_STATE_DISABLED}) {
+			CAPTURE(s0);
+			conv_readiness c = at(s0);
+			CHECK((fire(c, ev(CONV_EV_HOST_UPDATING, t)) & CONV_RD_IGNORED) != 0);
+			CHECK(c.state == s0);
+		}
+	}
+}
+
 TEST_CASE("conv_readiness: host crash -> WARMING(restarting, n); crash loop cutoff")
 {
 	conv_readiness r = at(XRT_CONV_STATE_READY);
