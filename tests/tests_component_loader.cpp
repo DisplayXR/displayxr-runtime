@@ -593,6 +593,71 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	                                          (int)out.size()) == 0);
 }
 
+TEST_CASE("component loader: the per-user Enabled overlay (N3a) -- HKCU wins, flags stay consistent",
+          "[component_loader]")
+{
+	// The overlay reads HKCU\<registry_root>\<id>\Enabled, so point the class
+	// at a throwaway HKCU root. (HKLM <root>\Policy\Lock is never written by a
+	// test; its absence is the "no lock" case exercised here.)
+	wchar_t wroot[128];
+	swprintf(wroot, 128, L"Software\\DisplayXR-Test\\Overlay-%lu", GetCurrentProcessId());
+	char root[128];
+	std::snprintf(root, sizeof(root), "Software\\DisplayXR-Test\\Overlay-%lu", GetCurrentProcessId());
+
+	HKEY r = reg_create(HKEY_CURRENT_USER, wroot);
+	HKEY a = reg_create(r, L"user-off"); // HKLM enabled, user disables
+	reg_dword(a, L"Enabled", 0);
+	RegCloseKey(a);
+	HKEY b = reg_create(r, L"user-on"); // HKLM disabled, user re-enables
+	reg_dword(b, L"Enabled", 1);
+	RegCloseKey(b);
+	HKEY c = reg_create(r, L"broken"); // malformed rows are never overlaid
+	reg_dword(c, L"Enabled", 0);
+	RegCloseKey(c);
+	RegCloseKey(r);
+
+	Class cls = plain_class("xrtTestNegotiate", 3);
+	cls.registry_root = root;
+
+	std::vector<Entry> rows;
+	rows.push_back(*make_entry("user-off", 10));
+	rows.push_back(*make_entry("user-on", 20));
+	rows[1].enabled = false;
+	rows[1].flags |= TARGET_COMPONENT_FLAG_DISABLED;
+	std::snprintf(rows[1].reason, sizeof(rows[1].reason), "%s", "disabled (Enabled = 0)");
+	rows.push_back(*make_entry("untouched", 30));
+	rows.push_back(*make_entry("broken", 40));
+	target_component_mark_malformed(&rows[3], "missing required 'Binary' value");
+
+	const int applied = target_component_apply_user_overlay(&cls, rows.data(), rows.size());
+	RegDeleteTreeW(HKEY_CURRENT_USER, wroot);
+	RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\DisplayXR-Test"); // only if now empty
+
+	CHECK(applied == 2);
+
+	CHECK_FALSE(rows[0].enabled);
+	CHECK((rows[0].flags & TARGET_COMPONENT_FLAG_DISABLED) != 0u);
+	CHECK((rows[0].flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0u);
+	CHECK(std::string(rows[0].reason).find("this user") != std::string::npos);
+
+	CHECK(rows[1].enabled);
+	CHECK((rows[1].flags & TARGET_COMPONENT_FLAG_DISABLED) == 0u);
+	CHECK((rows[1].flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0u);
+	CHECK(std::string(rows[1].reason).empty());
+
+	CHECK(rows[2].enabled);
+	CHECK(rows[2].flags == 0u);
+
+	CHECK(rows[3].enabled); // the HKCU value is not applied to a malformed row
+	CHECK((rows[3].flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) == 0u);
+	CHECK((rows[3].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0u);
+
+	// Degenerate arguments are refused without touching the registry.
+	CHECK(target_component_apply_user_overlay(nullptr, rows.data(), rows.size()) == 0);
+	CHECK(target_component_apply_user_overlay(&cls, nullptr, 1) == 0);
+	CHECK(target_component_apply_user_overlay(&cls, rows.data(), 0) == 0);
+}
+
 #endif
 
 TEST_CASE("component loader: the production enumeration of an empty class is well-formed", "[component_loader]")

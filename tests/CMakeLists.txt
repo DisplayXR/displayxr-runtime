@@ -46,6 +46,7 @@ set(tests
     tests_aux_display_desktop_select
     tests_cli_dims_check
     tests_cli_metres_check
+    tests_cli_input_predict
     tests_comp_vblank_grid
     tests_comp_present_feedback
     tests_comp_late_weave_adapt
@@ -769,6 +770,15 @@ target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/sr
 # VERIFIED claim has physical metres" (the 0 m screen trap). Header-only.
 target_include_directories(tests_cli_metres_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
+
+# N3a (ADR-054): the `input list` prediction rule — PreferredPlugin over
+# ProbeOrder, Enabled=0 never predicted — and the provider-id check behind
+# `input enable|disable|use`. Header-only; the loader header it includes is
+# only used for the descriptor struct.
+target_include_directories(
+	tests_cli_input_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_cli_input_predict PRIVATE xrt-interfaces)
 
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is
 # header-only and deliberately free of Vulkan and DXGI types — that is what

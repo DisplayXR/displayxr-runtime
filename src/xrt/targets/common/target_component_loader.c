@@ -1019,6 +1019,71 @@ target_component_enumerate(const struct target_component_class *cls, struct targ
 	return n;
 }
 
+int
+target_component_apply_user_overlay(const struct target_component_class *cls,
+                                    struct target_component_entry *entries,
+                                    size_t n)
+{
+#ifdef XRT_OS_WINDOWS
+	if (cls == NULL || cls->registry_root == NULL || entries == NULL || n == 0) {
+		return 0;
+	}
+	wchar_t wroot[256];
+	if (!tc_u2w(cls->registry_root, wroot, (int)(sizeof(wroot) / sizeof(wroot[0])))) {
+		return 0;
+	}
+
+	// HKLM `<root>\Policy\Lock` = 1: IT policy, the machine value wins for
+	// every row (64-bit view, where the rows live).
+	wchar_t wpolicy[320];
+	swprintf(wpolicy, sizeof(wpolicy) / sizeof(wpolicy[0]), L"%ls\\Policy", wroot);
+	DWORD lock = 0;
+	DWORD bytes = sizeof(lock);
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, wpolicy, L"Lock", RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &lock,
+	                 &bytes) == ERROR_SUCCESS &&
+	    lock == 1) {
+		U_LOG_I("%s: Policy\\Lock is set — per-user Enabled values are ignored.", tc_tag(cls));
+		return 0;
+	}
+
+	int applied = 0;
+	for (size_t i = 0; i < n; i++) {
+		struct target_component_entry *e = &entries[i];
+		if (!tc_usable(e)) {
+			continue;
+		}
+		wchar_t wid[64];
+		if (!tc_u2w(e->id, wid, (int)(sizeof(wid) / sizeof(wid[0])))) {
+			continue;
+		}
+		wchar_t wpath[384];
+		swprintf(wpath, sizeof(wpath) / sizeof(wpath[0]), L"%ls\\%ls", wroot, wid);
+		DWORD v = 0;
+		bytes = sizeof(v);
+		if (RegGetValueW(HKEY_CURRENT_USER, wpath, L"Enabled", RRF_RT_REG_DWORD, NULL, &v, &bytes) !=
+		    ERROR_SUCCESS) {
+			continue;
+		}
+		e->enabled = v != 0;
+		e->flags |= TARGET_COMPONENT_FLAG_USER_OVERLAY;
+		if (e->enabled) {
+			e->flags &= ~TARGET_COMPONENT_FLAG_DISABLED;
+			e->reason[0] = '\0';
+		} else {
+			e->flags |= TARGET_COMPONENT_FLAG_DISABLED;
+			tc_copy(e->reason, sizeof(e->reason), "disabled for this user (HKCU Enabled = 0)");
+		}
+		applied++;
+	}
+	return applied;
+#else
+	(void)cls;
+	(void)entries;
+	(void)n;
+	return 0;
+#endif
+}
+
 const char *
 target_component_load_result_str(enum target_component_load_result r)
 {
