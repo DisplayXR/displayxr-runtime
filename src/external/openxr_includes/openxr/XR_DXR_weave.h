@@ -137,8 +137,10 @@
  * Sync on Android is the macOS contract: the caller finishes its GPU writes
  * before submitting and the submit returns only once the woven output is
  * GPU-complete (no fence handle, fenceValue is a monotonic counter). The
- * fd-based (`sync_file`) acquire/release variant arrived in v10, for desktop
- * Linux only (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR).
+ * fd-based (`sync_file`) acquire/release variant arrived in v10 for desktop
+ * Linux (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR) and reached Android in
+ * v20 — see "Android sync_file fences" below. A caller that chains neither keeps
+ * this synchronous contract on every version.
  *
  * Per-region hardware wish (SPEC_VERSION 8, browser#88 Phase 3 item A). Until v8
  * the weave path drove the panel's physical 3D element ALL-OR-NOTHING: a present-
@@ -196,7 +198,8 @@
  * a per-output serial) and XrWeaveWindowLogicalOriginDXR (in, chained on
  * XrWeaveBindWindowInfoDXR — the caller's own LOGICAL origin + scale, echoed
  * back verbatim), so a present-owner can tag its own Wayland commit for
- * move-synchronised drag.
+ * move-synchronised drag. (13..19: see the per-version notes below; 20 =
+ * XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR accepted on Android.)
  *
  * An unreadable overlay refuses the submit on desktop Linux (SPEC_VERSION 16).
  * No new structure: from v16 the desktop-Linux engine, like the D3D11 service
@@ -237,6 +240,37 @@
  * single-rect submit is not. Windows (D3D11 service) only; segmentCount is 0
  * elsewhere. xrWeaveSnapWindowRectDXR snaps against the lattice of the screen
  * holding the majority of the window (same hysteresis as ADR-047 Amendment 2).
+ *
+ * Android sync_file fences (SPEC_VERSION 20). No new structure: from v20 the
+ * Android engine accepts v10's XrWeaveSubmitSyncDXR and XrWeaveOutputSyncDXR on
+ * an AHardwareBuffer submit (no dma-buf descriptor — the AHardwareBuffer IS the
+ * Android transport), so a present-owner can pipeline its GPU work with the weave
+ * instead of serialising the frame on the CPU:
+ *
+ *  - IN. XrWeaveSubmitSyncDXR::acquireFenceFd is a sync_file that signals when
+ *    the caller's GPU has finished WRITING the input (and overlay) AND finished
+ *    READING the previous woven output — one fence, both hazards, exactly as on
+ *    desktop Linux (the woven AHardwareBuffer is single-buffered). The runtime
+ *    waits it on the GPU before it touches either. -1 = no fence (the caller has
+ *    already finished, the v9 contract).
+ *  - OUT. XrWeaveOutputSyncDXR::releaseFenceFd receives a per-frame sync_file
+ *    that signals when THIS submit's woven output is complete, and
+ *    xrWeaveSubmitDXR then returns WITHOUT waiting for the weave on the CPU. It
+ *    also marks the end of the runtime's reads of this submit's input and
+ *    overlay: the caller must not write them again before it signals. -1
+ *    means the submit completed synchronously (the runtime fell back to its CPU
+ *    wait for that frame — a display processor that cannot join the GPU chain,
+ *    a dropped frame, the service kill switch): the output is ready now.
+ *  - NEITHER chained = unchanged: xrWeaveSubmitDXR returning is the completion
+ *    signal. The two halves are independent (acquire alone keeps the
+ *    synchronous return; release alone assumes the caller finished, as in v9).
+ *
+ * FD ownership is v10's: an acquire fd is the runtime's once xrWeaveSubmitDXR
+ * returns XR_SUCCESS (and stays the caller's on any other result); a release fd
+ * is the caller's to close. Capability = extensionVersion >= 20 on Android;
+ * before v20 the Android runtime refuses XrWeaveSubmitSyncDXR
+ * (XR_ERROR_VALIDATION_FAILURE) and writes -1 into XrWeaveOutputSyncDXR. The
+ * dma-buf structs stay desktop-Linux only.
  *
  * Android: an overlay is per submit, and an unreadable one refuses (SPEC_VERSION
  * 18). No new structure: from v18 the Android engine applies the v16 rule too
@@ -330,7 +364,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 19
+#define XR_DXR_weave_SPEC_VERSION 20
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -514,8 +548,8 @@ typedef enum XrWeaveHandleKindDXR {
  * RETURNS only once the woven output is GPU-complete (XrWeaveOutputDXR::fence
  * stays NULL, @c fenceValue is a plain monotonic counter). The fd-based
  * (`sync_file`) acquire/release variant is v10's XrWeaveSubmitSyncDXR /
- * XrWeaveOutputSyncDXR, desktop Linux only; it is a latency optimisation, never a
- * correctness requirement.
+ * XrWeaveOutputSyncDXR — desktop Linux from v10, Android from v20; it is a
+ * latency optimisation, never a correctness requirement.
  */
 typedef struct XrWeaveSubmitHandlesDXR {
     XrStructureType          type;        //!< XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR
@@ -680,7 +714,8 @@ typedef struct XrWeaveSubmitFlatRegionsDXR {
  *
  * Desktop Linux (v10): chain an XrWeaveOutputDmabufDXR to receive the woven
  * output as a typed dma-buf, and an XrWeaveOutputSyncDXR to receive a per-frame
- * release fence; @c fence is never set there. Without the dma-buf chain an
+ * release fence; @c fence is never set there. Android (v20): chain an
+ * XrWeaveOutputSyncDXR for the same per-frame release fence. Without the dma-buf chain an
  * OPAQUE_FD export rides @c weavedTexture as (void*)(intptr_t)fd.
  */
 typedef struct XrWeaveOutputDXR {
@@ -876,10 +911,11 @@ typedef struct XrWeaveOutputDmabufDXR {
 } XrWeaveOutputDmabufDXR;
 
 /*!
- * @brief Acquire fence for a dma-buf submit (spec v10, desktop Linux, #1699).
+ * @brief Acquire fence for a submit (spec v10 desktop Linux, #1699; spec v20 Android).
  *
- * Chain onto XrWeaveSubmitInfoDXR::next alongside an XrWeaveDmabufDescDXR (it is
- * rejected without one). @c acquireFenceFd is a sync_file that signals when the
+ * Chain onto XrWeaveSubmitInfoDXR::next. Desktop Linux: alongside an
+ * XrWeaveDmabufDescDXR (it is rejected without one). Android (v20): on an
+ * AHardwareBuffer submit, no descriptor. @c acquireFenceFd is a sync_file that signals when the
  * caller's GPU has finished WRITING the input (and overlay) AND finished READING
  * the previous woven output — one fence covers both hazards. The runtime waits it
  * on the GPU before it touches either, so the caller need not finish its GPU work
@@ -893,7 +929,7 @@ typedef struct XrWeaveSubmitSyncDXR {
 } XrWeaveSubmitSyncDXR;
 
 /*!
- * @brief Release fence for this frame's woven output (spec v10, desktop Linux).
+ * @brief Release fence for this frame's woven output (spec v10 desktop Linux, v20 Android).
  *
  * Chain onto XrWeaveOutputDXR::next. Unlike the woven dma-buf (once per
  * allocation) this is PER FRAME: every successful xrWeaveSubmitDXR writes a fresh

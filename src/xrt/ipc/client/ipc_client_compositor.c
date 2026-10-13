@@ -1146,6 +1146,129 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
 }
 #endif // XRT_OS_LINUX_DESKTOP
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * XR_DXR_weave v20: the Android sync_file submit. A call carries one handle
+ * type and the submit's in_handles are AHardwareBuffers, so the acquire
+ * sync_file goes first in its own weave_set_acquire_fence call (only when there
+ * is one), and the service consumes it with the weave_submit_sync right after
+ * it on this same connection. The reply's out handle is the per-frame release
+ * sync_file, present only when @p want_release_fence asked for one and the
+ * service produced it.
+ *
+ * FD ownership: @p acquire_fence_fd is NOT consumed (SCM_RIGHTS installs a copy
+ * in the service; oxr_weave.c closes the original once the whole
+ * xrWeaveSubmitDXR has succeeded). @p out_release_fence_fd is a NEW fd this
+ * process owns, or -1 (= the weave completed synchronously).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+                                             xrt_graphics_buffer_handle_t in_handle,
+                                             int32_t rect_x,
+                                             int32_t rect_y,
+                                             uint32_t rect_w,
+                                             uint32_t rect_h,
+                                             uint32_t rect_count,
+                                             const struct xrt_rect *rects,
+                                             xrt_graphics_buffer_handle_t overlay_handle,
+                                             uint32_t overlay_rect_count,
+                                             const struct xrt_rect *overlay_rects,
+                                             bool weave_frame_first,
+                                             const struct xrt_weave_atlas_layout *layout,
+                                             uint32_t flat_rect_count,
+                                             const struct xrt_rect *flat_rects,
+                                             bool mono_in_2d,
+                                             bool overlay_unchanged,
+                                             float overlay_filter_strength,
+                                             int acquire_fence_fd,
+                                             bool want_release_fence,
+                                             int *out_release_fence_fd,
+                                             bool *out_have_output,
+                                             uint32_t *out_width,
+                                             uint32_t *out_height,
+                                             uint64_t *out_fence_value,
+                                             struct xrt_eye_positions *out_eyes,
+                                             uint32_t *out_segment_count,
+                                             uint32_t *out_lift_cursor_mask)
+{
+	if (xc == NULL || out_release_fence_fd == NULL || out_have_output == NULL || out_width == NULL ||
+	    out_height == NULL || out_fence_value == NULL || out_eyes == NULL || out_lift_cursor_mask == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_release_fence_fd = -1;
+	*out_lift_cursor_mask = 0;
+	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (overlay_rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (overlay_rect_count > 0 && overlay_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX || (flat_rect_count > 0 && flat_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+	U_ZERO(out_eyes);
+	if (out_segment_count != NULL) {
+		*out_segment_count = 0;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_arg_weave_submit args = {0};
+	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
+	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
+	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
+	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
+
+	xrt_result_t xret = XRT_SUCCESS;
+	if (acquire_fence_fd >= 0) {
+		// Copies the fd into the service; does not consume ours.
+		xrt_graphics_sync_handle_t acquire[1] = {acquire_fence_fd};
+		xret = ipc_call_weave_set_acquire_fence(icc->ipc_c, acquire, 1);
+		if (xret != XRT_SUCCESS) {
+			return xret;
+		}
+	}
+
+	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
+	uint32_t handle_count = have_overlay ? 2u : 1u;
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
+	uint32_t segs = 0;
+	uint32_t lift_cursor_mask = 0;
+	xrt_graphics_sync_handle_t release[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
+	xret = ipc_call_weave_submit_sync(icc->ipc_c, &args, want_release_fence ? 1u : 0u, handles, handle_count, &have,
+	                                  &w, &h, &fv, &eyes, &segs, &lift_cursor_mask, release, 1);
+	if (xret != XRT_SUCCESS) {
+		// A refused submit sends no fence, but never leak one if a service did.
+		if (release[0] >= 0) {
+			u_graphics_sync_unref(&release[0]);
+		}
+		return xret;
+	}
+	*out_release_fence_fd = release[0];
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	*out_eyes = eyes;
+	if (out_segment_count != NULL) {
+		*out_segment_count = segs;
+	}
+	*out_lift_cursor_mask = lift_cursor_mask;
+	return XRT_SUCCESS;
+}
+#endif // XRT_OS_ANDROID
+
 xrt_result_t
 comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
                                                   int32_t origin_x,

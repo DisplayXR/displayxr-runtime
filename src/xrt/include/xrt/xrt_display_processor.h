@@ -53,11 +53,13 @@ typedef struct VkImage_T *VkImage_XDP;
 typedef struct VkImageView_T *VkImageView;
 typedef struct VkFramebuffer_T *VkFramebuffer;
 typedef struct VkRenderPass_T *VkRenderPass;
+typedef struct VkSemaphore_T *VkSemaphore_XDP; // == vulkan.h's VkSemaphore (xrt_display_processor_vk::set_weave_sync)
 #else
 typedef uint64_t VkImage_XDP;
 typedef uint64_t VkImageView;
 typedef uint64_t VkFramebuffer;
 typedef uint64_t VkRenderPass;
+typedef uint64_t VkSemaphore_XDP;
 #endif
 
 // Re-use Vulkan enum values without including vulkan.h.

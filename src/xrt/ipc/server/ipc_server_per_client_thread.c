@@ -124,10 +124,18 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// If the session hasn't been stopped, destroy the compositor.
 	ipc_server_client_destroy_session_and_compositor(ics);
 
-#ifdef XRT_OS_LINUX_DESKTOP
-	// XR_DXR_weave v10 (#1699): the last weave reply's release sync_file / output
-	// dup were parked for a next call that will never come.
+#ifdef XRT_OS_LINUX
+	// XR_DXR_weave v10 (#1699) / v20 (Android): the last weave reply's release
+	// sync_file / output dup were parked for a next call that will never come.
 	ipc_server_client_weave_flush_deferred_fds(ics);
+	// v20: an acquire fence delivered for a submit that never came.
+	if (ics->weave_have_pending_acquire) {
+		if (ics->weave_pending_acquire_fd >= 0) {
+			close(ics->weave_pending_acquire_fd);
+		}
+		ics->weave_have_pending_acquire = false;
+		ics->weave_pending_acquire_fd = -1;
+	}
 #endif
 
 	// XR_DXR_lift (ADR-042): streams are owned by the connection, not a session.

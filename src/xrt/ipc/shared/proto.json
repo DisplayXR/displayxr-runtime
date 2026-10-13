@@ -789,6 +789,28 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}
 	},
 
+	"weave_set_acquire_fence": {
+		"in_handles": {"type": "xrt_graphics_sync_handle_t", "name": "acquire_fences"}
+	},
+
+	"weave_submit_sync": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_weave_submit"},
+			{"name": "want_release_fence", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "fence_value", "type": "uint64_t"},
+			{"name": "eyes", "type": "struct xrt_eye_positions"},
+			{"name": "segment_count", "type": "uint32_t"},
+			{"name": "lift_cursor_mask", "type": "uint32_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"},
+		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}
+	},
+
 	"weave_get_output_dmabuf": {
 		"out": [
 			{"name": "have_output", "type": "bool"},

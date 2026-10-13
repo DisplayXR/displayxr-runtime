@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -1137,6 +1138,47 @@ maybe_dump()
 }
 
 //! One present-owner frame: paint -> upload -> weave -> composite -> present.
+/*
+ * XR_DXR_weave v20 functional probe, OFF by default: `setprop
+ * debug.dxr.weave.syncfd 1`. Chains XrWeaveOutputSyncDXR (release fence) and,
+ * from the second frame, XrWeaveSubmitSyncDXR with a dup of the PREVIOUS
+ * frame's release fence as the acquire (already signalled by then — it
+ * exercises the service's SYNC_FD import + the fd plumbing both ways). Each
+ * release fence is polled (bounded); counts are logged every 60 frames. The
+ * app still drains its own ring before the submit, so the acquire is
+ * redundant here by construction — this is a plumbing check, not a perf one.
+ */
+static int g_sync_prev_release = -1;
+static uint32_t g_sync_fds = 0, g_sync_minus1 = 0, g_sync_signalled = 0, g_sync_timeouts = 0;
+
+static bool
+sync_probe_enabled()
+{
+	char v[PROP_VALUE_MAX] = {0};
+	return __system_property_get("debug.dxr.weave.syncfd", v) > 0 && v[0] == '1';
+}
+
+static void
+sync_probe_after_submit(int release_fd)
+{
+	if (release_fd < 0) {
+		g_sync_minus1++;
+		return;
+	}
+	g_sync_fds++;
+	struct pollfd pfd = {release_fd, POLLIN, 0};
+	int r = poll(&pfd, 1, 1000);
+	if (r > 0) {
+		g_sync_signalled++;
+	} else {
+		g_sync_timeouts++;
+	}
+	if (g_sync_prev_release >= 0) {
+		close(g_sync_prev_release);
+	}
+	g_sync_prev_release = release_fd;
+}
+
 bool
 render_frame()
 {
@@ -1186,12 +1228,32 @@ render_frame()
 	XrWeaveOutputDXR out = {};
 	out.type = XR_TYPE_WEAVE_OUTPUT_DXR;
 
+	// v20 probe (see sync_probe_enabled).
+	const bool sync_probe = sync_probe_enabled();
+	XrWeaveSubmitSyncDXR sync_in = {};
+	XrWeaveOutputSyncDXR sync_out = {};
+	if (sync_probe) {
+		sync_in.type = XR_TYPE_WEAVE_SUBMIT_SYNC_DXR;
+		sync_in.next = info.next;
+		sync_in.acquireFenceFd = g_sync_prev_release >= 0 ? dup(g_sync_prev_release) : -1;
+		info.next = &sync_in;
+		sync_out.type = XR_TYPE_WEAVE_OUTPUT_SYNC_DXR;
+		sync_out.releaseFenceFd = -1;
+		out.next = &sync_out;
+	}
+
 	const uint64_t t0 = now_ns();
 	XrResult res = g_app.weave_submit(g_app.xr_session, &info, &out);
 	const uint64_t dt = now_ns() - t0;
 	if (res != XR_SUCCESS) {
+		if (sync_probe && sync_in.acquireFenceFd >= 0) {
+			close(sync_in.acquireFenceFd); // stays ours on failure (v10 ownership rule)
+		}
 		LOGE("xrWeaveSubmitDXR failed: %d", (int)res);
 		return false;
+	}
+	if (sync_probe) {
+		sync_probe_after_submit(sync_out.releaseFenceFd);
 	}
 	g_app.submit_ns_total += dt;
 	g_app.submit_samples++;
@@ -1244,6 +1306,11 @@ render_frame()
 		g_app.submit_ns_total = 0;
 		g_app.submit_ns_max = 0;
 		g_app.submit_samples = 0;
+		if (sync_probe) {
+			LOGW("WEAVE_CLIENT v20 syncfd: release fds=%u (signalled=%u timeouts=%u), release -1=%u", g_sync_fds,
+			     g_sync_signalled, g_sync_timeouts, g_sync_minus1);
+			g_sync_fds = g_sync_minus1 = g_sync_signalled = g_sync_timeouts = 0;
+		}
 	}
 	return true;
 }

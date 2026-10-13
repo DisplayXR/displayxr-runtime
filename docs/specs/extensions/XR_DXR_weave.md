@@ -466,10 +466,52 @@ Notes that only bite on Android:
 - The AHardwareBuffer IPC transport now frames an explicit handle count, because
   `AHardwareBuffer_recvHandleFromUnixSocket` blocks: a receiver expecting one buffer that the
   sender did not send would hang rather than fail.
-- **Follow-up, not a correctness gap:** an fd-based (`sync_file`) acquire/release pair would let
-  the submit return before the GPU finishes. Today's synchronous contract is the simplest one
-  that is correct, and it is what macOS already ships. v10 defines that pair (§5d) but accepts
-  it on desktop Linux only; bringing it to Android is a later, additive step.
+- The table's sync rows are the **default** (a caller that chains no fence). From v20 an Android
+  caller may chain the `sync_file` pair instead — next section.
+
+### 5b-sync. Android `sync_file` fences (v20)
+
+v10 defined the pair for desktop Linux (§5d); v20 accepts it on Android with **no new
+structure**, on the ordinary AHardwareBuffer submit (no `XrWeaveDmabufDescDXR` — the
+AHardwareBuffer is the Android transport). It exists because the synchronous contract
+CPU-serialises the whole frame: the caller finishes its GPU work (`GrSyncCpu::kYes` in the
+browser), the IPC submit blocks while the service waits its fence, and only then does the caller
+draw back and present. With zero frames in flight Adreno parks at its DVFS floor and the rate
+goes throughput-bound (browser audit, 2026-10-11: NP02J tablet 53.5 / 44 weaves/s on hello-cube /
+shop hero vs ~60 with clocks pinned).
+
+| | Contract |
+|---|---|
+| `XrWeaveSubmitSyncDXR::acquireFenceFd` | sync_file signalled when the caller's GPU has finished WRITING the input (and overlay) AND READING the previous woven output — one fence, both hazards (the woven AHardwareBuffer is single-buffered). Waited on the GPU before the runtime touches either. -1 = none (v9). |
+| `XrWeaveOutputSyncDXR::releaseFenceFd` | per-frame sync_file, signalled when THIS submit's woven output is complete — and the runtime's reads of its input/overlay with it. `xrWeaveSubmitDXR` returns without the service's CPU wait. -1 = the frame completed synchronously (a fallback below); the output is ready now. |
+| neither chained | unchanged: returning is completion. |
+| fd ownership | v10's: the acquire fd is the runtime's on `XR_SUCCESS`, the caller's otherwise; the release fd is the caller's to close. |
+| capability | `extensionVersion >= 20` on Android. |
+
+How the service runs it (`comp_multi_weave_android.c`, "sync_file weave"):
+
+- The acquire fd is imported (temporarily, `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`) into
+  a binary semaphore that the frame's FIRST batch waits — the pre-weave batch under the
+  self-submitting-DP split (`DXR_ANDROID_WEAVE_SPLIT`), otherwise the only batch. The final
+  batch signals an exportable semaphore whose `vkGetSemaphoreFdKHR(SYNC_FD)` export is the
+  release fence; the CPU fence wait moves to the top of the next submit (before any command
+  buffer or resource of the in-flight frame is reused).
+- A **self-submitting DP** (the Leia CNSDK weaver submits its own batches during
+  `process_atlas`) sits between the runtime's two batches, so it joins the chain through the
+  Vulkan DP slot **`set_weave_sync`** (slot 17, `XRT_DP_VK_HAS_WEAVE_SYNC`; see
+  `docs/reference/xrt_plugin_iface.md`): it waits the runtime's pre-weave semaphore before its
+  first atlas read and signals a semaphore the runtime's post-weave batch waits. A recording DP
+  (`sim_display`) needs nothing.
+- **Fallbacks** (that frame only, always correct): the DP lacks / declines the slot, the DP reports
+  the frame dropped (`get_last_frame_dropped` — semaphores are recreated after a queue drain),
+  the device has no SYNC_FD semaphores, the #1277 weave satellite is on, the split is disabled for
+  a self-submitting DP, or the kill switch **`debug.dxr.weave_sync_fd=0`**. Each CPU-polls the
+  acquire fence, completes synchronously and answers -1; the decision is logged once per change
+  (`weave v20 sync_file: ...`).
+- Wire: a call carries one handle type and the submit's are AHardwareBuffers, so the acquire fd
+  goes first in `weave_set_acquire_fence` (only when there is one) and `weave_submit_sync`
+  carries the submit + a want-release flag, returning the release fd as its out handle
+  (SCM_RIGHTS). A caller that chains nothing sends exactly the pre-v20 `weave_submit`.
 
 ## 5c. Desktop Linux platform mapping — the snap (#1588), and a full weave platform (#1699)
 
@@ -1099,6 +1141,10 @@ it keeps such an overlay off the wire there instead.
 
 **v19 needs no gate to send**: an older runtime skips the struct and it stays zero, which reads as
 "one display processor, use the base eyes".
+
+| 20 | No new structure: v10's `XrWeaveSubmitSyncDXR` (acquire `sync_file`, in) and `XrWeaveOutputSyncDXR` (per-frame release `sync_file`, out) are **accepted on Android**, on the AHardwareBuffer submit with no dma-buf descriptor (§5b-sync). A caller that chains the release struct gets the release fence and the submit returns without the service's CPU wait for the weave; a caller that chains neither keeps the synchronous contract. Before v20 the Android runtime refused `XrWeaveSubmitSyncDXR` (`XR_ERROR_VALIDATION_FAILURE`) and wrote -1 into the release struct. |
+
+**v20 is a gate to send**: an Android caller chains `XrWeaveSubmitSyncDXR` only on `extensionVersion >= 20` (an older Android runtime refuses the submit). Chaining `XrWeaveOutputSyncDXR` is harmless on any version — -1 means "already complete".
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return

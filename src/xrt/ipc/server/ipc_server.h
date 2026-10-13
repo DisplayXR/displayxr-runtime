@@ -192,10 +192,10 @@ struct ipc_client_state
 	//! late to be honoured and is refused.
 	bool handles_sent;
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX // desktop Linux (v10 dma-buf) + Android (v20 sync_file)
 	/*!
-	 * XR_DXR_weave v10 (#1699): fds this process handed to a weave reply and
-	 * must close AFTER that reply is on the wire.
+	 * XR_DXR_weave v10 (#1699) / v20 (Android): fds this process handed to a
+	 * weave reply and must close AFTER that reply is on the wire.
 	 *
 	 * The generated server dispatch sends a handler's out handles with
 	 * ipc_send_fds, which (SCM_RIGHTS) installs a copy in the client and does
@@ -210,6 +210,16 @@ struct ipc_client_state
 	 */
 	int weave_deferred_close_fds[4];
 	uint32_t weave_deferred_close_count;
+
+	/*!
+	 * XR_DXR_weave v20 (Android): the acquire sync_file of the NEXT
+	 * weave_submit_sync, delivered by weave_set_acquire_fence just before it
+	 * (a call carries one handle type, and the submit's in_handles are
+	 * AHardwareBuffers). Owned by this client state until a submit consumes
+	 * it; teardown closes a leftover. Flag-gated, so a zeroed state is empty.
+	 */
+	int weave_pending_acquire_fd;
+	bool weave_have_pending_acquire;
 #endif
 
 	/*!
@@ -635,10 +645,10 @@ ipc_server_client_thread(void *_ics);
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics);
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX
 /*!
  * Close every fd parked in ics->weave_deferred_close_fds (XR_DXR_weave v10,
- * #1699). Called at the top of the weave dma-buf handlers and at client
+ * #1699; v20 on Android). Called at the top of the weave dma-buf handlers and at client
  * teardown. Only safe once the reply that carried those fds has been sent.
  */
 void
