@@ -265,27 +265,37 @@ resolve_sibling_exe(const wchar_t *name, wchar_t *out, size_t cap)
 	return true;
 }
 
-//! True if the Control Panel GUI is installed alongside the service.
-static bool
-control_panel_available(void)
+//! The runtime GUI the tray opens: the DisplayXR Dashboard (Avalonia,
+//! src/dashboard/) when it is installed, else the ImGui Control Panel it
+//! replaces (still shipped until its removal PR; a package built without
+//! dotnet has no dashboard). NULL when neither sits beside the service.
+static const wchar_t *
+runtime_gui_exe(void)
 {
+	static const wchar_t *const candidates[] = {L"displayxr-dashboard.exe", L"displayxr-control-panel.exe"};
 	wchar_t path[MAX_PATH];
-	return resolve_sibling_exe(L"displayxr-control-panel.exe", path, ARRAYSIZE(path)) &&
-	       GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+	for (size_t i = 0; i < ARRAYSIZE(candidates); i++) {
+		if (resolve_sibling_exe(candidates[i], path, ARRAYSIZE(path)) &&
+		    GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+			return candidates[i];
+		}
+	}
+	return NULL;
 }
 
-//! Launch the sibling Control Panel GUI (best-effort; runs in the user's
-//! session since the service tray itself does).
+//! Launch the runtime GUI (best-effort; runs in the user's session since the
+//! service tray itself does).
 static void
-launch_control_panel(void)
+launch_runtime_gui(void)
 {
+	const wchar_t *exe = runtime_gui_exe();
 	wchar_t path[MAX_PATH];
-	if (!resolve_sibling_exe(L"displayxr-control-panel.exe", path, ARRAYSIZE(path))) {
+	if (exe == NULL || !resolve_sibling_exe(exe, path, ARRAYSIZE(path))) {
 		return;
 	}
-	// ShellExecute "open" is enough — the panel is a normal GUI exe and we
-	// don't need its handle. If it's already open this just brings up a
-	// second instance; the panel is cheap and stateless, so that's fine.
+	// ShellExecute "open" is enough — we don't need its handle. A second
+	// launch of the dashboard raises the first (it is single-instance per
+	// logon session); the Control Panel just opens another cheap window.
 	ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
 }
 
@@ -305,12 +315,15 @@ show_context_menu(HWND hwnd)
 	// Main menu
 	HMENU menu = CreatePopupMenu();
 
-	// Control Panel (runtime diagnostics GUI) — top-level entry, shown only
-	// when the panel exe is installed alongside the service. It's a runtime-
-	// level diagnostic, not a workspace-app action, so it lives on the
+	// Runtime GUI (the Dashboard, or the Control Panel it replaces) — top-level
+	// entry, shown only when one is installed alongside the service. It's a
+	// runtime-level diagnostic, not a workspace-app action, so it lives on the
 	// always-on service tray rather than a workspace controller's submenu.
-	if (control_panel_available()) {
-		AppendMenuW(menu, MF_STRING, IDM_CONTROL_PANEL, L"DisplayXR Control Panel");
+	const wchar_t *gui = runtime_gui_exe();
+	if (gui != NULL) {
+		AppendMenuW(menu, MF_STRING, IDM_CONTROL_PANEL,
+		            wcscmp(gui, L"displayxr-dashboard.exe") == 0 ? L"DisplayXR Dashboard"
+		                                                         : L"DisplayXR Control Panel");
 		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	}
 
@@ -1223,9 +1236,9 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		case IDM_WORKSPACE_AUTO: set_workspace_mode(SERVICE_CHILD_AUTO); break;
 		case IDM_WORKSPACE_DISABLE: set_workspace_mode(SERVICE_CHILD_DISABLE); break;
 
-		// Open the runtime diagnostics Control Panel
+		// Open the runtime GUI (Dashboard, else Control Panel)
 		case IDM_CONTROL_PANEL:
-			launch_control_panel();
+			launch_runtime_gui();
 			break;
 
 		// Start on login toggle
