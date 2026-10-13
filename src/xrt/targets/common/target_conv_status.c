@@ -13,6 +13,7 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_plugin.h"
 
+#include "conversion/conv_dp_lift_describe.h"
 #include "conversion/conv_registry.h"
 #include "conversion/conv_readiness.h"
 #include "conversion/conv_select.h"
@@ -30,8 +31,8 @@
 #include <windows.h>
 #endif
 
-#define DP_LIFT_ID "dp-lift"
-#define DP_LIFT_PROBE_ORDER 150u
+#define DP_LIFT_ID CONV_DP_LIFT_ID
+#define DP_LIFT_PROBE_ORDER CONV_DP_LIFT_PROBE_ORDER
 
 static void
 copy_str(char *dst, size_t cap, const char *src)
@@ -224,7 +225,9 @@ policy_enabled_override(const struct target_conv_policy *p, const char *id)
 /*
  *
  * The static dp-lift describe (spec §4.5). Runtime-internal: no DLL, no
- * negotiate, no factory call. #2003's adapter supersedes it in the service.
+ * negotiate, no factory call. The capabilities come from the one static
+ * describe the in-service adapter refines (conv_dp_lift_describe_static,
+ * #2030), so headless and in-service rows never disagree.
  *
  */
 
@@ -243,32 +246,6 @@ dpl_probe(struct xrt_conversion_plugin_instance **out_inst)
 	return XRT_SUCCESS;
 }
 
-static void
-dpl_fill(uint32_t index, struct xrt_conv_capability *c)
-{
-	const uint32_t tasks[3] = {XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_TASK_VIEWS_MONO};
-	c->cap_id = index + 1; // 1 DEPTH_MONO, 2 DEPTH_VIDEO, 3 VIEWS_MONO (spec §4.5)
-	c->task = tasks[index];
-	c->lanes = XRT_CONV_LANE_STREAM;
-	c->input_kinds = XRT_CONV_INPUT_MONO;
-	c->import_memory_kinds = XRT_CONV_MEM_CPU | XRT_CONV_MEM_WIN32_NT_HANDLE;
-	c->licence_class = XRT_CONV_LICENCE_UNKNOWN; // grandfathered: exempt from the gate
-	c->commercial_ok = 0;
-	copy_str(c->backend, sizeof(c->backend), "dp-lift");
-	copy_str(c->display_name, sizeof(c->display_name), "Display plug-in lift module");
-	if (c->task == XRT_CONV_TASK_VIEWS_MONO) {
-		c->outputs = XRT_CONV_OUT_VIEWS;
-		c->min_views = 2;
-		c->max_views = XRT_CONV_MAX_VIEWS; // refined from lift_get_caps by the live adapter
-		// Required for every VIEWS_* row by validation; the live adapter
-		// refines it from the plug-in's struct_size (ADR-048 fields).
-		c->flags = XRT_CONV_CAP_EXPLICIT_VIEWPOINTS;
-	} else {
-		c->outputs = XRT_CONV_OUT_DEPTH;
-		c->flags = c->task == XRT_CONV_TASK_DEPTH_VIDEO ? XRT_CONV_CAP_TEMPORAL : 0u;
-	}
-}
-
 static xrt_result_t
 dpl_describe(struct xrt_conversion_plugin_instance *inst,
              uint32_t index,
@@ -277,16 +254,12 @@ dpl_describe(struct xrt_conversion_plugin_instance *inst,
 {
 	(void)inst;
 	if (out_count != NULL) {
-		*out_count = 3;
+		*out_count = CONV_DP_LIFT_CAP_COUNT;
 	}
 	if (out == NULL) {
 		return XRT_SUCCESS;
 	}
-	if (index >= 3) {
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	dpl_fill(index, out);
-	return XRT_SUCCESS;
+	return conv_dp_lift_describe_static(index, out) ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
 static xrt_result_t

@@ -42,8 +42,6 @@ constexpr uint32_t kMaxStreams = 64;
 constexpr uint64_t kPollNs = 1000ull * 1000ull * 1000ull;
 //! Cancel polling granularity inside a warm (contract: ≤ 250 ms).
 constexpr uint64_t kCancelStepNs = 50ull * 1000ull * 1000ull;
-//! Module activation is slow (licence check, engine build): give the watchdog room.
-constexpr uint32_t kEstWarmupMs = 60000;
 //! Warms of the shared module closer together than this (one wave: the
 //! prewarm tasks + a create) share one activation attempt. Real retries (the
 //! 15 s backoff, an installer's registry change) are far apart.
@@ -227,44 +225,22 @@ max_views_of(const conv_dp_lift_snapshot &s)
 	return mv > XRT_CONV_MAX_VIEWS ? XRT_CONV_MAX_VIEWS : mv;
 }
 
+/*! The static describe (conv_dp_lift_describe_static, shared with the
+ *  headless status), refined from what the live module answered. */
 void
 fill_cap(const conv_dp_lift_snapshot &s, uint32_t index, xrt_conv_capability *c)
 {
-	static const uint32_t k_tasks[3] = {XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_TASK_DEPTH_VIDEO,
-	                                    XRT_CONV_TASK_VIEWS_MONO};
-	c->cap_id = index + 1;
-	c->task = k_tasks[index];
-	c->lanes = XRT_CONV_LANE_STREAM;
-	c->input_kinds = XRT_CONV_INPUT_MONO;
-	c->import_memory_kinds = XRT_CONV_MEM_CPU | XRT_CONV_MEM_WIN32_NT_HANDLE;
-	c->import_sync_kinds = (1u << XRT_CONV_SYNC_NONE) | (1u << XRT_CONV_SYNC_KEYED_MUTEX);
-	c->input_formats = 1u << XRT_CONV_FMT_RGBA8_UNORM;
-	c->depth_output_format = XRT_CONV_FMT_R32_FLOAT;
-	c->max_concurrent = 1;
-	c->depth_measure = XRT_CONV_MEASURE_PLANAR;
-	c->intrinsics_source = XRT_CONV_INTRINSICS_ASSUMED;
-	// Grandfathered (spec §4.5): UNKNOWN, never COMMERCIAL; exempt from the gate.
-	c->licence_class = XRT_CONV_LICENCE_UNKNOWN;
-	c->commercial_ok = 0;
-	copy_str(c->display_name, sizeof(c->display_name), "Display plug-in lift module");
+	(void)conv_dp_lift_describe_static(index, c);
 	if (s.have_module) {
 		copy_str(c->backend, sizeof(c->backend), s.caps.backend);
 		copy_str(c->model_id, sizeof(c->model_id), s.caps.backend);
 		copy_str(c->model_version, sizeof(c->model_version), s.caps.module_version);
-		c->max_streams = s.caps.max_streams != 0 ? s.caps.max_streams : 4;
+		c->max_streams = s.caps.max_streams != 0 ? s.caps.max_streams : CONV_DP_LIFT_DEFAULT_MAX_STREAMS;
 		c->est_latency_ms = (uint32_t)(s.caps.typical_latency_ns / 1000000ull);
-	} else {
-		copy_str(c->backend, sizeof(c->backend), "dp-lift");
-		c->max_streams = 4;
 	}
-	c->est_warmup_ms = kEstWarmupMs;
 
 	if (c->task == XRT_CONV_TASK_VIEWS_MONO) {
-		c->min_views = 2;
 		c->max_views = max_views_of(s);
-		// The runtime always passes the viewpoints it resolved, and a module
-		// must give them precedence (the lift DP has no tracker session).
-		c->flags = XRT_CONV_CAP_EXPLICIT_VIEWPOINTS;
 		if (s.has_depth_slot) {
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA; // ADR-048 era: rect + nominal z honoured
 		}
@@ -343,12 +319,12 @@ xrt_result_t
 dpl_describe_cap(xrt_conversion_plugin_instance *inst, uint32_t index, xrt_conv_capability *out, uint32_t *out_count)
 {
 	if (out_count != nullptr) {
-		*out_count = 3;
+		*out_count = CONV_DP_LIFT_CAP_COUNT;
 	}
 	if (out == nullptr) {
 		return XRT_SUCCESS;
 	}
-	if (index >= 3) {
+	if (index >= CONV_DP_LIFT_CAP_COUNT) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	conv_dp_lift_snapshot s;

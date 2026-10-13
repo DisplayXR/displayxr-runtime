@@ -472,12 +472,24 @@ TEST_CASE("dp-lift: static describe, INSTALLED before any module loads, selftest
 		if (c.task == XRT_CONV_TASK_DEPTH_VIDEO) {
 			CHECK((c.flags & XRT_CONV_CAP_TEMPORAL) != 0u);
 		}
+		// #2030: one static describe. Before any module answered, the adapter
+		// says byte for byte what the headless status (target_conv_status.c)
+		// says, because both read conv_dp_lift_describe_static -- except for
+		// what the live DP alone knows (it carries the depth slot).
+		xrt_conv_capability s{};
+		s.struct_size = (uint32_t)sizeof(s);
+		REQUIRE(conv_dp_lift_describe_static(i, &s));
+		xrt_conv_capability live = c;
+		live.flags &= ~XRT_CONV_CAP_OFFAXIS_CAMERA;
+		CHECK(std::memcmp(&s, &live, sizeof(live)) == 0);
 		xrt_conv_state st{};
 		st.struct_size = (uint32_t)sizeof(st);
 		REQUIRE(iface->get_state(inst, c.cap_id, &st) == XRT_SUCCESS);
 		CHECK(st.state == XRT_CONV_STATE_INSTALLED);
 	}
 	CHECK(f.activations == 0); // describing never instantiates the module
+	xrt_conv_capability none{};
+	CHECK_FALSE(conv_dp_lift_describe_static(CONV_DP_LIFT_CAP_COUNT, &none));
 
 	// No lift factory: ABSENT, and retryable (a plug-in swap may bring one).
 	{
