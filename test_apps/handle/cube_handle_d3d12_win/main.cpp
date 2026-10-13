@@ -19,6 +19,7 @@
 #include "input_handler.h"
 #include "logging.h"
 #include "projection_depth.h"
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "text_overlay.h"
 #include "xr_session.h"
 
@@ -608,8 +609,137 @@ static const float kCursorCubeHeight = 0.03f; // RenderScene(..., cubeHeight = 0
 static const float kCursorHeight = 0.04f;     // hint footprint, fraction of canvas height
 
 static bool g_cursorRuntimeDraw = false;
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3), as in cube_handle_metal_macos:
+//   DISPLAYXR_CURSOR_DEPTH_SOURCE=measured  show a synthetic stereo PHOTO
+//                                         (test_apps/common/stereo_photo_test.h)
+//                                         instead of the cube and let the runtime
+//                                         block-match the views under the cursor
+//                                         (no hit test, no depth). Needs spec v7.
+//   DISPLAYXR_STEREO_PHOTO=1              the photo without the measured source
+//                                         (a cost baseline).
+static bool g_cursorMeasured = false;
+static bool g_stereoPhoto = false;
 static bool g_cursorCustomSprite = false;
 static XrSwapchain g_cursorSprite = XR_NULL_HANDLE;
+
+// The stereo photo: one upload buffer per view, filled once per view size, and
+// copied into the view's region of the swapchain image (CopyTextureRegion). It
+// follows RenderScene's state contract: the image is COMMON between passes.
+static struct {
+    uint32_t w = 0, h = 0;
+    int eyes = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    ComPtr<ID3D12Resource> upload[8];
+} g_photoCache;
+
+static bool StereoPhotoWriteView(D3D12Renderer& r, ID3D12Resource* target, int eye, int eyes, uint32_t x,
+                                 uint32_t y, uint32_t w, uint32_t h)
+{
+    const D3D12_RESOURCE_DESC desc = target->GetDesc();
+    bool bgra;
+    switch (desc.Format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: bgra = true; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: bgra = false; break;
+    default: {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARN("stereo photo: swapchain format %d is not 8-bit RGBA/BGRA - drawing the cube instead",
+                     (int)desc.Format);
+        }
+        return false;
+    }
+    }
+    if (eye < 0 || eye >= 8 || w == 0 || h == 0 || x + w > desc.Width || y + h > desc.Height) return false;
+    if (g_photoCache.w != w || g_photoCache.h != h || g_photoCache.eyes != eyes || g_photoCache.format != desc.Format) {
+        g_photoCache.w = w;
+        g_photoCache.h = h;
+        g_photoCache.eyes = eyes;
+        g_photoCache.format = desc.Format;
+        for (int e = 0; e < 8; e++) g_photoCache.upload[e].Reset();
+        D3D12_RESOURCE_DESC view = desc;
+        view.Width = w;
+        view.Height = h;
+        view.DepthOrArraySize = 1;
+        view.MipLevels = 1;
+        UINT rows = 0;
+        UINT64 rowSize = 0, total = 0;
+        r.device->GetCopyableFootprints(&view, 0, 1, 0, &g_photoCache.footprint, &rows, &rowSize, &total);
+        LOG_INFO("stereo photo: %d views of %ux%u (foreground +%.1f px crossed, ground %.1f px, stripes %.1f px)",
+                 eyes, w, h, dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w,
+                 dxr_test::kPhotoStripesD * w);
+    }
+    ComPtr<ID3D12Resource>& up = g_photoCache.upload[eye];
+    if (!up) {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp = g_photoCache.footprint;
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC buf = {};
+        buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf.Width = (UINT64)fp.Footprint.RowPitch * h;
+        buf.Height = 1;
+        buf.DepthOrArraySize = 1;
+        buf.MipLevels = 1;
+        buf.SampleDesc.Count = 1;
+        buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(r.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&up)))) {
+            LOG_ERROR("stereo photo: upload buffer creation failed (view %d)", eye);
+            return false;
+        }
+        std::vector<uint8_t> px;
+        dxr_test::PhotoFill(eye, eyes, w, w, h, bgra, px);
+        uint8_t* mapped = nullptr;
+        const D3D12_RANGE none = {0, 0};
+        if (FAILED(up->Map(0, &none, reinterpret_cast<void**>(&mapped)))) {
+            up.Reset();
+            return false;
+        }
+        for (uint32_t row = 0; row < h; row++) {
+            memcpy(mapped + (size_t)row * fp.Footprint.RowPitch, px.data() + (size_t)row * w * 4, (size_t)w * 4);
+        }
+        up->Unmap(0, nullptr);
+    }
+
+    if (FAILED(r.commandAllocator->Reset()) || FAILED(r.commandList->Reset(r.commandAllocator.Get(), nullptr))) {
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = target;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    r.commandList->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = target;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = up.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = g_photoCache.footprint;
+    r.commandList->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    r.commandList->ResourceBarrier(1, &barrier);
+    if (FAILED(r.commandList->Close())) return false;
+    ID3D12CommandList* lists[] = {r.commandList.Get()};
+    r.commandQueue->ExecuteCommandLists(1, lists);
+    r.fenceValue++;
+    r.commandQueue->Signal(r.fence.Get(), r.fenceValue);
+    if (r.fence->GetCompletedValue() < r.fenceValue) {
+        r.fence->SetEventOnCompletion(r.fenceValue, r.fenceEvent);
+        WaitForSingleObject(r.fenceEvent, INFINITE);
+    }
+    return true;
+}
 
 static void CursorQuatRotate(const XrQuaternionf& q, float vx, float vy, float vz, XrVector3f& out)
 {
@@ -1074,6 +1204,12 @@ static void RenderThreadFunc(
                         cursorDrawInfo.sizeMeters = g_cursorCustomSprite ? 0.01f : 0.0f;
                         cursorDrawInfo.visible = XR_TRUE;
                         XrCursorDepthDrawStateDXR cursorDrawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
+                        // Spec v7: the runtime measures the disparity under the
+                        // cursor. It is looked up behind the hint, so it rides the
+                        // hint's chain (ahead of the rig struct); the hit test's
+                        // hasContent / nearestPoint are then ignored.
+                        XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+                        measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
                         bool cursorInCanvas = false;
                         if (g_hasCursorDepthExt && windowW > 0 && windowH > 0) {
                             float u = -1.0f, v = -1.0f;
@@ -1108,8 +1244,12 @@ static void RenderThreadFunc(
                                         ? XR_TRUE
                                         : XR_FALSE;
                                 cursorHint.nearestPoint = hit;
-                                // Chain: locateInfo -> hint [-> draw info] -> (rig struct).
+                                // Chain: locateInfo -> hint [-> draw info] [-> source] -> (rig struct).
                                 const void* hintTail = locateInfo.next;
+                                if (g_cursorMeasured) {
+                                    measuredSource.next = hintTail;
+                                    hintTail = &measuredSource;
+                                }
                                 if (g_cursorRuntimeDraw) {
                                     cursorDrawInfo.next = hintTail;
                                     hintTail = &cursorDrawInfo;
@@ -1371,12 +1511,19 @@ static void RenderThreadFunc(
                                     projMatrix = xr->projMatrices[si];
                                 }
 
-                                RenderScene(*renderer, swapchainTexture, rtvIdx,
-                                    vpX, vpY,
-                                    vpW, vpH,
-                                    viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor,
-                                    eye == 0);  // clear only on first eye
+                                // Amendment 3 test content: the stereo photo in
+                                // place of the cube (3D only; 2D keeps the cube).
+                                const bool photoDrawn =
+                                    g_stereoPhoto && !monoMode &&
+                                    StereoPhotoWriteView(*renderer, swapchainTexture, eye, eyeCount, vpX, vpY, vpW, vpH);
+                                if (!photoDrawn) {
+                                    RenderScene(*renderer, swapchainTexture, rtvIdx,
+                                        vpX, vpY,
+                                        vpW, vpH,
+                                        viewMatrix, projMatrix,
+                                        useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor,
+                                        eye == 0);  // clear only on first eye
+                                }
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
@@ -1800,6 +1947,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                  !g_cursorRuntimeDraw ? "APP (hint + placement only; OS cursor kept, no in-app crosshair)"
                  : g_cursorCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
                                         : "RUNTIME, default look");
+        const char* src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE");
+        if (src != nullptr && strcmp(src, "measured") == 0) {
+            if (g_cursorDepthSpecVersion >= 7) {
+                g_cursorMeasured = true;
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u) - "
+                         "keeping the app hit test",
+                         g_cursorDepthSpecVersion);
+            }
+        }
+        LOG_INFO("XR_DXR_cursor_depth source: %s",
+                 g_cursorMeasured ? "MEASURED DISPARITY (runtime block-matches the views)" : "app hit test");
+    }
+    {
+        const char* sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        g_stereoPhoto = g_cursorMeasured || (sp != nullptr && sp[0] == '1');
     }
 
     // INV-1.3: open on the 3D panel (#715) — one-shot move to the panel's
