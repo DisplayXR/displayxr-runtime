@@ -88,6 +88,12 @@ struct conv_host_proxy_config
 	//! Supervisor timings; NULL = the §3.4 defaults (tests shorten them).
 	const struct conv_supervisor_config *supervisor;
 
+	/*! How long a starting host may take to connect its channel and say
+	 *  hello. A start costs ~4 s at best, far more under load: default and
+	 *  floor CONV_HOST_PROXY_CONNECT_TIMEOUT_MS_DEFAULT (0 = the default). The
+	 *  supervisor's hello timeout is raised to it. */
+	uint32_t connect_timeout_ms;
+
 	//! CPU scratch bytes per lane (input images); 0 = default (64 MiB).
 	uint64_t scratch_bytes;
 
@@ -108,7 +114,10 @@ struct conv_host_proxy_config
 	bool spawn_for_describe;
 };
 
-//! Defaults: everything 0 / NULL / false.
+//! Default (and floor) of conv_host_proxy_config::connect_timeout_ms.
+#define CONV_HOST_PROXY_CONNECT_TIMEOUT_MS_DEFAULT 20000u
+
+//! Defaults: connect_timeout_ms = 20 s; everything else 0 / NULL / false.
 void
 conv_host_proxy_config_defaults(struct conv_host_proxy_config *cfg);
 

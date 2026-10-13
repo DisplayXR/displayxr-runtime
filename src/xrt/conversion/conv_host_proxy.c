@@ -57,7 +57,6 @@
 #define PX_ALIGN 4096ull
 
 #define PX_REQUEST_TIMEOUT_MS 5000u    //!< ordinary control requests
-#define PX_ACCEPT_TIMEOUT_MS 10000u    //!< the host connecting its channel (a start costs ~4 s on a slow box)
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
 #define PX_CHANNEL_EXIT_GRACE_MS 5000u //!< a closed channel: wait this long for the real exit code (a loaded box exits slowly)
@@ -1267,11 +1266,11 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 		os_channel_destroy(&ch);
 		return false;
 	}
-	// The connect is part of the host's start: give it the hello budget (a
-	// start costs seconds; far more on a loaded box), never less than 10 s.
+	// The connect is part of the host's start: the connect budget (>= 20 s;
+	// a start costs seconds, far more on a loaded box), or the hello budget if longer.
 	uint64_t accept_ms = p->sup.cfg.hello_timeout_ns / 1000000ull;
-	if (accept_ms < PX_ACCEPT_TIMEOUT_MS) {
-		accept_ms = PX_ACCEPT_TIMEOUT_MS;
+	if (accept_ms < p->cfg.connect_timeout_ms) {
+		accept_ms = p->cfg.connect_timeout_ms;
 	}
 	if (os_channel_accept_child(ch, proc, child_end, (uint32_t)accept_ms) != 0) {
 		int32_t code = 0;
@@ -2614,6 +2613,7 @@ conv_host_proxy_config_defaults(struct conv_host_proxy_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->spawn_for_describe = false; // the describe cache answers; conv_host_proxy_request_describe when it cannot
+	cfg->connect_timeout_ms = CONV_HOST_PROXY_CONNECT_TIMEOUT_MS_DEFAULT;
 }
 
 xrt_result_t
@@ -2646,7 +2646,15 @@ conv_host_proxy_create(const struct conv_host_proxy_config *cfg, struct conv_hos
 	}
 	p->cfg.gpu = NULL;
 	p->lane.handle = OS_NATIVE_HANDLE_INVALID;
+	if (p->cfg.connect_timeout_ms < CONV_HOST_PROXY_CONNECT_TIMEOUT_MS_DEFAULT) {
+		p->cfg.connect_timeout_ms = CONV_HOST_PROXY_CONNECT_TIMEOUT_MS_DEFAULT;
+	}
 	conv_supervisor_init(&p->sup, cfg->supervisor);
+	// The hello deadline covers the same start-up: never shorter than the connect budget.
+	const uint64_t connect_ns = (uint64_t)p->cfg.connect_timeout_ms * 1000000ull;
+	if (p->sup.cfg.hello_timeout_ns < connect_ns) {
+		p->sup.cfg.hello_timeout_ns = connect_ns;
+	}
 	if (os_mutex_init(&p->m) != 0 || os_mutex_init(&p->send_mtx) != 0 || os_cond_init(&p->cond) != 0) {
 		free(p);
 		return XRT_ERROR_THREADING_INIT_FAILURE;
