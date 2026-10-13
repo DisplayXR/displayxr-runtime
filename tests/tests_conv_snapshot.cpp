@@ -712,3 +712,48 @@ TEST_CASE("conv headless: the shipped sim provider describes cleanly (the CI sel
 	CHECK(st->providers[0].cap_count == 0);
 }
 #endif
+
+TEST_CASE("conv headless: DXR_CONV=0 (alias DXR_LIFT=0) means no conversion service (#2029)", "[conv_snapshot][selftest]")
+{
+	set_env("DXR_CONV", nullptr);
+	set_env("DXR_LIFT", nullptr);
+	CHECK(target_conv_kill_switch() == nullptr);
+	set_env("DXR_CONV", "1"); // only "0" engages it
+	CHECK(target_conv_kill_switch() == nullptr);
+
+	set_env("DXR_LIFT", "0");
+	REQUIRE(target_conv_kill_switch() != nullptr);
+	CHECK(std::string(target_conv_kill_switch()) == "DXR_LIFT");
+	set_env("DXR_CONV", "0");
+	CHECK(std::string(target_conv_kill_switch()) == "DXR_CONV"); // the spec name wins
+
+	// The headless pass enumerates and loads nothing: zero rows, the switch named.
+	auto st = std::make_unique<target_conv_status>();
+	std::memset(st.get(), 0xAB, sizeof(*st));
+	target_conv_status_build_headless(nullptr, st.get());
+	CHECK(st->provider_count == 0);
+	CHECK(st->task_count == 0);
+	CHECK(st->registered == 0);
+	CHECK(st->bad_descriptors == 0);
+	CHECK(std::string(st->kill_switch) == "DXR_CONV");
+	set_env("DXR_CONV", nullptr);
+	set_env("DXR_LIFT", nullptr);
+	CHECK(target_conv_kill_switch() == nullptr);
+
+#ifdef TESTS_HAVE_CLI_QUERY
+	// The selftest check passes and says why (and where the service reads it).
+	auto r = std::make_unique<cli_query_result>();
+	std::memset(r.get(), 0, sizeof(*r));
+	r->result_code = CLI_SELFTEST_PASS;
+	cli_query_apply_conversion(r.get(), st.get());
+	CHECK(r->result_code == CLI_SELFTEST_PASS);
+	CHECK(std::string(r->conv_note).find("DXR_CONV=0") != std::string::npos);
+	CHECK(std::string(r->conv_note).find("service") != std::string::npos);
+	cJSON *root = cli_query_selftest_to_cjson(r.get());
+	cJSON *obj = cJSON_GetObjectItem(root, "conversion_providers");
+	REQUIRE(obj != nullptr);
+	CHECK(std::string(cJSON_GetObjectItem(obj, "kill_switch")->valuestring) == "DXR_CONV");
+	CHECK(cJSON_GetObjectItem(obj, "count")->valuedouble == 0.0);
+	cJSON_Delete(root);
+#endif
+}

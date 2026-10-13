@@ -331,7 +331,16 @@ cli_query_apply_conversion(struct cli_query_result *r, const struct target_conv_
 	r->conv_dp_lift_declared = st->dp_lift_declared;
 	memcpy(r->conv_providers, st->providers, sizeof(r->conv_providers));
 
-	if (st->bad_descriptors > 0) {
+	snprintf(r->conv_kill_switch, sizeof(r->conv_kill_switch), "%s", st->kill_switch);
+
+	if (st->kill_switch[0] != '\0') {
+		// Discovery spec §3.2 (#2029). This is the CLI's own environment: the
+		// service reads ITS own, so say where to set it for the service.
+		snprintf(r->conv_note, sizeof(r->conv_note),
+		         "%s=0: no conversion service (kill switch in this process's environment; the service honours "
+		         "it only when set in the service's own environment) -- OK",
+		         st->kill_switch);
+	} else if (st->bad_descriptors > 0) {
 		snprintf(r->conv_note, sizeof(r->conv_note), "MALFORMED descriptor (%u): %s", st->bad_descriptors,
 		         st->bad_note);
 	} else if (st->registered == 0) {
@@ -2899,6 +2908,8 @@ add_conversion_providers_json(cJSON *root, const struct cli_query_result *r)
 	cJSON_AddNumberToObject(cp, "bad_descriptors", (double)r->conv_bad_descriptors);
 	cJSON_AddNumberToObject(cp, "task_rows", (double)r->conv_task_count);
 	cJSON_AddBoolToObject(cp, "dp_lift_declared", r->conv_dp_lift_declared);
+	// #2029: DXR_CONV=0 / DXR_LIFT=0 in this process ("" = none).
+	cJSON_AddStringToObject(cp, "kill_switch", r->conv_kill_switch);
 	cJSON_AddStringToObject(cp, "note", r->conv_note);
 	cJSON *arr = cJSON_AddArrayToObject(cp, "providers");
 	for (uint32_t i = 0; i < r->conv_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
