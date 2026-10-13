@@ -61,3 +61,11 @@ add_library(
 	)
 add_library(displayxr::conversion_runtime ALIAS conv_runtime)
 target_link_libraries(conv_runtime PUBLIC conv_core aux_util aux_os)
+
+# ADR-053 P2 (#2034): the satellite host proxy (conv_host_ops over the host
+# channel + shm rings). os_process is not built on Android, whose
+# `:conversion` service is a different mechanism (roadmap §4.3).
+if(NOT ANDROID)
+	target_sources(conv_runtime PRIVATE conv_host_proxy.c conv_host_proxy.h)
+	target_compile_definitions(conv_runtime PUBLIC CONV_HAVE_HOST_PROXY)
+endif()

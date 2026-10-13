@@ -113,6 +113,9 @@ struct conv_host_cmd
 #define CONV_HOST_EV_RESTORED 2u
 //! The supervisor's crash-loop cutoff: no respawn until a registry change.
 #define CONV_HOST_EV_CRASH_LOOP 3u
+//! A terminal host exit (ABI reject, licence, no device, elevated, ...): detail =
+//! the XRT_CONV_FAIL_* reason. No respawn until a registry change.
+#define CONV_HOST_EV_FAILED 4u
 /*! @} */
 
 /*! Does host exit code @p code count toward the crash-loop budget? The
