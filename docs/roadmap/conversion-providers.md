@@ -445,9 +445,14 @@ images re-registered on respawn) and the respawn itself waits for the maintenanc
 The idle unload and the shadow-copy load are **not** coming back: the owner rejected the 8–10 s
 reload stalls, and the satellite makes both unnecessary.
 
-**Respawn after exit 20** never happens on a timer. The supervisor respawns only on a registry or
-manifest change, or when the maintenance mutex is free and demand exists. The host never calls
-`RegisterApplicationRestart`.
+Measured (#2056): `RmShutdown(RmForceShutdown)` against a host owning such a window took 35.2 s and
+the killed host's exit code read **0**; the core follows the supervisor's classification (an exit 0
+the service did not ask for is abnormal), never the raw code.
+
+**Respawn after exit 20** never happens on a timer. The supervisor respawns only when the maintenance
+mutex is free and demand exists; a registry or manifest change clears the update state but the spawn
+still waits for the mutex. While the host is down nothing waits for it: commands are refused at once
+and frames stay pending in the stream mailbox. The host never calls `RegisterApplicationRestart`.
 
 **The installer contract (P3; onboarding guide §9 and discovery spec):** *close the host, never the
 service*, holding the maintenance mutex across the RM session. Old installers that close the service
