@@ -1520,5 +1520,14 @@
 		"in": [
 			{"name": "component_class", "type": "uint32_t"}
 		]
+	},
+	"conv_warm": {
+		"in": [
+			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
+		],
+		"out": [
+			{"name": "prev_state", "type": "uint32_t"},
+			{"name": "state", "type": "uint32_t"}
+		]
 	}
 }

@@ -1216,6 +1216,17 @@ ipc_server_conv_hint_interest(struct ipc_server_conv *sc, uint64_t client_id, ui
 	conv_core_hint_interest(sc->core, client_id, task_mask);
 }
 
+xrt_result_t
+ipc_server_conv_warm(struct ipc_server_conv *sc, uint32_t task, uint32_t *out_prev_state, uint32_t *out_state)
+{
+	*out_prev_state = 0;
+	*out_state = 0;
+	if (sc == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return conv_core_warm_task_explicit(sc->core, task, out_prev_state, out_state);
+}
+
 void
 ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 {
