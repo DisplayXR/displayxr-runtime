@@ -184,8 +184,12 @@ fake_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*i
 	}
 	os_mutex_lock(&f->mtx);
 	if (c != NULL && r == XRT_SUCCESS && c->state == XRT_CONV_STATE_WARMING) {
-		c->state = XRT_CONV_STATE_READY;
-		c->progress = 1.0f;
+		c->state = c->warm_end_state != 0 ? c->warm_end_state : XRT_CONV_STATE_READY;
+		c->progress = c->state == XRT_CONV_STATE_READY ? 1.0f : -1.0f;
+		if (c->state != XRT_CONV_STATE_READY) {
+			c->retryable = 0;
+			r = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
 	}
 	os_mutex_unlock(&f->mtx);
 	leave_s(f);

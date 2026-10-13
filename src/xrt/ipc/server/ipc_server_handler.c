@@ -9566,6 +9566,36 @@ ipc_handle_conv_hint_interest(volatile struct ipc_client_state *ics, const struc
 	return XRT_SUCCESS;
 }
 
+static_assert(sizeof(struct ipc_conv_warm_msg) <= IPC_BUF_SIZE, "conv_warm exceeds IPC_BUF_SIZE");
+
+/*!
+ * conv_warm (ADR-053 §6.2, #2029): `displayxr-cli conv warm` on its DIAG
+ * connection. Warms the task's selected capability; READY is a no-op; an
+ * all-terminal task is retried (the explicit-warm retry trigger, spec §4.3).
+ * Never blocks: the reply carries the state before and right after, and the
+ * CLI follows the rest through the status rows. A malformed struct is an
+ * untrusted-wire failure.
+ */
+xrt_result_t
+ipc_handle_conv_warm(volatile struct ipc_client_state *ics,
+                     const struct xrt_conv_wire_task_request *request,
+                     uint32_t *out_prev_state,
+                     uint32_t *out_state)
+{
+	IPC_TRACE_MARKER();
+	*out_prev_state = 0;
+	*out_state = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_warm");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (request->struct_size < sizeof(*request) ||
+	    request->family_version != XRT_CONV_WIRE_FAMILY_VERSION_CURRENT) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_server_conv_warm(ipc_server_get_conv(), request->task, out_prev_state, out_state);
+}
+
 xrt_result_t
 ipc_handle_lift_weave_rect_viewpoints(volatile struct ipc_client_state *ics,
                                       const struct ipc_arg_lift_rect_viewpoints *args)

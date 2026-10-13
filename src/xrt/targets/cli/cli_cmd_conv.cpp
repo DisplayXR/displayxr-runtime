@@ -6,7 +6,7 @@
  *
  *   conv list   [--json]                 providers x tasks, selection order, `selected`, reason per row
  *   conv status [--json] [--watch [--interval ms]]   readiness, streams, jobs
- *   conv warm   <task> | <id>[/<cap>] [<task>]       explicit prewarm (service only)
+ *   conv warm   <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]   explicit prewarm (service only)
  *   conv enable | disable <id> [--machine]           `Enabled` (HKCU; HKLM with --machine)
  *   conv use    <task> <id>[/<cap>] [--machine]      `PreferredProvider\<task>`
  *   conv reset  <task>|all [--machine]
@@ -25,9 +25,10 @@
  * its RegNotifyChangeKeyValue watch on the root (spec §4.1 re-describe
  * trigger) -- there is no separate poke RPC.
  *
- * GAP (#2003): `conv warm` needs the DIAG `conv_warm` call that lands with the
- * conv_core service object. Until then it validates its argument and reports
- * that the running service cannot take the request; it never warms headless.
+ * `conv warm` (#2029) is the DIAG `conv_warm` call: it warms the task's
+ * selected capability in the running service (READY is a no-op; an
+ * all-terminal task is retried) and, with --wait, follows the status rows
+ * until READY or terminal. It never warms headless.
  *
  * @ingroup cli
  */
@@ -49,6 +50,7 @@
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 #include "target_plugin_loader.h" // target_plugin_get_active (the static dp-lift row)
+#include "conversion/conv_readiness.h"
 #include "conversion/conv_select.h"
 
 #ifdef CLI_HAVE_IPC
@@ -60,12 +62,15 @@
 
 #include <cjson/cJSON.h>
 
+#include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef XRT_OS_WINDOWS
 #define WIN32_LEAN_AND_MEAN
@@ -712,45 +717,227 @@ cmd_reset(const char *task_name, bool machine)
 	return rc;
 }
 
+const char *
+state_upper(uint32_t state, char *buf, size_t cap)
+{
+	snprintf(buf, cap, "%s", conv_state_name(state));
+	for (char *c = buf; *c != '\0'; c++) {
+		*c = (char)toupper((unsigned char)*c);
+	}
+	return buf;
+}
+
+//! The row selection picked for @p task in @p snap (NULL = none).
+const struct xrt_status_conv_task *
+selected_row(const struct xrt_status_snapshot *snap, uint32_t task)
+{
+	for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		if (snap->conv_tasks[i].task == task && snap->conv_tasks[i].selected) {
+			return &snap->conv_tasks[i];
+		}
+	}
+	return nullptr;
+}
+
+#ifdef CLI_HAVE_IPC
+/*!
+ * One DIAG conv_warm (#2029) for @p task, one line out. Returns 0 accepted
+ * (READY already is a no-op, also 0), 1 nothing serves the task / refused,
+ * 2 the service runs no conversion core.
+ */
+int
+warm_one(struct ipc_connection *ipc_c, uint32_t task, const struct xrt_status_snapshot *snap, uint32_t *out_state)
+{
+	struct xrt_conv_wire_task_request req;
+	memset(&req, 0, sizeof(req));
+	req.struct_size = (uint32_t)sizeof(req);
+	req.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	req.task = task;
+	uint32_t prev = 0, now = 0;
+	const xrt_result_t xr = ipc_call_conv_warm(ipc_c, &req, &prev, &now);
+	*out_state = now;
+	char a[16], b[16];
+	const struct xrt_status_conv_task *row = selected_row(snap, task);
+	std::string who = row != nullptr
+	                      ? std::string(provider_id_of(snap, *row)) + " cap " + std::to_string(row->cap_id)
+	                      : std::string("no provider");
+	if (xr == XRT_ERROR_FEATURE_NOT_SUPPORTED && snap->conv_provider_count == 0 && snap->conv_task_count == 0) {
+		P("%s: the running service has no conversion core (DXR_CONV=0 / DXR_LIFT=0 in ITS environment, or the "
+		  "core "
+		  "did not start). Nothing was warmed.\n",
+		  conv_task_name(task));
+		return 2;
+	}
+	if (xr == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
+		P("%s: nothing serves it (%s). Nothing was warmed.\n", conv_task_name(task),
+		  state_upper(prev, a, sizeof(a)));
+		return 1;
+	}
+	if (xr != XRT_SUCCESS) {
+		P("%s: the service refused the warm (xrt_result %d).\n", conv_task_name(task), (int)xr);
+		return 1;
+	}
+	if (prev == XRT_CONV_STATE_READY) {
+		P("%s: already READY (%s) -- nothing to warm.\n", conv_task_name(task), who.c_str());
+		return 0;
+	}
+	P("%s: %s -> %s (%s)%s\n", conv_task_name(task), state_upper(prev, a, sizeof(a)),
+	  state_upper(now, b, sizeof(b)), who.c_str(),
+	  conv_state_is_terminal(prev) ? " -- retried (explicit warm)" : "");
+	return 0;
+}
+#endif
+
+/*!
+ * `conv warm <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]` (#2029):
+ * the DIAG conv_warm call. It warms the TASK's selected capability (an id
+ * names which tasks: those where that provider's row is the selected one --
+ * `conv use` changes the selection, not this verb). Never headless: the CLI
+ * never loads a model (spec §7.1).
+ */
 int
 cmd_warm(int argc, const char **argv)
 {
-	if (argc < 4) {
-		P("usage: displayxr-cli conv warm <task> | <id>[/<cap>] [<task>]\n");
+	if (argc < 4 || argv[3][0] == '-') {
+		P("usage: displayxr-cli conv warm <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]\n");
 		return 1;
 	}
 	const char *arg = argv[3];
 	const uint32_t task = conv_task_from_name(arg);
+	std::string id;
+	uint32_t cap = 0;
+	uint32_t only_task = 0;
 	if (task == 0) {
-		std::string id(arg);
+		id = arg;
 		const size_t slash = id.find('/');
 		if (slash != std::string::npos) {
+			cap = (uint32_t)strtoul(id.c_str() + slash + 1, nullptr, 10);
 			id.resize(slash);
 		}
 		if (!valid_id(id.c_str()) || !provider_known(id.c_str())) {
 			P("error: '%s' is neither a task nor a registered provider.\n", arg);
 			return 1;
 		}
-		if (argc >= 5 && argv[4][0] != '-' && conv_task_from_name(argv[4]) == 0) {
-			P("error: unknown task '%s'.\n", argv[4]);
-			return 1;
+		if (argc >= 5 && argv[4][0] != '-') {
+			only_task = conv_task_from_name(argv[4]);
+			if (only_task == 0) {
+				P("error: unknown task '%s'.\n", argv[4]);
+				return 1;
+			}
+		}
+	} else if (!conv_task_is_served(task)) {
+		P("error: task '%s' is not served in this version.\n", arg);
+		return 1;
+	}
+	const bool wait = cli_has_flag(argc, argv, "--wait");
+	uint32_t timeout_s = 120;
+	for (int i = 3; i + 1 < argc; i++) {
+		if (strcmp(argv[i], "--timeout") == 0) {
+			const long v = strtol(argv[i + 1], nullptr, 10);
+			timeout_s = v < 1 ? 1u : (uint32_t)v;
 		}
 	}
 #ifdef CLI_HAVE_IPC
 	// A real connect, not the pipe pre-check alone: a diagnostic must not claim a
 	// service it cannot reach (and never launches one, #1966).
 	struct ipc_connection ipc_c;
-	if (conv_connect(&ipc_c)) {
-		ipc_client_connection_fini(&ipc_c);
-		// GAP (#2003): the DIAG `conv_warm` call arrives with the conv_core
-		// service object; nothing on the wire can take this request yet.
-		P("The running service has no conversion warm call yet (it lands with the conversion core's service\n"
-		  "object, #2003). Nothing was warmed. Today a module warms on its first stream / job create.\n");
-		return 2;
+	if (!conv_connect(&ipc_c)) {
+		P("No DisplayXR service reachable. The CLI never warms a model headless (spec §7.1).\n");
+		return 1;
 	}
-#endif
-	P("No DisplayXR service reachable. The CLI never warms a model headless (spec §7.1).\n");
+	auto snap = std::make_unique<xrt_status_snapshot>();
+	memset(snap.get(), 0, sizeof(*snap));
+	(void)fetch_over(&ipc_c, snap.get()); // names the selected provider; an empty read is fine
+
+	// The tasks to warm.
+	std::vector<uint32_t> tasks;
+	int rc = 0;
+	if (task != 0) {
+		tasks.push_back(task);
+	} else {
+		bool matched = false;
+		for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+			const struct xrt_status_conv_task &t = snap->conv_tasks[i];
+			if (strcmp(provider_id_of(snap.get(), t), id.c_str()) != 0 || (cap != 0 && t.cap_id != cap) ||
+			    (only_task != 0 && t.task != only_task)) {
+				continue;
+			}
+			matched = true;
+			if (t.selected) {
+				if (std::find(tasks.begin(), tasks.end(), t.task) == tasks.end()) {
+					tasks.push_back(t.task);
+				}
+				continue;
+			}
+			const struct xrt_status_conv_task *sel = selected_row(snap.get(), t.task);
+			P("%s: %s cap %u is not the selected capability (selected: %s) -- `conv warm` warms the "
+			  "selection; `conv use %s %s` first to change it.\n",
+			  t.task_name, id.c_str(), t.cap_id, sel != nullptr ? provider_id_of(snap.get(), *sel) : "none",
+			  t.task_name, id.c_str());
+			rc = 1;
+		}
+		if (!matched) {
+			P("%s: the running service has no row for it%s.\n", arg,
+			  snap->conv_task_count == 0 ? " (no conversion rows at all)" : "");
+			ipc_client_connection_fini(&ipc_c);
+			return snap->conv_task_count == 0 ? 2 : 1;
+		}
+	}
+
+	std::vector<uint32_t> pending;
+	for (uint32_t t : tasks) {
+		uint32_t now = 0;
+		const int r = warm_one(&ipc_c, t, snap.get(), &now);
+		rc = r > rc ? r : rc;
+		if (r == 0 && now != XRT_CONV_STATE_READY && !conv_state_is_terminal(now)) {
+			pending.push_back(t);
+		}
+	}
+
+	// --wait: follow the selected rows through the status reads until each is
+	// READY or terminal (never re-sending the warm: that would be a retry).
+	if (wait && !pending.empty()) {
+		const uint64_t end = os_monotonic_get_ns() + (uint64_t)timeout_s * U_TIME_1S_IN_NS;
+		while (!pending.empty() && os_monotonic_get_ns() < end) {
+			os_nanosleep(250 * U_TIME_1MS_IN_NS);
+			if (!fetch_over(&ipc_c, snap.get())) {
+				break;
+			}
+			for (auto it = pending.begin(); it != pending.end();) {
+				const struct xrt_status_conv_task *row = selected_row(snap.get(), *it);
+				const uint32_t st = row != nullptr ? row->state : XRT_CONV_STATE_ABSENT;
+				if (st == XRT_CONV_STATE_READY || conv_state_is_terminal(st)) {
+					char a[16];
+					P("%s: %s%s%s\n", conv_task_name(*it), state_upper(st, a, sizeof(a)),
+					  row != nullptr && row->reason_name[0] != '\0' && st != XRT_CONV_STATE_READY
+					      ? " reason="
+					      : "",
+					  row != nullptr && st != XRT_CONV_STATE_READY ? row->reason_name : "");
+					rc = st == XRT_CONV_STATE_READY ? rc : 1;
+					it = pending.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+		for (uint32_t t : pending) {
+			P("%s: still warming after %u s (`conv status --watch` follows it).\n", conv_task_name(t),
+			  timeout_s);
+			rc = rc > 1 ? rc : 1;
+		}
+	} else if (!pending.empty()) {
+		P("`displayxr-cli conv status --watch` follows it (or pass --wait).\n");
+	}
+	ipc_client_connection_fini(&ipc_c);
+	return rc;
+#else
+	(void)wait;
+	(void)timeout_s;
+	(void)cap;
+	(void)only_task;
+	P("No IPC client in this build. The CLI never warms a model headless (spec §7.1).\n");
 	return 1;
+#endif
 }
 
 //! Model store root (ADR-053 decision 7; spec §5.1): first configured key wins.
@@ -825,7 +1012,8 @@ usage(void)
 	P("Usage: displayxr-cli conv <verb>   (conversion providers, ADR-053)\n");
 	P("  list [--json]                       providers x tasks, selection order, selected, reason per row\n");
 	P("  status [--json] [--watch [--interval ms]]   readiness, streams, jobs (live from the service)\n");
-	P("  warm <task> | <id>[/<cap>] [<task>] explicit prewarm, through the running service\n");
+	P("  warm <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]\n"
+	  "                                      explicit prewarm, through the running service (READY: no-op)\n");
 	P("  enable | disable <id> [--machine]   per-user (HKCU) Enabled; --machine = HKLM (admin)\n");
 	P("  use <task> <id>[/<cap>] [--machine] per-task preference (PreferredProvider\\<task>)\n");
 	P("  reset <task>|all [--machine]        clear it\n");

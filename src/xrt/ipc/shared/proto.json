@@ -1477,5 +1477,15 @@
 		"in": [
 			{"name": "hint", "type": "struct xrt_conv_wire_hint_interest"}
 		]
+	},
+
+	"conv_warm": {
+		"in": [
+			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
+		],
+		"out": [
+			{"name": "prev_state", "type": "uint32_t"},
+			{"name": "state", "type": "uint32_t"}
+		]
 	}
 }
