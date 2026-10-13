@@ -243,6 +243,58 @@ to check that the loader can reach it.
 Overrides: `queue` = tier 1 only · `layer` = force tier 2 even where a queue exists, so the layer
 path is testable on multi-queue GPUs · `off` = no layer injection, no repaint.
 
+#### `vulkan_enable1` apps — getting the layer into a chain the runtime does not create (#886)
+
+Tier 1 needs a queue the runtime asked for, and tier 2's layer is *injected* at
+`xrCreateVulkanInstanceKHR` — both exist only under `XR_KHR_vulkan_enable2`, where the runtime creates
+the `VkInstance` and `VkDevice`. Under `XR_KHR_vulkan_enable1` (every shipped native demo: avatar,
+modelviewer, gaussiansplat, earthview, mediaplayer) the **app** creates both, so there is never a
+runtime-owned queue — on any GPU — and the layer tier is the *only* repaint tier. The layer must
+reach the app's chain by a route the app or its environment controls:
+
+| Route | How | Verdict |
+|---|---|---|
+| **(a) implicit manifest** | The same layer, same name and library, also installed as an **implicit** layer: `/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json` (`.deb`) or `$XDG_DATA_HOME/vulkan/implicit_layer.d/` (tarball). Gated by `enable_environment` **`DXR_VK_QUEUE_LOCK=1`**; `disable_environment` **`DXR_VK_QUEUE_LOCK_DISABLE=1`** vetoes it. | **Shipped, desktop Linux.** No app change; a launcher or a user sets one env var. Inert without it — an ungated implicit layer would load into every Vulkan process on the box, which `displayxr-cli info` and the DebInstall gate both refuse. |
+| (b) runtime requirement list | Advertise the layer through `xrGetVulkanInstanceExtensionsKHR` / `xrGetVulkanGraphicsRequirementsKHR`. | **Not possible.** enable1 returns instance/device *extension* names and an API-version range only; the spec has no channel for layers, and a layer name in the extension string makes `vkCreateInstance` fail with `VK_ERROR_EXTENSION_NOT_PRESENT`. |
+| (c) app enables it | The app checks `vkEnumerateInstanceLayerProperties` and appends `VK_LAYER_DXR_queue_lock` to its own `ppEnabledLayerNames` (a native port did this behind `DXR_VK_QUEUE_LOCK=1` and the marker handshake worked: `repaint loop start ret=0`). | Works everywhere the explicit manifest is installed, including Windows; needs a change per app (tracked on `displayxr-common` for the demo template). |
+| (d) runtime arms (a) in-process | The runtime `setenv("DXR_VK_QUEUE_LOCK","1")` from `xrGetVulkanInstanceExtensionsKHR` (enable1 only) when the user has not set it. | **Viable, not enabled yet.** Verified: the Vulkan loader re-reads the environment on every `vkCreateInstance`, even after an earlier instance in the same process. Ordering requirement: the app's `VkInstance` must be created *after* that call — which the enable1 flow already implies, because the app needs that call's extension list to create the instance. An engine that creates its `VkInstance` before touching OpenXR misses it. `setenv` is process-wide and not thread-safe against concurrent `getenv`, so it belongs in that early, single-threaded call. Held back until runtime#2039 is re-measured on the fixed native app. |
+
+**Recommended default:** (a) is the mechanism and ships now, **opt-in** (`DXR_VK_QUEUE_LOCK=1`) — the
+same knob a native port already uses for its own app-side opt-in, so one variable means "give this
+app the layer" whichever route honours it. (c) is the belt-and-braces for apps that must work without
+the env var (and on Windows, where no implicit manifest is installed). (d) is the follow-up that makes
+it default-on with no app change, once runtime#2039's re-measurement shows no per-call serialisation
+cost for an enable1 app.
+
+*Experiment, not a product path:* Intel ANV honours `ANV_QUEUE_OVERRIDE=gc=2`, which exposes **two**
+graphics queues (measured on an Intel PTL laptop). That hands an **enable2** app tier 1 — the runtime
+asks for its own queue — and no layer is needed. It does nothing for enable1 (the app creates the
+device and asks for one queue), it is a driver debug knob, and it changes what every Vulkan process on
+the box sees; use it only to A/B tier 1 against tier 2 on the same iGPU.
+
+**The field log names the route.** The layer reports how it entered the chain through a second
+handshake entry point, `vkGetQueueLockActivationDXR(VkDevice)` — named in `ppEnabledLayerNames`,
+implicit (not named, `DXR_VK_QUEUE_LOCK=1`), or loader env (`VK_INSTANCE_LAYERS` /
+`VK_LOADER_LAYERS_ENABLE`) — and the runtime adds whether *it* named it. One line per session:
+
+```
+#886: VK_LAYER_DXR_queue_lock route=<injected|app-enabled|implicit|loader-env|absent|unknown> (...) —
+      <app-created (vulkan_enable1) | runtime-created (vulkan_enable2)> device,
+      graphics family has N queue(s), repaint tier: <runtime-owned queue | shared app queue | none>
+```
+
+`unknown` = a layer older than the query (the installed `.so` predates #886). The loader dedupes the
+explicit and implicit manifests by name, so a runtime-injected (enable2) session and an enable1 app
+run with `DXR_VK_QUEUE_LOCK=1` both get exactly one copy in the chain
+(`tests/tests_vk_queue_lock_activation.sh` pins this against the real loader).
+
+**Cost guard — log only (runtime#2039).** When an enable1 app on a single-graphics-queue GPU runs
+with the layer live, the repaint on its queue and app swapchains deeper than two images (more than
+one app frame can be queued on the shared queue), the compositor logs one `#868: per-call queue
+serialisation in effect …` line naming `DXR_WEAVE_REPAINT=0` as the A/B switch for the loop. Nothing
+is disabled automatically: the collapse first reported in #2039 reproduced *without* the layer and was
+later attributed to a tracked viewer plus a low GPU clock.
+
 ### `DXR_DEFER_PRESENT` — **REMOVED from the code; kept here as the measurement record** (#837)
 
 > **The variable no longer exists.** `grep -rn DEFER_PRESENT src/` returns nothing — the
@@ -514,7 +566,7 @@ moves the present any more. Re-open it only if a deferred-present mechanism is e
 | | dGPU (discrete, multi-queue) | iGPU (integrated) | Hybrid laptop |
 |---|---|---|---|
 | Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
-| Repaint | **on**, tier 1 dedicated queue | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) | on; follows the adapter the session was created on |
+| Repaint | **on**, tier 1 dedicated queue (enable2); enable1 apps: tier 2 only, opt-in `DXR_VK_QUEUE_LOCK=1` (#886) | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) — injected for enable2; enable1 apps opt in with `DXR_VK_QUEUE_LOCK=1` (#886) | on; follows the adapter the session was created on |
 | `DXR_DEFER_PRESENT` | *removed from the code* | *removed* | *removed* |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
