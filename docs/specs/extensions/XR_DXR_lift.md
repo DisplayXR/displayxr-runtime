@@ -527,6 +527,16 @@ Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
 | `SHARED_EVENT` | a macOS shared event + value |
 | `CPU_COMPLETE` | writes completed before the call: the spec-3 D3D12 rule of §5.3 (do not rewrite the image until a later frame; double-buffer) |
 
+**What `imageKinds` lists today.** On Windows (IPC sessions and in-process D3D11 / D3D12
+sessions): `D3D11_NT`, `D3D11_DXGI`, `D3D12_NT` and `CPU`, with any `region` inside the image.
+`D3D12_NT` takes `D3D_FENCE` (the service waits for `syncValue` on the GPU before its
+snapshot) or `CPU_COMPLETE`; `D3D11_*` take their keyed mutex or `D3D_FENCE`; `CPU` takes
+`NONE` / `CPU_COMPLETE`, RGBA8 or BGRA8, `cpuRowPitch ≥ (region x + width) · 4`, and the
+region's bytes are copied before the call returns. `VK_OPAQUE_WIN32`, `OPAQUE_FD`, `DMABUF`,
+`IOSURFACE` and `AHARDWAREBUFFER` appear in `imageKinds` only once their transports land
+(ADR-053 P5) — until then they are never listed, and submitting one is
+`XR_ERROR_VALIDATION_FAILURE`.
+
 As in spec 3 a GPU image is **snapshotted** before the call returns (one copy on the runtime's
 GPU, honouring the sync kind), so the caller may rewrite it afterwards — except under
 `CPU_COMPLETE` on a kind without a keyed mutex.
@@ -599,6 +609,13 @@ The handles are D3D12-consumable as they are: the export texture is an NT-handle
   kind `D3D12_NT` with sync kind `D3D_FENCE` (§4.5).
 
 ### 5.4 Result export (spec 4)
+
+`exportKinds` lists `D3D11_NT` and `CPU` today (Vulkan / dma-buf / IOSurface / AHB exports
+with P5). A **CPU** export: `outputTexture` is a pointer to the result's bytes, tightly packed
+(`extent.width ·` bytes per pixel per row), runtime-owned and valid until the next acquire on the
+stream; `fence` is NULL; `XrLiftResultExportDXR` says `kind = CPU`, the format, and
+`syncKind = CPU_COMPLETE` (the bytes are complete when the acquire returns). An auxiliary depth
+map keeps its D3D11 NT export.
 
 A stream created with an `exportKind` other than D3D11_NT returns its results through the same
 `outputTexture` / `fence` fields, described by `XrLiftResultExportDXR` chained on

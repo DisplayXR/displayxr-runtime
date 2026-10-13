@@ -227,6 +227,12 @@ if(TARGET comp_d3d11_lift)
 	# sim_display fake behind d3d11_lift, its output bytes pinned before the
 	# conversion core took over the lift thread. SKIPs without a D3D11 device.
 	list(APPEND tests tests_lift_dp_golden)
+	if(TARGET ipc_server_conv)
+		# #2054 -- XR_DXR_lift spec-4 transports on WARP (D3D11 NT + region,
+		# NT + D3D fence, a D3D12 resource + ID3D12Fence, CPU bytes, CPU
+		# export), each reproducing tests_lift_dp_golden's pinned SBS bytes.
+		list(APPEND tests tests_ipc_conv_v4_transports)
+	endif()
 endif()
 if(TARGET comp_d3d11_conv_host_lane)
 	# ADR-053 P2 (#2034) -- the satellite's D3D11 lane on WARP (debug layer when
@@ -1323,6 +1329,27 @@ if(TARGET tests_lift_dp_golden)
 		target_link_libraries(tests_lift_dp_golden PRIVATE ipc_server_conv displayxr::conversion_runtime)
 	endif()
 	set_target_properties(tests_lift_dp_golden PROPERTIES CXX_STANDARD 17)
+endif()
+if(TARGET tests_ipc_conv_v4_transports)
+	# As tests_lift_dp_golden: the sim_display fake lift compiled straight in, with
+	# the settings shim it reads its knobs through (N3c).
+	target_sources(
+		tests_ipc_conv_v4_transports
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_lift_d3d11.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_settings.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c
+		)
+	target_include_directories(
+		tests_ipc_conv_v4_transports PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+						     ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion
+		)
+	target_link_libraries(
+		tests_ipc_conv_v4_transports PRIVATE comp_d3d11_lift ipc_server_conv displayxr::conversion_runtime aux_os
+						     d3d11 d3d12 dxgi d3dcompiler
+		)
+	set_target_properties(tests_ipc_conv_v4_transports PROPERTIES CXX_STANDARD 17)
 endif()
 
 if(TARGET tests_oxr_lift_startup)

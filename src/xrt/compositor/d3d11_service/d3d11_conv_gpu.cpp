@@ -683,6 +683,16 @@ glue_stream_release(glue_stream &gs)
 	close_handle(gs.exp_handle);
 	rel(gs.exp_depth_tex);
 	close_handle(gs.exp_depth_handle);
+	rel(gs.imp_fence);
+	close_handle(gs.imp_fence_handle);
+	rel(gs.cpu_srv);
+	rel(gs.cpu_tex);
+	if (gs.cpu_view != nullptr) {
+		UnmapViewOfFile(gs.cpu_view);
+		gs.cpu_view = nullptr;
+	}
+	close_handle(gs.cpu_map);
+	rel(gs.cpu_stage);
 }
 
 void
@@ -1465,6 +1475,358 @@ d3d11_lift_glue_import_input_cpu(
 	}
 	*out_pixels = px;
 	return XRT_SUCCESS;
+}
+
+/*
+ *
+ * Spec-4 transports (#2054): D3D12 NT textures + a shared D3D fence, CPU
+ * bytes in a file mapping, a sub-rect region; CPU export.
+ *
+ */
+
+//! The stream's cached shared fence for @p handle (takes ownership of it).
+static ID3D11Fence *
+glue_import_fence(d3d11_lift *l, glue_stream *gs, HANDLE handle)
+{
+	if (gs->imp_fence != nullptr && same_kernel_object(gs->imp_fence_handle, handle)) {
+		CloseHandle(handle);
+		return gs->imp_fence;
+	}
+	rel(gs->imp_fence);
+	close_handle(gs->imp_fence_handle);
+	ID3D11Device5 *d5 = nullptr;
+	HRESULT hr = l->svc_device->QueryInterface(__uuidof(ID3D11Device5), (void **)&d5);
+	if (SUCCEEDED(hr)) {
+		hr = d5->OpenSharedFence(handle, __uuidof(ID3D11Fence), (void **)&gs->imp_fence);
+	}
+	rel(d5);
+	if (FAILED(hr)) {
+		U_LOG_E("[conv] spec-4 input fence OpenSharedFence failed: 0x%08lx", (unsigned long)hr);
+		rel(gs->imp_fence);
+		CloseHandle(handle);
+		return nullptr;
+	}
+	gs->imp_fence_handle = handle; // kept open for the identity compare
+	return gs->imp_fence;
+}
+
+//! The stream's upload texture for CPU input (@p w x @p h, RGBA8 or BGRA8).
+static bool
+glue_cpu_upload_ensure(d3d11_lift *l, glue_stream *gs, uint32_t w, uint32_t h, DXGI_FORMAT fmt)
+{
+	if (gs->cpu_tex != nullptr && gs->cpu_w == w && gs->cpu_h == h && gs->cpu_fmt == fmt) {
+		return true;
+	}
+	rel(gs->cpu_srv);
+	rel(gs->cpu_tex);
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = fmt;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	HRESULT hr = l->svc_device->CreateTexture2D(&td, nullptr, &gs->cpu_tex);
+	if (SUCCEEDED(hr)) {
+		hr = l->svc_device->CreateShaderResourceView(gs->cpu_tex, nullptr, &gs->cpu_srv);
+	}
+	if (FAILED(hr)) {
+		rel(gs->cpu_srv);
+		rel(gs->cpu_tex);
+		return false;
+	}
+	gs->cpu_w = w;
+	gs->cpu_h = h;
+	gs->cpu_fmt = fmt;
+	return true;
+}
+
+//! CPU input: a read-only view of the caller's file mapping, bounds-checked.
+static xrt_result_t
+glue_import_cpu_bytes(d3d11_lift *l, glue_stream *gs, const struct conv_input_import *in, const conv_submit_slot *slot)
+{
+	const xrt_conv_image *img = &slot->images[0];
+	const uint32_t w = in->w, h = in->h, pitch = in->cpu_row_pitch;
+	void *view = MapViewOfFile((HANDLE)in->handle, FILE_MAP_READ, 0, 0, 0);
+	CloseHandle((HANDLE)in->handle);
+	if (view == nullptr) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	MEMORY_BASIC_INFORMATION mbi = {};
+	const size_t mapped = VirtualQuery(view, &mbi, sizeof(mbi)) != 0 ? mbi.RegionSize : 0;
+	const uint64_t need = (uint64_t)pitch * (in->y + h - 1) + (uint64_t)(in->x + w) * 4u;
+	if (w == 0 || h == 0 || pitch < (in->x + w) * 4u || need > (uint64_t)mapped) {
+		UnmapViewOfFile(view);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // the wire is not trusted
+	}
+	const uint8_t *base = (const uint8_t *)view + (size_t)in->y * pitch + (size_t)in->x * 4u;
+	const bool bgra = in->cpu_bgra;
+	glue_img gi;
+	const bool gpu = glue_find(l, img->import_key, &gi);
+	bool ok;
+	if (gpu) {
+		ok = gi.rtv != nullptr &&
+		     glue_cpu_upload_ensure(l, gs, w, h, bgra ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM);
+		if (ok) {
+			std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+			l->svc_context->UpdateSubresource(gs->cpu_tex, 0, nullptr, base, pitch, 0);
+			blit_dst dst = {gi.km, gi.rtv};
+			ok = snapshot_blit(l, dst, gs->cpu_srv, w, h, 0, 0, w, h, gi.w, gi.h);
+			l->svc_context->Flush();
+		}
+	} else {
+		ok = img->memory_kind == XRT_CONV_MEM_CPU && img->cpu_ptr != nullptr && img->width == w && img->height == h;
+		const uint32_t stride = img->row_stride != 0 ? img->row_stride : w * 4u;
+		for (uint32_t yy = 0; ok && yy < h; yy++) {
+			uint8_t *dst = (uint8_t *)img->cpu_ptr + (size_t)yy * stride;
+			const uint8_t *src = base + (size_t)yy * pitch;
+			memcpy(dst, src, (size_t)w * 4u);
+			if (bgra) {
+				for (uint32_t xx = 0; xx < w; xx++) {
+					const uint8_t b = dst[4 * xx + 0];
+					dst[4 * xx + 0] = dst[4 * xx + 2];
+					dst[4 * xx + 2] = b;
+				}
+			}
+		}
+	}
+	UnmapViewOfFile(view);
+	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
+}
+
+xrt_result_t
+d3d11_lift_glue_import_input_ex(struct d3d11_lift *l,
+                                uint64_t wire,
+                                const struct conv_input_import *in,
+                                const struct conv_submit_slot *slot)
+{
+	const bool is_dxgi = in->kind == D3D11_LIFT_INPUT_DXGI;
+	if (l == nullptr || !l->snap_ok || slot == nullptr || slot->image_count < 1 || !glue_enter(l)) {
+		if (in->handle != nullptr && !is_dxgi) {
+			CloseHandle((HANDLE)in->handle);
+		}
+		if (in->sync_handle != nullptr) {
+			CloseHandle((HANDLE)in->sync_handle);
+		}
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	eyes_refresh_if_stale(l);
+	glue_stream *gs;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		gs = &l->glue_streams[wire]; // std::map: stable; one producer thread per stream
+	}
+	if (in->kind == D3D11_LIFT_INPUT_CPU) {
+		if (in->sync_handle != nullptr) {
+			CloseHandle((HANDLE)in->sync_handle);
+		}
+		const xrt_result_t r = glue_import_cpu_bytes(l, gs, in, slot);
+		glue_leave(l);
+		return r;
+	}
+	ID3D11Fence *fence = nullptr;
+	if (in->sync_kind == XRT_CONV_SYNC_FENCE_NT) {
+		fence = in->sync_handle != nullptr ? glue_import_fence(l, gs, (HANDLE)in->sync_handle) : nullptr;
+		if (fence == nullptr) {
+			if (in->handle != nullptr && !is_dxgi) {
+				CloseHandle((HANDLE)in->handle);
+			}
+			glue_leave(l);
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+	} else if (in->sync_handle != nullptr) {
+		CloseHandle((HANDLE)in->sync_handle);
+	}
+	if (!glue_import_client(l, wire, (HANDLE)in->handle, is_dxgi, &gs)) {
+		glue_leave(l);
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	const xrt_conv_image *img = &slot->images[0];
+	const uint32_t x = in->x, y = in->y;
+	if (x >= gs->imp_w || y >= gs->imp_h) {
+		glue_leave(l);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	const uint32_t w = in->w > gs->imp_w - x ? gs->imp_w - x : in->w;
+	const uint32_t h = in->h > gs->imp_h - y ? gs->imp_h - y : in->h;
+	glue_img gi;
+	const bool gpu = glue_find(l, img->import_key, &gi);
+	if (!gpu &&
+	    (img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == nullptr || img->width != w || img->height != h)) {
+		glue_leave(l);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	// The caller's keyed mutex (when its texture has one): 4 ms, the budget
+	// every weave-side acquire uses. A D3D12 texture has none: its writes are
+	// ordered by the fence wait below (or were complete before the call).
+	bool acquired = false;
+	if (gs->imp_km != nullptr) {
+		HRESULT hr = gs->imp_km->AcquireSync(0, 4);
+		if (FAILED(hr) || hr == (HRESULT)WAIT_TIMEOUT) {
+			glue_leave(l);
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+		acquired = true;
+	}
+	bool ok;
+	if (gpu) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		if (fence != nullptr) {
+			l->svc_context4->Wait(fence, in->sync_value); // GPU-side: the caller's writes land first
+		}
+		// The pre-core snapshot, into the core's slot: 1:1 (point) at the
+		// submitted size, box-filtered when inputScale shrank the slot.
+		blit_dst dst = {gi.km, gi.rtv};
+		ok = gi.rtv != nullptr && snapshot_blit(l, dst, gs->imp_srv, gs->imp_w, gs->imp_h, x, y, w, h, gi.w, gi.h);
+		l->svc_context->Flush();
+	} else {
+		// A CPU provider's slot: read the region back (slow path, sim providers only).
+		D3D11_TEXTURE2D_DESC td = {};
+		gs->imp_tex->GetDesc(&td);
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.MiscFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		ID3D11Texture2D *st = nullptr;
+		ok = (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM || td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+		      td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+		     SUCCEEDED(l->svc_device->CreateTexture2D(&td, nullptr, &st));
+		if (ok) {
+			std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+			if (fence != nullptr) {
+				l->svc_context4->Wait(fence, in->sync_value);
+			}
+			D3D11_BOX box = {x, y, 0, x + w, y + h, 1};
+			l->svc_context->CopySubresourceRegion(st, 0, 0, 0, 0, gs->imp_tex, 0, &box);
+			D3D11_MAPPED_SUBRESOURCE m = {};
+			ok = SUCCEEDED(l->svc_context->Map(st, 0, D3D11_MAP_READ, 0, &m));
+			if (ok) {
+				const uint32_t stride = img->row_stride != 0 ? img->row_stride : w * 4u;
+				for (uint32_t yy = 0; yy < h; yy++) {
+					memcpy((uint8_t *)img->cpu_ptr + (size_t)yy * stride,
+					       (const uint8_t *)m.pData + (size_t)yy * m.RowPitch, (size_t)w * 4u);
+				}
+				l->svc_context->Unmap(st, 0);
+			}
+		}
+		rel(st);
+	}
+	if (acquired) {
+		gs->imp_km->ReleaseSync(0);
+	}
+	glue_leave(l);
+	return ok ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
+}
+
+bool
+d3d11_lift_glue_export_cpu(struct d3d11_lift *l,
+                           uint64_t wire,
+                           bool copy,
+                           HANDLE *out_mapping,
+                           uint32_t *out_w,
+                           uint32_t *out_h,
+                           uint32_t *out_format,
+                           uint64_t *out_bytes,
+                           bool *out_realloc)
+{
+	*out_mapping = nullptr;
+	*out_realloc = false;
+	if (l == nullptr || !glue_enter(l)) {
+		return false;
+	}
+	glue_stream *gs = nullptr;
+	{
+		std::lock_guard<std::mutex> g(l->glue_mtx);
+		auto it = l->glue_streams.find(wire);
+		gs = it != l->glue_streams.end() ? &it->second : nullptr;
+	}
+	if (gs == nullptr || gs->exp_tex == nullptr) {
+		glue_leave(l);
+		return false;
+	}
+	if (!copy) {
+		// The current mapping, as the last copy left it (the export call).
+		const bool have = gs->cpu_map != nullptr;
+		if (have) {
+			*out_mapping = gs->cpu_map;
+			*out_w = gs->cpu_stage_w;
+			*out_h = gs->cpu_stage_h;
+			*out_format = (uint32_t)gs->cpu_stage_fmt;
+			*out_bytes = gs->cpu_map_bytes;
+		}
+		glue_leave(l);
+		return have;
+	}
+	const uint32_t w = gs->exp_w, h = gs->exp_h;
+	const DXGI_FORMAT fmt = (DXGI_FORMAT)gs->exp_format;
+	const uint32_t bpp = fmt == DXGI_FORMAT_R16_FLOAT ? 2u : 4u;
+	const uint64_t bytes = (uint64_t)w * h * bpp; // tightly packed rows
+	if (gs->cpu_map == nullptr || gs->cpu_map_bytes != bytes || gs->cpu_stage_w != w || gs->cpu_stage_h != h ||
+	    gs->cpu_stage_fmt != fmt) {
+		if (gs->cpu_view != nullptr) {
+			UnmapViewOfFile(gs->cpu_view);
+			gs->cpu_view = nullptr;
+		}
+		close_handle(gs->cpu_map);
+		rel(gs->cpu_stage);
+		D3D11_TEXTURE2D_DESC td = {};
+		gs->exp_tex->GetDesc(&td);
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.MiscFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		bool ok = SUCCEEDED(l->svc_device->CreateTexture2D(&td, nullptr, &gs->cpu_stage));
+		if (ok) {
+			gs->cpu_map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)(bytes >> 32),
+			                                 (DWORD)(bytes & 0xffffffffu), nullptr);
+			gs->cpu_view = gs->cpu_map != nullptr ? MapViewOfFile(gs->cpu_map, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+			ok = gs->cpu_view != nullptr;
+		}
+		if (!ok) {
+			if (gs->cpu_view != nullptr) {
+				UnmapViewOfFile(gs->cpu_view);
+				gs->cpu_view = nullptr;
+			}
+			close_handle(gs->cpu_map);
+			rel(gs->cpu_stage);
+			glue_leave(l);
+			return false;
+		}
+		gs->cpu_map_bytes = bytes;
+		gs->cpu_stage_w = w;
+		gs->cpu_stage_h = h;
+		gs->cpu_stage_fmt = fmt;
+		*out_realloc = true;
+	}
+	bool ok;
+	{
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		l->svc_context->CopyResource(gs->cpu_stage, gs->exp_tex);
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		ok = SUCCEEDED(l->svc_context->Map(gs->cpu_stage, 0, D3D11_MAP_READ, 0, &m)); // waits for the copy
+		if (ok) {
+			for (uint32_t y = 0; y < h; y++) {
+				memcpy((uint8_t *)gs->cpu_view + (size_t)y * w * bpp, (const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+				       (size_t)w * bpp);
+			}
+			l->svc_context->Unmap(gs->cpu_stage, 0);
+		}
+	}
+	if (ok) {
+		*out_mapping = gs->cpu_map; // service-owned; the transport duplicates it
+		*out_w = w;
+		*out_h = h;
+		*out_format = gs->exp_format;
+		*out_bytes = bytes;
+	}
+	glue_leave(l);
+	return ok;
 }
 
 void

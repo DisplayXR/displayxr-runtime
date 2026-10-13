@@ -172,6 +172,35 @@ d3d11_lift_glue_release_input(HANDLE handle, bool is_dxgi);
 uint64_t
 d3d11_lift_glue_input_content_key(struct d3d11_lift *lift, uint64_t stream_id, const struct conv_submit_slot *slot);
 
+//! The spec-4 input kinds (#2054): D3D11 / D3D12 NT (+ a shared D3D fence),
+//! legacy DXGI, CPU bytes in a file mapping; any sub-rect region.
+#define D3D11_LIFT_INPUT_NT CONV_INPUT_NT
+#define D3D11_LIFT_INPUT_DXGI CONV_INPUT_DXGI
+#define D3D11_LIFT_INPUT_CPU CONV_INPUT_CPU
+
+/*! S0 for a spec-4 submit: like d3d11_lift_glue_import_input, for any of the
+ *  kinds above and a region. Takes ownership of both handles. */
+xrt_result_t
+d3d11_lift_glue_import_input_ex(struct d3d11_lift *lift,
+                                uint64_t stream_id,
+                                const struct conv_input_import *in,
+                                const struct conv_submit_slot *slot);
+
+/*! CPU export (#2054): the stream's current export read back, tightly
+ *  packed, into a file mapping the service owns (re-created on a size or
+ *  format change: @p out_realloc). Synchronous; call right after publish.
+ *  @p copy false: only the current mapping (no copy, no realloc). */
+bool
+d3d11_lift_glue_export_cpu(struct d3d11_lift *lift,
+                           uint64_t stream_id,
+                           bool copy,
+                           HANDLE *out_mapping,
+                           uint32_t *out_w,
+                           uint32_t *out_h,
+                           uint32_t *out_format,
+                           uint64_t *out_bytes,
+                           bool *out_realloc);
+
 //! Copy @p res into the stream's export texture(s), signal its fence.
 xrt_result_t
 d3d11_lift_glue_publish(struct d3d11_lift *lift,

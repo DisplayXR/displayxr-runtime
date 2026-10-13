@@ -123,6 +123,8 @@ ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc)
 	gpu.io.export_output = g->export_output;
 	gpu.io.export_fence = g->export_fence;
 	gpu.io.stream_gone = g->stream_gone;
+	gpu.io.import_input_ex = g->import_input_ex;
+	gpu.io.export_cpu = g->export_cpu;
 	gpu.io.ud = g->io_ud;
 	gpu.nominal_z_m = g->nominal_z_m;
 	gpu.adapter_luid = g->adapter_luid;

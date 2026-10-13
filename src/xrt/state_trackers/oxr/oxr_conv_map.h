@@ -286,6 +286,24 @@ oxr_conv_views_info_from_wire(const struct xrt_conv_wire_views_info *w,
 	o->reliefOffset = relief ? depth->relief_offset : 0.0f;
 }
 
+//! The DXGI format of an export -> XrLiftPixelFormatDXR (0 = unknown).
+static inline XrLiftPixelFormatDXR
+oxr_conv_pixel_format_from_dxgi(int64_t dxgi)
+{
+	switch (dxgi) {
+	case 28: return XR_LIFT_PIXEL_FORMAT_RGBA8_UNORM_DXR;  // DXGI_FORMAT_R8G8B8A8_UNORM
+	case 29: return XR_LIFT_PIXEL_FORMAT_RGBA8_SRGB_DXR;   // _UNORM_SRGB
+	case 87: return XR_LIFT_PIXEL_FORMAT_BGRA8_UNORM_DXR;  // DXGI_FORMAT_B8G8R8A8_UNORM
+	case 91: return XR_LIFT_PIXEL_FORMAT_BGRA8_SRGB_DXR;   // _UNORM_SRGB
+	case 10: return XR_LIFT_PIXEL_FORMAT_RGBA16_FLOAT_DXR; // DXGI_FORMAT_R16G16B16A16_FLOAT
+	case 41: return XR_LIFT_PIXEL_FORMAT_R32_FLOAT_DXR;    // DXGI_FORMAT_R32_FLOAT
+	case 54: return XR_LIFT_PIXEL_FORMAT_R16_FLOAT_DXR;    // DXGI_FORMAT_R16_FLOAT
+	case 56: return XR_LIFT_PIXEL_FORMAT_R16_UNORM_DXR;    // DXGI_FORMAT_R16_UNORM
+	case 61: return XR_LIFT_PIXEL_FORMAT_R8_UNORM_DXR;     // DXGI_FORMAT_R8_UNORM
+	default: return XR_LIFT_PIXEL_FORMAT_UNKNOWN_DXR;
+	}
+}
+
 #ifdef __cplusplus
 }
 #endif

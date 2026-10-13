@@ -35,7 +35,8 @@ def _load():
 
 
 #: XR_DXR_lift spec 4 (#2054): the conv_* family, appended in this order.
-SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm', 'conv_stream_create', 'conv_stream_reset', 'conv_acquire_result', 'conv_poll_event']
+SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm', 'conv_stream_create', 'conv_stream_reset',
+                    'conv_acquire_result', 'conv_poll_event', 'conv_submit_frame', 'conv_get_cpu_output']
 
 class GeneratorMixedHandlesTest(unittest.TestCase):
 
@@ -351,14 +352,17 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
     def test_spec4_conv_family_is_appended(self):
         # XR_DXR_lift spec 4 (#2054): the conv_* family rides at the END,
         # after conv_hint_interest, so every v3 lift_* message keeps its enum
-        # value and wire form. No handles: spec-4 streams use the v3
-        # submit / export calls.
+        # value and wire form.
         names = [c.name for c in self.p.calls]
         self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
         self.assertLess(names.index("conv_hint_interest"), names.index(SPEC4_CONV_CALLS[0]))
         for name in SPEC4_CONV_CALLS:
             call = self._call(name)
-            self.assertFalse(call.in_handles or call.out_handles or call.varlen, name)
+            self.assertFalse(call.varlen, name)
+            # Only the transport calls carry handles: the submit's image (+ its
+            # fence) in, the CPU export's mapping out.
+            self.assertEqual(bool(call.in_handles), name == "conv_submit_frame", name)
+            self.assertEqual(bool(call.out_handles), name == "conv_get_cpu_output", name)
         create = self._call("conv_stream_create")
         self.assertEqual([(a.name, a.typename) for a in create.in_args],
                          [("desc", "struct xrt_conv_wire_stream_desc"), ("required_outputs", "uint64_t"),

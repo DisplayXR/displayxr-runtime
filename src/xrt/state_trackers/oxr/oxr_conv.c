@@ -375,6 +375,8 @@ static XrResult
 oxr_lift_stream_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_lift_stream_dxr *st = (struct oxr_lift_stream_dxr *)hb;
+	oxr_conv_cpu_unmap(st->cpu_view);
+	st->cpu_view = NULL;
 	// Best effort: a dead connection already took every stream with it.
 	if (st->sess != NULL && st->sess->xcn != NULL && !st->sess->has_lost) {
 		struct lift_route route;
@@ -602,7 +604,7 @@ lift_create_task_stream(struct oxr_logger *log,
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: exportKind %d is not offered here", what,
 			                 (int)t->exportKind);
 		}
-		export_memory = XRT_CONV_MEM_WIN32_NT_HANDLE; // D3D11_NT, the one export kind so far
+		export_memory = t->exportKind == XR_LIFT_IMAGE_KIND_CPU_DXR ? XRT_CONV_MEM_CPU : XRT_CONV_MEM_WIN32_NT_HANDLE;
 	}
 	if (ci->contentHint != XR_LIFT_CONTENT_HINT_VIDEO_DXR && ci->contentHint != XR_LIFT_CONTENT_HINT_PHOTO_DXR) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: contentHint (%d) invalid", what,
@@ -675,23 +677,50 @@ lift_create_task_stream(struct oxr_logger *log,
 	st->max_views = sess->lift_max_views;
 	st->v4 = true;
 	st->task = (uint32_t)t->task;
+	st->export_cpu = export_memory == XRT_CONV_MEM_CPU;
 	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
 	return XR_SUCCESS;
 }
 
+//! One resolved spec-4 input: either the v3 submit (D3D11 NT / DXGI at the
+//! origin, keyed mutex) or a conv_submit_frame descriptor.
+struct lift_input
+{
+	bool v4;
+	void *handle;
+	bool is_dxgi;
+	XrExtent2Di extent;
+	struct xrt_conv_wire_image image; //!< v4: kind, sync, CPU pitch / format
+	void *sync_handle;                //!< v4 D3D_FENCE: the caller's fence (borrowed)
+	uint32_t region_x, region_y;      //!< v4
+	bool owns_handle;                 //!< v4 CPU: a mapping this call made (closed after the submit)
+};
+
+static uint32_t
+lift_conv_fmt(XrLiftPixelFormatDXR f)
+{
+	switch (f) {
+	case XR_LIFT_PIXEL_FORMAT_RGBA8_UNORM_DXR:
+	case XR_LIFT_PIXEL_FORMAT_RGBA8_SRGB_DXR:
+	case XR_LIFT_PIXEL_FORMAT_BGRA8_UNORM_DXR:
+	case XR_LIFT_PIXEL_FORMAT_BGRA8_SRGB_DXR: return (uint32_t)f; // values equal the ABI's
+	default: return 0;
+	}
+}
+
 /*!
- * XrLiftFrameImagesDXR (spec 4) -> the v3 submit's handle + extent. A spec-4
- * runtime takes one COLOR image of a kind the session's imageKinds offer
- * (D3D11 NT / legacy DXGI), its region anchored at the origin.
+ * XrLiftFrameImagesDXR (spec 4) -> the submit. One COLOR image of a kind the
+ * session's imageKinds offer, any region inside it: D3D11 NT / legacy DXGI
+ * (keyed mutex, or a D3D fence), D3D12 NT (a D3D fence, or writes complete
+ * before the call), CPU bytes (copied into a mapping before return).
  */
 static XrResult
-lift_frame_images_to_v3(struct oxr_logger *log,
-                        struct oxr_session *sess,
-                        const XrLiftFrameImagesDXR *fi,
-                        void **out_handle,
-                        bool *out_is_dxgi,
-                        XrExtent2Di *out_extent)
+lift_frame_images_resolve(struct oxr_logger *log,
+                          struct oxr_session *sess,
+                          const XrLiftFrameImagesDXR *fi,
+                          struct lift_input *out)
 {
+	memset(out, 0, sizeof(*out));
 	if (fi->imageCount != 1 || fi->images == NULL) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 		                 "XrLiftFrameImagesDXR: imageCount %u (a spec-4 runtime takes one COLOR image)",
@@ -714,22 +743,69 @@ lift_frame_images_to_v3(struct oxr_logger *log,
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR: kind %d is not offered here",
 		                 (int)im->kind);
 	}
+	if (im->region.offset.x < 0 || im->region.offset.y < 0 || im->region.extent.width <= 0 ||
+	    im->region.extent.height <= 0) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR::region (%d,%d %dx%d) invalid",
+		                 im->region.offset.x, im->region.offset.y, im->region.extent.width,
+		                 im->region.extent.height);
+	}
+	const uint32_t rx = (uint32_t)im->region.offset.x, ry = (uint32_t)im->region.offset.y;
+	const uint32_t rw = (uint32_t)im->region.extent.width, rh = (uint32_t)im->region.extent.height;
+	out->extent = im->region.extent;
+	out->region_x = rx;
+	out->region_y = ry;
+	struct xrt_conv_wire_image *w = &out->image;
+	w->role = XRT_CONV_IMG_COLOR;
+	w->width = rw;
+	w->height = rh;
+	w->format = lift_conv_fmt(im->format);
+
+	if (kind == XR_LIFT_IMAGE_KIND_CPU_DXR) {
+		if (im->cpuBytes == NULL || w->format == 0 || im->cpuRowPitch < (rx + rw) * 4u ||
+		    (im->syncKind != XR_LIFT_SYNC_KIND_NONE_DXR && im->syncKind != XR_LIFT_SYNC_KIND_CPU_COMPLETE_DXR)) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "XrLiftImageDXR: a CPU image needs cpuBytes, an RGBA8 / BGRA8 format, cpuRowPitch >= "
+			                 "(region x + width) * 4 and syncKind NONE / CPU_COMPLETE");
+		}
+		// The bytes are copied before return (the region only, tightly packed).
+		if (!oxr_conv_cpu_upload(im->cpuBytes, im->cpuRowPitch, rx, ry, rw, rh, &out->handle)) {
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "XrLiftImageDXR: could not stage the CPU image");
+		}
+		out->owns_handle = true;
+		out->v4 = true;
+		out->region_x = 0;
+		out->region_y = 0;
+		w->memory_kind = XRT_CONV_MEM_CPU;
+		w->row_stride = rw * 4u;
+		w->byte_size = (uint64_t)rw * rh * 4u;
+		w->sync_kind = XRT_CONV_SYNC_NONE;
+		return XR_SUCCESS;
+	}
+
 	if (im->handle == NULL) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR::handle is NULL");
 	}
-	if (im->syncKind != XR_LIFT_SYNC_KIND_NONE_DXR && im->syncKind != XR_LIFT_SYNC_KIND_KEYED_MUTEX_DXR) {
+	const bool d3d12 = kind == XR_LIFT_IMAGE_KIND_D3D12_NT_DXR;
+	const bool fence = im->syncKind == XR_LIFT_SYNC_KIND_D3D_FENCE_DXR;
+	const bool sync_ok =
+	    fence || im->syncKind == XR_LIFT_SYNC_KIND_NONE_DXR ||
+	    (d3d12 ? im->syncKind == XR_LIFT_SYNC_KIND_CPU_COMPLETE_DXR : im->syncKind == XR_LIFT_SYNC_KIND_KEYED_MUTEX_DXR);
+	if (!sync_ok || (fence && im->syncHandle == NULL)) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-		                 "XrLiftImageDXR: syncKind %d (a D3D11 shared texture syncs with its keyed mutex)",
-		                 (int)im->syncKind);
+		                 "XrLiftImageDXR: syncKind %d does not fit kind %d (D3D11: keyed mutex or D3D fence; D3D12: "
+		                 "D3D fence or CPU_COMPLETE)",
+		                 (int)im->syncKind, (int)kind);
 	}
-	if (im->region.offset.x != 0 || im->region.offset.y != 0) {
-		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-		                 "XrLiftImageDXR::region must start at (0, 0) on this runtime (got %d, %d)",
-		                 im->region.offset.x, im->region.offset.y);
+	out->handle = im->handle;
+	out->is_dxgi = kind == XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR;
+	// The v3 submit when it can say it: a D3D11 texture at the origin, keyed mutex.
+	out->v4 = d3d12 || fence || rx != 0 || ry != 0;
+	if (out->v4) {
+		w->memory_kind = out->is_dxgi ? XRT_CONV_MEM_WIN32_KMT_HANDLE : XRT_CONV_MEM_WIN32_NT_HANDLE;
+		w->sync_kind = fence ? XRT_CONV_SYNC_FENCE_NT : XRT_CONV_SYNC_NONE;
+		w->sync_acquire_value = fence ? im->syncValue : 0;
+		out->sync_handle = fence ? im->syncHandle : NULL;
 	}
-	*out_handle = im->handle;
-	*out_is_dxgi = kind == XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR;
-	*out_extent = im->region.extent;
 	return XR_SUCCESS;
 }
 
@@ -975,17 +1051,21 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	*frameId = 0;
 
 	// Spec 4: XrLiftFrameImagesDXR replaces inputTexture / inputIsDxgi / extent.
-	void *in_texture = submitInfo->inputTexture;
-	bool in_is_dxgi = submitInfo->inputIsDxgi == XR_TRUE;
-	XrExtent2Di in_extent = submitInfo->extent;
+	struct lift_input li;
+	memset(&li, 0, sizeof(li));
+	li.handle = submitInfo->inputTexture;
+	li.is_dxgi = submitInfo->inputIsDxgi == XR_TRUE;
+	li.extent = submitInfo->extent;
 	const XrLiftFrameImagesDXR *frame_images =
 	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_FRAME_IMAGES_DXR, XrLiftFrameImagesDXR);
 	if (frame_images != NULL) {
-		XrResult ir = lift_frame_images_to_v3(&log, sess, frame_images, &in_texture, &in_is_dxgi, &in_extent);
+		XrResult ir = lift_frame_images_resolve(&log, sess, frame_images, &li);
 		if (ir != XR_SUCCESS) {
 			return ir;
 		}
 	}
+	void *in_texture = li.handle;
+	const XrExtent2Di in_extent = li.extent;
 	const XrLiftFrameControlDXR *frame_control =
 	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_FRAME_CONTROL_DXR, XrLiftFrameControlDXR);
 	const bool discontinuity =
@@ -994,6 +1074,8 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	if (in_texture == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameSubmitInfoDXR::inputTexture is NULL");
 	}
+	// Every return below this point goes through the submit (which closes a
+	// CPU staging mapping), except the validation of the options: do it here.
 	if (in_extent.width <= 0 || in_extent.height <= 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "XrLiftFrameSubmitInfoDXR::extent (%dx%d) must be positive", in_extent.width,
@@ -1017,6 +1099,9 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		}
 		XrResult vr = lift_validate_options(&log, opt, st->mode, st->max_views, /*weave_path*/ false);
 		if (vr != XR_SUCCESS) {
+			if (li.owns_handle) {
+				oxr_conv_close_handle(li.handle);
+			}
 			return vr;
 		}
 		lift_params_from_xr(opt, st->mode, &params);
@@ -1026,6 +1111,9 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		if (v != NULL) {
 			vr = oxr_lift_view_control_from_xr(&log, v, &vc);
 			if (vr != XR_SUCCESS) {
+				if (li.owns_handle) {
+					oxr_conv_close_handle(li.handle);
+				}
 				return vr;
 			}
 			vcp = &vc;
@@ -1047,6 +1135,9 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	struct lift_route route;
 	XrResult rr = lift_stream_route_open(&log, st, &route, "xrSubmitLiftFrameDXR");
 	if (rr != XR_SUCCESS) {
+		if (li.owns_handle) {
+			oxr_conv_close_handle(li.handle);
+		}
 		return rr;
 	}
 	xrt_result_t xret = XRT_SUCCESS;
@@ -1054,14 +1145,28 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 		// Spec 4: drop temporal state before this frame (seek / cut / switch).
 		xret = ipc_client_conv_stream_reset(route.c, st->id);
 		if (xret == XRT_ERROR_IPC_FAILURE) {
+			if (li.owns_handle) {
+				oxr_conv_close_handle(li.handle);
+			}
 			lift_route_close(sess, &route, xret);
 			return lift_xret(&log, sess, &route, xret, "xrSubmitLiftFrameDXR (discontinuity)");
 		}
 	}
-	xret = ipc_client_lift_submit(route.c, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)in_texture, in_is_dxgi,
-	                              (uint32_t)in_extent.width, (uint32_t)in_extent.height,
-	                              (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp,
-	                              rigp, frameId);
+	if (li.v4) {
+		xret = ipc_client_conv_submit_frame(
+		    route.c, st->id, &li.image, (xrt_graphics_buffer_handle_t)(intptr_t)in_texture,
+		    (xrt_graphics_buffer_handle_t)(intptr_t)li.sync_handle, li.region_x, li.region_y,
+		    (uint32_t)in_extent.width, (uint32_t)in_extent.height, (int64_t)submitInfo->sourceTime, pp,
+		    vp_count > 0 ? vps : NULL, vp_count, vcp, rigp, frameId);
+		if (li.owns_handle) {
+			oxr_conv_close_handle(li.handle); // the transport duplicated it into the service
+		}
+	} else {
+		xret = ipc_client_lift_submit(route.c, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)in_texture,
+		                              li.is_dxgi, (uint32_t)in_extent.width, (uint32_t)in_extent.height,
+		                              (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count,
+		                              vcp, rigp, frameId);
+	}
 	lift_route_close(sess, &route, xret);
 	return lift_xret(&log, sess, &route, xret, "xrSubmitLiftFrameDXR");
 }
@@ -1208,7 +1313,7 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_DEPTH_INFO_DXR, XrLiftDepthInfoDXR);
 	XrLiftViewsInfoDXR *views_info =
 	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_VIEWS_INFO_DXR, XrLiftViewsInfoDXR);
-	const bool want_v4 = depth_info != NULL || views_info != NULL;
+	const bool want_v4 = depth_info != NULL || views_info != NULL || st->export_cpu;
 
 	bool ready = false;
 	struct xrt_lift_result r;
@@ -1250,8 +1355,40 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		echo->rectSize.height = r.rect_size[1];
 	}
 
+	if (st->export_cpu) {
+		// CPU export: the bytes sit in a mapping the service refreshed for
+		// this acquire; map it on the first acquire and on reallocation.
+		if (r.output_realloc || st->cpu_view == NULL) {
+			bool have = false;
+			uint32_t cw = 0, ch = 0, cf = 0;
+			uint64_t cb = 0;
+			xrt_graphics_buffer_handle_t mh = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+			xret = ipc_client_conv_get_cpu_output(route.c, st->id, &have, &cw, &ch, &cf, &cb, &mh);
+			if (xret != XRT_SUCCESS) {
+				lift_route_close(sess, &route, xret);
+				return lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR (CPU export)");
+			}
+			oxr_conv_cpu_unmap(st->cpu_view);
+			st->cpu_view = have ? oxr_conv_cpu_map((void *)(intptr_t)mh, cb) : NULL;
+			oxr_conv_close_handle((void *)(intptr_t)mh); // the view keeps the section alive
+			st->cpu_bytes = st->cpu_view != NULL ? cb : 0;
+		}
+		result->outputTexture = st->cpu_view; // tightly packed rows, valid until the next acquire
+		result->fence = NULL;
+		const int64_t dxgi = result->format;
+		result->format = 0; // XrLiftResultExportDXR is authoritative
+		if (export_info != NULL) {
+			export_info->kind = XR_LIFT_IMAGE_KIND_CPU_DXR;
+			export_info->format = oxr_conv_pixel_format_from_dxgi(dxgi);
+			export_info->colorSpace = st->mode == XRT_DP_LIFT_MODE_DEPTH ? XR_LIFT_COLOR_SPACE_UNKNOWN_DXR
+			                                                             : XR_LIFT_COLOR_SPACE_SRGB_DXR;
+			export_info->syncKind = XR_LIFT_SYNC_KIND_CPU_COMPLETE_DXR;
+		}
+		st->exported = true;
+	}
+
 	// Handles: first acquire and every reallocation (the weave output pattern).
-	if (r.output_realloc || !st->exported) {
+	if (!st->export_cpu && (r.output_realloc || !st->exported)) {
 		bool have_tex = false, have_fence = false;
 		xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
@@ -1278,9 +1415,8 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	}
 
 	// Spec 4: XrLiftResultExportDXR is left untouched on a D3D11_NT stream
-	// (every stream so far: exportKind 0 or D3D11_NT); the result means what
+	// (filled above for a CPU export); the result means what
 	// XrLiftDepthInfoDXR / XrLiftViewsInfoDXR say.
-	(void)export_info;
 	if (want_v4) {
 		lift_fill_v4_info(&r4, discontinuity, depth_info, views_info);
 	}

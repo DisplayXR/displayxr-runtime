@@ -470,3 +470,72 @@ ipc_client_conv_poll_event(struct ipc_connection *ipc_c, bool *out_has, struct x
 	}
 	return ipc_call_conv_poll_event(ipc_c, out_has, out_event);
 }
+
+xrt_result_t
+ipc_client_conv_submit_frame(struct ipc_connection *ipc_c,
+                             uint64_t stream_id,
+                             const struct xrt_conv_wire_image *image,
+                             xrt_graphics_buffer_handle_t handle,
+                             xrt_graphics_buffer_handle_t sync_handle,
+                             uint32_t region_x,
+                             uint32_t region_y,
+                             uint32_t width,
+                             uint32_t height,
+                             int64_t source_time,
+                             const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_count,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
+                             uint64_t *out_frame_id)
+{
+	if (ipc_c == NULL || out_frame_id == NULL || image == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_frame_id = 0;
+	struct ipc_arg_lift_submit args;
+	U_ZERO(&args);
+	args.stream_id = stream_id;
+	args.source_time = source_time;
+	args.width = width;
+	args.height = height;
+	if (params != NULL) {
+		args.has_params = 1;
+		params_to_ipc(params, viewpoints, viewpoint_count, &args.params);
+		if (view_control != NULL) {
+			args.params.has_view_control = 1;
+			args.params.view_control = *view_control;
+		}
+		if (rig != NULL) {
+			args.params.rig = *rig;
+		}
+	}
+	xrt_graphics_buffer_handle_t handles[2] = {handle, sync_handle};
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	// Legacy DXGI handles cross raw, low-bit tagged (the weave_submit convention).
+	if (image->memory_kind == XRT_CONV_MEM_WIN32_KMT_HANDLE && handles[0] != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		handles[0] = (HANDLE)((size_t)handles[0] | 1);
+	}
+#endif
+	const uint32_t count = image->sync_kind == XRT_CONV_SYNC_FENCE_NT ? 2u : 1u;
+	return ipc_call_conv_submit_frame(ipc_c, &args, image, region_x, region_y, handles, count, out_frame_id);
+}
+
+xrt_result_t
+ipc_client_conv_get_cpu_output(struct ipc_connection *ipc_c,
+                               uint64_t stream_id,
+                               bool *out_have,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint32_t *out_format,
+                               uint64_t *out_bytes,
+                               xrt_graphics_buffer_handle_t *out_handle)
+{
+	*out_have = false;
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_conv_get_cpu_output(ipc_c, stream_id, out_have, out_width, out_height, out_format, out_bytes,
+	                                    out_handle, 1);
+}

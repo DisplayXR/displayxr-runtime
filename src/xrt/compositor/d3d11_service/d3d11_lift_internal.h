@@ -204,6 +204,19 @@ struct glue_stream
 	ID3D11Texture2D *exp_depth_tex = nullptr;
 	HANDLE exp_depth_handle = nullptr;
 	uint32_t exp_depth_w = 0, exp_depth_h = 0, exp_depth_format = 0;
+	// Spec 4 (#2054): the caller's shared fence, CPU-input upload, CPU export.
+	ID3D11Fence *imp_fence = nullptr;
+	HANDLE imp_fence_handle = nullptr;
+	ID3D11Texture2D *cpu_tex = nullptr;
+	ID3D11ShaderResourceView *cpu_srv = nullptr;
+	uint32_t cpu_w = 0, cpu_h = 0;
+	DXGI_FORMAT cpu_fmt = DXGI_FORMAT_UNKNOWN;
+	HANDLE cpu_map = nullptr;
+	void *cpu_view = nullptr;
+	uint64_t cpu_map_bytes = 0;
+	ID3D11Texture2D *cpu_stage = nullptr;
+	uint32_t cpu_stage_w = 0, cpu_stage_h = 0;
+	DXGI_FORMAT cpu_stage_fmt = DXGI_FORMAT_UNKNOWN;
 };
 
 //! S6 / S7 depth readback of one core stream (dispatcher thread).

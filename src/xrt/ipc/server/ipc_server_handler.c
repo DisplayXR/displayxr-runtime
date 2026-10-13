@@ -9801,6 +9801,7 @@ static_assert(sizeof(struct ipc_conv_stream_create_msg) <= IPC_BUF_SIZE, "conv_s
 static_assert(sizeof(struct ipc_conv_acquire_result_reply) <= IPC_BUF_SIZE,
               "conv_acquire_result reply exceeds IPC_BUF_SIZE");
 static_assert(sizeof(struct ipc_conv_poll_event_reply) <= IPC_BUF_SIZE, "conv_poll_event reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_submit_frame_msg) <= IPC_BUF_SIZE, "conv_submit_frame exceeds IPC_BUF_SIZE");
 
 static bool
 conv_header_ok(uint32_t struct_size, uint32_t family_version, size_t min_size)
@@ -9911,6 +9912,104 @@ ipc_handle_conv_acquire_result(volatile struct ipc_client_state *ics,
 	}
 	return ipc_server_conv_v4_acquire(ipc_server_get_conv(), ics->lift_owner, stream_id, out_ready,
 	                                  out_discontinuity, out_lift_result, out_meta);
+}
+
+xrt_result_t
+ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_lift_submit *args,
+                             const struct xrt_conv_wire_image *image,
+                             uint32_t region_x,
+                             uint32_t region_y,
+                             uint64_t *out_frame_id,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_frame_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_submit_frame");
+	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth;
+	}
+	const bool fence = image->sync_kind == XRT_CONV_SYNC_FENCE_NT;
+	if (handle_count < (fence ? 2u : 1u) || !ipc_server_conv_owns_stream(ipc_server_get_conv(), args->stream_id)) {
+		weave_submit_release_handles(handles, handle_count);
+		return handle_count < 1 ? XRT_ERROR_IPC_FAILURE : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	struct conv_input_import in;
+	memset(&in, 0, sizeof(in));
+	in.handle = handles[0];
+	in.sync_handle = fence ? handles[1] : XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	switch (image->memory_kind) {
+	case XRT_CONV_MEM_WIN32_NT_HANDLE: in.kind = CONV_INPUT_NT; break;
+	case XRT_CONV_MEM_WIN32_KMT_HANDLE:
+		in.kind = CONV_INPUT_DXGI;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		if ((size_t)in.handle & 1) {
+			in.handle = (HANDLE)((size_t)in.handle - 1); // legacy DXGI handles cross low-bit tagged
+		}
+#endif
+		break;
+	case XRT_CONV_MEM_CPU: in.kind = CONV_INPUT_CPU; break;
+	default:
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_INPUT_UNSUPPORTED; // a kind the service does not take (validated client-side)
+	}
+	if (handle_count > (fence ? 2u : 1u)) {
+		weave_submit_release_handles(handles + (fence ? 2 : 1), handle_count - (fence ? 2u : 1u));
+	}
+	in.sync_kind = image->sync_kind;
+	in.sync_value = image->sync_acquire_value;
+	in.x = region_x;
+	in.y = region_y;
+	in.cpu_row_pitch = image->row_stride;
+	in.cpu_bgra = image->format == XRT_CONV_FMT_BGRA8_UNORM || image->format == XRT_CONV_FMT_BGRA8_SRGB;
+	// ADR-048: the session's window is the lifted rect, as for the v3 submit.
+	struct xrt_lift_rect_frame frame = {0};
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *fxsysc = lift_xsysc(ics);
+	if (fxsysc != NULL) {
+		comp_d3d11_service_conv_rect_frame(fxsysc, ics->xc, &frame);
+	}
+#endif
+	return ipc_server_conv_v4_submit(ipc_server_get_conv(), lift_owner(ics), args, &in, &frame, out_frame_id);
+}
+
+xrt_result_t
+ipc_handle_conv_get_cpu_output(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_have_output,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint32_t *out_format,
+                               uint64_t *out_bytes,
+                               uint32_t max_handle_count,
+                               xrt_graphics_buffer_handle_t *out_handles,
+                               uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_bytes = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_get_cpu_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1 || ics->lift_owner == 0) {
+		return XRT_SUCCESS;
+	}
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (ipc_server_conv_v4_cpu_output(ipc_server_get_conv(), ics->lift_owner, stream_id, &h, out_width, out_height,
+	                                  out_format, out_bytes)) {
+		// Glue-owned: the transport DuplicateHandle's it into the caller.
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+	}
+	return XRT_SUCCESS;
 }
 
 xrt_result_t

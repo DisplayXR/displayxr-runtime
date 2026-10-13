@@ -103,10 +103,85 @@ oxr_conv_session_image_kinds(struct oxr_session *sess, uint64_t *out_in_kinds, u
 	if (native && !oxr_conv_inprocess_eligible(sess)) {
 		return;
 	}
-	*out_in_kinds = (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR) | (1ull << XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR);
-	*out_export_kinds = 1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR;
+	// The service masks these by what its transport takes (conv_enum_task).
+	*out_in_kinds = (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR) | (1ull << XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR) |
+	                (1ull << XR_LIFT_IMAGE_KIND_D3D12_NT_DXR) | (1ull << XR_LIFT_IMAGE_KIND_CPU_DXR);
+	*out_export_kinds = (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR) | (1ull << XR_LIFT_IMAGE_KIND_CPU_DXR);
 #else
 	(void)sess;
+#endif
+}
+
+bool
+oxr_conv_cpu_upload(const void *bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t w, uint32_t h, void **out_handle)
+{
+	*out_handle = NULL;
+#ifdef XRT_OS_WINDOWS
+	const uint64_t size = (uint64_t)w * h * 4u;
+	HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, (DWORD)(size >> 32),
+	                              (DWORD)(size & 0xffffffffu), NULL);
+	if (m == NULL) {
+		return false;
+	}
+	uint8_t *view = (uint8_t *)MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, 0);
+	if (view == NULL) {
+		CloseHandle(m);
+		return false;
+	}
+	const uint8_t *src = (const uint8_t *)bytes + (size_t)y * pitch + (size_t)x * 4u;
+	for (uint32_t row = 0; row < h; row++) {
+		memcpy(view + (size_t)row * w * 4u, src + (size_t)row * pitch, (size_t)w * 4u);
+	}
+	UnmapViewOfFile(view);
+	*out_handle = m;
+	return true;
+#else
+	(void)bytes;
+	(void)pitch;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+	return false;
+#endif
+}
+
+void *
+oxr_conv_cpu_map(void *handle, uint64_t bytes)
+{
+#ifdef XRT_OS_WINDOWS
+	if (handle == NULL || bytes == 0) {
+		return NULL;
+	}
+	return MapViewOfFile((HANDLE)handle, FILE_MAP_READ, 0, 0, (SIZE_T)bytes);
+#else
+	(void)handle;
+	(void)bytes;
+	return NULL;
+#endif
+}
+
+void
+oxr_conv_cpu_unmap(void *view)
+{
+#ifdef XRT_OS_WINDOWS
+	if (view != NULL) {
+		UnmapViewOfFile(view);
+	}
+#else
+	(void)view;
+#endif
+}
+
+void
+oxr_conv_close_handle(void *handle)
+{
+#ifdef XRT_OS_WINDOWS
+	if (handle != NULL) {
+		CloseHandle((HANDLE)handle);
+	}
+#else
+	(void)handle;
 #endif
 }
 

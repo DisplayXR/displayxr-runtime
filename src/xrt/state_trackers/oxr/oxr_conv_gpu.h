@@ -32,6 +32,21 @@ oxr_conv_link_get(struct oxr_session *sess);
 void
 oxr_conv_session_image_kinds(struct oxr_session *sess, uint64_t *out_in_kinds, uint64_t *out_export_kinds);
 
+/*! CPU input: copy the region (@p x, @p y, @p w x @p h of @p bytes, @p pitch)
+ *  tightly packed into a new file mapping; *out_handle is the caller's. */
+bool
+oxr_conv_cpu_upload(const void *bytes, uint32_t pitch, uint32_t x, uint32_t y, uint32_t w, uint32_t h, void **out_handle);
+
+//! CPU export: a read-only view of a mapping handle (NULL on failure).
+void *
+oxr_conv_cpu_map(void *handle, uint64_t bytes);
+
+void
+oxr_conv_cpu_unmap(void *view);
+
+void
+oxr_conv_close_handle(void *handle);
+
 #ifdef __cplusplus
 }
 #endif

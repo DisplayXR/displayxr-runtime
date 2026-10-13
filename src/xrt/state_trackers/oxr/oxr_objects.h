@@ -4753,6 +4753,9 @@ struct oxr_lift_stream_dxr
 	uint32_t max_views;
 	bool v4;       //!< spec 4: created with XrLiftTaskStreamCreateInfoDXR
 	uint32_t task; //!< spec 4: its XrLiftTaskDXR (0 = a spec-3 mode stream)
+	bool export_cpu;   //!< spec 4: exportKind CPU (results read from a mapping)
+	void *cpu_view;    //!< the mapped CPU export (valid until the next acquire)
+	uint64_t cpu_bytes;
 };
 
 //! Spec 4: at most this often does xrPollEvent ask the service for lift events.

@@ -72,7 +72,8 @@ struct sc_stream
 
 	/* Spec 4 (#2054): created by conv_stream_create (a task stream). */
 	bool v4;
-	uint32_t task; //!< XRT_CONV_TASK_*
+	uint32_t task;   //!< XRT_CONV_TASK_*
+	bool export_cpu; //!< results leave as CPU bytes (io.export_cpu)
 };
 
 //! Pending event ids per connection (tasks + the providers pseudo-id, each once).
@@ -1623,6 +1624,11 @@ ipc_server_conv_v4_image_kinds(struct ipc_server_conv *sc, bool export_kinds)
 	uint64_t kinds = 1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT;
 	if (!export_kinds) {
 		kinds |= 1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D11_DXGI;
+		if (io.import_input_ex != NULL) {
+			kinds |= (1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D12_NT) | (1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU);
+		}
+	} else if (io.export_cpu != NULL) {
+		kinds |= 1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU;
 	}
 	return kinds;
 }
@@ -1740,13 +1746,16 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 	if (input_kind != XRT_CONV_INPUT_MONO) {
 		return XRT_ERROR_INPUT_UNSUPPORTED; // stereo / image+depth input is spec 5
 	}
-	if (in->export_memory_kind != 0 && in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE) {
-		return XRT_ERROR_INPUT_UNSUPPORTED; // no candidate exports any other kind yet
+	struct ipc_server_conv_io_ops io;
+	const bool have_io = get_io(sc, &io);
+	const bool cpu_export = in->export_memory_kind == XRT_CONV_MEM_CPU;
+	if (in->export_memory_kind != 0 && in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE &&
+	    !(cpu_export && have_io && io.export_cpu != NULL)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // an export kind no candidate offers
 	}
 
 	/* FEATURE_UNSUPPORTED: no non-terminal candidate, no stream lane, no route. */
-	struct ipc_server_conv_io_ops io;
-	if (!get_io(sc, &io)) {
+	if (!have_io) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct xrt_conv_wire_task_desc d;
@@ -1786,6 +1795,7 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 	st.client_id = client_id;
 	st.v4 = true;
 	st.task = task;
+	st.export_cpu = cpu_export;
 	st.content_hint = task == XRT_CONV_TASK_DEPTH_MONO ? XRT_CONV_CONTENT_PHOTO
 	                  : task == XRT_CONV_TASK_DEPTH_VIDEO ? XRT_CONV_CONTENT_VIDEO
 	                                                      : in->content_hint;
@@ -1877,6 +1887,23 @@ ipc_server_conv_v4_acquire(struct ipc_server_conv *sc,
 	if (xret != XRT_SUCCESS || !*out_ready) {
 		return xret;
 	}
+	struct sc_stream st;
+	struct ipc_server_conv_io_ops io;
+	if (find_stream(sc, client_id, stream_id, &st) && st.export_cpu && get_io(sc, &io) && io.export_cpu != NULL) {
+		// CPU export: the result just published, read back into the mapping
+		// the caller reads (valid until its next acquire on this stream).
+		xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		uint32_t w = 0, hh = 0, f = 0;
+		uint64_t bytes = 0;
+		bool realloc_cpu = false;
+		if (!io.export_cpu(io.ud, stream_id, true, &h, &w, &hh, &f, &bytes, &realloc_cpu)) {
+			*out_ready = false;
+			return XRT_ERROR_WEAVE_REFUSED;
+		}
+		if (realloc_cpu) {
+			out_v3->output_realloc = 1;
+		}
+	}
 	xrt_conv_wire_begin(out, (uint32_t)sizeof(*out));
 	out->stream_id = stream_id;
 	out->frame_id = r.frame_id;
@@ -1908,4 +1935,137 @@ v4_client_gone(struct ipc_server_conv *sc, uint64_t client_id)
 		memset(e, 0, sizeof(*e));
 	}
 	os_mutex_unlock(&sc->ev_mtx);
+}
+
+static void
+v4_release_input(const struct ipc_server_conv_io_ops *io, const struct conv_input_import *in)
+{
+	io->release_input(io->ud, in->handle, in->kind == CONV_INPUT_DXGI);
+	if (in->sync_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		io->release_input(io->ud, in->sync_handle, false);
+	}
+}
+
+xrt_result_t
+ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
+                          uint64_t client_id,
+                          const struct ipc_arg_lift_submit *args,
+                          const struct conv_input_import *in,
+                          const struct xrt_lift_rect_frame *frame,
+                          uint64_t *out_frame_id)
+{
+	*out_frame_id = 0;
+	struct ipc_server_conv_io_ops io;
+	if (!get_io(sc, &io)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // the caller still owns the handles: route checked first
+	}
+	if (io.import_input_ex == NULL) {
+		v4_release_input(&io, in);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct sc_stream st;
+	if (!find_stream(sc, client_id, args->stream_id, &st) || st.core_id == 0) {
+		v4_release_input(&io, in);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream (or the GAUSSIANS facade): non-fatal
+	}
+	if (args->width == 0 || args->height == 0) {
+		v4_release_input(&io, in);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+
+	// The sticky params, exactly as the v3 submit keeps them.
+	if (args->has_params != 0) {
+		st.last_params = args->params;
+		st.has_last_params = true;
+	}
+	struct ipc_lift_params p;
+	memset(&p, 0, sizeof(p));
+	p.convergence = -1.0f;
+	p.strength = 1.0f;
+	p.inpaint = 1;
+	if (st.has_last_params) {
+		p = st.last_params;
+	}
+	if (st.mode == XRT_DP_LIFT_MODE_NVIEW && p.view_count != 0 && p.view_count != st.view_count) {
+		if (p.view_count < 2 || p.view_count > st.max_views) {
+			v4_release_input(&io, in);
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		const uint64_t old_core = st.core_id;
+		st.view_count = p.view_count;
+		xrt_result_t cr = core_create(sc, &st, &st.core_id);
+		if (cr != XRT_SUCCESS) {
+			v4_release_input(&io, in);
+			return cr;
+		}
+		(void)conv_core_stream_destroy(sc->core, old_core);
+	}
+	store_stream(sc, &st);
+
+	uint32_t sw = args->width, sh = args->height;
+	if (st.input_scale < 1.0f) {
+		sw = (uint32_t)((float)args->width * st.input_scale + 0.5f);
+		sh = (uint32_t)((float)args->height * st.input_scale + 0.5f);
+		sw = sw < 1 ? 1 : sw;
+		sh = sh < 1 ? 1 : sh;
+	}
+	struct conv_submit_layout lay;
+	memset(&lay, 0, sizeof(lay));
+	lay.image_count = 1;
+	lay.width[0] = sw;
+	lay.height[0] = sh;
+	lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+	lay.color_space[0] = XRT_CONV_CS_SRGB;
+	lay.role[0] = XRT_CONV_IMG_COLOR;
+	struct conv_submit_slot slot;
+	memset(&slot, 0, sizeof(slot));
+	xrt_result_t xret = conv_core_stream_begin_submit(sc->core, st.core_id, &lay, &slot);
+	if (xret != XRT_SUCCESS) {
+		v4_release_input(&io, in);
+		return xret;
+	}
+	struct conv_input_import region = *in;
+	region.w = args->width;
+	region.h = args->height;
+	xret = io.import_input_ex(io.ud, st.wire_id, &region, &slot); // owns the handles from here
+	if (xret != XRT_SUCCESS) {
+		conv_core_stream_abort_submit(sc->core, st.core_id, slot.slot);
+		return xret;
+	}
+
+	struct conv_frame_submit fr;
+	memset(&fr, 0, sizeof(fr));
+	fr.source_time = args->source_time;
+	frame_from_params(&p, st.view_count, &fr);
+	if (st.input_scale < 1.0f && fr.focal_px > 0.0f) {
+		fr.focal_px *= (float)sw / (float)args->width;
+	}
+	if (frame != NULL && frame->valid) {
+		fr.rect_valid = true;
+		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
+		fr.rect_w_m = frame->width_m;
+		fr.rect_h_m = frame->height_m;
+	}
+	return conv_core_stream_commit_submit(sc->core, st.core_id, slot.slot, &fr, out_frame_id);
+}
+
+bool
+ipc_server_conv_v4_cpu_output(struct ipc_server_conv *sc,
+                              uint64_t client_id,
+                              uint64_t stream_id,
+                              xrt_graphics_buffer_handle_t *out_handle,
+                              uint32_t *out_width,
+                              uint32_t *out_height,
+                              uint32_t *out_format,
+                              uint64_t *out_bytes)
+{
+	struct sc_stream st;
+	struct ipc_server_conv_io_ops io;
+	if (sc == NULL || !find_stream(sc, client_id, stream_id, &st) || !st.export_cpu || !get_io(sc, &io) ||
+	    io.export_cpu == NULL) {
+		return false;
+	}
+	bool realloc_unused = false;
+	return io.export_cpu(io.ud, stream_id, false, out_handle, out_width, out_height, out_format, out_bytes,
+	                     &realloc_unused);
 }

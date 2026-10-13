@@ -180,6 +180,31 @@ struct ipc_server_conv_io_ops
 	                                 uint32_t width,
 	                                 uint32_t height,
 	                                 uint8_t **out_pixels);
+
+	/*!
+	 * OPTIONAL (spec 4, #2054): import any spec-4 input kind (D3D11 / D3D12
+	 * NT + a shared fence, DXGI, CPU bytes in a file mapping) over a region
+	 * into @p slot. Takes ownership of both handles. NULL = only the v3
+	 * kinds (D3D11 NT / DXGI at the origin) are offered.
+	 */
+	xrt_result_t (*import_input_ex)(void *ud,
+	                                uint64_t stream_id,
+	                                const struct conv_input_import *in,
+	                                const struct conv_submit_slot *slot);
+	/*!
+	 * OPTIONAL (spec 4): the stream's export read back into a file mapping
+	 * the glue owns (@p copy: refresh it now, after publish_result; else the
+	 * current one). NULL = no CPU export kind.
+	 */
+	bool (*export_cpu)(void *ud,
+	                   uint64_t stream_id,
+	                   bool copy,
+	                   xrt_graphics_buffer_handle_t *out_handle,
+	                   uint32_t *out_width,
+	                   uint32_t *out_height,
+	                   uint32_t *out_format,
+	                   uint64_t *out_bytes,
+	                   bool *out_realloc);
 };
 
 /*!
@@ -439,6 +464,8 @@ ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id);
 /*! @name XrLiftImageKindDXR values the service's glue takes / gives (masks are 1 << kind) @{ */
 #define IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT 1u
 #define IPC_SERVER_CONV_IMAGE_KIND_D3D11_DXGI 2u
+#define IPC_SERVER_CONV_IMAGE_KIND_D3D12_NT 7u //!< with import_input_ex
+#define IPC_SERVER_CONV_IMAGE_KIND_CPU 16u     //!< input with import_input_ex, export with export_cpu
 /*! @} */
 
 /*! Latch @p client_id for events (idempotent; baseline = the effective states now). */
@@ -497,7 +524,8 @@ ipc_server_conv_v4_output_flags(const struct xrt_conv_wire_task_desc *d);
  * conv_stream_create (latches), roadmap §7.4:
  *  - XRT_ERROR_INPUT_UNSUPPORTED (VALIDATION_FAILURE): a reserved or spec-5
  *    task, @p legacy_mode not matching the task, an input kind other than
- *    MONO, an export kind other than the default / D3D11 NT, a view count
+ *    MONO, an export kind the glue does not give (default / D3D11 NT, CPU
+ *    with export_cpu), a view count
  *    outside 2..maxViews;
  *  - XRT_ERROR_FEATURE_NOT_SUPPORTED: no route (glue), no non-terminal
  *    candidate, a task without a stream lane, or a @p required_outputs bit
@@ -534,6 +562,33 @@ ipc_server_conv_v4_acquire(struct ipc_server_conv *sc,
                            bool *out_discontinuity,
                            struct ipc_lift_result *out_v3,
                            struct xrt_conv_wire_result *out);
+
+/*!
+ * conv_submit_frame (spec 4): the v3 submit (@p args: stream, extent =
+ * the region's size, source time, sticky params) of a spec-4 input image
+ * @p in (kind, handles, sync, region). Takes ownership of @p in's handles.
+ * Results as ipc_server_conv_lift_submit_framed, plus FEATURE_NOT_SUPPORTED
+ * when the glue has no import_input_ex.
+ */
+xrt_result_t
+ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
+                          uint64_t client_id,
+                          const struct ipc_arg_lift_submit *args,
+                          const struct conv_input_import *in,
+                          const struct xrt_lift_rect_frame *frame,
+                          uint64_t *out_frame_id);
+
+/*! conv_get_cpu_output: a CPU-export stream's current mapping (glue-owned:
+ *  the transport duplicates it) and its tightly packed layout. */
+bool
+ipc_server_conv_v4_cpu_output(struct ipc_server_conv *sc,
+                              uint64_t client_id,
+                              uint64_t stream_id,
+                              xrt_graphics_buffer_handle_t *out_handle,
+                              uint32_t *out_width,
+                              uint32_t *out_height,
+                              uint32_t *out_format,
+                              uint64_t *out_bytes);
 
 #ifdef __cplusplus
 }
