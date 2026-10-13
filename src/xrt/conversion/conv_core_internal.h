@@ -103,6 +103,9 @@ struct conv_stream
 	/* Temporal state. */
 	bool reset_pending;         //!< FRAME_RESET on the next conversion
 	bool discontinuity_pending; //!< `discontinuity` on the next result
+	//! A published result carried `discontinuity` that the consumer has not
+	//! acquired (latest-wins skipped it): the next acquired result carries it.
+	bool discontinuity_unread;
 	struct conv_policy_view_state vstate;
 	struct conv_observer observer;
 	bool has_observer;

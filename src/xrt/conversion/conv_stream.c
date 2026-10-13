@@ -1019,6 +1019,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 				st->still.budget = pf->budget;
 				st->still.rear_cap_m = pf->rear_cap_m;
 			}
+			// Latest-wins may supersede this result before anyone reads it:
+			// the reset must still reach the consumer (#2054).
+			st->discontinuity_unread = st->discontinuity_unread || s.discont;
 		} else {
 			u_lift_mailbox_abort_output(&st->mb, out_slot);
 		}
@@ -1672,7 +1675,9 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	memcpy(out->active, o->active, sizeof(out->active));
 	memcpy(out->rect_center, o->rect_center, sizeof(out->rect_center));
 	memcpy(out->rect_size, o->rect_size, sizeof(out->rect_size));
-	out->discontinuity = o->discontinuity;
+	// A discontinuity on a result latest-wins skipped rides on this one.
+	out->discontinuity = o->discontinuity || st->discontinuity_unread;
+	st->discontinuity_unread = false;
 	out->provisional = o->provisional;
 	out->output_realloc = o->alloc_gen != st->consumer_alloc_gen;
 	st->consumer_alloc_gen = o->alloc_gen;

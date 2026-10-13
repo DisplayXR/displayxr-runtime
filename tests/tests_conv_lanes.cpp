@@ -2614,3 +2614,45 @@ TEST_CASE("satellite: an orderly (idle) exit is not a crash; describe goes throu
 	}
 	conv_fake_fini(&f);
 }
+
+TEST_CASE("stream: a discontinuity latest-wins skipped rides on the next result acquired", "[conv_lanes]")
+{
+	// #2054: the result right after a reset may be superseded before the
+	// consumer reads it; the flag must not be lost with it.
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	c->state = XRT_CONV_STATE_READY;
+	c->convert_ms = 1;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 50) >= 0);
+		auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		conv_result r{};
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(wait_until(
+		    [&] { return conv_core_stream_acquire(core.c, cr.stream_id, true, &r) == XRT_SUCCESS; }, 2000));
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		// Reset, then two conversions publish before the consumer looks.
+		REQUIRE(conv_core_stream_reset(core.c, cr.stream_id) == XRT_SUCCESS);
+		const uint64_t before = stats(core.c, cr.stream_id).converted;
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(wait_until([&] { return stats(core.c, cr.stream_id).converted >= before + 1; }, 2000));
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(wait_until([&] { return stats(core.c, cr.stream_id).converted >= before + 2; }, 2000));
+		REQUIRE(conv_core_stream_acquire(core.c, cr.stream_id, true, &r) == XRT_SUCCESS);
+		CHECK(r.discontinuity); // the newest result carries the skipped one's flag
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+
+		REQUIRE(submit(core.c, cr.stream_id));
+		REQUIRE(wait_until(
+		    [&] { return conv_core_stream_acquire(core.c, cr.stream_id, true, &r) == XRT_SUCCESS; }, 2000));
+		CHECK_FALSE(r.discontinuity); // delivered once
+		conv_core_stream_release(core.c, cr.stream_id, r.ring_slot);
+		CHECK(f.resets_seen == 1u);
+	}
+	conv_fake_fini(&f);
+}
