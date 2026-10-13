@@ -33,6 +33,12 @@ if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	endif()
 endif()
 
+# ADR-053 D5 (#2033): the conversion-provider satellite host. Desktop only
+# (Android hosts providers in the runtime APK's :conversion process).
+if(XRT_FEATURE_SERVICE AND NOT ANDROID)
+	add_subdirectory(conversion_host)
+endif()
+
 # Android diagnostics dashboard JNI bridge (#558) — reuses the CLI's
 # query core, so it needs targets/cli configured.
 if(ANDROID AND XRT_MODULE_CLI)
