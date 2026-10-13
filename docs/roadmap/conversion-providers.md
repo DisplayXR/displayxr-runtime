@@ -493,8 +493,11 @@ p99 0.13–0.17 ms; in-service p50 0.02–0.05 ms, p99 0.07–0.13 ms; the hop a
 (three runs), inside the ≈ 0.05 ms CPU estimate above. Not in these numbers: the NT-handle open (once per
 output set), the CPU fence observe and the copy into the ring target on the D3D11 lane, and the
 weave-on-scanout split; those, and the end-to-end number against the in-process ≈ 22 ms, are the panel
-measurement still owed before P3. Recovery is the larger cost: a killed host was serving again after
-6.5–15.5 s (four runs) on this box, dominated by the host's start (the sim provider's probe alone took 3.5 s).
+measurement still owed before P3. **Restart (kill → the same stream served again, sim provider, 300 ms
+converts):** 6.5–15.5 s at first (six runs), almost all of it the file logger re-applying its AppContainer ACE
+over a log folder of ~11,600 files at every process start (#2044; the probe itself takes 0.2 ms); with that
+fixed, the kill is seen after 63–94 ms, the respawned host is RUNNING after 188 ms and the stream is served
+again after 551 ms.
 
 ### 3.8 Failure domains
 
