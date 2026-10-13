@@ -164,7 +164,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "system_workspace_hotkey_suspend", "weave_get_segments", "workspace_enumerate_screens",
                  "workspace_set_window_placement", "workspace_get_window_placement",
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
-                 "compositor_set_cursor_measure_request", "system_request_component_reselect")
+                 "compositor_set_cursor_measure_request", "system_request_component_reselect",
+                 "conv_warm")
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -211,7 +212,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # 8's three calls, #1884's weave_get_segments and ADR-052's three
         # workspace-screen calls follow it).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-15], "system_request_display_reprobe")
+        self.assertEqual(names[-16], "system_request_display_reprobe")
         call = self._call("system_request_display_reprobe")
         self.assertEqual(call.in_args, [])
         self.assertEqual(call.out_args, [])
@@ -227,7 +228,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # puts it back (one bool in). Session-free, DIAG only; only #1884's
         # weave_get_segments and ADR-052's workspace-screen calls follow them.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-14:-11], ["system_reload_service_config", "system_workspace_launch",
+        self.assertEqual(names[-15:-12], ["system_reload_service_config", "system_workspace_launch",
                                         "system_workspace_hotkey_suspend"])
         suspend = self._call("system_workspace_hotkey_suspend")
         self.assertEqual([(a.name, a.typename) for a in suspend.in_args], [("suspend", "bool")])
@@ -258,7 +259,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # gained a trailing count, below). The table is the per-segment views'
         # struct.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-11], "weave_get_segments")  # ADR-052's four calls, ADR-053's three, ADR-046 Phase 4's, then #2051's follow it
+        self.assertEqual(names[-12], "weave_get_segments")  # ADR-052's four calls, ADR-053's three, ADR-046 Phase 4's, then #2051's and #2029's conv_warm follow it
         call = self._call("weave_get_segments")
         self.assertEqual(call.in_args, [])
         self.assertEqual([(a.name, a.typename) for a in call.out_args],
@@ -273,7 +274,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # END of proto.json, so every earlier command keeps its enum value. A
         # pre-v25 controller sends none of them; set_window_pose is untouched.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-10:-7], ["workspace_enumerate_screens", "workspace_set_window_placement",
+        self.assertEqual(names[-11:-8], ["workspace_enumerate_screens", "workspace_set_window_placement",
                                          "workspace_get_window_placement"])
         enum = self._call("workspace_enumerate_screens")
         self.assertEqual(enum.in_args, [])
@@ -301,7 +302,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # the end -- the untagged workspace_set_overlay keeps its enum value and
         # its wire form, so a pre-v26 controller sends exactly what it always did.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-7], "workspace_set_overlay_on_screen")  # ADR-053's three calls, ADR-046 Phase 4's, then #2051's follow it
+        self.assertEqual(names[-8], "workspace_set_overlay_on_screen")  # ADR-053's three calls, ADR-046 Phase 4's, then #2051's and #2029's conv_warm follow it
         call = self._call("workspace_set_overlay_on_screen")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("info", "struct ipc_workspace_overlay_info"), ("screen_id", "uint64_t")])
@@ -320,7 +321,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # the head carries only the two row counts. #2005's conv_hint_interest, ADR-046 Phase 4's calls and
         # #2051's reselect follow.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-6:-4], ["system_get_conv_provider_row", "system_get_conv_task_row"])
+        self.assertEqual(names[-7:-5], ["system_get_conv_provider_row", "system_get_conv_task_row"])
         prov = self._call("system_get_conv_provider_row")
         task = self._call("system_get_conv_task_row")
         self.assertEqual([(a.name, a.typename) for a in prov.in_args], [("index", "uint32_t")])
@@ -342,7 +343,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # enum value and wire form. One fixed-size request, no reply payload,
         # no handles.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-6:-3], ["system_get_conv_provider_row", "system_get_conv_task_row",
+        self.assertEqual(names[-7:-4], ["system_get_conv_provider_row", "system_get_conv_task_row",
                                       "conv_hint_interest"])
         call = self._call("conv_hint_interest")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
@@ -358,7 +359,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # only on a frame that armed it - a client that never asks sends nothing.
         # The reply is the service's answer to the PREVIOUS request (#1952).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-3], "compositor_set_cursor_draw_request")  # Amendment 3's call, then #2051's, follow it
+        self.assertEqual(names[-4], "compositor_set_cursor_draw_request")  # Amendment 3's call, then #2051's and #2029's conv_warm follow it
         call = self._call("compositor_set_cursor_draw_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("request", "struct ipc_cursor_draw_request")])
@@ -375,7 +376,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # asks sends nothing. The reply is the service's newest finished
         # measurement (one to three frames old).
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-2], "compositor_set_cursor_measure_request")  # #2051's reselect follows it
+        self.assertEqual(names[-3], "compositor_set_cursor_measure_request")  # #2051's reselect, then #2029's conv_warm, follow it
         call = self._call("compositor_set_cursor_measure_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
                          [("request", "struct ipc_cursor_measure_request")])
@@ -392,7 +393,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # payload, session-free, DIAG only -- APPENDED at the end so every
         # earlier command keeps its enum value.
         names = [c.name for c in self.p.calls]
-        self.assertEqual(names[-1], "system_request_component_reselect")
+        self.assertEqual(names[-2], "system_request_component_reselect")
         call = self._call("system_request_component_reselect")
         self.assertEqual([(a.name, a.typename) for a in call.in_args], [("component_class", "uint32_t")])
         self.assertEqual(call.out_args, [])
@@ -419,6 +420,26 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         sub = [a.name for a in self._call("weave_submit_dmabuf").out_args]
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])
 
+
+    def test_conv_warm_is_appended(self):
+        # #2029: `displayxr-cli conv warm` rides its own DIAG call, APPENDED
+        # at the very end (every earlier command keeps its enum value): after
+        # conv_hint_interest, the two cursor calls (ADR-046) and #2051's
+        # component reselect. The request is the wire's conv_warm struct
+        # (xrt_conv_wire_task_request); the reply is the selected row's readiness
+        # before and right after the request. No handles, nothing variable-length.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-1], "conv_warm")
+        self.assertEqual(names[-2], "system_request_component_reselect")
+        self.assertEqual(names[-5], "conv_hint_interest")
+        call = self._call("conv_warm")
+        self.assertEqual([(a.name, a.typename) for a in call.in_args],
+                         [("request", "struct xrt_conv_wire_task_request")])
+        self.assertEqual([(a.name, a.typename) for a in call.out_args],
+                         [("prev_state", "uint32_t"), ("state", "uint32_t")])
+        self.assertFalse(call.in_handles or call.out_handles or call.varlen)
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        self.assertIn("ipc_handle_conv_warm(", text)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
