@@ -235,6 +235,20 @@ TEST_CASE("d3d11 lane: a host output is consumed only after its fence is observe
 		// The service device is untouched and still responsive.
 		CHECK(read_back(service, target.tex, W, H) == previous);
 	}
+	SECTION("the host died after its completion record: the fence reads UINT64_MAX, the observe fails")
+	{
+		// What Windows does to a shared fence whose signaller died
+		// (tests_conv_d3d11_xproc): every holder sees UINT64_MAX and every
+		// SetEventOnCompletion fires. That is a lost host, not a done frame.
+		host.ctx->Signal(fence, UINT64_MAX);
+		host.ctx->Flush();
+		const auto t0 = std::chrono::steady_clock::now();
+		CHECK_FALSE(ops.observe_fence(ops.ud, lfence, 1, 2000));
+		const auto ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+		CHECK(ms < 1500); // returns at once (or when the event fires), never at the timeout
+		CHECK(read_back(service, target.tex, W, H) == previous);
+	}
 	SECTION("the fence reaches the value: copy, bytes match")
 	{
 		host.ctx->Signal(fence, 1);
