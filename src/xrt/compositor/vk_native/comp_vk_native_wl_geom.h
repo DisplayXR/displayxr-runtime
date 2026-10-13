@@ -240,6 +240,21 @@ enum comp_vk_native_wl_move_sync_reply
 enum comp_vk_native_wl_move_sync_reply
 comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g);
 
+/*!
+ * #2071: how many times the publisher's bus name has GAINED an owner since this
+ * provider was created — a NameOwnerChanged to a non-empty owner, i.e. the
+ * extension (re)appeared after a lock screen, a shell restart, a re-enable, or
+ * first came up after this window did. Pumps the bus first (non-blocking).
+ *
+ * The provider already drops its cache and re-takes GetWindows on that edge
+ * (and renews move sync); what it cannot do is reset the COMPOSITOR's own
+ * state derived from the old publisher (the drop-snap anchor, the move-sync
+ * frame tag, the present-origin baseline, one-shot gate warnings). A caller
+ * that sees this number move treats the frame as a geometry re-sync.
+ */
+uint32_t
+comp_vk_native_wl_geom_publisher_generation(struct comp_vk_native_wl_geom *g);
+
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);
 

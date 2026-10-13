@@ -194,6 +194,15 @@ comp_vk_native_wl_move_sync_set_mapped(struct comp_vk_native_wl_move_sync *ms, b
 }
 
 void
+comp_vk_native_wl_move_sync_resync(struct comp_vk_native_wl_move_sync *ms)
+{
+	if (ms == NULL) {
+		return;
+	}
+	ms->have_last = false;
+}
+
+void
 comp_vk_native_wl_move_sync_destroy(struct comp_vk_native_wl_move_sync **ms_ptr)
 {
 	if (ms_ptr == NULL || *ms_ptr == NULL) {

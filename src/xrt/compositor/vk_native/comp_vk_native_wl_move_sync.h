@@ -90,6 +90,16 @@ comp_vk_native_wl_move_sync_tag(struct comp_vk_native_wl_move_sync *ms,
 void
 comp_vk_native_wl_move_sync_set_mapped(struct comp_vk_native_wl_move_sync *ms, bool mapped);
 
+/*!
+ * #2071: the window-geometry publisher reappeared. Forget the last tag
+ * position so the next comp_vk_native_wl_move_sync_tag re-sends it with the
+ * next presented frame, whatever it is: a restarted publisher has no record of
+ * where this window's frames were woven for, and an unchanged position would
+ * otherwise never be committed again.
+ */
+void
+comp_vk_native_wl_move_sync_resync(struct comp_vk_native_wl_move_sync *ms);
+
 void
 comp_vk_native_wl_move_sync_destroy(struct comp_vk_native_wl_move_sync **ms_ptr);
 
