@@ -306,6 +306,12 @@ dxr_acquire_timeout_ns(void)
 #include <vulkan/vulkan_xcb.h>
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
+// #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
+#include "comp_vk_native_present_feedback.h"
+
+struct comp_vk_native_target;
+static void
+target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd, bool is_wayland);
 
 #endif
 
@@ -600,6 +606,21 @@ struct comp_vk_native_target
 	uint64_t residual_ns;
 	uint32_t residual_samples;
 	uint64_t residual_last_log_ns;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*!
+	 * #902 desktop Linux: the window system's presentation feedback, the grid
+	 * source where the driver has no VK_GOOGLE_display_timing (measured: every
+	 * Intel iGPU). wp_presentation on native Wayland, Present CompleteNotify
+	 * on X11. NULL when the driver HAS display timing (that path stays the
+	 * source), when the window system offers neither, or with
+	 * DXR_VK_PRESENT_FEEDBACK=0.
+	 */
+	struct comp_vk_native_present_feedback *present_fb;
+	//! What the samples did to the grid (trust, debounced state, totals).
+	struct comp_present_feedback pf_state;
+	bool pf_period_refused_logged;
+#endif
 
 	//! When the refresh period was last re-read (ns). The panel is
 	//! variable-refresh, so this is polled rather than latched.
@@ -1919,6 +1940,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 	} // end XCB (non-Wayland) branch
+	target_present_feedback_create(target, hwnd, is_wayland);
 #else
 	U_LOG_E("VK native target: no supported surface type on this platform");
 	free(target);
@@ -2058,6 +2080,13 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 #endif
 
 	vk->vkDeviceWaitIdle(vk->device);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Before the surface: the protocol objects reference the app's surface /
+	// window, and the connection outlives the target (the compositor tears
+	// the target down before its window and before the app's own teardown).
+	comp_vk_native_present_feedback_destroy(&target->present_fb);
+#endif
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
@@ -2307,6 +2336,143 @@ comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
 	return target->vblank_grid.period_ns;
 }
 
+/*!
+ * #206: report the measured weave->scanout residual periodically. This is the
+ * number the whole CNSDK horizon question turns on — whether the vendor's
+ * hardcoded 40 ms matches what this pipeline actually does — so it is worth
+ * saying out loud rather than only exposing through an accessor nobody reads
+ * yet. Shared by both grid sources.
+ */
+static void
+target_log_residual(struct comp_vk_native_target *target)
+{
+	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
+	    target->vblank_grid.period_ns != 0) {
+		const uint64_t now2 = os_monotonic_get_ns();
+		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
+			target->residual_last_log_ns = now2;
+			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
+			        "(%.2f refresh periods, n=%u)",
+			        target->residual_ns / 1e6,
+			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
+			        target->residual_samples);
+		}
+	}
+}
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #902 desktop Linux: stand up the window-system grid source for this target.
+ *
+ * Only where the driver has NO VK_GOOGLE_display_timing — that path stays the
+ * source wherever it exists, and two sources anchoring one grid would only
+ * fight over sub-millisecond phase differences. The protocol objects live on
+ * the connection the surface belongs to (the app's wl_display / Xlib
+ * connection, or the runtime's own XCB connection for a self-created window),
+ * on private queues.
+ */
+static void
+target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd, bool is_wayland)
+{
+	const char *e = getenv("DXR_VK_PRESENT_FEEDBACK");
+	if (e != nullptr && e[0] == '0') {
+		U_LOG_W("#902: present-feedback feeder — DXR_VK_PRESENT_FEEDBACK=0, off; the vblank grid "
+		        "is unfed unless the driver has VK_GOOGLE_display_timing");
+		return;
+	}
+	if (hwnd == nullptr) {
+		return;
+	}
+	if (target->vk->has_GOOGLE_display_timing) {
+		U_LOG_W("#902: present-feedback feeder — not needed, the driver has "
+		        "VK_GOOGLE_display_timing (that feeds the vblank grid)");
+		return;
+	}
+	if (is_wayland) {
+		const struct comp_vk_native_wayland_handle *wl = (const struct comp_vk_native_wayland_handle *)hwnd;
+		target->present_fb = comp_vk_native_present_feedback_create_wayland(wl->display, wl->surface);
+	} else {
+		const struct comp_vk_native_xcb_handle *xh = (const struct comp_vk_native_xcb_handle *)hwnd;
+		target->present_fb = comp_vk_native_present_feedback_create_xcb(xh->connection, xh->window);
+	}
+}
+
+/*!
+ * #902 desktop Linux: drain the window system's presentation feedback into the
+ * vblank grid. Non-blocking (see comp_vk_native_present_feedback_poll); the
+ * decisions — vsync only, discards counted, timebase guard, period from the
+ * refresh value or the vblank counter — are comp_present_feedback_apply's and
+ * unit-tested on the host.
+ */
+static void
+target_feed_present_feedback(struct comp_vk_native_target *target)
+{
+	const char *kind = comp_vk_native_present_feedback_kind(target->present_fb);
+	struct comp_vk_native_present_feedback_event evs[16];
+	uint32_t n = 0;
+	do {
+		n = comp_vk_native_present_feedback_poll(target->present_fb, evs, 16);
+		const uint64_t now_ns = os_monotonic_get_ns();
+		for (uint32_t i = 0; i < n; i++) {
+			const struct comp_present_feedback_sample *s = &evs[i].sample;
+			const uint64_t before = target->vblank_grid.period_ns;
+			const struct comp_present_feedback_result r =
+			    comp_present_feedback_apply(&target->pf_state, &target->vblank_grid, s, now_ns);
+
+			if (r.period_changed) {
+				const uint64_t p = target->vblank_grid.period_ns;
+				U_LOG_W("#902: %s grid — refresh %.3f ms (%.2f Hz)%s%s", kind, p / 1e6, 1e9 / (double)p,
+				        before == 0 ? " [initial]" : " [CHANGED]",
+				        r.period_derived ? " (derived from the vblank counter)" : "");
+			}
+			if (r.period_refused && !target->pf_period_refused_logged) {
+				target->pf_period_refused_logged = true;
+				U_LOG_W("#902: %s reported an implausible refresh (%llu ns) — ignored", kind,
+				        (unsigned long long)s->refresh_ns);
+			}
+			if (r.state_changed) {
+				const struct comp_present_feedback *f = &target->pf_state;
+				switch (f->state) {
+				case COMP_PRESENT_FEEDBACK_STATE_FEEDING:
+					U_LOG_W("#902: %s feed — feeding the vblank grid (vsync'd presents, hw_clock=%d; "
+					        "accepted %llu, not-vsync %llu, discarded %llu)",
+					        kind, (int)s->hw_clock, (unsigned long long)f->accepted,
+					        (unsigned long long)f->not_vsync, (unsigned long long)f->discarded);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_NOT_VSYNC:
+					U_LOG_W("#902: %s feed — presents are NOT vsync'd, ignored; grid not fed "
+					        "(accepted %llu, not-vsync %llu)",
+					        kind, (unsigned long long)f->accepted, (unsigned long long)f->not_vsync);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_DISCARDING:
+					U_LOG_W("#902: %s feed — every recent present was discarded (window hidden or "
+					        "superseded); grid not fed (accepted %llu, discarded %llu)",
+					        kind, (unsigned long long)f->accepted, (unsigned long long)f->discarded);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_TIMEBASE_REFUSED:
+					U_LOG_W("#902: %s feed — presentation time %llu is not in os_monotonic (now %llu) "
+					        "— DIFFERENT CLOCK, grid refused",
+					        kind, (unsigned long long)s->present_ns, (unsigned long long)now_ns);
+					break;
+				default: break;
+				}
+			}
+
+			// #206: the weave->scanout residual, from the weave start the
+			// request was tagged with (Wayland; X11 cannot correlate, tag 0).
+			if (r.anchored && evs[i].tag != 0 && s->present_ns > evs[i].tag) {
+				const uint64_t res = s->present_ns - evs[i].tag;
+				if (res < 200ULL * 1000 * 1000) { // a stalled frame is not a latency
+					target->residual_ns = res;
+					target->residual_samples++;
+				}
+			}
+		}
+	} while (n == 16);
+	target_log_residual(target);
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
 static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {
@@ -2326,6 +2492,14 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 			        (vk != NULL && vk->vkGetRefreshCycleDurationGOOGLE != NULL));
 		}
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Created only where the driver has no display timing, so it is the
+	// grid's sole source whenever it exists.
+	if (target->present_fb != NULL) {
+		target_feed_present_feedback(target);
+		return;
+	}
+#endif
 	if (vk == NULL || !vk->has_GOOGLE_display_timing || target->swapchain == VK_NULL_HANDLE) {
 		return;
 	}
@@ -2472,22 +2646,7 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		target->residual_samples++;
 	}
 
-	// Report it periodically. This is the number the whole CNSDK horizon
-	// question turns on — whether the vendor's hardcoded 40 ms matches what
-	// this pipeline actually does — so it is worth saying out loud rather
-	// than only exposing through an accessor nobody reads yet.
-	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
-	    target->vblank_grid.period_ns != 0) {
-		const uint64_t now2 = os_monotonic_get_ns();
-		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
-			target->residual_last_log_ns = now2;
-			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
-			        "(%.2f refresh periods, n=%u)",
-			        target->residual_ns / 1e6,
-			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
-			        target->residual_samples);
-		}
-	}
+	target_log_residual(target);
 }
 
 #ifdef XRT_OS_WINDOWS
@@ -3054,9 +3213,15 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			}
 			if (!target->late_weave_grid_logged) {
 				target->late_weave_grid_logged = true;
+				const char *grid_source = "VK_GOOGLE_display_timing";
+#ifdef XRT_OS_LINUX_DESKTOP
+				if (target->present_fb != NULL) {
+					grid_source = comp_vk_native_present_feedback_kind(target->present_fb);
+				}
+#endif
 				U_LOG_W("#902: late weave on the measured grid — period %.3f ms, "
-				        "weave budget %.3f ms (no present_wait on this device)",
-				        period_ns / 1e6, budget_ns / 1e6);
+				        "weave budget %.3f ms (no present_wait on this device; grid source: %s)",
+				        period_ns / 1e6, budget_ns / 1e6, grid_source);
 			}
 		}
 		target->weave_start_ns = os_monotonic_get_ns();
@@ -3346,6 +3511,9 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		// refresh_cycle_probed clears too: a recreate can follow a mode change.
 		comp_vblank_grid_reset_phase(&target->vblank_grid);
 		target->refresh_cycle_probed = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+		comp_present_feedback_reset_phase(&target->pf_state);
+#endif
 
 		{
 			// Same lifetime guard as comp_vk_native_target_resize. This
@@ -3593,6 +3761,16 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 		target->residual_ring[slot].id = present_time.presentID;
 		target->residual_ring[slot].weave_start_ns = target->weave_start_ns;
 	}
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #902: ask the window system to report THIS present (Wayland: a
+	// wp_presentation.feedback on the commit the WSI makes inside
+	// vkQueuePresentKHR below; X11 reports every present without asking).
+	// Uncounted presents are not tagged, for the same reason as above.
+	if (counted && target->present_fb != NULL) {
+		comp_vk_native_present_feedback_request(target->present_fb, target->weave_start_ns);
+	}
+#endif
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
@@ -3848,6 +4026,9 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	// refresh_cycle_probed clears too: a recreate can follow a mode change.
 	comp_vblank_grid_reset_phase(&target->vblank_grid);
 	target->refresh_cycle_probed = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+	comp_present_feedback_reset_phase(&target->pf_state);
+#endif
 
 	// The crash this exists to stop: below, target->swapchain is set to
 	// VK_NULL_HANDLE before create_swapchain repopulates it, and the repaint
