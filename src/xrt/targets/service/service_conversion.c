@@ -62,6 +62,7 @@ static struct
 	const struct xrt_conversion_plugin_iface *dp_lift_iface;
 	struct xrt_conversion_plugin_instance *dp_lift_inst;
 	bool dp_lift_registered;
+	bool dp_lift_enabled; //!< the Enabled last applied to it (a live policy change compares)
 
 	char cache_path[600];
 
@@ -222,15 +223,8 @@ service_conversion_set_gpu_alloc(const struct conv_image_alloc_ops *ops)
 static bool
 dp_lift_enabled_by_policy(void)
 {
-	bool enabled = true;
 	os_mutex_lock(&g.mtx);
-	if (!g.policy.policy_lock) {
-		for (uint32_t i = 0; i < g.policy.override_count; i++) {
-			if (strcmp(g.policy.overrides[i].id, CONV_DP_LIFT_ID) == 0) {
-				enabled = g.policy.overrides[i].enabled;
-			}
-		}
-	}
+	const bool enabled = target_conv_policy_enabled(&g.policy, CONV_DP_LIFT_ID, true);
 	os_mutex_unlock(&g.mtx);
 	return enabled;
 }
@@ -270,6 +264,7 @@ on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
 	d.probe_order = CONV_DP_LIFT_PROBE_ORDER;
 	d.hosting = CONV_HOSTING_IN_SERVICE; // always: the display plug-in never leaves the service
 	d.enabled = dp_lift_enabled_by_policy();
+	g.dp_lift_enabled = d.enabled;
 	d.flags = CONV_PROV_LICENCE_EXEMPT | CONV_PROV_LEGACY_UNITS;
 	d.iface = g.dp_lift_iface;
 	d.inst = g.dp_lift_inst;
@@ -582,6 +577,38 @@ cache_save(void)
 	free(buf);
 }
 
+/*!
+ * #2029: re-read the §3.1 policy and hand it to the running core:
+ * PreferredProvider / AllowResearchOnly (the next selection), and the
+ * per-user Enabled of the built-in dp-lift adapter (rows of registered
+ * providers are reconciled by rescan). Watch thread; no core lock held.
+ */
+static void
+policy_reload(void)
+{
+	struct target_conv_policy fresh;
+	target_conv_policy_read(&fresh);
+	os_mutex_lock(&g.mtx);
+	g.policy = fresh;
+	os_mutex_unlock(&g.mtx);
+	if (g.core == NULL) {
+		return;
+	}
+	const char *pref[XRT_CONV_TASK_RESERVED_FIRST];
+	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
+		pref[t] = t < TARGET_CONV_POLICY_TASKS && fresh.preferred[t][0] != '\0' ? fresh.preferred[t] : NULL;
+	}
+	(void)conv_core_set_policy(g.core, pref, fresh.allow_research_only);
+	if (g.dp_lift_registered) {
+		const bool en = target_conv_policy_enabled(&fresh, CONV_DP_LIFT_ID, true);
+		if (en != g.dp_lift_enabled) {
+			g.dp_lift_enabled = en;
+			conv_core_set_provider_enabled(g.core, CONV_DP_LIFT_ID, en);
+			U_LOG_W("[conv] dp-lift %s by a registry change (no restart)", en ? "enabled" : "disabled");
+		}
+	}
+}
+
 //! The registry / manifests changed: re-enumerate and reconcile (watch thread).
 static void
 rescan(void)
@@ -597,15 +624,31 @@ rescan(void)
 			continue;
 		}
 		os_mutex_lock(&g.mtx);
+		// #2029: the per-user Enabled (HKCU) counts as much as HKLM's.
+		(void)target_conv_policy_apply_override(&g.policy, e);
 		const int k = find_entry_locked(e->id);
 		const bool known_enabled = k >= 0 ? g.entries[k].enabled : false;
+		const bool known_loaded = k >= 0 && g.entries[k].status == XRT_CONV_LOAD_NEGOTIATED;
 		os_mutex_unlock(&g.mtx);
 		if (k >= 0) {
 			if (known_enabled != e->enabled) {
-				conv_core_set_provider_enabled(g.core, e->id, e->enabled);
-				os_mutex_lock(&g.mtx);
-				g.entries[k].enabled = e->enabled;
-				os_mutex_unlock(&g.mtx);
+				if (e->enabled && !known_loaded) {
+					// Disabled at start, so never loaded: load it now
+					// (negotiate + probe + register), no restart.
+					add_entry(e);
+					os_mutex_lock(&g.mtx);
+					g.entries[k] = *e;
+					os_mutex_unlock(&g.mtx);
+				} else {
+					os_mutex_lock(&g.mtx);
+					g.entries[k].enabled = e->enabled;
+					os_mutex_unlock(&g.mtx);
+				}
+				conv_core_set_provider_enabled(
+				    g.core, e->id,
+				    e->enabled && (known_loaded || e->status == XRT_CONV_LOAD_NEGOTIATED));
+				U_LOG_W("[conv] provider %s %s by a registry change (no restart)", e->id,
+				        e->enabled ? "enabled" : "disabled");
 			}
 			conv_core_provider_changed(g.core, e->id);
 			continue;
@@ -716,9 +759,7 @@ watch_thread_body(LPVOID param)
 			if (WaitForSingleObject(g.watch_stop, 500) == WAIT_OBJECT_0) {
 				break;
 			}
-			os_mutex_lock(&g.mtx);
-			target_conv_policy_read(&g.policy);
-			os_mutex_unlock(&g.mtx);
+			policy_reload();
 			rescan();
 		}
 	}
@@ -865,6 +906,7 @@ service_conversion_start(void)
 		if (target_conv_is_policy_subkey(g.entries[i].id)) {
 			continue;
 		}
+		(void)target_conv_policy_apply_override(&g.policy, &g.entries[i]); // #2029: HKCU Enabled
 		add_entry(&g.entries[i]);
 		if (g.entry_count != i) {
 			g.entries[g.entry_count] = g.entries[i];

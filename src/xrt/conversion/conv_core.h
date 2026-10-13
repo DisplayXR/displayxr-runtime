@@ -172,6 +172,17 @@ conv_core_provider_changed(struct conv_core *core, const char *provider_id);
 void
 conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, bool enabled);
 
+/*!
+ * #2029: a live policy change (the service's registry watch re-read
+ * `PreferredProvider\<task>` / `AllowResearchOnly`). @p preferred has
+ * XRT_CONV_TASK_RESERVED_FIRST entries (NULL / "" = none; copied); NULL = no
+ * preference at all. Takes effect for the next selection (create, prewarm,
+ * properties); a live stream never moves. A change bumps conv_gen + status_gen
+ * and re-applies PrewarmOn. Returns whether anything changed.
+ */
+bool
+conv_core_set_policy(struct conv_core *core, const char *const *preferred, bool allow_research_only);
+
 
 /*
  *

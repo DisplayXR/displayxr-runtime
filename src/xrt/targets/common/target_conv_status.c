@@ -222,6 +222,35 @@ policy_enabled_override(const struct target_conv_policy *p, const char *id)
 }
 
 
+bool
+target_conv_policy_apply_override(const struct target_conv_policy *policy, struct xrt_conversion_plugin_entry *e)
+{
+	const int ov = policy_enabled_override(policy, e->id);
+	if (ov == 0) {
+		e->enabled = false;
+		if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
+			e->status = XRT_CONV_LOAD_DISABLED;
+			copy_str(e->reason, sizeof(e->reason), "disabled for this user (HKCU Enabled = 0)");
+		}
+	} else if (ov == 1) {
+		e->enabled = true;
+		e->flags &= ~XRT_CONV_ENTRY_FLAG_DISABLED;
+		if (e->status == XRT_CONV_LOAD_DISABLED) {
+			e->status = XRT_CONV_LOAD_NOT_LOADED;
+			e->reason[0] = '\0';
+		}
+	}
+	return e->enabled;
+}
+
+bool
+target_conv_policy_enabled(const struct target_conv_policy *policy, const char *id, bool dflt)
+{
+	const int ov = policy_enabled_override(policy, id);
+	return ov < 0 ? dflt : ov == 1;
+}
+
+
 /*
  *
  * The static dp-lift describe (spec §4.5). Runtime-internal: no DLL, no
@@ -599,16 +628,7 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 		if (e->status == XRT_CONV_LOAD_MALFORMED) {
 			out->malformed_rows++;
 		}
-		const int ov = policy_enabled_override(policy, e->id);
-		if (ov == 0 && e->status == XRT_CONV_LOAD_NOT_LOADED) {
-			e->enabled = false;
-			e->status = XRT_CONV_LOAD_DISABLED;
-			copy_str(e->reason, sizeof(e->reason), "disabled for this user (HKCU Enabled = 0)");
-		} else if (ov == 1 && e->status == XRT_CONV_LOAD_DISABLED) {
-			e->enabled = true;
-			e->status = XRT_CONV_LOAD_NOT_LOADED;
-			e->flags &= ~XRT_CONV_ENTRY_FLAG_DISABLED;
-		}
+		(void)target_conv_policy_apply_override(policy, e);
 		g_headless_entry = e; // the host's get_setting answers for this provider only
 		if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
 			(void)target_conversion_plugin_negotiate_one(e, target_conv_status_headless_host());
