@@ -2,19 +2,33 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Stub plug-in binaries for tests_conversion_loader (ADR-053).
+ * @brief Stub plug-in binaries for the loader tests and the per-class
+ *        conformance gate (ADR-053, ADR-054 N4).
  *
- * Built three times as test-only MODULE libraries:
+ * Built several times as test-only MODULE libraries, one class per kind:
  *  - STUB_KIND_CONVERSION, STUB_PLUGIN_API unset: a well-formed conversion
  *    provider at XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
  *  - STUB_KIND_CONVERSION, STUB_PLUGIN_API=<other major>: the same provider
  *    built against a different ABI major (the loader must reject it);
  *  - STUB_KIND_DISPLAY: a display-processor-shaped binary exporting only
- *    xrtPluginNegotiate (the conversion loader must not take it).
- * Never registered anywhere; the test hands the paths to the loader directly.
+ *    xrtPluginNegotiate (the conversion loader must not take it; the DP
+ *    loader sees a clean decline);
+ *  - STUB_KIND_DISPLAY, STUB_PLUGIN_API=<other major>: the ABI-mismatch
+ *    fixture for the DP class — negotiate reports the foreign major;
+ *  - STUB_KIND_INPUT [+ STUB_PLUGIN_API]: the same two shapes for the
+ *    input-provider class.
+ *
+ * Never registered by anything that ships. The unit tests hand the paths to
+ * the loaders directly; CI's conformance step registers the ABI fixtures
+ * under HKLM for one self-test run and removes them again, to prove that an
+ * ABI-major mismatch is rejected and fallen through — never dispatched —
+ * for every class (ADR-020 rule 3, ADR-054 §2.1).
  */
 
 #include "xrt/xrt_conversion_plugin.h"
+#include "xrt/xrt_input_plugin.h"
+#include "xrt/xrt_plugin.h"
+#include "xrt/xrt_results.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -61,13 +75,64 @@ xrtConversionPluginNegotiate(uint32_t runtime_api_version,
 
 #elif defined(STUB_KIND_DISPLAY)
 
-// Shape only: the conversion loader must refuse this binary before calling it.
-STUB_EXPORT int
-xrtPluginNegotiate(void)
+#ifndef STUB_PLUGIN_API
+#define STUB_PLUGIN_API XRT_PLUGIN_API_VERSION_CURRENT
+#endif
+
+/*
+ * Real signature. At the runtime's own major it DECLINES (the loader logs and
+ * moves on — a display processor for hardware that is not here). At a foreign
+ * major it does what a plug-in built against other headers does: hands back
+ * a vtable and reports its own major — and the loader must reject it on the
+ * version alone, before reading one byte of that vtable (ADR-020 rule 3).
+ * The vtable is an empty struct whose size is the only thing set, so a loader
+ * that DID dispatch would fault on a NULL slot rather than run anything.
+ */
+static struct xrt_plugin_iface g_dp_foreign_iface;
+
+STUB_EXPORT xrt_result_t
+xrtPluginNegotiate(uint32_t runtime_api_version,
+                   const struct xrt_plugin_host_iface *host,
+                   struct xrt_plugin_iface **out_iface,
+                   uint32_t *out_plugin_api_version)
 {
-	return -1;
+	(void)host;
+	*out_iface = NULL;
+	*out_plugin_api_version = STUB_PLUGIN_API;
+	if (runtime_api_version != STUB_PLUGIN_API) {
+		g_dp_foreign_iface.struct_size = (uint32_t)sizeof(g_dp_foreign_iface);
+		*out_iface = &g_dp_foreign_iface;
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_PROBER_NOT_SUPPORTED;
+}
+
+#elif defined(STUB_KIND_INPUT)
+
+#ifndef STUB_PLUGIN_API
+#define STUB_PLUGIN_API XRT_INPUT_PLUGIN_API_VERSION_CURRENT
+#endif
+
+// Same two shapes as the display stub, for the input-provider class.
+static struct xrt_input_plugin_iface g_input_foreign_iface;
+
+STUB_EXPORT xrt_result_t
+xrtInputPluginNegotiate(uint32_t runtime_api_version,
+                        const struct xrt_input_plugin_host_iface *host,
+                        struct xrt_input_plugin_iface **out_iface,
+                        uint32_t *out_plugin_api_version)
+{
+	(void)host;
+	*out_iface = NULL;
+	*out_plugin_api_version = STUB_PLUGIN_API;
+	if (runtime_api_version != STUB_PLUGIN_API) {
+		g_input_foreign_iface.struct_size = (uint32_t)sizeof(g_input_foreign_iface);
+		*out_iface = &g_input_foreign_iface;
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_PROBER_NOT_SUPPORTED;
 }
 
 #else
-#error "define STUB_KIND_CONVERSION or STUB_KIND_DISPLAY"
+#error "define STUB_KIND_CONVERSION, STUB_KIND_DISPLAY or STUB_KIND_INPUT"
 #endif

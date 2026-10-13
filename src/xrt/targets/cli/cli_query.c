@@ -1124,6 +1124,12 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	struct target_input_plugin_desc descs[16];
 	r->input_provider_count = target_input_plugin_enumerate(descs, 16);
 	r->input_force_qwerty = target_input_plugin_get_force_qwerty();
+	r->input_enabled_count = 0;
+	for (int i = 0; i < r->input_provider_count; i++) {
+		if (descs[i].enabled) {
+			r->input_enabled_count++;
+		}
+	}
 
 	if (r->input_provider_count == 0) {
 		snprintf(r->input_note, sizeof(r->input_note),
@@ -1135,12 +1141,27 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		         "not evaluated: ForceQwerty override set (OK — qwerty keeps the hand roles)");
 		return;
 	}
+	// ADR-054 N4: Enabled=0 is the user saying "not this one"; the loader
+	// never touches a disabled row, so with every row disabled there is
+	// nothing to evaluate and qwerty correctly keeps the hand roles.
+	if (r->input_enabled_count == 0) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "not evaluated: all %d registered provider(s) disabled (Enabled=0) "
+		         "(OK — qwerty keeps the hand roles)",
+		         r->input_provider_count);
+		return;
+	}
 
 	const struct xrt_input_plugin_iface *iface = target_input_plugin_get_active();
 	r->input_provider_active = iface != NULL;
 	if (iface != NULL) {
 		snprintf(r->input_provider_id, sizeof(r->input_provider_id), "%s", iface->id ? iface->id : "");
 	}
+	// The scan tally is reported whether or not somebody claimed the system:
+	// a provider that could not be dispatched (load failure, ABI-major
+	// mismatch) is a misconfiguration worth seeing even when a lower-ranked
+	// one fell through and took the roles (ADR-054 N4 conformance).
+	target_input_plugin_get_scan_result(&r->input_scan_declined, &r->input_scan_failed);
 
 	// Nobody claimed the system. That is only a fault if a provider
 	// failed to LOAD (bad entry point, ABI-major mismatch); providers
@@ -1148,19 +1169,16 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	// DXR_SIM_INPUT opt-in left unset — is the ordinary state of most
 	// boxes and leaves qwerty correctly holding the hand roles.
 	if (!r->input_provider_active) {
-		int declined = 0;
-		int failed = 0;
-		target_input_plugin_get_scan_result(&declined, &failed);
-		if (failed > 0) {
+		if (r->input_scan_failed > 0) {
 			r->input_evaluated = true;
 			snprintf(r->input_note, sizeof(r->input_note),
-			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)", failed,
-			         declined);
+			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)",
+			         r->input_scan_failed, r->input_scan_declined);
 		} else {
 			snprintf(r->input_note, sizeof(r->input_note),
 			         "not evaluated: all %d registered provider(s) declined "
 			         "(OK — qwerty keeps the hand roles)",
-			         declined);
+			         r->input_scan_declined);
 		}
 		return;
 	}
@@ -1239,9 +1257,15 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		    : r->input_ht_right_ok      ? "ok"
 		                                : "missing");
 	} else {
-		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s",
+		char scan[64] = {0};
+		if (r->input_scan_failed > 0) {
+			// Not a failure of THIS provider, but a better-ranked one that
+			// could not be dispatched is a misconfiguration worth a word.
+			snprintf(scan, sizeof(scan), "; %d other provider(s) failed to load", r->input_scan_failed);
+		}
+		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s%s",
 		         r->input_provider_id, r->input_left_str, r->input_right_str,
-		         (r->input_ht_left_ok || r->input_ht_right_ok) ? " (+hand-tracking roles)" : "");
+		         (r->input_ht_left_ok || r->input_ht_right_ok) ? " (+hand-tracking roles)" : "", scan);
 	}
 }
 
@@ -2454,6 +2478,10 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	P(" :: Input providers (ADR-034)\n");
 	PT("registered:   %d%s\n", r->input_provider_count,
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
+	if (r->input_provider_count > 0) {
+		PT("enabled:      %d  (scan: %d declined, %d failed to load)\n", r->input_enabled_count,
+		   r->input_scan_declined, r->input_scan_failed);
+	}
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
 		PT("hardware:     %s\n", r->input_provider_present ? "present (provider holds the hand roles)"
@@ -2777,6 +2805,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 	{
 		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
 		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
+		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
+		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
+		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
@@ -3361,6 +3392,23 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 	add_plugin_states_json(root, r);
 	add_conversion_providers_json(root, r);
+	// ADR-054 N4: the input-provider loader's view, as data — what was
+	// registered, what was enabled, who claimed, and how many could not be
+	// dispatched — so the per-class conformance gate reads a field, not a
+	// detail string. Same shape as `info --json`'s object, minus the roles.
+	{
+		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
+		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
+		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
+		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
+		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
+		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
+		cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
+		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
+		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
+		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+	}
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 
