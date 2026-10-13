@@ -834,7 +834,16 @@ target_commit(
 		return true;
 	}
 #ifdef _WIN32
-	if (img->memory_kind == XRT_CONV_MEM_WIN32_NT_HANDLE && sc->io != NULL) {
+	if (img->memory_kind == XRT_CONV_MEM_WIN32_NT_HANDLE) {
+		// A CPU input with GPU outputs (the satellite's lane: CPU slots in,
+		// host-allocated NT-handle outputs) reaches here before any GPU read
+		// created the I/O device.
+		if (sc->io == NULL) {
+			sc->io = sim_conv_d3d11_io_create();
+		}
+		if (sc->io == NULL) {
+			return false;
+		}
 		if (layers <= 1) {
 			return sim_conv_d3d11_io_write(sc->io, img, -1, src, stride);
 		}
