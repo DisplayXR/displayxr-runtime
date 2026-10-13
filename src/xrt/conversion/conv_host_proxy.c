@@ -57,7 +57,7 @@
 #define PX_ALIGN 4096ull
 
 #define PX_REQUEST_TIMEOUT_MS 5000u    //!< ordinary control requests
-#define PX_ACCEPT_TIMEOUT_MS 5000u     //!< the host connecting its channel
+#define PX_ACCEPT_TIMEOUT_MS 10000u    //!< the host connecting its channel (a start costs ~4 s on a slow box)
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
 #define PX_MAINTENANCE_POLL_NS (1000ull * 1000000ull)
@@ -1771,15 +1771,13 @@ exec_job(struct proxy *p, struct conv_host_cmd *c)
 	if (blob != OS_NATIVE_HANDLE_INVALID) {
 		os_native_handle_close(blob);
 	}
-#ifdef CONV_HOST_MSG_JOB_RELEASE
 	if (job_id != 0 && jd.blob_bytes > 0) {
-		// The service holds its own copy now: the host may drop the section.
-		struct conv_host_wire_job_ref jr;
+		// The service holds its own copy now: the host closes its section.
+		struct conv_host_wire_job_release jr;
 		conv_host_wire_init(&jr, sizeof(jr));
 		jr.job_id = job_id;
 		(void)px_send(p, CONV_HOST_MSG_JOB_RELEASE, 0, &jr, sizeof(jr), NULL, 0);
 	}
-#endif
 	if (r == XRT_SUCCESS && c->job_out != NULL) {
 		c->job_out->written = jd.written;
 		xrt_conv_wire_unpack_splat_info(&jd.splat_info, &c->job_out->splat_info);
