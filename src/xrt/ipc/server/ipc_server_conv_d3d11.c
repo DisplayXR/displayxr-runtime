@@ -125,6 +125,7 @@ ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc)
 	gpu.io.stream_gone = g->stream_gone;
 	gpu.io.ud = g->io_ud;
 	gpu.nominal_z_m = g->nominal_z_m;
+	gpu.adapter_luid = g->adapter_luid;
 
 	comp_d3d11_service_set_conv_eyes_sink(eyes_sink, eyes_retire, core);
 	struct comp_d3d11_conv_bridge b;

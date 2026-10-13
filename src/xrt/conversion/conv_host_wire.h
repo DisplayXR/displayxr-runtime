@@ -230,6 +230,7 @@ extern "C" {
 #define CONV_HOST_MSG_JOB_CANCEL 0x0112u       //!< conv_host_wire_job_ref -> – (the job still replies)
 #define CONV_HOST_MSG_SHUTDOWN 0x0113u         //!< conv_host_wire_shutdown -> conv_host_wire_status, then exit 0
 #define CONV_HOST_MSG_JOB_RELEASE 0x0114u      //!< conv_host_wire_job_release -> – (no reply)
+#define CONV_HOST_MSG_GET_PROVIDER_STATUS 0x0115u //!< conv_host_wire_index (0) -> conv_host_wire_provider_status
 
 
 /*
@@ -614,6 +615,24 @@ struct conv_host_wire_job_release
 	uint32_t struct_size;
 	uint32_t family_version;
 	uint64_t job_id;
+};
+
+/*!
+ * GET_PROVIDER_STATUS reply: the provider's get_provider_status, as the host
+ * process reads it (platform state, FALLBACK / REFERENCE flags, hint), so a
+ * satellite provider ranks and reports like an in-service one. @c reported
+ * 0 = the provider has no get_provider_status (or it returned false).
+ * sizeof == 152.
+ */
+struct conv_host_wire_provider_status
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	int32_t result;
+	uint32_t reported;
+	uint32_t state; //!< xrt_conv_provider_status::state
+	uint32_t flags; //!< XRT_CONV_PROVIDER_FLAG_*
+	char hint[128];
 };
 
 //! JOB_PROGRESS (H -> S). sizeof == 56.
@@ -1077,6 +1096,8 @@ XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_submit, params) == 64, "j
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_ref) == 16, "job ref size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_release) == 16, "job release size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_release, job_id) == 8, "job release layout");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_provider_status) == 152, "provider status size");
+XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_provider_status, hint) == 24, "provider status layout");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_progress) == 56, "job progress size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) == 368, "job done size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_done, depth_info) == 112, "job done: depth_info at 112");

@@ -190,7 +190,9 @@ struct Fixture : CoreOps
 	                 uint32_t crash_loop = 5,
 	                 const char *host_exe = CONV_PROXY_HOST,
 	                 const char *provider_id = "sat-test",
-	                 const char *binary = "scripted")
+	                 const char *binary = "scripted",
+	                 bool spawn_for_describe = true,
+	                 const std::vector<uint8_t> *cache = nullptr)
 	{
 		conv_core_config cfg{};
 		cfg.alloc.alloc = cpu_alloc;
@@ -224,6 +226,7 @@ struct Fixture : CoreOps
 		pc.scratch_bytes = 4ull * 1024 * 1024;
 		pc.extra_args = args.empty() ? nullptr : args.data();
 		pc.extra_arg_count = (uint32_t)args.size();
+		pc.spawn_for_describe = spawn_for_describe; // these tests start with no describe cache
 		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
 
 		conv_provider_desc d{};
@@ -233,6 +236,9 @@ struct Fixture : CoreOps
 		d.enabled = true;
 		d.host = host;
 		REQUIRE(conv_core_add_provider(c, &d) >= 0);
+		if (cache != nullptr) {
+			REQUIRE(conv_core_load_describe_cache(c, cache->data(), cache->size()) == 1);
+		}
 	}
 	~Fixture()
 	{
@@ -370,6 +376,84 @@ TEST_CASE("proxy: the stall watchdog kills a hung host (exit 30) and the stream 
 	REQUIRE(fx.convert(sid, 0x33, &r, 15000));
 	check_views(r, 0x33);
 	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+}
+
+TEST_CASE("proxy: the provider's status (FALLBACK, platform state) crosses the wire", "[conv_proxy]")
+{
+	Fixture fx({});
+	REQUIRE(wait_until([&] { return fx.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+	static conv_registry reg;
+	REQUIRE(wait_until(
+	    [&] {
+		    conv_core_copy_registry(fx.c, &reg);
+		    return (reg.providers[0].flags & CONV_PROV_FALLBACK) != 0;
+	    },
+	    5000));
+	CHECK(reg.providers[0].platform_state == 1u); // READY, as the provider said
+	xrt_conv_provider_status st{};
+	REQUIRE(fx.host->ops->get_provider_status(fx.host, &st));
+	CHECK(std::string(st.hint) == "scripted test host");
+}
+
+TEST_CASE("proxy: the ingest adapter LUID reaches the host; a change restarts it, not a crash", "[conv_proxy]")
+{
+	Fixture fx({});
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x21, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	uint64_t spawned = 1, hello = 1;
+	conv_host_proxy_get_adapter(fx.host, &spawned, &hello);
+	CHECK(spawned == 0u); // the GPU side had not attached yet
+	CHECK(hello == 0u);
+
+	// The GPU hook reports the service's ingest adapter.
+	constexpr uint64_t LUID = 0x00000001ABCD1234ull;
+	conv_host_proxy_set_adapter(fx.host, LUID, nullptr);
+	REQUIRE(wait_until(
+	    [&] {
+		    conv_host_proxy_get_adapter(fx.host, &spawned, &hello);
+		    return hello == LUID;
+	    },
+	    40000));
+	CHECK(spawned == LUID);
+	CHECK(fx.sup().spawns == 2u);
+	CHECK(fx.sup().restarts == 0u); // closed for update: no crash accounting
+	CHECK(fx.sup().last_exit == CONV_HOST_EXIT_UPDATE);
+
+	// The stream keeps its handle and runs on the new host.
+	REQUIRE(fx.convert(sid, 0x22, &r, 20000));
+	check_views(r, 0x22);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.stats(sid).reopens >= 1u);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+}
+
+TEST_CASE("proxy: with a warm describe cache nothing spawns until a warm / create", "[conv_proxy]")
+{
+	std::vector<uint8_t> cache;
+	{
+		Fixture first({});
+		REQUIRE(wait_until([&] { return first.row_state() != XRT_CONV_STATE_UNKNOWN; }, 40000));
+		const size_t n = conv_core_save_describe_cache(first.c, nullptr, 0);
+		REQUIRE(n > 0u);
+		cache.resize(n);
+		REQUIRE(conv_core_save_describe_cache(first.c, cache.data(), n) == n);
+	}
+	Fixture fx({}, 0, 5, CONV_PROXY_HOST, "sat-test", "scripted", false, &cache);
+	CHECK(fx.row_state() == XRT_CONV_STATE_INSTALLED); // answered from the cache
+	sleep_ms(1000);
+	CHECK(fx.sup().spawns == 0u);
+	CHECK(fx.sup().state == CONV_SUP_IDLE);
+
+	// The first create warms the row: that is the demand that spawns the host.
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x44, &r, 40000));
+	check_views(r, 0x44);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.sup().spawns == 1u);
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 }
 

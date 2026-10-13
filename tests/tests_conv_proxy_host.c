@@ -76,6 +76,7 @@ static unsigned g_crash_after = 0;
 static const char *g_crash_once = NULL;
 static unsigned g_hang_after = 0;
 static uint32_t g_state = XRT_CONV_STATE_INSTALLED;
+static uint64_t g_luid = 0;
 
 struct img
 {
@@ -356,6 +357,16 @@ handle(const struct conv_host_wire_frame *f, const uint8_t *payload, const uint6
 		send_frame(f->type | CONV_HOST_MSG_REPLY_BIT, rid, &r, sizeof(r), NULL, 0);
 		break;
 	}
+	case CONV_HOST_MSG_GET_PROVIDER_STATUS: {
+		struct conv_host_wire_provider_status r;
+		conv_host_wire_init(&r, sizeof(r));
+		r.reported = 1;
+		r.state = 1; // XRT_PLUGIN_PLATFORM_STATE_READY
+		r.flags = XRT_CONV_PROVIDER_FLAG_FALLBACK;
+		conv_host_wire_set_str(r.hint, sizeof(r.hint), "scripted test host");
+		send_frame(f->type | CONV_HOST_MSG_REPLY_BIT, rid, &r, sizeof(r), NULL, 0);
+		break;
+	}
 	case CONV_HOST_MSG_WARM:
 		sleep_ms(g_warm_ms);
 		g_state = XRT_CONV_STATE_READY;
@@ -501,6 +512,8 @@ main(int argc, char **argv)
 			snprintf(g_provider, sizeof(g_provider), "%s", v);
 		} else if (strcmp(k, CONV_HOST_ARG_CHANNEL) == 0) {
 			token = v;
+		} else if (strcmp(k, CONV_HOST_ARG_ADAPTER_LUID) == 0) {
+			g_luid = strtoull(v, NULL, 16);
 		} else if (strcmp(k, CONV_HOST_ARG_PARENT) == 0) {
 			parent = strtol(v, NULL, 10);
 		} else if (strcmp(k, "--fake-warm-ms") == 0) {
@@ -527,6 +540,7 @@ main(int argc, char **argv)
 	hello.provider_api_version = XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
 	hello.capability_count = 1;
 	hello.generation = 1;
+	hello.adapter_luid = g_luid; // a CPU provider would say 0; echoed so the test sees what it was given
 	conv_host_wire_set_str(hello.git_tag, sizeof(hello.git_tag), u_git_tag);
 	conv_host_wire_set_str(hello.provider_id, sizeof(hello.provider_id), g_provider);
 	if (send_frame(CONV_HOST_MSG_HELLO, 0, &hello, sizeof(hello), NULL, 0) != 0) {

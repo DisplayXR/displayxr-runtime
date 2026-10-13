@@ -1172,6 +1172,27 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 		(void)send_msg(s, f->type | CONV_HOST_MSG_REPLY_BIT, rid, &rep, sizeof(rep));
 		return true;
 	}
+	case CONV_HOST_MSG_GET_PROVIDER_STATUS: {
+		// The provider's own view of its platform (FALLBACK flag, state, hint):
+		// the service ranks and reports a satellite provider by it (#2034).
+		struct conv_host_wire_provider_status rep;
+		conv_host_wire_init(&rep, sizeof(rep));
+		const struct xrt_conversion_plugin_iface *iface =
+		    s->cfg->provider->entry != NULL ? s->cfg->provider->entry->iface : NULL;
+		struct xrt_conv_provider_status st;
+		memset(&st, 0, sizeof(st));
+		st.struct_size = sizeof(st);
+		if (iface != NULL && XRT_CONV_IFACE_HAS(iface, get_provider_status) && iface->get_provider_status != NULL &&
+		    iface->get_provider_status(&st)) {
+			rep.reported = 1;
+			rep.state = st.state;
+			rep.flags = st.flags;
+			conv_host_wire_set_str(rep.hint, sizeof(rep.hint), st.hint);
+		}
+		rep.result = XRT_SUCCESS;
+		(void)send_msg(s, f->type | CONV_HOST_MSG_REPLY_BIT, rid, &rep, sizeof(rep));
+		return true;
+	}
 	case CONV_HOST_MSG_GET_STATE: {
 		struct conv_host_wire_cap_request q;
 		struct conv_host_wire_state_reply rep;

@@ -211,6 +211,8 @@ struct conv_host_slot
 	bool down;
 	//! Satellite: RESTORED seen; re-warm the restarting rows after the re-describe.
 	bool rewarm;
+	//! Satellite: a non-crash exit (idle, update) evicted READY rows; RESTORED re-warms them.
+	bool rewarm_evicted;
 	uint32_t restarts; //!< LOST events seen (diagnostics)
 	uint64_t generation_seen;
 };

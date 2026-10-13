@@ -77,6 +77,15 @@ static struct
 	bool dp_lift_registered;
 	bool dp_lift_enabled; //!< the Enabled last applied to it (a live policy change compares)
 
+	//! The describe cache as read at start (satellites restore from it as they register).
+	uint8_t *cache_buf;
+	size_t cache_len;
+
+	//! Satellite proxies (owned by the core) and the ingest adapter they run on (#2034).
+	struct conv_host *sat_hosts[XRT_CONV_LOADER_MAX_ENTRIES];
+	uint32_t sat_count;
+	uint64_t adapter_luid;
+
 	char cache_path[600];
 } g;
 
@@ -236,6 +245,36 @@ dp_lift_enabled_by_policy(void)
 	return enabled;
 }
 
+/*!
+ * The ingest adapter is known: every satellite is (re)spawned on it, and gets
+ * its D3D11 lane there (opened only now, so it can never sit on another adapter).
+ */
+static void
+satellites_set_adapter(uint64_t luid)
+{
+	os_mutex_lock(&g.mtx);
+	g.adapter_luid = luid;
+	struct conv_host *hosts[XRT_CONV_LOADER_MAX_ENTRIES];
+	const uint32_t n = g.sat_count;
+	memcpy(hosts, g.sat_hosts, sizeof(hosts[0]) * n);
+	os_mutex_unlock(&g.mtx);
+	for (uint32_t i = 0; i < n; i++) {
+#ifdef CONV_HAVE_HOST_PROXY
+		const struct conv_host_proxy_gpu_ops *gp = NULL;
+#ifdef SERVICE_HAVE_CONV_HOST_LANE_D3D11
+		struct conv_host_proxy_gpu_ops gpu;
+		memset(&gpu, 0, sizeof(gpu));
+		if (d3d11_conv_host_lane_create(luid, &gpu)) {
+			gp = &gpu;
+		}
+#endif
+		conv_host_proxy_set_adapter(hosts[i], luid, gp);
+#else
+		(void)hosts;
+#endif
+	}
+}
+
 //! ipc_server_conv_gpu_hook_fn: the GPU side came (or goes).
 static void
 on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
@@ -254,6 +293,9 @@ on_gpu(void *ud, const struct ipc_server_conv_gpu *gpu)
 		return;
 	}
 	service_conversion_set_gpu_alloc(&gpu->alloc);
+	if (gpu->adapter_luid != 0) {
+		satellites_set_adapter(gpu->adapter_luid);
+	}
 	if (gpu->dp_lift.snapshot == NULL) {
 		return;
 	}
@@ -547,14 +589,17 @@ satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_h
 	cfg.provider_id = e->id;
 	cfg.provider_binary = e->binary_path;
 	cfg.host_exe = host_exe;
+	os_mutex_lock(&g.mtx);
+	cfg.adapter_luid = g.adapter_luid; // 0 until the GPU side attached (satellites_set_adapter)
+	os_mutex_unlock(&g.mtx);
 	// The host writes its own log (DisplayXR_conversion-host_<id>.<pid>_<ts>.log).
-	// adapter_luid stays 0 (any) until the GPU lane passes the ingest adapter.
 #ifdef SERVICE_HAVE_CONV_HOST_LANE_D3D11
 	// The GPU lane: NT-handle textures + the host's shared fence, observed on
-	// the CPU (the fence rule). Without it the satellite serves CPU images only.
+	// the CPU (the fence rule) -- on the ingest adapter only, so not before it
+	// is known. Without it the satellite serves CPU images only.
 	struct conv_host_proxy_gpu_ops gpu;
 	memset(&gpu, 0, sizeof(gpu));
-	if (d3d11_conv_host_lane_create(cfg.adapter_luid, &gpu)) {
+	if (cfg.adapter_luid != 0 && d3d11_conv_host_lane_create(cfg.adapter_luid, &gpu)) {
 		cfg.gpu = &gpu;
 	}
 #endif
@@ -614,7 +659,28 @@ add_entry(struct xrt_conversion_plugin_entry *e)
 			(void)snprintf(e->reason, sizeof(e->reason), "hosted in %s", CONV_HOST_EXE);
 			U_LOG_W("[conv] provider %s: Hosting=satellite%s (%s)", e->id, from_env ? " (from the environment)" : "",
 			        CONV_HOST_EXE);
-			(void)conv_core_add_provider(g.core, &d);
+			if (conv_core_add_provider(g.core, &d) < 0) {
+				return; // the core destroyed the proxy
+			}
+			os_mutex_lock(&g.mtx);
+			if (g.sat_count < XRT_CONV_LOADER_MAX_ENTRIES) {
+				g.sat_hosts[g.sat_count++] = host;
+			}
+			os_mutex_unlock(&g.mtx);
+			// The describe cache answers until the first warm / create spawns the
+			// host (roadmap §3.4 "Spawn"); restore this provider's rows now that it
+			// is registered.
+			if (g.cache_buf != NULL) {
+				(void)conv_core_load_describe_cache(g.core, g.cache_buf, g.cache_len);
+			}
+			if (!conv_core_provider_described(g.core, e->id)) {
+#ifdef CONV_HAVE_HOST_PROXY
+				U_LOG_W("[conv] provider %s: no cached describe (first run or a new binary): spawning its "
+				        "host once to describe it; the idle exit reclaims it",
+				        e->id);
+				conv_host_proxy_request_describe(host);
+#endif
+			}
 			return;
 		}
 		if (e->status == XRT_CONV_LOAD_NEGOTIATED) {
@@ -663,6 +729,12 @@ cache_load(void)
 	if (n > 0) {
 		const int32_t r = conv_core_load_describe_cache(g.core, buf, n);
 		U_LOG_I("[conv] describe cache: %d rows restored from %s", (int)r, g.cache_path);
+		// Kept: providers registered after this point (satellites, every
+		// provider at start) restore from it as they register.
+		free(g.cache_buf);
+		g.cache_buf = buf;
+		g.cache_len = n;
+		return;
 	}
 	free(buf);
 }
@@ -1040,6 +1112,10 @@ service_conversion_stop(void)
 	free(g.entries);
 	free(g.reg_scratch);
 	free(g.status_scratch);
+	free(g.cache_buf);
+	g.cache_buf = NULL;
+	g.cache_len = 0;
+	g.sat_count = 0; // the proxies died with the core
 	g.entries = NULL;
 	g.reg_scratch = NULL;
 	g.status_scratch = NULL;
