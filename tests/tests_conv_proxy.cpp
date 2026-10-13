@@ -6,7 +6,10 @@
  *         process (tests_conv_proxy_host, a scripted host speaking the real
  *         wire), through the real conversion core: the CPU lane end to end,
  *         a kill mid-stream (the stream keeps its handle and recovers), the
- *         crash-loop cutoff, the watchdog kill, a terminal exit.
+ *         crash-loop cutoff, the watchdog kill, a terminal exit; and the
+ *         update flow (#2056): exit 20 -> WARMING(updating), no respawn while
+ *         the maintenance mutex is held, respawn on its release -- driven by a
+ *         real Restart Manager session on Windows and by SIGTERM on POSIX.
  */
 
 #include "catch_amalgamated.hpp"
@@ -14,6 +17,7 @@
 #include "conversion/conv_core.h"
 #include "conversion/conv_host_proxy.h"
 #include "conversion/conv_host_wire.h"
+#include "conversion/conv_readiness.h"
 
 #include "os/os_process.h"
 
@@ -28,6 +32,24 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <restartmanager.h>
+#else
+#include <signal.h>
+#include <sys/types.h>
+#endif
+
+#include "os/os_process.h"
+
+#include <cctype>
 
 #ifndef CONV_PROXY_HOST
 #error "CONV_PROXY_HOST (path of tests_conv_proxy_host) must be defined"
@@ -63,6 +85,15 @@ wait_until(const std::function<bool()> &pred, uint32_t timeout_ms)
 }
 
 std::atomic<uint64_t> g_key{1};
+
+//! The fake maintenance mutex (every OS): held while true.
+std::atomic<bool> g_maint_held{false};
+
+bool
+fake_maintenance(void *, const char *)
+{
+	return g_maint_held.load();
+}
 
 bool
 cpu_alloc(void *, const conv_image_request *req, xrt_conv_image *out)
@@ -106,11 +137,11 @@ struct CoreOps
 	}
 
 	uint32_t
-	row_reason()
+	row_reason(uint32_t cap_id = 4)
 	{
 		static conv_registry reg;
 		conv_core_copy_registry(c, &reg);
-		const int32_t ri = conv_registry_find_row(&reg, 0, 4);
+		const int32_t ri = conv_registry_find_row(&reg, 0, cap_id);
 		return ri < 0 ? 0u : reg.rows[ri].rd.reason;
 	}
 
@@ -194,7 +225,8 @@ struct Fixture : CoreOps
 	                 const char *provider_id = "sat-test",
 	                 const char *binary = "scripted",
 	                 bool spawn_for_describe = true,
-	                 const std::vector<uint8_t> *cache = nullptr)
+	                 const std::vector<uint8_t> *cache = nullptr,
+	                 bool fake_mutex = false)
 	{
 		conv_core_config cfg{};
 		cfg.alloc.alloc = cpu_alloc;
@@ -229,6 +261,9 @@ struct Fixture : CoreOps
 		pc.extra_args = args.empty() ? nullptr : args.data();
 		pc.extra_arg_count = (uint32_t)args.size();
 		pc.spawn_for_describe = spawn_for_describe; // these tests start with no describe cache
+		if (fake_mutex) {
+			pc.maintenance_held = fake_maintenance; // else the real OS check
+		}
 		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
 
 		conv_provider_desc d{};
@@ -467,6 +502,68 @@ TEST_CASE("proxy: a terminal host exit (ABI reject) is FAILED, never respawned",
 	sleep_ms(400);
 	CHECK(fx.sup().spawns == spawns);
 	CHECK(fx.sup().last_exit == 10);
+}
+
+TEST_CASE("proxy: exit 20 = WARMING(updating); no respawn while the maintenance mutex is held", "[conv_proxy]")
+{
+	// #2056 (roadmap §3.6), the state machine on every OS: the scripted host
+	// exits 20 at its 3rd convert, once.
+	const std::string marker = temp_marker();
+	g_maint_held = false;
+	Fixture fx({"--fake-update-after", "3", "--fake-update-once", marker}, 0, 5, CONV_PROXY_HOST, "sat-test",
+	           "scripted", true, nullptr, true);
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x61, &r));
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(fx.convert(sid, 0x62, &r));
+	const uint64_t last = r.frame_id;
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const uint32_t spawns = fx.sup().spawns;
+
+	// The installer takes the mutex, then closes the host.
+	g_maint_held = true;
+	REQUIRE(fx.submit(sid, 0x63));
+	REQUIRE(wait_until([&] { return fx.sup().last_exit == CONV_HOST_EXIT_UPDATE; }, 10000));
+	REQUIRE(wait_until([&] { return fx.row_reason() == CONV_REASON_UPDATING; }, 5000));
+	CHECK(fx.sup().state == CONV_SUP_UPDATING);
+	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING);
+	CHECK(fx.sup().restarts == 0u); // no crash accounting
+
+	// Held: the producer keeps submitting on a valid handle; nothing respawns,
+	// for well past the 1 Hz probe and any backoff.
+	for (int i = 0; i < 30; i++) {
+		CHECK(fx.submit(sid, 0x64));
+		sleep_ms(50);
+	}
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().state == CONV_SUP_UPDATING);
+	CHECK(fx.row_state() == XRT_CONV_STATE_WARMING);
+	conv_stream_stats st0{};
+	CHECK(conv_core_stream_get_stats(fx.c, sid, &st0) == XRT_SUCCESS);
+
+	SECTION("a registration change clears the update gate, the spawn still waits for the mutex")
+	{
+		conv_host_proxy_config_changed(fx.host);
+		sleep_ms(300);
+		CHECK(fx.sup().state == CONV_SUP_IDLE);
+		CHECK(fx.sup().spawns == spawns);
+	}
+
+	// Released: the owed respawn; the stream converts again (discontinuity).
+	g_maint_held = false;
+	REQUIRE(fx.convert(sid, 0x65, &r, 20000));
+	check_views(r, 0x65);
+	CHECK(r.frame_id != last);
+	CHECK(fx.stats(sid).reopens >= 1u); // the provider stream re-opened on the new host (implicit reset)
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.sup().spawns == spawns + 1u);
+	CHECK(fx.sup().restarts == 0u);
+	CHECK(fx.row_state() == XRT_CONV_STATE_READY);
+	CHECK(fx.row_reason() == 0u);
+	CHECK(fx.stats(sid).rebinds == 0u);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	std::remove(marker.c_str());
 }
 
 
@@ -1186,6 +1283,170 @@ TEST_CASE("proxy: a host's own idle exit is orderly: no crash accounting, no res
 	CHECK(st.restarts == 0u);
 	CHECK(st.state == CONV_SUP_IDLE);
 	CHECK(st.spawns == 1u);
+}
+
+TEST_CASE("proxy: update flow on the real host (Restart Manager on Windows, SIGTERM on POSIX)", "[conv_proxy]")
+{
+	// #2056 (roadmap §3.6): the shipping displayxr-conversion-host with the sim
+	// provider DLL, closed the way a vendor installer closes it.
+	char id[48];
+	std::snprintf(id, sizeof(id), "sim-conv-upd-%lu", (unsigned long)os_process_current_pid());
+	char env_enable[96];
+	std::snprintf(env_enable, sizeof(env_enable), "DXR_CONV_%s_ENABLE", id);
+	for (char *c = env_enable; *c != '\0'; c++) {
+		*c = *c == '-' ? '_' : (char)std::toupper((unsigned char)*c);
+	}
+	std::string env_latency(env_enable);
+	env_latency.replace(env_latency.size() - std::strlen("ENABLE"), std::strlen("ENABLE"), "LATENCY_MS");
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1");
+	set_env(env_enable, "1");
+	set_env(env_latency.c_str(), "0");
+
+#ifdef _WIN32
+	const bool fake_mutex = false; // the real Global\ mutex
+	// Restart Manager closes EVERY process mapping a registered file, and ctest
+	// runs other tests on the same host binary in parallel: register private
+	// copies (beside the originals, so the host still finds the runtime DLL).
+	auto unique_copy = [&](const char *src, const char *ext) {
+		std::string dst(src);
+		dst.replace(dst.size() - std::strlen(ext), std::strlen(ext), std::string("-rmtest-") + id + ext);
+		REQUIRE(CopyFileA(src, dst.c_str(), FALSE));
+		return dst;
+	};
+	const std::string host_copy = unique_copy(CONV_REAL_HOST_EXE, ".exe");
+	const std::string dll_copy = unique_copy(SIM_CONVERSION_PATH, ".dll");
+	const char *host_exe = host_copy.c_str();
+	const char *provider_dll = dll_copy.c_str();
+#else
+	const bool fake_mutex = true; // POSIX has no installer mutex
+	g_maint_held = false;
+	const char *host_exe = CONV_REAL_HOST_EXE;
+	const char *provider_dll = SIM_CONVERSION_PATH;
+#endif
+	{
+	Fixture fx({}, 0, 5, host_exe, id, provider_dll, true, nullptr, fake_mutex);
+	const uint32_t cap = XRT_CONV_TASK_DEPTH_MONO;
+	const uint64_t sid = fx.stream(XRT_CONV_TASK_DEPTH_MONO, cap);
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x5A, &r, 20000));
+	REQUIRE((r.written & XRT_CONV_OUT_DEPTH) != 0u);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	const uint32_t spawns = fx.sup().spawns;
+	conv_supervisor_status sst{};
+	long host_pid = 0;
+	conv_host_proxy_get_status(fx.host, &sst, &host_pid);
+	REQUIRE(host_pid > 0);
+
+#ifdef _WIN32
+	// 1. The installer takes the maintenance mutex.
+	char mname[160];
+	conv_host_proxy_maintenance_mutex_name(id, mname, sizeof(mname));
+	wchar_t wmname[160];
+	REQUIRE(MultiByteToWideChar(CP_UTF8, 0, mname, -1, wmname, 160) > 0);
+	HANDLE mutex = CreateMutexW(nullptr, TRUE, wmname);
+	REQUIRE(mutex != nullptr);
+	REQUIRE(GetLastError() != ERROR_ALREADY_EXISTS);
+
+	// 2. A Restart Manager session on the host binary + the provider DLL.
+	auto widen_path = [](const char *u) {
+		std::wstring w(MultiByteToWideChar(CP_UTF8, 0, u, -1, nullptr, 0), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, u, -1, &w[0], (int)w.size());
+		w.resize(w.size() - 1);
+		for (auto &ch : w) {
+			ch = ch == L'/' ? L'\\' : ch;
+		}
+		return w;
+	};
+	const std::wstring host_file = widen_path(host_exe);
+	const std::wstring dll_file = widen_path(provider_dll);
+	DWORD session = 0;
+	WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
+	REQUIRE(RmStartSession(&session, 0, key) == ERROR_SUCCESS);
+	LPCWSTR files[2] = {host_file.c_str(), dll_file.c_str()};
+	REQUIRE(RmRegisterResources(session, 2, files, 0, nullptr, 0, nullptr) == ERROR_SUCCESS);
+
+	// 3. RmGetList lists the host, never the service (here: this process).
+	std::vector<RM_PROCESS_INFO> procs(8);
+	UINT needed = 0, count = (UINT)procs.size();
+	DWORD reasons = 0;
+	DWORD gl = RmGetList(session, &needed, &count, procs.data(), &reasons);
+	if (gl == ERROR_MORE_DATA) {
+		procs.resize(needed);
+		count = needed;
+		gl = RmGetList(session, &needed, &count, procs.data(), &reasons);
+	}
+	REQUIRE(gl == ERROR_SUCCESS);
+	bool host_listed = false, self_listed = false;
+	for (UINT i = 0; i < count; i++) {
+		const DWORD pid = procs[i].Process.dwProcessId;
+		UNSCOPED_INFO("RmGetList: pid " << pid << " type " << (int)procs[i].ApplicationType << " restartable "
+		                                << (int)procs[i].bRestartable);
+		host_listed = host_listed || pid == (DWORD)host_pid;
+		self_listed = self_listed || pid == GetCurrentProcessId();
+	}
+	CHECK(host_listed);
+	CHECK_FALSE(self_listed);
+	CHECK(reasons == RmRebootReasonNone);
+	for (UINT i = 0; i < count; i++) {
+		if (procs[i].Process.dwProcessId == (DWORD)host_pid) {
+			CHECK(procs[i].ApplicationType == RmOtherWindow); // the hidden session-end window
+			CHECK_FALSE(procs[i].bRestartable);               // never RegisterApplicationRestart
+		}
+	}
+
+	// 4. RmShutdown: the host answers WM_QUERYENDSESSION(ENDSESSION_CLOSEAPP) and exits 20.
+	CHECK(RmShutdown(session, 0, nullptr) == ERROR_SUCCESS);
+#else
+	// The POSIX stand-in for Restart Manager's close request, under what an
+	// installer's maintenance lock would be.
+	g_maint_held = true;
+	REQUIRE(kill((pid_t)host_pid, SIGTERM) == 0);
+#endif
+
+	REQUIRE(wait_until([&] { return fx.sup().last_exit == CONV_HOST_EXIT_UPDATE; }, 15000));
+	REQUIRE(wait_until([&] { return fx.row_reason(cap) == CONV_REASON_UPDATING; }, 5000));
+	CHECK(fx.row_state(cap) == XRT_CONV_STATE_WARMING);
+	CHECK(fx.sup().state == CONV_SUP_UPDATING);
+	CHECK(fx.sup().restarts == 0u);
+
+	// The stream keeps its handle; nothing respawns while the mutex is held.
+	for (int i = 0; i < 30; i++) {
+		CHECK(fx.submit(sid, 0x5B));
+		sleep_ms(50);
+	}
+	CHECK(fx.sup().spawns == spawns);
+	CHECK(fx.sup().state == CONV_SUP_UPDATING);
+	conv_stream_stats st0{};
+	CHECK(conv_core_stream_get_stats(fx.c, sid, &st0) == XRT_SUCCESS);
+
+	// 5. The installer replaces its files (nothing to do here), ends the
+	// session and releases the mutex: the host respawns and converts again.
+#ifdef _WIN32
+	CHECK(RmEndSession(session) == ERROR_SUCCESS);
+	CHECK(ReleaseMutex(mutex));
+	CloseHandle(mutex);
+#else
+	g_maint_held = false;
+#endif
+	REQUIRE(fx.convert(sid, 0x5C, &r, 40000));
+	REQUIRE((r.written & XRT_CONV_OUT_DEPTH) != 0u);
+	CHECK(fx.stats(sid).reopens >= 1u);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	// >= : on a loaded box a real host start can overrun the channel-accept
+	// timeout and be retried (a crash-path restart AFTER the update, which is
+	// not what this test is about; the update itself was checked above).
+	CHECK(fx.sup().spawns >= spawns + 1u);
+	CHECK(fx.row_state(cap) == XRT_CONV_STATE_READY);
+	long new_pid = 0;
+	conv_host_proxy_get_status(fx.host, &sst, &new_pid);
+	CHECK(new_pid != host_pid);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	} // the proxy ends its host here
+#ifdef _WIN32
+	(void)DeleteFileA(host_copy.c_str());
+	(void)DeleteFileA(dll_copy.c_str());
+#endif
 }
 
 #endif

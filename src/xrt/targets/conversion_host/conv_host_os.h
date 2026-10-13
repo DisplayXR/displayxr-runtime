@@ -16,6 +16,8 @@
  *    thread answers WM_QUERYENDSESSION (Restart Manager's close request,
  *    ENDSESSION_CLOSEAPP) / WM_ENDSESSION / WM_CLOSE by asking the host to
  *    exit 20, with a bounded backstop.
+ *  - Close for update (POSIX): SIGTERM asks the host to exit 20 the same way
+ *    (a self-pipe + watcher thread), with the same backstop.
  *
  * @ingroup conv_host
  */
@@ -37,7 +39,7 @@ conv_host_os_install_crash_handler(const char *provider_id);
  * Windows: start the hidden session-end window. @p on_close runs (once, on the
  * window's thread, must not block) when Restart Manager / logoff / WM_CLOSE
  * asks the process to close; if the process is still alive @p backstop_ms
- * later it exits with code 20 itself. POSIX: a no-op returning true.
+ * later it exits with code 20 itself. POSIX: the same for SIGTERM.
  */
 bool
 conv_host_os_start_session_end_watch(void (*on_close)(void *ctx), void *ctx, uint32_t backstop_ms);

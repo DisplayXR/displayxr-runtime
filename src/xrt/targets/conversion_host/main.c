@@ -15,6 +15,7 @@
  *     writer (minidump / core);
  *  2. refuse to run elevated (exit 14);
  *  3. Windows: the hidden session-end window (Restart Manager -> exit 20);
+ *     POSIX: SIGTERM -> exit 20 (close for update);
  *  4. the control channel (the service's inherited token or name);
  *  5. Windows: a D3D11 device on --adapter-luid, never the default adapter
  *     (exit 13 when none is usable); POSIX: CPU lane only;
