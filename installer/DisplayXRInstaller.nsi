@@ -804,6 +804,7 @@ dll_check:
 	; landed inside that window and aborted the bundle with code 6, though
 	; nothing held the DLL a few seconds later. Poll for up to 30 s; a real
 	; foreign holder still falls through to the naming/prompt path below.
+	DetailPrint "Waiting for DisplayXRClient.dll to be released..."
 	Call ClientDllSettle
 	StrCmp $R0 "1" dll_writable
 
