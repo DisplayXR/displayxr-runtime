@@ -12,6 +12,7 @@
 
 #include "conversion/conv_host_inproc.h"
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
 
 #include <ctype.h>
@@ -265,7 +266,13 @@ conv_host_provider_load(struct conv_host_provider *p,
 
 	xrt_result_t pr = XRT_SUCCESS;
 	if (XRT_CONV_IFACE_HAS(e->iface, probe)) {
+		const uint64_t t0 = os_monotonic_get_ns();
 		pr = e->iface->probe(&p->inst); // <= 100 ms, no model load (spec §2.3)
+		const uint64_t probe_us = (os_monotonic_get_ns() - t0) / 1000u;
+		// One line per host start: the probe is part of every respawn's cost.
+		U_LOG_W("conversion host: probe returned %d in %llu.%03llu ms%s", (int)pr,
+		        (unsigned long long)(probe_us / 1000u), (unsigned long long)(probe_us % 1000u),
+		        probe_us > 100000u ? " (over the 100 ms probe budget)" : "");
 	}
 	if (pr != XRT_SUCCESS) {
 		(void)snprintf(out_reason, reason_size, "probe returned %d", (int)pr);
