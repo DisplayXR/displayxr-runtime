@@ -200,11 +200,11 @@ void
 conv_supervisor_watchdog_breach(struct conv_supervisor *s, uint64_t now_ns);
 
 /*!
- * The host left on its OWN idle exit: exit 0 while the owner had no demand
- * for it (no command, stream, job or pin). Orderly: no backoff, no
- * crash-loop accounting, IDLE (respawned by the next demand). An exit 0 WITH
- * demand is still abnormal (a provider calling exit(0) mid-work): report it
- * through conv_supervisor_exited.
+ * The host left on its OWN orderly exit (exit 0 that the supervisor did not
+ * ask for: the host's idle exit, which can race work on its way). Orderly: no
+ * backoff, no crash-loop accounting, IDLE; the next demand respawns it at
+ * once. (conv_supervisor_exited still counts an unrequested 0 as abnormal for
+ * owners that cannot tell.)
  */
 void
 conv_supervisor_idle_exited(struct conv_supervisor *s, uint64_t now_ns);
