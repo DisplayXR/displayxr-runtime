@@ -8,6 +8,7 @@ If you're maintaining a vendor integration that was historically in-tree (the wa
 > - [`DisplayXR/displayxr-vendor-template`](https://github.com/DisplayXR/displayxr-vendor-template) — **the recommended starting point.** A buildable, ABI-correct, **vendor-SDK-free** starter kit: it's a plug-in skeleton (`drv_example`, D3D11 + Vulkan stub weavers) that consumes only the public runtime ABI (pinned via FetchContent). Generate a repo from it, rename `drv_example` → `drv_<vendor>`, replace the stub weave. See [§3](#3-building-from-the-template).
 > - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — a **full worked vendor integration** (the first vendor on the platform) to read for reference. It builds against a proprietary vendor SDK, so it's not a clean *starting* point — use it to see how a real weaver, eye-tracking listener, and installer come together.
 > - `src/xrt/drivers/sim_display/sim_display_plugin.c` (in this repo) — the runtime's in-tree neutral reference. Smaller, no vendor SDK; useful as a minimal-shape reference (can't be forked as a standalone plug-in repo — that's what the template is for).
+> - **Shipping a 2D→3D model rather than a display?** That is a conversion provider, a separate plug-in type with its own starter kit, [`displayxr-conversion-template`](https://github.com/DisplayXR/displayxr-conversion-template). Go straight to [§9](#9-conversion-providers--the-third-plug-in-type).
 
 ## 1. What you ship
 
@@ -514,6 +515,167 @@ The whole checklist:
 - Run the same checks a second time with `XRT_FORCE_MODE=ipc` and a running `displayxr-service.exe`. Roles, the rig and the composer all live service-side there, and the durable-recenter rule exists precisely because that path polls differently.
 - `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` skips input providers entirely — the fastest way to prove a symptom is yours.
 
+## 9. Conversion providers — the third plug-in type
+
+Everything from §1 to §7 is the **display** side, and §8 the tracking side. If what you ship is a **2D→3D model** — depth from an image or a video, stereo or N views from one image, disparity from a stereo pair, Gaussian splats from a photo — you write a **conversion provider**: contract [`xrt_conversion_plugin.h`](../../src/xrt/include/xrt/xrt_conversion_plugin.h), entry point `xrtConversionPluginNegotiate`, discovery root `HKLM\Software\DisplayXR\ConversionProviders` (POSIX: `NNN-<id>-conversion-provider.json` manifests). A model vendor is not a display vendor: there is no weaver, no device, no eye tracking and no display-processor vtable here, and you can skip §3–§7 above. The runtime owns every thread, queue, policy and app-facing API (apps reach you through [`XR_DXR_lift`](../specs/extensions/XR_DXR_lift.md) and never learn which provider served them); your provider does **pixels and units only** ([ADR-053](../adr/ADR-053-conversion-providers.md)). The normative contract is the [conversion-provider discovery spec](../specs/runtime/conversion-provider-discovery.md); this section is the walk-through.
+
+> **Where to start:** [`DisplayXR/displayxr-conversion-template`](https://github.com/DisplayXR/displayxr-conversion-template) — a buildable, dependency-free provider skeleton: one CPU `DEPTH_MONO` capability that returns a ramp, a settings example, a **fake host** that drives the provider through the same call sequence the runtime uses (no runtime install needed), dev-box registration scripts for Windows and POSIX, and CI on Windows, Linux and macOS. It builds with plain CMake against a vendored copy of the header. The in-tree `src/xrt/drivers/sim_conversion/` (every task, scriptable states) is the full reference; it cannot be forked as a standalone repository, which is what the template is for.
+
+### 9.1 What you ship
+
+1. **A provider DLL** (`.dll` / `.so` / `.dylib`), e.g. `DisplayXR-<Vendor>Conversion.dll`, exporting exactly one C symbol, `xrtConversionPluginNegotiate`. Its ABI major, `XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT` (1), is independent of the display (`XRT_PLUGIN_API_VERSION_CURRENT`) and input ABIs; the loader rejects a different major before calling anything ([ADR-020](../adr/ADR-020-plugin-abi-compatibility-policy.md)).
+2. **An installer** that drops it under `C:\Program Files\DisplayXR\Plugins\<Vendor>\` and writes the `ConversionProviders\<id>` row (§9.4), honouring the update contract in §9.8.
+
+**Ship a separate DLL, even if you are also a display vendor.** One DLL may export both `xrtPluginNegotiate` and `xrtConversionPluginNegotiate` and be registered under both roots, but its display half keeps it mapped in `displayxr-service.exe`, so every update of it still closes the service and drops every client session. A separate provider DLL runs in its own supervised `displayxr-conversion-host.exe` and updates with no session lost. A display vendor whose plug-in still serves lift through the frozen display-processor lift slots registers its new provider with `Supersedes = dp-lift`, which hides the runtime's legacy adapter row.
+
+The header is self-contained: `xrt/xrt_conversion_plugin.h` + `xrt/xrt_results.h` + the C standard headers. Linking `DisplayXRClient.lib` is optional and buys only the [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) logging surface (`u_log_*`), which both hosts export; a provider that does not log through it needs no runtime library at all.
+
+### 9.2 The ABI in one page
+
+| Slot | Thread / class | What it does |
+|---|---|---|
+| `xrtConversionPluginNegotiate` | the loader, once | store the host iface; return your iface and your compiled `XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT` |
+| `get_provider_status` | any, concurrent | are your dependencies there? (ADR-045 shape: the inference runtime, a driver — never a display) |
+| `probe` | control, ≤ 100 ms | create the instance — **no model load, no network**. `XRT_ERROR_PROBER_NOT_SUPPORTED` is a clean decline |
+| `describe_cap` | any, concurrent | **one capability per call**; `out == NULL` returns the count. The runtime zero-fills the struct and sets `struct_size`; write only within it |
+| `get_generation` | any, concurrent | changes whenever `describe_cap` would answer differently |
+| `get_state` | any, concurrent, µs | readiness per `cap_id`, from memory, allocation-free (§9.6) |
+| `warm` / `evict` | control | load / unload the model. `warm` may block for as long as it takes, polling `is_cancelled` at least every 250 ms and publishing progress through `get_state` |
+| `stream_get_output_desc` | any, concurrent, pure | the target extents and formats for a given input extent |
+| `stream_create` / `stream_convert` / `stream_destroy` | a stream worker | the per-frame lane: the runtime does latest-wins, priorities and timestamps; you do one inference per `stream_convert`, writing into **runtime-allocated** targets sized by your `stream_get_output_desc` |
+| `job_execute` | the job worker | the one-shot lane (photo → splats, seconds to minutes): decoded pixels in, blobs out through runtime sinks, progress + cooperative cancel |
+| `destroy` | control | **may never be called**: the host can be killed at any instant |
+
+**Threading: one call in flight per provider** by default, so a provider on a single-threaded library needs no locks; only the five read-only slots above marked "concurrent" may overlap anything, and they answer from memory. Overlap is opt-in per capability (`max_concurrent`, `XRT_CONV_CAP_LANES_CONCURRENT`, `XRT_CONV_CAP_WARM_CONCURRENT`). No slot is ever called from a render, compositor or IPC thread. Full table: discovery spec §2.3.
+
+**Struct rules** (discovery spec §2.2): every top-level struct starts with `struct_size` and is append-only; read and write only what `struct_size` covers (`XRT_CONV_COVERS`). The embedded structs (`xrt_conv_image`, `xrt_conv_sync`, `xrt_conv_depth_info`, `xrt_conv_views_info`, `xrt_conv_splat_info`, `xrt_conv_stereo_calibration`) are **frozen**, pinned by `sizeof` asserts in the header. Strings are fixed-size arrays; enumerations are `uint32_t` + `#define`s.
+
+**A capability** is one (task × model × backend × device): `cap_id` (non-zero, yours, stable for the instance's life), `task` (`XRT_CONV_TASK_*`), lanes, input kinds, outputs, flags, the memory and sync kinds you import, limits the runtime enforces (`min_views` / `max_views` ≤ 8, `max_streams`, `max_input_edge`), the output contract (depth kind, measure, intrinsics source), licence class (§9.7), and cost estimates. Two rules are hard: every `VIEWS_*` capability sets `XRT_CONV_CAP_EXPLICIT_VIEWPOINTS` (selection refuses one that does not), and every capability imports `XRT_CONV_MEM_CPU` at least on the job lane — the runtime copies any other memory kind to CPU for you, so a CPU-only provider is a complete provider. A provider whose library fixes one model per process declares **one** capability whose variant follows the quality hint, not several mutually exclusive ones.
+
+### 9.3 The hosting-agnostic rules
+
+The same DLL runs in the satellite host (the default for every registered provider) or, as a debugging escape hatch, inside the service (`Hosting=in-service`). It must not be able to tell them apart. The full table is discovery spec §2.4; the ones that bite:
+
+- **No runtime device.** Create your own (D3D11/12, Vulkan, Metal, an inference session) on the adapter `host->get_adapter_hint` names, and report it in `capability.device_luid`. Every image you see is runtime-allocated; you **import, never export**, and cache imports by `import_key`.
+- **No windows on non-pumping threads**, no `SetDllDirectory` / `SetCurrentDirectory` / `putenv` / `exit` / signal handlers / DPI changes. A dependency that insists on a hidden window gets `HWND_MESSAGE` or a pumping thread; otherwise Restart Manager and logoff hang.
+- **Load dependencies by absolute path** and **never statically import your inference runtime**: the provider DLL must load (and report `ABSENT`) when that runtime is missing. Delay-load it, or `LoadLibraryExW` it by full path with backslashes.
+- **Configuration only through `host->get_setting`** (§9.5), never `getenv`: in a satellite the environment is the host's.
+- **Network only inside `warm`**, only on capabilities flagged `XRT_CONV_CAP_NEEDS_NETWORK_TO_WARM`; never in `stream_convert` or `job_execute`. Model bytes from the shared store come through `host->model_resolve` / `model_request`; you never write the store.
+- **Medium integrity, interactive session**; licence activation must work non-elevated.
+- **No policy.** Viewpoints, convergence, the depth budget and the cursor are the runtime's. Render exactly `params.viewpoints_xyz`; when `params.convergence_mode` is `DECODED`, put exactly that plane at zero parallax, in the decoded units of your own depth output. You may *suggest* a convergence or a strength; policy ignores the suggestion unless your provider has been validated against the runtime's stereo ground-truth corpus.
+- **Honest units.** Report the depth kind you actually produce (metric, metric-inverse, affine depth, affine inverse depth, affine disparity, pixel disparity), the per-frame range **before** any normalisation, and intrinsics with their source. Unknown is zero; never invent a scale, focal length or baseline.
+
+### 9.4 Registration
+
+**Windows:** your installer writes `HKLM\Software\DisplayXR\ConversionProviders\<id>` (64-bit view; NSIS `SetRegView 64`). `<id>` is a short kebab-case string equal to `iface->id`.
+
+| Value | Type | Notes |
+|---|---|---|
+| `Binary` | `REG_SZ` | absolute DLL path, backslashes. Required |
+| `DisplayName` | `REG_SZ` | required |
+| `Vendor` | `REG_SZ` | informational |
+| `ProbeOrder` | `REG_DWORD` | lower wins: **50** for a vendor provider; 100 default; 150 is the legacy `dp-lift` row, 200 the open-model provider, 250 the sim. Pick a value distinct from every provider you expect to coexist with |
+| `Enabled` | `REG_DWORD` | 0 disables |
+| `Hosting` | `REG_SZ` | omit (= `auto` = satellite). `in-service` only for debugging |
+| `Supersedes` | `REG_SZ` | `dp-lift` if your display plug-in also serves lift through the legacy slots. It hides only that row; it never affects selection among other providers |
+| `Packs` | `REG_MULTI_SZ` | absolute paths of your model-pack manifests, if you use the shared model store |
+| `Settings\<KEY>` | `REG_SZ` | your settings (§9.5) |
+| `UninstallString` | `REG_SZ` | informational |
+| `Version` | `REG_SZ` | **written last**: it is the "row complete" marker the service re-describes on (§9.8) |
+
+**POSIX:** a manifest named `NNN-<id>-conversion-provider.json` (`NNN` = ProbeOrder) in a plug-in root (`XRT_PLUGIN_SEARCH_PATH`, or the per-user / system roots of [`plugin-discovery.md`](../specs/runtime/plugin-discovery.md) §3). The suffix routes it to the conversion loader; the display and input loaders skip it.
+
+```json
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "example-conversion",
+        "display_name": "Example Conversion Provider",
+        "vendor":       "Example Inc.",
+        "version":      "0.1.0",
+        "binary_path":  "/opt/example/lib/DisplayXR-ExampleConversion.so",
+        "probe_order":  50,
+        "settings":     { "RAMP_DIRECTION": "vertical" }
+    }
+}
+```
+
+Optional keys: `enabled` (bool), `hosting`, `supersedes`, `packs` (array of paths).
+
+**Selection** is the runtime's, per task, at each stream or job create: per-task user preference (`displayxr-cli conv use`), then ProbeOrder, then a direct capability before a composed pipeline, then id. **Readiness never reorders it**: a first choice that is installed, downloading, warming or evicted is waited for; only an absent, disabled, unlicensed, incompatible or failed one falls through to the next candidate (discovery spec §3.4).
+
+### 9.5 Settings
+
+`host->get_setting(key, buf, size)` resolves, in the **hosting** process:
+
+1. `DXR_CONV_<ID>_<KEY>` in that process's environment, where `<ID>` is your id upper-cased with `-` → `_` (`example-conversion` → `DXR_CONV_EXAMPLE_CONVERSION_RAMP_DIRECTION`). The host inherits the service's environment, and the service auto-starts from the logon environment — a variable set in an app's shell never reaches either;
+2. else `ConversionProviders\<id>\Settings\<KEY>` (Windows) or the manifest's `settings` object (POSIX).
+
+This replaces per-vendor environment knobs and ad-hoc registry keys. Read settings in `probe` or `warm`, not per frame.
+
+### 9.6 Readiness and the version gate
+
+`get_state(cap_id)` answers from memory with one of the states below, plus `failure_reason`, `retryable`, `progress` and a human-readable `detail` that is shown verbatim and never parsed. Call `host->notify_changed(cap_id)` whenever it changes (0 = re-describe everything); the runtime re-reads on its own thread.
+
+| Situation | Report | Why it matters |
+|---|---|---|
+| present, model cold | `INSTALLED` | consumers wait; a create or prewarm calls `warm` |
+| loading, compiling, first inference | `WARMING` with progress | waited for |
+| model bytes being fetched by the host | `DOWNLOADING` with progress | waited for |
+| converts now | `READY` | |
+| unloaded after idle | `EVICTED` | waited for; the reload is reported `WARMING` |
+| your inference runtime or other dependency is **not installed** | `ABSENT` | falls through to the next provider |
+| it is installed but **older than your floor** | **`FAILED` + `XRT_CONV_FAIL_VERSION`**, never `FAIL_MODEL` | the dashboard must say "too old", not "missing" |
+| model files missing, bad hash, unsupported | `FAILED` + `FAIL_MODEL` | |
+| GPU / OS / driver unusable | `INCOMPATIBLE` (or `FAILED` + `FAIL_PLATFORM` when discovered at warm) | |
+| licence missing or refused | `UNLICENSED` (or `FAILED` + `FAIL_LICENCE`) | |
+| not enough memory | `FAILED` + `FAIL_RESOURCES` | |
+| device lost during a convert | return a device-lost result | the runtime marks it `FAILED(DEVICE_LOST, retryable)` and re-warms; never retry silently inside a convert |
+
+Set `retryable` when a later `warm` may succeed. Version-gate extended entry points (an optional feature of a newer runtime, for example) inside the provider: declare the capability only when the loaded runtime has them, and bump `get_generation` if that changes.
+
+### 9.7 Licence classes
+
+| Class | Meaning | Selected |
+|---|---|---|
+| `PERMISSIVE` | open licence, commercial use permitted | always |
+| `COMMERCIAL` | proprietary, licensed for commercial use | always |
+| `RESEARCH_ONLY` | research / evaluation only | only after the user opts in (`AllowResearchOnly` = 1); **signed installers never write it** |
+| `UNKNOWN` | | treated as `RESEARCH_ONLY` |
+
+`commercial_ok` is an **AND** over the model, every dependency it was derived from, and the inference runtime you load: a provider cannot advertise a commercial class over a research-only runtime. Put the SPDX identifier in `licence_spdx` (`LicenseRef-<owner>` for a proprietary licence).
+
+### 9.8 The installer contract: close the host, never the service
+
+The display-side rules of §5 apply (you own your row, you may be installed before the runtime, silent uninstall, never start anything elevated). What changes is the update. Your DLL is mapped only by its `displayxr-conversion-host.exe`, so:
+
+1. Create **and own** `Global\DisplayXR-ConvMaintenance-<id>` before touching anything; hold it to the end. While it is held the service spawns no host for `<id>`.
+2. Restart Manager on **your provider's files**: `RmStartSession`, `RmRegisterResources`, `RmGetList` (it lists the host, not the service), `RmShutdown`. The host exits 20 ("closed for update"); the provider's tasks report `WARMING(updating)`; every app session and stream stays alive.
+3. Replace the files; write the row with **`Version` last**.
+4. `RmEndSession`. **Start nothing**: not the host, not the service. Do not stop the service either.
+5. Release the mutex. The service respawns the host on demand; tasks go back to `READY` with no client action.
+
+```nsis
+; In the section that replaces the files (create and release on the same thread):
+; own the maintenance mutex before touching anything.
+System::Call 'kernel32::CreateMutexW(p 0, i 1, w "Global\DisplayXR-ConvMaintenance-example-conversion") p .r9'
+; ... Restart Manager on the provider files, copy files, WriteRegStr ... "Version" last ...
+System::Call 'kernel32::ReleaseMutex(p r9)'
+System::Call 'kernel32::CloseHandle(p r9)'
+```
+
+Uninstall is the same without the respawn. On POSIX there is no Restart Manager and no mutex: replace the library by rename. Full contract, the as-built runtime behaviour per step and the exit-code table: discovery spec §3.8 and §4.4. An installer that still closes the service keeps working, at the cost of every live session — which is the cost this contract exists to remove.
+
+### 9.9 Testing without (and with) the runtime
+
+1. **The template's fake host**, no runtime needed: it loads your DLL the way the loader does (absolute path, the one symbol), negotiates against a stub host iface that answers `get_setting` from its command line, then probes, walks `describe_cap` with a deliberately short `struct_size` as well as the full one, polls `get_state`, warms with a cancel callback, creates a CPU stream, converts a test image and checks the output and the `depth_info` units. Run it in your CI on every OS you ship.
+2. **Register on a dev box** with a from-source runtime: `scripts\register_dev_plugin.bat conv C:\path\to\DisplayXR-<Vendor>Conversion.dll` (elevated; ProbeOrder 50; writes `Version` last), or the template's own `scripts/register-dev.{bat,sh}`. POSIX: drop the manifest into a directory on `XRT_PLUGIN_SEARCH_PATH`.
+3. **`displayxr-cli conv list [--json]`** prints every provider × capability, the selection order with a `selected` column and the reason each row was kept or dropped; **`conv status [--watch]`** prints readiness live. With no service running both fall back to a headless pass that negotiates, probes and describes but never warms, and say so (`source: headless`).
+4. **`displayxr-cli selftest`** includes a `conversion_providers` check: ABI, a well-formed `describe_cap` (known task, lanes set, `min_views ≤ max_views ≤ 8`, `VIEWS_*` ⇒ `EXPLICIT_VIEWPOINTS`, unique `cap_id`, known licence class) and in-range states. A malformed descriptor exits **13**; a missing provider never fails it.
+5. **Through the service**: with your row registered and the service running (non-elevated), a lift client reaches your provider in its satellite host. `displayxr-cli lift probe <image> --mode depth` drives a depth stream (it asks for video content, which is served by `DEPTH_VIDEO`; a `DEPTH_MONO`-only provider is reached by a photo depth stream or a spec-4 `XR_LIFT_TASK_DEPTH_MONO_DXR` stream). The host writes `%LOCALAPPDATA%\DisplayXR\DisplayXR_conversion-host_<id>.<pid>_<ts>.log`, and its WARN lines appear in the service log prefixed `[conv:<id>]`.
+6. **A known-good comparison**: `scripts\register_dev_plugin.bat conv sim` registers the in-tree `sim-conversion` provider (FALLBACK, ProbeOrder 250, enabled with setting `ENABLE` = 1). Its knobs script every readiness state, latency, hangs and device loss, so you can see what the runtime does with each before your provider produces it.
+7. **The update path**: take the maintenance mutex, run a Restart Manager session on your DLL with a stream live, and check that `RmGetList` names the host only, the stream survives, and the task returns to `READY` after you release the mutex.
+
 ## Related
 
 - [Plug-in iface reference](../reference/xrt_plugin_iface.md) — per-method contract for `xrt_plugin_iface`
@@ -523,4 +685,5 @@ The whole checklist:
 - [Eye tracking modes spec](../specs/vendor/eye-tracking-modes.md) — MANAGED vs MANUAL contract
 - [ADR-027](../adr/ADR-027-display-zones.md) + [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md) — the zones contract a region-scoped hardware weaver implements
 - [Input-provider iface reference](../reference/xrt_input_plugin_iface.md) + [discovery spec](../specs/runtime/input-provider-discovery.md) — the other plug-in type: controllers, hand tracking, and the rig (navigation) role (§8)
+- [Conversion-provider discovery spec](../specs/runtime/conversion-provider-discovery.md) + [ADR-053](../adr/ADR-053-conversion-providers.md) + [`XR_DXR_lift`](../specs/extensions/XR_DXR_lift.md) — the third plug-in type: 2D→3D models (§9); starter kit [`displayxr-conversion-template`](https://github.com/DisplayXR/displayxr-conversion-template)
 - [Legacy in-tree integration model](../archive/vendor-integration-historical.md) — historical reference for the pre-#263 in-tree integration shape
