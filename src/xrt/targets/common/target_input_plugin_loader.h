@@ -56,12 +56,14 @@ struct target_input_plugin_desc
 	bool enabled;         /* Windows `Enabled` DWORD (HKCU over HKLM) / manifest `enabled`; true when absent */
 	/*!
 	 * Where @ref enabled came from (N3a, ADR-054 verb `enable|disable`):
-	 * "user" (a per-user HKCU `Enabled` is in force — what `displayxr-cli
-	 * input enable|disable` writes; `TARGET_COMPONENT_FLAG_USER_OVERLAY`),
-	 * "machine" (disabled by HKLM `Enabled` = 0), "manifest" (disabled by
-	 * the POSIX manifest's `plugin.enabled`), else "default". An explicit
-	 * `Enabled` = 1 in HKLM / `"enabled": true` reads as "default": the
-	 * shared row reader records the value, not its presence.
+	 *  - "user": a per-user HKCU `Enabled` is in force, whatever its value
+	 *    (`TARGET_COMPONENT_FLAG_USER_OVERLAY`) — so an explicit HKCU
+	 *    `Enabled` = 1 reads "user";
+	 *  - "machine": disabled by HKLM `Enabled` = 0 (Windows);
+	 *  - "manifest": disabled by the POSIX manifest's `"enabled": false`;
+	 *  - "default": enabled with no per-user value — which includes an
+	 *    explicit HKLM `Enabled` = 1 / `"enabled": true`, because the shared
+	 *    row reader records the value, not its presence.
 	 */
 	char enabled_source[12];
 };

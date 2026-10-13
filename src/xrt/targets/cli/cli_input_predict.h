@@ -55,6 +55,28 @@ cli_input_predict_active(const struct target_input_plugin_desc *list, int n, con
 }
 
 /*!
+ * Index of the registered provider @p id in @p list, or -1. The gate behind
+ * `input enable|disable`: a per-user `Enabled` for an id that is not
+ * registered (HKLM row / manifest) would be an orphan row `list` can never
+ * show, so the verb refuses instead of writing it. (`input use` deliberately
+ * does NOT gate on this — a preference ahead of registration mirrors `dp use`
+ * and `conv use`.)
+ */
+static inline int
+cli_input_find(const struct target_input_plugin_desc *list, int n, const char *id)
+{
+	if (id == NULL) {
+		return -1;
+	}
+	for (int i = 0; i < n; i++) {
+		if (strcmp(list[i].id, id) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/*!
  * Is @p id a usable provider id for the `enable|disable|use` verbs: non-empty,
  * shorter than the 64-byte id field, no path separators (it names a registry
  * subkey), not flag-shaped.

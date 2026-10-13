@@ -89,6 +89,28 @@ TEST_CASE("cli_input_predict_active: the PreferredPlugin override")
 	}
 }
 
+TEST_CASE("cli_input_find: the registered gate behind input enable|disable")
+{
+	const target_input_plugin_desc list[] = {
+	    desc("a-hands", 50, true),
+	    desc("off-hands", 10, false),
+	};
+
+	SECTION("a registered id is found whether enabled or not")
+	{
+		CHECK(cli_input_find(list, 2, "a-hands") == 0);
+		CHECK(cli_input_find(list, 2, "off-hands") == 1);
+	}
+
+	SECTION("an unregistered id is refused — no orphan per-user row")
+	{
+		CHECK(cli_input_find(list, 2, "nope") == -1);
+		CHECK(cli_input_find(list, 2, "") == -1);
+		CHECK(cli_input_find(list, 2, nullptr) == -1);
+		CHECK(cli_input_find(nullptr, 0, "a-hands") == -1);
+	}
+}
+
 TEST_CASE("cli_input_id_valid: what can name a provider row")
 {
 	CHECK(cli_input_id_valid("sim-input"));
