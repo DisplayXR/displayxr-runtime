@@ -66,6 +66,14 @@ target_link_libraries(
 	PRIVATE comp_d3d11_conv_viewsyn comp_d3d11_conv_content ${D3D11_LIBRARY} ${DXGI_LIBRARY} d3dcompiler
 	)
 
+# ADR-053 P2 (#2034): the D3D11 NT-handle + shared-fence half of a
+# conversion-host satellite lane (the proxy's gpu ops). CPU-observed fences only.
+add_library(comp_d3d11_conv_host_lane STATIC d3d11_conv_host_lane.cpp d3d11_conv_host_lane.h)
+target_include_directories(comp_d3d11_conv_host_lane PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(
+	comp_d3d11_conv_host_lane PUBLIC xrt-interfaces aux_util conv_runtime PRIVATE ${D3D11_LIBRARY} ${DXGI_LIBRARY}
+	)
+
 add_library(
 	comp_d3d11_service STATIC
 	../d3d_shared/comp_equirect2_shaders.h

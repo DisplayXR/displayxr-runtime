@@ -1392,6 +1392,16 @@ if(TARGET tests_conv_proxy)
 		tests_conv_proxy PRIVATE "CONV_PROXY_HOST=\"$<TARGET_FILE:tests_conv_proxy_host>\""
 		)
 	add_dependencies(tests_conv_proxy tests_conv_proxy_host)
+	# The real host + the sim provider, compared against the same sources in-service.
+	if(TARGET displayxr-conversion-host AND TARGET drv_sim_conversion_plugin AND TARGET sim_conversion_static)
+		target_link_libraries(tests_conv_proxy PRIVATE sim_conversion_static)
+		add_dependencies(tests_conv_proxy displayxr-conversion-host drv_sim_conversion_plugin)
+		target_compile_definitions(
+			tests_conv_proxy
+			PRIVATE "CONV_REAL_HOST_EXE=\"$<TARGET_FILE:displayxr-conversion-host>\""
+				"SIM_CONVERSION_PATH=\"$<TARGET_FILE:drv_sim_conversion_plugin>\""
+			)
+	endif()
 endif()
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4

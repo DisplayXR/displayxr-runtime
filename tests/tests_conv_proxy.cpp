@@ -90,67 +90,16 @@ cpu_free(void *, xrt_conv_image *img)
 	img->cpu_ptr = nullptr;
 }
 
-struct Fixture
+struct CoreOps
 {
 	conv_core *c = nullptr;
-	conv_host *host = nullptr; //!< owned by the core once added
-	std::string marker;
-
-	explicit Fixture(const std::vector<std::string> &extra, uint64_t watchdog_ns = 0, uint32_t crash_loop = 5)
-	{
-		conv_core_config cfg{};
-		cfg.alloc.alloc = cpu_alloc;
-		cfg.alloc.free = cpu_free;
-		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
-		cfg.prewarm_task_mask = 1ull << 63;
-		cfg.rear_cap_m = -1.0f;
-		cfg.tick_ms = 10;
-		cfg.watchdog_stream_ns = watchdog_ns;
-		REQUIRE(conv_core_create(&cfg, &c) == XRT_SUCCESS);
-
-		conv_supervisor_config sc;
-		conv_supervisor_config_defaults(&sc);
-		sc.backoff_initial_ns = 50 * MS;
-		sc.backoff_max_ns = 200 * MS;
-		sc.crash_loop_count = crash_loop;
-		sc.hello_timeout_ns = 10000 * MS;
-
-		static std::vector<std::string> keep;
-		keep = extra;
-		args.clear();
-		for (const auto &a : keep) {
-			args.push_back(a.c_str());
-		}
-		conv_host_proxy_config pc;
-		conv_host_proxy_config_defaults(&pc);
-		pc.provider_id = "sat-test";
-		pc.provider_binary = "scripted";
-		pc.host_exe = CONV_PROXY_HOST;
-		pc.supervisor = &sc;
-		pc.scratch_bytes = 4ull * 1024 * 1024;
-		pc.extra_args = args.empty() ? nullptr : args.data();
-		pc.extra_arg_count = (uint32_t)args.size();
-		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
-
-		conv_provider_desc d{};
-		d.id = "sat-test";
-		d.probe_order = 100;
-		d.hosting = CONV_HOSTING_SATELLITE;
-		d.enabled = true;
-		d.host = host;
-		REQUIRE(conv_core_add_provider(c, &d) >= 0);
-	}
-	~Fixture()
-	{
-		conv_core_destroy(&c);
-	}
 
 	uint32_t
-	row_state()
+	row_state(uint32_t cap_id = 4)
 	{
 		static conv_registry reg;
 		conv_core_copy_registry(c, &reg);
-		const int32_t ri = conv_registry_find_row(&reg, 0, 4);
+		const int32_t ri = conv_registry_find_row(&reg, 0, cap_id);
 		return ri < 0 ? XRT_CONV_STATE_UNKNOWN : reg.rows[ri].rd.state;
 	}
 
@@ -163,25 +112,16 @@ struct Fixture
 		return ri < 0 ? 0u : reg.rows[ri].rd.reason;
 	}
 
-	conv_supervisor_status
-	sup()
-	{
-		conv_supervisor_status st{};
-		long pid = 0;
-		conv_host_proxy_get_status(host, &st, &pid);
-		return st;
-	}
-
 	uint64_t
-	stream()
+	stream(uint32_t task = XRT_CONV_TASK_VIEWS_MONO, uint32_t cap_id = 4)
 	{
-		REQUIRE(wait_until([&] { return row_state() != XRT_CONV_STATE_UNKNOWN; }, 10000));
+		REQUIRE(wait_until([&] { return row_state(cap_id) != XRT_CONV_STATE_UNKNOWN; }, 10000));
 		xrt_conv_wire_stream_desc d{};
 		d.struct_size = sizeof(d);
 		d.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
-		d.task = XRT_CONV_TASK_VIEWS_MONO;
-		d.outputs = XRT_CONV_OUT_VIEWS;
-		d.view_count = 2;
+		d.task = task;
+		d.outputs = task == XRT_CONV_TASK_VIEWS_MONO ? XRT_CONV_OUT_VIEWS : XRT_CONV_OUT_DEPTH;
+		d.view_count = task == XRT_CONV_TASK_VIEWS_MONO ? 2u : 0u;
 		d.views_layout = XRT_CONV_VIEWS_ROW;
 		d.input_kind = XRT_CONV_INPUT_MONO;
 		xrt_conv_wire_stream_created cr{};
@@ -235,6 +175,76 @@ struct Fixture
 		conv_stream_stats s{};
 		REQUIRE(conv_core_stream_get_stats(c, sid, &s) == XRT_SUCCESS);
 		return s;
+	}
+
+};
+
+struct Fixture : CoreOps
+{
+	conv_host *host = nullptr; //!< owned by the core once added
+	std::string marker;
+
+	explicit Fixture(const std::vector<std::string> &extra,
+	                 uint64_t watchdog_ns = 0,
+	                 uint32_t crash_loop = 5,
+	                 const char *host_exe = CONV_PROXY_HOST,
+	                 const char *provider_id = "sat-test",
+	                 const char *binary = "scripted")
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = cpu_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		cfg.watchdog_stream_ns = watchdog_ns;
+		REQUIRE(conv_core_create(&cfg, &c) == XRT_SUCCESS);
+
+		conv_supervisor_config sc;
+		conv_supervisor_config_defaults(&sc);
+		sc.backoff_initial_ns = 50 * MS;
+		sc.backoff_max_ns = 200 * MS;
+		sc.crash_loop_count = crash_loop;
+		sc.hello_timeout_ns = 10000 * MS;
+
+		static std::vector<std::string> keep;
+		keep = extra;
+		args.clear();
+		for (const auto &a : keep) {
+			args.push_back(a.c_str());
+		}
+		conv_host_proxy_config pc;
+		conv_host_proxy_config_defaults(&pc);
+		pc.provider_id = provider_id;
+		pc.provider_binary = binary;
+		pc.host_exe = host_exe;
+		pc.supervisor = &sc;
+		pc.scratch_bytes = 4ull * 1024 * 1024;
+		pc.extra_args = args.empty() ? nullptr : args.data();
+		pc.extra_arg_count = (uint32_t)args.size();
+		REQUIRE(conv_host_proxy_create(&pc, &host) == XRT_SUCCESS);
+
+		conv_provider_desc d{};
+		d.id = provider_id;
+		d.probe_order = 100;
+		d.hosting = CONV_HOSTING_SATELLITE;
+		d.enabled = true;
+		d.host = host;
+		REQUIRE(conv_core_add_provider(c, &d) >= 0);
+	}
+	~Fixture()
+	{
+		conv_core_destroy(&c);
+	}
+
+	conv_supervisor_status
+	sup()
+	{
+		conv_supervisor_status st{};
+		long pid = 0;
+		conv_host_proxy_get_status(host, &st, &pid);
+		return st;
 	}
 
 	std::vector<const char *> args;
@@ -371,3 +381,147 @@ TEST_CASE("proxy: a terminal host exit (ABI reject) is FAILED, never respawned",
 	CHECK(fx.sup().spawns == spawns);
 	CHECK(fx.sup().last_exit == 10);
 }
+
+
+#if defined(CONV_REAL_HOST_EXE) && defined(SIM_CONVERSION_PATH)
+
+extern "C" xrt_result_t
+xrtConversionPluginNegotiate(uint32_t runtime_api_version,
+                             const struct xrt_conversion_plugin_host_iface *host,
+                             struct xrt_conversion_plugin_iface **out_iface,
+                             uint32_t *out_plugin_api_version);
+
+namespace {
+
+void
+set_env(const char *name, const char *value)
+{
+#ifdef _WIN32
+	_putenv_s(name, value);
+#else
+	setenv(name, value, 1);
+#endif
+}
+
+bool
+sim_setting(const char *key, char *buf, uint32_t size)
+{
+	const char *v = std::strcmp(key, "ENABLE") == 0 ? "1" : std::strcmp(key, "LATENCY_MS") == 0 ? "0" : nullptr;
+	if (v == nullptr || size == 0) {
+		return false;
+	}
+	std::snprintf(buf, size, "%s", v);
+	return true;
+}
+
+//! The depth bytes of one DEPTH_MONO conversion of a fixed frame.
+std::vector<uint8_t>
+depth_bytes(CoreOps &fx)
+{
+	const uint64_t sid = fx.stream(XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_TASK_DEPTH_MONO);
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x5A, &r, 20000));
+	REQUIRE((r.written & XRT_CONV_OUT_DEPTH) != 0u);
+	REQUIRE(r.depth.memory_kind == XRT_CONV_MEM_CPU);
+	const auto *b = static_cast<const uint8_t *>(r.depth.cpu_ptr);
+	std::vector<uint8_t> out(b, b + r.depth.byte_size);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	return out;
+}
+
+//! The primary output bytes of one SPLATS_MONO job (the job lane through the host).
+std::vector<uint8_t>
+job_bytes(CoreOps &fx)
+{
+	std::vector<uint8_t> pixels(32 * 16 * 4, 0x6B);
+	conv_job_create_info ji{};
+	ji.task = XRT_CONV_TASK_SPLATS_MONO;
+	ji.input_kind = XRT_CONV_INPUT_MONO;
+	ji.image_count = 1;
+	ji.images[0].memory_kind = XRT_CONV_MEM_CPU;
+	ji.images[0].cpu_ptr = pixels.data();
+	ji.images[0].byte_size = pixels.size();
+	ji.images[0].width = 32;
+	ji.images[0].height = 16;
+	ji.images[0].row_stride = 32 * 4;
+	ji.images[0].format = XRT_CONV_FMT_RGBA8_UNORM;
+	ji.params.struct_size = sizeof(ji.params);
+	uint64_t job = 0;
+	REQUIRE(wait_until([&] { return conv_core_job_submit(fx.c, 1, &ji, &job) == XRT_SUCCESS; }, 10000));
+	conv_job_status st{};
+	REQUIRE(wait_until(
+	    [&] {
+		    conv_core_job_status(fx.c, job, &st);
+		    return st.status == CONV_JOB_SUCCEEDED || st.status == CONV_JOB_FAILED;
+	    },
+	    20000));
+	REQUIRE(st.status == CONV_JOB_SUCCEEDED);
+	std::vector<uint8_t> out(1u << 20);
+	uint64_t n = 0, total = 0;
+	REQUIRE(conv_core_job_read(fx.c, job, 0, 0, out.data(), out.size(), &n, &total) == XRT_SUCCESS);
+	out.resize((size_t)n);
+	CHECK(n > 0u);
+	CHECK(n == total);
+	conv_core_job_destroy(fx.c, job);
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("proxy: the real displayxr-conversion-host with the sim provider matches in-service", "[conv_proxy]")
+{
+	// The host inherits the service's environment and reads the settings itself.
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");   // the sim provider lives in the build tree (#952)
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1"); // CI runners and this harness are elevated
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", "0");
+	std::vector<uint8_t> satellite, satellite_job;
+	{
+		Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH);
+		satellite = depth_bytes(fx);
+		satellite_job = job_bytes(fx);
+		CHECK(fx.sup().state == CONV_SUP_RUNNING);
+	}
+
+	// The same sources linked in (sim_conversion_static), hosted in-service.
+	conv_core_config cfg{};
+	cfg.alloc.alloc = cpu_alloc;
+	cfg.alloc.free = cpu_free;
+	cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+	cfg.prewarm_task_mask = 1ull << 63;
+	cfg.rear_cap_m = -1.0f;
+	cfg.tick_ms = 10;
+	static xrt_conversion_plugin_host_iface host{};
+	host.struct_size = sizeof(host);
+	host.host_api_version = XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
+	host.get_setting = sim_setting;
+	xrt_conversion_plugin_iface *iface = nullptr;
+	uint32_t abi = 0;
+	REQUIRE(xrtConversionPluginNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &host, &iface, &abi) ==
+	        XRT_SUCCESS);
+	xrt_conversion_plugin_instance *inst = nullptr;
+	REQUIRE(iface->probe(&inst) == XRT_SUCCESS);
+
+	CoreOps view;
+	conv_core *&c = view.c;
+	REQUIRE(conv_core_create(&cfg, &c) == XRT_SUCCESS);
+	conv_provider_desc d{};
+	d.id = "sim-conversion";
+	d.probe_order = 100;
+	d.hosting = CONV_HOSTING_IN_SERVICE;
+	d.enabled = true;
+	d.iface = iface;
+	d.inst = inst;
+	REQUIRE(conv_core_add_provider(c, &d) >= 0);
+	std::vector<uint8_t> in_service = depth_bytes(view);
+	std::vector<uint8_t> in_service_job = job_bytes(view);
+	conv_core_destroy(&c);
+
+	REQUIRE(satellite.size() == in_service.size());
+	CHECK(satellite == in_service);
+	REQUIRE(satellite_job.size() == in_service_job.size());
+	CHECK(satellite_job == in_service_job);
+}
+
+#endif

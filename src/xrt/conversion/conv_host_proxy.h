@@ -73,6 +73,9 @@ struct conv_host_proxy_gpu_ops
 
 	void (*close_output)(void *ud, void *ctx);
 	void (*close_fence)(void *ud, void *fence);
+
+	//! Free @p ud (the proxy owns the ops once created; NULL = nothing to free).
+	void (*destroy)(void *ud);
 };
 
 struct conv_host_proxy_config
