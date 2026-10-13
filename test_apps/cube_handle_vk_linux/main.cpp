@@ -3040,6 +3040,19 @@ int main(int argc, char** argv) {
         LOG_WARN("--windowed only affects the Wayland backend — ignored on X11 (use DXR_CUBE_WINDOW)");
     }
 
+    // Launched into the workspace (the shell sets DISPLAYXR_WORKSPACE_SESSION=1):
+    // this app is an IPC client and the service composites its swapchain, so its
+    // own window is never a render target. Create it (it is still bound at
+    // xrCreateSession) but never map or fullscreen it, or it flashes up
+    // fullscreen on the 3D panel before the workspace tile appears. Same "1"
+    // gate as the runtime's own workspace-session window hide.
+    if (const char* ws = getenv("DISPLAYXR_WORKSPACE_SESSION")) {
+        if (strcmp(ws, "1") == 0) {
+            winDesc.start_hidden = true;
+            LOG_INFO("DISPLAYXR_WORKSPACE_SESSION=1: app window created hidden (the workspace composites it)");
+        }
+    }
+
     if (!g_window.create(xr.windowBackend, winDesc)) {
         LOG_ERROR("%s window creation failed", DxrLinuxWindow::backend_name(xr.windowBackend));
         CleanupOpenXR(xr);
