@@ -165,6 +165,13 @@ d3d11_lift_glue_import_input_cpu(struct d3d11_lift *lift,
 void
 d3d11_lift_glue_release_input(HANDLE handle, bool is_dxgi);
 
+/*! #2030: the content key of v3 stream @p stream_id's input (still-image
+ *  dedupe, PHOTO streams), sampled from @p slot's image after
+ *  d3d11_lift_glue_import_input filled it. One submit late; 0 = unknown
+ *  (see d3d11_conv_content_key.h). */
+uint64_t
+d3d11_lift_glue_input_content_key(struct d3d11_lift *lift, uint64_t stream_id, const struct conv_submit_slot *slot);
+
 //! Copy @p res into the stream's export texture(s), signal its fence.
 xrt_result_t
 d3d11_lift_glue_publish(struct d3d11_lift *lift,

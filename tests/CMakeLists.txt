@@ -213,6 +213,12 @@ if(TARGET comp_d3d11_conv_viewsyn)
 	# CPU march. SKIPs if no D3D11 device exists at all.
 	list(APPEND tests tests_conv_viewsyn_d3d11)
 endif()
+if(TARGET comp_d3d11_conv_content)
+	# #2030 -- still-image dedupe of GPU PHOTO inputs on WARP: the content
+	# check's key drives the core (two identical inputs -> one convert, a
+	# changed block -> another). SKIPs without a D3D11 device.
+	list(APPEND tests tests_conv_gpu_dedupe)
+endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
 endif()
@@ -1130,6 +1136,10 @@ target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/com
 target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
+if(TARGET tests_conv_gpu_dedupe)
+	target_sources(tests_conv_gpu_dedupe PRIVATE conv_fake_provider.c)
+	target_link_libraries(tests_conv_gpu_dedupe PRIVATE comp_d3d11_conv_content displayxr::conversion_runtime d3d11 dxgi)
 endif()
 if(TARGET tests_lift_dp_golden)
 	# The sim_display fake lift + the synthesis it shares with the sim provider,
