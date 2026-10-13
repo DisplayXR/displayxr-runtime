@@ -11,6 +11,7 @@ add_library(
 			    target_builder_qwerty_input.c target_builder_qwerty_input.h
 			    target_lists.c target_lists.h
 			    target_input_arbiter.c target_input_arbiter.h
+			    target_component_loader.c target_component_loader.h
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_conv_status.c target_conv_status.h

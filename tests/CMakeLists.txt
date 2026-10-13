@@ -125,6 +125,10 @@ if(TARGET target_lists)
 	# ADR-053 / #1999 -- the conversion-provider loader: manifest + registry row
 	# parsing, ordering, the plug-in-kind router and the ABI gate.
 	list(APPEND tests tests_conversion_loader)
+	# ADR-054 N2 -- the shared component loader: the class-agnostic manifest /
+	# registry row reader, ordering + shadowing, the load path and the ABI gate,
+	# driven by test-only class rows.
+	list(APPEND tests tests_component_loader)
 	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
@@ -506,6 +510,20 @@ if(TARGET tests_conversion_loader)
 			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
 			"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
 		)
+endif()
+if(TARGET tests_component_loader)
+	target_link_libraries(tests_component_loader PRIVATE target_lists xrt-interfaces aux_util)
+	# Reuses the conversion loader's stub binaries: a conversion-shaped module
+	# and a display-processor-shaped one, so the shared load path can be shown
+	# to resolve each class's entry point and refuse the other's.
+	if(TARGET tests_conversion_loader_stub_ok)
+		add_dependencies(tests_component_loader tests_conversion_loader_stub_ok tests_conversion_loader_stub_dp)
+		target_compile_definitions(
+			tests_component_loader
+			PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
+				"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
+			)
+	endif()
 endif()
 if(TARGET tests_conv_snapshot)
 	target_link_libraries(
