@@ -85,6 +85,15 @@ conv_stage_fini(struct conv_stage *st);
 int32_t
 conv_stage_add_output(struct conv_stage *st, uint32_t role, conv_stage_file_write_fn file_write, void *file_ctx);
 
+/*!
+ * Discard everything received so far and make every output writable again
+ * (same roles, same sinks): a job re-run from its input after its host died.
+ * false when an output streams to a caller's file and already wrote bytes
+ * (those cannot be taken back).
+ */
+bool
+conv_stage_reset(struct conv_stage *st);
+
 //! The provider-facing sinks (one per output), valid while @p st lives.
 struct xrt_conv_blob_sink *
 conv_stage_sinks(struct conv_stage *st, uint32_t *out_count);

@@ -161,6 +161,7 @@ struct conv_job
 	bool cancel;
 	bool destroyed; //!< the client dropped it: free once it stops running
 	bool running;
+	uint32_t host_losses; //!< times its host died under it (one retry, then FAILED)
 
 	struct xrt_conv_job_in in;
 	void *owned[XRT_CONV_MAX_FRAME_IMAGES]; //!< CPU input copies
