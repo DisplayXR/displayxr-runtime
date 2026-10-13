@@ -2011,3 +2011,61 @@ TEST_CASE("core: row activity counts bound streams and queued jobs; each change 
 	}
 	conv_fake_fini(&f);
 }
+
+TEST_CASE("core: a live policy change (PreferredProvider, AllowResearchOnly) reaches the next selection (#2029)",
+          "[conv_lanes]")
+{
+	conv_fake_provider a, b, r;
+	conv_fake_init(&a, "prov-a");
+	conv_fake_init(&b, "prov-b");
+	conv_fake_init(&r, "prov-research");
+	for (conv_fake_provider *f : {&a, &b}) {
+		conv_fake_cap *c =
+		    conv_fake_add_cap(f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+		c->state = XRT_CONV_STATE_READY;
+	}
+	conv_fake_cap *rc =
+	    conv_fake_add_cap(&r, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	rc->cap.licence_class = XRT_CONV_LICENCE_RESEARCH_ONLY;
+	rc->state = XRT_CONV_STATE_READY;
+	{
+		Core core(false);
+		REQUIRE(core.add(a, 100) >= 0);
+		REQUIRE(core.add(b, 200) >= 0);
+		REQUIRE(core.add(r, 300) >= 0);
+		auto bound_to = [&](const char *want) {
+			auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+			xrt_conv_wire_stream_created cr{};
+			REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+			const std::string got = stats(core.c, cr.stream_id).provider_id;
+			REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+			CHECK(got == want);
+		};
+		bound_to("prov-a"); // ProbeOrder
+
+		xrt_conv_wire_generation g0{}, g1{};
+		conv_core_get_generation(core.c, &g0);
+		const char *pref[XRT_CONV_TASK_RESERVED_FIRST] = {};
+		pref[XRT_CONV_TASK_VIEWS_MONO] = "prov-b";
+		CHECK(conv_core_set_policy(core.c, pref, false));
+		conv_core_get_generation(core.c, &g1);
+		CHECK(g1.conv_gen > g0.conv_gen);
+		CHECK(g1.status_gen > g0.status_gen);
+		bound_to("prov-b");                                     // no restart
+		CHECK_FALSE(conv_core_set_policy(core.c, pref, false)); // same policy: no change, no bump
+
+		// The preference cleared: back to ProbeOrder.
+		CHECK(conv_core_set_policy(core.c, nullptr, false));
+		bound_to("prov-a");
+
+		// AllowResearchOnly gates a research-only row live.
+		CHECK_FALSE(conv_core_task_has_candidate(core.c, XRT_CONV_TASK_DEPTH_VIDEO));
+		CHECK(conv_core_set_policy(core.c, nullptr, true));
+		CHECK(conv_core_task_has_candidate(core.c, XRT_CONV_TASK_DEPTH_VIDEO));
+		CHECK(conv_core_set_policy(core.c, nullptr, false));
+		CHECK_FALSE(conv_core_task_has_candidate(core.c, XRT_CONV_TASK_DEPTH_VIDEO));
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
+	conv_fake_fini(&r);
+}

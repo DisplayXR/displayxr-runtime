@@ -758,3 +758,60 @@ TEST_CASE("conv headless: DXR_CONV=0 (alias DXR_LIFT=0) means no conversion serv
 	cJSON_Delete(root);
 #endif
 }
+
+TEST_CASE("conv policy: the per-user Enabled override applies to an enumerated entry (#2029)", "[conv_snapshot]")
+{
+	auto pol = std::make_unique<target_conv_policy>();
+	std::memset(pol.get(), 0, sizeof(*pol));
+	pol->override_count = 2;
+	cpy(pol->overrides[0].id, sizeof(pol->overrides[0].id), "off-for-me");
+	pol->overrides[0].enabled = false;
+	cpy(pol->overrides[1].id, sizeof(pol->overrides[1].id), "on-for-me");
+	pol->overrides[1].enabled = true;
+
+	auto entry = [](const char *id, bool enabled, uint32_t status) {
+		xrt_conversion_plugin_entry e;
+		std::memset(&e, 0, sizeof(e));
+		cpy(e.id, sizeof(e.id), id);
+		e.enabled = enabled;
+		e.status = status;
+		if (!enabled) {
+			e.flags |= XRT_CONV_ENTRY_FLAG_DISABLED;
+		}
+		return e;
+	};
+
+	// HKCU Enabled = 0 over an HKLM-enabled row: never loaded.
+	xrt_conversion_plugin_entry a = entry("off-for-me", true, XRT_CONV_LOAD_NOT_LOADED);
+	CHECK_FALSE(target_conv_policy_apply_override(pol.get(), &a));
+	CHECK(a.status == XRT_CONV_LOAD_DISABLED);
+	// ... and over one already loaded (a live change): just not enabled.
+	xrt_conversion_plugin_entry a2 = entry("off-for-me", true, XRT_CONV_LOAD_NEGOTIATED);
+	CHECK_FALSE(target_conv_policy_apply_override(pol.get(), &a2));
+	CHECK(a2.status == XRT_CONV_LOAD_NEGOTIATED);
+
+	// HKCU Enabled = 1 over HKLM Enabled = 0: loadable again.
+	xrt_conversion_plugin_entry b = entry("on-for-me", false, XRT_CONV_LOAD_DISABLED);
+	CHECK(target_conv_policy_apply_override(pol.get(), &b));
+	CHECK(b.status == XRT_CONV_LOAD_NOT_LOADED);
+	CHECK((b.flags & XRT_CONV_ENTRY_FLAG_DISABLED) == 0u);
+
+	// No override: untouched.
+	xrt_conversion_plugin_entry c = entry("someone-else", false, XRT_CONV_LOAD_DISABLED);
+	CHECK_FALSE(target_conv_policy_apply_override(pol.get(), &c));
+	CHECK(c.status == XRT_CONV_LOAD_DISABLED);
+	CHECK_FALSE(target_conv_policy_apply_override(nullptr, &c));
+
+	// A built-in provider (dp-lift): the override, else the default.
+	CHECK_FALSE(target_conv_policy_enabled(pol.get(), "off-for-me", true));
+	CHECK(target_conv_policy_enabled(pol.get(), "on-for-me", false));
+	CHECK(target_conv_policy_enabled(pol.get(), "dp-lift", true));
+	CHECK(target_conv_policy_enabled(nullptr, "dp-lift", true));
+
+	// Policy\Lock: HKLM wins, the per-user override is ignored.
+	pol->policy_lock = true;
+	xrt_conversion_plugin_entry d = entry("off-for-me", true, XRT_CONV_LOAD_NOT_LOADED);
+	CHECK(target_conv_policy_apply_override(pol.get(), &d));
+	CHECK(d.status == XRT_CONV_LOAD_NOT_LOADED);
+	CHECK(target_conv_policy_enabled(pol.get(), "off-for-me", true));
+}
