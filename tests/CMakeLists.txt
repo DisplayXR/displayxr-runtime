@@ -597,6 +597,10 @@ if(TARGET tests_conv_host_satellite)
 			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
 		)
 	set_target_properties(tests_conv_host_satellite PROPERTIES CXX_STANDARD 17)
+	if(WIN32)
+		# The D3D11 NT-handle lane case (WARP, debug layer when installed).
+		target_link_libraries(tests_conv_host_satellite PRIVATE d3d11 dxgi)
+	endif()
 endif()
 if(TARGET tests_conv_snapshot)
 	target_link_libraries(

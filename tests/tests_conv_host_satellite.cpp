@@ -44,6 +44,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d11_4.h>
+#include <d3d11sdklayers.h>
+#include <dxgi1_2.h>
 #else
 #include <unistd.h>
 #endif
@@ -751,3 +754,436 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 	conv_host_handle_close(wake_out_host);
 #endif
 }
+
+
+#ifdef _WIN32
+
+namespace {
+
+//! WARP's LUID (0 = none).
+uint64_t
+warp_luid()
+{
+	IDXGIFactory1 *f = nullptr;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&f))) {
+		return 0;
+	}
+	uint64_t out = 0;
+	IDXGIAdapter1 *a = nullptr;
+	for (UINT i = 0; out == 0 && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+		DXGI_ADAPTER_DESC1 d;
+		a->GetDesc1(&d);
+		if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+			out = (uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32 | d.AdapterLuid.LowPart;
+		}
+		a->Release();
+	}
+	f->Release();
+	return out;
+}
+
+//! The test's "service" device on WARP, under the debug layer when installed.
+struct SvcDev
+{
+	ID3D11Device5 *dev = nullptr;
+	ID3D11DeviceContext4 *ctx = nullptr;
+	ID3D11InfoQueue *iq = nullptr;
+
+	~SvcDev()
+	{
+		if (iq != nullptr) {
+			iq->Release();
+		}
+		if (ctx != nullptr) {
+			ctx->Release();
+		}
+		if (dev != nullptr) {
+			dev->Release();
+		}
+	}
+
+	bool
+	create(uint64_t luid)
+	{
+		IDXGIFactory1 *f = nullptr;
+		if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&f))) {
+			return false;
+		}
+		IDXGIAdapter1 *a = nullptr, *found = nullptr;
+		for (UINT i = 0; found == nullptr && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d;
+			a->GetDesc1(&d);
+			if (((uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32 | d.AdapterLuid.LowPart) == luid) {
+				found = a;
+			} else {
+				a->Release();
+			}
+		}
+		f->Release();
+		if (found == nullptr) {
+			return false;
+		}
+		const D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1;
+		ID3D11Device *d = nullptr;
+		ID3D11DeviceContext *c = nullptr;
+		HRESULT hr = D3D11CreateDevice(found, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_DEBUG, &fl, 1,
+		                               D3D11_SDK_VERSION, &d, nullptr, &c);
+		if (FAILED(hr)) {
+			hr = D3D11CreateDevice(found, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &d,
+			                       nullptr, &c);
+		} else {
+			(void)d->QueryInterface(__uuidof(ID3D11InfoQueue), (void **)&iq);
+		}
+		found->Release();
+		if (FAILED(hr)) {
+			return false;
+		}
+		const bool ok = SUCCEEDED(d->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev)) &&
+		                SUCCEEDED(c->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&ctx));
+		d->Release();
+		c->Release();
+		return ok;
+	}
+
+	uint32_t
+	debug_errors()
+	{
+		if (iq == nullptr) {
+			return 0;
+		}
+		uint32_t n_err = 0;
+		const UINT64 n = iq->GetNumStoredMessages();
+		for (UINT64 i = 0; i < n; i++) {
+			SIZE_T len = 0;
+			iq->GetMessage(i, nullptr, &len);
+			std::vector<uint8_t> buf(len);
+			auto *m = (D3D11_MESSAGE *)buf.data();
+			if (SUCCEEDED(iq->GetMessage(i, m, &len)) &&
+			    (m->Severity == D3D11_MESSAGE_SEVERITY_ERROR || m->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION)) {
+				n_err++;
+				std::printf("service-side d3d11 debug layer: %.*s\n", (int)m->DescriptionByteLength,
+				            m->pDescription);
+			}
+		}
+		iq->ClearStoredMessages();
+		return n_err;
+	}
+
+	//! R32_FLOAT texels of @p tex.
+	std::vector<float>
+	read_r32f(ID3D11Texture2D *tex)
+	{
+		D3D11_TEXTURE2D_DESC td;
+		tex->GetDesc(&td);
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.MiscFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		std::vector<float> out((size_t)td.Width * td.Height, -1.0f);
+		ID3D11Texture2D *st = nullptr;
+		if (FAILED(dev->CreateTexture2D(&td, nullptr, &st))) {
+			return out;
+		}
+		ctx->CopyResource(st, tex);
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+			for (UINT y = 0; y < td.Height; y++) {
+				std::memcpy(&out[(size_t)y * td.Width], (const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+				            td.Width * 4u);
+			}
+			ctx->Unmap(st, 0);
+		}
+		st->Release();
+		return out;
+	}
+};
+
+} // namespace
+
+TEST_CASE("conv_host: the D3D11 NT-handle lane on WARP: fence values under the debug layer", "[conv_host]")
+{
+	const uint64_t luid = warp_luid();
+	if (luid == 0) {
+		SKIP("no WARP adapter");
+	}
+	SvcDev svc;
+	if (!svc.create(luid)) {
+		SKIP("no D3D11.4 device on WARP");
+	}
+	INFO("service-side debug layer: " << (svc.iq != nullptr ? "on" : "not installed"));
+
+	common_env();
+	set_env("DXR_CONV_HOST_D3D11_DEBUG", "1"); // the host's device under the debug layer too
+	Host h;
+	auto a = sim_args(h);
+	char lb[32];
+	std::snprintf(lb, sizeof(lb), "0x%016llx", (unsigned long long)luid);
+	a.push_back("--adapter-luid");
+	a.push_back(lb);
+	REQUIRE(h.spawn(a));
+	set_env("DXR_CONV_HOST_D3D11_DEBUG", nullptr);
+	REQUIRE(h.chan != nullptr);
+
+	// Every frame, LOG ones included: the host forwards its debug-layer errors.
+	std::vector<std::string> logs;
+	auto next = [&](conv_host_wire_frame &f, std::vector<uint8_t> &pl) {
+		pl.assign(CONV_HOST_WIRE_MAX_PAYLOAD, 0);
+		for (;;) {
+			if (!conv_host_chan_recv(h.chan, &f, pl.data())) {
+				return false;
+			}
+			if (f.type == CONV_HOST_MSG_LOG) {
+				conv_host_wire_log lg;
+				if (conv_host_wire_receive(&lg, sizeof(lg), pl.data(), f.payload_bytes)) {
+					lg.text[sizeof(lg.text) - 1] = 0;
+					logs.push_back(lg.text);
+				}
+				continue;
+			}
+			if (f.type == CONV_HOST_MSG_HEARTBEAT || f.type == CONV_HOST_MSG_STATE_CHANGED) {
+				continue;
+			}
+			return true;
+		}
+	};
+	auto status_of = [&](uint32_t type, uint32_t rid, const void *p, uint32_t n,
+	                     std::vector<std::pair<conv_host_wire_frame, std::vector<uint8_t>>> *side,
+	                     std::vector<uint64_t> handles = {}) -> int32_t {
+		if (!h.send(type, rid, p, n, handles)) {
+			return -10000;
+		}
+		conv_host_wire_frame f;
+		std::vector<uint8_t> pl;
+		while (next(f, pl)) {
+			if (f.type == (type | CONV_HOST_MSG_REPLY_BIT) && f.request_id == rid) {
+				conv_host_wire_status st;
+				return conv_host_wire_receive(&st, sizeof(st), pl.data(), f.payload_bytes) ? st.result
+				                                                                          : -10001;
+			}
+			if (side != nullptr) {
+				side->push_back({f, pl});
+			}
+		}
+		return -10002;
+	};
+
+	REQUIRE(handshake(h));
+	uint32_t rid = 1;
+	const uint32_t cap_id = XRT_CONV_TASK_DEPTH_MONO;
+	{
+		conv_host_wire_cap_request q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.cap_id = cap_id;
+		REQUIRE(status_of(CONV_HOST_MSG_WARM, rid++, &q, sizeof(q), nullptr) == XRT_SUCCESS);
+	}
+	const uint64_t stream = 5;
+	const uint32_t W = 8, H = 4;
+	{
+		conv_host_wire_stream_open q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.cap_id = cap_id;
+		q.stream = stream;
+		q.input_kind = XRT_CONV_INPUT_MONO;
+		q.outputs = XRT_CONV_OUT_DEPTH;
+		q.content_hint = XRT_CONV_CONTENT_PHOTO;
+		q.max_input_width = W;
+		q.max_input_height = H;
+		REQUIRE(status_of(CONV_HOST_MSG_STREAM_OPEN, rid++, &q, sizeof(q), nullptr) == XRT_SUCCESS);
+	}
+
+	// ALLOC_OUTPUTS: NT-handle depth textures on WARP + the host's output fence.
+	struct Out
+	{
+		uint32_t index;
+		ID3D11Texture2D *tex;
+	};
+	std::vector<Out> outs;
+	ID3D11Fence *fence = nullptr;
+	uint64_t fence_initial = 0;
+	{
+		conv_host_wire_alloc_outputs q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.stream = stream;
+		q.width = W;
+		q.height = H;
+		q.set_count = 2;
+		std::vector<std::pair<conv_host_wire_frame, std::vector<uint8_t>>> side;
+		REQUIRE(status_of(CONV_HOST_MSG_ALLOC_OUTPUTS, rid++, &q, sizeof(q), &side) == XRT_SUCCESS);
+		for (auto &fr : side) {
+			if (fr.first.type == CONV_HOST_MSG_SYNC) {
+				conv_host_wire_sync sy;
+				REQUIRE(conv_host_wire_receive(&sy, sizeof(sy), fr.second.data(), fr.first.payload_bytes));
+				CHECK(sy.kind == XRT_CONV_SYNC_FENCE_NT);
+				CHECK(sy.direction == CONV_HOST_SYNC_HOST_SIGNALS);
+				REQUIRE(fr.first.handle_count == 1);
+				HANDLE fh = (HANDLE)(uintptr_t)h.from_host(fr.first.handles[0]);
+				REQUIRE(fh != nullptr);
+				REQUIRE(SUCCEEDED(svc.dev->OpenSharedFence(fh, __uuidof(ID3D11Fence), (void **)&fence)));
+				CloseHandle(fh);
+				fence_initial = sy.initial_value;
+			} else if (fr.first.type == CONV_HOST_MSG_OUTPUT_IMAGE) {
+				conv_host_wire_output_image oi;
+				REQUIRE(conv_host_wire_receive(&oi, sizeof(oi), fr.second.data(), fr.first.payload_bytes));
+				CHECK(oi.image.memory_kind == XRT_CONV_MEM_WIN32_NT_HANDLE);
+				CHECK(oi.image.format == XRT_CONV_FMT_R32_FLOAT);
+				REQUIRE(fr.first.handle_count == 1);
+				HANDLE th = (HANDLE)(uintptr_t)h.from_host(fr.first.handles[0]);
+				REQUIRE(th != nullptr);
+				ID3D11Texture2D *t = nullptr;
+				REQUIRE(SUCCEEDED(svc.dev->OpenSharedResource1(th, __uuidof(ID3D11Texture2D), (void **)&t)));
+				CloseHandle(th);
+				outs.push_back({oi.index, t});
+			}
+		}
+	}
+	REQUIRE(fence != nullptr); // the SYNC frame precedes the reply
+	REQUIRE(outs.size() == 2);
+	CHECK(fence->GetCompletedValue() == fence_initial);
+
+	// The lane: CPU input in the shm, as in the CPU case above.
+	const size_t sb = u_shm_ring_bytes(sizeof(conv_host_wire_submit_record), CONV_HOST_WIRE_RING_CAPACITY);
+	const size_t cb = u_shm_ring_bytes(sizeof(conv_host_wire_complete_record), CONV_HOST_WIRE_RING_CAPACITY);
+	const uint64_t img_off = sb + cb;
+	const uint64_t img_bytes = (uint64_t)W * H * 4;
+	const uint64_t shm_bytes = img_off + img_bytes;
+	void *map = nullptr;
+	const uint64_t shm = conv_host_shm_create(shm_bytes, &map);
+	REQUIRE(shm != 0);
+	u_shm_ring submit = {};
+	u_shm_ring complete = {};
+	REQUIRE(u_shm_ring_init(&submit, map, sb, sizeof(conv_host_wire_submit_record), CONV_HOST_WIRE_RING_CAPACITY));
+	REQUIRE(u_shm_ring_init(&complete, (uint8_t *)map + sb, cb, sizeof(conv_host_wire_complete_record),
+	                        CONV_HOST_WIRE_RING_CAPACITY));
+	std::memset((uint8_t *)map + img_off, 0x80, (size_t)img_bytes);
+	{
+		conv_host_wire_register_image q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.index = 3;
+		q.image.memory_kind = XRT_CONV_MEM_CPU;
+		q.image.role = XRT_CONV_IMG_COLOR;
+		q.image.width = W;
+		q.image.height = H;
+		q.image.format = XRT_CONV_FMT_RGBA8_UNORM;
+		q.image.color_space = XRT_CONV_CS_SRGB;
+		q.image.row_stride = W * 4;
+		q.image.byte_size = img_bytes;
+		q.image.shm_offset = img_off;
+		REQUIRE(status_of(CONV_HOST_MSG_REGISTER_IMAGE, rid++, &q, sizeof(q), nullptr) == XRT_SUCCESS);
+	}
+	os_wake wake_in_mine = {}, wake_out_mine = {};
+	uint64_t wake_in_host = 0, wake_out_host = 0;
+	make_wake(wake_in_mine, wake_in_host);
+	make_wake(wake_out_mine, wake_out_host);
+	{
+		conv_host_wire_lane_open q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.lane = 0;
+		q.lane_kind = CONV_HOST_LANE_STREAM;
+		q.ring_capacity = CONV_HOST_WIRE_RING_CAPACITY;
+		q.submit_record_bytes = sizeof(conv_host_wire_submit_record);
+		q.complete_record_bytes = sizeof(conv_host_wire_complete_record);
+		q.shm_bytes = shm_bytes;
+		q.submit_ring_offset = 0;
+		q.complete_ring_offset = sb;
+		REQUIRE(status_of(CONV_HOST_MSG_LANE_OPEN, rid++, &q, sizeof(q), nullptr,
+		                  {shm, wake_in_host, wake_out_host}) == XRT_SUCCESS);
+	}
+
+	// N frames, one at a time: each completion carries the NEXT fence value,
+	// the CPU sees the fence reach it, and only then are the bytes read.
+	constexpr uint32_t N = 8;
+	uint64_t prev = fence_initial;
+	HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	for (uint32_t i = 0; i < N; i++) {
+		conv_host_wire_submit_record rec;
+		std::memset(&rec, 0, sizeof(rec));
+		rec.seq = 100 + i;
+		rec.stream = stream;
+		rec.op = CONV_HOST_RING_OP_CONVERT;
+		rec.image_count = 1;
+		rec.in_image_idx[0] = 3;
+		rec.in_image_role[0] = XRT_CONV_IMG_COLOR;
+		for (uint32_t k = 1; k < XRT_CONV_MAX_FRAME_IMAGES; k++) {
+			rec.in_image_idx[k] = CONV_HOST_WIRE_NO_INDEX;
+		}
+		rec.in_sync_idx = CONV_HOST_WIRE_NO_INDEX;
+		xrt_conv_params params = {};
+		params.struct_size = sizeof(params);
+		params.frame_id = 1 + i;
+		params.strength = 1.0f;
+		xrt_conv_wire_pack_params(&params, &rec.params);
+		bool wake = false;
+		REQUIRE(u_shm_ring_push(&submit, &rec, &wake) == U_SHM_RING_OK);
+		if (wake) {
+			os_wake_signal(&wake_in_mine);
+		}
+		conv_host_wire_complete_record comp;
+		bool got = false;
+		const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (!got && std::chrono::steady_clock::now() < end) {
+			if (u_shm_ring_pop(&complete, &comp) == U_SHM_RING_OK) {
+				got = true;
+			} else if (u_shm_ring_prepare_wait(&complete)) {
+				(void)os_wake_wait(&wake_out_mine, 100);
+				u_shm_ring_finish_wait(&complete);
+			}
+		}
+		REQUIRE(got);
+		INFO("frame " << i << " status " << comp.status);
+		CHECK(comp.seq == rec.seq);
+		REQUIRE(comp.status == XRT_SUCCESS);
+		REQUIRE(comp.out_sync_idx == 0u);
+		CHECK(comp.out_fence_value == prev + 1); // strictly increasing, one per frame
+		prev = comp.out_fence_value;
+		// THE FENCE RULE: observe on the CPU, bounded.
+		REQUIRE(SUCCEEDED(fence->SetEventOnCompletion(comp.out_fence_value, ev)));
+		REQUIRE(WaitForSingleObject(ev, 5000) == WAIT_OBJECT_0);
+		const uint32_t oi = comp.out_image_idx[CONV_HOST_WIRE_OUT_DEPTH];
+		ID3D11Texture2D *t = nullptr;
+		for (const auto &o : outs) {
+			if (o.index == oi) {
+				t = o.tex;
+			}
+		}
+		REQUIRE(t != nullptr);
+		const std::vector<float> px = svc.read_r32f(t);
+		for (uint32_t y = 0; y < H; y++) {
+			const float expect = ((float)y + 0.5f) / (float)H;
+			CHECK(px[(size_t)y * W] == Catch::Approx(expect));
+			CHECK(px[(size_t)y * W + W - 1] == Catch::Approx(expect));
+		}
+	}
+	CHECK(fence->GetCompletedValue() == prev);
+
+	{
+		conv_host_wire_shutdown q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.orderly = 1;
+		CHECK(status_of(CONV_HOST_MSG_SHUTDOWN, rid++, &q, sizeof(q), nullptr) == XRT_SUCCESS);
+	}
+	CHECK(h.wait_exit(5000) == CONV_HOST_EXIT_ORDERLY);
+
+	// Both sides of the share clean under the debug layer.
+	CHECK(svc.debug_errors() == 0u);
+	bool host_debug_on = false;
+	for (const auto &l : logs) {
+		INFO("host log: " << l);
+		CHECK(l.find("d3d11 debug layer:") == std::string::npos);
+		host_debug_on = host_debug_on || l.find("D3D11 debug layer on") != std::string::npos;
+	}
+	std::printf("conv_host NT lane on WARP: %u frames, fence %llu -> %llu, host debug layer %s, service %s\n", N,
+	            (unsigned long long)fence_initial, (unsigned long long)prev, host_debug_on ? "on" : "off",
+	            svc.iq != nullptr ? "on" : "off");
+
+	CloseHandle(ev);
+	for (auto &o : outs) {
+		o.tex->Release();
+	}
+	fence->Release();
+	conv_host_shm_unmap(map, shm_bytes);
+	conv_host_handle_close(shm);
+	os_wake_destroy(&wake_in_mine);
+	os_wake_destroy(&wake_out_mine);
+}
+
+#endif // _WIN32

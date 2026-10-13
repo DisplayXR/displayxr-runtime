@@ -14,9 +14,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_4.h>
+#include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 struct conv_host_d3d11
@@ -25,6 +27,8 @@ struct conv_host_d3d11
 	ID3D11DeviceContext4 *ctx;
 	ID3D11Fence *fence;
 	HANDLE fence_handle;
+	ID3D11InfoQueue *info_queue; //!< DXR_CONV_HOST_D3D11_DEBUG=1 with the debug layer installed
+	uint32_t debug_errors;       //!< ERROR / CORRUPTION messages logged so far
 	uint64_t fence_value;
 	SRWLOCK lock; //!< guards the immediate context + fence value
 	char name[128];
@@ -72,8 +76,24 @@ conv_host_d3d11_create(uint64_t luid, char *out_reason, uint32_t reason_size)
 	// BGRA for interop with the service's swapchain formats; threading stays
 	// the default (multithread-protected below): exec threads and the ring
 	// worker both touch the immediate context.
-	hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-	                       ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+	// DXR_CONV_HOST_D3D11_DEBUG=1 (CI / dev only): the D3D11 debug layer,
+	// when installed; its errors are logged (and so forwarded) after every
+	// fence signal and output allocation.
+	const char *dbg_env = getenv("DXR_CONV_HOST_D3D11_DEBUG");
+	const bool want_debug = dbg_env != nullptr && dbg_env[0] == '1';
+	hr = E_FAIL;
+	if (want_debug) {
+		hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+		                       D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG, levels,
+		                       ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+		U_LOG_W("conversion host: D3D11 debug layer %s (DXR_CONV_HOST_D3D11_DEBUG=1)",
+		        SUCCEEDED(hr) ? "on" : "requested but not installed");
+	}
+	const bool debug_on = SUCCEEDED(hr);
+	if (!debug_on) {
+		hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+		                       levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+	}
 	adapter->Release();
 	if (FAILED(hr)) {
 		set_reason(out_reason, reason_size, "D3D11CreateDevice on the adapter failed (0x%08lx)",
@@ -83,6 +103,9 @@ conv_host_d3d11_create(uint64_t luid, char *out_reason, uint32_t reason_size)
 
 	struct conv_host_d3d11 *d = new conv_host_d3d11();
 	InitializeSRWLock(&d->lock);
+	if (debug_on) {
+		(void)dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void **)&d->info_queue);
+	}
 	hr = dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&d->dev);
 	if (SUCCEEDED(hr)) {
 		hr = ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&d->ctx);
@@ -104,6 +127,37 @@ conv_host_d3d11_create(uint64_t luid, char *out_reason, uint32_t reason_size)
 	return d;
 }
 
+/*!
+ * Debug layer (CI / dev only): log every ERROR / CORRUPTION message the
+ * layer stored since the last drain, at ERROR (so the line is forwarded to
+ * the service and a test driving the host sees it). Caller holds d->lock.
+ */
+static void
+drain_debug_locked(struct conv_host_d3d11 *d)
+{
+	if (d->info_queue == nullptr) {
+		return;
+	}
+	const UINT64 n = d->info_queue->GetNumStoredMessages();
+	for (UINT64 i = 0; i < n; i++) {
+		SIZE_T len = 0;
+		if (FAILED(d->info_queue->GetMessage(i, nullptr, &len)) || len == 0) {
+			continue;
+		}
+		D3D11_MESSAGE *m = (D3D11_MESSAGE *)malloc(len);
+		if (m == nullptr) {
+			continue;
+		}
+		if (SUCCEEDED(d->info_queue->GetMessage(i, m, &len)) &&
+		    (m->Severity == D3D11_MESSAGE_SEVERITY_ERROR || m->Severity == D3D11_MESSAGE_SEVERITY_CORRUPTION)) {
+			d->debug_errors++;
+			U_LOG_E("conversion host: d3d11 debug layer: %.*s", (int)m->DescriptionByteLength, m->pDescription);
+		}
+		free(m);
+	}
+	d->info_queue->ClearStoredMessages();
+}
+
 extern "C" void
 conv_host_d3d11_destroy(struct conv_host_d3d11 **d_ptr)
 {
@@ -116,6 +170,10 @@ conv_host_d3d11_destroy(struct conv_host_d3d11 **d_ptr)
 	}
 	if (d->fence != nullptr) {
 		d->fence->Release();
+	}
+	if (d->info_queue != nullptr) {
+		drain_debug_locked(d);
+		d->info_queue->Release();
 	}
 	if (d->ctx != nullptr) {
 		d->ctx->Release();
@@ -157,6 +215,11 @@ conv_host_d3d11_alloc_image(struct conv_host_d3d11 *d,
 	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 	ID3D11Texture2D *tex = nullptr;
 	HRESULT hr = d->dev->CreateTexture2D(&td, nullptr, &tex);
+	if (d->info_queue != nullptr) {
+		AcquireSRWLockExclusive(&d->lock);
+		drain_debug_locked(d);
+		ReleaseSRWLockExclusive(&d->lock);
+	}
 	if (FAILED(hr)) {
 		U_LOG_W("conversion host: output texture %ux%ux%u fmt %u failed (0x%08lx)", width, height, td.ArraySize,
 		        dxgi_format, (unsigned long)hr);
@@ -236,6 +299,7 @@ conv_host_d3d11_reserve(struct conv_host_d3d11 *d)
 	}
 	AcquireSRWLockExclusive(&d->lock);
 	const uint64_t v = ++d->fence_value;
+	drain_debug_locked(d); // what the previous frame left (per frame: no-op without the layer)
 	ReleaseSRWLockExclusive(&d->lock);
 	return v;
 }
@@ -249,6 +313,7 @@ conv_host_d3d11_signal_value(struct conv_host_d3d11 *d, uint64_t value)
 	AcquireSRWLockExclusive(&d->lock);
 	const HRESULT hr = d->ctx->Signal(d->fence, value);
 	d->ctx->Flush();
+	drain_debug_locked(d);
 	ReleaseSRWLockExclusive(&d->lock);
 	return SUCCEEDED(hr);
 }

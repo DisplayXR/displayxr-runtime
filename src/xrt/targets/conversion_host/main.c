@@ -24,7 +24,8 @@
  *
  * Host-only knob (never read for a provider): DXR_CONV_HOST_ALLOW_ELEVATED=1
  * turns the elevation refusal into a WARN, for CI runners and dev harnesses
- * that are elevated themselves.
+ * that are elevated themselves. DXR_CONV_HOST_D3D11_DEBUG=1 (Windows) puts the
+ * host's D3D11 device under the debug layer (conv_host_d3d11.h).
  *
  * @ingroup conv_host
  */

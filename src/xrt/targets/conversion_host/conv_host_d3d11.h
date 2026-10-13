@@ -13,6 +13,10 @@
  * a feature-level-11 device with ID3D11Device5 (shared fences), is "no usable
  * device" (exit 13).
  *
+ * DXR_CONV_HOST_D3D11_DEBUG=1 (CI / dev only) creates the device with the
+ * D3D11 debug layer when it is installed; every ERROR / CORRUPTION message is
+ * logged at ERROR ("d3d11 debug layer: ...") and so forwarded to the service.
+ *
  * @ingroup conv_host
  */
 
