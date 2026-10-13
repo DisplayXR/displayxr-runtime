@@ -61,7 +61,10 @@ add_library(
 	oxr_views_change.c
 	oxr_views_change.h
 	oxr_weave.c
-	oxr_lift.c
+	oxr_conv.c
+	oxr_conv_gpu.h
+	oxr_conv_gpu_d3d.c
+	oxr_conv_map.h
 	oxr_lift_rules.h
 	oxr_stereo_camera.c
 	oxr_workspace.c

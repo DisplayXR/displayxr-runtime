@@ -177,6 +177,16 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		return call->session == session;
 	}
 #endif
+#ifdef OXR_HAVE_DXR_lift
+	case XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR: {
+		XrEventDataLiftTaskStateChangedDXR *changed = (XrEventDataLiftTaskStateChangedDXR *)type;
+		return changed->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR: {
+		XrEventDataLiftProvidersChangedDXR *changed = (XrEventDataLiftProvidersChangedDXR *)type;
+		return changed->session == session;
+	}
+#endif
 #ifdef OXR_HAVE_DXR_android_surface_binding
 	case XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR: {
 		XrEventDataAndroidWindowLayoutHintDXR *hint = (XrEventDataAndroidWindowLayoutHintDXR *)type;
@@ -938,6 +948,64 @@ oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct ox
 }
 #endif // OXR_HAVE_DXR_stereo_camera
 
+#ifdef OXR_HAVE_DXR_lift
+XrResult
+oxr_event_push_XrEventDataLiftTaskStateChangedDXR(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrLiftTaskDXR task,
+                                                  XrLiftTaskStateDXR state,
+                                                  XrLiftTaskStateDXR previousState,
+                                                  XrLiftFailureReasonDXR failureReason,
+                                                  float progress)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataLiftTaskStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->task = task;
+	changed->state = state;
+	changed->previousState = previousState;
+	changed->failureReason = failureReason;
+	changed->progress = progress;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: Lift task %d state %d -> %d (reason %d, progress %.2f)", (int)task, (int)previousState,
+	        (int)state, (int)failureReason, (double)progress);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataLiftProvidersChangedDXR(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataLiftProvidersChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_lift
+
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
 {
@@ -1011,6 +1079,14 @@ oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuf
 		if (ret != XR_SUCCESS) {
 			return ret;
 		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_lift
+	// Spec 4 (#2054): task / provider events of the sessions that opted in.
+	ret = oxr_conv_poll_events(log, inst);
+	if (ret != XR_SUCCESS) {
+		return ret;
 	}
 #endif
 

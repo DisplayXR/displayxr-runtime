@@ -133,6 +133,52 @@ ipc_client_lift_weave_rects(struct ipc_connection *ipc_c, uint32_t count, const 
 xrt_result_t
 ipc_client_conv_hint_interest(struct ipc_connection *ipc_c, uint64_t task_mask);
 
+/*
+ * XR_DXR_lift spec 4 (ADR-053 P3, #2054): the conv_* family. Thin wrappers
+ * over the generated calls, so the state tracker needs no generated header.
+ * Any of them latches this connection for the task / provider events.
+ */
+
+struct xrt_conv_wire_event;
+struct xrt_conv_wire_result;
+struct xrt_conv_wire_stream_created;
+struct xrt_conv_wire_stream_desc;
+struct xrt_conv_wire_task_desc;
+
+//! One task's effective capability + readiness, and the image kinds the service takes / gives for it.
+xrt_result_t
+ipc_client_conv_enum_task(struct ipc_connection *ipc_c,
+                          uint32_t task,
+                          struct xrt_conv_wire_task_desc *out_desc,
+                          uint64_t *out_image_kinds,
+                          uint64_t *out_export_kinds);
+
+xrt_result_t
+ipc_client_conv_warm(struct ipc_connection *ipc_c, uint32_t task);
+
+xrt_result_t
+ipc_client_conv_stream_create(struct ipc_connection *ipc_c,
+                              const struct xrt_conv_wire_stream_desc *desc,
+                              uint64_t required_outputs,
+                              uint32_t legacy_mode,
+                              float input_scale,
+                              struct xrt_conv_wire_stream_created *out_created);
+
+xrt_result_t
+ipc_client_conv_stream_reset(struct ipc_connection *ipc_c, uint64_t stream_id);
+
+//! The v3 acquire plus the result's spec-4 metadata (one round trip).
+xrt_result_t
+ipc_client_conv_acquire(struct ipc_connection *ipc_c,
+                        uint64_t stream_id,
+                        bool *out_ready,
+                        bool *out_discontinuity,
+                        struct xrt_lift_result *out_result,
+                        struct xrt_conv_wire_result *out_meta);
+
+xrt_result_t
+ipc_client_conv_poll_event(struct ipc_connection *ipc_c, bool *out_has, struct xrt_conv_wire_event *out_event);
+
 #ifdef __cplusplus
 }
 #endif

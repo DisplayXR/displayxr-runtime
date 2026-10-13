@@ -146,6 +146,26 @@ ipc_client_lift_submit(struct ipc_connection *ipc_c,
 	return ipc_call_lift_submit_frame(ipc_c, &args, handles, 1, out_frame_id);
 }
 
+static void
+lift_result_from_ipc(const struct ipc_lift_result *r, struct xrt_lift_result *out_result)
+{
+	out_result->frame_id = r->frame_id;
+	out_result->source_time = r->source_time;
+	out_result->fence_value = r->fence_value;
+	out_result->latency_ns = r->latency_ns;
+	out_result->width = r->width;
+	out_result->height = r->height;
+	out_result->format = r->format;
+	out_result->view_count = r->view_count;
+	out_result->output_realloc = r->output_realloc != 0;
+	out_result->viewpoint_count =
+	    r->viewpoint_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS : r->viewpoint_count;
+	memcpy(out_result->viewpoints, r->viewpoints, sizeof(out_result->viewpoints));
+	memcpy(out_result->rect_center, r->rect_center, sizeof(out_result->rect_center));
+	memcpy(out_result->rect_size, r->rect_size, sizeof(out_result->rect_size));
+	out_result->depth = r->depth;
+}
+
 xrt_result_t
 ipc_client_lift_acquire(struct ipc_connection *ipc_c,
                         uint64_t stream_id,
@@ -165,20 +185,7 @@ ipc_client_lift_acquire(struct ipc_connection *ipc_c,
 		return xret;
 	}
 	*out_ready = ready;
-	out_result->frame_id = r.frame_id;
-	out_result->source_time = r.source_time;
-	out_result->fence_value = r.fence_value;
-	out_result->latency_ns = r.latency_ns;
-	out_result->width = r.width;
-	out_result->height = r.height;
-	out_result->format = r.format;
-	out_result->view_count = r.view_count;
-	out_result->output_realloc = r.output_realloc != 0;
-	out_result->viewpoint_count = r.viewpoint_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS : r.viewpoint_count;
-	memcpy(out_result->viewpoints, r.viewpoints, sizeof(out_result->viewpoints));
-	memcpy(out_result->rect_center, r.rect_center, sizeof(out_result->rect_center));
-	memcpy(out_result->rect_size, r.rect_size, sizeof(out_result->rect_size));
-	out_result->depth = r.depth;
+	lift_result_from_ipc(&r, out_result);
 	return XRT_SUCCESS;
 }
 
@@ -365,4 +372,101 @@ ipc_client_lift_stats(struct ipc_connection *ipc_c, uint64_t stream_id, struct x
 	}
 	U_ZERO(out_stats);
 	return ipc_call_lift_stream_stats(ipc_c, stream_id, out_stats);
+}
+
+
+/*
+ *
+ * XR_DXR_lift spec 4: the conv_* family (#2054).
+ *
+ */
+
+xrt_result_t
+ipc_client_conv_enum_task(struct ipc_connection *ipc_c,
+                          uint32_t task,
+                          struct xrt_conv_wire_task_desc *out_desc,
+                          uint64_t *out_image_kinds,
+                          uint64_t *out_export_kinds)
+{
+	U_ZERO(out_desc);
+	*out_image_kinds = 0;
+	*out_export_kinds = 0;
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_conv_enum_task(ipc_c, task, out_desc, out_image_kinds, out_export_kinds);
+}
+
+xrt_result_t
+ipc_client_conv_warm(struct ipc_connection *ipc_c, uint32_t task)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_conv_wire_task_request req;
+	U_ZERO(&req);
+	req.struct_size = (uint32_t)sizeof(req);
+	req.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	req.task = task;
+	return ipc_call_conv_warm(ipc_c, &req);
+}
+
+xrt_result_t
+ipc_client_conv_stream_create(struct ipc_connection *ipc_c,
+                              const struct xrt_conv_wire_stream_desc *desc,
+                              uint64_t required_outputs,
+                              uint32_t legacy_mode,
+                              float input_scale,
+                              struct xrt_conv_wire_stream_created *out_created)
+{
+	U_ZERO(out_created);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_conv_stream_create(ipc_c, desc, required_outputs, legacy_mode, input_scale, out_created);
+}
+
+xrt_result_t
+ipc_client_conv_stream_reset(struct ipc_connection *ipc_c, uint64_t stream_id)
+{
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_conv_stream_reset(ipc_c, stream_id);
+}
+
+xrt_result_t
+ipc_client_conv_acquire(struct ipc_connection *ipc_c,
+                        uint64_t stream_id,
+                        bool *out_ready,
+                        bool *out_discontinuity,
+                        struct xrt_lift_result *out_result,
+                        struct xrt_conv_wire_result *out_meta)
+{
+	*out_ready = false;
+	*out_discontinuity = false;
+	U_ZERO(out_result);
+	U_ZERO(out_meta);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_lift_result r;
+	U_ZERO(&r);
+	xrt_result_t xret = ipc_call_conv_acquire_result(ipc_c, stream_id, out_ready, out_discontinuity, &r, out_meta);
+	if (xret != XRT_SUCCESS || !*out_ready) {
+		return xret;
+	}
+	lift_result_from_ipc(&r, out_result);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_client_conv_poll_event(struct ipc_connection *ipc_c, bool *out_has, struct xrt_conv_wire_event *out_event)
+{
+	*out_has = false;
+	U_ZERO(out_event);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_conv_poll_event(ipc_c, out_has, out_event);
 }

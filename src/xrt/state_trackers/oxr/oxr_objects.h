@@ -2949,6 +2949,15 @@ struct oxr_session
 	 */
 	uint32_t lift_max_views;
 
+	/*!
+	 * XR_DXR_lift spec 4 (#2054): the session made a spec-4 call, so it is
+	 * opted into the task / provider events (a spec-3 app never receives an
+	 * event type it does not know). Set once, never cleared.
+	 */
+	bool lift_v4;
+	//! Last time xrPollEvent drained this session's conversion events (ns).
+	uint64_t lift_ev_poll_ns;
+
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
 
@@ -4742,7 +4751,31 @@ struct oxr_lift_stream_dxr
 	//! from the session at create, refreshed at submit once the session has
 	//! read a newer one (0 = unknown, the XR_LIFT_MAX_VIEWS_DXR ceiling).
 	uint32_t max_views;
+	bool v4;       //!< spec 4: created with XrLiftTaskStreamCreateInfoDXR
+	uint32_t task; //!< spec 4: its XrLiftTaskDXR (0 = a spec-3 mode stream)
 };
+
+//! Spec 4: at most this often does xrPollEvent ask the service for lift events.
+#define OXR_CONV_EVENT_POLL_NS (20ull * 1000ull * 1000ull)
+
+/*!
+ * Spec 4 (#2054): drain the conversion events of every session that opted in
+ * (made a spec-4 call) into the instance queue. Called by xrPollEvent.
+ */
+XrResult
+oxr_conv_poll_events(struct oxr_logger *log, struct oxr_instance *inst);
+
+XrResult
+oxr_event_push_XrEventDataLiftTaskStateChangedDXR(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrLiftTaskDXR task,
+                                                  XrLiftTaskStateDXR state,
+                                                  XrLiftTaskStateDXR previousState,
+                                                  XrLiftFailureReasonDXR failureReason,
+                                                  float progress);
+
+XrResult
+oxr_event_push_XrEventDataLiftProvidersChangedDXR(struct oxr_logger *log, struct oxr_session *sess);
 
 /*!
  * Free an in-process session's lift-only service connection (ADR-049).

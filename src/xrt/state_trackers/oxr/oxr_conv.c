@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_DXR_lift API entry points — 2D→3D conversion streams (ADR-042).
+ * @brief  XR_DXR_lift API entry points — 2D→3D conversion streams (ADR-042),
+ *         spec 4 tasks / readiness / events (ADR-053; was oxr_lift.c).
  * @author David Fattal
  * @ingroup oxr_api
  *
@@ -20,7 +21,10 @@
  *    handles (texture + ID3D11Fence-created shared fence) a D3D12 device opens
  *    with OpenSharedHandle.
  *
- * Any other in-process session reports XR_ERROR_FEATURE_UNSUPPORTED.
+ * Any other in-process session reports XR_ERROR_FEATURE_UNSUPPORTED from the
+ * spec-3 calls; spec 4 enumerates the service's tasks to it with imageKinds /
+ * exportKinds 0 (known, not reachable from that session yet). What depends on
+ * the graphics API or Win32 lives in oxr_conv_gpu_d3d.c.
  *
  * Error contract (mirrors XR_DXR_weave §4b):
  *  - IPC session: a dead pipe (XRT_ERROR_IPC_FAILURE) marks the session lost →
@@ -43,10 +47,13 @@
 #include "oxr_api_verify.h"
 #include "oxr_chain.h"
 #include "oxr_lift_rules.h"
+#include "oxr_conv_gpu.h"
+#include "oxr_conv_map.h"
 
 #include "util/u_misc.h"
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_lift.h"
@@ -55,6 +62,7 @@
 // need nothing generated.
 #include "client/ipc_client_lift.h"
 #include "client/ipc_client_lift_link.h"
+#include "xrt/xrt_conv_wire.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "xrt/xrt_windows.h"
@@ -104,63 +112,6 @@ lift_session_is_ipc(struct oxr_session *sess)
 	return !inprocess;
 }
 
-/*!
- * ADR-049: which in-process sessions reach the service's module over a
- * lift-only connection. The conversion service is the Windows D3D11 service
- * and its results are D3D NT handles, which a D3D11 or D3D12 device opens
- * directly; other in-process APIs keep XR_ERROR_FEATURE_UNSUPPORTED.
- */
-static bool
-lift_inprocess_eligible(struct oxr_session *sess)
-{
-#ifdef XRT_OS_WINDOWS
-	return sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor;
-#else
-	(void)sess;
-	return false;
-#endif
-}
-
-//! The session's lift link, created on first use (no connect yet).
-static struct ipc_client_lift_link *
-lift_link_get(struct oxr_session *sess)
-{
-#ifdef XRT_OS_WINDOWS
-	struct ipc_client_lift_link *link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer(
-	    (PVOID volatile *)&sess->lift_link, NULL, NULL);
-	if (link != NULL) {
-		return link;
-	}
-
-	// Name the connection after the executable so `displayxr-cli clients` and
-	// the service log say whose it is.
-	char exe[MAX_PATH] = {0};
-	const char *base = "app";
-	if (GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe)) > 0) {
-		const char *slash = strrchr(exe, '\\');
-		base = slash != NULL ? slash + 1 : exe;
-	}
-	char label[XRT_MAX_APPLICATION_NAME_SIZE];
-	snprintf(label, sizeof(label), "%s (in-process lift)", base);
-
-	struct ipc_client_lift_link *made = NULL;
-	if (ipc_client_lift_link_create(label, &made) != XRT_SUCCESS) {
-		return NULL;
-	}
-	// Two threads may race the first lift call of a session: one link wins.
-	link = (struct ipc_client_lift_link *)InterlockedCompareExchangePointer((PVOID volatile *)&sess->lift_link,
-	                                                                        made, NULL);
-	if (link != NULL) {
-		ipc_client_lift_link_destroy(&made);
-		return link;
-	}
-	return made;
-#else
-	(void)sess;
-	return NULL;
-#endif
-}
-
 void
 oxr_lift_session_hint_interest(struct oxr_session *sess)
 {
@@ -174,11 +125,11 @@ oxr_lift_session_hint_interest(struct oxr_session *sess)
 		}
 		return;
 	}
-	if (!lift_inprocess_eligible(sess)) {
+	if (!oxr_conv_inprocess_eligible(sess)) {
 		return;
 	}
 	// Start the background connect now; it sends the hint once connected.
-	struct ipc_client_lift_link *link = lift_link_get(sess);
+	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
 	if (link == NULL) {
 		return;
 	}
@@ -223,13 +174,13 @@ lift_route_open(
 		route->state = IPC_CLIENT_LIFT_LINK_CONNECTED;
 		return XR_SUCCESS;
 	}
-	if (!lift_inprocess_eligible(sess)) {
+	if (!oxr_conv_inprocess_eligible(sess)) {
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "%s: in-process 2D→3D conversion is available to D3D11 / D3D12 sessions on Windows "
 		                 "only (other sessions: the out-of-process service path)",
 		                 what);
 	}
-	struct ipc_client_lift_link *link = lift_link_get(sess);
+	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
 	if (link == NULL) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s: could not create the lift service link", what);
 	}
@@ -442,6 +393,401 @@ oxr_lift_stream_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 
 /*
  *
+ * Spec 4 (ADR-053 P3, #2054): tasks, readiness events, task-typed streams,
+ * neutral input images, result contracts.
+ *
+ */
+
+//! Map a conv_* family result; INPUT_UNSUPPORTED is this family's validation failure.
+static XrResult
+conv_xret(struct oxr_logger *log,
+          struct oxr_session *sess,
+          const struct lift_route *route,
+          xrt_result_t xret,
+          const char *what)
+{
+	if (xret == XRT_ERROR_INPUT_UNSUPPORTED) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "%s: the request does not fit this task (view count, input kind, export kind or mode)",
+		                 what);
+	}
+	return lift_xret(log, sess, route, xret, what);
+}
+
+/*!
+ * The route of a spec-4 QUERY (enumerate, warm, events). Like lift_route_open,
+ * except that an in-process session the spec-3 calls refuse (GL, Vulkan,
+ * Metal) still reads the service's tasks over a lift-only link: they are
+ * known, with imageKinds / exportKinds 0 (not reachable from this session
+ * yet). Without a link (no service transport on this platform) route->c is
+ * NULL: nothing is known.
+ */
+static XrResult
+conv_query_route_open(struct oxr_logger *log, struct oxr_session *sess, struct lift_route *route, const char *what)
+{
+	if (lift_session_is_ipc(sess) || oxr_conv_inprocess_eligible(sess)) {
+		return lift_route_open(log, sess, 0, route, what);
+	}
+	memset(route, 0, sizeof(*route));
+	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
+	if (link == NULL) {
+		route->state = IPC_CLIENT_LIFT_LINK_FAILED;
+		return XR_SUCCESS;
+	}
+	route->inprocess = true;
+	route->c = ipc_client_lift_link_acquire_wait(link, 0, &route->state, &route->gen);
+	return XR_SUCCESS;
+}
+
+//! The first spec-4 call opts the session into the task / provider events.
+static void
+conv_latch(struct oxr_session *sess)
+{
+	sess->lift_v4 = true;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTasksDXR(XrSession session,
+                            uint32_t capacityInput,
+                            uint32_t *countOutput,
+                            XrLiftTaskPropertiesDXR *tasks)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateLiftTasksDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (capacityInput > 0 && tasks == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "xrEnumerateLiftTasksDXR: tasks is NULL");
+	}
+	for (uint32_t i = 0; i < capacityInput; i++) {
+		if (tasks[i].type != XR_TYPE_LIFT_TASK_PROPERTIES_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrEnumerateLiftTasksDXR: tasks[%u].type is not XR_TYPE_LIFT_TASK_PROPERTIES_DXR", i);
+		}
+	}
+	*countOutput = 0;
+
+	struct lift_route route;
+	XrResult r = conv_query_route_open(&log, sess, &route, "xrEnumerateLiftTasksDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	conv_latch(sess);
+	if (route.c == NULL) {
+		return XR_SUCCESS; // in-process, no connection yet: nothing known; poll again
+	}
+
+	uint64_t in_kinds = 0, out_kinds = 0;
+	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
+
+	struct xrt_conv_wire_task_desc found[XRT_CONV_TASK_RESERVED_FIRST];
+	uint64_t found_in[XRT_CONV_TASK_RESERVED_FIRST], found_out[XRT_CONV_TASK_RESERVED_FIRST];
+	uint32_t n = 0;
+	xrt_result_t xret = XRT_SUCCESS;
+	for (uint32_t t = XRT_CONV_TASK_DEPTH_MONO; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
+		if (!oxr_conv_task_is_spec4((XrLiftTaskDXR)t)) {
+			continue;
+		}
+		struct xrt_conv_wire_task_desc d;
+		uint64_t ik = 0, ek = 0;
+		xret = ipc_client_conv_enum_task(route.c, t, &d, &ik, &ek);
+		if (xret != XRT_SUCCESS) {
+			break;
+		}
+		if (d.state == XRT_CONV_STATE_ABSENT || d.task != t) {
+			continue;
+		}
+		found[n] = d;
+		found_in[n] = ik & in_kinds;
+		found_out[n] = ek & out_kinds;
+		n++;
+		if (t == XRT_CONV_TASK_VIEWS_MONO && d.max_views > 0) {
+			sess->lift_max_views = d.max_views > XR_LIFT_MAX_VIEWS_DXR ? XR_LIFT_MAX_VIEWS_DXR : d.max_views;
+		}
+	}
+	lift_route_close(sess, &route, xret);
+	r = lift_xret(&log, sess, &route, xret, "xrEnumerateLiftTasksDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+
+	*countOutput = n;
+	if (capacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (capacityInput < n) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "xrEnumerateLiftTasksDXR: capacity %u < %u",
+		                 capacityInput, n);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		oxr_conv_task_properties_from_wire(&found[i], found_in[i], found_out[i], &tasks[i]);
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestLiftTaskWarmDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
+	if (!oxr_conv_task_is_spec4(task)) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrRequestLiftTaskWarmDXR: task %d is reserved or not a spec-4 task", (int)task);
+	}
+	struct lift_route route;
+	XrResult r = conv_query_route_open(&log, sess, &route, "xrRequestLiftTaskWarmDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	conv_latch(sess);
+	if (route.c == NULL) {
+		return XR_SUCCESS; // in-process, connecting: the connect's own hint warms the defaults
+	}
+	xrt_result_t xret = ipc_client_conv_warm(route.c, (uint32_t)task);
+	lift_route_close(sess, &route, xret);
+	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
+		return XR_SUCCESS; // nothing to warm (no candidate): the enumeration says so
+	}
+	return conv_xret(&log, sess, &route, xret, "xrRequestLiftTaskWarmDXR");
+}
+
+/*!
+ * xrCreateLiftStreamDXR with XrLiftTaskStreamCreateInfoDXR chained (spec 4).
+ * The base struct's contentHint / inputScale keep their meaning; its mode is
+ * 0 or the legacy mode of the task.
+ */
+static XrResult
+lift_create_task_stream(struct oxr_logger *log,
+                        struct oxr_session *sess,
+                        const XrLiftStreamCreateInfoDXR *ci,
+                        const XrLiftTaskStreamCreateInfoDXR *t,
+                        XrLiftStreamDXR *stream)
+{
+	const char *what = "xrCreateLiftStreamDXR (task)";
+	if (!oxr_conv_task_is_spec4(t->task)) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: task %d is reserved or not a spec-4 task", what,
+		                 (int)t->task);
+	}
+	if (ci->mode != 0 && !oxr_conv_mode_matches_task((uint32_t)ci->mode, t->task)) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: mode %d does not match task %d", what,
+		                 (int)ci->mode, (int)t->task);
+	}
+	if (t->inputKind != 0 && t->inputKind != XR_LIFT_INPUT_KIND_MONO_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: input kind %d is not offered (spec 4: MONO)",
+		                 what, (int)t->inputKind);
+	}
+	if ((int)t->qualityHint < 0 || (int)t->qualityHint > (int)XR_LIFT_QUALITY_HINT_QUALITY_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: qualityHint %d invalid", what,
+		                 (int)t->qualityHint);
+	}
+	if (t->viewCount > XR_LIFT_MAX_VIEWS_DXR || t->viewCount == 1) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: viewCount %u (0 or 2..%u)", what, t->viewCount,
+		                 (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+	}
+	uint64_t in_kinds = 0, out_kinds = 0;
+	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
+	uint32_t export_memory = 0;
+	if (t->exportKind != XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR) {
+		if ((int)t->exportKind < 0 || (int)t->exportKind >= 64 ||
+		    (out_kinds & (1ull << (uint32_t)t->exportKind)) == 0) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: exportKind %d is not offered here", what,
+			                 (int)t->exportKind);
+		}
+		export_memory = XRT_CONV_MEM_WIN32_NT_HANDLE; // D3D11_NT, the one export kind so far
+	}
+	if (ci->contentHint != XR_LIFT_CONTENT_HINT_VIDEO_DXR && ci->contentHint != XR_LIFT_CONTENT_HINT_PHOTO_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: contentHint (%d) invalid", what,
+		                 (int)ci->contentHint);
+	}
+	if (ci->inputScale < 0.0f || ci->inputScale > 1.0f) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: inputScale (%f) must be in [0, 1]", what,
+		                 (double)ci->inputScale);
+	}
+	const bool views = t->task == XR_LIFT_TASK_VIEWS_MONO_DXR;
+	// XrLiftDepthRequestDXR beside it: aux depth, advisory (VIEWS_MONO only).
+	const XrLiftDepthRequestDXR *dreq =
+	    OXR_GET_INPUT_FROM_CHAIN(ci, XR_TYPE_LIFT_DEPTH_REQUEST_DXR, XrLiftDepthRequestDXR);
+	if (dreq != NULL && !views) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: XrLiftDepthRequestDXR is for VIEWS_MONO only",
+		                 what);
+	}
+	if ((t->requiredOutputs & XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR) != 0 && !views) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: AUX_DEPTH is for VIEWS_MONO only", what);
+	}
+
+	struct xrt_conv_wire_stream_desc sd;
+	memset(&sd, 0, sizeof(sd));
+	sd.struct_size = (uint32_t)sizeof(sd);
+	sd.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	sd.task = (uint32_t)t->task;
+	sd.quality_hint = (uint32_t)t->qualityHint;
+	sd.export_memory_kind = export_memory;
+	sd.input_kind = XRT_CONV_INPUT_MONO;
+	sd.content_hint = (uint32_t)ci->contentHint;
+	sd.view_count = t->viewCount;
+	sd.views_layout = XRT_CONV_VIEWS_ROW;
+	if (dreq != NULL) {
+		sd.outputs |= XRT_CONV_OUT_DEPTH; // advisory: the service adds it only when declared
+	}
+
+	struct lift_route route;
+	XrResult r = lift_route_open(log, sess, 6000, &route, what);
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	conv_latch(sess);
+	if (route.c == NULL) {
+		if (route.state == IPC_CLIENT_LIFT_LINK_CONNECTING) {
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+			                 "%s: the lift service connection is still being made - retry", what);
+		}
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED, "%s: no service to convert with", what);
+	}
+	struct xrt_conv_wire_stream_created created;
+	memset(&created, 0, sizeof(created));
+	xrt_result_t xret = ipc_client_conv_stream_create(route.c, &sd, (uint64_t)t->requiredOutputs,
+	                                                (uint32_t)ci->mode,
+	                                                ci->inputScale > 0.0f ? ci->inputScale : 1.0f, &created);
+	const uint32_t gen = route.gen;
+	lift_route_close(sess, &route, xret);
+	r = conv_xret(log, sess, &route, xret, what);
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+
+	struct oxr_lift_stream_dxr *st = NULL;
+	OXR_ALLOCATE_HANDLE_OR_RETURN(log, st, OXR_XR_DEBUG_LIFTSTREAM, oxr_lift_stream_destroy_cb, &sess->handle);
+	st->sess = sess;
+	st->id = created.stream_id;
+	st->mode = !views ? XRT_DP_LIFT_MODE_DEPTH
+	                  : (created.view_count > 2 ? XRT_DP_LIFT_MODE_NVIEW : XRT_DP_LIFT_MODE_SBS);
+	st->depth_requested = views && (dreq != NULL || (t->requiredOutputs & XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR) != 0);
+	st->link_gen = gen;
+	st->max_views = sess->lift_max_views;
+	st->v4 = true;
+	st->task = (uint32_t)t->task;
+	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
+	return XR_SUCCESS;
+}
+
+/*!
+ * XrLiftFrameImagesDXR (spec 4) -> the v3 submit's handle + extent. A spec-4
+ * runtime takes one COLOR image of a kind the session's imageKinds offer
+ * (D3D11 NT / legacy DXGI), its region anchored at the origin.
+ */
+static XrResult
+lift_frame_images_to_v3(struct oxr_logger *log,
+                        struct oxr_session *sess,
+                        const XrLiftFrameImagesDXR *fi,
+                        void **out_handle,
+                        bool *out_is_dxgi,
+                        XrExtent2Di *out_extent)
+{
+	if (fi->imageCount != 1 || fi->images == NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftFrameImagesDXR: imageCount %u (a spec-4 runtime takes one COLOR image)",
+		                 fi->imageCount);
+	}
+	const XrLiftImageDXR *im = &fi->images[0];
+	if (im->type != XR_TYPE_LIFT_IMAGE_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameImagesDXR: images[0].type invalid");
+	}
+	if (im->role != XR_LIFT_IMAGE_ROLE_COLOR_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR: role %d (spec 4: COLOR)", (int)im->role);
+	}
+	uint64_t in_kinds = 0, out_kinds = 0;
+	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
+	XrLiftImageKindDXR kind = im->kind;
+	if (kind == XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR) {
+		kind = XR_LIFT_IMAGE_KIND_D3D11_NT_DXR;
+	}
+	if ((int)kind < 0 || (int)kind >= 64 || (in_kinds & (1ull << (uint32_t)kind)) == 0) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR: kind %d is not offered here",
+		                 (int)im->kind);
+	}
+	if (im->handle == NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR::handle is NULL");
+	}
+	if (im->syncKind != XR_LIFT_SYNC_KIND_NONE_DXR && im->syncKind != XR_LIFT_SYNC_KIND_KEYED_MUTEX_DXR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftImageDXR: syncKind %d (a D3D11 shared texture syncs with its keyed mutex)",
+		                 (int)im->syncKind);
+	}
+	if (im->region.offset.x != 0 || im->region.offset.y != 0) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftImageDXR::region must start at (0, 0) on this runtime (got %d, %d)",
+		                 im->region.offset.x, im->region.offset.y);
+	}
+	*out_handle = im->handle;
+	*out_is_dxgi = kind == XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR;
+	*out_extent = im->region.extent;
+	return XR_SUCCESS;
+}
+
+/*
+ *
+ * Events (opt-in per session: only after a spec-4 call).
+ *
+ */
+
+//! xrPollEvent: drain each opted-in session's conversion events (throttled).
+XrResult
+oxr_conv_poll_events(struct oxr_logger *log, struct oxr_instance *inst)
+{
+	if (!inst->extensions.DXR_lift) {
+		return XR_SUCCESS;
+	}
+	const uint64_t now = os_monotonic_get_ns();
+	os_mutex_lock(&inst->sessions_mutex);
+	for (struct oxr_session *sess = inst->sessions; sess != NULL; sess = sess->next) {
+		if (!sess->lift_v4 || sess->has_lost) {
+			continue;
+		}
+		// Events are rate-limited at the source (2 Hz progress); 20 ms bounds
+		// the round trips of an app that polls in a tight loop.
+		if (now - sess->lift_ev_poll_ns < OXR_CONV_EVENT_POLL_NS) {
+			continue;
+		}
+		sess->lift_ev_poll_ns = now;
+		struct lift_route route;
+		if (conv_query_route_open(log, sess, &route, "xrPollEvent (lift)") != XR_SUCCESS) {
+			continue;
+		}
+		xrt_result_t xret = XRT_SUCCESS;
+		for (int i = 0; route.c != NULL && i < 16; i++) {
+			bool has = false;
+			struct xrt_conv_wire_event ev;
+			xret = ipc_client_conv_poll_event(route.c, &has, &ev);
+			if (xret != XRT_SUCCESS || !has) {
+				break;
+			}
+			if (ev.kind == XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED) {
+				oxr_event_push_XrEventDataLiftProvidersChangedDXR(log, sess);
+			} else if (ev.kind == XRT_CONV_WIRE_EVENT_TASK_STATE_CHANGED) {
+				oxr_event_push_XrEventDataLiftTaskStateChangedDXR(
+				    log, sess, (XrLiftTaskDXR)ev.task, (XrLiftTaskStateDXR)ev.state,
+				    (XrLiftTaskStateDXR)ev.previous_state, (XrLiftFailureReasonDXR)ev.failure_reason, ev.progress);
+			}
+		}
+		// A dead pipe surfaces on the session's next real call, not here.
+		lift_route_close(sess, &route, xret);
+	}
+	os_mutex_unlock(&inst->sessions_mutex);
+	return XR_SUCCESS;
+}
+
+
+/*
+ *
  * Entry points.
  *
  */
@@ -520,6 +866,13 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, createInfo, XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR);
 	OXR_VERIFY_ARG_NOT_NULL(&log, stream);
+
+	// Spec 4: a task-typed stream (its mode is 0 or the task's legacy mode).
+	const XrLiftTaskStreamCreateInfoDXR *task_ci = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_LIFT_TASK_STREAM_CREATE_INFO_DXR, XrLiftTaskStreamCreateInfoDXR);
+	if (task_ci != NULL) {
+		return lift_create_task_stream(&log, sess, createInfo, task_ci, stream);
+	}
 
 	const uint32_t mode = (uint32_t)createInfo->mode;
 	if (mode != XRT_DP_LIFT_MODE_DEPTH && mode != XRT_DP_LIFT_MODE_SBS && mode != XRT_DP_LIFT_MODE_NVIEW &&
@@ -621,13 +974,30 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	OXR_VERIFY_ARG_NOT_NULL(&log, frameId);
 	*frameId = 0;
 
-	if (submitInfo->inputTexture == NULL) {
+	// Spec 4: XrLiftFrameImagesDXR replaces inputTexture / inputIsDxgi / extent.
+	void *in_texture = submitInfo->inputTexture;
+	bool in_is_dxgi = submitInfo->inputIsDxgi == XR_TRUE;
+	XrExtent2Di in_extent = submitInfo->extent;
+	const XrLiftFrameImagesDXR *frame_images =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_FRAME_IMAGES_DXR, XrLiftFrameImagesDXR);
+	if (frame_images != NULL) {
+		XrResult ir = lift_frame_images_to_v3(&log, sess, frame_images, &in_texture, &in_is_dxgi, &in_extent);
+		if (ir != XR_SUCCESS) {
+			return ir;
+		}
+	}
+	const XrLiftFrameControlDXR *frame_control =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_FRAME_CONTROL_DXR, XrLiftFrameControlDXR);
+	const bool discontinuity =
+	    frame_control != NULL && (frame_control->flags & XR_LIFT_FRAME_CONTROL_DISCONTINUITY_BIT_DXR) != 0;
+
+	if (in_texture == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameSubmitInfoDXR::inputTexture is NULL");
 	}
-	if (submitInfo->extent.width <= 0 || submitInfo->extent.height <= 0) {
+	if (in_extent.width <= 0 || in_extent.height <= 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "XrLiftFrameSubmitInfoDXR::extent (%dx%d) must be positive", submitInfo->extent.width,
-		                 submitInfo->extent.height);
+		                 "XrLiftFrameSubmitInfoDXR::extent (%dx%d) must be positive", in_extent.width,
+		                 in_extent.height);
 	}
 
 	struct xrt_dp_lift_params params;
@@ -679,10 +1049,19 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	if (rr != XR_SUCCESS) {
 		return rr;
 	}
-	xrt_result_t xret = ipc_client_lift_submit(
-	    route.c, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
-	    submitInfo->inputIsDxgi == XR_TRUE, (uint32_t)submitInfo->extent.width, (uint32_t)submitInfo->extent.height,
-	    (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp, rigp, frameId);
+	xrt_result_t xret = XRT_SUCCESS;
+	if (discontinuity) {
+		// Spec 4: drop temporal state before this frame (seek / cut / switch).
+		xret = ipc_client_conv_stream_reset(route.c, st->id);
+		if (xret == XRT_ERROR_IPC_FAILURE) {
+			lift_route_close(sess, &route, xret);
+			return lift_xret(&log, sess, &route, xret, "xrSubmitLiftFrameDXR (discontinuity)");
+		}
+	}
+	xret = ipc_client_lift_submit(route.c, st->id, (xrt_graphics_buffer_handle_t)(intptr_t)in_texture, in_is_dxgi,
+	                              (uint32_t)in_extent.width, (uint32_t)in_extent.height,
+	                              (int64_t)submitInfo->sourceTime, pp, vp_count > 0 ? vps : NULL, vp_count, vcp,
+	                              rigp, frameId);
 	lift_route_close(sess, &route, xret);
 	return lift_xret(&log, sess, &route, xret, "xrSubmitLiftFrameDXR");
 }
@@ -764,6 +1143,37 @@ lift_fill_depth_result(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
+//! Fill the spec-4 result contracts that are chained (type / next kept).
+static void
+lift_fill_v4_info(const struct xrt_conv_wire_result *r4,
+                  bool discontinuity,
+                  XrLiftDepthInfoDXR *depth_info,
+                  XrLiftViewsInfoDXR *views_info)
+{
+	if (depth_info != NULL) {
+		XrStructureType type = depth_info->type;
+		void *next = depth_info->next;
+		memset(depth_info, 0, sizeof(*depth_info));
+		depth_info->type = type;
+		depth_info->next = next;
+		if ((r4->written & XRT_CONV_OUT_DEPTH) != 0) {
+			oxr_conv_depth_info_from_wire(&r4->depth_info, discontinuity, depth_info);
+		} else {
+			depth_info->discontinuity = discontinuity ? XR_TRUE : XR_FALSE;
+		}
+	}
+	if (views_info != NULL) {
+		XrStructureType type = views_info->type;
+		void *next = views_info->next;
+		memset(views_info, 0, sizeof(*views_info));
+		views_info->type = type;
+		views_info->next = next;
+		if ((r4->written & XRT_CONV_OUT_VIEWS) != 0) {
+			oxr_conv_views_info_from_wire(&r4->views_info, r4->views_width, r4->views_height, views_info);
+		}
+	}
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 {
@@ -790,9 +1200,21 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		return xr;
 	}
 
+	XrLiftResultExportDXR *export_info =
+	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_RESULT_EXPORT_DXR, XrLiftResultExportDXR);
+	XrLiftDepthInfoDXR *depth_info =
+	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_DEPTH_INFO_DXR, XrLiftDepthInfoDXR);
+	XrLiftViewsInfoDXR *views_info =
+	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_VIEWS_INFO_DXR, XrLiftViewsInfoDXR);
+	const bool want_v4 = depth_info != NULL || views_info != NULL;
+
 	bool ready = false;
 	struct xrt_lift_result r;
-	xrt_result_t xret = ipc_client_lift_acquire(route.c, st->id, &ready, &r);
+	struct xrt_conv_wire_result r4;
+	bool discontinuity = false;
+	memset(&r4, 0, sizeof(r4));
+	xrt_result_t xret = want_v4 ? ipc_client_conv_acquire(route.c, st->id, &ready, &discontinuity, &r, &r4)
+	                            : ipc_client_lift_acquire(route.c, st->id, &ready, &r);
 	if (xret != XRT_SUCCESS || !ready) {
 		lift_route_close(sess, &route, xret);
 		xr = lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR");
@@ -851,6 +1273,14 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		}
 		// Latch only on a complete export (the #1427 rule): a miss retries.
 		st->exported = got_tex && got_fence;
+	}
+
+	// Spec 4: XrLiftResultExportDXR is left untouched on a D3D11_NT stream
+	// (every stream so far: exportKind 0 or D3D11_NT); the result means what
+	// XrLiftDepthInfoDXR / XrLiftViewsInfoDXR say.
+	(void)export_info;
+	if (want_v4) {
+		lift_fill_v4_info(&r4, discontinuity, depth_info, views_info);
 	}
 
 	// Spec v3 (ADR-048 Addendum A): the auxiliary depth of this result.

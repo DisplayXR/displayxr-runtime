@@ -1136,6 +1136,17 @@ oxr_xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priorit
 //! OpenXR API function @ep{xrGetLiftStreamStatsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR *stats);
+
+//! OpenXR API function @ep{xrEnumerateLiftTasksDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTasksDXR(XrSession session,
+                            uint32_t capacityInput,
+                            uint32_t *countOutput,
+                            XrLiftTaskPropertiesDXR *tasks);
+
+//! OpenXR API function @ep{xrRequestLiftTaskWarmDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task);
 #endif
 
 #ifdef OXR_HAVE_DXR_stereo_camera
