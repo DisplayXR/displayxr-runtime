@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  XR_DXR_lift view-count rule (#2005 G2), shared by xrSubmitLiftFrameDXR
- *         (oxr_lift.c) and the weave path's lifted rects (oxr_weave.c).
+ *         (oxr_conv.c) and the weave path's lifted rects (oxr_weave.c).
  *
  * `XrLiftPropertiesDXR::maxViews` "bounds XrLiftOptionsDXR::viewCount for
  * NVIEW" (XR_DXR_lift spec §2), and a bad viewCount is

@@ -3652,7 +3652,7 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 
 /*
  * XR_DXR_lift bridges (ADR-042) — thin accessors the OpenXR state tracker
- * (oxr_lift.c, oxr_weave.c) forward-declares, like the weave bridges above:
+ * (oxr_conv.c, oxr_weave.c) forward-declares, like the weave bridges above:
  * extract the session's connection (and, for weave rects, forward to
  * ipc_client_lift.c). Streams belong to the
  * connection, so a session's streams die with its connection.
@@ -3668,7 +3668,7 @@ lift_conn(struct xrt_compositor *xc)
 }
 
 /*!
- * The session's connection, for oxr_lift.c: every stream call goes straight to
+ * The session's connection, for oxr_conv.c: every stream call goes straight to
  * ipc_client_lift.c on it — the same calls an in-process session makes on its
  * lift-only connection (ADR-049), so one code path serves both.
  */

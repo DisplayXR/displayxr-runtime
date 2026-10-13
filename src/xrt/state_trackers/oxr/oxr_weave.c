@@ -123,7 +123,7 @@ xrt_result_t
 comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
                                             uint32_t count,
                                             const struct xrt_lift_weave_rect *rects);
-//! XrLiftViewControlDXR -> xrt (oxr_lift.c).
+//! XrLiftViewControlDXR -> xrt (oxr_conv.c).
 XrResult
 oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR *v, struct xrt_lift_view_control *out);
 bool

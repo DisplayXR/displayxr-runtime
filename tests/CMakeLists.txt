@@ -1326,7 +1326,7 @@ if(TARGET tests_lift_dp_golden)
 endif()
 
 if(TARGET tests_oxr_lift_startup)
-	# The REAL entry points (oxr_lift.c) and client (ipc_client_lift.c), plus
+	# The REAL entry points (oxr_conv.c) and client (ipc_client_lift.c), plus
 	# the handle and logger code they verify with, compiled straight in; the
 	# wire calls, the lift link and the session bridge under them are faked in
 	# tests_oxr_lift_startup_fake.c. Deliberately NOT linked: st_oxr, ipc_client
@@ -1336,7 +1336,9 @@ if(TARGET tests_oxr_lift_startup)
 	target_sources(
 		tests_oxr_lift_startup
 		PRIVATE tests_oxr_lift_startup_fake.c
-			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_lift.c
+			tests_oxr_lift_startup_conv_fake.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_conv.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_conv_gpu_d3d.c
 			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_handle_base.c
 			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_logger.c
 			${PROJECT_SOURCE_DIR}/src/xrt/ipc/client/ipc_client_lift.c

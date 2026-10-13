@@ -87,7 +87,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_lift 1
-#define XR_DXR_lift_SPEC_VERSION 3
+#define XR_DXR_lift_SPEC_VERSION 4
 #define XR_DXR_LIFT_EXTENSION_NAME "XR_DXR_lift"
 
 // Reserved 1004999270..279. Allocation registry: README.md in this directory.
@@ -1074,10 +1074,10 @@ typedef struct XrLiftFrameControlDXR {
 
 /*!
  * Chain on XrLiftResultDXR::next. Says how outputTexture / fence are to be
- * read. On a stream whose exportKind is not D3D11_NT, XrLiftResultDXR::format
- * is 0 and these fields are authoritative; on a D3D11_NT stream they repeat
- * the v3 meaning. Handles arrive under the v3 rule: only on the first acquire
- * and on reallocation.
+ * read when the stream's exportKind is not D3D11_NT; XrLiftResultDXR::format
+ * is then 0 and these fields are authoritative. On a D3D11_NT stream the
+ * struct is left untouched. Handles arrive under the v3 rule: only on the
+ * first acquire and on reallocation.
  */
 typedef struct XrLiftResultExportDXR {
     XrStructureType          type;            //!< XR_TYPE_LIFT_RESULT_EXPORT_DXR
