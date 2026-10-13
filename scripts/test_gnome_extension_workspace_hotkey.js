@@ -19,6 +19,8 @@
 //   4. Configure("") releases, forgets the unit and never reports pending.
 //   5. Suspend: no grab, no press; capped at 60 s; resumes by itself.
 //   6. The cache file round trip never registers an owner.
+//   7. Bootstrap of a newly installed controller.
+//   8. The lock screen (version 14, #2071): no grab, no press, no bootstrap.
 'use strict';
 
 const GLib = imports.gi.GLib;
@@ -190,6 +192,22 @@ print('7. bootstrap: arm a newly installed controller without a prior service ru
     const old = WH.create();
     WH.deserialize(old, '{"version":1,"accelerator":"<Control>space","unit":"displayxr.service"}');
     check(WH.needBootstrap(old, fp), 'cache without a manifest record -> one start');
+}
+
+print('8. lock screen (version 14, #2071): no grab, no press, no bootstrap');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.20', '<Control>space', 'displayxr.service', 0, '');
+    check(WH.wantGrab(st, 10, false) && !WH.wantGrab(st, 10, true), 'locked -> grab released');
+    check(WH.wantGrab(st, 10), 'locked defaults to false (callers without a session mode)');
+    const r = WH.press(st, 10, true);
+    check(r.emit === false && r.startUnit === null, 'a press while locked is not acted on');
+    check(WH.press(st, 10, false).emit === true, 'unlocked -> a press emits again');
+    WH.ownerGone(st, ':1.20');
+    const gone = WH.press(st, 20, true);
+    check(gone.startUnit === null && st.pendingUntil === 0,
+        'client gone + locked: no StartUnit, nothing carried as pending');
+    check(!WH.mayBootstrap(true) && WH.mayBootstrap(false), 'bootstrap waits for the unlock');
 }
 
 if (failed > 0) {
