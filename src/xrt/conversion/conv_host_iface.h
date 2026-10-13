@@ -127,6 +127,15 @@ conv_host_exit_is_crash(int32_t code)
 	return code != 0 && code != 20;
 }
 
+/*! Is @p code CONV_HOST_EXIT_UPDATE (20, "closed for update", roadmap §3.6)?
+ *  The provider's tasks go WARMING(updating); the respawn waits for the
+ *  maintenance mutex (or a registry change), never for a timer. */
+static inline bool
+conv_host_exit_is_update(int32_t code)
+{
+	return code == 20;
+}
+
 /*! Watchdog view of a host (roadmap §5.3: every call is bracketed). */
 struct conv_host_heartbeat
 {

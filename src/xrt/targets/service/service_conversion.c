@@ -86,6 +86,7 @@ static struct
 
 	//! Satellite proxies (owned by the core) and the ingest adapter they run on (#2034).
 	struct conv_host *sat_hosts[XRT_CONV_LOADER_MAX_ENTRIES];
+	char sat_ids[XRT_CONV_LOADER_MAX_ENTRIES][64]; //!< provider id of sat_hosts[i]
 	uint32_t sat_count;
 	uint64_t adapter_luid;
 
@@ -660,6 +661,7 @@ add_entry(struct xrt_conversion_plugin_entry *e)
 			}
 			os_mutex_lock(&g.mtx);
 			if (g.sat_count < XRT_CONV_LOADER_MAX_ENTRIES) {
+				(void)snprintf(g.sat_ids[g.sat_count], sizeof(g.sat_ids[0]), "%s", e->id);
 				g.sat_hosts[g.sat_count++] = host;
 			}
 			os_mutex_unlock(&g.mtx);
@@ -788,7 +790,28 @@ rescan(void)
 		const int k = find_entry_locked(e->id);
 		const bool known_enabled = k >= 0 ? g.entries[k].enabled : false;
 		const bool known_loaded = k >= 0 && g.entries[k].status == XRT_CONV_LOAD_NEGOTIATED;
+		// Roadmap §3.6 respawn rule (i): the provider's own row changed (an
+		// installer writes `Version` last) -- not just any key under the root.
+		const bool reregistered = k >= 0 && (strcmp(g.entries[k].version, e->version) != 0 ||
+		                                     strcmp(g.entries[k].binary_path, e->binary_path) != 0);
+		struct conv_host *sat = NULL;
+		for (uint32_t j = 0; reregistered && j < g.sat_count; j++) {
+			if (strcmp(g.sat_ids[j], e->id) == 0) {
+				sat = g.sat_hosts[j];
+			}
+		}
+		if (reregistered) {
+			memcpy(g.entries[k].version, e->version, sizeof(e->version));
+			memcpy(g.entries[k].binary_path, e->binary_path, sizeof(e->binary_path));
+		}
 		os_mutex_unlock(&g.mtx);
+#ifdef CONV_HAVE_HOST_PROXY
+		if (sat != NULL) {
+			conv_host_proxy_config_changed(sat);
+		}
+#else
+		(void)sat;
+#endif
 		if (k >= 0) {
 			if (known_enabled != e->enabled) {
 				if (e->enabled && !known_loaded) {

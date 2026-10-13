@@ -60,7 +60,10 @@
 #define PX_SLICE_MS 50u                //!< worker / supervisor wait slice
 #define PX_FENCE_TIMEOUT_MS 2000u      //!< CPU fence observe per result
 #define PX_SPAWN_EXIT_GRACE_MS 1000u   //!< a host that never connected: did it die on its own?
-#define PX_CHANNEL_EXIT_GRACE_MS 5000u //!< a closed channel: wait this long for the real exit code (a loaded box exits slowly)
+//! A closed channel: wait this long for the host's own exit and its REAL code
+//! before killing it (a loaded box exits slowly; a kill's 30 would also turn an
+//! exit 20 "closed for update" into a crash, #2056).
+#define PX_CHANNEL_EXIT_GRACE_MS 5000u
 #define PX_MAINTENANCE_POLL_NS (1000ull * 1000000ull)
 
 static uint64_t
@@ -285,6 +288,7 @@ struct proxy
 	uint32_t raised_terminal; //!< supervisor FAILED already reported (by its failed_at_ns)
 	uint64_t raised_terminal_at;
 	uint64_t next_maintenance_ns;
+	bool maintenance_held; //!< the last probe's answer (logged on change)
 
 	/* The current incarnation. */
 	uint32_t epoch;
@@ -1097,6 +1101,14 @@ on_host_gone(struct proxy *p, int32_t code, bool orderly, bool had_demand)
 	struct px_sync *syncs = (struct px_sync *)calloc(PX_MAX_SYNCS, sizeof(*syncs));
 
 	os_mutex_lock(&p->m);
+	// Was anything using this incarnation (an open stream, a call, a warmed
+	// model)? After a close-for-update that work is owed a respawn once the
+	// maintenance mutex is free (roadmap §3.6): the core's streams only
+	// submit again after the RESTORED re-warm, so they cannot be the demand.
+	bool had_work = p->open_streams > 0 || p->queued > 0 || p->in_flight;
+	for (uint32_t i = 0; i < p->cap_count && !had_work; i++) {
+		had_work = p->states[i].state == XRT_CONV_STATE_READY || p->states[i].state == XRT_CONV_STATE_WARMING;
+	}
 	p->epoch++;
 	const bool was_running = p->running;
 	p->running = false;
@@ -1174,9 +1186,17 @@ on_host_gone(struct proxy *p, int32_t code, bool orderly, bool had_demand)
 		p->ever_lost = true;
 		// The core keeps the provider's tasks WARMING(restarting) and re-warms on
 		// RESTORED: the respawn is owed even with nothing queued right now.
-		// Respawned after a crash, an adapter change, or an orderly exit that
-		// raced work on its way (the casualties are re-warmed on RESTORED).
-		p->restart_owed = !orderly || p->luid_restart || had_demand;
+		if (code == CONV_HOST_EXIT_UPDATE && !p->luid_restart) {
+			U_LOG_W("[conv:%s] host closed for update: tasks WARMING(updating); respawn %s once the "
+			        "maintenance mutex is free or the registration changes, never on a timer",
+			        p->provider_id, had_work ? "owed" : "on the next demand");
+		}
+		// Respawned after a crash, an adapter change, an orderly exit that
+		// raced work on its way (the casualties are re-warmed on RESTORED), or
+		// a close for update of a host that had work (once the maintenance
+		// mutex is free, roadmap §3.6).
+		p->restart_owed =
+		    !orderly || p->luid_restart || had_demand || (code == CONV_HOST_EXIT_UPDATE && had_work);
 		p->luid_restart = false;
 		p->luid_kill_sent = false;
 		os_mutex_unlock(&p->m);
@@ -1352,6 +1372,22 @@ report_terminal(struct proxy *p)
 	}
 }
 
+//! The maintenance-mutex check (supervisor thread, no lock held).
+static bool
+maintenance_probe(struct proxy *p)
+{
+	if (p->cfg.maintenance_held != NULL) {
+		return p->cfg.maintenance_held(p->cfg.maintenance_ud, p->provider_id);
+	}
+#ifdef XRT_OS_WINDOWS
+	char name[160];
+	conv_host_proxy_maintenance_mutex_name(p->provider_id, name, sizeof(name));
+	return os_named_mutex_held(name);
+#else
+	return false; // no installer mutex on POSIX (roadmap §3.6)
+#endif
+}
+
 static void *
 sup_main(void *ptr)
 {
@@ -1386,7 +1422,12 @@ sup_main(void *ptr)
 		if (redescribe) {
 			p->redescribe = false;
 		}
-		const bool poll_mutex = t >= p->next_maintenance_ns;
+		// Probe the maintenance mutex at 1 Hz, and on every pass while the host
+		// is down with demand (a spawn may be due): a spawn must never act on a
+		// stale answer (an installer takes the mutex just before its Restart
+		// Manager session, and the host's exit 20 follows within milliseconds).
+		const bool poll_mutex =
+		    t >= p->next_maintenance_ns || (p->sup.demand && !conv_supervisor_host_alive(&p->sup));
 		os_mutex_unlock(&p->m);
 
 		if (broken_proc != NULL) {
@@ -1405,19 +1446,20 @@ sup_main(void *ptr)
 			os_mutex_unlock(&p->m);
 		}
 
-#ifdef XRT_OS_WINDOWS
 		if (poll_mutex) {
-			char name[160];
-			(void)snprintf(name, sizeof(name), "Global\\DisplayXR-ConvMaintenance-%s", p->provider_id);
-			const bool held = os_named_mutex_held(name);
+			const bool held = maintenance_probe(p);
 			os_mutex_lock(&p->m);
+			const bool changed = held != p->maintenance_held;
+			p->maintenance_held = held;
 			conv_supervisor_set_maintenance(&p->sup, held);
 			p->next_maintenance_ns = t + PX_MAINTENANCE_POLL_NS;
 			os_mutex_unlock(&p->m);
+			if (changed) {
+				U_LOG_W("[conv:%s] maintenance mutex %s", p->provider_id,
+				        held ? "held (an update is running): no host spawn until it is released"
+				             : "released");
+			}
 		}
-#else
-		(void)poll_mutex;
-#endif
 		if (hello) {
 			os_mutex_lock(&p->m);
 			p->hello_ok = false;
@@ -2745,6 +2787,31 @@ conv_host_proxy_set_adapter(struct conv_host *h, uint64_t adapter_luid, const st
 		U_LOG_W("[conv:%s] service adapter is %llx: restarting the host on it", p->provider_id,
 		        (unsigned long long)adapter_luid);
 	}
+}
+
+void
+conv_host_proxy_config_changed(struct conv_host *h)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	struct conv_supervisor_status st;
+	conv_supervisor_get_status(&p->sup, &st);
+	conv_supervisor_config_changed(&p->sup, now_ns());
+	os_cond_broadcast(&p->cond);
+	os_mutex_unlock(&p->m);
+	if (st.state == CONV_SUP_UPDATING || st.state == CONV_SUP_FAILED) {
+		U_LOG_W("[conv:%s] registration changed: the host may respawn (%s gate cleared)", p->provider_id,
+		        conv_supervisor_state_str(st.state));
+	}
+}
+
+void
+conv_host_proxy_maintenance_mutex_name(const char *provider_id, char *buf, size_t size)
+{
+	if (buf == NULL || size == 0) {
+		return;
+	}
+	(void)snprintf(buf, size, "Global\\DisplayXR-ConvMaintenance-%s", provider_id != NULL ? provider_id : "");
 }
 
 void

@@ -41,6 +41,7 @@
 #include "conv_supervisor.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -112,6 +113,13 @@ struct conv_host_proxy_config
 	 *  the host (roadmap §3.4 "Spawn"); with no cached describe at all, the
 	 *  service calls conv_host_proxy_request_describe instead. */
 	bool spawn_for_describe;
+
+	/*! The maintenance-mutex probe (roadmap §3.6): true while an installer
+	 *  holds `Global\DisplayXR-ConvMaintenance-<id>`. NULL = the OS check
+	 *  (os_named_mutex_held on Windows; never held on POSIX). Tests on every
+	 *  OS substitute their own. Called on the supervisor thread, no lock held. */
+	bool (*maintenance_held)(void *ud, const char *provider_id);
+	void *maintenance_ud;
 };
 
 //! Default (and floor) of conv_host_proxy_config::connect_timeout_ms.
@@ -142,6 +150,19 @@ conv_host_proxy_request_describe(struct conv_host *h);
  */
 void
 conv_host_proxy_set_adapter(struct conv_host *h, uint64_t adapter_luid, const struct conv_host_proxy_gpu_ops *gpu);
+
+/*!
+ * The provider's registry row or manifest changed (a re-registration, a new
+ * `Version`, another `Binary`): clears the supervisor's FAILED and UPDATING
+ * gates (roadmap §3.6 respawn rule (i)). A respawn still waits for demand and
+ * a free maintenance mutex.
+ */
+void
+conv_host_proxy_config_changed(struct conv_host *h);
+
+//! The maintenance-mutex name for @p provider_id: `Global\DisplayXR-ConvMaintenance-<id>`.
+void
+conv_host_proxy_maintenance_mutex_name(const char *provider_id, char *buf, size_t size);
 
 //! The LUID the current / last host was spawned with, and the one it said it opened.
 void
