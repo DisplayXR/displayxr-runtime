@@ -157,6 +157,25 @@ def check_metadata():
         fail(f"shell-version declares {FIRST_ESM_SHELL}+ but {MODERN_ENTRY} does not exist")
 
 
+    # Version 14 (#2071): the extension must stay enabled on the lock screen.
+    # Without `unlock-dialog` GNOME disables it at every lock — on a laptop,
+    # every suspend — the geometry bus name disappears, and a weaving window
+    # that lives across the lock loses its phase anchor. `gdm` must NOT be
+    # there: the greeter is not the user's session.
+    modes = meta.get("session-modes")
+    if modes is None:
+        fail(
+            'metadata.json has no "session-modes"; it must be ["user", "unlock-dialog"] '
+            "so the geometry publisher survives the lock screen (#2071)"
+        )
+    elif not isinstance(modes, list) or set(modes) != {"user", "unlock-dialog"} or len(modes) != 2:
+        fail(f'metadata.json session-modes is {modes!r}, must be exactly ["user", "unlock-dialog"] (#2071)')
+    else:
+        notes.append("session-modes: user + unlock-dialog (stays alive on the lock screen)")
+    if any(v < 42 for v in declared) and modes is not None:
+        fail("session-modes needs GNOME 42+, but shell-version declares an older shell")
+
+
 ESM_STATEMENT = re.compile(r"^\s*(?:import|export)\b", re.M)
 
 

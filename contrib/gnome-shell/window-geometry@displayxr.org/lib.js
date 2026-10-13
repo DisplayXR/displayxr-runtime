@@ -25,7 +25,30 @@
 //
 // `build()` is memoised per shell process: GObject.registerClass() must run
 // exactly once per GType name, and an extension that is disabled and re-enabled
-// (lock screen, user toggle) goes through the entry point again.
+// (user toggle, a shell older than this extension's session-modes) goes through
+// the entry point again.
+//
+// ── The lock screen (extension version 14, displayxr-runtime#2071) ─────────
+//
+// metadata.json declares `"session-modes": ["user", "unlock-dialog"]`, so GNOME
+// keeps this extension ENABLED while the screen is locked instead of disabling
+// it (and dropping the bus name) at every lock — which on a laptop is every
+// suspend. A weaving app that lives across the lock therefore keeps its
+// geometry publisher and its phase anchor. What runs on the lock screen:
+//   * the geometry snapshot + WindowsChanged (window rects of the user's own
+//     session, on the user's own session bus),
+//   * CaptureExclusion1 (removing it at lock would make every excluded window
+//     capturable for the length of the lock),
+//   * WindowPlacement1 / move sync (a client moving its OWN window; nothing a
+//     locked user can drive),
+//   * the WorkspaceHotkey1 D-Bus object (so a registered client is not lost).
+// What does NOT: the workspace hotkey's GRAB. Entering the lock screen
+// releases it and leaving it re-grabs (WorkspaceHotkey.wantGrab(…, locked)),
+// a press is never acted on while locked, and the manifest bootstrap is
+// deferred to the unlock — a lock screen must not run user-chosen actions.
+// The extension adds no UI anywhere, so it adds none to the lock screen.
+// The session-mode test is Main.sessionMode.isLocked (not currentMode, which is
+// 'ubuntu' rather than 'user' on Ubuntu), followed through its 'updated' signal.
 //
 // ── The D-Bus surface ───────────────────────────────────────────────────────
 //
@@ -746,8 +769,11 @@
         },
 
         //! A press: {emit, startUnit}. startUnit is the unit to start, or null.
-        press(st, nowMs) {
-            if (st.accelerator === '' || WorkspaceHotkey.suspended(st, nowMs))
+        //! @p locked: the session is on the lock screen (version 14, #2071) —
+        //! a press there is never acted on (the grab is released anyway; this
+        //! covers a press already queued when the lock came up).
+        press(st, nowMs, locked = false) {
+            if (locked || st.accelerator === '' || WorkspaceHotkey.suspended(st, nowMs))
                 return {emit: false, startUnit: null};
             if (st.owner !== null)
                 return {emit: true, startUnit: null};
@@ -774,9 +800,17 @@
             return st.suspendedUntil > nowMs;
         },
 
-        //! Whether the accelerator should be grabbed right now.
-        wantGrab(st, nowMs) {
-            return st.accelerator !== '' && !WorkspaceHotkey.suspended(st, nowMs);
+        //! Whether the accelerator should be grabbed right now. Never while
+        //! @p locked (the lock screen, version 14, #2071): the extension stays
+        //! enabled there for the geometry publisher, not for the hotkey.
+        wantGrab(st, nowMs, locked = false) {
+            return !locked && st.accelerator !== '' && !WorkspaceHotkey.suspended(st, nowMs);
+        },
+
+        //! Whether the manifest bootstrap may start a unit now (#2071): not
+        //! from the lock screen; it runs at the unlock instead.
+        mayBootstrap(locked) {
+            return !locked;
         },
 
         /*
@@ -1046,8 +1080,9 @@
                     Gio.bus_unwatch_name(client.watchId);
                 this._clients.clear();
                 // Remove EVERY effect we added, whether or not its owner is
-                // still registered: a disabled extension (lock screen, logout,
-                // user toggle) must leave no window invisible to capture.
+                // still registered: a disabled extension (logout, user toggle;
+                // since version 14 no longer the lock screen) must leave no
+                // window invisible to capture.
                 for (const actor of global.get_window_actors())
                     actor.remove_effect_by_name(EXCLUDE_EFFECT_NAME);
                 inStagePaint = false;
@@ -2610,6 +2645,11 @@
                 this._grabbedAccel = '';
                 this._watchId = 0;
                 this._suspendTimer = 0;
+                //! The session is on the lock screen (version 14, #2071). Set
+                //! by the owner through setLocked() before the first _sync().
+                this._locked = WorkspaceHotkeyService.sessionLocked();
+                //! A bootstrap came due while locked: run it at the unlock.
+                this._bootstrapDeferred = false;
                 const base = typeof GLib.get_user_state_dir === 'function'
                     ? GLib.get_user_state_dir() : GLib.get_user_cache_dir();
                 this._cacheDir = GLib.build_filenamev([base, 'displayxr']);
@@ -2647,6 +2687,25 @@
                     } catch (e) {
                         // An unreadable root is simply not watched.
                     }
+                }
+            }
+
+            //! Whether the shell is on the lock screen right now.
+            static sessionLocked() {
+                return Main?.sessionMode?.isLocked === true;
+            }
+
+            //! The lock screen came up or went away (#2071): release or
+            //! re-take the grab, and run a bootstrap deferred by the lock.
+            setLocked(locked) {
+                if (locked === this._locked)
+                    return;
+                this._locked = locked;
+                log(`displayxr: workspace hotkey: ${locked ? 'screen locked — grab released' : 'unlocked — grab restored'}`);
+                this._sync();
+                if (!locked && this._bootstrapDeferred) {
+                    this._bootstrapDeferred = false;
+                    this._scheduleBootstrap();
                 }
             }
 
@@ -2688,6 +2747,10 @@
             }
 
             _maybeBootstrap() {
+                if (!WorkspaceHotkey.mayBootstrap(this._locked)) {
+                    this._bootstrapDeferred = true;
+                    return;
+                }
                 const current = this._scanManifests();
                 if (!WorkspaceHotkey.needBootstrap(this._st, current))
                     return;
@@ -2783,7 +2846,7 @@
 
             //! Make the grab match the state (accelerator, suspend).
             _sync() {
-                const want = WorkspaceHotkey.wantGrab(this._st, Date.now());
+                const want = WorkspaceHotkey.wantGrab(this._st, Date.now(), this._locked);
                 if (want && this._action !== 0 && this._grabbedAccel === this._st.accelerator)
                     return;
                 this._ungrab();
@@ -2799,7 +2862,7 @@
             }
 
             _onPress(timestamp) {
-                const r = WorkspaceHotkey.press(this._st, Date.now());
+                const r = WorkspaceHotkey.press(this._st, Date.now(), this._locked);
                 if (r.emit && this._dbus) {
                     this._dbus.emit_signal('Activated', new GLib.Variant('(u)', [(timestamp ?? 0) >>> 0]));
                 }
@@ -2863,6 +2926,7 @@
                     registered: this._st.owner !== null,
                     grabbed: this._action !== 0,
                     suspended: WorkspaceHotkey.suspended(this._st, Date.now()),
+                    locked: this._locked,
                 });
             }
         }
@@ -2906,6 +2970,15 @@
                 // keybinding plumbing (Main, Shell) at hand; without it the
                 // object is not exported and a client falls back.
                 this._workspaceHotkey = Main?.wm && Shell ? new WorkspaceHotkeyService() : null;
+                // Version 14 (#2071): GNOME keeps this extension enabled on the
+                // lock screen (metadata.json session-modes), so follow the
+                // session mode instead of being torn down by it. Only the
+                // hotkey cares; everything else keeps running.
+                this._sessionModeId = 0;
+                if (Main?.sessionMode && typeof Main.sessionMode.connect === 'function') {
+                    this._sessionModeId = Main.sessionMode.connect('updated',
+                        () => this._workspaceHotkey?.setLocked(WorkspaceHotkeyService.sessionLocked()));
+                }
                 this._nameId = Gio.DBus.session.own_name(
                     'org.displayxr.WindowGeometry',
                     Gio.BusNameOwnerFlags.NONE, null, null);
@@ -2959,6 +3032,10 @@
             }
 
             disable() {
+                if (this._sessionModeId) {
+                    Main.sessionMode.disconnect(this._sessionModeId);
+                    this._sessionModeId = 0;
+                }
                 if (this._auditId) {
                     global.stage.disconnect(this._auditId);
                     this._auditId = 0;
