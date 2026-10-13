@@ -248,6 +248,22 @@ conv_core_hint_interest(struct conv_core *core, uint64_t client_id, uint64_t tas
 xrt_result_t
 conv_core_warm_task(struct conv_core *core, uint32_t task);
 
+/*!
+ * The explicit `conv warm` (DIAG, #2029): warm @p task's selected capability.
+ * READY is a no-op. When every candidate is terminal (FAILED, ABSENT -- e.g. a
+ * kill-switched or module-declared ABSENT(policy)) it is a retry trigger
+ * (spec §4.3): those rows go back to INSTALLED and the selected one warms.
+ * DISABLED rows are configuration and stay. Never blocks.
+ *
+ * @param out_prev  readiness of the selected row before the call (ABSENT /
+ *                  UNKNOWN when nothing serves the task)
+ * @param out_state readiness right after it (WARMING, READY, ...)
+ * @return XRT_SUCCESS (also for the no-op); XRT_ERROR_FEATURE_NOT_SUPPORTED
+ *         for a task v1 does not serve or with no row at all.
+ */
+xrt_result_t
+conv_core_warm_task_explicit(struct conv_core *core, uint32_t task, uint32_t *out_prev, uint32_t *out_state);
+
 xrt_result_t
 conv_core_evict_task(struct conv_core *core, uint32_t task);
 

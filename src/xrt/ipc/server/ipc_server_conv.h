@@ -379,6 +379,12 @@ ipc_server_conv_lift_stats(struct ipc_server_conv *sc,
 void
 ipc_server_conv_hint_interest(struct ipc_server_conv *sc, uint64_t client_id, uint64_t task_mask);
 
+/*! conv_warm (DIAG, `displayxr-cli conv warm`, #2029): the explicit warm of
+ *  @p task's selected capability (conv_core_warm_task_explicit). No core
+ *  (DXR_CONV=0, not started): XRT_ERROR_FEATURE_NOT_SUPPORTED, states 0. */
+xrt_result_t
+ipc_server_conv_warm(struct ipc_server_conv *sc, uint32_t task, uint32_t *out_prev_state, uint32_t *out_state);
+
 /*! The connection is gone: its v3 streams (and the core's streams / jobs
  *  for it) die with it. */
 void

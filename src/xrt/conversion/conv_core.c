@@ -867,6 +867,68 @@ conv_core_warm_task(struct conv_core *core, uint32_t task)
 	return ok ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
+xrt_result_t
+conv_core_warm_task_explicit(struct conv_core *core, uint32_t task, uint32_t *out_prev, uint32_t *out_state)
+{
+	uint32_t prev = XRT_CONV_STATE_UNKNOWN, now = XRT_CONV_STATE_UNKNOWN;
+	xrt_result_t r = XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	if (core != NULL && conv_task_is_served(task)) {
+		os_mutex_lock(&core->registry_mtx);
+		struct conv_binding b;
+		uint32_t state = 0;
+		bool have = select_simple_locked(core, task, &b, &state);
+		prev = have ? state
+		            : (conv_registry_discovery_settled(&core->reg) ? XRT_CONV_STATE_ABSENT
+		                                                           : XRT_CONV_STATE_UNKNOWN);
+		if (!have || conv_state_is_terminal(state)) {
+			// Every candidate is terminal: the explicit warm retries them (a
+			// registry-change event per row, so FAILED of any reason and
+			// ABSENT(policy) alike go back to INSTALLED; DISABLED stays).
+			const uint64_t t = now_ns();
+			bool any = false;
+			for (uint32_t i = 0; i < core->reg.row_count; i++) {
+				struct conv_cap_row *row = &core->reg.rows[i];
+				const uint32_t s = row->rd.state;
+				if (row->cap.task != task ||
+				    (s != XRT_CONV_STATE_FAILED && s != XRT_CONV_STATE_ABSENT)) {
+					continue;
+				}
+				struct conv_readiness_event ev = mk_ev(CONV_EV_REGISTRY_CHANGED, t);
+				apply_locked(core, i, &ev);
+				if (row->provider < CONV_REGISTRY_MAX_PROVIDERS) {
+					// The re-describe this queues must not demote the row
+					// before its warm answered (conv_core_provider_changed's rule).
+					core->retrying[row->provider] = true;
+				}
+				any = true;
+			}
+			if (any) {
+				have = select_simple_locked(core, task, &b, &state);
+			}
+		}
+		if (have) {
+			r = XRT_SUCCESS;
+			if (state != XRT_CONV_STATE_READY) {
+				conv_core_request_warm_locked(core, b.provider, b.cap_id, CONV_EV_WARM_REQUESTED);
+			}
+			now = conv_core_row_state_locked(core, b.provider, b.cap_id);
+			U_LOG_W("[conv] conv warm %s: %s cap %u %s -> %s", conv_task_name(task),
+			        core->reg.providers[b.provider].id, b.cap_id, conv_state_name(prev),
+			        conv_state_name(now));
+		} else {
+			now = prev;
+		}
+		os_mutex_unlock(&core->registry_mtx);
+	}
+	if (out_prev != NULL) {
+		*out_prev = prev;
+	}
+	if (out_state != NULL) {
+		*out_state = now;
+	}
+	return r;
+}
+
 struct evict_op
 {
 	struct conv_host_cmd cmd;

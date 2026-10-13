@@ -505,6 +505,77 @@ TEST_CASE("UNAVAILABLE -> READY after a provider install, without a restart", "[
 	conv_fake_fini(&f);
 }
 
+TEST_CASE("conv_warm (DIAG): warms the selection; READY is a no-op; a terminal task is retried (#2029)",
+          "[ipc_lift_core]")
+{
+	uint32_t prev = 99, now = 99;
+	// No conversion core in the service (DXR_CONV=0): refused, states zeroed.
+	CHECK(ipc_server_conv_warm(nullptr, XRT_CONV_TASK_VIEWS_MONO, &prev, &now) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+	CHECK(prev == 0u);
+	CHECK(now == 0u);
+
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *v =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	v->warm_ms = 30;
+	conv_fake_cap *d =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	d->warm_ms = 30;
+	d->warm_end_state = XRT_CONV_STATE_ABSENT; // the provider tries, then says "not here"
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(fx.add(f) >= 0);
+		REQUIRE(conv_core_task_state(fx.core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_INSTALLED);
+
+		// Cold: warmed, never blocking.
+		REQUIRE(ipc_server_conv_warm(fx.sc, XRT_CONV_TASK_VIEWS_MONO, &prev, &now) == XRT_SUCCESS);
+		CHECK(prev == XRT_CONV_STATE_INSTALLED);
+		CHECK(now == XRT_CONV_STATE_WARMING);
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(fx.core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_READY; },
+		    3000));
+		uint64_t warms = 0;
+		{
+			os_mutex_lock(&f.mtx);
+			warms = f.warms;
+			os_mutex_unlock(&f.mtx);
+		}
+		// READY: a no-op that says so; the provider is not called again.
+		REQUIRE(ipc_server_conv_warm(fx.sc, XRT_CONV_TASK_VIEWS_MONO, &prev, &now) == XRT_SUCCESS);
+		CHECK(prev == XRT_CONV_STATE_READY);
+		CHECK(now == XRT_CONV_STATE_READY);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		os_mutex_lock(&f.mtx);
+		CHECK(f.warms == warms);
+		os_mutex_unlock(&f.mtx);
+
+		// A task nothing serves: refused, ABSENT (discovery settled).
+		CHECK(ipc_server_conv_warm(fx.sc, XRT_CONV_TASK_DEPTH_MONO, &prev, &now) ==
+		      XRT_ERROR_FEATURE_NOT_SUPPORTED);
+		CHECK(prev == XRT_CONV_STATE_ABSENT);
+
+		// A provider that declares itself absent after the warm: terminal.
+		REQUIRE(ipc_server_conv_warm(fx.sc, XRT_CONV_TASK_DEPTH_VIDEO, &prev, &now) == XRT_SUCCESS);
+		CHECK(prev == XRT_CONV_STATE_INSTALLED);
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(fx.core, XRT_CONV_TASK_DEPTH_VIDEO) == XRT_CONV_STATE_ABSENT; },
+		    3000));
+		// The module got installed: an explicit warm is the retry trigger.
+		os_mutex_lock(&f.mtx);
+		d->warm_end_state = 0;
+		os_mutex_unlock(&f.mtx);
+		REQUIRE(ipc_server_conv_warm(fx.sc, XRT_CONV_TASK_DEPTH_VIDEO, &prev, &now) == XRT_SUCCESS);
+		CHECK(prev == XRT_CONV_STATE_ABSENT);
+		CHECK(now == XRT_CONV_STATE_WARMING);
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(fx.core, XRT_CONV_TASK_DEPTH_VIDEO) == XRT_CONV_STATE_READY; },
+		    3000));
+	}
+	conv_fake_fini(&f);
+}
+
 TEST_CASE("4-view stream created while ACTIVATING converts once READY on a module that has NVIEW (#2029)",
           "[ipc_lift_core]")
 {
