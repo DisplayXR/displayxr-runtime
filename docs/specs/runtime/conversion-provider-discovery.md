@@ -1,6 +1,7 @@
 # Conversion-Provider Discovery Contract
 
-> **Status: Implemented — ADR-053 (Accepted). The P1a conversion core landed in #1994 / #2015 and ships from v2.42.0; the contract header is [`src/xrt/include/xrt/xrt_conversion_plugin.h`](../../../src/xrt/include/xrt/xrt_conversion_plugin.h).** Open follow-ups: live re-select of `Enabled` / `PreferredProvider` in a running core (#2051) and the shared options contract (#2050) under the N3 epic #2047. The pre-implementation header draft stays at [`docs/roadmap/conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) for history only.
+> **Status: Implemented — ADR-053 (Accepted). The P1a conversion core landed in #1994 / #2015 and ships from v2.42.0 (core, loader, `dp-lift`, the sim provider); P1b and P2 (the satellite host) are implemented; §3.8 is the installer contract from P3.** Open follow-ups: live re-select of `Enabled` / `PreferredProvider` in a running core (#2051) and the shared options contract (#2050) under the N3 epic #2047.
+> Header: [`src/xrt/include/xrt/xrt_conversion_plugin.h`](../../../src/xrt/include/xrt/xrt_conversion_plugin.h) (design record, kept for history: [`conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) §1). Writing a provider: [`vendor-plugin-onboarding.md` §9](../../guides/vendor-plugin-onboarding.md#9-conversion-providers--the-third-plug-in-type) and the `displayxr-conversion-template` starter kit.
 
 **Audience:** integrators shipping a conversion-provider plug-in (a DLL / dylib / so that turns 2D images into depth, views or Gaussian splats for the runtime), and runtime engineers maintaining the conversion core, its loader and its host.
 
@@ -264,11 +265,31 @@ The ABI allows one DLL to export both `xrtPluginNegotiate` and `xrtConversionPlu
 - In-service, both loaders map the same file; the OS refcounts it. The two vtables run on disjoint threads, so shared mutable state needs the DLL's own locking.
 - **A combined DLL keeps the vendor files locked in the service** (the display half is mapped there), which is exactly what satellite hosting is meant to end. **Separate DLLs are the recommended shape**, and the vendor onboarding guide says so plainly.
 
-### 3.8 Registration lifetime
+### 3.8 Registration lifetime and the installer contract
 
-[`plugin-discovery.md` §5](plugin-discovery.md#5-registration-lifetime-no-cascade-uninstall) applies verbatim: no cascade uninstall; vendor rows survive the runtime; a provider may be installed before the runtime; Restart Manager instead of kill; start through `explorer.exe`, never elevated.
+[`plugin-discovery.md` §5](plugin-discovery.md#5-registration-lifetime-no-cascade-uninstall) applies verbatim: no cascade uninstall; vendor rows survive the runtime; a provider may be installed before the runtime; Restart Manager instead of kill; start through `explorer.exe`, never elevated. A provider's installer owns its `ConversionProviders\<id>` subkey (or its POSIX manifest) the way a display plug-in owns its `DisplayProcessors\<id>` subkey, and touches nothing else.
 
-**P3: close the host, never the service.** A vendor's separate conversion-provider DLL is satellite-hosted from day one, so the process its installer Restart-Manages is **`displayxr-conversion-host.exe`, never `displayxr-service.exe`**; the service never maps a satellite provider's DLL. The host answers `WM_QUERYENDSESSION` / `ENDSESSION_CLOSEAPP` and exits 20 ("closed for update"); the service reports the provider `WARMING(updating)`, keeps every client session and stream, and **does not respawn on a timer**. It respawns only when (i) the provider's registry row or manifest changes (installers write `Version` last), or (ii) demand exists and the named mutex **`Global\DisplayXR-ConvMaintenance-<id>`** is free — installers hold it across their whole Restart Manager session. The host never calls `RegisterApplicationRestart`. Lift that still runs through display-plug-in slots stays in the service (§4.5), so until a vendor ships its separate DLL its installer keeps closing the service, at the old cost.
+**Close the host, never the service.** A separate conversion-provider DLL is satellite-hosted (`Hosting` absent or `auto`, §3.1), so the only process that maps it is that provider's `displayxr-conversion-host.exe`; the service never loads a satellite provider's DLL. Restart Manager therefore lists the host, and closing the host costs no client session and no stream.
+
+**The update sequence** (normative for an installer that replaces or removes the provider's files):
+
+| Step | Installer | Runtime |
+|---|---|---|
+| 1 | Create and **own** the named mutex **`Global\DisplayXR-ConvMaintenance-<id>`** (`CreateMutexW(NULL, TRUE, …)`; `<id>` = the registry subkey and `iface->id`). Hold it until step 6 | The service polls the name about once a second. "Held" means it exists and cannot be acquired, **or** it exists and the service cannot open it (an elevated installer's default DACL). While it is held the supervisor spawns no host for `<id>`: no first spawn, no backoff respawn, no update respawn |
+| 2 | `RmStartSession`, `RmRegisterResources` on the provider's files, `RmGetList` | `RmGetList` names `displayxr-conversion-host.exe` (one process per provider binary), never `displayxr-service.exe` — unless the files are also mapped by a display plug-in (§3.7) or by an in-service hosting (`Hosting=in-service`) |
+| 3 | `RmShutdown` (graceful first; `RmForceShutdown` only if that fails) | The host's hidden top-level window takes `WM_QUERYENDSESSION` carrying `ENDSESSION_CLOSEAPP` (also `WM_ENDSESSION`, `WM_CLOSE`) and the host exits **20**, "closed for update"; a 3 s backstop exits 20 even if teardown stalls. Exit 20 is neither a crash nor a backoff step. The provider's tasks report `WARMING` with detail `updating`; streams keep their handles and their last result. A forced kill (any other exit code) takes the crash path instead, `WARMING(restarting)`, and that respawn also waits for the mutex |
+| 4 | Replace or delete the files; write or delete the registry row with **`Version` last** (the "row complete" marker). POSIX: write the manifest atomically (temp + rename) | Nothing respawns on a timer. The host never calls `RegisterApplicationRestart`, so `RmRestart` restarts nothing for it |
+| 5 | `RmEndSession`. **Do not start the host, and do not start or stop the service** | — |
+| 6 | Release and close the mutex | With the mutex free, the supervisor respawns the host when there is demand (a bound task, a stream, a job or a prewarm), or when the row or manifest changes; the core re-describes, re-warms and re-opens every provider stream (one result flagged `discontinuity`). Tasks go `WARMING` → `READY` with no client action |
+
+Code: the mutex poll and spawn gate are `conv_host_proxy.c` + `conv_supervisor.c` (`conv_supervisor_set_maintenance`); the session-end window and the 3 s backstop are `conv_host_os_win.c`; the exit codes are `conv_host_wire.h`. The `WARMING(updating)` report and the respawn on a row change complete in P3 (#2056); the test that drives a real Restart Manager session against a running host with the service up is part of it.
+
+- **Exit codes** the supervisor reads are in §4.4. Codes 10–14 are terminal (`FAILED` with a matching reason) until the row changes or a retry; 20 is the update path above; anything unlisted is a crash.
+- **Uninstall** is the same sequence without a respawn: the row is gone, and the provider's tasks fall through to the next candidate at the next create (§3.4). A live stream on the removed provider moves once, flagged `discontinuity` (§3.4 rule 5).
+- **Old installers that close the service** keep working at the old cost (every session is lost). Nothing in the runtime depends on the mutex being taken; it only prevents a respawn into a half-written install.
+- **A combined display + conversion DLL** stays mapped in the service by its display half (§3.7), so for it the service is still what Restart Manager lists. Separate DLLs are the recommended shape for exactly this reason.
+- **Lift that still runs through display-plug-in slots** (`dp-lift`, §4.5) stays in the service. Until a vendor ships its separate provider with `Supersedes = dp-lift`, that vendor's display-plug-in installer keeps closing the service.
+- **POSIX** has no Restart Manager and no maintenance mutex (the supervisor reads it as always free). A package manager replaces files by rename under a running host, which keeps the old mapping until its next restart; a host asked to exit for an update exits 20 as on Windows.
 
 The runtime installer does **not** register `sim-conversion` on user installs (FALLBACK, setting-gated, §6.1). CI and `register_dev_plugin.bat conv sim` do.
 
@@ -403,7 +424,21 @@ Both hostings implement the same service-side **host interface** (describe, warm
 - **Handles.** The service holds the only cross-process right: it **pulls** host-allocated output handles with `DuplicateHandle(host → self)` through its own handle on the host process. The host never holds a handle to the service process. POSIX: `SCM_RIGHTS` both ways.
 - **GPU sync.** Shared fence values; keyed mutexes are never used service ↔ host. **The service never enqueues a GPU wait on a host-signalled fence on any compositor context.** It observes completion from the CPU on the dispatcher thread (`SetEventOnCompletion` or a fence poll, with a timeout) before it consumes a host output; the client-facing export path follows the same rule. CI case: kill the host between submit and signal; the compositor frame rate is unaffected.
 - **Failure.** A crash fails in-flight work, reports `WARMING(restarting)`, keeps stream handles and the last published result, and respawns with backoff (0.5 s doubling to 30 s). Exit 20 respawns only per §3.8.
-- **Exit codes:** 0 orderly, 10 ABI reject, 11 negotiate / describe failed, 12 licence, 13 no usable device, 14 elevated, 20 closed for update, 30 watchdog kill.
+- **Exit codes** (`conv_host_wire.h`; an own namespace, unrelated to selftest's exit 13):
+
+  | Code | Meaning | Supervisor |
+  |---|---|---|
+  | 0 | orderly: a requested shutdown, or the 10 min idle exit | not a crash |
+  | 2 | bad command line | `FAILED`, not retryable |
+  | 10 | ABI reject; also a refused hello (git-tag or wire-family mismatch) | `FAILED` until the row changes or a retry |
+  | 11 | negotiate or describe failed | same |
+  | 12 | licence (reserved: an unlicensed capability is reported as state, not as an exit) | same |
+  | 13 | no usable device on `--adapter-luid` | same |
+  | 14 | refused to run elevated | same |
+  | 15 | the inherited control channel is unusable | crash accounting |
+  | 20 | closed for update (§3.8) | no backoff, no crash accounting; respawn only per §3.8 |
+  | 30 | killed by the supervisor (call watchdog, hello timeout, heartbeat silence) | crash accounting |
+  | other | crash; the host wrote a minidump | backoff, crash-loop cutoff |
 - **Logs:** `DisplayXR_conversion-host_<id>.<pid>_<ts>.log`; WARN+ lines are forwarded into the service log, prefixed `[conv:<id>]`.
 
 ### 4.5 The legacy DP-lift adapter (`dp-lift`)
@@ -639,17 +674,17 @@ Per [`debug-logging.md`](../../reference/debug-logging.md):
 | 11 | MCP | `displayxr-mcp` | `convert_file`, `get_conversion_status` via the CLI |
 | 12 | Extensions index | `docs/specs/extensions/index.json` | lift note update for spec 4 / 5 |
 | 13 | Docs | this spec; `docs/reference/xrt_conversion_plugin_iface.md` | |
-| 14 | Onboarding | `vendor-plugin-onboarding.md` new §9 | separate DLL, §2.4 rules, ProbeOrder 50, `Supersedes`; from P3 "close the host, never the service", `Version` written last, the `ConvMaintenance` mutex (§3.8) |
+| 14 | Onboarding | `vendor-plugin-onboarding.md` §9 (P3) | separate DLL, §2.4 rules, ProbeOrder 50, `Supersedes`; "close the host, never the service", `Version` written last, the `ConvMaintenance` mutex (§3.8); the `displayxr-conversion-template` starter kit |
 | 15 | Layering | `separation-of-concerns.md` | "Conversion provider" layer row + must-NOT list (§1.5); Vendor Isolation Rule covers conversion-vendor identifiers, CI link-line assert extended |
 | 16 | ADR | ADR-053 | ADR-042 and ADR-049 marked "amended by" |
 | 17 | Tests | `tests_conversion_abi.cpp`, `tests_conversion_select.cpp`, loader suffix tests | truncation, assert parity, selection (preference, `Policy\Lock`, licence, ties, fall-through on any FAILED, no live swap), cold-boot spec-3 ACTIVATING golden |
-| 18 | Vendor template | `displayxr-vendor-template` | one `VIEWS_MONO` CPU example, NSIS row, "minimum viable conversion provider" README |
+| 18 | Provider template | `displayxr-conversion-template` (its own repository: a model vendor is not a display vendor) | a CPU-only `DEPTH_MONO` provider, a fake host for hardware-free checks, dev registration (registry row / POSIX manifest), CI on Windows, Linux and macOS |
 | 19 | Loader | new `target_conversion_plugin_loader.{c,h}` | reuses `target_plugin_path_check`, `…_preload_runtime_core_dll`, `…_build_discovery_roots`, `…_sanitized_preload`; enumerate / try_load per `target_input_plugin_loader.c:331-566`; Android parse takes a prefix |
 | 20 | Service wiring | `d3d11_lift.cpp` `lift_activate` (`:777-871`), `comp_d3d11_service.cpp` `svc_lift` (`:35787-35807`) | P1a: the core behind the existing lift thread, the adapter wrapping the same DP calls; P1b: file split and deletions one release later. Mailbox, export and weave paths unchanged; v3 wire byte-for-byte |
 
 ### References
 
-- [ADR-053](../../adr/ADR-053-conversion-providers.md) (Proposed) — conversion providers.
+- [ADR-053](../../adr/ADR-053-conversion-providers.md) (Accepted) — conversion providers.
 - [`conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) — `xrt_conversion_plugin.h`, `XR_DXR_lift` spec 4 / 5, the `conv_*` wire family.
 - [`plugin-discovery.md`](plugin-discovery.md) — display-processor discovery; §4 DLL contract, §5 registration lifetime, §6 version negotiation.
 - [`input-provider-discovery.md`](input-provider-discovery.md) — the second plug-in type; shape of this spec.

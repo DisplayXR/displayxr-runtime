@@ -291,12 +291,23 @@ risks and the must-verify list per phase:
 
 ## Amendments to earlier records
 
-- **ADR-042**: §1 ("a READY vendor module supersedes the open default") and the consumer
-  contract's open-default rows are superseded by decision 6; §5 (the plug-in contract) is
-  superseded by decision 1 and frozen as the legacy adapter. §2–4 (pre-weave results, the
-  asynchronous mailbox, scheduling as runtime policy) stand.
-- **ADR-049**: the lift-only connection applies to every in-process session on every graphics
-  API; its D3D12 submit-fence follow-up is resolved by the spec-4 image sync kinds; its
-  adapter-LUID follow-up is resolved by per-task export capability data.
+Recorded here so ADR-042 and ADR-049 stay readable as written; each points at the section of
+the one extension spec, [`XR_DXR_lift.md`](../specs/extensions/XR_DXR_lift.md), that now
+carries the rule.
+
+- **ADR-042** (2026-09-25). §1 ("a READY vendor module supersedes the open default") and the
+  consumer contract's open-default rows are superseded by decision 6: a non-READY task is a
+  reason to wait, never a reason to switch paths, and there is no in-app converter
+  (spec §2.4, the consumer contract). §5 (the display-processor lift slots and the lift-only
+  factory) is superseded by decision 1: the slots are frozen under display-plug-in ABI 5 and
+  reached only through the built-in `dp-lift` adapter (spec §11; discovery spec §4.5).
+  §2–4 (pre-weave results, the asynchronous latest-wins mailbox, scheduling as runtime policy)
+  and Amendment 1 (AUTO convergence is runtime policy) stand.
+- **ADR-049** (2026-10-08). The lift-only connection now applies to every in-process session on
+  every graphics API wherever a service runs; until the non-Windows transports land (P5), a task
+  reachable from no image kind of the session reports `imageKinds = 0` (spec §2.2) rather than
+  being unsupported. Its two follow-ups are resolved by spec 4: the D3D12 submit-side fence by
+  the `D3D_FENCE` image sync kind (spec §4.5), and the adapter question by per-task
+  `imageKinds` / `exportKinds` plus the provider's declared device (spec §2.2, §5.4).
 - **ADR-045**: the conversion runtime it names as a fourth independently installed component
   is now a plug-in type with its own platform state.
