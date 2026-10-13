@@ -100,6 +100,20 @@ struct conv_stream
 	struct xrt_conv_depth_info last_depth;
 	bool has_last_depth;
 
+	/* Still-image dedupe (PHOTO; dispatcher thread only): what the latest
+	 * published result was converted from. */
+	struct
+	{
+		bool valid;
+		uint64_t content_key;
+		int32_t out_slot;
+		struct conv_binding bind;
+		uint32_t outputs;
+		bool provisional;
+		struct xrt_conv_params params; //!< S3's decisions (frame id / time / flags cleared)
+		float budget, rear_cap_m;
+	} still;
+
 	struct conv_stream_stats stats;
 	uint64_t last_stats_log_ns;
 	bool dead;
@@ -225,7 +239,14 @@ struct conv_core
 	struct conv_job *jobs;
 	uint64_t next_job_id;
 
+	/* eyes_mtx (leaf): the per-DP eyes table (roadmap §5.2). */
+	struct os_mutex eyes_mtx;
 	struct conv_eyes_slot eyes[CONV_CORE_MAX_DPS];
+	uint64_t eyes_key[CONV_CORE_MAX_DPS];        //!< 0 = slot never used
+	uint64_t eyes_publish_seq[CONV_CORE_MAX_DPS]; //!< LRU order
+	uint64_t eyes_seq;
+	struct conv_eyes_slot eyes_any; //!< the most recent snapshot of any DP
+	uint64_t eyes_any_key;          //!< who wrote eyes_any
 };
 
 
@@ -285,9 +306,6 @@ conv_core_emit(struct conv_core *core, uint64_t client_id, const struct xrt_conv
 struct conv_host *
 conv_core_host(struct conv_core *core, uint32_t provider);
 
-//! Read a DP's eyes snapshot.
-bool
-conv_core_read_eyes(struct conv_core *core, int32_t dp, uint64_t now_ns, struct conv_eyes *out);
 
 
 /*

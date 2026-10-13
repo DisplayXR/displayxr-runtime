@@ -61,8 +61,17 @@ struct conv_core;
 //! Local reason: the stall watchdog abandoned an in-service provider (FAILED(hung)).
 #define CONV_REASON_HUNG (CONV_REASON_LOCAL_BASE + 0x10u)
 
-//! Display processors with an eyes snapshot slot.
+//! Display processors with an eyes snapshot slot (live at once; LRU beyond).
 #define CONV_CORE_MAX_DPS 8u
+
+/*! @name Eyes keys (roadmap §5.2). A display processor is named by an opaque,
+ *  non-zero key its publisher chooses (the service: the DP's address), so the
+ *  core never dereferences a DP and needs no index bookkeeping. @{ */
+//! No binding: read the most recent snapshot any DP published (single screen).
+#define CONV_EYES_DP_ANY 0ull
+//! Never read eyes: the nominal viewer.
+#define CONV_EYES_DP_NONE (~0ull)
+/*! @} */
 
 struct conv_core_config
 {
@@ -349,13 +358,41 @@ conv_core_job_destroy(struct conv_core *core, uint64_t job_id);
 void
 conv_core_client_gone(struct conv_core *core, uint64_t client_id);
 
-/*! A display processor's eye listener / timer: publish its snapshot. */
+/*!
+ * A display processor's eye listener / timer: publish its snapshot under
+ * @p dp_key (non-zero, not CONV_EYES_DP_NONE). One snapshot per DP: a stream
+ * bound to the DP that owns its rect reads that DP's eyes, in that DP's
+ * display space (multi-screen M6). A new key takes a free slot, else a retired
+ * one, else the least recently published one.
+ */
 void
-conv_core_eyes_publish(struct conv_core *core, uint32_t dp_index, const struct conv_eyes *eyes);
+conv_core_eyes_publish(struct conv_core *core, uint64_t dp_key, const struct conv_eyes *eyes);
 
-//! The DP went away (multi-screen M6 segment removed): its readers go stale.
+/*!
+ * The DP went away (multi-screen M6 segment removed, a client's DP
+ * destroyed): streams bound to it read stale (the nominal viewer) until they
+ * are rebound, and the "any DP" snapshot forgets it if it was the last writer.
+ */
 void
-conv_core_eyes_retire(struct conv_core *core, uint32_t dp_index);
+conv_core_eyes_retire(struct conv_core *core, uint64_t dp_key);
+
+/*!
+ * Bind stream @p stream_id to the DP that owns its rect (CONV_EYES_DP_ANY =
+ * unbound, CONV_EYES_DP_NONE = never tracked). A submit can rebind as well
+ * (conv_frame_submit::eyes_dp), which is how a rect that moves to another
+ * screen follows it.
+ */
+xrt_result_t
+conv_core_stream_bind_eyes(struct conv_core *core, uint64_t stream_id, uint64_t dp_key);
+
+/*!
+ * Read the eyes a stream bound to @p dp_key would use at @p now_ns. False
+ * (out->valid false) = stale: the nominal viewer. An unknown key (the DP never
+ * published) reads the "any DP" snapshot, the pre-M6 behaviour; a retired key
+ * reads stale. Diagnostics and tests; the dispatchers call it per conversion.
+ */
+bool
+conv_core_eyes_read(struct conv_core *core, uint64_t dp_key, uint64_t now_ns, struct conv_eyes *out);
 
 #ifdef __cplusplus
 }
