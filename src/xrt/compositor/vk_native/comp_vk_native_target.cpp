@@ -310,6 +310,7 @@ dxr_acquire_timeout_ns(void)
 // #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
 #include "comp_vk_native_present_feedback.h"
 #include "util/comp_late_weave_adapt.h"
+#include "util/comp_feedback_pace.h"
 
 struct comp_vk_native_target;
 static void
@@ -650,6 +651,18 @@ struct comp_vk_native_target
 	struct comp_lw_lead lw_lead;
 	uint32_t lw_raise_logs;
 	bool lw_grid_optin_logged;
+
+	/*!
+	 * #2068 feedback pacing (opt-in, DXR_LATE_WEAVE_LINUX_PACE=1): the
+	 * present_wait latency-1 behaviour for enable1 apps, paced on the
+	 * wp_presentation feedback the feeder already receives.
+	 */
+	struct comp_fb_pace fb_pace;
+	bool fb_pace_inited;
+	bool fb_pace_logged;
+	bool fb_pace_unavailable_logged;
+	//! The swapchain's real image count has been logged (queue depth).
+	bool swapchain_depth_logged;
 
 	/*!
 	 * #2060 / #902 desktop Linux: the VK_KHR_present_wait late-weave tier —
@@ -1071,6 +1084,17 @@ create_swapchain(struct comp_vk_native_target *target)
 		U_LOG_E("Failed to get swapchain images: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2068: the FIFO queue an unpaced producer can fill is this deep — the
+	// number the weave->scanout residual is read against. Once per target.
+	if (!target->swapchain_depth_logged) {
+		target->swapchain_depth_logged = true;
+		U_LOG_W("#2068: VK native swapchain — %u images (surface minImageCount %u, maxImageCount %u), "
+		        "FIFO, %ux%u",
+		        target->image_count, caps.minImageCount, caps.maxImageCount, target->width,
+		        target->height);
+	}
+#endif
 
 	// Create image views
 	xrt_result_t vres = create_swapchain_views(target);
@@ -2418,6 +2442,14 @@ target_log_residual(struct comp_vk_native_target *target)
 				    st.truncated ? " (percentiles over the first 2048)" : "");
 			}
 #ifdef XRT_OS_LINUX_DESKTOP
+			if (target->fb_pace_inited) {
+				uint64_t waits = 0, slips = 0, sum = 0;
+				comp_fb_pace_take_stats(&target->fb_pace, &waits, &slips, &sum);
+				U_LOG_W("#2068: feedback pacing — waits %llu, slips %llu, mean wait %.2f ms (latency %d)%s",
+				        (unsigned long long)waits, (unsigned long long)slips,
+				        waits != 0 ? (double)sum / (double)waits / 1e6 : 0.0, target->fb_pace.depth,
+				        target->fb_pace.off ? " [OFF]" : "");
+			}
 			if (target->lw_lead.base_vblanks != 0) {
 				U_LOG_W("#2068: grid late weave — desktop floor %u vblank(s) commit-to-glass; %s lead "
 				        "%.2f ms, aimed hits %llu, misses %llu%s",
@@ -2601,6 +2633,40 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
  * the repaint loop's measured period). The present_wait tier is unaffected:
  * measured at the panel rate on and off (59.2-60.0 vs 59.4-60.0).
  */
+/*!
+ * #2068 feedback pacing knobs. DXR_LATE_WEAVE_LINUX_PACE=1 opts in;
+ * DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY (1..4, default 1) mirrors
+ * DXR_LATE_WEAVE_MAX_LATENCY; DXR_LATE_WEAVE_AUTOBACKOFF=0 holds the latency.
+ */
+static bool
+dxr_late_weave_linux_pace()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_PACE");
+		v = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return v == 1;
+}
+
+static int
+dxr_late_weave_linux_pace_latency()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY");
+		v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
+	}
+	return v;
+}
+
+static bool
+dxr_late_weave_autobackoff()
+{
+	const char *e = getenv("DXR_LATE_WEAVE_AUTOBACKOFF");
+	return !(e != nullptr && e[0] == '0');
+}
+
 static bool
 dxr_late_weave_linux_grid_optin()
 {
@@ -3371,6 +3437,61 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	 */
 	target->weave_start_ns = os_monotonic_get_ns();
 
+	bool have_fb_pacing = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * #2068 FEEDBACK PACING (opt-in): before weaving frame N, wait — bounded
+	 * at 1.5 periods — until the wp_presentation feedback for commit
+	 * N-latency has arrived, i.e. that frame is on glass (or was discarded).
+	 * The present_wait latency-1 behaviour for apps whose device has no
+	 * present_wait (enable1): nothing queues in FIFO, so a commit is shown at
+	 * the compositor's next cycle instead of behind the queue. Same blocking
+	 * point as the present_wait tier (acquire, inside xrEndFrame's commit).
+	 * Where present_wait exists it stays the pacer; the grid gate stands down
+	 * for either.
+	 */
+	if (dxr_late_weave_enabled() && dxr_late_weave_linux_pace() && target_present_wait_fn(target) == nullptr) {
+		if (!comp_vk_native_present_feedback_can_pace(target->present_fb)) {
+			if (!target->fb_pace_unavailable_logged) {
+				target->fb_pace_unavailable_logged = true;
+				U_LOG_W("#902: DXR_LATE_WEAVE_LINUX_PACE=1 but this surface has no wp_presentation feedback "
+				        "(X11, or the compositor lacks it) — feedback pacing not available");
+			}
+		} else {
+			if (!target->fb_pace_inited) {
+				target->fb_pace_inited = true;
+				comp_fb_pace_init(&target->fb_pace, dxr_late_weave_linux_pace_latency(),
+				                  dxr_late_weave_autobackoff());
+			}
+			const uint64_t wait_seq = comp_fb_pace_wait_target(&target->fb_pace, target->pf_seq);
+			have_fb_pacing = !target->fb_pace.off;
+			if (wait_seq != 0) {
+				const uint64_t t0 = os_monotonic_get_ns();
+				const bool ok = comp_vk_native_present_feedback_wait(
+				    target->present_fb, wait_seq, comp_fb_pace_timeout_ns(target->vblank_grid.period_ns));
+				const uint64_t t1 = os_monotonic_get_ns();
+				const int from = target->fb_pace.depth;
+				const enum comp_fb_pace_event e = comp_fb_pace_on_wait(&target->fb_pace, ok, t1 - t0, t1);
+				if (ok && !target->fb_pace_logged) {
+					target->fb_pace_logged = true;
+					U_LOG_W("#902: pacing enable1 weaves on wp_presentation feedback (latency %d)",
+					        target->fb_pace.depth);
+				}
+				if (e == COMP_FB_PACE_DEEPER || e == COMP_FB_PACE_SHALLOWER) {
+					U_LOG_W("#902: feedback pacing latency %d -> %d (%s)", from, target->fb_pace.depth,
+					        e == COMP_FB_PACE_DEEPER ? "slip-rate escalation" : "return probe");
+				} else if (e == COMP_FB_PACE_OFF) {
+					U_LOG_W("#902: feedback pacing OFF for this session — no wp_presentation feedback "
+					        "arrived within 1.5 periods, 3 times in a row, before any did");
+					have_fb_pacing = false;
+				}
+				// The weave starts now, after the pacing wait.
+				target->weave_start_ns = os_monotonic_get_ns();
+			}
+		}
+	}
+#endif
+
 	bool grid_tier_allowed = true;
 #ifdef XRT_OS_LINUX_DESKTOP
 	// #2068: opt-in on desktop Linux, and off for the session once the learned
@@ -3385,7 +3506,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		    "on a composited desktop it cost presents (#2068). The grid is still fed.");
 	}
 #endif
-	if (dxr_late_weave_enabled() && !have_present_wait && grid_tier_allowed) {
+	if (dxr_late_weave_enabled() && !have_present_wait && !have_fb_pacing && grid_tier_allowed) {
 		const uint64_t now_ns = os_monotonic_get_ns();
 		const uint64_t next_vblank =
 		    comp_vblank_grid_next_vblank_after(&target->vblank_grid, now_ns);

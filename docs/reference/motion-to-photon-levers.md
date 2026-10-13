@@ -101,7 +101,23 @@ feeder off.
 nothing (59.2–60.0 presents/s on vs 59.4–60.0 with `DXR_LATE_WEAVE=0`, Unity). The grid tier at
 the fixed 1.5 ms margin cost a quarter of the frames (40.5–43.4 vs 52.9–56.7, native enable1
 app): a composited desktop latches client buffers *before* the vblank, so a weave aimed just
-before it is shown a refresh late. **Measured on a composited Wayland desktop (GNOME, Intel, 60 Hz, `DXR_WEAVE_CADENCE_TRACE=1`): the
+before it is shown a refresh late. **Feedback pacing (#2068, opt-in `DXR_LATE_WEAVE_LINUX_PACE=1`).** The present_wait latency-1
+behaviour for enable1 apps: before weaving frame N the compositor waits, bounded at 1.5 periods,
+until the `wp_presentation` feedback for commit N−latency has arrived (it is on glass, or was
+discarded). Rationale: same compositor, same runtime FIFO swapchain, an enable2 app paced by
+present_wait measured a 0.90-period weave→scanout residual and an unpaced enable1 app 2.5–3.1 —
+the difference reads as frames queued in FIFO, which pacing removes. `DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY`
+(1..4, default 1) mirrors `DXR_LATE_WEAVE_MAX_LATENCY`; slip rules mirror the Windows governor
+(`util/comp_feedback_pace.h`: a wait that times out is a slip, ≥ 10 slips per 120 waits escalates one
+level capped at base + 1, three clean windows plus a 30 s dwell probe back, a failed probe doubles
+the dwell up to 300 s, `DXR_LATE_WEAVE_AUTOBACKOFF=0` holds it; three slips before any success turn
+it off). Wayland only — X11 Present carries no tag of ours yet. Logs: `#902: pacing enable1 weaves
+on wp_presentation feedback (latency 1)`, and under `DXR_WEAVE_CADENCE_TRACE=1` every 5 s
+`#2068: feedback pacing — waits N, slips M, mean wait X ms (latency D)` next to the `#206` residual.
+The swapchain's real depth is logged once per target: `#2068: VK native swapchain — N images
+(surface minImageCount M, …), FIFO`.
+
+**Measured on a composited Wayland desktop (GNOME, Intel, 60 Hz, `DXR_WEAVE_CADENCE_TRACE=1`): the
 weave→scanout residual is 46.0 ms — 2.76 refresh periods** (`#206: last measured weave->scanout
 residual 46.01 ms (2.76 refresh periods, n=102)`). That is the real latency budget behind a
 desktop compositor, which composes on one refresh and scans out on a later one, and it is the

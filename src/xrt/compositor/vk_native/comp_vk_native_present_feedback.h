@@ -95,6 +95,24 @@ comp_vk_native_present_feedback_poll(struct comp_vk_native_present_feedback *pf,
                                      struct comp_vk_native_present_feedback_event *out,
                                      uint32_t max);
 
+/*!
+ * #2068 feedback pacing: can @ref comp_vk_native_present_feedback_wait block on
+ * a specific commit? Wayland only — X11 CompleteNotify carries no tag of ours.
+ */
+bool
+comp_vk_native_present_feedback_can_pace(const struct comp_vk_native_present_feedback *pf);
+
+/*!
+ * #2068 feedback pacing: block until the feedback for the request tagged
+ * @p tag (or a later one) has arrived — presented or discarded — or until
+ * @p timeout_ns passes. Arrived samples stay queued for
+ * @ref comp_vk_native_present_feedback_poll.
+ *
+ * @return true if it arrived in time.
+ */
+bool
+comp_vk_native_present_feedback_wait(struct comp_vk_native_present_feedback *pf, uint64_t tag, uint64_t timeout_ns);
+
 void
 comp_vk_native_present_feedback_destroy(struct comp_vk_native_present_feedback **pf_ptr);
 
