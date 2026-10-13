@@ -102,6 +102,18 @@ if(APPLE)
 	target_sources(aux_os PRIVATE os_macos.c)
 endif()
 
+# ADR-053 D5 (#2032): child processes, the control channel, handle transfer
+# and the wake signal of the conversion-host satellite. Windows: kernel32 /
+# advapi32 only (job object, named pipe, token query). Desktop Linux + macOS:
+# POSIX (fork/exec, socketpair + SCM_RIGHTS). Not on Android (its
+# `:conversion` service is a different mechanism).
+if(WIN32)
+	target_sources(aux_os PRIVATE os_process.h os_process_win32.c)
+	target_link_libraries(aux_os PRIVATE advapi32)
+elseif(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	target_sources(aux_os PRIVATE os_process.h os_process_posix.c)
+endif()
+
 ####
 # UVC capture backend of the vendor-neutral stereo camera source (ADR-043
 # Amendment 4, util/u_stereo_uvc.h). Its own library so the capture DLL
