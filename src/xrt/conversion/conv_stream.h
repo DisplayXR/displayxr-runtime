@@ -39,6 +39,7 @@
 #pragma once
 
 #include "xrt/xrt_conversion_plugin.h"
+#include "xrt/xrt_handles.h"
 
 #include "util/u_lift_rig.h"
 #include "util/u_lift_viewpoint.h"
@@ -205,6 +206,29 @@ struct conv_stream_options
 	bool auto_convergence;  //!< S7 runtime auto-convergence (needs a configured observer)
 	uint64_t eyes_dp;       //!< DP whose eyes snapshot to read: a conv_core_eyes_publish key, CONV_EYES_DP_ANY or _NONE
 	uint32_t source_format; //!< XRT_CONV_FMT_* the producer snapshots; 0 = RGBA8
+};
+
+/*! @name conv_input_import::kind @{ */
+#define CONV_INPUT_NT 1u   //!< a D3D11 or D3D12 shared NT texture handle (keyed mutex if it has one)
+#define CONV_INPUT_DXGI 2u //!< a legacy global DXGI shared handle (process-independent)
+#define CONV_INPUT_CPU 3u  //!< a file mapping holding the bytes (RGBA8 / BGRA8, cpu_row_pitch)
+/*! @} */
+
+/*!
+ * One spec-4 input image as the service's GPU glue imports it (#2054): the
+ * handle(s) the transport delivered plus the region to convert. The glue
+ * takes ownership of both handles whatever the outcome.
+ */
+struct conv_input_import
+{
+	uint32_t kind; //!< CONV_INPUT_*
+	xrt_graphics_buffer_handle_t handle;
+	uint32_t sync_kind; //!< XRT_CONV_SYNC_NONE / KEYED_MUTEX / FENCE_NT
+	xrt_graphics_buffer_handle_t sync_handle; //!< FENCE_NT: a shared D3D fence; else invalid
+	uint64_t sync_value;                      //!< FENCE_NT: wait for this value
+	uint32_t x, y, w, h;                      //!< the region of the image to convert
+	uint32_t cpu_row_pitch;                   //!< CPU: bytes per row of the mapping
+	bool cpu_bgra;                            //!< CPU: BGRA8 rather than RGBA8
 };
 
 #ifdef __cplusplus

@@ -90,6 +90,20 @@ struct comp_d3d11_conv_glue
 	                      uint32_t *out_format);
 	bool (*export_fence)(void *ud, uint64_t stream_id, xrt_graphics_sync_handle_t *out_handle);
 	void (*stream_gone)(void *ud, uint64_t stream_id);
+	//! Spec 4 (#2054): any input kind over a region; CPU export.
+	xrt_result_t (*import_input_ex)(void *ud,
+	                                uint64_t stream_id,
+	                                const struct conv_input_import *in,
+	                                const struct conv_submit_slot *slot);
+	bool (*export_cpu)(void *ud,
+	                   uint64_t stream_id,
+	                   bool copy,
+	                   xrt_graphics_buffer_handle_t *out_handle,
+	                   uint32_t *out_width,
+	                   uint32_t *out_height,
+	                   uint32_t *out_format,
+	                   uint64_t *out_bytes,
+	                   bool *out_realloc);
 	void *io_ud;
 
 	//! The display's nominal viewing distance, metres (the policy's straight-on viewer).

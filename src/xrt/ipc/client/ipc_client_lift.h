@@ -179,6 +179,43 @@ ipc_client_conv_acquire(struct ipc_connection *ipc_c,
 xrt_result_t
 ipc_client_conv_poll_event(struct ipc_connection *ipc_c, bool *out_has, struct xrt_conv_wire_event *out_event);
 
+struct xrt_conv_wire_image;
+
+/*!
+ * conv_submit_frame: the v3 submit (same params, viewpoints, view control,
+ * rig) of a spec-4 image @p image (kind, sync, CPU pitch) over the region
+ * (@p region_x, @p region_y, @p width x @p height). @p handle (+ @p
+ * sync_handle for a fence) are the caller's; the transport duplicates them.
+ */
+xrt_result_t
+ipc_client_conv_submit_frame(struct ipc_connection *ipc_c,
+                             uint64_t stream_id,
+                             const struct xrt_conv_wire_image *image,
+                             xrt_graphics_buffer_handle_t handle,
+                             xrt_graphics_buffer_handle_t sync_handle,
+                             uint32_t region_x,
+                             uint32_t region_y,
+                             uint32_t width,
+                             uint32_t height,
+                             int64_t source_time,
+                             const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_count,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
+                             uint64_t *out_frame_id);
+
+//! A CPU-export stream's mapping (a NEW handle, caller-owned) and its tightly packed layout.
+xrt_result_t
+ipc_client_conv_get_cpu_output(struct ipc_connection *ipc_c,
+                               uint64_t stream_id,
+                               bool *out_have,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint32_t *out_format,
+                               uint64_t *out_bytes,
+                               xrt_graphics_buffer_handle_t *out_handle);
+
 #ifdef __cplusplus
 }
 #endif

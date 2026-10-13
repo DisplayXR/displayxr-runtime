@@ -38098,6 +38098,35 @@ conv_io_stream_gone(void *ud, uint64_t stream_id)
 	d3d11_lift_glue_stream_gone((struct d3d11_lift *)ud, stream_id);
 }
 
+static xrt_result_t
+conv_io_import_input_ex(void *ud,
+                        uint64_t stream_id,
+                        const struct conv_input_import *in,
+                        const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_import_input_ex((struct d3d11_lift *)ud, stream_id, in, slot);
+}
+
+static bool
+conv_io_export_cpu(void *ud,
+                   uint64_t stream_id,
+                   bool copy,
+                   xrt_graphics_buffer_handle_t *out_handle,
+                   uint32_t *out_w,
+                   uint32_t *out_h,
+                   uint32_t *out_format,
+                   uint64_t *out_bytes,
+                   bool *out_realloc)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_cpu((struct d3d11_lift *)ud, stream_id, copy, &h, out_w, out_h, out_format,
+	                                out_bytes, out_realloc)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
+	return true;
+}
+
 extern "C" bool
 comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3d11_conv_glue *out)
 {
@@ -38117,6 +38146,8 @@ comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3
 	out->export_output = conv_io_export_output;
 	out->export_fence = conv_io_export_fence;
 	out->stream_gone = conv_io_stream_gone;
+	out->import_input_ex = conv_io_import_input_ex;
+	out->export_cpu = conv_io_export_cpu;
 	out->io_ud = l;
 	out->nominal_z_m = d3d11_service_system_from_xrt(xsysc)->base.info.nominal_viewer_z_m;
 	// The lift device (the allocator's) lives on the service device's adapter.

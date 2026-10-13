@@ -1589,5 +1589,32 @@
 			{"name": "has_event", "type": "bool"},
 			{"name": "event", "type": "struct xrt_conv_wire_event"}
 		]
+	},
+
+	"conv_submit_frame": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_submit"},
+			{"name": "image", "type": "struct xrt_conv_wire_image"},
+			{"name": "region_x", "type": "uint32_t"},
+			{"name": "region_y", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "frame_id", "type": "uint64_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"conv_get_cpu_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"},
+			{"name": "bytes", "type": "uint64_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	}
 }
