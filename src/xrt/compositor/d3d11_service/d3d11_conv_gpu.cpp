@@ -864,6 +864,54 @@ glue_free(void *ud, struct xrt_conv_image *img)
 	glue_leave(l);
 }
 
+static uint32_t
+conv_fmt_bytes(uint32_t fmt)
+{
+	switch (fmt) {
+	case XRT_CONV_FMT_R8_UNORM: return 1;
+	case XRT_CONV_FMT_R16_FLOAT:
+	case XRT_CONV_FMT_R16_UNORM: return 2;
+	case XRT_CONV_FMT_RGBA16_FLOAT: return 8;
+	default: return 4;
+	}
+}
+
+/*!
+ * #2030: a CPU-memory provider result (the sim provider, a CPU-only provider)
+ * into its GPU mirror, on the conversion dispatcher thread, so the weave path
+ * pins views instead of weaving the rect flat. One UpdateSubresource per
+ * layer (nothing bound: no shared-context state is touched) inside the
+ * mirror's keyed mutex. CPU ARRAY views hold their layers back to back.
+ */
+static bool
+glue_upload(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	d3d11_lift *l = (d3d11_lift *)ud;
+	if (src == nullptr || dst == nullptr || src->memory_kind != XRT_CONV_MEM_CPU || src->cpu_ptr == nullptr ||
+	    dst->memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE || !glue_enter(l)) {
+		return false;
+	}
+	glue_img g;
+	const uint32_t pitch = src->row_stride != 0 ? src->row_stride : src->width * conv_fmt_bytes(src->format);
+	const uint64_t layer_bytes = (uint64_t)pitch * src->height;
+	bool ok = glue_find(l, dst->import_key, &g) && g.w == src->width && g.h == src->height &&
+	          g.dxgi == conv_fmt_to_dxgi(src->format) && src->byte_size >= layer_bytes * g.layers;
+	const bool held = ok && img_acquire(g.km, dst, 4);
+	if (held) {
+		std::lock_guard<std::mutex> ctx_lock(*l->svc_ctx_mutex);
+		for (uint32_t i = 0; i < g.layers; i++) {
+			l->svc_context->UpdateSubresource(g.tex, D3D11CalcSubresource(0, i, 1), nullptr,
+			                                  (const uint8_t *)src->cpu_ptr + layer_bytes * i, pitch, 0);
+		}
+		l->svc_context->Flush();
+	}
+	if (held) {
+		img_release(g.km, dst);
+	}
+	glue_leave(l);
+	return held;
+}
+
 void
 d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out)
 {
@@ -873,6 +921,7 @@ d3d11_lift_glue_alloc_ops(struct d3d11_lift *l, struct conv_image_alloc_ops *out
 	}
 	out->alloc = glue_alloc;
 	out->free = glue_free;
+	out->upload = glue_upload;
 	out->ud = l;
 }
 
@@ -1765,6 +1814,10 @@ core_weave_submit_locked(d3d11_lift *l,
 		fr.rect_w_m = frame->width_m;
 		fr.rect_h_m = frame->height_m;
 	}
+	if (frame != nullptr && frame->eyes_dp_key != 0) {
+		fr.eyes_dp_set = true; // the DP that owns the woven rect (roadmap §5.2)
+		fr.eyes_dp = frame->eyes_dp_key;
+	}
 	fr.active[0] = (float)(cx - x) / (float)w;
 	fr.active[1] = (float)(cy - y) / (float)h;
 	fr.active[2] = (float)(cx - x + cw) / (float)w;
@@ -1801,7 +1854,8 @@ core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
 	const bool have_views = (r.written & XRT_CONV_OUT_VIEWS) != 0 && glue_find(l, r.views.import_key, &vg) &&
 	                        vg.srv != nullptr && vg.km != nullptr;
 	if (!have_views || !img_acquire(vg.km, &r.views, 4)) {
-		// No GPU views (a CPU provider's result, or a busy slot): weave it flat.
+		// No GPU views (a busy slot, or a CPU result the glue could not
+		// mirror, #2030): weave it flat.
 		conv_core_stream_release(core, core_id, r.ring_slot);
 		glue_leave(l);
 		return false;
