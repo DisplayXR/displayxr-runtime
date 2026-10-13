@@ -65,7 +65,10 @@ endif()
 # Dev-tree manifest with an absolute library_path — run scripts point
 # VK_LAYER_PATH here. (Installed builds get a relative-path manifest via the
 # packaging step instead; Windows additionally needs the ExplicitLayers
-# registry key — VK_LAYER_PATH is ignored for elevated processes.)
+# registry key — VK_LAYER_PATH is ignored for elevated processes. The Linux
+# .deb / tarball do not use install() below: scripts/package_deb_linux.sh and
+# scripts/linux/install.sh fill VkLayer_DXR_queue_lock.json.in with the
+# ABSOLUTE installed path and drop it in a vulkan/explicit_layer.d, #2036.)
 if(WIN32)
 	set(DXR_QL_LIBRARY_PATH "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_DXR_queue_lock.dll")
 else()
