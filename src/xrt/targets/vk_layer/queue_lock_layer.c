@@ -26,6 +26,18 @@
  * shared-queue tier engages only when the marker resolves (handshake, not
  * hope). Design of record: docs/roadmap/vk-late-weave-queue-serialization.md.
  *
+ * Activation route (#886). A second handshake entry point,
+ * "vkGetQueueLockActivationDXR", reports HOW the layer got into the chain, so
+ * the runtime's field log can name the route: NAMED (the layer was in the
+ * VkInstanceCreateInfo's ppEnabledLayerNames — the runtime's enable2
+ * injection, or a vulkan_enable1 app that enabled it itself), IMPLICIT (not
+ * named, and the implicit manifest's enable_environment DXR_VK_QUEUE_LOCK=1 is
+ * set), or LOADER_ENV (not named, no enable env: VK_INSTANCE_LAYERS /
+ * VK_LOADER_LAYERS_ENABLE). The Khronos loader hands layers the APP's own
+ * layer list — implicit and env-forced layers are not added to it — which is
+ * what makes the split observable from inside the layer (verified against
+ * loader 1.4.341 with both manifests installed, see #886).
+ *
  * Deliberately dependency-free: no xrt/aux includes, no link against the
  * Vulkan loader (a layer linking the loader can recurse). Plain C + one
  * OS mutex primitive.
@@ -72,6 +84,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __ANDROID__
@@ -190,6 +203,17 @@ ql_mutex_init(ql_mutex_t *m)
 #define QL_LAYER_NAME "VK_LAYER_DXR_queue_lock"
 //! Keep in sync with the runtime's handshake string (comp_vk_native_compositor.c, #902).
 #define QL_MARKER_NAME "vkGetQueueLockMarkerDXR"
+//! #886 activation-route query. Keep in sync with u_vk_queue_lock.h.
+#define QL_ACTIVATION_NAME "vkGetQueueLockActivationDXR"
+//! The implicit manifest's enable_environment (#886). Keep in sync with
+//! VkLayer_DXR_queue_lock_implicit.json.in and u_vk_queue_lock.h.
+#define QL_IMPLICIT_ENABLE_ENV "DXR_VK_QUEUE_LOCK"
+
+//! Activation routes (#886) — values are wire ABI with the runtime
+//! (u_vk_queue_lock.h, enum u_vk_ql_activation). 0 = unknown.
+#define QL_ACTIVATION_NAMED 1
+#define QL_ACTIVATION_IMPLICIT 2
+#define QL_ACTIVATION_LOADER_ENV 3
 
 #define QL_MAX_INSTANCES 8
 #define QL_MAX_DEVICES 8
@@ -213,6 +237,7 @@ struct ql_instance
 	PFN_vkGetInstanceProcAddr gipa;
 	PFN_vkDestroyInstance DestroyInstance;
 	PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
+	uint32_t activation; //!< QL_ACTIVATION_* (#886)
 };
 
 struct ql_queue
@@ -241,6 +266,8 @@ struct ql_device
 	PFN_vkQueueInsertDebugUtilsLabelEXT QueueInsertDebugUtilsLabelEXT;
 	//! #1905: when set, every queue of this device shares device_mutex.
 	bool per_device;
+	//! #886: QL_ACTIVATION_* of the instance this device was created from.
+	uint32_t activation;
 	ql_mutex_t device_mutex;
 	struct ql_queue queues[QL_MAX_QUEUES];
 };
@@ -342,6 +369,50 @@ ql_GetQueueLockMarker(void)
 	return 1;
 }
 
+/*!
+ * #886: how this layer got into @p device's chain (QL_ACTIVATION_*), 0 when
+ * the device is unknown. Same calling shape as the marker plus the device, so
+ * the runtime resolves it through vkGetDeviceProcAddr on the device it shares
+ * with the app.
+ */
+static VKAPI_ATTR uint32_t VKAPI_CALL
+ql_GetQueueLockActivation(VkDevice device)
+{
+	if (device == NULL) {
+		return 0;
+	}
+	ql_mutex_lock(&g_registry_lock);
+	struct ql_device *d = ql_device_find(ql_key(device));
+	uint32_t a = d != NULL ? d->activation : 0;
+	ql_mutex_unlock(&g_registry_lock);
+	return a;
+}
+
+/*!
+ * #886: classify the activation route from what the loader handed us. The
+ * Khronos loader passes the APP's layer list down the chain; implicit layers
+ * and layers forced by VK_INSTANCE_LAYERS / VK_LOADER_LAYERS_ENABLE are not
+ * added to it. So "named" means someone put us in ppEnabledLayerNames, and
+ * "not named" splits on the implicit manifest's enable_environment.
+ */
+static uint32_t
+ql_classify_activation(const VkInstanceCreateInfo *ci)
+{
+	for (uint32_t i = 0; ci != NULL && i < ci->enabledLayerCount; i++) {
+		if (ci->ppEnabledLayerNames != NULL && ci->ppEnabledLayerNames[i] != NULL &&
+		    strcmp(ci->ppEnabledLayerNames[i], QL_LAYER_NAME) == 0) {
+			return QL_ACTIVATION_NAMED;
+		}
+	}
+#ifndef __ANDROID__
+	const char *env = getenv(QL_IMPLICIT_ENABLE_ENV);
+	if (env != NULL && strcmp(env, "1") == 0) {
+		return QL_ACTIVATION_IMPLICIT;
+	}
+#endif
+	return QL_ACTIVATION_LOADER_ENV;
+}
+
 /*
  *
  * Instance chain.
@@ -375,6 +446,9 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 
+	// #886: classify before calling down — the create info is the app's.
+	uint32_t activation = ql_classify_activation(pCreateInfo);
+
 	// Advance the chain for the next layer down.
 	chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
 
@@ -392,6 +466,7 @@ ql_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 		inst->DestroyInstance = (PFN_vkDestroyInstance)next_gipa(*pInstance, "vkDestroyInstance");
 		inst->EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)next_gipa(
 		    *pInstance, "vkEnumerateDeviceExtensionProperties");
+		inst->activation = activation;
 	}
 	ql_mutex_unlock(&g_registry_lock);
 
@@ -461,6 +536,7 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 	ql_mutex_lock(&g_registry_lock);
 	struct ql_instance *inst = ql_instance_find(ql_key(physicalDevice));
 	VkInstance instance = inst != NULL ? inst->instance : NULL;
+	uint32_t activation = inst != NULL ? inst->activation : 0;
 	ql_mutex_unlock(&g_registry_lock);
 
 	PFN_vkCreateDevice next_create = (PFN_vkCreateDevice)next_gipa(instance, "vkCreateDevice");
@@ -485,6 +561,7 @@ ql_CreateDevice(VkPhysicalDevice physicalDevice,
 		d->device = dev;
 		d->gdpa = next_gdpa;
 		d->per_device = ql_scope_per_device();
+		d->activation = activation;
 		ql_mutex_init(&d->device_mutex);
 		d->DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(dev, "vkDestroyDevice");
 		d->GetDeviceQueue = (PFN_vkGetDeviceQueue)next_gdpa(dev, "vkGetDeviceQueue");
@@ -816,6 +893,9 @@ ql_device_intercept(struct ql_device *d, const char *pName)
 	}
 	if (strcmp(pName, QL_MARKER_NAME) == 0) {
 		return (PFN_vkVoidFunction)ql_GetQueueLockMarker;
+	}
+	if (strcmp(pName, QL_ACTIVATION_NAME) == 0) {
+		return (PFN_vkVoidFunction)ql_GetQueueLockActivation;
 	}
 	return NULL;
 }
