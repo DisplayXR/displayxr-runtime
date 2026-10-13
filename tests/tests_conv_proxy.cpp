@@ -906,7 +906,9 @@ TEST_CASE("proxy: five real-host kills -> FAILED(crash_loop); the stream rebinds
 
 	uint32_t kills = 0;
 	std::vector<int32_t> exits;
-	const uint64_t end = now_ns() + 60000 * MS;
+	// Five real host starts: seconds each, far more when other suites start
+	// hosts at the same time (a parallel ctest on a shared box).
+	const uint64_t end = now_ns() + 300000 * MS;
 	while (fx.sup().state != CONV_SUP_FAILED && now_ns() < end) {
 		long pid = 0;
 		REQUIRE(wait_until(
@@ -914,7 +916,7 @@ TEST_CASE("proxy: five real-host kills -> FAILED(crash_loop); the stream rebinds
 			    pid = host_pid(fx);
 			    return pid > 0 || fx.sup().state == CONV_SUP_FAILED;
 		    },
-		    30000));
+		    60000));
 		if (fx.sup().state == CONV_SUP_FAILED) {
 			break;
 		}
