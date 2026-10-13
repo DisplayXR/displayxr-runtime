@@ -620,26 +620,38 @@ conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, 
 	os_mutex_unlock(&core->registry_mtx);
 }
 
-void
-conv_core_set_policy(struct conv_core *core,
-                     const char *const preferred[XRT_CONV_TASK_RESERVED_FIRST],
-                     bool allow_research_only)
+bool
+conv_core_set_policy(struct conv_core *core, const char *const *preferred, bool allow_research_only)
 {
+	bool changed = false;
 	os_mutex_lock(&core->registry_mtx);
-	bool changed = core->cfg.allow_research_only != allow_research_only;
-	core->cfg.allow_research_only = allow_research_only;
 	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST; t++) {
-		const char *want = preferred != NULL && preferred[t] != NULL ? preferred[t] : "";
-		if (strncmp(core->preferred[t], want, sizeof(core->preferred[t]) - 1) != 0) {
-			memset(core->preferred[t], 0, sizeof(core->preferred[t]));
-			strncpy(core->preferred[t], want, sizeof(core->preferred[t]) - 1);
-			changed = true;
+		const char *p = preferred != NULL && preferred[t] != NULL ? preferred[t] : "";
+		if (strncmp(core->preferred[t], p, sizeof(core->preferred[t]) - 1) == 0) {
+			continue;
 		}
+		U_LOG_W("[conv] policy: PreferredProvider\\%s '%s' -> '%s'", conv_task_name(t), core->preferred[t], p);
+		memset(core->preferred[t], 0, sizeof(core->preferred[t]));
+		strncpy(core->preferred[t], p, sizeof(core->preferred[t]) - 1);
+		changed = true;
+	}
+	if (core->cfg.allow_research_only != allow_research_only) {
+		U_LOG_W("[conv] policy: AllowResearchOnly %d -> %d", (int)core->cfg.allow_research_only,
+		        (int)allow_research_only);
+		core->cfg.allow_research_only = allow_research_only;
+		changed = true;
 	}
 	if (changed) {
-		core->conv_gen++; // the selection order moved: next create re-selects
+		// The effective capability of a task may have moved: properties /
+		// status readers wake, and the new selection follows PrewarmOn.
+		core->conv_gen++;
+		core->status_gen++;
+		core->prewarm_after_describe = true;
+		emit_simple(core, XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED, 0, 0, 0, 0, -1.0f);
+		os_cond_signal(&core->ctrl_cond);
 	}
 	os_mutex_unlock(&core->registry_mtx);
+	return changed;
 }
 
 

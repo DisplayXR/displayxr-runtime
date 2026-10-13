@@ -173,16 +173,17 @@ void
 conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, bool enabled);
 
 /*!
- * Replace the selection policy the core was created with (#2051, the #2025
- * item): `PreferredProvider\<task>` per task (NULL / "" = none; copied) and
- * `AllowResearchOnly`. Applies to the NEXT stream / job create — a live
- * stream never moves (spec §3.4 rule 5). Bumps `conv_gen` when anything
- * changed, so `conv status --watch` prints a line.
+ * Replace the selection policy the core was created with (#2051 / #2029, the
+ * #2025 item): `PreferredProvider\<task>` per task and `AllowResearchOnly`.
+ * @p preferred has XRT_CONV_TASK_RESERVED_FIRST entries (NULL / "" = none;
+ * copied); NULL = no preference at all. Applies to the NEXT selection (create,
+ * prewarm, properties) — a live stream never moves (spec §3.4 rule 5). A
+ * change bumps conv_gen + status_gen (so `conv status --watch` prints a line),
+ * emits PROVIDERS_CHANGED and re-applies PrewarmOn. Returns whether anything
+ * changed.
  */
-void
-conv_core_set_policy(struct conv_core *core,
-                     const char *const preferred[XRT_CONV_TASK_RESERVED_FIRST],
-                     bool allow_research_only);
+bool
+conv_core_set_policy(struct conv_core *core, const char *const *preferred, bool allow_research_only);
 
 
 /*

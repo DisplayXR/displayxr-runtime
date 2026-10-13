@@ -109,6 +109,21 @@ const char *
 target_conv_kill_switch(void);
 
 /*!
+ * #2029: apply @p policy's per-user `Enabled` override (HKCU, ignored under
+ * `Policy\Lock`) to an enumerated @p e. Override 0: not enabled, and a
+ * NOT_LOADED entry becomes DISABLED (never loaded); override 1: enabled, and a
+ * DISABLED (HKLM `Enabled` = 0) entry becomes NOT_LOADED again. Returns the
+ * effective `enabled`. @p policy may be NULL (no override).
+ */
+bool
+target_conv_policy_apply_override(const struct target_conv_policy *policy, struct xrt_conversion_plugin_entry *e);
+
+/*! The effective `Enabled` of a provider with no registry row (the built-in
+ *  dp-lift adapter): the per-user override, else @p dflt. */
+bool
+target_conv_policy_enabled(const struct target_conv_policy *policy, const char *id, bool dflt);
+
+/*!
  * Read the effective policy (Windows registry; POSIX: zeroed). Never fails;
  * an unreadable value is "absent".
  */
