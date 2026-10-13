@@ -150,6 +150,17 @@ extern "C" {
 #define CONV_HOST_EXIT_ELEVATED 14  //!< refused to run elevated
 #define CONV_HOST_EXIT_UPDATE 20    //!< closed for update: no backoff, no crash-loop accounting
 #define CONV_HOST_EXIT_WATCHDOG 30  //!< set by the supervisor when it kills a hung host
+/*!
+ * Two host-private codes, raised before there is anyone to talk to:
+ *  - 2: bad command line. The supervisor never spawns that; the proxy maps it
+ *    to FAILED, non-retryable (respawning cannot fix an argv bug).
+ *  - 15: the inherited control channel is unusable. Ordinary crash accounting
+ *    (backoff, crash-loop cutoff).
+ * 12 (licence) is reserved and not raised in P2: an unlicensed capability is
+ * per-capability state (XRT_CONV_STATE_UNLICENSED) reported through DESCRIBE.
+ */
+#define CONV_HOST_EXIT_USAGE 2
+#define CONV_HOST_EXIT_CHANNEL 15
 /*! @} */
 
 /*! @name conv_host_wire_hello_ack::reject_reason @{ */
@@ -218,6 +229,7 @@ extern "C" {
 #define CONV_HOST_MSG_JOB_SUBMIT 0x0111u       //!< conv_host_wire_job_submit -> conv_host_wire_job_done (when done)
 #define CONV_HOST_MSG_JOB_CANCEL 0x0112u       //!< conv_host_wire_job_ref -> – (the job still replies)
 #define CONV_HOST_MSG_SHUTDOWN 0x0113u         //!< conv_host_wire_shutdown -> conv_host_wire_status, then exit 0
+#define CONV_HOST_MSG_JOB_RELEASE 0x0114u      //!< conv_host_wire_job_release -> – (no reply)
 
 
 /*
@@ -470,9 +482,16 @@ struct conv_host_wire_output_desc_reply
 
 /*!
  * REGISTER_IMAGE (S -> H): an input slot, opened once per slot lifetime.
- * Handles: [0] the image memory (absent for MEM_CPU, whose bytes live in a
- * registered shm at image.shm_offset; see LANE_OPEN), then [1] its sync
+ * Handles: [0] the image memory (absent for MEM_CPU), then [1] its sync
  * object when image.sync_kind has one. sizeof == 112.
+ *
+ * MEM_CPU convention: the bytes live in a LANE's shm section (LANE_OPEN
+ * handles[0]), image.shm_offset bytes from its start; the record carries no
+ * lane. The host resolves the offset against the shm of the lane the submit
+ * record arrives on, at convert time (bounds-checked against shm_bytes); a
+ * JOB_SUBMIT, which arrives on no lane, resolves it against the
+ * lowest-numbered open lane. So a CPU input slot is valid on every lane whose
+ * shm holds its bytes at that offset; the service lays them out accordingly.
  */
 struct conv_host_wire_register_image
 {
@@ -577,6 +596,20 @@ struct conv_host_wire_job_submit
 
 //! JOB_CANCEL. sizeof == 16.
 struct conv_host_wire_job_ref
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	uint64_t job_id;
+};
+
+/*!
+ * JOB_RELEASE (S -> H, no reply): the service is done with job @c job_id's
+ * result (it pulled the blob handle of the JOB_SUBMIT reply on Windows, or
+ * received it as SCM_RIGHTS on POSIX). The host closes its own copy of the
+ * blob section. Without it the host keeps the last few results open and
+ * closes the oldest (a fallback, not the contract). sizeof == 16.
+ */
+struct conv_host_wire_job_release
 {
 	uint32_t struct_size;
 	uint32_t family_version;
@@ -690,6 +723,12 @@ struct conv_host_wire_submit_record
  * Completion ring record (H -> S). A completion says only that the host ISSUED
  * the signal of out_fence_value on out_sync_idx; the service observes the
  * fence from the CPU before it consumes any out image (§3.5 fence rule).
+ *
+ * Ordering: the host has ONE output fence. Values are reserved in submit order
+ * per host, but with several stream lanes converting at once a later value can
+ * be signalled before an earlier one, so "fence >= v" does not imply every
+ * earlier completion is done. Correct for P2's one stream lane per host; a
+ * multi-lane host needs a fence per lane (or per-lane value ranges).
  * sizeof == 320.
  */
 struct conv_host_wire_complete_record
@@ -1036,6 +1075,8 @@ XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_lane_open) == 56, "lane open si
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_submit) == 280, "job submit size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_submit, params) == 64, "job submit: params at 64");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_ref) == 16, "job ref size");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_release) == 16, "job release size");
+XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_release, job_id) == 8, "job release layout");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_progress) == 56, "job progress size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) == 368, "job done size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_done, depth_info) == 112, "job done: depth_info at 112");
