@@ -1431,6 +1431,10 @@ if(TARGET tests_conv_proxy)
 		tests_conv_proxy PRIVATE "CONV_PROXY_HOST=\"$<TARGET_FILE:tests_conv_proxy_host>\""
 		)
 	add_dependencies(tests_conv_proxy tests_conv_proxy_host)
+	if(WIN32)
+		# #2056: the update-flow test drives a real Restart Manager session.
+		target_link_libraries(tests_conv_proxy PRIVATE rstrtmgr)
+	endif()
 	# The real host + the sim provider, compared against the same sources in-service.
 	if(TARGET displayxr-conversion-host AND TARGET drv_sim_conversion_plugin AND TARGET sim_conversion_static)
 		target_link_libraries(tests_conv_proxy PRIVATE sim_conversion_static)

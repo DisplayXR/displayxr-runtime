@@ -14,6 +14,8 @@
  *   --fake-crash-once <file>       ... only when <file> does not exist (it is created first)
  *   --fake-hang-after <n>          stop serving converts at the n-th (the watchdog's case)
  *   --fake-exit-at-start <code>    exit with <code> before saying hello (10 = ABI reject, ...)
+ *   --fake-update-after <n>        exit(20) ("closed for update") when the n-th convert arrives
+ *   --fake-update-once <file>      ... only when <file> does not exist (it is created first)
  *
  * The capability: cap_id 4, VIEWS_MONO, stream lane, VIEWS output, CPU memory,
  * RGBA8 in; views out = 2 x w by h RGBA8 (ROW): every view is the input with
@@ -77,6 +79,8 @@ static unsigned g_describe_ms = 0;
 static unsigned g_crash_after = 0;
 static const char *g_crash_once = NULL;
 static unsigned g_hang_after = 0;
+static unsigned g_update_after = 0;
+static const char *g_update_once = NULL;
 static uint32_t g_state = XRT_CONV_STATE_INSTALLED;
 static uint64_t g_luid = 0;
 
@@ -292,6 +296,19 @@ ring_loop(void)
 						fclose(f);
 					}
 					exit(3);
+				}
+				fclose(f);
+			}
+			if (g_update_after != 0 && g_converts >= g_update_after) {
+				FILE *f = g_update_once != NULL ? fopen(g_update_once, "rb") : NULL;
+				if (f == NULL) {
+					if (g_update_once != NULL) {
+						f = fopen(g_update_once, "wb");
+						if (f != NULL) {
+							fclose(f);
+						}
+					}
+					exit(CONV_HOST_EXIT_UPDATE); // an installer closed us (Restart Manager / SIGTERM)
 				}
 				fclose(f);
 			}
@@ -531,6 +548,10 @@ main(int argc, char **argv)
 			g_crash_once = v;
 		} else if (strcmp(k, "--fake-hang-after") == 0) {
 			g_hang_after = (unsigned)strtoul(v, NULL, 10);
+		} else if (strcmp(k, "--fake-update-after") == 0) {
+			g_update_after = (unsigned)strtoul(v, NULL, 10);
+		} else if (strcmp(k, "--fake-update-once") == 0) {
+			g_update_once = v;
 		} else if (strcmp(k, "--fake-exit-at-start") == 0) {
 			return (int)strtol(v, NULL, 10);
 		}
