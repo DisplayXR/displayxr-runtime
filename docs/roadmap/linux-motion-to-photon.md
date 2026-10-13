@@ -25,7 +25,7 @@ The slot partition (#1257) and the #206 forward horizon consume the same vblank 
 dormant for the same reason. #2064 adds their Linux arm and one log line that names the live
 tiers.
 
-## Measured state on ds1-linux (2026-10-13)
+## Measured state on the reference Linux laptop (2026-10-13)
 
 Box: Intel Core Ultra 7 355 / Intel Graphics (PTL), Mesa 26.0.8 (`mesa-vulkan-drivers
 26.0.8-1ubuntu0.3`), Vulkan loader 1.4.341, Ubuntu 26.04, GNOME Shell 50.1 on Wayland. A
