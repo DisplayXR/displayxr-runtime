@@ -16,6 +16,9 @@
  *   --fake-exit-at-start <code>    exit with <code> before saying hello (10 = ABI reject, ...)
  *   --fake-update-after <n>        exit(20) ("closed for update") when the n-th convert arrives
  *   --fake-update-once <file>      ... only when <file> does not exist (it is created first)
+ *   --fake-rm-unresponsive 1       Windows: own a hidden top-level window that never pumps
+ *                                  messages (as a provider dependency may), so Restart
+ *                                  Manager can only close this process with RmForceShutdown
  *
  * The capability: cap_id 4, VIEWS_MONO, stream lane, VIEWS output, CPU memory,
  * RGBA8 in; views out = 2 x w by h RGBA8 (ROW): every view is the input with
@@ -548,6 +551,20 @@ main(int argc, char **argv)
 			g_crash_once = v;
 		} else if (strcmp(k, "--fake-hang-after") == 0) {
 			g_hang_after = (unsigned)strtoul(v, NULL, 10);
+		} else if (strcmp(k, "--fake-rm-unresponsive") == 0) {
+#ifdef _WIN32
+			// Created on the main thread, which never pumps: RM's
+			// WM_QUERYENDSESSION is never answered.
+			WNDCLASSEXW wc;
+			memset(&wc, 0, sizeof(wc));
+			wc.cbSize = sizeof(wc);
+			wc.lpfnWndProc = DefWindowProcW;
+			wc.hInstance = GetModuleHandleW(NULL);
+			wc.lpszClassName = L"DxrConvProxyTestUnresponsive";
+			(void)RegisterClassExW(&wc);
+			(void)CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"unresponsive", WS_POPUP, 0, 0, 0, 0, NULL,
+			                      NULL, wc.hInstance, NULL);
+#endif
 		} else if (strcmp(k, "--fake-update-after") == 0) {
 			g_update_after = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-update-once") == 0) {

@@ -1425,6 +1425,8 @@ if(TARGET tests_conv_proxy)
 	target_link_libraries(tests_conv_proxy_host PRIVATE aux_os aux_util displayxr::conversion_core)
 	if(NOT WIN32)
 		target_link_libraries(tests_conv_proxy_host PRIVATE xrt-pthreads)
+	else()
+		target_link_libraries(tests_conv_proxy_host PRIVATE user32)
 	endif()
 	target_link_libraries(tests_conv_proxy PRIVATE displayxr::conversion_runtime)
 	target_compile_definitions(
