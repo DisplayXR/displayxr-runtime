@@ -807,8 +807,9 @@ service_conversion_start(void)
 			}
 		}
 #endif
-		U_LOG_W("[conv] %s=0: no conversion service (kill switch, discovery spec §3.2); lift reports UNAVAILABLE",
-		        ks);
+		U_LOG_W(
+		    "[conv] %s=0: no conversion service (kill switch, discovery spec §3.2); lift reports UNAVAILABLE",
+		    ks);
 		return;
 	}
 	if (os_mutex_init(&g.mtx) != 0 || os_mutex_init(&g.alloc_mtx) != 0 || os_cond_init(&g.alloc_cond) != 0) {

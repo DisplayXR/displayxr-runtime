@@ -180,12 +180,8 @@ target_conv_status_from_registry(const struct conv_registry *reg,
  * What is bound to one task row (the service: `conv_core_row_activity`).
  * @p provider_id is the row's provider; @p composed selects the composed row.
  */
-typedef void (*target_conv_activity_fn)(void *ud,
-                                        const char *provider_id,
-                                        uint32_t cap_id,
-                                        bool composed,
-                                        uint32_t *out_streams,
-                                        uint32_t *out_jobs);
+typedef void (*target_conv_activity_fn)(
+    void *ud, const char *provider_id, uint32_t cap_id, bool composed, uint32_t *out_streams, uint32_t *out_jobs);
 
 /*!
  * #2029: fill every task row's `streams` / `jobs_queued` (service only; the

@@ -1007,10 +1007,13 @@ gate_locked(struct conv_core *core, struct conv_stream *st)
 			} else {
 				st->unsatisfied = true;
 				if (!was_unsatisfied) {
-					U_LOG_W("[conv] stream %llu: capability READY but lacks a required output (0x%x of "
-					        "0x%x): frames are dropped until the capability is refined",
-					        (unsigned long long)st->id, st->req.required_outputs & ~cap.outputs,
-					        st->req.required_outputs);
+					U_LOG_W(
+					    "[conv] stream %llu: capability READY but lacks a required output (0x%x of "
+					    "0x%x) or its %u views (max %u): frames are dropped until the capability "
+					    "is "
+					    "refined",
+					    (unsigned long long)st->id, st->req.required_outputs & ~cap.outputs,
+					    st->req.required_outputs, st->pipe.view_count, cap.max_views);
 				}
 			}
 		}

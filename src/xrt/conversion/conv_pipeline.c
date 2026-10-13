@@ -85,7 +85,11 @@ conv_pipeline_compose(const struct conv_pipeline_request *req,
 	if (conv_task_produces_views(req->task)) {
 		const uint32_t n = req->view_count == 0 ? 2u : req->view_count;
 		const uint32_t lo = composed ? 2u : (cap->min_views > 0 ? cap->min_views : 1u);
-		const uint32_t hi = composed ? XRT_CONV_MAX_VIEWS : cap->max_views;
+		// #2029: a capability that is not READY may still be describing a
+		// conservative max_views (the dp-lift adapter says 2 until its module
+		// is up): accept up to XRT_CONV_MAX_VIEWS and let the READY refine
+		// decide (conv_pipeline_refine: unsatisfied when it lacks the views).
+		const uint32_t hi = composed || !cap_ready ? XRT_CONV_MAX_VIEWS : cap->max_views;
 		if (n < lo || n > hi || n > XRT_CONV_MAX_VIEWS) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // G2: maxViews enforced at create
 		}
@@ -135,7 +139,14 @@ conv_pipeline_refine(struct conv_pipeline *p, uint32_t required_outputs, const s
 	} else {
 		p->stages &= ~CONV_STAGE_S7_OBSERVERS;
 	}
-	return (required_outputs & ~declared) == 0;
+	// #2029: a stream composed while provisional may ask for more views than
+	// the READY capability has: unsatisfied, re-tried on every gate pass.
+	bool views_ok = true;
+	if (!p->composed && conv_task_produces_views(p->task) && p->view_count != 0) {
+		const uint32_t lo = cap->min_views > 0 ? cap->min_views : 1u;
+		views_ok = p->view_count >= lo && p->view_count <= cap->max_views;
+	}
+	return (required_outputs & ~declared) == 0 && views_ok;
 }
 
 
