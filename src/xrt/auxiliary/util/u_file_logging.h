@@ -30,6 +30,20 @@ XRT_API_FUNC void
 u_file_logging_init(void);
 
 /*!
+ * Replace `<exe>` in the log file name with @p name (e.g.
+ * "conversion-host_<provider>" for DisplayXR_conversion-host_<provider>.<pid>_<ts>.log).
+ * Only before the first init; a no-op afterwards and on non-Windows platforms.
+ * Not part of the runtime DLL's exported surface: for executables that link
+ * aux statically.
+ */
+void
+u_file_logging_set_name(const char *name);
+
+//! The log file's path ("" before init, on failure, and on non-Windows platforms).
+const char *
+u_file_logging_get_path(void);
+
+/*!
  * Write a pre-formatted message to the log file.
  * Used by oxr_logger to route state tracker logs to the file.
  * Safe to call before init or after shutdown (will be a no-op).
