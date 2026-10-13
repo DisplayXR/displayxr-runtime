@@ -301,6 +301,13 @@ respawned; **Auto** waits for the hotkey). In-process OpenXR apps load the plug-
 dependencies — themselves, so `RmGetList` lists them too and they are closed by their own
 window handling.
 
+**Conversion providers hosted in the satellite** (ADR-053) are not in the service at all:
+`RmGetList` on their files lists `displayxr-conversion-host.exe` instead, which exits 20 on the
+close request while the service keeps every session (the provider's tasks report
+WARMING(`updating`) until the host respawns). The service is listed for a vendor's conversion
+module only while the display plug-in's legacy lift slots (`dp-lift`) have it loaded — then the
+sequence above applies. Contract: `conversion-provider-discovery.md` §3.8.
+
 **Installers that do not use Restart Manager** terminate `displayxr-service.exe`
 (`taskkill /F /IM displayxr-service.exe`; without `/F` it closes cleanly only while no vendor
 window sits above the session-end window, so it is not reliable), replace the
