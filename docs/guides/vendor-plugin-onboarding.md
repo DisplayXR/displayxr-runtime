@@ -630,7 +630,7 @@ This replaces per-vendor environment knobs and ad-hoc registry keys. Read settin
 | GPU / OS / driver unusable | `INCOMPATIBLE` (or `FAILED` + `FAIL_PLATFORM` when discovered at warm) | |
 | licence missing or refused | `UNLICENSED` (or `FAILED` + `FAIL_LICENCE`) | |
 | not enough memory | `FAILED` + `FAIL_RESOURCES` | |
-| device lost during a convert | return a device-lost result | the runtime marks it `FAILED(DEVICE_LOST, retryable)` and re-warms; never retry silently inside a convert |
+| device lost during a convert | `FAILED` + `FAIL_DEVICE_LOST`, `retryable` set, and return an error from the convert | the runtime reads your state after the failed call, reports `FAILED(DEVICE_LOST)` and re-warms on its backoff; never retry silently inside a convert |
 
 Set `retryable` when a later `warm` may succeed. Version-gate extended entry points (an optional feature of a newer runtime, for example) inside the provider: declare the capability only when the loaded runtime has them, and bump `get_generation` if that changes.
 
