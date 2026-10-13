@@ -346,9 +346,14 @@ with a controller installed, so the chord lives in the extension instead:
   combo (`Configure`), and the reply's `pending = true` makes it spawn the controller. The
   controller is an IPC client, so the service stays up while it runs and idle-exits 30 s
   after it closes.
-- *Extension restarted* (lock screen, shell restart) — it reloads the cached combo from
+- *Extension restarted* (shell restart, re-enable; the lock screen too before extension
+  version 14) — it reloads the cached combo from
   `$XDG_STATE_HOME/displayxr/workspace-hotkey.json`; a running service sees the bus name
   re-appear and pushes again.
+- *Screen locked* (extension version 14+, #2071) — the extension stays enabled, so the bus
+  name and the client's registration survive the lock, but the **grab is released** while
+  locked (a press is never acted on there, and the bootstrap waits for the unlock) and
+  re-taken on unlock. Nothing for the service to do.
 
 - *Controller just installed, service never ran* (bootstrap) — 5 s after it is enabled,
   and 2 s after any change in a manifest root it watches (inotify on the roots that exist),
