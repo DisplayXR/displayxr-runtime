@@ -83,6 +83,27 @@ d3d11_conv_viewsyn_render(struct d3d11_conv_viewsyn *vs,
                           const struct u_conv_viewsyn_params *params,
                           const struct d3d11_conv_viewsyn_target *target);
 
+/*!
+ * #2030: record the same render on @p deferred (a DEFERRED context of the
+ * stage's device) and hand back its command list. The caller replays it with
+ * ExecuteCommandList(list, TRUE) on its immediate context, so the synthesis
+ * never sees, and never leaves behind, any state of a context it shares: the
+ * list starts from the default state (FinishCommandList(FALSE) resets the
+ * deferred context after every recording) and the immediate context's state
+ * is restored around the replay. The deferred context is reset even on
+ * failure. The stage's cached passes 1-6 assume the list is replayed: drop it
+ * only by destroying the stage.
+ * @return false (and *out_list nullptr) when @p deferred is not deferred or
+ *         the render failed.
+ */
+bool
+d3d11_conv_viewsyn_record(struct d3d11_conv_viewsyn *vs,
+                          ID3D11DeviceContext *deferred,
+                          const struct d3d11_conv_viewsyn_inputs *in,
+                          const struct u_conv_viewsyn_params *params,
+                          const struct d3d11_conv_viewsyn_target *target,
+                          ID3D11CommandList **out_list);
+
 /*! Diagnostics: how many times passes 1-6 ran (live-dibr.js `stats.upsamples`). */
 uint64_t
 d3d11_conv_viewsyn_prepass_count(const struct d3d11_conv_viewsyn *vs);

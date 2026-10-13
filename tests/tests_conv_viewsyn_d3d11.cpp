@@ -148,7 +148,11 @@ struct Px
 
 //! Render and read back every view (slice or column block) into views[i][y*kW + x].
 bool
-render(Fixture &f, const u_conv_viewsyn_params &p, uint32_t layout, std::vector<std::vector<Px>> &views)
+render(Fixture &f,
+       const u_conv_viewsyn_params &p,
+       uint32_t layout,
+       std::vector<std::vector<Px>> &views,
+       bool deferred = false)
 {
 	const uint32_t n = p.view_count;
 	D3D11_TEXTURE2D_DESC td = {};
@@ -180,7 +184,22 @@ render(Fixture &f, const u_conv_viewsyn_params &p, uint32_t layout, std::vector<
 
 	d3d11_conv_viewsyn_inputs in = {f.color_srv, kW, kH, f.depth_srv, kDW, kDH, true};
 	d3d11_conv_viewsyn_target t = {rt, DXGI_FORMAT_UNKNOWN, layout};
-	bool ok = d3d11_conv_viewsyn_render(f.vs, f.ctx, &in, &p, &t);
+	bool ok;
+	if (deferred) {
+		// #2030: recorded on a deferred context, replayed on the immediate
+		// one with its state restored (the service glue's path).
+		ID3D11DeviceContext *dc = nullptr;
+		ID3D11CommandList *list = nullptr;
+		ok = SUCCEEDED(f.dev->CreateDeferredContext(0, &dc)) &&
+		     d3d11_conv_viewsyn_record(f.vs, dc, &in, &p, &t, &list);
+		if (ok) {
+			f.ctx->ExecuteCommandList(list, TRUE);
+		}
+		rel(list);
+		rel(dc);
+	} else {
+		ok = d3d11_conv_viewsyn_render(f.vs, f.ctx, &in, &p, &t);
+	}
 
 	td.Usage = D3D11_USAGE_STAGING;
 	td.BindFlags = 0;
@@ -371,4 +390,60 @@ TEST_CASE("viewsyn d3d11: a view at the source camera is the identity", "[conv_v
 	}
 	INFO("max |err| " << max_err * 255.0 << " /255");
 	CHECK(max_err * 255.0 < 1.0);
+}
+
+TEST_CASE("viewsyn d3d11: recorded on a deferred context, the shared context's state survives", "[conv_viewsyn][d3d11]")
+{
+	// #2030: the service glue records S5 on its own deferred context and
+	// replays it on the shared immediate context. The views must equal the
+	// immediate-context render, and whatever another thread had bound on the
+	// shared context (here a viewport and a pixel-shader constant buffer, the
+	// #1606 white-flash class) must still be bound after the replay.
+	Fixture f;
+	if (!make_fixture(f)) {
+		SKIP("no D3D11 device (WARP or hardware) available, or the stage failed to init");
+	}
+	u_conv_viewsyn_params p = make_params({-0.0315, 0.0315});
+	std::vector<std::vector<Px>> imm, def;
+	REQUIRE(render(f, p, XRT_CONV_VIEWS_ROW, imm));
+
+	D3D11_BUFFER_DESC bd = {};
+	bd.ByteWidth = 16;
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	ID3D11Buffer *other_cb = nullptr;
+	REQUIRE(SUCCEEDED(f.dev->CreateBuffer(&bd, nullptr, &other_cb)));
+	f.ctx->PSSetConstantBuffers(2, 1, &other_cb);
+	D3D11_VIEWPORT other_vp = {3.0f, 4.0f, 50.0f, 60.0f, 0.0f, 1.0f};
+	f.ctx->RSSetViewports(1, &other_vp);
+
+	REQUIRE(render(f, p, XRT_CONV_VIEWS_ROW, def, true));
+	check_views(p, def);
+	REQUIRE(def.size() == imm.size());
+	uint32_t diffs = 0;
+	for (size_t i = 0; i < imm.size(); i++) {
+		for (size_t k = 0; k < imm[i].size(); k++) {
+			diffs += std::memcmp(imm[i][k].raw, def[i][k].raw, sizeof(imm[i][k].raw)) != 0 ? 1u : 0u;
+		}
+	}
+	CHECK(diffs == 0u);
+
+	ID3D11Buffer *bound = nullptr;
+	f.ctx->PSGetConstantBuffers(2, 1, &bound);
+	CHECK(bound == other_cb);
+	rel(bound);
+	UINT n = 1;
+	D3D11_VIEWPORT vp = {};
+	f.ctx->RSGetViewports(&n, &vp);
+	CHECK(n == 1u);
+	CHECK(vp.TopLeftX == 3.0f);
+	CHECK(vp.Width == 50.0f);
+	rel(other_cb);
+
+	// Not a deferred context: refused, nothing handed back.
+	ID3D11CommandList *list = nullptr;
+	d3d11_conv_viewsyn_inputs in = {f.color_srv, kW, kH, f.depth_srv, kDW, kDH, true};
+	d3d11_conv_viewsyn_target t = {nullptr, DXGI_FORMAT_UNKNOWN, XRT_CONV_VIEWS_ROW};
+	CHECK_FALSE(d3d11_conv_viewsyn_record(f.vs, f.ctx, &in, &p, &t, &list));
+	CHECK(list == nullptr);
 }
