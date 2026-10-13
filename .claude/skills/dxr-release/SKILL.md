@@ -107,8 +107,10 @@ Four consequences for this skill:
   `build-box*.yml` run against the tagged commit, and the build lanes take their source
   as a `patch_ref` **input** — so a build dispatched `--ref main` with
   `patch_ref=<something else>` does **not** match, on purpose. The release procedure is
-  therefore: dispatch BOTH lanes with `--ref` at the commit you are about to tag, let
-  them finish, then tag. Proven on `preview-0.1.26`: both lanes dispatched at
+  therefore: dispatch EVERY lane the release should carry (Windows + Android, and Linux for
+  the `.deb` — the publish only attaches one if a Linux build ran at the tagged commit) with
+  `--ref` at the commit you are about to tag, let them finish, then tag. (v1.7.2 did all three
+  this way: `android=headsha windows=headsha`, Linux matched too, no fallback.) Proven on `preview-0.1.26`: both lanes dispatched at
   `60382687b3ab`, the tag run then resolved `android=headsha windows=headsha` with no
   fallback and no manual dispatch. Skip that ordering and you get the `preview-0.1.25`
   outcome — the tag run fails at *Resolve the build runs for this commit* and you publish
