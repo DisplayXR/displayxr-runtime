@@ -487,6 +487,15 @@ per-process `GPU Process Memory \ Dedicated Usage` counter grows at ≈ 550–67
 stream on both builds while the card's real usage stays flat — a counter artefact or an accounting
 leak in the lift bridge, to be chased separately.
 
+**Satellite hop, headless half (P2, 2026-10-13, win box, sim provider at 0 ms, CPU lane, 200 single
+submits, `tests_conv_proxy [hopcost]`).** The core's own submit → result time: in-host p50 0.04–0.08 ms,
+p99 0.13–0.17 ms; in-service p50 0.02–0.05 ms, p99 0.07–0.13 ms; the hop adds ≈ 0.02–0.04 ms at p50
+(three runs), inside the ≈ 0.05 ms CPU estimate above. Not in these numbers: the NT-handle open (once per
+output set), the CPU fence observe and the copy into the ring target on the D3D11 lane, and the
+weave-on-scanout split; those, and the end-to-end number against the in-process ≈ 22 ms, are the panel
+measurement still owed before P3. Recovery is the larger cost: a killed host was serving again after
+6.5–15.5 s (four runs) on this box, dominated by the host's start (the sim provider's probe alone took 3.5 s).
+
 ### 3.8 Failure domains
 
 | Fault in… | In-service (legacy adapter, escape hatch) | Satellite |
@@ -1102,8 +1111,14 @@ into separate DLLs where one worker cannot run both lanes.
 
 ### 11.2 Must verify before coding
 
-- [ ] WARP shared NT-handle textures + shared fences in CI
-- [ ] a shared NT-handle texture opened on the wrong adapter on the hybrid box fails loudly (not a silent drop)
+- [x] WARP shared NT-handle textures + shared fences in CI — WARP has both, in-process
+      (`tests_conv_host_lane_d3d11`) and across a process boundary with handles pulled by
+      `DuplicateHandle` (`tests_conv_d3d11_xproc`); the real host's NT-handle lane runs on WARP's
+      LUID under the debug layer on both sides (`tests_conv_host_satellite`). Nothing in P2 needs
+      a hardware-only list; those tests SKIP only where WARP itself is missing
+- [x] a shared NT-handle texture opened on the wrong adapter on the hybrid box fails loudly (not a silent drop) —
+      every pair of the win box's iGPU, dGPU and WARP: `OpenSharedResource1` and `OpenSharedFence` both
+      return `E_INVALIDARG` (`tests_conv_d3d11_xproc`, `DXR_TEST_D3D11_HW=1`, 2026-10-13)
 - [ ] the browser uninstaller's `RMDir /r blobs` and which browser versions in the field still run it
 - [ ] the store's effective ACL on an installed box (inherited `%ProgramData%` default vs anything the browser installer set)
 - [ ] the vendor lift factory without probe (stays in-service, so only for the adapter's static describe)
@@ -1120,7 +1135,12 @@ into separate DLLs where one worker cannot run both lanes.
       `<= XRT_MAX_IPC_HANDLES` (`tests_ipc_lift_core`), DIAG provider / task rows fit the reply with
       headroom (`tests_conv_snapshot`)
 - [ ] the browser GPU process's integrity level / AppContainer status
-- [ ] measured behaviour of a queue wait on a fence whose signaller died
+- [x] measured behaviour of a queue wait on a fence whose signaller died (`tests_conv_d3d11_xproc`, win box
+      2026-10-13, WARP / Intel iGPU / NVIDIA dGPU): Windows advances the fence to `UINT64_MAX` within ~2 ms of
+      the kill in every process holding it and fires every `SetEventOnCompletion`; no device removal. A CPU
+      observe therefore *returns "reached"*, so the lane treats `UINT64_MAX` as a lost host, never a finished
+      frame. The GPU queue behind a `Wait` is released at once on WARP and the iGPU but stays stalled ~3.8 s
+      on the dGPU (4 runs, 3.78–3.82 s): ≈ 230 frames at 60 Hz on a compositor context — the fence rule
 - [ ] whether the open provider's inference runtime can write into an externally allocated resource
 - [ ] the model-store write protocol run by the host under the ACL
 - [x] exit code 13 and type values 340–369 still free at merge — `CLI_SELFTEST_BAD_CONVERSION = 13` is
