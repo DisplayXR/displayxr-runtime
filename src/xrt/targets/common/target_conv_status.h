@@ -92,8 +92,21 @@ struct target_conv_status
 	bool dp_lift_declared;
 	char dp_lift_note[160];
 
+	//! #2029: the Â§3.2 kill switch that emptied this pass ("DXR_CONV" /
+	//! "DXR_LIFT"; "" = none). Set only by target_conv_status_build_headless.
+	char kill_switch[16];
+
 	struct target_conv_policy policy; //!< what selection ran with
 };
+
+/*!
+ * Discovery spec Â§3.2 (#2029): `DXR_CONV=0` -- no conversion service at all --
+ * or its alias `DXR_LIFT=0`, in THIS process's environment (the service reads
+ * its own; a variable set on a client never reaches it). Returns the name of
+ * the variable that engaged it ("DXR_CONV" wins when both are set), or NULL.
+ */
+const char *
+target_conv_kill_switch(void);
 
 /*!
  * Read the effective policy (Windows registry; POSIX: zeroed). Never fails;
@@ -114,7 +127,9 @@ target_conv_policy_enabled_override(const struct target_conv_policy *policy, con
 /*!
  * The headless pass over the registered providers
  * (@ref target_conversion_plugin_enumerate) plus the static dp-lift row of
- * @p active_dp (may be NULL: no dp-lift row). Reads the policy itself.
+ * @p active_dp (may be NULL: no dp-lift row). Reads the policy itself. With
+ * the kill switch engaged (@ref target_conv_kill_switch) it enumerates and
+ * loads nothing: zero rows, @ref target_conv_status::kill_switch set.
  * Every negotiated binary is probed, described, destroyed and unloaded again.
  */
 void

@@ -354,6 +354,7 @@ struct cli_query_result
 	uint32_t conv_bad_descriptors;
 	uint32_t conv_task_count;
 	bool conv_dp_lift_declared;
+	char conv_kill_switch[16]; //!< #2029: "DXR_CONV" / "DXR_LIFT" when that switch emptied the pass
 	char conv_note[256];
 	struct xrt_status_conv_provider conv_providers[XRT_STATUS_MAX_CONV_PROVIDERS];
 
