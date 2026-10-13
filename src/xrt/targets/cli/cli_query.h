@@ -522,8 +522,10 @@ struct cli_query_result
 
 	/*!
 	 * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` reachable by the Vulkan
-	 * loader? INFORMATIONAL ONLY, and Windows-only (`vk_layer_probed` stays
-	 * false elsewhere).
+	 * loader? INFORMATIONAL ONLY. Probed on Windows (the ExplicitLayers
+	 * registry key) and desktop Linux (the loader's explicit_layer.d search
+	 * path, #2036); `vk_layer_probed` stays false elsewhere. On Linux
+	 * "registered" means a manifest was found and `enabled` is always true.
 	 *
 	 * The layer is what lets the #868 late-weave repaint share the app's
 	 * VkQueue on a GPU whose graphics family exposes a single queue. Without

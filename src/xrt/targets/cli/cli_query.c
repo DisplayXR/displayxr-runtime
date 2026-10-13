@@ -1422,6 +1422,162 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
 }
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2036 — the desktop-Linux twin of the Windows probe above: is a
+ * `VkLayer_DXR_queue_lock.json` manifest on the Vulkan loader's explicit-layer
+ * search path, and does its `library_path` resolve to a file that exists?
+ *
+ * Same contract as the Windows one: answered from the FILES, never by loading
+ * libvulkan (this tool needs no GPU), INFORMATIONAL ONLY, and every exit path
+ * writes `vk_layer_note`. It reimplements the loader's directory list
+ * (docs: LoaderLayerInterface.md, "Linux Layer Discovery"):
+ *
+ *   VK_LAYER_PATH set   -> ONLY those directories (it REPLACES the defaults)
+ *   otherwise           -> VK_ADD_LAYER_PATH, then <dir>/vulkan/explicit_layer.d
+ *                          for $XDG_CONFIG_HOME (~/.config), $XDG_CONFIG_DIRS
+ *                          (/etc/xdg), /etc, $XDG_DATA_HOME (~/.local/share),
+ *                          $XDG_DATA_DIRS (/usr/local/share:/usr/share)
+ *
+ * The .deb ships the manifest in /usr/share/vulkan/explicit_layer.d with an
+ * ABSOLUTE library_path; the tarball's install.sh writes one into
+ * $XDG_DATA_HOME (or /usr/local/share for --system). A library_path with a
+ * '/' that is not absolute is joined to the manifest's directory, as the
+ * loader does; a bare name goes to dlopen()'s own search and is reported as
+ * unverified rather than guessed at.
+ */
+static bool
+vk_layer_try_dir(struct cli_query_result *r, const char *dir, size_t dir_len, const char *suffix)
+{
+	if (dir_len == 0) {
+		return false;
+	}
+	char path[512];
+	int n = snprintf(path, sizeof(path), "%.*s%s/VkLayer_DXR_queue_lock.json", (int)dir_len, dir, suffix);
+	if (n <= 0 || (size_t)n >= sizeof(path)) {
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	fclose(f);
+	snprintf(r->vk_layer_manifest, sizeof(r->vk_layer_manifest), "%s", path);
+	return true;
+}
+
+//! Walk a ':'-separated list (or @p fallback when @p list is unset/empty).
+static bool
+vk_layer_try_list(struct cli_query_result *r, const char *list, const char *fallback, const char *suffix)
+{
+	const char *p = (list != NULL && list[0] != '\0') ? list : fallback;
+	while (p != NULL && *p != '\0') {
+		const char *colon = strchr(p, ':');
+		size_t len = colon != NULL ? (size_t)(colon - p) : strlen(p);
+		if (vk_layer_try_dir(r, p, len, suffix)) {
+			return true;
+		}
+		p = colon != NULL ? colon + 1 : NULL;
+	}
+	return false;
+}
+
+static void
+probe_vk_queue_lock_layer(struct cli_query_result *r)
+{
+	r->vk_layer_probed = true;
+
+	static const char *k_sub = "/vulkan/explicit_layer.d";
+	const char *home = getenv("HOME");
+	char home_config[512] = "";
+	char home_data[512] = "";
+	if (home != NULL && home[0] != '\0') {
+		snprintf(home_config, sizeof(home_config), "%s/.config", home);
+		snprintf(home_data, sizeof(home_data), "%s/.local/share", home);
+	}
+
+	const char *layer_path = getenv("VK_LAYER_PATH");
+	bool found = false;
+	if (layer_path != NULL && layer_path[0] != '\0') {
+		found = vk_layer_try_list(r, layer_path, NULL, "");
+	} else {
+		found = vk_layer_try_list(r, getenv("VK_ADD_LAYER_PATH"), NULL, "") ||
+		        vk_layer_try_list(r, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
+		        vk_layer_try_list(r, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
+		        vk_layer_try_list(r, NULL, "/etc", k_sub) ||
+		        vk_layer_try_list(r, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
+		        vk_layer_try_list(r, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
+	}
+	if (!found) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "NOT found: no VkLayer_DXR_queue_lock.json on the Vulkan loader's explicit-layer path%s "
+		         "(#868 repaint unavailable on a single-graphics-queue GPU)",
+		         (layer_path != NULL && layer_path[0] != '\0') ? " (VK_LAYER_PATH replaces the defaults)" : "");
+		return;
+	}
+	r->vk_layer_registered = true;
+	r->vk_layer_enabled = true; // no per-manifest disable flag on Linux
+
+	FILE *f = fopen(r->vk_layer_manifest, "rb");
+	if (f == NULL) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "manifest vanished while reading: %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+	char json[4096];
+	size_t got = fread(json, 1, sizeof(json) - 1, f);
+	fclose(f);
+	json[got] = '\0';
+
+	cJSON *root = cJSON_Parse(json);
+	cJSON *layer = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, "layer") : NULL;
+	cJSON *name = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "name") : NULL;
+	cJSON *lib = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "library_path") : NULL;
+	if (!cJSON_IsString(name) || strcmp(name->valuestring, "VK_LAYER_DXR_queue_lock") != 0 ||
+	    !cJSON_IsString(lib) || lib->valuestring == NULL || lib->valuestring[0] == '\0') {
+		cJSON_Delete(root);
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "manifest does not parse as VK_LAYER_DXR_queue_lock with a library_path: %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+	r->vk_layer_manifest_ok = true;
+	snprintf(r->vk_layer_library, sizeof(r->vk_layer_library), "%s", lib->valuestring);
+	cJSON_Delete(root);
+
+	const char *p = r->vk_layer_library;
+	char resolved[1024];
+	if (p[0] == '/') {
+		snprintf(resolved, sizeof(resolved), "%s", p);
+	} else if (strchr(p, '/') != NULL) {
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", r->vk_layer_manifest);
+		char *slash = strrchr(dir, '/');
+		if (slash != NULL) {
+			*slash = '\0';
+		}
+		const char *rel = (p[0] == '.' && p[1] == '/') ? p + 2 : p;
+		snprintf(resolved, sizeof(resolved), "%s/%s", dir, rel);
+	} else {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "found, but library_path '%s' is a bare name left to dlopen()'s search — not verified (%s)", p,
+		         r->vk_layer_manifest);
+		return;
+	}
+	FILE *so = fopen(resolved, "rb");
+	if (so == NULL) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "manifest found but the layer library is MISSING: %s", resolved);
+		return;
+	}
+	fclose(so);
+	r->vk_layer_library_ok = true;
+
+	// Not phrased as "repaint is on" — see the Windows probe.
+	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "VK_LAYER_DXR_queue_lock reachable (%s)", resolved);
+}
+#endif
+
 /*!
  * ADR-045: snapshot every registered plug-in's load outcome + platform state.
  * Registered entries come from the discovery root (so a plug-in the loader
@@ -1871,11 +2027,11 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	// #1234 / #902 — can the Vulkan loader still reach the queue-lock layer?
 	// Pure reporting: never touches result_code. See the field comment in
 	// cli_query.h for why this must not be fatal.
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 	probe_vk_queue_lock_layer(r);
 #else
 	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
-	         "not probed: the queue-lock layer is a Windows-only registration (OK)");
+	         "not probed: the queue-lock layer is registered only on Windows and desktop Linux (OK)");
 #endif
 
 	// ADR-034 / #823 — a registered, non-overridden input provider whose
