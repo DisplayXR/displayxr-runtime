@@ -341,10 +341,12 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
 
     def _names_before_spec4(self):
         """Command names up to the spec-4 conv_* family (#2054), which is
-        appended after conv_hint_interest; the older end-relative pins read
+        appended LAST (after conv_hint_interest, the two cursor calls, #2051's reselect
+        and #2029's DIAG conv_warm); the older end-relative pins read
         against this prefix."""
         names = [c.name for c in self.p.calls]
-        return names[:names.index("conv_hint_interest") + 1]
+        self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
+        return names[:-len(SPEC4_CONV_CALLS)]
 
     def test_spec4_conv_family_is_appended(self):
         # XR_DXR_lift spec 4 (#2054): the conv_* family rides at the END,
@@ -352,8 +354,8 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # value and wire form. No handles: spec-4 streams use the v3
         # submit / export calls.
         names = [c.name for c in self.p.calls]
-        i = names.index("conv_hint_interest")
-        self.assertEqual(names[i + 1:], SPEC4_CONV_CALLS)
+        self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
+        self.assertLess(names.index("conv_hint_interest"), names.index(SPEC4_CONV_CALLS[0]))
         for name in SPEC4_CONV_CALLS:
             call = self._call(name)
             self.assertFalse(call.in_handles or call.out_handles or call.varlen, name)
@@ -391,7 +393,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # drawn cursor request crosses as its own call APPENDED at the end, and
         # only on a frame that armed it - a client that never asks sends nothing.
         # The reply is the service's answer to the PREVIOUS request (#1952).
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-4], "compositor_set_cursor_draw_request")  # Amendment 3's call follows it
         call = self._call("compositor_set_cursor_draw_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
@@ -408,7 +410,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         # end, only on a frame whose locate armed it - a client that never
         # asks sends nothing. The reply is the service's newest finished
         # measurement (one to three frames old).
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_spec4()
         self.assertEqual(names[-3], "compositor_set_cursor_measure_request")
         call = self._call("compositor_set_cursor_measure_request")
         self.assertEqual([(a.name, a.typename) for a in call.in_args],
