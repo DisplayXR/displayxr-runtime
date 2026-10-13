@@ -250,3 +250,53 @@ TEST_CASE("d3d11 lane: a host output is consumed only after its fence is observe
 	CloseHandle(fence_h);
 	rel(fence);
 }
+
+
+TEST_CASE("d3d11 lane: a mismatched adapter is refused loudly", "[conv_host_lane]")
+{
+	// No adapter has this LUID: no lane (the satellite stays on the CPU lane).
+	conv_host_proxy_gpu_ops ops{};
+	CHECK_FALSE(d3d11_conv_host_lane_create(0x7FFFFFFF00000001ull, &ops));
+
+	// A lane on WARP cannot open a texture that lives on a hardware adapter.
+	IDXGIAdapter1 *warp = warp_adapter();
+	if (warp == nullptr) {
+		SKIP("no WARP adapter");
+	}
+	const uint64_t warp_luid = luid_of(warp);
+	warp->Release();
+	IDXGIFactory1 *f = nullptr;
+	REQUIRE(SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&f)));
+	IDXGIAdapter1 *hw = nullptr, *a = nullptr;
+	for (UINT i = 0; hw == nullptr && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+		DXGI_ADAPTER_DESC1 d;
+		a->GetDesc1(&d);
+		if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+			hw = a;
+		} else {
+			a->Release();
+		}
+	}
+	f->Release();
+	if (hw == nullptr) {
+		SKIP("no hardware adapter to mismatch against");
+	}
+	Dev other;
+	const bool ok = other.create(hw);
+	hw->Release();
+	if (!ok) {
+		SKIP("no D3D11.4 device on the hardware adapter");
+	}
+	const std::vector<uint32_t> px(4 * 4, 0xFFFFFFFFu);
+	Shared tex;
+	REQUIRE(tex.create(other.dev, 4, 4, px));
+	REQUIRE(d3d11_conv_host_lane_create(warp_luid, &ops));
+	HANDLE dup = nullptr;
+	REQUIRE(DuplicateHandle(GetCurrentProcess(), tex.handle, GetCurrentProcess(), &dup, 0, FALSE,
+	                        DUPLICATE_SAME_ACCESS));
+	xrt_conv_image desc{};
+	desc.memory_kind = XRT_CONV_MEM_WIN32_NT_HANDLE;
+	void *ctx = nullptr;
+	CHECK_FALSE(ops.open_output(ops.ud, (uint64_t)(uintptr_t)dup, &desc, &ctx)); // WARN: wrong adapter
+	ops.destroy(ops.ud);
+}

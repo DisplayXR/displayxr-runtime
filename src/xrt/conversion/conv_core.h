@@ -151,6 +151,10 @@ conv_core_set_gpu(struct conv_core *core, const struct conv_core_gpu *gpu);
 int32_t
 conv_core_add_provider(struct conv_core *core, const struct conv_provider_desc *desc);
 
+//! @p provider_id has capability rows (a live describe or the describe cache).
+bool
+conv_core_provider_described(struct conv_core *core, const char *provider_id);
+
 /*! Restore rows from a persisted describe cache (before or after adding providers). */
 int32_t
 conv_core_load_describe_cache(struct conv_core *core, const uint8_t *buf, size_t len);

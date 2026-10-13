@@ -38119,6 +38119,17 @@ comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3
 	out->stream_gone = conv_io_stream_gone;
 	out->io_ud = l;
 	out->nominal_z_m = d3d11_service_system_from_xrt(xsysc)->base.info.nominal_viewer_z_m;
+	// The lift device (the allocator's) lives on the service device's adapter.
+	{
+		wil::com_ptr<IDXGIDevice> dxgi_dev;
+		wil::com_ptr<IDXGIAdapter> adapter;
+		DXGI_ADAPTER_DESC desc = {};
+		struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+		if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+		    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(&desc))) {
+			out->adapter_luid = (uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32 | desc.AdapterLuid.LowPart;
+		}
+	}
 	return true;
 }
 

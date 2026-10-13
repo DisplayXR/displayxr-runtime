@@ -94,6 +94,10 @@ struct comp_d3d11_conv_glue
 
 	//! The display's nominal viewing distance, metres (the policy's straight-on viewer).
 	float nominal_z_m;
+
+	//! LUID of the adapter the glue's images live on (the service's ingest
+	//! adapter); conversion-host satellites open their device on it (#2034).
+	uint64_t adapter_luid;
 };
 
 /*!

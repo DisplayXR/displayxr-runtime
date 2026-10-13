@@ -190,6 +190,9 @@ struct ipc_server_conv_gpu
 	struct conv_dp_lift_backend dp_lift;
 	struct ipc_server_conv_io_ops io;
 	float nominal_z_m; //!< the display's nominal viewing distance (S3); ≤ 0 = unknown
+	//! The adapter the allocator's images live on (packed LUID; 0 = unknown):
+	//! conversion-host satellites are spawned on it (--adapter-luid, #2034).
+	uint64_t adapter_luid;
 };
 
 /*!

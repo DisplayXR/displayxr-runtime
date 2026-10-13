@@ -274,6 +274,13 @@ struct proxy
 	uint32_t hello_caps;
 	bool ever_lost;     //!< a LOST was raised (RESTORED owed at the next bring-up)
 	bool restart_owed;  //!< an abnormal loss: respawn after the backoff even with no command queued
+	bool want_describe; //!< no cached describe: spawn once to describe (conv_host_proxy_request_describe)
+	bool luid_restart;  //!< the adapter LUID changed under a live host: respawn it on the new one
+	bool luid_kill_sent; //!< ... and the supervisor thread already ended it (exit 20)
+	uint64_t spawned_luid; //!< --adapter-luid the current / last host was given
+	uint64_t hello_luid;   //!< the adapter the host says it opened
+	bool status_known;
+	struct xrt_conv_provider_status provider_status;
 	uint32_t raised_terminal; //!< supervisor FAILED already reported (by its failed_at_ns)
 	uint64_t raised_terminal_at;
 	uint64_t next_maintenance_ns;
@@ -607,6 +614,11 @@ handle_hello(struct proxy *p, const uint8_t *payload, uint32_t bytes)
 	if (reject == CONV_HOST_REJECT_NONE) {
 		p->hello_ok = true;
 		p->hello_caps = h.capability_count;
+		p->hello_luid = h.adapter_luid;
+		if (p->spawned_luid != 0 && h.adapter_luid != 0 && h.adapter_luid != p->spawned_luid) {
+			U_LOG_W("[conv:%s] host opened adapter %llx, not the %llx it was given", p->provider_id,
+			        (unsigned long long)h.adapter_luid, (unsigned long long)p->spawned_luid);
+		}
 	}
 	os_cond_broadcast(&p->cond);
 	os_mutex_unlock(&p->m);
@@ -972,9 +984,33 @@ describe_all(struct proxy *p, uint32_t count)
 }
 
 //! After an accepted hello: describe, open the lane, go RUNNING (supervisor thread).
+//! GET_PROVIDER_STATUS: the FALLBACK flag, platform state and hint, cached for the registry.
+static void
+fetch_provider_status(struct proxy *p)
+{
+	struct conv_host_wire_index q;
+	conv_host_wire_init(&q, sizeof(q));
+	struct conv_host_wire_provider_status rep;
+	const xrt_result_t r = px_request(p, CONV_HOST_MSG_GET_PROVIDER_STATUS, &q, sizeof(q), NULL, 0, &rep,
+	                                  sizeof(rep), PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
+	os_mutex_lock(&p->m);
+	if (r == XRT_SUCCESS && rep.reported != 0) {
+		memset(&p->provider_status, 0, sizeof(p->provider_status));
+		p->provider_status.struct_size = (uint32_t)sizeof(p->provider_status);
+		p->provider_status.state = rep.state;
+		p->provider_status.flags = rep.flags;
+		conv_host_wire_set_str(p->provider_status.hint, sizeof(p->provider_status.hint), rep.hint);
+		p->status_known = true;
+	} else if (r == XRT_SUCCESS) {
+		p->status_known = false; // the provider reports none
+	}
+	os_mutex_unlock(&p->m);
+}
+
 static void
 bring_up(struct proxy *p, uint32_t caps)
 {
+	fetch_provider_status(p); // before the describe: the core reads both at the generation bump
 	if (!describe_all(p, caps) || !lane_open(p)) {
 		os_mutex_lock(&p->m);
 		conv_supervisor_channel_broken(&p->sup, now_ns());
@@ -984,6 +1020,7 @@ bring_up(struct proxy *p, uint32_t caps)
 	os_mutex_lock(&p->m);
 	p->running = true;
 	p->restart_owed = false;
+	p->want_describe = false;
 	const bool restored = p->ever_lost;
 	const uint32_t epoch = p->epoch;
 	os_cond_broadcast(&p->cond);
@@ -1123,7 +1160,9 @@ on_host_gone(struct proxy *p, int32_t code)
 		p->ever_lost = true;
 		// The core keeps the provider's tasks WARMING(restarting) and re-warms on
 		// RESTORED: the respawn is owed even with nothing queued right now.
-		p->restart_owed = code != 0 && code != CONV_HOST_EXIT_UPDATE;
+		p->restart_owed = (code != 0 && code != CONV_HOST_EXIT_UPDATE) || p->luid_restart;
+		p->luid_restart = false;
+		p->luid_kill_sent = false;
 		os_mutex_unlock(&p->m);
 		conv_host_raise_event(&p->base, CONV_HOST_EV_LOST, code);
 	}
@@ -1155,7 +1194,10 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 	}
 	char parent[32], luid[32];
 	(void)snprintf(parent, sizeof(parent), "%ld", os_process_current_pid());
-	(void)snprintf(luid, sizeof(luid), "%llx", (unsigned long long)p->cfg.adapter_luid);
+	os_mutex_lock(&p->m);
+	p->spawned_luid = p->cfg.adapter_luid;
+	(void)snprintf(luid, sizeof(luid), "%llx", (unsigned long long)p->spawned_luid);
+	os_mutex_unlock(&p->m);
 	const char *args[16 + 8];
 	uint32_t n = 0;
 	args[n++] = CONV_HOST_ARG_PROVIDER;
@@ -1217,7 +1259,7 @@ static bool
 demand_locked(const struct proxy *p)
 {
 	return p->queued > 0 || p->in_flight || p->open_streams > 0 || p->restart_owed ||
-	       (!p->described && p->cfg.spawn_for_describe);
+	       (!p->described && (p->cfg.spawn_for_describe || p->want_describe));
 }
 
 //! Report a terminal supervisor state once (FAILED / crash loop).
@@ -1264,6 +1306,12 @@ sup_main(void *ptr)
 		if (p->chan_broken) {
 			p->chan_broken = false;
 			conv_supervisor_channel_broken(&p->sup, t);
+		}
+		if (p->luid_restart && !p->luid_kill_sent && p->proc != NULL) {
+			// Closed for update: no backoff, no crash accounting; respawned on
+			// demand (restart_owed) with the new --adapter-luid.
+			p->luid_kill_sent = true;
+			(void)os_process_terminate(p->proc, CONV_HOST_EXIT_UPDATE);
 		}
 		const bool hello = p->hello_ok && !p->running;
 		const uint32_t hello_caps = p->hello_caps;
@@ -2071,6 +2119,23 @@ worker_main(void *ptr)
 			break;
 		}
 		struct conv_host_cmd *c = p->head;
+		// Nothing to undo in a host that is not running: its provider streams
+		// and resident models died with it. Never spawn one just to close
+		// (core teardown destroys streams after the host may have gone idle).
+		if (!p->running && (c->op == CONV_OP_STREAM_DESTROY || c->op == CONV_OP_EVICT)) {
+			p->head = c->next_;
+			if (p->head == NULL) {
+				p->tail = NULL;
+			}
+			p->queued--;
+			os_mutex_unlock(&p->m);
+			c->next_ = NULL;
+			c->result = XRT_SUCCESS;
+			c->end_ns = now_ns();
+			c->on_complete(c);
+			os_mutex_lock(&p->m);
+			continue;
+		}
 		// Wait for the host (lazy spawn: the queued command is the demand).
 		if (!wait_running_locked(p)) {
 			if (p->head == c) {
@@ -2291,9 +2356,14 @@ px_refresh_caps(struct conv_host *h)
 static bool
 px_get_provider_status(struct conv_host *h, struct xrt_conv_provider_status *out)
 {
-	(void)h;
-	(void)out;
-	return false; // not on the wire (hello carries no provider status)
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const bool known = p->status_known;
+	if (known) {
+		*out = p->provider_status;
+	}
+	os_mutex_unlock(&p->m);
+	return known; // what the host process read from the provider at its last bring-up
 }
 
 static xrt_result_t
@@ -2484,7 +2554,7 @@ void
 conv_host_proxy_config_defaults(struct conv_host_proxy_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->spawn_for_describe = true;
+	cfg->spawn_for_describe = false; // the describe cache answers; conv_host_proxy_request_describe when it cannot
 }
 
 xrt_result_t
@@ -2539,6 +2609,63 @@ conv_host_proxy_create(const struct conv_host_proxy_config *cfg, struct conv_hos
 	p->sup_started = true;
 	*out_host = &p->base;
 	return XRT_SUCCESS;
+}
+
+void
+conv_host_proxy_request_describe(struct conv_host *h)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	if (!p->described) {
+		p->want_describe = true;
+		os_cond_broadcast(&p->cond);
+	}
+	os_mutex_unlock(&p->m);
+}
+
+void
+conv_host_proxy_set_adapter(struct conv_host *h, uint64_t adapter_luid, const struct conv_host_proxy_gpu_ops *gpu)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const bool changed = p->cfg.adapter_luid != adapter_luid;
+	p->cfg.adapter_luid = adapter_luid;
+	// The GPU lane opens only once the adapter is known; a lane already in use stays.
+	bool adopted = false;
+	if (gpu != NULL && !p->have_gpu) {
+		p->gpu = *gpu;
+		p->have_gpu = true;
+		adopted = true;
+	}
+	// A live host on another adapter is restarted on this one (closed for
+	// update: no crash accounting); an idle one picks it up at its next spawn.
+	const bool restart = changed && p->proc != NULL && p->spawned_luid != adapter_luid;
+	if (restart) {
+		p->luid_restart = true; // the supervisor thread ends it (it owns the process)
+		os_cond_broadcast(&p->cond);
+	}
+	os_mutex_unlock(&p->m);
+	if (gpu != NULL && !adopted && gpu->destroy != NULL) {
+		gpu->destroy(gpu->ud);
+	}
+	if (restart) {
+		U_LOG_W("[conv:%s] service adapter is %llx: restarting the host on it", p->provider_id,
+		        (unsigned long long)adapter_luid);
+	}
+}
+
+void
+conv_host_proxy_get_adapter(struct conv_host *h, uint64_t *out_spawned, uint64_t *out_hello)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	if (out_spawned != NULL) {
+		*out_spawned = p->spawned_luid;
+	}
+	if (out_hello != NULL) {
+		*out_hello = p->hello_luid;
+	}
+	os_mutex_unlock(&p->m);
 }
 
 void

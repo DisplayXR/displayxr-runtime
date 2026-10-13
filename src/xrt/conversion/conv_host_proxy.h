@@ -101,13 +101,14 @@ struct conv_host_proxy_config
 	//! Append the host's stdout / stderr here (NULL = discard).
 	const char *log_path;
 
-	/*! Spawn the host as soon as the proxy exists when it has no describe yet
-	 *  (default true: the first service start has no describe cache).
-	 *  Otherwise the first warm / create spawns it. */
+	/*! Spawn the host as soon as the proxy exists, to describe it. Default
+	 *  false: the describe cache answers and the first warm / create spawns
+	 *  the host (roadmap §3.4 "Spawn"); with no cached describe at all, the
+	 *  service calls conv_host_proxy_request_describe instead. */
 	bool spawn_for_describe;
 };
 
-//! Defaults: spawn_for_describe = true, everything else 0 / NULL.
+//! Defaults: everything 0 / NULL / false.
 void
 conv_host_proxy_config_defaults(struct conv_host_proxy_config *cfg);
 
@@ -117,6 +118,25 @@ conv_host_proxy_config_defaults(struct conv_host_proxy_config *cfg);
  */
 xrt_result_t
 conv_host_proxy_create(const struct conv_host_proxy_config *cfg, struct conv_host **out_host);
+
+/*! The provider has no cached describe (first ever run): spawn the host once
+ *  to describe it; the idle exit reclaims it afterwards. */
+void
+conv_host_proxy_request_describe(struct conv_host *h);
+
+/*!
+ * The service's ingest adapter is known (the GPU side attached): later spawns
+ * pass it as --adapter-luid, and a live host on another adapter is restarted
+ * on it (closed-for-update shape: no crash accounting; the core re-warms on
+ * RESTORED). @p gpu (may be NULL), the D3D11 lane on that adapter, is adopted
+ * when the proxy has none yet, else destroyed.
+ */
+void
+conv_host_proxy_set_adapter(struct conv_host *h, uint64_t adapter_luid, const struct conv_host_proxy_gpu_ops *gpu);
+
+//! The LUID the current / last host was spawned with, and the one it said it opened.
+void
+conv_host_proxy_get_adapter(struct conv_host *h, uint64_t *out_spawned, uint64_t *out_hello);
 
 //! Diagnostics: the supervisor's view (state, restarts, last exit) and the host pid (0 = none).
 void

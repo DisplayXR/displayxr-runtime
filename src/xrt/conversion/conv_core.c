@@ -384,9 +384,11 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 				struct conv_readiness_event ev = mk_ev(CONV_EV_HOST_CRASH, t);
 				apply_locked(core, i, &ev);
 			} else if (core->reg.rows[i].rd.state == XRT_CONV_STATE_READY) {
-				// Orderly (idle) exit: the model went with the process.
+				// Orderly exit (idle, update, adapter change): the model went
+				// with the process; the host's return re-warms it.
 				struct conv_readiness_event ev = mk_ev(CONV_EV_EVICTED, t);
 				apply_locked(core, i, &ev);
+				hs->rewarm_evicted = true;
 			}
 		}
 		break;
@@ -456,10 +458,17 @@ rewarm_locked(struct conv_core *core, uint32_t p)
 		return;
 	}
 	hs->rewarm = false;
+	const bool evicted = hs->rewarm_evicted;
+	hs->rewarm_evicted = false;
 	for (uint32_t i = 0; i < core->reg.row_count; i++) {
 		const struct conv_cap_row *row = &core->reg.rows[i];
-		if (row->provider == p && row->rd.state == XRT_CONV_STATE_WARMING) {
+		if (row->provider != p) {
+			continue;
+		}
+		if (row->rd.state == XRT_CONV_STATE_WARMING) {
 			start_warm_locked(core, p, row->cap.cap_id);
+		} else if (evicted && row->rd.state == XRT_CONV_STATE_EVICTED) {
+			conv_core_request_warm_locked(core, p, row->cap.cap_id, CONV_EV_WARM_REQUESTED);
 		}
 	}
 }
@@ -701,6 +710,16 @@ conv_core_add_provider(struct conv_core *core, const struct conv_provider_desc *
 	        : host->hosting == CONV_HOSTING_SATELLITE ? "satellite host"
 	                                                  : "in-service host");
 	return pi;
+}
+
+bool
+conv_core_provider_described(struct conv_core *core, const char *provider_id)
+{
+	os_mutex_lock(&core->registry_mtx);
+	const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
+	const bool d = pi >= 0 && core->reg.providers[pi].described;
+	os_mutex_unlock(&core->registry_mtx);
+	return d;
 }
 
 int32_t
