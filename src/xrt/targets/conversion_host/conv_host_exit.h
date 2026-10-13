@@ -7,10 +7,8 @@
  * The table itself is the wire header's (conv_host_wire.h, shared with the
  * supervisor): 0 orderly, 10 ABI reject (also: hello refused), 11 negotiate /
  * describe failed, 12 licence, 13 no usable device, 14 elevated, 20 closed for
- * update, 30 watchdog (supervisor-side). Two host-private codes are added
- * here for failures that happen before there is anyone to talk to; the
- * supervisor counts them as crashes, which is right: the host could not even
- * start.
+ * update, 30 watchdog (supervisor-side), plus 2 (bad command line) and 15
+ * (unusable control channel), documented there.
  *
  * @ingroup conv_host
  */
@@ -19,8 +17,6 @@
 
 #include "conversion/conv_host_wire.h"
 
-#define CONV_HOST_EXIT_USAGE 2    //!< bad command line (the supervisor never spawns that)
-#define CONV_HOST_EXIT_CHANNEL 15 //!< the inherited control channel is unusable
 
 //! Short name of a host exit code, for logs ("crash" for anything unlisted).
 static inline const char *

@@ -12,12 +12,14 @@
 #include "conv_host_exit.h"
 #include "conv_host_log.h"
 #include "conv_host_os.h"
+#include "conv_host_shm.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "conv_host_d3d11.h"
 #endif
 
 #include "util/u_shm_ring.h"
+#include "os/os_process.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_git_tag.h"
@@ -98,7 +100,8 @@ struct lane
 	uint64_t shm_bytes;
 	struct u_shm_ring submit;   //!< consumer
 	struct u_shm_ring complete; //!< producer
-	uint64_t wake_in, wake_out;
+	struct os_wake wake_in;  //!< the service signals: the command ring is non-empty
+	struct os_wake wake_out; //!< we signal: the completion ring is non-empty
 	struct os_thread thread;
 	volatile bool stop;
 	struct conv_host_serve *srv;
@@ -119,7 +122,7 @@ struct pending
 	struct xrt_conv_params params;
 	struct xrt_conv_job_control ctl;
 	struct xrt_conv_job_out job_out;
-	struct xrt_conv_blob_sink sink;
+	struct xrt_conv_blob_sink sinks[5]; //!< one per role: a provider matches sink.role EXACTLY
 	uint8_t *blob;
 	uint64_t blob_bytes, blob_cap;
 	uint32_t blob_format;
@@ -144,7 +147,11 @@ struct conv_host_serve
 	uint32_t commands_in_flight;
 	uint32_t input_generation;
 	bool fence_announced;
-	uint64_t kept_blobs[MAX_KEPT_BLOBS];
+	struct
+	{
+		uint64_t job_id;
+		uint64_t handle;
+	} kept_blobs[MAX_KEPT_BLOBS]; //!< Windows: results the service has not JOB_RELEASEd yet
 	uint32_t kept_blob_next;
 	uint64_t last_bound_ns;
 
@@ -697,8 +704,10 @@ pending_done(struct conv_host_cmd *cmd)
 			// The service PULLS it from this process: keep the last few
 			// open (there is no release message), close the oldest.
 			os_mutex_lock(&s->mtx);
-			conv_host_handle_close(s->kept_blobs[s->kept_blob_next]);
-			s->kept_blobs[s->kept_blob_next] = h;
+			// Fallback when the service never sends JOB_RELEASE.
+			conv_host_handle_close(s->kept_blobs[s->kept_blob_next].handle);
+			s->kept_blobs[s->kept_blob_next].job_id = p->job_id;
+			s->kept_blobs[s->kept_blob_next].handle = h;
 			s->kept_blob_next = (s->kept_blob_next + 1) % MAX_KEPT_BLOBS;
 			os_mutex_unlock(&s->mtx);
 #else
@@ -988,7 +997,7 @@ lane_push_completion(struct lane *l, const struct conv_host_wire_complete_record
 		const enum u_shm_ring_result pr = u_shm_ring_push(&l->complete, c, &wake);
 		if (pr == U_SHM_RING_OK) {
 			if (wake) {
-				conv_host_wake_signal(l->wake_out);
+				os_wake_signal(&l->wake_out);
 			}
 			return;
 		}
@@ -997,7 +1006,7 @@ lane_push_completion(struct lane *l, const struct conv_host_wire_complete_record
 			        pr == U_SHM_RING_CORRUPT ? "corrupt" : "full", (unsigned long long)c->seq);
 			return;
 		}
-		conv_host_wake_signal(l->wake_out); // the service is behind: nudge it
+		os_wake_signal(&l->wake_out); // the service is behind: nudge it
 		os_nanosleep(1000 * 1000);
 	}
 }
@@ -1021,7 +1030,7 @@ lane_thread(void *ptr)
 			break;
 		}
 		if (u_shm_ring_prepare_wait(&l->submit)) {
-			(void)conv_host_wake_wait(l->wake_in, LANE_WAIT_MS);
+			(void)os_wake_wait(&l->wake_in, LANE_WAIT_MS);
 			u_shm_ring_finish_wait(&l->submit);
 		}
 	}
@@ -1043,8 +1052,8 @@ lane_close_locked_out(struct conv_host_serve *s, struct lane *l)
 		conv_host_shm_unmap(l->map, l->shm_bytes);
 	}
 	conv_host_handle_close(l->shm_handle);
-	conv_host_handle_close(l->wake_in);
-	conv_host_handle_close(l->wake_out);
+	os_wake_destroy(&l->wake_in);
+	os_wake_destroy(&l->wake_out);
 	memset(l, 0, sizeof(*l));
 }
 
@@ -1084,8 +1093,8 @@ handle_lane_open(struct conv_host_serve *s,
 				l->map = map;
 				l->shm_bytes = lo.shm_bytes;
 				l->shm_handle = f->handles[0];
-				l->wake_in = f->handles[1];
-				l->wake_out = f->handles[2];
+				os_wake_from_native(&l->wake_in, f->handles[1]);
+				os_wake_from_native(&l->wake_out, f->handles[2]);
 				l->index = lo.lane;
 				l->srv = s;
 				if (!u_shm_ring_attach(&l->submit, (uint8_t *)map + lo.submit_ring_offset, sb,
@@ -1467,15 +1476,20 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 		p->msg = f->type;
 		p->job_id = q.job_id;
 		xrt_conv_wire_unpack_params(&q.params, &p->params);
-		p->sink.struct_size = sizeof(p->sink);
-		p->sink.role = XRT_CONV_OUT_SPLAT_BLOB | XRT_CONV_OUT_DEPTH | XRT_CONV_OUT_VIEWS |
-		               XRT_CONV_OUT_DISPARITY | XRT_CONV_OUT_CONFIDENCE;
-		p->sink.ctx = p;
-		p->sink.begin = job_sink_begin;
-		p->sink.write = job_sink_write;
+		// One sink per output role (a provider picks the sink whose role
+		// equals what it emits); all write the one blob this job returns.
+		static const uint32_t roles[5] = {XRT_CONV_OUT_SPLAT_BLOB, XRT_CONV_OUT_DEPTH, XRT_CONV_OUT_VIEWS,
+		                                  XRT_CONV_OUT_DISPARITY, XRT_CONV_OUT_CONFIDENCE};
+		for (uint32_t k = 0; k < 5; k++) {
+			p->sinks[k].struct_size = sizeof(p->sinks[k]);
+			p->sinks[k].role = roles[k];
+			p->sinks[k].ctx = p;
+			p->sinks[k].begin = job_sink_begin;
+			p->sinks[k].write = job_sink_write;
+		}
 		p->ctl.struct_size = sizeof(p->ctl);
-		p->ctl.sink_count = 1;
-		p->ctl.sinks = &p->sink;
+		p->ctl.sink_count = 5;
+		p->ctl.sinks = p->sinks;
 		p->ctl.ctx = p;
 		p->ctl.progress = job_progress;
 		p->ctl.is_cancelled = pending_is_cancelled;
@@ -1504,6 +1518,21 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 			os_mutex_unlock(&s->mtx);
 		}
 		return true; // the job itself replies
+	}
+	case CONV_HOST_MSG_JOB_RELEASE: {
+		struct conv_host_wire_job_release q;
+		if (conv_host_wire_receive(&q, sizeof(q), pl, n)) {
+			os_mutex_lock(&s->mtx);
+			for (uint32_t i = 0; i < MAX_KEPT_BLOBS; i++) {
+				if (s->kept_blobs[i].handle != 0 && s->kept_blobs[i].job_id == q.job_id) {
+					conv_host_handle_close(s->kept_blobs[i].handle);
+					s->kept_blobs[i].handle = 0;
+					s->kept_blobs[i].job_id = 0;
+				}
+			}
+			os_mutex_unlock(&s->mtx);
+		}
+		return true; // no reply (POSIX: our copy was closed right after the send)
 	}
 	case CONV_HOST_MSG_SHUTDOWN: {
 		struct conv_host_wire_shutdown q;
@@ -1649,7 +1678,7 @@ hello(struct conv_host_serve *s)
 {
 	struct conv_host_wire_hello h;
 	conv_host_wire_init(&h, sizeof(h));
-	h.host_pid = (uint32_t)conv_host_os_pid();
+	h.host_pid = (uint32_t)os_process_current_pid();
 	h.provider_api_version = s->cfg->provider->entry != NULL ? s->cfg->provider->entry->plugin_api_version : 0;
 	h.flags = 0;
 	uint32_t count = 0;

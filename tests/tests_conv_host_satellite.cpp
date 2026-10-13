@@ -23,8 +23,10 @@
 
 #include "conv_host_args.h"
 #include "conv_host_chan.h"
+#include "conv_host_shm.h"
 
 #include "conversion/conv_host_wire.h"
+#include "os/os_process.h"
 #include "util/u_shm_ring.h"
 #include "xrt/xrt_conversion_plugin.h"
 
@@ -43,13 +45,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-#include <fcntl.h>
-#include <signal.h>
-#include <spawn.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 #include <unistd.h>
-extern char **environ;
 #endif
 
 namespace {
@@ -98,22 +94,20 @@ common_env()
 	// The provider's settings, as the service's environment would carry them.
 	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
 	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", "0");
+	set_env("DXR_CONV_SIM_CONVERSION_JOB_MS", "50");
 }
 
 /*!
- * The test's "service" end of one host: the spawned process, the channel and
- * the handle plumbing.
+ * The test's "service" end of one host, built from the same os_process.h
+ * layer the supervisor uses: os_channel_create_for_child, os_process_spawn
+ * with kill_on_parent_exit (a job object on Windows, PDEATHSIG on Linux), so
+ * a host never outlives the test, and os_process_dup_* for handles.
  */
 struct Host
 {
 	conv_host_chan *chan = nullptr;
-#ifdef _WIN32
-	PROCESS_INFORMATION pi = {};
-	HANDLE job = nullptr; //!< KILL_ON_JOB_CLOSE: a host never outlives the test, whatever happens
-#else
-	pid_t pid = -1;
-#endif
-	bool spawned = false;
+	os_process *proc = nullptr;
+	bool exited = false;
 
 	~Host()
 	{
@@ -121,189 +115,93 @@ struct Host
 		kill_now();
 	}
 
+	/*!
+	 * @p bare_token (Windows): pass the pipe's bare name instead of the
+	 * `\\.\pipe\...` path, the second accepted --channel form.
+	 */
 	bool
-	spawn(const std::vector<std::string> &extra_args, bool with_channel = true)
+	spawn(const std::vector<std::string> &extra_args, bool with_channel = true, bool bare_token = false)
 	{
-		std::vector<std::string> args = {CONV_HOST_EXE};
-#ifdef _WIN32
-		static int counter = 0;
-		char name[128];
-		snprintf(name, sizeof(name), "dxr-convhost-test-%lu-%d", (unsigned long)GetCurrentProcessId(),
-		         ++counter);
-		HANDLE pipe = INVALID_HANDLE_VALUE;
+		std::vector<std::string> args;
+		os_channel *parent = nullptr;
+		uint64_t child_handle = OS_NATIVE_HANDLE_INVALID;
 		if (with_channel) {
-			char path[192];
-			snprintf(path, sizeof(path), "\\\\.\\pipe\\%s", name);
-			pipe = CreateNamedPipeA(path, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-			                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536, 65536, 0, nullptr);
-			if (pipe == INVALID_HANDLE_VALUE) {
+			char token[256] = {0};
+			if (os_channel_create_for_child("dxr-convhost-test", &parent, token, sizeof(token),
+			                                &child_handle) != 0) {
 				return false;
 			}
+			std::string t = token;
+			const std::string prefix = "\\\\.\\pipe\\";
+			if (bare_token && t.compare(0, prefix.size(), prefix) == 0) {
+				t = t.substr(prefix.size());
+			}
 			args.push_back("--channel");
-			args.push_back(name);
+			args.push_back(t);
 		}
 		for (const auto &a : extra_args) {
 			args.push_back(a);
 		}
-		std::string cmd;
+		std::vector<const char *> argv;
 		for (const auto &a : args) {
-			cmd += "\"" + a + "\" ";
+			argv.push_back(a.c_str());
 		}
-		STARTUPINFOA si = {};
-		si.cb = sizeof(si);
-		std::vector<char> buf(cmd.begin(), cmd.end());
-		buf.push_back('\0');
-		if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-		                    nullptr, nullptr, &si, &pi)) {
-			if (pipe != INVALID_HANDLE_VALUE) {
-				CloseHandle(pipe);
-			}
+		os_process_spawn_info info = {};
+		info.exe_path = CONV_HOST_EXE;
+		info.args = argv.data();
+		info.arg_count = (uint32_t)argv.size();
+		info.kill_on_parent_exit = true;
+		info.channel_child_handle = child_handle;
+		if (os_process_spawn(&info, &proc) != 0) {
+			os_channel_destroy(&parent);
+			os_native_handle_close(child_handle);
 			return false;
 		}
-		// As the supervisor does: the host dies with this process (and with
-		// this Host object), so a failed assertion never leaves one behind.
-		job = CreateJobObjectA(nullptr, nullptr);
-		if (job != nullptr) {
-			JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
-			li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-			SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
-			AssignProcessToJobObject(job, pi.hProcess);
-		}
-		ResumeThread(pi.hThread);
-		spawned = true;
 		if (with_channel) {
-			OVERLAPPED ov = {};
-			ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-			BOOL ok = ConnectNamedPipe(pipe, &ov);
-			if (!ok && GetLastError() == ERROR_IO_PENDING) {
-				HANDLE hs[2] = {ov.hEvent, pi.hProcess};
-				const DWORD w = WaitForMultipleObjects(2, hs, FALSE, 20000);
-				DWORD dummy = 0;
-				ok = w == WAIT_OBJECT_0 && GetOverlappedResult(pipe, &ov, &dummy, FALSE);
-				if (!ok) {
-					CancelIoEx(pipe, &ov);
-				}
-			} else if (!ok && GetLastError() == ERROR_PIPE_CONNECTED) {
-				ok = TRUE;
+			// Windows: waits for the host to connect and checks its pid. A
+			// host that exits before connecting leaves chan NULL.
+			if (os_channel_accept_child(parent, proc, child_handle, 20000) == 0) {
+				chan = conv_host_chan_wrap(parent);
+			} else {
+				os_channel_destroy(&parent);
 			}
-			CloseHandle(ov.hEvent);
-			if (!ok) {
-				CloseHandle(pipe);
-				return true; // spawned, but the host never connected (it exited early)
-			}
-			char token[32];
-			snprintf(token, sizeof(token), "%llu", (unsigned long long)(uintptr_t)pipe);
-			chan = conv_host_chan_open(token, nullptr, 0);
 		}
 		return true;
-#else
-		int sv[2] = {-1, -1};
-		if (with_channel) {
-			if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-				return false;
-			}
-			fcntl(sv[0], F_SETFD, FD_CLOEXEC); // ours; sv[1] is inherited
-			args.push_back("--channel");
-			args.push_back(std::to_string(sv[1]));
-		}
-		for (const auto &a : extra_args) {
-			args.push_back(a);
-		}
-		std::vector<char *> argv;
-		for (auto &a : args) {
-			argv.push_back(const_cast<char *>(a.c_str()));
-		}
-		argv.push_back(nullptr);
-		const int r = posix_spawn(&pid, CONV_HOST_EXE, nullptr, nullptr, argv.data(), environ);
-		if (with_channel) {
-			close(sv[1]);
-		}
-		if (r != 0) {
-			if (with_channel) {
-				close(sv[0]);
-			}
-			return false;
-		}
-		spawned = true;
-		if (with_channel) {
-			char token[32];
-			snprintf(token, sizeof(token), "%d", sv[0]);
-			chan = conv_host_chan_open(token, nullptr, 0);
-		}
-		return true;
-#endif
 	}
 
 	std::string
 	parent_arg() const
 	{
-#ifdef _WIN32
-		return std::to_string((unsigned long)GetCurrentProcessId());
-#else
-		return std::to_string((long)getpid());
-#endif
+		return std::to_string(os_process_current_pid());
 	}
 
 	//! Wait for the process to exit; returns its code, or -1000 on timeout.
 	int
 	wait_exit(uint32_t timeout_ms)
 	{
-#ifdef _WIN32
-		if (!spawned) {
+		if (proc == nullptr) {
 			return -1001;
 		}
-		if (WaitForSingleObject(pi.hProcess, timeout_ms) != WAIT_OBJECT_0) {
+		int32_t code = 0;
+		if (os_process_wait(proc, timeout_ms, &code) != 1) {
 			return -1000;
 		}
-		DWORD code = 0;
-		GetExitCodeProcess(pi.hProcess, &code);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-		if (job != nullptr) {
-			CloseHandle(job);
-			job = nullptr;
-		}
-		spawned = false;
+		exited = true;
 		return (int)code;
-#else
-		if (!spawned) {
-			return -1001;
-		}
-		const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-		int status = 0;
-		while (std::chrono::steady_clock::now() < end) {
-			const pid_t w = waitpid(pid, &status, WNOHANG);
-			if (w == pid) {
-				spawned = false;
-				return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		return -1000;
-#endif
 	}
 
 	void
 	kill_now()
 	{
-		if (!spawned) {
+		if (proc == nullptr) {
 			return;
 		}
-#ifdef _WIN32
-		TerminateProcess(pi.hProcess, 99);
-		WaitForSingleObject(pi.hProcess, 5000);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-		if (job != nullptr) {
-			CloseHandle(job);
-			job = nullptr;
+		if (!exited) {
+			os_process_terminate(proc, 99);
+			int32_t code = 0;
+			(void)os_process_wait(proc, 5000, &code);
 		}
-#else
-		::kill(pid, SIGKILL);
-		int status = 0;
-		waitpid(pid, &status, 0);
-#endif
-		spawned = false;
+		os_process_destroy(&proc);
 	}
 
 	//! A local handle as the host will see it (Windows: duplicated INTO the host).
@@ -311,12 +209,8 @@ struct Host
 	to_host(uint64_t local)
 	{
 #ifdef _WIN32
-		HANDLE out = nullptr;
-		if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)(uintptr_t)local, pi.hProcess, &out, 0, FALSE,
-		                     DUPLICATE_SAME_ACCESS)) {
-			return 0;
-		}
-		return (uint64_t)(uintptr_t)out;
+		uint64_t remote = 0;
+		return os_process_dup_to_child(proc, local, &remote) == 0 ? remote : 0;
 #else
 		return local; // SCM_RIGHTS duplicates on send
 #endif
@@ -327,12 +221,8 @@ struct Host
 	from_host(uint64_t received)
 	{
 #ifdef _WIN32
-		HANDLE out = nullptr;
-		if (!DuplicateHandle(pi.hProcess, (HANDLE)(uintptr_t)received, GetCurrentProcess(), &out, 0, FALSE,
-		                     DUPLICATE_SAME_ACCESS)) {
-			return 0;
-		}
-		return (uint64_t)(uintptr_t)out;
+		uint64_t local = 0;
+		return os_process_dup_from_child(proc, received, false, &local) == 0 ? local : 0;
 #else
 		return received;
 #endif
@@ -395,22 +285,11 @@ struct Host
 	}
 };
 
+//! One wake direction: *mine is this process's end, *for_host the native to send.
 void
-make_wake(uint64_t &host_end, uint64_t &my_end, bool host_waits)
+make_wake(os_wake &mine, uint64_t &for_host)
 {
-#ifdef _WIN32
-	(void)host_waits;
-	HANDLE e = CreateEventA(nullptr, FALSE, FALSE, nullptr); // auto-reset: a wait consumes it
-	host_end = my_end = (uint64_t)(uintptr_t)e;
-#else
-	int p[2];
-	REQUIRE(pipe(p) == 0);
-	fcntl(p[0], F_SETFD, FD_CLOEXEC);
-	fcntl(p[1], F_SETFD, FD_CLOEXEC);
-	// The host waits on a read end and signals a write end.
-	host_end = (uint64_t)(host_waits ? p[0] : p[1]);
-	my_end = (uint64_t)(host_waits ? p[1] : p[0]);
-#endif
+	REQUIRE(os_wake_create_pair(&mine, &for_host) == 0);
 }
 
 bool
@@ -550,7 +429,8 @@ TEST_CASE("conv_host: idle exit with no bound task", "[conv_host]")
 	auto a = sim_args(h);
 	a.push_back("--idle-exit-ms");
 	a.push_back("1500");
-	REQUIRE(h.spawn(a));
+	// The bare pipe name (Windows), the second accepted --channel form.
+	REQUIRE(h.spawn(a, true, true));
 	REQUIRE(h.chan != nullptr);
 	REQUIRE(handshake(h));
 	// Heartbeats keep arriving; with nothing bound the host leaves on its own.
@@ -713,9 +593,11 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 	}
 
 	// LANE_OPEN: shm + wake in (host waits) + wake out (host signals).
-	uint64_t wake_in_host = 0, wake_in_mine = 0, wake_out_host = 0, wake_out_mine = 0;
-	make_wake(wake_in_host, wake_in_mine, true);
-	make_wake(wake_out_host, wake_out_mine, false);
+	os_wake wake_in_mine = {};  // we signal: the command ring is non-empty
+	os_wake wake_out_mine = {}; // the host signals: the completion ring is non-empty
+	uint64_t wake_in_host = 0, wake_out_host = 0;
+	make_wake(wake_in_mine, wake_in_host);
+	make_wake(wake_out_mine, wake_out_host);
 	{
 		conv_host_wire_lane_open q;
 		conv_host_wire_init(&q, sizeof(q));
@@ -752,7 +634,7 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 	bool wake = false;
 	REQUIRE(u_shm_ring_push(&submit, &rec, &wake) == U_SHM_RING_OK);
 	if (wake) {
-		conv_host_wake_signal(wake_in_mine);
+		os_wake_signal(&wake_in_mine);
 	}
 
 	// The completion.
@@ -767,7 +649,7 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 		}
 		REQUIRE(r == U_SHM_RING_EMPTY);
 		if (u_shm_ring_prepare_wait(&complete)) {
-			(void)conv_host_wake_wait(wake_out_mine, 100);
+			(void)os_wake_wait(&wake_out_mine, 100);
 			u_shm_ring_finish_wait(&complete);
 		}
 	}
@@ -800,6 +682,52 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 	}
 	conv_host_shm_unmap(omap, o->bytes);
 
+	// A job on the same capability, input from the lowest open lane's shm;
+	// the blob comes back as a host shm, then JOB_RELEASE frees the host's copy.
+	{
+		conv_host_wire_job_submit q;
+		conv_host_wire_init(&q, sizeof(q));
+		q.job_id = 9001;
+		q.cap_id = cap_id;
+		q.input_kind = XRT_CONV_INPUT_MONO;
+		q.image_count = 1;
+		q.image_idx[0] = 3;
+		q.image_role[0] = XRT_CONV_IMG_COLOR;
+		for (uint32_t i = 1; i < XRT_CONV_MAX_FRAME_IMAGES; i++) {
+			q.image_idx[i] = CONV_HOST_WIRE_NO_INDEX;
+		}
+		xrt_conv_wire_pack_params(&params, &q.params);
+		const uint32_t jrid = rid++;
+		REQUIRE(h.send(CONV_HOST_MSG_JOB_SUBMIT, jrid, &q, sizeof(q)));
+		conv_host_wire_frame f;
+		std::vector<uint8_t> pl;
+		bool done = false;
+		while (!done && h.recv(f, pl)) {
+			if (f.type != (CONV_HOST_MSG_JOB_SUBMIT | CONV_HOST_MSG_REPLY_BIT)) {
+				continue; // JOB_PROGRESS
+			}
+			done = true;
+			CHECK(f.request_id == jrid);
+			conv_host_wire_job_done jd;
+			REQUIRE(conv_host_wire_receive(&jd, sizeof(jd), pl.data(), f.payload_bytes));
+			CHECK(jd.result == XRT_SUCCESS);
+			CHECK(jd.job_id == 9001u);
+			REQUIRE(jd.blob_bytes >= (uint64_t)W * H * 4);
+			REQUIRE(f.handle_count == 1);
+			const uint64_t blob = h.from_host(f.handles[0]);
+			REQUIRE(blob != 0);
+			void *bm = conv_host_shm_map(blob, jd.blob_bytes);
+			REQUIRE(bm != nullptr);
+			conv_host_shm_unmap(bm, jd.blob_bytes);
+			conv_host_handle_close(blob);
+		}
+		REQUIRE(done);
+		conv_host_wire_job_release rel;
+		conv_host_wire_init(&rel, sizeof(rel));
+		rel.job_id = 9001;
+		CHECK(h.send(CONV_HOST_MSG_JOB_RELEASE, 0, &rel, sizeof(rel)));
+	}
+
 	// Orderly SHUTDOWN: reply, then exit 0.
 	{
 		conv_host_wire_shutdown q;
@@ -814,13 +742,12 @@ TEST_CASE("conv_host: sim provider describe / warm / one submit through the ring
 	for (const auto &x : outs) {
 		conv_host_handle_close(x.handle);
 	}
-#ifdef _WIN32
-	conv_host_handle_close(wake_in_mine);
-	conv_host_handle_close(wake_out_mine);
-#else
+	os_wake_destroy(&wake_in_mine);
+	os_wake_destroy(&wake_out_mine);
+#ifndef _WIN32
+	// POSIX: the host's ends were sent with SCM_RIGHTS; close our copies.
+	// (Windows: the same event as ours, closed by os_wake_destroy.)
 	conv_host_handle_close(wake_in_host);
-	conv_host_handle_close(wake_in_mine);
 	conv_host_handle_close(wake_out_host);
-	conv_host_handle_close(wake_out_mine);
 #endif
 }
