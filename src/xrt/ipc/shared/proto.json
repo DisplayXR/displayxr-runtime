@@ -1486,5 +1486,14 @@
 		"out": [
 			{"name": "outcome", "type": "struct ipc_cursor_draw_outcome"}
 		]
+	},
+
+	"compositor_set_cursor_measure_request": {
+		"in": [
+			{"name": "request", "type": "struct ipc_cursor_measure_request"}
+		],
+		"out": [
+			{"name": "measurement", "type": "struct ipc_cursor_measure_result"}
+		]
 	}
 }

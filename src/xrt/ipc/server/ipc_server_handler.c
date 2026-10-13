@@ -3487,6 +3487,36 @@ ipc_handle_compositor_set_cursor_draw_request(volatile struct ipc_client_state *
 	return XRT_SUCCESS;
 }
 
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). The D3D11
+ * service measures at the commit that follows and answers with its newest
+ * finished measurement. Every other service answers "no result" (valid = 0):
+ * the client then has no content and the cursor sits on the screen plane.
+ * Per-frame while armed: never log here.
+ */
+static_assert(sizeof(struct ipc_compositor_set_cursor_measure_request_msg) <= IPC_BUF_SIZE,
+              "compositor_set_cursor_measure_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_set_cursor_measure_request(volatile struct ipc_client_state *ics,
+                                                 const struct ipc_cursor_measure_request *request,
+                                                 struct ipc_cursor_measure_result *out_measurement)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_measurement, 0, sizeof(*out_measurement));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		comp_d3d11_service_set_cursor_measure_request((struct xrt_compositor *)ics->xc, request, out_measurement);
+		return XRT_SUCCESS;
+	}
+#endif
+	(void)ics;
+	(void)request;
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_compositor_predict_frame(volatile struct ipc_client_state *ics,
                                     int64_t *out_frame_id,

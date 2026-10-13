@@ -970,6 +970,49 @@ struct svc_client_cursor_draw
 	bool warned_lag = false;
 };
 
+/*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): one client's
+ * measured-disparity state - the in-process D3D11 compositor's, moved into the
+ * service. Zero-initialised and never touched for a client that never asks.
+ *
+ * A request arrives (`compositor_set_cursor_measure_request`) right before the
+ * commit it belongs to. That commit copies a cursor-sized patch of the two
+ * outermost views of its first projection layer into a staging slot (while it
+ * still holds the views), and later commits read the slot back without waiting
+ * and block-match it. The reply to each request is the newest result.
+ * Everything here is touched only on this client's IPC thread, except the
+ * result, which the reply reads under @ref result_mutex.
+ */
+struct svc_client_cursor_measure
+{
+	bool pending_valid = false;
+	struct u_cursor_measure_request pending = {};
+
+	struct
+	{
+		//! Both views' copies, stacked (view A rows 0..h-1, view B h..2h-1).
+		wil::com_ptr<ID3D11Texture2D> staging;
+		UINT w = 0, h = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		bool in_flight = false;
+		struct u_cursor_measure_request req = {};
+		struct u_cursor_measure_plan plan = {};
+		enum u_cursor_measure_format mformat = U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	} slot[3];
+	uint32_t next_slot = 0;
+	uint32_t in_flight = 0;
+	struct u_cursor_measure_cache cache = {};
+
+	//! Newest finished measurement; a LEAF.
+	std::mutex result_mutex;
+	struct u_cursor_measure_result result = {};
+
+	bool announced = false;
+	bool warned_format = false;
+	uint32_t stat_n = 0, stat_reused = 0;
+	uint64_t stat_cpu_ns = 0, stat_cpu_max_ns = 0;
+};
+
 //! Phase 4: requests the render thread may leave unanswered before the reply
 //! reports the frame as not drawn (under the shell the lift decision is the
 //! render tick's, which runs at its own rate).
@@ -1535,6 +1578,9 @@ struct d3d11_service_compositor
 
 	//! XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4).
 	struct svc_client_cursor_draw cursor_draw;
+
+	//! XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6).
+	struct svc_client_cursor_measure cursor_measure;
 };
 
 /*!
@@ -16008,6 +16054,179 @@ svc_cursor_client_is_tile(struct d3d11_service_system *sys, struct d3d11_service
 
 //! Where one view of a direct client's base projection layer was painted in
 //! its atlas (target px), for the cursor.
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): the in-process
+ * D3D11 compositor's measured-disparity copy and readback, run at a client's
+ * commit on the service's immediate context. The matcher is the shared
+ * u_cursor_measure_run(), so the service and every in-process compositor agree.
+ */
+static enum u_cursor_measure_format
+svc_cursor_measure_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+//! Read back every finished copy (never waits) and match it.
+static void
+svc_cursor_measure_harvest(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+	for (uint32_t s = 0; s < 3; s++) {
+		auto &sl = cm->slot[s];
+		if (!sl.in_flight) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		const HRESULT hr = sys->context->Map(sl.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			continue; // still in flight: look again next commit
+		}
+		sl.in_flight = false;
+		cm->in_flight--;
+		if (FAILED(hr)) {
+			continue;
+		}
+		const uint8_t *base = (const uint8_t *)m.pData;
+		const struct u_cursor_measure_patch pa = {base, m.RowPitch, sl.mformat};
+		const struct u_cursor_measure_patch pb = {base + (size_t)m.RowPitch * (size_t)sl.plan.h, m.RowPitch,
+		                                          sl.mformat};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		const bool ok = u_cursor_measure_run(&sl.req, &sl.plan, &pa, &pb, &cm->cache, &res);
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+		sys->context->Unmap(sl.staging.get(), 0);
+		if (!ok) {
+			continue;
+		}
+		{
+			std::lock_guard<std::mutex> rl(cm->result_mutex);
+			if (res.tag > cm->result.tag) {
+				cm->result = res;
+			}
+		}
+		cm->stat_n++;
+		cm->stat_reused += res.reused ? 1 : 0;
+		cm->stat_cpu_ns += cpu_ns;
+		if (cpu_ns > cm->stat_cpu_max_ns) {
+			cm->stat_cpu_max_ns = cpu_ns;
+		}
+		if (cm->stat_n >= 120) {
+			U_LOG_I("[cursor_measure] client %p: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms; "
+			        "last: %s %.2f px (matched %u, L-R rejected %u)",
+			        (void *)c, cm->stat_n, cm->stat_reused, (double)cm->stat_cpu_ns / cm->stat_n * 1e-6,
+			        (double)cm->stat_cpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			        res.disparity_px, res.matched, res.lr_rejected);
+			cm->stat_n = cm->stat_reused = 0;
+			cm->stat_cpu_ns = cm->stat_cpu_max_ns = 0;
+		}
+	}
+}
+
+/*!
+ * Copy the request's patch out of the two views (already acquired by the
+ * commit, so readable on this context) into the next staging slot.
+ */
+static void
+svc_cursor_measure_sample(struct d3d11_service_system *sys,
+                          struct d3d11_service_compositor *c,
+                          const struct u_cursor_measure_request *req,
+                          ID3D11Texture2D *const tex[U_CURSOR_DEPTH_PATCH_VIEWS],
+                          const struct xrt_sub_image *const sub[U_CURSOR_DEPTH_PATCH_VIEWS])
+{
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+	D3D11_TEXTURE2D_DESC desc[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		if (tex[i] == nullptr || sub[i] == nullptr) {
+			return;
+		}
+		tex[i]->GetDesc(&desc[i]);
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (UINT)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > desc[i].Width ||
+		    (UINT)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > desc[i].Height ||
+		    sub[i]->array_index >= desc[i].ArraySize || desc[i].SampleDesc.Count != 1) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    desc[0].Format != desc[1].Format) {
+		return;
+	}
+	const enum u_cursor_measure_format mformat = svc_cursor_measure_format(desc[0].Format);
+	if (mformat == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!cm->warned_format) {
+			cm->warned_format = true;
+			U_LOG_W("[cursor_measure] client %p: DXGI format %d is not read by the matcher - no content "
+			        "(one-time warning)",
+			        (void *)c, (int)desc[0].Format);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+	const uint32_t s = cm->next_slot;
+	auto &sl = cm->slot[s];
+	if (sl.in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	if (!sl.staging || sl.w < (UINT)plan.w || sl.h < (UINT)plan.h * 2 || sl.format != desc[0].Format) {
+		// First real request (or a larger patch): the only allocation this feature makes.
+		sl.staging.reset();
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = (UINT)plan.w;
+		sd.Height = (UINT)plan.h * 2;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = desc[0].Format;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(sys->device->CreateTexture2D(&sd, nullptr, sl.staging.put()))) {
+			sl.staging.reset();
+			return;
+		}
+		sl.w = sd.Width;
+		sl.h = sd.Height;
+		sl.format = sd.Format;
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		D3D11_BOX box = {};
+		box.left = (UINT)(sub[i]->rect.offset.w + plan.x);
+		box.top = (UINT)(sub[i]->rect.offset.h + plan.y);
+		box.front = 0;
+		box.right = box.left + (UINT)plan.w;
+		box.bottom = box.top + (UINT)plan.h;
+		box.back = 1;
+		const UINT src_sub = (UINT)sub[i]->array_index * desc[i].MipLevels; // mip 0
+		sys->context->CopySubresourceRegion(sl.staging.get(), 0, 0, (UINT)plan.h * i, 0, tex[i], src_sub, &box);
+	}
+	sl.in_flight = true;
+	sl.req = *req;
+	sl.plan = plan;
+	sl.mformat = mformat;
+	cm->in_flight++;
+	cm->next_slot = (s + 1) % 3;
+	if (!cm->announced) {
+		cm->announced = true;
+		U_LOG_W("[cursor_measure] client %p: copying a %dx%d px patch per view for the measured-disparity cursor "
+		        "over IPC (ADR-046 Amendment 3, first request)",
+		        (void *)c, plan.w, plan.h);
+	}
+}
+
 struct svc_cursor_tile
 {
 	bool ok;
@@ -22455,6 +22674,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 	}
+	// XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). ZERO COST
+	// UNLESS REQUESTED: one bool test here and one in the projection loop for a
+	// client that never asked. This commit consumes the request sent right
+	// before it; the copy is taken from the first projection layer's views
+	// while this commit holds them (so the cursor sprite never reaches it).
+	bool measure_frame = false;
+	bool measure_done = false;
+	struct u_cursor_measure_request measure_req = {};
+	if (c->cursor_measure.pending_valid) {
+		c->cursor_measure.pending_valid = false;
+		measure_req = c->cursor_measure.pending;
+		measure_frame = true;
+	}
 	// Phase 4: where the base projection layer's views land in the atlas.
 	struct svc_cursor_tile cursor_tiles[XRT_MAX_VIEWS] = {};
 	uint32_t cursor_tile_count = 0;
@@ -24787,6 +25019,31 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Store content dims on multi-comp slot for multi_compositor_render
 		// (readiness gate + per-slot stride snapshot — see the helper).
 		service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+
+		// ADR-046 Amendment 3 over IPC: read back finished copies, and copy
+		// this frame's patch out of the first projection layer's two outer
+		// views - before the release below, while this commit still holds them.
+		if (!measure_done && (measure_frame || c->cursor_measure.in_flight > 0)) {
+			measure_done = true;
+			svc_cursor_measure_harvest(sys, c);
+			if (measure_frame && u_cursor_measure_should_sample(&measure_req)) {
+				ID3D11Texture2D *mtex[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+				const struct xrt_sub_image *msub[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+				bool readable = true;
+				for (uint32_t k = 0; k < U_CURSOR_DEPTH_PATCH_VIEWS; k++) {
+					const uint32_t vi = measure_req.view_index[k];
+					if (vi >= proj_view_count || view_skip_blit[vi] || view_textures[vi] == nullptr) {
+						readable = false;
+						break;
+					}
+					mtex[k] = view_textures[vi];
+					msub[k] = &layer->data.proj.v[vi].sub;
+				}
+				if (readable) {
+					svc_cursor_measure_sample(sys, c, &measure_req, mtex, msub);
+				}
+			}
+		}
 
 		// Release KeyedMutex after reading
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
@@ -34000,6 +34257,50 @@ comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
 		U_LOG_W("[cursor_draw] client %p: runtime-drawn cursor requested over IPC - the service draws it "
 		        "(ADR-046 Phase 4, one-time notice)",
 		        (void *)c);
+	}
+}
+
+void
+comp_d3d11_service_set_cursor_measure_request(struct xrt_compositor *xc,
+                                              const struct ipc_cursor_measure_request *req,
+                                              struct ipc_cursor_measure_result *out)
+{
+	if (out != nullptr) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (xc == nullptr || req == nullptr || out == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+
+	// The commit that follows on this same IPC thread consumes it.
+	struct u_cursor_measure_request r = {};
+	r.requested = true;
+	r.tag = req->tag;
+	r.u = req->u;
+	r.v = req->v;
+	r.height = req->height;
+	r.view_index[0] = req->view_index[0];
+	r.view_index[1] = req->view_index[1];
+	cm->pending = r;
+	cm->pending_valid = true;
+
+	struct u_cursor_measure_result res;
+	{
+		std::lock_guard<std::mutex> rl(cm->result_mutex);
+		res = cm->result;
+	}
+	if (res.valid) {
+		out->tag = res.tag;
+		out->valid = 1;
+		out->confident = res.confident ? 1 : 0;
+		out->disparity_px = res.disparity_px;
+		out->sub_w = res.sub_w;
+		out->ncc = res.ncc;
+		out->matched = res.matched;
+		out->lr_rejected = res.lr_rejected;
+		out->reused = res.reused ? 1 : 0;
 	}
 }
 

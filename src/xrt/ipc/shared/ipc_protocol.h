@@ -792,6 +792,42 @@ struct ipc_cursor_draw_outcome
 };
 
 /*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): what the
+ * client asks the D3D11 service to measure at its next commit - the
+ * `u_cursor_measure_request` of the frame, field for field.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_measure_request
+{
+	uint64_t tag;              //!< echoed in the result so the client can age it
+	float u, v;                //!< cursor hotspot, canvas-normalised (origin top-left)
+	float height;              //!< sprite height, canvas heights (sizes the footprint)
+	uint32_t view_index[2];    //!< projection-layer views: the outermost active pair, [0] left
+	uint32_t _pad;
+};
+
+/*!
+ * The service's newest finished measurement for this client (one to three
+ * frames old: the copy is read back without waiting) - the
+ * `u_cursor_measure_result` field for field. `valid` = 0 until one has come back.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_measure_result
+{
+	uint64_t tag;
+	uint32_t valid;
+	uint32_t confident;    //!< 0 = no confident content (the screen plane)
+	float disparity_px;    //!< x_B - x_A, sub-image px: < 0 = crossed (in front)
+	float sub_w;           //!< the sub-image width it was measured in
+	float ncc;             //!< diagnostics below
+	uint32_t matched;
+	uint32_t lr_rejected;
+	uint32_t reused;
+};
+
+/*!
  * spec_version 17: session-global overlay source. The controller renders a
  * display-spanning UI (e.g. taskbar) into a swapchain (allocated via
  * xrCreateWorkspaceOverlaySwapchainDXR) and docks it via xrSetWorkspaceOverlayDXR.

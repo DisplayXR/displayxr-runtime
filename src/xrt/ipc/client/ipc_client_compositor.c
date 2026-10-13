@@ -130,6 +130,11 @@ struct ipc_client_compositor
 	//! To test image allocator.
 	struct xrt_image_native_allocator loopback_xina;
 #endif
+
+	//! XR_DXR_cursor_depth v7 over IPC: the newest measurement the service
+	//! returned (ADR-046 Amendment 3 point 6). Written and read on the app's
+	//! frame thread only (xrEndFrame / xrLocateViews).
+	struct u_cursor_measure_result cursor_measure_result;
 };
 
 /*!
@@ -391,6 +396,67 @@ comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, co
 		u_cursor_draw_report_refused(req, (enum u_cursor_draw_refusal)reason);
 	}
 	return true;
+}
+
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). Only reached
+ * on a frame whose locate armed the measured-disparity source (the state
+ * tracker's one bool test), so a session that never asks sends nothing.
+ */
+bool
+comp_ipc_client_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                      const struct u_cursor_measure_request *req)
+{
+	if (xc == NULL || req == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	struct ipc_cursor_measure_request wire;
+	memset(&wire, 0, sizeof(wire));
+	wire.tag = req->tag;
+	wire.u = req->u;
+	wire.v = req->v;
+	wire.height = req->height;
+	wire.view_index[0] = req->view_index[0];
+	wire.view_index[1] = req->view_index[1];
+
+	struct ipc_cursor_measure_result res;
+	memset(&res, 0, sizeof(res));
+	xrt_result_t xret = ipc_call_compositor_set_cursor_measure_request(icc->ipc_c, &wire, &res);
+	if (xret != XRT_SUCCESS) {
+		return false;
+	}
+	if (res.valid && res.tag > icc->cursor_measure_result.tag) {
+		struct u_cursor_measure_result *r = &icc->cursor_measure_result;
+		r->valid = true;
+		r->tag = res.tag;
+		r->confident = res.confident != 0;
+		r->disparity_px = res.disparity_px;
+		r->sub_w = res.sub_w;
+		r->ncc = res.ncc;
+		r->matched = res.matched;
+		r->lr_rejected = res.lr_rejected;
+		r->reused = res.reused != 0;
+	}
+	return true;
+}
+
+bool
+comp_ipc_client_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL) {
+		return false;
+	}
+	*out = icc->cursor_measure_result;
+	return out->valid;
 }
 
 /*
