@@ -638,16 +638,23 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
 ## 6. Diagnostics
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
-  (no DLL load): ProbeOrder, `Enabled` and where it came from
-  (`enabled_source`: `default` / `machine` / `user` / `manifest`), the
+  (no DLL load): ProbeOrder, `Enabled` and where it came from, the
   `PreferredPlugin` override (`preferred`, root-level; per row `preferred`),
   the one the loader would rank first (`*` / `active`), and the ForceQwerty
   state (mirror of `dp list`; what the dashboard's component row renders,
-  ADR-051).
+  ADR-051). The JSON `enabled_source` field reads, precisely:
+  `user` = a per-user HKCU `Enabled` is in force, whatever its value (so an
+  explicit HKCU `Enabled` = 1 is `user`); `machine` = disabled by HKLM
+  `Enabled` = 0; `manifest` = disabled by the POSIX manifest's
+  `"enabled": false`; `default` = enabled with no per-user value — which
+  includes an explicit HKLM `Enabled` = 1 or `"enabled": true`, because the
+  shared row reader records the value, not its presence.
 - `displayxr-cli input enable | disable <id> [--machine]` — the ADR-054
   `enable|disable` verb: `Enabled` on the provider's row, HKCU (per user, no
   admin) by default, HKLM 64-bit view with `--machine`; HKCU wins (§3).
-  Writes even for an unregistered id (with a warning), like `conv enable`.
+  Refuses an id that is not registered (HKLM row / manifest) — non-zero
+  exit, nothing written — since a per-user `Enabled` for it would be an
+  orphan row `input list` can never show.
 - `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` —
   the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
   `input-preferred` file on POSIX, where `--machine` is refused). Every

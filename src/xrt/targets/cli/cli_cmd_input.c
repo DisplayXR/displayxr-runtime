@@ -86,12 +86,7 @@ provider_registered(const char *id)
 {
 	struct target_input_plugin_desc list[MAX_PROVIDERS];
 	const int n = target_input_plugin_enumerate(list, MAX_PROVIDERS);
-	for (int i = 0; i < n; i++) {
-		if (strcmp(list[i].id, id) == 0) {
-			return true;
-		}
-	}
-	return false;
+	return cli_input_find(list, n, id) >= 0;
 }
 
 static int
@@ -388,7 +383,10 @@ cmd_enable(const char *id, bool enable, bool machine)
 		return 1;
 	}
 	if (!provider_registered(id)) {
-		P("warning: '%s' is not a registered input provider; writing the value anyway.\n", id);
+		// A per-user Enabled for an unregistered id would be an orphan row
+		// that `input list` can never show: refuse, write nothing.
+		P("FAIL: '%s' is not a registered input provider (see 'input list') — nothing written.\n", id);
+		return 1;
 	}
 	const int rc = write_result(
 	    store_set_enabled(id, enable, machine),
