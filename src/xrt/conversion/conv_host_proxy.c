@@ -1215,9 +1215,13 @@ on_host_gone(struct proxy *p, int32_t code, bool orderly, bool had_demand)
 
 /*!
  * The host process exited with @p code: classify, tear down, tell the
- * supervisor. An exit 0 with no demand is the host's own idle exit (orderly:
- * no accounting, no respawn until demand); 20 is closed for update; an exit
- * after our SHUTDOWN is orderly; anything else is a crash.
+ * supervisor. An exit 0 is the host's own idle exit (orderly: no accounting,
+ * no respawn until demand) ONLY when nothing was bound to it -- a host never
+ * idles out with an open stream or a warmed model, and Restart Manager's
+ * forced kill reports 0 (#2056); 20 is closed for update; an exit after our
+ * SHUTDOWN is orderly; anything else, and any exit of a host we were killing,
+ * is a crash. The core gets the verdict, never a raw 0 / 20 that disagrees
+ * with it (CONV_HOST_LOST_ABNORMAL).
  */
 static bool
 demand_locked(const struct proxy *p);
@@ -1228,15 +1232,28 @@ static void
 host_exited(struct proxy *p, int32_t code)
 {
 	os_mutex_lock(&p->m);
-	const bool stopping = p->sup.state == CONV_SUP_STOPPING;
+	const bool stopping = p->sup.state == CONV_SUP_STOPPING ||
+	                      (p->sup.state == CONV_SUP_KILLING && p->sup.kill_reason == CONV_SUP_KILL_LATE_SHUTDOWN);
+	const bool killed = p->sup.state == CONV_SUP_KILLING && !stopping;
 	const bool had_demand = demand_locked(p);
-	// Exit 0 is the host's own orderly (idle) exit, demand or not: a command
-	// that raced it is a casualty and re-sent to the next host, which the
-	// demand spawns at once. No crash accounting either way.
-	const bool idle = code == CONV_HOST_EXIT_ORDERLY && !stopping;
-	const bool orderly = stopping || idle || code == CONV_HOST_EXIT_UPDATE;
+	bool bound = p->open_streams > 0;
+	for (uint32_t i = 0; i < p->cap_count && !bound; i++) {
+		bound = p->states[i].state == XRT_CONV_STATE_READY || p->states[i].state == XRT_CONV_STATE_WARMING;
+	}
+	// Exit 0 with nothing bound is the host's own orderly (idle) exit, queued
+	// demand or not: a command that raced it is a casualty and re-sent to the
+	// next host, which the demand spawns at once. No crash accounting.
+	const bool idle = code == CONV_HOST_EXIT_ORDERLY && !stopping && !killed && !bound;
+	const bool update = code == CONV_HOST_EXIT_UPDATE && !killed;
+	const bool orderly = stopping || idle || update;
+	const int32_t detail = orderly ? (update ? CONV_HOST_EXIT_UPDATE : CONV_HOST_EXIT_ORDERLY)
+	                               : (conv_host_exit_is_crash(code) ? code : CONV_HOST_LOST_ABNORMAL);
 	os_mutex_unlock(&p->m);
-	on_host_gone(p, code, orderly, had_demand && orderly);
+	if (!orderly && detail != code) {
+		U_LOG_W("[conv:%s] host exit code %d with work bound to it%s: a crash (reported to the core as %d)",
+		        p->provider_id, (int)code, killed ? " while being killed" : "", (int)detail);
+	}
+	on_host_gone(p, detail, orderly, had_demand && orderly);
 	os_mutex_lock(&p->m);
 	if (idle) {
 		conv_supervisor_idle_exited(&p->sup, now_ns());
@@ -1492,13 +1509,12 @@ sup_main(void *ptr)
 			conv_supervisor_spawned(&p->sup, now_ns(), started);
 			os_mutex_unlock(&p->m);
 			if (!ok) {
-				on_host_gone(p, code, false, false);
 				if (started) {
-					os_mutex_lock(&p->m);
-					conv_supervisor_exited(&p->sup, now_ns(), code);
-					os_mutex_unlock(&p->m);
+					host_exited(p, code);
+				} else {
+					on_host_gone(p, code, false, false);
+					report_terminal(p);
 				}
-				report_terminal(p);
 			}
 			continue;
 		}
@@ -1556,6 +1572,42 @@ sup_main(void *ptr)
 
 /*! Wait until the host is RUNNING (true) or the command cannot be served
  *  (false: proxy stopping, or the supervisor gave up). p->m held. */
+/*!
+ * The host is down and no command may wait for it (workspace-stability rule:
+ * no unbounded waits): a respawn after a crash (backoff, then its start), a
+ * close for update, a held maintenance mutex, a kill, a terminal failure. Only
+ * the very first lazy start of an idle host is waited for (bounded by the
+ * accept and hello timeouts) -- the queued command is that spawn's demand.
+ */
+static bool
+host_down_locked(const struct proxy *p)
+{
+	if (p->running) {
+		return false;
+	}
+	switch (p->sup.state) {
+	case CONV_SUP_BACKOFF:
+	case CONV_SUP_UPDATING:
+	case CONV_SUP_KILLING:
+	case CONV_SUP_STOPPING:
+	case CONV_SUP_FAILED:
+	case CONV_SUP_STOPPED: return true;
+	case CONV_SUP_IDLE: return p->sup.maintenance_held || p->restart_owed;
+	case CONV_SUP_STARTING: return p->restart_owed;
+	default: return false;
+	}
+}
+
+//! A refused command still says "someone wants this host": the respawn is owed.
+static void
+note_refused_demand_locked(struct proxy *p)
+{
+	if (p->sup.state != CONV_SUP_FAILED && p->sup.state != CONV_SUP_STOPPED && !p->stop) {
+		p->restart_owed = true;
+		os_cond_broadcast(&p->cond);
+	}
+}
+
 static bool
 wait_running_locked(struct proxy *p)
 {
@@ -1566,10 +1618,9 @@ wait_running_locked(struct proxy *p)
 		if (p->running) {
 			return true;
 		}
-		struct conv_supervisor_status st;
-		conv_supervisor_get_status(&p->sup, &st);
-		if (st.state == CONV_SUP_FAILED || st.state == CONV_SUP_STOPPED) {
-			return false;
+		if (host_down_locked(p)) {
+			note_refused_demand_locked(p);
+			return false; // never wait for a host that is down (completes CONV_CMD_HOST_DOWN)
 		}
 		os_cond_wait_timeout_ns(&p->cond, &p->m, (uint64_t)PX_SLICE_MS * 1000000ull);
 	}
@@ -2272,6 +2323,7 @@ worker_main(void *ptr)
 				p->queued--;
 				os_mutex_unlock(&p->m);
 				c->next_ = NULL;
+				c->blocked |= CONV_CMD_HOST_DOWN;
 				c->result = XRT_ERROR_IPC_FAILURE;
 				c->end_ns = now_ns();
 				c->on_complete(c);
@@ -2447,14 +2499,16 @@ px_submit(struct conv_host *h, struct conv_host_cmd *cmd)
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	os_mutex_lock(&p->m);
-	struct conv_supervisor_status st;
-	conv_supervisor_get_status(&p->sup, &st);
-	if (p->stop || st.state == CONV_SUP_FAILED || st.state == CONV_SUP_STOPPED) {
+	cmd->blocked = 0;
+	if (p->stop || host_down_locked(p)) {
+		// Refused at once, never queued behind a host that is not coming
+		// back on its own (#2056): the caller keeps its frame pending.
+		note_refused_demand_locked(p);
+		cmd->blocked |= CONV_CMD_HOST_DOWN;
 		os_mutex_unlock(&p->m);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	cmd->result = XRT_SUCCESS;
-	cmd->blocked = 0;
 	cmd->queued_ns = now_ns();
 	cmd->start_ns = cmd->end_ns = 0;
 	cmd->next_ = NULL;
@@ -2597,6 +2651,16 @@ px_abandon(struct conv_host *h)
 	os_mutex_unlock(&p->m);
 }
 
+static bool
+px_is_down(struct conv_host *h)
+{
+	struct proxy *p = px(h);
+	os_mutex_lock(&p->m);
+	const bool down = p->stop || host_down_locked(p);
+	os_mutex_unlock(&p->m);
+	return down;
+}
+
 static uint32_t
 px_get_epoch(struct conv_host *h)
 {
@@ -2666,6 +2730,7 @@ static const struct conv_host_ops k_proxy_ops = {
     .heartbeat = px_heartbeat,
     .abandon = px_abandon,
     .get_epoch = px_get_epoch,
+    .is_down = px_is_down,
     .destroy = px_destroy,
 };
 

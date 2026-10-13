@@ -142,6 +142,24 @@ u_lift_mailbox_finish_input(struct u_lift_mailbox *mb, int32_t slot)
 	}
 }
 
+void
+u_lift_mailbox_return_input(struct u_lift_mailbox *mb, int32_t slot)
+{
+	if (!slot_ok_in(slot) || mb->in_state[slot] != U_LIFT_IN_CONVERTING) {
+		return;
+	}
+	for (int32_t i = 0; i < U_LIFT_INPUT_SLOTS; i++) {
+		if (i != slot && mb->in_state[i] == U_LIFT_IN_PENDING &&
+		    mb->in_meta[i].frame_id > mb->in_meta[slot].frame_id) {
+			mb->in_state[slot] = U_LIFT_IN_FREE; // superseded while it was out
+			mb->dropped++;
+			return;
+		}
+	}
+	mb->in_state[slot] = U_LIFT_IN_PENDING;
+	mb->in_meta[slot].convert_start_ns = 0;
+}
+
 bool
 u_lift_mailbox_begin_output(struct u_lift_mailbox *mb, int32_t *out_slot)
 {

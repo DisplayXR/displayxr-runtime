@@ -162,6 +162,14 @@ void
 u_lift_mailbox_finish_input(struct u_lift_mailbox *mb, int32_t slot);
 
 /*!
+ * Hand a taken (CONVERTING) frame back unconverted: it is PENDING again, unless
+ * a newer frame was committed meanwhile, which supersedes it (dropped, as at
+ * commit). For a worker that found its backend down before it could start.
+ */
+void
+u_lift_mailbox_return_input(struct u_lift_mailbox *mb, int32_t slot);
+
+/*!
  * Pick an output slot to write: never the latest result, never a pinned slot,
  * never one already being written. False = wait (a consumer still holds the
  * only candidate).

@@ -64,6 +64,9 @@ extern "C" {
 #define CONV_CMD_BLOCKED_BY_JOB (1u << 0)   //!< a job without LANES_CONCURRENT was in flight
 #define CONV_CMD_BLOCKED_BY_WARM (1u << 1)  //!< a warm without WARM_CONCURRENT was in flight
 #define CONV_CMD_BLOCKED_BY_OTHER (1u << 2) //!< another serialised call was in flight
+//! Refused at once: the host process is down (backoff, update, maintenance).
+//! Not a failure of the call or the capability: retry after RESTORED.
+#define CONV_CMD_HOST_DOWN (1u << 3)
 /*! @} */
 
 /*! One [S] call. Caller-owned until on_complete returns. */
@@ -108,6 +111,11 @@ struct conv_host_cmd
 //! CONV_HOST_EXIT_*; anything unlisted = crash). The epoch was already bumped; in-flight commands
 //! complete as XRT_ERROR_IPC_FAILURE; registrations and provider streams are gone.
 #define CONV_HOST_EV_LOST 1u
+//! CONV_HOST_EV_LOST detail when the supervisor classified an exit as abnormal
+//! although its code reads orderly (an exit 0 the service did not ask for, a
+//! kill whose victim managed to return 0 / 20): the core follows the
+//! supervisor's verdict, never the raw code. Counts as a crash.
+#define CONV_HOST_LOST_ABNORMAL (-2)
 //! A fresh host process is up and described (after the supervisor's backoff):
 //! re-warm, re-open streams, re-register images.
 #define CONV_HOST_EV_RESTORED 2u
@@ -192,6 +200,13 @@ struct conv_host_ops
 
 	/*! The current host-process incarnation. NULL = in-service (always 0). */
 	uint32_t (*get_epoch)(struct conv_host *h);
+
+	/*! [any thread, never blocks] The host process is down and will not come
+	 *  back until RESTORED (backoff, closed for update, maintenance mutex held,
+	 *  failed): submit refuses at once with CONV_CMD_HOST_DOWN. Callers keep
+	 *  their frames pending instead of failing them (no unbounded waits,
+	 *  workspace-stability rule). NULL = never (in-service). */
+	bool (*is_down)(struct conv_host *h);
 
 	/*! Orderly shutdown: cancel (is_cancelled turns true), drain, destroy the
 	 *  provider instance, join. A hung host is leaked instead. */
@@ -292,6 +307,12 @@ static inline uint32_t
 conv_host_get_epoch(struct conv_host *h)
 {
 	return h->ops->get_epoch != NULL ? h->ops->get_epoch(h) : 0u;
+}
+
+static inline bool
+conv_host_is_down(struct conv_host *h)
+{
+	return h != NULL && h->ops->is_down != NULL && h->ops->is_down(h);
 }
 
 static inline void

@@ -381,8 +381,9 @@ ensure_pstream(
 	cmd.stream_info = &info;
 	const xrt_result_t r = conv_host_call(host, &cmd);
 	if (r != XRT_SUCCESS) {
-		if (conv_host_get_epoch(host) != epoch) {
-			return false; // the host died under the create: retried on the next incarnation
+		if (conv_host_get_epoch(host) != epoch || (cmd.blocked & CONV_CMD_HOST_DOWN) != 0 ||
+		    conv_host_is_down(host)) {
+			return false; // the host died / is down: retried on the next incarnation
 		}
 		st->pstream_failed = true;
 		st->pstream_epoch = epoch;
@@ -963,9 +964,19 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		}
 	}
 
+	// The host is down (crash backoff, closed for update): the frame was never
+	// converted. Hand it back -- it stays pending, latest-wins, exactly as
+	// while the task is WARMING -- instead of failing it (#2056).
+	const bool host_down = !ok && host != NULL &&
+	                       (conv_host_is_down(host) || (pf != NULL && (pf->blocked & CONV_CMD_HOST_DOWN) != 0));
+
 	// S8: publish.
 	os_mutex_lock(&core->streams_mtx);
-	u_lift_mailbox_finish_input(&st->mb, in_slot);
+	if (host_down) {
+		u_lift_mailbox_return_input(&st->mb, in_slot);
+	} else {
+		u_lift_mailbox_finish_input(&st->mb, in_slot);
+	}
 	if (pf != NULL) {
 		if ((pf->blocked & CONV_CMD_BLOCKED_BY_JOB) != 0) {
 			st->stats.blocked_by_job++;
@@ -1011,7 +1022,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		} else {
 			u_lift_mailbox_abort_output(&st->mb, out_slot);
 		}
-	} else if (!ok) {
+	} else if (!ok && !host_down) {
 		st->mb.failed++;
 	}
 	if (!ok) {
@@ -1038,7 +1049,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 
 	// A failure because the host process died is the crash path's (LOST),
 	// never a provider failure of the row.
-	if (!ok && pr != XRT_SUCCESS && host != NULL && conv_host_get_epoch(host) == epoch) {
+	if (!ok && !host_down && pr != XRT_SUCCESS && host != NULL && conv_host_get_epoch(host) == epoch) {
 		os_mutex_unlock(&core->streams_mtx);
 		conv_core_call_failed(core, s.bind.provider, s.bind.cap_id, pr);
 		os_mutex_lock(&core->streams_mtx);
@@ -1071,6 +1082,9 @@ gate_locked(struct conv_core *core, struct conv_stream *st)
 	const uint32_t state = conv_core_row_state_locked(core, st->bind.provider, st->bind.cap_id);
 	st->stats.row_state = state;
 	bool ready = state == XRT_CONV_STATE_READY;
+	if (ready && conv_host_is_down(conv_core_host(core, st->bind.provider))) {
+		ready = false; // the frame stays pending until the host is back (#2056)
+	}
 	// Refine the provisional pipeline against the READY capability. An
 	// unsatisfied stream is re-tried on every gate pass: a provider's describe
 	// is refined asynchronously (the control thread re-describes when the
