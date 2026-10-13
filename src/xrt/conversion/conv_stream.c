@@ -11,6 +11,7 @@
 #include "os/os_time.h"
 #include "util/u_logging.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -490,6 +491,131 @@ provider_targets(struct conv_ring_slot *o, struct conv_host *host, struct xrt_co
 	}
 }
 
+/*
+ *
+ * Still-image dedupe (#2030). A PHOTO stream's producer resubmits an unchanged
+ * picture at page rate; converting it again buys nothing. When the input's
+ * content and every S3 decision equal what the latest result was converted
+ * from, that result is republished under the new frame id instead.
+ *
+ */
+
+static uint64_t
+mix64(uint64_t h, uint64_t v)
+{
+	h ^= v;
+	h *= 0x9E3779B97F4A7C15ull;
+	return h ^ (h >> 31);
+}
+
+//! The cheap content check for a CPU-memory input: every byte, 8 at a time.
+static uint64_t
+hash_cpu_image(uint64_t h, const struct xrt_conv_image *img)
+{
+	const uint8_t *p = (const uint8_t *)img->cpu_ptr;
+	uint64_t n = img->byte_size;
+	while (n >= 8) {
+		uint64_t v;
+		memcpy(&v, p, 8);
+		h = mix64(h, v);
+		p += 8;
+		n -= 8;
+	}
+	uint64_t tail = 0;
+	for (uint64_t i = 0; i < n; i++) {
+		tail |= (uint64_t)p[i] << (8 * i);
+	}
+	return mix64(h, tail ^ (n << 56));
+}
+
+/*! The identity of a committed input's content: the producer's key, else the
+ *  CPU pixels themselves. 0 = unknown (a GPU input without a key). */
+static uint64_t
+input_content_key(const struct conv_in_slot *in)
+{
+	const struct conv_frame_submit *fr = &in->frame;
+	uint64_t h = mix64(0xCBF29CE484222325ull, fr->content_key);
+	for (uint32_t i = 0; i < in->image_count; i++) {
+		const struct xrt_conv_image *img = &in->images[i];
+		h = mix64(h, ((uint64_t)img->width << 32) | img->height);
+		h = mix64(h, ((uint64_t)img->format << 32) | in->role[i]);
+		if (fr->content_key != 0) {
+			continue;
+		}
+		if (img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == NULL || img->byte_size == 0) {
+			return 0;
+		}
+		h = hash_cpu_image(h, img);
+	}
+	return in->image_count == 0 ? 0 : (h != 0 ? h : 1);
+}
+
+static bool
+near_eq(float a, float b)
+{
+	return fabsf(a - b) <= 1e-5f + 1e-5f * fabsf(b);
+}
+
+//! S3's decisions equal (frame id / time / flags excluded).
+static bool
+still_params_equal(const struct xrt_conv_params *a, const struct xrt_conv_params *b)
+{
+	if (a->convergence_mode != b->convergence_mode || a->view_count != b->view_count ||
+	    a->content_hint != b->content_hint || a->viewpoint_frame != b->viewpoint_frame ||
+	    a->viewpoint_source != b->viewpoint_source || a->axis_mode != b->axis_mode ||
+	    a->viewpoint_count != b->viewpoint_count) {
+		return false;
+	}
+	if (!near_eq(a->convergence, b->convergence) || !near_eq(a->strength, b->strength) ||
+	    !near_eq(a->input_scale, b->input_scale) || !near_eq(a->focal_px, b->focal_px) ||
+	    !near_eq(a->rect_width_m, b->rect_width_m) || !near_eq(a->rect_height_m, b->rect_height_m) ||
+	    !near_eq(a->baseline_m, b->baseline_m) || !near_eq(a->max_offset_m, b->max_offset_m) ||
+	    !near_eq(a->nominal_z_m, b->nominal_z_m)) {
+		return false;
+	}
+	const uint32_t n = a->viewpoint_count < XRT_CONV_MAX_VIEWS ? a->viewpoint_count : XRT_CONV_MAX_VIEWS;
+	for (uint32_t i = 0; i < n; i++) {
+		for (uint32_t k = 0; k < 3; k++) {
+			if (!near_eq(a->viewpoints_xyz[i][k], b->viewpoints_xyz[i][k])) {
+				return false;
+			}
+		}
+	}
+	return memcmp(&a->stereo, &b->stereo, sizeof(a->stereo)) == 0;
+}
+
+static void
+still_params_key(const struct xrt_conv_params *in, struct xrt_conv_params *out)
+{
+	memcpy(out, in, sizeof(*out));
+	out->frame_flags = 0;
+	out->source_time_ns = 0;
+	out->frame_id = 0;
+}
+
+/*! streams_mtx held. Republish the latest result under @p meta's frame id
+ *  (the new input's): consumers see a newer frame, the provider sees nothing. */
+static void
+republish_latest_locked(struct conv_stream *st,
+                        const struct u_lift_frame_meta *meta,
+                        const struct conv_frame_submit *fr)
+{
+	const int32_t l = st->mb.latest;
+	const uint64_t t = now_ns();
+	struct u_lift_frame_meta *m = &st->mb.out_meta[l];
+	*m = *meta;
+	m->done_ns = t;
+	st->mb.last_publish_ns = t;
+	// The echoes follow the new frame (a moved rect with the same picture).
+	struct conv_ring_slot *o = &st->out[l];
+	memcpy(o->active, fr->active, sizeof(o->active));
+	if (fr->rect_valid) {
+		memcpy(o->rect_center, fr->rect_center, sizeof(o->rect_center));
+		o->rect_size[0] = fr->rect_w_m;
+		o->rect_size[1] = fr->rect_h_m;
+	}
+}
+
 struct convert_snapshot
 {
 	struct conv_binding bind;
@@ -500,6 +626,8 @@ struct convert_snapshot
 	bool validated;
 	uint32_t cap_flags;
 	bool legacy_units; //!< CONV_PROV_LEGACY_UNITS (the dp-lift adapter)
+	uint64_t eyes_dp;
+	int32_t latest_slot; //!< the published result (dedupe); -1 = none
 };
 
 /*! streams_mtx held on entry and exit. */
@@ -533,6 +661,12 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	s.frame = st->in[in_slot].frame;
 	s.reset = st->reset_pending;
 	s.discont = st->discontinuity_pending;
+	s.eyes_dp = st->opts.eyes_dp;
+	s.latest_slot = -1;
+	if (st->mb.latest >= 0 && st->mb.latest < (int32_t)U_LIFT_RING_SIZE &&
+	    st->mb.out_state[st->mb.latest] == U_LIFT_OUT_READY) {
+		s.latest_slot = st->mb.latest;
+	}
 	st->reset_pending = false;
 	st->discontinuity_pending = false;
 	os_mutex_lock(&core->registry_mtx);
@@ -556,6 +690,14 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	struct conv_ring_slot *o = out_slot >= 0 ? &st->out[out_slot] : NULL;
 	ok = ok && o != NULL && ensure_targets(core, st, o, host, meta.width, meta.height);
 
+	// Dedupe applies to PHOTO only, and never across a reset / rebind (which
+	// still record what they converted, for the frames after them).
+	const bool still = ok && st->content_hint == XRT_CONV_CONTENT_PHOTO;
+	const uint64_t still_key = still ? input_content_key(&st->in[in_slot]) : 0;
+	bool dedupe = false;
+	struct xrt_conv_params still_params;
+	memset(&still_params, 0, sizeof(still_params));
+
 	if (ok) {
 		// S3: policy (runtime-owned; the provider only receives its results).
 		struct xrt_conv_params *pa = &pf->params;
@@ -575,7 +717,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		}
 		if ((s.pipe.stages & CONV_STAGE_S3_POLICY) != 0) {
 			struct conv_eyes eyes;
-			conv_core_read_eyes(core, st->opts.eyes_dp, t0, &eyes);
+			conv_core_eyes_read(core, s.eyes_dp, t0, &eyes);
 			struct conv_policy_view_in vin;
 			memset(&vin, 0, sizeof(vin));
 			vin.view_count = s.pipe.view_count;
@@ -646,6 +788,17 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			}
 		}
 
+		still_params_key(pa, &still_params);
+		dedupe = still_key != 0 && !s.reset && !s.discont && st->still.valid && st->still.content_key == still_key &&
+		         s.latest_slot >= 0 && s.latest_slot == st->still.out_slot &&
+		         st->still.bind.provider == s.bind.provider && st->still.bind.cap_id == s.bind.cap_id &&
+		         st->still.bind.composed == s.bind.composed && st->still.outputs == s.pipe.outputs &&
+		         st->still.provisional == s.pipe.provisional &&
+		         still_params_equal(&still_params, &st->still.params) &&
+		         near_eq(pf->budget, st->still.budget) && near_eq(pf->rear_cap_m, st->still.rear_cap_m);
+	}
+
+	if (ok && !dedupe) {
 		pf->host = host;
 		pf->cap_id = s.bind.cap_id;
 		pf->provider_stream = st->pstream;
@@ -681,7 +834,12 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		}
 	}
 	if (out_slot >= 0) {
-		if (ok) {
+		if (dedupe) {
+			u_lift_mailbox_abort_output(&st->mb, out_slot);
+			st->mb.failed--; // the slot was never written: not a failed conversion
+			republish_latest_locked(st, &meta, &s.frame);
+			st->stats.deduped++;
+		} else if (ok) {
 			o->written = pf->result.written;
 			o->views_info = pf->result.views_info;
 			o->depth_info = pf->result.depth_info;
@@ -697,6 +855,17 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			o->discontinuity = s.discont;
 			o->provisional = s.pipe.provisional;
 			u_lift_mailbox_publish_output(&st->mb, out_slot, &meta, now_ns());
+			st->still.valid = still_key != 0;
+			if (st->still.valid) {
+				st->still.content_key = still_key;
+				st->still.out_slot = out_slot;
+				st->still.bind = s.bind;
+				st->still.outputs = s.pipe.outputs;
+				st->still.provisional = s.pipe.provisional;
+				st->still.params = still_params;
+				st->still.budget = pf->budget;
+				st->still.rear_cap_m = pf->rear_cap_m;
+			}
 		} else {
 			u_lift_mailbox_abort_output(&st->mb, out_slot);
 		}
@@ -704,6 +873,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		st->mb.failed++;
 	}
 	if (!ok) {
+		st->still.valid = false;
 		// A failed conversion keeps the previous result and owes the flags.
 		st->reset_pending = st->reset_pending || s.reset;
 		st->discontinuity_pending = st->discontinuity_pending || s.discont;
@@ -713,11 +883,12 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	if (t - st->last_stats_log_ns > CONV_STATS_LOG_NS) {
 		st->last_stats_log_ns = t;
 		U_LOG_I(
-		    "[conv] stream %llu: submitted=%llu converted=%llu dropped=%llu failed=%llu "
+		    "[conv] stream %llu: submitted=%llu converted=%llu deduped=%llu dropped=%llu failed=%llu "
 		    "blocked_by_job=%llu blocked_by_warm=%llu latency ema=%.1fms",
 		    (unsigned long long)st->id, (unsigned long long)st->mb.submitted,
-		    (unsigned long long)st->mb.converted, (unsigned long long)st->mb.dropped,
-		    (unsigned long long)st->mb.failed, (unsigned long long)st->stats.blocked_by_job,
+		    (unsigned long long)st->mb.converted, (unsigned long long)st->stats.deduped,
+		    (unsigned long long)st->mb.dropped, (unsigned long long)st->mb.failed,
+		    (unsigned long long)st->stats.blocked_by_job,
 		    (unsigned long long)st->stats.blocked_by_warm, st->mb.lat_ema_ns / 1e6);
 	}
 	os_cond_broadcast(&lane->cond);
@@ -981,7 +1152,7 @@ conv_core_stream_create(struct conv_core *core,
 	}
 	struct conv_stream_options o;
 	memset(&o, 0, sizeof(o));
-	o.eyes_dp = -1;
+	o.eyes_dp = CONV_EYES_DP_ANY;
 	if (opts != NULL) {
 		o = *opts;
 	}
@@ -1241,6 +1412,9 @@ conv_core_stream_commit_submit(struct conv_core *core,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	st->in[slot].frame = *frame;
+	if (frame->eyes_dp_set) {
+		st->opts.eyes_dp = frame->eyes_dp; // the rect moved to another DP's screen: follow it
+	}
 	if ((frame->frame_flags & XRT_CONV_FRAME_RESET) != 0) {
 		// Applies even when this frame is superseded before conversion.
 		st->reset_pending = true;
@@ -1255,6 +1429,18 @@ conv_core_stream_commit_submit(struct conv_core *core,
 		*out_frame_id = fid;
 	}
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+conv_core_stream_bind_eyes(struct conv_core *core, uint64_t stream_id, uint64_t dp_key)
+{
+	os_mutex_lock(&core->streams_mtx);
+	struct conv_stream *st = find_locked(core, stream_id);
+	if (st != NULL) {
+		st->opts.eyes_dp = dp_key;
+	}
+	os_mutex_unlock(&core->streams_mtx);
+	return st != NULL ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
 void

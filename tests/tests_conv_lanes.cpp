@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -1339,3 +1340,380 @@ TEST_CASE("core: conv_hint_interest prewarms the default tasks; nothing register
 	CHECK(f.destroyed);
 	conv_fake_fini(&f);
 }
+
+
+/*
+ *
+ * #2030: still-image dedupe and per-DP eyes.
+ *
+ */
+
+namespace {
+
+xrt_conv_wire_stream_desc
+photo_desc(uint32_t task, uint32_t outputs, uint32_t views, uint32_t hint)
+{
+	xrt_conv_wire_stream_desc d = stream_desc(task, outputs, views);
+	d.content_hint = hint;
+	return d;
+}
+
+//! One frame whose pixels are all @p fill; optionally rebinding the eyes.
+bool
+submit_fill(conv_core *c, uint64_t sid, uint8_t fill, uint32_t flags = 0, uint64_t eyes_dp = 0, bool rebind = false)
+{
+	conv_submit_layout lay{};
+	lay.image_count = 1;
+	lay.width[0] = 64;
+	lay.height[0] = 32;
+	lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+	lay.color_space[0] = XRT_CONV_CS_SRGB;
+	lay.role[0] = XRT_CONV_IMG_COLOR;
+	conv_submit_slot slot{};
+	if (conv_core_stream_begin_submit(c, sid, &lay, &slot) != XRT_SUCCESS) {
+		return false;
+	}
+	std::memset(slot.images[0].cpu_ptr, fill, (size_t)slot.images[0].byte_size);
+	conv_frame_submit fr{};
+	fr.source_time = (int64_t)now_ns();
+	fr.frame_flags = flags;
+	fr.rect_valid = true;
+	fr.rect_w_m = 0.30f;
+	fr.rect_h_m = 0.20f;
+	fr.eyes_dp_set = rebind;
+	fr.eyes_dp = eyes_dp;
+	uint64_t fid = 0;
+	return conv_core_stream_commit_submit(c, sid, slot.slot, &fr, &fid) == XRT_SUCCESS;
+}
+
+//! Every committed frame has been converted, deduped, dropped or failed.
+bool
+drained(conv_core *c, uint64_t sid)
+{
+	conv_stream_stats s{};
+	if (conv_core_stream_get_stats(c, sid, &s) != XRT_SUCCESS) {
+		return false;
+	}
+	return s.converted + s.deduped + s.dropped + s.failed >= s.submitted;
+}
+
+//! Submit @p n identical frames, one at a time (none superseded).
+void
+submit_n(conv_core *c, uint64_t sid, uint8_t fill, int n)
+{
+	for (int i = 0; i < n; i++) {
+		REQUIRE(submit_fill(c, sid, fill));
+		REQUIRE(wait_until([&] { return drained(c, sid); }, 2000));
+	}
+}
+
+conv_eyes
+eyes_pair(float ipd, float z, bool tracking = true)
+{
+	conv_eyes e{};
+	e.valid = true;
+	e.is_tracking = tracking;
+	e.count = 2;
+	e.xyz[0][0] = -ipd * 0.5f;
+	e.xyz[1][0] = ipd * 0.5f;
+	e.xyz[0][2] = e.xyz[1][2] = z;
+	e.timestamp_ns = now_ns();
+	return e;
+}
+
+} // namespace
+
+TEST_CASE("stream: an unchanged PHOTO input is republished, not re-converted", "[conv_lanes][dedupe]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+	                                     XRT_CONV_OUT_VIEWS, XRT_CONV_CAP_EXPLICIT_VIEWPOINTS);
+	c->convert_ms = 1;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 100) >= 0);
+		auto d = photo_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2, XRT_CONV_CONTENT_PHOTO);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		const uint64_t sid = cr.stream_id;
+
+		// First frame converts; the identical ones after it never reach the provider.
+		submit_n(core.c, sid, 0x80, 1);
+		REQUIRE(wait_until([&] { return stats(core.c, sid).converted >= 1; }, 3000));
+		submit_n(core.c, sid, 0x80, 30);
+		conv_stream_stats s = stats(core.c, sid);
+		CHECK(s.converted == 1u);
+		CHECK(s.deduped == 30u);
+		uint64_t provider_converts = 0;
+		{
+			os_mutex_lock(&f.mtx);
+			provider_converts = f.converts;
+			os_mutex_unlock(&f.mtx);
+		}
+		CHECK(provider_converts == 1u);
+
+		// The republished result carries the newest frame id.
+		conv_result r{};
+		REQUIRE(conv_core_stream_acquire(core.c, sid, false, &r) == XRT_SUCCESS);
+		CHECK(r.frame_id == s.submitted);
+		CHECK((r.written & XRT_CONV_OUT_VIEWS) != 0u);
+		conv_core_stream_release(core.c, sid, r.ring_slot);
+
+		// A changed picture converts; so does an app reset of the same one.
+		submit_n(core.c, sid, 0x81, 1);
+		CHECK(stats(core.c, sid).converted == 2u);
+		REQUIRE(submit_fill(core.c, sid, 0x81, XRT_CONV_FRAME_RESET));
+		REQUIRE(wait_until([&] { return drained(core.c, sid); }, 2000));
+		CHECK(stats(core.c, sid).converted == 3u);
+		submit_n(core.c, sid, 0x81, 5);
+		CHECK(stats(core.c, sid).converted == 3u);
+
+		// New eyes are a new S3 decision: the views must follow them.
+		conv_eyes e = eyes_pair(0.064f, 0.6f);
+		conv_core_eyes_publish(core.c, 0x1000, &e);
+		submit_n(core.c, sid, 0x81, 1);
+		CHECK(stats(core.c, sid).converted == 4u);
+		REQUIRE(conv_core_stream_destroy(core.c, sid) == XRT_SUCCESS);
+
+		// A VIDEO stream of the same unchanged picture converts every frame.
+		auto dv = photo_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2, XRT_CONV_CONTENT_VIDEO);
+		xrt_conv_wire_stream_created cv{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &dv, nullptr, &cv) == XRT_SUCCESS);
+		submit_n(core.c, cv.stream_id, 0x80, 1);
+		REQUIRE(wait_until([&] { return stats(core.c, cv.stream_id).converted >= 1; }, 3000));
+		submit_n(core.c, cv.stream_id, 0x80, 10);
+		s = stats(core.c, cv.stream_id);
+		CHECK(s.deduped == 0u);
+		CHECK(s.converted + s.dropped == 11u);
+		CHECK(s.converted >= 10u);
+		REQUIRE(conv_core_stream_destroy(core.c, cv.stream_id) == XRT_SUCCESS);
+	}
+	CHECK(g_live_images.load() == 0);
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("stream: a producer content key decides for GPU inputs", "[conv_lanes][dedupe]")
+{
+	// The core cannot read a GPU input: without a key it always converts, with
+	// one equal keys dedupe. Simulated by keying CPU frames whose pixels differ
+	// (the key wins over the bytes).
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 1, XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	c->convert_ms = 1;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 100) >= 0);
+		auto d = photo_desc(XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_OUT_DEPTH, 0, XRT_CONV_CONTENT_PHOTO);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		const uint64_t sid = cr.stream_id;
+		auto keyed = [&](uint8_t fill, uint64_t key) {
+			conv_submit_layout lay{};
+			lay.image_count = 1;
+			lay.width[0] = 64;
+			lay.height[0] = 32;
+			lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+			lay.role[0] = XRT_CONV_IMG_COLOR;
+			conv_submit_slot slot{};
+			REQUIRE(conv_core_stream_begin_submit(core.c, sid, &lay, &slot) == XRT_SUCCESS);
+			std::memset(slot.images[0].cpu_ptr, fill, (size_t)slot.images[0].byte_size);
+			conv_frame_submit fr{};
+			fr.content_key = key;
+			uint64_t fid = 0;
+			REQUIRE(conv_core_stream_commit_submit(core.c, sid, slot.slot, &fr, &fid) == XRT_SUCCESS);
+			REQUIRE(wait_until([&] { return drained(core.c, sid); }, 2000));
+		};
+		// The first result feeds the next frame's policy (the last depth range):
+		// settle on two frames, then count.
+		keyed(1, 42);
+		REQUIRE(wait_until([&] { return stats(core.c, sid).converted >= 1; }, 3000));
+		keyed(1, 42);
+		const uint64_t c1 = stats(core.c, sid).converted;
+		const uint64_t d1 = stats(core.c, sid).deduped;
+		keyed(2, 42);
+		keyed(3, 42);
+		CHECK(stats(core.c, sid).converted == c1);
+		CHECK(stats(core.c, sid).deduped == d1 + 2u);
+		keyed(3, 43);
+		CHECK(stats(core.c, sid).converted == c1 + 1u);
+		REQUIRE(conv_core_stream_destroy(core.c, sid) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("policy: per-DP eyes — a stream reads the DP that owns its rect", "[conv_lanes][eyes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+	                                     XRT_CONV_OUT_VIEWS, XRT_CONV_CAP_EXPLICIT_VIEWPOINTS);
+	c->convert_ms = 1;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 100) >= 0);
+		const uint64_t dp_a = 0xA000, dp_b = 0xB000;
+
+		// The core's own read: keyed, ANY = the latest publish, unknown = ANY,
+		// retired = stale, NONE = stale.
+		conv_eyes ea = eyes_pair(0.060f, 0.6f), eb = eyes_pair(0.080f, 0.7f), got{};
+		CHECK_FALSE(conv_core_eyes_read(core.c, CONV_EYES_DP_ANY, now_ns(), &got));
+		conv_core_eyes_publish(core.c, dp_a, &ea);
+		conv_core_eyes_publish(core.c, dp_b, &eb);
+		REQUIRE(conv_core_eyes_read(core.c, dp_a, now_ns(), &got));
+		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.060, 1e-6));
+		REQUIRE(conv_core_eyes_read(core.c, dp_b, now_ns(), &got));
+		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.080, 1e-6));
+		REQUIRE(conv_core_eyes_read(core.c, CONV_EYES_DP_ANY, now_ns(), &got));
+		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.080, 1e-6)); // B published last
+		REQUIRE(conv_core_eyes_read(core.c, 0xC000, now_ns(), &got)); // never published: ANY
+		CHECK_FALSE(conv_core_eyes_read(core.c, CONV_EYES_DP_NONE, now_ns(), &got));
+
+		// Streams follow their binding into the provider's viewpoints.
+		auto d = photo_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2, XRT_CONV_CONTENT_VIDEO);
+		xrt_conv_wire_stream_created cr{};
+		conv_stream_options o{};
+		o.eyes_dp = dp_a;
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, &o, &cr) == XRT_SUCCESS);
+		const uint64_t sid = cr.stream_id;
+		auto baseline = [&] {
+			os_mutex_lock(&f.mtx);
+			const xrt_conv_params p = f.last_params;
+			os_mutex_unlock(&f.mtx);
+			return (double)p.viewpoints_xyz[1][0] - (double)p.viewpoints_xyz[0][0];
+		};
+		auto convert_once = [&](uint64_t key, bool rebind) {
+			const uint64_t before = stats(core.c, sid).converted;
+			REQUIRE(submit_fill(core.c, sid, 0x80, 0, key, rebind));
+			REQUIRE(wait_until([&] { return stats(core.c, sid).converted > before; }, 3000));
+		};
+		convert_once(0, false);
+		CHECK(close_to(baseline(), 0.060, 1e-5));
+
+		// The rect moved to B's screen: the submit rebinds.
+		convert_once(dp_b, true);
+		CHECK(close_to(baseline(), 0.080, 1e-5));
+		// A frame that does not name a DP keeps the binding.
+		ea = eyes_pair(0.050f, 0.6f);
+		conv_core_eyes_publish(core.c, dp_a, &ea); // A publishes last: ANY would read A
+		convert_once(0, false);
+		CHECK(close_to(baseline(), 0.080, 1e-5));
+
+		// B goes away: its streams read stale (the nominal viewer), even though
+		// A is still live (another screen's eyes are in another display space).
+		conv_core_eyes_retire(core.c, dp_b);
+		CHECK_FALSE(conv_core_eyes_read(core.c, dp_b, now_ns(), &got));
+		convert_once(0, false);
+		CHECK(close_to(baseline(), CONV_POLICY_NOMINAL_IPD_M, 1e-5));
+
+		// Explicit rebinding through the API.
+		REQUIRE(conv_core_stream_bind_eyes(core.c, sid, dp_a) == XRT_SUCCESS);
+		convert_once(0, false);
+		CHECK(close_to(baseline(), 0.050, 1e-5));
+		REQUIRE(conv_core_stream_bind_eyes(core.c, sid, CONV_EYES_DP_NONE) == XRT_SUCCESS);
+		convert_once(0, false);
+		CHECK(close_to(baseline(), CONV_POLICY_NOMINAL_IPD_M, 1e-5));
+		REQUIRE(conv_core_stream_destroy(core.c, sid) == XRT_SUCCESS);
+
+		// More DPs than slots: the least recently published one is evicted.
+		for (uint64_t k = 1; k <= CONV_CORE_MAX_DPS + 2; k++) {
+			conv_eyes e = eyes_pair(0.001f * (float)k, 0.6f);
+			conv_core_eyes_publish(core.c, 0x10000 * k, &e);
+		}
+		const uint64_t newest = 0x10000ull * (CONV_CORE_MAX_DPS + 2);
+		REQUIRE(conv_core_eyes_read(core.c, newest, now_ns(), &got));
+		CHECK(close_to(got.xyz[1][0] - got.xyz[0][0], 0.001 * (CONV_CORE_MAX_DPS + 2), 1e-6));
+	}
+	conv_fake_fini(&f);
+}
+
+#if defined(CONV_LANES_SIM_STATIC)
+extern "C" xrt_result_t
+xrtConversionPluginNegotiate(uint32_t runtime_api_version,
+                             const struct xrt_conversion_plugin_host_iface *host,
+                             struct xrt_conversion_plugin_iface **out_iface,
+                             uint32_t *out_plugin_api_version);
+
+namespace {
+bool
+sim_setting(const char *key, char *buf, uint32_t size)
+{
+	const char *v = nullptr;
+	if (std::strcmp(key, "ENABLE") == 0) {
+		v = "1";
+	} else if (std::strcmp(key, "LATENCY_MS") == 0) {
+		v = "0";
+	}
+	if (v == nullptr || size == 0) {
+		return false;
+	}
+	std::snprintf(buf, size, "%s", v);
+	return true;
+}
+} // namespace
+
+TEST_CASE("stream: still-image dedupe with the sim provider (converted stops growing)", "[conv_lanes][dedupe][sim]")
+{
+	static xrt_conversion_plugin_host_iface host{};
+	host.struct_size = sizeof(host);
+	host.host_api_version = XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT;
+	host.get_setting = sim_setting;
+	xrt_conversion_plugin_iface *iface = nullptr;
+	uint32_t ver = 0;
+	REQUIRE(xrtConversionPluginNegotiate(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT, &host, &iface, &ver) ==
+	        XRT_SUCCESS);
+	xrt_conversion_plugin_instance *inst = nullptr;
+	REQUIRE(iface->probe(&inst) == XRT_SUCCESS);
+	REQUIRE(inst != nullptr);
+
+	Core core(false);
+	conv_provider_desc pd{};
+	pd.id = "sim-conversion";
+	pd.probe_order = 250;
+	pd.enabled = true;
+	pd.iface = iface;
+	pd.inst = inst;
+	REQUIRE(conv_core_add_provider(core.c, &pd) >= 0);
+
+	for (const uint32_t task : {(uint32_t)XRT_CONV_TASK_VIEWS_MONO, (uint32_t)XRT_CONV_TASK_DEPTH_MONO}) {
+		CAPTURE(task);
+		const bool views = task == XRT_CONV_TASK_VIEWS_MONO;
+		auto d = photo_desc(task, views ? XRT_CONV_OUT_VIEWS : XRT_CONV_OUT_DEPTH, views ? 2u : 0u,
+		                    XRT_CONV_CONTENT_PHOTO);
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		const uint64_t sid = cr.stream_id;
+		submit_n(core.c, sid, 0x40, 1);
+		REQUIRE(wait_until([&] { return stats(core.c, sid).converted >= 1; }, 5000));
+		submit_n(core.c, sid, 0x40, 2); // the first result feeds the next policy decision
+
+		// Page rate for one second of an unchanged picture: no new conversions.
+		const uint64_t c0 = stats(core.c, sid).converted;
+		const uint64_t t0 = now_ns();
+		int frames = 0;
+		while (now_ns() - t0 < 1000 * MS) {
+			submit_n(core.c, sid, 0x40, 1);
+			frames++;
+			sleep_ms(40); // ~24 Hz
+		}
+		const conv_stream_stats s = stats(core.c, sid);
+		INFO("frames " << frames << " converted " << s.converted << " deduped " << s.deduped);
+		CHECK(s.converted == c0);
+		CHECK(s.deduped >= (uint64_t)frames);
+
+		// The sim output is still there, under the newest frame id.
+		conv_result r{};
+		REQUIRE(conv_core_stream_acquire(core.c, sid, false, &r) == XRT_SUCCESS);
+		CHECK(r.frame_id == s.submitted);
+		CHECK((r.written & (views ? XRT_CONV_OUT_VIEWS : XRT_CONV_OUT_DEPTH)) != 0u);
+		conv_core_stream_release(core.c, sid, r.ring_slot);
+
+		// A changed picture converts.
+		submit_n(core.c, sid, 0x41, 1);
+		CHECK(stats(core.c, sid).converted == c0 + 1);
+		REQUIRE(conv_core_stream_destroy(core.c, sid) == XRT_SUCCESS);
+	}
+}
+#endif

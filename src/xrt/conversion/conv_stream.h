@@ -128,6 +128,17 @@ struct conv_frame_submit
 	float strength;          //!< ≤ 0 = 1
 	float focal_px;          //!< ≤ 0 = unknown
 	struct xrt_conv_stereo_calibration stereo;
+
+	/*! Still-image dedupe (PHOTO streams): the producer's identity of this
+	 *  input's content (shared-texture identity combined with a cheap content
+	 *  check); equal keys mean an unchanged picture. 0 = unknown: the core
+	 *  hashes CPU-memory inputs itself, and a GPU input without a key always
+	 *  converts. */
+	uint64_t content_key;
+	/*! Rebind the stream's eyes to the DP that owns the rect this frame was
+	 *  taken from (conv_core_stream_bind_eyes); false = keep the binding. */
+	bool eyes_dp_set;
+	uint64_t eyes_dp;
 };
 
 //! A pinned result (conv_core_stream_acquire); release with its ring slot.
@@ -155,6 +166,9 @@ struct conv_result
 struct conv_stream_stats
 {
 	uint64_t submitted, converted, dropped, failed;
+	//! PHOTO frames answered by republishing the last result (unchanged input
+	//! and policy): they never reach the provider and never count as converted.
+	uint64_t deduped;
 	uint64_t blocked_by_job;  //!< converts that waited behind a non-concurrent job
 	uint64_t blocked_by_warm; //!< converts that waited behind a non-concurrent warm
 	uint64_t rebinds;
@@ -174,7 +188,7 @@ struct conv_stream_options
 	uint32_t priority;      //!< enum u_lift_priority; 0 → NORMAL
 	bool weave_rect_source; //!< S1 letterbox + input cap
 	bool auto_convergence;  //!< S7 runtime auto-convergence (needs a configured observer)
-	int32_t eyes_dp;        //!< display processor whose eyes snapshot to read; < 0 = stale (nominal)
+	uint64_t eyes_dp;       //!< DP whose eyes snapshot to read: a conv_core_eyes_publish key, CONV_EYES_DP_ANY or _NONE
 	uint32_t source_format; //!< XRT_CONV_FMT_* the producer snapshots; 0 = RGBA8
 };
 

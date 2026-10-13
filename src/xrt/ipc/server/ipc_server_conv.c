@@ -249,7 +249,9 @@ core_create(struct ipc_server_conv *sc, struct sc_stream *st, uint64_t *out_core
 	struct conv_stream_options opts;
 	memset(&opts, 0, sizeof(opts));
 	opts.priority = st->priority != 0 ? st->priority : U_LIFT_PRIORITY_NORMAL;
-	opts.eyes_dp = 0; // the primary display processor's eyes (#2003 publishes them; stale = nominal)
+	// Unbound until the first submit names the DP that owns the rect (roadmap
+	// §5.2); until then the most recent eyes any DP published (stale = nominal).
+	opts.eyes_dp = CONV_EYES_DP_ANY;
 	opts.source_format = XRT_CONV_FMT_RGBA8_UNORM;
 	// rt#1978's runtime auto-convergence on every view stream whose app leaves
 	// the plane AUTO (the core runs it only when an observer factory is configured).
@@ -902,6 +904,11 @@ ipc_server_conv_lift_submit_framed(struct ipc_server_conv *sc,
 		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
 		fr.rect_w_m = frame->width_m;
 		fr.rect_h_m = frame->height_m;
+	}
+	// The eyes of the DP that owns the session's window (multi-screen M6).
+	if (frame != NULL && frame->eyes_dp_key != 0) {
+		fr.eyes_dp_set = true;
+		fr.eyes_dp = frame->eyes_dp_key;
 	}
 	return conv_core_stream_commit_submit(sc->core, st.core_id, slot.slot, &fr, out_frame_id);
 }
