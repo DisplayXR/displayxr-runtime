@@ -285,7 +285,12 @@ TEST_CASE("d3d11 lane: a mismatched adapter is refused loudly", "[conv_host_lane
 	for (UINT i = 0; hw == nullptr && f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
 		DXGI_ADAPTER_DESC1 d;
 		a->GetDesc1(&d);
-		if ((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+		// A REAL hardware adapter only: not flagged software, not WARP itself,
+		// and not the Microsoft Basic Render Driver (vendor 0x1414), which a
+		// CI runner exposes without the software flag and which shares with WARP.
+		const bool real = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && luid_of(a) != warp_luid &&
+		                  d.VendorId != 0x1414;
+		if (real) {
 			hw = a;
 		} else {
 			a->Release();
@@ -293,7 +298,7 @@ TEST_CASE("d3d11 lane: a mismatched adapter is refused loudly", "[conv_host_lane
 	}
 	f->Release();
 	if (hw == nullptr) {
-		SKIP("no hardware adapter to mismatch against");
+		SKIP("no real hardware adapter to mismatch against (software / basic render only)");
 	}
 	Dev other;
 	const bool ok = other.create(hw);
