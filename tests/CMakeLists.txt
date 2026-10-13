@@ -325,6 +325,12 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
 
+# ADR-053 P2 (#2032): the OS process layer of the conversion-host satellite
+# (os_process.h) against a real helper child. Windows, desktop Linux, macOS.
+if(WIN32 OR APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	list(APPEND tests tests_conv_os_process)
+endif()
+
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
 	target_link_libraries(${testname} PRIVATE xrt-external-catch2)
@@ -1344,6 +1350,17 @@ target_link_libraries(tests_conv_lanes PRIVATE displayxr::conversion_runtime)
 if(TARGET sim_conversion_static)
 	target_link_libraries(tests_conv_lanes PRIVATE sim_conversion_static)
 	target_compile_definitions(tests_conv_lanes PRIVATE CONV_LANES_SIM_STATIC)
+endif()
+
+if(TARGET tests_conv_os_process)
+	add_executable(tests_conv_os_process_helper tests_conv_os_process_helper.c)
+	target_link_libraries(tests_conv_os_process_helper PRIVATE aux_os displayxr::conversion_core)
+	target_link_libraries(tests_conv_os_process PRIVATE displayxr::conversion_core)
+	target_compile_definitions(
+		tests_conv_os_process
+		PRIVATE "CONV_OS_PROCESS_HELPER=\"$<TARGET_FILE:tests_conv_os_process_helper>\""
+		)
+	add_dependencies(tests_conv_os_process tests_conv_os_process_helper)
 endif()
 
 # ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
