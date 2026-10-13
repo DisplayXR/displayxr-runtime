@@ -322,6 +322,15 @@ endif()
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
+# ADR-053 D5 (#2033) -- the conversion-host satellite binary, spawned with the
+# sim provider over a loopback channel; describe / warm / one submit through
+# the shm rings, and the exit-code table. Headless (CPU lane).
+if(TARGET displayxr-conversion-host
+   AND TARGET drv_sim_conversion_plugin
+   AND TARGET target_lists
+	)
+	list(APPEND tests tests_conv_host_satellite)
+endif()
 
 # ADR-053 P2 (#2032): the OS process layer of the conversion-host satellite
 # (os_process.h) against a real helper child. Windows, desktop Linux, macOS.
@@ -562,6 +571,18 @@ if(TARGET tests_component_loader)
 				"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
 			)
 	endif()
+endif()
+if(TARGET tests_conv_host_satellite)
+	target_link_libraries(tests_conv_host_satellite PRIVATE conv_host_core xrt-interfaces aux_util)
+	add_dependencies(tests_conv_host_satellite displayxr-conversion-host drv_sim_conversion_plugin
+	                 tests_conversion_loader_stub_abi)
+	target_compile_definitions(
+		tests_conv_host_satellite
+		PRIVATE "CONV_HOST_EXE=\"$<TARGET_FILE:displayxr-conversion-host>\""
+			"SIM_CONVERSION_PATH=\"$<TARGET_FILE:drv_sim_conversion_plugin>\""
+			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
+		)
+	set_target_properties(tests_conv_host_satellite PROPERTIES CXX_STANDARD 17)
 endif()
 if(TARGET tests_conv_snapshot)
 	target_link_libraries(
