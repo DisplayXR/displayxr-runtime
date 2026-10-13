@@ -261,7 +261,7 @@ dxgi_of(uint32_t fmt)
 #endif
 
 static uint32_t
-bound_tasks_locked(const struct conv_host_serve *s)
+bound_tasks_locked(const struct conv_host_serve *s) // calls, streams AND warm pins: "no bound task and no prewarm" (§3.4)
 {
 	uint32_t n = s->commands_in_flight;
 	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
