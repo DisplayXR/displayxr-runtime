@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  displayxr-conversion-host, Windows process duties: elevation check,
- *         in-host minidump writer, Restart Manager session-end window.
+ * @brief  displayxr-conversion-host, Windows process duties: in-host
+ *         minidump writer, Restart Manager session-end window.
  * @ingroup conv_host
  */
 
@@ -19,46 +19,6 @@
 
 #include <stdio.h>
 #include <string.h>
-
-
-/*
- *
- * Elevation.
- *
- */
-
-bool
-conv_host_os_is_elevated(char *out_detail, uint32_t detail_size)
-{
-	HANDLE tok = NULL;
-	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-		if (out_detail != NULL && detail_size > 0) {
-			(void)snprintf(out_detail, detail_size, "OpenProcessToken failed (%lu)", GetLastError());
-		}
-		return false;
-	}
-	TOKEN_ELEVATION e = {0};
-	DWORD len = 0;
-	const BOOL ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &len);
-
-	DWORD rid = 0;
-	union {
-		TOKEN_MANDATORY_LABEL tml;
-		BYTE buf[64];
-	} u;
-	if (GetTokenInformation(tok, TokenIntegrityLevel, &u, sizeof(u), &len)) {
-		PSID sid = u.tml.Label.Sid;
-		rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
-	}
-	CloseHandle(tok);
-
-	const bool elevated = (ok && e.TokenIsElevated != 0) || rid >= SECURITY_MANDATORY_HIGH_RID;
-	if (out_detail != NULL && detail_size > 0) {
-		(void)snprintf(out_detail, detail_size, "TokenIsElevated=%lu integrity RID 0x%lx",
-		               ok ? (unsigned long)e.TokenIsElevated : 0ul, (unsigned long)rid);
-	}
-	return elevated;
-}
 
 
 /*
@@ -259,15 +219,3 @@ conv_host_os_session_end_hwnd(void)
 	return g_se.hwnd;
 }
 
-bool
-conv_host_os_watch_parent(uint64_t parent_pid)
-{
-	(void)parent_pid;
-	return true; // KILL_ON_JOB_CLOSE + the channel breaking
-}
-
-uint64_t
-conv_host_os_pid(void)
-{
-	return (uint64_t)GetCurrentProcessId();
-}

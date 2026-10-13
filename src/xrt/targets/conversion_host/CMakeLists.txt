@@ -7,7 +7,9 @@
 # Windows).
 #
 # conv_host_core: everything but main(), so tests can reuse pure pieces
-# (argument parsing) without spawning.
+# (argument parsing, the wire framing over os_channel) without spawning. The
+# channel, wake, parent-watch and elevation primitives are aux_os's
+# os_process.h (#2032).
 
 add_library(
 	conv_host_core STATIC
@@ -23,6 +25,8 @@ add_library(
 	conv_host_provider.h
 	conv_host_serve.c
 	conv_host_serve.h
+	conv_host_shm.c
+	conv_host_shm.h
 	)
 target_include_directories(conv_host_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(

@@ -44,6 +44,7 @@
 #endif
 
 #include "xrt/xrt_config_os.h"
+#include "os/os_process.h"
 #include "util/u_git_tag.h"
 #include "util/u_logging.h"
 
@@ -90,21 +91,23 @@ main(int argc, char *argv[])
 	        u_git_tag);
 
 	// 2. Integrity: inherit the service's medium token, never elevated.
-	char detail[96] = {0};
-	if (conv_host_os_is_elevated(detail, sizeof(detail))) {
+	if (os_process_is_elevated()) {
 		const char *allow = getenv("DXR_CONV_HOST_ALLOW_ELEVATED");
 		if (allow == NULL || strcmp(allow, "1") != 0) {
-			U_LOG_E("conversion host: refusing to run elevated (%s)", detail);
+			U_LOG_E("conversion host: refusing to run elevated");
 			return finish(CONV_HOST_EXIT_ELEVATED);
 		}
-		U_LOG_W("conversion host: running ELEVATED (%s) because DXR_CONV_HOST_ALLOW_ELEVATED=1 (CI / dev only)",
-		        detail);
+		U_LOG_W("conversion host: running ELEVATED because DXR_CONV_HOST_ALLOW_ELEVATED=1 (CI / dev only)");
 	}
 
-	// Parent death (POSIX): the service went away before we even started.
-	if (!conv_host_os_watch_parent(args.parent_pid)) {
-		U_LOG_W("conversion host: parent %llu is gone; nothing to serve", (unsigned long long)args.parent_pid);
-		return finish(CONV_HOST_EXIT_ORDERLY);
+	// Parent death: Linux PDEATHSIG + a getppid check, macOS a kqueue
+	// NOTE_EXIT thread (both _exit(0) when the service is already gone);
+	// Windows relies on the supervisor's job object. A failure to arm it is
+	// not fatal: the control channel breaking ends the host too.
+	const int pw = os_process_watch_parent((long)args.parent_pid, CONV_HOST_EXIT_ORDERLY);
+	if (pw != 0) {
+		U_LOG_W("conversion host: parent-death watch on %llu not armed (%d); relying on the channel",
+		        (unsigned long long)args.parent_pid, pw);
 	}
 
 	// 3. Restart Manager / logoff close requests -> exit 20.
