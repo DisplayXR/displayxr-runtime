@@ -1576,4 +1576,106 @@ TEST_CASE("proxy: update flow on the real host (Restart Manager on Windows, SIGT
 #endif
 }
 
+namespace {
+
+void
+kill_pid(long pid)
+{
+#ifdef _WIN32
+	HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+	REQUIRE(h != nullptr);
+	CHECK(TerminateProcess(h, 3));
+	CloseHandle(h);
+#else
+	CHECK(kill((pid_t)pid, SIGKILL) == 0);
+#endif
+}
+
+} // namespace
+
+TEST_CASE("proxy: a job whose host dies mid-run is retried once; a second loss fails it", "[conv_proxy]")
+{
+	// #2056: same job id and handle; partial output discarded; WAITING_FOR_PROVIDER in between.
+	char id[48];
+	std::snprintf(id, sizeof(id), "sim-conv-job-%lu", (unsigned long)os_process_current_pid());
+	char env[96];
+	std::snprintf(env, sizeof(env), "DXR_CONV_%s_", id);
+	for (char *c = env; *c != '\0'; c++) {
+		*c = *c == '-' ? '_' : (char)std::toupper((unsigned char)*c);
+	}
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1");
+	set_env((std::string(env) + "ENABLE").c_str(), "1");
+	set_env((std::string(env) + "LATENCY_MS").c_str(), "0");
+	g_maint_held = false;
+	Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, id, SIM_CONVERSION_PATH, true, nullptr, true);
+	REQUIRE(wait_until([&] { return fx.row_state(XRT_CONV_TASK_SPLATS_MONO) != XRT_CONV_STATE_UNKNOWN; }, 40000));
+
+	std::vector<uint8_t> px(32 * 16 * 4, 0x6B);
+	conv_job_create_info ji{};
+	ji.task = XRT_CONV_TASK_SPLATS_MONO;
+	ji.input_kind = XRT_CONV_INPUT_MONO;
+	ji.image_count = 1;
+	ji.images[0].memory_kind = XRT_CONV_MEM_CPU;
+	ji.images[0].cpu_ptr = px.data();
+	ji.images[0].byte_size = px.size();
+	ji.images[0].width = 32;
+	ji.images[0].height = 16;
+	ji.images[0].row_stride = 32 * 4;
+	ji.images[0].format = XRT_CONV_FMT_RGBA8_UNORM;
+	ji.params.struct_size = sizeof(ji.params);
+	uint64_t job = 0;
+	REQUIRE(wait_until([&] { return conv_core_job_submit(fx.c, 1, &ji, &job) == XRT_SUCCESS; }, 10000));
+	conv_job_status js{};
+	auto running_on_new_host = [&](long not_pid, long *out_pid) {
+		return wait_until(
+		    [&] {
+			    conv_core_job_status(fx.c, job, &js);
+			    conv_supervisor_status st{};
+			    long pid = 0;
+			    conv_host_proxy_get_status(fx.host, &st, &pid);
+			    *out_pid = pid;
+			    return js.status == CONV_JOB_RUNNING && pid > 0 && pid != not_pid;
+		    },
+		    40000);
+	};
+	long pid1 = 0;
+	REQUIRE(running_on_new_host(0, &pid1));
+	sleep_ms(300); // well inside the sim's 2 s job
+	kill_pid(pid1);
+
+	SECTION("one loss: retried on the respawned host, same job, completes")
+	{
+		REQUIRE(wait_until(
+		    [&] {
+			    conv_core_job_status(fx.c, job, &js);
+			    return js.status == CONV_JOB_SUCCEEDED || js.status == CONV_JOB_FAILED;
+		    },
+		    40000));
+		CHECK(js.status == CONV_JOB_SUCCEEDED);
+		CHECK(js.job_id == job);
+		std::vector<uint8_t> out(1u << 20);
+		uint64_t n = 0, total = 0;
+		REQUIRE(conv_core_job_read(fx.c, job, 0, 0, out.data(), out.size(), &n, &total) == XRT_SUCCESS);
+		CHECK(n > 0u);
+		CHECK(n == total);
+	}
+	SECTION("two losses: FAILED with the crash reason")
+	{
+		long pid2 = 0;
+		REQUIRE(running_on_new_host(pid1, &pid2));
+		sleep_ms(300);
+		kill_pid(pid2);
+		REQUIRE(wait_until(
+		    [&] {
+			    conv_core_job_status(fx.c, job, &js);
+			    return js.status == CONV_JOB_SUCCEEDED || js.status == CONV_JOB_FAILED;
+		    },
+		    40000));
+		CHECK(js.status == CONV_JOB_FAILED);
+		CHECK(js.failure_reason == XRT_CONV_FAIL_CRASH_LOOP);
+	}
+	conv_core_job_destroy(fx.c, job);
+}
+
 #endif

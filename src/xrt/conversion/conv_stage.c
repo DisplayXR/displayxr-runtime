@@ -141,6 +141,29 @@ conv_stage_add_output(struct conv_stage *st, uint32_t role, conv_stage_file_writ
 	return (int32_t)i;
 }
 
+bool
+conv_stage_reset(struct conv_stage *st)
+{
+	for (uint32_t i = 0; i < st->count; i++) {
+		if (st->outs[i].file_write != NULL && st->outs[i].size > 0) {
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < st->count; i++) {
+		struct conv_stage_output *o = &st->outs[i];
+		for (uint32_t c = 0; c < o->chunk_count; c++) {
+			free(o->chunks[c]);
+		}
+		o->chunk_count = 0;
+		o->size = 0;
+		o->size_hint = 0;
+		o->blob_format = 0;
+		o->begun = false;
+		o->failed = false;
+	}
+	return true;
+}
+
 struct xrt_conv_blob_sink *
 conv_stage_sinks(struct conv_stage *st, uint32_t *out_count)
 {

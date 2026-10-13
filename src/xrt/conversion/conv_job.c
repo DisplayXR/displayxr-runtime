@@ -277,6 +277,7 @@ job_lane_main(void *ptr)
 		j->out.struct_size = (uint32_t)sizeof(j->out);
 		const uint32_t provider = j->bind.provider;
 		const uint32_t cap_id = j->bind.cap_id;
+		const uint32_t epoch = conv_host_get_epoch(host);
 		os_mutex_unlock(&core->jobs_mtx);
 
 		struct conv_host_cmd cmd;
@@ -296,6 +297,27 @@ job_lane_main(void *ptr)
 			set_status_locked(core, j, CONV_JOB_WAITING_FOR_PROVIDER);
 			continue;
 		}
+		// Its host process died under it (satellite): retried ONCE from its
+		// original input after RESTORED, partial output discarded, same id.
+		const bool host_lost = r != XRT_SUCCESS && host->hosting == CONV_HOSTING_SATELLITE &&
+		                       conv_host_get_epoch(host) != epoch && !job_is_cancelled(j);
+		if (host_lost) {
+			os_mutex_lock(&core->jobs_mtx);
+			j->running = false;
+			j->host_losses++;
+			if (j->host_losses == 1 && !j->destroyed && conv_stage_reset(&j->stage)) {
+				j->progress = 0.0f;
+				j->last_emit_progress = 0.0f;
+				memset(&j->out, 0, sizeof(j->out));
+				U_LOG_W("[conv] job %llu (%s): its host process died after %.2f s; retried once on the "
+				        "respawned host",
+				        (unsigned long long)j->id, conv_task_name(j->task),
+				        (double)(now_ns() - j->started_ns) / 1e9);
+				set_status_locked(core, j, CONV_JOB_WAITING_FOR_PROVIDER);
+				continue;
+			}
+			os_mutex_unlock(&core->jobs_mtx);
+		}
 		if (r != XRT_SUCCESS && !job_is_cancelled(j)) {
 			conv_core_call_failed(core, provider, cap_id, r);
 		}
@@ -312,7 +334,8 @@ job_lane_main(void *ptr)
 			j->progress = 1.0f;
 			set_status_locked(core, j, CONV_JOB_SUCCEEDED);
 		} else {
-			j->failure_reason = XRT_CONV_FAIL_LOAD;
+			// A second host loss is the crash reason; anything else a load failure.
+			j->failure_reason = host_lost ? XRT_CONV_FAIL_CRASH_LOOP : XRT_CONV_FAIL_LOAD;
 			set_status_locked(core, j, CONV_JOB_FAILED);
 		}
 		U_LOG_W("[conv] job %llu (%s) %s in %.2f s", (unsigned long long)j->id, conv_task_name(j->task),
