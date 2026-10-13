@@ -969,9 +969,8 @@ runtime-drawn cursor through the service's one drawer, `svc_draw_cursor_quads` (
   sprite swapchain over IPC (the client refuses it, `SPRITE_UNUSABLE`; resolving it to its IPC id
   through whichever client compositor wraps it is the follow-up); display-zones requests (refused,
   `ZONE_UNPLACEABLE`; the zones composite places zone tiles differently); multi-screen routed
-  direct-client frames (refused, `MULTI_SCREEN`, as in-process D3D11); the
-  Amendment 3 measured-disparity source (the IPC path still reports "no content"; the service
-  would run `u_cursor_measure` on the composed atlas around the cursor).
+  direct-client frames (refused, `MULTI_SCREEN`, as in-process D3D11). The Amendment 3
+  measured-disparity source has since landed over IPC as well (Amendment 3, point 6).
 
 ### Rollout
 
@@ -1066,10 +1065,16 @@ nothing need the runtime to measure it.
 6. **Where:** every native compositor's cursor pass and the service (IPC / shell clients), so it
    also serves stereo content shown through the service.
 
-   *Service: not yet.* Phase 4 (§B as built in the D3D11 service) draws the cursor for IPC
-   clients, but the measured source still reports "no content" over IPC (the target stays 0, the
-   OS cursor). The follow-up runs `u_cursor_measure` on the client's composed atlas tiles around
-   the cursor, at the same commit step the service draws in.
+   *Service, as built (2026-10-13):* a new IPC call, `compositor_set_cursor_measure_request`,
+   carries the frame's request to the D3D11 service; it is sent only on a frame that chained the
+   source. The client's next commit copies the patch out of the two outermost views of its first
+   projection layer, before it releases them. That copy comes from the client's own submitted
+   images, not the composed atlas, so no cursor sprite and no compose path can reach it. Later
+   commits read the copy back without waiting and run the shared `u_cursor_measure_run`. Each
+   reply carries the service's newest result, which the state tracker ages exactly as it does an
+   in-process one. It serves direct IPC clients and workspace windows alike: under the shell the
+   measured placement feeds the Phase 4 lift. Display-zones frames still report no content, as
+   they do in-process.
 
 ### Evidence required before merge
 

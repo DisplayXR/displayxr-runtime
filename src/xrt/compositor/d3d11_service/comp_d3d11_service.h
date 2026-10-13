@@ -471,6 +471,24 @@ comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
                                            struct ipc_cursor_draw_outcome *out);
 
 /*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): client @p xc's
+ * measured-disparity request for the commit that follows. That commit copies a
+ * cursor-sized patch of the two outermost views of its first projection layer;
+ * the copy is read back without waiting and block-matched by the shared
+ * u_cursor_measure_run(). @p out is the newest finished measurement (valid = 0
+ * until one has come back).
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct ipc_cursor_measure_request;
+struct ipc_cursor_measure_result;
+
+void
+comp_d3d11_service_set_cursor_measure_request(struct xrt_compositor *xc,
+                                              const struct ipc_cursor_measure_request *req,
+                                              struct ipc_cursor_measure_result *out);
+
+/*!
  * Check if the compositor's window is still valid (not closed by user).
  *
  * This should be checked periodically by the IPC server to detect when

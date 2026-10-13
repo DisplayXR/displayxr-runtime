@@ -138,6 +138,15 @@ struct u_cursor_draw_request;
 bool
 comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
 
+// XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6) — same linkage pattern.
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+bool
+comp_ipc_client_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                      const struct u_cursor_measure_request *req);
+bool
+comp_ipc_client_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
 // Multi-screen M6/M3 over IPC (ADR-047 Amendment 3) — same linkage pattern.
 // The table / routing travel by value; see ipc_client.h.
 struct xrt_segment_metrics;
@@ -2473,9 +2482,10 @@ oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cu
 
 /*
  * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3). Every
- * in-process native compositor copies the patch; the matcher is the shared
- * u_cursor_measure_run(). The IPC/service path reports "cannot measure", and
- * the placement then has no content (cursor on the plane) - never an error.
+ * in-process native compositor copies the patch, and (point 6) so does the
+ * D3D11 service for its IPC clients; the matcher is the shared
+ * u_cursor_measure_run(). Anything else reports "cannot measure", and the
+ * placement then has no content (cursor on the plane) - never an error.
  */
 bool
 oxr_session_cursor_measure_hand_request(struct oxr_session *sess, const struct u_cursor_measure_request *req)
@@ -2513,7 +2523,14 @@ oxr_session_cursor_measure_hand_request(struct oxr_session *sess, const struct u
 		return true;
 	}
 #endif
-	// TODO(ADR-046 Amendment 3 point 6): the IPC/service path.
+#ifdef XRT_OS_WINDOWS
+	// ADR-046 Amendment 3 point 6: to the D3D11 service, which measures at the
+	// commit that follows and returns its newest finished measurement - the
+	// same one-to-three-frame lag as in-process.
+	if (oxr_session_cursor_draw_via_service(sess)) {
+		return comp_ipc_client_compositor_set_cursor_measure_request(&sess->xcn->base, req);
+	}
+#endif
 	(void)req;
 	return false;
 }
@@ -2547,6 +2564,11 @@ oxr_session_cursor_measure_get_result(struct oxr_session *sess, struct u_cursor_
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 	if (sess->is_d3d12_native_compositor) {
 		return comp_d3d12_compositor_get_cursor_measure_result(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_OS_WINDOWS
+	if (oxr_session_cursor_draw_via_service(sess)) {
+		return comp_ipc_client_compositor_get_cursor_measure_result(&sess->xcn->base, out);
 	}
 #endif
 	(void)out;

@@ -201,6 +201,28 @@ bool
 comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
 
 /*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): hand the
+ * D3D11 service this frame's measured-disparity request (for the commit that
+ * follows) and keep the newest measurement it returns. Same gating contract as
+ * comp_ipc_client_compositor_set_cursor_draw_request.
+ *
+ * @return false on IPC failure (the placement then has no content).
+ */
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+
+bool
+comp_ipc_client_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                      const struct u_cursor_measure_request *req);
+
+/*!
+ * The newest measurement comp_ipc_client_compositor_set_cursor_measure_request
+ * received. @return @p out->valid.
+ */
+bool
+comp_ipc_client_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
+/*!
  * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the per-screen segment table
  * of this present-owner's last weave, every screen's eyes included (count 0 =
  * woven by one display processor). Zeroed on any failure; the result is
