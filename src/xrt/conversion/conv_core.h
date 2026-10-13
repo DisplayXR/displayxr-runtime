@@ -212,6 +212,21 @@ conv_core_task_has_candidate(struct conv_core *core, uint32_t task);
 void
 conv_core_copy_registry(struct conv_core *core, struct conv_registry *out);
 
+/*!
+ * What is bound to one capability row right now (the status snapshot's
+ * `streams` / `jobs_queued` columns, #2029): live streams bound to the row
+ * (@p composed selects the composed row over the same depth capability) and
+ * jobs queued or running on it. An unknown provider reads 0 / 0. Every change
+ * of either count bumps `status_gen`, so `conv status --watch` wakes.
+ */
+void
+conv_core_row_activity(struct conv_core *core,
+                       const char *provider_id,
+                       uint32_t cap_id,
+                       bool composed,
+                       uint32_t *out_streams,
+                       uint32_t *out_jobs);
+
 /*! conv_hint_interest: a client enabled XR_DXR_lift (task_mask 0 = default
  *  set). Prewarms per PrewarmOn. */
 void

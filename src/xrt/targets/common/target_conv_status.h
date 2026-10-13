@@ -153,6 +153,24 @@ target_conv_status_from_registry(const struct conv_registry *reg,
                                  struct target_conv_status *out);
 
 /*!
+ * What is bound to one task row (the service: `conv_core_row_activity`).
+ * @p provider_id is the row's provider; @p composed selects the composed row.
+ */
+typedef void (*target_conv_activity_fn)(void *ud,
+                                        const char *provider_id,
+                                        uint32_t cap_id,
+                                        bool composed,
+                                        uint32_t *out_streams,
+                                        uint32_t *out_jobs);
+
+/*!
+ * #2029: fill every task row's `streams` / `jobs_queued` (service only; the
+ * headless pass has neither and leaves them 0) by asking @p fn per row.
+ */
+void
+target_conv_status_fill_activity(struct target_conv_status *st, target_conv_activity_fn fn, void *ud);
+
+/*!
  * Copy the rows into @p snap (`conv_providers[]`, `conv_tasks[]`). Does not
  * derive warnings: call `u_status_warnings_derive` after.
  */

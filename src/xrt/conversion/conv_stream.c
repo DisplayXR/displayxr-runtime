@@ -280,6 +280,7 @@ do_rebind(struct conv_core *core, struct conv_stream *st)
 	st->stats.rebinds++;
 	os_mutex_lock(&core->registry_mtx);
 	copy_provider_id_locked(core, st);
+	core->status_gen++; // the stream moved rows: both rows' `streams` changed (#2029)
 	os_mutex_unlock(&core->registry_mtx);
 	signal_lane_locked(core, from.provider);
 	signal_lane_locked(core, st->bind.provider);
@@ -1162,6 +1163,21 @@ conv_streams_bound_count(struct conv_core *core, uint32_t provider, uint32_t cap
 	return n;
 }
 
+uint32_t
+conv_streams_row_count(struct conv_core *core, uint32_t provider, uint32_t cap_id, bool composed)
+{
+	uint32_t n = 0;
+	os_mutex_lock(&core->streams_mtx);
+	for (struct conv_stream *st = core->streams; st != NULL; st = st->next) {
+		if (!st->dead && st->bind.provider == provider && st->bind.cap_id == cap_id &&
+		    st->bind.composed == composed) {
+			n++;
+		}
+	}
+	os_mutex_unlock(&core->streams_mtx);
+	return n;
+}
+
 void
 conv_streams_destroy_all(struct conv_core *core)
 {
@@ -1181,14 +1197,19 @@ conv_streams_destroy_all(struct conv_core *core)
 void
 conv_streams_client_gone(struct conv_core *core, uint64_t client_id)
 {
+	bool any = false;
 	os_mutex_lock(&core->streams_mtx);
 	for (struct conv_stream *st = core->streams; st != NULL; st = st->next) {
 		if (st->client_id == client_id && !st->dead) {
 			st->dead = true;
+			any = true;
 			signal_lane_locked(core, st->bind.provider);
 		}
 	}
 	os_mutex_unlock(&core->streams_mtx);
+	if (any) {
+		conv_core_activity_changed(core);
+	}
 }
 
 
@@ -1332,6 +1353,7 @@ conv_core_stream_create(struct conv_core *core,
 	core->streams = st;
 	os_mutex_lock(&core->registry_mtx);
 	copy_provider_id_locked(core, st);
+	core->status_gen++; // the row's `streams` column moved (#2029)
 	os_mutex_unlock(&core->registry_mtx);
 	st->stats.provisional = pipe.provisional;
 	signal_lane_locked(core, b.provider);
@@ -1364,6 +1386,7 @@ conv_core_stream_destroy(struct conv_core *core, uint64_t stream_id)
 	}
 	st->dead = true;
 	signal_lane_locked(core, st->bind.provider);
+	conv_core_activity_changed(core); // streams_mtx -> registry_mtx: the lock order
 	os_mutex_unlock(&core->streams_mtx);
 	return XRT_SUCCESS;
 }

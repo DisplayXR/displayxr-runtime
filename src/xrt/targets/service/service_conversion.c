@@ -312,6 +312,14 @@ conv_status_generation(void *ud)
 	return gen.conv_gen + gen.status_gen;
 }
 
+//! target_conv_activity_fn over the live core (#2029: the streams / jobs columns).
+static void
+row_activity(void *ud, const char *provider_id, uint32_t cap_id, bool composed, uint32_t *streams, uint32_t *jobs)
+{
+	(void)ud;
+	conv_core_row_activity(g.core, provider_id, cap_id, composed, streams, jobs);
+}
+
 static void
 conv_status_fill(void *ud, struct xrt_status_live *live)
 {
@@ -324,6 +332,7 @@ conv_status_fill(void *ud, struct xrt_status_live *live)
 	os_mutex_lock(&g.mtx);
 	conv_core_copy_registry(g.core, g.reg_scratch);
 	target_conv_status_from_registry(g.reg_scratch, g.entries, g.entry_count, &g.policy, g.status_scratch);
+	target_conv_status_fill_activity(g.status_scratch, row_activity, NULL);
 	const struct target_conv_status *st = g.status_scratch;
 	live->conv_provider_count = st->provider_count;
 	memcpy(live->conv_providers, st->providers, sizeof(live->conv_providers));

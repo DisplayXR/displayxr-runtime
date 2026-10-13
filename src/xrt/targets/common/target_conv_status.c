@@ -779,6 +779,23 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 }
 
 void
+target_conv_status_fill_activity(struct target_conv_status *st, target_conv_activity_fn fn, void *ud)
+{
+	if (st == NULL || fn == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < st->task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		struct xrt_status_conv_task *t = &st->tasks[i];
+		t->streams = 0;
+		t->jobs_queued = 0;
+		if (t->provider >= st->provider_count || t->provider >= XRT_STATUS_MAX_CONV_PROVIDERS) {
+			continue;
+		}
+		fn(ud, st->providers[t->provider].id, t->cap_id, t->composed, &t->streams, &t->jobs_queued);
+	}
+}
+
+void
 target_conv_status_build_headless(const struct xrt_plugin_iface *active_dp, struct target_conv_status *out)
 {
 	struct xrt_conversion_plugin_entry *entries =

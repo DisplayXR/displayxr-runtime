@@ -314,6 +314,13 @@ struct conv_host *
 conv_core_host(struct conv_core *core, uint32_t provider);
 
 
+/*! A stream or job was bound, unbound, rebound or finished: the status
+ *  snapshot's streams / jobs columns moved, so bump status_gen (#2029).
+ *  Takes registry_mtx: call with no lock, streams_mtx or jobs_mtx held
+ *  (lock order), never with registry_mtx held. */
+void
+conv_core_activity_changed(struct conv_core *core);
+
 
 /*
  *
@@ -339,6 +346,10 @@ conv_streams_rebind_check(struct conv_core *core);
 //! Number of live streams bound to a row (streams_mtx NOT held).
 uint32_t
 conv_streams_bound_count(struct conv_core *core, uint32_t provider, uint32_t cap_id, bool any_cap);
+
+//! Live streams bound to exactly this row, composed or not (streams_mtx NOT held).
+uint32_t
+conv_streams_row_count(struct conv_core *core, uint32_t provider, uint32_t cap_id, bool composed);
 
 //! Destroy every stream (core shutdown, lanes stopped).
 void
@@ -367,6 +378,10 @@ conv_jobs_wake(struct conv_core *core);
 
 uint32_t
 conv_jobs_bound_count(struct conv_core *core, uint32_t provider, uint32_t cap_id);
+
+//! Jobs queued or running on exactly this row (jobs_mtx NOT held).
+uint32_t
+conv_jobs_row_count(struct conv_core *core, uint32_t provider, uint32_t cap_id, bool composed);
 
 void
 conv_jobs_destroy_all(struct conv_core *core);

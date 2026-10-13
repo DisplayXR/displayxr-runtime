@@ -1819,3 +1819,97 @@ TEST_CASE("stream: a CPU provider's views and depth are published through a GPU 
 	}
 	conv_fake_fini(&f);
 }
+
+TEST_CASE("core: row activity counts bound streams and queued jobs; each change moves status_gen (#2029)",
+          "[conv_lanes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *v =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	v->state = XRT_CONV_STATE_READY;
+	conv_fake_cap *jc =
+	    conv_fake_add_cap(&f, 6, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	jc->state = XRT_CONV_STATE_READY;
+	jc->job_ms = 5000;
+	f.cancel_poll_ms = 10;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 100) >= 0);
+		auto gen = [&] {
+			xrt_conv_wire_generation g{};
+			conv_core_get_generation(core.c, &g);
+			return g.status_gen;
+		};
+		auto rows = [&](uint32_t cap, uint32_t *s, uint32_t *j) {
+			conv_core_row_activity(core.c, "fake", cap, false, s, j);
+		};
+		uint32_t s = 9, j = 9;
+		rows(4, &s, &j);
+		CHECK(s == 0);
+		CHECK(j == 0);
+		conv_core_row_activity(core.c, "nobody", 4, false, &s, &j);
+		CHECK(s == 0);
+
+		// Stream create: counted, and the generation moved.
+		uint64_t g0 = gen();
+		auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+		xrt_conv_wire_stream_created cr{}, cr2{};
+		REQUIRE(conv_core_stream_create(core.c, 1, &d, nullptr, &cr) == XRT_SUCCESS);
+		REQUIRE(conv_core_stream_create(core.c, 2, &d, nullptr, &cr2) == XRT_SUCCESS);
+		CHECK(gen() > g0);
+		rows(4, &s, &j);
+		CHECK(s == 2);
+		CHECK(j == 0);
+		// The composed row over the same cap is a different row.
+		conv_core_row_activity(core.c, "fake", 4, true, &s, &j);
+		CHECK(s == 0);
+
+		// Destroy: uncounted at once (asynchronous reap or not), generation moved.
+		g0 = gen();
+		REQUIRE(conv_core_stream_destroy(core.c, cr.stream_id) == XRT_SUCCESS);
+		CHECK(gen() > g0);
+		rows(4, &s, &j);
+		CHECK(s == 1);
+		// The connection going away drops its streams the same way.
+		g0 = gen();
+		conv_core_client_gone(core.c, 2);
+		CHECK(gen() > g0);
+		rows(4, &s, &j);
+		CHECK(s == 0);
+
+		// Jobs: queued / running count; finishing (cancel) uncounts and moves the generation.
+		uint8_t pixels[16 * 16 * 4] = {};
+		conv_job_create_info ji{};
+		ji.task = XRT_CONV_TASK_SPLATS_MONO;
+		ji.image_count = 1;
+		ji.images[0].memory_kind = XRT_CONV_MEM_CPU;
+		ji.images[0].cpu_ptr = pixels;
+		ji.images[0].width = ji.images[0].height = 16;
+		ji.images[0].row_stride = 64;
+		ji.images[0].format = XRT_CONV_FMT_RGBA8_UNORM;
+		ji.params.struct_size = sizeof(ji.params);
+		g0 = gen();
+		uint64_t j1 = 0, j2 = 0;
+		REQUIRE(conv_core_job_submit(core.c, 1, &ji, &j1) == XRT_SUCCESS);
+		REQUIRE(conv_core_job_submit(core.c, 1, &ji, &j2) == XRT_SUCCESS);
+		CHECK(gen() > g0);
+		rows(6, &s, &j);
+		CHECK(s == 0);
+		CHECK(j == 2);
+		g0 = gen();
+		REQUIRE(conv_core_job_cancel(core.c, j2) == XRT_SUCCESS);
+		CHECK(gen() > g0);
+		rows(6, &s, &j);
+		CHECK(j == 1);
+		REQUIRE(conv_core_job_cancel(core.c, j1) == XRT_SUCCESS);
+		REQUIRE(wait_until(
+		    [&] {
+			    uint32_t ss = 0, jj = 0;
+			    rows(6, &ss, &jj);
+			    return jj == 0;
+		    },
+		    2000));
+	}
+	conv_fake_fini(&f);
+}

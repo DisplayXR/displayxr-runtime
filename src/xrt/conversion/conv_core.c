@@ -736,6 +736,41 @@ conv_core_copy_registry(struct conv_core *core, struct conv_registry *out)
 }
 
 void
+conv_core_activity_changed(struct conv_core *core)
+{
+	os_mutex_lock(&core->registry_mtx);
+	core->status_gen++;
+	os_mutex_unlock(&core->registry_mtx);
+}
+
+void
+conv_core_row_activity(struct conv_core *core,
+                       const char *provider_id,
+                       uint32_t cap_id,
+                       bool composed,
+                       uint32_t *out_streams,
+                       uint32_t *out_jobs)
+{
+	uint32_t streams = 0, jobs = 0;
+	if (core != NULL && provider_id != NULL) {
+		os_mutex_lock(&core->registry_mtx);
+		const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
+		os_mutex_unlock(&core->registry_mtx);
+		if (pi >= 0) {
+			// No registry lock across the counts: streams_mtx / jobs_mtx come first.
+			streams = conv_streams_row_count(core, (uint32_t)pi, cap_id, composed);
+			jobs = conv_jobs_row_count(core, (uint32_t)pi, cap_id, composed);
+		}
+	}
+	if (out_streams != NULL) {
+		*out_streams = streams;
+	}
+	if (out_jobs != NULL) {
+		*out_jobs = jobs;
+	}
+}
+
+void
 conv_core_hint_interest(struct conv_core *core, uint64_t client_id, uint64_t task_mask)
 {
 	(void)client_id;
