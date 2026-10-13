@@ -9200,34 +9200,13 @@ ipc_server_conv_core(struct ipc_server *server)
 }
 
 /*
- * ADR-053 (#2005): every v3 lift handler below first asks ipc_server_conv.h's
- * routing rule whether the call belongs to the conversion core; if not it
- * falls through, untouched, to the svc_lift path. The rule needs the GPU I/O
- * glue #2003 installs, so until then nothing routes and v3 is byte-for-byte
- * what it was. Once #2003 registers `dp-lift` as a core row, DEPTH / SBS /
- * NVIEW always route and the fall-through is dead (deleted in P1b).
+ * ADR-053: every v3 lift handler below is served by the conversion core
+ * (ipc_server_conv.h). The `dp-lift` row serves DEPTH / SBS / NVIEW from the
+ * display plug-in's module; GAUSSIANS routes only when a SPLATS_MONO provider
+ * exists. Anything the routing rule does not take is an honest refusal on the
+ * v3 wire (properties: modes 0, UNAVAILABLE; create: FEATURE_UNSUPPORTED) —
+ * the pre-core svc_lift path was deleted in P1b (#2028).
  */
-
-/*!
- * #2003 (ADR-053 P1a): with the GPU glue installed the `dp-lift` row serves
- * DEPTH / SBS / NVIEW, so the svc_lift fall-through below is dead on a box
- * with the legacy module. It stays until P1b; this says so, once per call
- * kind, if it is ever taken anyway.
- */
-static void
-lift_fallthrough_warn(int kind, const char *what, uint32_t mode)
-{
-	static bool s_warned[4];
-	if (kind < 0 || kind >= 4 || s_warned[kind] || ipc_server_get_conv() == NULL ||
-	    mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
-		return;
-	}
-	s_warned[kind] = true;
-	U_LOG_W(
-	    "[conv] v3 %s (mode %u) fell through to the pre-core svc_lift path (no conversion-core candidate or "
-	    "no GPU glue); P1b deletes this path",
-	    what, mode);
-}
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 static struct xrt_system_compositor *
@@ -9235,18 +9214,6 @@ lift_xsysc(volatile struct ipc_client_state *ics)
 {
 	struct xrt_system_compositor *xsysc = ics->server != NULL ? ics->server->xsysc : NULL;
 	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
-}
-
-static void
-lift_params_from_ipc(const struct ipc_lift_params *in, struct xrt_dp_lift_params *out)
-{
-	U_ZERO(out);
-	out->struct_size = (uint32_t)sizeof(*out);
-	out->convergence = in->convergence;
-	out->strength = in->strength;
-	out->inpaint = in->inpaint;
-	out->view_count = in->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : in->view_count;
-	out->focal_px = in->focal_px;
 }
 #endif
 
@@ -9258,12 +9225,6 @@ ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
 	}
 	// The conversion core's streams / jobs of this connection die with it.
 	ipc_server_conv_client_gone(ipc_server_get_conv(), ics->lift_owner);
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL) {
-		comp_d3d11_service_lift_release_owner(xsysc, ics->lift_owner);
-	}
-#endif
 	ics->lift_owner = 0;
 }
 
@@ -9280,31 +9241,14 @@ ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc
 	if (ipc_server_conv_routes_properties(sc)) {
 		struct xrt_dp_lift_caps caps;
 		ipc_server_conv_lift_properties(sc, &caps);
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-		// GAUSSIANS stays on svc_lift (no photo facade over the job lane yet).
-		struct xrt_system_compositor *gxsysc = lift_xsysc(ics);
-		if (gxsysc != NULL) {
-			struct xrt_dp_lift_caps legacy;
-			comp_d3d11_service_lift_get_caps(gxsysc, &legacy);
-			if (legacy.state == XRT_DP_LIFT_STATE_READY) {
-				caps.modes |= legacy.modes & XRT_DP_LIFT_MODE_GAUSSIANS;
-			}
-		}
-#endif
 		ipc_lift_properties_from_caps(&caps, out_props);
 		return XRT_SUCCESS;
 	}
-	// P1b: delete (the pre-core fall-through; dead once dp-lift is a core row).
-	lift_fallthrough_warn(0, "lift_get_properties", 0);
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL) {
-		struct xrt_dp_lift_caps caps;
-		comp_d3d11_service_lift_get_caps(xsysc, &caps);
-		ipc_lift_properties_from_caps(&caps, out_props);
-	}
-#endif
-	// Anything else: modes 0, UNAVAILABLE — a successful answer, not an error.
+	// No conversion core / no GPU glue / no candidate: modes 0, UNAVAILABLE — a
+	// successful answer, not an error.
+	struct xrt_dp_lift_caps none;
+	xrt_dp_lift_caps_init(&none);
+	ipc_lift_properties_from_caps(&none, out_props);
 	return XRT_SUCCESS;
 }
 
@@ -9328,28 +9272,11 @@ ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
 		return ipc_server_conv_lift_stream_create(sc, lift_owner(ics), mode, content_hint, input_scale,
 		                                          aux_outputs, aux_depth_format, out_stream_id);
 	}
-	// P1b: delete (the pre-core fall-through; dead for DEPTH / SBS / NVIEW once
-	// dp-lift is a core row — GAUSSIANS without a SPLATS provider still lands here).
-	lift_fallthrough_warn(1, "lift_stream_create", mode);
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL) {
-		struct xrt_dp_lift_stream_info info = {0};
-		info.struct_size = (uint32_t)sizeof(info);
-		info.mode = mode;
-		info.content_hint = content_hint;
-		info.input_scale = input_scale;
-		info.aux_outputs = aux_outputs;
-		info.aux_depth_format = aux_depth_format;
-		return comp_d3d11_service_lift_stream_create(xsysc, lift_owner(ics), &info, out_stream_id);
-	}
-#else
-	(void)mode;
-	(void)content_hint;
+	// Not routable (GAUSSIANS without a SPLATS_MONO provider, no candidate for
+	// the task, no GPU glue): XR_ERROR_FEATURE_UNSUPPORTED on the v3 wire.
 	(void)input_scale;
 	(void)aux_outputs;
 	(void)aux_depth_format;
-#endif
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
@@ -9364,14 +9291,7 @@ ipc_handle_lift_stream_destroy(volatile struct ipc_client_state *ics, uint64_t s
 	if (ics->lift_owner != 0 && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
 		return ipc_server_conv_lift_stream_destroy(ipc_server_get_conv(), ics->lift_owner, stream_id);
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL && ics->lift_owner != 0) {
-		comp_d3d11_service_lift_stream_destroy(xsysc, ics->lift_owner, stream_id);
-	}
-#else
-	(void)stream_id;
-#endif
+	// v3: destroy of an unknown stream is a no-op.
 	return XRT_SUCCESS;
 }
 
@@ -9416,41 +9336,9 @@ ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
 		return ipc_server_conv_lift_submit_framed(ipc_server_get_conv(), lift_owner(ics), args, ch, ch_is_dxgi,
 		                                          &frame, out_frame_id);
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	xrt_graphics_buffer_handle_t in_handle = handles[0];
-	bool in_is_dxgi = false;
-#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
-	if ((size_t)in_handle & 1) {
-		in_handle = (HANDLE)((size_t)in_handle - 1);
-		in_is_dxgi = true;
-	}
-#endif
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc == NULL) {
-		if (!in_is_dxgi && in_handle != NULL) {
-			CloseHandle(in_handle);
-		}
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	struct xrt_dp_lift_params params;
-	lift_params_from_ipc(&args->params, &params);
-	uint32_t vp_count = args->params.viewpoint_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS
-	                                                                     : args->params.viewpoint_count;
-	const bool has_vc = args->has_params && args->params.has_view_control != 0;
-	const bool has_rig = args->has_params && args->params.rig.type != XRT_LIFT_RIG_NONE;
-	// The handle is the service's from here (closed or cached inside). The
-	// session's compositor (NULL on a headless connection) names the window the
-	// viewpoints are rebased to (ADR-048).
-	return comp_d3d11_service_lift_submit(
-	    xsysc, ics->xc, lift_owner(ics), args->stream_id, in_handle, in_is_dxgi, args->width, args->height,
-	    args->source_time, args->has_params ? &params : NULL, args->params.viewpoints,
-	    args->has_params ? 3 * vp_count : 0, has_vc ? &args->params.view_control : NULL,
-	    has_rig ? &args->params.rig : NULL, out_frame_id);
-#else
-	(void)args;
+	// Not a stream of this connection: non-fatal, the handle is released here.
 	weave_submit_release_handles(handles, handle_count);
-	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-#endif
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 }
 
 xrt_result_t
@@ -9470,32 +9358,7 @@ ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
 		return ipc_server_conv_lift_acquire(ipc_server_get_conv(), lift_owner(ics), stream_id, out_ready,
 		                                    out_lift_result);
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc == NULL) {
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	struct xrt_lift_result r;
-	xrt_result_t xret = comp_d3d11_service_lift_acquire(xsysc, lift_owner(ics), stream_id, out_ready, &r);
-	out_lift_result->frame_id = r.frame_id;
-	out_lift_result->source_time = r.source_time;
-	out_lift_result->fence_value = r.fence_value;
-	out_lift_result->latency_ns = r.latency_ns;
-	out_lift_result->width = r.width;
-	out_lift_result->height = r.height;
-	out_lift_result->format = r.format;
-	out_lift_result->view_count = r.view_count;
-	out_lift_result->output_realloc = r.output_realloc ? 1u : 0u;
-	out_lift_result->viewpoint_count = r.viewpoint_count;
-	memcpy(out_lift_result->viewpoints, r.viewpoints, sizeof(out_lift_result->viewpoints));
-	memcpy(out_lift_result->rect_center, r.rect_center, sizeof(out_lift_result->rect_center));
-	memcpy(out_lift_result->rect_size, r.rect_size, sizeof(out_lift_result->rect_size));
-	out_lift_result->depth = r.depth;
-	return xret;
-#else
-	(void)stream_id;
-	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-#endif
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
 }
 
 xrt_result_t
@@ -9533,20 +9396,6 @@ ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
 		}
 		return XRT_SUCCESS;
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	if (xsysc != NULL && comp_d3d11_service_lift_export_output(xsysc, lift_owner(ics), stream_id, &h, out_width,
-	                                                           out_height, out_format)) {
-		// Service-owned: the transport DuplicateHandle's it into the caller.
-		out_handles[0] = h;
-		*out_handle_count = 1;
-		*out_have_output = true;
-	}
-#else
-	(void)stream_id;
-	(void)out_handles;
-#endif
 	return XRT_SUCCESS;
 }
 
@@ -9585,20 +9434,6 @@ ipc_handle_lift_get_depth_output(volatile struct ipc_client_state *ics,
 		}
 		return XRT_SUCCESS;
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	if (xsysc != NULL && comp_d3d11_service_lift_export_depth(xsysc, lift_owner(ics), stream_id, &h, out_width,
-	                                                          out_height, out_format)) {
-		// Service-owned: the transport DuplicateHandle's it into the caller.
-		out_handles[0] = h;
-		*out_handle_count = 1;
-		*out_have_depth = true;
-	}
-#else
-	(void)stream_id;
-	(void)out_handles;
-#endif
 	return XRT_SUCCESS;
 }
 
@@ -9629,18 +9464,6 @@ ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
 		}
 		return XRT_SUCCESS;
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
-	if (xsysc != NULL && comp_d3d11_service_lift_export_fence(xsysc, lift_owner(ics), stream_id, &h)) {
-		out_handles[0] = h;
-		*out_handle_count = 1;
-		*out_have_fence = true;
-	}
-#else
-	(void)stream_id;
-	(void)out_handles;
-#endif
 	return XRT_SUCCESS;
 }
 
@@ -9677,40 +9500,9 @@ ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t str
 			free(bytes);
 			bytes = NULL;
 		}
-	} else
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	    if (reply.result == XRT_SUCCESS) {
-		struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-		if (xsysc == NULL) {
-			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
-		} else {
-			uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
-			struct xrt_lift_blob_info info;
-			bool ready = false;
-			reply.result = comp_d3d11_service_lift_acquire_blob(xsysc, lift_owner(ics), stream_id, cap, &ready,
-			                                                    &info, &bytes);
-			reply.ready = ready;
-			reply.frame_id = info.frame_id;
-			reply.source_time = info.source_time;
-			reply.format = info.format;
-			reply.byte_count = info.byte_count;
-			if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
-				// Too big for one reply: report it, deliver nothing.
-				reply.result = XRT_ERROR_ALLOCATION;
-				free(bytes);
-				bytes = NULL;
-			}
-		}
+	} else if (reply.result == XRT_SUCCESS) {
+		reply.result = XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
 	}
-#else
-	{
-		(void)stream_id;
-		(void)capacity;
-		if (reply.result == XRT_SUCCESS) {
-			reply.result = XRT_ERROR_FEATURE_NOT_SUPPORTED;
-		}
-	}
-#endif
 
 	xrt_result_t xret = ipc_send(imc, &reply, sizeof(reply));
 	if (xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && bytes != NULL && reply.byte_count > 0) {
@@ -9868,16 +9660,7 @@ ipc_handle_lift_stream_set_priority(volatile struct ipc_client_state *ics, uint6
 	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
 		return ipc_server_conv_lift_set_priority(ipc_server_get_conv(), lift_owner(ics), stream_id, priority);
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL) {
-		return comp_d3d11_service_lift_set_priority(xsysc, lift_owner(ics), stream_id, priority);
-	}
-#else
-	(void)stream_id;
-	(void)priority;
-#endif
-	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
 }
 
 xrt_result_t
@@ -9894,15 +9677,7 @@ ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
 	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
 		return ipc_server_conv_lift_stats(ipc_server_get_conv(), lift_owner(ics), stream_id, out_stats);
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	struct xrt_system_compositor *xsysc = lift_xsysc(ics);
-	if (xsysc != NULL) {
-		return comp_d3d11_service_lift_get_stats(xsysc, lift_owner(ics), stream_id, out_stats);
-	}
-#else
-	(void)stream_id;
-#endif
-	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
 }
 
 

@@ -2,22 +2,21 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  ADR-053 P1a (#2003) — the legacy lift path's golden replay on WARP.
+ * @brief  ADR-053 (#2003, #2028) — the legacy lift output's golden replay on WARP.
  *
- * Drives d3d11_lift (the shipping XR_DXR_lift path) with the sim_display FAKE
- * lift module behind a minimal display processor, on WARP: a client-shared
- * input texture is submitted through the pre-core path
- * (d3d11_lift_submit_handle), the result is acquired into the client export
- * texture, read back and hashed.
+ * Drives the XR_DXR_lift v3 route the way the service does — ipc_server_conv
+ * over the conversion core, the `dp-lift` adapter on d3d11_lift's one lift
+ * thread, the D3D11 glue (d3d11_conv_gpu) for the slots / targets / export —
+ * with the sim_display FAKE lift module behind a minimal display processor,
+ * on WARP: a client-shared input texture is submitted, the result is acquired
+ * into the client export texture, read back and hashed.
  *
- * The hashes were pinned BEFORE the conversion core took over the lift thread
- * (#2003), so the refactor is checked against the shipping bytes, not against
- * itself. The second case runs the same conversions CORE-ROUTED: the v3
- * route (ipc_server_conv) over the conversion core, the `dp-lift` adapter on
- * the same lift thread, the D3D11 glue for the slots / targets / export. It
- * must reproduce those bytes exactly. The fake's pictures depend only on the input, the mode, the view
- * count and the strength (no eyes, no rect: the historical fan), so the pin is
- * deterministic.
+ * The hashes were pinned on the PRE-CORE path before the conversion core took
+ * over the lift thread (#2003), so the refactors (P1a, then the P1b split that
+ * deleted the pre-core path) are checked against the shipping bytes, not
+ * against themselves. The fake's pictures depend only on the input, the mode,
+ * the view count and the strength (no eyes, no rect: the historical fan), so
+ * the pin is deterministic.
  *
  * WARP means no GPU is required; no D3D11 device at all SKIPs.
  *
@@ -284,72 +283,6 @@ struct golden_result
 	uint64_t hash = 0;
 };
 
-/*!
- * One conversion through the PRE-CORE path: d3d11_lift with the fake as its
- * lift-only factory, a v3-shaped submit by NT handle, one acquire, the export
- * texture hashed.
- */
-bool
-precore_convert(Warp &wp, uint32_t mode, uint32_t view_count, golden_result *out)
-{
-	std::mutex ctx_mtx;
-	d3d11_lift *l = d3d11_lift_create(wp.dev, wp.ctx, &ctx_mtx, golden_resolve, nullptr, 0.5f);
-	if (l == nullptr) {
-		return false;
-	}
-	xrt_dp_lift_stream_info info = {};
-	info.struct_size = (uint32_t)sizeof(info);
-	info.mode = mode;
-	info.content_hint = XRT_DP_LIFT_CONTENT_VIDEO;
-	info.input_scale = 1.0f;
-	uint64_t id = 0;
-	bool ok = d3d11_lift_stream_create(l, 1, &info, &id) == XRT_SUCCESS;
-
-	xrt_dp_lift_params p = {};
-	p.struct_size = (uint32_t)sizeof(p);
-	p.convergence = -1.0f;
-	p.strength = 1.0f;
-	p.inpaint = 1;
-	p.view_count = view_count;
-
-	// Activation is lazy: the first submits are not taken until the module is up.
-	uint64_t frame = 0;
-	const auto t0 = std::chrono::steady_clock::now();
-	while (ok && frame == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(20)) {
-		xrt_dp_lift_caps caps;
-		d3d11_lift_get_caps(l, &caps);
-		HANDLE h = wp.input_handle();
-		const xrt_result_t r = d3d11_lift_submit_handle(l, 1, id, h, false, kW, kH, 1000, &p, nullptr, 0,
-		                                                nullptr, nullptr, nullptr, &frame);
-		ok = r == XRT_SUCCESS || r == XRT_ERROR_WEAVE_REFUSED;
-		if (frame == 0) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(20));
-		}
-	}
-	bool ready = false;
-	d3d11_lift_result_info ri = {};
-	while (ok && !ready && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30)) {
-		ok = d3d11_lift_acquire_result(l, 1, id, &ready, &ri) == XRT_SUCCESS;
-		if (!ready) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-	}
-	HANDLE eh = nullptr;
-	uint32_t ew = 0, ehh = 0, ef = 0;
-	ok = ok && ready && d3d11_lift_export_output(l, 1, id, &eh, &ew, &ehh, &ef);
-	if (ok) {
-		const uint32_t bpp = 4u; // RGBA8 views and R32F depth alike
-		out->w = ew;
-		out->h = ehh;
-		out->format = ef;
-		out->view_count = ri.view_count;
-		ok = wp.hash_shared(eh, ew, ehh, bpp, &out->hash);
-	}
-	d3d11_lift_stream_destroy(l, 1, id);
-	d3d11_lift_destroy(&l);
-	return ok;
-}
-
 /*
  * The core-routed path (#2003): the v3 adapter -> the conversion core -> the
  * dp-lift provider -> the lift thread, with the D3D11 glue.
@@ -422,7 +355,7 @@ bool
 core_convert(Warp &wp, uint32_t mode, uint32_t view_count, golden_result *out)
 {
 	std::mutex ctx_mtx;
-	d3d11_lift *l = d3d11_lift_create(wp.dev, wp.ctx, &ctx_mtx, golden_resolve, nullptr, 0.5f);
+	d3d11_lift *l = d3d11_lift_create(wp.dev, wp.ctx, &ctx_mtx, golden_resolve, nullptr);
 	if (l == nullptr) {
 		return false;
 	}
@@ -519,35 +452,7 @@ constexpr uint64_t kGoldenDepth = 0x1dbbe066f7193183ull;
 
 } // namespace
 
-TEST_CASE("lift_dp_golden: pre-core path output is pinned", "[lift][dp_golden]")
-{
-	_putenv("SIM_DISPLAY_FAKE_LIFT=1");
-	_putenv("SIM_DISPLAY_FAKE_LIFT_LATENCY_MS=0");
-	Warp wp;
-	if (!wp.init()) {
-		SKIP("no WARP D3D11 device");
-	}
-
-	golden_result sbs, nview, depth;
-	REQUIRE(precore_convert(wp, XRT_DP_LIFT_MODE_SBS, 2, &sbs));
-	REQUIRE(precore_convert(wp, XRT_DP_LIFT_MODE_NVIEW, 4, &nview));
-	REQUIRE(precore_convert(wp, XRT_DP_LIFT_MODE_DEPTH, 0, &depth));
-	UNSCOPED_INFO("SBS " << sbs.w << "x" << sbs.h << " fmt " << sbs.format << " hash 0x" << std::hex << sbs.hash);
-	UNSCOPED_INFO("NVIEW4 " << std::dec << nview.w << "x" << nview.h << " hash 0x" << std::hex << nview.hash);
-	UNSCOPED_INFO("DEPTH " << std::dec << depth.w << "x" << depth.h << " hash 0x" << std::hex << depth.hash);
-	CHECK(sbs.w == 2 * kW);
-	CHECK(sbs.h == kH);
-	CHECK(sbs.view_count == 2);
-	CHECK(nview.w == 4 * kW);
-	CHECK(nview.view_count == 4);
-	CHECK(depth.w == kW);
-	CHECK(depth.format == DXGI_FORMAT_R32_FLOAT);
-	CHECK(sbs.hash == kGoldenSbs);
-	CHECK(nview.hash == kGoldenNview4);
-	CHECK(depth.hash == kGoldenDepth);
-}
-
-TEST_CASE("lift_dp_golden: the core-routed dp-lift path reproduces the pre-core bytes", "[lift][dp_golden]")
+TEST_CASE("lift_dp_golden: the core-routed dp-lift path reproduces the pinned pre-core bytes", "[lift][dp_golden]")
 {
 	_putenv("SIM_DISPLAY_FAKE_LIFT=1");
 	_putenv("SIM_DISPLAY_FAKE_LIFT_LATENCY_MS=0");
@@ -563,9 +468,11 @@ TEST_CASE("lift_dp_golden: the core-routed dp-lift path reproduces the pre-core 
 	UNSCOPED_INFO("core NVIEW4 " << std::dec << nview.w << "x" << nview.h << " hash 0x" << std::hex << nview.hash);
 	UNSCOPED_INFO("core DEPTH " << std::dec << depth.w << "x" << depth.h << " hash 0x" << std::hex << depth.hash);
 	CHECK(sbs.w == 2 * kW);
+	CHECK(sbs.h == kH);
 	CHECK(sbs.view_count == 2);
 	CHECK(nview.w == 4 * kW);
 	CHECK(nview.view_count == 4);
+	CHECK(depth.w == kW);
 	CHECK(depth.format == DXGI_FORMAT_R32_FLOAT);
 	CHECK(sbs.hash == kGoldenSbs);
 	CHECK(nview.hash == kGoldenNview4);

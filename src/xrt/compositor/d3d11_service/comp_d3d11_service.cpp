@@ -30878,8 +30878,9 @@ resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compo
 /*
  * G7 (ADR-053, #2003): the conversion side never pulls eyes (that took
  * render_mutex once per conversion). Every eye query this service answers
- * publishes the result instead: into the lift module's snapshot (the pre-core
- * branch) and into the conversion core's per-DP snapshot (DP 0, the panel).
+ * publishes the result instead: into the conversion core's per-DP snapshot
+ * (DP 0, the panel), and notes the time in the lift module, whose producers
+ * refresh a stale snapshot first (d3d11_lift_publish_eyes).
  */
 static std::mutex g_conv_eyes_mtx;
 static void (*g_conv_eyes_fn)(void *ud, const struct xrt_eye_positions *eyes) = nullptr;
@@ -35856,7 +35857,7 @@ svc_lift(struct xrt_system_compositor *xsysc)
 		void *lift_factory = nullptr, *fallback = nullptr;
 		(void)svc_lift_resolve((void *)xsysc, &lift_factory, &fallback);
 		sys->lift = d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex,
-		                              svc_lift_resolve, (void *)xsysc, sys->base.info.nominal_viewer_z_m);
+		                              svc_lift_resolve, (void *)xsysc);
 		if (sys->lift != nullptr) {
 			d3d11_lift_set_eyes_refresh(sys->lift, svc_lift_eyes_refresh, (void *)xsysc);
 		}
@@ -36015,197 +36016,14 @@ comp_d3d11_service_conv_set_bridge(struct xrt_system_compositor *xsysc, const st
 	d3d11_lift_set_core_bridge(sys->lift, &b);
 }
 
-//! Called first thing in system_destroy: joins the lift thread (which calls
-//! back into the system for eyes) before anything it uses goes away.
+//! Called first thing in system_destroy: joins the lift thread and closes the
+//! glue (whose producers call back into the system for eyes) before anything
+//! they use goes away.
 static void
 svc_lift_destroy(struct d3d11_service_system *sys)
 {
 	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
 	d3d11_lift_destroy(&sys->lift);
-}
-
-extern "C" void
-comp_d3d11_service_lift_get_caps(struct xrt_system_compositor *xsysc, struct xrt_dp_lift_caps *out)
-{
-	xrt_dp_lift_caps_init(out);
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l != nullptr) {
-		d3d11_lift_get_caps(l, out);
-	}
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_stream_create(struct xrt_system_compositor *xsysc,
-                                      uint64_t owner,
-                                      const struct xrt_dp_lift_stream_info *info,
-                                      uint64_t *out_id)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l == nullptr) {
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	return d3d11_lift_stream_create(l, owner, info, out_id);
-}
-
-extern "C" void
-comp_d3d11_service_lift_stream_destroy(struct xrt_system_compositor *xsysc, uint64_t owner, uint64_t id)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l != nullptr) {
-		d3d11_lift_stream_destroy(l, owner, id);
-	}
-}
-
-extern "C" void
-comp_d3d11_service_lift_release_owner(struct xrt_system_compositor *xsysc, uint64_t owner)
-{
-	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
-		return;
-	}
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
-	if (sys->lift != nullptr) { // never CREATE the module just to release nothing
-		d3d11_lift_release_owner(sys->lift, owner);
-	}
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_submit(struct xrt_system_compositor *xsysc,
-                               struct xrt_compositor *xc,
-                               uint64_t owner,
-                               uint64_t id,
-                               xrt_graphics_buffer_handle_t handle,
-                               bool is_dxgi,
-                               uint32_t w,
-                               uint32_t h,
-                               int64_t source_time,
-                               const struct xrt_dp_lift_params *params,
-                               const float *viewpoints,
-                               uint32_t viewpoint_floats,
-                               const struct xrt_lift_view_control *view_control,
-                               const struct xrt_lift_rig *rig,
-                               uint64_t *out_frame_id)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l == nullptr) {
-		if (handle != nullptr && !is_dxgi) {
-			CloseHandle((HANDLE)handle);
-		}
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	// ADR-048: the session's window is the frame (the panel when it has none).
-	struct xrt_lift_rect_frame frame;
-	lift_rect_frame(d3d11_service_system_from_xrt(xsysc), xc, nullptr, 0, 0, &frame);
-	return d3d11_lift_submit_handle(l, owner, id, (HANDLE)handle, is_dxgi, w, h, source_time, params, viewpoints,
-	                                viewpoint_floats, view_control, rig, &frame, out_frame_id);
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_acquire(struct xrt_system_compositor *xsysc,
-                                uint64_t owner,
-                                uint64_t id,
-                                bool *out_ready,
-                                struct xrt_lift_result *out)
-{
-	*out_ready = false;
-	memset(out, 0, sizeof(*out));
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l == nullptr) {
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	struct d3d11_lift_result_info r = {};
-	xrt_result_t xret = d3d11_lift_acquire_result(l, owner, id, out_ready, &r);
-	out->frame_id = r.frame_id;
-	out->source_time = r.source_time;
-	out->fence_value = r.fence_value;
-	out->latency_ns = r.latency_ns;
-	out->width = r.width;
-	out->height = r.height;
-	out->format = r.format;
-	out->view_count = r.view_count;
-	out->output_realloc = r.output_realloc;
-	out->viewpoint_count = r.viewpoint_count;
-	memcpy(out->viewpoints, r.viewpoints, sizeof(out->viewpoints));
-	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
-	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
-	out->depth = r.depth;
-	return xret;
-}
-
-extern "C" bool
-comp_d3d11_service_lift_export_output(struct xrt_system_compositor *xsysc,
-                                      uint64_t owner,
-                                      uint64_t id,
-                                      xrt_graphics_buffer_handle_t *out_handle,
-                                      uint32_t *out_width,
-                                      uint32_t *out_height,
-                                      uint32_t *out_format)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	HANDLE h = nullptr;
-	if (l == nullptr || !d3d11_lift_export_output(l, owner, id, &h, out_width, out_height, out_format)) {
-		return false;
-	}
-	*out_handle = (xrt_graphics_buffer_handle_t)h;
-	return true;
-}
-
-extern "C" bool
-comp_d3d11_service_lift_export_fence(struct xrt_system_compositor *xsysc,
-                                     uint64_t owner,
-                                     uint64_t id,
-                                     xrt_graphics_sync_handle_t *out_handle)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	HANDLE h = nullptr;
-	if (l == nullptr || !d3d11_lift_export_fence(l, owner, id, &h)) {
-		return false;
-	}
-	*out_handle = (xrt_graphics_sync_handle_t)h;
-	return true;
-}
-
-extern "C" bool
-comp_d3d11_service_lift_export_depth(struct xrt_system_compositor *xsysc,
-                                     uint64_t owner,
-                                     uint64_t id,
-                                     xrt_graphics_buffer_handle_t *out_handle,
-                                     uint32_t *out_width,
-                                     uint32_t *out_height,
-                                     uint32_t *out_format)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	HANDLE h = nullptr;
-	if (l == nullptr || !d3d11_lift_export_depth(l, owner, id, &h, out_width, out_height, out_format)) {
-		return false;
-	}
-	*out_handle = (xrt_graphics_buffer_handle_t)h;
-	return true;
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_acquire_blob(struct xrt_system_compositor *xsysc,
-                                     uint64_t owner,
-                                     uint64_t id,
-                                     uint64_t capacity,
-                                     bool *out_ready,
-                                     struct xrt_lift_blob_info *out_info,
-                                     uint8_t **out_bytes)
-{
-	*out_ready = false;
-	memset(out_info, 0, sizeof(*out_info));
-	*out_bytes = nullptr;
-	struct d3d11_lift *l = svc_lift(xsysc);
-	if (l == nullptr) {
-		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
-	}
-	struct d3d11_lift_blob_info bi = {};
-	xrt_result_t xret = d3d11_lift_acquire_blob(l, owner, id, capacity, out_ready, &bi, out_bytes);
-	out_info->frame_id = bi.frame_id;
-	out_info->source_time = bi.source_time;
-	out_info->format = bi.format;
-	out_info->byte_count = bi.byte_count;
-	return xret;
 }
 
 extern "C" bool
@@ -36240,25 +36058,4 @@ comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
 	c->render.lift_owner = owner;
 	c->render.lift_rect_count = count;
 	return true;
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_set_priority(struct xrt_system_compositor *xsysc,
-                                     uint64_t owner,
-                                     uint64_t id,
-                                     uint32_t priority)
-{
-	struct d3d11_lift *l = svc_lift(xsysc);
-	return l != nullptr ? d3d11_lift_set_priority(l, owner, id, priority) : XRT_ERROR_FEATURE_NOT_SUPPORTED;
-}
-
-extern "C" xrt_result_t
-comp_d3d11_service_lift_get_stats(struct xrt_system_compositor *xsysc,
-                                  uint64_t owner,
-                                  uint64_t id,
-                                  struct xrt_lift_stream_stats *out)
-{
-	memset(out, 0, sizeof(*out));
-	struct d3d11_lift *l = svc_lift(xsysc);
-	return l != nullptr ? d3d11_lift_get_stats(l, owner, id, out) : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
