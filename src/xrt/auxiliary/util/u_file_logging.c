@@ -127,10 +127,67 @@ create_directory_recursive(const char *path)
 	return _mkdir(tmp);
 }
 
+//! @p mask grants read + write, as GENERIC_* bits or as their file-mapped form.
+static BOOL
+ac_mask_grants_rw(ACCESS_MASK mask)
+{
+	const ACCESS_MASK generic = GENERIC_READ | GENERIC_WRITE;
+	const ACCESS_MASK mapped = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+	return (mask & generic) == generic || (mask & mapped) == mapped;
+}
+
+/*!
+ * Whether @p dacl already carries what grant_appcontainer_write_access()
+ * applies for @p sid: an explicit allow ACE inheritable by files and
+ * subdirectories (CONTAINER_INHERIT | OBJECT_INHERIT) granting read + write,
+ * AND read + write on the directory itself. SetNamedSecurityInfo stores the
+ * grant as two ACEs (an effective one with the file-mapped rights and an
+ * INHERIT_ONLY one with the generic bits), so either form counts.
+ */
+static BOOL
+ac_ace_present(PACL dacl, PSID sid)
+{
+	if (dacl == NULL) {
+		return FALSE;
+	}
+	ACL_SIZE_INFORMATION info;
+	if (!GetAclInformation(dacl, &info, sizeof(info), AclSizeInformation)) {
+		return FALSE;
+	}
+	BOOL inheritable = FALSE;
+	BOOL effective = FALSE;
+	for (DWORD i = 0; i < info.AceCount; i++) {
+		void *ace = NULL;
+		if (!GetAce(dacl, i, &ace)) {
+			continue;
+		}
+		const ACE_HEADER *h = (const ACE_HEADER *)ace;
+		if (h->AceType != ACCESS_ALLOWED_ACE_TYPE || (h->AceFlags & INHERITED_ACE) != 0) {
+			continue;
+		}
+		const ACCESS_ALLOWED_ACE *a = (const ACCESS_ALLOWED_ACE *)ace;
+		if (!EqualSid((PSID)&a->SidStart, sid) || !ac_mask_grants_rw(a->Mask)) {
+			continue;
+		}
+		const BYTE ci_oi = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+		if ((h->AceFlags & ci_oi) == ci_oi) {
+			inheritable = TRUE;
+		}
+		if ((h->AceFlags & INHERIT_ONLY_ACE) == 0) {
+			effective = TRUE;
+		}
+	}
+	return inheritable && effective;
+}
+
 /*!
  * Grant ALL APPLICATION PACKAGES (AppContainer processes like Chrome) write access
  * to the log directory. Without this, Chrome's sandbox blocks fopen() to LOCALAPPDATA.
  * Uses the same approach as SRHydra's SDDL: (A;;GA;;;AC) for the AC SID (S-1-15-2-1).
+ *
+ * Skipped when the directory already carries the grant (every start after the
+ * first): SetNamedSecurityInfo re-propagates the inheritable ACE to every file
+ * in the tree, seconds with a large log history (#2044).
  */
 static void
 grant_appcontainer_write_access(const char *dir_path)
@@ -146,6 +203,12 @@ grant_appcontainer_write_access(const char *dir_path)
 	PSECURITY_DESCRIPTOR pSD = NULL;
 	if (GetNamedSecurityInfoA(dir_path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
 	                          NULL, NULL, &pOldDacl, NULL, &pSD) != ERROR_SUCCESS) {
+		LocalFree(pSid);
+		return;
+	}
+
+	if (ac_ace_present(pOldDacl, pSid)) {
+		LocalFree(pSD);
 		LocalFree(pSid);
 		return;
 	}
