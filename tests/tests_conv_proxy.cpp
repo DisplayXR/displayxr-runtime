@@ -1516,6 +1516,29 @@ TEST_CASE("proxy: update flow on the real host (Restart Manager on Windows, SIGT
 	conv_stream_stats st0{};
 	CHECK(conv_core_stream_get_stats(fx.c, sid, &st0) == XRT_SUCCESS);
 
+	// A job submitted during the update window waits (no thread blocks on the
+	// host) and runs after the respawn (§7.4).
+	std::vector<uint8_t> job_px(32 * 16 * 4, 0x6B);
+	conv_job_create_info ji{};
+	ji.task = XRT_CONV_TASK_SPLATS_MONO;
+	ji.input_kind = XRT_CONV_INPUT_MONO;
+	ji.image_count = 1;
+	ji.images[0].memory_kind = XRT_CONV_MEM_CPU;
+	ji.images[0].cpu_ptr = job_px.data();
+	ji.images[0].byte_size = job_px.size();
+	ji.images[0].width = 32;
+	ji.images[0].height = 16;
+	ji.images[0].row_stride = 32 * 4;
+	ji.images[0].format = XRT_CONV_FMT_RGBA8_UNORM;
+	ji.params.struct_size = sizeof(ji.params);
+	uint64_t job = 0;
+	REQUIRE(wait_until([&] { return conv_core_job_submit(fx.c, 1, &ji, &job) == XRT_SUCCESS; }, 5000));
+	conv_job_status js{};
+	sleep_ms(500);
+	conv_core_job_status(fx.c, job, &js);
+	CHECK(js.status == CONV_JOB_WAITING_FOR_PROVIDER);
+	CHECK(fx.sup().spawns == spawns); // the job is demand, but the mutex is held
+
 	// 5. The installer replaces its files (nothing to do here), ends the
 	// session and releases the mutex: the host respawns and converts again.
 #ifdef _WIN32
@@ -1537,6 +1560,14 @@ TEST_CASE("proxy: update flow on the real host (Restart Manager on Windows, SIGT
 	long new_pid = 0;
 	conv_host_proxy_get_status(fx.host, &sst, &new_pid);
 	CHECK(new_pid != host_pid);
+	REQUIRE(wait_until(
+	    [&] {
+		    conv_core_job_status(fx.c, job, &js);
+		    return js.status == CONV_JOB_SUCCEEDED || js.status == CONV_JOB_FAILED;
+	    },
+	    30000));
+	CHECK(js.status == CONV_JOB_SUCCEEDED);
+	conv_core_job_destroy(fx.c, job);
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 	} // the proxy ends its host here
 #ifdef _WIN32

@@ -443,6 +443,34 @@ TEST_CASE("conv_host: idle exit with no bound task", "[conv_host]")
 	CHECK(ms.count() >= 1000);
 }
 
+TEST_CASE("conv_host: a warmed capability counts as bound; no idle exit until it is evicted", "[conv_host]")
+{
+	// #2056 / roadmap §3.4 "no bound task AND no prewarm": a host holding a warm
+	// (prewarmed) model never idle-exits by itself; evicted, it does (exit 0).
+	common_env();
+	Host h;
+	auto a = sim_args(h);
+	a.push_back("--idle-exit-ms");
+	a.push_back("1500");
+	REQUIRE(h.spawn(a));
+	REQUIRE(h.chan != nullptr);
+	REQUIRE(handshake(h));
+	uint32_t rid = 1;
+	conv_host_wire_cap_request q;
+	conv_host_wire_init(&q, sizeof(q));
+	q.cap_id = XRT_CONV_TASK_DEPTH_MONO;
+	REQUIRE(h.request_status(CONV_HOST_MSG_WARM, rid++, &q, sizeof(q)) == XRT_SUCCESS);
+
+	// Well past the idle window: still alive.
+	CHECK(h.wait_exit(4000) == -1000);
+
+	REQUIRE(h.request_status(CONV_HOST_MSG_EVICT, rid++, &q, sizeof(q)) == XRT_SUCCESS);
+	const auto t0 = std::chrono::steady_clock::now();
+	CHECK(h.wait_exit(15000) == CONV_HOST_EXIT_ORDERLY);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+	CHECK(ms.count() >= 1000); // the idle window counts from the evict
+}
+
 TEST_CASE("conv_host: sim provider describe / warm / one submit through the rings", "[conv_host]")
 {
 	common_env();
