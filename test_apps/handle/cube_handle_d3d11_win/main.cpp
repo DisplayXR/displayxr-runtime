@@ -23,6 +23,7 @@
 #include "dxr_view_config.h"
 #include "hud_renderer.h"
 #include "projection_depth.h"
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 #include "text_overlay.h"
 #include "xr_session.h"
 #include <d3d11_1.h>
@@ -1061,8 +1062,67 @@ static const float kCursorCubeHeight = 0.03f; // RenderScene(..., cubeHeight = 0
 static const float kCursorHeight = 0.04f;     // hint footprint, fraction of canvas height
 
 static bool g_cursorRuntimeDraw = false;
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3), as in cube_handle_metal_macos:
+//   DISPLAYXR_CURSOR_DEPTH_SOURCE=measured  show a synthetic stereo PHOTO
+//                                         (test_apps/common/stereo_photo_test.h)
+//                                         instead of the cube and let the runtime
+//                                         block-match the views under the cursor
+//                                         (no hit test, no depth). Needs spec v7.
+//   DISPLAYXR_STEREO_PHOTO=1              the photo without the measured source
+//                                         (a cost baseline).
+static bool g_cursorMeasured = false;
+static bool g_stereoPhoto = false;
 static bool g_cursorCustomSprite = false;
 static XrSwapchain g_cursorSprite = XR_NULL_HANDLE;
+
+// The stereo photo: one CPU image per view, rebuilt when the view size changes,
+// written straight into the view's region of the swapchain image
+// (UpdateSubresource). It needs no texture of its own and works for the tiled
+// and array layouts alike.
+static struct {
+    uint32_t w = 0, h = 0;
+    int eyes = 0;
+    bool bgra = false;
+    std::vector<uint8_t> px[8];
+} g_photoCache;
+
+static bool StereoPhotoWriteView(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, DXGI_FORMAT fmt, UINT subresource,
+                                 int eye, int eyes, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    bool bgra;
+    switch (fmt) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: bgra = true; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: bgra = false; break;
+    default: {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARN("stereo photo: swapchain format %d is not 8-bit RGBA/BGRA - drawing the cube instead", (int)fmt);
+        }
+        return false;
+    }
+    }
+    if (eye < 0 || eye >= 8 || w == 0 || h == 0) return false;
+    if (g_photoCache.w != w || g_photoCache.h != h || g_photoCache.eyes != eyes || g_photoCache.bgra != bgra) {
+        g_photoCache.w = w;
+        g_photoCache.h = h;
+        g_photoCache.eyes = eyes;
+        g_photoCache.bgra = bgra;
+        for (int e = 0; e < 8; e++) g_photoCache.px[e].clear();
+        LOG_INFO("stereo photo: %d views of %ux%u (foreground +%.1f px crossed, ground %.1f px, stripes %.1f px)",
+                 eyes, w, h, dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w,
+                 dxr_test::kPhotoStripesD * w);
+    }
+    std::vector<uint8_t>& px = g_photoCache.px[eye];
+    if (px.empty()) dxr_test::PhotoFill(eye, eyes, w, w, h, bgra, px);
+    const D3D11_BOX box = {x, y, 0, x + w, y + h, 1};
+    ctx->UpdateSubresource(tex, subresource, &box, px.data(), w * 4, 0);
+    return true;
+}
 
 static void CursorQuatRotate(const XrQuaternionf& q, float vx, float vy, float vz, XrVector3f& out)
 {
@@ -1527,6 +1587,12 @@ static void RenderOneFrame(RenderState& rs) {
                     cursorDrawInfo.sizeMeters = g_cursorCustomSprite ? 0.01f : 0.0f;
                     cursorDrawInfo.visible = XR_TRUE;
                     XrCursorDepthDrawStateDXR cursorDrawState = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
+                    // Spec v7: the runtime measures the disparity under the
+                    // cursor. It is looked up behind the hint, so it rides the
+                    // hint's chain (ahead of the rig struct); the hit test's
+                    // hasContent / nearestPoint are then ignored.
+                    XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+                    measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
                     bool cursorInCanvas = false;
                     if (g_hasCursorDepthExt && g_windowWidth > 0 && g_windowHeight > 0) {
                         float u = -1.0f, v = -1.0f;
@@ -1561,8 +1627,12 @@ static void RenderOneFrame(RenderState& rs) {
                                     ? XR_TRUE
                                     : XR_FALSE;
                             cursorHint.nearestPoint = hit;
-                            // Chain: locateInfo -> hint [-> draw info] -> (rig struct).
+                            // Chain: locateInfo -> hint [-> draw info] [-> source] -> (rig struct).
                             const void* hintTail = locateInfo.next;
+                            if (g_cursorMeasured) {
+                                measuredSource.next = hintTail;
+                                hintTail = &measuredSource;
+                            }
                             if (g_cursorRuntimeDraw) {
                                 cursorDrawInfo.next = hintTail;
                                 hintTail = &cursorDrawInfo;
@@ -2065,11 +2135,22 @@ static void RenderOneFrame(RenderState& rs) {
                                 projMatrix = xr.projMatrices[vi];
                             }
 
-                            RenderScene(renderer, viewRtv, eyeDSV,
-                                renderW, renderH,
-                                viewMatrix, projMatrix,
-                                useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
-                                0.03f);
+                            // Amendment 3 test content: the stereo photo in place
+                            // of the cube (3D only; 2D keeps the cube).
+                            const bool photoDrawn =
+                                g_stereoPhoto && !monoMode &&
+                                StereoPhotoWriteView(renderer.context.Get(), swapchainTexture,
+                                                     static_cast<DXGI_FORMAT>(xr.swapchain.format),
+                                                     arrayLayout ? D3D11CalcSubresource(0, (UINT)eye, 1) : 0, eye,
+                                                     eyeCount, (uint32_t)vp.TopLeftX, (uint32_t)vp.TopLeftY,
+                                                     (uint32_t)vp.Width, (uint32_t)vp.Height);
+                            if (!photoDrawn) {
+                                RenderScene(renderer, viewRtv, eyeDSV,
+                                    renderW, renderH,
+                                    viewMatrix, projMatrix,
+                                    useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
+                                    0.03f);
+                            }
 
                             // #823 actions mode: draw a small marker cube at
                             // each tracked controller's grip pose (bigger
@@ -2548,6 +2629,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                  !g_cursorRuntimeDraw ? "APP (hint + placement only; OS cursor kept, no in-app crosshair)"
                  : g_cursorCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
                                         : "RUNTIME, default look");
+        const char* src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE");
+        if (src != nullptr && strcmp(src, "measured") == 0) {
+            if (g_cursorDepthSpecVersion >= 7) {
+                g_cursorMeasured = true;
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u) - "
+                         "keeping the app hit test",
+                         g_cursorDepthSpecVersion);
+            }
+        }
+        LOG_INFO("XR_DXR_cursor_depth source: %s",
+                 g_cursorMeasured ? "MEASURED DISPARITY (runtime block-matches the views)" : "app hit test");
+    }
+    {
+        const char* sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        g_stereoPhoto = g_cursorMeasured || (sp != nullptr && sp[0] == '1');
     }
 
     // INV-1.3: open on the 3D panel (#715) — one-shot move to the panel's
