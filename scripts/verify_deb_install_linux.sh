@@ -25,6 +25,9 @@
 #     installed service fails the headless smoke (scripts/smoke_service_linux.sh):
 #     detached start with no terminal, an IPC handshake, clean SIGTERM,
 #     stale-socket recovery, and socket activation + exit-when-idle.
+#   * VK_LAYER_DXR_queue_lock (#2036) is not installed: its manifest must sit
+#     in /usr/share/vulkan/explicit_layer.d with an absolute library_path to the
+#     installed .so, and `displayxr-cli info` must report it reachable;
 #   * the DisplayXR Dashboard is missing (binary, PATH symlink, menu entry,
 #     icon) or `displayxr-dashboard --version` fails: the self-contained .NET
 #     host must start on the release with no .NET runtime, no ICU and no display
@@ -92,6 +95,38 @@ unset XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH
 displayxr-cli info || fail=1
 displayxr-cli selftest || { echo "error: displayxr-cli selftest failed on $PRETTY_NAME." >&2; fail=1; }
 
+# --- VK_LAYER_DXR_queue_lock (#902 / #2036) ----------------------------------
+# Without it the #868 repaint is OFF for every Vulkan app on a single-graphics-
+# queue GPU (Intel), silently: the runtime retries instance creation without the
+# layer and logs "#902: ... not found by the Vulkan loader". No GPU / vulkaninfo
+# here, so check what the loader would read: the manifest on its default path,
+# naming the layer, with an absolute library_path to the installed .so (ldd -r
+# above already covered the .so itself) — then that displayxr-cli's own probe,
+# which walks the same loader search path, reports it reachable. Informational
+# in selftest; a FAIL here, because shipping it is this package's job.
+echo "=== VK_LAYER_DXR_queue_lock: manifest + library ==="
+QL_JSON=/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
+QL_SO=/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so
+if [ ! -f "$QL_JSON" ]; then
+    echo "error: $QL_JSON not installed" >&2
+    fail=1
+else
+    grep -q '"name": *"VK_LAYER_DXR_queue_lock"' "$QL_JSON" ||
+        { echo "error: $QL_JSON does not name VK_LAYER_DXR_queue_lock" >&2; fail=1; }
+    QL_LIB="$(sed -n 's/.*"library_path": *"\([^"]*\)".*/\1/p' "$QL_JSON")"
+    [ "$QL_LIB" = "$QL_SO" ] ||
+        { echo "error: $QL_JSON library_path is '$QL_LIB', expected $QL_SO" >&2; fail=1; }
+    [ -f "$QL_SO" ] || { echo "error: $QL_SO not installed" >&2; fail=1; }
+fi
+out="$(displayxr-cli info 2>&1 || true)"
+if grep -qF "VK_LAYER_DXR_queue_lock reachable ($QL_SO)" <<<"$out"; then
+    echo "    displayxr-cli: VK_LAYER_DXR_queue_lock reachable ($QL_SO)"
+else
+    grep -A3 'VK late-weave repaint' <<<"$out" >&2 || true
+    echo "error: displayxr-cli info does not report the queue-lock layer reachable at $QL_SO" >&2
+    fail=1
+fi
+
 # --- displayxr-service (#1744) ----------------------------------------------
 # Shipped since the .deb stopped being in-process-only: without it an
 # XR_DXR_weave present-owner (the DisplayXR browser) cannot weave at all.
@@ -151,6 +186,11 @@ if [ -n "$TARBALL" ]; then
         else
             echo "    ${elf#"$T"/}: no missing symbol versions"
         fi
+    done
+    # #2036: the queue-lock layer + the manifest template install.sh fills in.
+    for f in lib/libVkLayer_DXR_queue_lock.so share/vulkan/VkLayer_DXR_queue_lock.json.in; do
+        [ -n "$(find "$T" -path "*/$f" -type f | head -1)" ] ||
+            { echo "error: the tarball has no $f" >&2; fail=1; }
     done
     # The tarball's dashboard must start here too (the tarball has no
     # Depends, but its .NET host needs nothing beyond libc / libstdc++).

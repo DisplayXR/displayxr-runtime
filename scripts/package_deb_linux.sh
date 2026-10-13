@@ -14,6 +14,13 @@
 #   /usr/lib/displayxr/lib/openxr_displayxr.so           (the HYBRID runtime: in-process
 #       for ordinary apps, IPC to displayxr-service for XR_DXR_weave present-owners
 #       and workspace controllers — the Windows/macOS shape)
+#   /usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so  (#902 / #2036: the Vulkan
+#       layer the runtime injects at xrCreateVulkanInstanceKHR so the #868 repaint
+#       can share the app's only graphics queue — tier 2; without it every VK app
+#       on a single-graphics-queue GPU (Intel) runs with repaint OFF)
+#   /usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
+#       its manifest, on the loader's DEFAULT explicit-layer path (no env needed),
+#       with an ABSOLUTE library_path so it does not depend on the manifest dir
 #   /usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so   (built-in fallback DP)
 #   /usr/lib/displayxr/plugins/200-sim-display.json      (its discovery manifest)
 #   /usr/bin/displayxr-cli -> ../lib/displayxr/bin/displayxr-cli  (PATH symlink;
@@ -124,10 +131,18 @@ PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -
 # `|| true`: no targets/service dir at all in a non-service build; the check
 # below turns that into the real error message.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
+VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
 done
+# #2036: refuse a package without the queue-lock layer — its absence is silent
+# at run time (the runtime retries without it and repaint just stays off).
+[ -n "$VKLAYER_SO" ] || {
+    echo "error: libVkLayer_DXR_queue_lock.so not built under $BUILD_DIR/src/xrt/targets/vk_layer" >&2
+    echo "       (the .deb ships it, #2036)." >&2
+    exit 1
+}
 [ -n "$SERVICE_BIN" ] || {
     echo "error: displayxr-service not built — the .deb ships it (#1744). Build with" >&2
     echo "       scripts/build_linux.sh --hybrid (--no-build reuses whatever is in $BUILD_DIR)." >&2
@@ -198,6 +213,7 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/lib/displayxr/bin" \
          "$STAGE/usr/lib/displayxr/lib" \
          "$STAGE/usr/lib/displayxr/plugins" \
+         "$STAGE/usr/share/vulkan/explicit_layer.d" \
          "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID" \
          "$STAGE/usr/lib/systemd/user" \
          "$STAGE/etc/xdg/autostart"
@@ -206,6 +222,7 @@ install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
 install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+install -m 0644 "$VKLAYER_SO"  "$STAGE/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so"
 # The dashboard sits beside displayxr-cli, which it resolves next to itself.
 # Never strip it: the payload is appended to the ELF host.
 if [ -n "$DASHBOARD_BIN" ]; then
@@ -273,6 +290,18 @@ cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json" <<EOF
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json"
 
+# --- VK_LAYER_DXR_queue_lock manifest (#902 / #2036) ------------------------
+# Generated from the same template CMake uses (src/xrt/targets/vk_layer), with
+# the ABSOLUTE installed path: /usr/share/vulkan/explicit_layer.d is on the
+# loader's default search path, so every Vulkan process finds the layer with no
+# env var. (Like the Windows ExplicitLayers key, it is EXPLICIT: nothing loads
+# it unless enabled by name, which the runtime does for its own sessions only.)
+VKLAYER_JSON_IN="$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in"
+[ -f "$VKLAYER_JSON_IN" ] || { echo "error: missing $VKLAYER_JSON_IN" >&2; exit 1; }
+sed 's|@DXR_QL_LIBRARY_PATH@|/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so|' "$VKLAYER_JSON_IN" \
+    >"$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+chmod 0644 "$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+
 # --- Depends (#1656) ---------------------------------------------------------
 # ONE .deb for Ubuntu 22.04, 24.04 and 26.04. Two things make that true, and
 # both are checked here rather than trusted to the build host:
@@ -309,7 +338,7 @@ STABLE_SONAMES=(
     libXrandr.so.2                  # libxrandr2
     libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
-ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO")
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO" "$VKLAYER_SO")
 # The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
 # libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
 # HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor
