@@ -201,6 +201,7 @@ struct px_pending
 	int32_t result;
 	uint32_t reply_bytes;
 	uint8_t reply[CONV_HOST_WIRE_MAX_PAYLOAD];
+	uint64_t handle; //!< a pulled handle the reply carried (job blob); OS_NATIVE_HANDLE_INVALID = none
 };
 
 struct px_image
@@ -325,6 +326,11 @@ struct proxy
 	uint32_t cur_op, cur_cap;
 	uint64_t cur_since_ns;
 	uint64_t calls_total;
+
+	/* The job in flight (JOB_PROGRESS routing). */
+	uint64_t next_job_id;
+	uint64_t cur_job_id;
+	const struct xrt_conv_job_control *cur_job_ctl;
 };
 
 static inline struct proxy *
@@ -429,8 +435,13 @@ px_request(struct proxy *p,
            uint32_t timeout_ms,
            bool (*cancel)(void *),
            void *cancel_ctx,
-           uint32_t *out_request_id)
+           uint32_t *out_request_id,
+           uint64_t cancel_job_id,
+           uint64_t *out_handle)
 {
+	if (out_handle != NULL) {
+		*out_handle = OS_NATIVE_HANDLE_INVALID;
+	}
 	os_mutex_lock(&p->m);
 	if (p->proc == NULL || p->ch == NULL) {
 		os_mutex_unlock(&p->m);
@@ -456,6 +467,7 @@ px_request(struct proxy *p,
 	pd->used = true;
 	pd->request_id = rid;
 	pd->type = type;
+	pd->handle = OS_NATIVE_HANDLE_INVALID;
 	if (out_request_id != NULL) {
 		*out_request_id = rid;
 	}
@@ -477,6 +489,10 @@ px_request(struct proxy *p,
 	for (;;) {
 		if (pd->done) {
 			r = (xrt_result_t)pd->result;
+			if (out_handle != NULL) {
+				*out_handle = pd->handle;
+				pd->handle = OS_NATIVE_HANDLE_INVALID;
+			}
 			if (reply != NULL && reply_size > 0) {
 				const uint32_t n = pd->reply_bytes < reply_size ? pd->reply_bytes : reply_size;
 				memset(reply, 0, reply_size);
@@ -495,7 +511,13 @@ px_request(struct proxy *p,
 		if (cancel != NULL && !cancel_sent) {
 			os_mutex_unlock(&p->m);
 			const bool c = cancel(cancel_ctx);
-			if (c) {
+			if (c && cancel_job_id != 0) {
+				struct conv_host_wire_job_ref jr;
+				conv_host_wire_init(&jr, sizeof(jr));
+				jr.job_id = cancel_job_id;
+				(void)px_send(p, CONV_HOST_MSG_JOB_CANCEL, 0, &jr, sizeof(jr), NULL, 0);
+				cancel_sent = true;
+			} else if (c) {
 				struct conv_host_wire_cancel cw;
 				conv_host_wire_init(&cw, sizeof(cw));
 				cw.request_id = rid;
@@ -506,6 +528,10 @@ px_request(struct proxy *p,
 			continue;
 		}
 		os_cond_wait_timeout_ns(&p->cond, &p->m, (uint64_t)PX_SLICE_MS * 1000000ull);
+	}
+	if (pd->handle != OS_NATIVE_HANDLE_INVALID) {
+		os_native_handle_close(pd->handle); // nobody asked for it
+		pd->handle = OS_NATIVE_HANDLE_INVALID;
 	}
 	pd->used = false;
 	os_mutex_unlock(&p->m);
@@ -678,18 +704,26 @@ handle_frame(struct proxy *p,
 {
 	const uint32_t bytes = f->payload_bytes;
 	if ((f->type & CONV_HOST_MSG_REPLY_BIT) != 0) {
+		const bool has_handle = f->handle_count > 0 || nfds > 0;
+		const uint64_t h = has_handle ? pull_handle(p, f, fds, nfds, 0) : OS_NATIVE_HANDLE_INVALID;
+		bool kept = false;
 		os_mutex_lock(&p->m);
 		struct px_pending *pd = pending_find_locked(p, f->request_id);
 		if (pd != NULL && (pd->type | CONV_HOST_MSG_REPLY_BIT) == f->type) {
 			pd->reply_bytes = bytes;
 			memcpy(pd->reply, payload, bytes);
 			pd->result = reply_result(payload, bytes);
+			pd->handle = h;
+			kept = true;
 			pd->done = true;
 			os_cond_broadcast(&p->cond);
 		}
 		os_mutex_unlock(&p->m);
-		for (uint32_t i = 0; i < nfds; i++) {
-			os_native_handle_close(fds[i]); // no reply carries a handle we keep (jobs: P2 later)
+		if (!kept && h != OS_NATIVE_HANDLE_INVALID) {
+			os_native_handle_close(h);
+		}
+		for (uint32_t i = 1; i < nfds; i++) {
+			os_native_handle_close(fds[i]);
 		}
 		return;
 	}
@@ -737,7 +771,21 @@ handle_frame(struct proxy *p,
 	}
 	case CONV_HOST_MSG_OUTPUT_IMAGE: handle_output_image(p, f, payload, bytes, fds, nfds); return;
 	case CONV_HOST_MSG_SYNC: handle_sync(p, f, payload, bytes, fds, nfds); return;
-	default: break; // JOB_PROGRESS and anything newer: ignored
+	case CONV_HOST_MSG_JOB_PROGRESS: {
+		struct conv_host_wire_job_progress jp;
+		if (conv_host_wire_receive(&jp, sizeof(jp), payload, bytes)) {
+			jp.stage[sizeof(jp.stage) - 1] = '\0';
+			os_mutex_lock(&p->m);
+			const struct xrt_conv_job_control *ctl = jp.job_id == p->cur_job_id ? p->cur_job_ctl : NULL;
+			os_mutex_unlock(&p->m);
+			// The worker is blocked in this job's request: ctl outlives the call.
+			if (ctl != NULL && ctl->progress != NULL) {
+				ctl->progress(ctl->ctx, jp.fraction, jp.stage);
+			}
+		}
+		break;
+	}
+	default: break; // anything newer: ignored
 	}
 	for (uint32_t i = 0; i < nfds; i++) {
 		os_native_handle_close(fds[i]);
@@ -859,7 +907,7 @@ lane_open(struct proxy *p)
 	const uint64_t hs[3] = {p->lane.handle, remote_to, remote_from};
 	struct conv_host_wire_status st;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_LANE_OPEN, &lo, sizeof(lo), hs, 3, &st, sizeof(st),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 #ifndef XRT_OS_WINDOWS
 	// POSIX: the host has its own copies now (SCM_RIGHTS); Windows: the remote
 	// end IS our local event (os_wake_create_pair), nothing extra to close.
@@ -891,7 +939,7 @@ describe_all(struct proxy *p, uint32_t count)
 		req.index = i;
 		struct conv_host_wire_describe_reply rep;
 		if (px_request(p, CONV_HOST_MSG_DESCRIBE, &req, sizeof(req), NULL, 0, &rep, sizeof(rep),
-		               PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL) != XRT_SUCCESS) {
+		               PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL) != XRT_SUCCESS) {
 			return false;
 		}
 		if (i == 0 && rep.count < count) {
@@ -907,7 +955,7 @@ describe_all(struct proxy *p, uint32_t count)
 		req.cap_id = caps[i].cap_id;
 		struct conv_host_wire_state_reply rep;
 		if (px_request(p, CONV_HOST_MSG_GET_STATE, &req, sizeof(req), NULL, 0, &rep, sizeof(rep),
-		               PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL) == XRT_SUCCESS) {
+		               PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL) == XRT_SUCCESS) {
 			conv_host_wire_unpack_state(&rep.state, &states[i]);
 		} else {
 			states[i].state = XRT_CONV_STATE_INSTALLED;
@@ -1380,12 +1428,12 @@ exec_cap_request(struct proxy *p, uint32_t type, struct conv_host_cmd *c)
 	struct conv_host_wire_status st;
 	const bool warm = type == CONV_HOST_MSG_WARM;
 	xrt_result_t r = px_request(p, type, &req, sizeof(req), NULL, 0, &st, sizeof(st), 0,
-	                            warm && c->is_cancelled != NULL ? cmd_is_cancelled : NULL, c, NULL);
+	                            warm && c->is_cancelled != NULL ? cmd_is_cancelled : NULL, c, NULL, 0, NULL);
 	// Refresh the cached state: the core reads it right after the warm.
 	struct conv_host_wire_state_reply sr;
 	if (r != XRT_ERROR_IPC_FAILURE &&
 	    px_request(p, CONV_HOST_MSG_GET_STATE, &req, sizeof(req), NULL, 0, &sr, sizeof(sr), PX_REQUEST_TIMEOUT_MS,
-	               NULL, NULL, NULL) == XRT_SUCCESS) {
+	               NULL, NULL, NULL, 0, NULL) == XRT_SUCCESS) {
 		os_mutex_lock(&p->m);
 		for (uint32_t i = 0; i < p->cap_count; i++) {
 			if (p->caps[i].cap_id == c->cap_id) {
@@ -1435,7 +1483,7 @@ exec_stream_create(struct proxy *p, struct conv_host_cmd *c)
 	so.max_input_height = si->max_input_height;
 	struct conv_host_wire_status st;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_STREAM_OPEN, &so, sizeof(so), NULL, 0, &st, sizeof(st),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 	os_mutex_lock(&p->m);
 	s = stream_find_locked(p, id);
 	if (r == XRT_SUCCESS && s != NULL) {
@@ -1456,7 +1504,7 @@ exec_stream_destroy(struct proxy *p, struct conv_host_cmd *c)
 	sr.stream = c->stream;
 	struct conv_host_wire_status st;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_STREAM_CLOSE, &sr, sizeof(sr), NULL, 0, &st, sizeof(st),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 	struct px_output dead[PX_MAX_OUTPUTS];
 	uint32_t nd = 0;
 	os_mutex_lock(&p->m);
@@ -1520,16 +1568,12 @@ scratch_alloc_locked(struct proxy *p, uint64_t len, uint64_t *out_off)
 	return true;
 }
 
-//! Make the input image known to this incarnation; CPU: refresh its scratch copy.
+/*! Make slot @p si known to this incarnation; CPU: refresh its scratch copy
+ *  from @p img (the caller's pointer). */
 static bool
-push_input(struct proxy *p, const struct xrt_conv_image *img, uint32_t role, uint32_t *out_slot)
+push_slot(struct proxy *p, int32_t si, const struct xrt_conv_image *img, uint32_t role)
 {
 	os_mutex_lock(&p->m);
-	const int32_t si = image_slot_locked(p, img);
-	if (si < 0) {
-		os_mutex_unlock(&p->m);
-		return false;
-	}
 	struct px_image *im = &p->images[si];
 	const bool cpu = img->memory_kind == XRT_CONV_MEM_CPU;
 	bool need_push = !im->pushed;
@@ -1547,7 +1591,6 @@ push_input(struct proxy *p, const struct xrt_conv_image *img, uint32_t role, uin
 	const uint64_t scratch_off = im->scratch_off;
 	const struct xrt_conv_image svc = im->img;
 	os_mutex_unlock(&p->m);
-	*out_slot = (uint32_t)si;
 
 	if (cpu) {
 		if (svc.cpu_ptr == NULL || p->lane.ptr == NULL) {
@@ -1576,7 +1619,7 @@ push_input(struct proxy *p, const struct xrt_conv_image *img, uint32_t role, uin
 	}
 	struct conv_host_wire_status st;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_REGISTER_IMAGE, &ri, sizeof(ri), hs, nh, &st, sizeof(st),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 	if (r != XRT_SUCCESS) {
 		return false;
 	}
@@ -1586,6 +1629,167 @@ push_input(struct proxy *p, const struct xrt_conv_image *img, uint32_t role, uin
 	}
 	os_mutex_unlock(&p->m);
 	return true;
+}
+
+//! A registered input (found by import_key) pushed to this incarnation.
+static bool
+push_input(struct proxy *p, const struct xrt_conv_image *img, uint32_t role, uint32_t *out_slot)
+{
+	os_mutex_lock(&p->m);
+	const int32_t si = image_slot_locked(p, img);
+	os_mutex_unlock(&p->m);
+	if (si < 0) {
+		return false;
+	}
+	*out_slot = (uint32_t)si;
+	return push_slot(p, si, img, role);
+}
+
+//! Drop slot @p si here and on the host (job inputs; worker).
+static void
+drop_slot(struct proxy *p, int32_t si)
+{
+	os_mutex_lock(&p->m);
+	const bool pushed = p->images[si].pushed;
+	memset(&p->images[si], 0, sizeof(p->images[si]));
+	const bool running = p->running;
+	os_mutex_unlock(&p->m);
+	if (pushed && running) {
+		struct conv_host_wire_index ui;
+		conv_host_wire_init(&ui, sizeof(ui));
+		ui.index = (uint32_t)si;
+		struct conv_host_wire_status st;
+		(void)px_request(p, CONV_HOST_MSG_UNREGISTER_IMAGE, &ui, sizeof(ui), NULL, 0, &st, sizeof(st),
+		                 PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
+	}
+}
+
+static bool
+job_is_cancelled(void *ctx)
+{
+	const struct xrt_conv_job_control *ctl = (const struct xrt_conv_job_control *)ctx;
+	return ctl != NULL && ctl->is_cancelled != NULL && ctl->is_cancelled(ctl->ctx);
+}
+
+/*!
+ * A job through the satellite: the inputs are registered for the job's
+ * lifetime (CPU bytes in the lane scratch: the lowest-numbered open lane, the
+ * only one here), JOB_SUBMIT runs to its job_done reply (JOB_CANCEL when the
+ * caller's is_cancelled turns true; JOB_PROGRESS is routed to its progress),
+ * and the blob comes back as a host shm section that is pulled, mapped and
+ * written into the matching sink, then released on the host.
+ */
+static xrt_result_t
+exec_job(struct proxy *p, struct conv_host_cmd *c)
+{
+	const struct xrt_conv_job_in *in = c->job_in;
+	const struct xrt_conv_job_control *ctl = c->job_ctl;
+	if (in == NULL || in->image_count > XRT_CONV_MAX_FRAME_IMAGES) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct conv_host_wire_job_submit js;
+	conv_host_wire_init(&js, sizeof(js));
+	int32_t slots[XRT_CONV_MAX_FRAME_IMAGES];
+	uint32_t nslots = 0;
+	xrt_result_t r = XRT_SUCCESS;
+	for (uint32_t i = 0; i < in->image_count && r == XRT_SUCCESS; i++) {
+		os_mutex_lock(&p->m);
+		int32_t si = -1;
+		for (uint32_t k = 0; k < PX_MAX_IMAGES && si < 0; k++) {
+			if (!p->images[k].used) {
+				si = (int32_t)k;
+				memset(&p->images[k], 0, sizeof(p->images[k]));
+				p->images[k].used = true;
+				p->images[k].img = in->images[i];
+			}
+		}
+		os_mutex_unlock(&p->m);
+		if (si < 0) {
+			r = XRT_ERROR_ALLOCATION;
+			break;
+		}
+		slots[nslots++] = si;
+		if (!push_slot(p, si, &in->images[i], in->image_role[i])) {
+			r = XRT_ERROR_IPC_FAILURE;
+			break;
+		}
+		js.image_idx[i] = (uint32_t)si;
+		js.image_role[i] = in->image_role[i];
+	}
+	for (uint32_t i = in->image_count; i < XRT_CONV_MAX_FRAME_IMAGES; i++) {
+		js.image_idx[i] = CONV_HOST_WIRE_NO_INDEX;
+	}
+	uint64_t job_id = 0;
+	uint64_t blob = OS_NATIVE_HANDLE_INVALID;
+	struct conv_host_wire_job_done jd;
+	memset(&jd, 0, sizeof(jd));
+	if (r == XRT_SUCCESS) {
+		os_mutex_lock(&p->m);
+		job_id = ++p->next_job_id;
+		p->cur_job_id = job_id;
+		p->cur_job_ctl = ctl;
+		os_mutex_unlock(&p->m);
+		js.job_id = job_id;
+		js.cap_id = c->cap_id;
+		js.input_kind = in->input_kind;
+		js.image_count = in->image_count;
+		js.requested_blob_format = in->requested_blob_format;
+		if (c->params != NULL) {
+			xrt_conv_wire_pack_params(c->params, &js.params);
+		}
+		r = px_request(p, CONV_HOST_MSG_JOB_SUBMIT, &js, sizeof(js), NULL, 0, &jd, sizeof(jd), 0,
+		               ctl != NULL && ctl->is_cancelled != NULL ? job_is_cancelled : NULL, (void *)ctl, NULL,
+		               job_id, &blob);
+		os_mutex_lock(&p->m);
+		p->cur_job_id = 0;
+		p->cur_job_ctl = NULL;
+		os_mutex_unlock(&p->m);
+	}
+	// The blob, into the sink that takes it.
+	if (r == XRT_SUCCESS && jd.blob_bytes > 0) {
+		struct px_shm m;
+		if (blob == OS_NATIVE_HANDLE_INVALID || !px_shm_map(&m, blob, jd.blob_bytes)) {
+			r = XRT_ERROR_IPC_FAILURE;
+		} else {
+			blob = OS_NATIVE_HANDLE_INVALID; // owned by m now
+			bool delivered = false;
+			for (uint32_t i = 0; ctl != NULL && i < ctl->sink_count && !delivered; i++) {
+				struct xrt_conv_blob_sink *sk = &ctl->sinks[i];
+				if (ctl->sink_count > 1 && (sk->role & jd.written) == 0) {
+					continue;
+				}
+				delivered = true;
+				if (sk->begin != NULL && !sk->begin(sk->ctx, jd.blob_format, jd.blob_bytes)) {
+					r = XRT_ERROR_IPC_FAILURE;
+				} else if (sk->write != NULL && !sk->write(sk->ctx, m.ptr, jd.blob_bytes)) {
+					r = XRT_ERROR_IPC_FAILURE;
+				}
+			}
+			px_shm_close(&m);
+		}
+	}
+	if (blob != OS_NATIVE_HANDLE_INVALID) {
+		os_native_handle_close(blob);
+	}
+#ifdef CONV_HOST_MSG_JOB_RELEASE
+	if (job_id != 0 && jd.blob_bytes > 0) {
+		// The service holds its own copy now: the host may drop the section.
+		struct conv_host_wire_job_ref jr;
+		conv_host_wire_init(&jr, sizeof(jr));
+		jr.job_id = job_id;
+		(void)px_send(p, CONV_HOST_MSG_JOB_RELEASE, 0, &jr, sizeof(jr), NULL, 0);
+	}
+#endif
+	if (r == XRT_SUCCESS && c->job_out != NULL) {
+		c->job_out->written = jd.written;
+		xrt_conv_wire_unpack_splat_info(&jd.splat_info, &c->job_out->splat_info);
+		xrt_conv_wire_unpack_depth_info(&jd.depth_info, &c->job_out->depth_info);
+		xrt_conv_wire_unpack_views_info(&jd.views_info, &c->job_out->views_info);
+	}
+	for (uint32_t i = 0; i < nslots; i++) {
+		drop_slot(p, slots[i]);
+	}
+	return r;
 }
 
 //! A current output set for (stream, w, h): ALLOC_OUTPUTS when the extent changed.
@@ -1608,7 +1812,7 @@ ensure_outputs(struct proxy *p, uint64_t stream, uint32_t w, uint32_t h)
 	struct conv_host_wire_status st;
 	uint32_t rid = 0;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_ALLOC_OUTPUTS, &ao, sizeof(ao), NULL, 0, &st, sizeof(st),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, &rid);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, &rid, 0, NULL);
 	if (r != XRT_SUCCESS) {
 		return false;
 	}
@@ -1909,11 +2113,7 @@ worker_main(void *ptr)
 		case CONV_OP_STREAM_CREATE: r = exec_stream_create(p, c); break;
 		case CONV_OP_STREAM_DESTROY: r = exec_stream_destroy(p, c); break;
 		case CONV_OP_CONVERT: r = exec_convert(p, c, epoch); break;
-		case CONV_OP_JOB:
-			// Jobs through a satellite need the blob hand-back (JOB_SUBMIT /
-			// job_done); not in this proxy revision.
-			r = XRT_ERROR_FEATURE_NOT_SUPPORTED;
-			break;
+		case CONV_OP_JOB: r = exec_job(p, c); break;
 		default: r = XRT_ERROR_FEATURE_NOT_SUPPORTED; break;
 		}
 
@@ -2020,7 +2220,7 @@ px_get_output_desc(struct conv_host *h, uint64_t stream, uint32_t w, uint32_t hg
 	rq.height = hgt;
 	struct conv_host_wire_output_desc_reply rp;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_GET_OUTPUT_DESC, &rq, sizeof(rq), NULL, 0, &rp, sizeof(rp),
-	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+	                                  PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 	if (r != XRT_SUCCESS) {
 		return r;
 	}
@@ -2156,7 +2356,7 @@ px_unregister_image(struct conv_host *h, uint32_t index)
 		ui.index = slot;
 		struct conv_host_wire_status st;
 		(void)px_request(p, CONV_HOST_MSG_UNREGISTER_IMAGE, &ui, sizeof(ui), NULL, 0, &st, sizeof(st),
-		                 PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL);
+		                 PX_REQUEST_TIMEOUT_MS, NULL, NULL, NULL, 0, NULL);
 	}
 }
 
@@ -2249,6 +2449,9 @@ px_destroy(struct conv_host **h_ptr)
 		q = next;
 	}
 	lane_close(p);
+	if (p->have_gpu && p->gpu.destroy != NULL) {
+		p->gpu.destroy(p->gpu.ud);
+	}
 	os_cond_destroy(&p->cond);
 	os_mutex_destroy(&p->send_mtx);
 	os_mutex_destroy(&p->m);
@@ -2330,6 +2533,7 @@ conv_host_proxy_create(const struct conv_host_proxy_config *cfg, struct conv_hos
 	}
 	p->worker_started = true;
 	if (os_thread_init(&p->sup_thread) != 0 || os_thread_start(&p->sup_thread, sup_main, p) != 0) {
+		p->have_gpu = false; // on failure the caller keeps its gpu ops
 		struct conv_host *b = &p->base;
 		px_destroy(&b);
 		return XRT_ERROR_THREADING_INIT_FAILURE;

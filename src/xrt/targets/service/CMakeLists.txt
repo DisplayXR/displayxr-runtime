@@ -38,6 +38,11 @@ target_sources(displayxr-service PRIVATE
 	service_spawn.h
 )
 target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime ipc_server_conv)
+if(TARGET comp_d3d11_conv_host_lane)
+	# ADR-053 P2: the GPU lane of conversion-host satellites (Windows).
+	target_link_libraries(displayxr-service PRIVATE comp_d3d11_conv_host_lane)
+	target_compile_definitions(displayxr-service PRIVATE SERVICE_HAVE_CONV_HOST_LANE_D3D11)
+endif()
 
 # Delay-load Vulkan so the service can start on systems where it is absent.
 # The D3D11 service compositor path never calls into Vulkan functions, so the

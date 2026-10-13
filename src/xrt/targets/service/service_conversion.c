@@ -44,6 +44,9 @@
 #ifdef CONV_HAVE_HOST_PROXY
 #include "conversion/conv_host_proxy.h"
 #endif
+#ifdef SERVICE_HAVE_CONV_HOST_LANE_D3D11
+#include "d3d11_service/d3d11_conv_host_lane.h"
+#endif
 
 //! The conversion-host satellite (ADR-053 D5), installed beside the service.
 #define CONV_HOST_EXE "displayxr-conversion-host" SERVICE_SPAWN_EXE_SUFFIX
@@ -542,7 +545,21 @@ satellite_host_create(const struct xrt_conversion_plugin_entry *e, struct conv_h
 	cfg.host_exe = host_exe;
 	// The host writes its own log (DisplayXR_conversion-host_<id>.<pid>_<ts>.log).
 	// adapter_luid stays 0 (any) until the GPU lane passes the ingest adapter.
+#ifdef SERVICE_HAVE_CONV_HOST_LANE_D3D11
+	// The GPU lane: NT-handle textures + the host's shared fence, observed on
+	// the CPU (the fence rule). Without it the satellite serves CPU images only.
+	struct conv_host_proxy_gpu_ops gpu;
+	memset(&gpu, 0, sizeof(gpu));
+	if (d3d11_conv_host_lane_create(cfg.adapter_luid, &gpu)) {
+		cfg.gpu = &gpu;
+	}
+#endif
 	const xrt_result_t r = conv_host_proxy_create(&cfg, out);
+#ifdef SERVICE_HAVE_CONV_HOST_LANE_D3D11
+	if (r != XRT_SUCCESS && cfg.gpu != NULL) {
+		gpu.destroy(gpu.ud);
+	}
+#endif
 	if (r != XRT_SUCCESS) {
 		(void)snprintf(why, why_size, "the host proxy could not be created (%d)", (int)r);
 		return false;
