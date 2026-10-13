@@ -36,6 +36,8 @@ set(tests
     tests_conv_readiness
     tests_conv_registry
     tests_conv_lanes
+    tests_conv_supervisor
+    tests_conv_shm_ring
     tests_lift_abi
     tests_conv_viewsyn_math
     tests_aux_lift_viewpoint
@@ -1352,6 +1354,10 @@ if(TARGET sim_conversion_static)
 	target_compile_definitions(tests_conv_lanes PRIVATE CONV_LANES_SIM_STATIC)
 endif()
 
+# ADR-053 P2 (#2032): the satellite supervisor FSM (pure, scripted clock) and
+# the shm command / completion rings with the host wire records.
+target_link_libraries(tests_conv_supervisor PRIVATE displayxr::conversion_core)
+target_link_libraries(tests_conv_shm_ring PRIVATE displayxr::conversion_core)
 if(TARGET tests_conv_os_process)
 	add_executable(tests_conv_os_process_helper tests_conv_os_process_helper.c)
 	target_link_libraries(tests_conv_os_process_helper PRIVATE aux_os displayxr::conversion_core)

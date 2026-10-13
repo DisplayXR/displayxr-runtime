@@ -144,6 +144,8 @@ add_library(
 	u_session.h
 	u_setting.c
 	u_setting.h
+	u_shm_ring.c
+	u_shm_ring.h
 	u_space_overseer.c
 	u_space_overseer.h
 	u_status_snapshot.c
