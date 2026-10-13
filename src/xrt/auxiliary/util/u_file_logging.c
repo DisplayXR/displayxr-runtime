@@ -30,6 +30,8 @@
 // Log file handle
 static FILE *g_log_file = NULL;
 static int g_initialized = 0;
+static char g_name_override[96] = {0};
+static char g_log_path[MAX_PATH] = {0};
 
 // Forward declaration
 static void
@@ -268,6 +270,9 @@ u_file_logging_init(void)
 	GetModuleFileNameA(NULL, exe_path, MAX_PATH);
 	char *exe_name = strrchr(exe_path, '\\');
 	exe_name = exe_name ? exe_name + 1 : exe_path;
+	if (g_name_override[0] != '\0') {
+		exe_name = g_name_override;
+	}
 	DWORD pid = GetCurrentProcessId();
 
 	// Build log file path with process name, PID, and timestamp
@@ -295,6 +300,7 @@ u_file_logging_init(void)
 	if (g_log_file == NULL) {
 		return;
 	}
+	snprintf(g_log_path, sizeof(g_log_path), "%s", log_path);
 
 	// Announce log file location via OutputDebugString for discoverability
 	{
@@ -318,6 +324,21 @@ u_file_logging_init(void)
 
 	// Register cleanup at exit
 	atexit(u_file_logging_shutdown);
+}
+
+void
+u_file_logging_set_name(const char *name)
+{
+	if (g_initialized || name == NULL) {
+		return;
+	}
+	snprintf(g_name_override, sizeof(g_name_override), "%s", name);
+}
+
+const char *
+u_file_logging_get_path(void)
+{
+	return g_log_path;
 }
 
 void
@@ -371,6 +392,18 @@ u_file_logging_shutdown(void)
 #else /* !XRT_OS_WINDOWS */
 
 // Stub implementations for non-Windows platforms
+void
+u_file_logging_set_name(const char *name)
+{
+	(void)name;
+}
+
+const char *
+u_file_logging_get_path(void)
+{
+	return "";
+}
+
 void
 u_file_logging_init(void)
 {
