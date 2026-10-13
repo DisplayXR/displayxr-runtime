@@ -22,17 +22,88 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_lift.h"
 
 #include "conversion/conv_pipeline.h"
 #include "conversion/conv_stream.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d11.h>
 
 #include <stdint.h>
 
 struct d3d11_lift;
 struct conv_core;
+
+//! Set in every v3 stream id the conversion core route minted (== IPC_SERVER_CONV_STREAM_TAG).
+#define D3D11_LIFT_CORE_STREAM_TAG (1ull << 62)
+
+/*!
+ * A result pinned for reading on the SERVICE device (the weave's use). While
+ * pinned, its core ring slot is not reused and its keyed mutex is held.
+ */
+struct d3d11_lift_pin
+{
+	struct d3d11_lift *lift;
+	uint64_t stream_id;
+	int32_t slot; //!< unused (-1); the core ring slot is core_ring_slot
+	IDXGIKeyedMutex *km;
+	ID3D11ShaderResourceView *srv; //!< service-device SRV of the result
+	uint32_t width;                //!< whole result (all views)
+	uint32_t height;
+	uint32_t view_count;
+	//! The part of the lifted rect this result covers (letterbox crop):
+	//! x0, y0, x1, y1 normalised to the rect as it was snapshotted. Outside it
+	//! (the bars) the caller weaves the 2D input FLAT, identical in every view.
+	float active[4];
+	bool valid;
+
+	/*
+	 * ADR-046 Amendment 1 (depth cursor on lifted content).
+	 */
+
+	//! The viewpoints this result was synthesized for, relative to
+	//! @c rect_center (display axes, metres; ADR-048). 0 = none known.
+	uint32_t vp_count;
+	float vps[3 * XRT_LIFT_MAX_VIEWS];
+	float rect_center[3]; //!< display space, metres
+	float rect_size[2];   //!< metres
+	//! The result's auxiliary depth on the service device (NULL = none). Its
+	//! keyed mutex is held only after d3d11_lift_pin_depth returned true.
+	ID3D11Texture2D *depth_tex;
+	IDXGIKeyedMutex *depth_km;
+	bool depth_held;
+	uint32_t depth_w, depth_h, depth_format;
+	uint32_t depth_encoding; //!< XRT_DP_LIFT_DEPTH_ENCODING_*
+	float depth_value_scale;
+	float depth_value_offset;
+	//! z in front of the screen = relief_scale / depth + relief_offset
+	//! (xrt_dp_lift_depth::relief_*); false = the module reported none.
+	bool relief_valid;
+	float relief_scale;
+	float relief_offset;
+
+	//! #2003: a result of a core-routed stream (its ring slot stays pinned in
+	//! the core until d3d11_lift_unpin).
+	bool core;
+	uint64_t core_id;
+	uint32_t core_ring_slot;
+};
+
+/*!
+ * G7, producer side: the service notes every eye query it answered (the eyes
+ * themselves go to the conversion core's per-DP snapshot). A producer whose
+ * last note is older than 50 ms calls the refresh first, on its own thread
+ * (the refresh may take render_mutex; the lift thread never does).
+ */
+void
+d3d11_lift_publish_eyes(struct d3d11_lift *lift, const struct xrt_eye_positions *eyes);
+
+void
+d3d11_lift_set_eyes_refresh(struct d3d11_lift *lift, void (*fn)(void *ud), void *ud);
 
 //! The weave path's view of core-routed streams (installed by the IPC layer).
 struct d3d11_lift_core_bridge
@@ -115,3 +186,61 @@ d3d11_lift_glue_export_fence(struct d3d11_lift *lift, uint64_t stream_id, HANDLE
 
 void
 d3d11_lift_glue_stream_gone(struct d3d11_lift *lift, uint64_t stream_id);
+
+
+/*
+ *
+ * The weave path (comp_d3d11_service's lift-rect weave). Every lifted rect is
+ * a core-routed v3 stream; any other id is refused (non-fatal).
+ *
+ */
+
+//! The core-routed stream's v3 mode bit, 0 when @p id is not @p owner's live stream.
+uint32_t
+d3d11_lift_stream_mode(struct d3d11_lift *lift, uint64_t owner, uint64_t id);
+
+/*!
+ * The weave path's submit: snapshot region (@p x, @p y, @p w, @p h) of @p src
+ * (an SRV on the service device, @p src_tw x @p src_th) into a core slot.
+ * The CALLER holds the service context mutex and whatever keyed mutex guards
+ * @p src. The snapshot's long edge is capped at DXR_LIFT_MAX_INPUT_EDGE
+ * (default 1920, 0 = off; u_lift_cap_dims) — the result is stretched back into
+ * the rect, so consumers must sample it, never assume result size == rect size.
+ * The rect's letterbox bars are cropped first (DXR_LIFT_LETTERBOX). @p params
+ * NULL = the rect's last options. @p view_control NULL = none carried with this
+ * frame (conv_frame_submit); @p frame = the lifted rect's physical centre + size.
+ * @p viewpoints / @p rig: a lifted rect's EXPLICIT viewpoints and app rig
+ * (XR_DXR_lift v3).
+ */
+xrt_result_t
+d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
+                             uint64_t owner,
+                             uint64_t id,
+                             ID3D11ShaderResourceView *src,
+                             uint32_t src_tw,
+                             uint32_t src_th,
+                             uint32_t x,
+                             uint32_t y,
+                             uint32_t w,
+                             uint32_t h,
+                             int64_t source_time,
+                             const struct xrt_dp_lift_params *params,
+                             const float *viewpoints,
+                             uint32_t viewpoint_floats,
+                             const struct xrt_lift_view_control *view_control,
+                             const struct xrt_lift_rig *rig,
+                             const struct xrt_lift_rect_frame *frame,
+                             uint64_t *out_frame_id);
+
+//! Pin the stream's latest result for a service-device read (the weave).
+bool
+d3d11_lift_pin_latest(struct d3d11_lift *lift, uint64_t owner, uint64_t id, struct d3d11_lift_pin *out);
+
+//! ADR-046 Amendment 1: also take the pinned result's depth map (its keyed
+//! mutex, without waiting). False = the result has none, or it is busy this
+//! frame. Released by d3d11_lift_unpin.
+bool
+d3d11_lift_pin_depth(struct d3d11_lift_pin *pin);
+
+void
+d3d11_lift_unpin(struct d3d11_lift_pin *pin);
