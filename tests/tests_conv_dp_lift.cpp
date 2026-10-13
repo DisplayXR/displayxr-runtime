@@ -73,6 +73,11 @@ struct FakeLift
 	uint32_t module_status = 0; //!< forced module_status after activation (0 = from the script)
 	uint32_t modes = XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
 	uint32_t max_views = 4;
+	//! Aux outputs the caps answer carries while ACTIVATING and once READY. The
+	//! shipping plug-in advertises AUX_DEPTH only once its model is up, so a caps
+	//! answer taken while ACTIVATING says "no aux depth" (#2025).
+	uint32_t aux_at_activation = XRT_DP_LIFT_AUX_DEPTH;
+	uint32_t aux_at_ready = XRT_DP_LIFT_AUX_DEPTH;
 
 	// State the snapshot reports.
 	bool attempted = false, have = false;
@@ -128,10 +133,11 @@ fl_activate(void *ud, bool retry)
 		f->caps.modes = f->modes;
 		f->caps.max_views = f->max_views;
 		f->caps.max_streams = 4;
-		f->caps.aux_outputs = XRT_DP_LIFT_AUX_DEPTH;
+		const bool ready_now = f->polls_until_ready <= 0;
+		f->caps.aux_outputs = ready_now ? f->aux_at_ready : f->aux_at_activation;
 		f->caps.aux_depth_semantics = XRT_DP_LIFT_DEPTH_RELATIVE;
 		std::snprintf(f->caps.backend, sizeof(f->caps.backend), "fake-module");
-		f->set_state(f->polls_until_ready > 0 ? XRT_DP_LIFT_STATE_ACTIVATING : XRT_DP_LIFT_STATE_READY);
+		f->set_state(ready_now ? XRT_DP_LIFT_STATE_READY : XRT_DP_LIFT_STATE_ACTIVATING);
 	} else {
 		f->caps.state = XRT_DP_LIFT_STATE_UNAVAILABLE;
 		f->change++;
@@ -146,6 +152,7 @@ fl_poll(void *ud)
 	std::lock_guard<std::mutex> lk(f->m);
 	f->polls++;
 	if (f->have && f->polls_until_ready > 0 && --f->polls_until_ready == 0) {
+		f->caps.aux_outputs = f->aux_at_ready; // the model is up: its aux outputs with it
 		f->set_state(XRT_DP_LIFT_STATE_READY);
 	}
 }
@@ -205,6 +212,22 @@ fl_convert(void *ud, uint64_t, conv_dp_lift_convert *io)
 		io->depth.same_inference = 1;
 	}
 	return XRT_SUCCESS;
+}
+
+//! The declared outputs of one of dp-lift's rows (the registry copy).
+uint32_t
+row_outputs(conv_core *core, uint32_t cap_id)
+{
+	auto *reg = new conv_registry();
+	conv_core_copy_registry(core, reg);
+	uint32_t outputs = 0;
+	const int32_t pi = conv_registry_find_provider(reg, CONV_DP_LIFT_ID);
+	const int32_t ri = pi >= 0 ? conv_registry_find_row(reg, (uint32_t)pi, cap_id) : -1;
+	if (ri >= 0) {
+		outputs = reg->rows[ri].cap.outputs;
+	}
+	delete reg;
+	return outputs;
 }
 
 //! The readiness of one of dp-lift's rows (the registry copy the status snapshot reads).
@@ -561,6 +584,75 @@ TEST_CASE("legacy golden replay: cold boot ACTIVATING -> READY without a restart
 	CHECK(f.last_params.view_count == 2u);
 	CHECK(f.last_params.viewpoint_frame == XRT_DP_LIFT_VIEWPOINT_FRAME_RECT);
 	CHECK(f.last_params.inpaint == 1u);
+}
+
+TEST_CASE("dp-lift: a VIEWS|DEPTH stream created while the module warms converts once READY (#2025)",
+          "[conv_dp_lift]")
+{
+	// The lifted-rect cursor (ADR-046 Amendment 1) chains a depth request on
+	// its stream, so the stream requires VIEWS|DEPTH. The shipping plug-in
+	// advertises AUX_DEPTH only once its model is up; a caps answer taken while
+	// ACTIVATING therefore says "no aux depth". P1a described the capability
+	// from that answer and latched the stream as unsatisfied for its life.
+	FakeLift f;
+	f.polls_until_ready = 2;
+	f.aux_at_activation = 0; // like the plug-in: no aux depth until the model is up
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	uint64_t id = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 7, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, XRT_DP_LIFT_AUX_DEPTH, 0,
+	                                           &id) == XRT_SUCCESS);
+	REQUIRE(fx.submit(7, id) == XRT_SUCCESS);
+	ipc_lift_result r{};
+	CHECK_FALSE(fx.acquire(7, id, &r)); // frames wait while the module warms
+	REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 8000));
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(7, id);
+		    return fx.acquire(7, id, &r);
+	    },
+	    4000));
+	CHECK(r.view_count == 2u);
+	CHECK(r.depth.valid != 0u); // the depth request was honoured, not dropped
+}
+
+TEST_CASE("dp-lift: a stream latched unsatisfied un-latches when the capability gains the output (#2025)",
+          "[conv_dp_lift]")
+{
+	// The adversarial order: the module reports READY *without* aux depth, the
+	// stream is refined against that (unsatisfied, frames dropped), and the
+	// capability gains DEPTH afterwards. The core must re-refine, never latch.
+	FakeLift f;
+	f.polls_until_ready = 2;
+	f.aux_at_activation = 0;
+	f.aux_at_ready = 0; // READY without aux depth: the stream cannot be satisfied yet
+	Fixture fx(CONV_PREWARM_FIRST_CREATE);
+	REQUIRE(fx.add_dp_lift(&f) >= 0);
+	uint64_t id = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(fx.sc, 8, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, XRT_DP_LIFT_AUX_DEPTH, 0,
+	                                           &id) == XRT_SUCCESS);
+	REQUIRE(wait_until([&] { return fx.properties().state == XRT_DP_LIFT_STATE_READY; }, 8000));
+	REQUIRE(wait_until([&] { return (row_outputs(fx.core, CONV_DP_LIFT_CAP_VIEWS_MONO) & XRT_CONV_OUT_DEPTH) == 0; },
+	                   4000));
+	ipc_lift_result r{};
+	for (int i = 0; i < 5; i++) {
+		fx.submit(8, id);
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	CHECK_FALSE(fx.acquire(8, id, &r)); // dropped: READY but lacking DEPTH
+	{
+		std::lock_guard<std::mutex> lk(f.m);
+		f.caps.aux_outputs = XRT_DP_LIFT_AUX_DEPTH; // the capability gains the output
+		f.change++;
+	}
+	REQUIRE(wait_until(
+	    [&] {
+		    fx.submit(8, id);
+		    return fx.acquire(8, id, &r);
+	    },
+	    6000));
+	CHECK(r.view_count == 2u);
+	CHECK(r.depth.valid != 0u);
 }
 
 TEST_CASE("legacy golden replay: no module at first, READY after a registry change, no restart (G5)", "[conv_dp_lift]")
