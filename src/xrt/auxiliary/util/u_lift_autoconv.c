@@ -593,6 +593,10 @@ u_lift_autoconv_filter_step(struct u_lift_autoconv_filter *f,
 	if (f->fast &&
 	    (fabsf(f->x - f->target) < 0.01f || (double)(now_ns - f->fast_since_ns) * 1e-9 > (double)p->cut_max_s)) {
 		f->fast = false;
+		// Drop the fast follower's speed: carried into the ~20x slower spring
+		// it overshoots the new plane by ~15 % of the cut and drifts back over
+		// ~2 s.
+		f->v = 0.0f;
 	}
 	if (out_value != NULL) {
 		*out_value = f->x;

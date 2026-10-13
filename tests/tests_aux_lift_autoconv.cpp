@@ -340,6 +340,36 @@ TEST_CASE("lift autoconv: a confirmed scene cut ramps fast, never in one frame",
 	CHECK(x < 0.8f - 0.06f);
 }
 
+TEST_CASE("lift autoconv: a confirmed cut lands without overshoot", "[lift_autoconv]")
+{
+	u_lift_autoconv_filter_params p;
+	u_lift_autoconv_filter_params_default(&p);
+	u_lift_autoconv_filter f;
+	u_lift_autoconv_filter_reset(&f);
+	uint64_t t = 0;
+	u_lift_autoconv_estimate e = fake(0.2f, 2.0f);
+	u_lift_autoconv_filter_measure(&f, &p, &e, t);
+	float x = 0.0f;
+	u_lift_autoconv_filter_step(&f, &p, t, &x);
+
+	// A new scene from 1 s on, measured every 125 ms, stepped every 16 ms.
+	e = fake(0.8f, 12.0f);
+	t = 1000 * kMs;
+	uint64_t next_measure = t;
+	float max_x = x;
+	for (int i = 0; i < 250; i++, t += 16 * kMs) {
+		if (t >= next_measure) {
+			u_lift_autoconv_filter_measure(&f, &p, &e, t);
+			next_measure = t + 125 * kMs;
+		}
+		REQUIRE(u_lift_autoconv_filter_step(&f, &p, t, &x));
+		max_x = x > max_x ? x : max_x;
+	}
+	CHECK(f.cuts == 1);
+	CHECK(max_x <= 0.8f + 0.005f); // the fast follower's speed is not carried past the target
+	CHECK(x == Approx(0.8f).margin(0.01f));
+}
+
 TEST_CASE("lift autoconv: cuts are rate-limited by the refractory period", "[lift_autoconv]")
 {
 	u_lift_autoconv_filter_params p;
