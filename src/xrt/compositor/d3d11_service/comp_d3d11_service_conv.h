@@ -127,6 +127,8 @@ struct comp_d3d11_conv_bridge
 {
 	struct conv_core *core;
 	bool (*resolve)(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode);
+	//! Spec 4: the weave's view count for a lifted rect's stream (may be NULL).
+	void (*match_weave)(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views);
 	void *ud;
 };
 

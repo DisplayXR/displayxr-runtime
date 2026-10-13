@@ -73,6 +73,12 @@ bridge_resolve(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id
 }
 
 static void
+bridge_match_weave(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views)
+{
+	ipc_server_conv_v4_match_weave((struct ipc_server_conv *)ud, owner, wire_id, views);
+}
+
+static void
 eyes_sink(void *ud, uint64_t dp_key, const struct xrt_eye_positions *e)
 {
 	struct conv_eyes ce;
@@ -134,6 +140,7 @@ ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc)
 	memset(&b, 0, sizeof(b));
 	b.core = core;
 	b.resolve = bridge_resolve;
+	b.match_weave = bridge_match_weave;
 	b.ud = sc;
 	comp_d3d11_service_conv_set_bridge(xsysc, &b);
 	ipc_server_conv_install_gpu(sc, &gpu);

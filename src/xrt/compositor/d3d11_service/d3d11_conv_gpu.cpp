@@ -742,6 +742,22 @@ format_renderable(DXGI_FORMAT f)
 	return f != DXGI_FORMAT_UNKNOWN;
 }
 
+void
+d3d11_lift_rect_match_views(struct d3d11_lift *l, uint64_t owner, uint64_t id, uint32_t views)
+{
+	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		return;
+	}
+	d3d11_lift_core_bridge b;
+	{
+		std::lock_guard<std::mutex> g(l->bridge_mtx);
+		b = l->bridge;
+	}
+	if (b.match_weave != nullptr) {
+		b.match_weave(b.ud, owner, id, views);
+	}
+}
+
 static bool
 glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out)
 {

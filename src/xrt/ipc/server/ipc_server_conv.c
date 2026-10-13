@@ -73,7 +73,8 @@ struct sc_stream
 	/* Spec 4 (#2054): created by conv_stream_create (a task stream). */
 	bool v4;
 	uint32_t task;   //!< XRT_CONV_TASK_*
-	bool export_cpu; //!< results leave as CPU bytes (io.export_cpu)
+	bool export_cpu;  //!< results leave as CPU bytes (io.export_cpu)
+	bool match_weave; //!< viewCount 0: follow the weave's view count on a lifted rect
 };
 
 //! Pending event ids per connection (tasks + the providers pseudo-id, each once).
@@ -1796,6 +1797,7 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 	st.v4 = true;
 	st.task = task;
 	st.export_cpu = cpu_export;
+	st.match_weave = views && in->view_count == 0;
 	st.content_hint = task == XRT_CONV_TASK_DEPTH_MONO ? XRT_CONV_CONTENT_PHOTO
 	                  : task == XRT_CONV_TASK_DEPTH_VIDEO ? XRT_CONV_CONTENT_VIDEO
 	                                                      : in->content_hint;
@@ -2068,4 +2070,27 @@ ipc_server_conv_v4_cpu_output(struct ipc_server_conv *sc,
 	bool realloc_unused = false;
 	return io.export_cpu(io.ud, stream_id, false, out_handle, out_width, out_height, out_format, out_bytes,
 	                     &realloc_unused);
+}
+
+void
+ipc_server_conv_v4_match_weave(struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id, uint32_t views)
+{
+	struct sc_stream st;
+	if (sc == NULL || !find_stream(sc, client_id, stream_id, &st) || !st.match_weave || st.core_id == 0 ||
+	    views == st.view_count || views < 2 || views > st.max_views) {
+		return;
+	}
+	// A new view count is a new core stream behind the same handle, exactly
+	// as the v3 NVIEW resize (the glue reallocates the export, output_realloc).
+	const uint64_t old_core = st.core_id;
+	const uint32_t old_views = st.view_count;
+	st.view_count = views;
+	st.mode = views > 2 ? XRT_DP_LIFT_MODE_NVIEW : XRT_DP_LIFT_MODE_SBS;
+	if (core_create(sc, &st, &st.core_id) != XRT_SUCCESS) {
+		return; // keeps serving the old count
+	}
+	(void)conv_core_stream_destroy(sc->core, old_core);
+	store_stream(sc, &st);
+	U_LOG_I("[conv] spec-4 stream 0x%llx follows the weave: %u -> %u views", (unsigned long long)stream_id,
+	        old_views, views);
 }
