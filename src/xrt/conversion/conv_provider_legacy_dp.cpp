@@ -720,8 +720,12 @@ dpl_stream_convert(xrt_conversion_plugin_instance *inst,
 				di->source_width = dd.source_width;
 				di->source_height = dd.source_height;
 			}
-			if (dd.convergence_depth > 0.0f) {
-				di->convergence_value = dd.convergence_depth;
+			if (dd.convergence_depth > 0.0f && std::isfinite(dd.convergence_depth)) {
+				// The module reports the DEPTH it put on the screen plane; the
+				// ABI wants the DECODED value there, which for an INVERSE
+				// encoding is 1 / depth (XR_DXR_lift.h's decoding table).
+				const bool inverse = dd.encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+				di->convergence_value = inverse ? 1.0f / dd.convergence_depth : dd.convergence_depth;
 				di->suggest_flags |= 4u; // convergence_value valid
 			}
 			if (dd.relief_valid != 0 && std::isfinite(dd.relief_scale) && std::isfinite(dd.relief_offset) &&
