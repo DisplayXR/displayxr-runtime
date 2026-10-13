@@ -31,6 +31,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -199,6 +200,72 @@ TEST_CASE("conv snapshot: a readiness transition moves the generation", "[conv_s
 	b = a;
 	b.status++;
 	CHECK_FALSE(u_status_generation_equal(&a, &b));
+}
+
+namespace {
+struct ActivityCall
+{
+	std::string provider;
+	uint32_t cap_id;
+	bool composed;
+};
+
+//! A scripted target_conv_activity_fn: "fake" cap 1 has 2 streams + 1 job, its composed row 3 streams.
+void
+fake_activity(void *ud, const char *provider_id, uint32_t cap_id, bool composed, uint32_t *streams, uint32_t *jobs)
+{
+	auto *calls = static_cast<std::vector<ActivityCall> *>(ud);
+	calls->push_back({provider_id, cap_id, composed});
+	*streams = 0;
+	*jobs = 0;
+	if (std::strcmp(provider_id, "fake") == 0 && cap_id == 1) {
+		*streams = composed ? 3u : 2u;
+		*jobs = composed ? 0u : 1u;
+	}
+}
+} // namespace
+
+TEST_CASE("conv snapshot: streams / jobs columns come from the live core per task row (#2029)", "[conv_snapshot]")
+{
+	auto st = std::make_unique<target_conv_status>();
+	std::memset(st.get(), 0, sizeof(*st));
+	st->provider_count = 2;
+	st->providers[0] = provider("other");
+	st->providers[1] = provider("fake");
+	st->task_count = 4;
+	st->tasks[0] = task(1, XRT_CONV_TASK_DEPTH_VIDEO, "depth-video", XRT_CONV_STATE_READY, true, 0);
+	st->tasks[1] = task(1, XRT_CONV_TASK_VIEWS_MONO, "views-mono", XRT_CONV_STATE_READY, true, 0);
+	st->tasks[1].composed = true;
+	st->tasks[2] = task(0, XRT_CONV_TASK_DEPTH_VIDEO, "depth-video", XRT_CONV_STATE_READY, false, 1);
+	// A row whose provider fell off the provider table: never asked, reads 0.
+	st->tasks[3] = task(XRT_STATUS_CONV_NO_PROVIDER, XRT_CONV_TASK_DEPTH_MONO, "depth-mono",
+	                    XRT_CONV_STATE_READY, false, 0);
+	st->tasks[3].streams = 9; // stale values are cleared
+
+	std::vector<ActivityCall> calls;
+	target_conv_status_fill_activity(st.get(), fake_activity, &calls);
+	REQUIRE(calls.size() == 3);
+	CHECK(calls[0].provider == "fake");
+	CHECK_FALSE(calls[0].composed);
+	CHECK(calls[1].composed);
+	CHECK(calls[2].provider == "other");
+	CHECK(st->tasks[0].streams == 2);
+	CHECK(st->tasks[0].jobs_queued == 1);
+	CHECK(st->tasks[1].streams == 3);
+	CHECK(st->tasks[1].jobs_queued == 0);
+	CHECK(st->tasks[2].streams == 0);
+	CHECK(st->tasks[3].streams == 0);
+
+	// The columns reach the snapshot (and so `conv status` / the dashboard).
+	auto snap = std::make_unique<xrt_status_snapshot>();
+	std::memset(snap.get(), 0, sizeof(*snap));
+	target_conv_status_to_snapshot(st.get(), snap.get());
+	CHECK(snap->conv_tasks[0].streams == 2);
+	CHECK(snap->conv_tasks[0].jobs_queued == 1);
+
+	// No callback (the headless pass): untouched, no crash.
+	target_conv_status_fill_activity(st.get(), nullptr, nullptr);
+	CHECK(st->tasks[0].streams == 2);
 }
 
 

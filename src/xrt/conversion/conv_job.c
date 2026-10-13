@@ -50,6 +50,9 @@ set_status_locked(struct conv_core *core, struct conv_job *j, uint32_t status)
 	}
 	j->status = status;
 	emit_locked(core, j); // state changes always go out
+	// Enqueue / start / finish move the row's `jobs_queued` column (#2029);
+	// jobs_mtx -> registry_mtx is the lock order.
+	conv_core_activity_changed(core);
 }
 
 static struct conv_job *
@@ -358,6 +361,21 @@ conv_jobs_bound_count(struct conv_core *core, uint32_t provider, uint32_t cap_id
 	return n;
 }
 
+uint32_t
+conv_jobs_row_count(struct conv_core *core, uint32_t provider, uint32_t cap_id, bool composed)
+{
+	uint32_t n = 0;
+	os_mutex_lock(&core->jobs_mtx);
+	for (struct conv_job *j = core->jobs; j != NULL; j = j->next) {
+		if (!j->destroyed && !is_finished(j) && j->bind.provider == provider && j->bind.cap_id == cap_id &&
+		    j->bind.composed == composed) {
+			n++;
+		}
+	}
+	os_mutex_unlock(&core->jobs_mtx);
+	return n;
+}
+
 void
 conv_jobs_destroy_all(struct conv_core *core)
 {
@@ -599,11 +617,15 @@ conv_core_job_destroy(struct conv_core *core, uint64_t job_id)
 		os_mutex_unlock(&core->jobs_mtx);
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	const bool was_counted = !is_finished(j);
 	j->destroyed = true;
 	j->cancel = true;
 	if (!j->running) {
 		unlink_locked(core, j);
 		job_free(j);
+	}
+	if (was_counted) {
+		conv_core_activity_changed(core); // a queued job left the `jobs_queued` column
 	}
 	os_mutex_unlock(&core->jobs_mtx);
 	return XRT_SUCCESS;
@@ -613,6 +635,7 @@ void
 conv_core_client_gone(struct conv_core *core, uint64_t client_id)
 {
 	conv_streams_client_gone(core, client_id);
+	bool counted = false;
 	os_mutex_lock(&core->jobs_mtx);
 	struct conv_job **pp = &core->jobs;
 	while (*pp != NULL) {
@@ -621,6 +644,7 @@ conv_core_client_gone(struct conv_core *core, uint64_t client_id)
 			pp = &j->next;
 			continue;
 		}
+		counted = counted || (!j->destroyed && !is_finished(j));
 		j->destroyed = true;
 		j->cancel = true;
 		if (j->running) {
@@ -629,6 +653,9 @@ conv_core_client_gone(struct conv_core *core, uint64_t client_id)
 		}
 		*pp = j->next;
 		job_free(j);
+	}
+	if (counted) {
+		conv_core_activity_changed(core);
 	}
 	os_mutex_unlock(&core->jobs_mtx);
 }
