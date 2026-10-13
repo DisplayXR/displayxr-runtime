@@ -7,9 +7,11 @@
  * libdbus-1 client of the GNOME Shell extension `window-geometry@displayxr.org`
  * (contrib/gnome-shell/). One initial GetWindows snapshot at create, then a
  * non-blocking per-query pump of WindowsChanged signals. The publisher is
- * intermittent by design — GNOME disables user extensions whenever the screen
- * shield is up — so NameOwnerChanged is tracked too, and the cache is dropped
- * and re-taken across that gap. Single-threaded use from the compositor frame
+ * intermittent — a shell restart, a re-enable, and (before extension version
+ * 14, which declares the unlock-dialog session mode, #2071) every lock screen
+ * take the bus name away — so NameOwnerChanged is tracked too, and the cache is
+ * dropped and re-taken across that gap; each reappearance also bumps a
+ * generation the compositor uses to re-sync its own derived state. Single-threaded use from the compositor frame
  * loop — no locking.
  *
  * @ingroup comp_vk_native
@@ -161,6 +163,9 @@ struct comp_vk_native_wl_geom
 	//! publisher comes back (GNOME disables user extensions while the screen
 	//! shield is up, and a re-enabled extension has forgotten every caller).
 	bool move_sync_wanted;
+	//! #2071: NameOwnerChanged edges that GAVE the bus name an owner (see
+	//! comp_vk_native_wl_geom_publisher_generation).
+	uint32_t publisher_generation;
 };
 
 
@@ -375,13 +380,16 @@ wlg_handle_owner_changed(struct comp_vk_native_wl_geom *g, DBusMessage *msg)
 	wlg_invalidate(g);
 
 	if (new_owner[0] != '\0') {
+		// #2071: the compositor re-syncs everything it derived from the
+		// previous publisher (see comp_vk_native_wl_geom_publisher_generation).
+		g->publisher_generation++;
 		return true;
 	}
 
 	U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME
-	        " went away (GNOME disables user extensions "
-	        "while the screen shield is up) — dropped the cached geometry rather than weave at an "
-	        "origin we can no longer vouch for; display-scoped until it returns.");
+	        " went away (a shell restart, the extension disabled, or the lock screen with an extension "
+	        "older than version 14) — dropped the cached geometry rather than weave at an origin we can "
+	        "no longer vouch for; display-scoped until it returns, then re-synced (#2071).");
 	// The name has no owner, so an immediate GetWindows buys only an error
 	// reply. Hand the wait back to the bounded retry path.
 	g->next_retry_ns = os_monotonic_get_ns() + WLG_RETRY_PERIOD_NS;
@@ -1026,6 +1034,16 @@ comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g)
 	const enum comp_vk_native_wl_move_sync_reply r = wlg_send_enable_move_sync(g, 200);
 	g->move_sync_wanted = (r != COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED);
 	return r;
+}
+
+uint32_t
+comp_vk_native_wl_geom_publisher_generation(struct comp_vk_native_wl_geom *g)
+{
+	if (g == NULL) {
+		return 0;
+	}
+	wlg_pump(g);
+	return g->publisher_generation;
 }
 
 bool

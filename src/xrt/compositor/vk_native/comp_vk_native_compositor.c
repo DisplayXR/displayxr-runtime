@@ -688,6 +688,9 @@ struct comp_vk_native_compositor
 	//! Where this move started — the phase reference the DP is given.
 	int32_t wl_snap_anchor_x, wl_snap_anchor_y;
 	bool wl_snap_moving;    //!< a move is in progress
+	//! #2071: the window-geometry publisher generation this compositor last
+	//! re-synced to (comp_vk_native_wl_geom_publisher_generation).
+	uint32_t wl_geom_publisher_gen_seen;
 	//! A move request is out and its landing has not been read back yet.
 	bool wl_snap_verify_pending;
 	int32_t wl_snap_want_x, wl_snap_want_y; //!< what that request asked for
@@ -4865,6 +4868,11 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c);
 // (windowed-weaving phase anchor). Defined below, next to get_window_metrics.
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c);
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+// #2071: geometry re-sync when the window-geometry publisher reappears.
+static void
+vk_wl_geom_resync_if_publisher_reappeared(struct comp_vk_native_compositor *c);
+#endif
 // #1748 move sync (native Wayland) — defined beside vk_update_present_origin;
 // no-ops elsewhere.
 static void
@@ -10546,6 +10554,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// Cheap (a non-blocking D-Bus pump the metrics path already performs) and
 	// only acts on a transition.
 	vk_dp_refresh_resample_caps(c);
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	// #2071: before the gate, so a publisher that just came back is gated,
+	// fed and snapped from a clean slate this very frame.
+	vk_wl_geom_resync_if_publisher_reappeared(c);
+#endif
 	vk_linux_update_surface_not_1to1(c);
 #ifdef XRT_HAVE_WAYLAND
 	if (!c->use_wayland)
@@ -14509,6 +14522,76 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 #endif // XRT_OS_LINUX_DESKTOP && XRT_HAVE_WAYLAND && DXR_HAVE_WL_GEOM
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+/*!
+ * #2071: the window-geometry publisher's bus name gained an owner again — it
+ * came back after a lock screen (extensions older than version 14 are disabled
+ * there), a shell restart or a re-enable, or it first came up after this window.
+ *
+ * The provider already dropped its cache, re-took GetWindows and renewed move
+ * sync on that edge. Everything THIS compositor derived from the old publisher
+ * is re-synced here, once, so a session that lives across the gap never keeps
+ * a phase reasoned from before it:
+ *
+ *  - present origin: the baseline is forgotten, so the next weave re-feeds
+ *    the DP's set_present_origin from the fresh snapshot and logs it (the
+ *    feed itself runs every weave; this guarantees the INFO line and that the
+ *    jump is not mistaken for a drag by the #912 drag-shallow clamp);
+ *  - the 1:1 gate (vk_linux_update_surface_not_1to1) runs right after this,
+ *    on the fresh snapshot, and its one-shot "nothing to measure" /
+ *    off-panel lines are re-armed so a still-missing rect says so again;
+ *  - weave phase: a drop-snap verification in flight is abandoned (its target
+ *    came from the old publisher), and the gap is treated as a move from the
+ *    last position seen before it — so when the snapshot says the window is
+ *    still, the drop path re-asks the DP (snap_window_rect) and moves the
+ *    window onto the lattice if the gap left it off;
+ *  - move sync: the frame tag is re-sent with the next presented frame and
+ *    the extension's sync state is re-logged.
+ *
+ * One WARN per event. Never per frame: the generation moves only on a
+ * NameOwnerChanged.
+ */
+static void
+vk_wl_geom_resync_if_publisher_reappeared(struct comp_vk_native_compositor *c)
+{
+	if (!c->use_wayland || c->wl_geom == NULL) {
+		return;
+	}
+	const uint32_t gen = comp_vk_native_wl_geom_publisher_generation(c->wl_geom);
+	if (gen == c->wl_geom_publisher_gen_seen) {
+		return;
+	}
+	c->wl_geom_publisher_gen_seen = gen;
+
+	// Move sync owns the drop when the extension syncs this window: there is
+	// no drop snap to re-arm then, only the tag below.
+	const bool synced = c->wl_move_sync != NULL && c->wl_ms.active;
+	const bool rearm_snap = c->wl_snap_have_last && !synced;
+
+	U_LOG_W(
+	    "wl_geom: publisher reappeared — re-syncing geometry (#2071): present origin re-fed, 1:1 gate re-run, "
+	    "weave phase %s (%d, %d), move-sync tag %s (publisher generation %u)",
+	    rearm_snap ? "re-snap armed from the last position seen before the gap" : "baseline kept at",
+	    c->wl_snap_last_x, c->wl_snap_last_y, c->wl_move_sync != NULL ? "re-sent" : "n/a", gen);
+
+	c->have_last_present_origin = false;
+	c->warned_1to1_unknown = false;
+	c->warned_wl_window_off_panel = false;
+
+	c->wl_snap_verify_pending = false;
+	c->wl_snap_still = 0;
+	c->wl_snap_tries = 0;
+	if (rearm_snap) {
+		c->wl_snap_anchor_x = c->wl_snap_last_x;
+		c->wl_snap_anchor_y = c->wl_snap_last_y;
+		c->wl_snap_moving = true;
+	} else if (!c->wl_snap_have_last) {
+		c->wl_snap_moving = false;
+	}
+
+	comp_vk_native_wl_move_sync_resync(c->wl_move_sync);
+	c->wl_ms.logged_active = false;
+}
+
 /*!
  * TEST HOOK, off by default (extension v10 harness): DXR_WL_TEST_TAG
  *   off               never map the frame tag — a move-synced process that
