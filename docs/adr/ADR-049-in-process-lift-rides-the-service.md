@@ -1,6 +1,6 @@
 # ADR-049: In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
 
-**Status:** Proposed (2026-10-08) · Phase 1 implemented (runtime routing) · **generalised by [ADR-053](ADR-053-conversion-providers.md) (Proposed 2026-10-12):** the lift-only connection applies to every in-process session on every graphics API, and both follow-ups (submit-side fence, lift adapter LUID) are resolved by lift spec 4 · extends
+**Status:** Proposed (2026-10-08) · Phase 1 implemented (runtime routing) · **generalised by [ADR-053](ADR-053-conversion-providers.md) (Accepted 2026-10-12; recorded in its *Amendments* section, rules now in the [spec](../specs/extensions/XR_DXR_lift.md) §2.2, §4.5 and §5.4):** the lift-only connection applies to every in-process session on every graphics API, and both follow-ups (submit-side fence, lift adapter LUID) are resolved by lift spec 4 · extends
 [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) ·
 spec: [XR_DXR_lift.md](../specs/extensions/XR_DXR_lift.md) §2, §5.3, §10 · issue #1862, epic #1858
 
