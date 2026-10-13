@@ -673,6 +673,10 @@ Function CloseRuntimeClients
 	; The service is ours unconditionally and maps the DLL every time.
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
 	Pop $0
+	; ADR-053 P2: conversion hosts die with the service's job object
+	; (KILL_ON_JOB_CLOSE); sweep a straggler so its exe can be replaced.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
+	Pop $0
 
 	; The browser records its own root; a missing key just means not installed,
 	; and the empty entry is filtered out below.
@@ -900,6 +904,11 @@ client_dll_ok:
 
 	; Install service (needed for Chrome WebXR and other sandboxed apps)
 	File /nonfatal "${BIN_DIR}\displayxr-service.exe"
+
+	; The conversion-host satellite (ADR-053 D5): the service spawns one per
+	; conversion-provider DLL, from its own directory. /nonfatal: without it
+	; every provider is hosted in the service (the documented fallback).
+	File /nonfatal "${BIN_DIR}\displayxr-conversion-host.exe"
 
 	; Install manifest
 	File "${OUTPUT_DIR}\DisplayXR_win64.json"
@@ -1253,6 +1262,7 @@ Section "Uninstall"
 	; -----------------------------------------------------------------
 	DetailPrint "Stopping DisplayXR Service..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 	; Also clear the stale 32-bit (WOW6432Node) Run entry left by interim
 	; installers that wrote it before this section moved to SetRegView 64.
@@ -1392,6 +1402,7 @@ Section "Uninstall"
 	; $INSTDIR across versions if we don't sweep them.
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
+	Delete "$INSTDIR\displayxr-conversion-host.exe"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"

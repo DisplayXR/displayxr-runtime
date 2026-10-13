@@ -209,6 +209,12 @@ if [ -f "$SERVICE_SRC" ]; then
     chmod 0755 "$RUNTIME_ROOT/bin/displayxr-service"
     # Re-sign defensively (a tar round-trip in CI can drop the signature).
     codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-service" 2>/dev/null || true
+    # ADR-053 P2: the conversion-host satellite, spawned by the service from bin/.
+    if [ -f "$ARTIFACT_DIR/bin/displayxr-conversion-host" ]; then
+        cp "$ARTIFACT_DIR/bin/displayxr-conversion-host" "$RUNTIME_ROOT/bin/displayxr-conversion-host"
+        chmod 0755 "$RUNTIME_ROOT/bin/displayxr-conversion-host"
+        codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-conversion-host" 2>/dev/null || true
+    fi
 
     LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
     mkdir -p "$LAUNCHAGENT_DIR"
