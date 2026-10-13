@@ -83,6 +83,10 @@ if [ "$SYSTEM" = 1 ]; then
     fi
 fi
 
+# VK_LAYER_DXR_queue_lock manifest (#2036); prune the dirs only if empty.
+rm -f "$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
+
 # DisplayXR Dashboard menu entry + icon.
 rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
     "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
@@ -91,7 +95,8 @@ if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
     rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
-        "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+        "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
     rm -rf "$PREFIX"

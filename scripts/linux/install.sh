@@ -6,6 +6,7 @@
 #     runtime + plug-in     -> $XDG_DATA_HOME/displayxr            (~/.local/share/displayxr)
 #     OpenXR ActiveRuntime  -> $XDG_CONFIG_HOME/openxr/1/active_runtime.json
 #     DP discovery manifest -> $XDG_DATA_HOME/DisplayXR/DisplayProcessors/200-sim-display.json
+#     Vulkan layer manifest -> $XDG_DATA_HOME/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
 #     systemd --user units  -> $XDG_CONFIG_HOME/systemd/user/displayxr.{socket,service}
 #                              socket enabled + started: displayxr-service is
 #                              socket-activated on first use, exits when idle (#1744)
@@ -18,6 +19,7 @@
 #     runtime + plug-in     -> /usr/local/{bin,lib}
 #     OpenXR ActiveRuntime  -> /etc/xdg/openxr/1/active_runtime.json
 #     DP discovery manifest -> /usr/local/share/displayxr/DisplayProcessors/200-sim-display.json
+#     Vulkan layer manifest -> /usr/local/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
 #     systemd user units    -> /usr/local/lib/systemd/user/displayxr.{socket,service}
 #                              socket enabled for every user (systemctl --global)
 #     GNOME Shell extension -> /usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org
@@ -130,6 +132,20 @@ cat > "$DP_ROOT/200-sim-display.json" <<EOF
 }
 EOF
 echo "==> Display processor manifest: $DP_ROOT/200-sim-display.json"
+
+# --- VK_LAYER_DXR_queue_lock (#902 / #2036) ---------------------------------
+# The Vulkan layer the runtime enables by name at xrCreateVulkanInstanceKHR so
+# the #868 repaint can share the app's only graphics queue (Intel and other
+# single-graphics-queue GPUs; without it repaint silently stays off). Its
+# manifest goes on the loader's DEFAULT explicit-layer path ($XDG_DATA_HOME, or
+# /usr/local/share for --system) with an ABSOLUTE library_path into $PREFIX.
+VKLAYER_JSON_IN="$HERE/share/vulkan/VkLayer_DXR_queue_lock.json.in"
+if [ -f "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" ] && [ -f "$VKLAYER_JSON_IN" ]; then
+    mkdir -p "$SHARE_ROOT/vulkan/explicit_layer.d"
+    sed "s|@DXR_QL_LIBRARY_PATH@|$PREFIX/lib/libVkLayer_DXR_queue_lock.so|" "$VKLAYER_JSON_IN" \
+        >"$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+    echo "==> Vulkan layer manifest: $SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+fi
 
 # --- displayxr-service: socket-activated systemd user units (#1744) --------
 # The runtime is HYBRID: ordinary apps run in-process; XR_DXR_weave
