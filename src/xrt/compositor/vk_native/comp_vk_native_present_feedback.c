@@ -219,7 +219,8 @@ pf_wl_registry_global(void *data, struct wl_registry *registry, uint32_t name, c
 	struct comp_vk_native_present_feedback *pf = data;
 	if (strcmp(iface, wp_presentation_interface.name) == 0 && pf->presentation == NULL) {
 		pf->presentation_version = version < 2 ? version : 2;
-		pf->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, pf->presentation_version);
+		pf->presentation =
+		    wl_registry_bind(registry, name, &wp_presentation_interface, pf->presentation_version);
 		if (pf->presentation != NULL) {
 			wp_presentation_add_listener(pf->presentation, &pf_wl_presentation_listener, pf);
 		}
@@ -314,20 +315,22 @@ comp_vk_native_present_feedback_create_wayland(void *wl_display, void *wl_surfac
 		goto fail;
 	}
 	if (pf->presentation == NULL) {
-		U_LOG_W("#902: present-feedback feeder — the Wayland compositor has no wp_presentation; "
-		        "the vblank grid stays unfed and late weave dormant");
+		U_LOG_W(
+		    "#902: present-feedback feeder — the Wayland compositor has no wp_presentation; "
+		    "the vblank grid stays unfed and late weave dormant");
 		goto fail;
 	}
 	if (wl_display_roundtrip_queue(pf->display, pf->queue) < 0) {
 		goto fail;
 	}
-	U_LOG_W("#902: present-feedback feeder — wp_presentation v%u on the app's wl_display, "
-	        "clock %s (%lld)",
-	        pf->presentation_version,
-	        pf->clock_id == CLOCK_MONOTONIC ? "MONOTONIC"
-	        : pf->clock_id < 0             ? "UNKNOWN"
-	                                       : "other, translated",
-	        (long long)pf->clock_id);
+	U_LOG_W(
+	    "#902: present-feedback feeder — wp_presentation v%u on the app's wl_display, "
+	    "clock %s (%lld)",
+	    pf->presentation_version,
+	    pf->clock_id == CLOCK_MONOTONIC ? "MONOTONIC"
+	    : pf->clock_id < 0              ? "UNKNOWN"
+	                                    : "other, translated",
+	    (long long)pf->clock_id);
 	return pf;
 
 fail:
@@ -336,8 +339,9 @@ fail:
 #else
 	(void)wl_display;
 	(void)wl_surface;
-	U_LOG_W("#902: present-feedback feeder — built without wp_presentation (wayland-scanner "
-	        "missing at build time); the vblank grid stays unfed on Wayland");
+	U_LOG_W(
+	    "#902: present-feedback feeder — built without wp_presentation (wayland-scanner "
+	    "missing at build time); the vblank grid stays unfed on Wayland");
 	return NULL;
 #endif
 }
@@ -432,8 +436,9 @@ comp_vk_native_present_feedback_create_xcb(void *xcb_connection, uint32_t window
 	}
 	const xcb_query_extension_reply_t *ext = xcb_get_extension_data(c, &pf_xcb_present_ext);
 	if (ext == NULL || !ext->present) {
-		U_LOG_W("#902: present-feedback feeder — the X server has no Present extension; "
-		        "the vblank grid stays unfed and late weave dormant");
+		U_LOG_W(
+		    "#902: present-feedback feeder — the X server has no Present extension; "
+		    "the vblank grid stays unfed and late weave dormant");
 		return NULL;
 	}
 
@@ -458,15 +463,17 @@ comp_vk_native_present_feedback_create_xcb(void *xcb_connection, uint32_t window
 	// Creation-time only: one round trip to learn whether the selection held.
 	xcb_generic_error_t *err = xcb_request_check(c, ck);
 	if (err != NULL) {
-		U_LOG_W("#902: present-feedback feeder — PresentSelectInput on window 0x%x failed "
-		        "(X error %u)",
-		        window, err->error_code);
+		U_LOG_W(
+		    "#902: present-feedback feeder — PresentSelectInput on window 0x%x failed "
+		    "(X error %u)",
+		    window, err->error_code);
 		free(err);
 		goto fail;
 	}
-	U_LOG_W("#902: present-feedback feeder — X11 Present CompleteNotify on window 0x%x "
-	        "(ust/msc, CLOCK_MONOTONIC)",
-	        window);
+	U_LOG_W(
+	    "#902: present-feedback feeder — X11 Present CompleteNotify on window 0x%x "
+	    "(ust/msc, CLOCK_MONOTONIC)",
+	    window);
 	return pf;
 
 fail:

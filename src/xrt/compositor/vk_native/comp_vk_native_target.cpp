@@ -2374,16 +2374,16 @@ comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
 static void
 target_log_residual(struct comp_vk_native_target *target)
 {
-	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
-	    target->vblank_grid.period_ns != 0) {
+	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 && target->vblank_grid.period_ns != 0) {
 		const uint64_t now2 = os_monotonic_get_ns();
 		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
 			target->residual_last_log_ns = now2;
-			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
-			        "(%.2f refresh periods, n=%u)",
-			        target->residual_ns / 1e6,
-			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
-			        target->residual_samples);
+			U_LOG_W(
+			    "#206: last measured weave->scanout residual %.2f ms "
+			    "(%.2f refresh periods, n=%u)",
+			    target->residual_ns / 1e6,
+			    (double)target->residual_ns / (double)target->vblank_grid.period_ns,
+			    target->residual_samples);
 		}
 	}
 }
@@ -2404,16 +2404,18 @@ target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd,
 {
 	const char *e = getenv("DXR_VK_PRESENT_FEEDBACK");
 	if (e != nullptr && e[0] == '0') {
-		U_LOG_W("#902: present-feedback feeder — DXR_VK_PRESENT_FEEDBACK=0, off; the vblank grid "
-		        "is unfed unless the driver has VK_GOOGLE_display_timing");
+		U_LOG_W(
+		    "#902: present-feedback feeder — DXR_VK_PRESENT_FEEDBACK=0, off; the vblank grid "
+		    "is unfed unless the driver has VK_GOOGLE_display_timing");
 		return;
 	}
 	if (hwnd == nullptr) {
 		return;
 	}
 	if (target->vk->has_GOOGLE_display_timing) {
-		U_LOG_W("#902: present-feedback feeder — not needed, the driver has "
-		        "VK_GOOGLE_display_timing (that feeds the vblank grid)");
+		U_LOG_W(
+		    "#902: present-feedback feeder — not needed, the driver has "
+		    "VK_GOOGLE_display_timing (that feeds the vblank grid)");
 		return;
 	}
 	if (is_wayland) {
@@ -2462,25 +2464,29 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 				const struct comp_present_feedback *f = &target->pf_state;
 				switch (f->state) {
 				case COMP_PRESENT_FEEDBACK_STATE_FEEDING:
-					U_LOG_W("#902: %s feed — feeding the vblank grid (vsync'd presents, hw_clock=%d; "
-					        "accepted %llu, not-vsync %llu, discarded %llu)",
-					        kind, (int)s->hw_clock, (unsigned long long)f->accepted,
-					        (unsigned long long)f->not_vsync, (unsigned long long)f->discarded);
+					U_LOG_W(
+					    "#902: %s feed — feeding the vblank grid (vsync'd presents, hw_clock=%d; "
+					    "accepted %llu, not-vsync %llu, discarded %llu)",
+					    kind, (int)s->hw_clock, (unsigned long long)f->accepted,
+					    (unsigned long long)f->not_vsync, (unsigned long long)f->discarded);
 					break;
 				case COMP_PRESENT_FEEDBACK_STATE_NOT_VSYNC:
-					U_LOG_W("#902: %s feed — presents are NOT vsync'd, ignored; grid not fed "
-					        "(accepted %llu, not-vsync %llu)",
-					        kind, (unsigned long long)f->accepted, (unsigned long long)f->not_vsync);
+					U_LOG_W(
+					    "#902: %s feed — presents are NOT vsync'd, ignored; grid not fed "
+					    "(accepted %llu, not-vsync %llu)",
+					    kind, (unsigned long long)f->accepted, (unsigned long long)f->not_vsync);
 					break;
 				case COMP_PRESENT_FEEDBACK_STATE_DISCARDING:
-					U_LOG_W("#902: %s feed — every recent present was discarded (window hidden or "
-					        "superseded); grid not fed (accepted %llu, discarded %llu)",
-					        kind, (unsigned long long)f->accepted, (unsigned long long)f->discarded);
+					U_LOG_W(
+					    "#902: %s feed — every recent present was discarded (window hidden or "
+					    "superseded); grid not fed (accepted %llu, discarded %llu)",
+					    kind, (unsigned long long)f->accepted, (unsigned long long)f->discarded);
 					break;
 				case COMP_PRESENT_FEEDBACK_STATE_TIMEBASE_REFUSED:
-					U_LOG_W("#902: %s feed — presentation time %llu is not in os_monotonic (now %llu) "
-					        "— DIFFERENT CLOCK, grid refused",
-					        kind, (unsigned long long)s->present_ns, (unsigned long long)now_ns);
+					U_LOG_W(
+					    "#902: %s feed — presentation time %llu is not in os_monotonic (now %llu) "
+					    "— DIFFERENT CLOCK, grid refused",
+					    kind, (unsigned long long)s->present_ns, (unsigned long long)now_ns);
 					break;
 				default: break;
 				}
@@ -3276,9 +3282,10 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					grid_source = comp_vk_native_present_feedback_kind(target->present_fb);
 				}
 #endif
-				U_LOG_W("#902: late weave on the measured grid — period %.3f ms, "
-				        "weave budget %.3f ms (no present_wait on this device; grid source: %s)",
-				        period_ns / 1e6, budget_ns / 1e6, grid_source);
+				U_LOG_W(
+				    "#902: late weave on the measured grid — period %.3f ms, "
+				    "weave budget %.3f ms (no present_wait on this device; grid source: %s)",
+				    period_ns / 1e6, budget_ns / 1e6, grid_source);
 			}
 		}
 		target->weave_start_ns = os_monotonic_get_ns();
@@ -3541,9 +3548,11 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					target->present_wait_ever_ok = true;
 					if (!target->present_wait_logged) {
 						target->present_wait_logged = true;
-						U_LOG_W("#902: late weave on VK_KHR_present_wait — pacing on present id N-%llu "
-						        "hitting glass (DXR_LATE_WEAVE_MAX_LATENCY=%d)",
-						        (unsigned long long)relax, vk_late_weave_max_latency());
+						U_LOG_W(
+						    "#902: late weave on VK_KHR_present_wait — pacing on present id "
+						    "N-%llu "
+						    "hitting glass (DXR_LATE_WEAVE_MAX_LATENCY=%d)",
+						    (unsigned long long)relax, vk_late_weave_max_latency());
 					}
 					// #206 residual, only where no window-system feedback
 					// measures it more exactly (wait return = glass + wake-up).
@@ -3562,8 +3571,10 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					// WSI cannot report. Occlusion is not this case — that
 					// only times out AFTER waits have succeeded.
 					target->present_wait_latched_off = true;
-					U_LOG_W("#902: VK_KHR_present_wait never resolved (3 timeouts, 0 successes) — "
-					        "present_wait tier OFF for this session, the measured vblank grid takes over");
+					U_LOG_W(
+					    "#902: VK_KHR_present_wait never resolved (3 timeouts, 0 successes) — "
+					    "present_wait tier OFF for this session, the measured vblank grid takes "
+					    "over");
 				}
 				// The weave starts now, after the pacing wait: the budget
 				// and the residual measure from here.
