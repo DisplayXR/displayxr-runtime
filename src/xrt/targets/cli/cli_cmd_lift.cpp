@@ -9,6 +9,7 @@
  *                            [--n N] [--views N] [--strength F] [--convergence F]
  *                            [--focal PX] [--priority paused|low|normal|high]
  *                            [--pipelined] [--fps F] [--out DIR] [--wait S]
+ *                            [--content photo|video]
 	 *   --no-write          skip all readback/encode (measure pure submit->acquire; PNG encode of a 4K SBS takes seconds)
 	 *   --write-every N     write only every Nth result (default 1)
  *
@@ -595,7 +596,8 @@ cmd_probe(int argc, const char **argv)
 		printf(
 		    "usage: displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]\n"
 		    "       [--views N] [--strength F] [--convergence F] [--focal PX]\n"
-		    "       [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR] [--wait S]\n");
+		    "       [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR] [--wait S]\n"
+		    "       [--content photo|video]   (default video; photo: --mode depth is served by DEPTH_MONO)\n");
 		return 1;
 	}
 	const std::string src = argv[3];
@@ -608,6 +610,14 @@ cmd_probe(int argc, const char **argv)
 	const double fps = atof(opt_value(argc, argv, "--fps", "30"));
 	const double wait_s = atof(opt_value(argc, argv, "--wait", "30"));
 	const std::string prio_s = opt_value(argc, argv, "--priority", "normal");
+	// The content hint: VIDEO (default) keeps temporal state, so DEPTH is served
+	// by DEPTH_VIDEO; PHOTO selects DEPTH_MONO (a stills-only provider). GAUSSIANS
+	// is PHOTO always.
+	const std::string content_s = opt_value(argc, argv, "--content", "video");
+	if (content_s != "video" && content_s != "photo") {
+		printf("unknown --content '%s' (photo|video)\n", content_s.c_str());
+		return 1;
+	}
 
 	uint32_t mode = XRT_DP_LIFT_MODE_SBS;
 	if (mode_s == "depth") {
@@ -662,7 +672,9 @@ cmd_probe(int argc, const char **argv)
 
 	uint64_t sid = 0;
 	xrt_result_t xret = ipc_client_lift_stream_create(
-	    &ipc_c, mode, mode == XRT_DP_LIFT_MODE_GAUSSIANS ? XRT_DP_LIFT_CONTENT_PHOTO : XRT_DP_LIFT_CONTENT_VIDEO,
+	    &ipc_c, mode,
+	    mode == XRT_DP_LIFT_MODE_GAUSSIANS || content_s == "photo" ? XRT_DP_LIFT_CONTENT_PHOTO
+	                                                               : XRT_DP_LIFT_CONTENT_VIDEO,
 	    1.0f, /*aux_outputs*/ 0, /*aux_depth_format*/ 0, &sid);
 	if (xret != XRT_SUCCESS) {
 		printf("lift_stream_create failed: %d\n", (int)xret);
@@ -876,7 +888,8 @@ cli_cmd_lift(int argc, const char **argv)
 	}
 	printf(
 	    "usage: displayxr-cli lift caps [--json] [--wait S] [--timeout S]\n"
-	    "       displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N] ...\n");
+	    "       displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N] ...\n"
+	    "                                [--content photo|video]\n");
 	return 1;
 }
 
