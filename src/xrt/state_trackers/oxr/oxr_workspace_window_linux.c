@@ -77,6 +77,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <string.h>
 
 // Xlib prototypes, declared locally so this TU needs no <X11/Xlib.h> (the
 // symbols are resolved at run time from the app's already-loaded libX11).
@@ -93,6 +94,17 @@ struct x11_fns
 	pfn_XDefaultScreen default_screen;
 };
 
+// dlsym returns an object pointer; copying its bytes into the function-pointer
+// slot is the ISO-C-clean way to convert (a cast warns under -Wpedantic).
+static void
+x11_sym(void *lib, const char *name, void *out_fn, size_t fn_size)
+{
+	void *sym = dlsym(lib, name);
+	if (sym != NULL && fn_size == sizeof(sym)) {
+		memcpy(out_fn, &sym, sizeof(sym));
+	}
+}
+
 static bool
 x11_fns_load(struct x11_fns *f)
 {
@@ -105,10 +117,10 @@ x11_fns_load(struct x11_fns *f)
 	if (lib == NULL) {
 		return false;
 	}
-	f->withdraw = (pfn_XWithdrawWindow)dlsym(lib, "XWithdrawWindow");
-	f->map = (pfn_XMapWindow)dlsym(lib, "XMapWindow");
-	f->flush = (pfn_XFlush)dlsym(lib, "XFlush");
-	f->default_screen = (pfn_XDefaultScreen)dlsym(lib, "XDefaultScreen");
+	x11_sym(lib, "XWithdrawWindow", &f->withdraw, sizeof(f->withdraw));
+	x11_sym(lib, "XMapWindow", &f->map, sizeof(f->map));
+	x11_sym(lib, "XFlush", &f->flush, sizeof(f->flush));
+	x11_sym(lib, "XDefaultScreen", &f->default_screen, sizeof(f->default_screen));
 	// The NOLOAD handle only bumps a refcount on the app's copy; dropping it
 	// is safe because the app keeps libX11 loaded for as long as it holds
 	// the Display — and it does, for at least the duration of this call.
