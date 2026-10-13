@@ -39,8 +39,9 @@ cli_print_help(int argc, const char **argv)
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'; per screen:\n");
 	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
-	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
-	P("                      'input list [--json]', 'input haptic-test [seconds]'.\n");
+	P("  input <...>       - Input providers (motion controllers, ADR-034; verbs per ADR-054).\n");
+	P("                      'input list [--json]', 'input enable|disable <id> [--machine]',\n");
+	P("                      'input use <id> [--machine]', 'input reset', 'input haptic-test [seconds]'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
 	P("                      'runtime status'   full loader precedence + conflicts,\n");
 	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");

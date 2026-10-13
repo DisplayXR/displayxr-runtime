@@ -53,7 +53,17 @@ struct target_input_plugin_desc
 	char version[64];
 	char binary_path[512];
 	uint32_t probe_order; /* lower wins; missing defaults to 100 */
-	bool enabled;         /* Windows `Enabled` DWORD; true when absent */
+	bool enabled;         /* Windows `Enabled` DWORD (HKCU over HKLM) / manifest `enabled`; true when absent */
+	/*!
+	 * Where @ref enabled came from (N3a, ADR-054 verb `enable|disable`):
+	 * "user" (a per-user HKCU `Enabled` is in force — what `displayxr-cli
+	 * input enable|disable` writes; `TARGET_COMPONENT_FLAG_USER_OVERLAY`),
+	 * "machine" (disabled by HKLM `Enabled` = 0), "manifest" (disabled by
+	 * the POSIX manifest's `plugin.enabled`), else "default". An explicit
+	 * `Enabled` = 1 in HKLM / `"enabled": true` reads as "default": the
+	 * shared row reader records the value, not its presence.
+	 */
+	char enabled_source[12];
 };
 
 /*!
@@ -147,6 +157,21 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
  */
 bool
 target_input_plugin_get_force_qwerty(void);
+
+/*!
+ * Read the `PreferredPlugin` override (N3a, ADR-054 verb `prefer`; the
+ * input twin of DP spec §2.1/§3.3): the id of the provider ranked FIRST,
+ * ahead of ProbeOrder, for the hand/rig arbitration. Windows: HKCU
+ * `Software\DisplayXR\InputProviders\PreferredPlugin`, then HKLM (what
+ * `displayxr-cli input use <id> [--machine]` writes). POSIX:
+ * `XRT_PREFERRED_INPUT_PLUGIN_ID` in the environment, then the
+ * `input-preferred` file in the per-user manifest dir
+ * (`target_component_user_dir`). A preferred provider that is
+ * disabled, unregistered or declines falls through to normal ProbeOrder.
+ * Writes "" and returns false when nothing is set.
+ */
+bool
+target_input_plugin_get_preferred(char *out, size_t cap);
 
 /*!
  * Publish the active display processor's nominal panel + viewer geometry to

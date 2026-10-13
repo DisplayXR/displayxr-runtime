@@ -75,6 +75,7 @@ extern "C" {
 #define TARGET_COMPONENT_FLAG_DISABLED (1u << 0)        //!< `Enabled` = 0 / "enabled": false
 #define TARGET_COMPONENT_FLAG_MALFORMED (1u << 1)       //!< row / manifest unusable; see `reason`
 #define TARGET_COMPONENT_FLAG_PROBE_ORDER_TIE (1u << 2) //!< shares its ProbeOrder with a neighbour; id broke the tie
+#define TARGET_COMPONENT_FLAG_USER_OVERLAY (1u << 3)    //!< `enabled` came from the per-user (HKCU) overlay (N3a)
 
 //! One `Settings\<KEY>` value (Windows) / "settings" member (POSIX), as a string.
 struct target_component_setting
@@ -237,6 +238,25 @@ target_component_enumerate_registry(const struct target_component_class *cls,
                                     struct target_component_entry *out,
                                     int max);
 #endif
+
+/*!
+ * N3a (ADR-054 verb `enable|disable`): overlay the per-user `Enabled` onto
+ * rows @ref target_component_enumerate returned. For every usable row, reads
+ * `HKCU\<registry_root>\<id>\Enabled` and, where present, replaces the HKLM
+ * value — HKCU wins — unless HKLM `<registry_root>\Policy\Lock` = 1, which
+ * makes the machine value win for every row (the conversion class's rule,
+ * conversion-provider-discovery.md §3.1). Only `Enabled` is ever read from
+ * HKCU: a per-user key can never inject a binary. Keeps `flags` / `reason`
+ * consistent (DISABLED set with "disabled for this user (HKCU Enabled = 0)",
+ * or cleared) and marks each row it touched TARGET_COMPONENT_FLAG_USER_OVERLAY
+ * so a class can say where `enabled` came from. Windows only; a no-op on
+ * every other platform (there is no per-user `Enabled` store there — the
+ * manifest's `enabled` is the switch). Returns the number of rows overlaid.
+ */
+int
+target_component_apply_user_overlay(const struct target_component_class *cls,
+                                    struct target_component_entry *entries,
+                                    size_t n);
 
 #if !defined(_WIN32) && !defined(__ANDROID__)
 /*!

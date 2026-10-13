@@ -346,7 +346,10 @@ next to the manifests) skips providers entirely. Details: discovery spec
 ## Diagnostics
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
-  (no DLL load) + the predicted active one + the ForceQwerty state.
+  (no DLL load) + Enabled / PreferredPlugin + the one ranked first + the
+  ForceQwerty state; `input enable|disable <id>` and `input use <id>` /
+  `input reset` write those two values (ADR-054 verbs, N3a; discovery spec
+  §3 / §6).
 - `displayxr-cli selftest` — with a provider registered, not overridden,
   **and reporting `PRESENT`**, asserts left+right role devices with a
   valid interaction profile. Provider absence never fails, and neither

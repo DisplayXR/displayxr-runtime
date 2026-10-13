@@ -45,6 +45,26 @@
  *
  */
 
+/*!
+ * `Policy` holds root policy (`Policy\Lock`, honoured by the shared
+ * per-user overlay), never a provider row. Case-insensitive, like the
+ * conversion class's reserved names.
+ */
+static bool
+input_is_reserved_subkey(const char *name)
+{
+	static const char policy[] = "policy";
+	for (size_t i = 0;; i++) {
+		const char a = (char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + ('a' - 'A') : name[i]);
+		if (a != policy[i]) {
+			return false;
+		}
+		if (a == '\0') {
+			return true;
+		}
+	}
+}
+
 static const struct target_component_class g_input_class = {
     .name = "input provider",
     .log_tag = "input plugin loader",
@@ -56,7 +76,7 @@ static const struct target_component_class g_input_class = {
     // DP + conversion only for now; the qwerty fallback / shell-side input
     // path is unaffected.
     .android_prefix = NULL,
-    .is_reserved_subkey = NULL,
+    .is_reserved_subkey = input_is_reserved_subkey,
     .read_extra = NULL,
 };
 
@@ -344,6 +364,61 @@ input_try_load_one(const struct target_component_entry *e,
 	return iface;
 }
 
+/*!
+ * Where a row's `enabled` came from, for `displayxr-cli input list` (N3a):
+ * "user" when the shared per-user overlay applied, "machine" / "manifest"
+ * when the platform's own store disabled it, else "default". The shared row
+ * reader records the value, not its presence, so an explicit enable in
+ * HKLM / the manifest reads as "default".
+ */
+static const char *
+input_enabled_source(const struct target_component_entry *e)
+{
+	if ((e->flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0) {
+		return "user";
+	}
+	if (!e->enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
+/*!
+ * N3a (ADR-054 verb `prefer`) — class selection policy, which the shared
+ * loader deliberately never does: move the row whose id is @p preferred to
+ * the front of the sorted @p entries, keeping the rest in order, so the scan
+ * tries it first and notes it at arbitration priority 0 (the arbiter ranks
+ * by that value, ties in insertion order). Returns true when a row matched.
+ */
+static bool
+input_hoist_preferred(struct target_component_entry *entries, int n, const char *preferred)
+{
+	if (preferred == NULL || preferred[0] == '\0') {
+		return false;
+	}
+	for (int i = 0; i < n; i++) {
+		if (strcmp(entries[i].id, preferred) != 0) {
+			continue;
+		}
+		if (i > 0) {
+			struct target_component_entry *tmp = (struct target_component_entry *)malloc(sizeof(*tmp));
+			if (tmp == NULL) {
+				return true; // matched; leave the order alone rather than fail
+			}
+			*tmp = entries[i];
+			memmove(&entries[1], &entries[0], (size_t)i * sizeof(entries[0]));
+			entries[0] = *tmp;
+			free(tmp);
+		}
+		return true;
+	}
+	return false;
+}
+
 static void
 input_discover_all(void)
 {
@@ -358,6 +433,8 @@ input_discover_all(void)
 		free(entries);
 		return;
 	}
+	// N3a: per-user Enabled (HKCU over HKLM; Windows only) — `input enable|disable`.
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n);
 
 	// #1466: which provider outranks the other on a tie is an alphabetical
 	// accident, and the vendor whose provider lost is the only person who
@@ -372,26 +449,36 @@ input_discover_all(void)
 		}
 	}
 
+	// N3a: the PreferredPlugin override (`input use <id>`) is tried first and
+	// ranked at priority 0; unregistered → ignored, disabled → skipped below.
+	char preferred[64] = {0};
+	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
+	if (have_pref && !input_hoist_preferred(entries, n, preferred)) {
+		U_LOG_W("input plugin loader: PreferredPlugin '%s' is not a registered provider — ignored.", preferred);
+	}
+
 	U_LOG_I("input plugin loader: %d registered provider(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
 		const struct target_component_entry *e = &entries[i];
+		const bool is_pref = have_pref && strcmp(e->id, preferred) == 0;
 		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
 			U_LOG_W("input plugin loader:   [%d/%d] %s: %s — skipping.", i + 1, n, e->source, e->reason);
 			continue;
 		}
 		if (!e->enabled) {
-			U_LOG_I("input plugin loader:   [%d/%d] %s disabled (Enabled=0) — skipping.", i + 1, n, e->id);
+			U_LOG_I("input plugin loader:   [%d/%d] %s disabled (Enabled=0, %s)%s — skipping.", i + 1, n,
+			        e->id, input_enabled_source(e), is_pref ? " [preferred]" : "");
 			continue;
 		}
-		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, e->id, e->probe_order,
-		        e->binary_path);
+		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u%s, %s)", i + 1, n, e->id, e->probe_order,
+		        is_pref ? ", preferred" : "", e->binary_path);
 		struct xrt_input_plugin_instance *inst = NULL;
 		bool declined = false;
 		const struct xrt_input_plugin_iface *iface = input_try_load_one(e, &inst, &declined);
 		if (iface != NULL) {
 			// Keep going: every claiming provider is a live
 			// candidate the arbiter can fall back to.
-			input_note_provider(iface, inst, e->probe_order);
+			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order);
 			continue;
 		}
 		if (declined) {
@@ -423,6 +510,7 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
 		return 0;
 	}
 	int n = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n); // N3a: what the scan sees
 
 	int count = 0;
 	for (int i = 0; i < n && count < max; i++) {
@@ -440,6 +528,7 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
 		snprintf(d->binary_path, sizeof(d->binary_path), "%s", e->binary_path);
 		d->probe_order = e->probe_order;
 		d->enabled = e->enabled;
+		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", input_enabled_source(e));
 	}
 	free(entries);
 	return count;
@@ -467,12 +556,53 @@ target_input_plugin_get_force_qwerty(void)
 	return rc == ERROR_SUCCESS && value != 0;
 }
 
+/*
+ * N3a: `PreferredPlugin` — HKCU first (per user, `input use <id>`), then the
+ * HKLM 64-bit view (`--machine`). Same root value name as the DP loader's
+ * §2.1 override, under the InputProviders root. Class selection policy, so
+ * class code — the shared loader never selects.
+ */
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	wchar_t wbuf[64];
+	DWORD wbuf_bytes = sizeof(wbuf);
+	LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
+	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
+		wbuf_bytes = sizeof(wbuf);
+		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, wbuf, &wbuf_bytes);
+	}
+	if (rc != ERROR_SUCCESS) {
+		return false;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
+		out[0] = '\0';
+	}
+	return out[0] != '\0';
+}
+
 #elif defined(XRT_OS_ANDROID)
 
 bool
 target_input_plugin_get_force_qwerty(void)
 {
 	return false;
+}
+
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	return false; // no providers, no override on Android in v1
 }
 
 #else /* POSIX: macOS / desktop Linux */
@@ -498,6 +628,50 @@ target_input_plugin_get_force_qwerty(void)
 	/* Presence forces qwerty; a leading '0' turns the file into a
 	 * no-op so it can be toggled without deleting it. */
 	return c != '0';
+}
+
+/*
+ * N3a: the preferred provider — the DP loader's §3.3 pattern: an env var
+ * for dev/CI (no writable filesystem needed), else a one-line file next to
+ * `force_qwerty`, which is what `displayxr-cli input use <id>` / `input
+ * reset` write.
+ */
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	const char *env = getenv("XRT_PREFERRED_INPUT_PLUGIN_ID");
+	if (env != NULL && *env != '\0') {
+		snprintf(out, cap, "%s", env);
+		return out[0] != '\0';
+	}
+
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/input-preferred", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[64] = {0};
+	size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[got] = '\0';
+	size_t len = strlen(buf);
+	while (len > 0 &&
+	       (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+		buf[--len] = '\0';
+	}
+	snprintf(out, cap, "%s", buf);
+	return out[0] != '\0';
 }
 
 #endif /* platform-specific gate */

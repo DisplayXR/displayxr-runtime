@@ -11,8 +11,13 @@ arbitration, `sim_input`, and the CLI/self-test diagnostics). §5 —
 (`src/xrt/drivers/net_input/`, `DisplayXR-NetInput`). §4b — the rig
 (navigation) role, the rig composer, rig-local anchoring and the
 persistent host iface — is **implemented** (#1380, ADR-034 *Amendment 4*).
-Still planned: the `PreferredPlugin` override (§3, noted inline), and the
-per-client recenter lease under a workspace controller (§4b, ADR-035 D2).
+The `Enabled` / `PreferredPlugin` pair and the `displayxr-cli input
+enable|disable|use|reset` verbs (§3, §6) are **implemented** (N3a of the
+ADR-054 component model: the same four verbs for every component class).
+Still planned: live re-select when either value changes under a running
+service (N3 step d — today a change applies to processes started after the
+write), and the per-client recenter lease under a workspace controller (§4b,
+ADR-035 D2).
 The authoritative
 rationale is `docs/adr/ADR-034-input-provider-plugins.md`. This spec
 intentionally mirrors the display-processor contract
@@ -98,8 +103,28 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 Per-provider subkey, same value schema as DisplayProcessors: `Binary`
 (absolute DLL path, required), `DisplayName` / `Vendor` / `Version`
 (optional strings), `ProbeOrder` (DWORD; missing = 100), optional
-`Enabled` (DWORD, 0 disables — implemented for input providers; the DP
-root has no such value).
+`Enabled` (DWORD, 0 disables; the DP root has no such value yet — N3 step b).
+
+**Per-user policy (N3a, ADR-054 verbs `enable|disable` and `prefer`).** Two
+values are also read from **HKCU**, where they win over HKLM; they are what
+`displayxr-cli input …` writes without admin (`--machine` writes the HKLM
+64-bit view instead). Nothing else is ever read from HKCU — the provider rows
+themselves (`Binary`, `ProbeOrder`, …) are HKLM-only, so a per-user key can
+never inject a DLL.
+
+| Location | Value | Type | Purpose | Written by |
+|---|---|---|---|---|
+| `HKCU\…\InputProviders\<id>` (overrides `HKLM\…\InputProviders\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` (logged `disabled (Enabled=0, user|machine)`); absent = enabled | `displayxr-cli input enable|disable <id> [--machine]` |
+| `HKCU\…\InputProviders` root, then `HKLM\…\InputProviders` root | `PreferredPlugin` | REG_SZ | `<id>` is hoisted to the front of the ProbeOrder sort and noted at arbitration priority 0, so it holds the hand/rig roles whenever it is present. Unregistered → one WARN, ignored; disabled → skipped (`Enabled=0` is the stronger verb); declines → normal fall-through | `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` |
+
+The `Enabled` overlay is the shared component loader's
+(`target_component_apply_user_overlay`, ADR-054 N2), so the conversion root's
+kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
+machine value win for every row (conversion-provider-discovery.md §3.1); the
+`Policy` subkey is reserved and never read as a provider row. A change to
+either value applies to processes started after the write — the loader is
+one-shot per process (restart the service to switch a live session; live
+re-select is N3 step d).
 
 **Choosing a `ProbeOrder`:** lower wins. Pick a value distinct from every
 provider yours expects to coexist with — the in-tree Ultraleap provider
@@ -122,10 +147,29 @@ the installed plugin dir otherwise; the roots are shared via
 `target_plugin_build_discovery_roots`). Schema is identical to the DP
 manifest (`file_format_version` "1.0" + a `plugin` object with `id`,
 `binary_path`, optional `display_name` / `vendor` / `version` /
-`probe_order`). The `-input-provider.json` suffix is the router: the DP
-loader skips such manifests, the input loader requires them, so both
-plug-in types co-habit one directory. Per-user manifests shadow system
-ones by `id`, as in the DP loader.
+`probe_order`, and optional boolean `enabled`, `false` = the loader skips
+the provider; a non-boolean rejects the manifest as malformed — the shared
+component loader's parser, ADR-054 N2). The
+`-input-provider.json` suffix is the router: the DP loader skips such
+manifests, the input loader requires them, so both plug-in types co-habit
+one directory. Per-user manifests shadow system ones by `id`, as in the DP
+loader.
+
+**Preferred provider (N3a).** The DP loader's §3.3 pattern, same semantics
+as the Windows `PreferredPlugin` above:
+
+1. **`XRT_PREFERRED_INPUT_PLUGIN_ID` env var** — wins when set; a dev/CI
+   override that needs no writable filesystem.
+2. **An `input-preferred` file** in the per-user manifest dir
+   (`~/Library/Application Support/DisplayXR/DisplayProcessors/input-preferred`
+   on macOS; `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/input-preferred`
+   on Linux — next to the DP loader's `preferred` and this loader's
+   `force_qwerty`) — a single line containing the provider id. This is what
+   `displayxr-cli input use <id>` / `input reset` write.
+
+There is no per-user `Enabled` store on POSIX (nor is there one for
+conversion providers): `displayxr-cli input enable|disable` reports that
+and points at the manifest's `enabled` field. `--machine` is Windows-only.
 
 ### Selection
 
@@ -594,8 +638,20 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
 ## 6. Diagnostics
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
-  (no DLL load), the predicted active one, ProbeOrder/Enabled, and the
-  ForceQwerty state (mirror of `dp list`).
+  (no DLL load): ProbeOrder, `Enabled` and where it came from
+  (`enabled_source`: `default` / `machine` / `user` / `manifest`), the
+  `PreferredPlugin` override (`preferred`, root-level; per row `preferred`),
+  the one the loader would rank first (`*` / `active`), and the ForceQwerty
+  state (mirror of `dp list`; what the dashboard's component row renders,
+  ADR-051).
+- `displayxr-cli input enable | disable <id> [--machine]` — the ADR-054
+  `enable|disable` verb: `Enabled` on the provider's row, HKCU (per user, no
+  admin) by default, HKLM 64-bit view with `--machine`; HKCU wins (§3).
+  Writes even for an unregistered id (with a warning), like `conv enable`.
+- `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` —
+  the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
+  `input-preferred` file on POSIX, where `--machine` is refused). Every
+  write says that it applies to processes started afterwards.
 - `displayxr-cli selftest` — when a provider is registered and not
   ForceQwerty-overridden, asserts provider-claimed left+right
   motion-controller role devices exist with a valid interaction profile
