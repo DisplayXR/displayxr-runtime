@@ -57,6 +57,7 @@ set(tests
     tests_aux_lift_autoconv
     tests_aux_rear_budget
     tests_aux_route_policy
+    tests_aux_vk_queue_lock_route
     tests_aux_present_owner_route
     tests_aux_overlay_lease
     tests_aux_mini_window_tell

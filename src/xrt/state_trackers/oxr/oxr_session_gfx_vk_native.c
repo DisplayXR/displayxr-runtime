@@ -17,6 +17,7 @@
 
 #include <stdlib.h>
 
+#include "util/u_vk_queue_lock.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
@@ -577,11 +578,32 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	 * consequence once so this is discoverable rather than silent. (The
 	 * enable2-but-family-saturated case logs its own line in oxr_vulkan.c.)
 	 */
-	if (sess->sys->vulkan_runtime_queue_family < 0 && !sys->inst->extensions.KHR_vulkan_enable2) {
-		U_LOG_W("#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
-		        "the runtime has no queue of its own and weave rate cannot be decoupled from render "
-		        "rate (#868 repaint disabled). Port the app to XR_KHR_vulkan_enable2 "
-		        "(xrCreateVulkanDeviceKHR).");
+	const bool app_created_device = !sys->inst->extensions.KHR_vulkan_enable2;
+	comp_vk_native_compositor_set_vk_device_origin(&xcn->base, app_created_device,
+	                                               sys->vulkan_queue_lock_injected && !app_created_device);
+	if (sess->sys->vulkan_runtime_queue_family < 0 && app_created_device) {
+		bool ql_live = false;
+		bool repaint_on = false;
+		bool shared = comp_vk_native_compositor_get_queue_lock_state(&xcn->base, &ql_live, &repaint_on);
+		if (shared) {
+			// The app brought VK_LAYER_DXR_queue_lock into its own chain
+			// (named it, or DXR_VK_QUEUE_LOCK=1 + the implicit manifest):
+			// the repaint shares the app's queue, serialised by the layer.
+			U_LOG_W(
+			    "#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
+			    "the runtime has no queue of its own; VK_LAYER_DXR_queue_lock is live on it, so the "
+			    "#868 repaint shares the app's queue (layer tier; route in the #886 line above).");
+		} else {
+			U_LOG_W(
+			    "#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
+			    "the runtime has no queue of its own and weave rate cannot be decoupled from render "
+			    "rate (#868 repaint disabled%s). Fix: " U_VK_QL_ENABLE1_HINT
+			    ", or port the app to "
+			    "XR_KHR_vulkan_enable2 (xrCreateVulkanDeviceKHR).",
+			    ql_live
+			        ? "; the queue-lock layer is live but DXR_VK_QUEUE_MODE / DXR_WEAVE_REPAINT excludes it"
+			        : "");
+		}
 	}
 
 	// Native compositor is always visible and focused

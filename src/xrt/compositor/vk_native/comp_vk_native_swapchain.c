@@ -663,6 +663,9 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	U_LOG_I("Created VK native swapchain: %ux%u, %u images, format %d",
 	        info->width, info->height, image_count, (int)vk_format);
 
+	// #886: one-shot runtime#2039 guard (log only) — see the callee.
+	comp_vk_native_compositor_note_app_swapchain(c, image_count);
+
 	return XRT_SUCCESS;
 }
 

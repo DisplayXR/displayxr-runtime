@@ -168,6 +168,36 @@ void
 comp_vk_native_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
 
 /*!
+ * #886: tell the compositor who created the VkDevice it shares with the app,
+ * and whether the runtime itself injected VK_LAYER_DXR_queue_lock. Logs the
+ * layer's activation route once (`#886: VK_LAYER_DXR_queue_lock route=…`:
+ * injected / app-enabled / implicit / loader-env / absent). Call right after
+ * comp_vk_native_compositor_create.
+ *
+ * @param app_created_device  vulkan_enable1 — the app created the device.
+ * @param runtime_injected    the runtime named the layer at
+ *                            xrCreateVulkanInstanceKHR (enable2).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_vk_device_origin(struct xrt_compositor *xc,
+                                               bool app_created_device,
+                                               bool runtime_injected);
+
+/*!
+ * #886: the queue-lock state resolved at create.
+ *
+ * @param[out] out_layer_live  VK_LAYER_DXR_queue_lock is live on the device.
+ * @param[out] out_repaint     the #868 repaint is enabled.
+ * @return true when the repaint shares the app's queue (layer tier).
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_queue_lock_state(struct xrt_compositor *xc, bool *out_layer_live, bool *out_repaint);
+
+/*!
  * XR_DXR_depth_budget: the latest budget the weave thread computed.
  *
  * Read from the app's locate thread; the value is published under the runner's
@@ -382,6 +412,14 @@ void
 comp_vk_native_compositor_swapchain_images_destroyed(struct comp_vk_native_compositor *c,
                                                      const VkImage *images,
                                                      uint32_t count);
+
+/*!
+ * #886: an app swapchain of @p image_count images was created — the guard
+ * that logs (once, never acts) when the queue-lock layer's per-call
+ * serialisation applies to a vulkan_enable1 app on a single-queue GPU.
+ */
+void
+comp_vk_native_compositor_note_app_swapchain(struct comp_vk_native_compositor *c, uint32_t image_count);
 
 /*!
  * Get the queue family index from a VK native compositor (for sub-modules).
