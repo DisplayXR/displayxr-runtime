@@ -313,6 +313,10 @@ struct d3d11_lift
 	std::mutex viewsyn_mtx;
 	d3d11_conv_viewsyn *viewsyn = nullptr;
 	bool viewsyn_tried = false;
+	//! #2030: S5 records here (dispatcher thread, under viewsyn_mtx) and only
+	//! the replay touches the shared immediate context. nullptr = the device
+	//! refused one: S5 draws on the immediate context, as before.
+	ID3D11DeviceContext *viewsyn_deferred = nullptr;
 
 	//! G7, producer side: when the service last published the panel's eyes
 	//! (the conversion core holds the eyes themselves), and how a producer
