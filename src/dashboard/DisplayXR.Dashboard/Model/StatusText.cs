@@ -387,4 +387,65 @@ public static class StatusText
             ? WarningLine(w)
             : "SEGMENT_FLAT_2D: this segment has no display processor; that part of the window is flat 2D.";
     }
+
+    // ── Developer settings (perf-settings Phase 2A) ─────────────────────────
+
+    public const string DevSettingsTitle = "Developer settings";
+
+    public const string DevSettingsCollapsed =
+        "Every Tier 1 and Tier 2 runtime lever with its current value, where it came from and its compiled default. Read-only; collapsed every time the dashboard starts.";
+
+    public const string DevSettingsIntro =
+        "Values are what a process starting now would resolve (this dashboard's CLI environment, then the per-user file, then the machine default). " +
+        "Tier 1 levers apply the next time an app (or the service) starts; Tier 2 levers are read by the service when it starts. " +
+        "Tier 4 debug and test switches are intentionally not listed.";
+
+    public const string DevSettingsEnvOnlyNote =
+        "Most levers are environment-only: the runtime reads them with its own getenv, so a stored value would do nothing. Only the levers marked “settable” resolve from the settings file.";
+
+    /// <summary>The section's header caption: how many levers are not on their compiled default.</summary>
+    public static string DevSettingsCount(DevLeverList? list)
+    {
+        if (list is null) return "";
+        int n = list.NonDefaultCount;
+        return n == 0 ? $"{list.Levers.Count} levers, all on their defaults"
+                      : $"{n} of {list.Levers.Count} levers non-default";
+    }
+
+    public static string DevShownText(int shown, int total) =>
+        shown == total ? $"{total} levers" : $"{shown} of {total} levers shown";
+
+    public const string DevResetAllNote =
+        "Reset all clears every lever in the per-user settings file, including the Performance page's. Environment variables and the machine default are untouched.";
+
+    /// <summary>The chip colour of a value's source.</summary>
+    public static Level DevSourceLevel(string source) => source switch
+    {
+        "env" => Level.Warn,
+        "user" or "machine" => Level.Info,
+        _ => Level.Plain,
+    };
+
+    public static string DevTierLabel(int tier) => tier switch
+    {
+        1 => "Tier 1 · next launch",
+        2 => "Tier 2 · service start",
+        _ => "Tier ?",
+    };
+
+    /// <summary>What a non-managed row says instead of a Reset button.</summary>
+    public static string DevEnvOnlyHint(DevLever l)
+    {
+        string who = l.ForService && !l.ForApp ? "the service" : "the app";
+        return $"environment only — set {l.Name} before launching {who}";
+    }
+
+    /// <summary>Why a managed row's Reset is unavailable, or null when it can reset.</summary>
+    public static string? DevResetBlocked(DevLever l) => l.Source switch
+    {
+        "user" => null,
+        "env" => "set by an environment variable, which outranks the settings file",
+        "machine" => @"machine-wide default (HKLM\Software\DisplayXR\Settings), set by an administrator or installer",
+        _ => "on its default",
+    };
 }

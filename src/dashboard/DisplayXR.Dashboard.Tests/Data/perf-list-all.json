@@ -1,0 +1,60 @@
+{
+	"user_file":	"C:\Users\dev\AppData\Local\DisplayXR\settings.json",
+	"user_written":	"2026-10-13",
+	"resolved_for":	"a process starting now (this CLI's environment)",
+	"levers":	[{
+			"name":	"DXR_D3D_FORCE_GPU",
+			"tier":	1,
+			"proc":	"Both",
+			"default":	"unset",
+			"description":	"Supported contract (#845). scanout / igpu / dgpu / index.",
+			"managed":	true,
+			"value":	"dgpu",
+			"source":	"user"
+		}, {
+			"name":	"DXR_LATE_WEAVE",
+			"tier":	1,
+			"proc":	"App + Svc",
+			"default":	"on",
+			"description":	"Weave as late as possible before scanout.",
+			"managed":	false,
+			"value":	"0",
+			"source":	"env"
+		}, {
+			"name":	"DXR_PRESENT_OPAQUE",
+			"tier":	1,
+			"proc":	"App",
+			"default":	"off",
+			"description":	"Opaque flip chain instead of the composed chain.",
+			"managed":	false,
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_WEAVE_ON_SCANOUT",
+			"tier":	1,
+			"proc":	"App",
+			"default":	"on (kill switch)",
+			"description":	"Kill switch for the ADR-037 output-device split.",
+			"managed":	true,
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_COMMIT_PACE",
+			"tier":	2,
+			"proc":	"Svc",
+			"default":	"on (1; 0/1/2)",
+			"description":	"Commit backpressure. =0 lets a client run free; =2 is the legacy tick-align shape",
+			"managed":	false,
+			"value":	null,
+			"source":	"default"
+		}, {
+			"name":	"DXR_SPLIT_SAME_ADAPTER",
+			"tier":	2,
+			"proc":	"App",
+			"default":	"on (=0 kills)",
+			"description":	"ADR-039: engages the #918 split when render == scanout - one fill engine for every tier.",
+			"managed":	false,
+			"value":	null,
+			"source":	"default"
+		}]
+}

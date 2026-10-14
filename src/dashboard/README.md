@@ -15,7 +15,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Windows | the status feed (clients) | — |
 | Components | the status feed (clients by class); `info --json`; `workspace list --json` | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>` |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
-| Developer | `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `dp reset` (machine-wide; admin) |
+| Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
 
 **Components** groups what is plugged into the runtime by ROLE, never by product:
 display processors, the workspace controller (its launch hotkey / mode / "Launch now",

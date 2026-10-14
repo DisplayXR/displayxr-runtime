@@ -425,6 +425,9 @@ public sealed class MainWindow : Window
                 _ = _ctx.LoadPerfAsync(force: true);
                 break;
             case "developer":
+                _ = _ctx.LoadDpAsync(force: true);
+                if (_ctx.PerfAllWanted) _ = _ctx.LoadPerfAllAsync(force: true);
+                break;
             case "displays":
                 _ = _ctx.LoadDpAsync(force: true);
                 break;

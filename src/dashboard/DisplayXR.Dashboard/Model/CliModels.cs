@@ -213,3 +213,76 @@ public static class PerfStateParser
         catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
     }
 }
+
+/// <summary>Which process a Developer-settings row is filtered to.</summary>
+public enum ProcFilter { All = 0, App = 1, Service = 2 }
+
+/// <summary>
+/// One row of <c>perf list --all --json</c> (perf-settings Phase 2A): a Tier 1
+/// or Tier 2 lever from the census. <see cref="Managed"/> levers resolve from
+/// the per-user / machine stores and can be reset; every other lever is read by
+/// its own <c>getenv</c> and is environment-only, so the list offers no write
+/// for it (a stored value would do nothing).
+/// </summary>
+public sealed record DevLever(string Name, int Tier, string Proc, string Default, string Description,
+                              bool Managed, string? Value, string Source)
+{
+    /// <summary>Resolved from anything but the compiled default (env, user or machine).</summary>
+    public bool NonDefault => Source.Length > 0 && Source != "default";
+
+    /// <summary>Read in the app's process (the runtime DLL), per the census Proc column.</summary>
+    public bool ForApp => Proc.Contains("App", StringComparison.OrdinalIgnoreCase) || Proc.Contains("Both", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Read in displayxr-service.exe, per the census Proc column.</summary>
+    public bool ForService => Proc.Contains("Svc", StringComparison.OrdinalIgnoreCase) ||
+                              Proc.Contains("Service", StringComparison.OrdinalIgnoreCase) ||
+                              Proc.Contains("Both", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The per-user store holds it: the one source <c>perf reset NAME</c> can clear.</summary>
+    public bool Resettable => Managed && Source == "user";
+
+    /// <summary>Search (name / description substring, case-insensitive), tier (0 = all) and process filters.</summary>
+    public bool Matches(string? search, int tier, ProcFilter proc)
+    {
+        if (tier != 0 && Tier != tier) return false;
+        if (proc == ProcFilter.App && !ForApp) return false;
+        if (proc == ProcFilter.Service && !ForService) return false;
+        string q = search?.Trim() ?? "";
+        return q.Length == 0 || Name.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+               Description.Contains(q, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+/// <summary><c>perf list --all --json</c>: the Developer page's read-only lever list.</summary>
+public sealed record DevLeverList(string UserFile, string UserWritten, string ResolvedFor, IReadOnlyList<DevLever> Levers)
+{
+    public int NonDefaultCount => Levers.Count(l => l.NonDefault);
+
+    /// <summary>
+    /// False when the CLI ignored <c>--all</c> (it predates Phase 2A) and printed
+    /// the plain allow-listed list: no row then carries a tier.
+    /// </summary>
+    public bool IsCatalog => ResolvedFor.Length > 0 || Levers.Any(l => l.Tier > 0);
+
+    public DevLever? Lever(string name) => Levers.FirstOrDefault(l => l.Name == name);
+
+    public static DevLeverList Read(JsonElement e) => new(
+        e.Str("user_file"), e.Str("user_written"), e.Str("resolved_for"),
+        e.Arr("levers").Where(l => l.ValueKind == JsonValueKind.Object && l.Str("name").Length > 0)
+         .Select(l => new DevLever(l.Str("name"), l.Int("tier"), l.Str("proc"), l.Str("default"), l.Str("description"),
+                                   l.Bool("managed"), l.StrOrNull("value"), l.Str("source", "default"))).ToArray());
+
+    public static bool TryParse(string? json, out DevLeverList? list)
+    {
+        list = null;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return false;
+            list = Read(doc.RootElement);
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
+    }
+}
