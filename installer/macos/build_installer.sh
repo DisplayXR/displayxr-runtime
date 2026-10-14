@@ -261,6 +261,17 @@ else
     echo "Note: displayxr-service not in artifact (non-SERVICE build); .pkg ships runtime only."
 fi
 
+# --- 1b. Final code signature on the runtime payload (#280) ---
+# MUST stay the last thing that touches the payload's Mach-Os: every
+# install_name_tool above invalidated a signature (the ad-hoc re-signs only
+# keep the intermediate tree loadable). With DXR_MACOS_APP_IDENTITY set this is
+# a Developer ID + hardened-runtime signature, entitlements from
+# installer/macos/entitlements/map; unset, it is the ad-hoc '-' signature
+# contributor and fork-PR builds always had.
+SIGN="$REPO_ROOT/scripts/macos_sign_notarize.sh"
+"$SIGN" sign-tree "$WORK_DIR/payload-runtime" \
+    --entitlements-map "$SCRIPT_DIR/entitlements/map"
+
 # --- 2. Build runtime component pkg ---
 echo "--- Building runtime component ---"
 pkgbuild --root "$WORK_DIR/payload-runtime" \
@@ -274,6 +285,9 @@ pkgbuild --root "$WORK_DIR/payload-runtime" \
 echo "--- Building .app bundle ---"
 if [ -f "$ARTIFACT_DIR/bin/cube_handle_vk_macos" ]; then
     "$SCRIPT_DIR/create_app_bundle.sh" "$ARTIFACT_DIR" "$WORK_DIR/DisplayXRCube.app" cube_handle_vk_macos
+    # Sign the bundle's nested Mach-Os, then the bundle itself (#280).
+    "$SIGN" sign-tree "$WORK_DIR/DisplayXRCube.app" \
+        --entitlements-map "$SCRIPT_DIR/entitlements/map"
 
     # --- 4. Build test app component pkg ---
     echo "--- Building test app component ---"
@@ -322,6 +336,12 @@ productbuild --distribution "$DIST_XML" \
     --resources "$SCRIPT_DIR/resources" \
     --package-path "$WORK_DIR" \
     "$OUTPUT_PKG"
+
+# --- 6. Sign the product archive, notarize, staple (#280) ---
+# Each step runs only when its credentials are in the environment
+# (DXR_MACOS_INSTALLER_IDENTITY, DXR_NOTARY_PROFILE or DXR_NOTARY_KEY_*);
+# with none set the .pkg stays unsigned, exactly as before.
+"$SIGN" finalize-pkg "$OUTPUT_PKG"
 
 echo "=== Installer built: $OUTPUT_PKG ==="
 ls -lh "$OUTPUT_PKG"

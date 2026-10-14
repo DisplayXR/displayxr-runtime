@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	DisplayXR-owned executables that load plug-ins (displayxr-service,
+	displayxr-cli) run with the hardened runtime and dlopen() vendor
+	display-processor / input / conversion plug-ins. Those ship from the
+	vendors' own repos signed with THEIR Team ID (ADR-019), and library
+	validation would refuse every one of them. This is the only exception
+	these executables need: no DYLD_* environment variables, no unsigned
+	executable memory, no JIT.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

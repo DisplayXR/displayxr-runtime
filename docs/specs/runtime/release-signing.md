@@ -123,4 +123,62 @@ NSIS, Vulkan SDK, GitHub CLI; the box-local EV signer exposed as the `SIGN_CMD`
 secret; `SR_PATH` (Simulated Reality SDK) for the leia-plugin build; a
 `COMPONENT_READ_PAT` secret only if signing a **private** component repo. macOS
 `.pkg` signing (Apple Developer ID + notarization) is a separate track, not
-covered by the Windows runner.
+covered by the Windows runner — see below.
+
+## macOS: Developer ID + notarization (#280)
+
+One script, `scripts/macos_sign_notarize.sh`, does the whole macOS chain and is
+meant to be reused verbatim by every repo that ships a `.pkg` (runtime, MCP,
+shell, the five demos, and the bundle last). Like the Windows side it is
+**driven entirely by the environment**; nothing in the public repo names a
+certificate or a key.
+
+| Env var | Effect when unset |
+|---|---|
+| `DXR_MACOS_APP_IDENTITY` (`Developer ID Application: …`) | ad-hoc `-` signature — today's contributor / fork-PR behaviour |
+| `DXR_MACOS_INSTALLER_IDENTITY` (`Developer ID Installer: …`) | `.pkg` stays unsigned |
+| `DXR_NOTARY_PROFILE` (notarytool keychain profile) **or** `DXR_NOTARY_KEY_PATH` / `_KEY_ID` / `_ISSUER` (App Store Connect API key) | signed but not notarized |
+| `DXR_MACOS_KEYCHAIN` | default keychain search list |
+| `DXR_MACOS_NOTARIZE=0` | (set) sign only, skip notarization |
+
+Modes: `sign-tree <dir> [--entitlements-map <file>]`, `sign-pkg`, `notarize`,
+`staple`, `finalize-pkg` (sign-pkg → notarize → staple, each only when its
+credentials are present), `status`.
+
+**Rules the script enforces** (each one cost a rejected notarization or a
+SIGKILL somewhere before):
+- **Sign last.** Every `install_name_tool` invalidates a signature, and an
+  invalid signature on arm64 is SIGKILL at load. The ad-hoc re-signs after each
+  patch keep the intermediate tree loadable; `sign-tree` runs once, after all
+  patching, immediately before `pkgbuild`.
+- **Innermost first, each file individually:** dylibs and bundles, then
+  executables, then `.app`s deepest first. `--deep` is used only to verify.
+- **`--options runtime --timestamp`** on every Mach-O; `sign-tree` refuses to
+  finish if either is missing.
+- **Entitlements by map**, never blanket. `installer/macos/entitlements/map`
+  gives `com.apple.security.cs.disable-library-validation` to the executables
+  that load vendor plug-ins signed by other Team IDs (`displayxr-service`,
+  `displayxr-cli`, the in-process test app). The runtime dylib gets none:
+  library validation inside a host app is the host's choice.
+- **No `DYLD_*` under the hardened runtime.** dyld strips them, so a launcher
+  that relied on `DYLD_LIBRARY_PATH` breaks once signed. Fix the binary's
+  rpath instead (as `create_app_bundle.sh` now does); do not reach for
+  `allow-dyld-environment-variables`.
+- `finalize-pkg` fails unless notarytool says `Accepted` (printing
+  `notarytool log <id>` otherwise), and unless `spctl --assess --type install`
+  reports `source=Notarized Developer ID` after stapling.
+
+`installer/macos/build_installer.sh` calls `sign-tree` on the runtime payload
+and on `DisplayXRCube.app`, then `finalize-pkg` on the product archive. With
+no identities in the environment it produces the same unsigned `.pkg` with
+ad-hoc-signed Mach-Os as before, so CI on GitHub-hosted runners (and every
+fork PR) stays green with no secrets.
+
+**Local signed build** (a Mac whose login keychain holds both identities and a
+notarytool profile):
+```bash
+export DXR_MACOS_APP_IDENTITY="Developer ID Application: <Org> (<TEAM>)"
+export DXR_MACOS_INSTALLER_IDENTITY="Developer ID Installer: <Org> (<TEAM>)"
+export DXR_NOTARY_PROFILE=<profile>
+./scripts/build_macos.sh --installer      # or: installer/macos/build_installer.sh <artifact-dir> <out.pkg>
+```
