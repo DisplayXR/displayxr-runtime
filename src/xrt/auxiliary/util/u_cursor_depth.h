@@ -802,6 +802,34 @@ u_cursor_draw_arrow_rgba(uint8_t *rgba, uint32_t w, uint32_t h);
 void
 u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t pixel_count, uint8_t *out);
 
+/*!
+ * Linux default look (#2102): convert a cursor-theme image's pixels - Xcursor's
+ * ARGB32, one 32-bit word per pixel, alpha in the top byte, colour already
+ * PREMULTIPLIED - to the look's premultiplied RGBA8 (bytes R, G, B, A). Colour is
+ * clamped to alpha, so a malformed theme cannot produce out-of-range premultiplied
+ * values.
+ */
+void
+u_cursor_draw_from_argb32(const uint32_t *argb, uint32_t pixel_count, uint8_t *out);
+
+/*!
+ * The height, in OS points, at which the desktop shows a cursor-theme image. A
+ * theme ships a few nominal sizes and the desktop draws the nearest one scaled to
+ * the size asked for, so an image @p image_h pixels tall at nominal size
+ * @p image_nominal shows at image_h x want_nominal / image_nominal points. 0 when
+ * any input is 0.
+ */
+float
+u_cursor_theme_height_pt(uint32_t image_h, uint32_t image_nominal, uint32_t want_nominal);
+
+/*!
+ * Xft.dpi from an X resource database string (what XResourceManagerString
+ * returns): the value of the line "Xft.dpi:" followed by blanks and a number.
+ * 0 when there is no such line or the value is not a positive number.
+ */
+float
+u_cursor_parse_xft_dpi(const char *resources);
+
 
 /*
  *

@@ -101,6 +101,10 @@ struct comp_vk_native_wl_window_rect
 	//! below). The monitor scale in Mutter's LOGICAL layout mode, 1.0 in its
 	//! PHYSICAL mode — where the wire values already are device px.
 	float scale;
+	//! The monitor's own scale as Mutter reports it (get_monitor_scale), in
+	//! either layout mode: the scale the desktop draws its cursor at there
+	//! (#2102). Unlike @ref scale it is not 1.0 in PHYSICAL mode.
+	float monitor_scale;
 	//! left_px..height_px are the publisher's `buffer_device` (#1991), not
 	//! the conversion of the logical content rect.
 	bool from_buffer_device;

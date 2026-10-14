@@ -21,8 +21,11 @@
  * OS-cursor mirroring: macOS ([NSCursor currentCursor], read only when the
  * commit runs on the main thread - AppKit is main-thread-only;
  * comp_cursor_look_macos.m) and Windows (GetCursorInfo + DrawIconEx over
- * black and white, at the panel's DPI; comp_cursor_look_win.c). Elsewhere,
- * and whenever the shape cannot be read, the look is the arrow.
+ * black and white, at the panel's DPI; comp_cursor_look_win.c). Desktop
+ * Linux cannot read another client's cursor, so it loads the user's cursor
+ * theme instead - its "left_ptr", through a dlopen()ed libXcursor
+ * (comp_cursor_look_linux.c, #2102). Elsewhere, and whenever the shape
+ * cannot be read, the look is the arrow.
  * `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow everywhere.
  *
  * ZERO COST UNLESS REQUESTED (ADR-046 section 0): nothing here runs, and
@@ -58,8 +61,9 @@ struct comp_cursor_look
 	uint64_t generation;
 	//! The mirrored OS cursor (platform object, retained), NULL for the arrow.
 	void *os_cursor;
-	//! Windows: the backing scale (DPI / 96) the mirrored image was made at,
-	//! and a cursor that could not be read (not retried every frame).
+	//! Windows and Linux: the backing scale the mirrored image was made at
+	//! (Windows: DPI / 96); Windows: a cursor that could not be read (not
+	//! retried every frame).
 	float os_scale;
 	void *os_failed;
 };
@@ -77,7 +81,9 @@ comp_cursor_look_update(struct comp_cursor_look *look, float backing_scale);
 
 /*!
  * Backing pixels per OS point of the main screen (macOS), the system DPI / 96
- * (Windows), 1 elsewhere. macOS: read on the main thread and cached; off the main thread before the first read, 2 on
+ * (Windows), Xft.dpi / 96 from the X resource database (desktop Linux; a
+ * compositor that knows its window's monitor scale passes that instead), 1
+ * elsewhere. macOS: read on the main thread and cached; off the main thread before the first read, 2 on
  * macOS. The panel's metres per OS point is its pixel pitch times this.
  */
 float
@@ -131,7 +137,8 @@ comp_cursor_soften_params(void);
 /*
  *
  * Internal - the platform half (comp_cursor_look_macos.m on Apple,
- * comp_cursor_look_win.c on Windows).
+ * comp_cursor_look_win.c on Windows, comp_cursor_look_linux.c on desktop
+ * Linux).
  *
  */
 

@@ -273,6 +273,11 @@ elseif(WIN32)
 	# shared by the D3D11 and D3D12 compositors.
 	target_sources(comp_cursor_look PRIVATE util/comp_cursor_look_win.c)
 	target_link_libraries(comp_cursor_look PRIVATE user32 gdi32)
+elseif(XRT_HAVE_LINUX AND NOT ANDROID)
+	# The desktop-Linux cursor theme (#2102). libXcursor, GIO and libX11 are
+	# dlopen()ed, so the .deb's dependency list does not grow.
+	target_sources(comp_cursor_look PRIVATE util/comp_cursor_look_linux.c)
+	target_link_libraries(comp_cursor_look PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 ###

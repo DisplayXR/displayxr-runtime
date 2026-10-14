@@ -3123,3 +3123,52 @@ TEST_CASE("cursor_weave: sprite generations - load once, keep, fall back to the 
 	CHECK(u_cursor_weave_sprite_idle(1000 * MS, 2001 * MS));
 	CHECK(u_cursor_weave_sprite_idle(1000 * MS, 999 * MS));
 }
+
+TEST_CASE("cursor_look: an Xcursor ARGB32 image becomes premultiplied RGBA8")
+{
+	const uint32_t argb[4] = {
+	    0xFF102030u, // opaque
+	    0x80404040u, // half alpha, premultiplied grey
+	    0x00000000u, // transparent
+	    0x40FF8000u, // colour above alpha: clamped
+	};
+	uint8_t out[16];
+	u_cursor_draw_from_argb32(argb, 4, out);
+	CHECK(out[0] == 0x10);
+	CHECK(out[1] == 0x20);
+	CHECK(out[2] == 0x30);
+	CHECK(out[3] == 0xFF);
+	CHECK(out[4] == 0x40);
+	CHECK(out[7] == 0x80);
+	CHECK(out[8] == 0);
+	CHECK(out[11] == 0);
+	CHECK(out[12] == 0x40);
+	CHECK(out[13] == 0x40);
+	CHECK(out[14] == 0x00);
+	CHECK(out[15] == 0x40);
+}
+
+TEST_CASE("cursor_look: a theme image shows at the asked size in points")
+{
+	// The DS1 at 200 %: GNOME's 24 pt cursor, loaded as Yaru's 48 px image.
+	CHECK(u_cursor_theme_height_pt(48, 48, 24) == Catch::Approx(24.0f));
+	// 150 %: 36 px asked for, the theme's nearest is the 32 px image.
+	CHECK(u_cursor_theme_height_pt(32, 32, 24) == Catch::Approx(24.0f));
+	// An image taller than its nominal size keeps its proportion.
+	CHECK(u_cursor_theme_height_pt(50, 48, 24) == Catch::Approx(25.0f));
+	CHECK(u_cursor_theme_height_pt(0, 48, 24) == 0.0f);
+	CHECK(u_cursor_theme_height_pt(48, 0, 24) == 0.0f);
+	CHECK(u_cursor_theme_height_pt(48, 48, 0) == 0.0f);
+}
+
+TEST_CASE("cursor_look: Xft.dpi from the X resource database")
+{
+	CHECK(u_cursor_parse_xft_dpi("Xft.antialias:\t1\nXft.dpi:\t192\nXft.hinting:\t1\n") == Catch::Approx(192.0f));
+	CHECK(u_cursor_parse_xft_dpi("Xft.dpi: 144.5") == Catch::Approx(144.5f));
+	CHECK(u_cursor_parse_xft_dpi("Xft.dpi:\t96\n") == Catch::Approx(96.0f));
+	CHECK(u_cursor_parse_xft_dpi("Xcursor.size:\t48\n") == 0.0f);
+	CHECK(u_cursor_parse_xft_dpi("Xft.dpi:\tlarge\n") == 0.0f);
+	CHECK(u_cursor_parse_xft_dpi("Xft.dpi:\t-5\n") == 0.0f);
+	CHECK(u_cursor_parse_xft_dpi("") == 0.0f);
+	CHECK(u_cursor_parse_xft_dpi(NULL) == 0.0f);
+}
