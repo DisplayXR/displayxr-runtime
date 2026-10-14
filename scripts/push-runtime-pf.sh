@@ -80,6 +80,28 @@ for f in "$PKG"/plugins/*.dll; do
 done
 echo "== refreshed $refreshed already-installed plug-in DLL(s) under plugins/"
 
+# 3c. ADR-054 N4b: the provenance gate. Dev builds are unsigned, so allowlist the
+# SHA-256 of every plug-in DLL now under PF\plugins (value name = hex digest under
+# HKLM\Software\DisplayXR\Trust\Allowlist). Audit mode today (an unlisted DLL is
+# only logged "unverified"); once Trust\Enforce is set an unlisted dev DLL would be
+# refused, and the installed service is restarted ELEVATED by installers, where the
+# DXR_ALLOW_DEV_PLUGIN_PATHS override is deliberately not honoured. Best-effort:
+# needs an elevated shell, like the Version write below.
+allowed=0
+for f in "$PF"/plugins/*.dll; do
+  [ -f "$f" ] || continue
+  hex="$(sha256sum "$f" 2>/dev/null | awk '{print tolower($1)}')"
+  [ ${#hex} -eq 64 ] || continue
+  if reg add 'HKLM\Software\DisplayXR\Trust\Allowlist' //v "$hex" //t REG_SZ //d "push-runtime-pf.sh $(basename "$f")" //f //reg:64 >/dev/null 2>&1; then
+    allowed=$((allowed+1))
+  fi
+done
+if [ "$allowed" -gt 0 ]; then
+  echo "== allowlisted $allowed plug-in DLL digest(s) under HKLM\\Software\\DisplayXR\\Trust\\Allowlist (ADR-054 N4b)"
+else
+  echo "WARN: could not allowlist plug-in digests (not elevated?) — they read 'unverified' in audit mode (ADR-054 N4b)" >&2
+fi
+
 # Keep the installed MCP adapter in place (voice resolves it CWD-relative from
 # the Runtime dir; the file must EXIST there but must be the MCP\bin build).
 if [ -f "/c/Program Files/DisplayXR/MCP/bin/displayxr-mcp.exe" ]; then

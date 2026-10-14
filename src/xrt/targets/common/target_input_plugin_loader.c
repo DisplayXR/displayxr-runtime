@@ -309,7 +309,7 @@ target_input_plugin_get_host_iface(void)
  * XRT_ERROR_PROBER_NOT_SUPPORTED — as opposed to a load / ABI fault.
  */
 static const struct xrt_input_plugin_iface *
-input_try_load_one(const struct target_component_entry *e,
+input_try_load_one(struct target_component_entry *e,
                    struct xrt_input_plugin_instance **out_inst,
                    bool *out_declined)
 {
@@ -459,7 +459,7 @@ input_discover_all(void)
 
 	U_LOG_I("input plugin loader: %d registered provider(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
-		const struct target_component_entry *e = &entries[i];
+		struct target_component_entry *e = &entries[i];
 		const bool is_pref = have_pref && strcmp(e->id, preferred) == 0;
 		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
 			U_LOG_W("input plugin loader:   [%d/%d] %s: %s — skipping.", i + 1, n, e->source, e->reason);

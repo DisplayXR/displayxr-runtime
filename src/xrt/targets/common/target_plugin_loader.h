@@ -210,6 +210,7 @@ enum target_plugin_load_result
 	TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED,   //!< negotiate returned an error
 	TARGET_PLUGIN_RESULT_ABI_MISMATCH,       //!< ADR-020 rule 3 reject
 	TARGET_PLUGIN_RESULT_PROBE_FAILED,       //!< probe returned a hard error
+	TARGET_PLUGIN_RESULT_UNTRUSTED,          //!< provenance UNVERIFIED with the gate enforcing (ADR-054 N4b)
 };
 
 /*!
@@ -239,6 +240,13 @@ struct target_plugin_status
 	//! `XRT_STATUS_API_BIT_*` DP factories the iface offers, recorded before
 	//! probe() — so known for a plug-in that then DECLINED too; 0 if never loaded.
 	uint32_t dp_apis;
+	//! ADR-054 N4b: `enum target_component_provenance` of the binary at the
+	//! last attempt (UNKNOWN when the file could not even be found).
+	uint32_t provenance;
+	//! Leaf certificate CN when SIGNED; "" otherwise.
+	char signer[128];
+	//! One line: why that provenance verdict (incl. the allowlist row to write).
+	char provenance_reason[160];
 };
 
 /*!

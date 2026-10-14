@@ -706,6 +706,50 @@ for the old process to exit and builds its system on the new plug-in. A
 successor never restarts itself for adoption again (no loop on a flapping
 probe).
 
+### 4.3 Provenance: signed, allowlisted or admitted (ADR-054 N4b)
+
+A registration row needs administrator rights once; the binary it points at
+does not, and until ADR-054 nothing looked at the file. Every class loader now
+runs one **provenance check** on the binary, in the shared load path, after the
+#952 path guard and before `LoadLibrary` / `dlopen`. The verdict is one of
+these, first match wins (`target_component_provenance_classify`):
+
+| Verdict | Means | Where it comes from |
+|---|---|---|
+| `signed` | valid Authenticode chain to a trusted root | Windows, `WinVerifyTrust` (no UI, no network revocation) — any trusted root in v1, no publisher pinning |
+| `allowlisted` | the file's SHA-256 is in the **admin-only** allowlist | Windows: a value named `<sha256-hex>` under `HKLM\Software\DisplayXR\Trust\Allowlist` (data = a note); POSIX: a `<sha256-hex>` line in `/etc/displayxr/trust/allowlist` |
+| `platform-trusted` | the platform already vouches for it | Android: anything inside the runtime APK; `.deb`/package installs: root-owned, not group/world-writable, under `/usr` or `/opt` |
+| `dev-override` | unsigned and unlisted, admitted by `DXR_ALLOW_DEV_PLUGIN_PATHS` | **non-elevated hosts only** — an elevated process (the installer-restarted service, CI runners, an admin prompt) gets no override |
+| `unverified` | none of the above | what the gate refuses once enforcing |
+
+The digest, signer and one-line reason (for `unverified`: the exact allowlist row
+to write) are kept on the registration and shown by `displayxr-cli info`,
+`selftest --json` (`plugins[].provenance` / `signer` / `provenance_reason`) and,
+through the N3 CLI passes, the `dp|input|conv list` tables. The check caches per
+file (path, size, mtime) for the process, so the service's re-probes do not
+re-hash.
+
+**Audit first, then enforce.** With `HKLM\Software\DisplayXR\Trust\Enforce`
+absent (POSIX: no `/etc/displayxr/trust/enforce`) the gate is in **audit mode**:
+an `unverified` binary is logged (`provenance UNVERIFIED — … (audit mode: loading
+anyway)`) and loaded. With `Enforce` = 1 it is refused (`TARGET_COMPONENT_LOAD_UNTRUSTED`,
+plug-in status `UNTRUSTED`, one ERROR line naming the allowlist row) and discovery
+falls through to the next candidate. The default flips to enforcing one release
+after audit mode ships, with `Enforce = 0` kept as the escape hatch for one more
+release.
+
+**Dev lane.** `scripts\register_dev_plugin.bat` allowlists the SHA-256 of every
+DLL it registers in the same elevated run (a rebuilt DLL has a new digest: re-run
+it), `push-runtime-pf.sh` does the same for what it copies, and CI allowlists the
+just-built `sim_*` references before the per-class conformance step asserts
+`allowlisted` on them. Nothing else changes for a from-source box: the override
+still works in a normal prompt; it only stops working in an elevated one, where
+the allowlist is the right tool.
+
+What this is **not**: licensing or DRM (that is ADR-045 / ADR-053 vocabulary,
+N5), and not a path rule — on Windows a path is never a provenance, which is why
+`Program Files` alone does not make a binary `signed`.
+
 ---
 
 ## 5. Registration lifetime (no cascade-uninstall)

@@ -1805,8 +1805,10 @@ format_plugin_state_line(const struct target_plugin_status *p, char *out, size_t
 	} else if (used > 0 && (size_t)used < sizeof(detail) && p->os_error != 0) {
 		used += snprintf(detail + used, sizeof(detail) - (size_t)used, ", err=%u", (unsigned)p->os_error);
 	}
-	snprintf(out, cap, "%s plug-in '%s'%s%s — %s (%s; id=%s, ProbeOrder=%u)", p->fallback ? "fallback" : "vendor",
-	         name, p->version[0] != '\0' ? " " : "", p->version, state, detail, p->id, (unsigned)p->probe_order);
+	snprintf(out, cap, "%s plug-in '%s'%s%s — %s (%s; id=%s, ProbeOrder=%u, provenance=%s%s%s)",
+	         p->fallback ? "fallback" : "vendor", name, p->version[0] != '\0' ? " " : "", p->version, state, detail,
+	         p->id, (unsigned)p->probe_order, target_component_provenance_str(p->provenance),
+	         p->signer[0] != '\0' ? " by " : "", p->signer);
 }
 
 static void
@@ -1842,6 +1844,10 @@ add_plugin_states_json(cJSON *root, const struct cli_query_result *r)
 		cJSON_AddStringToObject(o, "hint", p->hint);
 		cJSON_AddStringToObject(o, "reason", p->reason);
 		cJSON_AddNumberToObject(o, "os_error", (double)p->os_error);
+		// ADR-054 N4b provenance, as the shared loader classified the binary.
+		cJSON_AddStringToObject(o, "provenance", target_component_provenance_str(p->provenance));
+		cJSON_AddStringToObject(o, "signer", p->signer);
+		cJSON_AddStringToObject(o, "provenance_reason", p->provenance_reason);
 		cJSON_AddItemToArray(arr, o);
 	}
 }
