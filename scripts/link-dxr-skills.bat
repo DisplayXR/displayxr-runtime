@@ -1,6 +1,6 @@
 @echo off
 REM Symlink the DisplayXR release skills into %USERPROFILE%\.claude\skills
-REM so /dxr-release + /installer-release are invocable from any working
+REM so /dxr-release, /installer-release + /sync-website are invocable from any working
 REM directory (Claude Code reads skills from the launch repo + the
 REM user-level skills dir). Windows sibling of scripts/link-dxr-skills.sh.
 REM
@@ -31,7 +31,8 @@ set "USKILLS=%USERPROFILE%\.claude\skills"
 
 REM Skills to expose globally. The runtime's own /release is NOT listed —
 REM it's only meaningful inside this repo, so it stays repo-scoped.
-set "SKILLS=dxr-release installer-release"
+REM Keep this list identical to SKILLS=(...) in link-dxr-skills.sh.
+set "SKILLS=dxr-release installer-release sync-website"
 
 if not exist "%USKILLS%" mkdir "%USKILLS%"
 
@@ -67,7 +68,7 @@ for %%S in (%SKILLS%) do (
 
 if /i "%MODE%"=="link" (
     echo.
-    echo Done. /dxr-release and /installer-release are now invocable from any directory.
+    echo Done. /dxr-release, /installer-release and /sync-website are now invocable from any directory.
     echo Canonical copies stay git-tracked in %SRC% - edit there, never the symlink target.
 )
 
