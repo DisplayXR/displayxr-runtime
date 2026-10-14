@@ -72,6 +72,95 @@ tc_tag(const struct target_component_class *cls)
 	return (cls != NULL && cls->log_tag != NULL) ? cls->log_tag : "component loader";
 }
 
+/*!
+ * WARN by default, INFO under TARGET_COMPONENT_LOAD_FLAG_QUIET: a class that
+ * re-attempts the same binary on world events pays one WARN per process for a
+ * binary that keeps failing the same way, not one per retry (ADR-045).
+ */
+#define TC_LOG_LOAD(quiet, ...)                                                                                        \
+	do {                                                                                                           \
+		if (quiet) {                                                                                           \
+			U_LOG_I(__VA_ARGS__);                                                                          \
+		} else {                                                                                               \
+			U_LOG_W(__VA_ARGS__);                                                                          \
+		}                                                                                                      \
+	} while (0)
+
+
+/*
+ *
+ * Routing (ADR-053) — platform-neutral, pure. Moved here from the
+ * display-processor loader (ADR-054 N2); the names stay.
+ *
+ */
+
+enum target_plugin_manifest_kind
+target_plugin_classify_manifest(const char *filename)
+{
+	static const char json_suffix[] = ".json";
+	static const char ip_suffix[] = "-input-provider.json";
+	static const char cp_suffix[] = "-conversion-provider.json";
+
+	if (filename == NULL) {
+		return TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	const size_t n = strlen(filename);
+	const size_t json_len = sizeof(json_suffix) - 1;
+	const size_t ip_len = sizeof(ip_suffix) - 1;
+	const size_t cp_len = sizeof(cp_suffix) - 1;
+
+	/* A bare suffix is not a manifest: there must be a name in front. */
+	if (n <= json_len || strcmp(filename + n - json_len, json_suffix) != 0) {
+		return TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	if (n >= ip_len && strcmp(filename + n - ip_len, ip_suffix) == 0) {
+		return n > ip_len ? TARGET_PLUGIN_MANIFEST_INPUT : TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	if (n >= cp_len && strcmp(filename + n - cp_len, cp_suffix) == 0) {
+		return n > cp_len ? TARGET_PLUGIN_MANIFEST_CONVERSION : TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	return TARGET_PLUGIN_MANIFEST_DISPLAY;
+}
+
+bool
+target_plugin_parse_android_filename(
+    const char *name, const char *prefix, uint32_t *out_order, char *out_id, size_t id_size)
+{
+	if (name == NULL || prefix == NULL || out_order == NULL || out_id == NULL || id_size == 0) {
+		return false;
+	}
+	const size_t prefix_len = strlen(prefix);
+	const size_t n = strlen(name);
+
+	/* Min plausible: "<prefix>NNN_X.so" = prefix + 3 + 1 + 1 + 3 chars. */
+	if (prefix_len == 0 || n < prefix_len + 8 || strncmp(name, prefix, prefix_len) != 0) {
+		return false;
+	}
+	if (strcmp(name + n - 3, ".so") != 0) {
+		return false;
+	}
+	for (size_t i = 0; i < 3; i++) {
+		if (!(name[prefix_len + i] >= '0' && name[prefix_len + i] <= '9')) {
+			return false;
+		}
+	}
+	if (name[prefix_len + 3] != '_') {
+		return false;
+	}
+
+	const size_t id_start = prefix_len + 4;
+	const size_t id_len = n - 3 - id_start;
+	if (id_len == 0 || id_len >= id_size) {
+		return false;
+	}
+
+	*out_order = (uint32_t)((name[prefix_len + 0] - '0') * 100 + (name[prefix_len + 1] - '0') * 10 +
+	                        (name[prefix_len + 2] - '0'));
+	memcpy(out_id, name + id_start, id_len);
+	out_id[id_len] = '\0';
+	return true;
+}
+
 
 /*
  *
@@ -591,6 +680,86 @@ target_component_enumerate_registry(const struct target_component_class *cls,
 	                             max);
 }
 
+/*!
+ * Pin the runtime core DLL (DisplayXRClient.dll) into the process by absolute
+ * path before any component is loaded. Runs once.
+ *
+ * Component DLLs statically import DisplayXRClient.dll, which ships in the
+ * runtime install dir. That dir is intentionally NOT on PATH (issue #104),
+ * and the per-component LOAD_WITH_ALTERED_SEARCH_PATH searches only the
+ * component's own dir + System32 + cwd + PATH — none of which hold
+ * DisplayXRClient.dll except cwd when it happens to equal the runtime dir. So
+ * at logon (Run-key launches with cwd=System32) and when the workspace
+ * controller spawns the service, that import fails with ERROR_MOD_NOT_FOUND
+ * (126) and every load aborts → no display processor → the service exits
+ * (issue #328).
+ *
+ * Pre-loading DisplayXRClient.dll by absolute path here pins it into the
+ * process by base name; the loader then satisfies each component's import
+ * from the already-resident module with no disk search, independent of
+ * cwd/PATH. The per-component load deliberately keeps
+ * LOAD_WITH_ALTERED_SEARCH_PATH so vendor side DLLs (e.g. the SR platform at
+ * C:\Program Files\LeiaSR\Platform\bin) still resolve via PATH.
+ *
+ * No process-wide search-order mutation (cf. target_dll_init.c) — this is
+ * the surgical option and leaves PATH resolution intact for vendors.
+ */
+void
+target_plugin_preload_runtime_core_dll(void)
+{
+	static int done = 0;
+	if (done) {
+		return;
+	}
+	done = 1;
+
+	// Directory of whatever module this loader code lives in — the
+	// service exe or DisplayXRClient.dll, both of which sit in the
+	// runtime install dir. UNCHANGED_REFCOUNT: we only want its path.
+	HMODULE self = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                        (LPCWSTR)(void *)&target_plugin_preload_runtime_core_dll, &self)) {
+		U_LOG_W("plugin loader: GetModuleHandleEx(self) failed (err=%lu) — cannot locate runtime dir to "
+		        "pre-load DisplayXRClient.dll.",
+		        GetLastError());
+		return;
+	}
+
+	wchar_t modpath[MAX_PATH];
+	DWORD len = GetModuleFileNameW(self, modpath, MAX_PATH);
+	if (len == 0 || len >= MAX_PATH) {
+		U_LOG_W("plugin loader: GetModuleFileName(self) failed/truncated — skipping DisplayXRClient.dll "
+		        "pre-load.");
+		return;
+	}
+
+	// Strip the module filename to leave the runtime dir.
+	wchar_t *slash = wcsrchr(modpath, L'\\');
+	if (slash == NULL) {
+		return;
+	}
+	*slash = L'\0';
+
+	wchar_t corepath[MAX_PATH];
+	if (swprintf_s(corepath, MAX_PATH, L"%s\\DisplayXRClient.dll", modpath) <= 0) {
+		return;
+	}
+
+	// If it is already resident (in-process app target, where the host
+	// loaded it via the OpenXR loader) this just bumps the refcount and
+	// the component import binds to it. Otherwise it loads now so the
+	// import resolves. LOAD_WITH_ALTERED_SEARCH_PATH so the core DLL's
+	// own siblings (cjson.dll, pthreadVC3.dll) resolve from the runtime
+	// dir rather than the host exe dir.
+	if (LoadLibraryExW(corepath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) == NULL) {
+		U_LOG_W("plugin loader: pre-load of %ls failed (err=%lu); plug-in loads may fail when cwd is not "
+		        "the runtime dir.",
+		        corepath, GetLastError());
+	} else {
+		U_LOG_I("plugin loader: pinned runtime core DLL for plug-in import resolution: %ls", corepath);
+	}
+}
+
 static int
 tc_discover(const struct target_component_class *cls, struct target_component_entry *out, int max)
 {
@@ -603,14 +772,16 @@ tc_discover(const struct target_component_class *cls, struct target_component_en
 }
 
 enum target_component_load_result
-target_component_load_binary(const struct target_component_class *cls,
-                             const struct target_component_entry *e,
-                             void **out_module,
-                             void **out_entrypoint,
-                             uint32_t *out_os_error,
-                             char *reason,
-                             size_t reason_cap)
+target_component_load_binary_ex(const struct target_component_class *cls,
+                                const struct target_component_entry *e,
+                                uint32_t flags,
+                                void **out_module,
+                                void **out_entrypoint,
+                                uint32_t *out_os_error,
+                                char *reason,
+                                size_t reason_cap)
 {
+	const bool quiet = (flags & TARGET_COMPONENT_LOAD_FLAG_QUIET) != 0;
 	if (out_module != NULL) {
 		*out_module = NULL;
 	}
@@ -647,7 +818,7 @@ target_component_load_binary(const struct target_component_class *cls,
 	if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
 		DWORD gle = GetLastError();
 		if (gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND) {
-			U_LOG_W("%s:   %s: registered Binary '%s' does not exist — skipping (orphan registration).",
+			TC_LOG_LOAD(quiet, "%s:   %s: registered Binary '%s' does not exist — skipping (orphan registration).",
 			        tc_tag(cls), e->id, e->binary_path);
 			if (out_os_error != NULL) {
 				*out_os_error = (uint32_t)gle;
@@ -677,7 +848,7 @@ target_component_load_binary(const struct target_component_class *cls,
 
 	// One-shot breadcrumb: a host-side crash during the load below leaves
 	// this as the last line in the per-app log, naming the in-flight binary.
-	U_LOG_W("%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
+	TC_LOG_LOAD(quiet, "%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
 	        e->binary_path);
 
 	HMODULE dll = LoadLibraryExW(wpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -687,7 +858,7 @@ target_component_load_binary(const struct target_component_class *cls,
 		// library IT imports is missing — typically the vendor platform the
 		// component should resolve lazily (ADR-045 rule 1).
 		const bool dep = gle == ERROR_MOD_NOT_FOUND;
-		U_LOG_W("%s:   %s: LoadLibrary(%s) failed (err=%lu)%s.", tc_tag(cls), e->id, e->binary_path, gle,
+		TC_LOG_LOAD(quiet, "%s:   %s: LoadLibrary(%s) failed (err=%lu)%s.", tc_tag(cls), e->id, e->binary_path, gle,
 		        dep ? " — a library the binary imports is missing (vendor platform not installed, or not "
 		              "resolvable from this process)"
 		            : "");
@@ -705,7 +876,7 @@ target_component_load_binary(const struct target_component_class *cls,
 
 	void *fn = (void *)GetProcAddress(dll, cls->entrypoint);
 	if (fn == NULL) {
-		U_LOG_W("%s:   %s: missing entry point '%s' — skipping.", tc_tag(cls), e->id, cls->entrypoint);
+		TC_LOG_LOAD(quiet, "%s:   %s: missing entry point '%s' — skipping.", tc_tag(cls), e->id, cls->entrypoint);
 		if (reason != NULL) {
 			snprintf(reason, reason_cap, "no '%s' export (not a %s)", cls->entrypoint,
 			         cls->name != NULL ? cls->name : "component of this class");
@@ -897,6 +1068,94 @@ tc_discover(const struct target_component_class *cls, struct target_component_en
 	return count;
 }
 
+static void
+tc_append_root(char roots[][PATH_MAX], int max_roots, int *n_roots, const char *path)
+{
+	if (path == NULL || *path == '\0' || *n_roots >= max_roots) {
+		return;
+	}
+	struct stat st;
+	if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		return;
+	}
+	snprintf(roots[(*n_roots)++], PATH_MAX, "%s", path);
+}
+
+/*!
+ * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.
+ *
+ * Roots searched, in priority order:
+ *   1. $XRT_PLUGIN_SEARCH_PATH — dev override, colon-separated list
+ *   2. macOS: ~/Library/Application Support/DisplayXR/DisplayProcessors/
+ *      Linux: $XDG_DATA_HOME/DisplayXR/DisplayProcessors/
+ *             (defaults to ~/.local/share/DisplayXR/DisplayProcessors/)
+ *   3. macOS: /Library/Application Support/DisplayXR/DisplayProcessors/
+ *      Linux: /usr/lib/displayxr/plugins (the .deb's packaged dir, #781),
+ *             /usr/local/share/displayxr/DisplayProcessors/
+ *             /usr/share/displayxr/DisplayProcessors/
+ *
+ * Per-user shadows system: roots are walked in priority order and the first
+ * occurrence of an id wins (@ref target_component_merge).
+ */
+int
+target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots)
+{
+	int n_roots = 0;
+
+	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
+	if (override != NULL && *override != '\0') {
+		/* Colon-separated list, like PATH. */
+		const char *p = override;
+		while (*p && n_roots < max_roots) {
+			const char *colon = strchr(p, ':');
+			size_t len = colon ? (size_t)(colon - p) : strlen(p);
+			if (len > 0 && len < PATH_MAX) {
+				char buf[PATH_MAX];
+				memcpy(buf, p, len);
+				buf[len] = '\0';
+				tc_append_root(roots, max_roots, &n_roots, buf);
+			}
+			if (!colon) {
+				break;
+			}
+			p = colon + 1;
+		}
+	}
+
+	const char *home = getenv("HOME");
+	char user_root[PATH_MAX];
+#ifdef __APPLE__
+	if (home != NULL && *home != '\0') {
+		snprintf(user_root, sizeof(user_root), "%s/Library/Application Support/DisplayXR/DisplayProcessors",
+		         home);
+		tc_append_root(roots, max_roots, &n_roots, user_root);
+	}
+	/* System-wide root for `.pkg`-style installs that run as root and
+	 * write to /Library/Application Support/ rather than ~. Per-user
+	 * entries above shadow system-wide entries. Issue #274. */
+	tc_append_root(roots, max_roots, &n_roots, "/Library/Application Support/DisplayXR/DisplayProcessors");
+#else
+	const char *xdg = getenv("XDG_DATA_HOME");
+	if (xdg != NULL && *xdg != '\0') {
+		snprintf(user_root, sizeof(user_root), "%s/DisplayXR/DisplayProcessors", xdg);
+		tc_append_root(roots, max_roots, &n_roots, user_root);
+	} else if (home != NULL && *home != '\0') {
+		snprintf(user_root, sizeof(user_root), "%s/.local/share/DisplayXR/DisplayProcessors", home);
+		tc_append_root(roots, max_roots, &n_roots, user_root);
+	}
+	/* Built-in default packaged plug-in dir — the Linux `.deb` drops the
+	 * sim-display .so + its `200-sim-display.json` manifest here, so an
+	 * installed box needs NO XRT_PLUGIN_SEARCH_PATH (#781). The env override
+	 * above is appended first, so a dev build still wins when it is set. This
+	 * is the POSIX analogue of the Windows DisplayProcessors registry root. */
+	tc_append_root(roots, max_roots, &n_roots, "/usr/lib/displayxr/plugins");
+	tc_append_root(roots, max_roots, &n_roots, "/usr/local/share/displayxr/DisplayProcessors");
+	tc_append_root(roots, max_roots, &n_roots, "/usr/share/displayxr/DisplayProcessors");
+#endif
+
+	return n_roots;
+}
+
 bool
 target_component_user_dir(char *out, size_t cap)
 {
@@ -927,14 +1186,16 @@ target_component_user_dir(char *out, size_t cap)
 #endif /* Android vs desktop POSIX */
 
 enum target_component_load_result
-target_component_load_binary(const struct target_component_class *cls,
-                             const struct target_component_entry *e,
-                             void **out_module,
-                             void **out_entrypoint,
-                             uint32_t *out_os_error,
-                             char *reason,
-                             size_t reason_cap)
+target_component_load_binary_ex(const struct target_component_class *cls,
+                                const struct target_component_entry *e,
+                                uint32_t flags,
+                                void **out_module,
+                                void **out_entrypoint,
+                                uint32_t *out_os_error,
+                                char *reason,
+                                size_t reason_cap)
 {
+	const bool quiet = (flags & TARGET_COMPONENT_LOAD_FLAG_QUIET) != 0;
 	if (out_module != NULL) {
 		*out_module = NULL;
 	}
@@ -951,7 +1212,7 @@ target_component_load_binary(const struct target_component_class *cls,
 		return TARGET_COMPONENT_LOAD_FAILED;
 	}
 
-	U_LOG_W("%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
+	TC_LOG_LOAD(quiet, "%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
 	        e->binary_path);
 
 	/* RTLD_LOCAL keeps the component's symbols private; aux symbols resolve
@@ -961,7 +1222,7 @@ target_component_load_binary(const struct target_component_class *cls,
 		const char *err = dlerror();
 		struct stat st;
 		const bool missing = stat(e->binary_path, &st) != 0;
-		U_LOG_W("%s:   %s: dlopen(%s) failed: %s.", tc_tag(cls), e->id, e->binary_path,
+		TC_LOG_LOAD(quiet, "%s:   %s: dlopen(%s) failed: %s.", tc_tag(cls), e->id, e->binary_path,
 		        err != NULL ? err : "?");
 		if (reason != NULL) {
 			snprintf(reason, reason_cap, "%s",
@@ -976,7 +1237,7 @@ target_component_load_binary(const struct target_component_class *cls,
 	void *sym = dlsym(handle, cls->entrypoint);
 	const char *err = dlerror();
 	if (sym == NULL || err != NULL) {
-		U_LOG_W("%s:   %s: missing entry point '%s' (%s) — skipping.", tc_tag(cls), e->id, cls->entrypoint,
+		TC_LOG_LOAD(quiet, "%s:   %s: missing entry point '%s' (%s) — skipping.", tc_tag(cls), e->id, cls->entrypoint,
 		        err != NULL ? err : "null");
 		if (reason != NULL) {
 			snprintf(reason, reason_cap, "no '%s' export (not a %s)", cls->entrypoint,
@@ -1006,6 +1267,18 @@ target_component_unload(void *module)
  * Public iface (every platform).
  *
  */
+
+enum target_component_load_result
+target_component_load_binary(const struct target_component_class *cls,
+                             const struct target_component_entry *e,
+                             void **out_module,
+                             void **out_entrypoint,
+                             uint32_t *out_os_error,
+                             char *reason,
+                             size_t reason_cap)
+{
+	return target_component_load_binary_ex(cls, e, 0, out_module, out_entrypoint, out_os_error, reason, reason_cap);
+}
 
 int
 target_component_enumerate(const struct target_component_class *cls, struct target_component_entry *out, int max)

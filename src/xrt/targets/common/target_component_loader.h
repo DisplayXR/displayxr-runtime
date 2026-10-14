@@ -46,8 +46,6 @@
 
 #pragma once
 
-#include "target_plugin_loader.h"
-
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_results.h"
 
@@ -55,9 +53,78 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if !defined(_WIN32) && !defined(__ANDROID__)
+#include <limits.h>
+#endif
+
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+
+/*
+ *
+ * Routing + platform plumbing shared by every class (moved here from the
+ * display-processor loader with ADR-054 N2; the `target_plugin_` names stay,
+ * they are what every caller and every doc says).
+ *
+ */
+
+/*!
+ * Which class a POSIX discovery-root file belongs to (ADR-053: "the suffix is
+ * the router"). All classes share one directory, so every loader classifies
+ * with this one function: `NNN-<id>-input-provider.json` is INPUT,
+ * `NNN-<id>-conversion-provider.json` is CONVERSION, any other `*.json` is
+ * DISPLAY, anything else is NONE. Pure, compiled on every platform so it is
+ * unit-testable everywhere.
+ */
+enum target_plugin_manifest_kind
+{
+	TARGET_PLUGIN_MANIFEST_NONE = 0,
+	TARGET_PLUGIN_MANIFEST_DISPLAY,
+	TARGET_PLUGIN_MANIFEST_INPUT,
+	TARGET_PLUGIN_MANIFEST_CONVERSION,
+};
+
+enum target_plugin_manifest_kind
+target_plugin_classify_manifest(const char *filename);
+
+//! Android library prefix of a display-processor plug-in (`libdxrp<NNN>_<id>.so`).
+#define TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY "libdxrp"
+//! Android library prefix of a conversion provider (`libdxrc<NNN>_<id>.so`, ADR-053).
+#define TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION "libdxrc"
+
+/*!
+ * Parse an Android component library name `<prefix><NNN>_<id>.so` into its
+ * three-digit ProbeOrder and `<id>`. Returns false (outputs untouched except
+ * possibly @p out_id on success only) on any malformed name, including a
+ * different prefix. Pure; compiled on every platform for unit tests.
+ */
+bool
+target_plugin_parse_android_filename(
+    const char *name, const char *prefix, uint32_t *out_order, char *out_id, size_t id_size);
+
+#if defined(_WIN32)
+/*!
+ * Pin the runtime core DLL (DisplayXRClient.dll) into the process by
+ * absolute path so component DLL imports of it resolve independent of
+ * cwd/PATH (issue #328). Idempotent, one-shot. Every class's binaries carry
+ * that import; @ref target_component_load_binary calls this before each load.
+ */
+void
+target_plugin_preload_runtime_core_dll(void);
+#endif
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+/*!
+ * Assemble the POSIX discovery roots (env override + per-user + system dirs)
+ * in priority order; returns the count. Each root is a PATH_MAX-sized buffer.
+ * Every class scans the SAME roots; the manifest suffix routes
+ * (`docs/specs/runtime/plugin-discovery.md` §3).
+ */
+int
+target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots);
 #endif
 
 //! Upper bound on registered components one enumeration returns, per class.
@@ -304,6 +371,29 @@ target_component_load_binary(const struct target_component_class *cls,
                              uint32_t *out_os_error,
                              char *reason,
                              size_t reason_cap);
+
+/*!
+ * Log the breadcrumb and any failure at INFO instead of WARN. For a class
+ * that re-probes the same binary on world events (the display-processor
+ * loader re-attempts a declined vendor plug-in on every refresh, ADR-045):
+ * one WARN per process for a binary that keeps failing the same way, not one
+ * per retry. The ABI gate's lines are unaffected (they are a verdict, not a
+ * retry).
+ */
+#define TARGET_COMPONENT_LOAD_FLAG_QUIET (1u << 0)
+
+/*!
+ * @ref target_component_load_binary with TARGET_COMPONENT_LOAD_FLAG_* flags.
+ */
+enum target_component_load_result
+target_component_load_binary_ex(const struct target_component_class *cls,
+                                const struct target_component_entry *e,
+                                uint32_t flags,
+                                void **out_module,
+                                void **out_entrypoint,
+                                uint32_t *out_os_error,
+                                char *reason,
+                                size_t reason_cap);
 
 //! FreeLibrary / dlclose a module from @ref target_component_load_binary. NULL is a no-op.
 void
