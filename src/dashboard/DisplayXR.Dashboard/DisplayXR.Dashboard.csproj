@@ -37,6 +37,11 @@
     <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.3" />
+    <!-- Transitive via Avalonia.FreeDesktop (the Linux D-Bus backend). Avalonia 11.2.3
+         pulls 0.20.0, vulnerable to CVE-2026-39959 / GHSA-xrw6-gwf8-vvr9 (a peer on the
+         session bus can spoof signals, exhaust fds, or crash the app; NU1903). 0.21.3 is
+         the backported fix. Drop this pin once Avalonia itself references >= 0.21.3. -->
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.21.3" />
   </ItemGroup>
 
   <ItemGroup>
