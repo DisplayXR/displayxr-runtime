@@ -3281,6 +3281,15 @@ struct oxr_session
 		//! frame's zone layer with @ref zone_id carries the views to draw with.
 		bool zone_valid;
 		uint32_t zone_id;
+		//! Multi-screen M3 (ADR-047): the arming locate split the window per
+		//! screen and placed the cursor with the view set of the segment under
+		//! the pointer - views [segment_first_view, + view_count) of the
+		//! frame's projection layer, at segment_rect of segment_canvas
+		//! (window px).
+		bool segment_valid;
+		uint32_t segment_first_view;
+		struct xrt_rect segment_rect;
+		struct xrt_rect segment_canvas;
 		//! The last armed frame could not draw (projection layer in another
 		//! space, a zones frame without the hinted zone, no projection
 		//! layer): locates in the same

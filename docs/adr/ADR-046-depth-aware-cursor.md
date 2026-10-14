@@ -620,9 +620,23 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
   kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
   4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
+- **Multi-screen (ADR-047 M3) on Metal.** A window split per screen gets one view set per
+  segment, each framing ONLY its segment, so the cursor is placed once per locate, after every
+  segment is located, from the view set of the segment under the pointer
+  (`oxr_segment_views_cursor_segment`: the hint's window-wide `cursorUV` re-expressed over that
+  segment) — its own screen's eyes and canvas, so its disparity is that screen's. xrEndFrame draws
+  with that segment's submitted views (`[firstView, +viewCount)` of the layer) and flags the
+  request `segment_valid` with the segment's rect; the compositor places the views at the
+  segment's rect of each tile — `comp_segments_tile_rect`, the same mapping as the segment's
+  layer views — with `u_cursor_draw_into_subrect`, clips to it, and sizes the sprite against the
+  segment's height. Before this the cursor was placed by whichever segment was located last (the
+  majority) from the window-wide uv, and drawn with segment 0's views over whole tiles, so on a
+  secondary screen it landed off its segment or mapped to no pixels (willDraw = false). Not yet:
+  an app sprite's `sizeMeters` is converted with the session screen's pixel pitch, and the
+  depth-layer / measured sources sample the layer's first view set.
 - **Not yet:** the service (`svc_draw_cursor_quads`; since drawn on the D3D11 service, Phase 4,
-  below); display zones (since drawn, runtime#1949, below); multi-screen routed frames draw per tile without the
-  segment routing on Metal (Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
+  below); display zones (since drawn, runtime#1949, below); multi-screen routed frames are drawn on Metal
+  only (below; Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
   (−0.005 is above it on current panels).
 
 #### §B as built on Vulkan and GL (`XR_DXR_cursor_depth` spec v5, unchanged)
@@ -791,7 +805,7 @@ refusal is only known at the commit).
   | Reason | Metal | vk_native | GL | D3D11 / D3D12 |
   |---|---|---|---|---|
   | zone mismatch / zone unplaceable | yes | yes | yes | yes |
-  | multi-screen routed frame | (draws) | yes | yes (Windows) | yes |
+  | multi-screen routed frame | (draws the pointer's segment; refuses a frame/request routing mismatch) | yes | yes (Windows) | yes |
   | no display info / canvas height | yes | yes | yes | yes |
   | sprite unusable (empty, no view, layered GL) | yes | yes (renderer: no source view) | yes | yes (renderer: no SRV / resource) |
   | default look build / upload failed | yes | yes (+ renderer: image not ready) | yes | yes (renderer: upload) |

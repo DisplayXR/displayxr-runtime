@@ -1214,6 +1214,89 @@ TEST_CASE("cursor_draw: a zone request maps into the zone's sub-rect of every ti
 	}
 }
 
+TEST_CASE("cursor_draw: a multi-screen segment request maps into the segment's rect of every tile")
+{
+	// A window split at x = 600 px across two screens (ADR-047 M3): the
+	// pointer is on the RIGHT segment, whose view set frames that segment
+	// only. Its request is segment-normalised; the compositor places it at the
+	// segment's rect of the tile (where a routed frame puts that segment's
+	// layer views) - and it must land where whole-window views would see it.
+	const int32_t sx = 600, sy = 0, sw = 900, sh = 1000;
+	const xrt_vec3 eyes[2] = {{-0.032f, 0.01f, 0.6f}, {0.032f, 0.01f, 0.6f}};
+	u_cursor_depth_view seg_v[2], full_v[2];
+	for (int i = 0; i < 2; i++) {
+		seg_v[i] = kooima_rect(eyes[i], sx, sy, sw, sh);
+		full_v[i] = kooima_rect(eyes[i], 0, 0, (int32_t)WIN_PX_W, (int32_t)WIN_PX_H);
+	}
+	// Window uv (0.7, 0.4) = segment uv ((1050 - 600) / 900, 0.4) = (0.5, 0.4).
+	u_cursor_depth_geometry g{};
+	REQUIRE(u_cursor_depth_geometry_solve(&seg_v[0], &seg_v[1], 0.5f, 0.4f, &g));
+
+	for (float disparity : {0.0f, -0.2f}) {
+		xrt_vec3 c{};
+		float h = 0.0f;
+		u_cursor_depth_place(&g, disparity, 0.05f, &c, &h);
+		const float unit = g.canvas_height / (1.0f - disparity);
+
+		u_cursor_draw_request req{};
+		req.requested = true;
+		req.view_count = 2;
+		for (int i = 0; i < 2; i++) {
+			REQUIRE(u_cursor_draw_view_from_placement(&seg_v[i], &c, &g.orientation, unit, &req.view[i]));
+		}
+		req.segment_valid = true;
+		req.segment_rect = {{sx, sy}, {sw, sh}};
+		req.segment_canvas = {{0, 0}, {(int32_t)WIN_PX_W, (int32_t)WIN_PX_H}};
+		REQUIRE(u_cursor_draw_should_draw(&req));
+		// One unit is the segment's height.
+		CHECK(u_cursor_draw_canvas_px_h(&req, WIN_PX_H) == (uint32_t)sh);
+
+		float clip[4];
+		REQUIRE(u_cursor_draw_into_subrect(&req, 600.0f / 1500.0f, 0.0f, 900.0f / 1500.0f, 1.0f, clip));
+		CHECK(clip[0] == Catch::Approx(0.4f));
+		CHECK(clip[1] == Catch::Approx(0.0f));
+		CHECK(clip[2] == Catch::Approx(0.6f));
+		CHECK(clip[3] == Catch::Approx(1.0f));
+
+		for (int i = 0; i < 2; i++) {
+			u_cursor_draw_view ref{};
+			REQUIRE(u_cursor_draw_view_from_placement(&full_v[i], &c, &g.orientation, unit, &ref));
+			for (int k = 0; k < 2; k++) {
+				CHECK(req.view[i].origin[k] == Catch::Approx(ref.origin[k]).margin(1e-4));
+				CHECK(req.view[i].axis_x[k] == Catch::Approx(ref.axis_x[k]).margin(1e-4));
+				CHECK(req.view[i].axis_y[k] == Catch::Approx(ref.axis_y[k]).margin(1e-4));
+			}
+		}
+		if (disparity == 0.0f) {
+			// On the plane: at the window uv.
+			CHECK(req.view[0].origin[0] == Catch::Approx(0.7f).margin(1e-4));
+			CHECK(req.view[0].origin[1] == Catch::Approx(0.4f).margin(1e-4));
+		}
+	}
+}
+
+TEST_CASE("cursor_draw: into_subrect clips to the tile and refuses an empty sub-rect")
+{
+	u_cursor_draw_request req{};
+	req.view_count = 2;
+	req.view[0].origin[0] = 0.5f;
+	req.view[0].origin[1] = 0.5f;
+	req.view[0].axis_x[0] = 1.0f;
+	req.view[0].axis_y[1] = -1.0f;
+	float clip[4];
+	// Hanging off the right edge: the clip stops at the tile.
+	REQUIRE(u_cursor_draw_into_subrect(&req, 0.75f, 0.0f, 0.5f, 1.0f, clip));
+	CHECK(clip[0] == Catch::Approx(0.75f));
+	CHECK(clip[2] == Catch::Approx(0.25f));
+	CHECK(req.view[0].origin[0] == Catch::Approx(1.0f));
+	CHECK(req.view[0].axis_x[0] == Catch::Approx(0.5f));
+	CHECK(req.view[0].axis_y[1] == Catch::Approx(-1.0f));
+	// Empty, outside, or not finite: nothing.
+	CHECK_FALSE(u_cursor_draw_into_subrect(&req, 0.0f, 0.0f, 0.0f, 1.0f, clip));
+	CHECK_FALSE(u_cursor_draw_into_subrect(&req, 1.2f, 0.0f, 0.5f, 1.0f, clip));
+	CHECK_FALSE(u_cursor_draw_into_subrect(&req, NAN, 0.0f, 0.5f, 1.0f, clip));
+}
+
 TEST_CASE("cursor_draw: zone clip and refusals")
 {
 	u_cursor_draw_request req{};

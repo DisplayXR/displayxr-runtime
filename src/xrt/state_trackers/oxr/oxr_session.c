@@ -2729,6 +2729,23 @@ oxr_session_cursor_depth_from_layer(struct oxr_session *sess,
 }
 
 /*!
+ * Multi-screen M3 (ADR-047): where a split locate places the cursor - the
+ * segment under the pointer (oxr_segment_views_cursor_segment) and its view
+ * set. Passed as NULL by every locate that keeps one view set.
+ */
+struct oxr_cursor_segment
+{
+	//! A segment holds the pointer; false = no cursor this locate.
+	bool held;
+	//! The pointer, normalised over that segment.
+	float u, v;
+	//! Its views in the located (and submitted) array.
+	uint32_t first_view, view_count;
+	//! The segment and its canvas, window px (the frame's routing).
+	struct xrt_rect rect, canvas;
+};
+
+/*!
  * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): this locate's placement is
  * active and the app asked the runtime to draw it. Keep what the frame's
  * xrEndFrame needs to hand the compositor a draw request, and report
@@ -2746,6 +2763,7 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
                             const struct xrt_vec3 *position,
                             const XrView *views,
                             uint32_t active_view_count,
+                            const struct oxr_cursor_segment *cs,
                             XrCursorDepthDrawStateDXR *draw_state)
 {
 	if (!draw_info->visible) {
@@ -2829,6 +2847,11 @@ oxr_session_arm_cursor_draw(struct oxr_session *sess,
 	sess->cursor_draw.hot_u = draw_info->hotSpot.x;
 	sess->cursor_draw.hot_v = draw_info->hotSpot.y;
 	sess->cursor_draw.size_m = isfinite(draw_info->sizeMeters) ? draw_info->sizeMeters : 0.0f;
+	// Multi-screen M3: xrEndFrame draws with the pointer segment's views.
+	sess->cursor_draw.segment_valid = cs != NULL;
+	sess->cursor_draw.segment_first_view = cs != NULL ? cs->first_view : 0;
+	sess->cursor_draw.segment_rect = cs != NULL ? cs->rect : (struct xrt_rect){{0, 0}, {0, 0}};
+	sess->cursor_draw.segment_canvas = cs != NULL ? cs->canvas : (struct xrt_rect){{0, 0}, {0, 0}};
 	// #1949: a zone-scoped locate framed its views (and cursorUV, and the
 	// unit above) to that zone; xrEndFrame draws through the zone's layer.
 	sess->cursor_draw.zone_valid = false;
@@ -2862,7 +2885,8 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
                               const XrViewLocateInfo *viewLocateInfo,
                               XrViewState *viewState,
                               const XrView *views,
-                              uint32_t active_view_count)
+                              uint32_t active_view_count,
+                              const struct oxr_cursor_segment *cs)
 {
 	// Spec v5: the draw report. Filled (false) whenever chained, so an app
 	// never reads a stale willDraw; set true only at the very end below.
@@ -2903,6 +2927,21 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 
 	if (hint == NULL || active_view_count < 2) {
 		return;
+	}
+
+	// Multi-screen M3: a split locate places the cursor with the views of the
+	// segment under the pointer (@p views is that set), the uv over it. No
+	// segment under the pointer (a part of the canvas no screen covers): no
+	// cursor - the app keeps its OS cursor.
+	XrCursorDepthHintDXR seg_hint;
+	if (cs != NULL) {
+		if (!cs->held) {
+			return;
+		}
+		seg_hint = *hint;
+		seg_hint.cursorUV.x = cs->u;
+		seg_hint.cursorUV.y = cs->v;
+		hint = &seg_hint;
 	}
 
 	// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
@@ -2982,7 +3021,7 @@ oxr_session_fill_cursor_depth(struct oxr_session *sess,
 
 	if (draw_info != NULL) {
 		oxr_session_arm_cursor_draw(sess, viewLocateInfo, draw_info, &g, disparity, &position, views,
-		                            active_view_count, draw_state);
+		                            active_view_count, cs, draw_state);
 	}
 }
 #endif // OXR_HAVE_DXR_cursor_depth
@@ -3072,6 +3111,9 @@ struct oxr_locate_segment
 	//! Filled by each call for the #1502 VIEW offset, which the wrapper
 	//! publishes once over ALL segments' active views. NULL = not wanted.
 	struct oxr_locate_segment_out *out;
+	//! XR_DXR_cursor_depth: the wrapper places the cursor itself, with the
+	//! views of the segment under the pointer.
+	bool skip_cursor_depth;
 };
 
 static XrResult
@@ -4532,8 +4574,10 @@ locate_views_one(struct oxr_logger *log,
 #ifdef OXR_HAVE_DXR_cursor_depth
 	// XR_DXR_cursor_depth (ADR-046): runtime gate, then the helper's own
 	// hint gate - no hint chained, no cursor work.
-	if (sess->sys->inst->extensions.DXR_cursor_depth) {
-		oxr_session_fill_cursor_depth(sess, viewLocateInfo, viewState, views, active_view_count);
+	// Multi-screen M3: a split locate places the cursor once, after every
+	// segment is located (oxr_session_locate_views), not per segment.
+	if (sess->sys->inst->extensions.DXR_cursor_depth && (seg == NULL || !seg->skip_cursor_depth)) {
+		oxr_session_fill_cursor_depth(sess, viewLocateInfo, viewState, views, active_view_count, NULL);
 	}
 #endif
 
@@ -5088,6 +5132,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			o.view_count = cnt[k];
 			o.side_effects = (k == mj);
 			o.out = &seg_out;
+			o.skip_cursor_depth = true;
 
 			XrView tmp[XRT_MAX_VIEWS];
 			for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
@@ -5142,6 +5187,29 @@ oxr_session_locate_views(struct oxr_logger *log,
 		route.first_view[k] = first[k];
 		route.view_count[k] = cnt[k];
 	}
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// XR_DXR_cursor_depth (ADR-046): one placement for the frame, from the
+	// view set of the segment under the pointer - its own screen's eyes and
+	// canvas - so the cursor is drawn on whichever screen the pointer is on.
+	if (sess->sys->inst->extensions.DXR_cursor_depth) {
+		struct oxr_cursor_segment cs = {0};
+		const XrCursorDepthHintDXR *hint =
+		    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CURSOR_DEPTH_HINT_DXR, XrCursorDepthHintDXR);
+		uint32_t k = 0;
+		if (hint != NULL &&
+		    oxr_segment_views_cursor_segment(&route, hint->cursorUV.x, hint->cursorUV.y, &k, &cs.u, &cs.v)) {
+			cs.held = true;
+			cs.first_view = first[k];
+			cs.view_count = cnt[k];
+			cs.rect = route.rect[k];
+			cs.canvas = route.canvas;
+		}
+		oxr_session_fill_cursor_depth(sess, viewLocateInfo, viewState, cs.held ? &views[cs.first_view] : views,
+		                              cs.held ? cs.view_count : 0, &cs);
+	}
+#endif
+
 	oxr_segment_views_route_record(&sess->seg_route, &route);
 	locate_fill_bindings(sess, viewState, &route);
 	return oxr_session_success_result(sess);
