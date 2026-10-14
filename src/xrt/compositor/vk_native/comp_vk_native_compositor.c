@@ -8929,7 +8929,10 @@ vk_repaint_thread(void *ptr)
 			 * does not exist yet; until it does, refusing to chase is the only
 			 * honest option.
 			 */
-			if (measured_ns != 0 && measured_ns < period_ns) {
+			// FASTER means a different mode, not rounding: 1e9/60 assumed vs a
+			// measured 16666666 ns tripped a strict `<` (#2068). Same 1%
+			// deadband the grid itself uses for a mode change.
+			if (measured_ns != 0 && measured_ns * 100 < period_ns * 99) {
 				if (!c->repaint.grid_clamp_logged) {
 					c->repaint.grid_clamp_logged = true;
 					U_LOG_W("#902: measured %.3f ms is FASTER than the assumed %.3f ms — "

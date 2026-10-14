@@ -117,6 +117,13 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			comp_vk_native_window_xcb.h)
 		target_include_directories(comp_vk_native PRIVATE ${XCB_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
+
+		# #902 present-feedback feeder: the desktop-Linux source for the vblank
+		# grid late weave aims at (X11 Present CompleteNotify, encoded in-tree —
+		# no libxcb-present — and native-Wayland wp_presentation, below).
+		target_sources(comp_vk_native PRIVATE
+			comp_vk_native_present_feedback.c
+			comp_vk_native_present_feedback.h)
 	endif()
 
 	if(XRT_HAVE_XLIB_XRANDR)
@@ -146,6 +153,41 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		# CMakeLists.txt for the full failure mode.
 		target_include_directories(comp_vk_native PRIVATE ${WAYLAND_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${WAYLAND_LIBRARIES})
+
+		# #902: wp_presentation glue for the present-feedback feeder, generated
+		# from the vendored XML (src/external/wayland-protocols) the same way
+		# the service window's protocols are (../CMakeLists.txt). Without
+		# wayland-scanner the feeder still builds, X11-only.
+		find_program(DXR_WAYLAND_SCANNER NAMES wayland-scanner)
+		if(XRT_HAVE_XCB AND DXR_WAYLAND_SCANNER)
+			set(_vkpf_xml "${PROJECT_SOURCE_DIR}/src/external/wayland-protocols/presentation-time.xml")
+			set(_vkpf_gen "${CMAKE_CURRENT_BINARY_DIR}/wayland-protocols")
+			set(_vkpf_hdr "${_vkpf_gen}/presentation-time-client-protocol.h")
+			set(_vkpf_src "${_vkpf_gen}/presentation-time-protocol.c")
+			add_custom_command(
+				OUTPUT "${_vkpf_hdr}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkpf_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" client-header "${_vkpf_xml}" "${_vkpf_hdr}"
+				DEPENDS "${_vkpf_xml}"
+				VERBATIM
+				)
+			add_custom_command(
+				OUTPUT "${_vkpf_src}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkpf_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" private-code "${_vkpf_xml}" "${_vkpf_src}"
+				DEPENDS "${_vkpf_xml}"
+				VERBATIM
+				)
+			target_sources(comp_vk_native PRIVATE "${_vkpf_hdr}" "${_vkpf_src}")
+			target_include_directories(comp_vk_native PRIVATE "${_vkpf_gen}")
+			# Source-local, not a target define: only the feeder TU reads it, and
+			# a target-wide define here is exactly what the vk_bundle note above
+			# warns about for VK_USE_PLATFORM_*.
+			set_source_files_properties(
+				comp_vk_native_present_feedback.c PROPERTIES COMPILE_DEFINITIONS
+									     DXR_HAVE_WP_PRESENTATION
+				)
+		endif()
 
 		if(XRT_HAVE_DBUS)
 			# Wayland window-geometry provider (#817): Wayland never exposes a
