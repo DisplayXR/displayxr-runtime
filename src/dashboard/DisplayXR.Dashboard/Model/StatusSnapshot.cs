@@ -45,6 +45,14 @@ public sealed record ConvTask(int? ProviderIndex, string? Provider, string Task,
                               string Reason, double Progress, bool Selected, int? Order, string Verdict, string LicenceClass,
                               int Streams, int JobsQueued, bool CpuStaging);
 
+/// <summary>
+/// One model pack in the runtime-owned model store (ADR-053 P4, <c>conv_packs[]</c>), read
+/// from disk by the CLI: <c>State</c> is installed / downloading / partial / evicted / absent.
+/// </summary>
+public sealed record ConvPack(string Pack, string Provider, string State, int Models, int ModelsInstalled,
+                              int ResearchModels, long BytesTotal, long BytesInstalled, long DownloadDone,
+                              long DownloadTotal, double Progress);
+
 public sealed record RuntimeInfo(string Version, string GitTag, int PluginAbi, string? ActiveOpenXrRuntime);
 
 public sealed record PluginInfo(string Id, string Name, string Vendor, string Version, string Load,
@@ -121,8 +129,12 @@ public sealed record StatusSnapshot(
     int Schema, string Source, Generation Generation, RuntimeInfo Runtime, IReadOnlyList<PluginInfo> Plugins,
     IReadOnlyList<Screen> Screens, IReadOnlyList<Client> Clients, Workspace Workspace,
     IReadOnlyList<StatusWarning> Warnings, string RawJson,
-    IReadOnlyList<ConvProvider>? ConvProviders = null, IReadOnlyList<ConvTask>? ConvTasks = null, bool ConvKnown = false)
+    IReadOnlyList<ConvProvider>? ConvProviders = null, IReadOnlyList<ConvTask>? ConvTasks = null, bool ConvKnown = false,
+    IReadOnlyList<ConvPack>? ConvPacks = null, string? ModelStoreRoot = null)
 {
+    /// <summary>Model packs in the runtime-owned store (ADR-053 P4); empty from a CLI that predates the store.</summary>
+    public IReadOnlyList<ConvPack> Packs => ConvPacks ?? Array.Empty<ConvPack>();
+
     /// <summary>Conversion providers (ADR-053); empty from a CLI that predates them (<see cref="ConvKnown"/> false).</summary>
     public IReadOnlyList<ConvProvider> Providers => ConvProviders ?? Array.Empty<ConvProvider>();
 
@@ -183,8 +195,15 @@ public static class StatusSnapshotParser
             raw,
             root.Arr("conv_providers").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadConvProvider).ToArray(),
             root.Arr("conv_tasks").Where(t => t.ValueKind == JsonValueKind.Object).Select(ReadConvTask).ToArray(),
-            root.Has("conv_providers"));
+            root.Has("conv_providers"),
+            root.Arr("conv_packs").Where(p => p.ValueKind == JsonValueKind.Object).Select(ReadConvPack).ToArray(),
+            root.Obj("conv_model_store").StrOrNull("root"));
     }
+
+    private static ConvPack ReadConvPack(JsonElement p) => new(
+        p.Str("pack"), p.Str("provider"), p.Str("state", "absent"), p.Int("models"), p.Int("models_installed"),
+        p.Int("research_models"), p.Long("bytes_total"), p.Long("bytes_installed"), p.Long("download_done"),
+        p.Long("download_total"), p.Num("progress", -1));
 
     private static ConvProvider ReadConvProvider(JsonElement p) => new(
         p.Str("id"), p.Str("name"), p.Str("vendor"), p.Str("version"), p.Str("load"), p.Str("hosting", "in_service"),
