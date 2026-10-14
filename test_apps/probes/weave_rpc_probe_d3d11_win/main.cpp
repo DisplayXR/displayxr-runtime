@@ -90,6 +90,26 @@
  * the panel, to 2D. The per-REGION half is observable on a DP reporting a real
  * cell grid; sim_display simulates one via SIM_DISPLAY_ZONE_GRID +
  * SIM_DISPLAY_ZONE_DUMP, which logs the resolved cell map.
+ *
+ * ── XR_DXR_cursor_depth v8: the web cursor, browser-free (ADR-046 Amendment 4) ─
+ *
+ *   --cursor-depth[=PX]   chain XrCursorDepthWeaveRequestDXR on every submit with
+ *                         ONE rect entry (rect 0): a SYNTHETIC page disparity of
+ *                         PX device pixels (default -24: in front of the glass),
+ *                         and read XrCursorDepthWeaveStateDXR back. The OS cursor
+ *                         is hidden exactly while the runtime reports it drew and
+ *                         the pointer is inside drawnBounds - the browser's rule.
+ *   --cursor-sprite=K     hcursor (default: the IDC_HAND HCURSOR, as the browser
+ *                         passes `pointer`), texture (a 32x32 shared NT texture:
+ *                         a green ring), default (the runtime's look), none
+ *                         (CSS cursor:none - nothing drawn), or cycle (all four,
+ *                         3 s each, a new generation per switch).
+ *   --cursor-content=off  hasContent = XR_FALSE (the cursor stays the OS one).
+ *   --cursor-sweep        the disparity ramps -48 px -> +16 px -> -48 px over 6 s,
+ *                         exercising rise, sink, the hand-back and "never behind".
+ *
+ * Needs runtime spec >= 8. Watch the service log's "[weave cursor]" lines (one
+ * per outcome change) and this probe's "cursor v8:" lines (one per state change).
  */
 
 #include "xr_session.h"
@@ -104,6 +124,7 @@
 
 #include <wincodec.h> // --lift: load the still
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib> // atoi — --flat-band / --screen-flat parsing
@@ -238,6 +259,24 @@ static ComPtr<IWICBitmapSource> g_liftImage; //!< decoded once, rescaled per rec
 static ComPtr<ID3D11Texture2D> g_liftTex;    //!< the still at the current rect size
 static uint32_t g_liftTexW = 0, g_liftTexH = 0;
 static volatile bool g_liftCursorDrawn = false; //!< last submit: the runtime drew the cursor
+// ---- --cursor-depth: XR_DXR_cursor_depth v8 (ADR-046 Amendment 4) ----------------
+enum CursorSpriteMode
+{
+	CURSOR_SPRITE_HCURSOR = 0,
+	CURSOR_SPRITE_TEXTURE,
+	CURSOR_SPRITE_DEFAULT,
+	CURSOR_SPRITE_NONE,
+	CURSOR_SPRITE_CYCLE,
+};
+static bool g_cursorDepth = false;
+static float g_cursorDepthPx = -24.0f;
+static bool g_cursorContent = true;
+static bool g_cursorSweep = false;
+static CursorSpriteMode g_cursorSprite = CURSOR_SPRITE_HCURSOR;
+static volatile bool g_weaveCursorDrawn = false; //!< last state: drawn (mask != 0)
+static RECT g_weaveCursorBounds = {};            //!< last state's drawnBounds, client px
+static ComPtr<ID3D11Texture2D> g_cursorTex;     //!< --cursor-sprite=texture carrier
+static HANDLE g_cursorTexHandle = nullptr;
 static RECT g_liftRect = {};                    //!< the lifted rect, client pixels
 
 //! Decode the still once (WIC), as 32bpp RGBA.
@@ -343,6 +382,15 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		return 0;
 	case WM_SETCURSOR:
+		// --cursor-depth (v8): hide the OS cursor exactly while the runtime reports
+		// it drew AND the pointer is inside the drawn bounds - the browser's rule.
+		if (g_cursorDepth && LOWORD(lParam) == HTCLIENT && g_weaveCursorDrawn) {
+			POINT pt;
+			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && PtInRect(&g_weaveCursorBounds, pt)) {
+				SetCursor(nullptr);
+				return TRUE;
+			}
+		}
 		// --lift-cursor: the runtime draws the cursor into the lifted views; hide
 		// the OS one over the rect only while it reports it did (else keep it).
 		if (g_liftCursor && LOWORD(lParam) == HTCLIENT && g_liftCursorDrawn) {
@@ -524,6 +572,60 @@ EnsureSbsTexture(uint32_t w, uint32_t h)
 // composites it "over" the woven output, so the bar should read as crisp 2D at
 // screen depth — no interlace, and NO parallax when the head moves (unlike the
 // woven squares). Painted once per (re)size; the service re-composites each frame.
+//! --cursor-sprite=texture: a 32x32 premultiplied RGBA8 green ring with a dark
+//! outline, hotspot at its centre, as a shared NT texture (no keyed mutex).
+static bool
+EnsureCursorTexture()
+{
+	if (g_cursorTex) {
+		return true;
+	}
+	const uint32_t n = 32;
+	std::vector<uint32_t> px(n * n, 0u);
+	for (uint32_t y = 0; y < n; y++) {
+		for (uint32_t x = 0; x < n; x++) {
+			const float dx = (float)x + 0.5f - 16.0f, dy = (float)y + 0.5f - 16.0f;
+			const float r = sqrtf(dx * dx + dy * dy);
+			// R8G8B8A8, little-endian 0xAABBGGRR, premultiplied.
+			if (r >= 9.0f && r < 13.0f) {
+				px[y * n + x] = 0xFF30E030u; // green ring
+			} else if ((r >= 7.5f && r < 9.0f) || (r >= 13.0f && r < 14.5f)) {
+				px[y * n + x] = 0xFF101010u; // outline
+			}
+		}
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = n;
+	td.Height = n;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = px.data();
+	init.SysMemPitch = n * 4;
+	HRESULT hr = g_device->CreateTexture2D(&td, &init, &g_cursorTex);
+	ComPtr<IDXGIResource1> res;
+	if (SUCCEEDED(hr)) {
+		hr = g_cursorTex.As(&res);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                             &g_cursorTexHandle);
+	}
+	if (FAILED(hr)) {
+		LOG_ERROR("--cursor-sprite=texture: shared texture create failed: 0x%08lx", hr);
+		g_cursorTex.Reset();
+		g_cursorTexHandle = nullptr;
+		return false;
+	}
+	g_context->Flush();
+	return true;
+}
+
 static bool
 EnsureOverlayTexture(uint32_t w, uint32_t h)
 {
@@ -1170,6 +1272,33 @@ ParseOptions(PWSTR cmdLineW)
 			} else if (_stricmp(tok, "--lift-cursor") == 0) {
 				g_lift = true;
 				g_liftCursor = true;
+			} else if (_stricmp(tok, "--cursor-depth") == 0 || _strnicmp(tok, "--cursor-depth=", 15) == 0) {
+				g_cursorDepth = true;
+				if (tok[14] == '=') {
+					g_cursorDepthPx = (float)atof(tok + 15);
+				}
+			} else if (_strnicmp(tok, "--cursor-sprite=", 16) == 0) {
+				g_cursorDepth = true;
+				const char *v = tok + 16;
+				if (_stricmp(v, "hcursor") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_HCURSOR;
+				} else if (_stricmp(v, "texture") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_TEXTURE;
+				} else if (_stricmp(v, "default") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_DEFAULT;
+				} else if (_stricmp(v, "none") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_NONE;
+				} else if (_stricmp(v, "cycle") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_CYCLE;
+				} else {
+					LOG_ERROR("--cursor-sprite: bad value '%s' (want hcursor|texture|default|none|cycle)", v);
+				}
+			} else if (_stricmp(tok, "--cursor-content=off") == 0) {
+				g_cursorDepth = true;
+				g_cursorContent = false;
+			} else if (_stricmp(tok, "--cursor-sweep") == 0) {
+				g_cursorDepth = true;
+				g_cursorSweep = true;
 			} else if (_strnicmp(tok, "--rect=", 7) != 0) {
 				LOG_INFO("unrecognized argument '%s' — ignored", tok);
 			}
@@ -1356,6 +1485,17 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		}
 		LOG_INFO("--lift: SBS stream created (depth %s, depth cursor %s)", g_liftCursor ? "requested" : "off",
 		         g_liftCursor ? "REQUESTED" : "off");
+	}
+	if (g_cursorDepth) {
+		if (g_cursorDepthSpecVersion < 8) {
+			LOG_ERROR("--cursor-depth: the runtime's XR_DXR_cursor_depth is v%u (needs v8) - running without it",
+			          g_cursorDepthSpecVersion);
+			g_cursorDepth = false;
+		} else {
+			LOG_INFO("--cursor-depth: v8 weave-rect cursor ON - synthetic disparity %.1f px%s%s, sprite mode %d",
+			         g_cursorDepthPx, g_cursorContent ? "" : " (hasContent = FALSE)",
+			         g_cursorSweep ? " (sweeping -48..+16 px)" : "", (int)g_cursorSprite);
+		}
 	}
 
 	if (g_requestMode >= 0) {
@@ -1578,6 +1718,73 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			tail = &lifts.next;
 		}
 
+		// --cursor-depth (XR_DXR_cursor_depth v8): the page's depth under the
+		// pointer for rect 0, plus the cursor the browser would have shown.
+		XrCursorDepthWeaveRectDXR wcEntry = {};
+		XrCursorDepthWeaveRequestDXR wcReq = {XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+		if (g_cursorDepth) {
+			static uint64_t s_gen = 0;
+			static int s_mode = -1;
+			static uint64_t s_sentGen = 0;
+			const ULONGLONG ms = GetTickCount64();
+			int mode = (int)g_cursorSprite;
+			if (g_cursorSprite == CURSOR_SPRITE_CYCLE) {
+				mode = (int)((ms / 3000) % 4); // hcursor, texture, default, none
+			}
+			if (mode != s_mode) {
+				s_mode = mode;
+				s_gen++;
+				LOG_INFO("cursor v8: sprite -> %s (generation %llu)",
+				         mode == CURSOR_SPRITE_HCURSOR ? "HCURSOR (IDC_HAND)"
+				         : mode == CURSOR_SPRITE_TEXTURE ? "TEXTURE (green ring)"
+				         : mode == CURSOR_SPRITE_DEFAULT ? "DEFAULT"
+				                                         : "NONE",
+				         (unsigned long long)s_gen);
+			}
+			wcReq.sprite.generation = s_gen;
+			const bool payload = s_sentGen != s_gen;
+			switch (mode) {
+			case CURSOR_SPRITE_HCURSOR:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				wcReq.sprite.osCursor = (uint64_t)(uintptr_t)LoadCursor(nullptr, IDC_HAND);
+				break;
+			case CURSOR_SPRITE_TEXTURE:
+				if (payload && EnsureCursorTexture()) {
+					wcReq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR;
+					wcReq.sprite.texture = (void *)g_cursorTexHandle;
+					wcReq.sprite.textureKind = XR_WEAVE_HANDLE_KIND_D3D11_NT_DXR;
+					wcReq.sprite.extent = {32, 32};
+					wcReq.sprite.hotSpotPx = {16.0f, 16.0f};
+				} else {
+					wcReq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				}
+				break;
+			case CURSOR_SPRITE_DEFAULT:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				break;
+			default:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_NONE_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				break;
+			}
+			s_sentGen = s_gen;
+			float px = g_cursorDepthPx;
+			if (g_cursorSweep) {
+				const float ph = (float)(ms % 6000) / 6000.0f; // triangle: -48 -> +16 -> -48
+				px = -48.0f + 64.0f * (ph < 0.5f ? 2.0f * ph : 2.0f - 2.0f * ph);
+			}
+			wcEntry.rectIndex = 0;
+			wcEntry.hasContent = g_cursorContent ? XR_TRUE : XR_FALSE;
+			wcEntry.disparityPx = px;
+			wcEntry.sampleUV = {0.5f, 0.5f};
+			wcReq.rectCount = 1;
+			wcReq.rects = &wcEntry;
+			*tail = &wcReq;
+			tail = &wcReq.next;
+		}
+
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
 		// v19 (#1884): ask for the per-screen split of the weave rect. static:
 		// the struct is ~4 KB and is re-read every frame.
@@ -1591,6 +1798,11 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		if (g_liftCursor) {
 			cursorState.next = out.next;
 			out.next = &cursorState;
+		}
+		XrCursorDepthWeaveStateDXR wcState = {XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+		if (g_cursorDepth) {
+			wcState.next = out.next;
+			out.next = &wcState;
 		}
 
 		LARGE_INTEGER t0, t1;
@@ -1668,6 +1880,37 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 				POINT pt;
 				if (GetCursorPos(&pt)) {
 					SetCursorPos(pt.x, pt.y);
+				}
+			}
+		}
+
+		if (g_cursorDepth) {
+			static uint32_t s_mask = UINT32_MAX;
+			static uint64_t s_gen = UINT64_MAX;
+			static XrRect2Di s_b = {};
+			const XrRect2Di &b = wcState.drawnBounds;
+			const bool moved = b.offset.x != s_b.offset.x || b.offset.y != s_b.offset.y ||
+			                   b.extent.width != s_b.extent.width || b.extent.height != s_b.extent.height;
+			// Log a mask or generation change at once, a bounds change at most 2/s.
+			static ULONGLONG s_lastBoundsLog = 0;
+			const ULONGLONG nowMs = GetTickCount64();
+			if (wcState.drawnRectMask != s_mask || wcState.spriteGeneration != s_gen ||
+			    (moved && nowMs - s_lastBoundsLog > 500)) {
+				s_lastBoundsLog = nowMs;
+				LOG_INFO("cursor v8: drawnRectMask=0x%x spriteGeneration=%llu drawnBounds=%d,%d %dx%d (frame %llu)",
+				         wcState.drawnRectMask, (unsigned long long)wcState.spriteGeneration, b.offset.x,
+				         b.offset.y, b.extent.width, b.extent.height, (unsigned long long)frame);
+			}
+			s_mask = wcState.drawnRectMask;
+			s_gen = wcState.spriteGeneration;
+			s_b = b;
+			const bool drawn = wcState.drawnRectMask != 0;
+			g_weaveCursorBounds = {b.offset.x, b.offset.y, b.offset.x + b.extent.width, b.offset.y + b.extent.height};
+			if (drawn != g_weaveCursorDrawn) {
+				g_weaveCursorDrawn = drawn;
+				POINT pt;
+				if (GetCursorPos(&pt)) {
+					SetCursorPos(pt.x, pt.y); // re-evaluate WM_SETCURSOR now
 				}
 			}
 		}
