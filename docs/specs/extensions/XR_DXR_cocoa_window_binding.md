@@ -176,6 +176,9 @@ window's drag and resize by default**:
   delegate. Setting a new delegate is supported (the proxy re-wraps it).
 - A window frame change the app makes itself (`setFrameOrigin:` etc.) is re-snapped on the next
   present; the frame the app's own move showed is off-phase (≤ 1 frame).
+- A window that the OS moved off a screen when that screen was unplugged is put back at its
+  position on it when the same screen (same display UUID) is plugged in again, unless the user
+  moved it meanwhile (ADR-050 Amendment 1; `DXR_MACOS_REPLUG_RESTORE=0` turns this off).
 - Clicks in the content area, on the traffic lights, and keyboard input are untouched.
 
 Not applied (AppKit keeps the window): offscreen and shared-IOSurface sessions, workspace (shell)
