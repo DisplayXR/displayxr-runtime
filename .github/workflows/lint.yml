@@ -109,6 +109,15 @@ jobs:
         # extensions (displayxr-extensions#2).
         run: python3 scripts/gen_extensions_index.py --check --github
 
+      - name: Developer-settings lever catalog matches the census
+        # src/xrt/targets/cli/cli_lever_catalog.h (what `displayxr-cli perf list
+        # --all` and the Dashboard's Developer settings list) is generated from
+        # Appendix A of docs/roadmap/control-panel-performance-settings.md. Fails
+        # when the header is stale, and when a Tier 1/2 name in the census no
+        # longer occurs as a string literal under src/xrt (a stale census row).
+        # Regenerate locally with: python3 scripts/gen_lever_catalog.py
+        run: python3 scripts/gen_lever_catalog.py --check --github
+
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
