@@ -13,7 +13,7 @@
  *   conv options <id> [--json]                       the provider's settings: declared + stored, with source
  *   conv set    <id> <KEY> <value> [--machine]       `Settings\<KEY>` (HKCU; HKLM with --machine) — N3c
  *   conv unset  <id> <KEY> [--machine]
- *   conv models list | prune                         the model store (P4; prints the root)
+ *   conv models list|verify|prune|fetch|init        the runtime-owned model store (P4)
  *
  * `list` / `status` read the running service's status snapshot over DIAG
  * (`system_get_conv_*_row`, one row per reply) and fall back to the headless
@@ -60,6 +60,7 @@
 #include "target_plugin_loader.h" // target_plugin_get_active (the static dp-lift row)
 #include "conversion/conv_readiness.h"
 #include "conversion/conv_select.h"
+#include "conversion/conv_model_store.h"
 
 #ifdef CLI_HAVE_IPC
 #include "xrt/xrt_results.h"
@@ -202,6 +203,13 @@ fetch_rows(struct xrt_status_snapshot *out, struct target_conv_policy *policy, s
 	why = "no IPC client in this build -- showing the HEADLESS describe";
 #endif
 	build_headless(out, nullptr);
+}
+
+//! ADR-053 P4: the model store's packs, read from disk (never over IPC).
+void
+fill_store(struct xrt_status_snapshot *out)
+{
+	target_conv_store_fill_snapshot(out);
 }
 
 
@@ -409,6 +417,7 @@ cmd_list(int argc, const char **argv, bool status_view)
 	auto policy = std::make_unique<target_conv_policy>();
 	std::string why;
 	fetch_rows(snap.get(), policy.get(), why);
+	fill_store(snap.get());
 	if (!why.empty()) {
 		fprintf(stderr, "displayxr-cli conv: %s.\n", why.c_str());
 	}
@@ -452,6 +461,7 @@ cmd_watch(int argc, const char **argv)
 	auto policy = std::make_unique<target_conv_policy>();
 	target_conv_policy_read(policy.get());
 	auto print = [&]() {
+		fill_store(snap.get());
 		if (json) {
 			print_json(snap.get(), policy.get(), true);
 		} else {
@@ -1024,70 +1034,266 @@ cmd_warm(int argc, const char **argv)
 #endif
 }
 
-//! Model store root (ADR-053 decision 7; spec §5.1): first configured key wins.
-std::string
-model_store_root(std::string &source)
+/*
+ *
+ * `conv models` (ADR-053 P4, #2108): the runtime-owned model store, local.
+ *
+ */
+
+//! Value of `--<name> <v>` (nullptr = absent).
+const char *
+flag_value(int argc, const char **argv, const char *name)
 {
-#ifdef XRT_OS_WINDOWS
-	struct
-	{
-		const char *sub;
-		const char *value;
-	} const keys[] = {
-	    {"Software\\DisplayXR\\Models", "Path"},
-	    {"Software\\DisplayXR\\Browser", "ModelsPath"},
-	};
-	for (const auto &k : keys) {
-		char buf[MAX_PATH];
-		DWORD sz = sizeof(buf);
-		if (RegGetValueA(HKEY_LOCAL_MACHINE, k.sub, k.value, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, buf,
-		                 &sz) == ERROR_SUCCESS &&
-		    buf[0] != '\0') {
-			source = std::string("HKLM\\") + k.sub + "\\" + k.value;
-			return buf;
+	for (int i = 3; i + 1 < argc; i++) {
+		if (strcmp(argv[i], name) == 0) {
+			return argv[i + 1];
 		}
 	}
-	char pd[MAX_PATH];
-	const DWORD n = GetEnvironmentVariableA("ProgramData", pd, sizeof(pd));
-	source = "%ProgramData% default";
-	return std::string(n > 0 && n < sizeof(pd) ? pd : "C:\\ProgramData") + "\\DisplayXR\\Models";
-#else
-	source = "not defined on this platform yet (P5)";
-	return "";
-#endif
+	return nullptr;
+}
+
+std::string
+mb(uint64_t bytes)
+{
+	char b[48];
+	if (bytes >= 1024ull * 1024ull) {
+		snprintf(b, sizeof(b), "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+	} else {
+		snprintf(b, sizeof(b), "%llu bytes", (unsigned long long)bytes);
+	}
+	return b;
+}
+
+void
+fetch_progress(void *user, const char *sha, uint64_t done, uint64_t total)
+{
+	(void)user;
+	P("  %.12s…  %s / %s\n", sha, mb(done).c_str(), mb(total).c_str());
+}
+
+struct store_guard
+{
+	conv_model_store *s = nullptr;
+	~store_guard()
+	{
+		conv_model_store_destroy(&s);
+	}
+};
+
+//! `conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]`.
+int
+models_fetch(int argc, const char **argv, conv_model_store *s, bool json)
+{
+	if (argc < 5 || argv[4][0] == '-') {
+		P("usage: displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n");
+		return 1;
+	}
+	const bool prefetch = cli_has_flag(argc, argv, "--prefetch");
+	const bool installer = cli_has_flag(argc, argv, "--installer");
+	const char *only = flag_value(argc, argv, "--model");
+	std::unique_ptr<conv_pack> pack(new conv_pack());
+	char err[192];
+	if (!conv_pack_load_url(argv[4], pack.get(), err, sizeof(err))) {
+		P("conv models fetch: %s\n", err);
+		return 2;
+	}
+	cJSON *o = json ? cJSON_CreateObject() : nullptr;
+	cJSON *arr = o != nullptr ? cJSON_AddArrayToObject(o, "models") : nullptr;
+	if (o != nullptr) {
+		cJSON_AddStringToObject(o, "pack", pack->pack);
+		cJSON_AddStringToObject(o, "store_root", conv_model_store_root(s));
+	} else {
+		P("Pack '%s' (%u models) -> %s\n", pack->pack, pack->model_count, conv_model_store_root(s));
+	}
+	int failed = 0;
+	for (uint32_t i = 0; i < pack->model_count; i++) {
+		const conv_pack_model &m = pack->models[i];
+		const bool wanted = only != nullptr ? strcmp(only, m.name) == 0 : prefetch ? m.prefetch : true;
+		if (!wanted) {
+			continue;
+		}
+		const char *result;
+		if (installer && !m.commercial) {
+			// A signed installer never pre-fetches a non-commercial blob (roadmap §11.1 c).
+			result = "skipped-non-commercial";
+		} else {
+			result = conv_store_blob_result_str(
+			    conv_model_store_fetch_model(s, pack.get(), &m, nullptr, /*skip_stamped=*/installer));
+			if (strcmp(result, "ok") != 0 && strcmp(result, "skipped") != 0) {
+				failed++;
+			}
+		}
+		if (arr != nullptr) {
+			cJSON *e = cJSON_CreateObject();
+			cJSON_AddStringToObject(e, "name", m.name);
+			cJSON_AddStringToObject(e, "result", result);
+			cJSON_AddItemToArray(arr, e);
+		} else {
+			P("  %-28s %s\n", m.name, result);
+		}
+	}
+	if (o != nullptr) {
+		cJSON_AddNumberToObject(o, "failed", failed);
+		char *t = cJSON_Print(o);
+		P("%s\n", t);
+		cJSON_free(t);
+		cJSON_Delete(o);
+	}
+	return failed > 0 ? 2 : 0;
 }
 
 int
 cmd_models(int argc, const char **argv)
 {
-	const char *verb = argc >= 4 ? argv[3] : "list";
-	if (strcmp(verb, "list") != 0 && strcmp(verb, "prune") != 0 && strcmp(verb, "verify") != 0) {
-		P("usage: displayxr-cli conv models list|verify|prune\n");
+	const char *verb = argc >= 4 && argv[3][0] != '-' ? argv[3] : "list";
+	const bool json = cli_has_flag(argc, argv, "--json");
+	if (strcmp(verb, "list") != 0 && strcmp(verb, "prune") != 0 && strcmp(verb, "verify") != 0 &&
+	    strcmp(verb, "fetch") != 0 && strcmp(verb, "init") != 0) {
+		P("usage: displayxr-cli conv models list|verify|prune|init [--json] [--root <dir>]\n"
+		  "       displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n");
 		return 1;
 	}
-	std::string source;
-	const std::string root = model_store_root(source);
-	if (cli_has_flag(argc, argv, "--json")) {
-		cJSON *o = cJSON_CreateObject();
-		cJSON_AddStringToObject(o, "store_root", root.c_str());
-		cJSON_AddStringToObject(o, "source", source.c_str());
-		cJSON_AddArrayToObject(o, "models");
-		cJSON_AddNumberToObject(o, "pruned", 0);
-		char *s = cJSON_Print(o);
-		if (s != nullptr) {
-			P("%s\n", s);
-			cJSON_free(s);
+	char root[512] = "", source[64] = "";
+	if (const char *r = flag_value(argc, argv, "--root")) {
+		snprintf(root, sizeof(root), "%s", r);
+		snprintf(source, sizeof(source), "--root");
+	} else if (!conv_store_root_resolve(root, sizeof(root), source, sizeof(source))) {
+		P("No model store root on this machine.\n");
+		return 1;
+	}
+	struct target_conv_policy policy;
+	target_conv_policy_read(&policy);
+	conv_model_store_config cfg;
+	conv_model_store_config_defaults(&cfg);
+	snprintf(cfg.root, sizeof(cfg.root), "%s", root);
+	const bool installer = cli_has_flag(argc, argv, "--installer");
+	cfg.allow_downloads = true; // an explicit fetch is the user's (or the installer's) own request
+	cfg.allow_research_only = !installer && policy.allow_research_only;
+	if (installer) {
+		snprintf(cfg.nonce, sizeof(cfg.nonce), "installer");
+	}
+	if (strcmp(verb, "fetch") == 0 && !json) {
+		cfg.on_progress = fetch_progress;
+	}
+	store_guard g;
+	if (!conv_model_store_create(&cfg, &g.s)) {
+		P("Could not open the model store at %s\n", root);
+		return 1;
+	}
+
+	if (strcmp(verb, "init") == 0) {
+		const bool ok = conv_model_store_ensure_root(g.s);
+		P("%s %s\n", ok ? "Model store ready:" : "Could not create the model store at", root);
+		return ok ? 0 : 1;
+	}
+	if (strcmp(verb, "fetch") == 0) {
+		return models_fetch(argc, argv, g.s, json);
+	}
+
+	// list / verify / prune: the registered providers' packs.
+	static char packs[XRT_CONV_LOADER_MAX_ENTRIES * XRT_CONV_LOADER_MAX_PACKS][512];
+	const uint32_t np = target_conv_store_registered_packs(packs, XRT_CONV_LOADER_MAX_ENTRIES * XRT_CONV_LOADER_MAX_PACKS);
+	for (uint32_t i = 0; i < np; i++) {
+		(void)conv_model_store_add_pack_file(g.s, packs[i]);
+	}
+	const uint32_t n = conv_model_store_pack_count(g.s);
+
+	if (strcmp(verb, "prune") == 0) {
+		if (n == 0 && !cli_has_flag(argc, argv, "--force")) {
+			// No registered pack: every blob would look unreferenced (e.g. the
+			// open provider is not installed yet, or a browser owns them).
+			P("No registered model pack: nothing pruned (pass --force to delete every blob in %s).\n", root);
+			return 0;
 		}
-		cJSON_Delete(o);
+		uint64_t bytes = 0;
+		const uint32_t deleted = conv_model_store_prune(g.s, &bytes);
+		if (json) {
+			P("{ \"store_root\": \"%s\", \"pruned\": %u, \"bytes\": %llu }\n", root, deleted,
+			  (unsigned long long)bytes);
+		} else {
+			P("Pruned %u blob(s), %s, from %s\n", deleted, mb(bytes).c_str(), root);
+		}
 		return 0;
 	}
-	P("Model store: %s  (%s)\n", root.empty() ? "(none)" : root.c_str(), source.c_str());
-	if (strcmp(verb, "prune") == 0) {
-		P("Nothing to prune: the shared model store and its index arrive in P4 (ADR-053 decision 7).\n");
-	} else {
-		P("No store index yet: model packs (schema 2) arrive in P4 (ADR-053 decision 7).\n");
+
+	std::unique_ptr<conv_pack> p(new conv_pack());
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "store_root", root);
+	cJSON_AddStringToObject(o, "source", source);
+	cJSON *ja = cJSON_AddArrayToObject(o, "packs");
+	if (!json) {
+		P("Model store: %s  (%s)\n", root, source);
+		if (n == 0) {
+			P("No registered model pack (a provider registers one with Packs / packs[]).\n");
+		}
 	}
-	return 0;
+	int bad = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (!conv_model_store_get_pack(g.s, i, p.get())) {
+			continue;
+		}
+		conv_store_pack_summary sum;
+		(void)conv_model_store_pack_summary(g.s, i, &sum);
+		cJSON *jp = cJSON_CreateObject();
+		cJSON_AddItemToArray(ja, jp);
+		cJSON_AddStringToObject(jp, "pack", p->pack);
+		cJSON_AddStringToObject(jp, "provider", p->provider);
+		cJSON_AddStringToObject(jp, "state", sum.state);
+		cJSON_AddStringToObject(jp, "manifest", p->manifest_path);
+		cJSON *jm = cJSON_AddArrayToObject(jp, "models");
+		if (!json) {
+			P("\n%s  [%s]  %u/%u models, %s of %s  (%s)\n", p->pack, sum.state, sum.models_installed, sum.models,
+			  mb(sum.bytes_installed).c_str(), mb(sum.bytes_total).c_str(), p->manifest_path);
+		}
+		for (uint32_t m = 0; m < p->model_count; m++) {
+			const conv_pack_model &pm = p->models[m];
+			cJSON *e = cJSON_CreateObject();
+			cJSON_AddItemToArray(jm, e);
+			cJSON_AddStringToObject(e, "name", pm.name);
+			cJSON_AddStringToObject(e, "task", pm.task);
+			cJSON_AddBoolToObject(e, "commercial", pm.commercial);
+			cJSON_AddBoolToObject(e, "prefetch", pm.prefetch);
+			cJSON *jf = cJSON_AddArrayToObject(e, "files");
+			std::string line;
+			for (uint32_t v = 0; v < pm.variant_count; v++) {
+				for (uint32_t f = 0; f < pm.variants[v].file_count; f++) {
+					const conv_pack_file &pf = pm.variants[v].files[f];
+					conv_store_blob_disk d;
+					conv_model_store_blob_disk(g.s, pf.sha256, &d);
+					const char *st = d.present && d.stamped && d.size == pf.size ? "installed"
+					                 : d.part_bytes > 0                          ? "downloading"
+					                 : d.present                                 ? "unstamped"
+					                                                             : "missing";
+					if (strcmp(verb, "verify") == 0 && d.present) {
+						st = conv_store_blob_result_str(conv_model_store_verify_blob(g.s, pf.sha256, pf.size));
+						bad += strcmp(st, "ok") != 0 ? 1 : 0;
+					}
+					cJSON *x = cJSON_CreateObject();
+					cJSON_AddItemToArray(jf, x);
+					cJSON_AddStringToObject(x, "variant", pm.variants[v].id);
+					cJSON_AddStringToObject(x, "sha256", pf.sha256);
+					cJSON_AddNumberToObject(x, "size", (double)pf.size);
+					cJSON_AddStringToObject(x, "state", st);
+					cJSON_AddNumberToObject(x, "part_bytes", (double)d.part_bytes);
+					line += std::string(line.empty() ? "" : ", ") + pm.variants[v].id + ":" + st;
+				}
+			}
+			if (!json) {
+				P("  %-28s %-16s %-14s %s\n", pm.name, pm.task, pm.commercial ? "commercial" : "NON-COMMERCIAL",
+				  line.c_str());
+			}
+		}
+	}
+	if (json) {
+		cJSON_AddNumberToObject(o, "bad", bad);
+		char *t = cJSON_Print(o);
+		P("%s\n", t);
+		cJSON_free(t);
+	} else if (strcmp(verb, "verify") == 0) {
+		P("\n%s\n", bad == 0 ? "Every blob present hashes to its name." : "Some blobs failed (deleted where allowed).");
+	}
+	cJSON_Delete(o);
+	return bad > 0 ? 1 : 0;
 }
 
 int
@@ -1104,7 +1310,8 @@ usage(void)
 	P("  options <id> [--json]               the provider's settings: key, type, default, value, source (N3c)\n");
 	P("  set <id> <KEY> <value> [--machine]  Settings\\<KEY> on the provider's row (HKCU; --machine = HKLM)\n");
 	P("  unset <id> <KEY> [--machine]        clear it; DXR_CONV_<ID>_<KEY> in the service's env always wins\n");
-	P("  models list|verify|prune [--json]   the model store (P4; prints the resolved root)\n");
+	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
+	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]   write protocol, here\n");
 	P("list/status read the running service over DIAG, else describe providers headless (no model load).\n");
 	return 1;
 }

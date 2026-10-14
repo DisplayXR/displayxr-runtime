@@ -103,6 +103,8 @@ target_link_libraries(
 		# ADR-053 (#2006): `conv list|status` runs the conversion core's
 		# selection headless (conv_select.h names, policy resolution).
 		displayxr::conversion_core
+		# ADR-053 P4 (#2108): `conv models` and the snapshot's model-store rows.
+		displayxr::conversion_store
 	)
 
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
