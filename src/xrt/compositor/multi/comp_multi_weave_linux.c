@@ -42,6 +42,18 @@
  *    (vk_create_exportable_dmabuf_image; driver-picked modifier, or LINEAR
  *    with DXR_WEAVE_OUTPUT_LINEAR=1), described by
  *    comp_multi_weave_export_output_dmabuf.
+ *  - Stage B sync_file fences are switchable: DXR_LINUX_WEAVE_SYNC_FD (tri-state)
+ *    decides whether acquire_sem / release_sem exist at all. Unset = ON, except
+ *    on an NVIDIA service device (vendor 0x10de), where it defaults OFF and stage
+ *    B runs the fallback the engine already has for a device without SYNC_FD
+ *    (acquire fence CPU-polled, synchronous completion, release fd -1). Reason:
+ *    on an RTX 4080 Laptop (driver 595.91.07, GNOME Wayland) the browser's
+ *    inline-3D path ran at ~2 fps with the GPU-process main thread spinning in
+ *    libnvidia-eglcore, and the raw-EGL-fence page path hit VK_ERROR_DEVICE_LOST
+ *    on the first submit; the suspect is the EGL native fence <-> Vulkan
+ *    SYNC_FD hand-off on that driver pair. Mesa (Intel) keeps the fences. `1`
+ *    forces them on (the A/B), `0` forces them off anywhere. The init WARN names
+ *    the path and the reason.
  *  - Output kind: one allocation, one kind. The first submit's path picks it
  *    (dma-buf submit -> dma-buf output, plain -> OPAQUE_FD); an export call of
  *    the other kind records the request, answers "nothing yet" and the next
@@ -134,6 +146,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(dxr_linux_weave_split, "DXR_LINUX_WEAVE_SPLIT", true)
 // {DRM_FORMAT_MOD_LINEAR}: the one layout every importer (EGL on another GPU,
 // the CPU) can read, at the cost of bandwidth on a tiled/compressed-capable GPU.
 DEBUG_GET_ONCE_BOOL_OPTION(dxr_weave_output_linear, "DXR_WEAVE_OUTPUT_LINEAR", false)
+
+// Stage B sync_file fences (tri-state). AUTO (unset) = SYNC_FD semaphores ON,
+// except on an NVIDIA service device (vendor 0x10de), where they are OFF and
+// stage B runs the CPU-poll + synchronous fallback; 1 forces them ON, 0 OFF.
+// See the file header (stage B sync_file fences) for why NVIDIA defaults off.
+DEBUG_GET_ONCE_TRISTATE_OPTION(dxr_linux_weave_sync_fd, "DXR_LINUX_WEAVE_SYNC_FD")
+
+#define WEAVE_VENDOR_ID_NVIDIA 0x10de
 
 /*
  *
@@ -1311,13 +1331,27 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	// Stage B sync_file semaphores (vk_dmabuf.h). Optional: without them the
 	// acquire fence is CPU-polled and completion stays synchronous, so a
 	// failure here is not a failed bring-up.
+	// DXR_LINUX_WEAVE_SYNC_FD gates them: AUTO = off on NVIDIA (file header).
 	const bool sync_fd = vk_dmabuf_sync_fd_supported(vk);
-	if (sync_fd) {
+	const enum debug_tristate_option sync_fd_opt = debug_get_tristate_option_dxr_linux_weave_sync_fd();
+	VkPhysicalDeviceProperties pdp = {0};
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &pdp);
+	const bool is_nvidia = pdp.vendorID == WEAVE_VENDOR_ID_NVIDIA;
+	const char *no_fence_reason = NULL;
+	if (!sync_fd) {
+		no_fence_reason = "none (device lacks SYNC_FD)";
+	} else if (sync_fd_opt == DEBUG_TRISTATE_OFF) {
+		no_fence_reason = "none (CPU poll + synchronous: DXR_LINUX_WEAVE_SYNC_FD=0)";
+	} else if (sync_fd_opt == DEBUG_TRISTATE_AUTO && is_nvidia) {
+		no_fence_reason = "none (CPU poll + synchronous: NVIDIA auto; DXR_LINUX_WEAVE_SYNC_FD=1 forces fences)";
+	}
+	if (no_fence_reason == NULL) {
 		VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 		if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS ||
 		    vk_create_exportable_sync_fd_semaphore(vk, &mc->weave.release_sem) != VK_SUCCESS) {
 			U_LOG_W("weave(#1699): sync_file semaphores could not be created — stage B stays synchronous");
 			weave_destroy_sync_semaphores(vk, mc);
+			no_fence_reason = "none (CPU poll + synchronous: semaphore creation failed)";
 		}
 	}
 
@@ -1327,7 +1361,10 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    "weave(#1699): desktop-Linux weave engine initialized (BGRA8 output; OPAQUE_FD stage A: yes; dma-buf "
 	    "stage B: %s; sync_file fences: %s; DP self-submitting=%d)",
 	    vk_dmabuf_supported(vk) ? "yes" : "NO (device lacks dma-buf / DRM modifier / foreign queue)",
-	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
+	    mc->weave.release_sem != VK_NULL_HANDLE
+	        ? (sync_fd_opt == DEBUG_TRISTATE_ON ? "GPU (SYNC_FD semaphores: DXR_LINUX_WEAVE_SYNC_FD=1)"
+	                                            : "GPU (SYNC_FD semaphores)")
+	        : (no_fence_reason != NULL ? no_fence_reason : "none (CPU poll + synchronous)"),
 	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
 
 	// A hardware 2D request that arrived before this DP existed (the page asked
