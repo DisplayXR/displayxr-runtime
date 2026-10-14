@@ -743,6 +743,27 @@ cdw_done:
 	Pop $0
 FunctionEnd
 
+; #2075: times the client-DLL write has been retried after losing a race.
+Var DxrDllWriteTries
+
+; Poll ClientDllWritable until the DLL is free or ~30 s pass.
+; $R0 = "1" free, "0" still held. Short steps on purpose: a respawned
+; XRDeviceService holds the DLL only while it probes, so the free window is
+; caught as soon as it opens.
+Function ClientDllSettle
+	Push $0
+	StrCpy $0 0
+cds_loop:
+	Call ClientDllWritable
+	StrCmp $R0 "1" cds_done
+	IntOp $0 $0 + 1
+	IntCmp $0 60 cds_done
+	Sleep 500
+	Goto cds_loop
+cds_done:
+	Pop $0
+FunctionEnd
+
 
 ;--------------------------------
 ; Installer Sections
@@ -766,15 +787,25 @@ Section "DisplayXR Runtime" SecRuntime
 	; cascade-uninstall first which handles their lifecycle.
 	Call CloseRuntimeClients
 	StrCpy $R3 0   ; 1 once the silent /CLOSEAPPS attempt has been made
+	StrCpy $R6 0   ; unnamed-holder settle rounds spent (#2075)
+	StrCpy $DxrDllWriteTries 0
 
 dll_check:
 	Call ClientDllWritable
 	StrCmp $R0 "1" dll_writable
 
-	; Give a straggler a second chance -- a process can be gone from the task
-	; list a moment before its image is unmapped.
-	Sleep 3000
-	Call ClientDllWritable
+	; #2075: wait for a hold to SETTLE, not for one fixed 3 s second chance.
+	; Some holds are ones our own sweep just caused, and they last longer than
+	; 3 s. Kill Chrome's XRDeviceService and Chrome respawns it within seconds
+	; while a WebXR page is open. The new one loads the runtime to probe it.
+	; With the service killed, that probe walks the client's no-pipe ->
+	; launch-service -> wait-for-pipe path (IPC_CONNECT_STARTING_TOTAL_MS plus
+	; the launch wait, ~10 s), then unloads the DLL. The old one-shot retry
+	; landed inside that window and aborted the bundle with code 6, though
+	; nothing held the DLL a few seconds later. Poll for up to 30 s; a real
+	; foreign holder still falls through to the naming/prompt path below.
+	DetailPrint "Waiting for DisplayXRClient.dll to be released..."
+	Call ClientDllSettle
 	StrCmp $R0 "1" dll_writable
 
 	; A holder we do NOT own is still running: a Unity editor, a customer app,
@@ -786,6 +817,17 @@ dll_check:
 	; forever.
 	Call FilesInUseList   ; $R1 = holder lines, $R2 = count
 	${If} $R2 == 0
+		; Restart Manager names nobody. The likeliest reason is that the hold
+		; ended between our check and RM's (#2075), so check again, and give
+		; the settle window one more round before blaming a program.
+		Call FilesInUseEnd
+		Call ClientDllWritable
+		StrCmp $R0 "1" dll_writable
+		${If} $R6 < 1
+			IntOp $R6 $R6 + 1
+			DetailPrint "DisplayXRClient.dll is busy, but no program is named as holding it -- waiting for it to settle..."
+			Goto dll_check
+		${EndIf}
 		StrCpy $R1 "  - (Windows did not say which program. Close every OpenXR application, including any web browser that has shown a WebXR page.)"
 	${EndIf}
 	DetailPrint "DisplayXRClient.dll is in use by:"
@@ -842,6 +884,14 @@ dll_writable:
 	ClearErrors
 	File "${BIN_DIR}\DisplayXRClient.dll"
 	IfErrors 0 client_dll_ok
+	; #2075: a respawned probe can re-map the DLL between the writability
+	; proof and this write. Nothing has been written yet, so go back to the
+	; check (bounded) rather than fail a transient race as "broken".
+	${If} $DxrDllWriteTries < 3
+		IntOp $DxrDllWriteTries $DxrDllWriteTries + 1
+		DetailPrint "DisplayXRClient.dll was re-opened by another process mid-write -- checking again (attempt $DxrDllWriteTries)..."
+		Goto dll_check
+	${EndIf}
 	SetErrorLevel 2
 	DetailPrint "FATAL: failed to write DisplayXRClient.dll."
 	MessageBox MB_OK|MB_ICONSTOP "DisplayXR could not replace DisplayXRClient.dll.$\n$\nInstallation has been stopped rather than leave a runtime whose client and service are different builds." /SD IDOK
