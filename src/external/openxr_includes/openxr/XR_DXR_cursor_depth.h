@@ -90,6 +90,19 @@
  * views and uses the nearest CONFIDENT disparity under the cursor. No new
  * struct; the same per-frame XrCursorDepthSourceDXR request.
  *
+ * Spec v8 (ADR-046 Amendment 4) lets the runtime draw the cursor on EVERY
+ * woven rect whose caller supplies a depth, not only lifted ones - the web
+ * page's cursor in the DisplayXR Browser. The weave caller chains
+ * @ref XrCursorDepthWeaveRequestDXR on XrWeaveSubmitInfoDXR::next: per rect,
+ * the on-screen disparity (device pixels) of the nearest content under the
+ * pointer, and once, the sprite (the cursor the browser would have shown: an
+ * OS cursor handle or a small texture). The runtime reads the pointer itself
+ * inside the submit, applies the one policy (v4) with the HYBRID anchor, the
+ * crosstalk softening, and draws per view before the weave. It reports what it
+ * drew in @ref XrCursorDepthWeaveStateDXR on XrWeaveOutputDXR::next, including
+ * the window pixels the sprite covers, so the caller hides its OS cursor
+ * exactly there. New structs only; XR_DXR_weave is required.
+ *
  * One call, one space. The hint is chained on XrViewLocateInfo::next and the
  * result on XrViewState::next of the SAME xrLocateViews call, and both are in
  * XrViewLocateInfo::space. The hint normally comes from the previous frame's
@@ -106,13 +119,15 @@
 #define XR_DXR_CURSOR_DEPTH_H 1
 
 #include <openxr/openxr.h>
+// Spec v8: the weave-rect structs name XrWeaveHandleKindDXR.
+#include <openxr/XR_DXR_weave.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define XR_DXR_cursor_depth 1
-#define XR_DXR_cursor_depth_SPEC_VERSION 7
+#define XR_DXR_cursor_depth_SPEC_VERSION 8
 #define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
 
 // Reserved 1004999320-329 (next free decade after stereo_camera's 310-319).
@@ -129,6 +144,9 @@ extern "C" {
 //! Spec v6 (ADR-046 Amendment 1, Phase 3c: the runtime-drawn cursor on lifted content).
 #define XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR ((XrStructureType)1004999326)
 #define XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR ((XrStructureType)1004999327)
+//! Spec v8 (ADR-046 Amendment 4: the runtime draws the web cursor on any weave rect).
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR ((XrStructureType)1004999328)
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR ((XrStructureType)1004999329)
 
 // ---- Input: app chains this on XrViewLocateInfo::next; runtime reads it. ----
 
@@ -471,6 +489,123 @@ typedef struct XrCursorDepthLiftStateDXR {
      */
     uint32_t drawnLiftMask;
 } XrCursorDepthLiftStateDXR;
+
+// ---- Spec v8: the runtime draws the cursor on any weave rect (ADR-046 Amendment 4). ----
+//
+// The weave caller (the DisplayXR Browser's GPU process) supplies the depth
+// under the pointer per rect, as the page measured it, and the cursor it would
+// have shown. The runtime does everything else: reads the pointer at draw time
+// (GetCursorPos inside the submit), applies the one policy (v4) with the HYBRID
+// anchor, softens it against crosstalk and draws it into every view of the
+// rect before the display processor weaves.
+
+/*!
+ * @brief Where the sprite comes from (spec v8).
+ */
+typedef enum XrCursorDepthWeaveSpriteKindDXR {
+    //! Unchanged since @c generation: no payload. If the runtime does not hold
+    //! that generation (it reports a different XrCursorDepthWeaveStateDXR::
+    //! spriteGeneration), it draws the default look until the caller resends.
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR = 0,
+    //! The runtime's default look (ADR-046 Amendment 2 A.6).
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR = 1,
+    //! The page hides its cursor (CSS `cursor: none`): draw nothing, report not drawn.
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_NONE_DXR = 2,
+    //! @c osCursor is an HCURSOR (Windows). Session-wide USER object: the caller
+    //! keeps it alive while it is the advertised sprite. The runtime rasterises
+    //! it at the bound window's DPI exactly as the native default look does.
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR = 3,
+    //! @c texture is a shared premultiplied, sRGB-encoded RGBA8 texture of
+    //! @c textureKind, @c extent px (<= 256 x 256), hotspot @c hotSpotPx.
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR = 4,
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrCursorDepthWeaveSpriteKindDXR;
+
+/*!
+ * @brief The cursor image (spec v8). A plain member, not chainable.
+ *
+ * Send the payload only when the cursor changes, under a new @c generation;
+ * on every other submit send XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR with the
+ * current generation.
+ */
+typedef struct XrCursorDepthWeaveSpriteDXR {
+    XrCursorDepthWeaveSpriteKindDXR kind;
+    uint64_t             generation;   //!< bumps on every change (> 0); KEEP refers to it
+    uint64_t             osCursor;     //!< OS_CURSOR: the HCURSOR
+    void*                texture;      //!< TEXTURE: a shared handle of @c textureKind
+    XrWeaveHandleKindDXR textureKind;  //!< TEXTURE: D3D11_NT / D3D11_DXGI / PLATFORM_DEFAULT (= NT)
+    XrExtent2Di          extent;       //!< TEXTURE: px (<= 256 x 256)
+    XrVector2f           hotSpotPx;    //!< TEXTURE: px from the top-left
+    //! Sprite height on the panel at the glass, metres. <= 0: image px x panel
+    //! pitch (OS_CURSOR / DEFAULT: the OS cursor's size at the window's DPI).
+    float                sizeMeters;
+} XrCursorDepthWeaveSpriteDXR;
+
+/*!
+ * @brief The depth under the pointer for one weave rect (spec v8). A plain
+ * member, not chainable.
+ */
+typedef struct XrCursorDepthWeaveRectDXR {
+    uint32_t   rectIndex;   //!< into this submit's XrWeaveSubmitRectsDXR::rects
+    //! XR_FALSE: the pointer is over the element but nothing 3D lies under the
+    //! cursor footprint (the cursor settles onto the glass: the OS cursor).
+    XrBool32   hasContent;
+    /*!
+     * On-screen disparity, in device (panel) pixels, between the two outermost
+     * views the caller rendered, of the NEAREST content under the cursor
+     * footprint. Signed: < 0 = crossed = in front of the glass. Raw content
+     * disparity, not a target: margin, clamp, threshold and smoothing are the
+     * runtime's (v4). The runtime converts it with the tracked eyes:
+     * d = disparityPx x pitch / eye baseline.
+     */
+    float      disparityPx;
+    XrVector2f sampleUV;    //!< where the page sampled it, rect-normalised, v down (diagnostic)
+    uint32_t   flags;       //!< reserved, must be 0
+} XrCursorDepthWeaveRectDXR;
+
+/*!
+ * @brief "Runtime, draw the cursor on these rects" (spec v8).
+ *
+ * Chain on XrWeaveSubmitInfoDXR::next. Chaining it IS the per-submit request
+ * (ADR-046 section 0): a submit without it does no cursor work, holds no sprite
+ * and sends nothing extra. Requires XrWeaveSubmitRectsDXR (rects are indexed
+ * into it). The runtime draws at most one cursor per window: on the rect the
+ * LIVE pointer is in that carries an entry, the topmost (last in submit order)
+ * when rects overlap. A rect's depth stays valid for 500 ms after the last
+ * submit that carried it (a re-weave with no new page frame keeps it), so the
+ * caller may omit an unchanged entry within that window.
+ *
+ * A frame with a request never takes the v6 zero-copy path.
+ */
+typedef struct XrCursorDepthWeaveRequestDXR {
+    XrStructureType                  type;   //!< Must be XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR
+    const void* XR_MAY_ALIAS         next;
+    XrCursorDepthWeaveSpriteDXR      sprite; //!< also the sprite of lifted rects' cursors (from W3)
+    uint32_t                         rectCount; //!< 0..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
+    const XrCursorDepthWeaveRectDXR* rects;
+} XrCursorDepthWeaveRequestDXR;
+
+/*!
+ * @brief What the runtime drew for a request (spec v8).
+ *
+ * Chain on XrWeaveOutputDXR::next of a submit that chained
+ * XrCursorDepthWeaveRequestDXR; filled on every successful such submit.
+ * Hide the OS cursor while the pointer lies inside @c drawnBounds of a fresh
+ * state with a non-zero mask, and show it otherwise: the failure mode is the
+ * flat OS cursor, never no cursor. The runtime clears the mask two frames
+ * BEFORE it stops drawing a cursor that sinks to the glass (it keeps drawing
+ * meanwhile), so the hand-back never shows no cursor.
+ */
+typedef struct XrCursorDepthWeaveStateDXR {
+    XrStructureType    type;   //!< Must be XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR
+    void* XR_MAY_ALIAS next;
+    //! Bit i = drawn into rects[i] of XrWeaveSubmitRectsDXR in the output just woven.
+    uint32_t           drawnRectMask;
+    //! The sprite generation the runtime now holds (0 = none, or the default look).
+    uint64_t           spriteGeneration;
+    //! Window (client) px the drawn sprite covers, over all views; 0 when none.
+    XrRect2Di          drawnBounds;
+} XrCursorDepthWeaveStateDXR;
 
 #ifdef __cplusplus
 }
