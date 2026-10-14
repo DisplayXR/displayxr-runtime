@@ -86,6 +86,75 @@ struct xrt_weave_atlas_layout
 };
 
 /*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): most rects one weave cursor
+ * request carries (XR_WEAVE_SUBMIT_MAX_RECTS_DXR).
+ */
+#define XRT_WEAVE_CURSOR_MAX_RECTS 32
+
+/*!
+ * One rect's depth under the pointer (XrCursorDepthWeaveRectDXR). POD: it
+ * rides the IPC wire as is.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_rect
+{
+	uint32_t rect_index;  //!< into the submit's rects
+	uint32_t has_content; //!< 0 = nothing 3D under the pointer
+	float disparity_px;   //!< device px between the outermost views, < 0 = in front
+	float sample_u;       //!< diagnostic: where the page sampled it (rect-normalised)
+	float sample_v;
+	uint32_t flags; //!< reserved, 0
+};
+
+/*!
+ * The weave-rect cursor request of the NEXT weave submit
+ * (XrCursorDepthWeaveRequestDXR, the sprite without its texture handle -
+ * that rides weave_cursor_sprite_texture). POD for the IPC wire.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_request
+{
+	uint32_t sprite_kind; //!< XrCursorDepthWeaveSpriteKindDXR value
+	uint32_t rect_count;  //!< 0..XRT_WEAVE_CURSOR_MAX_RECTS
+	uint64_t sprite_generation;
+	uint64_t os_cursor; //!< OS_CURSOR: the HCURSOR
+	float size_m;       //!< <= 0: image px x panel pitch
+	uint32_t reserved;
+	struct xrt_weave_cursor_rect rects[XRT_WEAVE_CURSOR_MAX_RECTS];
+};
+
+/*!
+ * The texture carrier's description (XrCursorDepthWeaveSpriteDXR with kind
+ * TEXTURE); the shared handle travels beside it. Sent only on a sprite change.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_sprite_texture
+{
+	uint64_t generation;
+	uint32_t width, height; //!< px, <= 256 x 256
+	float hot_x, hot_y;     //!< hotspot, px from the top-left
+	float size_m;           //!< <= 0: image px x panel pitch
+	uint32_t is_dxgi;       //!< Windows: legacy global DXGI handle (else NT)
+};
+
+/*!
+ * What the runtime drew for the last weave submit's cursor request
+ * (XrCursorDepthWeaveStateDXR).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_state
+{
+	uint32_t drawn_rect_mask; //!< bit i = drawn into the submit's rects[i]
+	uint32_t reserved;
+	uint64_t sprite_generation; //!< the sprite the runtime holds, 0 = none
+	int32_t bounds_x, bounds_y, bounds_w, bounds_h; //!< window px the sprite covers; 0 if none
+};
+
+/*!
  * Window metrics for adaptive FOV calculation and eye position adjustment.
  *
  * Contains display and window geometry needed to compute window-adaptive

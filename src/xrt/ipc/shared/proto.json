@@ -756,6 +756,25 @@
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},
 
+	"weave_cursor_request": {
+		"in": [
+			{"name": "req", "type": "struct xrt_weave_cursor_request"}
+		]
+	},
+
+	"weave_cursor_sprite_texture": {
+		"in": [
+			{"name": "info", "type": "struct xrt_weave_cursor_sprite_texture"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"weave_cursor_state": {
+		"out": [
+			{"name": "state", "type": "struct xrt_weave_cursor_state"}
+		]
+	},
+
 	"weave_get_output": {
 		"out": [
 			{"name": "have_output", "type": "bool"},

@@ -375,6 +375,27 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
                                            xrt_graphics_sync_handle_t *out_handle);
 
 /*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): stage the weave-rect cursor
+ * request of the NEXT weave_submit on this connection. Sent only by a submit
+ * that chained XrCursorDepthWeaveRequestDXR (zero cost otherwise).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v8: hand over the texture carrier of a new sprite
+ * generation (the handle is copied, not consumed). Sent on a sprite change only.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info);
+
+//! XR_DXR_cursor_depth v8: what the last weave_submit's cursor request drew.
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
+
+/*!
  * Workspace controller bridges (XR_DXR_spatial_workspace).
  *
  * Thin accessors used by the OpenXR state tracker to dispatch workspace

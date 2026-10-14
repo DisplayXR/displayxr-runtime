@@ -7600,6 +7600,105 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 #endif
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the weave-rect cursor. The
+ * request is staged for the NEXT weave_submit on this connection (one
+ * connection = one thread, so the submit that follows is the one it belongs
+ * to); the state reports what that submit drew. Only a caller that chained
+ * XrCursorDepthWeaveRequestDXR sends any of these (ADR-046 section 0).
+ *
+ */
+
+static_assert(sizeof(struct ipc_weave_cursor_request_msg) <= IPC_BUF_SIZE,
+              "weave_cursor_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_weave_cursor_request(volatile struct ipc_client_state *ics, const struct xrt_weave_cursor_request *req)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_request");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	comp_d3d11_service_weave_set_cursor_request(ics->xc, req);
+	return XRT_SUCCESS;
+#else
+	// No weave-rect cursor drawer on this platform yet (macOS, desktop Linux,
+	// Android): the state reports nothing drawn, the caller keeps its fallback.
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_cursor_sprite_texture(volatile struct ipc_client_state *ics,
+                                       const struct xrt_weave_cursor_sprite_texture *info,
+                                       const xrt_graphics_buffer_handle_t *handles,
+                                       uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_sprite_texture");
+	if (auth != XRT_SUCCESS || ics->xc == NULL || handle_count < 1) {
+		weave_submit_release_handles(handles, handle_count);
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		for (uint32_t i = 0; i < handle_count; i++) {
+			if (handles[i] != NULL && ((size_t)handles[i] & 1) == 0) {
+				CloseHandle(handles[i]); // an NT handle duplicated into us
+			}
+		}
+#endif
+		return auth != XRT_SUCCESS ? auth
+		                           : (ics->xc == NULL ? XRT_ERROR_IPC_SESSION_NOT_CREATED : XRT_ERROR_IPC_FAILURE);
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	xrt_graphics_buffer_handle_t h = handles[0];
+	bool is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	if ((size_t)h & 1) {
+		h = (HANDLE)((size_t)h - 1);
+		is_dxgi = true;
+	}
+	for (uint32_t i = 1; i < handle_count; i++) {
+		if (handles[i] != NULL && ((size_t)handles[i] & 1) == 0) {
+			CloseHandle(handles[i]);
+		}
+	}
+#endif
+	// The compositor takes ownership of h (closes it once imported or replaced).
+	comp_d3d11_service_weave_set_cursor_sprite_texture(ics->xc, h, is_dxgi, info);
+	return XRT_SUCCESS;
+#else
+	(void)info;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_cursor_state(volatile struct ipc_client_state *ics, struct xrt_weave_cursor_state *out_state)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_state);
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_state");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	comp_d3d11_service_weave_get_cursor_state(ics->xc, out_state);
+#endif
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
                             bool *out_have_output,

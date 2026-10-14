@@ -3361,6 +3361,9 @@ struct oxr_session
 		uint32_t last_h;
 		bool warned_export_miss;
 		bool warned_export_recovered;
+		//! XR_DXR_cursor_depth v8: the texture-carrier generation last handed
+		//! to the service (sent again only when it changes).
+		uint64_t cursor_tex_generation_sent;
 	} weave;
 #endif
 
