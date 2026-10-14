@@ -294,7 +294,7 @@ Numbers from the same box as the measured-state table above, every window 1:1 on
 | lever | Linux state after today | benefit measured | cost measured | recommendation |
 |---|---|---|---|---|
 | Repaint (#868) | shipped in v2.42.0 (layer); enable2 injected, enable1 opt-in (#2069 merged) | +~19 pose-fresh weaves/s for a 30 Hz app | +10 pts core, +2 pts GPU while filling; 0 at full rate | **keep, as shipped**; make enable1 default via the in-process env route later (#2063) |
-| Late weave, present_wait path (enable2) | PR #2068, default on | residual 0.90 period at 60 Hz (Unity) | none (59–60/s on and off) | **merge #2068** |
+| Late weave, present_wait path (enable2) | PR #2068, default on | residual 0.90 period at 60 Hz (Unity) | none (59–60/s on and off) — **but see #2119: that run was on the direct-scanout path; a composited window at depth 1 runs at half rate** | **merge #2068**; depth governed by #2119 |
 | Late weave, measured-grid path | PR #2068, opt-in, self-off | none on GNOME (no slack inside a period) | none when off | leave opt-in; only direct scanout / `VK_EXT_present_timing` (#2061) change this |
 | Feedback pacing for enable1 (#2077) | stacked PR, opt-in | −0.35 period (~6 ms) | −8 % present rate | **not by default**; revisit with p95 residuals |
 | Split weave / weave-on-scanout | not built on Linux (#2065 L, #2066 L) | n/a on single-GPU Intel (every Lenovo target) | large build | **do not build for Lenovo**; NVIDIA-laptop decision, measure there first |
@@ -329,6 +329,22 @@ The hypothesis from #2068's author: the native app's residual came from running 
 | paced, latency 2 | 55–57 (no cost) | 1.37 periods | 74 % / 34 % |
 
 Reading: the early 2.5–3.1-period native readings were start-up transients (n = 1…138); warm, the unpaced native app sits at ~0.9 periods like Unity. Pacing at latency 1 trims ~0.35 period (~6 ms) and costs ~8 % of the frames on this iGPU; latency 2 costs nothing and gains nothing. Verdict: **marginal — keep opt-in**; worth revisiting only with a distribution (p95) rather than last-sample residuals, which the PR will log next.
+
+### #2119: depth-1 present_wait pacing halves a composited window (2026-10-14, ds1-linux)
+
+Reproduced without a panel: the same RC2 Unity player (native Wayland), runtime 2.43.4 + sim-display claiming the laptop panel (`DXR_PLUGIN_EXCLUSIVE=sim-display SIM_DISPLAY_FAKE_TRACKING=1`), GNOME 50 Wayland, Intel PTL (xe); 30 s per arm, `DXR_FRAME_WITNESS=5` (present/s = app frames, repaint 0), GPU busy from fdinfo.
+
+| arm | pacing log line | present/s median (min–max) | player CPU | player GPU |
+|---|---|---|---|---|
+| late weave on (default) | `pacing on present id N-0 … MAX_LATENCY=1` | **30.0** (28.8–35.6) | 59 % | 19.5 % |
+| `DXR_LATE_WEAVE=0` | — | 55.5 (50.4–60.0) | 78 % | 19.0 % |
+| **`DXR_LATE_WEAVE_MAX_LATENCY=2`** | `pacing on present id N-1 … MAX_LATENCY=2` | **58.0** (52.8–60.0) | 77 % | 20.8 % |
+| late weave on, GPU clock pinned 2.5 GHz | N-0 | 33.6 (29.8–39.9) | 62 % | 9.8 % |
+| `DXR_LATE_WEAVE=0`, clock pinned | — | 58.1 (56.7–60.0) | 80 % | 15.8 % |
+
+Mechanism: the present_wait tier blocks until the previous present is on glass; Mesa resolves that from `wp_presentation.presented`, and GNOME shows a windowed commit about two refreshes later, so with no frame of overlap the loop is render → weave → present → wait ~2 periods (60/2 = 30 fps). The 2026-10-13 59–60 reading was on the Odyssey's fullscreen opaque-region path (direct scanout, 1-period presents). Re-runs show the lag is not even constant per desktop: across identical depth-1 arms the window ran at ~30 in four runs and ~60 in one, and inside one run the 5 s windows alternated 59, 34, 97, 60, 61, 60, 58, 24, 98, 61 — mutter's dynamic double/triple buffering flipping the lag between 1 and 2 periods, with our own pacing feeding back into it. Byungju's 41 (Meteor Lake) and 34–39 (NVIDIA) fit the same mechanism with a different mix.
+
+**Decision:** no per-OS default. The present_wait tier's depth is governed from measurements (base 1, ceiling 4): effective depth = max(commit-to-glass lag floor, slip level). The lag floor rises fast (EMA ≥ floor + 0.5 periods) and falls only after a 30 s calm dwell that doubles on a failed probe; the slip level is the shared `comp_feedback_pace.h` machine. Depth 2 is cheap — the #206 weave→scanout horizon measured the same at depth 1 and 2. `DXR_LATE_WEAVE_MAX_LATENCY` pins the depth, `DXR_LATE_WEAVE_AUTOBACKOFF=0` holds 1. Reference: `docs/reference/motion-to-photon-levers.md` § *present_wait depth governor*.
 
 ### GPU governor finding (Intel xe, PTL)
 With the governor free, the native app's light load lets the GPU park at its 400 MHz efficient floor for long stretches (20–25 presents/s with a tracked viewer) and in other sessions run at 2.5 GHz (55–58/s); the Unity app's heavier load keeps the clock up. Pinning `min_freq` to 2500 removes the variance. For any native app on Intel this is a product issue in its own right (a GPU-busy hint / `VK_EXT_global_priority` / a workload floor), independent of the levers.

@@ -312,6 +312,7 @@ dxr_acquire_timeout_ns(void)
 #include "comp_vk_native_present_feedback.h"
 #include "util/comp_late_weave_adapt.h"
 #include "util/comp_feedback_pace.h"
+#include "util/comp_late_weave_depth.h"
 
 struct comp_vk_native_target;
 static void
@@ -358,11 +359,25 @@ target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd,
  * runs inside one refresh interval and the FIFO queue stays empty.
  */
 
-// #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1). N>1 paces on the
+// #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..4, default 1). N>1 paces on the
 // present N-1 back, restoring N-1 frames of CPU/GPU overlap on a saturated
 // pipeline at the cost of that much extra weave-time prediction horizon.
-// (The DXGI paths additionally auto-back-off on measured saturation; the VK
-// pacer honors the explicit knob only for now.)
+// (The DXGI paths auto-back-off on measured saturation in
+// comp_weave_latency_win.h. On desktop Linux the present_wait pacer derives
+// its depth from measurements since #2119 — max(commit-to-glass lag floor,
+// slip level), util/comp_late_weave_depth.h + util/comp_feedback_pace.h — and
+// an explicit value here pins the depth for the session. The Windows VK pacer
+// still honours the knob only.)
+#ifdef XRT_OS_LINUX_DESKTOP
+//! True when DXR_LATE_WEAVE_MAX_LATENCY was set (non-empty) in the environment.
+static bool
+vk_late_weave_max_latency_explicit()
+{
+	const char *e = getenv("DXR_LATE_WEAVE_MAX_LATENCY");
+	return e != nullptr && e[0] != '\0';
+}
+#endif
+
 static int
 vk_late_weave_max_latency()
 {
@@ -684,6 +699,31 @@ struct comp_vk_native_target
 	uint32_t present_wait_timeouts;
 	uint64_t present_id_counter;
 	uint64_t last_present_id;
+	/*!
+	 * #2119: the present_wait tier's depth governor. effective depth =
+	 * max(commit-to-glass lag floor, slip level), base 1, ceiling 4:
+	 * pw_pace is the shared slip machine (comp_feedback_pace.h), pw_lag the
+	 * measured floor fed to it (comp_late_weave_depth.h). Pinned by an
+	 * explicit DXR_LATE_WEAVE_MAX_LATENCY, held at 1 by AUTOBACKOFF=0.
+	 */
+	struct comp_fb_pace pw_pace;
+	struct comp_lw_lag pw_lag;
+	bool pw_pace_inited;
+	bool pw_governing;
+	//! A correlated wp_presentation sample arrived: the lag comes from the
+	//! feeder from now on, not from present_wait returns.
+	bool pw_lag_from_feedback;
+	uint64_t pw_last_frame_ns;
+	uint64_t pw_depth_log_ns;
+	uint32_t pw_depth_log_suppressed;
+	uint32_t pw_depth_changes;
+	//! #2119/#867: xrWaitFrame return (mark) and the EMA of mark -> weave
+	//! start, the app-side half of the lookahead once depth > 1.
+	uint64_t pw_wait_frame_ns;
+	double pw_wait_to_weave_ema_ns;
+	//! vkQueuePresentKHR return per present id (id % 8, keyed by
+	//! present_weave_ring_id) — the commit time for the present_wait lag.
+	uint64_t present_commit_ring_ns[8];
 	//! Weave start per present id (id % 8), for the residual at wait return.
 	uint64_t present_weave_ring_id[8];
 	uint64_t present_weave_ring_ns[8];
@@ -2507,6 +2547,60 @@ target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd,
 }
 
 /*!
+ * #2119: the present_wait tier's effective depth (1 until the governor runs).
+ */
+static int
+target_pw_depth(const struct comp_vk_native_target *target)
+{
+	return target->pw_pace_inited ? comp_fb_pace_effective(&target->pw_pace) : 1;
+}
+
+/*!
+ * #2119: one WARN per effective-depth change, throttled to one per 2 s with a
+ * suppressed count, naming the signal that drove it. A silent depth change
+ * would make A/B numbers non-reproducible (the Windows governor's rule).
+ */
+static void
+target_pw_log_change(struct comp_vk_native_target *target, int from, const char *why, uint64_t now_ns)
+{
+	target->pw_depth_changes++;
+	if (target->pw_depth_log_ns != 0 && now_ns - target->pw_depth_log_ns < 2ULL * 1000 * 1000 * 1000) {
+		target->pw_depth_log_suppressed++;
+		return;
+	}
+	const uint64_t period_ns = target->vblank_grid.period_ns;
+	U_LOG_W(
+	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag %.2f ms = %.2f periods -> floor %d, "
+	    "slip level %d, period %.3f ms, probe dwell %llu s; change #%u, %u suppressed since last line)",
+	    from, target_pw_depth(target), why, target->pw_lag.ema_ns / 1e6,
+	    period_ns != 0 ? target->pw_lag.ema_ns / (double)period_ns : 0.0, target->pw_lag.depth,
+	    target->pw_pace.depth, period_ns / 1e6, (unsigned long long)(target->pw_pace.dwell_ns / 1000000000ULL),
+	    target->pw_depth_changes, target->pw_depth_log_suppressed);
+	target->pw_depth_log_suppressed = 0;
+	target->pw_depth_log_ns = now_ns;
+}
+
+/*!
+ * #2119: feed one commit-to-glass sample to the lag floor (signal a). Inert
+ * unless the governor runs (present_wait tier live, no explicit depth,
+ * auto-backoff on).
+ */
+static void
+target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint64_t now_ns)
+{
+	if (!target->pw_governing || target->present_wait_latched_off) {
+		return;
+	}
+	const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
+	if (comp_lw_lag_on_sample(&target->pw_lag, lag_ns, period_ns, now_ns)) {
+		const int from = target_pw_depth(target);
+		if (comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth, now_ns)) {
+			target_pw_log_change(target, from, "commit-to-glass lag", now_ns);
+		}
+	}
+}
+
+/*!
  * #902 desktop Linux: drain the window system's presentation feedback into the
  * vblank grid. Non-blocking (see comp_vk_native_present_feedback_poll); the
  * decisions — vsync only, discards counted, timebase guard, period from the
@@ -2595,6 +2689,12 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 			// aimed frames that take one vblank more are misses.
 			const uint64_t period = target->vblank_grid.period_ns;
 			const uint64_t commit = target->pf_ring[tag % 16].commit_ns;
+			// #2119: the same commit-to-glass span is the present_wait
+			// tier's lag floor — exact here (compositor timestamps).
+			if (commit != 0 && !s->discarded && s->present_ns > commit) {
+				target->pw_lag_from_feedback = true;
+				target_pw_note_lag(target, s->present_ns - commit, now_ns);
+			}
 			if (commit != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
 				const enum comp_lw_adapt_event e =
 				    comp_lw_lead_observe(&target->lw_lead, commit, s->present_ns, aimed != 0, period,
@@ -3227,6 +3327,10 @@ comp_vk_native_target_mark_wait_frame(struct comp_vk_native_target *target)
 #ifdef XRT_OS_WINDOWS
 	(void)target;
 	g_lw_gov_vk_bridge.on_wait_frame(); // #912: governor owns the EMAs now
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	if (target != NULL) {
+		target->pw_wait_frame_ns = os_monotonic_get_ns();
+	}
 #else
 	(void)target;
 #endif
@@ -3267,6 +3371,20 @@ comp_vk_native_target_get_predicted_lookahead_ns(struct comp_vk_native_target *t
 #ifdef XRT_OS_WINDOWS
 	return late_weave_lookahead_ns(g_lw_gov_vk_bridge.wait_to_weave_ema_ns, target->measured_r_ns,
 	                               target->period_hint_ns);
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	/*
+	 * #2119: at present_wait depth > 1 the app runs depth-1 frames further
+	 * ahead of glass, so the period x 2 constant (right for an app keeping up
+	 * at depth 1) under-predicts. Use the measured form the Windows paths use
+	 * (#867): xrWaitFrame -> weave start, plus the measured weave -> scanout
+	 * residual. At depth 1 keep the constant (0 = caller's fallback): that
+	 * case is unchanged by #2119.
+	 */
+	if (target == NULL || target_pw_depth(target) <= 1) {
+		return 0;
+	}
+	return late_weave_lookahead_ns(target->pw_wait_to_weave_ema_ns, target->residual_ns,
+	                               (double)comp_vk_native_target_vblank_period_ns(target));
 #else
 	(void)target;
 	return 0;
@@ -3854,12 +3972,63 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 	if (target->last_present_id != 0) {
 		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
 		if (wait_fn != nullptr) {
-			const uint64_t relax = (uint64_t)(vk_late_weave_max_latency() - 1);
-			const uint64_t wait_id = target->last_present_id > relax ? target->last_present_id - relax : 0;
+			// #2119: the depth comes from the governor — max(commit-to-glass
+			// lag floor, slip level), base 1 — unless DXR_LATE_WEAVE_MAX_LATENCY
+			// pins it or DXR_LATE_WEAVE_AUTOBACKOFF=0 holds it at the base.
+			const bool lat_explicit = vk_late_weave_max_latency_explicit();
+			if (!target->pw_pace_inited) {
+				target->pw_pace_inited = true;
+				target->pw_governing = !lat_explicit && dxr_late_weave_autobackoff();
+				comp_fb_pace_init(&target->pw_pace, vk_late_weave_max_latency(), target->pw_governing);
+				// The slip machine's "never resolved -> off" rule is for
+				// feedback pacing; this tier has its own latch (below), and a
+				// composited window's first depth-1 frames are all slips.
+				target->pw_pace.ever_ok = true;
+				comp_lw_lag_init(&target->pw_lag);
+			}
+			const int depth = target_pw_depth(target);
+			const uint64_t relax = (uint64_t)(depth - 1);
+			const uint64_t wait_id = comp_fb_pace_wait_target(&target->pw_pace, target->last_present_id);
 			if (wait_id != 0) {
+				const uint64_t wait_t0 = os_monotonic_get_ns();
 				const VkResult wres =
 				    wait_fn(vk->device, target->swapchain, wait_id, 100ull * 1000 * 1000);
 				const uint64_t now_ns = os_monotonic_get_ns();
+				if (wres != VK_SUCCESS) {
+					// Occluded / not reaching glass: not saturation.
+					target->pw_last_frame_ns = 0;
+				} else if (target->pw_governing) {
+					// (a) lag floor where the feeder cannot correlate per
+					// present (X11, no wp_presentation): a wait that blocked
+					// returned at glass (+ wake-up), so now − commit is the lag.
+					// A wait that did not block says only "already on glass".
+					const uint64_t commit = (target->present_weave_ring_id[wait_id % 8] == wait_id)
+					                            ? target->present_commit_ring_ns[wait_id % 8]
+					                            : 0;
+					if (!target->pw_lag_from_feedback && commit != 0 && now_ns > commit &&
+					    now_ns - wait_t0 > 200ULL * 1000) {
+						target_pw_note_lag(target, now_ns - commit, now_ns);
+					}
+					// (b) slip level: a paced frame interval over 1.55
+					// periods is a vsync-doubled frame (Windows slip test).
+					const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
+					const uint64_t dt =
+					    target->pw_last_frame_ns != 0 ? now_ns - target->pw_last_frame_ns : 0;
+					if (period_ns != 0 && dt != 0 && dt < 250ULL * 1000 * 1000) {
+						const int from = target_pw_depth(target);
+						const enum comp_fb_pace_event e = comp_fb_pace_on_wait(
+						    &target->pw_pace, !comp_lw_lag_is_slip(dt, period_ns),
+						    now_ns - wait_t0, now_ns);
+						if (target_pw_depth(target) != from) {
+							target_pw_log_change(target, from,
+							                     e == COMP_FB_PACE_DEEPER
+							                         ? "saturation: slip-rate escalation"
+							                         : "return probe",
+							                     now_ns);
+						}
+					}
+					target->pw_last_frame_ns = now_ns;
+				}
 				if (wres == VK_SUCCESS) {
 					target->present_wait_timeouts = 0;
 					target->present_wait_ever_ok = true;
@@ -3867,9 +4036,15 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 						target->present_wait_logged = true;
 						U_LOG_W(
 						    "#902: late weave on VK_KHR_present_wait — pacing on present id "
-						    "N-%llu "
-						    "hitting glass (DXR_LATE_WEAVE_MAX_LATENCY=%d)",
-						    (unsigned long long)relax, vk_late_weave_max_latency());
+						    "N-%llu hitting glass (%s)",
+						    (unsigned long long)relax,
+						    lat_explicit
+						        ? "depth pinned by DXR_LATE_WEAVE_MAX_LATENCY, governor off"
+						    : target->pw_governing
+						        ? "depth governed (#2119): max(commit-to-glass lag floor, slip "
+						          "level), "
+						          "base 1, changes logged as '#2119: late-weave depth'"
+						        : "governor off (DXR_LATE_WEAVE_AUTOBACKOFF=0), depth 1");
 					}
 					// #206 residual, only where no window-system feedback
 					// measures it more exactly (wait return = glass + wake-up).
@@ -3899,6 +4074,18 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 				// The weave starts now, after the pacing wait: the budget
 				// and the residual measure from here.
 				target->weave_start_ns = os_monotonic_get_ns();
+				// #2119/#867: xrWaitFrame -> weave start, for the lookahead.
+				if (target->pw_wait_frame_ns != 0 &&
+				    target->weave_start_ns > target->pw_wait_frame_ns) {
+					const double phi = (double)(target->weave_start_ns - target->pw_wait_frame_ns);
+					if (phi < 250e6) {
+						target->pw_wait_to_weave_ema_ns =
+						    target->pw_wait_to_weave_ema_ns == 0.0
+						        ? phi
+						        : target->pw_wait_to_weave_ema_ns * 0.9 + phi * 0.1;
+					}
+					target->pw_wait_frame_ns = 0;
+				}
 			}
 		}
 	}
@@ -3951,6 +4138,7 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 		comp_present_feedback_reset_phase(&target->pf_state);
 		target->present_id_counter = 0; // present ids are per-swapchain (#2060)
 		target->last_present_id = 0;
+		target->pw_last_frame_ns = 0; // #2119: no interval across a recreate
 #endif
 
 		{
@@ -4279,8 +4467,9 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
 #ifdef XRT_OS_LINUX_DESKTOP
+	const uint64_t present_ret_ns = os_monotonic_get_ns();
 	if (pf_req_seq != 0) {
-		target->pf_ring[pf_req_seq % 16].commit_ns = os_monotonic_get_ns();
+		target->pf_ring[pf_req_seq % 16].commit_ns = present_ret_ns;
 	}
 #endif
 
@@ -4324,6 +4513,7 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		target->last_present_id = pw_id;
 		target->present_weave_ring_id[pw_id % 8] = pw_id;
 		target->present_weave_ring_ns[pw_id % 8] = pw_weave_start;
+		target->present_commit_ring_ns[pw_id % 8] = present_ret_ns; // #2119 lag
 	}
 #endif
 
@@ -4547,6 +4737,7 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	comp_present_feedback_reset_phase(&target->pf_state);
 	target->present_id_counter = 0; // present ids are per-swapchain (#2060)
 	target->last_present_id = 0;
+	target->pw_last_frame_ns = 0; // #2119: no interval across a recreate
 #endif
 
 	// The crash this exists to stop: below, target->swapchain is set to

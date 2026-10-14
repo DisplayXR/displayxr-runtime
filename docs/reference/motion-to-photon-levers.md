@@ -81,8 +81,8 @@ service for workspace apps. An environment variable still outranks the stored va
 
 | Companion | Default | Effect |
 |---|---|---|
-| `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH` |
-| `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min |
+| `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH`. On the desktop-Linux present_wait tier an explicit value **pins** the depth and turns the #2119 governor off for the session |
+| `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min. On the desktop-Linux present_wait tier `0` holds the depth at 1 (no lag floor, no slip escalation) |
 | `DXR_LATE_WEAVE_SLIP_CAP` | on (`0` restores the pre-2026-09 policy) | Caps slip-rate escalation at `needed_depth() + 1`, requires three clean slip windows before a return probe, and doubles the probe dwell when a slip escalation follows a probe within two dwells (30 → 60 → 120 → 300 s; measured: the 2↔3 cycle converges instead of running forever) |
 
 Late weave depends on present-timing feedback from the swapchain. Where the platform does not
@@ -92,8 +92,37 @@ provide it, it is **dormant** rather than wrong — see the topology table.
 
 | Tier | Source | Covers | Log line when it engages |
 |---|---|---|---|
-| present_wait (#2060) | `VK_KHR_present_wait` — acquire blocks until the previous present hit glass, as on Windows | **enable2 apps** (Unity and anything using `xrCreateVulkanDeviceKHR`: the runtime chains `presentId`/`presentWait` itself) | `#902: late weave on VK_KHR_present_wait — pacing on present id N-0 hitting glass` |
+| present_wait (#2060) | `VK_KHR_present_wait` — acquire blocks until present id N−(depth−1) hit glass; depth governed since #2119 (below) | **enable2 apps** (Unity and anything using `xrCreateVulkanDeviceKHR`: the runtime chains `presentId`/`presentWait` itself) | `#902: late weave on VK_KHR_present_wait — pacing on present id N-0 hitting glass (depth governed (#2119) …)` |
 | measured grid (#2062) — **opt-in, `DXR_LATE_WEAVE_LINUX_GRID=1`** (#2068) | the window system's presentation feedback anchors `comp_vblank_grid.h`: native Wayland `wp_presentation` (`presented`: timestamp, refresh, seq, `vsync`/`hw_clock`), X11 Present `CompleteNotify` (`ust`/`msc`) | **enable1 apps** that did not chain the features, and any session where present_wait never resolves | `#902: late weave on the measured grid — period …, … (grid source: wp_presentation \| x11-present)` |
+
+**present_wait depth governor (#2119).** Depth 1 is only free when a present reaches glass within
+one refresh of its commit. A windowed surface on a composited desktop (GNOME/Wayland) reaches it
+about two refreshes later, so at depth 1 the next weave waits a whole extra refresh and the app
+runs at half rate — measured on ds1-linux (Intel PTL, GNOME 50, in-process Unity player, 60 Hz):
+**30.0 present/s at depth 1, 58.0 at depth 2, 55.5 with `DXR_LATE_WEAVE=0`**; the GPU clock is
+not involved (33.6 with it pinned at 2.5 GHz). So the depth is derived from measurements, base 1
+everywhere, ceiling 4:
+
+- **effective depth = max(lag floor, slip level).**
+- **Lag floor** (`util/comp_late_weave_depth.h`): EMA of each present's commit-to-glass time
+  (`wp_presentation` presented − `vkQueuePresentKHR` return, exact; on X11 / without correlated
+  feedback, the return of a present wait that actually blocked). Raised as soon as the EMA reaches
+  floor + 0.5 periods (2 on a composited window, 1 on direct scanout, whatever a PRIME path
+  measures); lowered one level only after the lower value held for a 30 s dwell, doubling to 300 s
+  when it is raised again within two dwells. Up fast, down slow on purpose: mutter switches between
+  double and triple buffering on its own render time, so the same window's lag flips between 1 and
+  2 periods within one run (measured 5 s windows at depth 1: 59, 34, 97, 60, 61, 60, 58, 24, 98, 61
+  presents/s), while depth 2 is cheap (the #206 weave→scanout horizon measured the same at depth 1
+  and 2).
+- **Slip level** — the shared slip machine `util/comp_feedback_pace.h` (the Windows governor's
+  rules, also used by feedback pacing) fed with "paced frame interval > 1.55 periods": ≥ 10 slips
+  per 120 frames escalates one level above the effective depth, capped at floor + 1; three clean
+  windows plus a 30 s dwell probe back down; a failed probe doubles the dwell.
+- The app's predicted display time follows the depth: at depth > 1 `xrWaitFrame` returns the
+  measured `wait_frame → weave + weave → scanout` lookahead (#867's formula) instead of `2 × period`.
+- `DXR_LATE_WEAVE_MAX_LATENCY` set = pinned depth, governor off; `DXR_LATE_WEAVE_AUTOBACKOFF=0` =
+  depth 1. Inert when the tier latches off. Every change logs one throttled WARN naming the
+  signal: `#2119: late-weave depth 1 -> 2 (commit-to-glass lag; … floor 2, slip level 1, …)`.
 
 `VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
 samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in
