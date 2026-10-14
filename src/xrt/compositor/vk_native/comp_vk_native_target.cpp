@@ -17,6 +17,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "util/u_setting.h"
 #include "util/u_misc.h"
 #include "util/u_git_tag.h"
 #include "util/comp_late_weave_lookahead.h"
@@ -2339,7 +2340,10 @@ dxr_late_weave_enabled()
 	static int enabled = -1;
 	if (enabled < 0) {
 		enabled = 1;
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// Environment, then the Dashboard's persisted stores (perf-settings
+		// Phase 2B); u_setting keeps the environment authoritative.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		if (e != nullptr && e[0] != '\0') {
 			enabled = (e[0] == '0') ? 0 : 1;
 		}

@@ -62,6 +62,14 @@ static const char *const managed_names[] = {
     // makes them safe to expose to a user at all.
     "DXR_FRAME_WITNESS",
     "DXR_FRAME_STAGE_TIMING",
+    // Developer settings (perf-settings Phase 2B, one lever per PR). Each is
+    // a bisecting switch a developer flips from the Dashboard for apps it
+    // never launched; none is on a user-facing control.
+    //
+    // Late weave: read once per process at five sites (D3D11 / D3D12 targets,
+    // D3D11 service, GL, VK native), all through u_setting_get_raw with their
+    // original parse. Only "0" changes anything (opt-out of the default ON).
+    "DXR_LATE_WEAVE",
 };
 
 #define MANAGED_COUNT ((uint32_t)(sizeof(managed_names) / sizeof(managed_names[0])))

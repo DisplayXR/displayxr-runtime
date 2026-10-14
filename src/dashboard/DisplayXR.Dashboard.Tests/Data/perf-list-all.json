@@ -17,7 +17,7 @@
 			"proc":	"App + Svc",
 			"default":	"on",
 			"description":	"Weave as late as possible before scanout.",
-			"managed":	false,
+			"managed":	true,
 			"value":	"0",
 			"source":	"env"
 		}, {

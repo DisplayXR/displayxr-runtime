@@ -87,5 +87,22 @@ TEST_CASE("cli_lever_catalog: the managed Tier 1 levers are listed (they get a R
 	}
 	// And a non-managed lever stays environment-only (Phase 2A changes no allow-list).
 	CHECK_FALSE(u_setting_is_managed("DXR_COMMIT_PACE"));
-	CHECK_FALSE(u_setting_is_managed("DXR_LATE_WEAVE"));
+	// DXR_LATE_WEAVE became settable in Phase 2B (the first developer lever).
+	CHECK(u_setting_is_managed("DXR_LATE_WEAVE"));
+	CHECK(cli_lever_find("DXR_LATE_WEAVE") != nullptr);
+}
+
+TEST_CASE("cli_lever_catalog: every allow-listed lever is in the developer list")
+{
+	// A lever made settable (Phase 2B) must show up in perf list --all, or the
+	// Dashboard can never offer its Reset. The two Diagnostics observers are
+	// Tier 3 and are the only deliberate exceptions.
+	for (uint32_t i = 0; i < u_setting_managed_count(); i++) {
+		const char *name = u_setting_managed_name(i);
+		INFO(name);
+		if (strcmp(name, "DXR_FRAME_WITNESS") == 0 || strcmp(name, "DXR_FRAME_STAGE_TIMING") == 0) {
+			continue;
+		}
+		CHECK(cli_lever_find(name) != nullptr);
+	}
 }
