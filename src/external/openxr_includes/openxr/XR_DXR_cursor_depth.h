@@ -601,7 +601,8 @@ typedef struct XrCursorDepthWeaveStateDXR {
     void* XR_MAY_ALIAS next;
     //! Bit i = drawn into rects[i] of XrWeaveSubmitRectsDXR in the output just woven.
     uint32_t           drawnRectMask;
-    //! The sprite generation the runtime now holds (0 = none, or the default look).
+    //! The sprite generation the runtime now holds (0 = none). DEFAULT and NONE
+    //! requests are held under their generation too, so KEEP works for them.
     uint64_t           spriteGeneration;
     //! Window (client) px the drawn sprite covers, over all views; 0 when none.
     XrRect2Di          drawnBounds;

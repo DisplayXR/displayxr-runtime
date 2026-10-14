@@ -274,7 +274,7 @@ HYBRID anchor, the softening and the drawing.
     `sampleUV` is diagnostic; `flags` is reserved (0).
 - **`XrCursorDepthWeaveStateDXR`** (output, 1004999329), chained on `XrWeaveOutputDXR::next` of a
   submit that carried a request: `drawnRectMask` (bit i = drawn into `rects[i]`),
-  `spriteGeneration` (the sprite the runtime holds; 0 = none or the default look — a `KEEP` whose
+  `spriteGeneration` (the sprite the runtime holds, `DEFAULT` and `NONE` included; 0 = none — a `KEEP` whose
   generation the runtime does not hold draws the default look and reports 0, the cue to resend)
   and `drawnBounds` (window px the drawn sprite covers over all views; zero when none).
 

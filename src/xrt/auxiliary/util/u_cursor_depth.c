@@ -1847,3 +1847,334 @@ u_cursor_draw_view_offset(const struct u_cursor_draw_request *req, uint32_t view
 	out_off[1] = req->view[view].origin[1] - my;
 	return isfinite(out_off[0]) && isfinite(out_off[1]);
 }
+
+
+/*
+ *
+ * ADR-046 Amendment 4: the weave-rect cursor (spec v8).
+ *
+ */
+
+int32_t
+u_cursor_weave_pick_rect(const struct u_cursor_weave_rect *rects,
+                         uint32_t count,
+                         uint32_t eligible_mask,
+                         float px,
+                         float py)
+{
+	if (rects == NULL || !isfinite(px) || !isfinite(py)) {
+		return -1;
+	}
+	if (count > U_CURSOR_WEAVE_MAX_RECTS) {
+		count = U_CURSOR_WEAVE_MAX_RECTS;
+	}
+	// Last in submit order = painted last = on top.
+	for (uint32_t k = count; k-- > 0;) {
+		if ((eligible_mask & (1u << k)) == 0) {
+			continue;
+		}
+		const struct u_cursor_weave_rect *r = &rects[k];
+		if (r->w <= 0 || r->h <= 0) {
+			continue;
+		}
+		if (px >= (float)r->x && px < (float)r->x + (float)r->w && py >= (float)r->y &&
+		    py < (float)r->y + (float)r->h) {
+			return (int32_t)k;
+		}
+	}
+	return -1;
+}
+
+enum u_cursor_weave_source
+u_cursor_weave_source_for(int32_t index, uint32_t caller_mask, uint32_t lift_mask)
+{
+	if (index < 0 || index >= (int32_t)U_CURSOR_WEAVE_MAX_RECTS) {
+		return U_CURSOR_WEAVE_SOURCE_NONE;
+	}
+	const uint32_t bit = 1u << (uint32_t)index;
+	if ((lift_mask & bit) != 0) {
+		return U_CURSOR_WEAVE_SOURCE_LIFT;
+	}
+	if ((caller_mask & bit) != 0) {
+		return U_CURSOR_WEAVE_SOURCE_CALLER;
+	}
+	return U_CURSOR_WEAVE_SOURCE_NONE;
+}
+
+void
+u_cursor_weave_memo_put(struct u_cursor_weave_memo *m,
+                        uint32_t rect_index,
+                        const struct u_cursor_weave_rect *rect,
+                        bool has_content,
+                        float disparity_px,
+                        uint64_t now_ns)
+{
+	m->valid = true;
+	m->rect_index = rect_index;
+	m->w = rect != NULL ? rect->w : 0;
+	m->h = rect != NULL ? rect->h : 0;
+	// A non-finite disparity is no content, never a NaN in the filter.
+	m->has_content = has_content && isfinite(disparity_px);
+	m->disparity_px = m->has_content ? disparity_px : 0.0f;
+	m->stamp_ns = now_ns;
+}
+
+bool
+u_cursor_weave_memo_get(const struct u_cursor_weave_memo *m,
+                        uint32_t rect_index,
+                        const struct u_cursor_weave_rect *rect,
+                        uint64_t now_ns,
+                        bool *out_has_content,
+                        float *out_disparity_px)
+{
+	if (m == NULL || !m->valid || m->rect_index != rect_index || rect == NULL || m->w != rect->w ||
+	    m->h != rect->h) {
+		return false;
+	}
+	if (now_ns < m->stamp_ns || now_ns - m->stamp_ns >= U_CURSOR_WEAVE_DEPTH_EXPIRY_NS) {
+		return false;
+	}
+	*out_has_content = m->has_content;
+	*out_disparity_px = m->disparity_px;
+	return true;
+}
+
+bool
+u_cursor_weave_px_to_baselines(float disparity_px, float m_per_px, float baseline_m, float *out_d)
+{
+	if (!isfinite(disparity_px) || !(m_per_px > 0.0f) || !(baseline_m > 0.0f) || !isfinite(m_per_px) ||
+	    !isfinite(baseline_m)) {
+		return false;
+	}
+	const float d = disparity_px * m_per_px / baseline_m;
+	if (!isfinite(d)) {
+		return false;
+	}
+	*out_d = d;
+	return true;
+}
+
+bool
+u_cursor_weave_viewpoints(const float *eyes_xyz,
+                          uint32_t eye_count,
+                          uint32_t view_count,
+                          const float origin[3],
+                          float *out_xyz)
+{
+	if (eyes_xyz == NULL || origin == NULL || out_xyz == NULL || eye_count == 0 || view_count == 0 ||
+	    view_count > XRT_MAX_VIEWS) {
+		return false;
+	}
+	const float *first = &eyes_xyz[0];
+	const float *last = &eyes_xyz[3 * (eye_count - 1)];
+	for (uint32_t i = 0; i < view_count; i++) {
+		float p[3];
+		if (eye_count == view_count) {
+			p[0] = eyes_xyz[3 * i + 0];
+			p[1] = eyes_xyz[3 * i + 1];
+			p[2] = eyes_xyz[3 * i + 2];
+		} else {
+			// Evenly from the leftmost eye to the rightmost: the outermost pair
+			// is the one the caller's disparity was measured between.
+			const float f = view_count > 1 ? (float)i / (float)(view_count - 1) : 0.5f;
+			for (int k = 0; k < 3; k++) {
+				p[k] = first[k] + f * (last[k] - first[k]);
+			}
+		}
+		for (int k = 0; k < 3; k++) {
+			out_xyz[3 * i + k] = p[k] - origin[k];
+			if (!isfinite(out_xyz[3 * i + k])) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+float
+u_cursor_weave_baseline(const float *viewpoints_xyz, uint32_t count)
+{
+	if (viewpoints_xyz == NULL || count < 2) {
+		return 0.0f;
+	}
+	const float *a = &viewpoints_xyz[0];
+	const float *b = &viewpoints_xyz[3 * (count - 1)];
+	const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+	const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+	return isfinite(d) ? d : 0.0f;
+}
+
+bool
+u_cursor_weave_project_point(const struct xrt_vec3 *c, const float *viewpoints_xyz, uint32_t count, float *out_xy)
+{
+	if (c == NULL || viewpoints_xyz == NULL || out_xy == NULL || count == 0 || count > XRT_MAX_VIEWS ||
+	    !v3_finite(*c)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const float *v = &viewpoints_xyz[3 * i];
+		const float dz = v[2] - c->z;
+		if (!(v[2] > 0.0f) || !(dz > 1e-6f)) {
+			return false; // the viewpoint is not in front of the plane or of C
+		}
+		// The ray v -> C crosses z = 0 at k = v.z / (v.z - C.z).
+		const float k = v[2] / dz;
+		out_xy[2 * i + 0] = v[0] + k * (c->x - v[0]);
+		out_xy[2 * i + 1] = v[1] + k * (c->y - v[1]);
+		if (!isfinite(out_xy[2 * i + 0]) || !isfinite(out_xy[2 * i + 1])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+u_cursor_weave_step(struct u_cursor_weave_state *st,
+                    const struct u_cursor_depth_tuning *t,
+                    const struct u_cursor_weave_input *in,
+                    struct u_cursor_weave_output *out)
+{
+	memset(out, 0, sizeof(*out));
+
+	// One filter and anchor per client, re-primed when the hovered rect
+	// changes: a new element is a new depth history and a new line of sight.
+	if (!st->has_rect || st->rect_index != in->rect_index || st->rect_w != in->rect_w ||
+	    st->rect_h != in->rect_h) {
+		memset(&st->filter, 0, sizeof(st->filter));
+		memset(&st->anchor, 0, sizeof(st->anchor));
+		st->has_rect = true;
+		st->rect_index = in->rect_index;
+		st->rect_w = in->rect_w;
+		st->rect_h = in->rect_h;
+	}
+
+	// The submit interval: the hand-back's unit of time.
+	if (st->last_ns != 0 && in->now_ns > st->last_ns) {
+		uint64_t dt = in->now_ns - st->last_ns;
+		dt = dt < 4000000ull ? 4000000ull : (dt > 100000000ull ? 100000000ull : dt);
+		st->frame_ns = st->frame_ns != 0 ? (3 * st->frame_ns + dt) / 4 : dt;
+	}
+	st->last_ns = in->now_ns;
+	const uint64_t frame_ns = st->frame_ns != 0 ? st->frame_ns : U_CURSOR_WEAVE_DEFAULT_FRAME_NS;
+
+	// The one policy (Amendment 2 A): never behind the glass, margin, clamp.
+	const float target = u_cursor_depth_target(t, in->has_content, in->content_d);
+	const bool reprimed = u_cursor_depth_filter_will_prime(&st->filter, t, in->now_ns);
+	const float d = u_cursor_depth_filter_step(&st->filter, t, target, in->now_ns);
+	out->target = target;
+	out->disparity = d;
+
+	// Geometry in the weave frame: E = the viewpoints' midpoint, S on z = 0.
+	if (in->viewpoints == NULL || in->view_count == 0 || in->view_count > XRT_MAX_VIEWS) {
+		return false;
+	}
+	struct xrt_vec3 e = {0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < in->view_count; i++) {
+		e.x += in->viewpoints[3 * i + 0];
+		e.y += in->viewpoints[3 * i + 1];
+		e.z += in->viewpoints[3 * i + 2];
+	}
+	e.x /= (float)in->view_count;
+	e.y /= (float)in->view_count;
+	e.z /= (float)in->view_count;
+	if (!v3_finite(e) || !(e.z > 0.0f) || !isfinite(in->sx) || !isfinite(in->sy)) {
+		return false;
+	}
+	struct u_cursor_depth_geometry g;
+	g.eye = e;
+	g.canvas_point = (struct xrt_vec3){in->sx, in->sy, 0.0f};
+	g.forward = (struct xrt_vec3){0.0f, 0.0f, -1.0f}; // away from the viewer
+	g.orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+	g.eye_to_canvas = e.z;
+	g.canvas_height = 1.0f; // the height is not used: the sprite keeps its panel size
+
+	// The anchor runs every step, drawn or not, so the hand-over stays continuous.
+	struct xrt_vec3 c;
+	float h_unused = 0.0f;
+	u_cursor_depth_place_anchored(&g, d, 1.0f, U_CURSOR_DEPTH_ANCHOR_HYBRID, &st->anchor, in->u, in->v, reprimed,
+	                              in->now_ns, &c, &h_unused);
+	if (!u_cursor_weave_project_point(&c, in->viewpoints, in->view_count, out->xy)) {
+		return false;
+	}
+
+	out->draw = u_cursor_depth_should_draw(t, d);
+	if (out->draw) {
+		// Hand back early: if the cursor, still heading for the same target,
+		// would no longer be drawn HANDBACK_FRAMES submits from now, report
+		// "not drawn" already (and keep drawing) so the caller's OS cursor is
+		// back before ours is gone - never no cursor.
+		struct u_cursor_depth_filter f = st->filter;
+		float pd = d;
+		for (uint32_t k = 1; k <= U_CURSOR_WEAVE_HANDBACK_FRAMES; k++) {
+			pd = u_cursor_depth_filter_step(&f, t, target, in->now_ns + k * frame_ns);
+		}
+		out->report_drawn = u_cursor_depth_should_draw(t, pd);
+	}
+	return true;
+}
+
+bool
+u_cursor_weave_sprite_bounds(const float *hot_px,
+                             uint32_t count,
+                             float spr_w,
+                             float spr_h,
+                             float hot_x,
+                             float hot_y,
+                             const struct u_cursor_weave_rect *clip,
+                             struct u_cursor_weave_rect *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (hot_px == NULL || count == 0 || clip == NULL || !(spr_w > 0.0f) || !(spr_h > 0.0f) ||
+	    !isfinite(hot_x) || !isfinite(hot_y)) {
+		return false;
+	}
+	float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+	for (uint32_t i = 0; i < count; i++) {
+		const float l = hot_px[2 * i + 0] - hot_x, tp = hot_px[2 * i + 1] - hot_y;
+		if (!isfinite(l) || !isfinite(tp)) {
+			return false;
+		}
+		x0 = l < x0 ? l : x0;
+		y0 = tp < y0 ? tp : y0;
+		x1 = l + spr_w > x1 ? l + spr_w : x1;
+		y1 = tp + spr_h > y1 ? tp + spr_h : y1;
+	}
+	const float cx0 = (float)clip->x, cy0 = (float)clip->y;
+	const float cx1 = cx0 + (float)clip->w, cy1 = cy0 + (float)clip->h;
+	x0 = x0 > cx0 ? x0 : cx0;
+	y0 = y0 > cy0 ? y0 : cy0;
+	x1 = x1 < cx1 ? x1 : cx1;
+	y1 = y1 < cy1 ? y1 : cy1;
+	const int32_t ix0 = (int32_t)floorf(x0), iy0 = (int32_t)floorf(y0);
+	const int32_t ix1 = (int32_t)ceilf(x1), iy1 = (int32_t)ceilf(y1);
+	if (ix1 <= ix0 || iy1 <= iy0) {
+		return false;
+	}
+	out->x = ix0;
+	out->y = iy0;
+	out->w = ix1 - ix0;
+	out->h = iy1 - iy0;
+	return true;
+}
+
+enum u_cursor_weave_sprite_action
+u_cursor_weave_sprite_resolve(uint32_t kind, uint64_t generation, uint64_t held_generation)
+{
+	const bool held = held_generation != 0 && generation == held_generation;
+	switch (kind) {
+	case U_CURSOR_WEAVE_SPRITE_KEEP: return held ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+	case U_CURSOR_WEAVE_SPRITE_NONE: return U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING;
+	case U_CURSOR_WEAVE_SPRITE_OS_CURSOR:
+		return held ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_LOAD_OS_CURSOR;
+	case U_CURSOR_WEAVE_SPRITE_TEXTURE:
+		return held ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_LOAD_TEXTURE;
+	case U_CURSOR_WEAVE_SPRITE_DEFAULT:
+	default: return U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+	}
+}
+
+bool
+u_cursor_weave_sprite_idle(uint64_t last_request_ns, uint64_t now_ns)
+{
+	return now_ns < last_request_ns || now_ns - last_request_ns > U_CURSOR_WEAVE_SPRITE_IDLE_NS;
+}
