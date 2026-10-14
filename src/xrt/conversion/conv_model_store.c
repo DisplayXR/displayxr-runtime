@@ -431,7 +431,7 @@ conv_store_root_from(const struct conv_store_root_inputs *in,
 		}
 		return false;
 	}
-	if (set(in->xdg_data_home)) {
+	if (set(in->xdg_data_home) && in->xdg_writable) {
 		(void)snprintf(out, out_size, "%s/displayxr/models", in->xdg_data_home);
 		cpy(source, source_size, "$XDG_DATA_HOME");
 		return true;
@@ -479,7 +479,28 @@ conv_store_root_resolve(char *out, size_t out_size, char *source, size_t source_
 	}
 #else
 	in.windows = false;
-	in.xdg_data_home = getenv("XDG_DATA_HOME");
+	static char xdg[CONV_STORE_PATH_MAX];
+	const char *x = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	if (set(x)) {
+		cpy(xdg, sizeof(xdg), x);
+	} else if (set(home)) {
+		(void)snprintf(xdg, sizeof(xdg), "%s/.local/share", home);
+	} else {
+		xdg[0] = '\0';
+	}
+	in.xdg_data_home = xdg;
+	// Writable = the nearest existing ancestor of <xdg>/displayxr/models is.
+	char probe[CONV_STORE_PATH_MAX];
+	(void)snprintf(probe, sizeof(probe), "%s/displayxr/models", xdg);
+	while (xdg[0] != '\0' && probe[0] != '\0' && !fs_exists(probe)) {
+		char *slash = strrchr(probe, '/');
+		if (slash == NULL || slash == probe) {
+			break;
+		}
+		*slash = '\0';
+	}
+	in.xdg_writable = xdg[0] != '\0' && access(probe, W_OK) == 0;
 #endif
 	return conv_store_root_from(&in, out, out_size, source, source_size);
 }

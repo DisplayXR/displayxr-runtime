@@ -1082,18 +1082,14 @@ struct store_guard
 
 //! `conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]`.
 int
-models_fetch(int argc, const char **argv, conv_model_store *s, bool json)
+fetch_one(const char *src, int argc, const char **argv, conv_model_store *s, bool json)
 {
-	if (argc < 5 || argv[4][0] == '-') {
-		P("usage: displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n");
-		return 1;
-	}
 	const bool prefetch = cli_has_flag(argc, argv, "--prefetch");
 	const bool installer = cli_has_flag(argc, argv, "--installer");
 	const char *only = flag_value(argc, argv, "--model");
 	std::unique_ptr<conv_pack> pack(new conv_pack());
 	char err[192];
-	if (!conv_pack_load_url(argv[4], pack.get(), err, sizeof(err))) {
+	if (!conv_pack_load_url(src, pack.get(), err, sizeof(err))) {
 		P("conv models fetch: %s\n", err);
 		return 2;
 	}
@@ -1140,6 +1136,35 @@ models_fetch(int argc, const char **argv, conv_model_store *s, bool json)
 		cJSON_Delete(o);
 	}
 	return failed > 0 ? 2 : 0;
+}
+
+/*!
+ * `fetch <pack-url|path>`: that pack. `fetch --prefetch` with no URL: every
+ * registered provider's pack (Packs / packs[]), its prefetch models only.
+ */
+int
+models_fetch(int argc, const char **argv, conv_model_store *s, bool json)
+{
+	if (argc >= 5 && argv[4][0] != '-') {
+		return fetch_one(argv[4], argc, argv, s, json);
+	}
+	if (!cli_has_flag(argc, argv, "--prefetch")) {
+		P("usage: displayxr-cli conv models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]\n"
+		  "       displayxr-cli conv models fetch --prefetch   (every registered pack's prefetch models)\n");
+		return 1;
+	}
+	static char packs[XRT_CONV_LOADER_MAX_ENTRIES * XRT_CONV_LOADER_MAX_PACKS][512];
+	const uint32_t n = target_conv_store_registered_packs(packs, XRT_CONV_LOADER_MAX_ENTRIES * XRT_CONV_LOADER_MAX_PACKS);
+	if (n == 0) {
+		P("No registered model pack to pre-fetch.\n");
+		return 0;
+	}
+	int rc = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		const int r = fetch_one(packs[i], argc, argv, s, json);
+		rc = r > rc ? r : rc;
+	}
+	return rc;
 }
 
 int
