@@ -339,7 +339,12 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	os_mutex_unlock(&f->mtx);
 
 	xrt_result_t r = XRT_SUCCESS;
-	for (uint32_t t = 0; t < ms; t += poll) {
+	// Wall-clock deadline, not an iteration count: a 10 ms sleep rounds up to the
+	// OS timer tick (15.6 ms on Windows by default), so counting polls stretched a
+	// 3 s job to ~4.7 s and timed out the lane-isolation test on a busy box.
+	const uint64_t start_ns = os_monotonic_get_ns();
+	const uint64_t span_ns = (uint64_t)ms * 1000000ull;
+	for (uint64_t el = 0; el < span_ns; el = os_monotonic_get_ns() - start_ns) {
 		if (ctl->is_cancelled(ctl->ctx)) {
 			os_mutex_lock(&f->mtx);
 			f->job_cancel_seen_ns = os_monotonic_get_ns();
@@ -348,7 +353,7 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 			break;
 		}
 		if (ctl->progress != NULL) {
-			ctl->progress(ctl->ctx, (float)t / (float)ms, "fake");
+			ctl->progress(ctl->ctx, (float)((double)el / (double)span_ns), "fake");
 		}
 		sleep_ms(poll);
 	}
