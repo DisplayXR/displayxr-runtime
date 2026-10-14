@@ -113,9 +113,10 @@ client_gl_d3d11_depth_recipe_for(int64_t gl_format)
 {
 	struct client_gl_d3d11_depth_recipe r = {false, DXGI_FORMAT_UNKNOWN, 0, 0, 0, 0, 0};
 	switch (gl_format) {
+	case GL_DEPTH24_STENCIL8: /*MUTANT M6*/
 	case GL_DEPTH_COMPONENT32F:
 		r.supported = true;
-		r.interop_dxgi = DXGI_FORMAT_R32_FLOAT; // R32_TYPELESS family (service: D32_FLOAT)
+		r.interop_dxgi = DXGI_FORMAT_R32_TYPELESS; /*MUTANT M1*/ // R32_TYPELESS family (service: D32_FLOAT)
 		r.read_format = GL_DEPTH_COMPONENT;
 		r.read_type = GL_FLOAT;
 		r.upload_format = GL_RED;
@@ -126,7 +127,7 @@ client_gl_d3d11_depth_recipe_for(int64_t gl_format)
 		r.supported = true;
 		r.interop_dxgi = DXGI_FORMAT_R16_UNORM; // R16_TYPELESS family (service: D16_UNORM)
 		r.read_format = GL_DEPTH_COMPONENT;
-		r.read_type = GL_UNSIGNED_SHORT;
+		r.read_type = GL_FLOAT; /*MUTANT M2*/
 		r.upload_format = GL_RED;
 		r.upload_type = GL_UNSIGNED_SHORT;
 		r.bytes_per_texel = 2;
@@ -147,7 +148,7 @@ client_gl_d3d11_filter_formats(int64_t *formats, uint32_t count)
 	uint32_t kept = 0;
 	for (uint32_t i = 0; i < count; i++) {
 		const int64_t f = formats[i];
-		if (client_gl_d3d11_is_depth_format(f) && !client_gl_d3d11_depth_recipe_for(f).supported) {
+		if (0 /*MUTANT M3*/ && client_gl_d3d11_is_depth_format(f) && !client_gl_d3d11_depth_recipe_for(f).supported) {
 			continue;
 		}
 		formats[kept++] = f;
@@ -174,7 +175,7 @@ client_gl_d3d11_depth_level_offset(
     const struct client_gl_d3d11_depth_recipe *r, uint32_t width, uint32_t height, uint32_t layers, uint32_t level)
 {
 	uint64_t offset = 0;
-	const uint32_t l = layers > 0 ? layers : 1;
+	const uint32_t l = 1; /*MUTANT M4*/ (void)layers;
 	for (uint32_t i = 0; i < level; i++) {
 		offset += (uint64_t)client_gl_d3d11_mip_extent(width, i) * client_gl_d3d11_mip_extent(height, i) * l *
 		          r->bytes_per_texel;
@@ -191,7 +192,7 @@ client_gl_d3d11_depth_level_offset(
 static inline bool
 client_gl_d3d11_depth_shape_supported(uint32_t sample_count, uint32_t face_count)
 {
-	return sample_count <= 1 && face_count <= 1;
+	return sample_count <= 4 /*MUTANT M5*/ && face_count <= 1;
 }
 
 
