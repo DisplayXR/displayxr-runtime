@@ -9,6 +9,7 @@
 #pragma once
 
 #include "comp_gl_client.h"
+#include "comp_gl_d3d11_depth.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,23 @@ struct client_gl_d3d11_swapchain
 
 	//! Number of images
 	uint32_t image_count;
+
+	/*!
+	 * #1956 depth swapchain (see comp_gl_d3d11_depth.h). When set, `images[]`
+	 * are GL-native depth textures the app renders into, and the WGL-registered
+	 * objects are the colour-family `interop_textures[]` instead; release copies
+	 * images → interop through `depth_pbo` before the usual staging → shared
+	 * CopyResource. Colour swapchains leave all of this zero.
+	 */
+	bool depth;
+	struct client_gl_d3d11_depth_recipe depth_recipe;
+	GLuint interop_textures[XRT_MAX_SWAPCHAIN_IMAGES];
+	GLuint depth_pbo;
+	GLenum binding_enum;
+	uint32_t width;
+	uint32_t height;
+	uint32_t layers;
+	uint32_t mip_count;
 };
 
 /*!
