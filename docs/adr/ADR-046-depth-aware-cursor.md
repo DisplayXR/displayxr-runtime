@@ -1480,15 +1480,14 @@ late read later; that is a Phase 2 item, not this amendment.
   browser has hidden the OS cursor, so there is nothing left to mirror. The browser has to say
   what it would have shown.
 
-### Open questions (for David)
+### Decisions (David, 2026-10-13: "go with your recommendations")
 
-1. Hide mechanism: the browser-process override (recommended), with 0400 migrating to it?
-2. Windows sprite: the `HCURSOR` carrier, if the spike passes, or always the texture (one
-   carrier on every platform, about one more browser day)?
-3. Is the pointer-driven re-weave's GPU cost acceptable on large windows?
-4. Depth unit: device pixels (recommended) or eye baselines of the rendered views?
-5. Should lifted rects get the real cursor in the same release (W3 folded into W2)?
-6. Should the SDK fallback get B.7 softening, or is the fallback rare enough to leave it?
+1. Hide in the browser process (the per-pointer override); 0400 migrates to it.
+2. Windows sprite: the `HCURSOR` carrier if the spike passes, the texture otherwise.
+3. The pointer-driven re-weave is accepted.
+4. Depth unit: device pixels.
+5. Lifted rects take the real cursor in the release after web pages (W3 stays separate).
+6. The SDK fallback gets B.7 softening.
 
 ### Not changed
 
