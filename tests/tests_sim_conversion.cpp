@@ -932,7 +932,7 @@ struct store_env
 TEST_CASE("sim_conversion: DOWNLOADING runs the host model store (file:// fake pack)", "[sim_conversion]")
 {
 	store_env env(true);
-	provider pv({{"SCRIPT", "views-mono.state=downloading:200,ready"}});
+	provider pv(settings{{"SCRIPT", "views-mono.state=downloading:200,ready"}});
 	g_host_storage.model_resolve = conv_store_host_model_resolve;
 	g_host_storage.model_request = conv_store_host_model_request;
 
@@ -964,7 +964,7 @@ TEST_CASE("sim_conversion: DOWNLOADING runs the host model store (file:// fake p
 TEST_CASE("sim_conversion: a download forbidden by policy is ABSENT(policy)", "[sim_conversion]")
 {
 	store_env env(false);
-	provider pv({{"SCRIPT", "views-mono.state=downloading:100,ready"}});
+	provider pv(settings{{"SCRIPT", "views-mono.state=downloading:100,ready"}});
 	g_host_storage.model_resolve = conv_store_host_model_resolve;
 	g_host_storage.model_request = conv_store_host_model_request;
 	cancel_flag never;
