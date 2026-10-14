@@ -732,9 +732,9 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 			pthread_mutex_unlock(&g_generation_lock);
 			U_LOG_W(
 			    "display hotplug: screen table generation %llu — %u screen(s) (+%u -%u, %u re-claimed, %u "
-			    "moved): %s",
+			    "moved, %u claim-level, %u other): %s",
 			    (unsigned long long)gen, now->count, c.added, c.removed, c.claimant_changed,
-			    c.geometry_changed, line);
+			    c.geometry_changed, c.claim_changed, c.other_changed, line);
 			for (uint32_t i = 0; i < now->count && i < XRT_SCREEN_LIST_MAX; i++) {
 				const struct xrt_screen *sc = &now->screens[i];
 				U_LOG_W(
@@ -745,6 +745,17 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 				    (double)sc->desktop_scale, sc->plugin_id, sc->confidence,
 				    (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0 ? " (system default)" : "");
 			}
+			g_published_screens = *now;
+		} else if (c.metadata_changed != 0) {
+			// Only an EDID physical size was refined (macOS: IOKit publishes
+			// the EDID blob ~0.5-1 s after CoreGraphics lists the monitor).
+			// Not a new generation — that would make every live session
+			// re-table and rebuild its segment DPs for nothing — but the
+			// baseline follows, so the next sweep compares against it.
+			char line[1024];
+			target_screens_change_format(&g_published_screens, now, line, sizeof(line));
+			U_LOG_I("display hotplug: screen table unchanged (generation %llu kept): %s",
+			        (unsigned long long)display_generation_read(), line);
 			g_published_screens = *now;
 		}
 	}

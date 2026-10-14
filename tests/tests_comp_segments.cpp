@@ -7,12 +7,14 @@
  */
 
 #include "util/comp_segments.h"
+#include "xrt/xrt_plugin.h"
 #include "util/comp_segments_route.h"
 #include "util/comp_segments_gl.h"
 
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -468,6 +470,61 @@ TEST_CASE("comp_segments: a DP carried across a screen-table change (display hot
 	CHECK_FALSE(comp_segments_lifecycle_adopt(&full, 0x999));
 	// Adopting a tracked id again reuses its slot.
 	CHECK(comp_segments_lifecycle_adopt(&full, 0x100));
+}
+
+TEST_CASE("comp_segments: which screen-table change keeps a segment DP (display hotplug)", "[comp_segments][hotplug]")
+{
+	static int leia_iface = 0, leia_inst = 0, sim_inst = 0;
+	xrt_screen_binding b{};
+	b.struct_size = sizeof(b);
+	b.monitor_id = 0x93ab6bb69aa4bc98ull;
+	b.desktop_left = 1512;
+	b.desktop_width = 1920;
+	b.desktop_height = 1080;
+	b.native_pixel_width = 3840;
+	b.native_pixel_height = 2160;
+	b.physical_width_mm = 598;
+	b.physical_height_mm = 341;
+	b.desktop_scale = 2.0f;
+	std::snprintf(b.serial, sizeof(b.serial), "VD012450ET0116");
+	std::snprintf(b.device_name, sizeof(b.device_name), "B0ED46B3-A72B-41CA-A98D-8E6BC987BA4D");
+
+	const comp_segments_dp_key was = {b.monitor_id, &leia_iface, &leia_inst, 100, &b};
+
+	// An identical republish keeps it (no retire, no second tracker acquire).
+	xrt_screen_binding same = b;
+	comp_segments_dp_key now = {b.monitor_id, &leia_iface, &leia_inst, 100, &same};
+	CHECK(comp_segments_dp_key_keeps(&was, &now));
+
+	// The EDID mm refined a sweep later (cg-ids 598x341 -> iokit-edid 600x340): kept.
+	xrt_screen_binding refined = b;
+	refined.physical_width_mm = 600;
+	refined.physical_height_mm = 340;
+	now.binding = &refined;
+	CHECK(comp_segments_dp_key_keeps(&was, &now));
+
+	// A claim-level change (PRESENT_NOT_READY -> claimed) rebuilds it.
+	const comp_segments_dp_key not_ready = {b.monitor_id, &leia_iface, &leia_inst,
+	                                        (uint32_t)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY, &b};
+	now = {b.monitor_id, &leia_iface, &leia_inst, 100, &same};
+	CHECK_FALSE(comp_segments_dp_key_keeps(&not_ready, &now));
+
+	// Re-bound: the same panel at new bounds rebuilds it (test D).
+	xrt_screen_binding rebound = b;
+	rebound.desktop_left = -1920;
+	now.binding = &rebound;
+	CHECK_FALSE(comp_segments_dp_key_keeps(&was, &now));
+
+	// Another serial (another panel on that connector) or another claimant instance.
+	xrt_screen_binding other_panel = b;
+	std::snprintf(other_panel.serial, sizeof(other_panel.serial), "OTHER");
+	now.binding = &other_panel;
+	CHECK_FALSE(comp_segments_dp_key_keeps(&was, &now));
+	now = {b.monitor_id, &leia_iface, &sim_inst, 100, &same};
+	CHECK_FALSE(comp_segments_dp_key_keeps(&was, &now));
+	now = {0x1234, &leia_iface, &leia_inst, 100, &same};
+	CHECK_FALSE(comp_segments_dp_key_keeps(&was, &now));
+	CHECK_FALSE(comp_segments_dp_key_keeps(&was, nullptr));
 }
 
 TEST_CASE("comp_segments: the session DP keeps its screen only while its plug-in owns it (display hotplug)",

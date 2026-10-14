@@ -522,6 +522,38 @@ comp_segments_lifecycle_set_created(struct comp_segments_lifecycle *lc, uint64_t
 bool
 comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t screen_id);
 
+struct xrt_screen_binding;
+
+/*!
+ * What a live segment DP was made for, as far as "may a new screen table keep
+ * it?" is concerned (display hotplug, ADR-047 Amendment 8).
+ */
+struct comp_segments_dp_key
+{
+	uint64_t screen_id;
+	const void *iface;      //!< The owning plug-in iface (`xrt_plugin_iface *`).
+	const void *inst;       //!< The owning plug-in instance.
+	uint32_t confidence;    //!< The screen's winning claim level (`xrt_screen::confidence`).
+	const struct xrt_screen_binding *binding; //!< The binding the DP was created with.
+};
+
+/*!
+ * May a segment DP made for @p was be kept for @p now? Yes when it is the same
+ * screen, claimed by the same plug-in instance at the same claim level, bound
+ * at the same desktop rect / mode / scale / serial / output name. A different
+ * claim level (PRESENT_NOT_READY -> claimed: the backend became able to drive
+ * the panel) or different bounds (the same panel re-bound at a new place) is a
+ * real change: the DP is rebuilt.
+ *
+ * The binding's EDID physical size is deliberately NOT part of the key. On
+ * macOS it is refined ~0.5-1 s after a plug-in (CoreGraphics' 598x341 mm
+ * until IOKit publishes the EDID blob, then the EDID's own 600x340 mm) for the
+ * same panel; rebuilding a vendor weaver (and re-acquiring its eye tracker)
+ * for that is wrong.
+ */
+bool
+comp_segments_dp_key_keeps(const struct comp_segments_dp_key *was, const struct comp_segments_dp_key *now);
+
 /*!
  * Does a DP exist for @p screen_id?
  */

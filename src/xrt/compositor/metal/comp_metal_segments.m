@@ -107,6 +107,7 @@ struct comp_metal_segments
 	struct xrt_screen_info info[COMP_SEGMENTS_MAX_SCREENS];
 	const struct xrt_plugin_iface *iface[COMP_SEGMENTS_MAX_SCREENS];
 	struct xrt_plugin_instance *inst[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t confidence[COMP_SEGMENTS_MAX_SCREENS]; //!< each screen's winning claim level
 	struct seg_screen_state st[COMP_SEGMENTS_MAX_SCREENS];
 
 	//! This update's table in points (lifecycle, logging) and converted.
@@ -497,6 +498,7 @@ struct seg_carry
 	uint64_t id;
 	const struct xrt_plugin_iface *iface;
 	struct xrt_plugin_instance *inst;
+	uint32_t confidence;
 	struct xrt_screen_binding binding;
 	struct seg_screen_state st;
 	bool taken;
@@ -540,6 +542,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 			k->id = segs->screens[i].id;
 			k->iface = segs->iface[i];
 			k->inst = segs->inst[i];
+			k->confidence = segs->confidence[i];
 			k->binding = segs->bindings[i];
 			os_mutex_lock(&segs->dp_mutex);
 			k->st = segs->st[i];
@@ -670,6 +673,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 
 		segs->iface[n] = NULL;
 		segs->inst[n] = NULL;
+		segs->confidence[n] = s->confidence;
 		if (e != NULL && !cs->is_primary) {
 			if (primary_entry == NULL || strcmp(e->plugin_id, primary_entry->plugin_id) != 0) {
 				mixed = true;
@@ -711,11 +715,27 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 		        : (e != NULL && e->not_ready) ? " (present, NOT READY: flat 2D)"
 		                                                : "");
 
-		// A live DP from the previous table for this very screen and binding.
+		// A live DP from the previous table for this very screen, plug-in
+		// instance, claim level and binding (comp_segments_dp_key_keeps: an
+		// identical republish, or a late EDID mm refinement, keeps it; a
+		// claim-level change or a re-bound panel rebuilds it).
+		const struct comp_segments_dp_key now_key = {
+		    .screen_id = s->id,
+		    .iface = segs->iface[n],
+		    .inst = segs->inst[n],
+		    .confidence = segs->confidence[n],
+		    .binding = b,
+		};
 		for (uint32_t k = 0; k < carry_n && !cs->is_primary; k++) {
 			struct seg_carry *c = &carry[k];
-			if (c->taken || c->id != s->id || c->iface != segs->iface[n] || c->inst != segs->inst[n] ||
-			    memcmp(&c->binding, b, sizeof(*b)) != 0) {
+			const struct comp_segments_dp_key was_key = {
+			    .screen_id = c->id,
+			    .iface = c->iface,
+			    .inst = c->inst,
+			    .confidence = c->confidence,
+			    .binding = &c->binding,
+			};
+			if (c->taken || !comp_segments_dp_key_keeps(&was_key, &now_key)) {
 				continue;
 			}
 			if (!comp_segments_lifecycle_adopt(&segs->lc, s->id)) {

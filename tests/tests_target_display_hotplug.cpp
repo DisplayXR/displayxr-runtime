@@ -19,6 +19,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include "xrt/xrt_plugin.h"
 #include "xrt/xrt_screen.h"
 
 #include "target_display_hotplug.h"
@@ -404,6 +405,85 @@ TEST_CASE("hotplug screens: what counts as a change", "[target][hotplug]")
 	CHECK(c.removed == 1);
 }
 
+
+TEST_CASE("hotplug screens: an identical or EDID-mm-only republish is not a new generation", "[target][hotplug]")
+{
+	// The Odyssey replug trace (2026-10-13): the sweep at +0.5 s lists the
+	// panel with CoreGraphics' 598x341 mm (join=cg-ids), the one at +1 s with
+	// the EDID's own 600x340 mm (join=iokit-edid, IOKit published the blob).
+	// Same id, bounds, claimant and claim level: that must not bump the
+	// generation, or every live session rebuilds its segment DPs.
+	xrt_screen_list was{};
+	was.count = 2;
+	was.screens[0] = screen(BUILTIN, "sim-display", 0, 1512, true);
+	was.screens[1] = screen(ODYSSEY, "leia-sr", 1512, 1920);
+	was.screens[1].confidence = 100;
+	was.screens[1].physical_width_mm = 598;
+	was.screens[1].physical_height_mm = 341;
+
+	target_screens_change c{};
+	xrt_screen_list same = was;
+	CHECK_FALSE(target_screens_compare(&was, &same, &c));
+	CHECK(c.metadata_changed == 0);
+	char line[512];
+	target_screens_change_format(&was, &same, line, sizeof(line));
+	CHECK(std::strstr(line, "no screen added") != nullptr);
+
+	xrt_screen_list refined = was;
+	refined.screens[1].physical_width_mm = 600;
+	refined.screens[1].physical_height_mm = 340;
+	CHECK_FALSE(target_screens_compare(&was, &refined, &c));
+	CHECK(c.metadata_changed == 1);
+	CHECK(c.other_changed == 0);
+	CHECK(c.claim_changed == 0);
+	target_screens_change_format(&was, &refined, line, sizeof(line));
+	CHECK(std::strstr(line, "physical 598x341 -> 600x340 mm") != nullptr);
+
+	// ...but anything the size feeds that an app sees (the derived metres) is.
+	xrt_screen_list derived = refined;
+	derived.screens[1].info.width_m = 0.600f;
+	REQUIRE(target_screens_compare(&was, &derived, &c));
+	CHECK(c.other_changed == 1);
+	target_screens_change_format(&was, &derived, line, sizeof(line));
+	CHECK(std::strstr(line, "display info") != nullptr);
+}
+
+TEST_CASE("hotplug screens: a claim-level change and new bounds still publish", "[target][hotplug]")
+{
+	xrt_screen_list not_ready{};
+	not_ready.count = 2;
+	not_ready.screens[0] = screen(BUILTIN, "sim-display", 0, 1512, true);
+	not_ready.screens[1] = screen(ODYSSEY, "leia-sr", 1512, 1920);
+	not_ready.screens[1].confidence = XRT_DISPLAY_CLAIM_PRESENT_NOT_READY;
+
+	// PRESENT_NOT_READY -> claimed (FPC auth finished): same claimant, new level.
+	target_screens_change c{};
+	xrt_screen_list ready = not_ready;
+	ready.screens[1].confidence = 100;
+	REQUIRE(target_screens_compare(&not_ready, &ready, &c));
+	CHECK(c.claim_changed == 1);
+	CHECK(c.claimant_changed == 0);
+	char line[512];
+	target_screens_change_format(&not_ready, &ready, line, sizeof(line));
+	char want[64];
+	std::snprintf(want, sizeof(want), "claim level %u -> 100", (unsigned)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY);
+	CHECK(std::strstr(line, want) != nullptr);
+
+	// The same panel re-bound at new bounds (test D): geometry, even if the
+	// EDID mm were refined in the same sweep.
+	xrt_screen_list rebound = ready;
+	rebound.screens[1].desktop_left = -1920;
+	rebound.screens[1].physical_width_mm = 600;
+	REQUIRE(target_screens_compare(&ready, &rebound, &c));
+	CHECK(c.geometry_changed == 1);
+	CHECK(c.metadata_changed == 0);
+
+	// Same screens, other order (the system default moved to the panel).
+	xrt_screen_list swapped = ready;
+	swapped.screens[0] = ready.screens[1];
+	swapped.screens[1] = ready.screens[0];
+	REQUIRE(target_screens_compare(&ready, &swapped, &c));
+}
 
 /*
  *
