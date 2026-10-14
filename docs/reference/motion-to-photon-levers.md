@@ -104,28 +104,33 @@ not involved (33.6 with it pinned at 2.5 GHz). So the depth is derived from meas
 everywhere, ceiling 4:
 
 - **effective depth = max(lag floor, slip level).**
-- **Floor** (`util/comp_late_weave_depth.h`) — up by measurement, down only by a verified probe:
+- **Floor** (`util/comp_late_weave_depth.h`) — every signal is one the pacer already measures:
   - **Raised by lag.** EMA of commit-to-glass (`wp_presentation` presented − `vkQueuePresentKHR`
-    return; on X11 / without correlated feedback, the return of a present wait that blocked),
-    taken **only from presents committed with 0 of ours outstanding** (the feeder counts committed
-    − answered tags), each sample clamped to EMA ± 0.5 period. The floor rises to round(EMA) once
-    the EMA reaches floor + 0.5 periods: 2 on a composited window, 1 on direct scanout. It is
-    **never lowered by lag**: how much of a sample taken behind our own queue is queueing cannot be
-    observed — a FIFO that withholds the frame adds a period per present ahead, a pipelined
-    compositor adds nothing. Three CI rounds found this out: subtracting nothing ran away to depth 4
-    (residual 1.99 → 3.99 periods); subtracting depth − 1, then the real outstanding count, read a
-    2-period pipeline as ~0.95 periods and dropped to depth 1 (30 present/s for two minutes).
-  - **Raised by depth-1 starvation.** A slip window at depth 1 while the acquire wait dominates the
-    frame (wait EMA ≥ 0.8 period) raises it to 2 without a lag sample.
-  - **Lowered only by a return probe, verified by throughput.** After a 30 s dwell, with the app at
-    rate, the floor steps down one level; the mean frame interval over the next ~1 s is compared
-    with a ~1–2 s EMA from before. A rate drop > 15 %, or 10 frames at ≥ 1.5 periods, reverts it at
-    once, doubles the dwell (30 → 60 → 120 → 300 s) and logs `#2119: late-weave probe failed …`;
-    otherwise `#2119: late-weave probe held …`. A clean lag sample that raises the floor during the
-    probe also fails it. Depth 2 is cheap (the #206 weave→scanout horizon measured the same at
-    depth 1 and 2) while mutter flips its own buffering, and so the same window's lag, between 1
-    and 2 periods within one run (5 s windows at depth 1: 59, 34, 97, 60, 61, 60, 58, 24, 98, 61
-    presents/s) — so staying up costs nothing and coming down is the step that gets checked.
+    return; on X11 the return of a present wait that blocked), taken **only from presents committed
+    with 0 of ours outstanding**, each sample clamped to EMA ± 0.5 period. The floor rises to
+    round(EMA) once the EMA reaches floor + 0.5 periods: 2 on a composited window, 1 on direct
+    scanout. Never lowered by lag — how much of a sample taken behind our own queue is queueing is
+    not observable (a FIFO that withholds the frame adds a period per present ahead; GNOME's
+    pipelined compositor adds nothing).
+  - **Raised by starvation.** In a 30-frame window, ≥ 24 frames that both waited ≥ 0.8 period in
+    the pacer and took ≥ 1.5 periods → one level up. This is the depth-1 serialisation signature,
+    and it catches a wrong lowering within about a second.
+  - **Lowered by slack.** At depth d the pacer waits on present N−(d−1). If over a dwell ≥ 95 % of
+    those waits return in < 0.1 period (the present was already on glass), the pipeline has a period
+    to spare → one level down, no probe. On a 2-period compositor the wait on N−1 stays ~0.7 period,
+    so depth 2 holds; on a 1-period target it is ~0, so depth 1 follows after the dwell. The dwell
+    starts at 5 s and doubles (to 300 s) when a raise follows a lowering within two dwells; the lag
+    EMA is re-learned after a lowering.
+  - **Drain.** After any raise, a frame is not admitted while more than depth − 1 of ours are
+    outstanding (Wayland: committed − answered feedback tags; bounded wait of 1.5 periods), so a
+    slot filled at the lower depth cannot stay queued — round 4 left the residual at 2.97 periods for
+    ~50 s after a revert.
+  - History: subtracting nothing from the lag ran away to depth 4 (residual 1.99 → 3.99 periods);
+    subtracting depth − 1 or the outstanding count misread the pipelined compositor and dropped to
+    depth 1 (30 present/s for two minutes); a 1 s throughput probe worked but cost a second at half
+    rate per probe plus the leftover queue. Depth 2 is cheap: the #206 weave→scanout horizon measured
+    the same at depth 1 and 2, while mutter flips its own buffering between 1 and 2 periods within a
+    run (5 s windows at depth 1: 59, 34, 97, 60, 61, 60, 58, 24, 98, 61 presents/s).
 - **Slip level** — the shared slip machine `util/comp_feedback_pace.h` (the Windows governor's
   rules, also used by feedback pacing) fed with "paced frame interval > 1.55 periods". On this tier
   it banks **no** level above the floor (`banked = 0`; feedback pacing keeps 1): measured on the
@@ -135,10 +140,10 @@ everywhere, ceiling 4:
 - The app's predicted display time follows the depth: at depth > 1 `xrWaitFrame` returns the
   measured `wait_frame → weave + weave → scanout` lookahead (#867's formula) instead of `2 × period`.
 - `DXR_LATE_WEAVE_MAX_LATENCY` set = pinned depth, governor off; `DXR_LATE_WEAVE_AUTOBACKOFF=0` =
-  depth 1. Inert when the tier latches off. Every change logs one throttled WARN naming the
+  depth 1. Inert when the tier latches off. Every change logs one WARN (unthrottled) naming the
   signal: `#2119: late-weave depth 1 -> 2 (commit-to-glass lag; … floor 2, slip level 1, …)`.
   With `DXR_WEAVE_CADENCE_TRACE=1` the 5 s `#206` residual line carries the governor state:
-  `| depth 2 (floor 2, slip level 1, governed), lag at 0 outstanding 1.98 periods, outstanding at last commit 1`.
+  `| depth 2 (floor 2, slip level 1, governed), lag at 0 outstanding 1.98 periods, outstanding at last commit 1, drains 0`.
 
 `VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
 samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in

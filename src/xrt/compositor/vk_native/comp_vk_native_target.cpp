@@ -719,13 +719,12 @@ struct comp_vk_native_target
 	//! feeder from now on, not from present_wait returns.
 	bool pw_lag_from_feedback;
 	uint64_t pw_last_frame_ns;
-	uint64_t pw_depth_log_ns;
-	uint32_t pw_depth_log_suppressed;
 	uint32_t pw_depth_changes;
 	//! Our presents outstanding when the last present was committed.
 	uint32_t pw_last_outstanding;
 	uint64_t pw_cap_log_ns;
 	uint32_t pw_cap_windows;
+	uint32_t pw_drains;
 	//! #2119/#867: xrWaitFrame return (mark) and the EMA of mark -> weave
 	//! start, the app-side half of the lookahead once depth > 1.
 	uint64_t pw_wait_frame_ns;
@@ -2490,16 +2489,16 @@ target_log_residual(struct comp_vk_native_target *target)
 			    comp_residual_window_take(&target->residual_win, target->vblank_grid.period_ns);
 			// #2119: the present_wait depth governor's state rides along, so
 			// one line says whether the residual moved with the depth.
-			char gov[192] = "";
+			char gov[256] = "";
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (target->pw_pace_inited) {
 				snprintf(
 				    gov, sizeof(gov),
 				    " | depth %d (floor %d, slip level %d, %s), lag at 0 outstanding %.2f periods, "
-				    "outstanding at last commit %u",
+				    "outstanding at last commit %u, drains %u",
 				    comp_fb_pace_effective(&target->pw_pace), target->pw_pace.floor,
 				    target->pw_pace.depth, target->pw_governing ? "governed" : "fixed",
-				    target->pw_lag.ema_ns / per, target->pw_last_outstanding);
+				    target->pw_lag.ema_ns / per, target->pw_last_outstanding, target->pw_drains);
 			}
 #endif
 			if (st.n != 0) {
@@ -2590,22 +2589,19 @@ target_pw_depth(const struct comp_vk_native_target *target)
 static void
 target_pw_log_change(struct comp_vk_native_target *target, int from, const char *why, uint64_t now_ns)
 {
+	// Every transition logs: the governor's dwells bound the rate (a lowering
+	// needs a whole dwell of slack), and a suppressed outcome line hid the
+	// round-3 probe reverts.
 	target->pw_depth_changes++;
-	if (target->pw_depth_log_ns != 0 && now_ns - target->pw_depth_log_ns < 2ULL * 1000 * 1000 * 1000) {
-		target->pw_depth_log_suppressed++;
-		return;
-	}
+	(void)now_ns;
 	const uint64_t period_ns = target->vblank_grid.period_ns;
 	U_LOG_W(
-	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag at 0 outstanding %.2f ms = %.2f periods, floor "
-	    "%d, "
-	    "slip level %d, period %.3f ms, probe dwell %llu s; change #%u, %u suppressed since last line)",
+	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag at 0 outstanding %.2f ms = %.2f periods, "
+	    "floor %d, slip level %d, period %.3f ms, lowering dwell %llu s; change #%u)",
 	    from, target_pw_depth(target), why, target->pw_lag.ema_ns / 1e6,
 	    period_ns != 0 ? target->pw_lag.ema_ns / (double)period_ns : 0.0, target->pw_lag.depth,
 	    target->pw_pace.depth, period_ns / 1e6, (unsigned long long)(target->pw_lag.dwell_ns / 1000000000ULL),
-	    target->pw_depth_changes, target->pw_depth_log_suppressed);
-	target->pw_depth_log_suppressed = 0;
-	target->pw_depth_log_ns = now_ns;
+	    target->pw_depth_changes);
 }
 
 /*!
@@ -4059,41 +4055,31 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 					const uint64_t dt =
 					    target->pw_last_frame_ns != 0 ? now_ns - target->pw_last_frame_ns : 0;
 					{
-						// Return probe + its throughput verification (the only
-						// way the floor comes down).
+						// Floor: raised by starvation (the wait is the frame),
+						// lowered by slack (the waited-on present was already on
+						// glass for a whole dwell). Both are free to measure.
 						const int from = target_pw_depth(target);
+						const uint32_t reverted = target->pw_lag.lowers_reverted;
 						const enum comp_lw_lag_event le = comp_lw_lag_on_frame(
 						    &target->pw_lag, dt, now_ns - wait_t0, period_ns, now_ns);
-						if (le == COMP_LW_LAG_PROBE_DOWN || le == COMP_LW_LAG_PROBE_FAILED) {
+						if (le != COMP_LW_LAG_NONE) {
 							comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth,
 							                       now_ns);
-						}
-						if (le == COMP_LW_LAG_PROBE_DOWN && target_pw_depth(target) != from) {
-							target_pw_log_change(
-							    target, from, "return probe (verifying throughput for 1 s)",
-							    now_ns);
-						} else if (le == COMP_LW_LAG_PROBE_FAILED) {
-							// Always logged: the revert is the point of the line.
-							U_LOG_W(
-							    "#2119: late-weave probe failed — depth %d -> %d reverted: "
-							    "mean frame "
-							    "interval %.2f ms after the probe vs %.2f ms before "
-							    "(period %.3f ms); "
-							    "next probe in %llu s",
-							    from, target_pw_depth(target),
-							    target->pw_lag.last_probe_after_ns / 1e6,
-							    target->pw_lag.probe_before_ns / 1e6, period_ns / 1e6,
-							    (unsigned long long)(target->pw_lag.dwell_ns /
-							                         1000000000ULL));
-							target->pw_depth_changes++;
-						} else if (le == COMP_LW_LAG_PROBE_HELD) {
-							U_LOG_W(
-							    "#2119: late-weave probe held at depth %d — mean frame "
-							    "interval %.2f ms "
-							    "after vs %.2f ms before",
-							    target_pw_depth(target),
-							    target->pw_lag.last_probe_after_ns / 1e6,
-							    target->pw_lag.probe_before_ns / 1e6);
+							char why[160];
+							if (le == COMP_LW_LAG_LOWERED_SLACK) {
+								snprintf(why, sizeof(why),
+								         "slack: %.0f%% of present waits < 0.1 period "
+								         "over the dwell",
+								         target->pw_lag.last_slack_share * 100.0);
+							} else {
+								snprintf(why, sizeof(why),
+								         "starvation: the pacer's wait was the frame%s",
+								         target->pw_lag.lowers_reverted != reverted
+								             ? " — the last lowering was wrong, dwell "
+								               "doubled"
+								             : "");
+							}
+							target_pw_log_change(target, from, why, now_ns);
 						}
 					}
 					if (period_ns != 0 && dt != 0 && dt < 250ULL * 1000 * 1000) {
@@ -4105,18 +4091,8 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 							target_pw_log_change(target, from,
 							                     e == COMP_FB_PACE_DEEPER
 							                         ? "saturation: slip-rate escalation"
-							                         : "return probe",
+							                         : "slip-level return probe",
 							                     now_ns);
-						} else if (e == COMP_FB_PACE_AT_CAP &&
-						           comp_lw_lag_on_slip_window_at_cap(&target->pw_lag, period_ns,
-						                                             now_ns)) {
-							// Depth-1 serialisation: slipping while the acquire
-							// wait dominates the frame. Raise without a lag sample.
-							comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth,
-							                       now_ns);
-							target_pw_log_change(
-							    target, from, "depth-1 starvation: slip window, wait-bound",
-							    now_ns);
 						} else if (e == COMP_FB_PACE_AT_CAP) {
 							target->pw_cap_windows++;
 							if (target->pw_cap_log_ns == 0 ||
@@ -4130,6 +4106,37 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 								    "(%u such windows so far)",
 								    from, target->pw_cap_windows);
 								target->pw_cap_log_ns = now_ns;
+							}
+						}
+					}
+					// Drain: never admit a frame with more of ours outstanding
+					// than the depth allows — after a raise the frames admitted
+					// at the lower depth would otherwise stay queued for good
+					// (round 4: residual 2.97 periods for ~50 s after a revert).
+					// Wayland only: X11 Present carries no tag of ours.
+					if (target->pw_lag_from_feedback && target->present_fb != NULL) {
+						const int d = target_pw_depth(target);
+						uint64_t tag =
+						    comp_lw_lag_drain_tag(target->pf_seq, target->pf_answered_seq, d);
+						if (tag != 0) {
+							target_feed_present_feedback(target); // count may be stale
+							tag = comp_lw_lag_drain_tag(target->pf_seq,
+							                            target->pf_answered_seq, d);
+						}
+						if (tag != 0) {
+							const uint64_t ahead = target->pf_seq - target->pf_answered_seq;
+							(void)comp_vk_native_present_feedback_wait(
+							    target->present_fb, tag,
+							    comp_fb_pace_timeout_ns(period_ns));
+							target_feed_present_feedback(target);
+							if (target->pw_drains++ == 0) {
+								U_LOG_W(
+								    "#2119: drained the present queue to depth %d "
+								    "before admitting a "
+								    "frame (%llu of ours were outstanding); further "
+								    "drains are counted "
+								    "on the #206 line",
+								    d, (unsigned long long)ahead);
 							}
 						}
 					}

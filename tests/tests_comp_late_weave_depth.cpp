@@ -3,9 +3,9 @@
 /*!
  * @file
  * @brief  Unit tests for the present_wait depth governor (#2119): the depth
- *         floor (comp_late_weave_depth.h — raised by clean lag samples and
- *         depth-1 starvation, lowered only by a throughput-verified probe) on
- *         top of the shared slip machine (comp_feedback_pace.h).
+ *         floor (comp_late_weave_depth.h — raised by clean lag samples or
+ *         starvation, lowered by slack) on top of the shared slip machine
+ *         (comp_feedback_pace.h), and the queue drain after a raise.
  */
 
 #include "catch_amalgamated.hpp"
@@ -25,13 +25,11 @@ struct gov
 	uint64_t now = 1 * S;
 	uint64_t last_frame = 0;
 	int raises = 0;
+	int lowers = 0;
+	int changes = 0;
 	int at_cap = 0;
-	int probes_down = 0;
-	int probes_failed = 0;
-	int probes_held = 0;
-	uint64_t last_probe_down = 0;
-	uint64_t min_probe_gap = UINT64_MAX;
-	uint64_t last_fail_revert_ns = 0; //!< probe -> revert time of the last failure
+	uint64_t last_lower = 0;
+	uint64_t min_lower_gap = UINT64_MAX;
 
 	gov()
 	{
@@ -50,53 +48,43 @@ struct gov
 	/*!
 	 * One paced frame: interval @p dt since the last one; a commit-to-glass
 	 * sample @p lag_ns (0 = none) committed with @p outstanding of ours ahead;
-	 * the acquire wait @p wait_ns.
+	 * the present wait @p wait_ns.
 	 */
 	void
-	frame(uint64_t dt, uint64_t lag_ns, uint32_t outstanding = 0, uint64_t wait_ns = 0)
+	frame(uint64_t dt, uint64_t lag_ns, uint32_t outstanding, uint64_t wait_ns)
 	{
 		now += dt;
+		const int before = depth();
 		if (lag_ns != 0 && comp_lw_lag_on_sample(&lag, lag_ns, outstanding, P60, now)) {
-			if (lag.probes_failed > (uint32_t)probes_failed) {
-				probes_failed = (int)lag.probes_failed;
-				last_fail_revert_ns = now - last_probe_down;
-			}
 			raises++;
 			comp_fb_pace_set_floor(&pace, lag.depth, now);
 		}
 		const uint64_t interval = last_frame != 0 ? now - last_frame : 0;
 		const comp_lw_lag_event le = comp_lw_lag_on_frame(&lag, interval, wait_ns, P60, now);
-		if (le == COMP_LW_LAG_PROBE_DOWN) {
-			probes_down++;
-			if (last_probe_down != 0 && now - last_probe_down < min_probe_gap) {
-				min_probe_gap = now - last_probe_down;
+		if (le == COMP_LW_LAG_LOWERED_SLACK) {
+			lowers++;
+			if (last_lower != 0 && now - last_lower < min_lower_gap) {
+				min_lower_gap = now - last_lower;
 			}
-			last_probe_down = now;
-		} else if (le == COMP_LW_LAG_PROBE_FAILED) {
-			probes_failed = (int)lag.probes_failed;
-			last_fail_revert_ns = now - last_probe_down;
-		} else if (le == COMP_LW_LAG_PROBE_HELD) {
-			probes_held++;
+			last_lower = now;
+		} else if (le == COMP_LW_LAG_RAISED_STARVED) {
+			raises++;
 		}
 		if (le != COMP_LW_LAG_NONE) {
 			comp_fb_pace_set_floor(&pace, lag.depth, now);
 		}
-		if (interval != 0) {
-			const comp_fb_pace_event e =
-			    comp_fb_pace_on_wait(&pace, !comp_lw_lag_is_slip(interval, P60), wait_ns, now);
-			if (e == COMP_FB_PACE_AT_CAP) {
-				at_cap++;
-				if (comp_lw_lag_on_slip_window_at_cap(&lag, P60, now)) {
-					raises++;
-					comp_fb_pace_set_floor(&pace, lag.depth, now);
-				}
-			}
+		if (interval != 0 && comp_fb_pace_on_wait(&pace, !comp_lw_lag_is_slip(interval, P60), wait_ns, now) ==
+		                         COMP_FB_PACE_AT_CAP) {
+			at_cap++;
+		}
+		if (depth() != before) {
+			changes++;
 		}
 		last_frame = now;
 	}
 
 	void
-	run(int n, uint64_t dt, uint64_t lag_ns, uint32_t outstanding = 0, uint64_t wait_ns = 0)
+	run(int n, uint64_t dt, uint64_t lag_ns, uint32_t outstanding, uint64_t wait_ns)
 	{
 		for (int i = 0; i < n; i++) {
 			frame(dt, lag_ns, outstanding, wait_ns);
@@ -104,22 +92,22 @@ struct gov
 	}
 
 	/*!
-	 * A composited desktop with a PIPELINED 2-period compositor: at depth 1 the
-	 * loop serialises to 2 periods per frame; at depth >= 2 it runs at rate.
-	 * Lag samples exist only at depth 1 (at 2 one of ours is always outstanding,
-	 * and the raw sample still reads 2 periods). @p with_lag false = no clean
-	 * samples at all (e.g. X11 with no wait that blocked).
+	 * A composited desktop with a pipelined 2-period compositor. At depth 1
+	 * the loop serialises to 2 periods per frame and the wait is most of it;
+	 * at depth 2 it runs at rate and the wait on N−1 is still ~0.7 period
+	 * (round 4's measurement). Lag samples exist only at depth 1.
+	 * @p time_at_1 accumulates the time spent at depth 1.
 	 */
 	void
-	composited(int n, bool with_lag, uint64_t *under_half_ns = nullptr)
+	composited(int n, uint64_t *time_at_1 = nullptr)
 	{
 		for (int i = 0; i < n; i++) {
 			const bool d1 = depth() == 1;
 			const uint64_t dt = d1 ? 2 * P60 : P60;
-			if (d1 && under_half_ns != nullptr) {
-				*under_half_ns += dt;
+			if (d1 && time_at_1 != nullptr) {
+				*time_at_1 += dt;
 			}
-			frame(dt, with_lag || !d1 ? 2 * P60 : 0, d1 ? 0 : 1, d1 ? P60 + P60 / 4 : P60 / 4);
+			frame(dt, 2 * P60, d1 ? 0 : 1, d1 ? P60 + P60 / 4 : P60 * 7 / 10);
 		}
 	}
 };
@@ -134,7 +122,7 @@ TEST_CASE("lw depth: base is 1 before anything is measured")
 TEST_CASE("lw depth: a composited window (2-period commit-to-glass lag) paces at depth 2")
 {
 	gov g;
-	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, P60 * 19 / 10);
+	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, P60 * 19 / 10, 0, P60);
 	CHECK(g.lag.depth == 2);
 	CHECK(g.depth() == 2);
 	CHECK(comp_fb_pace_wait_target(&g.pace, 10) == 9);
@@ -143,10 +131,9 @@ TEST_CASE("lw depth: a composited window (2-period commit-to-glass lag) paces at
 TEST_CASE("lw depth: a direct-scanout target (sub-period lag) stays at depth 1")
 {
 	gov g;
-	g.run(60 * 60, P60, P60 * 8 / 10);
-	CHECK(g.lag.depth == 1);
+	g.run(60 * 60, P60, P60 * 8 / 10, 0, P60 / 5);
 	CHECK(g.depth() == 1);
-	CHECK(g.probes_down == 0);
+	CHECK(g.changes == 0);
 }
 
 TEST_CASE("lw depth: lag samples taken behind our own presents are ignored")
@@ -162,73 +149,70 @@ TEST_CASE("lw depth: lag samples taken behind our own presents are ignored")
 	CHECK(l.depth == 1);
 }
 
-TEST_CASE("lw depth: round 3 replay — the floor never falls by lag, a failed probe reverts fast")
+TEST_CASE("lw depth: round 4 replay — on a 2-period compositor depth 2 never lowers")
 {
-	// Round 3 on a198c95: depth 2 at rate (residual 1.99), raw samples of 2
-	// periods with 1 of ours outstanding; the subtracting build read that as
-	// 0.95 periods, dropped to 1 and sat at 30 present/s for ~2 minutes.
+	// Round 4 (21c965e): the throughput probe lowered to 1 every dwell and a
+	// revert left an extra frame queued. With slack as the lowering signal the
+	// wait on N−1 (~0.7 period every frame at depth 2 here) never says
+	// "already on glass", so depth 2 holds for good: only `1 -> 2`.
 	gov g;
-	g.composited(60 * 5, true); // rises to 2 from the clean depth-1 samples
-	REQUIRE(g.depth() == 2);
+	uint64_t at1 = 0;
+	g.composited(60 * 600, &at1); // 10 minutes
+	CHECK(g.depth() == 2);
+	CHECK(g.changes == 1);
+	CHECK(g.lowers == 0);
+	CHECK(at1 < 1 * S); // only the start-up frames before the first raise
+}
 
-	// 10 minutes. Lag samples are never allowed to lower it; only probes do,
-	// each one must be reverted within ~1 s, the dwell must double, and the
-	// app must never spend more than ~2 s under half its pre-probe rate.
-	uint64_t under_half = 0;
-	int fails_before = g.probes_failed;
-	for (int i = 0; i < 600; i++) {
-		const int before = g.probes_failed;
-		uint64_t spell = 0;
-		g.composited(60, true, &spell);
-		under_half += spell;
-		CHECK(spell <= 2 * S);
-		if (g.probes_failed > before) {
-			CHECK(g.last_fail_revert_ns <= 1100 * MS);
+TEST_CASE("lw depth: on a 1-period target the wait on N−1 is ~0, so it lowers to 1 after the dwell and stays")
+{
+	gov g;
+	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, 2 * P60, 0, P60); // a transient raised it to 2
+	REQUIRE(g.depth() == 2);
+	const uint64_t raised_at = g.now;
+	// Now a direct-scanout target: at depth 2 the waited-on present is always
+	// on glass already; at depth 1 the loop keeps the rate.
+	for (int i = 0; i < 60 * 120; i++) {
+		const bool d2 = g.depth() == 2;
+		g.frame(P60, P60 * 8 / 10, d2 ? 1 : 0, d2 ? 0 : P60 / 5);
+	}
+	CHECK(g.depth() == 1);
+	CHECK(g.lowers == 1);
+	CHECK(g.last_lower - raised_at >= COMP_LW_DWELL_NS);
+	CHECK(g.last_lower - raised_at <= 2 * COMP_LW_DWELL_NS + S);
+}
+
+TEST_CASE("lw depth: a wrong lowering is caught by starvation within ~1 s and the dwell doubles")
+{
+	// An app throttled elsewhere (waits ~0 at depth 2) on a compositor where
+	// depth 1 serialises: slack lowers, starvation raises, and the doubling
+	// dwell makes each such lowering rarer. No lag samples at all.
+	gov g;
+	g.run(COMP_LW_STARVE_WINDOW + 1, 2 * P60, 0, 0, P60 + P60 / 4); // starvation: 1 -> 2
+	REQUIRE(g.depth() == 2);
+	uint64_t longest_at_1 = 0, spell = 0;
+	for (int i = 0; i < 60 * 600; i++) {
+		const bool d1 = g.depth() == 1;
+		g.frame(d1 ? 2 * P60 : P60, 0, 0, d1 ? P60 + P60 / 4 : 0);
+		if (d1) {
+			spell += d1 ? 2 * P60 : 0;
+			longest_at_1 = spell > longest_at_1 ? spell : longest_at_1;
+		} else {
+			spell = 0;
 		}
 	}
-	CHECK(g.probes_down >= 3);
-	CHECK(g.probes_failed - fails_before == g.probes_down);
-	CHECK(g.probes_held == 0);
 	CHECK(g.depth() == 2);
-	// 30 -> 60 -> 120 -> 300 s: probes get rarer, never more often than 30 s.
-	CHECK(g.min_probe_gap >= COMP_LW_PROBE_DWELL_NS);
-	CHECK(g.lag.dwell_ns >= 4 * COMP_LW_PROBE_DWELL_NS);
-	CHECK(under_half <= 2 * S * (uint64_t)g.probes_down);
+	CHECK(longest_at_1 <= 1100 * MS);
+	CHECK(g.lag.lowers_reverted == (uint32_t)g.lowers);
+	CHECK(g.lowers <= 7);                           // 5, 10, 20, 40, 80, 160, 300 s
+	CHECK(g.lag.dwell_ns >= 32 * COMP_LW_DWELL_NS); // doubled every time
+	CHECK(g.min_lower_gap >= 2 * COMP_LW_DWELL_NS);
 }
 
-TEST_CASE("lw depth: without lag samples a probe is reverted by throughput alone")
+TEST_CASE("lw depth: depth-1 starvation raises to 2 without a lag sample")
 {
 	gov g;
-	g.composited(60 * 5, true);
-	REQUIRE(g.depth() == 2);
-	// From here no clean lag sample ever arrives: the revert must come from
-	// the throughput check.
-	uint64_t under_half = 0;
-	g.composited(60 * 40, false, &under_half);
-	CHECK(g.probes_down == 1);
-	CHECK(g.probes_failed == 1);
-	CHECK(g.depth() == 2);
-	CHECK(g.lag.dwell_ns == 2 * COMP_LW_PROBE_DWELL_NS);
-	CHECK(g.last_fail_revert_ns <= 1100 * MS);
-	CHECK(under_half <= 1100 * MS);
-}
-
-TEST_CASE("lw depth: a probe that keeps the rate holds the lower depth")
-{
-	gov g;
-	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, 2 * P60); // transient: floor 2
-	REQUIRE(g.depth() == 2);
-	// The compositor went to direct scanout: depth 1 runs at rate, lag 0.8.
-	g.run(60 * 35, P60, 0);
-	CHECK(g.probes_down == 1);
-	CHECK(g.probes_held == 1);
-	CHECK(g.depth() == 1);
-}
-
-TEST_CASE("lw depth: depth-1 starvation (slipping, wait-bound) raises to 2 without a lag sample")
-{
-	gov g;
-	g.run(COMP_FB_PACE_WINDOW + 1, 2 * P60, 0, 0, P60 + P60 / 4);
+	g.run(COMP_LW_STARVE_WINDOW + 1, 2 * P60, 0, 0, P60 + P60 / 4);
 	CHECK(g.depth() == 2);
 	CHECK(g.raises == 1);
 }
@@ -244,42 +228,47 @@ TEST_CASE("lw depth: a render-bound slipper at depth 1 is not starvation")
 	CHECK(g.at_cap == 3);
 }
 
-TEST_CASE("lw depth: with a floor of 2, slipping windows stay at 2")
+TEST_CASE("lw depth: the drain brings our outstanding presents back to depth - 1 within one frame")
 {
-	gov g;
-	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, 2 * P60);
-	REQUIRE(g.depth() == 2);
-	g.run(COMP_FB_PACE_WINDOW * 4, 2 * P60, 2 * P60, 1);
-	CHECK(g.depth() == 2);
-	CHECK(g.at_cap >= 3);
+	CHECK(comp_lw_lag_drain_tag(10, 9, 2) == 0); // 1 outstanding at depth 2: fine
+	CHECK(comp_lw_lag_drain_tag(10, 8, 2) == 9); // 2 outstanding: wait for tag 9
+	CHECK(comp_lw_lag_drain_tag(10, 7, 1) == 10);
+	CHECK(comp_lw_lag_drain_tag(10, 10, 1) == 0);
+	CHECK(comp_lw_lag_drain_tag(0, 0, 2) == 0);
+
+	// Round 4's leftover: a revert to depth 2 found 2 of ours outstanding. The
+	// next admission drains to depth - 1 = 1, and the queue then stays there.
+	uint64_t last = 100, answered = 98;
+	const int depth = 2;
+	for (int f = 0; f < 10; f++) {
+		const uint64_t tag = comp_lw_lag_drain_tag(last, answered, depth);
+		if (tag != 0) {
+			answered = tag; // the feedback wait returns once tag is answered
+		}
+		CHECK(last - answered <= (uint64_t)(depth - 1)); // at admission
+		last++;                                          // commit
+		answered++;                                      // one present reaches glass per period
+	}
 }
 
 TEST_CASE("lw depth: a lag flipping 1 -> 2 -> 1 periods never flaps faster than the dwell")
 {
-	// mutter's dynamic buffering: the compositor flips between a 1- and a
+	// mutter's dynamic buffering flips the compositor between a 1- and a
 	// 2-period pipeline in 5 s spells (measured 59, 34, 97, 60, ... present/s).
 	gov g;
-	int changes = 0;
-	int prev = g.depth();
 	for (int spell = 0; spell < 120; spell++) { // 10 minutes
 		const bool two = (spell & 1) != 0;
 		for (int i = 0; i < 5 * 60; i++) {
 			const bool d1 = g.depth() == 1;
 			const uint64_t dt = (d1 && two) ? 2 * P60 : P60;
 			const uint64_t lag = two ? 2 * P60 : P60 * 9 / 10;
-			g.frame(dt, lag, d1 ? 0 : 1, d1 && two ? P60 : P60 / 4);
-			if (g.depth() != prev) {
-				changes++;
-				prev = g.depth();
-			}
+			const uint64_t wait = d1 ? (two ? P60 + P60 / 4 : P60 / 5) : (two ? P60 * 7 / 10 : 0);
+			g.frame(dt, lag, d1 ? 0 : 1, wait);
 		}
 	}
-	CHECK(g.depth() >= 1);
-	// It rose on the first 2-period spell; every lowering since is a probe, and
-	// probes are at least a dwell apart.
-	CHECK(g.min_probe_gap >= COMP_LW_PROBE_DWELL_NS);
-	// 10 minutes of 5 s flips: one rise plus at most a probe and its outcome per dwell.
-	CHECK(changes <= 1 + 2 * (int)(600 * S / COMP_LW_PROBE_DWELL_NS));
+	CHECK(g.min_lower_gap >= COMP_LW_DWELL_NS);
+	CHECK(g.changes <= 1 + 2 * (int)(600 * S / COMP_LW_DWELL_NS));
+	CHECK(g.lag.dwell_ns >= COMP_LW_DWELL_NS);
 }
 
 TEST_CASE("lw depth: the raise threshold is floor + 0.5 periods, stalls are ignored")
@@ -336,7 +325,7 @@ TEST_CASE("lw depth: replay of the second CI build's log stays at depth <= 2")
 		}
 		const bool burst = (i / COMP_FB_PACE_WINDOW) % 3 == 1;
 		const bool slip = burst ? (i % 10 == 0) : (next() % 30 == 0);
-		g.frame(slip ? 2 * P60 : P60, raw, outstanding, P60 / 4);
+		g.frame(slip ? 2 * P60 : P60, raw, outstanding, P60 / 2);
 		max_depth = g.depth() > max_depth ? g.depth() : max_depth;
 		if (g.lag.samples >= COMP_LW_LAG_MIN_SAMPLES) {
 			const double e = g.lag.ema_ns / (double)P60;
@@ -345,6 +334,7 @@ TEST_CASE("lw depth: replay of the second CI build's log stays at depth <= 2")
 		}
 	}
 	CHECK(max_depth == 2);
+	CHECK(g.depth() == 2);
 	CHECK(min_ema >= 1.5);
 	CHECK(max_ema <= 2.5);
 	CHECK(g.at_cap > 0);
