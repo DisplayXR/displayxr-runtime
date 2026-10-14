@@ -68,12 +68,24 @@ read_edid_from_regkey(HKEY hKey,
                       uint32_t *out_width_mm,
                       uint32_t *out_height_mm)
 {
-	BYTE edid_buf[256];
-	DWORD edid_size = sizeof(edid_buf);
+	// Size the buffer from the value: an EDID with more than one extension
+	// block (e.g. Samsung Odyssey 3D, 384 bytes) does not fit a fixed 256-byte
+	// buffer, and RegQueryValueExA then fails with ERROR_MORE_DATA and reads
+	// nothing, so the monitor silently drops out of the list.
+	DWORD edid_size = 0;
 	DWORD type = 0;
-
-	LONG ret = RegQueryValueExA(hKey, "EDID", NULL, &type, edid_buf, &edid_size);
+	LONG ret = RegQueryValueExA(hKey, "EDID", NULL, &type, NULL, &edid_size);
 	if (ret != ERROR_SUCCESS || edid_size < 16) {
+		return false;
+	}
+
+	BYTE *edid_buf = (BYTE *)malloc(edid_size);
+	if (edid_buf == NULL) {
+		return false;
+	}
+	ret = RegQueryValueExA(hKey, "EDID", NULL, &type, edid_buf, &edid_size);
+	if (ret != ERROR_SUCCESS || edid_size < 16) {
+		free(edid_buf);
 		return false;
 	}
 
@@ -89,6 +101,7 @@ read_edid_from_regkey(HKEY hKey,
 	if (os_display_edid_parse(edid_buf, edid_size, &parsed)) {
 		os_display_edid_parsed_mm(&parsed, out_width_mm, out_height_mm);
 	}
+	free(edid_buf);
 	return true;
 }
 
@@ -324,6 +337,19 @@ enumerate_via_displayconfig(struct os_display_edid_list *out_list, const struct 
 			}
 		}
 
+		// Skip a monitor the SetupAPI pass already resolved, so this pass
+		// can fill gaps next to it instead of only running when it found none.
+		bool already_listed = false;
+		for (uint32_t i = 0; mon->hmonitor != NULL && i < out_list->count; i++) {
+			if (out_list->monitors[i].hmonitor == mon->hmonitor) {
+				already_listed = true;
+				break;
+			}
+		}
+		if (already_listed) {
+			continue;
+		}
+
 		out_list->count++;
 		out_list->diag_displayconfig_count++;
 	}
@@ -493,9 +519,10 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		}
 	}
 
-	// Durable fallback: the registry EDID blob was missing or uncorrelated
-	// on this box. Resolve panels straight from the OS display topology.
-	if (out_list->count == 0) {
+	// Durable fallback: a registry EDID blob was missing, unreadable or
+	// uncorrelated for at least one monitor. Resolve the rest straight from
+	// the OS display topology (monitors already listed are skipped).
+	if (out_list->count < gdi_ctx.count) {
 		enumerate_via_displayconfig(out_list, &gdi_ctx);
 	}
 
