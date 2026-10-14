@@ -633,9 +633,10 @@ jobs:
       # guard refuses by design, so the documented dev override is set for
       # this step only. Rows are HKLM (the runner is admin) and are removed in
       # the finally block. Every verdict is read from `selftest --json` fields,
-      # never from log text. Gaps, by design, until N3 lands: DP has no
-      # `Enabled` (#2049) and input/conversion have no `prefer` verb through
-      # the loader (#2048), so those two cells are not asserted yet.
+      # never from log text. Preferred-wins is asserted for the DP
+      # (`PreferredPlugin`) and conversion (`PreferredProvider\<task>`); the
+      # input case lands with its verb (#2048). DP `Enabled=0` lands with
+      # #2049. Those two cells are the only ones not asserted yet.
       - name: Per-class conformance (ADR-054 N4)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
@@ -724,6 +725,29 @@ jobs:
             reg delete $dpRoot /v PreferredPlugin /f | Out-Null
             reg delete "$dpRoot\sim-display-alt" /f | Out-Null
 
+            # 3b. Preferred wins (conversion): `PreferredProvider\<task>` = sim-conversion for
+            # a task where the built-in dp-lift row outranks it by ProbeOrder (150 vs 250).
+            # Read from the headless `conv list --json` selection, the same pass the
+            # conversion core runs; the task is picked from the data so the assertion
+            # does not depend on which capabilities the sim provider happens to ship.
+            function ConvList-Json {
+              $raw = (& $cli conv list --json 2>$null | Out-String)
+              $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+              if ($s -lt 0 -or $e -le $s) { throw "conv list --json emitted no JSON object" }
+              return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+            }
+            $cl = ConvList-Json
+            $behind = $cl.tasks | Where-Object { $_.provider -eq "sim-conversion" -and -not $_.selected } | Select-Object -First 1
+            Expect ($null -ne $behind) "conversion: sim-conversion offers a task where it is ranked behind the selection (rows: $(($cl.tasks | ForEach-Object { $_.task + ':' + $_.provider + ':' + $_.selected }) -join ', '))"
+            if ($null -ne $behind) {
+              $convTask = $behind.task
+              reg add "$cvRoot\PreferredProvider" /v $convTask /t REG_SZ /d "sim-conversion" /f | Out-Null
+              $cl = ConvList-Json
+              $sel = $cl.tasks | Where-Object { $_.task -eq $convTask -and $_.selected } | Select-Object -First 1
+              Expect ($sel.provider -eq "sim-conversion") "conversion: PreferredProvider\$convTask=sim-conversion is selected over ProbeOrder (got '$($sel.provider)')"
+              reg delete "$cvRoot\PreferredProvider" /v $convTask /f | Out-Null
+            }
+
             # 4. ABI-major mismatch, per class: rejected, never dispatched, fallen through.
             Reg-Row $dpRoot "abi-fixture-dp" $fxDp 10
             Reg-Row $inRoot "abi-fixture-input" $fxIn 10
@@ -751,6 +775,7 @@ jobs:
             }
             reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
             if ($simHash) { reg delete "HKLM\Software\DisplayXR\Trust\Allowlist" /v $simHash /f 2>$null | Out-Null }
+            reg delete "$cvRoot\PreferredProvider" /f 2>$null | Out-Null
             Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
             Remove-Item Env:\DXR_ALLOW_DEV_PLUGIN_PATHS -ErrorAction SilentlyContinue
           }
