@@ -182,7 +182,18 @@ jobs:
       # half of the Android whole-page overlay (runtime #1835 v18 + #1845, browser-pvt#242).
       # Moved in lockstep with leia_plugin v2.12.0 (the first plug-in release built against
       # 0.10.75, set_overlay_2d on Android) and versions.json cnsdk_services.
-      CNSDK_TAG: v0.10.75
+      # v0.10.78: matches leia-plugin v2.15.3 (built against
+      # cnsdk-android-0.10.78+198.2a9d252.zip). Brings CNSDK #748 (the weave
+      # submits on the queue the plug-in passes via
+      # leia_interlacer_vulkan_initialize_with_queue -- the runtime's own weave
+      # queue -- instead of the app's family-0/idx-0 queue; renderSceneFence
+      # ringed per in-flight frame; semaphore waits at FRAGMENT_SHADER so the
+      # interlace pass's sampling of the prefilter output is covered) and
+      # CNSDK #724 (Android head tracking moves from the Blink detector to
+      # MediaPipe; service APKs are variant-suffixed, the bundle takes -63mm).
+      # v0.10.76/77 are tags without a release and 0.10.77's loader mis-declares
+      # the _with_queue slot -- 0.10.78 is the first pinnable tag (CNSDK #751).
+      CNSDK_TAG: v0.10.78
 
     steps:
 
