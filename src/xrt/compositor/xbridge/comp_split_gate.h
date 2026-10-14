@@ -106,11 +106,11 @@ enum comp_split_ingress_policy
  *
  * **The token name predates #1252 and is now slightly narrower than the truth:**
  * the kill switch is resolved through the settings chain, so it can also come
- * from the per-user store the Control Panel writes or from the machine default,
+ * from the per-user store the Dashboard writes or from the machine default,
  * with no environment variable set anywhere. The token is deliberately NOT
  * renamed — it is a closed-set identifier that shipped field logs and
  * `docs/reference/adapter-selection.md` are grepped for. To find out WHICH
- * source set it, ask `displayxr-cli perf list` (or the Control Panel), which
+ * source set it, ask `displayxr-cli perf list` (or the Dashboard), which
  * reports the provenance.
  */
 #define COMP_SPLIT_REASON_KILLED_BY_ENV "killed_by_env"

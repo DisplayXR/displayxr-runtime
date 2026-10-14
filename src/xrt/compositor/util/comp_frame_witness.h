@@ -62,7 +62,7 @@ struct comp_frame_witness
 		int e = enabled.load(std::memory_order_relaxed);
 		if (e < 0) {
 			// #1252: settings chain (env > per-user > machine). This is one of
-			// the two levers the Control Panel's Diagnostics toggle drives.
+			// the two levers the Dashboard's Diagnostics toggle drives.
 			char buf[64];
 			const char *v = u_setting_get_raw("DXR_FRAME_WITNESS", buf, sizeof(buf), nullptr);
 			long secs = (v != nullptr && v[0] != '\0') ? atol(v) : 0;

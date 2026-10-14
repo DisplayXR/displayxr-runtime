@@ -96,7 +96,7 @@ uint32_t (*probe_displays)(struct xrt_plugin_instance *inst,
 #378 added a single global `PreferredPlugin`. Generalize to per-monitor:
 a `PreferredPlugin\<monitor-key>` value (monitor-key = `MFR+PRODUCT` or a
 device-path hash) pins a specific plug-in id to a specific display; the global
-value remains the default. `displayxr-cli dp` / the Control Panel "Displays" tab
+value remains the default. `displayxr-cli dp` / the Dashboard "Displays" page
 gain a per-row assignment.
 
 ## Vendor migration example (minimal)

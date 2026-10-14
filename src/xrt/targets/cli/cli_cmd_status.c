@@ -5,7 +5,7 @@
  * @brief  `status [--json] [--watch [--interval ms]]` — the display status
  *         snapshot (ADR-051 D4).
  *
- * The one per-screen view the CLI, the Control Panel and agents share: the
+ * The one per-screen view the CLI, the Dashboard and agents share: the
  * snapshot from the running service when one is reachable (a session-free
  * DIAG connection, like `clients`), else the headless one this process builds
  * (labelled `source: headless` — "what a process starting now would get", not
@@ -15,7 +15,7 @@
  * `--watch` keeps ONE DIAG connection, polls the service's three generation
  * counters every `--interval` ms (default 500, floor 100) and fetches + prints
  * the snapshot only when one moved — one NDJSON line per change with `--json`
- * (what the Control Panel reads), else the §7 table redrawn in place. Without
+ * (what the Dashboard reads), else the §7 table redrawn in place. Without
  * a service it prints the headless snapshot once and keeps trying to connect.
  * Ends on Ctrl-C or when stdin reaches EOF (a parent that closes the pipe).
  *
@@ -290,7 +290,7 @@ on_signal(int sig)
 
 /*!
  * True once stdin has reached EOF — the parent that spawned us closed its end
- * (the Control Panel's way to stop a `--watch` child). A console stdin never
+ * (the Dashboard's way to stop a `--watch` child). A console stdin never
  * reports EOF here (Ctrl-C ends a console session); anything we read is
  * discarded.
  */

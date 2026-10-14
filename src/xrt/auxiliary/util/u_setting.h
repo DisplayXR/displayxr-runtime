@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Persisted runtime settings — the store the Control Panel writes and
+ * @brief  Persisted runtime settings — the store the Dashboard writes and
  *         the runtime reads *inside the app's own process*.
  * @ingroup aux_util
  *
  * ## Why this exists
  *
- * Every runtime tuning lever is an environment variable, and the Control Panel
- * cannot set one for an app it does not launch — which is every app. The panel
- * is a separate, non-elevated process; the runtime DLL lives in the app's. So
+ * Every runtime tuning lever is an environment variable, and the Dashboard
+ * cannot set one for an app it does not launch — which is every app. The
+ * Dashboard is a separate, non-elevated process; the runtime DLL lives in the app's. So
  * the only channel that reaches an arbitrary app is a store the runtime reads
  * from inside that process. This is that store.
  *
@@ -63,7 +63,7 @@ enum u_setting_source
 {
 	U_SETTING_SOURCE_DEFAULT = 0, //!< Nothing set it; the caller's own default stands.
 	U_SETTING_SOURCE_ENV,         //!< Environment variable / Android system property.
-	U_SETTING_SOURCE_USER,        //!< Per-user settings file (what the Control Panel writes).
+	U_SETTING_SOURCE_USER,        //!< Per-user settings file (what the Dashboard writes).
 	U_SETTING_SOURCE_MACHINE,     //!< Machine-wide default (HKLM; needs admin to write).
 };
 
@@ -103,7 +103,7 @@ u_setting_managed_name(uint32_t index);
 
 /*
  *
- * Writing the per-user store. Used by `displayxr-cli perf`; the Control Panel
+ * Writing the per-user store. Used by `displayxr-cli perf`; the Dashboard
  * goes through the CLI rather than writing the file itself, so there is one
  * writer (the same shape as the `PreferredPlugin` override).
  *

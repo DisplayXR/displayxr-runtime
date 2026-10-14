@@ -224,10 +224,10 @@ public sealed class DashboardContext
     }
 
     /// <summary>
-    /// Run CLI writes in order (one writer, the CLI; the panel never writes a
-    /// setting itself), stop at the first failure, then re-read the resolved
-    /// state: what the page shows is what the chain resolved, never what the
-    /// click assumed (control_panel_main.c perf_action).
+    /// Run CLI writes in order (one writer, the CLI; the dashboard never
+    /// writes a setting itself), stop at the first failure, then re-read the
+    /// resolved state: what the page shows is what the chain resolved, never
+    /// what the click assumed.
     /// </summary>
     public async Task RunActionsAsync(string area, params string[] commands)
     {

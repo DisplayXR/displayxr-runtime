@@ -873,15 +873,21 @@ client_dll_ok:
 	; nothing wrong. `displayxr-cli runtime` replaces it.
 	Delete "$INSTDIR\DisplayXRSwitcher.exe"
 
-	; Diagnostics CLI + Control Panel GUI (the Control Panel shells out to the
-	; CLI; both replace the retired DisplayXRSwitcher — #378). SDL2.dll (the
-	; Control Panel's only extra dep) is picked up by the *.dll sweep below.
+	; Sweep the retired ImGui Control Panel. The DisplayXR Dashboard below
+	; replaced it, and an in-place upgrade would otherwise leave the old exe
+	; (and its Start Menu shortcut) behind — still launchable, still looking
+	; current. The SDL2.dll it used stays: displayxr-service.exe and
+	; DisplayXRClient.dll import it too (debug GUI / qwerty), via the *.dll
+	; sweep below.
+	Delete "$INSTDIR\displayxr-control-panel.exe"
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk"
+
+	; Diagnostics CLI + DisplayXR Dashboard GUI (the Dashboard shells out to
+	; the CLI; together they replace the retired DisplayXRSwitcher — #378).
+	; The Dashboard (src/dashboard, Avalonia/.NET, ADR-051 D4) is a
+	; self-contained single-file exe. /nonfatal: a build without the .NET SDK
+	; has no dashboard, and the installer still builds.
 	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
-	File /nonfatal "${BIN_DIR}\displayxr-control-panel.exe"
-	; DisplayXR Dashboard (src/dashboard, Avalonia/.NET, ADR-051 D4): the
-	; Control Panel's successor, a self-contained single-file exe that, like
-	; the panel, only spawns displayxr-cli. /nonfatal: a build without the
-	; .NET SDK has no dashboard, and the installer still builds.
 	File /nonfatal "${BIN_DIR}\displayxr-dashboard.exe"
 
 	; Sweep a STRAY vulkan-1.dll left by any pre-#105 install (#1229).
@@ -1036,10 +1042,10 @@ client_dll_ok:
 	; transitive deps that previously *required* $INSTDIR on PATH are gone:
 	; cjson is compiled in from bundled source and pthreads is statically
 	; linked via the vcpkg overlay triplet at
-	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. The runtime DLL itself
-	; does not use SDL2; SDL2.dll ships only for the Control Panel GUI and
-	; sits next to displayxr-control-panel.exe in $INSTDIR, so it resolves via
-	; the exe's own directory without PATH.
+	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. SDL2.dll (imported by
+	; displayxr-service.exe and DisplayXRClient.dll for the debug GUI /
+	; qwerty input) sits next to both in $INSTDIR, so it resolves via the
+	; module's own directory without PATH.
 	;
 	; Under the vendor plug-in architecture (ADR-019 / issue #256), the
 	; runtime DLL has zero vendor identifiers in its link line — no SR
@@ -1172,9 +1178,9 @@ Section "Start Menu Shortcuts" SecShortcuts
 	; Workspace controllers add their own Start Menu shortcuts from their
 	; respective installers.
 
-	; Control Panel shortcut (replaces the retired Runtime Switcher — #378)
-	IfFileExists "$INSTDIR\displayxr-control-panel.exe" 0 +2
-		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk" "$INSTDIR\displayxr-control-panel.exe"
+	; Dashboard shortcut (replaces the retired Runtime Switcher — #378 — and
+	; the retired Control Panel, whose stale shortcut the install section
+	; sweeps)
 	IfFileExists "$INSTDIR\displayxr-dashboard.exe" 0 +2
 		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Dashboard.lnk" "$INSTDIR\displayxr-dashboard.exe"
 
@@ -1339,6 +1345,8 @@ Section "Uninstall"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
+	; Retired (superseded by the Dashboard); kept so uninstalling an older
+	; install still cleans it.
 	Delete "$INSTDIR\displayxr-control-panel.exe"
 	Delete "$INSTDIR\displayxr-dashboard.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"

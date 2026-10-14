@@ -88,9 +88,6 @@ endif()
 if(TARGET cli)
 	add_dependencies(installer cli)
 endif()
-if(TARGET control_panel)
-	add_dependencies(installer control_panel)
-endif()
 # Vendor plug-in: sim-display. The runtime installer ships this DLL as
 # the vendor-neutral fallback (ADR-019 / issue #256); vendor plug-ins
 # like DisplayXR-LeiaSR.dll come from their own installers.

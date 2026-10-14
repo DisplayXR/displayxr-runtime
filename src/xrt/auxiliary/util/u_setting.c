@@ -43,7 +43,7 @@
 /*!
  * Names the persisted stores may set. Everything else is environment-only.
  *
- * This is exactly the set the Control Panel's three user-facing controls drive
+ * This is exactly the set the Dashboard's three user-facing controls drive
  * (#1252 Phase 1). It is deliberately not "every tuning lever": each entry is a
  * name a GUI can now pin for every app on the machine, so adding one is a
  * decision about a support surface, not a convenience. The developer section

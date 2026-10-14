@@ -5,7 +5,8 @@ What ships, what runs, and how the pieces connect.
 ## Components
 
 The DisplayXR runtime installer delivers the runtime DLL, the service,
-`displayxr-cli.exe`, `displayxr-control-panel.exe`, and the vendor-neutral
+`displayxr-cli.exe`, `displayxr-dashboard.exe` (the DisplayXR Dashboard, which
+replaced the ImGui Control Panel), and the vendor-neutral
 sim-display plug-in. The workspace controller (reference: DisplayXR Shell) ships
 from `displayxr-shell-pvt` as a **separate** installer; the WebXR bridge is built
 from this repo and installed with the runtime. The MCP adapter and the voice

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
   Per-monitor-v2 DPI awareness, shared by every DisplayXR executable
-  (displayxr-cli, displayxr-service, displayxr-control-panel).
+  (displayxr-cli, displayxr-service).
 
   Without it Windows hands the process VIRTUALISED coordinates: on a 4K panel
   at 150% scaling every GDI query — EnumDisplayMonitors rects, GetMonitorInfo,

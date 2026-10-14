@@ -390,7 +390,7 @@ windowed path.
 ### Optional: per-screen status for the dashboard
 
 Implement `get_screen_status` (ADR-051 D2, `#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS`) to
-give each screen you claim a row in `displayxr-cli status` and the Control Panel: ready /
+give each screen you claim a row in `displayxr-cli status` and the DisplayXR Dashboard: ready /
 verified / calibrated, tracker and lens state, model and serial, up to eight warnings shown
 verbatim, and an optional command line that opens your own dashboard on that screen. It must be
 passive — no tracker / lens / display handle, no per-call SDK instance, < 20 ms, pollable every

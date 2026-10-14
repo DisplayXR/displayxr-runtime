@@ -2329,7 +2329,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
  * Public enumeration + PreferredPlugin override (Android — minimal).
  *
  * Android discovery is convention-driven (filename ProbeOrder) and the
- * diagnostic CLI / Control Panel don't ship there in v1, so enumeration
+ * diagnostic CLI / Dashboard don't ship there in v1, so enumeration
  * and the writable override are stubs; the read honors the env override
  * so a dev/emulator can still pin a plug-in.
  *

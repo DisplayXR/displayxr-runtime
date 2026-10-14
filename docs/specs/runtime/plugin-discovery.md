@@ -211,7 +211,7 @@ processes started afterward (restart the service to switch a live session).
 
 This is the non-destructive replacement for the old "delete the vendor
 registry key to force sim-display" workaround. Manage it with
-`displayxr-cli dp use <id>` / `dp reset` (or the Control Panel); both write
+`displayxr-cli dp use <id>` / `dp reset` (or the DisplayXR Dashboard); both write
 the 64-bit view (HKLM → administrator rights required). `FORCE_SIM_DISPLAY`
 is unrelated — it only nudges *builder* priority, not which *plug-in* loads.
 

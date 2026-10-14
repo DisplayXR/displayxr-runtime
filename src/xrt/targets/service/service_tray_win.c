@@ -35,7 +35,7 @@
 #define IDM_WORKSPACE_DISABLE   1011
 #define IDM_WORKSPACE_AUTO      1012
 #define IDM_START_ON_LOGIN  1030
-#define IDM_CONTROL_PANEL   1002
+#define IDM_DASHBOARD       1002
 #define IDM_EXIT            1001
 // ADR-043 R3: stereo camera indicator / kill switch / sharing toggle
 #define IDM_CAMERA_STOP     1060
@@ -265,37 +265,28 @@ resolve_sibling_exe(const wchar_t *name, wchar_t *out, size_t cap)
 	return true;
 }
 
-//! The runtime GUI the tray opens: the DisplayXR Dashboard (Avalonia,
-//! src/dashboard/) when it is installed, else the ImGui Control Panel it
-//! replaces (still shipped until its removal PR; a package built without
-//! dotnet has no dashboard). NULL when neither sits beside the service.
-static const wchar_t *
-runtime_gui_exe(void)
+//! Resolve the DisplayXR Dashboard (Avalonia, src/dashboard/) beside the
+//! service. False when it is not installed — a package built without dotnet
+//! has no dashboard.
+static bool
+resolve_dashboard_exe(wchar_t *path, size_t cap)
 {
-	static const wchar_t *const candidates[] = {L"displayxr-dashboard.exe", L"displayxr-control-panel.exe"};
-	wchar_t path[MAX_PATH];
-	for (size_t i = 0; i < ARRAYSIZE(candidates); i++) {
-		if (resolve_sibling_exe(candidates[i], path, ARRAYSIZE(path)) &&
-		    GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-			return candidates[i];
-		}
-	}
-	return NULL;
+	return resolve_sibling_exe(L"displayxr-dashboard.exe", path, cap) &&
+	       GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-//! Launch the runtime GUI (best-effort; runs in the user's session since the
+//! Launch the Dashboard (best-effort; runs in the user's session since the
 //! service tray itself does).
 static void
-launch_runtime_gui(void)
+launch_dashboard(void)
 {
-	const wchar_t *exe = runtime_gui_exe();
 	wchar_t path[MAX_PATH];
-	if (exe == NULL || !resolve_sibling_exe(exe, path, ARRAYSIZE(path))) {
+	if (!resolve_dashboard_exe(path, ARRAYSIZE(path))) {
 		return;
 	}
 	// ShellExecute "open" is enough — we don't need its handle. A second
-	// launch of the dashboard raises the first (it is single-instance per
-	// logon session); the Control Panel just opens another cheap window.
+	// launch raises the first (the dashboard is single-instance per logon
+	// session).
 	ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
 }
 
@@ -315,15 +306,13 @@ show_context_menu(HWND hwnd)
 	// Main menu
 	HMENU menu = CreatePopupMenu();
 
-	// Runtime GUI (the Dashboard, or the Control Panel it replaces) — top-level
-	// entry, shown only when one is installed alongside the service. It's a
-	// runtime-level diagnostic, not a workspace-app action, so it lives on the
-	// always-on service tray rather than a workspace controller's submenu.
-	const wchar_t *gui = runtime_gui_exe();
-	if (gui != NULL) {
-		AppendMenuW(menu, MF_STRING, IDM_CONTROL_PANEL,
-		            wcscmp(gui, L"displayxr-dashboard.exe") == 0 ? L"DisplayXR Dashboard"
-		                                                         : L"DisplayXR Control Panel");
+	// DisplayXR Dashboard — top-level entry, shown only when it is installed
+	// alongside the service. It's a runtime-level diagnostic, not a
+	// workspace-app action, so it lives on the always-on service tray rather
+	// than a workspace controller's submenu.
+	wchar_t dashboard_path[MAX_PATH];
+	if (resolve_dashboard_exe(dashboard_path, ARRAYSIZE(dashboard_path))) {
+		AppendMenuW(menu, MF_STRING, IDM_DASHBOARD, L"DisplayXR Dashboard");
 		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	}
 
@@ -1236,10 +1225,8 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		case IDM_WORKSPACE_AUTO: set_workspace_mode(SERVICE_CHILD_AUTO); break;
 		case IDM_WORKSPACE_DISABLE: set_workspace_mode(SERVICE_CHILD_DISABLE); break;
 
-		// Open the runtime GUI (Dashboard, else Control Panel)
-		case IDM_CONTROL_PANEL:
-			launch_runtime_gui();
-			break;
+		// Open the DisplayXR Dashboard
+		case IDM_DASHBOARD: launch_dashboard(); break;
 
 		// Start on login toggle
 		case IDM_START_ON_LOGIN:
