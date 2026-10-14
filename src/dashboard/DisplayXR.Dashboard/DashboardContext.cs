@@ -49,6 +49,14 @@ public sealed class DashboardContext
     public string? PerfError { get; private set; }
     public DateTime? PerfWhen { get; private set; }
 
+    /// <summary><c>perf list --all --json</c>: the Developer page's read-only lever list (Phase 2A).</summary>
+    public DevLeverList? PerfAll { get; private set; }
+    public string? PerfAllError { get; private set; }
+    public bool PerfAllLoading { get; private set; }
+    /// <summary>The Developer settings section is expanded: Refresh re-reads the list.</summary>
+    public bool PerfAllWanted { get; set; }
+    private bool _perfAllReloadPending;
+
     public SelftestResult? Selftest { get; private set; }
     public bool SelftestRunning { get; private set; }
     public string? SelftestError { get; private set; }
@@ -199,6 +207,37 @@ public sealed class DashboardContext
         Bump();
     }
 
+    /// <summary>
+    /// <c>perf list --all --json</c>: read when the Developer settings section is
+    /// expanded, on Refresh and after a reset (<paramref name="force"/>) — never
+    /// polled. One read at a time.
+    /// </summary>
+    public async Task LoadPerfAllAsync(bool force)
+    {
+        if (PerfAllLoading)
+        {
+            if (force) _perfAllReloadPending = true;
+            return;
+        }
+        if (!force && PerfAll is not null) return;
+        PerfAllLoading = true;
+        Bump();
+        try
+        {
+            var r = await Cli.RunAsync("perf list --all --json", ActionTimeout);
+            if (r.Ok && DevLeverList.TryParse(r.Json, out var list)) { PerfAll = list; PerfAllError = null; }
+            else PerfAllError = r.Ok ? "Could not read 'displayxr-cli perf list --all --json'." : r.Summary;
+        }
+        catch (Exception ex) { PerfAllError = ex.Message; DashboardLog.Error("perf list --all", ex); }
+        finally { PerfAllLoading = false; }
+        Bump();
+        if (_perfAllReloadPending)
+        {
+            _perfAllReloadPending = false;
+            await LoadPerfAllAsync(force: true);
+        }
+    }
+
     public async Task RunSelftestAsync()
     {
         if (SelftestRunning) return;
@@ -262,7 +301,8 @@ public sealed class DashboardContext
             ActionRunning = false;
             Bump();
         }
-        if (area == "perf") await LoadPerfAsync(force: true);
+        if (area is "perf" or "devperf") await LoadPerfAsync(force: true);
+        if (area == "devperf" || (area == "perf" && PerfAll is not null)) await LoadPerfAllAsync(force: true);
         if (area is "dp" or "screen-dp") await LoadDpAsync(force: true);
         if (area == "workspace") await LoadWorkspaceAsync(force: true);
         if (area == "runtime") await LoadInfoAsync(force: true);

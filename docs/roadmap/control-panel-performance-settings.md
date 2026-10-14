@@ -5,7 +5,9 @@
 > `displayxr-cli perf` verbs. References to "the Control Panel" / "the panel" below are
 > historical; the design and the census stand.
 
-> **Status: Phases 0 and 1 SHIPPED** (#1252); Phases 2-3 are still design. This doc answers "can the
+> **Status: Phases 0, 1 and 2A SHIPPED** (#1252; 2A = the read-only Developer settings list,
+> `displayxr-cli perf list --all` + the Dashboard's Developer page); Phases 2B and 3 are still
+> design. This doc answers "can the
 > runtime's performance levers be exposed as toggles in the DisplayXR Control Panel",
 > censuses every lever, and proposes the mechanism. Related: #378 (panel
 > architecture — *the GUI is dumb, `displayxr-cli` is the brain*), #793 (make the
@@ -211,7 +213,10 @@ documented as *"Returns defaults if the file is absent or contains errors — ne
 **"Developer settings" — collapsed, off by default, does not persist across panel
 launches.** Lists Tier 1 + Tier 2 levers with name, current value, **provenance**
 (env / user / machine / default), compiled default, and a per-row Reset, plus one
-"Reset all performance settings". Tier 4 never appears here.
+"Reset all performance settings". Tier 4 never appears here. *As shipped in Phase 2A the
+list is read-only and honest about reach:* only allow-listed (managed) levers have a
+provenance beyond env/default and a Reset; every other row is labelled "environment only"
+and names the variable to set, since writing it to the settings file would do nothing.
 
 ### 4. Effective state — and why the CLI is misleading today
 
@@ -280,7 +285,8 @@ process resolves the same chain. Three surfaces, in order of value:
 |---|---|---|
 | **0** | GPU topology + provenance in `displayxr-cli info --json`, rendered by the panel. No behaviour change. | **SHIPPED** |
 | **1** | `u_setting` chain + allow-list; the three user controls; `displayxr-cli perf`; the anti-stale banner. | **SHIPPED** |
-| **2** | Gated "Developer settings" list (Tier 1 + Tier 2, with provenance). Wants the panel on **tabs** first — the tab layout, the long-lived `status --watch` child and the Displays / Windows pages are specified in [`display-dashboard.md`](display-dashboard.md) (ADR-051) — it is nine sections in one scroll column now, and at 250 % DPI you see about a third of it. | design |
+| **2A** | **Read-only** "Developer settings" list (Tier 1 + Tier 2, with provenance) on the Dashboard's Developer page, over `displayxr-cli perf list --all [--json]`. Collapsed on every launch, read only while expanded and on Refresh, never polled; search + tier + process filters; non-default rows highlighted and counted. Managed levers (the `u_setting_is_managed()` six) get a per-row Reset and one "Reset all"; **every other lever is labelled environment-only** and names the variable to set, because it is read by its own `getenv` at its call site and a stored value would do nothing. No write path, no allow-list change, no runtime read site touched. The list is generated from Appendix A (see Appendix B). | **SHIPPED** |
+| **2B** | Per-lever settable: move one lever at a time onto the resolution chain (convert its call site to `u_setting_get_raw`, add it to the allow-list), **one PR per lever**, each with its own justification and measurement. The Developer list then grows a Reset (and later a setter) for that row automatically. | design |
 | **3** | Tier-2 live service settings over the existing `DIAG` IPC path. | design |
 
 ### The three controls, as shipped
@@ -632,3 +638,13 @@ As of this writing that yields **80** names, all present above. Read sites and m
 were machine-derived by intersecting that list with lines containing `getenv`,
 `GetEnvironmentVariable` or `DEBUG_GET_ONCE`, then spot-verified line by line. If the
 count changes, the table is stale.
+
+**The Tier 1 + Tier 2 rows are also machine-read.** `scripts/gen_lever_catalog.py` parses
+the tables above (every table with a `Var` and a `Tier` column; a multi-name Var cell
+yields one entry per `DXR_*` name; Tier 3 / 4 rows and non-`DXR_` properties are skipped)
+into `src/xrt/targets/cli/cli_lever_catalog.h`, which is what `displayxr-cli perf list
+--all` and the Dashboard's Developer settings list show. `lint.yml` runs it with
+`--check`: it fails when the checked-in header differs from what this appendix generates,
+and when a Tier 1/2 name no longer occurs as a string literal under `src/xrt` (the grep
+above), naming each stale row. So editing a row's tier, default or first sentence here
+means re-running `python3 scripts/gen_lever_catalog.py` in the same PR.
