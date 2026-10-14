@@ -327,8 +327,10 @@ also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
   Adreno a concurrent `vkQueueSubmit` on another thread races it on the shared
   GSL context (the -3 class above). The runtime calls it on the weave/repaint
   thread during target recreate (`comp_vk_native_target.cpp`, rotation /
-  `OUT_OF_DATE`) and on the `debug.dxr.weave_postwait_queue=0` path, while the
-  app keeps submitting. The layer now intercepts it on every platform: it takes
+  `OUT_OF_DATE`) while the app keeps submitting. (It also called it on the
+  `debug.dxr.weave_postwait_queue=0` path, until #2095 / ADR-055 deleted that
+  switch together with the post-weave drain it widened — the in-process weave is
+  now ordered by `set_weave_sync` semaphores, not host drains.) The layer now intercepts it on every platform: it takes
   every registered queue's mutex in ascending registry-slot order (per-device
   scope: the one device mutex), calls down, and releases in reverse. That order
   cannot invert against the other entry points, which each hold exactly one

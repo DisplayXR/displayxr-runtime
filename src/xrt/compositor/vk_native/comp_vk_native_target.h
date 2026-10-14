@@ -122,6 +122,54 @@ xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint);
 
 /*!
+ * #2095 / ADR-055: @ref comp_vk_native_target_acquire for a caller that joins
+ * the acquire to a GPU semaphore chain instead of a host wait.
+ *
+ * With @p acquire_sem == VK_NULL_HANDLE this is exactly
+ * comp_vk_native_target_acquire: the target's own semaphore is signalled and
+ * CONSUMED here by a dummy submit + vkQueueWaitIdle, so the image is usable
+ * on return. With a caller-owned @p acquire_sem, vkAcquireNextImageKHR
+ * signals THAT semaphore and nothing here waits it — the caller's first batch
+ * that touches the image must wait it on the GPU, and the caller owns the
+ * semaphore's reuse rule (binary: one signal, one wait, then a fence proves
+ * the wait retired). @p out_acquire_sem_signalled (may be NULL) reports
+ * whether the call actually enqueued a signal on @p acquire_sem: false when
+ * a held, never-presented image was handed out instead (no acquire ran) or
+ * on failure, so the caller never waits a semaphore nothing will signal.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
+                                 uint32_t *out_index,
+                                 VkQueue queue,
+                                 bool is_repaint,
+                                 VkSemaphore acquire_sem,
+                                 bool *out_acquire_sem_signalled);
+
+/*!
+ * #2095: consume a pending signal on a caller-owned acquire semaphore that
+ * nothing will wait on the GPU (the caller left its chain before the batch
+ * that waited it was submitted), the way the host-wait acquire always
+ * consumed the target's own: a dummy submit that waits it, then
+ * vkQueueWaitIdle(@p queue). After it the semaphore is unsignalled with no
+ * pending operations and the image is usable from the host's point of view.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_target_consume_acquire_signal(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore sem);
+
+/*!
+ * Number of images in the current target image set (0 before the first
+ * create). #2095: bounds the in-process weave-sync ring.
+ *
+ * @ingroup comp_vk_native
+ */
+uint32_t
+comp_vk_native_target_get_image_count(struct comp_vk_native_target *target);
+
+/*!
  * Present the rendered image.
  *
  * @param target  The target.
@@ -142,6 +190,24 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
  */
 xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted);
+
+/*!
+ * #2095 / ADR-055: @ref comp_vk_native_target_present with a GPU wait.
+ *
+ * @p wait_sem != VK_NULL_HANDLE makes vkQueuePresentKHR wait that semaphore
+ * (the caller's final batch signals it after the COLOR→PRESENT transition),
+ * which is what lets the caller present WITHOUT a host wait for its own GPU
+ * work. VK_NULL_HANDLE is the pre-existing behaviour: no wait, the caller has
+ * already drained. On the Windows DComp bridge the semaphore is ignored (that
+ * path never reaches WSI); callers only chain on WSI presents.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
+                                 VkQueue queue,
+                                 bool counted,
+                                 VkSemaphore wait_sem);
 
 /*!
  * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the

@@ -126,6 +126,25 @@ uint32_t
 comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc);
 
 /*!
+ * #2095 / ADR-055: the commit serial of the last chained in-process weave
+ * that reads image @p index (0 = none). Call under the compositor's
+ * weave-sync lock — see comp_vk_native_compositor_wait_swapchain_read().
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_read_serial(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * #2095 / ADR-055: record that chained commit @p serial reads image @p index
+ * (monotone: an older serial never overwrites a newer one). Same lock rule.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
+
+/*!
  * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
  * format the app asked for, rather than the UNORM sibling the runtime reads.
  *

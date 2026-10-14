@@ -49,6 +49,17 @@ struct comp_vk_native_swapchain
 	//! Owning compositor: told about the images before they are destroyed (#1782).
 	struct comp_vk_native_compositor *c;
 
+	/*!
+	 * #2095 / ADR-055: per image, the commit serial of the LAST in-process
+	 * weave whose GPU work reads it (0 = never read by a chained frame).
+	 * Written by the compositor at commit, read at wait_image/destroy — both
+	 * under the compositor's weave-sync lock, never bare. The commit thread
+	 * no longer waits for that GPU work, so this is what keeps the app from
+	 * re-acquiring an image the weave is still sampling: backpressure, only
+	 * when the app laps the compositor.
+	 */
+	uint64_t read_serial[MAX_SWAPCHAIN_IMAGES];
+
 	//! VkImages.
 	VkImage images[MAX_SWAPCHAIN_IMAGES];
 
@@ -269,17 +280,42 @@ vk_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t 
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	(void)timeout_ns;
 
-	// The app owns these images; there is no runtime-side GPU work to wait on
-	// (the compositor reads them at layer_commit, after release). The state
-	// tracker enforces the FIFO acquire->wait->release order, so this only has
-	// to move the named image on and reject an index that is not acquired.
+	// The app owns these images. The state tracker enforces the FIFO
+	// acquire->wait->release order, so this only has to move the named image
+	// on and reject an index that is not acquired.
 	xrt_result_t xret = comp_swapchain_ring_wait(&sc->ring, index);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Wait on non-acquired swapchain image index %u (image_count=%u)", index, sc->image_count);
 		return xret;
 	}
 
+	// #2095 / ADR-055: on the host-wait path the compositor had finished
+	// reading this image before layer_commit returned, so there was nothing to
+	// wait. Under the GPU chain the weave that read it may still be in flight:
+	// wait the fence of the last commit that read THIS image (no-op when it
+	// has retired, which is the common case). Bounded; a timeout WARNs and
+	// lets the app proceed rather than wedging xrWaitSwapchainImage.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_wait_swapchain_read(sc->c, xsc, index);
+	}
+
 	return XRT_SUCCESS;
+}
+
+uint64_t
+comp_vk_native_swapchain_get_read_serial(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return index < sc->image_count ? sc->read_serial[index] : 0;
+}
+
+void
+comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index < sc->image_count && serial > sc->read_serial[index]) {
+		sc->read_serial[index] = serial;
+	}
 }
 
 static xrt_result_t
@@ -310,6 +346,13 @@ vk_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	struct vk_bundle *vk = sc->vk;
+
+	// #2095 / ADR-055: a chained weave may still be sampling one of these
+	// images on the GPU (the commit thread no longer waits for it). Wait the
+	// last commit that read ANY of them before the VkImages go away.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_wait_swapchain_read(sc->c, xsc, UINT32_MAX);
+	}
 
 	// #1782: the compositor's HUD cache is keyed by VkImage, and the driver
 	// hands these handle values to the next images it creates.
