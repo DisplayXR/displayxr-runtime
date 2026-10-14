@@ -233,14 +233,18 @@ TEST_CASE("conv_store: root resolution order")
 		REQUIRE(conv_store_root_from(&in, out, sizeof(out), src, sizeof(src)));
 		CHECK(std::string(out) == "T:\\override");
 	}
-	SECTION("POSIX: $XDG_DATA_HOME, then /var/lib")
+	SECTION("POSIX: the writable XDG root first, /var/lib only as the packaged fallback")
 	{
 		conv_store_root_inputs p{};
 		p.windows = false;
 		p.models_path = "/ignored"; // registry keys mean nothing on POSIX
 		p.xdg_data_home = "/home/u/.local/share";
+		p.xdg_writable = true;
 		REQUIRE(conv_store_root_from(&p, out, sizeof(out), src, sizeof(src)));
 		CHECK(std::string(out) == "/home/u/.local/share/displayxr/models");
+		p.xdg_writable = false; // a read-only home: the packaged root
+		REQUIRE(conv_store_root_from(&p, out, sizeof(out), src, sizeof(src)));
+		CHECK(std::string(out) == "/var/lib/displayxr/models");
 		p.xdg_data_home = nullptr;
 		REQUIRE(conv_store_root_from(&p, out, sizeof(out), src, sizeof(src)));
 		CHECK(std::string(out) == "/var/lib/displayxr/models");

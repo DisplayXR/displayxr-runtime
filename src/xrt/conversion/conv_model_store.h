@@ -22,7 +22,8 @@
  *   Windows: HKLM\Software\DisplayXR\Models\Path, then the browser's
  *            HKLM\Software\DisplayXR\Browser\ModelsPath, then
  *            %ProgramData%\DisplayXR\Models.
- *   POSIX:   $XDG_DATA_HOME/displayxr/models, then /var/lib/displayxr/models.
+ *   POSIX:   $XDG_DATA_HOME/displayxr/models (default ~/.local/share) when
+ *            writable, else the packaged root /var/lib/displayxr/models.
  *   `DXR_CONV_MODELS_ROOT` (environment of the process that owns the store)
  *   overrides all of them: tests and dev boxes only.
  *
@@ -82,7 +83,8 @@ struct conv_store_root_inputs
 	const char *models_path;         //!< HKLM\Software\DisplayXR\Models\Path
 	const char *browser_models_path; //!< HKLM\Software\DisplayXR\Browser\ModelsPath
 	const char *program_data;        //!< %ProgramData% (Windows)
-	const char *xdg_data_home;       //!< $XDG_DATA_HOME (POSIX)
+	const char *xdg_data_home;       //!< $XDG_DATA_HOME, else $HOME/.local/share (POSIX)
+	bool xdg_writable;               //!< the XDG root (or its nearest existing parent) is writable
 	bool windows;                    //!< which order applies
 };
 

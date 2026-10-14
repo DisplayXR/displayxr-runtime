@@ -570,7 +570,7 @@ implementation; both hosts, the CLI and the installer pre-fetch run it.
 
 **Root.** `HKLM\Software\DisplayXR\Models\Path` → `HKLM\Software\DisplayXR\Browser\ModelsPath`
 → `%ProgramData%\DisplayXR\Models` (64-bit registry view); POSIX `$XDG_DATA_HOME/displayxr/models`
-→ `/var/lib/displayxr/models`. `DXR_CONV_MODELS_ROOT`, in the environment of the process that
+(default `~/.local/share`) when writable, else the packaged root `/var/lib/displayxr/models`. `DXR_CONV_MODELS_ROOT`, in the environment of the process that
 owns the store, overrides all of them (tests and dev boxes only; the service reads its own
 environment, not a client's). Layout:
 
@@ -640,7 +640,8 @@ snapshot it prints, read from disk (no IPC): `display-dashboard.md` §3.3.
 `prune` (delete blobs no registered pack references), `fetch <pack-url|path> [--prefetch]
 [--model <name>] [--installer]` (the write protocol on the calling thread; `--installer` =
 nonce `installer`, stamped blobs skipped without hashing, non-commercial models never),
-`init [--root <dir>]` (create the root with its ACL and marker).
+`init [--root <dir>]` (create the root with its ACL and marker). `fetch --prefetch` with no URL
+pre-fetches every registered pack's `prefetch` models.
 
 ---
 
