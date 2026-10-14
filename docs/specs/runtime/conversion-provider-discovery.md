@@ -1,7 +1,6 @@
 # Conversion-Provider Discovery Contract
 
-> **Status: Draft — ADR-053 (Proposed). Nothing here is implemented; the header lives in the roadmap draft until P1 lands.**
-> Header draft: [`docs/roadmap/conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) §1 (`xrt_conversion_plugin.h`).
+> **Status: Implemented — ADR-053 (Accepted). The P1a conversion core landed in #1994 / #2015 and ships from v2.42.0; the contract header is [`src/xrt/include/xrt/xrt_conversion_plugin.h`](../../../src/xrt/include/xrt/xrt_conversion_plugin.h).** Open follow-ups: live re-select of `Enabled` / `PreferredProvider` in a running core (#2051) and the shared options contract (#2050) under the N3 epic #2047. The pre-implementation header draft stays at [`docs/roadmap/conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) for history only.
 
 **Audience:** integrators shipping a conversion-provider plug-in (a DLL / dylib / so that turns 2D images into depth, views or Gaussian splats for the runtime), and runtime engineers maintaining the conversion core, its loader and its host.
 
