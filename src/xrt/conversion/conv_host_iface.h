@@ -214,6 +214,15 @@ struct conv_host_ops
 	/*! Orderly shutdown: cancel (is_cancelled turns true), drain, destroy the
 	 *  provider instance, join. A hung host is leaked instead. */
 	void (*destroy)(struct conv_host **h_ptr);
+
+	/*! [any thread, never blocks] First half of destroy, called by the core's
+	 *  teardown before it joins its lanes: new submits are refused, a command
+	 *  waiting on the host process returns XRT_ERROR_IPC_FAILURE within one
+	 *  slice, and the host is asked to shut down (killed after the grace if
+	 *  it cannot answer). Without it a lane stuck mid-convert on a hung host
+	 *  would block the join forever: the core's watchdog has already stopped.
+	 *  NULL = in-service (the inproc host is unaffected). */
+	void (*begin_shutdown)(struct conv_host *h);
 };
 
 /*! Base of every host. */
@@ -316,6 +325,14 @@ static inline bool
 conv_host_is_down(struct conv_host *h)
 {
 	return h != NULL && h->ops->is_down != NULL && h->ops->is_down(h);
+}
+
+static inline void
+conv_host_begin_shutdown(struct conv_host *h)
+{
+	if (h != NULL && h->ops->begin_shutdown != NULL) {
+		h->ops->begin_shutdown(h);
+	}
 }
 
 static inline void

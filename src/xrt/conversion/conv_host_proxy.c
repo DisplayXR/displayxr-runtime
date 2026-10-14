@@ -2680,15 +2680,26 @@ px_get_epoch(struct conv_host *h)
 }
 
 static void
-px_destroy(struct conv_host **h_ptr)
+px_begin_shutdown(struct conv_host *h)
 {
-	struct proxy *p = px(*h_ptr);
-	*h_ptr = NULL;
+	// Stop flag + orderly shutdown, no join: the worker's convert wait sees
+	// p->stop within one slice and returns IPC_FAILURE; submit refuses; the
+	// supervisor sends SHUTDOWN and kills a host that cannot answer after
+	// the grace. Idempotent (px_destroy repeats it).
+	struct proxy *p = px(h);
 	os_mutex_lock(&p->m);
 	p->stop = true;
 	conv_supervisor_service_shutdown(&p->sup, now_ns());
 	os_cond_broadcast(&p->cond);
 	os_mutex_unlock(&p->m);
+}
+
+static void
+px_destroy(struct conv_host **h_ptr)
+{
+	struct proxy *p = px(*h_ptr);
+	*h_ptr = NULL;
+	px_begin_shutdown(&p->base);
 	if (p->sup_started) {
 		os_thread_join(&p->sup_thread);
 		os_thread_destroy(&p->sup_thread);
@@ -2737,6 +2748,7 @@ static const struct conv_host_ops k_proxy_ops = {
     .lookup_image = px_lookup_image,
     .heartbeat = px_heartbeat,
     .abandon = px_abandon,
+    .begin_shutdown = px_begin_shutdown,
     .get_epoch = px_get_epoch,
     .is_down = px_is_down,
     .destroy = px_destroy,

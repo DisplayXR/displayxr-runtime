@@ -1631,6 +1631,13 @@ conv_core_destroy(struct conv_core **core_ptr)
 	}
 	os_cond_broadcast(&core->ctrl_cond);
 	os_mutex_unlock(&core->registry_mtx);
+	// Satellite hosts first (#2056): once the control thread is gone nothing
+	// watches a hung host, so a lane stuck mid-convert on one would block its
+	// join forever. Shutting the proxy down wakes that convert with a
+	// host-lost result. In-service hosts have no begin_shutdown (no-op).
+	for (uint32_t p = 0; p < CONV_REGISTRY_MAX_PROVIDERS; p++) {
+		conv_host_begin_shutdown(core->hosts[p].host);
+	}
 	if (core->ctrl_started) {
 		os_thread_join(&core->ctrl_thread);
 		os_thread_destroy(&core->ctrl_thread);
