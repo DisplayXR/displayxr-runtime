@@ -131,7 +131,13 @@ TEST_CASE("v4 create: requiredOutputs refuse only a READY provider; terminal sta
 		CHECK(fx.task(1, XRT_CONV_TASK_VIEWS_MONO).state != XRT_CONV_STATE_READY);
 		CHECK(fx.create_task(1, XRT_CONV_TASK_VIEWS_MONO, &id, 0, IPC_SERVER_CONV_OUTPUT_AUX_DEPTH) ==
 		      XRT_SUCCESS);
-		// FAILED (any reason) is terminal for new creates.
+		// FAILED (any reason) is terminal for new creates. The first create
+		// above prewarms the default tasks on the control thread; until that
+		// warm returns with the provider's FAILED(model) the row reads WARMING
+		// and a create is accepted as provisional, so wait for the row first
+		// (the race showed on a loaded CI runner).
+		REQUIRE(wait_until([&] { return fx.task(1, XRT_CONV_TASK_DEPTH_VIDEO).state == XRT_CONV_STATE_FAILED; },
+		                   3000));
 		CHECK(fx.create_task(1, XRT_CONV_TASK_DEPTH_VIDEO, &id) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
 		const xrt_conv_wire_task_desc dd = fx.task(1, XRT_CONV_TASK_DEPTH_VIDEO);
 		CHECK(dd.state == XRT_CONV_STATE_FAILED);
