@@ -1691,6 +1691,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	return NULL;
 }
 
+#if !defined(XRT_OS_ANDROID)
+/* Android has one plug-in and no per-monitor claim sources (the resolve path
+ * below never collects there), so the two collectors would be unused code. */
+
 /*!
  * Load EVERY registered plug-in and return them as display-claim sources for
  * the per-monitor registry (#69 / ADR-015, multi-screen M0). Unlike
@@ -1832,6 +1836,8 @@ rescan_display_sources_platform(struct plugin_display_source *out, int count, in
 	free(entries);
 	return count;
 }
+
+#endif /* !XRT_OS_ANDROID — display-claim sources */
 
 
 /*
