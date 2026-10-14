@@ -3172,3 +3172,22 @@ TEST_CASE("cursor_look: Xft.dpi from the X resource database")
 	CHECK(u_cursor_parse_xft_dpi("") == 0.0f);
 	CHECK(u_cursor_parse_xft_dpi(NULL) == 0.0f);
 }
+
+TEST_CASE("cursor_look: Windows draws a cursor at the pointer size times the DPI scale")
+{
+	// The SM_CYCURSOR table measured on the win box (metric_px per DPI) with a
+	// 32x32 image: the metric is only a floor, the pointer size scales.
+	CHECK(u_cursor_os_height_px_win(32, 96, 32, 32) == 32);
+	CHECK(u_cursor_os_height_px_win(32, 144, 48, 32) == 48);
+	CHECK(u_cursor_os_height_px_win(32, 192, 64, 32) == 64);
+	CHECK(u_cursor_os_height_px_win(32, 240, 64, 32) == 80); // was 64: 20 % small at 250 %
+	CHECK(u_cursor_os_height_px_win(32, 288, 96, 32) == 96);
+	// An accessibility pointer size of 48 at 200 %.
+	CHECK(u_cursor_os_height_px_win(48, 192, 64, 48) == 96);
+	// Floors: a metric above the scaled size, an image taller than both.
+	CHECK(u_cursor_os_height_px_win(32, 240, 96, 32) == 96);
+	CHECK(u_cursor_os_height_px_win(32, 96, 32, 64) == 64);
+	// No registry value means the default 32; no DPI means no size.
+	CHECK(u_cursor_os_height_px_win(0, 240, 64, 32) == 80);
+	CHECK(u_cursor_os_height_px_win(32, 0, 32, 32) == 0);
+}

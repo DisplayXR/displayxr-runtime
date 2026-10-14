@@ -16,9 +16,12 @@
  *
  * GetCursorInfo() is global - not per thread or per process - so the
  * compositor thread may call it. The image is drawn at the size the OS draws
- * the cursor on this panel (SM_CYCURSOR at the panel's DPI, or the image's own
- * size when larger) and cached by HCURSOR + scale: one GetCursorInfo() per
- * drawn frame, a re-raster only when the shape or the DPI changes.
+ * the cursor on this panel - the user's pointer size (CursorBaseSize, 32 by
+ * default) times the panel's DPI scale, see u_cursor_os_height_px_win(); the
+ * stepped SM_CYCURSOR table and the image's own size are floors only - and
+ * cached by HCURSOR + scale: one GetCursorInfo() per drawn frame, a re-raster
+ * only when the shape or the DPI changes. (SM_CYCURSOR alone drew 64 px where
+ * Windows draws 80 at 250 %: a visibly smaller cursor.)
  *
  * Hidden cursor: an app hides its cursor with SetCursor(NULL) as soon as a
  * locate reports willDraw, often before that frame's xrEndFrame, so on most
@@ -67,6 +70,34 @@ cursor_size_for_dpi(UINT dpi)
 	return fn != NULL ? fn(SM_CYCURSOR, dpi) : 0; // pre-1607: the image's own size
 }
 
+typedef LONG(WINAPI *pfn_reg_get_value_w)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+
+//! The user's pointer size in OS points (HKCU\Control Panel\Cursors
+//! CursorBaseSize: 32 by default, larger under an accessibility pointer size).
+//! Read once per process, like the Linux theme size; advapi32 through
+//! GetProcAddress so this library adds no link dependency.
+static uint32_t
+cursor_base_size_pt(void)
+{
+	static uint32_t cached = 0;
+	if (cached == 0) {
+		uint32_t base = 32;
+		HMODULE advapi = GetModuleHandleA("advapi32.dll");
+		pfn_reg_get_value_w fn =
+		    advapi != NULL ? (pfn_reg_get_value_w)(void *)GetProcAddress(advapi, "RegGetValueW") : NULL;
+		DWORD value = 0;
+		DWORD size = sizeof(value);
+		if (fn != NULL &&
+		    fn(HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", RRF_RT_REG_DWORD, NULL, &value,
+		       &size) == ERROR_SUCCESS &&
+		    value >= 16 && value <= CURSOR_LOOK_MAX_PX) {
+			base = (uint32_t)value;
+		}
+		cached = base;
+	}
+	return cached;
+}
+
 //! Rasterise @p hc over black and white; on success the look holds it.
 static bool
 snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
@@ -100,15 +131,13 @@ snapshot(struct comp_cursor_look *look, HCURSOR hc, float scale)
 		return false;
 	}
 
-	// The size the OS draws it at on this panel: the per-DPI nominal size, or
-	// the image's own when larger (an accessibility pointer size loads a
-	// bigger image than SM_CYCURSOR reports).
+	// The size the OS draws it at on this panel: the pointer size times the
+	// DPI scale; the per-DPI metric and the image's own size are floors.
 	const UINT dpi = (UINT)lrintf(96.0f * scale);
-	int th = cursor_size_for_dpi(dpi);
-	if (th < native_h) {
-		th = native_h;
-	}
-	const int tw = (int)lrintf((float)native_w * (float)th / (float)native_h);
+	const int metric = cursor_size_for_dpi(dpi);
+	const int th = (int)u_cursor_os_height_px_win(cursor_base_size_pt(), (uint32_t)dpi,
+	                                              metric > 0 ? (uint32_t)metric : 0u, (uint32_t)native_h);
+	const int tw = th > 0 ? (int)lrintf((float)native_w * (float)th / (float)native_h) : 0;
 	if (tw <= 0 || th <= 0 || tw > CURSOR_LOOK_MAX_PX || th > CURSOR_LOOK_MAX_PX) {
 		return false;
 	}

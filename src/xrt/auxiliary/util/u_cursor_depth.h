@@ -830,6 +830,20 @@ u_cursor_theme_height_pt(uint32_t image_h, uint32_t image_nominal, uint32_t want
 float
 u_cursor_parse_xft_dpi(const char *resources);
 
+/*!
+ * Windows: the height, in panel pixels, at which the OS draws a cursor on a
+ * window at @p dpi. Windows scales every cursor - system .cur files and an
+ * app's 32x32 custom cursor alike - to the user's pointer size
+ * (HKCU\Control Panel\Cursors CursorBaseSize, 32 by default) times the window's
+ * DPI scale: 80 px at 250 %. SM_CYCURSOR for that DPI (@p metric_px) is a
+ * stepped table (96->32, 144->48, 192->64, 240->64, 288->96) and only a floor,
+ * as is the image's own height @p image_h (an accessibility pointer size can
+ * load a bigger image than the metric reports). @p base_size_pt 0 means the
+ * default 32. 0 when @p dpi is 0.
+ */
+uint32_t
+u_cursor_os_height_px_win(uint32_t base_size_pt, uint32_t dpi, uint32_t metric_px, uint32_t image_h);
+
 
 /*
  *

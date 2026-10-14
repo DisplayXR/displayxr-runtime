@@ -2244,3 +2244,21 @@ u_cursor_weave_sprite_idle(uint64_t last_request_ns, uint64_t now_ns)
 {
 	return now_ns < last_request_ns || now_ns - last_request_ns > U_CURSOR_WEAVE_SPRITE_IDLE_NS;
 }
+
+uint32_t
+u_cursor_os_height_px_win(uint32_t base_size_pt, uint32_t dpi, uint32_t metric_px, uint32_t image_h)
+{
+	if (dpi == 0) {
+		return 0;
+	}
+	const uint32_t base = base_size_pt != 0 ? base_size_pt : 32;
+	// The size the OS scales the cursor to: the pointer size at this DPI.
+	uint32_t px = (uint32_t)lrintf((float)base * (float)dpi / 96.0f);
+	if (px < metric_px) {
+		px = metric_px;
+	}
+	if (px < image_h) {
+		px = image_h;
+	}
+	return px;
+}

@@ -97,8 +97,9 @@ comp_cursor_look_fini(struct comp_cursor_look *look);
  * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): rasterise a CALLER-SUPPLIED
  * OS cursor handle into @p look, the same way the default look mirrors the
  * current OS cursor (Windows: an HCURSOR, DrawIconEx over black and white at
- * SM_CYCURSOR for @p backing_scale x 96 DPI, or the image's own size when
- * larger). Re-rasterises only when the handle or the scale changes.
+ * the user's pointer size x @p backing_scale - u_cursor_os_height_px_win() -
+ * with SM_CYCURSOR and the image's own size as floors). Re-rasterises only
+ * when the handle or the scale changes.
  *
  * @return false when the handle cannot be read (a dead handle fails
  *         GetIconInfo) or on a platform without OS cursor handles; @p look
