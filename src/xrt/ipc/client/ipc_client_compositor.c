@@ -1076,6 +1076,56 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	if (xc == NULL || req == NULL || req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_cursor_request(icc->ipc_c, req);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info)
+{
+	if (xc == NULL || info == NULL || handle == XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_graphics_buffer_handle_t h = handle;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	// DXGI handles carry the low-bit tag across the wire (swapchain_import
+	// convention); NT handles are duplicated into the service.
+	if (info->is_dxgi) {
+		h = (void *)((size_t)h | 1);
+	}
+#endif
+	return ipc_call_weave_cursor_sprite_texture(icc->ipc_c, info, &h, 1);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	if (xc == NULL || out_state == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	U_ZERO(out_state);
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_cursor_state(icc->ipc_c, out_state);
+}
+
 #ifdef XRT_OS_LINUX_DESKTOP
 static void
 weave_pack_dmabuf(struct ipc_weave_dmabuf *dst, const struct xrt_weave_dmabuf_desc *src)

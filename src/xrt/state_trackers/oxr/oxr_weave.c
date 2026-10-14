@@ -185,6 +185,17 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t *out_lift_cursor_mask);
 
 xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
+
+xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                          uint32_t rect_count,
                                                          const struct xrt_rect *screen_rects);
@@ -1054,6 +1065,97 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the runtime draws the cursor
+	// on the caller's weave rects. Like the lift rects, staged by its own call
+	// right before the submit it belongs to (same connection, same order); a
+	// submit without the struct sends nothing (ADR-046 section 0).
+	bool cursor_requested = false;
+	const XrCursorDepthWeaveRequestDXR *creq = NULL;
+	if (sess->sys->inst->extensions.DXR_cursor_depth) {
+		creq = OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR,
+		                                XrCursorDepthWeaveRequestDXR);
+	}
+	if (creq != NULL) {
+		if (creq->rectCount > XR_WEAVE_SUBMIT_MAX_RECTS_DXR || (creq->rectCount > 0 && creq->rects == NULL)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR::rectCount (%u) must be 0..%u with "
+			                 "a non-NULL rects array",
+			                 creq->rectCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
+		}
+		if (creq->rectCount > 0 && rect_count == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR needs XrWeaveSubmitRectsDXR (its "
+			                 "rects index it)");
+		}
+		const XrCursorDepthWeaveSpriteDXR *sp = &creq->sprite;
+		if ((uint32_t)sp->kind > (uint32_t)XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveSpriteDXR::kind (%d) is not a valid kind",
+			                 (int)sp->kind);
+		}
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
+		    (sp->texture == NULL || sp->extent.width <= 0 || sp->extent.height <= 0 || sp->extent.width > 256 ||
+		     sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: a TEXTURE sprite needs a texture handle this platform accepts and "
+			                 "an extent of 1..256 x 1..256 (got %dx%d, kind %d)",
+			                 sp->extent.width, sp->extent.height, (int)sp->textureKind);
+		}
+		struct xrt_weave_cursor_request xreq;
+		memset(&xreq, 0, sizeof(xreq));
+		xreq.sprite_kind = (uint32_t)sp->kind;
+		xreq.sprite_generation = sp->generation;
+		xreq.os_cursor = sp->osCursor;
+		xreq.size_m = sp->sizeMeters;
+		xreq.rect_count = creq->rectCount;
+		for (uint32_t i = 0; i < creq->rectCount; i++) {
+			const XrCursorDepthWeaveRectDXR *e = &creq->rects[i];
+			if (e->rectIndex >= rect_count) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR rects[%u].rectIndex (%u) >= "
+				                 "rectCount (%u)",
+				                 i, e->rectIndex, rect_count);
+			}
+			xreq.rects[i].rect_index = e->rectIndex;
+			xreq.rects[i].has_content = e->hasContent == XR_TRUE ? 1u : 0u;
+			xreq.rects[i].disparity_px = e->disparityPx;
+			xreq.rects[i].sample_u = e->sampleUV.x;
+			xreq.rects[i].sample_v = e->sampleUV.y;
+			xreq.rects[i].flags = e->flags;
+		}
+#if defined(XR_USE_PLATFORM_WIN32)
+		// The texture carrier crosses once per generation, with its handle.
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
+		    sp->generation != sess->weave.cursor_tex_generation_sent) {
+			struct xrt_weave_cursor_sprite_texture ti;
+			memset(&ti, 0, sizeof(ti));
+			ti.generation = sp->generation;
+			ti.width = (uint32_t)sp->extent.width;
+			ti.height = (uint32_t)sp->extent.height;
+			ti.hot_x = sp->hotSpotPx.x;
+			ti.hot_y = sp->hotSpotPx.y;
+			ti.size_m = sp->sizeMeters;
+			ti.is_dxgi = sp->textureKind == XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR ? 1u : 0u;
+			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)sp->texture, &ti);
+			if (tx == XRT_ERROR_IPC_FAILURE) {
+				OXR_CHECK_XRET_MSG(&log, sess, tx, "xrWeaveSubmitDXR: cursor sprite texture failed (xrt_result=%d)",
+				                   (int)tx);
+			}
+			if (tx == XRT_SUCCESS) {
+				sess->weave.cursor_tex_generation_sent = sp->generation;
+			}
+		}
+#endif
+		xrt_result_t cx = comp_ipc_client_compositor_weave_cursor_request(&sess->xcn->base, &xreq);
+		if (cx == XRT_ERROR_IPC_FAILURE) {
+			OXR_CHECK_XRET_MSG(&log, sess, cx, "xrWeaveSubmitDXR: cursor request failed (xrt_result=%d)", (int)cx);
+		}
+		cursor_requested = cx == XRT_SUCCESS;
+	}
+#endif
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
@@ -1188,6 +1290,27 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR, XrCursorDepthLiftStateDXR);
 	if (cursor_state != NULL) {
 		cursor_state->drawnLiftMask = lift_cursor_mask;
+	}
+	// v8: what this submit's weave-rect cursor drew. Fetched only for a submit
+	// that carried a request AND chained the state (a missing state = not drawn).
+	XrCursorDepthWeaveStateDXR *weave_cursor_state =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR, XrCursorDepthWeaveStateDXR);
+	if (weave_cursor_state != NULL) {
+		struct xrt_weave_cursor_state cs;
+		memset(&cs, 0, sizeof(cs));
+		if (cursor_requested) {
+			xrt_result_t sx = comp_ipc_client_compositor_weave_cursor_state(&sess->xcn->base, &cs);
+			if (sx == XRT_ERROR_IPC_FAILURE) {
+				OXR_CHECK_XRET_MSG(&log, sess, sx, "xrWeaveSubmitDXR: cursor state failed (xrt_result=%d)",
+				                   (int)sx);
+			}
+		}
+		weave_cursor_state->drawnRectMask = cs.drawn_rect_mask;
+		weave_cursor_state->spriteGeneration = cs.sprite_generation;
+		weave_cursor_state->drawnBounds.offset.x = cs.bounds_x;
+		weave_cursor_state->drawnBounds.offset.y = cs.bounds_y;
+		weave_cursor_state->drawnBounds.extent.width = cs.bounds_w;
+		weave_cursor_state->drawnBounds.extent.height = cs.bounds_h;
 	}
 #else
 	(void)lift_cursor_mask;

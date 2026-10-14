@@ -1548,6 +1548,30 @@ uint32_t
 comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc);
 
 /*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): stage the weave-rect cursor
+ * request for the NEXT @ref comp_d3d11_service_weave_submit of @p xc. Per
+ * submit, like the lift rects: the submit consumes it; a submit without one
+ * does no cursor work.
+ */
+void
+comp_d3d11_service_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v8: the texture carrier of sprite generation
+ * @p info->generation. Takes ownership of @p handle (an NT handle is closed
+ * once imported or replaced; a DXGI global handle is never closed).
+ */
+void
+comp_d3d11_service_weave_set_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                   xrt_graphics_buffer_handle_t handle,
+                                                   bool is_dxgi,
+                                                   const struct xrt_weave_cursor_sprite_texture *info);
+
+//! XR_DXR_cursor_depth v8: what the last submit's cursor request drew (zero if none).
+void
+comp_d3d11_service_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.
