@@ -239,8 +239,21 @@ TEST_CASE("segments are placed continuously across the seam in the majority fram
 	// Same rows: A sits at B's height.
 	CHECK(l.seg[0].ref_cy == Catch::Approx(l.seg[1].ref_cy).margin(1e-6));
 
-	// The window centre is the centre of the union.
-	CHECK(l.window_ref_cx == Catch::Approx((l.seg[0].ref_cx - l.seg[0].w_m * 0.5f + b_left + l.seg[1].w_m) * 0.5f));
+	// The window is the WHOLE canvas at the majority (B) pitch, anchored at
+	// the majority segment: B's centre is 160 px right of the canvas centre.
+	CHECK(l.window_ref_cx == Catch::Approx(l.seg[1].ref_cx + (400.0f - 560.0f) * pb));
+	CHECK(l.window_ref_cy == Catch::Approx(l.seg[1].ref_cy));
+	CHECK(l.window_ref_w == Catch::Approx(800.0f * pb));
+	CHECK(l.window_ref_h == Catch::Approx(600.0f * (0.3375f / 1440.0f)));
+
+	// No canvas in the table: the union of the segments.
+	xrt_segment_metrics no_canvas = m;
+	no_canvas.canvas = {{0, 0}, {0, 0}};
+	oxr_segment_layout lu;
+	REQUIRE(oxr_segment_views_layout(&no_canvas, &lu));
+	CHECK(lu.window_ref_cx ==
+	      Catch::Approx((l.seg[0].ref_cx - l.seg[0].w_m * 0.5f + b_left + l.seg[1].w_m) * 0.5f));
+	CHECK(lu.window_ref_w == Catch::Approx(l.seg[0].w_m + l.seg[1].w_m));
 
 	// A screen of unknown size cannot be placed.
 	xrt_segment_metrics bad = m;
@@ -547,4 +560,90 @@ TEST_CASE("mixed vendors: each segment uses its OWN pitch and its OWN DP eye pai
 	under.eyes.count = 1;
 	CHECK_FALSE(oxr_segment_views_segment_eyes(&under, dx, dy, 2, &e1));
 	CHECK(oxr_segment_views_segment_eyes(&under, dx, dy, 1, &e1)); // a 1-view mode is covered
+}
+
+TEST_CASE("a window clipped by the desktop edge keeps its whole size and centre", "[oxr][segment_views]")
+{
+	// One segment on the non-primary screen B (2560x1440 at desktop (1920,0),
+	// the rightmost and lowest screen): an 800x600 window at desktop
+	// (4280,1240) shows only its top-left 280x200 px; the rest is off the
+	// desktop. The content must keep the WHOLE window's size and centre — the
+	// single-screen / PRIMARY_STEREO framing — not squeeze into the strip.
+	xrt_segment_metrics m;
+	std::memset(&m, 0, sizeof(m));
+	m.count = 1;
+	m.window_screen_left = 4280;
+	m.window_screen_top = 1240;
+	m.window_pixel_width = 800;
+	m.window_pixel_height = 600;
+	m.canvas = {{0, 0}, {800, 600}};
+	xrt_segment_metric &b = m.seg[0];
+	b.screen_id = 0xB;
+	b.window_rect = {{0, 0}, {280, 200}};
+	b.screen_rect = {{2360, 1240}, {280, 200}};
+	b.screen_desktop_left = 1920;
+	b.screen_desktop_top = 0;
+	b.screen_desktop_width = 2560;
+	b.screen_desktop_height = 1440;
+	b.screen_width_m = 0.60f;
+	b.screen_height_m = 0.3375f;
+	b.nominal_viewer_z_m = 0.8f;
+	b.woven = true;
+
+	oxr_segment_layout l;
+	REQUIRE(oxr_segment_views_layout(&m, &l));
+	const float px = 0.60f / 2560.0f;
+	const float py = 0.3375f / 1440.0f;
+
+	CHECK(l.window_ref_w == Catch::Approx(800.0f * px));
+	CHECK(l.window_ref_h == Catch::Approx(600.0f * py));
+	// The same window the PRIMARY_STEREO path frames on that screen.
+	xrt_window_metrics whole;
+	oxr_segment_views_whole_window_metrics(&m, 0, &whole);
+	REQUIRE(whole.valid);
+	CHECK(l.window_ref_cx == Catch::Approx(whole.window_center_offset_x_m));
+	CHECK(l.window_ref_cy == Catch::Approx(whole.window_center_offset_y_m));
+	CHECK(l.window_ref_h == Catch::Approx(whole.window_height_m));
+
+	// The visible strip is a third of the window's height...
+	CHECK(oxr_segment_views_vdh_scale(&l, 0) == Catch::Approx(200.0f / 600.0f));
+	// ...and sits up-left of the window centre (segment centre - canvas centre).
+	CHECK(l.seg[0].ref_cx - l.window_ref_cx == Catch::Approx((140.0f - 400.0f) * px));
+	CHECK(l.seg[0].ref_cy - l.window_ref_cy == Catch::Approx(-(100.0f - 300.0f) * py));
+}
+
+TEST_CASE("a segment appearing on a screen of another pitch does not rescale the majority", "[oxr][segment_views]")
+{
+	// An 800x600 window whose left 600 px are on A (the primary, finer pitch).
+	// First its right 200 px have no segment of their own; then a segment on
+	// B (coarser pitch) appears for them. The majority (A) must keep its m2v
+	// and its offset from the window centre: the window did not move, so its
+	// content must not rescale or shift.
+	xrt_segment_metrics two = two_screen_table();
+	two.window_screen_left = 1320;
+	two.seg[0].window_rect = {{0, 0}, {600, 600}};
+	two.seg[0].screen_rect = {{1320, 200}, {600, 600}};
+	two.seg[1].window_rect = {{600, 0}, {200, 600}};
+	two.seg[1].screen_rect = {{0, 200}, {200, 600}};
+	xrt_segment_metrics one = two;
+	one.count = 1;
+	std::memset(&one.seg[1], 0, sizeof(one.seg[1]));
+
+	oxr_segment_layout l1, l2;
+	REQUIRE(oxr_segment_views_layout(&one, &l1));
+	REQUIRE(oxr_segment_views_layout(&two, &l2));
+	REQUIRE(l1.majority == 0);
+	REQUIRE(l2.majority == 0);
+
+	CHECK(oxr_segment_views_vdh_scale(&l1, 0) == Catch::Approx(1.0f));
+	CHECK(oxr_segment_views_vdh_scale(&l2, 0) == Catch::Approx(oxr_segment_views_vdh_scale(&l1, 0)));
+	CHECK(l2.window_ref_h == Catch::Approx(l1.window_ref_h));
+	CHECK(l2.seg[0].ref_cx - l2.window_ref_cx == Catch::Approx(l1.seg[0].ref_cx - l1.window_ref_cx));
+	CHECK(l2.seg[0].ref_cy - l2.window_ref_cy == Catch::Approx(l1.seg[0].ref_cy - l1.window_ref_cy).margin(1e-6));
+
+	// Still one m2v across the seam with the new segment.
+	const float V = 0.24f;
+	const float m2v0 = V * oxr_segment_views_vdh_scale(&l2, 0) / l2.seg[0].h_m;
+	const float m2v1 = V * oxr_segment_views_vdh_scale(&l2, 1) / l2.seg[1].h_m;
+	CHECK(m2v0 == Catch::Approx(m2v1));
 }
