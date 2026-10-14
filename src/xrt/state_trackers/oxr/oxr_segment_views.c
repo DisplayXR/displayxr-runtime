@@ -133,10 +133,27 @@ oxr_segment_views_layout(const struct xrt_segment_metrics *m, struct oxr_segment
 	}
 	out->count = m->count;
 	out->majority = mj;
-	out->window_ref_cx = (x0 + x1) * 0.5f;
-	out->window_ref_cy = (y0 + y1) * 0.5f;
-	out->window_ref_w = x1 - x0;
-	out->window_ref_h = y1 - y0;
+	if (m->canvas.extent.w > 0 && m->canvas.extent.h > 0) {
+		// The WHOLE canvas at the majority pitch, anchored at the majority
+		// segment — as the single-screen and PRIMARY_STEREO paths frame it.
+		// The union of segments would drop a part hanging off the desktop
+		// (squeezing the content into the visible strip) and jump when a
+		// segment of another pitch appears (rescaling it in place).
+		const float pxm = pitch_x(ms);
+		const float pym = pitch_y(ms);
+		const float ccx = (float)m->canvas.offset.w + (float)m->canvas.extent.w * 0.5f;
+		const float ccy = (float)m->canvas.offset.h + (float)m->canvas.extent.h * 0.5f;
+		out->window_ref_cx = out->seg[mj].ref_cx + (ccx - mcx) * pxm;
+		out->window_ref_cy = out->seg[mj].ref_cy - (ccy - mcy) * pym; // px down, +Y up
+		out->window_ref_w = (float)m->canvas.extent.w * pxm;
+		out->window_ref_h = (float)m->canvas.extent.h * pym;
+	} else {
+		// No canvas: the union of the segments.
+		out->window_ref_cx = (x0 + x1) * 0.5f;
+		out->window_ref_cy = (y0 + y1) * 0.5f;
+		out->window_ref_w = x1 - x0;
+		out->window_ref_h = y1 - y0;
+	}
 	return true;
 }
 
