@@ -1,6 +1,6 @@
 # DisplayXR Dashboard
 
-`displayxr-dashboard.exe` — the runtime's desktop dashboard (Avalonia 11 / .NET 9), the
+`displayxr-dashboard.exe` — the runtime's desktop dashboard (Avalonia 11 / .NET 10), the
 successor of the ImGui Control Panel (`src/xrt/targets/control_panel/`, still shipped
 until its removal PR). Design: [ADR-051](../../docs/adr/ADR-051-display-status-model-and-dashboard.md)
 and [display-dashboard.md](../../docs/roadmap/display-dashboard.md) §8.
@@ -64,7 +64,7 @@ dotnet publish src\dashboard\DisplayXR.Dashboard\DisplayXR.Dashboard.csproj -c R
 dotnet test src\dashboard\DisplayXR.Dashboard.sln
 ```
 
-Needs the .NET 9 SDK. Output: `_package\bin\displayxr-dashboard.exe` (~47 MB,
+Needs the .NET 10 SDK. Output: `_package\bin\displayxr-dashboard.exe` (~47 MB,
 self-contained, compressed single file). CI: the `Dashboard` job in `build-windows.yml`
 (tests + artifact `DisplayXR-Dashboard`); the `Runtime` job publishes it into the package
 before the installer, which installs it beside `displayxr-cli.exe` with a Start-menu

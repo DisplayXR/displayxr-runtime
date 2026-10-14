@@ -1,7 +1,7 @@
 #!/bin/bash
 # Print the path of the Linux displayxr-dashboard binary to package, for
 # package_linux.sh and package_deb_linux.sh. The dashboard (src/dashboard,
-# Avalonia / .NET 9) is a self-contained single file: no .NET runtime on the
+# Avalonia / .NET 10) is a self-contained single file: no .NET runtime on the
 # target, the Skia / HarfBuzz natives inside the bundle (extracted at first run
 # to $DOTNET_BUNDLE_EXTRACT_BASE_DIR, default ~/.net — never next to the
 # binary, so a read-only install prefix is fine).
@@ -9,7 +9,7 @@
 #   DXR_DASHBOARD_BIN=<file>  a prebuilt binary (CI: the DashboardLinux job's
 #                             artifact, so the .deb and the tarball ship the
 #                             same bits)
-#   otherwise                 `dotnet publish` it into $1 when the .NET 9 SDK is
+#   otherwise                 `dotnet publish` it into $1 when the .NET 10 SDK is
 #                             on PATH
 #   neither                   print nothing and exit 0 (a runtime-only package,
 #                             with a WARN) — unless DXR_REQUIRE_DASHBOARD=1,

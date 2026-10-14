@@ -221,7 +221,7 @@ same floor in a `GLIBC_FLOOR` file and its `install.sh` refuses a host below it
 rather than unpacking a tree that cannot `dlopen`.
 
 **The DisplayXR Dashboard on Linux.** Both packages ship `displayxr-dashboard`
-(`src/dashboard/`, Avalonia / .NET 9) beside the `displayxr-cli` it runs, with a
+(`src/dashboard/`, Avalonia / .NET 10) beside the `displayxr-cli` it runs, with a
 "DisplayXR Dashboard" applications-menu entry (`Settings;System;`) and a 256 px icon.
 It is a self-contained single file: no .NET runtime to install, invariant globalization
 (no ICU), and the Skia / HarfBuzz natives inside the bundle, extracted on first run to
@@ -231,7 +231,7 @@ unchanged; the window needs fontconfig and the X11 client libraries, which the `
 lists as `Recommends`. CI publishes it once (the `DashboardLinux` job) for both the
 `.deb` and the tarball, and `DebInstall` runs `displayxr-dashboard --version` (no display
 server) on all three releases. `package_*_linux.sh` take a prebuilt binary from
-`DXR_DASHBOARD_BIN`, else publish it with a local .NET 9 SDK, else package without it
+`DXR_DASHBOARD_BIN`, else publish it with a local .NET 10 SDK, else package without it
 (a WARN; `DXR_REQUIRE_DASHBOARD=1` makes that an error).
 
 **GNOME Shell extension (GNOME on Wayland).** Windowed weaving under Wayland

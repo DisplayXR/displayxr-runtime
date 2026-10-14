@@ -40,7 +40,7 @@ name: Build Linux
 # the stable required context "Linux Packaging" on their behalf.
 #
 # DashboardLinux job: tests + publishes the DisplayXR Dashboard (src/dashboard,
-# Avalonia / .NET 9) as a self-contained linux-x64 single file, ONCE; Deb and
+# Avalonia / .NET 10) as a self-contained linux-x64 single file, ONCE; Deb and
 # Package download that artifact so the .deb and the tarball ship the same bits.
 
 on:
@@ -159,7 +159,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
-          dotnet-version: '9.x'
+          dotnet-version: '10.x'
 
       - name: Test
         if: needs.DetectChanges.outputs.docs_only != 'true'

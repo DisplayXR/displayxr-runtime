@@ -332,7 +332,7 @@ WINDOWS  1 client
 
 ## 8. The Control Panel — now the DisplayXR Dashboard
 
-**The panel is the Avalonia app `displayxr-dashboard.exe`** (`src/dashboard/`, .NET 9 /
+**The panel is the Avalonia app `displayxr-dashboard.exe`** (`src/dashboard/`, .NET 10 /
 Avalonia 11, the vendor dashboard's toolset and visual language: a left navigation rail
 with badges, cards, chips and badges). It replaces the ImGui Control Panel, which stays in
 the installer until its removal PR. Pages: **Home** (the Overview below), **Displays**,
