@@ -99,6 +99,24 @@ else
         echo "Warning: libcjson.1.dylib not found; .app may not load runtime on a clean machine"
 fi
 
+# --- Make the binary self-locating (#280) ---
+# Under the hardened runtime (Developer ID builds) dyld strips DYLD_* from the
+# environment, so the launcher's DYLD_LIBRARY_PATH no longer reaches the
+# binary. Resolve its libraries from Resources/lib/ via its own rpath instead,
+# and drop the absolute Homebrew / build-cache paths baked in at build time.
+APP_BIN="$APP_BUNDLE/Contents/Resources/$BINARY_NAME"
+chmod u+w "$APP_BIN"
+BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                          @rpath/libvulkan.1.dylib "$APP_BIN" 2>/dev/null || true
+for r in $(otool -l "$APP_BIN" | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+        /*) install_name_tool -delete_rpath "$r" "$APP_BIN" 2>/dev/null || true ;;
+    esac
+done
+install_name_tool -add_rpath @executable_path/lib "$APP_BIN" 2>/dev/null || true
+codesign --force --sign - "$APP_BIN" 2>/dev/null || true
+
 # --- Resources: manifests with paths relative to .app bundle ---
 cat > "$APP_BUNDLE/Contents/Resources/openxr_displayxr.json" <<EOF
 {

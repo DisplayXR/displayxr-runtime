@@ -1,0 +1,14 @@
+# Entitlements map for scripts/macos_sign_notarize.sh sign-tree --entitlements-map.
+# One '<glob> <plist>' pair per line. <glob> matches the path relative to the
+# tree being signed; <plist> is relative to this file.
+# Anything not listed is signed with NO entitlements (hardened runtime only).
+#
+# plugin-host = DisplayXR-owned executables that load the runtime's vendor
+# plug-ins (other Team IDs). The runtime dylib itself needs nothing: library
+# validation inside a third-party host app is that app's choice, not ours.
+*bin/displayxr-service                  plugin-host.entitlements
+*bin/displayxr-cli                      plugin-host.entitlements
+# Test app inside DisplayXRCube.app: runs the runtime in-process, so a vendor
+# DP plug-in loads into IT. (The bundle's CFBundleExecutable is a shell
+# launcher; the real Mach-O lives in Resources/.)
+Contents/Resources/cube_*               plugin-host.entitlements
