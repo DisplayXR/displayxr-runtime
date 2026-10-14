@@ -1,6 +1,6 @@
 # ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
 
-**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · spec:
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · spec:
 [XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
 [ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
 
@@ -571,6 +571,8 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
 - Later, the browser feeds the page's computed CSS `cursor` (including `url(...)` images) to the
   runtime as the sprite (B.1). Pages then style the depth cursor with plain CSS, and the SDK
   needs no cursor code for it.
+  *Designed in Amendment 4 (proposed): the page supplies only the depth; the browser feeds its
+  real cursor; the runtime draws at the weave.*
 
 #### §A as built in the runtime (#1847, `XR_DXR_cursor_depth` spec v4)
 
@@ -1087,3 +1089,407 @@ nothing need the runtime to measure it.
 
 §0, §A (front-only, margin, threshold, hybrid anchor) and §B (the runtime draws, the app chooses
 the look). This adds a depth source; it doesn't change policy.
+
+## Amendment 4 (2026-10-13): the runtime draws the web cursor
+
+**Proposed** (design + estimate; nothing implemented). It realises Amendment 2 §C's second
+bullet ("the browser feeds the page's computed CSS `cursor` to the runtime as the sprite"),
+which was sketched and never built.
+
+### Why
+
+A panel test of an inline-3D page in the DisplayXR Browser showed two defects of the
+page-drawn cursor (Phase 5, the SDK's `DepthCursor` / `cursor: 'depth'`):
+
+1. **Wrong look.** The SDK draws its arrow while the page had asked for `grab` (an orbit
+   control). The page cannot draw the cursor the browser would have shown: it does not have
+   the platform's cursor images, and a `url(...)` cursor would have to be re-implemented.
+2. **Sluggish.** The sprite is part of the page's frame. It moves when the page's
+   `pointermove` handler has run, the page has rendered (at the page's frame rate: 30 fps on a
+   heavy splat page), and the result has gone through compositing, the weave and present. The
+   OS cursor next to it is a hardware overlay that moves at once.
+
+The native path already solves both. The runtime draws (Amendment 2 B), with the one policy
+(A), the line-of-sight anchor (A.5), the mirrored OS cursor as the default look (A.6) and the
+crosstalk softening (B.7). It reads the pointer itself, late (Amendment 1, point 4). Web pages
+reach the panel through `XR_DXR_weave`, which has no `xrLocateViews` hint or `xrEndFrame` to
+hang that on. Amendment 1 already added the weave-side equivalent for **lifted** rects. This
+amendment extends it to **every** woven rect whose page supplies a depth.
+
+### Decision
+
+The page supplies **only the depth under the pointer**. The browser supplies **the cursor it
+would have shown**. The runtime does **everything else**: where the pointer is (read at draw
+time), the policy, the filter, the anchor, the look, the softening and the drawing. It draws at
+the weave, after the page's tiles and before the display processor, and it reports per rect
+whether it drew. The browser hides the OS cursor exactly over the rect the runtime drew in, and
+only while it did.
+
+```
+page (SDK pick, per rAF)                              runtime (D3D11 service, weave thread)
+  layer.setCursorDepth({disparityPx,u,v})               GetCursorPos -> window px -> rect
+        |  rides the compositor frame, beside            filter (A.4) + anchor (A.5) + threshold (A.3)
+        |  the element's weave rect (renderer -> viz)    sprite = browser's cursor, B.7 softened
+        v                                                draw per view into the rect's tiles
+GPU process weave client --- xrWeaveSubmitDXR ---------> (service scratch, never the caller's input)
+  chains XrCursorDepthWeaveRequestDXR (v8)               weave (DP)
+        ^                                                 |
+        | sprite on change (browser -> GPU)               | XrCursorDepthWeaveStateDXR.drawnRectMask
+browser process: current cursor (HCURSOR / bitmap)  <-----+ (GPU -> browser, edge-triggered, as 0400)
+  hides the OS cursor while the pointer is in a drawn rect
+```
+
+#### 1. The page → browser API
+
+A method on the existing element-bound layer, so the request is scoped to the page's own woven
+element by construction:
+
+```webidl
+partial interface XRDisplayLayer {
+  // Per animation frame while the pointer is over this layer's element; null = withdraw.
+  undefined setCursorDepth(XRCursorDepthInit? depth);
+  // Resolved once per session: "runtime" when the browser AND the runtime can draw it.
+  Promise<DOMString> getCursorDepthSupport();   // "runtime" | "none"
+};
+dictionary XRCursorDepthInit {
+  double? disparityPx;   // nearest content under the cursor footprint; null = nothing 3D there
+  double u;  double v;   // where it was sampled: element-normalised, v down
+};
+```
+
+- **Unit: on-screen disparity in device pixels**, between the two outermost views the page
+  rendered, at the nearest content under the cursor footprint (§1's footprint rule, unchanged).
+  Negative = crossed = in front of the glass. Why not eye baselines, or a point:
+  - It is rig-agnostic. A page's views come from the runtime's per-rect `XR_DXR_view_rig`
+    locate, and a rig may scale the eye spread (`ipdFactor`), so "eye baselines of the rendered
+    views" and "the tracked eyes' baseline" differ. The pixels on the panel are what both the
+    viewer and the runtime see.
+  - It is the unit the runtime already uses for a depth it did not compute (Amendment 3: §A.1
+    applied in on-screen pixels, `margin_px` from the panel's pixel pitch). The runtime converts
+    to the policy unit with the tracked eyes: d = disparityPx × pitch / eye baseline.
+  - The SDK already has it: `CursorDepthPlacer` computes `pxPerBaseline`, so
+    `disparityPx = d × pxPerBaseline`; the stereo-tile cursor (`pair-cursor.js`) measures pixels
+    directly.
+  - A locate-space point (the native hint's unit) would make the page map its world point back
+    through its rig into the browser's locate space. That is the subtle math §2 exists to keep
+    out of apps.
+- **Raw, not filtered.** The page sends the content's disparity, not a target. Margin, clamp,
+  threshold, rise/sink and anchor are the runtime's, once, so a page cannot drift from native.
+- **Timing.** One call per animation frame while the pointer is over the element; latest wins.
+  It rides the element's **compositor frame**, next to the weave rect it belongs to (the same
+  renderer → viz path the weave rects take since patch 0026), so a depth always arrives with the
+  pixels it describes. It stays valid until replaced, withdrawn (`null`), until the element stops
+  weaving, or for 500 ms (the filter's stale gap); after that it counts as no content. Pages with
+  static content may call it only on change, within that window.
+- **Multi-tile pages.** Each layer reports for its own element, and only while the pointer is
+  over it (the SDK's `CursorPointer` already knows). The runtime draws at most one cursor per
+  window: on the rect the **live** pointer is in that carries a request, topmost (last in submit
+  order) when rects overlap.
+- **Feature detection.** `'setCursorDepth' in XRDisplayLayer.prototype` (a method, never an
+  attribute: the SDK's documented `Illegal invocation` trap), then `getCursorDepthSupport()`,
+  which resolves `"runtime"` only when the weave session enabled `XR_DXR_cursor_depth` ≥ 8 and
+  the service reported a drawer.
+- **Security and privacy.** Nothing flows back to the page: not the pointer, not the eyes, not
+  whether the runtime drew. The support string reveals one capability bit, in the DisplayXR
+  Browser on DisplayXR hardware only, which the existing `XRDisplayLayer` surface already
+  reveals. A request applies only to the calling layer's own rect, and only while that element is
+  being woven. A lying page can at most float the sprite in front of its own element, inside the
+  [−0.6, 0] clamp, at the true pointer position. It could already hide the cursor and draw a fake
+  one anywhere, so this adds no spoofing surface. Hit testing never changes.
+
+#### 2. The cursor image: the browser's real cursor
+
+The browser process already knows the cursor Blink computed for the element under the pointer:
+`pointer`, `grab`, `grabbing`, `text`, a `url(...)` bitmap with its hotspot. That cursor becomes
+the sprite. It is sent **only when it changes**, under a generation number, from the browser
+process to the GPU process, which chains it on the next submit.
+
+Two carriers, one struct:
+
+| Carrier | Where | What the runtime does |
+|---|---|---|
+| **OS cursor handle** | Windows | The browser passes the `HCURSOR` it would have set. Cursor handles are session-wide USER objects, so the service rasterises it with the **same** `comp_cursor_look_win.c` code the native path uses (two `DrawIconEx` renders, unblend, sized by `GetSystemMetricsForDpi(SM_CYCURSOR)` at the window's DPI, or the image's own size when larger), cached by handle and generation. The look and size are therefore native's exactly. The browser keeps a reference on the cursor while it is the advertised sprite. A handle that has died fails `GetIconInfo` and the runtime keeps the last look, never a wrong one. |
+| **Bitmap texture** | macOS, Android, desktop Linux; Windows fallback | A small premultiplied, sRGB-encoded RGBA8 shared texture (≤ 256 × 256), passed as an `XrWeaveHandleKindDXR` handle exactly like the overlay texture (an NT or legacy-DXGI handle on Windows for the low-integrity GPU process, an IOSurface on macOS). Hotspot in pixels. The GPU process creates and fills it per cursor change only. |
+
+**Size.** One image pixel is one panel pixel at the glass (Chromium already rasterises custom
+cursors at the device scale factor), so the sprite's physical height is image px × pitch, and
+it keeps that apparent size at any lift (§2's t scaling). `sizeMeters > 0` overrides it.
+
+A page whose CSS cursor is `none` gets no runtime cursor: the runtime draws nothing for a
+`none` sprite, and reports not drawn.
+
+#### 3. Runtime side: the weave-rect cursor (`XR_DXR_cursor_depth` spec v8)
+
+**What exists and is reused unchanged:**
+- the service drawer `svc_draw_cursor_quads`, with the B.7 style (Phase 4);
+- the lifted-rect path's frame of the weave (Amendment 1, `svc_lift_cursor_draw`): the OS
+  pointer read with `GetCursorPos` → bound window → rect, the viewpoint-midpoint E, the
+  per-view projection `u_lift_cursor_project`, the per-view tile mapping for both input
+  layouts (v3 squeezed SBS, v6 N-view atlas), drawing into the service's scratch or crop and
+  never into the caller's shared input, and the drawn mask on the weave output;
+- the one policy (`u_cursor_depth_target`, `_filter_step`, `_should_draw`), the pixel policy of
+  Amendment 3, `u_cursor_draw_soften_sized`, `comp_cursor_look`, the refusal latch (#1952) and
+  its one-WARN-per-reason logging.
+
+**What is new:**
+- **A depth source per rect from the caller**, besides the lifted rect's depth map. The
+  lifted-rect cursor becomes the *weave-rect cursor* with a source: conversion depth map
+  (Amendment 1) or caller disparity (this amendment); Amendment 3's measured disparity can be a
+  third later. Eyes: the tracked eyes the weave hands out (`XrWeaveOutputDXR::eyes`, display
+  space), expressed in the rect's frame. The page rendered from the previous output's eyes; the
+  difference is one frame of head motion × |d|, sub-pixel.
+- **The hybrid line-of-sight anchor at the weave.** The lifted path is screen-anchored today.
+  A.5 is ported to the weave frame (E₀, S₀ in rect metres; the same continuity, parallax and
+  no-drift properties, unit-tested against the `u_cursor_depth` fixtures). The lifted path gets
+  it too, closing Amendment 1's "adopts A.5 in its next revision".
+- **One filter and anchor per weave client** (one pointer per window), re-primed when the
+  hovered rect changes. Not per rect index, because rect indices are not stable across frames.
+- **The sprite from the caller** (above) instead of the fixed procedural arrow; lifted rects use
+  the same sprite.
+- **A cursor frame never zero-copies** (the v6 exact-fill path), the same rule as every
+  in-process backend.
+
+**The structs** (new only; no existing struct grows). The type values are 1004999328–329, the
+two values the README held for a Phase 3b struct that Amendment 3 ended up not needing.
+
+```c
+#define XR_DXR_cursor_depth_SPEC_VERSION 8
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR ((XrStructureType)1004999328)
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR   ((XrStructureType)1004999329)
+
+typedef enum XrCursorDepthWeaveSpriteKindDXR {
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR      = 0, // unchanged since `generation` (no payload)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR   = 1, // the runtime's default look (A.6)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_NONE_DXR      = 2, // the page hides its cursor: draw nothing
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR = 3, // osCursor = an HCURSOR (Windows)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR   = 4, // texture = shared premultiplied RGBA8
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_MAX_ENUM_DXR  = 0x7FFFFFFF
+} XrCursorDepthWeaveSpriteKindDXR;
+
+typedef struct XrCursorDepthWeaveSpriteDXR {      // plain member, not chainable
+    XrCursorDepthWeaveSpriteKindDXR kind;
+    uint64_t             generation;   // bumps on every change; KEEP refers to it
+    uint64_t             osCursor;     // OS_CURSOR
+    void*                texture;      // TEXTURE: a shared handle of textureKind
+    XrWeaveHandleKindDXR textureKind;
+    XrExtent2Di          extent;       // TEXTURE: px (<= 256 x 256)
+    XrVector2f           hotSpotPx;    // TEXTURE: px from the top-left
+    float                sizeMeters;   // <= 0: image px x panel pitch (OS_CURSOR: A.6's size)
+} XrCursorDepthWeaveSpriteDXR;
+
+typedef struct XrCursorDepthWeaveRectDXR {        // plain member, not chainable
+    uint32_t   rectIndex;       // into this submit's XrWeaveSubmitRectsDXR::rects
+    XrBool32   hasContent;      // XR_FALSE: pointer over the element, nothing 3D under it
+    float      disparityPx;     // signed, device px, < 0 crossed (in front)
+    XrVector2f sampleUV;        // where the page sampled it, rect-normalised, v down
+    uint32_t   flags;           // reserved 0 (the "no softening" opt-out of B.7 lands here)
+} XrCursorDepthWeaveRectDXR;
+
+// Chained on XrWeaveSubmitInfoDXR::next. Chaining it IS the per-submit request (§0).
+typedef struct XrCursorDepthWeaveRequestDXR {
+    XrStructureType                  type;
+    const void* XR_MAY_ALIAS         next;
+    XrCursorDepthWeaveSpriteDXR      sprite;    // also the sprite of lifted rects' cursors
+    uint32_t                         rectCount; // 0..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
+    const XrCursorDepthWeaveRectDXR* rects;
+} XrCursorDepthWeaveRequestDXR;
+
+// Chained on XrWeaveOutputDXR::next of a submit that carried a request.
+typedef struct XrCursorDepthWeaveStateDXR {
+    XrStructureType    type;
+    void* XR_MAY_ALIAS next;
+    uint32_t           drawnRectMask;    // bit i = drawn into rects[i] of XrWeaveSubmitRectsDXR
+    uint64_t           spriteGeneration; // the sprite the runtime now holds (0 = none)
+    XrRect2Di          drawnBounds;      // window px the drawn sprite covers (all views); 0 if none
+} XrCursorDepthWeaveStateDXR;
+```
+
+- **Zero cost (§0).** A submit without the request does no cursor work, holds no sprite and
+  sends nothing extra over IPC. The sprite is released when a request stops arriving for 1 s or
+  the session ends.
+- **Older runtimes.** A pre-v8 runtime skips unknown chained structs (the weave's established
+  behaviour), so the browser enables the request only when the weave session reports
+  `XR_DXR_cursor_depth` ≥ 8, and treats a missing state struct as "not drawn".
+- **The 32-bit mask** is enough because each submit carries at most
+  `XR_WEAVE_SUBMIT_MAX_RECTS_DXR` (32) rects. A frame split over several submits gets one state
+  per submit.
+- **The lifted rects' v6 structs stay.** A lifted rect's depth still comes from its conversion;
+  only its sprite comes from the request when one is chained.
+
+#### 4. Latency: what moves the cursor, and what is left
+
+| | Pointer position read | Moves at | Behind the OS cursor (estimate, to be measured) |
+|---|---|---|---|
+| Today: SDK sprite | page `pointermove`, then the page's rAF | the **page's** frame rate | page frame + composite + weave + present: about 3–5 frames, more on a slow page |
+| This amendment | `GetCursorPos` **inside the weave submit**, right before the draw | the **display compositor's** rate (see re-weave below) | present + scanout of the woven frame: about 1–2 frames |
+| Hardware cursor | the OS | scanout | 0 |
+
+- **Pointer-driven re-weave.** A static page produces no compositor frames when only the mouse
+  moves, because the hardware cursor needs none, and then a runtime-drawn cursor would freeze.
+  While a runtime cursor is drawn in a window, the browser asks the display compositor for a
+  redraw on every pointer move it routes. No renderer work is involved: it re-weaves the last
+  tiles. So the cursor moves at display rate **even when the page renders at 30 fps**, which is
+  the larger part of the "sluggish" report. Cost: one weave of the window per pointer-move frame
+  while the cursor is lifted. That is a DP pass the page was usually paying for anyway.
+- **What remains.** The cursor is in the woven frame, so it still waits for the GPU process's
+  present and the compositor's scanout: one to two frames, versus the overlay's zero. That is
+  inherent to any cursor with disparity (Consequences, last bullet). The **depth** is a page frame
+  old (two to four frames). The fast-rise filter absorbs that, as it does for every other source,
+  and it affects only depth, never position.
+
+#### 5. Hiding the OS cursor, and the fallback ladder
+
+**Hide in the browser process, not in CSS.** Patch 0400 (lifted video) hides the cursor by
+setting `cursor: none !important` on the lifted elements from an isolated world. That is fine
+for 0400, which draws a fixed arrow. Here it would **destroy the feed**: with the element's
+cursor forced to `none`, Blink's computed cursor is `none`, so the browser could no longer see
+the page switch `grab` → `grabbing` on mousedown, or `pointer` over a hotspot. Instead:
+
+- The browser process keeps receiving Blink's computed cursor (and forwards changes as the
+  sprite).
+- **Where that cursor becomes the window's OS cursor**, it substitutes "none" while the pointer
+  lies inside a `drawnBounds` the GPU process reported for that window, and the report is fresh.
+- The browser routes every mouse move, so it restores the OS cursor **the moment the pointer
+  leaves** the drawn area, with no round trip. The report is edge-triggered and withdrawn on
+  teardown or a GPU-process death, exactly like 0400's (`LiftCursorDrawn`), so a dead GPU process
+  cannot leave the cursor hidden.
+- **Hand-off without a gap.** Taking over can show both cursors for one or two frames. That is
+  benign, because the drawn cursor appears near the glass (A.3's threshold), almost on top of
+  the OS one. Handing back must never show **no** cursor. So the runtime reports "not drawn" two
+  frames **before** it stops drawing a cursor that is sinking to the glass, and keeps drawing
+  meanwhile. A pointer that leaves the rect is handled by the browser's own bounds test above.
+
+0400 should move to this mechanism when the lift cursor takes the browser's sprite.
+
+**Fallback ladder** (each rung keeps a cursor on screen; none shows two policies):
+
+| Situation | Cursor |
+|---|---|
+| Browser has the API, runtime spec ≥ 8 with a drawer | runtime-drawn: the page's real cursor, the one policy, B.7 |
+| Same, but the runtime declines a frame (2D mode, no tracking, a refusal reason) | the flat OS cursor for that frame. The SDK must **not** draw its own sprite: the policy says flat |
+| Browser has the API, runtime < 8 or no drawer (`getCursorDepthSupport()` = `"none"`) | SDK-drawn sprite, as today |
+| Browser without the API (older release, other browsers) | SDK-drawn sprite, as today |
+
+The SDK's fallback sprite does not have B.7 softening yet; porting the 13-tap kernel into the
+three.js and PlayCanvas sprite materials is optional (§7).
+
+**Platforms.** Windows (D3D11 service) first. **macOS**: the Metal weave backend has no cursor
+drawer; it needs a port of the Metal in-process cursor pass into the weave, plus the texture
+carrier fed from `NSCursor` in the browser process. **Desktop Linux**: the weave backend exists
+(#1699), but the browser's Linux lane has never run; it comes after that. **Android**: touch
+first, with no hover cursor, so out of scope. Until a platform has a drawer,
+`getCursorDepthSupport()` says `"none"` there and the SDK draws.
+
+#### 6. Native parity
+
+The same code decides and draws on both sides of the API:
+- the policy is `u_cursor_depth` (A.1–A.5), with the same constants;
+- the softening is `u_cursor_draw_soften_sized` with the same `DXR_CURSOR_SOFTEN*` knobs, read
+  from the service's environment as for Phase 4;
+- on Windows the look is `comp_cursor_look_win.c`, which rasterises an `HCURSOR` at the window's
+  DPI, so `grab` over a woven three.js canvas is drawn exactly as a native app's `grab`;
+- the refusal reasons and their WARNs are shared.
+
+The only web-specific pieces are the depth unit (pixels, as Amendment 3's measured source) and
+the sprite carrier. What stays different, deliberately: the web pointer is read at weave time,
+while native in-process apps still hand the pointer in with the hint. Native could adopt the
+late read later; that is a Phase 2 item, not this amendment.
+
+#### 7. Estimate, risks, tests, rollout
+
+**Estimate** (working days, one engineer per repo, Windows first):
+
+| Repo | Work | Days |
+|---|---|---|
+| runtime | spec v8 header + spec section + type registry; IPC fields on the weave submit/output | 1.5 |
+| | weave-rect cursor: caller-disparity source, one filter + hybrid anchor per client (ported to the weave frame, unit-tested), late pointer, no zero-copy on cursor frames | 3 |
+| | sprite: `HCURSOR` through `comp_cursor_look_win`, texture carrier open/cache, generations | 1.5 |
+| | state + `drawnBounds` + early "not drawn" on sink, refusal reasons | 1 |
+| | tests: pure-math units, `weave_rpc_probe_d3d11_win` extension, zero-cost check; docs | 2 |
+| | **runtime total (Windows)** | **≈ 9** |
+| browser | Blink `setCursorDepth` / `getCursorDepthSupport`, carried on the compositor frame next to the weave rects (patch-0026 path) | 2 |
+| | GPU weave client: element → rect index, chain v8 (gated ≥ 8), read the state, report edges (0400's channel) | 1.5 |
+| | cursor feed: browser-process cursor → sprite (`HCURSOR` + ref, generation) → GPU | 2 |
+| | OS-cursor override gated by `drawnBounds`, withdrawal on GPU death | 1.5 |
+| | pointer-driven re-weave | 1.5 |
+| | build and panel cycles (multi-hour builds) | 2 |
+| | **browser total (Windows)** | **≈ 10.5** |
+| SDK | feature detect; send `disparityPx` from `DepthCursor`, PlayCanvas and the stereo-tile cursor, and skip drawing and `hideCss` when the runtime draws; tests; docs | 3 |
+| | optional: B.7 softening for the fallback sprite | 1.5 |
+| later | macOS: Metal weave drawer (runtime ≈ 4) + `NSCursor` texture feed (browser ≈ 2) | ≈ 6 |
+
+**Risks:**
+1. **Cross-process `HCURSOR`.** `GetIconInfo` / `DrawIconEx` on a handle created in the browser
+   process, called from the service, with a low-integrity GPU process in between. This is a
+   half-day spike, run first. If it fails, Windows uses the texture carrier (+1 browser day).
+2. **Re-weave cost and plumbing.** Forcing a display-compositor redraw with no damage must
+   reach the weave, and not be skipped as "nothing changed".
+3. **Hide/show flicker** at the hand-off; mitigated as in §5 and to be judged on the panel.
+4. **Depth lag at edges.** The depth is a page frame old while the position is current, so a
+   fast sweep across an edge can show a frame below the nearer content. This is the same as
+   every source (Consequences) and is absorbed by the footprint and the fast rise.
+5. **Overlapping woven elements**: topmost by submit order, which assumes submit order is paint
+   order.
+
+**Test plan:**
+- *Unit (runtime, SDK):* px → d → placement; per-view positions for both input layouts; the
+  hybrid anchor's continuity, parallax and no-drift in the weave frame; SDK fixtures equal to
+  the C ones.
+- *Headless runtime:* `weave_rpc_probe_d3d11_win` (sim-display) submits a synthetic SBS input
+  with a request and reads the woven output back. It shows the sprite with disparity =
+  `disparityPx` − margin_px, nothing at `hasContent = XR_FALSE`, the right refusal under
+  `DXR_CURSOR_DRAW_REFUSE`, and a woven output bit-identical to a run without the request when
+  none is chained (§0).
+- *Browser (sim-display, then panel):* a three.js cube with OrbitControls. Check that:
+  - `grab` and `grabbing` show lifted;
+  - `pointer` over a link-styled hotspot and a `url()` cursor work;
+  - the OS cursor is hidden exactly while drawn, and restored instantly on leaving the element;
+  - DOM over the canvas keeps the OS cursor;
+  - a static page still moves the cursor (re-weave);
+  - a 30 fps splat page moves it at display rate;
+  - an older runtime gives the SDK fallback;
+  - killing the GPU process restores the cursor.
+- *Panel (Windows, head-tracked):* side by side with `cube_handle_d3d11_win` at the same
+  disparity: the same look, margin, softening and hybrid parallax with head motion. **Latency:**
+  film the OS cursor, the SDK sprite and the runtime cursor with a 240 fps camera during a fast
+  mouse sweep, and report frames behind the OS cursor for each.
+
+**Rollout:**
+1. **W1, runtime:** spec v8 + the D3D11 service weave-rect cursor + the probe; the `HCURSOR`
+   spike first.
+2. **W2, browser + SDK on Windows:** the API, the sprite feed, the hide override, the re-weave;
+   the SDK prefers the runtime and keeps the fallback. Panel check, then ship.
+3. **W3:** lifted rects take the browser's sprite and the hybrid anchor; 0400 moves to the
+   browser-process hide.
+4. **W4:** macOS (Metal weave drawer, `NSCursor` feed).
+5. **W5:** desktop Linux once the browser's Linux lane runs. Optionally, Amendment 3's measured
+   source on weave rects, for stereo-video pages with no depth.
+
+### Alternatives considered
+
+- **Keep the SDK drawing and only fix its look.** The page cannot read the browser's cursor
+  images and would still move at the page's frame rate. That fixes neither defect.
+- **Chain the native v5 hint on the browser's per-rect rig locate** (the browser already calls
+  `xrLocateViews` with the element's zone rect each frame, patch 0036). It reuses the hint
+  verbatim, but the page would have to express its point in that locate space, through its rig;
+  the weave session has no `xrEndFrame` or swapchain sprite, so the draw still has to happen at
+  the weave; and the locate runs for the **next** frame, which adds skew. Rejected for the weave
+  request above.
+- **Hide with 0400's isolated-world CSS.** It erases the computed cursor the feed needs (§5).
+- **Let the runtime mirror the OS cursor itself, as on native.** While the runtime draws, the
+  browser has hidden the OS cursor, so there is nothing left to mirror. The browser has to say
+  what it would have shown.
+
+### Decisions (David, 2026-10-13: "go with your recommendations")
+
+1. Hide in the browser process (the per-pointer override); 0400 migrates to it.
+2. Windows sprite: the `HCURSOR` carrier if the spike passes, the texture otherwise.
+3. The pointer-driven re-weave is accepted.
+4. Depth unit: device pixels.
+5. Lifted rects take the real cursor in the release after web pages (W3 stays separate).
+6. The SDK fallback gets B.7 softening.
+
+### Not changed
+
+§0 (no request, no work), §A (the one policy), §B (the runtime draws; the caller chooses the
+look), Amendment 1's API, Amendment 3. Hit testing is never moved.
