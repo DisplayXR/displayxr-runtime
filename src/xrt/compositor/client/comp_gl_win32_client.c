@@ -301,8 +301,9 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 		const uint32_t before = c->base.base.base.info.format_count;
 		const uint32_t kept = client_gl_d3d11_filter_formats(c->base.base.base.info.formats, before);
 		if (kept != before) {
-			U_LOG_W("GL client (WGL_NV_DX_interop2): %u stencil depth format(s) not offered over IPC (#1956)",
-			        before - kept);
+			U_LOG_W(
+			    "GL client (WGL_NV_DX_interop2): %u stencil depth format(s) not offered over IPC (#1956)",
+			    before - kept);
 		}
 		c->base.base.base.info.format_count = kept;
 	}

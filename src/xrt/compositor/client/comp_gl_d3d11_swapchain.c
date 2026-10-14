@@ -193,10 +193,10 @@ release_interop_resources(struct client_gl_d3d11_swapchain *sc, bool have_contex
  */
 
 static const GLenum depth_pixel_store_params[] = {
-    GL_PACK_SWAP_BYTES,     GL_PACK_LSB_FIRST,     GL_PACK_ROW_LENGTH,   GL_PACK_IMAGE_HEIGHT,
-    GL_PACK_SKIP_ROWS,      GL_PACK_SKIP_PIXELS,   GL_PACK_SKIP_IMAGES,  GL_PACK_ALIGNMENT,
-    GL_UNPACK_SWAP_BYTES,   GL_UNPACK_LSB_FIRST,   GL_UNPACK_ROW_LENGTH, GL_UNPACK_IMAGE_HEIGHT,
-    GL_UNPACK_SKIP_ROWS,    GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_IMAGES, GL_UNPACK_ALIGNMENT,
+    GL_PACK_SWAP_BYTES,   GL_PACK_LSB_FIRST,     GL_PACK_ROW_LENGTH,    GL_PACK_IMAGE_HEIGHT,
+    GL_PACK_SKIP_ROWS,    GL_PACK_SKIP_PIXELS,   GL_PACK_SKIP_IMAGES,   GL_PACK_ALIGNMENT,
+    GL_UNPACK_SWAP_BYTES, GL_UNPACK_LSB_FIRST,   GL_UNPACK_ROW_LENGTH,  GL_UNPACK_IMAGE_HEIGHT,
+    GL_UNPACK_SKIP_ROWS,  GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_IMAGES, GL_UNPACK_ALIGNMENT,
 };
 
 #define DEPTH_PIXEL_STORE_COUNT (sizeof(depth_pixel_store_params) / sizeof(depth_pixel_store_params[0]))
@@ -244,8 +244,7 @@ depth_copy_to_interop(struct client_gl_d3d11_swapchain *sc, uint32_t index)
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, sc->depth_pbo);
 	glBindTexture(target, sc->base.base.images[index]);
 	for (uint32_t level = 0; level < sc->mip_count; level++) {
-		const uint64_t off =
-		    client_gl_d3d11_depth_level_offset(r, sc->width, sc->height, sc->layers, level);
+		const uint64_t off = client_gl_d3d11_depth_level_offset(r, sc->width, sc->height, sc->layers, level);
 		glGetTexImage(target, (GLint)level, r->read_format, r->read_type, (void *)(uintptr_t)off);
 	}
 	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack);
@@ -254,8 +253,7 @@ depth_copy_to_interop(struct client_gl_d3d11_swapchain *sc, uint32_t index)
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, sc->depth_pbo);
 	glBindTexture(target, sc->interop_textures[index]);
 	for (uint32_t level = 0; level < sc->mip_count; level++) {
-		const uint64_t off =
-		    client_gl_d3d11_depth_level_offset(r, sc->width, sc->height, sc->layers, level);
+		const uint64_t off = client_gl_d3d11_depth_level_offset(r, sc->width, sc->height, sc->layers, level);
 		const GLsizei w = (GLsizei)client_gl_d3d11_mip_extent(sc->width, level);
 		const GLsizei h = (GLsizei)client_gl_d3d11_mip_extent(sc->height, level);
 		if (array) {
@@ -325,8 +323,8 @@ depth_allocate_gl_objects(struct client_gl_d3d11_swapchain *sc, GLenum internal_
 		}
 	}
 
-	const uint64_t bytes = client_gl_d3d11_depth_level_offset(&sc->depth_recipe, sc->width, sc->height,
-	                                                          sc->layers, sc->mip_count);
+	const uint64_t bytes =
+	    client_gl_d3d11_depth_level_offset(&sc->depth_recipe, sc->width, sc->height, sc->layers, sc->mip_count);
 	GLint prev_pack = 0;
 	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
 	glGenBuffers(1, &sc->depth_pbo);
@@ -470,7 +468,8 @@ client_gl_d3d11_swapchain_create(struct xrt_compositor *xc,
 	// see client_gl_d3d11_filter_formats).
 	const bool depth = client_gl_d3d11_is_depth_format(info->format);
 	const struct client_gl_d3d11_depth_recipe recipe = client_gl_d3d11_depth_recipe_for(info->format);
-	if (depth && (!recipe.supported || !client_gl_d3d11_depth_shape_supported(info->sample_count, info->face_count))) {
+	if (depth &&
+	    (!recipe.supported || !client_gl_d3d11_depth_shape_supported(info->sample_count, info->face_count))) {
 		U_LOG_E("GL depth swapchain over IPC: format 0x%04x (samples %u, faces %u) cannot be backed (#1956)",
 		        (unsigned)info->format, info->sample_count, info->face_count);
 		return NULL;
@@ -589,13 +588,14 @@ client_gl_d3d11_swapchain_create(struct xrt_compositor *xc,
 
 		// Register the STAGING texture (not the shared one) with WGL interop
 		const GLuint interop_name = depth ? sc->interop_textures[i] : xscgl->images[i];
-		HANDLE interop_obj = pfn_wglDXRegisterObjectNV(
-		    interop_device, staging_tex,
-		    interop_name, tex_target, WGL_ACCESS_READ_WRITE_NV);
+		HANDLE interop_obj = pfn_wglDXRegisterObjectNV(interop_device, staging_tex, interop_name, tex_target,
+		                                               WGL_ACCESS_READ_WRITE_NV);
 		if (!interop_obj) {
-			U_LOG_E("wglDXRegisterObjectNV failed for image %u (target 0x%04x, DXGI %u, %ux%u x%u layers%s): %lu",
-			        i, tex_target, (unsigned)staging_desc.Format, desc.Width, desc.Height, desc.ArraySize,
-			        depth ? ", depth interop" : "", GetLastError());
+			U_LOG_E(
+			    "wglDXRegisterObjectNV failed for image %u (target 0x%04x, DXGI %u, %ux%u x%u layers%s): "
+			    "%lu",
+			    i, tex_target, (unsigned)staging_desc.Format, desc.Width, desc.Height, desc.ArraySize,
+			    depth ? ", depth interop" : "", GetLastError());
 			goto err_cleanup;
 		}
 		sc->dx_interop_objects[i] = interop_obj;
@@ -618,8 +618,8 @@ client_gl_d3d11_swapchain_create(struct xrt_compositor *xc,
 		}
 	}
 
-	U_LOG_W("GL/D3D11 interop swapchain created: %u images, %ux%u x%u layers via WGL_NV_DX_interop2%s",
-	        image_count, info->width, info->height, sc->layers,
+	U_LOG_W("GL/D3D11 interop swapchain created: %u images, %ux%u x%u layers via WGL_NV_DX_interop2%s", image_count,
+	        info->width, info->height, sc->layers,
 	        depth ? " (depth: GL-native texture + colour-family interop copy, #1956)" : "");
 
 	*out_cglsc = &sc->base;
