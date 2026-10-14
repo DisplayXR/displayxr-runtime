@@ -360,8 +360,11 @@ there was no panel then, was never asked again. Decisions:
    may wait on a vendor service describing a panel that just came up, so it runs outside the lock
    every screen-list reader takes (`g_display_info_mutex`). Then, under that lock: install the
    registry, re-resolve the panel's desktop rect and the per-screen preference, build the screen
-   list, and compare it with the published one (`target_screens_compare`). Only a different list is
-   **published**: copied, and a **display-topology generation** bumped under its own small lock.
+   list, and compare it with the published one (`target_screens_compare`). Only a materially
+   different list is **published** (a screen whose only difference is its EDID physical size is not:
+   macOS refines that ~0.5–1 s after a plug-in, when IOKit publishes the EDID blob, and republishing
+   for it rebuilt every live segment DP and re-acquired its eye tracker; a claim-level change or new
+   bounds still publish): copied, and a **display-topology generation** bumped under its own small lock.
    Nothing hands out pointers into the registry: a session takes one by-value snapshot
    (`xrt_instance::get_display_snapshot` — the list, the system info with its registry, and their
    generation, under the sweep's lock) and the compositors copy that. Every session reads the
@@ -384,8 +387,9 @@ there was no panel then, was never asked again. Decisions:
    every backend, its DPs are windowless with an explicit present origin (exactly what the SR Metal
    weaver takes), and its lifecycle is hysteresis-gated. The cost is an idle session DP while the
    window sits on a re-claimed screen. A new screen table re-tables the live segment manager **in
-   place**: a segment DP whose screen is listed again with the same binding, by the same plug-in
-   instance, is kept (`comp_segments_lifecycle_adopt` — a vendor weaver is not torn down because an
+   place**: a segment DP whose screen is listed again with the same binding (EDID mm aside) and claim
+   level, by the same plug-in instance, is kept (`comp_segments_dp_key_keeps` +
+   `comp_segments_lifecycle_adopt` — a vendor weaver is not torn down because an
    unrelated monitor came or went); every other one is destroyed on the commit thread between two
    weaves. **Unplug** is that case: the screen leaves the table, its DP is destroyed (the plug-in's
    `destroy` is where its weaver goes and its lens is switched off), and the window, which the OS

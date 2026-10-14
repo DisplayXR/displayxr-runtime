@@ -10,6 +10,8 @@
 
 #include "util/u_multi_display.h"
 
+#include "xrt/xrt_plugin.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -510,6 +512,26 @@ comp_segments_lifecycle_adopt(struct comp_segments_lifecycle *lc, uint64_t scree
 	s->present_streak = lc->create_after;
 	s->absent_streak = 0;
 	return true;
+}
+
+bool
+comp_segments_dp_key_keeps(const struct comp_segments_dp_key *was, const struct comp_segments_dp_key *now)
+{
+	if (was == NULL || now == NULL || was->binding == NULL || now->binding == NULL) {
+		return false;
+	}
+	if (was->screen_id != now->screen_id || was->iface != now->iface || was->inst != now->inst ||
+	    was->confidence != now->confidence) {
+		return false;
+	}
+	// The whole binding but its EDID mm (refined late on macOS, see the header).
+	struct xrt_screen_binding a;
+	struct xrt_screen_binding b;
+	memcpy(&a, was->binding, sizeof(a)); // bytes, padding included: memcmp below
+	memcpy(&b, now->binding, sizeof(b));
+	a.physical_width_mm = b.physical_width_mm = 0;
+	a.physical_height_mm = b.physical_height_mm = 0;
+	return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
 bool

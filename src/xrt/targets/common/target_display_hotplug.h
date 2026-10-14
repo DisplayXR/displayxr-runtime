@@ -140,14 +140,24 @@ struct target_screens_change
 	uint32_t removed;          //!< Screens only in the old list.
 	uint32_t claimant_changed; //!< Same screen, another winning plug-in.
 	uint32_t geometry_changed; //!< Same screen, another desktop rect / mode / scale.
-	uint32_t other_changed;    //!< Same screen, other fields (flags, info, confidence, names).
+	uint32_t claim_changed;    //!< Same screen and claimant, another claim level (confidence).
+	uint32_t other_changed;    //!< Same screen, other fields (flags, info, names, preferred mode).
+	uint32_t metadata_changed; //!< Same screen, ONLY its EDID physical size differs (not a change).
 	bool default_moved;        //!< The SYSTEM_DEFAULT screen is another one.
 };
 
 /*!
  * Compare two screen lists by screen id.
  *
- * @return true when anything differs (byte-for-byte equal lists are "no change").
+ * A screen whose only difference is its EDID physical size (`physical_*_mm`)
+ * counts in @ref target_screens_change::metadata_changed and is NOT a change:
+ * on macOS that field is refined ~0.5-1 s after a plug-in (CoreGraphics' mm
+ * until IOKit publishes the EDID blob, then the EDID's own) for the same panel,
+ * and republishing for it made every live session rebuild its segment DPs.
+ * Anything the size feeds that an app or a DP sees (the derived metres in
+ * `info`) is compared as usual.
+ *
+ * @return true when the lists differ materially (a new generation is due).
  */
 bool
 target_screens_compare(const struct xrt_screen_list *before,
@@ -156,7 +166,10 @@ target_screens_compare(const struct xrt_screen_list *before,
 
 /*!
  * One human-readable line naming each change ("+0x… 'name' (sim-display)",
- * "-0x…", "0x… claimant sim-display -> leia-sr", "0x… rect …").
+ * "-0x…", "0x… claimant sim-display -> leia-sr", "0x… rect …",
+ * "0x… claim level 50 -> 100", "0x… flags 0x0 -> 0x2", "0x… display info",
+ * "0x… physical 598x341 -> 600x340 mm"), so a published generation always
+ * says why.
  */
 void
 target_screens_change_format(const struct xrt_screen_list *before,

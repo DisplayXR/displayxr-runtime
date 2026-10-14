@@ -175,6 +175,19 @@ default_id(const struct xrt_screen_list *l)
 	return 0;
 }
 
+//! @p a and @p b with their EDID physical size ignored (the rest byte for byte).
+static bool
+equal_but_physical_mm(const struct xrt_screen *a, const struct xrt_screen *b)
+{
+	struct xrt_screen x;
+	struct xrt_screen y;
+	memcpy(&x, a, sizeof(x)); // bytes, padding included: memcmp below
+	memcpy(&y, b, sizeof(y));
+	x.physical_width_mm = y.physical_width_mm = 0;
+	x.physical_height_mm = y.physical_height_mm = 0;
+	return memcmp(&x, &y, sizeof(x)) == 0;
+}
+
 bool
 target_screens_compare(const struct xrt_screen_list *before,
                        const struct xrt_screen_list *after,
@@ -196,8 +209,12 @@ target_screens_compare(const struct xrt_screen_list *before,
 			c.claimant_changed++;
 		} else if (!geometry_equal(a, b)) {
 			c.geometry_changed++;
-		} else if (memcmp(a, b, sizeof(*a)) != 0) {
+		} else if (a->confidence != b->confidence) {
+			c.claim_changed++;
+		} else if (!equal_but_physical_mm(a, b)) {
 			c.other_changed++;
+		} else if (memcmp(a, b, sizeof(*a)) != 0) {
+			c.metadata_changed++;
 		}
 	}
 	for (uint32_t i = 0; i < nb; i++) {
@@ -207,13 +224,17 @@ target_screens_compare(const struct xrt_screen_list *before,
 	}
 	c.default_moved = default_id(before) != default_id(after);
 
-	const bool order_or_any =
-	    nb != na || (nb > 0 && memcmp(before->screens, after->screens, sizeof(before->screens[0]) * nb) != 0);
+	// Same screens, other order (screens[0] is the system default, and the
+	// rest follow the registry): what an app enumerates changed.
+	bool reordered = nb != na;
+	for (uint32_t i = 0; i < nb && !reordered; i++) {
+		reordered = before->screens[i].id != after->screens[i].id;
+	}
 	if (out != NULL) {
 		*out = c;
 	}
 	return c.added != 0 || c.removed != 0 || c.claimant_changed != 0 || c.geometry_changed != 0 ||
-	       c.other_changed != 0 || c.default_moved || order_or_any;
+	       c.claim_changed != 0 || c.other_changed != 0 || c.default_moved || reordered;
 }
 
 #define APPEND(...)                                                                                                    \
@@ -252,6 +273,24 @@ target_screens_change_format(const struct xrt_screen_list *before,
 			       (unsigned long long)a->id, a->device_name, b->desktop_left, b->desktop_top,
 			       b->desktop_width, b->desktop_height, a->desktop_left, a->desktop_top, a->desktop_width,
 			       a->desktop_height);
+		} else if (a->confidence != b->confidence) {
+			APPEND("%s0x%016llx '%s' claim level %u -> %u", used > 0 ? "; " : "", (unsigned long long)a->id,
+			       a->device_name, b->confidence, a->confidence);
+		} else if (!equal_but_physical_mm(a, b)) {
+			if (a->flags != b->flags) {
+				APPEND("%s0x%016llx '%s' flags 0x%x -> 0x%x", used > 0 ? "; " : "",
+				       (unsigned long long)a->id, a->device_name, b->flags, a->flags);
+			} else if (memcmp(&a->info, &b->info, sizeof(a->info)) != 0) {
+				APPEND("%s0x%016llx '%s' display info", used > 0 ? "; " : "", (unsigned long long)a->id,
+				       a->device_name);
+			} else {
+				APPEND("%s0x%016llx '%s' name / preferred mode", used > 0 ? "; " : "",
+				       (unsigned long long)a->id, a->device_name);
+			}
+		} else if (memcmp(a, b, sizeof(*a)) != 0) {
+			APPEND("%s0x%016llx '%s' physical %ux%u -> %ux%u mm (EDID refined; not a change)",
+			       used > 0 ? "; " : "", (unsigned long long)a->id, a->device_name, b->physical_width_mm,
+			       b->physical_height_mm, a->physical_width_mm, a->physical_height_mm);
 		}
 	}
 	for (uint32_t i = 0; i < list_count(before); i++) {
@@ -268,7 +307,7 @@ target_screens_change_format(const struct xrt_screen_list *before,
 		       (unsigned long long)da);
 	}
 	if (used == 0) {
-		APPEND("no screen added, removed, re-claimed or moved");
+		APPEND("no screen added, removed, re-claimed, moved or re-ordered");
 	}
 }
 
