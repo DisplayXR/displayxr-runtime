@@ -58,3 +58,4 @@
 - [ADR-052](ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
 - [ADR-053](ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
 - [ADR-054](ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
+- [ADR-055](ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
