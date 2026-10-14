@@ -88,7 +88,7 @@ TEST_CASE("fb pace: an ~8% slip window escalates once, capped at base + 1")
 	CHECK(p.depth == 1);
 	CHECK(window(p, COMP_FB_PACE_SLIP_LIMIT, now) == COMP_FB_PACE_DEEPER);
 	CHECK(p.depth == 2);
-	CHECK(window(p, 40, now) == COMP_FB_PACE_NONE); // the cap
+	CHECK(window(p, 40, now) == COMP_FB_PACE_AT_CAP); // the cap
 	CHECK(p.depth == 2);
 }
 

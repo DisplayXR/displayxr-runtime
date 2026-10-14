@@ -24,13 +24,21 @@
  *   effective depth = max(lag floor, slip/saturation level), ceiling 4
  *
  * - **Lag floor (this file).** EMA of the compositor's INTRINSIC
- *   commit-to-glass latency per present: `presented − commit` minus the
- *   periods the frame spent queued behind our own earlier presents
- *   (@ref comp_lw_lag_intrinsic_ns). Without that correction the floor runs
- *   away: at depth d the app commits d−1 frames ahead, each sample grows by
- *   ~(d−1) periods of FIFO wait, the floor rises, the depth rises, and so on —
- *   measured on the PR's first CI build: 1 -> 2 -> 3 -> 4 with the sample at
- *   3.51 periods and the #206 residual doubled from 1.99 to 3.99 periods. The
+ *   commit-to-glass latency per present: `presented − commit` minus one
+ *   period per present of OURS still outstanding (committed, not yet
+ *   presented) at commit time (@ref comp_lw_lag_intrinsic_ns). Without that
+ *   correction the floor runs away: a deeper pipeline queues more of our
+ *   frames ahead, each sample grows by that FIFO wait, the floor rises, the
+ *   depth rises — measured on the PR's first CI build: 1 -> 2 -> 3 -> 4, the
+ *   #206 residual doubled from 1.99 to 3.99 periods. The count must be the
+ *   ACTUAL outstanding presents, not depth − 1: the swapchain lets the app
+ *   run further ahead than the pacing depth (second CI build: a 5.5-period
+ *   raw sample at depth 3 read as 3.53 intrinsic, and the estimate swung
+ *   0.8-3.7 periods). Two more guards: samples taken with more than
+ *   @ref COMP_LW_LAG_MAX_OUTSTANDING presents outstanding are dropped (the
+ *   queue term dominates them), and each sample is clamped to the EMA
+ *   ± @ref COMP_LW_LAG_SAMPLE_CLAMP periods, so one frame can move the EMA by
+ *   at most 0.05 period. The
  *   raw sample comes from the window system's presentation feedback (wp_presentation; or, where the
  *   feedback cannot be correlated per present, the return of a present wait
  *   that actually blocked). The floor is the lag rounded to whole periods:
@@ -84,6 +92,11 @@ extern "C" {
 //! Raise once the lag reaches floor + this many periods.
 #define COMP_LW_LAG_RAISE_MARGIN 0.5
 #define COMP_LW_LAG_MIN_SAMPLES 16
+//! Samples taken with more of our presents outstanding than this are dropped.
+#define COMP_LW_LAG_MAX_OUTSTANDING 2
+//! A sample may sit at most this many periods from the EMA (alpha 0.1 ->
+//! one frame moves the EMA by <= 0.05 period).
+#define COMP_LW_LAG_SAMPLE_CLAMP 0.5
 #define COMP_LW_LAG_DWELL_NS (30ULL * 1000ULL * 1000ULL * 1000ULL)
 #define COMP_LW_LAG_DWELL_MAX_NS (300ULL * 1000ULL * 1000ULL * 1000ULL)
 //! Lag samples above this are a stall, not a property of the pipeline.
@@ -134,7 +147,12 @@ comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint64_t period_ns
 	if (l == NULL || lag_ns == 0 || lag_ns > COMP_LW_LAG_MAX_NS) {
 		return false;
 	}
-	l->ema_ns = (l->samples == 0) ? (double)lag_ns : l->ema_ns * 0.9 + (double)lag_ns * 0.1;
+	double v = (double)lag_ns;
+	if (l->samples != 0 && period_ns != 0) {
+		const double c = (double)period_ns * COMP_LW_LAG_SAMPLE_CLAMP;
+		v = v > l->ema_ns + c ? l->ema_ns + c : (v < l->ema_ns - c ? l->ema_ns - c : v);
+	}
+	l->ema_ns = (l->samples == 0) ? v : l->ema_ns * 0.9 + v * 0.1;
 	l->samples++;
 	if (period_ns == 0 || l->samples < COMP_LW_LAG_MIN_SAMPLES) {
 		return false;
@@ -173,14 +191,18 @@ comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint64_t period_ns
 /*!
  * The compositor's intrinsic commit-to-glass latency from one raw sample:
  * `sample − queued_ahead × period`, where @p queued_ahead is how many of our
- * own presents were ahead of this one at commit (the effective depth − 1 the
- * pacer allowed). At least 1 ns, so a fully-queue-explained sample still
- * counts as "well under a period". The estimate is the same at every depth,
- * which is what keeps the floor from feeding on its own depth.
+ * own presents were still outstanding (committed, not yet presented) when
+ * this one was committed. At least 1 ns, so a fully-queue-explained sample
+ * still counts as "well under a period"; 0 = drop the sample (more than
+ * @ref COMP_LW_LAG_MAX_OUTSTANDING outstanding). The estimate is the same at
+ * every depth, which is what keeps the floor from feeding on its own depth.
  */
 static inline uint64_t
 comp_lw_lag_intrinsic_ns(uint64_t sample_ns, uint32_t queued_ahead, uint64_t period_ns)
 {
+	if (queued_ahead > COMP_LW_LAG_MAX_OUTSTANDING) {
+		return 0;
+	}
 	const uint64_t q = (uint64_t)queued_ahead * period_ns;
 	return sample_ns > q ? sample_ns - q : 1;
 }

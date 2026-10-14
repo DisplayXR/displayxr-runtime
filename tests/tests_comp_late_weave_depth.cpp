@@ -24,11 +24,13 @@ struct gov
 	uint64_t now = 1 * S;
 	uint64_t last_frame = 0;
 	int lag_changes = 0;
+	int at_cap = 0;
 
 	gov()
 	{
 		comp_fb_pace_init(&pace, 1, true);
 		pace.ever_ok = true;
+		pace.banked = 0; // the present_wait tier: no level above the floor
 		comp_lw_lag_init(&lag);
 	}
 
@@ -49,7 +51,10 @@ struct gov
 			comp_fb_pace_set_floor(&pace, lag.depth, now);
 		}
 		if (last_frame != 0) {
-			comp_fb_pace_on_wait(&pace, !comp_lw_lag_is_slip(now - last_frame, P60), 0, now);
+			if (comp_fb_pace_on_wait(&pace, !comp_lw_lag_is_slip(now - last_frame, P60), 0, now) ==
+			    COMP_FB_PACE_AT_CAP) {
+				at_cap++;
+			}
 		}
 		last_frame = now;
 	}
@@ -91,32 +96,41 @@ TEST_CASE("lw depth: a direct-scanout target (sub-period lag) stays at depth 1")
 	CHECK(g.depth() == 1);
 }
 
-TEST_CASE("lw depth: a saturated 25 ms app at 60 Hz escalates to 2, then probes back to 1")
+TEST_CASE("lw depth: slips do not raise the depth above the measured floor on this tier")
 {
 	gov g;
-	// 25 ms average frame on a 60 Hz FIFO: alternating 1- and 2-vblank intervals,
-	// half of them slips. One-period lag: the floor stays 1, saturation drives it.
-	for (int i = 0; i <= COMP_FB_PACE_WINDOW; i++) { // first frame has no interval
+	// 25 ms average frame on a 60 Hz FIFO (alternating 1- and 2-vblank
+	// intervals, half of them slips) with a 1-period lag: the floor is 1 and
+	// slips alone do not bank a level above it — they are reported instead.
+	for (int i = 0; i <= COMP_FB_PACE_WINDOW * 3; i++) { // first frame has no interval
 		g.frame((i & 1) ? 2 * P60 : P60, P60 * 8 / 10);
 	}
 	CHECK(g.lag.depth == 1);
-	CHECK(g.depth() == 2);
-	// Saturation over: clean windows. No probe before the dwell...
-	g.run(COMP_FB_PACE_WINDOW * COMP_FB_PACE_CLEAN_WINDOWS, P60, P60 * 8 / 10);
-	CHECK(g.depth() == 2);
-	// ...and one level down after it.
-	g.run(60 * 40, P60, P60 * 8 / 10);
 	CHECK(g.depth() == 1);
+	CHECK(g.at_cap == 3);
 }
 
-TEST_CASE("lw depth: slip escalation is capped one level above the lag floor")
+TEST_CASE("lw depth: with a floor of 2, slipping windows stay at 2")
 {
 	gov g;
 	g.run(COMP_LW_LAG_MIN_SAMPLES, 2 * P60, 2 * P60);
 	REQUIRE(g.depth() == 2);
-	// Still slipping at the floor: one banked level, never more.
 	g.run(COMP_FB_PACE_WINDOW * 4, 2 * P60, 2 * P60);
-	CHECK(g.depth() == 3);
+	CHECK(g.depth() == 2);
+	CHECK(g.at_cap >= 3);
+}
+
+TEST_CASE("lw depth: the feedback-pacing default still banks one level")
+{
+	comp_fb_pace p;
+	comp_fb_pace_init(&p, 1, true);
+	CHECK(p.banked == 1);
+	uint64_t now = 10 * S;
+	for (int i = 0; i < COMP_FB_PACE_WINDOW; i++) {
+		now += P60;
+		comp_fb_pace_on_wait(&p, i == 0, 0, now); // one success, then slips
+	}
+	CHECK(comp_fb_pace_effective(&p) == 2);
 }
 
 TEST_CASE("lw depth: a lag flipping 1 -> 2 -> 1 periods rises fast and never flaps faster than the dwell")
@@ -239,6 +253,7 @@ TEST_CASE("lw depth: the intrinsic lag is the same at every depth")
 		CHECK(l.depth == 2);
 	}
 	CHECK(comp_lw_lag_intrinsic_ns(P60, 2, P60) == 1); // fully explained by our queue
+	CHECK(comp_lw_lag_intrinsic_ns(6 * P60, 3, P60) == 0); // too deep a queue: dropped
 }
 
 TEST_CASE("lw depth: the floor never feeds on our own depth (no runaway)")
@@ -261,4 +276,60 @@ TEST_CASE("lw depth: the floor never feeds on our own depth (no runaway)")
 	CHECK(g.lag_changes == 1);
 	// The intrinsic EMA reads the compositor, not the queue.
 	CHECK(g.lag.ema_ns == Catch::Approx((double)intrinsic).epsilon(0.01));
+}
+
+TEST_CASE("lw depth: one sample moves the EMA by at most 0.05 period")
+{
+	comp_lw_lag l;
+	comp_lw_lag_init(&l);
+	uint64_t now = S;
+	for (int i = 0; i < 60; i++) {
+		now += P60;
+		comp_lw_lag_on_sample(&l, 2 * P60, P60, now);
+	}
+	const double before = l.ema_ns;
+	comp_lw_lag_on_sample(&l, 150 * MS, P60, now); // a 9-period outlier
+	CHECK(l.ema_ns - before <= 0.05 * (double)P60 + 1.0);
+}
+
+TEST_CASE("lw depth: replay of the second CI build's log stays at depth 2")
+{
+	// David's 150 s governed arm on 2.44.2+4: intrinsic lag ~1.72 periods; raw
+	// samples carried 0..3 of our presents outstanding (and the count the
+	// feeder sees can lag the truth by one); 58 fps with slip windows from
+	// GPU jitter; a few multi-period stalls. The old build went 1 -> 2 -> 3
+	// -> 2 -> 3 -> 4 -> 3 -> 4 on this. Depth must never exceed 2 and the
+	// intrinsic EMA must stay in 1.5..2.5 periods.
+	gov g;
+	const uint64_t intrinsic = P60 * 172 / 100;
+	uint32_t rng = 12345;
+	auto next = [&]() {
+		rng = rng * 1103515245u + 12345u;
+		return (rng >> 16) & 0x7fff;
+	};
+	int max_depth = 0;
+	double min_ema = 1e30, max_ema = 0;
+	for (int i = 0; i < 60 * 150; i++) {
+		const uint32_t outstanding = next() % 4; // 0..3 of ours ahead
+		const uint32_t seen = (next() % 4 == 0 && outstanding > 0) ? outstanding - 1 : outstanding;
+		uint64_t raw = intrinsic + outstanding * P60 + (uint64_t)(next() % 3000) * 1000; // + <= 3 ms jitter
+		if (next() % 200 == 0) {
+			raw += 4 * P60; // a stall the count does not explain
+		}
+		// 58 fps: ~1 frame in 30 doubled, with bursty windows of 12 slips.
+		const bool burst = (i / COMP_FB_PACE_WINDOW) % 3 == 1;
+		const bool slip = burst ? (i % 10 == 0) : (next() % 30 == 0);
+		g.frame(slip ? 2 * P60 : P60, raw, seen);
+		max_depth = g.depth() > max_depth ? g.depth() : max_depth;
+		if (g.lag.samples >= COMP_LW_LAG_MIN_SAMPLES) {
+			const double e = g.lag.ema_ns / (double)P60;
+			min_ema = e < min_ema ? e : min_ema;
+			max_ema = e > max_ema ? e : max_ema;
+		}
+	}
+	CHECK(max_depth == 2);
+	CHECK(g.depth() == 2);
+	CHECK(min_ema >= 1.5);
+	CHECK(max_ema <= 2.5);
+	CHECK(g.at_cap > 0); // the slip windows were seen, and declined
 }

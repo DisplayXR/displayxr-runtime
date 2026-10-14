@@ -107,9 +107,13 @@ everywhere, ceiling 4:
 - **Lag floor** (`util/comp_late_weave_depth.h`): EMA of the compositor's **intrinsic**
   commit-to-glass time per present (`wp_presentation` presented − `vkQueuePresentKHR` return; on
   X11 / without correlated feedback, the return of a present wait that actually blocked), **minus
-  (depth − 1) periods** — the time the frame sat queued behind our own earlier presents. Without
-  that correction the floor fed on its own depth (first CI build: 1 → 2 → 3 → 4, the #206
-  residual doubled from 1.99 to 3.99 periods). Raised as soon as the EMA reaches
+  one period per present of ours still outstanding at commit** — the time the frame sat queued
+  behind our own earlier presents, counted from the feeder (committed tags − answered tags; X11
+  falls back to the depth − 1 bound present_wait guarantees). Samples with more than 2 outstanding
+  are dropped, and each sample is clamped to the EMA ± 0.5 period (one frame moves it ≤ 0.05
+  period). Without this the floor fed on its own depth: the first CI build went 1 → 2 → 3 → 4 with
+  the #206 residual doubling from 1.99 to 3.99 periods; the second, which subtracted depth − 1,
+  still swung 0.8–3.7 periods because the swapchain lets the app run further ahead than the depth. Raised as soon as the EMA reaches
   floor + 0.5 periods (2 on a composited window, 1 on direct scanout, whatever a PRIME path
   measures); lowered one level only after the lower value held for a 30 s dwell, doubling to 300 s
   when it is raised again within two dwells. Up fast, down slow on purpose: mutter switches between
@@ -118,14 +122,18 @@ everywhere, ceiling 4:
   presents/s), while depth 2 is cheap (the #206 weave→scanout horizon measured the same at depth 1
   and 2).
 - **Slip level** — the shared slip machine `util/comp_feedback_pace.h` (the Windows governor's
-  rules, also used by feedback pacing) fed with "paced frame interval > 1.55 periods": ≥ 10 slips
-  per 120 frames escalates one level above the effective depth, capped at floor + 1; three clean
-  windows plus a 30 s dwell probe back down; a failed probe doubles the dwell.
+  rules, also used by feedback pacing) fed with "paced frame interval > 1.55 periods". On this tier
+  it banks **no** level above the floor (`banked = 0`; feedback pacing keeps 1): measured on the
+  second CI build, a 58 fps app slipping from GPU jitter escalated 2 → 3, ran at 58 fps either way,
+  and paid a full period of residual. A slipping window at the cap logs
+  `#2119: slip window at the depth cap …` (at most every 30 s) instead.
 - The app's predicted display time follows the depth: at depth > 1 `xrWaitFrame` returns the
   measured `wait_frame → weave + weave → scanout` lookahead (#867's formula) instead of `2 × period`.
 - `DXR_LATE_WEAVE_MAX_LATENCY` set = pinned depth, governor off; `DXR_LATE_WEAVE_AUTOBACKOFF=0` =
   depth 1. Inert when the tier latches off. Every change logs one throttled WARN naming the
   signal: `#2119: late-weave depth 1 -> 2 (commit-to-glass lag; … floor 2, slip level 1, …)`.
+  With `DXR_WEAVE_CADENCE_TRACE=1` the 5 s `#206` residual line carries the governor state:
+  `| depth 2 (floor 2, slip level 1, governed), intrinsic lag 1.72 periods, outstanding at last commit 1`.
 
 `VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
 samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in

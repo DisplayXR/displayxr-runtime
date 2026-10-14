@@ -653,6 +653,9 @@ struct comp_vk_native_target
 	 * the grid gate aimed it at (0 = not aimed — the gate did not sleep).
 	 */
 	uint64_t pf_seq;
+	//! #2119: highest request tag the feeder has answered (presented or
+	//! discarded) — pf_seq minus this = our presents still outstanding.
+	uint64_t pf_answered_seq;
 	struct
 	{
 		uint64_t seq;
@@ -719,6 +722,10 @@ struct comp_vk_native_target
 	uint64_t pw_depth_log_ns;
 	uint32_t pw_depth_log_suppressed;
 	uint32_t pw_depth_changes;
+	//! Our presents outstanding when the last present was committed.
+	uint32_t pw_last_outstanding;
+	uint64_t pw_cap_log_ns;
+	uint32_t pw_cap_windows;
 	//! #2119/#867: xrWaitFrame return (mark) and the EMA of mark -> weave
 	//! start, the app-side half of the lookahead once depth > 1.
 	uint64_t pw_wait_frame_ns;
@@ -2481,14 +2488,28 @@ target_log_residual(struct comp_vk_native_target *target)
 			const double per = (double)target->vblank_grid.period_ns;
 			const struct comp_residual_stats st =
 			    comp_residual_window_take(&target->residual_win, target->vblank_grid.period_ns);
+			// #2119: the present_wait depth governor's state rides along, so
+			// one line says whether the residual moved with the depth.
+			char gov[192] = "";
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (target->pw_pace_inited) {
+				snprintf(gov, sizeof(gov),
+				         " | depth %d (floor %d, slip level %d, %s), intrinsic lag %.2f periods, "
+				         "outstanding at last commit %u",
+				         comp_fb_pace_effective(&target->pw_pace), target->pw_pace.floor,
+				         target->pw_pace.depth, target->pw_governing ? "governed" : "fixed",
+				         target->pw_lag.ema_ns / per, target->pw_last_outstanding);
+			}
+#endif
 			if (st.n != 0) {
 				U_LOG_W(
 				    "#206: weave->scanout residual over 5 s — n=%llu mean %.2f ms (%.2f periods), "
-				    "p50 %.2f ms (%.2f), p95 %.2f ms (%.2f), max %.2f ms (%.2f), >1.5 periods %.1f%%%s",
+				    "p50 %.2f ms (%.2f), p95 %.2f ms (%.2f), max %.2f ms (%.2f), >1.5 periods "
+				    "%.1f%%%s%s",
 				    (unsigned long long)st.n, st.mean_ns / 1e6, st.mean_ns / per, st.p50_ns / 1e6,
 				    (double)st.p50_ns / per, st.p95_ns / 1e6, (double)st.p95_ns / per, st.max_ns / 1e6,
 				    (double)st.max_ns / per, st.frac_over_1p5 * 100.0,
-				    st.truncated ? " (percentiles over the first 2048)" : "");
+				    st.truncated ? " (percentiles over the first 2048)" : "", gov);
 			}
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (target->fb_pace_inited) {
@@ -2604,6 +2625,9 @@ target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint32
 	// periods this frame waited behind our own earlier presents, or the
 	// floor feeds on its own depth (1 -> 2 -> 3 -> 4 on the first CI build).
 	const uint64_t intrinsic = comp_lw_lag_intrinsic_ns(lag_ns, queued_ahead, period_ns);
+	if (intrinsic == 0) {
+		return; // too much of our own queue ahead of it to say anything
+	}
 	if (comp_lw_lag_on_sample(&target->pw_lag, intrinsic, period_ns, now_ns)) {
 		const int from = target_pw_depth(target);
 		if (comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth, now_ns)) {
@@ -2680,6 +2704,9 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 			// Resolve the request this sample answers (Wayland; X11 cannot
 			// correlate, tag 0).
 			const uint64_t tag = evs[i].tag;
+			if (tag > target->pf_answered_seq) {
+				target->pf_answered_seq = tag; // #2119 outstanding count
+			}
 			if (tag == 0 || target->pf_ring[tag % 16].seq != tag) {
 				continue;
 			}
@@ -3997,6 +4024,10 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 				// feedback pacing; this tier has its own latch (below), and a
 				// composited window's first depth-1 frames are all slips.
 				target->pw_pace.ever_ok = true;
+				// No banked level above the measured floor on this tier: on a
+				// 58 fps app slipping from GPU jitter it bought no frames and
+				// cost a full period of residual (#2119, second CI build).
+				target->pw_pace.banked = 0;
 				comp_lw_lag_init(&target->pw_lag);
 			}
 			const int depth = target_pw_depth(target);
@@ -4039,6 +4070,20 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 							                         ? "saturation: slip-rate escalation"
 							                         : "return probe",
 							                     now_ns);
+						} else if (e == COMP_FB_PACE_AT_CAP) {
+							target->pw_cap_windows++;
+							if (target->pw_cap_log_ns == 0 ||
+							    now_ns - target->pw_cap_log_ns >
+							        30ULL * 1000 * 1000 * 1000) {
+								U_LOG_W(
+								    "#2119: slip window at the depth cap (depth %d = "
+								    "measured floor): "
+								    "not escalating, a level above the floor buys no "
+								    "frames here "
+								    "(%u such windows so far)",
+								    from, target->pw_cap_windows);
+								target->pw_cap_log_ns = now_ns;
+							}
 						}
 					}
 					target->pw_last_frame_ns = now_ns;
@@ -4473,7 +4518,17 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		target->pf_ring[pf_req_seq % 16].weave_start_ns = target->weave_start_ns;
 		target->pf_ring[pf_req_seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
 		target->pf_ring[pf_req_seq % 16].commit_ns = 0;
-		target->pf_ring[pf_req_seq % 16].queued_ahead = (uint32_t)(target_pw_depth(target) - 1);
+		// #2119: the ACTUAL number of our presents still outstanding at this
+		// commit (not depth - 1: the swapchain lets the app run further
+		// ahead). Drain the feedback first so the count is current.
+		if (target->pw_governing) {
+			target_feed_present_feedback(target);
+		}
+		const uint64_t prev = pf_req_seq - 1;
+		const uint32_t outstanding =
+		    prev > target->pf_answered_seq ? (uint32_t)(prev - target->pf_answered_seq) : 0;
+		target->pf_ring[pf_req_seq % 16].queued_ahead = outstanding;
+		target->pw_last_outstanding = outstanding;
 		comp_vk_native_present_feedback_request(target->present_fb, pf_req_seq);
 	}
 	target->lw_aimed_vblank_ns = 0;
@@ -4529,7 +4584,13 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		target->present_weave_ring_id[pw_id % 8] = pw_id;
 		target->present_weave_ring_ns[pw_id % 8] = pw_weave_start;
 		target->present_commit_ring_ns[pw_id % 8] = present_ret_ns; // #2119 lag
+		// X11 / uncorrelated feedback: present_wait only proves glass for the
+		// id the pacer waited on, so depth - 1 is the bound it guarantees
+		// (the Wayland path above counts the real outstanding presents).
 		target->present_commit_queued[pw_id % 8] = (uint32_t)(target_pw_depth(target) - 1);
+		if (!target->pw_lag_from_feedback) {
+			target->pw_last_outstanding = target->present_commit_queued[pw_id % 8];
+		}
 	}
 #endif
 
