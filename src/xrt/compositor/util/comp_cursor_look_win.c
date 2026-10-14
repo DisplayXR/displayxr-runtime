@@ -237,6 +237,29 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 	return false;
 }
 
+bool
+comp_cursor_look_from_os_cursor(struct comp_cursor_look *look, uint64_t os_cursor, float backing_scale)
+{
+	HCURSOR hc = (HCURSOR)(uintptr_t)os_cursor;
+	if (hc == NULL) {
+		return false;
+	}
+	const float scale = backing_scale > 0.0f ? backing_scale : comp_cursor_look_platform_backing_scale();
+	if ((void *)hc == look->os_cursor && look->os_scale == scale && look->rgba != NULL) {
+		return true; // unchanged
+	}
+	if ((void *)hc == look->os_failed) {
+		return false; // not retried every frame
+	}
+	if (snapshot(look, hc, scale)) {
+		look->os_failed = NULL;
+		return true;
+	}
+	look->os_failed = (void *)hc;
+	U_LOG_W("cursor_draw: could not read the caller's cursor %p (dead handle?) - keeping the last look", (void *)hc);
+	return false;
+}
+
 void
 comp_cursor_look_platform_release(void *os_cursor)
 {
