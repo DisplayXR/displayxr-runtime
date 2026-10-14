@@ -104,9 +104,12 @@ not involved (33.6 with it pinned at 2.5 GHz). So the depth is derived from meas
 everywhere, ceiling 4:
 
 - **effective depth = max(lag floor, slip level).**
-- **Lag floor** (`util/comp_late_weave_depth.h`): EMA of each present's commit-to-glass time
-  (`wp_presentation` presented − `vkQueuePresentKHR` return, exact; on X11 / without correlated
-  feedback, the return of a present wait that actually blocked). Raised as soon as the EMA reaches
+- **Lag floor** (`util/comp_late_weave_depth.h`): EMA of the compositor's **intrinsic**
+  commit-to-glass time per present (`wp_presentation` presented − `vkQueuePresentKHR` return; on
+  X11 / without correlated feedback, the return of a present wait that actually blocked), **minus
+  (depth − 1) periods** — the time the frame sat queued behind our own earlier presents. Without
+  that correction the floor fed on its own depth (first CI build: 1 → 2 → 3 → 4, the #206
+  residual doubled from 1.99 to 3.99 periods). Raised as soon as the EMA reaches
   floor + 0.5 periods (2 on a composited window, 1 on direct scanout, whatever a PRIME path
   measures); lowered one level only after the lower value held for a 30 s dwell, doubling to 300 s
   when it is raised again within two dwells. Up fast, down slow on purpose: mutter switches between

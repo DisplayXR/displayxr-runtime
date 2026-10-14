@@ -660,6 +660,8 @@ struct comp_vk_native_target
 		uint64_t aimed_vblank_ns;
 		//! vkQueuePresentKHR return — the WSI's wl_surface.commit is inside it.
 		uint64_t commit_ns;
+		//! #2119: our own presents queued ahead of this one (depth − 1).
+		uint32_t queued_ahead;
 	} pf_ring[16];
 	//! Set by the grid gate when it aims a weave, consumed by the request.
 	uint64_t lw_aimed_vblank_ns;
@@ -724,6 +726,9 @@ struct comp_vk_native_target
 	//! vkQueuePresentKHR return per present id (id % 8, keyed by
 	//! present_weave_ring_id) — the commit time for the present_wait lag.
 	uint64_t present_commit_ring_ns[8];
+	//! #2119: presents queued ahead at commit (effective depth − 1), so the
+	//! lag floor sees the compositor's intrinsic latency, not our queue.
+	uint32_t present_commit_queued[8];
 	//! Weave start per present id (id % 8), for the residual at wait return.
 	uint64_t present_weave_ring_id[8];
 	uint64_t present_weave_ring_ns[8];
@@ -2570,7 +2575,7 @@ target_pw_log_change(struct comp_vk_native_target *target, int from, const char 
 	}
 	const uint64_t period_ns = target->vblank_grid.period_ns;
 	U_LOG_W(
-	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag %.2f ms = %.2f periods -> floor %d, "
+	    "#2119: late-weave depth %d -> %d (%s; intrinsic commit-to-glass lag %.2f ms = %.2f periods -> floor %d, "
 	    "slip level %d, period %.3f ms, probe dwell %llu s; change #%u, %u suppressed since last line)",
 	    from, target_pw_depth(target), why, target->pw_lag.ema_ns / 1e6,
 	    period_ns != 0 ? target->pw_lag.ema_ns / (double)period_ns : 0.0, target->pw_lag.depth,
@@ -2586,13 +2591,20 @@ target_pw_log_change(struct comp_vk_native_target *target, int from, const char 
  * auto-backoff on).
  */
 static void
-target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint64_t now_ns)
+target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint32_t queued_ahead, uint64_t now_ns)
 {
 	if (!target->pw_governing || target->present_wait_latched_off) {
 		return;
 	}
 	const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
-	if (comp_lw_lag_on_sample(&target->pw_lag, lag_ns, period_ns, now_ns)) {
+	if (period_ns == 0) {
+		return; // cannot remove our own queue time without a period
+	}
+	// The floor must track the compositor's INTRINSIC latency: subtract the
+	// periods this frame waited behind our own earlier presents, or the
+	// floor feeds on its own depth (1 -> 2 -> 3 -> 4 on the first CI build).
+	const uint64_t intrinsic = comp_lw_lag_intrinsic_ns(lag_ns, queued_ahead, period_ns);
+	if (comp_lw_lag_on_sample(&target->pw_lag, intrinsic, period_ns, now_ns)) {
 		const int from = target_pw_depth(target);
 		if (comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth, now_ns)) {
 			target_pw_log_change(target, from, "commit-to-glass lag", now_ns);
@@ -2693,7 +2705,8 @@ target_feed_present_feedback(struct comp_vk_native_target *target)
 			// tier's lag floor — exact here (compositor timestamps).
 			if (commit != 0 && !s->discarded && s->present_ns > commit) {
 				target->pw_lag_from_feedback = true;
-				target_pw_note_lag(target, s->present_ns - commit, now_ns);
+				target_pw_note_lag(target, s->present_ns - commit,
+				                   target->pf_ring[tag % 16].queued_ahead, now_ns);
 			}
 			if (commit != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
 				const enum comp_lw_adapt_event e =
@@ -4007,7 +4020,8 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 					                            : 0;
 					if (!target->pw_lag_from_feedback && commit != 0 && now_ns > commit &&
 					    now_ns - wait_t0 > 200ULL * 1000) {
-						target_pw_note_lag(target, now_ns - commit, now_ns);
+						target_pw_note_lag(target, now_ns - commit,
+						                   target->present_commit_queued[wait_id % 8], now_ns);
 					}
 					// (b) slip level: a paced frame interval over 1.55
 					// periods is a vsync-doubled frame (Windows slip test).
@@ -4459,6 +4473,7 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		target->pf_ring[pf_req_seq % 16].weave_start_ns = target->weave_start_ns;
 		target->pf_ring[pf_req_seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
 		target->pf_ring[pf_req_seq % 16].commit_ns = 0;
+		target->pf_ring[pf_req_seq % 16].queued_ahead = (uint32_t)(target_pw_depth(target) - 1);
 		comp_vk_native_present_feedback_request(target->present_fb, pf_req_seq);
 	}
 	target->lw_aimed_vblank_ns = 0;
@@ -4514,6 +4529,7 @@ comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
 		target->present_weave_ring_id[pw_id % 8] = pw_id;
 		target->present_weave_ring_ns[pw_id % 8] = pw_weave_start;
 		target->present_commit_ring_ns[pw_id % 8] = present_ret_ns; // #2119 lag
+		target->present_commit_queued[pw_id % 8] = (uint32_t)(target_pw_depth(target) - 1);
 	}
 #endif
 

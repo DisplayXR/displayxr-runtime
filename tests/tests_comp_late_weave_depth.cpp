@@ -38,12 +38,13 @@ struct gov
 		return comp_fb_pace_effective(&pace);
 	}
 
-	//! One paced frame: interval @p dt since the last one, commit-to-glass @p lag_ns.
+	//! One paced frame: interval @p dt since the last one, raw commit-to-glass
+	//! @p lag_ns measured with @p queued presents of ours ahead of it.
 	void
-	frame(uint64_t dt, uint64_t lag_ns)
+	frame(uint64_t dt, uint64_t lag_ns, uint32_t queued = 0)
 	{
 		now += dt;
-		if (comp_lw_lag_on_sample(&lag, lag_ns, P60, now)) {
+		if (comp_lw_lag_on_sample(&lag, comp_lw_lag_intrinsic_ns(lag_ns, queued, P60), P60, now)) {
 			lag_changes++;
 			comp_fb_pace_set_floor(&pace, lag.depth, now);
 		}
@@ -221,4 +222,43 @@ TEST_CASE("fb pace: a floor of 0 leaves the feedback-pacing behaviour unchanged"
 	CHECK(comp_fb_pace_effective(&p) == 2);
 	CHECK(comp_fb_pace_set_floor(&p, 1, 2 * S)); // a lowering is a probe
 	CHECK(p.last_probe_ns == 2 * S);
+}
+
+TEST_CASE("lw depth: the intrinsic lag is the same at every depth")
+{
+	// A 2-period intrinsic lag, measured at depth 1 (sample 2 periods, nothing
+	// queued), depth 2 (3 periods, 1 queued) and depth 3 (4 periods, 2 queued).
+	for (uint32_t q = 0; q < 3; q++) {
+		comp_lw_lag l;
+		comp_lw_lag_init(&l);
+		uint64_t now = S;
+		for (int i = 0; i < 60; i++) {
+			now += P60;
+			comp_lw_lag_on_sample(&l, comp_lw_lag_intrinsic_ns((2 + q) * P60, q, P60), P60, now);
+		}
+		CHECK(l.depth == 2);
+	}
+	CHECK(comp_lw_lag_intrinsic_ns(P60, 2, P60) == 1); // fully explained by our queue
+}
+
+TEST_CASE("lw depth: the floor never feeds on our own depth (no runaway)")
+{
+	// The first CI build's runaway: every level of depth adds a period of FIFO
+	// wait to the raw sample. Model exactly that, with the measured 1.76-period
+	// intrinsic lag, and feed the governor's own depth back in as the queue.
+	gov g;
+	const uint64_t intrinsic = P60 * 176 / 100;
+	int max_floor = 0;
+	int max_depth = 0;
+	for (int i = 0; i < 60 * 120; i++) {
+		const uint32_t q = (uint32_t)(g.depth() - 1);
+		g.frame(P60, intrinsic + q * P60, q);
+		max_floor = g.lag.depth > max_floor ? g.lag.depth : max_floor;
+		max_depth = g.depth() > max_depth ? g.depth() : max_depth;
+	}
+	CHECK(max_floor == 2);
+	CHECK(max_depth == 2);
+	CHECK(g.lag_changes == 1);
+	// The intrinsic EMA reads the compositor, not the queue.
+	CHECK(g.lag.ema_ns == Catch::Approx((double)intrinsic).epsilon(0.01));
 }

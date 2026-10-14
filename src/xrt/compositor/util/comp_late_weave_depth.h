@@ -23,8 +23,15 @@
  *
  *   effective depth = max(lag floor, slip/saturation level), ceiling 4
  *
- * - **Lag floor (this file).** EMA of `presented − commit` per present, from
- *   the window system's presentation feedback (wp_presentation; or, where the
+ * - **Lag floor (this file).** EMA of the compositor's INTRINSIC
+ *   commit-to-glass latency per present: `presented − commit` minus the
+ *   periods the frame spent queued behind our own earlier presents
+ *   (@ref comp_lw_lag_intrinsic_ns). Without that correction the floor runs
+ *   away: at depth d the app commits d−1 frames ahead, each sample grows by
+ *   ~(d−1) periods of FIFO wait, the floor rises, the depth rises, and so on —
+ *   measured on the PR's first CI build: 1 -> 2 -> 3 -> 4 with the sample at
+ *   3.51 periods and the #206 residual doubled from 1.99 to 3.99 periods. The
+ *   raw sample comes from the window system's presentation feedback (wp_presentation; or, where the
  *   feedback cannot be correlated per present, the return of a present wait
  *   that actually blocked). The floor is the lag rounded to whole periods:
  *   RAISED as soon as the EMA (after @ref COMP_LW_LAG_MIN_SAMPLES samples)
@@ -161,6 +168,21 @@ comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint64_t period_ns
 	}
 	l->lower_since_ns = 0;
 	return false;
+}
+
+/*!
+ * The compositor's intrinsic commit-to-glass latency from one raw sample:
+ * `sample − queued_ahead × period`, where @p queued_ahead is how many of our
+ * own presents were ahead of this one at commit (the effective depth − 1 the
+ * pacer allowed). At least 1 ns, so a fully-queue-explained sample still
+ * counts as "well under a period". The estimate is the same at every depth,
+ * which is what keeps the floor from feeding on its own depth.
+ */
+static inline uint64_t
+comp_lw_lag_intrinsic_ns(uint64_t sample_ns, uint32_t queued_ahead, uint64_t period_ns)
+{
+	const uint64_t q = (uint64_t)queued_ahead * period_ns;
+	return sample_ns > q ? sample_ns - q : 1;
 }
 
 //! The slip signal for the present_wait tier: a paced frame interval over
