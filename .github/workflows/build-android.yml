@@ -193,7 +193,13 @@ jobs:
       # MediaPipe; service APKs are variant-suffixed, the bundle takes -63mm).
       # v0.10.76/77 are tags without a release and 0.10.77's loader mis-declares
       # the _with_queue slot -- 0.10.78 is the first pinnable tag (CNSDK #751).
-      CNSDK_TAG: v0.10.78
+      # v0.10.79: matches leia-plugin v2.15.6 (built against
+      # cnsdk-android-0.10.79+200.9aa8ce9.zip). Only CNSDK #752: the tracking
+      # camera becomes config data with a per-unit override
+      # (persist.debug.cnsdk.cam / debug.cnsdk.cam) in the service APKs; no API
+      # the plug-in calls changes. Moved in lockstep with versions.json
+      # cnsdk_services so the bundle ships the 0.10.79 -63mm services.
+      CNSDK_TAG: v0.10.79
 
     steps:
 
