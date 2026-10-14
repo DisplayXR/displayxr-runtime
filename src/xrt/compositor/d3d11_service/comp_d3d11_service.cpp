@@ -28,6 +28,7 @@
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_tracking_any.h"
 #include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: an element's screen
@@ -206,8 +207,12 @@ dxr_late_weave_enabled()
 	if (enabled < 0) {
 		// Default ON: late-weave is the product behavior on every path
 		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage. Read
+		// through u_setting so the Dashboard's Developer settings can set
+		// it for apps it never launched (perf-settings Phase 2B); the
+		// environment still wins. Same parse as before.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;

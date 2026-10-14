@@ -143,7 +143,7 @@ public sealed class DeveloperPage : Page
             body.Children.Add(U.Notice(Level.Warn, "The last read failed; showing the previous one", stale));
         if (Ctx.LastActionArea == "devperf" && Ctx.LastAction is { } a)
             body.Children.Add(U.Notice(Ctx.LastActionFailed ? Level.Critical : Level.Info,
-                Ctx.LastActionFailed ? "The reset did not apply" : "Reset", a));
+                Ctx.LastActionFailed ? "The change did not apply" : "Applied", a));
 
         body.Children.Add(FilterBar());
 
@@ -257,10 +257,24 @@ public sealed class DeveloperPage : Page
             reset.IsEnabled = !Ctx.ActionRunning && l.Resettable;
             Avalonia.Automation.AutomationProperties.SetName(reset, $"Reset {l.Name}");
             U.AddFlow(foot, U.Chip("settable", Level.Info), 12, 2);
+            if (l.SwitchValue is { } sv)
+            {
+                string label = StatusText.DevSwitchLabel(l);
+                var set = U.Button(label, () => _ = Ctx.RunActionsAsync("devperf", $"perf set {l.Name} {sv}"), "outline", "sm");
+                set.IsEnabled = !Ctx.ActionRunning && l.Switchable;
+                Avalonia.Automation.AutomationProperties.SetName(set, $"{label} {l.Name}");
+                U.AddFlow(foot, set, 12, 2);
+            }
             U.AddFlow(foot, reset, 12, 2);
             if (l.NonDefault && StatusText.DevResetBlocked(l) is { } why)
             {
                 var w = U.Text(why, "meta");
+                w.VerticalAlignment = VerticalAlignment.Center;
+                U.AddFlow(foot, w, 12, 2);
+            }
+            else if (l.SwitchValue is not null)
+            {
+                var w = U.Text(StatusText.DevSwitchNote(l), "meta");
                 w.VerticalAlignment = VerticalAlignment.Center;
                 U.AddFlow(foot, w, 12, 2);
             }

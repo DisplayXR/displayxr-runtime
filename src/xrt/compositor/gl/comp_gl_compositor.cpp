@@ -3323,8 +3323,10 @@ gl_crop_and_process_dp(
 		static int late_weave = -1;
 		if (late_weave < 0) {
 			// Default ON (opt-out DXR_LATE_WEAVE=0), matching the
-			// D3D11/D3D12/VK compositors.
-			const char *e = getenv("DXR_LATE_WEAVE");
+			// D3D11/D3D12/VK compositors. Via u_setting so the
+			// Dashboard can set it (perf-settings Phase 2B).
+			char lw_buf[16];
+			const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), NULL);
 			late_weave = (e != NULL && e[0] == '0') ? 0 : 1;
 		}
 		if (late_weave == 1) {

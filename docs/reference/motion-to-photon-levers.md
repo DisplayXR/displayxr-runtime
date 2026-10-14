@@ -73,7 +73,11 @@ D3D11      32 -> 17 ms
 workspace  29 -> 17 ms
 ```
 
-`DXR_LATE_WEAVE=0` opts out, for A/B or triage only.
+`DXR_LATE_WEAVE=0` opts out, for A/B or triage only. It is also a **settable** lever: the
+Dashboard's Developer settings ("Turn off") or `displayxr-cli perf set DXR_LATE_WEAVE 0` stores
+it per user, so it reaches apps the Dashboard never launched; `perf reset DXR_LATE_WEAVE` undoes it.
+Each read site caches it once per process, so it applies to apps started afterwards — restart the
+service for workspace apps. An environment variable still outranks the stored value.
 
 | Companion | Default | Effect |
 |---|---|---|

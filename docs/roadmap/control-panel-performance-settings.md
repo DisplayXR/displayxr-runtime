@@ -6,8 +6,8 @@
 > historical; the design and the census stand.
 
 > **Status: Phases 0, 1 and 2A SHIPPED** (#1252; 2A = the read-only Developer settings list,
-> `displayxr-cli perf list --all` + the Dashboard's Developer page); Phases 2B and 3 are still
-> design. This doc answers "can the
+> `displayxr-cli perf list --all` + the Dashboard's Developer page); **Phase 2B is in progress**
+> one lever at a time (first: `DXR_LATE_WEAVE`); Phase 3 is still design. This doc answers "can the
 > runtime's performance levers be exposed as toggles in the DisplayXR Control Panel",
 > censuses every lever, and proposes the mechanism. Related: #378 (panel
 > architecture — *the GUI is dumb, `displayxr-cli` is the brain*), #793 (make the
@@ -177,7 +177,8 @@ file would otherwise have made every one of them settable from a GUI-writable
 file. `DXR_ALLOW_DEV_PLUGIN_PATHS` is doubly safe: it reads via
 `GetEnvironmentVariableW`, outside this machinery entirely. The list starts as
 exactly the six levers the three controls drive; extending it is a deliberate
-act, and the Tier-4 names below must never appear on it.
+act (Phase 2B, one lever per PR — `DXR_LATE_WEAVE` is the first), and the Tier-4
+names below must never appear on it.
 
 **Robustness.** Parsed lazily, exactly once per process, behind `InitOnceExecuteOnce` /
 `pthread_once`. Every failure — file absent, unreadable, malformed, or a low-integrity /
@@ -286,7 +287,7 @@ process resolves the same chain. Three surfaces, in order of value:
 | **0** | GPU topology + provenance in `displayxr-cli info --json`, rendered by the panel. No behaviour change. | **SHIPPED** |
 | **1** | `u_setting` chain + allow-list; the three user controls; `displayxr-cli perf`; the anti-stale banner. | **SHIPPED** |
 | **2A** | **Read-only** "Developer settings" list (Tier 1 + Tier 2, with provenance) on the Dashboard's Developer page, over `displayxr-cli perf list --all [--json]`. Collapsed on every launch, read only while expanded and on Refresh, never polled; search + tier + process filters; non-default rows highlighted and counted. Managed levers (the `u_setting_is_managed()` six) get a per-row Reset and one "Reset all"; **every other lever is labelled environment-only** and names the variable to set, because it is read by its own `getenv` at its call site and a stored value would do nothing. No write path, no allow-list change, no runtime read site touched. The list is generated from Appendix A (see Appendix B). | **SHIPPED** |
-| **2B** | Per-lever settable: move one lever at a time onto the resolution chain (convert its call site to `u_setting_get_raw`, add it to the allow-list), **one PR per lever**, each with its own justification and measurement. The Developer list then grows a Reset (and later a setter) for that row automatically. | design |
+| **2B** | Per-lever settable: move one lever at a time onto the resolution chain (convert its call site to `u_setting_get_raw`, add it to the allow-list), **one PR per lever**, each with its own justification and measurement. The Developer list then grows a Reset for that row automatically, and a **Turn off / Turn on** switch when the lever is on/off (its compiled default starts with `on` or `off`) and no Performance-page control owns it. The switch writes the value that moves the lever off its default (`perf set NAME 0` or `1`); Reset is the way back, and an env-sourced value disables both. **Shipped levers:** `DXR_LATE_WEAVE` (all five read sites; the bisecting switch §"The three controls" keeps out of Compatibility). | **in progress** |
 | **3** | Tier-2 live service settings over the existing `DIAG` IPC path. | design |
 
 ### The three controls, as shipped
@@ -392,7 +393,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_WEAVE_REPAINT_DRAIN` | `compositor/vk_native/comp_vk_native_compositor.c:4219` | `getenv`, cached | off | App | 4 | Force `vkDeviceWaitIdle` around a repaint (cross-queue race probe) |
 | `DXR_WEAVE_SINGLE_THREAD` | `compositor/vk_native/comp_vk_native_compositor.c:6169` | `getenv` (+ `debug.dxr.weave_single_thread`) | on (Android), off elsewhere | App | 1 | #1196 pins the DP weave to one thread where the DP is proven thread-affine |
 | `DXR_WEAVE_APP_SUBMIT_GUARD` | `compositor/vk_native/comp_vk_native_compositor.c` (`dxr_weave_app_submit_guard`) | `getenv` (+ `debug.dxr.weave_app_submit_guard`), cached | **off** | App | 2 | #1394. Stops a fill weave running between the app's `xrBeginFrame` and `xrEndFrame`, i.e. across the app's own `vkQueueSubmit` calls. On Adreno every VkQueue in the process shares one GSL submission context and no `VK_LAYER_DXR_queue_lock` can load on Android, so a fill can lose the queue-timestamp race against the app and take the vendor weaver's own submit down with it. Measured on an NP02J: mini-window wedges 6/21 off vs 2/23 on, fullscreen weave rate 40-47 Hz off vs 17.6 Hz on. Off by default because that is more than half the weave rate for a partial fix, and it is a quality call. Tier 2 rather than 1: a user would only ever reach for it on a device showing the wedge |
-| `DXR_LATE_WEAVE` | `compositor/d3d11/comp_d3d11_target.cpp:51`; `d3d11_service/…:187`; `d3d12/comp_d3d12_target.cpp:68`; `gl/…:2423`; `vk_native/comp_vk_native_target.cpp:229` | `getenv`, cached per site | **on** | App + Svc | 1 | Weave as late as possible before scanout. The largest single latency win |
+| `DXR_LATE_WEAVE` | `compositor/d3d11/comp_d3d11_target.cpp:56`; `d3d11_service/…:215`; `d3d12/comp_d3d12_target.cpp:73`; `gl/…:3329`; `vk_native/comp_vk_native_target.cpp:2346` | `u_setting_get_raw` (managed, Phase 2B), cached per site | **on** | App + Svc | 1 | Weave as late as possible before scanout. The largest single latency win |
 | `DXR_LATE_WEAVE_LINUX_PACE` | `compositor/vk_native/comp_vk_native_target.cpp` (`dxr_late_weave_linux_pace`) | `getenv`, cached | **off** | App | 3 | #2068 opt-in: pace enable1 weaves on the previous commit's `wp_presentation` feedback (present_wait latency-1 behaviour without present_wait). Wayland only |
 | `DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY` | `compositor/vk_native/comp_vk_native_target.cpp` (`dxr_late_weave_linux_pace_latency`) | `getenv`, cached | 1 | App | 3 | Latency for feedback pacing, 1..4; mirrors `DXR_LATE_WEAVE_MAX_LATENCY` |
 | `DXR_LATE_WEAVE_LINUX_GRID` | `compositor/vk_native/comp_vk_native_target.cpp` (`dxr_late_weave_linux_grid_optin`) | `getenv`, cached | **off** | App | 3 | #2068 opt-in for the grid-paced late-weave tier on desktop Linux (enable1 apps). Off by default: at a fixed margin it cost presents on a composited desktop; the adaptive lead awaits a panel A/B |

@@ -63,11 +63,11 @@ public class DevSettingsTests
     public void EnvOnlyRows_NameTheVariable_AndNeverReset()
     {
         var list = Sample();
-        var late = list.Lever("DXR_LATE_WEAVE")!;
-        Assert.False(late.Managed);
-        Assert.True(late.NonDefault);
-        Assert.False(late.Resettable); // env-sourced and not managed: nothing the dashboard can write
-        Assert.Equal("environment only — set DXR_LATE_WEAVE before launching the app", StatusText.DevEnvOnlyHint(late));
+        var opaque = list.Lever("DXR_PRESENT_OPAQUE")!;
+        Assert.False(opaque.Managed);
+        Assert.False(opaque.Resettable);
+        Assert.Null(opaque.SwitchValue); // on/off, but not managed: a stored value would do nothing
+        Assert.Equal("environment only — set DXR_PRESENT_OPAQUE before launching the app", StatusText.DevEnvOnlyHint(opaque));
         // A service-only lever points at the service, not an app.
         Assert.Equal("environment only — set DXR_COMMIT_PACE before launching the service",
                      StatusText.DevEnvOnlyHint(list.Lever("DXR_COMMIT_PACE")!));
@@ -87,6 +87,33 @@ public class DevSettingsTests
         Assert.Equal(Level.Warn, StatusText.DevSourceLevel("env"));
         Assert.Equal(Level.Info, StatusText.DevSourceLevel("user"));
         Assert.Equal(Level.Plain, StatusText.DevSourceLevel("default"));
+    }
+
+    [Fact]
+    public void ManagedOnOffLevers_GetASwitch_ThatMovesThemOffTheirDefault()
+    {
+        var late = Sample().Lever("DXR_LATE_WEAVE")!;
+        Assert.True(late.Managed);
+        Assert.Equal("0", late.SwitchValue);           // default on -> the switch writes 0
+        Assert.Equal("Turn off", StatusText.DevSwitchLabel(late));
+        Assert.False(late.Switchable);                 // env-sourced: the environment outranks the file
+        Assert.False(late.Resettable);
+
+        var clean = late with { Value = null, Source = "default" };
+        Assert.True(clean.Switchable);
+        Assert.Contains("restart the service", StatusText.DevSwitchNote(clean)); // App + Svc
+        var stored = late with { Source = "user" };
+        Assert.False(stored.Switchable);               // already set: Reset is the way back
+        Assert.True(stored.Resettable);
+
+        var off = late with { Default = "off", Value = null, Source = "default" };
+        Assert.Equal("1", off.SwitchValue);
+        Assert.Equal("Turn on", StatusText.DevSwitchLabel(off));
+        Assert.Null((late with { Default = "1..3" }).SwitchValue); // not an on/off lever
+
+        // The Performance page owns these; the Developer list only resets them.
+        Assert.Null(Sample().Lever("DXR_WEAVE_ON_SCANOUT")!.SwitchValue);
+        Assert.Null(Sample().Lever("DXR_D3D_FORCE_GPU")!.SwitchValue);
     }
 
     [Fact]

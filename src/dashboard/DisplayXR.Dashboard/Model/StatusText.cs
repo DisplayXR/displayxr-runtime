@@ -440,6 +440,14 @@ public static class StatusText
         return $"environment only — set {l.Name} before launching {who}";
     }
 
+    /// <summary>The switch button's label: what it does to the lever.</summary>
+    public static string DevSwitchLabel(DevLever l) => l.SwitchValue == "0" ? "Turn off" : "Turn on";
+
+    /// <summary>When a switched lever takes effect, by the process that reads it.</summary>
+    public static string DevSwitchNote(DevLever l) => l.ForService
+        ? "applies to apps started next; restart the service for workspace apps"
+        : "applies to apps started next";
+
     /// <summary>Why a managed row's Reset is unavailable, or null when it can reset.</summary>
     public static string? DevResetBlocked(DevLever l) => l.Source switch
     {

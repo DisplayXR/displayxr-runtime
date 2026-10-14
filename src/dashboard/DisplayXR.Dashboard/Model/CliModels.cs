@@ -241,6 +241,38 @@ public sealed record DevLever(string Name, int Tier, string Proc, string Default
     /// <summary>The per-user store holds it: the one source <c>perf reset NAME</c> can clear.</summary>
     public bool Resettable => Managed && Source == "user";
 
+    /// <summary>
+    /// The Performance page's own controls (Target GPU, Mode, Diagnostics) drive
+    /// these; the Developer list only resets them, so the two pages can never
+    /// disagree about how one is set.
+    /// </summary>
+    public static readonly IReadOnlySet<string> PerformancePageLevers = new HashSet<string>
+    {
+        "DXR_D3D_FORCE_GPU", "DXR_VK_FORCE_GPU", "DXR_WEAVE_ON_SCANOUT",
+        "DXR_WEAVE_REPAINT", "DXR_FRAME_WITNESS", "DXR_FRAME_STAGE_TIMING",
+    };
+
+    /// <summary>
+    /// For a managed on/off developer lever (perf-settings Phase 2B), the value
+    /// that moves it OFF its compiled default: "0" for a default-on lever, "1"
+    /// for a default-off one. Null when the row offers no switch (not managed,
+    /// not on/off, or owned by the Performance page).
+    /// </summary>
+    public string? SwitchValue
+    {
+        get
+        {
+            if (!Managed || PerformancePageLevers.Contains(Name)) return null;
+            string d = Default.Trim();
+            if (d.StartsWith("on", StringComparison.OrdinalIgnoreCase)) return "0";
+            if (d.StartsWith("off", StringComparison.OrdinalIgnoreCase)) return "1";
+            return null;
+        }
+    }
+
+    /// <summary>The switch can be written now: nothing outranks it or already holds a value.</summary>
+    public bool Switchable => SwitchValue is not null && !NonDefault;
+
     /// <summary>Search (name / description substring, case-insensitive), tier (0 = all) and process filters.</summary>
     public bool Matches(string? search, int tier, ProcFilter proc)
     {
