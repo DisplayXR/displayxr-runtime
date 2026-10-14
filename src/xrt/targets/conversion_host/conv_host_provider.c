@@ -11,6 +11,8 @@
 #include "conv_host_log.h"
 
 #include "conversion/conv_host_inproc.h"
+#include "conversion/conv_model_store.h"
+#include "target_conv_status.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -142,6 +144,10 @@ init_iface(void)
 	g_iface.get_setting = host_get_setting;
 	g_iface.get_adapter_hint = host_get_adapter_hint;
 	g_iface.notify_changed = host_notify_changed;
+	// ADR-053 P4 (#2108): the host performs downloads and verification itself,
+	// into the runtime-owned store, under the store's ACL as this (user) process.
+	g_iface.model_resolve = conv_store_host_model_resolve;
+	g_iface.model_request = conv_store_host_model_request;
 }
 
 const struct xrt_conversion_plugin_host_iface *
@@ -193,6 +199,11 @@ conv_host_provider_config_from_registration(const char *provider_id, uint64_t ad
 	}
 	conv_host_provider_set_config(provider_id, mine != NULL ? mine->settings : NULL,
 	                              mine != NULL ? mine->setting_count : 0, adapter_luid);
+	// Its own packs only, under the policy as this process reads it (the
+	// service's environment: the supervisor spawns the host with it).
+	struct target_conv_policy policy;
+	target_conv_policy_read(&policy);
+	target_conv_store_configure(mine, mine != NULL ? 1 : 0, &policy);
 	U_LOG_I("conversion host: %u registered setting(s) for '%s' (%s)", mine != NULL ? mine->setting_count : 0,
 	        provider_id, mine != NULL ? mine->source : "no registration found");
 	free(rows);

@@ -31,7 +31,7 @@ add_library(
 target_include_directories(conv_host_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
 	conv_host_core
-	PUBLIC xrt-interfaces aux_util aux_os displayxr::conversion_runtime target_lists
+	PUBLIC xrt-interfaces aux_util aux_os displayxr::conversion_runtime displayxr::conversion_store target_lists
 	)
 if(WIN32)
 	target_sources(conv_host_core PRIVATE conv_host_os_win.c conv_host_d3d11.cpp conv_host_d3d11.h)

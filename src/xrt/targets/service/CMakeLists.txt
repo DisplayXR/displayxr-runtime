@@ -37,7 +37,7 @@ target_sources(displayxr-service PRIVATE
 	service_spawn.c
 	service_spawn.h
 )
-target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime ipc_server_conv)
+target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime displayxr::conversion_store ipc_server_conv)
 if(TARGET comp_d3d11_conv_host_lane)
 	# ADR-053 P2: the GPU lane of conversion-host satellites (Windows).
 	target_link_libraries(displayxr-service PRIVATE comp_d3d11_conv_host_lane)

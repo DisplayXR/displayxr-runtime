@@ -193,6 +193,11 @@ set "CPKEY=HKLM\Software\DisplayXR\ConversionProviders\%CPID%"
 reg add "%CPKEY%" /v Binary      /t REG_SZ    /d "%DLL%"    /f >nul || goto :regfail
 reg add "%CPKEY%" /v ProbeOrder  /t REG_DWORD /d %CPORDER%  /f >nul || goto :regfail
 reg add "%CPKEY%" /v DisplayName /t REG_SZ    /d "%CPNAME%" /f >nul || goto :regfail
+REM ADR-053 P4 (#2108): the sim's fake model pack (relative to the DLL), so its
+REM DOWNLOAD_MS knob runs the runtime-owned model store's write protocol.
+if /I "%CPID%"=="sim-conversion" (
+    reg add "%CPKEY%" /v Packs /t REG_MULTI_SZ /d "sim-conversion.models.json" /f >nul || goto :regfail
+)
 reg add "%CPKEY%" /v Version     /t REG_SZ    /d "dev"      /f >nul || goto :regfail
 echo Registered conversion provider '%CPID%' (ProbeOrder %CPORDER%):
 echo   %DLL%

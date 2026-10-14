@@ -15,6 +15,7 @@ add_library(
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_conv_status.c target_conv_status.h
+			    target_conv_store.c
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_screens.c target_screens.h
 			    target_display_hotplug.c target_display_hotplug.h
@@ -29,6 +30,9 @@ target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink
 # selection headless (selftest `conversion_providers`, `conv list`, the
 # headless status snapshot's conversion rows).
 target_link_libraries(target_lists PRIVATE displayxr::conversion_core)
+# ADR-053 P4 (#2108): target_conv_store.c (the hosts' model store packs). Only the
+# service and the satellite host reference it, so only they pull the store in.
+target_link_libraries(target_lists PRIVATE displayxr::conversion_store)
 # #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
 # aux_vk) to fingerprint-check VK DP plug-ins. Linked here so every consumer
 # of the loader resolves it; guarded because aux_vk only exists with Vulkan.

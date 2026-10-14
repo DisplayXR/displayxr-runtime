@@ -153,7 +153,8 @@ apply_locked(struct conv_core *core, uint32_t ri, const struct conv_readiness_ev
 			core->wake_pending = true;
 		}
 		os_cond_signal(&core->ctrl_cond);
-	} else if ((r & CONV_RD_PROGRESS) != 0) {
+	} else if ((r & CONV_RD_PROGRESS_DUE) != 0) {
+		// Rate-limited (2 Hz / 5 %): `status --watch` and the dashboard print on a bump.
 		core->status_gen++;
 	}
 	if ((r & CONV_RD_ACT_REDESCRIBE) != 0 && provider < CONV_REGISTRY_MAX_PROVIDERS) {
@@ -254,6 +255,13 @@ warm_done(struct conv_host_cmd *cmd)
 		if (cmd->result == XRT_SUCCESS && (!have_state || st.state == XRT_CONV_STATE_READY)) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
 			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
+		} else if (have_state && st.state == XRT_CONV_STATE_ABSENT && st.failure_reason == XRT_CONV_FAIL_POLICY) {
+			// Its model is not in the store and a policy forbids fetching it (#2108).
+			// Any other ABSENT at warm (a legacy module not installed) stays the
+			// retryable warm failure below.
+			struct conv_readiness_event ev = mk_ev(CONV_EV_MODEL_ABSENT, t);
+			ev.reason = conv_model_absent_reason(st.failure_reason);
+			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
 		} else if (have_state && declared_absent(&st)) {
 			// #2029: the provider says it is not there and a retry will not
 			// change that: terminal ABSENT, not FAILED + the 15 s backoff loop
@@ -264,8 +272,7 @@ warm_done(struct conv_host_cmd *cmd)
 			    "change or `conv warm`",
 			    core->reg.providers[op->provider].id, op->cap_id, st.detail[0] != '\0' ? st.detail : "-");
 			struct conv_readiness_event ev = mk_ev(CONV_EV_DECLARED_ABSENT, t);
-			ev.reason = declared_reason(&st);
-			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
+			ev.reason = declared_reason(&st);			apply_by_cap_locked(core, op->provider, op->cap_id, &ev);
 		} else if (cmd->result != XRT_SUCCESS || st.state == XRT_CONV_STATE_FAILED ||
 		           conv_state_is_terminal(st.state)) {
 			struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_FAILED, t);
@@ -1458,6 +1465,14 @@ poll_providers_locked(struct conv_core *core, uint64_t t)
 			if (st.state == XRT_CONV_STATE_READY) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
 				apply_locked(core, i, &ev);
+			} else if (st.state == XRT_CONV_STATE_DOWNLOADING) {
+				// The provider found its model missing at warm-up: the host downloads (#2108).
+				struct conv_readiness_event ev = mk_ev(CONV_EV_DOWNLOAD_STARTED, t);
+				apply_locked(core, i, &ev);
+			} else if (st.state == XRT_CONV_STATE_ABSENT && st.failure_reason == XRT_CONV_FAIL_POLICY) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_MODEL_ABSENT, t);
+				ev.reason = CONV_REASON_POLICY;
+				apply_locked(core, i, &ev);
 			} else if (st.progress >= 0.0f && st.progress != row->rd.progress) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_PROGRESS, t);
 				ev.progress = st.progress;
@@ -1466,6 +1481,18 @@ poll_providers_locked(struct conv_core *core, uint64_t t)
 		} else if (s == XRT_CONV_STATE_DOWNLOADING) {
 			if (st.state == XRT_CONV_STATE_WARMING) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_DOWNLOAD_DONE, t);
+				apply_locked(core, i, &ev);
+			} else if (st.state == XRT_CONV_STATE_READY) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_WARM_OK, t);
+				apply_locked(core, i, &ev);
+			} else if (st.state == XRT_CONV_STATE_ABSENT && st.failure_reason == XRT_CONV_FAIL_POLICY) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_MODEL_ABSENT, t);
+				ev.reason = CONV_REASON_POLICY;
+				apply_locked(core, i, &ev);
+			} else if (st.state == XRT_CONV_STATE_FAILED || st.state == XRT_CONV_STATE_ABSENT) {
+				struct conv_readiness_event ev = mk_ev(CONV_EV_DOWNLOAD_FAILED, t);
+				ev.reason = st.failure_reason;
+				ev.retryable = st.retryable != 0;
 				apply_locked(core, i, &ev);
 			} else if (st.progress >= 0.0f && st.progress != row->rd.progress) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_DOWNLOAD_PROGRESS, t);

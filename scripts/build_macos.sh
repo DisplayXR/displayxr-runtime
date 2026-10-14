@@ -220,6 +220,12 @@ fi
 SIMCONV_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.dylib" -type f | head -1)
 if [ -n "$SIMCONV_PLUGIN" ] && [ -f "$SIMCONV_PLUGIN" ]; then
   cp "$SIMCONV_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  # ADR-053 P4 (#2108): its fake model pack (the DOWNLOAD_MS knob's file:// source).
+  SIMCONV_DIR="$(dirname "$SIMCONV_PLUGIN")"
+  if [ -f "$SIMCONV_DIR/sim-conversion.models.json" ]; then
+    cp "$SIMCONV_DIR/sim-conversion.models.json" "$PKG_DIR/lib/displayxr/plugins/"
+    cp -r "$SIMCONV_DIR/sim-conversion-blobs" "$PKG_DIR/lib/displayxr/plugins/"
+  fi
   cat > "$PKG_DIR/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json" <<EOF
 {
     "file_format_version": "1.0",
@@ -229,7 +235,8 @@ if [ -n "$SIMCONV_PLUGIN" ] && [ -f "$SIMCONV_PLUGIN" ]; then
         "vendor":       "DisplayXR",
         "version":      "dev",
         "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimConversion.dylib",
-        "probe_order":  250
+        "probe_order":  250,
+        "packs":        ["sim-conversion.models.json"]
     }
 }
 EOF

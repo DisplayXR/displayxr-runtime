@@ -57,6 +57,9 @@ struct target_conv_policy
 {
 	bool policy_lock;         //!< HKLM `Policy\Lock` = 1
 	bool allow_research_only; //!< resolved `AllowResearchOnly`
+	//! Resolved `AllowDownloads` (default true; `DXR_CONV_ALLOW_DOWNLOADS=0` in
+	//! this process forces it off): may the model store fetch a missing model.
+	bool allow_downloads;
 	//! Resolved `PreferredProvider\<task>` per XRT_CONV_TASK_* ("" = none).
 	char preferred[TARGET_CONV_POLICY_TASKS][96];
 	//! Per-user `ConversionProviders\<id>\Enabled` overrides (HKCU; ignored under Policy\Lock).
@@ -138,6 +141,44 @@ target_conv_policy_read(struct target_conv_policy *out);
  */
 int
 target_conv_policy_enabled_override(const struct target_conv_policy *policy, const char *id);
+
+/*!
+ * Point this process's model store (conv_store_host_*) at the packs of
+ * @p entries (`Packs` / `packs[]`, relative to each binary) under @p policy.
+ * Packs are only ever added; the policy is replaced. Used by the service
+ * (every registered provider) and the satellite host (its own provider).
+ */
+void
+target_conv_store_configure(const struct xrt_conversion_plugin_entry *entries,
+                            int count,
+                            const struct target_conv_policy *policy);
+
+/*!
+ * ADR-053 P4: fill @p snap's model-store root + pack rows from disk: the
+ * registered providers' packs (`Packs` / `packs[]`) in the resolved root. No
+ * IPC, no network, no hashing; never fails (an unreadable pack is skipped).
+ */
+void
+target_conv_store_fill_snapshot(struct xrt_status_snapshot *snap);
+
+/*!
+ * As target_conv_store_fill_snapshot() with an explicit @p root (its source
+ * label @p source) and manifest paths (tests, and `conv models list`).
+ */
+void
+target_conv_store_fill_snapshot_with(struct xrt_status_snapshot *snap,
+                                     const char *root,
+                                     const char *source,
+                                     const char *const *pack_paths,
+                                     uint32_t pack_count);
+
+/*!
+ * The registered providers' pack manifest paths (resolved against each
+ * binary). Returns how many were written into @p out (each
+ * XRT_CONV_LOADER_PATH_MAX wide), at most @p max.
+ */
+uint32_t
+target_conv_store_registered_packs(char (*out)[512], uint32_t max);
 
 /*!
  * The headless pass over the registered providers

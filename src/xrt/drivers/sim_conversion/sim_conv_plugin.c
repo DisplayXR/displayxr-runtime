@@ -96,7 +96,15 @@ struct sim_cap
 	uint32_t override_state; //!< non-zero: DEVICE_LOST etc. until the next warm
 	uint32_t override_reason;
 	uint32_t last_reported; //!< for notify_changed on transitions
+	// #2108: the DOWNLOADING step gated on the host's model store ("sim/fake").
+	bool store_gate;       //!< the host's store knows the fake pack: the step waits for it
+	bool gate_done;        //!< the store reported READY
+	bool gate_terminal;    //!< the store refused / failed: the next warm restarts the script
+	int64_t gate_extra_ns; //!< how long the step was held past its DOWNLOAD_MS
 };
+
+//! The fake pack model the DOWNLOADING step fetches through the host's store.
+#define SIM_CONV_FAKE_MODEL "sim/fake"
 
 struct sim_stream
 {
@@ -657,9 +665,12 @@ struct eval
 	bool terminal; //!< in the last step (warm() is done)
 };
 
-//! Current state of @p c. Caller holds the lock.
+static bool
+host_has_resolve(void);
+
+//! Current state of @p c. Caller holds the lock. May advance the store gate.
 static struct eval
-cap_eval(const struct sim_conv *sc, const struct sim_cap *c, int64_t now)
+cap_eval(const struct sim_conv *sc, struct sim_cap *c, int64_t now)
 {
 	struct eval e = {XRT_CONV_STATE_UNKNOWN, 0, 0.0f, 0, true};
 	if (sc->crash_looped) {
@@ -684,13 +695,38 @@ cap_eval(const struct sim_conv *sc, const struct sim_cap *c, int64_t now)
 		e.terminal = false;
 		return e;
 	}
-	int64_t t = now - c->start_ns;
+	int64_t t = now - c->start_ns - c->gate_extra_ns;
 	for (uint32_t i = 0; i + 1 < c->step_count; i++) {
 		const int64_t d = (int64_t)c->steps[i].ms * 1000 * 1000;
+		float store_progress = -1.0f;
+		if (c->store_gate && !c->gate_done && c->steps[i].state == XRT_CONV_STATE_DOWNLOADING &&
+		    host_has_resolve() && t >= 0) {
+			// The host's store protocol (spec §6.1): the step lasts DOWNLOAD_MS AND
+			// until the store has the blob; refusal / failure ends the script.
+			struct xrt_conv_model_location loc;
+			memset(&loc, 0, sizeof(loc));
+			loc.struct_size = (uint32_t)sizeof(loc);
+			(void)g_host->model_resolve(SIM_CONV_FAKE_MODEL, &loc);
+			if (loc.state == XRT_CONV_STATE_READY) {
+				c->gate_done = true;
+			} else if (loc.state == XRT_CONV_STATE_ABSENT || loc.state == XRT_CONV_STATE_FAILED) {
+				c->gate_terminal = true;
+				e.state = loc.state;
+				e.reason = loc.failure_reason != 0 ? loc.failure_reason : XRT_CONV_FAIL_MODEL;
+				e.terminal = true;
+				return e;
+			} else {
+				if (t >= d) {
+					c->gate_extra_ns += t - d + 1;
+					t = d - 1;
+				}
+				store_progress = loc.progress;
+			}
+		}
 		if (t < d) {
 			e.state = c->steps[i].state;
 			e.reason = c->steps[i].reason;
-			e.progress = d > 0 ? (float)((double)t / (double)d) : 0.0f;
+			e.progress = store_progress >= 0.0f ? store_progress : d > 0 ? (float)((double)t / (double)d) : 0.0f;
 			e.eta_ns = (uint64_t)(d - t);
 			for (uint32_t j = i + 1; j + 1 < c->step_count; j++) {
 				e.eta_ns += (uint64_t)c->steps[j].ms * 1000 * 1000;
@@ -706,6 +742,13 @@ cap_eval(const struct sim_conv *sc, const struct sim_cap *c, int64_t now)
 	e.progress =
 	    (last->state == XRT_CONV_STATE_WARMING || last->state == XRT_CONV_STATE_DOWNLOADING) ? -1.0f : 0.0f;
 	return e;
+}
+
+static bool
+host_has_resolve(void)
+{
+	return g_host != NULL && COVERS(g_host, struct xrt_conversion_plugin_host_iface, model_resolve) &&
+	       g_host->model_resolve != NULL;
 }
 
 static bool
@@ -1067,7 +1110,8 @@ sc_get_state(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, struc
 	os_mutex_unlock(&sc->lock);
 
 	SET(out, struct xrt_conv_state, state, e.state);
-	SET(out, struct xrt_conv_state, failure_reason, e.state == XRT_CONV_STATE_FAILED ? e.reason : 0u);
+	SET(out, struct xrt_conv_state, failure_reason,
+	    e.state == XRT_CONV_STATE_FAILED || e.state == XRT_CONV_STATE_ABSENT ? e.reason : 0u);
 	SET(out, struct xrt_conv_state, retryable,
 	    e.state == XRT_CONV_STATE_FAILED && reason_retryable(e.reason) ? 1u : 0u);
 	SET(out, struct xrt_conv_state, progress, e.progress);
@@ -1116,7 +1160,8 @@ sc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 	}
 	bool request_download = false;
 	struct eval e0 = cap_eval(sc, c, os_monotonic_get_ns());
-	const bool failed_retry = e0.state == XRT_CONV_STATE_FAILED && reason_retryable(e0.reason);
+	const bool failed_retry =
+	    (e0.state == XRT_CONV_STATE_FAILED && reason_retryable(e0.reason)) || c->gate_terminal;
 	if (!c->started || c->override_state != 0 || failed_retry) {
 		// (Re)load: run the script from its first step.
 		c->started = true;
@@ -1124,6 +1169,10 @@ sc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 		c->override_state = 0;
 		c->override_reason = 0;
 		c->start_ns = os_monotonic_get_ns();
+		c->store_gate = false;
+		c->gate_done = false;
+		c->gate_terminal = false;
+		c->gate_extra_ns = 0;
 		for (uint32_t i = 0; i < c->step_count; i++) {
 			request_download |= c->steps[i].state == XRT_CONV_STATE_DOWNLOADING;
 		}
@@ -1132,8 +1181,20 @@ sc_warm(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, bool (*is_
 
 	if (request_download && g_host != NULL &&
 	    COVERS(g_host, struct xrt_conversion_plugin_host_iface, model_request) && g_host->model_request != NULL) {
-		// The host's store protocol (spec §6.1); timing stays scripted.
-		g_host->model_request("sim/fake");
+		// The host's store protocol (spec §6.1). A host whose store knows the
+		// fake pack gates the DOWNLOADING step on it (#2108); any other host
+		// (no store, no pack registered) keeps the scripted timing alone.
+		(void)g_host->model_request(SIM_CONV_FAKE_MODEL);
+		bool known = false;
+		if (host_has_resolve()) {
+			struct xrt_conv_model_location loc;
+			memset(&loc, 0, sizeof(loc));
+			loc.struct_size = (uint32_t)sizeof(loc);
+			known = g_host->model_resolve(SIM_CONV_FAKE_MODEL, &loc);
+		}
+		os_mutex_lock(&sc->lock);
+		c->store_gate = known;
+		os_mutex_unlock(&sc->lock);
 	}
 
 	for (;;) {

@@ -189,8 +189,16 @@ void
 target_conv_policy_read(struct target_conv_policy *out)
 {
 	memset(out, 0, sizeof(*out));
+	out->allow_downloads = true;
 #ifdef XRT_OS_WINDOWS
 	out->policy_lock = reg_dword(HKEY_LOCAL_MACHINE, "Policy", "Lock") == 1;
+	{
+		// AllowDownloads: HKCU over HKLM unless Policy\Lock; absent = allowed (#2108).
+		const int cu = reg_dword(HKEY_CURRENT_USER, NULL, "AllowDownloads");
+		const int lm = reg_dword(HKEY_LOCAL_MACHINE, NULL, "AllowDownloads");
+		const int v = out->policy_lock ? lm : cu >= 0 ? cu : lm;
+		out->allow_downloads = v != 0;
+	}
 	out->allow_research_only =
 	    conv_select_resolve_research_only(reg_dword(HKEY_CURRENT_USER, NULL, "AllowResearchOnly"),
 	                                      reg_dword(HKEY_LOCAL_MACHINE, NULL, "AllowResearchOnly"), out->policy_lock);
@@ -209,6 +217,10 @@ target_conv_policy_read(struct target_conv_policy *out)
 		read_enabled_overrides(out);
 	}
 #endif
+	const char *dl = getenv("DXR_CONV_ALLOW_DOWNLOADS");
+	if (dl != NULL && strcmp(dl, "0") == 0) {
+		out->allow_downloads = false;
+	}
 }
 
 int

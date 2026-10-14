@@ -600,6 +600,28 @@ XRT_STATUS_STATIC_ASSERT(sizeof(struct xrt_status_conv_task) + sizeof(struct xrt
                              XRT_STATUS_CONV_ROW_REPLY_MAX,
                          "xrt_status_conv_task row no longer fits one DIAG reply");
 
+//! Max model packs in @ref xrt_status_snapshot::conv_packs (ADR-053 P4).
+#define XRT_STATUS_MAX_CONV_PACKS 8
+
+/*!
+ * One model pack of the runtime-owned model store (ADR-053 P4, #2108).
+ * Never crosses IPC: the CLI fills it from disk in its own process
+ * (`target_conv_store_fill_snapshot`), so a download in any process shows.
+ */
+struct xrt_status_conv_pack
+{
+	char pack[XRT_STATUS_NAME_MAX];     //!< Pack id.
+	char provider[XRT_STATUS_NAME_MAX]; //!< Consuming provider (informational).
+	char state[16];                     //!< "installed" | "downloading" | "partial" | "evicted" | "absent".
+	uint32_t models;                    //!< Models in the pack.
+	uint32_t models_installed;          //!< ... on disk (stamped, right size).
+	uint32_t research_models;           //!< ... whose licence AND is non-commercial.
+	uint64_t bytes_total;               //!< Distinct blobs of every model.
+	uint64_t bytes_installed;           //!< ... on disk.
+	uint64_t download_done;             //!< In-flight bytes (.part sizes).
+	uint64_t download_total;            //!< ... of blobs this big.
+};
+
 //! Max presenter screens in a @ref xrt_status_workspace (= COMP_WS_MAX_SCREENS).
 #define XRT_STATUS_WORKSPACE_MAX_SCREENS 8
 
@@ -645,6 +667,12 @@ struct xrt_status_snapshot
 	//! ADR-053: per-task rows, grouped by task, each group in selection order.
 	uint32_t conv_task_count;
 	struct xrt_status_conv_task conv_tasks[XRT_STATUS_MAX_CONV_TASKS];
+	//! ADR-053 P4: the model store root ("" = not read) and how it was resolved.
+	char conv_model_store_root[256];
+	char conv_model_store_source[48];
+	//! ADR-053 P4: the registered providers' model packs (read from disk by the CLI).
+	uint32_t conv_pack_count;
+	struct xrt_status_conv_pack conv_packs[XRT_STATUS_MAX_CONV_PACKS];
 };
 
 /*!

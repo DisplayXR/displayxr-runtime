@@ -118,6 +118,11 @@ enum conv_readiness_event_type
 	 * registry change (or an explicit `conv warm`) tries again.
 	 */
 	CONV_EV_DECLARED_ABSENT,
+	//! The provider reports its model ABSENT at warm-up (the store has none and
+	//! may not fetch it). reason = CONV_REASON_POLICY when a policy forbids the
+	//! download (AllowDownloads = 0, a research-only model without the opt-in),
+	//! else XRT_CONV_FAIL_MODEL. From INSTALLED / EVICTED / WARMING / DOWNLOADING.
+	CONV_EV_MODEL_ABSENT,
 };
 
 /*! @name Event flags (conv_readiness_event::flags) @{ */
@@ -152,6 +157,8 @@ struct conv_readiness
 	bool restarting;          //!< WARMING after a host crash
 	uint32_t restart_attempt; //!< n in WARMING(restarting, n); reset at READY
 	float progress;           //!< WARMING / DOWNLOADING
+	float report_progress;    //!< progress as last reported (CONV_RD_PROGRESS_DUE)
+	uint64_t report_ns;       //!< when it was last reported
 
 	uint64_t generation;   //!< bumped on every state change
 	uint64_t entered_ns;   //!< when the current state was entered
@@ -169,6 +176,15 @@ struct conv_readiness
 #define CONV_RD_ACT_WARM (1u << 2)       //!< caller should (re)issue warm with fresh CONV_EVF_* flags
 #define CONV_RD_ACT_REDESCRIBE (1u << 3) //!< caller should re-describe the provider
 #define CONV_RD_IGNORED (1u << 4)        //!< event not applicable in this state
+//! With CONV_RD_PROGRESS: the move is worth reporting (roadmap §11.1: at most
+//! 2 Hz, at least 5 %, and always the step to 100 %). The caller bumps its
+//! status generation only on this bit.
+#define CONV_RD_PROGRESS_DUE (1u << 5)
+
+/*! @name Progress report rate limit @{ */
+#define CONV_PROGRESS_MIN_NS (CONV_NS_PER_S / 2u)
+#define CONV_PROGRESS_MIN_STEP 0.05f
+/*! @} */
 /*! @} */
 
 void
@@ -208,6 +224,13 @@ conv_state_name(uint32_t state);
 
 const char *
 conv_reason_name(uint32_t reason);
+
+/*!
+ * The core-local reason for a provider's ABSENT: XRT_CONV_FAIL_POLICY (the
+ * store refused by policy) -> CONV_REASON_POLICY; anything else -> MODEL.
+ */
+uint32_t
+conv_model_absent_reason(uint32_t provider_failure_reason);
 
 /*
  *

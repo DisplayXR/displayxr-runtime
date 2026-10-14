@@ -37,7 +37,25 @@ enter(struct conv_readiness *r, uint32_t state, uint32_t reason, uint64_t now_ns
 	} else {
 		r->progress = 0.0f;
 	}
+	r->report_progress = r->progress;
+	r->report_ns = now_ns;
 	return CONV_RD_CHANGED;
+}
+
+//! Progress moved: always CONV_RD_PROGRESS; CONV_RD_PROGRESS_DUE at 2 Hz / 5 % (and at 100 %).
+static uint32_t
+progress_moved(struct conv_readiness *r, float p, uint64_t now_ns)
+{
+	r->progress = p;
+	const float d = p > r->report_progress ? p - r->report_progress : r->report_progress - p;
+	const bool done = p >= 1.0f && r->report_progress < 1.0f;
+	const bool due = d >= CONV_PROGRESS_MIN_STEP && now_ns - r->report_ns >= CONV_PROGRESS_MIN_NS;
+	if (!done && !due) {
+		return CONV_RD_PROGRESS;
+	}
+	r->report_progress = p;
+	r->report_ns = now_ns;
+	return CONV_RD_PROGRESS | CONV_RD_PROGRESS_DUE;
 }
 
 //! Network / device loss are retryable by nature, whatever the caller said.
@@ -197,13 +215,13 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 
 	case CONV_EV_WARM_PROGRESS:
 		if (s == XRT_CONV_STATE_WARMING) {
-			r->progress = ev->progress;
-			return CONV_RD_PROGRESS;
+			return progress_moved(r, ev->progress, now);
 		}
 		return CONV_RD_IGNORED;
 
 	case CONV_EV_WARM_OK:
-		if (s == XRT_CONV_STATE_WARMING || is_cold(s)) {
+		// From DOWNLOADING too: a small model downloads and loads between two polls.
+		if (s == XRT_CONV_STATE_WARMING || s == XRT_CONV_STATE_DOWNLOADING || is_cold(s)) {
 			uint32_t res = enter(r, XRT_CONV_STATE_READY, 0, now);
 			r->restart_attempt = 0;
 			r->backoff_ns = 0;
@@ -213,21 +231,27 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 		return CONV_RD_IGNORED;
 
 	case CONV_EV_WARM_FAILED:
-		if (s == XRT_CONV_STATE_WARMING) {
+		if (s == XRT_CONV_STATE_WARMING || s == XRT_CONV_STATE_DOWNLOADING) {
 			return fail(r, ev->reason, ev->retryable, now);
 		}
 		return CONV_RD_IGNORED;
 
 	case CONV_EV_DOWNLOAD_STARTED:
-		if (is_cold(s)) {
+		// From WARMING too: the provider learns at warm-up that its model is missing.
+		if (is_cold(s) || s == XRT_CONV_STATE_WARMING) {
 			return enter(r, XRT_CONV_STATE_DOWNLOADING, 0, now);
 		}
 		return CONV_RD_IGNORED;
 
 	case CONV_EV_DOWNLOAD_PROGRESS:
 		if (s == XRT_CONV_STATE_DOWNLOADING) {
-			r->progress = ev->progress;
-			return CONV_RD_PROGRESS;
+			return progress_moved(r, ev->progress, now);
+		}
+		return CONV_RD_IGNORED;
+
+	case CONV_EV_MODEL_ABSENT:
+		if (is_cold(s) || s == XRT_CONV_STATE_WARMING || s == XRT_CONV_STATE_DOWNLOADING) {
+			return enter(r, XRT_CONV_STATE_ABSENT, ev->reason != 0 ? ev->reason : XRT_CONV_FAIL_MODEL, now);
 		}
 		return CONV_RD_IGNORED;
 
@@ -425,6 +449,7 @@ conv_reason_name(uint32_t reason)
 	case XRT_CONV_FAIL_MODEL: return "model";
 	case XRT_CONV_FAIL_DEVICE_LOST: return "device_lost";
 	case XRT_CONV_FAIL_CRASH_LOOP: return "crash_loop";
+	case XRT_CONV_FAIL_POLICY: return "policy";
 	case CONV_REASON_POLICY: return "policy";
 	case CONV_REASON_BINARY_MISSING: return "binary_missing";
 	case CONV_REASON_ABI_REJECTED: return "abi_rejected";
@@ -432,6 +457,12 @@ conv_reason_name(uint32_t reason)
 	case CONV_REASON_UPDATING: return "updating";
 	default: return "unknown";
 	}
+}
+
+uint32_t
+conv_model_absent_reason(uint32_t provider_failure_reason)
+{
+	return provider_failure_reason == XRT_CONV_FAIL_POLICY ? CONV_REASON_POLICY : XRT_CONV_FAIL_MODEL;
 }
 
 /*
