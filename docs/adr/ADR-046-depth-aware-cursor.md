@@ -759,9 +759,13 @@ sprite and the depth, and the runtime owns the drawing. Apps get the same contra
   `u_cursor_draw_unblend` (alpha = 1 − (white − black); the render over black is the
   premultiplied colour). That reads every cursor kind the same way — 32-bit alpha, colour + AND
   mask, monochrome AND/XOR — and turns XOR (invert) pixels into opaque white. Drawn at the size
-  the OS draws it on this panel: `GetSystemMetricsForDpi(SM_CYCURSOR, dpi)` with the window's
-  `GetDpiForWindow` (passed as the look's backing scale, DPI / 96), or the image's own size when
-  larger (accessibility pointer sizes); its `height_pt` is that size in 96-DPI points, so the
+  the OS draws it on this panel: the user's pointer size (`HKCU\Control Panel\Cursors`
+  `CursorBaseSize`, 32 by default, read once per process) × the window's `GetDpiForWindow` / 96
+  (passed as the look's backing scale) — `u_cursor_os_height_px_win` — with
+  `GetSystemMetricsForDpi(SM_CYCURSOR, dpi)` and the image's own size only as floors. The metric
+  alone is a stepped table (240 DPI → 64) while Windows scales every cursor to 32 × 2.5 = 80 px at
+  250 %, so the runtime-drawn cursor was 20 % smaller than the OS one on a 250 % panel (David, the
+  win SR laptop, 2026-10-14); its `height_pt` is that size in 96-DPI points, so the
   physical size is `height_pt` × DPI / 96 × the panel's pixel pitch. Cached by `HCURSOR` + scale,
   so it re-rasterises only on a shape change. `GetCursorInfo` is global, so the compositor thread
   may call it. While the app has hidden its cursor with `SetCursor(NULL)` — which it does as soon
