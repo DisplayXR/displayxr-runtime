@@ -284,3 +284,52 @@ packaging), #2039 (layer cost, to be re-measured).
 
 Until #2064 adds a single tier line, a support case has to assemble this from four lines and one
 absence.
+
+## Measured outcome and decisions (2026-10-13, Intel reference laptop)
+
+Numbers from the same box as the measured-state table above, every window 1:1 on the panel, GPU clock pinned where stated; full data and method in the session notes (`perf-assessment-2026-10-13.md`).
+
+### Decision table
+
+| lever | Linux state after today | benefit measured | cost measured | recommendation |
+|---|---|---|---|---|
+| Repaint (#868) | shipped in v2.42.0 (layer); enable2 injected, enable1 opt-in (#2069 merged) | +~19 pose-fresh weaves/s for a 30 Hz app | +10 pts core, +2 pts GPU while filling; 0 at full rate | **keep, as shipped**; make enable1 default via the in-process env route later (#2063) |
+| Late weave, present_wait path (enable2) | PR #2068, default on | residual 0.90 period at 60 Hz (Unity) | none (59–60/s on and off) | **merge #2068** |
+| Late weave, measured-grid path | PR #2068, opt-in, self-off | none on GNOME (no slack inside a period) | none when off | leave opt-in; only direct scanout / `VK_EXT_present_timing` (#2061) change this |
+| Feedback pacing for enable1 (#2077) | stacked PR, opt-in | −0.35 period (~6 ms) | −8 % present rate | **not by default**; revisit with p95 residuals |
+| Split weave / weave-on-scanout | not built on Linux (#2065 L, #2066 L) | n/a on single-GPU Intel (every Lenovo target) | large build | **do not build for Lenovo**; NVIDIA-laptop decision, measure there first |
+| Anti-aliasing | Unity: none (PR #6 → 4×, build pending); native: 2× default | 4× = clean silhouette (montage) | native 4× −15 % frames, 8× −23 % | native 2× default + 4× option on iGPU; Unity 4× then measure |
+| GPU governor (xe) | parks at 400 MHz under the native app's load | — | 20–25 presents/s episodes | product issue in its own right; pin for measurements |
+
+### Anti-aliasing (David's ask: both builds must have decent AA)
+
+Facts: the Unity project renders with **MSAA off** (URP asset `m_MSAA: 1`; URP ignores `QualitySettings.antiAliasing`; the plug-in's FXAA pass is Built-in/MultiPass only) — PR LeiaInc/lenovo-avatar#6 sets 4× and needs a Linux build from Byungju. The native renderer uses true MSAA on its colour target (default **2×**, `DXR_AVATAR_MSAA=1|2|4|8`) plus a 3×3 alpha-weighted silhouette soften pass.
+
+Captures (pre-weave atlas, left view, 4× nearest crops): the capture montages attached to the avatar PR; sources `aa_native_1/2/4/8.png`, `aa_native_{2,4}_rawA.png`, `aa_unity.png`;  Reading: native 1× = stair-steps on every silhouette; 2× = visibly softer but steps remain on the hat brim; 4× = clean; 8× ≈ 4×; Unity RC2 = the hardest steps of all (no AA, and the alpha silhouette is a 0/1 step too).
+
+Cost (native, MSAA buffers at 680x1368 per view): 2× 95 MB, 4× 158 MB, 8× 285 MB of GPU memory. Frame cost: pinned-clock sweep below (GPU min_freq 2500, back to back, same window, idle).
+
+| native MSAA (clock pinned 2.5 GHz) | present/s | app GPU | app CPU |
+|---|---|---|---|
+| 1× | 55.1–59.6 | 31 % | 75 % |
+| 2× (default) | 53.5–56.5 | 33 % | 74 % |
+| 4× | 46.3–49.2 | 38 % | 71 % |
+| 8× | 42.1–45.0 | 40 % | 69 % |
+
+Reading so far: on this iGPU 4× costs the native app ~15 % of its frames (55 → 47/s) for a clearly better silhouette; 2× is nearly free vs 1×. Recommendation: native default stays **2×** on Intel iGPUs with 4× as the quality option (or 4× by default once the frame-rate headroom exists, e.g. with the pacing/repaint work landed); Unity needs *some* MSAA first (PR #6 at 4×; drop to 2× if Byungju's build shows the same ~15 % cost).
+
+### Pacing enable1 apps on presentation feedback (stacked PR #2077, opt-in `DXR_LATE_WEAVE_LINUX_PACE=1`)
+
+The hypothesis from #2068's author: the native app's residual came from running ahead into the 4-image FIFO swapchain; pacing the weave on the previous frame's `wp_presentation.presented` would recover Unity's 0.9 periods. Clock-pinned A/B (native, same window):
+
+| arm | present/s | weave-to-scanout residual (last samples, n up to 5000) | app CPU / GPU |
+|---|---|---|---|
+| unpaced | 54–58 | 1.81 → 0.86 → **0.92** periods once warm | 73 % / 34 % |
+| paced, latency 1 | **48–52 (−8 %)** | **0.55** periods (9.2 ms); waits ~245 per 5 s, 0 slips, mean wait 0.5–0.7 ms | 74 % / 32 % |
+| paced, latency 2 | 55–57 (no cost) | 1.37 periods | 74 % / 34 % |
+
+Reading: the early 2.5–3.1-period native readings were start-up transients (n = 1…138); warm, the unpaced native app sits at ~0.9 periods like Unity. Pacing at latency 1 trims ~0.35 period (~6 ms) and costs ~8 % of the frames on this iGPU; latency 2 costs nothing and gains nothing. Verdict: **marginal — keep opt-in**; worth revisiting only with a distribution (p95) rather than last-sample residuals, which the PR will log next.
+
+### GPU governor finding (Intel xe, PTL)
+With the governor free, the native app's light load lets the GPU park at its 400 MHz efficient floor for long stretches (20–25 presents/s with a tracked viewer) and in other sessions run at 2.5 GHz (55–58/s); the Unity app's heavier load keeps the clock up. Pinning `min_freq` to 2500 removes the variance. For any native app on Intel this is a product issue in its own right (a GPU-busy hint / `VK_EXT_global_priority` / a workload floor), independent of the levers.
+
