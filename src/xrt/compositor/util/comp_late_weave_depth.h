@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Measured commit-to-glass lag -> late-weave depth floor (#2119).
+ * @brief  Late-weave depth floor for the present_wait pacer (#2119): raised
+ *         by measured commit-to-glass lag, lowered only by a verified probe.
  * @ingroup comp_util
  *
  * ## Why
@@ -21,56 +22,44 @@
  * refresh of latency on a 1-period target — so the depth is derived from what
  * the target measures, with depth 1 as the universal base:
  *
- *   effective depth = max(lag floor, slip/saturation level), ceiling 4
+ *   effective depth = max(floor, slip level), ceiling 4
  *
- * - **Lag floor (this file).** EMA of the compositor's INTRINSIC
- *   commit-to-glass latency per present: `presented − commit` minus one
- *   period per present of OURS still outstanding (committed, not yet
- *   presented) at commit time (@ref comp_lw_lag_intrinsic_ns). Without that
- *   correction the floor runs away: a deeper pipeline queues more of our
- *   frames ahead, each sample grows by that FIFO wait, the floor rises, the
- *   depth rises — measured on the PR's first CI build: 1 -> 2 -> 3 -> 4, the
- *   #206 residual doubled from 1.99 to 3.99 periods. The count must be the
- *   ACTUAL outstanding presents, not depth − 1: the swapchain lets the app
- *   run further ahead than the pacing depth (second CI build: a 5.5-period
- *   raw sample at depth 3 read as 3.53 intrinsic, and the estimate swung
- *   0.8-3.7 periods). Two more guards: samples taken with more than
- *   @ref COMP_LW_LAG_MAX_OUTSTANDING presents outstanding are dropped (the
- *   queue term dominates them), and each sample is clamped to the EMA
- *   ± @ref COMP_LW_LAG_SAMPLE_CLAMP periods, so one frame can move the EMA by
- *   at most 0.05 period. The
- *   raw sample comes from the window system's presentation feedback (wp_presentation; or, where the
- *   feedback cannot be correlated per present, the return of a present wait
- *   that actually blocked). The floor is the lag rounded to whole periods:
- *   RAISED as soon as the EMA (after @ref COMP_LW_LAG_MIN_SAMPLES samples)
- *   reaches floor + 0.5 periods; LOWERED only after round(lag) has sat below
- *   the floor continuously for a dwell (30 s), and a re-raise within two
- *   dwells of a lowering is a failed probe that doubles the dwell (30 -> 60
- *   -> 120 -> 300 s). A composited GNOME window reads 2, direct scanout 1, a
- *   PRIME / copy path whatever it measures — the generic form of "GNOME needs
- *   2".
+ * where the slip level is the shared machine in comp_feedback_pace.h with no
+ * level banked above the floor on this tier, so in practice depth = floor.
  *
- *   The lag is NOT a constant per desktop, which is why this is a tracked
- *   signal with hysteresis and never a one-shot measurement: mutter switches
- *   between double and triple buffering on its own measured render time, so
- *   the same window flips between 1 and 2 periods of lag within one run —
- *   and depth-1 pacing feeds back into it (less app load -> double buffering
- *   -> 1 period -> we run faster -> more load -> triple -> 2 periods -> we
- *   halve). Measured: 5 s windows of the same Unity window at depth 1
- *   alternating 59, 34, 97, 60, 61, 60, 58, 24, 98, 61 presents/s. Depth 2 is
- *   cheap by comparison (the #206 weave->scanout horizon measured the same at
- *   depth 1 and 2), so the asymmetry is deliberate: up fast, down slow.
- * - **Saturation level** — the existing slip machine in
- *   comp_feedback_pace.h (the Windows governor's slip rules: per-120-frame
- *   slip windows escalate one level above the effective depth, three clean
- *   windows + a doubling dwell probe back down), fed with "paced frame
- *   interval > 1.55 periods" as the slip, and given this floor through
- *   comp_fb_pace_set_floor().
+ * ## The floor — asymmetric on purpose, after three CI iterations
  *
- * Why the floor matters for the slip machine: without it, a composited window
- * at depth 1 slips every frame, escalates to 2, goes clean, and the return
- * probe drops it back to 1 — a guaranteed ~1 s at half rate every dwell. With
- * the floor at 2, depth 1 is never probed there.
+ * **Raised by lag, never lowered by lag.** `presented − commit` from the
+ * window system (wp_presentation; on X11 the return of a present wait that
+ * blocked) is used only from presents committed with ZERO of our presents
+ * outstanding. How much of a sample taken behind our own queue is queueing is
+ * not observable: a FIFO / frame callback that withholds the frame adds a
+ * period per present ahead (round 2: a 5.5-period raw sample at depth 3),
+ * while a pipelined compositor shows the frame `commit + 2 periods` regardless
+ * (round 3: subtracting one period per outstanding present read a 2-period
+ * pipeline as 0.95 periods, the floor fell to 1, and the app sat at 30
+ * present/s for two minutes). Round 1 subtracted nothing and ran away to 4.
+ * So: EMA of the clean samples (each clamped to EMA ± 0.5 period, so one
+ * frame moves it by <= 0.05 period); the floor rises to round(EMA) once the
+ * EMA reaches floor + 0.5 periods. At depth >= 2 the samples stop (there is
+ * always one of ours outstanding), which is fine: the floor only needs them
+ * to go UP.
+ *
+ * **Raised by depth-1 starvation.** A slipping window seen at depth 1 while
+ * the acquire wait dominates the frame (wait EMA >= 0.8 period) is the
+ * signature of depth-1 serialisation; it raises the floor to 2 even without a
+ * clean lag sample (@ref comp_lw_lag_on_slip_window_at_cap).
+ *
+ * **Lowered only by a verified return probe.** After a dwell (30 s) at a
+ * floor above 1, with the app at rate, the floor steps down one level. The
+ * probe is judged by throughput: the mean paced frame interval over the ~1 s
+ * after it against a slow EMA (~1-2 s) from before it. A rate drop of more
+ * than 15 %, or @ref COMP_LW_PROBE_SLOW_FRAMES frames at >= 1.5 periods,
+ * reverts it at once (which cuts the 30-present/s stretch to a fraction of a
+ * second), doubles the dwell (30 -> 60 -> 120 -> 300 s) and logs `probe
+ * failed`; otherwise the lower floor holds. Depth 2 is cheap by comparison
+ * (the #206 weave->scanout horizon measured the same at depth 1 and 2), so
+ * staying up a while longer costs nothing visible.
  *
  * Pure logic, no clocks or graphics types: unit-tested on the host
  * (tests/tests_comp_late_weave_depth.cpp).
@@ -92,25 +81,60 @@ extern "C" {
 //! Raise once the lag reaches floor + this many periods.
 #define COMP_LW_LAG_RAISE_MARGIN 0.5
 #define COMP_LW_LAG_MIN_SAMPLES 16
-//! Samples taken with more of our presents outstanding than this are dropped.
-#define COMP_LW_LAG_MAX_OUTSTANDING 2
-//! A sample may sit at most this many periods from the EMA (alpha 0.1 ->
-//! one frame moves the EMA by <= 0.05 period).
+//! A sample may sit at most this many periods from the EMA.
 #define COMP_LW_LAG_SAMPLE_CLAMP 0.5
-#define COMP_LW_LAG_DWELL_NS (30ULL * 1000ULL * 1000ULL * 1000ULL)
-#define COMP_LW_LAG_DWELL_MAX_NS (300ULL * 1000ULL * 1000ULL * 1000ULL)
 //! Lag samples above this are a stall, not a property of the pipeline.
 #define COMP_LW_LAG_MAX_NS (200ULL * 1000ULL * 1000ULL)
+//! A frame gap longer than this is a pause, not a slow frame.
+#define COMP_LW_LAG_PAUSE_NS (250ULL * 1000ULL * 1000ULL)
+//! Depth-1 starvation: the acquire wait EMA is at least this many periods.
+#define COMP_LW_LAG_STARVED_WAIT 0.8
+
+#define COMP_LW_PROBE_DWELL_NS (30ULL * 1000ULL * 1000ULL * 1000ULL)
+#define COMP_LW_PROBE_DWELL_MAX_NS (300ULL * 1000ULL * 1000ULL * 1000ULL)
+//! How long a probe is watched before it is accepted.
+#define COMP_LW_PROBE_VERIFY_NS (1000ULL * 1000ULL * 1000ULL)
+//! A probe fails when the mean interval after it exceeds before / this.
+#define COMP_LW_PROBE_RATE_KEEP 0.85
+//! ...or after this many frames at >= 1.5 periods inside the verify window.
+#define COMP_LW_PROBE_SLOW_FRAMES 10
+//! Probe only from an app at rate (slow interval EMA within this many periods).
+#define COMP_LW_PROBE_AT_RATE 1.2
+
+enum comp_lw_lag_event
+{
+	COMP_LW_LAG_NONE = 0,
+	COMP_LW_LAG_PROBE_DOWN,   //!< floor stepped down one level (on trial)
+	COMP_LW_LAG_PROBE_FAILED, //!< throughput fell: reverted, dwell doubled
+	COMP_LW_LAG_PROBE_HELD,   //!< throughput held: the lower floor stays
+};
 
 struct comp_lw_lag
 {
+	int depth; //!< current floor (1..MAX)
+
+	//! EMA of commit-to-glass samples taken with 0 of ours outstanding.
 	double ema_ns;
 	uint32_t samples;
-	int depth;               //!< current floor (1..MAX)
-	uint64_t lower_since_ns; //!< round(lag) first sat below the floor; 0 = not
-	uint64_t dwell_ns;       //!< calm needed before a lowering (doubles on failure)
-	uint64_t last_lower_ns;  //!< last lowering (a probe)
-	uint32_t changes;
+
+	// Throughput signal for the probe.
+	uint64_t last_frame_ns;
+	double interval_slow_ema_ns; //!< alpha 1/64: the "before" reference
+	double wait_ema_ns;          //!< acquire wait, alpha 0.1
+
+	uint64_t dwell_ns;
+	uint64_t last_change_ns;
+
+	// Probe under verification.
+	bool probing;
+	uint64_t probe_ns;
+	double probe_before_ns; //!< slow interval EMA at probe time
+	double probe_sum_ns;
+	uint32_t probe_frames;
+	uint32_t probe_slow;
+	double last_probe_after_ns; //!< for the log line
+
+	uint32_t probes_failed;
 };
 
 static inline void
@@ -121,7 +145,13 @@ comp_lw_lag_init(struct comp_lw_lag *l)
 	}
 	memset(l, 0, sizeof(*l));
 	l->depth = 1;
-	l->dwell_ns = COMP_LW_LAG_DWELL_NS;
+	l->dwell_ns = COMP_LW_PROBE_DWELL_NS;
+}
+
+static inline int
+comp_lw_lag_clamp_depth(int n)
+{
+	return n < 1 ? 1 : (n > COMP_LW_LAG_MAX_DEPTH ? COMP_LW_LAG_MAX_DEPTH : n);
 }
 
 //! round(ema / period), clamped to 1..MAX; 0 when unmeasured.
@@ -131,20 +161,33 @@ comp_lw_lag_target(const struct comp_lw_lag *l, uint64_t period_ns)
 	if (l == NULL || period_ns == 0 || l->samples == 0) {
 		return 0;
 	}
-	const int n = (int)(l->ema_ns / (double)period_ns + COMP_LW_LAG_RAISE_MARGIN);
-	return n < 1 ? 1 : (n > COMP_LW_LAG_MAX_DEPTH ? COMP_LW_LAG_MAX_DEPTH : n);
+	return comp_lw_lag_clamp_depth((int)(l->ema_ns / (double)period_ns + COMP_LW_LAG_RAISE_MARGIN));
+}
+
+static inline void
+comp_lw_lag_raise_(struct comp_lw_lag *l, int to, uint64_t now_ns)
+{
+	if (l->probing) {
+		// Raised while a probe was on trial: the probe failed.
+		l->probing = false;
+		l->dwell_ns =
+		    l->dwell_ns * 2 > COMP_LW_PROBE_DWELL_MAX_NS ? COMP_LW_PROBE_DWELL_MAX_NS : l->dwell_ns * 2;
+		l->probes_failed++;
+	}
+	l->depth = comp_lw_lag_clamp_depth(to);
+	l->last_change_ns = now_ns;
 }
 
 /*!
- * Feed one commit-to-glass sample.
+ * Feed one commit-to-glass sample. Only samples committed with zero of our
+ * presents outstanding count; the floor only ever RISES here.
  *
- * @param now_ns monotonic now, for the lowering dwell.
- * @return true when the floor (@ref comp_lw_lag::depth) changed.
+ * @return true when the floor rose.
  */
 static inline bool
-comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint64_t period_ns, uint64_t now_ns)
+comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint32_t outstanding, uint64_t period_ns, uint64_t now_ns)
 {
-	if (l == NULL || lag_ns == 0 || lag_ns > COMP_LW_LAG_MAX_NS) {
+	if (l == NULL || outstanding != 0 || lag_ns == 0 || lag_ns > COMP_LW_LAG_MAX_NS) {
 		return false;
 	}
 	double v = (double)lag_ns;
@@ -159,52 +202,96 @@ comp_lw_lag_on_sample(struct comp_lw_lag *l, uint64_t lag_ns, uint64_t period_ns
 	}
 	const int want = comp_lw_lag_target(l, period_ns);
 	if (want > l->depth) {
-		// Up fast. Re-raising soon after a lowering: the probe failed.
-		if (l->last_lower_ns != 0 && now_ns - l->last_lower_ns < 2 * l->dwell_ns) {
-			l->dwell_ns =
-			    l->dwell_ns * 2 > COMP_LW_LAG_DWELL_MAX_NS ? COMP_LW_LAG_DWELL_MAX_NS : l->dwell_ns * 2;
-		}
-		l->depth = want;
-		l->lower_since_ns = 0;
-		l->changes++;
+		comp_lw_lag_raise_(l, want, now_ns);
 		return true;
 	}
-	if (want < l->depth) {
-		// Down slow: only after the lower value held for a whole dwell.
-		if (l->lower_since_ns == 0) {
-			l->lower_since_ns = now_ns;
-			return false;
-		}
-		if (now_ns - l->lower_since_ns < l->dwell_ns) {
-			return false;
-		}
-		l->depth--; // one level at a time
-		l->lower_since_ns = 0;
-		l->last_lower_ns = now_ns;
-		l->changes++;
-		return true;
-	}
-	l->lower_since_ns = 0;
 	return false;
 }
 
 /*!
- * The compositor's intrinsic commit-to-glass latency from one raw sample:
- * `sample − queued_ahead × period`, where @p queued_ahead is how many of our
- * own presents were still outstanding (committed, not yet presented) when
- * this one was committed. At least 1 ns, so a fully-queue-explained sample
- * still counts as "well under a period"; 0 = drop the sample (more than
- * @ref COMP_LW_LAG_MAX_OUTSTANDING outstanding). The estimate is the same at
- * every depth, which is what keeps the floor from feeding on its own depth.
+ * A slipping window was seen at the depth cap. At depth 1, with the acquire
+ * wait dominating the frame, that is depth-1 serialisation: raise to 2.
+ *
+ * @return true when the floor rose.
  */
-static inline uint64_t
-comp_lw_lag_intrinsic_ns(uint64_t sample_ns, uint32_t queued_ahead, uint64_t period_ns)
+static inline bool
+comp_lw_lag_on_slip_window_at_cap(struct comp_lw_lag *l, uint64_t period_ns, uint64_t now_ns)
 {
-	if (queued_ahead > COMP_LW_LAG_MAX_OUTSTANDING) {
-		return 0;
+	if (l == NULL || l->depth != 1 || period_ns == 0) {
+		return false;
 	}
-	const uint64_t q = (uint64_t)queued_ahead * period_ns;
-	return sample_ns > q ? sample_ns - q : 1;
+	if (l->wait_ema_ns < (double)period_ns * COMP_LW_LAG_STARVED_WAIT) {
+		return false;
+	}
+	comp_lw_lag_raise_(l, 2, now_ns);
+	return true;
+}
+
+/*!
+ * Feed one paced frame: drives the return probe and its verification.
+ *
+ * @param interval_ns acquire-to-acquire time (0 = none: first frame).
+ * @param wait_ns     how long the present wait blocked this frame.
+ */
+static inline enum comp_lw_lag_event
+comp_lw_lag_on_frame(struct comp_lw_lag *l, uint64_t interval_ns, uint64_t wait_ns, uint64_t period_ns, uint64_t now_ns)
+{
+	if (l == NULL) {
+		return COMP_LW_LAG_NONE;
+	}
+	l->wait_ema_ns = l->wait_ema_ns == 0.0 ? (double)wait_ns : l->wait_ema_ns * 0.9 + (double)wait_ns * 0.1;
+	if (interval_ns == 0 || interval_ns > COMP_LW_LAG_PAUSE_NS || period_ns == 0) {
+		if (interval_ns > COMP_LW_LAG_PAUSE_NS) {
+			l->interval_slow_ema_ns = 0.0; // a pause is not a rate
+		}
+		return COMP_LW_LAG_NONE;
+	}
+	const double dt = (double)interval_ns;
+	const double per = (double)period_ns;
+
+	if (l->probing) {
+		l->probe_sum_ns += dt;
+		l->probe_frames++;
+		if (dt >= per * 1.5) {
+			l->probe_slow++;
+		}
+		const bool done = now_ns - l->probe_ns >= COMP_LW_PROBE_VERIFY_NS;
+		const bool slow = l->probe_slow >= COMP_LW_PROBE_SLOW_FRAMES;
+		if (!done && !slow) {
+			return COMP_LW_LAG_NONE;
+		}
+		const double after = l->probe_sum_ns / (double)l->probe_frames;
+		l->last_probe_after_ns = after;
+		l->probing = false;
+		if (slow || after > l->probe_before_ns / COMP_LW_PROBE_RATE_KEEP || after >= per * 1.5) {
+			l->depth++;
+			l->last_change_ns = now_ns;
+			l->dwell_ns =
+			    l->dwell_ns * 2 > COMP_LW_PROBE_DWELL_MAX_NS ? COMP_LW_PROBE_DWELL_MAX_NS : l->dwell_ns * 2;
+			l->probes_failed++;
+			return COMP_LW_LAG_PROBE_FAILED;
+		}
+		// Held: the probe's frames are a valid "before" for the next one.
+		l->interval_slow_ema_ns = after;
+		return COMP_LW_LAG_PROBE_HELD;
+	}
+
+	l->interval_slow_ema_ns =
+	    l->interval_slow_ema_ns == 0.0 ? dt : l->interval_slow_ema_ns * (63.0 / 64.0) + dt / 64.0;
+
+	if (l->depth > 1 && now_ns - l->last_change_ns >= l->dwell_ns &&
+	    l->interval_slow_ema_ns <= per * COMP_LW_PROBE_AT_RATE) {
+		l->probing = true;
+		l->probe_ns = now_ns;
+		l->probe_before_ns = l->interval_slow_ema_ns;
+		l->probe_sum_ns = 0.0;
+		l->probe_frames = 0;
+		l->probe_slow = 0;
+		l->depth--;
+		l->last_change_ns = now_ns;
+		return COMP_LW_LAG_PROBE_DOWN;
+	}
+	return COMP_LW_LAG_NONE;
 }
 
 //! The slip signal for the present_wait tier: a paced frame interval over

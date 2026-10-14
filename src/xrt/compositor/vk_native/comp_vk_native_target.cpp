@@ -663,7 +663,7 @@ struct comp_vk_native_target
 		uint64_t aimed_vblank_ns;
 		//! vkQueuePresentKHR return — the WSI's wl_surface.commit is inside it.
 		uint64_t commit_ns;
-		//! #2119: our own presents queued ahead of this one (depth − 1).
+		//! #2119: our own presents still outstanding when this one was committed.
 		uint32_t queued_ahead;
 	} pf_ring[16];
 	//! Set by the grid gate when it aims a weave, consumed by the request.
@@ -734,7 +734,7 @@ struct comp_vk_native_target
 	//! present_weave_ring_id) — the commit time for the present_wait lag.
 	uint64_t present_commit_ring_ns[8];
 	//! #2119: presents queued ahead at commit (effective depth − 1), so the
-	//! lag floor sees the compositor's intrinsic latency, not our queue.
+	//! lag floor only takes samples committed with nothing of ours ahead.
 	uint32_t present_commit_queued[8];
 	//! Weave start per present id (id % 8), for the residual at wait return.
 	uint64_t present_weave_ring_id[8];
@@ -2493,12 +2493,13 @@ target_log_residual(struct comp_vk_native_target *target)
 			char gov[192] = "";
 #ifdef XRT_OS_LINUX_DESKTOP
 			if (target->pw_pace_inited) {
-				snprintf(gov, sizeof(gov),
-				         " | depth %d (floor %d, slip level %d, %s), intrinsic lag %.2f periods, "
-				         "outstanding at last commit %u",
-				         comp_fb_pace_effective(&target->pw_pace), target->pw_pace.floor,
-				         target->pw_pace.depth, target->pw_governing ? "governed" : "fixed",
-				         target->pw_lag.ema_ns / per, target->pw_last_outstanding);
+				snprintf(
+				    gov, sizeof(gov),
+				    " | depth %d (floor %d, slip level %d, %s), lag at 0 outstanding %.2f periods, "
+				    "outstanding at last commit %u",
+				    comp_fb_pace_effective(&target->pw_pace), target->pw_pace.floor,
+				    target->pw_pace.depth, target->pw_governing ? "governed" : "fixed",
+				    target->pw_lag.ema_ns / per, target->pw_last_outstanding);
 			}
 #endif
 			if (st.n != 0) {
@@ -2596,11 +2597,12 @@ target_pw_log_change(struct comp_vk_native_target *target, int from, const char 
 	}
 	const uint64_t period_ns = target->vblank_grid.period_ns;
 	U_LOG_W(
-	    "#2119: late-weave depth %d -> %d (%s; intrinsic commit-to-glass lag %.2f ms = %.2f periods -> floor %d, "
+	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag at 0 outstanding %.2f ms = %.2f periods, floor "
+	    "%d, "
 	    "slip level %d, period %.3f ms, probe dwell %llu s; change #%u, %u suppressed since last line)",
 	    from, target_pw_depth(target), why, target->pw_lag.ema_ns / 1e6,
 	    period_ns != 0 ? target->pw_lag.ema_ns / (double)period_ns : 0.0, target->pw_lag.depth,
-	    target->pw_pace.depth, period_ns / 1e6, (unsigned long long)(target->pw_pace.dwell_ns / 1000000000ULL),
+	    target->pw_pace.depth, period_ns / 1e6, (unsigned long long)(target->pw_lag.dwell_ns / 1000000000ULL),
 	    target->pw_depth_changes, target->pw_depth_log_suppressed);
 	target->pw_depth_log_suppressed = 0;
 	target->pw_depth_log_ns = now_ns;
@@ -2621,14 +2623,11 @@ target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint32
 	if (period_ns == 0) {
 		return; // cannot remove our own queue time without a period
 	}
-	// The floor must track the compositor's INTRINSIC latency: subtract the
-	// periods this frame waited behind our own earlier presents, or the
-	// floor feeds on its own depth (1 -> 2 -> 3 -> 4 on the first CI build).
-	const uint64_t intrinsic = comp_lw_lag_intrinsic_ns(lag_ns, queued_ahead, period_ns);
-	if (intrinsic == 0) {
-		return; // too much of our own queue ahead of it to say anything
-	}
-	if (comp_lw_lag_on_sample(&target->pw_lag, intrinsic, period_ns, now_ns)) {
+	// #2119: only samples committed with 0 of ours outstanding count, and they
+	// can only RAISE the floor — how much of a sample taken behind our own
+	// queue is queueing is not observable (FIFO withholding vs a pipelined
+	// compositor); lowering is the verified probe's job.
+	if (comp_lw_lag_on_sample(&target->pw_lag, lag_ns, queued_ahead, period_ns, now_ns)) {
 		const int from = target_pw_depth(target);
 		if (comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth, now_ns)) {
 			target_pw_log_change(target, from, "commit-to-glass lag", now_ns);
@@ -4059,6 +4058,44 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 					const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
 					const uint64_t dt =
 					    target->pw_last_frame_ns != 0 ? now_ns - target->pw_last_frame_ns : 0;
+					{
+						// Return probe + its throughput verification (the only
+						// way the floor comes down).
+						const int from = target_pw_depth(target);
+						const enum comp_lw_lag_event le = comp_lw_lag_on_frame(
+						    &target->pw_lag, dt, now_ns - wait_t0, period_ns, now_ns);
+						if (le == COMP_LW_LAG_PROBE_DOWN || le == COMP_LW_LAG_PROBE_FAILED) {
+							comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth,
+							                       now_ns);
+						}
+						if (le == COMP_LW_LAG_PROBE_DOWN && target_pw_depth(target) != from) {
+							target_pw_log_change(
+							    target, from, "return probe (verifying throughput for 1 s)",
+							    now_ns);
+						} else if (le == COMP_LW_LAG_PROBE_FAILED) {
+							// Always logged: the revert is the point of the line.
+							U_LOG_W(
+							    "#2119: late-weave probe failed — depth %d -> %d reverted: "
+							    "mean frame "
+							    "interval %.2f ms after the probe vs %.2f ms before "
+							    "(period %.3f ms); "
+							    "next probe in %llu s",
+							    from, target_pw_depth(target),
+							    target->pw_lag.last_probe_after_ns / 1e6,
+							    target->pw_lag.probe_before_ns / 1e6, period_ns / 1e6,
+							    (unsigned long long)(target->pw_lag.dwell_ns /
+							                         1000000000ULL));
+							target->pw_depth_changes++;
+						} else if (le == COMP_LW_LAG_PROBE_HELD) {
+							U_LOG_W(
+							    "#2119: late-weave probe held at depth %d — mean frame "
+							    "interval %.2f ms "
+							    "after vs %.2f ms before",
+							    target_pw_depth(target),
+							    target->pw_lag.last_probe_after_ns / 1e6,
+							    target->pw_lag.probe_before_ns / 1e6);
+						}
+					}
 					if (period_ns != 0 && dt != 0 && dt < 250ULL * 1000 * 1000) {
 						const int from = target_pw_depth(target);
 						const enum comp_fb_pace_event e = comp_fb_pace_on_wait(
@@ -4070,6 +4107,16 @@ comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
 							                         ? "saturation: slip-rate escalation"
 							                         : "return probe",
 							                     now_ns);
+						} else if (e == COMP_FB_PACE_AT_CAP &&
+						           comp_lw_lag_on_slip_window_at_cap(&target->pw_lag, period_ns,
+						                                             now_ns)) {
+							// Depth-1 serialisation: slipping while the acquire
+							// wait dominates the frame. Raise without a lag sample.
+							comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth,
+							                       now_ns);
+							target_pw_log_change(
+							    target, from, "depth-1 starvation: slip window, wait-bound",
+							    now_ns);
 						} else if (e == COMP_FB_PACE_AT_CAP) {
 							target->pw_cap_windows++;
 							if (target->pw_cap_log_ns == 0 ||
