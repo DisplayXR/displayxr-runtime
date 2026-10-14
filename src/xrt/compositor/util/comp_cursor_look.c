@@ -150,6 +150,19 @@ comp_cursor_look_fini(struct comp_cursor_look *look)
 	}
 }
 
+#if !defined(_WIN32)
+bool
+comp_cursor_look_from_os_cursor(struct comp_cursor_look *look, uint64_t os_cursor, float backing_scale)
+{
+	// OS cursor handles as a carrier are Windows-only (the texture carrier is
+	// the cross-platform one).
+	(void)look;
+	(void)os_cursor;
+	(void)backing_scale;
+	return false;
+}
+#endif
+
 #if !defined(__APPLE__) && !defined(_WIN32)
 /*
  * No OS-cursor mirror on this platform yet (Linux: XFixesGetCursorImage is

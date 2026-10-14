@@ -864,6 +864,45 @@ struct d3d11_client_render_resources
 	int                                    lift_cursor_reason;
 	struct svc_lift_cursor                 lift_cursor[XRT_LIFT_WEAVE_RECTS_MAX];
 
+	/*!
+	 * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the weave-rect cursor.
+	 * Same IPC thread as the submit (one connection), so no lock. Nothing here
+	 * is touched by a client that never chains XrCursorDepthWeaveRequestDXR.
+	 * @{
+	 */
+	//! The request staged for the NEXT submit (comp_d3d11_service_weave_set_cursor_request).
+	struct xrt_weave_cursor_request        wc_req_next = {};
+	bool                                   wc_req_next_valid = false;
+	//! What the last submit drew (comp_d3d11_service_weave_get_cursor_state).
+	struct xrt_weave_cursor_state          wc_out = {};
+	//! One filter + HYBRID anchor per client (one pointer per window).
+	struct u_cursor_weave_state            wc_state = {};
+	//! The callers' last depth per rect index (500 ms, u_cursor_weave_memo).
+	struct u_cursor_weave_memo             wc_memo[XRT_WEAVE_CURSOR_MAX_RECTS] = {};
+	uint64_t                               wc_last_req_ns = 0;
+	//! Why the last weave-rect cursor was / was not drawn (logged on change).
+	int                                    wc_reason = 0;
+	//! The held sprite: its generation (0 = none) and kind (XrCursorDepthWeaveSpriteKindDXR).
+	uint64_t                               wc_sprite_gen = 0;
+	uint32_t                               wc_sprite_kind = 0;
+	uint64_t                               wc_sprite_os_cursor = 0;
+	//! OS_CURSOR carrier: the caller's HCURSOR rasterised (comp_cursor_look).
+	struct comp_cursor_look                wc_look = {};
+	uint64_t                               wc_look_uploaded = 0; //!< wc_look.generation in wc_sprite_tex
+	//! The held sprite's pixels (OS_CURSOR raster or TEXTURE copy), TYPELESS
+	//! with a non-decoding and a decoding view.
+	wil::com_ptr<ID3D11Texture2D>          wc_sprite_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> wc_sprite_srv;
+	wil::com_ptr<ID3D11ShaderResourceView> wc_sprite_srv_srgb;
+	uint32_t                               wc_sprite_w = 0, wc_sprite_h = 0;
+	float                                  wc_sprite_hot_x = 0.0f, wc_sprite_hot_y = 0.0f; //!< px
+	float                                  wc_sprite_size_m = 0.0f;
+	//! TEXTURE carrier staged by comp_d3d11_service_weave_set_cursor_sprite_texture (owned).
+	HANDLE                                 wc_tex_handle = nullptr;
+	bool                                   wc_tex_is_dxgi = false;
+	struct xrt_weave_cursor_sprite_texture wc_tex_info = {};
+	//! @}
+
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
 	//! shared-handle value exactly like weave_input_* above. A window-sized
 	//! premultiplied-alpha RGBA atlas the runtime composites OVER the woven
@@ -7277,6 +7316,23 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 static void
 weave_close_cached(HANDLE h, bool is_dxgi);
 
+//! XR_DXR_cursor_depth v8: drop the weave-rect cursor's held sprite.
+static void
+svc_weave_cursor_release_sprite(struct d3d11_client_render_resources *res)
+{
+	res->wc_sprite_srv.reset();
+	res->wc_sprite_srv_srgb.reset();
+	res->wc_sprite_tex.reset();
+	res->wc_sprite_w = 0;
+	res->wc_sprite_h = 0;
+	res->wc_sprite_gen = 0;
+	res->wc_sprite_kind = 0;
+	res->wc_sprite_os_cursor = 0;
+	res->wc_look_uploaded = 0;
+	comp_cursor_look_fini(&res->wc_look);
+	res->wc_look = {};
+}
+
 /*!
  * Clean up per-client render resources.
  */
@@ -7395,6 +7451,18 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_legacy_warned = false;
 	res->lift_rect_count = 0;
 	res->weave_crop_rtv.reset();
+	// XR_DXR_cursor_depth v8: the weave-rect cursor's sprite and staged carrier.
+	svc_weave_cursor_release_sprite(res);
+	if (res->wc_tex_handle != nullptr) {
+		weave_close_cached(res->wc_tex_handle, res->wc_tex_is_dxgi);
+		res->wc_tex_handle = nullptr;
+	}
+	res->wc_req_next_valid = false;
+	res->wc_out = {};
+	res->wc_state = {};
+	for (auto &m : res->wc_memo) {
+		m = {};
+	}
 	weave_close_cached(res->weave_overlay_handle_cached, res->weave_overlay_cached_is_dxgi);
 	res->weave_overlay_handle_cached = nullptr;
 	res->weave_overlay_km.reset();
@@ -27960,6 +28028,653 @@ svc_lift_cursor_draw(struct d3d11_service_system *sys,
 	return drawn;
 }
 
+/*
+ *
+ * ADR-046 Amendment 4 (XR_DXR_cursor_depth v8): the weave-rect cursor.
+ *
+ * The generalisation of the lifted-rect cursor above to ANY woven rect: the
+ * depth source is the weave caller's on-screen disparity (the web page's,
+ * through the browser) instead of a conversion's depth map. The pointer is
+ * read HERE, inside the submit (GetCursorPos -> the bound window -> the rect),
+ * not from the page; the placement is u_cursor_depth's one policy with the
+ * HYBRID anchor in the weave frame (u_cursor_weave_step); the look is the
+ * caller's sprite (an HCURSOR rasterised by comp_cursor_look, a texture, the
+ * default look or nothing); it is drawn by svc_draw_cursor_quads with the B.7
+ * softening into the service's scratch or crop, never into the caller's input.
+ *
+ * Zero cost unless requested (ADR-046 section 0): every function here returns
+ * at once for a submit that staged no request.
+ *
+ * Lifted rects that asked for the v6 cursor keep Amendment 1's drawer and its
+ * arrow until W3 (Decision 5); the pick below takes them into account so one
+ * window never shows two runtime cursors.
+ *
+ */
+
+enum svc_weave_cursor_reason
+{
+	SVC_WC_DRAWN = 1,
+	SVC_WC_DRAWN_HANDING_BACK,
+	SVC_WC_WORKSPACE_CURSOR,
+	SVC_WC_NO_WINDOW,
+	SVC_WC_NO_CURSOR_POS,
+	SVC_WC_NOT_OVER_WINDOW,
+	SVC_WC_NOT_OVER_A_REQUESTED_RECT,
+	SVC_WC_LIFTED_RECT,
+	SVC_WC_NO_DEPTH,
+	SVC_WC_FLAT_2D,
+	SVC_WC_NO_DISPLAY_INFO,
+	SVC_WC_NO_EYES,
+	SVC_WC_SPRITE_NONE,
+	SVC_WC_NO_SPRITE,
+	SVC_WC_NO_PIPELINE,
+	SVC_WC_FORCED_REFUSE,
+	SVC_WC_PLACEMENT_FAILED,
+	SVC_WC_ON_PLANE,
+	SVC_WC_NO_TILES,
+	SVC_WC_LEGACY_LAYOUT,
+};
+
+static const char *
+svc_weave_cursor_reason_str(int r)
+{
+	switch (r) {
+	case SVC_WC_DRAWN: return "DRAWN";
+	case SVC_WC_DRAWN_HANDING_BACK: return "drawn, reported NOT drawn (handing back to the OS cursor)";
+	case SVC_WC_WORKSPACE_CURSOR: return "not drawn: a workspace cursor is shown";
+	case SVC_WC_NO_WINDOW: return "not drawn: no bound weave window";
+	case SVC_WC_NO_CURSOR_POS: return "not drawn: GetCursorPos failed";
+	case SVC_WC_NOT_OVER_WINDOW: return "not drawn: the pointer is not over the bound window";
+	case SVC_WC_NOT_OVER_A_REQUESTED_RECT: return "not drawn: the pointer is over no rect with a depth";
+	case SVC_WC_LIFTED_RECT: return "not drawn here: the pointer is over a lifted rect (Amendment 1's cursor)";
+	case SVC_WC_NO_DEPTH: return "not drawn: no fresh depth for the hovered rect";
+	case SVC_WC_FLAT_2D: return "not drawn: the panel is in 2D";
+	case SVC_WC_NO_DISPLAY_INFO: return "not drawn: no window metrics / pixel pitch";
+	case SVC_WC_NO_EYES: return "not drawn: no valid eye pair from the display processor";
+	case SVC_WC_SPRITE_NONE: return "not drawn: the page hides its cursor (sprite NONE)";
+	case SVC_WC_NO_SPRITE: return "not drawn: no sprite could be built";
+	case SVC_WC_NO_PIPELINE: return "not drawn: cursor shaders unavailable";
+	case SVC_WC_FORCED_REFUSE: return "not drawn: DXR_CURSOR_DRAW_REFUSE";
+	case SVC_WC_PLACEMENT_FAILED: return "not drawn: degenerate placement";
+	case SVC_WC_ON_PLANE: return "not drawn: nothing comes out of the screen under it (OS cursor on the plane)";
+	case SVC_WC_NO_TILES: return "not drawn: the sprite falls outside the rect in every view";
+	case SVC_WC_LEGACY_LAYOUT: return "not drawn: the legacy single-rect layout has no cursor";
+	default: return "?";
+	}
+}
+
+static bool
+svc_format_is_srgb(DXGI_FORMAT f)
+{
+	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
+//! (Re)create the held sprite's texture from tightly packed premultiplied RGBA8.
+static bool
+svc_weave_cursor_upload_rgba(struct d3d11_service_system *sys,
+                             struct d3d11_client_render_resources *r,
+                             const uint8_t *rgba,
+                             uint32_t w,
+                             uint32_t h)
+{
+	r->wc_sprite_srv.reset();
+	r->wc_sprite_srv_srgb.reset();
+	r->wc_sprite_tex.reset();
+	r->wc_sprite_w = 0;
+	r->wc_sprite_h = 0;
+	if (rgba == nullptr || w == 0 || h == 0) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = rgba;
+	init.SysMemPitch = w * 4;
+	if (FAILED(sys->device->CreateTexture2D(&td, &init, r->wc_sprite_tex.put()))) {
+		r->wc_sprite_tex.reset();
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	HRESULT hr = sys->device->CreateShaderResourceView(r->wc_sprite_tex.get(), &sd, r->wc_sprite_srv.put());
+	if (SUCCEEDED(hr)) {
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = sys->device->CreateShaderResourceView(r->wc_sprite_tex.get(), &sd, r->wc_sprite_srv_srgb.put());
+	}
+	if (FAILED(hr)) {
+		r->wc_sprite_srv.reset();
+		r->wc_sprite_srv_srgb.reset();
+		r->wc_sprite_tex.reset();
+		return false;
+	}
+	r->wc_sprite_w = w;
+	r->wc_sprite_h = h;
+	return true;
+}
+
+/*!
+ * The texture carrier: open the caller's shared texture, copy it into a texture
+ * the service owns (so nothing keeps the caller's resource open), close the
+ * handle. Under render_mutex + immediate_ctx_mutex (the submit's locks).
+ */
+static bool
+svc_weave_cursor_import_texture(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r)
+{
+	HANDLE h = r->wc_tex_handle;
+	const bool is_dxgi = r->wc_tex_is_dxgi;
+	const struct xrt_weave_cursor_sprite_texture info = r->wc_tex_info;
+	r->wc_tex_handle = nullptr;
+	if (h == nullptr) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Texture2D> src;
+	HRESULT hr = is_dxgi ? sys->device->OpenSharedResource(h, IID_PPV_ARGS(src.put()))
+	                     : sys->device->OpenSharedResource1(h, IID_PPV_ARGS(src.put()));
+	weave_close_cached(h, is_dxgi);
+	if (FAILED(hr) || !src) {
+		U_LOG_W("[weave cursor] sprite texture: OpenSharedResource(%s) failed: 0x%08lx", is_dxgi ? "DXGI" : "NT",
+		        hr);
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC sdsc = {};
+	src->GetDesc(&sdsc);
+	DXGI_FORMAT tl;
+	DXGI_FORMAT unorm;
+	DXGI_FORMAT srgb;
+	switch (sdsc.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		tl = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		unorm = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		break;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		tl = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+		unorm = DXGI_FORMAT_B8G8R8A8_UNORM;
+		srgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		break;
+	default: U_LOG_W("[weave cursor] sprite texture: format %u is not RGBA8 / BGRA8", (unsigned)sdsc.Format); return false;
+	}
+	const uint32_t w = info.width < sdsc.Width ? info.width : sdsc.Width;
+	const uint32_t hh = info.height < sdsc.Height ? info.height : sdsc.Height;
+	if (w == 0 || hh == 0 || w > 256 || hh > 256) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Texture2D> dst;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = hh;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = tl;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(sys->device->CreateTexture2D(&td, nullptr, dst.put()))) {
+		return false;
+	}
+	wil::com_ptr<IDXGIKeyedMutex> km = src.try_query<IDXGIKeyedMutex>();
+	if (km) {
+		HRESULT ah = km->AcquireSync(0, 4);
+		if (FAILED(ah) || ah == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+			U_LOG_W("[weave cursor] sprite texture: AcquireSync timed out - keeping the last look");
+			return false;
+		}
+	}
+	D3D11_BOX box = {0, 0, 0, w, hh, 1};
+	sys->context->CopySubresourceRegion(dst.get(), 0, 0, 0, 0, src.get(), 0, &box);
+	if (km) {
+		km->ReleaseSync(0);
+	}
+	wil::com_ptr<ID3D11ShaderResourceView> srv, srv_srgb;
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	sd.Format = unorm;
+	hr = sys->device->CreateShaderResourceView(dst.get(), &sd, srv.put());
+	if (SUCCEEDED(hr)) {
+		sd.Format = srgb;
+		hr = sys->device->CreateShaderResourceView(dst.get(), &sd, srv_srgb.put());
+	}
+	if (FAILED(hr)) {
+		return false;
+	}
+	r->wc_sprite_tex = dst;
+	r->wc_sprite_srv = srv;
+	r->wc_sprite_srv_srgb = srv_srgb;
+	r->wc_sprite_w = w;
+	r->wc_sprite_h = hh;
+	r->wc_sprite_hot_x = info.hot_x;
+	r->wc_sprite_hot_y = info.hot_y;
+	r->wc_sprite_size_m = info.size_m;
+	U_LOG_W("[weave cursor] sprite: caller texture %ux%u (generation %llu, hotspot %.1f,%.1f)", w, hh,
+	        (unsigned long long)info.generation, info.hot_x, info.hot_y);
+	return true;
+}
+
+//! The sprite one weave-rect cursor draw uses (views AddRef'd).
+struct svc_weave_cursor_sprite
+{
+	wil::com_ptr<ID3D11ShaderResourceView> srv;      //!< non-decoding
+	wil::com_ptr<ID3D11ShaderResourceView> srv_srgb; //!< decoding
+	uint32_t w, h;   //!< texels
+	float hot_u, hot_v;
+	float height_px; //!< drawn height in window (= panel) px at the glass
+	bool nothing;    //!< sprite NONE: draw nothing
+};
+
+/*!
+ * Resolve the request's sprite against the held one, loading a new carrier
+ * when its generation is new. @p dpi_scale is the bound window's DPI / 96;
+ * @p m_per_px the panel pitch. Updates the held generation (the state's
+ * spriteGeneration). False if no sprite at all could be produced.
+ */
+static bool
+svc_weave_cursor_sprite_get(struct d3d11_service_system *sys,
+                            struct d3d11_client_render_resources *r,
+                            const struct xrt_weave_cursor_request &req,
+                            float dpi_scale,
+                            float m_per_px,
+                            struct svc_weave_cursor_sprite *out)
+{
+	*out = {};
+	enum u_cursor_weave_sprite_action act =
+	    u_cursor_weave_sprite_resolve(req.sprite_kind, req.sprite_generation, r->wc_sprite_gen);
+	if (act == U_CURSOR_WEAVE_SPRITE_LOAD_OS_CURSOR) {
+		bool ok = comp_cursor_look_from_os_cursor(&r->wc_look, req.os_cursor, dpi_scale);
+		if (ok && (r->wc_look.generation != r->wc_look_uploaded || !r->wc_sprite_tex ||
+		           r->wc_sprite_kind != U_CURSOR_WEAVE_SPRITE_OS_CURSOR)) {
+			// The held texture may be another carrier's: upload the raster.
+			ok = svc_weave_cursor_upload_rgba(sys, r, r->wc_look.rgba, r->wc_look.w, r->wc_look.h);
+		}
+		if (ok) {
+			r->wc_look_uploaded = r->wc_look.generation;
+			r->wc_sprite_gen = req.sprite_generation;
+			r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_OS_CURSOR;
+			r->wc_sprite_os_cursor = req.os_cursor;
+			r->wc_sprite_hot_x = r->wc_look.hot_u * (float)r->wc_look.w;
+			r->wc_sprite_hot_y = r->wc_look.hot_v * (float)r->wc_look.h;
+			r->wc_sprite_size_m = req.size_m;
+			act = U_CURSOR_WEAVE_SPRITE_USE_HELD;
+		} else {
+			// A dead or unreadable handle: keep the last look, never a wrong one.
+			act = r->wc_sprite_tex ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+		}
+	} else if (act == U_CURSOR_WEAVE_SPRITE_LOAD_TEXTURE) {
+		if (r->wc_tex_handle != nullptr && r->wc_tex_info.generation == req.sprite_generation &&
+		    svc_weave_cursor_import_texture(sys, r)) {
+			r->wc_sprite_gen = req.sprite_generation;
+			r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_TEXTURE;
+			r->wc_sprite_os_cursor = 0;
+			if (req.size_m > 0.0f) {
+				r->wc_sprite_size_m = req.size_m;
+			}
+			act = U_CURSOR_WEAVE_SPRITE_USE_HELD;
+		} else {
+			act = r->wc_sprite_tex ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+		}
+	} else if (act == U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING) {
+		r->wc_sprite_gen = req.sprite_generation;
+		r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_NONE;
+	} else if (act == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT && req.sprite_kind == U_CURSOR_WEAVE_SPRITE_DEFAULT) {
+		r->wc_sprite_gen = req.sprite_generation;
+		r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_DEFAULT;
+		r->wc_sprite_size_m = req.size_m;
+	}
+
+	if (act == U_CURSOR_WEAVE_SPRITE_USE_HELD) {
+		switch (r->wc_sprite_kind) {
+		case U_CURSOR_WEAVE_SPRITE_NONE: act = U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING; break;
+		case U_CURSOR_WEAVE_SPRITE_DEFAULT: act = U_CURSOR_WEAVE_SPRITE_USE_DEFAULT; break;
+		case U_CURSOR_WEAVE_SPRITE_OS_CURSOR:
+			// Re-rasterise when the window's DPI changed (cheap when it did not).
+			if (comp_cursor_look_from_os_cursor(&r->wc_look, r->wc_sprite_os_cursor, dpi_scale) &&
+			    r->wc_look.generation != r->wc_look_uploaded &&
+			    svc_weave_cursor_upload_rgba(sys, r, r->wc_look.rgba, r->wc_look.w, r->wc_look.h)) {
+				r->wc_look_uploaded = r->wc_look.generation;
+				r->wc_sprite_hot_x = r->wc_look.hot_u * (float)r->wc_look.w;
+				r->wc_sprite_hot_y = r->wc_look.hot_v * (float)r->wc_look.h;
+			}
+			break;
+		default: break;
+		}
+	}
+
+	if (act == U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING) {
+		out->nothing = true;
+		return true;
+	}
+	if (act == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT || !r->wc_sprite_srv || r->wc_sprite_w == 0 || r->wc_sprite_h == 0) {
+		struct svc_cursor_look_ref look = {};
+		if (!svc_cursor_look_get(sys, dpi_scale, &look)) {
+			return false;
+		}
+		out->srv = look.srv;
+		out->srv_srgb = look.srv_srgb;
+		out->w = look.w;
+		out->h = look.h;
+		out->hot_u = look.hot_u;
+		out->hot_v = look.hot_v;
+		const float size_m = r->wc_sprite_kind == U_CURSOR_WEAVE_SPRITE_DEFAULT ? r->wc_sprite_size_m : 0.0f;
+		out->height_px = size_m > 0.0f && m_per_px > 0.0f ? size_m / m_per_px : look.height_pt * dpi_scale;
+		return out->height_px > 0.0f;
+	}
+	out->srv = r->wc_sprite_srv;
+	out->srv_srgb = r->wc_sprite_srv_srgb;
+	out->w = r->wc_sprite_w;
+	out->h = r->wc_sprite_h;
+	out->hot_u = r->wc_sprite_hot_x / (float)r->wc_sprite_w;
+	out->hot_v = r->wc_sprite_hot_y / (float)r->wc_sprite_h;
+	// One image px is one panel px at the glass (the OS cursor raster is
+	// already at the window's DPI); sizeMeters overrides.
+	out->height_px = r->wc_sprite_size_m > 0.0f && m_per_px > 0.0f ? r->wc_sprite_size_m / m_per_px
+	                                                                : (float)r->wc_sprite_h;
+	return out->height_px > 0.0f;
+}
+
+/*!
+ * Draw the weave-rect cursor into @p rtv (the batch SBS scratch, @p layout
+ * NULL: two tiles of the window side by side; or the v6 crop, @p layout set),
+ * before the weave. Fills c->render.wc_out. @p lift_rect_mask: rect indices
+ * a lifted rect's own (v6) cursor owns.
+ */
+static int
+svc_weave_cursor_draw_impl(struct d3d11_service_system *sys,
+                           struct d3d11_service_compositor *c,
+                           struct xrt_display_processor_d3d11 *dp,
+                           const struct xrt_weave_cursor_request &req,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           const struct xrt_weave_atlas_layout *layout,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           uint32_t lift_rect_mask,
+                           ID3D11RenderTargetView *rtv,
+                           float target_w,
+                           float target_h)
+{
+	struct d3d11_client_render_resources *r = &c->render;
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		rect_count = XRT_WEAVE_CURSOR_MAX_RECTS;
+	}
+
+	// This submit's depths -> the 500 ms memo; every rect with a fresh depth is eligible.
+	struct u_cursor_weave_rect wr[XRT_WEAVE_CURSOR_MAX_RECTS];
+	for (uint32_t i = 0; i < rect_count; i++) {
+		wr[i] = {rects[i].offset.w, rects[i].offset.h, rects[i].extent.w, rects[i].extent.h};
+	}
+	for (uint32_t i = 0; i < req.rect_count && i < XRT_WEAVE_CURSOR_MAX_RECTS; i++) {
+		const struct xrt_weave_cursor_rect &e = req.rects[i];
+		if (e.rect_index < rect_count) {
+			u_cursor_weave_memo_put(&r->wc_memo[e.rect_index], e.rect_index, &wr[e.rect_index],
+			                        e.has_content != 0, e.disparity_px, now_ns);
+		}
+	}
+	uint32_t caller_mask = 0;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		bool has = false;
+		float px = 0.0f;
+		if (u_cursor_weave_memo_get(&r->wc_memo[i], i, &wr[i], now_ns, &has, &px)) {
+			caller_mask |= 1u << i;
+		}
+	}
+
+	// Window DPI and pitch first: the sprite is resolved on every request, so
+	// the reported generation is right even on a frame that draws nothing.
+	HWND hwnd = r->weave_hwnd;
+	if (hwnd == nullptr) {
+		return SVC_WC_NO_WINDOW;
+	}
+	UINT dpi = GetDpiForWindow(hwnd);
+	const float dpi_scale = dpi > 0 ? (float)dpi / 96.0f : 1.0f;
+	const uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	const float disp_h_m = sys->base.info.display_height_m;
+	const float m_per_px = (disp_px_h > 0 && disp_h_m > 0.0f) ? disp_h_m / (float)disp_px_h : 0.0f;
+	struct svc_weave_cursor_sprite spr;
+	const bool have_sprite = svc_weave_cursor_sprite_get(sys, r, req, dpi_scale, m_per_px, &spr);
+	r->wc_out.sprite_generation = r->wc_sprite_gen;
+
+	if (layout == nullptr && rects == nullptr) {
+		return SVC_WC_LEGACY_LAYOUT;
+	}
+	// The workspace controller draws its own cursor; never two.
+	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
+		return SVC_WC_WORKSPACE_CURSOR;
+	}
+	// The live pointer, in the bound window's client pixels - only over that window.
+	POINT pt;
+	if (!GetCursorPos(&pt)) {
+		return SVC_WC_NO_CURSOR_POS;
+	}
+	HWND under = WindowFromPoint(pt);
+	if (under == nullptr || GetAncestor(under, GA_ROOT) != GetAncestor(hwnd, GA_ROOT) || !ScreenToClient(hwnd, &pt)) {
+		return SVC_WC_NOT_OVER_WINDOW;
+	}
+	const float px = (float)pt.x + 0.5f, py = (float)pt.y + 0.5f;
+	const int32_t pick = u_cursor_weave_pick_rect(wr, rect_count, caller_mask | lift_rect_mask, px, py);
+	const enum u_cursor_weave_source src = u_cursor_weave_source_for(pick, caller_mask, lift_rect_mask);
+	if (src == U_CURSOR_WEAVE_SOURCE_LIFT) {
+		return SVC_WC_LIFTED_RECT;
+	}
+	if (src != U_CURSOR_WEAVE_SOURCE_CALLER) {
+		return SVC_WC_NOT_OVER_A_REQUESTED_RECT;
+	}
+	bool has_content = false;
+	float disparity_px = 0.0f;
+	if (!u_cursor_weave_memo_get(&r->wc_memo[pick], (uint32_t)pick, &wr[pick], now_ns, &has_content,
+	                             &disparity_px)) {
+		return SVC_WC_NO_DEPTH;
+	}
+	if (!sys->hardware_display_3d) {
+		return SVC_WC_FLAT_2D; // the views are shown flat: the OS cursor is right
+	}
+
+	// The weave frame: the bound window's centre, display axes, metres.
+	struct xrt_lift_rect_frame frame;
+	lift_rect_frame(sys, &c->base.base, nullptr, win_w, win_h, &frame);
+	if (!frame.valid || !(frame.width_m > 0.0f) || !(frame.height_m > 0.0f) || !(m_per_px > 0.0f)) {
+		return SVC_WC_NO_DISPLAY_INFO;
+	}
+	struct xrt_eye_positions eyes = {};
+	if (!xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &eyes) || !eyes.valid || eyes.count < 2) {
+		return SVC_WC_NO_EYES;
+	}
+	const uint32_t view_count = layout != nullptr ? layout->view_count : 2u;
+	if (view_count < 2 || view_count > SVC_CURSOR_MAX_QUADS || view_count > XRT_MAX_VIEWS) {
+		return SVC_WC_NO_TILES;
+	}
+	float eye_xyz[3 * 8];
+	const uint32_t ec = eyes.count > 8 ? 8 : eyes.count;
+	for (uint32_t i = 0; i < ec; i++) {
+		eye_xyz[3 * i + 0] = eyes.eyes[i].x;
+		eye_xyz[3 * i + 1] = eyes.eyes[i].y;
+		eye_xyz[3 * i + 2] = eyes.eyes[i].z;
+	}
+	float vps[3 * XRT_MAX_VIEWS];
+	if (!u_cursor_weave_viewpoints(eye_xyz, ec, view_count, frame.center, vps)) {
+		return SVC_WC_NO_EYES;
+	}
+	float content_d = 0.0f;
+	if (has_content &&
+	    !u_cursor_weave_px_to_baselines(disparity_px, m_per_px, u_cursor_weave_baseline(vps, view_count), &content_d)) {
+		return SVC_WC_NO_EYES;
+	}
+
+	struct u_cursor_depth_tuning tuning;
+	u_cursor_depth_tuning_defaults(&tuning);
+	struct u_cursor_weave_input in = {};
+	in.viewpoints = vps;
+	in.view_count = view_count;
+	in.u = px / (float)win_w;
+	in.v = py / (float)win_h;
+	in.sx = (in.u - 0.5f) * frame.width_m;
+	in.sy = (0.5f - in.v) * frame.height_m;
+	in.rect_index = (uint32_t)pick;
+	in.rect_w = wr[pick].w;
+	in.rect_h = wr[pick].h;
+	in.has_content = has_content;
+	in.content_d = content_d;
+	in.now_ns = now_ns;
+	struct u_cursor_weave_output out;
+	if (!u_cursor_weave_step(&r->wc_state, &tuning, &in, &out)) {
+		return SVC_WC_PLACEMENT_FAILED;
+	}
+	if (!out.draw) {
+		return SVC_WC_ON_PLANE;
+	}
+	if (!have_sprite) {
+		return SVC_WC_NO_SPRITE;
+	}
+	if (spr.nothing) {
+		return SVC_WC_SPRITE_NONE;
+	}
+	struct u_cursor_draw_request probe = {}; // the verification hook only reads the env
+	if (comp_cursor_draw_debug_refuse(&probe)) {
+		return SVC_WC_FORCED_REFUSE;
+	}
+
+	// Per view: the hotspot on the plane -> window px -> the view's tile.
+	const float spr_h = spr.height_px;
+	const float spr_w = spr_h * (float)spr.w / (float)spr.h;
+	const float hot_x = spr.hot_u * spr_w, hot_y = spr.hot_v * spr_h;
+	const struct xrt_rect &rc = rects[pick];
+	int32_t cx0 = rc.offset.w < 0 ? 0 : rc.offset.w, cy0 = rc.offset.h < 0 ? 0 : rc.offset.h;
+	int32_t cx1 = rc.offset.w + rc.extent.w, cy1 = rc.offset.h + rc.extent.h;
+	cx1 = cx1 > (int32_t)win_w ? (int32_t)win_w : cx1;
+	cy1 = cy1 > (int32_t)win_h ? (int32_t)win_h : cy1;
+	if (cx1 <= cx0 || cy1 <= cy0) {
+		return SVC_WC_NO_TILES;
+	}
+	float hot_px[2 * XRT_MAX_VIEWS];
+	struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+	uint32_t nq = 0;
+	for (uint32_t v = 0; v < view_count; v++) {
+		const float wx = (out.xy[2 * v + 0] / frame.width_m + 0.5f) * (float)win_w;
+		const float wy = (0.5f - out.xy[2 * v + 1] / frame.height_m) * (float)win_h;
+		hot_px[2 * v + 0] = wx;
+		hot_px[2 * v + 1] = wy;
+		float ox, oy, sx, sy;
+		if (layout != nullptr) {
+			ox = (float)((v % layout->tile_columns) * layout->content_view_w);
+			oy = (float)((v / layout->tile_columns) * layout->content_view_h);
+			sx = (float)layout->content_view_w / (float)win_w;
+			sy = (float)layout->content_view_h / (float)win_h;
+		} else {
+			ox = (float)(v * win_w);
+			oy = 0.0f;
+			sx = 1.0f;
+			sy = 1.0f;
+		}
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = ox + (wx - hot_x) * sx;
+		q->y = oy + (wy - hot_y) * sy;
+		q->w = spr_w * sx;
+		q->h = spr_h * sy;
+		q->clip.left = (LONG)floorf(ox + (float)cx0 * sx);
+		q->clip.top = (LONG)floorf(oy + (float)cy0 * sy);
+		q->clip.right = (LONG)ceilf(ox + (float)cx1 * sx);
+		q->clip.bottom = (LONG)ceilf(oy + (float)cy1 * sy);
+	}
+	struct u_cursor_weave_rect clip = {cx0, cy0, cx1 - cx0, cy1 - cy0};
+	struct u_cursor_weave_rect bounds;
+	if (!u_cursor_weave_sprite_bounds(hot_px, view_count, spr_w, spr_h, hot_x, hot_y, &clip, &bounds)) {
+		return SVC_WC_NO_TILES;
+	}
+	if (!svc_cursor_shaders_ensure(sys)) {
+		return SVC_WC_NO_PIPELINE;
+	}
+
+	// B.7: the ghost is the largest neighbouring-view hotspot distance (window =
+	// panel px); the blur cap follows the drawn sprite.
+	float ghost_px = 0.0f;
+	for (uint32_t k = 0; k + 1 < view_count; k++) {
+		const float gx = hot_px[2 * (k + 1)] - hot_px[2 * k], gy = hot_px[2 * (k + 1) + 1] - hot_px[2 * k + 1];
+		const float g = sqrtf(gx * gx + gy * gy);
+		if (std::isfinite(g) && g > ghost_px) {
+			ghost_px = g;
+		}
+	}
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(out.disparity, ghost_px, spr_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = true; // every carrier is premultiplied (comp_cursor_look, the v8 texture contract)
+	style.shared_shaders = true;
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && spr_w > 0.0f && spr_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / spr_w;
+		style.radius_uv[1] = soften.blur_px / spr_h;
+	}
+	// Colour (ADR-044): an _SRGB scratch decodes on write, so sample decoded;
+	// an encoded (UNORM) scratch takes the stored bytes as they are.
+	D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+	rtv->GetDesc(&rd);
+	ID3D11ShaderResourceView *srv = svc_format_is_srgb(rd.Format) ? spr.srv_srgb.get() : spr.srv.get();
+	svc_draw_cursor_quads(sys, rtv, target_w, target_h, srv, spr.w, spr.h, quads, nq, /*tint*/ nullptr,
+	                      /*convert_srgb*/ false, &style);
+
+	if (!out.report_drawn) {
+		return SVC_WC_DRAWN_HANDING_BACK;
+	}
+	r->wc_out.drawn_rect_mask = 1u << (uint32_t)pick;
+	r->wc_out.bounds_x = bounds.x;
+	r->wc_out.bounds_y = bounds.y;
+	r->wc_out.bounds_w = bounds.w;
+	r->wc_out.bounds_h = bounds.h;
+	return SVC_WC_DRAWN;
+}
+
+//! svc_weave_cursor_draw_impl + one WARN whenever the outcome changes (never per frame).
+static void
+svc_weave_cursor_draw(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct xrt_display_processor_d3d11 *dp,
+                      const struct xrt_weave_cursor_request &req,
+                      const struct xrt_rect *rects,
+                      uint32_t rect_count,
+                      const struct xrt_weave_atlas_layout *layout,
+                      uint32_t win_w,
+                      uint32_t win_h,
+                      uint32_t lift_rect_mask,
+                      ID3D11RenderTargetView *rtv,
+                      float target_w,
+                      float target_h)
+{
+	const int why = rtv == nullptr ? (int)SVC_WC_NO_TILES
+	                               : svc_weave_cursor_draw_impl(sys, c, dp, req, rects, rect_count, layout, win_w,
+	                                                            win_h, lift_rect_mask, rtv, target_w, target_h);
+	if (why != c->render.wc_reason) {
+		c->render.wc_reason = why;
+		U_LOG_W("[weave cursor] '%s': %s (sprite generation %llu, ADR-046 Amendment 4)", c->slot_app_name,
+		        svc_weave_cursor_reason_str(why), (unsigned long long)c->render.wc_sprite_gen);
+	}
+}
+
+//! The rect indices whose lifted rect asked for Amendment 1's own cursor.
+static uint32_t
+svc_weave_cursor_lift_mask(const struct xrt_lift_weave_rect *lift_rects, uint32_t lift_count)
+{
+	uint32_t m = 0;
+	for (uint32_t k = 0; k < lift_count; k++) {
+		if (lift_rects[k].depth_cursor && lift_rects[k].rect_index < XRT_WEAVE_CURSOR_MAX_RECTS) {
+			m |= 1u << lift_rects[k].rect_index;
+		}
+	}
+	return m;
+}
+
 /*!
  * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
  * frame. Snapshot it, then blit the stream's latest pair into the left / right
@@ -28691,6 +29406,54 @@ comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc)
 {
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	return c != nullptr ? c->render.lift_cursor_mask : 0u;
+}
+
+void
+comp_d3d11_service_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy || req == nullptr ||
+	    req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->render.wc_req_next = *req;
+	c->render.wc_req_next_valid = true;
+}
+
+void
+comp_d3d11_service_weave_set_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                   xrt_graphics_buffer_handle_t handle,
+                                                   bool is_dxgi,
+                                                   const struct xrt_weave_cursor_sprite_texture *info)
+{
+	HANDLE h = (HANDLE)handle;
+	if (xc == nullptr || xc->destroy != compositor_destroy || info == nullptr) {
+		weave_close_cached(h, is_dxgi);
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// Latest wins: an unconsumed older carrier is dropped (imported by the
+	// next submit whose request names this generation).
+	if (c->render.wc_tex_handle != nullptr) {
+		weave_close_cached(c->render.wc_tex_handle, c->render.wc_tex_is_dxgi);
+	}
+	c->render.wc_tex_handle = h;
+	c->render.wc_tex_is_dxgi = is_dxgi;
+	c->render.wc_tex_info = *info;
+}
+
+void
+comp_d3d11_service_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	if (out_state == nullptr) {
+		return;
+	}
+	*out_state = {};
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	*out_state = c->render.wc_out;
 }
 
 void
@@ -29620,6 +30383,30 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	c->render.lift_rect_count = 0;
 	c->render.lift_cursor_mask = 0;
 	struct d3d11_lift *lift = lift_count > 0 ? sys->lift : nullptr;
+
+	// XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): this submit's weave-rect
+	// cursor request, consumed NOW like the lift rects (valid for one submit).
+	// No request: no cursor work, and the held sprite goes after 1 s idle.
+	const bool wc_have = c->render.wc_req_next_valid;
+	struct xrt_weave_cursor_request wc_req = {};
+	c->render.wc_req_next_valid = false;
+	c->render.wc_out = {};
+	{
+		const uint64_t wc_now_ns = os_monotonic_get_ns();
+		if (wc_have) {
+			wc_req = c->render.wc_req_next;
+			c->render.wc_last_req_ns = wc_now_ns;
+		} else if ((c->render.wc_sprite_gen != 0 || c->render.wc_sprite_tex || c->render.wc_tex_handle != nullptr) &&
+		           u_cursor_weave_sprite_idle(c->render.wc_last_req_ns, wc_now_ns)) {
+			svc_weave_cursor_release_sprite(&c->render);
+			if (c->render.wc_tex_handle != nullptr) {
+				weave_close_cached(c->render.wc_tex_handle, c->render.wc_tex_is_dxgi);
+				c->render.wc_tex_handle = nullptr;
+			}
+			c->render.wc_state = {};
+			U_LOG_W("[weave cursor] '%s': no request for 1 s - sprite released", c->slot_app_name);
+		}
+	}
 	if (lift == nullptr) {
 		lift_count = 0;
 	}
@@ -30239,7 +31026,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// XR_DXR_lift (ADR-042): a frame with lift-flagged rects writes lifted
 		// views INTO the atlas, which must never be the caller's own texture —
 		// so it always takes the crop.
-		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height) && lift_count == 0;
+		//
+		// XR_DXR_cursor_depth v8: a cursor frame never zero-copies either (the
+		// cursor is drawn into the crop, never into the caller's texture).
+		const bool zero_copy =
+		    (packed_w == idesc.Width && packed_h == idesc.Height) && lift_count == 0 && !wc_have;
 		timing_path = zero_copy ? WEAVE_PATH_V6_ZERO_COPY : WEAVE_PATH_V6_CROP;
 		if (!zero_copy) {
 			if (!c->render.weave_crop_tex || c->render.weave_crop_w != packed_w ||
@@ -30305,6 +31096,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			if (lift_count > 0 && c->render.weave_crop_rtv) {
 				lift_weave_rects_nview(sys, c, lift, lift_owner, lift_rects, lift_count, rects, rect_count,
 				                       layout, win_w, win_h);
+			}
+			// XR_DXR_cursor_depth v8: the weave-rect cursor, into every tile of the crop.
+			if (wc_have) {
+				svc_weave_cursor_draw(sys, c, dp, wc_req, rects, rect_count, layout, win_w, win_h,
+				                      svc_weave_cursor_lift_mask(lift_rects, lift_count),
+				                      c->render.weave_crop_rtv.get(), (float)packed_w, (float)packed_h);
 			}
 		}
 
@@ -30385,6 +31182,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// page scrolls. Do not "optimise" that clear away for this branch.
 		uint32_t view_w = idesc.Width / 2;
 		uint32_t view_h = idesc.Height;
+		if (wc_have) {
+			// Resolves the sprite (so the state's generation is right) and logs
+			// that this layout has no cursor; draws nothing.
+			svc_weave_cursor_draw(sys, c, dp, wc_req, nullptr, 0, nullptr, win_w, win_h, 0, rtvs[0],
+			                      (float)win_w, (float)win_h);
+		}
 
 		// #1058 one-shot per client: this is the DEGRADED path — one weave()
 		// per element per frame (the SR predictor wants one per frame) and a
@@ -30527,6 +31330,13 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			                      src_th, (float)win_w + rx, ry, rw, rh, /*is_srgb*/ false,
 			                      /*blend*/ nullptr, c->render.weave_sbs_rtv.get(),
 			                      (float)(win_w * 2), (float)win_h);
+		}
+		// XR_DXR_cursor_depth v8: the weave-rect cursor, into both tiles, on top
+		// of every rect (it is clipped to the hovered one).
+		if (wc_have) {
+			svc_weave_cursor_draw(sys, c, dp, wc_req, rects, rect_count, nullptr, win_w, win_h,
+			                      svc_weave_cursor_lift_mask(lift_rects, lift_count),
+			                      c->render.weave_sbs_rtv.get(), (float)(win_w * 2), (float)win_h);
 		}
 
 		if (acquired && in_km) {
