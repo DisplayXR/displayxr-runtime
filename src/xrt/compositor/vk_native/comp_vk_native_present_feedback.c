@@ -75,6 +75,9 @@ struct comp_vk_native_present_feedback
 	int64_t clock_id;
 	struct pf_pending pending[PF_MAX_PENDING];
 	uint64_t pending_full;
+	//! Newest request tag answered (presented OR discarded) — what feedback
+	//! pacing waits on. Feedback is answered in commit order.
+	uint64_t last_answered_tag;
 #endif
 
 	xcb_connection_t *xcb;
@@ -189,6 +192,9 @@ pf_wl_fb_presented(void *data,
 	ev.sample.hw_clock = (flags & WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK) != 0;
 	ev.sample.discarded = (t == 0);
 	pf_push(pf, &ev);
+	if (pp->tag > pf->last_answered_tag) {
+		pf->last_answered_tag = pp->tag;
+	}
 
 	// presented is a destructor event: the server already dropped it.
 	pf_wl_pending_release(pp);
@@ -204,6 +210,9 @@ pf_wl_fb_discarded(void *data, struct wp_presentation_feedback *fb)
 	ev.tag = pp->tag;
 	ev.sample.discarded = true;
 	pf_push(pp->pf, &ev);
+	if (pp->tag > pp->pf->last_answered_tag) {
+		pp->pf->last_answered_tag = pp->tag;
+	}
 	pf_wl_pending_release(pp);
 }
 
@@ -252,7 +261,7 @@ static const struct wl_registry_listener pf_wl_registry_listener = {
  * and the one the Vulkan WSI itself uses on the same connection.
  */
 static void
-pf_wl_pump(struct comp_vk_native_present_feedback *pf)
+pf_wl_pump_timeout(struct comp_vk_native_present_feedback *pf, uint64_t timeout_ns)
 {
 	struct wl_display *d = pf->display;
 	if (pf->dead) {
@@ -266,7 +275,14 @@ pf_wl_pump(struct comp_vk_native_present_feedback *pf)
 	}
 	(void)wl_display_flush(d); // EAGAIN is fine: the WSI flushes every commit
 	struct pollfd p = {.fd = wl_display_get_fd(d), .events = POLLIN, .revents = 0};
-	if (poll(&p, 1, 0) > 0 && (p.revents & POLLIN) != 0) {
+	// timeout 0: the non-blocking pump. Bounded otherwise (feedback pacing).
+	// While we sit in ppoll with a read prepared, another thread's
+	// wl_display_read_events waits for us rather than consuming our events —
+	// and it only reaches read_events once the fd is readable, which wakes us
+	// at the same moment.
+	const struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1000000000ULL),
+	                            .tv_nsec = (long)(timeout_ns % 1000000000ULL)};
+	if (ppoll(&p, 1, &ts, NULL) > 0 && (p.revents & POLLIN) != 0) {
 		if (wl_display_read_events(d) < 0) {
 			pf->dead = true;
 			return;
@@ -277,6 +293,12 @@ pf_wl_pump(struct comp_vk_native_present_feedback *pf)
 	if (wl_display_dispatch_queue_pending(d, pf->queue) < 0) {
 		pf->dead = true;
 	}
+}
+
+static void
+pf_wl_pump(struct comp_vk_native_present_feedback *pf)
+{
+	pf_wl_pump_timeout(pf, 0);
 }
 
 #endif // DXR_HAVE_WP_PRESENTATION
@@ -597,6 +619,48 @@ comp_vk_native_present_feedback_poll(struct comp_vk_native_present_feedback *pf,
 	}
 	pthread_mutex_unlock(&pf->mutex);
 	return n;
+}
+
+bool
+comp_vk_native_present_feedback_can_pace(const struct comp_vk_native_present_feedback *pf)
+{
+#ifdef DXR_HAVE_WP_PRESENTATION
+	return pf != NULL && pf->kind == PF_KIND_WAYLAND && !pf->dead;
+#else
+	(void)pf;
+	return false;
+#endif
+}
+
+bool
+comp_vk_native_present_feedback_wait(struct comp_vk_native_present_feedback *pf, uint64_t tag, uint64_t timeout_ns)
+{
+#ifdef DXR_HAVE_WP_PRESENTATION
+	if (!comp_vk_native_present_feedback_can_pace(pf) || tag == 0) {
+		return false;
+	}
+	pthread_mutex_lock(&pf->mutex);
+	const uint64_t deadline = pf_clock_ns(CLOCK_MONOTONIC) + timeout_ns;
+	bool ok = false;
+	for (;;) {
+		if (pf->last_answered_tag >= tag) {
+			ok = true;
+			break;
+		}
+		const uint64_t now = pf_clock_ns(CLOCK_MONOTONIC);
+		if (pf->dead || now == 0 || now >= deadline) {
+			break;
+		}
+		pf_wl_pump_timeout(pf, deadline - now);
+	}
+	pthread_mutex_unlock(&pf->mutex);
+	return ok;
+#else
+	(void)pf;
+	(void)tag;
+	(void)timeout_ns;
+	return false;
+#endif
 }
 
 void
