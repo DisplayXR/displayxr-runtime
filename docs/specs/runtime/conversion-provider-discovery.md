@@ -563,6 +563,85 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 - **URL.** `<blobBaseUrl>/<sha256>.<format>`.
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
+### 5.4 The store as built (P4, #2108)
+
+`src/xrt/conversion/conv_model_store.{c,h}` (target `displayxr::conversion_store`) is the one
+implementation; both hosts, the CLI and the installer pre-fetch run it.
+
+**Root.** `HKLM\Software\DisplayXR\Models\Path` → `HKLM\Software\DisplayXR\Browser\ModelsPath`
+→ `%ProgramData%\DisplayXR\Models` (64-bit registry view); POSIX `$XDG_DATA_HOME/displayxr/models`
+→ `/var/lib/displayxr/models`. `DXR_CONV_MODELS_ROOT`, in the environment of the process that
+owns the store, overrides all of them (tests and dev boxes only; the service reads its own
+environment, not a client's). Layout:
+
+```
+<root>/displayxr-runtime.owner        the runtime claims the root (installer, or the store when it creates it)
+<root>/packs/<pack>.models.json       a pack this store provisioned: an absent default set is then "evicted"
+<root>/blobs/<sha256>                 bytes; <sha256>.ok stamp written last; <sha256>.<nonce>.part in flight
+```
+
+**Packs.** Each registered provider's `Packs` (registry `REG_MULTI_SZ`) / `packs[]` (manifest),
+a path relative to the provider binary's directory unless absolute. A relative `blobBaseUrl`
+resolves against the manifest's directory (`file://`); `https://` downloads use WinHTTP on
+Windows (redirects followed); POSIX has no network downloader yet (P5), so a missing blob there
+is `FAILED(NETWORK)` unless its pack is served from `file://`. The host ops carry no provider
+context, so a host's store serves the union of the packs it was configured with: the service
+every registered provider's, a satellite its own provider's.
+
+**`model_resolve(ref)`** never hashes and never touches the network (a stat of the blob and its
+stamp). `ref` is `<pack>/<model>[/<variant>]` (first variant when omitted) or a bare sha256.
+`xrt_conv_model_location::state`:
+
+| state | meaning | provider does |
+|---|---|---|
+| `READY` | every file present, stamped, and hashed **by this process** (cache key: file id + mtime + size); `path` = the variant's `model` file | load `path` |
+| `INSTALLED` | on disk and stamped, not yet verified by this process | `model_request` (warm-up verifies it) |
+| `WARMING` | the store's worker is hashing it | wait |
+| `DOWNLOADING` | in flight; `progress` = bytes / total over the model's files | report `DOWNLOADING` with that progress |
+| `ABSENT` | not in the store; `failure_reason = XRT_CONV_FAIL_POLICY` when a request was refused by policy | report `ABSENT` with that reason (the core shows `ABSENT(policy)`) |
+| `FAILED` | `NETWORK` (retryable: a new request retries) or `MODEL` (bytes failed size / hash) | report `FAILED(reason)` |
+
+**`model_request(ref)`** queues verification or download of every file that is not `READY` on
+the store's one worker thread; concurrent requests for one sha256 share one job. It returns
+false for an unknown ref or a policy refusal.
+
+**Policy.** `AllowDownloads` (DWORD under `ConversionProviders`, HKCU over HKLM unless
+`Policy\Lock`; default 1; `DXR_CONV_ALLOW_DOWNLOADS=0` in the hosting process forces it off): a
+missing blob with downloads off is `ABSENT(POLICY)`. A model whose `license.commercial` AND is
+false is fetched **and handed out** only with `AllowResearchOnly`; withdrawing the opt-in makes a
+present blob `ABSENT(POLICY)` again. `conv models fetch --installer` never fetches one, whatever
+the opt-in says.
+
+**Tamper rejection.** A stamped blob of the right size passes the browser's read check; the store
+does not trust it. The first `model_request` per process re-hashes it; a mismatch deletes the blob
+and its stamp and fetches it again (`FAILED(MODEL)` when downloads are off). A blob replaced after
+this process verified it changes its cache key and drops back to `INSTALLED`. Downloaded bytes are
+hashed while they stream; a part that fails size or hash is deleted and never renamed.
+
+**ACL (Windows).** A root the store (or `conv models init`) creates gets a protected DACL:
+SYSTEM and Administrators full; `BUILTIN\Users` `(OI)(CI)` read + execute and `(CI)` create
+files / create folders (the service and the browser run as the logged-in user); `CREATOR OWNER`
+full on what a writer creates (so a writer can rename and clean up its own parts); `ALL
+APPLICATION PACKAGES` `(OI)(CI)` read (an AppContainer reader). Users therefore cannot overwrite,
+append to or delete a blob another writer made. An existing root's ACL is left alone.
+`tests_conv_store` checks the effective rights of each SID.
+
+**Readiness.** A provider that learns at warm-up that its model is missing reports `DOWNLOADING`;
+the core moves the row `WARMING → DOWNLOADING` and on to `WARMING` / `READY` as the provider
+reports. A provider `ABSENT` with `XRT_CONV_FAIL_POLICY` becomes `ABSENT(policy)` (a registry or
+policy change lifts it). Progress bumps the status generation at most at 2 Hz and only when it
+moved 5 % (or reached 100 %), so `status --watch` and the dashboard stay quiet during a download.
+
+**Snapshot.** The CLI adds `conv_model_store` (`root`, `source`) and `conv_packs[]` to every
+snapshot it prints, read from disk (no IPC): `display-dashboard.md` §3.3.
+
+**CLI.** `conv models list [--json]` (per pack and model: on disk, stamped, in flight),
+`verify` (re-hash every referenced blob; a tampered one is deleted; exit 1 when any is),
+`prune` (delete blobs no registered pack references), `fetch <pack-url|path> [--prefetch]
+[--model <name>] [--installer]` (the write protocol on the calling thread; `--installer` =
+nonce `installer`, stamped blobs skipped without hashing, non-commercial models never),
+`init [--root <dir>]` (create the root with its ACL and marker).
+
 ---
 
 ## 6. Reference provider and stage
@@ -622,7 +701,7 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 | `conv probe <task> <file\|dir>` | APP connection, stream lane | today's `lift probe` |
 | `conv run <task> <in> <out> [--provider]` | APP connection, job lane | file → file; the CLI decodes and encodes files itself (the service never does); MCP `convert_file` backend |
 | `conv jobs` / `conv cancel <id>` | DIAG | |
-| `conv models list\|verify\|prune` | local + registry | model store |
+| `conv models list\|verify\|prune\|fetch\|init` | local + registry | model store (§5.4) |
 
 The CLI never loads a second model instance. When a service is reachable it asks it; otherwise it loads providers headless and calls `describe_cap` / `get_state` only, **never `warm`** (today's `probe_lift_caps_d3d11`, `cli_query.c:270-347`, which instantiates the module on WARP and waits up to 8 s, is retired). MCP `convert_file` and `get_conversion_status` are CLI-backed (ADR-051 D4).
 

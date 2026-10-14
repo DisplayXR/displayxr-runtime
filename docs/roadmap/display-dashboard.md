@@ -191,6 +191,36 @@ provider-table change), and the snapshot gains two arrays, appended after `warni
   `{schema, source, generation, providers[], tasks[], warnings[] (CONV_* only), policy}`
   (MCP `get_conversion_status` reads it).
 
+### 3.3 Model packs (ADR-053 P4, #2108)
+
+The CLI appends the runtime-owned model store to every snapshot it prints (`status`,
+`status --watch`, `conv list|status --json`), read **from disk** in the CLI's own process: the
+store's state is what is on disk (blobs, stamps, `.part` files), so no DIAG call is needed and a
+download in another process (the service, a satellite host, an installer) shows up as it
+happens. Keys only added; `schema` stays 1.
+
+```json
+"conv_model_store": { "root": "C:\\ProgramData\\DisplayXR\\Models", "source": "HKLM Models\\Path" },
+"conv_packs": [
+  { "pack": "sim", "provider": "sim-conversion", "state": "downloading", "models": 1, "models_installed": 0,
+    "research_models": 0, "bytes_total": 1024, "bytes_installed": 0, "download_done": 512,
+    "download_total": 1024, "progress": 0.5 }
+]
+```
+
+| `state` | when | dashboard chip |
+|---|---|---|
+| `installed` | every model of the pack's default set (its `prefetch` models; all of them when none is flagged) is stamped at the right size | green "installed" |
+| `downloading` | a blob of the pack is in flight (a `.part` exists); `progress` = `download_done / download_total` | blue "downloading N%" |
+| `evicted` | the store provisioned the pack (`packs/<pack>.models.json`) but default-set blobs are gone, e.g. wiped by an older browser uninstaller; the next use downloads them again | amber "evicted (re-downloads on use)" |
+| `partial` | some blobs present | blue "partly installed" |
+| `absent` | none present | plain "not installed (downloads on use)" |
+
+`research_models` counts models whose licence AND is non-commercial (used only with
+`AllowResearchOnly`). The packs are the registered providers' (`Packs` / `packs[]`), at most 8.
+The dashboard's Components page shows them as the **Conversion models** section, one row per
+pack; a CLI that predates the store sends neither key and the section is omitted.
+
 ## 4. Warnings as data
 
 Each warning is `{code, level, text}` with `level ∈ info | warn | critical`. Only `warn`
