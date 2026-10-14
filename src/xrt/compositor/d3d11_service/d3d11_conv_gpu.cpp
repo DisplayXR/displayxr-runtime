@@ -1917,7 +1917,13 @@ core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
 	}
 	memcpy(out->rect_center, r.rect_center, sizeof(out->rect_center));
 	memcpy(out->rect_size, r.rect_size, sizeof(out->rect_size));
-	if ((r.written & XRT_CONV_OUT_DEPTH) != 0 && glue_find(l, r.depth.import_key, &dg) && dg.km != nullptr) {
+	// The pin is the service's own consumer (the DP weave + the lifted-rect
+	// depth cursor, ADR-046 A1): like the pre-core path, it sees the module's
+	// depth whenever one was produced, including the observer-only depth
+	// (#2003) the app never asked for. The app-facing export
+	// (d3d11_lift_glue_publish) still follows written.
+	if ((r.provider_written & XRT_CONV_OUT_DEPTH) != 0 && glue_find(l, r.depth.import_key, &dg) &&
+	    dg.km != nullptr) {
 		const uint32_t k = r.depth_info.kind;
 		out->depth_tex = dg.tex;
 		out->depth_km = dg.km;
