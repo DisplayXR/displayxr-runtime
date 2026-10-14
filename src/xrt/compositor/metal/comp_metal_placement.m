@@ -33,7 +33,6 @@
 #include "comp_metal_placement.h"
 
 #include "util/u_logging.h"
-#include "util/u_x11_scale.h" // u_x11_reachable_round + lattice ring order (pure math)
 
 #include <math.h>
 #include <pthread.h>
@@ -144,7 +143,6 @@ screen_for_top_left(NSRect content, NSWindow *win)
 	bool warned_app_move;
 	bool warned_fallback;
 	bool warned_mismatch;
-	bool warned_lattice;
 	uint64_t moves_applied;
 	uint64_t mismatches;
 	//! Post-present verification (main-thread presents that moved): the
@@ -317,14 +315,6 @@ content_px(NSRect content, CGFloat scale, int32_t *out_x, int32_t *out_y)
 	*out_x = (int32_t)llround(content.origin.x * scale);
 	*out_y = (int32_t)llround((main_screen_height() - NSMaxY(content)) * scale);
 }
-
-//! On the lattice of positions reachable from @p anchor under @p q?
-static bool
-on_lattice(int32_t anchor, int32_t v, uint32_t q)
-{
-	return q <= 1 || ((v - anchor) % (int32_t)q) == 0;
-}
-
 
 @implementation DXRMetalPlacement
 
@@ -897,88 +887,6 @@ comp_metal_placement_destroy(struct comp_metal_placement **p_ptr)
 	// last reference. The mutex goes with the object (never contended now).
 }
 
-/*!
- * Snap @p target (top-down backing px) relative to @p anchor, landing on a
- * position the window can actually reach (anchor + q·Z², q = the backing
- * scale): the twin of vk_snap_search_lattice. Pure DP queries.
- */
-static bool
-snap_reachable(DXRMetalPlacement *pl,
-               double probe_x,
-               double probe_y,
-               int32_t ax,
-               int32_t ay,
-               int32_t tx,
-               int32_t ty,
-               uint32_t q,
-               int32_t *out_x,
-               int32_t *out_y)
-{
-	*out_x = tx;
-	*out_y = ty;
-	if (pl->snap == NULL) {
-		return false;
-	}
-	int32_t sx = tx, sy = ty;
-	if (!pl->snap(pl->snap_userdata, probe_x, probe_y, ax, ay, tx, ty, &sx, &sy)) {
-		return false; // no lattice / declined (no viewer yet): the target stands
-	}
-	if (on_lattice(ax, sx, q) && on_lattice(ay, sy, q)) {
-		*out_x = sx;
-		*out_y = sy;
-		return true;
-	}
-	const int32_t bx = u_x11_reachable_round(ax, sx, q);
-	const int32_t by = u_x11_reachable_round(ay, sy, q);
-	const uint32_t n = u_x11_lattice_candidate_count(3);
-	// Ring order finds the nearest RING with a phase-correct reachable point;
-	// within that ring take the point nearest the DP's own answer (Euclidean),
-	// so an axis the lattice does not constrain (y, for a vertical
-	// lenticular) is not nudged by the ring's walk order.
-	bool found = false;
-	int32_t best_x = 0, best_y = 0, found_ring = -1;
-	int64_t best_d2 = 0;
-	for (uint32_t k = 0; k < n; k++) {
-		int32_t i = 0, j = 0;
-		u_x11_lattice_candidate(k, &i, &j);
-		const int32_t ring = abs(i) > abs(j) ? abs(i) : abs(j);
-		if (found && ring > found_ring) {
-			break;
-		}
-		const int32_t px = bx + i * (int32_t)q;
-		const int32_t py = by + j * (int32_t)q;
-		int32_t rx = px, ry = py;
-		if (!pl->snap(pl->snap_userdata, probe_x, probe_y, ax, ay, px, py, &rx, &ry)) {
-			continue;
-		}
-		if (on_lattice(ax, rx, q) && on_lattice(ay, ry, q)) {
-			const int64_t ddx = (int64_t)rx - sx, ddy = (int64_t)ry - sy;
-			const int64_t d2 = ddx * ddx + ddy * ddy;
-			if (!found || d2 < best_d2) {
-				found = true;
-				found_ring = ring;
-				best_d2 = d2;
-				best_x = rx;
-				best_y = ry;
-			}
-		}
-	}
-	if (found) {
-		*out_x = best_x;
-		*out_y = best_y;
-		return true;
-	}
-	if (!pl->warned_lattice) {
-		pl->warned_lattice = true;
-		U_LOG_W("macOS placement: no phase-correct position reachable within %u px (backing scale %u) — "
-		        "landing on the nearest reachable pixel",
-		        3u * q, q);
-	}
-	*out_x = bx;
-	*out_y = by;
-	return true;
-}
-
 //! Fill the present-origin fields of @p f from a content rect (bottom-up pts).
 static void
 fill_origin(struct comp_metal_placement_frame *f, NSRect content, NSWindow *win)
@@ -1141,9 +1049,15 @@ comp_metal_placement_begin_present(struct comp_metal_placement *p,
 			const double probe_y = main_h - NSMaxY(target);
 			int32_t tx = 0, ty = 0;
 			content_px(target, scale, &tx, &ty);
-			const uint32_t q = (uint32_t)lround(scale) > 0 ? (uint32_t)lround(scale) : 1u;
+			// The DP's answer as-is (half points at 2x): forcing it onto whole
+			// points (the X11 reachable-lattice search) walked y by 2-5 px per
+			// step and the window bobbed on a level drag. AppKit may round the
+			// applied origin by a pixel; the present origin reads it back.
 			int32_t sx = tx, sy = ty;
-			(void)snap_reachable(pl, probe_x, probe_y, ax, ay, tx, ty, q, &sx, &sy);
+			if (pl->snap == NULL || !pl->snap(pl->snap_userdata, probe_x, probe_y, ax, ay, tx, ty, &sx, &sy)) {
+				sx = tx; // no lattice / declined (no viewer yet): the target stands
+				sy = ty;
+			}
 			const CGFloat nx = (CGFloat)sx / scale;
 			const CGFloat ntop = main_h - (CGFloat)sy / scale; // bottom-up top edge
 			if (keep_far) {
