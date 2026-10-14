@@ -805,6 +805,104 @@ TEST_CASE("stream: provisional outputs while WARMING, real after READY", "[conv_
 	conv_fake_fini(&f);
 }
 
+TEST_CASE("stream: observer-only depth reaches the service consumer, never the app (#2003, ADR-046 A1)", "[conv_lanes]")
+{
+	// A VIEWS_MONO stream whose app asked for VIEWS only, on a provider that
+	// can also produce depth, with runtime auto-convergence on: the provider
+	// is asked for the depth (observer-only), S8 never publishes it to the
+	// app, and the service's own consumer (the lifted-rect depth cursor)
+	// reads it through provider_written. The pre-core path pinned the
+	// module's depth whenever one was produced; the core must too.
+	struct Obs
+	{
+		int seen = 0;
+	};
+	static const conv_observer_ops ops = {
+	    [](void *) {},
+	    [](void *ctx, const xrt_conv_depth_info *, const conv_depth_samples *, const float *, uint64_t) {
+		    static_cast<Obs *>(ctx)->seen++;
+	    },
+	    nullptr,
+	    nullptr,
+	};
+	static Obs obs;
+	obs.seen = 0;
+
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *c = conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM,
+	                                     XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH, 0);
+	c->warm_ms = 0;
+	c->convert_ms = 1;
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = cpu_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.create_convergence_observer = [](void *ud, conv_observer *out) {
+			out->ops = &ops;
+			out->ctx = ud;
+			return true;
+		};
+		cfg.observer_ud = &obs;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		conv_core *core = nullptr;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		conv_provider_desc pd{};
+		pd.id = f.id;
+		pd.probe_order = 100;
+		pd.enabled = true;
+		pd.iface = &f.iface;
+		pd.inst = conv_fake_inst(&f);
+		REQUIRE(conv_core_add_provider(core, &pd) >= 0);
+
+		auto d = stream_desc(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_OUT_VIEWS, 2);
+		conv_stream_options opts{};
+		opts.auto_convergence = true;
+		opts.eyes_dp = -1;
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core, 1, &d, &opts, &cr) == XRT_SUCCESS);
+		CHECK(cr.outputs == XRT_CONV_OUT_VIEWS); // the app never gets the depth
+		REQUIRE(wait_until(
+		    [&] { return conv_core_task_state(core, XRT_CONV_TASK_VIEWS_MONO) == XRT_CONV_STATE_READY; },
+		    3000));
+		REQUIRE(submit(core, cr.stream_id));
+		conv_result r{};
+		REQUIRE(wait_until(
+		    [&] { return conv_core_stream_acquire(core, cr.stream_id, false, &r) == XRT_SUCCESS; }, 3000));
+		CHECK(r.written == XRT_CONV_OUT_VIEWS);                 // S8 mask: app-facing
+		CHECK((r.provider_written & XRT_CONV_OUT_VIEWS) != 0u); // a superset of written
+		CHECK((r.provider_written & XRT_CONV_OUT_DEPTH) != 0u); // the service-side depth
+		CHECK(r.depth.memory_kind == XRT_CONV_MEM_CPU);         // its target is live
+		CHECK(r.depth_info.same_inference == 1u);
+		CHECK(r.depth_info.range_min > 0.0f); // S6 ran on it
+		CHECK(obs.seen >= 1);                 // and so did the observer
+		conv_core_stream_release(core, cr.stream_id, r.ring_slot);
+
+		// Without observers nothing asks the provider for the depth: the
+		// service consumer sees none either (parity with the pre-core path).
+		conv_stream_options plain{};
+		plain.eyes_dp = -1;
+		xrt_conv_wire_stream_created cr2{};
+		REQUIRE(conv_core_stream_create(core, 1, &d, &plain, &cr2) == XRT_SUCCESS);
+		REQUIRE(submit(core, cr2.stream_id));
+		conv_result r2{};
+		REQUIRE(wait_until(
+		    [&] { return conv_core_stream_acquire(core, cr2.stream_id, false, &r2) == XRT_SUCCESS; }, 3000));
+		CHECK(r2.written == XRT_CONV_OUT_VIEWS);
+		CHECK((r2.provider_written & XRT_CONV_OUT_DEPTH) == 0u);
+		conv_core_stream_release(core, cr2.stream_id, r2.ring_slot);
+
+		REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
+		REQUIRE(conv_core_stream_destroy(core, cr2.stream_id) == XRT_SUCCESS);
+		conv_core_destroy(&core);
+	}
+	CHECK(g_live_images.load() == 0);
+	conv_fake_fini(&f);
+}
+
 TEST_CASE("stream: rebinding on a terminal FAILED is signalled by discontinuity", "[conv_lanes]")
 {
 	conv_fake_provider fa, fb;

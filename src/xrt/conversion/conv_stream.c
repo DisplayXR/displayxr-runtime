@@ -683,6 +683,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	if (out_slot >= 0) {
 		if (ok) {
 			o->written = pf->result.written;
+			o->provider_written = pf->provider_out.written;
 			o->views_info = pf->result.views_info;
 			o->depth_info = pf->result.depth_info;
 			memcpy(o->active, s.frame.active, sizeof(o->active));
@@ -1293,6 +1294,7 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	out->latency_ns = meta.done_ns > meta.submit_ns ? meta.done_ns - meta.submit_ns : 0;
 	out->ring_slot = (uint32_t)slot;
 	out->written = o->written;
+	out->provider_written = o->provider_written | o->written;
 	out->views = o->targets[CONV_RING_VIEWS];
 	out->depth = o->targets[CONV_RING_DEPTH];
 	out->confidence = o->targets[CONV_RING_CONFIDENCE];

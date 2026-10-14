@@ -51,7 +51,8 @@ struct conv_ring_slot
 	uint64_t alloc_gen;  //!< bumps on every (re)allocation
 
 	/* Published result. */
-	uint32_t written;
+	uint32_t written;          //!< XRT_CONV_OUT_* published to the app (S8 mask)
+	uint32_t provider_written; //!< what the provider wrote this frame, before the mask
 	struct xrt_conv_views_info views_info;
 	struct xrt_conv_depth_info depth_info;
 	float active[4];
