@@ -266,6 +266,7 @@ struct xrt_conv_image
 #define XRT_CONV_FAIL_MODEL 7u     //!< missing / bad hash / unsupported
 #define XRT_CONV_FAIL_DEVICE_LOST 8u
 #define XRT_CONV_FAIL_CRASH_LOOP 9u //!< satellite only: the crash-loop cutoff; a single crash is WARMING(restarting)
+#define XRT_CONV_FAIL_POLICY 10u    //!< ABSENT: a policy forbids fetching / loading the model (downloads off, research-only)
 /*! @} */
 
 /*! Runtime pre-sizes + zero-fills; provider answers from memory. */
@@ -735,9 +736,10 @@ struct xrt_conv_adapter_hint
 struct xrt_conv_model_location
 {
 	uint32_t struct_size;
-	uint32_t state; //!< READY / DOWNLOADING / ABSENT / FAILED
-	float progress;
-	uint32_t failure_reason;
+	uint32_t state;          //!< READY / INSTALLED (on disk, not yet verified: request it) / WARMING (verifying) /
+	                         //!< DOWNLOADING / ABSENT / FAILED
+	float progress;          //!< DOWNLOADING: bytes / total over the model's files; < 0 = n/a
+	uint32_t failure_reason; //!< XRT_CONV_FAIL_*: POLICY (ABSENT), NETWORK / MODEL (FAILED)
 	char path[512]; //!< UTF-8 absolute path of the verified blob when READY
 };
 

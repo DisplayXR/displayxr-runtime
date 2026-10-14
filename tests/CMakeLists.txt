@@ -35,6 +35,7 @@ set(tests
     tests_conv_select
     tests_conv_readiness
     tests_conv_registry
+    tests_conv_store
     tests_conv_lanes
     tests_conv_supervisor
     tests_conv_shm_ring
@@ -625,6 +626,9 @@ if(TARGET tests_conv_snapshot)
 		tests_conv_snapshot PRIVATE target_lists displayxr::conversion_core xrt-interfaces aux_util
 					    xrt-external-cjson
 		)
+	# ADR-053 P4 (#2108): the model-store pack rows (std::filesystem temp store).
+	target_link_libraries(tests_conv_snapshot PRIVATE displayxr::conversion_store)
+	set_target_properties(tests_conv_snapshot PROPERTIES CXX_STANDARD 17)
 	# The selftest verdict (cli_query_apply_conversion, exit 13) where the CLI's
 	# query core is built.
 	if(TARGET cli_query)
@@ -1421,7 +1425,7 @@ target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/
 
 # ADR-053 P1a: the DisplayXR-SimConversion provider, linked statically through
 # its own entry point (sim_conversion_static): no dlopen, no registry, no GPU.
-target_link_libraries(tests_sim_conversion PRIVATE sim_conversion_static)
+target_link_libraries(tests_sim_conversion PRIVATE sim_conversion_static displayxr::conversion_store)
 set_target_properties(tests_sim_conversion PROPERTIES CXX_STANDARD 17)
 
 # ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h) and the
@@ -1438,6 +1442,11 @@ target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
 foreach(_conv_test tests_conv_select tests_conv_readiness tests_conv_registry)
 	target_link_libraries(${_conv_test} PRIVATE displayxr::conversion_core)
 endforeach()
+
+# ADR-053 P4 (#2108): the model store - root order, write protocol over a
+# file:// pack, tamper rejection, research-only gating, the store ACL (Windows).
+target_link_libraries(tests_conv_store PRIVATE displayxr::conversion_store)
+set_target_properties(tests_conv_store PROPERTIES CXX_STANDARD 17)
 
 # ADR-053 P1a (#2001): the conversion core's runtime half (hosts, lanes,
 # pipeline, policy, jobs) against a scriptable CPU fake provider.

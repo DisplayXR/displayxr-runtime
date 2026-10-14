@@ -69,3 +69,15 @@ if(NOT ANDROID)
 	target_sources(conv_runtime PRIVATE conv_host_proxy.c conv_host_proxy.h)
 	target_compile_definitions(conv_runtime PUBLIC CONV_HAVE_HOST_PROXY)
 endif()
+
+# ADR-053 P4 (#2108): the runtime-owned model store (root resolution, schema-2
+# pack manifests, the browser's write protocol, the per-process hash check,
+# the store ACL) and the host-op glue both hosts put behind model_resolve /
+# model_request. Its own target: the CLI and both hosts link it, the pure
+# core does not.
+add_library(conv_store STATIC conv_model_store.c conv_model_store.h)
+add_library(displayxr::conversion_store ALIAS conv_store)
+target_link_libraries(conv_store PUBLIC conv_core aux_util aux_os xrt-external-cjson)
+if(WIN32)
+	target_link_libraries(conv_store PRIVATE winhttp advapi32)
+endif()
