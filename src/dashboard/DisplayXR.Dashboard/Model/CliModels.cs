@@ -39,8 +39,7 @@ public sealed record PerfState(string UserFile, string UserWritten, IReadOnlyLis
 
     /// <summary>
     /// Compatibility mode is derived from the resolved levers, never stored:
-    /// the UI can then never claim a mode the runtime is not in (as the ImGui
-    /// panel did, control_panel_main.c compat_mode_on).
+    /// the UI can then never claim a mode the runtime is not in.
     /// </summary>
     public bool CompatibilityMode => Value("DXR_WEAVE_ON_SCANOUT").StartsWith('0') && Value("DXR_WEAVE_REPAINT").StartsWith('0');
 

@@ -34,7 +34,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(print, "XRT_PRINT_OPTIONS", false)
  * The one place every `DEBUG_GET_ONCE_*` option is read from.
  *
  * Since #1252 this defers to @ref u_setting_get_raw, which checks the
- * environment FIRST and only then the persisted stores the Control Panel
+ * environment FIRST and only then the persisted stores the Dashboard
  * writes, and only for allow-listed names. For every name not on that list —
  * which is nearly all of them — the behaviour is bit-identical to the plain
  * `getenv`/system-property read this used to do, because that read is now step

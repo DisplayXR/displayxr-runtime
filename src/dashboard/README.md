@@ -1,8 +1,8 @@
 # DisplayXR Dashboard
 
 `displayxr-dashboard.exe` — the runtime's desktop dashboard (Avalonia 11 / .NET 10), the
-successor of the ImGui Control Panel (`src/xrt/targets/control_panel/`, still shipped
-until its removal PR). Design: [ADR-051](../../docs/adr/ADR-051-display-status-model-and-dashboard.md)
+successor of the ImGui Control Panel (`displayxr-control-panel.exe`, now removed; the
+installer sweeps a stale copy and its Start Menu shortcut on upgrade). Design: [ADR-051](../../docs/adr/ADR-051-display-status-model-and-dashboard.md)
 and [display-dashboard.md](../../docs/roadmap/display-dashboard.md) §8.
 
 The app is **dumb** (ADR-051 D4): it links no runtime or vendor code and only spawns

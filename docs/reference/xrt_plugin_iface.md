@@ -477,7 +477,7 @@ xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst, uint64_t mon
 
 The vendor summary cell for ONE screen the plug-in claimed (`monitor_id` is a
 `xrt_display_descriptor::monitor_id` it returned a claim for). The dashboard (`displayxr-cli
-status`, the Control Panel's Displays page) shows the values and strings; the runtime never
+status`, the DisplayXR Dashboard's Displays page) shows the values and strings; the runtime never
 learns what they mean for a vendor. `struct xrt_plugin_screen_status` (caller sets `struct_size`
 and zero-fills; the plug-in sets `version = 1` and never writes past `struct_size`):
 

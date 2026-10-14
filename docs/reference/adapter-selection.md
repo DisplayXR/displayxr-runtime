@@ -348,7 +348,7 @@ Neither variable has to be *guessed at*. Two places report the answer:
 
   **Since #1252 the provenance also names WHICH source forced it** —
   `env-forced:` (an environment variable), `user-forced:` (the per-user store
-  the Control Panel writes) or `machine-forced:`
+  the Dashboard writes) or `machine-forced:`
   (`HKLM\Software\DisplayXR\Settings`). The variable is resolved through that
   chain with the environment still winning, so nothing that set it before
   changed meaning; the prefix simply stops the line claiming "env" for a value
@@ -400,7 +400,7 @@ Neither variable has to be *guessed at*. Two places report the answer:
 
   **`killed_by_env` no longer implies an environment variable (#1252).** The
   kill switch is resolved through the settings chain — environment, then the
-  per-user store the Control Panel writes, then the machine default — so a log
+  per-user store the Dashboard writes, then the machine default — so a log
   can read `killed_by_env` on a box where nothing sets `DXR_WEAVE_ON_SCANOUT` in
   any environment. The token keeps its name because shipped field logs and this
   doc are grepped for it; run `displayxr-cli perf list` to see which source

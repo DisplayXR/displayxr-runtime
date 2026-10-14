@@ -217,8 +217,8 @@ Cross-cutting references that don't belong to a single audience.
 - [Weave Cadence vs. Eye Prediction](reference/weave-cadence-vs-eye-prediction.md) — how late weave / repaint / slot partition / adapter split relate to vendor-side late latching and the eye predictor, which of them exist on Android, and the CNSDK prediction measurement plan
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
 - [DPI Awareness](reference/dpi-awareness.md) — the DLL rule: Win32 geometry read inside the runtime answers in the HOST app's DPI space, so publish-worthy rects must pin a per-monitor-v2 thread context
-- [Control Panel performance settings](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
-- [Display dashboard](roadmap/display-dashboard.md) — multi-screen status for the CLI (`status --watch`), the Control Panel (Displays + Windows tabs) and agents: snapshot schema, warnings as data, the DIAG RPCs, the `get_screen_status` plug-in slot, phasing (design, ADR-051)
+- [Performance settings (Control Panel → Dashboard)](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
+- [Display dashboard](roadmap/display-dashboard.md) — multi-screen status for the CLI (`status --watch`), the DisplayXR Dashboard (Displays + Windows pages) and agents: snapshot schema, warnings as data, the DIAG RPCs, the `get_screen_status` plug-in slot, phasing (design, ADR-051)
 - [Workspace Stability](reference/workspace-stability.md) — the wedge family (lock starvation, fence jams, blocking presents, vendor-DP and MCP write wedges), the no-unbounded-work principle (#925), and the diagnostic toolkit ([RENDER] tell, PDBs, wedge captures, close gauntlet)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).

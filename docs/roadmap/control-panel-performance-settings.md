@@ -1,5 +1,10 @@
 # Runtime performance settings in the Control Panel — census + design
 
+> **Note:** the ImGui Control Panel described here has been removed; its successor is the
+> DisplayXR Dashboard (`src/dashboard/`, Performance page), which drives the same
+> `displayxr-cli perf` verbs. References to "the Control Panel" / "the panel" below are
+> historical; the design and the census stand.
+
 > **Status: Phases 0 and 1 SHIPPED** (#1252); Phases 2-3 are still design. This doc answers "can the
 > runtime's performance levers be exposed as toggles in the DisplayXR Control Panel",
 > censuses every lever, and proposes the mechanism. Related: #378 (panel

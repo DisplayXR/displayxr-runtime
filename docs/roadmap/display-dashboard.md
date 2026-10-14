@@ -4,10 +4,10 @@ owner: David Fattal
 updated: 2026-10-09
 adr: ADR-051
 issues: []
-code-paths: [src/xrt/targets/cli/, src/xrt/targets/control_panel/, src/xrt/ipc/, src/xrt/include/xrt/xrt_plugin.h, src/xrt/drivers/sim_display/]
+code-paths: [src/xrt/targets/cli/, src/dashboard/, src/xrt/ipc/, src/xrt/include/xrt/xrt_plugin.h, src/xrt/drivers/sim_display/]
 ---
 
-# Display dashboard — multi-screen status for the CLI, the Control Panel and agents
+# Display dashboard — multi-screen status for the CLI, the Dashboard and agents
 
 The decision record is [ADR-051](../adr/ADR-051-display-status-model-and-dashboard.md).
 This document is the design: the snapshot schema, where each field comes from, the feed,
@@ -23,7 +23,7 @@ monitor join in the plug-in. The box this was verified on has two 3D panels from
 vendor, each with its own camera, and the only way to know which plug-in claimed which
 monitor, whether the second panel's tracker is up, or where a window's seam sits, is to
 read `%LOCALAPPDATA%\DisplayXR\*.log` with a grep. `displayxr-cli info` still prints one
-"Display processor" block. The Control Panel renders one display. Meanwhile the vendor's
+"Display processor" block. The (since-removed) ImGui Control Panel rendered one display. Meanwhile the vendor's
 own dashboard shipped a Displays page this week whose design — monitor list backbone,
 2 s passive page-scoped feed, warnings as data — is exactly what the runtime needs, with
 the runtime's facts instead of the vendor's.
@@ -334,8 +334,9 @@ WINDOWS  1 client
 
 **The panel is the Avalonia app `displayxr-dashboard.exe`** (`src/dashboard/`, .NET 10 /
 Avalonia 11, the vendor dashboard's toolset and visual language: a left navigation rail
-with badges, cards, chips and badges). It replaces the ImGui Control Panel, which stays in
-the installer until its removal PR. Pages: **Home** (the Overview below), **Displays**,
+with badges, cards, chips and badges). It replaced the ImGui Control Panel, which has since been
+removed from the tree and the installer (an in-place upgrade deletes the stale
+`displayxr-control-panel.exe` and its Start Menu shortcut). Pages: **Home** (the Overview below), **Displays**,
 **Windows**, **Components** (what is plugged in, by role: display processors, the workspace
 controller and how it is launched, present owners, input providers, the conversion module,
 a stereo camera source, diagnostics clients), **Performance**, **Developer**; the header carries the source pill

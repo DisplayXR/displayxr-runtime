@@ -4442,7 +4442,7 @@ ipc_handle_system_get_display_status(volatile struct ipc_client_state *_ics, str
 /*
  * ADR-051 D3 (display dashboard phase 2): the service's display status
  * snapshot, session-free, for DIAG clients only (`displayxr-cli status`, the
- * Control Panel through it, the MCP surface through the CLI). Read-only. The
+ * Dashboard through it, the MCP surface through the CLI). Read-only. The
  * snapshot crosses in fixed-size pieces — the head with one screen row per
  * `system_get_status_snapshot(screen_index)`, one client row per
  * `system_get_client_segments(client_id)` — each carrying the generation it

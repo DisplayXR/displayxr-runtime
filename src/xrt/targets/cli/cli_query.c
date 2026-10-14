@@ -474,7 +474,7 @@ describe_service_ingest(
 	 * "FORCED" for an override that did not take is worse than no report.
 	 */
 	// #1252: "was it set" now spans the whole settings chain, not just getenv —
-	// otherwise a value set from the Control Panel would read as unset here.
+	// otherwise a value set from the Dashboard would read as unset here.
 	// The provenance the resolver returned names the source it actually used
 	// ("env-forced:" / "user-forced:" / "machine-forced:"), so match the shared
 	// "-forced" suffix rather than one specific source.
@@ -565,7 +565,7 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 
 	// #1252: through the settings chain, not getenv alone — otherwise this
 	// report would disagree with what the runtime does the moment anyone sets
-	// the lever from the Control Panel instead of the environment.
+	// the lever from the Dashboard instead of the environment.
 	char weave_buf[64];
 	enum u_setting_source weave_src = U_SETTING_SOURCE_DEFAULT;
 	const char *env = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", weave_buf, sizeof(weave_buf), &weave_src);
@@ -2995,7 +2995,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 
 	/*
 	 * #918 GPU topology. Printed in the human dump since Phase 0; serialized
-	 * here so the Control Panel (which only parses `--json`) can show the same
+	 * here so the Dashboard (which only parses `--json`) can show the same
 	 * answer instead of being blind to the one thing a hybrid box needs.
 	 *
 	 * The split is deliberate and load-bearing: everything at the top level is
@@ -3077,7 +3077,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 	/*
 	 * #1252 — the allow-listed performance settings, resolved through the same
 	 * chain the runtime uses (env > per-user file > machine default). This is
-	 * what the Control Panel's three controls read and write.
+	 * what the Dashboard's three controls read and write.
 	 *
 	 * Every row carries its `source`, and consumers must not drop it: a value
 	 * sourced from `env` is a property of THIS process and says nothing about

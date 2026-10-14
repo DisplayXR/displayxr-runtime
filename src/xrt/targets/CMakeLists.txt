@@ -25,10 +25,6 @@ if(XRT_HAVE_VULKAN)
 	add_subdirectory(vk_layer)
 endif()
 
-if(XRT_MODULE_CONTROL_PANEL)
-	add_subdirectory(control_panel)
-endif()
-
 if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	if(ANDROID)
 		add_subdirectory(service-lib)
@@ -47,7 +43,7 @@ endif()
 if(WIN32)
 	# (The standalone DisplayXRSwitcher was retired in #378 — its
 	# ActiveRuntime-switching function moved into `displayxr-cli runtime
-	# activate` and the Control Panel.)
+	# activate` and the DisplayXR Dashboard, src/dashboard/.)
 
 	# DisplayXR Shell (workspace controller) source has moved to
 	# DisplayXR/displayxr-shell-pvt and ships from there. The runtime

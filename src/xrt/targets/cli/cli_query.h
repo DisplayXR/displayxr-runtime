@@ -8,8 +8,9 @@
  * text + JSON serializers over it. `info` and `selftest` are thin wrappers:
  * they run the query and pick a serializer; the boilerplate that creates an
  * instance, runs vendor plug-in discovery with no compositor, and reads the
- * vendor-neutral display info lives here once. The Control Panel (issue
- * #378) and the session-free MCP tools consume the same `--json` shape.
+ * vendor-neutral display info lives here once. The DisplayXR Dashboard
+ * (successor of the #378 Control Panel) and the session-free MCP tools
+ * consume the same `--json` shape.
  *
  * @author David Fattal
  */

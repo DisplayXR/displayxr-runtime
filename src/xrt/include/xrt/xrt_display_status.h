@@ -5,7 +5,7 @@
  * @brief  Vendor-generic display status snapshot (ADR-051 D1).
  *
  * The ONE model every status renderer reads: `displayxr-cli status`, the
- * Control Panel, the MCP surface and any later web page. Its JSON shape is
+ * Dashboard, the MCP surface and any later web page. Its JSON shape is
  * `docs/roadmap/display-dashboard.md` §3 (`u_status_snapshot_to_cjson`), its
  * text shape is §7 (`u_status_snapshot_format_text`), and its runtime-derived
  * warnings are §4 (`u_status_warnings_derive`).

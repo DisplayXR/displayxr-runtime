@@ -10,7 +10,7 @@
  *   perf reset [<name>]       Clear one lever, or all of them.
  *   perf path                 Print the per-user store's path.
  *
- * The Control Panel drives this rather than writing the file itself — one
+ * The Dashboard drives this rather than writing the file itself — one
  * writer, the same shape as `dp use` / `dp reset`, and the GUI stays free of
  * runtime knowledge (#378).
  *

@@ -331,7 +331,7 @@ namespace {
 		RenderAdapterChoice none{nullptr, LUID{}, kProvUnresolved, false};
 
 		// #1252: resolved through the settings chain (env > per-user file >
-		// machine) so the Control Panel's Target GPU control reaches apps it
+		// machine) so the Dashboard's Target GPU control reaches apps it
 		// never launched. The environment still wins, so the documented
 		// in-process `_putenv_s` route (#845, displayxr-unity#243) and every
 		// launcher script keep working exactly as before.
