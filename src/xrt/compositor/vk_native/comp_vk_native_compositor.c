@@ -226,12 +226,14 @@ dxr_frame_stage_timing_enabled(void)
 
 enum vk_frame_stage
 {
-	VK_FSTAGE_PRE = 0,      // commit entry → pre-DP cmd recorded (renderer, accum, crops)
-	VK_FSTAGE_PREFLUSH,     // pre-DP submit + queue drain (self-submitting DP flush)
-	VK_FSTAGE_WEAVE,        // xrt_display_processor_process_atlas (SDK-internal submit+wait)
-	VK_FSTAGE_POSTWAIT,     // post-weave vkDeviceWaitIdle (audit B7)
-	VK_FSTAGE_COMPOSITE,    // Local2D composite + HUD record + submit + drain
-	VK_FSTAGE_PRESENT,      // comp_vk_native_target_present (bridge copy + DXGI Present)
+	VK_FSTAGE_PRE = 0,   // commit entry → pre-DP cmd recorded (renderer, accum, crops)
+	VK_FSTAGE_PREFLUSH,  // pre-DP submit (+ queue drain on the host-wait path; submit only under the #2095 chain)
+	VK_FSTAGE_WEAVE,     // xrt_display_processor_process_atlas (SDK-internal submit, + its own wait if it has one)
+	VK_FSTAGE_POSTWAIT,  // post-weave queue drain (host-wait path only; ~0 under the chain — nothing is waited)
+	VK_FSTAGE_COMPOSITE, // Local2D composite + HUD record + submit (+ fence wait on the host-wait path only)
+	                     // #2095: under the chain no stage contains GPU completion — that is observed at the
+	                     // NEXT commit's wait on this frame's fence (the #1905 trace's wsync_prev / #1962 drain).
+	VK_FSTAGE_PRESENT,   // comp_vk_native_target_present (bridge copy + DXGI Present)
 	VK_FSTAGE_COUNT
 };
 
@@ -293,6 +295,71 @@ struct comp_vk_settings
  * `plane_cmd` for why it is a ring rather than one buffer freed per frame.
  */
 #define VK_SPLIT_PLANE_CMD_RING 3
+
+/*!
+ * #2095 / ADR-055 — the in-process weave-sync ring: frames in flight on the
+ * GPU semaphore chain (pre batch → self-submitting DP → post batch → present).
+ * Slot count: VK_WEAVE_SYNC_RING, bounded by the target's image count.
+ */
+#define VK_WEAVE_SYNC_RING 2
+/*!
+ * Bound on every wait against a ring fence (#925: no unbounded waits). ONE
+ * second, deliberately shorter than the 2 s hand-off expiry (#1394,
+ * weave_hand): a slot that does not retire is reported and the ring latched
+ * off while the frame's requester is still waiting, so the ring's bounded
+ * recovery resolves BEFORE the abandon path can declare the weave wedged. A
+ * fence that is still pending after 1 s is a GPU that is not coming back,
+ * not a slow frame (a whole chained frame is a few ms of GPU time).
+ */
+#define VK_WEAVE_SYNC_WAIT_NS (1ULL * 1000 * 1000 * 1000)
+
+struct vk_weave_sync_slot
+{
+	//! Signalled by the slot's post batch — proves the whole chain retired.
+	VkFence fence;
+	//! Acquire → pre batch (the target's image_available, per slot).
+	VkSemaphore image_available;
+	//! Pre batch → DP (set_weave_sync wait).
+	VkSemaphore pre_sem;
+	//! DP → post batch (set_weave_sync signal).
+	VkSemaphore post_sem;
+	//! Post batch → vkQueuePresentKHR.
+	VkSemaphore present_sem;
+	//! The two batches, parked until the fence retires (they are pending).
+	VkCommandBuffer cmd_pre, cmd_post;
+	VkCommandPool pool;
+	//! Commit serial of the frame in flight (the swapchain read-serial key).
+	uint64_t serial;
+	bool in_flight; //!< fence submitted and not yet observed signalled + reset
+};
+
+struct vk_weave_sync_ring
+{
+	/*!
+	 * Leaf lock: ring bookkeeping + the swapchain read serials. Taken by the
+	 * frame path under c->mutex and by the app thread (xrWaitSwapchainImage,
+	 * swapchain destroy, the top of layer_commit) WITHOUT c->mutex. Never
+	 * take c->mutex or weave_hand.mutex while holding it. A fence wait may
+	 * run under it: every waiter is waiting the same GPU work, so holding
+	 * it across the wait only serialises waiters that would block anyway.
+	 */
+	struct os_mutex mutex;
+	struct vk_weave_sync_slot slot[VK_WEAVE_SYNC_RING];
+	uint32_t count, next;
+	//! Monotone commit serial (0 = none yet), assigned when a slot is taken.
+	//! There is deliberately NO "highest retired serial" shortcut: the serve
+	//! queue toggles between the runtime-owned queue (non-blocking serve) and
+	//! the app's (blocking), so frame N+1's fence retiring on one queue says
+	//! nothing about frame N's post batch on the other. "No in-flight slot
+	//! carries the serial" is the only sound test (the ring is 2 deep).
+	uint64_t serial;
+	bool created;     //!< ring resources exist
+	bool failed;      //!< creation failed or a slot never retired: host-wait path for the session
+	bool dp_declined; //!< the DP returned false from set_weave_sync: host-wait path for this DP
+	int last_mode;    //!< enum vk_weave_sync_mode, for the on-change log
+	uint64_t last_warn_ns;
+	uint64_t wait_prev_ema_ns; //!< TRACE: the app thread's wait on the previous chained weave at commit
+};
 
 /*!
  * The Vulkan native compositor structure.
@@ -1407,8 +1474,13 @@ struct comp_vk_native_compositor
 	//! #837 — fence for the windowed path's per-frame submit. Waiting this
 	//! instead of vkQueueWaitIdle scopes the CPU stall to OUR submission
 	//! (identical on a single-queue iGPU, strictly narrower elsewhere) and
-	//! is the stepping stone for deferred present. Lazily created.
+	//! is the stepping stone for deferred present. Lazily created. Host-wait
+	//! path only: a #2095 chained frame signals its ring slot's fence instead.
 	VkFence frame_fence;
+
+	//! #2095 / ADR-055 — the weave-sync ring (see the struct). Lazily created
+	//! on the first chained frame; the mutex is initialised at create.
+	struct vk_weave_sync_ring wsync;
 
 	//! #1917: signalled by the shared-texture commit's OWN submits, which
 	//! wait on it instead of vkQueueWaitIdle(main_queue) — the app's queue,
@@ -2441,6 +2513,9 @@ static bool
 dxr_weave_app_submit_guard(void);
 static bool
 vk_weave_blocked(struct comp_vk_native_compositor *c);
+//! #2095: the depth-1 wait on the newest chained weave (defined with the ring helpers).
+static uint64_t
+vk_weave_sync_wait_latest(struct comp_vk_native_compositor *c, const char *who);
 
 static xrt_result_t
 vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
@@ -4620,6 +4695,11 @@ vk_native_dump_image_to_png(struct comp_vk_native_compositor *c,
 	if (image == VK_NULL_HANDLE || w == 0 || h == 0) {
 		return false;
 	}
+	// #2095: this dump idles main_queue only; under the chain a non-blocking
+	// serve's batches run on the runtime queue and may still be sampling or
+	// writing the image being read back. Wait the latest chained frame first
+	// (bounded; a capture is a diagnostic, not a frame).
+	(void)vk_weave_sync_wait_latest(c, "capture");
 	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 	if (cmd_pool == VK_NULL_HANDLE) {
 		return false;
@@ -6215,82 +6295,561 @@ dxr_weave_cadence_trace(void)
 	return on == 1;
 }
 
+/*
+ * ── #2095 / ADR-055: in-process weave sync — a GPU semaphore chain ──────────
+ *
+ * A self-submitting DP (the Android CNSDK weaver) runs its weave in its own
+ * vkQueueSubmit, on the runtime-owned queue it captured at factory time
+ * (#868, #2012; CNSDK 0.10.78 initialize_with_queue). This path used to order
+ * the runtime's batches against that submit with HOST waits — the acquire's
+ * dummy submit + vkQueueWaitIdle, a pre-DP vkQueueWaitIdle, the #837
+ * post-weave queue drain, and a synchronous frame-fence wait. On an in-order
+ * queue those drains now also drain the app's NEXT frame (the non-blocking
+ * hand-off has it submitted by then), measured 10-40 % off GPU-bound apps;
+ * on a second queue they order nothing at all (#2095).
+ *
+ * The chain, per frame, on one ring slot:
+ *
+ *   acquire  —signals→ image_available
+ *   pre batch (WS composite, crop, backdrop, target→COLOR)
+ *            waits image_available, —signals→ pre_sem
+ *   DP (set_weave_sync: waits pre_sem before its first atlas read,
+ *       signals post_sem after its last target write, on ITS queue)
+ *   post batch (Local2D composite, HUD, COLOR→PRESENT)
+ *            waits post_sem, —signals→ present_sem, fence = slot fence
+ *   present  waits present_sem
+ *
+ * Nothing on the commit thread waits for the GPU. What still waits, and why:
+ *   - a slot is only REUSED after its fence (binary semaphores: one signal,
+ *     one wait, then proof the wait retired);
+ *   - the NEXT commit waits the previous chained frame's fence before it
+ *     rewrites the single-buffered atlas / crop scratch / backdrop the DP may
+ *     still be sampling on the other queue (vk_weave_sync_wait_latest — this
+ *     is the depth-1 bound the drain used to give for free);
+ *   - xrWaitSwapchainImage waits the fence of the last commit that read THAT
+ *     image (comp_vk_native_compositor_wait_swapchain_read): backpressure
+ *     only when the app laps the compositor;
+ *   - a fill waits the latest chained frame before its own submits (its host
+ *     waits only cover its own queue).
+ * Every way of leaving the chain part-way (a DP that declines the slot, a
+ * dropped frame, a failed submit or present) drains both queues and
+ * recreates the ring's semaphores before any later process_atlas — the slot
+ * contract's recreate-on-drop, as the browser path does it
+ * (comp_multi_weave_android.c, XR_DXR_weave v20).
+ *
+ * Scope: app frames against a self-submitting DP only. Fills keep their
+ * host-wait path (the fence-park's drop-if-superseded check depends on it);
+ * a recording DP (sim_display, the desktop weavers) orders itself in one
+ * batch and needs none of this.
+ */
+
+//! Why a frame is (not) on the chain — logged on change, never per frame.
+enum vk_weave_sync_mode
+{
+	VK_WEAVE_SYNC_MODE_NONE = 0,
+	VK_WEAVE_SYNC_MODE_GPU_CHAIN,
+	VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH,
+	VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED,
+	VK_WEAVE_SYNC_MODE_FALLBACK_RING,
+};
+
+static const char *
+vk_weave_sync_mode_str(enum vk_weave_sync_mode m)
+{
+	switch (m) {
+	case VK_WEAVE_SYNC_MODE_GPU_CHAIN: return "GPU chain (DP took set_weave_sync; no host waits)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH:
+		return "FALLBACK: DXR_WEAVE_SYNC_INPROC=0 / debug.dxr.weave_sync_inproc=0 (host waits)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED:
+		return "FALLBACK: DP lacks set_weave_sync or declined it (host waits for this DP)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_RING:
+		return "FALLBACK: weave-sync ring unavailable — creation failed or a slot never retired (host waits)";
+	default: return "none";
+	}
+}
+
+static void
+vk_weave_sync_log_mode(struct comp_vk_native_compositor *c, enum vk_weave_sync_mode m)
+{
+	if (c->wsync.last_mode != (int)m) {
+		c->wsync.last_mode = (int)m;
+		U_LOG_W("#2095: in-process weave sync = %s", vk_weave_sync_mode_str(m));
+	}
+}
+
+//! Lifecycle-rate WARN for the ring (one line per 5 s at most).
+static void
+vk_weave_sync_warn_throttled(struct comp_vk_native_compositor *c, const char *what)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	if (c->wsync.last_warn_ns == 0 || now - c->wsync.last_warn_ns > 5ULL * U_TIME_1S_IN_NS) {
+		c->wsync.last_warn_ns = now;
+		U_LOG_W("#2095: %s (throttled to one line per 5 s)", what);
+	}
+}
+
 /*!
- * #837 prototype: narrow the post-weave drain from the DEVICE to the DP's QUEUE.
- *
- * `postwait` measures 3.29 ms of a ~9.4 ms fire — 35% — and it is one
- * `vkDeviceWaitIdle`. Its comment says the wait "costs nothing in practice" on
- * Android because `c->hud == NULL` there; the first half is true (u_hud_create
- * is compiled out on Android) but the wait does not test for a HUD, so the cost
- * is real and was never measured.
- *
- * What it must actually guarantee: the vendor's weave submit has finished
- * writing `target_image` before we record and submit post-DP work that writes
- * the same image (the HUD on desktop, and `vk_composite_local_2d` everywhere —
- * which is why simply skipping the wait when there is no HUD would be wrong).
- *
- * The DP submits on ONE known queue. `vk_make_dp_vk` creates it with
- * `vk.main_queue->queue` temporarily swapped to `c->repaint_queue`, so that is
- * the queue the vendor's weave goes to — for a DP that captures the queue it is
- * given. The Android CNSDK DP does not (it always submits on family-0 index 0,
- * see the #868 note at the DP factory call), so for it this assumption is
- * unproven (#2012), not changed here. Waiting on that queue therefore gives
- * the identical ordering guarantee, while a device-wide wait ALSO drains the
- * app's own queue — its scene rendering, which never touches `target_image`.
- * On this device that is the majority of the wait.
- *
- * Falls back to the passed-in queue on the shared-queue tier, where there is no
- * runtime-owned queue and the DP submits on the app's.
- *
- * DEFAULT ON (2026-08-31), on three independent lines of evidence:
- *   - Queue identity, confirmed on-device rather than by reading this comment:
- *     `#868: queue handles — app=0x..ad0 repaint=0x..b70` and `creating the
- *     display processor against the runtime-owned queue 0x..b70` — the DP's
- *     queue IS `c->repaint_queue`, so this drain covers the vendor weave.
- *   - A/B on NP02J, identical conditions: postwait 3.25 ms -> 0.04 ms with the
- *     weave itself unchanged (0.43 -> 0.47 ms), zero discards, zero validation
- *     errors. The stall cost ~7x the weave it was protecting.
- *   - Human eyeball, 90 s of head motion + model rotation: no bad frame.
- *
- * NOT empirically covered: the `vk_composite_local_2d` consumer is inert in
- * every Android demo on hand (`#879: ... local2d_scratch=0x0`), so no test here
- * has exercised the read-after-weave hazard this wait exists for. State that
- * rather than imply otherwise. The correctness argument does not rest on it:
- * the wait is on the PRODUCER's queue and is host-blocking, so the weave is
- * complete before any consumer's command buffer is even recorded.
- *
- * Kill switch: DXR_WEAVE_POSTWAIT_QUEUE=0 / debug.dxr.weave_postwait_queue 0.
+ * Kill switch for a device A/B (ADR-055 "Consequences"): DXR_WEAVE_SYNC_INPROC=0
+ * / Android `debug.dxr.weave_sync_inproc=0` forces the host-wait path for the
+ * session. Default ON. Read once, logged once; the env, when set non-empty,
+ * wins over the property.
  */
 static bool
-dxr_postwait_queue_only(void)
+dxr_weave_sync_inproc_enabled(void)
 {
 	static int on = -1;
 	if (on < 0) {
-		on = 1; // default ON — see the evidence in the comment above
-		const char *e = getenv("DXR_WEAVE_POSTWAIT_QUEUE");
+		on = 1;
+		const char *src = "default";
+		const char *e = getenv("DXR_WEAVE_SYNC_INPROC");
 		if (e != NULL && e[0] != '\0') {
 			on = (e[0] == '0') ? 0 : 1;
+			src = "DXR_WEAVE_SYNC_INPROC";
 		}
 #ifdef XRT_OS_ANDROID
 		else {
 			char sp[PROP_VALUE_MAX] = {0};
-			// Now that the default is ON the prop must be able to turn it
-			// OFF, so test for '0' rather than only honouring '1'.
-			if (__system_property_get("debug.dxr.weave_postwait_queue", sp) > 0 &&
-			    sp[0] != '\0') {
+			if (__system_property_get("debug.dxr.weave_sync_inproc", sp) > 0 && sp[0] != '\0') {
 				on = (sp[0] == '0') ? 0 : 1;
+				src = "debug.dxr.weave_sync_inproc";
 			}
 		}
 #endif
-		/*
-		 * Say which drain is live, exactly once. A switch guarding a data
-		 * race with no engagement log made a clean QA pass unattributable:
-		 * the props had been cleared afterwards and nothing in the log could
-		 * establish whether the narrow drain had ever actually run.
-		 */
-		U_LOG_W("#837: post-weave drain = %s", on ? "QUEUE (narrow)" : "DEVICE (wide)");
+		U_LOG_W("#2095: in-process weave sync (GPU semaphore chain) %s (%s)", on ? "ENABLED" : "DISABLED", src);
 	}
 	return on == 1;
+}
+
+//! Every chain submit goes through the #1905 -3 retry on Android, like the rest.
+static VkResult
+vk_weave_sync_submit(struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *si, VkFence fence, const char *site)
+{
+#ifdef XRT_OS_ANDROID
+	return comp_vk_native_queue_submit_retry(vk, queue, si, fence, site);
+#else
+	(void)site;
+	return vk->vkQueueSubmit(queue, 1, si, fence);
+#endif
+}
+
+static void
+vk_weave_sync_slot_destroy_sems(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	VkSemaphore *sems[] = {&s->image_available, &s->pre_sem, &s->post_sem, &s->present_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (*sems[i] != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, *sems[i], NULL);
+			*sems[i] = VK_NULL_HANDLE;
+		}
+	}
+}
+
+static bool
+vk_weave_sync_slot_create_sems(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	VkSemaphore *sems[] = {&s->image_available, &s->pre_sem, &s->post_sem, &s->present_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (vk->vkCreateSemaphore(vk->device, &sci, NULL, sems[i]) != VK_SUCCESS) {
+			vk_weave_sync_slot_destroy_sems(vk, s);
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Only after the slot's work is known complete (fence waited / queues idle).
+static void
+vk_weave_sync_slot_free_cmds(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	if (s->pool == VK_NULL_HANDLE) {
+		return;
+	}
+	if (s->cmd_pre != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, s->pool, 1, &s->cmd_pre);
+		s->cmd_pre = VK_NULL_HANDLE;
+	}
+	if (s->cmd_post != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, s->pool, 1, &s->cmd_post);
+		s->cmd_post = VK_NULL_HANDLE;
+	}
+	s->pool = VK_NULL_HANDLE;
+}
+
+/*!
+ * Lazy creation, c->mutex held. K = VK_WEAVE_SYNC_RING bounded by the target's
+ * image count (a slot per frame that can be in flight against the presentation
+ * engine). A failure latches the host-wait path for the session.
+ */
+static bool
+vk_weave_sync_ring_ensure(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->wsync.created) {
+		return true;
+	}
+	if (c->wsync.failed) {
+		return false;
+	}
+	uint32_t n = comp_vk_native_target_get_image_count(c->target);
+	if (n == 0) {
+		n = 1;
+	}
+	if (n > VK_WEAVE_SYNC_RING) {
+		n = VK_WEAVE_SYNC_RING;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkCreateFence(vk->device, &fci, NULL, &s->fence) != VK_SUCCESS ||
+		    !vk_weave_sync_slot_create_sems(vk, s)) {
+			for (uint32_t j = 0; j <= i; j++) {
+				vk_weave_sync_slot_destroy_sems(vk, &c->wsync.slot[j]);
+				if (c->wsync.slot[j].fence != VK_NULL_HANDLE) {
+					vk->vkDestroyFence(vk->device, c->wsync.slot[j].fence, NULL);
+					c->wsync.slot[j].fence = VK_NULL_HANDLE;
+				}
+			}
+			c->wsync.failed = true;
+			U_LOG_W("#2095: weave-sync ring creation failed — host-wait path for this session");
+			return false;
+		}
+	}
+	c->wsync.count = n;
+	c->wsync.next = 0;
+	c->wsync.created = true;
+	U_LOG_W("#2095: weave-sync ring created: %u slot(s) (target has %u image(s))", n,
+	        comp_vk_native_target_get_image_count(c->target));
+	return true;
+}
+
+//! wsync.mutex held. true = the slot's fence is signalled (or it was never in flight).
+static bool
+vk_weave_sync_slot_wait_locked(struct comp_vk_native_compositor *c, struct vk_weave_sync_slot *s, uint64_t timeout_ns)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!s->in_flight) {
+		return true;
+	}
+	return vk->vkWaitForFences(vk->device, 1, &s->fence, VK_TRUE, timeout_ns) == VK_SUCCESS;
+}
+
+/*!
+ * wsync.mutex held: give up on a slot whose fence did not retire inside the
+ * bound. Its fence and parked command buffers are LEAKED on purpose — they
+ * are pending on a GPU that is not answering, and destroying or freeing a
+ * pending object is worse than a leak (teardown's vkDeviceWaitIdle reclaims
+ * them if the device ever does come back). Dropping the bookkeeping is what
+ * keeps every later commit, fill and tagged xrWaitSwapchainImage from paying
+ * the full bound again for a serial that can never retire.
+ */
+static void
+vk_weave_sync_slot_abandon_locked(struct vk_weave_sync_slot *s)
+{
+	s->in_flight = false;
+	s->cmd_pre = VK_NULL_HANDLE;
+	s->cmd_post = VK_NULL_HANDLE;
+	s->pool = VK_NULL_HANDLE;
+	s->fence = VK_NULL_HANDLE;
+}
+
+//! wsync.mutex held: make a slot reusable (fence reset, parked buffers freed).
+static bool
+vk_weave_sync_slot_retire_locked(struct comp_vk_native_compositor *c, struct vk_weave_sync_slot *s)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!vk_weave_sync_slot_wait_locked(c, s, VK_WEAVE_SYNC_WAIT_NS)) {
+		return false;
+	}
+	if (s->in_flight) {
+		vk->vkResetFences(vk->device, 1, &s->fence);
+		s->in_flight = false;
+	}
+	vk_weave_sync_slot_free_cmds(vk, s);
+	return true;
+}
+
+/*!
+ * c->mutex held, app frame against a self-submitting DP: the slot this frame
+ * runs on, or NULL for the host-wait path (reason logged on change).
+ * @p out_skip is set when the slot to reuse did not retire inside the bound —
+ * a GPU that is not coming back; the caller fails the frame instead of
+ * reusing a pending fence, and the ring is latched off for the session.
+ */
+static struct vk_weave_sync_slot *
+vk_weave_sync_take_slot(struct comp_vk_native_compositor *c, bool *out_skip)
+{
+	*out_skip = false;
+	if (!dxr_weave_sync_inproc_enabled()) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH);
+		return NULL;
+	}
+	if (c->wsync.dp_declined) {
+		return NULL; // logged when it declined
+	}
+	if (c->wsync.failed || !vk_weave_sync_ring_ensure(c)) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+		return NULL;
+	}
+	os_mutex_lock(&c->wsync.mutex);
+	struct vk_weave_sync_slot *s = &c->wsync.slot[c->wsync.next];
+	const bool ok = vk_weave_sync_slot_retire_locked(c, s);
+	const uint64_t stuck_serial = s->serial;
+	if (ok) {
+		c->wsync.next = (c->wsync.next + 1) % c->wsync.count;
+		// The serial is assigned HERE, before the acquire, and the app images
+		// this frame reads are tagged with it right after (the caller), so a
+		// tagged wait covers the whole GPU window from the pre batch on —
+		// not only what comes after the post submit.
+		s->serial = ++c->wsync.serial;
+	} else {
+		vk_weave_sync_slot_abandon_locked(s);
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (!ok) {
+		c->wsync.failed = true;
+		*out_skip = true;
+		U_LOG_W(
+		    "#2095: ring slot (commit #%llu) did not retire in %llu ms — failing this frame and "
+		    "latching the host-wait path for the session (device loss / hung vendor submit?)",
+		    (unsigned long long)stuck_serial, (unsigned long long)(VK_WEAVE_SYNC_WAIT_NS / U_TIME_1MS_IN_NS));
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+		return NULL;
+	}
+	return s;
+}
+
+/*!
+ * Wait (bounded) for chained commit @p serial to retire. Any thread; takes
+ * wsync.mutex. The test is "no in-flight slot carries the serial": a slot
+ * only leaves the in-flight state through a waited fence (or an abandon,
+ * which is the device not answering). A serial that was assigned but whose
+ * slot never went in flight (the frame left the chain, or its post batch is
+ * not submitted yet) has nothing on the GPU to wait for — the frame that
+ * left the chain host-waited, and a frame between take-slot and submit can
+ * only be an app-thread or blocking serve (the app thread is inside the
+ * commit) or a non-blocking serve that reads no app image (its eligibility).
+ * Returns false on timeout, after a throttled WARN.
+ */
+static bool
+vk_weave_sync_wait_serial(struct comp_vk_native_compositor *c, uint64_t serial, uint64_t timeout_ns, const char *who)
+{
+	if (serial == 0 || !c->wsync.created) {
+		return true;
+	}
+	bool ok = true;
+	os_mutex_lock(&c->wsync.mutex);
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		if (s->in_flight && s->serial == serial) {
+			ok = vk_weave_sync_slot_wait_locked(c, s, timeout_ns);
+			break;
+		}
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (!ok) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+		         "%s waited %llu ms for chained weave #%llu and it has not retired — proceeding", who,
+		         (unsigned long long)(timeout_ns / U_TIME_1MS_IN_NS), (unsigned long long)serial);
+		vk_weave_sync_warn_throttled(c, buf);
+	}
+	return ok;
+}
+
+/*!
+ * The depth-1 bound: wait the NEWEST chained frame (the top of layer_commit,
+ * before c->mutex; a fill before its submits). Returns the time spent, so the
+ * caller can account for it where the old host drain was accounted.
+ */
+static uint64_t
+vk_weave_sync_wait_latest(struct comp_vk_native_compositor *c, const char *who)
+{
+	if (!c->wsync.created) {
+		return 0;
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+	os_mutex_lock(&c->wsync.mutex);
+	const uint64_t serial = c->wsync.serial;
+	os_mutex_unlock(&c->wsync.mutex);
+	(void)vk_weave_sync_wait_serial(c, serial, VK_WEAVE_SYNC_WAIT_NS, who);
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->wsync.mutex);
+	const uint64_t ema = c->wsync.wait_prev_ema_ns;
+	c->wsync.wait_prev_ema_ns = ema == 0 ? d : (ema * 7 + d) / 8;
+	os_mutex_unlock(&c->wsync.mutex);
+	return d;
+}
+
+/*!
+ * Host-drain every queue a chain can span: the caller's, the DP's
+ * (repaint_queue) and the app's (main_queue). The third matters when the
+ * caller IS the runtime queue (a non-blocking serve): the previous frame's
+ * post batch and present may have run on main_queue (a blocking serve), and
+ * a reset that then destroys their semaphores must have seen them retire.
+ * Failure paths only, so draining the app's queue too is acceptable.
+ */
+static void
+vk_weave_sync_drain_queues(struct comp_vk_native_compositor *c, VkQueue queue)
+{
+	struct vk_bundle *vk = &c->vk;
+	vk->vkQueueWaitIdle(queue);
+	if (c->repaint_queue != VK_NULL_HANDLE && c->repaint_queue != queue) {
+		vk->vkQueueWaitIdle(c->repaint_queue);
+	}
+	if (vk->main_queue->queue != VK_NULL_HANDLE && vk->main_queue->queue != queue &&
+	    vk->main_queue->queue != c->repaint_queue) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+}
+
+/*!
+ * Recreate-on-drop (the slot contract), applied to every way of leaving the
+ * chain part-way: drain both queues, retire every slot, destroy and recreate
+ * every semaphore. c->mutex held (frame path), after the frame's present.
+ *
+ * Assumes that once the presenting queue is idle the present's own semaphore
+ * wait has executed — queue operations execute in submission order, and the
+ * target's recreate path destroys the swapchain on the same assumption.
+ */
+static void
+vk_weave_sync_ring_reset(struct comp_vk_native_compositor *c, VkQueue queue, const char *why)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->wsync.created) {
+		return;
+	}
+	vk_weave_sync_drain_queues(c, queue);
+	os_mutex_lock(&c->wsync.mutex);
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		if (!vk_weave_sync_slot_retire_locked(c, s)) {
+			// Its fence is pending despite the drain: leave its semaphores
+			// alone (destroying objects with pending operations is worse than
+			// a stale signal), drop its bookkeeping so no later wait pays the
+			// bound for it again, and stop chaining for the session.
+			vk_weave_sync_slot_abandon_locked(s);
+			c->wsync.failed = true;
+			continue;
+		}
+		vk_weave_sync_slot_destroy_sems(vk, s);
+		if (!vk_weave_sync_slot_create_sems(vk, s)) {
+			c->wsync.failed = true;
+		}
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	char buf[160];
+	snprintf(buf, sizeof(buf), "weave-sync ring reset — %s; queues drained, semaphores recreated%s", why,
+	         c->wsync.failed ? " (a slot would not retire: host-wait path from here on)" : "");
+	vk_weave_sync_warn_throttled(c, buf);
+	if (c->wsync.failed) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+	}
+}
+
+//! Teardown, after vkDeviceWaitIdle: nothing in the ring is pending.
+static void
+vk_weave_sync_ring_destroy(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->wsync.created) {
+		return;
+	}
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		s->in_flight = false;
+		vk_weave_sync_slot_free_cmds(vk, s);
+		vk_weave_sync_slot_destroy_sems(vk, s);
+		if (s->fence != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, s->fence, NULL);
+			s->fence = VK_NULL_HANDLE;
+		}
+	}
+	c->wsync.created = false;
+	c->wsync.count = 0;
+}
+
+static void
+vk_weave_sync_note_sub(struct xrt_swapchain *xsc, const struct xrt_sub_image *sub, uint64_t serial)
+{
+	if (xsc != NULL) {
+		comp_vk_native_swapchain_note_read(xsc, sub->image_index, serial);
+	}
+}
+
+/*!
+ * wsync.mutex held, c->mutex held: tag every app swapchain image this
+ * commit's GPU work reads with its serial. The weave's inputs that are
+ * app-owned: the projection views (zero-copy: the DP samples them directly;
+ * otherwise the renderer already blitted them, host-waited, before the
+ * commit), window-space and Local2D images (composited in the pre/post
+ * batches), zone views. Tagging a view the renderer already consumed costs
+ * one already-signalled fence check at the app's next wait — nothing.
+ */
+static void
+vk_weave_sync_note_layer_reads_locked(struct comp_vk_native_compositor *c, uint64_t serial)
+{
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		const struct xrt_layer_data *d = &l->data;
+		switch (d->type) {
+		case XRT_LAYER_PROJECTION:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_PROJECTION_DEPTH:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->depth.v[v].sub, serial);
+				vk_weave_sync_note_sub(l->sc_array[XRT_MAX_VIEWS + v], &d->depth.d[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_ZONE_3D:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->zone_3d.proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_QUAD: vk_weave_sync_note_sub(l->sc_array[0], &d->quad.sub, serial); break;
+		case XRT_LAYER_CUBE: vk_weave_sync_note_sub(l->sc_array[0], &d->cube.sub, serial); break;
+		case XRT_LAYER_CYLINDER: vk_weave_sync_note_sub(l->sc_array[0], &d->cylinder.sub, serial); break;
+		case XRT_LAYER_EQUIRECT1: vk_weave_sync_note_sub(l->sc_array[0], &d->equirect1.sub, serial); break;
+		case XRT_LAYER_EQUIRECT2: vk_weave_sync_note_sub(l->sc_array[0], &d->equirect2.sub, serial); break;
+		case XRT_LAYER_WINDOW_SPACE:
+			vk_weave_sync_note_sub(l->sc_array[0], &d->window_space.sub, serial);
+			break;
+		case XRT_LAYER_LOCAL_2D: vk_weave_sync_note_sub(l->sc_array[0], &d->local_2d.sub, serial); break;
+		default: break;
+		}
+	}
+}
+
+void
+comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *c,
+                                              struct xrt_swapchain *xsc,
+                                              uint32_t index)
+{
+	// `created` is set once, under c->mutex, by the first chained frame; the
+	// app thread reads it bare. Benign: an image can only have been tagged
+	// by a chained frame, and that frame's commit happens-before the app's
+	// next wait on the image (the hand-off wait, or the same thread).
+	if (c == NULL || xsc == NULL || !c->wsync.created) {
+		return;
+	}
+	uint64_t serial = 0;
+	os_mutex_lock(&c->wsync.mutex);
+	if (index == UINT32_MAX) {
+		for (uint32_t i = 0; i < xsc->image_count; i++) {
+			const uint64_t s = comp_vk_native_swapchain_get_read_serial(xsc, i);
+			serial = s > serial ? s : serial;
+		}
+	} else {
+		serial = comp_vk_native_swapchain_get_read_serial(xsc, index);
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (serial != 0) {
+		(void)vk_weave_sync_wait_serial(c, serial, VK_WEAVE_SYNC_WAIT_NS,
+		                                index == UINT32_MAX ? "swapchain destroy" : "xrWaitSwapchainImage");
+	}
 }
 
 /*
@@ -6726,10 +7285,66 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		return XRT_SUCCESS;
 	}
 
+	/*
+	 * #2095 / ADR-055 — does THIS frame run on the GPU semaphore chain?
+	 *
+	 * Only an app frame (not a fill) against a self-submitting DP, with the
+	 * switch on, the DP not having declined the slot, and a ring slot that
+	 * has retired. `ws` is the slot for the frame; `ws_chain` says the chain
+	 * is still intact (it drops to false at the first thing that cannot be
+	 * chained — a declined arm, a dropped weave, a failed submit — and the
+	 * frame finishes on the host-wait path); `ws_done` says the chained post
+	 * batch was submitted on the slot, so the slot is in flight and the
+	 * present may wait its semaphore. A slot that was taken and not completed
+	 * is drained and its semaphores recreated after the present (a stranded
+	 * signal on a binary semaphore would poison its next use).
+	 */
+	struct vk_weave_sync_slot *ws = NULL;
+	bool ws_chain = false;
+	bool ws_acq_signalled = false; // ws->image_available carries this frame's acquire
+	bool ws_armed = false;         // the DP took set_weave_sync for this frame
+	bool ws_done = false;
+	const char *ws_fail = NULL; // why the chain was left part-way, for the reset log
+	if (is_repaint) {
+		// A fill's depth-1 wait on the last chained app frame runs in
+		// vk_repaint_thread BEFORE it takes c->mutex (#1264 S1: no GPU wait
+		// under the compositor lock), not here.
+	} else if (c->display_processor != NULL && xrt_display_processor_is_self_submitting(c->display_processor)) {
+		bool ws_skip = false;
+		ws = vk_weave_sync_take_slot(c, &ws_skip);
+		ws_chain = ws != NULL;
+		if (ws_skip) {
+			// The slot to reuse did not retire inside the bound: a GPU that
+			// is not coming back (device loss, a hung vendor submit). Nothing
+			// below could present through it either; fail this frame
+			// cleanly rather than reuse a pending fence.
+			*out_skip_frame = true;
+			return XRT_SUCCESS;
+		}
+		if (ws != NULL) {
+			// Tag the app images this frame's GPU work reads with its serial
+			// NOW, so a tagged xrWaitSwapchainImage covers the whole window
+			// from the pre batch on (see vk_weave_sync_wait_serial for the
+			// taken-but-not-submitted case).
+			os_mutex_lock(&c->wsync.mutex);
+			vk_weave_sync_note_layer_reads_locked(c, ws->serial);
+			os_mutex_unlock(&c->wsync.mutex);
+		}
+	}
+
 	uint32_t target_index;
-	xret = comp_vk_native_target_acquire(c->target, &target_index, queue, is_repaint);
+	xret = comp_vk_native_target_acquire_ex(c->target, &target_index, queue, is_repaint,
+	                                        ws != NULL ? ws->image_available : VK_NULL_HANDLE,
+	                                        ws != NULL ? &ws_acq_signalled : NULL);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to acquire target");
+		if (ws != NULL) {
+			// The slot is not known clean: a SUBOPTIMAL first acquire that
+			// then failed its recreate, or a driver that signalled on an
+			// error path, leaves image_available signalled. Reset rather
+			// than reason about which — this is an error path.
+			vk_weave_sync_ring_reset(c, queue, "acquire failed");
+		}
 		return xret;
 	}
 
@@ -7033,10 +7648,66 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			if (ftime) {
 				fp[1] = os_monotonic_get_ns();
 			}
-			if (dp_self_submits) {
-				// Flush pre-DP work (WS-layer composite, atlas crop,
-				// target-image layout transition) so the DP's
-				// internal submit sees the right state on the GPU.
+			if (dp_self_submits && ws_chain) {
+				/*
+				 * #2095 / ADR-055 — the pre batch joins the chain. It waits
+				 * this frame's acquire (the slot's image_available, replacing
+				 * the acquire-side dummy submit + vkQueueWaitIdle) and signals
+				 * pre_sem, which the DP waits before its first atlas read.
+				 * No vkQueueWaitIdle: nothing on the host waits for it.
+				 *
+				 * Wait stage ALL_COMMANDS rather than COLOR_ATTACHMENT_OUTPUT:
+				 * the batch's first write to the target is the pre_weave
+				 * layout transition above, whose srcStage is TOP_OF_PIPE — a
+				 * narrower wait stage would let that transition run before
+				 * the presentation engine has released the image. The batch
+				 * is small, so waiting it whole costs nothing measurable.
+				 */
+				vk->vkEndCommandBuffer(cmd);
+				const VkPipelineStageFlags acq_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				VkSubmitInfo pre_si = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .waitSemaphoreCount = ws_acq_signalled ? 1u : 0u,
+				    .pWaitSemaphores = &ws->image_available,
+				    .pWaitDstStageMask = &acq_stage,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				    .signalSemaphoreCount = 1,
+				    .pSignalSemaphores = &ws->pre_sem,
+				};
+				res = vk_weave_sync_submit(vk, queue, &pre_si, VK_NULL_HANDLE, "chain-pre");
+				if (res == VK_SUCCESS) {
+					// Pending on the GPU: parked in the slot, freed when its
+					// fence retires — never by the post-weave block below.
+					ws->cmd_pre = cmd;
+					ws->pool = cmd_pool;
+					ws_acq_signalled = false; // consumed
+				} else {
+					// A failed submit neither waits nor signals
+					// (LeiaInc/CNSDK#734 is the same lesson on the vendor
+					// side): the DP must NOT be armed with a pre_sem no one
+					// will signal, and the acquire signal is still pending on
+					// image_available. Consume it on the host NOW (dummy
+					// submit + idle, what the host-wait acquire always did):
+					// it orders the DP's weave after the presentation engine
+					// released the image, and leaves the semaphore clean for
+					// the post-present reset to destroy. Then finish this
+					// frame on the host-wait path — which, exactly as before,
+					// does not wait for a pre batch that never landed.
+					if (ws_acq_signalled) {
+						comp_vk_native_target_consume_acquire_signal(c->target, queue,
+						                                             ws->image_available);
+						ws_acq_signalled = false;
+					}
+					ws_chain = false;
+					ws_fail = "pre-DP submit failed";
+				}
+			} else if (dp_self_submits) {
+				// Host-wait path (no chain: the switch is off, the DP declined
+				// the slot, or the ring is unavailable). Flush pre-DP work
+				// (WS-layer composite, atlas crop, target-image layout
+				// transition) so the DP's internal submit sees the right
+				// state on the GPU.
 				vk->vkEndCommandBuffer(cmd);
 				VkSubmitInfo pre_si = {
 				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -7191,6 +7862,17 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 #else
 			const bool seg_split = false;
 #endif
+			if (seg_split && ws_chain) {
+				// #2095: the segments branch records its own per-screen
+				// process_atlas calls and never arms the primary DP, so the
+				// chain cannot hold across it. Unreachable today — a
+				// self-submitting DP never splits (vk_segments_frame_update_split)
+				// — kept so it stays that way: complete the pre batch on the
+				// host and finish on the host-wait path.
+				vk->vkQueueWaitIdle(queue);
+				ws_chain = false;
+				ws_fail = "segments";
+			}
 			if (seg_split) {
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 				struct comp_vk_native_segments_frame sf = {
@@ -7219,6 +7901,38 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				(void)comp_vk_native_segments_record(c->segments, &sf);
 #endif
 			} else {
+				/*
+				 * #2095 / ADR-055 — arm the DP IMMEDIATELY before the
+				 * process_atlas it applies to (the slot's contract: nothing
+				 * but set_target_color_view may come between, and nothing
+				 * does). The DP commits to wait pre_sem before its first
+				 * atlas read and to signal post_sem after its last target
+				 * write, in the submits it issues on its own queue. The pre
+				 * batch signalling pre_sem is already in flight.
+				 *
+				 * false = the DP lacks the slot or declines it (an older
+				 * plug-in, or the legacy own-queue init). Then this DP never
+				 * takes it: latch, log once, and finish THIS frame the way
+				 * the host-wait path would have — the pre batch has to be
+				 * complete before the DP's own submit can see it, which the
+				 * host-wait flush guaranteed with an idle and we now owe
+				 * late. pre_sem keeps a signal nobody waits; the
+				 * post-present reset recreates it.
+				 */
+				if (ws_chain) {
+					if (xrt_display_processor_vk_set_weave_sync(
+					        (struct xrt_display_processor_vk *)c->display_processor,
+					        (VkSemaphore_XDP)ws->pre_sem, 0, (VkSemaphore_XDP)ws->post_sem, 0)) {
+						ws_armed = true;
+						vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_GPU_CHAIN);
+					} else {
+						c->wsync.dp_declined = true;
+						vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED);
+						vk->vkQueueWaitIdle(queue);
+						ws_chain = false;
+						ws_fail = "DP declined set_weave_sync";
+					}
+				}
 				xrt_display_processor_process_atlas(
 				    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
 				    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
@@ -7342,6 +8056,26 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				}
 			}
 
+			/*
+			 * #2095 / ADR-055 — the drop clause, as the browser path does it.
+			 * The slot's contract asks the DP to wait pre_sem and signal
+			 * post_sem even on a dropped frame, but the runtime does not bet a
+			 * GPU hang on a vendor submit that may never have been enqueued:
+			 * for THIS frame post_sem is not waited on the GPU — the queues
+			 * are drained on the host instead (both of them: the DP's own and
+			 * the one carrying our batches), the post batch and the present
+			 * then wait nothing, and the post-present reset destroys and
+			 * recreates the slot's semaphores before any later process_atlas
+			 * (so a DP that cannot tell whether its weaver consumed pre_sem is
+			 * never asked to wait it again). The #1394 recycle itself —
+			 * overlays suppressed, clear to black, uncounted present — is
+			 * unchanged and logged by the lines above.
+			 */
+			if (ws_armed && frame_dropped) {
+				vk_weave_sync_drain_queues(c, queue);
+				ws_chain = false;
+				ws_fail = "DP dropped the frame";
+			}
 
 			// XR_DXR_depth_budget: evaluate the rear budget from the background
 			// the DP just composited under. AFTER process_atlas, because that is
@@ -7355,24 +8089,38 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				fp[3] = os_monotonic_get_ns();
 			}
 			if (dp_self_submits) {
-				// DP owned the post-weave submit. The vendor weave's
-				// queue submit may still be in flight writing to
-				// target_image; the HUD cmd buffer we're about to
-				// record writes to the same image, so drain the GPU
-				// before recording the HUD to avoid a target_image
-				// race (audit B7). On Android the HUD is c->hud==NULL
-				// and this overlay is a no-op, so the wait costs
-				// nothing in practice — but keep it for safety when
-				// HUD eventually wires up.
-				if (dxr_postwait_queue_only()) {
-					// #837: drain only the queue the DP actually
-					// submits on (see dxr_postwait_queue_only).
-					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE)
-					                   ? c->repaint_queue
-					                   : queue;
-					vk->vkQueueWaitIdle(dp_q);
+				if (ws_chain) {
+					// #2095 / ADR-055: the vendor weave may still be in flight
+					// writing target_image — and that is fine: the post batch
+					// below waits post_sem on the GPU before its first touch of
+					// the target. Nothing is drained. The pre batch's buffer is
+					// parked in the slot (pending), not freed here.
 				} else {
-					vk->vkDeviceWaitIdle(vk->device);
+					// Host-wait path. DP owned the post-weave submit. The vendor
+					// weave's queue submit may still be in flight writing to
+					// target_image; the cmd buffer we're about to record
+					// (Local2D composite, HUD) writes to the same image, so
+					// drain before recording to avoid a target_image race
+					// (audit B7). #837: drain only the queue the DP submits on
+					// — `vk_make_dp_vk` creates the DP with the runtime-owned
+					// queue swapped in as main_queue, and the Android CNSDK DP
+					// captures it at initialize_with_queue (#2012 settled it);
+					// on the shared-queue tier that is the passed-in queue. A
+					// device-wide wait would also drain the app's own queue,
+					// which never touches target_image. (The old DEVICE-wide
+					// variant and its DXR_WEAVE_POSTWAIT_QUEUE switch are gone
+					// with ADR-055; the chain above is the real fix.)
+					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : queue;
+					vk->vkQueueWaitIdle(dp_q);
+					if (ws != NULL && ws->cmd_pre == cmd) {
+						// #2095: this frame left the chain AFTER its pre batch
+						// was submitted (a declined arm, a dropped weave). The
+						// buffer is parked in the slot and freed by the
+						// post-present ring reset once both queues are drained
+						// — not here, and never twice.
+					} else {
+						vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+					}
 				}
 
 				// Allocate a fresh cmd buffer for any post-DP
@@ -7384,7 +8132,6 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 				    .commandBufferCount = 1,
 				};
-				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
 				vk->vkAllocateCommandBuffers(vk->device, &post_ai, &cmd);
 				VkCommandBufferBeginInfo post_bi = {
 				    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -7583,17 +8330,39 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		// strictly narrower elsewhere, and the prerequisite for
 		// deferring the present off the frame's critical path.
 		// #868: a repaint signals its OWN fence — see repaint_fence.
-		VkFence *fence_p = is_repaint ? &c->repaint_fence : &c->frame_fence;
+		// #2095: a chained frame signals its ring slot's fence, which is
+		// never waited here — only before the slot is REUSED, by the next
+		// commit's depth-1 wait, and by xrWaitSwapchainImage on an image
+		// this frame read.
+		VkFence *fence_p = is_repaint ? &c->repaint_fence : ws_chain ? &ws->fence : &c->frame_fence;
 		if (*fence_p == VK_NULL_HANDLE) {
 			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			vk->vkCreateFence(vk->device, &fci, NULL, fence_p);
+		}
+		/*
+		 * #2095 / ADR-055 — the post batch joins the chain: it waits post_sem
+		 * (the DP's "last target write done") and signals present_sem for
+		 * vkQueuePresentKHR. Wait stage ALL_COMMANDS for the same reason as
+		 * the pre batch: the composite's and the drop-clear's internal
+		 * barriers include TOP_OF_PIPE-sourced transitions on the target,
+		 * which a FRAGMENT|COLOR|TRANSFER mask would not hold back.
+		 */
+		const VkPipelineStageFlags post_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		if (ws_chain) {
+			submit_info.waitSemaphoreCount = 1;
+			submit_info.pWaitSemaphores = &ws->post_sem;
+			submit_info.pWaitDstStageMask = &post_wait_stage;
+			submit_info.signalSemaphoreCount = 1;
+			submit_info.pSignalSemaphores = &ws->present_sem;
 		}
 #ifdef XRT_OS_ANDROID
 		// #1905: one retry on -3 (shared-GSL-context race; see the helper).
 		// Clean here: nothing has touched the command buffer or the fence
 		// since the failed attempt, which left both unchanged.
 		res = comp_vk_native_queue_submit_retry(vk, queue, &submit_info, *fence_p,
-		                                        is_repaint ? "fill" : "app-weave");
+		                                        is_repaint ? "fill"
+		                                        : ws_chain ? "chain-post"
+		                                                   : "app-weave");
 #else
 		res = vk->vkQueueSubmit(queue, 1, &submit_info, *fence_p);
 #endif
@@ -7624,7 +8393,35 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		}
 
 		bool cmd_freed = false;
-		if (res == VK_SUCCESS) {
+		if (ws_chain) {
+			if (res == VK_SUCCESS) {
+				/*
+				 * #2095 / ADR-055 — no host wait. The slot is in flight: its
+				 * fence retires the pre batch, the DP's weave (post_sem) and
+				 * this batch together. Record the commit serial and tag every
+				 * app swapchain image this frame's GPU work reads, so
+				 * xrWaitSwapchainImage can wait exactly this fence if the app
+				 * laps us (vk_swapchain_wait_image). Both command buffers stay
+				 * parked in the slot until it retires.
+				 */
+				os_mutex_lock(&c->wsync.mutex);
+				ws->cmd_post = cmd;
+				ws->pool = cmd_pool;
+				ws->in_flight = true; // serial assigned and images tagged at take-slot
+				os_mutex_unlock(&c->wsync.mutex);
+				ws_done = true;
+				cmd_freed = true;
+			} else {
+				// post_sem keeps the DP's signal and present_sem is never
+				// signalled: the present below must wait nothing, and the
+				// post-present reset recreates the slot. Drain first, as the
+				// host-wait path effectively did before presenting a target
+				// whose post batch never landed.
+				vk_weave_sync_drain_queues(c, queue);
+				ws_chain = false;
+				ws_fail = "post batch submit failed";
+			}
+		} else if (res == VK_SUCCESS) {
 			if (*fence_p != VK_NULL_HANDLE) {
 				/*
 				 * #1264 S1 fence-park: a FILL must not hold the compositor
@@ -7750,13 +8547,37 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	// #1748: the tag rides this commit — set here, under the lock, right
 	// before it, so no other commit can carry it.
 	vk_wl_move_sync_tag_present(c, ms_tag, ms_tag_x, ms_tag_y);
-	xret = comp_vk_native_target_present(c->target, queue, /*counted=*/!frame_dropped);
+	// #2095 / ADR-055: a chained frame's present waits present_sem on the
+	// GPU — the post batch signalled it after the COLOR→PRESENT barrier —
+	// instead of the host having drained first.
+	xret = comp_vk_native_target_present_ex(c->target, queue, /*counted=*/!frame_dropped,
+	                                        ws_done ? ws->present_sem : VK_NULL_HANDLE);
 	if (xret == XRT_SUCCESS && !frame_dropped) {
 		// #1394: a dropped frame IS presented (it is the only way to give the
 		// acquired image back) but never COUNTED. present_serial is the
 		// fence-park's drop-if-superseded key — bumping it here would let a
 		// parked fill mistake a recycled frame for a fresher one.
 		c->present_serial++; // #1264 S1: the fence-park's drop-if-superseded key
+	}
+	/*
+	 * #2095 / ADR-055 — a slot that did not complete its chain (left part-way
+	 * for any of the reasons in ws_fail, or whose present failed outright)
+	 * may hold a signal nothing waits, and a binary semaphore in that state
+	 * poisons its next use. Drain both queues and recreate every semaphore
+	 * in the ring before any later process_atlas — the slot contract's
+	 * recreate-on-drop, applied to every way of leaving the chain.
+	 */
+	if (ws != NULL && (!ws_done || xret != XRT_SUCCESS)) {
+		if (ws_acq_signalled) {
+			// The pre batch was never submitted (command-buffer allocation
+			// failed, or the DP path was not taken): the acquire signal is
+			// still pending and the target was presented with nothing
+			// waiting the presentation engine. Consume it on the host
+			// before the reset destroys the semaphore.
+			comp_vk_native_target_consume_acquire_signal(c->target, queue, ws->image_available);
+			ws_acq_signalled = false;
+		}
+		vk_weave_sync_ring_reset(c, queue, ws_fail != NULL ? ws_fail : "present failed");
 	}
 
 	/*
@@ -8468,8 +9289,20 @@ vk_async_fb_judge(struct comp_vk_native_compositor *c, uint64_t now, uint64_t p)
 			        iv_ms);
 			return;
 		}
+		/*
+		 * #2095: what "commit drain" measures. Host-wait path: the wait for the
+		 * previous serve, whose own host drains contain the weave's GPU time.
+		 * GPU chain: the serve returns without waiting the GPU, so the drain is
+		 * the wait for the serve's CPU work PLUS the top-of-commit wait on the
+		 * previous chained weave's fence (vk_weave_sync_wait_latest) — i.e.
+		 * still the whole time this commit stood behind the previous weave,
+		 * measured where it is now paid rather than where it used to be. A
+		 * trip under the chain means the weave's GPU time itself exceeds the
+		 * app's frame, which blocking cannot improve; ADR-055 expects silence.
+		 */
 		U_LOG_W(
 		    "#1905/#1962: non-blocking hand-off -> BLOCKING (trip #%u): over %u frames the commit drain "
+		    "(serve wait + previous weave's fence under the #2095 chain) "
 		    "exceeded P = %.2f ms on %u (mean drain %.2f ms) and the app interval averaged %.2f ms > 2P "
 		    "(last blocking window: %.2f ms, 0 = none) — the served weave runs behind the app's queued "
 		    "frames and costs throughput. Probing a %u-frame non-blocking window in %llu s.",
@@ -9168,20 +10001,26 @@ vk_repaint_thread(void *ptr)
 				c->hand_async.win_sync = 0;
 				c->hand_async.win_stalls = 0;
 				os_mutex_unlock(&c->weave_hand.mutex);
+				// #2095: the app thread's wait on the previous chained weave at
+				// the top of layer_commit (EMA) — where GPU completion is now
+				// observed; 0 while the host-wait path is live.
+				os_mutex_lock(&c->wsync.mutex);
+				const double wsync_prev_ms = (double)c->wsync.wait_prev_ema_ns / 1e6;
+				os_mutex_unlock(&c->wsync.mutex);
 				const double duty_pct =
 				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
 				U_LOG_W(
 				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
 				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
 				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
-				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u}",
+				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms}",
 				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
 				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
 				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
 				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
 				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
 				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
-				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail);
+				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms);
 				c->repaint.mf.legacy_fires = 0;
 				c->repaint.mf.midframe_fires = 0;
 				c->repaint.mf.in_frame = 0;
@@ -9422,6 +10261,14 @@ vk_repaint_thread(void *ptr)
 			const uint64_t pace_t1 = os_monotonic_get_ns();
 			u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 		}
+
+		// #2095: a fill replays the atlas and the backdrop that the last
+		// chained app frame's GPU work may still be sampling or writing on
+		// the OTHER queue; the fill's own host waits only ever cover its own.
+		// Waited HERE, with c->mutex released — the #1264 S1 rule: a fill
+		// never holds the compositor lock across a GPU wait. Bounded, and
+		// normally retired long ago.
+		(void)vk_weave_sync_wait_latest(c, "fill");
 
 		os_mutex_lock(&c->mutex);
 
@@ -11536,10 +12383,31 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		c->repaint.app_submit_window = false;
 		return XRT_SUCCESS;
 	}
+	/*
+	 * #2095 / ADR-055: the other half of the depth-1 bound. The drain above
+	 * proves the previous serve's CPU work is done; under the GPU chain its
+	 * GPU work (the DP sampling the atlas / crop scratch / backdrop on the
+	 * runtime queue) may still be in flight, and this commit is about to
+	 * rewrite every one of those single-buffered inputs. Wait that frame's
+	 * fence here — before c->mutex, so a fill is not held off by a GPU wait;
+	 * normally long retired. (On the LOCK_TAKEN arm the drain's trylock has
+	 * already won c->mutex, so there the wait runs under it: that is the
+	 * once-per-2-s abandon path, and the wait is bounded.) Folded into the
+	 * #1962 drain: it is the same "this commit stood behind the previous
+	 * weave" time, paid here now.
+	 */
+	{
+		const uint64_t w = vk_weave_sync_wait_latest(c, "commit");
+		if (w != 0) {
+			c->hand_async.fb_last_drain_ns += w; // app thread: the #1962 scorer's input
+		}
+	}
 	if (drain != VK_ASYNC_DRAIN_LOCK_TAKEN) {
 		os_mutex_lock(&c->mutex);
 	}
 #else
+	// #2095: same bound without the non-blocking hand-off (see above).
+	(void)vk_weave_sync_wait_latest(c, "commit");
 	os_mutex_lock(&c->mutex);
 #endif
 #ifdef VK_MIDFRAME_FILL
@@ -11678,6 +12546,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
 		c->frame_fence = VK_NULL_HANDLE;
 	}
+	// #2095: the ring — after the vkDeviceWaitIdle above, so no fence, semaphore
+	// or parked command buffer in it is still pending.
+	vk_weave_sync_ring_destroy(c);
 	if (c->shared_submit_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->shared_submit_fence, NULL);
 		c->shared_submit_fence = VK_NULL_HANDLE;
@@ -11832,6 +12703,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	os_mutex_destroy(&c->cursor_measure_mutex);
 	os_cond_destroy(&c->weave_hand.cond);
 	os_mutex_destroy(&c->weave_hand.mutex);
+	os_mutex_destroy(&c->wsync.mutex); // #2095: ring resources went with the device idle above
 	os_mutex_destroy(&c->ws_dead.mutex);
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	os_mutex_destroy(&c->seg_pub_mutex);
@@ -12056,16 +12928,16 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		 * its own queue before returning, which CPU-orders those uploads ahead
 		 * of whichever queue we later submit the recorded weave on.
 		 *
-		 * Android CNSDK DP (2026-10-12, CNSDK 0.10.75): this swap does NOT move
-		 * its submits. leia_interlacer_vulkan_initialize takes no queue at all;
-		 * CRendererVulkan::Init picks the first GRAPHICS family and calls
-		 * vkGetDeviceQueue(device, family, 0) — queue index 0, i.e. the APP's
-		 * queue on a two-queue device — and dereferences it live on every weave
-		 * pass, Apply2DEffect and one-time upload. Those submits are serialised
-		 * against the app's only because the per-queue lock layer wraps every
-		 * vkQueueSubmit in the process (#1905). The #837 queue-only post-weave
-		 * drain (dxr_postwait_queue_only) therefore does not cover CNSDK's
-		 * weave on such a device; tracked in #2012, behaviour unchanged.
+		 * Android CNSDK DP: up to CNSDK 0.10.75 this swap did NOT move its
+		 * submits — leia_interlacer_vulkan_initialize took no queue, and
+		 * CRendererVulkan::Init picked vkGetDeviceQueue(device, family, 0),
+		 * the APP's queue on a two-queue device, live on every weave pass.
+		 * Since 0.10.78 (initialize_with_queue, leia-plugin#361 /
+		 * runtime#2084) the DP captures the queue it is shown here — this
+		 * one — and #2012 is settled: the vendor weave runs on
+		 * c->repaint_queue. That is the queue the host-wait path's narrow
+		 * post-weave drain idles, and the queue the #2095 / ADR-055 chain's
+		 * set_weave_sync semaphores are waited and signalled on.
 		 *
 		 * The app frame keeps submitting on the APP's queue deliberately — that
 		 * is what orders the compositor's work after the app's own rendering
@@ -12418,6 +13290,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// #1394: the hand-off handshake runs on its own leaf lock — see weave_hand.mutex.
 	os_mutex_init(&c->weave_hand.mutex);
 	os_cond_init(&c->weave_hand.cond);
+	// #2095: the weave-sync ring's leaf lock — see vk_weave_sync_ring.
+	os_mutex_init(&c->wsync.mutex);
 	os_mutex_init(&c->ws_dead.mutex); // #1782
 #ifdef VK_NATIVE_HAVE_SEGMENTS
 	os_mutex_init(&c->seg_pub_mutex); // multi-screen M3

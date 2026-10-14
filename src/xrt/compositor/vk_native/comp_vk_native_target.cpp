@@ -3369,7 +3369,45 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint)
 {
+	return comp_vk_native_target_acquire_ex(target, out_index, queue, is_repaint, VK_NULL_HANDLE, NULL);
+}
+
+void
+comp_vk_native_target_consume_acquire_signal(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore sem)
+{
 	struct vk_bundle *vk = target->vk;
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	VkSubmitInfo wait_submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &sem,
+	    .pWaitDstStageMask = &wait_stage,
+	};
+#ifdef XRT_OS_ANDROID
+	comp_vk_native_queue_submit_retry(vk, queue, &wait_submit, VK_NULL_HANDLE, "acquire-stale-consume");
+#else
+	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+#endif
+	vk->vkQueueWaitIdle(queue);
+}
+
+xrt_result_t
+comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
+                                 uint32_t *out_index,
+                                 VkQueue queue,
+                                 bool is_repaint,
+                                 VkSemaphore acquire_sem,
+                                 bool *out_acquire_sem_signalled)
+{
+	struct vk_bundle *vk = target->vk;
+
+	// #2095 / ADR-055: which semaphore this acquire signals. The target's own
+	// is consumed below by the dummy submit (host-wait path); a caller-owned
+	// one is left signalled for the caller's first GPU batch to wait.
+	const VkSemaphore acq_sem = acquire_sem != VK_NULL_HANDLE ? acquire_sem : target->image_available;
+	if (out_acquire_sem_signalled != NULL) {
+		*out_acquire_sem_signalled = false;
+	}
 
 	// #1236: refuse to enter the driver with a destroyed swapchain. A failed
 	// recreate below leaves this NULL, and vkAcquireNextImageKHR(…, VK_NULL_HANDLE, …)
@@ -3886,9 +3924,8 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
-	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-	                                          dxr_acquire_timeout_ns(), target->image_available,
-	                                          VK_NULL_HANDLE, &target->current_index);
+	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
+	                                         VK_NULL_HANDLE, &target->current_index);
 	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
@@ -3955,12 +3992,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			}
 		}
 
-		// Retry acquire with new swapchain
-		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-		                                 dxr_acquire_timeout_ns(), target->image_available,
-		                                 VK_NULL_HANDLE, &target->current_index);
+		// #2095: a VK_SUBOPTIMAL_KHR first acquire DID acquire an image and
+		// signalled acq_sem; the recreate above idled the device, so that
+		// signal is now stale with nothing pending on it, and the retry
+		// below may not re-signal a signalled binary semaphore
+		// (VUID-vkAcquireNextImageKHR-semaphore-01286). Consume it the way
+		// the host-wait path always did. Caller-owned semaphore only: the
+		// target's own keeps its pre-existing behaviour byte for byte.
+		if (res == VK_SUBOPTIMAL_KHR && acquire_sem != VK_NULL_HANDLE) {
+			comp_vk_native_target_consume_acquire_signal(target, queue, acq_sem);
+		}
+
+		// Retry acquire with new swapchain. VK_SUBOPTIMAL_KHR IS a success
+		// here: an image was acquired and acq_sem signalled, so treating it
+		// as a failure would strand that signal (#2095 review) — the next
+		// frame presents it and the swapchain is recreated on the following
+		// acquire if it is still suboptimal.
+		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
+		                                VK_NULL_HANDLE, &target->current_index);
 		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
-		if (res != VK_SUCCESS) {
+		if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
 #ifdef XRT_OS_ANDROID
 			// #1236: same reasoning as the primary acquire path — a surface that
@@ -4022,6 +4073,18 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		return XRT_ERROR_VULKAN;
 	}
 
+	if (acquire_sem != VK_NULL_HANDLE) {
+		// #2095 / ADR-055: the caller's semaphore now carries one pending
+		// signal, which the caller's first batch on the image waits on the
+		// GPU. No dummy submit, no vkQueueWaitIdle — that pair is exactly
+		// the acquire-side host drain the chain exists to remove.
+		if (out_acquire_sem_signalled != NULL) {
+			*out_acquire_sem_signalled = true;
+		}
+		*out_index = target->current_index;
+		return XRT_SUCCESS;
+	}
+
 	// Wait for the acquired image to be available by doing a dummy submit
 	// that waits on the image_available semaphore.
 	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -4045,6 +4108,12 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_vk_native_target_get_image_count(struct comp_vk_native_target *target)
+{
+	return target != NULL ? target->image_count : 0;
 }
 
 #ifdef XRT_OS_ANDROID
@@ -4077,6 +4146,15 @@ comp_vk_native_queue_submit_retry(
 xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted)
 {
+	return comp_vk_native_target_present_ex(target, queue, counted, VK_NULL_HANDLE);
+}
+
+xrt_result_t
+comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
+                                 VkQueue queue,
+                                 bool counted,
+                                 VkSemaphore wait_sem)
+{
 	struct vk_bundle *vk = target->vk;
 
 	// Witness counts at the dispatch point so the DComp-bridge path (which
@@ -4096,12 +4174,14 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 #endif
 
-	// No semaphore wait needed — the compositor calls vkQueueWaitIdle
-	// after all rendering commands before presenting.
+	// Host-wait callers pass VK_NULL_HANDLE: they drained (vkQueueWaitIdle /
+	// a fence) before presenting, so there is nothing to wait. #2095 / ADR-055
+	// chained callers pass the semaphore their final batch signals, and have
+	// waited nothing on the host.
 	VkPresentInfoKHR present_info = {
 	    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-	    .waitSemaphoreCount = 0,
-	    .pWaitSemaphores = NULL,
+	    .waitSemaphoreCount = wait_sem != VK_NULL_HANDLE ? 1u : 0u,
+	    .pWaitSemaphores = wait_sem != VK_NULL_HANDLE ? &wait_sem : NULL,
 	    .swapchainCount = 1,
 	    .pSwapchains = &target->swapchain,
 	    .pImageIndices = &target->current_index,

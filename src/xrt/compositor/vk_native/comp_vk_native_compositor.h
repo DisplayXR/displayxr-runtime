@@ -422,6 +422,19 @@ void
 comp_vk_native_compositor_note_app_swapchain(struct comp_vk_native_compositor *c, uint32_t image_count);
 
 /*!
+ * #2095 / ADR-055: wait (bounded) for the last chained in-process weave that
+ * reads image @p index of @p xsc — every image when @p index is UINT32_MAX —
+ * to retire on the GPU. No-op when nothing chained ever read it or it has
+ * already retired, which is the common case; a timeout WARNs (throttled) and
+ * returns. Any thread: xrWaitSwapchainImage and swapchain destroy call it
+ * from the app thread while the weave thread commits.
+ */
+void
+comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *c,
+                                              struct xrt_swapchain *xsc,
+                                              uint32_t index);
+
+/*!
  * Get the queue family index from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native
