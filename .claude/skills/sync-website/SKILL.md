@@ -32,11 +32,11 @@ The DisplayXR website is kept in sync with the org by a **two-layer** system
 touch the same fields: the skill edits authored TSX (`lib/data/roadmap.ts`,
 `lib/data/ecosystem.ts`, `lib/data/news.ts`, `lib/constants.ts`,
 `app/architecture/page.tsx`, `app/extensions/page.tsx`, `lib/data/devices.ts`,
-`app/contribute/page.tsx`) and **never** the `lib/data/generated/*.json` files.
+`app/contribute/page.tsx`, `app/components/page.tsx`, `lib/data/components.ts`) and **never** the `lib/data/generated/*.json` files.
 
 ### Site IA note (hub-led, since the 2026-10 overhaul)
 The header is five one-click hubs: About · Browser · Developers · Contribute ·
-Display Vendors, plus Download and Docs ↗. `/browser` is the DisplayXR Browser's
+Components (`/components`; the old `/vendors` 308s there), plus Download and Docs ↗. `/browser` is the DisplayXR Browser's
 product page (`/web` and `/webxr` 308 there); the homepage tells the project story
 and carries only one browser teaser band. Copy follows the website CLAUDE.md positioning rules: "spatial
 display(s)" is the canonical term; DisplayXR *extends* OpenXR, never "replaces" it,
@@ -283,6 +283,7 @@ structure. Concrete mapping:
 | User-facing new ADR | `app/architecture/page.tsx` (product-level) and/or the headline-ADR array in `app/contribute/page.tsx` (contributor-facing) | A sentence/paragraph summarizing the decision in product terms (NOT the ADR's internal rationale). Most ADRs are internal — skip them; a genuinely notable one belongs on /architecture, a contributor-relevant one in the /contribute headline list. |
 | New featured repo | `lib/data/ecosystem.ts` (+ `lib/constants.ts` `REPO_URLS`) | An `EcosystemRepo` entry: name, repo, one-sentence description, `category`, optional `status` (`shipping` once it has a public release). Surfaces automatically on `/about`'s `EcosystemMap` **and** `/contribute`'s repo map — no page edit needed. Set `releasesOnly: true` on a repo that only publishes installers and takes issues while its source is private (today: `displayxr-shell-releases`, `displayxr-browser`); that keeps it off `/contribute`'s "Where the code lives" map. Never describe such a product as open source (nor as closed — make no claim). |
 | New extension | `app/extensions/page.tsx` | An entry in the `editorial` overlay, keyed by the extension name (the list itself is generated from the runtime headers): optional `title`, `status`, `tier` (`'essential'` \| `'advanced'`), and the three sentences the page renders — `vanillaGap` (completes "Vanilla OpenXR assumes …"), `adds` ("This adds …"), `needIf` ("You need it if …"). Derive them from the header and `docs/specs/extensions/<name>.md`; never infer. A missing key builds with a warning and renders the extension without its editorial copy. |
+| New component class or implementer (ADR-054) | `lib/data/components.ts` | The class cards on `/components` are data: one entry per class (`status` chip = `shipped` \| `core merged` \| `designed` \| `planned`, `shippedIn` = the first runtime tag carrying the core, compared against the generated runtime version so the chip flips itself; `impls` = known implementers with their own verification chip, e.g. `build-verified` for one never run on hardware). A new class, a core landing on `main`, its first tagged release, or a new third-party implementer each change this file — never the page TSX. |
 | New device | `lib/data/devices.ts` | A `Device` entry — only when the user supplies the hardware (not auto-discoverable). |
 | Closed milestone | `lib/data/roadmap.ts` | Move the matching item to the `done` phase, or add a `done` entry; trim the corresponding `now`/`next` item. |
 | News-worthy release (§2.6) | `lib/data/news.ts` | A `NewsItem` **prepended** to `NEWS` (the array is newest-first). See the writing rules below. |

@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-10-13
 deciders: David Fattal
 issues: []
@@ -8,7 +8,7 @@ related: [ADR-019, ADR-020, ADR-034, ADR-035, ADR-043, ADR-045, ADR-051, ADR-053
 
 # ADR-054: Component model — a trunk with peer component classes over versioned C ABIs
 
-**Status:** Proposed (2026-10-13, owner decisions after a cross-session review of the three
+**Status:** Accepted (2026-10-13, owner decisions after a cross-session review of the three
 plug-in classes) · supersedes nothing — this is the umbrella the class records sit under:
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) / [ADR-020](ADR-020-plugin-abi-compatibility-policy.md)
 (display processors), [ADR-034](ADR-034-input-provider-plugins.md) (input providers),
