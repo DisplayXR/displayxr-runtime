@@ -190,6 +190,8 @@ public static class Components
         };
         // ADR-053: only from a CLI whose snapshot carries the conversion rows.
         if (s is { ConvKnown: true }) list.Add(ConversionProviders(s, Of(policies, ComponentClass.Conversion)));
+        // ADR-053 P4: the model store's packs (a CLI that predates the store sends none).
+        if (s is { Packs.Count: > 0 }) list.Add(ModelPacks(s));
         if (StereoCamera(info) is { } cam) list.Add(cam);
         list.Add(ByClass(s, "diagnostics", "Diagnostics clients", DiagClass,
             "Read-only status readers, such as this dashboard's own status feed and the CLI.", collapsed: true));
@@ -492,6 +494,55 @@ public static class Components
         if (pol.Preferred) chips.Add(("preferred", Level.Info));
         if (pol.Untrusted) chips.Add(("refused: provenance", Level.Warn));
         if (pol.ProvenanceChip is { } pc) chips.Add(pc);
+    }
+
+    /// <summary>The state chip of one model pack: installed green, downloading blue with its percentage, evicted amber.</summary>
+    public static (string Text, Level Level) PackChip(ConvPack p) => p.State switch
+    {
+        "installed" => ("installed", Level.Ok),
+        "downloading" => (p.Progress >= 0 ? $"downloading {Math.Round(p.Progress * 100)}%" : "downloading", Level.Info),
+        "evicted" => ("evicted (re-downloads on use)", Level.Warn),
+        "partial" => ("partly installed", Level.Info),
+        "absent" => ("not installed (downloads on use)", Level.Plain),
+        var other => (other, Level.Plain),
+    };
+
+    private static string Megabytes(long bytes) =>
+        bytes >= 1024L * 1024L ? $"{Math.Round(bytes / (1024.0 * 1024.0))} MB" : $"{Math.Max(0, bytes / 1024)} KB";
+
+    /// <summary>
+    /// ADR-053 P4: one row per model pack in the runtime-owned store (installed / downloading with
+    /// progress / evicted), read from disk by the CLI. Models a pack's provider downloads on demand
+    /// are never a failure: a pack that is absent or evicted fetches on first use.
+    /// </summary>
+    public static ComponentSection ModelPacks(StatusSnapshot s)
+    {
+        var items = new List<ComponentItem>();
+        foreach (var p in s.Packs)
+        {
+            var chip = PackChip(p);
+            var lines = new List<string>
+            {
+                string.Join(Sep, new[]
+                {
+                    p.Provider.Length > 0 ? "for " + p.Provider : "",
+                    $"{p.ModelsInstalled} of {Plural(p.Models, "model", "models")} installed",
+                    $"{Megabytes(p.BytesInstalled)} of {Megabytes(p.BytesTotal)}",
+                }.Where(x => x.Length > 0)),
+            };
+            if (p.State == "downloading" && p.DownloadTotal > 0)
+                lines.Add($"downloading {Megabytes(p.DownloadDone)} of {Megabytes(p.DownloadTotal)}");
+            if (p.ResearchModels > 0)
+                lines.Add($"{Plural(p.ResearchModels, "model is", "models are")} non-commercial: used only with AllowResearchOnly");
+            items.Add(new ComponentItem(p.Pack, chip.Level, new[] { chip }, lines));
+        }
+        int installed = s.Packs.Count(p => p.State == "installed");
+        return new ComponentSection("conversion_models", "Conversion models",
+            "Model packs the runtime keeps in one shared store; providers load their models from it and download missing ones on first use.",
+            s.Packs.Count, installed,
+            $"{installed} of {Plural(s.Packs.Count, "pack", "packs")} installed"
+              + (s.ModelStoreRoot is { Length: > 0 } r ? $"{Sep}{r}" : ""),
+            items);
     }
 
     public static ComponentSection? StereoCamera(InfoComponents info)

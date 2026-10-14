@@ -99,4 +99,56 @@ public class ConversionProvidersTests
         Assert.Equal(Level.Critical, Components.TaskChip(T("FAILED", "crash_loop")).Level);
         Assert.Equal(("something_new", Level.Plain), Components.TaskChip(T("SOMETHING_NEW")));
     }
+    private const string WithPacks = """
+    {
+      "schema": 1, "source": "service",
+      "generation": { "topology": 1, "status": 3, "conversion": 4 },
+      "runtime": { "version": "2.43.0", "git_tag": "v2.43.0", "plugin_abi": 5 },
+      "plugins": [], "screens": [], "clients": [], "workspace": { "enabled": false, "controller": null, "screens": [] },
+      "warnings": [], "conv_providers": [], "conv_tasks": [],
+      "conv_model_store": { "root": "C:\\ProgramData\\DisplayXR\\Models", "source": "%ProgramData% default" },
+      "conv_packs": [
+        { "pack": "dxr-open-depth", "provider": "open-conversion", "state": "downloading", "models": 4, "models_installed": 2,
+          "research_models": 1, "bytes_total": 838860800, "bytes_installed": 115343360, "download_done": 31457280,
+          "download_total": 62914560, "progress": 0.5 },
+        { "pack": "sim", "provider": "sim-conversion", "state": "evicted", "models": 1, "models_installed": 0,
+          "research_models": 0, "bytes_total": 1024, "bytes_installed": 0, "download_done": 0, "download_total": 0,
+          "progress": -1 },
+        { "pack": "vendor", "provider": "x", "state": "installed", "models": 1, "models_installed": 1,
+          "research_models": 0, "bytes_total": 2048, "bytes_installed": 2048, "download_done": 0, "download_total": 0,
+          "progress": -1 }
+      ]
+    }
+    """;
+
+    [Fact]
+    public void ModelPacksShowInstalledDownloadingEvicted()
+    {
+        var s = TestData.Parse(WithPacks);
+        Assert.Equal(3, s.Packs.Count);
+        Assert.Equal(@"C:\ProgramData\DisplayXR\Models", s.ModelStoreRoot);
+        var sec = Components.Build(s, null).Single(c => c.Id == "conversion_models");
+        Assert.Equal(3, sec.Count);
+        Assert.Equal(1, sec.Connected);
+        Assert.StartsWith("1 of 3 packs installed", sec.ConnectedLine);
+
+        var open = sec.Items[0];
+        Assert.Equal("dxr-open-depth", open.Name);
+        Assert.Contains(open.Chips, c => c.Text == "downloading 50%" && c.Level == Level.Info);
+        Assert.Contains(open.Lines, l => l.Contains("2 of 4 models installed") && l.Contains("110 MB of 800 MB"));
+        Assert.Contains(open.Lines, l => l == "downloading 30 MB of 60 MB");
+        Assert.Contains(open.Lines, l => l.Contains("non-commercial"));
+
+        Assert.Equal(Level.Warn, sec.Items[1].Level);
+        Assert.Contains(sec.Items[1].Chips, c => c.Text.StartsWith("evicted"));
+        Assert.Equal(Level.Ok, sec.Items[2].Level);
+    }
+
+    [Fact]
+    public void AnOlderCliHasNoModelsSection()
+    {
+        var s = TestData.Parse(WithConv);
+        Assert.Empty(s.Packs);
+        Assert.DoesNotContain(Components.Build(s, null), c => c.Id == "conversion_models");
+    }
 }
