@@ -306,6 +306,56 @@ jobs:
             exit 1
           }
           Write-Host "PASS: runtime DLL has zero SimulatedReality imports (ADR-019 §2.1 holds)."
+          # ADR-054 N4: the trunk is more than the runtime DLL. The service and
+          # the CLI host every class loader too, and a vendor or a reference
+          # component (sim_display, sim_input, sim_conversion, the Ultraleap
+          # provider and its LeapC.dll) must reach them only through a loader,
+          # never through the import table or the link line. Two views, both
+          # asserted: what each binary imports (dumpbin /dependents) and what
+          # each binary's link edge named (the Release LINK_LIBRARIES in the
+          # Ninja Multi-Config impl file), because a static library drags in no
+          # import and shows only on the link line.
+          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe")
+          $forbiddenDeps = "SimulatedReality|LeapC|DisplayXR-Sim|DisplayXR-Ultraleap|DisplayXR-LeiaSR|DimencoWeaving"
+          $forbiddenLibs = "drv_sim_display\.lib|drv_leia|drv_ultraleap|SimulatedReality|LeapC|drv_sim_input|drv_sim_conversion"
+          $ninjaFile = "build/CMakeFiles/impl-Release.ninja"
+          if (-not (Test-Path $ninjaFile)) {
+            Write-Host "::error::$ninjaFile missing — the guard cannot see the Release link edges."
+            exit 1
+          }
+          $ninja = Get-Content $ninjaFile -Raw
+          foreach ($bin in $trunk) {
+            if (-not (Test-Path $bin)) {
+              Write-Host "::error::$bin missing — build did not produce expected artifact."
+              exit 1
+            }
+            $deps = & dumpbin /dependents $bin 2>&1 | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.Line.Trim() }
+            $bad = $deps | Where-Object { $_ -match $forbiddenDeps }
+            if ($bad) {
+              Write-Host "::error::ADR-054 §1 regression — $bin imports a component or vendor DLL: $($bad -join ', ')"
+              exit 1
+            }
+            $leaf = [System.IO.Path]::GetFileName($bin)
+            # The edge header is `build <dir>\Release\<leaf>[ <more outputs>]: <rule> ...`,
+            # followed by its indented variables up to the next blank line. The
+            # file is CRLF on Windows, so the blank line is `\r?\n\r?\n`.
+            $m = [regex]::Match($ninja, "(?ms)^build [^\n]*?\\Release\\$([regex]::Escape($leaf))[ :][^\n]*\n(.*?)\r?\n\r?\n")
+            if (-not $m.Success) {
+              Write-Host "::error::could not find the $leaf link edge in $ninjaFile — the guard cannot see its link line."
+              exit 1
+            }
+            $linkLine = ($m.Groups[1].Value -split "`n" | Where-Object { $_ -match 'LINK_LIBRARIES' }) -join ' '
+            if ($linkLine.Length -eq 0) {
+              Write-Host "::error::the $leaf link edge has no LINK_LIBRARIES line — the guard cannot see its link line."
+              exit 1
+            }
+            $badLibs = ($linkLine -split ' ' | Where-Object { $_ -match $forbiddenLibs } | Sort-Object -Unique)
+            if ($badLibs) {
+              Write-Host "::error::ADR-054 §1 regression — $leaf links a component or vendor library: $($badLibs -join ', ')"
+              exit 1
+            }
+            Write-Host "PASS: $leaf imports no component/vendor DLL and links no drv_*/vendor library."
+          }
           # Also assert that the plug-in DLL we expect IS shipped — guards
           # against a CMake regression that silently drops the plug-in.
           $plugin = "_package/bin/plugins/DisplayXR-SimDisplay.dll"
@@ -331,6 +381,19 @@ jobs:
             exit 1
           }
           Write-Host "PASS: sim-input provider built and exports xrtInputPluginNegotiate."
+          # And the conversion-provider reference (ADR-053 / #2002; required
+          # since ADR-054 §2.3: every class ships a reference implementation).
+          $convPlugin = "_package/bin/plugins/DisplayXR-SimConversion.dll"
+          if (-not (Test-Path $convPlugin)) {
+            Write-Host "::error::$convPlugin missing — sim-conversion provider did not build."
+            exit 1
+          }
+          $convExports = & dumpbin /exports $convPlugin 2>&1 | Select-String -Pattern "xrtConversionPluginNegotiate"
+          if (-not $convExports) {
+            Write-Host "::error::$convPlugin missing xrtConversionPluginNegotiate export (ADR-053 contract — exactly one symbol)."
+            exit 1
+          }
+          Write-Host "PASS: sim-conversion provider built and exports xrtConversionPluginNegotiate."
 
       # Unit tests. `tests/` has carried ~20 Catch2 suites that CI BUILT and never
       # RAN -- `grep -rn ctest .github/workflows/` returned nothing before this
@@ -395,29 +458,22 @@ jobs:
           reg add $inputKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Input" /f | Out-Null
           # ADR-053 / #1999: register the sim conversion provider too, exactly as
           # `register_dev_plugin.bat conv sim` does (ProbeOrder 250, FALLBACK
-          # band; Version written last). The DLL is built by #2002, which lands
-          # in parallel -- until then it is absent and this is a no-op.
-          # TODO(#2002, #2006): once #2002 lands, drop the Test-Path guard (a
-          # missing DLL must fail the job), and #2006 makes the selftest require
-          # conversion_providers.count >= 1.
+          # band; Version written last). The DLL is mandatory since #2002
+          # landed (the vendor-identifier step above already fails on its
+          # absence); ADR-054 §2.3 makes a shipped reference part of what a
+          # class IS, so a missing one is a build regression, not a skip.
           $convKey = "HKLM\Software\DisplayXR\ConversionProviders\sim-conversion"
-          $convPlugin = "_package/bin/plugins/DisplayXR-SimConversion.dll"
-          $convRegistered = $false
-          if (Test-Path $convPlugin) {
-            $convPlugin = (Resolve-Path $convPlugin).Path
-            reg add $convKey /v Binary /t REG_SZ /d "$convPlugin" /f | Out-Null
-            reg add $convKey /v ProbeOrder /t REG_DWORD /d 250 /f | Out-Null
-            reg add $convKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Conversion" /f | Out-Null
-            # #2006: the sim provider's probe declines unless setting ENABLE = 1
-            # (spec §7.2: "CI registers sim-conversion with ENABLE = 1"); without
-            # it the selftest lists the row but never validates a descriptor.
-            reg add "$convKey\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
-            reg add $convKey /v Version /t REG_SZ /d "ci" /f | Out-Null
-            $convRegistered = $true
-            Write-Host "Registered sim-conversion provider: $convPlugin"
-          } else {
-            Write-Host "sim-conversion provider not built yet ($convPlugin absent) -- skipping its registration (#2002)."
-          }
+          $convPlugin = (Resolve-Path "_package/bin/plugins/DisplayXR-SimConversion.dll").Path
+          reg add $convKey /v Binary /t REG_SZ /d "$convPlugin" /f | Out-Null
+          reg add $convKey /v ProbeOrder /t REG_DWORD /d 250 /f | Out-Null
+          reg add $convKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Conversion" /f | Out-Null
+          # #2006: the sim provider's probe declines unless setting ENABLE = 1
+          # (spec §7.2: "CI registers sim-conversion with ENABLE = 1"); without
+          # it the selftest lists the row but never validates a descriptor.
+          reg add "$convKey\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+          reg add $convKey /v Version /t REG_SZ /d "ci" /f | Out-Null
+          $convRegistered = $true
+          Write-Host "Registered sim-conversion provider: $convPlugin"
           # Registration is no longer enough: since ADR-034 Amendment 1
           # sim-input's probe() declines unless DXR_SIM_INPUT is set, so that a
           # stray registration on a dev box can't put synthetic controllers in
@@ -564,6 +620,131 @@ jobs:
             exit $code
           }
           Write-Host "PASS: headless self-test + per-display claim resolution succeeded."
+
+      # ADR-054 N4 — per-class conformance. The self-test above proves each
+      # class's reference component is discovered and selected. This step
+      # proves the loader CONTRACT around it, class by class, with the same
+      # hardware-free registrations: Enabled=0 falls back (§2.5/§2.6),
+      # Preferred wins (§2.6), and an ABI-major-mismatched component is
+      # rejected and fallen through — never dispatched (§2.1, ADR-020 rule 3).
+      # The ABI fixtures are the test-only stub modules the unit tests build
+      # (tests_conversion_loader_stub_*_abi.dll), registered by path exactly as
+      # a vendor plug-in would be; they live in the build tree, which the #952
+      # guard refuses by design, so the documented dev override is set for
+      # this step only. Rows are HKLM (the runner is admin) and are removed in
+      # the finally block. Every verdict is read from `selftest --json` fields,
+      # never from log text. Gaps, by design, until N3 lands: DP has no
+      # `Enabled` (#2049) and input/conversion have no `prefer` verb through
+      # the loader (#2048), so those two cells are not asserted yet.
+      - name: Per-class conformance (ADR-054 N4)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $cli = "_package/bin/displayxr-cli.exe"
+          $simDp   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimDisplay.dll").Path
+          $simIn   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimInput.dll").Path
+          $simConv = (Resolve-Path "_package/bin/plugins/DisplayXR-SimConversion.dll").Path
+          $stubDir = if (Test-Path "build/tests/Release") { "build/tests/Release" } else { "build/tests" }
+          $fxDp   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_dp_abi.dll").Path
+          $fxIn   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_input_abi.dll").Path
+          $fxConv = (Resolve-Path "$stubDir/tests_conversion_loader_stub_abi.dll").Path
+          $dpRoot = "HKLM\Software\DisplayXR\DisplayProcessors"
+          $inRoot = "HKLM\Software\DisplayXR\InputProviders"
+          $cvRoot = "HKLM\Software\DisplayXR\ConversionProviders"
+
+          function Reg-Row($root, $id, $bin, $order) {
+            reg add "$root\$id" /v Binary /t REG_SZ /d "$bin" /f | Out-Null
+            reg add "$root\$id" /v ProbeOrder /t REG_DWORD /d $order /f | Out-Null
+            reg add "$root\$id" /v DisplayName /t REG_SZ /d "$id" /f | Out-Null
+          }
+          function Selftest-Json {
+            $raw = (& $cli selftest --json 2>$null | Out-String)
+            $script:lastExit = $LASTEXITCODE
+            $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+            if ($s -lt 0 -or $e -le $s) { throw "selftest --json emitted no JSON object (exit $script:lastExit)" }
+            return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+          }
+          function Plugin($o, $id)  { $o.plugins | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
+          function ConvRow($o, $id) { $o.conversion_providers.providers | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
+          function Check($o, $name) { $o.checks | Where-Object { $_.name -eq $name } | Select-Object -First 1 }
+          $script:fails = @()
+          function Expect($cond, $msg) {
+            if ($cond) { Write-Host "PASS: $msg" } else { Write-Host "::error::FAIL: $msg"; $script:fails += $msg }
+          }
+
+          $env:DXR_SIM_INPUT = "1"
+          $env:DXR_ALLOW_DEV_PLUGIN_PATHS = "1"
+          try {
+            Reg-Row $dpRoot "sim-display" $simDp 200
+            Reg-Row $inRoot "sim-input" $simIn 200
+            Reg-Row $cvRoot "sim-conversion" $simConv 250
+            reg add "$cvRoot\sim-conversion\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+
+            # 1. The reference component is selected, per class.
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "baseline: selftest exit 0 (got $lastExit)"
+            Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: sim-display is ACTIVE"
+            Expect ($o.input_providers.active_id -eq "sim-input") "input: sim-input is the active provider"
+            Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: sim-conversion NEGOTIATED"
+
+            # 2. Enabled=0 falls back (input, conversion). DP gains Enabled in N3 (#2049).
+            reg add "$inRoot\sim-input" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            reg add "$cvRoot\sim-conversion" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "Enabled=0: selftest still exit 0 (got $lastExit)"
+            Expect (([int]$o.input_providers.enabled -eq 0) -and (-not $o.input_providers.active)) "input: Enabled=0 -> nothing loaded, qwerty keeps the hand roles"
+            Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok on a disabled row"
+            Expect (((ConvRow $o "sim-conversion").load -eq "DISABLED") -and ([int]$o.conversion_providers.negotiated -eq 0)) "conversion: Enabled=0 -> DISABLED, nothing negotiated"
+            reg delete "$inRoot\sim-input" /v Enabled /f | Out-Null
+            reg delete "$cvRoot\sim-conversion" /v Enabled /f | Out-Null
+
+            # 3. Preferred wins (DP: PreferredPlugin hoists a worse-ranked plug-in).
+            Reg-Row $dpRoot "sim-display-alt" $simDp 210
+            reg add $dpRoot /v PreferredPlugin /t REG_SZ /d "sim-display-alt" /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "Preferred: selftest exit 0 (got $lastExit)"
+            Expect ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") "DP: PreferredPlugin=sim-display-alt wins over ProbeOrder"
+            Expect ((Plugin $o "sim-display").load_result -eq "NOT_ATTEMPTED") "DP: the better-ranked sim-display was not even tried"
+            reg delete $dpRoot /v PreferredPlugin /f | Out-Null
+            reg delete "$dpRoot\sim-display-alt" /f | Out-Null
+
+            # 4. ABI-major mismatch, per class: rejected, never dispatched, fallen through.
+            Reg-Row $dpRoot "abi-fixture-dp" $fxDp 10
+            Reg-Row $inRoot "abi-fixture-input" $fxIn 10
+            Reg-Row $cvRoot "abi-fixture-conv" $fxConv 10
+            $o = Selftest-Json
+            # The DP gate fails the self-test ON PURPOSE here: a better-ranked DP
+            # that could not load is a misconfiguration (#1212) — and it must say
+            # why. The other two classes fall through and stay green.
+            Expect ($lastExit -ne 0) "DP: a better-ranked ABI-mismatched DP fails the self-test (exit $lastExit)"
+            $vdp = Check $o "vendor_dp"
+            Expect ((-not $vdp.ok) -and ($vdp.detail -match "ABI")) "DP: vendor_dp names the ABI mismatch ($($vdp.detail))"
+            Expect ((Plugin $o "abi-fixture-dp").load_result -eq "ABI_MISMATCH") "DP: fixture recorded as ABI_MISMATCH"
+            Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: fell through to sim-display"
+            Expect (([int]$o.input_providers.scan_failed -eq 1) -and ($o.input_providers.active_id -eq "sim-input")) "input: fixture counted failed-to-load, sim-input still active"
+            Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok (fall-through is not a fault)"
+            Expect ((ConvRow $o "abi-fixture-conv").load -eq "ABI_MISMATCH") "conversion: fixture recorded as ABI_MISMATCH"
+            Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: fell through to sim-conversion"
+            Expect ((Check $o "conversion_providers").ok) "conversion: the conversion_providers check stays ok"
+          } finally {
+            foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
+                             "$inRoot\sim-input", "$inRoot\abi-fixture-input",
+                             "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv")) {
+              reg delete $k /f 2>$null | Out-Null
+            }
+            reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
+            Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
+            Remove-Item Env:\DXR_ALLOW_DEV_PLUGIN_PATHS -ErrorAction SilentlyContinue
+          }
+          if ($script:fails.Count -gt 0) {
+            Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
+            exit 1
+          }
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / ABI mismatch rejected and fallen through."
+          # Explicit: the pwsh step otherwise exits with the LAST native command's
+          # code, and the finally block's best-effort `reg delete` of an
+          # already-removed value legitimately returns 1.
+          exit 0
 
       # The DisplayXR Dashboard (src/dashboard, Avalonia/.NET) is published into
       # _package/bin before the installer is packed, so the installer ships it.

@@ -361,6 +361,9 @@ struct cli_query_result
 	 * state of any box whose tracker is unplugged, and it is a PASS: the
 	 * arbiter hands the hand roles to qwerty, which is exactly right. */
 	int input_provider_count;    //!< registered providers (enumerated, unloaded)
+	int input_enabled_count;     //!< ...of which Enabled (ADR-054 N4: Enabled=0 must fall back)
+	int input_scan_declined;     //!< loader scan: providers that declined cleanly
+	int input_scan_failed;       //!< loader scan: providers that could not be dispatched (load / ABI)
 	bool input_force_qwerty;     //!< ForceQwerty override set
 	bool input_provider_active;  //!< a provider claimed the system
 	bool input_provider_present; //!< …and its hardware is there right now

@@ -497,7 +497,11 @@ if(TARGET tests_conversion_loader)
 	# Three stub binaries the loader is pointed at by path (never registered):
 	# a well-formed provider, the same provider built against the next ABI
 	# major, and a display-processor-shaped DLL with no conversion entry point.
-	foreach(_stub ok abi dp)
+	# ADR-054 N4 adds the display and input shapes and their ABI-mismatch
+	# twins (`*_dp_abi`, `*_input_abi`): CI's per-class conformance step
+	# registers those under HKLM for one self-test run to prove every class
+	# loader rejects a foreign ABI major and falls through (ADR-020 rule 3).
+	foreach(_stub ok abi dp dp_abi input input_abi)
 		add_library(tests_conversion_loader_stub_${_stub} MODULE tests_conversion_loader_stub.c)
 		target_link_libraries(tests_conversion_loader_stub_${_stub} PRIVATE xrt-interfaces)
 		set_target_properties(tests_conversion_loader_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
@@ -509,6 +513,15 @@ if(TARGET tests_conversion_loader)
 							 "STUB_PLUGIN_API=(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT + 1)"
 		)
 	target_compile_definitions(tests_conversion_loader_stub_dp PRIVATE STUB_KIND_DISPLAY)
+	target_compile_definitions(
+		tests_conversion_loader_stub_dp_abi PRIVATE STUB_KIND_DISPLAY
+							    "STUB_PLUGIN_API=(XRT_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	target_compile_definitions(tests_conversion_loader_stub_input PRIVATE STUB_KIND_INPUT)
+	target_compile_definitions(
+		tests_conversion_loader_stub_input_abi PRIVATE STUB_KIND_INPUT
+							       "STUB_PLUGIN_API=(XRT_INPUT_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
 	target_compile_definitions(
 		tests_conversion_loader
 		PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
