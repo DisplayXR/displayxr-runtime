@@ -29,10 +29,14 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
+// CGDisplayCreateUUIDFromDisplayID is declared in ColorSync, not CoreGraphics
+// (see os_display_desktop_macos.c); aux_os already links the framework.
+#include <ColorSync/ColorSync.h>
 
 #include "comp_metal_placement.h"
 
 #include "util/u_logging.h"
+#include "util/u_window_replug.h" // restore-on-replug geometry (pure math)
 
 #include <math.h>
 #include <pthread.h>
@@ -126,6 +130,17 @@ screen_for_top_left(NSRect content, NSWindow *win)
 	unsigned cursor_edges;
 	NSCursor *cursor_ours;
 	NSCursor *cursor_prev;
+	//! Restore on replug (see noteHome / replugCheck). The screen the window
+	//! last sat on (its display UUID: stable across replug, unlike a
+	//! CGDirectDisplayID) and the frame's top-left offset from that screen's
+	//! top-left (top-down pt). `evicted` = that screen went away and the OS
+	//! moved the window off it; the record is frozen until the screen returns
+	//! (restore) or the user moves the window (their choice wins).
+	NSString *home_uuid;
+	double home_dx, home_dy;
+	bool evicted;
+	bool replug_check_queued;
+	bool replug_disabled;
 
 	// ---- guarded by lock ----
 	bool pending;
@@ -165,6 +180,9 @@ screen_for_top_left(NSRect content, NSWindow *win)
 @property(nonatomic, strong) NSMutableArray *observers;
 - (void)queueZoom:(NSRect)frame;
 - (void)noteNativeResize;
+- (void)noteHome;
+- (void)scheduleReplugCheck;
+- (void)replugCheck;
 @end
 
 @implementation DXRWindowDelegateProxy
@@ -316,6 +334,58 @@ content_px(NSRect content, CGFloat scale, int32_t *out_x, int32_t *out_y)
 	*out_y = (int32_t)llround((main_screen_height() - NSMaxY(content)) * scale);
 }
 
+//! The stable identity of @p s: its display UUID (nil when it has none, e.g.
+//! a display that vanished between calls).
+static NSString *
+screen_uuid(NSScreen *s)
+{
+	NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+	if (n == nil) {
+		return nil;
+	}
+	CFUUIDRef u = CGDisplayCreateUUIDFromDisplayID((CGDirectDisplayID)n.unsignedIntValue);
+	if (u == NULL) {
+		return nil;
+	}
+	CFStringRef str = CFUUIDCreateString(NULL, u);
+	CFRelease(u);
+	return (__bridge_transfer NSString *)str;
+}
+
+//! The connected screen whose display UUID is @p uuid, or nil. "Connected" is
+//! asked of CoreGraphics too: on an unplug CG drops the display before AppKit
+//! updates +[NSScreen screens], and the eviction move can arrive in between.
+static NSScreen *
+screen_with_uuid(NSString *uuid)
+{
+	if (uuid == nil) {
+		return nil;
+	}
+	for (NSScreen *s in [NSScreen screens]) {
+		NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+		if (n != nil && CGDisplayIsOnline((CGDirectDisplayID)n.unsignedIntValue) &&
+		    [uuid isEqualToString:screen_uuid(s)]) {
+			return s;
+		}
+	}
+	return nil;
+}
+
+//! An AppKit (bottom-up) rect as a top-down u_window_replug_rect.
+static struct u_window_replug_rect
+td_rect(NSRect r)
+{
+	struct u_window_replug_rect t = {r.origin.x, main_screen_height() - NSMaxY(r), r.size.width, r.size.height};
+	return t;
+}
+
+static bool
+replug_restore_disabled(void)
+{
+	const char *e = getenv("DXR_MACOS_REPLUG_RESTORE");
+	return e != NULL && e[0] == '0';
+}
+
 @implementation DXRMetalPlacement
 
 - (void)noteNativeResize
@@ -347,6 +417,10 @@ content_px(NSRect content, CGFloat scale, int32_t *out_x, int32_t *out_y)
 	if (win == nil) {
 		return;
 	}
+	if (evicted) {
+		evicted = false; // a user zoom while the screen is away: their choice wins
+		home_uuid = nil;
+	}
 	const NSRect cur = [win contentRectForFrameRect:win.frame];
 	content_px(cur, win.backingScaleFactor, &anchor_px_x, &anchor_px_y);
 	NSRect target = [win contentRectForFrameRect:frame];
@@ -361,6 +435,103 @@ content_px(NSRect content, CGFloat scale, int32_t *out_x, int32_t *out_y)
 		U_LOG_W("placement: zoom -> content %.0f,%.0f %.0fx%.0f pt", target.origin.x, target.origin.y,
 		        target.size.width, target.size.height);
 	}
+}
+
+/*!
+ * Record where the window sits on its screen (main thread; on every move /
+ * resize and at create). A move that finds the recorded screen GONE is the OS
+ * evicting the window from an unplugged screen: the record is frozen there,
+ * so the replugged screen can have its window back (replugCheck).
+ */
+- (void)noteHome
+{
+	NSWindow *win = self.window;
+	if (replug_disabled || win == nil || atomic_load(&closed)) {
+		return;
+	}
+	if ((win.styleMask & NSWindowStyleMaskFullScreen) != 0 || win.miniaturized || evicted) {
+		return;
+	}
+	if (home_uuid != nil && screen_with_uuid(home_uuid) == nil) {
+		evicted = true;
+		U_LOG_W("macOS placement: screen %s went away and the OS moved the window off it — its position "
+		        "there (%.0f,%.0f pt from the screen's top-left) is restored if the same screen comes back "
+		        "(DXR_MACOS_REPLUG_RESTORE=0 turns this off)",
+		        home_uuid.UTF8String, home_dx, home_dy);
+		return;
+	}
+	const NSRect frame = win.frame;
+	NSScreen *scr = screen_for_top_left([win contentRectForFrameRect:frame], win);
+	NSString *uuid = scr != nil ? screen_uuid(scr) : nil;
+	if (uuid == nil) {
+		return;
+	}
+	const struct u_window_replug_rect f = td_rect(frame), sr = td_rect(scr.frame);
+	home_uuid = uuid;
+	u_window_replug_offset(&f, &sr, &home_dx, &home_dy);
+}
+
+//! Coalesced: a reconfiguration is a burst of notifications, and AppKit
+//! finishes re-laying out its windows after the first of them.
+- (void)scheduleReplugCheck
+{
+	if (replug_disabled || !evicted || replug_check_queued) {
+		return;
+	}
+	replug_check_queued = true;
+	__weak DXRMetalPlacement *weak_pl = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		DXRMetalPlacement *s = weak_pl;
+		if (s != nil) {
+			s->replug_check_queued = false;
+			[s replugCheck];
+		}
+	});
+}
+
+/*!
+ * The screen the window was evicted from is back: put the window where it was
+ * on it, through the ordinary pending-rect path (one atomic present, woven for
+ * where it lands). Skipped when the window is already back at that spot (the
+ * OS did it), and deferred while it is full-screen or minimised (the next
+ * screen change or move re-checks).
+ */
+- (void)replugCheck
+{
+	NSWindow *win = self.window;
+	if (!evicted || win == nil || atomic_load(&closed)) {
+		return;
+	}
+	NSScreen *home = screen_with_uuid(home_uuid);
+	if (home == nil) {
+		return; // still gone
+	}
+	if ((win.styleMask & NSWindowStyleMaskFullScreen) != 0 || win.miniaturized) {
+		return;
+	}
+	evicted = false;
+	const NSRect cur = win.frame;
+	const struct u_window_replug_rect sr = td_rect(home.frame), vr = td_rect(home.visibleFrame);
+	const struct u_window_replug_rect t =
+	    u_window_replug_restore(home_dx, home_dy, cur.size.width, cur.size.height, &sr, &vr, 64.0);
+	const struct u_window_replug_rect c = td_rect(cur);
+	// Judged by POSITION, not by "is it on that screen": a window the OS left
+	// at the panel's edge is on the panel, and still in the wrong place.
+	if (fabs(c.x - t.x) <= 2.0 && fabs(c.y - t.y) <= 2.0) {
+		U_LOG_W("macOS placement: screen %s is back and the window is already where it was — not moved",
+		        home_uuid.UTF8String);
+		[self noteHome];
+		return;
+	}
+	const NSRect frame = NSMakeRect(round(t.x), round(main_screen_height() - t.y - t.h), t.w, t.h);
+	const NSRect content = [NSWindow contentRectForFrameRect:frame styleMask:win.styleMask];
+	// No phase anchor survives a trip through another screen: anchor at the
+	// target itself (the move is atomic and woven for where it lands).
+	content_px(content, win.backingScaleFactor, &anchor_px_x, &anchor_px_y);
+	[self setPendingContent:content originMoves:true keepFar:false];
+	U_LOG_W("macOS placement: screen %s is back — restoring the window to %.0f,%.0f pt from its top-left "
+	        "(it was parked at %.0f,%.0f pt global)",
+	        home_uuid.UTF8String, t.x - sr.x, t.y - sr.y, cur.origin.x, main_screen_height() - NSMaxY(cur));
 }
 
 //! Re-wrap the window's delegate if the app replaced it (main thread).
@@ -493,6 +664,15 @@ content_px(NSRect content, CGFloat scale, int32_t *out_x, int32_t *out_y)
 		return nil;
 	}
 
+	if (evicted) {
+		// The user is placing the window while its screen is unplugged: their
+		// choice wins over the remembered spot, and the next move records the
+		// screen they put it on.
+		evicted = false;
+		home_uuid = nil;
+		U_LOG_W("macOS placement: window moved by the user while its screen is away — it will not be "
+		        "restored on replug");
+	}
 	mouse_start = m;
 	content_start = [win contentRectForFrameRect:win.frame];
 	content_px(content_start, win.backingScaleFactor, &anchor_px_x, &anchor_px_y);
@@ -835,6 +1015,32 @@ comp_metal_placement_create(void *ns_view, comp_metal_placement_snap_fn snap, vo
 				                                    atomic_store(&s->closed, true);
 			                                    }
 		                                    }]];
+		// Restore on replug: track where the window sits on which screen,
+		// notice the OS evicting it, and put it back when that screen returns.
+		pl->replug_disabled = replug_restore_disabled();
+		if (!pl->replug_disabled) {
+			void (^note)(NSNotification *) = ^(NSNotification *n) {
+				(void)n;
+				DXRMetalPlacement *s = weak_pl;
+				if (s != nil) {
+					[s noteHome];
+					[s scheduleReplugCheck];
+				}
+			};
+			[pl.observers addObject:[nc addObserverForName:NSWindowDidMoveNotification
+			                                        object:win
+			                                         queue:nil
+			                                    usingBlock:note]];
+			[pl.observers addObject:[nc addObserverForName:NSWindowDidResizeNotification
+			                                        object:win
+			                                         queue:nil
+			                                    usingBlock:note]];
+			[pl.observers addObject:[nc addObserverForName:NSApplicationDidChangeScreenParametersNotification
+			                                        object:nil
+			                                         queue:nil
+			                                    usingBlock:note]];
+			[pl noteHome];
+		}
 		ok = true;
 	});
 	if (!ok) {

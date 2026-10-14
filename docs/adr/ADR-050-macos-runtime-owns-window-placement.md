@@ -161,6 +161,49 @@ for it. This is the default; an app can opt out.
 - A window resized past the display the atlas was sized for no longer reads past the atlas (the
   crop blit is clamped; it used to assert under `MTL_DEBUG_LAYER=1`).
 
+## Amendment 1 (2026-10-13): a replugged screen gets its window back
+
+**Symptom.** A `_handle` Metal window (`cube_handle_metal_macos`) on the Odyssey panel, the panel
+unplugged and plugged in again: the window comes back at the panel's **left edge**, wherever it was
+on the panel before.
+
+**Cause: AppKit, not the runtime.** When a screen goes away AppKit moves its windows onto a
+surviving screen, and when the same screen returns it does not move them back. Logged on the
+Odyssey (laptop 1512 × 982 pt as the main display, panel arranged right of it): at the unplug the
+window's content went to x = 1472 pt — parked against the laptop's right edge, 40 pt on it, the
+rest hanging where the panel had been — and at the replug the panel found it there. The runtime's
+own move at the unplug is the app-initiated-move re-snap above: it re-snaps the origin AppKit
+chose (a phase correction of a few px, anchored at the last presented origin); it does not choose
+the position. Nothing in the runtime, the plug-in or the test app moves the window back, or to the
+left edge.
+
+**Decision.** The placement object, which already owns this window's position (Decision 1) and
+already handles "a display reconfiguration" moving it, also restores it:
+
+- On every move / resize (`NSWindowDidMoveNotification`, `NSWindowDidResizeNotification`) and at
+  create it records the screen holding the window — by **display UUID**
+  (`CGDisplayCreateUUIDFromDisplayID`, stable across a replug; a `CGDirectDisplayID` is not) — and
+  the frame's offset from that screen's top-left.
+- A move or screen change (`NSApplicationDidChangeScreenParametersNotification`) that finds the
+  recorded screen gone (not in `+[NSScreen screens]`, or `CGDisplayIsOnline` false — CoreGraphics
+  drops it before AppKit does) marks the window **evicted** and freezes the record.
+- When a screen with that UUID is back (checked 300 ms after the last screen change, coalesced)
+  the window goes back to its offset on it — through the ordinary pending-rect path, so it is one
+  atomic present woven for where it lands — clamped only as far as needed to stay reachable
+  (title bar under the menu bar, 64 pt on screen: `util/u_window_replug.h`, unit-tested in
+  `tests_aux_window_replug`). Skipped when the window is already at that spot (judged by position,
+  not by "is it on that screen": a window left at the panel's edge is on the panel and still
+  wrong), and deferred while it is full-screen or minimised.
+- **The user's choice wins:** a runtime-owned drag, resize or zoom while the screen is away clears
+  the record; the window stays where they put it.
+- Same eligibility as the rest of this ADR: an app that opted out (`XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR`,
+  `DXR_MACOS_NATIVE_DRAG=1`) owns its window across a replug too. `DXR_MACOS_REPLUG_RESTORE=0`
+  turns only this behaviour off.
+
+Not covered: an app that moves its own window with `setFrame:` while the screen is away cannot be
+told apart from AppKit's eviction settling, so it is moved back on the replug. The Vulkan / GL
+macOS paths and IPC sessions inherit this with the rest of the model (Follow-ups).
+
 ## Follow-ups (not in this ADR's implementation)
 
 - **Vulkan and GL on macOS** (`comp_vk_native` over a CAMetalLayer, the GL compositor): same

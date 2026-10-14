@@ -74,6 +74,7 @@ set(tests
     tests_status_ipc
     tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
+    tests_aux_window_replug
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
     tests_aux_weave_span2d
