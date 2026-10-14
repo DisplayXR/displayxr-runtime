@@ -6,6 +6,8 @@
  *         settings the runtime resolves inside each app's own process (#1252).
  *
  *   perf list [--json]        Every allow-listed lever: resolved value + source.
+ *   perf list --all [--json]  Every Tier 1 + Tier 2 lever in the census, read-only
+ *                             (the Dashboard's Developer settings, Phase 2A).
  *   perf set <name> <value>   Write one lever to the per-user store.
  *   perf reset [<name>]       Clear one lever, or all of them.
  *   perf path                 Print the per-user store's path.
@@ -29,6 +31,8 @@
 
 #include "util/u_setting.h"
 
+#include "cli_lever_catalog.h"
+
 #include <cjson/cJSON.h>
 
 #include <stdio.h>
@@ -37,6 +41,89 @@
 #define P(...) printf(__VA_ARGS__)
 
 
+/*!
+ * `perf list --all`: every Tier 1 + Tier 2 lever of the census (the generated
+ * cli_lever_catalog.h), resolved as a process starting right now would resolve
+ * it: this CLI's own environment, then (managed names only) the stores.
+ *
+ * Read-only by design. u_setting_get_raw() consults the per-user / machine
+ * stores only for the names u_setting_is_managed() accepts; every other lever
+ * is read by its own getenv() at its call site, so for those the environment
+ * is the ONLY source and the output says so ("managed": false). Writing such a
+ * name to settings.json would do nothing, which is why `perf set` refuses it.
+ */
+static int
+cmd_list_all(bool json, const char *path, bool have_written, const char *written)
+{
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON_AddStringToObject(root, "user_file", path);
+		if (have_written) {
+			cJSON_AddStringToObject(root, "user_written", written);
+		} else {
+			cJSON_AddNullToObject(root, "user_written");
+		}
+		cJSON_AddStringToObject(root, "resolved_for", "a process starting now (this CLI's environment)");
+		cJSON *arr = cJSON_AddArrayToObject(root, "levers");
+		for (size_t i = 0; i < CLI_LEVER_CATALOG_COUNT; i++) {
+			const struct cli_lever *l = &cli_lever_catalog[i];
+			char buf[256];
+			enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+			const char *val = u_setting_get_raw(l->name, buf, sizeof(buf), &src);
+
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "name", l->name);
+			cJSON_AddNumberToObject(o, "tier", l->tier);
+			cJSON_AddStringToObject(o, "proc", l->proc);
+			cJSON_AddStringToObject(o, "default", l->default_text);
+			cJSON_AddStringToObject(o, "description", l->description);
+			cJSON_AddBoolToObject(o, "managed", u_setting_is_managed(l->name));
+			if (val != NULL && val[0] != '\0') {
+				cJSON_AddStringToObject(o, "value", val);
+			} else {
+				cJSON_AddNullToObject(o, "value");
+			}
+			cJSON_AddStringToObject(o, "source", u_setting_source_str(src));
+			cJSON_AddItemToArray(arr, o);
+		}
+		char *out = cJSON_Print(root);
+		if (out != NULL) {
+			printf("%s\n", out);
+			cJSON_free(out);
+		}
+		cJSON_Delete(root);
+		return 0;
+	}
+
+	P(" :: Developer settings: Tier 1 + Tier 2 levers (read-only)\n");
+	P("\tresolved for a process starting now (this CLI's environment)\n");
+	P("\tstore: %s%s\n", path[0] != '\0' ? path : "<unavailable>", have_written ? "" : "  (not written yet)");
+	int non_default = 0;
+	for (int tier = 1; tier <= 2; tier++) {
+		P("\n\tTier %d - %s\n", tier,
+		  tier == 1 ? "next launch (read when an app or the service starts)"
+		            : "service-scoped (read by the service at its start)");
+		for (size_t i = 0; i < CLI_LEVER_CATALOG_COUNT; i++) {
+			const struct cli_lever *l = &cli_lever_catalog[i];
+			if (l->tier != tier) {
+				continue;
+			}
+			char buf[256];
+			enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+			const char *val = u_setting_get_raw(l->name, buf, sizeof(buf), &src);
+			const bool set = src != U_SETTING_SOURCE_DEFAULT;
+			non_default += set ? 1 : 0;
+			P("\t%c %-34s %-14s [%-7s] %s\n", set ? '*' : ' ', l->name,
+			  (val != NULL && val[0] != '\0') ? val : "<default>", u_setting_source_str(src),
+			  u_setting_is_managed(l->name) ? "settable" : "env only");
+		}
+	}
+	P("\n\t%d of %u lever(s) non-default (marked *).\n", non_default, (unsigned)CLI_LEVER_CATALOG_COUNT);
+	P("\t'env only' levers are read from the environment alone: set the variable before\n");
+	P("\tlaunching the app (or the service). 'settable' levers: perf set / perf reset.\n");
+	return 0;
+}
+
 static int
 cmd_list(int argc, const char **argv)
 {
@@ -44,6 +131,10 @@ cmd_list(int argc, const char **argv)
 	u_setting_user_path(path, sizeof(path));
 	char written[32] = {0};
 	const bool have_written = u_setting_user_written(written, sizeof(written)) != NULL;
+
+	if (cli_has_flag(argc, argv, "--all")) {
+		return cmd_list_all(cli_has_flag(argc, argv, "--json"), path, have_written, written);
+	}
 
 	const uint32_t n = u_setting_managed_count();
 
@@ -172,6 +263,8 @@ print_usage(void)
 {
 	P("Usage: displayxr-cli perf <list|set <name> <value>|reset [name]|path>\n");
 	P("  list [--json]        Allow-listed levers with their resolved value + source.\n");
+	P("  list --all [--json]  Every Tier 1 + Tier 2 lever (read-only): value, source,\n");
+	P("                       compiled default, tier, process; 'managed' ones are settable.\n");
 	P("  set <name> <value>   Write one lever to the per-user store (no admin needed).\n");
 	P("  reset [<name>]       Clear one lever, or every one.\n");
 	P("  path                 Print the per-user store's path.\n");

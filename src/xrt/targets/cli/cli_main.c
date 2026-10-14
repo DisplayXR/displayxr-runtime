@@ -35,7 +35,7 @@ cli_print_help(int argc, const char **argv)
 	P("  selftest [--json] - Headless self-test: discover a display processor and validate\n");
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
 	P("  perf <...>        - Performance settings the runtime reads inside each app.\n");
-	P("                      'perf list [--json]', 'perf set <name> <value>', 'perf reset'.\n");
+	P("                      'perf list [--all] [--json]', 'perf set <name> <value>', 'perf reset'.\n");
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'; per screen:\n");
 	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
