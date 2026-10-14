@@ -2126,15 +2126,25 @@ cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo,
 	// Only the views the arming locate reported active: a layer submitted for
 	// the worst-case mode carries views that are not tiles in this one, and
 	// their poses must not decide drawability.
-	req.view_count = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	// Multi-screen M3: a split frame draws with the view set of the segment
+	// the locate placed the cursor in - views [first, first + count) of the
+	// layer - segment-normalised, at that segment's rect of each tile.
+	const uint32_t first_view = sess->cursor_draw.segment_valid ? sess->cursor_draw.segment_first_view : 0;
+	const uint32_t layer_views = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	req.view_count = layer_views > first_view ? layer_views - first_view : 0;
 	if (sess->cursor_draw.view_count >= 2 && req.view_count > sess->cursor_draw.view_count) {
 		req.view_count = sess->cursor_draw.view_count;
 	}
 	struct u_cursor_depth_view submitted[XRT_MAX_VIEWS];
 	for (uint32_t i = 0; i < req.view_count; i++) {
 		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
-		submitted[i].pose = *(const struct xrt_pose *)&proj->views[i].pose;
-		submitted[i].fov = *(const struct xrt_fov *)&proj->views[i].fov;
+		submitted[i].pose = *(const struct xrt_pose *)&proj->views[first_view + i].pose;
+		submitted[i].fov = *(const struct xrt_fov *)&proj->views[first_view + i].fov;
+	}
+	if (sess->cursor_draw.segment_valid) {
+		req.segment_valid = true;
+		req.segment_rect = sess->cursor_draw.segment_rect;
+		req.segment_canvas = sess->cursor_draw.segment_canvas;
 	}
 	// The same predicate the locate reported with, on the submitted views.
 	if (!u_cursor_draw_placement_drawable(submitted, req.view_count, &sess->cursor_draw.position,

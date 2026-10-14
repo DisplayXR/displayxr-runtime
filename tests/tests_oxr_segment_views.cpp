@@ -647,3 +647,55 @@ TEST_CASE("a segment appearing on a screen of another pitch does not rescale the
 	const float m2v1 = V * oxr_segment_views_vdh_scale(&l2, 1) / l2.seg[1].h_m;
 	CHECK(m2v0 == Catch::Approx(m2v1));
 }
+
+TEST_CASE("segment_views: the cursor is placed in the segment under the pointer")
+{
+	// Two segments of an 800 px canvas, split at 320 px (as in the table above).
+	xrt_segment_view_routing r{};
+	r.count = 2;
+	r.canvas = {{0, 0}, {800, 600}};
+	r.rect[0] = {{0, 0}, {320, 600}};
+	r.rect[1] = {{320, 0}, {480, 600}};
+	r.first_view[1] = 2;
+	r.view_count[0] = r.view_count[1] = 2;
+
+	uint32_t k = 99;
+	float u = -1, v = -1;
+	// On the right segment: re-expressed over it.
+	REQUIRE(oxr_segment_views_cursor_segment(&r, 0.7f, 0.25f, &k, &u, &v));
+	CHECK(k == 1);
+	CHECK(u == Catch::Approx((560.0f - 320.0f) / 480.0f));
+	CHECK(v == Catch::Approx(0.25f));
+	// On the left one.
+	REQUIRE(oxr_segment_views_cursor_segment(&r, 0.1f, 0.9f, &k, &u, &v));
+	CHECK(k == 0);
+	CHECK(u == Catch::Approx(80.0f / 320.0f));
+	// The seam belongs to exactly one segment: the right one (half-open).
+	REQUIRE(oxr_segment_views_cursor_segment(&r, 0.4f, 0.5f, &k, &u, &v));
+	CHECK(k == 1);
+	CHECK(u == Catch::Approx(0.0f).margin(1e-6));
+	// The canvas's own far edges are inside.
+	REQUIRE(oxr_segment_views_cursor_segment(&r, 1.0f, 1.0f, &k, &u, &v));
+	CHECK(k == 1);
+	CHECK(u == Catch::Approx(1.0f));
+	CHECK(v == Catch::Approx(1.0f));
+
+	// A single segment (the window wholly on a secondary screen) is the canvas.
+	xrt_segment_view_routing one{};
+	one.count = 1;
+	one.canvas = {{0, 0}, {800, 600}};
+	one.rect[0] = one.canvas;
+	REQUIRE(oxr_segment_views_cursor_segment(&one, 0.3f, 0.6f, &k, &u, &v));
+	CHECK(k == 0);
+	CHECK(u == Catch::Approx(0.3f));
+	CHECK(v == Catch::Approx(0.6f));
+
+	// Canvas no screen covers, off the canvas, no table: no segment.
+	xrt_segment_view_routing gap = r;
+	gap.rect[1] = {{400, 0}, {400, 600}};
+	CHECK_FALSE(oxr_segment_views_cursor_segment(&gap, 0.45f, 0.5f, &k, &u, &v));
+	CHECK_FALSE(oxr_segment_views_cursor_segment(&r, 1.2f, 0.5f, &k, &u, &v));
+	CHECK_FALSE(oxr_segment_views_cursor_segment(&r, NAN, 0.5f, &k, &u, &v));
+	xrt_segment_view_routing none{};
+	CHECK_FALSE(oxr_segment_views_cursor_segment(&none, 0.5f, 0.5f, &k, &u, &v));
+}

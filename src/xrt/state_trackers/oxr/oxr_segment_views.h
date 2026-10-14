@@ -373,6 +373,52 @@ oxr_segment_views_alias_source(uint32_t i, uint32_t active_view_count)
 	return i < active_view_count ? i : 0;
 }
 
+/*!
+ * XR_DXR_cursor_depth (ADR-046) on a split window: the segment under the
+ * pointer, and the pointer re-expressed in it. Each per-segment view set
+ * frames ONE segment as its canvas, so the cursor is placed - and drawn -
+ * with the views of the segment it is on, the uv taken over that segment.
+ *
+ * @param r      The routing the split locate hands out (rects + canvas, window px).
+ * @param u, v   The hint's cursorUV: normalised over the whole canvas
+ *               (origin top-left, v down).
+ * @param out_k  The segment's index in @p r.
+ * @param out_u, out_v  (u, v) normalised over that segment's rect.
+ *
+ * @return false when no segment holds the point (the part of the canvas no
+ *         screen covers, a point off the canvas, or an empty table).
+ */
+static inline bool
+oxr_segment_views_cursor_segment(
+    const struct xrt_segment_view_routing *r, float u, float v, uint32_t *out_k, float *out_u, float *out_v)
+{
+	if (r == NULL || r->count == 0 || r->count > XRT_MAX_SEGMENTS || r->canvas.extent.w <= 0 ||
+	    r->canvas.extent.h <= 0 || !(u >= 0.0f && u <= 1.0f) || !(v >= 0.0f && v <= 1.0f)) {
+		return false;
+	}
+	const float x = (float)r->canvas.offset.w + u * (float)r->canvas.extent.w;
+	const float y = (float)r->canvas.offset.h + v * (float)r->canvas.extent.h;
+	for (uint32_t k = 0; k < r->count; k++) {
+		const struct xrt_rect *s = &r->rect[k];
+		if (s->extent.w <= 0 || s->extent.h <= 0) {
+			continue;
+		}
+		const float su = (x - (float)s->offset.w) / (float)s->extent.w;
+		const float sv = (y - (float)s->offset.h) / (float)s->extent.h;
+		// Half-open on the far edges, so a point on a shared seam belongs to
+		// exactly one segment - except the canvas's own far edge (uv = 1).
+		const bool in_u = su >= 0.0f && (su < 1.0f || (su <= 1.0f && u >= 1.0f));
+		const bool in_v = sv >= 0.0f && (sv < 1.0f || (sv <= 1.0f && v >= 1.0f));
+		if (in_u && in_v) {
+			*out_k = k;
+			*out_u = su;
+			*out_v = sv;
+			return true;
+		}
+	}
+	return false;
+}
+
 #ifdef __cplusplus
 }
 #endif

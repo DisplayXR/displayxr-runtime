@@ -556,6 +556,8 @@ struct comp_metal_compositor
 		uint64_t default_gen;
 		//! The shared default look (mirrored OS cursor, else the arrow).
 		struct comp_cursor_look look;
+		//! One-shot WARN: a routed frame and its request disagree.
+		bool warned_routed;
 		bool announced;
 		bool warned_zones;
 	} cursor_draw;
@@ -4455,23 +4457,67 @@ metal_cursor_draw(struct comp_metal_compositor *c,
                   uint32_t canvas_px_w,
                   uint32_t canvas_px_h,
                   uint32_t zones_target_w,
-                  uint32_t zones_target_h)
+                  uint32_t zones_target_h,
+                  bool routed)
 {
-	// #1949: a zone request's views are zone-normalised - re-express them in
-	// the tile the way the zone's own layer is placed, and clip to the zone.
+	// Multi-screen M3: a routed frame's tiles are per-segment mosaics, and its
+	// request carries the view set of the segment under the pointer. A frame
+	// and a request that disagree about that draw nothing.
 	// #1952: every way out that draws nothing reports why (the state
 	// tracker then reports willDraw = false at the next locate).
+	if (req->segment_valid != routed) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+		if (!c->cursor_draw.warned_routed) {
+			c->cursor_draw.warned_routed = true;
+			U_LOG_W("cursor_draw: %s - cursor not drawn (one-time warning)",
+			        routed ? "multi-screen routed frame without a segment request"
+			               : "segment request on a frame that is not routed");
+		}
+		return;
+	}
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed, and clip to the zone.
+	// A segment request's are segment-normalised - re-express them at the
+	// segment's rect of the tile, exactly where its layer views are placed
+	// (comp_segments_tile_rect, as metal_route_layer), and clip to it.
 	struct u_cursor_draw_request zreq = *req;
 	float clip[4];
-	if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+	if (req->segment_valid) {
+		const struct comp_seg_rect seg = {
+		    req->segment_rect.offset.w,
+		    req->segment_rect.offset.h,
+		    (uint32_t)(req->segment_rect.extent.w > 0 ? req->segment_rect.extent.w : 0),
+		    (uint32_t)(req->segment_rect.extent.h > 0 ? req->segment_rect.extent.h : 0),
+		};
+		const struct comp_seg_rect canvas = {
+		    req->segment_canvas.offset.w,
+		    req->segment_canvas.offset.h,
+		    (uint32_t)(req->segment_canvas.extent.w > 0 ? req->segment_canvas.extent.w : 0),
+		    (uint32_t)(req->segment_canvas.extent.h > 0 ? req->segment_canvas.extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (atlas_view_w == 0 || atlas_view_h == 0 ||
+		    !comp_segments_tile_rect(&seg, &canvas, atlas_view_w, atlas_view_h, &tr) ||
+		    !u_cursor_draw_into_subrect(&zreq, (float)tr.x / (float)atlas_view_w,
+		                                (float)tr.y / (float)atlas_view_h, (float)tr.w / (float)atlas_view_w,
+		                                (float)tr.h / (float)atlas_view_h, clip)) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+			return;
+		}
+	} else if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
 		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
 		return;
 	}
 	req = &zreq;
 	// The panel px that 0..1 of the (now tile-normalised) views span: the
-	// window for a zone request, else the canvas (ADR-046 B.7 ghost offset).
-	const float tile_px_w = (float)(req->zone_valid ? zones_target_w : canvas_px_w);
-	const float tile_px_h = (float)(req->zone_valid ? zones_target_h : canvas_px_h);
+	// window for a zone request, the segment for a segment request, else the
+	// canvas (ADR-046 B.7 ghost offset).
+	const float tile_px_w = (float)(req->zone_valid      ? zones_target_w
+	                                : req->segment_valid ? (uint32_t)req->segment_rect.extent.w
+	                                                     : canvas_px_w);
+	const float tile_px_h = (float)(req->zone_valid      ? zones_target_h
+	                                : req->segment_valid ? (uint32_t)req->segment_rect.extent.h
+	                                                     : canvas_px_h);
 	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
 
 	if (!metal_cursor_ensure_pipelines(c)) {
@@ -5817,7 +5863,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					canvas_px_h = (uint32_t)output_texture.height;
 				}
 				metal_cursor_draw(c, encoder, &cursor_req, atlas_cols, atlas_rows, atlas_view_w, atlas_view_h,
-				                  compose_linear, canvas_px_w, canvas_px_h, zones_target_w, zones_target_h);
+				                  compose_linear, canvas_px_w, canvas_px_h, zones_target_w, zones_target_h,
+				                  seg_route_in.count > 0);
 			}
 		}
 

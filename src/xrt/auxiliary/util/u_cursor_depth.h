@@ -584,6 +584,23 @@ struct u_cursor_draw_request
 	struct xrt_rect zone_rect;
 
 	/*!
+	 * Multi-screen M3 (ADR-047): the locate split the window into per-screen
+	 * view sets, and the views above are the set of the SEGMENT under the
+	 * pointer - so they are SEGMENT-normalised (0..1 spans the segment's
+	 * rect, which is where a routed frame places that segment's views inside
+	 * each tile) and one unit is the segment's height. The compositor maps
+	 * @ref segment_rect into its tile exactly as it places the segment's
+	 * layer views (the mosaic), re-expresses the views there with
+	 * u_cursor_draw_into_subrect() and clips the draw to it. False
+	 * (zero-initialised) = one view set for the whole window, as before.
+	 */
+	bool segment_valid;
+	//! The segment, and the canvas it was cut from, window pixels, origin
+	//! top-left - xrt_segment_view_routing::rect / ::canvas of the frame.
+	struct xrt_rect segment_rect;
+	struct xrt_rect segment_canvas;
+
+	/*!
 	 * #1952: where the compositor reports what it did with THIS request
 	 * (u_cursor_draw_report_drew / _refused), during the commit that
 	 * consumes it. Owned by the state tracker, which outlives the commit.
@@ -736,9 +753,25 @@ bool
 u_cursor_draw_into_zone(struct u_cursor_draw_request *req, uint32_t target_w, uint32_t target_h, float out_clip[4]);
 
 /*!
+ * The general form of u_cursor_draw_into_zone(): re-express every view of
+ * @p req - normalised over a sub-rect of the tile - in TILE-normalised
+ * coordinates, given that sub-rect (@p x, @p y, @p w, @p h; tile-normalised,
+ * origin top-left). Used for a multi-screen segment request
+ * (u_cursor_draw_request::segment_valid), whose sub-rect is where the
+ * compositor placed that segment's views inside the tile.
+ *
+ * @p out_clip receives the sub-rect clipped to the tile (x, y, w, h).
+ *
+ * @return false if the sub-rect lies entirely outside the tile: draw nothing.
+ */
+bool
+u_cursor_draw_into_subrect(struct u_cursor_draw_request *req, float x, float y, float w, float h, float out_clip[4]);
+
+/*!
  * The height, in the compositor's target pixels, of the canvas the request's
- * unit was built for: the zone's height for a zone request, else
- * @p canvas_px_h (the window / canvas the compositor already uses).
+ * unit was built for: the zone's height for a zone request, the segment's
+ * for a multi-screen segment request, else @p canvas_px_h (the window /
+ * canvas the compositor already uses).
  */
 uint32_t
 u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canvas_px_h);

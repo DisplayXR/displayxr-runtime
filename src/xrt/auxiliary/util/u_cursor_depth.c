@@ -683,6 +683,19 @@ u_cursor_draw_into_zone(struct u_cursor_draw_request *req, uint32_t target_w, ui
 	const float zy = (float)req->zone_rect.offset.h / (float)target_h;
 	const float zw = (float)req->zone_rect.extent.w / (float)target_w;
 	const float zh = (float)req->zone_rect.extent.h / (float)target_h;
+	return u_cursor_draw_into_subrect(req, zx, zy, zw, zh, out_clip);
+}
+
+bool
+u_cursor_draw_into_subrect(struct u_cursor_draw_request *req, float zx, float zy, float zw, float zh, float out_clip[4])
+{
+	out_clip[0] = 0.0f;
+	out_clip[1] = 0.0f;
+	out_clip[2] = 1.0f;
+	out_clip[3] = 1.0f;
+	if (!(zw > 0.0f) || !(zh > 0.0f) || !isfinite(zx) || !isfinite(zy) || !isfinite(zw) || !isfinite(zh)) {
+		return false;
+	}
 
 	const float x0 = zx > 0.0f ? zx : 0.0f;
 	const float y0 = zy > 0.0f ? zy : 0.0f;
@@ -714,6 +727,9 @@ u_cursor_draw_canvas_px_h(const struct u_cursor_draw_request *req, uint32_t canv
 {
 	if (req->zone_valid && req->zone_rect.extent.h > 0) {
 		return (uint32_t)req->zone_rect.extent.h;
+	}
+	if (req->segment_valid && req->segment_rect.extent.h > 0) {
+		return (uint32_t)req->segment_rect.extent.h;
 	}
 	return canvas_px_h;
 }
