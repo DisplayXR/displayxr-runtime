@@ -425,6 +425,38 @@ TEST_CASE("proxy: the stall watchdog kills a hung host (exit 30) and the stream 
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 }
 
+TEST_CASE("proxy: core teardown with a lane stuck mid-convert on a hung host returns (bounded)", "[conv_proxy]")
+{
+	// The host hangs at its 1st convert and the core's stall watchdog is far
+	// away, so at teardown a stream lane is still waiting on the host. The
+	// control thread (which runs the watchdog) stops first; without the
+	// satellite proxies shut down before the lane join, destroy never returns.
+	Fixture fx({"--fake-hang-after", "1"}, 600000 * MS);
+	const uint64_t sid = fx.stream();
+	REQUIRE(fx.submit(sid, 0x41));
+	REQUIRE(wait_until(
+	    [&] {
+		    conv_host_heartbeat hb{};
+		    conv_host_get_heartbeat(fx.host, &hb);
+		    return hb.oldest_op == CONV_OP_CONVERT && hb.oldest_since_ns != 0;
+	    },
+	    20000));
+	std::atomic<bool> done{false};
+	conv_core *core = fx.c;
+	fx.c = nullptr; // destroyed here, not by the fixture
+	std::thread t([&done, core]() mutable {
+		conv_core_destroy(&core);
+		done = true;
+	});
+	const bool returned = wait_until([&] { return done.load(); }, 20000);
+	if (returned) {
+		t.join();
+	} else {
+		t.detach(); // leaked on failure: the assertion below reports it
+	}
+	REQUIRE(returned);
+}
+
 TEST_CASE("proxy: the provider's status (FALLBACK, platform state) crosses the wire", "[conv_proxy]")
 {
 	Fixture fx({});
