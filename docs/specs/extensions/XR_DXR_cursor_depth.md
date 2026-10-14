@@ -250,6 +250,81 @@ sprite per view before the display processor. It reports "not drawn" whenever it
 shown), so the fallback is always the flat OS cursor. Anchor: SCREEN today; HYBRID follows.
 Backend: the D3D11 service (the only lift weave path today).
 
+### 2.8 `XrCursorDepthWeaveRequestDXR` / `XrCursorDepthWeaveStateDXR` (spec v8) — any weave rect
+
+For a present-owner that weaves through `XR_DXR_weave` (the DisplayXR Browser): the runtime draws
+the cursor on any woven rect whose caller supplies a depth (ADR-046 Amendment 4). The caller (the
+page, through the browser) supplies only **the depth under the pointer** and **the cursor it would
+have shown**; the runtime reads the pointer itself inside the submit and does the policy, the
+HYBRID anchor, the softening and the drawing.
+
+- **`XrCursorDepthWeaveRequestDXR`** (input, 1004999328), chained on `XrWeaveSubmitInfoDXR::next`.
+  Chaining it is the per-submit request; a submit without it costs nothing.
+  - `sprite` (`XrCursorDepthWeaveSpriteDXR`): `kind` = `KEEP` (no payload; the current
+    `generation`), `DEFAULT` (the runtime's default look), `NONE` (CSS `cursor: none`: draw
+    nothing), `OS_CURSOR` (`osCursor` = an `HCURSOR`, Windows; rasterised at the bound window's
+    DPI by the same code as the native default look) or `TEXTURE` (`texture` = a shared
+    premultiplied sRGB-encoded RGBA8 texture of `textureKind`, `extent` ≤ 256 × 256,
+    `hotSpotPx`). Send a payload only on change, under a new `generation`. `sizeMeters` ≤ 0 =
+    image px × panel pitch (the OS cursor's own size for `OS_CURSOR` / `DEFAULT`).
+  - `rects` (`XrCursorDepthWeaveRectDXR`, ≤ `XR_WEAVE_SUBMIT_MAX_RECTS_DXR`): per weave rect
+    (`rectIndex` into `XrWeaveSubmitRectsDXR::rects`), `hasContent` and `disparityPx`: the
+    on-screen disparity in device pixels between the two outermost views the caller rendered, of
+    the nearest content under the cursor footprint, < 0 in front of the glass. Raw, not filtered.
+    `sampleUV` is diagnostic; `flags` is reserved (0).
+- **`XrCursorDepthWeaveStateDXR`** (output, 1004999329), chained on `XrWeaveOutputDXR::next` of a
+  submit that carried a request: `drawnRectMask` (bit i = drawn into `rects[i]`),
+  `spriteGeneration` (the sprite the runtime holds; 0 = none or the default look — a `KEEP` whose
+  generation the runtime does not hold draws the default look and reports 0, the cue to resend)
+  and `drawnBounds` (window px the drawn sprite covers over all views; zero when none).
+
+Runtime behaviour, D3D11 service (the only weave drawer today; other weave backends report
+nothing drawn):
+
+- **Which rect.** At most one cursor per window: the topmost (last in submit order) rect that
+  carries an entry and contains the live pointer (`GetCursorPos`, read in the submit, mapped into
+  the bound window). A lifted rect that asked for the v6 cursor keeps its own (§2.7).
+- **Depth.** d = `disparityPx` × panel pitch / the outer tracked eyes' baseline (eye-baseline
+  units, the policy's unit), then the §3 policy (never behind the glass, margin, clamp, draw
+  threshold, rise/sink filter). A rect's depth stays valid for **500 ms** after the last submit
+  that carried it, so a re-weave with no new page frame (the pointer-driven re-weave) keeps it.
+  One filter and HYBRID anchor per weave client, re-primed when the hovered rect changes.
+- **Views.** The batch layout (v3) draws into both SBS tiles from the tracked eyes; the v6 N-view
+  layout draws into every tile, viewpoints spread evenly between the outermost tracked eyes when
+  the eye count differs from the view count. The legacy single-rect layout draws nothing.
+- **Drawing.** Into the service's scratch or crop (never the caller's input), clipped to the rect
+  in every view, with the crosstalk softening (Amendment 2 B.7, `DXR_CURSOR_SOFTEN*`). A frame
+  with a request never zero-copies.
+- **Hand-back.** `drawnRectMask` clears two frames before the cursor stops being drawn because it
+  sinks to the glass or its depth expires; the runtime keeps drawing meanwhile.
+- **Lifetime.** The sprite is released when no request has arrived for 1 s, or with the session.
+- **Refusals.** `DXR_CURSOR_DRAW_REFUSE` / `_PERIOD_MS` apply; each refusal reason logs one WARN.
+
+```c
+XrCursorDepthWeaveRectDXR entry = {0};
+entry.rectIndex   = elementRectIndex;
+entry.hasContent  = pageDepth.valid;
+entry.disparityPx = pageDepth.disparityPx;      // < 0: in front of the glass
+entry.sampleUV    = pageDepth.uv;
+
+XrCursorDepthWeaveRequestDXR req = {XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+req.sprite.kind       = spriteChanged ? XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR
+                                      : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+req.sprite.generation = spriteGeneration;
+req.sprite.osCursor   = (uint64_t)(uintptr_t)hcursor;
+req.rectCount = 1;
+req.rects     = &entry;
+req.next      = submitInfo.next;    // chain it on the submit
+submitInfo.next = &req;
+
+XrCursorDepthWeaveStateDXR state = {XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+output.next = &state;
+xrWeaveSubmitDXR(session, &submitInfo, &output);
+// Hide the OS cursor while the pointer is inside state.drawnBounds and state.drawnRectMask != 0.
+```
+
+Reference harness: `test_apps/probes/weave_rpc_probe_d3d11_win --cursor-depth` (Windows).
+
 ## 3. Runtime behaviour
 
 The canvas point under the cursor is triangulated from the outermost pair of **located views**.
@@ -357,3 +432,4 @@ Reference: `test_apps/handle/cube_handle_metal_macos` (`DISPLAYXR_CURSOR_DEPTH_D
 | 6 | **Lifted content** (ADR-046 Amendment 1, runtime#1907). New structs only: `XrCursorDepthLiftRectDXR` (1004999326, on `XrWeaveRectLiftDXR`: draw the cursor into this lifted rect's views) and `XrCursorDepthLiftStateDXR` (1004999327, on `XrWeaveOutputDXR`: `drawnLiftMask`). Placed from the lift conversion's depth map through the module's relief mapping (`xrt_dp_lift_depth::relief_*`), §3 policy, D3D11 service. §2.7. |
 | 6 (2026-10-11) | No version bump, no struct change; **default margin halved, 0.03 → 0.015** (ADR-046 Amendment 2 A.2) after the Windows Leia panel check: 0.03 (≈2 mm crossed) floated visibly off the content, 0.015 is ≈1 mm. The margin is a default, not a contract (`XrCursorDepthOptionsDXR::margin` still overrides it), so apps need no change; one that wants the old look chains the options struct with `margin = 0.03`. |
 | 7 | **Measured disparity** (ADR-046 Amendment 3, Phase 3b). No new struct: a third `XrCursorDepthSourceDXR` kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR` (2), for stereo content with no depth. The runtime block-matches a cursor-sized patch between the outermost submitted views (confidence-gated; low confidence = the display plane = the OS cursor). In-process Metal, Vulkan, GL, D3D11 and D3D12 compositors; IPC reports no content. §2.3. |
+| 8 | **The runtime draws the web cursor** (ADR-046 Amendment 4). New structs only: `XrCursorDepthWeaveRequestDXR` (1004999328, on `XrWeaveSubmitInfoDXR`: per-rect depth under the pointer in device pixels + the caller's sprite, an `HCURSOR` or a shared texture) and `XrCursorDepthWeaveStateDXR` (1004999329, on `XrWeaveOutputDXR`: drawn rects, sprite generation, drawn window bounds). The runtime reads the pointer in the submit, applies the one policy with the HYBRID anchor and B.7 softening, and hands back two frames early on sink. D3D11 service. §2.8. |
