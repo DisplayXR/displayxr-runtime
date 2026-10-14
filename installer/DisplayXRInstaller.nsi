@@ -111,6 +111,23 @@ ShowUninstDetails show
 !endif
 
 ;--------------------------------
+; Conversion model store (ADR-053 P4, #2108)
+;
+; The runtime owns the machine's conversion model store. The default pack
+; manifest is published by the open conversion provider (its own repository);
+; the installer pre-fetches only that pack's `prefetch: true` models, and only
+; the commercial ones: `displayxr-cli conv models fetch --installer` never
+; fetches a non-commercial blob, whatever AllowResearchOnly says. Both URLs
+; can be overridden at build time (-DDXR_MODELS_PACK_URL=...) or at install
+; time (/MODELSPACK=<url-or-path>); /NOMODELS deselects the default pack.
+!ifndef DXR_MODELS_PACK_URL
+	!define DXR_MODELS_PACK_URL "https://github.com/DisplayXR/displayxr-models/releases/download/packs/dxr-open-default.models.json"
+!endif
+!ifndef DXR_MODELS_LARGE_STILL
+	!define DXR_MODELS_LARGE_STILL "depth-still-large"
+!endif
+
+;--------------------------------
 ; Interface Settings
 
 !define MUI_ABORTWARNING
@@ -124,6 +141,9 @@ ShowUninstDetails show
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${SOURCE_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
+; ADR-053 P4 (#2108): the conversion-models components (default pack checked,
+; the large still-depth model unchecked).
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -1086,6 +1106,37 @@ client_dll_ok:
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "InstallPath" "$INSTDIR"
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "Version" "${VERSION}"
 
+	; ADR-053 P4 (#2108): the runtime-owned conversion model store. Root order
+	; as the runtime resolves it: an existing Models\Path, else the browser's
+	; ModelsPath (adopted, so its blobs are not downloaded twice), else
+	; %ProgramData%\DisplayXR\Models. Writing Models\Path + the owner marker
+	; is what tells a browser uninstaller not to delete blobs\ any more.
+	ReadRegStr $R2 HKLM "Software\DisplayXR\Models" "Path"
+	${If} $R2 == ""
+		ReadRegStr $R2 HKLM "Software\DisplayXR\Browser" "ModelsPath"
+	${EndIf}
+	${If} $R2 == ""
+		ReadEnvStr $R3 "ProgramData"
+		${If} $R3 == ""
+			StrCpy $R3 "C:\ProgramData"
+		${EndIf}
+		StrCpy $R2 "$R3\DisplayXR\Models"
+	${EndIf}
+	WriteRegStr HKLM "Software\DisplayXR\Models" "Path" "$R2"
+	; `conv models init` creates a missing root with the store ACL (Users read +
+	; create-files, AppContainer read) and the marker; an existing root keeps its ACL.
+	IfFileExists "$INSTDIR\displayxr-cli.exe" 0 +3
+		nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models init --root "$R2"'
+		Pop $R3
+	CreateDirectory "$R2\blobs"
+	ClearErrors
+	FileOpen $R3 "$R2\displayxr-runtime.owner" w
+	${IfNot} ${Errors}
+		FileWrite $R3 "displayxr-runtime$\n"
+		FileClose $R3
+	${EndIf}
+	DetailPrint "Conversion model store: $R2"
+
 	; Set as active OpenXR runtime (still in 64-bit view from section-start
 	; SetRegView; explicit no-op kept for clarity).
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
@@ -1250,6 +1301,50 @@ client_dll_ok:
 
 SectionEnd
 
+; ADR-053 P4 (#2108): pre-fetch the default conversion pack (the small video-
+; and still-depth models and the inpainter). Fail soft: a blob that does not
+; download is fetched on first use (it shows as DOWNLOADING), and the install
+; always succeeds. A stamped blob is skipped without hashing, never replaced
+; (a running process may have it mapped).
+Section "Conversion models (default pack)" SecModels
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOMODELS" $R1
+	${IfNot} ${Errors}
+		DetailPrint "Conversion models: skipped (/NOMODELS)."
+		Goto models_done
+	${EndIf}
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	ClearErrors
+	${GetOptions} $R0 "/MODELSPACK=" $R1
+	${IfNot} ${Errors}
+		StrCpy $R2 $R1
+	${EndIf}
+	DetailPrint "Conversion models: pre-fetching the default pack from $R2"
+	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --prefetch --installer'
+	Pop $R3
+	${If} $R3 != 0
+		DetailPrint "Conversion models: pre-fetch incomplete (exit $R3); the missing models download on first use."
+	${EndIf}
+	models_done:
+SectionEnd
+
+; The large still-depth model: on demand otherwise (DOWNLOADING on first use).
+Section /o "Large still-depth model (on demand otherwise)" SecModelsLarge
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/MODELSPACK=" $R1
+	${IfNot} ${Errors}
+		StrCpy $R2 $R1
+	${EndIf}
+	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --model "${DXR_MODELS_LARGE_STILL}" --installer'
+	Pop $R3
+	${If} $R3 != 0
+		DetailPrint "Large still-depth model: not fetched (exit $R3); it downloads on first use."
+	${EndIf}
+SectionEnd
+
 Section "Start Menu Shortcuts" SecShortcuts
 	CreateDirectory "$SMPROGRAMS\DisplayXR"
 
@@ -1271,6 +1366,15 @@ SectionEnd
 Section "Uninstall"
 	; Same 64-bit view as the install section — see Section "DisplayXR Runtime".
 	SetRegView 64
+
+	; ADR-053 P4 (#2108): the conversion model store outlives the runtime (other
+	; consumers may share it): the blobs stay. Only the runtime's claim goes —
+	; its owner marker and Models\Path. Never a recursive delete of the root.
+	ReadRegStr $R2 HKLM "Software\DisplayXR\Models" "Path"
+	${If} $R2 != ""
+		Delete "$R2\displayxr-runtime.owner"
+	${EndIf}
+	DeleteRegKey HKLM "Software\DisplayXR\Models"
 
 	; -----------------------------------------------------------------
 	; Kill displayxr-service BEFORE touching any file: it maps
@@ -1520,6 +1624,8 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecRuntime} "DisplayXR OpenXR runtime files (required)"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Create Start Menu shortcuts"
+	!insertmacro MUI_DESCRIPTION_TEXT ${SecModels} "Download the default 2D-to-3D conversion models now (about 113 MB). Without it they download on first use."
+	!insertmacro MUI_DESCRIPTION_TEXT ${SecModelsLarge} "Also download the large still-image depth model now (about 0.7 GB). Without it it downloads when first needed."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ;--------------------------------
