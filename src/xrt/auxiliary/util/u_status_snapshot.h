@@ -175,6 +175,19 @@ u_status_conv_task_to_cjson(const struct xrt_status_conv_task *t,
                             uint32_t provider_count);
 
 /*!
+ * ADR-053 P4: one model pack row (the `conv_packs[]` element). Caller owns it.
+ */
+cJSON *
+u_status_conv_pack_to_cjson(const struct xrt_status_conv_pack *p);
+
+/*!
+ * ADR-053 P4: add `conv_model_store` ({root, source}) and `conv_packs[]` to
+ * @p root when the snapshot carries a store root (a CLI that read it).
+ */
+void
+u_status_conv_store_add_cjson(cJSON *root, const struct xrt_status_snapshot *snap);
+
+/*!
  * ADR-053: the `displayxr-cli conv list|status --json` document (also MCP
  * `get_conversion_status`): `{schema, source, generation, providers[],
  * tasks[], warnings[]}` where `warnings` keeps only the `CONV_*` codes of

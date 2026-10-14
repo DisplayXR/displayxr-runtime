@@ -826,3 +826,88 @@ TEST_CASE("conv policy: the per-user Enabled override applies to an enumerated e
 	CHECK(d.status == XRT_CONV_LOAD_NOT_LOADED);
 	CHECK(target_conv_policy_enabled(pol.get(), "off-for-me", true));
 }
+
+/*
+ *
+ * ADR-053 P4 (#2108): model-store pack rows (read from disk, never over IPC).
+ *
+ */
+
+#include "util/u_sha256.h"
+
+#include <filesystem>
+#include <fstream>
+
+TEST_CASE("conv snapshot: model-store pack rows from disk", "[conv_snapshot][json][store]")
+{
+	namespace fs = std::filesystem;
+	const fs::path dir = fs::temp_directory_path() / ("dxr_snap_store_" + std::to_string((unsigned long long)rand()));
+	fs::create_directories(dir / "src");
+	std::string blob;
+	for (int i = 0; i < 64; i++) {
+		blob += "0123456789abcdef";
+	}
+	uint8_t d[32];
+	u_sha256(blob.data(), blob.size(), d);
+	char hex[65];
+	for (int i = 0; i < 32; i++) {
+		snprintf(hex + i * 2, 3, "%02x", d[i]);
+	}
+	{
+		std::ofstream(dir / "sim.models.json")
+		    << "{\"schema\":2,\"pack\":\"sim\",\"provider\":\"sim-conversion\",\"blobBaseUrl\":\"src\",\"models\":[{"
+		       "\"name\":\"fake\",\"prefetch\":true,\"license\":{\"commercial\":true},\"variants\":[{\"files\":[{"
+		       "\"sha256\":\""
+		    << hex << "\",\"size\":1024}]}]}]}";
+	}
+	const std::string manifest = (dir / "sim.models.json").u8string();
+	const std::string root = (dir / "Models").u8string();
+	const char *packs[] = {manifest.c_str()};
+	auto s = std::make_unique<xrt_status_snapshot>();
+	s->schema = XRT_STATUS_SCHEMA;
+
+	// Absent: nothing on disk.
+	target_conv_store_fill_snapshot_with(s.get(), root.c_str(), "test", packs, 1);
+	REQUIRE(s->conv_pack_count == 1);
+	CHECK(std::string(s->conv_packs[0].pack) == "sim");
+	CHECK(std::string(s->conv_packs[0].state) == "absent");
+	CHECK(s->conv_packs[0].bytes_total == 1024);
+
+	// Another process mid-download: a .part of 512 bytes.
+	fs::create_directories(dir / "Models" / "blobs");
+	std::ofstream(dir / "Models" / "blobs" / (std::string(hex) + ".4242-1.part"), std::ios::binary)
+	    << std::string(512, 'x');
+	target_conv_store_fill_snapshot_with(s.get(), root.c_str(), "test", packs, 1);
+	CHECK(std::string(s->conv_packs[0].state) == "downloading");
+	CHECK(s->conv_packs[0].download_done == 512);
+	CHECK(s->conv_packs[0].download_total == 1024);
+
+	cJSON *j = u_status_snapshot_to_cjson(s.get());
+	REQUIRE(j != nullptr);
+	cJSON *store = cJSON_GetObjectItem(j, "conv_model_store");
+	REQUIRE(store != nullptr);
+	CHECK(std::string(cJSON_GetObjectItem(store, "root")->valuestring) == root);
+	cJSON *rows = cJSON_GetObjectItem(j, "conv_packs");
+	REQUIRE(cJSON_IsArray(rows));
+	REQUIRE(cJSON_GetArraySize(rows) == 1);
+	cJSON *r0 = cJSON_GetArrayItem(rows, 0);
+	CHECK(std::string(cJSON_GetObjectItem(r0, "state")->valuestring) == "downloading");
+	CHECK(cJSON_GetObjectItem(r0, "progress")->valuedouble == Catch::Approx(0.5));
+	CHECK(cJSON_GetObjectItem(j, "schema")->valuedouble == 1.0);
+	cJSON_Delete(j);
+
+	// The same keys in the `conv list --json` document.
+	cJSON *c = u_status_conv_to_cjson(s.get());
+	CHECK(cJSON_GetObjectItem(c, "conv_packs") != nullptr);
+	cJSON_Delete(c);
+
+	// A snapshot without a store root (an older CLI path) carries neither key.
+	auto bare = std::make_unique<xrt_status_snapshot>();
+	cJSON *b = u_status_snapshot_to_cjson(bare.get());
+	CHECK(cJSON_GetObjectItem(b, "conv_packs") == nullptr);
+	CHECK(cJSON_GetObjectItem(b, "conv_model_store") == nullptr);
+	cJSON_Delete(b);
+
+	std::error_code ec;
+	fs::remove_all(dir, ec);
+}

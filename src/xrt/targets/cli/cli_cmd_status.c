@@ -34,6 +34,7 @@
 #include "util/u_status_snapshot.h"
 #include "util/u_time.h"
 #include "target_status_snapshot.h"
+#include "target_conv_status.h" // ADR-053 P4: the model store rows
 
 #ifdef CLI_HAVE_IPC
 #include "xrt/xrt_results.h"
@@ -190,6 +191,8 @@ status_fetch_service(struct xrt_status_snapshot *out, xrt_result_t *out_why)
 	}
 	const xrt_result_t xret = status_fetch_over(&ipc_c, out);
 	ipc_client_connection_fini(&ipc_c);
+	// ADR-053 P4: the model store's packs, read from disk here (never over IPC).
+	target_conv_store_fill_snapshot(out);
 	if (out_why != NULL) {
 		*out_why = xret;
 	}
@@ -214,6 +217,7 @@ status_build_headless(struct xrt_status_snapshot *out)
 	}
 	target_status_snapshot_build_headless(h.xi, h.xsysd, out);
 	cli_query_teardown(&h);
+	target_conv_store_fill_snapshot(out);
 }
 
 void

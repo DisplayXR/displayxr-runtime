@@ -1059,6 +1059,40 @@ u_status_conv_task_to_cjson(const struct xrt_status_conv_task *t,
 }
 
 cJSON *
+u_status_conv_pack_to_cjson(const struct xrt_status_conv_pack *p)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddStringToObject(o, "pack", p->pack);
+	cJSON_AddStringToObject(o, "provider", p->provider);
+	cJSON_AddStringToObject(o, "state", p->state);
+	cJSON_AddNumberToObject(o, "models", (double)p->models);
+	cJSON_AddNumberToObject(o, "models_installed", (double)p->models_installed);
+	cJSON_AddNumberToObject(o, "research_models", (double)p->research_models);
+	cJSON_AddNumberToObject(o, "bytes_total", (double)p->bytes_total);
+	cJSON_AddNumberToObject(o, "bytes_installed", (double)p->bytes_installed);
+	cJSON_AddNumberToObject(o, "download_done", (double)p->download_done);
+	cJSON_AddNumberToObject(o, "download_total", (double)p->download_total);
+	cJSON_AddNumberToObject(o, "progress",
+	                        p->download_total > 0 ? (double)p->download_done / (double)p->download_total : -1.0);
+	return o;
+}
+
+void
+u_status_conv_store_add_cjson(cJSON *root, const struct xrt_status_snapshot *snap)
+{
+	if (root == NULL || snap == NULL || snap->conv_model_store_root[0] == '\0') {
+		return;
+	}
+	cJSON *st = cJSON_AddObjectToObject(root, "conv_model_store");
+	cJSON_AddStringToObject(st, "root", snap->conv_model_store_root);
+	cJSON_AddStringToObject(st, "source", snap->conv_model_store_source);
+	cJSON *packs = cJSON_AddArrayToObject(root, "conv_packs");
+	for (uint32_t i = 0; i < snap->conv_pack_count && i < XRT_STATUS_MAX_CONV_PACKS; i++) {
+		cJSON_AddItemToArray(packs, u_status_conv_pack_to_cjson(&snap->conv_packs[i]));
+	}
+}
+
+cJSON *
 u_status_conv_to_cjson(const struct xrt_status_snapshot *snap)
 {
 	cJSON *root = cJSON_CreateObject();
@@ -1086,6 +1120,7 @@ u_status_conv_to_cjson(const struct xrt_status_snapshot *snap)
 			cJSON_AddItemToArray(w, warning_to_cjson(&snap->warnings[i]));
 		}
 	}
+	u_status_conv_store_add_cjson(root, snap);
 	return root;
 }
 
@@ -1163,6 +1198,8 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	for (uint32_t i = 0; i < snap->conv_task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
 		cJSON_AddItemToArray(ct, u_status_conv_task_to_cjson(&snap->conv_tasks[i], snap->conv_providers, ncp));
 	}
+	// ADR-053 P4: the model store's packs (keys only added; the schema stays 1).
+	u_status_conv_store_add_cjson(root, snap);
 	return root;
 }
 
