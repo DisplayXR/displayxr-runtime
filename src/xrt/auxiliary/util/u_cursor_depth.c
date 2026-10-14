@@ -865,6 +865,56 @@ u_cursor_draw_unblend(const uint8_t *on_black, const uint8_t *on_white, uint32_t
 	}
 }
 
+void
+u_cursor_draw_from_argb32(const uint32_t *argb, uint32_t pixel_count, uint8_t *out)
+{
+	if (argb == NULL || out == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < pixel_count; i++) {
+		const uint32_t p = argb[i];
+		const uint8_t a = (uint8_t)(p >> 24);
+		const uint8_t r = (uint8_t)(p >> 16);
+		const uint8_t g = (uint8_t)(p >> 8);
+		const uint8_t b = (uint8_t)p;
+		uint8_t *o = out + (size_t)i * 4;
+		o[0] = r > a ? a : r;
+		o[1] = g > a ? a : g;
+		o[2] = b > a ? a : b;
+		o[3] = a;
+	}
+}
+
+float
+u_cursor_theme_height_pt(uint32_t image_h, uint32_t image_nominal, uint32_t want_nominal)
+{
+	if (image_h == 0 || image_nominal == 0 || want_nominal == 0) {
+		return 0.0f;
+	}
+	return (float)image_h * (float)want_nominal / (float)image_nominal;
+}
+
+float
+u_cursor_parse_xft_dpi(const char *resources)
+{
+	static const char key[] = "Xft.dpi:";
+	const size_t key_len = sizeof(key) - 1;
+	for (const char *line = resources; line != NULL && *line != '\0';) {
+		if (strncmp(line, key, key_len) == 0) {
+			const char *v = line + key_len;
+			while (*v == ' ' || *v == '\t') {
+				v++;
+			}
+			char *end = NULL;
+			const double dpi = strtod(v, &end);
+			return (end != v && dpi > 0.0 && isfinite(dpi)) ? (float)dpi : 0.0f;
+		}
+		const char *nl = strchr(line, '\n');
+		line = nl != NULL ? nl + 1 : NULL;
+	}
+	return 0.0f;
+}
+
 
 /*
  *

@@ -900,6 +900,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->monitor_width_px = (uint32_t)mon_w_px;
 	out_rect->monitor_height_px = (uint32_t)mon_h_px;
 	out_rect->scale = (float)device_scale;
+	out_rect->monitor_scale = best->mon_scale;
 	out_rect->from_buffer_device = used_buffer_device;
 
 	/*

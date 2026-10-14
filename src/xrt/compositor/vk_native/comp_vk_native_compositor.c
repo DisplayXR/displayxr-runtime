@@ -9694,6 +9694,27 @@ vk_shared_submit_and_wait(struct comp_vk_native_compositor *c, const VkSubmitInf
 }
 
 /*!
+ * Backing pixels per OS point for the runtime-drawn cursor (#2102): on native
+ * Wayland the scale of the monitor the window is on, as the window-geometry
+ * extension reports it - the scale the desktop draws its own cursor at there,
+ * the way D3D passes its window's DPI. Else the platform's.
+ */
+static float
+vk_cursor_backing_scale(struct comp_vk_native_compositor *c)
+{
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	struct comp_vk_native_wl_window_rect wr;
+	if (c->use_wayland && c->wl_geom != NULL && comp_vk_native_wl_geom_last_rect(c->wl_geom, &wr) &&
+	    wr.monitor_scale > 0.0f) {
+		return wr.monitor_scale;
+	}
+#else
+	(void)c;
+#endif
+	return comp_cursor_look_backing_scale();
+}
+
+/*!
  * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): turn the state tracker's
  * per-view placement into this frame's renderer cursor - which image, its
  * size in canvas units, and each view's corners in its tile.
@@ -9756,7 +9777,7 @@ vk_cursor_resolve(struct comp_vk_native_compositor *c,
 		return false;
 	}
 	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
-	const float backing_scale = comp_cursor_look_backing_scale();
+	const float backing_scale = vk_cursor_backing_scale(c);
 	const float m_per_pt = m_per_px * backing_scale;
 	const float canvas_h_m = (float)canvas_px_h * m_per_px;
 

@@ -9,6 +9,8 @@
 
 #include "comp_cursor_look.h"
 
+#include "xrt/xrt_config_os.h"
+
 #include "util/u_cursor_depth.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -163,10 +165,10 @@ comp_cursor_look_from_os_cursor(struct comp_cursor_look *look, uint64_t os_curso
 }
 #endif
 
-#if !defined(__APPLE__) && !defined(_WIN32)
+#if !defined(__APPLE__) && !defined(_WIN32) && !defined(XRT_OS_LINUX_DESKTOP)
 /*
- * No OS-cursor mirror on this platform yet (Linux: XFixesGetCursorImage is
- * the follow-up). The arrow it is.
+ * No OS-cursor mirror on this platform (desktop Linux has the cursor theme,
+ * comp_cursor_look_linux.c). The arrow it is.
  */
 bool
 comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale)
