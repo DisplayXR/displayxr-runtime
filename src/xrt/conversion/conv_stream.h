@@ -137,7 +137,12 @@ struct conv_result
 	int64_t source_time;
 	uint64_t latency_ns;
 	uint32_t ring_slot;
-	uint32_t written; //!< XRT_CONV_OUT_*
+	uint32_t written; //!< XRT_CONV_OUT_* the app asked for (what the stream publishes)
+	/*! XRT_CONV_OUT_* the provider wrote this frame, before the S8 mask: a
+	 *  superset of `written`. The service's own consumers (the lifted-rect
+	 *  depth cursor, ADR-046 Amendment 1) read the observer-only depth
+	 *  (#2003) through it; the app-facing export follows `written` only. */
+	uint32_t provider_written;
 	struct xrt_conv_image views, depth, confidence, disparity;
 	struct xrt_conv_views_info views_info;
 	struct xrt_conv_depth_info depth_info;
