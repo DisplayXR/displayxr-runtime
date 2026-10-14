@@ -613,6 +613,50 @@ else()
 		)
 endif()
 
+# ADR-053 P4 (#2108): the fake model pack the sim's DOWNLOAD_MS knob fetches
+# through the host's model store ("sim/fake": one 1 KiB blob served from a
+# relative file:// base next to the DLL). Generated, so its sha256 is computed
+# here rather than typed (tests_conv_store writes the same bytes). Register it
+# with the provider's `Packs` = sim-conversion.models.json.
+set(_simconv_pack_dir "${CMAKE_CURRENT_BINARY_DIR}/sim_conversion_pack")
+string(REPEAT "0123456789abcdef" 64 _simconv_blob)
+file(WRITE "${_simconv_pack_dir}/fake.bin" "${_simconv_blob}")
+file(SHA256 "${_simconv_pack_dir}/fake.bin" _simconv_sha)
+file(MAKE_DIRECTORY "${_simconv_pack_dir}/sim-conversion-blobs")
+file(WRITE "${_simconv_pack_dir}/sim-conversion-blobs/${_simconv_sha}.bin" "${_simconv_blob}")
+file(WRITE "${_simconv_pack_dir}/sim-conversion.models.json"
+"{
+  \"schema\": 2,
+  \"pack\": \"sim\",
+  \"provider\": \"sim-conversion\",
+  \"generated\": \"build\",
+  \"blobBaseUrl\": \"sim-conversion-blobs\",
+  \"models\": [{
+    \"name\": \"fake\", \"version\": \"1.0.0\", \"task\": \"views-mono\", \"prefetch\": true,
+    \"license\": { \"spdx\": \"BSL-1.0\", \"commercial\": true },
+    \"variants\": [{ \"id\": \"cpu\", \"backend\": \"cpu\",
+      \"files\": [{ \"role\": \"model\", \"format\": \"bin\", \"sha256\": \"${_simconv_sha}\", \"size\": 1024 }] }]
+  }],
+  \"defaults\": { \"views-mono\": { \"low\": \"fake\", \"medium\": \"fake\", \"high\": \"fake\" } }
+}
+")
+add_custom_command(
+	TARGET drv_sim_conversion_plugin
+	POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_simconv_pack_dir}/sim-conversion.models.json"
+		"$<TARGET_FILE_DIR:drv_sim_conversion_plugin>/"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${_simconv_pack_dir}/sim-conversion-blobs"
+		"$<TARGET_FILE_DIR:drv_sim_conversion_plugin>/sim-conversion-blobs"
+	VERBATIM
+	)
+if(WIN32)
+	set(_simconv_pack_dest "${CMAKE_INSTALL_BINDIR}/plugins")
+else()
+	set(_simconv_pack_dest "${CMAKE_INSTALL_LIBDIR}/displayxr/plugins")
+endif()
+install(FILES "${_simconv_pack_dir}/sim-conversion.models.json" DESTINATION ${_simconv_pack_dest} COMPONENT Runtime)
+install(DIRECTORY "${_simconv_pack_dir}/sim-conversion-blobs" DESTINATION ${_simconv_pack_dest} COMPONENT Runtime)
+
 if(XRT_HAVE_LINUX)
 	# Dev staging, as for the other plug-ins (see the _plugins block below).
 	add_custom_command(

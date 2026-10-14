@@ -14,6 +14,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "conversion/conv_core.h"
+#include "conversion/conv_model_store.h"
 #include "conversion/conv_observer_autoconv.h"
 #include "conversion/conv_provider_legacy_dp.h"
 #include "conversion/conv_registry.h"
@@ -518,6 +519,10 @@ init_host(void)
 {
 	g_host = *target_conversion_plugin_default_host();
 	g_host.notify_changed = host_notify_changed;
+	// ADR-053 P4 (#2108): the runtime-owned model store. The ops carry no
+	// provider context, so one process store serves every in-service provider.
+	g_host.model_resolve = conv_store_host_model_resolve;
+	g_host.model_request = conv_store_host_model_request;
 }
 
 //! Is @p id already registered in the core? (g.mtx held)
@@ -774,6 +779,12 @@ rescan(void)
 		return;
 	}
 	const int n = target_conversion_plugin_enumerate(fresh, XRT_CONV_LOADER_MAX_ENTRIES);
+	// New packs (a provider installed or updated) and the current download /
+	// research policy reach the model store before any provider re-warms.
+	os_mutex_lock(&g.mtx);
+	const struct target_conv_policy policy = g.policy;
+	os_mutex_unlock(&g.mtx);
+	target_conv_store_configure(fresh, n, &policy);
 	for (int i = 0; i < n; i++) {
 		struct xrt_conversion_plugin_entry *e = &fresh[i];
 		if (target_conv_is_policy_subkey(e->id)) {
@@ -1093,6 +1104,7 @@ service_conversion_start(void)
 		g.entry_count++;
 	}
 	cache_save();
+	target_conv_store_configure(g.entries, g.entry_count, &g.policy);
 	U_LOG_W("[conv] conversion core up: %d provider(s) registered, PrewarmOn=%u", g.entry_count, cfg.prewarm_on);
 
 	if (ipc_server_conv_create(g.core, &g.sc) == XRT_SUCCESS) {

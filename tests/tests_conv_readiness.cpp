@@ -527,3 +527,78 @@ TEST_CASE("conv_readiness: a disabled row ignores everything but enable")
 	fire(r, ev(CONV_EV_ENABLE, 1002 * S));
 	CHECK(r.state == XRT_CONV_STATE_INSTALLED);
 }
+
+TEST_CASE("conv_readiness: DOWNLOADING rows of the model store (#2108)")
+{
+	const uint64_t t = 1001 * S;
+	// clang-format off
+	const golden table[] = {
+	    {"warming: model missing, the host downloads", XRT_CONV_STATE_WARMING, 0, CONV_EV_DOWNLOAD_STARTED, 0, 0, false, XRT_CONV_STATE_DOWNLOADING, 0, CONV_RD_CHANGED},
+	    {"warming: download forbidden by policy",      XRT_CONV_STATE_WARMING, 0, CONV_EV_MODEL_ABSENT, 0, CONV_REASON_POLICY, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"downloading: research-only refused",         XRT_CONV_STATE_DOWNLOADING, 0, CONV_EV_MODEL_ABSENT, 0, CONV_REASON_POLICY, false, XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY, CONV_RD_CHANGED},
+	    {"installed: model absent, no reason = MODEL", XRT_CONV_STATE_INSTALLED, 0, CONV_EV_MODEL_ABSENT, 0, 0, false, XRT_CONV_STATE_ABSENT, XRT_CONV_FAIL_MODEL, CONV_RD_CHANGED},
+	    {"downloading: small model loads at once",     XRT_CONV_STATE_DOWNLOADING, 0, CONV_EV_WARM_OK, 0, 0, false, XRT_CONV_STATE_READY, 0, CONV_RD_CHANGED},
+	    {"downloading: warm fails (tampered, no fetch)", XRT_CONV_STATE_DOWNLOADING, 0, CONV_EV_WARM_FAILED, 0, XRT_CONV_FAIL_MODEL, false, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_MODEL, CONV_RD_CHANGED},
+	    {"ready: model absent is ignored",             XRT_CONV_STATE_READY, 0, CONV_EV_MODEL_ABSENT, 0, CONV_REASON_POLICY, false, XRT_CONV_STATE_READY, 0, CONV_RD_IGNORED},
+	};
+	// clang-format on
+	for (const golden &g : table) {
+		CAPTURE(g.name);
+		conv_readiness r = at(g.from, g.from_reason);
+		const uint32_t bits = fire(r, ev(g.event, t, g.flags, g.reason, g.retryable));
+		CHECK(r.state == g.to);
+		CHECK(r.reason == g.to_reason);
+		CHECK((bits & g.bits) == g.bits);
+	}
+
+	SECTION("a wiped store is DOWNLOADING again, never a latched failure")
+	{
+		conv_readiness r = at(XRT_CONV_STATE_EVICTED);
+		fire(r, ev(CONV_EV_WARM_REQUESTED, t, CONV_EVF_MODEL_MISSING));
+		CHECK(r.state == XRT_CONV_STATE_DOWNLOADING);
+		fire(r, ev(CONV_EV_DOWNLOAD_DONE, t + S));
+		fire(r, ev(CONV_EV_WARM_OK, t + 2 * S));
+		CHECK(r.state == XRT_CONV_STATE_READY);
+	}
+	SECTION("ABSENT(policy) lifts on a registry / policy change")
+	{
+		conv_readiness r = at(XRT_CONV_STATE_ABSENT, CONV_REASON_POLICY);
+		fire(r, ev(CONV_EV_REGISTRY_CHANGED, t));
+		CHECK(r.state == XRT_CONV_STATE_INSTALLED);
+	}
+	CHECK(std::string(conv_reason_name(XRT_CONV_FAIL_POLICY)) == "policy");
+	CHECK(conv_model_absent_reason(XRT_CONV_FAIL_POLICY) == CONV_REASON_POLICY);
+	CHECK(conv_model_absent_reason(XRT_CONV_FAIL_NONE) == XRT_CONV_FAIL_MODEL);
+}
+
+TEST_CASE("conv_readiness: download progress is reported at 2 Hz / 5 %")
+{
+	const uint64_t ms = CONV_NS_PER_S / 1000u;
+	conv_readiness r;
+	conv_readiness_init(&r);
+	const uint64_t t0 = 1000 * S;
+	fire(r, ev(CONV_EV_DESCRIBED, t0));
+	fire(r, ev(CONV_EV_WARM_REQUESTED, t0, CONV_EVF_MODEL_MISSING));
+	REQUIRE(r.state == XRT_CONV_STATE_DOWNLOADING);
+	auto progress = [&](uint64_t at_ms, float p) {
+		conv_readiness_event e = ev(CONV_EV_DOWNLOAD_PROGRESS, t0 + at_ms * ms);
+		e.progress = p;
+		return fire(r, e);
+	};
+	// Moved, but too soon after entering: tracked, not reported.
+	uint32_t b = progress(100, 0.10f);
+	CHECK((b & CONV_RD_PROGRESS) != 0);
+	CHECK((b & CONV_RD_PROGRESS_DUE) == 0);
+	CHECK(r.progress == Catch::Approx(0.10f));
+	// 600 ms and +12 %: reported.
+	CHECK((progress(600, 0.12f) & CONV_RD_PROGRESS_DUE) != 0);
+	// 100 ms later, +38 %: too soon.
+	CHECK((progress(700, 0.50f) & CONV_RD_PROGRESS_DUE) == 0);
+	// 500 ms after the last report and +39 % from it: reported.
+	CHECK((progress(1100, 0.51f) & CONV_RD_PROGRESS_DUE) != 0);
+	// 2 s later, +2 %: not worth a report.
+	CHECK((progress(3100, 0.53f) & CONV_RD_PROGRESS_DUE) == 0);
+	// The step to 100 % is always reported.
+	CHECK((progress(3150, 1.0f) & CONV_RD_PROGRESS_DUE) != 0);
+	CHECK(r.state == XRT_CONV_STATE_DOWNLOADING);
+}

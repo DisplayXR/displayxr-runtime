@@ -29,6 +29,9 @@
 
 #include "sim_conv_synth.h"
 
+#include "conversion/conv_model_store.h"
+#include "util/u_sha256.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -36,6 +39,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -864,4 +869,113 @@ TEST_CASE("sim_conversion: DEPTH_VIDEO is temporal and FRAME_RESET snaps the pha
 	const float reset = frame(XRT_CONV_FRAME_RESET);
 	CHECK(reset == f0); // snapped back to phase 0
 	pv.iface->stream_destroy(pv.inst, id);
+}
+
+/*
+ *
+ * ADR-053 P4 (#2108): DOWNLOAD_MS through the host model store.
+ *
+ */
+
+namespace {
+
+struct store_env
+{
+	std::filesystem::path dir;
+	std::string manifest;
+	explicit store_env(bool allow_downloads)
+	{
+		dir = std::filesystem::temp_directory_path() /
+		      ("dxr_sim_store_" + std::to_string((unsigned long long)clk::now().time_since_epoch().count()));
+		std::filesystem::create_directories(dir / "src");
+		std::string blob;
+		for (int i = 0; i < 64; i++) {
+			blob += "0123456789abcdef";
+		}
+		uint8_t d[32];
+		u_sha256(blob.data(), blob.size(), d);
+		char hex[65];
+		for (int i = 0; i < 32; i++) {
+			std::snprintf(hex + i * 2, 3, "%02x", d[i]);
+		}
+		std::ofstream(dir / "src" / (std::string(hex) + ".bin"), std::ios::binary) << blob;
+		std::ofstream(dir / "sim.models.json")
+		    << "{\"schema\":2,\"pack\":\"sim\",\"provider\":\"sim-conversion\",\"blobBaseUrl\":\"src\",\"models\":[{"
+		       "\"name\":\"fake\",\"license\":{\"commercial\":true},\"variants\":[{\"id\":\"cpu\",\"files\":[{"
+		       "\"format\":\"bin\",\"sha256\":\""
+		    << hex << "\",\"size\":1024}]}]}]}";
+		manifest = (dir / "sim.models.json").u8string();
+		const std::string root = (dir / "Models").u8string();
+#ifdef _WIN32
+		_putenv_s("DXR_CONV_MODELS_ROOT", root.c_str());
+#else
+		setenv("DXR_CONV_MODELS_ROOT", root.c_str(), 1);
+#endif
+		const char *packs[] = {manifest.c_str()};
+		conv_store_host_configure(packs, 1, allow_downloads, false);
+	}
+	~store_env()
+	{
+		conv_store_host_shutdown();
+#ifdef _WIN32
+		_putenv_s("DXR_CONV_MODELS_ROOT", "");
+#else
+		unsetenv("DXR_CONV_MODELS_ROOT");
+#endif
+		std::error_code ec;
+		std::filesystem::remove_all(dir, ec);
+	}
+};
+
+} // namespace
+
+TEST_CASE("sim_conversion: DOWNLOADING runs the host model store (file:// fake pack)", "[sim_conversion]")
+{
+	store_env env(true);
+	provider pv({{"SCRIPT", "views-mono.state=downloading:200,ready"}});
+	g_host_storage.model_resolve = conv_store_host_model_resolve;
+	g_host_storage.model_request = conv_store_host_model_request;
+
+	cancel_flag never;
+	std::atomic<bool> done{false};
+	xrt_result_t warm_result = XRT_ERROR_IPC_FAILURE;
+	std::thread t([&] {
+		warm_result = pv.iface->warm(pv.inst, XRT_CONV_TASK_VIEWS_MONO, is_cancelled, &never);
+		done = true;
+	});
+	bool saw_downloading = false;
+	const auto t0 = clk::now();
+	while (!done && clk::now() - t0 < std::chrono::seconds(5)) {
+		saw_downloading |= pv.state(XRT_CONV_TASK_VIEWS_MONO).state == XRT_CONV_STATE_DOWNLOADING;
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	t.join();
+	CHECK(warm_result == XRT_SUCCESS);
+	CHECK(saw_downloading);
+	CHECK(pv.state(XRT_CONV_TASK_VIEWS_MONO).state == XRT_CONV_STATE_READY);
+	// The host wrote the blob with the write protocol.
+	xrt_conv_model_location loc{};
+	loc.struct_size = sizeof(loc);
+	REQUIRE(conv_store_host_model_resolve("sim/fake", &loc));
+	CHECK(loc.state == XRT_CONV_STATE_READY);
+	CHECK(std::filesystem::exists(std::filesystem::u8path(loc.path)));
+}
+
+TEST_CASE("sim_conversion: a download forbidden by policy is ABSENT(policy)", "[sim_conversion]")
+{
+	store_env env(false);
+	provider pv({{"SCRIPT", "views-mono.state=downloading:100,ready"}});
+	g_host_storage.model_resolve = conv_store_host_model_resolve;
+	g_host_storage.model_request = conv_store_host_model_request;
+	cancel_flag never;
+	CHECK(pv.iface->warm(pv.inst, XRT_CONV_TASK_VIEWS_MONO, is_cancelled, &never) != XRT_SUCCESS);
+	auto s = pv.state(XRT_CONV_TASK_VIEWS_MONO);
+	CHECK(s.state == XRT_CONV_STATE_ABSENT);
+	CHECK(s.failure_reason == XRT_CONV_FAIL_POLICY);
+
+	// Policy lifted: the next warm restarts the script and downloads.
+	const char *packs[] = {env.manifest.c_str()};
+	conv_store_host_configure(packs, 1, true, false);
+	CHECK(pv.iface->warm(pv.inst, XRT_CONV_TASK_VIEWS_MONO, is_cancelled, &never) == XRT_SUCCESS);
+	CHECK(pv.state(XRT_CONV_TASK_VIEWS_MONO).state == XRT_CONV_STATE_READY);
 }
