@@ -82,10 +82,11 @@ for it. This is the default; an app can opt out.
   re-wraps it on the next event.
 - **Snap** (commit thread): drag / zoom = move semantics (origin snapped, size kept); resize by the
   left / top edge = the far edges stay fixed and the **size absorbs** the snap's 1–2 px
-  correction; right / bottom-only resize needs no snap. Min content 320 × 200 pt. On Retina a
-  window origin lands on whole points, i.e. `anchor + scale·Z` backing px: the runtime searches
-  that reachable lattice (the vk_native X11 search, `u_x11_reachable_round`) and, within the
-  nearest ring holding a phase-correct point, takes the one nearest the DP's own answer.
+  correction; right / bottom-only resize needs no snap. Min content 320 × 200 pt. The DP's
+  answer is applied as-is (`px / scale`, half points on Retina), the same as the LeiaSR macOS
+  sample. An earlier whole-point search (the vk_native X11 `u_x11_reachable_round` lattice) made a
+  level drag bob 2–5 px vertically on a slanted lens, so it was removed. AppKit may round the
+  applied origin by one backing pixel; the present origin is read back from where it landed.
 - **Present** (`comp_metal_compositor.m` layer commit): `presentsWithTransaction = YES`;
   `[CATransaction begin]` + `setDisableActions:YES` → apply the frame (`setFrameOrigin`, or
   `setFrame:display:NO` + `drawableSize`; never `display:YES`) → `nextDrawable` →
