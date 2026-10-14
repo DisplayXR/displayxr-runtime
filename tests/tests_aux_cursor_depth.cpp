@@ -2732,3 +2732,311 @@ TEST_CASE("cursor_service: the shell lift takes each view's offset from the oute
 	req.view_count = 1;
 	CHECK_FALSE(u_cursor_draw_view_offset(&req, 0, l));
 }
+
+
+/*
+ *
+ * ADR-046 Amendment 4: the weave-rect cursor (spec v8).
+ *
+ */
+
+namespace {
+
+// Two eyes 64 mm apart, 0.6 m in front of the plane, in the weave frame.
+constexpr float kWeaveIpd = 0.064f;
+constexpr float kWeaveEyeZ = 0.6f;
+
+void
+weave_eyes(float cx, float out_vps[6])
+{
+	out_vps[0] = cx - kWeaveIpd / 2;
+	out_vps[1] = 0.0f;
+	out_vps[2] = kWeaveEyeZ;
+	out_vps[3] = cx + kWeaveIpd / 2;
+	out_vps[4] = 0.0f;
+	out_vps[5] = kWeaveEyeZ;
+}
+
+u_cursor_weave_input
+weave_input(const float *vps, float content_d, bool has, uint64_t now_ns, float u = 0.5f)
+{
+	u_cursor_weave_input in = {};
+	in.viewpoints = vps;
+	in.view_count = 2;
+	in.sx = 0.01f;
+	in.sy = -0.02f;
+	in.u = u;
+	in.v = 0.5f;
+	in.rect_index = 0;
+	in.rect_w = 640;
+	in.rect_h = 360;
+	in.has_content = has;
+	in.content_d = content_d;
+	in.now_ns = now_ns;
+	return in;
+}
+
+bool
+wstep(u_cursor_weave_state *st, const u_cursor_depth_tuning *t, u_cursor_weave_input in, u_cursor_weave_output *out)
+{
+	return u_cursor_weave_step(st, t, &in, out);
+}
+
+} // namespace
+
+TEST_CASE("cursor_weave: the topmost containing rect wins, half-open, eligible only")
+{
+	const u_cursor_weave_rect r[3] = {{0, 0, 100, 100}, {50, 50, 100, 100}, {200, 0, 10, 10}};
+	// Overlap: rect 1 is later in submit order, so on top.
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x7u, 60.0f, 60.0f) == 1);
+	// Not eligible: rect 1 is skipped, rect 0 underneath takes it.
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x1u, 60.0f, 60.0f) == 0);
+	// Half-open: the right / bottom edge is outside.
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x1u, 100.0f, 10.0f) == -1);
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x1u, 99.5f, 99.5f) == 0);
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x7u, 300.0f, 5.0f) == -1);
+	CHECK(u_cursor_weave_pick_rect(r, 3, 0x7u, NAN, 5.0f) == -1);
+}
+
+TEST_CASE("cursor_weave: a lifted rect's own cursor wins over a caller entry")
+{
+	CHECK(u_cursor_weave_source_for(2, 0x4u, 0x4u) == U_CURSOR_WEAVE_SOURCE_LIFT);
+	CHECK(u_cursor_weave_source_for(2, 0x4u, 0x0u) == U_CURSOR_WEAVE_SOURCE_CALLER);
+	CHECK(u_cursor_weave_source_for(2, 0x1u, 0x0u) == U_CURSOR_WEAVE_SOURCE_NONE);
+	CHECK(u_cursor_weave_source_for(-1, ~0u, ~0u) == U_CURSOR_WEAVE_SOURCE_NONE);
+}
+
+TEST_CASE("cursor_weave: a caller depth expires after 500 ms, and belongs to its rect")
+{
+	u_cursor_weave_memo m = {};
+	const u_cursor_weave_rect r = {10, 20, 640, 360};
+	bool has = false;
+	float px = 0.0f;
+	CHECK_FALSE(u_cursor_weave_memo_get(&m, 0, &r, 0, &has, &px));
+	u_cursor_weave_memo_put(&m, 3, &r, true, -12.5f, 1000 * MS);
+	REQUIRE(u_cursor_weave_memo_get(&m, 3, &r, 1499 * MS, &has, &px));
+	CHECK(has);
+	CHECK(px == -12.5f);
+	CHECK_FALSE(u_cursor_weave_memo_get(&m, 3, &r, 1500 * MS, &has, &px)); // expired
+	CHECK_FALSE(u_cursor_weave_memo_get(&m, 3, &r, 999 * MS, &has, &px));  // clock went back
+	CHECK_FALSE(u_cursor_weave_memo_get(&m, 2, &r, 1100 * MS, &has, &px)); // another index
+	const u_cursor_weave_rect moved = {400, 20, 640, 360};
+	CHECK(u_cursor_weave_memo_get(&m, 3, &moved, 1100 * MS, &has, &px)); // a scroll keeps it
+	const u_cursor_weave_rect resized = {10, 20, 641, 360};
+	CHECK_FALSE(u_cursor_weave_memo_get(&m, 3, &resized, 1100 * MS, &has, &px)); // another element
+	// A NaN disparity is stored as no content.
+	u_cursor_weave_memo_put(&m, 3, &r, true, NAN, 2000 * MS);
+	REQUIRE(u_cursor_weave_memo_get(&m, 3, &r, 2000 * MS, &has, &px));
+	CHECK_FALSE(has);
+}
+
+TEST_CASE("cursor_weave: device pixels convert to eye baselines through pitch and baseline")
+{
+	float d = 0.0f;
+	REQUIRE(u_cursor_weave_px_to_baselines(-20.0f, 0.0001f, 0.064f, &d));
+	CHECK(d == Catch::Approx(-20.0f * 0.0001f / 0.064f));
+	REQUIRE(u_cursor_weave_px_to_baselines(8.0f, 0.0002f, 0.064f, &d));
+	CHECK(d == Catch::Approx(0.025f));
+	CHECK_FALSE(u_cursor_weave_px_to_baselines(-20.0f, 0.0f, 0.064f, &d));
+	CHECK_FALSE(u_cursor_weave_px_to_baselines(-20.0f, 0.0001f, 0.0f, &d));
+	CHECK_FALSE(u_cursor_weave_px_to_baselines(NAN, 0.0001f, 0.064f, &d));
+}
+
+TEST_CASE("cursor_weave: viewpoints are the eyes, or spread between the outer pair")
+{
+	const float eyes[6] = {-0.032f, 0.01f, 0.6f, 0.032f, 0.01f, 0.6f};
+	const float origin[3] = {0.1f, 0.0f, 0.0f};
+	float vp[3 * 4];
+	REQUIRE(u_cursor_weave_viewpoints(eyes, 2, 2, origin, vp));
+	CHECK(vp[0] == Catch::Approx(-0.132f));
+	CHECK(vp[3] == Catch::Approx(-0.068f));
+	CHECK(vp[1] == Catch::Approx(0.01f));
+	CHECK(u_cursor_weave_baseline(vp, 2) == Catch::Approx(0.064f));
+	REQUIRE(u_cursor_weave_viewpoints(eyes, 2, 4, origin, vp));
+	CHECK(vp[0] == Catch::Approx(-0.132f));
+	CHECK(vp[3] == Catch::Approx(-0.132f + 0.064f / 3.0f));
+	CHECK(vp[6] == Catch::Approx(-0.132f + 2.0f * 0.064f / 3.0f));
+	CHECK(vp[9] == Catch::Approx(-0.068f));
+	CHECK(vp[11] == Catch::Approx(0.6f));
+	CHECK(u_cursor_weave_baseline(vp, 4) == Catch::Approx(0.064f));
+	CHECK_FALSE(u_cursor_weave_viewpoints(eyes, 0, 2, origin, vp));
+	CHECK_FALSE(u_cursor_weave_viewpoints(eyes, 2, 0, origin, vp));
+}
+
+TEST_CASE("cursor_weave: the drawn on-screen disparity is the policy's target, in px")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	// The page says -30 px at a 0.1 mm pitch.
+	float content_d = 0.0f;
+	REQUIRE(u_cursor_weave_px_to_baselines(-30.0f, 0.0001f, u_cursor_weave_baseline(vps, 2), &content_d));
+	u_cursor_weave_state st = {};
+	u_cursor_weave_output out;
+	REQUIRE(wstep(&st, &t, weave_input(vps, content_d, true, 100 * MS),
+	                            &out));
+	CHECK(out.draw);
+	CHECK(out.report_drawn);
+	CHECK(out.target == Catch::Approx(content_d - t.margin));
+	CHECK(out.disparity == Catch::Approx(out.target)); // the first step snaps
+	// Right view minus left view, on the plane = d x baseline (crossed: < 0).
+	const float sep = out.xy[2] - out.xy[0];
+	CHECK(sep == Catch::Approx(out.disparity * kWeaveIpd).margin(1e-6));
+	CHECK(sep / 0.0001f == Catch::Approx(-30.0f - t.margin * kWeaveIpd / 0.0001f).margin(1e-3));
+	// Centred on the pointer while it moves (SCREEN placement of the cyclopean ray).
+	CHECK(0.5f * (out.xy[0] + out.xy[2]) == Catch::Approx(0.01f).margin(1e-6));
+	CHECK(out.xy[1] == Catch::Approx(-0.02f).margin(1e-6));
+}
+
+TEST_CASE("cursor_weave: on or behind the glass, or no content, draws nothing")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	u_cursor_weave_output out;
+	u_cursor_weave_state a = {};
+	REQUIRE(wstep(&a, &t, weave_input(vps, 0.2f, true, 0), &out));
+	CHECK_FALSE(out.draw);
+	CHECK_FALSE(out.report_drawn);
+	CHECK(out.target == 0.0f);
+	u_cursor_weave_state b = {};
+	REQUIRE(wstep(&b, &t, weave_input(vps, -0.3f, false, 0), &out));
+	CHECK_FALSE(out.draw);
+	// The comfort clamp holds for a page that claims a huge pop-out.
+	u_cursor_weave_state c = {};
+	REQUIRE(wstep(&c, &t, weave_input(vps, -5.0f, true, 0), &out));
+	CHECK(out.target == Catch::Approx(t.min_disparity));
+}
+
+TEST_CASE("cursor_weave: hand-back reports not drawn at least two frames before the draw stops")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	u_cursor_weave_state st = {};
+	u_cursor_weave_output out;
+	uint64_t now = 1000 * MS;
+	const uint64_t frame = 16 * MS;
+	// Settle in front of content.
+	for (int i = 0; i < 30; i++, now += frame) {
+		REQUIRE(wstep(&st, &t, weave_input(vps, -0.08f, true, now), &out));
+	}
+	REQUIRE(out.draw);
+	REQUIRE(out.report_drawn);
+	// The content goes away: the cursor sinks to the glass.
+	int report_off_while_drawn = 0;
+	bool stopped = false;
+	for (int i = 0; i < 400; i++, now += frame) {
+		REQUIRE(wstep(&st, &t, weave_input(vps, 0.0f, false, now), &out));
+		if (out.draw) {
+			// Once reported off, it stays off until the draw stops (no flicker).
+			if (report_off_while_drawn > 0) {
+				CHECK_FALSE(out.report_drawn);
+			}
+			if (!out.report_drawn) {
+				report_off_while_drawn++;
+			}
+		} else {
+			stopped = true;
+			CHECK_FALSE(out.report_drawn);
+			break;
+		}
+	}
+	REQUIRE(stopped);
+	CHECK(report_off_while_drawn >= (int)U_CURSOR_WEAVE_HANDBACK_FRAMES);
+	CHECK(report_off_while_drawn <= (int)U_CURSOR_WEAVE_HANDBACK_FRAMES + 1);
+}
+
+TEST_CASE("cursor_weave: a new hovered rect re-primes the filter")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	u_cursor_weave_state st = {};
+	u_cursor_weave_output out;
+	uint64_t now = 1000 * MS;
+	for (int i = 0; i < 20; i++, now += 16 * MS) {
+		REQUIRE(wstep(&st, &t, weave_input(vps, -0.05f, true, now), &out));
+	}
+	// Same rect, nearer content: filtered (fast rise, but not a snap).
+	u_cursor_weave_state same = st;
+	REQUIRE(wstep(&same, &t, weave_input(vps, -0.2f, true, now), &out));
+	CHECK(out.disparity > out.target + 0.01f);
+	// Another rect: snaps straight to its target.
+	u_cursor_weave_input in = weave_input(vps, -0.2f, true, now);
+	in.rect_index = 1;
+	REQUIRE(u_cursor_weave_step(&st, &t, &in, &out));
+	CHECK(out.disparity == Catch::Approx(out.target));
+}
+
+TEST_CASE("cursor_weave: HYBRID - a still pointer leaves the cursor world-fixed under head motion")
+{
+	u_cursor_depth_tuning t;
+	u_cursor_depth_tuning_defaults(&t);
+	float vps[6];
+	weave_eyes(0.0f, vps);
+	u_cursor_weave_state st = {};
+	u_cursor_weave_output out;
+	uint64_t now = 1000 * MS;
+	const float cd = -0.1f;
+	for (int i = 0; i < 5; i++, now += 16 * MS) {
+		REQUIRE(wstep(&st, &t, weave_input(vps, cd, true, now), &out));
+	}
+	const float d = out.disparity;
+	const float mid0 = 0.5f * (out.xy[0] + out.xy[2]);
+	CHECK(mid0 == Catch::Approx(0.01f).margin(1e-6));
+	// The head moves 5 cm right; the pointer is still.
+	const float dx = 0.05f;
+	weave_eyes(dx, vps);
+	REQUIRE(wstep(&st, &t, weave_input(vps, cd, true, now), &out));
+	REQUIRE(out.disparity == Catch::Approx(d));
+	// World-fixed C seen from the moved cyclopean eye shifts on the plane by dx * d.
+	const float mid1 = 0.5f * (out.xy[0] + out.xy[2]);
+	CHECK(mid1 - mid0 == Catch::Approx(dx * d).margin(1e-5));
+	CHECK(std::fabs(mid1 - mid0) > 1e-3f);
+	// The pointer moves: back on the line of sight through it (SCREEN).
+	now += 16 * MS;
+	REQUIRE(wstep(&st, &t, weave_input(vps, cd, true, now, 0.6f), &out));
+	CHECK(0.5f * (out.xy[0] + out.xy[2]) == Catch::Approx(0.01f + 0.0f).margin(1e-6));
+}
+
+TEST_CASE("cursor_weave: the drawn bounds are the union of the views' sprites, clipped to the rect")
+{
+	const float hot[4] = {100.0f, 50.0f, 90.0f, 50.0f};
+	const u_cursor_weave_rect clip = {0, 0, 640, 360};
+	u_cursor_weave_rect b;
+	REQUIRE(u_cursor_weave_sprite_bounds(hot, 2, 32.0f, 32.0f, 10.0f, 4.0f, &clip, &b));
+	CHECK(b.x == 80);
+	CHECK(b.y == 46);
+	CHECK(b.w == 42); // 80 .. 122
+	CHECK(b.h == 32);
+	const u_cursor_weave_rect tight = {85, 0, 20, 60};
+	REQUIRE(u_cursor_weave_sprite_bounds(hot, 2, 32.0f, 32.0f, 10.0f, 4.0f, &tight, &b));
+	CHECK(b.x == 85);
+	CHECK(b.w == 20);
+	CHECK(b.h == 14); // 46 .. 60
+	const u_cursor_weave_rect away = {500, 300, 10, 10};
+	CHECK_FALSE(u_cursor_weave_sprite_bounds(hot, 2, 32.0f, 32.0f, 10.0f, 4.0f, &away, &b));
+	CHECK(b.w == 0);
+}
+
+TEST_CASE("cursor_weave: sprite generations - load once, keep, fall back to the default look")
+{
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_OS_CURSOR, 5, 0) ==
+	      U_CURSOR_WEAVE_SPRITE_LOAD_OS_CURSOR);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_OS_CURSOR, 5, 5) == U_CURSOR_WEAVE_SPRITE_USE_HELD);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_TEXTURE, 6, 5) == U_CURSOR_WEAVE_SPRITE_LOAD_TEXTURE);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_KEEP, 5, 5) == U_CURSOR_WEAVE_SPRITE_USE_HELD);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_KEEP, 5, 4) == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_KEEP, 0, 0) == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_NONE, 7, 0) == U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING);
+	CHECK(u_cursor_weave_sprite_resolve(U_CURSOR_WEAVE_SPRITE_DEFAULT, 8, 0) == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT);
+	CHECK(u_cursor_weave_sprite_resolve(99, 8, 8) == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT);
+	CHECK_FALSE(u_cursor_weave_sprite_idle(1000 * MS, 2000 * MS));
+	CHECK(u_cursor_weave_sprite_idle(1000 * MS, 2001 * MS));
+	CHECK(u_cursor_weave_sprite_idle(1000 * MS, 999 * MS));
+}

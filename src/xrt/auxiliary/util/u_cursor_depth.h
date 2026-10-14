@@ -1221,6 +1221,265 @@ u_cursor_draw_quad_rect(const float corners[4][2], const float tile[4], float ou
 bool
 u_cursor_draw_view_offset(const struct u_cursor_draw_request *req, uint32_t view, float out_off[2]);
 
+
+/*
+ *
+ * ADR-046 Amendment 4: the weave-rect cursor (XR_DXR_cursor_depth spec v8).
+ *
+ * The runtime draws the cursor on any woven rect whose weave caller supplies a
+ * depth: the on-screen disparity, in device pixels, of the nearest content
+ * under the pointer (the web page's, through the browser). The runtime reads
+ * the pointer itself, inside the weave submit. Everything here is pure: which
+ * rect, how long a depth stays valid, pixels -> eye baselines -> placement
+ * (the one policy + HYBRID anchor, in the weave frame), per-view positions,
+ * the sprite's window bounds and the early hand-back.
+ *
+ * The weave frame: display axes (+x right, +y up, +z toward the viewer),
+ * metres, the display plane at z = 0 and the origin wherever the caller puts
+ * it (the D3D11 service uses the bound window's centre). The viewpoints are
+ * the tracked eyes the weave hands out, expressed in that frame.
+ *
+ */
+
+//! A caller depth stays valid this long after the last submit that carried it
+//! (the filter's stale gap): a re-weave with no new page frame keeps it.
+#define U_CURSOR_WEAVE_DEPTH_EXPIRY_NS 500000000ull
+//! The caller's sprite is released when no request has arrived for this long.
+#define U_CURSOR_WEAVE_SPRITE_IDLE_NS 1000000000ull
+//! "Not drawn" is reported this many frames before a sinking cursor stops drawing.
+#define U_CURSOR_WEAVE_HANDBACK_FRAMES 2
+//! Most rects one submit carries (XR_WEAVE_SUBMIT_MAX_RECTS_DXR): the mask width.
+#define U_CURSOR_WEAVE_MAX_RECTS 32
+//! The submit interval assumed until two submits have been seen (60 Hz).
+#define U_CURSOR_WEAVE_DEFAULT_FRAME_NS 16666667ull
+
+//! A weave rect in bound-window client pixels (y down).
+struct u_cursor_weave_rect
+{
+	int32_t x, y, w, h;
+};
+
+/*!
+ * Which rect gets the cursor: the topmost (last in submit order) rect in
+ * @p eligible_mask (bit i = rects[i]) that contains the pointer (@p px, @p py),
+ * half-open. -1 if none, or for a non-finite pointer.
+ */
+int32_t
+u_cursor_weave_pick_rect(const struct u_cursor_weave_rect *rects,
+                         uint32_t count,
+                         uint32_t eligible_mask,
+                         float px,
+                         float py);
+
+//! The depth source of a picked rect.
+enum u_cursor_weave_source
+{
+	U_CURSOR_WEAVE_SOURCE_NONE = 0,
+	//! The weave caller's disparity (spec v8).
+	U_CURSOR_WEAVE_SOURCE_CALLER = 1,
+	//! The lift conversion's depth map (spec v6, Amendment 1): its own drawer.
+	U_CURSOR_WEAVE_SOURCE_LIFT = 2,
+};
+
+/*!
+ * The source for picked rect @p index: LIFT when the rect is a lifted rect
+ * that asked for the v6 cursor (its depth map wins), else CALLER when the
+ * caller sent an entry for it, else NONE. Pick from (caller | lift) first, so
+ * one window never shows two runtime cursors.
+ */
+enum u_cursor_weave_source
+u_cursor_weave_source_for(int32_t index, uint32_t caller_mask, uint32_t lift_mask);
+
+/*!
+ * One rect's last caller depth. Zero-initialise. Keyed by rect index AND the
+ * rect's size: rect indices are not stable across frames, so an index whose
+ * rect changed size is another element.
+ */
+struct u_cursor_weave_memo
+{
+	bool valid;
+	uint32_t rect_index;
+	int32_t w, h;
+	bool has_content;
+	float disparity_px;
+	uint64_t stamp_ns;
+};
+
+//! Record @p rect_index's depth from this submit.
+void
+u_cursor_weave_memo_put(struct u_cursor_weave_memo *m,
+                        uint32_t rect_index,
+                        const struct u_cursor_weave_rect *rect,
+                        bool has_content,
+                        float disparity_px,
+                        uint64_t now_ns);
+
+/*!
+ * The depth for @p rect_index if @p m holds it for a rect of the same size and
+ * it is younger than U_CURSOR_WEAVE_DEPTH_EXPIRY_NS at @p now_ns (a clock that
+ * went backwards counts as expired). False otherwise: no depth.
+ */
+bool
+u_cursor_weave_memo_get(const struct u_cursor_weave_memo *m,
+                        uint32_t rect_index,
+                        const struct u_cursor_weave_rect *rect,
+                        uint64_t now_ns,
+                        bool *out_has_content,
+                        float *out_disparity_px);
+
+/*!
+ * Device-pixel disparity -> eye-baseline units (the policy's unit, Amendment
+ * 3's conversion): d = disparity_px x m_per_px / baseline_m.
+ *
+ * @return false for a non-finite input, or a non-positive pitch or baseline.
+ */
+bool
+u_cursor_weave_px_to_baselines(float disparity_px, float m_per_px, float baseline_m, float *out_d);
+
+/*!
+ * The viewpoint of each of @p view_count views (xyz triples into @p out_xyz),
+ * relative to @p origin: view i = eye i when @p eye_count equals the view
+ * count, else spread evenly from the first to the last eye (the outermost
+ * pair). False on bad input (no eyes, no views, too many views, non-finite).
+ */
+bool
+u_cursor_weave_viewpoints(const float *eyes_xyz,
+                          uint32_t eye_count,
+                          uint32_t view_count,
+                          const float origin[3],
+                          float *out_xyz);
+
+//! Distance between the first and the last of @p count viewpoints, metres (0 if < 2).
+float
+u_cursor_weave_baseline(const float *viewpoints_xyz, uint32_t count);
+
+/*!
+ * Project point @p c (weave frame) onto the display plane z = 0 from each of
+ * @p count viewpoints: (x, y) pairs into @p out_xy. False if a viewpoint is not
+ * in front of the plane or of @p c, or on non-finite output.
+ */
+bool
+u_cursor_weave_project_point(const struct xrt_vec3 *c, const float *viewpoints_xyz, uint32_t count, float *out_xy);
+
+/*!
+ * The weave-rect cursor's state, one per weave client (one pointer per
+ * window). Zero-initialise.
+ */
+struct u_cursor_weave_state
+{
+	struct u_cursor_depth_filter filter;
+	struct u_cursor_depth_anchor anchor;
+	//! The hovered rect of the last step (re-primes on change); valid when has_rect.
+	bool has_rect;
+	uint32_t rect_index;
+	int32_t rect_w, rect_h;
+	//! Smoothed submit interval (the hand-back's frame), and the last step's time.
+	uint64_t frame_ns;
+	uint64_t last_ns;
+};
+
+//! One step's input.
+struct u_cursor_weave_input
+{
+	//! Viewpoints in the weave frame (u_cursor_weave_viewpoints), one per view.
+	const float *viewpoints;
+	uint32_t view_count;
+	//! The pointer's point on the display plane, weave frame metres.
+	float sx, sy;
+	//! The pointer, window-normalised (HYBRID's "is it moving" test).
+	float u, v;
+	//! The hovered rect (re-primes the filter and the anchor when it changes).
+	uint32_t rect_index;
+	int32_t rect_w, rect_h;
+	//! The content under the pointer, eye-baseline units (< 0 in front).
+	bool has_content;
+	float content_d;
+	uint64_t now_ns;
+};
+
+//! One step's result.
+struct u_cursor_weave_output
+{
+	//! Draw this frame (the filtered disparity passes the draw threshold).
+	bool draw;
+	//! Report drawn to the caller: draw, and still drawn
+	//! U_CURSOR_WEAVE_HANDBACK_FRAMES frames from now at the current target.
+	bool report_drawn;
+	float disparity; //!< filtered, eye baselines
+	float target;    //!< unfiltered target, eye baselines
+	//! The hotspot of each view on the display plane, weave frame metres.
+	float xy[2 * XRT_MAX_VIEWS];
+};
+
+/*!
+ * One weave-rect cursor step: the one policy (u_cursor_depth_target), the
+ * rise/sink filter, the HYBRID anchor ported to the weave frame (the geometry
+ * is the viewpoints' midpoint E, the pointer's plane point S, the plane
+ * normal -z), the per-view projection, and the early hand-back.
+ *
+ * @return false on degenerate input (fewer than one view, E not in front of
+ *         the plane, a failed projection); then nothing is drawn or reported,
+ *         but the filter has still stepped.
+ */
+bool
+u_cursor_weave_step(struct u_cursor_weave_state *st,
+                    const struct u_cursor_depth_tuning *t,
+                    const struct u_cursor_weave_input *in,
+                    struct u_cursor_weave_output *out);
+
+/*!
+ * Window pixels a sprite covers: the union over @p count views of the sprite
+ * box (@p spr_w x @p spr_h, its hotspot at @p hot_x, @p hot_y px from its top-
+ * left) placed with its hotspot at @p hot_px[2i], hot_px[2i+1], clipped to
+ * @p clip. Floors and ceils to whole pixels. False (and a zero rect) if empty.
+ */
+bool
+u_cursor_weave_sprite_bounds(const float *hot_px,
+                             uint32_t count,
+                             float spr_w,
+                             float spr_h,
+                             float hot_x,
+                             float hot_y,
+                             const struct u_cursor_weave_rect *clip,
+                             struct u_cursor_weave_rect *out);
+
+//! What to do with a request's sprite (XrCursorDepthWeaveSpriteKindDXR values).
+enum u_cursor_weave_sprite_kind
+{
+	U_CURSOR_WEAVE_SPRITE_KEEP = 0,
+	U_CURSOR_WEAVE_SPRITE_DEFAULT = 1,
+	U_CURSOR_WEAVE_SPRITE_NONE = 2,
+	U_CURSOR_WEAVE_SPRITE_OS_CURSOR = 3,
+	U_CURSOR_WEAVE_SPRITE_TEXTURE = 4,
+};
+
+enum u_cursor_weave_sprite_action
+{
+	//! Draw the held sprite (its generation is the requested one).
+	U_CURSOR_WEAVE_SPRITE_USE_HELD = 0,
+	//! Rasterise the request's OS cursor handle, then hold it under its generation.
+	U_CURSOR_WEAVE_SPRITE_LOAD_OS_CURSOR,
+	//! Import the request's texture, then hold it under its generation.
+	U_CURSOR_WEAVE_SPRITE_LOAD_TEXTURE,
+	//! Draw the runtime's default look (DEFAULT, an unknown kind, or KEEP of a
+	//! generation the runtime does not hold - the caller then resends).
+	U_CURSOR_WEAVE_SPRITE_USE_DEFAULT,
+	//! Draw nothing (CSS `cursor: none`).
+	U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING,
+};
+
+/*!
+ * Resolve a request's sprite (@p kind, @p generation) against the generation
+ * the runtime holds (@p held_generation, 0 = none). A payload whose generation
+ * is already held is not reloaded.
+ */
+enum u_cursor_weave_sprite_action
+u_cursor_weave_sprite_resolve(uint32_t kind, uint64_t generation, uint64_t held_generation);
+
+//! Release the held sprite? (no request for U_CURSOR_WEAVE_SPRITE_IDLE_NS)
+bool
+u_cursor_weave_sprite_idle(uint64_t last_request_ns, uint64_t now_ns);
+
 #ifdef __cplusplus
 }
 #endif
