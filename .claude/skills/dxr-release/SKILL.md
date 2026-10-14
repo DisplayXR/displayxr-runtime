@@ -550,11 +550,19 @@ if [ "$COMPONENT" = unity ]; then
   # "count the non-Valid ones" test then prints 0 with exit 0 -- a false
   # "signed" (bit displayxr-unreal's /release on v0.9.3). Count the positive
   # answer, never the absence of failures, and never swallow stderr.
+  # No PowerShell (Linux/macOS release box): osslsigncode gives the same
+  # fail-closed answer — "Signature verification: ok" on the chain + timestamp,
+  # and the signer must be Leia. (unity v2.25.2 was released from a Linux box and
+  # shipped unsigned for an hour because this helper only knew PowerShell.)
   verify_authenticode_file() {
     local f="$1" ps out
     if command -v pwsh >/dev/null 2>&1; then ps=pwsh
     elif command -v powershell >/dev/null 2>&1; then ps=powershell
-    else echo "no-powershell"; return 1; fi
+    elif command -v osslsigncode >/dev/null 2>&1; then
+      out=$(osslsigncode verify -in "$f" -CAfile /etc/ssl/certs/ca-certificates.crt 2>&1)
+      if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then echo "Valid"; return 0; fi
+      echo "osslsigncode: $(grep -E -m1 'Failed|error|Error' <<<"$out" || echo not-valid)"; return 1
+    else echo "no-powershell-no-osslsigncode (apt install osslsigncode)"; return 1; fi
     out=$("$ps" -NoProfile -Command "\$ErrorActionPreference='Stop'; (Get-AuthenticodeSignature '$(cygpath -w "$f")').Status" 2>&1 | tr -d '\r' | tail -1)
     echo "$out"; [ "$out" = "Valid" ]
   }
