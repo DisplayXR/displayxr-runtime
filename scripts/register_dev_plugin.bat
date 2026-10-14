@@ -69,6 +69,7 @@ reg add "%KEY%" /v ProbeOrder  /t REG_DWORD /d 200                    /f >nul ||
 reg add "%KEY%" /v DisplayName /t REG_SZ    /d "Simulated 3D Display" /f >nul || goto :regfail
 echo Registered dev sim-display (ProbeOrder 200, fallback):
 echo   %DLL%
+call :allow "%DLL%" "sim-display"
 goto :list
 
 :leia
@@ -88,6 +89,7 @@ reg add "%KEY%" /v ProbeOrder  /t REG_DWORD /d 50             /f >nul || goto :r
 reg add "%KEY%" /v DisplayName /t REG_SZ    /d "Leia SR (dev)" /f >nul || goto :regfail
 echo Registered dev Leia plug-in (ProbeOrder 50, wins over sim):
 echo   %DLL%
+call :allow "%DLL%" "leia-sr (dev)"
 echo Note: this OVERWRITES any installed leia-sr entry. Re-run the installer to restore it.
 goto :list
 
@@ -135,6 +137,7 @@ reg add "%IPKEY%" /v ProbeOrder  /t REG_DWORD /d %IPORDER%    /f >nul || goto :r
 reg add "%IPKEY%" /v DisplayName /t REG_SZ    /d "%IPNAME%"   /f >nul || goto :regfail
 echo Registered input provider (ProbeOrder %IPORDER%):
 echo   %DLL%
+call :allow "%DLL%" "input provider"
 if defined IPSIM (
     echo.
     echo NOTE: sim-input additionally requires DXR_SIM_INPUT=1 in the environment of the
@@ -193,6 +196,7 @@ reg add "%CPKEY%" /v DisplayName /t REG_SZ    /d "%CPNAME%" /f >nul || goto :reg
 reg add "%CPKEY%" /v Version     /t REG_SZ    /d "dev"      /f >nul || goto :regfail
 echo Registered conversion provider '%CPID%' (ProbeOrder %CPORDER%):
 echo   %DLL%
+call :allow "%DLL%" "%CPID%"
 goto :list
 
 :unregister_conv
@@ -220,3 +224,19 @@ exit /b 0
 :regfail
 echo ERROR: reg add failed (are you elevated?).
 exit /b 1
+
+REM --- ADR-054 N4b: the provenance gate. A dev-built plug-in is unsigned, so
+REM     registering it also allowlists its SHA-256 under
+REM     HKLM\Software\DisplayXR\Trust\Allowlist (value name = hex digest, data =
+REM     a note). Without this, the loader reports the binary "unverified" (audit
+REM     mode today; refused once Trust\Enforce is set). A rebuilt DLL has a new
+REM     digest: re-run this script after every build you want to run under the
+REM     live service (push-runtime-pf.sh does the same for what it copies).
+:allow
+set "ALLOW_HASH="
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%~1" SHA256 2^>nul') do if not defined ALLOW_HASH set "ALLOW_HASH=%%H"
+if not defined ALLOW_HASH exit /b 0
+set "ALLOW_HASH=%ALLOW_HASH: =%"
+reg add "HKLM\Software\DisplayXR\Trust\Allowlist" /v "%ALLOW_HASH%" /t REG_SZ /d "%~2 (register_dev_plugin.bat)" /f >nul
+if %ERRORLEVEL% EQU 0 echo   allowlisted sha256 %ALLOW_HASH% (ADR-054 N4b provenance gate)
+exit /b 0

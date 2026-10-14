@@ -31,6 +31,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 
@@ -656,6 +658,159 @@ TEST_CASE("component loader: the per-user Enabled overlay (N3a) -- HKCU wins, fl
 	CHECK(target_component_apply_user_overlay(nullptr, rows.data(), rows.size()) == 0);
 	CHECK(target_component_apply_user_overlay(&cls, nullptr, 1) == 0);
 	CHECK(target_component_apply_user_overlay(&cls, rows.data(), 0) == 0);
+}
+
+#endif
+
+/*
+ *
+ * Provenance (ADR-054 N4b).
+ *
+ */
+
+TEST_CASE("component loader: provenance names are stable", "[component_loader]")
+{
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_UNKNOWN)) == "unknown");
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_SIGNED)) == "signed");
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_ALLOWLISTED)) == "allowlisted");
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED)) ==
+	      "platform-trusted");
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE)) == "dev-override");
+	CHECK(std::string(target_component_provenance_str(TARGET_COMPONENT_PROVENANCE_UNVERIFIED)) == "unverified");
+	CHECK(std::string(target_component_provenance_str(99)) == "unknown");
+	CHECK(std::string(target_component_load_result_str(TARGET_COMPONENT_LOAD_UNTRUSTED)) == "untrusted");
+}
+
+TEST_CASE("component loader: the provenance rule -- first true wins, no override for an elevated host",
+          "[component_loader]")
+{
+	char reason[160];
+	const char *hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+	// Signed beats everything.
+	CHECK(target_component_provenance_classify(true, true, true, true, true, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_SIGNED);
+	CHECK(reason[0] != '\0');
+	// Then the allowlist, then the platform.
+	CHECK(target_component_provenance_classify(false, true, true, false, false, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_ALLOWLISTED);
+	CHECK(target_component_provenance_classify(false, false, true, false, false, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED);
+	// The dev override admits an unsigned, unlisted binary on a NON-elevated host only.
+	CHECK(target_component_provenance_classify(false, false, false, true, false, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE);
+	CHECK(target_component_provenance_classify(false, false, false, true, true, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+	CHECK(std::string(reason).find("elevated") != std::string::npos);
+	// Nothing at all: unverified, and the reason tells the admin the exact allowlist row.
+	CHECK(target_component_provenance_classify(false, false, false, false, false, hex, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+	CHECK(std::string(reason).find(hex) != std::string::npos);
+	// An unreadable file still yields a verdict and a reason.
+	CHECK(target_component_provenance_classify(false, false, false, false, false, nullptr, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+	CHECK(std::string(reason).find("unreadable") != std::string::npos);
+	// NULL reason is allowed.
+	CHECK(target_component_provenance_classify(true, false, false, false, false, hex, nullptr, 0) ==
+	      TARGET_COMPONENT_PROVENANCE_SIGNED);
+}
+
+TEST_CASE("component loader: the file digest is SHA-256 of the bytes", "[component_loader]")
+{
+	// FIPS 180-4 test vector: SHA-256("abc").
+	char path[1024];
+	std::snprintf(path, sizeof(path), "%s%ctests_component_loader_sha256_%lu.bin",
+	              std::getenv("TMP") != nullptr ? std::getenv("TMP")
+	                                           : (std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "."),
+#ifdef _WIN32
+	              '\\',
+#else
+	              '/',
+#endif
+	              (unsigned long)
+#ifdef _WIN32
+	                  GetCurrentProcessId()
+#else
+	                  getpid()
+#endif
+	);
+	FILE *f = std::fopen(path, "wb");
+	REQUIRE(f != nullptr);
+	std::fputs("abc", f);
+	std::fclose(f);
+
+	char hex[65] = {0};
+	REQUIRE(target_component_sha256_file(path, hex, sizeof(hex)));
+	CHECK(std::string(hex) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+	std::remove(path);
+
+	// Unreadable / degenerate.
+	CHECK_FALSE(target_component_sha256_file(path, hex, sizeof(hex)));
+	CHECK(hex[0] == '\0');
+	char small[8];
+	CHECK_FALSE(target_component_sha256_file(path, small, sizeof(small)));
+	CHECK_FALSE(target_component_sha256_file(nullptr, hex, sizeof(hex)));
+}
+
+#if defined(CONV_STUB_OK_PATH)
+
+TEST_CASE("component loader: a real unsigned binary gets a verdict that follows the override and elevation",
+          "[component_loader]")
+{
+	const Class cls = plain_class("xrtConversionPluginNegotiate", 1);
+	std::unique_ptr<Entry> e = make_entry("stub-conversion", 250);
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", CONV_STUB_OK_PATH);
+
+	// The test stubs are unsigned and nobody allowlists a build-tree hash, so
+	// the verdict is decided by the override and the host's elevation alone —
+	// exactly the rule the classifier test pins, now through the real inputs.
+	const bool elevated = target_component_process_elevated();
+
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	CHECK_FALSE(target_component_check_provenance(&cls, e.get()));
+	CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+	CHECK(std::strlen(e->sha256) == 64);
+	CHECK(e->signer[0] == '\0');
+	CHECK(std::string(e->provenance_reason).find(e->sha256) != std::string::npos);
+
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	CHECK(target_component_dev_override_set());
+	const bool admitted = target_component_check_provenance(&cls, e.get());
+	if (elevated) {
+		CHECK_FALSE(admitted);
+		CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+		CHECK(std::string(e->provenance_reason).find("elevated") != std::string::npos);
+	} else {
+		CHECK(admitted);
+		CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE);
+	}
+	// Second call hits the per-process cache and agrees.
+	std::string first_sha = e->sha256;
+	(void)target_component_check_provenance(&cls, e.get());
+	CHECK(std::string(e->sha256) == first_sha);
+
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+
+	// A missing file: no digest, unverified, still a reason.
+	std::unique_ptr<Entry> gone = make_entry("gone", 250);
+	std::snprintf(gone->binary_path, sizeof(gone->binary_path), "%s.does-not-exist", CONV_STUB_OK_PATH);
+	CHECK_FALSE(target_component_check_provenance(&cls, gone.get()));
+	CHECK(gone->sha256[0] == '\0');
+	CHECK(gone->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+	CHECK(gone->provenance_reason[0] != '\0');
+
+	// Audit mode (no Trust\Enforce on a dev box / CI): the load path still
+	// loads an UNVERIFIED binary, and leaves the verdict on the entry.
+	if (!target_component_trust_enforced()) {
+		set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1"); // the #952 path guard still wants it for a build-tree path
+		void *module = nullptr;
+		void *fn = nullptr;
+		REQUIRE(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, nullptr, 0) ==
+		        TARGET_COMPONENT_LOAD_OK);
+		CHECK(e->provenance != TARGET_COMPONENT_PROVENANCE_UNKNOWN);
+		target_component_unload(module);
+		set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	}
 }
 
 #endif

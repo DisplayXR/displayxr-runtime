@@ -674,6 +674,7 @@ jobs:
 
           $env:DXR_SIM_INPUT = "1"
           $env:DXR_ALLOW_DEV_PLUGIN_PATHS = "1"
+          $simHash = $null
           try {
             Reg-Row $dpRoot "sim-display" $simDp 200
             Reg-Row $inRoot "sim-input" $simIn 200
@@ -686,6 +687,21 @@ jobs:
             Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: sim-display is ACTIVE"
             Expect ($o.input_providers.active_id -eq "sim-input") "input: sim-input is the active provider"
             Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: sim-conversion NEGOTIATED"
+
+            # 1b. Provenance (ADR-054 N4b), audit mode. The freshly built sim-display is
+            # unsigned and nobody has allowlisted it; this runner is ELEVATED, so the
+            # dev override set above is refused — the verdict must be "unverified",
+            # naming the elevation, and the plug-in must still have loaded (audit).
+            $sd = Plugin $o "sim-display"
+            Expect ($sd.provenance -eq "unverified") "provenance: unsigned, unlisted sim-display reads unverified (got '$($sd.provenance)')"
+            Expect ($sd.provenance_reason -match "elevated") "provenance: the dev override is refused on an elevated host ($($sd.provenance_reason))"
+            # Allowlist its SHA-256 the way register_dev_plugin.bat / an installer would,
+            # and the same binary reads "allowlisted".
+            $simHash = (Get-FileHash -Path $simDp -Algorithm SHA256).Hash.ToLower()
+            reg add "HKLM\Software\DisplayXR\Trust\Allowlist" /v $simHash /t REG_SZ /d "ci sim-display" /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "provenance: selftest exit 0 after allowlisting (got $lastExit)"
+            Expect ((Plugin $o "sim-display").provenance -eq "allowlisted") "provenance: allowlisted sim-display reads allowlisted"
 
             # 2. Enabled=0 falls back (input, conversion). DP gains Enabled in N3 (#2049).
             reg add "$inRoot\sim-input" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
@@ -720,6 +736,7 @@ jobs:
             $vdp = Check $o "vendor_dp"
             Expect ((-not $vdp.ok) -and ($vdp.detail -match "ABI")) "DP: vendor_dp names the ABI mismatch ($($vdp.detail))"
             Expect ((Plugin $o "abi-fixture-dp").load_result -eq "ABI_MISMATCH") "DP: fixture recorded as ABI_MISMATCH"
+            Expect ((Plugin $o "abi-fixture-dp").provenance -eq "unverified") "provenance: a build-tree fixture on an elevated host reads unverified (audit: still attempted)"
             Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: fell through to sim-display"
             Expect (([int]$o.input_providers.scan_failed -eq 1) -and ($o.input_providers.active_id -eq "sim-input")) "input: fixture counted failed-to-load, sim-input still active"
             Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok (fall-through is not a fault)"
@@ -733,6 +750,7 @@ jobs:
               reg delete $k /f 2>$null | Out-Null
             }
             reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
+            if ($simHash) { reg delete "HKLM\Software\DisplayXR\Trust\Allowlist" /v $simHash /f 2>$null | Out-Null }
             Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
             Remove-Item Env:\DXR_ALLOW_DEV_PLUGIN_PATHS -ErrorAction SilentlyContinue
           }

@@ -18,8 +18,10 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_results.h"
 
+#include "util/u_camera_consent.h"
 #include "util/u_json.h"
 #include "util/u_logging.h"
+#include "util/u_sha256.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -680,6 +682,85 @@ target_component_enumerate_registry(const struct target_component_class *cls,
 	                             max);
 }
 
+
+/*
+ *
+ * Provenance hooks (Windows): Authenticode via the consent store's verifier
+ * (ADR-043 already answers "is this exe validly signed, by whom"), the
+ * admin-only allowlist as value names under HKLM\Software\DisplayXR\Trust\Allowlist,
+ * token elevation, and the Trust\Enforce knob.
+ *
+ */
+
+static bool
+tc_prov_signed(const char *path, char *signer, size_t cap)
+{
+	return u_camera_consent_exe_signer(path, signer, cap);
+}
+
+static bool
+tc_prov_allowlisted(const char *sha256_hex)
+{
+	if (sha256_hex == NULL || sha256_hex[0] == '\0') {
+		return false;
+	}
+	wchar_t wname[80];
+	if (!tc_u2w(sha256_hex, wname, (int)(sizeof(wname) / sizeof(wname[0])))) {
+		return false;
+	}
+	// Any value type counts; the data is a note for humans (which plug-in,
+	// who wrote it). The 64-bit view is where installers and the dev script
+	// write.
+	DWORD type = 0;
+	DWORD bytes = 0;
+	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Trust\\Allowlist", wname,
+	                          RRF_RT_ANY | RRF_SUBKEY_WOW6464KEY, &type, NULL, &bytes);
+	return rc == ERROR_SUCCESS || rc == ERROR_MORE_DATA;
+}
+
+static bool
+tc_prov_platform_trusted(const char *path)
+{
+	(void)path; // No platform rule on Windows: a path is not a provenance.
+	return false;
+}
+
+bool
+target_component_process_elevated(void)
+{
+	TOKEN_ELEVATION e = {0};
+	DWORD len = 0;
+	HANDLE tok = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return false;
+	}
+	BOOL ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &len);
+	CloseHandle(tok);
+	return ok && e.TokenIsElevated != 0;
+}
+
+bool
+target_component_dev_override_set(void)
+{
+	// Same reading as the #952 path guard: the Win32 environment, not the
+	// CRT copy a DLL may hold.
+	wchar_t buf[8];
+	DWORD n = GetEnvironmentVariableW(L"DXR_ALLOW_DEV_PLUGIN_PATHS", buf, 8);
+	return n > 0 && !(n == 1 && buf[0] == L'0');
+}
+
+bool
+target_component_trust_enforced(void)
+{
+	DWORD v = 0;
+	DWORD bytes = sizeof(v);
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Trust", L"Enforce",
+	                 RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v, &bytes) != ERROR_SUCCESS) {
+		return false;
+	}
+	return v != 0;
+}
+
 /*!
  * Pin the runtime core DLL (DisplayXRClient.dll) into the process by absolute
  * path before any component is loaded. Runs once.
@@ -773,7 +854,7 @@ tc_discover(const struct target_component_class *cls, struct target_component_en
 
 enum target_component_load_result
 target_component_load_binary_ex(const struct target_component_class *cls,
-                                const struct target_component_entry *e,
+                                struct target_component_entry *e,
                                 uint32_t flags,
                                 void **out_module,
                                 void **out_entrypoint,
@@ -841,6 +922,25 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		return TARGET_COMPONENT_LOAD_PATH_REFUSED;
 	}
 
+	// ADR-054 N4b: provenance. Audit mode says so and loads anyway; the
+	// enforcing gate refuses. The verdict stays on the entry for diagnostics.
+	(void)target_component_check_provenance(cls, e);
+	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
+		if (target_component_trust_enforced()) {
+			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (Trust\\Enforce is set, ADR-054 N4b).",
+			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
+			if (reason != NULL) {
+				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
+			}
+			return TARGET_COMPONENT_LOAD_UNTRUSTED;
+		}
+		TC_LOG_LOAD(quiet, "%s:   %s: provenance UNVERIFIED — %s (audit mode: loading anyway; ADR-054 N4b).",
+		            tc_tag(cls), e->id, e->provenance_reason);
+	} else {
+		U_LOG_I("%s:   %s: provenance %s%s%s", tc_tag(cls), e->id, target_component_provenance_str(e->provenance),
+		        e->signer[0] != '\0' ? " by " : "", e->signer);
+	}
+
 	// Components import DisplayXRClient.dll for the aux surface (#328), and
 	// LoadLibrary runs host DLL-notification code (#434).
 	target_plugin_preload_runtime_core_dll();
@@ -904,6 +1004,115 @@ target_component_unload(void *module)
 #include <dlfcn.h>
 #include <limits.h>
 #include <sys/stat.h>
+
+/*
+ *
+ * Provenance hooks (POSIX). No Authenticode; the admin-only allowlist is
+ * /etc/displayxr/trust/allowlist (one hex digest per line, `#` comments);
+ * platform trust is the package manager's (root-owned, not group/world
+ * writable, under /usr or /opt) and, on Android, the APK signature that
+ * already covers everything inside it.
+ *
+ */
+
+#include <unistd.h>
+
+static bool
+tc_prov_signed(const char *path, char *signer, size_t cap)
+{
+	(void)path;
+	if (cap > 0) {
+		signer[0] = '\0';
+	}
+	return false;
+}
+
+static bool
+tc_prov_allowlisted(const char *sha256_hex)
+{
+	if (sha256_hex == NULL || sha256_hex[0] == '\0') {
+		return false;
+	}
+	FILE *f = fopen("/etc/displayxr/trust/allowlist", "rb");
+	if (f == NULL) {
+		return false;
+	}
+	bool found = false;
+	char line[256];
+	while (!found && fgets(line, sizeof(line), f) != NULL) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		if (*p == '#' || *p == '\n' || *p == '\0') {
+			continue;
+		}
+		size_t n = 0;
+		while (p[n] != '\0' && p[n] != '\n' && p[n] != '\r' && p[n] != ' ' && p[n] != '\t' && p[n] != '#') {
+			n++;
+		}
+		if (n == 64) {
+			found = true;
+			for (size_t i = 0; i < 64; i++) {
+				int a = p[i], b = sha256_hex[i];
+				if (a >= 'A' && a <= 'F') {
+					a = a - 'A' + 'a';
+				}
+				if (b >= 'A' && b <= 'F') {
+					b = b - 'A' + 'a';
+				}
+				if (a != b) {
+					found = false;
+					break;
+				}
+			}
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+static bool
+tc_prov_platform_trusted(const char *path)
+{
+#if defined(XRT_OS_ANDROID)
+	// Everything the runtime can dlopen here came out of a signed APK.
+	(void)path;
+	return true;
+#else
+	struct stat st;
+	if (path == NULL || stat(path, &st) != 0) {
+		return false;
+	}
+	if (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+		return false;
+	}
+	return strncmp(path, "/usr/", 5) == 0 || strncmp(path, "/opt/", 5) == 0;
+#endif
+}
+
+bool
+target_component_process_elevated(void)
+{
+	return geteuid() == 0;
+}
+
+bool
+target_component_dev_override_set(void)
+{
+	const char *v = getenv("DXR_ALLOW_DEV_PLUGIN_PATHS");
+	return v != NULL && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+}
+
+bool
+target_component_trust_enforced(void)
+{
+#if defined(XRT_OS_ANDROID)
+	return false;
+#else
+	return access("/etc/displayxr/trust/enforce", F_OK) == 0;
+#endif
+}
 
 #if defined(XRT_OS_ANDROID)
 
@@ -1187,7 +1396,7 @@ target_component_user_dir(char *out, size_t cap)
 
 enum target_component_load_result
 target_component_load_binary_ex(const struct target_component_class *cls,
-                                const struct target_component_entry *e,
+                                struct target_component_entry *e,
                                 uint32_t flags,
                                 void **out_module,
                                 void **out_entrypoint,
@@ -1210,6 +1419,25 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 	}
 	if (cls == NULL || e == NULL || out_module == NULL || out_entrypoint == NULL) {
 		return TARGET_COMPONENT_LOAD_FAILED;
+	}
+
+	// ADR-054 N4b: provenance. Audit mode says so and loads anyway; the
+	// enforcing gate refuses. The verdict stays on the entry for diagnostics.
+	(void)target_component_check_provenance(cls, e);
+	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
+		if (target_component_trust_enforced()) {
+			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (Trust\\Enforce is set, ADR-054 N4b).",
+			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
+			if (reason != NULL) {
+				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
+			}
+			return TARGET_COMPONENT_LOAD_UNTRUSTED;
+		}
+		TC_LOG_LOAD(quiet, "%s:   %s: provenance UNVERIFIED — %s (audit mode: loading anyway; ADR-054 N4b).",
+		            tc_tag(cls), e->id, e->provenance_reason);
+	} else {
+		U_LOG_I("%s:   %s: provenance %s%s%s", tc_tag(cls), e->id, target_component_provenance_str(e->provenance),
+		        e->signer[0] != '\0' ? " by " : "", e->signer);
 	}
 
 	TC_LOG_LOAD(quiet, "%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
@@ -1268,9 +1496,239 @@ target_component_unload(void *module)
  *
  */
 
+
+/*
+ *
+ * Provenance (ADR-054 N4b) — platform-neutral part.
+ *
+ */
+
+const char *
+target_component_provenance_str(uint32_t p)
+{
+	switch (p) {
+	case TARGET_COMPONENT_PROVENANCE_UNKNOWN: return "unknown";
+	case TARGET_COMPONENT_PROVENANCE_SIGNED: return "signed";
+	case TARGET_COMPONENT_PROVENANCE_ALLOWLISTED: return "allowlisted";
+	case TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED: return "platform-trusted";
+	case TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE: return "dev-override";
+	case TARGET_COMPONENT_PROVENANCE_UNVERIFIED: return "unverified";
+	default: return "unknown";
+	}
+}
+
+uint32_t
+target_component_provenance_classify(bool signed_ok,
+                                     bool allowlisted,
+                                     bool platform_trusted,
+                                     bool dev_override,
+                                     bool elevated,
+                                     const char *sha256_hex,
+                                     char *reason,
+                                     size_t reason_cap)
+{
+	if (reason != NULL && reason_cap > 0) {
+		reason[0] = '\0';
+	}
+#define TC_REASON(...)                                                                                                 \
+	do {                                                                                                           \
+		if (reason != NULL && reason_cap > 0) {                                                                \
+			snprintf(reason, reason_cap, __VA_ARGS__);                                                     \
+		}                                                                                                      \
+	} while (0)
+	if (signed_ok) {
+		TC_REASON("valid Authenticode chain to a trusted root");
+		return TARGET_COMPONENT_PROVENANCE_SIGNED;
+	}
+	if (allowlisted) {
+		TC_REASON("SHA-256 is in the admin allowlist");
+		return TARGET_COMPONENT_PROVENANCE_ALLOWLISTED;
+	}
+	if (platform_trusted) {
+		TC_REASON("platform-trusted location (package-managed / APK)");
+		return TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
+	}
+	const char *hex = (sha256_hex != NULL && sha256_hex[0] != '\0') ? sha256_hex : "<unreadable>";
+	if (dev_override) {
+		if (elevated) {
+			TC_REASON("unsigned, not allowlisted; DXR_ALLOW_DEV_PLUGIN_PATHS refused: process is elevated "
+			          "(allowlist it instead: Trust\\Allowlist\\%s)",
+			          hex);
+			return TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
+		}
+		TC_REASON("unsigned, not allowlisted; admitted by DXR_ALLOW_DEV_PLUGIN_PATHS on a non-elevated host "
+		          "(sha256 %s)",
+		          hex);
+		return TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE;
+	}
+	TC_REASON("unsigned and not allowlisted (to allow: Trust\\Allowlist\\%s)", hex);
+	return TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
+#undef TC_REASON
+}
+
+bool
+target_component_sha256_file(const char *path, char *out_hex, size_t cap)
+{
+	if (out_hex == NULL || cap == 0) {
+		return false;
+	}
+	out_hex[0] = '\0';
+	if (path == NULL || cap < 65) {
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	struct u_sha256 st;
+	u_sha256_init(&st);
+	unsigned char buf[64 * 1024];
+	size_t got;
+	bool ok = true;
+	while ((got = fread(buf, 1, sizeof(buf), f)) > 0) {
+		u_sha256_update(&st, buf, got);
+	}
+	if (ferror(f)) {
+		ok = false;
+	}
+	fclose(f);
+	if (!ok) {
+		return false;
+	}
+	uint8_t digest[32];
+	u_sha256_final(&st, digest);
+	static const char hexd[] = "0123456789abcdef";
+	for (int i = 0; i < 32; i++) {
+		out_hex[i * 2] = hexd[digest[i] >> 4];
+		out_hex[i * 2 + 1] = hexd[digest[i] & 0xF];
+	}
+	out_hex[64] = '\0';
+	return true;
+}
+
+/*!
+ * Per-process verdict cache keyed by path + size + mtime, so a class that
+ * re-enumerates on every world event (the DP loader on each compositor
+ * create) does not re-hash and re-verify a multi-megabyte DLL each time.
+ * Small and linear: a box has a handful of components.
+ */
+#define TC_PROV_CACHE 32
+static struct tc_prov_cache_row
+{
+	char path[TARGET_COMPONENT_PATH_MAX];
+	uint64_t size;
+	uint64_t mtime;
+	uint32_t provenance;
+	char reason[160];
+	char signer[128];
+	char sha256[65];
+	bool valid;
+} g_tc_prov_cache[TC_PROV_CACHE];
+static int g_tc_prov_cache_next = 0;
+
+static bool
+tc_prov_file_identity(const char *path, uint64_t *out_size, uint64_t *out_mtime)
+{
+#ifdef XRT_OS_WINDOWS
+	wchar_t wpath[TARGET_COMPONENT_PATH_MAX];
+	if (!tc_u2w(path, wpath, (int)(sizeof(wpath) / sizeof(wpath[0])))) {
+		return false;
+	}
+	WIN32_FILE_ATTRIBUTE_DATA fad;
+	if (!GetFileAttributesExW(wpath, GetFileExInfoStandard, &fad)) {
+		return false;
+	}
+	*out_size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+	*out_mtime = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+	return true;
+#else
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		return false;
+	}
+	*out_size = (uint64_t)st.st_size;
+	*out_mtime = (uint64_t)st.st_mtime;
+	return true;
+#endif
+}
+
+bool
+target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e)
+{
+	(void)cls;
+	if (e == NULL) {
+		return false;
+	}
+	e->provenance = TARGET_COMPONENT_PROVENANCE_UNKNOWN;
+	e->provenance_reason[0] = '\0';
+	e->signer[0] = '\0';
+	e->sha256[0] = '\0';
+
+	uint64_t size = 0;
+	uint64_t mtime = 0;
+	const bool have_identity = tc_prov_file_identity(e->binary_path, &size, &mtime);
+
+	// The dev override and elevation are per process, not per file, and
+	// cheap: they are re-read, so a cached file verdict still reflects them.
+	const bool dev_override = target_component_dev_override_set();
+	const bool elevated = target_component_process_elevated();
+
+	struct tc_prov_cache_row *hit = NULL;
+	if (have_identity) {
+		for (int i = 0; i < TC_PROV_CACHE; i++) {
+			struct tc_prov_cache_row *r = &g_tc_prov_cache[i];
+			if (r->valid && r->size == size && r->mtime == mtime && strcmp(r->path, e->binary_path) == 0) {
+				hit = r;
+				break;
+			}
+		}
+	}
+
+	bool signed_ok = false;
+	bool allowlisted = false;
+	bool platform_trusted = false;
+	if (hit != NULL) {
+		tc_copy(e->sha256, sizeof(e->sha256), hit->sha256);
+		tc_copy(e->signer, sizeof(e->signer), hit->signer);
+		// Re-derive the three file facts from the cached verdict so the
+		// per-process inputs (override, elevation) can still move it.
+		signed_ok = hit->provenance == TARGET_COMPONENT_PROVENANCE_SIGNED;
+		allowlisted = hit->provenance == TARGET_COMPONENT_PROVENANCE_ALLOWLISTED;
+		platform_trusted = hit->provenance == TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
+	} else {
+		(void)target_component_sha256_file(e->binary_path, e->sha256, sizeof(e->sha256));
+		signed_ok = tc_prov_signed(e->binary_path, e->signer, sizeof(e->signer));
+		allowlisted = !signed_ok && tc_prov_allowlisted(e->sha256);
+		platform_trusted = !signed_ok && !allowlisted && tc_prov_platform_trusted(e->binary_path);
+	}
+
+	e->provenance = target_component_provenance_classify(signed_ok, allowlisted, platform_trusted, dev_override,
+	                                                     elevated, e->sha256, e->provenance_reason,
+	                                                     sizeof(e->provenance_reason));
+
+	if (hit == NULL && have_identity) {
+		struct tc_prov_cache_row *r = &g_tc_prov_cache[g_tc_prov_cache_next];
+		g_tc_prov_cache_next = (g_tc_prov_cache_next + 1) % TC_PROV_CACHE;
+		memset(r, 0, sizeof(*r));
+		tc_copy(r->path, sizeof(r->path), e->binary_path);
+		r->size = size;
+		r->mtime = mtime;
+		// Only the FILE facts are cached (signed / allowlisted / platform);
+		// a dev-override or unverified verdict is recomputed from them.
+		r->provenance = signed_ok ? TARGET_COMPONENT_PROVENANCE_SIGNED
+		                : allowlisted ? TARGET_COMPONENT_PROVENANCE_ALLOWLISTED
+		                : platform_trusted ? TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED
+		                                   : TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
+		tc_copy(r->signer, sizeof(r->signer), e->signer);
+		tc_copy(r->sha256, sizeof(r->sha256), e->sha256);
+		r->valid = true;
+	}
+	return e->provenance != TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
+}
+
 enum target_component_load_result
 target_component_load_binary(const struct target_component_class *cls,
-                             const struct target_component_entry *e,
+                             struct target_component_entry *e,
                              void **out_module,
                              void **out_entrypoint,
                              uint32_t *out_os_error,
@@ -1367,6 +1825,7 @@ target_component_load_result_str(enum target_component_load_result r)
 	case TARGET_COMPONENT_LOAD_FAILED: return "load-failed";
 	case TARGET_COMPONENT_LOAD_PATH_REFUSED: return "path-refused";
 	case TARGET_COMPONENT_LOAD_NO_ENTRY_POINT: return "no-entrypoint";
+	case TARGET_COMPONENT_LOAD_UNTRUSTED: return "untrusted";
 	default: return "unknown";
 	}
 }

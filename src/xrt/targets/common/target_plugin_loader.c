@@ -520,6 +520,7 @@ target_plugin_load_result_str(enum target_plugin_load_result r)
 	case TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED: return "NEGOTIATE_FAILED";
 	case TARGET_PLUGIN_RESULT_ABI_MISMATCH: return "ABI_MISMATCH";
 	case TARGET_PLUGIN_RESULT_PROBE_FAILED: return "PROBE_FAILED";
+	case TARGET_PLUGIN_RESULT_UNTRUSTED: return "UNTRUSTED";
 	}
 	return "?";
 }
@@ -1368,6 +1369,25 @@ dp_fill_host_iface(struct xrt_plugin_host_iface *host)
 }
 
 /*!
+ * ADR-054 N4b: copy the provenance verdict the shared load path left on the
+ * entry into the plug-in's ADR-045 status record, for `displayxr-cli info` /
+ * `selftest --json` and the dashboard.
+ */
+static void
+status_record_provenance(const char *id, const struct target_component_entry *e)
+{
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		s->provenance = e->provenance;
+		snprintf(s->signer, sizeof(s->signer), "%s", e->signer);
+		snprintf(s->provenance_reason, sizeof(s->provenance_reason), "%s", e->provenance_reason);
+	}
+	status_unlock();
+}
+
+/*!
  * Load + negotiate + ABI-check + probe one registered plug-in. Returns the
  * iface (writing the instance to *out_inst and the negotiated ABI version to
  * *out_version) on success, NULL (and unloads the binary) on any failure. No
@@ -1384,7 +1404,7 @@ dp_fill_host_iface(struct xrt_plugin_host_iface *host)
  * platform-state capture before probe, and probe itself.
  */
 static const struct xrt_plugin_iface *
-load_and_probe_one(const struct target_component_entry *e,
+load_and_probe_one(struct target_component_entry *e,
                    struct xrt_plugin_instance **out_inst,
                    uint32_t *out_version)
 {
@@ -1417,6 +1437,9 @@ load_and_probe_one(const struct target_component_entry *e,
 	const enum target_component_load_result lr =
 	    target_component_load_binary_ex(&g_dp_class, e, first_attempt ? 0u : TARGET_COMPONENT_LOAD_FLAG_QUIET,
 	                                    &module, &fn, &os_error, why, sizeof(why));
+	// ADR-054 N4b: whatever happened next, the provenance verdict the load
+	// path computed is a fact about the registration worth showing.
+	status_record_provenance(e->id, e);
 	if (lr != TARGET_COMPONENT_LOAD_OK) {
 		enum target_plugin_load_result result = TARGET_PLUGIN_RESULT_LOAD_FAILED;
 		const char *recorded = NULL;
@@ -1437,6 +1460,11 @@ load_and_probe_one(const struct target_component_entry *e,
 			recorded = "dev/build-tree path refused (#952)";
 			break;
 		case TARGET_COMPONENT_LOAD_NO_ENTRY_POINT: result = TARGET_PLUGIN_RESULT_NO_ENTRY_POINT; break;
+		case TARGET_COMPONENT_LOAD_UNTRUSTED:
+			// ADR-054 N4b, enforcing: the reason names the allowlist row.
+			result = TARGET_PLUGIN_RESULT_UNTRUSTED;
+			recorded = why;
+			break;
 		case TARGET_COMPONENT_LOAD_FAILED:
 		default: result = TARGET_PLUGIN_RESULT_LOAD_FAILED; break;
 		}
@@ -1527,7 +1555,7 @@ load_and_probe_one(const struct target_component_entry *e,
  * success, NULL on any failure.
  */
 static const struct xrt_plugin_iface *
-try_load_one(const struct target_component_entry *e, struct xrt_plugin_instance **out_inst)
+try_load_one(struct target_component_entry *e, struct xrt_plugin_instance **out_inst)
 {
 	uint32_t plugin_version = 0;
 	const struct xrt_plugin_iface *iface = load_and_probe_one(e, out_inst, &plugin_version);

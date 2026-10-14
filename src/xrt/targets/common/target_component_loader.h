@@ -170,6 +170,14 @@ struct target_component_entry
 	uint32_t setting_count;                      //!< valid entries in settings[]
 	struct target_component_setting settings[TARGET_COMPONENT_MAX_SETTINGS];
 	char reason[192]; //!< why MALFORMED / DISABLED; "" otherwise
+
+	/* Provenance (ADR-054 N4b). UNKNOWN until @ref target_component_check_provenance
+	 * ran — the load path runs it; a lister calls it explicitly. */
+	uint32_t provenance;         //!< enum target_component_provenance
+	char provenance_reason[160]; //!< one line: why this verdict (allowlist row to write, signer, ...)
+	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
+	char sha256[65];             //!< hex digest of the binary's bytes when it could be read; "" otherwise
+
 	//! Class-private row data filled by @ref target_component_class::read_extra
 	//! (e.g. a conversion provider's Hosting / Supersedes / Packs). Zeroed
 	//! before the hook runs; opaque to this file.
@@ -341,6 +349,84 @@ target_component_user_dir(char *out, size_t cap);
  *
  */
 
+/*
+ *
+ * Provenance (ADR-054 N4b): is this binary one the machine's administrator
+ * meant to run? A registration row needs admin once; the file it points at
+ * does not, and nothing used to look at the file. Every class gets this check
+ * in the shared load path. The gate is AUDIT-ONLY until `Trust\Enforce` is
+ * set (PR A); PR B flips the default.
+ *
+ */
+
+//! Why the trunk trusts (or does not trust) a component binary. Stable names: @ref target_component_provenance_str.
+enum target_component_provenance
+{
+	TARGET_COMPONENT_PROVENANCE_UNKNOWN = 0,       //!< not checked (yet)
+	TARGET_COMPONENT_PROVENANCE_SIGNED,            //!< valid Authenticode chain to a trusted root (Windows)
+	TARGET_COMPONENT_PROVENANCE_ALLOWLISTED,       //!< its SHA-256 is in the admin-only allowlist
+	TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED,  //!< inside the runtime APK / a root-owned system path (.deb)
+	TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE,      //!< unsigned + unlisted, admitted by DXR_ALLOW_DEV_PLUGIN_PATHS on a non-elevated host
+	TARGET_COMPONENT_PROVENANCE_UNVERIFIED,        //!< none of the above — what the gate refuses once enforced
+};
+
+//! "unknown" / "signed" / "allowlisted" / "platform-trusted" / "dev-override" / "unverified".
+const char *
+target_component_provenance_str(uint32_t p);
+
+/*!
+ * The verdict rule, pure, so it can be pinned by tests: first true wins —
+ * SIGNED, ALLOWLISTED, PLATFORM_TRUSTED, then DEV_OVERRIDE only when
+ * @p dev_override is set AND the process is not elevated (an elevated host
+ * gets no override: ADR-054 N4b), else UNVERIFIED. @p reason (may be NULL)
+ * receives the one-line why; @p sha256_hex (may be NULL) is quoted in the
+ * UNVERIFIED reason as the allowlist row to write.
+ */
+uint32_t
+target_component_provenance_classify(bool signed_ok,
+                                     bool allowlisted,
+                                     bool platform_trusted,
+                                     bool dev_override,
+                                     bool elevated,
+                                     const char *sha256_hex,
+                                     char *reason,
+                                     size_t reason_cap);
+
+/*!
+ * Fill @p e's provenance fields for its `binary_path`: hash the file
+ * (`sha256`), look the digest up in the admin-only allowlist
+ * (`HKLM\Software\DisplayXR\Trust\Allowlist` value names on Windows,
+ * `/etc/displayxr/trust/allowlist` lines on POSIX), check the Authenticode
+ * chain (Windows), the platform rule (Android: always; .deb: root-owned,
+ * not group/world-writable, under /usr or /opt), the dev override and the
+ * host's elevation, then @ref target_component_provenance_classify. Results
+ * are cached per path + size + mtime for the process, so a class that
+ * re-enumerates on every world event does not re-hash. Returns true when the
+ * verdict is anything but UNVERIFIED. Never loads the binary.
+ */
+bool
+target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e);
+
+//! Hex SHA-256 of a file's bytes into @p out_hex (65 chars). False when unreadable.
+bool
+target_component_sha256_file(const char *path, char *out_hex, size_t cap);
+
+//! Is this process elevated (Windows: token elevation; POSIX: euid 0)?
+bool
+target_component_process_elevated(void);
+
+//! `DXR_ALLOW_DEV_PLUGIN_PATHS` is set (non-empty, not "0") — the same reading the #952 path guard uses.
+bool
+target_component_dev_override_set(void);
+
+/*!
+ * Is the provenance gate ENFORCING? Windows: `HKLM\Software\DisplayXR\Trust`
+ * value `Enforce` (DWORD) != 0; POSIX: `/etc/displayxr/trust/enforce` exists.
+ * Absent = audit mode (log, load anyway). PR B flips this default.
+ */
+bool
+target_component_trust_enforced(void);
+
 //! Outcome of @ref target_component_load_binary.
 enum target_component_load_result
 {
@@ -350,6 +436,7 @@ enum target_component_load_result
 	TARGET_COMPONENT_LOAD_FAILED,             //!< any other LoadLibrary / dlopen failure
 	TARGET_COMPONENT_LOAD_PATH_REFUSED,       //!< #952 dev/build-tree path refused
 	TARGET_COMPONENT_LOAD_NO_ENTRY_POINT,     //!< loaded, but no class entry point (another class's binary)
+	TARGET_COMPONENT_LOAD_UNTRUSTED,          //!< provenance UNVERIFIED and the gate is enforcing (ADR-054 N4b)
 };
 
 /*!
@@ -365,7 +452,7 @@ enum target_component_load_result
  */
 enum target_component_load_result
 target_component_load_binary(const struct target_component_class *cls,
-                             const struct target_component_entry *e,
+                             struct target_component_entry *e,
                              void **out_module,
                              void **out_entrypoint,
                              uint32_t *out_os_error,
@@ -384,10 +471,14 @@ target_component_load_binary(const struct target_component_class *cls,
 
 /*!
  * @ref target_component_load_binary with TARGET_COMPONENT_LOAD_FLAG_* flags.
+ * Also runs @ref target_component_check_provenance on @p e (hence non-const)
+ * between the #952 path guard and the load: in audit mode an UNVERIFIED
+ * binary is logged (WARN, or INFO under QUIET) and loaded anyway; with the
+ * gate enforcing it is refused with TARGET_COMPONENT_LOAD_UNTRUSTED.
  */
 enum target_component_load_result
 target_component_load_binary_ex(const struct target_component_class *cls,
-                                const struct target_component_entry *e,
+                                struct target_component_entry *e,
                                 uint32_t flags,
                                 void **out_module,
                                 void **out_entrypoint,
