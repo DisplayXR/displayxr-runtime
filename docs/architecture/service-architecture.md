@@ -218,7 +218,7 @@ for input providers):
 
 | Aspect | Vendor DP | Input provider |
 |---|---|---|
-| Discovery (Win) | `HKLM\Software\DisplayXR\DisplayProcessors\*` (`Binary`, `ProbeOrder` default 100, cap 16, `PreferredPlugin` override) | `HKLM\Software\DisplayXR\InputProviders\*` (+ `Enabled`, cap 16, `Input\ForceQwerty` kill-switch) |
+| Discovery (Win) | `HKLM\Software\DisplayXR\DisplayProcessors\*` (`Binary`, `ProbeOrder` default 100, cap 16, `PreferredPlugin` override) | `HKLM\Software\DisplayXR\InputProviders\*` (+ `Enabled`, cap 16, `Input\ForceQwerty` kill-switch, `InputProviders\Policy\EmulatedControllers` qwerty-pair gate — N7) |
 | Load | `LoadLibraryExW(path, LOAD_WITH_ALTERED_SEARCH_PATH)`, ABI-major gate before any dispatch, **handle leaked for the process lifetime by design** | same (`target_input_plugin_loader.c:291, 323, 746`) |
 | When / thread | first `target_plugin_get_active()` — inside `xrt_instance_create_system` on the **main thread** at `init_all` (`ipc_server_process.c:506`); **plus** `target_plugin_refresh_active()` at **every per-client compositor create on that client's IPC thread**, under the process-wide `g_refresh_mutex` (`target_plugin_loader.c:1960-2008`; fired from `comp_d3d11_service.cpp:14196-14199`) | once per process at system build; no refresh, no unload, `iface->destroy` **never called** |
 | Where else | the same builder is linked into the runtime DLL and `displayxr-cli`, so an **in-process app hosts its own DP and its own providers** — two LeapC clients on one box (`targets/openxr/CMakeLists.txt:64`) | same |

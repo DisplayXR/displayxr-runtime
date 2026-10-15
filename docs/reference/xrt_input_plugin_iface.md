@@ -329,8 +329,11 @@ device is still a candidate. Hand-role churn bumps the same
 `generation_id` without disturbing the rig.
 
 `HKLM\Software\DisplayXR\Input\ForceQwerty` (POSIX: a `force_qwerty` file
-next to the manifests) skips providers entirely. Details: discovery spec
-§4 (hands) and §4b (rig).
+next to the manifests) skips providers entirely;
+`InputProviders\Policy\EmulatedControllers = 0` (POSIX: `emulated_controllers`)
+withholds the qwerty pair instead, so the hands fall to **no role** rather
+than to qwerty when yours is absent (ADR-054 N7). Details: discovery spec
+§4 (hands, items 3 / 3b) and §4b (rig).
 
 ## What providers must NOT do
 
@@ -369,9 +372,9 @@ next to the manifests) skips providers entirely. Details: discovery spec
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
   (no DLL load) + Enabled / PreferredPlugin + the one ranked first + the
-  ForceQwerty state; `input enable|disable <id>` and `input use <id>` /
-  `input reset` write those two values (ADR-054 verbs, N3a; discovery spec
-  §3 / §6).
+  ForceQwerty and EmulatedControllers state; `input enable|disable <id>` and
+  `input use <id>` / `input reset` write those two values (ADR-054 verbs,
+  N3a; discovery spec §3 / §6), `input emulated on|off` the gate (N7).
 - `displayxr-cli selftest` — with a provider registered, not overridden,
   **and reporting `PRESENT`**, asserts left+right role devices with a
   valid interaction profile. Provider absence never fails, and neither
