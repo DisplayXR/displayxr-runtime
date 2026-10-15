@@ -1198,7 +1198,17 @@ weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const
 	const bool prev_3d = !mc->weave.hw_2d_confirmed;
 	mc->weave.hw_2d_confirmed = !want_3d;
 	if (prev_3d == want_3d) {
-		return true; // already there (a re-assert keeps a drifted vendor honest; nothing to report)
+		// Already there as far as THIS client knows. The bring-up re-assert is
+		// the one case where the panel may disagree (another client's 2D took
+		// the lens), so it is logged once; every other re-assert stays silent.
+		if (why != NULL && strstr(why, "bring-up") != NULL) {
+			U_LOG_W("weave(#1699): hardware %s re-asserted (%s) on the weave engine's display processor (%s) in "
+			        "%.1f ms%s",
+			        want_3d ? "3D" : "2D", why,
+			        has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch", dp_ms,
+			        slow);
+		}
+		return true;
 	}
 
 	// One WARN per transition (a human-rate event: a tab switch, a page's mode
@@ -1330,13 +1340,21 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
 	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
 
-	// A hardware 2D request that arrived before this DP existed (the page asked
-	// for a flat panel before the first submit). 3D is the default, so only a
-	// 2D wish needs acting on — same shape as the Android session_render
-	// deferral in multi_compositor_init_session_render.
-	if (!mc->hardware_display_3d) {
-		(void)weave_apply_display_mode_locked(mc, false, "deferred request, applied at engine bring-up");
-	}
+	// Apply the client's standing wish now that the DP exists — BOTH ways.
+	// "3D is the default" only holds while the vendor's weaver still owns the
+	// lens. The service's display processor outlives every client (one SR
+	// context for the process), and the first 2D request any client sent made
+	// DisplayXR the owner of the lens preference (LeiaSR #266): from then on
+	// nobody turns the lens back on unless we ask. A new present owner whose
+	// 3D request arrived before its engine came up therefore found a 2D panel
+	// and stayed there until a service restart (Show unit on 2.43.4, 2026-10-14:
+	// close a browser -> "lens OFF", open the next -> "panel hardware -> 3D"
+	// in the browser, nothing in the service, lens off). The DP decides what
+	// the request means: a 3D wish on a weaver-owned lens is a no-op there
+	// (leia_lens_owner_on_request), on an app-owned one it is srLensEnable.
+	(void)weave_apply_display_mode_locked(mc, mc->hardware_display_3d,
+	                                      mc->hardware_display_3d ? "standing 3D wish, re-asserted at engine bring-up"
+	                                                              : "deferred request, applied at engine bring-up");
 	return true;
 }
 
@@ -3150,7 +3168,10 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
 	} else if (enable_3d && had_pending_2d) {
 		U_LOG_W(
 		    "weave(#1699): hardware 3D requested before the weave engine exists — the recorded 2D request is "
-		    "withdrawn, nothing to apply at bring-up");
+		    "withdrawn; 3D is re-asserted at bring-up");
+	} else if (enable_3d) {
+		U_LOG_W("weave(#1699): hardware 3D requested before the weave engine exists — recorded, re-asserted "
+		        "when the engine comes up (the panel may be 2D from an earlier client)");
 	} else if (!enable_3d) {
 		U_LOG_W(
 		    "weave(#1699): hardware 2D requested before the weave engine exists — recorded, applied when "
