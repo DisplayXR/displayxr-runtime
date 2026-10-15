@@ -70,7 +70,6 @@ tc_usable(const struct target_component_entry *e)
 	return (e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0;
 }
 
-<<<<<<< HEAD
 //! ASCII case-insensitive equality (setting keys are registry value names).
 static bool
 tc_ci_equal(const char *a, const char *b)
@@ -108,7 +107,8 @@ tc_upper_copy(char *dst, size_t cap, const char *src)
 		dst[i] = (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : (char)c;
 	}
 	dst[i] = '\0';
-=======
+}
+
 /*
  * ADR-054 N4b, PR B: the enforce default. -1 = follow the platform knob
  * (always, outside tests), 0 = audit, 1 = enforce. Only tests set it: the
@@ -133,7 +133,6 @@ target_component_trust_policy(bool knob_present, bool knob_zero, bool platform_d
 		return !knob_zero;
 	}
 	return platform_default;
->>>>>>> 47b4f4db4 (feat(loaders): provenance gate enforcing by default on Windows; Trust\Enforce = 0 opts out; installer allowlists what it ships (ADR-054 N4b, PR B))
 }
 
 static const char *

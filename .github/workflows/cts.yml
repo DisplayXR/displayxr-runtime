@@ -557,7 +557,13 @@ jobs:
           reg add $key /v Binary /t REG_SZ /d "$plugin" /f | Out-Null
           reg add $key /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
           reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
-          Write-Host "Registered sim-display plug-in: $plugin"
+          # ADR-054 N4b PR B: the provenance gate enforces by default on Windows and
+          # this runner is elevated (the dev override is refused there), so allowlist
+          # the unsigned just-built DLL the way the installer / register_dev_plugin.bat
+          # do — without the row the loader refuses it and no CTS arm can start.
+          $hash = (Get-FileHash -Path $plugin -Algorithm SHA256).Hash.ToLower()
+          reg add "HKLM\Software\DisplayXR\Trust\Allowlist" /v $hash /t REG_SZ /d "cts sim-display" /f | Out-Null
+          Write-Host "Registered sim-display plug-in: $plugin (allowlisted $hash)"
 
       # --- software rasterizers (#1525) ------------------------------------
       # Only the arms that cannot start without one (matrix.software, set in
