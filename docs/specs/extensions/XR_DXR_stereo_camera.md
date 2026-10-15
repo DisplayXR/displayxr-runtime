@@ -159,14 +159,36 @@ so that nothing a client holds moves:
   `SOURCE_LOST`), a new start on it fails with `XR_ERROR_STEREO_CAMERA_BUSY_DXR`, and if it is
   listed again it comes back with the same `cameraId`;
 - `displayName` / `platformDeviceHint` follow the source (a plug-in that learns which screen a
-  camera belongs to renames it). Geometry, format and flags are fixed at first enumeration for
-  the service's run.
+  camera belongs to renames it), and so does its display (spec v5, below). Geometry, format and
+  flags are fixed at first enumeration for the service's run.
 
 Any of these changes — and the sharing toggle switching the enumerated set to zero or back —
 queues one `XrEventDataStereoCamerasChangedDXR` to every instance that has enumerated (or
 created a stream) and is still connected. A client re-enumerates on it; a browser fires
 `devicechange`. A client that cannot poll events can still call enumerate periodically: the
-throttle makes that cheap, and the ids make a diff trivial.
+throttle makes that cheap, and the ids make a diff trivial. A display topology change (a screen
+plugged in or removed, or the active plug-in changing) wakes the background re-enumeration at
+once instead of at its next ~2 s tick.
+
+**Which display a camera belongs to (spec v5).** Chain `XrStereoCameraDisplayDXR` on a
+camera's `XrStereoCameraPropertiesDXR::next` and `xrEnumerateStereoCamerasDXR` fills it:
+
+```c
+typedef struct XrStereoCameraDisplayDXR {
+    XrStructureType type;      // XR_TYPE_STEREO_CAMERA_DISPLAY_DXR (1004999317)
+    void* XR_MAY_ALIAS next;
+    uint64_t displayId;        // XrDisplayDXR::displayId (XR_DXR_display_info v22), 0 = unknown
+} XrStereoCameraDisplayDXR;
+```
+
+`displayId` is the id `xrEnumerateDisplaysDXR` reports for the screen the camera is built into
+or mounted on, so an app can offer "the camera on this screen" or group cameras per screen
+without parsing `displayName`. It is 0 when the plug-in does not know, and for a camera that
+belongs to no display (a plain stereo webcam, §9a). It follows the source like the name: a
+change of it is a change of the list (one `XrEventDataStereoCamerasChangedDXR`). A runtime older
+than v5 leaves the struct untouched, so set `displayId` to 0 before the call. It is chained, not
+appended to `XrStereoCameraPropertiesDXR`, because growing a public struct would break apps
+built against the older size.
 
 ## 4. Calibration
 
@@ -619,7 +641,13 @@ while a device is listed and are never handed to another device; a device that a
 appended at any time; one that goes away may be dropped from the list (the service reports it
 `UNAVAILABLE` and never opens its index) or kept at its index (an append-only registry; its
 `open` waits / fails). No change counter or callback slot is needed: the service compares by
-`device_identity`. Enumerate/calibration are cheap and
+`device_identity`.
+
+`xrt_plugin_stereo_camera_info::monitor_id` (appended, spec v5, #1961; announced by
+`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`) is the `xrt_display_descriptor::monitor_id` of
+the screen the camera belongs to, as this plug-in claimed it, or 0. Write it only when the
+runtime's `struct_size` covers it; a plug-in built against an older header simply leaves it 0.
+Apps see it as `XrStereoCameraDisplayDXR::displayId`. Enumerate/calibration are cheap and
 callable from any thread. `SUSPENDED` from `wait_frame` maps to the camera state (§3). The
 plug-in owns decoding its transport and resolving calibration for its own device; the runtime
 owns threads, fan-out, rectification, format conversion, transport, consent and indicator.
@@ -880,6 +908,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |
 | 3 (Amendment 4) | No API change. The service's own vendor-neutral UVC side-by-side source (§9a): opt-in per device by `stereo-cameras.json`, never a plug-in's camera; an uncalibrated pair is reported without `CALIBRATED`, its RAW calibration is refused, its RECTIFIED output is a pass-through aligned by the online refinement — so RECTIFIED now requires a camera the service can rectify rather than `CALIBRATED \| NATIVELY_RECTIFIED`. `displayxr-cli camera list` shows the source; new `camera uvc-devices` |
 | 3 | Delegation hardening: `XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR` (`0x2`) — a delegating client opts out of row 6 for one instance (§2a); a delegating entry for a user-writable executable path is applied only with a recorded signer its valid Authenticode signature matches (`<valueName>.signer`, Windows; POSIX path-only) and a user-level entry's first use per executable per service run is announced (§7.1.1). Appended; nothing renumbered |

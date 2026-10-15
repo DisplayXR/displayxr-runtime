@@ -280,21 +280,26 @@ cmd_list(struct ipc_connection *ipc_c, bool json)
 			hint[hn++] = *c;
 		}
 		hint[hn] = '\0';
+		// Spec v5: the screen it belongs to, as `displays` prints ids (0 = unknown).
+		char disp[24];
+		snprintf(disp, sizeof(disp), "0x%016llx", (unsigned long long)p.display_id);
 		if (json) {
 			printf(
 			    "%s{\"id\": %llu, \"name\": \"%s\", \"source\": \"%s\", \"persistentId\": \"%s\", "
 			    "\"state\": \"%s\", "
 			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
 			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
-			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\"}",
+			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\", "
+			    "\"displayId\": \"%s\"}",
 			    i ? ", " : "", (unsigned long long)p.camera_id, p.display_name, source, p.persistent_id,
 			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
 			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
-			    (unsigned long long)p.supported_transports, hint);
+			    (unsigned long long)p.supported_transports, hint, disp);
 		} else {
 			printf("  [%llu] \"%s\"  %s  (source: %s)\n", (unsigned long long)p.camera_id, p.display_name,
 			       state_str(p.state), source);
 			printf("       persistentId %s\n", p.persistent_id);
+			printf("       display      %s\n", p.display_id != 0 ? disp : "unknown");
 			printf("       flags        %s\n", flags);
 			char rate[64];
 			if (p.max_frame_rate > 0.0f) {

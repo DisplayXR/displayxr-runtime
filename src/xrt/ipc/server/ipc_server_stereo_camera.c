@@ -490,6 +490,8 @@ struct ipc_server_stereo_camera
 	bool watch_started;
 	struct os_thread watch;
 	struct os_cond watch_cond;
+	//! ipc_server_stereo_camera_rescan_soon asked; the next watch pass is unthrottled.
+	bool rescan_soon;
 
 	// R3 privacy.
 	struct u_camera_consent consent;
@@ -2205,6 +2207,15 @@ refresh_camera_locked(struct ipc_server_stereo_camera *m, struct scam_camera *ca
 		         c->info.platform_device_hint);
 		changed = true;
 	}
+	if (cam->info.monitor_id != c->info.monitor_id) {
+		// The screen it belongs to moved (display plugged in, claim resolved
+		// late, monitor re-keyed): a label, like the name.
+		U_LOG_W("stereo camera %llu \"%s\": screen 0x%016llx -> 0x%016llx", (unsigned long long)cam->camera_id,
+		        cam->info.display_name, (unsigned long long)cam->info.monitor_id,
+		        (unsigned long long)c->info.monitor_id);
+		cam->info.monitor_id = c->info.monitor_id;
+		changed = true;
+	}
 	if (c->info.max_frame_rate > 0.0f && c->info.max_frame_rate <= 1000.0f) {
 		cam->info.max_frame_rate = c->info.max_frame_rate; // a rate the source learned since
 	}
@@ -2480,9 +2491,11 @@ watch_thread(void *ptr)
 			break;
 		}
 		const bool listening = has_listener_locked(m);
+		const bool soon = m->rescan_soon;
+		m->rescan_soon = false;
 		os_mutex_unlock(&m->lock);
 		if (listening) {
-			(void)rescan(m, false, false);
+			(void)rescan(m, soon, false);
 		}
 		os_mutex_lock(&m->lock);
 	}
@@ -2649,6 +2662,18 @@ ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *m)
 	return m != NULL && rescan(m, true, false);
 }
 
+void
+ipc_server_stereo_camera_rescan_soon(struct ipc_server_stereo_camera *m)
+{
+	if (m == NULL) {
+		return;
+	}
+	os_mutex_lock(&m->lock);
+	m->rescan_soon = true;
+	os_cond_broadcast(&m->watch_cond); // the watch thread rescans if anyone listens
+	os_mutex_unlock(&m->lock);
+}
+
 static void
 stream_stop_locked(struct scam_stream *s, struct scam_camera *cam)
 {
@@ -2789,6 +2814,7 @@ ipc_handle_stereo_camera_get_properties(volatile struct ipc_client_state *ics,
 	out_props->eye_height = cam->info.eye_height;
 	out_props->max_frame_rate = source_rate_hz(cam);
 	out_props->source = cam->source;
+	out_props->display_id = cam->info.monitor_id;
 	if (cam->have_calib) {
 		// Spec §3: per eye, RECTIFIED (the service's rectified focal when it
 		// rectifies; the plug-in's own for a natively rectified source).

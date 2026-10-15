@@ -232,6 +232,12 @@ oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
 		o->horizontalFovDeg = p.horizontal_fov_deg;
 		o->supportedFormats = p.supported_formats;
 		o->supportedTransports = p.supported_transports;
+		// Spec v5: the camera's display, when the app chained the struct.
+		XrStereoCameraDisplayDXR *disp =
+		    OXR_GET_OUTPUT_FROM_CHAIN(o, XR_TYPE_STEREO_CAMERA_DISPLAY_DXR, XrStereoCameraDisplayDXR);
+		if (disp != NULL) {
+			disp->displayId = p.display_id;
+		}
 	}
 	return XR_SUCCESS;
 }

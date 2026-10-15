@@ -390,6 +390,43 @@ TEST_CASE("re-enumeration: a vanished camera ends its streams", "[stereo_camera_
 	scm_destroy(f);
 }
 
+TEST_CASE("re-enumeration: each camera reports its screen, and a move is a change", "[stereo_camera_manager][rescan]")
+{
+	const char *ids_ab[] = {"test:A", "test:B"};
+	const char *names_ab[] = {"Camera - Laptop", "Camera - DS1"};
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+	const uint64_t mon_ab[] = {0x1111000000000001ull, 0x2222000000000002ull};
+	scm_fake_plugin_set_monitors(mon_ab, 2);
+	scm_fixture *f = scm_create_fake_plugin();
+	REQUIRE(f != nullptr);
+	REQUIRE(scm_count(f) == 2);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.display_id == mon_ab[0]);
+	REQUIRE(scm_properties(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.display_id == mon_ab[1]);
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 0);
+
+	// Unchanged screens: no change.
+	CHECK_FALSE(scm_rescan(f));
+
+	// B's screen is re-keyed (display moved port): same camera, new screen, ONE event.
+	const uint64_t mon_ab2[] = {mon_ab[0], 0x3333000000000003ull};
+	scm_fake_plugin_set_monitors(mon_ab2, 2);
+	CHECK(scm_rescan(f));
+	CHECK(drain(f, XRT_STEREO_CAMERA_EVENT_CAMERAS_CHANGED) == 1);
+	REQUIRE(scm_properties(f, 1, &p) == XRT_SUCCESS);
+	CHECK(p.display_id == mon_ab2[1]);
+	CHECK(std::string(p.display_name) == "Camera - DS1");
+
+	// A plug-in that does not know the screen reports 0.
+	scm_fake_plugin_set(ids_ab, names_ab, 2);
+	CHECK(scm_rescan(f));
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.display_id == 0);
+	scm_destroy(f);
+}
+
 TEST_CASE("re-enumeration: the enumerate path is throttled", "[stereo_camera_manager][rescan]")
 {
 	const char *ids_a[] = {"test:A"};

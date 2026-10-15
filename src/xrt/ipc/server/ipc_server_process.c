@@ -1005,6 +1005,8 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 	                          was_fallback != s->xsysc->info.active_plugin_is_fallback;
 	if (screens_moved || plugin_moved) {
 		ipc_server_status_bump(s, true);
+		// #1961: a display's camera (and the screen it belongs to) follows now.
+		ipc_server_stereo_camera_rescan_soon(s->stereo_camera);
 	}
 	if (was_fallback && !s->xsysc->info.active_plugin_is_fallback) {
 		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",

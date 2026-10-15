@@ -21,6 +21,7 @@
 #include "os/os_time.h"
 #include "util/u_camera_consent.h"
 
+#include <stddef.h>
 #include <stdio.h>
 
 #include <stdlib.h>
@@ -132,6 +133,7 @@ static struct
 	uint32_t count;
 	char identity[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
 	char name[XRT_STEREO_CAMERA_MAX_CAMERAS][128];
+	uint64_t monitor[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	uint32_t enumerate_calls;
 } g_fake;
 
@@ -155,6 +157,11 @@ fake_enumerate(struct xrt_plugin_instance *inst, uint32_t capacity, struct xrt_p
 		o->eye_height = 480;
 		o->max_frame_rate = 0.0f;
 		o->native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+		// Appended field: written only when the runtime's struct_size covers it.
+		const size_t need = offsetof(struct xrt_plugin_stereo_camera_info, monitor_id) + sizeof(o->monitor_id);
+		if (o->struct_size >= need) {
+			o->monitor_id = g_fake.monitor[i];
+		}
 	}
 	return g_fake.count;
 }
@@ -219,6 +226,15 @@ scm_fake_plugin_set(const char *const *identities, const char *const *names, uin
 	for (uint32_t i = 0; i < g_fake.count; i++) {
 		snprintf(g_fake.identity[i], sizeof(g_fake.identity[i]), "%s", identities[i]);
 		snprintf(g_fake.name[i], sizeof(g_fake.name[i]), "%s", names[i]);
+		g_fake.monitor[i] = 0;
+	}
+}
+
+void
+scm_fake_plugin_set_monitors(const uint64_t *monitor_ids, uint32_t count)
+{
+	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
+		g_fake.monitor[i] = i < count ? monitor_ids[i] : 0;
 	}
 }
 
