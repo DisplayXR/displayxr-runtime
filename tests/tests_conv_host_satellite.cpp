@@ -428,6 +428,45 @@ TEST_CASE("conv_host: exit codes before and at load", "[conv_host]")
 	}
 }
 
+#if defined(XRT_OS_WINDOWS)
+TEST_CASE("conv_host: a per-user setting (conv set) reaches the satellite provider without the environment",
+          "[conv_host]")
+{
+	// ADR-054 N3c: the service answers get_setting through the shared store
+	// (env > per-user > row). The satellite host answered from env + row only,
+	// so `displayxr-cli conv set sim-conversion ENABLE 1` enabled the sim
+	// provider in-service and NOT in a satellite (found live, 2026-10-15).
+	common_env();
+	set_env("DXR_CONV_SIM_CONVERSION_TEST_ENABLE", nullptr); // tier 1 must NOT carry it
+	// A test id: no registration row anywhere, so tier 3 is empty too.
+	const wchar_t *wkey = L"Software\\DisplayXR\\ConversionProviders\\sim-conversion-test\\Settings";
+	HKEY k = nullptr;
+	REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, wkey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) ==
+	        ERROR_SUCCESS);
+	const wchar_t one[] = L"1";
+	REQUIRE(RegSetValueExW(k, L"ENABLE", 0, REG_SZ, (const BYTE *)one, sizeof(one)) == ERROR_SUCCESS);
+	RegCloseKey(k);
+	struct Cleanup
+	{
+		~Cleanup()
+		{
+			RegDeleteTreeW(HKEY_CURRENT_USER,
+			               L"Software\\DisplayXR\\ConversionProviders\\sim-conversion-test");
+		}
+	} cleanup;
+
+	Host h;
+	REQUIRE(h.spawn({"--provider", "sim-conversion-test", "--binary", SIM_CONVERSION_PATH, "--parent",
+	                 h.parent_arg(), "--idle-exit-ms", "1500"}));
+	REQUIRE(h.chan != nullptr);
+	uint32_t caps = 0;
+	REQUIRE(handshake(h, &caps)); // probe() declined (exit 11) before the fix: ENABLE unseen
+	CHECK(caps >= 1);
+	// Nothing bound: the host leaves on its own.
+	CHECK(h.wait_exit(15000) == CONV_HOST_EXIT_ORDERLY);
+}
+#endif
+
 TEST_CASE("conv_host: idle exit with no bound task", "[conv_host]")
 {
 	common_env();

@@ -1404,7 +1404,17 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 			in->img.import_key = ((uint64_t)0x1Au << 56) | ((uint64_t)in->generation << 16) | q.index;
 			in->used = true;
 		}
+		const uint64_t log_handle = r == XRT_SUCCESS ? in->img.handle : 0;
+		const uint64_t log_sync = r == XRT_SUCCESS ? in->sync_handle : 0;
+		const uint32_t log_gen = r == XRT_SUCCESS ? in->generation : 0;
 		os_mutex_unlock(&s->mtx);
+		if (r == XRT_SUCCESS) {
+			// The duplicated handle values a provider will open: the one
+			// oracle for an OpenSharedResource1 failure on the provider side.
+			U_LOG_I("conversion host: image slot %u gen %u: %ux%u fmt %u kind %u handle 0x%llx sync 0x%llx",
+			        q.index, log_gen, q.image.width, q.image.height, q.image.format, q.image.memory_kind,
+			        (unsigned long long)log_handle, (unsigned long long)log_sync);
+		}
 		if (r != XRT_SUCCESS) {
 			close_handles(f);
 		}

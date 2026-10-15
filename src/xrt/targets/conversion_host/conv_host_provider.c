@@ -12,7 +12,9 @@
 
 #include "conversion/conv_host_inproc.h"
 #include "conversion/conv_model_store.h"
+#include "target_component_loader.h"
 #include "target_conv_status.h"
+#include "target_conversion_plugin_loader.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -39,6 +41,7 @@ static struct
 {
 	struct os_mutex mtx;
 	bool mtx_ok;
+	char provider_id[64];
 	char env_prefix[96]; //!< "DXR_CONV_<ID>_" (upper case, '-' -> '_')
 	uint32_t setting_count;
 	struct xrt_conversion_plugin_setting settings[CONV_HOST_MAX_SETTINGS];
@@ -77,33 +80,30 @@ host_get_setting(const char *key, char *buf, uint32_t buf_size)
 	if (key == NULL || buf == NULL || buf_size == 0) {
 		return false;
 	}
-	bool found = false;
+	// The one options contract (ADR-054 N3c), exactly as the service's
+	// in-process host answers it: tier 1 the environment (the supervisor
+	// spawns this host with the service's block), tier 2 the per-user store
+	// (HKCU `Settings\<KEY>` / <id>.settings.json, read live), tier 3 the
+	// registration row as enumerated at start. Before this the host answered
+	// from tiers 1 and 3 only, so a `conv set <id> KEY value` never reached a
+	// satellite provider while it reached the same provider in-service.
+	const char *row_value = NULL;
+	char id[64];
 	cfg_lock();
-	// 1. DXR_CONV_<ID>_<KEY> in this process's environment, which is the
-	//    service's: the supervisor spawns the host with its own environment
-	//    block (discovery spec §2.4 "Configuration").
-	char env[160];
-	const int n = snprintf(env, sizeof(env), "%s%s", g_cfg.env_prefix, key);
-	if (g_cfg.env_prefix[0] != '\0' && n > 0 && (size_t)n < sizeof(env)) {
-		for (char *c = env; *c != '\0'; c++) {
-			*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
-		}
-		const char *v = getenv(env);
-		if (v != NULL && v[0] != '\0') {
-			(void)snprintf(buf, buf_size, "%s", v);
-			found = true;
-		}
-	}
-	// 2. The registration's Settings\<KEY> / manifest "settings".
-	for (uint32_t i = 0; !found && i < g_cfg.setting_count; i++) {
+	(void)snprintf(id, sizeof(id), "%s", g_cfg.provider_id);
+	for (uint32_t i = 0; i < g_cfg.setting_count; i++) {
+#if defined(XRT_OS_WINDOWS)
+		if (_stricmp(g_cfg.settings[i].key, key) == 0) {
+#else
 		if (strcasecmp(g_cfg.settings[i].key, key) == 0) {
-			(void)snprintf(buf, buf_size, "%s", g_cfg.settings[i].value);
-			found = true;
+#endif
+			row_value = g_cfg.settings[i].value;
 			break;
 		}
 	}
 	cfg_unlock();
-	return found;
+	return target_component_get_setting_ex(target_conversion_plugin_component_class(), id, key, row_value, buf,
+	                                       buf_size, NULL);
 }
 
 static bool
@@ -165,6 +165,7 @@ conv_host_provider_set_config(const char *provider_id,
 {
 	cfg_init();
 	cfg_lock();
+	(void)snprintf(g_cfg.provider_id, sizeof(g_cfg.provider_id), "%s", provider_id != NULL ? provider_id : "");
 	(void)snprintf(g_cfg.env_prefix, sizeof(g_cfg.env_prefix), "DXR_CONV_%s_", provider_id != NULL ? provider_id : "");
 	for (char *c = g_cfg.env_prefix; *c != '\0'; c++) {
 		*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
