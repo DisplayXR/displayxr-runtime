@@ -125,6 +125,7 @@ static const struct target_component_class g_conv_class = {
     .android_prefix = TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION,
     .is_reserved_subkey = target_conversion_plugin_is_reserved_subkey,
     .read_extra = conv_read_extra,
+    .env_class = "CONV", // DXR_CONV_<ID>_<KEY> (spec §3.2; the shared store since N3c)
 };
 
 #ifdef XRT_OS_WINDOWS

@@ -252,6 +252,10 @@ struct target_component_class
 	bool (*is_reserved_subkey)(const char *name);
 	//! Optional: class-private row fields.
 	target_component_read_extra_fn read_extra;
+	//! The `<CLASS>` token of the class's environment override
+	//! `DXR_<CLASS>_<ID>_<KEY>` (N3c): "DP" / "INPUT" / "CONV". NULL = the
+	//! class has no environment tier (test rows).
+	const char *env_class;
 };
 
 /*!
@@ -356,11 +360,217 @@ target_component_apply_user_overlay(const struct target_component_class *cls,
 #if !defined(_WIN32) && !defined(__ANDROID__)
 /*!
  * The per-user manifest dir — the writable root for per-user overrides
- * (`preferred`, `force_qwerty`, ...). False when HOME and XDG are unset.
+ * (`preferred`, `force_qwerty`, `<id>.settings.json`, ...). False when HOME
+ * and XDG are unset.
  */
 bool
 target_component_user_dir(char *out, size_t cap);
 #endif
+
+
+/*
+ *
+ * Component settings — the one options contract (ADR-054 decision 7, N3c).
+ *
+ * Per-component settings live on the component's registration row and are
+ * read by the component ONLY through its host iface
+ * (`xrt/xrt_component_settings.h`), which calls @ref target_component_get_setting.
+ * The chain, highest first — the `u_setting` rule, environment always wins:
+ *
+ *   1. environment   `DXR_<CLASS>_<ID>_<KEY>` in the HOSTING process
+ *                    (`<CLASS>` = cls->env_class, `<ID>` = id upper-cased,
+ *                    `-` → `_`; Windows `getenv_s`, Android `debug.xrt.*`)
+ *   2. user          Windows: `HKCU\<registry_root>\<id>\Settings\<KEY>`
+ *                    (ignored when HKLM `<registry_root>\Policy\Lock` = 1 —
+ *                    the same kiosk rule as `Enabled`); POSIX: the
+ *                    `<id>.settings.json` object in the per-user manifest dir
+ *   3. machine       Windows: `HKLM\<registry_root>\<id>\Settings\<KEY>`
+ *                    (64-bit view; REG_SZ or REG_DWORD)
+ *      manifest      POSIX: the manifest's `plugin.settings` object
+ *   4. absent        nothing set it — the component keeps its compiled default
+ *
+ * Only `Settings\*` values are ever read from HKCU / the per-user file: a
+ * per-user store can change what a registered component is TOLD, never which
+ * binary loads. Keys are `[A-Za-z0-9_]`, matched case-insensitively (they are
+ * registry value names), conventionally upper-case. Values are strings; the
+ * component parses. `u_setting_is_managed` and its allow-list are untouched:
+ * this store is keyed by component row and never resolves a runtime-policy
+ * `DXR_*` name.
+ *
+ */
+
+//! Size of a setting key buffer, incl. the NUL.
+#define TARGET_COMPONENT_SETTING_KEY_MAX 64
+//! Size of a setting value buffer, incl. the NUL.
+#define TARGET_COMPONENT_SETTING_VALUE_MAX 256
+//! Size of a `DXR_<CLASS>_<ID>_<KEY>` buffer, incl. the NUL.
+#define TARGET_COMPONENT_SETTING_ENV_MAX 160
+
+//! Where an effective setting value came from. Stable names: @ref target_component_setting_source_str.
+enum target_component_setting_source
+{
+	TARGET_COMPONENT_SETTING_ABSENT = 0,  //!< nothing sets it; the component's default stands
+	TARGET_COMPONENT_SETTING_ENVIRONMENT, //!< `DXR_<CLASS>_<ID>_<KEY>` in the hosting process
+	TARGET_COMPONENT_SETTING_USER,        //!< the per-user store (HKCU / `<id>.settings.json`)
+	TARGET_COMPONENT_SETTING_MACHINE,     //!< HKLM `Settings\<KEY>` (Windows)
+	TARGET_COMPONENT_SETTING_MANIFEST,    //!< the manifest's `settings` object (POSIX)
+};
+
+//! "absent" / "environment" / "user" / "machine" / "manifest".
+const char *
+target_component_setting_source_str(uint32_t source);
+
+//! Outcome of a store write (@ref target_component_set_setting / unset).
+enum target_component_store_result
+{
+	TARGET_COMPONENT_STORE_OK = 0,
+	TARGET_COMPONENT_STORE_DENIED,      //!< needs an elevated process (HKLM) / a writable dir
+	TARGET_COMPONENT_STORE_UNSUPPORTED, //!< no such store on this platform (`--machine` on POSIX; Android)
+	TARGET_COMPONENT_STORE_FAILED,      //!< bad key / value, or I/O
+};
+
+/*!
+ * Is @p key a usable setting key: 1..63 chars of `[A-Za-z0-9_]`, not starting
+ * with a digit. Pure.
+ */
+bool
+target_component_setting_key_valid(const char *key);
+
+/*!
+ * The environment override's name, `DXR_<CLASS>_<ID>_<KEY>`: @p id and
+ * @p key upper-cased, `-` → `_`. False (and `out[0] = 0`) when a part is
+ * missing / invalid or the name does not fit @p cap. Pure.
+ */
+bool
+target_component_setting_env_name(const char *env_class, const char *id, const char *key, char *out, size_t cap);
+
+/*!
+ * The chain over already-read tiers, pure so tests can pin the order:
+ * @p env_value (tier 1), @p user_value (tier 2), @p stored_value (tier 3 —
+ * machine when @p stored_is_manifest is false, else manifest); each may be
+ * NULL, and an empty environment value counts as unset. @p lock = the
+ * machine's `Policy\Lock`, which makes tier 2 invisible. Returns @p buf with
+ * the value copied in and @p out_source (may be NULL) set, or NULL with
+ * ABSENT.
+ */
+const char *
+target_component_setting_resolve(const char *env_value,
+                                 const char *user_value,
+                                 const char *stored_value,
+                                 bool stored_is_manifest,
+                                 bool lock,
+                                 char *buf,
+                                 size_t cap,
+                                 uint32_t *out_source);
+
+/*!
+ * Look @p key up (case-insensitively) in the flat JSON object @p json_text
+ * (a per-user `<id>.settings.json`): a string, number or boolean member is a
+ * value (booleans read "1" / "0"); anything else is absent. Pure.
+ */
+bool
+target_component_user_settings_json_lookup(const char *json_text, const char *key, char *buf, size_t cap);
+
+/*!
+ * The effective value of setting @p key of the component registered as
+ * @p id, through the chain above. Writes it into @p buf (@p cap bytes,
+ * truncating) and returns true; false with `buf[0] = 0` and @p out_source
+ * (may be NULL) = ABSENT when nothing sets it. This is what every class's
+ * host `get_setting` calls. Re-reads the stores on every call — a component
+ * reads at init and caches.
+ */
+bool
+target_component_get_setting(const struct target_component_class *cls,
+                             const char *id,
+                             const char *key,
+                             char *buf,
+                             size_t cap,
+                             uint32_t *out_source);
+
+/*!
+ * Write `<KEY>` = @p value for @p id: per user by default (HKCU /
+ * `<id>.settings.json`, no admin), machine-wide with @p machine (HKLM 64-bit
+ * view, admin; UNSUPPORTED on POSIX — the manifest's `settings` object is
+ * the machine store there and is edited by hand). Refuses an invalid key or
+ * a value that does not fit. Does NOT check that @p id is registered — the
+ * CLI does, so an orphan row is never written.
+ */
+enum target_component_store_result
+target_component_set_setting(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine);
+
+//! Remove `<KEY>` from the per-user (default) or machine store of @p id. Absent is success.
+enum target_component_store_result
+target_component_unset_setting(const struct target_component_class *cls, const char *id, const char *key, bool machine);
+
+//! One stored key as the CLI lists it: the effective value + where it came from.
+struct target_component_setting_view
+{
+	char key[TARGET_COMPONENT_SETTING_KEY_MAX];
+	char value[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	uint32_t source; //!< enum target_component_setting_source
+};
+
+/*!
+ * Every key present in @p id's stores (user + machine / manifest, de-duplicated
+ * case-insensitively, keys upper-cased), each resolved through the full chain
+ * (so an environment override shows as such). Returns the count written to
+ * @p out (up to @p max). The environment cannot be enumerated: a key set only
+ * there appears when the caller also asks for it by name.
+ */
+int
+target_component_list_settings(const struct target_component_class *cls,
+                               const char *id,
+                               struct target_component_setting_view *out,
+                               int max);
+
+/*!
+ * Where a write would go, for messages: Windows the registry path
+ * (`HKCU\...\<id>\Settings` / `HKLM\...`), POSIX the per-user file path
+ * (@p machine: the manifest path when registered, else ""). False when there
+ * is no such store.
+ */
+bool
+target_component_setting_store_path(
+    const struct target_component_class *cls, const char *id, bool machine, char *out, size_t cap);
+
+//! One declared setting, as the loader hands it to the CLI (copied out of a plug-in / manifest).
+struct target_component_setting_desc
+{
+	char key[TARGET_COMPONENT_SETTING_KEY_MAX];
+	char type[16];
+	char default_value[64];
+	char help[192];
+};
+
+/*!
+ * The `plugin.settings_schema` array of @p id's manifest (POSIX; `[{"key",
+ * "type", "default", "help"}, ...]`, the manifest twin of the
+ * `describe_settings` vtable slot). Re-reads the manifest. Returns the count
+ * written to @p out (up to @p max); 0 on Windows / Android and for an
+ * unregistered id.
+ */
+int
+target_component_manifest_settings_schema(const struct target_component_class *cls,
+                                          const char *id,
+                                          struct target_component_setting_desc *out,
+                                          int max);
+
+struct xrt_component_setting_desc;
+
+/*!
+ * Copy a plug-in's declared settings (`describe_settings`, @p n entries of
+ * @p in) into @p out (up to @p max), skipping entries with an invalid key and
+ * keys already present in @p out's first @p existing entries (so a manifest
+ * schema and the binary's own declaration merge by key). Returns the new
+ * total count.
+ */
+int
+target_component_merge_setting_descs(struct target_component_setting_desc *out,
+                                     int existing,
+                                     int max,
+                                     const struct xrt_component_setting_desc *in,
+                                     uint32_t n);
 
 
 /*
