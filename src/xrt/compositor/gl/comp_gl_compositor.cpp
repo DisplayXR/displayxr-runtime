@@ -80,6 +80,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include <sys/stat.h>
 #ifndef XRT_OS_WINDOWS
 #include <unistd.h>
@@ -986,6 +987,13 @@ struct comp_gl_compositor
 	 * need no lock: the swap happens on that thread.
 	 */
 	struct os_mutex dp_swap_mutex;
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the post-process_atlas cache, the HUD, xrLocateViews) is pushed here,
+	 * so a DP without the target-time slot can still be sampled at a display
+	 * time (interpolate / extrapolate / stale) instead of "latest".
+	 */
+	struct u_eye_history eye_hist;
 	//! The session's eye-tracking mode, re-sent to a swapped-in primary DP.
 	bool eye_tracking_mode_set;
 	uint32_t eye_tracking_mode;
@@ -7761,6 +7769,9 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		if (fresh_ok && fresh_eyes.valid) {
 			c->cached_eye_pos = fresh_eyes;
 			c->have_cached_eye_pos = true;
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &fresh_eyes, (int64_t)os_monotonic_get_ns());
 		}
 	}
 
@@ -7905,6 +7916,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 #endif
 	xrt_display_processor_gl_destroy(&c->display_processor);
 	os_mutex_destroy(&c->dp_swap_mutex);
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	// Destroy HUD
 	if (c->hud_texture) glDeleteTextures(1, &c->hud_texture);
@@ -8642,7 +8654,38 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	bool ok = c->display_processor != NULL &&
 	          xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, out_eye_pos);
 	os_mutex_unlock(&c->dp_swap_mutex);
+	if (ok && out_eye_pos->valid) {
+		// N6 Part 1 (#2144): keyed by the time it was asked.
+		u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+	}
 	return ok;
+}
+
+bool
+comp_gl_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos)
+{
+	if (xc == NULL || out_eye_pos == NULL) {
+		return false;
+	}
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	// The DP's own target-time slot when it has one ...
+	os_mutex_lock(&c->dp_swap_mutex);
+	const bool has = xrt_display_processor_gl_has_eye_positions_at(c->display_processor);
+	const bool ok =
+	    has && xrt_display_processor_gl_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	if (has) {
+		return ok && out_eye_pos->valid;
+	}
+	// ... else the ring of per-frame answers sampled at the target ...
+	if (u_eye_history_get(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return true;
+	}
+	// ... else the plain "latest" answer (which primes the ring).
+	return comp_gl_compositor_get_predicted_eye_positions(xc, out_eye_pos) && out_eye_pos->valid;
 }
 
 void
@@ -8893,6 +8936,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	os_mutex_init(&c->cursor_measure_mutex); // XR_DXR_cursor_depth v7 result (leaf)
 	os_thread_helper_init(&c->repaint_thread);
 	os_mutex_init(&c->dp_swap_mutex); // multi-screen M6 primary-DP swap
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->seg_pub_mutex);
 #endif

@@ -74,6 +74,17 @@ comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_eye_positions *out_eye_pos);
 
 /*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one, else this compositor's ring
+ * of per-frame answers sampled at @p target_ns, else the "latest" answer.
+ * Returns false if no valid positions could be produced.
+ */
+bool
+comp_metal_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos);
+
+/*!
  * Get physical display dimensions in meters.
  * Returns false if not available.
  */
