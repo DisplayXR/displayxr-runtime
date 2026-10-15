@@ -24,9 +24,11 @@
  * libXcursor, GIO (GSettings) and libX11 (Xft.dpi) are all dlopen()ed: none of
  * them becomes a dependency of the .deb (package_deb_linux.sh's STABLE_SONAMES),
  * and without them the look stays the classic arrow. A loaded image is cached by
- * backing scale; a scale that failed is not retried every frame. The
- * process-wide state (the libXcursor entry points, the theme, the failed scale,
- * the backing scale) is guarded: two compositors can load the look at once.
+ * backing scale; a scale that failed is not retried every frame (remembered per
+ * look, so two compositors at different scales each give up once). The
+ * process-wide state (the libXcursor entry points, the theme, the one-time
+ * notice, the backing scale) is guarded: two compositors can load the look at
+ * once.
  *
  * Backing scale: a compositor that knows the scale of the monitor its window is
  * on passes it (vk_native on native Wayland, through the window-geometry GNOME
@@ -80,7 +82,7 @@ struct xcursor_image
 typedef struct xcursor_image *(*pfn_xcursor_library_load_image)(const char *library, const char *theme, int size);
 typedef void (*pfn_xcursor_image_destroy)(struct xcursor_image *image);
 
-//! Guards the libXcursor entry points, the theme, the failed scale and the one-time notice.
+//! Guards the libXcursor entry points, the theme and the one-time notice.
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 
 //! Called under s_lock.
@@ -229,9 +231,9 @@ static char s_theme_marker;
 static bool
 load_theme_locked(struct comp_cursor_look *look, float scale)
 {
-	static float failed_scale = -1.0f;
-	if (scale == failed_scale || !xcursor_available()) {
-		return false; // not retried every frame
+	if (!xcursor_available()) {
+		look->os_failed_scale = scale; // not retried every frame
+		return false;
 	}
 
 	const char *theme = NULL;
@@ -252,7 +254,7 @@ load_theme_locked(struct comp_cursor_look *look, float scale)
 		if (img != NULL) {
 			s_xcursor.image_destroy(img);
 		}
-		failed_scale = scale;
+		look->os_failed_scale = scale;
 		// comp_cursor_look_update() keeps the image the look already holds, else draws the arrow.
 		const bool keep_theme = look->os_cursor == &s_theme_marker && look->rgba != NULL;
 		U_LOG_W("cursor_draw: could not load the cursor theme '%s' left_ptr at %d px - %s",
@@ -297,6 +299,9 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 	const float scale = backing_scale > 0.0f ? backing_scale : comp_cursor_look_platform_backing_scale();
 	if (look->os_cursor == &s_theme_marker && look->os_scale == scale && look->rgba != NULL) {
 		return true; // loaded at this scale: the common case
+	}
+	if (look->os_failed_scale == scale) {
+		return false; // this look already failed at this scale: not retried every frame
 	}
 	pthread_mutex_lock(&s_lock);
 	const bool ok = load_theme_locked(look, scale);

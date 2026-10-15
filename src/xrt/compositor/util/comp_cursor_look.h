@@ -66,6 +66,9 @@ struct comp_cursor_look
 	//! retried every frame).
 	float os_scale;
 	void *os_failed;
+	//! Linux: a backing scale the theme image could not be loaded at (0 = none),
+	//! so that scale is not retried every frame.
+	float os_failed_scale;
 };
 
 /*!
