@@ -192,6 +192,9 @@ struct cli_gpu_adapter
  * instance is destroyed before @ref cli_query_run returns, so the result
  * stays valid with no dangling iface pointers and no live runtime objects.
  */
+//! = XRT_SYSTEM_MAX_DEVICES, without pulling xrt_system.h into every CLI TU (N7 device list).
+#define CLI_INPUT_MAX_DEVICES 32
+
 struct cli_query_result
 {
 	/* Runtime. */
@@ -376,6 +379,17 @@ struct cli_query_result
 	int input_scan_failed;       //!< loader scan: providers that could not be dispatched (load / ABI)
 	int input_scan_untrusted;    //!< loader scan: providers the provenance gate refused (ADR-054 N4b)
 	bool input_force_qwerty;     //!< ForceQwerty override set
+
+	/* ADR-054 N7 (#2143): the EmulatedControllers gate as read by the loader
+	 * (value + where it came from: user | machine | file | default), and the
+	 * system's device list as data so a conformance cell can assert the
+	 * qwerty pair's presence / absence from a field, not log text. */
+	int input_emulated_controllers; //!< 1 = the qwerty pair is published (default), 0 = withheld
+	char input_emulated_source[12];
+	int input_device_count;
+	char input_device_str[CLI_INPUT_MAX_DEVICES][64];
+	int input_device_type[CLI_INPUT_MAX_DEVICES]; //!< enum xrt_device_type
+
 	bool input_provider_active;  //!< a provider claimed the system
 	bool input_provider_present; //!< …and its hardware is there right now
 	bool input_evaluated;        //!< checks ran (provider present, no override)
