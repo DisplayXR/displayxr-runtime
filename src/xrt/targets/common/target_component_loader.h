@@ -194,7 +194,7 @@ struct target_component_entry
 	/* Provenance (ADR-054 N4b). UNKNOWN until @ref target_component_check_provenance
 	 * ran — the load path runs it; a lister calls it explicitly. */
 	uint32_t provenance;         //!< enum target_component_provenance
-	char provenance_reason[160]; //!< one line: why this verdict (allowlist row to write, signer, ...)
+	char provenance_reason[224]; //!< one line: why this verdict — long enough for the elevated-host text + the 64-hex allowlist row
 	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
 	char sha256[65];             //!< hex digest of the binary's bytes when it could be read; "" otherwise
 
@@ -668,12 +668,33 @@ bool
 target_component_dev_override_set(void);
 
 /*!
- * Is the provenance gate ENFORCING? Windows: `HKLM\Software\DisplayXR\Trust`
- * value `Enforce` (DWORD) != 0; POSIX: `/etc/displayxr/trust/enforce` exists.
- * Absent = audit mode (log, load anyway). PR B flips this default.
+ * Is the provenance gate ENFORCING (an `unverified` binary is refused) or in
+ * audit mode (logged, loaded anyway)?
+ *
+ * Windows (ADR-054 N4b PR B): enforcing by default; `HKLM\Software\DisplayXR\Trust`
+ * value `Enforce` (DWORD) = 0 opts out for one release, = 1 says it explicitly.
+ * POSIX: audit by default (no signer check, unsigned user-level tarball lane);
+ * `/etc/displayxr/trust/enforce` enforces unless its first non-blank byte is
+ * `0`. Android: never (everything is platform-trusted).
  */
 bool
 target_component_trust_enforced(void);
+
+/*!
+ * The pure decision behind @ref target_component_trust_enforced: an explicit
+ * knob wins (0 = audit, else enforce), otherwise the platform default.
+ */
+bool
+target_component_trust_policy(bool knob_present, bool knob_zero, bool platform_default);
+
+/*!
+ * TEST-ONLY. Pin the gate to audit (0) or enforcing (1) for this process, or
+ * -1 to follow the platform knob again. The knob lives in HKLM / /etc, which a
+ * unit test must not touch; the build-tree stubs tests load are unsigned and
+ * unlisted by construction, so a loading test pins audit first.
+ */
+void
+target_component_trust_set_enforce_override(int mode);
 
 //! Outcome of @ref target_component_load_binary.
 enum target_component_load_result

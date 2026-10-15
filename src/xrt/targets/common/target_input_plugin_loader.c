@@ -103,6 +103,10 @@ static int g_input_load_attempted = 0;
  */
 static int g_input_scan_declined = 0;
 static int g_input_scan_failed = 0;
+//! ADR-054 N4b: providers the provenance gate REFUSED (unsigned, not allowlisted) — counted apart from
+//! load failures so the verdict can say so; set by input_try_load_one for the row it just tried.
+static int g_input_scan_untrusted = 0;
+static bool g_input_last_untrusted = false;
 
 /*!
  * Every provider that loaded, ABI-passed and probed successfully, in
@@ -390,7 +394,11 @@ input_try_load_one(struct target_component_entry *e,
 
 	void *module = NULL;
 	void *fn = NULL;
-	if (target_component_load_binary(&g_input_class, e, &module, &fn, NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+	g_input_last_untrusted = false;
+	const enum target_component_load_result lr =
+	    target_component_load_binary(&g_input_class, e, &module, &fn, NULL, NULL, 0);
+	if (lr != TARGET_COMPONENT_LOAD_OK) {
+		g_input_last_untrusted = lr == TARGET_COMPONENT_LOAD_UNTRUSTED;
 		return NULL;
 	}
 	xrt_input_plugin_negotiate_fn_t negotiate = (xrt_input_plugin_negotiate_fn_t)fn;
@@ -555,6 +563,8 @@ input_discover_all(void)
 		}
 		if (declined) {
 			g_input_scan_declined++;
+		} else if (g_input_last_untrusted) {
+			g_input_scan_untrusted++;
 		} else {
 			g_input_scan_failed++;
 		}
@@ -563,9 +573,9 @@ input_discover_all(void)
 
 	if (g_input_provider_count == 0) {
 		U_LOG_I(
-		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) "
-		    "— qwerty keeps the hand roles.",
-		    g_input_scan_declined, g_input_scan_failed);
+		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load, %d "
+		    "refused by the provenance gate) — qwerty keeps the hand roles.",
+		    g_input_scan_declined, g_input_scan_failed, g_input_scan_untrusted);
 	}
 }
 
@@ -964,4 +974,11 @@ target_input_plugin_reread_policy(void)
 	U_LOG_W("input plugin loader: policy re-read — PreferredPlugin=%s, %d resident provider(s), %d re-ranked.",
 	        have_pref ? preferred : "<unset>", rank_count, changed);
 	return changed;
+}
+
+int
+target_input_plugin_get_scan_untrusted(void)
+{
+	(void)target_input_plugin_get_active();
+	return g_input_scan_untrusted;
 }

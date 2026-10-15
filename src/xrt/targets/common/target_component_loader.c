@@ -109,6 +109,32 @@ tc_upper_copy(char *dst, size_t cap, const char *src)
 	dst[i] = '\0';
 }
 
+/*
+ * ADR-054 N4b, PR B: the enforce default. -1 = follow the platform knob
+ * (always, outside tests), 0 = audit, 1 = enforce. Only tests set it: the
+ * knob lives in HKLM / /etc, which a unit test must not touch, and the
+ * build-tree stubs they load are unsigned and unlisted by construction.
+ */
+static int g_trust_enforce_override = -1;
+
+void
+target_component_trust_set_enforce_override(int mode)
+{
+	g_trust_enforce_override = mode < 0 ? -1 : (mode != 0 ? 1 : 0);
+}
+
+bool
+target_component_trust_policy(bool knob_present, bool knob_zero, bool platform_default)
+{
+	// An explicit knob always wins: 0 = audit, anything else = enforce.
+	// Without one, the platform's default applies (Windows enforces since
+	// PR B; POSIX still audits: no signer check, unsigned tarball lane).
+	if (knob_present) {
+		return !knob_zero;
+	}
+	return platform_default;
+}
+
 static const char *
 tc_tag(const struct target_component_class *cls)
 {
@@ -804,13 +830,17 @@ target_component_dev_override_set(void)
 bool
 target_component_trust_enforced(void)
 {
+	if (g_trust_enforce_override >= 0) {
+		return g_trust_enforce_override != 0;
+	}
 	DWORD v = 0;
 	DWORD bytes = sizeof(v);
-	if (RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Trust", L"Enforce",
-	                 RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v, &bytes) != ERROR_SUCCESS) {
-		return false;
-	}
-	return v != 0;
+	const bool present = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Trust", L"Enforce",
+	                                  RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v,
+	                                  &bytes) == ERROR_SUCCESS;
+	// PR B: enforcing is the Windows default; `Enforce` = 0 (DWORD) is the
+	// one-release escape hatch, `Enforce` = 1 says it explicitly.
+	return target_component_trust_policy(present, present && v == 0, true);
 }
 
 /*!
@@ -979,7 +1009,7 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 	(void)target_component_check_provenance(cls, e);
 	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
 		if (target_component_trust_enforced()) {
-			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (Trust\\Enforce is set, ADR-054 N4b).",
+			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (enforcing; Trust\\Enforce = 0 opts out, ADR-054 N4b).",
 			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
 			if (reason != NULL) {
 				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
@@ -1331,7 +1361,10 @@ tc_prov_platform_trusted(const char *path)
 	if (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
 		return false;
 	}
-	return strncmp(path, "/usr/", 5) == 0 || strncmp(path, "/opt/", 5) == 0;
+	// /usr and /opt (the .deb, /usr/local), plus the macOS .pkg's root-owned
+	// payload under /Library/Application Support/DisplayXR.
+	return strncmp(path, "/usr/", 5) == 0 || strncmp(path, "/opt/", 5) == 0 ||
+	       strncmp(path, "/Library/Application Support/DisplayXR/", 39) == 0;
 #endif
 }
 
@@ -1351,10 +1384,29 @@ target_component_dev_override_set(void)
 bool
 target_component_trust_enforced(void)
 {
+	if (g_trust_enforce_override >= 0) {
+		return g_trust_enforce_override != 0;
+	}
 #if defined(XRT_OS_ANDROID)
+	// Everything dlopen'd here is platform-trusted (inside the APK); the
+	// gate has nothing to refuse.
 	return false;
 #else
-	return access("/etc/displayxr/trust/enforce", F_OK) == 0;
+	// The file's first non-blank byte decides: "0" opts out, anything else
+	// (an empty file included) enforces. Absent = audit: POSIX has no signer
+	// check and the tarball's user-level install is unsigned and unlisted,
+	// so the default stays audit here until those lanes allowlist (PR B
+	// flipped Windows only).
+	FILE *f = fopen("/etc/displayxr/trust/enforce", "rb");
+	if (f == NULL) {
+		return target_component_trust_policy(false, false, false);
+	}
+	int c = fgetc(f);
+	while (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+		c = fgetc(f);
+	}
+	fclose(f);
+	return target_component_trust_policy(true, c == '0', false);
 #endif
 }
 
@@ -2043,7 +2095,7 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 	(void)target_component_check_provenance(cls, e);
 	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
 		if (target_component_trust_enforced()) {
-			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (Trust\\Enforce is set, ADR-054 N4b).",
+			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (enforcing; Trust\\Enforce = 0 opts out, ADR-054 N4b).",
 			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
 			if (reason != NULL) {
 				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);

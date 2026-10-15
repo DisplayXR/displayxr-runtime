@@ -228,8 +228,8 @@ exit /b 1
 REM --- ADR-054 N4b: the provenance gate. A dev-built plug-in is unsigned, so
 REM     registering it also allowlists its SHA-256 under
 REM     HKLM\Software\DisplayXR\Trust\Allowlist (value name = hex digest, data =
-REM     a note). Without this, the loader reports the binary "unverified" (audit
-REM     mode today; refused once Trust\Enforce is set). A rebuilt DLL has a new
+REM     a note). Without this, the enforcing gate (the Windows default since
+REM     PR B) REFUSES the binary as "unverified". A rebuilt DLL has a new
 REM     digest: re-run this script after every build you want to run under the
 REM     live service (push-runtime-pf.sh does the same for what it copies).
 :allow

@@ -221,6 +221,37 @@ Your uninstaller is run by the user (Add/Remove Programs) or by a bundle — nev
 
 `UninstallString` under your subkey is optional and informational (it mirrors your Add/Remove Programs entry); the runtime does not execute it.
 
+### Provenance: sign it, or allowlist it (ADR-054 N4b)
+
+Since PR B the runtime's provenance gate **enforces by default on Windows**: at
+load, every plug-in DLL must be **Authenticode-signed** (any trusted root — no
+publisher pinning) or have its **SHA-256 under
+`HKLM\Software\DisplayXR\Trust\Allowlist`** (value name = lowercase hex digest,
+data = a note). Otherwise the loader logs `REFUSING unverified binary …` and falls
+through to the next display processor — your users see `sim-display`, not you.
+A path is never a provenance on Windows: living under `Program Files` proves
+nothing.
+
+- **Signed releases need nothing else.** This is the expected shape of a shipping
+  vendor plug-in.
+- **If your installer can ship an unsigned build** (CI artifacts, developer
+  installers, a release your signing step missed), it must write the row for the
+  exact bytes it installs — compute the digest at packaging time, never by hand —
+  and its uninstaller must delete the same row and only that row. The runtime
+  installer does this for its own sim-display DLL: `installer/gen_allowlist_nsh.cmake`
+  generates `!macro DXR_ALLOWLIST_WRITE` / `DXR_ALLOWLIST_REMOVE` from the packed
+  file, and `DisplayXRInstaller.nsi` inserts them next to the registration. Copy
+  that pattern.
+- **Dev boxes:** `scripts\register_dev_plugin.bat leia <path>` registers *and*
+  allowlists; `DXR_ALLOW_DEV_PLUGIN_PATHS=1` still admits a build-tree DLL from a
+  normal prompt, never from an elevated process (the installed service after an
+  installer restarted it is elevated).
+- **Escape hatch, one release:** `HKLM\Software\DisplayXR\Trust` value `Enforce`
+  (DWORD) = 0 returns the gate to audit mode on that box. Do not ship that in an
+  installer.
+
+Contract text: `docs/specs/runtime/plugin-discovery.md` §4.3.
+
 ### Reference installer
 
 [`displayxr-vendor-template`](https://github.com/DisplayXR/displayxr-vendor-template)'s `installer/` is the starting point. The full worked integration linked at the top of this guide is being brought in line with this contract under [#1803](https://github.com/DisplayXR/displayxr-runtime/issues/1803); where the two differ, this section wins.

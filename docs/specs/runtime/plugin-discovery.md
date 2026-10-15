@@ -891,14 +891,36 @@ through the N3 CLI passes, the `dp|input|conv list` tables. The check caches per
 file (path, size, mtime) for the process, so the service's re-probes do not
 re-hash.
 
-**Audit first, then enforce.** With `HKLM\Software\DisplayXR\Trust\Enforce`
-absent (POSIX: no `/etc/displayxr/trust/enforce`) the gate is in **audit mode**:
-an `unverified` binary is logged (`provenance UNVERIFIED — … (audit mode: loading
-anyway)`) and loaded. With `Enforce` = 1 it is refused (`TARGET_COMPONENT_LOAD_UNTRUSTED`,
-plug-in status `UNTRUSTED`, one ERROR line naming the allowlist row) and discovery
-falls through to the next candidate. The default flips to enforcing one release
-after audit mode ships, with `Enforce = 0` kept as the escape hatch for one more
-release.
+**Enforcing on Windows (ADR-054 N4b PR B).** The gate shipped in audit mode in
+v2.44.2 and has **enforced by default on Windows** since the release after it:
+an `unverified` binary is refused (`TARGET_COMPONENT_LOAD_UNTRUSTED`, plug-in
+status `UNTRUSTED`, one ERROR line naming the allowlist row to write) and
+discovery falls through to the next candidate. The escape hatch for one
+release is `HKLM\Software\DisplayXR\Trust` value `Enforce` (DWORD) = **0**,
+which puts the gate back in audit mode (`provenance UNVERIFIED — … (audit
+mode: loading anyway)`); `Enforce` = 1 says enforcing explicitly and is the
+same as absent. **POSIX stays in audit mode by default**: it has no signer check
+(no Authenticode equivalent is wired, so nothing can read `signed`), and the
+tarball's user-level install (`install.sh` without `--system`) puts an unsigned
+plug-in in a user-owned directory the platform rule cannot vouch for.
+`/etc/displayxr/trust/enforce` enforces unless its first non-blank byte is
+`0`; the `.deb` (`/usr/lib/displayxr/plugins`) and the macOS `.pkg`
+(`/Library/Application Support/DisplayXR/…`) are root-owned and read
+`platform-trusted` either way. Android never enforces (everything is inside
+the APK). The pure decision is `target_component_trust_policy(knob_present,
+knob_zero, platform_default)`: an explicit knob wins, else the platform
+default.
+
+**What an installer must do.** A signed binary passes on its signature. An
+unsigned one — a CI build, a dev `build_windows.bat installer`, a release the
+signing provider missed — must have its SHA-256 written by the installer that
+ships it: the runtime installer does this for `DisplayXR-SimDisplay.dll`
+(`installer/gen_allowlist_nsh.cmake` hashes the exact bytes being packed into
+`!macro DXR_ALLOWLIST_WRITE` / `DXR_ALLOWLIST_REMOVE`; the uninstaller removes
+only the rows it wrote). A vendor installer that ships unsigned builds does the
+same under its own row data (see the vendor onboarding guide §5). Rows are
+value names under `HKLM\Software\DisplayXR\Trust\Allowlist`, data = a
+human note saying which installer wrote it and for what.
 
 **Dev lane.** `scripts\register_dev_plugin.bat` allowlists the SHA-256 of every
 DLL it registers in the same elevated run (a rebuilt DLL has a new digest: re-run
