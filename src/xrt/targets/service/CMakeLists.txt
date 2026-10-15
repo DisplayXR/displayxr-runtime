@@ -30,6 +30,9 @@ target_sources(displayxr-service PRIVATE
 	# ADR-053 (#2005): the service's conversion core (loader -> conv_core -> IPC).
 	service_conversion.c
 	service_conversion.h
+	# ADR-054 N3d (#2051): the one watch over every class's Enabled / Preferred store.
+	service_component_watch.c
+	service_component_watch.h
 )
 target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime ipc_server_conv)
 

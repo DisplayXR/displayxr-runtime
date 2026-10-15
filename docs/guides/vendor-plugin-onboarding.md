@@ -131,7 +131,7 @@ Your installer writes these values under `HKLM\Software\DisplayXR\DisplayProcess
 
 `<your-id>` is a short kebab-case identifier matching `iface->id` (the string the plug-in returns from `xrtPluginNegotiate`). The Leia plug-in uses `leia-sr`; sim-display uses `sim-display`.
 
-`displayxr-cli dp list [--json]` shows your row as the loader sees it — ProbeOrder, `Enabled` and where it came from, the `PreferredPlugin` override, the provenance verdict (signed / allowlisted / unverified, ADR-054 N4b) and `*` on the plug-in the loader would select — without loading any DLL; `dp use <id>` pins yours ahead of ProbeOrder for the current user (`--machine` for HKLM). A change to either value applies at the next service start / session.
+`displayxr-cli dp list [--json]` shows your row as the loader sees it — ProbeOrder, `Enabled` and where it came from, the `PreferredPlugin` override, the provenance verdict (signed / allowlisted / unverified, ADR-054 N4b) and `*` on the plug-in the loader would select — without loading any DLL; `dp use <id>` pins yours ahead of ProbeOrder for the current user (`--machine` for HKLM). A running service picks up a change to either value at once (a secondary screen re-probes now, the primary at the next session; `plugin-discovery.md` §4.2a).
 
 ### POSIX: JSON manifest-based
 

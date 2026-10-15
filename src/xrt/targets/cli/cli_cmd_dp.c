@@ -22,6 +22,9 @@
  *                      default, HKLM with --machine.
  *   dp reset [--machine]
  *                      Clear the global override (restore normal ProbeOrder).
+ *   Every write asks the running service to re-probe (#2051): a secondary
+ *   screen's segment DP follows now, the primary screen and in-process apps
+ *   at their next session (no live swap, plugin-discovery.md §4.2).
  *
  *   dp use <id> --screen <key> [--machine]
  *   dp reset --screen <key>|all [--machine]
@@ -44,9 +47,9 @@
  * the manifest's `plugin.enabled` is the switch, as for input and
  * conversion providers — and says so.
  *
- * No live re-select yet (#2051): a change to the global values takes effect
- * at the next service start / session. The per-screen preference re-probes
- * the running service at once.
+ * Every write asks the running service to re-probe (#2051), the same call
+ * the per-screen preference makes: a secondary screen's segment DP follows
+ * at once, the primary screen and in-process apps at their next session.
  *
  * Vendor-neutral throughout (ADR-019): enumeration reads the discovery root
  * without loading any plug-in DLL, so no vendor symbols are touched. `dp list`
@@ -430,16 +433,13 @@ write_result(enum store_write r, const char *what, bool machine)
 	}
 }
 
-//! No live re-select yet (#2051): say when the change applies.
-static void
-note_pickup(void)
-{
-	P("Takes effect at the next service start / session — restart the DisplayXR service\n");
-	P("(or launch a fresh app) for a running session to pick it up.\n");
-}
-
 static bool
 plugin_registered(const char *id);
+
+//! #2051: ask the running service to re-probe (its policy watch also catches a
+//! write made without the CLI); says when the change applies otherwise.
+static void
+poke_service(void);
 
 static int
 cmd_enable(const char *id, bool enable, bool machine)
@@ -470,7 +470,7 @@ cmd_enable(const char *id, bool enable, bool machine)
 		  "too.\n",
 		  id);
 	}
-	note_pickup();
+	poke_service();
 	return 0;
 }
 
@@ -497,7 +497,7 @@ cmd_use(const char *id, bool machine)
 #else
 	P("PreferredPlugin set to '%s' (per-user 'preferred' file) — tried first, ahead of ProbeOrder.\n", id);
 #endif
-	note_pickup();
+	poke_service();
 	return 0;
 }
 
@@ -510,7 +510,7 @@ cmd_reset(bool machine)
 	}
 	P("%s PreferredPlugin override cleared — normal ProbeOrder discovery restored.\n",
 	  machine ? "Machine-wide" : "Per-user");
-	note_pickup();
+	poke_service();
 	return 0;
 }
 
@@ -544,13 +544,13 @@ poke_service(void)
 			P("follows within ~1 s; the primary screen (and in-process apps) at the next session.\n");
 			return;
 		}
-		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies on next "
-		  "launch.\n",
+		P("The running DisplayXR service refused the re-probe request (xrt_result=%d) — applies at the "
+		  "next session.\n",
 		  (int)xret);
 		return;
 	}
 #endif
-	P("No DisplayXR service reachable — applies on next launch.\n");
+	P("No DisplayXR service reachable — applies at the next session (in-process apps: their next launch).\n");
 }
 
 //! Is @p key a connected screen's key? (Enumeration only — no plug-in is loaded.)
@@ -673,8 +673,8 @@ print_usage(void)
 	P("  use <id> --screen <key>       Weave the screen <key> (from 'dp list') with <id>; per-user, no admin.\n");
 	P("  reset --screen <key>|all      Clear one / every per-screen preference.\n");
 	P("    --machine                   With --screen: the machine-wide store (HKLM, admin) instead.\n");
-	P("Global writes take effect at the next service start / session. POSIX: use/reset write the\n");
-	P("per-user 'preferred' file; enable/disable = the manifest's plugin.enabled.\n");
+	P("A running service re-probes at once (secondary screens follow; the primary at the next session).\n");
+	P("POSIX: use/reset write the per-user 'preferred' file; enable/disable = the manifest's plugin.enabled.\n");
 	return 1;
 }
 

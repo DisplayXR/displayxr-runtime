@@ -33,8 +33,13 @@
  * `enable|disable` has no per-user store — the manifest's `plugin.enabled`
  * is the switch, as for conversion providers — and says so.
  *
- * No live re-select yet (N3 step d): a change applies to processes started
- * after the write, exactly like the global `dp use`.
+ * Live re-select (N3d, #2051): every write ends with a poke of the running
+ * service (`system_request_component_reselect`), which re-reads the policy
+ * and re-ranks the arbiter — the hand / rig roles move on the next
+ * xrSyncActions, no restart. The service's policy watch also catches a
+ * write made without the CLI. What stays a restart: a provider this
+ * service did not load (disabled or unregistered when it scanned); the
+ * enable verb says so. In-process apps re-read at their next launch.
  *
  * Issues #823 (list, haptic-test), N3a (ADR-054 verbs).
  *
@@ -43,6 +48,7 @@
 
 #include "cli_common.h"
 #include "cli_input_predict.h"
+#include "cli_ipc.h"
 #include "cli_query.h"
 
 #include "xrt/xrt_config_os.h"
@@ -373,12 +379,43 @@ write_result(enum store_write r, const char *what, bool machine)
 	}
 }
 
-//! No live re-select yet (N3 step d): say when the change applies.
+/*!
+ * #2051: poke the running service and say what happens now, per the input
+ * class's lifetime rules (provider set fixed per process; roles re-ranked
+ * live). @p enabling_id: the provider an `input enable` just enabled, so the
+ * one case that stays a restart is named.
+ */
 static void
-note_pickup(void)
+note_pickup(const char *enabling_id)
 {
-	P("Takes effect for processes started after this write — restart the DisplayXR\n");
-	P("service (or launch a fresh app) for a running session to pick it up.\n");
+#ifdef CLI_HAVE_IPC
+	xrt_result_t xret = XRT_SUCCESS;
+	switch (cli_ipc_poke_component_reselect(TARGET_COMPONENT_CLASS_INPUT, &xret)) {
+	case CLI_IPC_POKE_ACCEPTED:
+		P("The running DisplayXR service re-ranks its input providers now: the hand / rig roles move on\n");
+		P("the next xrSyncActions (a connected app sees a new roles generation).\n");
+		if (enabling_id != NULL) {
+			P("If '%s' was disabled when the service started it is not loaded yet — it joins at the\n",
+			  enabling_id);
+			P("next service start (the service log says which).\n");
+		}
+		P("In-process apps read the policy at their next launch.\n");
+		return;
+	case CLI_IPC_POKE_NO_WATCH:
+		P("The running DisplayXR service has no live re-select — applies at its next start.\n");
+		return;
+	case CLI_IPC_POKE_REFUSED:
+		P("The running DisplayXR service refused the re-select request (xrt_result=%d) — applies at its\n",
+		  (int)xret);
+		P("next start.\n");
+		return;
+	case CLI_IPC_POKE_UNREACHABLE:
+	default: break;
+	}
+#else
+	(void)enabling_id;
+#endif
+	P("No DisplayXR service reachable — applies when it next starts (in-process apps: their next launch).\n");
 }
 
 static int
@@ -405,7 +442,7 @@ cmd_enable(const char *id, bool enable, bool machine)
 	if (machine) {
 		P("note: a per-user (HKCU) Enabled value for '%s' still wins for that user.\n", id);
 	}
-	note_pickup();
+	note_pickup(enable ? id : NULL);
 	return 0;
 }
 
@@ -434,7 +471,7 @@ cmd_use(const char *id, bool machine)
 	(void)preferred_file_path(path, sizeof(path), false);
 	P("Preferred input provider set to '%s' (%s) — ranked first, ahead of ProbeOrder.\n", id, path);
 #endif
-	note_pickup();
+	note_pickup(NULL);
 	return 0;
 }
 
@@ -447,7 +484,7 @@ cmd_reset(bool machine)
 	}
 	P("%s PreferredPlugin override cleared — normal ProbeOrder ranking restored.\n",
 	  machine ? "Machine-wide" : "Per-user");
-	note_pickup();
+	note_pickup(NULL);
 	return 0;
 }
 
@@ -572,8 +609,9 @@ print_usage(void)
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
 	P("  haptic-test [seconds]        Headless: fire vibrations on the hand-role devices (default 5 s).\n");
 	P("                               Pair with scripts/net_input_feeder.py --assert-haptic.\n");
-	P("Writes apply to processes started afterwards (restart the service). POSIX: use/reset write\n");
-	P("the per-user input-preferred file; enable/disable = the manifest's plugin.enabled.\n");
+	P("A running service re-ranks at once (roles move on the next xrSyncActions); a provider it did not\n");
+	P("load joins at its next start. POSIX: use/reset write the per-user input-preferred file;\n");
+	P("enable/disable = the manifest's plugin.enabled.\n");
 	return 1;
 }
 

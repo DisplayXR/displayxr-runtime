@@ -3290,6 +3290,70 @@ screen_ids_equal(const char *a, const char *b)
 	return *a == *b;
 }
 
+#if !defined(XRT_OS_ANDROID)
+/*!
+ * `Enabled` for a plug-in that is ALREADY a display-claim source (N3b + N3d,
+ * #2049 / #2051). @ref dp_entry_usable keeps a disabled plug-in from ever
+ * loading, but the source set is collected once per process and a live
+ * `dp disable <id>` lands after that: the loaded plug-in must stop
+ * contributing claims, so every screen it drove re-resolves to the next
+ * candidate (the service recreates a secondary's segment DP; the session's
+ * primary DP stays until the next session, plugin-discovery.md §4.2a).
+ * Nothing is unloaded or destroyed — a live segment DP may still be made from
+ * the instance — and a source with no registration row at all is kept (the
+ * "removed after it loaded" rule of @ref collect_display_sources_platform).
+ * Re-read on every resolve (the policy overlay is what changed); each edge is
+ * logged once. Caller holds @ref g_refresh_mutex.
+ */
+static uint32_t g_withdrawn_mask = 0; // by source index; the set is stable per process
+
+static uint32_t
+dp_sources_apply_enabled(bool *withdrawn, uint32_t src_count)
+{
+	for (uint32_t s = 0; s < src_count; s++) {
+		withdrawn[s] = false;
+	}
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = dp_enumerate(entries, false);
+	uint32_t mask = 0;
+	uint32_t count = 0;
+	for (uint32_t s = 0; s < src_count && s < 32; s++) {
+		const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+		if (sif == NULL || sif->id == NULL) {
+			continue;
+		}
+		for (int i = 0; i < n; i++) {
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 ||
+			    strcmp(entries[i].id, sif->id) != 0) {
+				continue;
+			}
+			const bool was = (g_withdrawn_mask & (1u << s)) != 0;
+			if (!entries[i].enabled) {
+				withdrawn[s] = true;
+				mask |= 1u << s;
+				count++;
+				if (!was) {
+					U_LOG_W(
+					    "plugin loader: '%s' withdrawn from the display claims (Enabled=0, %s): "
+					    "its "
+					    "screens re-resolve now, the session's primary DP at the next session.",
+					    sif->id, dp_enabled_source(&entries[i]));
+				}
+			} else if (was) {
+				U_LOG_W("plugin loader: '%s' re-admitted to the display claims (Enabled=1).", sif->id);
+			}
+			break;
+		}
+	}
+	g_withdrawn_mask = mask;
+	free(entries);
+	return count;
+}
+#endif /* !XRT_OS_ANDROID */
+
 //! Monitors the last resolve found "present, not ready" (WARN only on entry). Guarded by g_refresh_mutex.
 static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_not_ready_prev_count = 0;
@@ -3322,6 +3386,22 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 
 	ensure_display_sources(descriptors, dn);
 
+	// N3b live: a source the policy disabled since it loaded contributes
+	// nothing below. POSIX's active-only shortcut set then holds no claim
+	// source at all, so ask every other plug-in once (the full set stays
+	// cached from here on — ensure_display_sources returns early on it).
+	bool src_withdrawn[TARGET_PLUGIN_MAX_SOURCES] = {false};
+#if !defined(XRT_OS_ANDROID)
+	if (dp_sources_apply_enabled(src_withdrawn, g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0) >
+	        0 &&
+	    g_display_sources_active_only) {
+		g_display_sources_active_only = false;
+		g_display_source_count = collect_display_sources_platform(g_display_sources, TARGET_PLUGIN_MAX_SOURCES);
+		(void)dp_sources_apply_enabled(src_withdrawn,
+		                               g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0);
+	}
+#endif
+
 	// Query every source once for the full descriptor set.
 	static struct xrt_display_claim src_claims[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t src_claim_count[TARGET_PLUGIN_MAX_SOURCES] = {0};
@@ -3331,8 +3411,9 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	struct target_screen_source_claims src_view[TARGET_PLUGIN_MAX_SOURCES];
 	const uint32_t src_count = g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0;
 	for (uint32_t s = 0; s < src_count; s++) {
-		src_claim_count[s] =
-		    query_source_claims(&g_display_sources[s], descriptors, dn, src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
+		src_claim_count[s] = src_withdrawn[s] ? 0u
+		                                      : query_source_claims(&g_display_sources[s], descriptors, dn,
+		                                                            src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
 		for (uint32_t c = 0; c < src_claim_count[s]; c++) {
 			src_mon[s][c] = src_claims[s][c].monitor_id;
 			src_conf[s][c] = (uint32_t)src_claims[s][c].confidence;
