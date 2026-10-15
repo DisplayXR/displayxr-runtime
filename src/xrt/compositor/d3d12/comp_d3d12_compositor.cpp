@@ -47,6 +47,7 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_display_processor_d3d12.h"
@@ -437,6 +438,13 @@ struct comp_d3d12_compositor
 
 	//! D3D12 display processor.
 	struct xrt_display_processor_d3d12 *display_processor;
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here, so a
+	 * DP without the target-time slot can still be sampled at a display
+	 * time (interpolate / extrapolate / stale) instead of "latest".
+	 */
+	struct u_eye_history eye_hist;
 
 	/*!
 	 * Multi-screen M6 (ADR-047 D2 on Windows, D3D12): a window spanning
@@ -5264,6 +5272,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct xrt_eye_positions eye_pos = {};
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_get_predicted_eye_positions(c->display_processor, &eye_pos);
+		if (eye_pos.valid) {
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &eye_pos, (int64_t)os_monotonic_get_ns());
+		}
 	}
 	if (!eye_pos.valid) {
 		// Use view_count from the active rendering mode for the fallback
@@ -6735,6 +6748,7 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	delete c;
 }
@@ -6780,6 +6794,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
 	// locate arriving before any preview reads a real CLIPPED_NO_SOURCE rather
 	// than an uninitialised struct. ARMED by the oxr setter, once the session's
@@ -7255,17 +7270,42 @@ comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	if (c->display_processor != nullptr) {
 		if (xrt_display_processor_d3d12_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
 		    out_eye_pos->valid) {
+			// N6 Part 1 (#2144): keyed by the time it was asked.
+			u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
 			return true;
 		}
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	if (c->reroute.active && c->reroute.split != NULL) {
-		return comp_vk_split_get_predicted_eye_positions(c->reroute.split, out_eye_pos) &&
-		       out_eye_pos->valid;
+		const bool ok =
+		    comp_vk_split_get_predicted_eye_positions(c->reroute.split, out_eye_pos) && out_eye_pos->valid;
+		if (ok) {
+			u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+		}
+		return ok;
 	}
 #endif
 
 	return false;
+}
+
+extern "C" bool
+comp_d3d12_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	// The DP's own target-time slot when it has one ...
+	if (xrt_display_processor_d3d12_has_eye_positions_at(c->display_processor)) {
+		return xrt_display_processor_d3d12_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
+		       out_eye_pos->valid;
+	}
+	// ... else the ring of per-frame answers sampled at the target ...
+	if (u_eye_history_get(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return true;
+	}
+	// ... else the plain "latest" answer (which primes the ring).
+	return comp_d3d12_compositor_get_predicted_eye_positions(xc, out_eye_pos);
 }
 
 extern "C" bool

@@ -339,11 +339,18 @@ to_string(XrSessionState state)
 }
 
 /*!
- * Get predicted eye positions from the session's compositor.
+ * Get the eye positions for @p target_ns from the session's compositor
+ * (ADR-054 §4.1 / N6 Part 1, #2144): xrLocateViews passes the frame's
+ * displayTime (monotonic), so the eyes the app renders for are the eyes at
+ * the instant its pixels are seen — the DP's own target-time slot when it
+ * has one, else the compositor's ring of per-frame answers sampled there,
+ * else the vendor's "latest" prediction.
  * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye_positions *out_eye_pos)
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos)
 {
 	if (sess == NULL || sess->xcn == NULL || out_eye_pos == NULL) {
 		return false;
@@ -354,31 +361,31 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_d3d11_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 	if (sess->is_d3d12_native_compositor) {
-		return comp_d3d12_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_d3d12_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
-		return comp_metal_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_metal_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->is_vk_native_compositor) {
-		return comp_vk_native_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_vk_native_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor) {
-		return comp_gl_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_gl_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
@@ -392,7 +399,7 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 			return false;
 		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
+		return multi_compositor_get_eye_positions_at(mc, target_ns, out_eye_pos);
 	}
 	return false;
 }
@@ -3434,7 +3441,8 @@ locate_views_one(struct oxr_logger *log,
 			}
 		}
 	} else {
-		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
+		// N6 Part 1 (#2144): the eyes at the frame's displayTime, not "latest".
+		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (int64_t)xdisplay_time, &eye_pos);
 	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
