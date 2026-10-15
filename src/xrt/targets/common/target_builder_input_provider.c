@@ -117,7 +117,19 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		// Debug override (registry / config gate): qwerty keeps the
 		// hand roles; providers are not even loaded, so behavior is
 		// bit-identical to a box with none registered.
-		U_LOG_W("input provider builder: ForceQwerty override set — skipping input providers.");
+		const char *gate_source = "default";
+		if (!target_input_plugin_get_emulated_controllers(&gate_source)) {
+			// N7: the two gates are orthogonal halves — ForceQwerty skips
+			// the providers, EmulatedControllers=0 withholds the pair — so
+			// both together is a box with no hand devices at all. Say so
+			// once, naming both, or the empty device list looks like a bug.
+			U_LOG_W(
+			    "input provider builder: ForceQwerty=1 AND EmulatedControllers=0 (%s) — input providers "
+			    "are skipped and the qwerty pair is not published: this box has NO hand-role devices.",
+			    gate_source);
+		} else {
+			U_LOG_W("input provider builder: ForceQwerty override set — skipping input providers.");
+		}
 		return XRT_SUCCESS;
 	}
 

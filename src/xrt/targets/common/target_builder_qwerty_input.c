@@ -11,7 +11,9 @@
 
 #include "target_builder_qwerty_input.h"
 #include "target_input_arbiter.h"
+#include "target_input_plugin_loader.h"
 
+#include "util/u_logging.h"
 #include "util/u_system_helpers.h"
 #include "util/u_builders.h"
 
@@ -31,7 +33,22 @@ t_builder_add_qwerty_input(struct xrt_system_devices *xsysd,
 	struct xrt_device *left = NULL;
 	struct xrt_device *right = NULL;
 
-	xrt_result_t xret = qwerty_create_devices(log_level, &qwerty_head, &left, &right);
+	// ADR-054 N7 (#2143): the `EmulatedControllers` gate. 0 = publish the
+	// look-around head only — no qwerty left/right in the device list, no
+	// floor candidate, so the hand roles stay unassigned (-1) whenever no
+	// provider holds them. Read through the loader (class policy), never
+	// getenv. One WARN per process: it changes what every app sees.
+	const char *gate_source = "default";
+	const bool emulated = target_input_plugin_get_emulated_controllers(&gate_source);
+	if (!emulated) {
+		U_LOG_W(
+		    "qwerty builder: EmulatedControllers=0 (%s) — the emulated controller pair is not published; "
+		    "the hand roles stay unassigned when no input provider holds them (the qwerty head stays as the "
+		    "look-around fallback).",
+		    gate_source);
+	}
+
+	xrt_result_t xret = qwerty_create_devices_ex(log_level, emulated, &qwerty_head, &left, &right);
 	if (xret != XRT_SUCCESS) {
 		return XRT_SUCCESS; // Non-fatal: display builder continues without input devices.
 	}

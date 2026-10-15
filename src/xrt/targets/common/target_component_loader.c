@@ -2572,6 +2572,64 @@ target_component_abi_gate(const struct target_component_class *cls,
  *
  */
 
+uint32_t
+target_component_policy_resolve(bool user_present,
+                                uint32_t user_value,
+                                bool machine_present,
+                                uint32_t machine_value,
+                                bool lock,
+                                uint32_t *out_value)
+{
+	if (user_present && !lock) {
+		if (out_value != NULL) {
+			*out_value = user_value;
+		}
+		return TARGET_COMPONENT_SETTING_USER;
+	}
+	if (machine_present) {
+		if (out_value != NULL) {
+			*out_value = machine_value;
+		}
+		return TARGET_COMPONENT_SETTING_MACHINE;
+	}
+	return TARGET_COMPONENT_SETTING_ABSENT;
+}
+
+uint32_t
+target_component_read_policy_dword(const struct target_component_class *cls, const char *name, uint32_t *out_value)
+{
+#ifdef XRT_OS_WINDOWS
+	if (cls == NULL || cls->registry_root == NULL || name == NULL || name[0] == '\0') {
+		return TARGET_COMPONENT_SETTING_ABSENT;
+	}
+	wchar_t wroot[256];
+	wchar_t wname[64];
+	if (!tc_u2w(cls->registry_root, wroot, (int)(sizeof(wroot) / sizeof(wroot[0]))) ||
+	    !tc_u2w(name, wname, (int)(sizeof(wname) / sizeof(wname[0])))) {
+		return TARGET_COMPONENT_SETTING_ABSENT;
+	}
+	wchar_t wpolicy[320];
+	swprintf(wpolicy, sizeof(wpolicy) / sizeof(wpolicy[0]), L"%ls\\Policy", wroot);
+
+	DWORD user_v = 0;
+	DWORD bytes = sizeof(user_v);
+	const bool user_present =
+	    RegGetValueW(HKEY_CURRENT_USER, wpolicy, wname, RRF_RT_REG_DWORD, NULL, &user_v, &bytes) == ERROR_SUCCESS;
+	DWORD machine_v = 0;
+	bytes = sizeof(machine_v);
+	const bool machine_present =
+	    RegGetValueW(HKEY_LOCAL_MACHINE, wpolicy, wname, RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &machine_v,
+	                 &bytes) == ERROR_SUCCESS;
+	return target_component_policy_resolve(user_present, (uint32_t)user_v, machine_present, (uint32_t)machine_v,
+	                                       tc_policy_lock(cls), out_value);
+#else
+	(void)cls;
+	(void)name;
+	(void)out_value;
+	return TARGET_COMPONENT_SETTING_ABSENT;
+#endif
+}
+
 const char *
 target_component_setting_source_str(uint32_t source)
 {

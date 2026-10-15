@@ -37,6 +37,14 @@
  * means the runtime's own fly camera (qwerty WASD/mouse-look) drives the
  * rig, which is what every box without a navigating provider reports.
  *
+ * ADR-054 N7 (#2143) makes the HAND floor optional too: with the
+ * `EmulatedControllers` gate at 0 the builder publishes no qwerty pair, so
+ * there is no floor candidate, and the hands fall to "no role" (-1, which
+ * the OpenXR layer reports as XR_NULL_PATH) when every provider is absent —
+ * exactly the rig's shape. A live gate flip withdraws / re-admits a pair
+ * that exists (@ref t_input_arbiter_set_floor_withdrawn), the way `Enabled`
+ * withdraws a provider; it never adds or removes devices.
+ *
  * That reuses the role-change path Monado already has end to end: the
  * OpenXR state tracker re-reads the roles in `xrSyncActions`, rebinds
  * actions and queues `XrEventDataInteractionProfileChanged` when the
@@ -135,10 +143,34 @@ t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_
 
 /*!
  * Record the qwerty fallback's left/right emulated controllers. Either
- * may be NULL. Called by @ref t_builder_add_qwerty_input.
+ * may be NULL. Called by @ref t_builder_add_qwerty_input. Both NULL (the
+ * `EmulatedControllers` gate at 0, N7) records no candidate: the hand floor
+ * is then "no role".
  */
 void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right);
+
+/*!
+ * N7: was a qwerty pair noted for this build — i.e. does a hand-role floor
+ * candidate exist at all? False when the `EmulatedControllers` gate was 0
+ * at system build (or no qwerty driver). Cheap; any thread.
+ */
+bool
+t_input_arbiter_has_floor(void);
+
+/*!
+ * N7 (#2143), the live half of the `EmulatedControllers` gate: withdraw
+ * (@p withdrawn = true) or re-admit the qwerty floor candidate, exactly as
+ * `Enabled` = 0 withdraws a provider through @ref t_input_arbiter_rerank —
+ * the pair's devices stay in `xsysd->xdevs`, the walks skip it, and the
+ * roles are recomputed at once (so a withdrawn floor with every provider
+ * absent lands both hands on -1 and bumps `generation_id`). Returns the
+ * number of candidates whose standing changed: 1 on a flip, 0 when the
+ * floor already stood that way, when no pair was noted, or when the
+ * arbiter is not installed. Any thread.
+ */
+int
+t_input_arbiter_set_floor_withdrawn(bool withdrawn);
 
 /*!
  * Should ANY input provider hold the hand roles at this instant?
