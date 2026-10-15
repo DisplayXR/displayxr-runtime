@@ -126,6 +126,34 @@ static char g_last_reject_reason[128] = {0};
  */
 static bool g_last_reject_declined = false;
 
+/*!
+ * N3b: better-ranked plug-ins the first-call discovery skipped because they
+ * are disabled (plus a disabled PreferredPlugin). Reported through
+ * @ref target_plugin_get_discovery_summary so `selftest` can say "sim-display
+ * is active because leia-sr is disabled" instead of leaving a vendor box's
+ * fallback looking like a mystery. Never counted as a reject: a disabled
+ * plug-in is the user's decision, not a misconfiguration.
+ */
+#define TARGET_PLUGIN_MAX_SKIPPED_DISABLED 8
+static int g_skipped_disabled_count = 0;
+static char g_skipped_disabled_ids[TARGET_PLUGIN_MAX_SKIPPED_DISABLED][64];
+//! Registration id of the winning row (see the summary's `active_id`).
+static char g_active_row_id[64] = {0};
+
+static void
+plugin_note_skipped_disabled(const char *id)
+{
+	for (int i = 0; i < g_skipped_disabled_count; i++) {
+		if (strcmp(g_skipped_disabled_ids[i], id) == 0) {
+			return;
+		}
+	}
+	if (g_skipped_disabled_count < TARGET_PLUGIN_MAX_SKIPPED_DISABLED) {
+		snprintf(g_skipped_disabled_ids[g_skipped_disabled_count], sizeof(g_skipped_disabled_ids[0]), "%s", id);
+		g_skipped_disabled_count++;
+	}
+}
+
 static void
 plugin_note_reject(const char *id, uint32_t probe_order)
 {
@@ -280,6 +308,12 @@ target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out)
 	out->best_rejected_order = g_best_rejected_order;
 	snprintf(out->best_rejected_id, sizeof(out->best_rejected_id), "%s", g_best_rejected_id);
 	snprintf(out->best_rejected_reason, sizeof(out->best_rejected_reason), "%s", g_best_rejected_reason);
+	out->skipped_disabled_count = g_skipped_disabled_count;
+	for (int i = 0; i < g_skipped_disabled_count && i < TARGET_PLUGIN_MAX_SKIPPED_DISABLED; i++) {
+		snprintf(out->skipped_disabled_ids[i], sizeof(out->skipped_disabled_ids[i]), "%s",
+		         g_skipped_disabled_ids[i]);
+	}
+	snprintf(out->active_id, sizeof(out->active_id), "%s", g_active_iface != NULL ? g_active_row_id : "");
 }
 
 /*
@@ -521,6 +555,7 @@ target_plugin_load_result_str(enum target_plugin_load_result r)
 	case TARGET_PLUGIN_RESULT_ABI_MISMATCH: return "ABI_MISMATCH";
 	case TARGET_PLUGIN_RESULT_PROBE_FAILED: return "PROBE_FAILED";
 	case TARGET_PLUGIN_RESULT_UNTRUSTED: return "UNTRUSTED";
+	case TARGET_PLUGIN_RESULT_DISABLED: return "DISABLED";
 	}
 	return "?";
 }
@@ -1581,33 +1616,92 @@ try_load_one(struct target_component_entry *e, struct xrt_plugin_instance **out_
  */
 
 /*!
+ * Where a row's `enabled` came from (the input loader's vocabulary, so
+ * `dp list` and `input list` read the same): "user" when the shared per-user
+ * overlay applied, "machine" / "manifest" when the platform's own store
+ * disabled it, else "default".
+ */
+static const char *
+dp_enabled_source(const struct target_component_entry *e)
+{
+	if ((e->flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0) {
+		return "user";
+	}
+	if (!e->enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
+/*!
+ * A registered-but-disabled plug-in costs one WARN per process per id, not
+ * one per scan: `dp_enumerate` runs on every world event the service sees
+ * (hotplug rescans, compositor-create refreshes), and a `U_LOG_W` there
+ * would be the per-frame-log-bloat class of bug.
+ */
+static char g_disabled_logged[TARGET_COMPONENT_MAX_ENTRIES][64];
+static int g_disabled_logged_count = 0;
+
+static void
+dp_log_disabled_once(const struct target_component_entry *e)
+{
+	bool first = true;
+	for (int i = 0; i < g_disabled_logged_count; i++) {
+		if (strcmp(g_disabled_logged[i], e->id) == 0) {
+			first = false;
+			break;
+		}
+	}
+	if (first && g_disabled_logged_count < TARGET_COMPONENT_MAX_ENTRIES) {
+		snprintf(g_disabled_logged[g_disabled_logged_count], sizeof(g_disabled_logged[0]), "%s", e->id);
+		g_disabled_logged_count++;
+	}
+	PLUGIN_LOG_OUTCOME(first, "plugin loader:   %s disabled (Enabled=0, %s; ProbeOrder=%u) — never tried.", e->id,
+	                   dp_enabled_source(e), e->probe_order);
+}
+
+/*!
  * Enumerate this class's registrations through the shared loader. Returns the
  * count (0 = nothing registered, or no discovery root at all). Malformed rows
  * come back flagged; the callers below skip them (a row the loader could never
  * try is not a candidate) and say so once.
  *
- * `Enabled` is read but NOT honoured for display processors yet: the DP
- * contract has no `Enabled` today (plugin-discovery.md); #2049 (N3) adds it
- * together with the `dp enable|disable` verbs.
+ * `Enabled` (N3b, ADR-054 verb `enable|disable`; plugin-discovery.md §2 /
+ * §2.1 / §3.1) is honoured here for EVERY scan — the single-winner discovery,
+ * the display-claim collection, the hotplug rescan and `dp list` — through
+ * the shared per-user overlay (HKCU over HKLM, `Policy\Lock` aside; a no-op
+ * off Windows, where the manifest's `enabled` is the switch) and
+ * @ref dp_entry_usable. A disabled plug-in is logged once per process per id
+ * (WARN the first time, INFO after: the service re-enumerates on world
+ * events) and is never loaded, so a vendor DLL the user turned off never
+ * enters the process.
  */
 static int
 dp_enumerate(struct target_component_entry *entries, bool loud)
 {
 	dp_platform_prepare_discovery();
 	const int n = target_component_enumerate(&g_dp_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_dp_class, entries, (size_t)n);
 	for (int i = 0; i < n; i++) {
 		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
 			PLUGIN_LOG_OUTCOME(loud, "plugin loader:   %s: %s — skipping.", entries[i].source,
 			                   entries[i].reason);
+		} else if (!entries[i].enabled) {
+			dp_log_disabled_once(&entries[i]);
 		}
 	}
 	return n;
 }
 
+//! A row every scan may try: well-formed AND enabled (N3b).
 static bool
 dp_entry_usable(const struct target_component_entry *e)
 {
-	return (e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0;
+	return (e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && e->enabled;
 }
 
 static const struct xrt_plugin_iface *
@@ -1638,6 +1732,12 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		plugin_warn_exclusive_miss(ids, n);
 	}
 
+	// N3b: the skipped-disabled summary describes the first-call pass; a
+	// refresh re-walks the same rows and must not double-count them.
+	if (first_call) {
+		g_skipped_disabled_count = 0;
+	}
+
 	// PreferredPlugin override (#378): try the user-pinned plug-in before
 	// the ProbeOrder sort. A stale or failed preference falls through to
 	// the normal order, so a bad value can never brick discovery.
@@ -1646,6 +1746,24 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		for (int i = 0; i < n; i++) {
 			if (strcmp(entries[i].id, preferred) != 0) {
 				continue;
+			}
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && !entries[i].enabled) {
+				// N3b: `Enabled=0` is the stronger verb — a disabled
+				// preference falls through to ProbeOrder, said ONCE
+				// (the refresh path never reaches here: a set
+				// preference short-circuits target_plugin_refresh_active).
+				PLUGIN_LOG_OUTCOME(first_call,
+				                   "plugin loader: PreferredPlugin '%s' is disabled (Enabled=0, %s) — "
+				                   "falling through to ProbeOrder.",
+				                   preferred, dp_enabled_source(&entries[i]));
+				if (first_call) {
+					plugin_note_skipped_disabled(entries[i].id);
+					status_begin(entries[i].id, entries[i].display_name, entries[i].version,
+					             entries[i].probe_order);
+					(void)status_finish(entries[i].id, TARGET_PLUGIN_RESULT_DISABLED, 0,
+					                    entries[i].reason);
+				}
+				break;
 			}
 			if (!dp_entry_usable(&entries[i])) {
 				break;
@@ -1668,6 +1786,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 			if (iface != NULL) {
 				g_active_probe_order = entries[i].probe_order;
+				snprintf(g_active_row_id, sizeof(g_active_row_id), "%s", entries[i].id);
 				free(entries);
 				return iface;
 			}
@@ -1679,14 +1798,28 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
-		if (!dp_entry_usable(&entries[i])) {
-			continue;
-		}
 		// Refresh path (#342) passes the active plug-in's ProbeOrder as
 		// max so we only re-attempt strictly-better candidates and never
 		// re-probe the already-active one. First-call path passes
 		// UINT32_MAX, so no entry is skipped.
 		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && !entries[i].enabled) {
+			// N3b: entries are in ProbeOrder, so a disabled one met
+			// before the winner out-ranks it — the summary names it,
+			// and its ADR-045 record reads DISABLED rather than the
+			// NOT_ATTEMPTED a lister would otherwise infer. Logged by
+			// dp_enumerate (once per process); never a reject.
+			if (first_call) {
+				plugin_note_skipped_disabled(entries[i].id);
+				status_begin(entries[i].id, entries[i].display_name, entries[i].version,
+				             entries[i].probe_order);
+				(void)status_finish(entries[i].id, TARGET_PLUGIN_RESULT_DISABLED, 0, entries[i].reason);
+			}
+			continue;
+		}
+		if (!dp_entry_usable(&entries[i])) {
 			continue;
 		}
 		/* #1545: skipped BEFORE the load, and deliberately without
@@ -1700,6 +1833,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 		if (iface != NULL) {
 			g_active_probe_order = entries[i].probe_order;
+			snprintf(g_active_row_id, sizeof(g_active_row_id), "%s", entries[i].id);
 			free(entries);
 			return iface;
 		}
@@ -1889,9 +2023,11 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max)
 
 	int count = 0;
 	for (int i = 0; i < n && count < max; i++) {
-		if (!dp_entry_usable(&entries[i])) {
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
 			continue; // a row the loader could never try is not a choice to list
 		}
+		// A DISABLED row IS listed (N3b): `dp list` must show what `dp
+		// disable` did, and `dp enable` must find it.
 		struct target_plugin_desc *d = &out[count++];
 		memset(d, 0, sizeof(*d));
 		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
@@ -1900,6 +2036,15 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max)
 		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
 		snprintf(d->binary_path, sizeof(d->binary_path), "%s", entries[i].binary_path);
 		d->probe_order = entries[i].probe_order;
+		d->enabled = entries[i].enabled;
+		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", dp_enabled_source(&entries[i]));
+		// ADR-054 N4b: the load path classifies what it loads; a lister
+		// asks explicitly (cached per file + size + mtime, so the service's
+		// status snapshot re-enumerating on world events never re-hashes).
+		(void)target_component_check_provenance(&g_dp_class, &entries[i]);
+		d->provenance = entries[i].provenance;
+		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", entries[i].provenance_reason);
+		snprintf(d->signer, sizeof(d->signer), "%s", entries[i].signer);
 	}
 	free(entries);
 	return count;
@@ -1922,10 +2067,19 @@ target_plugin_get_preferred(char *out, size_t cap)
 	}
 	out[0] = '\0';
 
+	// N3b: HKCU first (per user, `dp use <id>` without admin), then the HKLM
+	// 64-bit view (`dp use --machine`). Only this value and the per-row
+	// `Enabled` are ever read from HKCU — the rows stay HKLM-only, so a
+	// per-user key can never inject a DLL (plugin-discovery.md §2.1).
 	wchar_t wbuf[64];
 	DWORD wbuf_bytes = sizeof(wbuf);
-	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
+	LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
 	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
+		wbuf_bytes = sizeof(wbuf);
+		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, wbuf, &wbuf_bytes);
+	}
 	if (rc != ERROR_SUCCESS) {
 		return false;
 	}

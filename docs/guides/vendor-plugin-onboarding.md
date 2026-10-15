@@ -127,8 +127,11 @@ Your installer writes these values under `HKLM\Software\DisplayXR\DisplayProcess
 | `Version` | `REG_SZ` | Plug-in version (e.g. `1.0.0`) |
 | `ProbeOrder` | `REG_DWORD` | Discovery priority — see below |
 | `UninstallString` | `REG_SZ` | Optional, informational: quoted full path to your `Uninstall.exe`. The runtime never runs it — your plug-in is removed only by its own uninstaller (Add/Remove Programs) |
+| `Enabled` | `REG_DWORD` | **Do not write it.** 0 = the runtime never loads your plug-in, in any scan; it is the user's / administrator's switch (`displayxr-cli dp enable\|disable <id>`, per user in HKCU by default — which overrides your HKLM row — or `--machine`). Your installer leaves it alone on install and upgrade, and never touches HKCU on uninstall (spec §2.1 / §5, ADR-054 N3b) |
 
 `<your-id>` is a short kebab-case identifier matching `iface->id` (the string the plug-in returns from `xrtPluginNegotiate`). The Leia plug-in uses `leia-sr`; sim-display uses `sim-display`.
+
+`displayxr-cli dp list [--json]` shows your row as the loader sees it — ProbeOrder, `Enabled` and where it came from, the `PreferredPlugin` override, the provenance verdict (signed / allowlisted / unverified, ADR-054 N4b) and `*` on the plug-in the loader would select — without loading any DLL; `dp use <id>` pins yours ahead of ProbeOrder for the current user (`--machine` for HKLM). A change to either value applies at the next service start / session.
 
 ### POSIX: JSON manifest-based
 
@@ -148,6 +151,8 @@ Plus any directory in `XRT_PLUGIN_SEARCH_PATH`. Each `*.json` manifest:
     "binary": "/absolute/path/to/DisplayXR-YourVendor.dylib"
 }
 ```
+
+An optional boolean `enabled` (`false` = the runtime never loads the plug-in) is the POSIX switch; there is no per-user `Enabled` store there, so `dp enable|disable` points at this field. Ship your manifest without it.
 
 The full discovery contract — registry layout, JSON schema, env-var overrides, fallback search order — is documented in [`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md).
 
