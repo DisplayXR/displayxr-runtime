@@ -10,6 +10,9 @@
  *   conv enable | disable <id> [--machine]           `Enabled` (HKCU; HKLM with --machine)
  *   conv use    <task> <id>[/<cap>] [--machine]      `PreferredProvider\<task>`
  *   conv reset  <task>|all [--machine]
+ *   conv options <id> [--json]                       the provider's settings: declared + stored, with source
+ *   conv set    <id> <KEY> <value> [--machine]       `Settings\<KEY>` (HKCU; HKLM with --machine) — N3c
+ *   conv unset  <id> <KEY> [--machine]
  *   conv models list | prune                         the model store (P4; prints the root)
  *
  * `list` / `status` read the running service's status snapshot over DIAG
@@ -37,6 +40,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_component_options.h"
 #include "cli_ipc.h"
 
 #include "xrt/xrt_config_os.h"
@@ -766,6 +770,37 @@ cmd_reset(const char *task_name, bool machine)
 	return rc;
 }
 
+/*
+ *
+ * options / set / unset (N3c) — the shared verbs over the conversion class.
+ *
+ */
+
+//! Registered plug-in provider? The built-in `dp-lift` adapter has no row and no settings.
+bool
+options_registered(const char *id)
+{
+	return strcmp(id, "dp-lift") != 0 && provider_known(id);
+}
+
+const struct cli_component_class k_conv_options_class = {
+    /* verb */ "conv",
+    /* noun */ "conversion provider",
+    /* cls */ nullptr, // filled at first use (a static initialiser cannot call the accessor)
+    /* registered */ options_registered,
+    /* describe */ target_conversion_plugin_describe_settings,
+    /* note_pickup */ note_service_pickup,
+    /* posix_machine_hint */ "the manifest's \"settings\" object (NNN-<id>-conversion-provider.json)",
+};
+
+int
+cmd_options_verbs(int argc, const char **argv)
+{
+	struct cli_component_class k = k_conv_options_class;
+	k.cls = target_conversion_plugin_component_class();
+	return cli_component_options_dispatch(&k, argc, argv);
+}
+
 const char *
 state_upper(uint32_t state, char *buf, size_t cap)
 {
@@ -1066,6 +1101,9 @@ usage(void)
 	P("  enable | disable <id> [--machine]   per-user (HKCU) Enabled; --machine = HKLM (admin)\n");
 	P("  use <task> <id>[/<cap>] [--machine] per-task preference (PreferredProvider\\<task>)\n");
 	P("  reset <task>|all [--machine]        clear it\n");
+	P("  options <id> [--json]               the provider's settings: key, type, default, value, source (N3c)\n");
+	P("  set <id> <KEY> <value> [--machine]  Settings\\<KEY> on the provider's row (HKCU; --machine = HKLM)\n");
+	P("  unset <id> <KEY> [--machine]        clear it; DXR_CONV_<ID>_<KEY> in the service's env always wins\n");
 	P("  models list|verify|prune [--json]   the model store (P4; prints the resolved root)\n");
 	P("list/status read the running service over DIAG, else describe providers headless (no model load).\n");
 	return 1;
@@ -1110,6 +1148,10 @@ cli_cmd_conv(int argc, const char **argv)
 	}
 	if (strcmp(verb, "models") == 0) {
 		return cmd_models(argc, argv);
+	}
+	const int rc = cmd_options_verbs(argc, argv); // options | set | unset (N3c)
+	if (rc >= 0) {
+		return rc;
 	}
 	return usage();
 }

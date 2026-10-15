@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 
 #include <stdbool.h>
@@ -887,7 +888,20 @@ struct xrt_conversion_plugin_iface
 	/* Append-only below this line, forever (ADR-020). Each appended slot
 	 * gets an XRT_CONVERSION_PLUGIN_HAS_<X> macro so the downstream
 	 * `features` repin gate sees it. */
+
+	/*! [C]; pure. The settings this provider reads through
+	 *  `host->get_setting` (ADR-054 decision 7, the one options contract),
+	 *  for `displayxr-cli conv options <id>`. Optional: NULL (or a provider
+	 *  whose `struct_size` predates this slot) declares nothing — the store's
+	 *  keys are still listed. Gated by XRT_CONV_IFACE_HAS; announced by
+	 *  XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS. */
+	xrt_component_describe_settings_fn_t describe_settings;
 };
+
+/*! Defined when @ref xrt_conversion_plugin_iface carries `describe_settings`
+ *  (N3c), so a provider built against an older runtime header can
+ *  #ifdef-guard filling it. */
+#define XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS 1
 
 /*!
  * Signature of the exported XRT_CONVERSION_PLUGIN_ENTRYPOINT_NAME symbol. The
@@ -917,8 +931,10 @@ XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, warm) == 8 + 9 
                     "conversion iface: warm is slot 5");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, destroy) == 8 + 16 * sizeof(void *),
                     "conversion iface: v1 slot order changed - API major bump");
-XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 17 * sizeof(void *),
-                    "conversion iface v1 = 4 strings + 13 slots; append-only past destroy");
+XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conversion_plugin_iface, describe_settings) == 8 + 17 * sizeof(void *),
+                    "conversion iface: describe_settings is the first slot appended past destroy (N3c)");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_iface) == 8 + 18 * sizeof(void *),
+                    "conversion iface v1 = 4 strings + 13 slots + describe_settings; append-only past it");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conversion_plugin_host_iface) == 16 + 16 * sizeof(void *),
                     "conversion host iface size changed - carve from reserved[] instead");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_capability, struct_size) == 0 &&

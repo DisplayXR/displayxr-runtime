@@ -201,6 +201,29 @@ target_conversion_plugin_unload(struct xrt_conversion_plugin_entry *e);
 const struct xrt_conversion_plugin_host_iface *
 target_conversion_plugin_default_host(void);
 
+struct target_component_class;
+
+/*!
+ * The conversion class's row in the shared component loader (ADR-054 N2):
+ * what the one options contract keys on (`target_component_get_setting`,
+ * `displayxr-cli conv options|set|unset`, N3c). Static, never NULL.
+ */
+const struct target_component_class *
+target_conversion_plugin_component_class(void);
+
+struct target_component_setting_desc;
+
+/*!
+ * The settings provider @p id declares (N3c): its manifest `settings_schema`
+ * (POSIX) merged with the binary's `describe_settings` slot, which means
+ * loading + negotiating the registered binary with the default host (no
+ * probe, no describe_cap) and unloading it again. Returns the count written
+ * to @p out (up to @p max); 0 for an unregistered id or a binary that
+ * declares nothing.
+ */
+int
+target_conversion_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
 /*
  *
  * Pure helpers -- compiled on every platform, used by the discovery passes and

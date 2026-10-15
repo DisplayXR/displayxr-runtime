@@ -635,6 +635,50 @@ target_conversion_plugin_default_host(void)
 	return &g_conv_default_host;
 }
 
+const struct target_component_class *
+target_conversion_plugin_component_class(void)
+{
+	return &g_conv_class;
+}
+
+int
+target_conversion_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max)
+{
+	if (id == NULL || id[0] == '\0' || out == NULL || max <= 0) {
+		return 0;
+	}
+	// The manifest's schema first (POSIX), then whatever the binary declares.
+	int n = target_component_manifest_settings_schema(&g_conv_class, id, out, max);
+
+	struct xrt_conversion_plugin_entry *entries =
+	    (struct xrt_conversion_plugin_entry *)calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return n;
+	}
+	const int count = target_conversion_plugin_enumerate(entries, XRT_CONV_LOADER_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct xrt_conversion_plugin_entry *e = &entries[i];
+		if (strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// A disabled row still declares its settings: that is how one finds
+		// the key to enable it. Negotiate only (no probe, no describe_cap).
+		if (e->status == XRT_CONV_LOAD_DISABLED) {
+			e->status = XRT_CONV_LOAD_NOT_LOADED;
+		}
+		if (target_conversion_plugin_negotiate_one(e, NULL) && e->iface != NULL &&
+		    XRT_CONV_IFACE_HAS(e->iface, describe_settings)) {
+			const struct xrt_component_setting_desc *descs = NULL;
+			const uint32_t nd = e->iface->describe_settings(&descs);
+			n = target_component_merge_setting_descs(out, n, max, descs, nd);
+		}
+		target_conversion_plugin_unload(e);
+		break;
+	}
+	free(entries);
+	return n;
+}
+
 
 /*
  *

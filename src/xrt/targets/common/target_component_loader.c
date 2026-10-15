@@ -2659,13 +2659,16 @@ target_component_user_settings_json_lookup(const char *json_text, const char *ke
 	return ok;
 }
 
-bool
-target_component_get_setting(const struct target_component_class *cls,
-                             const char *id,
-                             const char *key,
-                             char *buf,
-                             size_t cap,
-                             uint32_t *out_source)
+//! The chain; tier 3 is the store unless @p use_row, then @p row_value (may be NULL).
+static bool
+tc_get_setting(const struct target_component_class *cls,
+               const char *id,
+               const char *key,
+               bool use_row,
+               const char *row_value,
+               char *buf,
+               size_t cap,
+               uint32_t *out_source)
 {
 	if (out_source != NULL) {
 		*out_source = TARGET_COMPONENT_SETTING_ABSENT;
@@ -2702,8 +2705,12 @@ target_component_get_setting(const struct target_component_class *cls,
 		if (!lock && tc_store_read(cls, id, key, true, user_buf, sizeof(user_buf))) {
 			user_value = user_buf;
 		}
-		if (user_value == NULL && tc_store_read(cls, id, key, false, stored_buf, sizeof(stored_buf))) {
-			stored_value = stored_buf;
+		if (user_value == NULL) {
+			if (use_row) {
+				stored_value = row_value;
+			} else if (tc_store_read(cls, id, key, false, stored_buf, sizeof(stored_buf))) {
+				stored_value = stored_buf;
+			}
 		}
 	}
 #if defined(XRT_OS_WINDOWS)
@@ -2713,6 +2720,29 @@ target_component_get_setting(const struct target_component_class *cls,
 #endif
 	return target_component_setting_resolve(env_value, user_value, stored_value, stored_is_manifest, lock, buf, cap,
 	                                        out_source) != NULL;
+}
+
+bool
+target_component_get_setting(const struct target_component_class *cls,
+                             const char *id,
+                             const char *key,
+                             char *buf,
+                             size_t cap,
+                             uint32_t *out_source)
+{
+	return tc_get_setting(cls, id, key, false, NULL, buf, cap, out_source);
+}
+
+bool
+target_component_get_setting_ex(const struct target_component_class *cls,
+                                const char *id,
+                                const char *key,
+                                const char *row_value,
+                                char *buf,
+                                size_t cap,
+                                uint32_t *out_source)
+{
+	return tc_get_setting(cls, id, key, true, row_value, buf, cap, out_source);
 }
 
 enum target_component_store_result

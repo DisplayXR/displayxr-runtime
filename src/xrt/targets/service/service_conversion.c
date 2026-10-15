@@ -32,6 +32,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef XRT_OS_WINDOWS
+#include <strings.h> // strcasecmp
+#endif
 
 #ifdef XRT_OS_WINDOWS
 #include "xrt/xrt_windows.h"
@@ -378,30 +381,23 @@ host_get_setting_slot(uint32_t slot, const char *key, char *buf, uint32_t buf_si
 	if (slot >= HOST_SLOTS || key == NULL || buf == NULL || buf_size == 0 || !g_host_slot[slot].used) {
 		return false;
 	}
-	char env[160];
-	const int n = snprintf(env, sizeof(env), "DXR_CONV_%s_%s", g_host_slot[slot].id, key);
-	if (n < 0 || (size_t)n >= sizeof(env)) {
-		return false;
-	}
-	for (char *c = env; *c != '\0'; c++) {
-		*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
-	}
-	const char *v = getenv(env);
-	if (v != NULL && v[0] != '\0') {
-		(void)snprintf(buf, buf_size, "%s", v);
-		return true;
-	}
+	// N3c: the one options contract's store (shared with the headless pass and
+	// every other class): the service's environment, then the per-user
+	// overlay (both read live, so a `conv set` reaches the next re-describe),
+	// then the row's Settings\* / manifest "settings" as enumerated.
+	const char *row_value = NULL;
 	for (uint32_t i = 0; i < g_host_slot[slot].setting_count && i < XRT_CONV_LOADER_MAX_SETTINGS; i++) {
 #ifdef XRT_OS_WINDOWS
 		if (_stricmp(g_host_slot[slot].settings[i].key, key) == 0) {
 #else
-		if (strcmp(g_host_slot[slot].settings[i].key, key) == 0) {
+		if (strcasecmp(g_host_slot[slot].settings[i].key, key) == 0) {
 #endif
-			(void)snprintf(buf, buf_size, "%s", g_host_slot[slot].settings[i].value);
-			return true;
+			row_value = g_host_slot[slot].settings[i].value;
+			break;
 		}
 	}
-	return false;
+	return target_component_get_setting_ex(target_conversion_plugin_component_class(), g_host_slot[slot].id, key,
+	                                       row_value, buf, buf_size, NULL);
 }
 
 #define HOST_GET_SETTING(i)                                                                                            \
