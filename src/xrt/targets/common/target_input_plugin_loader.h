@@ -66,15 +66,33 @@ struct target_input_plugin_desc
 	 *    row reader records the value, not its presence.
 	 */
 	char enabled_source[12];
+	/*! ADR-054 N4b: `enum target_component_provenance` of the binary, as
+	 * @ref target_input_plugin_enumerate classified it (a lister checks
+	 * explicitly; the verdict is cached per file for the process). */
+	uint32_t provenance;
+	char provenance_reason[160]; //!< one line: why that verdict
+	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
 };
 
 /*!
  * Enumerate registered input providers WITHOUT loading them. Writes up to
  * @p max descriptors and returns the count (0 if the discovery root is
- * absent / empty). Re-reads the discovery root every call.
+ * absent / empty). Re-reads the discovery root every call, and runs the N4b
+ * provenance check on every listed binary (cached per file).
  */
 int
 target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max);
+
+/*!
+ * The REGISTRATION id (registry subkey / manifest `id`) of the @p index'th
+ * resident provider in priority order, or "" when out of range. Distinct
+ * from `iface->id`, which is the binary's own: one DLL registered under two
+ * ids (CI's `sim-input` + `sim-input-alt`) is two rows with one `iface->id`,
+ * and `PreferredPlugin` names a ROW — so this is what says which row won
+ * (`selftest --json` `input_providers.ranked`, N3b).
+ */
+const char *
+target_input_plugin_get_row_id(int index);
 
 /*!
  * How many providers loaded, ABI-passed and probed successfully.

@@ -36,8 +36,9 @@ cli_print_help(int argc, const char **argv)
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
 	P("  perf <...>        - Performance settings the runtime reads inside each app.\n");
 	P("                      'perf list [--all] [--json]', 'perf set <name> <value>', 'perf reset'.\n");
-	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
-	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'; per screen:\n");
+	P("  dp <...>          - Display processors (ADR-019; verbs per ADR-054).\n");
+	P("                      'dp list [--json]', 'dp enable|disable <id> [--machine]',\n");
+	P("                      'dp use <id> [--machine]', 'dp reset [--machine]'; per screen:\n");
 	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034; verbs per ADR-054).\n");
 	P("                      'input list [--json]', 'input enable|disable <id> [--machine]',\n");

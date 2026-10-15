@@ -1157,6 +1157,15 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	if (iface != NULL) {
 		snprintf(r->input_provider_id, sizeof(r->input_provider_id), "%s", iface->id ? iface->id : "");
 	}
+	// N3b: the resident rows in priority order, by REGISTRATION id —
+	// `PreferredPlugin` names a row, and two rows of one DLL share iface->id.
+	r->input_ranked_count = 0;
+	const int resident = target_input_plugin_get_count();
+	for (int i = 0; i < resident && r->input_ranked_count < 16; i++) {
+		snprintf(r->input_ranked[r->input_ranked_count], sizeof(r->input_ranked[0]), "%s",
+		         target_input_plugin_get_row_id(i));
+		r->input_ranked_count++;
+	}
 	// The scan tally is reported whether or not somebody claimed the system:
 	// a provider that could not be dispatched (load failure, ABI-major
 	// mismatch) is a misconfiguration worth seeing even when a lower-ranked
@@ -1949,6 +1958,16 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	struct target_plugin_discovery_summary disc;
 	target_plugin_get_discovery_summary(&disc);
 	r->vendor_dp_ok = (disc.rejected_count == 0);
+	// N3b: a disabled better-ranked plug-in is the user's choice, not a
+	// fault — but say so, or "sim-display is active" on a vendor box reads
+	// as a mystery.
+	r->skipped_disabled_count = 0;
+	for (int i = 0; i < disc.skipped_disabled_count && i < 8; i++) {
+		snprintf(r->skipped_disabled[r->skipped_disabled_count], sizeof(r->skipped_disabled[0]), "%s",
+		         disc.skipped_disabled_ids[i]);
+		r->skipped_disabled_count++;
+	}
+	snprintf(r->active_row_id, sizeof(r->active_row_id), "%s", disc.active_id);
 	if (r->vendor_dp_ok) {
 		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
 		         "no better-ranked plug-in failed to load (active ProbeOrder=%u, %d declined their probe)",
@@ -2400,6 +2419,14 @@ cli_query_print_info_text(const struct cli_query_result *r)
 
 	PT("plug-in: id='%s' name='%s' vendor='%s' version='%s'\n", or_q(r->plugin_id), or_q(r->plugin_name),
 	   or_q(r->plugin_vendor), or_q(r->plugin_version));
+	if (r->skipped_disabled_count > 0) {
+		PT("skipped: selected over %d disabled higher-ranked plug-in(s) (Enabled=0):",
+		   r->skipped_disabled_count);
+		for (int i = 0; i < r->skipped_disabled_count; i++) {
+			printf("%s %s", i > 0 ? "," : "", r->skipped_disabled[i]);
+		}
+		printf("\n");
+	}
 	PT("ABI:     v%u (loader-verified match)\n", (unsigned)r->plugin_abi_version);
 	PT("device:  '%s'\n", r->head_str);
 
@@ -2606,6 +2633,13 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	}
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
+		if (r->input_ranked_count > 0) {
+			PT("ranked:      ");
+			for (int i = 0; i < r->input_ranked_count; i++) {
+				printf(" %s", r->input_ranked[i]);
+			}
+			printf("  (registration ids, priority order)\n");
+		}
 		PT("hardware:     %s\n", r->input_provider_present ? "present (provider holds the hand roles)"
 		                                                   : "absent (qwerty holds the hand roles)");
 		PT("left:         %s\n", r->input_left_ok ? r->input_left_str : "<missing>");
@@ -3291,8 +3325,13 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->name = "active_plugin";
 	c->ok = r->plugin_ok;
 	if (r->plugin_ok) {
-		snprintf(c->detail, sizeof(c->detail), "id='%s' name='%s' (ABI v%u)", or_q(r->plugin_id),
-		         or_q(r->plugin_name), (unsigned)r->plugin_abi_version);
+		int used = snprintf(c->detail, sizeof(c->detail), "id='%s' name='%s' (ABI v%u)", or_q(r->plugin_id),
+		                    or_q(r->plugin_name), (unsigned)r->plugin_abi_version);
+		// N3b: say when a disabled higher-ranked plug-in was passed over.
+		for (int i = 0; i < r->skipped_disabled_count && used > 0 && (size_t)used < sizeof(c->detail); i++) {
+			used += snprintf(c->detail + used, sizeof(c->detail) - (size_t)used, "%s%s",
+			                 i == 0 ? "; selected over disabled: " : ", ", r->skipped_disabled[i]);
+		}
 	} else {
 		snprintf(c->detail, sizeof(c->detail), "%s", "no active vendor plug-in");
 	}
@@ -3521,6 +3560,21 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 	add_plugin_states_json(root, r);
+	// N3b: the display-processor selection as data — which plug-in is
+	// active and which better-ranked ones discovery skipped because they are
+	// DISABLED (user / machine Enabled=0, manifest "enabled": false, or a
+	// disabled PreferredPlugin). Why THIS one is active; never a failure.
+	{
+		cJSON *dp = cJSON_AddObjectToObject(root, "display_processor");
+		cJSON_AddBoolToObject(dp, "active", r->plugin_ok);
+		// The REGISTRATION id of the winning row (what `Enabled` /
+		// `PreferredPlugin` name); `plugin.id` elsewhere is iface->id.
+		cJSON_AddStringToObject(dp, "active_id", r->plugin_ok ? r->active_row_id : "");
+		cJSON *sk = cJSON_AddArrayToObject(dp, "skipped_disabled");
+		for (int i = 0; i < r->skipped_disabled_count; i++) {
+			cJSON_AddItemToArray(sk, cJSON_CreateString(r->skipped_disabled[i]));
+		}
+	}
 	add_conversion_providers_json(root, r);
 	// ADR-054 N4: the input-provider loader's view, as data — what was
 	// registered, what was enabled, who claimed, and how many could not be
@@ -3535,6 +3589,12 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
 		cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
 		cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
+		// N3b: registration ids of the resident rows, priority order —
+		// index 0 is the PreferredPlugin row when one is set and claimed.
+		cJSON *rk = cJSON_AddArrayToObject(ip, "ranked");
+		for (int i = 0; i < r->input_ranked_count; i++) {
+			cJSON_AddItemToArray(rk, cJSON_CreateString(r->input_ranked[i]));
+		}
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");

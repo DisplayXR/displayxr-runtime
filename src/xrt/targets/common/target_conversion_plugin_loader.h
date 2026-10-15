@@ -217,6 +217,24 @@ void
 target_conversion_plugin_sort(struct xrt_conversion_plugin_entry *entries, int count);
 
 /*!
+ * ADR-054 N4b, for a LISTER (`displayxr-cli conv list`): classify the
+ * provenance of the provider binary at @p binary_path the way the shared
+ * load path does (`target_component_check_provenance`, cached per file for
+ * the process), without loading it. The status rows the CLI prints come over
+ * DIAG IPC and carry no verdict, so the lister asks here. Writes the
+ * `enum target_component_provenance` value, the one-line reason and the
+ * signer (any out-param may be NULL); returns true when the verdict is
+ * anything but UNVERIFIED. An empty path yields UNKNOWN / false.
+ */
+bool
+target_conversion_plugin_check_provenance(const char *binary_path,
+                                          uint32_t *out_provenance,
+                                          char *out_reason,
+                                          size_t reason_cap,
+                                          char *out_signer,
+                                          size_t signer_cap);
+
+/*!
  * Parse one POSIX manifest's JSON text into @p out (zeroed first). @p source
  * is the manifest path (recorded in out->source; its `NNN-` prefix supplies
  * the ProbeOrder when the manifest has none). Returns true for a usable
