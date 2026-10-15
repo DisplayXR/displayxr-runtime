@@ -67,7 +67,9 @@ FetchContent_Declare(
     # buffer_device (displayxr-common#81, #1991); the aux guard needs the same bytes.
     # v2.32.0: DxrLinuxWindowDesc::start_hidden — the window is never mapped or made
     # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
-    GIT_TAG v2.32.0
+    # v2.32.1: macOS — no depth cursor while the app is inactive; AppKit ignores
+    #   +[NSCursor hide] there, which gave a double cursor (displayxr-common#83).
+    GIT_TAG v2.32.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
