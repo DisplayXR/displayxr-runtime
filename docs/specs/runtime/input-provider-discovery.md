@@ -103,7 +103,8 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 Per-provider subkey, same value schema as DisplayProcessors: `Binary`
 (absolute DLL path, required), `DisplayName` / `Vendor` / `Version`
 (optional strings), `ProbeOrder` (DWORD; missing = 100), optional
-`Enabled` (DWORD, 0 disables; the DP root has no such value yet — N3 step b).
+`Enabled` (DWORD, 0 disables; the DP root has the same value since N3b,
+plugin-discovery.md §2).
 
 **Per-user policy (N3a, ADR-054 verbs `enable|disable` and `prefer`).** Two
 values are also read from **HKCU**, where they win over HKLM; they are what

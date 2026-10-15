@@ -21,6 +21,13 @@ never register a plug-in DLL living in a worktree or build directory under
 a live service (#943): the service holds the DLL and its stale code for its
 whole lifetime.
 
+The ADR-054 component verbs are **implemented** for this class (N3b,
+#2049): the optional `Enabled` value (§2), the per-user HKCU overlay for
+`Enabled` and `PreferredPlugin` (§2.1), the manifest's `enabled` (§3.1),
+and `displayxr-cli dp list | enable | disable | use | reset`. Still planned:
+live re-select when either value changes under a running service (#2051 —
+today a change applies at the next service start / session).
+
 This document is the **runtime ↔ plug-in discovery contract**. The
 C-ABI side — the negotiation entry point, the `xrt_plugin_iface` vtable,
 the `xrt_plugin_display_info` struct — lives in `xrt/xrt_plugin.h`. The
@@ -51,6 +58,14 @@ DisplayXR shell, …):
      Because the loader is **one-shot per process**, changing the
      preference takes effect on the **next** process: a running service must
      be **restarted** for the switch to apply to live sessions.
+   - **`Enabled` (§2 / §2.1 / §3.1, N3b):** an entry whose `Enabled` is 0
+     (per user or machine-wide) or whose manifest says `"enabled": false`
+     is **never tried, by any scan** — not here, not by the display-claim
+     collection (§3.4 / ADR-015, so the per-monitor registry stops
+     offering it), not by the mid-install re-scan or the hotplug rescan.
+     It is still listed by `dp list` (so it can be re-enabled). A disabled
+     `PreferredPlugin` falls through to the ProbeOrder sort with one WARN:
+     `Enabled=0` is the stronger verb.
 4. For each entry, in order:
    - `LoadLibraryExW` / `dlopen` the DLL/`.dylib`.
    - Resolve the single exported symbol `xrtPluginNegotiate`.
@@ -145,6 +160,7 @@ HKLM\Software\DisplayXR\DisplayProcessors
 | `Version`         | `REG_SZ`    | no       | Free-form vendor version string. Logged at successful negotiate.                                                                         |
 | `UninstallString` | `REG_SZ`    | no       | Optional, informational (mirrors the plug-in's Add/Remove Programs entry). The runtime never executes it — see §5.                       |
 | `ProbeOrder`      | `REG_DWORD` | no       | Lower runs first. Missing defaults to 100. Vendors should use 50; sim-display uses 200 so it's always the fallback.                      |
+| `Enabled`         | `REG_DWORD` | no       | 0 = the loader never tries this plug-in, in any scan (§1 step 3). Absent (or any non-zero) = enabled. Installers **do not write it** — it is the user's / administrator's switch (`displayxr-cli dp enable\|disable`, §2.1), and a per-user HKCU value overrides it. |
 
 **ProbeOrder convention:**
 
@@ -192,7 +208,7 @@ The runtime installer's reference implementation (sim-display, no
 `installer/DisplayXRInstaller.nsi` — the section labeled "Vendor
 plug-in: sim-display".
 
-### 2.1 `PreferredPlugin` override
+### 2.1 `PreferredPlugin` override and the per-user overlay
 
 A single **root-level** value selects a plug-in to try before the
 `ProbeOrder` sort. It is **not** a per-subkey value — it lives directly
@@ -200,26 +216,69 @@ under the discovery root:
 
 | Location                                              | Value            | Type     | Purpose                                                                                   |
 | ----------------------------------------------------- | ---------------- | -------- | ----------------------------------------------------------------------------------------- |
-| `HKLM\Software\DisplayXR\DisplayProcessors` (root)    | `PreferredPlugin`| `REG_SZ` | The `<id>` of the plug-in to attempt first. Empty / absent = normal `ProbeOrder` discovery. |
+| `HKCU\Software\DisplayXR\DisplayProcessors` (root), then `HKLM\…\DisplayProcessors` (root) | `PreferredPlugin`| `REG_SZ` | The `<id>` of the plug-in to attempt first. Empty / absent = normal `ProbeOrder` discovery. |
 
-Semantics: if the named id is registered and its `probe()` succeeds, it
-wins regardless of `ProbeOrder`. If the id is unregistered or fails to
-load, discovery silently falls back to the normal `ProbeOrder` order. The
-override is **sticky** — the mid-install re-scan never swaps it out — and,
-because the loader is one-shot per process, a change takes effect only for
-processes started afterward (restart the service to switch a live session).
+Semantics: if the named id is registered, **enabled**, and its `probe()`
+succeeds, it wins regardless of `ProbeOrder`. If the id is unregistered or
+fails to load, discovery silently falls back to the normal `ProbeOrder`
+order; if it is **disabled** (`Enabled` = 0, below) it falls back with one
+WARN — `Enabled=0` is the stronger verb. The override is **sticky** — the
+mid-install re-scan never swaps it out — and, because the loader is
+one-shot per process, a change takes effect only for processes started
+afterward (restart the service to switch a live session; live re-select is
+#2051).
+
+**Per-user policy (N3b, ADR-054 verbs `enable|disable` and `prefer`).** Two
+values are also read from **HKCU**, where they win over HKLM; they are what
+`displayxr-cli dp …` writes without admin (`--machine` writes the HKLM
+64-bit view instead). **Nothing else is ever read from HKCU** — the plug-in
+rows themselves (`Binary`, `ProbeOrder`, …) are HKLM-only, so a per-user key
+can never inject a DLL. (The per-screen preference of `dp use --screen` is a
+separate store — the per-user `settings.json`, or machine-wide
+`DisplayProcessors\PreferredPlugin\<key>` under HKLM, §1.1 — and is
+unchanged; the `PreferredPlugin` and `Policy` *subkeys* are reserved and
+never read as plug-in rows.)
+
+| Location | Value | Type | Purpose | Written by |
+|---|---|---|---|---|
+| `HKCU\…\DisplayProcessors\<id>` (overrides `HKLM\…\DisplayProcessors\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` in every scan (logged once per process: `disabled (Enabled=0, user\|machine)`); absent = the HKLM value; HKLM absent = enabled | `displayxr-cli dp enable\|disable <id> [--machine]` |
+| `HKCU\…\DisplayProcessors` root, then `HKLM\…\DisplayProcessors` root | `PreferredPlugin` | REG_SZ | as above | `displayxr-cli dp use <id> [--machine]` / `dp reset [--machine]` |
+
+The `Enabled` overlay is the shared component loader's
+(`target_component_apply_user_overlay`, ADR-054 N2), so the conversion
+root's kiosk rule applies here too: HKLM `DisplayProcessors\Policy\Lock` =
+1 makes the machine value win for every row
+(conversion-provider-discovery.md §3.1); the `Policy` subkey is reserved
+and never read as a plug-in row. `dp enable|disable` refuses an id that is
+not registered (HKLM row / manifest) — non-zero exit, nothing written — since
+a per-user `Enabled` for it would be an orphan row `dp list` can never show.
 
 This is the non-destructive replacement for the old "delete the vendor
 registry key to force sim-display" workaround. Manage it with
-`displayxr-cli dp use <id>` / `dp reset` (or the DisplayXR Dashboard); both write
-the 64-bit view (HKLM → administrator rights required). `FORCE_SIM_DISPLAY`
-is unrelated — it only nudges *builder* priority, not which *plug-in* loads.
+`displayxr-cli dp use <id>` / `dp reset` (or the DisplayXR Dashboard); the
+default writes HKCU (no admin), `--machine` writes the 64-bit HKLM view
+(administrator rights required). `FORCE_SIM_DISPLAY` is unrelated — it only
+nudges *builder* priority, not which *plug-in* loads.
 
 ```powershell
-# Force sim-display, then restore normal discovery:
-New-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin" -Value "sim-display" -PropertyType String -Force
-Remove-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
+# Force sim-display for this user, then restore normal discovery:
+New-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin" -Value "sim-display" -PropertyType String -Force
+Remove-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
+# Turn a registered plug-in off for this user (what `dp disable acme-panel` writes):
+New-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors\acme-panel" -Name "Enabled" -Value 0 -PropertyType DWord -Force
 ```
+
+`displayxr-cli dp list [--json]` shows every registered plug-in with its
+`Enabled` and where it came from (the JSON `enabled_source`: `user` = a
+per-user HKCU `Enabled` is in force, whatever its value; `machine` =
+disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX
+manifest; `default` = enabled with no per-user value), the `PreferredPlugin`
+override, the N4b provenance verdict, and `*` on the plug-in the loader
+would select — a disabled one is never `*`. `displayxr-cli selftest` reports
+the better-ranked plug-ins discovery skipped because they are disabled
+(`display_processor.skipped_disabled` in `--json`; the `active_plugin`
+check's detail in text), so "sim-display is active" on a box with a vendor
+panel is never a mystery; a disabled plug-in is never a failure.
 
 ### 2.2 `DXR_PLUGIN_EXCLUSIVE` — load one plug-in and nothing else
 
@@ -322,6 +381,7 @@ Fields mirror the Windows registry schema:
 | `plugin.version`      | `Version`          | no       | Free-form version string.                                                             |
 | `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib`. Spaces allowed.                                |
 | `plugin.probe_order`  | `ProbeOrder`       | no       | Default 100. Sim-display=200, vendors=50.                                             |
+| `plugin.enabled`      | `Enabled`          | no       | Boolean; `false` = the loader never tries this plug-in, in any scan (§1 step 3), and `dp list` shows it `no (manifest)`. A non-boolean rejects the manifest as malformed (the shared component loader's parser, ADR-054 N2). This is the POSIX switch — there is no per-user `Enabled` store, so `displayxr-cli dp enable\|disable` is refused here and points at this field. |
 | `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
 
 Discovery roots are searched in priority order — the per-user root
@@ -431,7 +491,11 @@ fall through on miss/failure, sticky for the process" semantics:
    (`~/Library/Application Support/DisplayXR/DisplayProcessors/preferred`
    on macOS; `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/preferred`
    on Linux) — a single line containing the plug-in id. This is what
-   `displayxr-cli dp use <id>` / `dp reset` write.
+   `displayxr-cli dp use <id>` / `dp reset` write (`--machine` is refused:
+   there is no machine-wide store on POSIX).
+
+A disabled preferred id (`"enabled": false`, §3.1) falls through to the
+ProbeOrder sort with one WARN, exactly as on Windows (§2.1).
 
 Android exposes only the env-var read (the writable override and `dp list`
 are not shipped there in v1; see Non-goals above).
@@ -803,6 +867,14 @@ therefore picks a vendor plug-in up again without reinstalling it.
 - On uninstall, delete your own `<id>` subkey and your own files, with or
   without the runtime present. Don't touch the runtime's files or any
   other subkey.
+- **Never touch HKCU** (N3b). The per-user `Enabled` / `PreferredPlugin`
+  overlay (§2.1) belongs to the user, not to your installer: an installer
+  runs elevated under one account and cannot enumerate every user's hive
+  anyway, and a per-user `Enabled` = 0 that outlives your registration is
+  harmless — the loader only overlays rows that exist in HKLM, and `dp
+  list` shows nothing for an id with no row. Likewise, do not write
+  `Enabled` on your own HKLM row at install time: a user who disabled your
+  plug-in before upgrading expects it to stay disabled.
 - `UninstallString` is optional and informational; the runtime does not
   execute it.
 
@@ -909,6 +981,8 @@ The runtime emits these one-shot lines at instance creation, all at
 | `plugin loader:   <id>: probe declined (no matching device).`                                                         | INFO — clean decline from probe (`XRT_ERROR_PROBER_NOT_SUPPORTED`). Suppressed at default WARN level.     |
 | `plugin loader:   <id>: LoadLibrary(<path>) failed (err=<n>).`                                                       | WARN — DLL load failure. `err=126` with the binary present adds "a library the plug-in imports is missing" (`DEPENDENCY_MISSING`). |
 | `plugin loader:   <id>: registered Binary '<path>' does not exist — skipping (orphan registration).`                  | WARN — `BINARY_MISSING` (ADR-045).                                                                        |
+| `plugin loader:   <id> disabled (Enabled=0, user\|machine\|manifest; ProbeOrder=<n>) — never tried.`                  | WARN once per process per id (INFO on later scans) — `DISABLED` (N3b, §2.1 / §3.1).                      |
+| `plugin loader: PreferredPlugin '<id>' is disabled (Enabled=0, …) — falling through to ProbeOrder.`                  | WARN once — the preferred plug-in is disabled; `Enabled=0` is the stronger verb (N3b).                    |
 | `plugin loader:   <id>: platform state <STATE>[ — <hint>]`                                                           | WARN on change — what `get_platform_state` reported, before `probe()` (ADR-045).                          |
 | `plug-in adoption: '<old>' -> '<new>' — weaving DP and display info follow now; …`                                   | WARN — a refresh adopted a better plug-in under the fallback's head device (service).                     |
 | `plug-in adoption: no client connected — restarting the service so the head device follows '<id>'.`                 | WARN — the adoption restart (Windows service).                                                            |

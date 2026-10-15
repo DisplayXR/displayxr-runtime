@@ -80,16 +80,39 @@ struct target_plugin_desc
 	char version[64];
 	char binary_path[512];
 	uint32_t probe_order; /* lower wins; missing defaults to 100 */
+	/*! `Enabled` (Windows: HKCU over HKLM; POSIX: the manifest's `enabled`);
+	 * true when absent (N3b, ADR-054 verb `enable|disable`). A disabled
+	 * plug-in is listed but never tried by any scan. */
+	bool enabled;
+	/*!
+	 * Where @ref enabled came from, for `displayxr-cli dp list` (the same
+	 * vocabulary as the input provider's, input-provider-discovery.md §6):
+	 *  - "user": a per-user HKCU `Enabled` is in force, whatever its value;
+	 *  - "machine": disabled by HKLM `Enabled` = 0;
+	 *  - "manifest": disabled by the POSIX manifest's `"enabled": false`;
+	 *  - "default": enabled with no per-user value — which includes an
+	 *    explicit HKLM `Enabled` = 1 / `"enabled": true`, because the shared
+	 *    row reader records the value, not its presence.
+	 */
+	char enabled_source[12];
+	/*! ADR-054 N4b: `enum target_component_provenance` of the binary, as
+	 * @ref target_plugin_enumerate classified it (a lister checks explicitly;
+	 * the verdict is cached per file for the process). */
+	uint32_t provenance;
+	char provenance_reason[160]; //!< one line: why that verdict
+	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
 };
 
 /*!
  * Enumerate registered plug-ins from the platform's discovery root
  * WITHOUT loading them. Writes up to @p max descriptors to @p out and
  * returns the count (0 if the discovery root is absent / empty). The
- * order is unspecified — callers that care sort by `probe_order`.
+ * order is the loader's own (ProbeOrder ascending, then id). Disabled
+ * plug-ins are listed (with `enabled` false); malformed rows are not.
  *
  * This re-reads the discovery root every call (it is not cached like the
- * active-plug-in path); cheap enough for an interactive `dp list`.
+ * active-plug-in path); cheap enough for an interactive `dp list`. It also
+ * runs the N4b provenance check on every listed binary (cached per file).
  */
 int
 target_plugin_enumerate(struct target_plugin_desc *out, int max);
@@ -100,31 +123,36 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max);
  * and returns true iff a non-empty override is configured; otherwise
  * writes an empty string and returns false.
  *
- * Windows: `REG_SZ` `PreferredPlugin` at the discovery root key
- * `HKLM\Software\DisplayXR\DisplayProcessors`. POSIX: the
- * `XRT_PREFERRED_PLUGIN_ID` env var, else a `preferred` file in the
- * per-user manifest dir.
+ * Windows: `REG_SZ` `PreferredPlugin` at the discovery root
+ * `Software\DisplayXR\DisplayProcessors` — HKCU first (per user, what
+ * `displayxr-cli dp use <id>` writes without admin), then the HKLM 64-bit
+ * view (`--machine`); N3b. POSIX: the `XRT_PREFERRED_PLUGIN_ID` env var,
+ * else a `preferred` file in the per-user manifest dir.
  */
 bool
 target_plugin_get_preferred(char *out, size_t cap);
 
 /*!
- * Set the `PreferredPlugin` override to @p id (a plug-in discovery id).
- * Takes effect for processes that begin discovery AFTER the write — the
- * loader is one-shot per process, so a running service must be restarted.
+ * Set the MACHINE-WIDE `PreferredPlugin` override to @p id (a plug-in
+ * discovery id). Takes effect for processes that begin discovery AFTER the
+ * write — the loader is one-shot per process, so a running service must be
+ * restarted (live re-select is #2051).
  *
- * Windows writes HKLM and therefore requires administrator rights;
- * returns @ref XRT_ERROR_NOT_AUTHORIZED on access-denied,
- * @ref XRT_ERROR_IPC_FAILURE on other write failures, and
- * @ref XRT_SUCCESS on success.
+ * Windows writes the HKLM 64-bit view and therefore requires administrator
+ * rights (`displayxr-cli dp use --machine`; the per-user HKCU value, which
+ * wins, is written by the CLI itself); returns @ref XRT_ERROR_NOT_AUTHORIZED
+ * on access-denied, @ref XRT_ERROR_IPC_FAILURE on other write failures, and
+ * @ref XRT_SUCCESS on success. POSIX has no machine store: this writes the
+ * per-user `preferred` file.
  */
 xrt_result_t
 target_plugin_set_preferred(const char *id);
 
 /*!
- * Clear the `PreferredPlugin` override (restore normal `ProbeOrder`
- * discovery). Idempotent — clearing an unset override is @ref XRT_SUCCESS.
- * Same elevation / restart caveats as @ref target_plugin_set_preferred.
+ * Clear the machine-wide `PreferredPlugin` override (restore normal
+ * `ProbeOrder` discovery). Idempotent — clearing an unset override is
+ * @ref XRT_SUCCESS. Same elevation / restart caveats as
+ * @ref target_plugin_set_preferred.
  */
 xrt_result_t
 target_plugin_clear_preferred(void);
@@ -182,6 +210,20 @@ struct target_plugin_discovery_summary
 	char best_rejected_id[64];
 	//! Why it was rejected — ABI mismatch text where known.
 	char best_rejected_reason[128];
+	//! N3b (ADR-054 verb `enable|disable`): better-ranked plug-ins the
+	//! first-call discovery SKIPPED because they are disabled (`Enabled` = 0 /
+	//! `"enabled": false`), plus a disabled `PreferredPlugin`. Not a fault —
+	//! the user asked for it — but `displayxr-cli selftest` says so, because
+	//! "sim-display is active" on a box with a vendor panel otherwise reads as
+	//! a mystery. Ids in the order they were skipped; at most 8 are kept.
+	int skipped_disabled_count;
+	char skipped_disabled_ids[8][64];
+	//! REGISTRATION id (registry subkey / manifest id) of the winner; ""
+	//! when none is active. Distinct from `iface->id`, the binary's own: one
+	//! DLL registered under two ids (CI's `sim-display` + `sim-display-alt`)
+	//! is two rows with one `iface->id`, and `Enabled` / `PreferredPlugin`
+	//! name a ROW.
+	char active_id[64];
 };
 
 /*!
@@ -211,6 +253,7 @@ enum target_plugin_load_result
 	TARGET_PLUGIN_RESULT_ABI_MISMATCH,       //!< ADR-020 rule 3 reject
 	TARGET_PLUGIN_RESULT_PROBE_FAILED,       //!< probe returned a hard error
 	TARGET_PLUGIN_RESULT_UNTRUSTED,          //!< provenance UNVERIFIED with the gate enforcing (ADR-054 N4b)
+	TARGET_PLUGIN_RESULT_DISABLED,           //!< `Enabled` = 0 / manifest `"enabled": false` — never tried (N3b)
 };
 
 /*!
