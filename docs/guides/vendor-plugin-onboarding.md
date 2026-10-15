@@ -514,6 +514,7 @@ The whole checklist:
 - `displayxr-cli input list [--json]` enumerates registered providers (ProbeOrder, Enabled + its source, the PreferredPlugin override, the one ranked first) and the ForceQwerty state without loading any DLL; `input enable|disable <id>` and `input use <id>` / `input reset` write the per-user `Enabled` / `PreferredPlugin` values the loader honours (`--machine` for HKLM; ADR-054 verbs, N3a); `displayxr-cli input haptic-test` re-resolves roles every iteration and prints each `generation_id` change, so it doubles as a live view of arbitration flipping.
 - Run the same checks a second time with `XRT_FORCE_MODE=ipc` and a running `displayxr-service.exe`. Roles, the rig and the composer all live service-side there, and the durable-recenter rule exists precisely because that path polls differently.
 - `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` skips input providers entirely — the fastest way to prove a symptom is yours.
+- `displayxr-cli input emulated off` (ADR-054 N7) withholds the qwerty emulated pair instead: with your provider absent the hand roles then read **unassigned** (`XR_NULL_PATH`) rather than qwerty's, which is how to prove an app is really seeing *your* controllers and not the keyboard fallback. `input emulated on` restores the default.
 
 ## 9. Conversion providers — the third plug-in type
 

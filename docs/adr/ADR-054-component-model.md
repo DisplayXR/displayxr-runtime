@@ -187,9 +187,12 @@ the trunk; it does not ship one.
 **4.7 Qwerty stays in the trunk** as the runtime-wide input floor. The review found the floor
 spelled `cand->iface == NULL` in five places in `target_input_arbiter.c`, WebXR
 interaction-profile churn, and CTS dependence on it — a DLL move would touch all of that for
-no user benefit. Instead: an `HKLM\Software\DisplayXR\Input\EmulatedControllers=0` gate
-next to the existing `ForceQwerty`, surfaced through the CLI and dashboard, so a user can
-turn the emulated pair off without a code change.
+no user benefit. Instead: an `EmulatedControllers=0` gate alongside the existing
+`ForceQwerty`, surfaced through the CLI and dashboard, so a user can turn the emulated pair
+off without a code change. (Landed as N7, #2143, under the class root —
+`InputProviders\Policy\EmulatedControllers`, HKCU over HKLM, not next to
+`Input\ForceQwerty` — so the policy watch and the `Policy\Lock` overlay rule cover it for
+free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 item 3b.)
 
 ### 5. Naming
 

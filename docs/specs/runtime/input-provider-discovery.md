@@ -117,13 +117,16 @@ never inject a DLL.
 |---|---|---|---|---|
 | `HKCU\…\InputProviders\<id>` (overrides `HKLM\…\InputProviders\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` (logged `disabled (Enabled=0, user|machine)`); absent = enabled | `displayxr-cli input enable|disable <id> [--machine]` |
 | `HKCU\…\InputProviders` root, then `HKLM\…\InputProviders` root | `PreferredPlugin` | REG_SZ | `<id>` is hoisted to the front of the ProbeOrder sort and noted at arbitration priority 0, so it holds the hand/rig roles whenever it is present. Unregistered → one WARN, ignored; disabled → skipped (`Enabled=0` is the stronger verb); declines → normal fall-through | `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` |
+| `HKCU\…\InputProviders\Policy`, then `HKLM\…\InputProviders\Policy` | `EmulatedControllers` | DWORD | **The N7 gate (§4 item 3b).** 0 = the qwerty emulated controller pair is not published (no qwerty left/right device; the hand roles stay unassigned whenever no provider holds them); absent = 1. The qwerty head is not affected. Lives under the class root on purpose — one root per class — so the service's policy watch and the `Policy\Lock` rule cover it with no new plumbing | `displayxr-cli input emulated on\|off [--machine]` |
 
 The `Enabled` overlay is the shared component loader's
 (`target_component_apply_user_overlay`, ADR-054 N2), so the conversion root's
 kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
-machine value win for every row (conversion-provider-discovery.md §3.1); the
-`Policy` subkey is reserved and never read as a provider row. A change to
-either value reaches a running service live — as a **re-rank** of the
+machine value win for every row (conversion-provider-discovery.md §3.1) **and
+hides the per-user `EmulatedControllers`** (the root-policy read,
+`target_component_read_policy_dword`); the `Policy` subkey is reserved and
+never read as a provider row. A change to any of the three values reaches a
+running service live — as a **re-rank** of the
 resident providers, since the provider set is fixed per process (see
 *Live re-select* under *Selection* below); in-process apps read it at their
 next launch.
@@ -168,6 +171,14 @@ as the Windows `PreferredPlugin` above:
    on Linux — next to the DP loader's `preferred` and this loader's
    `force_qwerty`) — a single line containing the provider id. This is what
    `displayxr-cli input use <id>` / `input reset` write.
+
+**Emulated-controller gate (N7).** An `emulated_controllers` file in the same
+dir, the `force_qwerty` byte convention (first byte `'0'` = off, anything
+else = on; absent = on) — what `displayxr-cli input emulated on|off` writes
+(`on` writes `1`, so the source reads `file`; delete the file to return to
+`default`). There is no machine tier on POSIX (`--machine` is refused, as for
+the other verbs); the service's per-user-dir poll folds the file into the
+input class's fingerprint, so a write is picked up live.
 
 There is no per-user `Enabled` store on POSIX (nor is there one for
 conversion providers): `displayxr-cli input enable|disable` reports that
@@ -257,7 +268,9 @@ launch.
 
 A provider is loaded, negotiated and probed **once per process** and then
 never unloaded (`target_input_plugin_loader.h`); the runtime does not call
-`destroy()` at all today. What DOES churn is `create_devices()`: the builder
+`destroy()` at all today. The same fixedness applies to the qwerty pair: it
+is created (or, with `EmulatedControllers = 0`, withheld) at system build,
+and a later gate flip can only withdraw or re-admit a pair that exists. What DOES churn is `create_devices()`: the builder
 calls it once per `xrt_system_devices`, i.e. once per `xrCreateInstance`,
 and the devices it returns are destroyed through their own
 `xrt_device::destroy` at `xrDestroyInstance`. A process may go round that
@@ -290,7 +303,10 @@ which pair holds each hand role is re-resolved for the life of the
 process: per hand, the highest-priority candidate that supplies that hand
 and reports `PRESENT` wins; qwerty (always present, priority
 `UINT32_MAX`) is the floor. Roles therefore move provider→provider on
-plug/unplug, not just provider↔qwerty.
+plug/unplug, not just provider↔qwerty. The floor is **optional** since N7:
+with `EmulatedControllers = 0` (item 3b below) no qwerty pair is noted, and
+the walk simply runs out of candidates — the hand lands on -1, the shape
+the rig role has always had.
 
 **Profile stability (masquerade).** When the qwerty floor wins a hand on a
 box that HAS ranked providers, the arbiter reports the top provider's
@@ -311,7 +327,8 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    `get_presence` slot, which means "assume present"), those devices hold
    `xrt_system_roles.left/right` and their `*_profile` fields. Otherwise
    qwerty holds them. Qwerty always registers as a device, so the roles
-   can come back to it.
+   can come back to it — unless the `EmulatedControllers` gate (3b) is 0,
+   in which case there is no qwerty pair and "otherwise" means **no role**.
 2a. `t_input_arbiter_install()` then replaces
    `xrt_system_devices::get_roles` with the arbiter's, which re-reads
    presence (rate-limited to ~250 ms) and bumps `generation_id` whenever
@@ -328,6 +345,42 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    anything else = on). Forces the fallback, registry/config-gated by
    convention (not an env var). Providers are then not loaded at all,
    so behavior is bit-identical to a box with none registered.
+3b. **`EmulatedControllers = 0`** (ADR-054 §4.7 / N7, #2143) is the *other*
+   half: it gates the **qwerty pair**, not the providers. Windows:
+   `InputProviders\Policy\EmulatedControllers` (DWORD), HKCU first, then the
+   HKLM 64-bit view, HKCU hidden under `InputProviders\Policy\Lock` = 1
+   (the shared loader's root-policy read — the same N3 overlay rules as
+   `Enabled`, which is why it lives under the class root rather than next
+   to `Input\ForceQwerty`). POSIX: the `emulated_controllers` per-user file
+   (§3). Absent = 1 = today's behaviour. Read through the input loader
+   (`target_input_plugin_get_emulated_controllers()`, value + source
+   `user|machine|file|default`), never `getenv` — this is class policy, not
+   a component setting. With it at 0, `t_builder_add_qwerty_input()`
+   publishes the qwerty **head only** (the look-around fallback is not a
+   controller): no qwerty left/right in `xsysd->xdevs`, no floor candidate
+   in the arbiter, and the hand roles sit at **-1 whenever no provider is
+   present or admitted** — `xrGetCurrentInteractionProfile` returns
+   `XR_NULL_PATH`, and the change-only event rule yields one
+   `XrEventDataInteractionProfileChanged` per flip, never a storm. A lone
+   provider is then still arbitrated (its hands must be able to fall to -1
+   and come back), where before a single candidate left the static roles in
+   place. Internally the qwerty driver still allocates the controller
+   objects — every input front-end addresses them — but as private state
+   that is never published and is freed with the head
+   (`qwerty_create_devices_ex`). Orthogonal to item 3: `ForceQwerty = 1`
+   skips the providers, `EmulatedControllers = 0` withholds the pair, and
+   both together is a box with **no hand devices at all** — the builder
+   logs one WARN naming both. **Live:** the policy watch covers the root
+   already; a flip is applied as a *withdrawal / re-admission* of a pair
+   that exists (`t_input_arbiter_set_floor_withdrawn`, exactly how
+   `Enabled = 0` withdraws a provider — devices stay resident, the roles
+   move on the next `xrSyncActions`), never as a device add: a pair the
+   service did not create at start (it started with the gate off) joins at
+   its next start, and on a box with no provider resident nothing
+   arbitrates, so the gate applies at the next start — both said once in
+   the log. The CTS lane relies on the pair being there (3a):
+   `scripts/run_cts.ps1` asserts the gate is absent or 1 before a run and
+   never writes it.
 3a. **`DXR_INPUT_PROVIDERS=0`** (process environment, all platforms) does the
    same thing for **one process**: the lazy discovery pass in
    `target_input_plugin_get_iface()` is skipped entirely, no provider DLL is
@@ -733,6 +786,18 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
   `input-preferred` file on POSIX, where `--machine` is refused). Every
   write says that it applies to processes started afterwards.
+- `displayxr-cli input emulated on|off [--machine]` — the N7
+  `EmulatedControllers` gate (§4 item 3b): HKCU by default, the HKLM 64-bit
+  view with `--machine` (POSIX: the per-user `emulated_controllers` file;
+  `--machine` refused). `input list` prints `Emulated controllers: on|off
+  (source)` (JSON: `emulated_controllers: {value, source}`), and both
+  `selftest --json` and `info --json` carry
+  `input_providers.emulated_controllers: {"value": 0|1, "source":
+  "user|machine|file|default"}` plus `input_providers.devices` (the system's
+  device list as `{str, type}` rows) — what the conformance cell asserts the
+  qwerty pair's presence / absence from. The write pokes the running service
+  like `input disable` does; the verb says which half applies live (a pair
+  that exists is withdrawn / re-admitted) and which waits for the next start.
 - `displayxr-cli input options <id> [--json]` / `input set <id> <KEY>
   <value> [--machine]` / `input unset <id> <KEY> [--machine]` — the ADR-054
   `options` verb (§3 *Component settings*, N3c): what the provider declares
@@ -741,7 +806,10 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   the POSIX per-user `<id>.settings.json`, and the provider reads them at
   its next init.
 - `displayxr-cli selftest` — when a provider is registered and not
-  ForceQwerty-overridden, asserts provider-claimed left+right
+  ForceQwerty-overridden (the `EmulatedControllers` gate does not change the
+  verdict: a present provider must still yield its pair, and with the gate
+  at 0 and no provider the hand roles are legitimately unassigned), asserts
+  provider-claimed left+right
   motion-controller role devices exist with a valid interaction profile
   (`CLI_SELFTEST_BAD_INPUT` on failure), and (#825 Tier 2) that any role
   device advertising `supported.hand_tracking` actually claimed a static
