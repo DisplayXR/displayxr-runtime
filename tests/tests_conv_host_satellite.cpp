@@ -142,6 +142,9 @@ struct Host
 			args.push_back("--channel");
 			args.push_back(t);
 		}
+		// Unsigned build-tree providers under an elevated harness (ADR-054 N4b PR B).
+		args.push_back("--trust-enforce");
+		args.push_back("0");
 		for (const auto &a : extra_args) {
 			args.push_back(a);
 		}

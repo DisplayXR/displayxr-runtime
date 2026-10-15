@@ -40,6 +40,7 @@
 #include "conv_host_os.h"
 #include "conv_host_provider.h"
 #include "conv_host_serve.h"
+#include "target_component_loader.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "conv_host_d3d11.h"
@@ -100,6 +101,15 @@ main(int argc, char *argv[])
 			return finish(CONV_HOST_EXIT_ELEVATED);
 		}
 		U_LOG_W("conversion host: running ELEVATED because DXR_CONV_HOST_ALLOW_ELEVATED=1 (CI / dev only)");
+	}
+
+	// The parent's provenance-gate override (ADR-054 N4b), when it holds one:
+	// a harness with unsigned build-tree providers under elevation, where the
+	// DXR_ALLOW_DEV_PLUGIN_PATHS allowance is refused. Never set by the service.
+	if (args.trust_enforce >= 0) {
+		target_component_trust_set_enforce_override(args.trust_enforce);
+		U_LOG_W("conversion host: provenance gate pinned to %s by the parent (ADR-054 N4b)",
+		        args.trust_enforce != 0 ? "enforce" : "audit");
 	}
 
 	// Parent death: Linux PDEATHSIG + a getppid check, macOS a kqueue

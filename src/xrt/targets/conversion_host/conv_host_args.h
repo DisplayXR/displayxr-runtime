@@ -38,6 +38,7 @@ struct conv_host_args
 	uint64_t adapter_luid; //!< 0 = none (CPU lane only)
 	bool has_adapter_luid;
 	uint32_t idle_exit_ms;
+	int trust_enforce; //!< -1 = not given (platform policy), 0 = audit, 1 = enforce (ADR-054 N4b)
 	char error[160]; //!< why parsing failed
 };
 

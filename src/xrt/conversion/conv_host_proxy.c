@@ -1301,6 +1301,10 @@ do_spawn(struct proxy *p, int32_t *out_exit_code)
 	args[n++] = parent;
 	args[n++] = CONV_HOST_ARG_ADAPTER_LUID;
 	args[n++] = luid;
+	if (p->cfg.trust_enforce == CONV_HOST_TRUST_AUDIT || p->cfg.trust_enforce == CONV_HOST_TRUST_ENFORCE) {
+		args[n++] = CONV_HOST_ARG_TRUST_ENFORCE;
+		args[n++] = p->cfg.trust_enforce == CONV_HOST_TRUST_ENFORCE ? "1" : "0";
+	}
 	for (uint32_t i = 0; i < p->cfg.extra_arg_count && n < 24; i++) {
 		args[n++] = p->cfg.extra_args[i];
 	}

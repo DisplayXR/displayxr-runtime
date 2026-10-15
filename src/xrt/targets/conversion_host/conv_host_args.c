@@ -102,6 +102,7 @@ conv_host_args_parse(int argc, const char *const *argv, struct conv_host_args *o
 {
 	memset(out, 0, sizeof(*out));
 	out->idle_exit_ms = CONV_HOST_IDLE_EXIT_MS_DEFAULT;
+	out->trust_enforce = -1;
 	bool have_parent = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -128,6 +129,9 @@ conv_host_args_parse(int argc, const char *const *argv, struct conv_host_args *o
 		} else if (strcmp(a, "--adapter-luid") == 0) {
 			ok = conv_host_parse_luid(v, &out->adapter_luid);
 			out->has_adapter_luid = ok && out->adapter_luid != 0;
+		} else if (strcmp(a, "--trust-enforce") == 0) {
+			ok = strcmp(v, "0") == 0 || strcmp(v, "1") == 0;
+			out->trust_enforce = ok ? (v[0] == '1' ? 1 : 0) : -1;
 		} else if (strcmp(a, "--idle-exit-ms") == 0) {
 			uint64_t ms = 0;
 			ok = parse_u64_dec(v, &ms) && ms > 0 && ms <= 0xffffffffull;

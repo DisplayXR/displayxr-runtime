@@ -79,6 +79,13 @@ struct conv_host_proxy_gpu_ops
 	void (*destroy)(void *ud);
 };
 
+enum conv_host_trust_mode
+{
+	CONV_HOST_TRUST_INHERIT = 0, //!< not passed: the host applies the platform policy
+	CONV_HOST_TRUST_AUDIT = 1,   //!< --trust-enforce 0
+	CONV_HOST_TRUST_ENFORCE = 2, //!< --trust-enforce 1
+};
+
 struct conv_host_proxy_config
 {
 	const char *provider_id;     //!< registry id (CONV_HOST_ARG_PROVIDER)
@@ -100,6 +107,13 @@ struct conv_host_proxy_config
 
 	//! The GPU lane; NULL = CPU memory only.
 	const struct conv_host_proxy_gpu_ops *gpu;
+
+	/*! The host's provenance-gate mode (ADR-054 N4b): CONV_HOST_TRUST_INHERIT (0,
+	 *  the default: nothing is passed, the host applies the platform policy) or
+	 *  CONV_HOST_TRUST_AUDIT / _ENFORCE, passed as CONV_HOST_ARG_TRUST_ENFORCE. A
+	 *  parent sets AUDIT only when it holds that override in-process itself
+	 *  (test harnesses with unsigned build-tree providers under elevation). */
+	uint32_t trust_enforce;
 
 	//! Extra host arguments (tests: a scripted host); appended after the standard ones.
 	const char *const *extra_args;
