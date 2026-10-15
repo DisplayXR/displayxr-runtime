@@ -41,7 +41,7 @@ ipc_call_conv_enum_task(struct ipc_connection *ipc_c,
 }
 
 xrt_result_t
-ipc_call_conv_warm(struct ipc_connection *ipc_c, const struct xrt_conv_wire_task_request *request)
+ipc_call_conv_request_warm(struct ipc_connection *ipc_c, const struct xrt_conv_wire_task_request *request)
 {
 	(void)ipc_c;
 	(void)request;
