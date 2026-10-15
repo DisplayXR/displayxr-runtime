@@ -365,6 +365,12 @@ RenderLiftStill(int32_t rx, int32_t ry, int32_t rw, int32_t rh)
 }
 
 // ---- Win32 window -----------------------------------------------------------
+// The class is registered with RegisterClassExW, so this is a UNICODE window and
+// every Win32 call that touches its messages must be the explicit W variant: this
+// file does not define UNICODE, so bare DefWindowProc is DefWindowProcA, which
+// reads WM_NCCREATE's UTF-16 title as ANSI and stores the one-char title "D". The
+// service names a slotted client after its window title, so every per-client log
+// line then said 'D' instead of the app (#2101).
 static LRESULT CALLBACK
 WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -400,8 +406,8 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 				return TRUE;
 			}
 		}
-		return DefWindowProc(hwnd, msg, wParam, lParam);
-	default: return DefWindowProc(hwnd, msg, wParam, lParam);
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
+	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 }
 
@@ -1417,9 +1423,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	LOG_INFO("Waiting for session to start...");
 	for (int i = 0; i < 2000 && !xr.sessionRunning && !g_quit; i++) {
 		MSG msg;
-		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			DispatchMessageW(&msg);
 		}
 		PollEvents(xr);
 		Sleep(2);
@@ -1520,9 +1526,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	LOG_INFO("Entering weave loop (ESC / close to quit)...");
 	while (!g_quit && !xr.exitRequested) {
 		MSG msg;
-		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			DispatchMessageW(&msg);
 		}
 		PollEvents(xr);
 
