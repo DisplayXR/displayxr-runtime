@@ -884,6 +884,20 @@ struct xrt_plugin_stereo_camera_info
 	float max_frame_rate;
 	//! @ref xrt_plugin_stereo_camera_format the plug-in decodes to.
 	uint32_t native_format;
+
+	/*
+	 * Appended (#1961), gated by @ref struct_size: write it only when
+	 * struct_size covers it. Announced by
+	 * @ref XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID.
+	 */
+
+	/*!
+	 * The screen this camera belongs to: the @ref
+	 * xrt_display_descriptor::monitor_id of the display it is built into or
+	 * mounted on, as this plug-in claimed it. 0 = unknown or not attached to
+	 * a display. Apps see it as XrStereoCameraDisplayDXR::displayId.
+	 */
+	uint64_t monitor_id;
 };
 
 /*!
@@ -1748,6 +1762,13 @@ xrt_plugin_iface_has_describe_settings(const struct xrt_plugin_iface *iface)
  * #ifdef-guard filling them.
  */
 #define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1
+
+/*!
+ * Defined when @ref xrt_plugin_stereo_camera_info carries @ref
+ * xrt_plugin_stereo_camera_info::monitor_id (#1961), so a plug-in built
+ * against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID 1
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

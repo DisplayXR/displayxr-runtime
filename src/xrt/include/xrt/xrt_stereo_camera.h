@@ -106,6 +106,7 @@ struct xrt_stereo_camera_properties
 	uint32_t source;               //!< enum xrt_stereo_camera_source (was reserved; same wire size)
 	uint64_t supported_formats;    //!< XRT_STEREO_CAMERA_BIT(format)
 	uint64_t supported_transports; //!< XRT_STEREO_CAMERA_BIT(transport)
+	uint64_t display_id;           //!< xrt_screen::id of the camera's screen, 0 = unknown (#1961)
 };
 
 struct xrt_stereo_camera_intrinsics

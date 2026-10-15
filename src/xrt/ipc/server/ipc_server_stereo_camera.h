@@ -88,6 +88,15 @@ ipc_server_stereo_camera_destroy(struct ipc_server_stereo_camera **mgr_ptr);
 bool
 ipc_server_stereo_camera_rescan(struct ipc_server_stereo_camera *mgr);
 
+/*!
+ * #1961: the display topology moved (a screen appeared or went, or the active
+ * plug-in changed). Wake the background re-enumeration now instead of at its
+ * next ~2 s tick, so a display's camera and its screen association follow a
+ * hotplug promptly. Never blocks; does nothing while no connection listens.
+ */
+void
+ipc_server_stereo_camera_rescan_soon(struct ipc_server_stereo_camera *mgr);
+
 //! Destroy every stream @p ics created. Called once at client teardown.
 void
 ipc_server_client_stereo_camera_release(volatile struct ipc_client_state *ics);

@@ -66,6 +66,10 @@ scm_stream_destroy(struct scm_fixture *f, uint64_t id);
 void
 scm_fake_plugin_set(const char *const *identities, const char *const *names, uint32_t count);
 
+//! Spec v5: the screen (monitor_id) each listed camera reports; reset to 0 by scm_fake_plugin_set.
+void
+scm_fake_plugin_set_monitors(const uint64_t *monitor_ids, uint32_t count);
+
 uint32_t
 scm_fake_plugin_enumerate_calls(void);
 

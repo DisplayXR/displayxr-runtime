@@ -68,6 +68,10 @@
  * XrEventDataStereoCamerasChangedDXR is now delivered to every instance that
  * enumerated, whenever the set or a camera's displayName / platformDeviceHint
  * changes.
+ * 5 = XrStereoCameraDisplayDXR, chained on XrStereoCameraPropertiesDXR::next:
+ * the XrDisplayDXR::displayId of the screen a camera belongs to (0 = not
+ * known). A change of it is reported like a displayName change. Nothing in
+ * XrStereoCameraPropertiesDXR changes size.
  */
 #ifndef XR_DXR_STEREO_CAMERA_H
 #define XR_DXR_STEREO_CAMERA_H 1
@@ -80,7 +84,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_stereo_camera 1
-#define XR_DXR_stereo_camera_SPEC_VERSION 4
+#define XR_DXR_stereo_camera_SPEC_VERSION 5
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -117,6 +121,9 @@ extern "C" {
 //! ERROR: this stream was ended by the service (see the STREAM_ENDED event);
 //! destroy it and create a new one.
 #define XR_ERROR_STEREO_CAMERA_STREAM_ENDED_DXR             ((XrResult)-1004999316)
+// Spec v5 (#1961) — appended.
+//! Chain on XrStereoCameraPropertiesDXR::next: which display the camera belongs to.
+#define XR_TYPE_STEREO_CAMERA_DISPLAY_DXR                   ((XrStructureType)1004999317)
 
 //! Size of XrStereoCameraPropertiesDXR::persistentId, NUL included.
 #define XR_STEREO_CAMERA_PERSISTENT_ID_MAX_SIZE_DXR 64
@@ -236,6 +243,22 @@ typedef struct XrStereoCameraPropertiesDXR {
     XrStereoCameraFormatFlagsDXR supportedFormats;
     XrStereoCameraTransportFlagsDXR supportedTransports;
 } XrStereoCameraPropertiesDXR;
+
+/*!
+ * Spec v5: chain on XrStereoCameraPropertiesDXR::next to learn which display a
+ * camera is built into or mounted on, e.g. to offer "the camera on this screen"
+ * or to group cameras per screen. Filled by xrEnumerateStereoCamerasDXR; a
+ * runtime older than v5 leaves it untouched, so set displayId to 0 first.
+ */
+typedef struct XrStereoCameraDisplayDXR {
+    XrStructureType type; //!< XR_TYPE_STEREO_CAMERA_DISPLAY_DXR
+    void* XR_MAY_ALIAS next;
+    //! The XrDisplayDXR::displayId (XR_DXR_display_info v22) of that display,
+    //! or 0 when it is not known or the camera belongs to no display (e.g. a
+    //! plain stereo webcam). Re-enumerate after a topology change, as for
+    //! xrEnumerateDisplaysDXR.
+    uint64_t displayId;
+} XrStereoCameraDisplayDXR;
 
 typedef struct XrStereoCameraIntrinsicsDXR {
     //! The image these numbers describe (per eye).
