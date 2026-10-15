@@ -24,7 +24,9 @@
  * libXcursor, GIO (GSettings) and libX11 (Xft.dpi) are all dlopen()ed: none of
  * them becomes a dependency of the .deb (package_deb_linux.sh's STABLE_SONAMES),
  * and without them the look stays the classic arrow. A loaded image is cached by
- * backing scale; a scale that failed is not retried every frame.
+ * backing scale; a scale that failed is not retried every frame. The
+ * process-wide state (the libXcursor entry points, the theme, the failed scale,
+ * the backing scale) is guarded: two compositors can load the look at once.
  *
  * Backing scale: a compositor that knows the scale of the monitor its window is
  * on passes it (vk_native on native Wayland, through the window-geometry GNOME
@@ -39,6 +41,7 @@
 
 #include <dlfcn.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +80,10 @@ struct xcursor_image
 typedef struct xcursor_image *(*pfn_xcursor_library_load_image)(const char *library, const char *theme, int size);
 typedef void (*pfn_xcursor_image_destroy)(struct xcursor_image *image);
 
+//! Guards the libXcursor entry points, the theme, the failed scale and the one-time notice.
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+
+//! Called under s_lock.
 static struct
 {
 	bool tried;
@@ -182,6 +189,7 @@ gsettings_cursor(char *theme, size_t theme_size, int *size)
 }
 
 //! The cursor theme ("" = libXcursor's default) and size in OS points, read once.
+//! Called under s_lock.
 static void
 cursor_theme(const char **out_theme, int *out_size)
 {
@@ -217,13 +225,10 @@ cursor_theme(const char **out_theme, int *out_size)
 //! Marks a look that holds the theme image (comp_cursor_look::os_cursor): nothing to release.
 static char s_theme_marker;
 
-bool
-comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale)
+//! Loads the theme image into @p look at @p scale. Called under s_lock.
+static bool
+load_theme_locked(struct comp_cursor_look *look, float scale)
 {
-	const float scale = backing_scale > 0.0f ? backing_scale : comp_cursor_look_platform_backing_scale();
-	if (look->os_cursor == &s_theme_marker && look->os_scale == scale && look->rgba != NULL) {
-		return true; // loaded at this scale: the common case
-	}
 	static float failed_scale = -1.0f;
 	if (scale == failed_scale || !xcursor_available()) {
 		return false; // not retried every frame
@@ -248,9 +253,12 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 			s_xcursor.image_destroy(img);
 		}
 		failed_scale = scale;
-		U_LOG_W("cursor_draw: could not load the cursor theme '%s' left_ptr at %d px - keeping the last shape "
-		        "or the arrow",
-		        theme_arg != NULL ? theme_arg : "default", want_px);
+		// comp_cursor_look_update() keeps the image the look already holds, else draws the arrow.
+		const bool keep_theme = look->os_cursor == &s_theme_marker && look->rgba != NULL;
+		U_LOG_W("cursor_draw: could not load the cursor theme '%s' left_ptr at %d px - %s",
+		        theme_arg != NULL ? theme_arg : "default", want_px,
+		        keep_theme ? "keeping the theme image loaded for an earlier scale"
+		                   : "the default look is the classic arrow");
 		return false;
 	}
 	u_cursor_draw_from_argb32(img->pixels, img->width * img->height, rgba);
@@ -283,6 +291,19 @@ comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_sc
 	return true;
 }
 
+bool
+comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale)
+{
+	const float scale = backing_scale > 0.0f ? backing_scale : comp_cursor_look_platform_backing_scale();
+	if (look->os_cursor == &s_theme_marker && look->os_scale == scale && look->rgba != NULL) {
+		return true; // loaded at this scale: the common case
+	}
+	pthread_mutex_lock(&s_lock);
+	const bool ok = load_theme_locked(look, scale);
+	pthread_mutex_unlock(&s_lock);
+	return ok;
+}
+
 void
 comp_cursor_look_platform_release(void *os_cursor)
 {
@@ -293,13 +314,13 @@ typedef void *(*pfn_x_open_display)(const char *name);
 typedef char *(*pfn_x_resource_manager_string)(void *display);
 typedef int (*pfn_x_close_display)(void *display);
 
-float
-comp_cursor_look_platform_backing_scale(void)
+//! Xft.dpi / 96, read once (comp_cursor_look_platform_backing_scale()).
+static float s_backing_scale = 1.0f;
+static pthread_once_t s_backing_scale_once = PTHREAD_ONCE_INIT;
+
+static void
+read_backing_scale(void)
 {
-	static float cached = 0.0f;
-	if (cached > 0.0f) {
-		return cached;
-	}
 	float scale = 1.0f;
 	void *x11 = getenv("DISPLAY") != NULL ? dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL) : NULL;
 	if (x11 != NULL) {
@@ -319,6 +340,12 @@ comp_cursor_look_platform_backing_scale(void)
 		}
 		// libX11 stays loaded: other code in the process may hold it too.
 	}
-	cached = scale;
-	return cached;
+	s_backing_scale = scale;
+}
+
+float
+comp_cursor_look_platform_backing_scale(void)
+{
+	pthread_once(&s_backing_scale_once, read_backing_scale);
+	return s_backing_scale;
 }
