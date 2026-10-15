@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/displayxr-versions.json",
-  "runtime":     "v2.44.6",
+  "runtime":     "v2.44.7",
   "shell":       "v2.4.1",
   "leia_plugin": "v2.15.9",
   "mcp_tools":   "v0.5.4",
