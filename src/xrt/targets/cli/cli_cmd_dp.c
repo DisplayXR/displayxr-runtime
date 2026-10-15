@@ -25,6 +25,17 @@
  *   Every write asks the running service to re-probe (#2051): a secondary
  *   screen's segment DP follows now, the primary screen and in-process apps
  *   at their next session (no live swap, plugin-discovery.md §4.2).
+ *   dp options <id> [--json]
+ *                      The plug-in's settings: declared (describe_settings /
+ *                      manifest settings_schema) + stored, with the effective
+ *                      value and its source (N3c, ADR-054 decision 7).
+ *   dp set <id> <KEY> <value> [--machine] / dp unset <id> <KEY> [--machine]
+ *                      `Settings\<KEY>` on the plug-in's row: HKCU by default,
+ *                      HKLM with --machine (POSIX: the per-user
+ *                      `<id>.settings.json`). DXR_DP_<ID>_<KEY> in the hosting
+ *                      process's environment always wins. The plug-in reads
+ *                      through the host iface at init, so a write applies to
+ *                      the next session / service start.
  *
  *   dp use <id> --screen <key> [--machine]
  *   dp reset --screen <key>|all [--machine]
@@ -60,6 +71,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_component_options.h"
 #include "cli_dp_predict.h"
 #include "cli_ipc.h"
 
@@ -440,6 +452,29 @@ plugin_registered(const char *id);
 //! write made without the CLI); says when the change applies otherwise.
 static void
 poke_service(void);
+//! A plug-in reads its settings at init through the host iface (N3c): same pickup rule as above.
+static void
+note_settings_pickup(void)
+{
+	P("The plug-in reads its settings at init through the host iface — a running service /\n");
+	P("session keeps what it read; restart the DisplayXR service (or launch a fresh app).\n");
+}
+
+//! The options | set | unset verbs over the display-processor class (shared logic, cli_component_options.c).
+static int
+cmd_options_verbs(int argc, const char **argv)
+{
+	const struct cli_component_class k = {
+	    .verb = "dp",
+	    .noun = "display processor",
+	    .cls = target_plugin_component_class(),
+	    .registered = plugin_registered,
+	    .describe = target_plugin_describe_settings,
+	    .note_pickup = note_settings_pickup,
+	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>.json in the DisplayProcessors dir)",
+	};
+	return cli_component_options_dispatch(&k, argc, argv);
+}
 
 static int
 cmd_enable(const char *id, bool enable, bool machine)
@@ -670,6 +705,8 @@ print_usage(void)
 	P("  use <id> [--machine]          Global PreferredPlugin override (e.g. 'sim-display', 'leia-sr'): tried\n");
 	P("                                first, ahead of ProbeOrder (per user; --machine = HKLM).\n");
 	P("  reset [--machine]             Clear the global override (restore normal ProbeOrder discovery).\n");
+	cli_component_options_usage(&(const struct cli_component_class){
+	    .verb = "dp", .noun = "display processor", .cls = target_plugin_component_class()});
 	P("  use <id> --screen <key>       Weave the screen <key> (from 'dp list') with <id>; per-user, no admin.\n");
 	P("  reset --screen <key>|all      Clear one / every per-screen preference.\n");
 	P("    --machine                   With --screen: the machine-wide store (HKLM, admin) instead.\n");
@@ -715,6 +752,10 @@ cli_cmd_dp(int argc, const char **argv)
 	}
 	if (strcmp(verb, "reset") == 0) {
 		return screen != NULL ? cmd_reset_screen(screen, machine) : cmd_reset(machine);
+	}
+	const int rc = cmd_options_verbs(argc, argv); // options | set | unset (N3c)
+	if (rc >= 0) {
+		return rc;
 	}
 	P("error: unknown 'dp' subcommand '%s'.\n\n", verb);
 	return print_usage();

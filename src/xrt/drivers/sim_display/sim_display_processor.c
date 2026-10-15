@@ -15,6 +15,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 
@@ -31,7 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 
 /*!
  * Audit the weave target against the declared panel (#817).
@@ -53,7 +55,7 @@ DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 
  * vendor hardware present. Off by default — purely diagnostic, never changes
  * what is rendered.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL", false)
+#define debug_get_bool_option_sim_display_strict_panel() sim_display_setting_on("STRICT_PANEL")
 
 /*!
  * #817 — stripe width, in panel pixels, for SIM_DISPLAY_OUTPUT=interlaced.
@@ -64,7 +66,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL",
  * widens the stripes so a human can see the pattern (and the phase shift when
  * the window moves) at a glance, at the cost of some of that sensitivity.
  */
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period, "SIM_DISPLAY_INTERLACE_PERIOD", 1)
+#define debug_get_num_option_sim_display_interlace_period() sim_display_setting_num("INTERLACE_PERIOD", 1)
 
 /*!
  * Fake switchable lens (test double for the hardware 2D/3D channel).
@@ -79,7 +81,7 @@ DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period, "SIM_DISPLAY_INTERLACE_P
  * records the requested state, logs one WARN per transition and reports it back,
  * like a vendor lens would. Off by default, so default behaviour is unchanged.
  */
-DEBUG_GET_ONCE_BOOL_OPTION(sim_display_fake_lens, "SIM_DISPLAY_FAKE_LENS", false)
+#define debug_get_bool_option_sim_display_fake_lens() sim_display_setting_on("LENS")
 
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "sim_display/shaders/fullscreen.vert.h"

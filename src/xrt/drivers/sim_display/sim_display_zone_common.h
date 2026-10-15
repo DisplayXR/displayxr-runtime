@@ -38,6 +38,7 @@
 #include "util/u_logging.h"
 
 #include "sim_display_interface.h" // sim_display_get_panel_metrics (#856), enum sim_display_output_mode (#842)
+#include "sim_display_settings.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,8 +77,9 @@ sim_zone_config_from_env(struct sim_zone_config *cfg, const char *variant)
 	cfg->dump = false;
 	cfg->quantize = SIM_ZONE_QUANTIZE_OFF;
 
-	const char *grid_env = getenv("SIM_DISPLAY_ZONE_GRID");
-	if (grid_env != NULL && grid_env[0] != '\0') {
+	// Through the host iface (N3c, sim_display_settings.h: ZONE_GRID, ZONE_DUMP, WISH_QUANTIZE).
+	char grid_env[32];
+	if (sim_display_setting("ZONE_GRID", grid_env, sizeof(grid_env))) {
 		unsigned gw = 0;
 		unsigned gh = 0;
 		if (sscanf(grid_env, "%ux%u", &gw, &gh) == 2 && gw >= 1 && gh >= 1 && gw <= SIM_ZONE_MAX_CELLS &&
@@ -85,23 +87,22 @@ sim_zone_config_from_env(struct sim_zone_config *cfg, const char *variant)
 			cfg->grid_w = gw;
 			cfg->grid_h = gh;
 		} else {
-			U_LOG_W("sim_display %s: bad SIM_DISPLAY_ZONE_GRID '%s' (want WxH, 1..%d cells) — using 1x1",
-			        variant, grid_env, SIM_ZONE_MAX_CELLS);
+			U_LOG_W("sim_display %s: bad ZONE_GRID '%s' (want WxH, 1..%d cells) — using 1x1", variant,
+			        grid_env, SIM_ZONE_MAX_CELLS);
 		}
 	}
 
-	const char *dump_env = getenv("SIM_DISPLAY_ZONE_DUMP");
-	cfg->dump = (dump_env != NULL && dump_env[0] != '\0' && dump_env[0] != '0');
+	cfg->dump = sim_display_setting_on("ZONE_DUMP");
 
-	const char *q_env = getenv("SIM_DISPLAY_WISH_QUANTIZE");
-	if (q_env != NULL && q_env[0] != '\0') {
+	char q_env[16];
+	if (sim_display_setting("WISH_QUANTIZE", q_env, sizeof(q_env))) {
 		if (strcmp(q_env, "band") == 0) {
 			cfg->quantize = SIM_ZONE_QUANTIZE_BAND;
 		} else if (strcmp(q_env, "cell") == 0) {
 			cfg->quantize = SIM_ZONE_QUANTIZE_CELL;
 		} else if (strcmp(q_env, "off") != 0) {
-			U_LOG_W("sim_display %s: bad SIM_DISPLAY_WISH_QUANTIZE '%s' (want off|band|cell) — using off",
-			        variant, q_env);
+			U_LOG_W("sim_display %s: bad WISH_QUANTIZE '%s' (want off|band|cell) — using off", variant,
+			        q_env);
 		}
 	}
 }

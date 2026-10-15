@@ -14,6 +14,7 @@
  */
 
 #include "sim_display_stereo_camera.h"
+#include "sim_display_settings.h"
 #include "sim_display_stereo_camera_pattern.h"
 
 #include "os/os_time.h"
@@ -72,52 +73,48 @@ fake_config(void)
 		return &cfg;
 	}
 	read = true;
-	const char *e = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA");
-	cfg.enabled = e != NULL && e[0] != '\0' && e[0] != '0';
+	// Every knob through the host iface (N3c, sim_display_settings.h: `dp set
+	// sim-display STEREO_CAMERA* ...`; the SIM_DISPLAY_FAKE_STEREO_CAMERA*
+	// names stay aliases for one release).
+	char sz[32], fps[32], bl[32], afps[32], fmt[16], sp[32], edy[32], eds[32];
+	cfg.enabled = sim_display_setting_on("STEREO_CAMERA");
 	cfg.eye_w = 640;
 	cfg.eye_h = 480;
 	cfg.fps = 30.0f;
 	cfg.format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
-	const char *sz = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_SIZE");
 	unsigned w = 0, h = 0;
-	if (sz != NULL && sscanf(sz, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 4096 && h <= 4096) {
+	if (sim_display_setting("STEREO_CAMERA_SIZE", sz, sizeof(sz)) && sscanf(sz, "%ux%u", &w, &h) == 2 && w >= 64 &&
+	    h >= 64 && w <= 4096 && h <= 4096) {
 		cfg.eye_w = w & ~1u; // NV12 needs even extents
 		cfg.eye_h = h & ~1u;
 	}
-	const char *fps = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_FPS");
-	if (fps != NULL && atof(fps) >= 1.0 && atof(fps) <= 240.0) {
+	if (sim_display_setting("STEREO_CAMERA_FPS", fps, sizeof(fps)) && atof(fps) >= 1.0 && atof(fps) <= 240.0) {
 		cfg.fps = (float)atof(fps);
 	}
 	cfg.advertised_fps = cfg.fps;
 	cfg.baseline_mm = FAKE_BASELINE_MM;
-	const char *bl = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_BASELINE_MM");
-	if (bl != NULL && atof(bl) >= 10.0 && atof(bl) <= 300.0) {
+	if (sim_display_setting("STEREO_CAMERA_BASELINE_MM", bl, sizeof(bl)) && atof(bl) >= 10.0 && atof(bl) <= 300.0) {
 		cfg.baseline_mm = atof(bl);
 	}
-	const char *afps = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_ADVERTISED_FPS");
-	if (afps != NULL && afps[0] != '\0' && atof(afps) >= 0.0 && atof(afps) <= 240.0) {
+	if (sim_display_setting("STEREO_CAMERA_ADVERTISED_FPS", afps, sizeof(afps)) && atof(afps) >= 0.0 &&
+	    atof(afps) <= 240.0) {
 		cfg.advertised_fps = (float)atof(afps);
 	}
-	const char *fmt = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_FORMAT");
-	if (fmt != NULL) {
+	if (sim_display_setting("STEREO_CAMERA_FORMAT", fmt, sizeof(fmt))) {
 		if (strcmp(fmt, "nv12") == 0) {
 			cfg.format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
 		} else if (strcmp(fmt, "bgra") == 0 || strcmp(fmt, "bgra8") == 0) {
 			cfg.format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8;
 		}
 	}
-	const char *sp = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_SUSPEND_PERIOD_MS");
-	if (sp != NULL && atol(sp) > 0) {
+	if (sim_display_setting("STEREO_CAMERA_SUSPEND_PERIOD_MS", sp, sizeof(sp)) && atol(sp) > 0) {
 		cfg.suspend_period_ns = (int64_t)atol(sp) * 1000000;
 	}
-	const char *dist = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT");
-	cfg.distort = dist != NULL && dist[0] != '\0' && dist[0] != '0';
-	const char *edy = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY");
-	if (edy != NULL && fabs(atof(edy)) <= 20.0) {
+	cfg.distort = sim_display_setting_on("STEREO_CAMERA_DISTORT");
+	if (sim_display_setting("STEREO_CAMERA_DY", edy, sizeof(edy)) && fabs(atof(edy)) <= 20.0) {
 		cfg.extra_dy_px = atof(edy);
 	}
-	const char *eds = getenv("SIM_DISPLAY_FAKE_STEREO_CAMERA_DY_SLOPE");
-	if (eds != NULL && fabs(atof(eds)) <= 5.0) {
+	if (sim_display_setting("STEREO_CAMERA_DY_SLOPE", eds, sizeof(eds)) && fabs(atof(eds)) <= 5.0) {
 		cfg.extra_dy_slope_100 = atof(eds);
 	}
 	if (cfg.enabled) {

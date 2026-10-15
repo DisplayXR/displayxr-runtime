@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 
@@ -29,14 +30,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_metal, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_metal() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 // ADR-050 test double: a phase lattice for the runtime-owned macOS placement.
 // 0 (default) = the snap_window_rect slot stays NULL, like any DP without a
 // lens lattice. N > 1 = snap horizontal displacement to whole multiples of N
 // backing px (the shape of the VK test double), so the runtime's snapped
 // drag, the L/T resize's size absorption and the Retina reachable-lattice
 // search can be exercised without hardware.
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_metal_snap_period, "SIM_DISPLAY_METAL_SNAP_PERIOD", 0)
+#define debug_get_num_option_sim_display_metal_snap_period() sim_display_setting_num("METAL_SNAP_PERIOD", 0)
 
 
 /*

@@ -29,20 +29,22 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h> // getenv
 #include <string.h>
 
 #include "xrt/xrt_display_scanout.h"
 #include "util/u_logging.h"
 
+#include "sim_display_settings.h"
+
 /*!
- * Parse `SIM_DISPLAY_WEAVE_SCOPE`. Unset or unrecognised ⟹ canvas.
+ * Parse the `WEAVE_SCOPE` setting (host iface, N3c; was the
+ * `SIM_DISPLAY_WEAVE_SCOPE` env var). Unset or unrecognised ⟹ canvas.
  */
 static inline enum xrt_dp_weave_scope
 sim_scanout_scope_from_env(void)
 {
-	const char *v = getenv("SIM_DISPLAY_WEAVE_SCOPE");
-	if (v == NULL) {
+	char v[16];
+	if (!sim_display_setting("WEAVE_SCOPE", v, sizeof(v))) {
 		return XRT_DP_WEAVE_SCOPE_CANVAS;
 	}
 	if (strcmp(v, "region") == 0) {
@@ -52,7 +54,7 @@ sim_scanout_scope_from_env(void)
 		return XRT_DP_WEAVE_SCOPE_SCANOUT;
 	}
 	if (strcmp(v, "canvas") != 0) {
-		U_LOG_W("sim_display: SIM_DISPLAY_WEAVE_SCOPE='%s' unrecognised — using canvas", v);
+		U_LOG_W("sim_display: WEAVE_SCOPE='%s' unrecognised — using canvas", v);
 	}
 	return XRT_DP_WEAVE_SCOPE_CANVAS;
 }

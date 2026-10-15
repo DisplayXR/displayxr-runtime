@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 
@@ -37,11 +38,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_gl, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_gl() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 
 //! #817: interlace stripe width in panel pixels (see the VK processor for why
 //! 1 is the default). Clamped to >= 1 at upload.
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period_gl, "SIM_DISPLAY_INTERLACE_PERIOD", 1)
+#define debug_get_num_option_sim_display_interlace_period_gl() sim_display_setting_num("INTERLACE_PERIOD", 1)
 
 
 /*

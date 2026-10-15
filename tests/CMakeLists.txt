@@ -1237,10 +1237,13 @@ if(TARGET tests_conv_gpu_dedupe)
 endif()
 if(TARGET tests_lift_dp_golden)
 	# The sim_display fake lift + the synthesis it shares with the sim provider,
-	# compiled straight in (the plug-in DLL is not linkable).
+	# compiled straight in (the plug-in DLL is not linkable). The fake lift
+	# reads its knobs through the settings shim (N3c), so that comes along;
+	# unbound (no host) it answers from the env aliases, as before.
 	target_sources(
 		tests_lift_dp_golden
 		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_lift_d3d11.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_settings.c
 			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.c
 			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.cpp
 			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c

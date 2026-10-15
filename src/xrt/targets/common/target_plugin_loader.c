@@ -1381,6 +1381,19 @@ dp_platform_prepare_discovery(void)
  * call; a DP is not allowed to retain it past negotiate (unlike input
  * providers), so a local is fine.
  */
+/*!
+ * The one options contract's read slot (N3c): a plug-in's per-component
+ * settings through the shared store — `DXR_DP_<ID>_<KEY>` in this process's
+ * environment, the per-user overlay, the row's `Settings\*` / manifest
+ * `settings`. Never the plug-in's own getenv. Lives in the runtime for the
+ * process lifetime, so a plug-in may copy the pointer at negotiate.
+ */
+static bool
+dp_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_size)
+{
+	return target_component_get_setting(&g_dp_class, id, key, buf, buf_size, NULL);
+}
+
 static void
 dp_fill_host_iface(struct xrt_plugin_host_iface *host)
 {
@@ -1389,6 +1402,8 @@ dp_fill_host_iface(struct xrt_plugin_host_iface *host)
 	host->host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
 	host->request_display_rescan = target_display_hotplug_plugin_request;
+	// ADR-054 decision 7 (N3c): the plug-in's settings come through here.
+	host->get_setting = dp_host_get_setting;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
@@ -1402,6 +1417,60 @@ dp_fill_host_iface(struct xrt_plugin_host_iface *host)
 	host->get_android_class_host_context = plugin_host_get_android_class_host_context;
 	host->android_package_is_visible = plugin_host_android_package_is_visible;
 #endif
+}
+
+const struct target_component_class *
+target_plugin_component_class(void)
+{
+	return &g_dp_class;
+}
+
+int
+target_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max)
+{
+	if (id == NULL || id[0] == '\0' || out == NULL || max <= 0) {
+		return 0;
+	}
+	// The manifest's schema first (POSIX), then whatever the binary declares.
+	int n = target_component_manifest_settings_schema(&g_dp_class, id, out, max);
+
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return n;
+	}
+	const int count = target_component_enumerate(&g_dp_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// Negotiate only (no probe, no instance): a disabled or declining
+		// plug-in still declares its settings — that is how one finds the
+		// key to enable it. Quiet: this is a lister, not the discovery scan.
+		void *module = NULL;
+		void *fn = NULL;
+		if (target_component_load_binary_ex(&g_dp_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module, &fn,
+		                                    NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_plugin_host_iface host;
+		dp_fill_host_iface(&host);
+		struct xrt_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret =
+		    ((xrt_plugin_negotiate_fn_t)fn)(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+		if (target_component_abi_gate(&g_dp_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		        TARGET_COMPONENT_ABI_OK &&
+		    xrt_plugin_iface_has_describe_settings(iface)) {
+			const struct xrt_component_setting_desc *descs = NULL;
+			const uint32_t nd = iface->describe_settings(&descs);
+			n = target_component_merge_setting_descs(out, n, max, descs, nd);
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return n;
 }
 
 /*!

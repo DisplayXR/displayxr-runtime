@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_monitor_geometry.h"
 
 #include "xrt/xrt_compiler.h"
@@ -143,14 +144,11 @@ sim_display_get_view_count(void)
 bool
 sim_display_fake_tracking_enabled(void)
 {
-	// Dev-only override (#441) — product gates live in the registry, but
-	// this is a test harness knob, so an env var is the right shape.
-	static int cached = -1;
-	if (cached < 0) {
-		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING");
-		cached = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-	}
-	return cached == 1;
+	// Dev-only knob (#441), read through the host iface since N3c
+	// (`dp set sim-display TRACKING 1`, or DXR_DP_SIM_DISPLAY_TRACKING=1 in
+	// the hosting process; SIM_DISPLAY_FAKE_TRACKING stays an alias for one
+	// release). The shim caches it per process.
+	return sim_display_setting_on("TRACKING");
 }
 
 bool
@@ -171,8 +169,7 @@ sim_display_fake_tracking_sample(uint64_t *out_edges)
 
 	static int64_t period_ms = -1;
 	if (period_ms < 0) {
-		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS");
-		period_ms = (e != NULL) ? atol(e) : 0;
+		period_ms = (int64_t)sim_display_setting_num("TRACKING_PERIOD_MS", 0);
 		if (period_ms < 0) {
 			period_ms = 0;
 		}
@@ -204,19 +201,25 @@ sim_display_set_view_count(uint32_t count)
  *
  */
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_width_m, "SIM_DISPLAY_WIDTH_M", 0.344f)
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_height_m, "SIM_DISPLAY_HEIGHT_M", 0.194f)
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_w, "SIM_DISPLAY_PIXEL_W", 1920)
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_h, "SIM_DISPLAY_PIXEL_H", 1080)
+/*
+ * Every knob below is read through the host iface (N3c, `sim_display_settings.h`:
+ * `dp set sim-display <KEY> <value>` / DXR_DP_SIM_DISPLAY_<KEY>; the former
+ * SIM_DISPLAY_<KEY> environment names stay aliases for one release), cached
+ * per process exactly like the DEBUG_GET_ONCE options they replaced.
+ */
+#define debug_get_float_option_sim_display_width_m() sim_display_setting_float("WIDTH_M", 0.344f)
+#define debug_get_float_option_sim_display_height_m() sim_display_setting_float("HEIGHT_M", 0.194f)
+#define debug_get_float_option_sim_display_nominal_z_m() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
+#define debug_get_num_option_sim_display_pixel_w() sim_display_setting_num("PIXEL_W", 1920)
+#define debug_get_num_option_sim_display_pixel_h() sim_display_setting_num("PIXEL_H", 1080)
 //! Dev/test knob: pin the active rendering mode to an explicit unified index —
 //! 0=2D, 1=Anaglyph, 2=Cropped SBS, 3=Squeezed SBS, 4=Quad — overriding the
-//! SIM_DISPLAY_OUTPUT-derived default AND every later mode request (see the
-//! guard in sim_display_hmd_set_property). -1 (unset) = normal behaviour. This
-//! is plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
+//! OUTPUT-derived default AND every later mode request (see the guard in
+//! sim_display_hmd_set_property). -1 (unset) = normal behaviour. This is
+//! plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
 //! e.g. a zones app can be forced to 4-view Quad for atlas inspection despite
 //! the session-begin/zone reconciliation that would otherwise select 2 views.
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_force_mode, "SIM_DISPLAY_FORCE_MODE", -1)
+#define debug_get_num_option_sim_display_force_mode() sim_display_setting_num("FORCE_MODE", -1)
 
 
 /*
@@ -554,10 +557,11 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 struct xrt_device *
 sim_display_hmd_create(void)
 {
-	// Parse output mode from env var early so it's available when
+	// Parse the OUTPUT setting early so it's available when
 	// target_instance.c queries sim_display_get_output_mode() for scale values.
 	{
-		const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+		char mode_buf[32];
+		const char *mode_str = sim_display_setting("OUTPUT", mode_buf, sizeof(mode_buf)) ? mode_buf : NULL;
 		if (mode_str) {
 			if (strcmp(mode_str, "sbs") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
@@ -628,10 +632,10 @@ sim_display_hmd_create(void)
 		dm.dmSize = sizeof(dm);
 		if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth > 0 &&
 		    dm.dmPelsHeight > 0) {
-			if (getenv("SIM_DISPLAY_PIXEL_W") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_W")) {
 				pixel_w = (int)dm.dmPelsWidth;
 			}
-			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_H")) {
 				pixel_h = (int)dm.dmPelsHeight;
 			}
 		}
@@ -654,16 +658,16 @@ sim_display_hmd_create(void)
 		struct sim_display_monitor_geometry geo;
 		if (os_display_edid_enumerate(&mons) && sim_display_pick_monitor_geometry(&mons, &geo)) {
 			const struct os_display_edid_monitor *m = &mons.monitors[geo.index];
-			if (getenv("SIM_DISPLAY_PIXEL_W") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_W")) {
 				pixel_w = (int)geo.pixel_width;
 			}
-			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_H")) {
 				pixel_h = (int)geo.pixel_height;
 			}
-			if (geo.physical_width_mm > 0 && getenv("SIM_DISPLAY_WIDTH_M") == NULL) {
+			if (geo.physical_width_mm > 0 && !sim_display_setting_is_set("WIDTH_M")) {
 				display_w_m = (float)geo.physical_width_mm / 1000.0f;
 			}
-			if (geo.physical_height_mm > 0 && getenv("SIM_DISPLAY_HEIGHT_M") == NULL) {
+			if (geo.physical_height_mm > 0 && !sim_display_setting_is_set("HEIGHT_M")) {
 				display_h_m = (float)geo.physical_height_mm / 1000.0f;
 			}
 			U_LOG_W(

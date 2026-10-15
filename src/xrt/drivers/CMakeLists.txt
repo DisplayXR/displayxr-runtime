@@ -90,6 +90,8 @@ endif()
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_interface.h
+	sim_display/sim_display_settings.c
+	sim_display/sim_display_settings.h
 	sim_display/sim_display_monitor_geometry.c
 	sim_display/sim_display_monitor_geometry.h
 	sim_display/sim_display_zone_common.h

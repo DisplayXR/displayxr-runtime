@@ -35,6 +35,7 @@
 #pragma once
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_display_processor_d3d11.h"
@@ -734,11 +735,39 @@ struct xrt_plugin_host_iface
 	void (*request_display_rescan)(const char *reason);
 
 	/*!
+	 * The one options contract (ADR-054 decision 7, N3c): the plug-in's
+	 * per-component settings, read ONLY through this slot — never `getenv`,
+	 * never an ad-hoc vendor registry key — with `id` = the plug-in's own
+	 * `iface->id`. The runtime resolves `DXR_DP_<ID>_<KEY>` in the hosting
+	 * process's environment, then the per-user store, then the registration
+	 * row's `Settings\<KEY>` / manifest `settings`
+	 * (`xrt/xrt_component_settings.h`; `displayxr-cli dp options|set|unset`).
+	 * The pointer lives in the runtime for the process lifetime, so a plug-in
+	 * may copy it at negotiate time (as for @ref request_display_rescan) and
+	 * read later; read at init and cache, not per frame.
+	 *
+	 * Carved out of the former `reserved[]` block like the slots above:
+	 * `struct_size` is unchanged and an older runtime leaves it zero, so
+	 * plug-ins MUST NULL-check it (and cover-check `struct_size`), and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Announced by
+	 * @ref XRT_PLUGIN_HOST_HAS_GET_SETTING.
+	 */
+	xrt_component_get_setting_fn_t get_setting;
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[9];
+	void *reserved[8];
 };
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::get_setting slot (the one options contract,
+ * ADR-054 decision 7 / N3c), so a plug-in that must also compile against an
+ * older runtime header can `#ifdef`-guard its use.
+ */
+#define XRT_PLUGIN_HOST_HAS_GET_SETTING 1
 
 /*!
  * Defined when this header carries the
@@ -1658,7 +1687,44 @@ struct xrt_plugin_iface
 	                                        void *window_handle,
 	                                        const struct xrt_screen_binding *binding,
 	                                        struct xrt_display_processor_gl **out_xdp);
+
+	/*!
+	 * The settings this plug-in reads through
+	 * @ref xrt_plugin_host_iface::get_setting (ADR-054 decision 7, the one
+	 * options contract), for `displayxr-cli dp options <id>`: key, type,
+	 * default and one line of help per setting
+	 * (`xrt/xrt_component_settings.h`). Pure, callable from any thread,
+	 * with no instance (it is called on a negotiated-only plug-in).
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * declares nothing — the store's keys are still listed. Appended per
+	 * ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_gl_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
+	 */
+	xrt_component_describe_settings_fn_t describe_settings;
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::describe_settings (N3c), so a plug-in built against an
+ * older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::describe_settings (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_describe_settings(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, describe_settings) + sizeof(iface->describe_settings) &&
+	       iface->describe_settings != NULL;
+}
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

@@ -18,6 +18,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "sim_display_settings.h"
 #include "os/os_time.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -29,8 +30,11 @@
 #include <cstring>
 #include <vector>
 
-DEBUG_GET_ONCE_BOOL_OPTION(sim_display_fake_lift, "SIM_DISPLAY_FAKE_LIFT", false)
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_fake_lift_latency_ms, "SIM_DISPLAY_FAKE_LIFT_LATENCY_MS", 8)
+/* Read through the host iface (N3c, sim_display_settings.h): `dp set sim-display
+ * LIFT 1` / DXR_DP_SIM_DISPLAY_LIFT; SIM_DISPLAY_FAKE_LIFT stays an alias for
+ * one release. Cached per process. */
+#define debug_get_bool_option_sim_display_fake_lift() sim_display_setting_on("LIFT")
+#define debug_get_num_option_sim_display_fake_lift_latency_ms() sim_display_setting_num("LIFT_LATENCY_MS", 8)
 
 //! Whole-field struct_size coverage: a caller built against an OLDER header
 //! passes a shorter struct, and the fake writes / reads only what it covers
