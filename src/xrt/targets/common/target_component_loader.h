@@ -360,12 +360,41 @@ target_component_apply_user_overlay(const struct target_component_class *cls,
 #if !defined(_WIN32) && !defined(__ANDROID__)
 /*!
  * The per-user manifest dir — the writable root for per-user overrides
- * (`preferred`, `force_qwerty`, `<id>.settings.json`, ...). False when HOME
- * and XDG are unset.
+ * (`preferred`, `force_qwerty`, `emulated_controllers`, `<id>.settings.json`,
+ * ...). False when HOME and XDG are unset.
  */
 bool
 target_component_user_dir(char *out, size_t cap);
 #endif
+
+/*!
+ * The per-user-over-machine rule for ONE root-policy DWORD, pure so a test
+ * can pin it: the user tier wins when present — unless @p lock (the
+ * machine's `Policy\Lock` = 1), which makes it invisible — else the machine
+ * tier when present, else absent (@p out_value untouched). Returns the
+ * tier: TARGET_COMPONENT_SETTING_USER / MACHINE / ABSENT.
+ */
+uint32_t
+target_component_policy_resolve(bool user_present,
+                                uint32_t user_value,
+                                bool machine_present,
+                                uint32_t machine_value,
+                                bool lock,
+                                uint32_t *out_value);
+
+/*!
+ * ADR-054 N7: read the root-policy DWORD `<registry_root>\Policy\<name>` —
+ * HKCU first (what `displayxr-cli <class> … [no --machine]` writes), then the
+ * HKLM 64-bit view (`--machine`) — through @ref target_component_policy_resolve
+ * with the class's `Policy\Lock`. The `Policy` subkey is reserved by every
+ * class and never read as a component row, so a class gate living there is
+ * covered by the service's policy watch (which watches the class root) for
+ * free. Returns the tier the value came from; ABSENT (and @p out_value
+ * untouched) when neither hive has it — and always ABSENT off Windows, where
+ * class gates are per-user files in @ref target_component_user_dir.
+ */
+uint32_t
+target_component_read_policy_dword(const struct target_component_class *cls, const char *name, uint32_t *out_value);
 
 
 /*

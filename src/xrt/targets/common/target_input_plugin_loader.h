@@ -209,6 +209,36 @@ bool
 target_input_plugin_get_force_qwerty(void);
 
 /*!
+ * ADR-054 N7 (#2143): the `EmulatedControllers` gate — may the qwerty
+ * emulated controller PAIR exist at all? True (the default, absent = 1)
+ * keeps today's floor: the pair is created, sits in the device list and
+ * takes any hand role no provider holds. False: the pair is not published —
+ * no qwerty left/right device, and the arbiter's floor becomes "no hand
+ * roles" (both -1, `xrGetCurrentInteractionProfile` = XR_NULL_PATH) whenever
+ * no provider is present. The qwerty head is NOT gated: it is the
+ * look-around fallback, not a controller.
+ *
+ * Windows: `InputProviders\Policy\EmulatedControllers` (DWORD), HKCU first
+ * (`displayxr-cli input emulated on|off`), then the HKLM 64-bit view
+ * (`--machine`), HKCU ignored under `InputProviders\Policy\Lock` = 1 — the
+ * shared loader's root-policy read, so the service's policy watch and the
+ * N3 overlay rules cover it unchanged. POSIX: an `emulated_controllers` file
+ * in the per-user manifest dir next to `force_qwerty` (first byte '0' = off,
+ * anything else = on); no machine tier. Android: always on.
+ *
+ * @p out_source (may be NULL) receives a static string: "user" / "machine"
+ * (the registry tier), "file" (the POSIX per-user file), or "default"
+ * (nothing set it). Never the environment: this is class policy, not a
+ * component setting, and it is read here — never via `getenv`.
+ *
+ * Orthogonal to ForceQwerty: ForceQwerty = 1 skips the providers,
+ * EmulatedControllers = 0 withholds the pair; both together is a box with no
+ * hand devices at all (the builder logs one WARN naming both).
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source);
+
+/*!
  * Read the `PreferredPlugin` override (N3a, ADR-054 verb `prefer`; the
  * input twin of DP spec §2.1/§3.3): the id of the provider ranked FIRST,
  * ahead of ProbeOrder, for the hand/rig arbitration. Windows: HKCU
@@ -234,8 +264,17 @@ target_input_plugin_get_preferred(char *out, size_t cap);
  * disabled (or unregistered) when this process scanned — the provider set is
  * fixed per process, so enabling one of those still takes a restart, which
  * the log says. Returns the number of candidates whose standing changed.
- * Runs discovery first if nothing did yet; a no-op (0) when no provider is
- * resident. Any thread.
+ * Runs discovery first if nothing did yet. Any thread.
+ *
+ * N7 (#2143): the `EmulatedControllers` gate is re-read too and applied the
+ * same way — as a WITHDRAWAL of the qwerty floor candidate
+ * (@ref t_input_arbiter_set_floor_withdrawn), never as a device add/remove:
+ * a pair created at system build stays resident and is withdrawn (roles go
+ * to -1 when no provider is present) or re-admitted at once; a pair NOT
+ * created at build (the process started with the gate off) cannot appear
+ * until the next start, which the log says. With no provider resident the
+ * arbiter is not installed and the gate, like `Enabled`, applies at the next
+ * start — logged once per process.
  */
 int
 target_input_plugin_reread_policy(void);

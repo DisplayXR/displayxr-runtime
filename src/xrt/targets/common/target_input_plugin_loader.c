@@ -10,7 +10,8 @@
  * class's table row below. What is left here is what only this class knows:
  * the host iface a provider retains (#1380), what `probe()` means, the
  * keep-every-claimer rule (ADR-034 Amendment 3), the scan tally the self-test
- * reads, and the `ForceQwerty` gate.
+ * reads, and the two class gates — `ForceQwerty` (skip the providers) and
+ * `EmulatedControllers` (withhold the qwerty pair, ADR-054 N7).
  *
  * v1 has no refresh path: provider devices are created exactly once at system
  * build, so the DP loader's #342 mid-install refresh problem (factory pointers
@@ -635,7 +636,8 @@ target_input_plugin_get_row_id(int index)
 
 /*
  *
- * The ForceQwerty gate (class-specific; the one platform split left here).
+ * The ForceQwerty + EmulatedControllers gates (class-specific; the one
+ * platform split left here).
  *
  */
 
@@ -652,6 +654,30 @@ target_input_plugin_get_force_qwerty(void)
 	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Input", L"ForceQwerty", RRF_RT_REG_DWORD,
 	                          NULL, &value, &bytes);
 	return rc == ERROR_SUCCESS && value != 0;
+}
+
+/*
+ * N7: `InputProviders\Policy\EmulatedControllers`, HKCU over HKLM under the
+ * class's `Policy\Lock` — the shared loader's root-policy read, so this is
+ * one call and the N3 rules apply unchanged.
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	uint32_t value = 1;
+	const uint32_t tier = target_component_read_policy_dword(&g_input_class, "EmulatedControllers", &value);
+	const char *source = "default";
+	if (tier == TARGET_COMPONENT_SETTING_USER) {
+		source = "user";
+	} else if (tier == TARGET_COMPONENT_SETTING_MACHINE) {
+		source = "machine";
+	} else {
+		value = 1; // absent = on
+	}
+	if (out_source != NULL) {
+		*out_source = source;
+	}
+	return value != 0;
 }
 
 /*
@@ -695,6 +721,15 @@ target_input_plugin_get_force_qwerty(void)
 }
 
 bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	return true; // no per-user store on Android; the pair is always published
+}
+
+bool
 target_input_plugin_get_preferred(char *out, size_t cap)
 {
 	if (out != NULL && cap > 0) {
@@ -725,6 +760,36 @@ target_input_plugin_get_force_qwerty(void)
 	fclose(f);
 	/* Presence forces qwerty; a leading '0' turns the file into a
 	 * no-op so it can be toggled without deleting it. */
+	return c != '0';
+}
+
+/*
+ * N7: the `emulated_controllers` file next to `force_qwerty`, same byte
+ * convention (first byte '0' = off, anything else = on); absent = on. What
+ * `displayxr-cli input emulated on|off` writes. No machine tier on POSIX.
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return true;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/emulated_controllers", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return true;
+	}
+	int c = fgetc(f);
+	fclose(f);
+	if (out_source != NULL) {
+		*out_source = "file";
+	}
 	return c != '0';
 }
 
@@ -876,15 +941,80 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed)
 	}
 }
 
+/*!
+ * N7: the live half of the `EmulatedControllers` gate — withdraw / re-admit
+ * the qwerty floor candidate. The two cases that cannot be applied live are
+ * each said once per process at WARN (the policy is re-read on every store
+ * write of any class), INFO after.
+ */
+static int
+input_reread_emulated_gate(void)
+{
+	const char *source = "default";
+	const bool emulated = target_input_plugin_get_emulated_controllers(&source);
+	bool installed = false;
+	t_input_arbiter_get_status(&installed, NULL);
+	const bool have_floor = t_input_arbiter_has_floor();
+
+	static bool warned_not_installed = false;
+	static bool warned_no_pair = false;
+	if (!installed) {
+		if (!emulated) {
+			// No provider resident -> nothing arbitrates -> the pair created
+			// at build keeps the roles until the next start (the restart rule
+			// `Enabled` has for a provider that was not loaded).
+			if (!warned_not_installed) {
+				warned_not_installed = true;
+				U_LOG_W(
+				    "input plugin loader: EmulatedControllers=0 (%s) but no input provider is "
+				    "resident, "
+				    "so nothing arbitrates the hand roles — the qwerty pair keeps them until the next "
+				    "service start (in-process apps: their next launch).",
+				    source);
+			} else {
+				U_LOG_I("input plugin loader: EmulatedControllers=0 (%s) — applies at the next start.",
+				        source);
+			}
+		}
+		return 0;
+	}
+	if (emulated && !have_floor) {
+		// The process started with the gate off: the pair was never created,
+		// and the candidate set (qwerty's included) is fixed per process.
+		if (!warned_no_pair) {
+			warned_no_pair = true;
+			U_LOG_W(
+			    "input plugin loader: EmulatedControllers=1 (%s) but the qwerty pair was not created at "
+			    "system build (the gate was 0 then) — it joins at the next service start.",
+			    source);
+		} else {
+			U_LOG_I("input plugin loader: EmulatedControllers=1 (%s) — the pair joins at the next start.",
+			        source);
+		}
+		return 0;
+	}
+	const int changed = t_input_arbiter_set_floor_withdrawn(!emulated);
+	if (changed > 0) {
+		U_LOG_W("input plugin loader: policy re-read — EmulatedControllers=%d (%s): the qwerty pair is %s.",
+		        emulated ? 1 : 0, source,
+		        emulated ? "re-admitted as the hand-role floor"
+		                 : "WITHDRAWN (devices stay resident; no floor)");
+	}
+	return changed;
+}
+
 int
 target_input_plugin_reread_policy(void)
 {
 	(void)target_input_plugin_get_iface(0); // Force discovery.
+	// N7 first: the floor is a candidate of its own, so the gate applies
+	// whether or not a provider is resident — and says so when it cannot.
+	const int floor_changed = input_reread_emulated_gate();
 	if (g_input_provider_count == 0) {
 		U_LOG_I(
 		    "input plugin loader: policy re-read — no resident provider; a newly enabled one loads at "
 		    "the next service start.");
-		return 0;
+		return floor_changed;
 	}
 	struct target_component_entry *entries =
 	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
@@ -973,7 +1103,7 @@ target_input_plugin_reread_policy(void)
 	const int changed = t_input_arbiter_rerank(ranks, rank_count);
 	U_LOG_W("input plugin loader: policy re-read — PreferredPlugin=%s, %d resident provider(s), %d re-ranked.",
 	        have_pref ? preferred : "<unset>", rank_count, changed);
-	return changed;
+	return changed + floor_changed;
 }
 
 int

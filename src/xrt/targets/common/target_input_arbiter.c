@@ -42,6 +42,12 @@
  * other, distinguished only by a NULL @ref t_input_candidate::iface
  * (nothing to ask — the keyboard is always there) and the lowest
  * possible priority.
+ *
+ * N7: that candidate is OPTIONAL. With the `EmulatedControllers` gate at
+ * 0 the builder notes no pair, so no candidate has a NULL iface, and every
+ * walk below simply runs out of candidates — the hands land on -1. Every
+ * `iface == NULL` test in this file is therefore "is this the floor", never
+ * "there is always a floor".
  */
 struct t_input_candidate
 {
@@ -132,6 +138,9 @@ struct t_input_arbiter
 
 	//! What get_roles hands out; generation_id bumps on every flip.
 	struct xrt_system_roles roles;
+
+	//! N7: a qwerty pair was noted for this build (a floor candidate exists).
+	bool floor_noted;
 };
 
 static struct t_input_arbiter g_arb = {0};
@@ -205,7 +214,10 @@ query_candidate_presence(const struct t_input_candidate *cand)
 		return false; // Supplied no arbitrable device at all.
 	}
 	if (cand->iface == NULL) {
-		return true; // Qwerty: the keyboard is always there.
+		// Qwerty: the keyboard is always there. (N7: a floor that was
+		// withdrawn by the gate is handled by the cache read, like a
+		// withdrawn provider — presence stays true, admission does not.)
+		return true;
 	}
 	if (!XRT_INPUT_PLUGIN_IFACE_HAS(cand->iface, get_presence)) {
 		// Provider predates the presence slot: assume present for as
@@ -220,7 +232,7 @@ static const char *
 candidate_name(const struct t_input_candidate *cand)
 {
 	if (cand == NULL) {
-		return "none";
+		return "none"; // no candidate won: the N7 "no hand role" floor
 	}
 	if (cand->iface == NULL) {
 		return "qwerty";
@@ -375,7 +387,7 @@ provider_holds_roles_locked(void)
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		struct t_input_candidate *cand = ranked_locked(i);
 		if (cand->iface == NULL) {
-			continue; // The qwerty floor is not a provider.
+			continue; // The qwerty floor is not a provider (and may be absent, N7).
 		}
 		if (!candidate_supplies_hands(cand)) {
 			continue; // Navigation-only: present, but not for the HANDS.
@@ -410,6 +422,10 @@ static enum xrt_device_name
 profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_device *xdev, bool want_left)
 {
 	if (winner == NULL || xdev == NULL) {
+		// Nobody won the hand (N7: no floor, every provider absent or
+		// withdrawn): no device, no profile — the OpenXR layer reports
+		// XR_NULL_PATH, and its change-only rule emits ONE
+		// XrEventDataInteractionProfileChanged per flip, not a storm.
 		return XRT_DEVICE_INVALID;
 	}
 	if (winner->iface != NULL) {
@@ -714,10 +730,11 @@ void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right)
 {
 	if (left == NULL && right == NULL) {
-		return;
+		return; // N7: no pair published -> no floor candidate -> hands fall to -1.
 	}
 	// UINT32_MAX: the floor — every provider outranks the keyboard.
 	note_candidate(NULL, NULL, 0xFFFFFFFFu, left, right);
+	g_arb.floor_noted = true;
 }
 
 bool
@@ -762,15 +779,25 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		have_nav |= g_arb.candidates[i].nav != NULL;
 	}
 
-	if (g_arb.candidate_count < 2 && !have_nav) {
-		// Zero or one candidate: nothing to arbitrate between; the
-		// static roles the builder already assigned are the right
-		// (and only) answer. A navigation device is the exception —
-		// the builder has no static seed for `roles.rig`, so a lone
-		// navigating provider still needs the arbiter to be reachable.
-		U_LOG_I("input arbiter: not installed — %s.", g_arb.candidate_count == 0
-		                                                  ? "no hand-role candidates at all"
-		                                                  : "single candidate owns the hand roles");
+	bool have_floor = false;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		have_floor |= g_arb.candidates[i].iface == NULL;
+	}
+
+	// Zero candidates, or qwerty alone: nothing to arbitrate between; the
+	// static roles the builder already assigned are the right (and only)
+	// answer. Two exceptions need the arbiter reachable anyway: a navigation
+	// device (the builder has no static seed for `roles.rig`), and — N7 — a
+	// lone PROVIDER with no floor under it, whose hands must fall to -1 when
+	// its hardware goes (and come back), which only the walk can do.
+	const bool lone_floor = g_arb.candidate_count == 1 && have_floor;
+	if ((g_arb.candidate_count == 0 || lone_floor) && !have_nav) {
+		U_LOG_I("input arbiter: not installed — %s.",
+		        g_arb.candidate_count == 0
+		            ? (t_input_arbiter_has_floor() ? "no hand-role candidates at all"
+		                                           : "no hand-role candidates at all (EmulatedControllers=0: "
+		                                             "the hand roles stay unassigned)")
+		            : "single candidate (qwerty) owns the hand roles");
 		return;
 	}
 
@@ -827,8 +854,45 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 			    candidate_name(cand));
 		}
 	}
-	U_LOG_W("input arbiter: installed — %d candidates; roles re-resolve on every xrSyncActions.",
-	        g_arb.candidate_count);
+	U_LOG_W("input arbiter: installed — %d candidates%s; roles re-resolve on every xrSyncActions.",
+	        g_arb.candidate_count,
+	        have_floor ? "" : " (no qwerty floor: hands fall to -1 when every provider is absent)");
+}
+
+bool
+t_input_arbiter_has_floor(void)
+{
+	return g_arb.floor_noted;
+}
+
+int
+t_input_arbiter_set_floor_withdrawn(bool withdrawn)
+{
+	if (!g_arb_mutex_ready) {
+		return 0;
+	}
+	os_mutex_lock(&g_arb_mutex);
+	if (g_arb.xsysd == NULL) {
+		os_mutex_unlock(&g_arb_mutex);
+		return 0; // Not installed: the static roles stand until the next build.
+	}
+	int changed = 0;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->iface != NULL || cand->withdrawn == withdrawn) {
+			continue;
+		}
+		U_LOG_W("input arbiter: qwerty floor %s.",
+		        withdrawn ? "WITHDRAWN (EmulatedControllers = 0; devices stay resident; no hand-role floor)"
+		                  : "re-admitted (EmulatedControllers = 1)");
+		cand->withdrawn = withdrawn;
+		changed++;
+	}
+	if (changed > 0) {
+		refresh_roles_locked(); // bumps generation_id and logs when the assignment moved
+	}
+	os_mutex_unlock(&g_arb_mutex);
+	return changed;
 }
 
 void
@@ -857,7 +921,7 @@ t_input_arbiter_rerank(const struct t_input_arbiter_rank *ranks, int count)
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		struct t_input_candidate *cand = &g_arb.candidates[i];
 		if (cand->iface == NULL || cand->iface->id == NULL) {
-			continue; // qwerty: never ranked by policy
+			continue; // qwerty: never ranked by policy (its gate is set_floor_withdrawn, N7)
 		}
 		for (int k = 0; k < count; k++) {
 			if (ranks[k].id == NULL || strcmp(ranks[k].id, cand->iface->id) != 0) {

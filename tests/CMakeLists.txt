@@ -107,6 +107,7 @@ set(tests
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
+    tests_input_arbiter_floor
     tests_sim_input_nav
     tests_comp_layer_view_camera
     tests_comp_color_policy
@@ -147,6 +148,10 @@ if(TARGET target_lists)
 	# (environment > user > machine / manifest), the DXR_<CLASS>_<ID>_<KEY>
 	# mapping, the per-user JSON lookup, and a live POSIX round trip.
 	list(APPEND tests tests_component_settings)
+	# ADR-054 N7 (#2143) -- the EmulatedControllers gate: the root-policy
+	# resolve rule (user over machine, under Policy\Lock) and the input
+	# loader's live POSIX per-user file read with HOME redirected.
+	list(APPEND tests tests_input_emulated_controllers)
 	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
@@ -599,6 +604,9 @@ endif()
 if(TARGET tests_component_settings)
 	target_link_libraries(tests_component_settings PRIVATE target_lists xrt-interfaces aux_util)
 endif()
+if(TARGET tests_input_emulated_controllers)
+	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)
+endif()
 if(TARGET tests_component_loader)
 	target_link_libraries(tests_component_loader PRIVATE target_lists xrt-interfaces aux_util)
 	# Reuses the conversion loader's stub binaries: a conversion-shaped module
@@ -820,6 +828,17 @@ target_include_directories(
 	tests_input_arbiter_rerank PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_input_arbiter_rerank PRIVATE xrt-interfaces aux_os)
+
+# ADR-054 N7 (#2143) -- the optional hand-role floor: no qwerty pair means the
+# hands fall to -1 (a lone provider is still arbitrated), and a live
+# EmulatedControllers flip withdraws / re-admits an existing pair. Same shape.
+target_sources(
+	tests_input_arbiter_floor PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_floor PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_floor PRIVATE xrt-interfaces aux_os)
 
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point
