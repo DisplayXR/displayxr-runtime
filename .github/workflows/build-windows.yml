@@ -775,6 +775,8 @@ jobs:
               if ($s -lt 0 -or $e -le $s) { throw "conv list --json emitted no JSON object" }
               return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
             }
+            function ConvRowList { return ConvList-Json }
+            function ConvListRow($o, $id) { $o.providers | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
             $cl = ConvList-Json
             $behind = $cl.tasks | Where-Object { $_.provider -eq "sim-conversion" -and -not $_.selected } | Select-Object -First 1
             Expect ($null -ne $behind) "conversion: sim-conversion offers a task where it is ranked behind the selection (rows: $(($cl.tasks | ForEach-Object { $_.task + ':' + $_.provider + ':' + $_.selected }) -join ', '))"
@@ -803,6 +805,51 @@ jobs:
             reg delete $inRoot /v PreferredPlugin /f | Out-Null
             reg delete "$inRoot\sim-input-alt" /f | Out-Null
 
+            # 3d. The one options contract (ADR-054 decision 7, N3c, #2050), on the
+            # conversion class: without its ENABLE setting sim-conversion declines its
+            # probe; `conv set` writes the per-user HKCU Settings\ENABLE (no admin), the
+            # headless `conv list` then negotiates it and `conv options` reads the value
+            # back as source=user; DXR_CONV_SIM_CONVERSION_ENABLE=0 in the environment
+            # beats the store (source=environment, declined again); `conv unset` reverts.
+            # The HKLM Settings\ENABLE registered above is removed for the cell and
+            # restored after it, since the cells below rely on it. The DP class is
+            # checked through its declaration: `dp options sim-display` lists TRACKING,
+            # read from the plug-in's describe_settings through the new host slot.
+            reg delete "$cvRoot\sim-conversion\Settings" /v ENABLE /f | Out-Null
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -ne "NEGOTIATED") "options: without ENABLE sim-conversion is not NEGOTIATED (got '$((ConvListRow $cl "sim-conversion").load)')"
+            & $cli conv set sim-conversion ENABLE 1 | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "options: 'conv set sim-conversion ENABLE 1' exit 0 (got $LASTEXITCODE)"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($null -ne $en) -and $en.declared -and ($en.value -eq "1") -and ($en.source -eq "user")) "options: conv options reads ENABLE=1 (user), declared by the provider (got value='$($en.value)' source='$($en.source)' declared=$($en.declared))"
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -eq "NEGOTIATED") "options: per-user ENABLE=1 -> sim-conversion NEGOTIATED (got '$((ConvListRow $cl "sim-conversion").load)')"
+            $env:DXR_CONV_SIM_CONVERSION_ENABLE = "0"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($en.value -eq "0") -and ($en.source -eq "environment")) "options: DXR_CONV_SIM_CONVERSION_ENABLE=0 beats the store (got value='$($en.value)' source='$($en.source)')"
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -ne "NEGOTIATED") "options: with the env override sim-conversion declines again (got '$((ConvListRow $cl "sim-conversion").load)')"
+            Remove-Item Env:\DXR_CONV_SIM_CONVERSION_ENABLE -ErrorAction SilentlyContinue
+            & $cli conv unset sim-conversion ENABLE | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "options: 'conv unset sim-conversion ENABLE' exit 0 (got $LASTEXITCODE)"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect ($en.source -eq "absent") "options: after unset ENABLE is absent (got source='$($en.source)')"
+            & $cli conv set no-such-provider ENABLE 1 | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "options: 'conv set' of an unregistered id is refused"
+            reg add "$cvRoot\sim-conversion\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($en.value -eq "1") -and ($en.source -eq "machine")) "options: the restored HKLM Settings\ENABLE reads as source=machine (got value='$($en.value)' source='$($en.source)')"
+            $do = Cli-Json @("dp", "options", "sim-display")
+            $tr = $do.settings | Where-Object { $_.key -eq "TRACKING" } | Select-Object -First 1
+            Expect (($null -ne $tr) -and $tr.declared -and ($tr.type -eq "bool")) "options: 'dp options sim-display' lists TRACKING from the plug-in's describe_settings (got declared=$($tr.declared) type='$($tr.type)')"
+            $io = Cli-Json @("input", "options", "sim-input")
+            $ie = $io.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($null -ne $ie) -and $ie.declared) "options: 'input options sim-input' lists ENABLE from the provider's describe_settings"
+
             # 4. ABI-major mismatch, per class: rejected, never dispatched, fallen through.
             Reg-Row $dpRoot "abi-fixture-dp" $fxDp 10
             Reg-Row $inRoot "abi-fixture-input" $fxIn 10
@@ -826,7 +873,8 @@ jobs:
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
                              "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
-                             "HKCU\Software\DisplayXR\DisplayProcessors\sim-display")) {
+                             "HKCU\Software\DisplayXR\DisplayProcessors\sim-display",
+                             "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion")) {
               reg delete $k /f 2>$null | Out-Null
             }
             reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null

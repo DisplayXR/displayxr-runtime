@@ -79,6 +79,7 @@ older runtime sees a zeroed slot.
 
 ### `get_android_class_host_context` (ADR-036 D2, #1037)
 | `request_display_rescan` | all | "My displays may have changed": the runtime re-runs the per-monitor claim sweep (ADR-047 Amendment 8) — re-enumerates the monitors, probes every plug-in that is not a claim source yet (so one whose `probe()` declined is asked again), calls `probe_displays` on every source and publishes the new screen table to live sessions. Debounced, served on a runtime thread, returns at once; callable from any thread (a vendor SDK's event thread, under the plug-in's own locks) and after `probe()` declined — copy the pointer at negotiate time. Call it when the vendor backend recognises or loses a panel (Leia SR: `SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED`). `XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN`. |
+| `get_setting` | all | The one options contract (ADR-054 decision 7, N3c): `get_setting(iface->id, "KEY", buf, cap)` resolves the plug-in's own setting through the runtime's chain — `DXR_DP_<ID>_<KEY>` in the hosting process's environment (always wins) → the per-user store (HKCU `…\DisplayProcessors\<id>\Settings\<KEY>` / POSIX `<id>.settings.json`) → the row's HKLM `Settings\<KEY>` / manifest `settings` → false (keep your compiled default). Strings; you parse. The ONLY way a plug-in reads a knob — never `getenv`. Process-lifetime pointer (copy it at negotiate); read at init and cache. `xrt/xrt_component_settings.h`; `XRT_PLUGIN_HOST_HAS_GET_SETTING`. Pair it with the optional `describe_settings` vtable slot below so `displayxr-cli dp options <id>` can list the keys. |
 
 ```c
 void *(*get_android_class_host_context)(void);   /* jobject, or NULL */
@@ -535,6 +536,16 @@ my_plugin_set_pose_source(struct xrt_plugin_instance *inst,
     m->external_pose_source = source;
 }
 ```
+
+### `describe_settings` (the one options contract, ADR-054 decision 7 / N3c)
+
+```c
+uint32_t (*describe_settings)(const struct xrt_component_setting_desc **out_descs);
+```
+
+Declare the keys your plug-in reads through the host's `get_setting` so `displayxr-cli dp options <id>` can list them with type, default, help, the effective value and where it came from. Write the address of a plug-in-owned `static const struct xrt_component_setting_desc[]` (`{key, type, default_value, help}`, every string valid for the plug-in's lifetime; `xrt/xrt_component_settings.h`) to `*out_descs` and return its length. Pure, callable from any thread, with no instance: it runs on a negotiated-only plug-in.
+
+**NULL is allowed** — the store's keys are still listed, just undeclared. Appended per ADR-020 after `create_dp_gl_for_screen` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`, test with `xrt_plugin_iface_has_describe_settings()`. Reference implementation: `sim_display_describe_settings` (`drivers/sim_display/sim_display_settings.c`, 36 keys — the same table the shim resolves them from).
 
 ## Forward-compatibility rules
 

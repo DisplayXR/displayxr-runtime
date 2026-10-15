@@ -160,6 +160,7 @@ HKLM\Software\DisplayXR\DisplayProcessors
 | `UninstallString` | `REG_SZ`    | no       | Optional, informational (mirrors the plug-in's Add/Remove Programs entry). The runtime never executes it — see §5.                       |
 | `ProbeOrder`      | `REG_DWORD` | no       | Lower runs first. Missing defaults to 100. Vendors should use 50; sim-display uses 200 so it's always the fallback.                      |
 | `Enabled`         | `REG_DWORD` | no       | 0 = the loader never tries this plug-in, in any scan (§1 step 3). Absent (or any non-zero) = enabled. Installers **do not write it** — it is the user's / administrator's switch (`displayxr-cli dp enable\|disable`, §2.1), and a per-user HKCU value overrides it. |
+| `Settings\<KEY>`  | `REG_SZ` / `REG_DWORD` | no | The plug-in's own settings, read by the plug-in ONLY through `host->get_setting` (§2.3, the one options contract — ADR-054 decision 7). Written by `displayxr-cli dp set <id> <KEY> <value> --machine`; a per-user HKCU `Settings\<KEY>` overrides it, and `DXR_DP_<ID>_<KEY>` in the hosting process's environment overrides both. |
 
 **ProbeOrder convention:**
 
@@ -322,6 +323,74 @@ caveat*.
 
 ---
 
+### 2.3 Component settings — the one options contract (ADR-054 decision 7, N3c)
+
+Every component class — display processors, input providers
+(input-provider-discovery.md § *Component settings*), conversion providers
+(conversion-provider-discovery.md §3.9) — carries its per-component settings
+the same way, and a component reads them **only through its host iface**,
+never from its own environment or an ad-hoc vendor key
+(`xrt/xrt_component_settings.h`; the display-processor slot is
+`xrt_plugin_host_iface::get_setting(id, key, buf, cap)`, announced by
+`XRT_PLUGIN_HOST_HAS_GET_SETTING`, carved from `reserved[]` at an unchanged
+ABI). In a satellite or the service the environment is the host's, not the
+user's shell, which is why a `getenv` in a plug-in can never be reached by a
+CLI verb.
+
+| Tier | Where | Wins over |
+|---|---|---|
+| 1 — environment | `DXR_DP_<ID>_<KEY>` in the **hosting** process's environment; `<ID>` = the id upper-cased, `-` → `_` (`DXR_DP_SIM_DISPLAY_TRACKING`). Android: the `debug.xrt.` system property of the same name. A set-but-empty variable is unset. | everything — the `u_setting` rule: a launcher, a `.bat` or a harness can always take control back from a setting somebody left behind |
+| 2 — user | Windows: `HKCU\Software\DisplayXR\DisplayProcessors\<id>\Settings\<KEY>` (`REG_SZ` or `REG_DWORD`). POSIX: `<id>.settings.json` in the per-user manifest dir (a flat object `{"KEY": "value"}`), next to `preferred`. | tier 3 — unless HKLM `DisplayProcessors\Policy\Lock` = 1, the kiosk rule `Enabled` already follows (§2.1), which hides the user tier (never the environment) |
+| 3 — machine / manifest | Windows: `HKLM\Software\DisplayXR\DisplayProcessors\<id>\Settings\<KEY>` (64-bit view). POSIX: the manifest's `plugin.settings` object (§3.1). | the plug-in's compiled default |
+
+Values are strings; the plug-in parses. Keys are `[A-Za-z0-9_]`, not
+digit-first, matched case-insensitively (they are registry value names) and
+conventionally upper-case. **Only `Settings\*` is ever read from HKCU / the
+per-user file**: a per-user store can change what a registered plug-in is
+*told*, never which binary loads — the §2.1 rule. `u_setting_is_managed`'s
+allow-list (the runtime-policy `DXR_*` levers of
+`docs/roadmap/control-panel-performance-settings.md`) is a different store
+this contract never touches: a component-owned key is `DXR_<CLASS>_<ID>_<KEY>`,
+a runtime-policy lever is a bare `DXR_*`, and neither resolves through the
+other.
+
+**Verbs** — one spelling across `dp` / `input` / `conv`
+(`cli_component_options.c`):
+
+| Verb | What |
+|---|---|
+| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. |
+| `dp set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written (the `enable\|disable` rule). After the write the CLI reads the key back and prints *Effective now:* the value the plug-in will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `dp unset <id> <KEY> [--machine]` | Removes it from that store; absent is success (POSIX: the per-user file is deleted once empty). |
+
+**When it applies.** A display processor reads its settings at init through
+the host iface (sim-display resolves each key once per process and caches
+it), so a write reaches the **next session / service start**; the verbs
+never poke the running service — restart it, or launch a fresh app. (Input
+providers: the same. Conversion providers differ: the running service
+re-describes on its registry watch, conversion-provider-discovery.md §4.1, so
+a `conv set` reaches the next re-describe.)
+
+**Reference implementation and the guard.** `drivers/sim_display/sim_display_settings.c`
+is the one place sim-display reads a knob: `dp options sim-display` lists all
+of them (`TRACKING`, `TRACKING_PERIOD_MS`, `OUTPUT`, `FORCE_MODE`, `WIDTH_M`,
+`HEIGHT_M`, `NOMINAL_Z_M`, `PIXEL_W`/`PIXEL_H`, `STRICT_PANEL`,
+`INTERLACE_PERIOD`, `METAL_SNAP_PERIOD`, `LENS`, `WEAVE_SCOPE`, `ZONE_*`,
+`WISH_QUANTIZE`, `LIFT*`, `STEREO_CAMERA*`, `WEBCAM_*`). The former
+`SIM_DISPLAY_<X>` / `SIM_DISPLAY_FAKE_<X>` environment names stay aliases for
+**one release** (a deprecation WARN once per key), read in that shim and
+nowhere else: `lint.yml`'s `sim-plugin-getenv-guard` fails any `getenv` under
+the three reference plug-ins outside their shims. A vendor plug-in follows
+the same shape (vendor-plugin-onboarding.md § *Settings*).
+
+```powershell
+# What the plug-in would read, and from where:
+displayxr-cli dp options sim-display
+# Fake eye tracking for this user (next session), then undo it:
+displayxr-cli dp set sim-display TRACKING 1
+displayxr-cli dp unset sim-display TRACKING
+```
+
 ## 3. Per-platform filesystem discovery
 
 POSIX (macOS / Linux) and Android both `dlopen` plug-in `.so`s from the
@@ -382,6 +451,8 @@ Fields mirror the Windows registry schema:
 | `plugin.probe_order`  | `ProbeOrder`       | no       | Default 100. Sim-display=200, vendors=50.                                             |
 | `plugin.enabled`      | `Enabled`          | no       | Boolean; `false` = the loader never tries this plug-in, in any scan (§1 step 3), and `dp list` shows it `no (manifest)`. A non-boolean rejects the manifest as malformed (the shared component loader's parser, ADR-054 N2). This is the POSIX switch — there is no per-user `Enabled` store, so `displayxr-cli dp enable\|disable` is refused here and points at this field. |
 | `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
+| `plugin.settings`     | `Settings\*`       | no       | Object of `"KEY": "value"` (strings; numbers and booleans are accepted and read as strings, `true` = `"1"`) — the machine tier of the plug-in's own settings (§2.3). Overridden per user by `<id>.settings.json` in the per-user manifest dir (what `dp set` writes), and by `DXR_DP_<ID>_<KEY>` in the hosting process's environment. |
+| `plugin.settings_schema` | n/a (the binary's `describe_settings`) | no | Array of `{"key", "type", "default", "help"}` declaring the keys for `dp options`; merged with what the binary itself declares. |
 
 Discovery roots are searched in priority order — the per-user root
 above first, then the packaged system roots below. Per-user entries with

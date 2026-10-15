@@ -44,9 +44,14 @@ lift thread runs on the conversion core.
 
 Read through `host->get_setting` in the hosting process only (never `getenv`):
 `Settings\<KEY>` under `HKLM\Software\DisplayXR\ConversionProviders\sim-conversion`
-on Windows, the manifest's `settings` object on POSIX, overridden by the
-environment variable **`DXR_CONV_SIM_CONVERSION_<KEY>`** (in the service's own
-environment, or the conversion host's).
+on Windows, the manifest's `settings` object on POSIX, overridden per user by
+`displayxr-cli conv set sim-conversion <KEY> <value>` (HKCU `Settings\<KEY>` /
+the POSIX `sim-conversion.settings.json`; the one options contract, ADR-054
+decision 7 / N3c) and by the environment variable
+**`DXR_CONV_SIM_CONVERSION_<KEY>`** (in the service's own environment, or the
+conversion host's), which always wins. `displayxr-cli conv options
+sim-conversion` lists the table below with each key's effective value and
+source (the provider declares it through `describe_settings`).
 
 | Key | Default | Effect |
 |---|---|---|
