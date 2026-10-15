@@ -711,7 +711,7 @@ the browser vendors the client side; the v3 handlers become thin adapters onto t
 | `conv_submit` | submit (params in scratch shm when > 1 KB) → frame id | in: 0–2 images + fence |
 | `conv_acquire_result` | id → views / depth meta | export handles |
 | `conv_job_submit` / `status` / `fetch` / `cancel` | job → id; state + progress; result | in: image / shm; out: shm |
-| `conv_warm` / `conv_evict` | task (evict: the CLI's DIAG only) | – |
+| `conv_request_warm` / `conv_evict` | task (evict: the CLI's DIAG only; the CLI's own `conv warm` is the DIAG `conv_warm` call, which echoes the row's state before / after) | – |
 | `conv_input_ring_get` | **P5 only** | GL / VK / Metal rings |
 | events | per-session queue + sessionless `conv_poll_event`: `TaskStateChanged`, `ProvidersChanged`, `JobStateChanged` | – |
 

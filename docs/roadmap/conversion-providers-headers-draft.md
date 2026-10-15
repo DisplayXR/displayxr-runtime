@@ -1767,7 +1767,7 @@ Spec 4 / 5 ride a new family. Its payloads are defined once, in `src/xrt/include
 | `conv_job_status` | job id (u64) | `job_status` (64): state (`XrLiftJobStateDXR`, spec 5), failure reason, progress, 32-byte stage label | – |
 | `conv_job_fetch` | job id (u64) | `job_result` (368): `written`, blob format, delivery (`NONE` / `INLINE` ≤ 1 MiB in the scratch shm / `SHM` / `FILE`), byte size, `splat_info` + `depth_info` + `views_info` twins | out: shm handle (`SHM`) |
 | `conv_job_cancel` | job id (u64) | – | – |
-| `conv_warm` / `conv_evict` | `task_request` (16) | – | – (`conv_warm` also open to DIAG; `conv_evict` only on the CLI's own DIAG connection) |
+| `conv_request_warm` / `conv_evict` | `task_request` (16) | – | – (the DIAG `conv_warm` is the CLI's, with a state echo; `conv_evict` only on the CLI's own DIAG connection) |
 | events | the per-session event queue, plus a sessionless per-connection queue drained by `conv_poll_event` | `event` (40): kind (`PROVIDERS_CHANGED` / `TASK_STATE_CHANGED` / `JOB_STATE_CHANGED`), task, state, previous state, failure reason, progress, job id | – |
 
 There is **no `conv_enum_provider`** on the wire: an app-facing connection sees tasks only, through `conv_enum_task`. Provider identity reaches the CLI and the status snapshot over the existing DIAG / snapshot path, not through this family.

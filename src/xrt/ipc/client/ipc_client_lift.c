@@ -408,7 +408,7 @@ ipc_client_conv_warm(struct ipc_connection *ipc_c, uint32_t task)
 	req.struct_size = (uint32_t)sizeof(req);
 	req.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
 	req.task = task;
-	return ipc_call_conv_warm(ipc_c, &req);
+	return ipc_call_conv_request_warm(ipc_c, &req);
 }
 
 xrt_result_t
