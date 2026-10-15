@@ -24,9 +24,8 @@ whole lifetime.
 The ADR-054 component verbs are **implemented** for this class (N3b,
 #2049): the optional `Enabled` value (§2), the per-user HKCU overlay for
 `Enabled` and `PreferredPlugin` (§2.1), the manifest's `enabled` (§3.1),
-and `displayxr-cli dp list | enable | disable | use | reset`. Still planned:
-live re-select when either value changes under a running service (#2051 —
-today a change applies at the next service start / session).
+and `displayxr-cli dp list | enable | disable | use | reset`; a change to
+either value under a running service is picked up live (§4.2a, #2051).
 
 This document is the **runtime ↔ plug-in discovery contract**. The
 C-ABI side — the negotiation entry point, the `xrt_plugin_iface` vtable,

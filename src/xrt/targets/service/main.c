@@ -51,9 +51,12 @@ workspace_launch_provider(const char *controller_id)
 #endif
 
 #include "target_lists.h"
-#include "target_status_snapshot.h" // ADR-051 D3: the status provider
-#include "target_display_hotplug.h" // ADR-051 D6: the display-identity follow-up sink
-#include "service_conversion.h"     // ADR-053: the conversion core
+#include "target_status_snapshot.h"     // ADR-051 D3: the status provider
+#include "target_display_hotplug.h"     // ADR-051 D6: the display-identity follow-up sink
+#include "target_component_loader.h"    // ADR-054: the component class ids
+#include "target_input_plugin_loader.h" // ADR-054 N3d: input policy re-read -> arbiter re-rank
+#include "service_conversion.h"         // ADR-053: the conversion core
+#include "service_component_watch.h"    // ADR-054 N3d (#2051): the policy-store watch
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -107,6 +110,56 @@ static void
 register_display_followup(void)
 {
 	target_display_hotplug_set_followup_sink(display_followup_to_reprobe);
+}
+
+/*
+ * ADR-054 N3d (#2051): live re-select on an `Enabled` / `Preferred` change.
+ * One watch thread over every class's policy store (service_component_watch)
+ * dispatches per class; the conversion core subscribes itself in
+ * service_conversion_start. What each class does, by its lifetime rules:
+ *  - display: the same debounced re-probe as `system_request_display_reprobe`
+ *    (a secondary screen's segment DP follows; the primary at the next
+ *    session — plugin-discovery.md §4.2, no live swap);
+ *  - input: re-read PreferredPlugin + Enabled and re-rank the arbiter (devices
+ *    stay resident; a disabled provider is withdrawn like presence loss).
+ * The DIAG call `system_request_component_reselect` pokes the same callbacks.
+ */
+static void
+on_display_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	ipc_server_request_display_reprobe(reason == SERVICE_COMPONENT_WATCH_POKED
+	                                       ? "display-processor preference changed"
+	                                       : "plug-in registration or policy changed");
+}
+
+static void
+on_input_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	(void)reason;
+	(void)target_input_plugin_reread_policy();
+}
+
+static xrt_result_t
+component_reselect_provider(uint32_t class_id)
+{
+	if (class_id == TARGET_COMPONENT_CLASS_NONE || class_id >= TARGET_COMPONENT_CLASS_COUNT) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return service_component_watch_poke(class_id, SERVICE_COMPONENT_WATCH_POKED) ? XRT_SUCCESS
+	                                                                             : XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+static void
+register_component_watch(void)
+{
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_DISPLAY, on_display_policy_watch, NULL);
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_INPUT, on_input_policy_watch, NULL);
+	ipc_server_set_component_reselect_provider(component_reselect_provider);
+	(void)service_component_watch_start();
 }
 
 
@@ -428,6 +481,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	register_display_followup();
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
 	service_conversion_start();
+	// ADR-054 N3d (#2051): after the conversion core subscribed.
+	register_component_watch();
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
@@ -466,6 +521,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
 
+	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
+	service_component_watch_stop();
 	// ADR-053: torn down last, after the IPC server (no client can reach it now).
 	service_conversion_stop();
 
@@ -588,6 +645,8 @@ main(int argc, char *argv[])
 	register_display_followup();
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
 	service_conversion_start();
+	// ADR-054 N3d (#2051): after the conversion core subscribed.
+	register_component_watch();
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =
@@ -607,6 +666,8 @@ main(int argc, char *argv[])
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
 
+	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
+	service_component_watch_stop();
 	// ADR-053: torn down last, after the IPC server (no client can reach it now).
 	service_conversion_stop();
 

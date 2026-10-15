@@ -21,9 +21,12 @@
  *
  * Registry writes follow `dp use`: per user (HKCU) by default, machine-wide
  * (HKLM, admin) with `--machine` (spec §3.1: HKCU wins over HKLM unless HKLM
- * `Policy\Lock` = 1). The running service picks a registry change up through
- * its RegNotifyChangeKeyValue watch on the root (spec §4.1 re-describe
- * trigger) -- there is no separate poke RPC.
+ * `Policy\Lock` = 1). Every write ends with a poke of the running service
+ * (`system_request_component_reselect`, #2051): it re-reads the policy, hands
+ * `PreferredProvider` to the core and re-applies `Enabled`, so the NEXT
+ * stream / job create selects under the new policy (a live stream never
+ * moves, spec §3.4 rule 5) and `conv status --watch` prints a line. The
+ * service's policy watch also catches a registry edit made without the CLI.
  *
  * GAP (#2003): `conv warm` needs the DIAG `conv_warm` call that lands with the
  * conv_core service object. Until then it validates its argument and reports
@@ -46,7 +49,7 @@
 #include "util/u_time.h"
 
 #include "cli_query.h" // cli_query_handles + teardown (the headless instance)
-#include "target_component_loader.h" // target_component_provenance_str (ADR-054 N4b)
+#include "target_component_loader.h" // target_component_provenance_str (N4b), TARGET_COMPONENT_CLASS_CONVERSION (#2051)
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 #include "target_plugin_loader.h" // target_plugin_get_active (the static dp-lift row)
@@ -611,18 +614,27 @@ write_result(reg_write r, const char *what)
 	}
 }
 
-//! How a registry change reaches the running service (spec §4.1).
+//! How a policy write reaches the running service (#2051; spec §3.4 rule 5, §4.1).
 void
 note_service_pickup(void)
 {
 #ifdef CLI_HAVE_IPC
-	struct ipc_connection ipc_c;
-	if (conv_connect(&ipc_c)) {
-		ipc_client_connection_fini(&ipc_c);
-		P("The running service picks this up from its registry watch on %s (a re-describe trigger, spec\n"
-		  "§4.1); it applies to the next stream / job create. A live stream never moves.\n",
-		  TARGET_CONV_REG_ROOT);
+	xrt_result_t xret = XRT_SUCCESS;
+	switch (cli_ipc_poke_component_reselect(TARGET_COMPONENT_CLASS_CONVERSION, &xret)) {
+	case CLI_IPC_POKE_ACCEPTED:
+		P("The running service re-selects now: the new preference / Enabled applies to the next stream /\n"
+		  "job create (a live stream never moves); `conv status --watch` prints the change.\n");
 		return;
+	case CLI_IPC_POKE_NO_WATCH:
+		P("The running service has no live re-select -- applies when it next starts.\n");
+		return;
+	case CLI_IPC_POKE_REFUSED:
+		P("The running service refused the re-select request (xrt_result=%d) -- its registry watch on %s\n"
+		  "still applies the write within ~1 s; otherwise at its next start.\n",
+		  (int)xret, TARGET_CONV_REG_ROOT);
+		return;
+	case CLI_IPC_POKE_UNREACHABLE:
+	default: break;
 	}
 #endif
 	P("No DisplayXR service reachable -- applies when it next starts.\n");

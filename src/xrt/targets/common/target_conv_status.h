@@ -103,6 +103,15 @@ void
 target_conv_policy_read(struct target_conv_policy *out);
 
 /*!
+ * The per-user `Enabled` override @p policy carries for @p id: 1 (HKCU
+ * Enabled = 1), 0 (HKCU Enabled = 0), or -1 (none, or `Policy\Lock` makes
+ * the machine value win). What the headless pass and the service's live
+ * rows (#2051) both apply over the loader's HKLM `enabled`.
+ */
+int
+target_conv_policy_enabled_override(const struct target_conv_policy *policy, const char *id);
+
+/*!
  * The headless pass over the registered providers
  * (@ref target_conversion_plugin_enumerate) plus the static dp-lift row of
  * @p active_dp (may be NULL: no dp-lift row). Reads the policy itself.

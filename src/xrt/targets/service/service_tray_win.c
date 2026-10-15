@@ -69,10 +69,6 @@ static service_tray_shutdown_cb s_shutdown_cb = NULL;
 static service_tray_config_change_cb s_config_cb = NULL;
 static struct service_config s_config;
 
-// ADR-045 R-c: registry waiter on the plug-in registration root.
-static HANDLE s_reg_watch_thread = NULL;
-static HANDLE s_reg_watch_stop = NULL;
-
 // ADR-043 R3: camera in-use icon (base icon + red dot) and the pending prompt.
 static HICON s_icon_base = NULL;
 static HICON s_icon_inuse = NULL;
@@ -957,96 +953,6 @@ update_status_tooltip(void)
 
 /*
  *
- * World-event sources for the display re-probe (ADR-045 R-c)
- *
- */
-
-/*!
- * Watch HKLM\Software\DisplayXR\DisplayProcessors (subtree) so a plug-in
- * registered, removed or re-registered while the service runs is re-probed at
- * once instead of on the next client connect. The root may not exist yet (no
- * plug-in ever installed): wait on HKLM\Software\DisplayXR instead until it
- * does. Requests go through ipc_server_request_display_reprobe, which only
- * flags the IPC server's debounced worker, so nothing here blocks on a probe.
- */
-static DWORD WINAPI
-reg_watch_thread_body(LPVOID param)
-{
-	(void)param;
-	HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
-	if (ev == NULL) {
-		return 1;
-	}
-	for (;;) {
-		bool watching_root = true;
-		HKEY key = NULL;
-		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0,
-		                  KEY_NOTIFY | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
-			watching_root = false;
-			if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR", 0, KEY_NOTIFY | KEY_WOW64_64KEY,
-			                  &key) != ERROR_SUCCESS) {
-				key = NULL;
-			}
-		}
-
-		DWORD w;
-		if (key != NULL && RegNotifyChangeKeyValue(key, TRUE,
-		                                           REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET |
-		                                               REG_NOTIFY_THREAD_AGNOSTIC,
-		                                           ev, TRUE) == ERROR_SUCCESS) {
-			HANDLE hs[2] = {s_reg_watch_stop, ev};
-			w = WaitForMultipleObjects(2, hs, FALSE, INFINITE);
-		} else {
-			// Nothing to watch yet (or the API failed): poll slowly.
-			w = WaitForSingleObject(s_reg_watch_stop, 10000);
-		}
-		if (key != NULL) {
-			RegCloseKey(key);
-		}
-		if (w == WAIT_OBJECT_0) {
-			break; // stop
-		}
-		if (w == WAIT_OBJECT_0 + 1 && watching_root) {
-			ipc_server_request_display_reprobe("plug-in registration changed");
-		}
-	}
-	CloseHandle(ev);
-	return 0;
-}
-
-static void
-reg_watch_start(void)
-{
-	s_reg_watch_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (s_reg_watch_stop == NULL) {
-		return;
-	}
-	s_reg_watch_thread = CreateThread(NULL, 0, reg_watch_thread_body, NULL, 0, NULL);
-	if (s_reg_watch_thread == NULL) {
-		U_LOG_W("Could not start the plug-in registration watcher (error %lu).", GetLastError());
-	}
-}
-
-static void
-reg_watch_stop(void)
-{
-	if (s_reg_watch_stop != NULL) {
-		SetEvent(s_reg_watch_stop);
-	}
-	if (s_reg_watch_thread != NULL) {
-		WaitForSingleObject(s_reg_watch_thread, 2000);
-		CloseHandle(s_reg_watch_thread);
-		s_reg_watch_thread = NULL;
-	}
-	if (s_reg_watch_stop != NULL) {
-		CloseHandle(s_reg_watch_stop);
-		s_reg_watch_stop = NULL;
-	}
-}
-
-
-/*
- *
  * Session-end window (Restart Manager, logoff, shutdown)
  *
  */
@@ -1429,8 +1335,9 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 	CloseHandle(s_ready_event);
 	s_ready_event = NULL;
 
-	// ADR-045 R-c: plug-in registration changes re-probe selection.
-	reg_watch_start();
+	// ADR-045 R-c: plug-in registration changes re-probe selection — watched
+	// by the service's one component-policy thread since #2051
+	// (service_component_watch.c, subscribed in main.c), not here.
 
 	// ADR-043 R3: the stereo camera's consent prompt + in-use indicator live on
 	// this tray. Registered before ipc_server_main creates the camera manager
@@ -1447,8 +1354,6 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 void
 service_tray_cleanup(void)
 {
-	reg_watch_stop();
-
 	if (s_tray_hwnd) {
 		// Tell the tray thread to exit
 		PostMessageW(s_tray_hwnd, WM_DESTROY, 0, 0);

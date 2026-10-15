@@ -7,6 +7,7 @@
  */
 
 #include "service_conversion.h"
+#include "service_component_watch.h"
 #include "service_config.h"
 
 #include "xrt/xrt_config_os.h"
@@ -19,6 +20,7 @@
 #include "server/ipc_server.h"
 #include "server/ipc_server_conv.h"
 
+#include "target_component_loader.h"
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 
@@ -64,12 +66,6 @@ static struct
 	bool dp_lift_registered;
 
 	char cache_path[600];
-
-#ifdef XRT_OS_WINDOWS
-	HANDLE watch_thread;
-	HANDLE watch_stop;
-	HANDLE notify_ev; //!< a provider called notify_changed
-#endif
 } g;
 
 
@@ -329,13 +325,10 @@ static void
 host_notify_changed(uint32_t cap_id)
 {
 	// Any provider thread, possibly inside a describe that holds the core's
-	// registry lock: only signal; the watch thread re-describes.
+	// registry lock: only signal; the service's component watch thread
+	// re-describes (on_policy_watch below).
 	(void)cap_id;
-#ifdef XRT_OS_WINDOWS
-	if (g.notify_ev != NULL) {
-		SetEvent(g.notify_ev);
-	}
-#endif
+	(void)service_component_watch_poke(TARGET_COMPONENT_CLASS_CONVERSION, SERVICE_COMPONENT_WATCH_PROVIDER_NOTIFY);
 }
 
 static struct xrt_conversion_plugin_host_iface g_host;
@@ -472,6 +465,23 @@ find_entry_locked(const char *id)
 	return -1;
 }
 
+/*!
+ * The row's EFFECTIVE `enabled`: the loader's HKLM / manifest value with the
+ * per-user HKCU override on top (spec §3.1, HKCU wins unless `Policy\Lock`).
+ * #2051 (the #2025 item): the loader reads only HKLM, and until now the
+ * service took its value verbatim — so `conv disable <id>` (HKCU) changed
+ * nothing in a running core; only the headless CLI pass applied the override.
+ * Reads g.policy under g.mtx; call with no lock held.
+ */
+static bool
+effective_enabled(const struct xrt_conversion_plugin_entry *e)
+{
+	os_mutex_lock(&g.mtx);
+	const int ov = target_conv_policy_enabled_override(&g.policy, e->id);
+	os_mutex_unlock(&g.mtx);
+	return ov < 0 ? e->enabled : ov == 1;
+}
+
 //! Negotiate + probe @p e and add it to the core (no g.mtx: calls a provider).
 static void
 add_entry(struct xrt_conversion_plugin_entry *e)
@@ -479,6 +489,7 @@ add_entry(struct xrt_conversion_plugin_entry *e)
 	if (target_conv_is_policy_subkey(e->id)) {
 		return;
 	}
+	e->enabled = effective_enabled(e);
 	if (e->status == XRT_CONV_LOAD_NOT_LOADED) {
 		(void)target_conversion_plugin_negotiate_one(e, host_for_entry(e));
 	}
@@ -573,12 +584,18 @@ rescan(void)
 		if (target_conv_is_policy_subkey(e->id)) {
 			continue;
 		}
+		// #2051: HKLM `Enabled` with the HKCU override applied — the value
+		// `conv enable|disable` writes lives in HKCU, which the loader never
+		// reads, so comparing the loader's value alone saw no change.
+		e->enabled = effective_enabled(e);
 		os_mutex_lock(&g.mtx);
 		const int k = find_entry_locked(e->id);
 		const bool known_enabled = k >= 0 ? g.entries[k].enabled : false;
 		os_mutex_unlock(&g.mtx);
 		if (k >= 0) {
 			if (known_enabled != e->enabled) {
+				U_LOG_W("[conv] provider %s: %s by policy — applies to the next stream / job create.",
+				        e->id, e->enabled ? "enabled" : "disabled");
 				conv_core_set_provider_enabled(g.core, e->id, e->enabled);
 				os_mutex_lock(&g.mtx);
 				g.entries[k].enabled = e->enabled;
@@ -618,7 +635,35 @@ rescan(void)
 	}
 	os_mutex_unlock(&g.mtx);
 	free(fresh);
+	// The built-in adapter has no registry row; its per-user Enabled is a
+	// policy override like any other (dp_lift_enabled_by_policy).
+	if (g.dp_lift_registered) {
+		conv_core_set_provider_enabled(g.core, CONV_DP_LIFT_ID, dp_lift_enabled_by_policy());
+	}
 	cache_save();
+}
+
+/*!
+ * #2051 (the #2025 item): hand the re-read policy to the core. conv_core
+ * COPIES `PreferredProvider\<task>` at create ("the copies are
+ * authoritative") and had no setter, so the watch thread's
+ * target_conv_policy_read refreshed g.policy — which only the status rows
+ * print — while selection kept ranking from the create-time copy.
+ */
+static void
+push_policy_to_core(void)
+{
+	const char *pref[XRT_CONV_TASK_RESERVED_FIRST] = {0};
+	bool research = false;
+	os_mutex_lock(&g.mtx);
+	for (uint32_t t = 0; t < XRT_CONV_TASK_RESERVED_FIRST && t < TARGET_CONV_POLICY_TASKS; t++) {
+		pref[t] = g.policy.preferred[t][0] != '\0' ? g.policy.preferred[t] : NULL;
+	}
+	research = g.policy.allow_research_only;
+	// g.policy is only ever rewritten on this (watch) thread, so the
+	// pointers stay valid across the unlock.
+	os_mutex_unlock(&g.mtx);
+	conv_core_set_policy(g.core, pref, research);
 }
 
 static void
@@ -636,74 +681,43 @@ redescribe_all(void)
 	}
 }
 
-#ifdef XRT_OS_WINDOWS
-static DWORD WINAPI
-watch_thread_body(LPVOID param)
+/*!
+ * service_component_watch_fn for the conversion class (#2051). Replaces this
+ * file's private Windows-only RegNotifyChangeKeyValue thread: the service's
+ * one watch thread calls here (debounced) on an HKLM / HKCU
+ * `ConversionProviders` change, on a POSIX manifest change, on the DIAG
+ * reselect call, and on a provider's `notify_changed`.
+ *
+ * A policy change is applied in three steps the old thread did only one of:
+ * re-read the policy (it did this), hand `PreferredProvider` /
+ * `AllowResearchOnly` to the core (new — the core kept its create-time copy),
+ * then rescan with the HKCU `Enabled` override applied to every row (new —
+ * the loader's HKLM value alone never changes on `conv disable`). The next
+ * stream / job create then selects under the new policy; a live stream never
+ * moves (spec §3.4 rule 5).
+ */
+static void
+on_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
 {
-	(void)param;
-	HANDLE ev_lm = CreateEventW(NULL, FALSE, FALSE, NULL);
-	HANDLE ev_cu = CreateEventW(NULL, FALSE, FALSE, NULL);
-	if (ev_lm == NULL || ev_cu == NULL) {
-		if (ev_lm != NULL) {
-			CloseHandle(ev_lm);
-		}
-		if (ev_cu != NULL) {
-			CloseHandle(ev_cu);
-		}
-		return 1;
+	(void)ud;
+	(void)class_id;
+	if (g.core == NULL) {
+		return;
 	}
-	for (;;) {
-		HKEY lm = NULL, cu = NULL;
-		const DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC;
-		// The root may not exist yet (no provider ever installed): watch its parent.
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, TARGET_CONV_REG_ROOT, 0, KEY_NOTIFY | KEY_WOW64_64KEY, &lm) !=
-		    ERROR_SUCCESS) {
-			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\DisplayXR", 0, KEY_NOTIFY | KEY_WOW64_64KEY,
-			                  &lm) != ERROR_SUCCESS) {
-				lm = NULL;
-			}
-		}
-		if (RegOpenKeyExA(HKEY_CURRENT_USER, TARGET_CONV_REG_ROOT, 0, KEY_NOTIFY, &cu) != ERROR_SUCCESS) {
-			if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\DisplayXR", 0, KEY_NOTIFY, &cu) != ERROR_SUCCESS) {
-				cu = NULL;
-			}
-		}
-		if (lm != NULL) {
-			(void)RegNotifyChangeKeyValue(lm, TRUE, filter, ev_lm, TRUE);
-		}
-		if (cu != NULL) {
-			(void)RegNotifyChangeKeyValue(cu, TRUE, filter, ev_cu, TRUE);
-		}
-		HANDLE hs[4] = {g.watch_stop, g.notify_ev, ev_lm, ev_cu};
-		// Nothing to watch: still wake on notify / stop, and re-open slowly.
-		const DWORD w = WaitForMultipleObjects(4, hs, FALSE, (lm == NULL && cu == NULL) ? 10000 : INFINITE);
-		if (lm != NULL) {
-			RegCloseKey(lm);
-		}
-		if (cu != NULL) {
-			RegCloseKey(cu);
-		}
-		if (w == WAIT_OBJECT_0) {
-			break;
-		}
-		if (w == WAIT_OBJECT_0 + 1) {
-			redescribe_all();
-		} else if (w == WAIT_OBJECT_0 + 2 || w == WAIT_OBJECT_0 + 3) {
-			// Debounce an installer's burst of writes (Version is written LAST, §3.8).
-			if (WaitForSingleObject(g.watch_stop, 500) == WAIT_OBJECT_0) {
-				break;
-			}
-			os_mutex_lock(&g.mtx);
-			target_conv_policy_read(&g.policy);
-			os_mutex_unlock(&g.mtx);
-			rescan();
-		}
+	if (reason == SERVICE_COMPONENT_WATCH_PROVIDER_NOTIFY) {
+		redescribe_all();
+		return;
 	}
-	CloseHandle(ev_lm);
-	CloseHandle(ev_cu);
-	return 0;
+	os_mutex_lock(&g.mtx);
+	target_conv_policy_read(&g.policy);
+	os_mutex_unlock(&g.mtx);
+	push_policy_to_core();
+	rescan();
+	U_LOG_W("[conv] policy re-read (%s): preferences and Enabled apply to the next stream / job create.",
+	        reason == SERVICE_COMPONENT_WATCH_POKED ? "reselect requested" : "registration or policy changed");
 }
 
+#ifdef XRT_OS_WINDOWS
 //! PrewarmOn: the registry string, else interest on mains / first-create on battery.
 static uint32_t
 read_prewarm_on(void)
@@ -840,16 +854,9 @@ service_conversion_start(void)
 	};
 	ipc_server_set_conv_status_source(&source);
 
-#ifdef XRT_OS_WINDOWS
-	g.watch_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
-	g.notify_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
-	if (g.watch_stop != NULL && g.notify_ev != NULL) {
-		g.watch_thread = CreateThread(NULL, 0, watch_thread_body, NULL, 0, NULL);
-	}
-	if (g.watch_thread == NULL) {
-		U_LOG_W("[conv] could not start the conversion-provider registration watcher");
-	}
-#endif
+	// #2051: registration / policy changes and provider notifies arrive from
+	// the service's one component watch thread (started by main.c after this).
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_CONVERSION, on_policy_watch, NULL);
 }
 
 void
@@ -860,24 +867,9 @@ service_conversion_stop(void)
 	}
 	ipc_server_set_conv_status_source(NULL);
 	ipc_server_set_conv(NULL);
-#ifdef XRT_OS_WINDOWS
-	if (g.watch_stop != NULL) {
-		SetEvent(g.watch_stop);
-	}
-	if (g.watch_thread != NULL) {
-		WaitForSingleObject(g.watch_thread, 5000);
-		CloseHandle(g.watch_thread);
-		g.watch_thread = NULL;
-	}
-	if (g.watch_stop != NULL) {
-		CloseHandle(g.watch_stop);
-		g.watch_stop = NULL;
-	}
-	if (g.notify_ev != NULL) {
-		CloseHandle(g.notify_ev);
-		g.notify_ev = NULL;
-	}
-#endif
+	// main.c stops the watch thread before this; clearing the subscription
+	// keeps a late poke from reaching a core that is going away.
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_CONVERSION, NULL, NULL);
 	cache_save();
 	ipc_server_conv_destroy(&g.sc);
 	// Providers die through their hosts; their binaries stay mapped for the

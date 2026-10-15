@@ -206,10 +206,10 @@ target_conv_policy_read(struct target_conv_policy *out)
 #endif
 }
 
-static int
-policy_enabled_override(const struct target_conv_policy *p, const char *id)
+int
+target_conv_policy_enabled_override(const struct target_conv_policy *p, const char *id)
 {
-	if (p == NULL || p->policy_lock) {
+	if (p == NULL || id == NULL || p->policy_lock) {
 		return -1;
 	}
 	for (uint32_t i = 0; i < p->override_count; i++) {
@@ -218,6 +218,12 @@ policy_enabled_override(const struct target_conv_policy *p, const char *id)
 		}
 	}
 	return -1;
+}
+
+static int
+policy_enabled_override(const struct target_conv_policy *p, const char *id)
+{
+	return target_conv_policy_enabled_override(p, id);
 }
 
 
