@@ -385,6 +385,7 @@ target_conversion_plugin_status_str(uint32_t status)
 	case XRT_CONV_LOAD_DECLINED: return "declined";
 	case XRT_CONV_LOAD_NEGOTIATE_FAILED: return "negotiate-failed";
 	case XRT_CONV_LOAD_ABI_MISMATCH: return "abi-mismatch";
+	case XRT_CONV_LOAD_UNTRUSTED: return "untrusted";
 	default: return "unknown";
 	}
 }
@@ -860,6 +861,7 @@ target_conversion_plugin_negotiate_one(struct xrt_conversion_plugin_entry *e,
 	case TARGET_COMPONENT_LOAD_OK: break;
 	case TARGET_COMPONENT_LOAD_PATH_REFUSED: e->status = XRT_CONV_LOAD_PATH_REFUSED; return false;
 	case TARGET_COMPONENT_LOAD_NO_ENTRY_POINT: e->status = XRT_CONV_LOAD_NO_ENTRYPOINT; return false;
+	case TARGET_COMPONENT_LOAD_UNTRUSTED: e->status = XRT_CONV_LOAD_UNTRUSTED; return false; // reason already set
 	case TARGET_COMPONENT_LOAD_BINARY_MISSING:
 	case TARGET_COMPONENT_LOAD_DEPENDENCY_MISSING:
 	case TARGET_COMPONENT_LOAD_FAILED:

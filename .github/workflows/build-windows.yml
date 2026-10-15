@@ -750,6 +750,17 @@ jobs:
             $o = Selftest-Json
             Expect ($lastExit -eq 0) "provenance: selftest exit 0 after allowlisting (got $lastExit)"
             Expect ((Plugin $o "sim-display").provenance -eq "allowlisted") "provenance: allowlisted sim-display reads allowlisted"
+            # Same gate, the other two classes: rows removed, sim-input is REFUSED and
+            # counted apart from load failures (the verdict names the gate), and
+            # sim-conversion reads UNTRUSTED. Both rows restored after.
+            reg delete $allowRoot /v $hashes[$simIn] /f | Out-Null
+            reg delete $allowRoot /v $hashes[$simConv] /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.scan_untrusted -eq 1) -and (-not $o.input_providers.active)) "provenance: unlisted sim-input is refused and counted as untrusted (untrusted=$($o.input_providers.scan_untrusted) active=$($o.input_providers.active))"
+            Expect ((Check $o "input_providers").detail -match "provenance gate") "provenance: the input verdict names the gate ($((Check $o 'input_providers').detail))"
+            Expect ((ConvRow $o "sim-conversion").load -eq "UNTRUSTED") "provenance: unlisted sim-conversion reads UNTRUSTED (got '$((ConvRow $o 'sim-conversion').load)')"
+            reg add $allowRoot /v $hashes[$simIn] /t REG_SZ /d "ci sim-input" /f | Out-Null
+            reg add $allowRoot /v $hashes[$simConv] /t REG_SZ /d "ci sim-conversion" /f | Out-Null
 
             # 2. Enabled=0 falls back (input, conversion, DP). The DP cell (N3b, #2049)
             # disables sim-display with a second row of the same DLL (sim-display-alt,

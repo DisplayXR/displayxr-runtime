@@ -1180,6 +1180,7 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	// mismatch) is a misconfiguration worth seeing even when a lower-ranked
 	// one fell through and took the roles (ADR-054 N4 conformance).
 	target_input_plugin_get_scan_result(&r->input_scan_declined, &r->input_scan_failed);
+	r->input_scan_untrusted = target_input_plugin_get_scan_untrusted();
 
 	// Nobody claimed the system. That is only a fault if a provider
 	// failed to LOAD (bad entry point, ABI-major mismatch); providers
@@ -1187,7 +1188,16 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	// DXR_SIM_INPUT opt-in left unset — is the ordinary state of most
 	// boxes and leaves qwerty correctly holding the hand roles.
 	if (!r->input_provider_active) {
-		if (r->input_scan_failed > 0) {
+		if (r->input_scan_untrusted > 0) {
+			// ADR-054 N4b: a refused provider is the trust policy speaking, not a
+			// broken DLL — say so, and where the row to write is shown.
+			r->input_evaluated = true;
+			snprintf(r->input_note, sizeof(r->input_note),
+			         "FAIL: %d registered provider(s) refused by the provenance gate (unsigned, not "
+			         "allowlisted; `input list --json` names the Trust\\Allowlist row), %d failed to load "
+			         "(%d declined cleanly)",
+			         r->input_scan_untrusted, r->input_scan_failed, r->input_scan_declined);
+		} else if (r->input_scan_failed > 0) {
 			r->input_evaluated = true;
 			snprintf(r->input_note, sizeof(r->input_note),
 			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)",
@@ -1275,11 +1285,12 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		    : r->input_ht_right_ok      ? "ok"
 		                                : "missing");
 	} else {
-		char scan[64] = {0};
-		if (r->input_scan_failed > 0) {
+		char scan[112] = {0};
+		if (r->input_scan_failed > 0 || r->input_scan_untrusted > 0) {
 			// Not a failure of THIS provider, but a better-ranked one that
 			// could not be dispatched is a misconfiguration worth a word.
-			snprintf(scan, sizeof(scan), "; %d other provider(s) failed to load", r->input_scan_failed);
+			snprintf(scan, sizeof(scan), "; %d other provider(s) failed to load, %d refused by the provenance gate",
+			         r->input_scan_failed, r->input_scan_untrusted);
 		}
 		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s%s",
 		         r->input_provider_id, r->input_left_str, r->input_right_str,
@@ -2637,8 +2648,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("registered:   %d%s\n", r->input_provider_count,
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
 	if (r->input_provider_count > 0) {
-		PT("enabled:      %d  (scan: %d declined, %d failed to load)\n", r->input_enabled_count,
-		   r->input_scan_declined, r->input_scan_failed);
+		PT("enabled:      %d  (scan: %d declined, %d failed to load, %d refused by the provenance gate)\n",
+		   r->input_enabled_count, r->input_scan_declined, r->input_scan_failed, r->input_scan_untrusted);
 	}
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
@@ -2981,6 +2992,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
 		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
 		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
+		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
@@ -3597,6 +3609,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
 		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
 		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
+		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
 		cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
 		cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);

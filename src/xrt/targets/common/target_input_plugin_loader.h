@@ -190,6 +190,14 @@ void
 target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
 
 /*!
+ * Providers the ADR-054 N4b provenance gate REFUSED at the last scan (unsigned,
+ * not allowlisted, no admissible override) — not part of @p out_failed above,
+ * so a verdict can name the gate instead of "failed to load".
+ */
+int
+target_input_plugin_get_scan_untrusted(void);
+
+/*!
  * Read the ForceQwerty debug override — `HKLM\Software\DisplayXR\Input\
  * ForceQwerty` (DWORD != 0) on Windows, a `force_qwerty` file in the
  * per-user manifest dir on POSIX (first byte '0' = off, anything else =

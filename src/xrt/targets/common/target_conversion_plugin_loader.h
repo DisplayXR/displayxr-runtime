@@ -97,6 +97,7 @@ enum xrt_conversion_plugin_load_status
 	XRT_CONV_LOAD_DECLINED,         //!< negotiate returned XRT_ERROR_PROBER_NOT_SUPPORTED
 	XRT_CONV_LOAD_NEGOTIATE_FAILED, //!< negotiate failed, or returned no / a too-small iface
 	XRT_CONV_LOAD_ABI_MISMATCH,     //!< plugin_api != XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT
+	XRT_CONV_LOAD_UNTRUSTED,        //!< ADR-054 N4b: the provenance gate refused the binary (unsigned, not allowlisted)
 };
 
 //! One `Settings\<KEY>` value (Windows) / "settings" member (POSIX), as a string.

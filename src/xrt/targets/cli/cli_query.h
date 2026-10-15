@@ -374,6 +374,7 @@ struct cli_query_result
 	int input_enabled_count;     //!< ...of which Enabled (ADR-054 N4: Enabled=0 must fall back)
 	int input_scan_declined;     //!< loader scan: providers that declined cleanly
 	int input_scan_failed;       //!< loader scan: providers that could not be dispatched (load / ABI)
+	int input_scan_untrusted;    //!< loader scan: providers the provenance gate refused (ADR-054 N4b)
 	bool input_force_qwerty;     //!< ForceQwerty override set
 	bool input_provider_active;  //!< a provider claimed the system
 	bool input_provider_present; //!< …and its hardware is there right now
@@ -389,7 +390,7 @@ struct cli_query_result
 	char input_ranked[16][64];
 	char input_left_str[256];
 	char input_right_str[256];
-	char input_note[160];
+	char input_note[256];
 
 	/* Rig (navigation) role checks (ADR-034 Amendment 4 / #1380). ABSENCE
 	 * NEVER FAILS: with no `XRT_DEVICE_TYPE_NAVIGATION` device in the
