@@ -624,6 +624,9 @@ if [ "$COMPONENT" = unity ]; then
       SIGNED_DLL=""
       if sign_track sign-artifact "$SIGN_TAG" -f release_tag="$SIGN_TAG"; then
         RID="$SIGN_RUN"
+        # Clear the download dirs first: a stale signed.zip left in $D/out (e.g. when $D is a
+        # reused scratch folder) makes unzip extract the WRONG file and the identity check refuse it.
+        rm -rf "$D/out" "$D/signed"
         gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
         # portable unzip (git-bash on Windows has no `unzip`).
         if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
