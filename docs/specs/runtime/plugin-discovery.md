@@ -222,10 +222,10 @@ succeeds, it wins regardless of `ProbeOrder`. If the id is unregistered or
 fails to load, discovery silently falls back to the normal `ProbeOrder`
 order; if it is **disabled** (`Enabled` = 0, below) it falls back with one
 WARN — `Enabled=0` is the stronger verb. The override is **sticky** — the
-mid-install re-scan never swaps it out — and, because the loader is
-one-shot per process, a change takes effect only for processes started
-afterward (restart the service to switch a live session; live re-select is
-#2051).
+mid-install re-scan never swaps it out. A change reaches a running service
+through the live re-select path (§4.2a): a secondary screen's segment DP
+follows at once, the primary screen's DP at the next session; in-process
+apps read it at their next launch.
 
 **Per-user policy (N3b, ADR-054 verbs `enable|disable` and `prefer`).** Two
 values are also read from **HKCU**, where they win over HKLM; they are what
@@ -768,6 +768,34 @@ loop and starts a successor (`--adoption-restart-after-pid <pid>`), which waits
 for the old process to exit and builds its system on the new plug-in. A
 successor never restarts itself for adoption again (no loop on a flapping
 probe).
+
+### 4.2a Live `Enabled` / `PreferredPlugin` change (ADR-054 N3d, #2051)
+
+A policy write — the root `PreferredPlugin` (§2.1 / §3.3), a row's `Enabled`
+(N3b) — is a world event of the same class as a registration change, and it
+is delivered the same way whether the CLI made it or a registry / file edit
+did:
+
+| Who | How the service learns | What happens |
+|---|---|---|
+| `displayxr-cli dp use|reset` (and `dp enable|disable`, N3b) | the DIAG call `system_request_display_reprobe` right after the write (`dp use --screen` has always done this) | the debounced re-probe worker runs at once |
+| a dashboard / `reg.exe` / editor write | the service's one component-policy watch thread (`service_component_watch.c`): `RegNotifyChangeKeyValue` on HKLM **and HKCU** `DisplayProcessors`, debounced 500 ms; on POSIX a 2 s mtime poll of the per-user dir (`preferred`, the manifests) | the same re-probe, within ~1 s |
+
+The re-probe is bound by the no-live-swap rule above: a **secondary screen's
+segment DP** is re-resolved against the new policy and follows within ~1 s
+(the segment manager recreates it); the **primary screen's DP** — held by the
+system compositor and every client's shared-memory snapshot — changes at the
+next session, and the log says so. `Enabled` = 0 for a plug-in that is
+already loaded as a display-claim source **withdraws its claims** at that
+re-resolve (`'<id>' withdrawn from the display claims (Enabled=0, user)` in
+the log, `re-admitted` on the way back), so the screen table — what
+`status` reports as each screen's claim — follows the policy at once even
+though the primary's live DP does not. Nothing is unloaded. **In-process apps**
+(`_handle` / `_hosted` / `_texture` without the service) run the loader once
+at `xrCreateInstance` and are unaffected until their next launch — the watch
+exists only in the service process, which is the only one that outlives a
+policy edit. The CLI's post-write message states exactly this (now / next
+session / next launch); "restart the service" is no longer the answer.
 
 ### 4.3 Provenance: signed, allowlisted or admitted (ADR-054 N4b)
 
