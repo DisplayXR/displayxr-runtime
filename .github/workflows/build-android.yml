@@ -199,7 +199,13 @@ jobs:
       # (persist.debug.cnsdk.cam / debug.cnsdk.cam) in the service APKs; no API
       # the plug-in calls changes. Moved in lockstep with versions.json
       # cnsdk_services so the bundle ships the 0.10.79 -63mm services.
-      CNSDK_TAG: v0.10.79
+      # v0.10.80: matches leia-plugin v2.15.8 (built against
+      # cnsdk-android-0.10.80+202.528800d.zip). CNSDK #753: the Vulkan weaver's
+      # per-RenderState fence, UBOs and descriptor set are ringed per in-flight
+      # frame -- layer 2 of the GPU-side weave-sync chain (ADR-055 / #2095;
+      # layer 1 = this runtime's semaphores, layer 3 = leia-plugin #374). Only
+      # RendererVulkan.cpp changed; no API, loader or INTRODUCED_IN change.
+      CNSDK_TAG: v0.10.80
 
     steps:
 
