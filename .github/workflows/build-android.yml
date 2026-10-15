@@ -205,7 +205,13 @@ jobs:
       # frame -- layer 2 of the GPU-side weave-sync chain (ADR-055 / #2095;
       # layer 1 = this runtime's semaphores, layer 3 = leia-plugin #374). Only
       # RendererVulkan.cpp changed; no API, loader or INTRODUCED_IN change.
-      CNSDK_TAG: v0.10.80
+      # v0.10.81: matches leia-plugin v2.15.9 (built against
+      # cnsdk-android-0.10.81+204.2e95902.zip). CNSDK #754: the head-tracking
+      # service reopens a lost camera (ISP fault, another app taking the front
+      # camera, HAL restart) by rebuilding the tracking session with a 1 s -> 30 s
+      # back-off instead of staying untracked until the service restarts.
+      # Service-side only; no API, loader or INTRODUCED_IN change.
+      CNSDK_TAG: v0.10.81
 
     steps:
 
