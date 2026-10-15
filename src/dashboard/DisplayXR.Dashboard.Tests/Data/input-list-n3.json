@@ -1,0 +1,36 @@
+{
+ "force_qwerty": false,
+ "preferred": null,
+ "providers": [
+  {
+   "id": "DisplayXR-Ultraleap",
+   "display_name": "Input Provider",
+   "vendor": "",
+   "version": "",
+   "probe_order": 50,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Runtime\\plugins\\DisplayXR-Ultraleap.dll",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\<unreadable>)",
+   "signer": "",
+   "preferred": false,
+   "active": true
+  },
+  {
+   "id": "portalvr-input",
+   "display_name": "PortalVR PSVR2 + Leap",
+   "vendor": "PortalVR",
+   "version": "0.3.0-preview.1",
+   "probe_order": 50,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Plugins\\PortalVR\\0.3.0-preview.1\\payload\\bin\\plugins\\PortalVR-DisplayXR-Input.dll",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\3e92e5e9b70c696ccb7fe378e3c16405418c5747f9de2d439b234127d9a0271f)",
+   "signer": "",
+   "preferred": false,
+   "active": false
+  }
+ ]
+}

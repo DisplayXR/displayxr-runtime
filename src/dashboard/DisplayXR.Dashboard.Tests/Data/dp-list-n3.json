@@ -1,0 +1,77 @@
+{
+ "preferred": null,
+ "plugins": [
+  {
+   "id": "leia-sr",
+   "display_name": "DisplayXR Leia SR",
+   "vendor": "Leia Inc.",
+   "version": "2.15.2",
+   "probe_order": 50,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Plugins\\LeiaSR\\DisplayXR-LeiaSR.dll",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "signed",
+   "provenance_reason": "valid Authenticode chain to a trusted root",
+   "signer": "Leia, Inc.",
+   "active": true,
+   "preferred": false
+  },
+  {
+   "id": "sim-display",
+   "display_name": "DisplayXR Sim Display",
+   "vendor": "DisplayXR",
+   "version": "2.41.1",
+   "probe_order": 200,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Runtime\\plugins\\DisplayXR-SimDisplay.dll",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "allowlisted",
+   "provenance_reason": "SHA-256 is in the admin allowlist",
+   "signer": "",
+   "active": false,
+   "preferred": false
+  }
+ ],
+ "screens": [
+  {
+   "key": "AUO-B194-00000000@DISPLAY1",
+   "device_name": "\\\\.\\DISPLAY1",
+   "friendly_name": "AUO B194",
+   "effective_plugin": "leia-sr",
+   "preferred_plugin": null,
+   "preferred_source": null,
+   "forced": false,
+   "apply": "next-session",
+   "candidates": [
+    {
+     "plugin_id": "leia-sr",
+     "confidence": 100
+    },
+    {
+     "plugin_id": "sim-display",
+     "confidence": 10
+    }
+   ]
+  },
+  {
+   "key": "ACR-0001-00000000@DISPLAY5",
+   "device_name": "\\\\.\\DISPLAY5",
+   "friendly_name": "ACR 0001",
+   "effective_plugin": "leia-sr",
+   "preferred_plugin": null,
+   "preferred_source": null,
+   "forced": false,
+   "apply": "live",
+   "candidates": [
+    {
+     "plugin_id": "leia-sr",
+     "confidence": 100
+    },
+    {
+     "plugin_id": "sim-display",
+     "confidence": 10
+    }
+   ]
+  }
+ ]
+}
