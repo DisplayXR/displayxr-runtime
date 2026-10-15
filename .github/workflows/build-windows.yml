@@ -857,6 +857,44 @@ jobs:
             reg delete $inRoot /v PreferredPlugin /f | Out-Null
             reg delete "$inRoot\sim-input-alt" /f | Out-Null
 
+            # 3e. The EmulatedControllers gate (ADR-054 N7, #2143): class policy under
+            # the InputProviders root — `InputProviders\Policy\EmulatedControllers`,
+            # HKCU over HKLM, HKCU hidden by Policy\Lock. 0 = the qwerty left/right
+            # pair is not published (the qwerty head stays); sim-input, resident,
+            # still holds the hands. Every verdict is a selftest --json field: the
+            # gate's {value, source} and the device list, never log text. HKLM is
+            # restored in the finally block.
+            function QwertyPair($o) { @($o.input_providers.devices | Where-Object { $_.str -match '^Qwerty (Left|Right) Controller$' }).Count }
+            function Gate($o) { "$($o.input_providers.emulated_controllers.value)/$($o.input_providers.emulated_controllers.source)/pair=$(QwertyPair $o)" }
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "default") -and ((QwertyPair $o) -eq 2)) "emulated: absent reads value=1 source=default with the qwerty pair present (got $(Gate $o))"
+            reg add "$inRoot\Policy" /v EmulatedControllers /t REG_DWORD /d 0 /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "emulated: selftest exit 0 with the gate off (got $lastExit)"
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 0) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 0)) "emulated: HKLM 0 reads value=0 source=machine and no qwerty left/right in the device list (got $(Gate $o))"
+            Expect (@($o.input_providers.devices | Where-Object { $_.str -eq 'Qwerty HMD' }).Count -eq 1) "emulated: the qwerty head (look-around) stays"
+            Expect ($o.input_providers.active -and (Check $o "input_providers").ok) "emulated: sim-input still holds the hand roles with the gate off"
+            # The per-user overlay (what `input emulated on` writes, no admin): HKCU 1
+            # beats HKLM 0 — unless Policy\Lock = 1, which hides the user tier.
+            reg add "HKCU\Software\DisplayXR\InputProviders\Policy" /v EmulatedControllers /t REG_DWORD /d 1 /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "user") -and ((QwertyPair $o) -eq 2)) "emulated: HKCU 1 over HKLM 0 reads value=1 source=user, pair back (got $(Gate $o))"
+            reg add "$inRoot\Policy" /v Lock /t REG_DWORD /d 1 /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 0) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 0)) "emulated: Policy\Lock hides the per-user value (got $(Gate $o))"
+            reg delete "$inRoot\Policy" /v Lock /f | Out-Null
+            reg delete "HKCU\Software\DisplayXR\InputProviders\Policy" /v EmulatedControllers /f | Out-Null
+            # `input list --json` carries the same {value, source}; `input emulated` is the verb that writes it.
+            $il = Cli-Json @("input", "list")
+            Expect (([int]$il.emulated_controllers.value -eq 0) -and ($il.emulated_controllers.source -eq "machine")) "emulated: input list --json carries {value, source} (got $($il.emulated_controllers.value)/$($il.emulated_controllers.source))"
+            & $cli input emulated on --machine | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "emulated: 'input emulated on --machine' exit 0 (got $LASTEXITCODE)"
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 2)) "emulated: the verb wrote 1 and the pair is back (got $(Gate $o))"
+            reg delete "$inRoot\Policy" /v EmulatedControllers /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "default") -and ((QwertyPair $o) -eq 2)) "emulated: deleted -> back to value=1 source=default with the pair present (got $(Gate $o))"
+
             # 3d. The one options contract (ADR-054 decision 7, N3c, #2050), on the
             # conversion class: without its ENABLE setting sim-conversion declines its
             # probe; `conv set` writes the per-user HKCU Settings\ENABLE (no admin), the
@@ -926,7 +964,8 @@ jobs:
                              "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
                              "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
                              "HKCU\Software\DisplayXR\DisplayProcessors\sim-display",
-                             "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion")) {
+                             "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion",
+                             "$inRoot\Policy", "HKCU\Software\DisplayXR\InputProviders\Policy")) {
               reg delete $k /f 2>$null | Out-Null
             }
             reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
@@ -941,7 +980,7 @@ jobs:
             Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
             exit 1
           }
-          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / ABI mismatch rejected and fallen through."
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through."
           # Explicit: the pwsh step otherwise exits with the LAST native command's
           # code, and the finally block's best-effort `reg delete` of an
           # already-removed value legitimately returns 1.
