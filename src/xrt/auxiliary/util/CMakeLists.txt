@@ -72,6 +72,8 @@ add_library(
 	u_distortion_mesh.c
 	u_distortion_mesh.h
 	u_documentation.h
+	u_eye_history.c
+	u_eye_history.h
 	u_file.c
 	u_file.cpp
 	u_file.h

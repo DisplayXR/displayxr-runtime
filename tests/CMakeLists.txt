@@ -101,6 +101,7 @@ set(tests
     tests_target_screen_pin
     tests_u_setting_per_screen
     tests_u_file_socket_path
+    tests_u_eye_history
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -480,6 +481,10 @@ endif()
 
 # Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
 target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
+
+# ADR-054 §4.1 / N6 Part 1 (#2144): the trunk's eye-pair ring sampled at a
+# target time (exact / interpolate / bounded extrapolate / stale).
+target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
 
 if(TARGET tests_sim_display_monitor_geometry)
 	# The pure pick is compiled straight in; the fixture path uses aux_os's
