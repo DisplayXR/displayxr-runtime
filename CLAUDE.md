@@ -368,7 +368,7 @@ A from-source runtime that's **ahead of the released ABI** will ABI-reject an *i
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
 ### Simulating eye tracking without hardware
-sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedDXR` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `displayxr-cli dp set sim-display TRACKING 1` (per user, next session; or `DXR_DP_SIM_DISPLAY_TRACKING=1` in the hosting process's env, which always wins) re-enables MANUAL_BIT + tracked 3D modes, and `TRACKING_PERIOD_MS` = N square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedDXR` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. The old `SIM_DISPLAY_FAKE_TRACKING=1` / `_PERIOD_MS` env names stay aliases for one release (N3c, ADR-054 decision 7 — every sim-display knob is now a setting: `dp options sim-display`). Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
 
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.

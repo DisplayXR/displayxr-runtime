@@ -156,6 +156,16 @@ An optional boolean `enabled` (`false` = the runtime never loads the plug-in) is
 
 The full discovery contract — registry layout, JSON schema, env-var overrides, fallback search order — is documented in [`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md).
 
+### Settings — the one options contract (ADR-054 decision 7)
+
+Your plug-in's own knobs (a debug overlay, a tracker tuning, a vendor-SDK toggle) go through **one** contract, the same for every component class, and you read them **only through the host iface** — never `getenv`, never an ad-hoc registry key of your own. In the service or a satellite the environment is the host's, not the user's shell, and only this path is reachable by the CLI and the Dashboard.
+
+- **Read:** `host->get_setting(iface->id, "KEY", buf, cap)` (`xrt_plugin_host_iface::get_setting`; `#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING`, NULL-check it — an older runtime leaves it NULL; the pointer lives for the process, so copy it at negotiate and read at init, then cache). The runtime resolves `DXR_DP_<ID>_<KEY>` in the hosting process's environment (always wins) → the per-user store → your row's `Settings\<KEY>` (HKLM, or the POSIX manifest's `settings` object) → nothing, in which case keep your compiled default. Values are strings; you parse.
+- **Declare:** fill the appended `iface->describe_settings` slot (`#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`) with a `static const struct xrt_component_setting_desc[]` of `{key, type, default, help}` so `displayxr-cli dp options <your-id>` lists them with their effective value and source. POSIX manifests may carry the same as a `settings_schema` array.
+- **Write (users / IT):** `displayxr-cli dp set <your-id> KEY value [--machine]` / `dp unset`. Your installer may seed `Settings\<KEY>` on your HKLM row (a `REG_SZ`); it never writes HKCU.
+
+`drivers/sim_display/sim_display_settings.c` is the worked example (36 keys behind one shim, cached per process), and the spec is [`plugin-discovery.md` §2.3](../specs/runtime/plugin-discovery.md). The in-tree reference plug-ins are guarded by CI against any `getenv` outside that shim; copy the shape.
+
 ### `ProbeOrder` convention
 
 | Range | Meaning | Examples |

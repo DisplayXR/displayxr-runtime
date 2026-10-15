@@ -178,11 +178,18 @@ that. The MANAGED/MANUAL contract they follow is in
 [`docs/specs/vendor/eye-tracking-modes.md`](../../specs/vendor/eye-tracking-modes.md);
 the advertisement rules are in ADR-022 (Amendment 1).
 
-- `SIM_DISPLAY_FAKE_TRACKING=1` (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N`):
-  a synthetic MANUAL tracker for exercising the tracking-state event. The
-  positions stay nominal.
-- `SIM_DISPLAY_WEBCAM_TRACKING=1`: real head tracking from a plain webcam
-  (MANAGED), described below.
+- `TRACKING` = 1 (+ `TRACKING_PERIOD_MS` = N): a synthetic MANUAL tracker for
+  exercising the tracking-state event. The positions stay nominal.
+- `WEBCAM_TRACKING` = 1: real head tracking from a plain webcam (MANAGED),
+  described below.
+
+Both are **settings** read through the host iface (ADR-054 decision 7, N3c):
+`displayxr-cli dp set sim-display TRACKING 1` (per user; next session), or
+`DXR_DP_SIM_DISPLAY_TRACKING=1` in the environment of the process loading the
+runtime, which always wins. `dp options sim-display` lists every key with its
+effective value and source. The former `SIM_DISPLAY_FAKE_TRACKING` /
+`SIM_DISPLAY_WEBCAM_TRACKING` (and every other `SIM_DISPLAY_*`) environment
+name keeps working for one release as an alias, with a deprecation WARN.
 
 ### Webcam eye tracking (#1855)
 

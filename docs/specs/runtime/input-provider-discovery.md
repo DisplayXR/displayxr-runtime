@@ -173,6 +173,55 @@ There is no per-user `Enabled` store on POSIX (nor is there one for
 conversion providers): `displayxr-cli input enable|disable` reports that
 and points at the manifest's `enabled` field. `--machine` is Windows-only.
 
+### Component settings — the one options contract (ADR-054 decision 7, N3c)
+
+Every component class — display processors (plugin-discovery.md §2.3), input
+providers, conversion providers (conversion-provider-discovery.md §3.9) —
+carries its per-component settings the same way, and a provider reads them
+**only through its host iface**, never from its own environment
+(`xrt/xrt_component_settings.h`; the input slot is
+`xrt_input_plugin_host_iface::get_setting(id, key, buf, cap)`, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING`, carved from `reserved[1]` at an
+unchanged ABI — the `get_display_geometry` precedent). In the service the
+environment is the host's, not the user's shell, which is why a `getenv` in a
+provider can never be reached by a CLI verb.
+
+| Tier | Where | Wins over |
+|---|---|---|
+| 1 — environment | `DXR_INPUT_<ID>_<KEY>` in the **hosting** process's environment; `<ID>` = the id upper-cased, `-` → `_` (`DXR_INPUT_SIM_INPUT_ENABLE`). Android: the `debug.xrt.` system property of the same name. A set-but-empty variable is unset. | everything — the `u_setting` rule: a launcher, a `.bat` or a harness can always take control back from a setting somebody left behind |
+| 2 — user | Windows: `HKCU\Software\DisplayXR\InputProviders\<id>\Settings\<KEY>` (`REG_SZ` or `REG_DWORD`). POSIX: `<id>.settings.json` in the per-user manifest dir (a flat object `{"KEY": "value"}`), next to `input-preferred`. | tier 3 — unless HKLM `InputProviders\Policy\Lock` = 1, the kiosk rule `Enabled` already follows (§3), which hides the user tier (never the environment) |
+| 3 — machine / manifest | Windows: `HKLM\Software\DisplayXR\InputProviders\<id>\Settings\<KEY>` (64-bit view). POSIX: the manifest's `plugin.settings` object (`"KEY": "value"`; numbers and booleans read as strings). | the provider's compiled default |
+
+Values are strings; the provider parses. Keys are `[A-Za-z0-9_]`, not
+digit-first, matched case-insensitively and conventionally upper-case.
+**Only `Settings\*` is ever read from HKCU / the per-user file**: a per-user
+store can change what a registered provider is *told*, never which binary
+loads. `u_setting_is_managed`'s allow-list (the runtime-policy `DXR_*`
+levers) is a different store this contract never touches.
+
+**Verbs** — one spelling across `dp` / `input` / `conv`
+(`cli_component_options.c`):
+
+| Verb | What |
+|---|---|
+| `displayxr-cli input options <id> [--json]` | Every key the provider declares (`xrt_input_plugin_iface::describe_settings`, `XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type, default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`). Loads + negotiates the registered binary (no probe) to ask it. |
+| `input set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written. After the write the CLI reads the key back and prints *Effective now:* the value the provider will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `input unset <id> <KEY> [--machine]` | Removes it from that store; absent is success. |
+
+**When it applies.** A provider reads its settings at init through the host
+iface (`probe()` / `create_devices()`), so a write reaches the **next session
+/ service start**; the verbs never poke the running service — restart it, or
+launch a fresh app.
+
+**Reference implementation.** `sim_input` is opt-in through this contract:
+`displayxr-cli input set sim-input ENABLE 1` (or
+`DXR_INPUT_SIM_INPUT_ENABLE=1` in the hosting process) replaces the former
+`DXR_SIM_INPUT=1`; `NAV`, `NAV_HOLD_MS`, `NAV_RECENTER_MS` replace
+`DXR_SIM_INPUT_NAV*` (§5). The old names stay aliases for **one release**
+(deprecation WARN once per key), read in `drivers/sim_input/sim_input_settings.c`
+and nowhere else — `lint.yml`'s `sim-plugin-getenv-guard` fails any other
+`getenv` under the reference plug-ins.
+
 ### Selection
 
 Entries sorted by ProbeOrder ascending; **every provider whose `probe()`
@@ -322,13 +371,15 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    absent optical tracker reports inactive joints, and qwerty has no hand
    tracking to fall back to anyway.
 6. **`sim_input` is opt-in at run time.** Being registered is not enough
-   — its `probe()` declines unless `DXR_SIM_INPUT` is set in the
-   environment of the process loading the runtime. It synthesises a fixed
-   motion pattern, so an un-gated registration silently displaces the
-   qwerty fallback with phantom controllers. (Env var rather than the
-   usual registry gate on purpose: a per-run developer switch, not
-   machine configuration. Set it process-level — the runtime DLL has its
-   own static-CRT environment block.)
+   — its `probe()` declines unless its `ENABLE` setting is 1, read through
+   the host iface (§3 *Component settings*): `displayxr-cli input set
+   sim-input ENABLE 1`, or `DXR_INPUT_SIM_INPUT_ENABLE=1` in the
+   environment of the process loading the runtime, which always wins. It
+   synthesises a fixed motion pattern, so an un-gated registration silently
+   displaces the qwerty fallback with phantom controllers. The pre-N3c
+   `DXR_SIM_INPUT=1` keeps working for one release as an alias (deprecation
+   WARN). Environment caveat unchanged: set a variable process-level — the
+   runtime DLL has its own static-CRT environment block.
 
 ## 4a. Pose anchoring — provider volumes are rig-relative
 
@@ -682,6 +733,13 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
   `input-preferred` file on POSIX, where `--machine` is refused). Every
   write says that it applies to processes started afterwards.
+- `displayxr-cli input options <id> [--json]` / `input set <id> <KEY>
+  <value> [--machine]` / `input unset <id> <KEY> [--machine]` — the ADR-054
+  `options` verb (§3 *Component settings*, N3c): what the provider declares
+  + what the stores hold, with the effective value and its source; writes go
+  to `Settings\<KEY>` on the provider's row (HKCU; HKLM with `--machine`) or
+  the POSIX per-user `<id>.settings.json`, and the provider reads them at
+  its next init.
 - `displayxr-cli selftest` — when a provider is registered and not
   ForceQwerty-overridden, asserts provider-claimed left+right
   motion-controller role devices exist with a valid interaction profile

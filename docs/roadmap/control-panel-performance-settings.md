@@ -126,6 +126,30 @@ detunes a **correctness** guard rather than trading frames for quality — `_MAS
 in particular restores the #1470 open/clip oscillation by design, which is the only reason
 it exists. Perceptual policy is the runtime's (ADR-040); none of these is a user setting.
 
+### Runtime policy vs component-owned (ADR-054 decision 7, N3c)
+
+Two stores, two name shapes, never crossed:
+
+| | Runtime policy | Component-owned |
+|---|---|---|
+| What | A lever the **runtime** reads — everything in Appendix A (`DXR_WEAVE_REPAINT`, `DXR_LATE_WEAVE_*`, the rear-budget switches, …) | A knob a **component** (display processor, input provider, conversion provider) reads about itself |
+| Name | bare `DXR_<NAME>` | `DXR_<CLASS>_<ID>_<KEY>` — `DXR_DP_SIM_DISPLAY_TRACKING`, `DXR_INPUT_SIM_INPUT_ENABLE`, `DXR_CONV_SIM_CONVERSION_ENABLE` |
+| Store | `u_setting`: the allow-list in `u_setting.c`, the per-user `settings.json`, HKLM `Software\DisplayXR\Settings`; `displayxr-cli perf` | the component's registration row: `HKLM\…\<Root>\<id>\Settings\<KEY>` + an HKCU overlay (POSIX: the manifest's `settings` object + a per-user `<id>.settings.json`); `displayxr-cli <class> options\|set\|unset` |
+| Read by | the runtime, in whichever process, through `u_setting_get_raw` | the component, **only** through its host iface `get_setting` — never `getenv` (`lint.yml` guards the reference plug-ins) |
+| Spec | this document | `docs/specs/runtime/plugin-discovery.md` §2.3 (and its input / conversion twins) |
+
+The environment wins in both (the rule above), and neither store resolves the
+other's names: `u_setting_is_managed` is untouched by the component contract,
+so a per-user component file can never flip a runtime-policy lever, and a
+`perf set` can never reach a plug-in. Every `DXR_*` in Appendix A is therefore
+runtime policy by construction; the rows that are *really* component knobs
+wearing a runtime-shaped name are marked **component-owned** in their table
+and now live behind the component contract — `DXR_SIM_INPUT*` (→ `input set
+sim-input ENABLE|NAV|NAV_HOLD_MS|NAV_RECENTER_MS`, alias for one release) and
+the whole `SIM_DISPLAY_*` family (→ `dp set sim-display <KEY>`, alias for one
+release). A vendor plug-in's knobs (Leia's, say) never appear here at all:
+they are `dp options leia-sr`.
+
 > **Security carve-out — `DXR_ALLOW_DEV_PLUGIN_PATHS`.** It is read via
 > `GetEnvironmentVariableW` in `target_plugin_path_guard.c:91`, deliberately outside the
 > `u_debug` machinery, and it **disables the #943 plug-in-path guard** — i.e. it decides
@@ -599,10 +623,10 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_ALLOW_UNVERIFIED_CONTROLLER` | `ipc/server/ipc_server_handler.c:167` | off | Svc | Accepts an unverified `CONTROLLER` claim. "Never set on a production box" |
 | `DXR_PLUGIN_EXCLUSIVE` | `targets/common/target_plugin_loader.c` (`plugin_exclusive_id` / `plugin_id_excluded`; applied in all three platforms' `discover_active_plugin` and in `collect_display_sources_platform`) | unset | Both | Loads ONLY the named display plug-in — every other registered one is skipped **before** `LoadLibrary`/`dlopen`, which `ProbeOrder` and `PreferredPlugin` never do (claim collection loads them all, #69/ADR-015). For the CTS lanes: on a box with the Leia SR plug-in installed, a `-G d3d11` run otherwise drags `SimulatedRealityOpenGL.dll` → `opengl32` → the NVIDIA GL ICD into the process and the `multithreading` case faults in an ICD worker (#1545). **No fallback on a miss** — a typo loads nothing and logs one WARN listing the registered ids. Excluded entries bypass the #1212 reject tally so `selftest` stays green. Set by `scripts/run_cts.ps1 -Plugin <name>`; not a user setting |
 | `DXR_INPUT_PROVIDERS` | `targets/common/target_input_plugin_loader.c` (`input_providers_disabled_by_env`, at the one-shot discovery site in `target_input_plugin_get_iface`) | unset (= discover) | Both | `0` skips input-provider discovery entirely: no provider DLL is loaded, `get_count()` is 0, `create_devices` is never called, hands stay on qwerty. Process-scoped twin of `HKLM\…\Input\ForceQwerty` — an env var precisely so a killed CTS run cannot leave input disabled machine-wide. Second half of the #1545 fix (the Ultraleap provider re-spins its LeapC thread pool per `xrCreateInstance`). One WARN per process |
-| `DXR_SIM_INPUT` | `drivers/sim_input/sim_input_plugin.c:59` | off | Both | Simulated-input opt-in |
-| `DXR_SIM_INPUT_NAV` | `drivers/sim_input/sim_input_plugin.c:139` | off | Both | With `DXR_SIM_INPUT=1`: adds the scripted "Sim navigation" device (rig role, ADR-034 Amendment 4) and puts the sim controllers on `RIG_LOCAL` origins. Test/CI only |
-| `DXR_SIM_INPUT_NAV_HOLD_MS` | `drivers/sim_input/sim_input_plugin.c:153` | 0 (never) | Both | Every *n* ms the scripted navigation pose reports invalid for 500 ms — exercises the composer's hold / re-align path |
-| `DXR_SIM_INPUT_NAV_RECENTER_MS` | `drivers/sim_input/sim_input_plugin.c:154` | 0 (never) | Both | Every *n* ms the scripted device publishes a durable RECENTER timestamp together with a phase jump — exercises recenter alignment; CI runs 400 |
+| `DXR_SIM_INPUT` | `drivers/sim_input/sim_input_settings.c` (legacy alias only) | off | Both | **Component-owned** (N3c): the sim-input provider's `ENABLE` setting — `displayxr-cli input set sim-input ENABLE 1` / `DXR_INPUT_SIM_INPUT_ENABLE=1`. This name is a one-release alias with a deprecation WARN, not a runtime lever |
+| `DXR_SIM_INPUT_NAV` | `drivers/sim_input/sim_input_settings.c` (legacy alias only) | off | Both | **Component-owned**: sim-input `NAV`. With `ENABLE`: adds the scripted "Sim navigation" device (rig role, ADR-034 Amendment 4) and puts the sim controllers on `RIG_LOCAL` origins. Test/CI only |
+| `DXR_SIM_INPUT_NAV_HOLD_MS` | `drivers/sim_input/sim_input_settings.c` (legacy alias only) | 0 (never) | Both | **Component-owned**: sim-input `NAV_HOLD_MS`. Every *n* ms the scripted navigation pose reports invalid for 500 ms — exercises the composer's hold / re-align path |
+| `DXR_SIM_INPUT_NAV_RECENTER_MS` | `drivers/sim_input/sim_input_settings.c` (legacy alias only) | 0 (never) | Both | **Component-owned**: sim-input `NAV_RECENTER_MS`. Every *n* ms the scripted device publishes a durable RECENTER timestamp together with a phase jump — exercises recenter alignment; CI runs 400 |
 | `DXR_LEGACY_STANDALONE` | `compositor/d3d11_service/comp_d3d11_service.cpp:286` | off | Svc | Reverts the service to the pre-hybrid standalone path (ADR-035 D3, slated for deletion) |
 | `DXR_COLOR_LEGACY_UNORM_ENCODED` | `auxiliary/util/u_color_encoding.h` (`u_color_legacy_unorm_encoded`, read once; consulted by every compose site that writes the atlas and by both zero-copy gates) | off | Both | #1589/#1610 transitional escape hatch: restores the pre-flip reading that a UNORM colour swapchain holds ALREADY-ENCODED bytes. With it on, sources are sampled through non-decoding views, no private `_SRGB`-view compose target is created, and layers blend in encoded space — i.e. the old behaviour WHOLESALE, one switch. **Never a Control Panel candidate** (a correctness/compat override, not a performance lever) and **to be deleted two releases after the flip ships**. Each component logs one `U_LOG_W` at init stating which regime it is in. See [ADR-021](../adr/ADR-021-color-management-encoding-state-invariant.md) |
 | `DXR_VIEW_CONFIG_LEGACY` | `state_trackers/oxr/oxr_system.c` (`oxr_system_fill_in`, `DEBUG_GET_ONCE_BOOL_OPTION`) | off | App | #1486 kill switch: restores the pre-#1486 single view configuration — `PRIMARY_STEREO` for any `view_count >= 2`, reporting the max across modes (4 on sim-display), and no `PRIMARY_MULTIVIEW_DXR`. Reintroduces the spec deviation and the CTS red on purpose, for one round of field bisection. Logs one `U_LOG_W` when active. 22 characters, so `debug.xrt.DXR_VIEW_CONFIG_LEGACY` is **stranded on Android** by the `PROP_NAME_MAX` trap above — env-only in practice. See [View-Configuration Model](../reference/view-configuration-model.md) |
@@ -623,8 +647,10 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 `GetEnvironmentVariableA` for exactly the split-CRT reason described in *The problem*) ·
 `XRT_PRINT_OPTIONS` (logs every `debug_get_*_option` read — the closest thing to a
 provenance tool that exists today) · `XRT_PREFERRED_PLUGIN_ID` / `XRT_PLUGIN_SEARCH_PATH` ·
-`XRT_LOG` / `XRT_JSON_LOG` · the `OXR_*`, `IPC_*`, `SIM_DISPLAY_*` and `DISPLAYXR_*`
-families.
+`XRT_LOG` / `XRT_JSON_LOG` · the `OXR_*`, `IPC_*` and `DISPLAYXR_*` families · the
+`SIM_DISPLAY_*` family, which is **component-owned** since N3c (`dp options sim-display`
+lists every key; `SIM_DISPLAY_<X>` / `SIM_DISPLAY_FAKE_<X>` are one-release aliases of
+`dp set sim-display <X>` / `DXR_DP_SIM_DISPLAY_<X>`).
 
 ## Appendix B — keeping this table honest
 

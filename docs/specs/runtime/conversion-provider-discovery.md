@@ -177,7 +177,7 @@ Each rule must hold in both hostings.
 | `Hosting` | REG_SZ | no | `auto` (default) / `in-service` / `satellite`, for plug-in providers. P1 honours `in-service` only; from P2, `auto` = satellite for every out-of-tree DLL. The legacy adapter is always in-service (§4.5) |
 | `Supersedes` | REG_SZ | no | `dp-lift` hides the legacy adapter row (§4.5). Hides only the named id; never affects selection among other providers, so a vendor provider whose module is absent still falls through to the next candidate |
 | `Packs` | REG_MULTI_SZ | no | absolute paths of the provider's model-pack manifests (§5) |
-| `Settings\*` | REG_SZ | no | read through `host->get_setting`; replaces per-vendor ad-hoc knob keys and sidesteps the logon-environment trap |
+| `Settings\*` | REG_SZ | no | read through `host->get_setting`; replaces per-vendor ad-hoc knob keys and sidesteps the logon-environment trap. Since N3c the machine tier of the one options contract (§3.9): a per-user HKCU `Settings\<KEY>` overrides it (`conv set <id> <KEY> <value>`), `DXR_CONV_<ID>_<KEY>` (§3.2) overrides both |
 
 **Root values** (on `ConversionProviders`). **HKCU overrides HKLM** where noted, unless HKLM `Policy\Lock` = 1, which makes every HKLM value win (kiosks, IT policy).
 
@@ -273,6 +273,52 @@ The ABI allows one DLL to export both `xrtPluginNegotiate` and `xrtConversionPlu
 The runtime installer does **not** register `sim-conversion` on user installs (FALLBACK, setting-gated, §6.1). CI and `register_dev_plugin.bat conv sim` do.
 
 ---
+
+### 3.9 Component settings — the one options contract (ADR-054 decision 7, N3c)
+
+Every component class — display processors (plugin-discovery.md §2.3), input
+providers (input-provider-discovery.md § *Component settings*), conversion
+providers — carries its per-component settings the same way, and a provider
+reads them **only through its host iface**, never from its own environment
+(§2.4; `xrt_conversion_plugin_host_iface::get_setting(key, buf, cap)` keeps
+its keyless v1 shape — the host binds the provider — and the shared store
+behind it is `xrt/xrt_component_settings.h`'s). This section is the
+conversion wording of the contract the §3.1 `Settings\*` row and §3.2
+`DXR_CONV_<ID>_<KEY>` already described; what N3c adds is the **per-user tier**
+and the verbs.
+
+| Tier | Where | Wins over |
+|---|---|---|
+| 1 — environment | `DXR_CONV_<ID>_<KEY>` in the **hosting** process's environment (the service's, or the satellite host's; §3.2); `<ID>` = the id upper-cased, `-` → `_` (`DXR_CONV_SIM_CONVERSION_ENABLE`). Android: the `debug.xrt.` system property of the same name. A set-but-empty variable is unset. | everything — the `u_setting` rule |
+| 2 — user | Windows: `HKCU\Software\DisplayXR\ConversionProviders\<id>\Settings\<KEY>` (`REG_SZ` or `REG_DWORD`). POSIX: `<id>.settings.json` in the per-user manifest dir (a flat object `{"KEY": "value"}`). | tier 3 — unless HKLM `ConversionProviders\Policy\Lock` = 1 (§3.1), which hides the user tier (never the environment) |
+| 3 — machine / manifest | Windows: `HKLM\…\ConversionProviders\<id>\Settings\<KEY>` (64-bit view, §3.1). POSIX: the manifest's `settings` object (§3.5). | the provider's compiled default |
+
+Values are strings; the provider parses. Keys are `[A-Za-z0-9_]`, not
+digit-first, matched case-insensitively and conventionally upper-case.
+**Only `Settings\*` is ever read from HKCU / the per-user file**: a per-user
+store can change what a registered provider is *told*, never which binary
+loads. `u_setting_is_managed`'s allow-list is a different store this contract
+never touches.
+
+**Verbs** — one spelling across `dp` / `input` / `conv`
+(`cli_component_options.c`; §7.1):
+
+| Verb | What |
+|---|---|
+| `displayxr-cli conv options <id> [--json]` | Every key the provider declares (`xrt_conversion_plugin_iface::describe_settings`, appended past `destroy`, `XRT_CONVERSION_PLUGIN_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type, default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`). Loads + negotiates the registered binary (no probe, no `describe_cap`) to ask it; the built-in `dp-lift` adapter has no row and no settings. |
+| `conv set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written. After the write the CLI reads the key back and prints *Effective now:* the value the provider will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `conv unset <id> <KEY> [--machine]` | Removes it from that store; absent is success. |
+
+**When it applies.** The running service re-describes on its registry watch
+(§4.1), re-reading tiers 1 and 2 live through its per-provider host, so a
+`conv set` reaches the next re-describe / next stream or job create; a live
+stream never moves. (Display processors and input providers read at init
+instead: next session / service start.)
+
+**Reference implementation.** `sim-conversion`'s `ENABLE` (§6.1): `conv set
+sim-conversion ENABLE 1` makes `conv list` negotiate and select it; with
+`DXR_CONV_SIM_CONVERSION_ENABLE=0` in the service's environment `conv
+options` reports `source: environment` and the provider declines again.
 
 ## 4. Lifetime and hosting
 
@@ -516,6 +562,7 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 | `conv use <task> <id>[/<cap>] [--machine]` / `conv reset <task>\|all` | registry (HKCU; HKLM with `--machine`) | per-task preference, like `dp use --screen` |
 | `conv warm <task>\|<id>/<cap> [--wait]` / `conv evict <task>` | DIAG → service | explicit prewarm / unload; `evict` is accepted only on the CLI's own DIAG connection |
 | `conv enable\|disable <id>` | registry | `Enabled` |
+| `conv options <id> [--json]` / `conv set <id> <KEY> <value> [--machine]` / `conv unset <id> <KEY> [--machine]` | registry (HKCU; HKLM with `--machine`) / the POSIX per-user `<id>.settings.json`; `options` negotiates the binary headless | the one options contract (§3.9, N3c): declared + stored keys with value and source; `Settings\<KEY>` writes |
 | `conv probe <task> <file\|dir>` | APP connection, stream lane | today's `lift probe` |
 | `conv run <task> <in> <out> [--provider]` | APP connection, job lane | file → file; the CLI decodes and encodes files itself (the service never does); MCP `convert_file` backend |
 | `conv jobs` / `conv cancel <id>` | DIAG | |
