@@ -256,6 +256,45 @@ component, or run its standalone installer — which requires only the DisplayXR
 
 ---
 
+## Plug-in refused: `REFUSING unverified binary` / `UNTRUSTED` (ADR-054 N4b)
+
+**Symptom.** `displayxr-cli selftest` fails (or an app falls back to `sim-display`,
+or finds no display processor at all) and the log has one ERROR line per refused
+DLL:
+
+```
+plugin loader:   leia-sr: REFUSING unverified binary C:\...\DisplayXR-LeiaSR.dll — unsigned and not allowlisted (to allow: Trust\Allowlist\<sha256>) (enforcing; Trust\Enforce = 0 opts out, ADR-054 N4b).
+```
+
+`displayxr-cli dp list` / `input list` / `conv list` show the row with
+`provenance=unverified` and `UNTRUSTED`; `selftest --json` has the same under
+`plugins[].provenance` / `provenance_reason`.
+
+**Cause — the provenance gate enforces by default on Windows.** A component
+binary must be Authenticode-signed (any trusted root) or have its SHA-256 under
+`HKLM\Software\DisplayXR\Trust\Allowlist`. Released installers satisfy this
+(signed release, or the installer writes the row for what it ships). What trips
+it:
+
+- **A dev-built DLL registered before the gate existed, or rebuilt since.** Every
+  rebuild is a new digest. Re-run `scripts\register_dev_plugin.bat …` (elevated) for
+  the DLL — it registers *and* allowlists — or `scripts/push-runtime-pf.sh`, which
+  allowlists everything it copies into Program Files.
+- **`DXR_ALLOW_DEV_PLUGIN_PATHS=1` set, but the process is elevated.** The dev
+  override is deliberately refused on an elevated host (an admin prompt, an
+  installer-restarted service, a CI runner). Allowlist the file instead, or run the
+  app from a normal prompt.
+- **A vendor installer that ships unsigned builds and writes no row.** The vendor's
+  bug: its installer must write the row (vendor onboarding guide §5), or ship signed.
+
+**Fixes, most to least specific.**
+
+1. Write the row the log names: `reg add HKLM\Software\DisplayXR\Trust\Allowlist /v <sha256> /t REG_SZ /d "why" /f /reg:64` (get the digest with `certutil -hashfile <dll> SHA256`), then restart the service.
+2. Re-run the component's installer (released installers write their rows).
+3. Opt out for this box, one release only: `reg add HKLM\Software\DisplayXR\Trust /v Enforce /t REG_DWORD /d 0 /f /reg:64` — the gate goes back to audit (logs `unverified`, loads anyway). Delete the value to enforce again.
+
+---
+
 ## Vulkan app crashes immediately on launch
 
 **Symptom.** A Vulkan-backed app crashes at or just after startup (often a null-pointer

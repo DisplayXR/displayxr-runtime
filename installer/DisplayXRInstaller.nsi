@@ -86,6 +86,22 @@ ShowUninstDetails show
 ; !makensis, so do not depend on the working directory.
 !include "${__FILEDIR__}\FilesInUse.nsh"
 
+; ADR-054 N4b (PR B): the provenance gate enforces by default — a plug-in DLL
+; must be signed or allowlisted (SHA-256 under HKLM\Software\DisplayXR\Trust\
+; Allowlist) or the runtime refuses to load it. installer/gen_allowlist_nsh.cmake
+; computes the rows for the DLL(s) this installer ships from the exact bytes
+; being packed; the macros below write them at install and drop them at
+; uninstall. A hand-run makensis without the define builds an installer that
+; writes nothing (a signed release needs no row).
+!ifdef ALLOWLIST_NSH
+	!include "${ALLOWLIST_NSH}"
+!else
+	!macro DXR_ALLOWLIST_WRITE
+	!macroend
+	!macro DXR_ALLOWLIST_REMOVE
+	!macroend
+!endif
+
 ; Windows constants for PATH modification
 !ifndef HWND_BROADCAST
 	!define HWND_BROADCAST 0xFFFF
@@ -1004,6 +1020,9 @@ client_dll_ok:
 		"Version" "${VERSION}"
 	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
 		"ProbeOrder" 200
+	; ADR-054 N4b: the digest of the sim-display DLL just written, so the
+	; enforcing provenance gate admits it even when this build is unsigned.
+	!insertmacro DXR_ALLOWLIST_WRITE
 	; No UninstallString — sim-display is owned by this runtime
 	; installer; the runtime uninstaller drops this subkey + its DLL
 	; directly.
@@ -1356,6 +1375,9 @@ Section "Uninstall"
 	; else is left in it.
 	; -----------------------------------------------------------------
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\sim-display"
+	; ADR-054 N4b: the allowlist rows this installer wrote for its own DLL(s);
+	; rows other installers or register_dev_plugin.bat wrote are left alone.
+	!insertmacro DXR_ALLOWLIST_REMOVE
 	ReadRegStr $0 HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"
 	${If} $0 == "sim-display"
 		DeleteRegValue HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"

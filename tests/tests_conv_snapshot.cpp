@@ -11,6 +11,7 @@
  * by path (tests_conv_snapshot_stub.c), like tests_conversion_loader.
  */
 
+#include "target_component_loader.h"
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 
@@ -501,10 +502,12 @@ stub_entry(const char *id, const char *path, uint32_t order)
 TEST_CASE("conv headless: a well-formed provider describes, selects, and never warms", "[conv_snapshot][headless]")
 {
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1"); // stubs live in the build tree (#952 guard)
+	target_component_trust_set_enforce_override(0); // unsigned build-tree stubs (ADR-054 N4b PR B)
 	xrt_conversion_plugin_entry e[1] = {stub_entry("stub-good", CONV_SNAP_STUB_GOOD, 250)};
 	auto st = std::make_unique<target_conv_status>();
 	target_conv_status_build_from_entries(e, 1, nullptr, nullptr, st.get());
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 
 	CHECK(st->registered == 1);
 	CHECK(st->negotiated == 1);
@@ -547,11 +550,13 @@ TEST_CASE("conv headless: a well-formed provider describes, selects, and never w
 TEST_CASE("conv headless: a malformed descriptor is counted (selftest exit 13)", "[conv_snapshot][headless][selftest]")
 {
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	target_component_trust_set_enforce_override(0); // unsigned build-tree stubs (ADR-054 N4b PR B)
 	xrt_conversion_plugin_entry e[2] = {stub_entry("stub-good", CONV_SNAP_STUB_GOOD, 100),
 	                                    stub_entry("stub-malformed", CONV_SNAP_STUB_MALFORMED, 200)};
 	auto st = std::make_unique<target_conv_status>();
 	target_conv_status_build_from_entries(e, 2, nullptr, nullptr, st.get());
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 
 	CHECK(st->negotiated == 2);
 	CHECK(st->bad_descriptors == 1);
@@ -610,10 +615,12 @@ TEST_CASE("conv headless: a malformed descriptor is counted (selftest exit 13)",
 TEST_CASE("conv headless: an out-of-range get_state is malformed too", "[conv_snapshot][headless][selftest]")
 {
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	target_component_trust_set_enforce_override(0); // unsigned build-tree stubs (ADR-054 N4b PR B)
 	xrt_conversion_plugin_entry e[1] = {stub_entry("stub-bad-state", CONV_SNAP_STUB_BAD_STATE, 100)};
 	auto st = std::make_unique<target_conv_status>();
 	target_conv_status_build_from_entries(e, 1, nullptr, nullptr, st.get());
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 	CHECK(st->bad_descriptors == 1);
 	CHECK(std::string(st->bad_note).find("out of range") != std::string::npos);
 }
@@ -621,6 +628,7 @@ TEST_CASE("conv headless: an out-of-range get_state is malformed too", "[conv_sn
 TEST_CASE("conv headless: a per-user Enabled = 0 override disables without loading", "[conv_snapshot][headless]")
 {
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	target_component_trust_set_enforce_override(0); // unsigned build-tree stubs (ADR-054 N4b PR B)
 	xrt_conversion_plugin_entry e[1] = {stub_entry("stub-good", CONV_SNAP_STUB_GOOD, 100)};
 	auto pol = std::make_unique<target_conv_policy>();
 	std::memset(pol.get(), 0, sizeof(*pol));
@@ -630,6 +638,7 @@ TEST_CASE("conv headless: a per-user Enabled = 0 override disables without loadi
 	auto st = std::make_unique<target_conv_status>();
 	target_conv_status_build_from_entries(e, 1, nullptr, pol.get(), st.get());
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 	CHECK(st->negotiated == 0);
 	REQUIRE(st->provider_count == 1);
 	CHECK_FALSE(st->providers[0].enabled);
@@ -639,8 +648,10 @@ TEST_CASE("conv headless: a per-user Enabled = 0 override disables without loadi
 	pol->policy_lock = true;
 	xrt_conversion_plugin_entry e2[1] = {stub_entry("stub-good", CONV_SNAP_STUB_GOOD, 100)};
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	target_component_trust_set_enforce_override(0); // unsigned build-tree stubs (ADR-054 N4b PR B)
 	target_conv_status_build_from_entries(e2, 1, nullptr, pol.get(), st.get());
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 	CHECK(st->negotiated == 1);
 	CHECK(st->providers[0].enabled);
 }

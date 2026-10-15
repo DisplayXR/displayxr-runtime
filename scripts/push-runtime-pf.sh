@@ -82,11 +82,11 @@ echo "== refreshed $refreshed already-installed plug-in DLL(s) under plugins/"
 
 # 3c. ADR-054 N4b: the provenance gate. Dev builds are unsigned, so allowlist the
 # SHA-256 of every plug-in DLL now under PF\plugins (value name = hex digest under
-# HKLM\Software\DisplayXR\Trust\Allowlist). Audit mode today (an unlisted DLL is
-# only logged "unverified"); once Trust\Enforce is set an unlisted dev DLL would be
-# refused, and the installed service is restarted ELEVATED by installers, where the
-# DXR_ALLOW_DEV_PLUGIN_PATHS override is deliberately not honoured. Best-effort:
-# needs an elevated shell, like the Version write below.
+# HKLM\Software\DisplayXR\Trust\Allowlist). The gate ENFORCES by default on
+# Windows (PR B): an unlisted dev DLL is refused, and the installed service is
+# restarted ELEVATED by installers, where the DXR_ALLOW_DEV_PLUGIN_PATHS override
+# is deliberately not honoured — so without these rows a pushed dev build has no
+# DP. Best-effort: needs an elevated shell, like the Version write below.
 allowed=0
 for f in "$PF"/plugins/*.dll; do
   [ -f "$f" ] || continue
@@ -99,7 +99,7 @@ done
 if [ "$allowed" -gt 0 ]; then
   echo "== allowlisted $allowed plug-in DLL digest(s) under HKLM\\Software\\DisplayXR\\Trust\\Allowlist (ADR-054 N4b)"
 else
-  echo "WARN: could not allowlist plug-in digests (not elevated?) — they read 'unverified' in audit mode (ADR-054 N4b)" >&2
+  echo "WARN: could not allowlist plug-in digests (not elevated?) — the enforcing gate will REFUSE the pushed plug-ins (ADR-054 N4b); re-run elevated or run scripts\\register_dev_plugin.bat" >&2
 fi
 
 # Keep the installed MCP adapter in place (voice resolves it CWD-relative from

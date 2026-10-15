@@ -61,7 +61,19 @@ set(DISPLAYXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 # Create installer target
 # White icon is set via MUI_ICON in the .nsi script (visible in dark mode Explorer).
 # Do NOT use rcedit post-build — it corrupts NSIS self-extracting executables.
+# ADR-054 N4b (PR B): the provenance allowlist rows for the plug-in DLL(s) the
+# installer ships, computed from the exact bytes in the install prefix right
+# before makensis runs (see gen_allowlist_nsh.cmake).
+set(DISPLAYXR_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
+# makensis resolves `!include` against a native (backslash) path only.
+file(TO_NATIVE_PATH "${DISPLAYXR_ALLOWLIST_NSH}" DISPLAYXR_ALLOWLIST_NSH_NATIVE)
+
 add_custom_target(installer
+	COMMAND "${CMAKE_COMMAND}"
+		"-DBIN_DIR=${DISPLAYXR_BIN_DIR}"
+		"-DVERSION=${DISPLAYXR_VERSION}"
+		"-DOUT=${DISPLAYXR_ALLOWLIST_NSH}"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
 	COMMAND "${NSIS_EXECUTABLE}"
 		"/DVERSION=${DISPLAYXR_VERSION}"
 		"/DVERSION_MAJOR=${DISPLAYXR_VERSION_MAJOR}"
@@ -72,6 +84,7 @@ add_custom_target(installer
 		"/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
 		"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
 		"/DSIGN_CMD=${SIGN_CMD}"
+		"/DALLOWLIST_NSH=${DISPLAYXR_ALLOWLIST_NSH_NATIVE}"
 		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRInstaller.nsi"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 	COMMENT "Building DisplayXR installer..."

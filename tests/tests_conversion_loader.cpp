@@ -11,6 +11,7 @@
  * from a throwaway HKCU key -- nothing here ever writes HKLM.
  */
 
+#include "target_component_loader.h"
 #include "target_conversion_plugin_loader.h"
 #include "target_plugin_loader.h"
 
@@ -602,6 +603,9 @@ TEST_CASE("conversion loader: negotiate_one loads, gates and unloads real binari
 	// Stubs live in the build tree, which the #952 dev-path guard refuses by
 	// design; the documented override lets a test (and a dev) load them.
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	// Unsigned + unlisted, and CI runs elevated: pin the provenance gate to
+	// audit (ADR-054 N4b PR B) — this test is about the ABI gate.
+	target_component_trust_set_enforce_override(0);
 
 	Entry ok = make_entry("stub-conversion", 250);
 	std::snprintf(ok.binary_path, sizeof(ok.binary_path), "%s", CONV_STUB_OK_PATH);
@@ -651,6 +655,7 @@ TEST_CASE("conversion loader: negotiate_one loads, gates and unloads real binari
 	CHECK(off.module == nullptr);
 
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 }
 
 #endif

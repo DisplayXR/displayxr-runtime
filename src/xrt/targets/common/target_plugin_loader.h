@@ -310,7 +310,7 @@ struct target_plugin_status
 	//! Leaf certificate CN when SIGNED; "" otherwise.
 	char signer[128];
 	//! One line: why that provenance verdict (incl. the allowlist row to write).
-	char provenance_reason[160];
+	char provenance_reason[224]; //!< mirrors target_component_entry (PR B widened it: the elevated-host reason + digest is > 160)
 };
 
 /*!

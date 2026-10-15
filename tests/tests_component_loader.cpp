@@ -395,6 +395,10 @@ TEST_CASE("component loader: the load path resolves each class's entry point and
 	// Stubs live in the build tree, which the #952 dev-path guard refuses by
 	// design; the documented override lets a test (and a dev) load them.
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	// They are also unsigned and unlisted, and CI runs elevated (no dev
+	// override there): pin the provenance gate to audit — this test is about
+	// entry points; the gate has its own cases below (ADR-054 N4b PR B).
+	target_component_trust_set_enforce_override(0);
 
 	const Class conv = plain_class("xrtConversionPluginNegotiate", 1);
 	const Class disp = plain_class("xrtPluginNegotiate", 1);
@@ -448,6 +452,7 @@ TEST_CASE("component loader: the load path resolves each class's entry point and
 	      TARGET_COMPONENT_LOAD_FAILED);
 
 	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+	target_component_trust_set_enforce_override(-1);
 
 	// The #952 REFUSED verdict cannot be provoked from here: the path guard
 	// trusts anything under the directory of the module the loader is linked
@@ -799,18 +804,75 @@ TEST_CASE("component loader: a real unsigned binary gets a verdict that follows 
 	CHECK(gone->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
 	CHECK(gone->provenance_reason[0] != '\0');
 
-	// Audit mode (no Trust\Enforce on a dev box / CI): the load path still
-	// loads an UNVERIFIED binary, and leaves the verdict on the entry.
-	if (!target_component_trust_enforced()) {
-		set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1"); // the #952 path guard still wants it for a build-tree path
+	// The gate, both ways, on the same unsigned + unlisted stub (PR B: the
+	// Windows default is enforcing, so this is the path a stray dev DLL hits).
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1"); // the #952 path guard still wants it for a build-tree path
+	{
+		// Audit: loaded anyway, verdict left on the entry.
+		target_component_trust_set_enforce_override(0);
 		void *module = nullptr;
 		void *fn = nullptr;
 		REQUIRE(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, nullptr, 0) ==
 		        TARGET_COMPONENT_LOAD_OK);
 		CHECK(e->provenance != TARGET_COMPONENT_PROVENANCE_UNKNOWN);
 		target_component_unload(module);
-		set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
 	}
+	if (elevated) {
+		// Enforcing on an elevated host: the override is refused, the verdict
+		// is unverified, and the load is REFUSED with a reason naming the
+		// allowlist row — before any LoadLibrary / dlopen.
+		target_component_trust_set_enforce_override(1);
+		void *module = nullptr;
+		void *fn = nullptr;
+		char reason[256] = {0};
+		CHECK(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, reason, sizeof(reason)) ==
+		      TARGET_COMPONENT_LOAD_UNTRUSTED);
+		CHECK(module == nullptr);
+		CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED);
+		CHECK(std::string(reason).find("untrusted") == 0);
+		CHECK(std::string(reason).find(e->sha256) != std::string::npos);
+	} else {
+		// Enforcing on a normal prompt: the dev override still admits it.
+		target_component_trust_set_enforce_override(1);
+		void *module = nullptr;
+		void *fn = nullptr;
+		REQUIRE(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, nullptr, 0) ==
+		        TARGET_COMPONENT_LOAD_OK);
+		CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_DEV_OVERRIDE);
+		target_component_unload(module);
+	}
+	target_component_trust_set_enforce_override(-1);
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+}
+
+TEST_CASE("component loader: the enforce policy -- an explicit knob wins, else the platform default (PR B)",
+          "[component_loader]")
+{
+	// Knob present: 0 = audit, anything else = enforce, whatever the platform.
+	CHECK_FALSE(target_component_trust_policy(true, true, true));
+	CHECK_FALSE(target_component_trust_policy(true, true, false));
+	CHECK(target_component_trust_policy(true, false, true));
+	CHECK(target_component_trust_policy(true, false, false));
+	// Knob absent: the platform default (Windows enforces, POSIX audits).
+	CHECK(target_component_trust_policy(false, false, true));
+	CHECK_FALSE(target_component_trust_policy(false, false, false));
+	CHECK_FALSE(target_component_trust_policy(false, true, false)); // knob_zero means nothing without a knob
+
+	// The test override pins the process either way and -1 releases it.
+	target_component_trust_set_enforce_override(1);
+	CHECK(target_component_trust_enforced());
+	target_component_trust_set_enforce_override(0);
+	CHECK_FALSE(target_component_trust_enforced());
+	target_component_trust_set_enforce_override(-1);
+#if defined(XRT_OS_WINDOWS)
+	// Released: the platform default applies — enforcing, unless this box
+	// wrote the opt-out knob (then the policy helper above already covers it).
+	DWORD v = 1;
+	DWORD bytes = sizeof(v);
+	const bool present = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Trust", L"Enforce",
+	                                  RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v, &bytes) == ERROR_SUCCESS;
+	CHECK(target_component_trust_enforced() == target_component_trust_policy(present, present && v == 0, true));
+#endif
 }
 
 #endif
