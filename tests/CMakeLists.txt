@@ -48,6 +48,7 @@ set(tests
     tests_cli_metres_check
     tests_cli_lever_catalog
     tests_cli_input_predict
+    tests_cli_dp_predict
     tests_comp_vblank_grid
     tests_comp_present_feedback
     tests_comp_late_weave_adapt
@@ -801,6 +802,14 @@ target_include_directories(
 	tests_cli_input_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_cli_input_predict PRIVATE xrt-interfaces)
+
+# N3b (ADR-054): the `dp list` twin — PreferredPlugin over ProbeOrder among
+# ENABLED plug-ins, a disabled one never predicted (the fallback takes over),
+# and the registered gate behind `dp enable|disable`. Header-only.
+target_include_directories(
+	tests_cli_dp_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_cli_dp_predict PRIVATE xrt-interfaces)
 
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is
 # header-only and deliberately free of Vulkan and DXGI types — that is what
