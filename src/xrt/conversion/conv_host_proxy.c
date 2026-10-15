@@ -569,7 +569,18 @@ reply_result(const uint8_t *payload, uint32_t bytes)
  *
  */
 
-//! Pull a handle the host announced (Windows: its value; POSIX: the fd that arrived).
+/*!
+ * Pull a handle the host announced (Windows: its value; POSIX: the fd that
+ * arrived). The host OWNS every handle it announces and closes it itself: the
+ * output fence (announced once, reused for its lifetime), each output texture
+ * (until conv_host_d3d11_free_image) and each job blob (until JOB_RELEASE or
+ * its kept-blob eviction). So this is a copy, never a transfer: the duplicate
+ * is ours to close on release and the host's handle must stay open. Pulling
+ * with DUPLICATE_CLOSE_SOURCE closed the host's copy, and the host then handed
+ * its providers dead (soon recycled) handle values: every out-of-process
+ * provider's OpenSharedResource1 on its own output failed with E_INVALIDARG
+ * on real hardware (win box, 2026-10-15), and free_image double-closed.
+ */
 static uint64_t
 pull_handle(struct proxy *p, const struct conv_host_wire_frame *f, const uint64_t *fds, uint32_t nfds, uint32_t i)
 {
@@ -580,7 +591,7 @@ pull_handle(struct proxy *p, const struct conv_host_wire_frame *f, const uint64_
 		return OS_NATIVE_HANDLE_INVALID;
 	}
 	uint64_t local = OS_NATIVE_HANDLE_INVALID;
-	if (os_process_dup_from_child(p->proc, f->handles[i], true, &local) != 0) {
+	if (os_process_dup_from_child(p->proc, f->handles[i], /*close_source=*/false, &local) != 0) {
 		return OS_NATIVE_HANDLE_INVALID;
 	}
 	return local;
