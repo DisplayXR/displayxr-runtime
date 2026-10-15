@@ -392,7 +392,9 @@ TEST_CASE("conversion ABI: iface slot order", "[conversion_abi]")
 	CHECK(offsetof(I, stream_destroy) == 8 + 14 * p);
 	CHECK(offsetof(I, job_execute) == 8 + 15 * p);
 	CHECK(offsetof(I, destroy) == 8 + 16 * p);
-	CHECK(sizeof(I) == 8 + 17 * p);
+	// N3c: the first slot appended past destroy (ADR-020 append-only, major unchanged).
+	CHECK(offsetof(I, describe_settings) == 8 + 17 * p);
+	CHECK(sizeof(I) == 8 + 18 * p);
 
 	using H = struct xrt_conversion_plugin_host_iface;
 	CHECK(offsetof(H, get_path) == 16);

@@ -8,6 +8,7 @@
  */
 
 #include "target_conv_status.h"
+#include "target_component_loader.h"
 #include "target_conversion_plugin_loader.h"
 
 #include "xrt/xrt_config_os.h"
@@ -25,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef XRT_OS_WINDOWS
+#include <strings.h> // strcasecmp
+#endif
 
 #ifdef XRT_OS_WINDOWS
 #define WIN32_LEAN_AND_MEAN
@@ -356,30 +360,22 @@ headless_get_setting(const char *key, char *buf, uint32_t buf_size)
 	if (e == NULL || key == NULL || buf == NULL || buf_size == 0) {
 		return false;
 	}
-	char env[160];
-	size_t n = (size_t)snprintf(env, sizeof(env), "DXR_CONV_%s_%s", e->id, key);
-	if (n >= sizeof(env)) {
-		return false;
-	}
-	for (char *c = env; *c != '\0'; c++) {
-		*c = *c == '-' ? '_' : (char)toupper((unsigned char)*c);
-	}
-	const char *v = getenv(env);
-	if (v != NULL && v[0] != '\0') {
-		copy_str(buf, buf_size, v);
-		return true;
-	}
+	// N3c: the one options contract's store — environment, then the per-user
+	// overlay, then the row's Settings\* / manifest "settings" as this pass
+	// enumerated it (rows may be built in memory, so the row is tier 3).
+	const char *row_value = NULL;
 	for (uint32_t i = 0; i < e->setting_count && i < XRT_CONV_LOADER_MAX_SETTINGS; i++) {
 #ifdef XRT_OS_WINDOWS
 		if (_stricmp(e->settings[i].key, key) == 0) {
 #else
-		if (strcmp(e->settings[i].key, key) == 0) {
+		if (strcasecmp(e->settings[i].key, key) == 0) {
 #endif
-			copy_str(buf, buf_size, e->settings[i].value);
-			return true;
+			row_value = e->settings[i].value;
+			break;
 		}
 	}
-	return false;
+	return target_component_get_setting_ex(target_conversion_plugin_component_class(), e->id, key, row_value, buf,
+	                                       buf_size, NULL);
 }
 
 const struct xrt_conversion_plugin_host_iface *

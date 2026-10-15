@@ -1900,6 +1900,42 @@ sc_destroy(struct xrt_conversion_plugin_instance *inst)
  *
  */
 
+/*
+ * The one options contract (ADR-054 decision 7, N3c): what this provider
+ * reads through host->get_setting, for `displayxr-cli conv options
+ * sim-conversion`. Same table as README.md § Settings; STATE_<cap> is
+ * per-capability and described under SCRIPT.
+ */
+static const struct xrt_component_setting_desc g_sim_conv_settings[] = {
+    {"ENABLE", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "probe() declines unless 1 (the fallback provider is opt-in)"},
+    {"WARM_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0", "every capability: WARMING for this long on its first warm"},
+    {"DOWNLOAD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0",
+     "every capability: DOWNLOADING for this long first (host->model_request(\"sim/fake\"))"},
+    {"LATENCY_MS", XRT_COMPONENT_SETTING_TYPE_INT, "8", "sleep per stream_convert"},
+    {"JOB_MS", XRT_COMPONENT_SETTING_TYPE_INT, "2000",
+     "job_execute duration, with progress; cancel polled every 50 ms"},
+    {"JOB_FAIL_AT", XRT_COMPONENT_SETTING_TYPE_FLOAT, "", "a job fails once its progress reaches this fraction (0..1)"},
+    {"HANG_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0", "extra sleep per stream_convert (the stall watchdog)"},
+    {"CRASH_AFTER", XRT_COMPONENT_SETTING_TYPE_INT, "0",
+     "after N converts / jobs: satellite exits (70), in-service reports FAILED(CRASH_LOOP)"},
+    {"DEVICE_LOST_EVERY", XRT_COMPONENT_SETTING_TYPE_INT, "0",
+     "every Nth convert / job fails with FAILED(DEVICE_LOST), retryable"},
+    {"LICENCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "",
+     "research = RESEARCH_ONLY, commercial_ok 0 (AllowResearchOnly gate)"},
+    {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_STRING, "",
+     "per-task script (README.md); applied last. STATE_<cap> = absent|incompatible|unlicensed|disabled|"
+     "failed:<reason>|installed also works per capability"},
+};
+
+static uint32_t
+sc_describe_settings(const struct xrt_component_setting_desc **out_descs)
+{
+	if (out_descs != NULL) {
+		*out_descs = g_sim_conv_settings;
+	}
+	return (uint32_t)(sizeof(g_sim_conv_settings) / sizeof(g_sim_conv_settings[0]));
+}
+
 static struct xrt_conversion_plugin_iface g_iface = {
     .struct_size = (uint32_t)sizeof(struct xrt_conversion_plugin_iface),
     .id = SIM_CONV_ID,
@@ -1919,6 +1955,7 @@ static struct xrt_conversion_plugin_iface g_iface = {
     .stream_destroy = sc_stream_destroy,
     .job_execute = sc_job_execute,
     .destroy = sc_destroy,
+    .describe_settings = sc_describe_settings,
 };
 
 /*!

@@ -488,6 +488,24 @@ target_component_get_setting(const struct target_component_class *cls,
                              uint32_t *out_source);
 
 /*!
+ * @ref target_component_get_setting with tier 3 supplied by the caller: the
+ * value of @p key as the component's enumerated row carries it
+ * (`target_component_entry::settings`, or NULL when the row has no such
+ * key) instead of a fresh machine / manifest read. For a host that already
+ * holds the row — the conversion class's per-provider host slots and the
+ * headless describe pass, which also run on rows built in memory by tests.
+ * Tiers 1 and 2 are read live exactly as above.
+ */
+bool
+target_component_get_setting_ex(const struct target_component_class *cls,
+                                const char *id,
+                                const char *key,
+                                const char *row_value,
+                                char *buf,
+                                size_t cap,
+                                uint32_t *out_source);
+
+/*!
  * Write `<KEY>` = @p value for @p id: per user by default (HKCU /
  * `<id>.settings.json`, no admin), machine-wide with @p machine (HKLM 64-bit
  * view, admin; UNSUPPORTED on POSIX — the manifest's `settings` object is
