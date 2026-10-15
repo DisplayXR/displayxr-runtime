@@ -125,8 +125,10 @@ struct sim_display_processor
 	float nominal_y_m;
 	float nominal_z_m;
 
-	//! When true, the app requested a transparent background — clear the
-	//! weave target to alpha=0 so alpha<1 regions stay see-through.
+	//! When true, the app requested a transparent background
+	//! (set_transparent_background) — clear the weave target to alpha=0 so
+	//! alpha<1 regions stay see-through, and gate the anaglyph alpha on the
+	//! views' overlap (#2121).
 	bool transparent_bg;
 
 	//! Lazy transparency test double: last state the runtime reported.
@@ -234,7 +236,11 @@ struct tile_push_constants
 	//! smaller push block reading the head of a larger range.
 	float phase_px;
 	float period_px;
-	float pad0;
+	//! #2121: 1 for a transparent session, 0 otherwise. Only anaglyph.frag
+	//! declares it: its output alpha is where both views cover (min) instead
+	//! of either (max). An opaque session keeps max, so an opaque app that
+	//! writes alpha 0 (Unreal, #425) is not turned black.
+	float overlap_alpha;
 	float pad1;
 };
 
@@ -458,6 +464,7 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .phase_px = (sdp->screen_bound && sdp->have_present_origin) ? (float)sdp->present_origin_x
 	                                                                : (float)canvas_offset_x,
 	    .period_px = (float)sdp->interlace_period_px,
+	    .overlap_alpha = sdp->transparent_bg ? 1.0f : 0.0f,
 	};
 	vk->vkCmdPushConstants(cmd_buffer, sdp->pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -1219,6 +1226,25 @@ sim_dp_set_transparency_active(struct xrt_display_processor_vk *xdp, bool active
 	        active ? "ACTIVE" : "IDLE", active ? "start" : "stop");
 }
 
+/*!
+ * xrt_display_processor_vk::set_transparent_background (#2121). sim_display
+ * composes nothing under the weave (the platform compositor shows the desktop
+ * through its alpha), so @p client_presents changes nothing here; the flag
+ * clears the target to alpha 0 and switches the anaglyph to the overlap alpha.
+ */
+static void
+sim_dp_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
+{
+	(void)client_presents;
+	struct sim_display_processor *sdp = (struct sim_display_processor *)xdp;
+	if (sdp->transparent_bg == enabled) {
+		return;
+	}
+	sdp->transparent_bg = enabled;
+	U_LOG_W("SIM TRANSPARENT BACKGROUND %s (anaglyph alpha = %s of the views)", enabled ? "ON" : "OFF",
+	        enabled ? "overlap" : "union");
+}
+
 static bool
 sim_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
 {
@@ -1294,11 +1320,13 @@ sim_display_processor_create_impl(enum sim_display_output_mode mode,
 	// ADR-020 rule 1: advertise the vtable size so the runtime knows which
 	// slots this plug-in actually built (calloc already zeroed reserved_0).
 	// ADR-020: advertise the VK variant's size — this DP fills base slots plus
-	// the vk snap_window_rect and set_transparency_active below; every other vk
+	// the vk snap_window_rect, set_transparent_background and
+	// set_transparency_active below; every other vk
 	// slot stays NULL (calloc),
 	// and the runtime's wrappers check both the size and the pointer.
 	sdp->base_vk.base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_vk);
 	sdp->base_vk.snap_window_rect = sim_dp_snap_window_rect; // #1588 / #1609
+	sdp->base_vk.set_transparent_background = sim_dp_set_transparent_background; // #2121
 	sdp->base_vk.set_transparency_active = sim_dp_set_transparency_active; // lazy transparency
 	sdp->base_vk.set_present_origin = sim_dp_set_present_origin;           // ADR-033 / multi-screen M2
 	sdp->base_vk.get_scanout_caps = sim_dp_get_scanout_caps;               // multi-screen M2 1:1 gate

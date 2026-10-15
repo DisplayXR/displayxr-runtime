@@ -24,8 +24,17 @@
 
 sim_display supports several output modes for visualizing stereo content on a 2D screen:
 
-- **Side-by-side (SBS)** — left view in left half, right view in right half. Default.
-- **Anaglyph (red/cyan)** — for use with red/cyan glasses.
+- **Side-by-side (SBS)** — left view in left half, right view in right half.
+- **Anaglyph (red/cyan)** — for use with red/cyan glasses. The default
+  (`SIM_DISPLAY_OUTPUT` unset), so 3D on sim_display is anaglyph: red from the
+  left view, green and blue from the right one. Without glasses that reads as
+  red and cyan fringes, wider the further content sits from the display plane.
+  In a transparent session (Vulkan) a transparent app keeps one silhouette over
+  the desktop: the output alpha is where **both** views cover (#2121), so the
+  strip of a silhouette's edge that only one view covers shows the desktop
+  instead of a red or cyan copy. A feature thinner than its disparity (a line
+  well off the display plane) vanishes the same way. An opaque session keeps the
+  alpha of either view, so an opaque app that writes alpha 0 keeps its colours.
 - **Blend** — interleaved or alpha-blended views for quick visual sanity checks.
 - **Interlaced** — 1-pixel-period column interlace: view 0 on even panel
   columns, view 1 on odd, both sampled at the same UV. The only

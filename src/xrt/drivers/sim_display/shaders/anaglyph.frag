@@ -10,6 +10,9 @@ layout(push_constant) uniform TileParams {
 	float inv_tile_rows;     // 1.0 / tile_rows
 	float tile_columns;
 	float tile_rows;
+	float phase_px;      // interlaced.frag only
+	float period_px;     // interlaced.frag only
+	float overlap_alpha; // #2121: 1 = transparent session
 } tile;
 
 layout(location = 0) in vec2 in_uv;
@@ -31,5 +34,23 @@ void main()
 	// Red-cyan anaglyph: red channel from left eye,
 	// green+blue channels from right eye. Preserve alpha (max of both eyes)
 	// so transparent-background regions survive the anaglyph mix (issue #392).
-	out_color = vec4(left.r, right.g, right.b, max(left.a, right.a));
+	if (tile.overlap_alpha < 0.5) {
+		out_color = vec4(left.r, right.g, right.b, max(left.a, right.a));
+		return;
+	}
+
+	// Transparent session (#2121): the alpha both views cover. A pixel has one
+	// alpha while its red and its green/blue come from different views, so
+	// where only one view covers (a silhouette's edge, shifted by the
+	// disparity) the max showed that view's channels alone, opaque: a red and a
+	// cyan copy of the silhouette side by side, read as ghosting over the
+	// desktop. Where the views agree min == max. Opaque sessions keep the max
+	// above: their present ignores alpha, and an opaque app may write alpha 0
+	// (Unreal, #425), which min would turn black. The atlas is premultiplied:
+	// each view's colour is taken out of its own alpha and premultiplied by the
+	// shared one.
+	float a = min(left.a, right.a);
+	vec3 lc = left.a > 0.0 ? left.rgb / left.a : vec3(0.0);
+	vec3 rc = right.a > 0.0 ? right.rgb / right.a : vec3(0.0);
+	out_color = vec4(vec3(lc.r, rc.g, rc.b) * a, a);
 }
