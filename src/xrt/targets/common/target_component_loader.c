@@ -124,6 +124,17 @@ target_plugin_classify_manifest(const char *filename)
 	return TARGET_PLUGIN_MANIFEST_DISPLAY;
 }
 
+const char *
+target_component_class_id_str(uint32_t class_id)
+{
+	switch (class_id) {
+	case TARGET_COMPONENT_CLASS_DISPLAY: return "display";
+	case TARGET_COMPONENT_CLASS_INPUT: return "input";
+	case TARGET_COMPONENT_CLASS_CONVERSION: return "conversion";
+	default: return "none";
+	}
+}
+
 bool
 target_plugin_parse_android_filename(
     const char *name, const char *prefix, uint32_t *out_order, char *out_id, size_t id_size)
