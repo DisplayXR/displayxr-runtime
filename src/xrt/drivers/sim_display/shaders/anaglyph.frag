@@ -29,7 +29,19 @@ void main()
 	vec4 right = texture(atlas_tex, right_uv);
 
 	// Red-cyan anaglyph: red channel from left eye,
-	// green+blue channels from right eye. Preserve alpha (max of both eyes)
-	// so transparent-background regions survive the anaglyph mix (issue #392).
-	out_color = vec4(left.r, right.g, right.b, max(left.a, right.a));
+	// green+blue channels from right eye. Alpha passes through so
+	// transparent-background regions survive the anaglyph mix (issue #392).
+	//
+	// It is the alpha both views cover (#2121). A pixel has one alpha while its
+	// red and its green/blue come from different views, so where only one view
+	// covers (a silhouette's edge, shifted by the disparity) the max of the two
+	// showed that view's channels alone, opaque: a red and a cyan copy of a
+	// transparent app's silhouette side by side, read as ghosting over the
+	// desktop. Where the views agree (opaque content, a 2D zone) min == max and
+	// the colour is unchanged. The atlas is premultiplied: each view's colour is
+	// taken out of its own alpha and premultiplied by the shared one.
+	float a = min(left.a, right.a);
+	vec3 lc = left.a > 0.0 ? left.rgb / left.a : vec3(0.0);
+	vec3 rc = right.a > 0.0 ? right.rgb / right.a : vec3(0.0);
+	out_color = vec4(vec3(lc.r, rc.g, rc.b) * a, a);
 }
