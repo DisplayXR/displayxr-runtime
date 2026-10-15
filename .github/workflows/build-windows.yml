@@ -633,10 +633,10 @@ jobs:
       # guard refuses by design, so the documented dev override is set for
       # this step only. Rows are HKLM (the runner is admin) and are removed in
       # the finally block. Every verdict is read from `selftest --json` fields,
-      # never from log text. Preferred-wins is asserted for the DP
-      # (`PreferredPlugin`) and conversion (`PreferredProvider\<task>`); the
-      # input case lands with its verb (#2048). DP `Enabled=0` lands with
-      # #2049. Those two cells are the only ones not asserted yet.
+      # never from log text. Enabled=0-falls-back and Preferred-wins are
+      # asserted for all three classes: DP `Enabled` + the per-user HKCU overlay
+      # (#2049, N3b) and the input `PreferredPlugin` row (N3a verb, #2048) were
+      # the last two cells to land.
       - name: Per-class conformance (ADR-054 N4)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
@@ -663,6 +663,12 @@ jobs:
             $script:lastExit = $LASTEXITCODE
             $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
             if ($s -lt 0 -or $e -le $s) { throw "selftest --json emitted no JSON object (exit $script:lastExit)" }
+            return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+          }
+          function Cli-Json([string[]]$verb) {
+            $raw = (& $cli @verb --json 2>$null | Out-String)
+            $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+            if ($s -lt 0 -or $e -le $s) { throw "$($verb -join ' ') --json emitted no JSON object" }
             return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
           }
           function Plugin($o, $id)  { $o.plugins | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
@@ -704,7 +710,13 @@ jobs:
             Expect ($lastExit -eq 0) "provenance: selftest exit 0 after allowlisting (got $lastExit)"
             Expect ((Plugin $o "sim-display").provenance -eq "allowlisted") "provenance: allowlisted sim-display reads allowlisted"
 
-            # 2. Enabled=0 falls back (input, conversion). DP gains Enabled in N3 (#2049).
+            # 2. Enabled=0 falls back (input, conversion, DP). The DP cell (N3b, #2049)
+            # disables sim-display with a second row of the same DLL (sim-display-alt,
+            # 210) left enabled: the disabled row reads DISABLED (never tried), the alt
+            # row is ACTIVE, and selftest names the skipped row by registration id —
+            # a disabled plug-in is the user's choice, never a failure.
+            Reg-Row $dpRoot "sim-display-alt" $simDp 210
+            reg add "$dpRoot\sim-display" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
             reg add "$inRoot\sim-input" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
             reg add "$cvRoot\sim-conversion" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
             $o = Selftest-Json
@@ -712,8 +724,35 @@ jobs:
             Expect (([int]$o.input_providers.enabled -eq 0) -and (-not $o.input_providers.active)) "input: Enabled=0 -> nothing loaded, qwerty keeps the hand roles"
             Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok on a disabled row"
             Expect (((ConvRow $o "sim-conversion").load -eq "DISABLED") -and ([int]$o.conversion_providers.negotiated -eq 0)) "conversion: Enabled=0 -> DISABLED, nothing negotiated"
+            Expect ((Plugin $o "sim-display").load_result -eq "DISABLED") "DP: Enabled=0 (machine) -> sim-display recorded DISABLED, never tried"
+            Expect ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") "DP: fell back to sim-display-alt"
+            Expect ($o.display_processor.active_id -eq "sim-display-alt") "DP: display_processor.active_id names the winning ROW (got '$($o.display_processor.active_id)')"
+            Expect (@($o.display_processor.skipped_disabled) -contains "sim-display") "DP: display_processor.skipped_disabled names sim-display"
             reg delete "$inRoot\sim-input" /v Enabled /f | Out-Null
             reg delete "$cvRoot\sim-conversion" /v Enabled /f | Out-Null
+            reg delete "$dpRoot\sim-display" /v Enabled /f | Out-Null
+
+            # 2b. The per-user overlay (N3b): what `dp disable` writes (HKCU, no admin)
+            # wins over an enabled HKLM row, `dp list --json` reads it back as
+            # enabled_source "user" and moves '*', and selftest falls back the same
+            # way. An unregistered id is refused (no orphan per-user row).
+            & $cli dp disable sim-display | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "DP: 'dp disable sim-display' exit 0 (got $LASTEXITCODE)"
+            $dl = Cli-Json @("dp", "list")
+            $row = $dl.plugins | Where-Object { $_.id -eq "sim-display" } | Select-Object -First 1
+            Expect ((-not $row.enabled) -and ($row.enabled_source -eq "user")) "DP: dp list reads sim-display Enabled=no (user) (got enabled=$($row.enabled) source='$($row.enabled_source)')"
+            Expect ((($dl.plugins | Where-Object { $_.active }).id) -eq "sim-display-alt") "DP: '*' (active) moves to sim-display-alt"
+            Expect ($null -ne $row.provenance) "DP: dp list --json carries provenance (got '$($row.provenance)')"
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") -and ((Plugin $o "sim-display").load_result -eq "DISABLED")) "DP: Enabled=0 (user) -> selftest falls back to sim-display-alt"
+            & $cli dp enable sim-display | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "DP: 'dp enable sim-display' exit 0 (got $LASTEXITCODE)"
+            & $cli dp disable no-such-plugin | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "DP: 'dp disable' of an unregistered id is refused"
+            reg delete "HKCU\Software\DisplayXR\DisplayProcessors\sim-display" /f | Out-Null
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ((Plugin $o "sim-display").load_result -eq "ACTIVE")) "DP: with the overlay removed sim-display is ACTIVE again"
+            reg delete "$dpRoot\sim-display-alt" /f | Out-Null
 
             # 3. Preferred wins (DP: PreferredPlugin hoists a worse-ranked plug-in).
             Reg-Row $dpRoot "sim-display-alt" $simDp 210
@@ -748,6 +787,22 @@ jobs:
               reg delete "$cvRoot\PreferredProvider" /v $convTask /f | Out-Null
             }
 
+            # 3c. Preferred wins (input): a second row of the same DLL (sim-input-alt,
+            # 210) is ranked first by `PreferredPlugin` although sim-input (200)
+            # outranks it by ProbeOrder. One DLL, two rows, one iface->id — so the
+            # ranked list is by REGISTRATION id, and the hand roles stay held.
+            Reg-Row $inRoot "sim-input-alt" $simIn 210
+            reg add $inRoot /v PreferredPlugin /t REG_SZ /d "sim-input-alt" /f | Out-Null
+            $il = Cli-Json @("input", "list")
+            $alt = $il.providers | Where-Object { $_.id -eq "sim-input-alt" } | Select-Object -First 1
+            Expect (($il.preferred -eq "sim-input-alt") -and $alt.preferred -and $alt.active) "input: input list predicts the preferred row first"
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "input Preferred: selftest exit 0 (got $lastExit)"
+            Expect ((@($o.input_providers.ranked).Count -eq 2) -and (@($o.input_providers.ranked)[0] -eq "sim-input-alt")) "input: PreferredPlugin=sim-input-alt is ranked first (ranked: $(@($o.input_providers.ranked) -join ', '))"
+            Expect ($o.input_providers.active -and (Check $o "input_providers").ok) "input: the preferred row holds the hand roles"
+            reg delete $inRoot /v PreferredPlugin /f | Out-Null
+            reg delete "$inRoot\sim-input-alt" /f | Out-Null
+
             # 4. ABI-major mismatch, per class: rejected, never dispatched, fallen through.
             Reg-Row $dpRoot "abi-fixture-dp" $fxDp 10
             Reg-Row $inRoot "abi-fixture-input" $fxIn 10
@@ -769,11 +824,13 @@ jobs:
             Expect ((Check $o "conversion_providers").ok) "conversion: the conversion_providers check stays ok"
           } finally {
             foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
-                             "$inRoot\sim-input", "$inRoot\abi-fixture-input",
-                             "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv")) {
+                             "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
+                             "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
+                             "HKCU\Software\DisplayXR\DisplayProcessors\sim-display")) {
               reg delete $k /f 2>$null | Out-Null
             }
             reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
+            reg delete $inRoot /v PreferredPlugin /f 2>$null | Out-Null
             if ($simHash) { reg delete "HKLM\Software\DisplayXR\Trust\Allowlist" /v $simHash /f 2>$null | Out-Null }
             reg delete "$cvRoot\PreferredProvider" /f 2>$null | Out-Null
             Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
