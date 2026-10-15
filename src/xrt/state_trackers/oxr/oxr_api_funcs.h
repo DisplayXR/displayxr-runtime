@@ -1099,6 +1099,10 @@ oxr_xrWeaveSnapWindowGridDXR(XrSession session,
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const XrRect2Di *screenRects);
 
+//! OpenXR API function @ep{xrWeaveReleaseTargetDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveReleaseTargetDXR(XrSession session, uint64_t targetId);
+
 //! OpenXR API function @ep{xrWeaveExportIpcConnectionDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection);

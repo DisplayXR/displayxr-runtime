@@ -4058,6 +4058,15 @@ locate_views_one(struct oxr_logger *log,
 			rig_info.zone_h_px = zone->rect.extent.height;
 		}
 #endif
+#if defined(OXR_HAVE_DXR_weave) && defined(XRT_OS_LINUX_DESKTOP)
+		// XR_DXR_weave v21 (browser-pvt#288): the zone rect is relative to
+		// THIS present-owner window, not the session's default one.
+		if (rig_route_native) {
+			const XrWeaveTargetDXR *wt =
+			    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_WEAVE_TARGET_DXR, XrWeaveTargetDXR);
+			rig_info.weave_target_id = wt != NULL ? wt->targetId : 0;
+		}
+#endif
 		// Bridge relays keep rig_type NONE (descriptors inert); only native
 		// routes carry the chained rig overrides. In workspace mode the app's
 		// own rig is honored by default (app visual policy within its canvas);

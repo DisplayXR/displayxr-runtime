@@ -2223,6 +2223,13 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	if (mc->weave.dp != NULL) {
 		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// XR_DXR_weave v21: a client whose default window closed weaves only
+	// through its other targets; their DPs track the same viewer.
+	if (mc->weave_targets.any_bound && comp_multi_weave_linux_predicted_eyes(mc, out_eye_pos)) {
+		return true;
+	}
+#endif
 #if defined(XRT_OS_MACOS) && defined(COMP_MULTI_WEAVE_HAVE_METAL)
 	// The macOS weave's Metal backend keeps its DP apart: `weave.dp` only ever
 	// holds a Vulkan-vtable DP. Read through the backend so the vendor call
@@ -2360,6 +2367,94 @@ compute_window_metrics_generic(void *window_handle,
 }
 #endif // XRT_OS_WINDOWS
 
+#ifdef COMP_MULTI_HAVE_WEAVE
+/*!
+ * Window metrics of a weave-only present-owner from a bound window rect
+ * (desktop-absolute device px on desktop Linux): the body of the weave-geometry
+ * branch of multi_compositor_get_window_metrics, shared with the per-target
+ * variant (XR_DXR_weave v21).
+ */
+static bool
+weave_geometry_window_metrics(struct multi_compositor *mc,
+                              int32_t win_x,
+                              int32_t win_y,
+                              uint32_t win_w,
+                              uint32_t win_h,
+                              struct xrt_window_metrics *out_metrics)
+{
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+
+	U_ZERO(out_metrics);
+
+	out_metrics->window_pixel_width = win_w;
+	out_metrics->window_pixel_height = win_h;
+	out_metrics->window_screen_left = win_x;
+	out_metrics->window_screen_top = win_y;
+	out_metrics->window_orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+
+	// The caller's rect is in the CURRENTLY HELD orientation; the runtime's
+	// display info is the natural-orientation panel (this class of device is
+	// natively portrait and is often run landscape). A window is always a
+	// sub-rect of its panel, so a rect that overflows the natural ordering
+	// proves the panel is held rotated — transpose the baseline to match,
+	// exactly as the display-zones rebase in ipc_server_handler.c does.
+	uint32_t panel_w = info->display_pixel_width;
+	uint32_t panel_h = info->display_pixel_height;
+	float panel_w_m = info->display_width_m;
+	float panel_h_m = info->display_height_m;
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Desktop Linux (#1699): the published rect is desktop-ABSOLUTE (the
+	// panel is one monitor of a multi-monitor desktop), and a desktop
+	// panel is not held rotated, so there is no transpose to infer — a
+	// window larger than the panel is just a window spilling off it. The
+	// panel's own screen origin re-bases the centre offset below.
+	const int32_t disp_left = info->display_screen_left;
+	const int32_t disp_top = info->display_screen_top;
+	const bool may_transpose = false;
+#else
+	const int32_t disp_left = 0;
+	const int32_t disp_top = 0;
+	const bool may_transpose = true;
+#endif
+	if (may_transpose && panel_w > 0 && panel_h > 0 && (win_w > panel_w || win_h > panel_h)) {
+		uint32_t t_px = panel_w;
+		panel_w = panel_h;
+		panel_h = t_px;
+		float t_m = panel_w_m;
+		panel_w_m = panel_h_m;
+		panel_h_m = t_m;
+	}
+	out_metrics->display_pixel_width = panel_w;
+	out_metrics->display_pixel_height = panel_h;
+	out_metrics->display_width_m = panel_w_m;
+	out_metrics->display_height_m = panel_h_m;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	// Square-pixel pitch from the NATIVE dims — orientation-invariant, so it
+	// stays valid against the (possibly transposed) baseline above. Unknown
+	// physical size leaves the metres zeroed and reports pixels only, which is
+	// what the Android present-target branch above already does.
+	float pitch = 0.0f;
+	if (info->display_pixel_width > 0 && info->display_width_m > 0.0f) {
+		pitch = info->display_width_m / (float)info->display_pixel_width;
+	}
+	if (pitch > 0.0f && panel_w > 0 && panel_h > 0) {
+		out_metrics->window_width_m = (float)win_w * pitch;
+		out_metrics->window_height_m = (float)win_h * pitch;
+		const float win_center_x = (float)(win_x - disp_left) + (float)win_w * 0.5f;
+		const float win_center_y = (float)(win_y - disp_top) + (float)win_h * 0.5f;
+		// +x right in both frames; y negated because screen pixels are
+		// y-down and eye coordinates are y-up.
+		out_metrics->window_center_offset_x_m = (win_center_x - (float)panel_w * 0.5f) * pitch;
+		out_metrics->window_center_offset_y_m = -((win_center_y - (float)panel_h * 0.5f) * pitch);
+	}
+
+	out_metrics->valid = true;
+	return true;
+}
+#endif
+
 bool
 multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics)
 {
@@ -2443,80 +2538,10 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 	// next locate corrects; taking the submit lock on the per-frame locate path
 	// would not.
 	if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0 && mc->msc != NULL) {
-		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-		const int32_t win_x = mc->weave.win_x;
-		const int32_t win_y = mc->weave.win_y;
-		const uint32_t win_w = mc->weave.win_w;
-		const uint32_t win_h = mc->weave.win_h;
-
-		U_ZERO(out_metrics);
-
-		out_metrics->window_pixel_width = win_w;
-		out_metrics->window_pixel_height = win_h;
-		out_metrics->window_screen_left = win_x;
-		out_metrics->window_screen_top = win_y;
-		out_metrics->window_orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
-
-		// The caller's rect is in the CURRENTLY HELD orientation; the runtime's
-		// display info is the natural-orientation panel (this class of device is
-		// natively portrait and is often run landscape). A window is always a
-		// sub-rect of its panel, so a rect that overflows the natural ordering
-		// proves the panel is held rotated — transpose the baseline to match,
-		// exactly as the display-zones rebase in ipc_server_handler.c does.
-		uint32_t panel_w = info->display_pixel_width;
-		uint32_t panel_h = info->display_pixel_height;
-		float panel_w_m = info->display_width_m;
-		float panel_h_m = info->display_height_m;
-#ifdef XRT_OS_LINUX_DESKTOP
-		// Desktop Linux (#1699): the published rect is desktop-ABSOLUTE (the
-		// panel is one monitor of a multi-monitor desktop), and a desktop
-		// panel is not held rotated, so there is no transpose to infer — a
-		// window larger than the panel is just a window spilling off it. The
-		// panel's own screen origin re-bases the centre offset below.
-		const int32_t disp_left = info->display_screen_left;
-		const int32_t disp_top = info->display_screen_top;
-		const bool may_transpose = false;
-#else
-		const int32_t disp_left = 0;
-		const int32_t disp_top = 0;
-		const bool may_transpose = true;
-#endif
-		if (may_transpose && panel_w > 0 && panel_h > 0 && (win_w > panel_w || win_h > panel_h)) {
-			uint32_t t_px = panel_w;
-			panel_w = panel_h;
-			panel_h = t_px;
-			float t_m = panel_w_m;
-			panel_w_m = panel_h_m;
-			panel_h_m = t_m;
+		if (!weave_geometry_window_metrics(mc, mc->weave.win_x, mc->weave.win_y, mc->weave.win_w,
+		                                   mc->weave.win_h, out_metrics)) {
+			return false;
 		}
-		out_metrics->display_pixel_width = panel_w;
-		out_metrics->display_pixel_height = panel_h;
-		out_metrics->display_width_m = panel_w_m;
-		out_metrics->display_height_m = panel_h_m;
-		out_metrics->display_screen_left = disp_left;
-		out_metrics->display_screen_top = disp_top;
-
-		// Square-pixel pitch from the NATIVE dims — orientation-invariant, so it
-		// stays valid against the (possibly transposed) baseline above. Unknown
-		// physical size leaves the metres zeroed and reports pixels only, which is
-		// what the Android present-target branch above already does.
-		float pitch = 0.0f;
-		if (info->display_pixel_width > 0 && info->display_width_m > 0.0f) {
-			pitch = info->display_width_m / (float)info->display_pixel_width;
-		}
-		if (pitch > 0.0f && panel_w > 0 && panel_h > 0) {
-			out_metrics->window_width_m = (float)win_w * pitch;
-			out_metrics->window_height_m = (float)win_h * pitch;
-			const float win_center_x = (float)(win_x - disp_left) + (float)win_w * 0.5f;
-			const float win_center_y = (float)(win_y - disp_top) + (float)win_h * 0.5f;
-			// +x right in both frames; y negated because screen pixels are
-			// y-down and eye coordinates are y-up.
-			out_metrics->window_center_offset_x_m = (win_center_x - (float)panel_w * 0.5f) * pitch;
-			out_metrics->window_center_offset_y_m = -((win_center_y - (float)panel_h * 0.5f) * pitch);
-		}
-
-		out_metrics->valid = true;
-
 		// Lifecycle only: one line the first time a weave session sources its
 		// metrics this way. The rect itself is re-published every frame, and
 		// comp_multi_weave_*::set_window_geometry already logs the changes.
@@ -2525,7 +2550,9 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 			U_LOG_W(
 			    "weave(#1116): window metrics from bound geometry %d,%d %ux%u "
 			    "(panel %ux%u, %.4fx%.4fm)",
-			    win_x, win_y, win_w, win_h, panel_w, panel_h, (double)panel_w_m, (double)panel_h_m);
+			    mc->weave.win_x, mc->weave.win_y, mc->weave.win_w, mc->weave.win_h,
+			    out_metrics->display_pixel_width, out_metrics->display_pixel_height,
+			    (double)out_metrics->display_width_m, (double)out_metrics->display_height_m);
 		}
 		return true;
 	}
@@ -2534,6 +2561,27 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 	// No main compositor available — metrics only from per-session paths above.
 	return false;
 }
+
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+bool
+multi_compositor_get_weave_target_window_metrics(struct multi_compositor *mc,
+                                                 uint64_t target_id,
+                                                 struct xrt_window_metrics *out_metrics)
+{
+	if (mc == NULL || out_metrics == NULL || mc->msc == NULL) {
+		return false;
+	}
+	if (target_id == 0) {
+		return multi_compositor_get_window_metrics(mc, out_metrics);
+	}
+	int32_t x = 0, y = 0;
+	uint32_t w = 0, h = 0;
+	if (!comp_multi_weave_linux_target_geometry(mc, target_id, &x, &y, &w, &h)) {
+		return false;
+	}
+	return weave_geometry_window_metrics(mc, x, y, w, h, out_metrics);
+}
+#endif
 
 bool
 multi_compositor_get_window_screen_rect(struct multi_compositor *mc,
@@ -2607,7 +2655,9 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// is a weave client. Any other request is recorded below as the wish the
 	// shared surface converges on (the weave engine reads the same wish at its
 	// bring-up, so a pre-bind request from a present-owner is not lost).
-	if (mc != NULL && !mc->session_render.initialized && mc->weave.window_bound) {
+	// v21: any of its targets' binds makes it one (its default window may be closed).
+	if (mc != NULL && !mc->session_render.initialized &&
+	    (mc->weave.window_bound || mc->weave_targets.any_bound)) {
 		return comp_multi_weave_linux_request_display_mode(mc, enable_3d);
 	}
 #endif

@@ -279,6 +279,20 @@ across a lock at all; seeing it on lock/unlock means the session still runs an
 older copy (`gnome-extensions info window-geometry@displayxr.org`; a running
 shell keeps the code it loaded until the next login).
 
+### 3.2 Several windows of one process (extension version 15, browser-pvt#288)
+
+Every entry of a process carries the same `pid`, and the other fields cannot tell a process's
+own windows apart. A window's `title` changes as it navigates, and two windows can share a size.
+A Wayland client also cannot learn its own position, so it cannot match by geometry. Version 15
+adds `"id"`, the window's `Meta.Window` stable sequence. It is unique for the session, never
+reused, and fixed for the window's lifetime.
+
+`id` names the entry but does not say which of the client's windows it is. The client learns that
+pairing itself. The DisplayXR Browser does it when the window has focus: the entry marked `focus`
+is the window the browser just activated. Older consumers ignore the field, and the schema stays
+version 1 because the change is additive. A consumer facing an older extension (no `id`) keeps one
+window, the focused one, as before.
+
 ## 4. Packaging contract — the publisher is a shared asset
 
 The publisher is deliberately **not** a DisplayXR-coupled component: it is a

@@ -103,6 +103,7 @@
 #include "util/u_debug.h"
 #include "util/u_weave_span2d.h"
 #include "util/u_weave_flat.h"
+#include "util/u_weave_targets.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -118,6 +119,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +188,16 @@ weave_get_vk(struct multi_compositor *mc)
  * file-static LEAF mutex (the Android #1387 d1 fix), never held while any other
  * lock is taken, so weave_ensure_mutex is safe under any caller's lock.
  */
+/*!
+ * XR_DXR_weave v21 (browser-pvt#288): the weave target the engine call in flight
+ * operates on — one present-owner window's whole engine. Every per-window field
+ * is reached through this, never through mc->weave directly (that is only the
+ * DEFAULT target, id 0, plus the client-wide lock). Outside an entry point's
+ * locked section @c cur is NULL and this is the default target, so a client
+ * that never names a target (every pre-v21 caller) runs exactly as before.
+ */
+#define WT(mc) ((mc)->weave_targets.cur != NULL ? (mc)->weave_targets.cur : &(mc)->weave)
+
 static pthread_mutex_t g_weave_mutex_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 //! Lazily create the per-client engine lock + the fd fields' -1 sentinels
@@ -200,6 +212,90 @@ weave_ensure_mutex(struct multi_compositor *mc)
 		mc->weave.mutex_initialized = true;
 	}
 	pthread_mutex_unlock(&g_weave_mutex_init_lock);
+}
+
+/*!
+ * v21: the engine of target @p id — the default target for 0, else one of the
+ * client's extra targets, created on demand when @p create. NULL when the id
+ * is unknown (and !create) or every extra slot is taken. weave.mutex held.
+ */
+static struct comp_multi_weave_linux_target *
+weave_target_find_locked(struct multi_compositor *mc, uint64_t id, bool create)
+{
+	if (id == 0) {
+		return &mc->weave;
+	}
+	const uint32_t cap = (uint32_t)ARRAY_SIZE(mc->weave_targets.ids);
+	int k = u_weave_target_find(mc->weave_targets.ids, cap, id);
+	if (k != U_WEAVE_TARGET_NO_SLOT) {
+		return mc->weave_targets.extra[k];
+	}
+	if (!create) {
+		return NULL;
+	}
+	struct comp_multi_weave_linux_target *t = U_TYPED_CALLOC(struct comp_multi_weave_linux_target);
+	if (t == NULL) {
+		return NULL;
+	}
+	bool created = false;
+	k = u_weave_target_claim(mc->weave_targets.ids, cap, id, &created);
+	if (k == U_WEAVE_TARGET_NO_SLOT) {
+		free(t);
+		if (!mc->weave_targets.limit_warned) {
+			mc->weave_targets.limit_warned = true;
+			U_LOG_W("weave(v21): target %" PRIu64 " REFUSED — this client already has %u present-owner "
+			        "windows (COMP_MULTI_WEAVE_LINUX_MAX_TARGETS); release one first",
+			        id, (unsigned)COMP_MULTI_WEAVE_LINUX_MAX_TARGETS);
+		}
+		return NULL;
+	}
+	t->out_fd = -1; // zero-alloced, and 0 is a valid fd (weave_ensure_mutex)
+	mc->weave_targets.extra[k] = t;
+	U_LOG_W("weave(v21): client target %" PRIu64 " created — %u extra present-owner window(s) besides the default "
+	        "one, each with its own engine and display processor",
+	        id, u_weave_target_count(mc->weave_targets.ids, cap));
+	return t;
+}
+
+/*!
+ * v21: make the selected target (multi_compositor::weave_targets.selected) the
+ * one WT() resolves to for the rest of this locked section. False = no such
+ * target (and !create, or the client is at its limit): the caller refuses the
+ * call. Pair with weave_target_leave_locked before unlocking.
+ */
+static bool
+weave_target_enter_locked(struct multi_compositor *mc, bool create)
+{
+	struct comp_multi_weave_linux_target *t = weave_target_find_locked(mc, mc->weave_targets.selected, create);
+	if (t == NULL) {
+		return false;
+	}
+	mc->weave_targets.cur = t;
+	return true;
+}
+
+static void
+weave_target_leave_locked(struct multi_compositor *mc)
+{
+	mc->weave_targets.cur = NULL;
+}
+
+/*!
+ * v21: does any target of this client have a display processor yet? The
+ * standing hardware wish is applied to every one that does. weave.mutex held.
+ */
+static bool
+weave_any_dp_locked(const struct multi_compositor *mc)
+{
+	if (mc->weave.dp != NULL) {
+		return true;
+	}
+	for (size_t k = 0; k < ARRAY_SIZE(mc->weave_targets.extra); k++) {
+		if (mc->weave_targets.extra[k] != NULL && mc->weave_targets.extra[k]->dp != NULL) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static void
@@ -297,8 +393,8 @@ weave_import_opaque_fd(struct vk_bundle *vk,
 	if (end > 0) {
 		size = (uint64_t)end;
 		(void)lseek(fd, 0, SEEK_SET);
-	} else if (!mc->weave.size_probe_warned) {
-		mc->weave.size_probe_warned = true;
+	} else if (!WT(mc)->size_probe_warned) {
+		WT(mc)->size_probe_warned = true;
 		U_LOG_W(
 		    "weave(#1699): lseek cannot size the %s fd (%s) — trusting the same-driver import's "
 		    "own memory requirements",
@@ -396,8 +492,8 @@ weave_import_dmabuf(struct vk_bundle *vk,
 	// d.fd is consumed either way (vk_dmabuf.h "always consumed").
 	if (ret != VK_SUCCESS) {
 		if (desc->drm_modifier != DRM_FORMAT_MOD_LINEAR) {
-			if (!mc->weave.modifier_refused_warned) {
-				mc->weave.modifier_refused_warned = true;
+			if (!WT(mc)->modifier_refused_warned) {
+				WT(mc)->modifier_refused_warned = true;
 				U_LOG_W(
 				    "weave(#1699): %s dma-buf import REFUSED: modifier 0x%016" PRIx64
 				    " (fourcc 0x%08x, %ux%u, %u plane(s)) does not import on the service's device "
@@ -473,7 +569,7 @@ weave_slot_release(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slo
 static void
 weave_overlay_refused(struct multi_compositor *mc)
 {
-	const uint32_t n = mc->weave.overlay_refusals++;
+	const uint32_t n = WT(mc)->overlay_refusals++;
 	if (n == 0 || (n % 300) == 0) {
 		U_LOG_W("weave: overlay import failed — submit REFUSED, woven output untouched (refusals=%u)", n + 1);
 	}
@@ -513,16 +609,16 @@ weave_overlay_expected_dims(const struct multi_compositor *mc,
 		if (rect_count > 0) {
 			*out_w = in_w;
 			*out_h = in_h;
-		} else if (mc->weave.have_geometry) {
-			*out_w = mc->weave.win_w;
-			*out_h = mc->weave.win_h;
+		} else if (WT(mc)->have_geometry) {
+			*out_w = WT(mc)->win_w;
+			*out_h = WT(mc)->win_h;
 		} else if (rect_x >= 0 && rect_y >= 0) {
 			*out_w = (uint32_t)rect_x + rect_w;
 			*out_h = (uint32_t)rect_y + rect_h;
 		}
-	} else if (mc->weave.have_geometry) {
-		*out_w = mc->weave.win_w;
-		*out_h = mc->weave.win_h;
+	} else if (WT(mc)->have_geometry) {
+		*out_w = WT(mc)->win_w;
+		*out_h = WT(mc)->win_h;
 	}
 	return *out_w != 0 && *out_h != 0;
 }
@@ -555,9 +651,9 @@ weave_overlay_gate(struct multi_compositor *mc,
                    uint32_t exp_h)
 {
 	if (stale) {
-		if (!mc->weave.overlay_stale) {
-			mc->weave.overlay_stale = true;
-			mc->weave.overlay_stale_frames = 0;
+		if (!WT(mc)->overlay_stale) {
+			WT(mc)->overlay_stale = true;
+			WT(mc)->overlay_stale_frames = 0;
 			if (ov_w != 0 && ov_h != 0) {
 				U_LOG_W("weave: stale overlay %ux%u vs output %ux%u — ignored until it matches", ov_w,
 				        ov_h, exp_w, exp_h);
@@ -567,15 +663,15 @@ weave_overlay_gate(struct multi_compositor *mc,
 				        ov_bytes, exp_w, exp_h, exp_w, exp_h);
 			}
 		}
-		mc->weave.overlay_stale_frames++;
+		WT(mc)->overlay_stale_frames++;
 		// The DP's cached layer (v14) predates the ignored frames.
-		mc->weave.overlay_force_changed = true;
+		WT(mc)->overlay_force_changed = true;
 		return false;
 	}
-	if (mc->weave.overlay_stale) {
-		mc->weave.overlay_stale = false;
+	if (WT(mc)->overlay_stale) {
+		WT(mc)->overlay_stale = false;
 		U_LOG_W("weave: overlay %ux%u matches the output again — composited (%u frame(s) ignored)", exp_w,
-		        exp_h, mc->weave.overlay_stale_frames);
+		        exp_h, WT(mc)->overlay_stale_frames);
 	}
 	return true;
 }
@@ -678,7 +774,7 @@ weave_cache_acquire(struct vk_bundle *vk,
 	const uint64_t dev = (uint64_t)st.st_dev;
 	const uint64_t ino = (uint64_t)st.st_ino;
 	const uint64_t buffer_id = desc != NULL ? desc->buffer_id : 0;
-	const uint64_t tick = ++mc->weave.slot_clock;
+	const uint64_t tick = ++WT(mc)->slot_clock;
 
 	const uint32_t want_family = desc != NULL ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
 	const uint32_t want_fourcc = desc != NULL ? desc->drm_fourcc : 0;
@@ -742,9 +838,9 @@ weave_cache_acquire(struct vk_bundle *vk,
 	victim->last_used = tick;
 	// Lifecycle WARN for the first imports only: a producer that hands a new
 	// buffer every frame (no pool) would otherwise log per frame.
-	const bool log_warn = mc->weave.imports_logged < 16;
+	const bool log_warn = WT(mc)->imports_logged < 16;
 	if (log_warn) {
-		mc->weave.imports_logged++;
+		WT(mc)->imports_logged++;
 	}
 	if (!log_warn) {
 		U_LOG_I("weave(#1699): %s import cached (%s %ux%u)", what, desc != NULL ? "dma-buf" : "OPAQUE_FD", w,
@@ -792,9 +888,9 @@ weave_stage_a_input_dims(struct multi_compositor *mc,
 		*out_h = layout->tile_rows * layout->content_view_h;
 		return;
 	}
-	if (mc->weave.have_geometry) {
-		*out_w = mc->weave.win_w;
-		*out_h = mc->weave.win_h;
+	if (WT(mc)->have_geometry) {
+		*out_w = WT(mc)->win_w;
+		*out_h = WT(mc)->win_h;
 		return;
 	}
 	if (rect_count > 0 && rects != NULL) {
@@ -883,8 +979,8 @@ static void
 weave_eye_stage_release_all(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; i++) {
-		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][0]);
-		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][1]);
+		weave_eye_stage_release(vk, &WT(mc)->eye_stage[i][0]);
+		weave_eye_stage_release(vk, &WT(mc)->eye_stage[i][1]);
 	}
 }
 
@@ -907,7 +1003,7 @@ weave_eye_stage_get(struct vk_bundle *vk,
 	if (slot >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS || eye > 1 || w == 0 || h == 0) {
 		return VK_NULL_HANDLE;
 	}
-	struct comp_multi_weave_eye_stage *s = &mc->weave.eye_stage[slot][eye];
+	struct comp_multi_weave_eye_stage *s = &WT(mc)->eye_stage[slot][eye];
 	if (s->image != VK_NULL_HANDLE && s->w == w && s->h == h && s->format == format) {
 		return s->image;
 	}
@@ -945,47 +1041,47 @@ static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
 	weave_eye_stage_release_all(vk, mc);
-	weave_release_local(vk, &mc->weave.sbs_image, &mc->weave.sbs_memory, &mc->weave.sbs_view);
-	mc->weave.sbs_w = 0;
-	mc->weave.sbs_h = 0;
+	weave_release_local(vk, &WT(mc)->sbs_image, &WT(mc)->sbs_memory, &WT(mc)->sbs_view);
+	WT(mc)->sbs_w = 0;
+	WT(mc)->sbs_h = 0;
 }
 
 static void
 weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	weave_release_local(vk, &mc->weave.crop_image, &mc->weave.crop_memory, &mc->weave.crop_view);
-	mc->weave.crop_w = 0;
-	mc->weave.crop_h = 0;
+	weave_release_local(vk, &WT(mc)->crop_image, &WT(mc)->crop_memory, &WT(mc)->crop_view);
+	WT(mc)->crop_w = 0;
+	WT(mc)->crop_h = 0;
 }
 
 static void
 weave_release_output(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	if (mc->weave.out_fb != VK_NULL_HANDLE) {
-		vk->vkDestroyFramebuffer(vk->device, mc->weave.out_fb, NULL);
-		mc->weave.out_fb = VK_NULL_HANDLE;
+	if (WT(mc)->out_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, WT(mc)->out_fb, NULL);
+		WT(mc)->out_fb = VK_NULL_HANDLE;
 	}
-	if (mc->weave.out_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, mc->weave.out_view, NULL);
-		mc->weave.out_view = VK_NULL_HANDLE;
+	if (WT(mc)->out_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, WT(mc)->out_view, NULL);
+		WT(mc)->out_view = VK_NULL_HANDLE;
 	}
-	if (mc->weave.out_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, mc->weave.out_image, NULL);
-		mc->weave.out_image = VK_NULL_HANDLE;
+	if (WT(mc)->out_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, WT(mc)->out_image, NULL);
+		WT(mc)->out_image = VK_NULL_HANDLE;
 	}
-	if (mc->weave.out_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, mc->weave.out_memory, NULL);
-		mc->weave.out_memory = VK_NULL_HANDLE;
+	if (WT(mc)->out_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, WT(mc)->out_memory, NULL);
+		WT(mc)->out_memory = VK_NULL_HANDLE;
 	}
 	// The caller's copies (sent over SCM_RIGHTS) are theirs; ours goes here.
-	weave_close_fd(&mc->weave.out_fd);
-	mc->weave.out_is_dmabuf = false;
-	U_ZERO(&mc->weave.out_dmabuf);
-	mc->weave.out_dmabuf.fd = -1;
-	mc->weave.out_size = 0;
-	mc->weave.out_w = 0;
-	mc->weave.out_h = 0;
-	mc->weave.out_layout = VK_IMAGE_LAYOUT_UNDEFINED; // #1387: a fresh allocation starts undefined
+	weave_close_fd(&WT(mc)->out_fd);
+	WT(mc)->out_is_dmabuf = false;
+	U_ZERO(&WT(mc)->out_dmabuf);
+	WT(mc)->out_dmabuf.fd = -1;
+	WT(mc)->out_size = 0;
+	WT(mc)->out_w = 0;
+	WT(mc)->out_h = 0;
+	WT(mc)->out_layout = VK_IMAGE_LAYOUT_UNDEFINED; // #1387: a fresh allocation starts undefined
 }
 
 //! Output view + framebuffer against the engine's render pass (both output kinds).
@@ -998,7 +1094,7 @@ weave_create_output_view_fb(struct vk_bundle *vk, struct multi_compositor *mc, u
 	    .layerCount = 1,
 	};
 	VkResult ret =
-	    vk_create_view(vk, mc->weave.out_image, VK_IMAGE_VIEW_TYPE_2D, WEAVE_VK_FORMAT, range, &mc->weave.out_view);
+	    vk_create_view(vk, WT(mc)->out_image, VK_IMAGE_VIEW_TYPE_2D, WEAVE_VK_FORMAT, range, &WT(mc)->out_view);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vk_create_view(output) failed: %s", vk_result_string(ret));
 		return false;
@@ -1006,14 +1102,14 @@ weave_create_output_view_fb(struct vk_bundle *vk, struct multi_compositor *mc, u
 
 	VkFramebufferCreateInfo fb_ci = {
 	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-	    .renderPass = mc->weave.render_pass,
+	    .renderPass = WT(mc)->render_pass,
 	    .attachmentCount = 1,
-	    .pAttachments = &mc->weave.out_view,
+	    .pAttachments = &WT(mc)->out_view,
 	    .width = w,
 	    .height = h,
 	    .layers = 1,
 	};
-	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &mc->weave.out_fb) != VK_SUCCESS) {
+	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &WT(mc)->out_fb) != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkCreateFramebuffer(output) failed");
 		return false;
 	}
@@ -1036,20 +1132,20 @@ weave_create_output_opaque(struct vk_bundle *vk, struct multi_compositor *mc, ui
 		U_LOG_E("weave(#1699): output allocation (%ux%u, OPAQUE_FD) failed: %s", w, h, vk_result_string(ret));
 		return false;
 	}
-	mc->weave.out_image = vkic.images[0].handle;
-	mc->weave.out_memory = vkic.images[0].memory;
-	mc->weave.out_size = vkic.images[0].size;
-	mc->weave.out_w = w;
-	mc->weave.out_h = h;
-	mc->weave.out_is_dmabuf = false;
+	WT(mc)->out_image = vkic.images[0].handle;
+	WT(mc)->out_memory = vkic.images[0].memory;
+	WT(mc)->out_size = vkic.images[0].size;
+	WT(mc)->out_w = w;
+	WT(mc)->out_h = h;
+	WT(mc)->out_is_dmabuf = false;
 
 	xrt_graphics_buffer_handle_t fd = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	ret = vk_get_native_handle_from_device_memory(vk, mc->weave.out_memory, &fd);
+	ret = vk_get_native_handle_from_device_memory(vk, WT(mc)->out_memory, &fd);
 	if (ret != VK_SUCCESS || fd < 0) {
 		U_LOG_E("weave(#1699): output vkGetMemoryFdKHR failed: %s", vk_result_string(ret));
 		return false;
 	}
-	mc->weave.out_fd = fd;
+	WT(mc)->out_fd = fd;
 	return weave_create_output_view_fb(vk, mc, w, h);
 }
 
@@ -1097,19 +1193,19 @@ weave_create_output_dmabuf(struct vk_bundle *vk, struct multi_compositor *mc, ui
 	U_ZERO(&desc);
 	desc.fd = -1;
 	VkResult ret = vk_create_exportable_dmabuf_image(vk, w, h, WEAVE_VK_FORMAT, usage, mod_count > 0 ? mods : NULL,
-	                                                 mod_count, &desc, &mc->weave.out_image, &mc->weave.out_memory);
+	                                                 mod_count, &desc, &WT(mc)->out_image, &WT(mc)->out_memory);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): output allocation (%ux%u, dma-buf, %u candidate modifier(s)) failed: %s", w, h,
 		        mod_count, vk_result_string(ret));
 		return false;
 	}
-	mc->weave.out_fd = desc.fd; // the engine's one fd; export hands out dups
-	mc->weave.out_dmabuf = desc;
-	mc->weave.out_dmabuf.fd = -1;
-	mc->weave.out_size = desc.size;
-	mc->weave.out_w = w;
-	mc->weave.out_h = h;
-	mc->weave.out_is_dmabuf = true;
+	WT(mc)->out_fd = desc.fd; // the engine's one fd; export hands out dups
+	WT(mc)->out_dmabuf = desc;
+	WT(mc)->out_dmabuf.fd = -1;
+	WT(mc)->out_size = desc.size;
+	WT(mc)->out_w = w;
+	WT(mc)->out_h = h;
+	WT(mc)->out_is_dmabuf = true;
 	U_LOG_W("weave(#1699): output %ux%u is a dma-buf: fourcc 0x%08x modifier 0x%016" PRIx64
 	        " (%s from %u), %u plane(s), plane0 offset %u stride %u, %" PRIu64 " bytes",
 	        w, h, desc.drm_fourcc, desc.drm_modifier,
@@ -1121,13 +1217,13 @@ weave_create_output_dmabuf(struct vk_bundle *vk, struct multi_compositor *mc, ui
 static void
 weave_destroy_sync_semaphores(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	if (mc->weave.acquire_sem != VK_NULL_HANDLE) {
-		vk->vkDestroySemaphore(vk->device, mc->weave.acquire_sem, NULL);
-		mc->weave.acquire_sem = VK_NULL_HANDLE;
+	if (WT(mc)->acquire_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, WT(mc)->acquire_sem, NULL);
+		WT(mc)->acquire_sem = VK_NULL_HANDLE;
 	}
-	if (mc->weave.release_sem != VK_NULL_HANDLE) {
-		vk->vkDestroySemaphore(vk->device, mc->weave.release_sem, NULL);
-		mc->weave.release_sem = VK_NULL_HANDLE;
+	if (WT(mc)->release_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, WT(mc)->release_sem, NULL);
+		WT(mc)->release_sem = VK_NULL_HANDLE;
 	}
 }
 
@@ -1136,14 +1232,14 @@ weave_destroy_sync_semaphores(struct vk_bundle *vk, struct multi_compositor *mc)
 static void
 weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	if (mc->weave.acquire_sem == VK_NULL_HANDLE) {
+	if (WT(mc)->acquire_sem == VK_NULL_HANDLE) {
 		return;
 	}
-	vk->vkDestroySemaphore(vk->device, mc->weave.acquire_sem, NULL);
-	mc->weave.acquire_sem = VK_NULL_HANDLE;
+	vk->vkDestroySemaphore(vk->device, WT(mc)->acquire_sem, NULL);
+	WT(mc)->acquire_sem = VK_NULL_HANDLE;
 	VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-	if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS) {
-		mc->weave.acquire_sem = VK_NULL_HANDLE; // acquire fences fall back to the CPU poll
+	if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &WT(mc)->acquire_sem) != VK_SUCCESS) {
+		WT(mc)->acquire_sem = VK_NULL_HANDLE; // acquire fences fall back to the CPU poll
 	}
 }
 
@@ -1159,7 +1255,7 @@ weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
 /*!
  * Apply a HARDWARE 2D/3D request to the engine's own DP and, once the DP
  * confirmed a CHANGE, tell this client's session (#961: the event follows the
- * DP, never the bookkeeping). Call with mc->weave.mutex held and mc->weave.dp
+ * DP, never the bookkeeping). Call with mc->weave.mutex held and WT(mc)->dp
  * non-NULL. The vendor call is one lens-hint call (Leia: srLensDisable /
  * srLensEnable under the plug-in's own context lock), so it is cheap enough
  * for the IPC thread; the lock order weave.mutex -> vendor lock is the same one
@@ -1181,7 +1277,7 @@ weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
 static bool
 weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
 {
-	struct xrt_display_processor *dp = mc->weave.dp;
+	struct xrt_display_processor *dp = WT(mc)->dp;
 	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
 	const int64_t t0_ns = os_monotonic_get_ns();
 	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
@@ -1195,8 +1291,8 @@ weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const
 		return false;
 	}
 
-	const bool prev_3d = !mc->weave.hw_2d_confirmed;
-	mc->weave.hw_2d_confirmed = !want_3d;
+	const bool prev_3d = !WT(mc)->hw_2d_confirmed;
+	WT(mc)->hw_2d_confirmed = !want_3d;
 	if (prev_3d == want_3d) {
 		// Already there as far as THIS client knows. The bring-up re-assert is
 		// the one case where the panel may disagree (another client's 2D took
@@ -1225,6 +1321,14 @@ weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const
 	                              : "2D (may lag — the lens switches asynchronously)")
 	                  : "none (the DP has no get_hardware_3d_state)");
 
+	// v21: a client with several windows switches each window's DP, but the
+	// session has ONE panel state — report a change of it once, not per target.
+	// With one target this is exactly that target's transition, as before.
+	if (mc->weave_targets.hw_2d_reported == !want_3d) {
+		return true;
+	}
+	mc->weave_targets.hw_2d_reported = !want_3d;
+
 	union xrt_session_event xse = {0};
 	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
 	xse.hardware_display_state_change.hardware_display_3d = want_3d;
@@ -1238,36 +1342,36 @@ weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const
 static bool
 weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	if (mc->weave.engine_initialized) {
+	if (WT(mc)->engine_initialized) {
 		return true;
 	}
-	if (mc->weave.engine_failed) {
+	if (WT(mc)->engine_failed) {
 		return false; // one-shot: don't re-run a hopeless bring-up every frame
 	}
-	mc->weave.engine_failed = true; // cleared on success below
+	WT(mc)->engine_failed = true; // cleared on success below
 
 	VkCommandPoolCreateInfo pool_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 	    .queueFamilyIndex = vk->main_queue->family_index,
 	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 	};
-	if (vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->weave.cmd_pool) != VK_SUCCESS) {
+	if (vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &WT(mc)->cmd_pool) != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkCreateCommandPool failed");
 		return false;
 	}
 	VkCommandBufferAllocateInfo cb_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = mc->weave.cmd_pool,
+	    .commandPool = WT(mc)->cmd_pool,
 	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 	    .commandBufferCount = 1,
 	};
-	if (vk->vkAllocateCommandBuffers(vk->device, &cb_info, &mc->weave.cmd) != VK_SUCCESS ||
-	    vk->vkAllocateCommandBuffers(vk->device, &cb_info, &mc->weave.cmd_post) != VK_SUCCESS) {
+	if (vk->vkAllocateCommandBuffers(vk->device, &cb_info, &WT(mc)->cmd) != VK_SUCCESS ||
+	    vk->vkAllocateCommandBuffers(vk->device, &cb_info, &WT(mc)->cmd_post) != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkAllocateCommandBuffers failed");
 		return false;
 	}
 	VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-	if (vk->vkCreateFence(vk->device, &fence_info, NULL, &mc->weave.fence) != VK_SUCCESS) {
+	if (vk->vkCreateFence(vk->device, &fence_info, NULL, &WT(mc)->fence) != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkCreateFence failed");
 		return false;
 	}
@@ -1298,7 +1402,7 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    .subpassCount = 1,
 	    .pSubpasses = &subpass,
 	};
-	if (vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &mc->weave.render_pass) != VK_SUCCESS) {
+	if (vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &WT(mc)->render_pass) != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkCreateRenderPass failed");
 		return false;
 	}
@@ -1311,9 +1415,9 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 		U_LOG_E("weave(#1699): the active plug-in has no Vulkan DP factory — cannot weave");
 		return false;
 	}
-	xrt_result_t xret = factory(vk, (void *)(uintptr_t)mc->weave.cmd_pool, NULL /* window_handle */,
-	                            (int32_t)WEAVE_VK_FORMAT, &mc->weave.dp);
-	if (xret != XRT_SUCCESS || mc->weave.dp == NULL) {
+	xrt_result_t xret = factory(vk, (void *)(uintptr_t)WT(mc)->cmd_pool, NULL /* window_handle */,
+	                            (int32_t)WEAVE_VK_FORMAT, &WT(mc)->dp);
+	if (xret != XRT_SUCCESS || WT(mc)->dp == NULL) {
 		U_LOG_E("weave(#1699): Vulkan DP factory failed: %d", xret);
 		return false;
 	}
@@ -1324,21 +1428,21 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	const bool sync_fd = vk_dmabuf_sync_fd_supported(vk);
 	if (sync_fd) {
 		VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-		if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS ||
-		    vk_create_exportable_sync_fd_semaphore(vk, &mc->weave.release_sem) != VK_SUCCESS) {
+		if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &WT(mc)->acquire_sem) != VK_SUCCESS ||
+		    vk_create_exportable_sync_fd_semaphore(vk, &WT(mc)->release_sem) != VK_SUCCESS) {
 			U_LOG_W("weave(#1699): sync_file semaphores could not be created — stage B stays synchronous");
 			weave_destroy_sync_semaphores(vk, mc);
 		}
 	}
 
-	mc->weave.engine_initialized = true;
-	mc->weave.engine_failed = false;
+	WT(mc)->engine_initialized = true;
+	WT(mc)->engine_failed = false;
 	U_LOG_W(
 	    "weave(#1699): desktop-Linux weave engine initialized (BGRA8 output; OPAQUE_FD stage A: yes; dma-buf "
 	    "stage B: %s; sync_file fences: %s; DP self-submitting=%d)",
 	    vk_dmabuf_supported(vk) ? "yes" : "NO (device lacks dma-buf / DRM modifier / foreign queue)",
-	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
-	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
+	    WT(mc)->release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
+	    (int)xrt_display_processor_is_self_submitting(WT(mc)->dp));
 
 	// Apply the client's standing wish now that the DP exists — BOTH ways.
 	// "3D is the default" only holds while the vendor's weaver still owns the
@@ -1467,17 +1571,17 @@ weave_release_slot(struct vk_bundle *vk,
 static bool
 weave_wait_prev_frame(struct vk_bundle *vk, struct multi_compositor *mc)
 {
-	if (!mc->weave.fence_pending) {
+	if (!WT(mc)->fence_pending) {
 		return true;
 	}
-	VkResult ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS);
+	VkResult ret = vk->vkWaitForFences(vk->device, 1, &WT(mc)->fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): previous weave still not complete after 1 s (%s) — refusing this submit",
 		        vk_result_string(ret));
 		return false;
 	}
-	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
-	mc->weave.fence_pending = false;
+	vk->vkResetFences(vk->device, 1, &WT(mc)->fence);
+	WT(mc)->fence_pending = false;
 	return true;
 }
 
@@ -1495,17 +1599,17 @@ weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int 
 	if (fd < 0) {
 		return true; // the caller had already finished (the v9 contract)
 	}
-	if (mc->weave.acquire_sem != VK_NULL_HANDLE) {
+	if (WT(mc)->acquire_sem != VK_NULL_HANDLE) {
 		// The helper always consumes what it is handed; keep the original for
 		// the poll fallback should the import fail.
 		int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-		if (dup_fd >= 0 && vk_semaphore_import_sync_fd(vk, mc->weave.acquire_sem, dup_fd) == VK_SUCCESS) {
+		if (dup_fd >= 0 && vk_semaphore_import_sync_fd(vk, WT(mc)->acquire_sem, dup_fd) == VK_SUCCESS) {
 			close(fd);
 			*out_wait = true;
 			return true;
 		}
-		if (!mc->weave.acquire_fallback_warned) {
-			mc->weave.acquire_fallback_warned = true;
+		if (!WT(mc)->acquire_fallback_warned) {
+			WT(mc)->acquire_fallback_warned = true;
 			U_LOG_W("weave(#1699): acquire sync_file import failed — CPU-polling it instead");
 		}
 	}
@@ -1533,16 +1637,16 @@ weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int 
 static void
 weave_feed_dp_geometry(struct multi_compositor *mc)
 {
-	if (!mc->weave.have_geometry || mc->weave.dp == NULL) {
+	if (!WT(mc)->have_geometry || WT(mc)->dp == NULL) {
 		return;
 	}
 	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-	const int32_t ox = mc->weave.win_x - info->display_screen_left;
-	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	const int32_t ox = WT(mc)->win_x - info->display_screen_left;
+	const int32_t oy = WT(mc)->win_y - info->display_screen_top;
 	const bool fed =
-	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)mc->weave.dp, ox, oy);
-	if (mc->weave.geometry_dirty) {
-		mc->weave.geometry_dirty = false;
+	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)WT(mc)->dp, ox, oy);
+	if (WT(mc)->geometry_dirty) {
+		WT(mc)->geometry_dirty = false;
 		U_LOG_W("weave(#1699): present origin (%d,%d) panel-relative %s the DP phase slot", ox, oy,
 		        fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)");
 	}
@@ -1558,10 +1662,10 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 static bool
 weave_want_dmabuf_output(struct vk_bundle *vk, struct multi_compositor *mc, bool dmabuf_submit)
 {
-	if (mc->weave.out_kind_req == 0) {
-		mc->weave.out_kind_req = dmabuf_submit ? 2 : 1;
+	if (WT(mc)->out_kind_req == 0) {
+		WT(mc)->out_kind_req = dmabuf_submit ? 2 : 1;
 	}
-	return mc->weave.out_kind_req == 2 && vk_dmabuf_supported(vk);
+	return WT(mc)->out_kind_req == 2 && vk_dmabuf_supported(vk);
 }
 
 /*
@@ -1618,8 +1722,8 @@ static uint32_t
 weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_px out[4], bool *out_whole)
 {
 	*out_whole = false;
-	if (!weave_span_2d_enabled() || !mc->weave.have_geometry || mc->weave.win_w == 0 || mc->weave.win_h == 0 ||
-	    mc->weave.out_w == 0 || mc->weave.out_h == 0) {
+	if (!weave_span_2d_enabled() || !WT(mc)->have_geometry || WT(mc)->win_w == 0 || WT(mc)->win_h == 0 ||
+	    WT(mc)->out_w == 0 || WT(mc)->out_h == 0) {
 		return 0;
 	}
 	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
@@ -1629,8 +1733,8 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 	uint32_t panel_w = 0, panel_h = 0;
 	{
 		int32_t ignored_left = 0, ignored_top = 0;
-		if (mc->weave.dp == NULL ||
-		    !xrt_display_processor_get_display_pixel_info(mc->weave.dp, &panel_w, &panel_h, &ignored_left,
+		if (WT(mc)->dp == NULL ||
+		    !xrt_display_processor_get_display_pixel_info(WT(mc)->dp, &panel_w, &panel_h, &ignored_left,
 		                                                  &ignored_top) ||
 		    panel_w == 0 || panel_h == 0) {
 			panel_w = info->display_pixel_width;
@@ -1655,26 +1759,26 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 		}
 	}
 
-	const int32_t ox = mc->weave.win_x - info->display_screen_left;
-	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	const int32_t ox = WT(mc)->win_x - info->display_screen_left;
+	const int32_t oy = WT(mc)->win_y - info->display_screen_top;
 	struct u_wl_rect_px win_bands[4];
 	const uint32_t win_count =
-	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, mc->weave.win_w, mc->weave.win_h, win_bands);
+	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, WT(mc)->win_w, WT(mc)->win_h, win_bands);
 
 	// Window px -> output px (pure arithmetic, pinned by tests_aux_weave_span2d).
 	bool whole = false;
-	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, mc->weave.win_w, mc->weave.win_h,
-	                                                 mc->weave.out_w, mc->weave.out_h, nview, out, &whole);
+	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, WT(mc)->win_w, WT(mc)->win_h,
+	                                                 WT(mc)->out_w, WT(mc)->out_h, nview, out, &whole);
 
 	// Log on a change of state only (band count, or "entirely off"), never per
 	// frame and not per drag step.
 	const uint32_t state = n | (whole ? 0x100u : 0u);
-	if (state != mc->weave.last_offpanel_band_count) {
-		mc->weave.last_offpanel_band_count = state;
+	if (state != WT(mc)->last_offpanel_band_count) {
+		WT(mc)->last_offpanel_band_count = state;
 		U_LOG_W(
 		    "weave(#1699) SPAN_2D: window at (%d, %d) %ux%u panel-relative on a %ux%u panel — %u off-panel "
 		    "band(s) painted flat 2D%s",
-		    ox, oy, mc->weave.win_w, mc->weave.win_h, panel_w, panel_h, n,
+		    ox, oy, WT(mc)->win_w, WT(mc)->win_h, panel_w, panel_h, n,
 		    whole ? " (entirely off the panel: weave skipped)" : "");
 	}
 	*out_whole = whole;
@@ -1738,7 +1842,7 @@ weave_flat_rects(struct multi_compositor *mc,
                  struct u_wl_rect_px out[WEAVE_FLAT_MAX_RECTS])
 {
 	uint32_t n = 0;
-	if (weave_flat_2d_enabled() && mc->weave.out_w != 0 && mc->weave.out_h != 0) {
+	if (weave_flat_2d_enabled() && WT(mc)->out_w != 0 && WT(mc)->out_h != 0) {
 		struct u_wl_rect_px win_rects[WEAVE_SUBMIT_FLAT_MAX];
 		struct u_wl_rect_px scr_rects[WEAVE_SCREEN_FLAT_MAX];
 		uint32_t win_count = 0, scr_count = 0;
@@ -1747,24 +1851,24 @@ weave_flat_rects(struct multi_compositor *mc,
 			win_rects[win_count++] = (struct u_wl_rect_px){flat_rects[i].offset.w, flat_rects[i].offset.h,
 			                                               flat_rects[i].extent.w, flat_rects[i].extent.h};
 		}
-		const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
-		for (uint32_t i = 0; geo && i < mc->weave.screen_flat_rect_count && i < ARRAY_SIZE(scr_rects); i++) {
-			const struct xrt_rect *r = &mc->weave.screen_flat_rects[i];
+		const bool geo = WT(mc)->have_geometry && WT(mc)->win_w != 0 && WT(mc)->win_h != 0;
+		for (uint32_t i = 0; geo && i < WT(mc)->screen_flat_rect_count && i < ARRAY_SIZE(scr_rects); i++) {
+			const struct xrt_rect *r = &WT(mc)->screen_flat_rects[i];
 			scr_rects[scr_count++] =
 			    (struct u_wl_rect_px){r->offset.w, r->offset.h, r->extent.w, r->extent.h};
 		}
-		const uint32_t win_w = geo ? mc->weave.win_w : mc->weave.out_w;
-		const uint32_t win_h = geo ? mc->weave.win_h : mc->weave.out_h;
-		n = u_wl_flat_rects_to_output(win_rects, win_count, scr_rects, scr_count, mc->weave.win_x,
-		                              mc->weave.win_y, win_w, win_h, mc->weave.out_w, mc->weave.out_h,
+		const uint32_t win_w = geo ? WT(mc)->win_w : WT(mc)->out_w;
+		const uint32_t win_h = geo ? WT(mc)->win_h : WT(mc)->out_h;
+		n = u_wl_flat_rects_to_output(win_rects, win_count, scr_rects, scr_count, WT(mc)->win_x,
+		                              WT(mc)->win_y, win_w, win_h, WT(mc)->out_w, WT(mc)->out_h,
 		                              nview && geo, out, WEAVE_FLAT_MAX_RECTS);
 	}
 
 	// Log on a change of the painted count only, never per frame.
-	if (n != mc->weave.last_flat_count) {
-		mc->weave.last_flat_count = n;
+	if (n != WT(mc)->last_flat_count) {
+		WT(mc)->last_flat_count = n;
 		U_LOG_W("weave(#1699) FLAT_2D: %u flat region(s) painted flat in the %ux%u output (%u sticky latched)",
-		        n, mc->weave.out_w, mc->weave.out_h, mc->weave.screen_flat_rect_count);
+		        n, WT(mc)->out_w, WT(mc)->out_h, WT(mc)->screen_flat_rect_count);
 	}
 	return n;
 }
@@ -1775,10 +1879,10 @@ weave_flat_rects(struct multi_compositor *mc,
 static bool
 weave_blend_begin(struct vk_bundle *vk, struct multi_compositor *mc, bool *begun)
 {
-	if (!mc->weave.overlay_blend_initialized) {
-		mc->weave.overlay_blend_initialized =
-		    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
-		if (mc->weave.overlay_blend_initialized) {
+	if (!WT(mc)->overlay_blend_initialized) {
+		WT(mc)->overlay_blend_initialized =
+		    vk_local2d_composite_init(&WT(mc)->overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
+		if (WT(mc)->overlay_blend_initialized) {
 			U_LOG_W("weave(#1699): premul-over blend pipeline ready");
 		} else {
 			U_LOG_E("weave(#1699): premul-over blend init failed");
@@ -1786,7 +1890,7 @@ weave_blend_begin(struct vk_bundle *vk, struct multi_compositor *mc, bool *begun
 		}
 	}
 	if (!*begun) {
-		vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
+		vk_local2d_composite_begin_frame(&WT(mc)->overlay_blend, vk);
 		*begun = true;
 	}
 	return true;
@@ -1828,7 +1932,7 @@ weave_paint_offpanel(struct vk_bundle *vk,
 
 	// Order after the weave's writes (or the UNDEFINED transition when the
 	// weave was skipped).
-	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	weave_layout_barrier(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1838,9 +1942,9 @@ weave_paint_offpanel(struct vk_bundle *vk,
 	// transfer usage or format feature on the (possibly DRM-modifier) output.
 	VkRenderPassBeginInfo rp_bi = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = mc->weave.render_pass,
-	    .framebuffer = mc->weave.out_fb,
-	    .renderArea = {{0, 0}, {mc->weave.out_w, mc->weave.out_h}},
+	    .renderPass = WT(mc)->render_pass,
+	    .framebuffer = WT(mc)->out_fb,
+	    .renderArea = {{0, 0}, {WT(mc)->out_w, WT(mc)->out_h}},
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 	VkClearAttachment clear = {
@@ -1862,7 +1966,7 @@ weave_paint_offpanel(struct vk_bundle *vk,
 	vk->vkCmdClearAttachments(cmd, 1, &clear, band_count, clear_rects);
 	vk->vkCmdEndRenderPass(cmd);
 
-	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	weave_layout_barrier(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1870,8 +1974,8 @@ weave_paint_offpanel(struct vk_bundle *vk,
 
 	for (uint32_t i = 0; i < band_count; i++) {
 		const struct u_wl_rect_px r = bands[i];
-		vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
-		                                  mc->weave.out_h, src_view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+		vk_local2d_composite_flatten_draw(&WT(mc)->overlay_blend, vk, cmd, WT(mc)->out_fb, WT(mc)->out_w,
+		                                  WT(mc)->out_h, src_view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
 		                                  (float)(tile_x + (uint32_t)r.x) / (float)src_w,
 		                                  (float)(tile_y + (uint32_t)r.y) / (float)src_h,
 		                                  (float)r.w / (float)src_w, (float)r.h / (float)src_h,
@@ -1953,8 +2057,8 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// (Re)allocate output (+ SBS scratch on the non-v6 paths) on resize, and
 	// when a client asked for the other output kind (see out_kind_req).
-	if (mc->weave.out_image == VK_NULL_HANDLE || mc->weave.out_w != want_w || mc->weave.out_h != want_h ||
-	    mc->weave.out_is_dmabuf != want_dmabuf_out) {
+	if (WT(mc)->out_image == VK_NULL_HANDLE || WT(mc)->out_w != want_w || WT(mc)->out_h != want_h ||
+	    WT(mc)->out_is_dmabuf != want_dmabuf_out) {
 		// Never yank resources out from under in-flight GPU work (the previous
 		// frame was already waited; this also covers other queue users).
 		weave_queue_wait_idle(vk);
@@ -1967,33 +2071,33 @@ weave_run_frame(struct vk_bundle *vk,
 			return false;
 		}
 		if (!nview) {
-			if (!weave_create_local(vk, want_w * 2, want_h, &mc->weave.sbs_image, &mc->weave.sbs_memory,
-			                        &mc->weave.sbs_view)) {
+			if (!weave_create_local(vk, want_w * 2, want_h, &WT(mc)->sbs_image, &WT(mc)->sbs_memory,
+			                        &WT(mc)->sbs_view)) {
 				return false;
 			}
-			mc->weave.sbs_w = want_w * 2;
-			mc->weave.sbs_h = want_h;
-			mc->weave.sbs_first_use = true;
+			WT(mc)->sbs_w = want_w * 2;
+			WT(mc)->sbs_h = want_h;
+			WT(mc)->sbs_first_use = true;
 		}
 		U_LOG_W("weave(#1699): output %ux%u (%s layout), exported %s %" PRIu64 " bytes", want_w, want_h,
 		        nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"),
-		        want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)mc->weave.out_size);
+		        want_dmabuf_out ? "dma-buf" : "OPAQUE_FD", (uint64_t)WT(mc)->out_size);
 	}
 
 	// v6 crop staging: (re)create when the packed region is smaller than the
 	// input. Zero-copy (packed == input) samples the input directly.
 	const bool v6_zero_copy = nview && (packed_w == in->w && packed_h == in->h);
 	if (nview && !v6_zero_copy &&
-	    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w || mc->weave.crop_h != packed_h)) {
+	    (WT(mc)->crop_image == VK_NULL_HANDLE || WT(mc)->crop_w != packed_w || WT(mc)->crop_h != packed_h)) {
 		weave_queue_wait_idle(vk);
 		weave_release_crop(vk, mc);
-		if (!weave_create_local(vk, packed_w, packed_h, &mc->weave.crop_image, &mc->weave.crop_memory,
-		                        &mc->weave.crop_view)) {
+		if (!weave_create_local(vk, packed_w, packed_h, &WT(mc)->crop_image, &WT(mc)->crop_memory,
+		                        &WT(mc)->crop_view)) {
 			return false;
 		}
-		mc->weave.crop_w = packed_w;
-		mc->weave.crop_h = packed_h;
-		mc->weave.crop_first_use = true;
+		WT(mc)->crop_w = packed_w;
+		WT(mc)->crop_h = packed_h;
+		WT(mc)->crop_first_use = true;
 	}
 
 	// ---- Record ----
@@ -2005,7 +2109,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// stage would not order behind the fence.
 	bool acquire_wait_pending = wait_acquire;
 	const VkPipelineStageFlags acquire_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-	VkCommandBuffer cmd = mc->weave.cmd;
+	VkCommandBuffer cmd = WT(mc)->cmd;
 	vk->vkResetCommandBuffer(cmd, 0);
 	VkCommandBufferBeginInfo begin = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2027,14 +2131,14 @@ weave_run_frame(struct vk_bundle *vk,
 	weave_acquire_slot(vk, cmd, in, in_stage, in_access);
 	in->first_use = false;
 
-	VkImage dp_src_image = mc->weave.sbs_image;
-	VkImageView dp_src_view = mc->weave.sbs_view;
-	uint32_t atlas_view_w = mc->weave.out_w;
-	uint32_t atlas_view_h = mc->weave.out_h;
+	VkImage dp_src_image = WT(mc)->sbs_image;
+	VkImageView dp_src_view = WT(mc)->sbs_view;
+	uint32_t atlas_view_w = WT(mc)->out_w;
+	uint32_t atlas_view_h = WT(mc)->out_h;
 	uint32_t grid_cols = 2, grid_rows = 1;
 	VkImageLayout in_layout = VK_IMAGE_LAYOUT_GENERAL; // where the input sits after the reads
 	VkFormat dp_src_format = WEAVE_VK_FORMAT;
-	uint32_t dp_src_w = mc->weave.sbs_w, dp_src_h = mc->weave.sbs_h;
+	uint32_t dp_src_w = WT(mc)->sbs_w, dp_src_h = WT(mc)->sbs_h;
 
 	if (nview) {
 		if (v6_zero_copy) {
@@ -2055,13 +2159,13 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 			in_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-			weave_layout_barrier(vk, cmd, mc->weave.crop_image,
-			                     mc->weave.crop_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			weave_layout_barrier(vk, cmd, WT(mc)->crop_image,
+			                     WT(mc)->crop_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
 			                                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
 			                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
-			mc->weave.crop_first_use = false;
+			WT(mc)->crop_first_use = false;
 
 			if (in->format == WEAVE_VK_FORMAT) {
 				VkImageCopy copy = {
@@ -2070,7 +2174,7 @@ weave_run_frame(struct vk_bundle *vk,
 				    .extent = {packed_w, packed_h, 1},
 				};
 				vk->vkCmdCopyImage(cmd, in->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+				                   WT(mc)->crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
 				                   &copy);
 			} else {
 				// A stage-B RGBA input (DRM ABGR8888) into the BGRA staging:
@@ -2083,18 +2187,18 @@ weave_run_frame(struct vk_bundle *vk,
 				    .dstOffsets = {{0, 0, 0}, {(int32_t)packed_w, (int32_t)packed_h, 1}},
 				};
 				vk->vkCmdBlitImage(cmd, in->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				                   mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+				                   WT(mc)->crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
 				                   VK_FILTER_NEAREST);
 			}
 
-			weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			weave_layout_barrier(vk, cmd, WT(mc)->crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 			                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-			dp_src_image = mc->weave.crop_image;
-			dp_src_view = mc->weave.crop_view;
-			dp_src_w = mc->weave.crop_w;
-			dp_src_h = mc->weave.crop_h;
+			dp_src_image = WT(mc)->crop_image;
+			dp_src_view = WT(mc)->crop_view;
+			dp_src_w = WT(mc)->crop_w;
+			dp_src_h = WT(mc)->crop_h;
 		}
 		atlas_view_w = cvw;
 		atlas_view_h = cvh;
@@ -2108,20 +2212,20 @@ weave_run_frame(struct vk_bundle *vk,
 		// from closed elements re-weave harmlessly; the caller composites
 		// back only its current rects).
 		weave_layout_barrier(
-		    vk, cmd, mc->weave.sbs_image,
-		    mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    vk, cmd, WT(mc)->sbs_image,
+		    WT(mc)->sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
 		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-		mc->weave.sbs_first_use = false;
+		WT(mc)->sbs_first_use = false;
 
 		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
 		// transparent on the first submit of a frame.
 		if (weave_frame_first) {
 			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			vk->vkCmdClearColorImage(cmd, WT(mc)->sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                         &sbs_transparent, 1, &range);
 			// Order the whole-image clear before the per-rect blits.
-			weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			weave_layout_barrier(vk, cmd, WT(mc)->sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 			                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2181,7 +2285,7 @@ weave_run_frame(struct vk_bundle *vk,
 			const int32_t dy1 = ry + rh;
 			const int32_t src_x[2] = {rx, rx + half};
 			const int32_t src_w[2] = {half, rw - half};
-			const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
+			const int32_t tile_x[2] = {0, (int32_t)WT(mc)->out_w}; // Right tile (+out_w).
 			for (uint32_t e = 0; e < 2; e++) {
 				VkImage stage =
 				    weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e], (uint32_t)rh, in->format);
@@ -2249,12 +2353,12 @@ weave_run_frame(struct vk_bundle *vk,
 			VkImage src = staged ? eye_src[k] : in->image;
 			VkImageLayout src_layout =
 			    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
-			vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
+			vk->vkCmdBlitImage(cmd, src, src_layout, WT(mc)->sbs_image,
 			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k], VK_FILTER_LINEAR);
 		}
 
 		// Scratch -> SHADER_READ for the DP sample.
-		weave_layout_barrier(vk, cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		weave_layout_barrier(vk, cmd, WT(mc)->sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 		                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -2263,7 +2367,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// Output -> COLOR_ATTACHMENT. Fully re-rendered every submit, so the
 	// discard from UNDEFINED is fine — and needs no acquire from the
 	// caller's family: contents that are not preserved need no transfer.
-	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_UNDEFINED,
+	weave_layout_barrier(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_UNDEFINED,
 	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
@@ -2274,13 +2378,13 @@ weave_run_frame(struct vk_bundle *vk,
 	// committed below only if the weave goes out: the same per-weave capture as
 	// the in-process compositor's comp_vk_native_wl_geom_last_rect.
 	const struct xrt_weave_woven_origin woven = {
-	    .valid = mc->weave.have_geometry,
-	    .x = mc->weave.have_geometry ? mc->weave.win_x : 0,
-	    .y = mc->weave.have_geometry ? mc->weave.win_y : 0,
-	    .logical_valid = mc->weave.have_geometry && mc->weave.win_logical.valid,
-	    .logical_x = mc->weave.win_logical.valid ? mc->weave.win_logical.x : 0,
-	    .logical_y = mc->weave.win_logical.valid ? mc->weave.win_logical.y : 0,
-	    .logical_scale = mc->weave.win_logical.valid ? mc->weave.win_logical.scale : 0.0f,
+	    .valid = WT(mc)->have_geometry,
+	    .x = WT(mc)->have_geometry ? WT(mc)->win_x : 0,
+	    .y = WT(mc)->have_geometry ? WT(mc)->win_y : 0,
+	    .logical_valid = WT(mc)->have_geometry && WT(mc)->win_logical.valid,
+	    .logical_x = WT(mc)->win_logical.valid ? WT(mc)->win_logical.x : 0,
+	    .logical_y = WT(mc)->win_logical.valid ? WT(mc)->win_logical.y : 0,
+	    .logical_scale = WT(mc)->win_logical.valid ? WT(mc)->win_logical.scale : 0.0f,
 	    .serial = 0, // assigned on success
 	};
 
@@ -2301,17 +2405,17 @@ weave_run_frame(struct vk_bundle *vk,
 	// own request, so the content goes flat only while the lens is really
 	// dropped (a DP that rejected the 2D request keeps the weave); it ends on
 	// the first submit after the confirmed state is 3D again.
-	const bool mono = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
-	if (mono != mc->weave.mono_active) {
-		mc->weave.mono_active = mono;
+	const bool mono = WT(mc)->mono_in_2d && WT(mc)->hw_2d_confirmed;
+	if (mono != WT(mc)->mono_active) {
+		WT(mc)->mono_active = mono;
 		U_LOG_W("weave(v13): %s",
 		        mono ? "MONO — hardware 2D and the caller asked for one view: the flat view (stereo: the left "
 		               "view) is painted over the whole output, no weave"
-		             : (mc->weave.mono_in_2d ? "weave resumed (the hardware is 3D again)"
+		             : (WT(mc)->mono_in_2d ? "weave resumed (the hardware is 3D again)"
 		                                     : "weave resumed (the caller no longer asks for mono)"));
 	}
 	if (mono) {
-		offpanel[0] = (struct u_wl_rect_px){0, 0, (int32_t)mc->weave.out_w, (int32_t)mc->weave.out_h};
+		offpanel[0] = (struct u_wl_rect_px){0, 0, (int32_t)WT(mc)->out_w, (int32_t)WT(mc)->out_h};
 		offpanel_count = 1;
 		skip_weave = true;
 	}
@@ -2326,10 +2430,10 @@ weave_run_frame(struct vk_bundle *vk,
 	// whichever command buffer they land in. A DP that declines (no slot, no SR
 	// compose, transparency, 2D content, ...) leaves the post-weave blend to do
 	// exactly what it did before; the layer is then already acquired.
-	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
+	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)WT(mc)->dp;
 	bool ov_acquired = false; // ov taken from the producer and in SHADER_READ_ONLY_OPTIMAL
 	bool ov_in_dp = false;    // the DP composites ov in this frame's process_atlas
-	if (ov != NULL && !skip_weave && ov->w == mc->weave.out_w && ov->h == mc->weave.out_h &&
+	if (ov != NULL && !skip_weave && ov->w == WT(mc)->out_w && ov->h == WT(mc)->out_h &&
 	    xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
 		weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 		weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
@@ -2338,20 +2442,20 @@ weave_run_frame(struct vk_bundle *vk,
 		ov->first_use = false;
 		ov_acquired = true;
 		// v15 strength first: the D3D11 order, and a DP may key its weave on both.
-		xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
+		xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, WT(mc)->overlay_filter_strength);
 		// v14 "unchanged" is the caller's claim against ITS previous submit.
 		// After a stale overlay was ignored (weave_overlay_gate) the DP's
 		// cached layer is older than that, so the first offer after it says
 		// "changed" whatever the caller claimed.
-		const bool unchanged = mc->weave.overlay_unchanged && !mc->weave.overlay_force_changed;
-		mc->weave.overlay_force_changed = false;
+		const bool unchanged = WT(mc)->overlay_unchanged && !WT(mc)->overlay_force_changed;
+		WT(mc)->overlay_force_changed = false;
 		ov_in_dp = xrt_display_processor_vk_set_overlay_2d(dp_vk, ov->view, (VkFormat_XDP)ov->format, ov->w,
 		                                                   ov->h, XRT_ATLAS_ENCODING_ENCODED, unchanged);
 	}
 	if (ov != NULL) {
 		const uint8_t verdict = ov_in_dp ? 2u : 1u;
-		if (verdict != mc->weave.overlay_in_dp) {
-			mc->weave.overlay_in_dp = verdict;
+		if (verdict != WT(mc)->overlay_in_dp) {
+			WT(mc)->overlay_in_dp = verdict;
 			U_LOG_W("weave: 2D overlay (%ux%u) %s", ov->w, ov->h,
 			        ov_in_dp ? "composited by the display processor INSIDE the weave (2D under the lens)"
 			                 : "blended post-weave by the runtime (the DP did not take it this frame)");
@@ -2363,7 +2467,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
 	// the pre-weave batch first; same-queue submission order then puts the
 	// DP's batch after it. The final submit + fence below retire both.
-	const bool self_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
+	const bool self_submits = xrt_display_processor_is_self_submitting(WT(mc)->dp);
 	if (self_submits && !skip_weave && debug_get_bool_option_dxr_linux_weave_split()) {
 		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 			U_LOG_E("weave(#1699): vkEndCommandBuffer (pre-weave) failed");
@@ -2372,7 +2476,7 @@ weave_run_frame(struct vk_bundle *vk,
 		VkSubmitInfo pre_submit = {
 		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		    .waitSemaphoreCount = acquire_wait_pending ? 1u : 0u,
-		    .pWaitSemaphores = &mc->weave.acquire_sem,
+		    .pWaitSemaphores = &WT(mc)->acquire_sem,
 		    .pWaitDstStageMask = &acquire_wait_stage,
 		    .commandBufferCount = 1,
 		    .pCommandBuffers = &cmd,
@@ -2384,7 +2488,7 @@ weave_run_frame(struct vk_bundle *vk,
 			U_LOG_E("weave(#1699): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
 			return false;
 		}
-		cmd = mc->weave.cmd_post;
+		cmd = WT(mc)->cmd_post;
 		vk->vkResetCommandBuffer(cmd, 0);
 		if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
 			U_LOG_E("weave(#1699): vkBeginCommandBuffer (post-weave) failed");
@@ -2411,15 +2515,15 @@ weave_run_frame(struct vk_bundle *vk,
 	// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
 	// contract; it records into its own buffer).
 	if (!skip_weave) {
-		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
-		xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
+		xrt_display_processor_set_target_color_view(WT(mc)->dp, WT(mc)->out_view);
+		xrt_display_processor_process_atlas(WT(mc)->dp, self_submits ? VK_NULL_HANDLE : cmd, //
 		                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
 		                                    atlas_view_w, atlas_view_h,                        //
 		                                    grid_cols, grid_rows,                              //
 		                                    (VkFormat_XDP)dp_src_format,                       //
-		                                    mc->weave.out_fb,                                  //
-		                                    (VkImage_XDP)mc->weave.out_image,                  //
-		                                    mc->weave.out_w, mc->weave.out_h,                  //
+		                                    WT(mc)->out_fb,                                  //
+		                                    (VkImage_XDP)WT(mc)->out_image,                  //
+		                                    WT(mc)->out_w, WT(mc)->out_h,                  //
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
 		                                    0, 0, 0, 0);
 	}
@@ -2436,7 +2540,7 @@ weave_run_frame(struct vk_bundle *vk,
 			struct xrt_eye_positions fe = {0};
 			float fx[ARRAY_SIZE(fe.eyes)];
 			uint32_t fn = 0;
-			if (xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, &fe) && fe.valid) {
+			if (xrt_display_processor_get_predicted_eye_positions(WT(mc)->dp, &fe) && fe.valid) {
 				fn = fe.count < ARRAY_SIZE(fe.eyes) ? fe.count : (uint32_t)ARRAY_SIZE(fe.eyes);
 				for (uint32_t i = 0; i < fn; i++) {
 					fx[i] = fe.eyes[i].x;
@@ -2530,7 +2634,7 @@ weave_run_frame(struct vk_bundle *vk,
 				ov_acquired = true;
 			}
 
-			weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			weave_layout_barrier(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 			                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2538,11 +2642,11 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 			if (!ov_in_dp) {
-				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
-				                                  mc->weave.out_w, mc->weave.out_h,
+				vk_local2d_composite_flatten_draw(&WT(mc)->overlay_blend, vk, cmd, WT(mc)->out_fb,
+				                                  WT(mc)->out_w, WT(mc)->out_h,
 				                                  ov->view, //
-				                                  0, 0, mc->weave.out_w,
-				                                  mc->weave.out_h,        // dst = full window
+				                                  0, 0, WT(mc)->out_w,
+				                                  WT(mc)->out_h,        // dst = full window
 				                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
 				                                  /*unpremultiplied*/ false);
 			} else {
@@ -2551,8 +2655,8 @@ weave_run_frame(struct vk_bundle *vk,
 				for (uint32_t i = 0; i < redo_count; i++) {
 					const struct u_wl_rect_px r = redo[i];
 					vk_local2d_composite_flatten_draw(
-					    &mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
-					    mc->weave.out_h, ov->view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+					    &WT(mc)->overlay_blend, vk, cmd, WT(mc)->out_fb, WT(mc)->out_w,
+					    WT(mc)->out_h, ov->view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
 					    (float)r.x / (float)ov->w, (float)r.y / (float)ov->h,
 					    (float)r.w / (float)ov->w, (float)r.h / (float)ov->h,
 					    /*unpremultiplied*/ false);
@@ -2572,19 +2676,19 @@ weave_run_frame(struct vk_bundle *vk,
 	// Output handed to the caller in GENERAL. A stage-B dma-buf goes to
 	// VK_QUEUE_FAMILY_FOREIGN_EXT (any API / process reads it); a stage-A
 	// OPAQUE_FD to VK_QUEUE_FAMILY_EXTERNAL (a same-driver Vulkan / GL peer).
-	if (mc->weave.out_is_dmabuf) {
-		vk_dmabuf_cmd_release_foreign(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	if (WT(mc)->out_is_dmabuf) {
+		vk_dmabuf_cmd_release_foreign(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 	} else {
-		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		weave_layout_barrier(vk, cmd, WT(mc)->out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		                     VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-		weave_ownership_barrier(vk, cmd, mc->weave.out_image, VK_QUEUE_FAMILY_EXTERNAL, false,
+		weave_ownership_barrier(vk, cmd, WT(mc)->out_image, VK_QUEUE_FAMILY_EXTERNAL, false,
 		                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT);
 	}
-	mc->weave.out_layout = VK_IMAGE_LAYOUT_GENERAL; // #1387 d3: the one authority
+	WT(mc)->out_layout = VK_IMAGE_LAYOUT_GENERAL; // #1387 d3: the one authority
 
 	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 		return false;
@@ -2596,35 +2700,35 @@ weave_run_frame(struct vk_bundle *vk,
 	// here — the next submit waits this fence first (weave_wait_prev_frame).
 	// Otherwise (stage A / no sync_file support) the completion is synchronous:
 	// a bounded wait before the IPC reply, so returning IS the completion signal.
-	const bool signal_release = want_release_fd && mc->weave.release_sem != VK_NULL_HANDLE;
+	const bool signal_release = want_release_fd && WT(mc)->release_sem != VK_NULL_HANDLE;
 	VkSubmitInfo submit = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .waitSemaphoreCount = acquire_wait_pending ? 1u : 0u,
-	    .pWaitSemaphores = &mc->weave.acquire_sem,
+	    .pWaitSemaphores = &WT(mc)->acquire_sem,
 	    .pWaitDstStageMask = &acquire_wait_stage,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
 	    .signalSemaphoreCount = signal_release ? 1u : 0u,
-	    .pSignalSemaphores = &mc->weave.release_sem,
+	    .pSignalSemaphores = &WT(mc)->release_sem,
 	};
 	vk_queue_lock(vk->main_queue);
-	VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
+	VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, WT(mc)->fence);
 	vk_queue_unlock(vk->main_queue);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vkQueueSubmit failed: %s", vk_result_string(ret));
 		return false;
 	}
-	mc->weave.fence_pending = true;
+	WT(mc)->fence_pending = true;
 
 	bool synchronous = true;
 	if (signal_release) {
 		int release_fd = -1;
-		ret = vk_semaphore_export_sync_fd(vk, mc->weave.release_sem, &release_fd);
+		ret = vk_semaphore_export_sync_fd(vk, WT(mc)->release_sem, &release_fd);
 		if (ret == VK_SUCCESS) {
 			*out_release_fd = release_fd; // -1 = already signalled, i.e. complete
 			synchronous = false;
-		} else if (!mc->weave.release_fallback_warned) {
-			mc->weave.release_fallback_warned = true;
+		} else if (!WT(mc)->release_fallback_warned) {
+			WT(mc)->release_fallback_warned = true;
 			U_LOG_W(
 			    "weave(#1699): release sync_file export failed (%s) — synchronous completion from now on",
 			    vk_result_string(ret));
@@ -2642,23 +2746,23 @@ weave_run_frame(struct vk_bundle *vk,
 		}
 	}
 
-	mc->weave.fence_value++;
+	WT(mc)->fence_value++;
 
 	// v12: this output now exists, woven for `woven`.
-	mc->weave.woven_origin = woven;
-	mc->weave.woven_origin.serial = ++mc->weave.woven_serial;
+	WT(mc)->woven_origin = woven;
+	WT(mc)->woven_origin.serial = ++WT(mc)->woven_serial;
 	if (out_origin != NULL) {
-		*out_origin = mc->weave.woven_origin;
+		*out_origin = WT(mc)->woven_origin;
 	}
 
-	*out_width = mc->weave.out_w;
-	*out_height = mc->weave.out_h;
-	*out_fence_value = mc->weave.fence_value;
+	*out_width = WT(mc)->out_w;
+	*out_height = WT(mc)->out_h;
+	*out_fence_value = WT(mc)->fence_value;
 
 	// Eyes flow OUT for the caller's next off-axis frame; the weave itself
 	// reads the tracker DP-internally.
 	U_ZERO(out_eyes);
-	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
+	if (!xrt_display_processor_get_predicted_eye_positions(WT(mc)->dp, out_eyes)) {
 		U_ZERO(out_eyes);
 	}
 
@@ -2680,21 +2784,30 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
+	const uint64_t target = mc->weave_targets.selected;
+	if (!weave_target_enter_locked(mc, true)) {
+		os_mutex_unlock(&mc->weave.mutex);
+		return false; // v21: past the client's target limit (logged once)
+	}
 	// Recorded only: an XID (X11) or 0 (Wayland, where a client cannot name
 	// its window to another process). The service creates no window and never
 	// derives geometry from it — that arrives through set_window_geometry.
-	const bool first = !mc->weave.window_bound;
-	const bool changed = first || mc->weave.window_id != window_id;
-	mc->weave.window_bound = true;
-	mc->weave.window_id = window_id;
+	const bool first = !WT(mc)->window_bound;
+	const bool changed = first || WT(mc)->window_id != window_id;
+	WT(mc)->window_bound = true;
+	WT(mc)->window_id = window_id;
+	mc->weave_targets.any_bound = true;
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	// A present-owner re-binds on every move — every frame of a drag under v12
 	// move sync — so this must not be a per-frame WARN: one WARN for the
 	// session's first bind, INFO when the id changes, silence on a repeat.
 	if (first) {
-		U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+		U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64 " (target %" PRIu64 ")", window_id,
+		        target);
 	} else if (changed) {
-		U_LOG_I("weave(#1699): present-owner window id now 0x%" PRIx64, window_id);
+		U_LOG_I("weave(#1699): present-owner window id now 0x%" PRIx64 " (target %" PRIu64 ")", window_id,
+		        target);
 	}
 	return true;
 }
@@ -2731,24 +2844,30 @@ comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	const bool changed = !mc->weave.have_geometry || mc->weave.win_x != origin_x || mc->weave.win_y != origin_y ||
-	                     mc->weave.win_w != client_w || mc->weave.win_h != client_h ||
-	                     mc->weave.win_display_id != display_id;
-	const bool logical_first = lo.valid && !mc->weave.win_logical.valid;
-	mc->weave.have_geometry = true;
-	mc->weave.win_x = origin_x;
-	mc->weave.win_y = origin_y;
-	mc->weave.win_w = client_w;
-	mc->weave.win_h = client_h;
-	mc->weave.win_display_id = display_id;
-	mc->weave.win_logical = lo;
-	mc->weave.geometry_dirty = mc->weave.geometry_dirty || changed;
+	const uint64_t target = mc->weave_targets.selected;
+	if (!weave_target_enter_locked(mc, true)) {
+		os_mutex_unlock(&mc->weave.mutex);
+		return false; // v21: past the client's target limit (logged once)
+	}
+	const bool changed = !WT(mc)->have_geometry || WT(mc)->win_x != origin_x || WT(mc)->win_y != origin_y ||
+	                     WT(mc)->win_w != client_w || WT(mc)->win_h != client_h ||
+	                     WT(mc)->win_display_id != display_id;
+	const bool logical_first = lo.valid && !WT(mc)->win_logical.valid;
+	WT(mc)->have_geometry = true;
+	WT(mc)->win_x = origin_x;
+	WT(mc)->win_y = origin_y;
+	WT(mc)->win_w = client_w;
+	WT(mc)->win_h = client_h;
+	WT(mc)->win_display_id = display_id;
+	WT(mc)->win_logical = lo;
+	WT(mc)->geometry_dirty = WT(mc)->geometry_dirty || changed;
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
 		// Lifecycle event (the window moved / resized); the caller may
 		// re-publish every frame, so log only on change.
-		U_LOG_W("weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
-		        client_h, display_id);
+		U_LOG_W("weave(#1699): present-owner window %d,%d %ux%u on display %d (target %" PRIu64 ")", origin_x,
+		        origin_y, client_w, client_h, display_id, target);
 	}
 	if (logical_first) {
 		// One-off per transition (not per move): the caller now reports its
@@ -2801,6 +2920,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 	bool ok = false;
 	do {
+		if (!weave_target_enter_locked(mc, true)) {
+			break; // v21: past the client's target limit (logged once)
+		}
 		if (!weave_ensure_engine(vk, mc) || !weave_wait_prev_frame(vk, mc)) {
 			break;
 		}
@@ -2808,7 +2930,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		uint32_t in_w = 0, in_h = 0;
 		weave_stage_a_input_dims(mc, rect_x, rect_y, rect_w, rect_h, rect_count, rects, layout, &in_w, &in_h);
 		struct comp_multi_weave_linux_slot *in =
-		    weave_cache_acquire(vk, mc, mc->weave.in_slots, in_fd, NULL, in_w, in_h, "input");
+		    weave_cache_acquire(vk, mc, WT(mc)->in_slots, in_fd, NULL, in_w, in_h, "input");
 		if (in == NULL) {
 			break;
 		}
@@ -2832,14 +2954,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                                          rect_h, &exp_w, &exp_h)) {
 			uint32_t real_w = 0, real_h = 0;
 			uint64_t real_bytes = 0;
-			const bool stale = weave_stage_a_overlay_stale(mc->weave.ov_slots, ov_fd, exp_w, exp_h, &real_w,
+			const bool stale = weave_stage_a_overlay_stale(WT(mc)->ov_slots, ov_fd, exp_w, exp_h, &real_w,
 			                                               &real_h, &real_bytes);
 			use_ov = weave_overlay_gate(mc, stale, real_w, real_h, real_bytes, exp_w, exp_h);
 		}
 		if (use_ov) {
-			uint32_t ov_w = mc->weave.have_geometry ? mc->weave.win_w : in_w;
-			uint32_t ov_h = mc->weave.have_geometry ? mc->weave.win_h : in_h;
-			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
+			uint32_t ov_w = WT(mc)->have_geometry ? WT(mc)->win_w : in_w;
+			uint32_t ov_h = WT(mc)->have_geometry ? WT(mc)->win_h : in_h;
+			ov = weave_cache_acquire(vk, mc, WT(mc)->ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
 			if (ov == NULL) {
 				weave_overlay_refused(mc);
 				break;
@@ -2857,6 +2979,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		ok = true;
 	} while (false);
 
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 
 	// Rule 1: the received fds, whatever happened above. An import that needed
@@ -2878,17 +3001,19 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 	}
 	os_mutex_lock(&mc->weave.mutex);
 	bool ok = false;
-	if (mc->weave.out_is_dmabuf) {
+	if (!weave_target_enter_locked(mc, false)) {
+		// v21: no such target (never submitted, or released): nothing to hand out.
+	} else if (WT(mc)->out_is_dmabuf) {
 		// This caller wants the stage-A OPAQUE_FD kind; the current allocation
 		// is a dma-buf, which cannot be exported as OPAQUE_FD. Nothing this
 		// frame ("nothing yet", #1427 — the client retries); the next submit
 		// reallocates the kind asked for.
-		mc->weave.out_kind_req = 1;
-		if (!mc->weave.out_kind_warned) {
-			mc->weave.out_kind_warned = true;
+		WT(mc)->out_kind_req = 1;
+		if (!WT(mc)->out_kind_warned) {
+			WT(mc)->out_kind_warned = true;
 			U_LOG_W("weave(#1699): client asked for an OPAQUE_FD output over a dma-buf one — reallocating");
 		}
-	} else if (mc->weave.out_fd >= 0 && mc->weave.out_w != 0) {
+	} else if (WT(mc)->out_fd >= 0 && WT(mc)->out_w != 0) {
 		// Hand out the CACHED fd without a dup: the plain weave_get_output
 		// handler sends it (generated out_handles → ipc_send_fds, SCM_RIGHTS
 		// installs the peer's own copy) and never closes it — unchanged by the
@@ -2898,11 +3023,12 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 		// (comp_multi_weave_export_output_dmabuf is the opposite contract: its
 		// handler parks and closes what it is given, so stage B hands out one
 		// dup per call.)
-		*out_handle = mc->weave.out_fd;
-		*out_width = mc->weave.out_w;
-		*out_height = mc->weave.out_h;
+		*out_handle = WT(mc)->out_fd;
+		*out_width = WT(mc)->out_w;
+		*out_height = WT(mc)->out_h;
 		ok = true;
 	}
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	return ok;
 }
@@ -2970,12 +3096,15 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 
 	bool ok = false;
 	do {
+		if (!weave_target_enter_locked(mc, true)) {
+			break; // v21: past the client's target limit (logged once)
+		}
 		if (!weave_ensure_engine(vk, mc)) {
 			break;
 		}
 		if (!vk_dmabuf_supported(vk)) {
-			if (!mc->weave.dmabuf_unsupported_warned) {
-				mc->weave.dmabuf_unsupported_warned = true;
+			if (!WT(mc)->dmabuf_unsupported_warned) {
+				WT(mc)->dmabuf_unsupported_warned = true;
 				U_LOG_W(
 				    "weave(#1699): dma-buf submit REFUSED — the service's Vulkan device lacks "
 				    "VK_EXT_external_memory_dma_buf / _image_drm_format_modifier / "
@@ -2990,7 +3119,7 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		}
 
 		struct comp_multi_weave_linux_slot *in_slot =
-		    weave_cache_acquire(vk, mc, mc->weave.in_slots, in_fd, in, in->width, in->height, "input");
+		    weave_cache_acquire(vk, mc, WT(mc)->in_slots, in_fd, in, in->width, in->height, "input");
 		if (in_slot == NULL) {
 			break;
 		}
@@ -3006,7 +3135,7 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 			use_ov = weave_overlay_gate(mc, stale, overlay->width, overlay->height, 0, exp_w, exp_h);
 		}
 		if (use_ov) {
-			ov_slot = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, overlay, overlay->width,
+			ov_slot = weave_cache_acquire(vk, mc, WT(mc)->ov_slots, ov_fd, overlay, overlay->width,
 			                              overlay->height, "overlay");
 			if (ov_slot == NULL) {
 				// Refused before the acquire fence is taken and before the
@@ -3044,6 +3173,7 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		ok = true;
 	} while (false);
 
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 
 	weave_close_fd(&in_fd);
@@ -3065,27 +3195,30 @@ comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weav
 	}
 	os_mutex_lock(&mc->weave.mutex);
 	bool ok = false;
-	if (mc->weave.out_image != VK_NULL_HANDLE && !mc->weave.out_is_dmabuf) {
+	if (!weave_target_enter_locked(mc, false)) {
+		// v21: no such target (never submitted, or released): nothing to hand out.
+	} else if (WT(mc)->out_image != VK_NULL_HANDLE && !WT(mc)->out_is_dmabuf) {
 		// This caller wants a dma-buf; the current allocation is stage A's
 		// OPAQUE_FD. "Nothing yet" this frame; the next submit reallocates.
-		mc->weave.out_kind_req = 2;
-		if (!mc->weave.out_kind_warned) {
-			mc->weave.out_kind_warned = true;
+		WT(mc)->out_kind_req = 2;
+		if (!WT(mc)->out_kind_warned) {
+			WT(mc)->out_kind_warned = true;
 			U_LOG_W("weave(#1699): client asked for a dma-buf output over an OPAQUE_FD one — reallocating");
 		}
-	} else if (mc->weave.out_is_dmabuf && mc->weave.out_fd >= 0) {
+	} else if (WT(mc)->out_is_dmabuf && WT(mc)->out_fd >= 0) {
 		// A FRESH dup per call: the dma-buf handler parks what it is handed
 		// and closes it after the reply (#1712), while the engine keeps its
 		// own fd for the allocation's lifetime.
-		int fd = fcntl(mc->weave.out_fd, F_DUPFD_CLOEXEC, 0);
+		int fd = fcntl(WT(mc)->out_fd, F_DUPFD_CLOEXEC, 0);
 		if (fd >= 0) {
-			*out = mc->weave.out_dmabuf;
+			*out = WT(mc)->out_dmabuf;
 			out->fd = fd;
 			ok = true;
 		} else {
 			U_LOG_E("weave(#1699): dup(output dma-buf) failed: %s", strerror(errno));
 		}
 	}
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	return ok;
 }
@@ -3102,12 +3235,17 @@ comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
+	if (!weave_target_enter_locked(mc, true)) {
+		os_mutex_unlock(&mc->weave.mutex);
+		return false;
+	}
 	// SET, not add: the latch is replaced wholesale, and count 0 clears it.
 	for (uint32_t i = 0; i < rect_count; i++) {
-		mc->weave.screen_flat_rects[i] = screen_rects[i];
+		WT(mc)->screen_flat_rects[i] = screen_rects[i];
 	}
-	const bool changed = rect_count != mc->weave.screen_flat_rect_count;
-	mc->weave.screen_flat_rect_count = rect_count;
+	const bool changed = rect_count != WT(mc)->screen_flat_rect_count;
+	WT(mc)->screen_flat_rect_count = rect_count;
+	weave_target_leave_locked(mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
 		// A caller may re-latch the same furniture on every layout pass; log
@@ -3144,9 +3282,17 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	bool snapped =
-	    xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)mc->weave.dp, origin_x,
-	                                              origin_y, target_x, target_y, out_snapped_x, out_snapped_y);
+	// v21: the lattice is the panel's, not a window's — any of this client's
+	// display processors answers it (the default target's first).
+	struct xrt_display_processor *dp = mc->weave.dp;
+	for (size_t k = 0; dp == NULL && k < ARRAY_SIZE(mc->weave_targets.extra); k++) {
+		if (mc->weave_targets.extra[k] != NULL) {
+			dp = mc->weave_targets.extra[k]->dp;
+		}
+	}
+	bool snapped = xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)dp, origin_x,
+	                                                         origin_y, target_x, target_y, out_snapped_x,
+	                                                         out_snapped_y);
 	os_mutex_unlock(&mc->weave.mutex);
 	return snapped;
 }
@@ -3160,11 +3306,25 @@ comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool en
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 	// The standing wish: read again at engine bring-up if the DP is not there yet.
-	const bool had_pending_2d = mc->weave.dp == NULL && !mc->hardware_display_3d;
+	const bool any_dp = weave_any_dp_locked(mc);
+	const bool had_pending_2d = !any_dp && !mc->hardware_display_3d;
 	mc->hardware_display_3d = enable_3d;
 	bool ok = true;
-	if (mc->weave.dp != NULL) {
-		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	if (any_dp) {
+		// v21: the panel's state is one, so every window's DP is switched; the
+		// session hears about the change once (weave_apply_display_mode_locked).
+		if (mc->weave.dp != NULL) {
+			ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR") && ok;
+		}
+		for (size_t k = 0; k < ARRAY_SIZE(mc->weave_targets.extra); k++) {
+			struct comp_multi_weave_linux_target *t = mc->weave_targets.extra[k];
+			if (t == NULL || t->dp == NULL) {
+				continue;
+			}
+			mc->weave_targets.cur = t;
+			ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR") && ok;
+			weave_target_leave_locked(mc);
+		}
 	} else if (enable_3d && had_pending_2d) {
 		U_LOG_W(
 		    "weave(#1699): hardware 3D requested before the weave engine exists — the recorded 2D request is "
@@ -3190,7 +3350,10 @@ comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	mc->weave.mono_in_2d = mono_in_2d;
+	if (weave_target_enter_locked(mc, true)) {
+		WT(mc)->mono_in_2d = mono_in_2d;
+		weave_target_leave_locked(mc);
+	}
 	os_mutex_unlock(&mc->weave.mutex);
 }
 
@@ -3203,11 +3366,156 @@ comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	mc->weave.overlay_unchanged = overlay_unchanged;
-	// Out of range (incl. NaN) = not set by the app: the DP's own default.
-	mc->weave.overlay_filter_strength =
-	    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
+	if (weave_target_enter_locked(mc, true)) {
+		WT(mc)->overlay_unchanged = overlay_unchanged;
+		// Out of range (incl. NaN) = not set by the app: the DP's own default.
+		WT(mc)->overlay_filter_strength =
+		    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
+		weave_target_leave_locked(mc);
+	}
 	os_mutex_unlock(&mc->weave.mutex);
+}
+
+/*!
+ * Tear down the engine WT() resolves to (one target): idle, release every
+ * Vulkan object and its DP, close its fds. weave.mutex held; @p vk may be NULL
+ * (the fds are still closed). Leaves the struct's bookkeeping for the caller
+ * to reset or free.
+ */
+static void
+weave_target_teardown_locked(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (vk != NULL) {
+		if (WT(mc)->engine_initialized) {
+			// Stage B leaves the last frame in flight (and a timed-out stage-A
+			// wait can too) — idle before tearing anything down.
+			weave_queue_wait_idle(vk);
+			WT(mc)->fence_pending = false;
+		}
+		weave_slots_release_all(vk, WT(mc)->in_slots);
+		weave_slots_release_all(vk, WT(mc)->ov_slots);
+		weave_release_scratch(vk, mc);
+		weave_release_crop(vk, mc);
+		weave_release_output(vk, mc);
+		if (WT(mc)->overlay_blend_initialized) {
+			vk_local2d_composite_fini(&WT(mc)->overlay_blend, vk);
+			WT(mc)->overlay_blend_initialized = false;
+		}
+		if (WT(mc)->dp != NULL) {
+			xrt_display_processor_destroy(&WT(mc)->dp);
+		}
+		if (WT(mc)->render_pass != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, WT(mc)->render_pass, NULL);
+			WT(mc)->render_pass = VK_NULL_HANDLE;
+		}
+		weave_destroy_sync_semaphores(vk, mc);
+		if (WT(mc)->fence != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, WT(mc)->fence, NULL);
+			WT(mc)->fence = VK_NULL_HANDLE;
+		}
+		if (WT(mc)->cmd_pool != VK_NULL_HANDLE) {
+			vk->vkDestroyCommandPool(vk->device, WT(mc)->cmd_pool, NULL);
+			WT(mc)->cmd_pool = VK_NULL_HANDLE;
+		}
+	}
+	// fds are process state, not Vulkan state: close them even without a vk.
+	weave_close_fd(&WT(mc)->out_fd);
+	WT(mc)->engine_initialized = false;
+}
+
+void
+comp_multi_weave_linux_select_target(struct xrt_compositor *xc, uint64_t target_id)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL) {
+		return;
+	}
+	// Written only by this client's IPC thread, right before the engine call
+	// it applies to; read by that call under weave.mutex (comp_multi_private.h).
+	mc->weave_targets.selected = target_id;
+}
+
+bool
+comp_multi_weave_linux_target_geometry(struct multi_compositor *mc,
+                                       uint64_t target_id,
+                                       int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h)
+{
+	if (mc == NULL || !mc->weave.mutex_initialized) {
+		return false;
+	}
+	bool ok = false;
+	os_mutex_lock(&mc->weave.mutex);
+	const struct comp_multi_weave_linux_target *t = weave_target_find_locked(mc, target_id, false);
+	if (t != NULL && t->have_geometry && t->win_w > 0 && t->win_h > 0) {
+		*out_x = t->win_x;
+		*out_y = t->win_y;
+		*out_w = t->win_w;
+		*out_h = t->win_h;
+		ok = true;
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
+}
+
+bool
+comp_multi_weave_linux_predicted_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos)
+{
+	if (mc == NULL || out_eye_pos == NULL || !mc->weave.mutex_initialized) {
+		return false;
+	}
+	bool ok = false;
+	os_mutex_lock(&mc->weave.mutex);
+	for (size_t k = 0; !ok && k < ARRAY_SIZE(mc->weave_targets.extra); k++) {
+		struct comp_multi_weave_linux_target *t = mc->weave_targets.extra[k];
+		if (t != NULL && t->dp != NULL) {
+			ok = xrt_display_processor_get_predicted_eye_positions(t->dp, out_eye_pos);
+		}
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
+}
+
+bool
+comp_multi_weave_linux_release_target(struct xrt_compositor *xc, uint64_t target_id)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	struct vk_bundle *vk = weave_get_vk(mc);
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	struct comp_multi_weave_linux_target *t = weave_target_find_locked(mc, target_id, false);
+	bool had_engine = false;
+	if (t != NULL) {
+		had_engine = t->engine_initialized;
+		mc->weave_targets.cur = t;
+		weave_target_teardown_locked(vk, mc);
+		weave_target_leave_locked(mc);
+		if (t == &mc->weave) {
+			// The default target is embedded: reset everything after the
+			// client-wide lock, back to a never-bound engine.
+			const size_t keep = offsetof(struct comp_multi_weave_linux_target, engine_initialized);
+			memset((char *)t + keep, 0, sizeof(*t) - keep);
+			t->out_fd = -1;
+		} else {
+			const int k = u_weave_target_release(mc->weave_targets.ids,
+			                                     (uint32_t)ARRAY_SIZE(mc->weave_targets.ids), target_id);
+			if (k != U_WEAVE_TARGET_NO_SLOT) {
+				mc->weave_targets.extra[k] = NULL;
+			}
+			free(t);
+		}
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	// Lifecycle (a window closed), never per frame.
+	U_LOG_W("weave(v21): client target %" PRIu64 " released%s", target_id,
+	        t == NULL ? " (it did not exist — nothing to do)"
+	                  : (had_engine ? " — its engine and display processor are gone" : " (it never wove)"));
+	return true;
 }
 
 void
@@ -3218,42 +3526,20 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	}
 	struct vk_bundle *vk = weave_get_vk(mc);
 	os_mutex_lock(&mc->weave.mutex);
-	if (vk != NULL) {
-		if (mc->weave.engine_initialized) {
-			// Stage B leaves the last frame in flight (and a timed-out stage-A
-			// wait can too) — idle before tearing anything down.
-			weave_queue_wait_idle(vk);
-			mc->weave.fence_pending = false;
+	// v21: every extra target first, then the default one.
+	for (size_t k = 0; k < ARRAY_SIZE(mc->weave_targets.extra); k++) {
+		struct comp_multi_weave_linux_target *t = mc->weave_targets.extra[k];
+		if (t == NULL) {
+			continue;
 		}
-		weave_slots_release_all(vk, mc->weave.in_slots);
-		weave_slots_release_all(vk, mc->weave.ov_slots);
-		weave_release_scratch(vk, mc);
-		weave_release_crop(vk, mc);
-		weave_release_output(vk, mc);
-		if (mc->weave.overlay_blend_initialized) {
-			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
-			mc->weave.overlay_blend_initialized = false;
-		}
-		if (mc->weave.dp != NULL) {
-			xrt_display_processor_destroy(&mc->weave.dp);
-		}
-		if (mc->weave.render_pass != VK_NULL_HANDLE) {
-			vk->vkDestroyRenderPass(vk->device, mc->weave.render_pass, NULL);
-			mc->weave.render_pass = VK_NULL_HANDLE;
-		}
-		weave_destroy_sync_semaphores(vk, mc);
-		if (mc->weave.fence != VK_NULL_HANDLE) {
-			vk->vkDestroyFence(vk->device, mc->weave.fence, NULL);
-			mc->weave.fence = VK_NULL_HANDLE;
-		}
-		if (mc->weave.cmd_pool != VK_NULL_HANDLE) {
-			vk->vkDestroyCommandPool(vk->device, mc->weave.cmd_pool, NULL);
-			mc->weave.cmd_pool = VK_NULL_HANDLE;
-		}
+		mc->weave_targets.cur = t;
+		weave_target_teardown_locked(vk, mc);
+		weave_target_leave_locked(mc);
+		mc->weave_targets.extra[k] = NULL;
+		mc->weave_targets.ids[k] = 0;
+		free(t);
 	}
-	// fds are process state, not Vulkan state: close them even without a vk.
-	weave_close_fd(&mc->weave.out_fd);
-	mc->weave.engine_initialized = false;
+	weave_target_teardown_locked(vk, mc);
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);
 	mc->weave.mutex_initialized = false;

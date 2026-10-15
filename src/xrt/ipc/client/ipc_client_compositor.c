@@ -743,7 +743,7 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  * marshal the wire.
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
+comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t target_id, uint64_t hwnd)
 {
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -752,7 +752,24 @@ comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_weave_bind_window(icc->ipc_c, hwnd);
+	return ipc_call_weave_bind_window(icc->ipc_c, hwnd, target_id);
+}
+
+/*!
+ * Spec v21 (browser-pvt#288): the caller closed the window of weave target
+ * @p target_id — the service tears that window's engine down.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_release_target(struct xrt_compositor *xc, uint64_t target_id)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_release_target(icc->ipc_c, target_id);
 }
 
 /*!
@@ -762,7 +779,7 @@ comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t
  * same numbers from the HWND) keeps its existing bind path byte-for-byte.
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc, uint64_t target_id,
                                                      int32_t origin_x,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
@@ -783,7 +800,7 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
 	const bool lv = logical != NULL && logical->valid;
 	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id,
 	                                          lv ? 1u : 0u, lv ? logical->x : 0, lv ? logical->y : 0,
-	                                          lv ? logical->scale : 0.0f);
+	                                          lv ? logical->scale : 0.0f, target_id);
 }
 
 /*!
@@ -878,7 +895,7 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
 }
 
 xrt_result_t
-comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc, uint64_t target_id,
                                         xrt_graphics_buffer_handle_t in_handle,
                                         bool in_is_dxgi,
                                         int32_t rect_x,
@@ -939,6 +956,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
 	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
 	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
+	args.target_id = target_id; // v21: which present-owner window
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
@@ -1015,7 +1033,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
 }
 
 xrt_result_t
-comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc, uint64_t target_id,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -1038,7 +1056,7 @@ comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
 	bool have = false;
 	uint32_t w = 0, h = 0;
 	xrt_graphics_buffer_handle_t handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, &have, &w, &h, &handle, 1);
+	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, target_id, &have, &w, &h, &handle, 1);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -1157,7 +1175,7 @@ weave_pack_dmabuf(struct ipc_weave_dmabuf *dst, const struct xrt_weave_dmabuf_de
  * service completed the weave synchronously.
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc, uint64_t target_id,
                                                const struct xrt_weave_dmabuf_desc *in,
                                                const struct xrt_weave_dmabuf_desc *overlay,
                                                int acquire_fence_fd,
@@ -1218,6 +1236,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, overlay != NULL,
 	                       overlay_rect_count, NULL, weave_frame_first, layout, flat_rect_count, flat_rects,
 	                       mono_in_2d, overlay_unchanged, overlay_filter_strength);
+	args.target_id = target_id; // v21: which present-owner window
 
 	struct ipc_arg_weave_dmabuf dmabuf = {0};
 	weave_pack_dmabuf(&dmabuf.input, in);
@@ -1284,7 +1303,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
  * @p out_have_output false, exactly like weave_get_output (#1427).
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc, uint64_t target_id,
                                                    bool *out_have_output,
                                                    struct xrt_weave_dmabuf_output_desc *out_desc)
 {
@@ -1303,7 +1322,7 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
 	bool have = false;
 	struct ipc_weave_dmabuf_output desc = {0};
 	xrt_graphics_buffer_handle_t handle[1] = {XRT_GRAPHICS_BUFFER_HANDLE_INVALID};
-	xrt_result_t xret = ipc_call_weave_get_output_dmabuf(icc->ipc_c, &have, &desc, handle, 1);
+	xrt_result_t xret = ipc_call_weave_get_output_dmabuf(icc->ipc_c, target_id, &have, &desc, handle, 1);
 	if (xret != XRT_SUCCESS) {
 		if (handle[0] >= 0) {
 			u_graphics_buffer_unref(&handle[0]);
@@ -1349,7 +1368,7 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
  * process owns, or -1 (= the weave completed synchronously).
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc, uint64_t target_id,
                                              xrt_graphics_buffer_handle_t in_handle,
                                              int32_t rect_x,
                                              int32_t rect_y,
@@ -1412,6 +1431,7 @@ comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
 	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
 	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
+	args.target_id = target_id; // v21: which present-owner window
 
 	xrt_result_t xret = XRT_SUCCESS;
 	if (acquire_fence_fd >= 0) {

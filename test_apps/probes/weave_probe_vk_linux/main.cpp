@@ -67,6 +67,14 @@
  * both composed; the latch cleared (all woven again); and a v6 N-view submit
  * whose flat half comes back as the centre view.
  *
+ * --targets (spec v21, browser-pvt#288): two present-owner windows on ONE
+ * session (XrWeaveTargetDXR). Window 0 (the default target) and window 7 are
+ * bound at different places and sizes with opposite patterns; each must get an
+ * output of its own size, weaving one must leave the other's output intact,
+ * the steady state must not re-export either, and xrWeaveReleaseTargetDXR must
+ * tear window 7 down (it comes back with a fresh output) without touching
+ * window 0.
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -1744,12 +1752,219 @@ run_flat_regions(Vk &vk,
 	return pass;
 }
 
+/*
+ *
+ * --targets: several present-owner windows on one session (spec v21,
+ * XrWeaveTargetDXR, browser-pvt#288).
+ *
+ */
+
+//! Bind window @p target (0 = the default one) at (@p x, @p y) @p w x @p h.
+static bool
+targets_bind(XrSession session,
+             PFN_xrWeaveBindWindow2DXR pfn_bind2,
+             uint64_t target,
+             int32_t x,
+             int32_t y,
+             uint32_t w,
+             uint32_t h)
+{
+	XrWeaveTargetDXR tgt = {(XrStructureType)XR_TYPE_WEAVE_TARGET_DXR};
+	tgt.targetId = target;
+	XrWeaveWindowGeometryDXR geom = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
+	geom.next = &tgt;
+	geom.windowOriginOnScreen = {x, y};
+	geom.clientSize = {(int32_t)w, (int32_t)h};
+	geom.displayId = -1;
+	XrWeaveBindWindowInfoDXR bind = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
+	bind.next = &geom;
+	bind.windowHandle = (void *)(uintptr_t)(0x100 + target);
+	XrResult r = pfn_bind2(session, &bind);
+	if (XR_FAILED(r)) {
+		LOG("FAIL: bind target %llu at (%d,%d) %ux%u -> %d", (unsigned long long)target, x, y, w, h, (int)r);
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * One submit to window @p target. A handed-back output replaces @p out_img (an
+ * output is exported once per allocation, per target); @p out_exported says
+ * whether this submit handed one back.
+ */
+static bool
+targets_submit(Vk &vk,
+               XrSession session,
+               PFN_xrWeaveSubmitDXR pfn_submit,
+               uint64_t target,
+               const Image &input,
+               const XrRect2Di *rects,
+               uint32_t rect_count,
+               Image &out_img,
+               bool *out_exported)
+{
+	XrWeaveTargetDXR tgt = {(XrStructureType)XR_TYPE_WEAVE_TARGET_DXR};
+	tgt.targetId = target;
+	XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+	batch.next = &tgt;
+	batch.rectCount = rect_count;
+	batch.rects = rects;
+	XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+	submit.next = &batch;
+	submit.firstChunk = XR_TRUE;
+	submit.inputTexture = (void *)(intptr_t)input.fd;
+	XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+	XrResult r = pfn_submit(session, &submit, &out);
+	if (XR_FAILED(r)) {
+		LOG("FAIL: xrWeaveSubmitDXR(target %llu) -> %d", (unsigned long long)target, (int)r);
+		return false;
+	}
+	*out_exported = out.weavedTexture != nullptr;
+	if (*out_exported) {
+		if (out_img.image != VK_NULL_HANDLE) {
+			destroy_image(vk, out_img);
+		}
+		if (!import_output_image(vk, (int)(intptr_t)out.weavedTexture, out.width, out.height, out_img)) {
+			LOG("FAIL: import of target %llu's woven output", (unsigned long long)target);
+			return false;
+		}
+	}
+	if (out_img.image == VK_NULL_HANDLE || out.width != out_img.w || out.height != out_img.h) {
+		LOG("FAIL: target %llu: output %ux%u, imported %ux%u", (unsigned long long)target, out.width, out.height,
+		    out_img.w, out_img.h);
+		return false;
+	}
+	return true;
+}
+
+static bool
+run_targets(Vk &vk,
+            XrSession session,
+            PFN_xrWeaveBindWindow2DXR pfn_bind2,
+            PFN_xrWeaveSubmitDXR pfn_submit,
+            PFN_xrWeaveReleaseTargetDXR pfn_release,
+            const std::string &dump_dir)
+{
+	// Two windows of one session. Window 0 (the default target) is the probe's
+	// usual 1280x720 with rect A woven RED; window 7 is a 960x540 window
+	// elsewhere with the OPPOSITE pattern in its rect (woven CYAN). Each must
+	// get an output of its own size, and weaving one must not touch the other.
+	const uint64_t kSecond = 7;
+	const uint32_t w2 = 960, h2 = 540;
+	const XrRect2Di rect2 = {{200, 120}, {320, 180}};
+	if (!targets_bind(session, pfn_bind2, 0, kWinOrigin.x, kWinOrigin.y, kWinW, kWinH) ||
+	    !targets_bind(session, pfn_bind2, kSecond, kWinOrigin.x + 160, kWinOrigin.y + 96, w2, h2)) {
+		return false;
+	}
+
+	std::vector<uint8_t> px0((size_t)kWinW * kWinH * 4, 0);
+	fill_sbs_rect(px0, kWinW, kRectA, 0xFF, 0x00);
+	std::vector<uint8_t> px2((size_t)w2 * h2 * 4, 0);
+	fill_sbs_rect(px2, w2, rect2, 0x00, 0xFF);
+	Image in0, in2, out0, out2;
+	if (!create_exported_image(vk, kWinW, kWinH, in0) || !upload_and_release(vk, in0, px0) ||
+	    !create_exported_image(vk, w2, h2, in2) || !upload_and_release(vk, in2, px2)) {
+		LOG("FAIL: targets image setup");
+		return false;
+	}
+	const int a_x = kRectA.offset.x + kRectA.extent.width / 4, a_y = kRectA.offset.y + kRectA.extent.height / 2;
+	const int b_x = rect2.offset.x + rect2.extent.width / 4, b_y = rect2.offset.y + rect2.extent.height / 2;
+	const uint8_t W = 255, K = 0;
+	std::vector<uint8_t> px;
+	bool pass = true;
+	bool exported = false;
+
+	LOG("targets case: window 0 then window %llu, each its own output", (unsigned long long)kSecond);
+	pass = pass && targets_submit(vk, session, pfn_submit, 0, in0, &kRectA, 1, out0, &exported);
+	if (pass && !exported) {
+		LOG("FAIL: window 0's first submit handed back no output");
+		pass = false;
+	}
+	pass = pass && targets_submit(vk, session, pfn_submit, kSecond, in2, &rect2, 1, out2, &exported);
+	if (pass && !exported) {
+		LOG("FAIL: window %llu's first submit handed back no output of its own", (unsigned long long)kSecond);
+		pass = false;
+	}
+	if (pass && (out0.w != kWinW || out0.h != kWinH || out2.w != w2 || out2.h != h2)) {
+		LOG("FAIL: outputs %ux%u / %ux%u, want %ux%u / %ux%u", out0.w, out0.h, out2.w, out2.h, kWinW, kWinH, w2,
+		    h2);
+		pass = false;
+	}
+	if (pass) {
+		pass = readback(vk, out2, px);
+		if (pass) {
+			dump_ppm(px, w2, h2, dump_dir + "/weave_probe_linux_targets_w7.ppm");
+			pass &= span_check(px, w2, "window 7 rect (woven CYAN)", b_x, b_y, K, W, W);
+		}
+		// Window 7's weave ran AFTER window 0's: window 0's output must
+		// still hold its own frame.
+		pass = pass && readback(vk, out0, px);
+		if (pass) {
+			dump_ppm(px, kWinW, kWinH, dump_dir + "/weave_probe_linux_targets_w0.ppm");
+			pass &= span_check(px, kWinW, "window 0 rect A (still RED)", a_x, a_y, W, K, K);
+		}
+	}
+
+	LOG("targets case: steady state — no re-export, outputs stay separate");
+	for (int frame = 0; pass && frame < 10; frame++) {
+		bool e0 = true, e2 = true;
+		pass = targets_submit(vk, session, pfn_submit, 0, in0, &kRectA, 1, out0, &e0) &&
+		       targets_submit(vk, session, pfn_submit, kSecond, in2, &rect2, 1, out2, &e2);
+		if (pass && (e0 || e2)) {
+			LOG("FAIL: frame %d re-exported an output (window 0: %d, window 7: %d) — the latch is per target",
+			    frame, (int)e0, (int)e2);
+			pass = false;
+		}
+	}
+	if (pass) {
+		pass = readback(vk, out0, px) && span_check(px, kWinW, "window 0 rect A (RED)", a_x, a_y, W, K, K);
+		pass = pass && readback(vk, out2, px) && span_check(px, w2, "window 7 rect (CYAN)", b_x, b_y, K, W, W);
+	}
+
+	LOG("targets case: release window %llu, then it comes back as a new window", (unsigned long long)kSecond);
+	if (pass) {
+		XrResult r = pfn_release(session, kSecond);
+		if (XR_FAILED(r)) {
+			LOG("FAIL: xrWeaveReleaseTargetDXR(%llu) -> %d", (unsigned long long)kSecond, (int)r);
+			pass = false;
+		}
+		r = pass ? pfn_release(session, 12345) : XR_SUCCESS; // never used: a no-op
+		if (XR_FAILED(r)) {
+			LOG("FAIL: xrWeaveReleaseTargetDXR(unused id) -> %d, want XR_SUCCESS", (int)r);
+			pass = false;
+		}
+	}
+	// Window 0 is untouched by the release.
+	pass = pass && targets_submit(vk, session, pfn_submit, 0, in0, &kRectA, 1, out0, &exported);
+	if (pass && exported) {
+		LOG("FAIL: releasing window 7 made window 0 re-export");
+		pass = false;
+	}
+	pass = pass && targets_bind(session, pfn_bind2, kSecond, kWinOrigin.x + 160, kWinOrigin.y + 96, w2, h2);
+	pass = pass && targets_submit(vk, session, pfn_submit, kSecond, in2, &rect2, 1, out2, &exported);
+	if (pass && !exported) {
+		LOG("FAIL: window 7 came back without a fresh output");
+		pass = false;
+	}
+	if (pass) {
+		pass = readback(vk, out2, px) && span_check(px, w2, "window 7 again (CYAN)", b_x, b_y, K, W, W);
+		pass = pass && readback(vk, out0, px) && span_check(px, kWinW, "window 0 (RED)", a_x, a_y, W, K, K);
+	}
+
+	destroy_image(vk, out0);
+	destroy_image(vk, out2);
+	destroy_image(vk, in0);
+	destroy_image(vk, in2);
+	return pass;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
 	long service_pid = 0;
 	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false, flat_regions = false;
+	bool targets = false;
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
 		dump_dir = t;
@@ -1771,9 +1986,11 @@ main(int argc, char **argv)
 			span2d = true; // off-panel flat 2D (#1654 on the service path)
 		} else if (strcmp(argv[i], "--flat-regions") == 0) {
 			flat_regions = true; // spec-v8 flat regions painted flat (desktop Linux)
+		} else if (strcmp(argv[i], "--targets") == 0) {
+			targets = true; // spec-v21 several windows on one session (browser-pvt#288)
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d] [--flat-regions]",
+			    "[--linear]] [--span2d] [--flat-regions] [--targets]",
 			    argv[0]);
 			return 2;
 		}
@@ -2022,6 +2239,23 @@ main(int argc, char **argv)
 	bind.windowHandle = (void *)(uintptr_t)0x1;
 	XR_CHECK(pfn_bind2(session, &bind));
 	LOG("bound fake window 0x1 at (%d,%d) %ux%u", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH);
+
+	if (targets) {
+		PFN_xrWeaveReleaseTargetDXR pfn_release = nullptr;
+		xrGetInstanceProcAddr(instance, "xrWeaveReleaseTargetDXR", (PFN_xrVoidFunction *)&pfn_release);
+		bool pass = pfn_release != nullptr && run_targets(vk, session, pfn_bind2, pfn_submit, pfn_release, dump_dir);
+		if (pfn_release == nullptr) {
+			LOG("FAIL: xrWeaveReleaseTargetDXR did not resolve");
+		}
+		xrDestroySession(session);
+		xrDestroyInstance(instance);
+		vkDestroyFence(vk.device, vk.fence, nullptr);
+		vkDestroyCommandPool(vk.device, vk.pool, nullptr);
+		vkDestroyDevice(vk.device, nullptr);
+		vkDestroyInstance(vk.instance, nullptr);
+		LOG("targets: %s", pass ? "PASS" : "FAIL");
+		return pass ? 0 : 1;
+	}
 
 	if (flat_regions) {
 		PFN_xrWeaveSetScreenFlatRegionsDXR pfn_set_flat = nullptr;

@@ -1455,7 +1455,15 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// window rect (the swap then only matters as the pre-rect fallback), and on
 	// macOS the #59 block does the same from the controller-placed window pose.
 	struct xrt_window_metrics wm = {0};
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// XR_DXR_weave v21: a present-owner with several windows names the one
+	// this locate's zone rect is relative to; frame it against that window.
+	bool have_wm = (rig != NULL && rig->weave_target_id != 0)
+	                   ? multi_compositor_get_weave_target_window_metrics(mc, rig->weave_target_id, &wm)
+	                   : multi_compositor_get_window_metrics(mc, &wm);
+#else
 	bool have_wm = multi_compositor_get_window_metrics(mc, &wm);
+#endif
 	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
 		bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
 		bool dims_landscape = screen_width_m >= screen_height_m;
@@ -7121,8 +7129,27 @@ ipc_handle_compositor_get_transparent_output_fence(volatile struct ipc_client_st
  * service compositor's additive weave entry points: the D3D11 service on
  * Windows, the comp_multi Vulkan weave engine on macOS (#759).
  */
+/*!
+ * XR_DXR_weave v21 (XrWeaveTargetDXR, browser-pvt#288): route this client's NEXT
+ * weave-engine call to the present-owner window @p target_id. Only the
+ * desktop-Linux engine keeps several windows per client; every other service
+ * takes the default target (0) and refuses any other as unsupported. Called
+ * right before each engine call, on this client's own IPC thread.
+ */
+static xrt_result_t
+weave_select_target(volatile struct ipc_client_state *ics, uint64_t target_id)
+{
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	comp_multi_weave_linux_select_target(ics->xc, target_id);
+	return XRT_SUCCESS;
+#else
+	(void)ics;
+	return target_id == 0 ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
 xrt_result_t
-ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwnd)
+ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwnd, uint64_t target_id)
 {
 	IPC_TRACE_MARKER();
 
@@ -7133,6 +7160,10 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 
 	if (ics->xc == NULL) {
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	xrt_result_t sel = weave_select_target(ics, target_id);
+	if (sel != XRT_SUCCESS) {
+		return sel;
 	}
 
 	// A refusal from the weave engine is NOT a transport failure — see
@@ -7154,6 +7185,31 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 }
 
 /*!
+ * XR_DXR_weave v21: the caller closed the window of target @p target_id — tear
+ * down that window's engine (its display processor, output and caches). Only
+ * the desktop-Linux engine has targets; elsewhere releasing the default one is
+ * a no-op and any other id is unsupported.
+ */
+xrt_result_t
+ipc_handle_weave_release_target(volatile struct ipc_client_state *ics, uint64_t target_id)
+{
+	IPC_TRACE_MARKER();
+
+	xrt_result_t auth = require_present_owner(ics, "weave_release_target");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	return comp_multi_weave_linux_release_target(ics->xc, target_id) ? XRT_SUCCESS : XRT_ERROR_WEAVE_REFUSED;
+#else
+	return target_id == 0 ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+/*!
  * XR_DXR_weave spec v7 (#1036): the present-owner's client-area rect on the
  * panel. The weave phase is absolute-screen, so a window that is not at the
  * panel origin needs its origin fed to the DP (`set_window_screen_rect`, ADR-036
@@ -7170,7 +7226,8 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
                                      uint32_t logical_valid,
                                      int32_t logical_x,
                                      int32_t logical_y,
-                                     float logical_scale)
+                                     float logical_scale,
+                                     uint64_t target_id)
 {
 	IPC_TRACE_MARKER();
 
@@ -7181,6 +7238,10 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 
 	if (ics->xc == NULL) {
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	xrt_result_t sel = weave_select_target(ics, target_id);
+	if (sel != XRT_SUCCESS) {
+		return sel;
 	}
 
 #if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
@@ -7281,6 +7342,8 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 		rects[i].extent.w = (int)args->rects[i].w;
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
+	// v21: the latch belongs to the default target (the call names no window).
+	comp_multi_weave_linux_select_target(ics->xc, 0);
 	if (!comp_multi_weave_set_screen_flat_regions(ics->xc, args->rect_count, args->rect_count > 0 ? rects : NULL)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
@@ -7363,6 +7426,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		// Malformed request: the wire is not trusted, so this one IS a
 		// transport-class failure.
 		return XRT_ERROR_IPC_FAILURE;
+	}
+	// v21: which present-owner window (the hints set below ride the same one).
+	xrt_result_t sel = weave_select_target(ics, args->target_id);
+	if (sel != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return sel;
 	}
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -7701,6 +7770,7 @@ ipc_handle_weave_cursor_state(volatile struct ipc_client_state *ics, struct xrt_
 
 xrt_result_t
 ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
+                            uint64_t target_id,
                             bool *out_have_output,
                             uint32_t *out_width,
                             uint32_t *out_height,
@@ -7721,6 +7791,10 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 
 	if (ics->xc == NULL || max_handle_count < 1) {
 		return XRT_SUCCESS;
+	}
+	xrt_result_t sel = weave_select_target(ics, target_id);
+	if (sel != XRT_SUCCESS) {
+		return sel;
 	}
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -7921,6 +7995,12 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	if (ics->xc == NULL) {
 		weave_submit_release_handles(handles, handle_count);
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	// v21: which present-owner window (the hints set below ride the same one).
+	xrt_result_t sel = weave_select_target(ics, args->target_id);
+	if (sel != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return sel;
 	}
 
 #if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
@@ -8184,6 +8264,7 @@ ipc_handle_weave_submit_sync(volatile struct ipc_client_state *ics,
 
 xrt_result_t
 ipc_handle_weave_get_output_dmabuf(volatile struct ipc_client_state *ics,
+                                   uint64_t target_id,
                                    bool *out_have_output,
                                    struct ipc_weave_dmabuf_output *out_desc,
                                    uint32_t max_handle_count,
@@ -8206,6 +8287,10 @@ ipc_handle_weave_get_output_dmabuf(volatile struct ipc_client_state *ics,
 	}
 	if (ics->xc == NULL || max_handle_count < 1) {
 		return XRT_SUCCESS;
+	}
+	xrt_result_t sel = weave_select_target(ics, target_id);
+	if (sel != XRT_SUCCESS) {
+		return sel;
 	}
 
 #if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)

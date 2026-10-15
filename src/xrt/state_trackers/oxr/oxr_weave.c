@@ -60,6 +60,7 @@
 #include "util/u_logging.h"
 #include "util/u_snap_grid.h"
 #include "util/u_weave_rect_parts.h"
+#include "util/u_weave_targets.h"
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
@@ -89,6 +90,7 @@
 
 #include <assert.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -140,14 +142,18 @@ xrt_result_t
 ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *out_handle);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t target_id, uint64_t hwnd);
+
+//! XR_DXR_weave v21 (browser-pvt#288): tear down one present-owner window's weave.
+xrt_result_t
+comp_ipc_client_compositor_weave_release_target(struct xrt_compositor *xc, uint64_t target_id);
 
 //! XR_DXR_weave v19 (#1884): the last weave's per-screen segment table.
 xrt_result_t
 comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc, uint64_t target_id,
                                                      int32_t origin_x,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
@@ -156,7 +162,7 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      const struct xrt_weave_logical_origin *logical);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc, uint64_t target_id,
                                         xrt_graphics_buffer_handle_t in_handle,
                                         bool in_is_dxgi,
                                         int32_t rect_x,
@@ -201,7 +207,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
                                                          const struct xrt_rect *screen_rects);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc, uint64_t target_id,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -215,7 +221,7 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
 #ifdef XRT_OS_LINUX_DESKTOP
 // Spec v10 (#1699) desktop-Linux dma-buf bridges, same file + pattern as above.
 xrt_result_t
-comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc, uint64_t target_id,
                                                const struct xrt_weave_dmabuf_desc *in,
                                                const struct xrt_weave_dmabuf_desc *overlay,
                                                int acquire_fence_fd,
@@ -242,7 +248,7 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc, uint64_t target_id,
                                                    bool *out_have_output,
                                                    struct xrt_weave_dmabuf_output_desc *out_desc);
 #endif
@@ -250,7 +256,7 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
 #ifdef XRT_OS_ANDROID
 // Spec v20 Android sync_file submit, same file + pattern as above.
 xrt_result_t
-comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc, uint64_t target_id,
                                              xrt_graphics_buffer_handle_t in_handle,
                                              int32_t rect_x,
                                              int32_t rect_y,
@@ -425,6 +431,73 @@ session_is_ipc(struct oxr_session *sess)
 	return !inprocess;
 }
 
+/*!
+ * Spec v21 (browser-pvt#288): the window a bind / submit is for — a chained
+ * XrWeaveTargetDXR's id, or 0 (the session's default window) without one. Only
+ * the desktop-Linux service keeps several windows per session; anywhere else a
+ * non-zero id is XR_ERROR_FEATURE_UNSUPPORTED, so a caller can fall back to one
+ * window without guessing from the spec version.
+ */
+static XrResult
+weave_target_from_chain(struct oxr_logger *log, const void *chain_head, const char *fn, uint64_t *out_target)
+{
+	*out_target = 0;
+	const XrWeaveTargetDXR *t = OXR_GET_INPUT_FROM_CHAIN(chain_head, XR_TYPE_WEAVE_TARGET_DXR, XrWeaveTargetDXR);
+	if (t == NULL || t->targetId == 0) {
+		return XR_SUCCESS;
+	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	*out_target = t->targetId;
+	return XR_SUCCESS;
+#else
+	return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+	                 "%s: XrWeaveTargetDXR::targetId %" PRIu64
+	                 " — several present-owner windows per session are a desktop-Linux service feature",
+	                 fn, t->targetId);
+#endif
+}
+
+/*!
+ * Spec v21: the one-shot output-export latch of @p target (#1427) — the
+ * session's own fields for the default target, else a target_latch slot,
+ * claimed on first use when @p claim. NULL when the table is full (the export
+ * then simply happens every frame: correct, only slower) or, without @p claim,
+ * when the target has none.
+ */
+struct weave_latch
+{
+	bool *exported;
+	uint32_t *last_w;
+	uint32_t *last_h;
+};
+
+static bool
+weave_target_latch(struct oxr_session *sess, uint64_t target, bool claim, struct weave_latch *out)
+{
+	if (target == 0) {
+		out->exported = &sess->weave.exported;
+		out->last_w = &sess->weave.last_w;
+		out->last_h = &sess->weave.last_h;
+		return true;
+	}
+	const uint32_t cap = (uint32_t)ARRAY_SIZE(sess->weave.target_latch_ids);
+	bool created = false;
+	const int k = claim ? u_weave_target_claim(sess->weave.target_latch_ids, cap, target, &created)
+	                    : u_weave_target_find(sess->weave.target_latch_ids, cap, target);
+	if (k == U_WEAVE_TARGET_NO_SLOT) {
+		return false;
+	}
+	if (created) {
+		sess->weave.target_latch[k].exported = false;
+		sess->weave.target_latch[k].last_w = 0;
+		sess->weave.target_latch[k].last_h = 0;
+	}
+	out->exported = &sess->weave.target_latch[k].exported;
+	out->last_w = &sess->weave.target_latch[k].last_w;
+	out->last_h = &sess->weave.target_latch[k].last_h;
+	return true;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle)
 {
@@ -443,7 +516,7 @@ oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle)
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_bind_window(
-	    &sess->xcn->base, (uint64_t)(uintptr_t)windowHandle);
+	    &sess->xcn->base, 0 /* v21: the default window */, (uint64_t)(uintptr_t)windowHandle);
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindowDXR: bind failed (xrt_result=%d)", (int)xret);
 	return XR_SUCCESS;
 }
@@ -466,10 +539,17 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 		                 "out-of-process (service) path");
 	}
 
+	// Spec v21: which of the caller's windows (0 = the default one).
+	uint64_t target = 0;
+	XrResult tr = weave_target_from_chain(&log, bindInfo, "xrWeaveBindWindow2DXR", &target);
+	if (tr != XR_SUCCESS) {
+		return tr;
+	}
+
 	// The handle half is exactly xrWeaveBindWindowDXR (NULL is legal — Android
 	// has no window handle at all and binds by geometry alone).
 	xrt_result_t xret = comp_ipc_client_compositor_weave_bind_window(
-	    &sess->xcn->base, (uint64_t)(uintptr_t)bindInfo->windowHandle);
+	    &sess->xcn->base, target, (uint64_t)(uintptr_t)bindInfo->windowHandle);
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: bind failed (xrt_result=%d)", (int)xret);
 
 	// Spec v7 (#1036): explicit client-area geometry on the panel. Optional on
@@ -510,7 +590,7 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 			                 geom->clientSize.width, geom->clientSize.height);
 		}
 		xret = comp_ipc_client_compositor_weave_set_window_geometry(
-		    &sess->xcn->base, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
+		    &sess->xcn->base, target, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
 		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId, &logical);
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
 		                   (int)xret);
@@ -645,6 +725,17 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "xrWeaveSubmitDXR: the weave service is only available on the "
 		                 "out-of-process (service) path");
+	}
+
+	// Spec v21 (browser-pvt#288): which of the caller's windows this frame is
+	// for (0 = the default one). Everything below — the weave, the woven
+	// output and its export latch — is that window's.
+	uint64_t target = 0;
+	{
+		XrResult tr = weave_target_from_chain(&log, submitInfo, "xrWeaveSubmitDXR", &target);
+		if (tr != XR_SUCCESS) {
+			return tr;
+		}
 	}
 
 	// Spec v3 batched submit: a chained XrWeaveSubmitRectsDXR switches the
@@ -1170,7 +1261,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		// originals are closed only once this call is certain to return
 		// XR_SUCCESS (bottom of this function) — the spec's Vulkan-style rule.
 		xret = comp_ipc_client_compositor_weave_submit_dmabuf(
-		    &sess->xcn->base, &in_desc, dmabuf_ov != NULL ? &ov_desc : NULL, acquire_fd,
+		    &sess->xcn->base, target, &in_desc, dmabuf_ov != NULL ? &ov_desc : NULL, acquire_fd,
 		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL,
 		    overlay_rect_count, submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL,
@@ -1185,7 +1276,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		// of the acquire fd (SCM_RIGHTS); the caller's original is closed only
 		// once this call is certain to return XR_SUCCESS (bottom of function).
 		xret = comp_ipc_client_compositor_weave_submit_sync(
-		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
+		    &sess->xcn->base, target, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL, overlay_handle,
 		    overlay_rect_count, overlay_rect_count > 0 ? overlay_rects : NULL,
@@ -1197,7 +1288,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 #endif
 	{
 		xret = comp_ipc_client_compositor_weave_submit(
-		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
+		    &sess->xcn->base, target, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
 		    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
 		    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
@@ -1316,7 +1407,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	(void)lift_cursor_mask;
 #endif
 
-	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
+	// v21: each target's output is its own allocation, so each has its own latch.
+	struct weave_latch latch = {0};
+	const bool have_latch = weave_target_latch(sess, target, true, &latch);
+	bool need_export = !have_latch || !*latch.exported || w != *latch.last_w || h != *latch.last_h;
 	if (have_out && w != 0 && h != 0 && need_export) {
 		bool have_tex = false;
 		bool got_tex = false;
@@ -1327,7 +1421,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		struct xrt_weave_dmabuf_output_desc od = {0};
 		od.fd = -1;
 		if (out_dmabuf != NULL) {
-			xret = comp_ipc_client_compositor_weave_get_output_dmabuf(&sess->xcn->base, &have_tex, &od);
+			xret = comp_ipc_client_compositor_weave_get_output_dmabuf(&sess->xcn->base, target, &have_tex, &od);
 			if (xret != XRT_SUCCESS && release_fd >= 0) {
 				close(release_fd); // not handing out a frame: drop its fence
 			}
@@ -1352,7 +1446,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		{
 			uint32_t gw = 0, gh = 0;
 			xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-			xret = comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h);
+			xret = comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, target, &have_tex, &gw, &gh,
+			                                                   &tex_h);
 #ifdef OXR_WEAVE_HAVE_SYNC_FD
 			if (xret != XRT_SUCCESS && release_fd >= 0) {
 				close(release_fd);
@@ -1412,9 +1507,11 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		// host without a service. v10's per-frame release fence is deliberately
 		// NOT part of it (see oxr_weave_latch.h).
 		if (oxr_weave_should_latch_export(oxr_weave_platform_exports_fence(), got_tex, got_fence)) {
-			sess->weave.exported = true;
-			sess->weave.last_w = w;
-			sess->weave.last_h = h;
+			if (have_latch) {
+				*latch.exported = true;
+				*latch.last_w = w;
+				*latch.last_h = h;
+			}
 			// One-off (never per-frame): pairs with the miss WARN below, so a
 			// field log shows the whole latch class in two lines.
 			if (sess->weave.warned_export_miss && !sess->weave.warned_export_recovered) {
@@ -1712,6 +1809,46 @@ oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_set_screen_flat_regions(&sess->xcn->base, rectCount,
 	                                                                            rectCount > 0 ? rects : NULL);
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSetScreenFlatRegionsDXR: latch failed (xrt_result=%d)", (int)xret);
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveReleaseTargetDXR(XrSession session, uint64_t targetId)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveReleaseTargetDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
+
+	if (!session_is_ipc(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveReleaseTargetDXR: the weave service is only available on the "
+		                 "out-of-process (service) path");
+	}
+#ifndef XRT_OS_LINUX_DESKTOP
+	if (targetId != 0) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveReleaseTargetDXR: targetId %" PRIu64
+		                 " — several present-owner windows per session are a desktop-Linux service feature",
+		                 targetId);
+	}
+#endif
+
+	xrt_result_t xret = comp_ipc_client_compositor_weave_release_target(&sess->xcn->base, targetId);
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveReleaseTargetDXR: release failed (xrt_result=%d)", (int)xret);
+
+	// The next output of this id is a new allocation: export it again.
+	struct weave_latch latch = {0};
+	if (weave_target_latch(sess, targetId, false, &latch)) {
+		*latch.exported = false;
+		*latch.last_w = 0;
+		*latch.last_h = 0;
+	}
+	(void)u_weave_target_release(sess->weave.target_latch_ids, (uint32_t)ARRAY_SIZE(sess->weave.target_latch_ids),
+	                             targetId); // no-op for 0: the default latch is the session's own
 	return XR_SUCCESS;
 }
 

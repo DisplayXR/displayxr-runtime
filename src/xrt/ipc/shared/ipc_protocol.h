@@ -1089,6 +1089,13 @@ struct ipc_arg_weave_submit
 	//! strength for the overlay, [0,1]; NEGATIVE = not set (the DP's own default).
 	//! Appended: 832 + 4 = 836 B; the dma-buf call is 4 + 836 + 136 = 976 of 1024.
 	float overlay_filter_strength;
+
+	//! XR_DXR_weave v21 (XrWeaveTargetDXR, browser-pvt#288): which of the
+	//! client's present-owner windows this submit is for; 0 = the default one
+	//! (every pre-v21 caller). Desktop-Linux engine only; any other service
+	//! refuses a non-zero id. Appended: 836 + 4 (alignment) + 8 = 848 B; the
+	//! dma-buf call is 4 + 4 (alignment) + 848 + 136 = 992 of 1024.
+	uint64_t target_id;
 };
 
 /*!
@@ -1437,6 +1444,15 @@ struct ipc_view_rig_info
 	int32_t zone_y_px; //!< Zone rect top, client-window pixels (y-down)
 	int32_t zone_w_px; //!< Zone rect width in pixels
 	int32_t zone_h_px; //!< Zone rect height in pixels
+
+	/*
+	 * XR_DXR_weave v21 (browser-pvt#288) — append-only past this point.
+	 */
+
+	//! The weave target (XrWeaveTargetDXR chained on the locate) whose
+	//! window the zone rect is relative to; 0 = the session's default window
+	//! (every other locate). Desktop-Linux service only.
+	uint64_t weave_target_id;
 };
 
 /*!

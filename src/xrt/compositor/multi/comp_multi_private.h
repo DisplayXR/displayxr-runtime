@@ -218,6 +218,240 @@ struct comp_multi_weave_eye_stage
 	VkFormat format; //!< The input's format, so the copy is a same-format box copy.
 };
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * XR_DXR_weave present-owner state (#1699 R2) — the desktop-Linux sibling
+ * of the Android block above (minus the Arch-C satellite), with fds in
+ * place of AHardwareBuffers. The caller owns its window and presents
+ * itself; we import its buffer fd (stage A: OPAQUE_FD from the same
+ * driver + device; stage B: a dma-buf with a DRM modifier), blit every
+ * submitted rect into a window-sized 2x1 SBS scratch atlas (or sample its
+ * v6 N-view atlas directly), run ONE DP process_atlas into an exportable
+ * output, and either wait completion before the IPC reply (stage A) or
+ * hand back a release sync_file and wait the frame at the start of the
+ * next submit (stage B). Implemented in comp_multi_weave_linux.c.
+ *
+ * XR_DXR_weave v21 (browser-pvt#288): one of these is ONE present-owner
+ * window's whole engine — its DP, output, caches, geometry and fences. A
+ * client's default target (id 0, every pre-v21 caller) lives in
+ * multi_compositor::weave; further windows of the same client live in
+ * multi_compositor::weave_targets. Only the default target's @c mutex /
+ * @c mutex_initialized are used: one lock serializes every target of a client.
+ */
+struct comp_multi_weave_linux_target
+{
+	bool mutex_initialized;
+	struct os_mutex mutex; //!< Serializes submits + teardown for this client.
+
+	bool engine_initialized;
+	bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
+	VkCommandPool cmd_pool;
+	VkCommandBuffer cmd;
+	//! Post-weave half of the split submission for a self-submitting DP
+	//! (the Android ordering fix, DXR_LINUX_WEAVE_SPLIT).
+	VkCommandBuffer cmd_post;
+	VkFence fence;
+	/*!
+	 * The last final submit's fence has not been waited yet. Stage B
+	 * leaves it pending (the caller waits the release sync_file instead)
+	 * and the NEXT submit waits it — bounded — before it resets a command
+	 * buffer or evicts a cache slot; a timed-out stage-A wait leaves it
+	 * pending too. Never reset a fence while this is set.
+	 */
+	bool fence_pending;
+	VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
+	struct xrt_display_processor *dp;
+
+	uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+	bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
+	uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
+
+	//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
+	//! Device pixels, desktop-absolute. Fed to the DP as a panel-relative
+	//! present origin (`set_present_origin`) before every weave; also the
+	//! window-metrics source for a weave-only session (#1116).
+	//! @{
+	bool have_geometry;
+	int32_t win_x, win_y;
+	uint32_t win_w, win_h;
+	int32_t win_display_id;
+	bool geometry_dirty; //!< Log the change once, not per frame.
+	bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+	//! v12 (browser-pvt#180): the caller's logical origin + scale, latched
+	//! verbatim with the device geometry above by the same bind (a bind
+	//! without one clears it).
+	struct xrt_weave_logical_origin win_logical;
+	//! v12: the origin the LAST successful weave was phase-locked to —
+	//! snapshotted where the weave feeds the DP (weave_feed_dp_geometry),
+	//! committed only when the weave succeeds. Serial source below.
+	struct xrt_weave_woven_origin woven_origin;
+	uint64_t woven_serial; //!< Bumped per successful weave; first output = 1.
+	//! Off-panel state of the last submit (#1654 on the service path): the
+	//! band count, | 0x100 when the window is entirely off the panel. The
+	//! WARN fires on a change only.
+	uint32_t last_offpanel_band_count;
+	//! @}
+
+	/*!
+	 * Hardware 2D/3D as last CONFIRMED by mc->weave.dp and reported to
+	 * this client's session (comp_multi_weave_linux_request_display_mode).
+	 * Stored inverted so the zero-initialised struct means 3D, the state
+	 * every session starts in. The standing WISH is mc->hardware_display_3d.
+	 */
+	bool hw_2d_confirmed;
+
+	/*!
+	 * Spec v13 (XrWeaveSubmitMonoIn2DDXR): the caller asked, on the submit
+	 * being processed, for one flat view instead of the weave while
+	 * hw_2d_confirmed. Set by comp_multi_weave_linux_set_mono_in_2d right
+	 * before each submit (per submit, never sticky); @c mono_active is the
+	 * state the last submit actually rendered, so the WARN fires on an edge
+	 * only.
+	 */
+	bool mono_in_2d;
+	bool mono_active;
+
+	/*!
+	 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
+	 * Per-submit overlay hints, set by comp_multi_weave_linux_set_overlay_hints
+	 * right before each submit (never sticky), forwarded to the DP with the
+	 * overlay when its set_overlay_2d slot takes it. @c overlay_in_dp is the
+	 * last verdict (DP composites vs runtime post-weave blend) so the WARN
+	 * fires on a change only.
+	 * @{
+	 */
+	bool overlay_unchanged;
+	float overlay_filter_strength;
+	uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+	//! @}
+
+	//! @name Flat regions (spec v8, browser#88, on desktop Linux)
+	//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
+	//! absolute screen device px; a SET, count 0 clears. Unioned with
+	//! each submit's own flat rects and painted flat in the output.
+	//! @{
+	struct xrt_rect screen_flat_rects[8]; //!< IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX
+	uint32_t screen_flat_rect_count;
+	//! Flat rects painted by the last submit (0 = none); the WARN fires on
+	//! a change of this count only.
+	uint32_t last_flat_count;
+	//! @}
+
+	//! @name Input + overlay import caches (keyed by buffer id / fd inode)
+	//! A received fd is a new number on every submit, so the key is the
+	//! underlying file (`fstat` st_dev/st_ino) or, in stage B, the
+	//! caller's `buffer_id`. N slots so a producer rotating a small pool
+	//! does not re-import every frame.
+	//! @{
+	struct comp_multi_weave_linux_slot in_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+	struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+	uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
+	bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
+	uint32_t imports_logged; //!< Import WARNs emitted (capped; a re-importing producer would spam).
+	//! @}
+
+	//! @name v6 N-view crop staging (#774) — see the macOS block.
+	//! @{
+	VkImage crop_image;
+	VkDeviceMemory crop_memory;
+	VkImageView crop_view;
+	uint32_t crop_w, crop_h;
+	bool crop_first_use;
+	//! @}
+
+	//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
+	//! @{
+	VkImage sbs_image;
+	VkDeviceMemory sbs_memory;
+	VkImageView sbs_view;
+	uint32_t sbs_w, sbs_h;
+	bool sbs_first_use;
+	//! @}
+
+	//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+	//! @{
+	struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
+	//! @}
+
+	//! @name Exportable weaved output (handed to the caller)
+	//! @{
+	VkImage out_image;
+	VkDeviceMemory out_memory;
+	VkDeviceSize out_size; //!< Allocation size (what an OPAQUE_FD importer needs).
+	VkImageView out_view;
+	VkFramebuffer out_fb;
+	/*!
+	 * The ONE exported fd of the current output allocation (-1 = none).
+	 * Exported once per (re)allocation — every vkGetMemoryFdKHR mints a
+	 * new fd, and the IPC send dups without closing, so exporting per
+	 * call would leak one fd per weave_get_output. Closed on release.
+	 */
+	int out_fd;
+	/*!
+	 * Stage B: the output is a DRM-modifier dma-buf (vk_create_exportable_dmabuf_image,
+	 * released to VK_QUEUE_FAMILY_FOREIGN_EXT) rather than a stage-A OPAQUE_FD
+	 * allocation (released to VK_QUEUE_FAMILY_EXTERNAL). One allocation serves
+	 * one kind: the engine allocates the kind the client last asked for
+	 * (out_kind_req) and reallocates on the next submit when a client asks for
+	 * the other one.
+	 */
+	bool out_is_dmabuf;
+	//! 0 = nobody asked yet (first submit's path decides), 1 = OPAQUE_FD, 2 = dma-buf.
+	uint8_t out_kind_req;
+	//! Cached descriptor of the dma-buf output (its fd field is unused: out_fd is the one fd).
+	struct xrt_weave_dmabuf_output_desc out_dmabuf;
+	uint32_t out_w, out_h;
+	VkImageLayout out_layout; //!< Layout the last weave retired the output in (#1387 d3).
+	//! @}
+
+	//! @name v4 DP-composited 2D overlay atlas (browser#18)
+	//! @{
+	struct vk_local2d_composite overlay_blend;
+	bool overlay_blend_initialized;
+	//! @}
+
+	//! @name Stage B (#1699 R2) — dma-buf + sync_file
+	//! Built on R5's aux_vk helpers (vk_dmabuf.h); nothing new ever goes
+	//! into struct vk_bundle (plug-in ABI, xrt_plugin.h). Both semaphores
+	//! exist only when vk_dmabuf_sync_fd_supported(); otherwise the acquire
+	//! fence is CPU-polled and completion stays synchronous.
+	//! @{
+	VkSemaphore acquire_sem; //!< Plain binary; a SYNC_FD is imported into it (temporary) per frame.
+	//! Exportable SYNC_FD, signalled by the final submit. The per-frame
+	//! release sync_file exported from it is NOT engine state: the IPC
+	//! handler owns, sends and closes it after the reply (#1712).
+	VkSemaphore release_sem;
+	bool dmabuf_unsupported_warned; //!< One-shot: the device cannot import dma-bufs.
+	bool modifier_refused_warned;   //!< One-shot: a non-LINEAR import failed (cross-device?).
+	bool acquire_fallback_warned;   //!< One-shot: acquire fence CPU-polled / timed out.
+	bool release_fallback_warned;   //!< One-shot: release export failed, back to synchronous.
+	bool out_kind_warned;           //!< One-shot: output kind switched on a client request.
+	                                //! @}
+	//! Submits refused because their chained overlay could not be
+	//! imported (weave_overlay_refused; throttles its log line).
+	uint32_t overlay_refusals;
+
+	/*!
+	 * @name Stale overlay (resize race)
+	 * A chained overlay whose real / declared size is not the window
+	 * size of the submit it rides (the producer has not reallocated it
+	 * after a resize yet) is IGNORED for that frame — not refused, not
+	 * blended — see weave_overlay_gate. @c overlay_stale is the current
+	 * state so the WARN fires once per transition; @c overlay_force_changed
+	 * makes the next overlay offered to the DP carry layer_unchanged =
+	 * false, since the DP's cached layer predates the ignored frames.
+	 * @{
+	 */
+	bool overlay_stale;
+	bool overlay_force_changed;
+	uint32_t overlay_stale_frames; //!< Frames ignored in the current stale run.
+	                               //! @}
+};
+
+//! Present-owner windows one desktop-Linux weave client may bind at once (v21).
+#define COMP_MULTI_WEAVE_LINUX_MAX_TARGETS 8
+#endif
+
 struct multi_compositor
 {
 	struct xrt_compositor_native base;
@@ -994,227 +1228,30 @@ struct multi_compositor
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
+	//! The default weave target (id 0); see struct comp_multi_weave_linux_target.
+	struct comp_multi_weave_linux_target weave;
+
 	/*!
-	 * XR_DXR_weave present-owner state (#1699 R2) — the desktop-Linux sibling
-	 * of the Android block above (minus the Arch-C satellite), with fds in
-	 * place of AHardwareBuffers. The caller owns its window and presents
-	 * itself; we import its buffer fd (stage A: OPAQUE_FD from the same
-	 * driver + device; stage B: a dma-buf with a DRM modifier), blit every
-	 * submitted rect into a window-sized 2x1 SBS scratch atlas (or sample its
-	 * v6 N-view atlas directly), run ONE DP process_atlas into an exportable
-	 * output, and either wait completion before the IPC reply (stage A) or
-	 * hand back a release sync_file and wait the frame at the start of the
-	 * next submit (stage B). Implemented in comp_multi_weave_linux.c.
+	 * XR_DXR_weave v21 (browser-pvt#288): the client's OTHER present-owner
+	 * windows, each a whole engine of its own, keyed by the caller-chosen
+	 * target id (never 0). All of it is guarded by weave.mutex, except
+	 * @c selected, which only the client's own IPC thread writes (right
+	 * before each engine call) and the engine reads under the mutex.
 	 */
 	struct
 	{
-		bool mutex_initialized;
-		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
-
-		bool engine_initialized;
-		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
-		VkCommandPool cmd_pool;
-		VkCommandBuffer cmd;
-		//! Post-weave half of the split submission for a self-submitting DP
-		//! (the Android ordering fix, DXR_LINUX_WEAVE_SPLIT).
-		VkCommandBuffer cmd_post;
-		VkFence fence;
-		/*!
-		 * The last final submit's fence has not been waited yet. Stage B
-		 * leaves it pending (the caller waits the release sync_file instead)
-		 * and the NEXT submit waits it — bounded — before it resets a command
-		 * buffer or evicts a cache slot; a timed-out stage-A wait leaves it
-		 * pending too. Never reset a fence while this is set.
-		 */
-		bool fence_pending;
-		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
-		struct xrt_display_processor *dp;
-
-		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
-		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
-		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
-
-		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
-		//! Device pixels, desktop-absolute. Fed to the DP as a panel-relative
-		//! present origin (`set_present_origin`) before every weave; also the
-		//! window-metrics source for a weave-only session (#1116).
-		//! @{
-		bool have_geometry;
-		int32_t win_x, win_y;
-		uint32_t win_w, win_h;
-		int32_t win_display_id;
-		bool geometry_dirty; //!< Log the change once, not per frame.
-		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
-		//! v12 (browser-pvt#180): the caller's logical origin + scale, latched
-		//! verbatim with the device geometry above by the same bind (a bind
-		//! without one clears it).
-		struct xrt_weave_logical_origin win_logical;
-		//! v12: the origin the LAST successful weave was phase-locked to —
-		//! snapshotted where the weave feeds the DP (weave_feed_dp_geometry),
-		//! committed only when the weave succeeds. Serial source below.
-		struct xrt_weave_woven_origin woven_origin;
-		uint64_t woven_serial; //!< Bumped per successful weave; first output = 1.
-		//! Off-panel state of the last submit (#1654 on the service path): the
-		//! band count, | 0x100 when the window is entirely off the panel. The
-		//! WARN fires on a change only.
-		uint32_t last_offpanel_band_count;
-		//! @}
-
-		/*!
-		 * Hardware 2D/3D as last CONFIRMED by mc->weave.dp and reported to
-		 * this client's session (comp_multi_weave_linux_request_display_mode).
-		 * Stored inverted so the zero-initialised struct means 3D, the state
-		 * every session starts in. The standing WISH is mc->hardware_display_3d.
-		 */
-		bool hw_2d_confirmed;
-
-		/*!
-		 * Spec v13 (XrWeaveSubmitMonoIn2DDXR): the caller asked, on the submit
-		 * being processed, for one flat view instead of the weave while
-		 * hw_2d_confirmed. Set by comp_multi_weave_linux_set_mono_in_2d right
-		 * before each submit (per submit, never sticky); @c mono_active is the
-		 * state the last submit actually rendered, so the WARN fires on an edge
-		 * only.
-		 */
-		bool mono_in_2d;
-		bool mono_active;
-
-		/*!
-		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
-		 * Per-submit overlay hints, set by comp_multi_weave_linux_set_overlay_hints
-		 * right before each submit (never sticky), forwarded to the DP with the
-		 * overlay when its set_overlay_2d slot takes it. @c overlay_in_dp is the
-		 * last verdict (DP composites vs runtime post-weave blend) so the WARN
-		 * fires on a change only.
-		 * @{
-		 */
-		bool overlay_unchanged;
-		float overlay_filter_strength;
-		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
-		//! @}
-
-		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
-		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
-		//! absolute screen device px; a SET, count 0 clears. Unioned with
-		//! each submit's own flat rects and painted flat in the output.
-		//! @{
-		struct xrt_rect screen_flat_rects[8]; //!< IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX
-		uint32_t screen_flat_rect_count;
-		//! Flat rects painted by the last submit (0 = none); the WARN fires on
-		//! a change of this count only.
-		uint32_t last_flat_count;
-		//! @}
-
-		//! @name Input + overlay import caches (keyed by buffer id / fd inode)
-		//! A received fd is a new number on every submit, so the key is the
-		//! underlying file (`fstat` st_dev/st_ino) or, in stage B, the
-		//! caller's `buffer_id`. N slots so a producer rotating a small pool
-		//! does not re-import every frame.
-		//! @{
-		struct comp_multi_weave_linux_slot in_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
-		struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
-		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
-		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
-		uint32_t imports_logged; //!< Import WARNs emitted (capped; a re-importing producer would spam).
-		//! @}
-
-		//! @name v6 N-view crop staging (#774) — see the macOS block.
-		//! @{
-		VkImage crop_image;
-		VkDeviceMemory crop_memory;
-		VkImageView crop_view;
-		uint32_t crop_w, crop_h;
-		bool crop_first_use;
-		//! @}
-
-		//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
-		//! @{
-		VkImage sbs_image;
-		VkDeviceMemory sbs_memory;
-		VkImageView sbs_view;
-		uint32_t sbs_w, sbs_h;
-		bool sbs_first_use;
-		//! @}
-
-		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
-		//! @{
-		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
-		//! @}
-
-		//! @name Exportable weaved output (handed to the caller)
-		//! @{
-		VkImage out_image;
-		VkDeviceMemory out_memory;
-		VkDeviceSize out_size; //!< Allocation size (what an OPAQUE_FD importer needs).
-		VkImageView out_view;
-		VkFramebuffer out_fb;
-		/*!
-		 * The ONE exported fd of the current output allocation (-1 = none).
-		 * Exported once per (re)allocation — every vkGetMemoryFdKHR mints a
-		 * new fd, and the IPC send dups without closing, so exporting per
-		 * call would leak one fd per weave_get_output. Closed on release.
-		 */
-		int out_fd;
-		/*!
-		 * Stage B: the output is a DRM-modifier dma-buf (vk_create_exportable_dmabuf_image,
-		 * released to VK_QUEUE_FAMILY_FOREIGN_EXT) rather than a stage-A OPAQUE_FD
-		 * allocation (released to VK_QUEUE_FAMILY_EXTERNAL). One allocation serves
-		 * one kind: the engine allocates the kind the client last asked for
-		 * (out_kind_req) and reallocates on the next submit when a client asks for
-		 * the other one.
-		 */
-		bool out_is_dmabuf;
-		//! 0 = nobody asked yet (first submit's path decides), 1 = OPAQUE_FD, 2 = dma-buf.
-		uint8_t out_kind_req;
-		//! Cached descriptor of the dma-buf output (its fd field is unused: out_fd is the one fd).
-		struct xrt_weave_dmabuf_output_desc out_dmabuf;
-		uint32_t out_w, out_h;
-		VkImageLayout out_layout; //!< Layout the last weave retired the output in (#1387 d3).
-		//! @}
-
-		//! @name v4 DP-composited 2D overlay atlas (browser#18)
-		//! @{
-		struct vk_local2d_composite overlay_blend;
-		bool overlay_blend_initialized;
-		//! @}
-
-		//! @name Stage B (#1699 R2) — dma-buf + sync_file
-		//! Built on R5's aux_vk helpers (vk_dmabuf.h); nothing new ever goes
-		//! into struct vk_bundle (plug-in ABI, xrt_plugin.h). Both semaphores
-		//! exist only when vk_dmabuf_sync_fd_supported(); otherwise the acquire
-		//! fence is CPU-polled and completion stays synchronous.
-		//! @{
-		VkSemaphore acquire_sem; //!< Plain binary; a SYNC_FD is imported into it (temporary) per frame.
-		//! Exportable SYNC_FD, signalled by the final submit. The per-frame
-		//! release sync_file exported from it is NOT engine state: the IPC
-		//! handler owns, sends and closes it after the reply (#1712).
-		VkSemaphore release_sem;
-		bool dmabuf_unsupported_warned; //!< One-shot: the device cannot import dma-bufs.
-		bool modifier_refused_warned;   //!< One-shot: a non-LINEAR import failed (cross-device?).
-		bool acquire_fallback_warned;   //!< One-shot: acquire fence CPU-polled / timed out.
-		bool release_fallback_warned;   //!< One-shot: release export failed, back to synchronous.
-		bool out_kind_warned;           //!< One-shot: output kind switched on a client request.
-		                                //! @}
-		//! Submits refused because their chained overlay could not be
-		//! imported (weave_overlay_refused; throttles its log line).
-		uint32_t overlay_refusals;
-
-		/*!
-		 * @name Stale overlay (resize race)
-		 * A chained overlay whose real / declared size is not the window
-		 * size of the submit it rides (the producer has not reallocated it
-		 * after a resize yet) is IGNORED for that frame — not refused, not
-		 * blended — see weave_overlay_gate. @c overlay_stale is the current
-		 * state so the WARN fires once per transition; @c overlay_force_changed
-		 * makes the next overlay offered to the DP carry layer_unchanged =
-		 * false, since the DP's cached layer predates the ignored frames.
-		 * @{
-		 */
-		bool overlay_stale;
-		bool overlay_force_changed;
-		uint32_t overlay_stale_frames; //!< Frames ignored in the current stale run.
-		                               //! @}
-	} weave;
+		uint64_t selected; //!< Target of the engine call about to run (0 = default).
+		//! The target the call in flight operates on; NULL = the default one.
+		struct comp_multi_weave_linux_target *cur;
+		uint64_t ids[COMP_MULTI_WEAVE_LINUX_MAX_TARGETS - 1];
+		struct comp_multi_weave_linux_target *extra[COMP_MULTI_WEAVE_LINUX_MAX_TARGETS - 1];
+		//! Some target of this client has bound a window (routes hardware requests).
+		bool any_bound;
+		//! Hardware 2D last REPORTED to the session, so N targets switching
+		//! together send the session one event, not N (zero = 3D, as hw_2d_confirmed).
+		bool hw_2d_reported;
+		bool limit_warned; //!< One-shot: a bind past MAX_TARGETS was refused.
+	} weave_targets;
 #endif
 };
 
@@ -1946,6 +1983,52 @@ comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d
  */
 void
 comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * XR_DXR_weave v21 (browser-pvt#288): name the weave target — one present-owner
+ * window — the NEXT engine call on this client applies to. The IPC handler
+ * calls it with the message's target id (0 = the default target, every
+ * pre-v21 caller) immediately before every bind / geometry / submit / output
+ * / flat-region / hint call, so the selection never outlives the call it
+ * was made for. A target other than 0 is created by its first bind,
+ * geometry or submit (up to COMP_MULTI_WEAVE_LINUX_MAX_TARGETS per client)
+ * and owns a whole engine: its own display processor, output, import caches,
+ * geometry and fences. The snap and the hardware 2D/3D request are not
+ * per target (the lattice and the lens are the panel's).
+ */
+void
+comp_multi_weave_linux_select_target(struct xrt_compositor *xc, uint64_t target_id);
+
+/*!
+ * XR_DXR_weave v21: the predicted eyes from any of this client's EXTRA targets'
+ * display processors (the default target's is read lock-free by the caller
+ * first). Takes weave.mutex. False when no extra target has a DP.
+ */
+bool
+comp_multi_weave_linux_predicted_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * XR_DXR_weave v21: the bound window rect (desktop-absolute device px) of
+ * target @p target_id — the geometry a locate naming that target is framed
+ * against. Takes weave.mutex. False when the target does not exist or has
+ * no geometry yet.
+ */
+bool
+comp_multi_weave_linux_target_geometry(struct multi_compositor *mc,
+                                       uint64_t target_id,
+                                       int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h);
+
+/*!
+ * XR_DXR_weave v21: tear down one target's engine (its window closed) — idle,
+ * destroy its display processor and every resource, close its fds. The default
+ * target (0) is reset to a never-bound engine; any other is freed. An unknown
+ * id is a no-op. Always true for a live client.
+ */
+bool
+comp_multi_weave_linux_release_target(struct xrt_compositor *xc, uint64_t target_id);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 
@@ -2090,6 +2173,19 @@ multi_dp_factory_create(xrt_dp_factory_vk_fn_t factory,
  */
 bool
 multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics);
+
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * XR_DXR_weave v21 (browser-pvt#288): the window metrics of ONE of a weave
+ * client's present-owner windows — the rect its target was bound with — so a
+ * locate whose zone rect is relative to that window is framed against it.
+ * Target 0 is exactly multi_compositor_get_window_metrics.
+ */
+bool
+multi_compositor_get_weave_target_window_metrics(struct multi_compositor *mc,
+                                                 uint64_t target_id,
+                                                 struct xrt_window_metrics *out_metrics);
+#endif
 
 /*!
  * Read this session's cached window rect on the panel (ADR-036 D6, #1033/#1034).

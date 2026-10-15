@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 17 |
+| **Spec Version** | 21 |
 | **Extension Type** | Instance extension (service path — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036, desktop Linux/comp_multi-Vulkan dma-buf #1699 when the service carries its engine; the snap and its bulk grid form also work in-process on desktop Linux, §5c / #1588 / #1723) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9+ additions in a fresh `1004999240–249` decade — 240 v9, 241–245 v10, 246 v11, 247–248 v12) |
@@ -1109,6 +1109,60 @@ that screen's eyes and the zone's `canvasRectPx` relative to that screen. A zone
 seam is still located from the primary screen; rendering it per part needs a view set per part,
 which no locate returns today.
 
+## 5h. Several present-owner windows on one session (v21, browser-pvt#288)
+
+```c
+#define XR_TYPE_WEAVE_TARGET_DXR ((XrStructureType)1004999293)
+
+typedef struct XrWeaveTargetDXR {
+    XrStructureType          type;      // XR_TYPE_WEAVE_TARGET_DXR
+    const void* XR_MAY_ALIAS next;
+    uint64_t                 targetId;  // caller-chosen window id; 0 = the default window
+} XrWeaveTargetDXR;
+
+XrResult xrWeaveReleaseTargetDXR(XrSession session, uint64_t targetId);
+```
+
+A session binds ONE window unless the caller names more. One process can own several windows
+(a browser does) but holds one session, because the OpenXR loader allows one instance per process.
+Before v21, its second window was woven at the first window's phase and through the first
+window's output (browser-pvt#288).
+
+**What it addresses.** Chain `XrWeaveTargetDXR` onto:
+
+| call | effect |
+|---|---|
+| `xrWeaveBindWindow2DXR` (on `XrWeaveBindWindowInfoDXR`) | binds `targetId`'s window and geometry |
+| `xrWeaveSubmitDXR` (on `XrWeaveSubmitInfoDXR`) | weaves that window. The woven output, its export latch (#1427), the v12 woven origin and serial, the off-panel bands and the flat regions are all that window's |
+| `xrLocateViews` (on `XrViewLocateInfo`, with an `XrDisplayZoneDXR`) | the zone rect is relative to that window, and the frame is built against its bound geometry |
+
+`targetId` 0, or no chain, is the default window, so every pre-v21 call is unchanged.
+
+**What stays per session.** The hardware 2D/3D state (`xrRequestDisplayModeDXR` switches every
+target's display processor; the session receives one `XrEventDataHardwareDisplayStateChangedDXR`
+per change of the panel's state, not per target), the snap (the lattice is the panel's: any of
+the session's display processors answers), and `xrWeaveSetScreenFlatRegionsDXR` (latched on the
+default target).
+
+**Lifetime.** A non-default target comes into existence on its first bind or submit and ends with
+`xrWeaveReleaseTargetDXR` or with the session. Releasing an id that was never used is
+`XR_SUCCESS`. Releasing 0 resets the default window the same way. A runtime keeps a bounded
+number of extra targets per session: 7 on desktop Linux, so 8 windows counting the default. A
+bind or submit past the bound is refused like any other engine refusal: the session survives.
+
+**Desktop Linux.** Each target is a whole weave engine: its own display processor (from the
+plug-in's Vulkan factory), its own output allocation and import caches, its own geometry,
+fences and woven origin. Two windows of one client behave like two clients did, on one session
+and one connection. One lock serializes every target of a client.
+
+**Elsewhere.** Every other service accepts `targetId` 0 and reports
+`XR_ERROR_FEATURE_UNSUPPORTED` for any other id. The OpenXR layer says so before anything crosses
+IPC. A caller gates on `extensionVersion >= 21` and on desktop Linux.
+
+**Where an id comes from.** The caller picks it. The DisplayXR Browser uses the Ozone
+`gfx::AcceleratedWidget` of each top-level window (the XID on X11), the same integer in its
+browser process (geometry feed) and its GPU process (the Viz output surface that submits).
+
 ## 6. Version history
 
 | Version | Change |
@@ -1145,6 +1199,11 @@ it keeps such an overlay off the wire there instead.
 | 20 | No new structure: v10's `XrWeaveSubmitSyncDXR` (acquire `sync_file`, in) and `XrWeaveOutputSyncDXR` (per-frame release `sync_file`, out) are **accepted on Android**, on the AHardwareBuffer submit with no dma-buf descriptor (§5b-sync). A caller that chains the release struct gets the release fence and the submit returns without the service's CPU wait for the weave; a caller that chains neither keeps the synchronous contract. Before v20 the Android runtime refused `XrWeaveSubmitSyncDXR` (`XR_ERROR_VALIDATION_FAILURE`) and wrote -1 into the release struct. |
 
 **v20 is a gate to send**: an Android caller chains `XrWeaveSubmitSyncDXR` only on `extensionVersion >= 20` (an older Android runtime refuses the submit). Chaining `XrWeaveOutputSyncDXR` is harmless on any version — -1 means "already complete".
+
+| 21 | `XrWeaveTargetDXR` (in, on a bind, a submit, or a zone-scoped locate) + `xrWeaveReleaseTargetDXR`: several present-owner windows on one session, each woven at its own phase into its own output (§5h, browser-pvt#288). Desktop Linux; `targetId` 0 everywhere else. |
+
+**v21 is a gate to send**: an older runtime skips the chain and would weave every window as the
+default one, which is the bug v21 removes. So a caller names targets only on `extensionVersion >= 21`.
 
 **v16 is a gate for one kind of caller**: one whose overlay IS its 2D (a whole-page overlay)
 must not send it to an older desktop-Linux runtime, which would weave without it and return
@@ -1193,7 +1252,7 @@ implicit. §4c's entry point + struct settle it: **v9**.
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
 | DisplayXR Browser on two 3D screens (planned, #1884) | Chromium GPU process | Batch (v3) or v6 + `XrWeaveOutputRectPartsDXR` (v19): render each rect part from its screen's eyes |
-| DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10. Move-synchronised Wayland drag: v12 woven origin (§5e), gate on spec ≥ 12 |
+| DisplayXR Browser on desktop Linux (planned, #1699) | Chromium GPU process (GL/EGL) → comp_multi service | v10 dma-buf + `sync_file` fences; gate on spec ≥ 10. Move-synchronised Wayland drag: v12 woven origin (§5e), gate on spec ≥ 12. Several windows: v21 targets keyed by the Ozone widget (§5h), gate on spec ≥ 21 |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it
 (`third_party/displayxr` in the fork) — coupled-PR order: runtime → extensions auto-sync →

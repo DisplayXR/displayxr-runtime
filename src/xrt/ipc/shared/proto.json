@@ -722,7 +722,14 @@
 
 	"weave_bind_window": {
 		"in": [
-			{"name": "hwnd", "type": "uint64_t"}
+			{"name": "hwnd", "type": "uint64_t"},
+			{"name": "target_id", "type": "uint64_t"}
+		]
+	},
+
+	"weave_release_target": {
+		"in": [
+			{"name": "target_id", "type": "uint64_t"}
 		]
 	},
 
@@ -736,7 +743,8 @@
 			{"name": "logical_valid", "type": "uint32_t"},
 			{"name": "logical_x", "type": "int32_t"},
 			{"name": "logical_y", "type": "int32_t"},
-			{"name": "logical_scale", "type": "float"}
+			{"name": "logical_scale", "type": "float"},
+			{"name": "target_id", "type": "uint64_t"}
 		]
 	},
 
@@ -776,6 +784,9 @@
 	},
 
 	"weave_get_output": {
+		"in": [
+			{"name": "target_id", "type": "uint64_t"}
+		],
 		"out": [
 			{"name": "have_output", "type": "bool"},
 			{"name": "width", "type": "uint32_t"},
@@ -831,6 +842,9 @@
 	},
 
 	"weave_get_output_dmabuf": {
+		"in": [
+			{"name": "target_id", "type": "uint64_t"}
+		],
 		"out": [
 			{"name": "have_output", "type": "bool"},
 			{"name": "desc", "type": "struct ipc_weave_dmabuf_output"}

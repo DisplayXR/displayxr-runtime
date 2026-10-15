@@ -364,7 +364,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 20
+#define XR_DXR_weave_SPEC_VERSION 21
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -407,6 +407,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
 // Spec v19 (#1884): per-screen parts of each weave rect + per-screen eyes.
 #define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR        ((XrStructureType)1004999292)
+// Spec v21 (browser-pvt#288): several present-owner windows on one session.
+#define XR_TYPE_WEAVE_TARGET_DXR                   ((XrStructureType)1004999293)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -1253,6 +1255,44 @@ typedef struct XrWeaveOutputRectPartsDXR {
     uint64_t                generation; //!< bumped on a segment-geometry change
 } XrWeaveOutputRectPartsDXR;
 
+/*!
+ * @brief Which of the caller's present-owner windows a call is for (spec v21,
+ *        browser-pvt#288).
+ *
+ * A session weaves ONE window unless the caller names more. Chain this onto
+ * XrWeaveBindWindowInfoDXR::next (xrWeaveBindWindow2DXR) or
+ * XrWeaveSubmitInfoDXR::next (xrWeaveSubmitDXR) to address window
+ * @c targetId instead of the session's default one. The id is the caller's
+ * choice (a browser uses one per top-level window); 0 is the default window,
+ * so a call without the chain, or with @c targetId 0, is exactly the pre-v21
+ * call.
+ *
+ * Every target is a whole weave of its own — its own bound window and
+ * geometry, its own woven output (exported once per allocation, per target),
+ * its own woven origin and serial (v12), its own off-panel and flat-region
+ * state — so two windows on the panel are each woven at their own phase.
+ * What a target does NOT have of its own: the hardware 2D/3D state
+ * (xrRequestDisplayModeDXR switches the panel for every target of the session),
+ * the snap (the lattice is the panel's), and xrWeaveSetScreenFlatRegionsDXR
+ * (latched on the default target).
+ *
+ * A non-default target comes into existence on its first bind or submit and is
+ * torn down by xrWeaveReleaseTargetDXR (or with the session). A runtime keeps a
+ * bounded number per session (8 on desktop Linux); a bind or submit past it is
+ * refused like any other engine refusal (not XR_SUCCESS, the session survives).
+ *
+ * Supported on the desktop-Linux service path. Every other platform accepts
+ * @c targetId 0 and reports XR_ERROR_FEATURE_UNSUPPORTED for any other id.
+ */
+typedef struct XrWeaveTargetDXR {
+    XrStructureType    type; //!< XR_TYPE_WEAVE_TARGET_DXR
+    const void* XR_MAY_ALIAS next;
+    uint64_t           targetId; //!< caller-chosen window id; 0 = the session's default window
+} XrWeaveTargetDXR;
+
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveReleaseTargetDXR)(
+    XrSession session, uint64_t targetId);
+
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
 
@@ -1396,6 +1436,16 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSetScreenFlatRegionsDXR(
 //! could be opened.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveExportIpcConnectionDXR(
     XrInstance instance, XrWeaveIpcConnectionDXR* connection);
+
+//! Tear down the weave of present-owner window @c targetId (spec v21): the
+//! caller closed that window. Frees the target's display processor, woven
+//! output and caches; the next bind or submit naming the id starts a fresh
+//! one. Releasing target 0 resets the default window the same way. An id that
+//! was never used is a no-op (XR_SUCCESS). Reports XR_ERROR_FEATURE_UNSUPPORTED
+//! for a non-zero id where targets are unsupported (see XrWeaveTargetDXR), and
+//! on an in-process session.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveReleaseTargetDXR(
+    XrSession session, uint64_t targetId);
 
 #endif /* !XR_NO_PROTOTYPES */
 

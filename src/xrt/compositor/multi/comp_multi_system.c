@@ -7687,6 +7687,11 @@ multi_compositor_status_get_client(struct xrt_system_compositor *xsysc,
 		// client's submits; read here unlocked, the same torn-read trade
 		// multi_compositor_get_window_metrics makes (a stale rect for one read).
 		out->weave_owner = mc->weave.window_bound || mc->weave.dp != NULL || mc->weave.have_geometry;
+#ifdef XRT_OS_LINUX_DESKTOP
+		// XR_DXR_weave v21: a client weaving several windows reports its
+		// default window's rect and state (the row is per client, not per window).
+		out->weave_owner = out->weave_owner || mc->weave_targets.any_bound;
+#endif
 		if (out->weave_owner) {
 			out->has_dp = mc->weave.dp != NULL;
 			out->woven = out->has_dp && mc->weave.woven_serial > 0 && !mc->weave.hw_2d_confirmed &&

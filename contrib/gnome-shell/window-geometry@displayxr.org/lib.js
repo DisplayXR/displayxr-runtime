@@ -176,6 +176,11 @@
 //                                           // monitor at scale 1: both agree)
 //   "windows": [
 //     {
+//       "id": 42,                           // ext v15+: Meta.Window stable
+//                                           // sequence — unique per window for
+//                                           // the session, never reused; how a
+//                                           // process with several windows
+//                                           // tells its own entries apart
 //       "pid": 1234,
 //       "app_id": "cube_handle_vk_linux",   // wm_class / Wayland app-id
 //       "title": "...",
@@ -3174,6 +3179,10 @@
                             monitor.device_scale = deviceScale;
                     }
                     windows.push({
+                        // v15: stable for the window's lifetime, never reused in
+                        // the session — lets a process with several windows tell
+                        // its own entries apart (browser-pvt#288).
+                        id: win.get_stable_sequence(),
                         pid: win.get_pid(),
                         app_id: win.get_wm_class() ?? '',
                         title: win.get_title() ?? '',

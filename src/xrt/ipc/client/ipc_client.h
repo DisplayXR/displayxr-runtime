@@ -326,10 +326,10 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  *   weaved-texture handle + fence handle ONCE (the caller caches them).
  */
 xrt_result_t
-comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t target_id, uint64_t hwnd);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc, uint64_t target_id,
                                         xrt_graphics_buffer_handle_t in_handle,
                                         bool in_is_dxgi,
                                         int32_t rect_x,
@@ -363,7 +363,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
                                                          const struct xrt_rect *screen_rects);
 
 xrt_result_t
-comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc, uint64_t target_id,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,

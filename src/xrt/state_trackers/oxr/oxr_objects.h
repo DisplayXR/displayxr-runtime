@@ -3373,6 +3373,16 @@ struct oxr_session
 		//! XR_DXR_cursor_depth v8: the texture-carrier generation last handed
 		//! to the service (sent again only when it changes).
 		uint64_t cursor_tex_generation_sent;
+		//! XR_DXR_weave v21 (XrWeaveTargetDXR): the export latch above is the
+		//! default target's; every other target's woven output is an allocation
+		//! of its own, latched here, keyed by target_latch_ids.
+		uint64_t target_latch_ids[8]; //!< u_weave_targets.h table (0 = free)
+		struct
+		{
+			bool exported;
+			uint32_t last_w;
+			uint32_t last_h;
+		} target_latch[8];
 	} weave;
 #endif
 

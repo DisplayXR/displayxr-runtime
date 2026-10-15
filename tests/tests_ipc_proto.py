@@ -87,7 +87,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertEqual(sub, ["have_output", "width", "height", "fence_value", "eyes", "origin"])
         geo = [a.name for a in self._call("weave_set_window_geometry").in_args]
         self.assertEqual(geo[:5], ["origin_x", "origin_y", "client_w", "client_h", "display_id"])
-        self.assertEqual(geo[5:], ["logical_valid", "logical_x", "logical_y", "logical_scale"])
+        self.assertEqual(geo[5:9], ["logical_valid", "logical_x", "logical_y", "logical_scale"])
         # The once-per-allocation export is untouched: the origin is per frame.
         out = [a.name for a in self._call("weave_get_output_dmabuf").out_args]
         self.assertEqual(out, ["have_output", "desc"])

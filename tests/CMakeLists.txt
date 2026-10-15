@@ -80,6 +80,7 @@ set(tests
     tests_comp_wl_move_sync_tag
     tests_aux_weave_span2d
     tests_aux_weave_flat
+    tests_aux_weave_targets
     tests_aux_display_mode_hold
     tests_aux_tracking_any
     tests_comp_rear_budget

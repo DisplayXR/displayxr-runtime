@@ -519,6 +519,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrWeaveSnapWindowRectDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveSnapWindowGridDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveSetScreenFlatRegionsDXR, DXR_weave);
+	ENTRY_IF_EXT(xrWeaveReleaseTargetDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveExportIpcConnectionDXR, DXR_weave);
 #endif
 #ifdef OXR_HAVE_DXR_lift
