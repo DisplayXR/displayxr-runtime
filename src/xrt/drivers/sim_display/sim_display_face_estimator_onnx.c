@@ -29,6 +29,7 @@
 #endif
 
 #include "sim_display_face_estimator.h"
+#include "sim_display_settings.h"
 #include "sim_display_face_yunet.h"
 
 #include "util/u_logging.h"
@@ -173,18 +174,16 @@ resolve_paths(path_char *lib, path_char *model, size_t cap)
 	if (!own_dir(dir, PATH_CAP) || !join(lib, cap, dir, SIM_ORT_LIB_NAME)) {
 		return false;
 	}
+	// WEBCAM_MODEL through the host iface (N3c; UTF-8, converted for the wide path on Windows).
+	char override[512];
+	if (sim_display_setting("WEBCAM_MODEL", override, sizeof(override))) {
 #ifdef _WIN32
-	const wchar_t *env = _wgetenv(L"SIM_DISPLAY_WEBCAM_MODEL");
-	if (env != NULL && env[0] != 0) {
-		return _snwprintf_s(model, cap, _TRUNCATE, L"%ls", env) > 0;
-	}
+		return MultiByteToWideChar(CP_UTF8, 0, override, -1, model, (int)cap) > 0;
 #else
-	const char *env = getenv("SIM_DISPLAY_WEBCAM_MODEL");
-	if (env != NULL && env[0] != 0) {
-		const int n = snprintf(model, cap, "%s", env);
+		const int n = snprintf(model, cap, "%s", override);
 		return n > 0 && (size_t)n < cap;
-	}
 #endif
+	}
 	return join(model, cap, dir, SIM_WEBCAM_MODEL_NAME);
 }
 

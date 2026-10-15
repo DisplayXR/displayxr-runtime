@@ -34,6 +34,7 @@
 #include "xrt/xrt_results.h"
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_stereo_camera.h"
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
 #include "vk/vk_helpers.h" // #1243: sizeof(struct vk_bundle) fingerprint
@@ -492,6 +493,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #else
     .create_dp_gl_for_screen = NULL,
 #endif
+
+    /* N3c (ADR-054 decision 7): what `displayxr-cli dp options sim-display` lists. */
+    .describe_settings = sim_display_describe_settings,
 };
 
 
@@ -507,8 +511,6 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
                    struct xrt_plugin_iface **out_iface,
                    uint32_t *out_plugin_api_version)
 {
-	(void)host;
-
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 
 	if (runtime_api_version != XRT_PLUGIN_API_VERSION_CURRENT) {
@@ -519,6 +521,10 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+
+	/* N3c: settings come through the host from now on (the pointer lives
+	 * in the runtime for the life of the process, like request_display_rescan). */
+	sim_display_settings_bind(host);
 
 	*out_iface = &g_sim_display_iface;
 	return XRT_SUCCESS;

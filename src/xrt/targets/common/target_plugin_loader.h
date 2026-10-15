@@ -133,6 +133,27 @@ bool
 target_plugin_get_preferred(char *out, size_t cap);
 
 /*!
+ * The display-processor class's row in the shared component loader (ADR-054
+ * N2): what the one options contract keys on (`target_component_get_setting`,
+ * `displayxr-cli dp options|set|unset`, N3c). Static, never NULL.
+ */
+const struct target_component_class *
+target_plugin_component_class(void);
+
+struct target_component_setting_desc;
+
+/*!
+ * The settings plug-in @p id declares (N3c): its manifest `settings_schema`
+ * (POSIX) merged with the binary's `describe_settings` slot, which means
+ * loading + negotiating the registered binary (no probe) and unloading it
+ * again — the same exposure as `dp list`'s status snapshot. Returns the
+ * count written to @p out (up to @p max); 0 for an unregistered id or a
+ * binary that declares nothing.
+ */
+int
+target_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
+/*!
  * Set the MACHINE-WIDE `PreferredPlugin` override to @p id (a plug-in
  * discovery id). Takes effect for processes that begin discovery AFTER the
  * write — the loader is one-shot per process, so a running service must be

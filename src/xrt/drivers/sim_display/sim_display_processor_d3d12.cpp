@@ -16,6 +16,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 
@@ -35,7 +36,8 @@
 #include <cstdlib>
 #include <cstring>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d12, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_d3d12() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)

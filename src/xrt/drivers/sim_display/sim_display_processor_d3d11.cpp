@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 #include "sim_display_lift_d3d11.h"
@@ -34,7 +35,8 @@
 #include <cstdlib>
 #include <cstring>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d11, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_d3d11() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 
 // ADR-021: this DP declares XRT_DP_COLOR_EITHER. When the runtime sends a
 // LINEAR atlas (Model B), the matched encode lives here in the DP. Shared HLSL:

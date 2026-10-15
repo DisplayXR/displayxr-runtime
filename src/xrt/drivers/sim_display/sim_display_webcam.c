@@ -20,6 +20,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_face_estimator.h"
 #include "sim_display_webcam_tracker.h"
 #include "sim_display_webcam_tracking.h"
@@ -40,21 +41,11 @@ static struct sim_webcam_tracker *g_webcam_tracker = NULL; // guarded
 static struct sim_face_estimator *g_webcam_est = NULL;     // guarded
 static bool g_webcam_warned_no_estimator = false;          // guarded
 
-static bool
-env_truthy(const char *name)
-{
-	const char *e = getenv(name);
-	return e != NULL && e[0] != '\0' && e[0] != '0';
-}
-
 bool
 sim_display_webcam_tracking_requested(void)
 {
-	static int cached = -1;
-	if (cached < 0) {
-		cached = env_truthy("SIM_DISPLAY_WEBCAM_TRACKING") ? 1 : 0;
-	}
-	return cached == 1;
+	// Through the host iface (N3c, sim_display_settings.h; cached per process).
+	return sim_display_setting_on("WEBCAM_TRACKING");
 }
 
 bool
@@ -63,29 +54,29 @@ sim_display_webcam_tracking_enabled(void)
 	return sim_display_webcam_tracking_requested() && sim_face_estimator_default_available();
 }
 
+//! The webcam knobs, through the host iface (N3c: `dp set sim-display WEBCAM_* ...`).
 static void
-config_from_env(struct sim_webcam_config *cfg)
+config_from_settings(struct sim_webcam_config *cfg)
 {
 	sim_webcam_config_defaults(cfg);
-	const char *e = getenv("SIM_DISPLAY_WEBCAM_HFOV_DEG");
-	if (e != NULL) {
+	char e[64];
+	if (sim_display_setting("WEBCAM_HFOV_DEG", e, sizeof(e))) {
 		const float v = (float)atof(e);
 		if (v > 10.0f && v < 170.0f) {
 			cfg->hfov_deg = v;
 		}
 	}
-	e = getenv("SIM_DISPLAY_WEBCAM_IPD_MM");
-	if (e != NULL) {
+	if (sim_display_setting("WEBCAM_IPD_MM", e, sizeof(e))) {
 		const float v = (float)atof(e);
 		if (v > 40.0f && v < 90.0f) {
 			cfg->ipd_m = v / 1000.0f;
 		}
 	}
-	e = getenv("SIM_DISPLAY_WEBCAM_OFFSET_MM");
-	if (e != NULL && !sim_webcam_parse_offset_mm(e, cfg->cam_offset_m)) {
-		U_LOG_W("sim_display webcam tracking: SIM_DISPLAY_WEBCAM_OFFSET_MM='%s' is not \"x,y,z\" - ignored", e);
+	if (sim_display_setting("WEBCAM_OFFSET_MM", e, sizeof(e)) &&
+	    !sim_webcam_parse_offset_mm(e, cfg->cam_offset_m)) {
+		U_LOG_W("sim_display webcam tracking: WEBCAM_OFFSET_MM='%s' is not \"x,y,z\" - ignored", e);
 	}
-	cfg->mirrored = env_truthy("SIM_DISPLAY_WEBCAM_MIRROR");
+	cfg->mirrored = sim_display_setting_on("WEBCAM_MIRROR");
 }
 
 //! Start the tracker (caller holds the lock). Leaves it NULL when it cannot run.
@@ -113,15 +104,16 @@ start_locked(void)
 		return;
 	}
 	struct sim_webcam_config cfg;
-	config_from_env(&cfg);
+	config_from_settings(&cfg);
 	float w_m = 0.0f, h_m = 0.0f;
 	uint32_t px_w = 0, px_h = 0;
 	sim_display_get_panel_metrics(&w_m, &h_m, &px_w, &px_h);
 	if (!(h_m > 0.0f)) {
 		sim_display_get_default_viewer(NULL, &h_m, NULL, NULL);
 	}
-	g_webcam_tracker =
-	    sim_webcam_tracker_create(&cfg, &backend, getenv("SIM_DISPLAY_WEBCAM_DEVICE"), g_webcam_est, h_m);
+	char device[256];
+	const char *device_name = sim_display_setting("WEBCAM_DEVICE", device, sizeof(device)) ? device : NULL;
+	g_webcam_tracker = sim_webcam_tracker_create(&cfg, &backend, device_name, g_webcam_est, h_m);
 	if (g_webcam_tracker == NULL) {
 		sim_face_estimator_destroy(&g_webcam_est);
 	}

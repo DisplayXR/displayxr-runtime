@@ -39,7 +39,9 @@ cli_print_help(int argc, const char **argv)
 	P("  dp <...>          - Display processors (ADR-019; verbs per ADR-054).\n");
 	P("                      'dp list [--json]', 'dp enable|disable <id> [--machine]',\n");
 	P("                      'dp use <id> [--machine]', 'dp reset [--machine]'; per screen:\n");
-	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
+	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all';\n");
+	P("                      'dp options <id> [--json]', 'dp set <id> <KEY> <value> [--machine]',\n");
+	P("                      'dp unset <id> <KEY> [--machine]' (the plug-in's own settings).\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034; verbs per ADR-054).\n");
 	P("                      'input list [--json]', 'input enable|disable <id> [--machine]',\n");
 	P("                      'input use <id> [--machine]', 'input reset', 'input options <id> [--json]',\n");

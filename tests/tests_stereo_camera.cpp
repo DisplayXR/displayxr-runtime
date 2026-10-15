@@ -318,7 +318,8 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	// segments create_dp_metal_for_screen right after that, then M6 D3D12
 	// create_dp_d3d12_for_screen right after that, then the ADR-051 dashboard
 	// get_screen_status right after that, then M6 OpenGL
-	// create_dp_gl_for_screen right after that; it now ends the struct.
+	// create_dp_gl_for_screen right after that, then the ADR-054 N3c
+	// describe_settings right after that; it now ends the struct.
 	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
 	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_vk_for_screen) ==
@@ -333,7 +334,9 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, create_dp_d3d12_for_screen) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_gl_for_screen) ==
 	      offsetof(xrt_plugin_iface, get_screen_status) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, create_dp_gl_for_screen) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	CHECK(offsetof(xrt_plugin_iface, describe_settings) ==
+	      offsetof(xrt_plugin_iface, create_dp_gl_for_screen) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, describe_settings) + sizeof(void *) == sizeof(xrt_plugin_iface));
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);

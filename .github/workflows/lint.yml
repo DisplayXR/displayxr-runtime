@@ -118,6 +118,37 @@ jobs:
         # Regenerate locally with: python3 scripts/gen_lever_catalog.py
         run: python3 scripts/gen_lever_catalog.py --check --github
 
+  sim-plugin-getenv-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Reference plug-ins read settings through the host iface, never getenv
+        run: |
+          # ADR-054 decision 7 (N3c, #2050): a component reads its settings
+          # ONLY through its host iface (`get_setting`), never from its own
+          # environment -- in a satellite / the service the environment is the
+          # host's, not the user's shell, and the CLI's `options|set|unset`
+          # cannot reach a getenv. The in-tree reference plug-ins are the
+          # worked example every vendor copies, so they must not regress. The
+          # one allow-listed file per plug-in is its settings shim, where the
+          # legacy SIM_DISPLAY_* / DXR_SIM_INPUT* names live as aliases for one
+          # release. Add a key to the shim's table; never add a getenv.
+          MATCHES=$(grep -rnE '\b_?w?getenv(_s)?\s*\(' \
+            src/xrt/drivers/sim_display src/xrt/drivers/sim_input src/xrt/drivers/sim_conversion \
+            --include='*.c' --include='*.cpp' --include='*.h' --include='*.hpp' --include='*.m' --include='*.mm' \
+            | grep -vE '^src/xrt/drivers/(sim_display/sim_display_settings\.c|sim_input/sim_input_settings\.c):' \
+            || true)
+          if [ -n "$MATCHES" ]; then
+            echo "::error::getenv in a reference plug-in outside its settings shim (ADR-054 decision 7, N3c):"
+            echo "$MATCHES"
+            echo ""
+            echo "Read the knob through host->get_setting (sim_display_settings.h / sim_input_settings.h /"
+            echo "the conversion host iface) and declare it in describe_settings instead."
+            exit 1
+          fi
+          echo "Reference plug-ins read settings through the host iface only. ✓"
+
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
