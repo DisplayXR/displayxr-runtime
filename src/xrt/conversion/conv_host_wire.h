@@ -135,6 +135,12 @@ extern "C" {
 #define CONV_HOST_ARG_CHANNEL "--channel"       //!< inherited channel token (os_channel_child_token)
 #define CONV_HOST_ARG_PARENT "--parent"         //!< service pid (diagnostics + POSIX parent-death check)
 #define CONV_HOST_ARG_ADAPTER_LUID "--adapter-luid" //!< hex; the service's ingest adapter, 0 = CPU / any
+/*! "0" | "1": pin the host's provenance gate (ADR-054 N4b) to audit / enforce.
+ *  Passed only when the PARENT holds that in-process override itself (a test
+ *  harness with unsigned build-tree providers): the parent could have loaded
+ *  the binary in-process under the same override, so this adds no bypass. The
+ *  service never passes it; the host then applies the platform policy. */
+#define CONV_HOST_ARG_TRUST_ENFORCE "--trust-enforce"
 /*! @} */
 
 /*!

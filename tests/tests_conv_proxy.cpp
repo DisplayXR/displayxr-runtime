@@ -262,6 +262,9 @@ struct Fixture : CoreOps
 		}
 		conv_host_proxy_config pc;
 		conv_host_proxy_config_defaults(&pc);
+		// Unsigned build-tree providers under an elevated harness: the host takes
+		// this process's audit pin (ADR-054 N4b PR B), as the in-process tests do.
+		pc.trust_enforce = CONV_HOST_TRUST_AUDIT;
 		pc.provider_id = provider_id;
 		pc.provider_binary = binary;
 		pc.host_exe = host_exe;
