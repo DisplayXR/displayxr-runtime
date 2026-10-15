@@ -779,6 +779,40 @@ struct xrt_display_processor_vk
 	                       uint64_t wait_value,
 	                       VkSemaphore_XDP signal_sem,
 	                       uint64_t signal_value);
+
+	/*!
+	 * Eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144).
+	 *
+	 * @p target_ns is when the pixels the caller is about to produce are
+	 * expected to be SEEN — a display time on the `os_monotonic_get_ns()`
+	 * clock: xrLocateViews passes the frame's displayTime, a compositor its
+	 * weave / scan-out instant, a status query "now". The DP predicts (or
+	 * samples) its tracker for THAT instant and fills @p out exactly as
+	 * @ref xrt_display_processor::get_predicted_eye_positions does;
+	 * `out->timestamp_ns` is the time of the tracker sample the answer is
+	 * based on — not the target — so the caller can tell how far it was
+	 * predicted.
+	 *
+	 * Lives on the VK variant, not the base: the variant embeds the base by
+	 * value, so growing the base would move every variant slot (see the note
+	 * above @ref set_window_screen_rect). The base IS the Vulkan interface,
+	 * so this costs no reach.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
+	 * the runtime falls back to the base's get_predicted_eye_positions ("now
+	 * + the vendor's default horizon") and samples that at the target itself
+	 * through a trunk-side ring (util/u_eye_history.h). Appended after
+	 * @ref set_weave_sync per ADR-020 (append-only within a major; no
+	 * version bump), announced by XRT_DP_VK_HAS_EYE_POSITIONS_AT.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param      target_ns  Monotonic time the eyes are wanted for.
+	 * @param[out] out        Eye positions at @p target_ns.
+	 * @return true if @p out is valid.
+	 */
+	bool (*get_eye_positions_at)(struct xrt_display_processor_vk *xdp,
+	                             int64_t target_ns,
+	                             struct xrt_eye_positions *out);
 };
 
 /*!
@@ -892,7 +926,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_act
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d)            == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_weave_sync)            == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_eye_positions_at)     == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -942,6 +977,15 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * #ifdef-guard its implementation. Purely additive (ADR-020).
  */
 #define XRT_DP_VK_HAS_WEAVE_SYNC 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::get_eye_positions_at slot (ADR-054 §4.1 / N6
+ * Part 1, #2144 — the target-time eye query), so a plug-in built against an
+ * older runtime can #ifdef-guard its implementation. Purely additive
+ * (ADR-020).
+ */
+#define XRT_DP_VK_HAS_EYE_POSITIONS_AT 1
 // clang-format on
 
 /*!
@@ -1481,6 +1525,51 @@ xrt_display_processor_vk_set_weave_sync(struct xrt_display_processor_vk *xdp,
 		return false;
 	}
 	return xdp->set_weave_sync(xdp, wait_sem, wait_value, signal_sem, signal_value);
+}
+
+/*!
+ * Does this DP answer a target-time eye query itself (the
+ * @ref xrt_display_processor_vk::get_eye_positions_at slot is covered by the
+ * plug-in's `base.struct_size` and non-NULL)? When not, the trunk samples its
+ * own ring at the target instead of trusting the fallback's horizon.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_has_eye_positions_at(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_eye_positions_at + sizeof(xdp->get_eye_positions_at);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->get_eye_positions_at != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_eye_positions_at
+ *
+ * Falls back to the base's @ref xrt_display_processor_get_predicted_eye_positions
+ * when the slot is absent (older plug-in `base.struct_size`) or NULL — an
+ * older plug-in keeps working and its answer means "now + the vendor's
+ * default horizon". @ref xrt_display_processor_vk_has_eye_positions_at tells
+ * the two apart. Takes the VARIANT pointer; a base `xrt_display_processor *`
+ * from a Vulkan factory is the same object (the variant embeds the base at
+ * offset 0), so callers cast as the other vk wrappers' callers do.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_eye_positions_at(struct xrt_display_processor_vk *xdp,
+                                              int64_t target_ns,
+                                              struct xrt_eye_positions *out)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	if (!xrt_display_processor_vk_has_eye_positions_at(xdp)) {
+		return xrt_display_processor_get_predicted_eye_positions(&xdp->base, out);
+	}
+	return xdp->get_eye_positions_at(xdp, target_ns, out);
 }
 
 #ifdef __cplusplus

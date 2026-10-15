@@ -459,6 +459,35 @@ struct xrt_display_processor_metal
 	                         int32_t target_y,
 	                         int32_t *out_x,
 	                         int32_t *out_y);
+
+	/*!
+	 * Eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144).
+	 *
+	 * @p target_ns is when the pixels the caller is about to produce are
+	 * expected to be SEEN — a display time on the `os_monotonic_get_ns()`
+	 * clock: xrLocateViews passes the frame's displayTime, a compositor its
+	 * weave / scan-out instant, a status query "now". The DP predicts (or
+	 * samples) its tracker for THAT instant and fills @p out exactly as
+	 * @ref get_predicted_eye_positions does; `out->timestamp_ns` is the time
+	 * of the tracker sample the answer is based on — not the target — so the
+	 * caller can tell how far it was predicted.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime falls back to @ref get_predicted_eye_positions ("now + the
+	 * vendor's default horizon") and samples that at the target itself
+	 * through a trunk-side ring (util/u_eye_history.h). Appended after
+	 * @ref snap_window_rect per ADR-020 (append-only within a major; no
+	 * version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_METAL_HAS_EYE_POSITIONS_AT.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param      target_ns  Monotonic time the eyes are wanted for.
+	 * @param[out] out        Eye positions at @p target_ns.
+	 * @return true if @p out is valid.
+	 */
+	bool (*get_eye_positions_at)(struct xrt_display_processor_metal *xdp,
+	                             int64_t target_ns,
+	                             struct xrt_eye_positions *out);
 };
 
 
@@ -519,7 +548,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_scanout_caps)
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_background_preview) == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_present_origin)     == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, snap_window_rect)       == XRT_DP_METAL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_eye_positions_at)   == XRT_DP_METAL_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_present_origin slot (multi-screen
@@ -542,6 +572,14 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                    
  * - the coupled-ABI-addition pattern used by every other appended slot.
  */
 #define XRT_DP_METAL_HAS_BACKGROUND_PREVIEW 1
+
+/*!
+ * Defined when this header carries the get_eye_positions_at slot (ADR-054
+ * §4.1 / N6 Part 1, #2144 — the target-time eye query), so a plug-in built
+ * against an older runtime can #ifdef-guard its implementation. Purely
+ * additive (ADR-020).
+ */
+#define XRT_DP_METAL_HAS_EYE_POSITIONS_AT 1
 // clang-format on
 
 /*!
@@ -943,6 +981,42 @@ xrt_display_processor_metal_snap_window_rect(struct xrt_display_processor_metal 
 	*out_x = sx;
 	*out_y = sy;
 	return true;
+}
+
+/*!
+ * Does this DP answer a target-time eye query itself (the
+ * @ref xrt_display_processor_metal::get_eye_positions_at slot is present and
+ * non-NULL)? When not, the trunk samples its own ring at the target instead of
+ * trusting the fallback's horizon.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_has_eye_positions_at(struct xrt_display_processor_metal *xdp)
+{
+	return xdp != NULL && XRT_DP_HAS_SLOT(xdp, get_eye_positions_at) && xdp->get_eye_positions_at != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::get_eye_positions_at
+ *
+ * Falls back to @ref xrt_display_processor_metal_get_predicted_eye_positions
+ * when the slot is absent (older plug-in `struct_size`) or NULL — an older
+ * plug-in keeps working and its answer means "now + the vendor's default
+ * horizon". @ref xrt_display_processor_metal_has_eye_positions_at tells the
+ * two apart.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_get_eye_positions_at(struct xrt_display_processor_metal *xdp,
+                                                 int64_t target_ns,
+                                                 struct xrt_eye_positions *out)
+{
+	if (!xrt_display_processor_metal_has_eye_positions_at(xdp)) {
+		return xrt_display_processor_metal_get_predicted_eye_positions(xdp, out);
+	}
+	return xdp->get_eye_positions_at(xdp, target_ns, out);
 }
 
 /*!

@@ -102,6 +102,8 @@ set(tests
     tests_u_setting_per_screen
     tests_u_file_socket_path
     tests_u_eye_history
+    tests_sim_eyes
+    tests_dp_eye_positions_at
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -485,6 +487,9 @@ target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces
 # ADR-054 §4.1 / N6 Part 1 (#2144): the trunk's eye-pair ring sampled at a
 # target time (exact / interpolate / bounded extrapolate / stale).
 target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
+# ... and the target-time slot on all five DP vtables: appended last, gated,
+# falling back to the vendor horizon.
+target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
 
 if(TARGET tests_sim_display_monitor_geometry)
 	# The pure pick is compiled straight in; the fixture path uses aux_os's
@@ -1565,6 +1570,13 @@ target_sources(
 		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_face_yunet.c
 	)
 target_include_directories(tests_sim_webcam_tracking PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+
+# N6 Part 1 (#2144): sim_display's synthetic viewer at a target time — the pure
+# half of its get_eye_positions_at slot (sway + square-wave tracking), pinned
+# host-side (it compiles into the plug-in).
+target_sources(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_eyes.c)
+target_include_directories(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+target_link_libraries(tests_sim_eyes PRIVATE xrt-interfaces)
 
 # ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).
