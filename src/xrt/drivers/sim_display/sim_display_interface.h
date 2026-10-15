@@ -163,6 +163,41 @@ bool
 sim_display_fake_tracking_sample(uint64_t *out_edges);
 
 /*!
+ * @ref sim_display_fake_tracking_sample evaluated at @p target_ns instead of
+ * now (N6 Part 1: the target-time eye query, #2144). Deterministic.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_sample_at(int64_t target_ns, uint64_t *out_edges);
+
+/*!
+ * The ONE eye answer every sim_display DP gives (N6 Part 1, #2144): the
+ * synthetic viewer (nominal, or the fake-tracking sway when `TRACKING_SWAY_MM`
+ * is set) in the N-view layout, evaluated at @p target_ns, `is_tracking` from
+ * the fake tracker's square wave at that instant, then the webcam override
+ * sampled at the target through its ring. `get_predicted_eye_positions`
+ * passes now; `get_eye_positions_at` the caller's target.
+ *
+ * @param[out] out            Filled completely.
+ * @param view_count          1 / 2 / ≥4 layout.
+ * @param nominal_x_m,nominal_y_m,nominal_z_m,ipd_m  The DP's viewer.
+ * @param target_ns           Monotonic time the eyes are wanted for.
+ * @param webcam_dp_ref       The DP's tracker reference (NULL for a
+ *                            screen-bound segment DP: never webcam-tracked).
+ * @return true (always valid: the contract never hands out zeros).
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_eyes_at(struct xrt_eye_positions *out,
+                    uint32_t view_count,
+                    float nominal_x_m,
+                    float nominal_y_m,
+                    float nominal_z_m,
+                    float ipd_m,
+                    int64_t target_ns,
+                    bool *webcam_dp_ref);
+
+/*!
  * Webcam eye tracking (#1855), opt-in: `SIM_DISPLAY_WEBCAM_TRACKING=1`.
  * Was it asked for? (Cached env read; all of the below are no-ops without it.)
  * @ingroup drv_sim_display
@@ -192,6 +227,23 @@ sim_display_webcam_tracking_enabled(void);
 bool
 sim_display_webcam_tracking_apply(
     struct xrt_eye_positions *out, float nominal_x_m, float nominal_y_m, float nominal_z_m, float ipd_m, bool *dp_ref);
+
+/*!
+ * @ref sim_display_webcam_tracking_apply for a TARGET time (N6 Part 1,
+ * #2144): the tracker's latest pair goes through a `u_eye_history` ring that
+ * is sampled at @p target_ns (interpolated / extrapolated / stale per that
+ * ring's rules); `out->timestamp_ns` becomes the sample time the answer is
+ * based on and `out->is_tracking` the ring's answer.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_apply_at(struct xrt_eye_positions *out,
+                                     float nominal_x_m,
+                                     float nominal_y_m,
+                                     float nominal_z_m,
+                                     float ipd_m,
+                                     int64_t target_ns,
+                                     bool *dp_ref);
 
 //! Drop a DP's tracker reference (DP destroy). Stops the camera with the last one.
 void

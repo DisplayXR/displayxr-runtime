@@ -507,36 +507,23 @@ sim_dp_gl_bind_screen(struct sim_display_processor_gl *sdp, const struct xrt_scr
 	}
 }
 
+//! N6 Part 1 (#2144): the synthetic viewer (nominal / fake-tracking sway,
+//! is_tracking, the opt-in webcam override through its ring — #1855; a
+//! screen-bound segment DP stays nominal) evaluated at the caller's target.
+static bool
+sim_dp_gl_get_eye_positions_at(struct xrt_display_processor_gl *xdp, int64_t target_ns, struct xrt_eye_positions *out)
+{
+	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
+	return sim_display_eyes_at(out, sim_display_get_view_count(), sdp->nominal_x_m, sdp->nominal_y_m,
+	                           sdp->nominal_z_m, sdp->ipd_m, target_ns,
+	                           sdp->screen_bound ? NULL : &sdp->webcam_ref);
+}
+
 static bool
 sim_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
                                        struct xrt_eye_positions *out)
 {
-	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
-	float half_ipd = sdp->ipd_m / 2.0f;
-	uint32_t vc = sim_display_get_view_count();
-
-	if (vc == 1) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 1;
-	} else if (vc >= 4) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->count = 4;
-	} else {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 2;
-	}
-	out->timestamp_ns = os_monotonic_get_ns();
-	out->valid = true;
-	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
-	// #1855: opt-in webcam tracking overrides the nominal eyes (no-op unless
-	// SIM_DISPLAY_WEBCAM_TRACKING; a screen-bound segment DP stays nominal).
-	sim_display_webcam_tracking_apply(out, sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m, sdp->ipd_m,
-	                                  &sdp->webcam_ref);
-	return true;
+	return sim_dp_gl_get_eye_positions_at(xdp, (int64_t)os_monotonic_get_ns(), out);
 }
 
 static void
@@ -798,6 +785,7 @@ sim_display_processor_gl_create_bound(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_gl_destroy;
 	sdp->base.process_atlas = sim_dp_gl_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_gl_get_predicted_eye_positions;
+	sdp->base.get_eye_positions_at = sim_dp_gl_get_eye_positions_at;       // N6 Part 1 (#2144)
 	sdp->base.get_display_dimensions = sim_dp_gl_get_display_dimensions;   // #856
 	sdp->base.get_display_pixel_info = sim_dp_gl_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_gl_is_alpha_native;

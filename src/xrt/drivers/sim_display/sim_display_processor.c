@@ -913,37 +913,28 @@ sim_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scan
 }
 
 static bool
+sim_dp_get_eye_positions_at(struct xrt_display_processor_vk *xdp, int64_t target_ns, struct xrt_eye_positions *out);
+
+static bool
 sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_positions *out)
 {
-	struct sim_display_processor *sdp = sim_display_processor(xdp);
-	float half_ipd = sdp->ipd_m / 2.0f;
+	return sim_dp_get_eye_positions_at((struct xrt_display_processor_vk *)xdp, (int64_t)os_monotonic_get_ns(), out);
+}
+
+//! N6 Part 1 (#2144): the same viewer, evaluated at the caller's target time.
+static bool
+sim_dp_get_eye_positions_at(struct xrt_display_processor_vk *xdp, int64_t target_ns, struct xrt_eye_positions *out)
+{
+	struct sim_display_processor *sdp = sim_display_processor(&xdp->base);
 	// A segment DP (multi-screen) reports one eye per view of the atlas it
 	// weaves; the session DP keeps the process-wide sim view count.
 	uint32_t vc =
 	    sdp->screen_bound ? (sdp->last_atlas_views > 0 ? sdp->last_atlas_views : 2) : sim_display_get_view_count();
-
-	if (vc == 1) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 1;
-	} else if (vc >= 4) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->count = 4;
-	} else {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 2;
-	}
-	out->timestamp_ns = os_monotonic_get_ns();
-	out->valid = true;
-	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
-	// #1855: opt-in webcam tracking overrides the nominal eyes (no-op unless
-	// SIM_DISPLAY_WEBCAM_TRACKING; a screen-bound segment DP stays nominal).
-	sim_display_webcam_tracking_apply(out, sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m, sdp->ipd_m,
-	                                  sdp->screen_bound ? NULL : &sdp->webcam_ref);
-	return true;
+	// Nominal (or fake-tracking sway) layout at the target, is_tracking at the
+	// target, then the opt-in webcam override through its ring (#1855; a
+	// screen-bound segment DP stays nominal).
+	return sim_display_eyes_at(out, vc, sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m, sdp->ipd_m, target_ns,
+	                           sdp->screen_bound ? NULL : &sdp->webcam_ref);
 }
 
 //! SIM_DISPLAY_FAKE_LENS: record the request (one WARN per transition).
@@ -1332,6 +1323,7 @@ sim_display_processor_create_impl(enum sim_display_output_mode mode,
 	sdp->base_vk.set_transparency_active = sim_dp_set_transparency_active; // lazy transparency
 	sdp->base_vk.set_present_origin = sim_dp_set_present_origin;           // ADR-033 / multi-screen M2
 	sdp->base_vk.get_scanout_caps = sim_dp_get_scanout_caps;               // multi-screen M2 1:1 gate
+	sdp->base_vk.get_eye_positions_at = sim_dp_get_eye_positions_at;       // N6 Part 1 (#2144)
 	sdp->base_vk.base.destroy = sim_dp_destroy;
 	sdp->base_vk.base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base_vk.base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;

@@ -89,6 +89,8 @@ endif()
 # Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
+	sim_display/sim_display_eyes.c
+	sim_display/sim_display_eyes.h
 	sim_display/sim_display_interface.h
 	sim_display/sim_display_settings.c
 	sim_display/sim_display_settings.h
