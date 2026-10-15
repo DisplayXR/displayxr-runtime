@@ -123,9 +123,10 @@ The `Enabled` overlay is the shared component loader's
 kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
 machine value win for every row (conversion-provider-discovery.md §3.1); the
 `Policy` subkey is reserved and never read as a provider row. A change to
-either value applies to processes started after the write — the loader is
-one-shot per process (restart the service to switch a live session; live
-re-select is N3 step d).
+either value reaches a running service live — as a **re-rank** of the
+resident providers, since the provider set is fixed per process (see
+*Live re-select* under *Selection* below); in-process apps read it at their
+next launch.
 
 **Choosing a `ProbeOrder`:** lower wins. Pick a value distinct from every
 provider yours expects to coexist with — the in-tree Ultraleap provider
@@ -181,6 +182,27 @@ arbitration priority, exactly the DP loader's convention: lower wins. The
 ranked list is exposed via `target_input_plugin_get_count()/get_iface(i)`;
 `get_active()` aliases index 0. No registered provider is not an error: the
 builder falls back to qwerty.
+
+**Live re-select (ADR-054 N3d, #2051).** The provider set is fixed per
+process (next section), so an `Enabled` / `PreferredPlugin` change while
+the service runs cannot add or remove a provider — it **re-ranks** the
+resident ones. The service re-reads both values
+(`target_input_plugin_reread_policy`) and hands the arbiter a new standing
+per resident provider (`t_input_arbiter_rerank`): the preferred one to
+priority 0, every other to its `ProbeOrder`, a disabled one **withdrawn** —
+skipped by every role walk exactly as presence loss skips it (§4), its
+devices left in `xsysd->xdevs`, still polled for presence so re-enabling is
+instant. The roles are recomputed at once and `generation_id` moves, so
+every client sees the flip on its next `xrSyncActions` (`input haptic-test`
+prints the new generation). The trigger is the DIAG call
+`system_request_component_reselect(input)` the CLI makes after each write,
+or the service's component-policy watch for an edit made without the CLI
+(`service-architecture.md` §3.1; on POSIX the `input-preferred` file and
+the manifests' `enabled` are polled). Two things stay a restart, and the
+`enable` verb says so: a provider that was disabled or unregistered when
+the service scanned is not resident and joins at the next service start
+(the service log names it), and in-process apps re-read at their next
+launch.
 
 ### Lifetime — the provider is per-process, its devices are per-instance
 
