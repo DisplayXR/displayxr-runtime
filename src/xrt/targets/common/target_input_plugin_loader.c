@@ -79,6 +79,7 @@ static const struct target_component_class g_input_class = {
     .android_prefix = NULL,
     .is_reserved_subkey = input_is_reserved_subkey,
     .read_extra = NULL,
+    .env_class = "INPUT", // DXR_INPUT_<ID>_<KEY> (N3c)
 };
 
 

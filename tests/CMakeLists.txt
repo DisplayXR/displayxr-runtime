@@ -140,6 +140,10 @@ if(TARGET target_lists)
 	# registry row reader, ordering + shadowing, the load path and the ABI gate,
 	# driven by test-only class rows.
 	list(APPEND tests tests_component_loader)
+	# ADR-054 N3c -- the one options contract's store: resolution order
+	# (environment > user > machine / manifest), the DXR_<CLASS>_<ID>_<KEY>
+	# mapping, the per-user JSON lookup, and a live POSIX round trip.
+	list(APPEND tests tests_component_settings)
 	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
@@ -540,6 +544,9 @@ if(TARGET tests_conversion_loader)
 			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
 			"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
 		)
+endif()
+if(TARGET tests_component_settings)
+	target_link_libraries(tests_component_settings PRIVATE target_lists xrt-interfaces aux_util)
 endif()
 if(TARGET tests_component_loader)
 	target_link_libraries(tests_component_loader PRIVATE target_lists xrt-interfaces aux_util)

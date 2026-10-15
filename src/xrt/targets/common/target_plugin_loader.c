@@ -734,6 +734,7 @@ static const struct target_component_class g_dp_class = {
     .android_prefix = TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY,
     .is_reserved_subkey = dp_is_reserved_subkey,
     .read_extra = NULL,
+    .env_class = "DP", // DXR_DP_<ID>_<KEY> (N3c)
 };
 
 //! One per-class entry array, heap-allocated (~11 KB a row).

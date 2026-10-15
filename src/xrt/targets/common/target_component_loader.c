@@ -15,12 +15,14 @@
 #include "target_plugin_path_guard.h"
 #include "target_plugin_preload_sanitize.h"
 
+#include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_results.h"
 
 #include "util/u_camera_consent.h"
 #include "util/u_json.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_sha256.h"
 
 #include <errno.h>
@@ -66,6 +68,45 @@ static bool
 tc_usable(const struct target_component_entry *e)
 {
 	return (e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0;
+}
+
+//! ASCII case-insensitive equality (setting keys are registry value names).
+static bool
+tc_ci_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) {
+		return false;
+	}
+	for (;; a++, b++) {
+		int ca = (unsigned char)*a;
+		int cb = (unsigned char)*b;
+		if (ca >= 'a' && ca <= 'z') {
+			ca -= 'a' - 'A';
+		}
+		if (cb >= 'a' && cb <= 'z') {
+			cb -= 'a' - 'A';
+		}
+		if (ca != cb) {
+			return false;
+		}
+		if (ca == '\0') {
+			return true;
+		}
+	}
+}
+
+static void
+tc_upper_copy(char *dst, size_t cap, const char *src)
+{
+	if (cap == 0) {
+		return;
+	}
+	size_t i = 0;
+	for (; src != NULL && src[i] != '\0' && i + 1 < cap; i++) {
+		const unsigned char c = (unsigned char)src[i];
+		dst[i] = (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : (char)c;
+	}
+	dst[i] = '\0';
 }
 
 static const char *
@@ -1009,6 +1050,198 @@ target_component_unload(void *module)
 	}
 }
 
+
+/*
+ *
+ * Component settings store (Windows): `<hive>\<root>\<id>\Settings\<KEY>`.
+ * HKLM is the 64-bit view (where installers and the rows live); HKCU is
+ * read as-is, like the N3a/N3b `Enabled` overlay.
+ *
+ */
+
+//! HKLM `<root>\Policy\Lock` = 1: the machine's values win over the user's (kiosk rule).
+static bool
+tc_policy_lock(const struct target_component_class *cls)
+{
+	if (cls == NULL || cls->registry_root == NULL) {
+		return false;
+	}
+	wchar_t wroot[256];
+	if (!tc_u2w(cls->registry_root, wroot, (int)(sizeof(wroot) / sizeof(wroot[0])))) {
+		return false;
+	}
+	wchar_t wpolicy[320];
+	swprintf(wpolicy, sizeof(wpolicy) / sizeof(wpolicy[0]), L"%ls\\Policy", wroot);
+	DWORD lock = 0;
+	DWORD bytes = sizeof(lock);
+	return RegGetValueW(HKEY_LOCAL_MACHINE, wpolicy, L"Lock", RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &lock,
+	                    &bytes) == ERROR_SUCCESS &&
+	       lock == 1;
+}
+
+//! `<root>\<id>\Settings` as a wide path; false when a part does not convert / fit.
+static bool
+tc_settings_key_path(const struct target_component_class *cls, const char *id, wchar_t *out, size_t cap_chars)
+{
+	if (cls == NULL || cls->registry_root == NULL || id == NULL || id[0] == '\0' || out == NULL || cap_chars == 0) {
+		return false;
+	}
+	wchar_t wroot[256];
+	wchar_t wid[TARGET_COMPONENT_SETTING_KEY_MAX];
+	if (!tc_u2w(cls->registry_root, wroot, (int)(sizeof(wroot) / sizeof(wroot[0]))) ||
+	    !tc_u2w(id, wid, (int)(sizeof(wid) / sizeof(wid[0])))) {
+		return false;
+	}
+	const int n = swprintf(out, cap_chars, L"%ls\\%ls\\Settings", wroot, wid);
+	return n > 0 && (size_t)n < cap_chars;
+}
+
+static bool
+tc_store_lock(const struct target_component_class *cls)
+{
+	return tc_policy_lock(cls);
+}
+
+//! One tier's value: the user (HKCU) or machine (HKLM, 64-bit view) `Settings\<KEY>`.
+static bool
+tc_store_read(
+    const struct target_component_class *cls, const char *id, const char *key, bool user, char *buf, size_t cap)
+{
+	wchar_t wpath[400];
+	wchar_t wkey[TARGET_COMPONENT_SETTING_KEY_MAX];
+	if (!tc_settings_key_path(cls, id, wpath, sizeof(wpath) / sizeof(wpath[0])) ||
+	    !tc_u2w(key, wkey, (int)(sizeof(wkey) / sizeof(wkey[0])))) {
+		return false;
+	}
+	const HKEY hive = user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+	const DWORD flags = RRF_RT_ANY | (user ? 0u : RRF_SUBKEY_WOW6464KEY);
+	DWORD type = 0;
+	BYTE data[TARGET_COMPONENT_SETTING_VALUE_MAX * sizeof(wchar_t)];
+	DWORD bytes = sizeof(data) - sizeof(wchar_t);
+	memset(data, 0, sizeof(data));
+	if (RegGetValueW(hive, wpath, wkey, flags, &type, data, &bytes) != ERROR_SUCCESS) {
+		return false;
+	}
+	if (type == REG_SZ || type == REG_EXPAND_SZ) {
+		tc_w2u((const wchar_t *)data, buf, (int)cap);
+		return true;
+	}
+	if (type == REG_DWORD && bytes == sizeof(DWORD)) {
+		DWORD v;
+		memcpy(&v, data, sizeof(v));
+		snprintf(buf, cap, "%lu", (unsigned long)v);
+		return true;
+	}
+	return false;
+}
+
+static enum target_component_store_result
+tc_store_write(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	wchar_t wpath[400];
+	wchar_t wkey[TARGET_COMPONENT_SETTING_KEY_MAX];
+	if (!tc_settings_key_path(cls, id, wpath, sizeof(wpath) / sizeof(wpath[0])) ||
+	    !tc_u2w(key, wkey, (int)(sizeof(wkey) / sizeof(wkey[0])))) {
+		return TARGET_COMPONENT_STORE_FAILED;
+	}
+	const HKEY hive = machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+	const REGSAM sam = KEY_SET_VALUE | (machine ? KEY_WOW64_64KEY : 0);
+	HKEY k = NULL;
+	LSTATUS rc;
+	if (value != NULL) {
+		rc = RegCreateKeyExW(hive, wpath, 0, NULL, 0, sam, NULL, &k, NULL);
+	} else {
+		rc = RegOpenKeyExW(hive, wpath, 0, sam, &k);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			return TARGET_COMPONENT_STORE_OK; // nothing to clear
+		}
+	}
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
+	}
+	if (value != NULL) {
+		wchar_t wval[TARGET_COMPONENT_SETTING_VALUE_MAX];
+		if (!tc_u2w(value, wval, (int)(sizeof(wval) / sizeof(wval[0])))) {
+			RegCloseKey(k);
+			return TARGET_COMPONENT_STORE_FAILED;
+		}
+		rc = RegSetValueExW(k, wkey, 0, REG_SZ, (const BYTE *)wval,
+		                    (DWORD)((wcslen(wval) + 1) * sizeof(wchar_t)));
+	} else {
+		rc = RegDeleteValueW(k, wkey);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			rc = ERROR_SUCCESS;
+		}
+	}
+	RegCloseKey(k);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
+	}
+	return TARGET_COMPONENT_STORE_OK;
+}
+
+//! Every value name under one tier's `Settings` key.
+static int
+tc_store_keys(const struct target_component_class *cls,
+              const char *id,
+              bool user,
+              char keys[][TARGET_COMPONENT_SETTING_KEY_MAX],
+              int max)
+{
+	wchar_t wpath[400];
+	if (!tc_settings_key_path(cls, id, wpath, sizeof(wpath) / sizeof(wpath[0]))) {
+		return 0;
+	}
+	const HKEY hive = user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+	HKEY k = NULL;
+	if (RegOpenKeyExW(hive, wpath, 0, KEY_READ | (user ? 0 : KEY_WOW64_64KEY), &k) != ERROR_SUCCESS) {
+		return 0;
+	}
+	int n = 0;
+	for (DWORD i = 0; n < max; i++) {
+		wchar_t name[TARGET_COMPONENT_SETTING_KEY_MAX];
+		DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+		DWORD type = 0;
+		LSTATUS rc = RegEnumValueW(k, i, name, &name_len, NULL, &type, NULL, NULL);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ && type != REG_DWORD)) {
+			continue;
+		}
+		tc_w2u(name, keys[n], TARGET_COMPONENT_SETTING_KEY_MAX);
+		if (keys[n][0] != '\0') {
+			n++;
+		}
+	}
+	RegCloseKey(k);
+	return n;
+}
+
+static bool
+tc_store_path(const struct target_component_class *cls, const char *id, bool machine, char *out, size_t cap)
+{
+	if (cls == NULL || cls->registry_root == NULL || id == NULL) {
+		return false;
+	}
+	const int n = snprintf(out, cap, "%s\\%s\\%s\\Settings", machine ? "HKLM" : "HKCU", cls->registry_root, id);
+	return n > 0 && (size_t)n < cap;
+}
+
+static int
+tc_store_manifest_schema(const struct target_component_class *cls,
+                         const char *id,
+                         struct target_component_setting_desc *out,
+                         int max)
+{
+	(void)cls;
+	(void)id;
+	(void)out;
+	(void)max;
+	return 0; // registry discovery carries no manifest; the binary declares (describe_settings)
+}
+
 #else /* POSIX: Android, macOS, desktop Linux */
 
 #include <dirent.h>
@@ -1195,6 +1428,84 @@ tc_discover(const struct target_component_class *cls, struct target_component_en
 		}
 	}
 	return count;
+}
+
+/*
+ * Component settings store (Android): file-name discovery carries no
+ * manifest and there is no per-user dir, so the environment
+ * (`debug.xrt.DXR_<CLASS>_<ID>_<KEY>` / the process environment) is the only
+ * tier. Writes are refused.
+ */
+static bool
+tc_store_lock(const struct target_component_class *cls)
+{
+	(void)cls;
+	return false;
+}
+
+static bool
+tc_store_read(
+    const struct target_component_class *cls, const char *id, const char *key, bool user, char *buf, size_t cap)
+{
+	(void)cls;
+	(void)id;
+	(void)key;
+	(void)user;
+	(void)buf;
+	(void)cap;
+	return false;
+}
+
+static enum target_component_store_result
+tc_store_write(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	(void)cls;
+	(void)id;
+	(void)key;
+	(void)value;
+	(void)machine;
+	return TARGET_COMPONENT_STORE_UNSUPPORTED;
+}
+
+static int
+tc_store_keys(const struct target_component_class *cls,
+              const char *id,
+              bool user,
+              char keys[][TARGET_COMPONENT_SETTING_KEY_MAX],
+              int max)
+{
+	(void)cls;
+	(void)id;
+	(void)user;
+	(void)keys;
+	(void)max;
+	return 0;
+}
+
+static bool
+tc_store_path(const struct target_component_class *cls, const char *id, bool machine, char *out, size_t cap)
+{
+	(void)cls;
+	(void)id;
+	(void)machine;
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	return false;
+}
+
+static int
+tc_store_manifest_schema(const struct target_component_class *cls,
+                         const char *id,
+                         struct target_component_setting_desc *out,
+                         int max)
+{
+	(void)cls;
+	(void)id;
+	(void)out;
+	(void)max;
+	return 0;
 }
 
 #else /* macOS / desktop Linux */
@@ -1401,6 +1712,301 @@ target_component_user_dir(char *out, size_t cap)
 	}
 	return false;
 #endif
+}
+
+
+/*
+ *
+ * Component settings store (desktop POSIX): the manifest's `settings` object
+ * is the machine tier (edited by hand; `--machine` writes are refused), the
+ * per-user `<id>.settings.json` next to `preferred` is the user tier.
+ *
+ */
+
+//! The registered, usable entry @p id of @p cls, re-enumerated; false when absent.
+static bool
+tc_posix_find_entry(const struct target_component_class *cls, const char *id, struct target_component_entry *out)
+{
+	if (cls == NULL || id == NULL || out == NULL) {
+		return false;
+	}
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return false;
+	}
+	const int n = tc_discover(cls, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	bool found = false;
+	for (int i = 0; i < n; i++) {
+		if (tc_usable(&entries[i]) && strcmp(entries[i].id, id) == 0) {
+			*out = entries[i];
+			found = true;
+			break;
+		}
+	}
+	free(entries);
+	return found;
+}
+
+static bool
+tc_user_settings_path(const char *id, char *out, size_t cap)
+{
+	char dir[PATH_MAX];
+	if (id == NULL || id[0] == '\0' || !target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	const int n = snprintf(out, cap, "%s/%s.settings.json", dir, id);
+	return n > 0 && (size_t)n < cap;
+}
+
+static bool
+tc_store_lock(const struct target_component_class *cls)
+{
+	(void)cls; // no kiosk policy store on POSIX: the per-user file always wins
+	return false;
+}
+
+static bool
+tc_store_read(
+    const struct target_component_class *cls, const char *id, const char *key, bool user, char *buf, size_t cap)
+{
+	if (user) {
+		char path[PATH_MAX];
+		if (!tc_user_settings_path(id, path, sizeof(path))) {
+			return false;
+		}
+		char *text = tc_read_file(path);
+		if (text == NULL) {
+			return false;
+		}
+		const bool ok = target_component_user_settings_json_lookup(text, key, buf, cap);
+		free(text);
+		return ok;
+	}
+	struct target_component_entry *e = (struct target_component_entry *)calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return false;
+	}
+	bool ok = false;
+	if (tc_posix_find_entry(cls, id, e)) {
+		for (uint32_t i = 0; i < e->setting_count && i < TARGET_COMPONENT_MAX_SETTINGS; i++) {
+			if (tc_ci_equal(e->settings[i].key, key)) {
+				tc_copy(buf, cap, e->settings[i].value);
+				ok = true;
+				break;
+			}
+		}
+	}
+	free(e);
+	return ok;
+}
+
+static enum target_component_store_result
+tc_store_write(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	(void)cls;
+	if (machine) {
+		return TARGET_COMPONENT_STORE_UNSUPPORTED; // the manifest's "settings" object is the machine store
+	}
+	char path[PATH_MAX];
+	if (!tc_user_settings_path(id, path, sizeof(path))) {
+		return TARGET_COMPONENT_STORE_UNSUPPORTED;
+	}
+	char *text = tc_read_file(path);
+	cJSON *root = text != NULL ? cJSON_Parse(text) : NULL;
+	free(text);
+	if (root == NULL && value == NULL) {
+		return TARGET_COMPONENT_STORE_OK; // nothing to clear (absent or unreadable file)
+	}
+	if (root != NULL && !cJSON_IsObject(root)) {
+		cJSON_Delete(root);
+		root = NULL;
+	}
+	if (root == NULL) {
+		root = cJSON_CreateObject();
+		if (root == NULL) {
+			return TARGET_COMPONENT_STORE_FAILED;
+		}
+	}
+	// Keys match case-insensitively: drop every spelling before adding ours.
+	for (;;) {
+		cJSON *victim = NULL;
+		cJSON *kv = NULL;
+		cJSON_ArrayForEach(kv, root)
+		{
+			if (kv->string != NULL && tc_ci_equal(kv->string, key)) {
+				victim = kv;
+				break;
+			}
+		}
+		if (victim == NULL) {
+			break;
+		}
+		cJSON_DetachItemViaPointer(root, victim);
+		cJSON_Delete(victim);
+	}
+	if (value != NULL) {
+		char upper[TARGET_COMPONENT_SETTING_KEY_MAX];
+		tc_upper_copy(upper, sizeof(upper), key);
+		if (cJSON_AddStringToObject(root, upper, value) == NULL) {
+			cJSON_Delete(root);
+			return TARGET_COMPONENT_STORE_FAILED;
+		}
+	}
+	enum target_component_store_result r = TARGET_COMPONENT_STORE_OK;
+	if (cJSON_GetArraySize(root) == 0) {
+		if (remove(path) != 0 && errno != ENOENT) {
+			r = errno == EACCES ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
+		}
+	} else {
+		char dir[PATH_MAX];
+		if (target_component_user_dir(dir, sizeof(dir))) {
+			(void)mkdir(dir, 0755); // best-effort, single level (as `preferred`)
+		}
+		char *printed = cJSON_Print(root);
+		FILE *f = printed != NULL ? fopen(path, "wb") : NULL;
+		if (f == NULL) {
+			r = errno == EACCES ? TARGET_COMPONENT_STORE_DENIED : TARGET_COMPONENT_STORE_FAILED;
+		} else {
+			fprintf(f, "%s\n", printed);
+			fclose(f);
+		}
+		cJSON_free(printed);
+	}
+	cJSON_Delete(root);
+	return r;
+}
+
+static int
+tc_store_keys(const struct target_component_class *cls,
+              const char *id,
+              bool user,
+              char keys[][TARGET_COMPONENT_SETTING_KEY_MAX],
+              int max)
+{
+	int n = 0;
+	if (user) {
+		char path[PATH_MAX];
+		if (!tc_user_settings_path(id, path, sizeof(path))) {
+			return 0;
+		}
+		char *text = tc_read_file(path);
+		if (text == NULL) {
+			return 0;
+		}
+		cJSON *root = cJSON_Parse(text);
+		free(text);
+		if (root == NULL) {
+			return 0;
+		}
+		const cJSON *kv = NULL;
+		cJSON_ArrayForEach(kv, root)
+		{
+			if (n >= max || kv->string == NULL ||
+			    !(cJSON_IsString(kv) || cJSON_IsNumber(kv) || cJSON_IsBool(kv))) {
+				continue;
+			}
+			tc_copy(keys[n++], TARGET_COMPONENT_SETTING_KEY_MAX, kv->string);
+		}
+		cJSON_Delete(root);
+		return n;
+	}
+	struct target_component_entry *e = (struct target_component_entry *)calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return 0;
+	}
+	if (tc_posix_find_entry(cls, id, e)) {
+		for (uint32_t i = 0; i < e->setting_count && i < TARGET_COMPONENT_MAX_SETTINGS && n < max; i++) {
+			tc_copy(keys[n++], TARGET_COMPONENT_SETTING_KEY_MAX, e->settings[i].key);
+		}
+	}
+	free(e);
+	return n;
+}
+
+static bool
+tc_store_path(const struct target_component_class *cls, const char *id, bool machine, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (!machine) {
+		return tc_user_settings_path(id, out, cap);
+	}
+	struct target_component_entry *e = (struct target_component_entry *)calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return false;
+	}
+	const bool found = tc_posix_find_entry(cls, id, e);
+	if (found) {
+		tc_copy(out, cap, e->source);
+	}
+	free(e);
+	return found;
+}
+
+static int
+tc_store_manifest_schema(const struct target_component_class *cls,
+                         const char *id,
+                         struct target_component_setting_desc *out,
+                         int max)
+{
+	struct target_component_entry *e = (struct target_component_entry *)calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return 0;
+	}
+	int n = 0;
+	char *text = NULL;
+	if (tc_posix_find_entry(cls, id, e)) {
+		text = tc_read_file(e->source);
+	}
+	free(e);
+	if (text == NULL) {
+		return 0;
+	}
+	cJSON *root = cJSON_Parse(text);
+	free(text);
+	if (root == NULL) {
+		return 0;
+	}
+	const cJSON *plugin = u_json_get(root, "plugin");
+	const cJSON *schema = plugin != NULL ? u_json_get(plugin, "settings_schema") : NULL;
+	if (schema != NULL && cJSON_IsArray(schema)) {
+		const cJSON *item = NULL;
+		cJSON_ArrayForEach(item, schema)
+		{
+			if (n >= max || !cJSON_IsObject(item)) {
+				continue;
+			}
+			struct target_component_setting_desc *d = &out[n];
+			memset(d, 0, sizeof(*d));
+			tc_json_str(item, "key", d->key, sizeof(d->key));
+			if (!target_component_setting_key_valid(d->key)) {
+				U_LOG_I("%s: %s: settings_schema entry with an invalid key '%s' — skipped.",
+				        tc_tag(cls), id, d->key);
+				continue;
+			}
+			bool dup = false;
+			for (int i = 0; i < n; i++) {
+				if (tc_ci_equal(out[i].key, d->key)) {
+					dup = true;
+					break;
+				}
+			}
+			if (dup) {
+				continue;
+			}
+			tc_upper_copy(d->key, sizeof(d->key), d->key);
+			tc_json_str(item, "type", d->type, sizeof(d->type));
+			tc_json_str(item, "default", d->default_value, sizeof(d->default_value));
+			tc_json_str(item, "help", d->help, sizeof(d->help));
+			n++;
+		}
+	}
+	cJSON_Delete(root);
+	return n;
 }
 
 #endif /* Android vs desktop POSIX */
@@ -1905,4 +2511,327 @@ target_component_abi_gate(const struct target_component_class *cls,
 	}
 
 	return TARGET_COMPONENT_ABI_OK;
+}
+
+
+/*
+ *
+ * Component settings (every platform) — the one options contract, N3c.
+ *
+ */
+
+const char *
+target_component_setting_source_str(uint32_t source)
+{
+	switch (source) {
+	case TARGET_COMPONENT_SETTING_ABSENT: return "absent";
+	case TARGET_COMPONENT_SETTING_ENVIRONMENT: return "environment";
+	case TARGET_COMPONENT_SETTING_USER: return "user";
+	case TARGET_COMPONENT_SETTING_MACHINE: return "machine";
+	case TARGET_COMPONENT_SETTING_MANIFEST: return "manifest";
+	default: return "absent";
+	}
+}
+
+bool
+target_component_setting_key_valid(const char *key)
+{
+	if (key == NULL || key[0] == '\0' || (key[0] >= '0' && key[0] <= '9')) {
+		return false;
+	}
+	size_t n = 0;
+	for (const char *c = key; *c != '\0'; c++, n++) {
+		const bool ok =
+		    (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_';
+		if (!ok) {
+			return false;
+		}
+	}
+	return n < TARGET_COMPONENT_SETTING_KEY_MAX;
+}
+
+bool
+target_component_setting_env_name(const char *env_class, const char *id, const char *key, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (env_class == NULL || env_class[0] == '\0' || id == NULL || id[0] == '\0' ||
+	    !target_component_setting_key_valid(key)) {
+		return false;
+	}
+	const int n = snprintf(out, cap, "DXR_%s_%s_%s", env_class, id, key);
+	if (n <= 0 || (size_t)n >= cap) {
+		out[0] = '\0';
+		return false;
+	}
+	for (char *c = out; *c != '\0'; c++) {
+		if (*c == '-') {
+			*c = '_';
+		} else if (*c >= 'a' && *c <= 'z') {
+			*c = (char)(*c - ('a' - 'A'));
+		} else if (!((*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_')) {
+			out[0] = '\0';
+			return false; // an id that cannot name an environment variable
+		}
+	}
+	return true;
+}
+
+const char *
+target_component_setting_resolve(const char *env_value,
+                                 const char *user_value,
+                                 const char *stored_value,
+                                 bool stored_is_manifest,
+                                 bool lock,
+                                 char *buf,
+                                 size_t cap,
+                                 uint32_t *out_source)
+{
+	uint32_t src = TARGET_COMPONENT_SETTING_ABSENT;
+	const char *ret = NULL;
+	if (buf == NULL || cap == 0) {
+		goto out;
+	}
+	buf[0] = '\0';
+	// 1. The environment always wins (u_setting rule) — a set-but-empty
+	//    variable is "unset", as the conversion read side always treated it.
+	if (env_value != NULL && env_value[0] != '\0') {
+		tc_copy(buf, cap, env_value);
+		src = TARGET_COMPONENT_SETTING_ENVIRONMENT;
+		ret = buf;
+		goto out;
+	}
+	// 2. The per-user store, unless the machine's policy lock hides it.
+	if (!lock && user_value != NULL) {
+		tc_copy(buf, cap, user_value);
+		src = TARGET_COMPONENT_SETTING_USER;
+		ret = buf;
+		goto out;
+	}
+	// 3. The machine store / the manifest.
+	if (stored_value != NULL) {
+		tc_copy(buf, cap, stored_value);
+		src = stored_is_manifest ? TARGET_COMPONENT_SETTING_MANIFEST : TARGET_COMPONENT_SETTING_MACHINE;
+		ret = buf;
+	}
+out:
+	if (out_source != NULL) {
+		*out_source = src;
+	}
+	return ret;
+}
+
+bool
+target_component_user_settings_json_lookup(const char *json_text, const char *key, char *buf, size_t cap)
+{
+	if (json_text == NULL || key == NULL || buf == NULL || cap == 0) {
+		return false;
+	}
+	buf[0] = '\0';
+	cJSON *root = cJSON_Parse(json_text);
+	if (root == NULL) {
+		return false;
+	}
+	bool ok = false;
+	if (cJSON_IsObject(root)) {
+		const cJSON *kv = NULL;
+		cJSON_ArrayForEach(kv, root)
+		{
+			if (kv->string == NULL || !tc_ci_equal(kv->string, key)) {
+				continue;
+			}
+			if (cJSON_IsString(kv) && kv->valuestring != NULL) {
+				tc_copy(buf, cap, kv->valuestring);
+				ok = true;
+			} else if (cJSON_IsBool(kv)) {
+				tc_copy(buf, cap, cJSON_IsTrue(kv) ? "1" : "0");
+				ok = true;
+			} else if (cJSON_IsNumber(kv)) {
+				snprintf(buf, cap, "%.17g", kv->valuedouble);
+				ok = true;
+			}
+			break;
+		}
+	}
+	cJSON_Delete(root);
+	return ok;
+}
+
+bool
+target_component_get_setting(const struct target_component_class *cls,
+                             const char *id,
+                             const char *key,
+                             char *buf,
+                             size_t cap,
+                             uint32_t *out_source)
+{
+	if (out_source != NULL) {
+		*out_source = TARGET_COMPONENT_SETTING_ABSENT;
+	}
+	if (buf == NULL || cap == 0) {
+		return false;
+	}
+	buf[0] = '\0';
+	if (cls == NULL || id == NULL || id[0] == '\0' || !target_component_setting_key_valid(key)) {
+		return false;
+	}
+
+	// Tier 1: the hosting process's environment, through u_setting's env
+	// reader (Windows getenv_s, Android debug.xrt.* properties, POSIX
+	// getenv) — an unmanaged name never touches u_setting's own stores.
+	char env_name[TARGET_COMPONENT_SETTING_ENV_MAX];
+	char env_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	const char *env_value = NULL;
+	if (target_component_setting_env_name(cls->env_class, id, key, env_name, sizeof(env_name))) {
+		enum u_setting_source us = U_SETTING_SOURCE_DEFAULT;
+		if (u_setting_get_raw(env_name, env_buf, sizeof(env_buf), &us) != NULL && us == U_SETTING_SOURCE_ENV) {
+			env_value = env_buf;
+		}
+	}
+
+	// Tiers 2 + 3, read only when needed (each is a registry / file read).
+	char user_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	char stored_buf[TARGET_COMPONENT_SETTING_VALUE_MAX];
+	const char *user_value = NULL;
+	const char *stored_value = NULL;
+	bool lock = false;
+	if (env_value == NULL || env_value[0] == '\0') {
+		lock = tc_store_lock(cls);
+		if (!lock && tc_store_read(cls, id, key, true, user_buf, sizeof(user_buf))) {
+			user_value = user_buf;
+		}
+		if (user_value == NULL && tc_store_read(cls, id, key, false, stored_buf, sizeof(stored_buf))) {
+			stored_value = stored_buf;
+		}
+	}
+#if defined(XRT_OS_WINDOWS)
+	const bool stored_is_manifest = false;
+#else
+	const bool stored_is_manifest = true;
+#endif
+	return target_component_setting_resolve(env_value, user_value, stored_value, stored_is_manifest, lock, buf, cap,
+	                                        out_source) != NULL;
+}
+
+enum target_component_store_result
+target_component_set_setting(
+    const struct target_component_class *cls, const char *id, const char *key, const char *value, bool machine)
+{
+	if (cls == NULL || id == NULL || id[0] == '\0' || !target_component_setting_key_valid(key) || value == NULL ||
+	    strlen(value) >= TARGET_COMPONENT_SETTING_VALUE_MAX) {
+		return TARGET_COMPONENT_STORE_FAILED;
+	}
+	char upper[TARGET_COMPONENT_SETTING_KEY_MAX];
+	tc_upper_copy(upper, sizeof(upper), key);
+	return tc_store_write(cls, id, upper, value, machine);
+}
+
+enum target_component_store_result
+target_component_unset_setting(const struct target_component_class *cls, const char *id, const char *key, bool machine)
+{
+	if (cls == NULL || id == NULL || id[0] == '\0' || !target_component_setting_key_valid(key)) {
+		return TARGET_COMPONENT_STORE_FAILED;
+	}
+	char upper[TARGET_COMPONENT_SETTING_KEY_MAX];
+	tc_upper_copy(upper, sizeof(upper), key);
+	return tc_store_write(cls, id, upper, NULL, machine);
+}
+
+int
+target_component_list_settings(const struct target_component_class *cls,
+                               const char *id,
+                               struct target_component_setting_view *out,
+                               int max)
+{
+	if (cls == NULL || id == NULL || out == NULL || max <= 0) {
+		return 0;
+	}
+	char keys[2 * TARGET_COMPONENT_MAX_SETTINGS][TARGET_COMPONENT_SETTING_KEY_MAX];
+	const int cap = (int)(sizeof(keys) / sizeof(keys[0]));
+	int n = tc_store_keys(cls, id, false, keys, cap);
+	n += tc_store_keys(cls, id, true, keys + n, cap - n);
+
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		if (!target_component_setting_key_valid(keys[i])) {
+			continue;
+		}
+		bool dup = false;
+		for (int j = 0; j < count; j++) {
+			if (tc_ci_equal(out[j].key, keys[i])) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup) {
+			continue;
+		}
+		struct target_component_setting_view *v = &out[count];
+		memset(v, 0, sizeof(*v));
+		tc_upper_copy(v->key, sizeof(v->key), keys[i]);
+		(void)target_component_get_setting(cls, id, v->key, v->value, sizeof(v->value), &v->source);
+		count++;
+	}
+	return count;
+}
+
+bool
+target_component_setting_store_path(
+    const struct target_component_class *cls, const char *id, bool machine, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	return tc_store_path(cls, id, machine, out, cap);
+}
+
+int
+target_component_manifest_settings_schema(const struct target_component_class *cls,
+                                          const char *id,
+                                          struct target_component_setting_desc *out,
+                                          int max)
+{
+	if (cls == NULL || id == NULL || out == NULL || max <= 0) {
+		return 0;
+	}
+	return tc_store_manifest_schema(cls, id, out, max);
+}
+
+int
+target_component_merge_setting_descs(struct target_component_setting_desc *out,
+                                     int existing,
+                                     int max,
+                                     const struct xrt_component_setting_desc *in,
+                                     uint32_t n)
+{
+	if (out == NULL || existing < 0 || existing > max) {
+		return existing;
+	}
+	int count = existing;
+	for (uint32_t i = 0; in != NULL && i < n && count < max; i++) {
+		const struct xrt_component_setting_desc *d = &in[i];
+		if (!target_component_setting_key_valid(d->key)) {
+			continue;
+		}
+		bool dup = false;
+		for (int j = 0; j < count; j++) {
+			if (tc_ci_equal(out[j].key, d->key)) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup) {
+			continue;
+		}
+		struct target_component_setting_desc *o = &out[count++];
+		memset(o, 0, sizeof(*o));
+		tc_upper_copy(o->key, sizeof(o->key), d->key);
+		tc_copy(o->type, sizeof(o->type), d->type);
+		tc_copy(o->default_value, sizeof(o->default_value), d->default_value);
+		tc_copy(o->help, sizeof(o->help), d->help);
+	}
+	return count;
 }
