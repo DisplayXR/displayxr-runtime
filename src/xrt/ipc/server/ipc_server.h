@@ -1052,6 +1052,25 @@ void
 ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn);
 
 /*!
+ * ADR-054 N3d (#2051): function pointer the IPC server calls for the DIAG
+ * RPC `system_request_component_reselect` — a component class's `Enabled` /
+ * `Preferred` policy was just written (`displayxr-cli dp|input|conv
+ * use|reset|enable|disable`); re-read it and re-select now, by that class's
+ * own lifetime rules (display: the debounced re-probe; input: an arbiter
+ * re-rank; conversion: next create re-selects). @p component_class is a
+ * `TARGET_COMPONENT_CLASS_*` id (target_component_loader.h). Returns
+ * XRT_SUCCESS when the request was queued, XRT_ERROR_FEATURE_NOT_SUPPORTED
+ * for an unknown class, XRT_ERROR_NOT_IMPLEMENTED when the service runs no
+ * watch (the CLI then says "applies at the next service start"). The
+ * standalone service registers it; nothing else does.
+ */
+typedef xrt_result_t (*ipc_server_component_reselect_fn)(uint32_t component_class);
+
+//! Register the component-reselect provider. Pass NULL to clear.
+void
+ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn);
+
+/*!
  * Display dashboard phase 8: function pointer the IPC server calls for the
  * DIAG RPC `system_workspace_launch` — spawn workspace controller
  * @p controller_id now, through the same path as the launch hotkey. Returns an

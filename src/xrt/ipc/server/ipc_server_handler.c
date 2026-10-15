@@ -474,11 +474,19 @@ ipc_server_request_workspace_summon(void)
 // system_reload_service_config / system_workspace_launch handlers).
 static ipc_server_service_config_reload_fn s_service_config_reload_provider = NULL;
 static ipc_server_workspace_launch_fn s_workspace_launch_provider = NULL;
+// ADR-054 N3d (#2051): the service's live re-select hook.
+static ipc_server_component_reselect_fn s_component_reselect_provider = NULL;
 
 void
 ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn)
 {
 	s_service_config_reload_provider = fn;
+}
+
+void
+ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn)
+{
+	s_component_reselect_provider = fn;
 }
 
 void
@@ -4564,6 +4572,28 @@ ipc_handle_system_request_display_reprobe(volatile struct ipc_client_state *ics)
 	ipc_server_request_display_reprobe("per-screen DP preference changed");
 #endif
 	return XRT_SUCCESS;
+}
+
+/*
+ * ADR-054 N3d (#2051): `displayxr-cli dp|input|conv use|reset|enable|disable`
+ * just wrote a class's Enabled / Preferred policy — re-select now rather than
+ * at the next service start. Session-free, DIAG only. The service's watch
+ * thread also catches edits made without the CLI; this is the no-wait path.
+ */
+xrt_result_t
+ipc_handle_system_request_component_reselect(volatile struct ipc_client_state *ics, uint32_t component_class)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_request_component_reselect");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_component_reselect_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	xret = s_component_reselect_provider(component_class);
+	IPC_INFO(ics->server, "system_request_component_reselect: class %u requested by pid %ld (%d).",
+	         (unsigned)component_class, (long)ics->client_state.pid, (int)xret);
+	return xret;
 }
 
 /*

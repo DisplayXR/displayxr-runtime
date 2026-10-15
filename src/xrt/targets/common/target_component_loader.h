@@ -90,6 +90,26 @@ enum target_plugin_manifest_kind
 enum target_plugin_manifest_kind
 target_plugin_classify_manifest(const char *filename);
 
+/*!
+ * The component classes the trunk knows (ADR-054 §2), as a stable id — what a
+ * class-generic verb or wire call names when it says "this class": the
+ * `system_request_component_reselect` DIAG call, the service's policy-store
+ * watch (`service_component_watch.h`). Never renumbered: the value crosses
+ * the IPC boundary. 0 is reserved for "no class".
+ */
+enum target_component_class_id
+{
+	TARGET_COMPONENT_CLASS_NONE = 0,
+	TARGET_COMPONENT_CLASS_DISPLAY = 1,    //!< display processors (ADR-019/020)
+	TARGET_COMPONENT_CLASS_INPUT = 2,      //!< input providers (ADR-034)
+	TARGET_COMPONENT_CLASS_CONVERSION = 3, //!< conversion providers (ADR-053)
+	TARGET_COMPONENT_CLASS_COUNT = 4,      //!< one past the last valid id
+};
+
+//! "display" / "input" / "conversion" / "none"; never NULL.
+const char *
+target_component_class_id_str(uint32_t class_id);
+
 //! Android library prefix of a display-processor plug-in (`libdxrp<NNN>_<id>.so`).
 #define TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY "libdxrp"
 //! Android library prefix of a conversion provider (`libdxrc<NNN>_<id>.so`, ADR-053).
