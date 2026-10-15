@@ -940,6 +940,18 @@ qwerty_system_remove(struct qwerty_system *qs, struct qwerty_device *qd)
 {
 	if (eq(qd, qs->hmd)) {
 		qs->hmd = NULL;
+		if (qs->controllers_private && qs->lctrl != NULL && qs->rctrl != NULL) {
+			// N7: nobody else holds the private pair, so its lifetime is
+			// the HMD's. Each destroy re-enters here; the second one finds
+			// every slot empty and frees @p qs — so nothing below may
+			// touch it.
+			struct xrt_device *left = &qs->lctrl->base.base;
+			struct xrt_device *right = &qs->rctrl->base.base;
+			qs->controllers_private = false;
+			xrt_device_destroy(&left);
+			xrt_device_destroy(&right);
+			return;
+		}
 	} else if (eq(qd, qs->lctrl)) {
 		qs->lctrl = NULL;
 	} else if (eq(qd, qs->rctrl)) {
