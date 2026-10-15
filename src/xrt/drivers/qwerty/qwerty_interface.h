@@ -199,6 +199,23 @@ qwerty_create_devices(enum u_logging_level log_level,
                       struct xrt_device **out_right);
 
 /*!
+ * Create the qwerty devices, publishing the emulated controller pair only
+ * when @p publish_controllers is true (ADR-054 N7, the `EmulatedControllers`
+ * gate). With it false, `*out_left` / `*out_right` are NULL: the caller gets
+ * the look-around HMD alone, and the pair — which the driver's input
+ * front-ends still require internally — stays private to the driver (in no
+ * device list, no role, freed with the HMD).
+ *
+ * @ingroup drv_qwerty
+ */
+xrt_result_t
+qwerty_create_devices_ex(enum u_logging_level log_level,
+                         bool publish_controllers,
+                         struct xrt_device **out_hmd,
+                         struct xrt_device **out_left,
+                         struct xrt_device **out_right);
+
+/*!
  * Get the current qwerty HMD pose without side effects.
  *
  * Finds the qwerty HMD in @p xdevs and returns its current internal

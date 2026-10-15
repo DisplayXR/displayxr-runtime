@@ -39,6 +39,13 @@ struct qwerty_system
 	struct qwerty_hmd *hmd;          //!< Can be NULL
 	struct qwerty_controller *lctrl; //!< Cannot be NULL
 	struct qwerty_controller *rctrl; //!< Cannot be NULL
+	/*!
+	 * ADR-054 N7 (`EmulatedControllers` = 0): the pair exists only because
+	 * the input front-ends address it — it was never handed to the caller
+	 * (`qwerty_create_devices_ex`), is in no device list and holds no role,
+	 * so the system destroys it itself when the HMD goes.
+	 */
+	bool controllers_private;
 	enum u_logging_level log_level;
 	bool process_keys;  //!< If false disable keyboard and mouse input
 	bool hmd_focused;   //!< For gui var tracking only, true if hmd is the focused device
