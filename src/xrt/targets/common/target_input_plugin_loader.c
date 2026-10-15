@@ -22,6 +22,7 @@
  */
 
 #include "target_input_plugin_loader.h"
+#include "target_input_arbiter.h"
 #include "target_component_loader.h"
 
 #include "xrt/xrt_input_plugin.h"
@@ -797,4 +798,104 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed)
 	if (out_failed != NULL) {
 		*out_failed = g_input_scan_failed;
 	}
+}
+
+int
+target_input_plugin_reread_policy(void)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	if (g_input_provider_count == 0) {
+		U_LOG_I(
+		    "input plugin loader: policy re-read — no resident provider; a newly enabled one loads at "
+		    "the next service start.");
+		return 0;
+	}
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n);
+	char preferred[64] = {0};
+	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
+
+	struct t_input_arbiter_rank ranks[TARGET_COMPONENT_MAX_ENTRIES];
+	int rank_count = 0;
+	for (int p = 0; p < g_input_provider_count; p++) {
+		struct input_provider_slot *slot = &g_input_providers[p];
+		const char *id = slot->iface != NULL ? slot->iface->id : NULL;
+		if (id == NULL) {
+			continue;
+		}
+		// A row gone from the store is treated as disabled: still resident
+		// (never unloaded), no longer a candidate.
+		bool enabled = false;
+		uint32_t priority = slot->probe_order;
+		for (int i = 0; i < n; i++) {
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 ||
+			    strcmp(entries[i].id, id) != 0) {
+				continue;
+			}
+			enabled = entries[i].enabled;
+			priority = entries[i].probe_order;
+			break;
+		}
+		if (have_pref && strcmp(id, preferred) == 0) {
+			priority = 0;
+		}
+		slot->probe_order = priority;
+		ranks[rank_count].id = id;
+		ranks[rank_count].priority = priority;
+		ranks[rank_count].enabled = enabled;
+		rank_count++;
+	}
+	// Say so when the preferred / re-enabled provider is not resident: the
+	// user's write is honoured only by a restart, and nothing else would tell.
+	for (int i = 0; i < n; i++) {
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || !entries[i].enabled) {
+			continue;
+		}
+		bool resident = false;
+		for (int p = 0; p < g_input_provider_count && !resident; p++) {
+			resident = g_input_providers[p].iface != NULL && g_input_providers[p].iface->id != NULL &&
+			           strcmp(g_input_providers[p].iface->id, entries[i].id) == 0;
+		}
+		if (!resident) {
+			// Once per process per id at WARN; INFO after — the policy is
+			// re-read on every store write of any class, and a provider
+			// that declined at scan would otherwise WARN on each of them.
+			static char logged[TARGET_COMPONENT_MAX_ENTRIES][64];
+			static int logged_count = 0;
+			bool first = true;
+			for (int k = 0; k < logged_count; k++) {
+				if (strcmp(logged[k], entries[i].id) == 0) {
+					first = false;
+					break;
+				}
+			}
+			if (first && logged_count < TARGET_COMPONENT_MAX_ENTRIES) {
+				snprintf(logged[logged_count], sizeof(logged[0]), "%s", entries[i].id);
+				logged_count++;
+			}
+			const char *pref = have_pref && strcmp(entries[i].id, preferred) == 0 ? " and preferred" : "";
+			if (first) {
+				U_LOG_W(
+				    "input plugin loader: '%s' is enabled%s but was not loaded by this process "
+				    "(disabled, unregistered or declined at scan) — it joins at the next service "
+				    "start.",
+				    entries[i].id, pref);
+			} else {
+				U_LOG_I(
+				    "input plugin loader: '%s' is enabled%s but not resident — joins at the next "
+				    "service start.",
+				    entries[i].id, pref);
+			}
+		}
+	}
+	free(entries);
+	const int changed = t_input_arbiter_rerank(ranks, rank_count);
+	U_LOG_W("input plugin loader: policy re-read — PreferredPlugin=%s, %d resident provider(s), %d re-ranked.",
+	        have_pref ? preferred : "<unset>", rank_count, changed);
+	return changed;
 }

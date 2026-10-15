@@ -194,6 +194,38 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd);
 void
 t_input_arbiter_get_status(bool *out_installed, bool *out_provider_holds_roles);
 
+/*!
+ * One provider's new standing for @ref t_input_arbiter_rerank: matched to
+ * the candidate whose `iface->id` is @p id.
+ */
+struct t_input_arbiter_rank
+{
+	const char *id;    //!< the provider's `xrt_input_plugin_iface::id`
+	uint32_t priority; //!< ascending = wins; 0 for the PreferredPlugin
+	bool enabled;      //!< false = withdrawn as a candidate (devices stay)
+};
+
+/*!
+ * ADR-054 N3d (#2051): live re-select on an `Enabled` / `PreferredPlugin`
+ * change. The provider set is fixed per process (devices are per
+ * `xrt_system_devices`, spec §3 "Lifetime"), so a policy change cannot add
+ * or remove a candidate — it re-RANKS them. For every provider candidate
+ * named in @p ranks: its priority becomes @p priority and it is withdrawn
+ * while `enabled` is false, exactly as presence loss withdraws it (the walks
+ * skip it; its devices stay resident in `xsysd->xdevs`; it is polled for
+ * presence throughout so re-enabling is instant). A candidate not named
+ * keeps its standing; qwerty is never named. The roles are then recomputed
+ * at once — not at the next `get_roles` — so `generation_id` moves (and the
+ * arbiter logs the new assignment) the moment the policy does, and every
+ * `xrSyncActions` client sees the flip on its next call.
+ *
+ * Returns the number of candidates whose priority or withdrawal changed;
+ * 0 when nothing moved or the arbiter is not installed. Callable from any
+ * thread (the service's policy watch thread calls it).
+ */
+int
+t_input_arbiter_rerank(const struct t_input_arbiter_rank *ranks, int count);
+
 #ifdef __cplusplus
 }
 #endif
