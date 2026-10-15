@@ -201,6 +201,9 @@ Confirm:
 - Assets contain `DisplayXRBundle-*.pkg` (macOS, non-zero size)
 - Assets contain `DisplayXRBundle-*.exe` (Windows, non-zero size)
 - Assets contain `DisplayXRBundle-*-linux-amd64.tar.gz` (non-zero size)
+- Assets contain `SHA256SUMS` (written by CI since DisplayXR/displayxr-installer#89; its `.exe`
+  line is for the unsigned exe until Step 4.5.3 refreshes it — an older release has none,
+  and Step 4.5.3 generates it)
 - Prerelease flag matches input (the gh field is `isPrerelease`, NOT `prerelease` —
   the latter is rejected as an invalid field and the whole query fails)
 
@@ -399,6 +402,62 @@ if [ "$SIGNED" = yes ]; then
 fi
 ```
 
+### Step 4.5.3: Refresh `SHA256SUMS` for the signed .exe (fail-soft)
+
+`publish-bundle.yml` attaches a `SHA256SUMS` (`sha256sum` format, bare filenames, order
+`.pkg`, `.exe`, `-linux-amd64.tar.gz`, `.apk`) — but CI hashed the **unsigned** exe, so
+the moment Step 4.5.2 uploads the signed one over it, the `.exe` line is wrong and
+`sha256sum -c SHA256SUMS` fails for every Windows downloader. Rewrite that one line from
+the signed file. Runs only when the signed upload landed (`SIGNED=yes`; the restore-unsigned
+path sets `SIGNED=no`, and then CI's line is still right). An older workflow published no
+`SHA256SUMS` — then generate the whole file from the four release assets. **Never fails the
+release:** every problem logs a `⚠ SHA256SUMS:` line and moves on; carry `SUMS` into the report.
+
+```bash
+SUMS="untouched (bundle not signed — CI's SHA256SUMS still matches the published .exe)"
+if [ "$SIGNED" = yes ]; then
+  R=DisplayXR/displayxr-installer; K="$D/sums"; rm -rf "$K"; mkdir -p "$K"
+  NEW=$(sha256sum "$SIGNED_EXE" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$NEW" ] || NEW=$(shasum -a 256 "$SIGNED_EXE" | cut -d' ' -f1)   # macOS has no sha256sum
+  if gh release download "$TAG" -R "$R" -p SHA256SUMS -D "$K" 2>/dev/null && [ -s "$K/SHA256SUMS" ]; then
+    if awk -v f="$EXE" '$2==f || $2=="*"f {n=1} END {exit !n}' "$K/SHA256SUMS"; then
+      # Replace ONLY the exe line, in place — keeps the other lines and their order.
+      awk -v f="$EXE" -v h="$NEW" '$2==f || $2=="*"f {print h"  "f; next} {print}' \
+        "$K/SHA256SUMS" > "$K/SHA256SUMS.new" && mv "$K/SHA256SUMS.new" "$K/SHA256SUMS"
+      SUMS="refreshed .exe line → $NEW"
+    else
+      echo "⚠ SHA256SUMS: no line for $EXE in the release's file — appending one"
+      printf '%s  %s\n' "$NEW" "$EXE" >> "$K/SHA256SUMS"; SUMS="appended .exe line → $NEW"
+    fi
+  else
+    # Older workflow (no SHA256SUMS asset): build it from all four assets, signed exe included.
+    echo "SHA256SUMS: not on $TAG — generating it from the release assets"
+    rm -f "$K/SHA256SUMS"
+    if gh release download "$TAG" -R "$R" -p 'DisplayXRBundle-*.pkg' -p 'DisplayXRBundle-*-linux-amd64.tar.gz' \
+         -p 'DisplayXR-Installer-*.apk' -D "$K/a" && cp "$SIGNED_EXE" "$K/a/$EXE"; then
+      ( cd "$K/a" && set -- DisplayXRBundle-*.pkg "$EXE" DisplayXRBundle-*-linux-amd64.tar.gz DisplayXR-Installer-*.apk
+        for f in "$@"; do [ -f "$f" ] || { echo "⚠ SHA256SUMS: $f missing — skipped"; continue; }
+          printf '%s  %s\n' "$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)" "$f"; done ) > "$K/SHA256SUMS"
+      SUMS="generated ($(wc -l < "$K/SHA256SUMS" | tr -d ' ') lines; release had none)"
+    else
+      echo "⚠ SHA256SUMS: could not download the release assets — leaving the release without one"
+    fi
+  fi
+  if [ -s "$K/SHA256SUMS" ]; then
+    echo "--- SHA256SUMS for $TAG ---"; cat "$K/SHA256SUMS"
+    if gh release upload "$TAG" "$K/SHA256SUMS" --clobber -R "$R"; then
+      echo "SHA256SUMS: $SUMS — uploaded"
+    else
+      echo "⚠ SHA256SUMS: upload failed — the release's file is stale for $EXE; re-upload $K/SHA256SUMS by hand"
+      SUMS="⚠ upload FAILED (stale for the .exe; file left at $K/SHA256SUMS)"
+    fi
+  else
+    SUMS="⚠ not refreshed (see log above)"
+  fi
+fi
+echo "SHA256SUMS: $SUMS"
+```
+
 Only the Windows `.exe` is covered; the macOS `.pkg` uses an Apple Developer ID
 cert + notarization (separate track). Carry `SIGNED` into the report.
 
@@ -421,7 +480,9 @@ Release:    https://github.com/DisplayXR/displayxr-installer/releases/tag/$TAG
 Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
             DisplayXRBundle-X.Y.Z-linux-amd64.tar.gz (~N MB)
+            SHA256SUMS
 Prerelease: true/false
+Checksums:  $SUMS
 Signing:    [signed → "bundle .exe signed on the provider runner (run $RID) and re-uploaded"] | [none → "⚠ bundle UNSIGNED — provider unreachable; set DXR_SIGN_REPO or ship unsigned"]  (macOS .pkg: unsigned, TODO)
 
 Source of truth verification:
