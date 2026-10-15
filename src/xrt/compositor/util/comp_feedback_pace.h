@@ -30,6 +30,15 @@
  *   return probe one level down. A re-escalation within two dwells of a probe
  *   is a failed probe and doubles the dwell (30 -> 60 -> 120 -> 300 s).
  * - DXR_LATE_WEAVE_AUTOBACKOFF=0 holds the latency at base.
+ * - @ref comp_fb_pace::banked (default 1) is how many levels slip escalation
+ *   may add above max(base, floor); the #2119 present_wait tier sets 0.
+ * - An optional measured FLOOR (#2119, @ref comp_fb_pace_set_floor) sits
+ *   under the slip machine: the effective latency is max(depth, floor), slip
+ *   escalation is capped at max(base, floor) + 1 and starts from the effective
+ *   latency, and a floor that falls counts as a return probe for the
+ *   failed-probe rule. The present_wait tier sets it from the measured
+ *   commit-to-glass lag (comp_late_weave_depth.h); the feedback-pacing path
+ *   leaves it at 0, which is the pre-#2119 behaviour exactly.
  * - Never resolved: three slips in a row before any wait has ever succeeded
  *   (no feedback is arriving at all) turns pacing off for the session — the
  *   present_wait tier's 3-timeouts rule.
@@ -65,13 +74,21 @@ enum comp_fb_pace_event
 	COMP_FB_PACE_SHALLOWER,
 	//! No feedback ever arrived: pacing off for the session.
 	COMP_FB_PACE_OFF,
+	//! A slipping window at the escalation cap: nothing changed (#2119 logs it).
+	COMP_FB_PACE_AT_CAP,
 };
 
 struct comp_fb_pace
 {
 	int base;  //!< configured latency (DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY)
-	int depth; //!< current latency: wait for commit N - depth
+	int depth; //!< slip-machine latency (effective = max(depth, floor))
+	int floor; //!< measured floor, 0 = none (#2119)
 	bool autobackoff;
+	//! Levels slip escalation may bank above max(base, floor): 1 (default,
+	//! the Windows "one banked token") or 0 (#2119 present_wait tier: a level
+	//! above the measured floor bought no frames on a GPU-jitter slipper at
+	//! 58 fps and cost a full period of weave->scanout residual).
+	int banked;
 	bool off;
 	bool ever_ok;
 	uint32_t slips_in_row;
@@ -100,7 +117,47 @@ comp_fb_pace_init(struct comp_fb_pace *p, int base, bool autobackoff)
 	p->base = base < 1 ? 1 : (base > COMP_FB_PACE_MAX_DEPTH ? COMP_FB_PACE_MAX_DEPTH : base);
 	p->depth = p->base;
 	p->autobackoff = autobackoff;
+	p->banked = 1;
 	p->dwell_ns = COMP_FB_PACE_DWELL_NS;
+}
+
+//! The latency actually paced at: max(depth, floor).
+static inline int
+comp_fb_pace_effective(const struct comp_fb_pace *p)
+{
+	if (p == NULL) {
+		return 1;
+	}
+	return p->floor > p->depth ? p->floor : p->depth;
+}
+
+/*!
+ * Set the measured floor (#2119), clamped to 0..MAX. A floor that lowers the
+ * effective latency is a return probe: a slip escalation within two dwells of
+ * it doubles the dwell, as for the slip machine's own probes.
+ *
+ * @return true when the effective latency changed.
+ */
+static inline bool
+comp_fb_pace_set_floor(struct comp_fb_pace *p, int floor, uint64_t now_ns)
+{
+	if (p == NULL) {
+		return false;
+	}
+	floor = floor < 0 ? 0 : (floor > COMP_FB_PACE_MAX_DEPTH ? COMP_FB_PACE_MAX_DEPTH : floor);
+	const int before = comp_fb_pace_effective(p);
+	p->floor = floor;
+	// A slip level at or under the floor buys nothing; let it be re-earned
+	// relative to the floor instead of resurfacing if the floor later falls.
+	if (floor >= p->depth) {
+		p->depth = p->base;
+	}
+	const int after = comp_fb_pace_effective(p);
+	if (after < before) {
+		p->last_change_ns = now_ns;
+		p->last_probe_ns = now_ns;
+	}
+	return after != before;
 }
 
 /*!
@@ -113,7 +170,7 @@ comp_fb_pace_wait_target(const struct comp_fb_pace *p, uint64_t last_commit_seq)
 	if (p == NULL || p->off || last_commit_seq == 0) {
 		return 0;
 	}
-	const uint64_t relax = (uint64_t)(p->depth - 1);
+	const uint64_t relax = (uint64_t)(comp_fb_pace_effective(p) - 1);
 	return last_commit_seq > relax ? last_commit_seq - relax : 0;
 }
 
@@ -166,21 +223,24 @@ comp_fb_pace_on_wait(struct comp_fb_pace *p, bool ok, uint64_t wait_ns, uint64_t
 	}
 
 	if (slipping) {
-		const int cap = p->base + 1 > COMP_FB_PACE_MAX_DEPTH ? COMP_FB_PACE_MAX_DEPTH : p->base + 1;
-		if (p->depth >= cap) {
-			return COMP_FB_PACE_NONE;
+		const int top = p->floor > p->base ? p->floor : p->base;
+		const int cap = top + p->banked > COMP_FB_PACE_MAX_DEPTH ? COMP_FB_PACE_MAX_DEPTH : top + p->banked;
+		const int eff = comp_fb_pace_effective(p);
+		if (eff >= cap) {
+			return COMP_FB_PACE_AT_CAP;
 		}
 		// Re-escalating soon after a probe: the probe failed.
 		if (p->last_probe_ns != 0 && now_ns - p->last_probe_ns < 2 * p->dwell_ns) {
 			p->dwell_ns = p->dwell_ns * 2 > COMP_FB_PACE_DWELL_MAX_NS ? COMP_FB_PACE_DWELL_MAX_NS
 			                                                          : p->dwell_ns * 2;
 		}
-		p->depth++;
+		// From the effective latency: a level under the floor buys nothing.
+		p->depth = eff + 1;
 		p->last_change_ns = now_ns;
 		return COMP_FB_PACE_DEEPER;
 	}
 
-	if (p->depth > p->base && p->clean_windows >= COMP_FB_PACE_CLEAN_WINDOWS &&
+	if (p->depth > p->base && p->depth > p->floor && p->clean_windows >= COMP_FB_PACE_CLEAN_WINDOWS &&
 	    now_ns - p->last_change_ns >= p->dwell_ns) {
 		p->depth--;
 		p->clean_windows = 0;
