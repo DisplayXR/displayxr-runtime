@@ -358,6 +358,25 @@ $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsI
               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Write-Output "ELEVATED: $isElevated (if true, the OpenXR and Vulkan loaders ignore their path env vars; HKLM is the only channel)"
 
+# ---- ADR-054 N7 (#2143): the EmulatedControllers gate must be absent or 1 ----
+# Every lane here runs with DXR_INPUT_PROVIDERS=0 and so relies on the qwerty
+# emulated pair for the hand roles. The gate is class policy the runtime reads
+# from the registry (InputProviders\Policy\EmulatedControllers, HKCU over
+# HKLM), so a box left with it off fails every action test with no obvious
+# cause. ASSERT, NEVER WRITE: this script deliberately does not own the gate —
+# a run killed mid-flight (the harness kills on timeout) must not be able to
+# leave it changed, which is the same reason the input suppression above is an
+# env var and not ForceQwerty.
+foreach ($hive in @("HKLM:", "HKCU:")) {
+  $gateKey = "$hive\SOFTWARE\DisplayXR\InputProviders\Policy"
+  $gate = Get-ItemProperty $gateKey -Name EmulatedControllers -ErrorAction SilentlyContinue
+  if ($null -ne $gate -and [int]$gate.EmulatedControllers -eq 0) {
+    $fix = if ($hive -eq "HKLM:") { "displayxr-cli input emulated on --machine" } else { "displayxr-cli input emulated on" }
+    throw "EmulatedControllers=0 under $gateKey - the CTS needs the qwerty emulated pair (hands on qwerty under DXR_INPUT_PROVIDERS=0). Run '$fix' (or delete the value) and retry; this script never writes it."
+  }
+}
+Write-Output "CHECKED  EmulatedControllers gate absent or 1 in HKLM + HKCU (the qwerty pair is available to the CTS)"
+
 $runStart = (Get-Date).AddSeconds(-5)   # slack for clock skew on the log stamps
 
 try {
