@@ -83,6 +83,13 @@ struct t_input_candidate
 	bool present;
 	bool have_verdict;
 	int64_t verdict_at_ns;
+
+	/*!
+	 * #2051: withdrawn by policy (`Enabled` = 0 written while the service
+	 * runs). Treated by every walk exactly like an absent verdict; the
+	 * presence poll keeps running so re-enabling is instant.
+	 */
+	bool withdrawn;
 };
 
 //! Slot order for t_input_candidate::ht_devices / ::ht_indices.
@@ -106,9 +113,18 @@ struct t_input_arbiter
 	//! BEFORE the providers it dereferences are freed.
 	void (*fallback_destroy)(struct xrt_system_devices *xsysd);
 
-	//! Candidates in priority order: providers first, qwerty last.
+	/*!
+	 * Candidates in NOTE order (the builder's insertion sort puts them in
+	 * priority order at build time). #2051: the array is never reordered
+	 * after install — the presence poll thread reads `candidates[i]` off
+	 * the lock — so a re-rank rewrites @ref order instead.
+	 */
 	struct t_input_candidate candidates[ARBITER_MAX_CANDIDATES];
 	int candidate_count;
+
+	//! The walk order: indices into @ref candidates, priority ascending
+	//! (ties keep note order). Rebuilt by rebuild_order_locked.
+	int order[ARBITER_MAX_CANDIDATES];
 
 	//! Index of the most recently noted candidate (insertion moves it),
 	//! for attaching hand-tracking devices. -1 = none.
@@ -214,11 +230,42 @@ candidate_name(const struct t_input_candidate *cand)
 
 //! Caller holds g_arb_mutex. #958: a PURE read of the cache the poll thread
 //! fills — no provider code runs here (and never on a client thread). Not-yet-
-//! verified reads as absent (matches PRESENCE_UNKNOWN).
+//! verified reads as absent (matches PRESENCE_UNKNOWN). #2051: a candidate
+//! withdrawn by policy reads as absent too.
 static bool
 candidate_is_present_locked(struct t_input_candidate *cand)
 {
+	if (cand->withdrawn) {
+		return false;
+	}
 	return cand->have_verdict ? cand->present : false;
+}
+
+//! The @p k'th candidate in walk (priority) order. Caller holds the mutex
+//! (or is the single-threaded builder path).
+static struct t_input_candidate *
+ranked_locked(int k)
+{
+	return &g_arb.candidates[g_arb.order[k]];
+}
+
+/*!
+ * Rebuild @ref t_input_arbiter::order: priority ascending, ties by note
+ * order (a stable insertion sort over at most 17 entries). Caller holds the
+ * mutex or is the builder path.
+ */
+static void
+rebuild_order_locked(void)
+{
+	const int n = g_arb.candidate_count;
+	for (int i = 0; i < n; i++) {
+		int pos = i;
+		while (pos > 0 && g_arb.candidates[g_arb.order[pos - 1]].priority > g_arb.candidates[i].priority) {
+			g_arb.order[pos] = g_arb.order[pos - 1];
+			pos--;
+		}
+		g_arb.order[pos] = i;
+	}
 }
 
 //! #958: write one candidate's fresh verdict into the cache under g_arb_mutex.
@@ -247,7 +294,7 @@ static struct t_input_candidate *
 pick_for_hand_locked(bool want_left)
 {
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		struct t_input_candidate *cand = &g_arb.candidates[i];
+		struct t_input_candidate *cand = ranked_locked(i);
 		int32_t index = want_left ? cand->left_index : cand->right_index;
 		if (index < 0) {
 			continue;
@@ -269,7 +316,7 @@ static int32_t
 pick_rig_locked(void)
 {
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		struct t_input_candidate *cand = &g_arb.candidates[i];
+		struct t_input_candidate *cand = ranked_locked(i);
 		if (cand->nav_index < 0) {
 			continue;
 		}
@@ -285,7 +332,7 @@ static int32_t
 pick_ht_slot_locked(int slot)
 {
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		struct t_input_candidate *cand = &g_arb.candidates[i];
+		struct t_input_candidate *cand = ranked_locked(i);
 		if (cand->ht_indices[slot] < 0) {
 			continue;
 		}
@@ -326,7 +373,7 @@ static bool
 provider_holds_roles_locked(void)
 {
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		struct t_input_candidate *cand = &g_arb.candidates[i];
+		struct t_input_candidate *cand = ranked_locked(i);
 		if (cand->iface == NULL) {
 			continue; // The qwerty floor is not a provider.
 		}
@@ -371,10 +418,11 @@ profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_devi
 
 	// The floor won: find the top-ranked provider candidate's device
 	// for this hand (either hand as a fallback — the profile is a
-	// device-class statement, not a handedness one).
+	// device-class statement, not a handedness one). #2051: a withdrawn
+	// provider is not "there" for an app any more than an unplugged one.
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		const struct t_input_candidate *cand = &g_arb.candidates[i];
-		if (cand->iface == NULL) {
+		const struct t_input_candidate *cand = ranked_locked(i);
+		if (cand->iface == NULL || cand->withdrawn) {
 			continue;
 		}
 		struct xrt_device *prov = want_left ? cand->left : cand->right;
@@ -551,6 +599,7 @@ t_input_arbiter_reset(void)
 	memset(&g_arb, 0, sizeof(g_arb));
 	g_arb.last_noted = -1;
 	g_arb.roles = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
+	rebuild_order_locked();
 	os_mutex_unlock(&g_arb_mutex);
 }
 
@@ -594,6 +643,7 @@ note_candidate(const struct xrt_input_plugin_iface *iface,
 	}
 	g_arb.candidate_count++;
 	g_arb.last_noted = pos;
+	rebuild_order_locked(); // note order == priority order at build time
 }
 
 void
@@ -790,4 +840,48 @@ t_input_arbiter_get_status(bool *out_installed, bool *out_provider_holds_roles)
 	if (out_provider_holds_roles != NULL) {
 		*out_provider_holds_roles = t_input_arbiter_provider_holds_roles();
 	}
+}
+
+int
+t_input_arbiter_rerank(const struct t_input_arbiter_rank *ranks, int count)
+{
+	if (ranks == NULL || count <= 0 || !g_arb_mutex_ready) {
+		return 0;
+	}
+	os_mutex_lock(&g_arb_mutex);
+	if (g_arb.xsysd == NULL) {
+		os_mutex_unlock(&g_arb_mutex);
+		return 0; // Not installed: nothing arbitrates, nothing to re-rank.
+	}
+	int changed = 0;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->iface == NULL || cand->iface->id == NULL) {
+			continue; // qwerty: never ranked by policy
+		}
+		for (int k = 0; k < count; k++) {
+			if (ranks[k].id == NULL || strcmp(ranks[k].id, cand->iface->id) != 0) {
+				continue;
+			}
+			const bool withdraw = !ranks[k].enabled;
+			if (cand->priority != ranks[k].priority || cand->withdrawn != withdraw) {
+				U_LOG_W("input arbiter: '%s' priority %u -> %u%s.", candidate_name(cand),
+				        (unsigned)cand->priority, (unsigned)ranks[k].priority,
+				        withdraw != cand->withdrawn
+				            ? (withdraw ? ", WITHDRAWN (Enabled = 0; devices stay resident)"
+				                        : ", re-admitted (Enabled = 1)")
+				            : "");
+				cand->priority = ranks[k].priority;
+				cand->withdrawn = withdraw;
+				changed++;
+			}
+			break;
+		}
+	}
+	if (changed > 0) {
+		rebuild_order_locked();
+		refresh_roles_locked(); // bumps generation_id and logs when the assignment moved
+	}
+	os_mutex_unlock(&g_arb_mutex);
+	return changed;
 }

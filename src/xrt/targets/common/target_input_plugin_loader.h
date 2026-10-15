@@ -194,6 +194,23 @@ bool
 target_input_plugin_get_preferred(char *out, size_t cap);
 
 /*!
+ * ADR-054 N3d (#2051): re-read the class's policy — `PreferredPlugin` (HKCU
+ * then HKLM / the `input-preferred` file) and every registered row's
+ * `Enabled` (HKLM with the HKCU overlay / the manifest) — and re-rank the
+ * resident providers with it (@ref t_input_arbiter_rerank): the preferred
+ * one to priority 0, the rest to their ProbeOrder, a disabled one withdrawn.
+ * The loader's own ranked table follows, so `get_priority(i)` and `info`
+ * agree with the arbiter. What it cannot do: load a provider that was
+ * disabled (or unregistered) when this process scanned — the provider set is
+ * fixed per process, so enabling one of those still takes a restart, which
+ * the log says. Returns the number of candidates whose standing changed.
+ * Runs discovery first if nothing did yet; a no-op (0) when no provider is
+ * resident. Any thread.
+ */
+int
+target_input_plugin_reread_policy(void);
+
+/*!
  * Publish the active display processor's nominal panel + viewer geometry to
  * input providers (#1380).
  *

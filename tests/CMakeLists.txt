@@ -103,6 +103,7 @@ set(tests
     tests_oxr_tracking_properties_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
+    tests_input_arbiter_rerank
     tests_sim_input_nav
     tests_comp_layer_view_camera
     tests_comp_color_policy
@@ -725,6 +726,17 @@ target_include_directories(
 	tests_input_arbiter_rig PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_input_arbiter_rig PRIVATE xrt-interfaces aux_os)
+
+# ADR-054 N3d (#2051) — the arbiter's live re-rank: a PreferredPlugin flip and
+# an Enabled = 0 withdrawal move the roles at once and bump generation_id.
+# Same shape as tests_input_arbiter_rig (the arbiter compiled straight in).
+target_sources(
+	tests_input_arbiter_rerank PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_rerank PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_rerank PRIVATE xrt-interfaces aux_os)
 
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point
