@@ -79,6 +79,18 @@ COMPONENT_INSTALL_MARKER_MACOS_leia_plugin=""
 COMPONENT_INSTALL_MARKER_WINDOWS_leia_plugin="HKLM\\Software\\DisplayXR\\DisplayProcessors\\leia-sr"
 COMPONENT_INSTALL_MARKER_LINUX_leia_plugin="/usr/lib/displayxr/plugins/050-leia-sr.json"
 
+# --- conversion_open ---
+# Open-model conversion provider (ADR-053 P4). Windows: DisplayXROpenConversionSetup-*.exe
+# (registers ConversionProviders\open-conversion). Linux: a per-user tarball with its own
+# install.sh, not a .deb, so the .deb glob is empty here (warn-and-skip). No macOS build yet.
+COMPONENT_REPO_conversion_open="DisplayXR/displayxr-conversion-open"
+COMPONENT_PKG_MACOS_conversion_open=""
+COMPONENT_EXE_WINDOWS_conversion_open="DisplayXROpenConversionSetup-*.exe"
+COMPONENT_DEB_LINUX_conversion_open=""
+COMPONENT_INSTALL_MARKER_MACOS_conversion_open=""
+COMPONENT_INSTALL_MARKER_WINDOWS_conversion_open="HKLM\Software\DisplayXR\ConversionProviders\open-conversion"
+COMPONENT_INSTALL_MARKER_LINUX_conversion_open=""
+
 # --- mcp_tools ---
 # displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg
 # (productbuild). On macOS the postinstall flips the capability bit at

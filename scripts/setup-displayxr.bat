@@ -11,7 +11,7 @@ REM same default-install semantics, same warn-and-skip pattern for
 REM components whose pinned release has no Windows asset attached.
 REM
 REM Usage:
-REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia
+REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia + open conversion
 REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Tools
 REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (opt-in)
 REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
@@ -43,6 +43,13 @@ set "COMPONENT_MARKER_shell=HKLM\Software\DisplayXR\WorkspaceControllers\shell"
 set "COMPONENT_REPO_leia_plugin=DisplayXR/displayxr-leia-plugin"
 set "COMPONENT_EXE_leia_plugin=DisplayXRLeiaSRSetup-*.exe"
 set "COMPONENT_MARKER_leia_plugin=HKLM\Software\DisplayXR\DisplayProcessors\leia-sr"
+
+REM Open-model conversion provider (ADR-053 P4): the conversion provider every box gets
+REM without a vendor module. Registers HKLM\...\ConversionProviders\open-conversion; models
+REM are fetched by the runtime model store on first use, not by this installer.
+set "COMPONENT_REPO_conversion_open=DisplayXR/displayxr-conversion-open"
+set "COMPONENT_EXE_conversion_open=DisplayXROpenConversionSetup-*.exe"
+set "COMPONENT_MARKER_conversion_open=HKLM\Software\DisplayXR\ConversionProviders\open-conversion"
 
 set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
@@ -167,6 +174,7 @@ REM --- Read pins from versions.json ---
 call :read_pin runtime RUNTIME_TAG
 call :read_pin shell SHELL_TAG
 call :read_pin leia_plugin LEIA_TAG
+call :read_pin conversion_open CONVOPEN_TAG
 call :read_pin mcp_tools MCP_TAG
 call :read_pin browser BROWSER_TAG
 
@@ -174,10 +182,11 @@ REM --- Staging dir ---
 set "STAGING=%TEMP%\dxr-setup-%RANDOM%%RANDOM%"
 if "%DRY_RUN%"=="0" mkdir "%STAGING%" 2>nul
 
-REM --- Per-component install loop (runtime, shell, leia always; mcp opt-in) ---
+REM --- Per-component install loop (runtime, shell, leia, open conversion always; mcp opt-in) ---
 call :install_component runtime "%RUNTIME_TAG%"
 call :install_component shell "%SHELL_TAG%"
 call :install_component leia_plugin "%LEIA_TAG%"
+call :install_component conversion_open "%CONVOPEN_TAG%"
 if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
 if "%WITH_BROWSER%"=="1" call :install_component browser "%BROWSER_TAG%"
 
