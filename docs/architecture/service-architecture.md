@@ -405,6 +405,7 @@ Each reply is a fixed-size struct by value (the `system_enumerate_displays` mech
 carries the generation it belongs to, so a reader that straddles a rebuild refetches.
 `compositor_get_segment_metrics` stays own-session. Consumers: `displayxr-cli status`
 (`--watch` holds one DIAG slot and polls the counters), the Dashboard through it, MCP
+(Writes go the other way round: the Dashboard never talks to the service or the registry itself — a component's Enabled / Preferred change is one `displayxr-cli dp|input|conv …` invocation, which writes the policy store and pokes the service's component watch, ADR-054 N3d/N3e.)
 `get_status_snapshot` through the CLI.
 
 ---

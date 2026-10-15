@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using DisplayXR.Dashboard.Feed;
@@ -156,6 +157,59 @@ public sealed class DashboardContext
         }
     }
 
+    // ADR-054 N3e: the per-class policy (`dp|input|conv list --json`) the Components
+    // page's controls read and, after every write, re-read. One read per class at a
+    // time; never polled (dp / input list load every component headlessly, ~10 s).
+    private readonly Dictionary<ComponentClass, PolicyList> _policies = new();
+    private readonly Dictionary<ComponentClass, string> _policyErrors = new();
+    private readonly Dictionary<ComponentClass, DateTime> _policyWhen = new();
+    private readonly HashSet<ComponentClass> _policyLoading = new();
+    private readonly HashSet<ComponentClass> _policyReloadPending = new();
+    private readonly HashSet<ComponentClass> _policyUnsupported = new();
+
+    public IReadOnlyDictionary<ComponentClass, PolicyList> Policies => _policies;
+    public bool PolicyLoading(ComponentClass c) => _policyLoading.Contains(c);
+    public string? PolicyError(ComponentClass c) => _policyErrors.TryGetValue(c, out var e) ? e : null;
+    /// <summary>The CLI has no <c>&lt;class&gt; list --json</c> (predates N3): the controls stay hidden.</summary>
+    public bool PolicyUnsupported(ComponentClass c) => _policyUnsupported.Contains(c);
+
+    /// <summary>
+    /// <c>&lt;class&gt; list --json</c>: on Components show when older than 30 s, forced after a
+    /// change. What the page shows is what the CLI resolved, never what the click assumed.
+    /// </summary>
+    public async Task LoadPolicyAsync(ComponentClass cls, bool force = false, TimeSpan? maxAge = null)
+    {
+        if (_policyLoading.Contains(cls))
+        {
+            if (force) _policyReloadPending.Add(cls);
+            return;
+        }
+        if (!force && _policyWhen.TryGetValue(cls, out var t) && DateTime.Now - t < (maxAge ?? TimeSpan.FromSeconds(30))) return;
+        _policyLoading.Add(cls);
+        Bump();
+        try
+        {
+            string verb = $"{cls.Verb()} list --json";
+            var r = await Cli.RunAsync(verb, InfoTimeout);
+            if (r.Ok && PolicyList.TryParse(cls, r.Json, out var list))
+            {
+                _policies[cls] = list!;
+                _policyErrors.Remove(cls);
+                _policyUnsupported.Remove(cls);
+            }
+            else if (r.Started && !r.TimedOut && !r.Ok && r.Stdout.Length == 0)
+            {
+                _policyUnsupported.Add(cls); // unknown verb: an older CLI
+            }
+            else _policyErrors[cls] = r.Ok ? $"Could not read 'displayxr-cli {verb}'." : r.Summary;
+            _policyWhen[cls] = DateTime.Now;
+        }
+        catch (Exception ex) { _policyErrors[cls] = ex.Message; DashboardLog.Error(cls.Verb() + " list", ex); }
+        finally { _policyLoading.Remove(cls); }
+        Bump();
+        if (_policyReloadPending.Remove(cls)) await LoadPolicyAsync(cls, force: true);
+    }
+
     public bool DpLoading { get; private set; }
     private DateTime? _dpWhen;
     private bool _dpReloadPending;
@@ -306,6 +360,13 @@ public sealed class DashboardContext
         if (area is "dp" or "screen-dp") await LoadDpAsync(force: true);
         if (area == "workspace") await LoadWorkspaceAsync(force: true);
         if (area == "runtime") await LoadInfoAsync(force: true);
+        // ADR-054 N3e: a policy write re-reads that class (and the DP list the Displays page shares).
+        foreach (var c in ComponentClasses.All)
+            if (area == PolicyCommands.Area(c))
+            {
+                await LoadPolicyAsync(c, force: true);
+                if (c == ComponentClass.Display) await LoadDpAsync(force: true);
+            }
     }
 
     private static string Tail(string s) => s.Length <= 400 ? s : s[^400..];

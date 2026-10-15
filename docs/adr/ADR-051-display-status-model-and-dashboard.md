@@ -244,3 +244,28 @@ vendor executable name.
   a mixed-vendor box has two of them, and the runtime view (claims, DPs, segments,
   clients) is the runtime's to show. Each side shows one cell of the other's data and
   links across.
+
+## Amendment 1 — component policy controls (ADR-054 N3e, #2052)
+
+D4 said the CLI is the brain and the panel a renderer; ADR-054 decision 6 said the
+dashboard drives every change through the CLI. Step N3e makes the Components page
+**write** for the first time outside workspace launch settings, and keeps both rules:
+
+- Every display processor, input provider and conversion provider row carries an
+  **Enabled** toggle and a **Preferred** control (global for display and input,
+  per task for conversion). Each one runs exactly one `displayxr-cli` line —
+  `dp|input|conv enable|disable <id>`, `dp|input use <id>` / `reset`,
+  `conv use <task> <id>` / `conv reset <task>|all` — logged in the dashboard's log
+  pane, then re-reads that class's `list --json`. What the row shows afterwards is
+  what the CLI resolved (`enabled` + `enabled_source`, `preferred`, `provenance`),
+  never what the click assumed.
+- Per user by default. The dashboard runs non-elevated by design, so machine-wide
+  (`--machine`) writes are offered only when it happens to run elevated; otherwise
+  the row shows the `--machine` command for an administrator and attempts nothing.
+- The rows are joined by registration id onto the sections the status snapshot and
+  `info --json` already build; a CLI without the N3 verbs (no `enabled_source` in
+  its rows) shows no controls and loses nothing. Still zero `Microsoft.Win32`
+  references in the dashboard.
+- Vocabulary: "display processor", "input provider", "conversion provider" in every
+  dashboard string (the ADR-054 N3 line); no "plug-in" / "driver".
+- The Options drawer (per-class options contract, N3c #2050) lands with its CLI verbs.

@@ -33,7 +33,14 @@ public sealed class ComponentsPage : Page
     {
         _ = Ctx.LoadInfoAsync(force: false);
         _ = Ctx.LoadWorkspaceAsync();
+        // ADR-054 N3e: the policy rows behind the Enabled / Preferred controls.
+        foreach (var c in ComponentClasses.All) _ = Ctx.LoadPolicyAsync(c);
     }
+
+    // ADR-054 N3e: machine-wide (--machine) writes, offered only to an elevated dashboard;
+    // and the row the last policy action was run for, so its CLI reply shows under it.
+    private bool _machine;
+    private string? _policyActionRow;
 
     // Hotkey capture: the controller being captured, and the last capture's note.
     private string? _capturing;
@@ -64,7 +71,7 @@ public sealed class ComponentsPage : Page
     }
 
     private IReadOnlyList<ComponentSection> Sections() =>
-        Components.Build(Ctx.Feed.Snapshot, Ctx.Info?.Components, Ctx.Workspace);
+        Components.Build(Ctx.Feed.Snapshot, Ctx.Info?.Components, Ctx.Workspace, Ctx.Policies);
 
     protected override string Key()
     {
@@ -72,10 +79,16 @@ public sealed class ComponentsPage : Page
         sb.Append(Ctx.InfoLoading).Append(Ctx.InfoError).Append(string.Join(",", _expanded)).Append('|')
           .Append(Ctx.ActionRunning).Append(_captureNoteFor).Append(_captureNote).Append('|');
         if (Ctx.LastActionArea == "workspace") sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
+        foreach (var c in ComponentClasses.All)
+        {
+            sb.Append(Ctx.PolicyLoading(c)).Append(Ctx.PolicyUnsupported(c)).Append(Ctx.PolicyError(c));
+            if (Ctx.LastActionArea == PolicyCommands.Area(c)) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed).Append(_policyActionRow);
+        }
+        sb.Append(_machine).Append('|');
         foreach (var s in Sections())
         {
             sb.Append(s.Id).Append(s.Count).Append(s.Connected).Append(s.ConnectedLine);
-            foreach (var i in s.Items) sb.Append(i.Name).Append(i.Level).Append(string.Join("/", i.Chips)).Append(string.Join("/", i.Lines)).Append(i.Controller?.Launch);
+            foreach (var i in s.Items) sb.Append(i.Name).Append(i.Level).Append(string.Join("/", i.Chips)).Append(string.Join("/", i.Lines)).Append(i.Controller?.Launch).Append(i.Policy);
             sb.Append(';');
         }
         return sb.ToString();
@@ -121,6 +134,7 @@ public sealed class ComponentsPage : Page
                 if (i > 0) list.Children.Add(new Border { Height = 12 });
                 list.Children.Add(ItemRow(s.Items[i]));
                 if (s.Items[i].Controller is { Launch: not null } rc) list.Children.Add(LaunchRow(rc));
+                if (s.Items[i].Policy is { } pr && Ctx.Policies.TryGetValue(pr.Class, out var pl) && pl.Writable) list.Children.Add(PolicyControls(pr, pl));
             }
             body.Children.Add(list);
             if (s.Collapsed) body.Children.Add(U.Button("Hide", () => Toggle(s.Id), "link"));
@@ -130,7 +144,7 @@ public sealed class ComponentsPage : Page
 
     private static string EmptyText(ComponentSection s) => s.Id switch
     {
-        "display_processors" => "No display-processor plug-in is registered.",
+        "display_processors" => "No display processor is registered.",
         "workspace_controller" => "No workspace controller is registered or connected.",
         "present_owners" => "No present owner is connected.",
         "input_providers" => "No input provider reported.",
@@ -267,6 +281,111 @@ public sealed class ComponentsPage : Page
         if (Ctx.LastActionArea == "workspace" && Ctx.LastAction is { } la && Ctx.LastActionFailed)
             col.Children.Add(U.Wrapped(la, "soft"));
         var box = new Border { Child = col, Margin = new Thickness(22, 10, 0, 0) };
+        box.Classes.Add("field");
+        return box;
+    }
+
+    /// <summary>
+    /// ADR-054 N3e: Enabled and Preferred for one display processor / input provider /
+    /// conversion provider. Every change is a `displayxr-cli` write (logged, visible in the
+    /// log pane); the row is then re-read from `&lt;class&gt; list --json`. Per user unless the
+    /// dashboard runs elevated and "Machine-wide" is ticked; a non-elevated dashboard shows the
+    /// `--machine` command for an administrator instead of attempting it.
+    /// </summary>
+    private Control PolicyControls(PolicyRow r, PolicyList list)
+    {
+        var cls = r.Class;
+        string area = PolicyCommands.Area(cls);
+        bool busy = Ctx.ActionRunning;
+        bool elevated = Elevation.IsElevated;
+        bool machine = _machine && elevated;
+        var row = U.Flow(10, 6);
+
+        void Run(string command)
+        {
+            _policyActionRow = r.Id;
+            _ = Ctx.RunActionsAsync(area, command);
+        }
+
+        // (a) Enabled.
+        if (r.EnabledKnown)
+        {
+            var enabled = new CheckBox { Content = "Enabled", IsChecked = r.Enabled, IsEnabled = !busy && !r.Untrusted, VerticalAlignment = VerticalAlignment.Center };
+            Avalonia.Automation.AutomationProperties.SetName(enabled, $"Enabled: {r.Name}");
+            ToolTip.SetTip(enabled, r.Untrusted
+                ? "Refused by the provenance gate: allowlist the binary first (the runtime log names the row to write)."
+                : $"displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, machine) : PolicyCommands.Enable(cls, r.Id, machine))}");
+            enabled.IsCheckedChanged += (_, _) =>
+            {
+                if (Ctx.ActionRunning) return;
+                bool on = enabled.IsChecked == true;
+                if (on == r.Enabled) return;
+                Run(on ? PolicyCommands.Enable(cls, r.Id, machine) : PolicyCommands.Disable(cls, r.Id, machine));
+            };
+            U.AddFlow(row, enabled, 10, 6);
+        }
+
+        // (b) Preferred: global for display / input, per task for conversion.
+        if (cls != ComponentClass.Conversion)
+        {
+            if (r.Preferred)
+            {
+                U.AddFlow(row, U.Chip("preferred", Level.Info), 10, 6);
+                var reset = U.Button("Reset preference", () => Run(PolicyCommands.Reset(cls, machine)), "quiet", "sm");
+                reset.IsEnabled = !busy;
+                ToolTip.SetTip(reset, $"displayxr-cli {PolicyCommands.Reset(cls, machine)}");
+                U.AddFlow(row, reset, 10, 6);
+            }
+            else
+            {
+                var prefer = U.Button("Prefer", () => Run(PolicyCommands.Prefer(cls, r.Id, machine)), "quiet", "sm");
+                prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted;
+                ToolTip.SetTip(prefer, $"Rank this {cls.Noun()} first: displayxr-cli {PolicyCommands.Prefer(cls, r.Id, machine)}");
+                U.AddFlow(row, prefer, 10, 6);
+            }
+        }
+        else
+        {
+            foreach (var task in list.TasksOf(r.Id).Select(t => t.Task).Distinct())
+            {
+                bool mine = list.PreferredByTask.TryGetValue(task, out var pref)
+                            && (pref == r.Id || pref.StartsWith(r.Id + "/", System.StringComparison.Ordinal));
+                if (mine)
+                {
+                    U.AddFlow(row, U.Chip($"preferred for {task}", Level.Info), 10, 6);
+                    var reset = U.Button($"Reset {task}", () => Run(PolicyCommands.ResetTask(task, machine)), "quiet", "sm");
+                    reset.IsEnabled = !busy;
+                    ToolTip.SetTip(reset, $"displayxr-cli {PolicyCommands.ResetTask(task, machine)}");
+                    U.AddFlow(row, reset, 10, 6);
+                }
+                else
+                {
+                    var prefer = U.Button($"Prefer for {task}", () => Run(PolicyCommands.PreferTask(task, r.Id, machine)), "quiet", "sm");
+                    prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted;
+                    ToolTip.SetTip(prefer, $"displayxr-cli {PolicyCommands.PreferTask(task, r.Id, machine)}");
+                    U.AddFlow(row, prefer, 10, 6);
+                }
+            }
+        }
+
+        // (c) scope: machine-wide only when elevated (the dashboard runs non-elevated by design).
+        if (elevated)
+        {
+            var mw = new CheckBox { Content = "Machine-wide", IsChecked = _machine, IsEnabled = !busy, VerticalAlignment = VerticalAlignment.Center };
+            ToolTip.SetTip(mw, "Write the machine-wide (HKLM) value instead of this user's. Available because the dashboard is running elevated.");
+            mw.IsCheckedChanged += (_, _) => { _machine = mw.IsChecked == true; Update(force: true); };
+            U.AddFlow(row, mw, 10, 6);
+        }
+
+        // (d) what a change means, and how an administrator does it machine-wide.
+        var col = U.VStack(6, row);
+        string scope = machine ? "Machine-wide." : elevated ? "Per user." : "Per user; machine-wide needs an administrator prompt.";
+        col.Children.Add(U.Wrapped($"{scope} {cls.AppliesNote()}", "meta"));
+        if (!elevated && r.EnabledKnown)
+            col.Children.Add(U.Wrapped($"Machine-wide: displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, true) : PolicyCommands.Enable(cls, r.Id, true))}", "mono"));
+        if (Ctx.LastActionArea == area && _policyActionRow == r.Id && Ctx.LastAction is { } la)
+            col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("POLICY", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        var box = new Border { Child = col, Margin = new Thickness(22, 8, 0, 0) };
         box.Classes.Add("field");
         return box;
     }

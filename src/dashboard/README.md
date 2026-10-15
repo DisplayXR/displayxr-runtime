@@ -13,7 +13,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
-| Components | the status feed (clients by class); `info --json`; `workspace list --json` | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>` |
+| Components | the status feed (clients by class); `info --json`; `workspace list --json`; `dp\|input\|conv list --json` (ADR-054 N3e) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise the command is shown for an administrator) |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
 
@@ -114,7 +114,9 @@ parts (the job object, raising the first instance) are no-ops there.
 ## Layout of the code
 
 - `Model/` — pure: the snapshot and CLI JSON models (tolerant readers, every key
-  optional), `StatusText` (every string a page shows), `DesktopMapGeometry`.
+  optional), `StatusText` (every string a page shows), `DesktopMapGeometry`,
+  `ComponentPolicy` (the per-class Enabled / Preferred rows of `dp|input|conv list --json`
+  and the CLI lines the Components controls run — ADR-054 N3e).
 - `Feed/` — `StatusFeed` (the state machine above, single-threaded on a scheduler),
   `CliProcessSource` (the real CLI), `FixtureProcessSource`, the job object, the vendor
   dashboard launcher (D7: the command line is never parsed).

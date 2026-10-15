@@ -149,7 +149,7 @@ public sealed record LiftModule(bool Probed, bool Malformed, string? Backend, lo
 
 /// <summary>One row of a Components section.</summary>
 public sealed record ComponentItem(string Name, Level Level, IReadOnlyList<(string Text, Level Level)> Chips, IReadOnlyList<string> Lines,
-                                   RegisteredController? Controller = null);
+                                   RegisteredController? Controller = null, PolicyRow? Policy = null);
 
 /// <summary>One role: what it is, how many are registered / connected, and its rows.</summary>
 public sealed record ComponentSection(string Id, string Title, string Role, int Count, int Connected,
@@ -169,30 +169,34 @@ public static class Components
     private static string Plural(int n, string one, string many) => StatusText.Plural(n, one, many);
 
     /// <summary>Every section, in page order. Sections whose source is absent are omitted (stereo camera).</summary>
-    public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info, WorkspaceList? workspace = null)
+    public static IReadOnlyList<ComponentSection> Build(StatusSnapshot? s, InfoComponents? info, WorkspaceList? workspace = null,
+                                                        IReadOnlyDictionary<ComponentClass, PolicyList>? policies = null)
     {
         info ??= InfoComponents.Empty;
+        // ADR-054 N3e: the per-class policy (`dp|input|conv list --json`) joins the rows by id.
+        static PolicyList? Of(IReadOnlyDictionary<ComponentClass, PolicyList>? d, ComponentClass c) =>
+            d is not null && d.TryGetValue(c, out var l) ? l : null;
         // `workspace list --json` (live connected / pid / launch) supersedes info's copy of the same array.
         if (workspace is not null)
             info = info with { WorkspaceControllers = workspace.Controllers, WorkspaceControllersKnown = true };
         var list = new List<ComponentSection>
         {
-            DisplayProcessors(s),
+            DisplayProcessors(s, Of(policies, ComponentClass.Display)),
             WorkspaceController(s, info),
             ByClass(s, "present_owners", "Present owners", PresentOwnerClass,
                 "A present owner presents its own window (a browser, a capture app) while the runtime weaves into it."),
-            InputProviders(info),
+            InputProviders(info, Of(policies, ComponentClass.Input)),
             Conversion(info),
         };
         // ADR-053: only from a CLI whose snapshot carries the conversion rows.
-        if (s is { ConvKnown: true }) list.Add(ConversionProviders(s));
+        if (s is { ConvKnown: true }) list.Add(ConversionProviders(s, Of(policies, ComponentClass.Conversion)));
         if (StereoCamera(info) is { } cam) list.Add(cam);
         list.Add(ByClass(s, "diagnostics", "Diagnostics clients", DiagClass,
             "Read-only status readers, such as this dashboard's own status feed and the CLI.", collapsed: true));
         return list;
     }
 
-    public static ComponentSection DisplayProcessors(StatusSnapshot? s)
+    public static ComponentSection DisplayProcessors(StatusSnapshot? s, PolicyList? policy = null)
     {
         var items = new List<ComponentItem>();
         int active = 0;
@@ -206,6 +210,8 @@ public static class Components
                 (p.PlatformState, StatusText.PluginLevel(p) is Level.Ok or Level.Plain ? Level.Plain : StatusText.PluginLevel(p)),
             };
             if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
+            var pol = policy?.Row(p.Id);
+            AddPolicyChips(chips, pol);
             var claims = s!.Screens.Where(x => x.Claim.PluginId == p.Id).Select(x =>
                 $"{(StatusText.ShortDevice(x.DeviceName) is { Length: > 0 } d ? d : StatusText.ScreenName(x))} ({x.Claim.Confidence})").ToList();
             var lines = new List<string>
@@ -215,10 +221,10 @@ public static class Components
                 claims.Count > 0 ? "Claims " + string.Join(", ", claims) : "Claims no screen",
             };
             if (p.Hint.Length > 0) lines.Add(p.Hint);
-            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips, lines));
+            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, StatusText.PluginLevel(p), chips, lines, Policy: pol));
         }
         return new ComponentSection("display_processors", "Display processors",
-            "A display processor turns the views an app renders into what one kind of 3D display shows; each is a plug-in that claims the screens it drives.",
+            "A display processor turns the views an app renders into what one kind of 3D display shows; each claims the screens it drives.",
             items.Count, active, $"{Plural(items.Count, "registered", "registered")}{Sep}{active} active", items);
     }
 
@@ -304,14 +310,35 @@ public static class Components
             items, collapsed);
     }
 
-    public static ComponentSection InputProviders(InfoComponents info)
+    public static ComponentSection InputProviders(InfoComponents info, PolicyList? policy = null)
     {
         var items = new List<ComponentItem>();
-        foreach (var p in info.InputProviders)
-            items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active ? Level.Ok : Level.Plain,
-                new[] { (p.HardwarePresent ? "hardware present" : "hardware absent", p.HardwarePresent ? Level.Ok : Level.Plain) }
-                    .Concat(p.Active ? new[] { ("active", Level.Ok) } : Array.Empty<(string, Level)>()).ToArray(),
-                p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>()));
+        if (policy is { Rows.Count: > 0 })
+        {
+            // ADR-054 N3e: `input list --json` names every registered provider (info's
+            // input_providers is a summary on most CLIs); its rows carry the policy, info's
+            // per-provider rows (when present) add hardware presence and the note.
+            foreach (var r in policy.Rows)
+            {
+                var ip = info.InputProviders.FirstOrDefault(x => x.Id == r.Id);
+                bool active = r.Active || ip is { Active: true };
+                var chips = new List<(string, Level)>();
+                if (ip is not null) chips.Add((ip.HardwarePresent ? "hardware present" : "hardware absent", ip.HardwarePresent ? Level.Ok : Level.Plain));
+                if (active) chips.Add(("active", Level.Ok));
+                AddPolicyChips(chips, r);
+                var lines = new List<string>();
+                if (ip is { Note.Length: > 0 }) lines.Add(ip.Note);
+                else if (r.Untrusted && r.ProvenanceReason is { Length: > 0 } why) lines.Add(why);
+                items.Add(new ComponentItem(r.Name.Length > 0 ? r.Name : r.Id, active ? Level.Ok : r.Untrusted ? Level.Warn : Level.Plain,
+                    chips, lines, Policy: r));
+            }
+        }
+        else
+            foreach (var p in info.InputProviders)
+                items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id, p.Active ? Level.Ok : Level.Plain,
+                    new[] { (p.HardwarePresent ? "hardware present" : "hardware absent", p.HardwarePresent ? Level.Ok : Level.Plain) }
+                        .Concat(p.Active ? new[] { ("active", Level.Ok) } : Array.Empty<(string, Level)>()).ToArray(),
+                    p.Note.Length > 0 ? new[] { p.Note } : Array.Empty<string>()));
         if (items.Count == 0 && info.Input is { } sum)
         {
             var lines = new List<string> { sum.Note };
@@ -329,13 +356,14 @@ public static class Components
             items.Add(new ComponentItem("Rig (navigation) role", rig.Evaluated ? Level.Ok : Level.Plain,
                 new[] { (rig.Evaluated ? "evaluated" : "not evaluated", Level.Plain) },
                 new[] { rig.Device is { Length: > 0 } d ? $"Device: {d}" : "", rig.Note }.Where(x => x.Length > 0).ToArray()));
-        int registered = info.InputProviders.Count > 0 ? info.InputProviders.Count : info.Input?.Registered ?? 0;
+        int registered = policy is { Rows.Count: > 0 } ? policy.Rows.Count
+                       : info.InputProviders.Count > 0 ? info.InputProviders.Count : info.Input?.Registered ?? 0;
         int connected = info.InputProviders.Count > 0 ? info.InputProviders.Count(p => p.HardwarePresent)
                       : info.Input is { HardwarePresent: true } ? 1 : 0;
         return new ComponentSection("input_providers", "Input providers",
             "An input provider feeds controllers, hands or a navigation device into the runtime; without hardware, keyboard and mouse hold those roles.",
             registered, connected,
-            info.Input is null && info.InputProviders.Count == 0 ? "not read yet"
+            info.Input is null && info.InputProviders.Count == 0 && policy is null ? "not read yet"
                 : $"{Plural(registered, "registered", "registered")}{Sep}{(connected > 0 ? "hardware present" : "no hardware present")}",
             items);
     }
@@ -403,7 +431,7 @@ public static class Components
     /// load / platform state, and one line per task it declares (its readiness and whether
     /// selection picked it). Provider names are the providers' own registration, verbatim.
     /// </summary>
-    public static ComponentSection ConversionProviders(StatusSnapshot s)
+    public static ComponentSection ConversionProviders(StatusSnapshot s, PolicyList? policy = null)
     {
         var items = new List<ComponentItem>();
         var providers = s.Providers;
@@ -417,6 +445,10 @@ public static class Components
             if (!p.Enabled) chips.Add(("disabled", Level.Plain));
             if (p.Hidden) chips.Add(("superseded", Level.Plain));
             if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
+            var pol = policy?.Row(p.Id);
+            // Enabled is already a chip above (the snapshot carries it); add the rest of the policy.
+            if (pol?.ProvenanceChip is { } pc) chips.Add(pc);
+            if (pol is { Untrusted: true }) chips.Add(("refused: provenance", Level.Warn));
             var lines = new List<string>
             {
                 string.Join(Sep, new[]
@@ -439,17 +471,27 @@ public static class Components
                          .DefaultIfEmpty(Level.Plain).Max();
             items.Add(new ComponentItem(p.Name.Length > 0 ? p.Name : p.Id,
                 malformed ? Level.Critical : worst is Level.Critical or Level.Warn ? worst : usable ? Level.Ok : Level.Plain,
-                chips, lines));
+                chips, lines, Policy: pol));
         }
         var served = s.Tasks.Where(t => t.Selected).Select(t => t.Task).Distinct().ToArray();
         int ready = s.Tasks.Count(t => t.Selected && t.State == "READY");
         return new ComponentSection("conversion_providers", "Conversion providers",
-            "A conversion provider is a plug-in that turns 2D content into depth, views or splats; the runtime picks one per task and every app shares it.",
+            "A conversion provider turns 2D content into depth, views or splats; the runtime picks one per task and every app shares it.",
             providers.Count, ready,
             providers.Count == 0 ? "none registered"
                 : $"{Plural(providers.Count, "registered", "registered")}{Sep}{Plural(served.Length, "task", "tasks")} served{Sep}{ready} ready"
                   + (s.IsService ? "" : $"{Sep}headless describe"),
             items);
+    }
+
+    /// <summary>ADR-054 N3e: the policy chips a row carries — Enabled (and its source), Preferred, the provenance verdict.</summary>
+    public static void AddPolicyChips(List<(string, Level)> chips, PolicyRow? pol)
+    {
+        if (pol is null) return;
+        if (pol.EnabledChip is { } ec) chips.Add(ec);
+        if (pol.Preferred) chips.Add(("preferred", Level.Info));
+        if (pol.Untrusted) chips.Add(("refused: provenance", Level.Warn));
+        if (pol.ProvenanceChip is { } pc) chips.Add(pc);
     }
 
     public static ComponentSection? StereoCamera(InfoComponents info)
