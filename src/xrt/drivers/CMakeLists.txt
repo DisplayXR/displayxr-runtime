@@ -424,6 +424,8 @@ add_library(drv_sim_input_plugin SHARED
 	sim_input/sim_input_nav.c
 	sim_input/sim_input_interface.h
 	sim_input/sim_input_plugin.c
+	sim_input/sim_input_settings.c
+	sim_input/sim_input_settings.h
 	)
 if(XRT_HAVE_LINUX)
 	# ELF self-contained model: static aux, single-symbol version script —
