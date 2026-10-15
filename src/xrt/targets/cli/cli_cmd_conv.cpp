@@ -46,6 +46,7 @@
 #include "util/u_time.h"
 
 #include "cli_query.h" // cli_query_handles + teardown (the headless instance)
+#include "target_component_loader.h" // target_component_provenance_str (ADR-054 N4b)
 #include "target_conv_status.h"
 #include "target_conversion_plugin_loader.h"
 #include "target_plugin_loader.h" // target_plugin_get_active (the static dp-lift row)
@@ -212,11 +213,45 @@ add_policy_json(cJSON *root, const struct target_conv_policy *policy)
 	}
 }
 
+/*!
+ * ADR-054 N4b: the rows come over DIAG IPC (or the headless describe) and
+ * carry no provenance; a LISTER asks explicitly — the shared load path's
+ * verdict for the registered binary, cached per file. UNKNOWN for the
+ * built-in dp-lift adapter (no binary).
+ */
+struct conv_provenance
+{
+	uint32_t verdict = 0;
+	char reason[160] = {0};
+	char signer[128] = {0};
+};
+
+conv_provenance
+provenance_of(const struct xrt_status_conv_provider &p)
+{
+	conv_provenance out;
+	(void)target_conversion_plugin_check_provenance(p.binary, &out.verdict, out.reason, sizeof(out.reason),
+	                                                out.signer, sizeof(out.signer));
+	return out;
+}
+
 void
 print_json(const struct xrt_status_snapshot *snap, const struct target_conv_policy *policy, bool compact)
 {
 	cJSON *root = u_status_conv_to_cjson(snap);
 	add_policy_json(root, policy);
+	// N4b: join the lister's provenance verdict onto each provider row by id.
+	cJSON *providers = cJSON_GetObjectItemCaseSensitive(root, "providers");
+	for (uint32_t i = 0; i < snap->conv_provider_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
+		cJSON *row = cJSON_GetArrayItem(providers, (int)i);
+		if (row == nullptr) {
+			break;
+		}
+		const conv_provenance pv = provenance_of(snap->conv_providers[i]);
+		cJSON_AddStringToObject(row, "provenance", target_component_provenance_str(pv.verdict));
+		cJSON_AddStringToObject(row, "provenance_reason", pv.reason);
+		cJSON_AddStringToObject(row, "signer", pv.signer);
+	}
 	char *s = compact ? cJSON_PrintUnformatted(root) : cJSON_Print(root);
 	if (s != nullptr) {
 		P("%s\n", s);
@@ -242,9 +277,11 @@ print_providers_text(const struct xrt_status_snapshot *snap)
 		P("  none registered\n");
 		return;
 	}
-	P("  %-18s %-16s %5s  %-10s %-9s %4s  %s\n", "id", "load", "order", "hosting", "status", "caps", "notes");
+	P("  %-18s %-16s %5s  %-10s %-9s %4s  %-12s %s\n", "id", "load", "order", "hosting", "status", "caps",
+	  "provenance", "notes");
 	for (uint32_t i = 0; i < snap->conv_provider_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
 		const struct xrt_status_conv_provider &p = snap->conv_providers[i];
+		const conv_provenance pv = provenance_of(p);
 		std::string notes;
 		if (!p.enabled) {
 			notes += "disabled ";
@@ -264,9 +301,9 @@ print_providers_text(const struct xrt_status_snapshot *snap)
 		if (p.hint[0] != '\0') {
 			notes += std::string("- ") + p.hint;
 		}
-		P("  %-18s %-16s %5u  %-10s %-9s %4u  %s\n", p.id, p.load, p.probe_order,
+		P("  %-18s %-16s %5u  %-10s %-9s %4u  %-12s %s\n", p.id, p.load, p.probe_order,
 		  u_status_conv_hosting_str(p.hosting), u_status_platform_state_str(p.platform_state), p.cap_count,
-		  notes.c_str());
+		  target_component_provenance_str(pv.verdict), notes.c_str());
 	}
 }
 

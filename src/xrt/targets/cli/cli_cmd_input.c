@@ -8,8 +8,9 @@
  *
  *   input list [--json]                 Registered input-provider plug-ins with
  *                                       ProbeOrder, Enabled (+ where it came
- *                                       from), the PreferredPlugin override and
- *                                       which one the loader would rank first.
+ *                                       from), the PreferredPlugin override,
+ *                                       provenance (ADR-054 N4b) and which one
+ *                                       the loader would rank first.
  *                                       Reads the discovery root without loading
  *                                       any provider DLL (mirror of `dp list`).
  *   input enable | disable <id> [--machine]
@@ -119,6 +120,10 @@ cmd_list(int argc, const char **argv)
 			cJSON_AddStringToObject(p, "binary_path", list[i].binary_path);
 			cJSON_AddBoolToObject(p, "enabled", list[i].enabled);
 			cJSON_AddStringToObject(p, "enabled_source", list[i].enabled_source);
+			// ADR-054 N4b, as the lister classified the binary.
+			cJSON_AddStringToObject(p, "provenance", target_component_provenance_str(list[i].provenance));
+			cJSON_AddStringToObject(p, "provenance_reason", list[i].provenance_reason);
+			cJSON_AddStringToObject(p, "signer", list[i].signer);
 			cJSON_AddBoolToObject(p, "preferred", have_pref && strcmp(list[i].id, preferred) == 0);
 			cJSON_AddBoolToObject(p, "active", i == active && !force_qwerty);
 			cJSON_AddItemToArray(arr, p);
@@ -144,13 +149,14 @@ cmd_list(int argc, const char **argv)
 	if (force_qwerty) {
 		P("\tForceQwerty override: SET — providers are skipped, qwerty claims the hand roles.\n");
 	}
-	P("\t  %-20s %-24s %10s  %-18s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred");
+	P("\t  %-20s %-24s %10s  %-18s %-10s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred", "Provenance");
 	for (int i = 0; i < n; i++) {
 		char enabled[32];
 		snprintf(enabled, sizeof(enabled), "%s (%s)", list[i].enabled ? "yes" : "no", list[i].enabled_source);
-		P("\t%s %-20s %-24s %10u  %-18s %s\n", (i == active && !force_qwerty) ? "*" : " ", list[i].id,
+		P("\t%s %-20s %-24s %10u  %-18s %-10s %s\n", (i == active && !force_qwerty) ? "*" : " ", list[i].id,
 		  list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order, enabled,
-		  (have_pref && strcmp(list[i].id, preferred) == 0) ? "yes" : "-");
+		  (have_pref && strcmp(list[i].id, preferred) == 0) ? "yes" : "-",
+		  target_component_provenance_str(list[i].provenance));
 		P("\t    %s\n", list[i].binary_path);
 	}
 	P("\t('*' = the provider the loader would rank first.)\n");

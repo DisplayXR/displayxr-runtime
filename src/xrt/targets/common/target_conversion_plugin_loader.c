@@ -407,6 +407,47 @@ conv_compare(const void *a, const void *b)
 	return strcmp(ea->source, eb->source);
 }
 
+bool
+target_conversion_plugin_check_provenance(const char *binary_path,
+                                          uint32_t *out_provenance,
+                                          char *out_reason,
+                                          size_t reason_cap,
+                                          char *out_signer,
+                                          size_t signer_cap)
+{
+	if (out_provenance != NULL) {
+		*out_provenance = TARGET_COMPONENT_PROVENANCE_UNKNOWN;
+	}
+	if (out_reason != NULL && reason_cap > 0) {
+		out_reason[0] = '\0';
+	}
+	if (out_signer != NULL && signer_cap > 0) {
+		out_signer[0] = '\0';
+	}
+	if (binary_path == NULL || binary_path[0] == '\0') {
+		return false;
+	}
+	// The shared check wants a row (~11 KB): heap, never a hot stack.
+	struct target_component_entry *c = (struct target_component_entry *)calloc(1, sizeof(*c));
+	if (c == NULL) {
+		return false;
+	}
+	target_component_entry_init(c);
+	conv_copy(c->binary_path, sizeof(c->binary_path), binary_path);
+	const bool ok = target_component_check_provenance(&g_conv_class, c);
+	if (out_provenance != NULL) {
+		*out_provenance = c->provenance;
+	}
+	if (out_reason != NULL && reason_cap > 0) {
+		conv_copy(out_reason, reason_cap, c->provenance_reason);
+	}
+	if (out_signer != NULL && signer_cap > 0) {
+		conv_copy(out_signer, signer_cap, c->signer);
+	}
+	free(c);
+	return ok;
+}
+
 void
 target_conversion_plugin_sort(struct xrt_conversion_plugin_entry *entries, int count)
 {

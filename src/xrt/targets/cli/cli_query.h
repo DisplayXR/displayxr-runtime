@@ -228,6 +228,15 @@ struct cli_query_result
 	 * i.e. the runtime fell back. Absence of such a candidate is fine. */
 	bool vendor_dp_ok;
 	char vendor_dp_note[256];
+	/* N3b: better-ranked plug-ins discovery skipped because they are
+	 * DISABLED (`Enabled` = 0 / `"enabled": false`), incl. a disabled
+	 * PreferredPlugin. Never a failure — the user asked — but the
+	 * `display_processor` block says so (`skipped_disabled`). */
+	int skipped_disabled_count;
+	char skipped_disabled[8][64];
+	//! Registration id of the winning row ("" when none) — `plugin_id` is
+	//! iface->id, which two rows of one DLL share.
+	char active_row_id[64];
 
 	/* ADR-045 — every registered plug-in with its load outcome and the
 	 * platform state + hint it reports (UNKNOWN for a plug-in that predates
@@ -371,6 +380,12 @@ struct cli_query_result
 	bool input_left_ok;
 	bool input_right_ok;
 	char input_provider_id[64];
+	/* N3b: the resident providers' REGISTRATION ids in priority order
+	 * (index 0 = the one the loader ranked first — the PreferredPlugin row
+	 * when one is set). `input_provider_id` above is iface->id, which two
+	 * rows of one DLL share; this is what tells them apart. */
+	int input_ranked_count;
+	char input_ranked[16][64];
 	char input_left_str[256];
 	char input_right_str[256];
 	char input_note[160];

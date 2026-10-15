@@ -2,17 +2,26 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  `dp` subcommand — list registered display processors and set or
- *         clear the non-destructive `PreferredPlugin` override, globally or
- *         per screen.
+ * @brief  `dp` subcommand — display processors (ADR-019): the four component
+ *         verbs of ADR-054 (`list`, `enable|disable`, `use|reset`), globally
+ *         or per screen.
  *
  *   dp list [--json]   Enumerate registered display-processor plug-ins with
- *                      their ProbeOrder + which one the loader would select,
- *                      and every screen's effective / preferred plug-in.
- *   dp use <id>        Write the global PreferredPlugin override (the loader
- *                      tries <id> before the ProbeOrder sort). Requires a
- *                      service restart / fresh process to take effect.
- *   dp reset           Clear the global override (restore normal ProbeOrder).
+ *                      their ProbeOrder, Enabled (+ where it came from), the
+ *                      PreferredPlugin override, provenance, which one the
+ *                      loader would select, and every screen's effective /
+ *                      preferred plug-in.
+ *   dp enable | disable <id> [--machine]
+ *                      `Enabled` on the plug-in's row: per user (HKCU, no
+ *                      admin) by default, machine-wide (HKLM, admin) with
+ *                      --machine. HKCU wins. A disabled plug-in is never
+ *                      loaded by any scan (N3b).
+ *   dp use <id> [--machine]
+ *                      The global PreferredPlugin override (the loader tries
+ *                      <id> before the ProbeOrder sort): per user (HKCU) by
+ *                      default, HKLM with --machine.
+ *   dp reset [--machine]
+ *                      Clear the global override (restore normal ProbeOrder).
  *
  *   dp use <id> --screen <key> [--machine]
  *   dp reset --screen <key>|all [--machine]
@@ -23,6 +32,22 @@
  *                      machine-wide (HKLM, admin) with --machine. The running
  *                      service is asked to re-probe right away.
  *
+ * Registry writes follow `input enable|use` (N3a, the newer pattern): HKCU
+ * by default, HKLM 64-bit view with `--machine`; the loader reads HKCU over
+ * HKLM for both values (`target_plugin_loader.c`). Only `Enabled` and
+ * `PreferredPlugin` are ever read from HKCU — the plug-in rows (`Binary`,
+ * `ProbeOrder`, …) stay HKLM-only, so a per-user key cannot inject a DLL
+ * (plugin-discovery.md §2.1).
+ *
+ * POSIX: `use` / `reset` write the per-user `preferred` file (spec §3.3,
+ * `target_plugin_set_preferred`); `enable|disable` has no per-user store —
+ * the manifest's `plugin.enabled` is the switch, as for input and
+ * conversion providers — and says so.
+ *
+ * No live re-select yet (#2051): a change to the global values takes effect
+ * at the next service start / session. The per-screen preference re-probes
+ * the running service at once.
+ *
  * Vendor-neutral throughout (ADR-019): enumeration reads the discovery root
  * without loading any plug-in DLL, so no vendor symbols are touched. `dp list`
  * also builds the headless status snapshot for its `screens[]`, which loads the
@@ -32,8 +57,10 @@
  */
 
 #include "cli_common.h"
+#include "cli_dp_predict.h"
 #include "cli_ipc.h"
 
+#include "target_component_loader.h"
 #include "target_plugin_loader.h"
 #include "target_screen_pin.h"
 
@@ -54,38 +81,23 @@
 
 #include <cjson/cJSON.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef XRT_OS_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #define MAX_DPS 16
+
+//! Discovery root — the registry key the loader enumerates (Windows).
+#define DP_REG_ROOT "Software\\DisplayXR\\DisplayProcessors"
 
 #define P(...) printf(__VA_ARGS__)
 
-
-/*!
- * Predict which plug-in the loader would select: the PreferredPlugin
- * override if it names a registered plug-in, otherwise the lowest
- * ProbeOrder (first wins on ties). Returns the index into @p list, or -1.
- */
-static int
-predict_active(const struct target_plugin_desc *list, int n, const char *preferred)
-{
-	if (preferred != NULL && preferred[0] != '\0') {
-		for (int i = 0; i < n; i++) {
-			if (strcmp(list[i].id, preferred) == 0) {
-				return i;
-			}
-		}
-	}
-	int best = -1;
-	for (int i = 0; i < n; i++) {
-		if (best < 0 || list[i].probe_order < list[best].probe_order) {
-			best = i;
-		}
-	}
-	return best;
-}
 
 //! The value of `--name <value>` in argv[2..], or NULL.
 static const char *
@@ -117,7 +129,7 @@ cmd_list(int argc, const char **argv)
 
 	char preferred[64] = {0};
 	bool have_pref = target_plugin_get_preferred(preferred, sizeof(preferred));
-	int active = predict_active(list, n, have_pref ? preferred : NULL);
+	int active = cli_dp_predict_active(list, n, have_pref ? preferred : NULL);
 
 	// Every screen's effective and preferred plug-in, as a process starting
 	// now resolves them (the headless snapshot: same registry, same rules).
@@ -143,6 +155,12 @@ cmd_list(int argc, const char **argv)
 			cJSON_AddStringToObject(p, "version", list[i].version);
 			cJSON_AddNumberToObject(p, "probe_order", (double)list[i].probe_order);
 			cJSON_AddStringToObject(p, "binary_path", list[i].binary_path);
+			cJSON_AddBoolToObject(p, "enabled", list[i].enabled);
+			cJSON_AddStringToObject(p, "enabled_source", list[i].enabled_source);
+			// ADR-054 N4b, as the lister classified the binary.
+			cJSON_AddStringToObject(p, "provenance", target_component_provenance_str(list[i].provenance));
+			cJSON_AddStringToObject(p, "provenance_reason", list[i].provenance_reason);
+			cJSON_AddStringToObject(p, "signer", list[i].signer);
 			cJSON_AddBoolToObject(p, "active", i == active);
 			cJSON_AddBoolToObject(p, "preferred", have_pref && strcmp(list[i].id, preferred) == 0);
 			cJSON_AddItemToArray(arr, p);
@@ -190,13 +208,25 @@ cmd_list(int argc, const char **argv)
 		P("\t(none — discovery root absent or empty)\n");
 	} else {
 		P("\tPreferredPlugin override: %s\n", have_pref ? preferred : "<unset>");
-		for (int i = 0; i < n; i++) {
-			P("\t%s%s id='%s' name='%s' ProbeOrder=%u\n", i == active ? "* " : "  ",
-			  (have_pref && strcmp(list[i].id, preferred) == 0) ? "[preferred]" : "           ", list[i].id,
-			  list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order);
-			P("\t       %s\n", list[i].binary_path);
+		const int pref_at = have_pref ? cli_dp_find(list, n, preferred) : -1;
+		if (have_pref && pref_at < 0) {
+			P("\t  (not a registered plug-in — the loader ignores it)\n");
+		} else if (pref_at >= 0 && !list[pref_at].enabled) {
+			P("\t  (disabled — the loader falls through to ProbeOrder)\n");
 		}
-		P("\t('*' = the plug-in the loader would select.)\n");
+		P("\t  %-20s %-24s %10s  %-18s %-10s %s\n", "id", "name", "ProbeOrder", "Enabled", "Preferred",
+		  "Provenance");
+		for (int i = 0; i < n; i++) {
+			char enabled[32];
+			snprintf(enabled, sizeof(enabled), "%s (%s)", list[i].enabled ? "yes" : "no",
+			         list[i].enabled_source);
+			P("\t%s %-20s %-24s %10u  %-18s %-10s %s\n", i == active ? "*" : " ", list[i].id,
+			  list[i].display_name[0] ? list[i].display_name : "?", list[i].probe_order, enabled,
+			  (have_pref && strcmp(list[i].id, preferred) == 0) ? "yes" : "-",
+			  target_component_provenance_str(list[i].provenance));
+			P("\t    %s\n", list[i].binary_path);
+		}
+		P("\t('*' = the plug-in the loader would select; a disabled one is never tried.)\n");
 	}
 
 	P(" :: Screens (per-screen preference: dp use <id> --screen <key>)\n");
@@ -217,39 +247,271 @@ cmd_list(int argc, const char **argv)
 	return 0;
 }
 
-static int
-cmd_use(const char *id)
+/*
+ *
+ * enable | disable | use | reset (N3b) — the global values.
+ *
+ */
+
+enum store_write
 {
-	xrt_result_t xret = target_plugin_set_preferred(id);
+	STORE_WRITE_OK,
+	STORE_WRITE_DENIED,
+	STORE_WRITE_UNSUPPORTED,
+	STORE_WRITE_FAILED,
+};
+
+#ifdef XRT_OS_WINDOWS
+
+/*!
+ * Open-or-create `<root>[\<sub>]` for writing in the hive the verb targets.
+ * HKLM is the 64-bit view (the loader reads without redirection); HKCU has no
+ * redirection to speak of.
+ */
+static enum store_write
+reg_open_for_write(bool machine, const char *sub, bool create, HKEY *out_key)
+{
+	char path[256];
+	if (sub != NULL && sub[0] != '\0') {
+		snprintf(path, sizeof(path), "%s\\%s", DP_REG_ROOT, sub);
+	} else {
+		snprintf(path, sizeof(path), "%s", DP_REG_ROOT);
+	}
+	const HKEY hive = machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+	const REGSAM sam = KEY_SET_VALUE | (machine ? KEY_WOW64_64KEY : 0);
+	LSTATUS rc;
+	if (create) {
+		rc = RegCreateKeyExA(hive, path, 0, NULL, 0, sam, NULL, out_key, NULL);
+	} else {
+		rc = RegOpenKeyExA(hive, path, 0, sam, out_key);
+		if (rc == ERROR_FILE_NOT_FOUND) {
+			*out_key = NULL;
+			return STORE_WRITE_OK; // nothing to clear
+		}
+	}
+	if (rc != ERROR_SUCCESS) {
+		*out_key = NULL;
+		return rc == ERROR_ACCESS_DENIED ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	return STORE_WRITE_OK;
+}
+
+static enum store_write
+reg_set_dword(bool machine, const char *sub, const char *value, uint32_t v)
+{
+	HKEY key = NULL;
+	enum store_write r = reg_open_for_write(machine, sub, true, &key);
+	if (r != STORE_WRITE_OK) {
+		return r;
+	}
+	DWORD d = v;
+	const LSTATUS w = RegSetValueExA(key, value, 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
+	RegCloseKey(key);
+	if (w != ERROR_SUCCESS) {
+		return w == ERROR_ACCESS_DENIED ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	return STORE_WRITE_OK;
+}
+
+static enum store_write
+reg_set_string(bool machine, const char *sub, const char *value, const char *s)
+{
+	HKEY key = NULL;
+	enum store_write r = reg_open_for_write(machine, sub, true, &key);
+	if (r != STORE_WRITE_OK) {
+		return r;
+	}
+	const LSTATUS w = RegSetValueExA(key, value, 0, REG_SZ, (const BYTE *)s, (DWORD)strlen(s) + 1);
+	RegCloseKey(key);
+	if (w != ERROR_SUCCESS) {
+		return w == ERROR_ACCESS_DENIED ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	return STORE_WRITE_OK;
+}
+
+static enum store_write
+reg_clear_value(bool machine, const char *sub, const char *value)
+{
+	HKEY key = NULL;
+	enum store_write r = reg_open_for_write(machine, sub, false, &key);
+	if (r != STORE_WRITE_OK || key == NULL) {
+		return r;
+	}
+	const LSTATUS rc = RegDeleteValueA(key, value);
+	RegCloseKey(key);
+	if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+		return rc == ERROR_ACCESS_DENIED ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	return STORE_WRITE_OK;
+}
+
+static enum store_write
+store_set_enabled(const char *id, bool enabled, bool machine)
+{
+	return reg_set_dword(machine, id, "Enabled", enabled ? 1u : 0u);
+}
+
+static enum store_write
+store_set_preferred(const char *id, bool machine)
+{
+	return reg_set_string(machine, NULL, "PreferredPlugin", id);
+}
+
+static enum store_write
+store_clear_preferred(bool machine)
+{
+	return reg_clear_value(machine, NULL, "PreferredPlugin");
+}
+
+#else /* POSIX / Android */
+
+static enum store_write
+store_set_enabled(const char *id, bool enabled, bool machine)
+{
+	(void)id;
+	(void)enabled;
+	(void)machine;
+	return STORE_WRITE_UNSUPPORTED;
+}
+
+static enum store_write
+store_from_xret(xrt_result_t xret)
+{
 	if (xret == XRT_SUCCESS) {
-		P("PreferredPlugin set to '%s'.\n", id);
-		P("Takes effect for processes started after this write — restart the DisplayXR\n");
-		P("service (or launch a fresh app) for a running session to pick it up.\n");
-		return 0;
+		return STORE_WRITE_OK;
 	}
 	if (xret == XRT_ERROR_NOT_AUTHORIZED) {
-		P("FAIL: writing the override was denied — run from an elevated terminal (HKLM needs admin).\n");
+		return STORE_WRITE_DENIED;
+	}
+	return xret == XRT_ERROR_NOT_IMPLEMENTED ? STORE_WRITE_UNSUPPORTED : STORE_WRITE_FAILED;
+}
+
+//! The loader's own per-user `preferred` file (spec §3.3); no machine store.
+static enum store_write
+store_set_preferred(const char *id, bool machine)
+{
+	if (machine) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	return store_from_xret(target_plugin_set_preferred(id));
+}
+
+static enum store_write
+store_clear_preferred(bool machine)
+{
+	if (machine) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	return store_from_xret(target_plugin_clear_preferred());
+}
+
+#endif
+
+static int
+write_result(enum store_write r, const char *what, bool machine)
+{
+	switch (r) {
+	case STORE_WRITE_OK: return 0;
+	case STORE_WRITE_DENIED:
+		P("FAIL: %s was denied — run from an elevated terminal (HKLM needs admin).\n", what);
+		return 1;
+	case STORE_WRITE_UNSUPPORTED:
+		if (machine) {
+			P("FAIL: %s — there is no machine-wide store on this platform (drop --machine).\n", what);
+		} else {
+			P("FAIL: %s — not supported on this platform: there is no per-user Enabled store.\n"
+			  "      Set \"enabled\": false in the plug-in's manifest (`plugin.enabled`,\n"
+			  "      NNN-<id>.json in the DisplayProcessors dir) instead.\n",
+			  what);
+		}
+		return 1;
+	case STORE_WRITE_FAILED:
+	default: P("FAIL: %s failed.\n", what); return 1;
+	}
+}
+
+//! No live re-select yet (#2051): say when the change applies.
+static void
+note_pickup(void)
+{
+	P("Takes effect at the next service start / session — restart the DisplayXR service\n");
+	P("(or launch a fresh app) for a running session to pick it up.\n");
+}
+
+static bool
+plugin_registered(const char *id);
+
+static int
+cmd_enable(const char *id, bool enable, bool machine)
+{
+	if (!cli_dp_id_valid(id)) {
+		P("error: '%s' is not a plug-in id.\n", id != NULL ? id : "");
 		return 1;
 	}
-	P("FAIL: could not write the PreferredPlugin override (xret=%d).\n", (int)xret);
-	return 1;
+	if (!plugin_registered(id)) {
+		// A per-user Enabled for an unregistered id would be an orphan row
+		// that `dp list` can never show: refuse, write nothing.
+		P("FAIL: '%s' is not a registered display processor (see 'dp list') — nothing written.\n", id);
+		return 1;
+	}
+	const int rc = write_result(
+	    store_set_enabled(id, enable, machine),
+	    machine ? "writing the machine-wide Enabled value" : "writing the per-user Enabled value", machine);
+	if (rc != 0) {
+		return rc;
+	}
+	P("%s: %s %s.\n", id, enable ? "enabled" : "disabled",
+	  machine ? "machine-wide (HKLM)" : "for this user (HKCU)");
+	if (machine) {
+		P("note: a per-user (HKCU) Enabled value for '%s' still wins for that user.\n", id);
+	}
+	if (!enable) {
+		P("note: no scan loads '%s' while it is disabled — the per-monitor DP registry stops offering it "
+		  "too.\n",
+		  id);
+	}
+	note_pickup();
+	return 0;
 }
 
 static int
-cmd_reset(void)
+cmd_use(const char *id, bool machine)
 {
-	xrt_result_t xret = target_plugin_clear_preferred();
-	if (xret == XRT_SUCCESS) {
-		P("PreferredPlugin override cleared — normal ProbeOrder discovery restored.\n");
-		P("Restart the DisplayXR service (or launch a fresh app) for a running session to pick it up.\n");
-		return 0;
-	}
-	if (xret == XRT_ERROR_NOT_AUTHORIZED) {
-		P("FAIL: clearing the override was denied — run from an elevated terminal (HKLM needs admin).\n");
+	if (!cli_dp_id_valid(id)) {
+		P("error: '%s' is not a plug-in id.\n", id != NULL ? id : "");
 		return 1;
 	}
-	P("FAIL: could not clear the PreferredPlugin override (xret=%d).\n", (int)xret);
-	return 1;
+	if (!plugin_registered(id)) {
+		P("warning: '%s' is not a registered display processor; the preference is ignored until it is.\n", id);
+	}
+	const int rc = write_result(store_set_preferred(id, machine), "writing the PreferredPlugin override", machine);
+	if (rc != 0) {
+		return rc;
+	}
+#ifdef XRT_OS_WINDOWS
+	P("%s PreferredPlugin set to '%s' — tried first, ahead of ProbeOrder.\n", machine ? "Machine-wide" : "Per-user",
+	  id);
+	if (machine) {
+		P("note: a per-user (HKCU) PreferredPlugin still wins for that user.\n");
+	}
+#else
+	P("PreferredPlugin set to '%s' (per-user 'preferred' file) — tried first, ahead of ProbeOrder.\n", id);
+#endif
+	note_pickup();
+	return 0;
+}
+
+static int
+cmd_reset(bool machine)
+{
+	const int rc = write_result(store_clear_preferred(machine), "clearing the PreferredPlugin override", machine);
+	if (rc != 0) {
+		return rc;
+	}
+	P("%s PreferredPlugin override cleared — normal ProbeOrder discovery restored.\n",
+	  machine ? "Machine-wide" : "Per-user");
+	note_pickup();
+	return 0;
 }
 
 
@@ -309,17 +571,13 @@ screen_key_connected(const char *key)
 	return false;
 }
 
+//! Registered (HKLM row / manifest), enabled or not — enumeration only.
 static bool
 plugin_registered(const char *id)
 {
 	struct target_plugin_desc list[MAX_DPS];
 	const int n = target_plugin_enumerate(list, MAX_DPS);
-	for (int i = 0; i < n; i++) {
-		if (strcmp(list[i].id, id) == 0) {
-			return true;
-		}
-	}
-	return false;
+	return cli_dp_find(list, n, id) >= 0;
 }
 
 static int
@@ -401,14 +659,22 @@ cmd_reset_screen(const char *key, bool machine)
 static int
 print_usage(void)
 {
-	P("Usage: displayxr-cli dp <list|use <id>|reset> [--screen <key> [--machine]]\n");
-	P("  list [--json]                 Registered display processors + every screen's effective / preferred\n");
-	P("                                plug-in.\n");
-	P("  use <id>                      Set the global PreferredPlugin override (e.g. 'sim-display', 'leia-sr').\n");
-	P("  reset                         Clear the global override (restore normal ProbeOrder discovery).\n");
+	P("Usage: displayxr-cli dp <list|enable|disable|use|reset> [--machine] [--screen <key>]\n");
+	P("  list [--json]                 Registered display processors: ProbeOrder, Enabled (+ source), the\n");
+	P("                                PreferredPlugin override, provenance, the one the loader would select\n");
+	P("                                ('*'), and every screen's effective / preferred plug-in.\n");
+	P("  enable | disable <id> [--machine]\n");
+	P("                                Enabled on the plug-in's row: per user (HKCU, no admin) by default,\n");
+	P("                                machine-wide (HKLM, admin) with --machine; HKCU wins. A disabled\n");
+	P("                                plug-in is never loaded by any scan.\n");
+	P("  use <id> [--machine]          Global PreferredPlugin override (e.g. 'sim-display', 'leia-sr'): tried\n");
+	P("                                first, ahead of ProbeOrder (per user; --machine = HKLM).\n");
+	P("  reset [--machine]             Clear the global override (restore normal ProbeOrder discovery).\n");
 	P("  use <id> --screen <key>       Weave the screen <key> (from 'dp list') with <id>; per-user, no admin.\n");
 	P("  reset --screen <key>|all      Clear one / every per-screen preference.\n");
 	P("    --machine                   With --screen: the machine-wide store (HKLM, admin) instead.\n");
+	P("Global writes take effect at the next service start / session. POSIX: use/reset write the\n");
+	P("per-user 'preferred' file; enable/disable = the manifest's plugin.enabled.\n");
 	return 1;
 }
 
@@ -418,29 +684,38 @@ cli_cmd_dp(int argc, const char **argv)
 	if (argc < 3) {
 		return print_usage();
 	}
+	const char *verb = argv[2];
 	const char *screen = flag_value(argc, argv, "--screen");
 	const bool machine = cli_has_flag(argc, argv, "--machine");
 	if (cli_has_flag(argc, argv, "--screen") && screen == NULL) {
 		P("error: '--screen' needs a screen key (see 'dp list').\n\n");
 		return print_usage();
 	}
-	if (machine && screen == NULL) {
-		P("error: '--machine' applies to a per-screen preference ('--screen <key>').\n\n");
-		return print_usage();
-	}
-	if (strcmp(argv[2], "list") == 0) {
+	if (strcmp(verb, "list") == 0) {
 		return cmd_list(argc, argv);
 	}
-	if (strcmp(argv[2], "use") == 0) {
+	if (strcmp(verb, "enable") == 0 || strcmp(verb, "disable") == 0) {
+		if (screen != NULL) {
+			P("error: 'dp %s' is global — there is no per-screen Enabled (use 'dp use --screen').\n\n",
+			  verb);
+			return print_usage();
+		}
+		if (argc < 4 || argv[3][0] == '-') {
+			P("error: 'dp %s' needs a plug-in id.\n\n", verb);
+			return print_usage();
+		}
+		return cmd_enable(argv[3], strcmp(verb, "enable") == 0, machine);
+	}
+	if (strcmp(verb, "use") == 0) {
 		if (argc < 4 || argv[3][0] == '-') {
 			P("error: 'dp use' needs a plug-in id.\n\n");
 			return print_usage();
 		}
-		return screen != NULL ? cmd_use_screen(argv[3], screen, machine) : cmd_use(argv[3]);
+		return screen != NULL ? cmd_use_screen(argv[3], screen, machine) : cmd_use(argv[3], machine);
 	}
-	if (strcmp(argv[2], "reset") == 0) {
-		return screen != NULL ? cmd_reset_screen(screen, machine) : cmd_reset();
+	if (strcmp(verb, "reset") == 0) {
+		return screen != NULL ? cmd_reset_screen(screen, machine) : cmd_reset(machine);
 	}
-	P("error: unknown 'dp' subcommand '%s'.\n\n", argv[2]);
+	P("error: unknown 'dp' subcommand '%s'.\n\n", verb);
 	return print_usage();
 }

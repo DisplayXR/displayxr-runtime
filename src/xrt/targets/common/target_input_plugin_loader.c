@@ -123,6 +123,7 @@ static struct input_provider_slot
 	const struct xrt_input_plugin_iface *iface;
 	struct xrt_input_plugin_instance *inst;
 	uint32_t probe_order;
+	char row_id[64]; //!< the registration id (row), not iface->id (N3b)
 } g_input_providers[TARGET_COMPONENT_MAX_ENTRIES];
 
 static int g_input_provider_count = 0;
@@ -132,7 +133,10 @@ static int g_input_provider_count = 0;
  * discovery pass in ProbeOrder, so the array ends up sorted.
  */
 static void
-input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst, uint32_t order)
+input_note_provider(const struct xrt_input_plugin_iface *iface,
+                    struct xrt_input_plugin_instance *inst,
+                    uint32_t order,
+                    const char *row_id)
 {
 	if (iface == NULL || g_input_provider_count >= TARGET_COMPONENT_MAX_ENTRIES) {
 		return;
@@ -141,6 +145,7 @@ input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input
 	slot->iface = iface;
 	slot->inst = inst;
 	slot->probe_order = order;
+	snprintf(slot->row_id, sizeof(slot->row_id), "%s", row_id != NULL ? row_id : "");
 }
 
 
@@ -478,7 +483,7 @@ input_discover_all(void)
 		if (iface != NULL) {
 			// Keep going: every claiming provider is a live
 			// candidate the arbiter can fall back to.
-			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order);
+			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order, e->id);
 			continue;
 		}
 		if (declined) {
@@ -529,9 +534,25 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
 		d->probe_order = e->probe_order;
 		d->enabled = e->enabled;
 		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", input_enabled_source(e));
+		// ADR-054 N4b: the load path classifies what it loads; a lister
+		// asks explicitly (cached per file + size + mtime).
+		(void)target_component_check_provenance(&g_input_class, entries + i);
+		d->provenance = e->provenance;
+		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", e->provenance_reason);
+		snprintf(d->signer, sizeof(d->signer), "%s", e->signer);
 	}
 	free(entries);
 	return count;
+}
+
+const char *
+target_input_plugin_get_row_id(int index)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	if (index < 0 || index >= g_input_provider_count) {
+		return "";
+	}
+	return g_input_providers[index].row_id;
 }
 
 
