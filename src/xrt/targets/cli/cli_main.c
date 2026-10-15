@@ -42,7 +42,9 @@ cli_print_help(int argc, const char **argv)
 	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all'.\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034; verbs per ADR-054).\n");
 	P("                      'input list [--json]', 'input enable|disable <id> [--machine]',\n");
-	P("                      'input use <id> [--machine]', 'input reset', 'input haptic-test [seconds]'.\n");
+	P("                      'input use <id> [--machine]', 'input reset', 'input options <id> [--json]',\n");
+	P("                      'input set <id> <KEY> <value> [--machine]', 'input unset <id> <KEY>',\n");
+	P("                      'input haptic-test [seconds]'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
 	P("                      'runtime status'   full loader precedence + conflicts,\n");
 	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");
@@ -71,7 +73,9 @@ cli_print_help(int argc, const char **argv)
 	P("  conv <...>        - Conversion providers (ADR-053): 'conv list|status [--json]',\n");
 	P("                      'conv status --watch', 'conv warm <task>|<id>[/<cap>]', 'conv enable|disable\n");
 	P("                      <id> [--machine]', 'conv use <task> <id>' / 'conv reset <task>|all',\n");
-	P("                      'conv models list|prune'. Reads the service over DIAG, else headless.\n");
+	P("                      'conv options <id> [--json]', 'conv set <id> <KEY> <value> [--machine]',\n");
+	P("                      'conv unset <id> <KEY>', 'conv models list|prune'. Reads the service over\n");
+	P("                      DIAG, else headless.\n");
 	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");

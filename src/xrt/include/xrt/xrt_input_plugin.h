@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 
 #include <stddef.h>
@@ -262,19 +263,49 @@ struct xrt_input_plugin_host_iface
 	xrt_result_t (*get_display_geometry)(struct xrt_input_host_display_geometry *inout);
 
 	/*!
+	 * The one options contract (ADR-054 decision 7, N3c): the provider's
+	 * per-component settings, read ONLY through this slot — never
+	 * `getenv` — with `id` = the provider's own `iface->id`. The runtime
+	 * resolves `DXR_INPUT_<ID>_<KEY>` in the hosting process's environment,
+	 * then the per-user store, then the registration row's `Settings\<KEY>`
+	 * / manifest `settings` (`xrt/xrt_component_settings.h`;
+	 * `displayxr-cli input options|set|unset`). Valid for the life of the
+	 * process (copy it at negotiate time); read at init, not per frame.
+	 *
+	 * Carved out of the former reserved[1], like @ref get_display_geometry:
+	 * size and every other offset unchanged, the API major stays 1. An older
+	 * runtime leaves it NULL — providers MUST NULL-check (and cover-check
+	 * `struct_size`). Announced by @ref XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING.
+	 */
+	xrt_component_get_setting_fn_t get_setting;
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Providers MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[13];
+	void *reserved[12];
 };
 
-// The get_display_geometry slot was carved out of the former reserved[0]: the
-// host iface's size and every other offset are unchanged, so providers built
-// against the previous header keep working and the API major stays 1.
+/*!
+ * Defined when this header carries the
+ * @ref xrt_input_plugin_host_iface::get_setting slot (N3c), so a provider
+ * that must also compile against an older runtime header can `#ifdef`-guard
+ * its use.
+ */
+#define XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING 1
+
+// The get_display_geometry and get_setting slots were carved out of the former
+// reserved[0] / reserved[1]: the host iface's size and every other offset are
+// unchanged, so providers built against the previous header keep working and
+// the API major stays 1.
 // clang-format off
-XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, get_setting) ==
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     sizeof(void *),
+                            "xrt_input_plugin_host_iface: get_setting must occupy the former reserved[1]");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+                                offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+                                    2 * sizeof(void *),
                             "xrt_input_plugin_host_iface: get_display_geometry must occupy the former reserved[0]");
 XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_host_iface) ==
                                 2 * sizeof(uint32_t) + 14 * sizeof(void *),
@@ -410,7 +441,26 @@ struct xrt_input_plugin_iface
 	 * roles for as long as it is loaded.
 	 */
 	enum xrt_input_provider_presence (*get_presence)(struct xrt_input_plugin_instance *inst);
+
+	/*!
+	 * The settings this provider reads through
+	 * @ref xrt_input_plugin_host_iface::get_setting (ADR-054 decision 7,
+	 * the one options contract), for `displayxr-cli input options <id>`.
+	 * Optional: NULL (or a provider whose `struct_size` predates this slot)
+	 * declares nothing — the store's keys are still listed. Appended under
+	 * `struct_size` cover (API major stays 1); the runtime guards the call
+	 * with @ref XRT_INPUT_PLUGIN_IFACE_HAS. Announced by
+	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
+	 */
+	xrt_component_describe_settings_fn_t describe_settings;
 };
+
+/*!
+ * Defined when @ref xrt_input_plugin_iface carries `describe_settings` (N3c),
+ * so a provider built against an older runtime header can #ifdef-guard
+ * filling it.
+ */
+#define XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS 1
 
 
 /*

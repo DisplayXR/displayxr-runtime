@@ -245,6 +245,18 @@ input_host_get_display_geometry(struct xrt_input_host_display_geometry *inout)
 }
 
 /*!
+ * The one options contract's read slot (N3c): a provider's per-component
+ * settings through the shared store — `DXR_INPUT_<ID>_<KEY>` in this
+ * process's environment, the per-user overlay, the row's `Settings\*` /
+ * manifest `settings`. Never the provider's own getenv.
+ */
+static bool
+input_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_size)
+{
+	return target_component_get_setting(&g_input_class, id, key, buf, buf_size, NULL);
+}
+
+/*!
  * Fill @ref g_input_host once and hand it out. Called from
  * `input_try_load_one` immediately before `negotiate`.
  */
@@ -257,9 +269,62 @@ input_host_iface(void)
 		g_input_host.struct_size = (uint32_t)sizeof(struct xrt_input_plugin_host_iface);
 		g_input_host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
 		g_input_host.get_display_geometry = input_host_get_display_geometry;
+		g_input_host.get_setting = input_host_get_setting;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
+}
+
+const struct target_component_class *
+target_input_plugin_component_class(void)
+{
+	return &g_input_class;
+}
+
+int
+target_input_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max)
+{
+	if (id == NULL || id[0] == '\0' || out == NULL || max <= 0) {
+		return 0;
+	}
+	// The manifest's schema first (POSIX), then whatever the binary declares.
+	int n = target_component_manifest_settings_schema(&g_input_class, id, out, max);
+
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return n;
+	}
+	const int count = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// Negotiate only (no probe): a disabled or declining provider still
+		// declares its settings — that is how one finds the key to enable it.
+		void *module = NULL;
+		void *fn = NULL;
+		if (target_component_load_binary_ex(&g_input_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module, &fn,
+		                                    NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_input_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret = ((xrt_input_plugin_negotiate_fn_t)fn)(
+		    XRT_INPUT_PLUGIN_API_VERSION_CURRENT, input_host_iface(), &iface, &plugin_version);
+		if (target_component_abi_gate(&g_input_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		        TARGET_COMPONENT_ABI_OK &&
+		    XRT_INPUT_PLUGIN_IFACE_HAS(iface, describe_settings)) {
+			const struct xrt_component_setting_desc *descs = NULL;
+			const uint32_t nd = iface->describe_settings(&descs);
+			n = target_component_merge_setting_descs(out, n, max, descs, nd);
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return n;
 }
 
 void

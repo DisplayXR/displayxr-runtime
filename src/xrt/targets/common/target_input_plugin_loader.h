@@ -94,6 +94,28 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max);
 const char *
 target_input_plugin_get_row_id(int index);
 
+struct target_component_class;
+
+/*!
+ * The input class's row in the shared component loader (ADR-054 N2): what
+ * the one options contract keys on (`target_component_get_setting`,
+ * `displayxr-cli input options|set|unset`, N3c). Static, never NULL.
+ */
+const struct target_component_class *
+target_input_plugin_component_class(void);
+
+struct target_component_setting_desc;
+
+/*!
+ * The settings provider @p id declares (N3c): its manifest `settings_schema`
+ * (POSIX) merged with the binary's `describe_settings` slot, which means
+ * loading + negotiating the registered binary (no probe) and unloading it
+ * again. Returns the count written to @p out (up to @p max); 0 for an
+ * unregistered id or a binary that declares nothing.
+ */
+int
+target_input_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
 /*!
  * How many providers loaded, ABI-passed and probed successfully.
  *

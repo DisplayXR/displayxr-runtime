@@ -20,6 +20,13 @@
  *   input use <id> [--machine]          `PreferredPlugin` under the InputProviders
  *                                       root: ranked first, ahead of ProbeOrder.
  *   input reset [--machine]             Clear it.
+ *   input options <id> [--json]         The provider's settings: declared + stored,
+ *                                       with value and source (N3c).
+ *   input set <id> <KEY> <value> [--machine] / input unset <id> <KEY> [--machine]
+ *                                       `Settings\<KEY>` on the provider's row (HKCU;
+ *                                       HKLM with --machine; the POSIX per-user
+ *                                       `<id>.settings.json`). DXR_INPUT_<ID>_<KEY>
+ *                                       in the hosting process's env always wins.
  *   input haptic-test [seconds]         Headless haptics driver (#823 Phase 2).
  *
  * Registry writes follow `conv enable|use` (ADR-053 §7.1, the newer pattern):
@@ -47,6 +54,7 @@
  */
 
 #include "cli_common.h"
+#include "cli_component_options.h"
 #include "cli_input_predict.h"
 #include "cli_ipc.h"
 #include "cli_query.h"
@@ -418,6 +426,30 @@ note_pickup(const char *enabling_id)
 	P("No DisplayXR service reachable — applies when it next starts (in-process apps: their next launch).\n");
 }
 
+//! A provider reads its settings at init through the host iface (N3c): same pickup rule as above.
+static void
+note_settings_pickup(void)
+{
+	P("The provider reads its settings at init through the host iface — a running service /\n");
+	P("session keeps what it read; restart the DisplayXR service (or launch a fresh app).\n");
+}
+
+//! The options | set | unset verbs over the input class (shared logic, cli_component_options.c).
+static int
+cmd_options_verbs(int argc, const char **argv)
+{
+	const struct cli_component_class k = {
+	    .verb = "input",
+	    .noun = "input provider",
+	    .cls = target_input_plugin_component_class(),
+	    .registered = provider_registered,
+	    .describe = target_input_plugin_describe_settings,
+	    .note_pickup = note_settings_pickup,
+	    .posix_machine_hint = "the manifest's \"settings\" object (NNN-<id>-input-provider.json)",
+	};
+	return cli_component_options_dispatch(&k, argc, argv);
+}
+
 static int
 cmd_enable(const char *id, bool enable, bool machine)
 {
@@ -607,11 +639,14 @@ print_usage(void)
 	P("  use <id> [--machine]         PreferredPlugin override: <id> is ranked first, ahead of\n");
 	P("                               ProbeOrder (per user; --machine = HKLM).\n");
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
+	cli_component_options_usage(&(const struct cli_component_class){
+	    .verb = "input", .noun = "input provider", .cls = target_input_plugin_component_class()});
 	P("  haptic-test [seconds]        Headless: fire vibrations on the hand-role devices (default 5 s).\n");
 	P("                               Pair with scripts/net_input_feeder.py --assert-haptic.\n");
 	P("A running service re-ranks at once (roles move on the next xrSyncActions); a provider it did not\n");
-	P("load joins at its next start. POSIX: use/reset write the per-user input-preferred file;\n");
-	P("enable/disable = the manifest's plugin.enabled.\n");
+	P("load joins at its next start; settings are read at provider init (restart to apply). POSIX:\n");
+	P("use/reset write the per-user input-preferred file; enable/disable = the manifest's plugin.enabled;\n");
+	P("set/unset write the per-user <id>.settings.json (--machine = the manifest's settings object, by hand).\n");
 	return 1;
 }
 
@@ -645,6 +680,10 @@ cli_cmd_input(int argc, const char **argv)
 	}
 	if (strcmp(verb, "haptic-test") == 0) {
 		return cmd_haptic_test(argc, argv);
+	}
+	const int rc = cmd_options_verbs(argc, argv); // options | set | unset (N3c)
+	if (rc >= 0) {
+		return rc;
 	}
 	P("error: unknown 'input' subcommand '%s'.\n\n", verb);
 	return print_usage();
