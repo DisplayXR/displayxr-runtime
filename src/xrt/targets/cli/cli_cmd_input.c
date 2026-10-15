@@ -20,6 +20,14 @@
  *   input use <id> [--machine]          `PreferredPlugin` under the InputProviders
  *                                       root: ranked first, ahead of ProbeOrder.
  *   input reset [--machine]             Clear it.
+ *   input emulated on|off [--machine]   The `EmulatedControllers` gate (ADR-054
+ *                                       N7): `InputProviders\Policy\
+ *                                       EmulatedControllers`, HKCU by default,
+ *                                       HKLM with --machine (POSIX: the per-user
+ *                                       `emulated_controllers` file). off = no
+ *                                       qwerty left/right pair; the hand roles
+ *                                       stay unassigned when no provider holds
+ *                                       them. The qwerty head is not affected.
  *   input options <id> [--json]         The provider's settings: declared + stored,
  *                                       with value and source (N3c).
  *   input set <id> <KEY> <value> [--machine] / input unset <id> <KEY> [--machine]
@@ -111,6 +119,8 @@ cmd_list(int argc, const char **argv)
 	int n = target_input_plugin_enumerate(list, MAX_PROVIDERS);
 
 	bool force_qwerty = target_input_plugin_get_force_qwerty();
+	const char *emulated_source = "default";
+	const bool emulated = target_input_plugin_get_emulated_controllers(&emulated_source);
 	char preferred[64] = {0};
 	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
 	int active = cli_input_predict_active(list, n, have_pref ? preferred : NULL);
@@ -118,6 +128,10 @@ cmd_list(int argc, const char **argv)
 	if (cli_has_flag(argc, argv, "--json")) {
 		cJSON *root = cJSON_CreateObject();
 		cJSON_AddBoolToObject(root, "force_qwerty", force_qwerty);
+		// N7: the gate as data — {value, source}, the selftest's shape.
+		cJSON *em = cJSON_AddObjectToObject(root, "emulated_controllers");
+		cJSON_AddNumberToObject(em, "value", emulated ? 1 : 0);
+		cJSON_AddStringToObject(em, "source", emulated_source);
 		if (have_pref) {
 			cJSON_AddStringToObject(root, "preferred", preferred);
 		} else {
@@ -156,8 +170,11 @@ cmd_list(int argc, const char **argv)
 	if (have_pref && !provider_registered(preferred)) {
 		P("\t  (not a registered provider — the loader ignores it)\n");
 	}
+	P("\tEmulated controllers: %s (%s)%s\n", emulated ? "on" : "off", emulated_source,
+	  emulated ? "" : " — no qwerty left/right pair; hand roles unassigned when no provider holds them");
 	if (n == 0) {
-		P("\t(none — discovery root absent or empty; qwerty keeps the hand roles)\n");
+		P("\t(none — discovery root absent or empty; %s)\n",
+		  emulated ? "qwerty keeps the hand roles" : "the hand roles stay unassigned");
 		return 0;
 	}
 	if (force_qwerty) {
@@ -294,6 +311,13 @@ store_clear_preferred(bool machine)
 	return reg_clear_value(machine, NULL, "PreferredPlugin");
 }
 
+//! N7: `InputProviders\Policy\EmulatedControllers` in the hive the verb targets.
+static enum store_write
+store_set_emulated(bool on, bool machine)
+{
+	return reg_set_dword(machine, "Policy", "EmulatedControllers", on ? 1u : 0u);
+}
+
 #else /* POSIX / Android */
 
 static enum store_write
@@ -304,6 +328,27 @@ store_set_enabled(const char *id, bool enabled, bool machine)
 	(void)machine;
 	return STORE_WRITE_UNSUPPORTED;
 }
+
+#ifndef XRT_OS_ANDROID
+//! Best-effort `mkdir -p` of the per-user dir: a fresh box has no
+//! `DisplayXR/DisplayProcessors` under HOME / XDG yet, and a single-level
+//! mkdir left the first `input use` / `input emulated` write failing with
+//! ENOENT.
+static void
+user_dir_mkdir_p(const char *dir)
+{
+	char path[512];
+	snprintf(path, sizeof(path), "%s", dir);
+	for (char *p = path + 1; *p != '\0'; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			(void)mkdir(path, 0755);
+			*p = '/';
+		}
+	}
+	(void)mkdir(path, 0755);
+}
+#endif
 
 //! `<per-user dir>/input-preferred` — the DP loader's `preferred` file pattern.
 static bool
@@ -320,7 +365,7 @@ preferred_file_path(char *out, size_t cap, bool create_dir)
 		return false;
 	}
 	if (create_dir) {
-		(void)mkdir(dir, 0755); // best-effort, single level
+		user_dir_mkdir_p(dir);
 	}
 	snprintf(out, cap, "%s/input-preferred", dir);
 	return true;
@@ -359,6 +404,47 @@ store_clear_preferred(bool machine)
 	if (remove(path) != 0 && errno != ENOENT) {
 		return errno == EACCES ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
 	}
+	return STORE_WRITE_OK;
+}
+
+//! N7: `<per-user dir>/emulated_controllers` — the loader's `force_qwerty` byte convention.
+static bool
+emulated_file_path(char *out, size_t cap, bool create_dir)
+{
+	char dir[512];
+#ifdef XRT_OS_ANDROID
+	(void)dir;
+	(void)create_dir;
+	out[0] = '\0';
+	return false; // no per-user store on Android; the pair is always published
+#else
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	if (create_dir) {
+		user_dir_mkdir_p(dir);
+	}
+	snprintf(out, cap, "%s/emulated_controllers", dir);
+	return true;
+#endif
+}
+
+static enum store_write
+store_set_emulated(bool on, bool machine)
+{
+	if (machine) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	char path[600];
+	if (!emulated_file_path(path, sizeof(path), true)) {
+		return STORE_WRITE_UNSUPPORTED;
+	}
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return errno == EACCES ? STORE_WRITE_DENIED : STORE_WRITE_FAILED;
+	}
+	fprintf(f, "%s\n", on ? "1" : "0");
+	fclose(f);
 	return STORE_WRITE_OK;
 }
 
@@ -520,6 +606,59 @@ cmd_reset(bool machine)
 	return 0;
 }
 
+/*!
+ * `input emulated on|off [--machine]` — the `EmulatedControllers` gate (ADR-054
+ * N7, #2143). Same store rules as `enable|disable`: HKCU by default, the HKLM
+ * 64-bit view with --machine, HKCU wins unless `Policy\Lock`; POSIX writes the
+ * per-user `emulated_controllers` file and refuses --machine like the other
+ * verbs. The pickup rule differs in one way, said below: the gate can only be
+ * applied live to a pair that EXISTS (the provider set, qwerty's pair
+ * included, is fixed per process).
+ */
+static int
+cmd_emulated(const char *arg, bool machine)
+{
+	bool on;
+	if (arg != NULL && strcmp(arg, "on") == 0) {
+		on = true;
+	} else if (arg != NULL && strcmp(arg, "off") == 0) {
+		on = false;
+	} else {
+		P("error: 'input emulated' takes on|off.\n\n");
+		return -1;
+	}
+	const int rc = write_result(store_set_emulated(on, machine),
+	                            machine ? "writing the machine-wide EmulatedControllers value"
+	                                    : "writing the per-user EmulatedControllers value",
+	                            machine);
+	if (rc != 0) {
+		return rc;
+	}
+#ifdef XRT_OS_WINDOWS
+	P("Emulated controllers: %s %s.\n", on ? "on" : "off",
+	  machine ? "machine-wide (HKLM)" : "for this user (HKCU)");
+	if (machine) {
+		P("note: a per-user (HKCU) EmulatedControllers value still wins for that user (unless "
+		  "InputProviders\\Policy\\Lock = 1).\n");
+	}
+#else
+	char path[600] = {0};
+	(void)emulated_file_path(path, sizeof(path), false);
+	P("Emulated controllers: %s (%s).\n", on ? "on" : "off", path);
+#endif
+	if (on) {
+		P("The qwerty left/right pair is published and is the hand-role floor again.\n");
+	} else {
+		P("The qwerty left/right pair is not published: the hand roles stay unassigned (XR_NULL_PATH)\n");
+		P("when no input provider holds them. The qwerty head (look-around) is unaffected.\n");
+	}
+	P("A pair that exists in the running service is %s live; a pair the service did not create at\n",
+	  on ? "re-admitted" : "withdrawn");
+	P("start (it started with the gate off) joins at its next start.\n");
+	note_pickup(NULL);
+	return 0;
+}
+
 
 /*
  *
@@ -630,7 +769,7 @@ cmd_haptic_test(int argc, const char **argv)
 static int
 print_usage(void)
 {
-	P("Usage: displayxr-cli input <list|enable|disable|use|reset|haptic-test>\n");
+	P("Usage: displayxr-cli input <list|enable|disable|use|reset|emulated|haptic-test>\n");
 	P("  list [--json]                Registered input providers: ProbeOrder, Enabled (+ source),\n");
 	P("                               the PreferredPlugin override, and the one ranked first ('*').\n");
 	P("  enable | disable <id> [--machine]\n");
@@ -639,6 +778,10 @@ print_usage(void)
 	P("  use <id> [--machine]         PreferredPlugin override: <id> is ranked first, ahead of\n");
 	P("                               ProbeOrder (per user; --machine = HKLM).\n");
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
+	P("  emulated on | off [--machine]\n");
+	P("                               EmulatedControllers gate: off = no qwerty left/right pair, hand\n");
+	P("                               roles unassigned when no provider holds them (per user; --machine\n");
+	P("                               = HKLM). The qwerty head (look-around) stays either way.\n");
 	cli_component_options_usage(&(const struct cli_component_class){
 	    .verb = "input", .noun = "input provider", .cls = target_input_plugin_component_class()});
 	P("  haptic-test [seconds]        Headless: fire vibrations on the hand-role devices (default 5 s).\n");
@@ -677,6 +820,10 @@ cli_cmd_input(int argc, const char **argv)
 	}
 	if (strcmp(verb, "reset") == 0) {
 		return cmd_reset(machine);
+	}
+	if (strcmp(verb, "emulated") == 0) {
+		const int rc = cmd_emulated(argc >= 4 ? argv[3] : NULL, machine);
+		return rc < 0 ? print_usage() : rc;
 	}
 	if (strcmp(verb, "haptic-test") == 0) {
 		return cmd_haptic_test(argc, argv);

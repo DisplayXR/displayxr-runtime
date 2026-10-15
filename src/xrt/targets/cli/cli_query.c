@@ -1133,21 +1133,47 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	struct target_input_plugin_desc descs[16];
 	r->input_provider_count = target_input_plugin_enumerate(descs, 16);
 	r->input_force_qwerty = target_input_plugin_get_force_qwerty();
+	// N7: the gate, and the device list it shapes — recorded before any of
+	// the early returns below, so they are data whatever the verdict.
+	{
+		const char *src = "default";
+		r->input_emulated_controllers = target_input_plugin_get_emulated_controllers(&src) ? 1 : 0;
+		snprintf(r->input_emulated_source, sizeof(r->input_emulated_source), "%s", src);
+		r->input_device_count = 0;
+		if (h->xsysd != NULL) {
+			for (uint32_t i = 0; i < h->xsysd->xdev_count && r->input_device_count < CLI_INPUT_MAX_DEVICES;
+			     i++) {
+				struct xrt_device *xdev = h->xsysd->xdevs[i];
+				if (xdev == NULL) {
+					continue;
+				}
+				const int k = r->input_device_count++;
+				snprintf(r->input_device_str[k], sizeof(r->input_device_str[k]), "%s", xdev->str);
+				r->input_device_type[k] = (int)xdev->device_type;
+			}
+		}
+	}
 	r->input_enabled_count = 0;
 	for (int i = 0; i < r->input_provider_count; i++) {
 		if (descs[i].enabled) {
 			r->input_enabled_count++;
 		}
 	}
+	// N7: what "nobody holds the hands" means depends on the gate — the
+	// qwerty floor, or no role at all. Either is OK; the note must not claim
+	// a pair that was not published.
+	const char *floor = r->input_emulated_controllers != 0
+	                        ? "qwerty keeps the hand roles"
+	                        : "the hand roles stay unassigned, EmulatedControllers=0";
 
 	if (r->input_provider_count == 0) {
-		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: no input provider registered (OK — qwerty keeps the hand roles)");
+		snprintf(r->input_note, sizeof(r->input_note), "not evaluated: no input provider registered (OK — %s)",
+		         floor);
 		return;
 	}
 	if (r->input_force_qwerty) {
-		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: ForceQwerty override set (OK — qwerty keeps the hand roles)");
+		snprintf(r->input_note, sizeof(r->input_note), "not evaluated: ForceQwerty override set (OK — %s)",
+		         floor);
 		return;
 	}
 	// ADR-054 N4: Enabled=0 is the user saying "not this one"; the loader
@@ -1155,9 +1181,8 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	// nothing to evaluate and qwerty correctly keeps the hand roles.
 	if (r->input_enabled_count == 0) {
 		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: all %d registered provider(s) disabled (Enabled=0) "
-		         "(OK — qwerty keeps the hand roles)",
-		         r->input_provider_count);
+		         "not evaluated: all %d registered provider(s) disabled (Enabled=0) (OK — %s)",
+		         r->input_provider_count, floor);
 		return;
 	}
 
@@ -1204,9 +1229,8 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 			         r->input_scan_failed, r->input_scan_declined);
 		} else {
 			snprintf(r->input_note, sizeof(r->input_note),
-			         "not evaluated: all %d registered provider(s) declined "
-			         "(OK — qwerty keeps the hand roles)",
-			         r->input_scan_declined);
+			         "not evaluated: all %d registered provider(s) declined (OK — %s)",
+			         r->input_scan_declined, floor);
 		}
 		return;
 	}
@@ -1217,9 +1241,8 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	r->input_provider_present = t_input_arbiter_provider_holds_roles();
 	if (!r->input_provider_present) {
 		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: provider '%s' loaded but its hardware is absent "
-		         "(OK — qwerty holds the hand roles)",
-		         r->input_provider_id);
+		         "not evaluated: provider '%s' loaded but its hardware is absent (OK — %s)",
+		         r->input_provider_id, floor);
 		return;
 	}
 
@@ -2647,6 +2670,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	P(" :: Input providers (ADR-034)\n");
 	PT("registered:   %d%s\n", r->input_provider_count,
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
+	PT("emulated:     %s (%s)%s\n", r->input_emulated_controllers != 0 ? "on" : "off", r->input_emulated_source,
+	   r->input_emulated_controllers != 0 ? "" : "  — no qwerty pair; hand roles unassigned without a provider");
 	if (r->input_provider_count > 0) {
 		PT("enabled:      %d  (scan: %d declined, %d failed to load, %d refused by the provenance gate)\n",
 		   r->input_enabled_count, r->input_scan_declined, r->input_scan_failed, r->input_scan_untrusted);
@@ -2717,6 +2742,25 @@ cli_query_print_info_text(const struct cli_query_result *r)
 
 static void
 add_conversion_providers_json(cJSON *root, const struct cli_query_result *r);
+
+/*!
+ * N7: the EmulatedControllers gate and the device list, as data, on the
+ * `input_providers` object of both `info --json` and `selftest --json`.
+ */
+static void
+add_input_emulated_json(cJSON *ip, const struct cli_query_result *r)
+{
+	cJSON *em = cJSON_AddObjectToObject(ip, "emulated_controllers");
+	cJSON_AddNumberToObject(em, "value", (double)r->input_emulated_controllers);
+	cJSON_AddStringToObject(em, "source", r->input_emulated_source);
+	cJSON *devs = cJSON_AddArrayToObject(ip, "devices");
+	for (int i = 0; i < r->input_device_count; i++) {
+		cJSON *d = cJSON_CreateObject();
+		cJSON_AddStringToObject(d, "str", r->input_device_str[i]);
+		cJSON_AddNumberToObject(d, "type", (double)r->input_device_type[i]);
+		cJSON_AddItemToArray(devs, d);
+	}
+}
 
 cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
@@ -2994,6 +3038,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
 		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		add_input_emulated_json(ip, r);
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
@@ -3611,6 +3656,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
 		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		add_input_emulated_json(ip, r); // N7: {value, source} + the device list
 		cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
 		cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
 		// N3b: registration ids of the resident rows, priority order —

@@ -423,7 +423,7 @@ fold_path(uint64_t h, const char *dir, const char *name)
 
 /*!
  * One hash per class over what that class reads from the per-user dir:
- * `preferred` (display), `input-preferred` (input), every manifest by its
+ * `preferred` (display), `input-preferred` + `emulated_controllers` (input), every manifest by its
  * suffix (the manifest's `enabled` is the POSIX Enabled switch). A file's
  * absence is folded too, and a manifest added or removed changes its
  * class's name set — so the dir's own mtime is deliberately NOT folded: it
@@ -443,6 +443,10 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 	}
 	out[TARGET_COMPONENT_CLASS_DISPLAY] = fold_path(out[TARGET_COMPONENT_CLASS_DISPLAY], dir, "preferred");
 	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "input-preferred");
+	// N7 (#2143): the EmulatedControllers gate — what `input emulated on|off`
+	// writes; the Windows twin lives under the InputProviders root the
+	// registry watch already covers.
+	out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, "emulated_controllers");
 
 	DIR *d = opendir(dir);
 	if (d == NULL) {
