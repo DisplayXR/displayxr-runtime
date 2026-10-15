@@ -804,6 +804,24 @@ a death to platform policy.
      display-service-class apps, so that a reinstall or OTA does not reset them
      into the blocked state.
 
+   - **Force-idle of a bound runtime while its client is in the foreground**
+     (measured NP02J, 2026-10-15). Some OEM freezers force the runtime service
+     idle about 40 s after a client binds it, even while that client is the
+     foreground activity (`updateAppinfoFlagsForTopSvr force into idle`), so a
+     live 3D session loses its runtime mid-use. A running foreground service does
+     **not** prevent it (tested). The freezer's "user freezer whitelist" is the
+     AOSP device-idle user whitelist (`dumpsys deviceidle whitelist`) — the
+     standard battery-optimization exemption — and with the runtime in it the
+     force-idle decision is never issued (measured). The OEM's own "lock app" /
+     strategy provider is signature-protected and unreachable from a third-party
+     APK. **DisplayXR mitigation:** the runtime's dashboard asks once per install
+     via `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` (one system dialog;
+     re-requestable from its "background exemption" row), the single lever an
+     app has. The user-side alternative is to **lock the runtime app in
+     recents**. **Ask:** treat a bound display-service-class app as exempt
+     without a user dialog — and see the persistence bullet above: an exemption
+     the platform prunes is not a fix.
+
    Two measurements bound what the platform *does* still permit, and both point
    at the same component. **The activity path is allowed where the service path
    is not** — on the NP02J the same `AutoLaunchManagerService` that blocks a

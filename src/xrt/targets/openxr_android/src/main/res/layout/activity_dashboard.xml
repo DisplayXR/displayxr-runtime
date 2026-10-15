@@ -239,6 +239,18 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:visibility="gone" />
+
+                <!-- Battery-optimization exemption: OEM freezers leave a
+                     whitelisted runtime alone. Tap to (re)request. -->
+                <TextView
+                    android:id="@+id/textBatteryOpt"
+                    style="@style/DashboardCardMono"
+                    android:layout_marginTop="8dp"
+                    android:background="?attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

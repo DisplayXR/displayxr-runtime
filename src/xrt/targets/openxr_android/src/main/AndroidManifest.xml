@@ -47,6 +47,13 @@
          bindService() always finds a live service (background-restricted ROMs
          refuse to CREATE one on a client's behalf). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Some OEM freezers force the runtime service idle ~40 s after a client
+         binds it, even with that client in the foreground and a foreground
+         service running; their "user freezer whitelist" is the AOSP device-idle
+         user whitelist. DashboardActivity asks for that exemption once
+         (ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS). See
+         docs/specs/vendor/oem-android-platform-requirements.md R8.6. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!--
         Android 11+ package visibility: the out-of-process runtime SERVICE

@@ -7,19 +7,24 @@
  */
 package org.freedesktop.monado.openxr_runtime
 
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import android.os.PowerManager
 import android.os.Process
+import android.provider.Settings
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.ImageView
@@ -121,6 +126,9 @@ class DashboardActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnRefresh).setOnClickListener { runQuery() }
         findViewById<Button>(R.id.btnCopyJson).setOnClickListener { copyJson() }
         findViewById<Button>(R.id.btnShare).setOnClickListener { shareJson() }
+        findViewById<TextView>(R.id.textBatteryOpt).setOnClickListener {
+            if (!isIgnoringBatteryOptimizations()) requestBatteryOptExemption("tap")
+        }
 
         // The merged APK always ships the service, so the live card, the
         // overlay-permission frame and the shutdown button are unconditional
@@ -144,6 +152,11 @@ class DashboardActivity : AppCompatActivity() {
         tx.commit()
 
         runQuery()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        checkBatteryOptExemption()
     }
 
     override fun onDestroy() {
@@ -393,6 +406,87 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     /*
+     * Battery-optimization exemption.
+     *
+     * Some OEM freezers (measured: CpuFreezerManagerServiceV2 on the NP02J)
+     * force the runtime service idle ~40 s after a client binds it, even while
+     * that client is the foreground activity and the service holds a foreground
+     * service. The freezer's "user freezer whitelist" is the AOSP device-idle
+     * user whitelist, i.e. the standard battery-optimization exemption; with
+     * the runtime whitelisted it never issues the force-idle decision. The
+     * system dialog is the only lever an app has, so ask once per install
+     * (onResume) and let the dashboard row re-ask on tap.
+     */
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun checkBatteryOptExemption() {
+        val granted = isIgnoringBatteryOptimizations()
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val wasRequested = prefs.getBoolean(PREF_BATTERY_OPT_ASKED, false)
+        Log.w(TAG, "[battery_opt] on resume: exemption " +
+            (if (granted) "granted" else "NOT granted") +
+            (if (wasRequested) " (requested before)" else ""))
+        if (wasRequested && prefs.getBoolean(PREF_BATTERY_OPT_PENDING, false)) {
+            // Back from the dialog/settings this run — report what it changed.
+            prefs.edit().putBoolean(PREF_BATTERY_OPT_PENDING, false).apply()
+            Log.w(TAG, "[battery_opt] request result: " +
+                if (granted) "granted" else "declined / still not granted")
+        }
+        updateBatteryOptRow(granted)
+        if (granted || wasRequested) {
+            if (!granted) {
+                Log.w(TAG, "[battery_opt] dialog not shown (asked once already; tap the row to retry)")
+            }
+            return
+        }
+        requestBatteryOptExemption("first run")
+    }
+
+    private fun requestBatteryOptExemption(reason: String) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_BATTERY_OPT_ASKED, true)
+            .putBoolean(PREF_BATTERY_OPT_PENDING, true)
+            .apply()
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+            Log.w(TAG, "[battery_opt] dialog shown ($reason)")
+            return
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "[battery_opt] request dialog unavailable ($reason): $e — trying settings list")
+        } catch (e: SecurityException) {
+            Log.w(TAG, "[battery_opt] request dialog refused ($reason): $e — trying settings list")
+        }
+        try {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            Log.w(TAG, "[battery_opt] battery-optimization settings list shown ($reason)")
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "[battery_opt] no battery-optimization settings on this device: $e")
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_BATTERY_OPT_PENDING, false).apply()
+            Toast.makeText(this, R.string.diag_battery_opt_unavailable, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun updateBatteryOptRow(granted: Boolean) {
+        val row = findViewById<TextView>(R.id.textBatteryOpt)
+        row.text = getString(
+            if (granted) R.string.diag_battery_opt_granted else R.string.diag_battery_opt_not_granted
+        )
+        row.setTextColor(if (granted) 0xFF66BB6A.toInt() else 0xFFFFA726.toInt())
+        row.isClickable = !granted
+    }
+
+    /*
      * Actions.
      */
 
@@ -424,5 +518,9 @@ class DashboardActivity : AppCompatActivity() {
     companion object {
         private const val QUERY_TIMEOUT_MS = 30_000L
         private const val DIAG_CLIENT_NAME = "displayxr-diag"
+        private const val TAG = "DashboardActivity"
+        private const val PREFS_NAME = "displayxr_dashboard"
+        private const val PREF_BATTERY_OPT_ASKED = "battery_opt_asked"
+        private const val PREF_BATTERY_OPT_PENDING = "battery_opt_pending"
     }
 }
