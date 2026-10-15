@@ -146,6 +146,7 @@ comp_cursor_look_fini(struct comp_cursor_look *look)
 	free(look->rgba);
 	look->rgba = NULL;
 	look->os_failed = NULL;
+	look->os_failed_scale = 0.0f;
 	if (look->os_cursor != NULL) {
 		comp_cursor_look_platform_release(look->os_cursor);
 		look->os_cursor = NULL;
