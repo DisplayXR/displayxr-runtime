@@ -19,6 +19,11 @@
  *   desktop_backend_smoke move X Y
  *   desktop_backend_smoke click X Y [left|right|middle] [count]
  *   desktop_backend_smoke scroll DX DY
+ *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
+ *                                                 OS grant from `request` lasts for the rest;
+ *                                                 needed on GNOME, where the portal grant lives
+ *                                                 in memory). Lines: the same commands, quotes
+ *                                                 for spaces, `sleep MS`, `#` comments.
  *
  * It bypasses EVERY safety check of the common layer (consent, kill switch, idle
  * wait, target verification, audit): it is for the person sitting at the machine.
@@ -107,18 +112,9 @@ done(enum u_desktop_result r, const char *msg)
 	return r == U_DESKTOP_OK ? 0 : 1;
 }
 
-int
-main(int argc, char **argv)
+static int
+run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 {
-	if (argc < 2) {
-		fprintf(stderr, "usage: see the header of desktop_backend_smoke.c\n");
-		return 2;
-	}
-	struct u_desktop_backend *b = u_desktop_backend_create_platform();
-	if (b == NULL) {
-		printf("no desktop-control backend on this OS / desktop\n");
-		return 3;
-	}
 	const char *cmd = argv[1];
 	char msg[U_DESKTOP_MSG_SIZE] = {0};
 	enum u_desktop_result r = U_DESKTOP_ERR_UNSUPPORTED;
@@ -236,7 +232,76 @@ main(int argc, char **argv)
 		fprintf(stderr, "unknown command / missing arguments: %s\n", cmd);
 		rc = 2;
 	}
+	return rc;
+}
 
+//! Split @p line in place into argv[1..] (argv[0] = @p prog); "double quotes" group.
+static int
+tokenize(char *line, const char *prog, char **argv, int max)
+{
+	int n = 0;
+	argv[n++] = (char *)prog;
+	char *p = line;
+	while (*p != '\0' && n < max) {
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+			p++;
+		}
+		if (*p == '\0' || *p == '#') {
+			break;
+		}
+		if (*p == '"') {
+			argv[n++] = ++p;
+			while (*p != '\0' && *p != '"') {
+				p++;
+			}
+		} else {
+			argv[n++] = p;
+			while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+				p++;
+			}
+		}
+		if (*p != '\0') {
+			*p++ = '\0';
+		}
+	}
+	return n;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr, "usage: see the header of desktop_backend_smoke.c\n");
+		return 2;
+	}
+	struct u_desktop_backend *b = u_desktop_backend_create_platform();
+	if (b == NULL) {
+		printf("no desktop-control backend on this OS / desktop\n");
+		return 3;
+	}
+	int rc = 0;
+	if (strcmp(argv[1], "script") == 0) {
+		char line[4096];
+		while (fgets(line, sizeof(line), stdin) != NULL) {
+			char *args[32];
+			int n = tokenize(line, argv[0], args, 32);
+			if (n < 2) {
+				continue;
+			}
+			printf("> %s\n", args[1]);
+			if (strcmp(args[1], "sleep") == 0 && n >= 3) {
+				sleep_ms((unsigned)atoi(args[2]));
+				continue;
+			}
+			int r = run_cmd(b, n, args);
+			if (r != 0) {
+				rc = r;
+			}
+			fflush(stdout);
+		}
+	} else {
+		rc = run_cmd(b, argc, argv);
+	}
 	b->destroy(b);
 	return rc;
 }
