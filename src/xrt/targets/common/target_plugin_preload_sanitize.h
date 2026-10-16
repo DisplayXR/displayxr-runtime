@@ -55,6 +55,16 @@ extern "C" {
  * and falls through to the normal load — never worse than the status quo.
  *
  * Call once per plug-in, immediately before `LoadLibraryExW` of the binary.
+ *
+ * Trust (ADR-054 N4b review): the staging directory is per-user and
+ * user-writable, and under UAC an elevated process shares the user's
+ * %LOCALAPPDATA% — so on an ELEVATED host this does nothing (the plug-in
+ * loads its dependencies the normal way; the host-tracer crash it works
+ * around is an in-process engine-app problem, not an elevated-service one).
+ * Elsewhere a staged copy is reused only when its SHA-256 equals the
+ * source's (re-copied otherwise), and is held open share-read-only from
+ * that check until its LoadLibrary returns. Dependencies are not
+ * provenance-gated either way; only the component binary is.
  */
 void
 target_plugin_sanitized_preload(const wchar_t *plugin_binary_path);
