@@ -1,0 +1,1219 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  GNOME desktop control: the RemoteDesktop portal session, the portal
+ *         clipboard and libei — the app's consent and its input path (ADR-056).
+ *
+ * ## Consent and the session lifetime
+ *
+ * org.freedesktop.portal.RemoteDesktop, in the APP's name: CreateSession →
+ * SelectDevices (KEYBOARD | POINTER, persist_mode 2, the restore token from
+ * earlier in this process if any) → Clipboard.RequestClipboard → Start (the
+ * dialog, the first time) → ConnectToEIS → a libei sender context.
+ *
+ * The restore token lives in this process's memory only — DisplayXR never writes
+ * it to disk (ADR-056): a new process asks again. Before the first portal call
+ * the connection registers the host app id with org.freedesktop.host.portal.
+ * Registry (xdg-desktop-portal >= 1.19) — from `DXR_DESKTOP_APP_ID`, else from
+ * the basename of `GIO_LAUNCHED_DESKTOP_FILE` — so the portal attributes the
+ * request, and remembers the approval, per app id.
+ *
+ * A session is opened per action burst and closed after 2 s without input, so
+ * GNOME's remote-access indicator is up only while the agent acts. Re-opening
+ * restores silently with the (single-use, renewed every Start) token. Locking the
+ * screen closes portal sessions (the Session's Closed signal); the next action
+ * re-opens one. Without a token (a portal that did not persist) the session is
+ * kept open instead, since re-opening would prompt.
+ *
+ * ## Input
+ *
+ * libei, dlopen'd ("libei.so.1": no DT_NEEDED — it is absent on Ubuntu 22.04 and
+ * is not one of package_deb_linux.sh's STABLE_SONAMES). Absolute pointer motion is
+ * in the device regions' coordinates, which on GNOME are stage (logical) px — the
+ * extension's space, and right on mixed / fractional scales. The portal's own
+ * NotifyPointerMotionAbsolute D-Bus path is deliberately NOT used: it maps HiDPI
+ * coordinates wrongly (the prototype clicked the wrong window with it).
+ *
+ * Chord keys: a character ("ctrl+z") is the key producing it on the ACTIVE layout
+ * of the keymap libei hands out for the keyboard device (compiled with
+ * xkbcommon, dlopen'd "libxkbcommon.so.0"; the active group follows
+ * EI_EVENT_KEYBOARD_MODIFIERS) — GNOME matches shortcuts by keysym, so on AZERTY
+ * ctrl+z must press the key labelled Z. Named keys are fixed evdev codes.
+ *
+ * ## Text
+ *
+ * Never key codes (an active IME — Korean, Japanese — rewrites them): the text is
+ * offered on the clipboard through the portal (SetSelection; SelectionTransfer →
+ * SelectionWrite → write → SelectionWriteDone) and pasted with Ctrl+V, or
+ * Ctrl+Shift+V in a terminal. The previous clipboard text is read first
+ * (SelectionRead) and offered again after the paste. LIMITATION: a portal
+ * session's selection dies with the session, so ~2 s after the burst (the idle
+ * close) GNOME's clipboard no longer holds either text unless a clipboard manager
+ * kept a copy.
+ *
+ * ## Threading
+ *
+ * Everything here runs on ONE private thread with its own private session-bus
+ * connection (never the observation connection). Callers post a command and
+ * wait for it (bounded); a command a caller gave up on is dropped, or, if it is
+ * already running, completes and is freed by the thread.
+ */
+
+#include "u_desktop_gnome_portal_priv.h"
+
+#include "util/u_logging.h"
+
+#include <dbus/dbus.h>
+#include <linux/input-event-codes.h>
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#define REQUEST_IFACE "org.freedesktop.portal.Request"
+#define SESSION_IFACE "org.freedesktop.portal.Session"
+#define REGISTRY_IFACE "org.freedesktop.host.portal.Registry"
+
+#define RD_DEVICE_KEYBOARD 1u
+#define RD_DEVICE_POINTER 2u
+
+//! Close the session after this long without input.
+#define SESSION_IDLE_CLOSE_MS 2000
+//! The interactive dialog.
+#define INTERACTIVE_START_TIMEOUT_MS (10 * 60 * 1000)
+
+bool
+gnome_portal_libei_available(void)
+{
+	return gnome_libs_ei();
+}
+
+/*
+ * The portal object
+ */
+
+void
+gp_set_msg(char *msg, const char *fmt, ...)
+{
+	if (msg == NULL) {
+		return;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, U_DESKTOP_MSG_SIZE, fmt, ap);
+	va_end(ap);
+}
+
+static void
+wake_thread(struct gnome_portal *p)
+{
+	char b = 1;
+	ssize_t r = write(p->wake[1], &b, 1);
+	(void)r;
+}
+
+/*
+ * a{sv} building and reading
+ */
+
+static void
+dict_add_basic(DBusMessageIter *dict, const char *key, int type, const char *sig, const void *val)
+{
+	DBusMessageIter entry, var;
+	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, sig, &var);
+	dbus_message_iter_append_basic(&var, type, val);
+	dbus_message_iter_close_container(&entry, &var);
+	dbus_message_iter_close_container(dict, &entry);
+}
+
+static void
+dict_add_str(DBusMessageIter *dict, const char *key, const char *val)
+{
+	dict_add_basic(dict, key, DBUS_TYPE_STRING, "s", &val);
+}
+
+static void
+dict_add_u32(DBusMessageIter *dict, const char *key, uint32_t val)
+{
+	dbus_uint32_t v = val;
+	dict_add_basic(dict, key, DBUS_TYPE_UINT32, "u", &v);
+}
+
+void
+gp_dict_add_strv(DBusMessageIter *dict, const char *key, const char *const *vals, int n)
+{
+	DBusMessageIter entry, var, arr;
+	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "as", &var);
+	dbus_message_iter_open_container(&var, DBUS_TYPE_ARRAY, "s", &arr);
+	for (int i = 0; i < n; i++) {
+		dbus_message_iter_append_basic(&arr, DBUS_TYPE_STRING, &vals[i]);
+	}
+	dbus_message_iter_close_container(&var, &arr);
+	dbus_message_iter_close_container(&entry, &var);
+	dbus_message_iter_close_container(dict, &entry);
+}
+
+
+void
+gp_pmsg_begin(struct pmsg *pm, const char *iface, const char *method, const char *session, const char *str)
+{
+	pm->m = dbus_message_new_method_call(PORTAL_DEST, PORTAL_PATH, iface, method);
+	dbus_message_iter_init_append(pm->m, &pm->it);
+	if (session != NULL) {
+		dbus_message_iter_append_basic(&pm->it, DBUS_TYPE_OBJECT_PATH, &session);
+	}
+	if (str != NULL) {
+		dbus_message_iter_append_basic(&pm->it, DBUS_TYPE_STRING, &str);
+	}
+	dbus_message_iter_open_container(&pm->it, DBUS_TYPE_ARRAY, "{sv}", &pm->dict);
+}
+
+//! Send; returns the reply (caller unrefs) or NULL with @p err filled.
+DBusMessage *
+gp_pmsg_send(struct gnome_portal *p, struct pmsg *pm, int timeout_ms, struct gdbus_err *err)
+{
+	dbus_message_iter_close_container(&pm->it, &pm->dict);
+	DBusError e;
+	dbus_error_init(&e);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->c, pm->m, timeout_ms, &e);
+	dbus_message_unref(pm->m);
+	pm->m = NULL;
+	if (err != NULL) {
+		err->name[0] = err->message[0] = '\0';
+		if (dbus_error_is_set(&e)) {
+			snprintf(err->name, sizeof(err->name), "%s", e.name ? e.name : "");
+			snprintf(err->message, sizeof(err->message), "%s", e.message ? e.message : "");
+		}
+	}
+	dbus_error_free(&e);
+	return reply;
+}
+
+static void
+next_token(struct gnome_portal *p, char *out, size_t cap)
+{
+	snprintf(out, cap, "dxr%u_%u", (unsigned)getpid(), ++p->token_counter);
+}
+
+/*
+ * Response / signal handling
+ */
+
+static void
+parse_results(struct gnome_portal *p, DBusMessageIter *arr)
+{
+	DBusMessageIter dict;
+	dbus_message_iter_recurse(arr, &dict);
+	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+		DBusMessageIter entry, var;
+		const char *key = NULL;
+		dbus_message_iter_recurse(&dict, &entry);
+		dbus_message_iter_get_basic(&entry, &key);
+		if (dbus_message_iter_next(&entry) && dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
+			dbus_message_iter_recurse(&entry, &var);
+			int t = dbus_message_iter_get_arg_type(&var);
+			if (key && strcmp(key, "session_handle") == 0 &&
+			    (t == DBUS_TYPE_STRING || t == DBUS_TYPE_OBJECT_PATH)) {
+				const char *s = NULL;
+				dbus_message_iter_get_basic(&var, &s);
+				snprintf(p->resp_session, sizeof(p->resp_session), "%s", s ? s : "");
+			} else if (key && strcmp(key, "restore_token") == 0 && t == DBUS_TYPE_STRING) {
+				const char *s = NULL;
+				dbus_message_iter_get_basic(&var, &s);
+				snprintf(p->resp_token, sizeof(p->resp_token), "%s", s ? s : "");
+				p->resp_has_token = s != NULL && s[0] != '\0';
+			} else if (key && strcmp(key, "clipboard_enabled") == 0 && t == DBUS_TYPE_BOOLEAN) {
+				dbus_bool_t b = FALSE;
+				dbus_message_iter_get_basic(&var, &b);
+				p->resp_clip = b;
+			}
+		}
+		dbus_message_iter_next(&dict);
+	}
+}
+
+
+static void
+ei_teardown(struct gnome_portal *p)
+{
+	gp_xkb_forget(p);
+	for (int i = 0; i < GP_MAX_DEVICES; i++) {
+		if (p->devs[i].dev != NULL) {
+			g_ei.device_unref(p->devs[i].dev);
+		}
+		p->devs[i].dev = NULL;
+		p->devs[i].resumed = false;
+	}
+	if (p->ei != NULL) {
+		g_ei.unref(p->ei); // closes the EIS fd
+		p->ei = NULL;
+	}
+	p->ei_dead = false;
+}
+
+void
+gp_session_forget(struct gnome_portal *p)
+{
+	ei_teardown(p);
+	p->session_open = false;
+	p->session[0] = '\0';
+	p->clipboard_enabled = false;
+	p->clip_owner = false;
+	free(p->clip_text);
+	p->clip_text = NULL;
+	pthread_mutex_lock(&p->lock);
+	p->session_open_shared = false;
+	if (!p->have_token && p->access == U_DESKTOP_ACCESS_GRANTED) {
+		// Nothing to restore from: the next action needs a new request.
+		p->access = U_DESKTOP_ACCESS_UNKNOWN;
+	}
+	pthread_mutex_unlock(&p->lock);
+}
+
+static void
+session_close(struct gnome_portal *p)
+{
+	if (!p->session_open && p->session[0] == '\0') {
+		ei_teardown(p);
+		return;
+	}
+	ei_teardown(p);
+	if (p->session[0] != '\0' && p->c != NULL) {
+		DBusMessage *m = dbus_message_new_method_call(PORTAL_DEST, p->session, SESSION_IFACE, "Close");
+		if (m != NULL) {
+			dbus_message_set_no_reply(m, TRUE);
+			dbus_connection_send(p->c, m, NULL);
+			dbus_connection_flush(p->c);
+			dbus_message_unref(m);
+		}
+	}
+	U_LOG_I("desktop/gnome: closed the RemoteDesktop session");
+	gp_session_forget(p);
+}
+
+
+
+static void
+handle_message(struct gnome_portal *p, DBusMessage *m)
+{
+	if (dbus_message_get_type(m) != DBUS_MESSAGE_TYPE_SIGNAL) {
+		return;
+	}
+	const char *path = dbus_message_get_path(m);
+	if (dbus_message_is_signal(m, REQUEST_IFACE, "Response")) {
+		if (path == NULL || strcmp(path, p->wait_path) != 0) {
+			return;
+		}
+		DBusMessageIter it;
+		if (!dbus_message_iter_init(m, &it) || dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_UINT32) {
+			return;
+		}
+		dbus_uint32_t code = 2;
+		dbus_message_iter_get_basic(&it, &code);
+		p->resp_code = code;
+		if (dbus_message_iter_next(&it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
+			parse_results(p, &it);
+		}
+		p->resp_done = true;
+	} else if (dbus_message_is_signal(m, SESSION_IFACE, "Closed")) {
+		if (path != NULL && p->session[0] != '\0' && strcmp(path, p->session) == 0) {
+			U_LOG_W(
+			    "desktop/gnome: the portal closed the RemoteDesktop session (screen lock / revoked); "
+			    "the next action re-opens one");
+			gp_session_forget(p);
+		}
+	} else if (dbus_message_is_signal(m, CLIP_IFACE, "SelectionTransfer")) {
+		const char *session = NULL, *mime = NULL;
+		dbus_uint32_t serial = 0;
+		if (dbus_message_get_args(m, NULL, DBUS_TYPE_OBJECT_PATH, &session, DBUS_TYPE_STRING, &mime,
+		                          DBUS_TYPE_UINT32, &serial, DBUS_TYPE_INVALID) &&
+		    p->session_open && strcmp(session, p->session) == 0) {
+			gp_serve_transfer(p, mime, serial);
+		}
+	} else if (dbus_message_is_signal(m, CLIP_IFACE, "SelectionOwnerChanged")) {
+		DBusMessageIter it;
+		const char *session = NULL;
+		if (!dbus_message_iter_init(m, &it) || dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_OBJECT_PATH) {
+			return;
+		}
+		dbus_message_iter_get_basic(&it, &session);
+		if (!p->session_open || strcmp(session, p->session) != 0 || !dbus_message_iter_next(&it) ||
+		    dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_ARRAY) {
+			return;
+		}
+		bool owner = false;
+		DBusMessageIter dict;
+		dbus_message_iter_recurse(&it, &dict);
+		while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+			DBusMessageIter entry, var;
+			const char *key = NULL;
+			dbus_message_iter_recurse(&dict, &entry);
+			dbus_message_iter_get_basic(&entry, &key);
+			if (key && strcmp(key, "session_is_owner") == 0 && dbus_message_iter_next(&entry)) {
+				dbus_message_iter_recurse(&entry, &var);
+				if (dbus_message_iter_get_arg_type(&var) == DBUS_TYPE_BOOLEAN) {
+					dbus_bool_t b = FALSE;
+					dbus_message_iter_get_basic(&var, &b);
+					owner = b;
+				}
+			}
+			dbus_message_iter_next(&dict);
+		}
+		p->clip_owner = owner;
+	} else if (dbus_message_is_signal(m, DBUS_INTERFACE_LOCAL, "Disconnected")) {
+		U_LOG_W("desktop/gnome: lost the portal D-Bus connection");
+		gp_session_forget(p);
+	}
+}
+
+/*
+ * libei events
+ */
+
+static void
+ei_pump(struct gnome_portal *p)
+{
+	if (p->ei == NULL) {
+		return;
+	}
+	g_ei.dispatch(p->ei);
+	struct ei_event *ev;
+	while ((ev = g_ei.get_event(p->ei)) != NULL) {
+		int type = g_ei.event_get_type(ev);
+		switch (type) {
+		case EIX_EVENT_CONNECT: U_LOG_I("desktop/gnome: libei connected"); break;
+		case EIX_EVENT_DISCONNECT:
+			U_LOG_W("desktop/gnome: the EIS server disconnected libei");
+			p->ei_dead = true;
+			break;
+		case EIX_EVENT_SEAT_ADDED: {
+			struct ei_seat *seat = g_ei.event_get_seat(ev);
+			g_ei.seat_bind_capabilities(seat, EIX_CAP_POINTER_ABSOLUTE, EIX_CAP_BUTTON, EIX_CAP_SCROLL,
+			                            EIX_CAP_KEYBOARD, NULL);
+			break;
+		}
+		case EIX_EVENT_DEVICE_ADDED: {
+			struct ei_device *d = g_ei.event_get_device(ev);
+			for (int i = 0; i < GP_MAX_DEVICES; i++) {
+				if (p->devs[i].dev == NULL) {
+					p->devs[i].dev = g_ei.device_ref(d);
+					p->devs[i].resumed = false;
+					U_LOG_I("desktop/gnome: libei device \"%s\"%s%s%s%s", g_ei.device_get_name(d),
+					        g_ei.device_has_capability(d, EIX_CAP_POINTER_ABSOLUTE) ? " abs" : "",
+					        g_ei.device_has_capability(d, EIX_CAP_BUTTON) ? " button" : "",
+					        g_ei.device_has_capability(d, EIX_CAP_SCROLL) ? " scroll" : "",
+					        g_ei.device_has_capability(d, EIX_CAP_KEYBOARD) ? " keyboard" : "");
+					break;
+				}
+			}
+			break;
+		}
+		case EIX_EVENT_DEVICE_REMOVED: {
+			struct ei_device *d = g_ei.event_get_device(ev);
+			for (int i = 0; i < GP_MAX_DEVICES; i++) {
+				if (p->devs[i].dev == d) {
+					if (p->xkb_dev == d) {
+						gp_xkb_forget(p);
+					}
+					g_ei.device_unref(d);
+					p->devs[i].dev = NULL;
+					p->devs[i].resumed = false;
+				}
+			}
+			break;
+		}
+		case EIX_EVENT_DEVICE_PAUSED:
+		case EIX_EVENT_DEVICE_RESUMED: {
+			struct ei_device *d = g_ei.event_get_device(ev);
+			for (int i = 0; i < GP_MAX_DEVICES; i++) {
+				if (p->devs[i].dev == d) {
+					p->devs[i].resumed = type == EIX_EVENT_DEVICE_RESUMED;
+					if (p->devs[i].resumed) {
+						g_ei.device_start_emulating(d, ++p->seq);
+					}
+				}
+			}
+			break;
+		}
+		case EIX_EVENT_KEYBOARD_MODIFIERS:
+			if (g_ei.event_keyboard_get_xkb_group != NULL) {
+				p->xkb_group = g_ei.event_keyboard_get_xkb_group(ev);
+			}
+			break;
+		default: break;
+		}
+		g_ei.event_unref(ev);
+	}
+	if (p->ei_dead) {
+		ei_teardown(p);
+	}
+}
+
+//! A resumed device with @p cap; with @p prefer_abs, one that is also absolute first.
+struct ei_device *
+gp_find_dev(struct gnome_portal *p, int cap, bool prefer_abs)
+{
+	struct ei_device *any = NULL;
+	for (int i = 0; i < GP_MAX_DEVICES; i++) {
+		struct ei_device *d = p->devs[i].dev;
+		if (d == NULL || !p->devs[i].resumed || !g_ei.device_has_capability(d, cap)) {
+			continue;
+		}
+		if (!prefer_abs || g_ei.device_has_capability(d, EIX_CAP_POINTER_ABSOLUTE)) {
+			return d;
+		}
+		if (any == NULL) {
+			any = d;
+		}
+	}
+	return any;
+}
+
+/*
+ * The loop
+ */
+
+//! Wait up to @p timeout_ms for anything (a command, a D-Bus message, libei) and handle it.
+void
+gp_pump(struct gnome_portal *p, int timeout_ms)
+{
+	struct pollfd fds[3];
+	int n = 0;
+	fds[n++] = (struct pollfd){p->wake[0], POLLIN, 0};
+	int dbus_fd = -1;
+	if (p->c != NULL && dbus_connection_get_unix_fd(p->c, &dbus_fd)) {
+		fds[n++] = (struct pollfd){dbus_fd, POLLIN, 0};
+	}
+	if (p->ei != NULL) {
+		fds[n++] = (struct pollfd){g_ei.get_fd(p->ei), POLLIN, 0};
+	}
+	if (p->c != NULL && dbus_connection_get_dispatch_status(p->c) == DBUS_DISPATCH_DATA_REMAINS) {
+		timeout_ms = 0;
+	}
+	poll(fds, (nfds_t)n, timeout_ms);
+	if (fds[0].revents & POLLIN) {
+		char buf[64];
+		while (read(p->wake[0], buf, sizeof(buf)) > 0) {
+		}
+	}
+	if (p->c != NULL) {
+		dbus_connection_read_write(p->c, 0);
+		DBusMessage *m;
+		while ((m = dbus_connection_pop_message(p->c)) != NULL) {
+			handle_message(p, m);
+			dbus_message_unref(m);
+		}
+	}
+	ei_pump(p);
+}
+
+static bool
+quitting(struct gnome_portal *p)
+{
+	pthread_mutex_lock(&p->lock);
+	bool q = p->quit;
+	pthread_mutex_unlock(&p->lock);
+	return q;
+}
+
+//! Wait for the Response of request @p path.
+static bool
+wait_response(struct gnome_portal *p, uint32_t timeout_ms)
+{
+	uint64_t deadline = gdbus_now_ms() + timeout_ms;
+	while (!p->resp_done) {
+		uint64_t now = gdbus_now_ms();
+		if (now >= deadline || quitting(p) || p->c == NULL) {
+			return false;
+		}
+		uint64_t left = deadline - now;
+		gp_pump(p, left > 100 ? 100 : (int)left);
+	}
+	return true;
+}
+
+static void
+expect_response(struct gnome_portal *p, const char *token)
+{
+	snprintf(p->wait_path, sizeof(p->wait_path), "%s/request/%s/%s", PORTAL_PATH, p->sender, token);
+	p->resp_done = false;
+	p->resp_code = 2;
+	p->resp_session[0] = '\0';
+	p->resp_token[0] = '\0';
+	p->resp_has_token = false;
+	p->resp_clip = false;
+}
+
+//! The request handle the method returned (older portals may not follow the token convention).
+static void
+take_request_handle(struct gnome_portal *p, DBusMessage *reply)
+{
+	const char *handle = NULL;
+	if (dbus_message_get_args(reply, NULL, DBUS_TYPE_OBJECT_PATH, &handle, DBUS_TYPE_INVALID) && handle &&
+	    strcmp(handle, p->wait_path) != 0) {
+		snprintf(p->wait_path, sizeof(p->wait_path), "%s", handle);
+	}
+}
+
+static void
+app_id_from_env(char *out, size_t cap)
+{
+	out[0] = '\0';
+	const char *id = getenv("DXR_DESKTOP_APP_ID");
+	if (id != NULL && id[0] != '\0') {
+		snprintf(out, cap, "%s", id);
+		return;
+	}
+	const char *df = getenv("GIO_LAUNCHED_DESKTOP_FILE");
+	if (df != NULL && df[0] != '\0') {
+		const char *base = strrchr(df, '/');
+		base = base ? base + 1 : df;
+		snprintf(out, cap, "%s", base);
+		size_t len = strlen(out);
+		if (len > 8 && strcmp(out + len - 8, ".desktop") == 0) {
+			out[len - 8] = '\0';
+		}
+	}
+}
+
+//! org.freedesktop.host.portal.Registry.Register — must precede every other portal call on the connection.
+static void
+register_app_once(struct gnome_portal *p)
+{
+	if (p->registered_tried) {
+		return;
+	}
+	p->registered_tried = true;
+	char app_id[256];
+	app_id_from_env(app_id, sizeof(app_id));
+	if (app_id[0] == '\0') {
+		U_LOG_W(
+		    "desktop/gnome: no app id (set DXR_DESKTOP_APP_ID, or launch from a .desktop file) — the "
+		    "portal cannot attribute the request to an app, and its approval will not persist across runs");
+		return;
+	}
+	struct pmsg pm;
+	gp_pmsg_begin(&pm, REGISTRY_IFACE, "Register", NULL, app_id);
+	struct gdbus_err err;
+	DBusMessage *reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	if (reply != NULL) {
+		U_LOG_I("desktop/gnome: registered host app id \"%s\" with the portal", app_id);
+		dbus_message_unref(reply);
+	} else {
+		U_LOG_W(
+		    "desktop/gnome: could not register app id \"%s\" with the portal (%s%s%s) — needs "
+		    "xdg-desktop-portal >= 1.19; the approval may not persist across runs",
+		    app_id, err.name, err.message[0] ? ": " : "", err.message);
+	}
+}
+
+static bool
+ei_ready(struct gnome_portal *p)
+{
+	return p->ei != NULL && gp_find_dev(p, EIX_CAP_POINTER_ABSOLUTE, false) != NULL &&
+	       gp_find_dev(p, EIX_CAP_KEYBOARD, false) != NULL;
+}
+
+static enum u_desktop_result
+connect_eis(struct gnome_portal *p, char *msg)
+{
+	struct pmsg pm;
+	gp_pmsg_begin(&pm, RD_IFACE, "ConnectToEIS", p->session, NULL);
+	struct gdbus_err err;
+	DBusMessage *reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	int fd = -1;
+	if (reply == NULL || !dbus_message_get_args(reply, NULL, DBUS_TYPE_UNIX_FD, &fd, DBUS_TYPE_INVALID) || fd < 0) {
+		gp_set_msg(msg, "ConnectToEIS failed: %s %s", err.name, err.message);
+		if (reply != NULL) {
+			dbus_message_unref(reply);
+		}
+		return U_DESKTOP_ERR_FAILED;
+	}
+	dbus_message_unref(reply);
+
+	p->ei = g_ei.new_sender(NULL);
+	if (p->ei == NULL) {
+		close(fd);
+		gp_set_msg(msg, "ei_new_sender failed");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	g_ei.configure_name(p->ei, "DisplayXR desktop control");
+	if (g_ei.setup_backend_fd(p->ei, fd) != 0) { // takes the fd
+		ei_teardown(p);
+		gp_set_msg(msg, "ei_setup_backend_fd failed");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	uint64_t deadline = gdbus_now_ms() + 3000;
+	while (!ei_ready(p) && p->ei != NULL && gdbus_now_ms() < deadline && !quitting(p)) {
+		gp_pump(p, 20);
+	}
+	if (p->ei == NULL) {
+		gp_set_msg(msg, "the EIS server refused the libei connection");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	if (!ei_ready(p)) {
+		U_LOG_W("desktop/gnome: libei: no%s%s device resumed within 3 s — continuing with what there is",
+		        gp_find_dev(p, EIX_CAP_POINTER_ABSOLUTE, false) ? "" : " absolute-pointer",
+		        gp_find_dev(p, EIX_CAP_KEYBOARD, false) ? "" : " keyboard");
+	}
+	return U_DESKTOP_OK;
+}
+
+//! CreateSession → SelectDevices → RequestClipboard → Start → ConnectToEIS.
+static enum u_desktop_result
+open_session(struct gnome_portal *p, bool interactive, char *msg)
+{
+	if (p->c == NULL) {
+		gp_set_msg(msg, "no D-Bus session bus");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	register_app_once(p);
+	session_close(p);
+
+	char token[64], stoken[64];
+	struct gdbus_err err;
+
+	// CreateSession
+	next_token(p, token, sizeof(token));
+	next_token(p, stoken, sizeof(stoken));
+	expect_response(p, token);
+	struct pmsg pm;
+	gp_pmsg_begin(&pm, RD_IFACE, "CreateSession", NULL, NULL);
+	dict_add_str(&pm.dict, "handle_token", token);
+	dict_add_str(&pm.dict, "session_handle_token", stoken);
+	DBusMessage *reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	if (reply == NULL) {
+		gp_set_msg(msg, "RemoteDesktop.CreateSession failed: %s %s", err.name, err.message);
+		return U_DESKTOP_ERR_FAILED;
+	}
+	take_request_handle(p, reply);
+	dbus_message_unref(reply);
+	if (!wait_response(p, CALL_TIMEOUT_MS) || p->resp_code != 0 || p->resp_session[0] == '\0') {
+		gp_set_msg(msg, "RemoteDesktop.CreateSession: no session (response %u)", p->resp_code);
+		return U_DESKTOP_ERR_FAILED;
+	}
+	snprintf(p->session, sizeof(p->session), "%s", p->resp_session);
+	p->session_open = true;
+
+	// SelectDevices
+	char restore[1024] = {0};
+	pthread_mutex_lock(&p->lock);
+	if (p->have_token) {
+		snprintf(restore, sizeof(restore), "%s", p->token);
+	}
+	pthread_mutex_unlock(&p->lock);
+	next_token(p, token, sizeof(token));
+	expect_response(p, token);
+	gp_pmsg_begin(&pm, RD_IFACE, "SelectDevices", p->session, NULL);
+	dict_add_str(&pm.dict, "handle_token", token);
+	dict_add_u32(&pm.dict, "types", RD_DEVICE_KEYBOARD | RD_DEVICE_POINTER);
+	if (p->rd_version >= 2 && p->input) {
+		dict_add_u32(&pm.dict, "persist_mode", 2); // until revoked
+		if (restore[0] != '\0') {
+			dict_add_str(&pm.dict, "restore_token", restore);
+		}
+	}
+	reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	if (reply == NULL) {
+		gp_set_msg(msg, "RemoteDesktop.SelectDevices failed: %s %s", err.name, err.message);
+		session_close(p);
+		return U_DESKTOP_ERR_FAILED;
+	}
+	take_request_handle(p, reply);
+	dbus_message_unref(reply);
+	if (!wait_response(p, CALL_TIMEOUT_MS) || p->resp_code != 0) {
+		gp_set_msg(msg, "RemoteDesktop.SelectDevices refused (response %u)", p->resp_code);
+		session_close(p);
+		return U_DESKTOP_ERR_FAILED;
+	}
+
+	// RequestClipboard — before Start. No Request object, no response.
+	if (p->have_clipboard_portal && p->input) {
+		gp_pmsg_begin(&pm, CLIP_IFACE, "RequestClipboard", p->session, NULL);
+		reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+		if (reply != NULL) {
+			dbus_message_unref(reply);
+		} else {
+			U_LOG_W("desktop/gnome: Clipboard.RequestClipboard failed (%s) — type_text unavailable",
+			        err.name);
+		}
+	}
+
+	// Start — the dialog (or a silent restore).
+	next_token(p, token, sizeof(token));
+	expect_response(p, token);
+	gp_pmsg_begin(&pm, RD_IFACE, "Start", p->session, "");
+	dict_add_str(&pm.dict, "handle_token", token);
+	reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	if (reply == NULL) {
+		gp_set_msg(msg, "RemoteDesktop.Start failed: %s %s", err.name, err.message);
+		session_close(p);
+		return U_DESKTOP_ERR_FAILED;
+	}
+	take_request_handle(p, reply);
+	dbus_message_unref(reply);
+	uint32_t start_timeout = interactive ? INTERACTIVE_START_TIMEOUT_MS : RESTORE_START_TIMEOUT_MS;
+	if (!wait_response(p, start_timeout)) {
+		gp_set_msg(msg, interactive ? "no answer to the remote-desktop dialog"
+		                            : "the portal did not restore the session silently (a dialog may be up)");
+		session_close(p);
+		return U_DESKTOP_ERR_TIMEOUT;
+	}
+	if (p->resp_code != 0) {
+		bool cancelled = p->resp_code == 1;
+		gp_set_msg(msg, cancelled ? "the user declined remote control" : "the portal refused the session");
+		session_close(p);
+		if (!interactive) {
+			// The token is no good any more.
+			pthread_mutex_lock(&p->lock);
+			p->have_token = false;
+			p->token[0] = '\0';
+			p->access = cancelled ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
+			pthread_mutex_unlock(&p->lock);
+		}
+		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	p->clipboard_enabled = p->resp_clip;
+	pthread_mutex_lock(&p->lock);
+	// Tokens are single use: keep the new one, or none.
+	p->have_token = p->resp_has_token;
+	snprintf(p->token, sizeof(p->token), "%s", p->resp_has_token ? p->resp_token : "");
+	p->session_open_shared = true;
+	bool have_token = p->have_token;
+	pthread_mutex_unlock(&p->lock);
+	if (!p->input) {
+		// Consent only: the user answered; nothing to drive.
+		U_LOG_I("desktop/gnome: remote-control consent granted (no libei: observation only)");
+		session_close(p);
+		return U_DESKTOP_OK;
+	}
+	if (!have_token && !p->warned_no_token) {
+		p->warned_no_token = true;
+		U_LOG_W(
+		    "desktop/gnome: the portal returned no restore token (RemoteDesktop v%u) — keeping the session "
+		    "open instead of closing it when idle",
+		    p->rd_version);
+	}
+	if (!p->clipboard_enabled && p->have_clipboard_portal) {
+		U_LOG_W("desktop/gnome: the session has no clipboard access — type_text unavailable");
+	}
+
+	enum u_desktop_result r = connect_eis(p, msg);
+	if (r != U_DESKTOP_OK) {
+		session_close(p);
+		return r;
+	}
+	p->last_use_ms = gdbus_now_ms();
+	U_LOG_I("desktop/gnome: RemoteDesktop session %s (%s)", interactive ? "granted" : "restored", p->session);
+	return U_DESKTOP_OK;
+}
+
+//! Bring-up knob for desktop_backend_smoke: an action with no grant opens the portal dialog itself.
+static bool
+dev_prompt_on_action(void)
+{
+	const char *v = getenv("DXR_DESKTOP_GNOME_PROMPT_ON_ACTION");
+	return v != NULL && strcmp(v, "1") == 0;
+}
+
+enum u_desktop_result
+gp_ensure_session(struct gnome_portal *p, char *msg)
+{
+	if (!p->input) {
+		gp_set_msg(msg, "no input on this system (libei.so.1 missing, or RemoteDesktop portal < v2)");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	if (p->session_open && p->ei != NULL) {
+		p->last_use_ms = gdbus_now_ms();
+		return U_DESKTOP_OK;
+	}
+	pthread_mutex_lock(&p->lock);
+	bool have_token = p->have_token;
+	enum u_desktop_access acc = p->access;
+	pthread_mutex_unlock(&p->lock);
+	if (!have_token && dev_prompt_on_action()) {
+		// Bring-up only (desktop_backend_smoke runs one command per process, and
+		// the token never outlives a process): show the portal's dialog now. It
+		// is still the OS's consent — the user must approve it within the
+		// silent-restore timeout (15 s).
+		U_LOG_W("desktop/gnome: DXR_DESKTOP_GNOME_PROMPT_ON_ACTION=1 — asking the portal from an action");
+		enum u_desktop_result r = open_session(p, false, msg);
+		pthread_mutex_lock(&p->lock);
+		p->access = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		pthread_mutex_unlock(&p->lock);
+		return r;
+	}
+	if (!have_token) {
+		gp_set_msg(msg, acc == U_DESKTOP_ACCESS_GRANTED
+		                    ? "the remote-desktop session ended and cannot be restored — request access again"
+		                    : "remote control was not granted to this app — request access first");
+		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	return open_session(p, false, msg);
+}
+
+/*
+ * Commands (run on the thread)
+ */
+
+static enum u_desktop_result
+cmd_request(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_access acc;
+	pthread_mutex_lock(&p->lock);
+	bool already = p->have_token || p->session_open_shared || p->consent_only_granted;
+	pthread_mutex_unlock(&p->lock);
+	if (already) {
+		acc = U_DESKTOP_ACCESS_GRANTED;
+	} else {
+		enum u_desktop_result r = open_session(p, true, c->msg);
+		acc = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		if (r == U_DESKTOP_OK && !p->input) {
+			pthread_mutex_lock(&p->lock);
+			p->consent_only_granted = true;
+			pthread_mutex_unlock(&p->lock);
+		}
+		if (r != U_DESKTOP_OK) {
+			U_LOG_W("desktop/gnome: access request: %s", c->msg);
+		}
+	}
+	pthread_mutex_lock(&p->lock);
+	p->access = acc;
+	p->pending = false;
+	pthread_mutex_unlock(&p->lock);
+	c->done(c->done_ctx, acc);
+	return U_DESKTOP_OK;
+}
+
+
+
+/*
+ * Thread
+ */
+
+void
+gp_cmd_free(struct gp_cmd *c)
+{
+	free(c->text);
+	free(c);
+}
+
+static void *
+portal_thread(void *arg)
+{
+	struct gnome_portal *p = arg;
+	DBusError e;
+	dbus_error_init(&e);
+	p->c = dbus_bus_get_private(DBUS_BUS_SESSION, &e);
+	if (p->c == NULL) {
+		U_LOG_W("desktop/gnome: portal thread: no session bus (%s)", dbus_error_is_set(&e) ? e.message : "?");
+		dbus_error_free(&e);
+	} else {
+		dbus_connection_set_exit_on_disconnect(p->c, FALSE);
+		const char *unique = dbus_bus_get_unique_name(p->c);
+		size_t j = 0;
+		for (const char *s = unique ? unique : ""; *s && j + 1 < sizeof(p->sender); s++) {
+			if (*s == ':') {
+				continue;
+			}
+			p->sender[j++] = *s == '.' ? '_' : *s;
+		}
+		p->sender[j] = '\0';
+		static const char *const rules[] = {
+		    "type='signal',interface='" REQUEST_IFACE "',member='Response'",
+		    "type='signal',interface='" SESSION_IFACE "',member='Closed'",
+		    "type='signal',interface='" CLIP_IFACE "'",
+		};
+		for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+			dbus_bus_add_match(p->c, rules[i], &e);
+			if (dbus_error_is_set(&e)) {
+				U_LOG_W("desktop/gnome: AddMatch %s: %s", rules[i], e.message);
+				dbus_error_free(&e);
+			}
+		}
+	}
+
+	pthread_mutex_lock(&p->lock);
+	while (!p->quit) {
+		struct gp_cmd *c = p->head;
+		if (c != NULL) {
+			p->head = c->next;
+			if (p->head == NULL) {
+				p->tail = NULL;
+			}
+			c->started = true;
+			pthread_mutex_unlock(&p->lock);
+
+			c->msg[0] = '\0';
+			enum u_desktop_result r = c->fn(p, c);
+
+			pthread_mutex_lock(&p->lock);
+			c->result = r;
+			c->finished = true;
+			if (c->async || c->abandoned) {
+				gp_cmd_free(c);
+			} else {
+				pthread_cond_broadcast(&p->cond);
+			}
+			continue;
+		}
+		pthread_mutex_unlock(&p->lock);
+
+		// Close the session after a quiet spell (only when it can be restored).
+		int timeout = 250;
+		if (p->session_open) {
+			pthread_mutex_lock(&p->lock);
+			bool have_token = p->have_token;
+			pthread_mutex_unlock(&p->lock);
+			uint64_t idle = gdbus_now_ms() - p->last_use_ms;
+			if (have_token && idle >= SESSION_IDLE_CLOSE_MS) {
+				session_close(p);
+			} else if (have_token) {
+				uint64_t left = SESSION_IDLE_CLOSE_MS - idle;
+				timeout = left < 250 ? (int)left + 1 : 250;
+			}
+		}
+		gp_pump(p, timeout);
+		pthread_mutex_lock(&p->lock);
+	}
+	// Drop what is queued: async requests still get their one callback.
+	struct gp_cmd *c = p->head;
+	p->head = p->tail = NULL;
+	pthread_mutex_unlock(&p->lock);
+	while (c != NULL) {
+		struct gp_cmd *next = c->next;
+		pthread_mutex_lock(&p->lock);
+		if (c->async) {
+			pthread_mutex_unlock(&p->lock);
+			c->done(c->done_ctx, U_DESKTOP_ACCESS_DENIED);
+			gp_cmd_free(c);
+		} else {
+			c->result = U_DESKTOP_ERR_FAILED;
+			snprintf(c->msg, sizeof(c->msg), "desktop control is shutting down");
+			c->finished = true;
+			if (c->abandoned) {
+				gp_cmd_free(c);
+			}
+			pthread_cond_broadcast(&p->cond);
+			pthread_mutex_unlock(&p->lock);
+		}
+		c = next;
+	}
+
+	session_close(p);
+	if (p->c != NULL) {
+		dbus_connection_close(p->c);
+		dbus_connection_unref(p->c);
+		p->c = NULL;
+	}
+	return NULL;
+}
+
+//! Under p->lock.
+static bool
+ensure_thread_locked(struct gnome_portal *p)
+{
+	if (p->thread_started) {
+		return true;
+	}
+	if (pthread_create(&p->thread, NULL, portal_thread, p) != 0) {
+		return false;
+	}
+	p->thread_started = true;
+	return true;
+}
+
+static void
+enqueue_locked(struct gnome_portal *p, struct gp_cmd *c)
+{
+	c->next = NULL;
+	if (p->tail != NULL) {
+		p->tail->next = c;
+	} else {
+		p->head = c;
+	}
+	p->tail = c;
+}
+
+//! Run @p c on the thread and wait at most @p timeout_ms. Takes ownership of @p c.
+enum u_desktop_result
+gp_run_sync(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char *msg)
+{
+	pthread_mutex_lock(&p->lock);
+	if (p->quit || !ensure_thread_locked(p)) {
+		pthread_mutex_unlock(&p->lock);
+		gp_cmd_free(c);
+		gp_set_msg(msg, "desktop control is shutting down");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	enqueue_locked(p, c);
+	wake_thread(p);
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint64_t ns = (uint64_t)ts.tv_nsec + (uint64_t)timeout_ms * 1000000ull;
+	ts.tv_sec += (time_t)(ns / 1000000000ull);
+	ts.tv_nsec = (long)(ns % 1000000000ull);
+	while (!c->finished) {
+		if (pthread_cond_timedwait(&p->cond, &p->lock, &ts) == ETIMEDOUT) {
+			break;
+		}
+	}
+	enum u_desktop_result r;
+	if (c->finished) {
+		r = c->result;
+		if (msg != NULL && c->msg[0] != '\0') {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "%s", c->msg);
+		}
+		gp_cmd_free(c);
+	} else if (!c->started) {
+		// Still queued: unlink it.
+		struct gp_cmd **pp = &p->head;
+		struct gp_cmd *prev = NULL;
+		while (*pp != NULL && *pp != c) {
+			prev = *pp;
+			pp = &(*pp)->next;
+		}
+		if (*pp == c) {
+			*pp = c->next;
+			if (p->tail == c) {
+				p->tail = prev;
+			}
+		}
+		gp_cmd_free(c);
+		r = U_DESKTOP_ERR_TIMEOUT;
+		gp_set_msg(msg, "the portal is busy (an access dialog may be open)");
+	} else {
+		c->abandoned = true; // the thread frees it
+		r = U_DESKTOP_ERR_TIMEOUT;
+		gp_set_msg(msg, "the portal did not answer in time");
+	}
+	pthread_mutex_unlock(&p->lock);
+	return r;
+}
+
+struct gp_cmd *
+gp_cmd_new(gp_cmd_fn fn)
+{
+	struct gp_cmd *c = calloc(1, sizeof(*c));
+	if (c != NULL) {
+		c->fn = fn;
+	}
+	return c;
+}
+
+/*
+ * Public
+ */
+
+struct gnome_portal *
+gnome_portal_create(uint32_t rd_version, bool have_clipboard)
+{
+	if (rd_version == 0) {
+		return NULL;
+	}
+	struct gnome_portal *p = calloc(1, sizeof(*p));
+	if (p == NULL) {
+		return NULL;
+	}
+	if (pipe(p->wake) != 0) {
+		free(p);
+		return NULL;
+	}
+	fcntl(p->wake[0], F_SETFL, O_NONBLOCK);
+	fcntl(p->wake[1], F_SETFL, O_NONBLOCK);
+	fcntl(p->wake[0], F_SETFD, FD_CLOEXEC);
+	fcntl(p->wake[1], F_SETFD, FD_CLOEXEC);
+	pthread_mutex_init(&p->lock, NULL);
+	pthread_condattr_t ca;
+	pthread_condattr_init(&ca);
+	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+	pthread_cond_init(&p->cond, &ca);
+	pthread_condattr_destroy(&ca);
+	p->rd_version = rd_version;
+	p->have_clipboard_portal = have_clipboard;
+	p->input = rd_version >= 2 && gnome_portal_libei_available();
+	p->access = U_DESKTOP_ACCESS_UNKNOWN;
+	return p;
+}
+
+void
+gnome_portal_destroy(struct gnome_portal *p)
+{
+	if (p == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&p->lock);
+	p->quit = true;
+	bool started = p->thread_started;
+	pthread_mutex_unlock(&p->lock);
+	wake_thread(p);
+	if (started) {
+		pthread_join(p->thread, NULL);
+	}
+	close(p->wake[0]);
+	close(p->wake[1]);
+	pthread_cond_destroy(&p->cond);
+	pthread_mutex_destroy(&p->lock);
+	// Forget the token (memory only, never written anywhere).
+	memset(p->token, 0, sizeof(p->token));
+	free(p);
+}
+
+bool
+gnome_portal_has_input(struct gnome_portal *p)
+{
+	return p->input;
+}
+
+enum u_desktop_access
+gnome_portal_access(struct gnome_portal *p)
+{
+	pthread_mutex_lock(&p->lock);
+	enum u_desktop_access a = p->access;
+	if (p->pending) {
+		a = U_DESKTOP_ACCESS_PENDING;
+	} else if (p->have_token || p->session_open_shared || p->consent_only_granted) {
+		a = U_DESKTOP_ACCESS_GRANTED;
+	}
+	pthread_mutex_unlock(&p->lock);
+	return a;
+}
+
+void
+gnome_portal_request(struct gnome_portal *p, u_desktop_access_done_fn done, void *ctx)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_request);
+	if (c == NULL) {
+		done(ctx, U_DESKTOP_ACCESS_DENIED);
+		return;
+	}
+	c->async = true;
+	c->done = done;
+	c->done_ctx = ctx;
+	pthread_mutex_lock(&p->lock);
+	if (p->quit || !ensure_thread_locked(p)) {
+		pthread_mutex_unlock(&p->lock);
+		gp_cmd_free(c);
+		done(ctx, U_DESKTOP_ACCESS_DENIED);
+		return;
+	}
+	p->pending = true;
+	enqueue_locked(p, c);
+	pthread_mutex_unlock(&p->lock);
+	wake_thread(p);
+}
