@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-10-16
 deciders: David Fattal
 issues: []
@@ -8,7 +8,7 @@ related: [ADR-053, ADR-054, ADR-042, ADR-048, ADR-046]
 
 # ADR-057: Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
 
-**Status:** Proposed (2026-10-16, draft for owner review) · builds on
+**Status:** Accepted (2026-10-16, owner go) · builds on
 [ADR-053](ADR-053-conversion-providers.md) (conversion providers, the `SPLATS_MONO` /
 `SPLATS_STEREO` job-lane tasks, the schema-2 model store) and
 [ADR-054](ADR-054-component-model.md) (component classes, options contract, provenance gate) ·
@@ -205,6 +205,35 @@ build X" signal a downstream copy uses to re-pull.
   releases. Where it does not, as for Sharp, the user runs the conversion script locally
   after downloading the official file.
 - **The model store's tamper rule is unchanged:** the host re-hashes a blob on first load.
+
+### 6. Remote endpoint contract, v1
+
+What a remote endpoint implements, so the provider (S2) and the first endpoint (S3) are built
+against one text. HTTPS, `Authorization: Bearer <token>`, JSON in UTF-8.
+
+- **`GET /v1/describe`** returns:
+  `{ "contract": 1, "endpoint_id", "tasks": [ { "task": "splats-mono" | "splats-stereo",
+  "formats": ["sog", "ply"], "max_long_side", "max_bytes", "rectified_required" } ],
+  "licence": { "class": "commercial" | "research_only" | "unknown", "name", "link" },
+  "build": { "provider_commit", "model_id", "model_sha256", "runtime", "runtime_version",
+  "host_kind", "host_id" } }`.
+  The provider calls it on warm-up and on each endpoint switch. A `build` that differs between
+  hosts of one endpoint list is logged as a WARN.
+- **`POST /v1/jobs`**, `multipart/form-data`:
+  - **Images:** `image`, or `left` + `right`.
+  - **`params`** (JSON): `task`, `format`, `baseline_m` (omitted = unknown), `rectified`,
+    `focal_px` (given; wins over EXIF), `max_long_side`, `options` (the provider's settings,
+    passed through).
+  - **Synchronous:** the response body is the blob (`application/octet-stream`).
+  - **Header `X-DXR-Result`** carries one JSON object with every fact of §4: `build`,
+    `refusal { code, reason }`, `coords`, `intrinsics { fx, fy, cx, cy, width, height }`,
+    `metric`, `baseline_m`, `metric_fit`, `near_m`, `far_m`, `layers`, `splat_count`,
+    `focus_suggestion`, `timings_ms`.
+  - **Cancel** is the client closing the connection.
+- **Errors:** `422 { code, message }` means bad input; it is never retried and maps to a
+  failed job with that reason. `5xx`, `429`, `408`, `401`, `403`, `404` and timeouts fall
+  through to the next host in the list.
+- **Not in v1:** signed-URL uploads and webhooks for long jobs (video) — contract 2.
 
 ## Consequences
 
