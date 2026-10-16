@@ -209,6 +209,16 @@ TEST_CASE("component loader: malformed manifests are rejected with a reason", "[
 	     R"({"file_format_version":"1.0","plugin":{"id":"e","binary_path":"/a.so","enabled":"yes"}})", "e"},
 	    {"settings not object",
 	     R"({"file_format_version":"1.0","plugin":{"id":"t","binary_path":"/a.so","settings":[1]}})", "t"},
+	    // Nothing resolves binary_path against the manifest's directory, so a
+	    // relative one would be searched for by dlopen (ADR-054 N4b review).
+	    {"bare binary name", R"({"file_format_version":"1.0","plugin":{"id":"r1","binary_path":"libacme.so"}})",
+	     "r1"},
+	    {"dot-relative binary", R"({"file_format_version":"1.0","plugin":{"id":"r2","binary_path":"./lib/a.so"}})",
+	     "r2"},
+	    {"parent-relative binary",
+	     R"({"file_format_version":"1.0","plugin":{"id":"r3","binary_path":"../plugins/a.so"}})", "r3"},
+	    {"drive-relative binary", R"({"file_format_version":"1.0","plugin":{"id":"r4","binary_path":"C:a.dll"}})",
+	     "r4"},
 	};
 	for (const Case &c : cases) {
 		INFO(c.what);
@@ -222,6 +232,57 @@ TEST_CASE("component loader: malformed manifests are rejected with a reason", "[
 	std::unique_ptr<Entry> e(new Entry);
 	CHECK_FALSE(target_component_parse_manifest_json(&cls, nullptr, "/x/null.json", e.get()));
 	CHECK((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0u);
+
+	// The relative-binary rejection names the field.
+	std::unique_ptr<Entry> rel(new Entry);
+	CHECK_FALSE(target_component_parse_manifest_json(
+	    &cls, R"({"file_format_version":"1.0","plugin":{"id":"rel","binary_path":"a.so"}})", "/x/rel.json",
+	    rel.get()));
+	CHECK(std::string(rel->reason).find("absolute") != std::string::npos);
+}
+
+TEST_CASE("component loader: only an absolute binary path is a binary path", "[component_loader]")
+{
+	// Manifest rules: POSIX-absolute, or either Windows absolute form.
+	CHECK(target_component_path_is_absolute("/usr/lib/displayxr/plugins/a.so", false));
+	CHECK(target_component_path_is_absolute("C:\\Program Files\\A\\a.dll", false));
+	CHECK(target_component_path_is_absolute("c:/x/a.dll", false));
+	CHECK(target_component_path_is_absolute("\\\\server\\share\\a.dll", false));
+	CHECK_FALSE(target_component_path_is_absolute("a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("./a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("../a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("C:a.dll", false));
+	CHECK_FALSE(target_component_path_is_absolute("", false));
+	CHECK_FALSE(target_component_path_is_absolute(nullptr, false));
+
+	// Registry rows (Windows rules): a lone leading separator is relative to
+	// the current drive, so only drive-letter and UNC / device paths count.
+	CHECK(target_component_path_is_absolute("C:\\Program Files\\A\\a.dll", true));
+	CHECK(target_component_path_is_absolute("D:/plugins/a.dll", true));
+	CHECK(target_component_path_is_absolute("\\\\?\\C:\\a.dll", true));
+	CHECK(target_component_path_is_absolute("//server/share/a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("\\Program Files\\a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("/opt/a.so", true));
+	CHECK_FALSE(target_component_path_is_absolute("a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("plugins\\a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("C:a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("C:", true));
+}
+
+TEST_CASE("component loader: the load path refuses a relative binary before touching it", "[component_loader]")
+{
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	std::unique_ptr<Entry> e = make_entry("relative", 100);
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", "libDoesNotMatter.so");
+	void *module = nullptr;
+	void *fn = nullptr;
+	char reason[128] = {0};
+	CHECK(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_LOAD_FAILED);
+	CHECK(module == nullptr);
+	CHECK(std::string(reason).find("absolute") != std::string::npos);
+	// Never reached the provenance check.
+	CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_UNKNOWN);
 }
 
 TEST_CASE("component loader: the class hook sees the plugin object and may reject the row", "[component_loader]")
@@ -536,6 +597,11 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	reg_dword(c, L"Enabled", 0);
 	RegCloseKey(c);
 
+	// A relative Binary: LoadLibrary would search for it, so it is malformed.
+	HKEY rb = reg_create(r, L"rel-binary");
+	reg_sz(rb, L"Binary", L"plugins\\rel.dll");
+	RegCloseKey(rb);
+
 	// A policy subkey the class reserves, in odd case: never a row.
 	HKEY pol = reg_create(r, L"POLICY");
 	reg_dword(pol, L"Lock", 1);
@@ -553,9 +619,9 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	RegDeleteTreeW(HKEY_CURRENT_USER, wroot);
 	RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\DisplayXR-Test"); // only if now empty
 
-	REQUIRE(n == 3);
+	REQUIRE(n == 4);
 	target_component_sort(&cls, out.data(), n);
-	// acme (50) first; "no-binary" and "off" share the default 100 -> by id.
+	// acme (50) first; the rest share the default 100 -> by id.
 	CHECK(std::string(out[0].id) == "acme-thing");
 	CHECK(std::string(out[1].id) == "no-binary");
 	CHECK(std::string(out[2].id) == "off");
@@ -594,6 +660,10 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	CHECK_FALSE(out[2].enabled);
 	CHECK(out[2].probe_order == TARGET_COMPONENT_DEFAULT_PROBE_ORDER);
 	CHECK(std::string(out[2].display_name) == "off");
+
+	CHECK(std::string(out[3].id) == "rel-binary");
+	CHECK((out[3].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0u);
+	CHECK(std::string(out[3].reason).find("absolute") != std::string::npos);
 
 	// An absent root is zero rows, not an error.
 	CHECK(target_component_enumerate_registry(&cls, true, "Software\\DisplayXR-Test\\NoSuchRoot-Ever", out.data(),

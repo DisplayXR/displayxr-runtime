@@ -655,6 +655,18 @@ target_component_provenance_classify(bool signed_ok,
 bool
 target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e);
 
+/*!
+ * Is @p path absolute? With @p windows_rules (registry `Binary` rows): a
+ * drive-letter path (`C:\…`, `C:/…`) or a UNC / device path (`\\…`) — a lone
+ * leading separator is current-drive-relative and does not count. Without
+ * (manifest `plugin.binary_path`): a leading `/`, or either Windows form. A
+ * row whose binary is not absolute is MALFORMED: the loader would otherwise
+ * hand it to LoadLibrary / dlopen, which resolve it against the host's search
+ * order or cwd.
+ */
+bool
+target_component_path_is_absolute(const char *path, bool windows_rules);
+
 //! Hex SHA-256 of a file's bytes into @p out_hex (65 chars). False when unreadable.
 bool
 target_component_sha256_file(const char *path, char *out_hex, size_t cap);
