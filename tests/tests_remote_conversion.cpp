@@ -357,6 +357,31 @@ base_settings(const std::string &endpoints)
  *
  */
 
+TEST_CASE("endpoint URLs: the authority is parsed; userinfo and look-alike hosts are refused", "[remote_conversion]")
+{
+	CHECK(rc_url_endpoint_allowed("https://splats.example/api"));
+	CHECK(rc_url_endpoint_allowed("https://splats.example:8443/api"));
+	CHECK(rc_url_endpoint_allowed("http://127.0.0.1:8080"));
+	CHECK(rc_url_endpoint_allowed("http://localhost"));
+	CHECK(rc_url_endpoint_allowed("http://localhost/"));
+	CHECK(rc_url_endpoint_allowed("http://[::1]:9000/x"));
+	// The bypass forms: a loopback-looking prefix in front of another host.
+	CHECK_FALSE(rc_url_endpoint_allowed("http://localhost:x@evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://localhost@evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://127.0.0.1@evil.example"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://localhost.evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://127.0.0.1.evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://[::1].evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://localhost:80x/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://localhost\\@evil.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("http://evil.example/"));
+	// Userinfo is refused for https too (it hides the real host from a reader).
+	CHECK_FALSE(rc_url_endpoint_allowed("https://user:pass@splats.example/"));
+	CHECK_FALSE(rc_url_endpoint_allowed("https://"));
+	CHECK_FALSE(rc_url_endpoint_allowed("https:// splats.example"));
+	CHECK_FALSE(rc_url_endpoint_allowed("ftp://splats.example"));
+}
+
 TEST_CASE("remote provider: off unless ENABLE, consent-gated, endpoint list validated", "[remote_conversion]")
 {
 	g_settings.clear();
@@ -382,6 +407,12 @@ TEST_CASE("remote provider: off unless ENABLE, consent-gated, endpoint list vali
 		CHECK((c.flags & XRT_CONV_CAP_REMOTE) != 0);
 		CHECK(c.lanes == XRT_CONV_LANE_JOB);
 		CHECK(c.licence_class == XRT_CONV_LICENCE_UNKNOWN); // until a describe says otherwise
+	}
+	for (const char *bad : {"http://example.com", "http://localhost:x@evil.example/"}) {
+		base_settings(bad);
+		provider p;
+		REQUIRE(make_provider(p));
+		CHECK(state_of(p, 1).state == XRT_CONV_STATE_DISABLED);
 	}
 	base_settings("http://example.com");
 	{
@@ -638,6 +669,42 @@ TEST_CASE("remote provider: research-only is reported as-is", "[remote_conversio
 	const xrt_conv_capability c = cap_of(p, 0);
 	CHECK(c.licence_class == XRT_CONV_LICENCE_RESEARCH_ONLY);
 	CHECK(c.commercial_ok == 0);
+}
+
+TEST_CASE("remote provider: the licence is known before the first warm (selection needs it)", "[remote_conversion]")
+{
+	if (!have_python()) {
+		SKIP("no Python 3");
+	}
+	server s;
+	REQUIRE(start_server(s, "--token test-token"));
+	server_guard g{s};
+	base_settings(s.base);
+	g_consent = false;
+	{
+		provider p; // no consent: nothing is asked of the endpoint at all
+		REQUIRE(make_provider(p));
+		os_nanosleep(300ll * 1000 * 1000);
+		cJSON *o = stats(s);
+		CHECK(cJSON_GetObjectItem(o, "describe")->valueint == 0);
+		cJSON_Delete(o);
+	}
+	g_consent = true;
+	provider p;
+	REQUIRE(make_provider(p));
+	const uint64_t gen0 = p.iface->get_generation(p.inst);
+	xrt_conv_capability c{};
+	for (int i = 0; i < 100; i++) {
+		c = cap_of(p, 0);
+		if (c.licence_class != XRT_CONV_LICENCE_UNKNOWN) {
+			break;
+		}
+		os_nanosleep(50ll * 1000 * 1000);
+	}
+	CHECK(c.licence_class == XRT_CONV_LICENCE_COMMERCIAL);   // selectable without AllowResearchOnly
+	CHECK(p.iface->get_generation(p.inst) != gen0);          // the runtime re-describes
+	CHECK(state_of(p, 1).state == XRT_CONV_STATE_INSTALLED); // no warm happened
+	CHECK(stat_jobs(s) == 0);                                // and no picture was sent
 }
 
 TEST_CASE("remote provider: cancel closes the connection promptly", "[remote_conversion]")
@@ -931,6 +998,174 @@ TEST_CASE("pack schema 2: a per-model url overrides blobBaseUrl for its model fi
 	delete p;
 }
 
+TEST_CASE("camera block: duplicate camera keys are the author's if any is not auto",
+          "[remote_conversion][camera_block]")
+{
+	const xrt_conv_splat_info si = sample_info(false);
+	cJSON *facts = conv_splat_facts_to_json(&si, nullptr);
+	cJSON *block = conv_camera_block_from_facts(facts, nullptr, 0);
+	REQUIRE(block != nullptr);
+	char *out = nullptr;
+	char err[128];
+	const char *dup = "{\"count\": 1, \"camera\": {\"source\": \"auto\"}, \"camera\": {\"rig\": \"display\"}}";
+	CHECK(conv_camera_block_apply_meta(dup, block, &out, err, sizeof(err)) == CONV_CAMERA_BLOCK_KEPT_AUTHORED);
+	CHECK(out == nullptr);
+	const char *dup2 = "{\"count\": 1, \"camera\": {\"rig\": \"display\"}, \"camera\": {\"source\": \"auto\"}}";
+	CHECK(conv_camera_block_apply_meta(dup2, block, &out, err, sizeof(err)) == CONV_CAMERA_BLOCK_KEPT_AUTHORED);
+	cJSON_Delete(block);
+	cJSON_Delete(facts);
+}
+
+namespace {
+
+//! A minimal stored zip with one entry "meta.json" = @p meta.
+std::vector<uint8_t>
+tiny_zip(const std::string &meta)
+{
+	auto w16 = [](std::vector<uint8_t> &v, uint32_t x) {
+		v.push_back((uint8_t)x);
+		v.push_back((uint8_t)(x >> 8));
+	};
+	auto w32 = [&](std::vector<uint8_t> &v, uint32_t x) {
+		w16(v, x & 0xffff);
+		w16(v, x >> 16);
+	};
+	std::vector<uint8_t> z;
+	const std::string name = "meta.json";
+	w32(z, 0x04034b50);
+	w16(z, 20);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w32(z, 0); // crc (not checked by the reader)
+	w32(z, (uint32_t)meta.size());
+	w32(z, (uint32_t)meta.size());
+	w16(z, (uint32_t)name.size());
+	w16(z, 0);
+	z.insert(z.end(), name.begin(), name.end());
+	z.insert(z.end(), meta.begin(), meta.end());
+	const uint32_t cd = (uint32_t)z.size();
+	w32(z, 0x02014b50);
+	w16(z, 20);
+	w16(z, 20);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w32(z, 0);
+	w32(z, (uint32_t)meta.size());
+	w32(z, (uint32_t)meta.size());
+	w16(z, (uint32_t)name.size());
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 0);
+	w32(z, 0);
+	w32(z, 0); // local header offset
+	z.insert(z.end(), name.begin(), name.end());
+	const uint32_t cd_size = (uint32_t)z.size() - cd;
+	w32(z, 0x06054b50);
+	w16(z, 0);
+	w16(z, 0);
+	w16(z, 1);
+	w16(z, 1);
+	w32(z, cd_size);
+	w32(z, cd);
+	w16(z, 0);
+	return z;
+}
+
+std::string
+write_tmp(const std::vector<uint8_t> &bytes, const char *tag)
+{
+	char path[512];
+#ifdef _WIN32
+	snprintf(path, sizeof(path), "%s\\dxr_zip_%s_%d.sog", getenv("TEMP") != nullptr ? getenv("TEMP") : ".", tag,
+	         (int)_getpid());
+#else
+	snprintf(path, sizeof(path), "/tmp/dxr_zip_%s_%d.sog", tag, (int)getpid());
+#endif
+	FILE *f = fopen(path, "wb");
+	REQUIRE(f != nullptr);
+	fwrite(bytes.data(), 1, bytes.size(), f);
+	fclose(f);
+	return path;
+}
+
+} // namespace
+
+TEST_CASE("camera block: a truncated or crafted zip is refused, never over-read", "[remote_conversion][camera_block]")
+{
+	const std::vector<uint8_t> good = tiny_zip("{\"count\": 1}");
+	char err[256];
+	{
+		const std::string p = write_tmp(good, "good");
+		char *meta = conv_sog_read_meta(p.c_str(), err, sizeof(err));
+		REQUIRE(meta != nullptr);
+		CHECK(std::string(meta) == "{\"count\": 1}");
+		free(meta);
+		remove(p.c_str());
+	}
+	const size_t cd = good.size() - 22 - (46 + 9); // central directory offset
+	struct
+	{
+		const char *tag;
+		size_t at;
+		std::vector<uint8_t> patch;
+	} cases[] = {
+	    {"name_len", cd + 28, {0xff, 0xff}},                          // a name running past the directory
+	    {"extra_len", cd + 30, {0xff, 0x7f}},                         // an extra field running past it
+	    {"csize", cd + 20, {0xff, 0xff, 0xff, 0x00}},                 // data running into the directory
+	    {"local_off", cd + 42, {0x40, 0x00, 0x00, 0x00}},             // a local header inside the data
+	    {"cd_size", good.size() - 22 + 12, {0xff, 0x00, 0x00, 0x00}}, // directory past the end record
+	    {"cd_off", good.size() - 22 + 16, {0xf0, 0xff, 0x00, 0x00}},  // directory beyond the file
+	    {"local_name", 26, {0xff, 0xff}},                             // the local name running past its data
+	};
+	for (auto &c : cases) {
+		std::vector<uint8_t> bad = good;
+		for (size_t i = 0; i < c.patch.size(); i++) {
+			bad[c.at + i] = c.patch[i];
+		}
+		const std::string p = write_tmp(bad, c.tag);
+		INFO(c.tag);
+		char *meta = conv_sog_read_meta(p.c_str(), err, sizeof(err));
+		CHECK(meta == nullptr);
+		free(meta);
+		remove(p.c_str());
+	}
+	// Truncations at every length.
+	for (size_t n = 0; n < good.size(); n += 3) {
+		std::vector<uint8_t> cut(good.begin(), good.begin() + (long)n);
+		const std::string p = write_tmp(cut, "cut");
+		char *meta = conv_sog_read_meta(p.c_str(), err, sizeof(err));
+		CHECK(meta == nullptr);
+		free(meta);
+		remove(p.c_str());
+	}
+}
+
+TEST_CASE("splat result: provider-written strings are terminated and counts clamped", "[remote_conversion][wire]")
+{
+	xrt_conv_splat_result r{};
+	memset(&r, 'A', sizeof(r));
+	r.struct_size = sizeof(r);
+	r.layer_count = 1000;
+	conv_splat_result_sanitize(&r);
+	CHECK(strlen(r.build_provider) == sizeof(r.build_provider) - 1);
+	CHECK(strlen(r.build_model_sha256) == sizeof(r.build_model_sha256) - 1);
+	CHECK(strlen(r.refusal_reason) == sizeof(r.refusal_reason) - 1);
+	CHECK(r.layer_count == XRT_CONV_MAX_SPLAT_LAYERS);
+	conv_host_wire_splat_result w;
+	memset(&w, 'B', sizeof(w));
+	w.struct_size = sizeof(w);
+	xrt_conv_splat_result dst{};
+	dst.struct_size = sizeof(dst);
+	REQUIRE(conv_host_wire_unpack_splat_result(&w, &dst));
+	CHECK(strlen(dst.build_host_id) == sizeof(dst.build_host_id) - 1);
+	CHECK(strlen(dst.refusal_reason) == sizeof(dst.refusal_reason) - 1);
+}
+
 TEST_CASE("satellite wire: the splat result crosses as a byte-equal twin, within the receiver's extent",
           "[remote_conversion][wire]")
 {
@@ -976,6 +1211,17 @@ TEST_CASE("credential reader: names are validated; the test store stands in for 
 	CHECK(std::string(tok) == "test-token");
 	CHECK(u_credential_read("nope", tok, sizeof(tok), err, sizeof(err)) == U_CREDENTIAL_NOT_FOUND);
 	CHECK(tok[0] == 0);
+	// A secret that would inject a header line is refused on write and on read.
+	CHECK(u_credential_write("dxr-never-written", "tok\r\nX-Evil: 1", err, sizeof(err)) == U_CREDENTIAL_BAD_SECRET);
+	CHECK_FALSE(u_credential_secret_valid_n("a\nb", 3));
+	CHECK(u_credential_secret_valid_n("abc-DEF_123.~", 13));
+	u_credential_set_reader_for_tests([](const char *, char *out, size_t size) {
+		snprintf(out, size, "bad\001token");
+		return U_CREDENTIAL_OK;
+	});
+	CHECK(u_credential_read("any", tok, sizeof(tok), err, sizeof(err)) == U_CREDENTIAL_BAD_SECRET);
+	CHECK(tok[0] == 0);
+	u_credential_set_reader_for_tests(test_reader);
 }
 
 
