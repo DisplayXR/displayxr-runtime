@@ -1492,6 +1492,12 @@ if(TARGET tests_conv_proxy)
 	# The real host + the sim provider, compared against the same sources in-service.
 	if(TARGET displayxr-conversion-host AND TARGET drv_sim_conversion_plugin AND TARGET sim_conversion_static)
 		target_link_libraries(tests_conv_proxy PRIVATE sim_conversion_static)
+		if(WIN32 AND TARGET comp_d3d11_lift AND TARGET comp_d3d11_conv_host_lane)
+			# The real host over the D3D11 lane on WARP (service glue allocator + lane ops).
+			target_link_libraries(
+				tests_conv_proxy PRIVATE comp_d3d11_lift comp_d3d11_conv_host_lane d3d11 dxgi
+				)
+		endif()
 		add_dependencies(tests_conv_proxy displayxr-conversion-host drv_sim_conversion_plugin)
 		target_compile_definitions(
 			tests_conv_proxy
