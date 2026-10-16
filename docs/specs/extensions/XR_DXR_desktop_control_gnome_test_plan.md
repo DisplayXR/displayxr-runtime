@@ -43,16 +43,21 @@ export DXR_DESKTOP_APP_ID=org.displayxr.SmokeTest   # else: "no app id" WARN, ap
 ```
 
 **One grant per process.** The restore token lives in the process's memory only (ADR-056: never
-written to disk by DisplayXR), and `desktop_backend_smoke` runs one command per process. So
-for every input / window-op command below, set the bring-up knob, which makes the action
-itself open the portal dialog — **you then have 15 s to click "Share"** in GNOME's dialog:
+written to disk by DisplayXR). Run every input / window-op section below in **one** smoke
+process with `script` mode, starting with `request` (answer the dialog with "Share"):
 
 ```bash
-export DXR_DESKTOP_GNOME_PROMPT_ON_ACTION=1
+cat > /tmp/s.txt <<'S'
+request
+type "hello"
+key 1 z
+S
+$SMOKE script < /tmp/s.txt
 ```
 
-(Inside an app the common layer calls `request_access` first and the session then restores
-silently for the rest of the process — section 7 tests that path.)
+The commands in the sections below go into such a script (`sleep MS` lines pause; `target ID`
+pins the guard's target window). `prepare_input` never prompts: without a grant every action
+returns `not-granted` and **no dialog appears** (only `request` shows one).
 
 ## 1. Capabilities and state
 
@@ -100,7 +105,9 @@ $SMOKE text X Y   # over a gedit paragraph, a button, a terminal line, the Setti
 ```
 
 Expected: the paragraph's text (whole buffer for a text view), the button's label, the
-sidebar row's name; `""` + `result: ok` over the desktop. Measure with `time`: < 50 ms after
+sidebar row's name; `""` + `result: ok` over the desktop. Two windows of the same app with
+different titles: each point reads its own window's text; a window whose accessible frame name
+differs from its title (rename the document) → `""` (never another window's text). Measure with `time`: < 50 ms after
 the first call. GTK3/Qt/Electron apps answer only once accessibility is on
 (`gsettings set org.gnome.desktop.interface toolkit-accessibility true`, then restart them).
 
@@ -161,16 +168,62 @@ $SMOKE type "Hello, 世界 — ünïcödé"        # into gedit
 ## 7. Session lifetime and consent
 
 ```bash
-$SMOKE request          # without DXR_DESKTOP_GNOME_PROMPT_ON_ACTION
+$SMOKE request
 ```
 
 - Click **Cancel** → `access: denied`. Click **Share** → `access: granted`.
 - Inside an app (Unity / native, through the runtime): grant once; act; wait > 2 s (indicator
   goes away); act again → **no dialog** (silent restore with the in-memory token), indicator back.
 - Lock the screen while a session is open, unlock, act again → still no dialog; the log shows
-  `the portal closed the RemoteDesktop session (screen lock / revoked)` then `session restored`.
+  `the screen lock closed the RemoteDesktop session` then `session restored`.
+- **Stop from GNOME's indicator** (top bar → remote-access menu → Stop) while a session is
+  open, then act → `not-granted — remote control was declined or revoked` **immediately** (no
+  15 s wait, no silent restore — the log says `treating it as a revoked grant`); `request` asks again.
+- Revoke the permission (Settings → Apps → the app, or `flatpak permission-reset`), act → the
+  first action returns `not-granted` within ~5 s (`did not restore the session silently`), the
+  next ones at once.
 - Restart the app → the dialog comes back once (the token is never written to disk). With
   `DXR_DESKTOP_APP_ID` registered on xdg-desktop-portal >= 1.19 the dialog names that app.
+
+## 7b. Delivery guarantee (contract v2) — must hold
+
+Each needs `script` mode after `request`, and a helper to move focus / copy at the right
+moment (a second terminal with `sleep 1; wmctrl`-style or just your hands, with `sleep` lines
+in the script to give you the window).
+
+- **Paste never happens unless we own the clipboard.** Copy "SECRET" in gedit. Make the portal
+  clipboard unavailable for the session (a portal without Clipboard, or kill
+  `xdg-desktop-portal-gnome` right after `request`), then `type "x"` into another gedit: result
+  `failed — the portal did not make this session the clipboard owner — not pasting` /
+  `unsupported`, and the target must NOT receive "SECRET".
+- **Clipboard changes hands before Ctrl+V.** Run `type "AGENT"` with a clipboard manager or a
+  script that copies "OTHER" at the same instant; either "AGENT" is pasted or the result is
+  `refused — lost the clipboard before the paste`; "OTHER" must never be pasted.
+- **A clipboard manager is not a delivery.** With GPaste / Clipboard Indicator running, `type`
+  into a window that takes no text (Settings sidebar): result `failed — the focused window did
+  not ask for the pasted text`, not `ok`.
+- **Focus stolen just before Ctrl+V.** `target <gedit id>`, then `type "long text…"` while a
+  timer (`sleep 0.3; gnome-text-editor &` in another shell) raises a new window: result
+  `refused — focus moved`, nothing pasted into the new window; the clipboard text from before is
+  offered again.
+- **Chords.** `target <id>`, `key 1 a` while focus moves away mid-chord → `refused — focus
+  moved`, and Ctrl is NOT left held (type in the new window: no Ctrl shortcuts fire).
+- **Trailing newline.** `type "ls\n"` into a terminal → `ls` pasted, then Enter as a separate,
+  checked key press (the command runs). Move focus between the paste and the Enter → refused, no
+  Enter in the new window.
+- **Clicks / scroll at the verified point.** `target <id>`, `click X Y` while you move the mouse
+  → `refused — the pointer moved off the verified point` or `target no longer under the point`.
+- **Super+L protection.** During `op move ID X Y` and `op minimize ID`, hammer the L key: the
+  screen must NOT lock (Super is held only across the button press, ~20 ms) — record the result;
+  also verify mutter keeps the Super+drag grab after Super is released (the window still moves
+  to the target). If the move fails here, report it: Super would have to be held for the drag.
+- **Kill switch mid-action.** In the app path (common layer), `displayxr-cli desktop stop` while a
+  long `type` / `op move` runs → the next batch is refused (`stopped: desktop control was
+  suspended…`), no key or button left pressed.
+- **Lock fails closed.** `info` while `org.gnome.ScreenSaver` does not answer (e.g. right after
+  shell start, or `kill -STOP` the shell for a second) → `locked=1`.
+- **Privacy.** With `XRT_LOG=debug`, grep the app's log for the typed strings, chord letters,
+  the clipboard text and the AT-SPI text read in §3 → no hits.
 
 ## 8. Window ops on other apps (Super gestures)
 

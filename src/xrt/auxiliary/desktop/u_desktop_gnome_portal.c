@@ -192,6 +192,12 @@ gp_pmsg_send(struct gnome_portal *p, struct pmsg *pm, int timeout_ms, struct gdb
 	DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->c, pm->m, timeout_ms, &e);
 	dbus_message_unref(pm->m);
 	pm->m = NULL;
+	// Every call here goes to the portal: its reply names the portal's unique bus
+	// name, the only sender whose Response / Closed / Clipboard signals count.
+	const char *sender = reply != NULL ? dbus_message_get_sender(reply) : NULL;
+	if (sender != NULL && strcmp(sender, p->portal_owner) != 0) {
+		snprintf(p->portal_owner, sizeof(p->portal_owner), "%s", sender);
+	}
 	if (err != NULL) {
 		err->name[0] = err->message[0] = '\0';
 		if (dbus_error_is_set(&e)) {
@@ -273,8 +279,13 @@ gp_session_forget(struct gnome_portal *p)
 	p->session[0] = '\0';
 	p->clipboard_enabled = false;
 	p->clip_owner = false;
+	p->clip_is_paste = false;
+	p->paste_armed = false;
 	free(p->clip_text);
 	p->clip_text = NULL;
+	free(p->clip_prev);
+	p->clip_prev = NULL;
+	p->hold_until_ms = 0;
 	pthread_mutex_lock(&p->lock);
 	p->session_open_shared = false;
 	if (!p->have_token && p->access == U_DESKTOP_ACCESS_GRANTED) {
@@ -307,10 +318,60 @@ session_close(struct gnome_portal *p)
 
 
 
+//! org.gnome.ScreenSaver.GetActive on the portal connection (true only on a definite yes).
+static bool
+screen_locked_now(struct gnome_portal *p)
+{
+	DBusMessage *reply = gdbus_call(p->c, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+	                                "org.gnome.ScreenSaver", "GetActive", 500, NULL, DBUS_TYPE_INVALID);
+	dbus_bool_t active = FALSE;
+	if (reply != NULL) {
+		dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &active, DBUS_TYPE_INVALID);
+		dbus_message_unref(reply);
+	}
+	return active;
+}
+
+//! The portal's session went away under us: a lock (restorable) or the user
+//! stopping it from GNOME's indicator (a revocation — never restored silently).
+static void
+session_closed_by_portal(struct gnome_portal *p)
+{
+	gp_session_forget(p);
+	bool locked = screen_locked_now(p);
+	if (!locked) {
+		gdbus_sleep_ms(300); // the lock screen may come up just after the close
+		locked = screen_locked_now(p);
+	}
+	if (locked) {
+		U_LOG_W("desktop/gnome: the screen lock closed the RemoteDesktop session; the next action restores it");
+		return;
+	}
+	U_LOG_W(
+	    "desktop/gnome: the RemoteDesktop session was stopped (not by a lock) — treating it as a revoked "
+	    "grant; the app must request access again");
+	pthread_mutex_lock(&p->lock);
+	p->have_token = false;
+	memset(p->token, 0, sizeof(p->token));
+	p->access = U_DESKTOP_ACCESS_DENIED;
+	pthread_mutex_unlock(&p->lock);
+}
+
 static void
 handle_message(struct gnome_portal *p, DBusMessage *m)
 {
 	if (dbus_message_get_type(m) != DBUS_MESSAGE_TYPE_SIGNAL) {
+		return;
+	}
+	if (dbus_message_is_signal(m, DBUS_INTERFACE_LOCAL, "Disconnected")) {
+		U_LOG_W("desktop/gnome: lost the portal D-Bus connection");
+		gp_session_forget(p);
+		return;
+	}
+	// Everything else must come from the portal itself: any bus peer can emit a
+	// signal named Response / Closed / SelectionTransfer (a forged grant).
+	const char *sender = dbus_message_get_sender(m);
+	if (sender == NULL || p->portal_owner[0] == '\0' || strcmp(sender, p->portal_owner) != 0) {
 		return;
 	}
 	const char *path = dbus_message_get_path(m);
@@ -331,10 +392,7 @@ handle_message(struct gnome_portal *p, DBusMessage *m)
 		p->resp_done = true;
 	} else if (dbus_message_is_signal(m, SESSION_IFACE, "Closed")) {
 		if (path != NULL && p->session[0] != '\0' && strcmp(path, p->session) == 0) {
-			U_LOG_W(
-			    "desktop/gnome: the portal closed the RemoteDesktop session (screen lock / revoked); "
-			    "the next action re-opens one");
-			gp_session_forget(p);
+			session_closed_by_portal(p);
 		}
 	} else if (dbus_message_is_signal(m, CLIP_IFACE, "SelectionTransfer")) {
 		const char *session = NULL, *mime = NULL;
@@ -374,9 +432,6 @@ handle_message(struct gnome_portal *p, DBusMessage *m)
 			dbus_message_iter_next(&dict);
 		}
 		p->clip_owner = owner;
-	} else if (dbus_message_is_signal(m, DBUS_INTERFACE_LOCAL, "Disconnected")) {
-		U_LOG_W("desktop/gnome: lost the portal D-Bus connection");
-		gp_session_forget(p);
 	}
 }
 
@@ -521,8 +576,8 @@ gp_pump(struct gnome_portal *p, int timeout_ms)
 	ei_pump(p);
 }
 
-static bool
-quitting(struct gnome_portal *p)
+bool
+gp_quitting(struct gnome_portal *p)
 {
 	pthread_mutex_lock(&p->lock);
 	bool q = p->quit;
@@ -537,7 +592,7 @@ wait_response(struct gnome_portal *p, uint32_t timeout_ms)
 	uint64_t deadline = gdbus_now_ms() + timeout_ms;
 	while (!p->resp_done) {
 		uint64_t now = gdbus_now_ms();
-		if (now >= deadline || quitting(p) || p->c == NULL) {
+		if (now >= deadline || gp_quitting(p) || p->c == NULL) {
 			return false;
 		}
 		uint64_t left = deadline - now;
@@ -658,7 +713,7 @@ connect_eis(struct gnome_portal *p, char *msg)
 		return U_DESKTOP_ERR_FAILED;
 	}
 	uint64_t deadline = gdbus_now_ms() + 3000;
-	while (!ei_ready(p) && p->ei != NULL && gdbus_now_ms() < deadline && !quitting(p)) {
+	while (!ei_ready(p) && p->ei != NULL && gdbus_now_ms() < deadline && !gp_quitting(p)) {
 		gp_pump(p, 20);
 	}
 	if (p->ei == NULL) {
@@ -768,10 +823,22 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	dbus_message_unref(reply);
 	uint32_t start_timeout = interactive ? INTERACTIVE_START_TIMEOUT_MS : RESTORE_START_TIMEOUT_MS;
 	if (!wait_response(p, start_timeout)) {
-		gp_set_msg(msg, interactive ? "no answer to the remote-desktop dialog"
-		                            : "the portal did not restore the session silently (a dialog may be up)");
-		session_close(p);
-		return U_DESKTOP_ERR_TIMEOUT;
+		session_close(p); // also dismisses a dialog nobody is answering
+		if (interactive) {
+			gp_set_msg(msg, "no answer to the remote-desktop dialog");
+			return U_DESKTOP_ERR_TIMEOUT;
+		}
+		// A restore that is not silent means the portal no longer honours the
+		// token (revoked / expired): drop it, so later actions fail at once
+		// instead of waiting here again.
+		pthread_mutex_lock(&p->lock);
+		p->have_token = false;
+		memset(p->token, 0, sizeof(p->token));
+		p->access = U_DESKTOP_ACCESS_DENIED;
+		pthread_mutex_unlock(&p->lock);
+		gp_set_msg(msg,
+		           "the portal did not restore the session silently (grant revoked?) — request access again");
+		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
 	if (p->resp_code != 0) {
 		bool cancelled = p->resp_code == 1;
@@ -781,8 +848,8 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 			// The token is no good any more.
 			pthread_mutex_lock(&p->lock);
 			p->have_token = false;
-			p->token[0] = '\0';
-			p->access = cancelled ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
+			memset(p->token, 0, sizeof(p->token));
+			p->access = U_DESKTOP_ACCESS_DENIED;
 			pthread_mutex_unlock(&p->lock);
 		}
 		return U_DESKTOP_ERR_NOT_GRANTED;
@@ -822,46 +889,36 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	return U_DESKTOP_OK;
 }
 
-//! Bring-up knob for desktop_backend_smoke: an action with no grant opens the portal dialog itself.
-static bool
-dev_prompt_on_action(void)
-{
-	const char *v = getenv("DXR_DESKTOP_GNOME_PROMPT_ON_ACTION");
-	return v != NULL && strcmp(v, "1") == 0;
-}
-
 enum u_desktop_result
-gp_ensure_session(struct gnome_portal *p, char *msg)
+gp_ensure_session(struct gnome_portal *p, bool restore, char *msg)
 {
 	if (!p->input) {
 		gp_set_msg(msg, "no input on this system (libei.so.1 missing, or RemoteDesktop portal < v2)");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
-	if (p->session_open && p->ei != NULL) {
-		p->last_use_ms = gdbus_now_ms();
-		return U_DESKTOP_OK;
-	}
 	pthread_mutex_lock(&p->lock);
 	bool have_token = p->have_token;
 	enum u_desktop_access acc = p->access;
 	pthread_mutex_unlock(&p->lock);
-	if (!have_token && dev_prompt_on_action()) {
-		// Bring-up only (desktop_backend_smoke runs one command per process, and
-		// the token never outlives a process): show the portal's dialog now. It
-		// is still the OS's consent — the user must approve it within the
-		// silent-restore timeout (15 s).
-		U_LOG_W("desktop/gnome: DXR_DESKTOP_GNOME_PROMPT_ON_ACTION=1 — asking the portal from an action");
-		enum u_desktop_result r = open_session(p, false, msg);
-		pthread_mutex_lock(&p->lock);
-		p->access = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
-		pthread_mutex_unlock(&p->lock);
-		return r;
+	if (acc == U_DESKTOP_ACCESS_DENIED) {
+		gp_set_msg(msg, "remote control was declined or revoked — request access again");
+		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	if (p->session_open && p->ei != NULL) {
+		p->last_use_ms = gdbus_now_ms();
+		return U_DESKTOP_OK;
 	}
 	if (!have_token) {
 		gp_set_msg(msg, acc == U_DESKTOP_ACCESS_GRANTED
 		                    ? "the remote-desktop session ended and cannot be restored — request access again"
 		                    : "remote control was not granted to this app — request access first");
 		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	if (!restore) {
+		// After verification: restoring here would put seconds between the
+		// check and the injection. prepare_input is where sessions are opened.
+		gp_set_msg(msg, "the remote-desktop session closed mid-action (screen lock?) — retry");
+		return U_DESKTOP_ERR_REFUSED;
 	}
 	return open_session(p, false, msg);
 }
@@ -882,6 +939,9 @@ cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 	} else {
 		enum u_desktop_result r = open_session(p, true, c->msg);
 		acc = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		if (r != U_DESKTOP_OK && gp_quitting(p)) {
+			acc = U_DESKTOP_ACCESS_UNKNOWN; // torn down before the user answered
+		}
 		if (r == U_DESKTOP_OK && !p->input) {
 			pthread_mutex_lock(&p->lock);
 			p->consent_only_granted = true;
@@ -934,9 +994,9 @@ portal_thread(void *arg)
 		}
 		p->sender[j] = '\0';
 		static const char *const rules[] = {
-		    "type='signal',interface='" REQUEST_IFACE "',member='Response'",
-		    "type='signal',interface='" SESSION_IFACE "',member='Closed'",
-		    "type='signal',interface='" CLIP_IFACE "'",
+		    "type='signal',sender='" PORTAL_DEST "',interface='" REQUEST_IFACE "',member='Response'",
+		    "type='signal',sender='" PORTAL_DEST "',interface='" SESSION_IFACE "',member='Closed'",
+		    "type='signal',sender='" PORTAL_DEST "',interface='" CLIP_IFACE "'",
 		};
 		for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
 			dbus_bus_add_match(p->c, rules[i], &e);
@@ -979,8 +1039,13 @@ portal_thread(void *arg)
 			pthread_mutex_lock(&p->lock);
 			bool have_token = p->have_token;
 			pthread_mutex_unlock(&p->lock);
-			uint64_t idle = gdbus_now_ms() - p->last_use_ms;
-			if (have_token && idle >= SESSION_IDLE_CLOSE_MS) {
+			uint64_t now = gdbus_now_ms();
+			uint64_t idle = now - p->last_use_ms;
+			if (now < p->hold_until_ms) {
+				// prepare_input asked to keep it (verification / idle wait in progress).
+				uint64_t left = p->hold_until_ms - now;
+				timeout = left < 250 ? (int)left + 1 : 250;
+			} else if (have_token && idle >= SESSION_IDLE_CLOSE_MS) {
 				session_close(p);
 			} else if (have_token) {
 				uint64_t left = SESSION_IDLE_CLOSE_MS - idle;
@@ -999,7 +1064,7 @@ portal_thread(void *arg)
 		pthread_mutex_lock(&p->lock);
 		if (c->async) {
 			pthread_mutex_unlock(&p->lock);
-			c->done(c->done_ctx, U_DESKTOP_ACCESS_DENIED);
+			c->done(c->done_ctx, U_DESKTOP_ACCESS_UNKNOWN); // never answered
 			gp_cmd_free(c);
 		} else {
 			c->result = U_DESKTOP_ERR_FAILED;
@@ -1053,6 +1118,12 @@ enqueue_locked(struct gnome_portal *p, struct gp_cmd *c)
 enum u_desktop_result
 gp_run_sync(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char *msg)
 {
+	return gp_run_sync_keep(p, c, timeout_ms, msg, NULL);
+}
+
+enum u_desktop_result
+gp_run_sync_keep(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char *msg, struct gp_cmd *out)
+{
 	pthread_mutex_lock(&p->lock);
 	if (p->quit || !ensure_thread_locked(p)) {
 		pthread_mutex_unlock(&p->lock);
@@ -1075,6 +1146,11 @@ gp_run_sync(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char 
 	}
 	enum u_desktop_result r;
 	if (c->finished) {
+		if (out != NULL) {
+			*out = *c;
+			out->text = NULL;
+			out->next = NULL;
+		}
 		r = c->result;
 		if (msg != NULL && c->msg[0] != '\0') {
 			snprintf(msg, U_DESKTOP_MSG_SIZE, "%s", c->msg);
@@ -1098,9 +1174,22 @@ gp_run_sync(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char 
 		r = U_DESKTOP_ERR_TIMEOUT;
 		gp_set_msg(msg, "the portal is busy (an access dialog may be open)");
 	} else {
-		c->abandoned = true; // the thread frees it
-		r = U_DESKTOP_ERR_TIMEOUT;
-		gp_set_msg(msg, "the portal did not answer in time");
+		// Running: every command is bounded (D-Bus calls <= CALL_TIMEOUT_MS, the
+		// silent restore <= RESTORE_START_TIMEOUT_MS, the paste <= ~3 s), so wait
+		// for it rather than leave input in flight after we returned.
+		while (!c->finished) {
+			pthread_cond_wait(&p->cond, &p->lock);
+		}
+		if (out != NULL) {
+			*out = *c;
+			out->text = NULL;
+			out->next = NULL;
+		}
+		r = c->result;
+		if (msg != NULL && c->msg[0] != '\0') {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "%s", c->msg);
+		}
+		gp_cmd_free(c);
 	}
 	pthread_mutex_unlock(&p->lock);
 	return r;

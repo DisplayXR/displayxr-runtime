@@ -33,7 +33,8 @@ static void
 press_escape(struct gnome_backend *g)
 {
 	char m[U_DESKTOP_MSG_SIZE];
-	gnome_portal_chord(g->portal, 0, KEY_ESC, 0, m);
+	// Our own cleanup (an overview / popup our gesture opened): no target to check.
+	gnome_send_chord(g, NULL, 0, 0, KEY_ESC, 0, m);
 	gdbus_sleep_ms(200);
 }
 
@@ -151,33 +152,58 @@ visible_point(struct gnome_backend *g,
 	return false;
 }
 
-//! Super + left press at (x, y) (+ an optional drag to (x+dx, y+dy)) + releases.
+/*!
+ * Super + left press at (x, y) (+ an optional drag to (x+dx, y+dy)) + releases,
+ * under the guard. Super is held only across the button press (~20 ms), not the
+ * whole drag: a key the user hits while Super is down becomes a Super shortcut
+ * (Super+L locks the screen). mutter keeps the move grab it started on the press
+ * until the button is released.
+ */
 static enum u_desktop_result
-super_gesture(struct gnome_backend *g, int32_t x, int32_t y, bool drag, int32_t dx, int32_t dy, char *msg)
+super_gesture(struct gnome_backend *g,
+              const struct u_desktop_input_guard *guard,
+              uint64_t target,
+              int32_t x,
+              int32_t y,
+              bool drag,
+              int32_t dx,
+              int32_t dy,
+              char *msg)
 {
-	const uint32_t super_down[1] = {KEY_LEFTMETA}, super_up[1] = {KEY_LEFTMETA};
+	const uint32_t super_key[1] = {KEY_LEFTMETA};
 	const bool t[1] = {true}, f[1] = {false};
+	char tmp[U_DESKTOP_MSG_SIZE];
 	enum u_desktop_result r = gnome_move_verified(g, x, y, msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
-	r = gnome_portal_keys(g->portal, super_down, t, 1, msg);
+	// The last look before the gesture: the guard, the pointer, the pick.
+	r = gnome_guard_point(g, guard, target, x, y, msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
-	char tmp[U_DESKTOP_MSG_SIZE];
+	r = gnome_portal_keys(g->portal, super_key, t, 1, msg);
+	if (r != U_DESKTOP_OK) {
+		gnome_portal_keys(g->portal, super_key, f, 1, tmp);
+		return r;
+	}
 	r = gnome_portal_button(g->portal, BTN_LEFT, true, msg);
+	gnome_portal_keys(g->portal, super_key, f, 1, tmp);
 	if (r == U_DESKTOP_OK && drag) {
 		gdbus_sleep_ms(40);
-		// Jump: a slow drag across a monitor edge pops the tiling assistant.
-		r = gnome_portal_motion(g->portal, x + dx, y + dy, msg);
-		gdbus_sleep_ms(60);
-		if (r == U_DESKTOP_OK) {
-			r = gnome_move_verified(g, x + dx, y + dy, msg);
+		if (!guard->still_allowed(guard->ctx)) {
+			gnome_set_msg(msg, "stopped: desktop control was suspended, revoked or the screen locked");
+			r = U_DESKTOP_ERR_REFUSED;
+		} else {
+			// Jump: a slow drag across a monitor edge pops the tiling assistant.
+			r = gnome_portal_motion(g->portal, x + dx, y + dy, msg);
+			gdbus_sleep_ms(60);
+			if (r == U_DESKTOP_OK) {
+				r = gnome_move_verified(g, x + dx, y + dy, msg);
+			}
 		}
 	}
 	gnome_portal_button(g->portal, BTN_LEFT, false, tmp);
-	gnome_portal_keys(g->portal, super_up, f, 1, tmp);
 	return r;
 }
 
@@ -230,7 +256,7 @@ restore_pointer(struct gnome_backend *g, bool have, int32_t x, int32_t y)
 
 //! Super+click on a visible point of @p id, then wait for focus.
 static enum u_desktop_result
-activate_other(struct gnome_backend *g, uint64_t id, char *msg)
+activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, char *msg)
 {
 	struct u_desktop_window *ws;
 	uint32_t n;
@@ -265,7 +291,7 @@ activate_other(struct gnome_backend *g, uint64_t id, char *msg)
 	}
 	int32_t ox = 0, oy = 0;
 	bool have_orig = gnome_get_pointer_msg(g, &ox, &oy, NULL) == U_DESKTOP_OK;
-	r = super_gesture(g, x, y, false, 0, 0, msg);
+	r = super_gesture(g, guard, id, x, y, false, 0, 0, msg);
 	// mutter's grab from the Super+click: keys sent before it ends are lost.
 	gdbus_sleep_ms(GRAB_SETTLE_MS);
 	tidy_after_gesture(g, false);
@@ -280,9 +306,24 @@ activate_other(struct gnome_backend *g, uint64_t id, char *msg)
 	return U_DESKTOP_OK;
 }
 
-static enum u_desktop_result
-move_other(struct gnome_backend *g, uint64_t id, const struct u_desktop_rect *rect, char *msg)
+//! Keep window arithmetic far from int32 overflow (an app can pass any rect).
+static int32_t
+clamp_coord(int64_t v)
 {
+	const int64_t lim = 1000000;
+	return (int32_t)(v < -lim ? -lim : v > lim ? lim : v);
+}
+
+static enum u_desktop_result
+move_other(struct gnome_backend *g,
+           const struct u_desktop_input_guard *guard,
+           uint64_t id,
+           const struct u_desktop_rect *rect_in,
+           char *msg)
+{
+	struct u_desktop_rect rect_c = {clamp_coord(rect_in->x), clamp_coord(rect_in->y), clamp_coord(rect_in->w),
+	                                clamp_coord(rect_in->h)};
+	const struct u_desktop_rect *rect = &rect_c;
 	int32_t ox = 0, oy = 0;
 	bool have_orig = gnome_get_pointer_msg(g, &ox, &oy, NULL) == U_DESKTOP_OK;
 	enum u_desktop_result r = U_DESKTOP_OK;
@@ -318,14 +359,14 @@ move_other(struct gnome_backend *g, uint64_t id, const struct u_desktop_rect *re
 			r = U_DESKTOP_ERR_REFUSED;
 			break;
 		}
-		if (attempt == 0 && ((rect->w > 0 && abs(rect->w - frame.w) > POINTER_TOLERANCE_PX) ||
-		                     (rect->h > 0 && abs(rect->h - frame.h) > POINTER_TOLERANCE_PX))) {
+		if (attempt == 0 && ((rect->w > 0 && llabs((int64_t)rect->w - frame.w) > POINTER_TOLERANCE_PX) ||
+		                     (rect->h > 0 && llabs((int64_t)rect->h - frame.h) > POINTER_TOLERANCE_PX))) {
 			free(ws);
 			gnome_set_msg(msg, "resizing other apps' windows is not possible on GNOME (move only)");
 			r = U_DESKTOP_ERR_UNSUPPORTED;
 			break;
 		}
-		int32_t dx = rect->x - frame.x, dy = rect->y - frame.y;
+		int32_t dx = clamp_coord((int64_t)rect->x - frame.x), dy = clamp_coord((int64_t)rect->y - frame.y);
 		if (abs(dx) <= POINTER_TOLERANCE_PX && abs(dy) <= POINTER_TOLERANCE_PX) {
 			free(ws);
 			r = U_DESKTOP_OK;
@@ -342,7 +383,7 @@ move_other(struct gnome_backend *g, uint64_t id, const struct u_desktop_rect *re
 			r = U_DESKTOP_ERR_REFUSED;
 			break;
 		}
-		r = super_gesture(g, x, y, true, dx, dy, msg);
+		r = super_gesture(g, guard, id, x, y, true, dx, dy, msg);
 		gdbus_sleep_ms(GRAB_SETTLE_MS);
 		tidy_after_gesture(g, true);
 		if (r != U_DESKTOP_OK) {
@@ -360,8 +401,8 @@ move_other(struct gnome_backend *g, uint64_t id, const struct u_desktop_rect *re
 			const struct u_desktop_window *w = gnome_find_window(ws, n, id);
 			if (w == NULL) {
 				r = U_DESKTOP_ERR_WINDOW_LOST;
-			} else if (abs(w->frame.x - rect->x) <= POINTER_TOLERANCE_PX &&
-			           abs(w->frame.y - rect->y) <= POINTER_TOLERANCE_PX) {
+			} else if (llabs((int64_t)w->frame.x - rect->x) <= POINTER_TOLERANCE_PX &&
+			           llabs((int64_t)w->frame.y - rect->y) <= POINTER_TOLERANCE_PX) {
 				r = U_DESKTOP_OK;
 			} else {
 				gnome_set_msg(msg, "the window landed at (%d,%d), not (%d,%d) — mutter constrained it",
@@ -433,12 +474,17 @@ own_move(struct gnome_backend *g, int32_t x, int32_t y, char *msg)
 
 enum u_desktop_result
 gnome_window_op(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
                 enum u_desktop_window_op op,
                 uint64_t window_id,
                 const struct u_desktop_rect *rect,
                 char *msg)
 {
 	struct gnome_backend *g = gnome(b);
+	if (guard == NULL) {
+		gnome_set_msg(msg, "no input guard");
+		return U_DESKTOP_ERR_FAILED;
+	}
 	struct u_desktop_window *ws;
 	uint32_t n;
 	enum u_desktop_result r = gnome_snapshot(g, &ws, &n, msg);
@@ -470,7 +516,7 @@ gnome_window_op(struct u_desktop_backend *b,
 				gnome_set_msg(msg, "resizing is not available on GNOME (move only)");
 				return U_DESKTOP_ERR_UNSUPPORTED;
 			}
-			return own_move(g, rect->x, rect->y, msg);
+			return own_move(g, clamp_coord(rect->x), clamp_coord(rect->y), msg);
 		case U_DESKTOP_OP_CLOSE:
 			if (!gnome_can_input(g, msg)) {
 				return U_DESKTOP_ERR_UNSUPPORTED;
@@ -480,7 +526,9 @@ gnome_window_op(struct u_desktop_backend *b,
 				gnome_set_msg(msg, "the window did not take focus");
 				return U_DESKTOP_ERR_TIMEOUT;
 			}
-			return r == U_DESKTOP_OK ? gnome_portal_chord(g->portal, U_DESKTOP_MOD_ALT, KEY_F4, 0, msg) : r;
+			return r == U_DESKTOP_OK
+			           ? gnome_send_chord(g, guard, window_id, U_DESKTOP_MOD_ALT, KEY_F4, 0, msg)
+			           : r;
 		default: gnome_set_msg(msg, "unknown window op"); return U_DESKTOP_ERR_FAILED;
 		}
 	}
@@ -490,17 +538,18 @@ gnome_window_op(struct u_desktop_backend *b,
 	}
 	bool gone = false;
 	switch (op) {
-	case U_DESKTOP_OP_ACTIVATE: return activate_other(g, window_id, msg);
+	case U_DESKTOP_OP_ACTIVATE: return activate_other(g, guard, window_id, msg);
 
-	case U_DESKTOP_OP_MOVE_RESIZE: return move_other(g, window_id, rect, msg);
+	case U_DESKTOP_OP_MOVE_RESIZE: return move_other(g, guard, window_id, rect, msg);
 
 	case U_DESKTOP_OP_MINIMIZE:
 		if (target.state & U_DESKTOP_WINDOW_MINIMIZED) {
 			return U_DESKTOP_OK;
 		}
-		r = activate_other(g, window_id, msg);
+		r = activate_other(g, guard, window_id, msg);
 		if (r == U_DESKTOP_OK) {
-			r = gnome_portal_chord(g->portal, U_DESKTOP_MOD_SUPER, 0, 'h', msg);
+			// Keys go to the focused window: re-check it holds focus (and the guard).
+			r = gnome_send_chord(g, guard, window_id, U_DESKTOP_MOD_SUPER, 0, 'h', msg);
 		}
 		if (r == U_DESKTOP_OK && !wait_state(g, window_id, U_DESKTOP_WINDOW_MINIMIZED, true, 1000, &gone)) {
 			gnome_set_msg(msg,
@@ -513,9 +562,9 @@ gnome_window_op(struct u_desktop_backend *b,
 		if (target.state & U_DESKTOP_WINDOW_MAXIMIZED) {
 			return U_DESKTOP_OK;
 		}
-		r = activate_other(g, window_id, msg);
+		r = activate_other(g, guard, window_id, msg);
 		if (r == U_DESKTOP_OK) {
-			r = gnome_portal_chord(g->portal, U_DESKTOP_MOD_SUPER, KEY_UP, 0, msg);
+			r = gnome_send_chord(g, guard, window_id, U_DESKTOP_MOD_SUPER, KEY_UP, 0, msg);
 		}
 		if (r == U_DESKTOP_OK && !wait_state(g, window_id, U_DESKTOP_WINDOW_MAXIMIZED, true, 1000, &gone)) {
 			gnome_set_msg(msg, gone ? "the window is gone"
@@ -529,9 +578,9 @@ gnome_window_op(struct u_desktop_backend *b,
 			gnome_set_msg(msg, "minimized windows of other apps cannot be restored on GNOME");
 			return U_DESKTOP_ERR_UNSUPPORTED;
 		}
-		r = activate_other(g, window_id, msg);
+		r = activate_other(g, guard, window_id, msg);
 		if (r == U_DESKTOP_OK && (target.state & U_DESKTOP_WINDOW_MAXIMIZED)) {
-			r = gnome_portal_chord(g->portal, U_DESKTOP_MOD_SUPER, KEY_DOWN, 0, msg);
+			r = gnome_send_chord(g, guard, window_id, U_DESKTOP_MOD_SUPER, KEY_DOWN, 0, msg);
 			if (r == U_DESKTOP_OK &&
 			    !wait_state(g, window_id, U_DESKTOP_WINDOW_MAXIMIZED, false, 1000, &gone)) {
 				gnome_set_msg(msg, gone ? "the window is gone" : "the window did not unmaximize");
@@ -541,11 +590,12 @@ gnome_window_op(struct u_desktop_backend *b,
 		return r;
 
 	case U_DESKTOP_OP_CLOSE: {
-		r = activate_other(g, window_id, msg);
+		r = activate_other(g, guard, window_id, msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
-		r = gnome_portal_chord(g->portal, U_DESKTOP_MOD_ALT, KEY_F4, 0, msg);
+		// Alt+F4 closes whatever has focus: it must still be the target.
+		r = gnome_send_chord(g, guard, window_id, U_DESKTOP_MOD_ALT, KEY_F4, 0, msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}

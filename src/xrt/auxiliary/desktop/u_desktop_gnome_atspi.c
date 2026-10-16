@@ -9,7 +9,7 @@
  * a client, so the lookup is window-relative: the extension's pick gives the
  * window (pid, title, frame); here we find the AT-SPI application of that pid
  * (the root's children, each matched by its bus name's unix process id), its
- * frame whose name is the window title (else the ACTIVE one, else the first),
+ * frame whose name is the window title (no match: "" — never another window's),
  * then Component.GetAccessibleAtPoint in WINDOW coordinates (coord_type 1,
  * relative to the frame), descending until a leaf. The leaf's Text (GetText 0,-1)
  * if it has one, else its Name.
@@ -36,7 +36,6 @@
 #define ATSPI_COMPONENT "org.a11y.atspi.Component"
 #define ATSPI_TEXT "org.a11y.atspi.Text"
 #define ATSPI_COORD_TYPE_WINDOW 1u
-#define ATSPI_STATE_ACTIVE 1u
 
 #define APP_CACHE 32
 
@@ -209,27 +208,6 @@ get_name(struct gnome_atspi *a, const struct atspi_ref *r, char *buf, size_t cap
 	return ok;
 }
 
-static bool
-is_active(struct gnome_atspi *a, const struct atspi_ref *r, struct budget *b)
-{
-	DBusMessage *reply =
-	    gdbus_call(a->c, r->bus, r->path, ATSPI_ACCESSIBLE, "GetState", left_ms(b), NULL, DBUS_TYPE_INVALID);
-	if (reply == NULL) {
-		return false;
-	}
-	bool active = false;
-	DBusMessageIter it, arr;
-	if (dbus_message_iter_init(reply, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
-		dbus_message_iter_recurse(&it, &arr);
-		if (dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_UINT32) {
-			dbus_uint32_t w0 = 0;
-			dbus_message_iter_get_basic(&arr, &w0);
-			active = (w0 >> ATSPI_STATE_ACTIVE) & 1u;
-		}
-	}
-	dbus_message_unref(reply);
-	return active;
-}
 
 static bool
 has_interface(struct gnome_atspi *a, const struct atspi_ref *r, const char *iface, struct budget *b)
@@ -280,7 +258,10 @@ find_app(struct gnome_atspi *a, uint32_t pid, struct atspi_ref *out, struct budg
 			return true;
 		}
 	}
-	static struct atspi_ref apps[128]; // under a->lock
+	struct atspi_ref *apps = calloc(128, sizeof(*apps)); // per call: nothing shared across instances
+	if (apps == NULL) {
+		return false;
+	}
 	struct atspi_ref root = {ATSPI_REGISTRY, ATSPI_ROOT};
 	uint32_t n = children(a, &root, apps, 128, b);
 	bool found = false;
@@ -300,6 +281,7 @@ find_app(struct gnome_atspi *a, uint32_t pid, struct atspi_ref *out, struct budg
 			found = true;
 		}
 	}
+	free(apps);
 	return found;
 }
 
@@ -375,6 +357,7 @@ gnome_atspi_text_at(struct gnome_atspi *a,
 
 	enum u_desktop_result r = U_DESKTOP_OK;
 	struct atspi_ref app, cur;
+	struct atspi_ref *frames = NULL;
 	if (!find_app(a, pid, &app, &b)) {
 		// Not an accessible app (toolkit a11y off) — nothing to read.
 		if (msg) {
@@ -383,23 +366,32 @@ gnome_atspi_text_at(struct gnome_atspi *a,
 		goto out;
 	}
 
-	// Its frame for this window.
-	static struct atspi_ref frames[64]; // under a->lock
+	// Its frame for THIS window, by title. No match → nothing: falling back to the
+	// active / first frame could read another window's text.
+	frames = calloc(64, sizeof(*frames)); // per call
+	if (frames == NULL) {
+		r = U_DESKTOP_ERR_FAILED;
+		goto out;
+	}
 	uint32_t nf = children(a, &app, frames, 64, &b);
 	if (nf == 0) {
 		forget_app(a, pid); // stale cache entry, or an app with no windows
 		goto out;
 	}
-	int pick = -1, active = -1;
+	int pick = -1;
 	for (uint32_t i = 0; i < nf && pick < 0 && left_ms(&b) > 2; i++) {
 		char name[U_DESKTOP_TITLE_SIZE];
 		if (title && title[0] && get_name(a, &frames[i], name, sizeof(name), &b) && strcmp(name, title) == 0) {
 			pick = (int)i;
-		} else if (active < 0 && is_active(a, &frames[i], &b)) {
-			active = (int)i;
 		}
 	}
-	cur = frames[pick >= 0 ? pick : active >= 0 ? active : 0];
+	if (pick < 0) {
+		if (msg) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "no accessible frame matches the window");
+		}
+		goto out;
+	}
+	cur = frames[pick];
 
 	// Descend.
 	for (int depth = 0; depth < 32 && left_ms(&b) > 2; depth++) {
@@ -445,6 +437,7 @@ gnome_atspi_text_at(struct gnome_atspi *a,
 		}
 	}
 out:
+	free(frames);
 	pthread_mutex_unlock(&a->lock);
 	return r;
 }

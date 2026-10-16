@@ -20,11 +20,15 @@
 #define PORTAL_PATH "/org/freedesktop/portal/desktop"
 #define RD_IFACE "org.freedesktop.portal.RemoteDesktop"
 #define CLIP_IFACE "org.freedesktop.portal.Clipboard"
-#define CALL_TIMEOUT_MS 3000
+//! Bounded so destroy() can tear the thread down within ~2 s.
+#define CALL_TIMEOUT_MS 1500
 //! A silent restore that has not answered by then is a dialog nobody is answering.
-#define RESTORE_START_TIMEOUT_MS 15000
+#define RESTORE_START_TIMEOUT_MS 5000
 //! A restore (Start answered silently) plus ConnectToEIS fits in this.
 #define ACTION_TIMEOUT_MS (RESTORE_START_TIMEOUT_MS + 6000)
+//! After prepare_input, keep the session open this long (verification + the
+//! common layer's idle wait, at most 10 s, run before the injection).
+#define GNOME_PREPARE_HOLD_MS 12000
 
 struct gp_cmd;
 typedef enum u_desktop_result (*gp_cmd_fn)(struct gnome_portal *p, struct gp_cmd *c);
@@ -45,6 +49,11 @@ struct gp_cmd
 	uint32_t ch;   //!< chord: a character to find on the active layout (0: use code)
 	char *text;    // owned
 	bool terminal;
+	//! May (re)open the session (silent restore). Only prepare_input and pointer
+	//! motion do: an injecting command after verification must not spend seconds
+	//! restoring between the check and the injection — it refuses instead.
+	bool restore;
+	uint32_t out_mods, out_code; //!< resolved chord
 	u_desktop_access_done_fn done;
 	void *done_ctx;
 
@@ -104,9 +113,21 @@ struct gnome_portal
 	bool resp_has_token;
 	bool resp_clip;
 
-	char *clip_text; //!< what we serve on SelectionTransfer
-	bool clip_owner; //!< SelectionOwnerChanged said session_is_owner
-	uint32_t transfers;
+	char *clip_text;       //!< what we serve on SelectionTransfer
+	bool clip_owner;       //!< SelectionOwnerChanged (from the portal) said session_is_owner
+	bool clip_is_paste;    //!< clip_text is the agent's text (not the restored previous one)
+	char *clip_prev;       //!< the clipboard text before the paste, to offer again
+	bool paste_armed;      //!< the paste keystroke was sent: transfers now count
+	uint32_t paste_writes; //!< successful writes of the agent's text since armed
+	uint32_t paste_last_serial;
+	bool paste_have_serial;
+
+	//! Unique bus name of the portal, from its first reply: Response / Closed /
+	//! Clipboard signals from anyone else are ignored (no forged grant).
+	char portal_owner[128];
+	//! prepare_input keeps the session open at least until then (the common
+	//! layer's verification and idle wait run between prepare and injection).
+	uint64_t hold_until_ms;
 
 	struct ei *ei;
 	bool ei_dead;
@@ -158,7 +179,7 @@ gp_pump(struct gnome_portal *p, int timeout_ms);
 
 //! The session is open with libei connected — restoring it silently if needed.
 enum u_desktop_result
-gp_ensure_session(struct gnome_portal *p, char *msg);
+gp_ensure_session(struct gnome_portal *p, bool restore, char *msg);
 
 void
 gp_session_forget(struct gnome_portal *p);
@@ -169,9 +190,23 @@ gp_cmd_new(gp_cmd_fn fn);
 void
 gp_cmd_free(struct gp_cmd *c);
 
-//! Run @p c on the thread and wait at most @p timeout_ms. Takes ownership of @p c.
+/*!
+ * Run @p c on the thread. Waits at most @p timeout_ms for it to START (a queued
+ * command is dropped with TIMEOUT); once running it is always waited for (every
+ * command is bounded), so no input is in flight after the call returns. Takes
+ * ownership of @p c.
+ */
 enum u_desktop_result
 gp_run_sync(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char *msg);
+
+//! gp_run_sync, copying the finished command into @p out (may be NULL) first.
+enum u_desktop_result
+gp_run_sync_keep(struct gnome_portal *p, struct gp_cmd *c, uint32_t timeout_ms, char *msg, struct gp_cmd *out);
+
+//! destroy() has begun: loops on the thread stop waiting.
+bool
+gp_quitting(struct gnome_portal *p);
+
 
 //! u_desktop_gnome_input.c: answer a SelectionTransfer (the paste asking for our text).
 void
