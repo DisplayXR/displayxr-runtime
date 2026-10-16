@@ -76,6 +76,7 @@
 #define RC_CONSENT_TTL_NS (1000ll * 1000 * 1000)
 #define RC_SINK_CHUNK (256u * 1024u)
 #define RC_DEFAULT_TIMEOUT_S 120u
+#define RC_DEFAULT_MAX_RESPONSE_MB 512u //!< a SHARP-class SOG is ~10 MB; this bounds a hostile endpoint
 
 #define COVERS(PTR, TYPE, FIELD) XRT_CONV_COVERS(PTR, TYPE, FIELD)
 #define SET(PTR, TYPE, FIELD, VALUE)                                                                                   \
@@ -94,7 +95,8 @@ struct rc_describe
 	char endpoint_id[64];
 	bool serves[RC_CAP_COUNT + 1]; //!< by cap id
 	uint32_t max_long_side[RC_CAP_COUNT + 1];
-	uint64_t max_bytes[RC_CAP_COUNT + 1];
+	uint64_t max_bytes[RC_CAP_COUNT + 1];        //!< largest INPUT it accepts (0 = no limit stated)
+	uint64_t max_result_bytes[RC_CAP_COUNT + 1]; //!< largest result it states (0 = not stated)
 	uint32_t blob_formats[RC_CAP_COUNT + 1]; //!< 1u << XRT_CONV_BLOB_*
 	bool rectified_required;
 	uint32_t licence_class; //!< XRT_CONV_LICENCE_*
@@ -126,6 +128,7 @@ struct rc
 	struct rc_host hosts[RC_MAX_HOSTS];
 	char credential[128];
 	uint32_t timeout_s;
+	uint64_t max_response_bytes;  //!< MAX_RESPONSE_MB: the largest blob accepted from any endpoint
 	char options[RC_OPTIONS_MAX]; //!< a JSON object, passed through as params.options ("" = none)
 	uint32_t blob_format;         //!< XRT_CONV_BLOB_SOG / PLY_3DGS
 	char config_error[128];       //!< a bad setting: DISABLED with this detail
@@ -147,6 +150,10 @@ struct rc
 	uint64_t generation;
 	bool build_logged;
 	bool build_differs_warned;
+
+	/* The background describe (licence before the first warm). */
+	struct os_thread bg;
+	bool bg_started;
 };
 
 
@@ -212,17 +219,7 @@ never_cancelled(void *ctx)
 static bool
 url_allowed(const char *u)
 {
-	if (strncmp(u, "https://", 8) == 0) {
-		return u[8] != '\0';
-	}
-	static const char *const loop[] = {"http://127.0.0.1", "http://localhost", "http://[::1]"};
-	for (size_t i = 0; i < sizeof(loop) / sizeof(loop[0]); i++) {
-		const size_t n = strlen(loop[i]);
-		if (strncmp(u, loop[i], n) == 0 && (u[n] == '\0' || u[n] == ':' || u[n] == '/')) {
-			return true;
-		}
-	}
-	return false;
+	return rc_url_endpoint_allowed(u);
 }
 
 static const char *
@@ -277,7 +274,33 @@ static float
 jfloat(const cJSON *o, const char *key, float dflt)
 {
 	double d;
-	return jnum(o, key, &d) ? (float)d : dflt;
+	if (!jnum(o, key, &d)) {
+		return dflt;
+	}
+	// Untrusted: keep it representable (a float cast out of range is undefined).
+	return (float)(d > 1e30 ? 1e30 : d < -1e30 ? -1e30 : d);
+}
+
+/*! An untrusted JSON number as an unsigned integer in [0, @p max]; @p dflt when
+ *  absent, negative or not finite. Never a float-to-int cast out of range. */
+static uint64_t
+jcount(const cJSON *o, const char *key, uint64_t max, uint64_t dflt)
+{
+	double d;
+	if (!jnum(o, key, &d) || d < 0.0) {
+		return dflt;
+	}
+	return d >= (double)max ? max : (uint64_t)d;
+}
+
+//! A bare cJSON number the same way.
+static uint64_t
+jcount_item(const cJSON *v, uint64_t max)
+{
+	if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble) || v->valuedouble < 0.0) {
+		return 0;
+	}
+	return v->valuedouble >= (double)max ? max : (uint64_t)v->valuedouble;
 }
 
 static uint32_t
@@ -340,6 +363,13 @@ load_settings(struct rc *rc)
 {
 	char buf[2048];
 	rc->timeout_s = RC_DEFAULT_TIMEOUT_S;
+	rc->max_response_bytes = (uint64_t)RC_DEFAULT_MAX_RESPONSE_MB << 20;
+	if (setting("MAX_RESPONSE_MB", buf, sizeof(buf))) {
+		const unsigned long v = strtoul(buf, NULL, 10);
+		if (v >= 1 && v <= 4096) {
+			rc->max_response_bytes = (uint64_t)v << 20;
+		}
+	}
 	if (setting("TIMEOUT_S", buf, sizeof(buf))) {
 		const unsigned long v = strtoul(buf, NULL, 10);
 		rc->timeout_s = v >= 1 && v <= 3600 ? (uint32_t)v : RC_DEFAULT_TIMEOUT_S;
@@ -414,6 +444,9 @@ load_settings(struct rc *rc)
  *
  */
 
+static void
+bg_describe_start_locked(struct rc *rc);
+
 //! Refresh the cached consent (at most once a second from [C] slots). rc->lock held.
 static void
 consent_refresh_locked(struct rc *rc, bool force)
@@ -428,6 +461,7 @@ consent_refresh_locked(struct rc *rc, bool force)
 	if (was != rc->consent && rc->consent_read_ns != 0) {
 		rc->generation++;
 	}
+	bg_describe_start_locked(rc);
 }
 
 struct rc_eval
@@ -524,9 +558,7 @@ describe_parse(const char *json, struct rc_describe *d, char *err, size_t err_si
 		copy_str(err, err_size, "describe is not a JSON object");
 		return false;
 	}
-	double c = 0;
-	(void)jnum(root, "contract", &c);
-	d->contract = (uint32_t)c;
+	d->contract = (uint32_t)jcount(root, "contract", 1000u, 0u);
 	copy_str(d->endpoint_id, sizeof(d->endpoint_id), jstr(root, "endpoint_id"));
 	const cJSON *t = NULL;
 	cJSON_ArrayForEach(t, cJSON_GetObjectItemCaseSensitive(root, "tasks"))
@@ -540,13 +572,10 @@ describe_parse(const char *json, struct rc_describe *d, char *err, size_t err_si
 			continue;
 		}
 		d->serves[cap] = true;
-		double v = 0;
-		if (jnum(t, "max_long_side", &v) && v > 0) {
-			d->max_long_side[cap] = (uint32_t)v;
-		}
-		if (jnum(t, "max_bytes", &v) && v > 0) {
-			d->max_bytes[cap] = (uint64_t)v;
-		}
+		d->max_long_side[cap] = (uint32_t)jcount(t, "max_long_side", 65536u, 0u);
+		d->max_bytes[cap] = jcount(t, "max_bytes", 1ull << 40, 0u);
+		// Optional (beyond v1's required keys): the largest result it returns.
+		d->max_result_bytes[cap] = jcount(t, "max_result_bytes", 1ull << 40, 0u);
 		const cJSON *rr = cJSON_GetObjectItemCaseSensitive(t, "rectified_required");
 		if (cap == RC_CAP_STEREO && cJSON_IsTrue(rr)) {
 			d->rectified_required = true;
@@ -678,6 +707,65 @@ read_token(struct rc *rc, char *token, size_t token_size, char *err, size_t err_
 		return true;
 	}
 	return u_credential_read(rc->credential, token, token_size, err, err_size) == U_CREDENTIAL_OK;
+}
+
+
+/*
+ * The licence class must be known BEFORE the first warm: selection drops a
+ * capability whose class is UNKNOWN unless AllowResearchOnly (spec §3.4), and
+ * a capability that is never selected is never warmed - so a commercial
+ * endpoint would never be reachable through the service. Once the user has
+ * granted consent (and the endpoint list is usable), one background GET
+ * /v1/describe runs; when it answers, the generation moves and the runtime
+ * re-describes the capability with the stated class. No picture is sent; the
+ * state stays INSTALLED until a warm. It runs once per instance.
+ */
+static void *
+bg_describe_main(void *ptr)
+{
+	struct rc *rc = (struct rc *)ptr;
+	char token[U_CREDENTIAL_SECRET_MAX + 1];
+	char err[256] = {0};
+	bool answered = false;
+	if (read_token(rc, token, sizeof(token), err, sizeof(err))) {
+		os_mutex_lock(&rc->lock);
+		const uint32_t hosts = rc->host_count;
+		os_mutex_unlock(&rc->lock);
+		for (uint32_t i = 0; i < hosts && !answered; i++) {
+			if (describe_host(rc, i, token, NULL, NULL, err, sizeof(err)) == 0) {
+				os_mutex_lock(&rc->lock);
+				if (!rc->have_describe) {
+					rc->cur = rc->hosts[i].d;
+					rc->have_describe = true;
+					rc->generation++;
+				}
+				os_mutex_unlock(&rc->lock);
+				answered = true;
+			}
+		}
+	}
+	u_credential_wipe(token, sizeof(token));
+	if (answered) {
+		notify(0);
+	}
+	return NULL;
+}
+
+static void
+bg_describe_start_locked(struct rc *rc)
+{
+	if (rc->bg_started || !rc->consent || rc->have_describe || rc->host_count == 0 || !rc->http_ok ||
+	    rc->config_error[0] != '\0') {
+		return;
+	}
+	if (os_thread_init(&rc->bg) != 0) {
+		return;
+	}
+	if (os_thread_start(&rc->bg, bg_describe_main, rc) != 0) {
+		os_thread_destroy(&rc->bg);
+		return;
+	}
+	rc->bg_started = true;
 }
 
 
@@ -1121,8 +1209,8 @@ apply_result(
 	si.fy = jfloat(in, "fy", 0.0f);
 	si.cx = jfloat(in, "cx", 0.0f);
 	si.cy = jfloat(in, "cy", 0.0f);
-	si.grid_width = (uint32_t)jfloat(in, "width", 0.0f);
-	si.grid_height = (uint32_t)jfloat(in, "height", 0.0f);
+	si.grid_width = (uint32_t)jcount(in, "width", 65536u, 0u);
+	si.grid_height = (uint32_t)jcount(in, "height", 65536u, 0u);
 	const char *isrc = jstr(in, "source");
 	si.intrinsics_source = si.fx <= 0.0f                                  ? XRT_CONV_INTRINSICS_NONE
 	                       : isrc != NULL && strcmp(isrc, "given") == 0   ? XRT_CONV_INTRINSICS_GIVEN
@@ -1135,8 +1223,7 @@ apply_result(
 	si.baseline_m = si.metric != 0 ? baseline : 0.0f;
 	si.near_m = jfloat(res, "near_m", 0.0f);
 	si.far_m = jfloat(res, "far_m", 0.0f);
-	double count = 0;
-	si.splat_count = jnum(res, "splat_count", &count) && count > 0 ? (uint64_t)count : 0u;
+	si.splat_count = jcount(res, "splat_count", 1ull << 40, 0u);
 	const cJSON *fs = cJSON_GetObjectItemCaseSensitive(res, "focus_suggestion");
 	const cJSON *pt = cJSON_GetObjectItemCaseSensitive(fs, "point");
 	if (cJSON_IsArray(pt) && cJSON_GetArraySize(pt) == 3) {
@@ -1209,7 +1296,7 @@ apply_result(
 		}
 	} else if (cJSON_IsNumber(layers) && layers->valuedouble > 0) {
 		f.valid |= XRT_CONV_SPLAT_VALID_LAYERS;
-		f.layer_count = (uint32_t)layers->valuedouble;
+		f.layer_count = (uint32_t)jcount_item(layers, XRT_CONV_MAX_SPLAT_LAYERS);
 		f.layer_count = f.layer_count > XRT_CONV_MAX_SPLAT_LAYERS ? XRT_CONV_MAX_SPLAT_LAYERS : f.layer_count;
 	}
 	if (cJSON_IsArray(pt) && cJSON_GetArraySize(pt) == 3) {
@@ -1473,6 +1560,12 @@ rc_job_execute(struct xrt_conversion_plugin_instance *inst,
 		rq.body = body.p;
 		rq.body_size = body.n;
 		rq.timeout_ms = rc->timeout_s * 1000u;
+		// The result is buffered: bound it by the setting, and by what the host
+		// itself states (describe's max_result_bytes) when that is smaller.
+		rq.max_response_bytes = rc->max_response_bytes;
+		if (d.max_result_bytes[cap_id] != 0 && d.max_result_bytes[cap_id] < rq.max_response_bytes) {
+			rq.max_response_bytes = d.max_result_bytes[cap_id];
+		}
 		rq.is_cancelled = job.is_cancelled;
 		rq.cancel_ctx = job.ctx;
 		rq.progress = http_progress;
@@ -1633,6 +1726,13 @@ rc_destroy(struct xrt_conversion_plugin_instance *inst)
 	if (rc == NULL) {
 		return;
 	}
+	os_mutex_lock(&rc->lock);
+	const bool bg = rc->bg_started;
+	os_mutex_unlock(&rc->lock);
+	if (bg) {
+		os_thread_join(&rc->bg); // bounded by the describe timeout
+		os_thread_destroy(&rc->bg);
+	}
 	os_mutex_destroy(&rc->lock);
 	free(rc);
 }
@@ -1654,6 +1754,8 @@ static const struct xrt_component_setting_desc g_rc_settings[] = {
     {"TIMEOUT_S", XRT_COMPONENT_SETTING_TYPE_INT, "120",
      "per-request timeout; a timeout falls through to the next host"},
     {"FORMAT", XRT_COMPONENT_SETTING_TYPE_ENUM, "sog", "sog | ply: the blob asked for when the job names none"},
+    {"MAX_RESPONSE_MB", XRT_COMPONENT_SETTING_TYPE_INT, "512",
+     "the largest result blob accepted (1..4096 MB); a larger answer fails that host"},
     {"OPTIONS", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "a JSON object passed through as params.options (model-specific switches)"},
 };

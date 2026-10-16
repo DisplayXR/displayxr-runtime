@@ -47,9 +47,10 @@ displayxr-cli conv run splats-mono photo.jpg photo.sog --camera-block auto
 | Key | Default | Meaning |
 |---|---|---|
 | `ENABLE` | 0 | `probe` declines unless 1 |
-| `ENDPOINTS` | — | base URLs in fallback order; `https://`, or `http://` on loopback only |
+| `ENDPOINTS` | — | base URLs in fallback order; `https://`, or `http://` to exactly `localhost` / `127.0.0.1` / `[::1]`; userinfo (`@`) is always refused |
 | `CREDENTIAL` | — | the **name** of the bearer token in the OS credential store; never the token |
 | `TIMEOUT_S` | 120 | per request; a timeout falls through to the next host |
+| `MAX_RESPONSE_MB` | 512 | the largest result accepted (and a host's own `max_result_bytes`, when smaller) |
 | `FORMAT` | `sog` | `sog` \| `ply` when the job names none |
 | `OPTIONS` | — | a JSON object passed through as `params.options` |
 

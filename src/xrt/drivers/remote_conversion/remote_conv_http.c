@@ -30,7 +30,7 @@
 #endif
 
 #define RC_HTTP_DEFAULT_TIMEOUT_MS 120000u
-#define RC_HTTP_DEFAULT_MAX_BYTES (1024ull * 1024ull * 1024ull)
+#define RC_HTTP_DEFAULT_MAX_BYTES (512ull * 1024ull * 1024ull) //!< when a caller sets no cap
 
 static void
 set_msg(struct rc_http_response *r, int error, const char *fmt, const char *arg)
@@ -50,6 +50,11 @@ buf_append(uint8_t **buf, size_t *size, size_t *cap, const void *data, size_t n,
 		size_t nc = *cap != 0 ? *cap : 64u * 1024u;
 		while (nc < *size + n + 1) {
 			nc *= 2;
+		}
+		// Never grow past the cap (+1 for the NUL): a 512 MiB limit must not
+		// become a 1 GiB allocation by doubling.
+		if ((uint64_t)nc > max + 1) {
+			nc = (size_t)(max + 1);
 		}
 		uint8_t *nb = (uint8_t *)realloc(*buf, nc);
 		if (nb == NULL) {
@@ -75,6 +80,79 @@ rc_http_response_free(struct rc_http_response *resp)
 	resp->body = NULL;
 	resp->headers = NULL;
 	resp->body_size = resp->headers_size = 0;
+}
+
+bool
+rc_url_endpoint_allowed(const char *url)
+{
+	if (url == NULL) {
+		return false;
+	}
+	for (const unsigned char *c = (const unsigned char *)url; *c != '\0'; c++) {
+		if (*c <= 0x20 || *c == 0x7f || *c == '\\') {
+			return false; // white space, control characters, backslashes: never in an endpoint
+		}
+	}
+	bool https;
+	const char *a;
+	if (strncmp(url, "https://", 8) == 0) {
+		https = true;
+		a = url + 8;
+	} else if (strncmp(url, "http://", 7) == 0) {
+		https = false;
+		a = url + 7;
+	} else {
+		return false;
+	}
+	// The authority ends at the first '/', '?' or '#'.
+	size_t alen = strcspn(a, "/?#");
+	if (alen == 0 || memchr(a, '@', alen) != NULL) {
+		return false; // no host, or userinfo (the classic `allowed-host@other-host` bypass)
+	}
+	// Split host and port.
+	size_t hlen;
+	const char *port = NULL;
+	if (a[0] == '[') {
+		const char *rb = memchr(a, ']', alen);
+		if (rb == NULL) {
+			return false;
+		}
+		hlen = (size_t)(rb - a) + 1;
+		if (hlen < alen) {
+			if (a[hlen] != ':') {
+				return false;
+			}
+			port = a + hlen + 1;
+		}
+	} else {
+		const char *colon = memchr(a, ':', alen);
+		hlen = colon != NULL ? (size_t)(colon - a) : alen;
+		port = colon != NULL ? colon + 1 : NULL;
+	}
+	if (hlen == 0) {
+		return false;
+	}
+	if (port != NULL) {
+		const size_t plen = alen - (size_t)(port - a);
+		if (plen == 0 || plen > 5) {
+			return false;
+		}
+		for (size_t i = 0; i < plen; i++) {
+			if (port[i] < '0' || port[i] > '9') {
+				return false;
+			}
+		}
+	}
+	if (https) {
+		return true;
+	}
+	static const char *const loop[] = {"localhost", "127.0.0.1", "[::1]"};
+	for (size_t i = 0; i < sizeof(loop) / sizeof(loop[0]); i++) {
+		if (strlen(loop[i]) == hlen && strncmp(a, loop[i], hlen) == 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool
@@ -132,11 +210,23 @@ rc_http_header(const struct rc_http_response *resp, const char *name, char *out,
  *
  */
 
+/*
+ * Handle ownership (the cancel race): the request handle belongs to the
+ * calling thread. The watcher only RECORDS a cancel / deadline; it closes the
+ * handle itself only while the calling thread is inside a blocking WinHTTP
+ * call (`in_call`), which is the documented way to abort a synchronous
+ * call. The calling thread checks `stop` (under the lock) before every call
+ * and never touches the handle once `closed` is set; non-blocking queries run
+ * with the lock held, so the watcher cannot close under them. Whoever has not
+ * closed it at the end - the calling thread - does.
+ */
 struct win_watch
 {
 	struct os_mutex mtx;
 	HINTERNET req;
 	bool done;
+	bool in_call; //!< the calling thread is in (or entering) a blocking call on req
+	bool closed;  //!< the watcher closed req: never touch it again
 	bool cancelled;
 	bool timed_out;
 	uint64_t deadline_ns;
@@ -154,16 +244,49 @@ win_watch_main(void *ptr)
 			os_mutex_unlock(&w->mtx);
 			return NULL;
 		}
-		const bool cancel = w->rq->is_cancelled != NULL && w->rq->is_cancelled(w->rq->cancel_ctx);
-		const bool late = (uint64_t)os_monotonic_get_ns() > w->deadline_ns;
-		if ((cancel || late) && w->req != NULL) {
+		if (!w->cancelled && !w->timed_out) {
+			const bool cancel = w->rq->is_cancelled != NULL && w->rq->is_cancelled(w->rq->cancel_ctx);
+			const bool late = (uint64_t)os_monotonic_get_ns() > w->deadline_ns;
 			w->cancelled = cancel;
-			w->timed_out = !cancel;
-			WinHttpCloseHandle(w->req); // aborts the call blocked on it
-			w->req = NULL;
+			w->timed_out = !cancel && late;
+		}
+		if ((w->cancelled || w->timed_out) && w->in_call && !w->closed) {
+			WinHttpCloseHandle(w->req); // aborts the blocking call in progress
+			w->closed = true;
 		}
 		os_mutex_unlock(&w->mtx);
 	}
+}
+
+//! Enter a blocking call on w->req; false = stopped (cancel / deadline / closed): do not call.
+static bool
+win_call_begin(struct win_watch *w)
+{
+	os_mutex_lock(&w->mtx);
+	const bool go = !w->cancelled && !w->timed_out && !w->closed;
+	w->in_call = go;
+	os_mutex_unlock(&w->mtx);
+	return go;
+}
+
+static void
+win_call_end(struct win_watch *w)
+{
+	os_mutex_lock(&w->mtx);
+	w->in_call = false;
+	os_mutex_unlock(&w->mtx);
+}
+
+//! Lock for a NON-blocking call on w->req; false (unlocked) = stopped.
+static bool
+win_quick_begin(struct win_watch *w)
+{
+	os_mutex_lock(&w->mtx);
+	if (w->cancelled || w->timed_out || w->closed) {
+		os_mutex_unlock(&w->mtx);
+		return false;
+	}
+	return true;
 }
 
 static wchar_t *
@@ -259,9 +382,13 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 	struct os_thread th;
 	const bool watching = os_thread_init(&th) == 0 && os_thread_start(&th, win_watch_main, &w) == 0;
 
-	BOOL ok =
-	    WinHttpSendRequest(req, whdr != NULL ? whdr : WINHTTP_NO_ADDITIONAL_HEADERS, whdr != NULL ? (DWORD)-1L : 0,
-	                       (LPVOID)rq->body, (DWORD)rq->body_size, (DWORD)rq->body_size, 0);
+	BOOL ok = win_call_begin(&w);
+	if (ok) {
+		ok = WinHttpSendRequest(req, whdr != NULL ? whdr : WINHTTP_NO_ADDITIONAL_HEADERS,
+		                        whdr != NULL ? (DWORD)-1L : 0, (LPVOID)rq->body, (DWORD)rq->body_size,
+		                        (DWORD)rq->body_size, 0);
+		win_call_end(&w);
+	}
 	if (whdr != NULL) {
 		SecureZeroMemory(whdr, wcslen(whdr) * sizeof(wchar_t));
 		free(whdr);
@@ -269,14 +396,18 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 	if (rq->progress != NULL && ok) {
 		rq->progress(rq->progress_ctx, 1.0f, 0.0f);
 	}
-	ok = ok && WinHttpReceiveResponse(req, NULL);
-	if (ok) {
+	if (ok && (ok = win_call_begin(&w))) {
+		ok = WinHttpReceiveResponse(req, NULL);
+		win_call_end(&w);
+	}
+	if (ok && (ok = win_quick_begin(&w))) {
 		DWORD status = 0, sz = sizeof(status);
 		ok = WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
 		                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
 		resp->status = (long)status;
+		os_mutex_unlock(&w.mtx);
 	}
-	if (ok) {
+	if (ok && win_quick_begin(&w)) {
 		DWORD wsz = 0;
 		(void)WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &wsz,
 		                          WINHTTP_NO_HEADER_INDEX);
@@ -291,13 +422,19 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 			}
 		}
 		free(wh);
+		os_mutex_unlock(&w.mtx);
 	}
 	size_t cap = 0;
 	bool too_large = false;
-	while (ok) {
-		uint8_t chunk[64 * 1024];
+	uint8_t *chunk = (uint8_t *)malloc(64 * 1024);
+	while (ok && chunk != NULL) {
 		DWORD got = 0;
-		ok = WinHttpReadData(req, chunk, sizeof(chunk), &got);
+		if (!win_call_begin(&w)) {
+			ok = FALSE;
+			break;
+		}
+		ok = WinHttpReadData(req, chunk, 64 * 1024, &got);
+		win_call_end(&w);
 		if (!ok || got == 0) {
 			break;
 		}
@@ -306,12 +443,13 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 			break;
 		}
 	}
+	free(chunk);
 	os_mutex_lock(&w.mtx);
 	w.done = true;
 	const bool cancelled = w.cancelled, timed_out = w.timed_out;
-	if (w.req != NULL) {
-		WinHttpCloseHandle(w.req);
-		w.req = NULL;
+	if (!w.closed) {
+		WinHttpCloseHandle(w.req); // ours: the watcher never closed it
+		w.closed = true;
 	}
 	os_mutex_unlock(&w.mtx);
 	if (watching) {

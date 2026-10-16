@@ -42,7 +42,7 @@ struct rc_http_request
 	const void *body;
 	size_t body_size;
 	uint32_t timeout_ms;         //!< whole request; 0 = 120 s
-	uint64_t max_response_bytes; //!< 0 = 1 GiB
+	uint64_t max_response_bytes; //!< 0 = 512 MiB; the buffer never grows past it
 	bool (*is_cancelled)(void *ctx);
 	void *cancel_ctx;
 	//! Upload / download progress in [0,1] (optional; called on the request thread).
@@ -60,6 +60,17 @@ struct rc_http_response
 	size_t headers_size;
 	char message[192]; //!< a one-line reason when error != RC_HTTP_OK
 };
+
+/*!
+ * May @p url be an endpoint base URL? The authority is parsed, not
+ * prefix-matched: any userinfo (`@`), backslash, white space or control
+ * character is refused; `https://<host>[:<digits>]` is allowed; plain
+ * `http://` only when the host is EXACTLY `localhost`, `127.0.0.1` or `[::1]`
+ * (so `http://localhost:x@evil.example/` and `http://localhost.evil.example/`
+ * are refused: a token never crosses a network in clear).
+ */
+bool
+rc_url_endpoint_allowed(const char *url);
 
 /*! Is an HTTP stack available here? False with @p why filled (Linux without libcurl). */
 bool
