@@ -37,9 +37,13 @@
  * - Observation calls (list_windows, get_pointer, pick, text_at, focused_window,
  *   is_locked, user_idle_ms, access_status) may come from ANY thread, concurrently
  *   with an action in flight, and must NOT block on it: they are called from the
- *   app's main thread (a Unity frame). Keep them fast (target < 5 ms; text_at,
- *   which walks the accessibility tree, < 50 ms) and use separate connections /
- *   locks from the action path where the OS API needs it.
+ *   app's main thread (a Unity frame). Keep them fast — pick / focused_window /
+ *   get_pointer / is_locked / user_idle_ms target < 5 ms; list_windows and text_at
+ *   (window-server / accessibility round trips) target < 50 ms typical, with OS-side
+ *   spikes allowed (macOS CGWindowList measured 3 ms mean, ~90 ms max). Callers must
+ *   not list windows every frame; the common layer's per-action checks use pick and
+ *   focused_window. Use separate connections / locks from the action path where the
+ *   OS API needs it.
  * - request_access may complete asynchronously: call @p done exactly once, from
  *   any thread, possibly before request_access returns.
  *
