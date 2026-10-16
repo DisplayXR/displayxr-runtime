@@ -249,6 +249,14 @@ jobs:
         # set. Plain gjs.
         run: gjs scripts/test_gnome_extension_own_window.js
 
+      - name: Pointer reply
+        # Unit test for PointerPick in lib.js (extension version 16,
+        # WindowGeometry1.GetPointer / GetWindowAt): the window under the
+        # pointer is the picked actor's window actor (a subsurface counts),
+        # desktop vs shell UI (incl. Ubuntu's desktop-icons window), points on
+        # no monitor, parent_id, and the reply (nothing while locked). Plain gjs.
+        run: gjs scripts/test_gnome_extension_pointer.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:
