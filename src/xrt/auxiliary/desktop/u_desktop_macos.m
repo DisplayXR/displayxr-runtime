@@ -404,6 +404,16 @@ struct macos_backend
 		uint64_t until;
 	} slow[16]; //!< apps that timed out: skipped by the refresher until `until`
 
+	// Consent poll (request_access), see access_wait_thread.
+	pthread_mutex_t access_lock;
+	pthread_cond_t access_cond;
+	pthread_t access_thread;
+	bool access_thread_started;
+	bool access_cancel;
+	bool access_delivered;
+	u_desktop_access_done_fn access_done;
+	void *access_ctx;
+
 	// Worker-thread-only input state.
 	CGEventSourceRef src;
 	uint32_t buttons_down; //!< bit per enum u_desktop_button
@@ -550,7 +560,10 @@ ax_build_table(struct macos_backend *m, pid_t pid, float timeout, struct ax_app_
 				if (t) {
 					CFRelease(t);
 				}
-				CFIndex best = -1;
+				// Unique frame match, else unique frame + title match; anything
+				// still ambiguous stays unmapped (see ax_element_window_id).
+				CFIndex best = -1, best_titled = -1;
+				int n_frame = 0, n_titled = 0;
 				CFIndex cn = CFArrayGetCount(cg_all);
 				for (CFIndex k = 0; k < cn && k < 1024; k++) {
 					CFDictionaryRef d = CFArrayGetValueAtIndex(cg_all, k);
@@ -558,11 +571,17 @@ ax_build_table(struct macos_backend *m, pid_t pid, float timeout, struct ax_app_
 					    dict_int(d, kCGWindowLayer, -1) != 0 || !rect_near(dict_bounds(d), fr, 1.0)) {
 						continue;
 					}
+					best = k;
+					n_frame++;
 					char cgt[U_DESKTOP_TITLE_SIZE] = {0};
 					cfstr_to_utf8(CFDictionaryGetValue(d, kCGWindowName), cgt, sizeof(cgt));
-					if (best < 0 || (title[0] && strcmp(title, cgt) == 0)) {
-						best = k;
+					if (title[0] && strcmp(title, cgt) == 0) {
+						best_titled = k;
+						n_titled++;
 					}
+				}
+				if (n_frame != 1) {
+					best = n_titled == 1 ? best_titled : -1;
 				}
 				if (best >= 0) {
 					taken[best] = true;
@@ -780,15 +799,19 @@ ax_element_window_id(struct macos_backend *m, AXUIElementRef win)
 	if (all == NULL) {
 		return 0;
 	}
+	// Two stacked same-size windows of one app are indistinguishable by frame:
+	// an ambiguous match is NO match (focus unknown -> input refused, never guessed).
+	int matches = 0;
 	for (CFIndex i = 0; i < CFArrayGetCount(all); i++) {
 		CFDictionaryRef d = CFArrayGetValueAtIndex(all, i);
-		if (dict_int(d, kCGWindowOwnerPID, -1) == pid && rect_near(dict_bounds(d), fr, 1.0)) {
+		if (dict_int(d, kCGWindowOwnerPID, -1) == pid && dict_int(d, kCGWindowLayer, -1) == 0 &&
+		    rect_near(dict_bounds(d), fr, 1.0)) {
 			wid = (CGWindowID)dict_int(d, kCGWindowNumber, 0);
-			break;
+			matches++;
 		}
 	}
 	CFRelease(all);
-	return wid;
+	return matches == 1 ? wid : 0;
 }
 
 /*
@@ -1358,29 +1381,77 @@ mac_access_status(struct u_desktop_backend *b)
 	return trusted() ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
 }
 
-struct access_wait
-{
-	u_desktop_access_done_fn done;
-	void *ctx;
-};
-
+/*
+ * The consent poll (TCC has no completion callback). One joinable thread per
+ * request; destroy() cancels it through access_cond, joins it, and answers
+ * UNKNOWN for it if it never answered (u_desktop.h "Lifetime"). done() is called
+ * by exactly one party: the thread, or the canceller after the join.
+ */
 static void *
 access_wait_thread(void *p)
 {
-	struct access_wait *w = p;
+	struct macos_backend *m = p;
 	enum u_desktop_access res = U_DESKTOP_ACCESS_DENIED;
-	// TCC has no completion callback: poll. AXIsProcessTrusted reflects a grant
-	// made in System Settings without restarting the process.
-	for (int i = 0; i < 120 * 4; i++) {
-		if (AXIsProcessTrusted()) {
+	uint64_t deadline = now_ns() + 120ull * 1000 * 1000 * 1000;
+
+	pthread_mutex_lock(&m->access_lock);
+	while (!m->access_cancel) {
+		pthread_mutex_unlock(&m->access_lock);
+		// Reflects a grant made in System Settings without a relaunch [assumed].
+		bool ok = AXIsProcessTrusted();
+		pthread_mutex_lock(&m->access_lock);
+		if (ok) {
 			res = U_DESKTOP_ACCESS_GRANTED;
 			break;
 		}
-		sleep_ms(250);
+		if (now_ns() >= deadline) {
+			break;
+		}
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += 250 * 1000 * 1000;
+		if (ts.tv_nsec >= 1000000000) {
+			ts.tv_sec++;
+			ts.tv_nsec -= 1000000000;
+		}
+		pthread_cond_timedwait(&m->access_cond, &m->access_lock, &ts); // wakes at once on cancel
 	}
-	w->done(w->ctx, res);
-	free(w);
+	bool deliver = !m->access_cancel && !m->access_delivered;
+	if (deliver) {
+		m->access_delivered = true;
+	}
+	u_desktop_access_done_fn done = m->access_done;
+	void *ctx = m->access_ctx;
+	pthread_mutex_unlock(&m->access_lock);
+	if (deliver) {
+		done(ctx, res);
+	}
 	return NULL;
+}
+
+//! Cancel and join the poll thread, answering UNKNOWN if it never answered.
+static void
+access_cancel_join(struct macos_backend *m)
+{
+	pthread_mutex_lock(&m->access_lock);
+	bool running = m->access_thread_started;
+	m->access_cancel = true;
+	pthread_cond_broadcast(&m->access_cond);
+	pthread_mutex_unlock(&m->access_lock);
+	if (!running) {
+		return;
+	}
+	pthread_join(m->access_thread, NULL);
+	pthread_mutex_lock(&m->access_lock);
+	bool owed = !m->access_delivered;
+	m->access_delivered = true;
+	m->access_thread_started = false;
+	u_desktop_access_done_fn done = m->access_done;
+	void *ctx = m->access_ctx;
+	pthread_mutex_unlock(&m->access_lock);
+	if (owed && done != NULL) {
+		done(ctx, U_DESKTOP_ACCESS_UNKNOWN);
+	}
 }
 
 static void
@@ -1389,8 +1460,11 @@ mac_request_access(struct u_desktop_backend *b,
                    u_desktop_access_done_fn done,
                    void *ctx)
 {
-	(void)b;
+	struct macos_backend *m = mb(b);
 	(void)app; // TCC names the responsible process itself; we cannot (and must not) relabel it.
+
+	// A previous request still polling: retire it (it answers UNKNOWN) first.
+	access_cancel_join(m);
 
 	if (!CGPreflightScreenCaptureAccess()) {
 		// Optional (titles only). Shows the system prompt once per responsible
@@ -1409,20 +1483,20 @@ mac_request_access(struct u_desktop_backend *b,
 		return;
 	}
 
-	struct access_wait *w = calloc(1, sizeof(*w));
-	pthread_t th;
-	if (w == NULL) {
-		done(ctx, U_DESKTOP_ACCESS_DENIED);
-		return;
+	pthread_mutex_lock(&m->access_lock);
+	m->access_done = done;
+	m->access_ctx = ctx;
+	m->access_cancel = false;
+	m->access_delivered = false;
+	m->access_thread_started = pthread_create(&m->access_thread, NULL, access_wait_thread, m) == 0;
+	bool started = m->access_thread_started;
+	if (!started) {
+		m->access_delivered = true;
 	}
-	w->done = done;
-	w->ctx = ctx;
-	if (pthread_create(&th, NULL, access_wait_thread, w) != 0) {
-		free(w);
+	pthread_mutex_unlock(&m->access_lock);
+	if (!started) {
 		done(ctx, U_DESKTOP_ACCESS_DENIED);
-		return;
 	}
-	pthread_detach(th);
 }
 
 static bool
@@ -1959,6 +2033,7 @@ ensure_not_fullscreen(AXUIElementRef el, char *msg)
 
 static enum u_desktop_result
 mac_window_op(struct u_desktop_backend *b,
+              const struct u_desktop_input_guard *guard,
               enum u_desktop_window_op op,
               uint64_t window_id,
               const struct u_desktop_rect *rect,
@@ -1968,6 +2043,12 @@ mac_window_op(struct u_desktop_backend *b,
 	if (!trusted()) {
 		set_msg(msg, "Accessibility permission not granted");
 		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	// AX window ops inject no input, so the per-press re-pick does not apply;
+	// still honour a kill switch / lock that arrived since verification.
+	if (guard != NULL && guard->still_allowed != NULL && !guard->still_allowed(guard->ctx)) {
+		set_msg(msg, "stopped: desktop control suspended, denied or screen locked");
+		return U_DESKTOP_ERR_REFUSED;
 	}
 	CGWindowID wid = (CGWindowID)window_id;
 	CFDictionaryRef info = window_id != 0 && window_id <= UINT32_MAX ? cg_window_info(wid) : NULL;
@@ -2195,7 +2276,7 @@ layout_lookup_run(struct layout_lookup *l)
 	}
 	CFDataRef data = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
 	if (data == NULL) {
-		snprintf(l->err, sizeof(l->err), "layout %s has no Unicode key layout data", l->source_id);
+		snprintf(l->err, sizeof(l->err), "the active keyboard layout has no Unicode key data");
 		CFRelease(src);
 		return;
 	}
@@ -2269,7 +2350,8 @@ layout_char_to_key(struct macos_backend *m, UniChar ch, uint16_t *code, bool *sh
 	} else if (l->err[0]) {
 		set_msg(msg, "%s", l->err);
 	} else {
-		set_msg(msg, "no key on the active layout (%s) types '%c'", l->source_id, (char)ch);
+		// Never name the character (u_desktop.h "Privacy").
+		set_msg(msg, "the active keyboard layout has no key for that character");
 	}
 	layout_lookup_unref(l);
 	return ok;
@@ -2304,13 +2386,118 @@ post_unicode(struct macos_backend *m, const UniChar *s, CFIndex n)
 	return true;
 }
 
+/*
+ * Delivery guarantee (u_desktop.h, contract v2): before EVERY injection batch,
+ * (1) the OS permission still holds — CGEventPost silently drops events after a
+ * TCC revoke, so we must not report OK for them; (2) the guard (kill switch,
+ * lock, denial); (3) the target still holds focus / is still under the point.
+ * Messages name the failure, never the data (u_desktop.h "Privacy").
+ */
 static enum u_desktop_result
-mac_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
+check_permission(char *msg)
+{
+	if (!trusted()) {
+		set_msg(msg, "Accessibility permission not granted (revoked?)");
+		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	return U_DESKTOP_OK;
+}
+
+static enum u_desktop_result
+check_guard(const struct u_desktop_input_guard *guard, char *msg)
+{
+	enum u_desktop_result r = check_permission(msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (guard == NULL || guard->still_allowed == NULL || guard->target_id == 0) {
+		set_msg(msg, "no input guard");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (!guard->still_allowed(guard->ctx)) {
+		set_msg(msg, "stopped: desktop control suspended, denied or screen locked");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+//! Is @p wid the target, or a sheet hanging off it (its parent_id)?
+static bool
+is_target_or_child(struct macos_backend *m, CGWindowID wid, uint64_t target)
+{
+	if (wid == 0) {
+		return false; // unknown / ambiguous focus is never the target
+	}
+	if ((uint64_t)wid == target) {
+		return true;
+	}
+	CFDictionaryRef info = cg_window_info(wid);
+	if (info == NULL) {
+		return false;
+	}
+	pid_t pid = (pid_t)dict_int(info, kCGWindowOwnerPID, 0);
+	CFRelease(info);
+	CGWindowID parent = 0;
+	if (ax_cache_peek(m, pid, wid, &parent, NULL, 0) && parent != 0) {
+		return (uint64_t)parent == target;
+	}
+	// Not cached yet (a sheet that just opened): ask AX (worker thread, may block briefly).
+	if (ax_window_for(m, pid, wid, AX_OBSERVE_TIMEOUT_S, true, NULL, &parent)) {
+		return parent != 0 && (uint64_t)parent == target;
+	}
+	return false;
+}
+
+//! Keyboard input: permission, guard, then focus on the target (or its sheet).
+static enum u_desktop_result
+check_focus(struct macos_backend *m, const struct u_desktop_input_guard *guard, char *msg)
+{
+	enum u_desktop_result r = check_guard(guard, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (!is_target_or_child(m, focused_wid_ax(m), guard->target_id)) {
+		set_msg(msg, "focus moved: the target window no longer has keyboard focus");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+static CGPoint
+cursor_now(void);
+
+static enum u_desktop_result
+mac_pick(struct u_desktop_backend *b, int32_t x, int32_t y, struct u_desktop_pick *out);
+
+//! Pointer input: permission, guard, pointer still at the verified point, pick = target.
+static enum u_desktop_result
+check_point(struct macos_backend *m, const struct u_desktop_input_guard *guard, int32_t x, int32_t y, char *msg)
+{
+	enum u_desktop_result r = check_guard(guard, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	CGPoint now = cursor_now();
+	if (fabs(now.x - x) > 2 || fabs(now.y - y) > 2) {
+		set_msg(msg, "pointer moved off the verified point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	struct u_desktop_pick p;
+	if (mac_pick(&m->base, x, y, &p) != U_DESKTOP_OK || p.kind != U_DESKTOP_PICK_WINDOW ||
+	    !(p.window.id == guard->target_id || (p.window.parent_id != 0 && p.window.parent_id == guard->target_id))) {
+		set_msg(msg, "target no longer under the point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+static enum u_desktop_result
+mac_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
 {
 	struct macos_backend *m = mb(b);
-	if (!trusted()) {
-		set_msg(msg, "Accessibility permission not granted");
-		return U_DESKTOP_ERR_NOT_GRANTED;
+	enum u_desktop_result r = check_permission(msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
 	}
 	CFStringRef s = CFStringCreateWithBytes(NULL, (const UInt8 *)utf8, (CFIndex)strlen(utf8),
 	                                        kCFStringEncodingUTF8, false);
@@ -2330,6 +2517,12 @@ mac_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 	bool ok = true;
 	CFIndex i = 0;
 	while (ok && i < len) {
+		// Before EVERY batch — a chunk, a Return, a Tab: permission, guard, focus.
+		// Each batch is a complete down+up, so a stop leaves nothing pressed.
+		r = check_focus(m, guard, msg);
+		if (r != U_DESKTOP_OK) {
+			break;
+		}
 		// Line breaks and tabs as their keys: a unicode "\n" is not Return to most apps.
 		if (u[i] == '\n' || u[i] == '\r' || u[i] == '\t') {
 			uint16_t code = u[i] == '\t' ? KVK_TAB : KVK_RETURN;
@@ -2353,21 +2546,29 @@ mac_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 		i += n;
 		sleep_ms(4);
 	}
+	memset(u, 0, sizeof(UniChar) * (size_t)(len > 0 ? len : 1));
 	free(u);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
 	if (!ok) {
 		set_msg(msg, "CGEvent creation failed");
 		return U_DESKTOP_ERR_FAILED;
 	}
-	return U_DESKTOP_OK;
+	// A revoke during the last batch drops it silently: never report OK for that.
+	return check_permission(msg);
 }
 
 static enum u_desktop_result
-mac_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, char *msg)
+mac_key_chord(struct u_desktop_backend *b,
+              const struct u_desktop_input_guard *guard,
+              const struct u_desktop_chord *chord,
+              char *msg)
 {
 	struct macos_backend *m = mb(b);
-	if (!trusted()) {
-		set_msg(msg, "Accessibility permission not granted");
-		return U_DESKTOP_ERR_NOT_GRANTED;
+	enum u_desktop_result r = check_permission(msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
 	}
 	const struct key_map *key = NULL;
 	struct key_map char_key = {NULL, 0, 0, 0};
@@ -2392,7 +2593,7 @@ mac_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, 
 			}
 		}
 		if (key == NULL) {
-			set_msg(msg, "key \"%s\" has no macOS key code", chord->key);
+			set_msg(msg, "this key has no macOS key code");
 			return U_DESKTOP_ERR_UNSUPPORTED;
 		}
 	}
@@ -2409,14 +2610,21 @@ mac_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, 
 	};
 	CGEventFlags flags = 0;
 	bool ok = true;
-	for (size_t i = 0; i < 4; i++) {
+	uint32_t pressed = 0; // modifiers we pressed, released on every exit path
+	r = check_focus(m, guard, msg);
+	for (size_t i = 0; r == U_DESKTOP_OK && i < 4; i++) {
 		if (mods_eff & mods[i].mod) {
 			flags |= mods[i].flag;
 			ok = ok && post_key(m, mods[i].code, true, flags);
+			pressed |= mods[i].mod;
 			sleep_ms(2);
 		}
 	}
-	if (key != NULL) {
+	// Re-check right before the key-down: this is the keystroke that does something.
+	if (r == U_DESKTOP_OK && key != NULL) {
+		r = check_focus(m, guard, msg);
+	}
+	if (r == U_DESKTOP_OK && key != NULL) {
 		CGEventFlags kf = flags | (key->fn ? kCGEventFlagMaskSecondaryFn : 0) |
 		                  (key->np ? kCGEventFlagMaskNumericPad : 0);
 		ok = ok && post_key(m, key->code, true, kf);
@@ -2425,17 +2633,20 @@ mac_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, 
 		sleep_ms(2);
 	}
 	for (int i = 3; i >= 0; i--) {
-		if (mods_eff & mods[i].mod) {
+		if (pressed & mods[i].mod) {
 			flags &= ~mods[i].flag;
 			ok = post_key(m, mods[i].code, false, flags) && ok; // always release
 			sleep_ms(2);
 		}
 	}
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
 	if (!ok) {
 		set_msg(msg, "CGEvent creation failed");
 		return U_DESKTOP_ERR_FAILED;
 	}
-	return U_DESKTOP_OK;
+	return check_permission(msg);
 }
 
 static CGPoint
@@ -2494,13 +2705,15 @@ mac_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 }
 
 static enum u_desktop_result
-mac_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bool down, char *msg)
+mac_pointer_button(struct u_desktop_backend *b,
+                   const struct u_desktop_input_guard *guard,
+                   enum u_desktop_button button,
+                   bool down,
+                   int32_t x,
+                   int32_t y,
+                   char *msg)
 {
 	struct macos_backend *m = mb(b);
-	if (!trusted()) {
-		set_msg(msg, "Accessibility permission not granted");
-		return U_DESKTOP_ERR_NOT_GRANTED;
-	}
 	CGEventType type;
 	CGMouseButton cgb;
 	switch (button) {
@@ -2518,7 +2731,17 @@ mac_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bo
 		break;
 	default: set_msg(msg, "unknown button %d", (int)button); return U_DESKTOP_ERR_UNSUPPORTED;
 	}
-	CGPoint pt = cursor_now();
+	// The event goes AT the verified point, never "wherever the cursor is now".
+	CGPoint pt = CGPointMake(x, y);
+	if (down) {
+		enum u_desktop_result r = check_point(m, guard, x, y, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	} else if (!(m->buttons_down & (1u << button))) {
+		return check_permission(msg); // nothing of ours to release
+	}
+	// A release is always posted (a stop must not leave our button pressed).
 
 	// Click count: the system double-click interval, same button, within 4 pt.
 	if (down) {
@@ -2554,16 +2777,24 @@ mac_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bo
 	} else {
 		m->buttons_down &= ~(1u << button);
 	}
-	return U_DESKTOP_OK;
+	return check_permission(msg); // a revoke drops the event silently
 }
 
 static enum u_desktop_result
-mac_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
+mac_scroll(struct u_desktop_backend *b,
+           const struct u_desktop_input_guard *guard,
+           int32_t x,
+           int32_t y,
+           int32_t dx,
+           int32_t dy,
+           char *msg)
 {
 	struct macos_backend *m = mb(b);
-	if (!trusted()) {
-		set_msg(msg, "Accessibility permission not granted");
-		return U_DESKTOP_ERR_NOT_GRANTED;
+	// macOS routes wheel events by the cursor position, so the pointer must still
+	// be at the verified point, and the target under it.
+	enum u_desktop_result r = check_point(m, guard, x, y, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
 	}
 	// wheel1 = vertical (+ = up), wheel2 = horizontal (+ = left); ours is +y down, +x right.
 	CGEventRef e = CGEventCreateScrollWheelEvent2(m->src, kCGScrollEventUnitLine, 2, -dy, -dx, 0);
@@ -2571,10 +2802,10 @@ mac_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
 		set_msg(msg, "CGEvent creation failed");
 		return U_DESKTOP_ERR_FAILED;
 	}
-	CGEventSetLocation(e, cursor_now());
+	CGEventSetLocation(e, CGPointMake(x, y));
 	CGEventPost(kCGHIDEventTap, e);
 	CFRelease(e);
-	return U_DESKTOP_OK;
+	return check_permission(msg);
 }
 
 /*
@@ -2590,6 +2821,7 @@ mac_destroy(struct u_desktop_backend *b)
 	if (m == NULL) {
 		return;
 	}
+	access_cancel_join(m); // u_desktop.h "Lifetime": no answer may arrive after destroy
 	pthread_mutex_lock(&m->lock);
 	m->stop = true;
 	pthread_cond_broadcast(&m->cond);
@@ -2606,6 +2838,8 @@ mac_destroy(struct u_desktop_backend *b)
 	}
 	pthread_cond_destroy(&m->cond);
 	pthread_mutex_destroy(&m->lock);
+	pthread_cond_destroy(&m->access_cond);
+	pthread_mutex_destroy(&m->access_lock);
 	free(m);
 }
 
@@ -2618,6 +2852,8 @@ u_desktop_backend_create_platform(void)
 	}
 	pthread_mutex_init(&m->lock, NULL);
 	pthread_cond_init(&m->cond, NULL);
+	pthread_mutex_init(&m->access_lock, NULL);
+	pthread_cond_init(&m->access_cond, NULL);
 	m->ax_get_window = (ax_get_window_fn)dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow");
 	m->src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
 	if (m->src != NULL) {
@@ -2632,6 +2868,7 @@ u_desktop_backend_create_platform(void)
 	b->remembers_in_store = false;
 	b->access_status = mac_access_status;
 	b->request_access = mac_request_access;
+	b->prepare_input = NULL; // nothing to warm up: TCC is checked per call
 	b->is_locked = mac_is_locked;
 	b->user_idle_ms = mac_user_idle_ms;
 	b->list_windows = mac_list_windows;
