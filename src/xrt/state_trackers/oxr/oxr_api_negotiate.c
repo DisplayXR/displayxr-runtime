@@ -546,6 +546,16 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrGetStereoCameraStreamStatsDXR, DXR_stereo_camera);
 #endif
 
+#ifdef OXR_HAVE_DXR_desktop_control
+	ENTRY_IF_EXT(xrGetDesktopControlStateDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrRequestDesktopControlDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrEnumerateDesktopWindowsDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopPointerDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrPickDesktopDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopTextAtDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrSubmitDesktopActionDXR, DXR_desktop_control);
+#endif
+
 #ifdef OXR_HAVE_DXR_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerDXR, DXR_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestDXR, DXR_workspace_file_dialog);

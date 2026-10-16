@@ -67,6 +67,7 @@ add_library(
 	oxr_conv_map.h
 	oxr_lift_rules.h
 	oxr_stereo_camera.c
+	oxr_desktop_control.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
 	oxr_workspace_window_linux.c
@@ -83,6 +84,12 @@ target_include_directories(st_oxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 if(XRT_HAVE_VULKAN)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_vk.c oxr_swapchain_vk.c oxr_vulkan.c)
 	target_link_libraries(st_oxr PUBLIC aux_vk)
+endif()
+
+# XR_DXR_desktop_control (ADR-056): the common safety layer + this OS's backend,
+# linked into the runtime only (every operation runs in the app's process).
+if(TARGET aux_desktop)
+	target_link_libraries(st_oxr PRIVATE aux_desktop)
 endif()
 
 if(XRT_HAVE_OPENGL OR XRT_HAVE_OPENGLES)
