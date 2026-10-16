@@ -1,0 +1,197 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// Unit test for the GNOME Shell extension's own-window requests (OwnWindow in
+// contrib/gnome-shell/window-geometry@displayxr.org/lib.js, extension version
+// 15: SetKeepAbove / ActivateWindow / SetMinimized, placement capability bits
+// 5-7).
+//
+// Hermetic: plain gjs, no GNOME Shell. OwnWindow lives outside lib.js's
+// GI-dependent build(), so this drives the shipped code with stand-in windows.
+//
+//   gjs scripts/test_gnome_extension_own_window.js
+//
+// What it checks:
+//   1. The gate: only the caller's own window (pid 0 or its own PID, from the
+//      bus), never during a grab of that window or any extension pointer drag,
+//      never on the lock screen.
+//   2. Maximized is read on both sides of mutter 49's API change
+//      (get_maximized() flags before, is_maximized() after).
+//   3. SetKeepAbove sets and clears; a maximized window is refused and left
+//      alone; one bus-name watch per client however many windows it raises.
+//   4. Undo on disconnect: only the keep-above the extension set — never a
+//      user's own "Always on Top" (also not one the user cleared and set again),
+//      never a window whose keep-above was cleared since, never a window that
+//      went away.
+//   5. SetMinimized minimizes and restores, refuses a window mutter says
+//      cannot be minimized, and is idempotent.
+'use strict';
+
+const GLib = imports.gi.GLib;
+
+const here = GLib.path_get_dirname(imports.system.programPath ?? imports.system.programInvocationName);
+imports.searchPath.unshift(GLib.build_filenamev([here, '..', 'contrib', 'gnome-shell',
+    'window-geometry@displayxr.org']));
+imports.lib; // side effect: globalThis.displayxrWindowGeometry
+const OW = globalThis.displayxrWindowGeometry.OwnWindow;
+
+let failed = 0;
+function check(cond, what) {
+    if (cond) {
+        print(`  ok   ${what}`);
+    } else {
+        print(`  FAIL ${what}`);
+        failed++;
+    }
+}
+
+const BOTH = 3; // Meta.MaximizeFlags.BOTH
+
+//! A stand-in Meta.Window. api: 'new' (mutter 49+, is_maximized) or 'old'
+//! (mutter 42-48, get_maximized returning flags).
+class Win {
+    constructor({above = false, maximized = false, minimized = false, canMinimize = true, api = 'new'} = {}) {
+        this._above = above;
+        this._maximized = maximized;
+        this.minimized = minimized;
+        this._canMinimize = canMinimize;
+        this.calls = [];
+        if (api === 'new')
+            this.is_maximized = () => this._maximized;
+        else
+            this.get_maximized = () => (this._maximized ? BOTH : 0);
+    }
+
+    is_above() {
+        return this._above;
+    }
+
+    make_above() {
+        this.calls.push('make_above');
+        this._above = true;
+    }
+
+    unmake_above() {
+        this.calls.push('unmake_above');
+        this._above = false;
+    }
+
+    can_minimize() {
+        return this._canMinimize;
+    }
+
+    minimize() {
+        this.calls.push('minimize');
+        this.minimized = true;
+    }
+
+    unminimize() {
+        this.calls.push('unminimize');
+        this.minimized = false;
+    }
+}
+
+print('1. the gate');
+{
+    const win = new Win(), other = new Win();
+    const base = {senderPid: 100, pid: 0, win, grabbed: null, pointerDrag: false, locked: false};
+    check(OW.allowed(base), 'pid 0 = the caller: allowed');
+    check(OW.allowed({...base, pid: 100}), 'the caller\'s own PID: allowed');
+    check(!OW.allowed({...base, pid: 101}), 'another PID: refused');
+    check(!OW.allowed({...base, senderPid: 0}), 'no PID from the bus: refused');
+    check(!OW.allowed({...base, win: null}), 'the caller has no window: refused');
+    check(!OW.allowed({...base, grabbed: win}), 'the user is dragging this window: refused');
+    check(OW.allowed({...base, grabbed: other}), 'a grab on another window: allowed');
+    check(!OW.allowed({...base, pointerDrag: true}), 'an extension pointer drag is running: refused');
+    check(!OW.allowed({...base, locked: true}), 'the screen is locked: refused');
+}
+
+print('2. maximized, both mutter APIs');
+{
+    check(OW.isMaximized(new Win({maximized: true}), BOTH), 'mutter 49+: is_maximized() true');
+    check(!OW.isMaximized(new Win(), BOTH), 'mutter 49+: is_maximized() false');
+    check(OW.isMaximized(new Win({maximized: true, api: 'old'}), BOTH), 'mutter <= 48: get_maximized() == BOTH');
+    check(!OW.isMaximized(new Win({api: 'old'}), BOTH), 'mutter <= 48: get_maximized() == 0');
+}
+
+print('3. SetKeepAbove');
+{
+    const t = OW.newTracker();
+    const a = new Win(), b = new Win();
+    let r = OW.keepAbove(t, ':1.5', a, true, BOTH);
+    check(r.ok && a.is_above() && r.watch, 'set: above, first window of the client -> watch its name');
+    r = OW.keepAbove(t, ':1.5', a, true, BOTH);
+    check(r.ok && !r.watch && a.calls.length === 1, 'set again: ok, no second make_above, no second watch');
+    r = OW.keepAbove(t, ':1.5', b, true, BOTH);
+    check(r.ok && !r.watch, 'a second window of the same client: no second watch');
+    r = OW.keepAbove(t, ':1.5', a, false, BOTH);
+    check(r.ok && !a.is_above(), 'clear: no longer above');
+    r = OW.keepAbove(t, ':1.5', a, false, BOTH);
+    check(r.ok && a.calls.filter(c => c === 'unmake_above').length === 1, 'clear again: ok, nothing to undo');
+
+    const m = new Win({maximized: true});
+    r = OW.keepAbove(t, ':1.6', m, true, BOTH);
+    check(!r.ok && !m.is_above() && m.calls.length === 0 && !r.watch, 'maximized: refused, untouched');
+    const mo = new Win({maximized: true, api: 'old'});
+    check(!OW.keepAbove(t, ':1.6', mo, true, BOTH).ok, 'maximized (mutter <= 48): refused');
+
+    const user = new Win({above: true});
+    r = OW.keepAbove(t, ':1.7', user, true, BOTH);
+    check(r.ok && !r.watch && user.calls.length === 0, 'already above (the user\'s): ok, not recorded');
+}
+
+print('4. undo on disconnect: only what the extension set');
+{
+    const t = OW.newTracker();
+    const ours = new Win(), user = new Win({above: true}), cleared = new Win(), gone = new Win();
+    OW.keepAbove(t, ':1.8', ours, true, BOTH);
+    OW.keepAbove(t, ':1.8', user, true, BOTH);      // the user's own: not recorded
+    OW.keepAbove(t, ':1.8', cleared, true, BOTH);
+    OW.keepAbove(t, ':1.8', cleared, false, BOTH);  // cleared since: forgotten
+    OW.keepAbove(t, ':1.8', gone, true, BOTH);
+    OW.forgetWindow(t, gone);                       // the window was unmanaged
+    const other = new Win();
+    OW.keepAbove(t, ':1.9', other, true, BOTH);     // another client
+
+    const n = OW.dropClient(t, ':1.8');
+    check(n === 1 && !ours.is_above(), 'the window the client raised is lowered again');
+    check(user.is_above() && user.calls.length === 0, 'the user\'s own "Always on Top" is left alone');
+    check(cleared.calls.filter(c => c === 'unmake_above').length === 1, 'a cleared window is not touched again');
+    check(gone.calls.filter(c => c === 'unmake_above').length === 0, 'a window that went away is not touched');
+    check(other.is_above(), 'another client\'s window is left alone');
+    check(OW.dropClient(t, ':1.8') === 0, 'a second disconnect does nothing');
+    check(!t.has(':1.8') && t.has(':1.9'), 'only that client\'s record is dropped');
+
+    // The user cleared it by hand meanwhile: nothing to undo, nothing re-set.
+    const handCleared = new Win();
+    OW.keepAbove(t, ':1.10', handCleared, true, BOTH);
+    handCleared.unmake_above();
+    check(OW.dropClient(t, ':1.10') === 0 && !handCleared.is_above(), 'cleared by the user meanwhile: left alone');
+
+    // The user cleared it and set it again (window menu off, then on): theirs now. The
+    // service calls forgetWindow on every clear (notify::above going false).
+    const reset = new Win();
+    OW.keepAbove(t, ':1.11', reset, true, BOTH);
+    reset.unmake_above();
+    OW.forgetWindow(t, reset);
+    reset.make_above();
+    check(OW.dropClient(t, ':1.11') === 0 && reset.is_above(), 'cleared and set again by the user: left above');
+}
+
+print('5. SetMinimized');
+{
+    const w = new Win();
+    check(OW.minimize(w, true) && w.minimized, 'minimize');
+    check(OW.minimize(w, true) && w.calls.filter(c => c === 'minimize').length === 1, 'minimize again: ok, idempotent');
+    check(OW.minimize(w, false) && !w.minimized, 'restore');
+    check(OW.minimize(w, false) && w.calls.filter(c => c === 'unminimize').length === 1, 'restore again: ok, idempotent');
+    const fixed = new Win({canMinimize: false});
+    check(!OW.minimize(fixed, true) && !fixed.minimized && fixed.calls.length === 0,
+        'a window mutter cannot minimize: refused, untouched');
+}
+
+if (failed) {
+    print(`${failed} check(s) FAILED`);
+    imports.system.exit(1);
+}
+print('all own-window checks passed');

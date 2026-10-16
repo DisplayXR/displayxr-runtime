@@ -40,7 +40,8 @@
 //   * CaptureExclusion1 (removing it at lock would make every excluded window
 //     capturable for the length of the lock),
 //   * WindowPlacement1 / move sync (a client moving its OWN window; nothing a
-//     locked user can drive),
+//     locked user can drive) — but not the version 15 requests (keep-above,
+//     activate, minimize), which are refused while locked,
 //   * the WorkspaceHotkey1 D-Bus object (so a registered client is not lost).
 // What does NOT: the workspace hotkey's GRAB. Entering the lock screen
 // releases it and leaving it re-grabs (WorkspaceHotkey.wantGrab(…, locked)),
@@ -88,6 +89,8 @@
 //             bit 3: EnableMoveSync (version 9, #1748; GNOME 45+)
 //             bit 4: move sync is tag-gated (version 10): a synced window
 //                    is held only while a tag subsurface is mapped
+//             bits 5, 6, 7: SetKeepAbove, ActivateWindow, SetMinimized
+//                    (version 15)
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
@@ -121,6 +124,16 @@
 //   Method  EndPointerDrag(u pid)
 //             The extension moves the caller's window with the pointer while
 //             `button` is held, with no grab (see "The pointer drag").
+//   Method  SetKeepAbove(u pid, b above) -> (b ok)           (version 15)
+//   Method  ActivateWindow(u pid) -> (b ok)                  (version 15)
+//   Method  SetMinimized(u pid, b minimized) -> (b ok)       (version 15)
+//             What a Wayland client cannot do for its own window: keep it
+//             above other windows, bring it to the front with focus (from the
+//             background, minimized or another workspace), minimize and
+//             restore it. Same gate and window choice as MoveWindow; refused
+//             during a grab or a pointer drag and on the lock screen;
+//             keep-above lasts as long as the caller's bus connection. See
+//             "The caller's own window".
 //   Signal  DragLatticeNeeded(u pid, i dx, i dy)
 //   Signal  DragLatticeDone(u pid, u moves, u corrected, u misses,
 //                           u maxCorrection, u tables, b landedOnTable)
@@ -196,11 +209,16 @@
 //       "move_sync": false,                 // ext v9+: this pid is
 //                                           // in move sync (EnableMoveSync), so
 //                                           // an app builds no drag lattice.
-//       "moving": false                     // ext v3+: an interactive grab
+//       "moving": false,                    // ext v3+: an interactive grab
 //                                           // (move/resize) is in progress on
 //                                           // this window. A consumer that
 //                                           // repositions a window waits for
 //                                           // this to go false.
+//       "minimized": false,                 // ext v15+: minimized (by the app,
+//                                           // the user or the dock)
+//       "above": false                      // ext v15+: kept above other
+//                                           // windows (SetKeepAbove, or the
+//                                           // user's "Always on Top")
 //     }, ...
 //   ]
 // }
@@ -900,6 +918,127 @@
         },
     };
 
+    /*
+     * ── The caller's own window: keep-above, activate, minimize (version 15) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_own_window.js loads this
+     * file under plain gjs and drives it with stand-in windows.
+     *
+     * A native Wayland client cannot keep its window above others (no protocol
+     * for it), bring it to the front from the background (xdg-activation
+     * without a fresh input serial only demands attention), or un-minimize it
+     * (xdg_toplevel has set_minimized and nothing to undo it). An app that
+     * expects its own window to do these — an always-on-top 3D companion, a
+     * hotkey that summons it — has no way there. WindowPlacement1 therefore
+     * takes three requests on the CALLER's own window, with MoveWindow's gate
+     * and window choice:
+     *   SetKeepAbove(u pid, b above) -> (b ok)          capability bit 5 (32)
+     *   ActivateWindow(u pid) -> (b ok)                 capability bit 6 (64)
+     *   SetMinimized(u pid, b minimized) -> (b ok)      capability bit 7 (128)
+     * Each is refused (false, nothing changed) unless `allowed` holds. Nothing
+     * here can reach another process's window: the window is chosen by the
+     * caller's PID from the bus, and the argument may only name the caller.
+     *
+     * Keep-above the extension set is undone when the caller's bus connection
+     * goes away and when the extension is disabled — but only what it set: a
+     * user's own "Always on Top" on the same window is never undone behind
+     * their back (an explicit SetKeepAbove(false) does clear it, as the window
+     * menu would). There is no SetMaximized: an app that places its own window
+     * (as the DisplayXR plugin does) fights a maximize, and mutter keeps a
+     * maximized window in the normal layer whatever its "above" flag says.
+     */
+    const OwnWindow = {
+        //! Whether a request from @p senderPid naming @p pid may act on @p win,
+        //! the caller's own window (null: it has none). The caller names itself
+        //! (0 = "me"); never while the user drags it or any extension pointer
+        //! drag runs (never fight the user); never on the lock screen, where a
+        //! locked user drives nothing, so nothing should change stacking or
+        //! focus behind the shield.
+        allowed({senderPid, pid, win, grabbed, pointerDrag, locked}) {
+            return senderPid > 0 && (pid === 0 || pid === senderPid) && !!win &&
+                win !== grabbed && !pointerDrag && !locked;
+        },
+
+        //! mutter 49 replaced get_maximized() (flags) with is_maximized().
+        isMaximized(win, maximizeBoth) {
+            if (typeof win.is_maximized === 'function')
+                return win.is_maximized();
+            return typeof win.get_maximized === 'function' && win.get_maximized() === maximizeBoth;
+        },
+
+        //! Which windows each client made keep-above: sender -> Set(win).
+        newTracker() {
+            return new Map();
+        },
+
+        //! SetKeepAbove on the caller's @p win for bus name @p sender. Returns
+        //! {ok, watch}: watch = @p sender has no record yet, so the service
+        //! starts watching its bus name. A maximized window is refused, as
+        //! GNOME's window menu greys "Always on Top" out for it.
+        keepAbove(tracker, sender, win, above, maximizeBoth) {
+            if (!above) {
+                if (win.is_above())
+                    win.unmake_above();
+                OwnWindow.forgetWindow(tracker, win);
+                return {ok: !win.is_above(), watch: false};
+            }
+            if (OwnWindow.isMaximized(win, maximizeBoth))
+                return {ok: false, watch: false};
+            if (win.is_above())
+                return {ok: true, watch: false}; // ours already, or the user's: not ours to record
+            win.make_above();
+            let wins = tracker.get(sender);
+            const watch = wins === undefined;
+            if (watch) {
+                // Kept even when it empties, so one client never gets two watches.
+                wins = new Set();
+                tracker.set(sender, wins);
+            }
+            wins.add(win);
+            return {ok: win.is_above(), watch};
+        },
+
+        //! The window is gone, or its keep-above was cleared: no client's any more.
+        forgetWindow(tracker, win) {
+            for (const wins of tracker.values())
+                wins.delete(win);
+        },
+
+        //! @p sender's bus connection went away, or the extension is disabled:
+        //! undo the keep-above it set on the windows that still have it.
+        //! Returns how many windows changed.
+        dropClient(tracker, sender) {
+            const wins = tracker.get(sender);
+            if (wins === undefined)
+                return 0;
+            tracker.delete(sender);
+            let n = 0;
+            for (const win of wins) {
+                if (win.is_above()) {
+                    win.unmake_above();
+                    n++;
+                }
+            }
+            return n;
+        },
+
+        //! SetMinimized on the caller's @p win. Restoring does not focus: an app
+        //! that wants its window back in front asks for ActivateWindow, which
+        //! restores it as well.
+        minimize(win, minimized) {
+            if (minimized) {
+                if (typeof win.can_minimize === 'function' && !win.can_minimize())
+                    return false;
+                if (!win.minimized)
+                    win.minimize();
+                return win.minimized === true;
+            }
+            if (win.minimized)
+                win.unminimize();
+            return win.minimized === false;
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -918,6 +1057,8 @@
         StageScale,
         //! The workspace hotkey's bookkeeping, exported for its unit test.
         WorkspaceHotkey,
+        //! The own-window requests' gate and bookkeeping, exported for its unit test.
+        OwnWindow,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
@@ -1315,6 +1456,20 @@
     <method name="EndPointerDrag">
       <arg type="u" direction="in" name="pid"/>
     </method>
+    <method name="SetKeepAbove">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="above"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="ActivateWindow">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SetMinimized">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="minimized"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
 
     <signal name="DragLatticeNeeded">
       <arg type="u" name="pid"/>
@@ -1386,6 +1541,10 @@
         //! process that shows nothing woven drags as a plain window, with no
         //! stall. Only ever set together with PLACEMENT_CAP_MOVE_SYNC.
         const PLACEMENT_CAP_MOVE_SYNC_TAG_GATED = 16;
+        //! Version 15: the caller's own window (see "The caller's own window").
+        const PLACEMENT_CAP_KEEP_ABOVE = 32;
+        const PLACEMENT_CAP_ACTIVATE = 64;
+        const PLACEMENT_CAP_MINIMIZE = 128;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -2287,6 +2446,10 @@
                 //! service treats it as the grab it stands in for.
                 this._onPointerDrag = onPointerDrag;
                 this._pd = null;
+                //! Version 15: the windows each client made keep-above, and the
+                //! watch on each such client's bus name (sender -> watch id).
+                this._above = OwnWindow.newTracker();
+                this._aboveWatch = new Map();
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
@@ -2317,7 +2480,13 @@
                 this._stampAudit?.flush();
             }
 
+            //! Keep-above went off on @p win, whoever cleared it.
+            onKeepAboveCleared(win) {
+                OwnWindow.forgetWindow(this._above, win);
+            }
+
             onWindowUnmanaged(win) {
+                OwnWindow.forgetWindow(this._above, win);
                 this._lattice.forget(win);
                 this._moveSync?.forget(win);
             }
@@ -2392,7 +2561,8 @@
                 return (this._lattice.supported()
                     ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0) |
                     (this._moveSync ? PLACEMENT_CAP_MOVE_SYNC | PLACEMENT_CAP_MOVE_SYNC_TAG_GATED : 0) |
-                    PLACEMENT_CAP_POINTER_DRAG;
+                    PLACEMENT_CAP_POINTER_DRAG |
+                    PLACEMENT_CAP_KEEP_ABOVE | PLACEMENT_CAP_ACTIVATE | PLACEMENT_CAP_MINIMIZE;
             }
 
             /*
@@ -2535,6 +2705,11 @@
             }
 
             destroy() {
+                // A request whose sender PID is still being looked up must not act
+                // after this (it would leave a window above with nobody to undo it).
+                this._destroyed = true;
+                for (const sender of [...this._above.keys()])
+                    this._dropAboveClient(sender);
                 this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
                 this._lattice = null;
@@ -2583,6 +2758,71 @@
                     }
                 }
                 return best;
+            }
+
+            /*
+             * The caller's own window (version 15; see "The caller's own window"
+             * near the top of this file). @p act(win, sender) runs only when
+             * OwnWindow.allowed holds and returns whether it took effect.
+             */
+            _ownWindowAsync(pid, invocation, act) {
+                const sender = invocation.get_sender();
+                this._senderPid(sender, senderPid => {
+                    let ok = false;
+                    const win = senderPid > 0 && !this._destroyed ? this._windowOfPid(senderPid) : null;
+                    if (OwnWindow.allowed({
+                        senderPid, pid, win, grabbed: this._getGrabbedWindow(),
+                        pointerDrag: this._pd !== null, locked: Main?.sessionMode?.isLocked === true,
+                    })) {
+                        try {
+                            ok = act(win, sender) === true;
+                        } catch (e) {
+                            log(`displayxr: own-window request from pid ${senderPid} failed: ${e}`);
+                        }
+                    }
+                    invocation.return_value(new GLib.Variant('(b)', [ok]));
+                });
+            }
+
+            //! Undo the keep-above @p sender set, and stop watching it.
+            _dropAboveClient(sender) {
+                const watchId = this._aboveWatch.get(sender);
+                if (watchId !== undefined) {
+                    Gio.bus_unwatch_name(watchId);
+                    this._aboveWatch.delete(sender);
+                }
+                OwnWindow.dropClient(this._above, sender);
+            }
+
+            SetKeepAboveAsync([pid, above], invocation) {
+                this._ownWindowAsync(pid, invocation, (win, sender) => {
+                    const r = OwnWindow.keepAbove(this._above, sender, win, above,
+                        Meta.MaximizeFlags?.BOTH);
+                    if (r.watch) {
+                        // Lives as long as the caller's connection: an app that
+                        // exits or crashes leaves no window stuck on top.
+                        this._aboveWatch.set(sender, Gio.bus_watch_name_on_connection(
+                            Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE,
+                            null, () => this._dropAboveClient(sender)));
+                    }
+                    return r.ok;
+                });
+            }
+
+            ActivateWindowAsync([pid], invocation) {
+                this._ownWindowAsync(pid, invocation, win => {
+                    // A server timestamp, not 0: activate(0) skips the
+                    // focus-stealing check but, for a window on another
+                    // workspace, only marks it as demanding attention.
+                    // Main.activateWindow() would also close the Overview and
+                    // the calendar. activate() restores a minimized window too.
+                    win.activate(global.display.get_current_time_roundtrip());
+                    return win.has_focus();
+                });
+            }
+
+            SetMinimizedAsync([pid, minimized], invocation) {
+                this._ownWindowAsync(pid, invocation, win => OwnWindow.minimize(win, minimized));
             }
 
             MoveWindowAsync([pid, x, y], invocation) {
@@ -3095,6 +3335,18 @@
                         this._queueEmit(this._placement?.moveSyncHolding(win) ?? false);
                     }),
                     win.connect('size-changed', () => this._queueEmit()),
+                    // v15: the snapshot reports both (an app reads its own window's
+                    // state back; the user may change either from the dock or
+                    // the window menu).
+                    win.connect('notify::minimized', () => this._queueEmit()),
+                    win.connect('notify::above', () => {
+                        // Cleared (by the user from the window menu, or on request):
+                        // no longer the extension's to undo — if the user sets it
+                        // again, it is theirs.
+                        if (!win.is_above())
+                            this._placement?.onKeepAboveCleared(win);
+                        this._queueEmit();
+                    }),
                     win.connect('unmanaged', () => {
                         this._placement?.onWindowUnmanaged(win);
                         const old = this._windowSignals.get(win);
@@ -3186,6 +3438,8 @@
                         lattice_drop: this._placement?.latticeDrop(win) ?? false,
                         move_sync: this._placement?.moveSynced(win) ?? false,
                         moving: win === this._grabbedWindow,
+                        minimized: win.minimized === true,
+                        above: win.is_above(),
                     });
                 }
                 const snapshot = {version: 1};

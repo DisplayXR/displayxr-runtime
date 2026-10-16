@@ -240,6 +240,15 @@ jobs:
         # Configure, 30 s window), release, suspend cap, cache round trip.
         run: gjs scripts/test_gnome_extension_workspace_hotkey.js
 
+      - name: Own-window requests
+        # Unit test for OwnWindow in lib.js (extension version 15,
+        # WindowPlacement1 SetKeepAbove / ActivateWindow / SetMinimized): the
+        # gate (own window only, not during a grab or pointer drag, not on the
+        # lock screen), maximized on both sides of mutter 49's API change, and
+        # the undo on disconnect touching only the keep-above the extension
+        # set. Plain gjs.
+        run: gjs scripts/test_gnome_extension_own_window.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:

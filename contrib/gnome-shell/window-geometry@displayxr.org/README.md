@@ -297,6 +297,21 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   screen. The runtime additionally re-syncs whenever the bus name reappears
   (`wl_geom: publisher reappeared — re-syncing geometry (#2071)`), so an
   older extension still recovers a correct phase after unlock.
+- Version 15, same `WindowPlacement1` interface: the caller's **own window
+  state** — `SetKeepAbove(u pid, b above) -> (b ok)` (capability bit 5, value
+  32), `ActivateWindow(u pid) -> (b ok)` (bit 6, 64), `SetMinimized(u pid, b
+  minimized) -> (b ok)` (bit 7, 128). What an app does to its own window with
+  EWMH on X11 and a Wayland client has no protocol for: keep it above other
+  windows, bring it to the front with focus (from the background, minimized or
+  another workspace), minimize and restore it. MoveWindow's gate and window
+  choice (only your own window; the call must come from your own process);
+  refused during a grab of that window or an extension pointer drag, and on the lock screen. Keep-above
+  the extension set is undone when the caller's bus connection goes away and
+  when the extension is disabled — never a user's own "Always on Top". No
+  maximize: it fights an app that places its own window. Every window in the
+  geometry snapshot gains `minimized` and `above`, so an app reads its window's
+  state back, including what the user changed from the dock or the window menu
+  (`WindowsChanged` follows both). See the spec, §11.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then
