@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
@@ -86,8 +87,8 @@ public interface IProcessSource
     /// </summary>
     IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit);
 
-    /// <summary>Run one CLI verb to completion.</summary>
-    Task<CliResult> RunAsync(string arguments, TimeSpan timeout, CancellationToken cancel = default);
+    /// <summary>Run one CLI verb to completion; <paramref name="args"/> is the argument vector, never a parsed string.</summary>
+    Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default);
 }
 
 /// <summary>The feed's clock and thread. The app posts to the UI thread; the tests drive time by hand.</summary>

@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
@@ -114,15 +115,16 @@ public sealed class FixtureProcessSource : IProcessSource
         catch (JsonException) { return line; } // a deliberately truncated line stays truncated
     }
 
-    public Task<CliResult> RunAsync(string arguments, TimeSpan timeout, CancellationToken cancel = default)
+    public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default)
     {
-        if (arguments == "status --json" && _lines.Length > 0)
+        var a = args.Args.ToArray();
+        if (a is ["status", "--json"] && _lines.Length > 0)
             return Task.FromResult(new CliResult(0, Apply(_lines[0]), "", false, null));
-        if (_workspace is not null && arguments.StartsWith("workspace ", StringComparison.Ordinal))
-            return Task.FromResult(Workspace(arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries)));
-        if (_screens.Count > 0 && arguments.StartsWith("dp ", StringComparison.Ordinal))
-            return Task.FromResult(Dp(arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries)));
-        return _real.RunAsync(arguments, timeout, cancel);
+        if (_workspace is not null && a is ["workspace", ..])
+            return Task.FromResult(Workspace(a));
+        if (_screens.Count > 0 && a is ["dp", ..])
+            return Task.FromResult(Dp(a));
+        return _real.RunAsync(args, timeout, cancel);
     }
 
     private CliResult Dp(string[] a)

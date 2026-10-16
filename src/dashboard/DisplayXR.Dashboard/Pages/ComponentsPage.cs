@@ -233,12 +233,12 @@ public sealed class ComponentsPage : Page
                 }
                 var combo = new Hotkey(mods, name!).ToString();
                 _captureNote = null;
-                _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --hotkey {StatusText.Quote(combo)}");
+                _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--hotkey", combo));
                 Update(force: true);
             }, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         }
 
-        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --no-hotkey"), "quiet", "sm");
+        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--no-hotkey")), "quiet", "sm");
         clear.IsEnabled = !busy && launch.Hotkey is { Length: > 0 };
 
         // (b) mode.
@@ -255,11 +255,11 @@ public sealed class ComponentsPage : Page
         mode.SelectionChanged += (_, _) =>
         {
             if (mode.SelectedIndex < 0 || mode.SelectedIndex == modeWas || Ctx.ActionRunning) return;
-            _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --mode {(mode.SelectedIndex == 1 ? "disabled" : "auto")}");
+            _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--mode", mode.SelectedIndex == 1 ? "disabled" : "auto"));
         };
 
         // (c) launch now.
-        var launchNow = U.Button("Launch now", () => _ = Ctx.RunActionsAsync("workspace", $"workspace launch {StatusText.Quote(id)}"), "primary", "sm");
+        var launchNow = U.Button("Launch now", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "launch", id)), "primary", "sm");
         launchNow.IsEnabled = !busy && !launch.Disabled && !connected;
         ToolTip.SetTip(launchNow, launch.Disabled ? "Launching is disabled." : connected ? "Already connected." : "Start it now, the same way the hotkey does.");
 
@@ -307,7 +307,7 @@ public sealed class ComponentsPage : Page
         bool machine = _machine && elevated;
         var row = U.Flow(10, 6);
 
-        void Run(string command)
+        void Run(CliArgs command)
         {
             _policyActionRow = r.Id;
             _ = Ctx.RunActionsAsync(area, command);

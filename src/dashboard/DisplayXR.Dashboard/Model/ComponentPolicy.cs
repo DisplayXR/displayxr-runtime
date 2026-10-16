@@ -184,26 +184,30 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
 }
 
 /// <summary>
-/// The CLI lines the controls run — pure, so a test can pin them. Per-user by
-/// default; <paramref name="machine"/> adds <c>--machine</c> (HKLM), which only an
-/// elevated dashboard may attempt (the page shows the command instead otherwise).
+/// The CLI commands the controls run — pure, so a test can pin the argument vectors. Per-user
+/// by default; <paramref name="machine"/> adds <c>--machine</c> (HKLM), which only an elevated
+/// dashboard may attempt (the page shows the command instead otherwise). Ids travel as single
+/// arguments (<see cref="CliArgs"/>), whatever a manifest put in them.
 /// </summary>
 public static class PolicyCommands
 {
-    private static string Q(string s) => StatusText.Quote(s);
-    private static string M(bool machine) => machine ? " --machine" : "";
+    private static CliArgs Cmd(bool machine, params string[] a) => machine ? new CliArgs(a).With("--machine") : new CliArgs(a);
 
-    public static string Enable(ComponentClass c, string id, bool machine = false) => $"{c.Verb()} enable {Q(id)}{M(machine)}";
-    public static string Disable(ComponentClass c, string id, bool machine = false) => $"{c.Verb()} disable {Q(id)}{M(machine)}";
+    public static CliArgs Enable(ComponentClass c, string id, bool machine = false) => Cmd(machine, c.Verb(), "enable", id);
+    public static CliArgs Disable(ComponentClass c, string id, bool machine = false) => Cmd(machine, c.Verb(), "disable", id);
+
+    /// <summary>The Enabled toggle's command for a row now <paramref name="enabled"/>: the flip.</summary>
+    public static CliArgs Toggle(ComponentClass c, string id, bool enabled, bool machine = false) =>
+        enabled ? Disable(c, id, machine) : Enable(c, id, machine);
 
     /// <summary>Global preference (display / input).</summary>
-    public static string Prefer(ComponentClass c, string id, bool machine = false) => $"{c.Verb()} use {Q(id)}{M(machine)}";
-    public static string Reset(ComponentClass c, bool machine = false) =>
-        c == ComponentClass.Conversion ? $"conv reset all{M(machine)}" : $"{c.Verb()} reset{M(machine)}";
+    public static CliArgs Prefer(ComponentClass c, string id, bool machine = false) => Cmd(machine, c.Verb(), "use", id);
+    public static CliArgs Reset(ComponentClass c, bool machine = false) =>
+        c == ComponentClass.Conversion ? Cmd(machine, "conv", "reset", "all") : Cmd(machine, c.Verb(), "reset");
 
     /// <summary>Conversion prefers per task: <c>conv use &lt;task&gt; &lt;id&gt;</c> / <c>conv reset &lt;task&gt;</c>.</summary>
-    public static string PreferTask(string task, string id, bool machine = false) => $"conv use {Q(task)} {Q(id)}{M(machine)}";
-    public static string ResetTask(string task, bool machine = false) => $"conv reset {Q(task)}{M(machine)}";
+    public static CliArgs PreferTask(string task, string id, bool machine = false) => Cmd(machine, "conv", "use", task, id);
+    public static CliArgs ResetTask(string task, bool machine = false) => Cmd(machine, "conv", "reset", task);
 
     /// <summary>The action area a class's writes report under (DashboardContext.RunActionsAsync).</summary>
     public static string Area(ComponentClass c) => "policy-" + c.Verb();

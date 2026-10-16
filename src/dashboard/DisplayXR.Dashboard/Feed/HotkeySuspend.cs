@@ -3,6 +3,7 @@
 
 using System;
 using System.Threading.Tasks;
+using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
@@ -39,7 +40,7 @@ public sealed class HotkeySuspend
     {
         if (Active) return;
         Active = true;
-        Enqueue("workspace hotkey-suspend on", checkSupport: true);
+        Enqueue(CliArgs.Words("workspace hotkey-suspend on"), checkSupport: true);
     }
 
     /// <summary>Always runs "off" when Begin ran, whatever happened in between (even if "on" failed).</summary>
@@ -47,7 +48,7 @@ public sealed class HotkeySuspend
     {
         if (!Active) return;
         Active = false;
-        Enqueue("workspace hotkey-suspend off", checkSupport: false);
+        Enqueue(CliArgs.Words("workspace hotkey-suspend off"), checkSupport: false);
     }
 
     /// <summary>Completes when every queued call has finished (tests, shutdown).</summary>
@@ -56,7 +57,7 @@ public sealed class HotkeySuspend
         lock (_gate) return _chain;
     }
 
-    private void Enqueue(string args, bool checkSupport)
+    private void Enqueue(CliArgs args, bool checkSupport)
     {
         lock (_gate)
         {

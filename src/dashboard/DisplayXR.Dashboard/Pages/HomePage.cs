@@ -63,7 +63,7 @@ public sealed class HomePage : Page
 
         if (StatusText.MachineOverrideNotice(Ctx.Dp) is { } ov)
         {
-            var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "warn", "sm");
+            var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", CliArgs.Words("dp reset")), "warn", "sm");
             clear.IsEnabled = !Ctx.ActionRunning;
             page.Children.Add(U.Notice(Level.Warn, ov.Title, ov.Text, clear));
         }
@@ -125,7 +125,7 @@ public sealed class HomePage : Page
         if (known) ((TextBlock)activeBlock.Children[0]).Foreground = isDxr ? Tokens.For(Level.Ok) : Tokens.For(Level.Critical);
         if (known && !isDxr)
             activeBlock.Children.Add(U.Button("Make DisplayXR the active OpenXR runtime",
-                () => _ = Ctx.RunActionsAsync("runtime", "runtime activate"), "primary", "sm"));
+                () => _ = Ctx.RunActionsAsync("runtime", CliArgs.Words("runtime activate")), "primary", "sm"));
         kv.Add("Active OpenXR runtime", activeBlock);
 
         string service = s is null ? (Ctx.Feed.IsRunning ? "connecting…" : "—")

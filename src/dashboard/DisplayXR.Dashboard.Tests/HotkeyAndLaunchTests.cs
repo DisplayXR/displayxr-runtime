@@ -113,7 +113,7 @@ public class HotkeyAndLaunchTests
     {
         DashboardLog.Disabled = true;
         var fx = new FixtureProcessSource(TestData.Path("components.ndjson"), new FakeSource());
-        CliResult Run(string a) => fx.RunAsync(a, TimeSpan.FromSeconds(1)).Result;
+        CliResult Run(string a) => fx.RunAsync(CliArgs.Words(a), TimeSpan.FromSeconds(1)).Result;
         Assert.True(Run("workspace set other-controller --hotkey ctrl+shift+f9").Ok);
         Assert.False(Run("workspace set other-controller --hotkey F9").Ok); // no modifier
         Assert.True(Run("workspace set other-controller --mode disabled").Ok);
