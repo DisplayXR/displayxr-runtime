@@ -163,8 +163,16 @@ enum u_desktop_mod
  * "equal", "comma", "period", "slash", "backslash", "semicolon", "quote",
  * "bracketleft", "bracketright", "grave", "capslock", "printscreen", "menu".
  * An empty key means "modifiers only" (e.g. "super" alone).
- * Keys are PHYSICAL positions on a US layout (evdev / virtual-key / kVK codes),
- * which is what shortcuts mean; text goes through type_text, never key codes.
+ *
+ * Letters, digits and punctuation name the CHARACTER on the user's ACTIVE keyboard
+ * layout, because that is how every OS matches shortcuts: "ctrl+z" must press the
+ * key labelled Z, which on a French AZERTY layout is not the US-QWERTY Z position.
+ * Backends map character -> key through the active layout (Windows VkKeyScanExW on
+ * the foreground thread's HKL; macOS UCKeyTranslate over the current input source;
+ * GNOME the session keymap libei hands out, via xkbcommon). If the active layout has
+ * no key producing the character without AltGr-style extra modifiers, fail with
+ * U_DESKTOP_ERR_UNSUPPORTED and a message naming the character. Named keys (enter,
+ * f5, left, ...) are layout-independent. Text goes through type_text, never chords.
  */
 struct u_desktop_chord
 {

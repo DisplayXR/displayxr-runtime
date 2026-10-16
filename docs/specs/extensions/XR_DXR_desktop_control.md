@@ -111,7 +111,7 @@ the rule exists for).
 
 Chords are parsed by `u_desktop_chord_parse()`: `+`-separated, case-insensitive; modifiers
 `ctrl`/`control`, `shift`, `alt`/`option`, `super`/`win`/`cmd`/`command`/`meta`; at most one
-key from the canonical list in `u_desktop.h`.
+key from the canonical list in `u_desktop.h`. Letters, digits and punctuation name the character on the user's **active keyboard layout** (as every OS matches shortcuts: `ctrl+z` presses the key labelled Z on AZERTY too); named keys are layout-independent.
 
 ## 6. The store and the audit log
 
