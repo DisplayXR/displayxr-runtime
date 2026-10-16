@@ -55,6 +55,7 @@ add_executable(
 	cli_cmd_lift.cpp
 	cli_cmd_camera.c
 	cli_cmd_conv.cpp
+	cli_cmd_conv_run.cpp
 	cli_component_options.c
 	cli_component_options.h
 	cli_lift_service.c

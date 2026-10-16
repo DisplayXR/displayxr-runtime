@@ -14,6 +14,7 @@
  *   conv set    <id> <KEY> <value> [--machine]       `Settings\<KEY>` (HKCU; HKLM with --machine) — N3c
  *   conv unset  <id> <KEY> [--machine]
  *   conv models list|verify|prune|fetch|init        the runtime-owned model store (P4)
+ *   conv run | consent | camera-block                ADR-057: cli_cmd_conv_run.cpp
  *
  * `list` / `status` read the running service's status snapshot over DIAG
  * (`system_get_conv_*_row`, one row per reply) and fall back to the headless
@@ -1377,6 +1378,10 @@ usage(void)
 	P("  unset <id> <KEY> [--machine]        clear it; DXR_CONV_<ID>_<KEY> in the service's env always wins\n");
 	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
 	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]   write protocol, here\n");
+	P("  run <task> <in> [<in-right>] <out> [options]   one splat job, file to file (`conv run` for options)\n");
+	P("  consent <id> grant|revoke|status    off-box consent for a remote provider (per user)\n");
+	P("  camera-block <sog> --facts <json>   write facts as the SOG camera block, \"source\":\"auto\"\n");
+	P("  credential set|delete|status <name> a provider's token in the OS credential store (set reads stdin)\n");
 	P("list/status read the running service over DIAG, else describe providers headless (no model load).\n");
 	return 1;
 }
@@ -1420,6 +1425,19 @@ cli_cmd_conv(int argc, const char **argv)
 	}
 	if (strcmp(verb, "models") == 0) {
 		return cmd_models(argc, argv);
+	}
+	// ADR-057 (cli_cmd_conv_run.cpp).
+	if (strcmp(verb, "run") == 0) {
+		return cli_cmd_conv_run(argc, argv);
+	}
+	if (strcmp(verb, "consent") == 0) {
+		return cli_cmd_conv_consent(argc, argv);
+	}
+	if (strcmp(verb, "camera-block") == 0) {
+		return cli_cmd_conv_camera_block(argc, argv);
+	}
+	if (strcmp(verb, "credential") == 0) {
+		return cli_cmd_conv_credential(argc, argv);
 	}
 	const int rc = cmd_options_verbs(argc, argv); // options | set | unset (N3c)
 	if (rc >= 0) {
