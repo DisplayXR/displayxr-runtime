@@ -93,7 +93,10 @@ it always succeeds for a valid session. A capability the backend lacks returns
    `idle_ms` (store, default 600 ms), polling the backend's `user_idle_ms`. Input the runtime
    itself injected does not count — but only input whose OS timestamp falls inside one of
    the runtime's own injection windows `[start, end + 150 ms]`; activity after that window is
-   the user's, however soon the next action follows. (Known limit: a user keystroke landing
+   the user's, however soon the next action follows. The decision is taken only once the
+   last injection's grace window has closed (an action following another by < 150 ms waits
+   out the rest of it), so a user who starts typing right after our injection is seen as
+   active rather than absorbed into our grace. (Known limit: a user keystroke landing
    *during* one of our injections is indistinguishable from ours on these OSes.) Waits at
    most 10 s, then `REFUSED` "the user is active".
 3. **Target exists.** The target window is in the backend's window list — else
