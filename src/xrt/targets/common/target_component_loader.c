@@ -82,6 +82,10 @@ tc_bin_close(struct tc_bin *b);
 static bool
 tc_bin_path_is_bin(const char *path, const struct tc_bin *b);
 #endif
+static bool
+tc_prov_cache_lock(void);
+static void
+tc_prov_cache_unlock(void);
 static void
 tc_prov_evaluate(struct target_component_entry *e, struct tc_bin *b);
 static enum target_component_load_result
@@ -900,6 +904,29 @@ tc_prov_platform_trusted(const char *path, const struct tc_bin *b)
 }
 
 bool
+target_component_owner_chain_ok(
+    const char *resolved_path, uint32_t owner_uid, const char *stop_dir, char *why, size_t why_cap)
+{
+	(void)resolved_path;
+	(void)owner_uid;
+	(void)stop_dir;
+	if (why != NULL && why_cap > 0) {
+		snprintf(why, why_cap, "no POSIX ownership rule on Windows");
+	}
+	return false;
+}
+
+bool
+target_component_platform_trusted_path(const char *path, char *why, size_t why_cap)
+{
+	(void)path;
+	if (why != NULL && why_cap > 0) {
+		snprintf(why, why_cap, "no platform rule on Windows: a path is not a provenance");
+	}
+	return false;
+}
+
+bool
 target_component_process_elevated(void)
 {
 	TOKEN_ELEVATION e = {0};
@@ -1427,10 +1454,12 @@ tc_store_manifest_schema(const struct target_component_class *cls,
 /*
  *
  * Provenance hooks (POSIX). No Authenticode; the admin-only allowlist is
- * /etc/displayxr/trust/allowlist (one hex digest per line, `#` comments);
- * platform trust is the package manager's (root-owned, not group/world
- * writable, under /usr or /opt) and, on Android, the APK signature that
- * already covers everything inside it.
+ * /etc/displayxr/trust/allowlist (one hex digest per line, `#` comments),
+ * honoured only when it and every parent directory are root-owned and not
+ * group/world-writable; platform trust is the package manager's (the RESOLVED
+ * path under /usr, /opt or the .pkg payload, the file and every parent
+ * directory root-owned and not group/world-writable) and, on Android, the
+ * APK signature that already covers everything inside it.
  *
  */
 
@@ -1447,13 +1476,151 @@ tc_prov_signed(const char *path, const struct tc_bin *b, char *signer, size_t ca
 	return false;
 }
 
+bool
+target_component_owner_chain_ok(
+    const char *resolved_path, uint32_t owner_uid, const char *stop_dir, char *why, size_t why_cap)
+{
+	if (why != NULL && why_cap > 0) {
+		why[0] = '\0';
+	}
+	if (resolved_path == NULL || resolved_path[0] != '/') {
+		if (why != NULL) {
+			snprintf(why, why_cap, "not an absolute resolved path");
+		}
+		return false;
+	}
+	const char *stop = (stop_dir != NULL && stop_dir[0] != '\0') ? stop_dir : "/";
+	char cur[PATH_MAX];
+	tc_copy(cur, sizeof(cur), resolved_path);
+	for (;;) {
+		struct stat st;
+		// lstat: a resolved path has no symlinks left; one appearing now is a swap.
+		if (lstat(cur, &st) != 0) {
+			if (why != NULL) {
+				snprintf(why, why_cap, "cannot stat %s", cur);
+			}
+			return false;
+		}
+		if (S_ISLNK(st.st_mode)) {
+			if (why != NULL) {
+				snprintf(why, why_cap, "%s is a symlink", cur);
+			}
+			return false;
+		}
+		if ((uint32_t)st.st_uid != owner_uid) {
+			if (why != NULL) {
+				snprintf(why, why_cap, "%s is owned by uid %lu, not %lu", cur, (unsigned long)st.st_uid,
+				         (unsigned long)owner_uid);
+			}
+			return false;
+		}
+		if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+			if (why != NULL) {
+				snprintf(why, why_cap, "%s is group- or world-writable", cur);
+			}
+			return false;
+		}
+		if (strcmp(cur, stop) == 0 || strcmp(cur, "/") == 0) {
+			return true;
+		}
+		char *slash = strrchr(cur, '/');
+		if (slash == NULL) {
+			return false;
+		}
+		if (slash == cur) {
+			cur[1] = '\0'; // parent is the root
+		} else {
+			*slash = '\0';
+		}
+	}
+}
+
+bool
+target_component_platform_trusted_path(const char *path, char *why, size_t why_cap)
+{
+	if (why != NULL && why_cap > 0) {
+		why[0] = '\0';
+	}
+#if defined(XRT_OS_ANDROID)
+	// Everything the runtime can dlopen here came out of a signed APK.
+	(void)path;
+	return true;
+#else
+	char resolved[PATH_MAX];
+	if (path == NULL || realpath(path, resolved) == NULL) {
+		if (why != NULL) {
+			snprintf(why, why_cap, "path does not resolve");
+		}
+		return false;
+	}
+	// The prefix is checked on the RESOLVED path: `/usr/../home/x/lib.so` or
+	// a /usr symlink into a user directory is not under /usr. /usr and /opt
+	// (the .deb, /usr/local), plus the macOS .pkg's root-owned payload under
+	// /Library/Application Support/DisplayXR.
+	if (strncmp(resolved, "/usr/", 5) != 0 && strncmp(resolved, "/opt/", 5) != 0 &&
+	    strncmp(resolved, "/Library/Application Support/DisplayXR/", 39) != 0) {
+		if (why != NULL) {
+			snprintf(why, why_cap, "%s is not under /usr, /opt or the .pkg payload", resolved);
+		}
+		return false;
+	}
+	// Root-owned and not group/world-writable: the file AND every directory
+	// up to /, so nobody but root can have replaced or re-pointed any of it.
+	return target_component_owner_chain_ok(resolved, 0, "/", why, why_cap);
+#endif
+}
+
+#if !defined(XRT_OS_ANDROID)
+/*!
+ * An admin-only trust file (the allowlist, the enforce knob) counts only if
+ * it and every directory above it are root-owned and not group/world
+ * writable; otherwise it is ignored, with one WARN per file per process.
+ * Absent = false, silently. @p resolved receives the path to open.
+ */
+static bool
+tc_admin_file_trusted(const char *path, bool *warned, char *resolved, size_t resolved_cap)
+{
+	char tmp[PATH_MAX];
+	if (realpath(path, tmp) == NULL) {
+		return false; // absent: nothing to trust or ignore
+	}
+	char why[PATH_MAX + 64];
+	if (!target_component_owner_chain_ok(tmp, 0, "/", why, sizeof(why))) {
+		bool say = false;
+		if (tc_prov_cache_lock()) {
+			say = !*warned;
+			*warned = true;
+			tc_prov_cache_unlock();
+		}
+		if (say) {
+			U_LOG_W(
+			    "component loader: IGNORING %s — %s; an admin-only trust file must be root-owned and not "
+			    "group/world-writable, with every parent directory the same (ADR-054 N4b).",
+			    path, why);
+		}
+		return false;
+	}
+	tc_copy(resolved, resolved_cap, tmp);
+	return true;
+}
+#endif
+
 static bool
 tc_prov_allowlisted(const char *sha256_hex)
 {
 	if (sha256_hex == NULL || sha256_hex[0] == '\0') {
 		return false;
 	}
+#if defined(XRT_OS_ANDROID)
 	FILE *f = fopen("/etc/displayxr/trust/allowlist", "rb");
+#else
+	static bool warned = false;
+	char resolved[PATH_MAX];
+	if (!tc_admin_file_trusted("/etc/displayxr/trust/allowlist", &warned, resolved, sizeof(resolved))) {
+		return false;
+	}
+	FILE *f = fopen(resolved, "rb");
+#endif
 	if (f == NULL) {
 		return false;
 	}
@@ -1501,18 +1668,18 @@ tc_prov_platform_trusted(const char *path, const struct tc_bin *b)
 	(void)b;
 	return true;
 #else
-	// The descriptor that was hashed and will be loaded, not the path again.
+	if (path == NULL || !b->open) {
+		return false;
+	}
+	// The resolved path must name the descriptor that was hashed and will be
+	// loaded, and pass the location + ownership rule.
+	char resolved[PATH_MAX];
 	struct stat st;
-	if (path == NULL || !b->open || fstat(b->fd, &st) != 0) {
+	if (realpath(path, resolved) == NULL || stat(resolved, &st) != 0 || (uint64_t)st.st_dev != b->dev ||
+	    (uint64_t)st.st_ino != b->ino) {
 		return false;
 	}
-	if (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-		return false;
-	}
-	// /usr and /opt (the .deb, /usr/local), plus the macOS .pkg's root-owned
-	// payload under /Library/Application Support/DisplayXR.
-	return strncmp(path, "/usr/", 5) == 0 || strncmp(path, "/opt/", 5) == 0 ||
-	       strncmp(path, "/Library/Application Support/DisplayXR/", 39) == 0;
+	return target_component_platform_trusted_path(resolved, NULL, 0);
 #endif
 }
 
@@ -1544,8 +1711,14 @@ target_component_trust_enforced(void)
 	// (an empty file included) enforces. Absent = audit: POSIX has no signer
 	// check and the tarball's user-level install is unsigned and unlisted,
 	// so the default stays audit here until those lanes allowlist (PR B
-	// flipped Windows only).
-	FILE *f = fopen("/etc/displayxr/trust/enforce", "rb");
+	// flipped Windows only). A knob file a non-root user could have written
+	// is ignored (WARN once) — the platform default applies.
+	static bool warned = false;
+	char resolved[PATH_MAX];
+	FILE *f = NULL;
+	if (tc_admin_file_trusted("/etc/displayxr/trust/enforce", &warned, resolved, sizeof(resolved))) {
+		f = fopen(resolved, "rb");
+	}
 	if (f == NULL) {
 		return target_component_trust_policy(false, false, false);
 	}

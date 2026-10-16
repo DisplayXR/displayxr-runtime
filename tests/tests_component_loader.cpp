@@ -35,6 +35,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -953,6 +955,86 @@ TEST_CASE("component loader: a file rewritten with its size and mtime put back i
 	CHECK(std::string(e->sha256) == now);
 	CHECK(std::string(e->provenance_reason).find(now) != std::string::npos);
 	std::remove(p.c_str());
+}
+#endif
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+TEST_CASE("component loader: the ownership chain covers the file and every directory above it", "[component_loader]")
+{
+	// A private tree under the temp dir, judged against our own uid with the
+	// tree's root as the stop: the real rule uses uid 0 and "/".
+	char tmpl_buf[1024];
+	std::snprintf(tmpl_buf, sizeof(tmpl_buf), "%s", temp_path("tests_component_loader_chain_XXXXXX").c_str());
+	REQUIRE(mkdtemp(tmpl_buf) != nullptr);
+	char base[PATH_MAX];
+	REQUIRE(realpath(tmpl_buf, base) != nullptr);
+	const std::string a = std::string(base) + "/a";
+	const std::string ab = a + "/b";
+	const std::string lib = ab + "/lib.so";
+	REQUIRE(mkdir(a.c_str(), 0755) == 0);
+	REQUIRE(mkdir(ab.c_str(), 0755) == 0);
+	write_file(lib, "not really a library");
+	REQUIRE(chmod(base, 0755) == 0);
+	REQUIRE(chmod(lib.c_str(), 0644) == 0);
+	const uint32_t me = (uint32_t)getuid();
+	char why[PATH_MAX + 64];
+
+	CHECK(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	// Wrong owner.
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me + 1, base, why, sizeof(why)));
+	CHECK(std::string(why).find("owned by") != std::string::npos);
+	// A group-writable directory in the MIDDLE of the chain is enough to fail.
+	REQUIRE(chmod(a.c_str(), 0775) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	CHECK(std::string(why).find(a) != std::string::npos);
+	REQUIRE(chmod(a.c_str(), 0755) == 0);
+	// A world-writable file.
+	REQUIRE(chmod(lib.c_str(), 0646) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	REQUIRE(chmod(lib.c_str(), 0644) == 0);
+	// A symlink in the chain (callers pass resolved paths; one here is a swap).
+	const std::string link = std::string(base) + "/link.so";
+	REQUIRE(symlink(lib.c_str(), link.c_str()) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(link.c_str(), me, base, why, sizeof(why)));
+	CHECK(std::string(why).find("symlink") != std::string::npos);
+	// Relative / missing.
+	CHECK_FALSE(target_component_owner_chain_ok("relative/lib.so", me, base, why, sizeof(why)));
+	CHECK_FALSE(target_component_owner_chain_ok((ab + "/missing.so").c_str(), me, base, why, sizeof(why)));
+
+	// The platform rule itself: a user-owned temp file is never platform-trusted.
+	CHECK_FALSE(target_component_platform_trusted_path(lib.c_str(), why, sizeof(why)));
+
+	std::remove(link.c_str());
+	std::remove(lib.c_str());
+	rmdir(ab.c_str());
+	rmdir(a.c_str());
+	rmdir(base);
+}
+
+TEST_CASE("component loader: the platform rule judges the RESOLVED path", "[component_loader]")
+{
+	char why[PATH_MAX + 64];
+	// A string that starts with /usr/ but resolves elsewhere: the old string
+	// prefix check called a root-owned /etc file platform-trusted.
+	struct stat st;
+	if (stat("/etc/hosts", &st) == 0 && st.st_uid == 0) {
+		CHECK_FALSE(target_component_platform_trusted_path("/usr/../etc/hosts", why, sizeof(why)));
+		CHECK(std::string(why).find("not under") != std::string::npos);
+	}
+	// A real root-owned system binary under /usr passes, directly and through
+	// a user-owned symlink (the symlink is resolved; the TARGET is judged, and
+	// the load path then requires the resolved file to be the hashed one).
+	if (stat("/usr/bin/true", &st) == 0 && st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0) {
+		INFO(why);
+		CHECK(target_component_platform_trusted_path("/usr/bin/true", why, sizeof(why)));
+		const std::string link = temp_path("tests_component_loader_true_link");
+		std::remove(link.c_str());
+		REQUIRE(symlink("/usr/bin/true", link.c_str()) == 0);
+		CHECK(target_component_platform_trusted_path(link.c_str(), why, sizeof(why)));
+		std::remove(link.c_str());
+	}
+	CHECK_FALSE(target_component_platform_trusted_path("/usr/no/such/file.so", why, sizeof(why)));
+	CHECK_FALSE(target_component_platform_trusted_path(nullptr, why, sizeof(why)));
 }
 #endif
 
