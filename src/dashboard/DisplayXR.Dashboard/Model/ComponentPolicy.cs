@@ -136,6 +136,14 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
     /// <summary>The tasks a conversion provider offers, in the CLI's order.</summary>
     public IEnumerable<PolicyTask> TasksOf(string providerId) => Tasks.Where(t => t.Provider == providerId);
 
+    /// <summary>The distinct task names a conversion provider offers, in the CLI's order.</summary>
+    public IEnumerable<string> TaskNamesOf(string providerId) => TasksOf(providerId).Select(t => t.Task).Distinct();
+
+    /// <summary>Is <paramref name="providerId"/> the preference for <paramref name="task"/> (a bare id or <c>id/cap</c>)?</summary>
+    public bool IsPreferredFor(string task, string providerId) =>
+        PreferredByTask.TryGetValue(task, out var pref)
+        && (pref == providerId || pref.StartsWith(providerId + "/", StringComparison.Ordinal));
+
     /// <summary>True when any row carries an Enabled value: the CLI has the N3 verbs, so the controls can show.</summary>
     public bool Writable => Rows.Any(r => r.EnabledKnown) || Class == ComponentClass.Conversion && Rows.Count > 0;
 
@@ -211,4 +219,33 @@ public static class PolicyCommands
 
     /// <summary>The action area a class's writes report under (DashboardContext.RunActionsAsync).</summary>
     public static string Area(ComponentClass c) => "policy-" + c.Verb();
+
+    /// <summary>
+    /// The machine-wide (<c>--machine</c>) equivalent of every control the row shows, in the
+    /// order they appear: the Enabled flip, then the global Prefer / Reset (display / input)
+    /// or each task's Prefer / Reset (conversion). What a non-elevated dashboard prints for an
+    /// administrator instead of attempting it. A built-in row has no Enabled and is never
+    /// preferred; a task it already holds keeps its Reset.
+    /// </summary>
+    public static IReadOnlyList<CliArgs> MachineHints(PolicyRow r, PolicyList list)
+    {
+        var c = r.Class;
+        var hints = new List<CliArgs>();
+        bool usable = r.Enabled && !r.Untrusted;
+        if (r.EnabledKnown && !r.Untrusted) hints.Add(Toggle(c, r.Id, r.Enabled, machine: true));
+        if (c != ComponentClass.Conversion)
+        {
+            if (r.Preferred) hints.Add(Reset(c, machine: true));
+            else if (usable) hints.Add(Prefer(c, r.Id, machine: true));
+        }
+        else
+        {
+            foreach (var task in list.TaskNamesOf(r.Id))
+            {
+                if (list.IsPreferredFor(task, r.Id)) hints.Add(ResetTask(task, machine: true));
+                else if (!r.BuiltIn && usable) hints.Add(PreferTask(task, r.Id, machine: true));
+            }
+        }
+        return hints;
+    }
 }
