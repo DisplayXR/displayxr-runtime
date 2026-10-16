@@ -247,6 +247,7 @@ The suffix is the router, so all three plug-in types share one directory:
 | DP loader | skips `-conversion-provider.json`, beside its input skip (`target_plugin_loader.c:2511-2517`) |
 | Input loader | already *requires* `-input-provider.json` (`target_input_plugin_loader.c:807-808`); a unit test pins that conversion manifests stay invisible to it |
 | Conversion loader | requires `-conversion-provider.json` |
+| Every loader | skips `<pack>.models.json` — a model pack (§ model store) is not a manifest. Packs ship beside the provider that lists them in `packs[]`, i.e. in this same directory; before this rule the DP loader read each one as a malformed DP manifest (`target_plugin_classify_manifest`, `target_component_loader.c`) |
 
 Preferred provider: `DXR_CONV_PREFERRED_<TASK>` in the environment, or a `conversion-preferred.json` in the per-user dir (the `plugin-discovery.md` §3.3 pattern).
 

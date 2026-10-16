@@ -169,6 +169,15 @@ target_plugin_classify_manifest(const char *filename)
 	static const char json_suffix[] = ".json";
 	static const char ip_suffix[] = "-input-provider.json";
 	static const char cp_suffix[] = "-conversion-provider.json";
+	/*
+	 * ADR-053 P4 model packs (`<pack>.models.json`) are not manifests. They
+	 * ship beside the conversion provider that lists them in `packs[]` — in
+	 * this same discovery dir — so the router must skip them: read as a DP
+	 * manifest each one was logged malformed ("unsupported
+	 * file_format_version") on every enumeration and took one of
+	 * TARGET_COMPONENT_MAX_ENTRIES.
+	 */
+	static const char pack_suffix[] = ".models.json";
 
 	if (filename == NULL) {
 		return TARGET_PLUGIN_MANIFEST_NONE;
@@ -177,9 +186,13 @@ target_plugin_classify_manifest(const char *filename)
 	const size_t json_len = sizeof(json_suffix) - 1;
 	const size_t ip_len = sizeof(ip_suffix) - 1;
 	const size_t cp_len = sizeof(cp_suffix) - 1;
+	const size_t pack_len = sizeof(pack_suffix) - 1;
 
 	/* A bare suffix is not a manifest: there must be a name in front. */
 	if (n <= json_len || strcmp(filename + n - json_len, json_suffix) != 0) {
+		return TARGET_PLUGIN_MANIFEST_NONE;
+	}
+	if (n >= pack_len && strcmp(filename + n - pack_len, pack_suffix) == 0) {
 		return TARGET_PLUGIN_MANIFEST_NONE;
 	}
 	if (n >= ip_len && strcmp(filename + n - ip_len, ip_suffix) == 0) {

@@ -75,9 +75,10 @@ extern "C" {
  * Which class a POSIX discovery-root file belongs to (ADR-053: "the suffix is
  * the router"). All classes share one directory, so every loader classifies
  * with this one function: `NNN-<id>-input-provider.json` is INPUT,
- * `NNN-<id>-conversion-provider.json` is CONVERSION, any other `*.json` is
- * DISPLAY, anything else is NONE. Pure, compiled on every platform so it is
- * unit-testable everywhere.
+ * `NNN-<id>-conversion-provider.json` is CONVERSION, a `<pack>.models.json`
+ * model pack (ADR-053 P4, shipped beside its provider) is NONE, any other
+ * `*.json` is DISPLAY, anything else is NONE. Pure, compiled on every
+ * platform so it is unit-testable everywhere.
  */
 enum target_plugin_manifest_kind
 {
