@@ -998,6 +998,19 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
   there is no cross-API intermediary. Authoritative: `docs/architecture/multi-compositor.md`; live
   code `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (`multi_compositor_render`).
 
+- **INV-10.4 — Never expose desktop control through your MCP tools.** `XR_DXR_desktop_control`
+  runs in your process under a grant the OS (or DisplayXR's own prompt, on Windows) gave to
+  **your app**, by name. Your app's MCP tools (`XR_DXR_mcp_tools`) are served on an endpoint that
+  **any local process** of the same user can call, unauthenticated. A tool whose handler lists
+  windows, reads UI text, types, clicks or moves windows hands your grant to every program on the
+  machine — exactly the hole ADR-056 D2 closes. MCP stays **inbound**: agents operate *your app*;
+  only your app's own agent (in your process) operates the desktop. The runtime itself exposes no
+  desktop-control MCP tools either. If a future case needs it, it requires per-client
+  authorisation in the MCP framework first, and its own ADR (ADR-056 D4). The linter flags an
+  app that uses both APIs (WARN); after checking that no tool handler reaches an
+  `xr*Desktop*DXR` call, exempt it with `// dxr-lint: allow-mcp-desktop <reason>`.
+  Spec: `docs/specs/extensions/XR_DXR_desktop_control.md`.
+
 ---
 
 ## 11. Android — pixel-exactness rules
@@ -1166,6 +1179,7 @@ macOS app (no manifest → no Android findings).
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
+- [ ] (agent apps) no MCP tool handler reaches an `xr*Desktop*DXR` call — desktop control is never re-exported (INV-10.4)
 - [ ] Capture via `xrCaptureAtlasDXR`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
 - [ ] Full mip chain + trilinear on every backend (INV-7.5)
 - [ ] Loader DLL shipped next to exe; no compiled-in runtime path (INV-8.2)
