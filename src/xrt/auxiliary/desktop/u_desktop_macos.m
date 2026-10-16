@@ -29,6 +29,7 @@
  */
 
 #include "u_desktop.h"
+#include "u_desktop_mini_cache.h"
 
 #import <AppKit/AppKit.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -325,7 +326,9 @@ ax_app_create(pid_t pid, float timeout)
 #define AX_CACHE_TTL_NS (1000ull * 1000 * 1000)
 #define APPID_CACHE 64
 #define SAVED_FRAMES 64
-#define MINIMIZED_MAX 64
+#define MINIMIZED_MAX U_DESKTOP_MINI_CACHE_MAX
+//! The worker (off the main thread) refreshes a minimized list older than this itself.
+#define MINIMIZED_WORKER_MAX_AGE_NS (250ull * 1000 * 1000)
 #define SCREENS_MAX 16
 #define SCREENS_TTL_NS (2000ull * 1000 * 1000)
 
@@ -381,9 +384,12 @@ struct macos_backend
 	struct saved_frame saved[SAVED_FRAMES]; //!< pre-MAXIMIZE frames, for RESTORE
 	uint32_t saved_next;
 
-	struct u_desktop_window minimized[MINIMIZED_MAX];
-	uint32_t minimized_n;
+	//! Minimized windows (CGWindowList's on-screen list drops them): the refresher's
+	//! snapshot plus pins from our own window ops (u_desktop_mini_cache.h).
+	struct u_desktop_mini_cache mini;
 	uint64_t minimized_at;
+	//! Serialises refresh_once between the refresher and the worker's sync refresh.
+	pthread_mutex_t refresh_lock;
 
 	struct screen_info screens[SCREENS_MAX];
 	uint32_t screens_n;
@@ -1153,11 +1159,12 @@ slow_mark(struct macos_backend *m, pid_t pid, uint64_t until)
  * says which are AXMinimized (the rest are on other Spaces or in hidden apps).
  */
 static void
-refresh_once(struct macos_backend *m)
+refresh_once_body(struct macos_backend *m)
 {
 	if (!trusted()) {
 		return;
 	}
+	const uint64_t started = now_ns(); // pins made after this may be missing below
 	CFArrayRef all = CGWindowListCopyWindowInfo(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
 	                                            kCGNullWindowID);
 	if (all == NULL) {
@@ -1272,14 +1279,41 @@ refresh_once(struct macos_backend *m)
 
 	pthread_mutex_lock(&m->lock);
 	if (res != NULL) {
-		memcpy(m->minimized, res, sizeof(*res) * n);
-		m->minimized_n = n;
+		u_desktop_mini_cache_publish(&m->mini, res, n, started);
 	}
 	m->minimized_at = now_ns();
 	m->snapshot_gen++;
 	pthread_cond_broadcast(&m->cond);
 	pthread_mutex_unlock(&m->lock);
 	free(res);
+}
+
+static void
+refresh_once(struct macos_backend *m)
+{
+	pthread_mutex_lock(&m->refresh_lock);
+	refresh_once_body(m);
+	pthread_mutex_unlock(&m->refresh_lock);
+}
+
+/*!
+ * Worker thread only: make sure the minimized list is at most @p max_age_ns old,
+ * refreshing it synchronously if not (bounded by the per-app AX timeout; slow
+ * apps are skipped). The main thread never comes here: it must not block.
+ */
+static void
+refresh_if_stale(struct macos_backend *m, uint64_t max_age_ns)
+{
+	pthread_mutex_lock(&m->refresh_lock); // waits for a refresh in flight, then re-checks
+	pthread_mutex_lock(&m->lock);
+	uint64_t at = m->minimized_at;
+	pthread_mutex_unlock(&m->lock);
+	if (at == 0 || now_ns() - at > max_age_ns) {
+		@autoreleasepool {
+			refresh_once_body(m);
+		}
+	}
+	pthread_mutex_unlock(&m->refresh_lock);
 }
 
 static void *
@@ -1352,10 +1386,48 @@ static uint32_t
 minimized_get(struct macos_backend *m, struct u_desktop_window *out, uint32_t cap)
 {
 	pthread_mutex_lock(&m->lock);
-	uint32_t n = m->minimized_n < cap ? m->minimized_n : cap;
-	memcpy(out, m->minimized, sizeof(*out) * n);
+	uint32_t n = u_desktop_mini_cache_get(&m->mini, out, cap);
 	pthread_mutex_unlock(&m->lock);
 	return n;
+}
+
+//! Our MINIMIZE of @p wid succeeded: list it as minimized at once (frame, title, pid).
+static void
+minimized_pin_present(struct macos_backend *m, CGWindowID wid, pid_t pid, AXUIElementRef el)
+{
+	struct u_desktop_window w;
+	memset(&w, 0, sizeof(w));
+	w.id = wid;
+	w.pid = (uint32_t)pid;
+	char owner[U_DESKTOP_APP_ID_SIZE] = {0};
+	CFDictionaryRef info = cg_window_info(wid);
+	if (info != NULL) {
+		cfstr_to_utf8(CFDictionaryGetValue(info, kCGWindowOwnerName), owner, sizeof(owner));
+		cfstr_to_utf8(CFDictionaryGetValue(info, kCGWindowName), w.title, sizeof(w.title));
+		w.frame = rect_from_cg(dict_bounds(info)); // the frame it will come back to
+		CFRelease(info);
+	}
+	if (w.title[0] == '\0' && el != NULL) {
+		CFTypeRef t = ax_copy(el, kAXTitleAttribute);
+		cfstr_to_utf8(t, w.title, sizeof(w.title));
+		if (t) {
+			CFRelease(t);
+		}
+	}
+	app_identity(m, pid, owner, w.app_id, sizeof(w.app_id), NULL);
+	w.state = U_DESKTOP_WINDOW_MINIMIZED | (pid == getpid() ? U_DESKTOP_WINDOW_OWN : 0);
+	pthread_mutex_lock(&m->lock);
+	u_desktop_mini_cache_pin(&m->mini, wid, true, &w, now_ns());
+	pthread_mutex_unlock(&m->lock);
+}
+
+//! Our op took @p wid out of the minimized state (restored, activated, maximized, closed).
+static void
+minimized_pin_absent(struct macos_backend *m, CGWindowID wid)
+{
+	pthread_mutex_lock(&m->lock);
+	u_desktop_mini_cache_pin(&m->mini, wid, false, NULL, now_ns());
+	pthread_mutex_unlock(&m->lock);
 }
 
 static void
@@ -1549,6 +1621,12 @@ mac_list_windows(struct u_desktop_backend *b, struct u_desktop_window *out, uint
 	*count = 0;
 	refresher_touch(m);
 	bool ax_ok = trusted();
+	if (ax_ok && !is_main_thread()) {
+		// The worker's "target exists" check (spec §5 step 3): a window minimized
+		// since the last snapshot is only in a fresh one. The main thread stays
+		// non-blocking and reads the cache as is.
+		refresh_if_stale(m, MINIMIZED_WORKER_MAX_AGE_NS);
+	}
 	CGWindowID focused = focused_wid(m);
 	struct screen_info scr[SCREENS_MAX];
 	uint32_t scr_n = screens_get(m, scr);
@@ -1575,7 +1653,15 @@ mac_list_windows(struct u_desktop_backend *b, struct u_desktop_window *out, uint
 	if (ax_ok) {
 		struct u_desktop_window mins[MINIMIZED_MAX];
 		uint32_t mn = minimized_get(m, mins, MINIMIZED_MAX);
+		uint32_t onscreen = total < cap ? total : cap;
 		for (uint32_t i = 0; i < mn; i++) {
+			bool dup = false; // a pin can outlive the window's return to the screen
+			for (uint32_t k = 0; k < onscreen && !dup; k++) {
+				dup = out[k].id == mins[i].id;
+			}
+			if (dup) {
+				continue;
+			}
 			if (total < cap) {
 				out[total] = mins[i];
 				out[total].z = total;
@@ -2084,8 +2170,10 @@ mac_window_op(struct u_desktop_backend *b,
 		// macOS 14+ cooperative activation may ignore the request above from a
 		// background app; AXFrontmost (Accessibility-granted) is not subject to it.
 		AXUIElementRef ax_app = ax_app_create(pid, AX_ACTION_TIMEOUT_S);
-		ax_set_bool(ax_app, kAXFrontmostAttribute, true);
-		CFRelease(ax_app);
+		if (ax_app != NULL) { // NULL when the app is exiting: CFRelease(NULL) crashes
+			ax_set_bool(ax_app, kAXFrontmostAttribute, true);
+			CFRelease(ax_app);
+		}
 		AXUIElementPerformAction(el, kAXRaiseAction);
 		ax_set_bool(el, kAXMainAttribute, true);
 		r = U_DESKTOP_ERR_REFUSED;
@@ -2176,6 +2264,16 @@ mac_window_op(struct u_desktop_backend *b,
 		break;
 	}
 	default: set_msg(msg, "unknown window op %d", (int)op); r = U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	if (r == U_DESKTOP_OK) {
+		// Pin the outcome in the minimized cache NOW: CGWindowList's on-screen list
+		// drops a minimized window at once, and the next AX snapshot may be a while.
+		if (op == U_DESKTOP_OP_MINIMIZE) {
+			minimized_pin_present(m, wid, pid, el);
+		} else if (op == U_DESKTOP_OP_RESTORE || op == U_DESKTOP_OP_CLOSE || op == U_DESKTOP_OP_ACTIVATE ||
+		           op == U_DESKTOP_OP_MAXIMIZE) {
+			minimized_pin_absent(m, wid);
+		}
 	}
 	CFRelease(el);
 	return r;
@@ -2611,9 +2709,14 @@ mac_key_chord(struct u_desktop_backend *b,
 	CGEventFlags flags = 0;
 	bool ok = true;
 	uint32_t pressed = 0; // modifiers we pressed, released on every exit path
-	r = check_focus(m, guard, msg);
+	r = U_DESKTOP_OK;
 	for (size_t i = 0; r == U_DESKTOP_OK && i < 4; i++) {
 		if (mods_eff & mods[i].mod) {
+			// Every key-down is an injection batch: the guard and focus before EACH one.
+			r = check_focus(m, guard, msg);
+			if (r != U_DESKTOP_OK) {
+				break;
+			}
 			flags |= mods[i].flag;
 			ok = ok && post_key(m, mods[i].code, true, flags);
 			pressed |= mods[i].mod;
@@ -2772,12 +2875,17 @@ mac_pointer_button(struct u_desktop_backend *b,
 	}
 	CGEventPost(kCGHIDEventTap, e);
 	CFRelease(e);
+	// A revoke drops the event silently: a press counts as held only when the
+	// permission still holds after the post (else there is nothing to release).
+	enum u_desktop_result pr = check_permission(msg);
 	if (down) {
-		m->buttons_down |= 1u << button;
+		if (pr == U_DESKTOP_OK) {
+			m->buttons_down |= 1u << button;
+		}
 	} else {
 		m->buttons_down &= ~(1u << button);
 	}
-	return check_permission(msg); // a revoke drops the event silently
+	return pr;
 }
 
 static enum u_desktop_result
@@ -2838,6 +2946,7 @@ mac_destroy(struct u_desktop_backend *b)
 	}
 	pthread_cond_destroy(&m->cond);
 	pthread_mutex_destroy(&m->lock);
+	pthread_mutex_destroy(&m->refresh_lock);
 	pthread_cond_destroy(&m->access_cond);
 	pthread_mutex_destroy(&m->access_lock);
 	free(m);
@@ -2851,6 +2960,7 @@ u_desktop_backend_create_platform(void)
 		return NULL;
 	}
 	pthread_mutex_init(&m->lock, NULL);
+	pthread_mutex_init(&m->refresh_lock, NULL);
 	pthread_cond_init(&m->cond, NULL);
 	pthread_mutex_init(&m->access_lock, NULL);
 	pthread_cond_init(&m->access_cond, NULL);

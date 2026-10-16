@@ -16,6 +16,7 @@
 #include "desktop/u_desktop_chord.h"
 #include "desktop/u_desktop_control.h"
 #include "desktop/u_desktop_fake.h"
+#include "desktop/u_desktop_mini_cache.h"
 #include "desktop/u_desktop_policy.h"
 
 #include "catch_amalgamated.hpp"
@@ -1811,4 +1812,110 @@ TEST_CASE("polish6_audit: an unknown action type while GRANTED is audited once p
 	u_desktop_action t = type_text(101, "");
 	CHECK(u_desktop_control_submit(h.c, &t, &id) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
 	CHECK(count_of(slurp(dir.file("desktop_control_audit.jsonl")), "\"action\":\"unknown\"") == 2);
+}
+
+// --- 11. macOS minimized cache (platform-neutral logic) ---------------------------
+
+namespace {
+
+u_desktop_window
+mini_win(uint64_t id, const char *title)
+{
+	u_desktop_window w;
+	memset(&w, 0, sizeof(w));
+	w.id = id;
+	snprintf(w.title, sizeof(w.title), "%s", title);
+	w.frame = {10, 20, 300, 200};
+	w.state = U_DESKTOP_WINDOW_MINIMIZED;
+	return w;
+}
+
+bool
+mini_has(const u_desktop_mini_cache &c, uint64_t id)
+{
+	u_desktop_window out[U_DESKTOP_MINI_CACHE_MAX];
+	uint32_t n = u_desktop_mini_cache_get(&c, out, U_DESKTOP_MINI_CACHE_MAX);
+	for (uint32_t i = 0; i < n; i++) {
+		if (out[i].id == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+TEST_CASE("polish11_mini: a window we minimize is listed at once and survives a stale snapshot",
+          "[desktop][polish][macos]")
+{
+	static u_desktop_mini_cache c; // large: keep it off the stack
+	memset(&c, 0, sizeof(c));
+	const uint64_t S = 1000000000ull;
+	u_desktop_window other = mini_win(5, "other");
+	u_desktop_mini_cache_publish(&c, &other, 1, 1 * S);
+	CHECK(mini_has(c, 5));
+	CHECK_FALSE(mini_has(c, 718));
+
+	// MINIMIZE 718 at t=2 s: listed immediately (the reviewer's repro).
+	u_desktop_window w = mini_win(718, "notes");
+	w.state = 0;
+	u_desktop_mini_cache_pin(&c, 718, true, &w, 2 * S);
+	REQUIRE(mini_has(c, 718));
+	u_desktop_window out[U_DESKTOP_MINI_CACHE_MAX];
+	uint32_t n = u_desktop_mini_cache_get(&c, out, U_DESKTOP_MINI_CACHE_MAX);
+	for (uint32_t i = 0; i < n; i++) {
+		if (out[i].id == 718) {
+			CHECK((out[i].state & U_DESKTOP_WINDOW_MINIMIZED) != 0);
+			CHECK(std::string(out[i].title) == "notes");
+			CHECK(out[i].frame.w == 300);
+		}
+	}
+
+	// A snapshot that started BEFORE the minimize (t=1.5 s) does not list it: the pin stays.
+	u_desktop_mini_cache_publish(&c, &other, 1, 1500000000ull);
+	CHECK(mini_has(c, 718));
+	CHECK(mini_has(c, 5));
+	// A snapshot after it that still misses it (a slow app's stale AX table): pin still young.
+	u_desktop_mini_cache_publish(&c, &other, 1, 3 * S);
+	CHECK(mini_has(c, 718));
+	// A snapshot that confirms it retires the pin...
+	u_desktop_window both[2] = {other, mini_win(718, "notes")};
+	u_desktop_mini_cache_publish(&c, both, 2, 4 * S);
+	CHECK(c.pin_n == 0);
+	CHECK(mini_has(c, 718));
+
+	// RESTORE at t=5 s: gone at once, even under a snapshot that started earlier.
+	u_desktop_mini_cache_pin(&c, 718, false, nullptr, 5 * S);
+	CHECK_FALSE(mini_has(c, 718));
+	u_desktop_mini_cache_publish(&c, both, 2, 4500000000ull);
+	CHECK_FALSE(mini_has(c, 718));
+	CHECK(mini_has(c, 5));
+
+	// A pin the snapshots keep contradicting expires after the TTL: the OS wins
+	// (the user re-minimized it themselves).
+	u_desktop_mini_cache_publish(&c, both, 2, 5 * S + U_DESKTOP_MINI_CACHE_PIN_TTL_NS + 1);
+	CHECK(mini_has(c, 718));
+	CHECK(c.pin_n == 0);
+
+	// CLOSE of a minimized window removes it; a newer pin for the same id replaces the old one.
+	u_desktop_mini_cache_pin(&c, 718, true, &w, 20 * S);
+	u_desktop_mini_cache_pin(&c, 718, false, nullptr, 21 * S);
+	CHECK(c.pin_n == 1);
+	CHECK_FALSE(mini_has(c, 718));
+}
+
+TEST_CASE("polish11_mini: a full cache never overwrites an entry with a pin", "[desktop][polish][macos]")
+{
+	static u_desktop_mini_cache c;
+	memset(&c, 0, sizeof(c));
+	static u_desktop_window snap[U_DESKTOP_MINI_CACHE_MAX];
+	for (uint32_t i = 0; i < U_DESKTOP_MINI_CACHE_MAX; i++) {
+		snap[i] = mini_win(100 + i, "w");
+	}
+	u_desktop_mini_cache_publish(&c, snap, U_DESKTOP_MINI_CACHE_MAX, 1);
+	u_desktop_window w = mini_win(9999, "new");
+	u_desktop_mini_cache_pin(&c, 9999, true, &w, 2);
+	CHECK(c.n == U_DESKTOP_MINI_CACHE_MAX);
+	CHECK(mini_has(c, 100 + U_DESKTOP_MINI_CACHE_MAX - 1));
+	CHECK_FALSE(mini_has(c, 9999));
 }

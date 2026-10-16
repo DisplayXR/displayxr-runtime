@@ -23,6 +23,8 @@ add_library(
 	u_desktop_control.h
 	u_desktop_fake.c
 	u_desktop_fake.h
+	u_desktop_mini_cache.c
+	u_desktop_mini_cache.h
 	u_desktop_policy.c
 	u_desktop_policy.h
 	u_desktop_select.c
