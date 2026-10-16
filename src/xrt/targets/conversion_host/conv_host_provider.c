@@ -17,6 +17,7 @@
 #include "target_conversion_plugin_loader.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
+#include "util/u_camera_consent.h"
 #include "util/u_logging.h"
 
 #include <ctype.h>
@@ -123,6 +124,18 @@ host_get_adapter_hint(struct xrt_conv_adapter_hint *inout)
 	return true;
 }
 
+/*! ADR-057 §2: the user's per-provider off-box consent (the per-user consent
+ *  store; this host runs as the user). */
+static bool
+host_get_consent(uint32_t kind)
+{
+	char id[sizeof(g_cfg.provider_id)];
+	cfg_lock();
+	(void)snprintf(id, sizeof(id), "%s", g_cfg.provider_id);
+	cfg_unlock();
+	return kind == XRT_CONV_CONSENT_OFFBOX && u_offbox_consent_granted(id);
+}
+
 static void
 host_notify_changed(uint32_t cap_id)
 {
@@ -144,6 +157,7 @@ init_iface(void)
 	g_iface.get_setting = host_get_setting;
 	g_iface.get_adapter_hint = host_get_adapter_hint;
 	g_iface.notify_changed = host_notify_changed;
+	g_iface.get_consent = host_get_consent;
 	// ADR-053 P4 (#2108): the host performs downloads and verification itself,
 	// into the runtime-owned store, under the store's ACL as this (user) process.
 	g_iface.model_resolve = conv_store_host_model_resolve;
