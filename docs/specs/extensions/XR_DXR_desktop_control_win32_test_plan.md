@@ -39,10 +39,21 @@ second `info` must print `locked=1`. (A UAC prompt up during the call must also 
 %SMOKE% request
 ```
 A top-most "DisplayXR" message box: *"desktop_backend_smoke wants to control your
-computer. … bring-up test … To stop it, run: displayxr-cli desktop deny "<smoke exe path>"
-(or 'displayxr-cli desktop stop' to pause every app)"*, Yes/No. Yes → `access: granted`;
-No → `access: denied`. The terminal must keep running while the box is up (it is on its own
-thread). Also try it while another app is in front: the box must still be top-most.
+computer. … The app says: "bring-up test" … To stop it, run: displayxr-cli desktop deny
+"<smoke exe path>" (or 'displayxr-cli desktop stop' to pause every app)"*, Yes/No. Yes →
+`access: granted`; No → `access: denied`. The terminal must keep running while the box is
+up (it is on its own thread). Also try it while another app is in front: the box must
+still be top-most.
+
+- **No is the default, and the box ignores the first 500 ms.** Run `request` and press
+  Enter (or Space, or click Yes) *immediately*, while still holding the key from launching
+  the command: nothing happens. Wait a second, press Enter without touching the buttons:
+  `access: denied` (No had focus).
+- **Destroy with the prompt up.** Run `request` and leave the box alone. After 120 s the
+  smoke prints `access: no answer in 120 s` and calls `destroy()`: the box must close by
+  itself, the process must exit within ~1 s with no crash, no hang and no second line
+  printed afterwards. (destroy() answers UNKNOWN, joins the prompt thread, and done()
+  is never called after it returns.)
 
 ## 3. Window list
 
@@ -126,7 +137,8 @@ in Windows settings, switch Notepad to it (Win+Space), type `abc`, then:
 ```
 Expect: `key 1 z` undoes the typing (it must NOT close Notepad's tab, which is what a
 US-position Ctrl+W would do); `key 1 a` selects all; the last prints
-`result: unsupported — '[' needs AltGr on the active keyboard layout…`. `key 1 slash`
+`result: unsupported — this keyboard layout has no key for that character (it needs AltGr)`
+(no character in the message: privacy rule, u_desktop.h). `key 1 slash`
 (Shift+`:` on AZERTY) must send Ctrl+Shift+that key. Switch back to US and repeat `key 1 z`:
 undo again.
 
@@ -164,8 +176,42 @@ Start a second Notepad **as administrator** (`id` = `NPA`), keep the smoke non-e
   that particular call through — record which; nothing may claim `ok` without the effect).
 - Run the smoke elevated: all of the above succeed.
 
+## 10. Delivery guarantee (contract v2)
+
+The smoke's guard always allows; its target is the focused window (text, keys) or the
+window under the point (click, scroll), read when the command starts — unless pinned with
+`target ID` in a script. Pinning a window that is NOT focused makes the re-check fire
+deterministically. Use script mode (one process):
+
+```bat
+:: focus.txt — Notepad's id = NP, the terminal stays in front
+target NP
+type "should not appear anywhere"
+key 0 enter
+key 1 a
+```
+`%SMOKE% script < focus.txt` → each line prints `result: refused — focus moved away from
+the target window`; nothing is typed into the terminal, no Enter is pressed, and no
+modifier stays held (type in the terminal afterwards: plain lowercase letters).
+
+- **Focus stolen mid-type (manual race).** In PowerShell, with Notepad in front:
+  `$s = ('x' * 20000) + "`n" + 'END'; Start-Sleep 2; & $env:SMOKE type $s`, and during the
+  typing Alt+Tab to another window (e.g. a second Notepad). Expect
+  `result: refused — focus moved away from the target window (after N of 20002 characters)`,
+  the first Notepad ends with N `x` and NO newline, the second window receives at most one
+  32-character batch that was already in flight and never the Enter or `END`.
+- **Pointer re-check.** `target NP` then `click X Y` with (X, Y) over the terminal:
+  `refused — target no longer under the point`, no click. With (X, Y) on Notepad but the
+  smoke's `move` landing elsewhere is not reproducible by hand; covered by the 2 px rule in
+  code review.
+- **Cross-process popup is not the target's dialog.** With Notepad pinned, open a window
+  owned by Notepad from ANOTHER process (rare; e.g. a shell `IFileDialog` hosted out of
+  process) — if you can produce one, typing into it must be refused. Notepad's own Find
+  dialog (Ctrl+F, same process) must be accepted: `target NP`, open Find, `type "abc"` →
+  `ok`, text lands in the Find box.
+
 ## What to send back
 
 The full stdout of each step, the Windows build (`winver`), the per-monitor scale factors,
 and for any `timeout` / unexpected `refused`, the target app. Highest-value first:
-§6 activate under the foreground lock, §8 cross-DPI move, §9 UIPI, §5 timing, §7 AZERTY.
+§10 delivery re-checks, §2 destroy with the prompt up, §6 activate under the foreground lock, §8 cross-DPI move, §9 UIPI, §5 timing, §7 AZERTY.
