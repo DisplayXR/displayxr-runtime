@@ -32,6 +32,64 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef XRT_OS_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+
+/*
+ *
+ * One open handle on a component binary (ADR-054 N4b review).
+ *
+ * The provenance gate hashes, verifies and loads the SAME file: the binary is
+ * opened once, hashed and (Windows) Authenticode-verified through that handle,
+ * and the handle stays open until the load returns. On Windows the share mode
+ * (FILE_SHARE_READ only) refuses every writer, renamer and deleter meanwhile;
+ * on POSIX the path is re-checked against the hashed descriptor's identity
+ * before and after dlopen. Definitions live with the provenance code below.
+ *
+ */
+
+struct tc_bin
+{
+#ifdef XRT_OS_WINDOWS
+	HANDLE h;
+#else
+	int fd;
+#endif
+	bool open;
+	bool missing;      //!< the open failed because the file does not exist
+	uint32_t os_error; //!< GetLastError() / errno of a failed open
+	uint64_t dev;      //!< volume serial number / st_dev
+	uint64_t ino;      //!< file index / st_ino
+	uint64_t size;
+	uint64_t mtime; //!< FILETIME ticks / nanoseconds since the epoch
+};
+
+static bool
+tc_bin_open(const char *path, struct tc_bin *b);
+static void
+tc_bin_close(struct tc_bin *b);
+#ifndef XRT_OS_WINDOWS
+static bool
+tc_bin_path_is_bin(const char *path, const struct tc_bin *b);
+#endif
+static void
+tc_prov_evaluate(struct target_component_entry *e, struct tc_bin *b);
+static enum target_component_load_result
+tc_prov_gate(const struct target_component_class *cls,
+             struct target_component_entry *e,
+             struct tc_bin *b,
+             bool quiet,
+             char *reason,
+             size_t reason_cap);
+
 
 /*
  *
@@ -816,11 +874,12 @@ target_component_enumerate_registry(const struct target_component_class *cls,
  */
 
 static bool
-tc_prov_signed(const char *path, char *signer, size_t cap)
+tc_prov_signed(const char *path, const struct tc_bin *b, char *signer, size_t cap)
 {
-	// A valid chain with no leaf CN is signed "(unknown subject)", not
+	// Verified through the handle the caller hashed and will load from. A
+	// valid chain with no leaf CN is signed "(unknown subject)", not
 	// unverified (the consent store's helper needs a name; this gate does not).
-	return u_authenticode_file_signer(path, NULL, signer, cap);
+	return u_authenticode_file_signer(path, b->open ? (void *)b->h : NULL, signer, cap);
 }
 
 static bool
@@ -844,9 +903,10 @@ tc_prov_allowlisted(const char *sha256_hex)
 }
 
 static bool
-tc_prov_platform_trusted(const char *path)
+tc_prov_platform_trusted(const char *path, const struct tc_bin *b)
 {
 	(void)path; // No platform rule on Windows: a path is not a provenance.
+	(void)b;
 	return false;
 }
 
@@ -981,6 +1041,28 @@ tc_discover(const struct target_component_class *cls, struct target_component_en
 	return tc_enumerate_registry(cls, HKEY_LOCAL_MACHINE, cls->registry_root, label, out, max);
 }
 
+//! Is the file @p dll was mapped from the file @p b holds open (volume serial + file index)?
+static bool
+tc_module_is_bin(HMODULE dll, const struct tc_bin *b)
+{
+	wchar_t mpath[TARGET_COMPONENT_PATH_MAX];
+	DWORD n = GetModuleFileNameW(dll, mpath, (DWORD)(sizeof(mpath) / sizeof(mpath[0])));
+	if (n == 0 || n >= (DWORD)(sizeof(mpath) / sizeof(mpath[0]))) {
+		return false;
+	}
+	// Attributes only: not subject to the share mode the gate's handle holds.
+	HANDLE h = CreateFileW(mpath, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                       NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	BY_HANDLE_FILE_INFORMATION fi;
+	const bool ok = GetFileInformationByHandle(h, &fi) != 0;
+	CloseHandle(h);
+	return ok && (uint64_t)fi.dwVolumeSerialNumber == b->dev &&
+	       (((uint64_t)fi.nFileIndexHigh << 32) | fi.nFileIndexLow) == b->ino;
+}
+
 enum target_component_load_result
 target_component_load_binary_ex(const struct target_component_class *cls,
                                 struct target_component_entry *e,
@@ -1058,23 +1140,27 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		return TARGET_COMPONENT_LOAD_PATH_REFUSED;
 	}
 
-	// ADR-054 N4b: provenance. Audit mode says so and loads anyway; the
-	// enforcing gate refuses. The verdict stays on the entry for diagnostics.
-	(void)target_component_check_provenance(cls, e);
-	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
-		if (target_component_trust_enforced()) {
-			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (enforcing; Trust\\Enforce = 0 opts out, ADR-054 N4b).",
-			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
-			if (reason != NULL) {
-				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
-			}
-			return TARGET_COMPONENT_LOAD_UNTRUSTED;
+	// ADR-054 N4b: provenance, on ONE handle. The binary is opened here with
+	// FILE_SHARE_READ only, hashed and Authenticode-verified through that
+	// handle, and the handle is held until LoadLibraryExW has returned: while
+	// it is open nobody can open the file for writing, rename it or delete
+	// it, so the bytes LoadLibrary maps are the bytes the gate judged.
+	struct tc_bin bin;
+	if (!tc_bin_open(e->binary_path, &bin) && bin.missing) {
+		TC_LOG_LOAD(quiet, "%s:   %s: registered Binary '%s' does not exist — skipping (orphan registration).",
+		            tc_tag(cls), e->id, e->binary_path);
+		if (out_os_error != NULL) {
+			*out_os_error = bin.os_error;
 		}
-		TC_LOG_LOAD(quiet, "%s:   %s: provenance UNVERIFIED — %s (audit mode: loading anyway; ADR-054 N4b).",
-		            tc_tag(cls), e->id, e->provenance_reason);
-	} else {
-		U_LOG_I("%s:   %s: provenance %s%s%s", tc_tag(cls), e->id, target_component_provenance_str(e->provenance),
-		        e->signer[0] != '\0' ? " by " : "", e->signer);
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "registered Binary does not exist (orphan registration)");
+		}
+		return TARGET_COMPONENT_LOAD_BINARY_MISSING;
+	}
+	enum target_component_load_result gate = tc_prov_gate(cls, e, &bin, quiet, reason, reason_cap);
+	if (gate != TARGET_COMPONENT_LOAD_OK) {
+		tc_bin_close(&bin);
+		return gate;
 	}
 
 	// Components import DisplayXRClient.dll for the aux surface (#328), and
@@ -1088,8 +1174,24 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 	        e->binary_path);
 
 	HMODULE dll = LoadLibraryExW(wpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+	const DWORD load_gle = dll == NULL ? GetLastError() : 0; // before CloseHandle can touch it
+	if (dll != NULL && bin.open && !tc_module_is_bin(dll, &bin)) {
+		// The share mode makes this unreachable for the file itself; a
+		// renamed parent directory is what is left. Same answer either way.
+		U_LOG_E(
+		    "%s:   %s: REFUSING %s — the module LoadLibrary mapped is not the file that was verified "
+		    "(ADR-054 N4b).",
+		    tc_tag(cls), e->id, e->binary_path);
+		FreeLibrary(dll);
+		tc_bin_close(&bin);
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "untrusted: the binary changed between verification and load");
+		}
+		return TARGET_COMPONENT_LOAD_UNTRUSTED;
+	}
+	tc_bin_close(&bin);
 	if (dll == NULL) {
-		DWORD gle = GetLastError();
+		DWORD gle = load_gle;
 		// The binary exists (checked above), so ERROR_MOD_NOT_FOUND means a
 		// library IT imports is missing — typically the vendor platform the
 		// component should resolve lazily (ADR-045 rule 1).
@@ -1346,9 +1448,10 @@ tc_store_manifest_schema(const struct target_component_class *cls,
 #include <unistd.h>
 
 static bool
-tc_prov_signed(const char *path, char *signer, size_t cap)
+tc_prov_signed(const char *path, const struct tc_bin *b, char *signer, size_t cap)
 {
 	(void)path;
+	(void)b;
 	if (cap > 0) {
 		signer[0] = '\0';
 	}
@@ -1401,15 +1504,17 @@ tc_prov_allowlisted(const char *sha256_hex)
 }
 
 static bool
-tc_prov_platform_trusted(const char *path)
+tc_prov_platform_trusted(const char *path, const struct tc_bin *b)
 {
 #if defined(XRT_OS_ANDROID)
 	// Everything the runtime can dlopen here came out of a signed APK.
 	(void)path;
+	(void)b;
 	return true;
 #else
+	// The descriptor that was hashed and will be loaded, not the path again.
 	struct stat st;
-	if (path == NULL || stat(path, &st) != 0) {
+	if (path == NULL || !b->open || fstat(b->fd, &st) != 0) {
 		return false;
 	}
 	if (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
@@ -2152,23 +2257,37 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		return TARGET_COMPONENT_LOAD_FAILED;
 	}
 
-	// ADR-054 N4b: provenance. Audit mode says so and loads anyway; the
-	// enforcing gate refuses. The verdict stays on the entry for diagnostics.
-	(void)target_component_check_provenance(cls, e);
-	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
-		if (target_component_trust_enforced()) {
-			U_LOG_E("%s:   %s: REFUSING unverified binary %s — %s (enforcing; Trust\\Enforce = 0 opts out, ADR-054 N4b).",
-			        tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
-			if (reason != NULL) {
-				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
-			}
-			return TARGET_COMPONENT_LOAD_UNTRUSTED;
+	// ADR-054 N4b: provenance, on ONE descriptor. The binary is opened here,
+	// hashed through that descriptor, and its identity (st_dev, st_ino, size,
+	// mtime) pinned; the path is re-checked against it just before and just
+	// after dlopen. (dlopen("/proc/self/fd/N") would load the descriptor
+	// itself on Linux, but it makes the module's name /proc/self/fd/N, which
+	// breaks $ORIGIN and the dladdr() own-directory lookups plug-ins use to
+	// find their resources — sim_display's ONNX model, the Leia plug-in.)
+	struct tc_bin bin;
+	if (!tc_bin_open(e->binary_path, &bin) && bin.missing) {
+		TC_LOG_LOAD(quiet, "%s:   %s: registered binary '%s' does not exist — skipping (orphan registration).",
+		            tc_tag(cls), e->id, e->binary_path);
+		if (out_os_error != NULL) {
+			*out_os_error = bin.os_error;
 		}
-		TC_LOG_LOAD(quiet, "%s:   %s: provenance UNVERIFIED — %s (audit mode: loading anyway; ADR-054 N4b).",
-		            tc_tag(cls), e->id, e->provenance_reason);
-	} else {
-		U_LOG_I("%s:   %s: provenance %s%s%s", tc_tag(cls), e->id, target_component_provenance_str(e->provenance),
-		        e->signer[0] != '\0' ? " by " : "", e->signer);
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "registered binary does not exist (orphan registration)");
+		}
+		return TARGET_COMPONENT_LOAD_BINARY_MISSING;
+	}
+	enum target_component_load_result gate = tc_prov_gate(cls, e, &bin, quiet, reason, reason_cap);
+	if (gate == TARGET_COMPONENT_LOAD_OK && bin.open && !tc_bin_path_is_bin(e->binary_path, &bin)) {
+		U_LOG_E("%s:   %s: REFUSING %s — the path no longer names the file that was verified (ADR-054 N4b).",
+		        tc_tag(cls), e->id, e->binary_path);
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "untrusted: the binary changed between verification and load");
+		}
+		gate = TARGET_COMPONENT_LOAD_UNTRUSTED;
+	}
+	if (gate != TARGET_COMPONENT_LOAD_OK) {
+		tc_bin_close(&bin);
+		return gate;
 	}
 
 	TC_LOG_LOAD(quiet, "%s:   %s: loading %s binary %s", tc_tag(cls), e->id, cls->name != NULL ? cls->name : "plug-in",
@@ -2177,6 +2296,19 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 	/* RTLD_LOCAL keeps the component's symbols private; aux symbols resolve
 	 * via the runtime library already in the process. */
 	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
+	if (handle != NULL && bin.open && !tc_bin_path_is_bin(e->binary_path, &bin)) {
+		// Swapped while dlopen ran: its constructors have run, but nothing
+		// gets an entry point out of it.
+		U_LOG_E("%s:   %s: REFUSING %s — the file changed while it was being loaded (ADR-054 N4b).",
+		        tc_tag(cls), e->id, e->binary_path);
+		dlclose(handle);
+		tc_bin_close(&bin);
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "untrusted: the binary changed between verification and load");
+		}
+		return TARGET_COMPONENT_LOAD_UNTRUSTED;
+	}
+	tc_bin_close(&bin);
 	if (handle == NULL) {
 		const char *err = dlerror();
 		struct stat st;
@@ -2297,6 +2429,17 @@ target_component_provenance_classify(bool signed_ok,
 #undef TC_REASON
 }
 
+static void
+tc_hex_digest(const uint8_t digest[32], char *out_hex)
+{
+	static const char hexd[] = "0123456789abcdef";
+	for (int i = 0; i < 32; i++) {
+		out_hex[i * 2] = hexd[digest[i] >> 4];
+		out_hex[i * 2 + 1] = hexd[digest[i] & 0xF];
+	}
+	out_hex[64] = '\0';
+}
+
 bool
 target_component_sha256_file(const char *path, char *out_hex, size_t cap)
 {
@@ -2328,14 +2471,201 @@ target_component_sha256_file(const char *path, char *out_hex, size_t cap)
 	}
 	uint8_t digest[32];
 	u_sha256_final(&st, digest);
-	static const char hexd[] = "0123456789abcdef";
-	for (int i = 0; i < 32; i++) {
-		out_hex[i * 2] = hexd[digest[i] >> 4];
-		out_hex[i * 2 + 1] = hexd[digest[i] & 0xF];
-	}
-	out_hex[64] = '\0';
+	tc_hex_digest(digest, out_hex);
 	return true;
 }
+
+
+/*
+ *
+ * The open binary (struct tc_bin, declared at the top of the file).
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+
+static bool
+tc_bin_open(const char *path, struct tc_bin *b)
+{
+	memset(b, 0, sizeof(*b));
+	b->h = INVALID_HANDLE_VALUE;
+	wchar_t wpath[TARGET_COMPONENT_PATH_MAX];
+	if (path == NULL || !tc_u2w(path, wpath, (int)(sizeof(wpath) / sizeof(wpath[0])))) {
+		return false;
+	}
+	for (wchar_t *p = wpath; *p != L'\0'; p++) {
+		if (*p == L'/') {
+			*p = L'\\';
+		}
+	}
+	// FILE_SHARE_READ only: while this handle is open, nobody can open the
+	// file for writing, rename it or delete it (and the open fails if someone
+	// already holds it for writing — not a state to verify bytes in).
+	b->h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (b->h == INVALID_HANDLE_VALUE) {
+		const DWORD gle = GetLastError();
+		b->os_error = (uint32_t)gle;
+		b->missing = gle == ERROR_FILE_NOT_FOUND || gle == ERROR_PATH_NOT_FOUND;
+		return false;
+	}
+	BY_HANDLE_FILE_INFORMATION fi;
+	if (!GetFileInformationByHandle(b->h, &fi)) {
+		b->os_error = (uint32_t)GetLastError();
+		CloseHandle(b->h);
+		b->h = INVALID_HANDLE_VALUE;
+		return false;
+	}
+	b->dev = (uint64_t)fi.dwVolumeSerialNumber;
+	b->ino = ((uint64_t)fi.nFileIndexHigh << 32) | fi.nFileIndexLow;
+	b->size = ((uint64_t)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+	b->mtime = ((uint64_t)fi.ftLastWriteTime.dwHighDateTime << 32) | fi.ftLastWriteTime.dwLowDateTime;
+	b->open = true;
+	return true;
+}
+
+static void
+tc_bin_close(struct tc_bin *b)
+{
+	if (b->open && b->h != INVALID_HANDLE_VALUE) {
+		CloseHandle(b->h);
+	}
+	b->h = INVALID_HANDLE_VALUE;
+	b->open = false;
+}
+
+//! Read up to @p cap bytes at @p offset; returns the count, 0 at EOF, -1 on error.
+static int64_t
+tc_bin_read_at(struct tc_bin *b, uint64_t offset, void *buf, size_t cap)
+{
+	OVERLAPPED ov;
+	memset(&ov, 0, sizeof(ov));
+	ov.Offset = (DWORD)(offset & 0xFFFFFFFFu);
+	ov.OffsetHigh = (DWORD)(offset >> 32);
+	DWORD got = 0;
+	if (!ReadFile(b->h, buf, (DWORD)cap, &got, &ov)) {
+		return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+	}
+	return (int64_t)got;
+}
+
+#else /* POSIX */
+
+static uint64_t
+tc_stat_mtime_ns(const struct stat *st)
+{
+#if defined(__APPLE__)
+	return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st->st_mtimespec.tv_nsec;
+#else
+	return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+static bool
+tc_bin_open(const char *path, struct tc_bin *b)
+{
+	memset(b, 0, sizeof(*b));
+	b->fd = -1;
+	if (path == NULL) {
+		return false;
+	}
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		b->os_error = (uint32_t)errno;
+		b->missing = errno == ENOENT || errno == ENOTDIR;
+		return false;
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		b->os_error = (uint32_t)errno;
+		close(fd);
+		return false;
+	}
+	b->fd = fd;
+	b->dev = (uint64_t)st.st_dev;
+	b->ino = (uint64_t)st.st_ino;
+	b->size = (uint64_t)st.st_size;
+	b->mtime = tc_stat_mtime_ns(&st);
+	b->open = true;
+	return true;
+}
+
+static void
+tc_bin_close(struct tc_bin *b)
+{
+	if (b->open && b->fd >= 0) {
+		close(b->fd);
+	}
+	b->fd = -1;
+	b->open = false;
+}
+
+static int64_t
+tc_bin_read_at(struct tc_bin *b, uint64_t offset, void *buf, size_t cap)
+{
+	for (;;) {
+		ssize_t got = pread(b->fd, buf, cap, (off_t)offset);
+		if (got < 0 && errno == EINTR) {
+			continue;
+		}
+		return (int64_t)got;
+	}
+}
+
+/*!
+ * Does @p path still name the file @p b holds (same st_dev, st_ino, size,
+ * mtime)? The POSIX load path asks just before and just after dlopen.
+ */
+static bool
+tc_bin_path_is_bin(const char *path, const struct tc_bin *b)
+{
+	struct stat st;
+	if (path == NULL || stat(path, &st) != 0) {
+		return false;
+	}
+	return (uint64_t)st.st_dev == b->dev && (uint64_t)st.st_ino == b->ino && (uint64_t)st.st_size == b->size &&
+	       tc_stat_mtime_ns(&st) == b->mtime;
+}
+
+#endif /* platform */
+
+//! SHA-256 of everything @p b holds, read through the handle / descriptor.
+static bool
+tc_bin_sha256(struct tc_bin *b, char *out_hex, size_t cap)
+{
+	if (out_hex == NULL || cap < 65) {
+		return false;
+	}
+	out_hex[0] = '\0';
+	if (!b->open) {
+		return false;
+	}
+	struct u_sha256 st;
+	u_sha256_init(&st);
+	unsigned char buf[64 * 1024];
+	uint64_t off = 0;
+	for (;;) {
+		int64_t got = tc_bin_read_at(b, off, buf, sizeof(buf));
+		if (got < 0) {
+			return false;
+		}
+		if (got == 0) {
+			break;
+		}
+		u_sha256_update(&st, buf, (size_t)got);
+		off += (uint64_t)got;
+	}
+	uint8_t digest[32];
+	u_sha256_final(&st, digest);
+	tc_hex_digest(digest, out_hex);
+	return true;
+}
+
+
+/*
+ *
+ * The verdict.
+ *
+ */
 
 /*!
  * Per-process verdict cache keyed by path + size + mtime, so a class that
@@ -2357,47 +2687,13 @@ static struct tc_prov_cache_row
 } g_tc_prov_cache[TC_PROV_CACHE];
 static int g_tc_prov_cache_next = 0;
 
-static bool
-tc_prov_file_identity(const char *path, uint64_t *out_size, uint64_t *out_mtime)
+static void
+tc_prov_evaluate(struct target_component_entry *e, struct tc_bin *b)
 {
-#ifdef XRT_OS_WINDOWS
-	wchar_t wpath[TARGET_COMPONENT_PATH_MAX];
-	if (!tc_u2w(path, wpath, (int)(sizeof(wpath) / sizeof(wpath[0])))) {
-		return false;
-	}
-	WIN32_FILE_ATTRIBUTE_DATA fad;
-	if (!GetFileAttributesExW(wpath, GetFileExInfoStandard, &fad)) {
-		return false;
-	}
-	*out_size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-	*out_mtime = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
-	return true;
-#else
-	struct stat st;
-	if (stat(path, &st) != 0) {
-		return false;
-	}
-	*out_size = (uint64_t)st.st_size;
-	*out_mtime = (uint64_t)st.st_mtime;
-	return true;
-#endif
-}
-
-bool
-target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e)
-{
-	(void)cls;
-	if (e == NULL) {
-		return false;
-	}
 	e->provenance = TARGET_COMPONENT_PROVENANCE_UNKNOWN;
 	e->provenance_reason[0] = '\0';
 	e->signer[0] = '\0';
 	e->sha256[0] = '\0';
-
-	uint64_t size = 0;
-	uint64_t mtime = 0;
-	const bool have_identity = tc_prov_file_identity(e->binary_path, &size, &mtime);
 
 	// The dev override and elevation are per process, not per file, and
 	// cheap: they are re-read, so a cached file verdict still reflects them.
@@ -2405,10 +2701,11 @@ target_component_check_provenance(const struct target_component_class *cls, stru
 	const bool elevated = target_component_process_elevated();
 
 	struct tc_prov_cache_row *hit = NULL;
-	if (have_identity) {
+	if (b->open) {
 		for (int i = 0; i < TC_PROV_CACHE; i++) {
 			struct tc_prov_cache_row *r = &g_tc_prov_cache[i];
-			if (r->valid && r->size == size && r->mtime == mtime && strcmp(r->path, e->binary_path) == 0) {
+			if (r->valid && r->size == b->size && r->mtime == b->mtime &&
+			    strcmp(r->path, e->binary_path) == 0) {
 				hit = r;
 				break;
 			}
@@ -2427,23 +2724,24 @@ target_component_check_provenance(const struct target_component_class *cls, stru
 		allowlisted = hit->provenance == TARGET_COMPONENT_PROVENANCE_ALLOWLISTED;
 		platform_trusted = hit->provenance == TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
 	} else {
-		(void)target_component_sha256_file(e->binary_path, e->sha256, sizeof(e->sha256));
-		signed_ok = tc_prov_signed(e->binary_path, e->signer, sizeof(e->signer));
-		allowlisted = !signed_ok && tc_prov_allowlisted(e->sha256);
-		platform_trusted = !signed_ok && !allowlisted && tc_prov_platform_trusted(e->binary_path);
+		// Every file fact comes from the one open handle / descriptor.
+		const bool have_hash = tc_bin_sha256(b, e->sha256, sizeof(e->sha256));
+		signed_ok = have_hash && tc_prov_signed(e->binary_path, b, e->signer, sizeof(e->signer));
+		allowlisted = !signed_ok && have_hash && tc_prov_allowlisted(e->sha256);
+		platform_trusted = !signed_ok && !allowlisted && tc_prov_platform_trusted(e->binary_path, b);
 	}
 
 	e->provenance = target_component_provenance_classify(signed_ok, allowlisted, platform_trusted, dev_override,
 	                                                     elevated, e->sha256, e->provenance_reason,
 	                                                     sizeof(e->provenance_reason));
 
-	if (hit == NULL && have_identity) {
+	if (hit == NULL && b->open) {
 		struct tc_prov_cache_row *r = &g_tc_prov_cache[g_tc_prov_cache_next];
 		g_tc_prov_cache_next = (g_tc_prov_cache_next + 1) % TC_PROV_CACHE;
 		memset(r, 0, sizeof(*r));
 		tc_copy(r->path, sizeof(r->path), e->binary_path);
-		r->size = size;
-		r->mtime = mtime;
+		r->size = b->size;
+		r->mtime = b->mtime;
 		// Only the FILE facts are cached (signed / allowlisted / platform);
 		// a dev-override or unverified verdict is recomputed from them.
 		r->provenance = signed_ok ? TARGET_COMPONENT_PROVENANCE_SIGNED
@@ -2454,7 +2752,53 @@ target_component_check_provenance(const struct target_component_class *cls, stru
 		tc_copy(r->sha256, sizeof(r->sha256), e->sha256);
 		r->valid = true;
 	}
+}
+
+bool
+target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e)
+{
+	(void)cls;
+	if (e == NULL) {
+		return false;
+	}
+	// A lister's question: open, judge, close. Nothing is loaded, so there is
+	// no window to close; the load path holds its handle across the load.
+	struct tc_bin b;
+	(void)tc_bin_open(e->binary_path, &b);
+	tc_prov_evaluate(e, &b);
+	tc_bin_close(&b);
 	return e->provenance != TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
+}
+
+static enum target_component_load_result
+tc_prov_gate(const struct target_component_class *cls,
+             struct target_component_entry *e,
+             struct tc_bin *b,
+             bool quiet,
+             char *reason,
+             size_t reason_cap)
+{
+	// Audit mode says so and loads anyway; the enforcing gate refuses. The
+	// verdict stays on the entry for diagnostics.
+	tc_prov_evaluate(e, b);
+	if (e->provenance == TARGET_COMPONENT_PROVENANCE_UNVERIFIED) {
+		if (target_component_trust_enforced()) {
+			U_LOG_E(
+			    "%s:   %s: REFUSING unverified binary %s — %s (enforcing; Trust\\Enforce = 0 opts out, "
+			    "ADR-054 N4b).",
+			    tc_tag(cls), e->id, e->binary_path, e->provenance_reason);
+			if (reason != NULL && reason_cap > 0) {
+				snprintf(reason, reason_cap, "untrusted: %s", e->provenance_reason);
+			}
+			return TARGET_COMPONENT_LOAD_UNTRUSTED;
+		}
+		TC_LOG_LOAD(quiet, "%s:   %s: provenance UNVERIFIED — %s (audit mode: loading anyway; ADR-054 N4b).",
+		            tc_tag(cls), e->id, e->provenance_reason);
+	} else {
+		U_LOG_I("%s:   %s: provenance %s%s%s", tc_tag(cls), e->id,
+		        target_component_provenance_str(e->provenance), e->signer[0] != '\0' ? " by " : "", e->signer);
+	}
+	return TARGET_COMPONENT_LOAD_OK;
 }
 
 enum target_component_load_result
