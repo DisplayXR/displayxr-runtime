@@ -675,8 +675,8 @@ target_component_provenance_classify(bool signed_ok,
  * (`sha256`), look the digest up in the admin-only allowlist
  * (`HKLM\Software\DisplayXR\Trust\Allowlist` value names on Windows,
  * `/etc/displayxr/trust/allowlist` lines on POSIX), check the Authenticode
- * chain (Windows), the platform rule (Android: always; .deb: root-owned,
- * not group/world-writable, under /usr or /opt), the dev override and the
+ * chain (Windows), the platform rule (Android: always; .deb / .pkg:
+ * @ref target_component_platform_trusted_path), the dev override and the
  * host's elevation, then @ref target_component_provenance_classify. Every
  * fact is read through one open handle / descriptor on the file. The digest
  * is recomputed on every call; only the Authenticode result is cached for the
@@ -699,6 +699,30 @@ target_component_check_provenance(const struct target_component_class *cls, stru
  */
 bool
 target_component_path_is_absolute(const char *path, bool windows_rules);
+
+/*!
+ * POSIX: is @p resolved_path (absolute, symlinks already resolved) and every
+ * directory above it, up to and including @p stop_dir (NULL = "/"), owned by
+ * @p owner_uid and not group- or world-writable? The platform-trusted rule
+ * and the admin-only trust files use owner 0 and "/"; tests use their own uid
+ * and a temp root. @p why (may be NULL) names the first component that fails.
+ * Windows: always false.
+ */
+bool
+target_component_owner_chain_ok(
+    const char *resolved_path, uint32_t owner_uid, const char *stop_dir, char *why, size_t why_cap);
+
+/*!
+ * The POSIX platform-trusted rule for a path (ADR-054 N4b): `realpath()` it,
+ * require the RESOLVED path under `/usr/`, `/opt/` or
+ * `/Library/Application Support/DisplayXR/`, then
+ * @ref target_component_owner_chain_ok with owner root up to `/`. Android:
+ * always true (inside the signed APK). Windows: always false (a path is not a
+ * provenance). The load path additionally requires the resolved path to be
+ * the very file it hashed.
+ */
+bool
+target_component_platform_trusted_path(const char *path, char *why, size_t why_cap);
 
 //! Hex SHA-256 of a file's bytes into @p out_hex (65 chars). False when unreadable.
 bool
