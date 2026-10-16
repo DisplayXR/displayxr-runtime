@@ -420,9 +420,13 @@ gnome_is_locked(struct u_desktop_backend *b)
 	DBusMessage *reply = gdbus_call(g->obs, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
 	                                "org.gnome.ScreenSaver", "GetActive", OBS_TIMEOUT_MS, NULL, DBUS_TYPE_INVALID);
 	pthread_mutex_unlock(&g->obs_lock);
-	dbus_bool_t active = FALSE;
+	// Fail CLOSED: no answer (a timeout, the shell restarting) reads as locked, so
+	// no action proceeds on a guess.
+	dbus_bool_t active = TRUE;
 	if (reply != NULL) {
-		dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &active, DBUS_TYPE_INVALID);
+		if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &active, DBUS_TYPE_INVALID)) {
+			active = TRUE;
+		}
 		dbus_message_unref(reply);
 	}
 	return active;
@@ -652,6 +656,159 @@ gnome_move_verified(struct gnome_backend *g, int32_t x, int32_t y, char *msg)
 	return U_DESKTOP_ERR_TIMEOUT;
 }
 
+/*
+ * The delivery guarantee (u_desktop.h "Delivery guarantee"): the last checks,
+ * on the worker thread, right before each injection batch. guard->still_allowed
+ * is the common layer's and is only ever called from this (its own) thread.
+ */
+
+static bool
+guard_allows(const struct u_desktop_input_guard *guard, char *msg)
+{
+	if (guard != NULL && guard->still_allowed != NULL && !guard->still_allowed(guard->ctx)) {
+		gnome_set_msg(msg, "stopped: desktop control was suspended, revoked or the screen locked");
+		return false;
+	}
+	return true;
+}
+
+enum u_desktop_result
+gnome_guard_focus(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t target, char *msg)
+{
+	if (guard == NULL) {
+		return U_DESKTOP_OK; // our own cleanup (Escape after a gesture)
+	}
+	if (!guard_allows(guard, msg)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (target == 0) {
+		gnome_set_msg(msg, "no target window");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	struct u_desktop_window *ws;
+	uint32_t n;
+	enum u_desktop_result r = gnome_snapshot(g, &ws, &n, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	bool ok = false;
+	for (uint32_t i = 0; i < n; i++) {
+		if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
+			ok = ws[i].id == target || ws[i].parent_id == target;
+			break;
+		}
+	}
+	free(ws);
+	if (!ok) {
+		gnome_set_msg(msg, "focus moved — the target window no longer has keyboard focus");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+enum u_desktop_result
+gnome_guard_point(struct gnome_backend *g,
+                  const struct u_desktop_input_guard *guard,
+                  uint64_t target,
+                  int32_t x,
+                  int32_t y,
+                  char *msg)
+{
+	if (!guard_allows(guard, msg)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	int32_t px = 0, py = 0;
+	enum u_desktop_result r = gnome_get_pointer_msg(g, &px, &py, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (abs(px - x) > POINTER_TOLERANCE_PX || abs(py - y) > POINTER_TOLERANCE_PX) {
+		gnome_set_msg(msg, "the pointer moved off the verified point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	struct u_desktop_pick pk;
+	r = gnome_pick_msg(g, x, y, &pk, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (target == 0 || pk.kind != U_DESKTOP_PICK_WINDOW ||
+	    (pk.window.id != target && pk.window.parent_id != target)) {
+		gnome_set_msg(msg, "target no longer under the point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+enum u_desktop_result
+gnome_send_chord(struct gnome_backend *g,
+                 const struct u_desktop_input_guard *guard,
+                 uint64_t target,
+                 uint32_t mods,
+                 uint32_t code,
+                 uint32_t ch,
+                 char *msg)
+{
+	uint32_t rm = 0, rc = 0;
+	enum u_desktop_result r = gnome_portal_resolve_chord(g->portal, mods, code, ch, &rm, &rc, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	uint32_t mc[4];
+	uint32_t nm = gnome_chord_mod_codes(rm, mc);
+	bool down[4] = {true, true, true, true}, up[4] = {false, false, false, false};
+	uint32_t rev[4];
+	for (uint32_t i = 0; i < nm; i++) {
+		rev[i] = mc[nm - 1 - i];
+	}
+	// Before the first key-down.
+	r = gnome_guard_focus(g, guard, target, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (nm > 0) {
+		r = gnome_portal_keys(g->portal, mc, down, nm, msg);
+		if (r != U_DESKTOP_OK) {
+			char tmp[U_DESKTOP_MSG_SIZE];
+			gnome_portal_keys(g->portal, rev, up, nm, tmp);
+			return r;
+		}
+		if (rc == 0) {
+			return gnome_portal_keys(g->portal, rev, up, nm, msg);
+		}
+		// Before the key-down of the key itself: release the modifiers on a stop.
+		r = gnome_guard_focus(g, guard, target, msg);
+		if (r != U_DESKTOP_OK) {
+			char tmp[U_DESKTOP_MSG_SIZE];
+			gnome_portal_keys(g->portal, rev, up, nm, tmp);
+			return r;
+		}
+	}
+	uint32_t codes[2 + 4];
+	bool press[2 + 4];
+	uint32_t n = 0;
+	codes[n] = rc, press[n++] = true;
+	codes[n] = rc, press[n++] = false;
+	for (uint32_t i = 0; i < nm; i++) {
+		codes[n] = rev[i], press[n++] = false;
+	}
+	r = gnome_portal_keys(g->portal, codes, press, n, msg);
+	if (r != U_DESKTOP_OK && nm > 0) {
+		char tmp[U_DESKTOP_MSG_SIZE];
+		gnome_portal_keys(g->portal, rev, up, nm, tmp);
+	}
+	return r;
+}
+
+static enum u_desktop_result
+gnome_prepare_input(struct u_desktop_backend *b, char *msg)
+{
+	struct gnome_backend *g = gnome(b);
+	if (!gnome_can_input(g, msg)) {
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	return gnome_portal_prepare(g->portal, msg);
+}
+
 static enum u_desktop_result
 gnome_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 {
@@ -663,7 +820,13 @@ gnome_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 }
 
 static enum u_desktop_result
-gnome_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bool down, char *msg)
+gnome_pointer_button(struct u_desktop_backend *b,
+                     const struct u_desktop_input_guard *guard,
+                     enum u_desktop_button button,
+                     bool down,
+                     int32_t x,
+                     int32_t y,
+                     char *msg)
 {
 	struct gnome_backend *g = gnome(b);
 	if (!gnome_can_input(g, msg)) {
@@ -672,15 +835,34 @@ gnome_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, 
 	uint32_t code = button == U_DESKTOP_BUTTON_RIGHT    ? BTN_RIGHT
 	                : button == U_DESKTOP_BUTTON_MIDDLE ? BTN_MIDDLE
 	                                                    : BTN_LEFT;
+	if (down) {
+		// A press: the pointer is still on the verified point, the target is
+		// still what a click there meets, and the guard holds.
+		enum u_desktop_result r = gnome_guard_point(g, guard, guard ? guard->target_id : 0, x, y, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
+	// A release is never refused: a button must not stay down.
 	return gnome_portal_button(g->portal, code, down, msg);
 }
 
 static enum u_desktop_result
-gnome_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
+gnome_scroll(struct u_desktop_backend *b,
+             const struct u_desktop_input_guard *guard,
+             int32_t x,
+             int32_t y,
+             int32_t dx,
+             int32_t dy,
+             char *msg)
 {
 	struct gnome_backend *g = gnome(b);
 	if (!gnome_can_input(g, msg)) {
 		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	enum u_desktop_result r = gnome_guard_point(g, guard, guard ? guard->target_id : 0, x, y, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
 	}
 	return gnome_portal_scroll(g->portal, dx, dy, msg);
 }
@@ -761,7 +943,10 @@ char_key(const char *k)
 }
 
 static enum u_desktop_result
-gnome_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, char *msg)
+gnome_key_chord(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
+                const struct u_desktop_chord *chord,
+                char *msg)
 {
 	struct gnome_backend *g = gnome(b);
 	if (!gnome_can_input(g, msg)) {
@@ -774,11 +959,15 @@ gnome_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord
 			ch = char_key(chord->key);
 		}
 		if (code == 0 && ch == 0) {
-			gnome_set_msg(msg, "unknown key \"%s\"", chord->key);
+			gnome_set_msg(msg, "unknown key name"); // privacy: never echo the key
 			return U_DESKTOP_ERR_FAILED;
 		}
 	}
-	return gnome_portal_chord(g->portal, chord->mods, code, ch, msg);
+	if (guard == NULL) {
+		gnome_set_msg(msg, "no input guard");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	return gnome_send_chord(g, guard, guard->target_id, chord->mods, code, ch, msg);
 }
 
 //! A terminal pastes with Ctrl+Shift+V.
@@ -812,25 +1001,70 @@ is_terminal(const char *app_id)
 }
 
 static enum u_desktop_result
-gnome_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
+gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
 {
 	struct gnome_backend *g = gnome(b);
 	if (!gnome_can_input(g, msg)) {
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
-	bool terminal = false;
-	struct u_desktop_window *ws;
-	uint32_t n;
-	if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
-		for (uint32_t i = 0; i < n; i++) {
-			if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
-				terminal = is_terminal(ws[i].app_id);
-				break;
-			}
-		}
-		free(ws);
+	if (guard == NULL) {
+		gnome_set_msg(msg, "no input guard");
+		return U_DESKTOP_ERR_FAILED;
 	}
-	return gnome_portal_paste_text(g->portal, utf8, terminal, msg);
+	// Trailing newlines are sent as Enter key presses, each under its own check
+	// (a pasted "\n" is up to the app; a Return must reach the verified target).
+	size_t len = strlen(utf8);
+	uint32_t enters = 0;
+	while (len > 0 && utf8[len - 1] == '\n') {
+		len--;
+		enters++;
+		if (len > 0 && utf8[len - 1] == '\r') {
+			len--;
+		}
+	}
+	if (len > 0) {
+		char *body = strndup(utf8, len);
+		if (body == NULL) {
+			return U_DESKTOP_ERR_FAILED;
+		}
+		bool terminal = false;
+		struct u_desktop_window *ws;
+		uint32_t n;
+		if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
+			for (uint32_t i = 0; i < n; i++) {
+				if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
+					terminal = is_terminal(ws[i].app_id);
+					break;
+				}
+			}
+			free(ws);
+		}
+		// 1. Take the clipboard (slow: read the old text, offer ours, wait to own it).
+		enum u_desktop_result r = gnome_portal_clip_take(g->portal, body, msg);
+		memset(body, 0, len);
+		free(body);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		// 2. Right before the paste keystroke: the guard, and the focus.
+		r = gnome_guard_focus(g, guard, guard->target_id, msg);
+		if (r != U_DESKTOP_OK) {
+			gnome_portal_clip_restore(g->portal);
+			return r;
+		}
+		// 3. Paste (refused there if the clipboard changed hands meanwhile).
+		r = gnome_portal_clip_paste(g->portal, terminal, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
+	for (uint32_t i = 0; i < enters; i++) {
+		enum u_desktop_result r = gnome_send_chord(g, guard, guard->target_id, 0, KEY_ENTER, 0, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
+	return U_DESKTOP_OK;
 }
 
 
@@ -964,6 +1198,7 @@ u_desktop_backend_create_platform(void)
 	g->base.pick = gnome_pick;
 	g->base.focused_window = gnome_focused_window;
 	g->base.text_at = gnome_text_at;
+	g->base.prepare_input = gnome_prepare_input;
 	g->base.window_op = gnome_window_op;
 	g->base.type_text = gnome_type_text;
 	g->base.key_chord = gnome_key_chord;

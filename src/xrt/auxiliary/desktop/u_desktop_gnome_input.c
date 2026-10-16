@@ -97,8 +97,13 @@ gp_serve_transfer(struct gnome_portal *p, const char *mime, uint32_t serial)
 	if (reply != NULL) {
 		dbus_message_unref(reply);
 	}
-	if (ok) {
-		p->transfers++;
+	// Count only a write of the AGENT's text, after the paste keystroke, once per
+	// serial: a clipboard manager reading the new selection must not make an
+	// unanswered paste look delivered.
+	if (ok && p->paste_armed && p->clip_is_paste && (!p->paste_have_serial || serial != p->paste_last_serial)) {
+		p->paste_writes++;
+		p->paste_last_serial = serial;
+		p->paste_have_serial = true;
 	}
 }
 
@@ -120,7 +125,7 @@ gp_xkb_forget(struct gnome_portal *p)
 static enum u_desktop_result
 cmd_motion(struct gnome_portal *p, struct gp_cmd *c)
 {
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
+	enum u_desktop_result r = gp_ensure_session(p, c->restore, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
@@ -149,7 +154,7 @@ cmd_motion(struct gnome_portal *p, struct gp_cmd *c)
 static enum u_desktop_result
 cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 {
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
+	enum u_desktop_result r = gp_ensure_session(p, c->restore, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
@@ -168,7 +173,7 @@ cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 static enum u_desktop_result
 cmd_scroll(struct gnome_portal *p, struct gp_cmd *c)
 {
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
+	enum u_desktop_result r = gp_ensure_session(p, c->restore, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
@@ -304,84 +309,12 @@ us_code_for_char(uint32_t ch)
 	}
 }
 
-/*!
- * Press @p mods (u_desktop_mod bits) + one key, release in reverse. The key is
- * @p ch (a character, looked up on the session keymap's active layout) or, when
- * @p ch is 0, the fixed evdev @p code (named keys; 0 = modifiers only).
- */
-static enum u_desktop_result
-send_chord(struct gnome_portal *p, uint32_t mods, uint32_t code, uint32_t ch, char *msg)
-{
-	struct ei_device *kbd = gp_find_dev(p, EIX_CAP_KEYBOARD, false);
-	if (kbd == NULL) {
-		gp_set_msg(msg, "the remote-desktop session has no keyboard");
-		return U_DESKTOP_ERR_UNSUPPORTED;
-	}
-	if (ch != 0) {
-		bool shift = false;
-		if (xkb_ensure(p, kbd)) {
-			if (!xkb_find_char(p, ch, &code, &shift)) {
-				if (ch < 0x80) {
-					gp_set_msg(msg, "no key produces '%c' on the active keyboard layout", (char)ch);
-				} else {
-					gp_set_msg(msg, "no key produces U+%04X on the active keyboard layout", ch);
-				}
-				return U_DESKTOP_ERR_UNSUPPORTED;
-			}
-		} else {
-			code = us_code_for_char(ch);
-			if (code == 0) {
-				gp_set_msg(msg, "no key for character U+%04X", ch);
-				return U_DESKTOP_ERR_UNSUPPORTED;
-			}
-		}
-		if (shift) {
-			mods |= U_DESKTOP_MOD_SHIFT;
-		}
-	}
-	static const struct
-	{
-		uint32_t bit, code;
-	} modkeys[] = {
-	    {U_DESKTOP_MOD_CTRL, KEY_LEFTCTRL},
-	    {U_DESKTOP_MOD_SHIFT, KEY_LEFTSHIFT},
-	    {U_DESKTOP_MOD_ALT, KEY_LEFTALT},
-	    {U_DESKTOP_MOD_SUPER, KEY_LEFTMETA},
-	};
-	uint32_t codes[GNOME_PORTAL_MAX_KEYS];
-	bool press[GNOME_PORTAL_MAX_KEYS];
-	uint32_t n = 0;
-	for (size_t i = 0; i < 4; i++) {
-		if (mods & modkeys[i].bit) {
-			codes[n] = modkeys[i].code, press[n++] = true;
-		}
-	}
-	if (code != 0) {
-		codes[n] = code, press[n++] = true;
-		codes[n] = code, press[n++] = false;
-	}
-	for (size_t i = 4; i-- > 0;) {
-		if (mods & modkeys[i].bit) {
-			codes[n] = modkeys[i].code, press[n++] = false;
-		}
-	}
-	return send_keys(p, codes, press, n, msg);
-}
 
-static enum u_desktop_result
-cmd_chord(struct gnome_portal *p, struct gp_cmd *c)
-{
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
-	if (r != U_DESKTOP_OK) {
-		return r;
-	}
-	return send_chord(p, c->mods, c->code, c->ch, c->msg);
-}
 
 static enum u_desktop_result
 cmd_keys(struct gnome_portal *p, struct gp_cmd *c)
 {
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
+	enum u_desktop_result r = gp_ensure_session(p, c->restore, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
@@ -448,12 +381,109 @@ clipboard_read(struct gnome_portal *p)
 	return buf;
 }
 
+
+
+/*!
+ * Map a chord's key to an evdev code: @p ch (a character, looked up on the
+ * session keymap's active layout; Shift added when it sits on the Shift level)
+ * or, when @p ch is 0, the fixed evdev @p code. Messages never name the
+ * character (privacy: a chord can be part of what the agent types).
+ */
+static enum u_desktop_result
+resolve_chord(struct gnome_portal *p,
+              uint32_t mods,
+              uint32_t code,
+              uint32_t ch,
+              uint32_t *out_mods,
+              uint32_t *out_code,
+              char *msg)
+{
+	struct ei_device *kbd = gp_find_dev(p, EIX_CAP_KEYBOARD, false);
+	if (kbd == NULL) {
+		gp_set_msg(msg, "the remote-desktop session has no keyboard");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	if (ch != 0) {
+		bool shift = false;
+		if (xkb_ensure(p, kbd)) {
+			if (!xkb_find_char(p, ch, &code, &shift)) {
+				gp_set_msg(msg,
+				           "the active keyboard layout has no key for that character (without AltGr)");
+				return U_DESKTOP_ERR_UNSUPPORTED;
+			}
+		} else {
+			code = us_code_for_char(ch);
+			if (code == 0) {
+				gp_set_msg(msg, "no key for that character");
+				return U_DESKTOP_ERR_UNSUPPORTED;
+			}
+		}
+		if (shift) {
+			mods |= U_DESKTOP_MOD_SHIFT;
+		}
+	}
+	*out_mods = mods;
+	*out_code = code;
+	return U_DESKTOP_OK;
+}
+
+static const struct
+{
+	uint32_t bit, code;
+} k_modkeys[] = {
+    {U_DESKTOP_MOD_CTRL, KEY_LEFTCTRL},
+    {U_DESKTOP_MOD_SHIFT, KEY_LEFTSHIFT},
+    {U_DESKTOP_MOD_ALT, KEY_LEFTALT},
+    {U_DESKTOP_MOD_SUPER, KEY_LEFTMETA},
+};
+
+uint32_t
+gnome_chord_mod_codes(uint32_t mods, uint32_t *codes)
+{
+	uint32_t n = 0;
+	for (size_t i = 0; i < 4; i++) {
+		if (mods & k_modkeys[i].bit) {
+			codes[n++] = k_modkeys[i].code;
+		}
+	}
+	return n;
+}
+
+static enum u_desktop_result
+cmd_prepare(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, true, c->msg);
+	if (r == U_DESKTOP_OK) {
+		p->hold_until_ms = gdbus_now_ms() + GNOME_PREPARE_HOLD_MS;
+	}
+	return r;
+}
+
+static enum u_desktop_result
+cmd_resolve(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	return resolve_chord(p, c->mods, c->code, c->ch, &c->out_mods, &c->out_code, c->msg);
+}
+
+/*!
+ * Offer @p text as the clipboard. True only once the PORTAL said this session
+ * owns the selection: otherwise a paste would insert whatever the previous owner
+ * holds (possibly a copied password) into the target.
+ */
 static bool
-clipboard_offer(struct gnome_portal *p, const char *text)
+clipboard_offer(struct gnome_portal *p, const char *text, bool is_paste)
 {
 	free(p->clip_text);
 	p->clip_text = strdup(text);
+	p->clip_is_paste = is_paste && p->clip_text != NULL;
 	p->clip_owner = false;
+	if (p->clip_text == NULL) {
+		return false;
+	}
 	static const char *const mimes[] = {"text/plain;charset=utf-8", "text/plain"};
 	struct pmsg pm;
 	gp_pmsg_begin(&pm, CLIP_IFACE, "SetSelection", p->session, NULL);
@@ -461,22 +491,39 @@ clipboard_offer(struct gnome_portal *p, const char *text)
 	struct gdbus_err err;
 	DBusMessage *reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
 	if (reply == NULL) {
-		U_LOG_W("desktop/gnome: Clipboard.SetSelection failed: %s %s", err.name, err.message);
+		U_LOG_W("desktop/gnome: Clipboard.SetSelection failed: %s", err.name);
 		return false;
 	}
 	dbus_message_unref(reply);
 	// Wait (briefly) until mutter made us the owner, so the paste asks us.
 	uint64_t deadline = gdbus_now_ms() + 500;
-	while (!p->clip_owner && gdbus_now_ms() < deadline && p->session_open) {
+	while (!p->clip_owner && gdbus_now_ms() < deadline && p->session_open && !gp_quitting(p)) {
 		gp_pump(p, 10);
 	}
-	return p->session_open;
+	return p->session_open && p->clip_owner;
+}
+
+//! Offer the clipboard text from before the paste again (best effort).
+static void
+clipboard_restore(struct gnome_portal *p)
+{
+	if (p->session_open && p->clip_prev != NULL) {
+		char *prev = p->clip_prev;
+		p->clip_prev = NULL;
+		clipboard_offer(p, prev, false);
+		free(prev);
+	} else if (p->clip_is_paste) {
+		// Nothing to restore: stop serving the agent's text at least.
+		free(p->clip_text);
+		p->clip_text = NULL;
+		p->clip_is_paste = false;
+	}
 }
 
 static enum u_desktop_result
-cmd_paste(struct gnome_portal *p, struct gp_cmd *c)
+cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 {
-	enum u_desktop_result r = gp_ensure_session(p, c->msg);
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
@@ -486,55 +533,96 @@ cmd_paste(struct gnome_portal *p, struct gp_cmd *c)
 		           "is never typed as key codes");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
-	// The previous text: our own if we still own the selection (reading from
-	// ourselves would deadlock this thread), else whatever the owner gives.
-	char *prev = NULL;
-	if (p->clip_owner && p->clip_text != NULL) {
-		prev = strdup(p->clip_text);
-	} else {
-		prev = clipboard_read(p);
+	// The previous text: if we still own the selection, what we were serving
+	// (reading from ourselves would deadlock this thread), else the owner's.
+	free(p->clip_prev);
+	p->clip_prev = NULL;
+	if (p->clip_owner && p->clip_text != NULL && !p->clip_is_paste) {
+		p->clip_prev = strdup(p->clip_text);
+	} else if (!p->clip_owner) {
+		p->clip_prev = clipboard_read(p);
 	}
-
-	if (!clipboard_offer(p, c->text)) {
-		free(prev);
-		gp_set_msg(c->msg, "could not put the text on the clipboard");
+	if (!clipboard_offer(p, c->text, true)) {
+		clipboard_restore(p);
+		gp_set_msg(c->msg, "the portal did not make this session the clipboard owner — not pasting");
 		return U_DESKTOP_ERR_FAILED;
 	}
+	return U_DESKTOP_OK;
+}
 
-	// Ctrl+V matched by keysym: the key producing 'v' on the active layout.
-	uint32_t before = p->transfers;
-	r = send_chord(p, U_DESKTOP_MOD_CTRL | (c->terminal ? U_DESKTOP_MOD_SHIFT : 0), 0, 'v', c->msg);
+static enum u_desktop_result
+cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
 	if (r != U_DESKTOP_OK) {
-		free(prev);
+		return r;
+	}
+	if (!p->clip_owner || !p->clip_is_paste) {
+		// Someone copied in between: Ctrl+V would paste THEIR content.
+		clipboard_restore(p);
+		gp_set_msg(c->msg, "lost the clipboard before the paste — not pasting");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	uint32_t mods = 0, code = 0;
+	r = resolve_chord(p, U_DESKTOP_MOD_CTRL | (c->terminal ? U_DESKTOP_MOD_SHIFT : 0), 0, 'v', &mods, &code,
+	                  c->msg);
+	if (r != U_DESKTOP_OK) {
+		clipboard_restore(p);
+		return r;
+	}
+	uint32_t codes[GNOME_PORTAL_MAX_KEYS];
+	bool press[GNOME_PORTAL_MAX_KEYS];
+	uint32_t mc[4];
+	uint32_t nm = gnome_chord_mod_codes(mods, mc), n = 0;
+	for (uint32_t i = 0; i < nm; i++) {
+		codes[n] = mc[i], press[n++] = true;
+	}
+	codes[n] = code, press[n++] = true;
+	codes[n] = code, press[n++] = false;
+	for (uint32_t i = nm; i-- > 0;) {
+		codes[n] = mc[i], press[n++] = false;
+	}
+	p->paste_armed = true;
+	p->paste_writes = 0;
+	p->paste_have_serial = false;
+	r = send_keys(p, codes, press, n, c->msg);
+	if (r != U_DESKTOP_OK) {
+		p->paste_armed = false;
+		clipboard_restore(p);
 		return r;
 	}
 
-	// Serve the paste: at least one transfer, then a short quiet period (a
+	// Serve the paste: one write of our text, then a short quiet period (a
 	// client may ask for several mime types).
 	uint64_t deadline = gdbus_now_ms() + 2000;
 	uint64_t quiet_until = 0;
-	uint32_t seen = before;
-	while (gdbus_now_ms() < deadline && p->session_open) {
+	uint32_t seen = 0;
+	while (gdbus_now_ms() < deadline && p->session_open && !gp_quitting(p)) {
 		gp_pump(p, 10);
-		if (p->transfers != seen) {
-			seen = p->transfers;
+		if (p->paste_writes != seen) {
+			seen = p->paste_writes;
 			quiet_until = gdbus_now_ms() + 150;
 		}
 		if (quiet_until != 0 && gdbus_now_ms() >= quiet_until) {
 			break;
 		}
 	}
+	p->paste_armed = false;
 	p->last_use_ms = gdbus_now_ms();
-	bool served = p->transfers != before;
-
-	if (prev != NULL && p->session_open) {
-		clipboard_offer(p, prev);
-	}
-	free(prev);
+	bool served = p->paste_writes > 0;
+	clipboard_restore(p);
 	if (!served) {
 		gp_set_msg(c->msg, "the focused window did not ask for the pasted text (does it accept text?)");
 		return U_DESKTOP_ERR_FAILED;
 	}
+	return U_DESKTOP_OK;
+}
+
+static enum u_desktop_result
+cmd_clip_restore(struct gnome_portal *p, struct gp_cmd *c)
+{
+	(void)c;
+	clipboard_restore(p);
 	return U_DESKTOP_OK;
 }
 
@@ -547,6 +635,7 @@ gnome_portal_motion(struct gnome_portal *p, int32_t x, int32_t y, char *msg)
 	}
 	c->x = x;
 	c->y = y;
+	c->restore = true;
 	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
 }
 
@@ -592,30 +681,72 @@ gnome_portal_keys(struct gnome_portal *p, const uint32_t *codes, const bool *pre
 }
 
 enum u_desktop_result
-gnome_portal_chord(struct gnome_portal *p, uint32_t mods, uint32_t evdev_code, uint32_t ch, char *msg)
+gnome_portal_prepare(struct gnome_portal *p, char *msg)
 {
-	struct gp_cmd *c = gp_cmd_new(cmd_chord);
+	struct gp_cmd *c = gp_cmd_new(cmd_prepare);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+enum u_desktop_result
+gnome_portal_resolve_chord(struct gnome_portal *p,
+                           uint32_t mods,
+                           uint32_t evdev_code,
+                           uint32_t ch,
+                           uint32_t *out_mods,
+                           uint32_t *out_code,
+                           char *msg)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_resolve);
 	if (c == NULL) {
 		return U_DESKTOP_ERR_FAILED;
 	}
 	c->mods = mods;
 	c->code = evdev_code;
 	c->ch = ch;
-	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+	// gp_run_sync frees c: copy the outputs through the message-free path below.
+	struct gp_cmd copy;
+	enum u_desktop_result r = gp_run_sync_keep(p, c, ACTION_TIMEOUT_MS, msg, &copy);
+	if (r == U_DESKTOP_OK) {
+		*out_mods = copy.out_mods;
+		*out_code = copy.out_code;
+	}
+	return r;
 }
 
 enum u_desktop_result
-gnome_portal_paste_text(struct gnome_portal *p, const char *utf8, bool terminal, char *msg)
+gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg)
 {
-	struct gp_cmd *c = gp_cmd_new(cmd_paste);
+	struct gp_cmd *c = gp_cmd_new(cmd_clip_take);
 	if (c == NULL) {
 		return U_DESKTOP_ERR_FAILED;
 	}
 	c->text = strdup(utf8);
-	c->terminal = terminal;
 	if (c->text == NULL) {
 		gp_cmd_free(c);
 		return U_DESKTOP_ERR_FAILED;
 	}
-	return gp_run_sync(p, c, ACTION_TIMEOUT_MS + 3000, msg);
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+enum u_desktop_result
+gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, char *msg)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_clip_paste);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	c->terminal = terminal;
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+void
+gnome_portal_clip_restore(struct gnome_portal *p)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_clip_restore);
+	if (c != NULL) {
+		gp_run_sync(p, c, ACTION_TIMEOUT_MS, NULL);
+	}
 }

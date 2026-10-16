@@ -191,6 +191,13 @@ audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `re
 | lock | `OpenInputDesktop` fails / WTS session locked | `CGSessionCopyCurrentDictionary` `CGSSessionScreenIsLocked` | `org.gnome.ScreenSaver.GetActive` |
 | idle | `GetLastInputInfo` | `CGEventSourceSecondsSinceLastEventType` | `org.gnome.Mutter.IdleMonitor.GetIdletime` |
 
+GNOME notes: text reaches the target through the clipboard (the portal has no "commit this
+string" path that survives an IME), so on GNOME **the agent's typed text passes through the
+clipboard, where clipboard managers and clipboard history can see and keep it**; the previous
+clipboard text is offered again afterwards, best effort, while the portal session lives. The
+paste is sent only after the portal confirms the session owns the selection, and an action
+counts as delivered only when the target read the agent's text after the paste keystroke.
+
 ## 8. Not in v1
 
 Window capture (screenshots), a DisplayXR-drawn in-use indicator on Windows / macOS and a

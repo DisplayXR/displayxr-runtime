@@ -154,22 +154,50 @@ enum u_desktop_result
 gnome_portal_keys(struct gnome_portal *p, const uint32_t *codes, const bool *press, uint32_t n, char *msg);
 
 /*!
- * Press @p mods (enum u_desktop_mod bits) plus one key, release in reverse.
- * @p ch != 0: the key producing that character on the session keymap's ACTIVE
- * layout (libei's keymap through xkbcommon; Shift added when the character is on
- * the Shift level; UNSUPPORTED when no key produces it without AltGr). @p ch == 0:
- * the fixed evdev @p evdev_code (named keys), 0 = modifiers only.
+ * Open or silently restore the session (the only slow step), before the common
+ * layer verifies the target; keeps it open for the verification + idle wait.
  */
 enum u_desktop_result
-gnome_portal_chord(struct gnome_portal *p, uint32_t mods, uint32_t evdev_code, uint32_t ch, char *msg);
+gnome_portal_prepare(struct gnome_portal *p, char *msg);
 
 /*!
- * Put @p utf8 on the clipboard through the portal session, paste it with
- * Ctrl+V (Ctrl+Shift+V when @p terminal), serve the paste, then offer the
- * previous clipboard text again (best effort — see the file's header).
+ * Resolve a chord's key without pressing anything: @p ch != 0 is a character
+ * looked up on the session keymap's ACTIVE layout (xkbcommon over libei's keymap;
+ * Shift is added to @p out_mods when it is on the Shift level; UNSUPPORTED when no
+ * key produces it without AltGr); @p ch == 0 keeps the fixed evdev @p evdev_code.
  */
 enum u_desktop_result
-gnome_portal_paste_text(struct gnome_portal *p, const char *utf8, bool terminal, char *msg);
+gnome_portal_resolve_chord(struct gnome_portal *p,
+                           uint32_t mods,
+                           uint32_t evdev_code,
+                           uint32_t ch,
+                           uint32_t *out_mods,
+                           uint32_t *out_code,
+                           char *msg);
+
+//! The keycodes of @p mods (enum u_desktop_mod), in press order. Returns how many (<= 4).
+uint32_t
+gnome_chord_mod_codes(uint32_t mods, uint32_t *codes);
+
+/*!
+ * Text, step 1: remember the current clipboard text, offer @p utf8 instead. OK
+ * only once the portal confirmed this session OWNS the selection.
+ */
+enum u_desktop_result
+gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg);
+
+/*!
+ * Text, step 2 (after the caller re-checked the guard): if we still own the
+ * selection, press Ctrl+V (Ctrl+Shift+V when @p terminal), serve the paste
+ * (only writes of our text after the keystroke count), then offer the previous
+ * text again. REFUSED when the clipboard was lost in between.
+ */
+enum u_desktop_result
+gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, char *msg);
+
+//! Text, abort: offer the previous clipboard text again (best effort).
+void
+gnome_portal_clip_restore(struct gnome_portal *p);
 
 /*
  * AT-SPI (u_desktop_gnome_atspi.c)
@@ -261,9 +289,43 @@ gnome_move_verified(struct gnome_backend *g, int32_t x, int32_t y, char *msg);
 bool
 gnome_can_input(struct gnome_backend *g, char *msg);
 
+/*!
+ * Delivery guarantee, keyboard: guard->still_allowed, and the focused window is
+ * @p target or a window whose parent is it. @p guard NULL = no check (cleanup).
+ */
+enum u_desktop_result
+gnome_guard_focus(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t target, char *msg);
+
+/*!
+ * Delivery guarantee, pointer: guard->still_allowed, the pointer is within 2 px of
+ * (@p x, @p y), and the pick there is @p target or its dialog.
+ */
+enum u_desktop_result
+gnome_guard_point(struct gnome_backend *g,
+                  const struct u_desktop_input_guard *guard,
+                  uint64_t target,
+                  int32_t x,
+                  int32_t y,
+                  char *msg);
+
+/*!
+ * A chord under the guard: resolve (nothing pressed), check focus, press the
+ * modifiers, check again, press + release the key, release the modifiers (also
+ * on any stop). @p ch: a character on the active layout, else evdev @p code.
+ */
+enum u_desktop_result
+gnome_send_chord(struct gnome_backend *g,
+                 const struct u_desktop_input_guard *guard,
+                 uint64_t target,
+                 uint32_t mods,
+                 uint32_t code,
+                 uint32_t ch,
+                 char *msg);
+
 //! u_desktop_gnome_windows.c — the vtable's window_op.
 enum u_desktop_result
 gnome_window_op(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
                 enum u_desktop_window_op op,
                 uint64_t window_id,
                 const struct u_desktop_rect *rect,
