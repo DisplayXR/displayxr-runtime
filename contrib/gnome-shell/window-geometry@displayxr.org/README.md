@@ -324,8 +324,9 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   same for any stage point; a point on no monitor is `outside`. Read-only, like
   `GetWindows`; while the screen is locked both answer only
   `{"version": 1, "locked": true}`. Every window entry gains `id` (mutter's window
-  id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double) and, for
-  a transient window such as a popup menu, `parent_id`. See the spec, §12.
+  id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double),
+  `maximized` and `fullscreen`, and, for a transient window such as a popup menu,
+  `parent_id`. See the spec, §12.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then
