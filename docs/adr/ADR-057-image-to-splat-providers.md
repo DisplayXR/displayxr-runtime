@@ -49,7 +49,7 @@ uses a remote endpoint, with the licence shown.
     `ml-site.cdn-apple.com`. The official Hugging Face repo `apple/Sharp` holds the same file,
     same size. Licence: Apple ML Research Model Licence (`apple-amlr`), research only, and it
     follows derivatives.
-  - **Runtime:** PyTorch CUDA on a cloud GPU (RunPod primary, Modal L4 fallback), about 8.5 s
+  - **Runtime:** PyTorch CUDA on a cloud GPU (two hosts, one fallback), about 8.5 s
     per image warm, 40–60 s cold. Output is always 2 layers × 768² = 1,179,648 Gaussians, a
     roughly 10 MB `.sog`.
   - **Stereo:** the winning arm is full FoundationStereo plus `local_align`. `local_align` is
@@ -74,14 +74,14 @@ uses a remote endpoint, with the licence shown.
   WebGPU, a Qualcomm QNN build, and an MLX fp16 build. They show that an ONNX export is
   feasible. Their quality is unmeasured, their provenance is unverified, several mislabel the
   licence, and all of them remain derivatives under `apple-amlr`. One of them,
-  `sm079/sharp-onnx-webgpu` (int8, 658 MB, fetched at page load), has been seen running in a
-  browser tab on WebGPU at about 3.6 s warm. Only a screenshot shows it; the browser, GPU,
-  memory and any CPU fallback are unknown. It is raw mono Sharp: no stereo arm, no metric
-  scale, no camera block.
-- **Leia's own distilled model.** The private `LeiaInc/Leia_ml_sharp` repo exports a distilled
-  student (`best_v2` + Depth Anything V2) to `sharp_bestv2_dav2.onnx`. Its weights live only on
-  a RunPod volume, it has never run in a browser, and its licence depends on how it was
-  trained from Sharp. That is undetermined.
+  `sm079/sharp-onnx-webgpu` (int8, 0.66 GB), runs in a browser tab in a public personal
+  experiment page (ONNX Runtime Web 1.30 on WebGPU, about 3.6 s warm in one observation).
+  That page runs Sharp on the left eye, gets metric scale from its own CPU stereo matcher
+  (census + SGM) by a median depth ratio, and writes a `.sog` with a camera block. It has no
+  FoundationStereo and no `local_align`, gives no checkpoint hash, and has no quality
+  measurement against PyTorch. It shows the in-page path is feasible, not that it is good.
+- **Distilled alternatives.** A smaller distilled model trained against Sharp is being
+  evaluated internally. Its licence depends on how it was trained, and that is undetermined.
 
 ## Decision
 
@@ -253,9 +253,8 @@ build X" signal a downstream copy uses to re-pull.
 
 ## Open questions
 
-- **Leia's distilled student** (`sharp_bestv2_dav2`): is it a derivative under `apple-amlr`,
-  how good is it against Apple's checkpoint, and could it become the commercial or local
-  model? It is smaller and already exported to ONNX.
+- **A distilled model**: is it a derivative under `apple-amlr`, how good is it against Apple's
+  checkpoint, and could it become the commercial or local model?
 - **Int8 quality.** No one has measured an int8 Sharp against the PyTorch checkpoint. The
   export spike (S4) must, on the gallery corpus, before any quantized pack ships.
 
