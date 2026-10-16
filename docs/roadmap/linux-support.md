@@ -435,7 +435,11 @@ per-window Kooima (`ipc_try_get_oop_view_poses`, now built on Linux too);
   correct, fd counts flat), and a `--no-release-wait` negative control reads
   stale frames (the fence is doing work). This is the path Chromium's (GL)
   GPU process needs; stage A only serves a Vulkan client on the service's own
-  GPU. Still to prove: a real GL producer and a real panel.
+  GPU. Still to prove: a real GL producer and a real panel. The fences are
+  switchable: `DXR_LINUX_WEAVE_SYNC_FD` (unset = on, except **off on NVIDIA**,
+  where the EGL-fence <-> Vulkan SYNC_FD hand-off is suspected of a ~2 fps
+  inline-3D path; `1` / `0` force) — off, stage B CPU-polls the acquire fence
+  and completes synchronously, as on a device without SYNC_FD.
 - **Windowed present-owner (headless-verified; first panel run pending):**
   `test_apps/weave/weave_present_vk_linux` is the browser's GPU process in
   miniature and the vehicle for the first woven frame on a panel through the
