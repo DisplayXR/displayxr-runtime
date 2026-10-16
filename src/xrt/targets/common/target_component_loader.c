@@ -2527,6 +2527,12 @@ target_component_unload(void *module)
 
 #endif /* platform */
 
+bool
+target_component_policy_lock(const struct target_component_class *cls)
+{
+	return tc_store_lock(cls);
+}
+
 
 /*
  *

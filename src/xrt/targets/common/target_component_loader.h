@@ -358,6 +358,17 @@ target_component_apply_user_overlay(const struct target_component_class *cls,
                                     struct target_component_entry *entries,
                                     size_t n);
 
+/*!
+ * Is the class's machine policy lock set — HKLM `<registry_root>\Policy\Lock`
+ * = 1 (Windows, 64-bit view)? When it is, every per-user value of the class
+ * (`Enabled`, `Settings\*`) is ignored and the machine's wins. Always false
+ * on POSIX and Android (no kiosk policy store there). What `dp|input list
+ * --json` report as `policy.policy_lock`, so a front end can say why a
+ * per-user write has no effect.
+ */
+bool
+target_component_policy_lock(const struct target_component_class *cls);
+
 #if !defined(_WIN32) && !defined(__ANDROID__)
 /*!
  * The per-user manifest dir — the writable root for per-user overrides
