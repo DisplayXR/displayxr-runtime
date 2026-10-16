@@ -884,6 +884,24 @@ struct comp_vk_native_compositor
 	//! / already logged, so the per-window rect feed and its Kooima line stay
 	//! lifecycle events rather than per-frame noise (#1037).
 	uint64_t android_rect_generation_fed;
+	/*!
+	 * The last published rect whose extent matched the weave target, and the
+	 * bounded hold that feeds it while a newer rect is ahead of (or behind) the
+	 * swapchain. See @ref vk_android_rect_for_weave.
+	 */
+	struct
+	{
+		bool valid;
+		int32_t x, y, display_id;
+		uint32_t w, h, disp_w, disp_h;
+		//! Generation of the rect currently being held back (0 = no hold).
+		uint64_t hold_generation;
+		uint64_t hold_since_ns;
+		//! A hold expired without the target ever matching: gate off until a
+		//! coherent pair is seen again, so a structural mismatch never stalls.
+		bool bypass;
+		uint32_t corrections;
+	} android_rect_coherent;
 	//! #1367: last rect generation the view-dims log line reported.
 	uint64_t android_rect_generation_viewed;
 	uint64_t android_rect_generation_logged;
@@ -15648,6 +15666,115 @@ vk_wl_move_fill_due(const struct comp_vk_native_compositor *c, uint64_t period_n
 }
 #endif
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * Pick the window rect the weave is fed THIS frame: the published one when its
+ * extent matches the target being woven, else the last one that did.
+ *
+ * The rect and the target reach this point down two different paths: MonadoView
+ * publishes the rect from its UI thread the moment surfaceChanged reports the
+ * new size, while the swapchain is only recreated at the next acquire that sees
+ * the surface's currentExtent move — and on a resume the surface can move FIRST
+ * (the WSI reports the new extent a frame before Java's surfaceChanged). Resuming
+ * a phone under the lock-screen status bar toggles the window 0,0 1080x2400 <->
+ * 0,99 1080x2301 two or three times in two seconds, and on every toggle the DP
+ * got a few frames of the NEW origin over the OLD-size target (or the reverse).
+ * The Leia DP anchors the lenticular phase on (rect origin, target height) —
+ * CNSDK turns it into a bottom origin of panel_h - target_h - y — so a 99-row
+ * disagreement is a visibly wrong weave on those frames.
+ *
+ * The rule: origin and extent are a MATCHED PAIR. While the newest rect's
+ * extent disagrees with the target, keep feeding the last rect that agreed —
+ * that is the geometry the buffers still being presented were laid out for —
+ * and switch the moment the target catches up.
+ *
+ * BOUNDED (@p hold_ns). A configuration in which the rect extent legitimately
+ * never equals the target would otherwise freeze the origin forever; if the
+ * hold expires the published rect is fed as before and the gate stays off until
+ * a coherent pair is seen again. Transposed extents count as matching: under
+ * Android pre-rotation the landscape target is panel-native portrait while the
+ * rect is in the current orientation (comp_vk_native_target.cpp, LOXR-730).
+ * No target (the shared-texture branch) means nothing to pair with: pass-through.
+ */
+static void
+vk_android_rect_for_weave(struct comp_vk_native_compositor *c,
+                          uint64_t generation,
+                          int32_t *x,
+                          int32_t *y,
+                          uint32_t *w,
+                          uint32_t *h,
+                          int32_t *display_id,
+                          uint32_t *disp_w,
+                          uint32_t *disp_h)
+{
+	const uint64_t hold_ns = 250ull * U_TIME_1MS_IN_NS;
+	uint32_t tw = 0, th = 0;
+	if (c->target != NULL) {
+		comp_vk_native_target_get_dimensions(c->target, &tw, &th);
+	}
+	const bool coherent = tw == 0 || th == 0 || (*w == tw && *h == th) || (*w == th && *h == tw);
+
+	if (coherent) {
+		if (c->android_rect_coherent.hold_generation != 0) {
+			const uint64_t held_ms =
+			    (os_monotonic_get_ns() - c->android_rect_coherent.hold_since_ns) / U_TIME_1MS_IN_NS;
+			c->android_rect_coherent.corrections++;
+			// One line per correction (a window toggle), never per frame;
+			// after the first few, INFO so a resize-drag cannot flood.
+			if (c->android_rect_coherent.corrections <= 4) {
+				U_LOG_W(
+				    "WINDOW_RECT: held %d,%d %ux%u for %llu ms until the target caught up with "
+				    "%d,%d %ux%u (target %ux%u) — origin/extent fed as a matched pair",
+				    c->android_rect_coherent.x, c->android_rect_coherent.y, c->android_rect_coherent.w,
+				    c->android_rect_coherent.h, (unsigned long long)held_ms, *x, *y, *w, *h, tw, th);
+			} else {
+				U_LOG_I("WINDOW_RECT: held a rect for %llu ms until the target matched %ux%u",
+				        (unsigned long long)held_ms, tw, th);
+			}
+		}
+		c->android_rect_coherent.valid = true;
+		c->android_rect_coherent.bypass = false;
+		c->android_rect_coherent.hold_generation = 0;
+		c->android_rect_coherent.x = *x;
+		c->android_rect_coherent.y = *y;
+		c->android_rect_coherent.w = *w;
+		c->android_rect_coherent.h = *h;
+		c->android_rect_coherent.display_id = *display_id;
+		c->android_rect_coherent.disp_w = *disp_w;
+		c->android_rect_coherent.disp_h = *disp_h;
+		return;
+	}
+
+	if (!c->android_rect_coherent.valid || c->android_rect_coherent.bypass) {
+		return; // nothing coherent to hold, or the gate is off: feed as published
+	}
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (c->android_rect_coherent.hold_generation == 0) {
+		c->android_rect_coherent.hold_since_ns = now;
+	}
+	c->android_rect_coherent.hold_generation = generation;
+
+	if (now - c->android_rect_coherent.hold_since_ns >= hold_ns) {
+		U_LOG_W(
+		    "WINDOW_RECT: rect %d,%d %ux%u never matched the %ux%u target within %llu ms — "
+		    "feeding it as published",
+		    *x, *y, *w, *h, tw, th, (unsigned long long)(hold_ns / U_TIME_1MS_IN_NS));
+		c->android_rect_coherent.bypass = true;
+		c->android_rect_coherent.hold_generation = 0;
+		return;
+	}
+
+	*x = c->android_rect_coherent.x;
+	*y = c->android_rect_coherent.y;
+	*w = c->android_rect_coherent.w;
+	*h = c->android_rect_coherent.h;
+	*display_id = c->android_rect_coherent.display_id;
+	*disp_w = c->android_rect_coherent.disp_w;
+	*disp_h = c->android_rect_coherent.disp_h;
+}
+#endif
+
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c)
 {
@@ -15683,6 +15810,7 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 				        "(#1037/#1033)",
 				        x, y, w, h, display_id, disp_w, disp_h);
 			}
+			vk_android_rect_for_weave(c, generation, &x, &y, &w, &h, &display_id, &disp_w, &disp_h);
 			xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)c->display_processor, x, y, w, h, display_id);
 			/*
