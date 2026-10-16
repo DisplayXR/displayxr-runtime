@@ -71,6 +71,9 @@
 //           screen is locked only {"version": 1, "locked": true}. See "The pointer".
 //   Method  GetWindowAt(i x, i y) -> (s)   (version 16) the same for a given stage
 //           point: what a click there would meet.
+//   Method  GetAllWindows() -> (s)   (version 16) GetWindows' snapshot with the
+//           app's dialogs and utility windows too (a "Save changes?" dialog);
+//           every entry has "window_type".
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
 //
 // Service   : org.displayxr.WindowGeometry          (same bus name)
@@ -1112,6 +1115,14 @@
             return parent ? {parent_id: Number(parent.get_id())} : {};
         },
 
+        //! The window types GetAllWindows lists: what a user calls the app's
+        //! windows (normal, dialog, modal dialog, utility), not menus, popups,
+        //! tooltips, docks or the desktop.
+        inAllWindows(type, Meta) {
+            const T = Meta.WindowType;
+            return type === T.NORMAL || type === T.DIALOG || type === T.MODAL_DIALOG || type === T.UTILITY;
+        },
+
         //! Maximized in both directions (half-tiled is not). mutter 49+ has
         //! is_maximized(); older ones get_maximized(), the MaximizeFlags.
         isMaximized(win, Meta) {
@@ -1206,6 +1217,9 @@
     <method name="GetWindowAt">
       <arg type="i" direction="in" name="x"/>
       <arg type="i" direction="in" name="y"/>
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetAllWindows">
       <arg type="s" direction="out" name="json"/>
     </method>
     <signal name="WindowsChanged">
@@ -3557,15 +3571,23 @@
                 };
             }
 
-            _snapshotJson() {
+            //! @p all: GetAllWindows (dialogs and utility windows too, each
+            //! entry with its window_type), else GetWindows (normal only).
+            _snapshotJson(all = false) {
                 const focus = global.display.focus_window;
                 const windows = [];
                 const layout = currentLayoutMode();
                 for (const actor of global.get_window_actors()) {
                     const win = actor.meta_window;
-                    if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
+                    if (!win)
                         continue;
-                    windows.push(this._windowEntry(win, focus, layout));
+                    const type = win.get_window_type();
+                    if (all ? !PointerPick.inAllWindows(type, Meta) : type !== Meta.WindowType.NORMAL)
+                        continue;
+                    const entry = this._windowEntry(win, focus, layout);
+                    if (all)
+                        entry.window_type = type;
+                    windows.push(entry);
                 }
                 const snapshot = {version: 1};
                 if (layout !== null)
@@ -3576,6 +3598,12 @@
 
             GetWindows() {
                 return this._snapshotJson();
+            }
+
+            //! Version 16: with the app's dialogs and utility windows (GetWindows
+            //! keeps to normal windows, which its consumers rely on).
+            GetAllWindows() {
+                return this._snapshotJson(true);
             }
 
             //! Version 16: where the pointer is and the window under it (see "The
