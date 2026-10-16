@@ -161,6 +161,11 @@ cmd_list(int argc, const char **argv)
 		} else {
 			cJSON_AddNullToObject(root, "preferred");
 		}
+		// HKLM `<root>\Policy\Lock` (Windows): per-user Enabled values are ignored.
+		// The same `policy.policy_lock` key `conv list --json` emits.
+		cJSON *pol = cJSON_AddObjectToObject(root, "policy");
+		cJSON_AddBoolToObject(pol, "policy_lock",
+		                      target_component_policy_lock(target_plugin_component_class()));
 		cJSON *arr = cJSON_AddArrayToObject(root, "plugins");
 		for (int i = 0; i < n; i++) {
 			cJSON *p = cJSON_CreateObject();
@@ -223,6 +228,9 @@ cmd_list(int argc, const char **argv)
 		P("\t(none — discovery root absent or empty)\n");
 	} else {
 		P("\tPreferredPlugin override: %s\n", have_pref ? preferred : "<unset>");
+		if (target_component_policy_lock(target_plugin_component_class())) {
+			P("\tPolicy\\Lock: SET (HKLM) — per-user Enabled values are ignored; the machine's win.\n");
+		}
 		const int pref_at = have_pref ? cli_dp_find(list, n, preferred) : -1;
 		if (have_pref && pref_at < 0) {
 			P("\t  (not a registered plug-in — the loader ignores it)\n");
@@ -497,8 +505,11 @@ cmd_enable(const char *id, bool enable, bool machine)
 	}
 	P("%s: %s %s.\n", id, enable ? "enabled" : "disabled",
 	  machine ? "machine-wide (HKLM)" : "for this user (HKCU)");
-	if (machine) {
+	const bool locked = target_component_policy_lock(target_plugin_component_class());
+	if (machine && !locked) {
 		P("note: a per-user (HKCU) Enabled value for '%s' still wins for that user.\n", id);
+	} else if (!machine && locked) {
+		P("note: HKLM Policy\\Lock is set, so the per-user value is ignored.\n");
 	}
 	if (!enable) {
 		P("note: no scan loads '%s' while it is disabled — the per-monitor DP registry stops offering it "

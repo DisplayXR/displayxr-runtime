@@ -255,6 +255,40 @@ provenance_of(const struct xrt_status_conv_provider &p)
 	return out;
 }
 
+//! The built-in `dp-lift` adapter: no binary, no Enabled value, no settings.
+bool
+is_built_in(const struct xrt_status_conv_provider &p)
+{
+	return strcmp(p.load, "BUILT_IN") == 0 || strcmp(p.id, "dp-lift") == 0;
+}
+
+/*!
+ * Where a row's `enabled` came from, in the vocabulary `dp list` / `input list`
+ * use (N3e review): "user" when a per-user `Enabled` override applies (HKCU,
+ * not hidden by `Policy\Lock` — @ref target_conv_policy_enabled_override, the
+ * rule the loader itself applies), "machine" / "manifest" when the platform's
+ * own store disabled it, else "default". The built-in adapter has no Enabled
+ * value at all: "default".
+ */
+const char *
+conv_enabled_source(const struct xrt_status_conv_provider &p, const struct target_conv_policy *policy)
+{
+	if (is_built_in(p)) {
+		return "default";
+	}
+	if (target_conv_policy_enabled_override(policy, p.id) >= 0) {
+		return "user";
+	}
+	if (!p.enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
 void
 print_json(const struct xrt_status_snapshot *snap, const struct target_conv_policy *policy, bool compact)
 {
@@ -271,6 +305,12 @@ print_json(const struct xrt_status_snapshot *snap, const struct target_conv_poli
 		cJSON_AddStringToObject(row, "provenance", target_component_provenance_str(pv.verdict));
 		cJSON_AddStringToObject(row, "provenance_reason", pv.reason);
 		cJSON_AddStringToObject(row, "signer", pv.signer);
+		// N3e review: the policy facts a front end needs to draw the row's
+		// controls, joined here like provenance (the rows themselves carry
+		// none: they come over DIAG IPC). `built_in` = no Enabled value and no
+		// settings (`conv enable|disable dp-lift` is refused).
+		cJSON_AddStringToObject(row, "enabled_source", conv_enabled_source(snap->conv_providers[i], policy));
+		cJSON_AddBoolToObject(row, "built_in", is_built_in(snap->conv_providers[i]));
 	}
 	char *s = compact ? cJSON_PrintUnformatted(root) : cJSON_Print(root);
 	if (s != nullptr) {

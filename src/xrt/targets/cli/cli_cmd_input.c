@@ -123,6 +123,11 @@ cmd_list(int argc, const char **argv)
 		} else {
 			cJSON_AddNullToObject(root, "preferred");
 		}
+		// HKLM `<root>\Policy\Lock` (Windows): per-user Enabled values are ignored.
+		// The same `policy.policy_lock` key `conv list --json` emits.
+		cJSON *pol = cJSON_AddObjectToObject(root, "policy");
+		cJSON_AddBoolToObject(pol, "policy_lock",
+		                      target_component_policy_lock(target_input_plugin_component_class()));
 		cJSON *arr = cJSON_AddArrayToObject(root, "providers");
 		for (int i = 0; i < n; i++) {
 			cJSON *p = cJSON_CreateObject();
@@ -159,6 +164,9 @@ cmd_list(int argc, const char **argv)
 	if (n == 0) {
 		P("\t(none — discovery root absent or empty; qwerty keeps the hand roles)\n");
 		return 0;
+	}
+	if (target_component_policy_lock(target_input_plugin_component_class())) {
+		P("\tPolicy\\Lock: SET (HKLM) — per-user Enabled values are ignored; the machine's win.\n");
 	}
 	if (force_qwerty) {
 		P("\tForceQwerty override: SET — providers are skipped, qwerty claims the hand roles.\n");
@@ -471,8 +479,11 @@ cmd_enable(const char *id, bool enable, bool machine)
 	}
 	P("%s: %s %s.\n", id, enable ? "enabled" : "disabled",
 	  machine ? "machine-wide (HKLM)" : "for this user (HKCU)");
-	if (machine) {
+	const bool locked = target_component_policy_lock(target_input_plugin_component_class());
+	if (machine && !locked) {
 		P("note: a per-user (HKCU) Enabled value for '%s' still wins for that user.\n", id);
+	} else if (!machine && locked) {
+		P("note: HKLM Policy\\Lock is set, so the per-user value is ignored.\n");
 	}
 	note_pickup(enable ? id : NULL);
 	return 0;
