@@ -42,3 +42,7 @@ elseif(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_DBUS)
 else()
 	target_sources(aux_desktop PRIVATE u_desktop_none.c)
 endif()
+
+# Bring-up tool: drives the platform backend directly (no OpenXR, NO safety layer).
+add_executable(desktop_backend_smoke desktop_backend_smoke.c)
+target_link_libraries(desktop_backend_smoke PRIVATE aux_desktop)
