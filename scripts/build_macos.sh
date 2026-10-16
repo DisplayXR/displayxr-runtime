@@ -380,6 +380,15 @@ HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conver
 if [ "$SERVICE_MODE" = "ON" ] && [ -n "$HOST_BIN" ]; then
   cp "$HOST_BIN" "$PKG_DIR/bin/displayxr-conversion-host"
   chmod u+w "$PKG_DIR/bin/displayxr-conversion-host"
+  # Its Vulkan/cJSON deps get the same retarget as the service's — without it
+  # the installed host still names Homebrew's libvulkan and never starts on a
+  # Mac without Homebrew.
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
   for r in $(otool -l "$PKG_DIR/bin/displayxr-conversion-host" \
              | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
     case "$r" in

@@ -275,6 +275,23 @@ fi
 # installer/macos/entitlements/map; unset, it is the ad-hoc '-' signature
 # contributor and fork-PR builds always had.
 SIGN="$REPO_ROOT/scripts/macos_sign_notarize.sh"
+
+# Every shipped Mach-O must resolve its deps on a Mac without Homebrew: an
+# absolute build-box path (Homebrew prefix, /usr/local, /tmp, a home dir)
+# loads on the build box and fails everywhere else. displayxr-conversion-host
+# shipped naming /opt/homebrew/.../libvulkan.1.dylib for exactly that reason.
+BAD_DEPS=""
+while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q 'Mach-O' || continue
+    d="$(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local|/tmp|/private/tmp|/Users)/' || true)"
+    [ -n "$d" ] && BAD_DEPS="$BAD_DEPS
+  ${f#"$WORK_DIR/payload-runtime"}: $(echo $d)"
+done < <(find "$WORK_DIR/payload-runtime" -type f -print0)
+if [ -n "$BAD_DEPS" ]; then
+    echo "Error: payload Mach-Os depend on build-box paths:$BAD_DEPS" >&2
+    exit 1
+fi
+
 "$SIGN" sign-tree "$WORK_DIR/payload-runtime" \
     --entitlements-map "$SCRIPT_DIR/entitlements/map"
 
