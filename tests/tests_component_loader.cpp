@@ -20,18 +20,22 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -826,6 +830,131 @@ TEST_CASE("component loader: the file digest is SHA-256 of the bytes", "[compone
 	CHECK_FALSE(target_component_sha256_file(path, small, sizeof(small)));
 	CHECK_FALSE(target_component_sha256_file(nullptr, hex, sizeof(hex)));
 }
+
+namespace {
+
+//! A per-process scratch path in the temp dir.
+std::string
+temp_path(const char *stem)
+{
+	const char *dir = std::getenv("TMP") != nullptr
+	                      ? std::getenv("TMP")
+	                      : (std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp");
+	char path[1024];
+#ifdef _WIN32
+	std::snprintf(path, sizeof(path), "%s\\%s_%lu", dir, stem, (unsigned long)GetCurrentProcessId());
+#else
+	std::snprintf(path, sizeof(path), "%s/%s_%lu", dir, stem, (unsigned long)getpid());
+#endif
+	return path;
+}
+
+void
+write_file(const std::string &path, const char *bytes)
+{
+	// r+ when it exists: rewrite in place, same inode (what a swap that keeps
+	// the file identity looks like).
+	FILE *f = std::fopen(path.c_str(), "r+b");
+	if (f == nullptr) {
+		f = std::fopen(path.c_str(), "wb");
+	}
+	REQUIRE(f != nullptr);
+	std::fputs(bytes, f);
+	std::fclose(f);
+}
+
+} // namespace
+
+TEST_CASE("component loader: provenance is thread-safe and every thread sees the same verdict", "[component_loader]")
+{
+	// The DP refresh, IPC status snapshots and the input / conversion loaders
+	// all call this from their own threads (ADR-054 N4b review).
+	const std::string a = temp_path("tests_component_loader_conc_a.bin");
+	const std::string b = temp_path("tests_component_loader_conc_b.bin");
+	write_file(a, "the first file");
+	write_file(b, "the second file, longer");
+	char sha_a[65] = {0};
+	char sha_b[65] = {0};
+	REQUIRE(target_component_sha256_file(a.c_str(), sha_a, sizeof(sha_a)));
+	REQUIRE(target_component_sha256_file(b.c_str(), sha_b, sizeof(sha_b)));
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	constexpr int kThreads = 8;
+	constexpr int kIters = 50;
+	std::atomic<int> bad{0};
+	std::vector<std::thread> threads;
+	for (int t = 0; t < kThreads; t++) {
+		threads.emplace_back([&, t]() {
+			std::unique_ptr<Entry> e(new Entry);
+			for (int i = 0; i < kIters; i++) {
+				const bool use_a = ((t + i) & 1) == 0;
+				target_component_entry_init(e.get());
+				std::snprintf(e->binary_path, sizeof(e->binary_path), "%s",
+				              use_a ? a.c_str() : b.c_str());
+				(void)target_component_check_provenance(&cls, e.get());
+				const char *want = use_a ? sha_a : sha_b;
+				if (std::strcmp(e->sha256, want) != 0 ||
+				    e->provenance != TARGET_COMPONENT_PROVENANCE_UNVERIFIED ||
+				    std::strstr(e->provenance_reason, want) == nullptr || e->signer[0] != '\0') {
+					bad++;
+				}
+			}
+		});
+	}
+	for (std::thread &th : threads) {
+		th.join();
+	}
+	CHECK(bad.load() == 0);
+	std::remove(a.c_str());
+	std::remove(b.c_str());
+}
+
+#ifndef _WIN32
+TEST_CASE("component loader: a file rewritten with its size and mtime put back is judged on its new bytes",
+          "[component_loader]")
+{
+	// The old cache keyed on path + size + mtime served the first verdict
+	// (and digest) for a file swapped in place with both restored — exactly
+	// how an allowlisted file would be swapped for an unlisted one.
+	const std::string p = temp_path("tests_component_loader_stale.bin");
+	write_file(p, "AAAAAAAA");
+	struct stat before;
+	REQUIRE(stat(p.c_str(), &before) == 0);
+
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	std::unique_ptr<Entry> e(new Entry);
+	target_component_entry_init(e.get());
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", p.c_str());
+	(void)target_component_check_provenance(&cls, e.get());
+	const std::string first = e->sha256;
+	REQUIRE(first.size() == 64);
+
+	write_file(p, "BBBBBBBB"); // same size, same inode
+	struct timespec ts[2];
+#if defined(__APPLE__)
+	ts[0] = before.st_atimespec;
+	ts[1] = before.st_mtimespec;
+#else
+	ts[0] = before.st_atim;
+	ts[1] = before.st_mtim;
+#endif
+	REQUIRE(utimensat(AT_FDCWD, p.c_str(), ts, 0) == 0);
+	struct stat after;
+	REQUIRE(stat(p.c_str(), &after) == 0);
+	REQUIRE(after.st_size == before.st_size);
+	REQUIRE(after.st_ino == before.st_ino);
+	REQUIRE(after.st_mtime == before.st_mtime);
+
+	char now[65] = {0};
+	REQUIRE(target_component_sha256_file(p.c_str(), now, sizeof(now)));
+	REQUIRE(first != now);
+	(void)target_component_check_provenance(&cls, e.get());
+	CHECK(std::string(e->sha256) == now);
+	CHECK(std::string(e->provenance_reason).find(now) != std::string::npos);
+	std::remove(p.c_str());
+}
+#endif
 
 #if defined(CONV_STUB_OK_PATH)
 
