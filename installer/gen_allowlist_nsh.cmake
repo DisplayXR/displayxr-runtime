@@ -26,6 +26,8 @@ endif()
 # Keep in sync with the `File "${BIN_DIR}\plugins\..."` lines of the .nsi.
 set(_shipped_plugins
 	"${BIN_DIR}/plugins/DisplayXR-SimDisplay.dll"
+	"${BIN_DIR}/plugins/DisplayXR-SimInput.dll"
+	"${BIN_DIR}/plugins/DisplayXR-SimConversion.dll"
 )
 
 set(_write "")

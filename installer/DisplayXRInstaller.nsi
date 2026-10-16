@@ -1049,12 +1049,69 @@ client_dll_ok:
 		"Version" "${VERSION}"
 	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
 		"ProbeOrder" 200
-	; ADR-054 N4b: the digest of the sim-display DLL just written, so the
-	; enforcing provenance gate admits it even when this build is unsigned.
-	!insertmacro DXR_ALLOWLIST_WRITE
 	; No UninstallString — sim-display is owned by this runtime
 	; installer; the runtime uninstaller drops this subkey + its DLL
 	; directly.
+
+	; -----------------------------------------------------------------
+	; Reference input + conversion providers (ADR-054 §2 clause 3: every
+	; component class ships its sim_* reference so the system runs with
+	; no hardware, no vendor and no model — the macOS .pkg and the Linux
+	; packages already did; Windows shipped only sim-display until now).
+	;
+	; Registering them changes NOTHING for a user: both providers decline
+	; at probe unless their ENABLE setting is on (sim-input:
+	; `displayxr-cli input set sim-input ENABLE 1` / DXR_INPUT_SIM_INPUT_ENABLE;
+	; sim-conversion: `displayxr-cli conv set sim-conversion ENABLE 1` /
+	; DXR_CONV_SIM_CONVERSION_ENABLE), so qwerty keeps the hand roles and
+	; the vendor / open conversion providers keep every task. Same "only
+	; our rows" discipline as sim-display: this section writes exactly the
+	; two subkeys below and the uninstaller removes exactly those two.
+	; -----------------------------------------------------------------
+	SetOutPath "$INSTDIR\plugins"
+	File "${BIN_DIR}\plugins\DisplayXR-SimInput.dll"
+	File "${BIN_DIR}\plugins\DisplayXR-SimConversion.dll"
+	; ADR-053 P4 (#2108): the sim's fake model pack (its DOWNLOAD_MS knob
+	; drives the model store's write protocol through it).
+	File "${BIN_DIR}\plugins\sim-conversion.models.json"
+	SetOutPath "$INSTDIR\plugins\sim-conversion-blobs"
+	File /r "${BIN_DIR}\plugins\sim-conversion-blobs\*.*"
+	SetOutPath "$INSTDIR"
+
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimInput.dll"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"DisplayName" "DisplayXR Sim Input"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"ProbeOrder" 200
+	; Version LAST — the "row complete" marker (input-provider-discovery.md §3).
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Version" "${VERSION}"
+
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimConversion.dll"
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"DisplayName" "DisplayXR Sim Conversion"
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"ProbeOrder" 250
+	; Packs is a REG_MULTI_SZ (NSIS has no native writer); the service
+	; re-describes on Version, written after it (conversion spec §3.8).
+	nsExec::ExecToLog '"$SYSDIR\reg.exe" add "HKLM\Software\DisplayXR\ConversionProviders\sim-conversion" /v Packs /t REG_MULTI_SZ /d "$INSTDIR\plugins\sim-conversion.models.json" /f /reg:64'
+	Pop $0
+	${If} $0 != 0
+		DetailPrint "WARNING: could not write sim-conversion Packs (reg.exe exit $0); the provider still registers."
+	${EndIf}
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Version" "${VERSION}"
+
+	; ADR-054 N4b: the digests of the three plug-in DLLs just written, so
+	; the enforcing provenance gate admits them even when this build is
+	; unsigned (installer/gen_allowlist_nsh.cmake, same list as above).
+	!insertmacro DXR_ALLOWLIST_WRITE
 
 	; -----------------------------------------------------------------
 	; #902: VK_LAYER_DXR_queue_lock — per-queue submit serialization so
@@ -1489,6 +1546,14 @@ Section "Uninstall"
 	; else is left in it.
 	; -----------------------------------------------------------------
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\sim-display"
+	; The two reference providers this installer registered (ADR-054 §2
+	; clause 3). Only these subkeys: a vendor's or the open provider's row
+	; under the same roots belongs to its own installer (#1803), and the
+	; roots themselves are dropped only when nothing else is left in them.
+	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\sim-input"
+	DeleteRegKey HKLM "Software\DisplayXR\ConversionProviders\sim-conversion"
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\InputProviders"
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
 	; ADR-054 N4b: the allowlist rows this installer wrote for its own DLL(s);
 	; rows other installers or register_dev_plugin.bat wrote are left alone.
 	!insertmacro DXR_ALLOWLIST_REMOVE
@@ -1550,6 +1615,10 @@ Section "Uninstall"
 	; and are never touched (#1803); the sweep is non-recursive and so is
 	; the RMDir, so a subdirectory someone else put here survives.
 	Delete "$INSTDIR\plugins\*.dll"
+	; The sim-conversion model pack this installer wrote (manifest + its
+	; blobs directory); still no recursive sweep of plugins\ itself.
+	Delete "$INSTDIR\plugins\sim-conversion.models.json"
+	RMDir /r "$INSTDIR\plugins\sim-conversion-blobs"
 	RMDir "$INSTDIR\plugins"
 
 	; Save uninstall log to temp before removing directory

@@ -135,6 +135,41 @@ cat > "$DP_ROOT/200-sim-display.json" <<EOF
 EOF
 echo "==> Display processor manifest: $DP_ROOT/200-sim-display.json"
 
+# --- Reference input + conversion provider manifests (ADR-054 §2 clause 3) --
+# Same discovery root; the `-input-provider.json` / `-conversion-provider.json`
+# suffixes route each manifest to its class loader. Both providers decline at
+# probe until their ENABLE setting is on (`displayxr-cli input set sim-input
+# ENABLE 1` / `conv set sim-conversion ENABLE 1`), so this changes nothing for
+# a user: qwerty keeps the hand roles and no conversion task moves.
+cat > "$DP_ROOT/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-SimInput.so",
+        "probe_order":  200
+    }
+}
+EOF
+cat > "$DP_ROOT/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-SimConversion.so",
+        "probe_order":  250,
+        "packs":        ["$PREFIX/lib/displayxr/plugins/sim-conversion.models.json"]
+    }
+}
+EOF
+echo "==> Reference provider manifests: $DP_ROOT/200-sim-input-input-provider.json, $DP_ROOT/250-sim-conversion-conversion-provider.json"
+
 # --- VK_LAYER_DXR_queue_lock (#902 / #2036) ---------------------------------
 # The Vulkan layer the runtime enables by name at xrCreateVulkanInstanceKHR so
 # the #868 repaint can share the app's only graphics queue (Intel and other
