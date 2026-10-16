@@ -30,7 +30,7 @@ elseif(APPLE)
 	target_sources(aux_desktop PRIVATE u_desktop_macos.m)
 	target_link_libraries(
 		aux_desktop PRIVATE "-framework ApplicationServices" "-framework AppKit" "-framework CoreGraphics"
-				    "-framework CoreFoundation"
+				    "-framework CoreFoundation" "-framework Carbon"
 		)
 elseif(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_DBUS)
 	# GNOME Wayland: RemoteDesktop portal + libei (dlopen'd: no DT_NEEDED, libei is
