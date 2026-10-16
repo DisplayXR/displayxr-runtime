@@ -694,7 +694,7 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 
 | Verb | Path | What |
 |---|---|---|
-| `conv list [--json]` | DIAG IPC; headless describe as fallback | providers × capabilities, selection order, `selected`, reason per row |
+| `conv list [--json]` | DIAG IPC; headless describe as fallback | providers × capabilities, selection order, `selected`, reason per row. JSON: each provider row adds what the lister resolved — `provenance` / `provenance_reason` / `signer` (N4b), `enabled_source` (`user` = a per-user HKCU `Enabled` is in force, not hidden by `Policy\Lock`; `machine` = disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX manifest; `default` otherwise — the `dp list` / `input list` vocabulary) and `built_in` (the `dp-lift` adapter: no `Enabled` value, no settings, `conv enable\|disable dp-lift` refused); the root `policy` object carries `policy_lock`, `allow_research_only` and the per-task `preferred` |
 | `conv status [--watch]` | DIAG | readiness, streams, jobs |
 | `conv use <task> <id>[/<cap>] [--machine]` / `conv reset <task>\|all` | registry (HKCU; HKLM with `--machine`) | per-task preference, like `dp use --screen` |
 | `conv warm <task>\|<id>/<cap> [--wait]` / `conv evict <task>` | DIAG → service | explicit prewarm / unload; `evict` is accepted only on the CLI's own DIAG connection |
