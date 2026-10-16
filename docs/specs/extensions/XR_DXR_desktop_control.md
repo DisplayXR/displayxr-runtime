@@ -90,15 +90,19 @@ it always succeeds for a valid session. A capability the backend lacks returns
    switch", "screen locked", "disabled by the user").
 2. **Never fight the user.** EVERY action (window ops included: on GNOME they are input
    gestures, and everywhere they move focus) waits until the user has been idle for
-   `idle_ms` (store, default 600 ms), polling the backend's `user_idle_ms`. Input the runtime
-   itself injected does not count — but only input whose OS timestamp falls inside one of
-   the runtime's own injection windows `[start, end + 150 ms]`; activity after that window is
-   the user's, however soon the next action follows. The decision is taken only once the
-   last injection's grace window has closed (an action following another by < 150 ms waits
-   out the rest of it), so a user who starts typing right after our injection is seen as
-   active rather than absorbed into our grace. (Known limit: a user keystroke landing
-   *during* one of our injections is indistinguishable from ours on these OSes.) Waits at
-   most 10 s, then `REFUSED` "the user is active".
+   `idle_ms` (store, default 600 ms), polling the backend's `user_idle_ms`. The wait runs
+   AFTER the backend's slow setup (`prepare_input`, e.g. restoring the GNOME portal session,
+   0.3–9 s), so a user who starts typing during that setup is still waited for. Input the
+   runtime itself injected does not count — but only input whose OS timestamp falls inside
+   one of the runtime's own injection windows `[start, end + 30 ms]` (the 30 ms grace absorbs
+   the OS processing our own events late); activity after that window is the user's, however
+   soon the next action follows. The decision is taken only once the last injection's grace
+   window has closed (an action following another by < 30 ms waits out the rest of it), so a
+   user who starts typing right after our injection is seen as active rather than absorbed
+   into our grace. **Residual window:** user input landing *during* one of our injections, or
+   within 30 ms after it ends, is indistinguishable from ours on these OSes and is not waited
+   for. The opposite error is safe: a late-processed event of ours mistaken for the user only
+   costs one idle wait. Waits at most 10 s, then `REFUSED` "the user is active".
 3. **Target exists.** The target window is in the backend's window list — else
    `WINDOW_LOST`.
 4. **Target verification** for input actions, immediately before delivery:
@@ -122,7 +126,8 @@ key-down, each button press, each scroll burst — together with the kill switch
 (the input guard, `u_desktop.h`). A check that fails mid-action stops it with `REFUSED`
 ("focus moved", "kill switch", "screen locked"); what was already injected stays, and every
 pressed key and button is released. Slow setup (opening / restoring the GNOME portal
-session) happens before step 4, never between it and the injection.
+session) happens before step 2 (so the idle wait comes after it) and never between step 4
+and the injection.
 
 **Revocation.** A backend that finds the OS permission gone returns NOT_GRANTED; the state
 becomes `DENIED` (event) and every further action is refused without reaching the OS.
@@ -256,12 +261,18 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   10 000 are clamped.
 - Our own injections: every backend action call (window ops included) records its window
   `[start, end]`; the last 32 are kept. Input whose OS timestamp (`now − idle_ms`, 1 ms rounding
-  allowed) falls in `[start, end + 150 ms]` is ours — **but the decision waits until that window
+  allowed) falls in `[start, end + 30 ms]` is ours — **but the decision waits until that window
   has closed**: a user who keeps typing then shows a newer timestamp outside it, so back-to-back
   actions cannot chain past an active user through each other's grace windows. Cost: an action
-  that follows another by less than 150 ms waits for the rest of the grace window.
-- Before step 3 the backend's `prepare_input` (if any) runs, so slow setup (the GNOME portal)
-  happens before verification, never between it and the injection.
+  that follows another by less than 30 ms waits for the rest of the grace window. **Residual
+  window, stated plainly:** user input during one of our injections or within 30 ms after it
+  ends is indistinguishable from ours (a user keystroke at +50 ms is seen and waited for). The
+  failure direction of the grace is safe: our own synthetic event processed later than 30 ms
+  is taken for the user and costs one idle wait, never an injection into an active user.
+- Before step 2 (right after step 1 and the capability check) the backend's `prepare_input`
+  (if any) runs, so slow setup (the GNOME portal: 0.3–9 s) happens before the idle wait — a
+  user who starts typing during it is still waited for — and before verification, never
+  between it and the injection.
 - Step 5 runs under the input guard (`u_desktop.h`): `still_allowed` re-reads the store stamp
   and checks an unreadable store, the kill switch, the deny, `is_locked`, revocation and session
   destroy, and announces a state change it finds. A stop it causes completes with that reason
@@ -270,6 +281,9 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
 - `CLICK`, `DRAG` and `SCROLL` move the pointer to `point` first, then re-pick, then press —
   the press and the scroll carry the verified point. A pressed button is always released,
   whatever happens next (a drag releases at `point2` if the move got there, else at `point`).
+  A `DRAG` re-asks the guard after its press: if the kill switch, a lock, a deny or a
+  revocation arrived in between, it releases at `point` (never moving to `point2`) and
+  completes `REFUSED` with that reason.
 - Exact messages: `"kill switch"`, `"screen locked"`, `"disabled by the user"`,
   `"the user is active"`, `"target is not under the point (found <app>: <title>)"` (or
   `found the desktop` / `found the shell` / `found nothing: outside every monitor`),
@@ -298,7 +312,14 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   switch must always work) moves it to `desktop_control.json.corrupt` and writes a fresh
   suspended store. `displayxr-cli desktop status` reports an unreadable store.
 - Every read-modify-write holds an exclusive OS lock on `desktop_control.json.lock` (`flock` /
-  `LockFileEx`) and re-reads the file under it.
+  `LockFileEx`) and re-reads the file under it. If the lock cannot be taken the write is
+  refused (it never writes unlocked) — except `stop`, which proceeds unlocked: the kill switch
+  must always land.
+- Windows: readers open the store with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
+  (`CreateFileW`, not `_wfopen`), so an app reading the store never blocks the writer's atomic
+  rename; the rename is still retried for up to ~1 s on a sharing violation / access denied
+  (antivirus, indexers). `displayxr-cli desktop stop` exits non-zero with "could not save the
+  kill switch — is the store locked?" if it still fails.
 - `DXR_DESKTOP_CONTROL_DIR` overrides both the store and the audit directory; the runtime logs a
   WARN once per process when it does, and `desktop status` prints the override and the store
   path in use.
@@ -310,7 +331,9 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   (AltGr on Windows / Linux). A bare, shift-only, alt-only (macOS Option) or AltGr chord produces
   a character, and typed text never reaches the log.
 - An action refused at submit because the state is not granted is audited once per state
-  (`result: "not_granted"`); an unknown action type is audited as `"unknown"`.
+  (`result: "not_granted"`); an unknown action type is audited as `"unknown"` — also while
+  `GRANTED`, where it is refused with `XR_ERROR_VALIDATION_FAILURE` (`result: "invalid"`, one
+  record per submit).
 - The audit record type has no text field at all, so the rule cannot be broken by a caller.
 
 **Lifetime.** The context handed to `request_access` is a small refcounted block (one
