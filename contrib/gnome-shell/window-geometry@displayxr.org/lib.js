@@ -41,7 +41,8 @@
 //     capturable for the length of the lock),
 //   * WindowPlacement1 / move sync (a client moving its OWN window; nothing a
 //     locked user can drive) — but not the version 15 requests (keep-above,
-//     activate, minimize), which are refused while locked,
+//     activate, minimize), which are refused while locked, and not the
+//     version 16 GetPointer / GetWindowAt, which answer only {"locked": true},
 //   * the WorkspaceHotkey1 D-Bus object (so a registered client is not lost).
 // What does NOT: the workspace hotkey's GRAB. Entering the lock screen
 // releases it and leaving it re-grabs (WorkspaceHotkey.wantGrab(…, locked)),
@@ -63,6 +64,13 @@
 // Object    : /org/displayxr/WindowGeometry
 // Interface : org.displayxr.WindowGeometry1
 //   Method  GetWindows() -> (s)   JSON snapshot (schema below)
+//   Method  GetPointer() -> (s)   (version 16) the pointer and the window under it:
+//           {"version": 1, "x", "y", "layout_mode",
+//            "over": "window"|"desktop"|"shell"|"outside",
+//            "window": <a snapshot window entry> | null, "window_type"}; while the
+//           screen is locked only {"version": 1, "locked": true}. See "The pointer".
+//   Method  GetWindowAt(i x, i y) -> (s)   (version 16) the same for a given stage
+//           point: what a click there would meet.
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
 //
 // Service   : org.displayxr.WindowGeometry          (same bus name)
@@ -189,6 +197,12 @@
 //                                           // monitor at scale 1: both agree)
 //   "windows": [
 //     {
+//       "id": 3517497060,                   // ext v16+: mutter's window id, unique
+//                                           // and stable for the window's lifetime;
+//                                           // UNSIGNED 64-bit, often > INT32_MAX
+//                                           // (read as int64 / double, not int)
+//       "parent_id": 3517497041,            // ext v16+, transient windows only (a
+//                                           // popup, a dialog): the owner's id
 //       "pid": 1234,
 //       "app_id": "cube_handle_vk_linux",   // wm_class / Wayland app-id
 //       "title": "...",
@@ -1039,6 +1053,85 @@
         },
     };
 
+    /*
+     * ── The pointer (version 16) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_pointer.js drives it.
+     *
+     * A Wayland client only learns where the pointer is while it is over its
+     * own surface, so an app cannot answer "what is under my mouse?" (an
+     * assistant reading or acting on what the user points at). The compositor
+     * knows. WindowGeometry1.GetPointer() -> (s json) reports the pointer
+     * position in stage coordinates (the snapshot's space; `layout_mode` says
+     * which) and the window under it, found the way a click would find it:
+     * mutter's reactive pick, so stacking order, input regions (a click-through
+     * window is passed over) and shell UI on top are all accounted for.
+     * Read-only, like GetWindows (which already lists every window); nothing is
+     * reported while the screen is locked.
+     */
+    const PointerPick = {
+        //! The window a picked actor belongs to: the first ancestor that is a
+        //! window actor (it has a meta_window). null for shell UI or the stage.
+        windowOf(actor) {
+            for (let a = actor; a; a = a.get_parent()) {
+                if (a.meta_window)
+                    return a.meta_window;
+            }
+            return null;
+        },
+
+        //! What the pick found when it is not a window: 'desktop' for the
+        //! desktop background (or the stage under it), else 'shell' (the panel,
+        //! a popup, the overview).
+        nonWindow(actor, stage, Meta) {
+            if (!actor || actor === stage)
+                return 'desktop';
+            for (let a = actor; a; a = a.get_parent()) {
+                if ((Meta.BackgroundActor && a instanceof Meta.BackgroundActor) ||
+                    (Meta.BackgroundGroup && a instanceof Meta.BackgroundGroup))
+                    return 'desktop';
+            }
+            return 'shell';
+        },
+
+        //! A window that IS the desktop: type DESKTOP, or the desktop-icons
+        //! extension's window (Ubuntu's default "ding", which is a NORMAL window
+        //! before mutter 49 because only 49+ lets it set its type).
+        isDesktopWindow(win, Meta) {
+            return win.get_window_type() === Meta.WindowType.DESKTOP || win.customJS_ding !== undefined ||
+                win.get_wm_class?.() === 'com.rastersoft.ding';
+        },
+
+        //! {parent_id} of a transient window (a popup menu, a dialog: its owner
+        //! window's id), else {} — such a window's own app_id/title may be empty.
+        parentOf(win) {
+            const parent = win.get_transient_for?.();
+            return parent ? {parent_id: Number(parent.get_id())} : {};
+        },
+
+        //! Whether (x, y) is on a monitor (@p rects: their [x, y, w, h]); a point
+        //! between or beside monitors is on none, and no click can reach it.
+        onMonitor(x, y, rects) {
+            return rects.some(([mx, my, mw, mh]) => x >= mx && x < mx + mw && y >= my && y < my + mh);
+        },
+
+        //! The JSON reply. @p over: 'window' | 'desktop' | 'shell' | 'outside';
+        //! @p window: the snapshot entry of the window hit (also for a desktop
+        //! window), else null.
+        reply({locked = false, x = 0, y = 0, layout = null, over = 'desktop', window = null, windowType = null}) {
+            if (locked)
+                return {version: 1, locked: true};
+            const r = {version: 1, x, y};
+            if (layout !== null)
+                r.layout_mode = layout;
+            r.over = over;
+            r.window = window;
+            if (window && windowType !== null)
+                r.window_type = windowType;
+            return r;
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -1059,6 +1152,8 @@
         WorkspaceHotkey,
         //! The own-window requests' gate and bookkeeping, exported for its unit test.
         OwnWindow,
+        //! The pointer reply, exported for its unit test.
+        PointerPick,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
@@ -1090,6 +1185,14 @@
 <node>
   <interface name="org.displayxr.WindowGeometry1">
     <method name="GetWindows">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetPointer">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetWindowAt">
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
       <arg type="s" direction="out" name="json"/>
     </method>
     <signal name="WindowsChanged">
@@ -3402,45 +3505,52 @@
                 }
             }
 
-            _snapshotJson() {
+            //! One window as the snapshot (and GetPointer) report it.
+            _windowEntry(win, focus, layout) {
                 const display = global.display;
-                const focus = display.focus_window;
+                const frame = win.get_frame_rect();
+                const buffer = win.get_buffer_rect();
+                const mon = win.get_monitor();
+                let monitor = null;
+                if (mon >= 0) {
+                    const g = display.get_monitor_geometry(mon);
+                    const scale = display.get_monitor_scale(mon);
+                    monitor = {x: g.x, y: g.y, w: g.width, h: g.height, scale};
+                    // v11: the factor a consumer converts by. Absent when
+                    // the layout mode cannot be told.
+                    const deviceScale = StageScale.deviceScale(layout, scale);
+                    if (deviceScale !== null)
+                        monitor.device_scale = deviceScale;
+                }
+                return {
+                    id: Number(win.get_id()),
+                    pid: win.get_pid(),
+                    app_id: win.get_wm_class() ?? '',
+                    title: win.get_title() ?? '',
+                    focus: win === focus,
+                    xwayland: win.get_client_type() === Meta.WindowClientType.X11,
+                    frame: [frame.x, frame.y, frame.width, frame.height],
+                    buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
+                    monitor,
+                    capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
+                    lattice_drop: this._placement?.latticeDrop(win) ?? false,
+                    move_sync: this._placement?.moveSynced(win) ?? false,
+                    moving: win === this._grabbedWindow,
+                    minimized: win.minimized === true,
+                    above: win.is_above(),
+                    ...PointerPick.parentOf(win),
+                };
+            }
+
+            _snapshotJson() {
+                const focus = global.display.focus_window;
                 const windows = [];
                 const layout = currentLayoutMode();
                 for (const actor of global.get_window_actors()) {
                     const win = actor.meta_window;
                     if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
                         continue;
-                    const frame = win.get_frame_rect();
-                    const buffer = win.get_buffer_rect();
-                    const mon = win.get_monitor();
-                    let monitor = null;
-                    if (mon >= 0) {
-                        const g = display.get_monitor_geometry(mon);
-                        const scale = display.get_monitor_scale(mon);
-                        monitor = {x: g.x, y: g.y, w: g.width, h: g.height, scale};
-                        // v11: the factor a consumer converts by. Absent when
-                        // the layout mode cannot be told.
-                        const deviceScale = StageScale.deviceScale(layout, scale);
-                        if (deviceScale !== null)
-                            monitor.device_scale = deviceScale;
-                    }
-                    windows.push({
-                        pid: win.get_pid(),
-                        app_id: win.get_wm_class() ?? '',
-                        title: win.get_title() ?? '',
-                        focus: win === focus,
-                        xwayland: win.get_client_type() === Meta.WindowClientType.X11,
-                        frame: [frame.x, frame.y, frame.width, frame.height],
-                        buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
-                        monitor,
-                        capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
-                        lattice_drop: this._placement?.latticeDrop(win) ?? false,
-                        move_sync: this._placement?.moveSynced(win) ?? false,
-                        moving: win === this._grabbedWindow,
-                        minimized: win.minimized === true,
-                        above: win.is_above(),
-                    });
+                    windows.push(this._windowEntry(win, focus, layout));
                 }
                 const snapshot = {version: 1};
                 if (layout !== null)
@@ -3451,6 +3561,45 @@
 
             GetWindows() {
                 return this._snapshotJson();
+            }
+
+            //! Version 16: where the pointer is and the window under it (see "The
+            //! pointer"). The window is what mutter's pick finds there, so stacking,
+            //! input regions (a click-through window is passed over) and shell UI
+            //! on top are what the user's click would meet.
+            GetPointer() {
+                const [x, y] = global.get_pointer();
+                return this._pickJson(x, y);
+            }
+
+            //! Version 16: the same for any stage point (what a click at x, y
+            //! would meet), e.g. to check a target before acting on it.
+            GetWindowAt(x, y) {
+                return this._pickJson(x, y);
+            }
+
+            _pickJson(x, y) {
+                if (Main?.sessionMode?.isLocked === true)
+                    return JSON.stringify(PointerPick.reply({locked: true}));
+                const layout = currentLayoutMode();
+                const display = global.display;
+                const monitors = [];
+                for (let i = 0; i < display.get_n_monitors(); i++) {
+                    const g = display.get_monitor_geometry(i);
+                    monitors.push([g.x, g.y, g.width, g.height]);
+                }
+                if (!PointerPick.onMonitor(x, y, monitors))
+                    return JSON.stringify(PointerPick.reply({x, y, layout, over: 'outside'}));
+                const actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+                const win = PointerPick.windowOf(actor);
+                let over = win ? 'window' : PointerPick.nonWindow(actor, global.stage, Meta);
+                if (win && PointerPick.isDesktopWindow(win, Meta))
+                    over = 'desktop';
+                return JSON.stringify(PointerPick.reply({
+                    x, y, layout, over,
+                    window: win ? this._windowEntry(win, display.focus_window, layout) : null,
+                    windowType: win ? win.get_window_type() : null,
+                }));
             }
         }
 

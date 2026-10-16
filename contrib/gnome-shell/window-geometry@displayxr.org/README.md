@@ -312,6 +312,20 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   geometry snapshot gains `minimized` and `above`, so an app reads its window's
   state back, including what the user changed from the dock or the window menu
   (`WindowsChanged` follows both). See the spec, §11.
+- Version 16, `WindowGeometry1`: `GetPointer() -> (s json)` — where the pointer
+  is and what is under it: `{"version": 1, "x", "y", "layout_mode", "over":
+  "window" | "desktop" | "shell" | "outside", "window": <a snapshot entry> | null,
+  "window_type"}` (`window_type`: mutter's `Meta.WindowType` number). A Wayland
+  client only learns the pointer while it is over its own surface, so an app
+  could not answer "what is under my mouse?". The hit is what mutter's pick finds
+  there, so stacking, a click-through window (empty input region) and shell UI on
+  top count as they do for a click; the desktop background and a desktop-icons
+  window (Ubuntu's) are `desktop`. `GetWindowAt(i x, i y) -> (s json)` answers the
+  same for any stage point; a point on no monitor is `outside`. Read-only, like
+  `GetWindows`; while the screen is locked both answer only
+  `{"version": 1, "locked": true}`. Every window entry gains `id` (mutter's window
+  id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double) and, for
+  a transient window such as a popup menu, `parent_id`. See the spec, §12.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then

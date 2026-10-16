@@ -247,7 +247,8 @@ calling `disable()`. What keeps running there: the geometry snapshot and
 `WindowsChanged`, `CaptureExclusion1` (tearing it down at lock would make every
 excluded window capturable for the length of the lock), `WindowPlacement1` and
 move sync (a client moving its own window; the version 15 keep-above / activate /
-minimize requests are refused while locked, §11.2), and the `WorkspaceHotkey1`
+minimize requests are refused while locked, §11.2, and the version 16 GetPointer /
+GetWindowAt answer only `{"locked": true}`, §12.2), and the `WorkspaceHotkey1`
 object.
 What does not: the workspace hotkey's **grab** — the extension follows
 `Main.sessionMode` (`isLocked`, via its `updated` signal; not `currentMode`,
@@ -1491,3 +1492,83 @@ Unity plugin as the caller:
 
 Not verified: GNOME 42–49 at run time (the calls exist in the mutter sources from
 42.0; maximize's API change is handled by an existence check).
+
+## 12. The pointer — `WindowGeometry1.GetPointer` (extension version 16)
+
+### 12.1 Why
+
+A Wayland client learns where the pointer is only while it is over the client's own
+surface. An assistant app that reads or acts on what the user points at ("which
+window is under my mouse?", "what text is under my mouse?") therefore cannot answer
+on GNOME Wayland: there is no protocol for a global position. GNOME 50's
+`org.freedesktop.a11y.PointerLocator` only answers the Orca screen reader, and a
+ScreenCast stream with cursor metadata costs a consent dialog and keeps the
+screen-sharing indicator on for as long as the app listens. The compositor knows the
+position, and this extension already publishes every window's geometry.
+
+### 12.2 D-Bus surface
+
+`GetPointer() -> (s json)` on `org.displayxr.WindowGeometry1`:
+
+```json
+{ "version": 1, "x": 1180, "y": 640, "layout_mode": "logical",
+  "over": "window", "window": { …a GetWindows entry… }, "window_type": 0 }
+```
+
+- `x`, `y`: stage coordinates, the same space as the snapshot (`layout_mode` says
+  which; absent when it cannot be told).
+- `over`:
+  - `window`: an app window is what a click there would meet;
+  - `desktop`: the desktop background, or a window that is the desktop (type
+    DESKTOP, or Ubuntu's desktop-icons window "ding", a NORMAL window before
+    mutter 49 because only 49+ lets it set its type);
+  - `shell`: shell UI is on top (the panel, a shell popup, the overview);
+  - `outside` (GetWindowAt only): the point is on no monitor (negative, beyond
+    the stage, or in the gap beside a smaller monitor) — no click can reach it.
+- `window`: the snapshot entry of the window hit (also for a desktop window), else
+  `null`. `window_type` is mutter's `Meta.WindowType` number: 0 NORMAL, 1 DESKTOP,
+  2 DOCK, 3 DIALOG, 4 MODAL_DIALOG, 5 TOOLBAR, 6 MENU, 7 UTILITY, 8 SPLASHSCREEN,
+  9 DROPDOWN_MENU, 10 POPUP_MENU, 11 TOOLTIP, 12 NOTIFICATION, 13 COMBO, 14 DND,
+  15 OVERRIDE_OTHER. A popup menu (an xdg_popup) has no app_id or title of its own;
+  its entry carries `parent_id`, the owning window's `id`.
+- While the screen is locked: `{"version": 1, "locked": true}` and nothing else.
+
+`GetWindowAt(i x, i y) -> (s json)` gives the same reply for a given stage point
+instead of the pointer: what a click at that point would meet (a caller checks a
+target before acting on it, or resolves "the window at x, y").
+
+Every window entry (in `GetWindows`, `WindowsChanged` and here) also gains `id`:
+mutter's window id (`Meta.Window.get_id()`), unique and stable for the window's
+lifetime (a client that recreates its toplevel gets a new one). It is an
+**unsigned 64-bit** number and is above INT32_MAX in about half of all sessions:
+read it as int64 or double, never as a 32-bit int. A transient window (a popup, a
+dialog) also has `parent_id`. Additive; the schema stays `version: 1`.
+
+The hit is found the way a click is: `global.stage.get_actor_at_pos(REACTIVE)` —
+the same reactive pick mutter uses for Wayland pointer focus — then the first
+ancestor that is a window actor. Stacking order, input regions (a click-through
+window, e.g. the transparent part of a DisplayXR overlay app, is passed over to the
+window behind) and shell UI on top all count as they would for a click. One
+exception: while a grab is open (a shell menu, Alt+Tab, a modal dialog, a Wayland
+popup grab) a click only ends the grab, although the pick still names the window.
+The pure part is `PointerPick` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_pointer.js`.
+
+**Trust.** Read-only and open to any session-bus client, like `GetWindows`, which
+already lists every window. The addition is where the pointer is — what X11 gives
+every client; GNOME's own `org.gnome.Shell.Introspect` is narrower (allow-listed
+callers only). A same-user process could poll it to follow the pointer. This is a
+deliberate choice for assistant apps; gating it (for example answering only callers
+that own the focused window) would defeat "what is under my mouse" while the app is
+in the background. Nothing is reported on the lock screen.
+
+### 12.3 Verified (private headless GNOME Shell 50.1)
+
+Pointer driven through that instance's `org.gnome.Mutter.RemoteDesktop`:
+
+- two overlapping windows: the one on top is reported;
+- the desktop background: `over: desktop` (a shell without the desktop-icons
+  extension; with it, the "ding" window is reported as `desktop` by the rule above,
+  unit-tested); the top bar: `over: shell`; a point on no monitor: `outside`;
+- a click-through window (empty input region) on top: the window behind it is
+  reported, and a real click at the same point is received by that window behind.
