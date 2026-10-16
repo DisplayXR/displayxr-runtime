@@ -327,7 +327,7 @@ public sealed class ComponentsPage : Page
             ToolTip.SetTip(enabled, r.Untrusted
                 ? "Refused by the provenance gate: allowlist the binary first (the runtime log names the row to write)."
                 : enabledLocked ? lockTip
-                : $"displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, machine) : PolicyCommands.Enable(cls, r.Id, machine))}");
+                : $"displayxr-cli {PolicyCommands.Toggle(cls, r.Id, r.Enabled, machine)}");
             enabled.IsCheckedChanged += (_, _) =>
             {
                 if (Ctx.ActionRunning) return;
@@ -359,11 +359,9 @@ public sealed class ComponentsPage : Page
         }
         else
         {
-            foreach (var task in list.TasksOf(r.Id).Select(t => t.Task).Distinct())
+            foreach (var task in list.TaskNamesOf(r.Id))
             {
-                bool mine = list.PreferredByTask.TryGetValue(task, out var pref)
-                            && (pref == r.Id || pref.StartsWith(r.Id + "/", System.StringComparison.Ordinal));
-                if (mine)
+                if (list.IsPreferredFor(task, r.Id))
                 {
                     U.AddFlow(row, U.Chip($"preferred for {task}", Level.Info), 10, 6);
                     var reset = U.Button($"Reset {task}", () => Run(PolicyCommands.ResetTask(task, machine)), "quiet", "sm");
@@ -396,8 +394,12 @@ public sealed class ComponentsPage : Page
             col.Children.Add(U.Wrapped("Built-in adapter: it has no Enabled value and is not a provider to prefer. A registered provider hides it with Supersedes = dp-lift.", "meta"));
         string scope = machine ? "Machine-wide." : elevated ? "Per user." : "Per user; machine-wide needs an administrator prompt.";
         col.Children.Add(U.Wrapped($"{scope} {cls.AppliesNote()}", "meta"));
-        if (!elevated && r.EnabledKnown)
-            col.Children.Add(U.Wrapped($"Machine-wide: displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, true) : PolicyCommands.Enable(cls, r.Id, true))}", "mono"));
+        // Non-elevated: every control's machine-wide command (Enabled, Prefer, Reset), for an administrator.
+        if (!elevated && PolicyCommands.MachineHints(r, list) is { Count: > 0 } hints)
+        {
+            col.Children.Add(U.Wrapped("Machine-wide, from an administrator prompt:", "meta"));
+            foreach (var h in hints) col.Children.Add(U.Wrapped($"displayxr-cli {h}", "mono"));
+        }
         if (Ctx.LastActionArea == area && _policyActionRow == r.Id && Ctx.LastAction is { } la)
             col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("POLICY", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
         var box = new Border { Child = col, Margin = new Thickness(22, 8, 0, 0) };
