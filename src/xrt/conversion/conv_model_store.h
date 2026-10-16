@@ -127,6 +127,25 @@ struct conv_pack_variant
 	struct conv_pack_file files[CONV_STORE_MAX_FILES];
 };
 
+/*! @name conv_pack_auth::kind (ADR-057 §5) @{ */
+#define CONV_PACK_AUTH_NONE 0u
+#define CONV_PACK_AUTH_BEARER 1u      //!< `Authorization: Bearer <token>` (an auth server, a private release)
+#define CONV_PACK_AUTH_HUGGINGFACE 2u //!< a gated Hugging Face repository (its token, sent as a bearer)
+/*! @} */
+
+/*!
+ * A model's optional `auth` block (ADR-057 §5): how its bytes are fetched
+ * when the source is gated. Names a credential; the secret is read from the
+ * OS credential store (u_credential.h) by the downloader, at fetch time, and
+ * never stored anywhere else. Sent only over https, and only to the host the
+ * URL names (never forwarded across a redirect to another host).
+ */
+struct conv_pack_auth
+{
+	uint32_t kind;        //!< CONV_PACK_AUTH_*
+	char credential[128]; //!< credential-store name ("" when kind is NONE)
+};
+
 struct conv_pack_model
 {
 	char name[64];
@@ -135,6 +154,14 @@ struct conv_pack_model
 	char spdx[48];
 	bool commercial; //!< AND over the model and every dependency (missing = false)
 	bool prefetch;   //!< in the installer's default pre-fetch set
+	/*! ADR-057 §5: an optional per-model download URL (Apple's CDN, a Hugging
+	 *  Face `resolve` URL) that overrides `<blobBaseUrl>/<sha256>.<format>` for
+	 *  the model's `model`-role file. The file's sha256 + size still identify
+	 *  the bytes; every variant's `model` file must therefore be the same blob
+	 *  (url_sha256), or the pack is refused as ambiguous. "" = none. */
+	char url[CONV_STORE_PATH_MAX];
+	char url_sha256[CONV_STORE_SHA_HEX]; //!< the blob `url` serves ("" when url is "")
+	struct conv_pack_auth auth;          //!< ADR-057 §5; kind NONE = public
 	uint32_t variant_count;
 	struct conv_pack_variant variants[CONV_STORE_MAX_VARIANTS];
 };
@@ -179,6 +206,21 @@ conv_pack_load(const char *path, struct conv_pack *out, char *err, size_t err_si
  */
 void
 conv_pack_blob_url(const struct conv_pack *p, const struct conv_pack_file *f, char *out, size_t out_size);
+
+/*!
+ * The download URL of file @p f of model @p m: the model's own `url` when it
+ * serves that blob (ADR-057 §5), else conv_pack_blob_url().
+ */
+void
+conv_pack_file_url(const struct conv_pack *p,
+                   const struct conv_pack_model *m,
+                   const struct conv_pack_file *f,
+                   char *out,
+                   size_t out_size);
+
+//! "bearer" / "huggingface" -> CONV_PACK_AUTH_*; false for anything else.
+bool
+conv_pack_auth_kind_parse(const char *s, uint32_t *out);
 
 /*!
  * conv_pack_load() of a local path, a `file://` URL, or (Windows) an
@@ -301,6 +343,7 @@ enum conv_store_blob_result
 	CONV_STORE_BLOB_POLICY,          //!< refused: downloads off or research-only
 	CONV_STORE_BLOB_IO,              //!< cannot create / write / rename in the store
 	CONV_STORE_BLOB_CANCELLED,       //!< the store is shutting down
+	CONV_STORE_BLOB_AUTH,            //!< the model's credential is missing / unreadable, or was refused (ADR-057)
 };
 
 const char *
