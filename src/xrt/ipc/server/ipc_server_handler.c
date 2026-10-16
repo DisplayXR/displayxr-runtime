@@ -676,7 +676,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// fell through to device-default view poses (rig_applied=0): a
 		// static, symmetric frustum with the rig and zone rect ignored.
 		// xc == NULL (headless relay) keeps the previous behaviour.
-		if (!comp_d3d11_service_get_predicted_eye_positions_for_client(s->xsysc, xc, &left_eye, &right_eye)) {
+		// N6 Part 1 (#2144): at the locate's display time, not "latest".
+		if (!comp_d3d11_service_get_predicted_eye_positions_for_client_at(s->xsysc, xc, at_timestamp_ns,
+		                                                                  &left_eye, &right_eye)) {
 			static bool logged_no_eye_pos = false;
 			if (!logged_no_eye_pos) {
 				logged_no_eye_pos = true;
@@ -701,8 +703,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (ws_framed) {
 			full_eyes = ws_eyes; // the framing screen's set (ADR-052 D2)
 		}
-		if ((ws_framed ||
-		     comp_d3d11_service_get_predicted_eye_positions_full_for_client(s->xsysc, xc, &full_eyes)) &&
+		if ((ws_framed || comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		                      s->xsysc, xc, at_timestamp_ns, &full_eyes)) &&
 		    full_eyes.valid) {
 			uint32_t raw_n = full_eyes.count;
 			if (raw_n > XRT_MAX_VIEWS) {
@@ -1803,7 +1805,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	bool is_tracking = false;
 	int64_t sample_time_ns = 0;
 	struct xrt_eye_positions eyes = {0};
-	bool have_dp_eyes = multi_compositor_get_predicted_eye_positions(mc, &eyes) && eyes.valid && eyes.count > 0;
+	// N6 Part 1 (#2144): the eyes at the locate's display time, not "latest".
+	bool have_dp_eyes =
+	    multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) && eyes.valid && eyes.count > 0;
 	if (have_dp_eyes) {
 		head_eye_count = (eyes.count < XRT_MAX_VIEWS) ? eyes.count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < head_eye_count; i++) {
@@ -3308,6 +3312,7 @@ session_tracking_or(volatile struct ipc_client_state *ics, struct u_tracking_any
 
 xrt_result_t
 ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_state *ics,
+                                                  int64_t target_ns,
                                                   struct xrt_eye_positions *out_eye_positions)
 {
 	IPC_TRACE_MARKER();
@@ -3325,9 +3330,10 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		// Scope to THIS client's DP (#625) — same reason as the locate path:
 		// a client that never renders still owns a live DP, and the xc-less
 		// query would report isTracking=false for it (or another app's state)
-		// even while its own located views are tracked.
-		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
-		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
+		// even while its own located views are tracked. N6 Part 1 (#2144):
+		// at the client's target time (its frame's displayTime).
+		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, target_ns, &eyes);
 
 		// ADR-047 Amendment 7: the session is tracked when ANY DP presenting
 		// for it sees a viewer — its own (above), or a segment DP / workspace
@@ -3345,10 +3351,12 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 	// FALSE (and the tracking-state edge event never fired) even while its
 	// located views and the weave itself tracked the head.
 	if (ics->xc != NULL) {
-		(void)multi_compositor_get_predicted_eye_positions(multi_compositor(ics->xc), &eyes);
+		// N6 Part 1 (#2144): at the client's target time.
+		(void)multi_compositor_get_eye_positions_at(multi_compositor(ics->xc), target_ns, &eyes);
 	}
 #else
 	(void)ics;
+	(void)target_ns;
 #endif
 
 	// eyes.valid == false signals "no DP / no data" to the client.

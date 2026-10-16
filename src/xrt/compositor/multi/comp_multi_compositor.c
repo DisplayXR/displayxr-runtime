@@ -2257,6 +2257,10 @@ multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
 	if (mc == NULL || out_eye_pos == NULL) {
 		return false;
 	}
+	if (target_ns <= 0) {
+		// 0 = "latest" (the pre-N6 IPC wire meaning).
+		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
+	}
 
 	// N6 Part 1 (#2144): the same source order as the "latest" query above,
 	// asking each Vulkan-vtable DP's target-time slot (on the VK variant —

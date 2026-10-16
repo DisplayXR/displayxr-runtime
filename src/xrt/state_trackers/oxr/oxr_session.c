@@ -161,6 +161,7 @@ comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct
 struct xrt_eye_positions;
 bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       int64_t target_ns,
                                                        struct xrt_eye_positions *out_eyes);
 
 // IPC-client eye-tracking-mode push to the out-of-process DP (#522) — same
@@ -185,6 +186,7 @@ comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uin
 struct xrt_system_compositor;
 bool
 comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              int64_t target_ns,
                                                               struct xrt_eye_positions *out_eyes);
 
 #ifdef OXR_HAVE_DXR_view_rig
@@ -3443,6 +3445,13 @@ locate_views_one(struct oxr_logger *log,
 	} else {
 		// N6 Part 1 (#2144): the eyes at the frame's displayTime, not "latest".
 		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (int64_t)xdisplay_time, &eye_pos);
+		static bool logged_target = false;
+		if (!logged_target && got_eye_positions) {
+			logged_target = true;
+			U_LOG_W("N6: xrLocateViews eyes at displayTime (now %+.1f ms): valid=%d tracking=%d count=%u",
+			        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
+			        (int)eye_pos.valid, (int)eye_pos.is_tracking, (unsigned)eye_pos.count);
+		}
 	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
@@ -4676,20 +4685,30 @@ locate_views_one(struct oxr_logger *log,
 		    !sess->is_metal_native_compositor && sess->sys->xsysc->xmcc == NULL) {
 			struct xrt_eye_positions ipc_eyes;
 			bool got = false;
+			// N6 Part 1 (#2144): ask for the frame's displayTime — the
+			// server samples this client's DP / ring at that instant.
 			if (sess->xcn != NULL) {
-				got = comp_ipc_client_compositor_get_predicted_eye_positions(&sess->xcn->base, &ipc_eyes);
+				got = comp_ipc_client_compositor_get_predicted_eye_positions(
+				    &sess->xcn->base, (int64_t)xdisplay_time, &ipc_eyes);
 			} else {
 				// Compositor-less sessions (#449): headless clients
 				// like the WebXR bridge have no xcn — route the same
 				// RPC through the IPC system-compositor proxy so
 				// their derived isTracking (and the edge event) is
 				// truthful instead of constant-FALSE.
-				got = comp_ipc_client_system_compositor_get_predicted_eye_positions(sess->sys->xsysc,
-				                                                                    &ipc_eyes);
+				got = comp_ipc_client_system_compositor_get_predicted_eye_positions(
+				    sess->sys->xsysc, (int64_t)xdisplay_time, &ipc_eyes);
 			}
 			if (got) {
 				is_tracking = ipc_eyes.is_tracking;
 				from_ipc = true;
+				static bool logged_ipc_target = false;
+				if (!logged_ipc_target) {
+					logged_ipc_target = true;
+					U_LOG_W("N6: IPC eye query at displayTime (now %+.1f ms): valid=%d tracking=%d",
+					        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
+					        (int)ipc_eyes.valid, (int)ipc_eyes.is_tracking);
+				}
 			}
 		}
 

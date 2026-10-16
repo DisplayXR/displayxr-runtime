@@ -36,6 +36,7 @@
 #include "util/u_system.h"
 #include "util/u_time.h"
 #include "util/u_crash_guard.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
@@ -32912,6 +32913,100 @@ svc_conv_eyes_key(const struct xrt_display_processor_d3d11 *dp)
 	return (uint64_t)(uintptr_t)dp;
 }
 
+/*
+ * N6 Part 1 (ADR-054 §4.1, #2144): one u_eye_history ring per display
+ * processor this service asks for eyes. Every answer published below (the
+ * per-client locate queries AND the render thread's per-frame viewer publish
+ * in multi_compositor_render) is pushed into the answering DP's ring, keyed
+ * by the time it was asked, so a DP without the target-time slot can still be
+ * sampled at a client's display time. A small fixed table, not a map: a DP
+ * destroyed without a retire (a panel DP swap) just ages out of its slot,
+ * the least-recently-fed slot is reused, and a lost ring only costs the
+ * fallback to the "latest" answer.
+ */
+#define SVC_EYE_RING_SLOTS 16
+
+struct svc_eye_ring_slot
+{
+	uint64_t dp_key;      //!< 0 = free
+	int64_t last_push_ns; //!< LRU for reuse
+	bool inited;
+	struct u_eye_history hist;
+};
+
+static std::mutex g_eye_ring_mtx; // guards the slot table, not the samples
+static struct svc_eye_ring_slot g_eye_rings[SVC_EYE_RING_SLOTS];
+
+//! The ring for @p key; with @p create, claims a free / least-recent slot.
+static struct u_eye_history *
+svc_eye_ring_find(uint64_t key, bool create, int64_t now_ns)
+{
+	if (key == 0) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> g(g_eye_ring_mtx);
+	struct svc_eye_ring_slot *victim = nullptr;
+	for (uint32_t i = 0; i < SVC_EYE_RING_SLOTS; i++) {
+		struct svc_eye_ring_slot *s = &g_eye_rings[i];
+		if (s->dp_key == key) {
+			if (create) {
+				s->last_push_ns = now_ns;
+			}
+			return &s->hist;
+		}
+		// A free slot beats any used one; among used, the least recently fed.
+		if (s->dp_key == 0) {
+			if (victim == nullptr || victim->dp_key != 0) {
+				victim = s;
+			}
+		} else if (victim == nullptr || (victim->dp_key != 0 && s->last_push_ns < victim->last_push_ns)) {
+			victim = s;
+		}
+	}
+	if (!create || victim == nullptr) {
+		return nullptr;
+	}
+	if (!victim->inited) {
+		u_eye_history_init(&victim->hist);
+		victim->inited = true;
+	} else {
+		u_eye_history_clear(&victim->hist);
+	}
+	victim->dp_key = key;
+	victim->last_push_ns = now_ns;
+	return &victim->hist;
+}
+
+static void
+svc_eye_ring_push(uint64_t key, const struct xrt_eye_positions *eyes)
+{
+	if (eyes == nullptr || !eyes->valid) {
+		return;
+	}
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/true, now_ns);
+	if (h != nullptr) {
+		u_eye_history_push(h, eyes, now_ns);
+	}
+}
+
+//! A destroyed DP's ring is emptied and its slot freed.
+static void
+svc_eye_ring_retire(uint64_t key)
+{
+	if (key == 0) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(g_eye_ring_mtx);
+	for (uint32_t i = 0; i < SVC_EYE_RING_SLOTS; i++) {
+		if (g_eye_rings[i].dp_key == key) {
+			u_eye_history_clear(&g_eye_rings[i].hist);
+			g_eye_rings[i].dp_key = 0;
+			g_eye_rings[i].last_push_ns = 0;
+		}
+	}
+}
+
 static void
 svc_publish_eyes(struct d3d11_service_system *sys,
                  const struct xrt_display_processor_d3d11 *dp,
@@ -32923,6 +33018,8 @@ svc_publish_eyes(struct d3d11_service_system *sys,
 	if (l != nullptr) {
 		d3d11_lift_publish_eyes(l, eyes);
 	}
+	// N6 Part 1 (#2144): every published answer feeds the answering DP's ring.
+	svc_eye_ring_push(svc_conv_eyes_key(dp), eyes);
 	void (*fn)(void *, uint64_t, const struct xrt_eye_positions *);
 	void *ud;
 	{
@@ -32948,6 +33045,9 @@ svc_conv_eyes_retire(const struct xrt_display_processor_d3d11 *dp)
 	}
 	if (fn != nullptr && dp != nullptr) {
 		fn(ud, svc_conv_eyes_key(dp));
+	}
+	if (dp != nullptr) {
+		svc_eye_ring_retire(svc_conv_eyes_key(dp)); // N6 Part 1 (#2144)
 	}
 }
 
@@ -33008,6 +33108,82 @@ comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor
                                                      struct xrt_eye_positions *out_eyes)
 {
 	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, /*xc=*/nullptr, out_eyes);
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_system_compositor *xsysc,
+                                                                  struct xrt_compositor *xc,
+                                                                  int64_t target_ns,
+                                                                  struct xrt_eye_positions *out_eyes)
+{
+	// target 0 = "latest" (the pre-N6 wire meaning, and any caller without a
+	// display time).
+	if (target_ns <= 0) {
+		return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, out_eyes);
+	}
+	if (xsysc == NULL || out_eyes == NULL) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	uint64_t key = 0;
+	{
+		// Same lock + DP resolution as the "latest" query (#363, #625).
+		render_mutex_fair_lock render_lock(sys);
+		struct xrt_display_processor_d3d11 *dp = resolve_eye_display_processor(sys, xc);
+		if (dp != nullptr) {
+			key = svc_conv_eyes_key(dp);
+		}
+		// The DP's own target-time slot when it has one ...
+		if (dp != nullptr && xrt_display_processor_d3d11_has_eye_positions_at(dp)) {
+			U_ZERO(out_eyes);
+			if (xc != nullptr && xc->destroy == compositor_destroy) {
+				d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.store(key,
+				                                                           std::memory_order_relaxed);
+			}
+			static bool logged_slot = false;
+			if (!logged_slot) {
+				logged_slot = true;
+				U_LOG_W(
+				    "N6: eyes at a target time from the DP's get_eye_positions_at slot "
+				    "(target = now %+.1f ms)",
+				    (double)(target_ns - (int64_t)os_monotonic_get_ns()) / 1e6);
+			}
+			return xrt_display_processor_d3d11_get_eye_positions_at(dp, target_ns, out_eyes) &&
+			       out_eyes->valid;
+		}
+	}
+	// ... else that DP's ring of published answers sampled at the target ...
+	struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/false, 0);
+	if (h != nullptr && u_eye_history_get(h, target_ns, out_eyes) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eyes->valid;
+	}
+	// ... else the "latest" answer (which primes the ring).
+	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, out_eyes);
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client_at(struct xrt_system_compositor *xsysc,
+                                                             struct xrt_compositor *xc,
+                                                             int64_t target_ns,
+                                                             struct xrt_vec3 *out_left,
+                                                             struct xrt_vec3 *out_right)
+{
+	if (out_left == NULL || out_right == NULL) {
+		return false;
+	}
+	struct xrt_eye_positions eyes;
+	if (!comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(xsysc, xc, target_ns, &eyes) ||
+	    !eyes.valid) {
+		return false;
+	}
+	out_left->x = eyes.eyes[0].x;
+	out_left->y = eyes.eyes[0].y;
+	out_left->z = eyes.eyes[0].z;
+	out_right->x = eyes.eyes[1].x;
+	out_right->y = eyes.eyes[1].y;
+	out_right->z = eyes.eyes[1].z;
+	return true;
 }
 
 bool
