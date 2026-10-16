@@ -135,6 +135,12 @@ fi
 RUNTIME_SO="$(find_runtime)"
 CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli -type f | head -1)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
+# ADR-054 §2 clause 3: every component class ships its sim_* reference. Both
+# decline at probe until their ENABLE setting is on (`displayxr-cli input set
+# sim-input ENABLE 1` / `conv set sim-conversion ENABLE 1`), so shipping them
+# changes nothing for a user: qwerty keeps the hand roles, no task moves.
+SIMINPUT_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
+SIMCONV_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
 # `|| true`: no targets/service dir at all in a non-service build; the check
 # below turns that into the real error message.
 SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
@@ -162,6 +168,16 @@ done
 [ -n "$HOST_BIN" ] || {
     echo "error: displayxr-conversion-host not built — the .deb ships it beside the service" >&2
     echo "       (ADR-053 P2). Build with scripts/build_linux.sh --hybrid." >&2
+    exit 1
+}
+[ -n "$SIMINPUT_SO" ] && [ -n "$SIMCONV_SO" ] || {
+    echo "error: DisplayXR-SimInput.so / DisplayXR-SimConversion.so not built under $BUILD_DIR/src/xrt/drivers" >&2
+    echo "       (the .deb ships the reference provider of every class, ADR-054 §2 clause 3)." >&2
+    exit 1
+}
+SIMCONV_PACK="$(dirname "$SIMCONV_SO")/sim-conversion.models.json"
+[ -f "$SIMCONV_PACK" ] && [ -d "$(dirname "$SIMCONV_SO")/sim-conversion-blobs" ] || {
+    echo "error: sim-conversion.models.json / sim-conversion-blobs not next to $SIMCONV_SO (ADR-053 P4 pack)." >&2
     exit 1
 }
 
@@ -240,6 +256,11 @@ install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
 install -m 0755 "$HOST_BIN"    "$STAGE/usr/lib/displayxr/bin/displayxr-conversion-host"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+install -m 0644 "$SIMINPUT_SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimInput.so"
+install -m 0644 "$SIMCONV_SO"  "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimConversion.so"
+install -m 0644 "$SIMCONV_PACK" "$STAGE/usr/lib/displayxr/plugins/sim-conversion.models.json"
+mkdir -p "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs"
+install -m 0644 "$(dirname "$SIMCONV_SO")/sim-conversion-blobs"/* "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs/"
 install -m 0644 "$VKLAYER_SO"  "$STAGE/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so"
 # The dashboard sits beside displayxr-cli, which it resolves next to itself.
 # Never strip it: the payload is appended to the ELF host.
@@ -307,6 +328,40 @@ cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json" <<EOF
 }
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json"
+
+# --- Reference input + conversion provider manifests (ADR-054 §2 clause 3) --
+# The `-input-provider.json` / `-conversion-provider.json` suffixes route each
+# manifest to its class loader. Shipped as dpkg-tracked files like the DP one;
+# both providers stay inert until their ENABLE setting is on.
+cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "$VERSION",
+        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-SimInput.so",
+        "probe_order":  200
+    }
+}
+EOF
+cat > "$STAGE/usr/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "$VERSION",
+        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-SimConversion.so",
+        "probe_order":  250,
+        "packs":        ["/usr/lib/displayxr/plugins/sim-conversion.models.json"]
+    }
+}
+EOF
+chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-input-input-provider.json" \
+           "$STAGE/usr/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json"
 
 # --- VK_LAYER_DXR_queue_lock manifest (#902 / #2036) ------------------------
 # Generated from the same template CMake uses (src/xrt/targets/vk_layer), with

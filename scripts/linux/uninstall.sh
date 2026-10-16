@@ -54,6 +54,7 @@ if [ -f "$ACTIVE" ] && grep -q "openxr_displayxr.so" "$ACTIVE"; then
 fi
 
 rm -f "$DP_ROOT/200-sim-display.json"
+rm -f "$DP_ROOT/200-sim-input-input-provider.json" "$DP_ROOT/250-sim-conversion-conversion-provider.json"
 # Leave other vendors' manifests + the shared root in place; prune if empty.
 rmdir "$DP_ROOT" 2>/dev/null || true
 
