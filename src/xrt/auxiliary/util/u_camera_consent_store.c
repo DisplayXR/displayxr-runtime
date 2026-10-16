@@ -709,23 +709,21 @@ u_camera_consent_path_user_writable(const char *exe)
 	return true;
 }
 
-bool
-u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+/*!
+ * WinVerifyTrust on @p wpath (and, when not INVALID_HANDLE_VALUE, the already
+ * open @p file, so the bytes verified are the bytes the caller holds). Returns
+ * whether the Authenticode chain verified; @p out receives the leaf signer's
+ * subject CN and @p have_cn says whether one was found.
+ */
+static bool
+authenticode_verify(const wchar_t *wpath, HANDLE file, char *out, size_t cap, bool *have_cn)
 {
-	if (cap > 0) {
-		out[0] = '\0';
-	}
-	if (exe == NULL || exe[0] == '\0' || cap == 0) {
-		return false;
-	}
-	wchar_t *wexe = u8_to_w(exe);
-	if (wexe == NULL) {
-		return false;
-	}
+	*have_cn = false;
 	WINTRUST_FILE_INFO fi;
 	memset(&fi, 0, sizeof(fi));
 	fi.cbStruct = sizeof(fi);
-	fi.pcwszFilePath = wexe;
+	fi.pcwszFilePath = wpath;
+	fi.hFile = file != INVALID_HANDLE_VALUE ? file : NULL;
 
 	WINTRUST_DATA wd;
 	memset(&wd, 0, sizeof(wd));
@@ -742,8 +740,8 @@ u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 
 	GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 	LONG st = WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
-	bool ok = false;
-	if (st == ERROR_SUCCESS) {
+	const bool chain_ok = st == ERROR_SUCCESS;
+	if (chain_ok) {
 		CRYPT_PROVIDER_DATA *pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
 		CRYPT_PROVIDER_SGNR *sg = pd != NULL ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : NULL;
 		CRYPT_PROVIDER_CERT *pc = sg != NULL ? WTHelperGetProvCertFromChain(sg, 0) : NULL;
@@ -751,13 +749,60 @@ u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 			wchar_t cn[U_CAMERA_CONSENT_SIGNER_MAX];
 			DWORD n = CertGetNameStringW(pc->pCert, CERT_NAME_ATTR_TYPE, 0, (void *)szOID_COMMON_NAME, cn,
 			                             (DWORD)(sizeof(cn) / sizeof(cn[0])));
-			ok = n > 1 && w_to_u8(cn, (int)wcslen(cn), out, cap) && out[0] != '\0';
+			*have_cn = n > 1 && w_to_u8(cn, (int)wcslen(cn), out, cap) && out[0] != '\0';
 		}
 	}
 	wd.dwStateAction = WTD_STATEACTION_CLOSE;
 	WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
+	if (!*have_cn && cap > 0) {
+		out[0] = '\0';
+	}
+	return chain_ok;
+}
+
+bool
+u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+{
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	if (exe == NULL || exe[0] == '\0' || cap == 0) {
+		return false;
+	}
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return false;
+	}
+	// Consent records key on the signer's name: no CN, no signer.
+	bool have_cn = false;
+	const bool chain_ok = authenticode_verify(wexe, INVALID_HANDLE_VALUE, out, cap, &have_cn);
 	free(wexe);
-	return ok;
+	return chain_ok && have_cn;
+}
+
+bool
+u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap)
+{
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	if (path == NULL || path[0] == '\0' || cap == 0) {
+		return false;
+	}
+	wchar_t *wpath = u8_to_w(path);
+	if (wpath == NULL) {
+		return false;
+	}
+	HANDLE h = file_handle != NULL ? (HANDLE)file_handle : INVALID_HANDLE_VALUE;
+	bool have_cn = false;
+	const bool chain_ok = authenticode_verify(wpath, h, out, cap, &have_cn);
+	free(wpath);
+	if (chain_ok && !have_cn) {
+		// A valid chain whose leaf has no CN is still signed; say so rather
+		// than demote it to unverified.
+		snprintf(out, cap, "%s", "(unknown subject)");
+	}
+	return chain_ok;
 }
 
 #else // POSIX
@@ -1113,6 +1158,17 @@ bool
 u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 {
 	(void)exe;
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	return false;
+}
+
+bool
+u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap)
+{
+	(void)path;
+	(void)file_handle;
 	if (cap > 0) {
 		out[0] = '\0';
 	}

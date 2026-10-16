@@ -533,6 +533,20 @@ u_camera_consent_path_user_writable(const char *exe);
 bool
 u_camera_consent_exe_signer(const char *exe, char *out, size_t cap);
 
+/*!
+ * Windows: does the file at @p path carry a VALID Authenticode chain to a
+ * trusted root (same verifier policy as @ref u_camera_consent_exe_signer: no
+ * UI, no revocation check, cache-only URL retrieval)? When @p file_handle (a
+ * Win32 `HANDLE` opened for read) is not NULL, WinVerifyTrust reads through
+ * it, so the verdict covers the bytes the caller holds open rather than
+ * whatever the path names a moment later. On success @p out receives the leaf
+ * signer's subject CN, or "(unknown subject)" when the leaf has none — unlike
+ * u_camera_consent_exe_signer, a CN-less signature still counts as signed.
+ * POSIX: always false.
+ */
+bool
+u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

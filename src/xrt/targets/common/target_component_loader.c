@@ -64,6 +64,28 @@ tc_basename(const char *path)
 	return base;
 }
 
+bool
+target_component_path_is_absolute(const char *path, bool windows_rules)
+{
+	if (path == NULL || path[0] == '\0') {
+		return false;
+	}
+	const bool sep0 = path[0] == '/' || path[0] == '\\';
+	const bool sep1 = path[1] == '/' || path[1] == '\\';
+	// `X:\` / `X:/` — a drive letter alone (`X:foo`) is drive-relative.
+	const bool drive = ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+	                   path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+	// `\\server\share`, `\\?\…`, `\\.\…`.
+	const bool unc = sep0 && sep1;
+	if (windows_rules) {
+		// A single leading separator is relative to the current drive.
+		return drive || unc;
+	}
+	// Manifest paths: POSIX-absolute, or a Windows absolute path (a test or
+	// cross-platform manifest), never anything cwd- or search-relative.
+	return path[0] == '/' || drive || unc;
+}
+
 static bool
 tc_usable(const struct target_component_entry *e)
 {
@@ -549,6 +571,13 @@ target_component_parse_manifest_json(const struct target_component_class *cls,
 		target_component_mark_malformed(out, "required field 'plugin.binary_path' missing");
 		return false;
 	}
+	// Nothing resolves a manifest's binary_path against the manifest's own
+	// directory, so a relative one would be resolved by dlopen against the
+	// process cwd / library search path: never what the manifest meant.
+	if (!target_component_path_is_absolute(out->binary_path, false)) {
+		target_component_mark_malformed(out, "'plugin.binary_path' is not an absolute path");
+		return false;
+	}
 
 	tc_entry_finish(out);
 	return true;
@@ -696,6 +725,9 @@ tc_read_row(const struct target_component_class *cls,
 
 	if (!have_binary || e->binary_path[0] == '\0') {
 		target_component_mark_malformed(e, "missing required 'Binary' value");
+	} else if (!target_component_path_is_absolute(e->binary_path, true)) {
+		// LoadLibrary would resolve it against the host's search order.
+		target_component_mark_malformed(e, "'Binary' is not an absolute path");
 	}
 	if (cls != NULL && cls->read_extra != NULL) {
 		cls->read_extra(cls, (const void *)sub, TARGET_COMPONENT_RAW_REGISTRY_KEY, e);
@@ -786,7 +818,9 @@ target_component_enumerate_registry(const struct target_component_class *cls,
 static bool
 tc_prov_signed(const char *path, char *signer, size_t cap)
 {
-	return u_camera_consent_exe_signer(path, signer, cap);
+	// A valid chain with no leaf CN is signed "(unknown subject)", not
+	// unverified (the consent store's helper needs a name; this gate does not).
+	return u_authenticode_file_signer(path, NULL, signer, cap);
 }
 
 static bool
@@ -971,6 +1005,13 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		reason[0] = '\0';
 	}
 	if (cls == NULL || e == NULL || out_module == NULL || out_entrypoint == NULL) {
+		return TARGET_COMPONENT_LOAD_FAILED;
+	}
+	// Discovery marks such rows MALFORMED; this catches a caller-built entry.
+	if (!target_component_path_is_absolute(e->binary_path, true)) {
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "binary path is not absolute");
+		}
 		return TARGET_COMPONENT_LOAD_FAILED;
 	}
 
@@ -2100,6 +2141,14 @@ target_component_load_binary_ex(const struct target_component_class *cls,
 		reason[0] = '\0';
 	}
 	if (cls == NULL || e == NULL || out_module == NULL || out_entrypoint == NULL) {
+		return TARGET_COMPONENT_LOAD_FAILED;
+	}
+	// Discovery marks such rows MALFORMED; this catches a caller-built entry
+	// (a bare name would make dlopen search the library path).
+	if (!target_component_path_is_absolute(e->binary_path, false)) {
+		if (reason != NULL) {
+			snprintf(reason, reason_cap, "binary path is not absolute");
+		}
 		return TARGET_COMPONENT_LOAD_FAILED;
 	}
 
