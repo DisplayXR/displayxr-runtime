@@ -137,21 +137,57 @@ public class ComponentPolicyTests
     }
 
     [Fact]
-    public void Commands_AreTheCliLines()
+    public void Commands_AreArgumentVectors()
     {
-        Assert.Equal("dp enable leia-sr", PolicyCommands.Enable(ComponentClass.Display, "leia-sr"));
-        Assert.Equal("dp disable leia-sr --machine", PolicyCommands.Disable(ComponentClass.Display, "leia-sr", machine: true));
-        Assert.Equal("input use sim-input", PolicyCommands.Prefer(ComponentClass.Input, "sim-input"));
-        Assert.Equal("input reset", PolicyCommands.Reset(ComponentClass.Input));
-        Assert.Equal("dp reset --machine", PolicyCommands.Reset(ComponentClass.Display, machine: true));
-        Assert.Equal("conv enable sim-conversion", PolicyCommands.Enable(ComponentClass.Conversion, "sim-conversion"));
-        Assert.Equal("conv use depth-mono acme-conv", PolicyCommands.PreferTask("depth-mono", "acme-conv"));
-        Assert.Equal("conv reset depth-mono --machine", PolicyCommands.ResetTask("depth-mono", machine: true));
-        Assert.Equal("conv reset all", PolicyCommands.Reset(ComponentClass.Conversion));
-        // Ids are quoted the way every other control quotes CLI arguments.
-        Assert.Equal("input disable \"odd id\"", PolicyCommands.Disable(ComponentClass.Input, "odd id"));
+        static string[] V(params string[] a) => a;
+        Assert.Equal(V("dp", "enable", "leia-sr"), PolicyCommands.Enable(ComponentClass.Display, "leia-sr").Args);
+        Assert.Equal(V("dp", "disable", "leia-sr", "--machine"), PolicyCommands.Disable(ComponentClass.Display, "leia-sr", machine: true).Args);
+        Assert.Equal(V("input", "use", "sim-input"), PolicyCommands.Prefer(ComponentClass.Input, "sim-input").Args);
+        Assert.Equal(V("input", "reset"), PolicyCommands.Reset(ComponentClass.Input).Args);
+        Assert.Equal(V("dp", "reset", "--machine"), PolicyCommands.Reset(ComponentClass.Display, machine: true).Args);
+        Assert.Equal(V("conv", "enable", "sim-conversion"), PolicyCommands.Enable(ComponentClass.Conversion, "sim-conversion").Args);
+        Assert.Equal(V("conv", "use", "depth-mono", "acme-conv"), PolicyCommands.PreferTask("depth-mono", "acme-conv").Args);
+        Assert.Equal(V("conv", "reset", "depth-mono", "--machine"), PolicyCommands.ResetTask("depth-mono", machine: true).Args);
+        Assert.Equal(V("conv", "reset", "all"), PolicyCommands.Reset(ComponentClass.Conversion).Args);
+        Assert.Equal(V("input", "disable", "x"), PolicyCommands.Toggle(ComponentClass.Input, "x", enabled: true).Args);
+        Assert.Equal(V("input", "enable", "x", "--machine"), PolicyCommands.Toggle(ComponentClass.Input, "x", enabled: false, machine: true).Args);
+        // The readable form (log pane, administrator hints).
+        Assert.Equal("conv use depth-mono acme-conv/depth-a", PolicyCommands.PreferTask("depth-mono", "acme-conv/depth-a").ToString());
         Assert.Equal(new[] { "policy-dp", "policy-input", "policy-conv" }, ComponentClasses.All.Select(PolicyCommands.Area));
         Assert.Equal(new[] { "display processor", "input provider", "conversion provider" }, ComponentClasses.All.Select(c => c.Noun()));
+    }
+
+    [Theory]
+    [InlineData("odd id")]
+    [InlineData("quote\"in\"id")]
+    [InlineData("trailing\\")]
+    [InlineData("back\\\"slash")]
+    [InlineData("")]
+    [InlineData("--machine")]
+    public void Ids_TravelAsOneArgument(string id)
+    {
+        // Whatever a (Linux) manifest put in an id, it is exactly one argument: no quoting
+        // rule between the dashboard and the CLI can split or merge it.
+        foreach (var c in ComponentClasses.All)
+        {
+            var cmd = PolicyCommands.Disable(c, id);
+            Assert.Equal(3, cmd.Args.Count);
+            Assert.Equal(id, cmd.Args[2]);
+        }
+        Assert.Equal(id, PolicyCommands.PreferTask("depth-mono", id).Args[3]);
+    }
+
+    [Theory]
+    [InlineData("plain", "plain")]
+    [InlineData("odd id", "\"odd id\"")]
+    [InlineData("a\"b", "\"a\\\"b\"")]
+    [InlineData("C:\\dir\\", "C:\\dir\\")]
+    [InlineData("C:\\my dir\\", "\"C:\\my dir\\\\\"")]
+    [InlineData("", "\"\"")]
+    public void ReadableForm_QuotesTheWayWindowsSplitsBack(string arg, string shown)
+    {
+        Assert.Equal(shown, CliArgs.Display(arg));
+        Assert.Equal(new CliArgs("a", "b"), CliArgs.Words(" a  b "));
     }
 
     [Fact]

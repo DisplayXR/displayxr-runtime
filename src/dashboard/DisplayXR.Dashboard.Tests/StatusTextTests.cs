@@ -162,9 +162,11 @@ public class StatusTextTests
         Assert.Equal(2, forced.Selected);
         Assert.Equal("forced (user)", StatusText.ForcedChip(keyed, dp));
         Assert.Equal("applies live", StatusText.ApplyLabel(keyed, dp));
-        Assert.Equal("dp use sim-display --screen k1", StatusText.DpVerb("k1", forced.Items[2]));
-        Assert.Equal("dp reset --screen k1", StatusText.DpVerb("k1", forced.Items[0]));
-        Assert.Equal("dp reset --screen \"a b\"", StatusText.DpVerb("a b", forced.Items[0]));
+        Assert.Equal(new[] { "dp", "use", "sim-display", "--screen", "k1" }, StatusText.DpVerb("k1", forced.Items[2]).Args);
+        Assert.Equal(new[] { "dp", "reset", "--screen", "k1" }, StatusText.DpVerb("k1", forced.Items[0]).Args);
+        // A key with a space is ONE argument; only the readable form quotes it.
+        Assert.Equal(new[] { "dp", "reset", "--screen", "a b" }, StatusText.DpVerb("a b", forced.Items[0]).Args);
+        Assert.Equal("dp reset --screen \"a b\"", StatusText.DpVerb("a b", forced.Items[0]).ToString());
 
         var unknown = new DpList(null, plugins, new[] { new DpScreen("k1", "", "", "x", "gone-plugin", "machine", true, "next-session") });
         var u = StatusText.DpSelector(keyed, unknown)!.Value;

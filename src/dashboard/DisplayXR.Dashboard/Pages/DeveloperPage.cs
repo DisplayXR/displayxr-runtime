@@ -91,7 +91,7 @@ public sealed class DeveloperPage : Page
             // Cleared (or never set): nothing about it, unless a clear just failed.
             return failed ? U.Notice(Level.Critical, "The machine-wide override did not change", Ctx.LastAction!) : null;
         }
-        var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", "dp reset"), "warn", "sm");
+        var clear = U.Button("Clear machine-wide override", () => _ = Ctx.RunActionsAsync("dp", CliArgs.Words("dp reset")), "warn", "sm");
         clear.IsEnabled = !Ctx.ActionRunning;
         var displays = U.Button("Open Displays", () => Ctx.Navigate("displays"), "outline", "sm");
         var box = U.VStack(8, U.Notice(Level.Warn, n.Title, n.Text, clear, displays));
@@ -159,7 +159,7 @@ public sealed class DeveloperPage : Page
         var shown = U.Text("", "meta");
         shown.VerticalAlignment = VerticalAlignment.Center;
         _shown = shown;
-        var resetAll = U.Button("Reset all", () => _ = Ctx.RunActionsAsync("devperf", "perf reset"), "warn", "sm");
+        var resetAll = U.Button("Reset all", () => _ = Ctx.RunActionsAsync("devperf", CliArgs.Words("perf reset")), "warn", "sm");
         resetAll.IsEnabled = !Ctx.ActionRunning;
         body.Children.Add(U.Flow(14, 6, shown, resetAll));
         body.Children.Add(U.Wrapped(StatusText.DevResetAllNote, "desc"));
@@ -253,14 +253,14 @@ public sealed class DeveloperPage : Page
         var foot = U.Flow(12, 2, dflt);
         if (l.Managed)
         {
-            var reset = U.Button("Reset", () => _ = Ctx.RunActionsAsync("devperf", $"perf reset {l.Name}"), "outline", "sm");
+            var reset = U.Button("Reset", () => _ = Ctx.RunActionsAsync("devperf", new CliArgs("perf", "reset", l.Name)), "outline", "sm");
             reset.IsEnabled = !Ctx.ActionRunning && l.Resettable;
             Avalonia.Automation.AutomationProperties.SetName(reset, $"Reset {l.Name}");
             U.AddFlow(foot, U.Chip("settable", Level.Info), 12, 2);
             if (l.SwitchValue is { } sv)
             {
                 string label = StatusText.DevSwitchLabel(l);
-                var set = U.Button(label, () => _ = Ctx.RunActionsAsync("devperf", $"perf set {l.Name} {sv}"), "outline", "sm");
+                var set = U.Button(label, () => _ = Ctx.RunActionsAsync("devperf", new CliArgs("perf", "set", l.Name, sv)), "outline", "sm");
                 set.IsEnabled = !Ctx.ActionRunning && l.Switchable;
                 Avalonia.Automation.AutomationProperties.SetName(set, $"{label} {l.Name}");
                 U.AddFlow(foot, set, 12, 2);

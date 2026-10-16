@@ -92,7 +92,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            var r = await Cli.RunAsync("info --json", InfoTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("info --json"), InfoTimeout);
             InfoResult? info = null;
             string? err = null;
             if (r.Started && !r.TimedOut && InfoResult.TryParse(r.Json, out info, out err))
@@ -135,7 +135,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            var r = await Cli.RunAsync("workspace list --json", InfoTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("workspace list --json"), InfoTimeout);
             if (r.Started && !r.TimedOut && WorkspaceList.TryParse(r.Json, out var ws))
             {
                 Workspace = ws;
@@ -189,7 +189,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            string verb = $"{cls.Verb()} list --json";
+            var verb = new CliArgs(cls.Verb(), "list", "--json");
             var r = await Cli.RunAsync(verb, InfoTimeout);
             if (r.Ok && PolicyList.TryParse(cls, r.Json, out var list))
             {
@@ -234,7 +234,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            var r = await Cli.RunAsync("dp list --json", InfoTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("dp list --json"), InfoTimeout);
             if (r.Ok && DpList.TryParse(r.Json, out var list)) { Dp = list; DpError = null; _dpWhen = DateTime.Now; }
             else DpError = r.Ok ? "Could not read 'displayxr-cli dp list --json'." : r.Summary;
         }
@@ -253,7 +253,7 @@ public sealed class DashboardContext
         if (!force && PerfWhen is { } t && DateTime.Now - t < TimeSpan.FromSeconds(5)) return;
         try
         {
-            var r = await Cli.RunAsync("perf list --json", ActionTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("perf list --json"), ActionTimeout);
             if (r.Ok && PerfStateParser.TryParse(r.Json, out var p)) { Perf = p; PerfError = null; PerfWhen = DateTime.Now; }
             else PerfError = r.Ok ? "Could not read 'displayxr-cli perf list --json'." : r.Summary;
         }
@@ -278,7 +278,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            var r = await Cli.RunAsync("perf list --all --json", ActionTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("perf list --all --json"), ActionTimeout);
             if (r.Ok && DevLeverList.TryParse(r.Json, out var list)) { PerfAll = list; PerfAllError = null; }
             else PerfAllError = r.Ok ? "Could not read 'displayxr-cli perf list --all --json'." : r.Summary;
         }
@@ -300,7 +300,7 @@ public sealed class DashboardContext
         Bump();
         try
         {
-            var r = await Cli.RunAsync("selftest --json", SelftestTimeout);
+            var r = await Cli.RunAsync(CliArgs.Words("selftest --json"), SelftestTimeout);
             if (r.Started && !r.TimedOut && SelftestResult.TryParse(r.Json, DateTime.Now, out var st)) Selftest = st;
             else
             {
@@ -322,7 +322,7 @@ public sealed class DashboardContext
     /// resolved state: what the page shows is what the chain resolved, never
     /// what the click assumed.
     /// </summary>
-    public async Task RunActionsAsync(string area, params string[] commands)
+    public async Task RunActionsAsync(string area, params CliArgs[] commands)
     {
         if (ActionRunning) return;
         ActionRunning = true;

@@ -7,6 +7,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
@@ -85,7 +86,18 @@ public sealed class CliProcessSource : IProcessSource
         return sb.ToString();
     }
 
-    private ProcessStartInfo Info(string arguments, bool stdin) => new(CliPath, arguments)
+    /// <summary>
+    /// The start info for one run. Arguments go through <see cref="ProcessStartInfo.ArgumentList"/>
+    /// (the runtime quotes each one for the platform), never a hand-built command line.
+    /// </summary>
+    private ProcessStartInfo Info(CliArgs args, bool stdin)
+    {
+        var psi = NewInfo(stdin);
+        foreach (var a in args.Args) psi.ArgumentList.Add(a);
+        return psi;
+    }
+
+    private ProcessStartInfo NewInfo(bool stdin) => new(CliPath)
     {
         UseShellExecute = false,
         CreateNoWindow = true,
@@ -100,7 +112,7 @@ public sealed class CliProcessSource : IProcessSource
     public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit)
     {
         if (!CliExists) throw new FileNotFoundException($"{ExeName} not found (looked at {CliPath})");
-        var p = new Process { StartInfo = Info("status --watch --json", stdin: true), EnableRaisingEvents = false };
+        var p = new Process { StartInfo = Info(CliArgs.Words("status --watch --json"), stdin: true), EnableRaisingEvents = false };
         p.Start();
         ChildJob.Add(p);
         DashboardLog.Info($"status --watch started (pid {p.Id})");
@@ -169,13 +181,13 @@ public sealed class CliProcessSource : IProcessSource
         }
     }
 
-    public async Task<CliResult> RunAsync(string arguments, TimeSpan timeout, CancellationToken cancel = default)
+    public async Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default)
     {
         if (!CliExists) return new CliResult(-1, "", "", false, $"{ExeName} not found (looked at {CliPath}).");
         Process p;
         try
         {
-            p = new Process { StartInfo = Info(arguments, stdin: true) };
+            p = new Process { StartInfo = Info(args, stdin: true) };
             p.Start();
         }
         catch (Exception ex)
