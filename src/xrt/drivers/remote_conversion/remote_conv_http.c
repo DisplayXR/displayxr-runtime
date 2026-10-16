@@ -229,7 +229,7 @@ rc_http_perform(const struct rc_http_request *rq, struct rc_http_response *resp)
 		set_msg(resp, RC_HTTP_CONNECT, "cannot open a connection to %s", rq->url);
 		goto out_handles;
 	}
-	(void)WinHttpSetTimeouts(ses, (int)timeout, (int)timeout, (int)timeout, (int)timeout);
+	(void)WinHttpSetTimeouts(req, (int)timeout, (int)timeout, (int)timeout, (int)timeout);
 	// Never follow a redirect: the Authorization header must reach only the configured host.
 	DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
 	(void)WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof(never));
