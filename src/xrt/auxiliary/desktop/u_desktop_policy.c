@@ -24,6 +24,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -97,6 +99,31 @@ static FILE *
 file_open(const char *path, const char *mode)
 {
 #ifdef XRT_OS_WINDOWS
+	if (mode[0] == 'r') {
+		// Readers share EVERYTHING, delete included: _wfopen omits FILE_SHARE_DELETE,
+		// so an app merely reading the store would make the writer's MoveFileExW
+		// rename-over fail with a sharing violation — and the kill switch not land.
+		wchar_t *wr = u8_to_w(path);
+		if (wr == NULL) {
+			return NULL;
+		}
+		HANDLE h = CreateFileW(wr, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+		                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		free(wr);
+		if (h == INVALID_HANDLE_VALUE) {
+			return NULL;
+		}
+		int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+		if (fd < 0) {
+			CloseHandle(h);
+			return NULL;
+		}
+		FILE *rf = _fdopen(fd, "rb");
+		if (rf == NULL) {
+			_close(fd); // closes the handle too
+		}
+		return rf;
+	}
 	wchar_t *wp = u8_to_w(path);
 	wchar_t wm[8];
 	size_t i = 0;
@@ -135,8 +162,23 @@ file_rename_replace(const char *from, const char *to)
 #ifdef XRT_OS_WINDOWS
 	wchar_t *wf = u8_to_w(from);
 	wchar_t *wt = u8_to_w(to);
-	bool ok =
-	    wf != NULL && wt != NULL && MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+	bool ok = false;
+	if (wf != NULL && wt != NULL) {
+		// Our own readers share delete (file_open), but another process (an older
+		// runtime, an antivirus or indexer) may hold the target briefly: retry a
+		// sharing violation / access denied for up to ~1 s.
+		for (int attempt = 0; attempt < 50; attempt++) {
+			if (MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+				ok = true;
+				break;
+			}
+			DWORD e = GetLastError();
+			if (e != ERROR_SHARING_VIOLATION && e != ERROR_ACCESS_DENIED) {
+				break;
+			}
+			Sleep(20);
+		}
+	}
 	free(wf);
 	free(wt);
 	return ok;
@@ -821,6 +863,11 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 		return false;
 	}
 	store_lock_t lk = store_lock(path);
+	if (lk == STORE_LOCK_NONE) {
+		// Never write unlocked: a concurrent `desktop stop` could be overwritten.
+		U_LOG_W("desktop_control: could not lock %s.lock - not changing the store", path);
+		return false;
+	}
 	enum load_status st;
 	cJSON *loaded = load_root_status(path, &st); // re-read UNDER the lock
 	if (st == LOAD_CORRUPT) {
@@ -874,6 +921,15 @@ u_desktop_policy_set_suspended(bool suspended, const char *by)
 		return false;
 	}
 	store_lock_t lk = store_lock(path);
+	if (lk == STORE_LOCK_NONE) {
+		if (!suspended) {
+			U_LOG_W("desktop_control: could not lock %s.lock - not resuming", path);
+			return false;
+		}
+		// The kill switch must always land: proceed unlocked. The worst a racing
+		// writer can do is an allow/deny lost to this write, never a resume.
+		U_LOG_W("desktop_control: could not lock %s.lock - writing the kill switch unlocked", path);
+	}
 	enum load_status st;
 	cJSON *loaded = load_root_status(path, &st); // re-read UNDER the lock
 	if (st == LOAD_CORRUPT) {
