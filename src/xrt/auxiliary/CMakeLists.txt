@@ -38,6 +38,11 @@ add_subdirectory(tracking)
 # Util library.
 add_subdirectory(util)
 
+# Desktop control library (XR_DXR_desktop_control, ADR-056).
+if(NOT ANDROID)
+	add_subdirectory(desktop)
+endif()
+
 # Android library.
 if(ANDROID)
 	add_subdirectory(android)
