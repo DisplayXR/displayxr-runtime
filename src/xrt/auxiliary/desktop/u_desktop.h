@@ -209,7 +209,8 @@ enum u_desktop_mod
  * the foreground thread's HKL; macOS UCKeyTranslate over the current input source;
  * GNOME the session keymap libei hands out, via xkbcommon). If the active layout has
  * no key producing the character without AltGr-style extra modifiers, fail with
- * U_DESKTOP_ERR_UNSUPPORTED and a message naming the character. Named keys (enter,
+ * U_DESKTOP_ERR_UNSUPPORTED and a message that does NOT name the character (see
+ * "Privacy": "the active keyboard layout has no key for that character"). Named keys (enter,
  * f5, left, ...) are layout-independent. Text goes through type_text, never chords.
  */
 struct u_desktop_chord
