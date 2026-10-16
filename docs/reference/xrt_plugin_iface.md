@@ -940,9 +940,9 @@ latter falls back to `get_predicted_eye_positions` when the slot is absent or NU
 `target_ns` is when the caller's pixels will be **seen**, on the `os_monotonic_get_ns()` clock —
 `xrLocateViews` passes the frame's `displayTime`. Fill `out` exactly as
 `get_predicted_eye_positions` does; set `out->timestamp_ns` to the tracker sample the answer is
-based on. The old slot keeps meaning "now + your default horizon". A plug-in that does not
-implement the new slot loses nothing: the runtime samples a ring of its old-slot answers at the
-target. Full contract: [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
+based on. The old slot keeps meaning "now + your default horizon". A DP without the slot keeps
+today's latest-answer behaviour — every path returns its `get_predicted_eye_positions` answer
+unchanged; implementing the slot opts in to display-time sampling. Full contract: [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
 ## Frame-timing inputs are an offer, never a requirement
 
@@ -959,7 +959,7 @@ Concretely, and verified rather than assumed:
 | Measured weave→scanout residual and panel period | `set_frame_timing`, an **optional appended slot** on each per-API vtable | Guarded by both `XRT_DP_HAS_SLOT` (a `struct_size` read-clamp, so a plug-in compiled against older headers is safe) and a NULL check. The runtime skips the call. |
 | Presentation paced to the previous frame's real scanout | Nothing — the runtime simply presents later | The plug-in sees an ordinary `process_atlas` call. Pacing changes *when* it is called, never *what* it must do. |
 | Fresh viewer position at weave time | The plug-in's own `get_predicted_eye_positions`, if it chooses to re-predict | A plug-in that samples once, or not at all, produces a correct frame with a staler viewer position. No runtime path requires re-prediction. |
-| The display time the eyes are wanted for | `get_eye_positions_at(target_ns)`, an **optional appended slot** on each per-API vtable (N6 Part 1) | The runtime asks `get_predicted_eye_positions` and samples its own ring of those answers at the target (interpolate / extrapolate ≤ 50 ms / stale after 500 ms). |
+| The display time the eyes are wanted for | `get_eye_positions_at(target_ns)`, an **optional appended slot** on each per-API vtable (N6 Part 1) | The runtime uses `get_predicted_eye_positions` unchanged — exactly the pre-slot behaviour. |
 
 The corollary matters for anyone writing a plug-in: **do not treat late
 presentation as a contract that you will be called at a particular time.** The

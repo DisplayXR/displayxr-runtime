@@ -2265,7 +2265,7 @@ multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
 	// N6 Part 1 (#2144): the same source order as the "latest" query above,
 	// asking each Vulkan-vtable DP's target-time slot (on the VK variant —
 	// every DP a Vulkan factory hands out is one) when it has it. A DP
-	// without the slot falls through to the "latest" path; the multi
+	// without the slot keeps the unchanged "latest" answer; the multi
 	// compositor keeps no ring of its own (the per-frame weave queries live
 	// in the weave engines — Part 1b).
 	struct xrt_display_processor *dp = NULL;
@@ -2283,9 +2283,12 @@ multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
 	}
 #endif
 	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
-	if (xrt_display_processor_vk_has_eye_positions_at(vdp)) {
-		return xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos) && out_eye_pos->valid;
+	if (xrt_display_processor_vk_has_eye_positions_at(vdp) &&
+	    xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos) && out_eye_pos->valid) {
+		return true;
 	}
+	// No slot (or it failed; there is no ring here): the DP's own "latest"
+	// answer, unchanged — exactly the pre-N6 behaviour.
 	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
 }
 

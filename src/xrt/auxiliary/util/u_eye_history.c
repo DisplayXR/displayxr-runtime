@@ -119,8 +119,8 @@ u_eye_history_push(struct u_eye_history *h, const struct xrt_eye_positions *eyes
 	return true;
 }
 
-enum u_eye_history_result
-u_eye_history_get(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_positions *out)
+static enum u_eye_history_result
+get_impl(struct u_eye_history *h, int64_t target_ns, bool extrapolate, struct xrt_eye_positions *out)
 {
 	os_mutex_lock(&h->mutex);
 	if (h->count == 0) {
@@ -148,7 +148,7 @@ u_eye_history_get(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_pos
 			// Velocity from the newest two samples when they describe the
 			// same tracked layout; otherwise hold the latest.
 			const struct u_eye_history_entry *prev = h->count >= 2 ? at(h, h->count - 2) : NULL;
-			const bool have_velocity = prev != NULL && prev->ts_ns < newest->ts_ns &&
+			const bool have_velocity = extrapolate && prev != NULL && prev->ts_ns < newest->ts_ns &&
 			                           prev->eyes.count == newest->eyes.count && prev->eyes.is_tracking &&
 			                           newest->eyes.is_tracking;
 			if (have_velocity) {
@@ -202,6 +202,18 @@ u_eye_history_get(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_pos
 	out->valid = true;
 	os_mutex_unlock(&h->mutex);
 	return r;
+}
+
+enum u_eye_history_result
+u_eye_history_get(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_positions *out)
+{
+	return get_impl(h, target_ns, true, out);
+}
+
+enum u_eye_history_result
+u_eye_history_get_clamped(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_positions *out)
+{
+	return get_impl(h, target_ns, false, out);
 }
 
 bool

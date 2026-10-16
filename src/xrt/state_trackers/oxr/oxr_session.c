@@ -345,8 +345,8 @@ to_string(XrSessionState state)
  * (ADR-054 §4.1 / N6 Part 1, #2144): xrLocateViews passes the frame's
  * displayTime (monotonic), so the eyes the app renders for are the eyes at
  * the instant its pixels are seen — the DP's own target-time slot when it
- * has one, else the compositor's ring of per-frame answers sampled there,
- * else the vendor's "latest" prediction.
+ * has one; a DP without the slot keeps the vendor's "latest" prediction
+ * unchanged (today's behaviour).
  * Returns false if eye tracking is not available.
  */
 static bool

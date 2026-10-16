@@ -148,10 +148,11 @@ comp_d3d11_service_get_predicted_eye_positions_for_client(struct xrt_system_comp
  * Eye positions for a SPECIFIC client at a TARGET time (ADR-054 §4.1 /
  * N6 Part 1, #2144): the client's DP (resolved exactly as
  * @ref comp_d3d11_service_get_predicted_eye_positions_full_for_client) answers
- * through its own get_eye_positions_at slot when it has one; else the ring of
- * that DP's published answers (every query plus the render thread's
- * per-frame viewer publish) is sampled at @p target_ns; else the "latest"
- * answer.
+ * through its own get_eye_positions_at slot when it has one (if that slot
+ * fails, the ring of that DP's published answers — every query plus the
+ * render thread's per-frame viewer publish — is read at @p target_ns,
+ * clamped, never extrapolated). A DP WITHOUT the slot gets its "latest"
+ * answer unchanged — today's behaviour.
  *
  * @param target_ns When the pixels will be seen (os_monotonic_get_ns clock);
  *                  0 = "latest" (the pre-N6 behaviour).

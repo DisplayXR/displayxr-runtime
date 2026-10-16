@@ -280,8 +280,9 @@ Every DP vtable carries an optional appended slot `get_eye_positions_at(xdp, tar
 it with the instant the frame will be **seen** (`os_monotonic_get_ns()` clock — the app's
 `displayTime` for `xrLocateViews`), so if your SDK can predict to an arbitrary time (a
 predict-with-latency call), implement it and predict for `target_ns` rather than your default
-horizon. Leave it NULL and nothing breaks: the runtime keeps calling `get_predicted_eye_positions`
-and samples a ring of those answers at the target. Contract:
+horizon. Leave it NULL and nothing changes: a DP without the slot keeps today's latest-answer
+behaviour (the runtime uses your `get_predicted_eye_positions` answer unchanged); implementing the
+slot opts in to display-time sampling. Contract:
 [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
 ### Per-mode tracking capability (`mode_flags`, ABI v3 / #441)

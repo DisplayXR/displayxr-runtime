@@ -146,15 +146,20 @@ The contract:
   `valid` / `is_tracking` / never-zeros rules as *Tracking loss* below); `out->timestamp_ns` is the
   time of the **tracker sample** the answer is based on, so the caller can tell how far it was
   predicted.
-- **Fallback** — when the slot is absent (`struct_size` does not cover it: a plug-in built against
-  an older header) or NULL, the runtime calls `get_predicted_eye_positions` instead and samples
-  its own **trunk-side ring** (`util/u_eye_history.h`) at the target: every answer a compositor
-  gets from its DP (per-frame and per-locate) is pushed into the ring, keyed by when it was asked;
-  sampling is exact / interpolated (per eye; `is_tracking` is the AND of the neighbours, so a
-  tracking-lost edge is never interpolated away) / extrapolated on the last velocity for at most
-  50 ms / **stale** once the newest sample is older than 500 ms (last-known positions,
-  `is_tracking = false`). An older plug-in therefore keeps working unchanged; its residual error
-  is the vendor horizon it already applied.
+- **Fallback — a DP without the slot keeps today's latest-answer behaviour; implementing the slot
+  opts in to display-time sampling.** When the slot is absent (`struct_size` does not cover it: a
+  plug-in built against an older header) or NULL, every path — the in-process compositors, the
+  D3D11 service's per-client getters, the IPC server — returns the DP's own
+  `get_predicted_eye_positions` answer **unchanged**. That answer is already vendor-predicted, so
+  the runtime never re-samples or extrapolates it to the target (that would apply the horizon
+  twice).
+- **Ring** — every answer a compositor gets from its DP (per-frame and per-locate) is still pushed
+  into a **trunk-side ring** (`util/u_eye_history.h`), keyed by when it was asked. It is read only
+  when a DP **has** the slot and the slot fails or returns `valid = false`, and then **clamped**:
+  exact / interpolated between samples (per eye; `is_tracking` is the AND of the neighbours, so a
+  tracking-lost edge is never interpolated away) / the newest sample for any later target —
+  **never extrapolated** / **stale** once the newest sample is older than 500 ms (last-known
+  positions, `is_tracking = false`).
 
 The in-process compositors (D3D11, D3D12, GL, Metal, Vulkan) each own one ring next to their DP.
 The D3D11 service keeps one ring per DP it asks (a small fixed table; the render thread's
@@ -255,7 +260,7 @@ The display processor must:
 1. **Store the active eye tracking mode** (like it now stores `view_count`)
 2. **On mode change** (`xrRequestEyeTrackingModeDXR`): call vendor SDK to enable/disable managed behavior
 3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for MANAGED vs MANUAL (the SDK does it)
-4. **Optionally implement `get_eye_positions_at(target_ns)`** (see *Target-time query*): predict for the caller's display time with the SDK's own predictor (e.g. a predict-with-latency call) instead of its default horizon. Without it the runtime samples its ring of your `get_predicted_eye_positions()` answers.
+4. **Optionally implement `get_eye_positions_at(target_ns)`** (see *Target-time query*): predict for the caller's display time with the SDK's own predictor (e.g. a predict-with-latency call) instead of its default horizon. Without it the runtime keeps using your `get_predicted_eye_positions()` answer unchanged (today's behaviour).
 
 ### Event propagation for vendor-initiated transitions (MANAGED mode)
 

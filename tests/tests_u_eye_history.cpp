@@ -335,3 +335,42 @@ TEST_CASE("u_eye_history: result names")
 	CHECK(std::string(u_eye_history_result_str(U_EYE_HISTORY_RESULT_STALE)) == "stale");
 	CHECK(std::string(u_eye_history_result_str(U_EYE_HISTORY_RESULT_EXTRAPOLATED)) == "extrapolated");
 }
+
+TEST_CASE("u_eye_history: the clamped read never extrapolates past the newest sample")
+{
+	// The compositors read the ring only when a DP's target-time slot fails,
+	// and its samples are already vendor-predicted: predicting them again
+	// would double the horizon. So past the newest sample the clamped read
+	// holds that sample (LATEST), where u_eye_history_get extrapolates.
+	Ring r;
+	const xrt_eye_positions a = pair(0.00f, 0.1f, 0.6f);
+	const xrt_eye_positions b = pair(0.01f, 0.1f, 0.6f);
+	REQUIRE(u_eye_history_push(&r.h, &a, 100 * kMs));
+	REQUIRE(u_eye_history_push(&r.h, &b, 110 * kMs));
+
+	xrt_eye_positions out = {};
+	CHECK(u_eye_history_get_clamped(&r.h, 130 * kMs, &out) == U_EYE_HISTORY_RESULT_LATEST);
+	CHECK(out.eyes[0].x == Catch::Approx(0.01f - 0.032f));
+	CHECK(out.timestamp_ns == 110 * kMs);
+	CHECK(out.is_tracking);
+	CHECK(out.valid);
+
+	// The extrapolating read moves on with the velocity (0.01 m / 10 ms).
+	xrt_eye_positions ext = {};
+	CHECK(u_eye_history_get(&r.h, 130 * kMs, &ext) == U_EYE_HISTORY_RESULT_EXTRAPOLATED);
+	CHECK(ext.eyes[0].x == Catch::Approx(0.03f - 0.032f).margin(1e-5f));
+
+	// Between samples, interpolation is unchanged.
+	CHECK(u_eye_history_get_clamped(&r.h, 105 * kMs, &out) == U_EYE_HISTORY_RESULT_INTERPOLATED);
+	CHECK(out.eyes[0].x == Catch::Approx(0.005f - 0.032f).margin(1e-5f));
+
+	// Stale is still stale: last known, not tracking.
+	CHECK(u_eye_history_get_clamped(&r.h, 110 * kMs + U_EYE_HISTORY_MAX_AGE_NS + 1, &out) ==
+	      U_EYE_HISTORY_RESULT_STALE);
+	CHECK_FALSE(out.is_tracking);
+	CHECK(out.valid);
+
+	// Empty is empty.
+	Ring e;
+	CHECK(u_eye_history_get_clamped(&e.h, 1, &out) == U_EYE_HISTORY_RESULT_EMPTY);
+}
