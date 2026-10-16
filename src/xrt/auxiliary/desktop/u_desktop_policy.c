@@ -132,8 +132,8 @@ file_rename_replace(const char *from, const char *to)
 #ifdef XRT_OS_WINDOWS
 	wchar_t *wf = u8_to_w(from);
 	wchar_t *wt = u8_to_w(to);
-	bool ok = wf != NULL && wt != NULL &&
-	          MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+	bool ok =
+	    wf != NULL && wt != NULL && MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 	free(wf);
 	free(wt);
 	return ok;

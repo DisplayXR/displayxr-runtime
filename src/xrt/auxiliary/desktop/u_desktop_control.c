@@ -282,8 +282,7 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		// 8. The DisplayXR store is the ONLY grant for a backend whose OS has
 		// no consent of its own (Windows): an OS "granted" means nothing there.
 		// The in-memory answer counts only if persisting it failed.
-		if (d == U_DESKTOP_APP_ALLOW ||
-		    (c->store_write_failed && c->req_result == U_DESKTOP_ACCESS_GRANTED)) {
+		if (d == U_DESKTOP_APP_ALLOW || (c->store_write_failed && c->req_result == U_DESKTOP_ACCESS_GRANTED)) {
 			r = R_STORE_ALLOW;
 			s = U_DESKTOP_STATE_GRANTED;
 			goto out;
@@ -407,8 +406,7 @@ u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 	enum u_desktop_control_state s = evaluate_locked(c, &why);
 
 	// Rows 1–5: resolved without prompting; announce the blocking state.
-	if (why == R_NO_BACKEND || why == R_ENV_OFF || why == R_KILL_SWITCH || why == R_STORE_DENY ||
-	    why == R_LOCKED) {
+	if (why == R_NO_BACKEND || why == R_ENV_OFF || why == R_KILL_SWITCH || why == R_STORE_DENY || why == R_LOCKED) {
 		update_state_locked(c, NULL, true);
 		os_mutex_unlock(&c->mutex);
 		return U_DESKTOP_XR_SUCCESS;
@@ -459,10 +457,7 @@ observe_gate(struct u_desktop_control *c, uint32_t cap_bit)
 }
 
 int32_t
-u_desktop_control_list_windows(struct u_desktop_control *c,
-                               struct u_desktop_window *out,
-                               uint32_t cap,
-                               uint32_t *count)
+u_desktop_control_list_windows(struct u_desktop_control *c, struct u_desktop_window *out, uint32_t cap, uint32_t *count)
 {
 	int32_t g = observe_gate(c, U_DESKTOP_CAP_LIST_WINDOWS);
 	if (g != U_DESKTOP_XR_SUCCESS) {
@@ -1080,7 +1075,8 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 	result = refresh_window_list(c, &count, msg);
 	if (result != U_DESKTOP_XR_SUCCESS) {
 		if (result == U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED) {
-			snprintf(msg, sizeof(msg), "cannot verify the target: this desktop backend cannot list windows");
+			snprintf(msg, sizeof(msg),
+			         "cannot verify the target: this desktop backend cannot list windows");
 		}
 		so = STEP_FAIL;
 		goto done;
@@ -1219,8 +1215,8 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 		os_thread_name(&c->thread, "dxr: desktop");
 	}
 
-	U_LOG_I("desktop_control: created for %s (backend %s, state %s)", c->name,
-	        c->b != NULL ? c->b->name : "none", u_desktop_control_state_str(c->last_state));
+	U_LOG_I("desktop_control: created for %s (backend %s, state %s)", c->name, c->b != NULL ? c->b->name : "none",
+	        u_desktop_control_state_str(c->last_state));
 	*out = c;
 	return 0;
 }

@@ -87,8 +87,8 @@ struct u_desktop_action
 	uint32_t type; //!< enum u_desktop_action_type (validated: may hold any value)
 	uint64_t target_window_id;
 	struct u_desktop_rect rect;
-	int32_t x, y;   //!< point
-	int32_t x2, y2; //!< point2 (DRAG end)
+	int32_t x, y;    //!< point
+	int32_t x2, y2;  //!< point2 (DRAG end)
 	uint32_t button; //!< enum u_desktop_button (validated)
 	uint32_t click_count;
 	int32_t scroll_x, scroll_y;

@@ -11,11 +11,10 @@
 #include <string.h>
 
 static const char *const k_named_keys[] = {
-    "enter",     "tab",       "escape",       "backspace",    "delete", "insert",   "home",
-    "end",       "pageup",    "pagedown",     "left",         "right",  "up",       "down",
-    "space",     "minus",     "equal",        "comma",        "period", "slash",    "backslash",
-    "semicolon", "quote",     "bracketleft",  "bracketright", "grave",  "capslock", "printscreen",
-    "menu",
+    "enter",        "tab",      "escape",   "backspace",   "delete",    "insert",    "home",  "end",
+    "pageup",       "pagedown", "left",     "right",       "up",        "down",      "space", "minus",
+    "equal",        "comma",    "period",   "slash",       "backslash", "semicolon", "quote", "bracketleft",
+    "bracketright", "grave",    "capslock", "printscreen", "menu",
 };
 
 static bool
@@ -59,8 +58,8 @@ modifier_bit(const char *t)
 	if (strcmp(t, "alt") == 0 || strcmp(t, "option") == 0) {
 		return U_DESKTOP_MOD_ALT;
 	}
-	if (strcmp(t, "super") == 0 || strcmp(t, "win") == 0 || strcmp(t, "cmd") == 0 ||
-	    strcmp(t, "command") == 0 || strcmp(t, "meta") == 0) {
+	if (strcmp(t, "super") == 0 || strcmp(t, "win") == 0 || strcmp(t, "cmd") == 0 || strcmp(t, "command") == 0 ||
+	    strcmp(t, "meta") == 0) {
 		return U_DESKTOP_MOD_SUPER;
 	}
 	return 0;

@@ -454,7 +454,9 @@ fake_window_op(struct u_desktop_backend *b,
 			f->focus = 0;
 		}
 		break;
-	case U_DESKTOP_OP_RESTORE: w->state &= ~(uint32_t)(U_DESKTOP_WINDOW_MINIMIZED | U_DESKTOP_WINDOW_MAXIMIZED); break;
+	case U_DESKTOP_OP_RESTORE:
+		w->state &= ~(uint32_t)(U_DESKTOP_WINDOW_MINIMIZED | U_DESKTOP_WINDOW_MAXIMIZED);
+		break;
 	case U_DESKTOP_OP_MAXIMIZE:
 		w->state |= U_DESKTOP_WINDOW_MAXIMIZED;
 		w->frame = (struct u_desktop_rect){0, PANEL_H, SCREEN_W, SCREEN_H - PANEL_H};
@@ -533,8 +535,8 @@ fake_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 		int32_t dx = f->px - x, dy = f->py - y;
 		if (dx < -2 || dx > 2 || dy < -2 || dy > 2) {
 			if (msg != NULL) {
-				snprintf(msg, U_DESKTOP_MSG_SIZE, "pointer landed at (%d,%d), not (%d,%d)", f->px, f->py,
-				         x, y);
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "pointer landed at (%d,%d), not (%d,%d)", f->px,
+				         f->py, x, y);
 			}
 			r = U_DESKTOP_ERR_FAILED;
 		}

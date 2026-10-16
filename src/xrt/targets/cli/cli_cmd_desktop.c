@@ -204,8 +204,7 @@ print_audit_line(void *ctx, const char *line)
 		}
 	}
 	printf("%s  %-14s %-12s %-11s", cJSON_IsString(t) ? t->valuestring : "?", base,
-	       cJSON_IsString(action) ? action->valuestring : "?",
-	       cJSON_IsString(result) ? result->valuestring : "");
+	       cJSON_IsString(action) ? action->valuestring : "?", cJSON_IsString(result) ? result->valuestring : "");
 	if (cJSON_IsObject(target)) {
 		const cJSON *app = cJSON_GetObjectItemCaseSensitive(target, "app");
 		const cJSON *title = cJSON_GetObjectItemCaseSensitive(target, "title");
