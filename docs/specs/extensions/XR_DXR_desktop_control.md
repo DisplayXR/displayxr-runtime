@@ -199,6 +199,15 @@ audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `re
 | lock | `OpenInputDesktop` fails / WTS session locked | `CGSessionCopyCurrentDictionary` `CGSSessionScreenIsLocked` | `org.gnome.ScreenSaver.GetActive` |
 | idle | `GetLastInputInfo` | `CGEventSourceSecondsSinceLastEventType` | `org.gnome.Mutter.IdleMonitor.GetIdletime` |
 
+macOS notes: CGWindowList's on-screen list drops a window the moment it is minimized, so
+minimized windows come from a background AX snapshot (`u_desktop_mini_cache`). The backend's
+own window ops pin their outcome into it at once (a `MINIMIZE` lists the window immediately; a
+`RESTORE` / `ACTIVATE` / `MAXIMIZE` / `CLOSE` removes it), a snapshot that contradicts a pin
+younger than 5 s does not undo it, and `list_windows` called off the main thread (the worker's
+"target exists" check) refreshes a snapshot older than 250 ms synchronously — so a window just
+minimized, by the agent or by the user, is never a false `WINDOW_LOST`. The main thread never
+blocks on it.
+
 GNOME notes: text reaches the target through the clipboard (the portal has no "commit this
 string" path that survives an IME), so on GNOME **the agent's typed text passes through the
 clipboard, where clipboard managers and clipboard history can see and keep it**; the previous
