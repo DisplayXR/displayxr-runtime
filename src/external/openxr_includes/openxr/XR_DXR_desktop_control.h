@@ -154,7 +154,7 @@ typedef struct XrDesktopPickDXR {
     void* XR_MAY_ALIAS    next;
     XrOffset2Di           point;  //!< desktop coordinates
     XrDesktopPickKindDXR  kind;
-    XrDesktopWindowDXR    window; //!< valid when kind == WINDOW (window.type is set)
+    XrDesktopWindowDXR    window; //!< output; filled by the runtime (incl. window.type) when kind == WINDOW, zeroed otherwise
 } XrDesktopPickDXR;
 
 typedef enum XrDesktopActionTypeDXR {
@@ -206,9 +206,9 @@ typedef struct XrDesktopActionDXR {
 } XrDesktopActionDXR;
 
 /*!
- * Optional: chained on nothing in v1; reserved. `reason` is shown to the user in
- * the DisplayXR prompt where DisplayXR draws one (Windows) and written to the
- * audit log. Pass NULL for no reason.
+ * Optional argument of xrRequestDesktopControlDXR (pass NULL for none). `reason` is
+ * shown to the user in the DisplayXR prompt where DisplayXR draws one (Windows) and
+ * written to the audit log. `next` must be NULL in spec version 1.
  */
 typedef struct XrDesktopControlRequestInfoDXR {
     XrStructureType            type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR
@@ -233,6 +233,8 @@ typedef struct XrEventDataDesktopControlStateChangedDXR {
 } XrEventDataDesktopControlStateChangedDXR;
 
 //! Current state and what this OS backend can do (capabilities may be a subset).
+//! Never gated: succeeds for any valid session, whatever the state (it is how an
+//! app learns that it is not granted).
 typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopControlStateDXR)(
     XrSession                           session,
     XrDesktopControlStateDXR*           state,
@@ -265,7 +267,9 @@ typedef XrResult (XRAPI_PTR *PFN_xrPickDesktopDXR)(
 
 //! The accessible text of the UI element at @p point (UTF-8, two-call idiom).
 //! Empty (count 1) when the element exposes none. Apps whose accessibility is off
-//! (some browsers / Electron) expose nothing; that is not an error.
+//! (some browsers / Electron) expose nothing; that is not an error. Each call reads
+//! the live UI: the text may change between the size query and the fill call, in
+//! which case the fill returns XR_ERROR_SIZE_INSUFFICIENT with the new size — retry.
 typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopTextAtDXR)(
     XrSession             session,
     XrOffset2Di           point,
@@ -274,8 +278,11 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopTextAtDXR)(
     char*                 buffer);
 
 //! Queue an action. Returns at once with @p actionId (never 0); the result
-//! arrives as XrEventDataDesktopActionCompletedDXR. Actions of one session run in
-//! submission order.
+//! arrives as XrEventDataDesktopActionCompletedDXR — exactly one per accepted action
+//! while the session exists (the event carries only the id: keep your own id → action
+//! map). Actions of one session run in submission order. At most 64 are queued per
+//! session (XR_ERROR_LIMIT_REACHED beyond); destroying the session drops queued
+//! actions without events.
 typedef XrResult (XRAPI_PTR *PFN_xrSubmitDesktopActionDXR)(
     XrSession                  session,
     const XrDesktopActionDXR*  action,

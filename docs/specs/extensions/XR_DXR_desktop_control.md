@@ -69,7 +69,8 @@ state event, so a kill switch or a lock takes effect on the very next operation.
 ## 4. Operations
 
 All operations — observation included — require `GRANTED`, else
-`XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`. A capability the backend lacks returns
+`XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`. `xrGetDesktopControlStateDXR` is the one exception:
+it always succeeds for a valid session. A capability the backend lacks returns
 `XR_ERROR_FEATURE_UNSUPPORTED` (observation) or completes with it (actions).
 
 - **Observation** (`xrEnumerateDesktopWindowsDXR`, `xrGetDesktopPointerDXR`,
@@ -111,7 +112,7 @@ the rule exists for).
 
 Chords are parsed by `u_desktop_chord_parse()`: `+`-separated, case-insensitive; modifiers
 `ctrl`/`control`, `shift`, `alt`/`option`, `super`/`win`/`cmd`/`command`/`meta`; at most one
-key from the canonical list in `u_desktop.h`.
+key from the canonical list in `u_desktop.h`. Letters, digits and punctuation name the character on the user's **active keyboard layout** (as every OS matches shortcuts: `ctrl+z` presses the key labelled Z on AZERTY too); named keys are layout-independent.
 
 ## 6. The store and the audit log
 
