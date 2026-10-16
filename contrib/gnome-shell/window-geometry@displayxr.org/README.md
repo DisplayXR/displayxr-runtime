@@ -321,7 +321,9 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   there, so stacking, a click-through window (empty input region) and shell UI on
   top count as they do for a click; the desktop background and a desktop-icons
   window (Ubuntu's) are `desktop`. `GetWindowAt(i x, i y) -> (s json)` answers the
-  same for any stage point; a point on no monitor is `outside`. Read-only, like
+  same for any stage point; a point on no monitor is `outside`. `GetAllWindows()
+  -> (s json)` is `GetWindows`' snapshot with the app's dialogs and utility windows
+  too, each with its `window_type`. Read-only, like
   `GetWindows`; while the screen is locked both answer only
   `{"version": 1, "locked": true}`. Every window entry gains `id` (mutter's window
   id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double),

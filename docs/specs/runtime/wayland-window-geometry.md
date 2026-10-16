@@ -1537,7 +1537,14 @@ position, and this extension already publishes every window's geometry.
 instead of the pointer: what a click at that point would meet (a caller checks a
 target before acting on it, or resolves "the window at x, y").
 
-Every window entry (in `GetWindows`, `WindowsChanged` and here) also gains `id`:
+`GetAllWindows() -> (s json)` is `GetWindows`' snapshot with the app's dialogs and
+utility windows too (types NORMAL, DIALOG, MODAL_DIALOG, UTILITY; not menus,
+popups, tooltips, docks or the desktop), each entry with its `window_type`. A
+"Save changes?" dialog that takes the focus after a close request is in it, so a
+caller can see where the keyboard went. `GetWindows` keeps to normal windows: its
+consumers (the runtime, the Unity plugin) look up an app's main window in it.
+
+Every window entry (in `GetWindows`, `GetAllWindows`, `WindowsChanged` and here) also gains `id`:
 mutter's window id (`Meta.Window.get_id()`), unique and stable for the window's
 lifetime (a client that recreates its toplevel gets a new one). It is an
 **unsigned 64-bit** number and is above INT32_MAX in about half of all sessions:

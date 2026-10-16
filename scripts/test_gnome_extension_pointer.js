@@ -20,7 +20,8 @@
 //      window before mutter 49) count as the desktop; an app window does not.
 //   4. Points on no monitor (beside a smaller monitor, negative) are outside.
 //   5. parent_id for a transient window (a popup), nothing otherwise.
-//   6. maximized: is_maximized() (mutter 49+) or get_maximized() == BOTH.
+//   6. maximized: is_maximized() (mutter 49+) or get_maximized() == BOTH; the
+//      window types GetAllWindows lists.
 //   7. The reply: locked -> nothing but {version, locked}; otherwise the point,
 //      the layout mode when known, `over`, and the window entry.
 'use strict';
@@ -118,6 +119,14 @@ print('6. maximized');
     check(!PP.isMaximized({get_maximized: () => 2}, M) && !PP.isMaximized({get_maximized: () => 0}, M),
         'older mutter: one direction (half-tiled) or none is not maximized');
     check(!PP.isMaximized({}, M), 'neither method: not maximized');
+}
+
+print('6b. GetAllWindows types');
+{
+    const M = {WindowType: {NORMAL: 0, DESKTOP: 1, DOCK: 2, DIALOG: 3, MODAL_DIALOG: 4, TOOLBAR: 5, MENU: 6,
+        UTILITY: 7, SPLASHSCREEN: 8, DROPDOWN_MENU: 9, POPUP_MENU: 10, TOOLTIP: 11}};
+    check([0, 3, 4, 7].every(t => PP.inAllWindows(t, M)), 'normal, dialog, modal dialog, utility: listed');
+    check([1, 2, 5, 6, 8, 9, 10, 11].every(t => !PP.inAllWindows(t, M)), 'desktop, dock, menus, popups, tooltips: not');
 }
 
 print('7. the reply');
