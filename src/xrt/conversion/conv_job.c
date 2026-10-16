@@ -7,6 +7,7 @@
  */
 
 #include "conv_core_internal.h"
+#include "conv_host_wire.h" // conv_splat_result_sanitize
 
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -323,6 +324,9 @@ job_lane_main(void *ptr)
 		cmd.job_ctl = &ctl;
 		cmd.job_out = &j->out;
 		const xrt_result_t r = conv_host_call(host, &cmd);
+		if (j->out.splat_result != NULL) {
+			conv_splat_result_sanitize(j->out.splat_result); // provider-written: terminate, clamp
+		}
 		if (r != XRT_SUCCESS && (cmd.blocked & CONV_CMD_HOST_DOWN) != 0) {
 			// Refused before it started: its host went down in the race with the
 			// gate. Back to WAITING_FOR_PROVIDER; it starts after RESTORED.

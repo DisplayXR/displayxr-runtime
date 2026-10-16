@@ -50,7 +50,13 @@ enum u_credential_result
 	U_CREDENTIAL_BAD_NAME,    //!< empty, too long, or a control character
 	U_CREDENTIAL_TOO_LONG,    //!< the secret does not fit the caller's buffer
 	U_CREDENTIAL_ERROR,       //!< the store failed; @p err says how
+	U_CREDENTIAL_BAD_SECRET,  //!< the secret holds a control character (CR / LF / NUL ...): refused
 };
+
+/*! Are the @p n bytes of @p s a usable secret (non-empty, no control
+ *  character, so it can never inject a header line)? */
+bool
+u_credential_secret_valid_n(const char *s, size_t n);
 
 /*!
  * Read the secret stored under @p name into @p out (NUL-terminated, trailing

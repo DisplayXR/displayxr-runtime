@@ -25,6 +25,8 @@
 #include <Security/Security.h>
 #elif defined(XRT_OS_LINUX_DESKTOP)
 #include <dlfcn.h>
+#include <pthread.h>
+#include <time.h>
 #endif
 
 static u_credential_reader_fn g_test_reader = NULL;
@@ -55,6 +57,7 @@ u_credential_result_str(enum u_credential_result r)
 	case U_CREDENTIAL_BAD_NAME: return "bad_name";
 	case U_CREDENTIAL_TOO_LONG: return "too_long";
 	case U_CREDENTIAL_ERROR: return "error";
+	case U_CREDENTIAL_BAD_SECRET: return "bad_secret";
 	default: return "?";
 	}
 }
@@ -82,6 +85,18 @@ msg(char *err, size_t err_size, const char *text, const char *name)
 	}
 }
 
+bool
+u_credential_secret_valid_n(const char *s, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		const unsigned char c = (unsigned char)s[i];
+		if (c < 0x20 || c == 0x7f) {
+			return false; // CR, LF, NUL, ...: a secret goes into a header line
+		}
+	}
+	return n > 0;
+}
+
 //! Copy @p n secret bytes into @p out, trimming a trailing CR / LF.
 static enum u_credential_result
 put_secret(const uint8_t *bytes, size_t n, char *out, size_t out_size)
@@ -94,6 +109,9 @@ put_secret(const uint8_t *bytes, size_t n, char *out, size_t out_size)
 	}
 	if (n + 1 > out_size || n > U_CREDENTIAL_SECRET_MAX) {
 		return U_CREDENTIAL_TOO_LONG;
+	}
+	if (!u_credential_secret_valid_n((const char *)bytes, n)) {
+		return U_CREDENTIAL_BAD_SECRET; // would inject into an HTTP header line
 	}
 	memcpy(out, bytes, n);
 	out[n] = '\0';
@@ -383,6 +401,79 @@ os_write(const char *name, const char *secret, char *err, size_t err_size)
 
 #elif defined(XRT_OS_LINUX_DESKTOP)
 
+#define LINUX_LOOKUP_TIMEOUT_S 10
+
+typedef void *(*cancellable_new_fn)(void);
+typedef void (*cancellable_cancel_fn)(void *);
+typedef void (*object_unref_fn)(void *);
+
+//! A watchdog that cancels a libsecret lookup after LINUX_LOOKUP_TIMEOUT_S.
+struct lookup_watch
+{
+	void *cancellable; //!< GCancellable*, NULL when GIO's entry points are unavailable
+	cancellable_cancel_fn cancel;
+	object_unref_fn unref;
+	pthread_t thread;
+	pthread_mutex_t mtx;
+	pthread_cond_t cond;
+	bool done, started;
+};
+
+static void *
+lookup_watch_main(void *ptr)
+{
+	struct lookup_watch *w = (struct lookup_watch *)ptr;
+	struct timespec until;
+	clock_gettime(CLOCK_REALTIME, &until);
+	until.tv_sec += LINUX_LOOKUP_TIMEOUT_S;
+	pthread_mutex_lock(&w->mtx);
+	while (!w->done) {
+		if (pthread_cond_timedwait(&w->cond, &w->mtx, &until) != 0) {
+			break; // timed out
+		}
+	}
+	if (!w->done) {
+		w->cancel(w->cancellable); // the lookup returns with a "cancelled" error
+	}
+	pthread_mutex_unlock(&w->mtx);
+	return NULL;
+}
+
+static void
+lookup_watch_start(void *lib, struct lookup_watch *w)
+{
+	// GIO / GObject are libsecret dependencies: resolvable through its handle.
+	cancellable_new_fn mk = (cancellable_new_fn)dlsym(lib, "g_cancellable_new");
+	w->cancel = (cancellable_cancel_fn)dlsym(lib, "g_cancellable_cancel");
+	w->unref = (object_unref_fn)dlsym(lib, "g_object_unref");
+	if (mk == NULL || w->cancel == NULL || w->unref == NULL || (w->cancellable = mk()) == NULL) {
+		w->cancellable = NULL;
+		return;
+	}
+	pthread_mutex_init(&w->mtx, NULL);
+	pthread_cond_init(&w->cond, NULL);
+	w->started = pthread_create(&w->thread, NULL, lookup_watch_main, w) == 0;
+}
+
+static void
+lookup_watch_stop(struct lookup_watch *w)
+{
+	if (w->cancellable == NULL) {
+		return;
+	}
+	if (w->started) {
+		pthread_mutex_lock(&w->mtx);
+		w->done = true;
+		pthread_cond_signal(&w->cond);
+		pthread_mutex_unlock(&w->mtx);
+		pthread_join(w->thread, NULL);
+	}
+	pthread_cond_destroy(&w->cond);
+	pthread_mutex_destroy(&w->mtx);
+	w->unref(w->cancellable);
+	w->cancellable = NULL;
+}
+
 /* The parts of libsecret's / GLib's ABI used here (stable since libsecret 0.7). */
 typedef struct
 {
@@ -436,7 +527,14 @@ os_read(const char *name, char *out, size_t out_size, char *err, size_t err_size
 	schema.attributes[0].name = "service";
 	schema.attributes[0].type = 0;
 	dxr_gerror *gerr = NULL;
-	char *secret = lookup(&schema, NULL, &gerr, "service", name, (const char *)NULL);
+	// Bounded: libsecret has no "never prompt" switch for a lookup, and a locked
+	// collection may raise an unlock prompt that nobody answers in a service.
+	// A GCancellable cancelled by a watchdog after LINUX_LOOKUP_TIMEOUT_S ends it.
+	struct lookup_watch lw;
+	memset(&lw, 0, sizeof(lw));
+	lookup_watch_start(lib, &lw);
+	char *secret = lookup(&schema, lw.cancellable, &gerr, "service", name, (const char *)NULL);
+	lookup_watch_stop(&lw);
 	enum u_credential_result r;
 	if (secret != NULL) {
 		const size_t n = strlen(secret);
@@ -582,6 +680,10 @@ u_credential_write(const char *name, const char *secret, char *err, size_t err_s
 		msg(err, err_size, "invalid credential name '%s'", name);
 		return U_CREDENTIAL_BAD_NAME;
 	}
+	if (secret != NULL && secret[0] != '\0' && !u_credential_secret_valid_n(secret, strlen(secret))) {
+		msg(err, err_size, "the secret for '%s' contains control characters (CR / LF / ...): refused", name);
+		return U_CREDENTIAL_BAD_SECRET;
+	}
 	if (secret == NULL || secret[0] == '\0' || strlen(secret) > U_CREDENTIAL_SECRET_MAX) {
 		msg(err, err_size, "the secret for '%s' is empty or too long", name);
 		return U_CREDENTIAL_TOO_LONG;
@@ -619,8 +721,11 @@ u_credential_read(const char *name, char *out, size_t out_size, char *err, size_
 	enum u_credential_result r;
 	if (g_test_reader != NULL) {
 		r = g_test_reader(name, out, out_size);
+		if (r == U_CREDENTIAL_OK && !u_credential_secret_valid_n(out, strnlen(out, out_size))) {
+			r = U_CREDENTIAL_BAD_SECRET;
+		}
 		if (r != U_CREDENTIAL_OK) {
-			msg(err, err_size, "test store: no credential '%s'", name);
+			msg(err, err_size, "test store: no usable credential '%s'", name);
 		}
 	} else {
 		r = os_read(name, out, out_size, err, err_size);

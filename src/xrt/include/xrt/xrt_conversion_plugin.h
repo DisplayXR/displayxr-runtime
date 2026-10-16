@@ -1161,7 +1161,8 @@ XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || offsetof(struct xrt_conv_frame_out, d
 XRT_CONV_ABI_ASSERT(sizeof(void *) != 8 || sizeof(struct xrt_conv_frame_out) == 776,
                     "xrt_conv_frame_out: no hidden padding (8 + 4 x 128 + 124 + 4 + 128)");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_out, views_info) == 208 &&
-                    offsetof(struct xrt_conv_job_out, splat_result) == 336,
+                    offsetof(struct xrt_conv_job_out, splat_result) == 336 &&
+                    sizeof(struct xrt_conv_job_out) == 336 + sizeof(void *),
                     "xrt_conv_job_out: no hidden padding (8 + 72 + 128 + 124 + 4), then splat_result (ADR-057)");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_job_in, job_flags) == offsetof(struct xrt_conv_job_in, reserved_0) + 4,
                     "xrt_conv_job_in: the ADR-057 job inputs follow reserved_0");

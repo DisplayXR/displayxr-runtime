@@ -305,9 +305,15 @@ conv_camera_block_apply_meta(const char *meta_json, const cJSON *block, char **o
 		seterr(err, err_size, "meta.json is not a JSON object");
 		return CONV_CAMERA_BLOCK_ERROR;
 	}
-	const cJSON *old = cJSON_GetObjectItemCaseSensitive(meta, "camera");
+	// EVERY `camera` key counts (a document may repeat one; readers disagree on
+	// which wins): if any is not an auto block, the file is the author's.
 	enum conv_camera_block_result res = CONV_CAMERA_BLOCK_WRITTEN;
-	if (old != NULL) {
+	const cJSON *old = NULL;
+	cJSON_ArrayForEach(old, meta)
+	{
+		if (old->string == NULL || strcmp(old->string, "camera") != 0) {
+			continue;
+		}
 		const cJSON *src = cJSON_GetObjectItemCaseSensitive(old, "source");
 		if (!(cJSON_IsObject(old) && cJSON_IsString(src) && strcmp(src->valuestring, "auto") == 0)) {
 			// The author's block: never rewritten, whatever the new facts say.
@@ -491,13 +497,21 @@ zip_parse(const uint8_t *z, size_t n, struct zip_entry *e, uint32_t *count, char
 		return false;
 	}
 	const uint32_t entries = rd16(z + eocd + 10), cd_size = rd32(z + eocd + 12), cd_off = rd32(z + eocd + 16);
-	if (entries == 0xffffu || cd_off == 0xffffffffu || (size_t)cd_off + cd_size > n || entries > ZIP_MAX_ENTRIES) {
+	if (entries == 0xffffu || cd_off == 0xffffffffu || entries > ZIP_MAX_ENTRIES) {
 		seterr(err, err_size, "unsupported zip (zip64, or too many entries)");
+		return false;
+	}
+	// Every field below is untrusted: the central directory must lie inside the
+	// archive before the end record, each record inside the directory, and each
+	// entry's local header and data before the directory.
+	const size_t cd_end = (size_t)cd_off + cd_size;
+	if (cd_end > eocd) {
+		seterr(err, err_size, "corrupt zip (central directory out of bounds)");
 		return false;
 	}
 	size_t p = cd_off;
 	for (uint32_t i = 0; i < entries; i++) {
-		if (p + 46 > n || rd32(z + p) != 0x02014b50u) {
+		if (p + 46 > cd_end || rd32(z + p) != 0x02014b50u) {
 			seterr(err, err_size, "corrupt zip central directory");
 			return false;
 		}
@@ -517,14 +531,18 @@ zip_parse(const uint8_t *z, size_t n, struct zip_entry *e, uint32_t *count, char
 		x->comment_len = rd16(z + p + 32);
 		x->ext_attr = rd32(z + p + 38);
 		x->local_off = rd32(z + p + 42);
-		if (x->csize == 0xffffffffu || x->local_off == 0xffffffffu || (size_t)x->local_off + 30 > n ||
+		if (p + 46 + (size_t)x->name_len + x->extra_len + x->comment_len > cd_end) {
+			seterr(err, err_size, "corrupt zip central directory (a record runs past it)");
+			return false;
+		}
+		if (x->csize == 0xffffffffu || x->local_off == 0xffffffffu || (size_t)x->local_off + 30 > cd_off ||
 		    rd32(z + x->local_off) != 0x04034b50u) {
 			seterr(err, err_size, "corrupt zip entry");
 			return false;
 		}
 		const size_t data =
 		    (size_t)x->local_off + 30 + rd16(z + x->local_off + 26) + rd16(z + x->local_off + 28);
-		if (data + x->csize > n) {
+		if (data > cd_off || (size_t)x->csize > cd_off - data) {
 			seterr(err, err_size, "truncated zip entry");
 			return false;
 		}

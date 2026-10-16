@@ -1033,6 +1033,41 @@ conv_host_wire_pack_output_desc(const struct xrt_conv_output_desc *in, struct co
 	out->disparity_format = in->disparity_format;
 }
 
+/*!
+ * A provider wrote @p r (third-party code, in a satellite or in the service):
+ * NUL-terminate every string within r->struct_size (a string the extent cuts
+ * ends at the extent) and clamp layer_count. Called on every receive.
+ */
+static inline void
+conv_splat_result_sanitize(struct xrt_conv_splat_result *r)
+{
+	if (r == NULL || r->struct_size <= sizeof(uint32_t)) {
+		return;
+	}
+	const size_t cap = r->struct_size < sizeof(*r) ? r->struct_size : sizeof(*r);
+#define CONV_SPLAT_TERMINATE(F)                                                                                        \
+	do {                                                                                                           \
+		const size_t at_ = offsetof(struct xrt_conv_splat_result, F);                                          \
+		if (cap >= at_ + sizeof(r->F)) {                                                                       \
+			r->F[sizeof(r->F) - 1] = '\0';                                                                 \
+		} else if (cap > at_) {                                                                                \
+			((char *)r)[cap - 1] = '\0';                                                                   \
+		}                                                                                                      \
+	} while (0)
+	CONV_SPLAT_TERMINATE(build_provider);
+	CONV_SPLAT_TERMINATE(build_model_id);
+	CONV_SPLAT_TERMINATE(build_model_sha256);
+	CONV_SPLAT_TERMINATE(build_runtime);
+	CONV_SPLAT_TERMINATE(build_runtime_version);
+	CONV_SPLAT_TERMINATE(build_host_id);
+	CONV_SPLAT_TERMINATE(refusal_reason);
+#undef CONV_SPLAT_TERMINATE
+	if (cap >= offsetof(struct xrt_conv_splat_result, layer_count) + sizeof(r->layer_count) &&
+	    r->layer_count > XRT_CONV_MAX_SPLAT_LAYERS) {
+		r->layer_count = XRT_CONV_MAX_SPLAT_LAYERS;
+	}
+}
+
 /*! xrt_conv_splat_result -> its twin (one copy: same layout, asserted below).
  *  A NULL / zero-sized source packs "none" (struct_size 0). */
 static inline void
@@ -1060,6 +1095,7 @@ conv_host_wire_unpack_splat_result(const struct conv_host_wire_splat_result *in,
 	n = n < cap ? n : cap;
 	memcpy(out, in, n);
 	out->struct_size = cap; // the receiver's own extent; bytes past n stay as zero-filled
+	conv_splat_result_sanitize(out);
 	return true;
 }
 
