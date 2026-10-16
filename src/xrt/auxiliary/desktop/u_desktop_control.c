@@ -6,9 +6,12 @@
  *         ADR-056 D3). See u_desktop_control.h.
  *
  * Locking: one mutex guards the consent state, the policy cache and the queue.
- * Backend OBSERVATION calls (is_locked, access_status, list/pick/...) may be
- * made under it — they are fast and never block on an action (u_desktop.h).
- * Backend ACTION calls and request_access are always made with it released.
+ * Only access_status (an in-memory answer on every backend) is called under it.
+ * is_locked can be a D-Bus round trip (GNOME, up to 250 ms): it is always called
+ * with the mutex RELEASED and its answer stored in a snapshot the state machine
+ * reads (see probe_locked), so a slow lock query never blocks the app thread's
+ * observation calls. Backend ACTION calls and request_access are always made with
+ * it released too.
  */
 
 #include "u_desktop_control.h"
@@ -25,7 +28,11 @@
 
 #define NS_PER_MS 1000000ull
 #define DEFAULT_POLL_NS (50ull * NS_PER_MS)
-#define DEFAULT_GRACE_NS (150ull * NS_PER_MS)
+//! Input this soon after one of our injections ends is taken for ours (late OS
+//! processing). Short on purpose: a user keystroke inside it is the residual blind
+//! spot (spec §9); the other direction (our late event mistaken for the user) only
+//! costs one idle wait.
+#define DEFAULT_GRACE_NS (30ull * NS_PER_MS)
 #define DEFAULT_MAX_WAIT_NS (10000ull * NS_PER_MS)
 #define EXE_CAP 1024
 #define NAME_CAP 256
@@ -96,6 +103,11 @@ struct u_desktop_control
 	enum u_desktop_access req_result;
 	bool store_write_failed;
 	enum u_desktop_control_state last_state;
+	//! Last backend->is_locked answer (probed with the mutex released, see probe_locked)
+	//! and the ticket of the probe that produced it: an older probe finishing late never
+	//! overwrites a newer answer.
+	bool locked_snapshot;
+	uint64_t locked_seq_issued, locked_seq_stored;
 	//! state + 1 of the last submit refused for state (0 = none since the last accepted
 	//! submit): refusals are audited once per state, so a spamming app cannot flood the log.
 	int refused_audit_state_plus1;
@@ -297,7 +309,7 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		s = U_DESKTOP_STATE_DISABLED_BY_USER;
 		goto out;
 	}
-	if (c->b->is_locked != NULL && c->b->is_locked(c->b)) { // 5
+	if (c->locked_snapshot) { // 5 (probed outside the mutex: probe_locked)
 		r = R_LOCKED;
 		s = U_DESKTOP_STATE_SUSPENDED;
 		goto out;
@@ -366,9 +378,36 @@ update_state_locked(struct u_desktop_control *c, enum reason *out_reason, bool f
 	return s;
 }
 
+/*!
+ * Ask the backend whether the session is locked WITHOUT holding the mutex (GNOME:
+ * a D-Bus call of up to 250 ms), then store the answer in the snapshot the state
+ * machine reads. Call with the mutex released; returns the answer.
+ */
+static bool
+probe_locked(struct u_desktop_control *c)
+{
+	if (c->b == NULL || c->b->is_locked == NULL) {
+		return false;
+	}
+	os_mutex_lock(&c->mutex);
+	uint64_t ticket = ++c->locked_seq_issued;
+	os_mutex_unlock(&c->mutex);
+
+	bool locked = c->b->is_locked(c->b);
+
+	os_mutex_lock(&c->mutex);
+	if (ticket > c->locked_seq_stored) {
+		c->locked_seq_stored = ticket;
+		c->locked_snapshot = locked;
+	}
+	os_mutex_unlock(&c->mutex);
+	return locked;
+}
+
 static enum u_desktop_control_state
 update_state(struct u_desktop_control *c, enum reason *out_reason)
 {
+	probe_locked(c);
 	os_mutex_lock(&c->mutex);
 	enum u_desktop_control_state s = update_state_locked(c, out_reason, false);
 	os_mutex_unlock(&c->mutex);
@@ -473,6 +512,7 @@ request_done_locked(struct u_desktop_control *c, enum u_desktop_access result)
 int32_t
 u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 {
+	probe_locked(c); // row 5 needs a fresh answer: a locked session is never prompted
 	os_mutex_lock(&c->mutex);
 	enum reason why;
 	enum u_desktop_control_state s = evaluate_locked(c, &why);
@@ -756,6 +796,21 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 	c->refused_audit_state_plus1 = 0;
 	os_mutex_unlock(&c->mutex);
 	if (!u_desktop_control_validate(a, NULL, 0)) {
+		if (a != NULL && action_name(a->type) == NULL) {
+			// An action type this runtime does not know: app-controlled garbage, but
+			// a user reading the audit log should still see the attempt (once per
+			// submit, like every action).
+			struct u_desktop_audit_record r;
+			memset(&r, 0, sizeof(r));
+			r.exe = c->exe;
+			r.action = "unknown";
+			r.chars = -1;
+			r.has_target = true;
+			r.target_id = a->target_window_id;
+			r.result = result_str(U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+			r.message = "unknown actionType";
+			u_desktop_audit_append(&r);
+		}
 		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
 	}
 
@@ -1106,6 +1161,9 @@ guard_still_allowed(void *ctx)
 	struct guard_ctx *g = (struct guard_ctx *)ctx;
 	struct u_desktop_control *c = g->c;
 	g->calls++;
+	// The lock query first, with the mutex released (it can be a D-Bus round trip):
+	// probe_locked stores the answer for the state machine below.
+	bool locked = probe_locked(c);
 	os_mutex_lock(&c->mutex);
 	enum reason why = R_OS_GRANTED;
 	bool ok = true;
@@ -1123,7 +1181,7 @@ guard_still_allowed(void *ctx)
 		} else if (u_desktop_policy_app(c->policy, c->exe) == U_DESKTOP_APP_DENY) {
 			ok = false;
 			why = R_STORE_DENY;
-		} else if (c->b->is_locked != NULL && c->b->is_locked(c->b)) {
+		} else if (locked) {
 			ok = false;
 			why = R_LOCKED;
 		} else if (c->revoked) {
@@ -1302,6 +1360,13 @@ execute(struct u_desktop_control *c,
 		if (r != U_DESKTOP_OK) {
 			break;
 		}
+		// The button is down: the kill switch / lock / deny may have arrived since the
+		// press. Stopping here drops the drag where it started (a click, not a move).
+		if (!guard->still_allowed(guard->ctx)) {
+			release_button(c, guard, btn, a->x, a->y);
+			r = U_DESKTOP_ERR_REFUSED;
+			break;
+		}
 		t0 = injection_begin();
 		enum u_desktop_result rm = b->pointer_move(b, a->x2, a->y2, msg);
 		injection_end(c, t0);
@@ -1399,14 +1464,9 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 		goto done;
 	}
 
-	// 2. Never fight the user — EVERY action (window ops move focus, and on GNOME
-	// they are input gestures).
-	so = wait_for_idle(c, &result, msg);
-	if (so != STEP_OK) {
-		goto done;
-	}
-
-	// Slow setup BEFORE verification, never between it and the injection.
+	// Slow setup FIRST (GNOME: restoring the portal session, 0.3–9 s): before the
+	// idle wait, so a user who starts typing during it is still seen by step 2, and
+	// before verification, never between it and the injection.
 	if (c->b->prepare_input != NULL) {
 		char pmsg[MSG_CAP] = {0};
 		enum u_desktop_result pr = c->b->prepare_input(c->b, pmsg);
@@ -1420,6 +1480,13 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 			so = STEP_ABORT;
 			goto done;
 		}
+	}
+
+	// 2. Never fight the user — EVERY action (window ops move focus, and on GNOME
+	// they are input gestures). Re-runs step 1 at every poll.
+	so = wait_for_idle(c, &result, msg);
+	if (so != STEP_OK) {
+		goto done;
 	}
 
 	// 3. Target exists.

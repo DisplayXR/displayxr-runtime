@@ -1609,3 +1609,206 @@ TEST_CASE("fix8_lifetime: a consent answer delivered after destroy is dropped sa
 	CHECK(u_desktop_policy_app(pol, kExe) == U_DESKTOP_APP_NONE);
 	u_desktop_policy_destroy(&pol);
 }
+
+// --- polish round ------------------------------------------------------------------
+
+namespace {
+
+void
+write_idle_ms(const TempDir &dir, int ms)
+{
+	std::ofstream f(dir.file("desktop_control.json"));
+	f << "{\"version\":1,\"suspended\":false,\"idle_ms\":" << ms << ",\"apps\":{}}";
+}
+
+size_t
+count_of(const std::string &hay, const std::string &needle)
+{
+	size_t n = 0;
+	for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size())) {
+		n++;
+	}
+	return n;
+}
+
+} // namespace
+
+TEST_CASE("polish1_order: a user who starts typing during a slow prepare_input is still waited for",
+          "[desktop][polish][idle]")
+{
+	TempDir dir;
+	const u_desktop_control_timing t = {10ull * 1000000ull, 0, 300ull * 1000000ull};
+	Harness h(&t);
+	h.grant();
+	// GNOME's silent portal restore takes 0.3-9 s; the user starts typing meanwhile.
+	Hook hook{"prepare", 0, [&] {
+		          u_desktop_fake_set_user_active(h.fake, true);
+		          std::this_thread::sleep_for(200ms);
+	          }};
+	hook.install(h.fake);
+	auto t0 = Clock::now();
+	auto r = h.run(type_text(101, "x"));
+	auto took = Clock::now() - t0;
+	CHECK(u_desktop_fake_prepare_count(h.fake) == 1);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "the user is active");
+	CHECK(content(h.fake, 101).empty());
+	CHECK(took >= 450ms); // 200 ms setup, THEN the 300 ms idle wait
+}
+
+TEST_CASE("polish1_order: a user active during prepare_input who then stops gets the action delivered",
+          "[desktop][polish][idle]")
+{
+	TempDir dir;
+	write_idle_ms(dir, 200);
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"prepare", 0, [&] {
+		          u_desktop_fake_set_user_active(h.fake, true);
+		          std::this_thread::sleep_for(100ms);
+		          u_desktop_fake_set_user_active(h.fake, false); // last keystroke now
+	          }};
+	hook.install(h.fake);
+	auto t0 = Clock::now();
+	auto r = h.run(type_text(101, "x"));
+	CHECK(r.result == U_DESKTOP_XR_SUCCESS);
+	CHECK(content(h.fake, 101) == "x");
+	CHECK(Clock::now() - t0 >= 280ms); // 100 ms setup + the 200 ms idle requirement
+}
+
+TEST_CASE("polish2_grace: a user keystroke 50 ms after our injection ends is the user's",
+          "[desktop][polish][idle]")
+{
+	// Reviewer case: with a 150 ms grace this keystroke was absorbed as ours and the
+	// next action ran straight into the user's typing.
+	TempDir dir;
+	write_idle_ms(dir, 1000);
+	const u_desktop_control_timing t = {10ull * 1000000ull, 0, 300ull * 1000000ull}; // default grace
+	Harness h(&t);
+	h.grant();
+	CHECK(h.run(click(101, 300, 300)).result == U_DESKTOP_XR_SUCCESS);
+	std::this_thread::sleep_for(50ms);
+	u_desktop_fake_set_user_active(h.fake, true); // one keystroke at ~+50 ms
+	u_desktop_fake_set_user_active(h.fake, false);
+	auto r = h.run(type_text(101, "x"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "the user is active");
+	CHECK(content(h.fake, 101).empty());
+}
+
+TEST_CASE("polish2_grace: back-to-back actions are not slowed by our own input (30 ms grace)",
+          "[desktop][polish][idle]")
+{
+	TempDir dir;
+	write_idle_ms(dir, 3000);
+	Harness h(&kFast);
+	h.grant();
+	auto t0 = Clock::now();
+	for (int i = 0; i < 5; i++) {
+		h.submit(type_text(101, "ab"));
+	}
+	REQUIRE(h.rec.wait_done(5));
+	for (auto &c : h.rec.done) {
+		CHECK(c.result == U_DESKTOP_XR_SUCCESS);
+	}
+	CHECK(content(h.fake, 101) == "ababababab");
+	CHECK(Clock::now() - t0 < 1500ms);
+}
+
+TEST_CASE("polish4_drag: the kill switch after the press releases at the START point, no move",
+          "[desktop][polish][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"pressed", 0, [] { u_desktop_policy_set_suspended(true, "test"); }};
+	hook.install(h.fake);
+	u_desktop_action a = act(U_DESKTOP_ACTION_DRAG, 101);
+	a.x = 200;
+	a.y = 200;
+	a.x2 = 600;
+	a.y2 = 500;
+	auto r = h.run(a);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "kill switch");
+	std::string log = h.log();
+	CHECK(log.find("button left down") != std::string::npos);
+	CHECK(log.find("button left up 200 200") != std::string::npos);
+	CHECK(log.find("move 600 500") == std::string::npos);
+	CHECK(u_desktop_fake_pressed_buttons(h.fake) == 0);
+	CHECK(h.rec.wait_state(U_DESKTOP_STATE_SUSPENDED));
+}
+
+TEST_CASE("polish4_drag: an uninterrupted drag still moves and releases at the end point",
+          "[desktop][polish][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_action a = act(U_DESKTOP_ACTION_DRAG, 101);
+	a.x = 200;
+	a.y = 200;
+	a.x2 = 600;
+	a.y2 = 500;
+	CHECK(h.run(a).result == U_DESKTOP_XR_SUCCESS);
+	std::string log = h.log();
+	CHECK(log.find("move 600 500") != std::string::npos);
+	CHECK(log.find("button left up 600 500") != std::string::npos);
+	CHECK(u_desktop_fake_pressed_buttons(h.fake) == 0);
+}
+
+TEST_CASE("polish5_lock: a slow lock query never holds the control's mutex", "[desktop][polish][lock]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_fake_set_lock_query_delay_ms(h.fake, 300);
+	// Three threads observe at once. Under the mutex they would queue (900 ms).
+	auto t0 = Clock::now();
+	std::vector<std::thread> ts;
+	std::atomic<int> granted{0};
+	for (int i = 0; i < 3; i++) {
+		ts.emplace_back([&] {
+			if (u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED) {
+				granted++;
+			}
+		});
+	}
+	for (auto &t : ts) {
+		t.join();
+	}
+	CHECK(Clock::now() - t0 < 700ms);
+	CHECK(granted == 3);
+
+	// The answer still counts: locked -> SUSPENDED, and an action is refused.
+	u_desktop_fake_set_lock_query_delay_ms(h.fake, 0);
+	u_desktop_fake_set_locked(h.fake, true);
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED);
+	u_desktop_fake_set_locked(h.fake, false);
+	CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+	Hook hook{"type", 1, [&] { u_desktop_fake_set_locked(h.fake, true); }};
+	hook.install(h.fake);
+	auto r = h.run(type_text(101, "abc"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "screen locked");
+	CHECK(content(h.fake, 101) == "a");
+}
+
+TEST_CASE("polish6_audit: an unknown action type while GRANTED is audited once per submit",
+          "[desktop][polish][audit]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_action a = act(99, 101);
+	uint64_t id = 0;
+	CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(count_of(audit, "\"action\":\"unknown\"") == 2);
+	CHECK(audit.find("\"result\":\"invalid\"") != std::string::npos);
+	// A known type that fails validation is not an "unknown" record.
+	u_desktop_action t = type_text(101, "");
+	CHECK(u_desktop_control_submit(h.c, &t, &id) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	CHECK(count_of(slurp(dir.file("desktop_control_audit.jsonl")), "\"action\":\"unknown\"") == 2);
+}

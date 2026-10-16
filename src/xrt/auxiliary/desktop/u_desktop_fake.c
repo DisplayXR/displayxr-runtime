@@ -64,6 +64,7 @@ struct u_desktop_fake
 	// contract v2 test knobs
 	u_desktop_fake_batch_fn batch_hook;
 	void *batch_hook_ctx;
+	uint32_t lock_query_delay_ms; //!< is_locked sleeps this long (a slow D-Bus round trip)
 	bool injection_is_input;  //!< false: like macOS HID idle, our injections do not reset it
 	uint32_t pressed_buttons; //!< bit per enum u_desktop_button
 	uint32_t prepare_count;
@@ -369,6 +370,12 @@ static bool
 fake_is_locked(struct u_desktop_backend *b)
 {
 	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	uint32_t delay = f->lock_query_delay_ms;
+	os_mutex_unlock(&f->mutex);
+	if (delay > 0) {
+		os_nanosleep((int64_t)delay * 1000000); // outside the fake's lock, like a D-Bus wait
+	}
 	os_mutex_lock(&f->mutex);
 	bool l = f->locked;
 	os_mutex_unlock(&f->mutex);
@@ -740,7 +747,7 @@ fake_pointer_button(struct u_desktop_backend *b,
 		os_mutex_lock(&f->mutex);
 		if (f->pressed_buttons & bit) {
 			f->pressed_buttons &= ~bit;
-			log_line(f, "button %s up", button_name(button));
+			log_line(f, "button %s up %d %d", button_name(button), x, y);
 			note_input_locked(f);
 		}
 		os_mutex_unlock(&f->mutex);
@@ -779,6 +786,9 @@ fake_pointer_button(struct u_desktop_backend *b,
 		note_input_locked(f);
 	}
 	os_mutex_unlock(&f->mutex);
+	if (r == U_DESKTOP_OK) {
+		batch_hook(f, "pressed", 0); // the button is now held
+	}
 	return r;
 }
 
@@ -1026,6 +1036,14 @@ u_desktop_fake_set_locked(struct u_desktop_fake *f, bool locked)
 {
 	os_mutex_lock(&f->mutex);
 	f->locked = locked;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_lock_query_delay_ms(struct u_desktop_fake *f, uint32_t ms)
+{
+	os_mutex_lock(&f->mutex);
+	f->lock_query_delay_ms = ms;
 	os_mutex_unlock(&f->mutex);
 }
 
