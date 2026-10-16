@@ -377,6 +377,17 @@ conv_core_job_read(struct conv_core *core,
                    uint64_t *out_count,
                    uint64_t *out_total);
 
+/*!
+ * ADR-057 §4: the facts a SPLATS_* job reported (build stamp, refusal, metric
+ * fit, layers, focus suggestion), for a SUCCEEDED job and also for a FAILED
+ * one (whose refusal_code / refusal_reason say why). Copies min(sizeof,
+ * out->struct_size) bytes; out->struct_size must be set by the caller.
+ * XRT_ERROR_NO_IMAGE_AVAILABLE while the job has not finished, or for a task
+ * that is not a splat task.
+ */
+xrt_result_t
+conv_core_job_splat_result(struct conv_core *core, uint64_t job_id, struct xrt_conv_splat_result *out);
+
 xrt_result_t
 conv_core_job_cancel(struct conv_core *core, uint64_t job_id);
 

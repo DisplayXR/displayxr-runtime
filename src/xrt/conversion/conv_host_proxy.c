@@ -1979,6 +1979,9 @@ exec_job(struct proxy *p, struct conv_host_cmd *c)
 		js.input_kind = in->input_kind;
 		js.image_count = in->image_count;
 		js.requested_blob_format = in->requested_blob_format;
+		js.job_flags = XRT_CONV_COVERS(in, struct xrt_conv_job_in, job_flags) ? in->job_flags : 0u;
+		js.max_input_long_side =
+		    XRT_CONV_COVERS(in, struct xrt_conv_job_in, max_input_long_side) ? in->max_input_long_side : 0u;
 		if (c->params != NULL) {
 			xrt_conv_wire_pack_params(c->params, &js.params);
 		}
@@ -2022,6 +2025,11 @@ exec_job(struct proxy *p, struct conv_host_cmd *c)
 		conv_host_wire_init(&jr, sizeof(jr));
 		jr.job_id = job_id;
 		(void)px_send(p, CONV_HOST_MSG_JOB_RELEASE, 0, &jr, sizeof(jr), NULL, 0);
+	}
+	// ADR-057: the facts (or the refusal) come back for a failed job too.
+	if (c->job_out != NULL && XRT_CONV_COVERS(c->job_out, struct xrt_conv_job_out, splat_result) &&
+	    c->job_out->splat_result != NULL) {
+		(void)conv_host_wire_unpack_splat_result(&jd.splat_result, c->job_out->splat_result);
 	}
 	if (r == XRT_SUCCESS && c->job_out != NULL) {
 		c->job_out->written = jd.written;

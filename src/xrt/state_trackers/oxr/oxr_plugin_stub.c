@@ -137,6 +137,17 @@ _Static_assert(sizeof(XRT_CONVERSION_PLUGIN_ENTRYPOINT_NAME) == sizeof("xrtConve
 _Static_assert(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT == XRT_CONVERSION_PLUGIN_API_VERSION_1,
                "xrt_conversion_plugin: API version current/v1 drift");
 
+/* ADR-057 S1: the splat result is a chained top-level struct (the frozen
+ * xrt_conv_splat_info never grows); the job I/O and the host iface grew only
+ * at their tails / out of reserved[]. */
+_Static_assert(XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT == 1, "ADR-057 feature macro");
+_Static_assert(sizeof(struct xrt_conv_splat_result) == 568, "xrt_conv_splat_result layout changed - append only");
+_Static_assert(offsetof(struct xrt_conv_job_out, splat_result) == 336,
+               "xrt_conv_job_out: splat_result appended at 336");
+_Static_assert(XRT_CONV_FAIL_INPUT == 11u && XRT_CONV_CAP_REMOTE == (1u << 9) && XRT_CONV_CONSENT_OFFBOX == 1u &&
+                   XRT_CONV_REFUSAL_REMOTE_ERROR == 6u,
+               "ADR-057 values are ABI");
+
 /* Capability state 0..7 == the legacy module status (xrt_dp_lift.h). */
 _Static_assert(XRT_CONV_STATE_UNKNOWN == XRT_DP_LIFT_MODULE_UNKNOWN, "conv state UNKNOWN != DP lift module UNKNOWN");
 _Static_assert(XRT_CONV_STATE_READY == XRT_DP_LIFT_MODULE_READY, "conv state READY != DP lift module READY");

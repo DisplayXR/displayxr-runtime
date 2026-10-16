@@ -350,6 +350,10 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	const uint32_t ms = c != NULL ? c->job_ms : 0;
 	const uint64_t bytes = c != NULL ? c->job_bytes : 0;
 	const uint32_t blob_format = c != NULL && c->job_blob_format != 0 ? c->job_blob_format : XRT_CONV_BLOB_SPZ;
+	const uint32_t refusal = c != NULL ? c->job_refusal : 0u;
+	if (c != NULL && in != NULL && XRT_CONV_COVERS(in, struct xrt_conv_job_in, job_flags)) {
+		c->job_flags_seen = in->job_flags;
+	}
 	const uint32_t poll = f->cancel_poll_ms != 0 ? f->cancel_poll_ms : 10;
 	f->jobs++;
 	f->job_running = true;
@@ -358,6 +362,25 @@ fake_job(struct xrt_conversion_plugin_instance *inst,
 	os_mutex_unlock(&f->mtx);
 
 	xrt_result_t r = XRT_SUCCESS;
+	// ADR-057: the runtime-owned splat result, written within ITS struct_size.
+	struct xrt_conv_splat_result *sr =
+	    XRT_CONV_COVERS(out, struct xrt_conv_job_out, splat_result) ? out->splat_result : NULL;
+	if (sr != NULL && sr->struct_size >= sizeof(*sr)) {
+		sr->valid = XRT_CONV_SPLAT_VALID_BUILD;
+		strncpy(sr->build_provider, "fake-build", sizeof(sr->build_provider) - 1);
+		sr->host_kind = XRT_CONV_HOST_KIND_LOCAL;
+		sr->refusal_code = refusal;
+		if (refusal != 0) {
+			strncpy(sr->refusal_reason, "fake refusal", sizeof(sr->refusal_reason) - 1);
+		}
+	}
+	if (refusal != 0 && refusal != XRT_CONV_REFUSAL_METRIC_FIT_REFUSED) {
+		os_mutex_lock(&f->mtx);
+		f->job_running = false;
+		os_mutex_unlock(&f->mtx);
+		leave_s(f);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
 	// Wall-clock deadline, not an iteration count: a 10 ms sleep rounds up to the
 	// OS timer tick (15.6 ms on Windows by default), so counting polls stretched a
 	// 3 s job to ~4.7 s and timed out the lane-isolation test on a busy box.

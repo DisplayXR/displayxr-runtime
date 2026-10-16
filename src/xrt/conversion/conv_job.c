@@ -108,6 +108,39 @@ is_finished(const struct conv_job *j)
 	return j->status == CONV_JOB_SUCCEEDED || j->status == CONV_JOB_FAILED || j->status == CONV_JOB_CANCELLED;
 }
 
+static bool
+is_splat_task(uint32_t task)
+{
+	return task == XRT_CONV_TASK_SPLATS_MONO || task == XRT_CONV_TASK_SPLATS_STEREO;
+}
+
+/*! ADR-057 §4: a SPLATS_* job carries the runtime-owned splat result, zero-filled
+ *  per run (a retry after a host loss starts from nothing). */
+static void
+job_point_splat_result(struct conv_job *j)
+{
+	memset(&j->splat_result, 0, sizeof(j->splat_result));
+	if (is_splat_task(j->task)) {
+		j->splat_result.struct_size = (uint32_t)sizeof(j->splat_result);
+		j->out.splat_result = &j->splat_result;
+	} else {
+		j->out.splat_result = NULL;
+	}
+}
+
+/*! The failure reason of a job its provider failed: a refusal it reported
+ *  (ADR-057) is the input's fault or the remote's, never a load failure. */
+static uint32_t
+job_refusal_reason(const struct conv_job *j)
+{
+	switch (is_splat_task(j->task) ? j->splat_result.refusal_code : XRT_CONV_REFUSAL_NONE) {
+	case XRT_CONV_REFUSAL_NONE:
+	case XRT_CONV_REFUSAL_METRIC_FIT_REFUSED: return XRT_CONV_FAIL_LOAD; // not a reason to fail by itself
+	case XRT_CONV_REFUSAL_REMOTE_ERROR: return XRT_CONV_FAIL_NETWORK;
+	default: return XRT_CONV_FAIL_INPUT;
+	}
+}
+
 
 /*
  *
@@ -275,6 +308,7 @@ job_lane_main(void *ptr)
 		ctl.is_cancelled = job_is_cancelled;
 		memset(&j->out, 0, sizeof(j->out));
 		j->out.struct_size = (uint32_t)sizeof(j->out);
+		job_point_splat_result(j);
 		const uint32_t provider = j->bind.provider;
 		const uint32_t cap_id = j->bind.cap_id;
 		const uint32_t epoch = conv_host_get_epoch(host);
@@ -310,6 +344,8 @@ job_lane_main(void *ptr)
 				j->progress = 0.0f;
 				j->last_emit_progress = 0.0f;
 				memset(&j->out, 0, sizeof(j->out));
+				j->out.struct_size = (uint32_t)sizeof(j->out);
+				job_point_splat_result(j);
 				U_LOG_W("[conv] job %llu (%s): its host process died after %.2f s; retried once on the "
 				        "respawned host",
 				        (unsigned long long)j->id, conv_task_name(j->task),
@@ -335,8 +371,9 @@ job_lane_main(void *ptr)
 			j->progress = 1.0f;
 			set_status_locked(core, j, CONV_JOB_SUCCEEDED);
 		} else {
-			// A second host loss is the crash reason; anything else a load failure.
-			j->failure_reason = host_lost ? XRT_CONV_FAIL_CRASH_LOOP : XRT_CONV_FAIL_LOAD;
+			// A second host loss is the crash reason; a refusal the provider
+			// reported (ADR-057) its own; anything else a load failure.
+			j->failure_reason = host_lost ? XRT_CONV_FAIL_CRASH_LOOP : job_refusal_reason(j);
 			set_status_locked(core, j, CONV_JOB_FAILED);
 		}
 		U_LOG_W("[conv] job %llu (%s) %s in %.2f s", (unsigned long long)j->id, conv_task_name(j->task),
@@ -501,6 +538,18 @@ conv_core_job_submit(struct conv_core *core,
 	    info->image_count > XRT_CONV_MAX_FRAME_IMAGES) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
+	// ADR-057 §4: a baseline is validated, never defaulted (0 = unknown = no
+	// metric result); a pair is declared rectified OR raw, never both.
+	const float baseline = info->params.stereo.baseline_m;
+	if (!(baseline >= 0.0f && baseline <= XRT_CONV_MAX_BASELINE_M) ||
+	    (info->job_flags & (XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_PAIR_RAW)) ==
+	        (XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_PAIR_RAW) ||
+	    (info->job_flags & ~(XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_PAIR_RAW | XRT_CONV_JOB_FOCAL_GIVEN)) !=
+	        0) {
+		U_LOG_W("[conv] job refused: baseline %.4f m / job flags 0x%x invalid", (double)baseline,
+		        info->job_flags);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
 	// Providers with live streams: a job is routed away from them unless
 	// LANES_CONCURRENT lets it run beside the streams.
 	bool busy[CONV_REGISTRY_MAX_PROVIDERS];
@@ -537,6 +586,8 @@ conv_core_job_submit(struct conv_core *core,
 	j->in.input_kind = info->input_kind != 0 ? info->input_kind : XRT_CONV_INPUT_MONO;
 	j->in.image_count = info->image_count;
 	j->in.requested_blob_format = info->requested_blob_format;
+	j->in.job_flags = info->job_flags;
+	j->in.max_input_long_side = info->max_input_long_side;
 	for (uint32_t i = 0; i < info->image_count; i++) {
 		j->in.image_role[i] = info->image_role[i];
 		j->in.images[i] = info->images[i];
@@ -654,6 +705,30 @@ conv_core_job_read(struct conv_core *core,
 	if (out_count != NULL) {
 		*out_count = n;
 	}
+	os_mutex_unlock(&core->jobs_mtx);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+conv_core_job_splat_result(struct conv_core *core, uint64_t job_id, struct xrt_conv_splat_result *out)
+{
+	if (out == NULL || out->struct_size < sizeof(uint32_t)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	os_mutex_lock(&core->jobs_mtx);
+	struct conv_job *j = find_locked(core, job_id);
+	if (j == NULL) {
+		os_mutex_unlock(&core->jobs_mtx);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (!is_splat_task(j->task) || (j->status != CONV_JOB_SUCCEEDED && j->status != CONV_JOB_FAILED)) {
+		os_mutex_unlock(&core->jobs_mtx);
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
+	}
+	const uint32_t want = out->struct_size;
+	const size_t n = want < sizeof(j->splat_result) ? want : sizeof(j->splat_result);
+	memcpy(out, &j->splat_result, n);
+	out->struct_size = (uint32_t)n;
 	os_mutex_unlock(&core->jobs_mtx);
 	return XRT_SUCCESS;
 }

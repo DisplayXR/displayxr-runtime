@@ -357,7 +357,10 @@ TEST_CASE("conversion ABI: top-level structs start with struct_size, no hidden p
 	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, depth_info) == 80);
 	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, views_info) == 208);
 	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, reserved_pad) == 332);
-	STATIC_REQUIRE(sizeof(struct xrt_conv_job_out) == 336);
+	STATIC_REQUIRE(offsetof(struct xrt_conv_job_out, splat_result) == 336); // ADR-057: chained, not embedded
+	STATIC_REQUIRE(sizeof(struct xrt_conv_job_out) == 336 + sizeof(void *));
+	STATIC_REQUIRE(offsetof(struct xrt_conv_splat_result, struct_size) == 0);
+	STATIC_REQUIRE(sizeof(struct xrt_conv_splat_result) == 568);
 	if (sizeof(void *) == 8) {
 		CHECK(offsetof(struct xrt_conv_frame_out, written) == 4);
 		CHECK(offsetof(struct xrt_conv_frame_out, views) == 8);
@@ -403,7 +406,8 @@ TEST_CASE("conversion ABI: iface slot order", "[conversion_abi]")
 	CHECK(offsetof(H, model_resolve) == 16 + 3 * p);
 	CHECK(offsetof(H, model_request) == 16 + 4 * p);
 	CHECK(offsetof(H, notify_changed) == 16 + 5 * p);
-	CHECK(offsetof(H, reserved) == 16 + 6 * p);
+	CHECK(offsetof(H, get_consent) == 16 + 6 * p); // ADR-057: carved from reserved[0]
+	CHECK(offsetof(H, reserved) == 16 + 7 * p);
 	CHECK(sizeof(H) == 16 + 16 * p);
 }
 

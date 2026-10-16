@@ -172,6 +172,8 @@ struct conv_job
 	uint32_t requested_outputs;
 	struct conv_stage stage;
 	struct xrt_conv_job_out out;
+	//! ADR-057: the facts of a SPLATS_* job; out.splat_result points here while it runs.
+	struct xrt_conv_splat_result splat_result;
 	xrt_result_t result;
 };
 

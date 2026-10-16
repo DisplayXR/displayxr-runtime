@@ -122,6 +122,7 @@ struct pending
 	struct xrt_conv_params params;
 	struct xrt_conv_job_control ctl;
 	struct xrt_conv_job_out job_out;
+	struct xrt_conv_splat_result splat_result; //!< ADR-057: job_out.splat_result for a splat job
 	struct xrt_conv_blob_sink sinks[5]; //!< one per role: a provider matches sink.role EXACTLY
 	uint8_t *blob;
 	uint64_t blob_bytes, blob_cap;
@@ -685,6 +686,7 @@ pending_done(struct conv_host_cmd *cmd)
 		xrt_conv_wire_pack_splat_info(&p->job_out.splat_info, &jd.splat_info);
 		xrt_conv_wire_pack_depth_info(&p->job_out.depth_info, &jd.depth_info);
 		xrt_conv_wire_pack_views_info(&p->job_out.views_info, &jd.views_info);
+		conv_host_wire_pack_splat_result(p->job_out.splat_result, &jd.splat_result);
 		uint64_t h = 0;
 		if (r == XRT_SUCCESS && p->blob_bytes > 0) {
 			void *map = NULL;
@@ -1483,6 +1485,8 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 			p->job_in.input_kind = q.input_kind;
 			p->job_in.image_count = q.image_count;
 			p->job_in.requested_blob_format = q.requested_blob_format;
+			p->job_in.job_flags = q.job_flags;
+			p->job_in.max_input_long_side = q.max_input_long_side;
 			os_mutex_lock(&s->mtx);
 			for (uint32_t i = 0; i < q.image_count && r == XRT_SUCCESS; i++) {
 				p->job_in.image_role[i] = q.image_role[i];
@@ -1525,6 +1529,10 @@ dispatch(struct conv_host_serve *s, const struct conv_host_wire_frame *f, const 
 		p->ctl.progress = job_progress;
 		p->ctl.is_cancelled = pending_is_cancelled;
 		p->job_out.struct_size = sizeof(p->job_out);
+		// ADR-057: the service sends a splat result back for every job; the
+		// provider fills it only for a splat task (it knows its cap's task).
+		p->splat_result.struct_size = sizeof(p->splat_result);
+		p->job_out.splat_result = &p->splat_result;
 		p->cmd.op = CONV_OP_JOB;
 		p->cmd.cap_id = q.cap_id;
 		p->cmd.job_in = &p->job_in;
