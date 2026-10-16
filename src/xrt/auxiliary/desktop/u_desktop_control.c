@@ -76,6 +76,9 @@ struct u_desktop_control
 	enum u_desktop_access req_result;
 	bool store_write_failed;
 	enum u_desktop_control_state last_state;
+	//! state + 1 of the last submit refused for state (0 = none since the last accepted
+	//! submit): refusals are audited once per state, so a spamming app cannot flood the log.
+	int refused_audit_state_plus1;
 
 	struct queued_action q[U_DESKTOP_CONTROL_QUEUE_SIZE];
 	uint32_t q_head, q_count;
@@ -637,9 +640,31 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 	if (out_id != NULL) {
 		*out_id = 0;
 	}
-	if (update_state(c, NULL) != U_DESKTOP_STATE_GRANTED) {
+	enum u_desktop_control_state st = update_state(c, NULL);
+	if (st != U_DESKTOP_STATE_GRANTED) {
+		// An attempt while suspended / disabled / not granted is what a user reading
+		// the audit log most wants to see (spec §5 step 6) — once per state.
+		os_mutex_lock(&c->mutex);
+		bool first = c->refused_audit_state_plus1 != (int)st + 1;
+		c->refused_audit_state_plus1 = (int)st + 1;
+		os_mutex_unlock(&c->mutex);
+		if (first) {
+			struct u_desktop_audit_record r;
+			memset(&r, 0, sizeof(r));
+			r.exe = c->exe;
+			r.action = action_name(a != NULL ? a->type : U_DESKTOP_ACTION_TYPE_TEXT);
+			r.chars = -1;
+			r.has_target = a != NULL;
+			r.target_id = a != NULL ? a->target_window_id : 0;
+			r.result = "not_granted";
+			r.message = u_desktop_control_state_str(st);
+			u_desktop_audit_append(&r);
+		}
 		return U_DESKTOP_XR_ERROR_NOT_GRANTED;
 	}
+	os_mutex_lock(&c->mutex);
+	c->refused_audit_state_plus1 = 0;
+	os_mutex_unlock(&c->mutex);
 	if (!u_desktop_control_validate(a, NULL, 0)) {
 		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
 	}
