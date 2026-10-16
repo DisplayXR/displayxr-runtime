@@ -3,7 +3,7 @@
   "runtime":     "v2.45.3",
   "shell":       "v2.4.2",
   "leia_plugin": "v2.16.3",
-  "conversion_open": "v0.1.0",
+  "conversion_open": "v0.1.1",
   "mcp_tools":   "v0.5.5",
   "browser":     "v1.7.3",
   "gauss_demo":  "v1.29.5",
