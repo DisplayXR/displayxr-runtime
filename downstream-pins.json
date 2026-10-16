@@ -126,6 +126,19 @@
         }
       }
     },
+    "displayxr-conversion-open": {
+      "role": "Open-model conversion provider (ADR-053 P4): ships from its own repo like a vendor plug-in, built against the conversion-provider ABI only",
+      "tracks": {
+        "windows": {
+          "bump_when": "abi",
+          "abi_headers": ["src/xrt/include/xrt/xrt_conversion_plugin.h"],
+          "reason": "The repo vendors include/xrt/xrt_conversion_plugin.h, xrt_results.h and xrt_conv_wire.h verbatim and compiles against no runtime source, so the pin is metadata: the runtime tag the vendored headers match (a set(DXR_RUNTIME_GIT_TAG ...) literal in CMakeLists.txt). Gated on the conversion-provider ABI major alone, not on feature macros: the provider reads and writes every struct within its struct_size, so an append-only addition needs no repin. A repin PR must re-vendor the headers from the new tag in the same change; the bump only rewrites the literal.",
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" }
+          ]
+        }
+      }
+    },
     "displayxr-vendor-template": {
       "role": "Scaffold every new vendor plug-in repo is generated from -- stale pins here seed into all future vendor repos, so it matters more than its commit count suggests",
       "tracks": {
