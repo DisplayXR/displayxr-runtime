@@ -25,6 +25,8 @@
 #include "util/u_setting.h"
 #include "util/u_sha256.h"
 
+#include "os/os_threading.h"
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -2655,24 +2657,115 @@ tc_bin_sha256(struct tc_bin *b, char *out_hex, size_t cap)
  */
 
 /*!
- * Per-process verdict cache keyed by path + size + mtime, so a class that
- * re-enumerates on every world event (the DP loader on each compositor
- * create) does not re-hash and re-verify a multi-megabyte DLL each time.
- * Small and linear: a box has a handful of components.
+ * Per-process cache of the one expensive file fact: the Authenticode
+ * verification (WinVerifyTrust parses the whole PE and builds a chain). It is
+ * keyed on the file's IDENTITY (volume serial + file index / st_dev + st_ino),
+ * size, mtime AND the SHA-256 just read through the open handle — the hash
+ * is recomputed on every check (cheap next to LoadLibrary), so a file whose
+ * bytes changed with size and mtime put back misses the cache instead of
+ * inheriting the old verdict. The allowlist and platform facts are not cached
+ * at all: they are cheap lookups, and an admin may remove an allowlist row at
+ * any time. A signature verdict is only ever cached from a verification that
+ * read through the same handle the digest came from.
+ *
+ * One mutex guards lookup + insert, and rows are copied out under it: the DP
+ * refresh, IPC status snapshots (target_plugin_enumerate), and the input and
+ * conversion loaders all reach this from their own threads. The slow
+ * verification itself runs outside the lock (two threads may both verify a
+ * new file once; harmless). Small and linear: a box has a handful of
+ * components.
  */
 #define TC_PROV_CACHE 32
-static struct tc_prov_cache_row
+struct tc_prov_cache_row
 {
-	char path[TARGET_COMPONENT_PATH_MAX];
+	uint64_t dev;
+	uint64_t ino;
 	uint64_t size;
 	uint64_t mtime;
-	uint32_t provenance;
-	char reason[160];
-	char signer[128];
 	char sha256[65];
+	bool signed_ok;
+	char signer[128];
 	bool valid;
-} g_tc_prov_cache[TC_PROV_CACHE];
+};
+static struct tc_prov_cache_row g_tc_prov_cache[TC_PROV_CACHE];
 static int g_tc_prov_cache_next = 0;
+static struct os_mutex g_tc_prov_mutex;
+static pthread_once_t g_tc_prov_once = PTHREAD_ONCE_INIT;
+static bool g_tc_prov_mutex_ok = false;
+
+static void
+tc_prov_mutex_init(void)
+{
+	g_tc_prov_mutex_ok = os_mutex_init(&g_tc_prov_mutex) == 0;
+}
+
+//! Lock the cache; false (and the cache is not touched) if the mutex could not be created.
+static bool
+tc_prov_cache_lock(void)
+{
+	pthread_once(&g_tc_prov_once, tc_prov_mutex_init);
+	if (!g_tc_prov_mutex_ok) {
+		return false;
+	}
+	os_mutex_lock(&g_tc_prov_mutex);
+	return true;
+}
+
+static void
+tc_prov_cache_unlock(void)
+{
+	os_mutex_unlock(&g_tc_prov_mutex);
+}
+
+//! Copy the cached signature verdict for @p b + @p sha256 out; false on a miss.
+static bool
+tc_prov_cache_get(const struct tc_bin *b, const char *sha256, bool *out_signed, char *signer, size_t signer_cap)
+{
+	if (!tc_prov_cache_lock()) {
+		return false;
+	}
+	bool hit = false;
+	for (int i = 0; i < TC_PROV_CACHE && !hit; i++) {
+		const struct tc_prov_cache_row *r = &g_tc_prov_cache[i];
+		if (r->valid && r->dev == b->dev && r->ino == b->ino && r->size == b->size && r->mtime == b->mtime &&
+		    strcmp(r->sha256, sha256) == 0) {
+			*out_signed = r->signed_ok;
+			tc_copy(signer, signer_cap, r->signer);
+			hit = true;
+		}
+	}
+	tc_prov_cache_unlock();
+	return hit;
+}
+
+static void
+tc_prov_cache_put(const struct tc_bin *b, const char *sha256, bool signed_ok, const char *signer)
+{
+	if (!tc_prov_cache_lock()) {
+		return;
+	}
+	struct tc_prov_cache_row *r = NULL;
+	// Refresh this file's row in place if it has one (new bytes, same file).
+	for (int i = 0; i < TC_PROV_CACHE && r == NULL; i++) {
+		if (g_tc_prov_cache[i].valid && g_tc_prov_cache[i].dev == b->dev && g_tc_prov_cache[i].ino == b->ino) {
+			r = &g_tc_prov_cache[i];
+		}
+	}
+	if (r == NULL) {
+		r = &g_tc_prov_cache[g_tc_prov_cache_next];
+		g_tc_prov_cache_next = (g_tc_prov_cache_next + 1) % TC_PROV_CACHE;
+	}
+	memset(r, 0, sizeof(*r));
+	r->dev = b->dev;
+	r->ino = b->ino;
+	r->size = b->size;
+	r->mtime = b->mtime;
+	tc_copy(r->sha256, sizeof(r->sha256), sha256);
+	r->signed_ok = signed_ok;
+	tc_copy(r->signer, sizeof(r->signer), signer);
+	r->valid = true;
+	tc_prov_cache_unlock();
+}
 
 static void
 tc_prov_evaluate(struct target_component_entry *e, struct tc_bin *b)
@@ -2683,62 +2776,25 @@ tc_prov_evaluate(struct target_component_entry *e, struct tc_bin *b)
 	e->sha256[0] = '\0';
 
 	// The dev override and elevation are per process, not per file, and
-	// cheap: they are re-read, so a cached file verdict still reflects them.
+	// cheap: re-read every time.
 	const bool dev_override = target_component_dev_override_set();
 	const bool elevated = target_component_process_elevated();
 
-	struct tc_prov_cache_row *hit = NULL;
-	if (b->open) {
-		for (int i = 0; i < TC_PROV_CACHE; i++) {
-			struct tc_prov_cache_row *r = &g_tc_prov_cache[i];
-			if (r->valid && r->size == b->size && r->mtime == b->mtime &&
-			    strcmp(r->path, e->binary_path) == 0) {
-				hit = r;
-				break;
-			}
-		}
-	}
+	// Every file fact comes from the one open handle / descriptor, and the
+	// digest is always re-read: it is what the cache and the allowlist key on.
+	const bool have_hash = tc_bin_sha256(b, e->sha256, sizeof(e->sha256));
 
 	bool signed_ok = false;
-	bool allowlisted = false;
-	bool platform_trusted = false;
-	if (hit != NULL) {
-		tc_copy(e->sha256, sizeof(e->sha256), hit->sha256);
-		tc_copy(e->signer, sizeof(e->signer), hit->signer);
-		// Re-derive the three file facts from the cached verdict so the
-		// per-process inputs (override, elevation) can still move it.
-		signed_ok = hit->provenance == TARGET_COMPONENT_PROVENANCE_SIGNED;
-		allowlisted = hit->provenance == TARGET_COMPONENT_PROVENANCE_ALLOWLISTED;
-		platform_trusted = hit->provenance == TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
-	} else {
-		// Every file fact comes from the one open handle / descriptor.
-		const bool have_hash = tc_bin_sha256(b, e->sha256, sizeof(e->sha256));
-		signed_ok = have_hash && tc_prov_signed(e->binary_path, b, e->signer, sizeof(e->signer));
-		allowlisted = !signed_ok && have_hash && tc_prov_allowlisted(e->sha256);
-		platform_trusted = !signed_ok && !allowlisted && tc_prov_platform_trusted(e->binary_path, b);
+	if (have_hash && !tc_prov_cache_get(b, e->sha256, &signed_ok, e->signer, sizeof(e->signer))) {
+		signed_ok = tc_prov_signed(e->binary_path, b, e->signer, sizeof(e->signer));
+		tc_prov_cache_put(b, e->sha256, signed_ok, e->signer);
 	}
+	const bool allowlisted = !signed_ok && have_hash && tc_prov_allowlisted(e->sha256);
+	const bool platform_trusted = !signed_ok && !allowlisted && tc_prov_platform_trusted(e->binary_path, b);
 
-	e->provenance = target_component_provenance_classify(signed_ok, allowlisted, platform_trusted, dev_override,
-	                                                     elevated, e->sha256, e->provenance_reason,
-	                                                     sizeof(e->provenance_reason));
-
-	if (hit == NULL && b->open) {
-		struct tc_prov_cache_row *r = &g_tc_prov_cache[g_tc_prov_cache_next];
-		g_tc_prov_cache_next = (g_tc_prov_cache_next + 1) % TC_PROV_CACHE;
-		memset(r, 0, sizeof(*r));
-		tc_copy(r->path, sizeof(r->path), e->binary_path);
-		r->size = b->size;
-		r->mtime = b->mtime;
-		// Only the FILE facts are cached (signed / allowlisted / platform);
-		// a dev-override or unverified verdict is recomputed from them.
-		r->provenance = signed_ok ? TARGET_COMPONENT_PROVENANCE_SIGNED
-		                : allowlisted ? TARGET_COMPONENT_PROVENANCE_ALLOWLISTED
-		                : platform_trusted ? TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED
-		                                   : TARGET_COMPONENT_PROVENANCE_UNVERIFIED;
-		tc_copy(r->signer, sizeof(r->signer), e->signer);
-		tc_copy(r->sha256, sizeof(r->sha256), e->sha256);
-		r->valid = true;
-	}
+	e->provenance =
+	    target_component_provenance_classify(signed_ok, allowlisted, platform_trusted, dev_override, elevated,
+	                                         e->sha256, e->provenance_reason, sizeof(e->provenance_reason));
 }
 
 bool

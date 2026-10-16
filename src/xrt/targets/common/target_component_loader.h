@@ -647,10 +647,13 @@ target_component_provenance_classify(bool signed_ok,
  * `/etc/displayxr/trust/allowlist` lines on POSIX), check the Authenticode
  * chain (Windows), the platform rule (Android: always; .deb: root-owned,
  * not group/world-writable, under /usr or /opt), the dev override and the
- * host's elevation, then @ref target_component_provenance_classify. Results
- * are cached per path + size + mtime for the process, so a class that
- * re-enumerates on every world event does not re-hash. Returns true when the
- * verdict is anything but UNVERIFIED. Never loads the binary.
+ * host's elevation, then @ref target_component_provenance_classify. Every
+ * fact is read through one open handle / descriptor on the file. The digest
+ * is recomputed on every call; only the Authenticode result is cached for the
+ * process, keyed on file identity (volume + file index / st_dev + st_ino),
+ * size, mtime and that digest, under a lock (thread-safe). Returns true when
+ * the verdict is anything but UNVERIFIED. Never loads the binary — the load
+ * path runs the same evaluation on the handle it then loads through.
  */
 bool
 target_component_check_provenance(const struct target_component_class *cls, struct target_component_entry *e);
