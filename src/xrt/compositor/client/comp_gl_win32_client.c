@@ -291,30 +291,19 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 
 	c->base.base.base.destroy = client_gl_win32_compositor_destroy;
 
-	// #1956: the WGL_NV_DX_interop2 import renders into a device-local STAGING
-	// copy (BIND_SHADER_RESOURCE | BIND_RENDER_TARGET) and CopyResource's it into
-	// the shared image at release — a recipe that cannot be created for a depth
-	// family, and depth registration with wglDXRegisterObjectNV is unverified on
-	// every vendor. So the D3D11 service's depth formats are NOT offered to a GL
-	// app on this path: it sees no depth format (and skips depth) rather than one
-	// that fails xrCreateSwapchain. Follow-up: a depth staging recipe + interop
-	// check on hardware.
+	// #1956: on the WGL_NV_DX_interop2 path a depth image is a GL-native depth
+	// texture copied into a colour-family interop texture at release
+	// (comp_gl_d3d11_depth.h). That backs GL_DEPTH_COMPONENT32F and
+	// GL_DEPTH_COMPONENT16 exactly; the stencil families have no RENDER_TARGET
+	// member to stage through, so they are dropped here rather than offered
+	// and then failed at xrCreateSwapchain.
 	if (swapchain_create_fn == client_gl_d3d11_swapchain_create) {
-		uint32_t kept = 0;
-		for (uint32_t i = 0; i < c->base.base.base.info.format_count; i++) {
-			int64_t f = c->base.base.base.info.formats[i];
-			switch (f) {
-			case GL_DEPTH_COMPONENT16:
-			case GL_DEPTH_COMPONENT24:
-			case GL_DEPTH_COMPONENT32F:
-			case GL_DEPTH24_STENCIL8:
-			case GL_DEPTH32F_STENCIL8: continue;
-			default: c->base.base.base.info.formats[kept++] = f; break;
-			}
-		}
-		if (kept != c->base.base.base.info.format_count) {
-			U_LOG_W("GL client (WGL_NV_DX_interop2): %u depth format(s) not offered over IPC (#1956)",
-			        c->base.base.base.info.format_count - kept);
+		const uint32_t before = c->base.base.base.info.format_count;
+		const uint32_t kept = client_gl_d3d11_filter_formats(c->base.base.base.info.formats, before);
+		if (kept != before) {
+			U_LOG_W(
+			    "GL client (WGL_NV_DX_interop2): %u stencil depth format(s) not offered over IPC (#1956)",
+			    before - kept);
 		}
 		c->base.base.base.info.format_count = kept;
 	}

@@ -223,6 +223,14 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# keyed mutex, D3D11 + D3D12 open). SKIPs if no WARP device exists.
 	list(APPEND tests tests_comp_d3d11_service_formats)
 endif()
+# #1956 — depth swapchains for GL clients over IPC (WGL_NV_DX_interop2 path):
+# the GL depth recipe / format filter / transfer layout, cross-checked against
+# the D3D11 service's format policy, plus a WARP run of the D3D11 half of the
+# release copy (colour-family staging -> TYPELESS shared depth under the keyed
+# mutex). SKIPs if no WARP device exists.
+if(WIN32 AND XRT_HAVE_D3D11 AND XRT_HAVE_OPENGL AND TARGET aux_ogl)
+	list(APPEND tests tests_comp_gl_d3d11_depth)
+endif()
 if(TARGET comp_d3d11_lift)
 	# ADR-053 P1a (#2003) -- the legacy lift path's golden replay on WARP: the
 	# sim_display fake behind d3d11_lift, its output bytes pinned before the
@@ -1217,6 +1225,13 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		tests_comp_d3d11_service_formats PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
 		)
 	target_link_libraries(tests_comp_d3d11_service_formats PRIVATE aux_d3d xrt-interfaces d3d11 dxgi)
+	if(TARGET tests_comp_gl_d3d11_depth)
+		target_include_directories(
+			tests_comp_gl_d3d11_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+							  ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+			)
+		target_link_libraries(tests_comp_gl_d3d11_depth PRIVATE aux_d3d aux_ogl xrt-interfaces d3d11 dxgi)
+	endif()
 	if(XRT_HAVE_D3D12)
 		target_compile_definitions(tests_comp_d3d11_service_formats PRIVATE DXR_TEST_HAVE_D3D12)
 		target_link_libraries(tests_comp_d3d11_service_formats PRIVATE d3d12)
