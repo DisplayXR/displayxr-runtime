@@ -274,7 +274,12 @@ per-user HKCU `Enabled` is in force, whatever its value; `machine` =
 disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX
 manifest; `default` = enabled with no per-user value), the `PreferredPlugin`
 override, the N4b provenance verdict, and `*` on the plug-in the loader
-would select — a disabled one is never `*`. `displayxr-cli selftest` reports
+would select — a disabled one is never `*`. The JSON also carries
+`policy.policy_lock` (bool; the same key `conv list --json` emits): HKLM
+`DisplayProcessors\Policy\Lock` = 1, so no row is `user` and a per-user
+`dp enable|disable` is ignored — the CLI says so in a `note:` line, and the
+dashboard disables its per-user Enabled control (a `PreferredPlugin` is not
+under the lock). Always false on POSIX. `displayxr-cli selftest` reports
 the better-ranked plug-ins discovery skipped because they are disabled
 (`display_processor.skipped_disabled` in `--json`; the `active_plugin`
 check's detail in text), so "sim-display is active" on a box with a vendor
