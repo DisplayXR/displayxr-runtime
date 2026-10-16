@@ -73,7 +73,15 @@ uses a remote endpoint, with the licence shown.
   fp16 at about 1.3 GB, int8 at about 660–800 MB, int4 at about 430–580 MB, some aimed at
   WebGPU, a Qualcomm QNN build, and an MLX fp16 build. They show that an ONNX export is
   feasible. Their quality is unmeasured, their provenance is unverified, several mislabel the
-  licence, and all of them remain derivatives under `apple-amlr`.
+  licence, and all of them remain derivatives under `apple-amlr`. One of them,
+  `sm079/sharp-onnx-webgpu` (int8, 658 MB, fetched at page load), has been seen running in a
+  browser tab on WebGPU at about 3.6 s warm. Only a screenshot shows it; the browser, GPU,
+  memory and any CPU fallback are unknown. It is raw mono Sharp: no stereo arm, no metric
+  scale, no camera block.
+- **Leia's own distilled model.** The private `LeiaInc/Leia_ml_sharp` repo exports a distilled
+  student (`best_v2` + Depth Anything V2) to `sharp_bestv2_dav2.onnx`. Its weights live only on
+  a RunPod volume, it has never run in a browser, and its licence depends on how it was
+  trained from Sharp. That is undetermined.
 
 ## Decision
 
@@ -115,11 +123,14 @@ Both modes sit behind the job lane, so an app cannot tell them apart.
   - **Long jobs.** Uploads and results go through signed URLs, so the GPU host never holds a
     storage key.
 
-**No in-page inference for this class.** The weights are 1.3–2.8 GB (0.4–0.8 GB quantized)
-and the stereo model's 3D convolutions already failed in ONNX Runtime Web. On the DisplayXR
-Browser, splat requests go through `XR_DXR_lift`'s job lane like any other app, so one
-provider serves native apps and the browser. What the web SDK does on a browser without
-DisplayXR is outside this ADR.
+**In-page inference is a web-SDK option, not the runtime's path.** An int8 export has run
+in a browser tab, so in-page mono Sharp is possible. It is still 0.4–0.8 GB per page load,
+and it cannot run the stereo arm: the stereo model's 3D convolutions fail in ONNX Runtime
+Web. On the DisplayXR Browser, splat requests go through `XR_DXR_lift`'s job lane like any
+other app, so one provider serves native apps and the browser and the runtime's store holds
+the weights once. A web-SDK in-page provider for browsers without DisplayXR is the SDK's
+decision. If it ships, it must pin a revision and verify the file hash, carry the research-only
+licence, and be A/B'd against the server first.
 
 ### 3. Facts, suggestions, intent — and who writes the camera block
 
@@ -222,9 +233,9 @@ build X" signal a downstream copy uses to re-pull.
 - **Runtime composes metric stereo** from `SPLATS_MONO` + `DISPARITY_STEREO`. The arm that
   won depends on a network inside Sharp's own checkpoint and on model-specific guards.
   Composition would ship the arm that lost.
-- **In-page ONNX Runtime Web for this class.** The weights are 0.4–2.8 GB, and ONNX Runtime
-  Web's operator coverage already failed for the stereo model. The runtime path serves the
-  browser instead.
+- **In-page ONNX Runtime Web as the runtime's path.** Mono Sharp can run in a tab, but each
+  page downloads 0.4–0.8 GB and the stereo arm cannot run there. The runtime path serves the
+  DisplayXR Browser instead; an in-page provider stays a web-SDK option (§2).
 - **Consume third-party ONNX exports from Hugging Face.** Unverified provenance and quality,
   mislabelled licences. We export from the official checkpoint and record the provenance.
 
@@ -241,6 +252,12 @@ build X" signal a downstream copy uses to re-pull.
 | S7 | DisplayXR Browser: splat requests through `XR_DXR_lift` jobs | browser |
 
 ## Open questions
+
+- **Leia's distilled student** (`sharp_bestv2_dav2`): is it a derivative under `apple-amlr`,
+  how good is it against Apple's checkpoint, and could it become the commercial or local
+  model? It is smaller and already exported to ONNX.
+- **Int8 quality.** No one has measured an int8 Sharp against the PyTorch checkpoint. The
+  export spike (S4) must, on the gallery corpus, before any quantized pack ships.
 
 - **Product use of Sharp.** Every path here is research-only until Apple licenses it
   otherwise. Is internal and demo use the only goal, or should S2 also prove a commercial
