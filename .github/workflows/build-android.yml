@@ -211,7 +211,12 @@ jobs:
       # camera, HAL restart) by rebuilding the tracking session with a 1 s -> 30 s
       # back-off instead of staying untracked until the service restarts.
       # Service-side only; no API, loader or INTRODUCED_IN change.
-      CNSDK_TAG: v0.10.81
+      # v0.10.83: matches leia-plugin v2.16.4 (built against
+      # cnsdk-android-0.10.83+208.5d40493.zip). CNSDK #755: head-tracking service
+      # deadlock after boot (every app 2D until the service was force-stopped);
+      # CNSDK #756: panel SPR wake guard (Lume phone class: double image in every
+      # 3D app after a sleep/wake). Service-side only; no API/loader change.
+      CNSDK_TAG: v0.10.83
 
     steps:
 
