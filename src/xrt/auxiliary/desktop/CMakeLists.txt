@@ -31,7 +31,7 @@ target_link_libraries(aux_desktop PUBLIC aux-includes aux_os PRIVATE aux_util xr
 
 if(WIN32)
 	target_sources(aux_desktop PRIVATE u_desktop_win32.cpp)
-	target_link_libraries(aux_desktop PRIVATE user32 ole32 oleaut32 uuid dwmapi)
+	target_link_libraries(aux_desktop PRIVATE user32 advapi32 ole32 oleaut32 uuid dwmapi)
 elseif(APPLE)
 	target_sources(aux_desktop PRIVATE u_desktop_macos.m)
 	target_link_libraries(
