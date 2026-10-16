@@ -18,7 +18,8 @@
  *   desktop_backend_smoke key MODS KEY            MODS: bits ctrl=1 shift=2 alt=4 super=8
  *   desktop_backend_smoke move X Y
  *   desktop_backend_smoke click X Y [left|right|middle] [count]
- *   desktop_backend_smoke scroll DX DY
+ *   desktop_backend_smoke scroll DX DY            at the current pointer
+ *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
  *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
  *                                                 OS grant from `request` lasts for the rest;
  *                                                 needed on GNOME, where the portal grant lives
@@ -92,6 +93,38 @@ print_pick(const struct u_desktop_pick *p)
 	if (p->kind == U_DESKTOP_PICK_WINDOW) {
 		print_window(&p->window);
 	}
+}
+
+//! The smoke tool has no policy layer: the guard always allows, and targets the
+//! focused window (text / keys) or the window under the point (buttons / scroll),
+//! read at the moment the command starts. Set `target ID` in a script to pin one.
+static uint64_t g_target = 0;
+static bool
+smoke_still_allowed(void *ctx)
+{
+	(void)ctx;
+	return true;
+}
+static struct u_desktop_input_guard
+guard_for_focus(struct u_desktop_backend *b)
+{
+	uint64_t id = g_target;
+	if (id == 0 && b->focused_window) {
+		b->focused_window(b, &id);
+	}
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	return g;
+}
+static struct u_desktop_input_guard
+guard_for_point(struct u_desktop_backend *b, int32_t x, int32_t y)
+{
+	uint64_t id = g_target;
+	struct u_desktop_pick p;
+	if (id == 0 && b->pick && b->pick(b, x, y, &p) == U_DESKTOP_OK && p.kind == U_DESKTOP_PICK_WINDOW) {
+		id = p.window.id;
+	}
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	return g;
 }
 
 static volatile int g_done = 0;
@@ -195,16 +228,28 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			rect.w = argc > 6 ? atoi(argv[6]) : 0;
 			rect.h = argc > 7 ? atoi(argv[7]) : 0;
 		}
-		r = b->window_op(b, (enum u_desktop_window_op)op, id, &rect, msg);
+		struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		r = b->window_op(b, &g, (enum u_desktop_window_op)op, id, &rect, msg);
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "type") == 0 && argc >= 3) {
-		r = b->type_text(b, argv[2], msg);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_focus(b);
+		r = b->type_text(b, &g, argv[2], msg);
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "key") == 0 && argc >= 4) {
 		struct u_desktop_chord c = {0};
 		c.mods = (uint32_t)strtoul(argv[2], NULL, 0);
 		snprintf(c.key, sizeof(c.key), "%s", argv[3]);
-		r = b->key_chord(b, &c, msg);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_focus(b);
+		r = b->key_chord(b, &g, &c, msg);
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "move") == 0 && argc >= 4) {
 		r = b->pointer_move(b, atoi(argv[2]), atoi(argv[3]), msg);
@@ -217,16 +262,30 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			btn = U_DESKTOP_BUTTON_MIDDLE;
 		}
 		int count = argc > 5 ? atoi(argv[5]) : 1;
-		r = b->pointer_move(b, atoi(argv[2]), atoi(argv[3]), msg);
+		int32_t x = atoi(argv[2]), y = atoi(argv[3]);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->pointer_move(b, x, y, msg);
 		for (int i = 0; r == U_DESKTOP_OK && i < count; i++) {
-			r = b->pointer_button(b, btn, true, msg);
+			r = b->pointer_button(b, &g, btn, true, x, y, msg);
 			if (r == U_DESKTOP_OK) {
-				r = b->pointer_button(b, btn, false, msg);
+				r = b->pointer_button(b, &g, btn, false, x, y, msg);
 			}
 		}
 		rc = done(r, msg);
+	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
+		g_target = strtoull(argv[2], NULL, 10);
+		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);
 	} else if (strcmp(cmd, "scroll") == 0 && argc >= 4) {
-		r = b->scroll(b, atoi(argv[2]), atoi(argv[3]), msg);
+		int32_t x = 0, y = 0;
+		b->get_pointer(b, &x, &y);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->scroll(b, &g, x, y, atoi(argv[2]), atoi(argv[3]), msg);
 		rc = done(r, msg);
 	} else {
 		fprintf(stderr, "unknown command / missing arguments: %s\n", cmd);
