@@ -540,6 +540,7 @@ comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uin
  */
 bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       int64_t target_ns,
                                                        struct xrt_eye_positions *out_eyes)
 {
 	if (xc == NULL || out_eyes == NULL) {
@@ -551,7 +552,9 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
 		return false;
 	}
 
-	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	// N6 Part 1 (#2144): the server answers for @p target_ns (the frame's
+	// displayTime), from the client's DP's own target-time slot or its ring.
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, target_ns, out_eyes);
 	if (xret != XRT_SUCCESS) {
 		return false;
 	}
@@ -569,6 +572,7 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
  */
 bool
 comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              int64_t target_ns,
                                                               struct xrt_eye_positions *out_eyes)
 {
 	if (xsysc == NULL || out_eyes == NULL) {
@@ -580,7 +584,7 @@ comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_
 		return false;
 	}
 
-	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, target_ns, out_eyes);
 	if (xret != XRT_SUCCESS) {
 		return false;
 	}
