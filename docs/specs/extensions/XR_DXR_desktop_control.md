@@ -69,7 +69,8 @@ state event, so a kill switch or a lock takes effect on the very next operation.
 ## 4. Operations
 
 All operations — observation included — require `GRANTED`, else
-`XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`. A capability the backend lacks returns
+`XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`. `xrGetDesktopControlStateDXR` is the one exception:
+it always succeeds for a valid session. A capability the backend lacks returns
 `XR_ERROR_FEATURE_UNSUPPORTED` (observation) or completes with it (actions).
 
 - **Observation** (`xrEnumerateDesktopWindowsDXR`, `xrGetDesktopPointerDXR`,
