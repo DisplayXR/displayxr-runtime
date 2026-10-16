@@ -1,0 +1,53 @@
+# XR_DXR_desktop_control end-to-end over the in-memory fake backend (ADR-056).
+# Never touches the real desktop. Needs displayxr-cli on PATH:
+#   PATH=<build>/src/xrt/targets/cli:$PATH XR_RUNTIME_JSON=<build>/openxr_displayxr-dev.json \
+#   DXR_DESKTOP_BACKEND=fake DXR_DESKTOP_CONTROL_DIR=$(mktemp -d) desktop_control_probe script e2e_fake.txt
+# Exit code 0 = every expectation held.
+expect-state NOT_REQUESTED
+request so the probe can type for you
+expect-state GRANTED
+list
+pointer
+pick 200 200
+pick 5 5
+text 200 200
+# keyboard: 101 has focus
+act type target=101 text="secret words 123"
+expect XR_SUCCESS
+expect-text 200 200 "secret words 123"
+act type target=102 text="must not land"
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key target=101 keys=ctrl+s
+expect XR_SUCCESS
+act key target=101 keys=ctrl+banana
+expect XR_ERROR_VALIDATION_FAILURE
+# pointer
+act click target=101 x=300 y=300
+expect XR_SUCCESS
+act click target=102 x=300 y=300
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act activate target=102
+expect XR_SUCCESS
+act type target=102 text="now it lands"
+expect XR_SUCCESS
+act drag target=102 x=1100 y=300 x2=1300 y2=500
+expect XR_SUCCESS
+act scroll target=102 x=1100 y=300 sy=3
+expect XR_SUCCESS
+act move target=103 rect=60,700,0,0
+expect XR_SUCCESS
+act close target=103
+expect XR_SUCCESS
+act close target=103
+expect XR_ERROR_DESKTOP_WINDOW_LOST_DXR
+list
+# the kill switch
+run displayxr-cli desktop stop
+act key target=102 keys=ctrl+s
+expect XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+expect-state SUSPENDED
+run displayxr-cli desktop resume
+expect-state GRANTED
+act key target=102 keys=ctrl+s
+expect XR_SUCCESS
+run displayxr-cli desktop audit --tail 40
