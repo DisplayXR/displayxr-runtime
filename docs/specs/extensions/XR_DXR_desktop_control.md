@@ -88,11 +88,14 @@ it always succeeds for a valid session. A capability the backend lacks returns
 
 1. **State** is `GRANTED` (§3 re-evaluated) — else `NOT_GRANTED` / `REFUSED` ("kill
    switch", "screen locked", "disabled by the user").
-2. **Never fight the user.** Input actions (text, keys, pointer, scroll) — and `ACTIVATE` —
-   wait until the user has been idle for `idle_ms` (store, default 600 ms), polling the
-   backend's `user_idle_ms`; input the runtime itself injected does not count (the common
-   layer remembers when its own last injection ended and ignores activity up to 150 ms after
-   it). Waits at most 10 s, then `REFUSED` "the user is active".
+2. **Never fight the user.** EVERY action (window ops included: on GNOME they are input
+   gestures, and everywhere they move focus) waits until the user has been idle for
+   `idle_ms` (store, default 600 ms), polling the backend's `user_idle_ms`. Input the runtime
+   itself injected does not count — but only input whose OS timestamp falls inside one of
+   the runtime's own injection windows `[start, end + 150 ms]`; activity after that window is
+   the user's, however soon the next action follows. (Known limit: a user keystroke landing
+   *during* one of our injections is indistinguishable from ours on these OSes.) Waits at
+   most 10 s, then `REFUSED` "the user is active".
 3. **Target exists.** The target window is in the backend's window list — else
    `WINDOW_LOST`.
 4. **Target verification** for input actions, immediately before delivery:
@@ -107,8 +110,23 @@ it always succeeds for a valid session. A capability the backend lacks returns
 6. **Audit** (§6.2) — every action, whatever its result.
 
 Window actions (`ACTIVATE`, `MOVE_RESIZE`, `MINIMIZE`, `RESTORE`, `MAXIMIZE`, `CLOSE`) skip
-step 4; step 2 applies to `ACTIVATE` only (moving focus under a typing user is the theft
-the rule exists for).
+step 4's focus / pick check in the common layer; a backend that performs them through
+input (GNOME) re-picks before every gesture under the input guard.
+
+**Delivery guarantee.** Verification (step 4) is repeated by the backend immediately before
+every injection batch — each text chunk, the paste keystroke, each Return/Tab, each chord
+key-down, each button press, each scroll burst — together with the kill switch and the lock
+(the input guard, `u_desktop.h`). A check that fails mid-action stops it with `REFUSED`
+("focus moved", "kill switch", "screen locked"); what was already injected stays, and every
+pressed key and button is released. Slow setup (opening / restoring the GNOME portal
+session) happens before step 4, never between it and the injection.
+
+**Revocation.** A backend that finds the OS permission gone returns NOT_GRANTED; the state
+becomes `DENIED` (event) and every further action is refused without reaching the OS.
+
+**Privacy.** Typed text, characters from chords (incl. AltGr / Option combinations, which
+produce characters), clipboard contents and UI text read from other apps never reach a
+log, an audit record or a message — validation errors name the problem, not the input.
 
 Chords are parsed by `u_desktop_chord_parse()`: `+`-separated, case-insensitive; modifiers
 `ctrl`/`control`, `shift`, `alt`/`option`, `super`/`win`/`cmd`/`command`/`meta`; at most one
@@ -131,8 +149,14 @@ One JSON file per user, read on every evaluation when its mtime changed:
   "apps": { "<executable full path>": "allow" | "deny" } }
 ```
 
-Writes are atomic (temp file + rename). A missing or unreadable file means defaults
-(nothing suspended, nobody allowed or denied).
+Writes are atomic (temp file + rename) and serialised across processes by an OS file lock
+on `desktop_control.json.lock` (`flock` / `LockFileEx`), with the read-modify-write done
+under the lock — so `displayxr-cli desktop stop` can never be overwritten by an app's
+concurrent `allow`. A **missing** file means defaults (nothing suspended, nobody allowed or
+denied). A file that **exists but cannot be parsed** never means defaults — that would
+silently turn off the kill switch and every `deny`: the last good policy read in this
+process is kept, and with none, the state is `SUSPENDED` ("the desktop-control settings
+file is unreadable") until the file is fixed or removed.
 
 ### 6.2 Audit log
 

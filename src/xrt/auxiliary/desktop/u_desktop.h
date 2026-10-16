@@ -52,6 +52,40 @@
  * Functions return enum u_desktop_result. On failure a backend may fill the
  * optional @p msg buffer (UTF-8, NUL-terminated, may be NULL) with a short human
  * reason; it ends up in the action-completed event and the audit log.
+ *
+ * ## Privacy (contract v2)
+ *
+ * A message, a log line (U_LOG at any level) or anything else a backend emits must
+ * NEVER contain typed text, a character from a chord, clipboard contents or UI text
+ * read from another app. Name the failure, not the data ("this layout has no key for
+ * that character", not "no key for 'é'").
+ *
+ * ## Delivery guarantee (contract v2)
+ *
+ * The common layer verifies the target (spec §5 step 4) and then hands the action to
+ * the backend together with a struct u_desktop_input_guard. The verification is only
+ * as good as the gap between it and the actual injection, so every injecting backend
+ * call MUST, immediately before EACH injection batch (each chunk of text, the paste
+ * keystroke, each Return/Tab inside text, each key-down of a chord, each button press,
+ * each scroll burst, each Super/Alt gesture of a window op):
+ *   1. call guard->still_allowed(guard->ctx) and stop with U_DESKTOP_ERR_REFUSED if it
+ *      returns false (the kill switch or the lock screen arrived mid-action), and
+ *   2. re-check that the target still holds what the action needs — keyboard focus
+ *      (text, chords: the focused window is guard->target_id or a window whose
+ *      parent_id is it) or the pick at the point (buttons, scroll, gestures) — and stop
+ *      with U_DESKTOP_ERR_REFUSED "focus moved" / "target no longer under the point".
+ * Anything already injected stays injected; a stop must release every key and button
+ * the backend pressed. A backend must never report OK for input the OS dropped (e.g. a
+ * revoked permission): re-check the OS permission before injecting and return
+ * U_DESKTOP_ERR_NOT_GRANTED, which the common layer turns into a DENIED state.
+ *
+ * ## Lifetime (contract v2)
+ *
+ * destroy() must not return while a request_access answer is still owed: it cancels
+ * the prompt / the polling (close the dialog, stop the poll thread), JOINS that
+ * thread, and either calls done() first (with U_DESKTOP_ACCESS_UNKNOWN when the user
+ * never answered) or guarantees done() is never called afterwards. The common layer
+ * frees the context right after destroy() returns.
  */
 
 #pragma once
@@ -202,6 +236,20 @@ struct u_desktop_app_info
 
 typedef void (*u_desktop_access_done_fn)(void *ctx, enum u_desktop_access result);
 
+/*!
+ * Handed to every injecting backend call (see "Delivery guarantee").
+ */
+struct u_desktop_input_guard
+{
+	//! The window the action was verified against (never 0).
+	uint64_t target_id;
+	//! True while the action may continue: not suspended (kill switch), not denied,
+	//! not locked. Cheap (a stat of the store + the backend's is_locked); call it
+	//! before every injection batch. Never NULL.
+	bool (*still_allowed)(void *ctx);
+	void *ctx;
+};
+
 struct u_desktop_backend
 {
 	const char *name; //!< "win32", "macos", "gnome", "fake"
@@ -251,29 +299,60 @@ struct u_desktop_backend
 
 	// ---- actions: worker thread only ----
 
-	//! @p rect only for U_DESKTOP_OP_MOVE_RESIZE (w/h 0 = keep size).
+	/*!
+	 * Optional (may be NULL). Called on the worker BEFORE the common layer verifies
+	 * the target of an input action or a window op, so slow setup (GNOME: opening /
+	 * restoring the portal session) happens before verification, not between
+	 * verification and injection. Must not inject anything.
+	 */
+	enum u_desktop_result (*prepare_input)(struct u_desktop_backend *b, char *msg);
+
+	//! @p rect only for U_DESKTOP_OP_MOVE_RESIZE (w/h 0 = keep size). Backends that
+	//! perform a window op through input (GNOME gestures) honour @p guard as for input
+	//! (re-pick before every press); others may ignore it.
 	enum u_desktop_result (*window_op)(struct u_desktop_backend *b,
+	                                   const struct u_desktop_input_guard *guard,
 	                                   enum u_desktop_window_op op,
 	                                   uint64_t window_id,
 	                                   const struct u_desktop_rect *rect,
 	                                   char *msg);
 
-	//! Commit @p utf8 as text into the focused window (IME-safe: not key codes).
-	enum u_desktop_result (*type_text)(struct u_desktop_backend *b, const char *utf8, char *msg);
+	//! Commit @p utf8 as text into guard->target_id (IME-safe: not key codes),
+	//! re-checking the guard before every batch (see "Delivery guarantee").
+	enum u_desktop_result (*type_text)(struct u_desktop_backend *b,
+	                                   const struct u_desktop_input_guard *guard,
+	                                   const char *utf8,
+	                                   char *msg);
 
-	enum u_desktop_result (*key_chord)(struct u_desktop_backend *b, const struct u_desktop_chord *chord, char *msg);
+	enum u_desktop_result (*key_chord)(struct u_desktop_backend *b,
+	                                   const struct u_desktop_input_guard *guard,
+	                                   const struct u_desktop_chord *chord,
+	                                   char *msg);
 
 	//! Move the pointer to (x, y). The backend verifies it arrived (within 2 px).
 	enum u_desktop_result (*pointer_move)(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg);
 
+	//! Press / release at the VERIFIED point (@p x, @p y): the backend posts the event
+	//! at that point (not "wherever the cursor is now") and, for a press, first
+	//! confirms the pointer is still there (2 px) and the guard still holds.
 	enum u_desktop_result (*pointer_button)(struct u_desktop_backend *b,
+	                                        const struct u_desktop_input_guard *guard,
 	                                        enum u_desktop_button button,
 	                                        bool down,
+	                                        int32_t x,
+	                                        int32_t y,
 	                                        char *msg);
 
-	//! Notches: +x right, +y down.
-	enum u_desktop_result (*scroll)(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg);
+	//! Notches at the verified point (@p x, @p y): +dx right, +dy down.
+	enum u_desktop_result (*scroll)(struct u_desktop_backend *b,
+	                                const struct u_desktop_input_guard *guard,
+	                                int32_t x,
+	                                int32_t y,
+	                                int32_t dx,
+	                                int32_t dy,
+	                                char *msg);
 
+	//! See "Lifetime": never returns while a consent answer is owed.
 	void (*destroy)(struct u_desktop_backend *b);
 };
 
