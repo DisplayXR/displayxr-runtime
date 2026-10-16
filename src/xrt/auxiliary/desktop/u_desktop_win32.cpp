@@ -27,6 +27,14 @@
  * - **UIPI.** SendInput / PostMessage into a higher-integrity (elevated) process
  *   is blocked by Windows, often silently. Input actions compare the target's
  *   integrity level with ours first and return REFUSED rather than pretend.
+ * - **Delivery guarantee (contract v2).** type_text / key_chord re-check the
+ *   guard and that the foreground root is guard->target_id (or its same-process
+ *   dialog) before every batch, every Enter / Tab and every key-down;
+ *   pointer_button / scroll re-check the guard, the cursor (2 px) and the hit
+ *   window at the verified point before every press / burst, and act AT it.
+ * - **Consent prompt lifetime.** The MessageBox thread is joinable; destroy()
+ *   closes the dialog (answer UNKNOWN), joins, and done() has run before it
+ *   returns. The dialog defaults to "No" and ignores input for 500 ms.
  * - **Chord keys follow the ACTIVE layout** (u_desktop.h): a character key is
  *   mapped with VkKeyScanExW on the foreground thread's HKL ("ctrl+z" = the key
  *   labelled Z, on AZERTY too); AltGr-only characters are UNSUPPORTED. Named
@@ -72,7 +80,11 @@
 #define WIN32_WINDOW_OP_MS 1000      // show / move verification budget
 #define WIN32_TEXT_BATCH_CHARS 32    // characters per SendInput batch
 #define WIN32_SCROLL_MAX_NOTCHES 100 // per call, per axis
-#define WIN32_ALT_MASK_VK 0xE8       // unassigned VK: masks the Alt tap so no menu bar activates
+#define WIN32_ALT_MASK_VK 0xE8
+#define WIN32_PROMPT_ARM_MS 500   // the consent dialog ignores input this long
+#define WIN32_PROMPT_JOIN_MS 3000 // destroy(): bound on closing the dialog
+#define WIN32_PROMPT_REASON_MAX                                                                                        \
+	200 // code points of the app's reason shown       // unassigned VK: masks the Alt tap so no menu bar activates
 
 static void
 set_msg(char *msg, const char *fmt, ...)
@@ -664,6 +676,9 @@ struct win32_backend
 	SRWLOCK uia_init_lock;
 	uia_worker *uia; // lazily started on the first text_at
 	bool uia_failed;
+
+	SRWLOCK prompt_lock;
+	struct prompt_state *prompt; // the consent prompt (joinable), or NULL
 };
 
 static inline win32_backend *
@@ -715,22 +730,205 @@ win32_access_status(struct u_desktop_backend *b)
 	return U_DESKTOP_ACCESS_UNKNOWN;
 }
 
-struct prompt_job
+/*
+ * The consent prompt. A joinable thread runs a MessageBoxW whose input is
+ * ignored for its first WIN32_PROMPT_ARM_MS (a CBT hook disables the dialog as
+ * it activates and a timer re-enables it), so a click or Enter meant for
+ * something else cannot answer it. "No" is the default button. destroy()
+ * cancels it (posts IDNO to the dialog, answer reported as UNKNOWN), joins the
+ * thread, and guarantees done() ran exactly once before it returns.
+ */
+
+struct prompt_state
 {
+	volatile LONG refs; // backend + thread
+	SRWLOCK lock;
 	std::wstring text;
 	u_desktop_access_done_fn done;
 	void *ctx;
+	HANDLE thread;
+	DWORD tid;
+
+	// Guarded by lock.
+	bool done_called;
+	bool cancelled; // destroy() is closing it: the answer is UNKNOWN
+	HWND dialog;
 };
+
+static thread_local prompt_state *t_prompt = NULL;
+
+static void
+prompt_unref(prompt_state *p)
+{
+	if (InterlockedDecrement(&p->refs) == 0) {
+		if (p->thread != NULL) {
+			CloseHandle(p->thread);
+		}
+		delete p;
+	}
+}
+
+//! Call done() unless it was already claimed. The claim is under the lock, the
+//! call is not: done() may take the common layer's lock, which its destroy()
+//! caller may hold while it waits (bounded) for our join.
+static void
+prompt_finish(prompt_state *p, enum u_desktop_access result)
+{
+	AcquireSRWLockExclusive(&p->lock);
+	bool call = !p->done_called;
+	p->done_called = true;
+	ReleaseSRWLockExclusive(&p->lock);
+	if (call) {
+		p->done(p->ctx, result);
+	}
+}
+
+static void
+prompt_post_no(HWND dialog)
+{
+	PostMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDNO, BN_CLICKED), 0);
+}
+
+static VOID CALLBACK
+prompt_arm_timer(HWND h, UINT msg, UINT_PTR id, DWORD time)
+{
+	(void)msg;
+	(void)time;
+	KillTimer(h, id);
+	EnableWindow(h, TRUE);
+	HWND no = GetDlgItem(h, IDNO);
+	if (no != NULL) {
+		SetFocus(no);
+	}
+}
+
+static LRESULT CALLBACK
+prompt_cbt_hook(int code, WPARAM wp, LPARAM lp)
+{
+	prompt_state *p = t_prompt;
+	if (code == HCBT_ACTIVATE && p != NULL) {
+		HWND h = (HWND)wp;
+		wchar_t cls[16];
+		class_of(h, cls, 16);
+		AcquireSRWLockExclusive(&p->lock);
+		bool first = p->dialog == NULL && wcscmp(cls, L"#32770") == 0;
+		if (first) {
+			p->dialog = h;
+		}
+		bool cancel = p->cancelled;
+		ReleaseSRWLockExclusive(&p->lock);
+		if (first) {
+			EnableWindow(h, FALSE);
+			SetTimer(h, 1, WIN32_PROMPT_ARM_MS, prompt_arm_timer);
+			if (cancel) {
+				prompt_post_no(h);
+			}
+		}
+	}
+	return CallNextHookEx(NULL, code, wp, lp);
+}
 
 static DWORD WINAPI
 prompt_thread_main(LPVOID param)
 {
-	prompt_job *job = (prompt_job *)param;
-	int r = MessageBoxW(NULL, job->text.c_str(), L"DisplayXR",
-	                    MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
-	job->done(job->ctx, r == IDYES ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED);
-	delete job;
+	prompt_state *p = (prompt_state *)param;
+	t_prompt = p;
+
+	AcquireSRWLockExclusive(&p->lock);
+	bool cancel = p->cancelled;
+	ReleaseSRWLockExclusive(&p->lock);
+
+	int r = 0;
+	if (!cancel) {
+		HHOOK hook = SetWindowsHookExW(WH_CBT, prompt_cbt_hook, NULL, GetCurrentThreadId());
+		r = MessageBoxW(NULL, p->text.c_str(), L"DisplayXR",
+		                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND);
+		if (hook != NULL) {
+			UnhookWindowsHookEx(hook);
+		}
+	}
+
+	AcquireSRWLockExclusive(&p->lock);
+	cancel = p->cancelled;
+	p->dialog = NULL;
+	ReleaseSRWLockExclusive(&p->lock);
+
+	// A destroy-initiated close is not the user's "no": it must not be stored.
+	enum u_desktop_access result = U_DESKTOP_ACCESS_UNKNOWN;
+	if (!cancel && r == IDYES) {
+		result = U_DESKTOP_ACCESS_GRANTED;
+	} else if (!cancel && r == IDNO) {
+		result = U_DESKTOP_ACCESS_DENIED;
+	}
+	prompt_finish(p, result);
+
+	t_prompt = NULL;
+	prompt_unref(p);
 	return 0;
+}
+
+static BOOL CALLBACK
+prompt_close_enum(HWND h, LPARAM lp)
+{
+	(void)lp;
+	wchar_t cls[16];
+	class_of(h, cls, 16);
+	if (wcscmp(cls, L"#32770") == 0) {
+		prompt_post_no(h);
+	}
+	return TRUE;
+}
+
+//! Cancel, close and join the prompt; done() has run when this returns.
+static void
+prompt_shutdown(prompt_state *p)
+{
+	AcquireSRWLockExclusive(&p->lock);
+	p->cancelled = true;
+	HWND dialog = p->dialog;
+	ReleaseSRWLockExclusive(&p->lock);
+	if (dialog != NULL) {
+		prompt_post_no(dialog);
+	}
+	ULONGLONG end = GetTickCount64() + WIN32_PROMPT_JOIN_MS;
+	while (WaitForSingleObject(p->thread, 50) == WAIT_TIMEOUT && GetTickCount64() < end) {
+		// Covers a dialog that appeared after the flag was read, and a
+		// failed CBT hook.
+		EnumThreadWindows(p->tid, prompt_close_enum, 0);
+	}
+	// Normally a no-op (the thread already answered UNKNOWN). If the thread is
+	// somehow still alive and has not claimed the answer, this answers for it
+	// and the claim stops it from ever calling done() after we return.
+	prompt_finish(p, U_DESKTOP_ACCESS_UNKNOWN);
+	prompt_unref(p);
+}
+
+//! App-supplied text for the prompt: one line, no control / bidi-override
+//! characters (no faking the prompt's own lines), at most @p max code points.
+static std::wstring
+prompt_sanitize(const std::wstring &in, size_t max)
+{
+	std::wstring out;
+	size_t cps = 0;
+	for (size_t i = 0; i < in.size(); i++) {
+		wchar_t c = in[i];
+		if ((c >= 0x202A && c <= 0x202E) || (c >= 0x2066 && c <= 0x2069) || c == 0x200E || c == 0x200F) {
+			continue;
+		}
+		if (cps == max) {
+			out += L"\x2026";
+			break;
+		}
+		if (c < 0x20 || c == 0x7F || c == 0x2028 || c == 0x2029) {
+			c = L' ';
+		}
+		out += c;
+		if (IS_HIGH_SURROGATE(c) && i + 1 < in.size() && IS_LOW_SURROGATE(in[i + 1])) {
+			out += in[++i];
+		}
+		cps++;
+	}
+	return out;
 }
 
 static void
@@ -739,45 +937,68 @@ win32_request_access(struct u_desktop_backend *b,
                      u_desktop_access_done_fn done,
                      void *ctx)
 {
-	(void)b;
+	win32_backend *wb = win32(b);
+
 	std::wstring name;
 	if (app != NULL && app->display_name != NULL && app->display_name[0] != '\0') {
-		name = utf8_to_utf16(app->display_name);
+		name = prompt_sanitize(utf8_to_utf16(app->display_name), 80);
 	} else if (app != NULL && app->exe_path != NULL && app->exe_path[0] != '\0') {
 		std::wstring path = utf8_to_utf16(app->exe_path);
 		size_t slash = path.find_last_of(L"\\/");
-		name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+		name = prompt_sanitize(slash == std::wstring::npos ? path : path.substr(slash + 1), 80);
 	}
 	if (name.empty()) {
 		name = L"An app";
 	}
+	std::wstring exe = app != NULL && app->exe_path != NULL && app->exe_path[0] != '\0'
+	                       ? prompt_sanitize(utf8_to_utf16(app->exe_path), 400)
+	                       : name;
 
-	prompt_job *job = new prompt_job();
-	job->done = done;
-	job->ctx = ctx;
-	job->text = name;
-	job->text +=
+	std::wstring text = name;
+	text +=
 	    L" wants to control your computer.\n\n"
 	    L"It will be able to see your windows, and type and click in other apps.\n\n";
 	if (app != NULL && app->reason != NULL && app->reason[0] != '\0') {
-		job->text += utf8_to_utf16(app->reason);
-		job->text += L"\n\n";
+		text += L"The app says: \"";
+		text += prompt_sanitize(utf8_to_utf16(app->reason), WIN32_PROMPT_REASON_MAX);
+		text += L"\"\n\n";
 	}
-	std::wstring exe =
-	    app != NULL && app->exe_path != NULL && app->exe_path[0] != '\0' ? utf8_to_utf16(app->exe_path) : name;
-	job->text += L"To stop it, run: displayxr-cli desktop deny \"";
-	job->text += exe;
-	job->text += L"\" (or 'displayxr-cli desktop stop' to pause every app)";
+	text += L"To stop it, run: displayxr-cli desktop deny \"";
+	text += exe;
+	text += L"\" (or 'displayxr-cli desktop stop' to pause every app)";
 
-	HANDLE t = CreateThread(NULL, 0, prompt_thread_main, job, 0, NULL);
-	if (t == NULL) {
-		// No prompt was shown: that is not the user's "no" (it must not be
-		// persisted as a deny).
-		delete job;
+	AcquireSRWLockExclusive(&wb->prompt_lock);
+	if (wb->prompt != NULL) {
+		if (WaitForSingleObject(wb->prompt->thread, 0) != WAIT_OBJECT_0) {
+			// One prompt at a time; this request is not answered by the user.
+			ReleaseSRWLockExclusive(&wb->prompt_lock);
+			done(ctx, U_DESKTOP_ACCESS_UNKNOWN);
+			return;
+		}
+		prompt_unref(wb->prompt); // finished: its done() already ran
+		wb->prompt = NULL;
+	}
+
+	prompt_state *p = new prompt_state();
+	p->refs = 2;
+	InitializeSRWLock(&p->lock);
+	p->text.swap(text);
+	p->done = done;
+	p->ctx = ctx;
+	p->done_called = false;
+	p->cancelled = false;
+	p->dialog = NULL;
+	p->thread = CreateThread(NULL, 0, prompt_thread_main, p, CREATE_SUSPENDED, &p->tid);
+	if (p->thread == NULL) {
+		ReleaseSRWLockExclusive(&wb->prompt_lock);
+		delete p;
+		// No prompt was shown: that is not the user's "no".
 		done(ctx, U_DESKTOP_ACCESS_UNKNOWN);
 		return;
 	}
-	CloseHandle(t);
+	wb->prompt = p;
+	ResumeThread(p->thread);
+	ReleaseSRWLockExclusive(&wb->prompt_lock);
 }
 
 /*
@@ -1037,13 +1258,44 @@ win32_text_at(struct u_desktop_backend *b, int32_t x, int32_t y, char *buf, size
  */
 
 static bool
+guard_allows(const struct u_desktop_input_guard *g)
+{
+	return g == NULL || g->still_allowed == NULL || g->still_allowed(g->ctx);
+}
+
+static const char *const k_msg_stopped = "stopped: desktop control was paused, denied or the screen locked";
+
+/*!
+ * @p root is the target, or a dialog of it: owned by the target AND in the same
+ * process (a cross-process popup owned by the target is not its dialog).
+ */
+static bool
+is_target_or_dialog(HWND root, HWND target)
+{
+	if (root == NULL || target == NULL) {
+		return false;
+	}
+	if (root == target) {
+		return true;
+	}
+	if (GetWindow(root, GW_OWNER) != target) {
+		return false;
+	}
+	DWORD p_root = 0;
+	DWORD p_target = 0;
+	GetWindowThreadProcessId(root, &p_root);
+	GetWindowThreadProcessId(target, &p_target);
+	return p_root != 0 && p_root == p_target;
+}
+
+static bool
 fg_matches(HWND target, HWND activated)
 {
 	HWND fg = root_of(GetForegroundWindow());
 	if (fg == NULL) {
 		return false;
 	}
-	return fg == target || fg == activated || GetWindow(fg, GW_OWNER) == target;
+	return fg == activated || is_target_or_dialog(fg, target);
 }
 
 static bool
@@ -1062,7 +1314,7 @@ poll_fg(HWND target, HWND activated, DWORD ms)
 }
 
 static enum u_desktop_result
-op_activate(HWND h, char *msg)
+op_activate(HWND h, const struct u_desktop_input_guard *guard, char *msg)
 {
 	ULONGLONG end = GetTickCount64() + WIN32_ACTIVATE_MS;
 	if (IsIconic(h)) {
@@ -1071,7 +1323,7 @@ op_activate(HWND h, char *msg)
 	// Activate what Alt+Tab would: the window's enabled last active popup
 	// (its modal dialog), else the window itself.
 	HWND act = GetLastActivePopup(h);
-	if (act == NULL || !IsWindowVisible(act) || !IsWindowEnabled(act)) {
+	if (act == NULL || !IsWindowVisible(act) || !IsWindowEnabled(act) || !is_target_or_dialog(act, h)) {
 		act = h;
 	}
 	if (fg_matches(h, act) && !IsIconic(h)) {
@@ -1102,7 +1354,12 @@ op_activate(HWND h, char *msg)
 
 	// 3. The Alt tap: an injected keystroke makes us the last-input process,
 	//    which lifts the foreground lock. The masking key keeps the Alt
-	//    release from opening the current window's menu bar.
+	//    release from opening the current window's menu bar. It is an
+	//    injection, so the guard is consulted first.
+	if (!guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	INPUT in[4];
 	memset(in, 0, sizeof(in));
 	for (int i = 0; i < 4; i++) {
@@ -1197,7 +1454,15 @@ op_move_resize(HWND h, const struct u_desktop_rect *rect, char *msg)
 		if (keep_size) {
 			flags |= SWP_NOSIZE;
 		}
-		if (!SetWindowPos(h, NULL, rect->x - bl, rect->y - bt, rect->w + bl + br, rect->h + bt + bb, flags)) {
+		// 64-bit arithmetic, clamped: rect values may be anywhere in int32.
+		auto clamp32 = [](int64_t v) -> int {
+			return v > INT32_MAX ? INT32_MAX : (v < INT32_MIN ? INT32_MIN : (int)v);
+		};
+		int nx = clamp32((int64_t)rect->x - bl);
+		int ny = clamp32((int64_t)rect->y - bt);
+		int nw = clamp32((int64_t)rect->w + bl + br);
+		int nh = clamp32((int64_t)rect->h + bt + bb);
+		if (!SetWindowPos(h, NULL, nx, ny, nw, nh, flags)) {
 			DWORD err = GetLastError();
 			if (err == ERROR_ACCESS_DENIED || window_above_us(h)) {
 				set_msg(msg, "%s", k_msg_elevated);
@@ -1212,8 +1477,8 @@ op_move_resize(HWND h, const struct u_desktop_rect *rect, char *msg)
 			if (!IsWindow(h)) {
 				return U_DESKTOP_ERR_WINDOW_LOST;
 			}
-			if (window_frame(h, &fb) && labs((long)(fb.left - rect->x)) <= 2 &&
-			    labs((long)(fb.top - rect->y)) <= 2) {
+			if (window_frame(h, &fb) && llabs((long long)fb.left - rect->x) <= 2 &&
+			    llabs((long long)fb.top - rect->y) <= 2) {
 				// Position is ours to set; a size the window refuses (minimum
 				// size, a DPI-change rescale) is the window's right.
 				return U_DESKTOP_OK;
@@ -1235,6 +1500,7 @@ op_move_resize(HWND h, const struct u_desktop_rect *rect, char *msg)
 
 static enum u_desktop_result
 win32_window_op(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
                 enum u_desktop_window_op op,
                 uint64_t window_id,
                 const struct u_desktop_rect *rect,
@@ -1251,7 +1517,7 @@ win32_window_op(struct u_desktop_backend *b,
 	}
 
 	switch (op) {
-	case U_DESKTOP_OP_ACTIVATE: return op_activate(h, msg);
+	case U_DESKTOP_OP_ACTIVATE: return op_activate(h, guard, msg);
 	case U_DESKTOP_OP_MOVE_RESIZE: return op_move_resize(h, rect, msg);
 	case U_DESKTOP_OP_MINIMIZE: return show_and_verify(h, SW_MINIMIZE, op, msg);
 	case U_DESKTOP_OP_RESTORE: return show_and_verify(h, SW_RESTORE, op, msg);
@@ -1321,8 +1587,75 @@ key_unicode(INPUT *in, wchar_t unit, bool up)
 	in->ki.dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0);
 }
 
+/*!
+ * The keyboard half of the delivery guarantee: immediately before a batch, the
+ * guard still allows and the foreground root is the target or its dialog.
+ */
 static enum u_desktop_result
-win32_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
+check_focus(const struct u_desktop_input_guard *guard, char *msg)
+{
+	if (!guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (guard == NULL || guard->target_id == 0) {
+		set_msg(msg, "no verified target");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (!is_target_or_dialog(root_of(GetForegroundWindow()), to_hwnd(guard->target_id))) {
+		set_msg(msg, "focus moved away from the target window");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+/*!
+ * The pointer half: the guard still allows, the cursor is still at the verified
+ * point (2 px), and the window there is still the target or its dialog.
+ */
+static enum u_desktop_result
+check_point(const struct u_desktop_input_guard *guard, int32_t x, int32_t y, char *msg)
+{
+	if (!guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (guard == NULL || guard->target_id == 0) {
+		set_msg(msg, "no verified target");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	DpiScope dpi;
+	POINT cur;
+	if (!GetCursorPos(&cur) || llabs((long long)cur.x - x) > 2 || llabs((long long)cur.y - y) > 2) {
+		set_msg(msg, "the pointer moved away from the verified point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	POINT pt = {x, y};
+	HWND root = root_of(WindowFromPoint(pt));
+	if (!is_target_or_dialog(root, to_hwnd(guard->target_id))) {
+		set_msg(msg, "target no longer under the point");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (window_above_us(root)) {
+		set_msg(msg, "%s", k_msg_elevated);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return U_DESKTOP_OK;
+}
+
+//! Put the cursor exactly on the verified point (it is within 2 px already).
+static void
+cursor_to(int32_t x, int32_t y)
+{
+	DpiScope dpi;
+	POINT cur;
+	if (!GetCursorPos(&cur) || cur.x != x || cur.y != y) {
+		SetCursorPos(x, y);
+	}
+}
+
+static enum u_desktop_result
+win32_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
 {
 	(void)b;
 	if (utf8 == NULL || utf8[0] == '\0') {
@@ -1334,8 +1667,7 @@ win32_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 	}
 	std::wstring w = utf8_to_utf16(utf8);
 
-	HWND fg = root_of(GetForegroundWindow());
-	if (window_above_us(fg)) {
+	if (window_above_us(root_of(GetForegroundWindow()))) {
 		set_msg(msg, "%s", k_msg_elevated);
 		return U_DESKTOP_ERR_REFUSED;
 	}
@@ -1353,44 +1685,60 @@ win32_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 	size_t i = 0;
 	size_t chars_done = 0;
 	while (i < w.size()) {
-		if (chars_done > 0 && root_of(GetForegroundWindow()) != fg) {
-			set_msg(msg, "focus moved to another window after %zu of %zu characters", chars_done,
-			        total_chars);
-			return U_DESKTOP_ERR_FAILED;
+		if (w[i] == L'\r' && i + 1 < w.size() && w[i + 1] == L'\n') {
+			i++; // CRLF -> one Enter
+			continue;
 		}
+
+		// Re-verified before EVERY batch, and every Enter / Tab is a batch of
+		// its own: a newline must never land in a window that took focus.
+		enum u_desktop_result chk = check_focus(guard, msg);
+		if (chk != U_DESKTOP_OK) {
+			if (chars_done > 0) {
+				char inner[U_DESKTOP_MSG_SIZE];
+				snprintf(inner, sizeof(inner), "%s", msg != NULL ? msg : "");
+				set_msg(msg, "%s (after %zu of %zu characters)", inner, chars_done, total_chars);
+			}
+			return chk;
+		}
+
 		batch.clear();
 		size_t batch_chars = 0;
-		while (i < w.size() && batch_chars < WIN32_TEXT_BATCH_CHARS) {
-			wchar_t c = w[i];
-			INPUT in[4];
-			UINT k = 0;
-			if (c == L'\r' && i + 1 < w.size() && w[i + 1] == L'\n') {
-				i++; // CRLF -> one Enter
-				continue;
+		wchar_t c = w[i];
+		if (c == L'\n' || c == L'\r' || c == L'\t') {
+			// Apps expect the Enter / Tab key, not a raw control character.
+			INPUT in[2];
+			WORD vk = c == L'\t' ? VK_TAB : VK_RETURN;
+			key_vk(&in[0], vk, false);
+			key_vk(&in[1], vk, true);
+			batch.insert(batch.end(), in, in + 2);
+			batch_chars = 1;
+			i++;
+		} else {
+			while (i < w.size() && batch_chars < WIN32_TEXT_BATCH_CHARS) {
+				c = w[i];
+				if (c == L'\n' || c == L'\r' || c == L'\t') {
+					break;
+				}
+				INPUT in[4];
+				UINT k = 0;
+				if (IS_HIGH_SURROGATE(c) && i + 1 < w.size() && IS_LOW_SURROGATE(w[i + 1])) {
+					key_unicode(&in[k++], c, false);
+					key_unicode(&in[k++], w[i + 1], false);
+					key_unicode(&in[k++], c, true);
+					key_unicode(&in[k++], w[i + 1], true);
+					i += 2;
+				} else {
+					key_unicode(&in[k++], c, false);
+					key_unicode(&in[k++], c, true);
+					i++;
+				}
+				batch.insert(batch.end(), in, in + k);
+				batch_chars++;
 			}
-			if (c == L'\n' || c == L'\r') {
-				// Apps expect the Enter key, not a raw LF character.
-				key_vk(&in[k++], VK_RETURN, false);
-				key_vk(&in[k++], VK_RETURN, true);
-				i++;
-			} else if (c == L'\t') {
-				key_vk(&in[k++], VK_TAB, false);
-				key_vk(&in[k++], VK_TAB, true);
-				i++;
-			} else if (IS_HIGH_SURROGATE(c) && i + 1 < w.size() && IS_LOW_SURROGATE(w[i + 1])) {
-				key_unicode(&in[k++], c, false);
-				key_unicode(&in[k++], w[i + 1], false);
-				key_unicode(&in[k++], c, true);
-				key_unicode(&in[k++], w[i + 1], true);
-				i += 2;
-			} else {
-				key_unicode(&in[k++], c, false);
-				key_unicode(&in[k++], c, true);
-				i++;
-			}
-			batch.insert(batch.end(), in, in + k);
-			batch_chars++;
 		}
+
+		// Every batch carries its own key-ups: nothing is left pressed on a stop.
 		enum u_desktop_result r = send_inputs(batch.data(), (UINT)batch.size(), msg);
 		if (r != U_DESKTOP_OK) {
 			if (chars_done > 0 || r == U_DESKTOP_ERR_FAILED) {
@@ -1526,7 +1874,7 @@ resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *need_shift, cha
 		}
 	}
 	if (ch == 0) {
-		set_msg(msg, "unknown key \"%s\"", name);
+		set_msg(msg, "unknown key name");
 		return U_DESKTOP_ERR_FAILED;
 	}
 
@@ -1537,13 +1885,13 @@ resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *need_shift, cha
 			*out_vk = (WORD)ch;
 			return U_DESKTOP_OK;
 		}
-		set_msg(msg, "no key produces '%c' on the active keyboard layout", (char)ch);
+		set_msg(msg, "this keyboard layout has no key for that character");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
 	WORD vk = (WORD)(r & 0xFF);
 	int shift_state = (r >> 8) & 0xFF;
 	if ((shift_state & (2 | 4)) != 0) { // Ctrl / Alt (AltGr) level
-		set_msg(msg, "'%c' needs AltGr on the active keyboard layout: not usable in a shortcut", (char)ch);
+		set_msg(msg, "this keyboard layout has no key for that character (it needs AltGr)");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
 	*out_vk = vk;
@@ -1554,7 +1902,10 @@ resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *need_shift, cha
 }
 
 static enum u_desktop_result
-win32_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, char *msg)
+win32_key_chord(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
+                const struct u_desktop_chord *chord,
+                char *msg)
 {
 	(void)b;
 	if (chord == NULL) {
@@ -1567,7 +1918,7 @@ win32_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord
 		return U_DESKTOP_ERR_REFUSED;
 	}
 	// The layout that will interpret the keys: the foreground thread's.
-	HKL hkl = GetKeyboardLayout(fg != NULL ? GetWindowThreadProcessId(GetForegroundWindow(), NULL) : 0);
+	HKL hkl = GetKeyboardLayout(fg != NULL ? GetWindowThreadProcessId(fg, NULL) : 0);
 
 	bool have_key = chord->key[0] != '\0';
 	WORD vk = 0;
@@ -1596,46 +1947,62 @@ win32_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord
 	    {U_DESKTOP_MOD_ALT, VK_LMENU},
 	    {U_DESKTOP_MOD_SUPER, VK_LWIN},
 	};
-	INPUT in[10];
-	UINT n = 0;
-	for (const auto &m : mods) {
-		if (mods_bits & m.bit) {
-			key_vk_hkl(&in[n++], m.vk, hkl, false);
-		}
-	}
-	if (have_key) {
-		key_vk_hkl(&in[n++], vk, hkl, false);
-		key_vk_hkl(&in[n++], vk, hkl, true);
-	}
-	for (int i = (int)(sizeof(mods) / sizeof(mods[0])) - 1; i >= 0; i--) {
-		if (mods_bits & mods[i].bit) {
-			key_vk_hkl(&in[n++], mods[i].vk, hkl, true);
-		}
-	}
-	enum u_desktop_result r = send_inputs(in, n, msg);
-	if (r == U_DESKTOP_ERR_FAILED) {
-		// A partial chord can leave a modifier held: release them all.
+	WORD pressed[4];
+	UINT n_pressed = 0;
+	auto release_pressed = [&]() {
 		INPUT rel[4];
 		UINT k = 0;
-		for (const auto &m : mods) {
-			if (mods_bits & m.bit) {
-				key_vk_hkl(&rel[k++], m.vk, hkl, true);
-			}
+		for (UINT j = n_pressed; j > 0; j--) {
+			key_vk_hkl(&rel[k++], pressed[j - 1], hkl, true);
 		}
-		SendInput(k, rel, sizeof(INPUT));
+		if (k > 0) {
+			SendInput(k, rel, sizeof(INPUT));
+		}
+		n_pressed = 0;
+	};
+
+	// Every key-down is preceded by the guard + focus check.
+	for (const auto &m : mods) {
+		if ((mods_bits & m.bit) == 0) {
+			continue;
+		}
+		enum u_desktop_result r = check_focus(guard, msg);
+		if (r == U_DESKTOP_OK) {
+			INPUT in;
+			key_vk_hkl(&in, m.vk, hkl, false);
+			r = send_inputs(&in, 1, msg);
+		}
+		if (r != U_DESKTOP_OK) {
+			release_pressed();
+			return r;
+		}
+		pressed[n_pressed++] = m.vk;
+	}
+	if (have_key) {
+		enum u_desktop_result r = check_focus(guard, msg);
+		if (r == U_DESKTOP_OK) {
+			INPUT in[2];
+			key_vk_hkl(&in[0], vk, hkl, false);
+			key_vk_hkl(&in[1], vk, hkl, true);
+			r = send_inputs(in, 2, msg);
+		}
+		if (r != U_DESKTOP_OK) {
+			release_pressed();
+			return r;
+		}
+	}
+	// Releases are never gated: nothing may stay held.
+	INPUT rel[4];
+	UINT k = 0;
+	for (UINT j = n_pressed; j > 0; j--) {
+		key_vk_hkl(&rel[k++], pressed[j - 1], hkl, true);
+	}
+	n_pressed = 0;
+	enum u_desktop_result r = send_inputs(rel, k, msg);
+	if (r != U_DESKTOP_OK) {
+		SendInput(k, rel, sizeof(INPUT)); // one retry: a held modifier is worse than a duplicate key-up
 	}
 	return r;
-}
-
-static HWND
-window_under_cursor(void)
-{
-	DpiScope dpi;
-	POINT pt;
-	if (!GetCursorPos(&pt)) {
-		return NULL;
-	}
-	return root_of(WindowFromPoint(pt));
 }
 
 static enum u_desktop_result
@@ -1648,7 +2015,7 @@ win32_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 		return U_DESKTOP_ERR_FAILED;
 	}
 	POINT pt;
-	if (!GetCursorPos(&pt) || labs((long)(pt.x - x)) > 2 || labs((long)(pt.y - y)) > 2) {
+	if (!GetCursorPos(&pt) || llabs((long long)pt.x - x) > 2 || llabs((long long)pt.y - y) > 2) {
 		set_msg(msg, "pointer did not arrive (at %ld,%ld)", (long)pt.x, (long)pt.y);
 		return U_DESKTOP_ERR_FAILED;
 	}
@@ -1656,7 +2023,13 @@ win32_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 }
 
 static enum u_desktop_result
-win32_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bool down, char *msg)
+win32_pointer_button(struct u_desktop_backend *b,
+                     const struct u_desktop_input_guard *guard,
+                     enum u_desktop_button button,
+                     bool down,
+                     int32_t x,
+                     int32_t y,
+                     char *msg)
 {
 	(void)b;
 	DWORD flag = 0;
@@ -1666,30 +2039,32 @@ win32_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, 
 	case U_DESKTOP_BUTTON_MIDDLE: flag = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
 	default: set_msg(msg, "unknown button %d", (int)button); return U_DESKTOP_ERR_FAILED;
 	}
-	// Refuse a press into an elevated window, but always let a release through
-	// (never leave a button logically held).
-	if (down && window_above_us(window_under_cursor())) {
-		set_msg(msg, "%s", k_msg_elevated);
-		return U_DESKTOP_ERR_REFUSED;
+	// A press is gated (guard, cursor still on the point, target still under it,
+	// not elevated); a release always goes through — never leave a button held.
+	if (down) {
+		enum u_desktop_result r = check_point(guard, x, y, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
 	}
+	cursor_to(x, y); // the event happens AT the verified point
 	INPUT in;
 	memset(&in, 0, sizeof(in));
 	in.type = INPUT_MOUSE;
-	in.mi.dwFlags = flag; // no MOVE: acts at the current position
+	in.mi.dwFlags = flag; // no MOVE: acts at the cursor, now on (x, y)
 	return send_inputs(&in, 1, msg);
 }
 
 static enum u_desktop_result
-win32_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
+win32_scroll(struct u_desktop_backend *b,
+             const struct u_desktop_input_guard *guard,
+             int32_t x,
+             int32_t y,
+             int32_t dx,
+             int32_t dy,
+             char *msg)
 {
 	(void)b;
-	if (dx == 0 && dy == 0) {
-		return U_DESKTOP_OK;
-	}
-	if (window_above_us(window_under_cursor())) {
-		set_msg(msg, "%s", k_msg_elevated);
-		return U_DESKTOP_ERR_REFUSED;
-	}
 	auto clamp = [](int32_t v) -> int32_t {
 		return v > WIN32_SCROLL_MAX_NOTCHES ? WIN32_SCROLL_MAX_NOTCHES
 		                                    : (v < -WIN32_SCROLL_MAX_NOTCHES ? -WIN32_SCROLL_MAX_NOTCHES : v);
@@ -1697,25 +2072,39 @@ win32_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
 	dx = clamp(dx);
 	dy = clamp(dy);
 
+	// Two bursts (vertical, horizontal), each re-verified before it is sent.
 	// One event per notch: some apps act on a single WHEEL_DELTA per message.
-	std::vector<INPUT> in;
-	for (int32_t i = 0; i < (dy < 0 ? -dy : dy); i++) {
-		INPUT e;
-		memset(&e, 0, sizeof(e));
-		e.type = INPUT_MOUSE;
-		e.mi.dwFlags = MOUSEEVENTF_WHEEL;
-		e.mi.mouseData = (DWORD)(dy > 0 ? -WHEEL_DELTA : WHEEL_DELTA); // +y down = wheel toward the user
-		in.push_back(e);
+	for (int axis = 0; axis < 2; axis++) {
+		int32_t v = axis == 0 ? dy : dx;
+		if (v == 0) {
+			continue;
+		}
+		enum u_desktop_result r = check_point(guard, x, y, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		cursor_to(x, y);
+		std::vector<INPUT> in;
+		for (int32_t i = 0; i < (v < 0 ? -v : v); i++) {
+			INPUT e;
+			memset(&e, 0, sizeof(e));
+			e.type = INPUT_MOUSE;
+			if (axis == 0) {
+				e.mi.dwFlags = MOUSEEVENTF_WHEEL;
+				e.mi.mouseData =
+				    (DWORD)(v > 0 ? -WHEEL_DELTA : WHEEL_DELTA); // +y down = toward the user
+			} else {
+				e.mi.dwFlags = MOUSEEVENTF_HWHEEL;
+				e.mi.mouseData = (DWORD)(v > 0 ? WHEEL_DELTA : -WHEEL_DELTA); // +x right
+			}
+			in.push_back(e);
+		}
+		r = send_inputs(in.data(), (UINT)in.size(), msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
 	}
-	for (int32_t i = 0; i < (dx < 0 ? -dx : dx); i++) {
-		INPUT e;
-		memset(&e, 0, sizeof(e));
-		e.type = INPUT_MOUSE;
-		e.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-		e.mi.mouseData = (DWORD)(dx > 0 ? WHEEL_DELTA : -WHEEL_DELTA); // +x right
-		in.push_back(e);
-	}
-	return send_inputs(in.data(), (UINT)in.size(), msg);
+	return U_DESKTOP_OK;
 }
 
 /*
@@ -1728,6 +2117,16 @@ static void
 win32_destroy(struct u_desktop_backend *b)
 {
 	win32_backend *wb = win32(b);
+
+	// Lifetime (u_desktop.h): never return while a consent answer is owed.
+	AcquireSRWLockExclusive(&wb->prompt_lock);
+	prompt_state *p = wb->prompt;
+	wb->prompt = NULL;
+	ReleaseSRWLockExclusive(&wb->prompt_lock);
+	if (p != NULL) {
+		prompt_shutdown(p);
+	}
+
 	uia_worker *w = wb->uia;
 	if (w != NULL) {
 		AcquireSRWLockExclusive(&w->lock);
@@ -1752,6 +2151,8 @@ u_desktop_backend_create_platform(void)
 	InitializeSRWLock(&wb->uia_init_lock);
 	wb->uia = NULL;
 	wb->uia_failed = false;
+	InitializeSRWLock(&wb->prompt_lock);
+	wb->prompt = NULL;
 
 	// Resolve the lazily-initialised statics now, off the hot path.
 	(void)get_set_thread_dpi_ctx();
@@ -1771,6 +2172,7 @@ u_desktop_backend_create_platform(void)
 	b->pick = win32_pick;
 	b->focused_window = win32_focused_window;
 	b->text_at = win32_text_at;
+	b->prepare_input = NULL; // nothing slow to set up on Windows
 	b->window_op = win32_window_op;
 	b->type_text = win32_type_text;
 	b->key_chord = win32_key_chord;
