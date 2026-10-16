@@ -331,17 +331,21 @@ public sealed class DashboardContext
         try
         {
             CliResult? last = null;
+            var notes = new List<string>();
             foreach (var cmd in commands)
             {
                 DashboardLog.Info($"action: displayxr-cli {cmd}");
                 last = await Cli.RunAsync(cmd, ActionTimeout);
+                notes.AddRange(last.Notes);
                 if (!last.Ok) break;
             }
             if (last is not null)
             {
                 LastActionFailed = !last.Ok;
-                // Verbatim: the CLI's own words (the pages say what needs admin).
-                LastAction = last.Summary;
+                // Verbatim: the CLI's own words (the pages say what needs admin) — its result line
+                // and every note / warning of every command run, not only the first line.
+                LastAction = CliResult.Compose(last.Summary, notes);
+                foreach (var n in notes) DashboardLog.Info($"action: {n}");
             }
         }
         catch (Exception ex)

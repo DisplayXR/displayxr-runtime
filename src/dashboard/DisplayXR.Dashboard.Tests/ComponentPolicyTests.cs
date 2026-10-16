@@ -66,7 +66,12 @@ public class ComponentPolicyTests
         Assert.Equal("dp-lift", lift.Id);
         Assert.Equal("BUILT_IN", lift.Load);
         Assert.True(lift.Enabled);
-        Assert.Equal("default", lift.EnabledSource); // conv rows always carry `enabled`
+        // This CLI (v2.44.6) predates `enabled_source` / `built_in` on conv rows: nothing is
+        // invented — the load verdict marks the built-in adapter, which gets no Enabled control.
+        Assert.Equal("", lift.EnabledSource);
+        Assert.True(lift.BuiltIn);
+        Assert.False(lift.EnabledKnown);
+        Assert.Null(lift.EnabledChip);
         Assert.Null(lift.ProvenanceChip);            // built-in: no binary, provenance "unknown"
         Assert.Empty(conv.PreferredByTask);
         Assert.Equal(new[] { "depth-mono", "depth-video", "views-mono" }, conv.TasksOf("dp-lift").Select(t => t.Task).Distinct());
@@ -77,7 +82,8 @@ public class ComponentPolicyTests
     public void ConvPolicy_PreferredByTask_IsRead()
     {
         Assert.True(PolicyList.TryParse(ComponentClass.Conversion, """
-            { "providers": [ { "id": "acme-conv", "name": "Acme", "enabled": false, "load": "NEGOTIATED",
+            { "providers": [ { "id": "acme-conv", "name": "Acme", "enabled": false, "enabled_source": "user", "load": "NEGOTIATED",
+                               "built_in": false,
                                "provenance": "unverified", "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\ab12)" } ],
               "tasks": [ { "task": "depth-mono", "provider": "acme-conv", "selected": false, "verdict": "disabled" } ],
               "policy": { "policy_lock": false, "preferred": { "depth-mono": "acme-conv/depth-a" } } }
@@ -85,7 +91,9 @@ public class ComponentPolicyTests
         Assert.Equal("acme-conv/depth-a", conv!.PreferredByTask["depth-mono"]);
         var row = Assert.Single(conv.Rows);
         Assert.False(row.Enabled);
-        Assert.Equal(("disabled (default)", Level.Plain), row.EnabledChip);
+        Assert.Equal("user", row.EnabledSource); // the CLI's word, read — never invented
+        Assert.Equal(("disabled (user)", Level.Plain), row.EnabledChip);
+        Assert.False(conv.PolicyLock);
         Assert.Equal(("unverified", Level.Warn), row.ProvenanceChip);
     }
 
