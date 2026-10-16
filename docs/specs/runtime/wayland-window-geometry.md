@@ -246,7 +246,9 @@ extension's floor), so GNOME keeps it enabled on the lock screen instead of
 calling `disable()`. What keeps running there: the geometry snapshot and
 `WindowsChanged`, `CaptureExclusion1` (tearing it down at lock would make every
 excluded window capturable for the length of the lock), `WindowPlacement1` and
-move sync (a client moving its own window), and the `WorkspaceHotkey1` object.
+move sync (a client moving its own window; the version 15 keep-above / activate /
+minimize requests are refused while locked, §11.2), and the `WorkspaceHotkey1`
+object.
 What does not: the workspace hotkey's **grab** — the extension follows
 `Main.sessionMode` (`isLocked`, via its `updated` signal; not `currentMode`,
 which is `ubuntu` on Ubuntu), releases the accelerator on lock, never acts on a
@@ -1363,3 +1365,129 @@ accelerator for one client and starts the unit that client named. The unit name 
 from the client, the systemd manager is the user's own, and only a `*.service` name is
 accepted. The bootstrap is the one DisplayXR-specific piece (the manifest roots and the
 default unit name); it does nothing on a box without workspace-controller manifests.
+
+## 11. The caller's own window — keep-above, activate, minimize (extension version 15)
+
+### 11.1 Why
+
+What an app does to its own window with EWMH on X11 — keep it above other windows,
+bring it to the front, minimize and restore it — has no Wayland protocol:
+
+- no keep-above request at all (only the user, through the window menu);
+- `xdg-activation-v1` from an app in the background, without a fresh input serial,
+  only marks the window as demanding attention ("… is ready");
+- `xdg_toplevel.set_minimized` exists, nothing undoes it.
+
+An always-on-top 3D companion (a transparent avatar), or a hotkey that summons one,
+therefore cannot be ported to a native-Wayland player as written. On Windows the
+DisplayXR Unity plugin keeps such a window `WS_EX_TOPMOST`; on X11 the plugin's
+transparent mode keeps Unity's window `_NET_WM_STATE_ABOVE`. The extension closes
+the gap for the caller's **own** window.
+
+### 11.2 D-Bus surface
+
+On `org.displayxr.WindowPlacement1`, each with its own placement capability bit:
+
+| member | bit (value) | mutter call |
+|---|---|---|
+| `SetKeepAbove(u pid, b above) -> (b ok)` | 5 (32) | `make_above()` / `unmake_above()` |
+| `ActivateWindow(u pid) -> (b ok)` | 6 (64) | `activate(get_current_time_roundtrip())` |
+| `SetMinimized(u pid, b minimized) -> (b ok)` | 7 (128) | `minimize()` / `unminimize()` |
+
+- **Whose window:** MoveWindow's gate and choice — the caller's PID comes from the bus
+  daemon, `pid` must be 0 or that PID, and the window is that process's focused
+  normal window, else its largest. No member can reach another process's window, so
+  the call must come from inside the app process: a helper process (`gdbus`) or a
+  sandbox proxy (Flatpak) is refused.
+- **Refused** (false, nothing changed) while a grab runs on that window or any
+  extension pointer drag runs (never fight the user), and on the lock screen.
+- **`ok`:** keep-above / minimized now reads as asked; activate: the window has focus.
+- **Reading the state back:** every window in the geometry snapshot gains
+  `minimized` and `above` (additive; the schema stays `version: 1`), and
+  `WindowsChanged` follows changes of both. A caller learns from it what the user
+  did meanwhile (restored it from the dock, cleared "Always on Top" from the window
+  menu); a request's `ok` alone cannot tell it that.
+- **Keep-above lifetime:** what the extension set is undone when the caller's bus
+  connection goes away (an app that exits or crashes leaves no window stuck on top)
+  and when the extension is disabled. Only what it set: a user's own "Always on Top"
+  on the same window is never undone behind their back — including one the user
+  cleared and set again after the app's request (any clear ends the extension's
+  claim); an explicit `SetKeepAbove(false)` does clear it, as the window menu would.
+  A request still waiting for its sender's PID when the extension is disabled does
+  nothing. A consumer that
+  wants keep-above to persist re-applies it when the extension reappears and when
+  its window is recreated (the DisplayXR plugin does).
+- **No maximize.** An app that places its own window (the DisplayXR plugin moves a
+  resized window back and re-applies its size) fights a maximize, and mutter keeps a
+  maximized window in the normal layer whatever its "above" flag says.
+  `SetKeepAbove(true)` on a maximized window is refused, as GNOME's window menu greys
+  "Always on Top" out for it.
+- **`ActivateWindow` timestamp.** `activate(0)` skips mutter's focus-stealing check
+  but, for a window on another workspace, only marks it as demanding attention.
+  `Main.activateWindow()` would also close the Overview and the calendar. A
+  server-roundtrip timestamp brings the window to the front with focus, restores it
+  from minimized and switches to its workspace. It is newer than any user input, so
+  focus-stealing prevention does not hold it back: an app takes keyboard focus even
+  while the user is typing in another app (measured, §11.5). Whether to allow that
+  as is, or only after recent input in the app, is a policy choice for the caller.
+
+The pure part (gate, keep-above bookkeeping, maximized on both sides of mutter 49's
+API change, minimize) is the `OwnWindow` object in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_own_window.js`. The consumer is the DisplayXR Unity
+plugin (`displayxr_linux_set_keep_above` / `_activate_window` / `_set_minimized`).
+
+### 11.3 Mutter policy a consumer should know
+
+- **Keep-above changes focus for new windows** (mutter's rule, the same for a user's
+  own "Always on Top"). A window that opens underneath a kept-above window on the same
+  workspace, while some window has focus, does not get focus; it is stacked under the
+  focused window and flagged as demanding attention. mutter 47+: when about 60 % or
+  more of it is covered (`window_would_mostly_be_covered_by_always_above_window`,
+  visible area ≤ 40 %); mutter 42–46: any overlap (`window_would_be_covered`).
+  Coverage is measured on the kept-above window's frame rectangle, not its visible
+  pixels — a transparent avatar window counts as its whole rectangle.
+- **Keep-above and maximize:** a window made above and maximized afterwards stays in
+  the top layer only until the next relayer (any window opening), then drops to the
+  normal layer while `is_above()` still reads true.
+
+### 11.4 Verified (private headless GNOME Shell 50.1)
+
+GTK4 test windows and the real Unity player (a Lenovo Avatar build on sim_display,
+`DXR_PLUGIN_EXCLUSIVE=sim-display`, native Wayland), each calling from its own
+process:
+
+- capabilities 255; all three members refused for another process naming the app's
+  PID, the window unchanged;
+- keep-above holds the stack while another app's larger window has focus; cleared on
+  request;
+- activate from the background (another app focused), from minimized, and on another
+  workspace (switches to it): focus each time; `SetMinimized(false)` restores without
+  focus;
+- minimize with the player's Vulkan weave running: the player keeps running and is
+  restored by its own later request;
+- maximized window: `SetKeepAbove(true)` refused and the window untouched; accepted
+  after unmaximize;
+- bus disconnect and extension disable each undo the keep-above the extension set; a
+  user's own "Always on Top" survives both; a closed window leaves no record;
+- extension disabled and enabled again: the plugin re-applies keep-above.
+
+- a user who clears "Always on Top" and sets it again keeps it after the app
+  disconnects; without the user's toggle it is undone.
+
+### 11.5 Verified (real GNOME 50.1 session, Ubuntu 26.04, Leia SR panel)
+
+The same Unity player, native Wayland, weaving on the panel, with the DisplayXR
+Unity plugin as the caller:
+
+- keep-above: the window stays above a file manager window dragged over it while
+  another app has focus;
+- activate while the user holds a key in a text editor: keyboard focus moves to the
+  app (the editor's key repeat stops) — focus-stealing prevention does not apply;
+- screen locked: all three refused; after unlock the plugin re-sends keep-above
+  (done), activate and minimize are not replayed;
+- right-button drag of the window (extension pointer drag): all three refused;
+  keep-above re-sent after the drop (done);
+- minimize, then restore from the Ubuntu dock: the weave shows correctly again.
+
+Not verified: GNOME 42–49 at run time (the calls exist in the mutter sources from
+42.0; maximize's API change is handled by an existence check).
