@@ -884,15 +884,58 @@ poll_resize_cursor(DXRMetalPlacement *pl)
  *
  */
 
+/*!
+ * Run @p block on the main thread and wait at most @p timeout_ms for it. Returns true
+ * if it ran (or is running and has now finished), false if the main thread did not
+ * pick it up in time — the block is then CANCELLED and will never run.
+ *
+ * Why not dispatch_sync: an engine creates its OpenXR session on its GRAPHICS thread
+ * while its MAIN thread waits for that thread (Unity's XRDisplaySubsystem::Start →
+ * InvokeGraphicsThreadSync). A dispatch_sync to the main queue from there is a
+ * deadlock: the main thread waits on the graphics thread, which waits on the main
+ * thread. Seen with the DisplayXR Unity provider on macOS — the player hung at XR start.
+ */
+static bool
+run_on_main_bounded(void (^block)(void), int64_t timeout_ms)
+{
+	if ([NSThread isMainThread]) {
+		block();
+		return true;
+	}
+	// 0 = pending, 1 = taken by the main thread, 2 = cancelled by the waiter.
+	__block _Atomic int state = 0;
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	dispatch_async(dispatch_get_main_queue(), ^{
+		int expected = 0;
+		if (atomic_compare_exchange_strong(&state, &expected, 1)) {
+			block();
+			dispatch_semaphore_signal(done);
+		}
+	});
+	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) == 0) {
+		return true;
+	}
+	int expected = 0;
+	if (atomic_compare_exchange_strong(&state, &expected, 2)) {
+		return false; // never ran, never will
+	}
+	// The main thread took it just now: it is running, wait for it to finish.
+	dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+	return true;
+}
+
 static void
-run_on_main_sync(void (^block)(void))
+run_on_main_async(void (^block)(void))
 {
 	if ([NSThread isMainThread]) {
 		block();
 	} else {
-		dispatch_sync(dispatch_get_main_queue(), block);
+		dispatch_async(dispatch_get_main_queue(), block);
 	}
 }
+
+//! How long session creation waits for the main thread before declining placement.
+#define PLACEMENT_MAIN_TIMEOUT_MS 250
 
 static inline DXRMetalPlacement *
 placement_obj(struct comp_metal_placement *p)
@@ -923,11 +966,16 @@ comp_metal_placement_eligible(
 	} else {
 		__block NSWindow *win = nil;
 		__block NSView *cv = nil;
-		run_on_main_sync(^{
-			win = view.window;
-			cv = win.contentView;
-		});
-		if (win == nil) {
+		bool ran = run_on_main_bounded(
+		    ^{
+		      win = view.window;
+		      cv = win.contentView;
+		    },
+		    PLACEMENT_MAIN_TIMEOUT_MS);
+		if (!ran) {
+			why = "the main thread is waiting on this thread (engine session create): "
+			      "placement left to AppKit";
+		} else if (win == nil) {
 			why = "the view has no window";
 		} else if (cv != view) {
 			why = "the bound view is not its window's contentView (a sub-view placement is the app's)";
@@ -958,7 +1006,7 @@ comp_metal_placement_create(void *ns_view, comp_metal_placement_snap_fn snap, vo
 	pl.view = view;
 
 	__block bool ok = false;
-	run_on_main_sync(^{
+	bool ran = run_on_main_bounded(^{
 		NSWindow *win = view.window;
 		if (win == nil) {
 			return;
@@ -1042,8 +1090,14 @@ comp_metal_placement_create(void *ns_view, comp_metal_placement_snap_fn snap, vo
 			[pl noteHome];
 		}
 		ok = true;
-	});
-	if (!ok) {
+	}, PLACEMENT_MAIN_TIMEOUT_MS);
+	if (!ran) {
+		// The main thread is blocked waiting on THIS thread (an engine creating its
+		// session on the graphics thread): nothing was installed; keep AppKit's drag.
+		U_LOG_W("macOS window placement: main thread unavailable during session create "
+		        "(engine graphics thread?) — left to AppKit");
+	}
+	if (!ran || !ok) {
 		pthread_mutex_destroy(&pl->lock);
 		return NULL;
 	}
@@ -1060,7 +1114,13 @@ comp_metal_placement_destroy(struct comp_metal_placement **p_ptr)
 	}
 	DXRMetalPlacement *pl = (__bridge_transfer DXRMetalPlacement *)(void *)*p_ptr;
 	*p_ptr = NULL;
-	run_on_main_sync(^{
+	// Stop every path that consults the placement before the unhook runs.
+	atomic_store(&pl->closed, true);
+	// Never block on the main thread here: an engine may destroy the session on its
+	// graphics thread while its main thread waits for it (same deadlock as create).
+	// The block retains pl, so the window's delegate proxy never points at freed memory
+	// before the unhook below runs.
+	run_on_main_async(^{
 		if (pl.monitor != nil) {
 			[NSEvent removeMonitor:pl.monitor];
 			pl.monitor = nil;
