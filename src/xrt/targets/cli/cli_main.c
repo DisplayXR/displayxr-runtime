@@ -82,6 +82,11 @@ cli_print_help(int argc, const char **argv)
 	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
 	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
 	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
+#ifdef CLI_HAVE_DESKTOP
+	P("  desktop <...>     - Desktop control (XR_DXR_desktop_control, ADR-056), the user's store + audit\n");
+	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
+	P("                      'desktop allow|deny|forget <exe>', 'desktop audit [--tail N] [--json]'.\n");
+#endif
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -149,5 +154,10 @@ main(int argc, const char **argv)
 	if (strcmp(argv[1], "camera") == 0) {
 		return cli_cmd_camera(argc, argv);
 	}
+#ifdef CLI_HAVE_DESKTOP
+	if (strcmp(argv[1], "desktop") == 0) {
+		return cli_cmd_desktop(argc, argv);
+	}
+#endif
 	return cli_print_help(argc, argv);
 }

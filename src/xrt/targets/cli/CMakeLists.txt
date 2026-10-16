@@ -107,6 +107,14 @@ target_link_libraries(
 		displayxr::conversion_store
 	)
 
+# ADR-056: `displayxr-cli desktop ...` -- the desktop-control store + audit log
+# (u_desktop_policy only; the CLI never creates a desktop backend).
+if(TARGET aux_desktop)
+	target_sources(cli PRIVATE cli_cmd_desktop.c)
+	target_link_libraries(cli PRIVATE aux_desktop)
+	target_compile_definitions(cli PRIVATE CLI_HAVE_DESKTOP)
+endif()
+
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
 # Same gating as targets/diag-lib.
 if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
