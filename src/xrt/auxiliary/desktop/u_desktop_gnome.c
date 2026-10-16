@@ -637,8 +637,14 @@ gnome_can_input(struct gnome_backend *g, char *msg)
 enum u_desktop_result
 gnome_move_verified(struct gnome_backend *g, int32_t x, int32_t y, char *msg)
 {
+	return gnome_move_verified_ex(g, x, y, true, msg);
+}
+
+enum u_desktop_result
+gnome_move_verified_ex(struct gnome_backend *g, int32_t x, int32_t y, bool restore, char *msg)
+{
 	for (int attempt = 0; attempt < 2; attempt++) {
-		enum u_desktop_result r = gnome_portal_motion(g->portal, x, y, msg);
+		enum u_desktop_result r = gnome_portal_motion_ex(g->portal, x, y, restore, msg);
 		if (r != U_DESKTOP_OK || !g->have_ext16) {
 			return r;
 		}

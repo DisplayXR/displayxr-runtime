@@ -20,6 +20,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "desktop/u_desktop_policy.h"
+#include "os/os_time.h"
 
 #include <cjson/cJSON.h>
 
@@ -161,11 +162,27 @@ cmd_status(bool json)
 static int
 cmd_suspend(bool suspended)
 {
-	if (!u_desktop_policy_set_suspended(suspended, "cli")) {
+	// The kill switch must land: a store held open by another process can fail the
+	// rename (Windows), so `stop` retries a few times before giving up loudly.
+	bool ok = false;
+	for (int attempt = 0; attempt < (suspended ? 3 : 1) && !ok; attempt++) {
+		if (attempt > 0) {
+			os_nanosleep(250 * 1000 * 1000);
+		}
+		ok = u_desktop_policy_set_suspended(suspended, "cli");
+	}
+	if (!ok) {
 		char store[1024] = {0};
 		u_desktop_policy_store_path(store, sizeof(store));
-		fprintf(stderr, "desktop: could not write the store %s%s\n", store,
-		        suspended ? "" : " (if it cannot be parsed, fix or remove it)");
+		if (suspended) {
+			fprintf(stderr,
+			        "desktop: could not save the kill switch - is the store locked? (%s)\n"
+			        "desktop: desktop control is NOT stopped\n",
+			        store);
+		} else {
+			fprintf(stderr, "desktop: could not write the store %s (if it cannot be parsed, fix or remove it)\n",
+			        store);
+		}
 		return 1;
 	}
 	printf(suspended ? "desktop control stopped for every app (kill switch on)\n"

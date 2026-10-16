@@ -112,7 +112,7 @@ struct u_desktop_control_callbacks
 struct u_desktop_control_timing
 {
 	uint64_t idle_poll_ns;     //!< default 50 ms
-	uint64_t own_grace_ns;     //!< default 150 ms: our own injections are ignored this long after they end
+	uint64_t own_grace_ns;     //!< default 30 ms: our own injections are ignored this long after they end
 	uint64_t idle_max_wait_ns; //!< default 10 s, then REFUSED "the user is active"
 };
 

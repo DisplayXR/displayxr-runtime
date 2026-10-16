@@ -108,6 +108,10 @@ u_desktop_fake_set_caps(struct u_desktop_fake *f, uint32_t caps);
 void
 u_desktop_fake_set_locked(struct u_desktop_fake *f, bool locked);
 
+//! is_locked sleeps @p ms before answering (GNOME: a D-Bus call of up to 250 ms).
+void
+u_desktop_fake_set_lock_query_delay_ms(struct u_desktop_fake *f, uint32_t ms);
+
 // --- idle --------------------------------------------------------------------
 
 //! While true, the user is "typing": user_idle_ms reports 0 on every poll.
@@ -141,7 +145,7 @@ u_desktop_fake_raise_on_next_move(struct u_desktop_fake *f, uint64_t id);
 /*!
  * The operation log, one line per injected operation / window op, e.g.
  * "type 101 hello", "key ctrl+s", "move 400 300", "button left down",
- * "scroll 0 3", "op activate 102". Copies at most @p cap - 1 bytes.
+ * "button left up 400 300" (a release names its point), "scroll 0 3", "op activate 102". Copies at most @p cap - 1 bytes.
  */
 size_t
 u_desktop_fake_log(struct u_desktop_fake *f, char *out, size_t cap);
@@ -158,7 +162,8 @@ u_desktop_fake_clear_log(struct u_desktop_fake *f);
 /*!
  * Called before every injection batch (outside the fake's lock — it may change
  * the desktop or the store): @p op is "prepare", "type", "key", "press",
- * "scroll" or "window_op"; @p index counts batches within the call.
+ * "scroll" or "window_op"; @p index counts batches within the call. One more op,
+ * "pressed", fires AFTER a button press was delivered (the button is held).
  */
 typedef void (*u_desktop_fake_batch_fn)(void *ctx, const char *op, uint32_t index);
 

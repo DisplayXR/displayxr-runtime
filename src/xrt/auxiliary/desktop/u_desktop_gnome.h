@@ -136,8 +136,14 @@ void
 gnome_portal_request(struct gnome_portal *p, u_desktop_access_done_fn done, void *ctx);
 
 //! libei absolute motion to stage point (x, y). REFUSED when no input region holds it.
+//! May silently restore a closed session (only valid BEFORE verification).
 enum u_desktop_result
 gnome_portal_motion(struct gnome_portal *p, int32_t x, int32_t y, char *msg);
+
+//! As gnome_portal_motion; with @p restore false a closed session is never reopened
+//! (REFUSED instead) — for motion after verification (mid-gesture, mid-drag).
+enum u_desktop_result
+gnome_portal_motion_ex(struct gnome_portal *p, int32_t x, int32_t y, bool restore, char *msg);
 
 //! @p evdev_button: BTN_LEFT / BTN_RIGHT / BTN_MIDDLE.
 enum u_desktop_result
@@ -285,6 +291,10 @@ gnome_focused_window(struct u_desktop_backend *b, uint64_t *out_id);
 //! Move, then confirm with the extension that the pointer arrived (within 2 px).
 enum u_desktop_result
 gnome_move_verified(struct gnome_backend *g, int32_t x, int32_t y, char *msg);
+
+//! As gnome_move_verified; @p restore false never reopens a closed session.
+enum u_desktop_result
+gnome_move_verified_ex(struct gnome_backend *g, int32_t x, int32_t y, bool restore, char *msg);
 
 bool
 gnome_can_input(struct gnome_backend *g, char *msg);

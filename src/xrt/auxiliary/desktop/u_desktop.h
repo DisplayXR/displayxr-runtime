@@ -32,8 +32,12 @@
  *
  * - Action calls (window_action, type_text, key_chord, pointer_*, scroll) are
  *   made from ONE worker thread per backend, never concurrently with each other.
- *   They may block (portal round trips, waiting for a grab to end) — bounded,
- *   at most a few seconds each.
+ *   They may block (portal round trips, waiting for a grab to end) and must be
+ *   bounded: a few seconds for everything but text. type_text takes time
+ *   proportional to its length (chunk pacing, about 1 s per 2 KiB worst case:
+ *   a 64 KiB text runs ~13 s on macOS, ~30 s on Windows); the input guard,
+ *   re-asked before every chunk, keeps it interruptible (kill switch, lock,
+ *   focus change) throughout.
  * - Observation calls (list_windows, get_pointer, pick, text_at, focused_window,
  *   is_locked, user_idle_ms, access_status) may come from ANY thread, concurrently
  *   with an action in flight, and must NOT block on it: they are called from the

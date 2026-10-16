@@ -30,21 +30,29 @@ overview_active(struct gnome_backend *g)
 }
 
 static void
-press_escape(struct gnome_backend *g)
+press_escape(struct gnome_backend *g, const struct u_desktop_input_guard *guard)
 {
+	// Our own cleanup (an overview / popup our gesture opened): no target to check,
+	// but the kill switch / lock still applies to this keystroke.
+	if (!guard->still_allowed(guard->ctx)) {
+		return;
+	}
 	char m[U_DESKTOP_MSG_SIZE];
-	// Our own cleanup (an overview / popup our gesture opened): no target to check.
 	gnome_send_chord(g, NULL, 0, 0, KEY_ESC, 0, m);
 	gdbus_sleep_ms(200);
 }
 
-//! After a Super gesture: no overview left open, no tiling popup holding the keyboard.
+/*!
+ * After a SUCCESSFUL Super gesture: no overview left open, no tiling popup holding
+ * the keyboard. Never called after a refused / failed gesture: then nothing is sent
+ * beyond releasing what the gesture pressed.
+ */
 static void
-tidy_after_gesture(struct gnome_backend *g, bool expect_focus)
+tidy_after_gesture(struct gnome_backend *g, const struct u_desktop_input_guard *guard, bool expect_focus)
 {
 	if (overview_active(g)) {
 		U_LOG_I("desktop/gnome: a Super gesture opened the overview — closing it");
-		press_escape(g);
+		press_escape(g, guard);
 	}
 	if (expect_focus) {
 		struct u_desktop_window *ws;
@@ -58,7 +66,7 @@ tidy_after_gesture(struct gnome_backend *g, bool expect_focus)
 			if (!any) {
 				// The keyboard went to shell UI (Ubuntu's tiling popup).
 				U_LOG_I("desktop/gnome: no window has focus after a gesture — pressing Escape");
-				press_escape(g);
+				press_escape(g, guard);
 			}
 		}
 	}
@@ -196,10 +204,12 @@ super_gesture(struct gnome_backend *g,
 			r = U_DESKTOP_ERR_REFUSED;
 		} else {
 			// Jump: a slow drag across a monitor edge pops the tiling assistant.
-			r = gnome_portal_motion(g->portal, x + dx, y + dy, msg);
+			// Past verification: a closed session is never reopened here (that
+			// would put seconds between the check and the drop) — it refuses.
+			r = gnome_portal_motion_ex(g->portal, x + dx, y + dy, false, msg);
 			gdbus_sleep_ms(60);
 			if (r == U_DESKTOP_OK) {
-				r = gnome_move_verified(g, x + dx, y + dy, msg);
+				r = gnome_move_verified_ex(g, x + dx, y + dy, false, msg);
 			}
 		}
 	}
@@ -245,12 +255,14 @@ wait_state(struct gnome_backend *g, uint64_t id, uint32_t mask, bool set, uint32
 	return false;
 }
 
+//! Put the pointer back after a SUCCESSFUL gesture (never after a refusal), and
+//! never by reopening a session that closed meanwhile.
 static void
 restore_pointer(struct gnome_backend *g, bool have, int32_t x, int32_t y)
 {
 	if (have) {
 		char tmp[U_DESKTOP_MSG_SIZE];
-		gnome_portal_motion(g->portal, x, y, tmp);
+		gnome_portal_motion_ex(g->portal, x, y, false, tmp);
 	}
 }
 
@@ -292,13 +304,15 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 	int32_t ox = 0, oy = 0;
 	bool have_orig = gnome_get_pointer_msg(g, &ox, &oy, NULL) == U_DESKTOP_OK;
 	r = super_gesture(g, guard, id, x, y, false, 0, 0, msg);
-	// mutter's grab from the Super+click: keys sent before it ends are lost.
-	gdbus_sleep_ms(GRAB_SETTLE_MS);
-	tidy_after_gesture(g, false);
-	restore_pointer(g, have_orig, ox, oy);
 	if (r != U_DESKTOP_OK) {
+		// Refused / failed: super_gesture released what it pressed; send nothing more
+		// (no Escape, no pointer restore).
 		return r;
 	}
+	// mutter's grab from the Super+click: keys sent before it ends are lost.
+	gdbus_sleep_ms(GRAB_SETTLE_MS);
+	tidy_after_gesture(g, guard, false);
+	restore_pointer(g, have_orig, ox, oy);
 	if (!wait_focus(g, id, 1000)) {
 		gnome_set_msg(msg, "the window did not take focus");
 		return U_DESKTOP_ERR_TIMEOUT;
@@ -327,6 +341,7 @@ move_other(struct gnome_backend *g,
 	int32_t ox = 0, oy = 0;
 	bool have_orig = gnome_get_pointer_msg(g, &ox, &oy, NULL) == U_DESKTOP_OK;
 	enum u_desktop_result r = U_DESKTOP_OK;
+	bool gesture_failed = false; //!< then nothing more is sent (no Escape, no pointer restore)
 	struct u_desktop_rect frame = {0, 0, 0, 0};
 	for (int attempt = 0; attempt < 2; attempt++) {
 		struct u_desktop_window *ws;
@@ -384,11 +399,12 @@ move_other(struct gnome_backend *g,
 			break;
 		}
 		r = super_gesture(g, guard, id, x, y, true, dx, dy, msg);
-		gdbus_sleep_ms(GRAB_SETTLE_MS);
-		tidy_after_gesture(g, true);
 		if (r != U_DESKTOP_OK) {
+			gesture_failed = true;
 			break;
 		}
+		gdbus_sleep_ms(GRAB_SETTLE_MS);
+		tidy_after_gesture(g, guard, true);
 		// FAILED = "verify by read-back": the next attempt re-reads the frame and
 		// corrects by the residual; after the last one, the read-back below decides.
 		r = U_DESKTOP_ERR_FAILED;
@@ -411,7 +427,9 @@ move_other(struct gnome_backend *g,
 			free(ws);
 		}
 	}
-	restore_pointer(g, have_orig, ox, oy);
+	if (!gesture_failed) {
+		restore_pointer(g, have_orig, ox, oy);
+	}
 	return r;
 }
 

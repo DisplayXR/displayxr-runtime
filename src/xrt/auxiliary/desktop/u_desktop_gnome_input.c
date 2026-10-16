@@ -627,7 +627,7 @@ cmd_clip_restore(struct gnome_portal *p, struct gp_cmd *c)
 }
 
 enum u_desktop_result
-gnome_portal_motion(struct gnome_portal *p, int32_t x, int32_t y, char *msg)
+gnome_portal_motion_ex(struct gnome_portal *p, int32_t x, int32_t y, bool restore, char *msg)
 {
 	struct gp_cmd *c = gp_cmd_new(cmd_motion);
 	if (c == NULL) {
@@ -635,8 +635,14 @@ gnome_portal_motion(struct gnome_portal *p, int32_t x, int32_t y, char *msg)
 	}
 	c->x = x;
 	c->y = y;
-	c->restore = true;
+	c->restore = restore;
 	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+enum u_desktop_result
+gnome_portal_motion(struct gnome_portal *p, int32_t x, int32_t y, char *msg)
+{
+	return gnome_portal_motion_ex(p, x, y, true, msg);
 }
 
 enum u_desktop_result

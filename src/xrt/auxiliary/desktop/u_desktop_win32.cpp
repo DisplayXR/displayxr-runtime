@@ -903,8 +903,9 @@ prompt_shutdown(prompt_state *p)
 	prompt_unref(p);
 }
 
-//! App-supplied text for the prompt: one line, no control / bidi-override
-//! characters (no faking the prompt's own lines), at most @p max code points.
+//! App-supplied text for the prompt (reason, app name): one line, no control,
+//! bidi, zero-width or format characters (no faking the prompt's own lines, no
+//! hidden or reordered text), at most @p max code points.
 static std::wstring
 prompt_sanitize(const std::wstring &in, size_t max)
 {
@@ -912,14 +913,18 @@ prompt_sanitize(const std::wstring &in, size_t max)
 	size_t cps = 0;
 	for (size_t i = 0; i < in.size(); i++) {
 		wchar_t c = in[i];
-		if ((c >= 0x202A && c <= 0x202E) || (c >= 0x2066 && c <= 0x2069) || c == 0x200E || c == 0x200F) {
+		// Invisible / reordering characters: bidi controls and overrides, zero-width
+		// and format characters, the Arabic letter mark, the BOM. They can hide or
+		// rearrange what the prompt shows the user.
+		if ((c >= 0x200B && c <= 0x200F) || (c >= 0x2028 && c <= 0x202F) || (c >= 0x2060 && c <= 0x206F) ||
+		    c == 0xFEFF || c == 0x061C) {
 			continue;
 		}
 		if (cps == max) {
 			out += L"\x2026";
 			break;
 		}
-		if (c < 0x20 || c == 0x7F || c == 0x2028 || c == 0x2029) {
+		if (c < 0x20 || c == 0x7F) {
 			c = L' ';
 		}
 		out += c;
@@ -1560,6 +1565,25 @@ send_inputs(INPUT *in, UINT n, char *msg)
 		return U_DESKTOP_OK;
 	}
 	DWORD err = GetLastError();
+	// SendInput delivers a prefix. A key whose down went out but whose up did not
+	// (e.g. only the down of an Enter / Tab pair) would stay pressed: send each
+	// missing up now, ungated — releasing what we pressed is always allowed.
+	for (UINT i = 0; i < sent && i < n; i++) {
+		if (in[i].type != INPUT_KEYBOARD || (in[i].ki.dwFlags & KEYEVENTF_KEYUP) != 0) {
+			continue;
+		}
+		bool released = false;
+		for (UINT k = i + 1; k < sent && !released; k++) {
+			released = in[k].type == INPUT_KEYBOARD && (in[k].ki.dwFlags & KEYEVENTF_KEYUP) != 0 &&
+			           in[k].ki.wVk == in[i].ki.wVk && in[k].ki.wScan == in[i].ki.wScan &&
+			           (in[k].ki.dwFlags & KEYEVENTF_UNICODE) == (in[i].ki.dwFlags & KEYEVENTF_UNICODE);
+		}
+		if (!released) {
+			INPUT up = in[i];
+			up.ki.dwFlags |= KEYEVENTF_KEYUP;
+			SendInput(1, &up, sizeof(INPUT));
+		}
+	}
 	if (sent == 0 && err == ERROR_ACCESS_DENIED) {
 		set_msg(msg, "input blocked by Windows (UIPI or secure desktop)");
 		return U_DESKTOP_ERR_REFUSED;
