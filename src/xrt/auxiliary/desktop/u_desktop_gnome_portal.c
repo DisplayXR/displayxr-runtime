@@ -822,6 +822,14 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	return U_DESKTOP_OK;
 }
 
+//! Bring-up knob for desktop_backend_smoke: an action with no grant opens the portal dialog itself.
+static bool
+dev_prompt_on_action(void)
+{
+	const char *v = getenv("DXR_DESKTOP_GNOME_PROMPT_ON_ACTION");
+	return v != NULL && strcmp(v, "1") == 0;
+}
+
 enum u_desktop_result
 gp_ensure_session(struct gnome_portal *p, char *msg)
 {
@@ -837,6 +845,18 @@ gp_ensure_session(struct gnome_portal *p, char *msg)
 	bool have_token = p->have_token;
 	enum u_desktop_access acc = p->access;
 	pthread_mutex_unlock(&p->lock);
+	if (!have_token && dev_prompt_on_action()) {
+		// Bring-up only (desktop_backend_smoke runs one command per process, and
+		// the token never outlives a process): show the portal's dialog now. It
+		// is still the OS's consent — the user must approve it within the
+		// silent-restore timeout (15 s).
+		U_LOG_W("desktop/gnome: DXR_DESKTOP_GNOME_PROMPT_ON_ACTION=1 — asking the portal from an action");
+		enum u_desktop_result r = open_session(p, false, msg);
+		pthread_mutex_lock(&p->lock);
+		p->access = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		pthread_mutex_unlock(&p->lock);
+		return r;
+	}
 	if (!have_token) {
 		gp_set_msg(msg, acc == U_DESKTOP_ACCESS_GRANTED
 		                    ? "the remote-desktop session ended and cannot be restored — request access again"
