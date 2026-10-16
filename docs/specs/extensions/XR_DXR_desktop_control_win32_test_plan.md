@@ -39,7 +39,8 @@ second `info` must print `locked=1`. (A UAC prompt up during the call must also 
 %SMOKE% request
 ```
 A top-most "DisplayXR" message box: *"desktop_backend_smoke wants to control your
-computer. … bring-up test … displayxr-cli desktop deny"*, Yes/No. Yes → `access: granted`;
+computer. … bring-up test … To stop it, run: displayxr-cli desktop deny "<smoke exe path>"
+(or 'displayxr-cli desktop stop' to pause every app)"*, Yes/No. Yes → `access: granted`;
 No → `access: denied`. The terminal must keep running while the box is up (it is on its own
 thread). Also try it while another app is in front: the box must still be top-most.
 
@@ -114,11 +115,20 @@ string (several SendInput batches): every character arrives, in order.
 %SMOKE% op activate NP && %SMOKE% key 0 end
 %SMOKE% op activate NP && %SMOKE% key 3 left     :: ctrl+shift+left
 ```
-Switch to a non-US layout (French AZERTY) and run `key 1 q`: it injects the physical
-US **Q** position, which AZERTY labels **A**, so Notepad must *select all* (Ctrl+A), not
-quit. Keys are physical US positions by contract (u_desktop.h) — record what is observed;
-this semantic is the one most worth a second opinion. (Avoid `key 1 z` here: on AZERTY that
-is Ctrl+W, which closes Notepad's tab.)
+Chord keys are the **character on the active layout** (u_desktop.h). Add French (AZERTY)
+in Windows settings, switch Notepad to it (Win+Space), type `abc`, then:
+
+```bat
+%SMOKE% op activate NP && %SMOKE% key 1 z        :: Ctrl + the key LABELLED Z -> undo
+%SMOKE% op activate NP && %SMOKE% key 1 a        :: select all (the key labelled A)
+%SMOKE% op activate NP && %SMOKE% key 1 1        :: Ctrl+VK_1 (no Shift added for digits)
+%SMOKE% key 1 bracketleft                        :: '[' is AltGr+5 on AZERTY
+```
+Expect: `key 1 z` undoes the typing (it must NOT close Notepad's tab, which is what a
+US-position Ctrl+W would do); `key 1 a` selects all; the last prints
+`result: unsupported — '[' needs AltGr on the active keyboard layout…`. `key 1 slash`
+(Shift+`:` on AZERTY) must send Ctrl+Shift+that key. Switch back to US and repeat `key 1 z`:
+undo again.
 
 ```bat
 %SMOKE% move X Y                   :: X,Y = a point in Notepad's text

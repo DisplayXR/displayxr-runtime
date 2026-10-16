@@ -27,9 +27,10 @@
  * - **UIPI.** SendInput / PostMessage into a higher-integrity (elevated) process
  *   is blocked by Windows, often silently. Input actions compare the target's
  *   integrity level with ours first and return REFUSED rather than pretend.
- * - **Keys are scan codes.** Chord keys are PHYSICAL US positions (u_desktop.h),
- *   so they are injected as set-1 scan codes (KEYEVENTF_SCANCODE): the target's
- *   own layout maps them, exactly like a physical keyboard.
+ * - **Chord keys follow the ACTIVE layout** (u_desktop.h): a character key is
+ *   mapped with VkKeyScanExW on the foreground thread's HKL ("ctrl+z" = the key
+ *   labelled Z, on AZERTY too); AltGr-only characters are UNSUPPORTED. Named
+ *   keys (enter, f5, arrows, ...) are fixed virtual keys.
  */
 
 #ifndef NOMINMAX
@@ -762,7 +763,11 @@ win32_request_access(struct u_desktop_backend *b,
 		job->text += utf8_to_utf16(app->reason);
 		job->text += L"\n\n";
 	}
-	job->text += L"You can turn this off at any time with: displayxr-cli desktop deny";
+	std::wstring exe =
+	    app != NULL && app->exe_path != NULL && app->exe_path[0] != '\0' ? utf8_to_utf16(app->exe_path) : name;
+	job->text += L"To stop it, run: displayxr-cli desktop deny \"";
+	job->text += exe;
+	job->text += L"\" (or 'displayxr-cli desktop stop' to pause every app)";
 
 	HANDLE t = CreateThread(NULL, 0, prompt_thread_main, job, 0, NULL);
 	if (t == NULL) {
@@ -1316,15 +1321,6 @@ key_unicode(INPUT *in, wchar_t unit, bool up)
 	in->ki.dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0);
 }
 
-static void
-key_scan(INPUT *in, WORD scan, bool ext, bool up)
-{
-	memset(in, 0, sizeof(*in));
-	in->type = INPUT_KEYBOARD;
-	in->ki.wScan = scan;
-	in->ki.dwFlags = KEYEVENTF_SCANCODE | (ext ? KEYEVENTF_EXTENDEDKEY : 0) | (up ? KEYEVENTF_KEYUP : 0);
-}
-
 static enum u_desktop_result
 win32_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 {
@@ -1413,114 +1409,148 @@ win32_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
 	return U_DESKTOP_OK;
 }
 
-struct key_def
+struct named_key
 {
 	const char *name;
-	WORD scan; // set-1 make code, US physical position
-	bool ext;  // E0-prefixed
+	WORD vk;
 };
 
-static const key_def k_keys[] = {
-    {"a", 0x1E, false},
-    {"b", 0x30, false},
-    {"c", 0x2E, false},
-    {"d", 0x20, false},
-    {"e", 0x12, false},
-    {"f", 0x21, false},
-    {"g", 0x22, false},
-    {"h", 0x23, false},
-    {"i", 0x17, false},
-    {"j", 0x24, false},
-    {"k", 0x25, false},
-    {"l", 0x26, false},
-    {"m", 0x32, false},
-    {"n", 0x31, false},
-    {"o", 0x18, false},
-    {"p", 0x19, false},
-    {"q", 0x10, false},
-    {"r", 0x13, false},
-    {"s", 0x1F, false},
-    {"t", 0x14, false},
-    {"u", 0x16, false},
-    {"v", 0x2F, false},
-    {"w", 0x11, false},
-    {"x", 0x2D, false},
-    {"y", 0x15, false},
-    {"z", 0x2C, false},
-    {"1", 0x02, false},
-    {"2", 0x03, false},
-    {"3", 0x04, false},
-    {"4", 0x05, false},
-    {"5", 0x06, false},
-    {"6", 0x07, false},
-    {"7", 0x08, false},
-    {"8", 0x09, false},
-    {"9", 0x0A, false},
-    {"0", 0x0B, false},
-    {"f1", 0x3B, false},
-    {"f2", 0x3C, false},
-    {"f3", 0x3D, false},
-    {"f4", 0x3E, false},
-    {"f5", 0x3F, false},
-    {"f6", 0x40, false},
-    {"f7", 0x41, false},
-    {"f8", 0x42, false},
-    {"f9", 0x43, false},
-    {"f10", 0x44, false},
-    {"f11", 0x57, false},
-    {"f12", 0x58, false},
-    {"f13", 0x64, false},
-    {"f14", 0x65, false},
-    {"f15", 0x66, false},
-    {"f16", 0x67, false},
-    {"f17", 0x68, false},
-    {"f18", 0x69, false},
-    {"f19", 0x6A, false},
-    {"f20", 0x6B, false},
-    {"f21", 0x6C, false},
-    {"f22", 0x6D, false},
-    {"f23", 0x6E, false},
-    {"f24", 0x76, false},
-    {"enter", 0x1C, false},
-    {"tab", 0x0F, false},
-    {"escape", 0x01, false},
-    {"backspace", 0x0E, false},
-    {"delete", 0x53, true},
-    {"insert", 0x52, true},
-    {"home", 0x47, true},
-    {"end", 0x4F, true},
-    {"pageup", 0x49, true},
-    {"pagedown", 0x51, true},
-    {"left", 0x4B, true},
-    {"right", 0x4D, true},
-    {"up", 0x48, true},
-    {"down", 0x50, true},
-    {"space", 0x39, false},
-    {"minus", 0x0C, false},
-    {"equal", 0x0D, false},
-    {"comma", 0x33, false},
-    {"period", 0x34, false},
-    {"slash", 0x35, false},
-    {"backslash", 0x2B, false},
-    {"semicolon", 0x27, false},
-    {"quote", 0x28, false},
-    {"bracketleft", 0x1A, false},
-    {"bracketright", 0x1B, false},
-    {"grave", 0x29, false},
-    {"capslock", 0x3A, false},
-    {"printscreen", 0x37, true},
-    {"menu", 0x5D, true},
+//! Layout-independent keys: fixed virtual-key codes.
+static const named_key k_named_keys[] = {
+    {"enter", VK_RETURN},
+    {"tab", VK_TAB},
+    {"escape", VK_ESCAPE},
+    {"backspace", VK_BACK},
+    {"delete", VK_DELETE},
+    {"insert", VK_INSERT},
+    {"home", VK_HOME},
+    {"end", VK_END},
+    {"pageup", VK_PRIOR},
+    {"pagedown", VK_NEXT},
+    {"left", VK_LEFT},
+    {"right", VK_RIGHT},
+    {"up", VK_UP},
+    {"down", VK_DOWN},
+    {"space", VK_SPACE},
+    {"capslock", VK_CAPITAL},
+    {"printscreen", VK_SNAPSHOT},
+    {"menu", VK_APPS},
 };
 
-static const key_def *
-find_key(const char *name)
+//! Character keys: the canonical name -> the character it stands for.
+static const struct
 {
-	for (const key_def &k : k_keys) {
+	const char *name;
+	wchar_t ch;
+} k_char_keys[] = {
+    {"minus", L'-'},       {"equal", L'='},        {"comma", L','},     {"period", L'.'},
+    {"slash", L'/'},       {"backslash", L'\\'},   {"semicolon", L';'}, {"quote", L'\''},
+    {"bracketleft", L'['}, {"bracketright", L']'}, {"grave", L'`'},
+};
+
+//! Keys whose make code is E0-prefixed (MapVirtualKeyEx does not flag all of them).
+static bool
+vk_is_extended(WORD vk)
+{
+	switch (vk) {
+	case VK_INSERT:
+	case VK_DELETE:
+	case VK_HOME:
+	case VK_END:
+	case VK_PRIOR:
+	case VK_NEXT:
+	case VK_LEFT:
+	case VK_RIGHT:
+	case VK_UP:
+	case VK_DOWN:
+	case VK_SNAPSHOT:
+	case VK_APPS:
+	case VK_LWIN:
+	case VK_RWIN:
+	case VK_RCONTROL:
+	case VK_RMENU:
+	case VK_DIVIDE:
+	case VK_NUMLOCK: return true;
+	default: return false;
+	}
+}
+
+//! A key event by virtual key, with the scan code of the active layout.
+static void
+key_vk_hkl(INPUT *in, WORD vk, HKL hkl, bool up)
+{
+	UINT sc = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, hkl);
+	bool ext = vk_is_extended(vk) || ((sc >> 8) & 0xFF) == 0xE0 || ((sc >> 8) & 0xFF) == 0xE1;
+	memset(in, 0, sizeof(*in));
+	in->type = INPUT_KEYBOARD;
+	in->ki.wVk = vk;
+	in->ki.wScan = (WORD)(sc & 0xFF);
+	in->ki.dwFlags = (ext ? KEYEVENTF_EXTENDEDKEY : 0) | (up ? KEYEVENTF_KEYUP : 0);
+}
+
+/*!
+ * Resolve the chord's key to a virtual key on @p hkl (u_desktop.h: characters
+ * on the ACTIVE layout, named keys fixed). @p need_shift is set when the
+ * character sits on the Shift level of its key.
+ */
+static enum u_desktop_result
+resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *need_shift, char *msg)
+{
+	*need_shift = false;
+	for (const named_key &k : k_named_keys) {
 		if (strcmp(k.name, name) == 0) {
-			return &k;
+			*out_vk = k.vk;
+			return U_DESKTOP_OK;
 		}
 	}
-	return NULL;
+	if (name[0] == 'f' && name[1] >= '1' && name[1] <= '9') {
+		int n = atoi(name + 1);
+		if (n >= 1 && n <= 24) {
+			*out_vk = (WORD)(VK_F1 + (n - 1));
+			return U_DESKTOP_OK;
+		}
+	}
+
+	wchar_t ch = 0;
+	bool is_digit = false;
+	if (name[0] != '\0' && name[1] == '\0' &&
+	    ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= '0' && name[0] <= '9'))) {
+		ch = (wchar_t)name[0];
+		is_digit = name[0] >= '0' && name[0] <= '9';
+	} else {
+		for (const auto &k : k_char_keys) {
+			if (strcmp(k.name, name) == 0) {
+				ch = k.ch;
+				break;
+			}
+		}
+	}
+	if (ch == 0) {
+		set_msg(msg, "unknown key \"%s\"", name);
+		return U_DESKTOP_ERR_FAILED;
+	}
+
+	SHORT r = VkKeyScanExW(ch, hkl);
+	if (r == -1) {
+		if (is_digit) {
+			// Every Windows layout keeps VK_0..VK_9 on the number row.
+			*out_vk = (WORD)ch;
+			return U_DESKTOP_OK;
+		}
+		set_msg(msg, "no key produces '%c' on the active keyboard layout", (char)ch);
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	WORD vk = (WORD)(r & 0xFF);
+	int shift_state = (r >> 8) & 0xFF;
+	if ((shift_state & (2 | 4)) != 0) { // Ctrl / Alt (AltGr) level
+		set_msg(msg, "'%c' needs AltGr on the active keyboard layout: not usable in a shortcut", (char)ch);
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	*out_vk = vk;
+	// Windows matches shortcuts on the VK: AZERTY's number row is VK_1..VK_0
+	// on the SHIFT level, and "ctrl+1" there means Ctrl + VK_1, not Ctrl+Shift.
+	*need_shift = (shift_state & 1) != 0 && !(is_digit && vk == (WORD)ch);
+	return U_DESKTOP_OK;
 }
 
 static enum u_desktop_result
@@ -1530,53 +1560,56 @@ win32_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord
 	if (chord == NULL) {
 		return U_DESKTOP_ERR_FAILED;
 	}
-	const key_def *key = NULL;
-	if (chord->key[0] != '\0') {
-		char name[sizeof(chord->key) + 1];
-		snprintf(name, sizeof(name), "%.*s", (int)sizeof(chord->key), chord->key);
-		key = find_key(name);
-		if (key == NULL) {
-			set_msg(msg, "unknown key \"%s\"", name);
-			return U_DESKTOP_ERR_FAILED;
-		}
-	}
-	if (key == NULL && chord->mods == 0) {
-		set_msg(msg, "empty chord");
-		return U_DESKTOP_ERR_FAILED;
-	}
 
 	HWND fg = root_of(GetForegroundWindow());
 	if (window_above_us(fg)) {
 		set_msg(msg, "%s", k_msg_elevated);
 		return U_DESKTOP_ERR_REFUSED;
 	}
+	// The layout that will interpret the keys: the foreground thread's.
+	HKL hkl = GetKeyboardLayout(fg != NULL ? GetWindowThreadProcessId(GetForegroundWindow(), NULL) : 0);
 
-	// Left-hand modifiers by scan code, pressed in a fixed order, released in reverse.
+	bool have_key = chord->key[0] != '\0';
+	WORD vk = 0;
+	bool need_shift = false;
+	if (have_key) {
+		char name[sizeof(chord->key) + 1];
+		snprintf(name, sizeof(name), "%.*s", (int)sizeof(chord->key), chord->key);
+		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &need_shift, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	} else if (chord->mods == 0) {
+		set_msg(msg, "empty chord");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	uint32_t mods_bits = chord->mods | (need_shift ? (uint32_t)U_DESKTOP_MOD_SHIFT : 0u);
+
+	// Left-hand modifiers, pressed in a fixed order, released in reverse.
 	struct
 	{
 		uint32_t bit;
-		WORD scan;
-		bool ext;
+		WORD vk;
 	} const mods[] = {
-	    {U_DESKTOP_MOD_CTRL, 0x1D, false},
-	    {U_DESKTOP_MOD_SHIFT, 0x2A, false},
-	    {U_DESKTOP_MOD_ALT, 0x38, false},
-	    {U_DESKTOP_MOD_SUPER, 0x5B, true},
+	    {U_DESKTOP_MOD_CTRL, VK_LCONTROL},
+	    {U_DESKTOP_MOD_SHIFT, VK_LSHIFT},
+	    {U_DESKTOP_MOD_ALT, VK_LMENU},
+	    {U_DESKTOP_MOD_SUPER, VK_LWIN},
 	};
 	INPUT in[10];
 	UINT n = 0;
 	for (const auto &m : mods) {
-		if (chord->mods & m.bit) {
-			key_scan(&in[n++], m.scan, m.ext, false);
+		if (mods_bits & m.bit) {
+			key_vk_hkl(&in[n++], m.vk, hkl, false);
 		}
 	}
-	if (key != NULL) {
-		key_scan(&in[n++], key->scan, key->ext, false);
-		key_scan(&in[n++], key->scan, key->ext, true);
+	if (have_key) {
+		key_vk_hkl(&in[n++], vk, hkl, false);
+		key_vk_hkl(&in[n++], vk, hkl, true);
 	}
 	for (int i = (int)(sizeof(mods) / sizeof(mods[0])) - 1; i >= 0; i--) {
-		if (chord->mods & mods[i].bit) {
-			key_scan(&in[n++], mods[i].scan, mods[i].ext, true);
+		if (mods_bits & mods[i].bit) {
+			key_vk_hkl(&in[n++], mods[i].vk, hkl, true);
 		}
 	}
 	enum u_desktop_result r = send_inputs(in, n, msg);
@@ -1585,8 +1618,8 @@ win32_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord
 		INPUT rel[4];
 		UINT k = 0;
 		for (const auto &m : mods) {
-			if (chord->mods & m.bit) {
-				key_scan(&rel[k++], m.scan, m.ext, true);
+			if (mods_bits & m.bit) {
+				key_vk_hkl(&rel[k++], m.vk, hkl, true);
 			}
 		}
 		SendInput(k, rel, sizeof(INPUT));
@@ -1703,6 +1736,7 @@ win32_destroy(struct u_desktop_backend *b)
 		ReleaseSRWLockExclusive(&w->lock);
 		// A provider stuck past UIA's own timeouts leaves the thread running;
 		// it then frees the shared state itself (refcount) when it returns.
+		// Accepted for v1: a thread still stuck here would crash if the runtime DLL were unloaded.
 		WaitForSingleObject(w->thread, 2 * WIN32_UIA_PROVIDER_MS);
 		CloseHandle(w->thread);
 		uia_worker_unref(w);
