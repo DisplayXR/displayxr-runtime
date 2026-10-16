@@ -656,17 +656,12 @@ fake_key_chord(struct u_desktop_backend *b,
 		return r;
 	}
 	// Key-downs: each modifier, then the key; each one is a batch.
-	static const uint32_t order[] = {U_DESKTOP_MOD_CTRL, U_DESKTOP_MOD_SHIFT, U_DESKTOP_MOD_ALT,
-	                                 U_DESKTOP_MOD_SUPER};
-	uint32_t downs[5];
 	uint32_t nd = 0;
-	for (uint32_t i = 0; i < 4; i++) {
-		if (chord->mods & order[i]) {
-			downs[nd++] = order[i];
-		}
+	for (uint32_t m = chord->mods & 0xF; m != 0; m &= m - 1) {
+		nd++;
 	}
 	if (chord->key[0] != '\0') {
-		downs[nd++] = 0; // the key itself
+		nd++; // the key itself
 	}
 	uint32_t pressed = 0;
 	for (uint32_t i = 0; i < nd; i++) {

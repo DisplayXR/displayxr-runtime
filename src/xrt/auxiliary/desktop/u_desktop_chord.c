@@ -92,7 +92,7 @@ u_desktop_chord_parse(const char *s, struct u_desktop_chord *out)
 		while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) {
 			len--;
 		}
-		char tok[32];
+		char tok[sizeof(((struct u_desktop_chord *)0)->key)]; // longer than any canonical key
 		if (len == 0 || len >= sizeof(tok)) {
 			return false; // empty token ("ctrl++a", trailing '+') or absurdly long
 		}
