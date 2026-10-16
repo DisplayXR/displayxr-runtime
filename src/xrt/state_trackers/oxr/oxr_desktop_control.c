@@ -359,14 +359,10 @@ oxr_xrGetDesktopTextAtDXR(
 		free(tmp);
 		return gate_result(&log, r);
 	}
-	// Never hand out a split code point when the backend filled the whole buffer.
+	// u_desktop_control_text_at already dropped a code point a full buffer cut in
+	// half (u_desktop_utf8_trim_partial); the old in-place loop here tested the NUL
+	// terminator instead of the last byte and never trimmed anything.
 	size_t len = strlen(tmp);
-	if (len == TEXT_AT_MAX - 1) {
-		while (len > 0 && ((unsigned char)tmp[len] & 0xC0) == 0x80) {
-			len--;
-		}
-		tmp[len] = '\0';
-	}
 	uint32_t needed = (uint32_t)len + 1;
 	*countOutput = needed;
 	XrResult ret = XR_SUCCESS;

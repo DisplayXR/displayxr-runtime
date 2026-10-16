@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -456,7 +457,8 @@ TEST_CASE("desktop_policy: allow / deny / forget / suspend round trip, atomic, m
 	u_desktop_policy_destroy(&pol);
 }
 
-TEST_CASE("desktop_policy: hand-edited store — idle_ms clamp, malformed = defaults", "[desktop][store]")
+TEST_CASE("desktop_policy: hand-edited store — idle_ms clamp; an unparseable store keeps the last good read",
+          "[desktop][store]")
 {
 	TempDir dir;
 	{
@@ -475,14 +477,14 @@ TEST_CASE("desktop_policy: hand-edited store — idle_ms clamp, malformed = defa
 	}
 	std::this_thread::sleep_for(20ms);
 	u_desktop_policy_refresh(pol);
-	CHECK_FALSE(u_desktop_policy_is_suspended(pol));
-	CHECK(u_desktop_policy_idle_ms(pol) == U_DESKTOP_POLICY_DEFAULT_IDLE_MS);
-	CHECK(u_desktop_policy_app(pol, "/a") == U_DESKTOP_APP_NONE);
+	// v2 (spec §6.1): never defaults — the last good read is kept.
+	CHECK(u_desktop_policy_is_suspended(pol));
+	CHECK(u_desktop_policy_app(pol, "/a") == U_DESKTOP_APP_DENY);
+	CHECK_FALSE(u_desktop_policy_is_unreadable(pol));
 
-	// A writer over a malformed file starts from defaults rather than failing.
-	REQUIRE(u_desktop_policy_set_app("/a", U_DESKTOP_APP_ALLOW, "test"));
-	u_desktop_policy_refresh(pol);
-	CHECK(u_desktop_policy_app(pol, "/a") == U_DESKTOP_APP_ALLOW);
+	// A writer never turns an unparseable store into defaults.
+	CHECK_FALSE(u_desktop_policy_set_app("/a", U_DESKTOP_APP_ALLOW, "test"));
+	CHECK(slurp(dir.file("desktop_control.json")) == "{ not json");
 	u_desktop_policy_destroy(&pol);
 }
 
@@ -851,10 +853,10 @@ TEST_CASE("desktop_idle: the user never stops -> REFUSED after the max wait", "[
 	CHECK(r.message == "the user is active");
 	CHECK(h.log().find("type") == std::string::npos);
 
-	// Window actions other than ACTIVATE do not wait.
-	auto m = act(U_DESKTOP_ACTION_MINIMIZE, 103);
-	CHECK(h.run(m).result == U_DESKTOP_XR_SUCCESS);
+	// v2: EVERY action waits, window ops included.
+	CHECK(h.run(act(U_DESKTOP_ACTION_MINIMIZE, 103)).result == U_DESKTOP_XR_ERROR_REFUSED);
 	CHECK(h.run(act(U_DESKTOP_ACTION_ACTIVATE, 103)).result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(h.log().find("op ") == std::string::npos);
 }
 
 TEST_CASE("desktop_verify: pointer target verification (incl. dialogs and the re-pick)", "[desktop][verify]")
@@ -1128,4 +1130,482 @@ TEST_CASE("desktop_select: DXR_DESKTOP_BACKEND chooses the fake / none", "[deskt
 	CHECK(std::string(name) == "Lumo");
 	u_desktop_display_name_from_exe("/usr/bin/3dluma", name, sizeof(name));
 	CHECK(std::string(name) == "3dluma");
+}
+
+
+/*
+ *
+ * Fix round (adversarial review of the integrated branch) — every case below
+ * failed on the code before it.
+ *
+ */
+
+namespace {
+
+//! A batch hook that runs @ref fn once, at batch @ref at of op @ref op.
+struct Hook
+{
+	std::string op;
+	uint32_t at = 0;
+	std::function<void()> fn;
+	bool fired = false;
+
+	static void
+	call(void *ctx, const char *op, uint32_t index)
+	{
+		auto *h = static_cast<Hook *>(ctx);
+		if (!h->fired && h->op == op && index == h->at) {
+			h->fired = true;
+			h->fn();
+		}
+	}
+
+	void
+	install(u_desktop_fake *f)
+	{
+		u_desktop_fake_set_batch_hook(f, call, this);
+	}
+};
+
+std::string
+content(u_desktop_fake *f, uint64_t id)
+{
+	char buf[1024];
+	REQUIRE(u_desktop_fake_window_content(f, id, buf, sizeof(buf)));
+	return buf;
+}
+
+bool
+saw_state(Recorder &r, u_desktop_control_state s)
+{
+	std::lock_guard<std::mutex> g(r.m);
+	for (auto x : r.states) {
+		if (x == s) {
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+// --- 1. the input guard ----------------------------------------------------------
+
+TEST_CASE("fix1_guard: focus moving mid-text stops the rest of the text", "[desktop][fix][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"type", 3, [&] { u_desktop_fake_set_focus(h.fake, 102); }};
+	hook.install(h.fake);
+
+	auto r = h.run(type_text(101, "abcdefgh"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "focus moved");
+	CHECK(content(h.fake, 101) == "abc"); // what was delivered stays
+	CHECK(content(h.fake, 102).empty());  // nothing reaches the new focus
+}
+
+TEST_CASE("fix1_guard: the kill switch flipping mid-text stops it at once", "[desktop][fix][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"type", 2, [] { REQUIRE(u_desktop_policy_set_suspended(true, "test")); }};
+	hook.install(h.fake);
+
+	auto r = h.run(type_text(101, "secret-text"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "kill switch");
+	CHECK(content(h.fake, 101) == "se");
+	CHECK(h.rec.wait_state(U_DESKTOP_STATE_SUSPENDED));
+}
+
+TEST_CASE("fix1_guard: the pick changing between the move and the press refuses the press", "[desktop][fix][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"press", 0, [&] {
+		          u_desktop_window pop;
+		          memset(&pop, 0, sizeof(pop));
+		          pop.id = 105;
+		          snprintf(pop.app_id, sizeof(pop.app_id), "popup");
+		          snprintf(pop.title, sizeof(pop.title), "Phishing dialog");
+		          pop.frame = {150, 150, 300, 300};
+		          u_desktop_fake_add_window(h.fake, &pop);
+	          }};
+	hook.install(h.fake);
+
+	auto r = h.run(click(101, 200, 200));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(h.log().find("button left down") == std::string::npos);
+	CHECK(u_desktop_fake_pressed_buttons(h.fake) == 0);
+}
+
+TEST_CASE("fix1_guard: a chord stopped mid-way releases what it pressed", "[desktop][fix][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	Hook hook{"key", 1, [&] { u_desktop_fake_set_focus(h.fake, 102); }};
+	hook.install(h.fake);
+	auto r = h.run(chord(101, "ctrl+shift+w"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "focus moved");
+	CHECK(h.log().find("keys released 1") != std::string::npos);
+	CHECK(h.log().find("key ctrl+shift+w") == std::string::npos);
+}
+
+TEST_CASE("fix1_guard: prepare_input runs BEFORE target verification", "[desktop][fix][guard]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	// Slow setup that steals focus (a portal dialog) must be caught by step 4.
+	Hook hook{"prepare", 0, [&] { u_desktop_fake_set_focus(h.fake, 102); }};
+	hook.install(h.fake);
+	auto r = h.run(type_text(101, "x"));
+	CHECK(u_desktop_fake_prepare_count(h.fake) == 1);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "target window does not have focus \xe2\x80\x94 ACTIVATE it first");
+	CHECK(content(h.fake, 101).empty());
+	CHECK(content(h.fake, 102).empty());
+}
+
+// --- 2. the idle wait ------------------------------------------------------------
+
+TEST_CASE("fix2_idle: reviewer case — one click, the user goes active, 20 queued texts all refused",
+          "[desktop][fix][idle]")
+{
+	TempDir dir;
+	const u_desktop_control_timing t = {10ull * 1000000ull, 0, 120ull * 1000000ull};
+	Harness h(&t);
+	h.grant();
+	CHECK(h.run(click(101, 300, 300)).result == U_DESKTOP_XR_SUCCESS);
+	u_desktop_fake_set_user_active(h.fake, true); // right after our click
+	std::vector<uint64_t> ids;
+	for (int i = 0; i < 20; i++) {
+		ids.push_back(h.submit(type_text(101, "x")));
+	}
+	REQUIRE(h.rec.wait_done(21, 15000ms));
+	for (auto id : ids) {
+		auto c = h.rec.completion(id);
+		CHECK(c.result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(c.message == "the user is active");
+	}
+	CHECK(content(h.fake, 101).empty());
+}
+
+TEST_CASE("fix2_idle: window ops wait for the user too", "[desktop][fix][idle]")
+{
+	TempDir dir;
+	const u_desktop_control_timing t = {10ull * 1000000ull, 0, 150ull * 1000000ull};
+	Harness h(&t);
+	h.grant();
+	u_desktop_fake_set_user_active(h.fake, true);
+	for (uint32_t ty : {U_DESKTOP_ACTION_MINIMIZE, U_DESKTOP_ACTION_MAXIMIZE, U_DESKTOP_ACTION_CLOSE,
+	                    U_DESKTOP_ACTION_MOVE_RESIZE}) {
+		auto r = h.run(act(ty, 103));
+		CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(r.message == "the user is active");
+	}
+	CHECK(h.log().find("op ") == std::string::npos);
+}
+
+TEST_CASE("fix2_idle: input before our injection is the user's even if the OS ignores ours",
+          "[desktop][fix][idle]")
+{
+	// macOS HID idle model: our synthetic events never reset the idle counter, so
+	// after our click the OS still reports the USER's last keystroke. Old code:
+	// "anything up to our last end + grace is ours" took it for ours.
+	TempDir dir;
+	auto write_idle = [&](int ms) {
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":false,\"idle_ms\":" << ms << ",\"apps\":{}}";
+	};
+	write_idle(100);
+	const u_desktop_control_timing t = {10ull * 1000000ull, 0, 300ull * 1000000ull};
+	Harness h(&t);
+	h.grant();
+	u_desktop_fake_set_injection_is_input(h.fake, false);
+	u_desktop_fake_set_user_active(h.fake, true);
+	std::this_thread::sleep_for(50ms);
+	u_desktop_fake_set_user_active(h.fake, false); // the user's last keystroke: U
+	// Idle 100 ms is enough for the click: it runs after U, in its own window.
+	CHECK(h.run(click(101, 300, 300)).result == U_DESKTOP_XR_SUCCESS);
+	std::this_thread::sleep_for(20ms);
+	write_idle(3000); // now the user must have been idle 3 s
+	auto r = h.run(type_text(101, "x"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "the user is active");
+	CHECK(content(h.fake, 101).empty());
+}
+
+// --- 3. corrupt store ------------------------------------------------------------
+
+TEST_CASE("fix3_store: suspended + deny + a trailing comma stays SUSPENDED / DISABLED", "[desktop][fix][store]")
+{
+	TempDir dir;
+	Harness h;
+	h.grant();
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":true,\"idle_ms\":600,\"apps\":{\"" << kExe << "\":\"deny\"}}";
+	}
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED);
+	std::this_thread::sleep_for(20ms);
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":true,\"idle_ms\":600,\"apps\":{\"" << kExe << "\":\"deny\",}}";
+	}
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED); // NOT back to GRANTED
+
+	// deny alone, then broken: still DISABLED_BY_USER.
+	std::this_thread::sleep_for(20ms);
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":false,\"idle_ms\":600,\"apps\":{\"" << kExe << "\":\"deny\"}}";
+	}
+	CHECK(h.state() == U_DESKTOP_STATE_DISABLED_BY_USER);
+	std::this_thread::sleep_for(20ms);
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":false,\"apps\":{\"" << kExe << "\":\"deny\",},}";
+	}
+	CHECK(h.state() == U_DESKTOP_STATE_DISABLED_BY_USER);
+}
+
+TEST_CASE("fix3_store: unreadable with no good read -> SUSPENDED with a clear message", "[desktop][fix][store]")
+{
+	TempDir dir;
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"suspended\":true,}";
+	}
+	Harness h(&kFast);
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED);
+	u_desktop_policy *pol = u_desktop_policy_create();
+	CHECK(u_desktop_policy_is_unreadable(pol));
+	CHECK(u_desktop_policy_is_suspended(pol));
+	u_desktop_policy_destroy(&pol);
+
+	// Resuming over it is refused; the kill switch moves it aside and works.
+	CHECK_FALSE(u_desktop_policy_set_suspended(false, "test"));
+	CHECK_FALSE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_ALLOW, "test"));
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	CHECK(exists(dir.file("desktop_control.json.corrupt")));
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED);
+	std::remove(dir.file("desktop_control.json.corrupt").c_str());
+
+	// A MISSING file is defaults, though.
+	std::remove(dir.file("desktop_control.json").c_str());
+	CHECK(h.state() == U_DESKTOP_STATE_NOT_REQUESTED);
+}
+
+TEST_CASE("fix3_store: an action refused by an unreadable store says so", "[desktop][fix][store]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_fake_set_action_delay_ms(h.fake, 100);
+	h.submit(chord(101, "ctrl+s")); // in flight
+	uint64_t b = h.submit(chord(101, "ctrl+s"));
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "not json at all";
+	}
+	REQUIRE(h.rec.wait_done(2));
+	// This process had a good read (defaults: no file) - it keeps it ...
+	CHECK(h.rec.completion(b).result == U_DESKTOP_XR_SUCCESS);
+	// ... a process that never read the store fails closed, and never prompts.
+	Harness h2(&kFast);
+	CHECK(h2.state() == U_DESKTOP_STATE_SUSPENDED);
+	CHECK(u_desktop_control_request(h2.c, nullptr) == U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_request_count(h2.fake) == 0);
+	CHECK(saw_state(h2.rec, U_DESKTOP_STATE_SUSPENDED));
+}
+
+// --- 4. store races --------------------------------------------------------------
+
+TEST_CASE("fix4_store: concurrent read-modify-writes never lose an update", "[desktop][fix][store]")
+{
+	TempDir dir;
+	const int N = 150;
+	std::thread a([&] {
+		for (int i = 0; i < N; i++) {
+			if (i == N / 3) {
+				u_desktop_policy_set_suspended(true, "stop");
+			}
+			u_desktop_policy_set_app(("/a/" + std::to_string(i)).c_str(), U_DESKTOP_APP_DENY, "a");
+		}
+	});
+	std::thread b([&] {
+		for (int i = 0; i < N; i++) {
+			u_desktop_policy_set_app(("/b/" + std::to_string(i)).c_str(), U_DESKTOP_APP_ALLOW, "b");
+		}
+	});
+	a.join();
+	b.join();
+	u_desktop_policy *pol = u_desktop_policy_create();
+	CHECK(u_desktop_policy_is_suspended(pol)); // the kill switch was never overwritten
+	int lost = 0;
+	for (int i = 0; i < N; i++) {
+		lost += u_desktop_policy_app(pol, ("/a/" + std::to_string(i)).c_str()) != U_DESKTOP_APP_DENY;
+		lost += u_desktop_policy_app(pol, ("/b/" + std::to_string(i)).c_str()) != U_DESKTOP_APP_ALLOW;
+	}
+	CHECK(lost == 0);
+	u_desktop_policy_destroy(&pol);
+	std::remove(dir.file("desktop_control.json.lock").c_str());
+}
+
+// --- 5. revocation ---------------------------------------------------------------
+
+TEST_CASE("fix5_revocation: NOT_GRANTED from the backend -> DENIED, no further backend calls",
+          "[desktop][fix][revocation]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_fake_set_action_delay_ms(h.fake, 50);
+	u_desktop_fake_set_action_result(h.fake, "type_text", U_DESKTOP_ERR_NOT_GRANTED);
+	uint64_t a = h.submit(type_text(101, "x"));
+	uint64_t b = h.submit(chord(101, "ctrl+s")); // queued behind it
+	REQUIRE(h.rec.wait_done(2));
+	CHECK(h.rec.completion(a).result == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	CHECK(h.rec.completion(b).result == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	CHECK(h.log().find("key ") == std::string::npos); // the chord never reached the OS
+	CHECK(h.rec.wait_state(U_DESKTOP_STATE_DENIED));
+	CHECK(h.state() == U_DESKTOP_STATE_DENIED); // although the fake still says GRANTED
+
+	uint32_t calls = u_desktop_fake_action_calls(h.fake);
+	uint64_t id = 0;
+	u_desktop_action c = chord(101, "ctrl+s");
+	CHECK(u_desktop_control_submit(h.c, &c, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	std::this_thread::sleep_for(50ms);
+	CHECK(u_desktop_fake_action_calls(h.fake) == calls);
+
+	// A new request on a user gesture asks again.
+	u_desktop_fake_set_action_result(h.fake, nullptr, U_DESKTOP_OK);
+	CHECK(u_desktop_control_request(h.c, nullptr) == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+}
+
+// --- 6. privacy ------------------------------------------------------------------
+
+TEST_CASE("fix6_privacy: a bad chord is never echoed back", "[desktop][fix][privacy]")
+{
+	u_desktop_action a = chord(101, "ctrl+SECRETXYZ");
+	char why[256];
+	CHECK_FALSE(u_desktop_control_validate(&a, why, sizeof(why)));
+	CHECK(std::string(why) == "keys is not a valid chord");
+}
+
+TEST_CASE("fix6_privacy: a backend message naming typed text never reaches the event or the audit",
+          "[desktop][fix][privacy]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	u_desktop_fake_set_action_result(h.fake, "type_text", U_DESKTOP_ERR_FAILED);
+	auto r = h.run(type_text(101, "hunter2-password"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_RUNTIME_FAILURE);
+	CHECK(r.message == "the input could not be delivered");
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(audit.find("hunter2") == std::string::npos);
+	CHECK(audit.find("could not be delivered") != std::string::npos);
+}
+
+TEST_CASE("fix6_privacy: only real shortcuts are audited — never AltGr / Option / shift text", "[desktop][fix][privacy]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	for (const char *k : {"ctrl+alt+q", "alt+e", "option+shift+2", "ctrl+alt+super+e", "shift+a", "q"}) {
+		CHECK(h.run(chord(101, k)).result == U_DESKTOP_XR_SUCCESS);
+	}
+	CHECK(h.run(chord(101, "ctrl+s")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(chord(101, "super+shift+s")).result == U_DESKTOP_XR_SUCCESS);
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	INFO(audit);
+	CHECK(audit.find("\"keys\":\"ctrl+s\"") != std::string::npos);
+	CHECK(audit.find("\"keys\":\"shift+super+s\"") != std::string::npos);
+	size_t n = 0;
+	for (size_t p = audit.find("\"keys\""); p != std::string::npos; p = audit.find("\"keys\"", p + 1)) {
+		n++;
+	}
+	CHECK(n == 2);
+}
+
+// --- 7. robustness ---------------------------------------------------------------
+
+TEST_CASE("fix7_robust: coordinates are clamped at validation", "[desktop][fix][validate]")
+{
+	u_desktop_action a = click(101, 1000000, -1000000);
+	CHECK(u_desktop_control_validate(&a, nullptr, 0));
+	a.x = 1000001;
+	CHECK_FALSE(u_desktop_control_validate(&a, nullptr, 0));
+	a = act(U_DESKTOP_ACTION_DRAG, 101);
+	a.x2 = -2000000000;
+	CHECK_FALSE(u_desktop_control_validate(&a, nullptr, 0));
+	a = act(U_DESKTOP_ACTION_MOVE_RESIZE, 101);
+	a.rect = {0, 0, 1000001, 10};
+	CHECK_FALSE(u_desktop_control_validate(&a, nullptr, 0));
+	a.rect = {-1000001, 0, 10, 10};
+	CHECK_FALSE(u_desktop_control_validate(&a, nullptr, 0));
+}
+
+TEST_CASE("fix7_robust: an unknown action refused at submit is still audited", "[desktop][fix][audit]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	u_desktop_action a = act(99, 101);
+	uint64_t id = 0;
+	CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(audit.find("\"action\":\"unknown\"") != std::string::npos);
+}
+
+TEST_CASE("fix7_robust: text at a point never ends in half a code point", "[desktop][fix][text]")
+{
+	CHECK(u_desktop_utf8_trim_partial("ab\xc3", 3) == 2);         // é cut after its lead byte
+	CHECK(u_desktop_utf8_trim_partial("ab\xc3\xa9", 4) == 4);     // complete
+	CHECK(u_desktop_utf8_trim_partial("a\xe2\x82", 3) == 1);      // € cut
+	CHECK(u_desktop_utf8_trim_partial("a\xf0\x9f\x98", 4) == 1);  // emoji cut
+	CHECK(u_desktop_utf8_trim_partial("a\xf0\x9f\x98\x80", 5) == 5);
+	CHECK(u_desktop_utf8_trim_partial("abc", 3) == 3);
+
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	CHECK(h.run(type_text(101, "ab\xc3\xa9z")).result == U_DESKTOP_XR_SUCCESS);
+	char buf[4]; // "ab" + the first byte of é + NUL
+	REQUIRE(u_desktop_control_text_at(h.c, 200, 200, buf, sizeof(buf)) == U_DESKTOP_XR_SUCCESS);
+	CHECK(std::string(buf) == "ab");
+}
+
+// --- 8. lifetime ------------------------------------------------------------------
+
+TEST_CASE("fix8_lifetime: a consent answer delivered after destroy is dropped safely", "[desktop][fix][lifetime]")
+{
+	TempDir dir;
+	u_desktop_fake_orphan orphan = {nullptr, nullptr};
+	{
+		Harness h;
+		u_desktop_fake_set_request_answer(h.fake, U_DESKTOP_ACCESS_GRANTED, true);
+		u_desktop_fake_set_orphan_on_destroy(h.fake, &orphan);
+		CHECK(u_desktop_control_request(h.c, nullptr) == U_DESKTOP_XR_SUCCESS);
+		size_t states = h.rec.states.size();
+		u_desktop_control_destroy(&h.c);
+		REQUIRE(orphan.done != nullptr);
+		// The backend broke its contract: the answer arrives after the control is
+		// freed. Must not touch freed memory (ASan) nor call back.
+		orphan.done(orphan.ctx, U_DESKTOP_ACCESS_GRANTED);
+		CHECK(h.rec.states.size() == states);
+	}
+	u_desktop_policy *pol = u_desktop_policy_create();
+	CHECK(u_desktop_policy_app(pol, kExe) == U_DESKTOP_APP_NONE);
+	u_desktop_policy_destroy(&pol);
 }

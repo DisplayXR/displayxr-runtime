@@ -51,6 +51,8 @@ extern "C" {
 #define U_DESKTOP_CONTROL_MAX_CLICKS 3
 //! |scrollX|, |scrollY| above this fail validation.
 #define U_DESKTOP_CONTROL_MAX_SCROLL 100
+//! |point|, |point2|, |rect.offset| and rect.extent above this fail validation.
+#define U_DESKTOP_CONTROL_MAX_COORD 1000000
 
 //! Same values as XrDesktopControlStateDXR.
 enum u_desktop_control_state
@@ -192,6 +194,13 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 //! Validation alone (spec §4), for tests and the state tracker. Fills @p why on failure.
 bool
 u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t why_cap);
+
+/*!
+ * Length of @p s[0..len) without a trailing, incomplete UTF-8 sequence (a code
+ * point cut by a full buffer). Never splits a complete code point.
+ */
+size_t
+u_desktop_utf8_trim_partial(const char *s, size_t len);
 
 //! "UNSUPPORTED", "GRANTED", ...
 const char *

@@ -19,8 +19,15 @@
  * Behaviour: activate raises + focuses (+ un-minimizes); a button press focuses
  * and raises the window under the pointer; typed text is appended to the
  * focused window's content, which text_at returns (else the window title);
- * close removes the window. Every injected operation is appended to a log
- * (test-only, so it DOES contain typed text — the audit log never does).
+ * close removes the window.
+ *
+ * Contract v2 (u_desktop.h "Delivery guarantee"), honoured exactly: text is
+ * injected one code point per batch, a chord one key-down per batch, and before
+ * every batch, every button press, every scroll and every window op the fake
+ * calls guard->still_allowed and re-checks focus (text, chords) or the pick at
+ * the VERIFIED point (press, scroll); a failed check stops with
+ * U_DESKTOP_ERR_REFUSED, keeps what was delivered and releases what it pressed. Every injected operation is appended to
+ * a log (test-only, so it DOES contain typed text — the audit log never does).
  *
  * Environment knobs when selected through `DXR_DESKTOP_BACKEND=fake`:
  *   DXR_DESKTOP_FAKE_ANSWER=deny     the consent request is refused
@@ -145,6 +152,48 @@ u_desktop_fake_op_count(struct u_desktop_fake *f);
 
 void
 u_desktop_fake_clear_log(struct u_desktop_fake *f);
+
+// --- contract v2 knobs ---------------------------------------------------------
+
+/*!
+ * Called before every injection batch (outside the fake's lock — it may change
+ * the desktop or the store): @p op is "prepare", "type", "key", "press",
+ * "scroll" or "window_op"; @p index counts batches within the call.
+ */
+typedef void (*u_desktop_fake_batch_fn)(void *ctx, const char *op, uint32_t index);
+
+void
+u_desktop_fake_set_batch_hook(struct u_desktop_fake *f, u_desktop_fake_batch_fn fn, void *ctx);
+
+//! false: our injections do not reset the idle counter (macOS HID idle). Default true.
+void
+u_desktop_fake_set_injection_is_input(struct u_desktop_fake *f, bool counts);
+
+//! Bit per enum u_desktop_button currently held down.
+uint32_t
+u_desktop_fake_pressed_buttons(struct u_desktop_fake *f);
+
+//! How often prepare_input was called.
+uint32_t
+u_desktop_fake_prepare_count(struct u_desktop_fake *f);
+
+//! Every action-path call (prepare, window op, text, chord, move, button, scroll).
+uint32_t
+u_desktop_fake_action_calls(struct u_desktop_fake *f);
+
+struct u_desktop_fake_orphan
+{
+	u_desktop_access_done_fn done;
+	void *ctx;
+};
+
+/*!
+ * Test-only contract BREAK: on destroy, a consent answer still owed is NOT
+ * delivered but stored in @p orphan, so a test can deliver it after the control
+ * object is gone (the common layer must survive that).
+ */
+void
+u_desktop_fake_set_orphan_on_destroy(struct u_desktop_fake *f, struct u_desktop_fake_orphan *orphan);
 
 #ifdef __cplusplus
 }

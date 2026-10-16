@@ -10,6 +10,8 @@
 
 #include "xrt/xrt_config_os.h"
 
+#include "util/u_logging.h"
+
 #include <cjson/cJSON.h>
 
 #include <stdio.h>
@@ -26,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -340,10 +343,21 @@ static bool
 override_dir(char *out, size_t cap)
 {
 #ifdef XRT_OS_WINDOWS
-	return env_u8(L"" U_DESKTOP_POLICY_DIR_ENV, out, cap);
+	bool on = env_u8(L"" U_DESKTOP_POLICY_DIR_ENV, out, cap);
 #else
-	return env_u8(U_DESKTOP_POLICY_DIR_ENV, out, cap);
+	bool on = env_u8(U_DESKTOP_POLICY_DIR_ENV, out, cap);
 #endif
+	// The override moves the kill switch and every deny somewhere else: say so,
+	// once per process (a benign race on the flag at worst logs it twice).
+	static bool warned = false;
+	if (on && !warned) {
+		warned = true;
+		U_LOG_W(
+		    "desktop_control: %s is set - the desktop-control store and audit log are in %s, not the "
+		    "user's (the user's kill switch and denies do not apply to this process)",
+		    U_DESKTOP_POLICY_DIR_ENV, out);
+	}
+	return on;
 }
 
 static bool
@@ -458,6 +472,8 @@ struct u_desktop_policy
 	bool have_path;
 	struct file_stamp stamp;
 	bool loaded_once;
+	bool have_good;  //!< a good (or missing = defaults) read happened in this process
+	bool unreadable; //!< the file exists, cannot be parsed, and there is no good read to keep
 	bool suspended;
 	uint32_t idle_ms;
 	cJSON *apps; //!< owned object: exe -> "allow" | "deny"
@@ -508,20 +524,105 @@ policy_from_json(struct u_desktop_policy *p, const cJSON *root)
 	}
 }
 
-static cJSON *
-load_root(const char *path)
+enum load_status
 {
+	LOAD_MISSING, //!< no file: defaults
+	LOAD_OK,
+	LOAD_CORRUPT, //!< exists but cannot be read / parsed: NEVER defaults (spec §6.1)
+};
+
+static cJSON *
+load_root_status(const char *path, enum load_status *out_status)
+{
+	*out_status = LOAD_MISSING;
+	if (!file_get_stamp(path).exists) {
+		return NULL;
+	}
 	char *txt = read_whole(path, NULL);
 	if (txt == NULL) {
+		*out_status = LOAD_CORRUPT;
 		return NULL;
 	}
 	cJSON *root = cJSON_Parse(txt);
 	free(txt);
-	if (root != NULL && !cJSON_IsObject(root)) {
+	if (root == NULL || !cJSON_IsObject(root)) {
 		cJSON_Delete(root);
-		root = NULL;
+		*out_status = LOAD_CORRUPT;
+		return NULL;
 	}
+	*out_status = LOAD_OK;
 	return root;
+}
+
+
+/*
+ *
+ * Cross-process lock around every read-modify-write: `<store>.lock`.
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+typedef HANDLE store_lock_t;
+#define STORE_LOCK_NONE INVALID_HANDLE_VALUE
+#else
+typedef int store_lock_t;
+#define STORE_LOCK_NONE (-1)
+#endif
+
+static store_lock_t
+store_lock(const char *store_path)
+{
+	char lp[PATH_CAP + 8];
+	snprintf(lp, sizeof(lp), "%s.lock", store_path);
+	make_parent_dirs(lp);
+#ifdef XRT_OS_WINDOWS
+	wchar_t *w = u8_to_w(lp);
+	if (w == NULL) {
+		return STORE_LOCK_NONE;
+	}
+	HANDLE h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	free(w);
+	if (h == INVALID_HANDLE_VALUE) {
+		return STORE_LOCK_NONE;
+	}
+	OVERLAPPED ov;
+	memset(&ov, 0, sizeof(ov));
+	if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+		CloseHandle(h);
+		return STORE_LOCK_NONE;
+	}
+	return h;
+#else
+	int fd = open(lp, O_RDWR | O_CREAT, 0600);
+	if (fd < 0) {
+		return STORE_LOCK_NONE;
+	}
+	while (flock(fd, LOCK_EX) != 0) {
+		if (errno != EINTR) {
+			close(fd);
+			return STORE_LOCK_NONE;
+		}
+	}
+	return fd;
+#endif
+}
+
+static void
+store_unlock(store_lock_t l)
+{
+	if (l == STORE_LOCK_NONE) {
+		return;
+	}
+#ifdef XRT_OS_WINDOWS
+	OVERLAPPED ov;
+	memset(&ov, 0, sizeof(ov));
+	UnlockFileEx(l, 0, 1, 0, &ov);
+	CloseHandle(l);
+#else
+	flock(l, LOCK_UN);
+	close(l);
+#endif
 }
 
 static bool
@@ -623,16 +724,37 @@ u_desktop_policy_refresh(struct u_desktop_policy *p)
 	}
 	p->stamp = now;
 	p->loaded_once = true;
-	cJSON *root = now.exists ? load_root(p->path) : NULL;
+	enum load_status st;
+	cJSON *root = load_root_status(p->path, &st);
+	if (st == LOAD_CORRUPT) {
+		// Never defaults: that would silently drop the kill switch and every
+		// deny. Keep the last good policy; with none, fail closed.
+		if (!p->have_good && !p->unreadable) {
+			U_LOG_W(
+			    "desktop_control: %s cannot be parsed - desktop control is suspended until it is "
+			    "fixed or removed",
+			    p->path);
+		}
+		p->unreadable = !p->have_good;
+		return true;
+	}
 	policy_from_json(p, root);
 	cJSON_Delete(root);
+	p->have_good = true;
+	p->unreadable = false;
 	return true;
+}
+
+bool
+u_desktop_policy_is_unreadable(const struct u_desktop_policy *p)
+{
+	return p != NULL && p->unreadable;
 }
 
 bool
 u_desktop_policy_is_suspended(const struct u_desktop_policy *p)
 {
-	return p != NULL && p->suspended;
+	return p != NULL && (p->suspended || p->unreadable);
 }
 
 uint32_t
@@ -698,8 +820,18 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 	if (!u_desktop_policy_store_path(path, sizeof(path))) {
 		return false;
 	}
-	cJSON *root = normalised_root(load_root(path));
+	store_lock_t lk = store_lock(path);
+	enum load_status st;
+	cJSON *loaded = load_root_status(path, &st); // re-read UNDER the lock
+	if (st == LOAD_CORRUPT) {
+		// Writing over it would turn its kill switch / denies into defaults.
+		U_LOG_W("desktop_control: %s cannot be parsed - not changing it (fix or remove the file)", path);
+		store_unlock(lk);
+		return false;
+	}
+	cJSON *root = normalised_root(loaded);
 	if (root == NULL) {
+		store_unlock(lk);
 		return false;
 	}
 	cJSON *apps = cJSON_GetObjectItemCaseSensitive(root, "apps");
@@ -719,6 +851,7 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 	}
 	bool ok = save_root_atomic(path, root);
 	cJSON_Delete(root);
+	store_unlock(lk);
 
 	if (ok && (d != U_DESKTOP_APP_NONE || removed)) {
 		struct u_desktop_audit_record r;
@@ -740,15 +873,35 @@ u_desktop_policy_set_suspended(bool suspended, const char *by)
 	if (!u_desktop_policy_store_path(path, sizeof(path))) {
 		return false;
 	}
-	cJSON *root = normalised_root(load_root(path));
+	store_lock_t lk = store_lock(path);
+	enum load_status st;
+	cJSON *loaded = load_root_status(path, &st); // re-read UNDER the lock
+	if (st == LOAD_CORRUPT) {
+		if (!suspended) {
+			// Resuming over an unreadable file would mean "defaults": refuse.
+			U_LOG_W("desktop_control: %s cannot be parsed - not resuming (fix or remove the file)", path);
+			store_unlock(lk);
+			return false;
+		}
+		// The kill switch must always work: keep the damaged file aside for the
+		// user and write a fresh, suspended store.
+		char aside[PATH_CAP + 16];
+		snprintf(aside, sizeof(aside), "%s.corrupt", path);
+		file_rename_replace(path, aside);
+		U_LOG_W("desktop_control: %s could not be parsed - moved to %s; writing a suspended store", path,
+		        aside);
+	}
+	cJSON *root = normalised_root(loaded);
 	if (root == NULL) {
+		store_unlock(lk);
 		return false;
 	}
-	bool was = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "suspended"));
+	bool was = st == LOAD_CORRUPT ? false : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "suspended"));
 	cJSON_DeleteItemFromObjectCaseSensitive(root, "suspended");
 	cJSON_AddBoolToObject(root, "suspended", suspended);
 	bool ok = save_root_atomic(path, root);
 	cJSON_Delete(root);
+	store_unlock(lk);
 
 	if (ok && was != suspended) {
 		struct u_desktop_audit_record r;
