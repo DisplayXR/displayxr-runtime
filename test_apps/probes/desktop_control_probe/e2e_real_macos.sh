@@ -15,6 +15,14 @@ BUILD=$(cd "${1:?runtime build dir}" && pwd)
 PROBE=${2:?desktop_control_probe binary}
 SMOKE=$BUILD/src/xrt/auxiliary/desktop/desktop_backend_smoke
 CLI=$BUILD/src/xrt/targets/cli/displayxr-cli
+# Only on an idle machine: this test takes focus and types. A person using the Mac
+# would have their keystrokes land in the scratch documents, and their focus changes
+# make the safety layer (correctly) refuse. DXR_E2E_FORCE=1 skips the check.
+idle=$("$SMOKE" info | sed -nE 's/.*idle=([0-9]+) ms.*/\1/p')
+if [ "${DXR_E2E_FORCE:-0}" != 1 ] && [ "${idle:-0}" -lt 60000 ]; then
+	echo "refusing: someone is using this Mac (idle ${idle:-?} ms < 60 s). Run it unattended."
+	exit 3
+fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
