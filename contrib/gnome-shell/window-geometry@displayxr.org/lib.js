@@ -230,9 +230,12 @@
 //                                           // this to go false.
 //       "minimized": false,                 // ext v15+: minimized (by the app,
 //                                           // the user or the dock)
-//       "above": false                      // ext v15+: kept above other
+//       "above": false,                     // ext v15+: kept above other
 //                                           // windows (SetKeepAbove, or the
 //                                           // user's "Always on Top")
+//       "maximized": false,                 // ext v16+: maximized both ways
+//                                           // (half-tiled is not)
+//       "fullscreen": false                 // ext v16+
 //     }, ...
 //   ]
 // }
@@ -1107,6 +1110,16 @@
         parentOf(win) {
             const parent = win.get_transient_for?.();
             return parent ? {parent_id: Number(parent.get_id())} : {};
+        },
+
+        //! Maximized in both directions (half-tiled is not). mutter 49+ has
+        //! is_maximized(); older ones get_maximized(), the MaximizeFlags.
+        isMaximized(win, Meta) {
+            if (typeof win.is_maximized === 'function')
+                return win.is_maximized() === true;
+            if (typeof win.get_maximized === 'function')
+                return win.get_maximized() === Meta.MaximizeFlags.BOTH;
+            return false;
         },
 
         //! Whether (x, y) is on a monitor (@p rects: their [x, y, w, h]); a point
@@ -3538,6 +3551,8 @@
                     moving: win === this._grabbedWindow,
                     minimized: win.minimized === true,
                     above: win.is_above(),
+                    maximized: PointerPick.isMaximized(win, Meta),
+                    fullscreen: win.is_fullscreen() === true,
                     ...PointerPick.parentOf(win),
                 };
             }

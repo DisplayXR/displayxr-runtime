@@ -1542,7 +1542,10 @@ mutter's window id (`Meta.Window.get_id()`), unique and stable for the window's
 lifetime (a client that recreates its toplevel gets a new one). It is an
 **unsigned 64-bit** number and is above INT32_MAX in about half of all sessions:
 read it as int64 or double, never as a 32-bit int. A transient window (a popup, a
-dialog) also has `parent_id`. Additive; the schema stays `version: 1`.
+dialog) also has `parent_id`. Every entry also says `maximized` (both ways; a
+half-tiled window is not) and `fullscreen`, so a client that sends the user's
+maximize toggle (mutter's `toggle-maximized`) knows which way it will go. Additive;
+the schema stays `version: 1`.
 
 The hit is found the way a click is: `global.stage.get_actor_at_pos(REACTIVE)` —
 the same reactive pick mutter uses for Wayland pointer focus — then the first

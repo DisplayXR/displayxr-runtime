@@ -20,7 +20,8 @@
 //      window before mutter 49) count as the desktop; an app window does not.
 //   4. Points on no monitor (beside a smaller monitor, negative) are outside.
 //   5. parent_id for a transient window (a popup), nothing otherwise.
-//   6. The reply: locked -> nothing but {version, locked}; otherwise the point,
+//   6. maximized: is_maximized() (mutter 49+) or get_maximized() == BOTH.
+//   7. The reply: locked -> nothing but {version, locked}; otherwise the point,
 //      the layout mode when known, `over`, and the window entry.
 'use strict';
 
@@ -108,7 +109,18 @@ print('5. parent_id');
     check(Object.keys(PP.parentOf({get_transient_for: () => null})).length === 0, 'a toplevel: nothing');
 }
 
-print('6. the reply');
+print('6. maximized');
+{
+    const M = {MaximizeFlags: {HORIZONTAL: 1, VERTICAL: 2, BOTH: 3}};
+    check(PP.isMaximized({is_maximized: () => true}, M) && !PP.isMaximized({is_maximized: () => false}, M),
+        'mutter 49+: is_maximized()');
+    check(PP.isMaximized({get_maximized: () => 3}, M), 'older mutter: get_maximized() BOTH');
+    check(!PP.isMaximized({get_maximized: () => 2}, M) && !PP.isMaximized({get_maximized: () => 0}, M),
+        'older mutter: one direction (half-tiled) or none is not maximized');
+    check(!PP.isMaximized({}, M), 'neither method: not maximized');
+}
+
+print('7. the reply');
 {
     const r = PP.reply({locked: true});
     check(r.version === 1 && r.locked === true && r.x === undefined && r.window === undefined,
