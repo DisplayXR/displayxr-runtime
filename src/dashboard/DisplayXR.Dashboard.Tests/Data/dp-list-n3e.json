@@ -1,0 +1,39 @@
+{
+ "preferred": "sim-display",
+ "policy": {
+  "policy_lock": false
+ },
+ "plugins": [
+  {
+   "id": "sim-display",
+   "display_name": "DisplayXR Sim Display",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 200,
+   "binary_path": "/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\a485959e1a54679aa7b70426e3d5767e1a5bf8ca7ed5279566402ef9608d183c)",
+   "signer": "",
+   "active": true,
+   "preferred": true
+  },
+  {
+   "id": "sim-display-b",
+   "display_name": "DisplayXR Sim Display (copy)",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 300,
+   "binary_path": "/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib",
+   "enabled": false,
+   "enabled_source": "manifest",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\a485959e1a54679aa7b70426e3d5767e1a5bf8ca7ed5279566402ef9608d183c)",
+   "signer": "",
+   "active": false,
+   "preferred": false
+  }
+ ],
+ "screens": []
+}

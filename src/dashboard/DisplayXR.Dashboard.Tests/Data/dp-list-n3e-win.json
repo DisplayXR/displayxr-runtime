@@ -1,0 +1,39 @@
+{
+ "preferred": "leia-sr",
+ "policy": {
+  "policy_lock": false
+ },
+ "plugins": [
+  {
+   "id": "sim-display",
+   "display_name": "DisplayXR Sim Display",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 200,
+   "binary_path": "/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib",
+   "enabled": false,
+   "enabled_source": "user",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\a485959e1a54679aa7b70426e3d5767e1a5bf8ca7ed5279566402ef9608d183c)",
+   "signer": "",
+   "active": false,
+   "preferred": false
+  },
+  {
+   "id": "leia-sr",
+   "display_name": "Leia SR",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 300,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Plugins\\LeiaSR\\DisplayXR-LeiaSR.dll",
+   "enabled": false,
+   "enabled_source": "machine",
+   "provenance": "signed",
+   "provenance_reason": "",
+   "signer": "Leia, Inc.",
+   "active": false,
+   "preferred": true
+  }
+ ],
+ "screens": []
+}

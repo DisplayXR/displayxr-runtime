@@ -1,0 +1,39 @@
+{
+ "force_qwerty": false,
+ "preferred": "sim-input",
+ "policy": {
+  "policy_lock": true
+ },
+ "providers": [
+  {
+   "id": "sim-input",
+   "display_name": "DisplayXR Sim Input",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 200,
+   "binary_path": "/usr/lib/displayxr/plugins/DisplayXR-SimInput.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\cce9a9a724db51c9d45157dbce0ad40b90a288ae70544dbcf11d0a5e7452ad13)",
+   "signer": "",
+   "preferred": true,
+   "active": true
+  },
+  {
+   "id": "sim-input-b",
+   "display_name": "DisplayXR Sim Input (copy)",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 300,
+   "binary_path": "/usr/lib/displayxr/plugins/DisplayXR-SimInput.dylib",
+   "enabled": false,
+   "enabled_source": "machine",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\cce9a9a724db51c9d45157dbce0ad40b90a288ae70544dbcf11d0a5e7452ad13)",
+   "signer": "",
+   "preferred": false,
+   "active": false
+  }
+ ]
+}
