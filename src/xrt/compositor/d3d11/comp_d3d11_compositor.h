@@ -198,8 +198,9 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 /*!
  * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
- * the DP's own target-time slot when it has one, else this compositor's ring
- * of per-frame answers sampled at @p target_ns, else the "latest" answer.
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
  *
  * @param xc          The compositor.
  * @param target_ns   When the pixels will be seen (monotonic ns).

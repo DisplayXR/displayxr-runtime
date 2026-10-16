@@ -835,8 +835,9 @@ struct xrt_display_processor_d3d11
 	 *
 	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
 	 * runtime falls back to @ref get_predicted_eye_positions ("now + the
-	 * vendor's default horizon") and samples that at the target itself
-	 * through a trunk-side ring (util/u_eye_history.h). Appended after
+	 * vendor's default horizon") and uses that answer UNCHANGED — today's
+	 * behaviour; implementing the slot opts in to display-time sampling.
+	 * Appended after
 	 * @ref lift_get_depth per ADR-020 (append-only within a major; no
 	 * version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
 	 * XRT_DP_D3D11_HAS_EYE_POSITIONS_AT.
@@ -1617,8 +1618,8 @@ xrt_display_processor_d3d11_set_present_origin(struct xrt_display_processor_d3d1
 /*!
  * Does this DP answer a target-time eye query itself (the
  * @ref xrt_display_processor_d3d11::get_eye_positions_at slot is present and
- * non-NULL)? When not, the trunk samples its own ring at the target instead of
- * trusting the fallback's horizon.
+ * non-NULL)? When not, the trunk uses the DP's
+ * get_predicted_eye_positions answer unchanged (no display-time sampling).
  *
  * @public @memberof xrt_display_processor_d3d11
  */

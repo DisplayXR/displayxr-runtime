@@ -32918,8 +32918,8 @@ svc_conv_eyes_key(const struct xrt_display_processor_d3d11 *dp)
  * processor this service asks for eyes. Every answer published below (the
  * per-client locate queries AND the render thread's per-frame viewer publish
  * in multi_compositor_render) is pushed into the answering DP's ring, keyed
- * by the time it was asked, so a DP without the target-time slot can still be
- * sampled at a client's display time. A small fixed table, not a map: a DP
+ * by the time it was asked. It is read (clamped) only when a DP's own
+ * target-time slot fails; a DP without the slot keeps its "latest" answer. A small fixed table, not a map: a DP
  * destroyed without a retire (a panel DP swap) just ages out of its slot,
  * the least-recently-fed slot is reused, and a lost ring only costs the
  * fallback to the "latest" answer.
@@ -33125,17 +33125,22 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_sys
 		return false;
 	}
 
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (already vendor-predicted; sampling it again at the target
+	// would double the horizon). Only a DP that HAS the slot gets display-time
+	// sampling; if that slot fails, the DP's ring is read at the target
+	// CLAMPED to its newest sample (never extrapolated).
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	uint64_t key = 0;
+	bool has = false;
 	{
 		// Same lock + DP resolution as the "latest" query (#363, #625).
 		render_mutex_fair_lock render_lock(sys);
 		struct xrt_display_processor_d3d11 *dp = resolve_eye_display_processor(sys, xc);
-		if (dp != nullptr) {
+		has = dp != nullptr && xrt_display_processor_d3d11_has_eye_positions_at(dp);
+		if (has) {
 			key = svc_conv_eyes_key(dp);
-		}
-		// The DP's own target-time slot when it has one ...
-		if (dp != nullptr && xrt_display_processor_d3d11_has_eye_positions_at(dp)) {
 			U_ZERO(out_eyes);
 			if (xc != nullptr && xc->destroy == compositor_destroy) {
 				d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.store(key,
@@ -33149,16 +33154,20 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_sys
 				    "(target = now %+.1f ms)",
 				    (double)(target_ns - (int64_t)os_monotonic_get_ns()) / 1e6);
 			}
-			return xrt_display_processor_d3d11_get_eye_positions_at(dp, target_ns, out_eyes) &&
-			       out_eyes->valid;
+			if (xrt_display_processor_d3d11_get_eye_positions_at(dp, target_ns, out_eyes) &&
+			    out_eyes->valid) {
+				return true;
+			}
 		}
 	}
-	// ... else that DP's ring of published answers sampled at the target ...
-	struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/false, 0);
-	if (h != nullptr && u_eye_history_get(h, target_ns, out_eyes) != U_EYE_HISTORY_RESULT_EMPTY) {
-		return out_eyes->valid;
+	if (has) {
+		struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/false, 0);
+		if (h != nullptr && u_eye_history_get_clamped(h, target_ns, out_eyes) != U_EYE_HISTORY_RESULT_EMPTY) {
+			return out_eyes->valid;
+		}
 	}
-	// ... else the "latest" answer (which primes the ring).
+	// No slot (or nothing in the ring): the DP's own "latest" answer,
+	// unchanged — which also feeds the ring.
 	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, out_eyes);
 }
 

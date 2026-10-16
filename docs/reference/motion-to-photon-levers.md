@@ -665,11 +665,12 @@ app renders for used to be "the vendor's latest prediction" — now + a horizon 
 see — so the rendered pair and the woven pair could disagree by however far the app's
 `displayTime` was from that horizon. `xrLocateViews` now passes the frame's `displayTime`
 (monotonic) down to the DP's optional `get_eye_positions_at` slot — in-process, and over IPC to the
-service, which answers from that client's DP. A DP without the slot is sampled through the
-trunk's eye ring (`u_eye_history`: interpolate / extrapolate ≤ 50 ms / stale after 500 ms), keyed
-by when each answer was asked — which treats the vendor's own horizon as zero, so that path's
-residual is the vendor horizon. No env var: the target is the app's own `displayTime`, so
-anything that moves `xrWaitFrame`'s predicted display time moves the eyes with it. Server-side
+service, which answers from that client's DP. **A DP without the slot keeps today's latest-answer
+behaviour; implementing the slot opts in to display-time sampling** — the runtime never
+re-extrapolates an answer the vendor already predicted (that would double the horizon). The
+trunk's eye ring (`u_eye_history`) is read only when an implemented slot fails, and then clamped
+to its newest sample. No env var: the target is the app's own `displayTime`, so anything that
+moves `xrWaitFrame`'s predicted display time moves a slot-implementing DP's eyes with it. Server-side
 weave-time queries (the weave engines' own per-frame eye reads) still use "latest" — Part 1b.
 
 ### Adjacent levers that change the picture

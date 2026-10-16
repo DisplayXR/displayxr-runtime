@@ -800,8 +800,8 @@ struct xrt_display_processor_vk
 	 *
 	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
 	 * the runtime falls back to the base's get_predicted_eye_positions ("now
-	 * + the vendor's default horizon") and samples that at the target itself
-	 * through a trunk-side ring (util/u_eye_history.h). Appended after
+	 * + the vendor\'s default horizon") and uses that answer UNCHANGED —
+	 * today\'s behaviour; implementing the slot opts in. Appended after
 	 * @ref set_weave_sync per ADR-020 (append-only within a major; no
 	 * version bump), announced by XRT_DP_VK_HAS_EYE_POSITIONS_AT.
 	 *
@@ -1530,8 +1530,8 @@ xrt_display_processor_vk_set_weave_sync(struct xrt_display_processor_vk *xdp,
 /*!
  * Does this DP answer a target-time eye query itself (the
  * @ref xrt_display_processor_vk::get_eye_positions_at slot is covered by the
- * plug-in's `base.struct_size` and non-NULL)? When not, the trunk samples its
- * own ring at the target instead of trusting the fallback's horizon.
+ * plug-in's `base.struct_size` and non-NULL)? When not, the trunk uses the
+ * DP's get_predicted_eye_positions answer unchanged (no display-time sampling).
  *
  * @public @memberof xrt_display_processor_vk
  */

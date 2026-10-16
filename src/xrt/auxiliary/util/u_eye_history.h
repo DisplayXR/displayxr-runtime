@@ -154,6 +154,18 @@ enum u_eye_history_result
 u_eye_history_get(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_positions *out);
 
 /*!
+ * As @ref u_eye_history_get, but NEVER predicts: a target past the newest
+ * sample returns that sample (@ref U_EYE_HISTORY_RESULT_LATEST, or STALE
+ * past the max age), never an extrapolation. Interpolation between samples
+ * and the before-oldest clamp are unchanged. This is what the compositors use
+ * when a DP's target-time slot fails — its ring holds already-predicted
+ * answers, so predicting them again would double the vendor's horizon.
+ * @public @memberof u_eye_history
+ */
+enum u_eye_history_result
+u_eye_history_get_clamped(struct u_eye_history *h, int64_t target_ns, struct xrt_eye_positions *out);
+
+/*!
  * The newest kept sample, if any.
  * @param[out] out_ts_ns  Its time (may be NULL).
  * @param[out] out        Its eyes (may be NULL).

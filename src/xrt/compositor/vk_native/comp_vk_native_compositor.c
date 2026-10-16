@@ -863,9 +863,10 @@ struct comp_vk_native_compositor
 
 	/*!
 	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
-	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here, so a
-	 * DP without the target-time slot can still be sampled at a display
-	 * time (interpolate / extrapolate / stale) instead of "latest".
+	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
 	 */
 	struct u_eye_history eye_hist;
 
@@ -3607,31 +3608,39 @@ vk_dp_predicted_eyes(struct comp_vk_native_compositor *c, struct xrt_eye_positio
 
 /*!
  * N6 Part 1 (#2144): the eyes for @p target_ns — the DP's own target-time
- * slot when it has one, else this compositor's ring (fed by every per-frame
- * query above) sampled at the target, else the plain "latest" answer.
+ * slot when it has one (if it fails, this compositor's ring — fed by every
+ * per-frame query above — read at the target, clamped); a DP without the
+ * slot gets its plain "latest" answer unchanged.
  */
 static bool
 vk_dp_eyes_at(struct comp_vk_native_compositor *c, int64_t target_ns, struct xrt_eye_positions *out_eye_pos)
 {
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	bool has = false;
+	bool ok = false;
 #ifdef XRT_OS_WINDOWS
 	if (c->split == NULL) {
 		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
 		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
-		const bool has = xrt_display_processor_vk_has_eye_positions_at(vdp);
-		const bool ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
+		has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+		ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
 		os_mutex_unlock(&c->dp_swap_mutex);
-		if (has) {
-			return ok;
-		}
 	}
 #else
 	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
-	if (xrt_display_processor_vk_has_eye_positions_at(vdp)) {
-		return xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
-	}
+	has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+	ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
 #endif
-	if (u_eye_history_get(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+	if (ok && out_eye_pos->valid) {
 		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
 	}
 	return vk_dp_predicted_eyes(c, out_eye_pos);
 }

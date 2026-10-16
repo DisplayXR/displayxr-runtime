@@ -280,9 +280,10 @@ struct comp_metal_compositor
 	struct xrt_display_processor_metal *display_processor;
 	/*!
 	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
-	 * (the post-process_atlas cache, the HUD, xrLocateViews) is pushed here,
-	 * so a DP without the target-time slot can still be sampled at a display
-	 * time (interpolate / extrapolate / stale) instead of "latest".
+	 * (the post-process_atlas cache, the HUD, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
 	 */
 	struct u_eye_history eye_hist;
 
@@ -7050,16 +7051,20 @@ comp_metal_compositor_get_eye_positions_at(struct xrt_compositor *xc,
                                            struct xrt_eye_positions *out_eye_pos)
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
-	// The DP's own target-time slot when it has one ...
-	if (xrt_display_processor_metal_has_eye_positions_at(c->display_processor)) {
-		return xrt_display_processor_metal_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
-		       out_eye_pos->valid;
-	}
-	// ... else the ring of per-frame answers sampled at the target ...
-	if (u_eye_history_get(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	const bool has = xrt_display_processor_metal_has_eye_positions_at(c->display_processor);
+	if (has && xrt_display_processor_metal_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
+	    out_eye_pos->valid) {
 		return true;
 	}
-	// ... else the plain "latest" answer (which primes the ring).
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
 	return comp_metal_compositor_get_predicted_eye_positions(xc, out_eye_pos) && out_eye_pos->valid;
 }
 
