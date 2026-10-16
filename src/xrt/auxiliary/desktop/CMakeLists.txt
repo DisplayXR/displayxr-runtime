@@ -36,9 +36,13 @@ elseif(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_DBUS)
 	# GNOME Wayland: RemoteDesktop portal + libei (dlopen'd: no DT_NEEDED, libei is
 	# absent on Ubuntu 22.04 and is not on package_deb_linux.sh's STABLE_SONAMES),
 	# the DisplayXR GNOME extension (read-only, v16) and AT-SPI, all over libdbus.
-	target_sources(aux_desktop PRIVATE u_desktop_gnome.c)
+	target_sources(
+		aux_desktop PRIVATE u_desktop_gnome.c u_desktop_gnome.h u_desktop_gnome_portal.c u_desktop_gnome_atspi.c
+		u_desktop_gnome_libs.c u_desktop_gnome_libs.h u_desktop_gnome_input.c u_desktop_gnome_portal_priv.h
+		u_desktop_gnome_windows.c
+		)
 	target_include_directories(aux_desktop SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
-	target_link_libraries(aux_desktop PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS})
+	target_link_libraries(aux_desktop PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT})
 else()
 	target_sources(aux_desktop PRIVATE u_desktop_none.c)
 endif()
