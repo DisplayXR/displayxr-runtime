@@ -660,6 +660,18 @@ change in real present latency is largely self-correcting without any runtime kn
 the DP thinks it means when `DXR_DEFER_PRESENT` moves the present into the following call. Nothing
 moves the present any more. Re-open it only if a deferred-present mechanism is ever reintroduced.
 
+**Look-around eyes are asked for at the display time (ADR-054 N6 Part 1, #2144).** The eyes an
+app renders for used to be "the vendor's latest prediction" — now + a horizon the caller could not
+see — so the rendered pair and the woven pair could disagree by however far the app's
+`displayTime` was from that horizon. `xrLocateViews` now passes the frame's `displayTime`
+(monotonic) down to the DP's optional `get_eye_positions_at` slot — in-process, and over IPC to the
+service, which answers from that client's DP. A DP without the slot is sampled through the
+trunk's eye ring (`u_eye_history`: interpolate / extrapolate ≤ 50 ms / stale after 500 ms), keyed
+by when each answer was asked — which treats the vendor's own horizon as zero, so that path's
+residual is the vendor horizon. No env var: the target is the app's own `displayTime`, so
+anything that moves `xrWaitFrame`'s predicted display time moves the eyes with it. Server-side
+weave-time queries (the weave engines' own per-frame eye reads) still use "latest" — Part 1b.
+
 ### Adjacent levers that change the picture
 
 | Lever | Default | Note |

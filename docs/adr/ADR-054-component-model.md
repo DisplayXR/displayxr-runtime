@@ -145,6 +145,14 @@ webcam tracker merged in PR #1914 (`src/xrt/drivers/sim_display/sim_display_webc
 the contract lands. There is **no `set_viewer_eyes` slot on the DP**: the trunk never pushes
 eyes into a display processor; a DP that weaves from eyes tracks them itself.
 
+> **Implemented — N6 Part 1 landed in #2166 (2026-10).** The DP eye query gained the target-time
+> slot `get_eye_positions_at(target_ns)` on all five per-API vtables (ADR-020 append-only, ABI
+> unchanged, `XRT_DP_<API>_HAS_EYE_POSITIONS_AT`), the trunk keeps the eye-pair ring
+> (`util/u_eye_history.h`) every compositor samples at its target, and `xrLocateViews` asks for the
+> frame's `displayTime` in-process and over IPC. Contract:
+> [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
+> Part 2 (the tracking-provider class, `sim_tracking`) is still open (#2144).
+
 **4.2 Display profile slot / reference weaver — NO, ever.** Pitch, slant and phase describe
 one lens family. Parallax barriers, directional backlights, glasses-based and volumetric
 displays have none of them, and a "reference weaver" in the trunk would be a lenticular
