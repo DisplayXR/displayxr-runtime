@@ -2147,6 +2147,17 @@ mac_window_op(struct u_desktop_backend *b,
 
 	AXUIElementRef el = NULL;
 	if (!ax_window_for(m, pid, wid, AX_ACTION_TIMEOUT_S, true, &el, NULL)) {
+		// A window that is closing leaves AX first and CGWindowList a moment later
+		// (up to a few hundred ms): give it that long before calling it unreachable.
+		for (int i = 0; i < 12; i++) {
+			CFDictionaryRef again = cg_window_info(wid);
+			if (again == NULL) {
+				set_msg(msg, "the target window no longer exists");
+				return U_DESKTOP_ERR_WINDOW_LOST;
+			}
+			CFRelease(again);
+			sleep_ms(25);
+		}
 		set_msg(msg, "window not reachable through Accessibility (another Space, or the app has no AX)");
 		return U_DESKTOP_ERR_FAILED;
 	}
@@ -2185,7 +2196,16 @@ mac_window_op(struct u_desktop_backend *b,
 			sleep_ms(25);
 		}
 		if (r != U_DESKTOP_OK) {
-			set_msg(msg, "the window did not take focus within 500 ms");
+			// A window that is closing (CLOSE is asynchronous: it can still be listed
+			// for a moment) never takes focus — report that as what it is.
+			CFDictionaryRef still = cg_window_info(wid);
+			if (still == NULL) {
+				set_msg(msg, "the target window no longer exists");
+				r = U_DESKTOP_ERR_WINDOW_LOST;
+			} else {
+				CFRelease(still);
+				set_msg(msg, "the window did not take focus within 500 ms");
+			}
 		}
 		break;
 	}
@@ -2246,6 +2266,24 @@ mac_window_op(struct u_desktop_backend *b,
 			saved_put(m, wid, cur);
 		}
 		r = set_frame(el, wid, scr[s].visible, false, msg);
+		if (r == U_DESKTOP_ERR_REFUSED) {
+			// The OS (and the app) clamp a window to the TRUE visible frame, which the
+			// off-main-thread estimate (Dock from its AX list element) can overshoot
+			// by a few px; an app may also impose a maximum size. Accept the frame the
+			// window settled at when it starts at the requested origin, stays inside
+			// the requested area and covers most of it: that is maximized.
+			CGRect want = scr[s].visible, got;
+			if (ax_get_frame(el, &got) && fabs(got.origin.x - want.origin.x) <= 2 &&
+			    fabs(got.origin.y - want.origin.y) <= 2 && got.size.width <= want.size.width + 2 &&
+			    got.size.height <= want.size.height + 2 && got.size.width >= 0.85 * want.size.width &&
+			    got.size.height >= 0.85 * want.size.height) {
+				wait_cg_frame(wid, got, false);
+				if (msg != NULL) {
+					msg[0] = '\0';
+				}
+				r = U_DESKTOP_OK;
+			}
+		}
 		break;
 	}
 	case U_DESKTOP_OP_CLOSE: {
