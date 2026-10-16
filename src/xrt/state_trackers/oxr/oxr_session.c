@@ -5719,6 +5719,12 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// session across the CTS's rapid create/destroy cycling.
 	oxr_conformance_teardown(sess);
 
+#ifdef OXR_HAVE_DXR_desktop_control
+	// XR_DXR_desktop_control: join the action worker BEFORE the event drain
+	// below, so no completion / state event can land after it (spec §4).
+	oxr_desktop_control_session_fini(sess);
+#endif
+
 	XrResult ret = oxr_event_remove_session_events(log, sess);
 
 	oxr_session_binding_destroy_all(log, sess);
@@ -5753,6 +5759,9 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
 	os_mutex_destroy(&sess->view_space_offset_lock); // #1502
+#ifdef OXR_HAVE_DXR_desktop_control
+	os_mutex_destroy(&sess->desktop_control_mutex);
+#endif
 
 #ifdef OXR_HAVE_DXR_android_surface_binding
 	// Drop the reference XR_DXR_android_surface_binding took on the app's
@@ -5816,6 +5825,10 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	// is not a pose - seed the identity explicitly.
 	sess->view_space_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
 	os_mutex_init(&sess->view_space_offset_lock);
+
+#ifdef OXR_HAVE_DXR_desktop_control
+	os_mutex_init(&sess->desktop_control_mutex);
+#endif
 
 	// Debug and user options.
 	sess->ipd_meters = debug_get_num_option_ipd() / 1000.0f;

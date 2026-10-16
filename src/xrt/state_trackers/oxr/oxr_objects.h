@@ -39,6 +39,8 @@
 #include "oxr_frame_sync.h"
 #include "oxr_views_change.h"
 
+struct u_desktop_control; // XR_DXR_desktop_control (aux/desktop)
+
 #if defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12)
 #include <dxgi.h>
 #include <d3dcommon.h>
@@ -3143,6 +3145,17 @@ struct oxr_session
 	struct os_mutex view_space_offset_lock;
 	struct xrt_pose view_space_offset;
 
+#ifdef OXR_HAVE_DXR_desktop_control
+	/*!
+	 * XR_DXR_desktop_control (ADR-056): the session's common safety layer +
+	 * OS backend, created on first use (oxr_desktop_control.c) and destroyed
+	 * in session destroy BEFORE the session's events are removed. The mutex
+	 * guards only the lazy creation; the object is internally thread-safe.
+	 */
+	struct os_mutex desktop_control_mutex;
+	struct u_desktop_control *desktop_control;
+#endif
+
 #ifdef OXR_HAVE_DXR_depth_budget
 	//! XR_DXR_depth_budget: the session's transparency, remembered from
 	//! xrCreateSession. The rear-depth default is a function of it (a
@@ -4839,6 +4852,26 @@ oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
 XrResult
 oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst);
 #endif // OXR_HAVE_DXR_stereo_camera
+
+
+#ifdef OXR_HAVE_DXR_desktop_control
+//! Called from the desktop-control worker / consent thread (event queue is locked internally).
+XrResult
+oxr_event_push_XrEventDataDesktopControlStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state);
+
+XrResult
+oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
+                                                 struct oxr_session *sess,
+                                                 uint64_t actionId,
+                                                 XrResult result,
+                                                 const char *message);
+
+//! Session destroy: stop the worker, drop queued actions (no events). Before the event drain.
+void
+oxr_desktop_control_session_fini(struct oxr_session *sess);
+#endif // OXR_HAVE_DXR_desktop_control
 
 
 #ifdef OXR_HAVE_EXT_user_presence

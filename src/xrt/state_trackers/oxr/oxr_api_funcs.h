@@ -1193,6 +1193,42 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR *stats);
 #endif
 
+#ifdef OXR_HAVE_DXR_desktop_control
+//! OpenXR API function @ep{xrGetDesktopControlStateDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopControlStateDXR(XrSession session,
+                                XrDesktopControlStateDXR *state,
+                                XrDesktopControlCapabilityFlagsDXR *capabilities);
+
+//! OpenXR API function @ep{xrRequestDesktopControlDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestInfoDXR *info);
+
+//! OpenXR API function @ep{xrEnumerateDesktopWindowsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDesktopWindowsDXR(XrSession session,
+                                 uint32_t windowCapacityInput,
+                                 uint32_t *windowCountOutput,
+                                 XrDesktopWindowDXR *windows);
+
+//! OpenXR API function @ep{xrGetDesktopPointerDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopPointerDXR(XrSession session, XrDesktopPickDXR *pick);
+
+//! OpenXR API function @ep{xrPickDesktopDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrPickDesktopDXR(XrSession session, XrOffset2Di point, XrDesktopPickDXR *pick);
+
+//! OpenXR API function @ep{xrGetDesktopTextAtDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopTextAtDXR(
+    XrSession session, XrOffset2Di point, uint32_t capacityInput, uint32_t *countOutput, char *buffer);
+
+//! OpenXR API function @ep{xrSubmitDesktopActionDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action, uint64_t *actionId);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

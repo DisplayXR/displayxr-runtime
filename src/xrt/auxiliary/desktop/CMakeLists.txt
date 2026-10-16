@@ -10,6 +10,9 @@
 # app's (ADR-056 D2). Never link this into displayxr-service or displayxr-cli
 # for anything but the store / audit readers (u_desktop_policy).
 #
+# u_desktop_fake.c is an in-memory desktop compiled on every OS; it is only
+# ever selected by DXR_DESKTOP_BACKEND=fake (tests, CI, the probe's E2E run).
+#
 
 add_library(
 	aux_desktop STATIC
@@ -18,8 +21,11 @@ add_library(
 	u_desktop_chord.h
 	u_desktop_control.c
 	u_desktop_control.h
+	u_desktop_fake.c
+	u_desktop_fake.h
 	u_desktop_policy.c
 	u_desktop_policy.h
+	u_desktop_select.c
 	)
 target_link_libraries(aux_desktop PUBLIC aux-includes aux_os PRIVATE aux_util xrt-external-cjson)
 

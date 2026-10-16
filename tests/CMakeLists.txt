@@ -381,6 +381,13 @@ if(WIN32 OR APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
 	list(APPEND tests tests_conv_proxy)
 endif()
 
+# ADR-056 -- XR_DXR_desktop_control's common layer (consent state machine,
+# store + audit, queue, safety layer) end to end over the in-memory fake
+# backend. Desktop OSes only, like aux_desktop itself.
+if(TARGET aux_desktop)
+	list(APPEND tests tests_desktop_control)
+endif()
+
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
 	target_link_libraries(${testname} PRIVATE xrt-external-catch2)
@@ -391,6 +398,10 @@ endforeach()
 # For tests that require more than just aux_util, link those other libs down here.
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+
+if(TARGET tests_desktop_control)
+	target_link_libraries(tests_desktop_control PRIVATE aux_desktop)
+endif()
 
 # #1594 -- compiles oxr_layer_space.c straight into the unit and injects the
 # relations oxr_space_locate_device() would have returned, so the VIEW/LOCAL

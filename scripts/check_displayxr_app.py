@@ -72,6 +72,7 @@ RULES = {
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
     "INV-9.2": "2D icon is 512x512 (`icon`); 3D icon is 1024x512 (`icon_3d`, requires `icon`); layout in {sbs-lr,sbs-rl,tb,bt}.",
     "INV-10.1": "Apps registering MCP tools (XR_DXR_mcp_tools) declare a manifest `id` (^[a-z0-9][a-z0-9-]{0,31}$) matching the xrSetMCPAppInfoDXR appId.",
+    "INV-10.4": "Never expose desktop control (XR_DXR_desktop_control) through your MCP tools: the per-app MCP endpoint answers any local process, so a tool that lists windows, reads UI text, types or clicks hands your OS grant to all of them (ADR-056 D4). Advisory (WARN) heuristic: a source tree using both APIs is flagged; exempt with `// dxr-lint: allow-mcp-desktop <reason>` once you have checked no tool handler reaches a desktop call.",
     # --- Android pixel-exactness (§11). All no-op unless an AndroidManifest.xml is found. ---
     "INV-1.4": "(Android) Declare PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS=false — else getLocationOnScreen may go window-relative and every window weaves at the same wrong phase.",
     "INV-11.1": "(Android) resizeableActivity=true, no fixed screenOrientation, no min/maxAspectRatio — fixed activities invite invisible server-side size-compat/letterbox scaling that destroys the interlace.",
@@ -662,6 +663,45 @@ def check_mcp_pairing(root: Path, findings: list):
                                     f"xrSetMCPAppInfoDXR appId {lit!r} does not match any manifest id "
                                     f"({', '.join(sorted(set(manifest_ids.values())))}).",
                                     "Make the code and manifest agree — agents key tool names on this slug."))
+
+
+DESKTOP_CONTROL_CALLS = ("xrSubmitDesktopActionDXR", "xrEnumerateDesktopWindowsDXR", "xrGetDesktopTextAtDXR",
+                         "xrPickDesktopDXR", "xrGetDesktopPointerDXR")
+
+
+def check_mcp_desktop_control(root: Path, findings: list):
+    """INV-10.4 (advisory) — MCP tools must not re-export desktop control (ADR-056 D4).
+
+    The grant is the app's: the OS (or DisplayXR's prompt) asked the user about
+    THIS app. App MCP tools are served on an endpoint any local process can
+    call, so a tool whose handler lists windows, reads UI text, types or clicks
+    gives every process on the machine the app's grant. We cannot prove which
+    handler reaches which call, so an app using BOTH APIs gets one WARN unless
+    a source line carries `dxr-lint: allow-mcp-desktop`.
+    """
+    mcp_at = None
+    desktop_at = None
+    exempt = False
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file() or is_excluded(p, root):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "dxr-lint: allow-mcp-desktop" in text:
+            exempt = True
+        for i, line in enumerate(text.splitlines(), 1):
+            if mcp_at is None and "xrRegisterMCPToolDXR" in line:
+                mcp_at = (rel(p, root), i)
+            if desktop_at is None and any(c in line for c in DESKTOP_CONTROL_CALLS):
+                desktop_at = (rel(p, root), i)
+    if mcp_at is None or desktop_at is None or exempt:
+        return
+    findings.append(Finding(WARN, "INV-10.4", desktop_at[0], desktop_at[1],
+                            f"App uses XR_DXR_desktop_control and registers MCP tools ({mcp_at[0]}:{mcp_at[1]}).",
+                            "Make sure no MCP tool handler reaches a desktop-control call (ADR-056 D4), then add "
+                            "`// dxr-lint: allow-mcp-desktop <reason>`."))
 
 
 def check_manual_tracking_event(root: Path, findings: list):
@@ -1494,6 +1534,7 @@ def main(argv=None) -> int:
     scan_sources(root, findings)
     scan_manifests(root, findings)
     check_mcp_pairing(root, findings)
+    check_mcp_desktop_control(root, findings)
     check_manual_tracking_event(root, findings)
     check_mode_switch_easing(root, findings)
     check_views_change_realloc(root, findings)

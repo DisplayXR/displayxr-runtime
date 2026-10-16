@@ -4,7 +4,7 @@
 |---|---|
 | **Name** | `XR_DXR_desktop_control` |
 | **Spec version** | 1 |
-| **Status** | In development (ADR-056) |
+| **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. |
 | **Header** | [`XR_DXR_desktop_control.h`](../../../src/external/openxr_includes/openxr/XR_DXR_desktop_control.h) |
 | **Decision** | [ADR-056](../../adr/ADR-056-desktop-control-runs-in-the-app.md) |
 | **Code** | `src/xrt/auxiliary/desktop/` (common layer + one OS backend), `src/xrt/state_trackers/oxr/oxr_desktop_control.c` |
@@ -172,3 +172,75 @@ audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `re
 Window capture (screenshots), a DisplayXR-drawn in-use indicator on Windows / macOS and a
 global kill-switch hotkey (both planned in the service tray, as the stereo camera's §7.3–7.4),
 X11 sessions, KDE window listing, Flatpak-sandboxed apps on GNOME.
+
+## 9. Implementation notes (v1)
+
+Decisions the sections above leave open, as implemented in `u_desktop_control.c`,
+`u_desktop_policy.c` and `oxr_desktop_control.c`:
+
+**Consent (§3).**
+- `xrRequestDesktopControlDXR` returns `XR_SUCCESS` and **always** announces the outcome with a
+  state event, even when it equals the previous state: rows 1–5 announce the blocking state
+  (and do not count as "requested" — after a kill switch is lifted the state is
+  `NOT_REQUESTED`, not a stale grant); a remembered store grant announces `GRANTED`; a prompt
+  announces `PENDING` and then its answer. A request while `PENDING` is a no-op (never two prompts).
+- Row 8 vs row 9: for a `remembers_in_store` backend (Windows) the **store is the only grant** —
+  the backend's `access_status` is never consulted, so `forget` revokes at once. The in-memory
+  answer counts only if writing it to the store failed.
+- Row 9: `access_status() == GRANTED`, or `UNKNOWN` (the OS cannot tell without prompting) and
+  this session's request was answered `GRANTED`. An explicit `DENIED` (revoked) wins.
+- On Windows a "Don't allow" is written as `deny`, so the state is then `DISABLED_BY_USER`
+  (row 4), not `DENIED`, until `displayxr-cli desktop forget <exe>`.
+- `DXR_DESKTOP_CONTROL=0` is read once, when the session's desktop-control object is created
+  (first call on the session).
+- `DXR_DESKTOP_BACKEND=fake` selects an in-memory desktop (`u_desktop_fake.h`) on every OS — for
+  tests, CI and dry runs; `none` selects no backend. Neither is a user setting.
+
+**Validation (§4).** Besides the listed rules: `text` must be valid UTF-8 and at most 65 536
+bytes; `clickCount` 0–3 (0 = 1); `button` LEFT/RIGHT/MIDDLE; `SCROLL` needs a non-zero
+`scrollX`/`scrollY`, each within ±100 notches; `MOVE_RESIZE` width/height ≥ 0 (0 = keep size).
+`xrEnumerateDesktopWindowsDXR` requires `windows[i].type` to be set (OpenXR's usual array rule);
+`XrDesktopPickDXR.window` is pure output.
+
+**Text at a point.** At most 16 KiB are returned (cut on a code point).
+
+**Safety layer (§5).**
+- Before step 2 an action whose capability the backend lacks (`WINDOW_ACTIONS` / `INPUT`)
+  completes with `XR_ERROR_FEATURE_UNSUPPORTED`. Likewise a pointer action on a backend without a
+  hit test, or a keyboard action on one that cannot report focus: never delivered unverified.
+- Step 2: the kill switch, a lock or a deny that lands during the idle wait ends it at once
+  (state re-checked on every poll; default poll 50 ms). An unknown idle time (backend returns
+  false) does not wait. `idle_ms` 0 disables the wait; values above 10 000 are clamped.
+- "Our own input" is marked after every injected input call (text, keys, pointer move, button,
+  scroll). Window operations are **not** marked: on most OSes they are not input, and marking
+  them would hide real user activity for 150 ms; where a backend performs them as simulated
+  input (GNOME), the next input action merely waits `idle_ms`.
+- `CLICK`, `DRAG` and `SCROLL` move the pointer to `point` first, then re-pick, then press.
+  A pressed button is always released, whatever happens next.
+- Exact messages: `"kill switch"`, `"screen locked"`, `"disabled by the user"`,
+  `"the user is active"`, `"target is not under the point (found <app>: <title>)"` (or
+  `found the desktop` / `found the shell` / `found nothing: outside every monitor`),
+  `"target window does not have focus — ACTIVATE it first"`,
+  `"the target window no longer exists"`; success is `"ok"`. A state that is not
+  granted for any other reason completes with `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
+  `"desktop control is not granted (state <STATE>)"`.
+- Backend errors map to: `UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED`, `NOT_GRANTED` →
+  `…_NOT_GRANTED_DXR` (and the state is re-announced), `WINDOW_LOST` → `…_WINDOW_LOST_DXR`,
+  `REFUSED` → `…_REFUSED_DXR`, `TIMEOUT` / `FAILED` → `XR_ERROR_RUNTIME_FAILURE`.
+- On session destroy an action mid-flight finishes its current backend call and stops (audited
+  as `aborted`, no event).
+
+**Store and audit (§6).**
+- The store is re-read when its stamp changes: mtime (with nanoseconds), size and file identity
+  (inode / creation time) — so two writes within one mtime tick are still seen.
+- `DXR_DESKTOP_CONTROL_DIR` overrides both the store and the audit directory.
+- Audit records: `t`, `exe`, `pid`, `action`, `target` (`id`, `app`, `title`), `x`/`y` for
+  pointer actions, `chars` (code points) for `type_text`, `result`, `message` on failure,
+  `reason` on `request`, and `by` + `subject` for store changes (`allow` / `deny` / `forget` /
+  `suspended` / `resumed`, written by whoever changed the store: `cli`, `prompt`).
+- A key chord is logged only when it is a shortcut (`ctrl`, `alt` or `super` held): a bare or
+  shift-only key is a typed character, and typed text never reaches the log.
+- The audit record type has no text field at all, so the rule cannot be broken by a caller.
+
+**Probe.** `test_apps/probes/desktop_control_probe` (headless, every desktop OS) exposes every
+call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-end run.
