@@ -115,6 +115,10 @@ cmd_status(bool json)
 	if (json) {
 		cJSON *o = cJSON_CreateObject();
 		cJSON_AddBoolToObject(o, "suspended", u_desktop_policy_is_suspended(p));
+		cJSON_AddBoolToObject(o, "store_unreadable", u_desktop_policy_is_unreadable(p));
+		cJSON_AddBoolToObject(o, "dir_override",
+		                      getenv(U_DESKTOP_POLICY_DIR_ENV) != NULL &&
+		                          getenv(U_DESKTOP_POLICY_DIR_ENV)[0] != '\0');
 		cJSON_AddNumberToObject(o, "idle_ms", u_desktop_policy_idle_ms(p));
 		cJSON *apps = cJSON_AddObjectToObject(o, "apps");
 		u_desktop_policy_for_each_app(p, json_app, apps);
@@ -127,6 +131,17 @@ cmd_status(bool json)
 		cJSON_Delete(o);
 	} else {
 		printf("desktop control (XR_DXR_desktop_control, ADR-056)\n");
+		if (u_desktop_policy_is_unreadable(p)) {
+			printf(
+			    "  STORE UNREADABLE: %s cannot be parsed - every app is suspended until it is fixed or\n"
+			    "                    removed ('desktop stop' moves it aside and writes a suspended "
+			    "store)\n",
+			    store);
+		}
+		const char *ov = getenv(U_DESKTOP_POLICY_DIR_ENV);
+		if (ov != NULL && ov[0] != '\0') {
+			printf("  override:     %s=%s (not the user's store)\n", U_DESKTOP_POLICY_DIR_ENV, ov);
+		}
 		printf("  kill switch:  %s\n", u_desktop_policy_is_suspended(p)
 		                                   ? "ON - every app is refused (`displayxr-cli desktop resume`)"
 		                                   : "off");
@@ -147,7 +162,10 @@ static int
 cmd_suspend(bool suspended)
 {
 	if (!u_desktop_policy_set_suspended(suspended, "cli")) {
-		fprintf(stderr, "desktop: could not write the store\n");
+		char store[1024] = {0};
+		u_desktop_policy_store_path(store, sizeof(store));
+		fprintf(stderr, "desktop: could not write the store %s%s\n", store,
+		        suspended ? "" : " (if it cannot be parsed, fix or remove it)");
 		return 1;
 	}
 	printf(suspended ? "desktop control stopped for every app (kill switch on)\n"
@@ -167,7 +185,10 @@ cmd_app(const char *op, int argc, const char **argv)
 	                                : strcmp(op, "deny") == 0 ? U_DESKTOP_APP_DENY
 	                                                          : U_DESKTOP_APP_NONE;
 	if (!u_desktop_policy_set_app(exe, d, "cli")) {
-		fprintf(stderr, "desktop: could not write the store\n");
+		char store[1024] = {0};
+		u_desktop_policy_store_path(store, sizeof(store));
+		fprintf(stderr, "desktop: could not write the store %s (if it cannot be parsed, fix or remove it)\n",
+		        store);
 		return 1;
 	}
 	printf("%s: %s\n", op, exe);

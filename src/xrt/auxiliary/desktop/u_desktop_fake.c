@@ -61,6 +61,15 @@ struct u_desktop_fake
 	int32_t skew_x, skew_y;
 	uint64_t raise_on_move;
 
+	// contract v2 test knobs
+	u_desktop_fake_batch_fn batch_hook;
+	void *batch_hook_ctx;
+	bool injection_is_input;  //!< false: like macOS HID idle, our injections do not reset it
+	uint32_t pressed_buttons; //!< bit per enum u_desktop_button
+	uint32_t prepare_count;
+	uint32_t action_calls;
+	struct u_desktop_fake_orphan *orphan;
+
 	char log[FAKE_LOG_SIZE];
 	size_t log_len;
 	uint32_t op_count;
@@ -253,8 +262,55 @@ action_delay(struct u_desktop_fake *f)
 static void
 note_input_locked(struct u_desktop_fake *f)
 {
-	// The backend reports idle time for ANY input, ours included (u_desktop.h).
-	f->last_input_ns = os_monotonic_get_ns();
+	// The backend reports idle time for ANY input, ours included (u_desktop.h) -
+	// unless the test models an OS whose idle counter ignores synthetic input.
+	if (f->injection_is_input) {
+		f->last_input_ns = os_monotonic_get_ns();
+	}
+}
+
+//! The test's per-batch hook (outside the fake's lock: it may call back in).
+static void
+batch_hook(struct u_desktop_fake *f, const char *op, uint32_t index)
+{
+	os_mutex_lock(&f->mutex);
+	u_desktop_fake_batch_fn fn = f->batch_hook;
+	void *ctx = f->batch_hook_ctx;
+	os_mutex_unlock(&f->mutex);
+	if (fn != NULL) {
+		fn(ctx, op, index);
+	}
+}
+
+static void
+count_call(struct u_desktop_fake *f)
+{
+	os_mutex_lock(&f->mutex);
+	f->action_calls++;
+	os_mutex_unlock(&f->mutex);
+}
+
+//! Keyboard focus is the guard's target or a dialog of it (call with the mutex held).
+static bool
+focus_ok_locked(struct u_desktop_fake *f, uint64_t target)
+{
+	if (f->focus == 0) {
+		return false;
+	}
+	if (f->focus == target) {
+		return true;
+	}
+	int idx = find_index(f, f->focus);
+	return idx >= 0 && f->windows[idx].w.parent_id == target;
+}
+
+//! The pick at (x, y) is the guard's target or a dialog of it (mutex held).
+static bool
+pick_ok_locked(struct u_desktop_fake *f, uint64_t target, int32_t x, int32_t y)
+{
+	struct u_desktop_pick p;
+	pick_locked(f, x, y, &p);
+	return p.kind == U_DESKTOP_PICK_WINDOW && (p.window.id == target || p.window.parent_id == target);
 }
 
 static const char *
@@ -410,14 +466,33 @@ fake_text_at(struct u_desktop_backend *b, int32_t x, int32_t y, char *buf, size_
 }
 
 static enum u_desktop_result
+fake_prepare_input(struct u_desktop_backend *b, char *msg)
+{
+	(void)msg;
+	struct u_desktop_fake *f = fake(b);
+	count_call(f);
+	os_mutex_lock(&f->mutex);
+	f->prepare_count++;
+	os_mutex_unlock(&f->mutex);
+	batch_hook(f, "prepare", 0);
+	return U_DESKTOP_OK;
+}
+
+static enum u_desktop_result
 fake_window_op(struct u_desktop_backend *b,
+               const struct u_desktop_input_guard *guard,
                enum u_desktop_window_op op,
                uint64_t window_id,
                const struct u_desktop_rect *rect,
                char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
+	batch_hook(f, "window_op", 0);
+	if (guard != NULL && !guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "window_op", msg);
 	if (r != U_DESKTOP_OK) {
@@ -477,38 +552,139 @@ fake_window_op(struct u_desktop_backend *b,
 	return U_DESKTOP_OK;
 }
 
+//! Bytes of the UTF-8 sequence starting with @p lead.
+static size_t
+cp_len(unsigned char lead)
+{
+	if (lead < 0x80) {
+		return 1;
+	}
+	if ((lead & 0xE0) == 0xC0) {
+		return 2;
+	}
+	if ((lead & 0xF0) == 0xE0) {
+		return 3;
+	}
+	return 4;
+}
+
+/*!
+ * One code point per injection batch, each re-checking the guard and the focus
+ * (u_desktop.h "Delivery guarantee"); the log gets one "type <id> <text so far>"
+ * line for what was actually delivered.
+ */
 static enum u_desktop_result
-fake_type_text(struct u_desktop_backend *b, const char *utf8, char *msg)
+fake_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "type_text", msg);
-	if (r == U_DESKTOP_OK) {
+	if (r != U_DESKTOP_OK) {
+		// A deliberately careless backend message that names the text: the
+		// common layer must never pass it on (privacy, contract v2).
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "fake: could not type \"%s\"", utf8);
+		}
+		os_mutex_unlock(&f->mutex);
+		return r;
+	}
+	os_mutex_unlock(&f->mutex);
+
+	char delivered[FAKE_CONTENT_SIZE];
+	size_t dn = 0;
+	delivered[0] = '\0';
+	uint32_t batch = 0;
+	for (const char *p = utf8; *p != '\0'; batch++) {
+		size_t n = cp_len((unsigned char)*p);
+		batch_hook(f, "type", batch);
+		if (!guard->still_allowed(guard->ctx)) {
+			r = U_DESKTOP_ERR_REFUSED;
+			if (msg != NULL) {
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "stopped");
+			}
+			break;
+		}
+		os_mutex_lock(&f->mutex);
+		if (!focus_ok_locked(f, guard->target_id)) {
+			os_mutex_unlock(&f->mutex);
+			r = U_DESKTOP_ERR_REFUSED;
+			if (msg != NULL) {
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "focus moved");
+			}
+			break;
+		}
 		int idx = find_index(f, f->focus);
 		if (idx >= 0) {
 			size_t have = strlen(f->windows[idx].content);
-			snprintf(f->windows[idx].content + have, FAKE_CONTENT_SIZE - have, "%s", utf8);
+			if (have + n < FAKE_CONTENT_SIZE) {
+				memcpy(f->windows[idx].content + have, p, n);
+				f->windows[idx].content[have + n] = '\0';
+			}
 		}
-		log_line(f, "type %llu %s", (unsigned long long)f->focus, utf8);
 		note_input_locked(f);
+		os_mutex_unlock(&f->mutex);
+		if (dn + n < sizeof(delivered)) {
+			memcpy(delivered + dn, p, n);
+			dn += n;
+			delivered[dn] = '\0';
+		}
+		p += n;
 	}
-	os_mutex_unlock(&f->mutex);
+	if (dn > 0) {
+		os_mutex_lock(&f->mutex);
+		log_line(f, "type %llu %s", (unsigned long long)guard->target_id, delivered);
+		os_mutex_unlock(&f->mutex);
+	}
 	return r;
 }
 
 static enum u_desktop_result
-fake_key_chord(struct u_desktop_backend *b, const struct u_desktop_chord *chord, char *msg)
+fake_key_chord(struct u_desktop_backend *b,
+               const struct u_desktop_input_guard *guard,
+               const struct u_desktop_chord *chord,
+               char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "key_chord", msg);
+	os_mutex_unlock(&f->mutex);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	// Key-downs: each modifier, then the key; each one is a batch.
+	uint32_t nd = 0;
+	for (uint32_t m = chord->mods & 0xF; m != 0; m &= m - 1) {
+		nd++;
+	}
+	if (chord->key[0] != '\0') {
+		nd++; // the key itself
+	}
+	uint32_t pressed = 0;
+	for (uint32_t i = 0; i < nd; i++) {
+		batch_hook(f, "key", i);
+		bool ok = guard->still_allowed(guard->ctx);
+		os_mutex_lock(&f->mutex);
+		ok = ok && focus_ok_locked(f, guard->target_id);
+		os_mutex_unlock(&f->mutex);
+		if (!ok) {
+			r = U_DESKTOP_ERR_REFUSED;
+			break;
+		}
+		pressed++;
+	}
+	os_mutex_lock(&f->mutex);
 	if (r == U_DESKTOP_OK) {
-		char s[64];
-		u_desktop_chord_format(chord, s, sizeof(s));
-		log_line(f, "key %s", s);
+		char s2[64];
+		u_desktop_chord_format(chord, s2, sizeof(s2));
+		log_line(f, "key %s", s2);
 		note_input_locked(f);
+	} else if (pressed > 0) {
+		// A stop releases every key it pressed.
+		log_line(f, "keys released %u", pressed);
 	}
 	os_mutex_unlock(&f->mutex);
 	return r;
@@ -518,6 +694,7 @@ static enum u_desktop_result
 fake_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "pointer_move", msg);
@@ -546,23 +723,59 @@ fake_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 }
 
 static enum u_desktop_result
-fake_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, bool down, char *msg)
+fake_pointer_button(struct u_desktop_backend *b,
+                    const struct u_desktop_input_guard *guard,
+                    enum u_desktop_button button,
+                    bool down,
+                    int32_t x,
+                    int32_t y,
+                    char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
+	uint32_t bit = 1u << (uint32_t)button;
+	if (!down) {
+		// A release always happens (never leave a button held).
+		os_mutex_lock(&f->mutex);
+		if (f->pressed_buttons & bit) {
+			f->pressed_buttons &= ~bit;
+			log_line(f, "button %s up", button_name(button));
+			note_input_locked(f);
+		}
+		os_mutex_unlock(&f->mutex);
+		return U_DESKTOP_OK;
+	}
+	batch_hook(f, "press", 0);
+	if (!guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "pointer_button", msg);
 	if (r == U_DESKTOP_OK) {
-		if (down) {
-			struct u_desktop_pick p;
-			pick_locked(f, f->px, f->py, &p);
-			if (p.kind == U_DESKTOP_PICK_WINDOW) {
-				f->focus = p.window.id;
-				raise_index(f, find_index(f, p.window.id));
-				recompute_z(f);
+		int32_t dx = f->px - x, dy = f->py - y;
+		if (dx < -2 || dx > 2 || dy < -2 || dy > 2) {
+			r = U_DESKTOP_ERR_REFUSED;
+			if (msg != NULL) {
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "the pointer moved off the verified point");
+			}
+		} else if (!pick_ok_locked(f, guard->target_id, x, y)) {
+			r = U_DESKTOP_ERR_REFUSED;
+			if (msg != NULL) {
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "target no longer under the point");
 			}
 		}
-		log_line(f, "button %s %s", button_name(button), down ? "down" : "up");
+	}
+	if (r == U_DESKTOP_OK) {
+		struct u_desktop_pick p;
+		pick_locked(f, x, y, &p);
+		if (p.kind == U_DESKTOP_PICK_WINDOW) {
+			f->focus = p.window.id;
+			raise_index(f, find_index(f, p.window.id));
+			recompute_z(f);
+		}
+		f->pressed_buttons |= bit;
+		log_line(f, "button %s down", button_name(button));
 		note_input_locked(f);
 	}
 	os_mutex_unlock(&f->mutex);
@@ -570,12 +783,29 @@ fake_pointer_button(struct u_desktop_backend *b, enum u_desktop_button button, b
 }
 
 static enum u_desktop_result
-fake_scroll(struct u_desktop_backend *b, int32_t dx, int32_t dy, char *msg)
+fake_scroll(struct u_desktop_backend *b,
+            const struct u_desktop_input_guard *guard,
+            int32_t x,
+            int32_t y,
+            int32_t dx,
+            int32_t dy,
+            char *msg)
 {
 	struct u_desktop_fake *f = fake(b);
+	count_call(f);
 	action_delay(f);
+	batch_hook(f, "scroll", 0);
+	if (!guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "scroll", msg);
+	if (r == U_DESKTOP_OK && !pick_ok_locked(f, guard->target_id, x, y)) {
+		r = U_DESKTOP_ERR_REFUSED;
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "target no longer under the point");
+		}
+	}
 	if (r == U_DESKTOP_OK) {
 		log_line(f, "scroll %d %d", dx, dy);
 		note_input_locked(f);
@@ -588,14 +818,22 @@ static void
 fake_destroy(struct u_desktop_backend *b)
 {
 	struct u_desktop_fake *f = fake(b);
-	// A deferred answer still owed: the contract is "done exactly once".
 	os_mutex_lock(&f->mutex);
 	u_desktop_access_done_fn done = f->pending_done;
 	void *ctx = f->pending_ctx;
 	f->pending_done = NULL;
+	struct u_desktop_fake_orphan *orphan = f->orphan;
 	os_mutex_unlock(&f->mutex);
 	if (done != NULL) {
-		done(ctx, U_DESKTOP_ACCESS_DENIED);
+		if (orphan != NULL) {
+			// Test knob: BREAK the Lifetime contract on purpose and hand the owed
+			// answer to the test, which delivers it after the control is gone.
+			orphan->done = done;
+			orphan->ctx = ctx;
+		} else {
+			// The contract: deliver the owed answer before returning.
+			done(ctx, U_DESKTOP_ACCESS_UNKNOWN);
+		}
 	}
 	os_mutex_destroy(&f->mutex);
 	free(f);
@@ -629,6 +867,7 @@ u_desktop_fake_create(void)
 	f->base.remembers_in_store = env_is("DXR_DESKTOP_FAKE_STORE", "1");
 	f->base.access_status = fake_access_status;
 	f->base.request_access = fake_request_access;
+	f->base.prepare_input = fake_prepare_input;
 	f->base.is_locked = fake_is_locked;
 	f->base.user_idle_ms = fake_user_idle_ms;
 	f->base.list_windows = fake_list_windows;
@@ -647,6 +886,7 @@ u_desktop_fake_create(void)
 	f->access = U_DESKTOP_ACCESS_UNKNOWN;
 	f->answer = env_is("DXR_DESKTOP_FAKE_ANSWER", "deny") ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_GRANTED;
 	f->locked = env_is("DXR_DESKTOP_FAKE_LOCKED", "1");
+	f->injection_is_input = true;
 	// The user last touched the machine long ago: no idle wait by default.
 	uint64_t now = os_monotonic_get_ns();
 	f->last_input_ns = now > 60ull * 1000000000ull ? now - 60ull * 1000000000ull : 0;
@@ -793,10 +1033,12 @@ void
 u_desktop_fake_set_user_active(struct u_desktop_fake *f, bool active)
 {
 	os_mutex_lock(&f->mutex);
-	f->user_active = active;
-	if (active) {
+	// The user's input is continuous while active: stamp both edges, so the
+	// last input is when they stopped even if nobody polled in between.
+	if (active || f->user_active) {
 		f->last_input_ns = os_monotonic_get_ns();
 	}
+	f->user_active = active;
 	os_mutex_unlock(&f->mutex);
 }
 
@@ -870,5 +1112,57 @@ u_desktop_fake_clear_log(struct u_desktop_fake *f)
 	f->log_len = 0;
 	f->log[0] = '\0';
 	f->op_count = 0;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_batch_hook(struct u_desktop_fake *f, u_desktop_fake_batch_fn fn, void *ctx)
+{
+	os_mutex_lock(&f->mutex);
+	f->batch_hook = fn;
+	f->batch_hook_ctx = ctx;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_injection_is_input(struct u_desktop_fake *f, bool counts)
+{
+	os_mutex_lock(&f->mutex);
+	f->injection_is_input = counts;
+	os_mutex_unlock(&f->mutex);
+}
+
+uint32_t
+u_desktop_fake_pressed_buttons(struct u_desktop_fake *f)
+{
+	os_mutex_lock(&f->mutex);
+	uint32_t v = f->pressed_buttons;
+	os_mutex_unlock(&f->mutex);
+	return v;
+}
+
+uint32_t
+u_desktop_fake_prepare_count(struct u_desktop_fake *f)
+{
+	os_mutex_lock(&f->mutex);
+	uint32_t v = f->prepare_count;
+	os_mutex_unlock(&f->mutex);
+	return v;
+}
+
+uint32_t
+u_desktop_fake_action_calls(struct u_desktop_fake *f)
+{
+	os_mutex_lock(&f->mutex);
+	uint32_t v = f->action_calls;
+	os_mutex_unlock(&f->mutex);
+	return v;
+}
+
+void
+u_desktop_fake_set_orphan_on_destroy(struct u_desktop_fake *f, struct u_desktop_fake_orphan *orphan)
+{
+	os_mutex_lock(&f->mutex);
+	f->orphan = orphan;
 	os_mutex_unlock(&f->mutex);
 }

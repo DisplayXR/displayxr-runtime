@@ -30,6 +30,7 @@
 #define EXE_CAP 1024
 #define NAME_CAP 256
 #define MSG_CAP U_DESKTOP_MSG_SIZE
+#define U_DESKTOP_CONTROL_INJECTION_HISTORY 32
 
 static const char k_em_dash[] = "\xe2\x80\x94";
 
@@ -38,6 +39,7 @@ enum reason
 {
 	R_NO_BACKEND,
 	R_ENV_OFF,
+	R_STORE_UNREADABLE, //!< row 3, fail closed: the store exists but cannot be parsed
 	R_KILL_SWITCH,
 	R_STORE_DENY,
 	R_LOCKED,
@@ -45,7 +47,22 @@ enum reason
 	R_PENDING,
 	R_STORE_ALLOW,
 	R_OS_GRANTED,
+	R_REVOKED, //!< row 10: the backend reported NOT_GRANTED mid-session
 	R_DENIED,
+};
+
+/*!
+ * The context handed to backend->request_access. It outlives the control object:
+ * one reference belongs to the control, one to each request in flight, and the
+ * callback only reaches the control through @ref c, which destroy clears under
+ * @ref mutex. So an answer that arrives after destroy (a backend breaking the
+ * Lifetime contract) is dropped instead of touching freed memory.
+ */
+struct request_ctx
+{
+	struct os_mutex mutex;
+	int refs;
+	struct u_desktop_control *c; //!< NULL once the control is dying
 };
 
 struct queued_action
@@ -68,8 +85,11 @@ struct u_desktop_control
 
 	struct os_mutex mutex;
 	struct os_cond cond;
+	struct request_ctx *rq; //!< see struct request_ctx
 
 	// --- under mutex ---
+	bool dying;   //!< set before backend->destroy: consent answers are ignored from here on
+	bool revoked; //!< the backend reported NOT_GRANTED: DENIED until a new request
 	struct u_desktop_policy *policy;
 	bool requested;
 	bool pending;
@@ -88,7 +108,13 @@ struct u_desktop_control
 	// --- worker only ---
 	struct os_thread thread;
 	bool thread_started;
-	uint64_t own_end_ns; //!< when our last injection ended (0 = never)
+	//! Our recent injections [start, end] (spec §5 step 2): input whose OS timestamp
+	//! falls inside one of them (+ grace) is ours; anything else is the user's.
+	struct
+	{
+		uint64_t start_ns, end_ns;
+	} inj[U_DESKTOP_CONTROL_INJECTION_HISTORY];
+	uint32_t inj_next, inj_count;
 	struct u_desktop_window *list_buf;
 	uint32_t list_cap;
 };
@@ -255,6 +281,11 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		goto out;
 	}
 	u_desktop_policy_refresh(c->policy);
+	if (u_desktop_policy_is_unreadable(c->policy)) { // 3, fail closed (spec §6.1)
+		r = R_STORE_UNREADABLE;
+		s = U_DESKTOP_STATE_SUSPENDED;
+		goto out;
+	}
 	if (u_desktop_policy_is_suspended(c->policy)) { // 3
 		r = R_KILL_SWITCH;
 		s = U_DESKTOP_STATE_SUSPENDED;
@@ -279,6 +310,13 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 	if (c->pending) { // 7
 		r = R_PENDING;
 		s = U_DESKTOP_STATE_PENDING;
+		goto out;
+	}
+	if (c->revoked) {
+		// The OS took the permission back mid-session (backend NOT_GRANTED):
+		// refuse everything without reaching the OS until a new request.
+		r = R_REVOKED;
+		s = U_DESKTOP_STATE_DENIED;
 		goto out;
 	}
 	if (c->b->remembers_in_store) {
@@ -342,6 +380,9 @@ static int32_t
 refusal_for_state(enum u_desktop_control_state s, enum reason r, char *msg, size_t cap)
 {
 	switch (r) {
+	case R_STORE_UNREADABLE:
+		snprintf(msg, cap, "the desktop-control settings file is unreadable");
+		return U_DESKTOP_XR_ERROR_REFUSED;
 	case R_KILL_SWITCH: snprintf(msg, cap, "kill switch"); return U_DESKTOP_XR_ERROR_REFUSED;
 	case R_LOCKED: snprintf(msg, cap, "screen locked"); return U_DESKTOP_XR_ERROR_REFUSED;
 	case R_STORE_DENY: snprintf(msg, cap, "disabled by the user"); return U_DESKTOP_XR_ERROR_REFUSED;
@@ -372,14 +413,43 @@ audit_consent(struct u_desktop_control *c, const char *what, const char *reason)
 }
 
 static void
+request_ctx_unref(struct request_ctx *rq)
+{
+	os_mutex_lock(&rq->mutex);
+	bool last = --rq->refs == 0;
+	os_mutex_unlock(&rq->mutex);
+	if (last) {
+		os_mutex_destroy(&rq->mutex);
+		free(rq);
+	}
+}
+
+static void
+request_done_locked(struct u_desktop_control *c, enum u_desktop_access result);
+
+static void
 request_done(void *ctx, enum u_desktop_access result)
 {
-	struct u_desktop_control *c = (struct u_desktop_control *)ctx;
-	os_mutex_lock(&c->mutex);
-	c->pending = false;
-	if (c->stop) {
-		// Owed answer delivered from the backend's destroy: nobody is asking.
+	struct request_ctx *rq = (struct request_ctx *)ctx;
+	// Held across the handling: destroy clears rq->c under this mutex, so it
+	// waits for an answer being handled and every later answer sees NULL.
+	os_mutex_lock(&rq->mutex);
+	struct u_desktop_control *c = rq->c;
+	if (c != NULL) {
+		os_mutex_lock(&c->mutex);
+		request_done_locked(c, result);
 		os_mutex_unlock(&c->mutex);
+	}
+	os_mutex_unlock(&rq->mutex);
+	request_ctx_unref(rq); // the in-flight request's reference
+}
+
+static void
+request_done_locked(struct u_desktop_control *c, enum u_desktop_access result)
+{
+	c->pending = false;
+	if (c->dying || c->stop) {
+		// Owed answer delivered from the backend's destroy: nobody is asking.
 		return;
 	}
 	c->req_result = result;
@@ -398,7 +468,6 @@ request_done(void *ctx, enum u_desktop_access result)
 	        c->name);
 	// Always announce the outcome, even when it equals the previous state.
 	update_state_locked(c, NULL, true);
-	os_mutex_unlock(&c->mutex);
 }
 
 int32_t
@@ -409,7 +478,8 @@ u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 	enum u_desktop_control_state s = evaluate_locked(c, &why);
 
 	// Rows 1–5: resolved without prompting; announce the blocking state.
-	if (why == R_NO_BACKEND || why == R_ENV_OFF || why == R_KILL_SWITCH || why == R_STORE_DENY || why == R_LOCKED) {
+	if (why == R_NO_BACKEND || why == R_ENV_OFF || why == R_STORE_UNREADABLE || why == R_KILL_SWITCH ||
+	    why == R_STORE_DENY || why == R_LOCKED) {
 		update_state_locked(c, NULL, true);
 		os_mutex_unlock(&c->mutex);
 		return U_DESKTOP_XR_SUCCESS;
@@ -422,6 +492,7 @@ u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 
 	audit_consent(c, "request", reason);
 	c->requested = true;
+	c->revoked = false; // a new request on a user gesture re-asks the OS
 
 	// Remembered grant: no prompt (row 8).
 	if (c->b->remembers_in_store && u_desktop_policy_app(c->policy, c->exe) == U_DESKTOP_APP_ALLOW) {
@@ -433,10 +504,15 @@ u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 	c->pending = true;
 	update_state_locked(c, NULL, true);
 	struct u_desktop_backend *b = c->b;
+	struct request_ctx *rq = c->rq;
 	os_mutex_unlock(&c->mutex);
+	// After releasing c->mutex: request_done takes rq->mutex THEN c->mutex.
+	os_mutex_lock(&rq->mutex);
+	rq->refs++; // the in-flight request's reference, dropped by request_done
+	os_mutex_unlock(&rq->mutex);
 
 	struct u_desktop_app_info app = {c->exe, c->name, reason};
-	b->request_access(b, &app, request_done, c); // may call request_done before returning
+	b->request_access(b, &app, request_done, rq); // may call request_done before returning
 	return U_DESKTOP_XR_SUCCESS;
 }
 
@@ -520,7 +596,11 @@ u_desktop_control_text_at(struct u_desktop_control *c, int32_t x, int32_t y, cha
 	buf[cap - 1] = '\0';
 	if (r != U_DESKTOP_XR_SUCCESS) {
 		buf[0] = '\0';
+		return r;
 	}
+	// A backend that filled the whole buffer may have cut a code point in half.
+	size_t len = strlen(buf);
+	buf[u_desktop_utf8_trim_partial(buf, len)] = '\0';
 	return r;
 }
 
@@ -562,6 +642,14 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		snprintf(why, why_cap, "targetWindowId is required");
 		return false;
 	}
+	// Coordinates far outside any desktop are a bug (or an overflow waiting to
+	// happen in a backend's arithmetic): reject them for every action type.
+	const int32_t L = U_DESKTOP_CONTROL_MAX_COORD;
+	if (a->x < -L || a->x > L || a->y < -L || a->y > L || a->x2 < -L || a->x2 > L || a->y2 < -L || a->y2 > L ||
+	    a->rect.x < -L || a->rect.x > L || a->rect.y < -L || a->rect.y > L || a->rect.w > L || a->rect.h > L) {
+		snprintf(why, why_cap, "coordinates are limited to +/-%d", L);
+		return false;
+	}
 	switch (a->type) {
 	case U_DESKTOP_ACTION_MOVE_RESIZE:
 		if (a->rect.w < 0 || a->rect.h < 0) {
@@ -592,7 +680,8 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 			return false;
 		}
 		if (!u_desktop_chord_parse(a->keys, &ch)) {
-			snprintf(why, why_cap, "keys \"%.64s\" is not a valid chord", a->keys);
+			// Never echo the input: a chord can be a character the user typed.
+			snprintf(why, why_cap, "keys is not a valid chord");
 			return false;
 		}
 		break;
@@ -652,7 +741,8 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 			struct u_desktop_audit_record r;
 			memset(&r, 0, sizeof(r));
 			r.exe = c->exe;
-			r.action = action_name(a != NULL ? a->type : U_DESKTOP_ACTION_TYPE_TEXT);
+			const char *name = a != NULL ? action_name(a->type) : NULL;
+			r.action = name != NULL ? name : "unknown"; // never drop the record
 			r.chars = -1;
 			r.has_target = a != NULL;
 			r.target_id = a != NULL ? a->target_window_id : 0;
@@ -727,6 +817,38 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
  *
  */
 
+size_t
+u_desktop_utf8_trim_partial(const char *s, size_t len)
+{
+	if (s == NULL || len == 0) {
+		return 0;
+	}
+	// Walk back over continuation bytes to the lead byte of the last sequence.
+	size_t i = len;
+	size_t cont = 0;
+	while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80 && cont < 3) {
+		i--;
+		cont++;
+	}
+	if (i == 0) {
+		return 0; // only continuation bytes: nothing complete
+	}
+	unsigned char lead = (unsigned char)s[i - 1];
+	size_t need;
+	if (lead < 0x80) {
+		need = 0;
+	} else if ((lead & 0xE0) == 0xC0) {
+		need = 1;
+	} else if ((lead & 0xF0) == 0xE0) {
+		need = 2;
+	} else if ((lead & 0xF8) == 0xF0) {
+		need = 3;
+	} else {
+		return i - 1; // a stray byte: drop it and what follows
+	}
+	return cont >= need ? len : i - 1;
+}
+
 static bool
 stopping(struct u_desktop_control *c)
 {
@@ -736,11 +858,55 @@ stopping(struct u_desktop_control *c)
 	return s;
 }
 
-//! Note that one of our injections just ended (§5 step 2's subtraction).
-static void
-mark_own_injection(struct u_desktop_control *c)
+static uint64_t
+injection_begin(void)
 {
-	c->own_end_ns = os_monotonic_get_ns();
+	return os_monotonic_get_ns();
+}
+
+//! Record one of our injections (any backend action call, window ops included).
+static void
+injection_end(struct u_desktop_control *c, uint64_t start_ns)
+{
+	uint32_t i = c->inj_next;
+	c->inj[i].start_ns = start_ns;
+	c->inj[i].end_ns = os_monotonic_get_ns();
+	c->inj_next = (i + 1) % U_DESKTOP_CONTROL_INJECTION_HISTORY;
+	if (c->inj_count < U_DESKTOP_CONTROL_INJECTION_HISTORY) {
+		c->inj_count++;
+	}
+}
+
+/*!
+ * True when input with OS timestamp @p ts_ns falls inside one of our injection
+ * windows [start, end + grace]; @p out_closes_ns is when that window closes.
+ */
+static bool
+input_is_ours(struct u_desktop_control *c, uint64_t ts_ns, uint64_t *out_closes_ns)
+{
+	// The OS reports idle time in whole ms: allow 1 ms of rounding at the start.
+	for (uint32_t k = 0; k < c->inj_count; k++) {
+		uint64_t start = c->inj[k].start_ns > NS_PER_MS ? c->inj[k].start_ns - NS_PER_MS : 0;
+		uint64_t end = c->inj[k].end_ns + c->timing.own_grace_ns;
+		if (ts_ns >= start && ts_ns <= end) {
+			*out_closes_ns = end;
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The backend took the permission back: DENIED (event), no more backend calls.
+static void
+mark_revoked(struct u_desktop_control *c)
+{
+	os_mutex_lock(&c->mutex);
+	if (!c->revoked) {
+		c->revoked = true;
+		U_LOG_W("desktop_control: the OS revoked desktop control for %s", c->name);
+	}
+	update_state_locked(c, NULL, false);
+	os_mutex_unlock(&c->mutex);
 }
 
 enum step_outcome
@@ -791,10 +957,16 @@ wait_for_idle(struct u_desktop_control *c, int32_t *result, char *msg)
 		uint64_t now = os_monotonic_get_ns();
 		uint64_t idle_ns = idle_ms * NS_PER_MS;
 		uint64_t last_input_ns = now > idle_ns ? now - idle_ns : 0;
-		if (c->own_end_ns != 0 && last_input_ns <= c->own_end_ns + c->timing.own_grace_ns) {
-			return STEP_OK; // the most recent input was ours
-		}
 		if (idle_ms >= need_ms) {
+			return STEP_OK;
+		}
+		// The latest input is inside one of our injection windows. Decide only
+		// once that window has CLOSED: until then a user keystroke in the grace
+		// part is indistinguishable from ours, and accepting it at once would let
+		// back-to-back actions chain past a user who keeps typing. After the close,
+		// a still-active user shows a newer timestamp (outside the window).
+		uint64_t closes_ns = 0;
+		if (input_is_ours(c, last_input_ns, &closes_ns) && now > closes_ns) {
 			return STEP_OK;
 		}
 		if (now - start >= c->timing.idle_max_wait_ns) {
@@ -912,14 +1084,131 @@ verify_keyboard_target(struct u_desktop_control *c, uint64_t target, uint32_t co
 	return STEP_FAIL;
 }
 
+
+/*
+ *
+ * The input guard (u_desktop.h "Delivery guarantee").
+ *
+ */
+
+struct guard_ctx
+{
+	struct u_desktop_control *c;
+	bool stopped;    //!< still_allowed returned false at least once
+	enum reason why; //!< ... and why
+	uint32_t calls;  //!< how often the backend asked (tests / diagnostics)
+};
+
+//! Kill switch (store stamp), unreadable store, deny, lock, revocation, destroy.
+static bool
+guard_still_allowed(void *ctx)
+{
+	struct guard_ctx *g = (struct guard_ctx *)ctx;
+	struct u_desktop_control *c = g->c;
+	g->calls++;
+	os_mutex_lock(&c->mutex);
+	enum reason why = R_OS_GRANTED;
+	bool ok = true;
+	if (c->stop) {
+		ok = false;
+		why = R_NOT_REQUESTED;
+	} else {
+		u_desktop_policy_refresh(c->policy);
+		if (u_desktop_policy_is_unreadable(c->policy)) {
+			ok = false;
+			why = R_STORE_UNREADABLE;
+		} else if (u_desktop_policy_is_suspended(c->policy)) {
+			ok = false;
+			why = R_KILL_SWITCH;
+		} else if (u_desktop_policy_app(c->policy, c->exe) == U_DESKTOP_APP_DENY) {
+			ok = false;
+			why = R_STORE_DENY;
+		} else if (c->b->is_locked != NULL && c->b->is_locked(c->b)) {
+			ok = false;
+			why = R_LOCKED;
+		} else if (c->revoked) {
+			ok = false;
+			why = R_REVOKED;
+		}
+	}
+	if (!ok) {
+		if (!g->stopped) {
+			g->stopped = true;
+			g->why = why;
+		}
+		update_state_locked(c, NULL, false); // announce the change mid-action
+	}
+	os_mutex_unlock(&c->mutex);
+	return ok;
+}
+
+/*!
+ * Result of an injecting backend call, with a message the common layer chose.
+ * For text and chords a backend's own message is never passed on (it could name
+ * a character): every outcome maps to a fixed string. A guard stop always reads
+ * as its reason ("kill switch", "screen locked", ...).
+ */
+static int32_t
+injection_result(
+    struct u_desktop_control *c, const struct guard_ctx *g, uint32_t type, enum u_desktop_result r, char *msg)
+{
+	if (r == U_DESKTOP_OK) {
+		return U_DESKTOP_XR_SUCCESS;
+	}
+	if (r == U_DESKTOP_ERR_NOT_GRANTED) {
+		mark_revoked(c);
+	}
+	if (g != NULL && g->stopped && r == U_DESKTOP_ERR_REFUSED) {
+		if (g->why == R_NOT_REQUESTED) {
+			snprintf(msg, MSG_CAP, "the session is ending");
+			return U_DESKTOP_XR_ERROR_REFUSED;
+		}
+		if (g->why == R_REVOKED) {
+			snprintf(msg, MSG_CAP, "the OS refused: permission missing or revoked");
+			return U_DESKTOP_XR_ERROR_NOT_GRANTED;
+		}
+		return refusal_for_state(U_DESKTOP_STATE_SUSPENDED, g->why, msg, MSG_CAP);
+	}
+	if (is_keyboard_action(type)) {
+		const char *fixed;
+		int32_t x;
+		switch (r) {
+		case U_DESKTOP_ERR_REFUSED:
+			fixed = "focus moved";
+			x = U_DESKTOP_XR_ERROR_REFUSED;
+			break;
+		case U_DESKTOP_ERR_NOT_GRANTED:
+			fixed = "the OS refused: permission missing or revoked";
+			x = U_DESKTOP_XR_ERROR_NOT_GRANTED;
+			break;
+		case U_DESKTOP_ERR_UNSUPPORTED:
+			fixed = "this desktop backend cannot deliver this input";
+			x = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+			break;
+		case U_DESKTOP_ERR_WINDOW_LOST:
+			fixed = "the target window no longer exists";
+			x = U_DESKTOP_XR_ERROR_WINDOW_LOST;
+			break;
+		default:
+			fixed = "the input could not be delivered";
+			x = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+			break;
+		}
+		snprintf(msg, MSG_CAP, "%s", fixed);
+		return x;
+	}
+	return map_backend_result(r, msg, MSG_CAP);
+}
+
 //! Move the pointer, then re-pick before anything is pressed (§5 step 4, last item).
 static enum step_outcome
 move_and_reverify(struct u_desktop_control *c, uint64_t target, int32_t x, int32_t y, int32_t *result, char *msg)
 {
+	uint64_t t0 = injection_begin();
 	enum u_desktop_result r = c->b->pointer_move(c->b, x, y, msg);
-	mark_own_injection(c);
+	injection_end(c, t0);
 	if (r != U_DESKTOP_OK) {
-		*result = map_backend_result(r, msg, MSG_CAP);
+		*result = injection_result(c, NULL, U_DESKTOP_ACTION_POINTER_MOVE, r, msg);
 		return STEP_FAIL;
 	}
 	if (stopping(c)) {
@@ -928,14 +1217,35 @@ move_and_reverify(struct u_desktop_control *c, uint64_t target, int32_t x, int32
 	return verify_pointer_target(c, target, x, y, result, msg);
 }
 
+//! Release a button whatever else happened (never leave it held).
+static void
+release_button(struct u_desktop_control *c,
+               const struct u_desktop_input_guard *guard,
+               enum u_desktop_button button,
+               int32_t x,
+               int32_t y)
+{
+	char m[MSG_CAP] = {0};
+	uint64_t t0 = injection_begin();
+	c->b->pointer_button(c->b, guard, button, false, x, y, m);
+	injection_end(c, t0);
+}
+
 //! §5 step 5. Called only after steps 1–4 passed.
 static enum step_outcome
-execute(struct u_desktop_control *c, const struct queued_action *qa, int32_t *result, char *msg)
+execute(struct u_desktop_control *c,
+        const struct queued_action *qa,
+        const struct u_desktop_input_guard *guard,
+        const struct guard_ctx *g,
+        int32_t *result,
+        char *msg)
 {
 	const struct u_desktop_action *a = &qa->a;
 	struct u_desktop_backend *b = c->b;
 	enum u_desktop_result r = U_DESKTOP_OK;
 	enum step_outcome so;
+	enum u_desktop_button btn = (enum u_desktop_button)a->button;
+	uint64_t t0;
 
 	switch (a->type) {
 	case U_DESKTOP_ACTION_ACTIVATE:
@@ -944,24 +1254,25 @@ execute(struct u_desktop_control *c, const struct queued_action *qa, int32_t *re
 	case U_DESKTOP_ACTION_RESTORE:
 	case U_DESKTOP_ACTION_MAXIMIZE:
 	case U_DESKTOP_ACTION_CLOSE:
-		r = b->window_op(b, (enum u_desktop_window_op)a->type, a->target_window_id,
+		t0 = injection_begin();
+		r = b->window_op(b, guard, (enum u_desktop_window_op)a->type, a->target_window_id,
 		                 a->type == U_DESKTOP_ACTION_MOVE_RESIZE ? &a->rect : NULL, msg);
-		// Deliberately NOT marked as our own injection: on most OSes a window
-		// op is not input, and widening the "ours" window would hide real user
-		// activity. Where a backend performs it as simulated input (GNOME), the
-		// next input action merely waits idle_ms — the safe side.
+		injection_end(c, t0);
 		break;
 	case U_DESKTOP_ACTION_TYPE_TEXT:
-		r = b->type_text(b, a->text, msg);
-		mark_own_injection(c);
+		t0 = injection_begin();
+		r = b->type_text(b, guard, a->text, msg);
+		injection_end(c, t0);
 		break;
 	case U_DESKTOP_ACTION_KEY_CHORD:
-		r = b->key_chord(b, &qa->chord, msg);
-		mark_own_injection(c);
+		t0 = injection_begin();
+		r = b->key_chord(b, guard, &qa->chord, msg);
+		injection_end(c, t0);
 		break;
 	case U_DESKTOP_ACTION_POINTER_MOVE:
+		t0 = injection_begin();
 		r = b->pointer_move(b, a->x, a->y, msg);
-		mark_own_injection(c);
+		injection_end(c, t0);
 		break;
 	case U_DESKTOP_ACTION_CLICK:
 		so = move_and_reverify(c, a->target_window_id, a->x, a->y, result, msg);
@@ -969,17 +1280,15 @@ execute(struct u_desktop_control *c, const struct queued_action *qa, int32_t *re
 			return so;
 		}
 		for (uint32_t i = 0; i < a->click_count && r == U_DESKTOP_OK; i++) {
-			r = b->pointer_button(b, (enum u_desktop_button)a->button, true, msg);
-			mark_own_injection(c);
+			t0 = injection_begin();
+			r = b->pointer_button(b, guard, btn, true, a->x, a->y, msg);
+			injection_end(c, t0);
 			if (r != U_DESKTOP_OK) {
-				break;
+				break; // the press did not happen: nothing to release
 			}
-			// Never leave a button held, even when stopping.
-			r = b->pointer_button(b, (enum u_desktop_button)a->button, false, msg);
-			mark_own_injection(c);
-			if (r == U_DESKTOP_OK && i + 1 < a->click_count && stopping(c)) {
-				return STEP_ABORT;
-			}
+			t0 = injection_begin();
+			r = b->pointer_button(b, guard, btn, false, a->x, a->y, msg);
+			injection_end(c, t0);
 		}
 		break;
 	case U_DESKTOP_ACTION_DRAG: {
@@ -987,21 +1296,18 @@ execute(struct u_desktop_control *c, const struct queued_action *qa, int32_t *re
 		if (so != STEP_OK) {
 			return so;
 		}
-		r = b->pointer_button(b, (enum u_desktop_button)a->button, true, msg);
-		mark_own_injection(c);
+		t0 = injection_begin();
+		r = b->pointer_button(b, guard, btn, true, a->x, a->y, msg);
+		injection_end(c, t0);
 		if (r != U_DESKTOP_OK) {
 			break;
 		}
+		t0 = injection_begin();
 		enum u_desktop_result rm = b->pointer_move(b, a->x2, a->y2, msg);
-		mark_own_injection(c);
-		// Always release, whatever the move did.
-		char up_msg[MSG_CAP] = {0};
-		enum u_desktop_result ru = b->pointer_button(b, (enum u_desktop_button)a->button, false, up_msg);
-		mark_own_injection(c);
-		r = rm != U_DESKTOP_OK ? rm : ru;
-		if (rm == U_DESKTOP_OK && ru != U_DESKTOP_OK) {
-			snprintf(msg, MSG_CAP, "%s", up_msg);
-		}
+		injection_end(c, t0);
+		// Always release, whatever the move did (at the end point if it got there).
+		release_button(c, guard, btn, rm == U_DESKTOP_OK ? a->x2 : a->x, rm == U_DESKTOP_OK ? a->y2 : a->y);
+		r = rm;
 		break;
 	}
 	case U_DESKTOP_ACTION_SCROLL:
@@ -1009,17 +1315,26 @@ execute(struct u_desktop_control *c, const struct queued_action *qa, int32_t *re
 		if (so != STEP_OK) {
 			return so;
 		}
-		r = b->scroll(b, a->scroll_x, a->scroll_y, msg);
-		mark_own_injection(c);
+		t0 = injection_begin();
+		r = b->scroll(b, guard, a->x, a->y, a->scroll_x, a->scroll_y, msg);
+		injection_end(c, t0);
 		break;
 	default: r = U_DESKTOP_ERR_UNSUPPORTED; break;
 	}
 
-	*result = map_backend_result(r, msg, MSG_CAP);
-	if (r == U_DESKTOP_ERR_NOT_GRANTED) {
-		update_state(c, NULL); // the OS revoked us: announce it
-	}
+	*result = injection_result(c, g, a->type, r, msg);
 	return *result == U_DESKTOP_XR_SUCCESS ? STEP_OK : STEP_FAIL;
+}
+
+//! A chord is a shortcut (loggable) only with ctrl or super held and NOT ctrl+alt
+//! (AltGr): option/alt alone, shift, AltGr combinations and bare keys produce text.
+static bool
+chord_is_shortcut(const struct u_desktop_chord *ch)
+{
+	bool ctrl = (ch->mods & U_DESKTOP_MOD_CTRL) != 0;
+	bool alt = (ch->mods & U_DESKTOP_MOD_ALT) != 0;
+	bool super = (ch->mods & U_DESKTOP_MOD_SUPER) != 0;
+	return (ctrl || super) && !(ctrl && alt);
 }
 
 static void
@@ -1034,7 +1349,8 @@ audit_action(struct u_desktop_control *c,
 	struct u_desktop_audit_record r;
 	memset(&r, 0, sizeof(r));
 	r.exe = c->exe;
-	r.action = action_name(a->type);
+	const char *name = action_name(a->type);
+	r.action = name != NULL ? name : "unknown";
 	r.has_target = true;
 	r.target_id = a->target_window_id;
 	if (target != NULL) {
@@ -1047,12 +1363,8 @@ audit_action(struct u_desktop_control *c,
 		r.y = a->y;
 	}
 	r.chars = a->type == U_DESKTOP_ACTION_TYPE_TEXT ? utf8_count(a->text) : -1;
-	// A chord is logged only when it is a shortcut (ctrl / alt / super held):
-	// a bare or shift-only key is a typed character, and typed text never
-	// reaches the log.
 	char keys[64];
-	if (a->type == U_DESKTOP_ACTION_KEY_CHORD &&
-	    (qa->chord.mods & (U_DESKTOP_MOD_CTRL | U_DESKTOP_MOD_ALT | U_DESKTOP_MOD_SUPER)) != 0 &&
+	if (a->type == U_DESKTOP_ACTION_KEY_CHORD && chord_is_shortcut(&qa->chord) &&
 	    u_desktop_chord_format(&qa->chord, keys, sizeof(keys))) {
 		r.keys = keys;
 	}
@@ -1087,10 +1399,25 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 		goto done;
 	}
 
-	// 2. Never fight the user: input, and ACTIVATE (focus theft).
-	if (!is_window_action(a->type) || a->type == U_DESKTOP_ACTION_ACTIVATE) {
-		so = wait_for_idle(c, &result, msg);
-		if (so != STEP_OK) {
+	// 2. Never fight the user — EVERY action (window ops move focus, and on GNOME
+	// they are input gestures).
+	so = wait_for_idle(c, &result, msg);
+	if (so != STEP_OK) {
+		goto done;
+	}
+
+	// Slow setup BEFORE verification, never between it and the injection.
+	if (c->b->prepare_input != NULL) {
+		char pmsg[MSG_CAP] = {0};
+		enum u_desktop_result pr = c->b->prepare_input(c->b, pmsg);
+		if (pr != U_DESKTOP_OK) {
+			result = injection_result(c, NULL, a->type, pr, pmsg);
+			snprintf(msg, sizeof(msg), "%s", pmsg); // fixed for text / chords (injection_result)
+			so = STEP_FAIL;
+			goto done;
+		}
+		if (stopping(c)) {
+			so = STEP_ABORT;
 			goto done;
 		}
 	}
@@ -1133,9 +1460,12 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 		goto done;
 	}
 
-	// 5. Execute.
+	// 5. Execute, under the input guard: the backend repeats the verification
+	// and the kill-switch / lock check before every injection batch.
+	struct guard_ctx g = {c, false, R_OS_GRANTED, 0};
+	struct u_desktop_input_guard guard = {a->target_window_id, guard_still_allowed, &g};
 	msg[0] = '\0';
-	so = execute(c, qa, &result, msg);
+	so = execute(c, qa, &guard, &g, &result, msg);
 
 done:
 	// 6. Audit — every action, whatever its result.
@@ -1197,12 +1527,20 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 {
 	*out = NULL;
 	struct u_desktop_control *c = (struct u_desktop_control *)calloc(1, sizeof(*c));
-	if (c == NULL) {
+	struct request_ctx *rq = (struct request_ctx *)calloc(1, sizeof(*rq));
+	if (c == NULL || rq == NULL) {
+		free(c);
+		free(rq);
 		if (backend != NULL && backend->destroy != NULL) {
 			backend->destroy(backend);
 		}
 		return -1;
 	}
+	os_mutex_init(&rq->mutex);
+	rq->refs = 1; // the control's own reference
+	rq->c = c;
+	c->rq = rq;
+
 	c->b = backend;
 	const char *env = getenv("DXR_DESKTOP_CONTROL");
 	c->env_off = env != NULL && strcmp(env, "0") == 0;
@@ -1266,18 +1604,33 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 	os_cond_broadcast(&c->cond);
 	os_mutex_unlock(&c->mutex);
 
-	// An action mid-flight finishes its current backend call first.
+	// An action mid-flight finishes its current backend call first (its guard
+	// now says no, so a well-behaved backend stops at the next batch).
 	if (c->thread_started) {
 		os_thread_join(&c->thread);
 	}
 	os_thread_destroy(&c->thread);
 
-	// A consent answer still owed is delivered (and ignored: stop is set)
-	// inside the backend's destroy.
+	// From here on a consent answer is ignored ...
+	os_mutex_lock(&c->mutex);
+	c->dying = true;
+	os_mutex_unlock(&c->mutex);
+
+	// ... and the backend's destroy must deliver (or cancel) any owed answer
+	// before it returns (u_desktop.h "Lifetime").
 	if (c->b != NULL && c->b->destroy != NULL) {
 		c->b->destroy(c->b);
 	}
 	c->b = NULL;
+
+	// Belt and braces for a backend that breaks that contract: detach the
+	// request context (waits for an answer being handled right now), so a later
+	// answer finds no control instead of freed memory.
+	struct request_ctx *rq = c->rq;
+	os_mutex_lock(&rq->mutex);
+	rq->c = NULL;
+	os_mutex_unlock(&rq->mutex);
+	request_ctx_unref(rq);
 
 	u_desktop_policy_destroy(&c->policy);
 	os_cond_destroy(&c->cond);

@@ -25,8 +25,13 @@
  * Reads are cached: u_desktop_policy_refresh() re-reads the file only when its
  * stamp (mtime + size + file identity) changed. Writes are read-modify-write
  * and atomic (temp file + rename; Windows MoveFileExW REPLACE_EXISTING). A
- * missing or unreadable store means defaults: nothing suspended, nobody
- * allowed or denied, idle_ms 600.
+ * MISSING store means defaults: nothing suspended, nobody allowed or denied,
+ * idle_ms 600. A store that EXISTS but cannot be parsed never means defaults:
+ * the last good policy read in this process is kept, and with none the
+ * policy reads as suspended (u_desktop_policy_is_unreadable()). Writers take a
+ * cross-process lock on `<store>.lock` (flock / LockFileEx) and re-read the
+ * store under it; they refuse to change an unparseable store, except the kill
+ * switch, which moves it aside to `<store>.corrupt` and writes a suspended one.
  *
  * Not thread-safe per object; the owner (u_desktop_control) serialises.
  * Never links a backend: the CLI uses this file alone.
@@ -87,9 +92,18 @@ u_desktop_policy_destroy(struct u_desktop_policy **p_ptr);
 bool
 u_desktop_policy_refresh(struct u_desktop_policy *p);
 
-//! The kill switch (`displayxr-cli desktop stop`).
+//! The kill switch (`displayxr-cli desktop stop`) — also true while the store is
+//! unreadable with no good read to fall back on (fail closed, spec §6.1).
 bool
 u_desktop_policy_is_suspended(const struct u_desktop_policy *p);
+
+/*!
+ * The store exists but cannot be parsed and this process has no good read of it
+ * to keep: everything is suspended until the file is fixed or removed. (With a
+ * good read in hand, the last good policy is kept and this stays false.)
+ */
+bool
+u_desktop_policy_is_unreadable(const struct u_desktop_policy *p);
 
 uint32_t
 u_desktop_policy_idle_ms(const struct u_desktop_policy *p);
