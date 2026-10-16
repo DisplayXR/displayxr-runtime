@@ -105,6 +105,10 @@ TEST_CASE("conversion loader: the manifest suffix routes each file to exactly on
 	CHECK(target_plugin_classify_manifest("-conversion-provider.json") == TARGET_PLUGIN_MANIFEST_NONE);
 	CHECK(target_plugin_classify_manifest("-input-provider.json") == TARGET_PLUGIN_MANIFEST_NONE);
 	CHECK(target_plugin_classify_manifest(nullptr) == TARGET_PLUGIN_MANIFEST_NONE);
+	// ADR-053 P4 model packs ship beside their provider, in the same dir.
+	CHECK(target_plugin_classify_manifest("sim-conversion.models.json") == TARGET_PLUGIN_MANIFEST_NONE);
+	CHECK(target_plugin_classify_manifest("dxr-open-default.models.json") == TARGET_PLUGIN_MANIFEST_NONE);
+	CHECK(target_plugin_classify_manifest(".models.json") == TARGET_PLUGIN_MANIFEST_NONE);
 
 	// The input loader's own rule (requires "-input-provider.json") must stay
 	// blind to conversion manifests, and the DP loader skips everything that

@@ -891,3 +891,52 @@ TEST_CASE("component loader: the production enumeration of an empty class is wel
 	CHECK(target_component_enumerate(&cls, nullptr, 4) == 0);
 	CHECK(target_component_enumerate(&cls, out.data(), 0) == 0);
 }
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+TEST_CASE("component loader: a model pack in a discovery root is not a manifest of any class", "[component_loader]")
+{
+	// ADR-053 P4: the packagers install `sim-conversion.models.json` beside
+	// its provider in the shared plug-in dir. It must be neither a DP row nor
+	// a malformed one (it used to be both: "unsupported file_format_version").
+	char dir[] = "/tmp/dxr_tc_packs_XXXXXX";
+	REQUIRE(mkdtemp(dir) != nullptr);
+	const std::string root(dir);
+	const std::string pack = root + "/sim-conversion.models.json";
+	const std::string dp = root + "/200-acme-dp.json";
+	FILE *f = std::fopen(pack.c_str(), "w");
+	REQUIRE(f != nullptr);
+	std::fputs(R"({"schema":2,"pack":"sim","provider":"sim-conversion","models":[]})", f);
+	std::fclose(f);
+	f = std::fopen(dp.c_str(), "w");
+	REQUIRE(f != nullptr);
+	std::fputs(R"({"file_format_version":"1.0","plugin":{"id":"acme-dp","binary_path":"/nowhere/acme.so"}})", f);
+	std::fclose(f);
+
+	const char *old = std::getenv("XRT_PLUGIN_SEARCH_PATH");
+	const std::string saved = old != nullptr ? old : "";
+	const bool had_old = old != nullptr;
+	set_env("XRT_PLUGIN_SEARCH_PATH", dir);
+
+	const Class cls = plain_class("xrtTestNegotiate", 1); // DISPLAY manifest kind
+	std::vector<Entry> out(TARGET_COMPONENT_MAX_ENTRIES);
+	const int n = target_component_enumerate(&cls, out.data(), (int)out.size());
+
+	set_env("XRT_PLUGIN_SEARCH_PATH", had_old ? saved.c_str() : nullptr);
+	std::remove(pack.c_str());
+	std::remove(dp.c_str());
+	rmdir(dir);
+
+	// Only rows from our root: a dev box may have real DP manifests installed.
+	int ours = 0;
+	for (int i = 0; i < n; i++) {
+		const std::string src(out[i].source);
+		if (src.compare(0, root.size(), root) != 0) {
+			continue;
+		}
+		ours++;
+		CHECK(src == dp);
+		CHECK((out[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0u);
+	}
+	CHECK(ours == 1);
+}
+#endif
