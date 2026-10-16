@@ -30,6 +30,7 @@
 
 #include "u_desktop.h"
 #include "u_desktop_mini_cache.h"
+#include "os/os_time.h"
 
 #import <AppKit/AppKit.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -1025,10 +1026,33 @@ focused_wid_ax(struct macos_backend *m)
 	}
 	AXUIElementSetMessagingTimeout(app, AX_OBSERVE_TIMEOUT_S);
 	AXUIElementRef win = (AXUIElementRef)ax_copy(app, kAXFocusedWindowAttribute);
+	// Where keystrokes actually go: the window of the app's focused UI element (the
+	// key window's first responder). AXFocusedWindow follows kAXMain as soon as it is
+	// set, while the app moves its KEY window a moment later — and in that gap a
+	// keystroke lands in the previous window (seen in the real E2E: one character in
+	// the decoy, same app). Both signals must agree; while they disagree, the focus
+	// is unknown (0), so ACTIVATE keeps waiting and input is refused, never guessed.
+	AXUIElementRef el = (AXUIElementRef)ax_copy(app, kAXFocusedUIElementAttribute);
 	CFRelease(app);
+	CGWindowID by_win = 0, by_el = 0;
 	if (win != NULL) {
-		wid = ax_element_window_id(m, win);
+		by_win = ax_element_window_id(m, win);
 		CFRelease(win);
+	}
+	if (el != NULL) {
+		AXUIElementRef elwin = (AXUIElementRef)ax_copy(el, kAXWindowAttribute);
+		CFRelease(el);
+		if (elwin != NULL) {
+			by_el = ax_element_window_id(m, elwin);
+			CFRelease(elwin);
+		}
+	}
+	if (by_el != 0 && by_win != 0) {
+		wid = by_el == by_win ? by_win : 0;
+	} else {
+		// One signal missing (an app with no focusable element, e.g. an empty
+		// window): fall back to the window AX names — but never to a disagreement.
+		wid = by_win;
 	}
 	return wid;
 }
@@ -2187,11 +2211,30 @@ mac_window_op(struct u_desktop_backend *b,
 		}
 		AXUIElementPerformAction(el, kAXRaiseAction);
 		ax_set_bool(el, kAXMainAttribute, true);
+		// Success only once focus has STAYED on the target for 200 ms. The app
+		// activation above completes asynchronously, and when it lands AppKit restores
+		// the app's previous key window — after our raise (seen in the real E2E: the
+		// decoy took focus back between ACTIVATE and the next action). If focus is
+		// taken back, raise again; give up after ~1.5 s.
 		r = U_DESKTOP_ERR_REFUSED;
-		for (int i = 0; i < 20; i++) {
+		uint64_t stable_since = 0;
+		int reraise = 0;
+		for (int i = 0; i < 60; i++) {
+			uint64_t now = os_monotonic_get_ns();
 			if (focused_wid_ax(m) == wid) {
-				r = U_DESKTOP_OK;
-				break;
+				if (stable_since == 0) {
+					stable_since = now;
+				} else if (now - stable_since >= 200ull * 1000 * 1000) {
+					r = U_DESKTOP_OK;
+					break;
+				}
+			} else {
+				if (stable_since != 0 && reraise < 3) {
+					reraise++;
+					AXUIElementPerformAction(el, kAXRaiseAction);
+					ax_set_bool(el, kAXMainAttribute, true);
+				}
+				stable_since = 0;
 			}
 			sleep_ms(25);
 		}
