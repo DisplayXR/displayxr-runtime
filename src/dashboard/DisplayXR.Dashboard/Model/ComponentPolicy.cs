@@ -68,14 +68,20 @@ public static class ComponentClasses
 /// <see cref="EnabledSource"/> / <see cref="Provenance"/> are the CLI's own words
 /// (<c>user</c> / <c>machine</c> / <c>manifest</c> / <c>default</c>; <c>signed</c> /
 /// <c>allowlisted</c> / <c>platform-trusted</c> / <c>dev-override</c> / <c>unverified</c>),
-/// shown verbatim; "" when the CLI predates the field.
+/// shown verbatim; "" when the CLI predates the field — never invented here.
+/// <see cref="BuiltIn"/>: the conversion class's built-in <c>dp-lift</c> adapter, which has
+/// no Enabled value and is never a provider to prefer (the CLI refuses
+/// <c>conv enable|disable dp-lift</c>).
 /// </summary>
 public sealed record PolicyRow(ComponentClass Class, string Id, string Name, bool Enabled, string EnabledSource,
                                bool Preferred, bool Active, string Load, string Provenance, string? Signer,
-                               string? ProvenanceReason, bool Hidden = false)
+                               string? ProvenanceReason, bool Hidden = false, bool BuiltIn = false)
 {
-    /// <summary>Whether the CLI reported an Enabled value at all (older CLIs do not).</summary>
-    public bool EnabledKnown => EnabledSource.Length > 0;
+    /// <summary>
+    /// Whether the row has an Enabled value the CLI reported (older CLIs do not, and a
+    /// built-in row has none): the Enabled control shows only then.
+    /// </summary>
+    public bool EnabledKnown => EnabledSource.Length > 0 && !BuiltIn;
 
     /// <summary>The chip for the Enabled state and where it came from: "enabled" is the quiet default.</summary>
     public (string Text, Level Level)? EnabledChip => !EnabledKnown ? null
@@ -104,12 +110,27 @@ public sealed record PolicyTask(string Task, string Provider, bool Selected, str
 /// <summary>
 /// <c>&lt;class&gt; list --json</c> as the policy controls see it. <see cref="Preferred"/> is the
 /// global preference (display / input); conversion prefers per task (<see cref="PreferredByTask"/>,
-/// from the <c>policy.preferred</c> object).
+/// from the <c>policy.preferred</c> object). <see cref="PolicyLock"/> is the CLI's
+/// <c>policy.policy_lock</c>: HKLM <c>Policy\Lock</c> = 1, so per-user values are ignored.
 /// </summary>
 public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOnlyList<PolicyRow> Rows,
                                 IReadOnlyDictionary<string, string> PreferredByTask, IReadOnlyList<PolicyTask> Tasks,
-                                bool ForceQwerty = false)
+                                bool ForceQwerty = false, bool PolicyLock = false)
 {
+    /// <summary>
+    /// What the lock hides from a per-user write: every class's per-user Enabled, and for
+    /// conversion also the per-user per-task preference (conversion-provider-discovery.md
+    /// §3.1). A display / input <c>PreferredPlugin</c> is not under the lock.
+    /// </summary>
+    public bool LockHidesUserEnabled => PolicyLock;
+    public bool LockHidesUserPreference => PolicyLock && Class == ComponentClass.Conversion;
+
+    /// <summary>The section's "locked" line, or null when the class is not locked.</summary>
+    public string? LockText => !PolicyLock ? null
+        : Class == ComponentClass.Conversion
+            ? "Locked by machine policy (HKLM Policy\\Lock): per-user Enabled values and per-task preferences are ignored. An administrator changes the machine-wide values (--machine)."
+            : "Locked by machine policy (HKLM Policy\\Lock): per-user Enabled values are ignored. An administrator changes the machine-wide value (--machine).";
+
     public PolicyRow? Row(string id) => Rows.FirstOrDefault(r => r.Id == id);
 
     /// <summary>The tasks a conversion provider offers, in the CLI's order.</summary>
@@ -117,6 +138,10 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
 
     /// <summary>True when any row carries an Enabled value: the CLI has the N3 verbs, so the controls can show.</summary>
     public bool Writable => Rows.Any(r => r.EnabledKnown) || Class == ComponentClass.Conversion && Rows.Count > 0;
+
+    /// <summary>The class whose Components section is <paramref name="sectionId"/>, if any.</summary>
+    public static ComponentClass? ClassOfSection(string sectionId) =>
+        ComponentClasses.All.Cast<ComponentClass?>().FirstOrDefault(c => c!.Value.SectionId() == sectionId);
 
     public static bool TryParse(ComponentClass cls, string? json, out PolicyList? list)
     {
@@ -131,11 +156,14 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
             if (!root.Has(arrayKey)) return false; // not this verb's output (an older CLI, "unknown command")
             var rows = root.Arr(arrayKey).Where(e => e.ValueKind == JsonValueKind.Object && e.Str("id").Length > 0)
                 .Select(e => new PolicyRow(cls, e.Str("id"), e.Str("display_name", e.Str("name", e.Str("id"))),
-                    // conv rows always carry `enabled`; dp / input rows only from the N3 CLI (enabled_source says so).
                     e.Has("enabled") ? e.Bool("enabled") : true,
-                    e.Str("enabled_source", cls == ComponentClass.Conversion && e.Has("enabled") ? "default" : ""),
+                    // The CLI's word for where `enabled` came from; "" (no Enabled control) when it
+                    // does not say — a conv row's bare `enabled` is not a policy value.
+                    e.Str("enabled_source"),
                     e.Bool("preferred"), e.Bool("active"), e.Str("load", e.Str("load_result")),
-                    e.Str("provenance"), e.StrOrNull("signer"), e.StrOrNull("provenance_reason"), e.Bool("hidden")))
+                    e.Str("provenance"), e.StrOrNull("signer"), e.StrOrNull("provenance_reason"), e.Bool("hidden"),
+                    // `built_in` from a current CLI; the load verdict says the same on an older one.
+                    e.Bool("built_in") || string.Equals(e.Str("load"), "BUILT_IN", StringComparison.Ordinal)))
                 .ToArray();
             var byTask = new Dictionary<string, string>(StringComparer.Ordinal);
             var tasks = new List<PolicyTask>();
@@ -147,7 +175,8 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                 tasks.AddRange(root.Arr("tasks").Where(t => t.ValueKind == JsonValueKind.Object && t.Str("task").Length > 0)
                     .Select(t => new PolicyTask(t.Str("task"), t.Str("provider"), t.Bool("selected"), t.Str("verdict"))));
             }
-            list = new PolicyList(cls, root.StrOrNull("preferred"), rows, byTask, tasks, root.Bool("force_qwerty"));
+            list = new PolicyList(cls, root.StrOrNull("preferred"), rows, byTask, tasks, root.Bool("force_qwerty"),
+                                  root.Obj("policy").Bool("policy_lock"));
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }

@@ -444,11 +444,13 @@ public static class Components
             bool usable = p.Enabled && !p.Hidden && !malformed && p.CapCount > 0;
             var chips = new List<(string, Level)> { (p.Load.Length > 0 ? p.Load : "UNKNOWN", usable ? Level.Ok : Level.Plain) };
             if (malformed) chips.Add(("malformed", Level.Critical));
-            if (!p.Enabled) chips.Add(("disabled", Level.Plain));
+            var pol = policy?.Row(p.Id);
+            // Enabled: the policy row's chip names the source ("disabled (user)"); the snapshot's
+            // bare flag only when `conv list` has not said (or predates enabled_source).
+            if (pol?.EnabledChip is { } ec) chips.Add(ec);
+            else if (!p.Enabled) chips.Add(("disabled", Level.Plain));
             if (p.Hidden) chips.Add(("superseded", Level.Plain));
             if (p.Fallback) chips.Add(("FALLBACK", Level.Plain));
-            var pol = policy?.Row(p.Id);
-            // Enabled is already a chip above (the snapshot carries it); add the rest of the policy.
             if (pol?.ProvenanceChip is { } pc) chips.Add(pc);
             if (pol is { Untrusted: true }) chips.Add(("refused: provenance", Level.Warn));
             var lines = new List<string>
