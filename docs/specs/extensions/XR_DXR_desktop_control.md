@@ -197,7 +197,7 @@ Window capture (screenshots), a DisplayXR-drawn in-use indicator on Windows / ma
 global kill-switch hotkey (both planned in the service tray, as the stereo camera's §7.3–7.4),
 X11 sessions, KDE window listing, Flatpak-sandboxed apps on GNOME.
 
-## 9. Implementation notes (v1)
+## 9. Implementation notes (contract v2)
 
 Decisions the sections above leave open, as implemented in `u_desktop_control.c`,
 `u_desktop_policy.c` and `oxr_desktop_control.c`:
@@ -213,6 +213,11 @@ Decisions the sections above leave open, as implemented in `u_desktop_control.c`
   answer counts only if writing it to the store failed.
 - Row 9: `access_status() == GRANTED`, or `UNKNOWN` (the OS cannot tell without prompting) and
   this session's request was answered `GRANTED`. An explicit `DENIED` (revoked) wins.
+- Revocation: once any backend call returns `NOT_GRANTED`, the session is `DENIED` (row 10,
+  event) whatever `access_status` says afterwards, and every queued and later action is refused
+  without reaching the backend — until the app calls `xrRequestDesktopControlDXR` again.
+- An unreadable store (§6.1) sits at row 3: `SUSPENDED`, refusals read
+  `"the desktop-control settings file is unreadable"`, and a request never prompts.
 - On Windows a "Don't allow" is written as `deny`, so the state is then `DISABLED_BY_USER`
   (row 4), not `DENIED`, until `displayxr-cli desktop forget <exe>`.
 - `DXR_DESKTOP_CONTROL=0` is read once, when the session's desktop-control object is created
@@ -222,25 +227,39 @@ Decisions the sections above leave open, as implemented in `u_desktop_control.c`
 
 **Validation (§4).** Besides the listed rules: `text` must be valid UTF-8 and at most 65 536
 bytes; `clickCount` 0–3 (0 = 1); `button` LEFT/RIGHT/MIDDLE; `SCROLL` needs a non-zero
-`scrollX`/`scrollY`, each within ±100 notches; `MOVE_RESIZE` width/height ≥ 0 (0 = keep size).
+`scrollX`/`scrollY`, each within ±100 notches; `MOVE_RESIZE` width/height ≥ 0 (0 = keep size);
+`point`, `point2` and the rect's offset within ±1 000 000 and its extent ≤ 1 000 000, for every
+action type. Validation messages never echo the input (`"keys is not a valid chord"`).
 `xrEnumerateDesktopWindowsDXR` requires `windows[i].type` to be set (OpenXR's usual array rule);
 `XrDesktopPickDXR.window` is pure output.
 
-**Text at a point.** At most 16 KiB are returned (cut on a code point).
+**Text at a point.** At most 16 KiB are returned. A backend that fills the buffer may cut a
+code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_partial`).
 
 **Safety layer (§5).**
 - Before step 2 an action whose capability the backend lacks (`WINDOW_ACTIONS` / `INPUT`)
   completes with `XR_ERROR_FEATURE_UNSUPPORTED`. Likewise a pointer action on a backend without a
   hit test, or a keyboard action on one that cannot report focus: never delivered unverified.
-- Step 2: the kill switch, a lock or a deny that lands during the idle wait ends it at once
-  (state re-checked on every poll; default poll 50 ms). An unknown idle time (backend returns
-  false) does not wait. `idle_ms` 0 disables the wait; values above 10 000 are clamped.
-- "Our own input" is marked after every injected input call (text, keys, pointer move, button,
-  scroll). Window operations are **not** marked: on most OSes they are not input, and marking
-  them would hide real user activity for 150 ms; where a backend performs them as simulated
-  input (GNOME), the next input action merely waits `idle_ms`.
-- `CLICK`, `DRAG` and `SCROLL` move the pointer to `point` first, then re-pick, then press.
-  A pressed button is always released, whatever happens next.
+- Step 2 applies to every action. The kill switch, a lock or a deny that lands during the
+  idle wait ends it at once (state re-checked on every poll; default poll 50 ms). An unknown
+  idle time (backend returns false) does not wait. `idle_ms` 0 disables the wait; values above
+  10 000 are clamped.
+- Our own injections: every backend action call (window ops included) records its window
+  `[start, end]`; the last 32 are kept. Input whose OS timestamp (`now − idle_ms`, 1 ms rounding
+  allowed) falls in `[start, end + 150 ms]` is ours — **but the decision waits until that window
+  has closed**: a user who keeps typing then shows a newer timestamp outside it, so back-to-back
+  actions cannot chain past an active user through each other's grace windows. Cost: an action
+  that follows another by less than 150 ms waits for the rest of the grace window.
+- Before step 3 the backend's `prepare_input` (if any) runs, so slow setup (the GNOME portal)
+  happens before verification, never between it and the injection.
+- Step 5 runs under the input guard (`u_desktop.h`): `still_allowed` re-reads the store stamp
+  and checks an unreadable store, the kill switch, the deny, `is_locked`, revocation and session
+  destroy, and announces a state change it finds. A stop it causes completes with that reason
+  (`"kill switch"`, `"screen locked"`, `"disabled by the user"`,
+  `"the desktop-control settings file is unreadable"`); a stop at destroy is not reported.
+- `CLICK`, `DRAG` and `SCROLL` move the pointer to `point` first, then re-pick, then press —
+  the press and the scroll carry the verified point. A pressed button is always released,
+  whatever happens next (a drag releases at `point2` if the move got there, else at `point`).
 - Exact messages: `"kill switch"`, `"screen locked"`, `"disabled by the user"`,
   `"the user is active"`, `"target is not under the point (found <app>: <title>)"` (or
   `found the desktop` / `found the shell` / `found nothing: outside every monitor`),
@@ -249,22 +268,46 @@ bytes; `clickCount` 0–3 (0 = 1); `button` LEFT/RIGHT/MIDDLE; `SCROLL` needs a 
   granted for any other reason completes with `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
   `"desktop control is not granted (state <STATE>)"`.
 - Backend errors map to: `UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED`, `NOT_GRANTED` →
-  `…_NOT_GRANTED_DXR` (and the state is re-announced), `WINDOW_LOST` → `…_WINDOW_LOST_DXR`,
-  `REFUSED` → `…_REFUSED_DXR`, `TIMEOUT` / `FAILED` → `XR_ERROR_RUNTIME_FAILURE`.
+  `…_NOT_GRANTED_DXR` (and the state becomes `DENIED`, see Revocation), `WINDOW_LOST` →
+  `…_WINDOW_LOST_DXR`, `REFUSED` → `…_REFUSED_DXR`, `TIMEOUT` / `FAILED` →
+  `XR_ERROR_RUNTIME_FAILURE`.
+- **Privacy:** for `TYPE_TEXT` and `KEY_CHORD` a backend's own message is never passed on.
+  Every outcome maps to a fixed string: `REFUSED` → `"focus moved"` (or the guard's reason),
+  `NOT_GRANTED` → `"the OS refused: permission missing or revoked"`, `UNSUPPORTED` →
+  `"this desktop backend cannot deliver this input"`, `WINDOW_LOST` →
+  `"the target window no longer exists"`, anything else → `"the input could not be delivered"`.
 - On session destroy an action mid-flight finishes its current backend call and stops (audited
   as `aborted`, no event).
 
 **Store and audit (§6).**
 - The store is re-read when its stamp changes: mtime (with nanoseconds), size and file identity
   (inode / creation time) — so two writes within one mtime tick are still seen.
-- `DXR_DESKTOP_CONTROL_DIR` overrides both the store and the audit directory.
+- An existing file that cannot be read or parsed: the last good policy read in this process is
+  kept; with none, everything is `SUSPENDED` (above). Writers never turn it into defaults:
+  `allow` / `deny` / `forget` / `resume` fail with a message naming the file; `stop` (the kill
+  switch must always work) moves it to `desktop_control.json.corrupt` and writes a fresh
+  suspended store. `displayxr-cli desktop status` reports an unreadable store.
+- Every read-modify-write holds an exclusive OS lock on `desktop_control.json.lock` (`flock` /
+  `LockFileEx`) and re-reads the file under it.
+- `DXR_DESKTOP_CONTROL_DIR` overrides both the store and the audit directory; the runtime logs a
+  WARN once per process when it does, and `desktop status` prints the override and the store
+  path in use.
 - Audit records: `t`, `exe`, `pid`, `action`, `target` (`id`, `app`, `title`), `x`/`y` for
   pointer actions, `chars` (code points) for `type_text`, `result`, `message` on failure,
   `reason` on `request`, and `by` + `subject` for store changes (`allow` / `deny` / `forget` /
   `suspended` / `resumed`, written by whoever changed the store: `cli`, `prompt`).
-- A key chord is logged only when it is a shortcut (`ctrl`, `alt` or `super` held): a bare or
-  shift-only key is a typed character, and typed text never reaches the log.
+- A key chord is logged only when it is a shortcut: `ctrl` or `super` held, and not `ctrl+alt`
+  (AltGr on Windows / Linux). A bare, shift-only, alt-only (macOS Option) or AltGr chord produces
+  a character, and typed text never reaches the log.
+- An action refused at submit because the state is not granted is audited once per state
+  (`result: "not_granted"`); an unknown action type is audited as `"unknown"`.
 - The audit record type has no text field at all, so the rule cannot be broken by a caller.
+
+**Lifetime.** The context handed to `request_access` is a small refcounted block (one
+reference for the session object, one per request in flight) that outlives the session object.
+Destroy sets `dying`, destroys the backend (which must deliver or cancel an owed answer first),
+then detaches the block, so an answer arriving later from a backend that broke that contract
+is dropped instead of touching freed memory.
 
 **Probe.** `test_apps/probes/desktop_control_probe` (headless, every desktop OS) exposes every
 call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-end run.

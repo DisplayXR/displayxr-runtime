@@ -2,7 +2,7 @@
 # Never touches the real desktop. Needs displayxr-cli on PATH:
 #   PATH=<build>/src/xrt/targets/cli:$PATH XR_RUNTIME_JSON=<build>/openxr_displayxr-dev.json \
 #   DXR_DESKTOP_BACKEND=fake DXR_DESKTOP_CONTROL_DIR=$(mktemp -d) desktop_control_probe script e2e_fake.txt
-# Exit code 0 = every expectation held.
+# Exit code 0 = every expectation held. The last block uses a POSIX shell (`run sh -c`).
 expect-state NOT_REQUESTED
 request so the probe can type for you
 expect-state GRANTED
@@ -51,3 +51,14 @@ expect-state GRANTED
 act key target=102 keys=ctrl+s
 expect XR_SUCCESS
 run displayxr-cli desktop audit --tail 40
+# contract v2 (spec §6.1): an unparseable store never means defaults
+run sh -c 'echo {not-json, > $DXR_DESKTOP_CONTROL_DIR/desktop_control.json'
+expect-state GRANTED
+run displayxr-cli desktop status
+# ...and the kill switch still works over it (moved aside, suspended store written)
+run displayxr-cli desktop stop
+expect-state SUSPENDED
+run displayxr-cli desktop resume
+expect-state GRANTED
+act key target=102 keys=ctrl+w
+expect XR_SUCCESS
