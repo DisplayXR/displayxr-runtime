@@ -1,0 +1,77 @@
+name: Mirror CI images
+
+# Mirrors the Ubuntu base images the Linux CI lanes run in (build-linux.yml:
+# Package / Deb / Newest containers, DebInstall's clean-install check) into this
+# org's GitHub Container Registry, ghcr.io/displayxr/ci-ubuntu:<release>.
+#
+# Why: every public registry caps ANONYMOUS pulls, and GitHub-hosted runners share
+# egress IPs, so the cap is someone else's to exhaust:
+#   - Docker Hub: "You have reached your pull rate limit" (#1893, moved off it in #1909)
+#   - ECR Public: "toomanyrequests: Data limit exceeded" — took out the v2.45.3
+#     release's Deb job twice, so v2.45.3 shipped with no .deb.
+# CI jobs pull the mirror AUTHENTICATED with their own GITHUB_TOKEN, which GHCR does
+# not cap that way. Only this workflow touches the upstream registries: three pulls
+# a week, Docker Hub first, ECR Public as the fallback, with retries.
+#
+# Bootstrap / refresh: runs weekly (security updates land in the upstream tags), on
+# workflow_dispatch, and on any change to this file.
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'   # Mondays 04:17 UTC
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths: [ '.github/workflows/mirror-ci-images.yml' ]
+  pull_request:
+    paths: [ '.github/workflows/mirror-ci-images.yml' ]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-ci-images
+  cancel-in-progress: false
+
+jobs:
+  Mirror:
+    # Fork PRs get a read-only token and cannot publish; the same-repo PR / main run does.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ '22.04', '24.04', '26.04' ]
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull ubuntu:${{ matrix.release }} (Docker Hub, then ECR Public)
+        id: pull
+        run: |
+          set -u
+          for src in "docker.io/library/ubuntu:${{ matrix.release }}" "public.ecr.aws/ubuntu/ubuntu:${{ matrix.release }}"; do
+            for i in 1 2 3 4; do
+              if docker pull "$src"; then
+                echo "src=$src" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              sleep $((i * 20))
+            done
+            echo "::warning::$src unavailable after retries; trying the next registry"
+          done
+          echo "::error::ubuntu:${{ matrix.release }} could not be pulled from Docker Hub or ECR Public"
+          exit 1
+
+      - name: Push ghcr.io/displayxr/ci-ubuntu:${{ matrix.release }}
+        run: |
+          set -eu
+          dst="ghcr.io/displayxr/ci-ubuntu:${{ matrix.release }}"
+          # Label the image with this repo so GHCR links the package to it (repo
+          # access for the CI token, and the package page points back here).
+          printf 'FROM %s\nLABEL org.opencontainers.image.source=https://github.com/%s\nLABEL org.opencontainers.image.description="Mirror of %s for DisplayXR CI"\n' \
+            "${{ steps.pull.outputs.src }}" "${{ github.repository }}" "${{ steps.pull.outputs.src }}" > Dockerfile.mirror
+          docker build -f Dockerfile.mirror -t "$dst" .
+          docker push "$dst"
+          echo "Mirrored ${{ steps.pull.outputs.src }} -> $dst"
