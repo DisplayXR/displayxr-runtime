@@ -7,12 +7,16 @@
 # Acts on no other window. Needs Accessibility for the launching app (Terminal /
 # your IDE) and an unlocked screen; the runtime refuses everything while locked.
 #
-#   test_apps/probes/desktop_control_probe/e2e_real_macos.sh <runtime build dir> <probe binary>
+#   test_apps/probes/desktop_control_probe/e2e_real_macos.sh <runtime build dir> <probe binary> [repeat N]
+#
+# With a repeat count the idle check runs once, before the first pass: the test's own
+# keystrokes reset the OS idle timer, so a per-pass check would refuse pass 2 onwards.
 #
 # Exit 0 = every expectation held and both files read back as expected.
 set -euo pipefail
 BUILD=$(cd "${1:?runtime build dir}" && pwd)
 PROBE=${2:?desktop_control_probe binary}
+REPEAT=${4:-1}
 SMOKE=$BUILD/src/xrt/auxiliary/desktop/desktop_backend_smoke
 CLI=$BUILD/src/xrt/targets/cli/displayxr-cli
 # Only on an idle machine: this test takes focus and types. A person using the Mac
@@ -22,6 +26,14 @@ idle=$("$SMOKE" info | sed -nE 's/.*idle=([0-9]+) ms.*/\1/p')
 if [ "${DXR_E2E_FORCE:-0}" != 1 ] && [ "${idle:-0}" -lt 60000 ]; then
 	echo "refusing: someone is using this Mac (idle ${idle:-?} ms < 60 s). Run it unattended."
 	exit 3
+fi
+if [ "$REPEAT" -gt 1 ]; then
+	fails=0
+	for n in $(seq 1 "$REPEAT"); do
+		if DXR_E2E_FORCE=1 "$0" "$1" "$2"; then echo "pass $n/$REPEAT: clean"; else fails=$((fails+1)); echo "pass $n/$REPEAT: FAILED"; fi
+	done
+	echo "repeat summary: $((REPEAT-fails))/$REPEAT clean"
+	exit $fails
 fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
