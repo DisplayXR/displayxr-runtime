@@ -164,6 +164,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-053](adr/ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
 - [ADR-054](adr/ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
 - [ADR-055](adr/ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
+- [ADR-057](adr/ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
 <!-- END ADR INDEX -->
 
 ---
