@@ -235,11 +235,17 @@ struct Fixture : CoreOps
 	                 const char *binary = "scripted",
 	                 bool spawn_for_describe = true,
 	                 const std::vector<uint8_t> *cache = nullptr,
-	                 bool fake_mutex = false)
+	                 bool fake_mutex = false,
+	                 const conv_image_alloc_ops *alloc = nullptr,
+	                 uint64_t adapter_luid = 0,
+	                 const conv_host_proxy_gpu_ops *gpu = nullptr)
 	{
 		conv_core_config cfg{};
 		cfg.alloc.alloc = cpu_alloc;
 		cfg.alloc.free = cpu_free;
+		if (alloc != nullptr) {
+			cfg.alloc = *alloc;
+		}
 		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
 		cfg.prewarm_task_mask = 1ull << 63;
 		cfg.rear_cap_m = -1.0f;
@@ -270,6 +276,8 @@ struct Fixture : CoreOps
 		pc.host_exe = host_exe;
 		pc.supervisor = &sc;
 		pc.scratch_bytes = 4ull * 1024 * 1024;
+		pc.adapter_luid = adapter_luid;
+		pc.gpu = gpu;
 		pc.extra_args = args.empty() ? nullptr : args.data();
 		pc.extra_arg_count = (uint32_t)args.size();
 		pc.spawn_for_describe = spawn_for_describe; // these tests start with no describe cache
@@ -700,6 +708,15 @@ TEST_CASE("proxy: RmForceShutdown of a host that cannot answer is the crash path
 
 #if defined(CONV_REAL_HOST_EXE) && defined(SIM_CONVERSION_PATH)
 
+#ifdef _WIN32
+#include "d3d11_service/d3d11_conv_host_lane.h"
+#include "d3d11_service/d3d11_lift.h"
+
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
+#include <mutex>
+#endif
+
 extern "C" xrt_result_t
 xrtConversionPluginNegotiate(uint32_t runtime_api_version,
                              const struct xrt_conversion_plugin_host_iface *host,
@@ -838,6 +855,186 @@ TEST_CASE("proxy: the real displayxr-conversion-host with the sim provider match
 	REQUIRE(satellite_job.size() == in_service_job.size());
 	CHECK(satellite_job == in_service_job);
 }
+
+
+#ifdef _WIN32
+
+namespace {
+
+//! Inputs (role 0) stay CPU memory (the submit helper writes cpu_ptr, the lane
+//! pushes them through scratch); results (role != 0) come from the service's
+//! D3D11 glue: shared NT-handle textures the host's output is copied into.
+struct HybridAlloc
+{
+	d3d11_lift *lift = nullptr;
+	conv_image_alloc_ops glue{};
+};
+
+bool
+hybrid_alloc(void *ud, const conv_image_request *req, xrt_conv_image *out)
+{
+	auto *h = static_cast<HybridAlloc *>(ud);
+	if (req->role != 0) {
+		// The sim provider takes no keyed mutex, which the glue insists on for
+		// its own images; a real GPU provider does. Ask as "any" so the glue
+		// serves it (the lane's copy acquires the target's keyed mutex).
+		conv_image_request any = *req;
+		any.import_memory_kinds = 0;
+		any.import_sync_kinds = 0;
+		if (h->glue.alloc(h->glue.ud, &any, out)) {
+			return true;
+		}
+	}
+	return cpu_alloc(nullptr, req, out);
+}
+
+void
+hybrid_free(void *ud, xrt_conv_image *img)
+{
+	auto *h = static_cast<HybridAlloc *>(ud);
+	if (img->memory_kind == XRT_CONV_MEM_CPU) {
+		cpu_free(nullptr, img);
+	} else {
+		h->glue.free(h->glue.ud, img);
+	}
+}
+
+template <typename T>
+void
+com_rel(T *&p)
+{
+	if (p != nullptr) {
+		p->Release();
+		p = nullptr;
+	}
+}
+
+} // namespace
+
+TEST_CASE(
+    "proxy: the real host over the D3D11 lane (WARP): the provider opens its own output texture after the "
+    "service pulled the announce",
+    "[conv_proxy][gpu]")
+{
+	// Regression: the service pulled every announced handle (output fence,
+	// output textures) with DUPLICATE_CLOSE_SOURCE, closing the HOST's copy; the
+	// host then handed its provider dead handle values at convert and the
+	// provider's open of its own output failed (E_INVALIDARG), so every convert
+	// failed. No other case drives the real host over the D3D11 lane.
+	ID3D11Device *dev = nullptr;
+	ID3D11DeviceContext *ctx = nullptr;
+	ID3D11Device1 *dev1 = nullptr;
+	const D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+	if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 2,
+	                             D3D11_SDK_VERSION, &dev, nullptr, &ctx)) ||
+	    FAILED(dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&dev1))) {
+		com_rel(ctx);
+		com_rel(dev1);
+		com_rel(dev);
+		SKIP("no D3D11.1 device on WARP");
+	}
+	uint64_t luid = 0;
+	{
+		IDXGIDevice *dd = nullptr;
+		IDXGIAdapter *ad = nullptr;
+		if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dd)) &&
+		    SUCCEEDED(dd->GetAdapter(&ad))) {
+			DXGI_ADAPTER_DESC d;
+			ad->GetDesc(&d);
+			luid = (uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32 | d.AdapterLuid.LowPart;
+		}
+		com_rel(ad);
+		com_rel(dd);
+	}
+	// WARP must share NT-handle textures and fences (the cross-process half is
+	// tests_conv_d3d11_xproc's probe; the host process is the proof here).
+	{
+		bool ok = luid != 0;
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = td.Height = 8;
+		td.MipLevels = td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+		ID3D11Texture2D *t = nullptr;
+		IDXGIResource1 *r = nullptr;
+		HANDLE h = nullptr;
+		ok = ok && SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &t)) &&
+		     SUCCEEDED(t->QueryInterface(__uuidof(IDXGIResource1), (void **)&r)) &&
+		     SUCCEEDED(r->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+		                                     nullptr, &h));
+		if (h != nullptr) {
+			CloseHandle(h);
+		}
+		com_rel(r);
+		com_rel(t);
+		ID3D11Device5 *d5 = nullptr;
+		ID3D11Fence *f = nullptr;
+		HANDLE fh = nullptr;
+		ok = ok && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&d5)) &&
+		     SUCCEEDED(d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **)&f)) &&
+		     SUCCEEDED(f->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &fh));
+		if (fh != nullptr) {
+			CloseHandle(fh);
+		}
+		com_rel(f);
+		com_rel(d5);
+		if (!ok) {
+			com_rel(ctx);
+			com_rel(dev1);
+			com_rel(dev);
+			SKIP("WARP cannot share NT-handle textures / fences");
+		}
+	}
+
+	std::mutex ctx_mtx;
+	HybridAlloc ha;
+	ha.lift = d3d11_lift_create(dev, ctx, &ctx_mtx, nullptr, nullptr);
+	REQUIRE(ha.lift != nullptr);
+	d3d11_lift_glue_alloc_ops(ha.lift, &ha.glue);
+	conv_image_alloc_ops alloc{};
+	alloc.alloc = hybrid_alloc;
+	alloc.free = hybrid_free;
+	alloc.ud = &ha;
+
+	conv_host_proxy_gpu_ops gpu{};
+	REQUIRE(d3d11_conv_host_lane_create(luid, &gpu));
+
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", "1");
+	set_env("DXR_CONV_HOST_ALLOW_ELEVATED", "1");
+	set_env("DXR_CONV_SIM_CONVERSION_ENABLE", "1");
+	set_env("DXR_CONV_SIM_CONVERSION_LATENCY_MS", "0");
+	uint64_t converted = 0, failed = 0;
+	{
+		// The proxy adopts the lane ops (destroyed with it); the same LUID goes
+		// to the host (--adapter-luid) so its and the sim's devices are on WARP.
+		Fixture fx({}, 0, 5, CONV_REAL_HOST_EXE, "sim-conversion", SIM_CONVERSION_PATH, true, nullptr, false,
+		           &alloc, luid, &gpu);
+		const uint64_t sid = fx.stream(XRT_CONV_TASK_DEPTH_MONO, XRT_CONV_TASK_DEPTH_MONO);
+		for (int i = 0; i < 3; i++) {
+			conv_result r{};
+			REQUIRE(fx.convert(sid, (uint8_t)(0x40 + i), &r, 20000));
+			CHECK((r.written & XRT_CONV_OUT_DEPTH) != 0u);
+			CHECK(r.depth.memory_kind == XRT_CONV_MEM_WIN32_NT_HANDLE);
+			conv_core_stream_release(fx.c, sid, r.ring_slot);
+		}
+		const conv_stream_stats st = fx.stats(sid);
+		converted = st.converted;
+		failed = st.failed;
+		CHECK(fx.sup().state == CONV_SUP_RUNNING);
+		REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+	}
+	CHECK(converted >= 2u);
+	CHECK(failed == 0u);
+
+	d3d11_lift_destroy(&ha.lift);
+	com_rel(ctx);
+	com_rel(dev1);
+	com_rel(dev);
+}
+
+#endif // _WIN32
 
 
 /*
