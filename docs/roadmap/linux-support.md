@@ -648,8 +648,10 @@ extension: a root-window grab while the service runs. Design and lifecycle:
 `docs/specs/runtime/workspace-controller-registration.md` § *Linux*. Unit-tested
 (`tests_service_orchestrator_linux`, `tests_service_hotkey_linux[_dbus]`,
 `tests_service_client_class`, `scripts/test_gnome_extension_workspace_hotkey.js`);
-**not yet run on a desktop** — the v13 extension has not been loaded in a live GNOME
-Shell, and there is no Linux shell build to spawn yet.
+The Linux shell build exists since shell v2.4.x (2026-10-11, `displayxr-shell_*_amd64.deb`
+on every shell release), so the spawn path has a real controller, and the extension has
+since run on a GNOME desktop: version 14 shipped with the lock-screen fix (#2072, three
+suspend/lock cycles with a weaving app, extension active throughout).
 
 ### Conformance — the Linux CTS arms (#1527)
 
