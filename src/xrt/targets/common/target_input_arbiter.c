@@ -216,7 +216,8 @@ struct t_input_arbiter
 
 	struct t_input_client clients[ARBITER_MAX_CLIENTS];
 
-	//! Moves when any client's resolved roles change or a client comes / goes (xrt_input_selection::get_generation).
+	//! Moves when any client's resolved roles change or a client comes / goes
+	//! (xrt_input_selection::get_generation).
 	uint64_t selection_generation;
 
 	/*!
@@ -791,7 +792,8 @@ client_get_and_lock(const struct xrt_input_selection_client *ref)
 		g_arb.clients_dropped++;
 		if (g_arb.clients_dropped == 1) {
 			U_LOG_W(
-			    "input arbiter: per-client table full (%d) — client %llu ('%s') gets the system-wide roles; its "
+			    "input arbiter: per-client table full (%d) — client %llu ('%s') gets the system-wide "
+			    "roles; its "
 			    "per-app pin and requests do not apply (see `input list --json` clients_dropped).",
 			    ARBITER_MAX_CLIENTS, (unsigned long long)key, exe);
 		} else {
@@ -921,12 +923,12 @@ resolve_client_locked(struct t_input_client *c)
 		const bool first = !c->warned;
 		c->warned = true;
 		U_LOG_IFL(first ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
-		    "input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
-		    "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
-		    (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
-		    ht[ARB_HT_UNOBSTRUCTED_RIGHT], gamepad, c->pref_id[0][0] ? c->pref_id[0] : "-",
-		    c->pref_id[1][0] ? c->pref_id[1] : "-", c->pref_id[2][0] ? c->pref_id[2] : "-",
-		    (unsigned long long)next.generation_id);
+		          "input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
+		          "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
+		          (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
+		          ht[ARB_HT_UNOBSTRUCTED_RIGHT], gamepad, c->pref_id[0][0] ? c->pref_id[0] : "-",
+		          c->pref_id[1][0] ? c->pref_id[1] : "-", c->pref_id[2][0] ? c->pref_id[2] : "-",
+		          (unsigned long long)next.generation_id);
 	}
 }
 
