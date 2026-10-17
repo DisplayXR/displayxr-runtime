@@ -619,6 +619,9 @@ multi_compositor_detach_and_destroy_dp(struct multi_compositor *mc)
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 	os_mutex_unlock(&mc->msc->render_lock);
 
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+	comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)xdp); // its eyes key (roadmap §5.2)
+#endif
 	xrt_display_processor_destroy(&xdp);
 }
 
@@ -2201,6 +2204,26 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	return true;
 }
 
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * ADR-053 P5 step C (roadmap §5.2): every eye query comp_multi answers
+ * publishes the answering DP's eyes into the conversion core, keyed by that DP
+ * -- the D3D11 service's per-DP eyes sink. A lifted weave rect names its weave
+ * engine's DP, so its stream reads exactly these.
+ */
+static bool
+eyes_published(const void *dp, bool ok, const struct xrt_eye_positions *eyes)
+{
+	if (ok) {
+		comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)dp, eyes);
+	}
+	return ok;
+}
+#define EYES_PUBLISHED(dp, call) eyes_published((dp), (call), out_eye_pos)
+#else
+#define EYES_PUBLISHED(dp, call) (call)
+#endif
+
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos)
 {
@@ -2209,8 +2232,9 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	}
 
 	if (mc->session_render.initialized && mc->session_render.display_processor != NULL) {
-		return xrt_display_processor_get_predicted_eye_positions(mc->session_render.display_processor,
-		                                                         out_eye_pos);
+		return EYES_PUBLISHED(mc->session_render.display_processor,
+		                      xrt_display_processor_get_predicted_eye_positions(
+		                          mc->session_render.display_processor, out_eye_pos));
 	}
 
 #ifdef COMP_MULTI_HAVE_WEAVE
@@ -2222,14 +2246,16 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// the weave itself visibly tracks the head. Same lock-free read trade as
 	// the weave-geometry metrics branch above.
 	if (mc->weave.dp != NULL) {
-		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
+		return EYES_PUBLISHED(mc->weave.dp,
+		                      xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos));
 	}
 #if defined(XRT_OS_MACOS) && defined(COMP_MULTI_WEAVE_HAVE_METAL)
 	// The macOS weave's Metal backend keeps its DP apart: `weave.dp` only ever
 	// holds a Vulkan-vtable DP. Read through the backend so the vendor call
 	// runs inside an autorelease pool (this is an IPC pthread with none).
 	if (mc->weave.dp_metal != NULL) {
-		return comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eye_pos);
+		return EYES_PUBLISHED(mc->weave.dp_metal,
+		                      comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eye_pos));
 	}
 #endif
 #endif
@@ -2241,7 +2267,8 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// shared_dp lives until the system compositor is destroyed (lock-free read,
 	// as above).
 	if (mc->msc != NULL && multi_shared_surface_active(mc->msc) && mc->msc->shared_dp != NULL) {
-		return xrt_display_processor_get_predicted_eye_positions(mc->msc->shared_dp, out_eye_pos);
+		return EYES_PUBLISHED(mc->msc->shared_dp, xrt_display_processor_get_predicted_eye_positions(
+		                                              mc->msc->shared_dp, out_eye_pos));
 	}
 #endif
 
