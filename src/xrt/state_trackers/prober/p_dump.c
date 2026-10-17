@@ -108,39 +108,6 @@ p_dump_device(struct prober *p, struct prober_device *pdev, int id, bool use_std
 		PTT("port%s            %s", num > 1 ? "s:" : ": ", tmp);
 	}
 
-#ifdef XRT_HAVE_LIBUSB
-	if (pdev->usb.dev != NULL) {
-		PTT("libusb:           %p", (void *)pdev->usb.dev);
-	}
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-	uvc_device_t *uvc_dev = pdev->uvc.dev;
-	if (uvc_dev != NULL) {
-		struct uvc_device_descriptor *desc;
-
-		PTT("libuvc:           %p", (void *)uvc_dev);
-
-		uvc_get_device_descriptor(uvc_dev, &desc);
-
-		if (desc->product != NULL) {
-
-			PTT("product:          '%s'", desc->product);
-		}
-		if (desc->manufacturer != NULL) {
-
-			PTT("manufacturer:     '%s'", desc->manufacturer);
-		}
-		if (desc->serialNumber != NULL) {
-
-			PTT("serial:           '%s'", desc->serialNumber);
-		}
-
-		uvc_free_device_descriptor(desc);
-		desc = NULL;
-	}
-#endif
-
 #ifdef XRT_HAVE_V4L2
 	for (size_t j = 0; j < pdev->num_v4ls; j++) {
 		struct prober_v4l *v4l = &pdev->v4ls[j];

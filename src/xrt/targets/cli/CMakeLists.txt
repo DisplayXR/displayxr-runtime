@@ -89,7 +89,6 @@ target_link_libraries(
 	PRIVATE
 		xrt-interfaces
 		aux_os
-		aux_os_ble
 		# ADR-043 Amendment 4: `camera uvc-devices` lists capture devices + the UVC config.
 		aux_os_uvc
 		aux_util

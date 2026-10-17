@@ -26,18 +26,6 @@
 #include "v4l2/v4l2_interface.h"
 #endif
 
-#ifdef XRT_BUILD_DRIVER_VF
-#include "vf/vf_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_EUROC
-#include "euroc/euroc_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_REALSENSE
-#include "realsense/rs_interface.h"
-#endif
-
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,9 +42,6 @@
 DEBUG_GET_ONCE_LOG_OPTION(prober_log, "PROBER_LOG", U_LOGGING_INFO)
 DEBUG_GET_ONCE_BOOL_OPTION(qwerty_enable, "QWERTY_ENABLE", false)
 DEBUG_GET_ONCE_BOOL_OPTION(qwerty_combine, "QWERTY_COMBINE", false)
-DEBUG_GET_ONCE_OPTION(vf_path, "VF_PATH", NULL)
-DEBUG_GET_ONCE_OPTION(euroc_path, "EUROC_PATH", NULL)
-DEBUG_GET_ONCE_NUM_OPTION(rs_source_index, "RS_SOURCE_INDEX", -1)
 
 
 /*
@@ -468,28 +453,6 @@ initialize(struct prober *p, struct xrt_prober_entry_lists *lists)
 		return -1;
 	}
 
-#ifdef XRT_HAVE_LIBUSB
-	ret = p_libusb_init(p);
-	if (ret != 0) {
-		teardown(p);
-		return -1;
-	}
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-	ret = p_libuvc_init(p);
-	if (ret != 0) {
-		teardown(p);
-		return -1;
-	}
-#endif
-
-	ret = p_tracking_init(p);
-	if (ret != 0) {
-		teardown(p);
-		return -1;
-	}
-
 	for (int i = 0; i < XRT_MAX_AUTO_PROBERS && lists->auto_probers[i]; i++) {
 		p->auto_probers[i] = lists->auto_probers[i]();
 	}
@@ -530,18 +493,6 @@ teardown_devices(struct prober *p)
 			free((char *)pdev->usb.path);
 			pdev->usb.path = NULL;
 		}
-
-#ifdef XRT_HAVE_LIBUSB
-		if (pdev->usb.dev != NULL) {
-			//! @todo Free somewhere else
-		}
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-		if (pdev->uvc.dev != NULL) {
-			//! @todo Free somewhere else
-		}
-#endif
 
 #ifdef XRT_HAVE_V4L2
 		for (size_t j = 0; j < pdev->num_v4ls; j++) {
@@ -601,9 +552,6 @@ teardown(struct prober *p)
 		p->auto_probers[i] = NULL;
 	}
 
-	// Need to turn off tracking early.
-	p_tracking_teardown(p);
-
 	// Need to free all entries.
 	if (p->entries != NULL) {
 		free(p->entries);
@@ -612,14 +560,6 @@ teardown(struct prober *p)
 	}
 
 	teardown_devices(p);
-
-#ifdef XRT_HAVE_LIBUVC
-	p_libuvc_teardown(p);
-#endif
-
-#ifdef XRT_HAVE_LIBUSB
-	p_libusb_teardown(p);
-#endif
 
 	u_config_json_close(&p->json);
 
@@ -869,22 +809,6 @@ p_probe(struct xrt_prober *xp)
 	ret = p_udev_probe(p);
 	if (ret != 0) {
 		P_ERROR(p, "Failed to enumerate udev devices\n");
-		return XRT_ERROR_PROBING_FAILED;
-	}
-#endif
-
-#ifdef XRT_HAVE_LIBUSB
-	ret = p_libusb_probe(p);
-	if (ret != 0) {
-		P_ERROR(p, "Failed to enumerate libusb devices\n");
-		return XRT_ERROR_PROBING_FAILED;
-	}
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-	ret = p_libuvc_probe(p);
-	if (ret != 0) {
-		P_ERROR(p, "Failed to enumerate libuvc devices\n");
 		return XRT_ERROR_PROBING_FAILED;
 	}
 #endif
@@ -1207,33 +1131,6 @@ p_open_video_device(struct xrt_prober *xp,
 
 	XRT_MAYBE_UNUSED struct prober_device *pdev = (struct prober_device *)xpdev;
 
-#if defined(XRT_BUILD_DRIVER_VF)
-	const char *path = debug_get_option_vf_path();
-	if (path != NULL) {
-		struct xrt_fs *xfs = vf_fs_open_file(xfctx, path);
-		if (xfs) {
-			*out_xfs = xfs;
-			return 0;
-		}
-	}
-#endif
-
-#if defined(XRT_BUILD_DRIVER_EUROC)
-	const char *euroc_path = debug_get_option_euroc_path();
-	if (euroc_path != NULL) {
-		*out_xfs = euroc_player_create(xfctx, euroc_path, NULL); // Euroc will exit if it can't be created
-		return 0;
-	}
-#endif
-
-#if defined(XRT_BUILD_DRIVER_REALSENSE)
-	int rs_source_index = debug_get_num_option_rs_source_index();
-	if (rs_source_index != -1) {
-		*out_xfs = rs_source_create(xfctx, rs_source_index);
-		return 0;
-	}
-#endif
-
 #if defined(XRT_HAVE_V4L2)
 	if (pdev->num_v4ls == 0) {
 		return -1;
@@ -1257,28 +1154,11 @@ p_list_video_devices(struct xrt_prober *xp, xrt_prober_list_video_func_t cb, voi
 {
 	struct prober *p = (struct prober *)xp;
 
-	// Video sources from drivers (at most one will be listed)
-	const char *vf_path = debug_get_option_vf_path();
-	const char *euroc_path = debug_get_option_euroc_path();
-	int rs_source_index = debug_get_num_option_rs_source_index();
-
-	if (vf_path != NULL) {
-		cb(xp, NULL, "Video File", "Collabora", vf_path, ptr);
-	} else if (euroc_path != NULL) {
-		cb(xp, NULL, "Euroc Dataset", "Collabora", euroc_path, ptr);
-	} else if (rs_source_index != -1) {
-		cb(xp, NULL, "RealSense Source", "Collabora", "", ptr);
-	}
-
 	// Video sources from video devices
 	for (size_t i = 0; i < p->device_count; i++) {
 		struct prober_device *pdev = &p->devices[i];
 
 		bool has = false;
-#ifdef XRT_HAVE_LIBUVC
-		has |= pdev->uvc.dev != NULL;
-#endif
-
 #ifdef XRT_HAVE_V4L2
 		has |= pdev->num_v4ls > 0;
 #endif
@@ -1332,20 +1212,10 @@ p_get_string_descriptor(struct xrt_prober *xp,
 	struct prober_device *pdev = (struct prober_device *)xpdev;
 	int ret = 0;
 
-#ifdef XRT_HAVE_LIBUSB
-	if (pdev->base.bus == XRT_BUS_TYPE_USB && pdev->usb.dev != NULL) {
-		assert(max_length < INT_MAX);
-		ret = p_libusb_get_string_descriptor(p, pdev, which_string, buffer, (int)max_length);
-		if (ret >= 0) {
-			return ret;
-		}
-	}
-#else
 	if (pdev->base.bus == XRT_BUS_TYPE_USB) {
-		P_WARN(p, "Cannot get usb descriptors (libusb-dev not installed)!");
+		P_WARN(p, "Cannot get usb descriptors (no USB descriptor backend built in)!");
 		return ret;
 	}
-#endif
 
 	if (pdev && pdev->base.bus == XRT_BUS_TYPE_BLUETOOTH) {
 		switch (which_string) {
@@ -1378,13 +1248,6 @@ p_can_open(struct xrt_prober *xp, struct xrt_prober_device *xpdev)
 	struct prober *p = (struct prober *)xp;
 	struct prober_device *pdev = (struct prober_device *)xpdev;
 	bool has_been_queried = false;
-
-#ifdef XRT_HAVE_LIBUSB
-	has_been_queried = true;
-	if (pdev->usb.dev != NULL) {
-		return p_libusb_can_open(p, pdev);
-	}
-#endif
 
 	// No backend compiled in to judge the ability to open the device.
 	if (!has_been_queried) {
