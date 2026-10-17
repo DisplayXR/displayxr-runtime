@@ -23,6 +23,7 @@ set(tests
     tests_vector
     tests_worker
     tests_pose
+    tests_view_rig_point
     tests_vec3_angle
     tests_u_multi_display
     tests_dp_weave_scope
@@ -555,6 +556,10 @@ target_link_libraries(tests_quatexpmap PRIVATE aux_math)
 target_link_libraries(tests_rational PRIVATE aux_math)
 target_link_libraries(tests_relation_chain PRIVATE aux_math)
 target_link_libraries(tests_pose PRIVATE aux_math)
+# XR_DXR_view_rig spec 4 (#2189) -- the rig point mapping hand joints use IS the
+# shared core's eye mapping: bit-for-bit against displayxr-common across a sweep,
+# plus the issue's joint cases.
+target_link_libraries(tests_view_rig_point PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)

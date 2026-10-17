@@ -20,8 +20,8 @@
  *
  * TO BE FOLDED into displayxr-common as point functions (a point mapping
  * without the frustum the core computes alongside each eye):
- * DisplayXR/displayxr-common issue "expose rig point mapping so the runtime's
- * hand-joint path can share the view math". Until then this file is the one
+ * DisplayXR/displayxr-common#84 ("expose rig point mapping so the runtime's
+ * hand-joint path can share the view math"). Until then this file is the one
  * runtime-side caller.
  *
  * @ingroup aux_math
@@ -66,7 +66,79 @@ struct m_view_rig_canvas
  * xrLocateViews applies to every DP eye before the rig math.
  */
 void
-m_view_rig_canvas_rebase(const struct m_view_rig_canvas *canvas, const struct xrt_vec3 *p_display, struct xrt_vec3 *out);
+m_view_rig_canvas_rebase(const struct m_view_rig_canvas *canvas,
+                         const struct xrt_vec3 *p_display,
+                         struct xrt_vec3 *out);
+
+/*!
+ * Which rig a mapping applies; NONE = identity (no descriptor chained).
+ */
+enum m_view_rig_kind
+{
+	M_VIEW_RIG_NONE = 0,
+	M_VIEW_RIG_DISPLAY = 1,
+	M_VIEW_RIG_CAMERA = 2,
+};
+
+/*!
+ * A rig descriptor, post-clamp, in the shape the view math consumes (the
+ * XrDisplayRigDXR / XrCameraRigDXR values after the runtime's boundary
+ * conversions). @ref pose is in the OUTPUT space — the space the mapped point
+ * is wanted in (for joints: XrHandJointsLocateInfoEXT::baseSpace).
+ */
+struct m_view_rig
+{
+	enum m_view_rig_kind kind;
+	struct xrt_pose pose;
+	// Display rig.
+	float virtual_display_height; //!< app units; m2v = this / canvas height
+	float perspective_factor;
+	// Camera rig.
+	float m2v;                      //!< meters -> world units (<= 0 treated as 1)
+	float inv_convergence_distance; //!< frustum only: does not move a point
+	float half_tan_vfov;            //!< frustum only: does not move a point
+};
+
+/*!
+ * Canvas frame -> rig frame for ONE point: the shared core's eye mapping for an
+ * eye at @p p_canvas with the eye-pair factors (ipd, parallax) neutral —
+ * `dxr_xrt_display3d_compute_views` / `dxr_xrt_camera3d_compute_views` with a
+ * count of one. So a point maps exactly as an eye there would.
+ * M_VIEW_RIG_NONE copies the point.
+ */
+void
+m_view_rig_map_canvas_point(const struct m_view_rig_canvas *canvas,
+                            const struct m_view_rig *rig,
+                            const struct xrt_vec3 *p_canvas,
+                            struct xrt_vec3 *out);
+
+/*!
+ * The uniform length scale the rig applies to a point (radii, linear
+ * velocities): display rig `perspectiveFactor x virtualDisplayHeight / canvas
+ * height`, camera rig `metersToVirtual` (<= 0 = 1). 1 for NONE.
+ */
+float
+m_view_rig_length_scale(const struct m_view_rig_canvas *canvas, const struct m_view_rig *rig);
+
+/*!
+ * Map one tracked relation (a hand joint) from @p base into the rig frame:
+ * base -> physical display plane (`inverse(plane_base)`) -> canvas
+ * (@ref m_view_rig_canvas_rebase) -> rig (@ref m_view_rig_map_canvas_point).
+ * Orientation and angular velocity are rotated by
+ * `rig.pose.orientation * inverse(canvas.orientation) * inverse(plane.orientation)`;
+ * linear velocity is rotated the same way and scaled by
+ * @ref m_view_rig_length_scale, as is @p radius. Flags are kept. For
+ * M_VIEW_RIG_NONE (or an invalid canvas) the relation and radius are copied
+ * unchanged.
+ */
+void
+m_view_rig_map_relation(const struct m_view_rig_canvas *canvas,
+                        const struct m_view_rig *rig,
+                        const struct xrt_pose *plane_base,
+                        const struct xrt_space_relation *in_base,
+                        float radius,
+                        struct xrt_space_relation *out,
+                        float *out_radius);
 
 #ifdef __cplusplus
 }

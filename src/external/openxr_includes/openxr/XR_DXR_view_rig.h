@@ -40,6 +40,22 @@
  * frame), and a locate that chains nothing keeps the default behavior —
  * including the raw-eye transport in XrView.pose for external-window apps.
  *
+ * Rig-scoped hand joints (spec 4): the SAME descriptor may be chained on
+ * XrHandJointsLocateInfoEXT::next (XR_EXT_hand_tracking). The runtime then
+ * returns the joints in the rig frame — exactly the transform the views get for
+ * that descriptor: display rig: display-space metres -> app units by
+ * virtualDisplayHeight / the session's resolved canvas height, times
+ * perspectiveFactor, placed at the rig pose; camera rig: metersToVirtual about
+ * the nominal viewer plane, placed at the camera pose. Joint radii and linear
+ * velocities scale by the same factor; orientations and angular velocities are
+ * rotated into the rig frame. The eye-pair tunables (ipdFactor, parallaxFactor)
+ * and the camera frustum (convergence, vertical FOV) do not move a point and do
+ * not apply. The canvas is the one the session's most recent xrLocateViews
+ * resolved (in service mode, the one the service resolved for it), so joints
+ * are consistent with the latest views; chain the same descriptor on both. The
+ * rig pose is taken in XrHandJointsLocateInfoEXT::baseSpace. A locate that
+ * chains nothing returns base-space metres, as before.
+ *
  * The app-facing halves are pure next-chain structs on xrLocateViews. The one
  * entry point, xrSetWorkspaceViewRigDXR, is for the workspace controller only:
  * an app's own rig is honored by default (app visual policy within its canvas),
@@ -57,7 +73,9 @@ extern "C" {
 #endif
 
 #define XR_DXR_view_rig 1
-#define XR_DXR_view_rig_SPEC_VERSION 3
+// Spec 4 (#2189): the rig descriptors are also valid on
+// XrHandJointsLocateInfoEXT::next — joints are returned in the rig frame.
+#define XR_DXR_view_rig_SPEC_VERSION 4
 #define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
 
 // Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
@@ -69,7 +87,8 @@ extern "C" {
 //! Capacity of XrViewDisplayRawDXR::rawEyes (matches the runtime's max views).
 #define XR_VIEW_RIG_MAX_RAW_EYES_DXR 8
 
-// ---- Request: chain exactly ONE of these on XrViewLocateInfo::next. ----
+// ---- Request: chain exactly ONE of these on XrViewLocateInfo::next ----
+// ---- (spec 4: or on XrHandJointsLocateInfoEXT::next, for rig-frame joints). ----
 
 /*!
  * @brief Display-centric rig: the window/canvas is a portal into the scene.

@@ -33,6 +33,8 @@
 #include "util/u_cursor_depth.h"
 #include "util/u_tracking_any.h"
 
+#include "math/m_view_rig_point.h"
+
 #include "oxr_extension_support.h"
 #include "oxr_subaction.h"
 #include "oxr_defines.h"
@@ -3118,6 +3120,34 @@ struct oxr_session
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
+
+	/*!
+	 * XR_DXR_view_rig spec 4 (#2189): the canvas and PHYSICAL display plane the
+	 * most recent view locate resolved, for rig-scoped hand joints. Written by
+	 * every view locate that resolves one view set for the whole window (the
+	 * single-screen path, the majority segment of a stereo split); in service
+	 * mode from the SERVICE's reply for that locate (never re-derived here).
+	 * Joints are therefore consistent with the latest view locate on this
+	 * session. @ref plane_origin is the physical display plane in the head
+	 * device's tracking-origin space (before any rig pose replaces it), so a
+	 * joint locate in any base space re-expresses it through that device's
+	 * origin relation at the joint time.
+	 */
+	struct
+	{
+		struct os_mutex lock;
+		bool valid;
+		XrTime display_time; //!< the view locate's predicted display time
+		struct m_view_rig_canvas canvas;
+		struct xrt_pose plane_origin;
+	} rig_canvas;
+
+	/*!
+	 * XR_DXR_view_rig spec 4 (#2189): the rig last chained on
+	 * XrHandJointsLocateInfoEXT — the same parse + clamps as @ref view_rig,
+	 * kept apart so a joint locate never changes what the views use.
+	 */
+	struct oxr_view_rig_state joint_rig;
 
 	/*!
 	 * #1502: the VIEW reference space's eye-centroid offset, expressed in the

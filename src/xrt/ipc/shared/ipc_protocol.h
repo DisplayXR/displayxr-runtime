@@ -33,6 +33,7 @@
 #include "xrt/xrt_config_build.h"
 
 #include <assert.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 
@@ -1488,6 +1489,30 @@ struct ipc_view_raw_info
 };
 
 /*!
+ * XR_DXR_view_rig spec 4 (#2189): the canvas and PHYSICAL display plane the
+ * server resolved for this locate's views, so the client maps rig-scoped hand
+ * joints into the same frame without re-deriving the canvas from window rects.
+ * @ref center / @ref orientation are what the server subtracted from / rotated
+ * the eyes by (window + zone centre offset, window orientation); @ref plane is
+ * the display plane BEFORE a rig pose replaced it, in the head device's
+ * tracking-origin space (the server's math frame).
+ *
+ * @ingroup ipc
+ */
+struct ipc_view_rig_canvas
+{
+	uint32_t valid;
+	float width_m;  //!< Kooima canvas width (after any portrait swap)
+	float height_m; //!< Kooima canvas height — the display rig's m2v denominator
+	struct xrt_vec3 center;
+	struct xrt_quat orientation;
+	uint32_t has_orientation;
+	float nominal_y_m;
+	float nominal_z_m;
+	struct xrt_pose plane;
+};
+
+/*!
  * XR_DXR_view_rig over IPC (#396 W7): reply for session_locate_views_rig.
  * head_relation/fovs/poses are the SAME outputs the legacy
  * device_get_view_poses handler produces (same server code path, with the
@@ -1520,7 +1545,19 @@ struct ipc_info_locate_views_rig
 	float rear_far_offset_vh; //!< vH; 0 = clip at the ZDP, 1000 = unrestricted
 	uint32_t rear_state;      //!< enum u_rear_budget_state / XrRearDepthBudgetStateDXR
 	float rear_cue;           //!< 0..1 background cue energy; 0 when no source
+
+	/*
+	 * XR_DXR_view_rig spec 4 (#2189) - append-only past this point.
+	 */
+	struct ipc_view_rig_canvas canvas;
 };
+
+// The rig reply is one message: it must still fit the buffer with the canvas appended.
+static_assert(sizeof(struct ipc_info_locate_views_rig) + 16 <= IPC_BUF_SIZE,
+              "ipc_info_locate_views_rig no longer fits one IPC reply");
+// Append-only (#2189): the canvas rides after every earlier field.
+static_assert(offsetof(struct ipc_info_locate_views_rig, canvas) > offsetof(struct ipc_info_locate_views_rig, rear_cue),
+              "ipc_info_locate_views_rig::canvas must stay appended after rear_cue");
 
 struct ipc_pcm_haptic_buffer
 {
