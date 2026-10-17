@@ -137,7 +137,10 @@ struct vk_conv_weave_ops
 	//! A new weave starts recording: everything still pending was never submitted (dropped).
 	void (*begin)(void *ud, struct vk_conv_weave_client *c);
 	//! Record one lifted rect into @p cmd. False = not lifted (weave the rect as drawn).
-	bool (*record)(void *ud, struct vk_conv_weave_client *c, VkCommandBuffer cmd, const struct vk_conv_weave_rect *r);
+	bool (*record)(void *ud,
+	               struct vk_conv_weave_client *c,
+	               VkCommandBuffer cmd,
+	               const struct vk_conv_weave_rect *r);
 	//! The GPU finished everything recorded since begin: commit snapshots, read profiles, unpin.
 	void (*complete)(void *ud, struct vk_conv_weave_client *c);
 };

@@ -722,8 +722,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		} else {
 			// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's
 			// stream reads this DP's.
-			const void *dp_key = mc->weave.dp != NULL ? (const void *)mc->weave.dp
-			                                          : (const void *)mc->weave.dp_metal;
+			const void *dp_key =
+			    mc->weave.dp != NULL ? (const void *)mc->weave.dp : (const void *)mc->weave.dp_metal;
 			comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)dp_key, out_eyes);
 		}
 

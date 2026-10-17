@@ -1361,7 +1361,8 @@ TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven re
 
 	auto weave = [&]() {
 		vk_conv_weave_begin(w, c);
-		const bool rec = run_cmd(vk, &pool, [&](VkCommandBuffer cmd) { return vk_conv_weave_record(w, c, cmd, &r); });
+		const bool rec =
+		    run_cmd(vk, &pool, [&](VkCommandBuffer cmd) { return vk_conv_weave_record(w, c, cmd, &r); });
 		vk_conv_weave_complete(w, c); // the "fence" signalled: run_cmd waited
 		return rec;
 	};
@@ -1383,9 +1384,9 @@ TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven re
 	CHECK(st.committed == 1u);
 	CHECK_FALSE(st.woven_result);
 	REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));
-	CHECK(src_rgba_eq(580, 400, px(580, 400)));         // tile 0: the 2D frame, 1:1
-	CHECK(src_rgba_eq(580, 400, px(W + 580, 400)));     // tile 1: the same pixels (flat)
-	CHECK(px(10, 10)[3] == 0);                          // outside the rect: untouched
+	CHECK(src_rgba_eq(580, 400, px(580, 400)));     // tile 0: the 2D frame, 1:1
+	CHECK(src_rgba_eq(580, 400, px(W + 580, 400))); // tile 1: the same pixels (flat)
+	CHECK(px(10, 10)[3] == 0);                      // outside the rect: untouched
 	CHECK(px(W + RX + RW + 10, RY + 10)[3] == 0);
 
 	// 2. The conversion lands; the next weave samples it into the rect.
@@ -1418,7 +1419,9 @@ TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven re
 	// Once a result of the cropped input lands, the bars are the 2D input, flat.
 	const uint64_t done = ss.converted;
 	REQUIRE(wait_until(
-	    [&] { return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted > done + 1; },
+	    [&] {
+		    return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted > done + 1;
+	    },
 	    5000));
 	REQUIRE(weave());
 	REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));

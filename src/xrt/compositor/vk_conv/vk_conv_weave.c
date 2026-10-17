@@ -116,7 +116,7 @@ struct vkcw_stream
 	uint32_t logged_res_w, logged_res_h, logged_res_views;
 	bool logged_unresolved;
 	const char *logged_fail; //!< the stage of the last failure logged (NULL = none since)
-	//! @}
+	                         //! @}
 };
 
 struct vkcw_pin
@@ -339,8 +339,8 @@ barrier_image(struct vk_bundle *vk,
 	    .image = image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
-	                         1, &b);
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &b);
 }
 
 static void
@@ -531,7 +531,10 @@ frame_fill(struct vkcw_stream *st,
  * the host buffer; measure the whole rect's lines for the letterbox.
  */
 static void
-record_snapshot(struct vk_conv_weave *w, struct vkcw_stream *st, VkCommandBuffer cmd, const struct vk_conv_weave_rect *r)
+record_snapshot(struct vk_conv_weave *w,
+                struct vkcw_stream *st,
+                VkCommandBuffer cmd,
+                const struct vk_conv_weave_rect *r)
 {
 	struct vk_bundle *vk = w->vk;
 	const uint32_t x = (uint32_t)r->x, y = (uint32_t)r->y;
@@ -573,11 +576,12 @@ record_snapshot(struct vk_conv_weave *w, struct vkcw_stream *st, VkCommandBuffer
 		int32_t px = (int32_t)cx, py = (int32_t)cy, pw = (int32_t)cw, ph = (int32_t)ch;
 		for (uint32_t i = 0; i < levels; i++) {
 			struct vkcw_img *li = &st->chain[i];
-			barrier_image(vk, cmd, li->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-			              VK_ACCESS_TRANSFER_WRITE_BIT);
+			barrier_image(vk, cmd, li->image, VK_IMAGE_LAYOUT_UNDEFINED,
+			              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 			const bool scaled = (uint32_t)pw != li->w || (uint32_t)ph != li->h;
-			blit(vk, cmd, prev, prev_layout, px, py, pw, ph, li->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-			     0, (int32_t)li->w, (int32_t)li->h, scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+			blit(vk, cmd, prev, prev_layout, px, py, pw, ph, li->image,
+			     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 0, (int32_t)li->w, (int32_t)li->h,
+			     scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 			barrier_image(vk, cmd, li->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 			              VK_ACCESS_TRANSFER_READ_BIT);
@@ -691,8 +695,7 @@ stage_view(struct vk_conv_weave *w,
 	const bool array = ref->layers > 1;
 	const uint32_t vw = array ? ref->width : ref->width / views;
 	const uint32_t vh = ref->height;
-	if (vw == 0 || vh == 0 || (array && v >= ref->layers) ||
-	    !img_ensure(vk, s, vw, vh, unorm4(ref->format))) {
+	if (vw == 0 || vh == 0 || (array && v >= ref->layers) || !img_ensure(vk, s, vw, vh, unorm4(ref->format))) {
 		return NULL;
 	}
 	barrier_image(vk, cmd, s->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
@@ -752,8 +755,8 @@ draw_result(struct vk_conv_weave *w,
 	}
 	// The active part of the rect (letterbox): integer edges, the bars tile
 	// the rest exactly.
-	const bool whole = res->active[0] == 0.0f && res->active[1] == 0.0f && res->active[2] == 0.0f &&
-	                   res->active[3] == 0.0f;
+	const bool whole =
+	    res->active[0] == 0.0f && res->active[1] == 0.0f && res->active[2] == 0.0f && res->active[3] == 0.0f;
 	const float a0 = whole ? 0.0f : res->active[0], a1 = whole ? 0.0f : res->active[1];
 	const float a2 = whole ? 1.0f : res->active[2], a3 = whole ? 1.0f : res->active[3];
 	int32_t ax0 = r->x + (int32_t)lroundf(a0 * (float)r->w);
@@ -979,8 +982,10 @@ vk_conv_weave_record(struct vk_conv_weave *w,
 	}
 	if (!resolved && !st->logged_unresolved) {
 		st->logged_unresolved = true;
-		U_LOG_I("lift rect: stream 0x%llx failed: resolve (not a core-routed stream of this connection); woven flat",
-		        (unsigned long long)wire);
+		U_LOG_I(
+		    "lift rect: stream 0x%llx failed: resolve (not a core-routed stream of this connection); woven "
+		    "flat",
+		    (unsigned long long)wire);
 	}
 	return true;
 }
@@ -1005,16 +1010,19 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 			float *rows = c->lb_rows, *cols = c->lb_cols;
 			uint32_t nr = 0, nc = 0;
 			const uint8_t *base = (const uint8_t *)st->lb_buf.map;
-			u_lift_letterbox_profile_from_lines(base, base + (size_t)U_LIFT_LETTERBOX_LINE_SAMPLES * st->lb_h * 4u,
-			                                    st->lb_w, st->lb_h, st->lb_bgra, rows, &nr, cols, &nc);
+			u_lift_letterbox_profile_from_lines(
+			    base, base + (size_t)U_LIFT_LETTERBOX_LINE_SAMPLES * st->lb_h * 4u, st->lb_w, st->lb_h,
+			    st->lb_bgra, rows, &nr, cols, &nc);
 			if (u_lift_letterbox_update(&st->lb, st->lb_w, st->lb_h, rows, nr, cols, nc)) {
 				const struct u_lift_crop *cr = &st->lb.committed;
 				if (u_lift_crop_active(cr)) {
 					U_LOG_W(
-					    "[lift] stream 0x%llx: letterbox crop %ux%u -> active %ux%u (bars top %u bottom "
+					    "[lift] stream 0x%llx: letterbox crop %ux%u -> active %ux%u (bars top %u "
+					    "bottom "
 					    "%u left %u right %u; bars woven flat)",
-					    (unsigned long long)st->wire, st->lb_w, st->lb_h, st->lb_w - cr->left - cr->right,
-					    st->lb_h - cr->top - cr->bottom, cr->top, cr->bottom, cr->left, cr->right);
+					    (unsigned long long)st->wire, st->lb_w, st->lb_h,
+					    st->lb_w - cr->left - cr->right, st->lb_h - cr->top - cr->bottom, cr->top,
+					    cr->bottom, cr->left, cr->right);
 				} else {
 					U_LOG_W("[lift] stream 0x%llx: letterbox crop off (%ux%u lifted whole)",
 					        (unsigned long long)st->wire, st->lb_w, st->lb_h);
@@ -1047,10 +1055,12 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 					bool ok = false;
 					if (img->memory_kind == XRT_CONV_MEM_CPU && img->cpu_ptr != NULL) {
 						const uint32_t pitch = img->row_stride != 0 ? img->row_stride : tight;
-						if ((uint64_t)pitch * st->snap_h <= img->byte_size || img->byte_size == 0) {
+						if ((uint64_t)pitch * st->snap_h <= img->byte_size ||
+						    img->byte_size == 0) {
 							for (uint32_t y = 0; y < st->snap_h; y++) {
 								memcpy((uint8_t *)img->cpu_ptr + (size_t)y * pitch,
-								       (const uint8_t *)st->snap_buf.map + (size_t)y * tight,
+								       (const uint8_t *)st->snap_buf.map +
+								           (size_t)y * tight,
 								       tight);
 							}
 							ok = true;
