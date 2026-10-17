@@ -112,6 +112,7 @@ set(tests
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
     tests_input_arbiter_floor
+    tests_input_arbiter_per_client
     tests_sim_input_nav
     tests_gamepad_map
     tests_touch_gesture
@@ -893,6 +894,19 @@ target_include_directories(
 	tests_input_arbiter_floor PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
 	)
 target_link_libraries(tests_input_arbiter_floor PRIVATE xrt-interfaces aux_os)
+
+# ADR-034 Amendment 5 (#2181) — per-client role resolution: the overlay walk
+# (pins only where the provider claims the family, presence-gated), per-client
+# monotonic generations across a global re-rank, persist, Lock, enumerate,
+# holders. Same shape as tests_input_arbiter_floor (the arbiter compiled in;
+# the policy store faked through t_input_arbiter_set_policy).
+target_sources(
+	tests_input_arbiter_per_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_per_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_per_client PRIVATE xrt-interfaces aux_os)
 
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point

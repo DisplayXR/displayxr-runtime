@@ -129,6 +129,15 @@ u_status_warning_push(struct xrt_status_warning *arr,
                       const char *text);
 
 /*!
+ * ADR-034 Amendment 5: add `input_holders: [{client, app, generation,
+ * holders{controllers, hand_tracking, gamepad}, preferred{...}}]` to @p root
+ * (null = nobody / the default walk). Shared by the snapshot and
+ * `displayxr-cli input list --json`.
+ */
+void
+u_status_input_holders_add_cjson(cJSON *root, const struct xrt_input_client_holders *rows, uint32_t count);
+
+/*!
  * The design §3 JSON of @p snap (`schema` first). Caller owns the tree.
  */
 cJSON *

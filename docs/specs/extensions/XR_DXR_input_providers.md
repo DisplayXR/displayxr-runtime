@@ -8,7 +8,7 @@
 | **Type values** | `1004999410`–`412` ([registry](../../../src/external/openxr_includes/openxr/README.md)) |
 | **Decision** | [ADR-034 Amendment 5](../../adr/ADR-034-input-provider-plugins.md) · [ADR-054 decision 8](../../adr/ADR-054-component-model.md) |
 | **Runtime contract** | [`input-provider-discovery.md`](../runtime/input-provider-discovery.md) §3 *Per-client selection* |
-| **Status** | Phase 1 (#2181): surface, IPC transport, per-app pin store and CLI. The per-client resolution in the arbiter is phase 2 — until it lands, every system reports **no providers** and the setter returns `XR_ERROR_FEATURE_UNSUPPORTED`. |
+| **Status** | Implemented (#2181): the surface, the IPC transport, the per-app pin store + CLI, and the arbiter's per-client resolution. A system with no arbiter (no input provider resident, or only the emulated pair) lists no providers. Hardware validation on the Windows box pending. |
 
 ## 1. What it is for
 
@@ -104,7 +104,9 @@ rank order for this app:
 
 A family that appears in no entry's `currentFamilies` has no holder for this
 app (no present provider supplies it). A system with no selection support
-returns a count of 0 — that is not an error.
+returns a count of 0 — that is not an error. A provider withdrawn by the user
+(`Enabled = 0`) and a provider that supplies none of the three families (a
+navigation-only rig provider) are not listed.
 
 ### `xrSetInputProviderPreferenceDXR(session, info)`
 
@@ -160,5 +162,6 @@ the event on its own. Rebinding itself rides the core
 | Pin store + precedence | `target_input_plugin_get_app_pin` / `set_app_pin` / `list_app_pins` / `target_input_resolve_preference` (`target_input_plugin_loader.{c,h}`) |
 | Live pickup | the component-policy watch (#2051): the Windows registry watch covers the subtree; POSIX folds every `input-preferred-*` file |
 | CLI | `displayxr-cli input use <id> --app <exe>` / `input reset --app <exe>`; `input list --json` `per_app` |
-| Per-client resolution (phase 2) | the arbiter's per-client overlay + generation, live holders in `input list --json` and the ADR-051 status snapshot |
-| Tests | `tests_input_selection_policy` (precedence matrix, exe-basename key, POSIX pin store) |
+| Per-client resolution | `target_input_arbiter.c`: a client table (each IPC connection + the in-process implicit client, key 0); per family the preferred candidate is hoisted only where it supplies the family and only while present; resolved roles cached per client, recomputed when the arbiter's state epoch (presence edge, re-rank, floor withdrawal) or the client's overlay moved — never on the presence poll thread; one monotonic generation per client, seeded from the system's. The installed arbiter publishes `xsysd->input_selection`; the IPC server answers `system_devices_get_roles` per connection through it. Store reads are injected (`t_input_arbiter_policy`) |
+| Live holders | DIAG `system_get_input_holders(index)` → `displayxr-cli input list --json` `holders` (null when no service) and the ADR-051 snapshot's `input_holders: [{client, app, generation, holders{controllers, hand_tracking, gamepad}, preferred{…}}]`. Current at fetch time; a holder change does not move the snapshot's generation counters, so `status --watch` prints it with the next change |
+| Tests | `tests_input_selection_policy` (precedence matrix, exe-basename key, POSIX pin store, holders JSON), `tests_input_arbiter_per_client` (the overlay walk, fall-through, per-client generation across a re-rank, persist, Lock, enumerate, holders, detach) |

@@ -1124,6 +1124,35 @@ u_status_conv_to_cjson(const struct xrt_status_snapshot *snap)
 	return root;
 }
 
+void
+u_status_input_holders_add_cjson(cJSON *root, const struct xrt_input_client_holders *rows, uint32_t count)
+{
+	static const char *const family_keys[XRT_INPUT_ROLE_FAMILY_COUNT] = {"controllers", "hand_tracking", "gamepad"};
+	cJSON *arr = cJSON_AddArrayToObject(root, "input_holders");
+	for (uint32_t i = 0; rows != NULL && i < count; i++) {
+		const struct xrt_input_client_holders *h = &rows[i];
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddNumberToObject(o, "client", (double)h->key);
+		cJSON_AddStringToObject(o, "app", h->exe_basename);
+		cJSON_AddNumberToObject(o, "generation", (double)h->generation);
+		cJSON *held = cJSON_AddObjectToObject(o, "holders");
+		cJSON *pref = cJSON_AddObjectToObject(o, "preferred");
+		for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
+			if (h->holder[f][0] != '\0') {
+				cJSON_AddStringToObject(held, family_keys[f], h->holder[f]);
+			} else {
+				cJSON_AddNullToObject(held, family_keys[f]);
+			}
+			if (h->preferred[f][0] != '\0') {
+				cJSON_AddStringToObject(pref, family_keys[f], h->preferred[f]);
+			} else {
+				cJSON_AddNullToObject(pref, family_keys[f]);
+			}
+		}
+		cJSON_AddItemToArray(arr, o);
+	}
+}
+
 cJSON *
 u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 {
@@ -1200,6 +1229,10 @@ u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap)
 	}
 	// ADR-053 P4: the model store's packs (keys only added; the schema stays 1).
 	u_status_conv_store_add_cjson(root, snap);
+	// ADR-034 Am.5: per-client live input holders (keys only added; the schema stays 1).
+	u_status_input_holders_add_cjson(root, snap->input_holders,
+	                                 snap->input_holder_count < XRT_STATUS_MAX_CLIENTS ? snap->input_holder_count
+	                                                                                   : XRT_STATUS_MAX_CLIENTS);
 	return root;
 }
 

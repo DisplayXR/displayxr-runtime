@@ -708,7 +708,8 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 
 	CHECK(keys(d.root) ==
 	      V{"schema", "source", "generation", "runtime", "plugins", "screens", "clients", "workspace", "warnings",
-	        "conv_providers", "conv_tasks"}); // ADR-053 (#2006): keys only added, schema stays 1
+	        "conv_providers", "conv_tasks",
+	        "input_holders"}); // ADR-053 (#2006), ADR-034 Am.5 (#2181): keys only added, schema stays 1
 	CHECK(str(d.root, "source") == "service");
 	CHECK(keys(cJSON_GetObjectItem(d.root, "generation")) == V{"topology", "status", "conversion"});
 	CHECK(keys(cJSON_GetObjectItem(d.root, "runtime")) ==

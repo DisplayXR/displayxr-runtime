@@ -127,7 +127,7 @@ typedef struct XrInputProviderPropertiesDXR {
     XrBool32                    isPresent;
     //! The user's default provider (Dashboard / `displayxr-cli input use <id>`).
     XrBool32                    isUserDefault;
-    //! The user pinned this app to it (its families' requests from this app rank below the pin).
+    //! The user pinned this app to it; the pin outranks this app's own requests.
     XrBool32                    isAppPinned;
 } XrInputProviderPropertiesDXR;
 

@@ -38,6 +38,7 @@
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_screen.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_input_selection.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -673,6 +674,15 @@ struct xrt_status_snapshot
 	//! ADR-053 P4: the registered providers' model packs (read from disk by the CLI).
 	uint32_t conv_pack_count;
 	struct xrt_status_conv_pack conv_packs[XRT_STATUS_MAX_CONV_PACKS];
+	/*!
+	 * ADR-034 Amendment 5 decision 6: each attached client's LIVE input-role
+	 * holder per family (and the preference that put it there), next to the
+	 * stored pins the Dashboard edits. Service only (fetched one row per DIAG
+	 * reply, `system_get_input_holders`); 0 headless. Diagnostics: current at
+	 * fetch time, not covered by @ref generation.
+	 */
+	uint32_t input_holder_count;
+	struct xrt_input_client_holders input_holders[XRT_STATUS_MAX_CLIENTS];
 };
 
 /*!

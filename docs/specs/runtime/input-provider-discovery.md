@@ -298,8 +298,7 @@ the service scanned is not resident and joins at the next service start
 (the service log names it), and in-process apps re-read at their next
 launch.
 
-**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — #2181: the store, CLI and
-`XR_DXR_input_providers` surface are in; the arbiter's per-client walk is in progress).**
+**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — implemented in #2181).**
 The ranked walk above is the *default*; the controller, hand-tracking and gamepad
 roles are resolved **per client** (IPC connection / in-process process) with an
 optional per-family preferred provider id layered on top: machine `Policy\Lock`
@@ -317,6 +316,12 @@ The precedence for one family is the pure `target_input_resolve_preference`
 service through the component-policy watch (the Windows watch covers the
 `PerApp` subtree; POSIX folds every `input-preferred-*` file into the input
 fingerprint). App-facing contract: [`XR_DXR_input_providers`](../extensions/XR_DXR_input_providers.md).
+In the arbiter the overlay is a per-client table — each IPC connection, plus
+the in-process implicit client whose view is `xsysd->get_roles` — whose
+resolved roles are cached and recomputed only when the arbiter's state epoch
+(a presence edge, a re-rank, a floor withdrawal) or the client's own overlay
+moved; never on the presence poll thread (#958). The IPC server answers
+`system_devices_get_roles` per connection.
 
 ### Lifetime — the provider is per-process, its devices are per-instance
 
@@ -973,8 +978,11 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   `Policy\Lock` is the machine's say); `--app` takes an executable name or a
   path, reduced to its basename. `input list` prints the pins; `input list
   --json` carries them as `per_app: [{app, preferred, registered}]` (what is
-  stored — `policy.policy_lock` says whether they apply). Per-client live
-  holders join in #2181 phase 2.
+  stored — `policy.policy_lock` says whether they apply) and the running
+  service's per-client LIVE holders as `holders: [{client, app, generation,
+  holders{controllers, hand_tracking, gamepad}, preferred{…}}]` (`null` when
+  no service is reachable); the ADR-051 snapshot carries the same rows as
+  `input_holders`.
 - `displayxr-cli input emulated on|off [--machine]` — the N7
   `EmulatedControllers` gate (§4 item 3b): HKCU by default, the HKLM 64-bit
   view with `--machine` (POSIX: the per-user `emulated_controllers` file;
