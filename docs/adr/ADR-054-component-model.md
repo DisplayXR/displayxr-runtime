@@ -103,6 +103,15 @@ every one of these holds:
    override that always wins, and the component reads them **through the host interface**,
    never from the environment or from ad-hoc vendor keys (ADR-053 §5 already requires this of
    conversion providers; it becomes the rule for all).
+8. **Selection scope is per class; apps express preferences, never policy** (2026-10-17). The
+   trunk keeps every installed, enabled component of a class resident and arbitrates among them;
+   the user sets defaults and pins in the Dashboard / CLI (`prefer`); an app may *enumerate* the
+   candidates (ids and the components' own display names, never a vendor it recognises) and
+   *request* one for its own use, and the request never outranks a user's pin or a machine lock.
+   The scope of a selection follows the class: display processors **per screen** (`dp use --screen`),
+   conversion providers **per task and per stream / job** (lift spec 5, #2178), input providers
+   **per role family and per client** (ADR-034 Amendment 5). A new class must say what its scope is
+   before it ships its `prefer` verb.
 
 ### 3. Admission rule
 

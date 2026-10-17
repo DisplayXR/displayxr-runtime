@@ -587,3 +587,73 @@ Alternatives rejected along the way, beyond the prototype above:
 - **Letting the provider own the head pose directly.** The shortest path,
   and the one that ends this ADR: parallax, the fly-camera fallback and the
   *Amendment 2* composition all live behind that pose.
+
+## Amendment 5 — Hand roles are resolved per client; apps may express a provider preference (2026-10-17)
+
+**Status:** Accepted (David, 2026-10-17; design reviewed by the inputs session). Implementation tracked
+in the runtime issue linked from the spec; first test app: `displayxr-demo-mediaplayer`.
+
+### What was wrong
+
+Amendments 1–3 made every claiming provider resident and put every provider's devices in
+`xsysd->xdevs`, but kept **one** rank table and **one** resolved `xrt_system_roles`: whichever
+provider won a hand held it for the shell and for every app at once. That was a policy of the
+arbiter, never a structural fact. The role query was already per client on both paths (an
+in-process app owns its own arbiter instance; an IPC client's `system_devices_get_roles` lands in a
+handler that has the client's state), and shared memory carries only the *static* hand-tracking
+roles — the `XR_EXT_hand_tracking` gate. With several input providers installed (two hand trackers,
+a gamepad, a controller feeder) the user could pick one default in the Dashboard and nothing else;
+an app could not offer its user a choice, and a user could not pin one app to one provider.
+
+### Decision
+
+1. **Scope.** The controller roles (`left` / `right`) and the dynamic hand-tracking roles are
+   resolved **per client** — the IPC connection, or the process for an in-process app. The rig
+   (navigation) role and the head stay **runtime-wide**: the rig composer feeds the display
+   processor's pose source, which is per display and shared by every app on that screen. The
+   *static* hand-tracking roles stay per system; they only say whether `XR_EXT_hand_tracking`
+   exists. The gamepad role (the gamepad provider amendment) is per client like the hands.
+2. **Overlay, not a second table.** The arbiter keeps its ranked candidate list and presence
+   walk; a client contributes at most one **preferred provider id per role family**
+   (`CONTROLLERS`, `HAND_TRACKING`, `GAMEPAD`), which hoists that provider to the front of the
+   walk **for that family and that client only, and only where the provider claims the
+   family**. Every other family keeps the default walk, so pinning an app to a controllers-only
+   provider never parks its hand tracking at -1 while an optical tracker is resident. Presence
+   still gates everything: an absent pinned provider falls through exactly as an absent ranked
+   one does.
+3. **Precedence** (top wins): `InputProviders\Policy\Lock` (machine) → the **per-app pin** the
+   user set (`HKCU\…\InputProviders\PerApp\<exe-basename>\PreferredPlugin`; POSIX
+   `input-preferred-<exe-basename>` in the per-user manifest dir) → the app's **session request**
+   → the user default (`input use <id>`, `PreferredPlugin`) → `ProbeOrder`. `DXR_INPUT_PROVIDERS=0`
+   and `ForceQwerty` beat every pin, as today. The per-app key is the **executable basename
+   resolved by the service from the peer process** (the in-process runtime reads its own), never
+   `XrInstanceCreateInfo::applicationName`; it shares the per-title keyspace of #1381 so the
+   Dashboard shows one per-app record.
+4. **One monotonic generation per client**, seeded from the global generation and bumped whenever
+   that client's resolved roles change (global re-rank, presence flip, its own overlay). The state
+   tracker refreshes its role cache on strict `<`, so the counter must never go down. Resolved
+   per-client roles are cached on the client state and recomputed only when its generation moves;
+   `get_roles` stays O(candidates) and never runs on the presence poll thread.
+5. **App surface — `XR_DXR_input_providers`.** Enumerate the resident providers (id, display
+   name verbatim from the plug-in, families claimable, presence, `isCurrent` per family for this
+   client, `isUserDefault`); set a preference per family on a session (`providerId` or empty =
+   default) with a `persist` flag that writes the **same per-app record the Dashboard writes**, so
+   an in-app selector and the Dashboard never disagree and the pin-vs-request order only matters
+   for a non-persisted request; a providers-changed event. Rebinding rides
+   `XrEventDataInteractionProfileChanged` unchanged. Apps show the strings; they never hardcode or
+   recognise a vendor name. Enumeration ships first (a HUD "hands: <name>" hint), the setter second.
+6. **Live holders are diagnostics.** The ADR-051 status snapshot and `input list --json` carry the
+   per-client resolved holder per family, so the Dashboard shows who *holds* a role next to the pin.
+
+### Consequences
+
+- No preference set ⇒ bit-identical to Amendment 3: the overlay is empty and the walk is the
+  default walk. The CTS lane is unaffected (it suppresses providers per process anyway).
+- The handle-app qwerty skip (`oxr_input.c`, `has_external_window`) is a per-session policy above
+  roles: pinning a handle app to qwerty still yields no controllers, and the spec says so.
+- `xrGetSystemProperties` reads live roles before any session exists, so a later session request
+  can change what it would have reported; documented, accepted.
+- The shell is untouched: service-side input routing goes by window focus, never by device index.
+- The trunk rule this generalises (ADR-054 decision 8): every class keeps all installed components
+  resident; selection scope is per class — display processors per screen, conversion providers per
+  task and per stream, input providers per role family and per client.
