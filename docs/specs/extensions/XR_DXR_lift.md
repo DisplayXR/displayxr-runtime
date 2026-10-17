@@ -846,7 +846,7 @@ copy, never the caller's texture).
 |---|---|
 | Windows (D3D11 service) | yes |
 | macOS, Vulkan weave backend (`DXR_WEAVE_MAC_BACKEND=vk`, or `auto` with a plug-in that exports a Vulkan DP) | yes. The snapshot reaches a CPU-lane provider through host memory; same policy as Windows |
-| macOS, Metal weave backend | not yet: `lift_weave_rects` is refused and the rect is woven as drawn |
+| macOS, Metal weave backend (`DXR_WEAVE_MAC_BACKEND=metal`, or `auto` with a plug-in that exports only a Metal DP) | yes. Same policy and same CPU-lane snapshot as the Vulkan backend. The result is the IOSurface the conversion glue exported, sampled in Metal. A result with no IOSurface export (device-private or layered) is woven flat |
 | desktop Linux (the Vulkan weave engine) | yes (same code as macOS Vulkan; not yet run on hardware) |
 
 No cursor is drawn on the POSIX weave engines yet: the lift cursor mask is 0 (not drawn), and the

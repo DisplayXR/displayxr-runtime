@@ -853,8 +853,8 @@ ordering, the snapshot cap and letterbox crop, "flat until first result", and th
 5. `XrLiftOptionsDXR::convergence = AUTO` now means runtime auto-convergence (rt#1978).
 
 **Platforms.** Windows: the D3D11 service (`lift_weave_rect_batch` / `lift_weave_rects_nview`).
-macOS (the Vulkan weave backend) and desktop Linux: `vk_conv_weave` (P5 step C, below), same
-policy, same wire. The macOS Metal weave backend refuses lifted rects for now (woven as drawn).
+macOS (both weave backends) and desktop Linux: `vk_conv_weave` (P5 step C, below), same policy,
+same wire. The macOS Metal backend records in Metal as a host client of that helper.
 
 ---
 
@@ -1125,11 +1125,18 @@ Validated on a developer Mac (MoltenVK, vk backend, sim provider): `tests_conv_v
 `weave_probe_vk_macos --lift`. The Linux engine is compiled only in a syntax check; it has not
 run.
 
+**Landed (step C on the macOS Metal weave backend).** `vk_conv_weave` takes host clients: a
+client created without a Vulkan device asks `vk_conv_weave_host_plan` per rect (the same crop,
+cap, frame and pin as `record`) and hands its copies over with `vk_conv_weave_host_done`.
+`comp_multi_weave_metal_lift.m` records the plan in the Metal weave's own command buffer. The
+snapshot goes into a shared `MTLBuffer`. The result's IOSurface export is wrapped as an
+`MTLTexture`, with its format taken from the conversion format and not from the IOSurface. No
+cross-API semaphore is needed: the glue publishes only completed work, and the pin holds the
+result until the Metal command buffer has completed. See the glue note's Metal section.
+
 Still open:
 
 - A GPU client transport (textures and fences to the app): the client gets CPU bytes.
-- Lifted rects on the macOS Metal weave backend: wrap the results' IOSurface export as
-  `MTLTexture`s and read the snapshot back through a shared buffer.
 - The depth-aware cursor on lifted rects (ADR-046 Amendment 1). No POSIX weave engine draws a
   cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
 - A GPU → GPU snapshot once a POSIX provider takes GPU inputs. The zero-copy step (E) removes
