@@ -84,6 +84,7 @@ struct xrt_conv_wire_result;
 struct xrt_conv_wire_stream_created;
 struct xrt_conv_wire_stream_desc;
 struct xrt_conv_wire_task_desc;
+struct xrt_eye_positions;
 
 //! Bit set in every v3 stream id minted by the core route (svc_lift ids are small counters).
 #define IPC_SERVER_CONV_STREAM_TAG (1ull << 62)
@@ -266,6 +267,18 @@ ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_
  */
 void
 ipc_server_conv_set_weave_rects(struct ipc_server_conv *sc, bool enabled);
+
+/*!
+ * The per-DP eyes sink (roadmap §5.2) as the POSIX service installs it: @p eyes
+ * of the DP keyed @p dp_key (its address) into the core's per-DP snapshot,
+ * stamped now; retire when that DP is destroyed. (The D3D11 service converts
+ * in its own glue file.)
+ */
+void
+ipc_server_conv_eyes_publish(struct ipc_server_conv *sc, uint64_t dp_key, const struct xrt_eye_positions *eyes);
+
+void
+ipc_server_conv_eyes_retire(struct ipc_server_conv *sc, uint64_t dp_key);
 
 /*!
  * The weave path's resolver (#2003): a v3 stream id this module minted for

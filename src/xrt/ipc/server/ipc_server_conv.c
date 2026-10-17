@@ -10,6 +10,8 @@
 
 #include "shared/ipc_protocol.h"
 
+#include "xrt/xrt_display_metrics.h"
+
 #include "conversion/conv_candidates.h"
 #include "conversion/conv_core.h"
 #include "conversion/conv_readiness.h"
@@ -561,6 +563,34 @@ ipc_server_conv_routes_create(struct ipc_server_conv *sc, uint32_t mode, uint32_
 		return false;
 	}
 	return conv_core_task_has_candidate(sc->core, mode_task(mode, content_hint));
+}
+
+void
+ipc_server_conv_eyes_publish(struct ipc_server_conv *sc, uint64_t dp_key, const struct xrt_eye_positions *e)
+{
+	if (sc == NULL || e == NULL || dp_key == 0) {
+		return;
+	}
+	struct conv_eyes ce;
+	memset(&ce, 0, sizeof(ce));
+	ce.valid = e->valid;
+	ce.is_tracking = e->is_tracking;
+	ce.count = e->count > CONV_EYES_MAX ? CONV_EYES_MAX : e->count;
+	for (uint32_t i = 0; i < ce.count; i++) {
+		ce.xyz[i][0] = e->eyes[i].x;
+		ce.xyz[i][1] = e->eyes[i].y;
+		ce.xyz[i][2] = e->eyes[i].z;
+	}
+	ce.timestamp_ns = os_monotonic_get_ns();
+	conv_core_eyes_publish(sc->core, dp_key, &ce);
+}
+
+void
+ipc_server_conv_eyes_retire(struct ipc_server_conv *sc, uint64_t dp_key)
+{
+	if (sc != NULL && dp_key != 0) {
+		conv_core_eyes_retire(sc->core, dp_key);
+	}
 }
 
 bool

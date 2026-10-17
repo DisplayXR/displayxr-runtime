@@ -60,7 +60,6 @@
 #include "vk_conv/vk_conv_gpu.h"
 #include "vk_conv/vk_conv_weave.h"
 
-#include "os/os_time.h"
 #include "util/u_logging.h"
 
 #include <string.h>
@@ -87,24 +86,13 @@ bridge_match_weave(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views)
 static void
 eyes_sink(void *ud, uint64_t dp_key, const struct xrt_eye_positions *e)
 {
-	struct conv_eyes ce;
-	memset(&ce, 0, sizeof(ce));
-	ce.valid = e->valid;
-	ce.is_tracking = e->is_tracking;
-	ce.count = e->count > CONV_EYES_MAX ? CONV_EYES_MAX : e->count;
-	for (uint32_t i = 0; i < ce.count; i++) {
-		ce.xyz[i][0] = e->eyes[i].x;
-		ce.xyz[i][1] = e->eyes[i].y;
-		ce.xyz[i][2] = e->eyes[i].z;
-	}
-	ce.timestamp_ns = os_monotonic_get_ns();
-	conv_core_eyes_publish((struct conv_core *)ud, dp_key, &ce);
+	ipc_server_conv_eyes_publish((struct ipc_server_conv *)ud, dp_key, e);
 }
 
 static void
 eyes_retire(void *ud, uint64_t dp_key)
 {
-	conv_core_eyes_retire((struct conv_core *)ud, dp_key);
+	ipc_server_conv_eyes_retire((struct ipc_server_conv *)ud, dp_key);
 }
 
 //! The weave stream tag the bridge resolves is the v3 route's (as on D3D11).
@@ -170,7 +158,7 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 
 	// Step C: the per-DP eyes sink, then lifted weave rects.
 	struct conv_core *core = ipc_server_conv_get_core(sc);
-	comp_multi_set_conv_eyes_sink(eyes_sink, eyes_retire, core);
+	comp_multi_set_conv_eyes_sink(eyes_sink, eyes_retire, sc);
 	if (vk_conv_weave_create(vk, g_conv_vk.glue, &g_conv_vk.weave)) {
 		struct vk_conv_weave_bridge b;
 		memset(&b, 0, sizeof(b));
