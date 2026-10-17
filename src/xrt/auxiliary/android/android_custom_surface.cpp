@@ -13,7 +13,9 @@
 #include "android_load_class.hpp"
 
 #include "xrt/xrt_config_android.h"
+#include "xrt/xrt_input_plugin.h"
 #include "util/u_logging.h"
+#include "util/u_pointer_sink.h"
 
 #include "wrap/android.content.h"
 #include "wrap/android.hardware.display.h"
@@ -82,23 +84,63 @@ jni_window_rect_changed(JNIEnv * /*env*/,
 	                                       disp_h > 0 ? (uint32_t)disp_h : 0u);
 }
 
+/*
+ * #132: the hosted view's touch, one platform-neutral event per pointer, into
+ * the runtime's pointer-event queue. The touch input provider drains it through
+ * the host iface (poll_pointer_events) and turns it into the rig + an emulated
+ * controller; nothing here interprets a gesture. The app-owned-surface path
+ * lands in the same queue from xrSubmitAndroidInputEventDXR.
+ */
+static void
+jni_touch_event(JNIEnv * /*env*/,
+                jclass /*clazz*/,
+                jlong /*native_pointer*/,
+                jint action,
+                jint pointer_id,
+                jfloat x,
+                jfloat y,
+                jint count,
+                jint surface_w,
+                jint surface_h,
+                jlong event_time_ns)
+{
+	if (action < XRT_INPUT_POINTER_ACTION_DOWN || action > XRT_INPUT_POINTER_ACTION_CANCEL) {
+		return;
+	}
+	struct xrt_input_pointer_event ev = {};
+	ev.struct_size = sizeof(ev);
+	ev.action = (uint32_t)action;
+	ev.timestamp_ns = (int64_t)event_time_ns;
+	ev.pointer_id = pointer_id >= 0 ? (uint32_t)pointer_id : 0u;
+	ev.pointer_count = count >= 0 ? (uint32_t)count : 0u;
+	ev.x = x;
+	ev.y = y;
+	ev.surface_width = surface_w > 0 ? (uint32_t)surface_w : 0u;
+	ev.surface_height = surface_h > 0 ? (uint32_t)surface_h : 0u;
+	u_pointer_sink_push(&ev);
+}
+
 static void
 register_window_rect_native(jobject view)
 {
 	static const JNINativeMethod methods[] = {
 	    {"nativeWindowRectChanged", "(JIIIIIII)V", (void *)&jni_window_rect_changed},
+	    {"nativeTouchEvent", "(JIIFFIIIJ)V", (void *)&jni_touch_event},
 	};
 	JNIEnv *env = jni::env();
 	jclass clazz = env->GetObjectClass(view);
-	const jint rc = env->RegisterNatives(clazz, methods, 1);
+	const jint rc = env->RegisterNatives(clazz, methods, 2);
 	env->DeleteLocalRef(clazz);
 	if (rc != JNI_OK) {
-		// An older MonadoView without the method (mismatched AAR) — the Java
-		// side catches the UnsatisfiedLinkError and stops polling; nothing
-		// else depends on this.
+		// An older MonadoView without the methods (mismatched AAR) — the
+		// Java side catches the UnsatisfiedLinkError and stops polling /
+		// publishing; nothing else depends on this. Registration is
+		// all-or-nothing, so an AAR that predates nativeTouchEvent (#132)
+		// loses the rect report too — the two ship together.
 		env->ExceptionClear();
-		U_LOG_W("android_custom_surface: could not register nativeWindowRectChanged — "
-		        "hosted window rect will not be published (#1367)");
+		U_LOG_W(
+		    "android_custom_surface: could not register nativeWindowRectChanged / nativeTouchEvent — "
+		    "hosted window rect and touch will not be published (#1367, #132)");
 	}
 }
 

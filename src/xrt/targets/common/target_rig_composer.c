@@ -400,10 +400,18 @@ t_rig_composer_create(struct xrt_device *qwerty_hmd, struct xrt_system_devices *
 	// offset, which cancels in every composition — so recenter and
 	// `world = rig(t) o L` stay exact either way. The overseer logs its copy
 	// ("Rig source ... armed at"); this WARN is the other half of the pair.
+	//
+	// No qwerty (Android has no fly camera, #132): seed from the HEAD's own
+	// pose instead. It is not bound to this composer yet, so what it answers
+	// is its static nominal-viewer pose — and that is exactly what the floor
+	// then keeps emitting (`rig_composer_emit(&rig_last)` with no qwerty to
+	// read), so a box whose provider never takes the role is byte-for-byte
+	// what it was before the composer existed.
 	struct xrt_pose seed = XRT_POSE_IDENTITY;
-	if (qwerty_hmd != NULL) {
+	struct xrt_device *seed_src = qwerty_hmd != NULL ? qwerty_hmd : head;
+	if (seed_src != NULL) {
 		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-		if (xrt_device_get_tracked_pose(qwerty_hmd, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &rel) ==
+		if (xrt_device_get_tracked_pose(seed_src, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &rel) ==
 		    XRT_SUCCESS) {
 			seed = rel.pose;
 		}

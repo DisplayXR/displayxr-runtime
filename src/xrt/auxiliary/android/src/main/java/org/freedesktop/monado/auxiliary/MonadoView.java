@@ -234,10 +234,81 @@ public class MonadoView extends SurfaceView
             // so raw-vs-local on a REAL drag measures the scale. Free — we already see
             // every event here.
             miniLayout.measureTouchScale(event);
+            // #132: the runtime's own input path. The hosted view is the ONE surface
+            // the runtime owns in-process, so this is where its touch provider's
+            // events come from; the app still gets every event below, unchanged.
+            publishTouchToNative(event);
             hostActivity.dispatchTouchEvent(event);
             return true; // claim the gesture so we keep receiving MOVE/UP
         }
         return super.onTouchEvent(event);
+    }
+
+    // ---------------------------------------------------------------- touch -> native (#132)
+
+    /** Set once {@link #nativeTouchEvent} fails to link (older runtime .so): stop trying. */
+    private boolean touchNativeUnavailable = false;
+
+    /**
+     * Feed one MotionEvent into the runtime's pointer-event queue
+     * ({@code u_pointer_sink}, read by the touch input provider), as one platform-neutral
+     * event PER POINTER: a MOVE carries every finger, so it is unrolled; a POINTER_DOWN / UP
+     * names its own finger. Coordinates are view-local pixels with the view's extent, so the
+     * provider can normalise without knowing where the window sits. Only the in-process hosted
+     * view (host Activity + native counterpart) reports; the service-owned overlay and the weave
+     * satellite have no host Activity and are excluded, exactly like the window rect (#1367).
+     */
+    private void publishTouchToNative(android.view.MotionEvent event) {
+        if (touchNativeUnavailable || !reportsRectToNative()) {
+            return;
+        }
+        final long ptr = nativeCounterpart.getNativePointer();
+        final int w = getWidth();
+        final int h = getHeight();
+        final long tNs = event.getEventTime() * 1_000_000L; // uptimeMillis == CLOCK_MONOTONIC
+        final int masked = event.getActionMasked();
+        final int count = event.getPointerCount();
+        try {
+            switch (masked) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                case android.view.MotionEvent.ACTION_POINTER_DOWN:
+                    {
+                        final int i = event.getActionIndex();
+                        final int id = event.getPointerId(i);
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 1, id, x, y, count, w, h, tNs);
+                        break;
+                    }
+                case android.view.MotionEvent.ACTION_MOVE:
+                    for (int i = 0; i < count; i++) {
+                        final int id = event.getPointerId(i);
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 2, id, x, y, count, w, h, tNs);
+                    }
+                    break;
+                case android.view.MotionEvent.ACTION_UP:
+                case android.view.MotionEvent.ACTION_POINTER_UP:
+                    {
+                        final int i = event.getActionIndex();
+                        final int id = event.getPointerId(i);
+                        final int left = count - 1;
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 3, id, x, y, left, w, h, tNs);
+                        break;
+                    }
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    nativeTouchEvent(ptr, 4, 0, 0f, 0f, 0, w, h, tNs);
+                    break;
+                default:
+                    break;
+            }
+        } catch (UnsatisfiedLinkError e) {
+            touchNativeUnavailable = true;
+            Log.w(TAG, "nativeTouchEvent not registered; touch stays with the app only (#132)", e);
+        }
     }
 
     @Override
@@ -843,6 +914,22 @@ public class MonadoView extends SurfaceView
      */
     private static native void nativeWindowRectChanged(
             long nativePointer, int x, int y, int w, int h, int displayId, int dispW, int dispH);
+
+    /**
+     * Registered by native code like {@link #nativeWindowRectChanged} (#132). {@code action} is
+     * the platform-neutral {@code xrt_input_pointer_action}: 1 down, 2 move, 3 up, 4 cancel;
+     * {@code count} is the number of pointers down AFTER the event.
+     */
+    private static native void nativeTouchEvent(
+            long nativePointer,
+            int action,
+            int pointerId,
+            float x,
+            float y,
+            int count,
+            int surfaceW,
+            int surfaceH,
+            long eventTimeNs);
 
     /**
      * #558 P3: make this service-owned overlay declare an explicit touchable Region via the hidden
