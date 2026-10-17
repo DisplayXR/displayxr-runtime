@@ -571,8 +571,8 @@ Section "Install"
   WriteRegStr   HKLM "${REG_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
   WriteRegDWORD HKLM "${REG_KEY}" "SupportsFileDialog" 0
   ; Optional tray actions (see "Optional: published menu actions").
-  WriteRegStr   HKLM "${REG_KEY}\Actions\0" "Label" "Open Cockpit"
-  WriteRegStr   HKLM "${REG_KEY}\Actions\0" "Type"  "controller:open"
+  WriteRegStr   HKLM "${REG_KEY}\Actions\01-open" "Label" "Open Cockpit"
+  WriteRegStr   HKLM "${REG_KEY}\Actions\01-open" "Type"  "controller:open"
   ; 4. Own Add/Remove Programs entry — never the runtime's.
   WriteRegStr   HKLM "${ARP_KEY}" "DisplayName"     "Acme Cockpit"
   WriteRegStr   HKLM "${ARP_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
