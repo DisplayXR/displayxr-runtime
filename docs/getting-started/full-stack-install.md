@@ -98,9 +98,11 @@ repos ship an asset for your platform:
 | Component   | Repo                                  | macOS today                        | Windows today                            |
 |-------------|---------------------------------------|------------------------------------|------------------------------------------|
 | runtime     | `displayxr-runtime`                   | yes (`DisplayXR-Installer-*.pkg`)  | yes (`DisplayXRSetup-*.exe`)             |
-| shell       | `displayxr-shell-releases`            | — (macOS port deferred, M6)        | yes (`DisplayXRShellSetup-*.exe`)        |
+| shell       | `displayxr-shell-releases`            | yes (`DisplayXRShell-*.pkg`)       | yes (`DisplayXRShellSetup-*.exe`)        |
 | leia_plugin | `displayxr-leia-plugin`               | — (vendor SDK is Windows-only)     | yes (`DisplayXRLeiaSRSetup-*.exe`)       |
 | mcp_tools   | `displayxr-mcp`                       | yes (`DisplayXRMCP-*.pkg`)         | yes (`DisplayXRMCPSetup-*.exe`)          |
+
+Linux: the runtime (`displayxr-runtime_*_amd64.deb`) and the shell (`displayxr-shell_*_amd64.deb`) ship `.deb` packages on their releases; see `docs/roadmap/linux-support.md`.
 
 Empty cells warn-and-skip cleanly: the orchestrator does not abort when
 a component lacks an asset for the pinned tag.
