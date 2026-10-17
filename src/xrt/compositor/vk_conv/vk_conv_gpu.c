@@ -337,7 +337,21 @@ cmd_submit(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_waits *w
 	return r == VK_SUCCESS;
 }
 
-//! Submit, wait, free. Always frees @p cmd and releases @p waits.
+/*!
+ * Submit, wait, free. Always frees @p cmd and releases @p waits.
+ *
+ * THE HAND-OVER POINT FOR RESULTS (XRT_CONV_SYNC_NONE, "producer finished
+ * before hand-over"). Every GPU write of a result image goes through here and
+ * returns only after a HOST-side vkWaitForFences on that submit: the S5 views
+ * (glue_viewsyn_render) and the #2030 mirror upload (glue_upload ->
+ * vk_conv_gpu_write -> write_locked). conv_stream publishes the result (S8,
+ * u_lift_mailbox_publish_output) only after those calls returned, so a
+ * consumer on another API -- the macOS Metal weave backend sampling the
+ * result's IOSurface -- never reads unfinished Vulkan work and needs no
+ * semaphore. (No POSIX provider writes a GPU result itself: the provider mask
+ * defaults to 0.) The reader keeps the result pinned until ITS GPU work is done
+ * (Metal: vk_conv_weave_complete runs after waitUntilCompleted).
+ */
 static bool
 cmd_submit_wait(struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_waits *waits)
 {

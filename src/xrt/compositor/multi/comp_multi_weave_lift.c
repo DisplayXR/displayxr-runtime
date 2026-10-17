@@ -35,6 +35,30 @@ static struct vk_conv_weave_ops g_ops;
 static bool g_have_ops;
 static uint64_t g_gen = 1;
 
+/*
+ * Host engines' frames in flight (Metal: begun, not yet completed). A host
+ * engine's GPU work is on a queue the helper cannot idle (vk_conv_weave_destroy
+ * idles only the Vulkan queue), so replacing / clearing the ops waits here
+ * until every such frame has run _complete -- which the engine calls only
+ * after its command buffer completed. That keeps "the pin is released only
+ * after the GPU stopped reading the result" true across a detach too.
+ */
+static pthread_cond_t g_host_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t g_host_frames;
+static bool g_swapping; //!< set_lift_ops is waiting: no new host frames
+
+//! g_lift_mtx held: @p l's host frame (if any) is over.
+static void
+host_frame_end_locked(struct comp_multi_weave_lift *l)
+{
+	if (l->host_frame) {
+		l->host_frame = false;
+		if (g_host_frames > 0 && --g_host_frames == 0) {
+			pthread_cond_broadcast(&g_host_cv);
+		}
+	}
+}
+
 static pthread_mutex_t g_eyes_mtx = PTHREAD_MUTEX_INITIALIZER;
 static void (*g_eyes_publish)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes);
 static void (*g_eyes_retire)(void *ud, uint64_t dp_key);
@@ -44,6 +68,11 @@ void
 comp_multi_weave_set_lift_ops(const struct vk_conv_weave_ops *ops)
 {
 	pthread_mutex_lock(&g_lift_mtx);
+	g_swapping = true;
+	while (g_host_frames > 0) {
+		pthread_cond_wait(&g_host_cv, &g_lift_mtx); // bounded: host engines complete synchronously
+	}
+	g_swapping = false;
 	if (ops != NULL) {
 		g_ops = *ops;
 		g_have_ops = true;
@@ -100,6 +129,7 @@ client_locked(struct comp_multi_weave_lift *l)
 	if (l->client != NULL && l->client_gen != g_gen) {
 		l->client = NULL; // freed by the helper that made it
 		l->in_flight = false;
+		host_frame_end_locked(l);
 	}
 	return l->client;
 }
@@ -166,8 +196,9 @@ comp_multi_weave_lift_begin(struct comp_multi_weave_lift *l, struct vk_bundle *v
 		g_ops.begin(g_ops.ud, c); // the last weave never completed: it was never submitted
 		l->in_flight = false;
 	}
+	host_frame_end_locked(l);
 	bool ok = false;
-	if (count > 0 && g_have_ops) {
+	if (count > 0 && g_have_ops && !(vk == NULL && g_swapping)) {
 		if (c == NULL && g_ops.client_create != NULL) {
 			c = g_ops.client_create(g_ops.ud, vk);
 			l->client = c;
@@ -177,6 +208,10 @@ comp_multi_weave_lift_begin(struct comp_multi_weave_lift *l, struct vk_bundle *v
 		if (ok) {
 			g_ops.begin(g_ops.ud, c);
 			l->in_flight = true;
+			if (vk == NULL) {
+				l->host_frame = true;
+				g_host_frames++;
+			}
 		}
 	}
 	pthread_mutex_unlock(&g_lift_mtx);
@@ -229,9 +264,10 @@ comp_multi_weave_lift_complete(struct comp_multi_weave_lift *l)
 	pthread_mutex_lock(&g_lift_mtx);
 	struct vk_conv_weave_client *c = client_locked(l);
 	if (c != NULL && l->in_flight && g_ops.complete != NULL) {
-		g_ops.complete(g_ops.ud, c);
+		g_ops.complete(g_ops.ud, c); // releases the frame's result pins
 	}
 	l->in_flight = false;
+	host_frame_end_locked(l);
 	pthread_mutex_unlock(&g_lift_mtx);
 }
 
@@ -245,6 +281,7 @@ comp_multi_weave_lift_fini(struct comp_multi_weave_lift *l)
 	}
 	l->client = NULL;
 	l->in_flight = false;
+	host_frame_end_locked(l);
 	l->count = 0;
 	pthread_mutex_unlock(&g_lift_mtx);
 }

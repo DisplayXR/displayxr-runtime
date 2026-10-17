@@ -63,6 +63,9 @@ struct comp_multi_weave_lift
 	uint64_t client_gen;
 	//! A weave with lifted rects was recorded and not yet completed / dropped.
 	bool in_flight;
+	//! ... and it is a host engine's (Metal): counted in the process-wide
+	//! host-frame count that clearing the ops waits on.
+	bool host_frame;
 };
 
 /*!
