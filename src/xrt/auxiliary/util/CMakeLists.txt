@@ -129,6 +129,8 @@ add_library(
 	u_overlay_lease.c
 	u_overlay_lease.h
 	u_pacing.h
+	u_pointer_sink.c
+	u_pointer_sink.h
 	u_pacing_app.c
 	u_pacing_compositor.c
 	u_pacing_compositor_fake.c
