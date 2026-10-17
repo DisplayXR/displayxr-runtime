@@ -34,3 +34,15 @@ target_include_directories(comp_vk_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # Generated SPIR-V headers land under the binary dir mirroring shaders/.
 target_include_directories(comp_vk_conv_viewsyn PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(comp_vk_conv_viewsyn PUBLIC xrt-interfaces aux_vk PRIVATE aux_util)
+
+# Image allocation (exportable VkImages), CPU <-> image, S5 adapter, S6 readback.
+add_library(comp_vk_conv STATIC vk_conv_gpu.c vk_conv_gpu.h)
+target_include_directories(comp_vk_conv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(
+	comp_vk_conv
+	PUBLIC xrt-interfaces aux_vk conv_runtime comp_vk_conv_viewsyn
+	PRIVATE aux_util aux_os
+	)
+if(APPLE)
+	target_link_libraries(comp_vk_conv PRIVATE "-framework CoreFoundation" "-framework IOSurface")
+endif()
