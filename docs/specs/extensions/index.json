@@ -110,7 +110,7 @@
     "XR_DXR_android_surface_binding": {
       "group": "windowing",
       "title": "Android Surface Binding",
-      "summary": "App-provided Android Surface / ANativeWindow, republished across background and resume, with the per-frame window rect"
+      "summary": "App-provided Android Surface / ANativeWindow, republished across background and resume, with the per-frame window rect and the surface's touch events for the runtime's touch input provider"
     },
     "XR_DXR_macos_gl_binding": {
       "group": "windowing",

@@ -32,6 +32,9 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
+#include "util/u_pointer_sink.h"
+
+#include "xrt/xrt_input_plugin.h"
 
 #include "os/os_time.h"
 
@@ -719,6 +722,62 @@ oxr_xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeomet
 	                               (uint32_t)(geometry->panelExtent.width > 0 ? geometry->panelExtent.width : 0),
 	                               (uint32_t)(geometry->panelExtent.height > 0 ? geometry->panelExtent.height : 0));
 
+	return XR_SUCCESS;
+}
+
+/*
+ * Spec v3 (#132): the third fact only the app sees — its surface's touch.
+ *
+ * The runtime's touch provider reads a process-wide pointer queue through the
+ * input-provider host iface; the hosted MonadoView pushes its own events into
+ * it, and an app that owns its Surface pushes here. The two paths are
+ * indistinguishable past this point, which is the whole design: the provider
+ * never learns which kind of surface it is driving.
+ */
+XrResult
+oxr_xrSubmitAndroidInputEventDXR(XrSession session, const XrAndroidInputEventDXR *event)
+{
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSubmitAndroidInputEventDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_android_surface_binding);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, event, XR_TYPE_ANDROID_INPUT_EVENT_DXR);
+
+	if (event->action < XR_ANDROID_INPUT_ACTION_DOWN_DXR || event->action > XR_ANDROID_INPUT_ACTION_CANCEL_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSubmitAndroidInputEventDXR: action %d is not an "
+		                 "XrAndroidInputActionDXR",
+		                 (int)event->action);
+	}
+	if (event->surfaceExtent.width < 0 || event->surfaceExtent.height < 0) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSubmitAndroidInputEventDXR: surfaceExtent must be non-negative (%dx%d)",
+		                 event->surfaceExtent.width, event->surfaceExtent.height);
+	}
+
+	struct xrt_input_pointer_event ev = {0};
+	ev.struct_size = (uint32_t)sizeof(ev);
+	// XrAndroidInputActionDXR was defined 1:1 on xrt_input_pointer_action.
+	ev.action = (uint32_t)event->action;
+	ev.timestamp_ns = event->eventTimeNs > 0 ? event->eventTimeNs : (int64_t)os_monotonic_get_ns();
+	ev.pointer_id = event->pointerId;
+	ev.pointer_count = event->pointerCount;
+	ev.x = event->position.x;
+	ev.y = event->position.y;
+	ev.surface_width = (uint32_t)event->surfaceExtent.width;
+	ev.surface_height = (uint32_t)event->surfaceExtent.height;
+	if (ev.surface_width == 0 || ev.surface_height == 0) {
+		// Fall back to the extent the app last published for the weave; an
+		// app that publishes neither leaves the provider unable to
+		// normalise, and it ignores the event (its slop is in pixels).
+		uint32_t w = 0;
+		uint32_t h = 0;
+		if (android_globals_get_window_screen_rect(NULL, NULL, &w, &h, NULL, NULL, NULL, NULL)) {
+			ev.surface_width = w;
+			ev.surface_height = h;
+		}
+	}
+	u_pointer_sink_push(&ev);
 	return XR_SUCCESS;
 }
 

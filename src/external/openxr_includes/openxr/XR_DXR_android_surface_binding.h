@@ -57,6 +57,14 @@
  * the weave; escaping it needs a layout change only the app can make, from a
  * measurement only the runtime does. See that struct.
  *
+ * Spec v3 adds a THIRD fact only the app sees — its surface's touch — through
+ * @ref xrSubmitAndroidInputEventDXR (runtime#132). The runtime's touch input
+ * provider turns pointer events into a navigation rig (orbit / pinch / pan)
+ * and an emulated controller (aim ray under the finger, select on tap), but
+ * it can only see events on surfaces the runtime owns: the hosted
+ * `SurfaceView` forwards its own. An app that owns its Surface owns its
+ * `MotionEvent`s too, and submits the ones it wants the runtime to act on.
+ *
  * TRAP: an OEM that applies the `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` compat
  * change makes `View.getLocationOnScreen()` return WINDOW-relative
  * coordinates, so every window would report (0,0) with no error anywhere. The
@@ -76,7 +84,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_android_surface_binding 1
-#define XR_DXR_android_surface_binding_SPEC_VERSION 2
+#define XR_DXR_android_surface_binding_SPEC_VERSION 3
 #define XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_android_surface_binding"
 
 // XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR keeps the value published in
@@ -84,11 +92,12 @@ extern "C" {
 // XR_DXR_display_info.md §4 — it sits in one of the two unused gaps of the
 // XR_DXR_display_info decade rather than in this extension's own decade. The
 // geometry struct takes the next free decade, 1004999220–229 (220 = geometry,
-// 221 = the spec-v2 layout-hint event). Both are recorded in this directory's
-// README.md registry.
+// 221 = the spec-v2 layout-hint event, 222 = the spec-v3 input event). All are
+// recorded in this directory's README.md registry.
 #define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999005)
 #define XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR ((XrStructureType)1004999220)
 #define XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR ((XrStructureType)1004999221)
+#define XR_TYPE_ANDROID_INPUT_EVENT_DXR ((XrStructureType)1004999222)
 
 #if defined(__ANDROID__)
 
@@ -268,10 +277,81 @@ xrSetAndroidSurfaceDXR(XrSession session, const XrAndroidSurfaceBindingCreateInf
 XRAPI_ATTR XrResult XRAPI_CALL
 xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeometryDXR *geometry);
 
+/*!
+ * @brief What happened to one pointer in an @ref XrAndroidInputEventDXR (spec v3).
+ *
+ * The platform-neutral subset of `MotionEvent`'s action vocabulary. A `MotionEvent`
+ * that carries several pointers (every ACTION_MOVE does) is submitted as one
+ * event PER POINTER; ACTION_POINTER_DOWN / ACTION_POINTER_UP name the pointer at
+ * `getActionIndex()`.
+ */
+typedef enum XrAndroidInputActionDXR {
+    XR_ANDROID_INPUT_ACTION_DOWN_DXR = 1,   //!< ACTION_DOWN / ACTION_POINTER_DOWN
+    XR_ANDROID_INPUT_ACTION_MOVE_DXR = 2,   //!< ACTION_MOVE, one per pointer
+    XR_ANDROID_INPUT_ACTION_UP_DXR = 3,     //!< ACTION_UP / ACTION_POINTER_UP
+    XR_ANDROID_INPUT_ACTION_CANCEL_DXR = 4, //!< ACTION_CANCEL: every pointer is up
+    XR_ANDROID_INPUT_ACTION_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrAndroidInputActionDXR;
+
+/*!
+ * @brief One pointer event on the bound surface, for @ref xrSubmitAndroidInputEventDXR
+ *        (spec v3, runtime#132).
+ *
+ * Coordinates are the bound SURFACE's pixels, origin top-left, y down — `MotionEvent.getX(i)` /
+ * `getY(i)` on the app's `SurfaceView`, or `AMotionEvent_getX/Y` in a `NativeActivity`. The
+ * runtime's touch provider maps the surface onto the display plane, so a sub-panel window maps
+ * its own extent onto the whole panel (an approximation it accepts; the provider never learns
+ * where a window sits).
+ */
+typedef struct XrAndroidInputEventDXR {
+    XrStructureType             type;           //!< Must be XR_TYPE_ANDROID_INPUT_EVENT_DXR
+    const void* XR_MAY_ALIAS    next;           //!< Pointer to next structure in chain
+    XrAndroidInputActionDXR     action;
+    //! `MotionEvent.getPointerId(i)`: stable across this pointer's DOWN..UP life.
+    uint32_t                    pointerId;
+    //! Pointers down AFTER this event (`getPointerCount()`, minus one for an UP; 0 for CANCEL).
+    uint32_t                    pointerCount;
+    //! Surface-local position in pixels (ignored for CANCEL).
+    XrVector2f                  position;
+    //! The surface's extent in pixels at the time of the event. {0,0} ⟹ the runtime uses the
+    //! extent of the last rect published through @ref xrSetAndroidWindowGeometryDXR.
+    XrExtent2Di                 surfaceExtent;
+    //! `MotionEvent.getEventTime()` in NANOSECONDS (`uptimeMillis * 1e6`, i.e. CLOCK_MONOTONIC),
+    //! or `AMotionEvent_getEventTime()`. 0 ⟹ the runtime stamps the time of the call.
+    int64_t                     eventTimeNs;
+} XrAndroidInputEventDXR;
+
+/*!
+ * @brief Submit one pointer event from the application-owned Surface (spec v3).
+ *
+ * Feeds the runtime's pointer-event queue, which its touch input provider turns
+ * into the navigation rig (one-finger drag orbits, pinch dollies, two-finger drag
+ * pans, double tap recenters) and an emulated `khr/simple_controller` (aim ray
+ * from the nominal viewer through the finger; SELECT on a tap or a press-and-hold).
+ * The application keeps the events for itself too — submitting is a copy, not a
+ * hand-over — and may submit a subset (e.g. only what its own UI did not consume).
+ *
+ * Cheap: a mutex-guarded ring write, safe from the UI thread. The queue holds a
+ * bounded number of events and drops the oldest on overflow, so submit as they
+ * arrive rather than batching. Events submitted while no touch provider is
+ * resident are discarded.
+ *
+ * In-process sessions only (ADR-036 D2): over IPC the input provider lives in
+ * the service, which the per-client queue does not reach yet (#1996 is the
+ * routing design); the call succeeds and the events are dropped.
+ *
+ * @return XR_SUCCESS, XR_ERROR_HANDLE_INVALID, XR_ERROR_VALIDATION_FAILURE or
+ *         XR_ERROR_FUNCTION_UNSUPPORTED.
+ */
+XRAPI_ATTR XrResult XRAPI_CALL
+xrSubmitAndroidInputEventDXR(XrSession session, const XrAndroidInputEventDXR *event);
+
 typedef XrResult(XRAPI_PTR *PFN_xrSetAndroidSurfaceDXR)(XrSession session,
                                                         const XrAndroidSurfaceBindingCreateInfoDXR *binding);
 typedef XrResult(XRAPI_PTR *PFN_xrSetAndroidWindowGeometryDXR)(XrSession session,
                                                                const XrAndroidWindowGeometryDXR *geometry);
+typedef XrResult(XRAPI_PTR *PFN_xrSubmitAndroidInputEventDXR)(XrSession session,
+                                                              const XrAndroidInputEventDXR *event);
 
 #endif // defined(__ANDROID__)
 
