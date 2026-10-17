@@ -685,13 +685,8 @@ namespace {
 //! The D3D11 reduction shader (k_lb_ps), transcribed: one bucket's value read
 //! straight from the whole image (R G B A, @p stride texels per row).
 float
-lb_shader_bucket(const std::vector<uint8_t> &img,
-                 uint32_t stride,
-                 uint32_t w,
-                 uint32_t h,
-                 bool rows,
-                 uint32_t i,
-                 uint32_t n)
+lb_shader_bucket(
+    const std::vector<uint8_t> &img, uint32_t stride, uint32_t w, uint32_t h, bool rows, uint32_t i, uint32_t n)
 {
 	auto line_frac = [&](float a, float span) {
 		float cnt = 0.0f;
@@ -715,11 +710,8 @@ lb_shader_bucket(const std::vector<uint8_t> &img,
 
 //! The sampled lines of a w x h RGBA image, as a copy-only service reads them back.
 void
-lb_extract_lines(const std::vector<uint8_t> &img,
-                 uint32_t w,
-                 uint32_t h,
-                 std::vector<uint8_t> &cols,
-                 std::vector<uint8_t> &rows)
+lb_extract_lines(
+    const std::vector<uint8_t> &img, uint32_t w, uint32_t h, std::vector<uint8_t> &cols, std::vector<uint8_t> &rows)
 {
 	const uint32_t n = U_LIFT_LETTERBOX_LINE_SAMPLES;
 	cols.assign((size_t)n * h * 4, 0);

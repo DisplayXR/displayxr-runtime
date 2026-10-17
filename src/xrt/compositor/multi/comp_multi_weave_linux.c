@@ -2270,8 +2270,9 @@ weave_run_frame(struct vk_bundle *vk,
 			VkImageLayout crop_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			if (lifting) {
 				// The lift reads tile 0 and writes every tile of the crop: GENERAL.
-				weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+				weave_layout_barrier(vk, cmd, mc->weave.crop_image,
+				                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_ACCESS_TRANSFER_WRITE_BIT,
 				                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
 				                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 				weave_lift_record_nview(mc, cmd, layout, rect_count, rects, lift);
