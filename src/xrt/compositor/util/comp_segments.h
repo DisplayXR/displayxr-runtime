@@ -414,6 +414,35 @@ comp_segments_content_ring_get(const struct comp_segments_content_ring *r,
                                struct comp_segments_content *out);
 
 /*!
+ * The window placement one weave partitions its back buffer with (#1883): the
+ * window rect read at the weave itself when it is usable, else @p committed.
+ *
+ * The back buffer lands on the panels where the window is when it is
+ * presented, so the segment table (each DP's canvas, viewport, scissor and
+ * present origin) has to come from the freshest placement there is, read ONCE
+ * per weave and used for the whole table — the Windows half of the Linux
+ * move-sync contract (wayland-window-geometry.md §9: one origin per weave,
+ * a repaint re-weaves the last atlas at the NEW position). A placement read
+ * earlier (at the commit's start, before the late-weave pace, or by the last
+ * app frame for a repaint) puts the seam where the window was, and the
+ * neighbour's woven pixels show across it until the window rests.
+ *
+ * @p live is taken only when it has @p committed's size: a resize in flight
+ * keeps the committed size the back buffer was made for (the resize lag has its
+ * own handling), and a sample read in another DPI-virtualisation space differs
+ * in size, never only in origin, so it falls back too.
+ *
+ * @param committed The rect the frame was committed with (always valid).
+ * @param live      The rect read at the weave, or NULL when it could not be read.
+ * @param[out] out  The rect to weave with.
+ * @return true when @p live was taken.
+ */
+bool
+comp_segments_latch_window(const struct comp_seg_rect *committed,
+                           const struct comp_seg_rect *live,
+                           struct comp_seg_rect *out);
+
+/*!
  * Equal geometry and screens (used to log a table change once).
  */
 bool
