@@ -1,0 +1,53 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// ADR-053 S5, passes 2 / 3 / 6: one direction of the separable filters
+// (live-dibr.js dilateMax / erodeMin / snapPack, and MAX_FRAG): r = max over
+// rad_r, g = min over rad_c, b = max over rad_c, each window clamped to the
+// image. `seed` = take g / b from r. Port of k_viewsyn_filter_ps.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t_src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D o_dst;
+
+layout(push_constant) uniform Filter
+{
+	ivec2 dir;
+	int rad_r;
+	int rad_c;
+	int seed;
+	int pad0;
+	ivec2 out_size;
+}
+pc;
+
+void
+main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= pc.out_size.x || p.y >= pc.out_size.y) {
+		return;
+	}
+	ivec2 hi = textureSize(t_src, 0) - 1;
+	vec4 c = texelFetch(t_src, p, 0);
+	float r = c.r;
+	float g = pc.seed != 0 ? c.r : c.g;
+	float b = pc.seed != 0 ? c.r : c.b;
+	for (int k = 1; k <= 16; k++) {
+		if (k > pc.rad_r && k > pc.rad_c) {
+			break;
+		}
+		vec4 s0 = texelFetch(t_src, clamp(p + pc.dir * k, ivec2(0), hi), 0);
+		vec4 s1 = texelFetch(t_src, clamp(p - pc.dir * k, ivec2(0), hi), 0);
+		if (k <= pc.rad_r) {
+			r = max(r, max(s0.r, s1.r));
+		}
+		if (k <= pc.rad_c) {
+			g = min(g, pc.seed != 0 ? min(s0.r, s1.r) : min(s0.g, s1.g));
+			b = max(b, pc.seed != 0 ? max(s0.r, s1.r) : max(s0.b, s1.b));
+		}
+	}
+	imageStore(o_dst, p, vec4(r, g, b, 1.0));
+}

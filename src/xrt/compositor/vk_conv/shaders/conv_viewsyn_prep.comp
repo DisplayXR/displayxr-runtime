@@ -1,0 +1,50 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// ADR-053 S5, pass 1 (depth res): raw sample -> decoded -> nearness ->
+// unclamped normalised u, written to r, g and b (the snap's cores start equal
+// to the value). Line-for-line port of k_viewsyn_prep_ps
+// (d3d11_service/d3d11_conv_viewsyn_shaders.h).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t_depth;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D o_dst;
+
+layout(push_constant) uniform Prep
+{
+	float value_scale;
+	float value_shift;
+	float near_lo;
+	float inv_span;
+	uint kind; // XRT_CONV_DEPTH_*
+	uint has_invalid;
+	float invalid_sample;
+	float pad0;
+	ivec2 out_size;
+}
+pc;
+
+void
+main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= pc.out_size.x || p.y >= pc.out_size.y) {
+		return;
+	}
+	float s = texelFetch(t_depth, p, 0).r;
+	if (pc.has_invalid != 0u && s == pc.invalid_sample) {
+		imageStore(o_dst, p, vec4(0.0, 0.0, 0.0, 1.0));
+		return;
+	}
+	float d = pc.value_scale * s + pc.value_shift;
+	float n = d;
+	if (pc.kind == 1u) {
+		n = d > 0.0 ? 1.0 / d : 0.0; // METRIC: 1/z (live-dibr.js toDisparity)
+	} else if (pc.kind == 5u) {
+		n = -d; // AFFINE depth: larger = farther
+	}
+	float u = (n - pc.near_lo) * pc.inv_span;
+	imageStore(o_dst, p, vec4(u, u, u, 1.0));
+}

@@ -522,6 +522,15 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 endif()
 
 ###
+# ADR-053 P5: the conversion core's Vulkan glue (image allocation, the S5
+# reference view synthesis, S6 readback) for the macOS and desktop-Linux
+# services. Windows uses the D3D11 service's glue (d3d11_service).
+#
+if(XRT_HAVE_VULKAN AND (APPLE OR (XRT_HAVE_LINUX AND NOT ANDROID)))
+	add_subdirectory(vk_conv)
+endif()
+
+###
 # Native OpenGL compositor (bypasses Vulkan entirely)
 #
 # Win32 + macOS only: those are the only platforms that link it (st_oxr's
