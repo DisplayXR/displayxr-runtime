@@ -108,6 +108,36 @@ struct vkc_sem
 	VkSemaphore sem;
 };
 
+//! A client image imported for one copy (work_mtx held); ext_free releases it.
+struct vkc_ext
+{
+	VkImage image;
+	VkDeviceMemory mem;
+	VkFormat format;
+	uint32_t w, h;
+	uint32_t kind;
+	bool cached; //!< owned by the import cache: ext_free leaves it
+	bool primed; //!< used before: left in GENERAL by the last copy (a cached IOSurface)
+};
+
+/*!
+ * Imported client IOSurfaces, by IOSurfaceID (an app submits the same few
+ * surfaces every frame; importing one costs a VkImage + an MTLTexture
+ * import). The cached image's MTLTexture retains its IOSurface, so the ID
+ * cannot be reused while it is cached; an entry unused for
+ * VKC_EXT_CACHE_IDLE_NS is dropped (and the app's surface with it).
+ */
+#define VKC_EXT_CACHE_SIZE 4u
+#define VKC_EXT_CACHE_IDLE_NS (2ull * 1000ull * 1000ull * 1000ull)
+struct vkc_ext_cache_entry
+{
+	uint64_t key; //!< IOSurfaceID; 0 = empty
+	uint32_t format;
+	uint64_t last_use_ns;
+	struct vkc_ext e;
+};
+
+
 //! Waits a submit carries (imported sync of the images it reads).
 #define VKC_MAX_WAITS 4u
 struct vkc_waits
@@ -153,6 +183,8 @@ struct vk_conv_gpu
 	//! Client transport scratch (work_mtx): a raw (UNORM) copy of an _SRGB
 	//! source, and the blit target of a copy into a CPU slot.
 	struct vkc_img *x_raw, *x_cpu;
+	//! Client IOSurfaces already imported (work_mtx).
+	struct vkc_ext_cache_entry ext_cache[VKC_EXT_CACHE_SIZE];
 	//! Copies made, by direction (work_mtx).
 	struct vk_conv_gpu_stats stats;
 
@@ -1698,20 +1730,15 @@ vk_conv_gpu_stage_ops(struct vk_conv_gpu *g, struct conv_viewsyn_ops *viewsyn, s
  *
  */
 
-//! A client image imported for one copy (work_mtx held); ext_free releases it.
-struct vkc_ext
-{
-	VkImage image;
-	VkDeviceMemory mem;
-	VkFormat format;
-	uint32_t w, h;
-	uint32_t kind;
-};
 
 static void
 ext_free(struct vk_conv_gpu *g, struct vkc_ext *e)
 {
 	struct vk_bundle *vk = g->vk;
+	if (e->cached) {
+		memset(e, 0, sizeof(*e));
+		return; // the cache keeps it
+	}
 	if (e->image != VK_NULL_HANDLE) {
 		vk->vkDestroyImage(vk->device, e->image, NULL);
 	}
@@ -1927,7 +1954,43 @@ ext_import(struct vk_conv_gpu *g, const struct vk_conv_gpu_external *src, struct
 		// Imported as the UNORM alias: the bytes are copied raw (an _SRGB
 		// input stays encoded, as the CPU kind's bytes do).
 		out->format = unorm_alias(conv_to_vk(src->format));
-		return iosurface_image(g, surf, out->format, out->w, out->h, 0, &out->image, &out->mem, NULL);
+		const uint64_t key = (uint64_t)IOSurfaceGetID(surf);
+		const uint64_t now = os_monotonic_get_ns();
+		struct vkc_ext_cache_entry *slot = NULL, *lru = NULL;
+		for (uint32_t i = 0; i < VKC_EXT_CACHE_SIZE; i++) {
+			struct vkc_ext_cache_entry *c = &g->ext_cache[i];
+			if (c->key != 0 && now - c->last_use_ns > VKC_EXT_CACHE_IDLE_NS) {
+				c->e.cached = false;
+				ext_free(g, &c->e);
+				memset(c, 0, sizeof(*c));
+			}
+			if (c->key == key && c->format == src->format && c->e.w == out->w && c->e.h == out->h) {
+				slot = c;
+			}
+			if (lru == NULL || c->key == 0 || (lru->key != 0 && c->last_use_ns < lru->last_use_ns)) {
+				lru = c;
+			}
+		}
+		if (slot == NULL) {
+			if (!iosurface_image(g, surf, out->format, out->w, out->h, 0, &out->image, &out->mem, NULL)) {
+				return false;
+			}
+			if (lru->key != 0) {
+				lru->e.cached = false;
+				ext_free(g, &lru->e);
+			}
+			lru->key = key;
+			lru->format = src->format;
+			lru->e = *out;
+			lru->e.cached = true;
+			slot = lru;
+			*out = slot->e;
+		} else {
+			*out = slot->e;
+			out->primed = true;
+		}
+		slot->last_use_ns = now;
+		return true;
 	}
 #endif
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
@@ -2053,9 +2116,11 @@ ext_acquire(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_ext *e)
 	    .srcAccessMask = 0,
 	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 	    // OPAQUE_FD: the producer leaves the image in GENERAL (the contract) and
-	    // releases it to VK_QUEUE_FAMILY_EXTERNAL. IOSurface (MoltenVK) keeps
-	    // its bytes across any layout transition.
-	    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+	    // releases it to VK_QUEUE_FAMILY_EXTERNAL. IOSurface: a fresh import is
+	    // UNDEFINED (MoltenVK keeps the surface's bytes across it), a cached
+	    // one was left GENERAL by ext_release.
+	    .oldLayout = (e->kind == XRT_CONV_MEM_VK_OPAQUE_FD || e->primed) ? VK_IMAGE_LAYOUT_GENERAL
+	                                                                     : VK_IMAGE_LAYOUT_UNDEFINED,
 	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2084,6 +2149,23 @@ ext_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_ext *e)
 		return;
 	}
 #endif
+	if (e->kind == XRT_CONV_MEM_IOSURFACE) {
+		// Cached for the next submit of the same surface: back to GENERAL.
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = e->image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &b);
+		return;
+	}
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 	if (e->kind == XRT_CONV_MEM_VK_OPAQUE_FD) {
 		VkImageMemoryBarrier b = {
@@ -2100,10 +2182,6 @@ ext_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_ext *e)
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
 		                         0, NULL, 0, NULL, 1, &b);
 	}
-#else
-	(void)vk;
-	(void)cmd;
-	(void)e;
 #endif
 }
 
@@ -2240,9 +2318,21 @@ region_to_dst_locked(struct vk_conv_gpu *g,
 			by = 0;
 		}
 	}
+	const uint32_t pitch =
+	    cpu_dst && dst->row_stride != 0 ? dst->row_stride : (target != NULL ? target->w * 4u : 0);
+	if (ok && cpu_dst) {
+		ok = (dst->byte_size == 0 || dst->byte_size >= (uint64_t)pitch * target->h) &&
+		     stage_ensure(g, (VkDeviceSize)target->w * 4u * target->h);
+	}
 	if (ok) {
 		record_region_blit(g, cmd, blit_src, blit_layout, bx, by, w, h, target);
 		g->stats.gpu_copies++;
+		if (cpu_dst) {
+			// The readback rides the same submit (one round trip, not two).
+			record_buffer_image(vk, cmd, g->stage_buf, target, false);
+			cmd_global_barrier(vk, cmd);
+			g->stats.host_reads++;
+		}
 	}
 	if (before_submit != NULL) {
 		before_submit(g, cmd, ctx);
@@ -2250,9 +2340,8 @@ region_to_dst_locked(struct vk_conv_gpu *g,
 	const bool submitted = cmd_submit_wait(g, cmd, waits);
 	ok = ok && submitted;
 	if (ok && cpu_dst) {
-		const uint32_t pitch = dst->row_stride != 0 ? dst->row_stride : target->w * 4u;
-		ok = (dst->byte_size == 0 || dst->byte_size >= (uint64_t)pitch * target->h) &&
-		     read_locked(g, target, dst->cpu_ptr, pitch);
+		copy_rows((uint8_t *)dst->cpu_ptr, pitch, (const uint8_t *)g->stage_map, target->w * 4u, target->w * 4u,
+		          target->h);
 	}
 	return ok;
 }
@@ -2719,6 +2808,10 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 	}
 	img_destroy(g, g->x_raw);
 	img_destroy(g, g->x_cpu);
+	for (uint32_t i = 0; i < VKC_EXT_CACHE_SIZE; i++) {
+		g->ext_cache[i].e.cached = false;
+		ext_free(g, &g->ext_cache[i].e);
+	}
 	if (g->s5_sem != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
 	}
