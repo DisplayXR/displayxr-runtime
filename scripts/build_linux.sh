@@ -158,9 +158,7 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
-  -DXRT_HAVE_SDL2=OFF \
-  -DXRT_HAVE_OPENCV=OFF \
-  -DXRT_HAVE_LIBUSB=OFF
+  -DXRT_HAVE_SDL2=OFF
 
 echo "=== Building runtime + displayxr-cli + sim_display plug-in ==="
 cmake --build "$BUILD_DIR"

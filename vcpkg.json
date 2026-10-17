@@ -25,21 +25,8 @@
         "vulkan-headers",
         "vulkan-loader"
     ],
-    "default-features": [
-        "usb"
-    ],
+    "default-features": [],
     "features": {
-        "usb": {
-            "description": "Support USB device drivers",
-            "dependencies": [
-                "libusb",
-                "hidapi",
-                {
-                    "name": "zlib",
-                    "platform": "linux"
-                }
-            ]
-        },
         "gui": {
             "description": "Debug GUI support",
             "dependencies": [
@@ -49,12 +36,6 @@
                         "vulkan"
                     ]
                 }
-            ]
-        },
-        "tracking": {
-            "description": "OpenCV-based tracking features",
-            "dependencies": [
-                "opencv"
             ]
         }
     },
