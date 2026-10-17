@@ -72,10 +72,12 @@ internal sealed class FakeSource : IProcessSource
     {
         public Action<string> OnLine = _ => { };
         public Action<int?> OnExit = _ => { };
+        public Action<string> OnNote = _ => { };
         public bool Stopped;
         public void Stop() => Stopped = true;
         public void Line(string s) => OnLine(s);
         public void Exit(int? code = 1) => OnExit(code);
+        public void Note(string s) => OnNote(s);
     }
 
     public readonly List<Child> Children = new();
@@ -88,10 +90,10 @@ internal sealed class FakeSource : IProcessSource
 
     public Child Last => Children[^1];
 
-    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit)
+    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote)
     {
         if (FailStart) throw new System.IO.FileNotFoundException("displayxr-cli.exe not found");
-        var c = new Child { OnLine = onLine, OnExit = onExit };
+        var c = new Child { OnLine = onLine, OnExit = onExit, OnNote = onNote };
         Children.Add(c);
         return c;
     }
@@ -142,6 +144,75 @@ public class StatusFeedTests
         Assert.True(src.Last.Stopped);
         Assert.Equal(FeedMode.Idle, feed.Mode);
         Assert.Null(feed.Snapshot); // D5.4: no stale badge after release
+    }
+
+    // The "connecting… forever" class: a watch child that stays up and prints nothing
+    // (a service that admits a CLI from another directory as APP, not DIAG, and refuses
+    // every status read; the pre-fix CLI then looped connect -> refuse without a line).
+    [Fact]
+    public void SilentChild_IsReportedAfterTenSeconds_WithTheCliNote()
+    {
+        var (feed, src, clock) = Make();
+        feed.Hold();
+        src.Last.Note("displayxr-cli status: the service refused the status read (not DIAG).");
+        clock.Drain();
+        Assert.Equal("displayxr-cli status: the service refused the status read (not DIAG).", feed.ChildNote);
+        clock.Advance(StatusFeed.SilenceWarn - TimeSpan.FromSeconds(1));
+        Assert.False(feed.Silent);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Assert.True(feed.Silent);
+        Assert.Null(feed.Snapshot);
+        Assert.Equal(FeedMode.Watching, feed.Mode);
+        Assert.False(src.Last.Stopped); // reported, not killed: it may still connect
+
+        src.Last.Line(Headless); // the fixed CLI falls back to the headless snapshot
+        clock.Drain();
+        Assert.False(feed.Silent);
+        Assert.NotNull(feed.Snapshot);
+    }
+
+    [Fact]
+    public void ChildThatPrintsAtOnce_IsNeverSilent_AndTheWatchdogIsGone()
+    {
+        var (feed, src, clock) = Make();
+        feed.Hold();
+        src.Last.Line(Service);
+        clock.Drain();
+        clock.Advance(StatusFeed.SilenceWarn * 3);
+        Assert.False(feed.Silent);
+        Assert.Equal(0, clock.PendingTimers);
+    }
+
+    [Fact]
+    public void ReplacedChild_SilenceAndNotesOfTheOldChildAreIgnored()
+    {
+        var (feed, src, clock) = Make();
+        feed.Hold();
+        var old = src.Last;
+        feed.Refresh();
+        Assert.Equal(2, src.Children.Count);
+        old.Note("displayxr-cli status: stale");
+        old.Line(Service); // dropped: not the current child
+        clock.Drain();
+        Assert.Null(feed.ChildNote);
+        Assert.Null(feed.Snapshot);
+        src.Last.Line(Service);
+        clock.Advance(StatusFeed.SilenceWarn * 2);
+        Assert.False(feed.Silent);
+        Assert.NotNull(feed.Snapshot);
+    }
+
+    [Fact]
+    public void Release_ClearsTheSilenceState()
+    {
+        var (feed, src, clock) = Make();
+        feed.Hold();
+        clock.Advance(StatusFeed.SilenceWarn);
+        Assert.True(feed.Silent);
+        feed.SetPaused(true);
+        Assert.False(feed.Silent);
+        Assert.Null(feed.ChildNote);
+        Assert.Equal(0, clock.PendingTimers);
     }
 
     [Fact]

@@ -79,7 +79,7 @@ public sealed class FixtureProcessSource : IProcessSource
         DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s); workspace {(_workspace is null ? "absent" : "simulated")}");
     }
 
-    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit)
+    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote)
     {
         var w = new Replay();
         _ = Task.Run(async () =>
