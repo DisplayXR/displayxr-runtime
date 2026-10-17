@@ -34,6 +34,7 @@ static bool g_provider_claimed_left = false;
 static bool g_provider_claimed_right = false;
 static bool g_provider_claimed_ht_left = false;
 static bool g_provider_claimed_ht_right = false;
+static bool g_provider_claimed_gamepad = false;
 
 void
 t_builder_input_provider_get_claims(bool *out_left, bool *out_right)
@@ -110,6 +111,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 	g_provider_claimed_right = false;
 	g_provider_claimed_ht_left = false;
 	g_provider_claimed_ht_right = false;
+	g_provider_claimed_gamepad = false;
 
 	t_input_arbiter_reset();
 
@@ -140,6 +142,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 	int provider_count = target_input_plugin_get_count();
 	struct xrt_device *first_left = NULL;
 	struct xrt_device *first_right = NULL;
+	struct xrt_device *first_gamepad = NULL;
 
 	for (int p = 0; p < provider_count; p++) {
 		const struct xrt_input_plugin_iface *iface = target_input_plugin_get_iface(p);
@@ -184,6 +187,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 
 		struct xrt_device *prov_left = NULL;
 		struct xrt_device *prov_right = NULL;
+		struct xrt_device *prov_gamepad = NULL;
 		struct xrt_device *ht_ul = NULL;
 		struct xrt_device *ht_ur = NULL;
 		struct xrt_device *ht_cl = NULL;
@@ -210,8 +214,10 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 			// are in the provider's own private frame F and are
 			// read directly by the rig composer, which is what
 			// DEFINES the rig. Rig-composing it through the space
-			// graph would feed the rig back into itself.
+			// graph would feed the rig back into itself. A GAMEPAD
+			// has no pose at all, so there is nothing to compose.
 			if (xdev->device_type != XRT_DEVICE_TYPE_NAVIGATION &&
+			    xdev->device_type != XRT_DEVICE_TYPE_GAMEPAD &&
 			    ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
 				ubrh->rig_relative[ubrh->rig_relative_count++] = xdev;
 			}
@@ -236,6 +242,14 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 					prov_left = xdev;
 				} else if (prov_right == NULL) {
 					prov_right = xdev;
+				}
+				break;
+			case XRT_DEVICE_TYPE_GAMEPAD:
+				// `/user/gamepad`: the role the legacy builder
+				// assigned statically and the component path never
+				// did. Presence-gated by the arbiter like the rig.
+				if (prov_gamepad == NULL) {
+					prov_gamepad = xdev;
 				}
 				break;
 			default:
@@ -283,9 +297,10 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 
 			U_LOG_I("input provider builder: '%s' added device '%s' (type=%d)%s",
 			        iface->id != NULL ? iface->id : "?", xdev->str, (int)xdev->device_type,
-			        (prov_left == xdev)    ? " [left]"
-			        : (prov_right == xdev) ? " [right]"
-			                               : "");
+			        (prov_left == xdev)      ? " [left]"
+			        : (prov_right == xdev)   ? " [right]"
+			        : (prov_gamepad == xdev) ? " [gamepad]"
+			                                 : "");
 		}
 
 		// Hand this provider's pair to the arbiter with its identity
@@ -295,6 +310,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		t_input_arbiter_note_provider_pair(iface, inst, priority, prov_left, prov_right);
 		t_input_arbiter_note_provider_hand_tracking(ht_ul, ht_ur, ht_cl, ht_cr);
 		t_input_arbiter_note_provider_navigation(devs, count);
+		t_input_arbiter_note_provider_gamepad(devs, count);
 
 		if (first_left == NULL) {
 			first_left = prov_left;
@@ -302,13 +318,27 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		if (first_right == NULL) {
 			first_right = prov_right;
 		}
+		if (first_gamepad == NULL) {
+			first_gamepad = prov_gamepad;
+		}
 
 		g_provider_claimed_left |= prov_left != NULL;
 		g_provider_claimed_right |= prov_right != NULL;
+		g_provider_claimed_gamepad |= prov_gamepad != NULL;
 
-		U_LOG_W("input provider builder: provider '%s' (priority %u) supplied %u device(s)%s%s.",
+		U_LOG_W("input provider builder: provider '%s' (priority %u) supplied %u device(s)%s%s%s.",
 		        iface->id != NULL ? iface->id : "?", priority, count,
-		        prov_left != NULL ? " — left supplied" : "", prov_right != NULL ? ", right supplied" : "");
+		        prov_left != NULL ? " — left supplied" : "", prov_right != NULL ? ", right supplied" : "",
+		        prov_gamepad != NULL ? ", gamepad supplied" : "");
+	}
+
+	// The gamepad's static seed: the highest-ranked pad. Taken whether or
+	// not a pad is attached right now — the arbiter installs itself whenever
+	// a gamepad candidate exists and re-resolves the role against presence
+	// from its first get_roles on, so a seeded-but-unplugged pad reads -1
+	// before any app can see it.
+	if (ubrh->gamepad == NULL) {
+		ubrh->gamepad = first_gamepad;
 	}
 
 	// The static role seed: the highest-ranked pair, taken only if any
@@ -331,11 +361,12 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 
 	if (provider_count > 0) {
 		U_LOG_W(
-		    "input provider builder: %d provider(s) resident%s%s%s%s; hardware %s — %s holds the hand roles.",
+		    "input provider builder: %d provider(s) resident%s%s%s%s%s; hardware %s — %s holds the hand roles.",
 		    provider_count, g_provider_claimed_left ? " — left supplied" : "",
 		    g_provider_claimed_right ? ", right supplied" : "",
 		    g_provider_claimed_ht_left ? ", ht-left claimed" : "",
-		    g_provider_claimed_ht_right ? ", ht-right claimed" : "", holds ? "present" : "absent",
+		    g_provider_claimed_ht_right ? ", ht-right claimed" : "",
+		    g_provider_claimed_gamepad ? ", gamepad supplied" : "", holds ? "present" : "absent",
 		    holds ? "a provider" : "qwerty");
 	}
 

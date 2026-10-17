@@ -37,6 +37,13 @@
  * means the runtime's own fly camera (qwerty WASD/mouse-look) drives the
  * rig, which is what every box without a navigating provider reports.
  *
+ * The **gamepad role** (`xrt_system_roles::gamepad`, `/user/gamepad`) joins
+ * the same walk: a provider may supply one @ref XRT_DEVICE_TYPE_GAMEPAD
+ * device, and the role points at the highest-priority present one. Like the
+ * rig, its floor is an absence (-1 — qwerty has no pad); unlike the rig, the
+ * runtime seeds a static assignment from the builder, which the arbiter then
+ * keeps presence-gated so an unplugged pad really is gone.
+ *
  * ADR-054 N7 (#2143) makes the HAND floor optional too: with the
  * `EmulatedControllers` gate at 0 the builder publishes no qwerty pair, so
  * there is no floor candidate, and the hands fall to "no role" (-1, which
@@ -140,6 +147,21 @@ t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left
  */
 void
 t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_t count);
+
+/*!
+ * Record the gamepad device the SAME provider supplied — must follow the
+ * matching @ref t_input_arbiter_note_provider_pair call (attaches to the most
+ * recently noted provider candidate). Same shape as
+ * @ref t_input_arbiter_note_provider_navigation: the arbiter picks the one
+ * device of type @ref XRT_DEVICE_TYPE_GAMEPAD out of @p devs; a second is a
+ * provider bug (warned, first kept); none means no gamepad candidate.
+ *
+ * `xrt_system_roles::gamepad` then follows the presence walk: the
+ * highest-priority present candidate with a gamepad wins, -1 when none does
+ * (there is no qwerty gamepad). `gamepad_profile` is that device's `name`.
+ */
+void
+t_input_arbiter_note_provider_gamepad(struct xrt_device *const *devs, uint32_t count);
 
 /*!
  * Record the qwerty fallback's left/right emulated controllers. Either

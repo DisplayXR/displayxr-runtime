@@ -85,6 +85,15 @@ struct t_input_candidate
 	//! Index for @ref nav, resolved at install. -1 = absent.
 	int32_t nav_index;
 
+	/*!
+	 * The single @ref XRT_DEVICE_TYPE_GAMEPAD device this candidate
+	 * supplies, or NULL. Qwerty never has one; the floor is -1.
+	 */
+	struct xrt_device *gamepad;
+
+	//! Index for @ref gamepad, resolved at install. -1 = absent.
+	int32_t gamepad_index;
+
 	//! Cached presence verdict for this candidate.
 	bool present;
 	bool have_verdict;
@@ -210,7 +219,7 @@ candidate_supplies_hands(const struct t_input_candidate *cand)
 static bool
 query_candidate_presence(const struct t_input_candidate *cand)
 {
-	if (!candidate_supplies_hands(cand) && cand->nav == NULL) {
+	if (!candidate_supplies_hands(cand) && cand->nav == NULL && cand->gamepad == NULL) {
 		return false; // Supplied no arbitrable device at all.
 	}
 	if (cand->iface == NULL) {
@@ -334,6 +343,27 @@ pick_rig_locked(void)
 		}
 		if (candidate_is_present_locked(cand)) {
 			return cand->nav_index;
+		}
+	}
+	return -1;
+}
+
+/*!
+ * Same walk for the gamepad role: the highest-priority present candidate
+ * that supplies a @ref XRT_DEVICE_TYPE_GAMEPAD device. -1 when none does —
+ * there is no qwerty gamepad, so the floor is "no gamepad", which is what
+ * every box without a pad provider (or with its pad unplugged) reports.
+ */
+static int32_t
+pick_gamepad_locked(void)
+{
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = ranked_locked(i);
+		if (cand->gamepad_index < 0) {
+			continue;
+		}
+		if (candidate_is_present_locked(cand)) {
+			return cand->gamepad_index;
 		}
 	}
 	return -1;
@@ -482,12 +512,13 @@ refresh_roles_locked(void)
 	int32_t ht_cr = pick_ht_slot_locked(ARB_HT_CONFORMING_RIGHT);
 
 	int32_t rig = pick_rig_locked();
+	int32_t gamepad = pick_gamepad_locked();
 
 	if (g_arb.roles.generation_id != 0 && g_arb.roles.left == left && g_arb.roles.right == right &&
 	    g_arb.roles.hand_tracking.unobstructed.left == ht_ul &&
 	    g_arb.roles.hand_tracking.unobstructed.right == ht_ur &&
 	    g_arb.roles.hand_tracking.conforming.left == ht_cl && g_arb.roles.hand_tracking.conforming.right == ht_cr &&
-	    g_arb.roles.rig == rig) {
+	    g_arb.roles.rig == rig && g_arb.roles.gamepad == gamepad) {
 		return; // Nothing moved.
 	}
 
@@ -509,13 +540,23 @@ refresh_roles_locked(void)
 	g_arb.roles.hand_tracking.conforming.right = ht_cr;
 	g_arb.roles.rig = rig;
 
+	// The gamepad reports its own profile (a provider device, never a
+	// masquerading floor): -1 / INVALID when no present candidate has one.
+	struct xrt_device *gamepad_xdev =
+	    (gamepad >= 0 && (size_t)gamepad < g_arb.xsysd->xdev_count) ? g_arb.xsysd->xdevs[gamepad] : NULL;
+	g_arb.roles.gamepad = gamepad;
+	g_arb.roles.gamepad_profile = name_of(gamepad_xdev);
+
 	struct xrt_device *rig_xdev =
 	    (rig >= 0 && (size_t)rig < g_arb.xsysd->xdev_count) ? g_arb.xsysd->xdevs[rig] : NULL;
 
-	U_LOG_W("input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), rig -> '%s', generation %u.",
-	        left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
-	        right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand),
-	        rig_xdev != NULL ? rig_xdev->str : "<runtime fly camera>", (unsigned)generation);
+	U_LOG_W(
+	    "input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), rig -> '%s', gamepad -> '%s', "
+	    "generation %u.",
+	    left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
+	    right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand),
+	    rig_xdev != NULL ? rig_xdev->str : "<runtime fly camera>",
+	    gamepad_xdev != NULL ? gamepad_xdev->str : "<none>", (unsigned)generation);
 }
 
 static xrt_result_t
@@ -654,6 +695,7 @@ note_candidate(const struct xrt_input_plugin_iface *iface,
 	cand->left_index = -1;
 	cand->right_index = -1;
 	cand->nav_index = -1;
+	cand->gamepad_index = -1;
 	for (int i = 0; i < 4; i++) {
 		cand->ht_indices[i] = -1;
 	}
@@ -727,6 +769,30 @@ t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_
 }
 
 void
+t_input_arbiter_note_provider_gamepad(struct xrt_device *const *devs, uint32_t count)
+{
+	// Attaches to the candidate note_provider_pair just created, exactly
+	// like the navigation device does.
+	if (devs == NULL || g_arb.last_noted < 0 || g_arb.last_noted >= g_arb.candidate_count) {
+		return;
+	}
+	struct t_input_candidate *cand = &g_arb.candidates[g_arb.last_noted];
+
+	for (uint32_t i = 0; i < count; i++) {
+		struct xrt_device *xdev = devs[i];
+		if (xdev == NULL || xdev->device_type != XRT_DEVICE_TYPE_GAMEPAD) {
+			continue;
+		}
+		if (cand->gamepad != NULL) {
+			U_LOG_W("input arbiter: '%s' supplied more than one gamepad device — keeping '%s'.",
+			        candidate_name(cand), cand->gamepad->str);
+			break;
+		}
+		cand->gamepad = xdev;
+	}
+}
+
+void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right)
 {
 	if (left == NULL && right == NULL) {
@@ -774,9 +840,12 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		return;
 	}
 
+	// A navigation or gamepad candidate forces the arbiter in (below): the
+	// builder has no static seed for `roles.rig`, and the gamepad's static
+	// seed must become presence-gated so an unplugged pad really is gone.
 	bool have_nav = false;
 	for (int i = 0; i < g_arb.candidate_count; i++) {
-		have_nav |= g_arb.candidates[i].nav != NULL;
+		have_nav |= g_arb.candidates[i].nav != NULL || g_arb.candidates[i].gamepad != NULL;
 	}
 
 	bool have_floor = false;
@@ -814,6 +883,7 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 			cand->ht_indices[k] = index_of(xsysd, cand->ht_devices[k]);
 		}
 		cand->nav_index = index_of(xsysd, cand->nav);
+		cand->gamepad_index = index_of(xsysd, cand->gamepad);
 		// #958: seed the cache synchronously (single-threaded here) so the
 		// refresh below and the first client xrSyncActions / cli selftest get a
 		// valid verdict before the poll thread's first tick. The builder's own
@@ -838,9 +908,9 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		const struct t_input_candidate *cand = &g_arb.candidates[i];
-		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d) nav (%d).", i,
+		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d) nav (%d) gamepad (%d).", i,
 		        candidate_name(cand), (unsigned)cand->priority, cand->left_index, cand->right_index,
-		        cand->nav_index);
+		        cand->nav_index, cand->gamepad_index);
 		// A provider built before the presence slot is ASSUMED present for as
 		// long as it is loaded (query_candidate_presence), so with no hardware
 		// attached it still outranks qwerty and every hosted / WebXR app sees
