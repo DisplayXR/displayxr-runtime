@@ -465,6 +465,15 @@ if(TARGET comp_linux_window)
 	target_link_libraries(comp_multi PRIVATE comp_linux_window)
 endif()
 
+# XR_DXR_lift §6 on the Vulkan weave engines (macOS, desktop Linux): the
+# lifted-rect latch, the ops table the IPC layer installs (vk_conv_weave, not
+# linked here) and the conversion core's per-DP eyes sink.
+if(APPLE OR (XRT_HAVE_LINUX AND NOT ANDROID))
+	target_sources(
+		comp_multi PRIVATE multi/comp_multi_weave_lift.c multi/comp_multi_weave_lift.h
+		)
+endif()
+
 if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
 	# XR_DXR_weave present-owner service on desktop Linux (#1699, piece R2):
 	# the same Vulkan weave engine as macOS / Android with fds in and out

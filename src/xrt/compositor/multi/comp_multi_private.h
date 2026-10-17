@@ -39,6 +39,9 @@
 #include "vk/vk_hud_blend.h"
 #include "vk/vk_local2d_composite.h"
 #include "multi/comp_multi_content_blend.h"
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+#include "multi/comp_multi_weave_lift.h"
+#endif
 
 #include "render/render_interface.h"
 
@@ -736,6 +739,9 @@ struct multi_compositor
 		struct vk_local2d_composite overlay_blend; //!< premul-over flatten pipeline.
 		bool overlay_blend_initialized;
 		//! @}
+
+		//! XR_DXR_lift §6: lifted weave rects (vk backend; comp_multi_weave_lift.h).
+		struct comp_multi_weave_lift lift;
 	} weave;
 #endif
 
@@ -1214,6 +1220,9 @@ struct multi_compositor
 		bool overlay_force_changed;
 		uint32_t overlay_stale_frames; //!< Frames ignored in the current stale run.
 		                               //! @}
+
+		//! XR_DXR_lift §6: lifted weave rects (comp_multi_weave_lift.h).
+		struct comp_multi_weave_lift lift;
 	} weave;
 #endif
 };
