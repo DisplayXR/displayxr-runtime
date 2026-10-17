@@ -60,7 +60,7 @@
     "XR_DXR_display_zones": {
       "group": "rendering",
       "title": "Display Zones",
-      "summary": "A layout of independent 3D zones and flat 2D zones across one display, each 3D zone with its own view rig, plus the wish mask a switchable-lens panel honours; poll xrGetDisplayZoneRecommendedViewSizeDXR for per-zone sizes — XrEventDataDisplayZoneMetricsChangedDXR is deprecated and never emitted"
+      "summary": "A layout of independent 3D zones and flat 2D zones across one display, each 3D zone with its own view rig, plus the wish mask a switchable-lens panel honours; a zone straddling two screens can get a view set per part (XrDisplayZonePartsDXR); poll xrGetDisplayZoneRecommendedViewSizeDXR for per-zone sizes — XrEventDataDisplayZoneMetricsChangedDXR is deprecated and never emitted"
     },
     "XR_DXR_local_3d_zone": {
       "group": "rendering",

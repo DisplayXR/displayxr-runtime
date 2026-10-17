@@ -38,6 +38,7 @@
 #include "oxr_defines.h"
 #include "oxr_frame_sync.h"
 #include "oxr_views_change.h"
+#include "oxr_segment_views.h"
 
 struct u_desktop_control; // XR_DXR_desktop_control (aux/desktop)
 
@@ -3368,6 +3369,11 @@ struct oxr_session
 		bool warned_validate_unlocated;
 		bool warned_validate_rect_mismatch;
 		bool warned_frame_end_info_legacy;
+		//! XrDisplayZonePartsDXR (spec v4): the zones split per part for
+		//! the current display time (the per-frame cap, DXR_ZONE_PARTS_MAX).
+		struct oxr_zone_parts_budget parts_budget;
+		//! Change-only log latch: the last split decision logged.
+		uint32_t parts_logged_sig;
 	} display_zones;
 #endif
 

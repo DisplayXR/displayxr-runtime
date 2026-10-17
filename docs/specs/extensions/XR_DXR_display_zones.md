@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_display_zones` |
-| Spec Version | 1 |
-| Type Values | `1004999150–1004999153` |
+| Spec Version | 4 |
+| Type Values | `1004999150–1004999155` |
 | Author | Leia Inc. |
 | Platform | All (extension-app classes only) |
 | Requires | `XR_DXR_local_3d_zone` (≥ v3), `XR_DXR_view_rig` (≥ v2) |
@@ -60,13 +60,15 @@ physically *switches* (the wish). Full rationale: ADR-027.
 
 ```c
 #define XR_DXR_display_zones 1
-#define XR_DXR_display_zones_SPEC_VERSION 1
+#define XR_DXR_display_zones_SPEC_VERSION 4
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
 
 #define XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR               ((XrStructureType)1004999150)
 #define XR_TYPE_DISPLAY_ZONE_DXR                            ((XrStructureType)1004999151)
 #define XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR            ((XrStructureType)1004999152)
 #define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR ((XrStructureType)1004999153)
+#define XR_TYPE_DISPLAY_ZONE_FEATHER_DXR                    ((XrStructureType)1004999154) // v3
+#define XR_TYPE_DISPLAY_ZONE_PARTS_DXR                      ((XrStructureType)1004999155) // v4
 
 typedef XrFlags64 XrDisplayZonesFrameEndFlagsDXR;
 //! Cross-check zone/locate/mask consistency this frame: zone rects vs wish
@@ -127,13 +129,16 @@ typedef struct XrDisplayZoneDXR {
 } XrDisplayZoneDXR;
 ```
 
-**Multi-screen (Windows, `XR_DXR_weave` present-owners).** When the session's
-window is woven per screen (ADR-047 Amendment 4), a zone-scoped locate whose
-`rect` lies wholly on a non-primary screen is framed from that screen: its
-eyes, its nominal viewer, and the zone placed on its physical rectangle
-(Amendment 4 addendum). The raw channel then reports that screen's eyes and the
-zone relative to that screen. A zone that straddles a seam is located from the
-primary screen, as before.
+**Multi-screen.** When the session's window is woven per screen (ADR-047), a
+zone-scoped locate whose `rect` lies wholly on one screen is framed from that
+screen: its eyes, its nominal viewer, and the zone placed on its physical
+rectangle. The raw channel then reports that screen's eyes and the zone relative
+to that screen. A zone that straddles a seam gets ONE view set in `XrView[]`,
+framed from the screen holding most of the zone (ties to the primary), on every
+session (spec v4; a present-owner used the primary before, every other session
+the screen holding most of the window). `XrView[]` is never split per segment,
+under `PRIMARY_MULTIVIEW_DXR` either: a straddling zone's per-part view sets
+ride `XrDisplayZonePartsDXR` (§ 3.3.2).
 
 `zoneId` exists for locate↔submit pairing (validate mode), debug
 logs/captures, and as the stable referent for the reserved effective-mask
@@ -163,6 +168,74 @@ typedef struct XrDisplayZoneFeatherDXR {
     float                    radiusPx;
 } XrDisplayZoneFeatherDXR;
 ```
+
+### 3.3.2 XrDisplayZonePartsDXR — per-part views of a straddling zone (spec v4)
+
+```c
+typedef struct XrDisplayZonePartDXR {
+    uint64_t  displayId; // the screen (XrDisplayDXR::displayId)
+    XrRect2Di rect;      // the part, ZONE-relative px, cut at the seam
+    uint32_t  firstView; // its first view in XrDisplayZonePartsDXR::views
+    uint32_t  viewCount; // = the locate's active view count
+} XrDisplayZonePartDXR;
+
+typedef struct XrDisplayZonePartsDXR {
+    XrStructureType       type;              // XR_TYPE_DISPLAY_ZONE_PARTS_DXR (1004999155)
+    void* XR_MAY_ALIAS    next;
+    uint64_t              generation;        // changes with the screen table the parts are cut from
+    uint32_t              partCapacityInput;
+    uint32_t              partCountOutput;   // 0 = not split: use XrView[] as before
+    XrDisplayZonePartDXR* parts;
+    uint32_t              viewCapacityInput;
+    uint32_t              viewCountOutput;
+    XrView*               views;             // every part's set, contiguous
+} XrDisplayZonePartsDXR;
+```
+
+**Chain point.** OUTPUT, on `XrViewState::next` of a zone-scoped `xrLocateViews`
+(an `XrDisplayZoneDXR` on `XrViewLocateInfo`). Without a zone it is left at 0.
+
+**What it returns.** When the session's window is woven per screen and the zone
+straddles a seam, one view set per part, left to right:
+
+- **Each part from its own screen.** That screen's eyes (its nominal viewer when
+  untracked, ADR-047), Kooima against that screen with the part as the canvas.
+  The two screens' viewers may disagree, so the zone can be visibly
+  discontinuous at the seam; that is accepted, as for windows (no blending).
+- **One scale per zone.** Under a display rig (`XrDisplayRigDXR`) the rig's
+  virtual display height maps the ZONE: each part gets its share of it and its
+  offset from the zone's centre, so the parts meet at the seam at the same
+  metres-to-virtual scale, also across panels of different pixel pitch.
+- **One frame.** Every part's poses are in the locate's base space; the parts are
+  placed continuously in the display space of the screen holding most of the
+  zone, the screen that also frames `XrView[]`.
+
+**How to render.** Part p's view at index v fills `p.rect` (scaled by image size /
+zone size) of view v's image of the zone's projection layer; each part's FOV
+covers exactly its rect. Submit the zone's projection layer as usual: each
+screen's display processor weaves its part.
+
+**When it is 0** (render `XrView[]`): the zone lies on one screen, the window is
+not woven per screen, the locate is camera-centric (`XrCameraRigDXR`), or the
+runtime's per-frame budget of split zones is spent. A split zone renders its
+views once per part, so at most 4 zones per display time are split, first
+located first served (`DXR_ZONE_PARTS_MAX`, 0 = never). Locate the zones that
+matter most first. `XrView[]` is always the zone's one set, so an app that
+ignores this struct renders as before.
+
+**Two-call idiom, never an error.** `partCountOutput` and `viewCountOutput` are
+always written; `parts` and `views` only when both capacities suffice (0 = count
+query). Today at most 2 parts (`XRT_MAX_SEGMENTS`) × the per-set view count.
+
+**`PRIMARY_MULTIVIEW_DXR`.** A zone-scoped locate is never split into
+`XrView[]`; its per-part sets come through this struct only, the same mechanism
+for every view configuration.
+
+**Where it is filled.** In-process segmenting compositors and direct clients of
+the D3D11 service (the parts are located client-side from the service's segment
+table). For an `XR_DXR_weave` present-owner (the DisplayXR Browser), whose
+element locates are framed by the service, `partCountOutput` stays 0 until the
+service-side parts land (`docs/roadmap/multi-screen.md` § 8.1).
 
 ### 3.4 XrDisplayZonesFrameEndInfoDXR — per-frame wish reference
 

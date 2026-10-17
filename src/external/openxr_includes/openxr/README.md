@@ -34,7 +34,7 @@ Rules:
 | 1004999120–122 | `XR_DXR_workspace_file_dialog` | 122 is an `XrResult`, not an `XrStructureType` |
 | 1004999130–132 | `XR_DXR_mcp_tools` | |
 | 1004999140–142 | `XR_DXR_view_rig` | |
-| 1004999150–153 | `XR_DXR_display_zones` | assigned (spec v1) |
+| 1004999150–159 | `XR_DXR_display_zones` | 150–153 assigned (spec v1); 154 = `XR_TYPE_DISPLAY_ZONE_FEATHER_DXR` (spec v3); 155 = `XR_TYPE_DISPLAY_ZONE_PARTS_DXR` (per-part views of a zone straddling a screen seam, spec v4, multi-screen § 8); 156–159 free for it |
 | 1004999160–166 | `XR_DXR_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1004999170–171 | `XR_DXR_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1004999180 | `XR_DXR_macos_gl_binding` | relocated from 1004999010 (collided with display_info) — spec v2 |

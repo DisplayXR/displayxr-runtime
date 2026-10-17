@@ -792,15 +792,16 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// present-owner's bound window can be woven per screen; its locates
 		// were still framed from the primary screen (the session DP's eyes, the
 		// window relative to the primary's display). An element that lies
-		// WHOLLY on another screen now gets that screen's eyes and is framed
-		// against that screen's display: swap in the whole window relative to
-		// it, and the zone rebase below places the element on it exactly as it
-		// places one on the primary. A straddling element, an element on the
-		// primary, and every window on one screen keep the framing above, byte
-		// for byte (no per-screen table exists for a window on one screen: the
-		// lookup answers false before anything else is touched). Per-part views
-		// for a straddling element need a second view set per element
-		// (displayxr-browser-pvt#272).
+		// wholly or MOSTLY on another screen now gets that screen's eyes and is
+		// framed against that screen's display: swap in the whole window
+		// relative to it, and the zone rebase below places the element on it
+		// exactly as it places one on the primary. A straddling element is
+		// framed from the screen holding most of it, the rule every session
+		// shares (multi-screen § 8, decided 2026-10-12; it kept the primary's
+		// framing before). An element mostly on the primary, and every window
+		// on one screen, keep the framing above, byte for byte (no per-screen
+		// table exists for a window on one screen: the lookup answers false
+		// before anything else is touched).
 		if (have_wm && wm_from_app_window && rig != NULL && rig->zone_valid != 0 && rig->zone_w_px > 0 &&
 		    rig->zone_h_px > 0) {
 			struct xrt_rect zone_rect;

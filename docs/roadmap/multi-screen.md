@@ -305,3 +305,54 @@ that configuration is accepted; it disappears when every screen is tracked.
   ST-5598 → SR-P1; ST-3160 → SR-P3.
 - New: ADR "Multi-screen: segments and per-screen views" (supersedes ADR-015 §3-§4),
   `XR_DXR_display_info` v22 spec section, `comp_segments` design note.
+
+## 8. Per-part views for a zone that straddles a seam (displayxr-browser-pvt#272)
+
+**Decided (David, 2026-10-12).** Runtime record: ADR-047 Amendment 10; API:
+`XR_DXR_display_zones.md` § 3.3.2.
+
+A zone (an `XR_DXR_display_zones` zone, or an inline-3D element, which the browser locates as
+one) that straddles a seam is woven per screen, but one view set renders both parts from one
+screen's viewer. The fix gives each part its own view set.
+
+### 8.1 Runtime: the locate returns the parts
+
+- **Surface.** A zone-scoped `xrLocateViews` returns the parts through
+  `XrDisplayZonePartsDXR`, chained on `XrViewState` (`XR_DXR_display_zones` v4). The caller does
+  not locate each part: the browser locates in its browser process and weaves in its GPU process,
+  so the weave output's parts never reach the code that renders views, and pairing a locate's
+  views with a weave's parts would mix two tables a frame apart during a drag (the #1883 sliver).
+- **Per part:** that screen's eyes, Kooima against that screen with the part as the canvas, and
+  for a display rig ONE m2v for the whole zone (`vdh_scale` / rig offset with "window" read as
+  "zone"), so the parts meet at the seam. Implemented as the per-segment math over the parts' own
+  table (`u_weave_zone_part_table`, `oxr_segment_views_zone_parts`).
+- **Unaware callers.** `XrView[]` keeps one set, framed from the screen holding most of the ZONE
+  on every path (`u_weave_rect_majority_segment`). This changed the present-owner path, which
+  used the primary, and every other session, which used the window's majority.
+- **Seam.** Two viewers can make the zone discontinuous at the seam. Accepted, no blending, as for
+  windows (decided 2026-10-07).
+- **Budget.** At most 4 split zones per display time, first located first served
+  (`DXR_ZONE_PARTS_MAX`, 0 = never split, max 16). Past it a zone keeps its one set.
+- **`PRIMARY_MULTIVIEW_DXR`** gets per-part zone views only through the struct, never through
+  `XrView[]`.
+- **Where it runs today.** In-process segmenting compositors and direct D3D11-service clients:
+  the parts are located client-side from the segment table, no wire change; those frames stay
+  unrouted and are cropped at the live seam.
+- **Still to land: present-owners.** Their element locates are framed server-side
+  (`ipc_try_get_sr_view_poses`), so the locate reply gains an appended, fixed-size parts block
+  (≤ `XRT_MAX_SEGMENTS` parts × the active views of pose + fov), versioned by append-only fields
+  under the `u_git_tag` gate. The weave then crops each part where it was **painted**: the batch /
+  v6 submit carries the partition the frame was rendered with (zone-relative rects per screen,
+  appended to the rect), and `weave_seg_record` crops with it.
+
+### 8.2 Browser and web API (displayxr-browser-pvt)
+
+- **Shape:** each part is an extra view pair, every `XRView` carrying a **sub-viewport** (the
+  part's rect relative to the element, normalised 0..1). DisplayXR-only for now.
+- Blink installs the parts with their views per element (today one view pair per element, patch
+  0036); `GetLatestViews` grows a parts list. An element with zero or one part keeps the current
+  shape and code path.
+- The page renders each pair into that sub-rect of each eye's half of the element's side-by-side
+  submission (a part occupies `rect.x / w ÷ 2` inside each half, `XR_DXR_weave.md` §5g item 4). A
+  page that reads only the first pair renders the element from its majority screen.
+- The weave submit is unchanged apart from carrying the painted partition (8.1).
