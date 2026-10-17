@@ -32,7 +32,6 @@ struct xrt_prober_entry;
 struct xrt_prober_device;
 struct xrt_prober_entry_lists;
 struct xrt_auto_prober;
-struct xrt_tracking_factory;
 struct xrt_builder;
 struct xrt_system_devices;
 struct xrt_space_overseer;
@@ -130,9 +129,6 @@ typedef void (*xrt_prober_list_video_func_t)(struct xrt_prober *xp,
  */
 struct xrt_prober
 {
-	//! Factory for producing tracked objects.
-	struct xrt_tracking_factory *tracking;
-
 	/*!
 	 * Enumerate all connected devices, whether or not we have an associated
 	 * driver. Cannot be called with the device list is locked

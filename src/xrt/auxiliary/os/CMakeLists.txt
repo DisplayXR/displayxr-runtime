@@ -134,18 +134,3 @@ else()
 	# Desktop Linux: V4L2 is a TODO (see the file); everything else has none.
 	target_sources(aux_os_uvc PRIVATE os_uvc_capture_stubs.c)
 endif()
-
-####
-# BLE library
-#
-
-add_library(aux_os_ble STATIC os_ble.h)
-target_link_libraries(aux_os_ble PUBLIC aux-includes aux_os)
-
-if(XRT_HAVE_DBUS)
-	target_sources(aux_os_ble PRIVATE os_ble_dbus.c)
-	target_link_libraries(aux_os_ble PRIVATE ${DBUS_LIBRARIES})
-	target_include_directories(aux_os_ble SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
-else()
-	target_sources(aux_os_ble PRIVATE os_ble_stubs.c)
-endif()

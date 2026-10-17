@@ -105,20 +105,6 @@ cli_cmd_probe(int argc, const char **argv)
 		printf("\t%s\n", auto_probers[i]->name);
 	}
 
-	printf(" :: Additional built in drivers\n");
-// special cased drivers that are not probed through prober entries/autoprobers
-#ifdef XRT_BUILD_DRIVER_REMOTE
-	printf("\tRemote Debugging\n");
-#endif
-
-#ifdef XRT_BUILD_DRIVER_V4L2
-	printf("\tv4l2\n");
-#endif
-
-#ifdef XRT_BUILD_DRIVER_VF
-	printf("\tvf\n");
-#endif
-
 	printf(" :: Destroying probed devices\n");
 
 	xrt_space_overseer_destroy(&xso);

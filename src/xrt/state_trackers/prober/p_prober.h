@@ -18,14 +18,6 @@
 #include "util/u_logging.h"
 #include "util/u_config_json.h"
 
-#ifdef XRT_HAVE_LIBUSB
-#include <libusb.h>
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-#include <libuvc/libuvc.h>
-#endif
-
 #ifndef __KERNEL__
 #include <sys/types.h>
 #endif
@@ -86,10 +78,6 @@ struct prober_device
 
 		uint8_t ports[8];
 		uint32_t num_ports;
-
-#ifdef XRT_HAVE_LIBUSB
-		libusb_device *dev;
-#endif
 	} usb;
 
 	struct
@@ -98,13 +86,6 @@ struct prober_device
 
 		char product[P_PROBER_BLUETOOTH_PRODUCT_COUNT];
 	} bluetooth;
-
-#ifdef XRT_HAVE_LIBUVC
-	struct
-	{
-		uvc_device_t *dev;
-	} uvc;
-#endif
 
 #ifdef XRT_HAVE_V4L2
 	size_t num_v4ls;
@@ -142,25 +123,6 @@ struct prober
 	 * Has the list been locked.
 	 */
 	bool list_locked;
-
-#ifdef XRT_HAVE_LIBUSB
-	struct
-	{
-		libusb_context *ctx;
-		libusb_device **list;
-		ssize_t count;
-	} usb;
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-	struct
-	{
-		uvc_context_t *ctx;
-		uvc_device_t **list;
-		ssize_t count;
-	} uvc;
-#endif
-
 
 	struct xrt_auto_prober *auto_probers[XRT_MAX_AUTO_PROBERS];
 
@@ -217,104 +179,6 @@ p_dev_get_bluetooth_dev(struct prober *p,
                         uint16_t product_id,
                         const char *product_name,
                         struct prober_device **out_pdev);
-
-/*!
- * @name Tracking systems
- * @{
- */
-/*!
- * Init the tracking factory.
- *
- * @private @memberof prober
- * @see xrt_tracking_factory
- */
-int
-p_tracking_init(struct prober *p);
-
-/*!
- * Teardown the tracking factory.
- *
- * @private @memberof prober
- * @see xrt_tracking_factory
- */
-void
-p_tracking_teardown(struct prober *p);
-
-/*!
- * @}
- */
-
-#ifdef XRT_HAVE_LIBUSB
-/*!
- * @name libusb
- * @{
- */
-/*!
- * @private @memberof prober
- */
-int
-p_libusb_init(struct prober *p);
-
-/*!
- * @private @memberof prober
- */
-void
-p_libusb_teardown(struct prober *p);
-
-/*!
- * @private @memberof prober
- */
-int
-p_libusb_probe(struct prober *p);
-
-/*!
- * @private @memberof prober
- */
-int
-p_libusb_get_string_descriptor(struct prober *p,
-                               struct prober_device *pdev,
-                               enum xrt_prober_string which_string,
-                               unsigned char *buffer,
-                               int length);
-
-/*!
- * @private @memberof prober
- */
-bool
-p_libusb_can_open(struct prober *p, struct prober_device *pdev);
-
-/*!
- * @}
- */
-#endif
-
-#ifdef XRT_HAVE_LIBUVC
-/*!
- * @name libuvc
- * @{
- */
-/*!
- * @private @memberof prober
- */
-int
-p_libuvc_init(struct prober *p);
-
-/*!
- * @private @memberof prober
- */
-void
-p_libuvc_teardown(struct prober *p);
-
-/*!
- * @private @memberof prober
- */
-int
-p_libuvc_probe(struct prober *p);
-
-/*!
- * @}
- */
-#endif
 
 #ifdef XRT_HAVE_LIBUDEV
 /*!
