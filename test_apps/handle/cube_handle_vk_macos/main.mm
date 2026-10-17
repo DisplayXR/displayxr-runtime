@@ -2753,6 +2753,16 @@ static bool InitializeOpenXR(AppXrSession& xr) {
                  : xr.cursorDepthCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
                                               : "RUNTIME, default look");
     }
+    if (xr.hasSpatialWorkspaceExt && g_liftProbe.enabled &&
+        getenv("XRT_FORCE_MODE") == nullptr) {
+        // A hybrid runtime routes any session that enables the workspace
+        // extension through the service (IPC); --lift is here to exercise the
+        // IN-PROCESS lift link, so it leaves it off (XRT_FORCE_MODE=ipc still
+        // gives the IPC route on purpose).
+        LOG_INFO("--lift: XR_DXR_spatial_workspace left off so the session "
+                 "stays in-process");
+        xr.hasSpatialWorkspaceExt = false;
+    }
     if (xr.hasSpatialWorkspaceExt) {
         enabledExtensions.push_back(XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME);
     }

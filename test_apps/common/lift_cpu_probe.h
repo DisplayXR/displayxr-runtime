@@ -355,7 +355,8 @@ private:
   uint32_t transitions_ = 0, shift_samples_ = 0;
   int last_shift_ = 0;
   XrResult last_enum_result_ = XR_SUCCESS;
-  char last_sig_[256] = {0};
+  char last_sig_[256] =
+      "?"; //!< "?" = nothing printed yet: the first enumeration always logs
   bool done_ = false;
 };
 
