@@ -38,10 +38,15 @@
  *    twin): every eye query comp_multi answers publishes the answering DP's
  *    eyes into the core keyed by that DP; a destroyed DP retires its key.
  *
+ *  - step E (the client GPU kinds): the same set_gpu call lends the CPU table
+ *    the glue's transport -- a client IOSurface (macOS) / OPAQUE_FD / dma-buf
+ *    (Linux) imported into the input slot, results exported as an IOSurface /
+ *    OPAQUE_FD image -- and the kinds behind it, which the service then lists
+ *    beside CPU in imageKinds / exportKinds.
+ *
  * Not installed:
  *
- *  - the `dp-lift` backend: the display plug-in's lift slots are D3D11-only;
- *  - a GPU client transport (textures + fences to the app): CPU bytes only.
+ *  - the `dp-lift` backend: the display plug-in's lift slots are D3D11-only.
  *
  * Detach runs in teardown_all BEFORE the system compositor (and its Vulkan
  * bundle) is destroyed.

@@ -528,8 +528,8 @@ again after 551 ms.
 | Win · D3D11 IPC session (browser) | session IPC | NT-handle snapshot slot / NT export texture | keyed mutex on the input import; `ID3D11Fence` NT | **yes** (v3) |
 | Win · D3D12 / D3D11 in-process (Unity, Unreal) | ADR-049 lift link | app texture as NT handle / NT texture + fence | D3D fence | **yes** |
 | Win · OpenGL, Vulkan | generalised link | v1: CPU bytes (a file mapping) in and out. Later: runtime-allocated NT input ring, imported via `GL_EXT_memory_object_win32` / `VK_KHR_external_memory_win32` | v1: none (`CPU_COMPLETE`). Later: external semaphore on a D3D fence | v1 **yes** (CPU); GPU P5 |
-| Linux · Vulkan / GL | session or link | v1: CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out. Later: opaque fd or dma-buf (single-plane modifier) / exportable VK image fd | v1: none. Later: timeline semaphore fd; sync_fd | v1 **yes** (CPU; built, not run on a Linux box yet); GPU P5: service-side Vulkan glue landed (OPAQUE_FD / DMABUF allocation, S5 view synthesis, timeline-fd and sync_file waits on images it reads) under the CPU route; providers on the CPU lane; no GPU client transport yet |
-| macOS · Metal / MoltenVK / GL | session or link | v1: CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out. Later: IOSurface textures (zero-copy for a CoreML EP); **no opaque fd: MoltenVK has no `VK_KHR_external_memory_fd`** | v1: none. Later: `MTLSharedEvent` (MoltenVK has no external-semaphore fd) | v1 **yes** (CPU, verified with the sim provider); GPU P5: service-side Vulkan glue landed under the CPU route; IOSurface export and `VK_EXT_metal_objects` import verified on MoltenVK; AF_UNIX transfer unverified |
+| Linux · Vulkan / GL | session or link | CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out, every session. In-process **Vulkan** sessions also: an `OPAQUE_FD` allocation or a single-plane dma-buf in, an `OPAQUE_FD` export image out (no dma-buf export: `XrLiftResultExportDXR` cannot carry a modifier) | in: `CPU_COMPLETE`, sync_file, timeline semaphore fd (waited for on the service's GPU); out: `CPU_COMPLETE` | CPU v1 **yes** (built, not run on a Linux box yet). GPU kinds **done in code (step E)**, compiled in a container and their tests compiled in; **not run on Linux hardware** (Intel / Mesa first). Providers on the CPU lane |
+| macOS · Metal / MoltenVK / GL | session or link | CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out, every session. In-process **Vulkan** sessions also: a global IOSurface in, a global IOSurface export out (`VK_EXT_metal_objects`; **no opaque fd: MoltenVK has no `VK_KHR_external_memory_fd`**) | in / out: `CPU_COMPLETE` (`MTLSharedEvent` input not taken yet); the service's own S5 results hand over on an `MTLSharedEvent` to the Metal weave backend | **yes (step E)**: verified with the sim provider, direct and composed, `cube_handle_vk_macos --lift-gpu` (IOSurface over AF_UNIX by global ID, export byte-exact) |
 | Android · Vulkan | binder bootstrap to `:conversion`, then a socketpair | AHardwareBuffer | sync_fd | P5 |
 | any · CPU (CLI, MCP, jobs) | DIAG / APP connection | shm image / inline, shm or caller handle | none | partial |
 
@@ -915,7 +915,7 @@ interval" (§7.4) is the fix, and the cold-boot smoke test is its regression tes
 
 | Consumer | Plan | ≈ lines |
 |---|---|---|
-| demo-mediaplayer (Vulkan, four OSes) | stereo auto-convergence stays in-app. Mono→3D via `LiftClient`: VIEWS_MONO, `viewCount = 0`, discontinuity on seek. **CPU-first:** v1 hands the decoded frame in as CPU bytes and takes the views back as CPU bytes (the §4.2 link, usable now on Windows / Linux / macOS — but SBS on POSIX needs a views-emitting provider until step B's Vulkan GPU glue brings the composed views path); then the decoded VkImage as the platform's kind with timeline / sync-file sync at P5. LIF via VIEWS_FROM_DEPTH at P6 | +450, +120 |
+| demo-mediaplayer (Vulkan, four OSes) | stereo auto-convergence stays in-app. Mono→3D via `LiftClient`: VIEWS_MONO, `viewCount = 0`, discontinuity on seek. **CPU-first:** v1 hands the decoded frame in as CPU bytes and takes the views back as CPU bytes (the §4.2 link, usable now on Windows / Linux / macOS — but SBS on POSIX needs a views-emitting provider until step B's Vulkan GPU glue brings the composed views path); then the decoded VkImage as the platform's kind with timeline / sync-file sync at P5 — **the runtime side is in (step E)**: on macOS hand in the decoded frame as a global-IOSurface-backed VkImage (`IOSURFACE`) and create the stream with `exportKind` IOSURFACE; on Linux an `OPAQUE_FD` image made with the spec §4.5 parameters (or a single-plane dma-buf) with a sync_file / timeline fd, results as `OPAQUE_FD`. Enumerate first (the kinds are listed only when the service takes them) and fall back to CPU. `cube_handle_vk_macos --lift-gpu` is the reference; the player follows in its own PR. LIF via VIEWS_FROM_DEPTH at P6 | +450, +120 |
 | demo-gaussiansplat | SPLATS_MONO job (SPLATS_STEREO with a typed baseline); `stb_image` pixels downscaled to `maxInputExtent`; `preferredFormat = SOG` so `gs_sog_loader` consumes it unchanged; relative-scene heuristic when `metricSource == NONE`; progress, Cancel, "Save .sog" via a caller handle | +350 |
 | Unity | VIEWS_MONO, 2 views, aux depth required (provisional outputs make this safe during warm-up); double-buffered `D3D12_NT` input with D3D fence sync (closes ADR-049's submit-fence follow-up); C# `DisplayXRLiftSource` | +600, +350 |
 | Unreal | follows Unity; SBS feeds `SideBySideCoords`; adaptive N-view uses `viewCount = 0` | +500 |
@@ -1134,17 +1134,52 @@ snapshot goes into a shared `MTLBuffer`. The result's IOSurface export is wrappe
 cross-API semaphore is needed: the glue publishes only completed work, and the pin holds the
 result until the Metal command buffer has completed. See the glue note's Metal section.
 
+**Landed (step E, zero-copy transports on POSIX).**
+
+- **Client GPU kinds.** An in-process Vulkan session offers `IOSURFACE` (macOS) or `OPAQUE_FD` +
+  `DMABUF` in / `OPAQUE_FD` out (Linux) beside CPU, but only once the service's per-task kinds
+  list them (the Windows handshake: enumeration intersects; the session remembers the service's
+  answer). The handle crosses on the image-slot message as it is (the IOSurface's global ID, the
+  fd over `SCM_RIGHTS`); the glue imports it (`vk_conv_gpu_import_copy`) and blits the region into
+  the stream's input slot: GPU → GPU when the slot is a GPU image, one GPU → host readback (in the
+  same submit) when the provider is on the CPU lane. Client IOSurfaces are cached by ID. A stream
+  created with `exportKind` IOSURFACE / OPAQUE_FD gets its results copied GPU → GPU into a
+  per-stream export image (a **global** IOSurface the glue creates: MoltenVK's own exports are
+  not global, so a peer's `IOSurfaceLookup` fails), handed out under the §5.1 rule. Spec §4.5 /
+  §5.4 carry the per-kind contract (the OPAQUE_FD creation parameters, the global-IOSurface rule).
+- **Weave-rect snapshot GPU → GPU.** When the stream's binding takes a GPU kind the glue would
+  give its slot (`conv_core_stream_input_kinds` + `vk_conv_gpu_input_memory_kind`; a composed
+  binding reports its depth stage's), the engine records no host copy and the glue copies the
+  snapshot chain's last image into the slot at complete. Otherwise the GPU → host → slot path is
+  unchanged — which is every POSIX provider today (the provider mask defaults to 0).
+- **No host stall before publish on macOS.** MoltenVK 1.4 exports a timeline semaphore as an
+  `MTLSharedEvent`. An S5 render into a glue image now returns once submitted, signalling the
+  glue's timeline; the result is published without a host fence wait, the Metal weave backend
+  encodes `encodeWaitForEvent:value:` before sampling it, and every Vulkan reader is ordered by
+  the shared queue. One such submit is in flight at most; the next glue call retires it.
+  `DXR_CONV_VK_ASYNC_S5=0` restores the old hand-over. Linux keeps the host wait.
+
+Measured on a developer Mac (MoltenVK, sim provider, 640×360 input, `cube_handle_vk_macos`):
+`--lift` and `--lift-gpu` convert at the same rate and latency (≈ 28 ms average both, direct);
+`--lift-gpu` removes, per frame, the app's GPU → host readback (a real Vulkan app's cost of
+producing CPU bytes), the runtime's 921 600 B staging copy and the service's section → slot copy
+on input, and the service's 1 843 200 B result readback on output. With a CPU-lane provider the
+service still reads the input back once, on the GPU's clock: across runs the submit call took
+1.2–2.2 ms against 0.5–1.1 ms for the CPU kind (the MoltenVK submit-and-wait round trip vs a
+0.9 MB memcpy; the numbers are noisy on a desktop under load). That gap
+closes only when a provider takes GPU inputs.
+
 Still open:
 
-- A GPU client transport (textures and fences to the app): the client gets CPU bytes.
+- A POSIX provider that takes GPU inputs (a conversion-host GPU lane, or a raised provider mask
+  for an in-service provider): until then the input zero-copy ends at the service's slot readback.
+- `MTLSharedEvent` / sync_file **result** sync to the app (results leave `CPU_COMPLETE`), and
+  `SHARED_EVENT` input sync on macOS.
 - The depth-aware cursor on lifted rects (ADR-046 Amendment 1). No POSIX weave engine draws a
   cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
-- A GPU → GPU snapshot once a POSIX provider takes GPU inputs. The zero-copy step (E) removes
-  the GPU → host → CPU snapshot copy that POSIX lifted weave rects make today.
-- MTLSharedEvent import removes the host stall. Today the glue's host fence wait before publish
-  is what orders the Vulkan result write before the Metal backend's read.
 - Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
-  second) and lavapipe in CI.
+  second) and lavapipe in CI. The step E Linux paths (OPAQUE_FD / DMABUF import, OPAQUE_FD
+  export, sync_file / timeline waits) have only been compiled.
 
 Details: [`docs/reference/vulkan-conversion-glue.md`](../reference/vulkan-conversion-glue.md).
 

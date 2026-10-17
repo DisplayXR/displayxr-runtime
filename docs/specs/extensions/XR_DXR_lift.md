@@ -70,7 +70,9 @@ xrCreateLiftStreamDXR(session, &ci, &stream);
 | IPC session (any platform with a service) | the service's view (§2.3) | one element per task some provider can serve (§2.2) |
 | In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's view, over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection | the same, over the same connection; `imageKinds` = `D3D11_NT`, `D3D11_DXGI`, `D3D12_NT`, `CPU`; `exportKinds` = `D3D11_NT`, `CPU` |
 | In-process GL / Vulkan session on Windows | `XR_ERROR_FEATURE_UNSUPPORTED` (spec 3 is D3D11 shared textures) | the service's tasks over the same kind of lift-only connection, with `imageKinds` = `exportKinds` = `CPU` |
-| In-process Vulkan / GL / Metal session on desktop Linux or macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks over a lift-only connection (a plain socket connect: the service is never launched for it; no service = no tasks), with `imageKinds` = `exportKinds` = `CPU` |
+| In-process Vulkan session on macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks over a lift-only connection (a plain socket connect: the service is never launched for it; no service = no tasks), with `imageKinds` = `exportKinds` = `IOSURFACE`, `CPU` (IOSURFACE only when the service's Vulkan glue takes it, §4.5) |
+| In-process Vulkan session on desktop Linux | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the same kind of lift-only connection, with `imageKinds` = `OPAQUE_FD`, `DMABUF`, `CPU` and `exportKinds` = `OPAQUE_FD`, `CPU` (the fd kinds only when the service's glue takes them, §4.5) |
+| In-process GL / Metal session on desktop Linux or macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the same kind of lift-only connection, with `imageKinds` = `exportKinds` = `CPU` |
 | IPC session on desktop Linux or macOS | the service's view: modes 0 / `UNAVAILABLE` (the POSIX service has no D3D11 textures to serve spec 3 with) | one element per task, `imageKinds` = `exportKinds` = `CPU` |
 | Any other in-process session (Android) | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | nothing known yet (no lift-only connection on that platform; the transport lands without a spec bump, ADR-053 P5) |
 | A service with no provider (no plug-in registered, or `DXR_LIFT=0`) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` | `countOutput = 0` |
@@ -595,19 +597,38 @@ Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
 
 **What `imageKinds` lists today.** On Windows (IPC sessions and in-process D3D11 / D3D12
 sessions): `D3D11_NT`, `D3D11_DXGI`, `D3D12_NT` and `CPU`, with any `region` inside the image.
-Everywhere else a session can reach the service from — in-process GL / Vulkan on Windows, and
-in-process Vulkan / GL / Metal plus IPC sessions on desktop Linux and macOS — `CPU` only, in
-and out (§2.1); a `PLATFORM_DEFAULT` input or export on such a session means `CPU`. The CPU
+In-process **Vulkan** sessions on macOS add `IOSURFACE`, and on desktop Linux `OPAQUE_FD` and
+`DMABUF`, beside `CPU` (below). Everywhere else a session can reach the service from — in-process
+GL / Vulkan on Windows, in-process GL / Metal on desktop Linux and macOS, and IPC sessions there
+— `CPU` only, in and out (§2.1). A `PLATFORM_DEFAULT` input or export on a session without D3D
+kinds means `CPU`. A GPU kind is listed only when the session offers it **and** the service's
+transport takes it (the per-task intersection every enumeration makes); the runtime remembers the
+service's answer from the last `xrEnumerateLiftTasksDXR`, so enumerate before submitting a GPU kind. The CPU
 bytes cross to the service in a shared section the runtime makes (a file mapping on Windows,
 an unlinked shared-memory fd on Linux, an IOSurface used as a byte buffer on macOS); the app
 only ever sees `cpuBytes` going in and a mapped `outputTexture` pointer coming out.
 `D3D12_NT` takes `D3D_FENCE` (the service waits for `syncValue` on the GPU before its
 snapshot) or `CPU_COMPLETE`; `D3D11_*` take their keyed mutex or `D3D_FENCE`; `CPU` takes
 `NONE` / `CPU_COMPLETE`, RGBA8 or BGRA8, `cpuRowPitch ≥ (region x + width) · 4`, and the
-region's bytes are copied before the call returns. `VK_OPAQUE_WIN32`, `OPAQUE_FD`, `DMABUF`,
-`IOSURFACE` and `AHARDWAREBUFFER` appear in `imageKinds` only once their transports land
-(ADR-053 P5) — until then they are never listed, and submitting one is
-`XR_ERROR_VALIDATION_FAILURE`.
+region's bytes are copied before the call returns. `VK_OPAQUE_WIN32` and `AHARDWAREBUFFER`
+appear in `imageKinds` only once their transports land (ADR-053 P5) — until then they are never
+listed, and submitting one is `XR_ERROR_VALIDATION_FAILURE`.
+
+**The POSIX GPU kinds (ADR-053 P5 step E).** All take RGBA8 / BGRA8 (UNORM or SRGB; the bytes
+are copied raw, an SRGB image stays encoded) and any `region` inside the image. The handle is
+borrowed; the service copies the region on its GPU before the call returns, so the caller may
+rewrite the image afterwards.
+
+| Kind | `handle` | The image | Sync |
+|---|---|---|---|
+| `IOSURFACE` (macOS) | the `IOSurfaceRef` | the surface's own extent. It must be **global** (`kIOSurfaceIsGlobal`): the transport carries its ID and the service looks it up. A non-global surface fails the submit | `NONE` / `CPU_COMPLETE` (`SHARED_EVENT` is not taken yet) |
+| `OPAQUE_FD` (Linux) | `(void *)(intptr_t)fd` of a Vulkan `OPAQUE_FD` allocation | `XrLiftFrameSubmitInfoDXR::extent` when it is positive, else the region's bottom-right corner. The allocation does not describe itself, so the image must be created exactly as the service imports it: 2D, 1 mip, 1 layer, `VK_IMAGE_TILING_OPTIMAL`, usage `SAMPLED \| TRANSFER_SRC \| TRANSFER_DST`, `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` for an SRGB format (else no flags), a dedicated allocation, on the service's device. Leave it in `VK_IMAGE_LAYOUT_GENERAL`, released to `VK_QUEUE_FAMILY_EXTERNAL` | `NONE` / `CPU_COMPLETE`, `SYNC_FILE` (fd; −1 = signalled) or `VK_TIMELINE` (timeline semaphore fd + value) |
+| `DMABUF` (Linux) | NULL; the fd is `XrLiftImageDmabufDescDXR::fd` on `next` | the descriptor's: **one** plane at offset 0, `strides[0] ≥ width · 4`, `drmFourcc` `AB24` / `XB24` for RGBA8 or `AR24` / `XR24` for BGRA8, any modifier the service's device imports. Released to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `GENERAL` | as `OPAQUE_FD` |
+
+Where the copy lands depends on the stream's provider, never on the caller: into a GPU input
+image when the provider imports GPU memory (no host memory touched), else one GPU → host
+readback into the provider's CPU input — the CPU kind's staging copies, and the app's own
+readback to produce CPU bytes, are gone either way.
 
 As in spec 3 a GPU image is **snapshotted** before the call returns (one copy on the runtime's
 GPU, honouring the sync kind), so the caller may rewrite it afterwards — except under
@@ -682,8 +703,21 @@ The handles are D3D12-consumable as they are: the export texture is an NT-handle
 
 ### 5.4 Result export (spec 4)
 
-`exportKinds` lists `D3D11_NT` and `CPU` on Windows D3D11 / D3D12 and IPC sessions, `CPU`
-alone everywhere else (§2.1; Vulkan / dma-buf / IOSurface / AHB exports with P5). A **CPU** export: `outputTexture` is a pointer to the result's bytes, tightly packed
+`exportKinds` lists `D3D11_NT` and `CPU` on Windows D3D11 / D3D12 and IPC sessions;
+`IOSURFACE` and `CPU` on in-process Vulkan sessions on macOS; `OPAQUE_FD` and `CPU` on in-process
+Vulkan sessions on desktop Linux; `CPU` alone everywhere else (§2.1; Windows Vulkan and AHB
+exports with P5). `DMABUF` is not an export kind: `XrLiftResultExportDXR` cannot describe a
+modifier or a stride.
+
+A **GPU export** (`IOSURFACE`, `OPAQUE_FD`): `outputTexture` is the per-stream export image's
+handle — a global `IOSurfaceRef`, or `(void *)(intptr_t)fd` of an `OPAQUE_FD` allocation created
+with the §4.5 parameters at `extent` and the reported format — handed out on the first acquire
+and again on reallocation, and the **caller's** (`CFRelease` the surface, `close` the fd, once
+imported). `fence` is NULL and `syncKind = CPU_COMPLETE`: the service copied the result into the
+image on its GPU before the acquire returned. Finish sampling before the next acquire on the
+stream, which rewrites the same image. No auxiliary depth export exists on such a session.
+
+A **CPU** export: `outputTexture` is a pointer to the result's bytes, tightly packed
 (`extent.width ·` bytes per pixel per row), runtime-owned and valid until the next acquire on the
 stream; `fence` is NULL; `XrLiftResultExportDXR` says `kind = CPU`, the format, and
 `syncKind = CPU_COMPLETE` (the bytes are complete when the acquire returns). An auxiliary depth
@@ -1118,7 +1152,9 @@ pinned by a golden test (`tests/tests_lift_v3_shifts.cpp`, tag `[lift_v3_shift]`
   runs in its own supervised host (P2), so a provider crash or update no longer touches any
   session.
 - Non-D3D transports (Vulkan external memory, dma-buf, IOSurface, AHardwareBuffer) land without
-  a version bump: availability is the per-task `imageKinds` / `exportKinds`.
+  a version bump: availability is the per-task `imageKinds` / `exportKinds`. In-process Vulkan
+  sessions on macOS (`IOSURFACE`) and desktop Linux (`OPAQUE_FD`, `DMABUF` in; `OPAQUE_FD` out)
+  got theirs this way (ADR-053 P5 step E, §4.5 / §5.4); an older service never lists them.
 
 ## Probing on a Windows box — gotchas
 

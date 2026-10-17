@@ -22,8 +22,11 @@
  *  - no v3 route (cpu_only): v3 is D3D11 shared textures by definition.
  *
  * The core has no CPU view synthesis: a VIEWS task here is served only by a
- * provider that emits views itself. Depth-only providers need the Vulkan GPU
- * glue (step B) before a COMPOSED views task exists on POSIX.
+ * provider that emits views itself; the Vulkan GPU glue (step B, attached
+ * under this table) brings the composed views. Step E: the same glue lends the
+ * table a client GPU transport (ipc_server_conv_cpu_gpu's import / export
+ * hooks), so in-process Vulkan sessions also hand in and take out IOSurfaces
+ * (macOS) or OPAQUE_FD / dma-buf images (Linux).
  */
 
 #pragma once

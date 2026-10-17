@@ -36,9 +36,11 @@
  *     both tiles; v6 leaves the caller's identical tiles as drawn.
  *
  * Providers on POSIX run on the CPU lane (vk_conv_gpu.h), so a stream's input
- * slot is CPU memory: the snapshot is GPU -> host buffer -> slot. A GPU slot
- * (a provider kind raised with vk_conv_gpu_set_provider_kinds) is filled from
- * the same host buffer through vk_conv_gpu_write, synchronously, at completion.
+ * slot is CPU memory: the snapshot is GPU -> host buffer -> slot. When the
+ * stream's binding takes a GPU kind the glue would give its slot (a provider
+ * kind raised with vk_conv_gpu_set_provider_kinds; ADR-053 P5 step E) no host
+ * copy is recorded: at completion the glue copies the chain's last image into
+ * the GPU slot (vk_conv_gpu_copy_from_vk), synchronously.
  * Results are GPU images on the same device (S5 render targets, #2030
  * mirrors), sampled in place.
  *
