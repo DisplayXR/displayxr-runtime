@@ -314,7 +314,9 @@ region**, in display axes (+x right, +y up, +z toward the viewer), metres:
 |---|---|
 | lifted weave rect (§6) | that rect, on the weave client's window |
 | `xrSubmitLiftFrameDXR` | the session's window (its window binding / presenter window) |
-| `xrSubmitLiftFrameDXR` on a connection with no session window (e.g. `displayxr-cli lift`) | the panel |
+| `xrSubmitLiftFrameDXR` on a connection with no session window (e.g. `displayxr-cli lift`, an in-process link) | the panel; for a spec-4 submit, a rect of the submitted `extent`'s aspect fitted inside the panel, centred |
+
+The windowless default is "aspect-fit, centred": the rect is geometry only, the module still synthesizes at the submitted `extent`, and an app-declared placement (a canvas or rect on the stream) is a spec-6 item.
 
 So a lifted video in a corner window looks straight-on to a viewer facing that window, not to a
 viewer facing the panel centre (the same window-relative rule ADR-012 sets for Kooima). This
