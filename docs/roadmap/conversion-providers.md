@@ -126,8 +126,8 @@ Linux service and in Android's `:conversion` process (§4.3).
 | Pipeline composer | `conv_pipeline.{c,h}` | hard-wired paths in `lift_convert_one` (`:1212-1405`) | dispatcher |
 | Job lane + result staging | `conv_job.{c,h}`, `conv_stage.{c,h}` | GAUSSIANS on the stream thread; the 256 MiB blob latch (`:2725-2784`, `ipc_protocol.h:1118`) | one job thread per host |
 | GPU glue, D3D11 | `d3d11_conv_gpu.cpp`, split out of `d3d11_lift.cpp` in P1b | snapshot, letterbox, import cache, export + fence (`:1861-2700`) | IPC, dispatcher |
-| GPU glue, Vulkan | `vk_conv_gpu.c` (P5) | none on `main` | same |
-| Reference view synthesis | `d3d11_conv_viewsyn.cpp`, `vk_conv_viewsyn.c` (P5), shared `u_conv_viewsyn.h` | the browser's `live-dibr.js` (ported) | dispatcher |
+| GPU glue, Vulkan | `vk_conv/vk_conv_gpu.c` (P5, landed: allocation, S5 adapter, S6; [reference](../reference/vulkan-conversion-glue.md)) | none | same |
+| Reference view synthesis | `d3d11_conv_viewsyn.cpp`, `vk_conv/vk_conv_viewsyn.c` (P5, landed), shared `u_conv_viewsyn.h` | the browser's `live-dibr.js` (ported) | dispatcher |
 | Policy stages | `conv_policy.{c,h}` wrapping `resolve_viewpoints` (`:988-1112`), `u_lift_depth`, `u_lift_recenter`, rt#1978's `u_lift_autoconv` | same code, behind a stage interface | dispatcher |
 | Host interface + in-service shim | `conv_host_iface.h`, `conv_host_inproc.c` | the DP lift slots, `lift_activate` | exec thread per provider |
 | Legacy DP adapter (`dp-lift`) | `conv_provider_legacy_dp.cpp` | the six slots + `create_dp_d3d11_lift` | exec thread |
@@ -528,8 +528,8 @@ again after 551 ms.
 | Win · D3D11 IPC session (browser) | session IPC | NT-handle snapshot slot / NT export texture | keyed mutex on the input import; `ID3D11Fence` NT | **yes** (v3) |
 | Win · D3D12 / D3D11 in-process (Unity, Unreal) | ADR-049 lift link | app texture as NT handle / NT texture + fence | D3D fence | **yes** |
 | Win · OpenGL, Vulkan | generalised link | v1: CPU bytes (a file mapping) in and out. Later: runtime-allocated NT input ring, imported via `GL_EXT_memory_object_win32` / `VK_KHR_external_memory_win32` | v1: none (`CPU_COMPLETE`). Later: external semaphore on a D3D fence | v1 **yes** (CPU); GPU P5 |
-| Linux · Vulkan / GL | session or link | v1: CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out. Later: opaque fd or dma-buf / exportable VK image fd | v1: none. Later: timeline semaphore fd; sync_fd | v1 **yes** (CPU; built, not run on a Linux box yet); GPU P5 |
-| macOS · Metal / MoltenVK / GL | session or link | v1: CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out. Later: IOSurface textures (zero-copy for a CoreML EP) | v1: none. Later: `MTLSharedEvent` | v1 **yes** (CPU, verified with the sim provider); GPU P5 |
+| Linux · Vulkan / GL | session or link | v1: CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out. Later: opaque fd or dma-buf (single-plane modifier) / exportable VK image fd | v1: none. Later: timeline semaphore fd; sync_fd | v1 **yes** (CPU; built, not run on a Linux box yet); GPU P5: service-side Vulkan glue landed (OPAQUE_FD / DMABUF allocation, S5 view synthesis, timeline-fd and sync_file waits on images it reads) under the CPU route; providers on the CPU lane; no GPU client transport yet |
+| macOS · Metal / MoltenVK / GL | session or link | v1: CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out. Later: IOSurface textures (zero-copy for a CoreML EP); **no opaque fd: MoltenVK has no `VK_KHR_external_memory_fd`** | v1: none. Later: `MTLSharedEvent` (MoltenVK has no external-semaphore fd) | v1 **yes** (CPU, verified with the sim provider); GPU P5: service-side Vulkan glue landed under the CPU route; IOSurface export and `VK_EXT_metal_objects` import verified on MoltenVK; AF_UNIX transfer unverified |
 | Android · Vulkan | binder bootstrap to `:conversion`, then a socketpair | AHardwareBuffer | sync_fd | P5 |
 | any · CPU (CLI, MCP, jobs) | DIAG / APP connection | shm image / inline, shm or caller handle | none | partial |
 
@@ -1060,6 +1060,39 @@ prefix-parametrised parse, `target_plugin_loader.c:1850-1880`). **Tests:** lavap
 DMABUF + SYNC_FILE; CPU everywhere; mediaplayer headless against the sim. **Exit:** mediaplayer
 mono→3D on Linux and macOS; the Android browser menu shows with `:conversion` READY. **Risks:**
 IOSurface over AF_UNIX; Android importance and freezing (device-only validation).
+
+**Landed (step B, Vulkan GPU glue).** `src/xrt/compositor/vk_conv/` holds two pieces:
+
+- `vk_conv_viewsyn`, the S5 stage as GLSL compute shaders. It is a pass-for-pass port of the
+  D3D11 stage, pinned by a CPU golden in `tests_conv_viewsyn_vk`.
+- `vk_conv_gpu`, which provides allocation, CPU ↔ image copies, the #2030 mirror upload, the
+  S5 adapter over CPU or GPU images, and S6 readback.
+
+`ipc_server_conv_vk.c` attaches the glue to the multi system compositor's Vulkan bundle on
+macOS and desktop Linux. That is the null compositor's device, the same one the weave engines
+use. It attaches under the CPU I/O table, which stays the one POSIX I/O table (`cpu_only`): the
+glue lends it its CPU ↔ image copies (`ipc_server_conv_cpu_io_set_gpu`), so a composed result
+on the GPU is exported to the client as CPU bytes. So a depth-only provider now serves the
+composed `VIEWS_MONO` / `VIEWS_FROM_DEPTH` on POSIX; `tests_conv_vk_gpu` runs one end to end.
+
+The real transports are `VK_OPAQUE_FD` and `DMABUF` on Linux, and `IOSURFACE` on macOS.
+
+**IOSurface finding.** On MoltenVK, `VK_EXT_metal_objects` import and export of IOSurfaces both
+work; the test checks the bytes in each direction. MoltenVK has no `VK_KHR_external_memory_fd`
+and no external-semaphore fd, so the plan's "OPAQUE_FD on macOS via MoltenVK" does not hold, and
+IOSurface is the macOS GPU transport. MoltenVK-created IOSurfaces report pixel format 0.
+
+Providers stay on the CPU lane until a POSIX conversion-host GPU lane exists: the glue's
+provider mask defaults to 0.
+
+Still open:
+
+- A GPU client transport (textures and fences to the app): the client gets CPU bytes.
+- The weave-rect bridge and the per-DP eyes sink (step C).
+- Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
+  second) and lavapipe in CI.
+
+Details: [`docs/reference/vulkan-conversion-glue.md`](../reference/vulkan-conversion-glue.md).
 
 ### P6 — Lift spec 5 + job consumers
 
