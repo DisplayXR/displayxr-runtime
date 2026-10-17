@@ -852,6 +852,10 @@ ordering, the snapshot cap and letterbox crop, "flat until first result", and th
 4. `XrLiftFrameControlDXR` may chain on a rect to signal a seek.
 5. `XrLiftOptionsDXR::convergence = AUTO` now means runtime auto-convergence (rt#1978).
 
+**Platforms.** Windows: the D3D11 service (`lift_weave_rect_batch` / `lift_weave_rects_nview`).
+macOS (the Vulkan weave backend) and desktop Linux: `vk_conv_weave` (P5 step C, below), same
+policy, same wire. The macOS Metal weave backend refuses lifted rects for now (woven as drawn).
+
 ---
 
 ## 8. Consumer migration
@@ -1085,10 +1089,42 @@ IOSurface is the macOS GPU transport. MoltenVK-created IOSurfaces report pixel f
 Providers stay on the CPU lane until a POSIX conversion-host GPU lane exists: the glue's
 provider mask defaults to 0.
 
+**Landed (step C, lifted weave rects on POSIX).** `vk_conv/vk_conv_weave.c` is the twin of the
+D3D11 service's weave-rect path, shared by the desktop-Linux weave engine and the macOS Vulkan
+weave backend. They reach it through an ops table that `ipc_server_conv_vk.c` installs into
+comp_multi (`comp_multi_weave_lift.c`), because the runtime client links comp_multi too.
+
+- **Snapshot.** The rect is blitted into a staging image: the letterbox-cropped active area,
+  capped to the 1920 long edge with halving blits. It is copied to a host buffer in the engine's
+  own command buffer. When the engine's fence signals, the pixels go into the stream's input
+  slot (begin, copy, commit in one call). The letterbox profile is measured from the 96 sampled
+  columns and rows of the whole rect, read back the same way and reduced on the CPU
+  (`u_lift_letterbox_profile_from_lines`, bucket-for-bucket the D3D11 shader's).
+- **Result.** The latest GPU result stays pinned until the fence. Each view is copied raw into a
+  UNORM staging image and stretched into the rect's active area of each tile. The bars are the
+  2D input, flat. A rect is woven flat until the first result.
+- **Bridge and spec 3.** The bridge resolves core-routed v3 stream ids
+  (`IPC_SERVER_CONV_STREAM_TAG`). Under the CPU route a spec-3 SBS or NVIEW stream can now be
+  created for weave rects only (`ipc_server_conv_set_weave_rects`). Its properties report SBS and
+  NVIEW only, because spec 3's own submit and export kinds are D3D11 textures.
+- **Eyes sink.** Every eye query comp_multi answers publishes the answering DP's eyes, keyed by
+  that DP. A lifted rect's frame names the weave engine's DP.
+
+Providers run on the CPU lane on POSIX, so the snapshot goes GPU → host → slot. It is not
+GPU → GPU as on Windows. A GPU slot is filled through `vk_conv_gpu_write` from the same buffer.
+
+Validated on a developer Mac (MoltenVK, vk backend, sim provider): `tests_conv_vk_gpu` and
+`weave_probe_vk_macos --lift`. The Linux engine is compiled only in a syntax check; it has not
+run.
+
 Still open:
 
 - A GPU client transport (textures and fences to the app): the client gets CPU bytes.
-- The weave-rect bridge and the per-DP eyes sink (step C).
+- Lifted rects on the macOS Metal weave backend: wrap the results' IOSurface export as
+  `MTLTexture`s and read the snapshot back through a shared buffer.
+- The depth-aware cursor on lifted rects (ADR-046 Amendment 1). No POSIX weave engine draws a
+  cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
+- A GPU → GPU snapshot once a POSIX provider takes GPU inputs.
 - Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
   second) and lavapipe in CI.
 
