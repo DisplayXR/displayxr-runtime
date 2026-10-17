@@ -20,6 +20,7 @@
 #include "conversion/conv_select.h"
 
 #include "os/os_time.h"
+#include "util/u_camera_consent.h"
 
 #include <ctype.h>
 #include <stddef.h>
@@ -390,12 +391,27 @@ headless_get_setting(const char *key, char *buf, uint32_t buf_size)
 	                                       buf_size, NULL);
 }
 
+//! ADR-057 §2: the user's off-box consent for the provider being described.
+static bool
+headless_get_consent(uint32_t kind)
+{
+	const struct xrt_conversion_plugin_entry *e = g_headless_entry;
+	return e != NULL && kind == XRT_CONV_CONSENT_OFFBOX && u_offbox_consent_granted(e->id);
+}
+
+void
+target_conv_status_set_headless_entry(const struct xrt_conversion_plugin_entry *e)
+{
+	g_headless_entry = e;
+}
+
 const struct xrt_conversion_plugin_host_iface *
 target_conv_status_headless_host(void)
 {
 	if (!g_headless_host_ready) {
 		g_headless_host = *target_conversion_plugin_default_host();
 		g_headless_host.get_setting = headless_get_setting;
+		g_headless_host.get_consent = headless_get_consent;
 		g_headless_host.host_flags |= 2u; // bit1: headless / CI
 		g_headless_host_ready = true;
 	}

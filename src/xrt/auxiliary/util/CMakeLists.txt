@@ -49,6 +49,8 @@ add_library(
 	u_camera_consent.h
 	u_camera_consent_store.c
 	u_client_class.c
+	u_credential.c
+	u_credential.h
 	u_client_class.h
 	u_sha256.c
 	u_sha256.h
@@ -230,6 +232,12 @@ target_link_libraries(aux_util PRIVATE displayxr::math_core)
 # CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
 if(APPLE)
 	target_link_libraries(aux_util PRIVATE "-framework CoreFoundation")
+	# Security: SecItemCopyMatching, the Keychain reader of u_credential.c (ADR-057).
+	target_link_libraries(aux_util PRIVATE "-framework Security")
+endif()
+# u_credential.c loads libsecret at run time (dlopen) on desktop Linux.
+if(XRT_HAVE_LINUX AND NOT ANDROID)
+	target_link_libraries(aux_util PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # Is basically used everywhere, unavoidable.

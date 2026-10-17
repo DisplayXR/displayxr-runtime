@@ -35,6 +35,7 @@
 #include "os/os_time.h"
 
 #include <atomic>
+#include <string>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -568,6 +569,84 @@ TEST_CASE("job: cancel is observed by the provider and reported within 100 ms", 
 		CHECK(f.job_cancel_seen_ns != 0u);
 		CHECK(f.job_cancel_seen_ns - t0 <= 100 * MS);
 		CHECK(f.jobs == 1u); // the cancelled queued job never reached the provider
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("job: the splat result travels with the job; a refusal fails it as INPUT (ADR-057)", "[conv_lanes]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "fake");
+	conv_fake_cap *jc =
+	    conv_fake_add_cap(&f, 6, XRT_CONV_TASK_SPLATS_MONO, XRT_CONV_LANE_JOB, XRT_CONV_OUT_SPLAT_BLOB, 0);
+	jc->job_ms = 1;
+	jc->job_bytes = 64;
+	jc->state = XRT_CONV_STATE_READY;
+	{
+		Core core(false);
+		REQUIRE(core.add(f, 100) >= 0);
+		uint8_t pixels[16 * 16 * 4] = {};
+		conv_job_create_info ji{};
+		ji.task = XRT_CONV_TASK_SPLATS_MONO;
+		ji.image_count = 1;
+		ji.images[0].memory_kind = XRT_CONV_MEM_CPU;
+		ji.images[0].cpu_ptr = pixels;
+		ji.images[0].width = ji.images[0].height = 16;
+		ji.images[0].row_stride = 64;
+		ji.images[0].format = XRT_CONV_FMT_RGBA8_UNORM;
+		ji.params.struct_size = sizeof(ji.params);
+
+		// The baseline is validated, never defaulted; a pair is rectified OR raw.
+		uint64_t bad = 0;
+		ji.params.stereo.baseline_m = -0.06f;
+		CHECK(conv_core_job_submit(core.c, 1, &ji, &bad) == XRT_ERROR_INPUT_UNSUPPORTED);
+		ji.params.stereo.baseline_m = 0.065f;
+		ji.job_flags = XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_PAIR_RAW;
+		CHECK(conv_core_job_submit(core.c, 1, &ji, &bad) == XRT_ERROR_INPUT_UNSUPPORTED);
+		ji.job_flags = XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_FOCAL_GIVEN;
+
+		uint64_t j = 0;
+		REQUIRE(conv_core_job_submit(core.c, 1, &ji, &j) == XRT_SUCCESS);
+		conv_job_status st{};
+		REQUIRE(wait_until(
+		    [&] {
+			    conv_core_job_status(core.c, j, &st);
+			    return st.status == CONV_JOB_SUCCEEDED || st.status == CONV_JOB_FAILED;
+		    },
+		    2000));
+		CHECK(st.status == CONV_JOB_SUCCEEDED);
+		CHECK(jc->job_flags_seen == (XRT_CONV_JOB_PAIR_RECTIFIED | XRT_CONV_JOB_FOCAL_GIVEN));
+		xrt_conv_splat_result sr{};
+		sr.struct_size = sizeof(sr);
+		REQUIRE(conv_core_job_splat_result(core.c, j, &sr) == XRT_SUCCESS);
+		CHECK(std::string(sr.build_provider) == "fake-build");
+		CHECK(sr.host_kind == XRT_CONV_HOST_KIND_LOCAL);
+		CHECK(sr.refusal_code == XRT_CONV_REFUSAL_NONE);
+		// A smaller (older) caller gets exactly its extent.
+		xrt_conv_splat_result small{};
+		small.struct_size = 8;
+		REQUIRE(conv_core_job_splat_result(core.c, j, &small) == XRT_SUCCESS);
+		CHECK(small.struct_size == 8u);
+		CHECK(small.build_provider[0] == 0);
+
+		jc->job_refusal = XRT_CONV_REFUSAL_INPUT_TOO_LARGE;
+		uint64_t j2 = 0;
+		REQUIRE(conv_core_job_submit(core.c, 1, &ji, &j2) == XRT_SUCCESS);
+		REQUIRE(wait_until(
+		    [&] {
+			    conv_core_job_status(core.c, j2, &st);
+			    return st.status == CONV_JOB_SUCCEEDED || st.status == CONV_JOB_FAILED;
+		    },
+		    2000));
+		CHECK(st.status == CONV_JOB_FAILED);
+		CHECK(st.failure_reason == XRT_CONV_FAIL_INPUT);
+		xrt_conv_splat_result sr2{};
+		sr2.struct_size = sizeof(sr2);
+		REQUIRE(conv_core_job_splat_result(core.c, j2, &sr2) == XRT_SUCCESS); // a failed job's facts too
+		CHECK(sr2.refusal_code == XRT_CONV_REFUSAL_INPUT_TOO_LARGE);
+		CHECK(std::string(sr2.refusal_reason) == "fake refusal");
+		CHECK(conv_core_task_state(core.c, XRT_CONV_TASK_SPLATS_MONO) ==
+		      XRT_CONV_STATE_READY); // the cap is fine
 	}
 	conv_fake_fini(&f);
 }

@@ -59,6 +59,21 @@ cli_status_build_headless(struct xrt_status_snapshot *out);
 int
 cli_cmd_clients(int argc, const char **argv);
 
+/*! ADR-057: `conv run <task> <in> [<in-right>] <out>` (a job, file to file),
+ *  `conv consent <id> grant|revoke|status` and `conv camera-block <sog> --facts <json>`. */
+int
+cli_cmd_conv_run(int argc, const char **argv);
+
+int
+cli_cmd_conv_consent(int argc, const char **argv);
+
+int
+cli_cmd_conv_camera_block(int argc, const char **argv);
+
+//! `conv credential set|delete|status <name>`: the OS credential store a provider setting names.
+int
+cli_cmd_conv_credential(int argc, const char **argv);
+
 //! `conv list|status|warm|enable|disable|use|reset|models` — conversion providers (ADR-053).
 int
 cli_cmd_conv(int argc, const char **argv);

@@ -215,6 +215,14 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 const struct xrt_conversion_plugin_host_iface *
 target_conv_status_headless_host(void);
 
+/*!
+ * Bind the headless host to @p e (its get_setting / get_consent answer for
+ * that provider only; NULL unbinds). The pass binds each entry itself; `conv
+ * run` binds the one provider it hosts for the job (ADR-057).
+ */
+void
+target_conv_status_set_headless_entry(const struct xrt_conversion_plugin_entry *e);
+
 struct conv_registry;
 
 /*!

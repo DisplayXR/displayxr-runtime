@@ -27,6 +27,7 @@
 #include "target_conversion_plugin_loader.h"
 
 #include "os/os_threading.h"
+#include "util/u_camera_consent.h"
 #include "util/u_logging.h"
 
 #include <ctype.h>
@@ -476,6 +477,44 @@ HOST_GET_SETTING(13)
 HOST_GET_SETTING(14)
 HOST_GET_SETTING(15)
 
+/*! ADR-057 §2: the user's per-provider consent, from the per-user consent
+ *  store (the same one ADR-043's camera consumers use), keyed by the slot's id. */
+static bool
+host_get_consent_slot(uint32_t slot, uint32_t kind)
+{
+	return kind == XRT_CONV_CONSENT_OFFBOX && g_host_slot[slot].used &&
+	       u_offbox_consent_granted(g_host_slot[slot].id);
+}
+
+#define HOST_GET_CONSENT(i)                                                                                            \
+	static bool host_get_consent_##i(uint32_t kind)                                                                \
+	{                                                                                                              \
+		return host_get_consent_slot(i, kind);                                                                 \
+	}
+HOST_GET_CONSENT(0)
+HOST_GET_CONSENT(1)
+HOST_GET_CONSENT(2)
+HOST_GET_CONSENT(3)
+HOST_GET_CONSENT(4)
+HOST_GET_CONSENT(5)
+HOST_GET_CONSENT(6)
+HOST_GET_CONSENT(7)
+HOST_GET_CONSENT(8)
+HOST_GET_CONSENT(9)
+HOST_GET_CONSENT(10)
+HOST_GET_CONSENT(11)
+HOST_GET_CONSENT(12)
+HOST_GET_CONSENT(13)
+HOST_GET_CONSENT(14)
+HOST_GET_CONSENT(15)
+
+static bool (*const k_host_get_consent[HOST_SLOTS])(uint32_t) = {
+    host_get_consent_0,  host_get_consent_1,  host_get_consent_2,  host_get_consent_3,
+    host_get_consent_4,  host_get_consent_5,  host_get_consent_6,  host_get_consent_7,
+    host_get_consent_8,  host_get_consent_9,  host_get_consent_10, host_get_consent_11,
+    host_get_consent_12, host_get_consent_13, host_get_consent_14, host_get_consent_15,
+};
+
 static bool (*const k_host_get_setting[HOST_SLOTS])(const char *, char *, uint32_t) = {
     host_get_setting_0,  host_get_setting_1,  host_get_setting_2,  host_get_setting_3,
     host_get_setting_4,  host_get_setting_5,  host_get_setting_6,  host_get_setting_7,
@@ -511,6 +550,7 @@ host_for_entry(const struct xrt_conversion_plugin_entry *e)
 	memcpy(g_host_slot[slot].settings, e->settings, sizeof(g_host_slot[slot].settings));
 	g_hosts[slot] = g_host;
 	g_hosts[slot].get_setting = k_host_get_setting[slot];
+	g_hosts[slot].get_consent = k_host_get_consent[slot];
 	return &g_hosts[slot];
 }
 

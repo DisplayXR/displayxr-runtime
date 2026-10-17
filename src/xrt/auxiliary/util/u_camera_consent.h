@@ -547,6 +547,40 @@ u_camera_consent_exe_signer(const char *exe, char *out, size_t cap);
 bool
 u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap);
 
+
+/*
+ *
+ * Off-box consent (ADR-057 §2).
+ *
+ * A conversion provider that sends the user's pictures to a remote endpoint
+ * (XRT_CONV_CAP_REMOTE) needs the user's own, per-provider, revocable
+ * consent. It is the same kind of decision as a camera consumer's (ADR-043),
+ * so it lives in the same per-user store, beside it:
+ *   Windows  HKCU\Software\DisplayXR\CameraConsent\OffBox   REG_DWORD, value
+ *            name = provider id, 1 = granted (absent / 0 = not granted)
+ *   POSIX    camera_consent.json   "offbox": {"<provider id>": "granted"}
+ * Never machine-wide and never a setting: a policy, an environment variable
+ * or an installer cannot grant it for the user. The conversion host answers
+ * xrt_conversion_plugin_host_iface::get_consent from here; the CLI writes it
+ * (`displayxr-cli conv consent <id> grant|revoke|status`).
+ *
+ */
+
+//! Longest provider id the store accepts (bytes, NUL excluded).
+#define U_OFFBOX_CONSENT_ID_MAX 63
+
+//! Has the user granted @p provider_id off-box consent? Unknown / unreadable = false.
+bool
+u_offbox_consent_granted(const char *provider_id);
+
+//! Grant (true) or revoke (false) it. False when the id is invalid or the store cannot be written.
+bool
+u_offbox_consent_set(const char *provider_id, bool granted);
+
+//! Every provider id holding a grant, through @p cb (status listings).
+void
+u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

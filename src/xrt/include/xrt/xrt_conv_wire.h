@@ -417,7 +417,9 @@ struct xrt_conv_wire_result
 
 /*!
  * conv_job_submit request. Decoded pixels only (XRT_CONV_INPUT_ENCODED is
- * reserved and has no wire field). sizeof == 632.
+ * reserved and has no wire field). sizeof == 640 (632 before ADR-057
+ * appended job_flags / max_input_long_side; an older sender's request reads
+ * them as 0 = undeclared).
  */
 struct xrt_conv_wire_job_desc
 {
@@ -432,6 +434,9 @@ struct xrt_conv_wire_job_desc
 	uint32_t reserved_0;
 	struct xrt_conv_wire_image images[XRT_CONV_MAX_FRAME_IMAGES];
 	struct xrt_conv_wire_params params;
+	/* ADR-057 §4 (xrt_conv_job_in tail). */
+	uint32_t job_flags;           //!< XRT_CONV_JOB_*
+	uint32_t max_input_long_side; //!< px; 0 = the provider's own
 };
 
 //! conv_job_status reply. sizeof == 64.
@@ -1179,6 +1184,9 @@ xrt_conv_wire_pack_job_desc(uint32_t task,
 	out->input_kind = in->input_kind;
 	out->image_count = in->image_count;
 	out->requested_blob_format = in->requested_blob_format;
+	out->job_flags = XRT_CONV_COVERS(in, struct xrt_conv_job_in, job_flags) ? in->job_flags : 0u;
+	out->max_input_long_side =
+	    XRT_CONV_COVERS(in, struct xrt_conv_job_in, max_input_long_side) ? in->max_input_long_side : 0u;
 	for (i = 0; i < in->image_count; i++) {
 		xrt_conv_wire_pack_image(&in->images[i], in->image_role[i], shm_offsets != NULL ? shm_offsets[i] : 0,
 		                         &out->images[i]);
@@ -1207,6 +1215,8 @@ xrt_conv_wire_unpack_job_desc(const struct xrt_conv_wire_job_desc *in,
 	job->input_kind = in->input_kind;
 	job->image_count = in->image_count;
 	job->requested_blob_format = in->requested_blob_format;
+	job->job_flags = in->job_flags;
+	job->max_input_long_side = in->max_input_long_side;
 	for (i = 0; i < in->image_count; i++) {
 		xrt_conv_wire_unpack_image(&in->images[i], &job->images[i], &job->image_role[i],
 		                           out_shm_offsets != NULL ? &out_shm_offsets[i] : NULL);
@@ -1362,7 +1372,7 @@ XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_submit) == 560, "conv_submit siz
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_wire_submit, depth_in_info) == 432, "conv_submit: depth_in_info at 432");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_result) == 352, "conv_acquire_result size");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_wire_result, depth_info) == 224, "conv_acquire_result: depth_info at 224");
-XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_job_desc) == 632, "conv_job_submit size");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_job_desc) == 640, "conv_job_submit size");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_job_status) == 64, "conv_job_status size");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_job_result) == 368, "conv_job_fetch size");
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_wire_job_result, views_info) == 240, "conv_job_fetch: views_info at 240");
