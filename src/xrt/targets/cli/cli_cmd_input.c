@@ -190,6 +190,12 @@ cmd_list(int argc, const char **argv)
 		} else {
 			cJSON_AddNullToObject(root, "preferred");
 		}
+		// ADR-034 Am.5: under Policy\Lock only the machine's PreferredPlugin is
+		// read — a per-user `input use <id>` is ignored ("machine (locked)").
+		cJSON_AddStringToObject(root, "preferred_source",
+		                        target_component_policy_lock(target_input_plugin_component_class())
+		                            ? "machine (locked)"
+		                            : "user over machine");
 		// HKLM `<root>\Policy\Lock` (Windows): per-user Enabled values are ignored.
 		// The same `policy.policy_lock` key `conv list --json` emits.
 		cJSON *pol = cJSON_AddObjectToObject(root, "policy");
@@ -219,7 +225,11 @@ cmd_list(int argc, const char **argv)
 			const int nl = fetch_live_holders(live, 32);
 			if (nl < 0) {
 				cJSON_AddNullToObject(root, "holders");
+				cJSON_AddNullToObject(root, "clients_dropped");
 			} else {
+				// Clients the service's per-client table refused (full): their pins
+				// and requests do not apply. Repeated in every row; 0 with no rows.
+				cJSON_AddNumberToObject(root, "clients_dropped", nl > 0 ? (double)live[0].clients_dropped : 0.0);
 				cJSON *tmp = cJSON_CreateObject();
 				u_status_input_holders_add_cjson(tmp, live, (uint32_t)nl);
 				cJSON_AddItemToObject(root, "holders",
@@ -268,7 +278,8 @@ cmd_list(int argc, const char **argv)
 		return 0;
 	}
 	if (target_component_policy_lock(target_input_plugin_component_class())) {
-		P("\tPolicy\\Lock: SET (HKLM) — per-user Enabled values are ignored; the machine's win.\n");
+		P("\tPolicy\\Lock: SET (HKLM) — per-user Enabled values, the per-user PreferredPlugin and every\n"
+		  "\t  per-app pin are ignored; the machine's win (PreferredPlugin source: machine (locked)).\n");
 	}
 	if (force_qwerty) {
 		P("\tForceQwerty override: SET — providers are skipped, qwerty claims the hand roles.\n");

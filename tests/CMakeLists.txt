@@ -108,6 +108,7 @@ set(tests
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
+    tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
     tests_input_arbiter_rerank
@@ -953,6 +954,13 @@ target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
 target_include_directories(
 	tests_oxr_tracking_properties_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
+
+# ADR-034 Amendment 5 (#2181) — XR_DXR_input_providers event discipline: the
+# setter's "should I queue the event" rule, header-only like the rules above.
+target_include_directories(
+	tests_oxr_input_providers_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_input_providers_rule PRIVATE xrt-interfaces)
 
 # One source of truth for the ACTIVE mode's per-view scale. The accessor is a
 # static inline over xrt_device / xrt_rendering_mode, so headers are all it

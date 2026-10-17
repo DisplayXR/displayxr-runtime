@@ -355,6 +355,12 @@ TEST_CASE("per-client: generations are per client and monotonic across a global 
 	REQUIRE(a0.left == f.c_left_i);
 	REQUIRE(b0.left == f.h_left_i);
 
+	// The selection generation (what the ADR-051 status tick folds in) at rest.
+	const uint64_t sg0 = xrt_input_selection_get_generation(f.xis());
+	(void)f.roles(f.a);
+	(void)f.roles(f.b);
+	CHECK(xrt_input_selection_get_generation(f.xis()) == sg0); // repeat reads: no status bump
+
 	// The user makes ctl the default (a re-rank): B moves, A already was there.
 	const struct t_input_arbiter_rank rank[2] = {{"ctl", 0, true}, {"hands", 50, true}};
 	REQUIRE(t_input_arbiter_rerank(rank, 2) > 0);
@@ -364,6 +370,11 @@ TEST_CASE("per-client: generations are per client and monotonic across a global 
 	CHECK(b1.generation_id == b0.generation_id + 1);
 	CHECK(a1.left == f.c_left_i);
 	CHECK(a1.generation_id == a0.generation_id); // nothing moved for A: no bump
+	// B's holder moved (hands -> ctl): the status generation moves, exactly once.
+	const uint64_t sg1 = xrt_input_selection_get_generation(f.xis());
+	CHECK(sg1 == sg0 + 1);
+	(void)f.roles(f.b);
+	CHECK(xrt_input_selection_get_generation(f.xis()) == sg1);
 
 	// Back again, then A drops its request: every step only ever goes up.
 	const struct t_input_arbiter_rank back[2] = {{"ctl", 100, true}, {"hands", 50, true}};
@@ -424,12 +435,42 @@ TEST_CASE("per-client: persist writes the per-app pin every client of that app s
 	CHECK(g_store.pins.count("A.exe") == 0);
 	CHECK(f.roles(a2).left == f.h_left_i);
 
-	SECTION("no executable identity: persist is refused")
+	SECTION("no executable identity: persist is refused and nothing is written")
 	{
+		// A restricted-token peer the service could not resolve (exe "") — the
+		// OpenXR layer maps this to XR_ERROR_FEATURE_UNSUPPORTED.
+		const size_t pins_before = g_store.pins.size();
 		struct xrt_input_selection_client anon = client(9, "");
 		CHECK(xrt_input_selection_set_preference(f.xis(), &anon, XRT_INPUT_ROLE_FAMILY_CONTROLLERS, "ctl",
 		                                         true) == XRT_ERROR_FEATURE_NOT_SUPPORTED);
+		CHECK(g_store.pins.size() == pins_before);
+		CHECK(f.roles(anon).left == f.h_left_i); // and no request was recorded either
 	}
+}
+
+TEST_CASE("per-client: a pin changed while the app is attached reaches it on the next get_roles",
+          "[input_per_client]")
+{
+	fixture f;
+	const struct xrt_system_roles before = f.roles(f.a); // attached, no pin
+	REQUIRE(before.left == f.h_left_i);
+
+	// The Dashboard / `input use ctl --app A.exe` writes the store while A runs ...
+	g_store.pins["A.exe"] = "ctl";
+	// ... and the service's policy watch (N3d) re-reads: A's cached pin follows.
+	CHECK(t_input_arbiter_policy_changed() == 1);
+	const struct xrt_system_roles after = f.roles(f.a);
+	CHECK(after.left == f.c_left_i);
+	CHECK(after.generation_id == before.generation_id + 1);
+	CHECK(f.roles(f.b).left == f.h_left_i); // another app's pin is its own
+
+	// Cleared while attached: back to the default walk, one more generation.
+	g_store.pins.erase("A.exe");
+	CHECK(t_input_arbiter_policy_changed() == 1);
+	const struct xrt_system_roles cleared = f.roles(f.a);
+	CHECK(cleared.left == f.h_left_i);
+	CHECK(cleared.generation_id == after.generation_id + 1);
+	CHECK(t_input_arbiter_policy_changed() == 0); // nothing moved: nothing counted
 }
 
 TEST_CASE("per-client: the gamepad is a per-client family; the rig is not", "[input_per_client]")
@@ -476,6 +517,7 @@ TEST_CASE("per-client: enumerate, holders and detach", "[input_per_client]")
 	CHECK(by_id["ctl"].requested_families == C);
 	CHECK(by_id["pad"].claimable_families == G);
 	CHECK(by_id["pad"].current_families == G);
+	CHECK(std::string(XRT_INPUT_PROVIDER_ID_EMULATED) == "emulated"); // public + stable (review: not "qwerty")
 	CHECK(by_id[XRT_INPUT_PROVIDER_ID_EMULATED].builtin);
 	CHECK(by_id[XRT_INPUT_PROVIDER_ID_EMULATED].claimable_families == C);
 	CHECK(by_id[XRT_INPUT_PROVIDER_ID_EMULATED].current_families == 0);
@@ -499,6 +541,7 @@ TEST_CASE("per-client: enumerate, holders and detach", "[input_per_client]")
 	}
 	CHECK(saw_a);
 	CHECK(saw_b);
+	CHECK(h.clients_dropped == 0);
 
 	// Detach drops the request; a reconnect (new key) starts on the default walk.
 	xrt_input_selection_client_detach(f.xis(), &f.a);
@@ -514,4 +557,22 @@ TEST_CASE("per-client: with no policy store everything still resolves", "[input_
 	CHECK(f.roles(f.a).left == f.c_left_i);
 	CHECK(xrt_input_selection_set_preference(f.xis(), &f.a, XRT_INPUT_ROLE_FAMILY_CONTROLLERS, "ctl", true) ==
 	      XRT_ERROR_FEATURE_NOT_SUPPORTED);
+}
+
+TEST_CASE("per-client: table overflow is counted once per client, and the client gets the system roles",
+          "[input_per_client]")
+{
+	fixture f;
+	g_store.pins["Late.exe"] = "ctl";
+	for (uint64_t k = 100; k < 100 + 40; k++) { // fill every entry
+		(void)f.roles(client(k, "Filler.exe"));
+	}
+	struct xrt_input_selection_client late = client(500, "Late.exe");
+	const struct xrt_system_roles r = f.roles(late);
+	CHECK(r.left == f.h_left_i); // the system-wide roles: its pin does not apply
+	(void)f.roles(late);         // a refused client's per-frame calls do not recount
+	(void)f.roles(client(501, "Later.exe"));
+	struct xrt_input_client_holders h;
+	REQUIRE(xrt_input_selection_query_holders(f.xis(), 0, &h) == XRT_SUCCESS);
+	CHECK(h.clients_dropped == 2);
 }
