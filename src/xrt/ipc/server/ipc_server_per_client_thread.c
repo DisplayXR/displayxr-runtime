@@ -144,6 +144,9 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// XR_DXR_stereo_camera (ADR-043): streams are owned by the connection.
 	ipc_server_client_stereo_camera_release(ics);
 
+	// XR_DXR_input_providers (ADR-034 Am.5): session requests die with the connection.
+	ipc_server_client_input_release(ics);
+
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {
 		// Cast away volatile.

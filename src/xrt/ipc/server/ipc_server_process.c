@@ -31,6 +31,7 @@
 
 #include "util/u_git_tag.h"
 #include "util/u_setting.h"
+#include "util/u_exe_basename.h"
 
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
@@ -1763,6 +1764,16 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	long peer_pid = ipc_server_derive_peer_pid(ipc_handle, &peer_create_ns);
 	unsigned long orch_pid = ipc_server_get_orchestrator_workspace_pid();
 
+	// ADR-034 Am.5 (#2181): the per-app input key from the PEER process, resolved
+	// here — outside the global lock, since it opens the process.
+	char input_exe[XRT_INPUT_EXE_BASENAME_SIZE] = {0};
+	{
+		char exe_path[512];
+		if (peer_pid != 0 && ipc_server_peer_exe_path(peer_pid, exe_path, sizeof(exe_path))) {
+			(void)u_exe_basename_from_path(exe_path, input_exe, sizeof(input_exe));
+		}
+	}
+
 	os_mutex_lock(&vs->global_state.lock);
 
 	// #959: runtime-admitted cap with a reserved controller slot. A client whose
@@ -1870,6 +1881,8 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	ics->server = vs;
 	ics->server_thread_index = cs_index;
 	ics->io_active = true;
+	// ADR-034 Am.5 (#2181): the per-app key, resolved before the lock was taken.
+	memcpy((char *)ics->input_exe_basename, input_exe, sizeof(input_exe));
 
 	ics->plane_detection_size = 0;
 	ics->plane_detection_count = 0;

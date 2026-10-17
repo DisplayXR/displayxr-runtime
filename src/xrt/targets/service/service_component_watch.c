@@ -423,7 +423,8 @@ fold_path(uint64_t h, const char *dir, const char *name)
 
 /*!
  * One hash per class over what that class reads from the per-user dir:
- * `preferred` (display), `input-preferred` + `emulated_controllers` (input), every manifest by its
+ * `preferred` (display), `input-preferred` + `emulated_controllers` + every per-app
+ * `input-preferred-<exe>` pin (input), every manifest by its
  * suffix (the manifest's `enabled` is the POSIX Enabled switch). A file's
  * absence is folded too, and a manifest added or removed changes its
  * class's name set — so the dir's own mtime is deliberately NOT folded: it
@@ -455,6 +456,12 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 	struct dirent *ent;
 	while ((ent = readdir(d)) != NULL) {
 		uint32_t cls;
+		// ADR-034 Am.5 (#2181): a per-app input pin (`input-preferred-<exe>`)
+		// is input policy — a write re-ranks live like `input-preferred`.
+		if (strncmp(ent->d_name, "input-preferred-", 16) == 0) {
+			out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, ent->d_name);
+			continue;
+		}
 		switch (target_plugin_classify_manifest(ent->d_name)) {
 		case TARGET_PLUGIN_MANIFEST_DISPLAY: cls = TARGET_COMPONENT_CLASS_DISPLAY; break;
 		case TARGET_PLUGIN_MANIFEST_INPUT: cls = TARGET_COMPONENT_CLASS_INPUT; break;

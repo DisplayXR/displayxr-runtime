@@ -4873,6 +4873,28 @@ void
 oxr_desktop_control_session_fini(struct oxr_session *sess);
 #endif // OXR_HAVE_DXR_desktop_control
 
+#ifdef OXR_HAVE_DXR_input_providers
+//! Queue XrEventDataInputProvidersChangedDXR on @p inst (instance-scoped; any thread).
+XrResult
+oxr_event_push_XrEventDataInputProvidersChanged(struct oxr_logger *log,
+                                                struct oxr_instance *inst,
+                                                XrInputRoleFamilyFlagsDXR changed_families);
+#endif // OXR_HAVE_DXR_input_providers
+
+/*!
+ * ADR-034 Amendment 5 (#2181): the roles this client resolves just moved from
+ * @p old_roles to @p new_roles (xrSyncActions saw a newer generation). Raises
+ * XrEventDataInputProvidersChangedDXR naming the families that moved, when the
+ * app enabled XR_DXR_input_providers; a no-op otherwise (and when the very
+ * first roles arrive — nothing "changed" for an app that never enumerated).
+ * Called under `sys->sync_actions_mutex`; only queues an event.
+ */
+void
+oxr_input_providers_roles_changed(struct oxr_logger *log,
+                                  struct oxr_system *sys,
+                                  const struct xrt_system_roles *old_roles,
+                                  const struct xrt_system_roles *new_roles);
+
 
 #ifdef OXR_HAVE_EXT_user_presence
 XrResult

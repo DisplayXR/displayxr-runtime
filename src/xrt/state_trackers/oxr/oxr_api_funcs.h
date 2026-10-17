@@ -1233,6 +1233,20 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action, uint64_t *actionId);
 #endif
 
+#ifdef OXR_HAVE_DXR_input_providers
+//! OpenXR API function @ep{xrEnumerateInputProvidersDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateInputProvidersDXR(XrInstance instance,
+                                 XrSystemId systemId,
+                                 uint32_t providerCapacityInput,
+                                 uint32_t *providerCountOutput,
+                                 XrInputProviderPropertiesDXR *providers);
+
+//! OpenXR API function @ep{xrSetInputProviderPreferenceDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPreferenceInfoDXR *info);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

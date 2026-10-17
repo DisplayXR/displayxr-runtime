@@ -13,6 +13,10 @@
 
 #include "util/u_system_helpers.h"
 
+#include "xrt/xrt_input_selection.h"
+
+#include <string.h>
+
 
 struct ipc_client_system_devices
 {
@@ -23,6 +27,14 @@ struct ipc_client_system_devices
 	struct ipc_connection *ipc_c;
 
 	struct xrt_reference feature_use[XRT_DEVICE_FEATURE_MAX_ENUM];
+
+	/*!
+	 * ADR-034 Amendment 5 (#2181): per-client input-provider selection,
+	 * forwarded to the service. The connection IS the client, so the
+	 * @ref xrt_input_selection_client the OpenXR layer passes is ignored —
+	 * the service keys on the peer it resolved at accept.
+	 */
+	struct xrt_input_selection input_selection;
 };
 
 
@@ -51,6 +63,44 @@ ipc_client_system_devices_get_roles(struct xrt_system_devices *xsysd, struct xrt
 	struct ipc_client_system_devices *usysd = ipc_system_devices(xsysd);
 
 	return ipc_call_system_devices_get_roles(usysd->ipc_c, out_roles);
+}
+
+static inline struct ipc_client_system_devices *
+ipc_system_devices_from_selection(struct xrt_input_selection *xis)
+{
+	return container_of(xis, struct ipc_client_system_devices, input_selection);
+}
+
+static xrt_result_t
+ipc_client_input_selection_enumerate(struct xrt_input_selection *xis,
+                                     const struct xrt_input_selection_client *client,
+                                     uint32_t start,
+                                     struct xrt_input_provider_page *out_page)
+{
+	(void)client; // the service resolves the client from the connection
+	struct ipc_client_system_devices *icsd = ipc_system_devices_from_selection(xis);
+	return ipc_call_input_providers_enumerate(icsd->ipc_c, start, out_page);
+}
+
+static xrt_result_t
+ipc_client_input_selection_set_preference(struct xrt_input_selection *xis,
+                                          const struct xrt_input_selection_client *client,
+                                          enum xrt_input_role_family family,
+                                          const char *provider_id,
+                                          bool persist)
+{
+	(void)client;
+	struct ipc_client_system_devices *icsd = ipc_system_devices_from_selection(xis);
+	struct ipc_input_provider_id id;
+	memset(&id, 0, sizeof(id));
+	if (provider_id != NULL) {
+		const size_t len = strnlen(provider_id, sizeof(id.id));
+		if (len >= sizeof(id.id)) {
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // cannot name a provider in a truncated id
+		}
+		memcpy(id.id, provider_id, len);
+	}
+	return ipc_call_input_set_provider_preference(icsd->ipc_c, (uint32_t)family, &id, persist);
 }
 
 static xrt_result_t
@@ -114,6 +164,10 @@ ipc_client_system_devices_create(struct ipc_connection *ipc_c)
 	icsd->base.base.feature_inc = ipc_client_system_devices_feature_inc;
 	icsd->base.base.feature_dec = ipc_client_system_devices_feature_dec;
 	icsd->ipc_c = ipc_c;
+	// Holders / detach are service-side concerns (DIAG + the connection's own teardown).
+	icsd->input_selection.enumerate = ipc_client_input_selection_enumerate;
+	icsd->input_selection.set_preference = ipc_client_input_selection_set_preference;
+	icsd->base.base.input_selection = &icsd->input_selection;
 
 	return &icsd->base.base;
 }

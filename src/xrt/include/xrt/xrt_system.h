@@ -24,6 +24,7 @@ struct xrt_system_devices;
 struct xrt_session;
 struct xrt_compositor_native;
 struct xrt_session_info;
+struct xrt_input_selection;
 
 
 /*
@@ -348,6 +349,15 @@ struct xrt_system_devices
 			} conforming;
 		} hand_tracking;
 	} static_roles;
+
+	/*!
+	 * Per-client input-provider selection (ADR-034 Amendment 5,
+	 * `xrt/xrt_input_selection.h`): enumerate the resident providers as this
+	 * client sees them and express a per-family preference. Not owned —
+	 * the implementation lives as long as this object. NULL = no selection
+	 * support on this system (the OpenXR layer then lists no providers).
+	 */
+	struct xrt_input_selection *input_selection;
 
 
 	/*!

@@ -253,6 +253,110 @@ target_input_plugin_get_emulated_controllers(const char **out_source);
 bool
 target_input_plugin_get_preferred(char *out, size_t cap);
 
+/*
+ *
+ * Per-client selection policy (ADR-034 Amendment 5, #2181).
+ *
+ */
+
+//! Outcome of a per-app pin write (`displayxr-cli input use <id> --app <exe>`, a persisted app request).
+enum target_input_pin_write
+{
+	TARGET_INPUT_PIN_WRITE_OK = 0,
+	TARGET_INPUT_PIN_WRITE_INVALID = 1,     //!< not a usable exe basename / provider id — nothing written
+	TARGET_INPUT_PIN_WRITE_DENIED = 2,      //!< the store refused the write (permissions)
+	TARGET_INPUT_PIN_WRITE_UNSUPPORTED = 3, //!< no per-user store on this platform (Android; POSIX without HOME)
+	TARGET_INPUT_PIN_WRITE_FAILED = 4,
+};
+
+/*!
+ * The user's per-app pin for executable @p exe_basename: the provider id that
+ * app's controller / hand / gamepad roles prefer, ahead of the app's own
+ * request and of `PreferredPlugin`. Windows: HKCU
+ * `Software\DisplayXR\InputProviders\PerApp\<exe-basename>\PreferredPlugin`
+ * (REG_SZ) — hidden under HKLM `InputProviders\Policy\Lock` = 1, the N3
+ * kiosk rule every per-user value of the class follows. POSIX: the one-line
+ * `input-preferred-<exe-basename>` file in the per-user manifest dir, next to
+ * `input-preferred`. Android: never set. Writes "" and returns false when
+ * nothing is pinned or @p exe_basename is not a valid key
+ * (`u_exe_basename_valid`). Shares the per-title keyspace of #1381: the
+ * actual executable's file name, never `applicationName`.
+ */
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap);
+
+/*!
+ * Write (@p provider_id non-empty) or clear (NULL / "") the per-app pin of
+ * @p exe_basename, in the store @ref target_input_plugin_get_app_pin reads.
+ * Per user, no admin. Does not poke the service: the caller does (the CLI's
+ * reselect poke), or the component-policy watch picks the edit up (#2051 —
+ * the Windows watch covers the subtree; POSIX folds every
+ * `input-preferred-*` file into the input fingerprint). An unregistered id is
+ * written anyway (a preference ahead of registration, as `input use`).
+ */
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id);
+
+//! One per-app pin row, for `input list --json` `per_app`.
+struct target_input_app_pin
+{
+	char exe_basename[128];
+	char provider_id[64];
+};
+
+/*!
+ * Every per-app pin in the per-user store (Windows: HKCU `PerApp` subkeys
+ * with a non-empty `PreferredPlugin`; POSIX: the `input-preferred-*` files),
+ * up to @p max, in store order. Returns the count. Ignores `Policy\Lock` —
+ * this is what is STORED; the caller reports the lock beside it.
+ */
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max);
+
+//! Where a family's effective preference came from (@ref target_input_resolve_preference).
+enum target_input_pref_source
+{
+	TARGET_INPUT_PREF_NONE = 0,         //!< default walk (ProbeOrder)
+	TARGET_INPUT_PREF_APP_PIN = 1,      //!< the user's per-app pin
+	TARGET_INPUT_PREF_REQUEST = 2,      //!< the client's non-persisted session request
+	TARGET_INPUT_PREF_USER_DEFAULT = 3, //!< `PreferredPlugin` (already priority 0 in the global rank)
+};
+
+/*!
+ * Everything the per-family precedence needs, gathered by the caller. A
+ * `*_claims` flag says whether that candidate supplies THIS family — a
+ * preference never applies to a family its provider does not claim (ADR-034
+ * Amendment 5 decision 2), so an unclaimed level falls through to the next.
+ */
+struct target_input_pref_inputs
+{
+	//! `DXR_INPUT_PROVIDERS=0` or `ForceQwerty`: no provider is resident; every pin is moot.
+	bool providers_disabled;
+	//! HKLM `InputProviders\Policy\Lock` = 1: the per-user pin and the app's request are ignored.
+	bool lock;
+	const char *app_pin; //!< NULL / "" = none
+	bool app_pin_claims;
+	const char *request; //!< NULL / "" = none
+	bool request_claims;
+	const char *user_default; //!< NULL / "" = none
+	bool user_default_claims;
+};
+
+/*!
+ * The precedence of ADR-034 Amendment 5 decision 3 for ONE family, pure:
+ * `Policy\Lock` -> per-app pin -> session request -> `PreferredPlugin` ->
+ * ProbeOrder, with `DXR_INPUT_PROVIDERS=0` / `ForceQwerty` beating all. Writes
+ * the winning id to @p out ("" for NONE) and returns its source. Presence is
+ * NOT decided here: the arbiter hoists the winner and its walk still skips it
+ * while absent.
+ */
+enum target_input_pref_source
+target_input_resolve_preference(const struct target_input_pref_inputs *in, char *out, size_t cap);
+
+//! Stable lower-case name of a @ref target_input_pref_source ("none", "app_pin", "request", "user_default").
+const char *
+target_input_pref_source_str(enum target_input_pref_source source);
+
 /*!
  * ADR-054 N3d (#2051): re-read the class's policy — `PreferredPlugin` (HKCU
  * then HKLM / the `input-preferred` file) and every registered row's
