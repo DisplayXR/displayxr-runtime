@@ -11,6 +11,7 @@
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "util/u_json.h"
+#include "util/u_credential.h"
 #include "util/u_logging.h"
 #include "util/u_sha256.h"
 
@@ -598,6 +599,38 @@ conv_pack_parse(const char *json, const char *base_dir, struct conv_pack *out, c
 			goto done;
 		}
 		pm->prefetch = jbool(m, "prefetch", false);
+		// ADR-057 §5: an optional per-model URL and auth block.
+		jstr(m, "url", pm->url, sizeof(pm->url));
+		const cJSON *auth = cJSON_GetObjectItemCaseSensitive(m, "auth");
+		if (auth != NULL) {
+			char kind[32] = {0};
+			if (!cJSON_IsObject(auth)) {
+				(void)snprintf(err, err_size, "model '%s': 'auth' is not an object", pm->name);
+				goto done;
+			}
+			jstr(auth, "kind", kind, sizeof(kind));
+			jstr(auth, "credential", pm->auth.credential, sizeof(pm->auth.credential));
+			if (!conv_pack_auth_kind_parse(kind, &pm->auth.kind)) {
+				(void)snprintf(err, err_size, "model '%s': auth.kind '%s' is not bearer or huggingface",
+				               pm->name, kind);
+				goto done;
+			}
+			if (!u_credential_name_valid(pm->auth.credential)) {
+				(void)snprintf(err, err_size, "model '%s': auth.credential must name a credential",
+				               pm->name);
+				goto done;
+			}
+		}
+		if (pm->url[0] != '\0' && strncmp(pm->url, "https://", 8) != 0 && strncmp(pm->url, "http://", 7) != 0 &&
+		    strncmp(pm->url, "file://", 7) != 0) {
+			(void)snprintf(err, err_size, "model '%s': url must be https://, http:// or file://", pm->name);
+			goto done;
+		}
+		if (pm->auth.kind != CONV_PACK_AUTH_NONE && pm->url[0] != '\0' &&
+		    strncmp(pm->url, "https://", 8) != 0) {
+			(void)snprintf(err, err_size, "model '%s': an auth block needs an https:// url", pm->name);
+			goto done;
+		}
 		// Commercial = AND over the model and every dependency; missing = false.
 		const cJSON *lic = cJSON_GetObjectItemCaseSensitive(m, "license");
 		pm->commercial = cJSON_IsObject(lic) && jbool(lic, "commercial", false);
@@ -656,6 +689,28 @@ conv_pack_parse(const char *json, const char *base_dir, struct conv_pack *out, c
 				pv->file_count++;
 			}
 			pm->variant_count++;
+		}
+		// The per-model url serves exactly one blob: every variant's `model` file.
+		for (uint32_t vi = 0; pm->url[0] != '\0' && vi < pm->variant_count; vi++) {
+			for (uint32_t fi = 0; fi < pm->variants[vi].file_count; fi++) {
+				const struct conv_pack_file *pf = &pm->variants[vi].files[fi];
+				if (strcmp(pf->role, "model") != 0) {
+					continue;
+				}
+				if (pm->url_sha256[0] == '\0') {
+					cpy(pm->url_sha256, sizeof(pm->url_sha256), pf->sha256);
+				} else if (strcmp(pm->url_sha256, pf->sha256) != 0) {
+					(void)snprintf(
+					    err, err_size,
+					    "model '%s': 'url' is ambiguous (its variants have different model files)",
+					    pm->name);
+					goto done;
+				}
+			}
+		}
+		if (pm->url[0] != '\0' && pm->url_sha256[0] == '\0') {
+			(void)snprintf(err, err_size, "model '%s': 'url' given but no file has role 'model'", pm->name);
+			goto done;
 		}
 		out->model_count++;
 	}
@@ -742,6 +797,51 @@ conv_pack_blob_url(const struct conv_pack *p, const struct conv_pack_file *f, ch
 }
 
 
+bool
+conv_pack_auth_kind_parse(const char *s, uint32_t *out)
+{
+	if (s != NULL && strcmp(s, "bearer") == 0) {
+		*out = CONV_PACK_AUTH_BEARER;
+		return true;
+	}
+	if (s != NULL && strcmp(s, "huggingface") == 0) {
+		*out = CONV_PACK_AUTH_HUGGINGFACE;
+		return true;
+	}
+	return false;
+}
+
+void
+conv_pack_file_url(const struct conv_pack *p,
+                   const struct conv_pack_model *m,
+                   const struct conv_pack_file *f,
+                   char *out,
+                   size_t out_size)
+{
+	if (m != NULL && m->url[0] != '\0' && strcmp(m->url_sha256, f->sha256) == 0) {
+		cpy(out, out_size, m->url);
+		return;
+	}
+	conv_pack_blob_url(p, f, out, out_size);
+}
+
+//! The model's auth when @p f is the blob its url serves, else none (ADR-057 §5).
+static const struct conv_pack_auth *
+file_auth(const struct conv_pack_model *m, const struct conv_pack_file *f)
+{
+	if (m == NULL || m->auth.kind == CONV_PACK_AUTH_NONE) {
+		return NULL;
+	}
+	// With its own url, the auth is that url's (the other files come from the
+	// pack's blobBaseUrl, unauthenticated); without one, the model's files all
+	// come from a gated blobBaseUrl and every one is fetched with it.
+	if (m->url[0] != '\0' && strcmp(m->url_sha256, f->sha256) != 0) {
+		return NULL;
+	}
+	return &m->auth;
+}
+
+
 /*
  *
  * The store object.
@@ -765,7 +865,8 @@ struct blob
 	char sha[CONV_STORE_SHA_HEX];
 	uint64_t size;
 	char url[CONV_STORE_PATH_MAX];
-	uint32_t pack_mask; //!< packs (by index) that reference it
+	struct conv_pack_auth auth; //!< ADR-057 §5: how to authenticate the fetch (kind NONE = public)
+	uint32_t pack_mask;         //!< packs (by index) that reference it
 	uint32_t st;
 	uint32_t fail; //!< XRT_CONV_FAIL_* while FAILED
 	uint64_t done; //!< bytes downloaded / hashed so far
@@ -805,6 +906,7 @@ conv_store_blob_result_str(enum conv_store_blob_result r)
 	case CONV_STORE_BLOB_POLICY: return "policy";
 	case CONV_STORE_BLOB_IO: return "io";
 	case CONV_STORE_BLOB_CANCELLED: return "cancelled";
+	case CONV_STORE_BLOB_AUTH: return "auth";
 	default: return "unknown";
 	}
 }
@@ -1131,23 +1233,8 @@ fetch_file(struct conv_model_store *s, const char *url, struct sink *k, struct x
 
 #ifdef XRT_OS_WINDOWS
 static enum conv_store_blob_result
-fetch_http(struct conv_model_store *s, const char *url, struct sink *k, struct xfer *x)
+fetch_http(struct conv_model_store *s, const char *url, const char *bearer, struct sink *k, struct xfer *x)
 {
-	wchar_t wurl[2048];
-	if (!widen(url, wurl, 2048)) {
-		return CONV_STORE_BLOB_NETWORK;
-	}
-	URL_COMPONENTS uc;
-	memset(&uc, 0, sizeof(uc));
-	uc.dwStructSize = sizeof(uc);
-	wchar_t host[256], path[2048];
-	uc.lpszHostName = host;
-	uc.dwHostNameLength = 256;
-	uc.lpszUrlPath = path;
-	uc.dwUrlPathLength = 2048;
-	if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
-		return CONV_STORE_BLOB_NETWORK;
-	}
 	enum conv_store_blob_result r = CONV_STORE_BLOB_NETWORK;
 	HINTERNET ses = WinHttpOpen(L"DisplayXR-ModelStore/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
 	                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -1160,21 +1247,99 @@ fetch_http(struct conv_model_store *s, const char *url, struct sink *k, struct x
 		goto out;
 	}
 	(void)WinHttpSetTimeouts(ses, 15000, 15000, 30000, 30000);
-	con = WinHttpConnect(ses, host, uc.nPort, 0);
-	if (con == NULL) {
+
+	// ADR-057 §5: with a credential, redirects are followed HERE, not by
+	// WinHTTP, so the token goes only to the host the pack named (a gated
+	// repository 302s to a CDN that must never see it). Without one, WinHTTP
+	// follows them itself, as before.
+	wchar_t cur[2048];
+	if (!widen(url, cur, 2048)) {
 		goto out;
 	}
-	// Redirects (release assets 302 to a CDN) are followed by default.
-	req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-	                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-	if (req == NULL || !WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-	    !WinHttpReceiveResponse(req, NULL)) {
+	wchar_t origin_host[256] = {0};
+	DWORD status = 0;
+	for (int hop = 0; hop < 6; hop++) {
+		URL_COMPONENTS uc;
+		memset(&uc, 0, sizeof(uc));
+		uc.dwStructSize = sizeof(uc);
+		wchar_t host[256], path[2048];
+		uc.lpszHostName = host;
+		uc.dwHostNameLength = 256;
+		uc.lpszUrlPath = path;
+		uc.dwUrlPathLength = 2048;
+		if (!WinHttpCrackUrl(cur, 0, 0, &uc)) {
+			goto out;
+		}
+		if (hop == 0) {
+			(void)wcsncpy(origin_host, host, 255);
+		}
+		const bool send_token =
+		    bearer != NULL && uc.nScheme == INTERNET_SCHEME_HTTPS && _wcsicmp(host, origin_host) == 0;
+		if (req != NULL) {
+			WinHttpCloseHandle(req);
+			req = NULL;
+		}
+		if (con != NULL) {
+			WinHttpCloseHandle(con);
+			con = NULL;
+		}
+		con = WinHttpConnect(ses, host, uc.nPort, 0);
+		if (con == NULL) {
+			goto out;
+		}
+		req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+		                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+		if (req == NULL) {
+			goto out;
+		}
+		wchar_t hdr[U_CREDENTIAL_SECRET_MAX + 32];
+		hdr[0] = L'\0';
+		if (bearer != NULL) {
+			DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+			(void)WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof(never));
+		}
+		if (send_token) {
+			wchar_t wtok[U_CREDENTIAL_SECRET_MAX + 1];
+			if (!widen(bearer, wtok, U_CREDENTIAL_SECRET_MAX + 1)) {
+				goto out;
+			}
+			(void)_snwprintf(hdr, sizeof(hdr) / sizeof(hdr[0]) - 1, L"Authorization: Bearer %ls", wtok);
+			hdr[sizeof(hdr) / sizeof(hdr[0]) - 1] = L'\0';
+			SecureZeroMemory(wtok, sizeof(wtok));
+		}
+		const BOOL sent =
+		    WinHttpSendRequest(req, hdr[0] != L'\0' ? hdr : WINHTTP_NO_ADDITIONAL_HEADERS,
+		                       hdr[0] != L'\0' ? (DWORD)-1L : 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+		SecureZeroMemory(hdr, sizeof(hdr));
+		if (!sent || !WinHttpReceiveResponse(req, NULL)) {
+			goto out;
+		}
+		DWORD sz = sizeof(status);
+		if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+		                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+			goto out;
+		}
+		const bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+		if (!redirect || bearer == NULL) {
+			break;
+		}
+		DWORD lsz = sizeof(cur);
+		if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, cur, &lsz,
+		                         WINHTTP_NO_HEADER_INDEX)) {
+			goto out;
+		}
+		if (wcsstr(cur, L"://") == NULL) {
+			U_LOG_W("[conv-store] %s: a relative redirect is not followed with a credential", url);
+			goto out;
+		}
+	}
+	if (status == 401 || status == 403) {
+		U_LOG_W("[conv-store] %s: HTTP %lu (the credential was refused or is missing)", url,
+		        (unsigned long)status);
+		r = bearer != NULL ? CONV_STORE_BLOB_AUTH : CONV_STORE_BLOB_NETWORK;
 		goto out;
 	}
-	DWORD status = 0, sz = sizeof(status);
-	if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-	                         &status, &sz, WINHTTP_NO_HEADER_INDEX) ||
-	    status != 200) {
+	if (status != 200) {
 		U_LOG_W("[conv-store] %s: HTTP %lu", url, (unsigned long)status);
 		goto out;
 	}
@@ -1217,18 +1382,40 @@ out:
 #endif
 
 static enum conv_store_blob_result
-fetch_url(struct conv_model_store *s, const char *url, struct sink *k, struct xfer *x)
+fetch_url(
+    struct conv_model_store *s, const char *url, const struct conv_pack_auth *auth, struct sink *k, struct xfer *x)
 {
 	if (strncmp(url, "file://", 7) == 0) {
-		return fetch_file(s, url, k, x);
+		return fetch_file(s, url, k, x); // a local file needs no credential
 	}
+	// ADR-057 §5: a gated source's token, read from the OS credential store now
+	// and wiped after the fetch. Never sent over plain http.
+	char token[U_CREDENTIAL_SECRET_MAX + 1];
+	token[0] = '\0';
+	if (auth != NULL && auth->kind != CONV_PACK_AUTH_NONE) {
+		if (strncmp(url, "https://", 8) != 0) {
+			U_LOG_W("[conv-store] refusing to send credential '%s' to a non-https URL", auth->credential);
+			return CONV_STORE_BLOB_AUTH;
+		}
+		char err[256];
+		const enum u_credential_result cr =
+		    u_credential_read(auth->credential, token, sizeof(token), err, sizeof(err));
+		if (cr != U_CREDENTIAL_OK) {
+			U_LOG_W("[conv-store] model credential: %s", err);
+			return CONV_STORE_BLOB_AUTH;
+		}
+	}
+	enum conv_store_blob_result r = CONV_STORE_BLOB_NETWORK;
 #ifdef XRT_OS_WINDOWS
 	if (strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0) {
-		return fetch_http(s, url, k, x);
-	}
+		r = fetch_http(s, url, token[0] != '\0' ? token : NULL, k, x);
+	} else
 #endif
-	U_LOG_W("[conv-store] no downloader for %s on this platform", url);
-	return CONV_STORE_BLOB_NETWORK;
+	{
+		U_LOG_W("[conv-store] no downloader for %s on this platform", url);
+	}
+	u_credential_wipe(token, sizeof(token));
+	return r;
 }
 
 
@@ -1268,7 +1455,8 @@ conv_pack_load_url(const char *url_or_path, struct conv_pack *out, char *err, si
 	k.mem = malloc((size_t)max + 1);
 	u_sha256_init(&k.h);
 	struct xfer x = {s, NULL, "manifest", max, 0, 0};
-	const enum conv_store_blob_result r = k.mem != NULL ? fetch_url(s, url_or_path, &k, &x) : CONV_STORE_BLOB_IO;
+	const enum conv_store_blob_result r =
+	    k.mem != NULL ? fetch_url(s, url_or_path, NULL, &k, &x) : CONV_STORE_BLOB_IO;
 	conv_model_store_destroy(&s);
 	if (r != CONV_STORE_BLOB_OK) {
 		free(k.mem);
@@ -1370,6 +1558,7 @@ blob_protocol(struct conv_model_store *s,
               const char *sha,
               uint64_t size,
               const char *url,
+              const struct conv_pack_auth *auth,
               bool skip_stamped,
               bool allow_downloads,
               struct blob *b)
@@ -1437,7 +1626,7 @@ blob_protocol(struct conv_model_store *s,
 	u_sha256_init(&k.h);
 	struct xfer x = {s, b, sha, size, 0, 0};
 	xfer_progress(&x, 0, false);
-	enum conv_store_blob_result r = fetch_url(s, url, &k, &x);
+	enum conv_store_blob_result r = fetch_url(s, url, auth, &k, &x);
 	const bool closed = fclose(k.f) == 0;
 	if (r == CONV_STORE_BLOB_OK && !closed) {
 		r = CONV_STORE_BLOB_IO;
@@ -1484,6 +1673,9 @@ fail_of(enum conv_store_blob_result r)
 {
 	switch (r) {
 	case CONV_STORE_BLOB_NETWORK: return XRT_CONV_FAIL_NETWORK;
+	// A missing / refused credential is fixed by the user adding it; a new
+	// request retries, like a network failure (ADR-057 §5).
+	case CONV_STORE_BLOB_AUTH: return XRT_CONV_FAIL_NETWORK;
 	case CONV_STORE_BLOB_IO: return XRT_CONV_FAIL_LOAD;
 	default: return XRT_CONV_FAIL_MODEL;
 	}
@@ -1539,6 +1731,7 @@ worker_main(void *ptr)
 		char sha[CONV_STORE_SHA_HEX], url[CONV_STORE_PATH_MAX];
 		cpy(sha, sizeof(sha), job->sha);
 		cpy(url, sizeof(url), job->url);
+		const struct conv_pack_auth auth = job->auth;
 		const uint64_t size = job->size;
 		const bool allow = s->cfg.allow_downloads;
 		const uint32_t mask = job->pack_mask;
@@ -1546,9 +1739,10 @@ worker_main(void *ptr)
 		s->busy++;
 		os_mutex_unlock(&s->mtx);
 
-		enum conv_store_blob_result r = blob_protocol(s, sha, size, url, false, allow, job);
+		const struct conv_pack_auth *ap = auth.kind != CONV_PACK_AUTH_NONE ? &auth : NULL;
+		enum conv_store_blob_result r = blob_protocol(s, sha, size, url, ap, false, allow, job);
 		if (r == CONV_STORE_BLOB_TAMPERED && allow) {
-			r = blob_protocol(s, sha, size, url, false, allow, job); // re-fetch once
+			r = blob_protocol(s, sha, size, url, ap, false, allow, job); // re-fetch once
 		}
 		if (r == CONV_STORE_BLOB_OK) {
 			for (uint32_t p = 0; p < s->pack_count; p++) {
@@ -1697,7 +1891,11 @@ conv_model_store_add_pack(struct conv_model_store *s, const struct conv_pack *p)
 				}
 				b->pack_mask |= 1u << idx;
 				if (b->url[0] == '\0') {
-					conv_pack_blob_url(p, &pv->files[f], b->url, sizeof(b->url));
+					conv_pack_file_url(p, &p->models[m], &pv->files[f], b->url, sizeof(b->url));
+					const struct conv_pack_auth *a = file_auth(&p->models[m], &pv->files[f]);
+					if (a != NULL) {
+						b->auth = *a;
+					}
 				}
 			}
 		}
@@ -2089,11 +2287,13 @@ conv_model_store_fetch_model(struct conv_model_store *s,
 		}
 		for (uint32_t f = 0; f < pv->file_count; f++) {
 			char url[CONV_STORE_PATH_MAX];
-			conv_pack_blob_url(p, &pv->files[f], url, sizeof(url));
-			enum conv_store_blob_result r =
-			    blob_protocol(s, pv->files[f].sha256, pv->files[f].size, url, skip_stamped, allow, NULL);
+			conv_pack_file_url(p, m, &pv->files[f], url, sizeof(url));
+			const struct conv_pack_auth *auth = file_auth(m, &pv->files[f]);
+			enum conv_store_blob_result r = blob_protocol(s, pv->files[f].sha256, pv->files[f].size, url,
+			                                              auth, skip_stamped, allow, NULL);
 			if (r == CONV_STORE_BLOB_TAMPERED && allow) {
-				r = blob_protocol(s, pv->files[f].sha256, pv->files[f].size, url, skip_stamped, allow, NULL);
+				r = blob_protocol(s, pv->files[f].sha256, pv->files[f].size, url, auth, skip_stamped,
+				                  allow, NULL);
 			}
 			all_skipped = all_skipped && r == CONV_STORE_BLOB_SKIPPED;
 			if (r != CONV_STORE_BLOB_OK && r != CONV_STORE_BLOB_SKIPPED && worst == CONV_STORE_BLOB_OK) {

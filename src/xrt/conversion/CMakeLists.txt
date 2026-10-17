@@ -75,7 +75,9 @@ endif()
 # the store ACL) and the host-op glue both hosts put behind model_resolve /
 # model_request. Its own target: the CLI and both hosts link it, the pure
 # core does not.
-add_library(conv_store STATIC conv_model_store.c conv_model_store.h)
+add_library(conv_store STATIC conv_model_store.c conv_model_store.h
+	# ADR-057 S1: facts JSON + the convenience camera-block writer (CLI, tests).
+	conv_camera_block.c conv_camera_block.h)
 add_library(displayxr::conversion_store ALIAS conv_store)
 target_link_libraries(conv_store PUBLIC conv_core aux_util aux_os xrt-external-cjson)
 if(WIN32)

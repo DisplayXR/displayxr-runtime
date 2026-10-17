@@ -89,6 +89,8 @@ endif()
 # Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
+	sim_display/sim_display_eyes.c
+	sim_display/sim_display_eyes.h
 	sim_display/sim_display_interface.h
 	sim_display/sim_display_settings.c
 	sim_display/sim_display_settings.h
@@ -671,6 +673,94 @@ if(XRT_HAVE_LINUX)
 endif()
 endif() # XRT_FEATURE_OPENXR
 endif() # NOT ANDROID — DisplayXR-SimConversion block
+
+####
+# DisplayXR-RemoteConversion conversion-provider plug-in (ADR-057 S2): the
+# generic remote provider. SPLATS_MONO / SPLATS_STEREO on the job lane,
+# forwarded to HTTPS endpoints implementing endpoint contract v1. No new
+# build or package dependency: WinHTTP on Windows; libcurl loaded at run time
+# on macOS / desktop Linux (absent = the provider reports ABSENT). Off by
+# default (setting ENABLE) and consent-gated; opt-in registration, like
+# net-input: no installer registers it. remote_conversion_static: the same
+# sources without XRT_USING_RUNTIME_DLL, for tests/tests_remote_conversion.cpp.
+if(NOT ANDROID)
+set(REMOTE_CONVERSION_SOURCES
+	remote_conversion/remote_conv_plugin.c
+	remote_conversion/remote_conv_http.c
+	remote_conversion/remote_conv_http.h
+	)
+add_library(remote_conversion_static OBJECT ${REMOTE_CONVERSION_SOURCES})
+target_link_libraries(remote_conversion_static PUBLIC xrt-interfaces aux_util aux_os xrt-external-cjson xrt-external-stb)
+target_include_directories(remote_conversion_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/remote_conversion)
+if(WIN32)
+	target_link_libraries(remote_conversion_static PUBLIC winhttp)
+elseif(NOT APPLE)
+	target_link_libraries(remote_conversion_static PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
+if(XRT_FEATURE_OPENXR)
+add_library(drv_remote_conversion_plugin SHARED ${REMOTE_CONVERSION_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_remote_conversion_plugin PRIVATE xrt-interfaces aux_util aux_os xrt-external-cjson
+		xrt-external-stb ${CMAKE_DL_LIBS})
+else()
+	target_compile_definitions(drv_remote_conversion_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_remote_conversion_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			xrt-external-cjson
+			xrt-external-stb
+		)
+	add_dependencies(drv_remote_conversion_plugin ${RUNTIME_TARGET})
+endif()
+if(WIN32)
+	target_link_libraries(drv_remote_conversion_plugin PRIVATE winhttp)
+endif()
+target_include_directories(drv_remote_conversion_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/remote_conversion)
+set_target_properties(drv_remote_conversion_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-RemoteConversion"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+if(APPLE)
+	target_link_options(drv_remote_conversion_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtConversionPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_remote_conversion_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/conversion_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_remote_conversion_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_remote_conversion_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+if(XRT_HAVE_LINUX)
+	add_custom_command(
+		TARGET drv_remote_conversion_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_remote_conversion_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_remote_conversion_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR
+endif() # NOT ANDROID — DisplayXR-RemoteConversion block
 
 ####
 # DisplayXR-NetInput input-provider plug-in DLL (ADR-034 / #823 Phase 2).

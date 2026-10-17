@@ -13,9 +13,14 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
-| Components | the status feed (clients by class); `info --json`; `workspace list --json`; `dp\|input\|conv list --json` (ADR-054 N3e) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise the command is shown for an administrator) |
+| Components | the status feed (clients by class); `info --json`; `workspace list --json`; `dp\|input\|conv list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, `policy.policy_lock`) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
+
+Every CLI run is an argument vector (`Model/CliArgs`, passed through
+`ProcessStartInfo.ArgumentList`): an id or value is always exactly one argument, whatever
+a manifest put in it; the log pane shows the readable form. A write's result line is
+followed by every `note:` / `warning:` line the CLI printed.
 
 **Components** groups what is plugged into the runtime by ROLE, never by product:
 display processors, the workspace controller (its launch hotkey / mode / "Launch now",

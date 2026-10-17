@@ -585,7 +585,8 @@ struct conv_host_wire_lane_open
 /*!
  * JOB_SUBMIT (S -> H): job_execute on registered input images. The reply,
  * JOB_SUBMIT | REPLY_BIT, is a conv_host_wire_job_done sent when the job
- * finishes. sizeof == 280.
+ * finishes. sizeof == 288 (280 before ADR-057 appended the job inputs; an
+ * older service's request reads them as 0 = undeclared).
  */
 struct conv_host_wire_job_submit
 {
@@ -599,6 +600,44 @@ struct conv_host_wire_job_submit
 	uint32_t image_idx[XRT_CONV_MAX_FRAME_IMAGES];
 	uint32_t image_role[XRT_CONV_MAX_FRAME_IMAGES];
 	struct xrt_conv_wire_params params;
+	/* ADR-057 §4 (xrt_conv_job_in tail). */
+	uint32_t job_flags;           //!< XRT_CONV_JOB_*
+	uint32_t max_input_long_side; //!< px; 0 = the provider's own
+};
+
+/*!
+ * Twin of xrt_conv_splat_result (ADR-057), byte for byte: that struct is
+ * flat and padding-free by design, so the twin is packed with one copy and
+ * asserted field by field below. sizeof == 568.
+ */
+struct conv_host_wire_splat_result
+{
+	uint32_t struct_size;
+	uint32_t valid;
+	char build_provider[XRT_CONV_STAMP_MAX];
+	char build_model_id[XRT_CONV_STAMP_MAX];
+	char build_model_sha256[72];
+	char build_runtime[32];
+	char build_runtime_version[32];
+	char build_host_id[XRT_CONV_STAMP_MAX];
+	uint32_t host_kind;
+	uint32_t reserved_0;
+	uint32_t refusal_code;
+	uint32_t reserved_1;
+	char refusal_reason[XRT_CONV_DETAIL_MAX];
+	float metric_scale;
+	uint32_t metric_source;
+	float metric_inlier_fraction;
+	float metric_mad_log;
+	float principal_point_shift_px;
+	uint32_t layer_count;
+	uint32_t layer_flags[XRT_CONV_MAX_SPLAT_LAYERS];
+	float focus_point[3];
+	float focus_subject_m;
+	float focus_near_m;
+	float focus_far_m;
+	uint32_t focus_source;
+	uint32_t reserved_2;
 };
 
 //! JOB_CANCEL. sizeof == 16.
@@ -655,7 +694,9 @@ struct conv_host_wire_job_progress
 /*!
  * JOB_SUBMIT reply. Handles: [0] a host-created shm holding the blob
  * (blob_bytes long) when blob_bytes > 0; a HOST value on Windows (pulled).
- * sizeof == 368.
+ * sizeof == 936 (368 before ADR-057 appended splat_result, which is sent
+ * for a FAILED job too: its refusal says why). splat_result.struct_size == 0
+ * means "none" (an older host, or not a splat job).
  */
 struct conv_host_wire_job_done
 {
@@ -671,6 +712,7 @@ struct conv_host_wire_job_done
 	struct xrt_conv_wire_depth_info depth_info;
 	struct xrt_conv_wire_views_info views_info;
 	uint32_t reserved_1;
+	struct conv_host_wire_splat_result splat_result; //!< ADR-057
 };
 
 //! SHUTDOWN. Orderly: cancel, drain, destroy the provider, reply, exit 0 within 3 s. sizeof == 16.
@@ -991,6 +1033,72 @@ conv_host_wire_pack_output_desc(const struct xrt_conv_output_desc *in, struct co
 	out->disparity_format = in->disparity_format;
 }
 
+/*!
+ * A provider wrote @p r (third-party code, in a satellite or in the service):
+ * NUL-terminate every string within r->struct_size (a string the extent cuts
+ * ends at the extent) and clamp layer_count. Called on every receive.
+ */
+static inline void
+conv_splat_result_sanitize(struct xrt_conv_splat_result *r)
+{
+	if (r == NULL || r->struct_size <= sizeof(uint32_t)) {
+		return;
+	}
+	const size_t cap = r->struct_size < sizeof(*r) ? r->struct_size : sizeof(*r);
+#define CONV_SPLAT_TERMINATE(F)                                                                                        \
+	do {                                                                                                           \
+		const size_t at_ = offsetof(struct xrt_conv_splat_result, F);                                          \
+		if (cap >= at_ + sizeof(r->F)) {                                                                       \
+			r->F[sizeof(r->F) - 1] = '\0';                                                                 \
+		} else if (cap > at_) {                                                                                \
+			((char *)r)[cap - 1] = '\0';                                                                   \
+		}                                                                                                      \
+	} while (0)
+	CONV_SPLAT_TERMINATE(build_provider);
+	CONV_SPLAT_TERMINATE(build_model_id);
+	CONV_SPLAT_TERMINATE(build_model_sha256);
+	CONV_SPLAT_TERMINATE(build_runtime);
+	CONV_SPLAT_TERMINATE(build_runtime_version);
+	CONV_SPLAT_TERMINATE(build_host_id);
+	CONV_SPLAT_TERMINATE(refusal_reason);
+#undef CONV_SPLAT_TERMINATE
+	if (cap >= offsetof(struct xrt_conv_splat_result, layer_count) + sizeof(r->layer_count) &&
+	    r->layer_count > XRT_CONV_MAX_SPLAT_LAYERS) {
+		r->layer_count = XRT_CONV_MAX_SPLAT_LAYERS;
+	}
+}
+
+/*! xrt_conv_splat_result -> its twin (one copy: same layout, asserted below).
+ *  A NULL / zero-sized source packs "none" (struct_size 0). */
+static inline void
+conv_host_wire_pack_splat_result(const struct xrt_conv_splat_result *in, struct conv_host_wire_splat_result *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (in == NULL || in->struct_size == 0) {
+		return;
+	}
+	const size_t n = in->struct_size < sizeof(*out) ? in->struct_size : sizeof(*out);
+	memcpy(out, in, n);
+	out->struct_size = (uint32_t)n;
+}
+
+/*! The twin -> @p out, within out->struct_size (the receiver's, set by the
+ *  runtime). Returns false when the peer sent none. */
+static inline bool
+conv_host_wire_unpack_splat_result(const struct conv_host_wire_splat_result *in, struct xrt_conv_splat_result *out)
+{
+	if (in == NULL || out == NULL || in->struct_size == 0 || out->struct_size == 0) {
+		return false;
+	}
+	const uint32_t cap = out->struct_size;
+	size_t n = in->struct_size < sizeof(*in) ? in->struct_size : sizeof(*in);
+	n = n < cap ? n : cap;
+	memcpy(out, in, n);
+	out->struct_size = cap; // the receiver's own extent; bytes past n stay as zero-filled
+	conv_splat_result_sanitize(out);
+	return true;
+}
+
 //! Reply fields -> xrt_conv_output_desc (zeroed, struct_size = its sizeof).
 static inline void
 conv_host_wire_unpack_output_desc(const struct conv_host_wire_output_desc_reply *in, struct xrt_conv_output_desc *out)
@@ -1060,6 +1168,35 @@ CONV_HOST_WIRE_TWIN(conv_host_wire_capability, xrt_conv_capability, est_latency_
 CONV_HOST_WIRE_TWIN(conv_host_wire_capability, xrt_conv_capability, est_vram_mb);
 CONV_HOST_WIRE_TWIN(conv_host_wire_capability, xrt_conv_capability, est_ram_mb);
 
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_splat_result) == sizeof(struct xrt_conv_splat_result), "splat result twin size");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_splat_result) == 568, "conv_host_wire_splat_result: append-only");
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, struct_size);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, valid);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_provider);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_model_id);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_model_sha256);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_runtime);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_runtime_version);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, build_host_id);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, host_kind);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, reserved_0);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, refusal_code);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, reserved_1);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, refusal_reason);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, metric_scale);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, metric_source);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, metric_inlier_fraction);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, metric_mad_log);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, principal_point_shift_px);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, layer_count);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, layer_flags);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, focus_point);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, focus_subject_m);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, focus_near_m);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, focus_far_m);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, focus_source);
+CONV_HOST_WIRE_TWIN(conv_host_wire_splat_result, xrt_conv_splat_result, reserved_2);
+
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_state) == sizeof(struct xrt_conv_state), "state twin size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_state) == 208, "conv_host_wire_state is FROZEN");
 CONV_HOST_WIRE_TWIN(conv_host_wire_state, xrt_conv_state, struct_size);
@@ -1097,7 +1234,7 @@ XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_alloc_outputs) == 32, "alloc ou
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_output_image) == 120, "output image size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_output_image, image) == 24, "output image: image at 24");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_lane_open) == 56, "lane open size");
-XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_submit) == 280, "job submit size");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_submit) == 288, "job submit size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_submit, params) == 64, "job submit: params at 64");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_ref) == 16, "job ref size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_release) == 16, "job release size");
@@ -1105,7 +1242,8 @@ XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_release, job_id) == 8, "j
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_provider_status) == 152, "provider status size");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_provider_status, hint) == 24, "provider status layout");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_progress) == 56, "job progress size");
-XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) == 368, "job done size");
+XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_job_done) == 936, "job done size");
+XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_done, splat_result) == 368, "job done: splat_result appended at 368");
 XRT_CONV_ABI_ASSERT(offsetof(struct conv_host_wire_job_done, depth_info) == 112, "job done: depth_info at 112");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_shutdown) == 16, "shutdown size");
 XRT_CONV_ABI_ASSERT(sizeof(struct conv_host_wire_log) == 496, "log size");

@@ -1,6 +1,6 @@
 # Conversion-Provider Discovery Contract
 
-> **Status: Implemented — ADR-053 (Accepted). The P1a conversion core landed in #1994 / #2015 and ships from v2.42.0 (core, loader, `dp-lift`, the sim provider); P1b and P2 (the satellite host) are implemented; §3.8 is the installer contract from P3.** Open follow-ups: live re-select of `Enabled` / `PreferredProvider` in a running core (#2051) and the shared options contract (#2050) under the N3 epic #2047.
+> **Status: Implemented — ADR-053 (Accepted). The P1a conversion core landed in #1994 / #2015 and ships from v2.42.0 (core, loader, `dp-lift`, the sim provider); P1b and P2 (the satellite host) are implemented; §3.8 is the installer contract from P3.** Open follow-ups: live re-select of `Enabled` / `PreferredProvider` in a running core (#2051) and the shared options contract (#2050) under the N3 epic #2047. **ADR-057 S1 + S2** ([ADR-057](../../adr/ADR-057-image-to-splat-providers.md), image → splat providers) add the splat result's facts (§2.6), the per-model pack `url` + `auth` (§5.5), and the generic remote provider `DisplayXR-RemoteConversion` (§6.3).
 > Header: [`src/xrt/include/xrt/xrt_conversion_plugin.h`](../../../src/xrt/include/xrt/xrt_conversion_plugin.h) (design record, kept for history: [`conversion-providers-headers-draft.md`](../../roadmap/conversion-providers-headers-draft.md) §1). Writing a provider: [`vendor-plugin-onboarding.md` §9](../../guides/vendor-plugin-onboarding.md#9-conversion-providers--the-third-plug-in-type) and the `displayxr-conversion-template` starter kit.
 
 **Audience:** integrators shipping a conversion-provider plug-in (a DLL / dylib / so that turns 2D images into depth, views or Gaussian splats for the runtime), and runtime engineers maintaining the conversion core, its loader and its host.
@@ -65,7 +65,7 @@ Inside the runtime — headers, loader, registry, CLI, ADR — the word is **con
 | Cursor relief | runtime (ADR-046 A1); the provider reports the generic `relief_*` field |
 | OpenXR types | the state tracker. The header is self-contained: `xrt_results.h` + `<stdint.h>` / `<stddef.h>` / `<stdbool.h>` |
 | Windows (top-level or hidden on a non-pumping thread) | nobody (§2.4) |
-| Network on the convert path | the host fetches model bytes; network only inside `warm` (§2.4) |
+| Network on the convert path | the host fetches model bytes; network only inside `warm` (§2.4). The one exception is a capability flagged `XRT_CONV_CAP_REMOTE`, whose `job_execute` IS a network call (§6.3), consent-gated |
 
 ---
 
@@ -142,7 +142,7 @@ Each rule must hold in both hostings.
 | Files | Holds files open only while needed. Writes only to `XRT_CONV_PATH_SCRATCH`, atomically (temp + rename). MUST NOT write the model store; the host does. |
 | Lifetime | MAY be killed at any instant without `destroy`, or live for weeks. No per-frame leaks. |
 | Elevation | Medium integrity, interactive user session. Licence activation MUST work non-elevated. |
-| Network | Only inside `warm`, only on caps flagged `NEEDS_NETWORK_TO_WARM`. **Never** in `stream_convert` / `job_execute`. Model bytes come through `model_request`. |
+| Network | Only inside `warm`, only on caps flagged `NEEDS_NETWORK_TO_WARM`. **Never** in `stream_convert` / `job_execute`, except on a capability flagged **`XRT_CONV_CAP_REMOTE`** (ADR-057): its `job_execute` sends the job to a remote endpoint, and it is DISABLED until the user grants that provider off-box consent (§6.3). Model bytes come through `model_request`. |
 | Configuration | Only through `host->get_setting`, never the provider's own `getenv` (in a satellite the environment is the host's). The host resolves a key from `Settings\<KEY>` (§3.1), overridable by `DXR_CONV_<ID>_<KEY>` in the service's environment (§3.2). |
 | Logging | ADR-019 aux surface (`u_log*`), exported by both hosts. |
 | GPU loss | Return the DEVICE_LOST class. The runtime marks the cap `FAILED(DEVICE_LOST, retryable)` and re-warms on CTRL. No silent retry inside a convert. |
@@ -159,6 +159,35 @@ Each rule must hold in both hostings.
 - **Stream limits** are the selected provider's `max_streams` per task; spec-3 `maxStreams` reports `VIEWS_MONO`'s.
 - **A process-wide model choice** is one capability whose variant follows `qualityHint`, not a set of capabilities that exclude each other.
 - **`XRT_CONV_INPUT_ENCODED`** is reserved.
+
+### 2.6 Splat jobs: facts, suggestions, intent (ADR-057 S1)
+
+A splat result carries three kinds of information with three owners (ADR-057 §3). **Facts** — what the provider measured: the intrinsics of the grid it unprojected through, the coordinate convention, `metric` + `baseline_m` + the fit statistics or a refusal, near / far, splat and layer counts, the build stamp — are the provider's, never invented, absent = unknown. **Suggestions** — a focus point, a subject distance — are the provider's too, labelled with their source, and an author may discard them. **Intent** — the rig, the rest pose, the chosen focus (= pivot = convergence), the `dxr.*` factors — is the author's. **The runtime never writes or rewrites a content file's camera block**: it returns the blob and the facts as typed fields; the app or SDK that saves the content writes the block. Display-time behaviour (convergence and depth budget on *this* panel) stays runtime policy and reads the author's intent; it never changes the file.
+
+**`struct xrt_conv_splat_result`** (`xrt_conversion_plugin.h`, `XRT_CONVERSION_PLUGIN_HAS_SPLAT_RESULT`). A new **top-level** struct (`struct_size`, append-only, flat, no hidden padding, 568 bytes) reached through **`xrt_conv_job_out::splat_result`**, a pointer appended at the job result's tail. Why a chained struct and not more fields: `xrt_conv_splat_info` is embedded by value in `xrt_conv_job_out` and is therefore **frozen** (§2.2); growth goes into a new top-level struct, and a pointer at the tail of the top-level out-struct is the one place an older provider never writes (its `struct_size` check stops before it). The runtime zero-fills it, sets its `struct_size` and points to it for every `SPLATS_*` job (NULL otherwise); a provider writes through it only when `XRT_CONV_COVERS(out, struct xrt_conv_job_out, splat_result)` and it is non-NULL, and only within its `struct_size`.
+
+| Group (`valid` bit) | Fields |
+|---|---|
+| build stamp (`BUILD`) | `build_provider`, `build_model_id`, `build_model_sha256`, `build_runtime`, `build_runtime_version`, `build_host_id`, `host_kind` (`LOCAL` / `REMOTE`). Returned with **every** result: a changed stamp is the "superseded by build X" signal; consumers key caches on input hash + parameters + stamp, because providers promise identical geometry, not identical bytes |
+| refusal (always) | `refusal_code` (`NONE`, `METRIC_FIT_REFUSED`, `BASELINE_MISSING`, `INPUT_TOO_LARGE`, `UNRECTIFIED_PAIR`, `UNSUPPORTED_INPUT`, `REMOTE_ERROR`; append-only) + `refusal_reason` |
+| metric fit (`METRIC_FIT`) | `metric_scale`, `metric_source` (`STEREO`, `MODEL`, `OTHER`), `metric_inlier_fraction`, `metric_mad_log`, `principal_point_shift_px` (deconvergence as a `cx` offset) |
+| layers (`LAYERS`) | `layer_count` (≤ 8) + per layer `VISIBLE` / `INPAINTED` |
+| focus suggestion (`FOCUS`) | `focus_point[3]` (the splat's own coordinates), `focus_subject_m`, `focus_near_m`, `focus_far_m`, `focus_source` (`NEAREST_CLUMP`, `CONVERGENCE`, `OTHER`) |
+
+**Refusals.** A refused **metric fit** still returns the non-metric splat: the job SUCCEEDS with `splat_info.metric = 0` and `refusal_code = METRIC_FIT_REFUSED`. Every other code fails the job with no blob; the core reports it as **`XRT_CONV_FAIL_INPUT`** (11, new; `REMOTE_ERROR` maps to `NETWORK`), never as a load failure, and the capability stays READY (it was the input's fault). The facts of a FAILED job stay readable (`conv_core_job_splat_result`).
+
+**Job inputs** (appended to `xrt_conv_job_in`, read only when its `struct_size` covers them):
+
+| Field | Meaning |
+|---|---|
+| `job_flags` `XRT_CONV_JOB_PAIR_RECTIFIED` / `XRT_CONV_JOB_PAIR_RAW` | a pair is **declared** rectified or raw. Neither = undeclared, and a provider that needs to know refuses with `UNRECTIFIED_PAIR`; it never guesses. Both at once is refused at submit |
+| `job_flags` `XRT_CONV_JOB_FOCAL_GIVEN` | `params.focal_px` was given by the caller: it wins over EXIF and over any estimate |
+| `max_input_long_side` | px; the knob that bounds splat count (the model's grid follows the input). 0 = the provider's own. Cap the input, never thin the Gaussians |
+| `params.stereo.baseline_m` (existing) | **validated** at submit: finite and 0 ≤ b ≤ `XRT_CONV_MAX_BASELINE_M` (10 m), else `XRT_ERROR_INPUT_UNSUPPORTED`. 0 = unknown: no metric result. Never defaulted |
+
+**Where it travels.** In service: the in-process host passes the pointer through. Satellite: `conv_host_wire_job_submit` carries the two job inputs at its tail (288 bytes, was 280) and `conv_host_wire_job_done` a byte-equal twin of the splat result (936, was 368; sent for a failed job too; `struct_size` 0 = none, which is what an older host sends). The service-side core keeps it per job (`conv_core_job_splat_result`). The app wire `xrt_conv_wire_job_desc` carries the job inputs (640 bytes, was 632). **`XR_DXR_lift` is not bumped in S1:** the app-facing job API (spec 5) does not yet run over IPC, so no app can receive the facts today; carrying them in the extension's job result is a follow-up with that work, not a spec bump now.
+
+**The convenience camera-block writer** (`conversion/conv_camera_block.{h,c}`; `displayxr-cli conv run --camera-block auto`, `conv camera-block`) turns facts + suggestions into a SOG `meta.json` `camera` block, v2 shape: `convention`, `rig` (`"camera"`, the auto writer's default), `rest` (identity), `intrinsics`, `stereo.baseline_m` **only for a metric result**, `metric` (the fit), `focus` (the suggestion, `source: "auto"`), `dxr` (neutral factors) — the whole block marked **`"source": "auto"`**. It never overwrites a block it did not write: an existing `camera` whose `source` is not `"auto"` is the author's and the file is left byte-for-byte untouched (`kept-authored`); an earlier auto block is replaced. A bundled `.sog` is rewritten entry by entry (every other entry keeps its compressed bytes; `meta.json` written stored, inserted after `count`, ≤ 64 KiB); an unbundled `meta.json` or its directory is edited in place, atomically.
 
 ---
 
@@ -247,6 +276,7 @@ The suffix is the router, so all three plug-in types share one directory:
 | DP loader | skips `-conversion-provider.json`, beside its input skip (`target_plugin_loader.c:2511-2517`) |
 | Input loader | already *requires* `-input-provider.json` (`target_input_plugin_loader.c:807-808`); a unit test pins that conversion manifests stay invisible to it |
 | Conversion loader | requires `-conversion-provider.json` |
+| Every loader | skips `<pack>.models.json` — a model pack (§ model store) is not a manifest. Packs ship beside the provider that lists them in `packs[]`, i.e. in this same directory; before this rule the DP loader read each one as a malformed DP manifest (`target_plugin_classify_manifest`, `target_component_loader.c`) |
 
 Preferred provider: `DXR_CONV_PREFERRED_<TASK>` in the environment, or a `conversion-preferred.json` in the per-user dir (the `plugin-discovery.md` §3.3 pattern).
 
@@ -560,7 +590,7 @@ Schema 2 replaces the browser's `models.json` schema 1. The browser's store is d
 - **Trust is the hash, not the stamp.** The host re-hashes a blob on first load per process (cached by file id + mtime + size) before handing it to the inference runtime. The stamp + size check alone is not trusted: the store's inherited ACL lets any local user plant a same-size blob and its stamp.
 - **Signing.** A signed installer MUST NOT pre-fetch a non-commercial blob; the open-provider repo's CI asserts it.
 - **Blob identity.** `sha256` + `size` identify a blob; variants may share blobs.
-- **URL.** `<blobBaseUrl>/<sha256>.<format>`.
+- **URL.** `<blobBaseUrl>/<sha256>.<format>`, unless the model gives its own `url` (§5.5).
 - **Validation.** `scripts/check_model_pack.py` (open-provider repo) checks the schema and the licence AND; `--verify-store` checks a store against its packs.
 
 ### 5.4 The store as built (P4, #2108)
@@ -643,6 +673,44 @@ nonce `installer`, stamped blobs skipped without hashing, non-commercial models 
 `init [--root <dir>]` (create the root with its ACL and marker). `fetch --prefetch` with no URL
 pre-fetches every registered pack's `prefetch` models.
 
+### 5.5 Per-model `url` and `auth` (ADR-057 §5)
+
+Two optional model keys, so a pack can point at an upstream file (a vendor CDN, a Hugging Face
+`resolve` URL) instead of re-hosting it:
+
+```jsonc
+{
+  "name": "sharp", "version": "1.0.0", "task": "splats-mono",
+  "url": "https://<host>/<path>/model.pt",            // overrides <blobBaseUrl>/<sha256>.<format>
+  "auth": { "kind": "huggingface", "credential": "hf-token" },   // or "bearer"
+  "license": { "spdx": "LicenseRef-<owner>", "commercial": false },
+  "variants": [{ "id": "pt", "files": [{ "role": "model", "format": "pt", "sha256": "<64 hex>", "size": 2809738232 }] }]
+}
+```
+
+- **`url`** serves the model's `model`-role file. `sha256` + `size` still identify the bytes, so
+  every variant's `model` file must be the **same** blob; a pack where they differ is refused as
+  ambiguous. Other files (role `data`, …) keep `<blobBaseUrl>/<sha256>.<format>`. Scheme
+  `https://`, `http://` or `file://`.
+- **`auth`** names a credential; it never carries one. `kind` is `bearer` (an auth server, a private
+  release) or `huggingface` (a gated repository); both send `Authorization: Bearer <token>`.
+  `credential` is a name in the **OS credential store** (Windows Credential Manager via `CredReadW`,
+  macOS Keychain via `SecItemCopyMatching`, Linux Secret Service via libsecret loaded at run time —
+  absent = a clear `unsupported` error, never a fallback), read by the host's downloader at fetch
+  time and wiped after (`util/u_credential.h`). **Never** from the registry, a settings file, a
+  manifest or the environment. `displayxr-cli conv credential set <name>` stores one (§7.1).
+- **Only over https, only to the named host.** An `auth` model needs an `https://` url (or an https
+  `blobBaseUrl` when it has no url); the downloader follows redirects itself when it sends a token,
+  and sends it only to the host the pack named — a CDN a gated repository redirects to never sees
+  it. With its own `url`, the auth applies to that file; without one, to every file of the model.
+- A missing, unreadable or refused credential is **`CONV_STORE_BLOB_AUTH`** → `FAILED(NETWORK)`,
+  retryable: adding the credential and requesting again fixes it.
+- **As built:** Windows downloads with WinHTTP (`fetch_http`). POSIX still has no network
+  downloader (P5), so `url` / `auth` are parsed and validated there but an `https` blob stays
+  `FAILED(NETWORK)` until P5 lands.
+- Research-only weights are still never bundled, mirrored or pre-fetched (§5.3); `url` exists so the
+  user's own download can come from the official source.
+
 ---
 
 ## 6. Reference provider and stage
@@ -683,6 +751,68 @@ It writes only within `struct_size`; `tests/tests_conversion_abi.cpp` feeds it e
 
 A runtime **pipeline stage**, never a provider row and never selectable. It turns image + depth into N views so every depth capability yields views (a composed pipeline, §3.4), and it is the A/B baseline; it does not compete with a provider's own `VIEWS_MONO`. Apps see it only through the task's `COMPOSED` output bit. **Acceptance bar:** match or beat the browser's current in-page view synthesis on the lift panel corpus (real media), including temporal stability; its hole-fill is ported from there, not written anew.
 
+### 6.3 `DisplayXR-RemoteConversion` — the generic remote provider (ADR-057 S2)
+
+`src/xrt/drivers/remote_conversion/`, shipped as `DisplayXR-RemoteConversion.{dll,so,dylib}`, id
+`remote-conversion`. **One provider for every remote splat endpoint**: an endpoint is configuration,
+not code. It serves `SPLATS_MONO` (cap 1) and `SPLATS_STEREO` (cap 2) on the job lane, both flagged
+`XRT_CONV_CAP_REMOTE | NEEDS_NETWORK_TO_WARM`, CPU import (RGBA8 / BGRA8; it encodes PNG). Off by
+default exactly like the sims (`probe` declines unless `ENABLE` = 1) and **opt-in to register**: no
+installer writes its row (like `net-input`); a user adds a registry row / POSIX manifest.
+
+**Settings** (the options contract, §3.9; `conv options remote-conversion`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ENABLE` | 0 | `probe` declines unless 1 |
+| `ENDPOINTS` | — | base URLs in **fallback order** (comma / space separated). The authority is **parsed**, not prefix-matched: any userinfo (`@`), backslash, white space or control character is refused; `https://<host>[:<port>]`, or `http://` only when the host is **exactly** `localhost`, `127.0.0.1` or `[::1]` (so `http://localhost:x@evil.example/` and `http://localhost.evil.example/` are refused — a token never crosses a network in clear); anything else reports DISABLED with the reason |
+| `CREDENTIAL` | — | the **name** of the bearer token in the OS credential store (§5.5); never the token. Empty = no `Authorization` header (an open endpoint) |
+| `TIMEOUT_S` | 120 | per request; a timeout falls through to the next host |
+| `MAX_RESPONSE_MB` | 512 | the largest result blob accepted (1–4096); lowered further to a host's own `max_result_bytes` when its describe states one. The buffer never grows past the cap; a larger answer fails that host |
+| `FORMAT` | `sog` | `sog` \| `ply`, when the job names none |
+| `OPTIONS` | — | a JSON object passed through as `params.options` (model-specific switches such as an alignment stage — settings, never contract fields) |
+
+**Consent.** Sending a photo off the box is a **per-provider, per-user, revocable** consent, stored
+beside ADR-043's camera-consumer consent (`util/u_camera_consent.h`: Windows
+`HKCU\Software\DisplayXR\CameraConsent\OffBox\<id>` = 1; POSIX `camera_consent.json` `"offbox"`).
+The provider asks through the new host slot **`xrt_conversion_plugin_host_iface::get_consent(
+XRT_CONV_CONSENT_OFFBOX)`**, carved from `reserved[0]` (a host that predates it leaves it NULL =
+not granted: fail closed); every host — service, satellite, headless CLI — answers it from the store
+for the provider it hosts. Never a setting: an environment variable, a machine policy or an installer
+cannot grant it. Without it both capabilities report **`DISABLED`, "consent required"**; consent is
+re-read for every job, so a revoke stops the next upload. `displayxr-cli conv consent <id>
+grant|revoke|status` writes / reads it (§7.1). The Dashboard row (grant / revoke, shown while active)
+is the N3e drawer's work.
+
+**Endpoint contract v1** (ADR-057 §6), what it calls:
+
+| Call | Provider behaviour |
+|---|---|
+| `GET <base>/v1/describe` | at warm-up, on each endpoint switch, and **once in the background as soon as consent is granted** (no picture is sent; the state stays INSTALLED). The background call exists because selection drops a capability whose licence class is `UNKNOWN` unless `AllowResearchOnly` (§3.4) — a capability that is never selected is never warmed, so without it a commercial endpoint could never be reached through the service. When it answers, the generation moves and the runtime re-describes the capability with the stated class. `contract` must be 1 (else that host is skipped, `FAILED(VERSION)` if none speaks it). Reads tasks, `max_long_side` (→ the capability's `max_input_edge`; the runtime downscales above it), `max_bytes`, `rectified_required`, `formats`, the **licence class as stated** (`commercial` → `COMMERCIAL`, `research_only` → `RESEARCH_ONLY`, else `UNKNOWN`: remote hosting never makes a research-only model commercial, so `AllowResearchOnly` decides) and the **build stamp**, logged once per host (WARN). Hosts of one list reporting **different builds** log one WARN |
+| `POST <base>/v1/jobs` | `multipart/form-data`: `params` (JSON: `task`, `format`, `baseline_m` only when known, `rectified` for pairs, `focal_px` only when given, `max_long_side` when set, `options`) + `image`, or `left` + `right` (an SBS input is split; `eye_order` honoured). 200: the body is the blob, `X-DXR-Result` the facts (→ `splat_info` + `splat_result`; `metric` only with a real baseline) |
+| `422 {code, message}` (and any other 4xx but 401 / 403 / 404 / 408 / 429) | bad input: **never retried**; the job fails with the refusal mapped from `code` (`413` → `INPUT_TOO_LARGE`) |
+| `5xx`, `429`, `408`, `401`, `403`, `404`, timeout, connect error | **fall through** to the next host. All failed: `REMOTE_ERROR`, and the capability goes `FAILED(NETWORK, retryable)` so selection falls through and the runtime re-warms on its backoff |
+| cancel | the client **closes the connection** (`is_cancelled` is polled during the transfer) |
+
+Before any upload the provider refuses, locally: an undeclared pair, a raw pair to a
+`rectified_required` endpoint (`UNRECTIFIED_PAIR`), an input above `max_long_side` or `max_bytes`
+(`INPUT_TOO_LARGE`). A credential that is configured but missing / unreadable is
+`FAILED(LICENCE)`, retryable, with the store's message (nothing is sent without it); an endpoint
+that answers 401 / 403 on describe likewise. Redirects are never followed (the token reaches only
+the configured host).
+
+**HTTP stack, no new dependency.** Windows: WinHTTP (a watcher thread closes the request handle on
+cancel / deadline). macOS and desktop Linux: **libcurl loaded at run time** (`dlopen`; macOS always
+has it). On Linux without `libcurl.so.4` the provider status is `PLATFORM_ABSENT` and both
+capabilities **`ABSENT(PLATFORM)`** with that reason — the plug-in still loads.
+
+Not in v1 (contract 2): signed-URL uploads and webhooks for long jobs.
+
+Tests: `tests/tests_remote_conversion.cpp` against `tests/conv_remote_test_server.py`, a stdlib-only
+contract-v1 endpoint on 127.0.0.1 (success, 422 no-retry, 503 fall-through, every host down,
+metric-fit refusal, missing / refused credential, no consent → DISABLED, research-only as-is,
+cancel), plus pack `url` / `auth`, the camera-block writer, the satellite twin and the consent store.
+
 ---
 
 ## 7. Diagnostics
@@ -693,14 +823,17 @@ Verbs (ADR-053); `lift caps|probe` stay as aliases.
 
 | Verb | Path | What |
 |---|---|---|
-| `conv list [--json]` | DIAG IPC; headless describe as fallback | providers × capabilities, selection order, `selected`, reason per row |
+| `conv list [--json]` | DIAG IPC; headless describe as fallback | providers × capabilities, selection order, `selected`, reason per row. JSON: each provider row adds what the lister resolved — `provenance` / `provenance_reason` / `signer` (N4b), `enabled_source` (`user` = a per-user HKCU `Enabled` is in force, not hidden by `Policy\Lock`; `machine` = disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX manifest; `default` otherwise — the `dp list` / `input list` vocabulary) and `built_in` (the `dp-lift` adapter: no `Enabled` value, no settings, `conv enable\|disable dp-lift` refused); the root `policy` object carries `policy_lock`, `allow_research_only` and the per-task `preferred` |
 | `conv status [--watch]` | DIAG | readiness, streams, jobs |
 | `conv use <task> <id>[/<cap>] [--machine]` / `conv reset <task>\|all` | registry (HKCU; HKLM with `--machine`) | per-task preference, like `dp use --screen` |
 | `conv warm <task>\|<id>/<cap> [--wait]` / `conv evict <task>` | DIAG → service | explicit prewarm / unload; `evict` is accepted only on the CLI's own DIAG connection |
 | `conv enable\|disable <id>` | registry | `Enabled` |
 | `conv options <id> [--json]` / `conv set <id> <KEY> <value> [--machine]` / `conv unset <id> <KEY> [--machine]` | registry (HKCU; HKLM with `--machine`) / the POSIX per-user `<id>.settings.json`; `options` negotiates the binary headless | the one options contract (§3.9, N3c): declared + stored keys with value and source; `Settings\<KEY>` writes |
 | `conv probe <task> <file\|dir>` | APP connection, stream lane | today's `lift probe` |
-| `conv run <task> <in> <out> [--provider]` | APP connection, job lane | file → file; the CLI decodes and encodes files itself (the service never does); MCP `convert_file` backend |
+| `conv run <task> <in> [<in-right>] <out> [--provider <id>]` | **as built (ADR-057): headless, in the CLI** | file → file; the CLI decodes the input (the service never decodes media), hosts the provider headless (negotiate, probe, describe, warm, `job_execute`: the job lane the core drives), downscales to the capability's `max_input_edge`, writes the blob untouched and prints the facts. Options: `--baseline-m`, `--rectified` / `--raw`, `--sbs`, `--focal-px`, `--max-long-side`, `--format sog\|ply`, `--facts <json>`, `--camera-block auto`, `--allow-research-only` (POSIX has no root `AllowResearchOnly` yet; this is the per-run opt-in). Moves to the APP connection once spec-5 jobs run over IPC; for a local provider it loads a second model instance meanwhile, and says so. Splat tasks only in this release |
+| `conv consent <id> grant\|revoke\|status` / `conv consent status` | the per-user consent store | off-box consent for a `REMOTE` provider (§6.3) |
+| `conv camera-block <sog\|meta.json\|dir> --facts <json>` | local | the convenience writer on its own (§2.6): `"source": "auto"`, never over an authored block |
+| `conv credential set\|delete\|status <name>` | the OS credential store | stores a provider's token (`set` reads one line from stdin; `status` never prints it). On macOS an item a DisplayXR binary made is readable by DisplayXR binaries without a prompt; one made with the `security` tool is not (its partition list names Apple's tools), and reads as `denied` — never a prompt, never a hang |
 | `conv jobs` / `conv cancel <id>` | DIAG | |
 | `conv models list\|verify\|prune\|fetch\|init` | local + registry | model store (§5.4) |
 

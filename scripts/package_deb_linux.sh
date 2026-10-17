@@ -422,8 +422,12 @@ STABLE_SONAMES=(
     libXrandr.so.2                  # libxrandr2
     libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
-ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$PLUGIN_SO" "$VKLAYER_SO")
-ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$HOST_BIN" "$PLUGIN_SO")
+# EVERY ELF the .deb installs (the staging block above) — one list, so a binary
+# added there must be added here. It used to be assigned twice: the second
+# assignment silently dropped the queue-lock layer from these checks, and the
+# sim-input / sim-conversion plug-ins were never in it.
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$HOST_BIN" "$PLUGIN_SO"
+    "$SIMINPUT_SO" "$SIMCONV_SO" "$VKLAYER_SO")
 # The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
 # libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
 # HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor

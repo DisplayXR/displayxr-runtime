@@ -775,7 +775,11 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   `Enabled` = 0; `manifest` = disabled by the POSIX manifest's
   `"enabled": false`; `default` = enabled with no per-user value — which
   includes an explicit HKLM `Enabled` = 1 or `"enabled": true`, because the
-  shared row reader records the value, not its presence.
+  shared row reader records the value, not its presence. The root carries
+  `policy.policy_lock` (bool; the key `dp list` / `conv list` emit too): HKLM
+  `InputProviders\Policy\Lock` = 1, under which no row is `user` and a
+  per-user `input enable|disable` is ignored (the CLI prints a `note:`);
+  always false on POSIX.
 - `displayxr-cli input enable | disable <id> [--machine]` — the ADR-054
   `enable|disable` verb: `Enabled` on the provider's row, HKCU (per user, no
   admin) by default, HKLM 64-bit view with `--machine`; HKCU wins (§3).

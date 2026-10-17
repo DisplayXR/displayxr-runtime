@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using DisplayXR.Dashboard.Model;
 
 namespace DisplayXR.Dashboard.Feed;
 
@@ -47,6 +50,24 @@ public sealed record CliResult(int ExitCode, string Stdout, string Stderr, bool 
             return ExitCode == 0 ? "(done)" : $"displayxr-cli exited with code {ExitCode} without a result.";
         }
     }
+
+    /// <summary>
+    /// Every <c>note:</c> / <c>warning:</c> line the CLI printed (stdout, then stderr), in order:
+    /// a write's caveats — "HKLM Policy\Lock is set, so the per-user value is ignored", an
+    /// unregistered id — which are rarely the first line, so <see cref="Summary"/> alone drops them.
+    /// </summary>
+    public IReadOnlyList<string> Notes =>
+        new[] { Stdout, Stderr }.SelectMany(t => t.Split('\n')).Select(l => l.Trim())
+            .Where(l => l.StartsWith("note:", StringComparison.OrdinalIgnoreCase) ||
+                        l.StartsWith("warning:", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+    /// <summary>What a person reads after a write: <see cref="Summary"/>, then every note it is not.</summary>
+    public string Report => Compose(Summary, Notes);
+
+    /// <summary><paramref name="summary"/> and then each distinct note that is not the summary, one per line.</summary>
+    public static string Compose(string summary, IEnumerable<string> notes) =>
+        string.Join("\n", new[] { summary }.Concat(notes.Where(n => n != summary).Distinct()));
 }
 
 /// <summary>A running <c>status --watch</c> child.</summary>
@@ -66,8 +87,8 @@ public interface IProcessSource
     /// </summary>
     IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit);
 
-    /// <summary>Run one CLI verb to completion.</summary>
-    Task<CliResult> RunAsync(string arguments, TimeSpan timeout, CancellationToken cancel = default);
+    /// <summary>Run one CLI verb to completion; <paramref name="args"/> is the argument vector, never a parsed string.</summary>
+    Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default);
 }
 
 /// <summary>The feed's clock and thread. The app posts to the UI thread; the tests drive time by hand.</summary>

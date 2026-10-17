@@ -450,6 +450,7 @@ conv_reason_name(uint32_t reason)
 	case XRT_CONV_FAIL_DEVICE_LOST: return "device_lost";
 	case XRT_CONV_FAIL_CRASH_LOOP: return "crash_loop";
 	case XRT_CONV_FAIL_POLICY: return "policy";
+	case XRT_CONV_FAIL_INPUT: return "input";
 	case CONV_REASON_POLICY: return "policy";
 	case CONV_REASON_BINARY_MISSING: return "binary_missing";
 	case CONV_REASON_ABI_REJECTED: return "abi_rejected";

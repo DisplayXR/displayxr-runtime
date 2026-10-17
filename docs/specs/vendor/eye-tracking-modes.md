@@ -123,6 +123,51 @@ Per-screen views are unaffected: the per-view raw block (`XR_DXR_view_rig`) and
 `XrWeaveOutputRectPartsDXR` keep each screen's own `isTracking`. The vendor's MANAGED 2D/3D
 auto-switch also stays per panel: each DP drives its own lens from its own tracker.
 
+### Target-time query (ADR-054 §4.1 / N6 Part 1, #2144)
+
+Every eye consumer asks for the eyes **at the instant the pixels it is about to produce will be
+seen**, not for "the latest prediction". The DP eye query has two forms:
+
+| Slot | Meaning |
+|---|---|
+| `get_predicted_eye_positions(xdp, out)` | The original slot, unchanged: the eyes at **now + the vendor's default horizon** (a horizon the caller cannot see or control). |
+| `get_eye_positions_at(xdp, target_ns, out)` | **New, optional** (ADR-020 append-only slot on all five per-API vtables, announced by `XRT_DP_<API>_HAS_EYE_POSITIONS_AT`): the eyes at `target_ns`. |
+
+The contract:
+
+- **Clock** — `target_ns` is on the `os_monotonic_get_ns()` clock, the same clock as
+  `xrt_eye_positions.timestamp_ns`.
+- **Target** — the expected **display time** of the pixels: `xrLocateViews` passes the frame's
+  `displayTime` (converted from `XrTime` to monotonic), a compositor its weave / scan-out instant,
+  a status query "now". Over IPC, `compositor_get_predicted_eye_positions` carries the client's
+  `target_ns` to the service, which answers from that client's DP; `target_ns = 0` on the wire
+  means "latest" (the pre-N6 behaviour).
+- **Answer** — `out` is filled exactly as `get_predicted_eye_positions` fills it (same
+  `valid` / `is_tracking` / never-zeros rules as *Tracking loss* below); `out->timestamp_ns` is the
+  time of the **tracker sample** the answer is based on, so the caller can tell how far it was
+  predicted.
+- **Fallback — a DP without the slot keeps today's latest-answer behaviour; implementing the slot
+  opts in to display-time sampling.** When the slot is absent (`struct_size` does not cover it: a
+  plug-in built against an older header) or NULL, every path — the in-process compositors, the
+  D3D11 service's per-client getters, the IPC server — returns the DP's own
+  `get_predicted_eye_positions` answer **unchanged**. That answer is already vendor-predicted, so
+  the runtime never re-samples or extrapolates it to the target (that would apply the horizon
+  twice).
+- **Ring** — every answer a compositor gets from its DP (per-frame and per-locate) is still pushed
+  into a **trunk-side ring** (`util/u_eye_history.h`), keyed by when it was asked. It is read only
+  when a DP **has** the slot and the slot fails or returns `valid = false`, and then **clamped**:
+  exact / interpolated between samples (per eye; `is_tracking` is the AND of the neighbours, so a
+  tracking-lost edge is never interpolated away) / the newest sample for any later target —
+  **never extrapolated** / **stale** once the newest sample is older than 500 ms (last-known
+  positions, `is_tracking = false`).
+
+The in-process compositors (D3D11, D3D12, GL, Metal, Vulkan) each own one ring next to their DP.
+The D3D11 service keeps one ring per DP it asks (a small fixed table; the render thread's
+per-frame viewer publish feeds the presenter's ring); the macOS / Linux `comp_multi` service asks
+the DP's slot and otherwise answers "latest". `sim_display` implements the slot on every variant;
+with `TRACKING=1` its fake tracker can sway deterministically in the target time
+(`TRACKING_SWAY_MM`, `TRACKING_SWAY_PERIOD_MS`; default 0 = static) so the round trip is testable.
+
 ### Tracking loss and eye position reporting
 
 **"Tracking lost" (`isTracking = false`)** means the viewer is outside the display's supported 3D view zone — it does **not** necessarily mean the physical tracker has lost lock on the viewer. Some vendors' trackers continue following the viewer even after `isTracking` flips to `false` (e.g., the viewer stepped too far to the side but the camera still sees them). Other vendors' trackers truly lose the viewer and can only report the last known position.
@@ -215,6 +260,7 @@ The display processor must:
 1. **Store the active eye tracking mode** (like it now stores `view_count`)
 2. **On mode change** (`xrRequestEyeTrackingModeDXR`): call vendor SDK to enable/disable managed behavior
 3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for MANAGED vs MANUAL (the SDK does it)
+4. **Optionally implement `get_eye_positions_at(target_ns)`** (see *Target-time query*): predict for the caller's display time with the SDK's own predictor (e.g. a predict-with-latency call) instead of its default horizon. Without it the runtime keeps using your `get_predicted_eye_positions()` answer unchanged (today's behaviour).
 
 ### Event propagation for vendor-initiated transitions (MANAGED mode)
 

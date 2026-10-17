@@ -36,6 +36,7 @@
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 
 #include "xrt/xrt_system.h"
 
@@ -492,6 +493,14 @@ struct comp_d3d11_compositor
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
+	 */
+	struct u_eye_history eye_hist;
 
 	/*!
 	 * ADR-047 Amendment 2: while another screen holds the window, the segment
@@ -4007,6 +4016,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct xrt_eye_positions eye_pos = {};
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, &eye_pos);
+		if (eye_pos.valid) {
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &eye_pos, (int64_t)os_monotonic_get_ns());
+		}
 	}
 	if (!eye_pos.valid) {
 		// Use view_count from the active rendering mode for the fallback
@@ -4946,6 +4960,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	delete c;
 }
@@ -5104,6 +5119,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->owns_window = false;
 	c->app_hwnd = nullptr;
 	c->hardware_display_3d = true;
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
 
@@ -8931,11 +8947,43 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	if (c->display_processor != nullptr) {
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
 		    out_eye_pos->valid) {
+			// N6 Part 1 (#2144): keyed by the time it was asked.
+			u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
 			return true;
 		}
 	}
 
 	return false;
+}
+
+extern "C" bool
+comp_d3d11_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	bool has = false;
+	bool ok = false;
+	{
+		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
+		has = xrt_display_processor_d3d11_has_eye_positions_at(c->display_processor);
+		ok = has &&
+		     xrt_display_processor_d3d11_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
+		     out_eye_pos->valid;
+	}
+	if (ok) {
+		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
+	return comp_d3d11_compositor_get_predicted_eye_positions(xc, out_eye_pos);
 }
 
 extern "C" bool

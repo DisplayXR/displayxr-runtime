@@ -17,6 +17,7 @@
  */
 
 #include "util/u_logging.h"
+#include "xrt/xrt_display_processor_vk.h" // N6 Part 1 (#2144): the target-time eye slot on the VK variant
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_display_metrics.h"
@@ -2246,6 +2247,49 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 
 	out_eye_pos->valid = false;
 	return false;
+}
+
+bool
+multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
+                                      int64_t target_ns,
+                                      struct xrt_eye_positions *out_eye_pos)
+{
+	if (mc == NULL || out_eye_pos == NULL) {
+		return false;
+	}
+	if (target_ns <= 0) {
+		// 0 = "latest" (the pre-N6 IPC wire meaning).
+		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
+	}
+
+	// N6 Part 1 (#2144): the same source order as the "latest" query above,
+	// asking each Vulkan-vtable DP's target-time slot (on the VK variant —
+	// every DP a Vulkan factory hands out is one) when it has it. A DP
+	// without the slot keeps the unchanged "latest" answer; the multi
+	// compositor keeps no ring of its own (the per-frame weave queries live
+	// in the weave engines — Part 1b).
+	struct xrt_display_processor *dp = NULL;
+	if (mc->session_render.initialized && mc->session_render.display_processor != NULL) {
+		dp = mc->session_render.display_processor;
+	}
+#ifdef COMP_MULTI_HAVE_WEAVE
+	if (dp == NULL && mc->weave.dp != NULL) {
+		dp = mc->weave.dp;
+	}
+#endif
+#ifdef COMP_MULTI_SHARED_SURFACE
+	if (dp == NULL && mc->msc != NULL && multi_shared_surface_active(mc->msc) && mc->msc->shared_dp != NULL) {
+		dp = mc->msc->shared_dp;
+	}
+#endif
+	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
+	if (xrt_display_processor_vk_has_eye_positions_at(vdp) &&
+	    xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos) && out_eye_pos->valid) {
+		return true;
+	}
+	// No slot (or it failed; there is no ring here): the DP's own "latest"
+	// answer, unchanged — exactly the pre-N6 behaviour.
+	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
 }
 
 #ifdef XRT_OS_WINDOWS

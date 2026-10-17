@@ -115,6 +115,24 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                struct xrt_eye_positions *out_eye_pos);
 
 /*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
+ *
+ * @param xc          GL compositor base.
+ * @param target_ns   When the pixels will be seen (monotonic ns).
+ * @param out_eye_pos Output eye positions (N-view).
+ * @return true if valid positions were produced.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos);
+
+/*!
  * Get window metrics for adaptive FOV calculation.
  *
  * @param xc          GL compositor base.

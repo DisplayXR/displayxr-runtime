@@ -57,6 +57,7 @@
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_threading.h"
 #ifdef XRT_OS_ANDROID
 #include <sys/system_properties.h>
@@ -859,6 +860,15 @@ struct comp_vk_native_compositor
 	 */
 	struct comp_segments_content seg_content;
 #endif // VK_NATIVE_HAVE_SEGMENTS
+
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
+	 */
+	struct u_eye_history eye_hist;
 
 #ifdef XRT_OS_WINDOWS
 	/*!
@@ -3571,23 +3581,68 @@ vk_dp_display_dimensions(struct comp_vk_native_compositor *c, float *out_w_m, fl
 static bool
 vk_dp_predicted_eyes(struct comp_vk_native_compositor *c, struct xrt_eye_positions *out_eye_pos)
 {
+	bool ok;
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_predicted_eye_positions(c->split, out_eye_pos);
+		ok = comp_vk_split_get_predicted_eye_positions(c->split, out_eye_pos);
+	} else {
+		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
+		ok = c->display_processor != NULL &&
+		     xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+		os_mutex_unlock(&c->dp_swap_mutex);
 	}
-#endif
-#ifdef XRT_OS_WINDOWS
-	os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
-	const bool ok = c->display_processor != NULL &&
-	                xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
-	os_mutex_unlock(&c->dp_swap_mutex);
-	return ok;
 #else
 	if (c->display_processor == NULL) {
 		return false;
 	}
-	return xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	ok = xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
 #endif
+	// N6 Part 1 (#2144): every "latest" answer feeds the ring, keyed by the
+	// time it was ASKED (the vendor's horizon is unknown; the ring's own
+	// extrapolation is relative to query time).
+	if (ok && out_eye_pos->valid) {
+		u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+	}
+	return ok;
+}
+
+/*!
+ * N6 Part 1 (#2144): the eyes for @p target_ns — the DP's own target-time
+ * slot when it has one (if it fails, this compositor's ring — fed by every
+ * per-frame query above — read at the target, clamped); a DP without the
+ * slot gets its plain "latest" answer unchanged.
+ */
+static bool
+vk_dp_eyes_at(struct comp_vk_native_compositor *c, int64_t target_ns, struct xrt_eye_positions *out_eye_pos)
+{
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	bool has = false;
+	bool ok = false;
+#ifdef XRT_OS_WINDOWS
+	if (c->split == NULL) {
+		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
+		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+		has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+		ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
+		os_mutex_unlock(&c->dp_swap_mutex);
+	}
+#else
+	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+	has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+	ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
+#endif
+	if (ok && out_eye_pos->valid) {
+		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
+	return vk_dp_predicted_eyes(c, out_eye_pos);
 }
 
 static bool
@@ -12750,6 +12805,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 #ifdef XRT_OS_WINDOWS
 	os_mutex_destroy(&c->dp_swap_mutex);
 #endif
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
@@ -13338,6 +13394,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_WINDOWS
 	os_mutex_init(&c->dp_swap_mutex); // ADR-047 Amendment 2
 #endif
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	os_thread_helper_init(&c->repaint_thread);
 
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
@@ -14451,6 +14508,15 @@ comp_vk_native_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	}
 
 	return false;
+}
+
+bool
+comp_vk_native_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                               int64_t target_ns,
+                                               struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	return vk_dp_eyes_at(c, target_ns, out_eye_pos) && out_eye_pos->valid;
 }
 
 bool

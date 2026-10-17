@@ -165,6 +165,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-054](adr/ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
 - [ADR-055](adr/ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
 - [ADR-056](adr/ADR-056-desktop-control-runs-in-the-app.md) — Desktop control is a first-class capability that runs in the app — the OS's consent belongs to the app, never to DisplayXR
+- [ADR-057](adr/ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
 <!-- END ADR INDEX -->
 
 ---

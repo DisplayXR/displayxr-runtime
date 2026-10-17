@@ -273,6 +273,18 @@ If it doesn't, the user installs your vendor platform software separately — **
 
 Declare both bits if your SDK supports both modes; declare just one if not. A typical hardware DP is `MANAGED`-only. Declare `0` if your display has no eye tracker at all — sim-display does this (its positions are nominal, not tracked). The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
 
+### Eyes at a target time (`get_eye_positions_at`, optional)
+
+Every DP vtable carries an optional appended slot `get_eye_positions_at(xdp, target_ns, out)`
+(ADR-054 N6 Part 1; ABI unchanged, `#ifdef XRT_DP_<API>_HAS_EYE_POSITIONS_AT`). The runtime calls
+it with the instant the frame will be **seen** (`os_monotonic_get_ns()` clock — the app's
+`displayTime` for `xrLocateViews`), so if your SDK can predict to an arbitrary time (a
+predict-with-latency call), implement it and predict for `target_ns` rather than your default
+horizon. Leave it NULL and nothing changes: a DP without the slot keeps today's latest-answer
+behaviour (the runtime uses your `get_predicted_eye_positions` answer unchanged); implementing the
+slot opts in to display-time sampling. Contract:
+[eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
+
 ### Per-mode tracking capability (`mode_flags`, ABI v3 / #441)
 
 Every `xrt_rendering_mode` your `create_device` device exposes carries a `mode_flags`

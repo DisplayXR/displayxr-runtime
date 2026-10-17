@@ -14,6 +14,7 @@
  *   conv set    <id> <KEY> <value> [--machine]       `Settings\<KEY>` (HKCU; HKLM with --machine) — N3c
  *   conv unset  <id> <KEY> [--machine]
  *   conv models list|verify|prune|fetch|init        the runtime-owned model store (P4)
+ *   conv run | consent | camera-block                ADR-057: cli_cmd_conv_run.cpp
  *
  * `list` / `status` read the running service's status snapshot over DIAG
  * (`system_get_conv_*_row`, one row per reply) and fall back to the headless
@@ -255,6 +256,40 @@ provenance_of(const struct xrt_status_conv_provider &p)
 	return out;
 }
 
+//! The built-in `dp-lift` adapter: no binary, no Enabled value, no settings.
+bool
+is_built_in(const struct xrt_status_conv_provider &p)
+{
+	return strcmp(p.load, "BUILT_IN") == 0 || strcmp(p.id, "dp-lift") == 0;
+}
+
+/*!
+ * Where a row's `enabled` came from, in the vocabulary `dp list` / `input list`
+ * use (N3e review): "user" when a per-user `Enabled` override applies (HKCU,
+ * not hidden by `Policy\Lock` — @ref target_conv_policy_enabled_override, the
+ * rule the loader itself applies), "machine" / "manifest" when the platform's
+ * own store disabled it, else "default". The built-in adapter has no Enabled
+ * value at all: "default".
+ */
+const char *
+conv_enabled_source(const struct xrt_status_conv_provider &p, const struct target_conv_policy *policy)
+{
+	if (is_built_in(p)) {
+		return "default";
+	}
+	if (target_conv_policy_enabled_override(policy, p.id) >= 0) {
+		return "user";
+	}
+	if (!p.enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
 void
 print_json(const struct xrt_status_snapshot *snap, const struct target_conv_policy *policy, bool compact)
 {
@@ -271,6 +306,12 @@ print_json(const struct xrt_status_snapshot *snap, const struct target_conv_poli
 		cJSON_AddStringToObject(row, "provenance", target_component_provenance_str(pv.verdict));
 		cJSON_AddStringToObject(row, "provenance_reason", pv.reason);
 		cJSON_AddStringToObject(row, "signer", pv.signer);
+		// N3e review: the policy facts a front end needs to draw the row's
+		// controls, joined here like provenance (the rows themselves carry
+		// none: they come over DIAG IPC). `built_in` = no Enabled value and no
+		// settings (`conv enable|disable dp-lift` is refused).
+		cJSON_AddStringToObject(row, "enabled_source", conv_enabled_source(snap->conv_providers[i], policy));
+		cJSON_AddBoolToObject(row, "built_in", is_built_in(snap->conv_providers[i]));
 	}
 	char *s = compact ? cJSON_PrintUnformatted(root) : cJSON_Print(root);
 	if (s != nullptr) {
@@ -1337,6 +1378,10 @@ usage(void)
 	P("  unset <id> <KEY> [--machine]        clear it; DXR_CONV_<ID>_<KEY> in the service's env always wins\n");
 	P("  models list|verify|prune|init [--json] [--root <dir>]   the runtime-owned model store\n");
 	P("  models fetch <pack-url|path> [--prefetch] [--model <name>] [--installer]   write protocol, here\n");
+	P("  run <task> <in> [<in-right>] <out> [options]   one splat job, file to file (`conv run` for options)\n");
+	P("  consent <id> grant|revoke|status    off-box consent for a remote provider (per user)\n");
+	P("  camera-block <sog> --facts <json>   write facts as the SOG camera block, \"source\":\"auto\"\n");
+	P("  credential set|delete|status <name> a provider's token in the OS credential store (set reads stdin)\n");
 	P("list/status read the running service over DIAG, else describe providers headless (no model load).\n");
 	return 1;
 }
@@ -1380,6 +1425,19 @@ cli_cmd_conv(int argc, const char **argv)
 	}
 	if (strcmp(verb, "models") == 0) {
 		return cmd_models(argc, argv);
+	}
+	// ADR-057 (cli_cmd_conv_run.cpp).
+	if (strcmp(verb, "run") == 0) {
+		return cli_cmd_conv_run(argc, argv);
+	}
+	if (strcmp(verb, "consent") == 0) {
+		return cli_cmd_conv_consent(argc, argv);
+	}
+	if (strcmp(verb, "camera-block") == 0) {
+		return cli_cmd_conv_camera_block(argc, argv);
+	}
+	if (strcmp(verb, "credential") == 0) {
+		return cli_cmd_conv_credential(argc, argv);
 	}
 	const int rc = cmd_options_verbs(argc, argv); // options | set | unset (N3c)
 	if (rc >= 0) {

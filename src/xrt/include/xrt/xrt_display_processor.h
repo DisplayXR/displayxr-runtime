@@ -276,6 +276,15 @@ struct xrt_display_processor
 	 * Get predicted eye positions from vendor eye tracking SDK.
 	 * Optional — NULL means not supported.
 	 *
+	 * The horizon is the VENDOR's: this answers "now + the vendor's default
+	 * prediction" (ADR-054 §4.1). A caller that knows when its pixels will
+	 * be seen asks for that instant instead through the target-time query —
+	 * `get_eye_positions_at` on each per-API vtable (for Vulkan it lives on
+	 * @ref xrt_display_processor_vk, because that variant embeds this base
+	 * by value and a base append would move every variant slot; N6 Part 1,
+	 * #2144). The runtime samples a fallback answer at its target itself
+	 * (util/u_eye_history.h) when a DP has no target-time slot.
+	 *
 	 * @param      xdp           Pointer to self.
 	 * @param[out] out_eye_pos   Predicted N-view eye positions.
 	 * @return true if eye positions are valid.

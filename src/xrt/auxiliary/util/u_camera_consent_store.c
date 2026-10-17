@@ -16,6 +16,8 @@
  *                              executable's path is user-writable, i.e. not under
  *                              %ProgramFiles%, %ProgramFiles(x86)% or %SystemRoot%).
  *                              Never itself an entry, whatever its data.
+ *     OffBox\      REG_DWORD   value NAME = conversion provider id, 1 = the user granted it
+ *                              consent to send pictures off this machine (ADR-057 §2)
  *   HKLM\Software\DisplayXR\CameraConsent\Delegating   same shape, written by installers
  *   The OS camera privacy switch is read from CapabilityAccessManager\ConsentStore\webcam
  *   (HKLM global policy, HKCU global, NonPackaged = desktop apps, and the per-app entry
@@ -24,7 +26,7 @@
  * POSIX — JSON, mode 0600, in the user config dir ($XDG_CONFIG_HOME/displayxr or
  * ~/.config/monado, like every other runtime file): camera_consent.json
  *   {"sharing": true, "secret": "<64 hex>", "apps": {"<exe>": "allow"|"deny"},
- *    "delegating": ["<exe>", ...]}
+ *    "delegating": ["<exe>", ...], "offbox": {"<provider id>": "granted"}}
  * plus the system delegating list an installer may write:
  *   Linux  /etc/displayxr/camera-delegating.json
  *   macOS  /Library/Application Support/DisplayXR/camera-delegating.json
@@ -111,6 +113,23 @@ fill_random(uint8_t *out, size_t n)
 		x ^= x << 17;
 		out[i] = (uint8_t)(x ^ (uint64_t)rand());
 	}
+}
+
+//! ADR-057 off-box consent: a provider id is [A-Za-z0-9._-], 1..63 bytes.
+static bool
+offbox_id_valid(const char *id)
+{
+	if (id == NULL || id[0] == '\0' || strlen(id) > U_OFFBOX_CONSENT_ID_MAX) {
+		return false;
+	}
+	for (const char *c = id; *c != '\0'; c++) {
+		const bool ok = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') ||
+		                *c == '-' || *c == '_' || *c == '.';
+		if (!ok) {
+			return false;
+		}
+	}
+	return true;
 }
 
 
@@ -490,6 +509,60 @@ u_camera_consent_store_default(void)
 	return &win_ops;
 }
 
+#define OFFBOX_KEY CONSENT_KEY L"\\OffBox"
+
+bool
+u_offbox_consent_granted(const char *provider_id)
+{
+	if (!offbox_id_valid(provider_id)) {
+		return false;
+	}
+	wchar_t *w = u8_to_w(provider_id);
+	DWORD v = 0;
+	const bool have = w != NULL && reg_read_dword(HKEY_CURRENT_USER, OFFBOX_KEY, w, &v);
+	free(w);
+	return have && v == 1;
+}
+
+bool
+u_offbox_consent_set(const char *provider_id, bool granted)
+{
+	if (!offbox_id_valid(provider_id)) {
+		return false;
+	}
+	wchar_t *w = u8_to_w(provider_id);
+	if (w == NULL) {
+		return false;
+	}
+	const bool ok = granted ? reg_write_dword(HKEY_CURRENT_USER, OFFBOX_KEY, w, 1u)
+	                        : reg_delete_value(HKEY_CURRENT_USER, OFFBOX_KEY, w);
+	free(w);
+	return ok;
+}
+
+void
+u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx)
+{
+	HKEY k;
+	if (cb == NULL || RegOpenKeyExW(HKEY_CURRENT_USER, OFFBOX_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+		return;
+	}
+	for (DWORD i = 0;; i++) {
+		wchar_t name[U_OFFBOX_CONSENT_ID_MAX + 2];
+		DWORD name_len = U_OFFBOX_CONSENT_ID_MAX + 2, type = 0, data = 0, size = sizeof(data);
+		const LSTATUS rc = RegEnumValueW(k, i, name, &name_len, NULL, &type, (LPBYTE)&data, &size);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		char id[U_OFFBOX_CONSENT_ID_MAX + 1];
+		if (rc == ERROR_SUCCESS && type == REG_DWORD && data == 1 &&
+		    w_to_u8(name, (int)name_len, id, sizeof(id)) && offbox_id_valid(id)) {
+			cb(ctx, id);
+		}
+	}
+	RegCloseKey(k);
+}
+
 //! Set (non-empty @p signer_u8) or delete the "<id>.signer" companion of entry @p id (open key @p k).
 static bool
 write_entry_signer(HKEY k, const wchar_t *id, const char *signer_u8)
@@ -709,23 +782,21 @@ u_camera_consent_path_user_writable(const char *exe)
 	return true;
 }
 
-bool
-u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+/*!
+ * WinVerifyTrust on @p wpath (and, when not INVALID_HANDLE_VALUE, the already
+ * open @p file, so the bytes verified are the bytes the caller holds). Returns
+ * whether the Authenticode chain verified; @p out receives the leaf signer's
+ * subject CN and @p have_cn says whether one was found.
+ */
+static bool
+authenticode_verify(const wchar_t *wpath, HANDLE file, char *out, size_t cap, bool *have_cn)
 {
-	if (cap > 0) {
-		out[0] = '\0';
-	}
-	if (exe == NULL || exe[0] == '\0' || cap == 0) {
-		return false;
-	}
-	wchar_t *wexe = u8_to_w(exe);
-	if (wexe == NULL) {
-		return false;
-	}
+	*have_cn = false;
 	WINTRUST_FILE_INFO fi;
 	memset(&fi, 0, sizeof(fi));
 	fi.cbStruct = sizeof(fi);
-	fi.pcwszFilePath = wexe;
+	fi.pcwszFilePath = wpath;
+	fi.hFile = file != INVALID_HANDLE_VALUE ? file : NULL;
 
 	WINTRUST_DATA wd;
 	memset(&wd, 0, sizeof(wd));
@@ -742,8 +813,8 @@ u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 
 	GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 	LONG st = WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
-	bool ok = false;
-	if (st == ERROR_SUCCESS) {
+	const bool chain_ok = st == ERROR_SUCCESS;
+	if (chain_ok) {
 		CRYPT_PROVIDER_DATA *pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
 		CRYPT_PROVIDER_SGNR *sg = pd != NULL ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : NULL;
 		CRYPT_PROVIDER_CERT *pc = sg != NULL ? WTHelperGetProvCertFromChain(sg, 0) : NULL;
@@ -751,13 +822,60 @@ u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 			wchar_t cn[U_CAMERA_CONSENT_SIGNER_MAX];
 			DWORD n = CertGetNameStringW(pc->pCert, CERT_NAME_ATTR_TYPE, 0, (void *)szOID_COMMON_NAME, cn,
 			                             (DWORD)(sizeof(cn) / sizeof(cn[0])));
-			ok = n > 1 && w_to_u8(cn, (int)wcslen(cn), out, cap) && out[0] != '\0';
+			*have_cn = n > 1 && w_to_u8(cn, (int)wcslen(cn), out, cap) && out[0] != '\0';
 		}
 	}
 	wd.dwStateAction = WTD_STATEACTION_CLOSE;
 	WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &action, &wd);
+	if (!*have_cn && cap > 0) {
+		out[0] = '\0';
+	}
+	return chain_ok;
+}
+
+bool
+u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
+{
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	if (exe == NULL || exe[0] == '\0' || cap == 0) {
+		return false;
+	}
+	wchar_t *wexe = u8_to_w(exe);
+	if (wexe == NULL) {
+		return false;
+	}
+	// Consent records key on the signer's name: no CN, no signer.
+	bool have_cn = false;
+	const bool chain_ok = authenticode_verify(wexe, INVALID_HANDLE_VALUE, out, cap, &have_cn);
 	free(wexe);
-	return ok;
+	return chain_ok && have_cn;
+}
+
+bool
+u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap)
+{
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	if (path == NULL || path[0] == '\0' || cap == 0) {
+		return false;
+	}
+	wchar_t *wpath = u8_to_w(path);
+	if (wpath == NULL) {
+		return false;
+	}
+	HANDLE h = file_handle != NULL ? (HANDLE)file_handle : INVALID_HANDLE_VALUE;
+	bool have_cn = false;
+	const bool chain_ok = authenticode_verify(wpath, h, out, cap, &have_cn);
+	free(wpath);
+	if (chain_ok && !have_cn) {
+		// A valid chain whose leaf has no CN is still signed; say so rather
+		// than demote it to unverified.
+		snprintf(out, cap, "%s", "(unknown subject)");
+	}
+	return chain_ok;
 }
 
 #else // POSIX
@@ -1025,6 +1143,64 @@ u_camera_consent_store_default(void)
 }
 
 bool
+u_offbox_consent_granted(const char *provider_id)
+{
+	if (!offbox_id_valid(provider_id)) {
+		return false;
+	}
+	cJSON *root = load_user(false);
+	if (root == NULL) {
+		return false;
+	}
+	const cJSON *v = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItem(root, "offbox"), provider_id);
+	const bool granted = cJSON_IsString(v) && strcmp(v->valuestring, "granted") == 0;
+	cJSON_Delete(root);
+	return granted;
+}
+
+bool
+u_offbox_consent_set(const char *provider_id, bool granted)
+{
+	if (!offbox_id_valid(provider_id)) {
+		return false;
+	}
+	cJSON *root = load_user(true);
+	if (root == NULL) {
+		return false;
+	}
+	cJSON *obj = cJSON_GetObjectItem(root, "offbox");
+	if (obj == NULL || !cJSON_IsObject(obj)) {
+		cJSON_DeleteItemFromObject(root, "offbox");
+		obj = cJSON_AddObjectToObject(root, "offbox");
+	}
+	cJSON_DeleteItemFromObjectCaseSensitive(obj, provider_id);
+	if (granted) {
+		cJSON_AddStringToObject(obj, provider_id, "granted");
+	}
+	const bool ok = save_user(root);
+	cJSON_Delete(root);
+	return ok;
+}
+
+void
+u_offbox_consent_list(void (*cb)(void *ctx, const char *provider_id), void *ctx)
+{
+	cJSON *root = cb != NULL ? load_user(false) : NULL;
+	if (root == NULL) {
+		return;
+	}
+	const cJSON *it = NULL;
+	cJSON_ArrayForEach(it, cJSON_GetObjectItem(root, "offbox"))
+	{
+		if (it->string != NULL && cJSON_IsString(it) && strcmp(it->valuestring, "granted") == 0 &&
+		    offbox_id_valid(it->string)) {
+			cb(ctx, it->string);
+		}
+	}
+	cJSON_Delete(root);
+}
+
+bool
 u_camera_consent_store_set_delegating(const char *exe, bool delegating, const char *signer)
 {
 	(void)signer; // POSIX delegation is path-only for now (see the file comment)
@@ -1113,6 +1289,17 @@ bool
 u_camera_consent_exe_signer(const char *exe, char *out, size_t cap)
 {
 	(void)exe;
+	if (cap > 0) {
+		out[0] = '\0';
+	}
+	return false;
+}
+
+bool
+u_authenticode_file_signer(const char *path, void *file_handle, char *out, size_t cap)
+{
+	(void)path;
+	(void)file_handle;
 	if (cap > 0) {
 		out[0] = '\0';
 	}

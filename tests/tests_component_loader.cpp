@@ -20,18 +20,24 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -209,6 +215,16 @@ TEST_CASE("component loader: malformed manifests are rejected with a reason", "[
 	     R"({"file_format_version":"1.0","plugin":{"id":"e","binary_path":"/a.so","enabled":"yes"}})", "e"},
 	    {"settings not object",
 	     R"({"file_format_version":"1.0","plugin":{"id":"t","binary_path":"/a.so","settings":[1]}})", "t"},
+	    // Nothing resolves binary_path against the manifest's directory, so a
+	    // relative one would be searched for by dlopen (ADR-054 N4b review).
+	    {"bare binary name", R"({"file_format_version":"1.0","plugin":{"id":"r1","binary_path":"libacme.so"}})",
+	     "r1"},
+	    {"dot-relative binary", R"({"file_format_version":"1.0","plugin":{"id":"r2","binary_path":"./lib/a.so"}})",
+	     "r2"},
+	    {"parent-relative binary",
+	     R"({"file_format_version":"1.0","plugin":{"id":"r3","binary_path":"../plugins/a.so"}})", "r3"},
+	    {"drive-relative binary", R"({"file_format_version":"1.0","plugin":{"id":"r4","binary_path":"C:a.dll"}})",
+	     "r4"},
 	};
 	for (const Case &c : cases) {
 		INFO(c.what);
@@ -222,6 +238,57 @@ TEST_CASE("component loader: malformed manifests are rejected with a reason", "[
 	std::unique_ptr<Entry> e(new Entry);
 	CHECK_FALSE(target_component_parse_manifest_json(&cls, nullptr, "/x/null.json", e.get()));
 	CHECK((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0u);
+
+	// The relative-binary rejection names the field.
+	std::unique_ptr<Entry> rel(new Entry);
+	CHECK_FALSE(target_component_parse_manifest_json(
+	    &cls, R"({"file_format_version":"1.0","plugin":{"id":"rel","binary_path":"a.so"}})", "/x/rel.json",
+	    rel.get()));
+	CHECK(std::string(rel->reason).find("absolute") != std::string::npos);
+}
+
+TEST_CASE("component loader: only an absolute binary path is a binary path", "[component_loader]")
+{
+	// Manifest rules: POSIX-absolute, or either Windows absolute form.
+	CHECK(target_component_path_is_absolute("/usr/lib/displayxr/plugins/a.so", false));
+	CHECK(target_component_path_is_absolute("C:\\Program Files\\A\\a.dll", false));
+	CHECK(target_component_path_is_absolute("c:/x/a.dll", false));
+	CHECK(target_component_path_is_absolute("\\\\server\\share\\a.dll", false));
+	CHECK_FALSE(target_component_path_is_absolute("a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("./a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("../a.so", false));
+	CHECK_FALSE(target_component_path_is_absolute("C:a.dll", false));
+	CHECK_FALSE(target_component_path_is_absolute("", false));
+	CHECK_FALSE(target_component_path_is_absolute(nullptr, false));
+
+	// Registry rows (Windows rules): a lone leading separator is relative to
+	// the current drive, so only drive-letter and UNC / device paths count.
+	CHECK(target_component_path_is_absolute("C:\\Program Files\\A\\a.dll", true));
+	CHECK(target_component_path_is_absolute("D:/plugins/a.dll", true));
+	CHECK(target_component_path_is_absolute("\\\\?\\C:\\a.dll", true));
+	CHECK(target_component_path_is_absolute("//server/share/a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("\\Program Files\\a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("/opt/a.so", true));
+	CHECK_FALSE(target_component_path_is_absolute("a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("plugins\\a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("C:a.dll", true));
+	CHECK_FALSE(target_component_path_is_absolute("C:", true));
+}
+
+TEST_CASE("component loader: the load path refuses a relative binary before touching it", "[component_loader]")
+{
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	std::unique_ptr<Entry> e = make_entry("relative", 100);
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", "libDoesNotMatter.so");
+	void *module = nullptr;
+	void *fn = nullptr;
+	char reason[128] = {0};
+	CHECK(target_component_load_binary(&cls, e.get(), &module, &fn, nullptr, reason, sizeof(reason)) ==
+	      TARGET_COMPONENT_LOAD_FAILED);
+	CHECK(module == nullptr);
+	CHECK(std::string(reason).find("absolute") != std::string::npos);
+	// Never reached the provenance check.
+	CHECK(e->provenance == TARGET_COMPONENT_PROVENANCE_UNKNOWN);
 }
 
 TEST_CASE("component loader: the class hook sees the plugin object and may reject the row", "[component_loader]")
@@ -536,6 +603,11 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	reg_dword(c, L"Enabled", 0);
 	RegCloseKey(c);
 
+	// A relative Binary: LoadLibrary would search for it, so it is malformed.
+	HKEY rb = reg_create(r, L"rel-binary");
+	reg_sz(rb, L"Binary", L"plugins\\rel.dll");
+	RegCloseKey(rb);
+
 	// A policy subkey the class reserves, in odd case: never a row.
 	HKEY pol = reg_create(r, L"POLICY");
 	reg_dword(pol, L"Lock", 1);
@@ -553,9 +625,9 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	RegDeleteTreeW(HKEY_CURRENT_USER, wroot);
 	RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\DisplayXR-Test"); // only if now empty
 
-	REQUIRE(n == 3);
+	REQUIRE(n == 4);
 	target_component_sort(&cls, out.data(), n);
-	// acme (50) first; "no-binary" and "off" share the default 100 -> by id.
+	// acme (50) first; the rest share the default 100 -> by id.
 	CHECK(std::string(out[0].id) == "acme-thing");
 	CHECK(std::string(out[1].id) == "no-binary");
 	CHECK(std::string(out[2].id) == "off");
@@ -594,6 +666,10 @@ TEST_CASE("component loader: Windows registry rows are read in full for any clas
 	CHECK_FALSE(out[2].enabled);
 	CHECK(out[2].probe_order == TARGET_COMPONENT_DEFAULT_PROBE_ORDER);
 	CHECK(std::string(out[2].display_name) == "off");
+
+	CHECK(std::string(out[3].id) == "rel-binary");
+	CHECK((out[3].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0u);
+	CHECK(std::string(out[3].reason).find("absolute") != std::string::npos);
 
 	// An absent root is zero rows, not an error.
 	CHECK(target_component_enumerate_registry(&cls, true, "Software\\DisplayXR-Test\\NoSuchRoot-Ever", out.data(),
@@ -757,6 +833,211 @@ TEST_CASE("component loader: the file digest is SHA-256 of the bytes", "[compone
 	CHECK_FALSE(target_component_sha256_file(nullptr, hex, sizeof(hex)));
 }
 
+namespace {
+
+//! A per-process scratch path in the temp dir.
+std::string
+temp_path(const char *stem)
+{
+	const char *dir = std::getenv("TMP") != nullptr
+	                      ? std::getenv("TMP")
+	                      : (std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp");
+	char path[1024];
+#ifdef _WIN32
+	std::snprintf(path, sizeof(path), "%s\\%s_%lu", dir, stem, (unsigned long)GetCurrentProcessId());
+#else
+	std::snprintf(path, sizeof(path), "%s/%s_%lu", dir, stem, (unsigned long)getpid());
+#endif
+	return path;
+}
+
+void
+write_file(const std::string &path, const char *bytes)
+{
+	// r+ when it exists: rewrite in place, same inode (what a swap that keeps
+	// the file identity looks like).
+	FILE *f = std::fopen(path.c_str(), "r+b");
+	if (f == nullptr) {
+		f = std::fopen(path.c_str(), "wb");
+	}
+	REQUIRE(f != nullptr);
+	std::fputs(bytes, f);
+	std::fclose(f);
+}
+
+} // namespace
+
+TEST_CASE("component loader: provenance is thread-safe and every thread sees the same verdict", "[component_loader]")
+{
+	// The DP refresh, IPC status snapshots and the input / conversion loaders
+	// all call this from their own threads (ADR-054 N4b review).
+	const std::string a = temp_path("tests_component_loader_conc_a.bin");
+	const std::string b = temp_path("tests_component_loader_conc_b.bin");
+	write_file(a, "the first file");
+	write_file(b, "the second file, longer");
+	char sha_a[65] = {0};
+	char sha_b[65] = {0};
+	REQUIRE(target_component_sha256_file(a.c_str(), sha_a, sizeof(sha_a)));
+	REQUIRE(target_component_sha256_file(b.c_str(), sha_b, sizeof(sha_b)));
+	set_env("DXR_ALLOW_DEV_PLUGIN_PATHS", nullptr);
+
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	constexpr int kThreads = 8;
+	constexpr int kIters = 50;
+	std::atomic<int> bad{0};
+	std::vector<std::thread> threads;
+	for (int t = 0; t < kThreads; t++) {
+		threads.emplace_back([&, t]() {
+			std::unique_ptr<Entry> e(new Entry);
+			for (int i = 0; i < kIters; i++) {
+				const bool use_a = ((t + i) & 1) == 0;
+				target_component_entry_init(e.get());
+				std::snprintf(e->binary_path, sizeof(e->binary_path), "%s",
+				              use_a ? a.c_str() : b.c_str());
+				(void)target_component_check_provenance(&cls, e.get());
+				const char *want = use_a ? sha_a : sha_b;
+				if (std::strcmp(e->sha256, want) != 0 ||
+				    e->provenance != TARGET_COMPONENT_PROVENANCE_UNVERIFIED ||
+				    std::strstr(e->provenance_reason, want) == nullptr || e->signer[0] != '\0') {
+					bad++;
+				}
+			}
+		});
+	}
+	for (std::thread &th : threads) {
+		th.join();
+	}
+	CHECK(bad.load() == 0);
+	std::remove(a.c_str());
+	std::remove(b.c_str());
+}
+
+#ifndef _WIN32
+TEST_CASE("component loader: a file rewritten with its size and mtime put back is judged on its new bytes",
+          "[component_loader]")
+{
+	// The old cache keyed on path + size + mtime served the first verdict
+	// (and digest) for a file swapped in place with both restored — exactly
+	// how an allowlisted file would be swapped for an unlisted one.
+	const std::string p = temp_path("tests_component_loader_stale.bin");
+	write_file(p, "AAAAAAAA");
+	struct stat before;
+	REQUIRE(stat(p.c_str(), &before) == 0);
+
+	const Class cls = plain_class("xrtTestNegotiate", 3);
+	std::unique_ptr<Entry> e(new Entry);
+	target_component_entry_init(e.get());
+	std::snprintf(e->binary_path, sizeof(e->binary_path), "%s", p.c_str());
+	(void)target_component_check_provenance(&cls, e.get());
+	const std::string first = e->sha256;
+	REQUIRE(first.size() == 64);
+
+	write_file(p, "BBBBBBBB"); // same size, same inode
+	struct timespec ts[2];
+#if defined(__APPLE__)
+	ts[0] = before.st_atimespec;
+	ts[1] = before.st_mtimespec;
+#else
+	ts[0] = before.st_atim;
+	ts[1] = before.st_mtim;
+#endif
+	REQUIRE(utimensat(AT_FDCWD, p.c_str(), ts, 0) == 0);
+	struct stat after;
+	REQUIRE(stat(p.c_str(), &after) == 0);
+	REQUIRE(after.st_size == before.st_size);
+	REQUIRE(after.st_ino == before.st_ino);
+	REQUIRE(after.st_mtime == before.st_mtime);
+
+	char now[65] = {0};
+	REQUIRE(target_component_sha256_file(p.c_str(), now, sizeof(now)));
+	REQUIRE(first != now);
+	(void)target_component_check_provenance(&cls, e.get());
+	CHECK(std::string(e->sha256) == now);
+	CHECK(std::string(e->provenance_reason).find(now) != std::string::npos);
+	std::remove(p.c_str());
+}
+#endif
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+TEST_CASE("component loader: the ownership chain covers the file and every directory above it", "[component_loader]")
+{
+	// A private tree under the temp dir, judged against our own uid with the
+	// tree's root as the stop: the real rule uses uid 0 and "/".
+	char tmpl_buf[1024];
+	std::snprintf(tmpl_buf, sizeof(tmpl_buf), "%s", temp_path("tests_component_loader_chain_XXXXXX").c_str());
+	REQUIRE(mkdtemp(tmpl_buf) != nullptr);
+	char base[PATH_MAX];
+	REQUIRE(realpath(tmpl_buf, base) != nullptr);
+	const std::string a = std::string(base) + "/a";
+	const std::string ab = a + "/b";
+	const std::string lib = ab + "/lib.so";
+	REQUIRE(mkdir(a.c_str(), 0755) == 0);
+	REQUIRE(mkdir(ab.c_str(), 0755) == 0);
+	write_file(lib, "not really a library");
+	REQUIRE(chmod(base, 0755) == 0);
+	REQUIRE(chmod(lib.c_str(), 0644) == 0);
+	const uint32_t me = (uint32_t)getuid();
+	char why[PATH_MAX + 64];
+
+	CHECK(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	// Wrong owner.
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me + 1, base, why, sizeof(why)));
+	CHECK(std::string(why).find("owned by") != std::string::npos);
+	// A group-writable directory in the MIDDLE of the chain is enough to fail.
+	REQUIRE(chmod(a.c_str(), 0775) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	CHECK(std::string(why).find(a) != std::string::npos);
+	REQUIRE(chmod(a.c_str(), 0755) == 0);
+	// A world-writable file.
+	REQUIRE(chmod(lib.c_str(), 0646) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(lib.c_str(), me, base, why, sizeof(why)));
+	REQUIRE(chmod(lib.c_str(), 0644) == 0);
+	// A symlink in the chain (callers pass resolved paths; one here is a swap).
+	const std::string link = std::string(base) + "/link.so";
+	REQUIRE(symlink(lib.c_str(), link.c_str()) == 0);
+	CHECK_FALSE(target_component_owner_chain_ok(link.c_str(), me, base, why, sizeof(why)));
+	CHECK(std::string(why).find("symlink") != std::string::npos);
+	// Relative / missing.
+	CHECK_FALSE(target_component_owner_chain_ok("relative/lib.so", me, base, why, sizeof(why)));
+	CHECK_FALSE(target_component_owner_chain_ok((ab + "/missing.so").c_str(), me, base, why, sizeof(why)));
+
+	// The platform rule itself: a user-owned temp file is never platform-trusted.
+	CHECK_FALSE(target_component_platform_trusted_path(lib.c_str(), why, sizeof(why)));
+
+	std::remove(link.c_str());
+	std::remove(lib.c_str());
+	rmdir(ab.c_str());
+	rmdir(a.c_str());
+	rmdir(base);
+}
+
+TEST_CASE("component loader: the platform rule judges the RESOLVED path", "[component_loader]")
+{
+	char why[PATH_MAX + 64];
+	// A string that starts with /usr/ but resolves elsewhere: the old string
+	// prefix check called a root-owned /etc file platform-trusted.
+	struct stat st;
+	if (stat("/etc/hosts", &st) == 0 && st.st_uid == 0) {
+		CHECK_FALSE(target_component_platform_trusted_path("/usr/../etc/hosts", why, sizeof(why)));
+		CHECK(std::string(why).find("not under") != std::string::npos);
+	}
+	// A real root-owned system binary under /usr passes, directly and through
+	// a user-owned symlink (the symlink is resolved; the TARGET is judged, and
+	// the load path then requires the resolved file to be the hashed one).
+	if (stat("/usr/bin/true", &st) == 0 && st.st_uid == 0 && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0) {
+		INFO(why);
+		CHECK(target_component_platform_trusted_path("/usr/bin/true", why, sizeof(why)));
+		const std::string link = temp_path("tests_component_loader_true_link");
+		std::remove(link.c_str());
+		REQUIRE(symlink("/usr/bin/true", link.c_str()) == 0);
+		CHECK(target_component_platform_trusted_path(link.c_str(), why, sizeof(why)));
+		std::remove(link.c_str());
+	}
+	CHECK_FALSE(target_component_platform_trusted_path("/usr/no/such/file.so", why, sizeof(why)));
+	CHECK_FALSE(target_component_platform_trusted_path(nullptr, why, sizeof(why)));
+}
+#endif
+
 #if defined(CONV_STUB_OK_PATH)
 
 TEST_CASE("component loader: a real unsigned binary gets a verdict that follows the override and elevation",
@@ -891,3 +1172,52 @@ TEST_CASE("component loader: the production enumeration of an empty class is wel
 	CHECK(target_component_enumerate(&cls, nullptr, 4) == 0);
 	CHECK(target_component_enumerate(&cls, out.data(), 0) == 0);
 }
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+TEST_CASE("component loader: a model pack in a discovery root is not a manifest of any class", "[component_loader]")
+{
+	// ADR-053 P4: the packagers install `sim-conversion.models.json` beside
+	// its provider in the shared plug-in dir. It must be neither a DP row nor
+	// a malformed one (it used to be both: "unsupported file_format_version").
+	char dir[] = "/tmp/dxr_tc_packs_XXXXXX";
+	REQUIRE(mkdtemp(dir) != nullptr);
+	const std::string root(dir);
+	const std::string pack = root + "/sim-conversion.models.json";
+	const std::string dp = root + "/200-acme-dp.json";
+	FILE *f = std::fopen(pack.c_str(), "w");
+	REQUIRE(f != nullptr);
+	std::fputs(R"({"schema":2,"pack":"sim","provider":"sim-conversion","models":[]})", f);
+	std::fclose(f);
+	f = std::fopen(dp.c_str(), "w");
+	REQUIRE(f != nullptr);
+	std::fputs(R"({"file_format_version":"1.0","plugin":{"id":"acme-dp","binary_path":"/nowhere/acme.so"}})", f);
+	std::fclose(f);
+
+	const char *old = std::getenv("XRT_PLUGIN_SEARCH_PATH");
+	const std::string saved = old != nullptr ? old : "";
+	const bool had_old = old != nullptr;
+	set_env("XRT_PLUGIN_SEARCH_PATH", dir);
+
+	const Class cls = plain_class("xrtTestNegotiate", 1); // DISPLAY manifest kind
+	std::vector<Entry> out(TARGET_COMPONENT_MAX_ENTRIES);
+	const int n = target_component_enumerate(&cls, out.data(), (int)out.size());
+
+	set_env("XRT_PLUGIN_SEARCH_PATH", had_old ? saved.c_str() : nullptr);
+	std::remove(pack.c_str());
+	std::remove(dp.c_str());
+	rmdir(dir);
+
+	// Only rows from our root: a dev box may have real DP manifests installed.
+	int ours = 0;
+	for (int i = 0; i < n; i++) {
+		const std::string src(out[i].source);
+		if (src.compare(0, root.size(), root) != 0) {
+			continue;
+		}
+		ours++;
+		CHECK(src == dp);
+		CHECK((out[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0u);
+	}
+	CHECK(ours == 1);
+}
+#endif

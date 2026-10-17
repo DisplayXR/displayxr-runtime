@@ -473,6 +473,26 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_conv_warm(", text)
         self.assertIn("ipc_handle_conv_request_warm(", text)
 
+    def test_eye_positions_carry_a_target_time(self):
+        # ADR-054 §4.1 / N6 Part 1 (#2144): the client's eye query names the
+        # instant the eyes are wanted for (the frame's displayTime, monotonic
+        # ns) instead of taking the server's "latest". The EXISTING call grew
+        # an in-arg — it is not appended (its enum value is unchanged; the
+        # u_git_tag gate pairs client and service, so the wire struct may
+        # change shape) and nothing after it moved.
+        names = [c.name for c in self.p.calls]
+        call = self._call("compositor_get_predicted_eye_positions")
+        self.assertEqual([(a.name, a.typename) for a in call.in_args], [("target_ns", "int64_t")])
+        self.assertEqual([(a.name, a.typename) for a in call.out_args],
+                         [("eye_positions", "struct xrt_eye_positions")])
+        self.assertFalse(call.in_handles or call.out_handles or call.varlen)
+        self.assertLess(names.index("compositor_get_predicted_eye_positions"),
+                        names.index("compositor_predict_frame"))
+        text = self._generate("generate_client_c", "ipc_client_generated.c")
+        body = self._function_body(text, "ipc_call_compositor_get_predicted_eye_positions(")
+        self.assertIn("int64_t target_ns", body)
+        self.assertIn("struct xrt_eye_positions *out_eye_positions", body)
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.stderr.write(__doc__)

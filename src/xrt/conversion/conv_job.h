@@ -80,6 +80,12 @@ struct conv_job_create_info
 	conv_stage_file_write_fn file_write;
 	void *file_ctx;
 	uint64_t max_result_bytes; //!< in-memory limit per output; 0 = none
+
+	/* ADR-057 §4 job inputs, copied to xrt_conv_job_in. params.stereo.baseline_m
+	 * is validated at submit (finite, 0 <= b <= XRT_CONV_MAX_BASELINE_M; 0 =
+	 * unknown, never defaulted). */
+	uint32_t job_flags;           //!< XRT_CONV_JOB_*
+	uint32_t max_input_long_side; //!< px; 0 = the provider's own
 };
 
 struct conv_job_status

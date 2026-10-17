@@ -161,6 +161,7 @@ comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct
 struct xrt_eye_positions;
 bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       int64_t target_ns,
                                                        struct xrt_eye_positions *out_eyes);
 
 // IPC-client eye-tracking-mode push to the out-of-process DP (#522) — same
@@ -185,6 +186,7 @@ comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uin
 struct xrt_system_compositor;
 bool
 comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              int64_t target_ns,
                                                               struct xrt_eye_positions *out_eyes);
 
 #ifdef OXR_HAVE_DXR_view_rig
@@ -339,11 +341,18 @@ to_string(XrSessionState state)
 }
 
 /*!
- * Get predicted eye positions from the session's compositor.
+ * Get the eye positions for @p target_ns from the session's compositor
+ * (ADR-054 §4.1 / N6 Part 1, #2144): xrLocateViews passes the frame's
+ * displayTime (monotonic), so the eyes the app renders for are the eyes at
+ * the instant its pixels are seen — the DP's own target-time slot when it
+ * has one; a DP without the slot keeps the vendor's "latest" prediction
+ * unchanged (today's behaviour).
  * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye_positions *out_eye_pos)
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos)
 {
 	if (sess == NULL || sess->xcn == NULL || out_eye_pos == NULL) {
 		return false;
@@ -354,31 +363,31 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_d3d11_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 	if (sess->is_d3d12_native_compositor) {
-		return comp_d3d12_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_d3d12_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
-		return comp_metal_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_metal_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->is_vk_native_compositor) {
-		return comp_vk_native_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_vk_native_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor) {
-		return comp_gl_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
+		return comp_gl_compositor_get_eye_positions_at(&sess->xcn->base, target_ns, out_eye_pos);
 	}
 #endif
 
@@ -392,7 +401,7 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 			return false;
 		}
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
+		return multi_compositor_get_eye_positions_at(mc, target_ns, out_eye_pos);
 	}
 	return false;
 }
@@ -3434,7 +3443,15 @@ locate_views_one(struct oxr_logger *log,
 			}
 		}
 	} else {
-		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
+		// N6 Part 1 (#2144): the eyes at the frame's displayTime, not "latest".
+		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (int64_t)xdisplay_time, &eye_pos);
+		static bool logged_target = false;
+		if (!logged_target && got_eye_positions) {
+			logged_target = true;
+			U_LOG_W("N6: xrLocateViews eyes at displayTime (now %+.1f ms): valid=%d tracking=%d count=%u",
+			        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
+			        (int)eye_pos.valid, (int)eye_pos.is_tracking, (unsigned)eye_pos.count);
+		}
 	}
 
 	// One-shot diagnostic: log stereo gate values for first frames
@@ -4668,20 +4685,30 @@ locate_views_one(struct oxr_logger *log,
 		    !sess->is_metal_native_compositor && sess->sys->xsysc->xmcc == NULL) {
 			struct xrt_eye_positions ipc_eyes;
 			bool got = false;
+			// N6 Part 1 (#2144): ask for the frame's displayTime — the
+			// server samples this client's DP / ring at that instant.
 			if (sess->xcn != NULL) {
-				got = comp_ipc_client_compositor_get_predicted_eye_positions(&sess->xcn->base, &ipc_eyes);
+				got = comp_ipc_client_compositor_get_predicted_eye_positions(
+				    &sess->xcn->base, (int64_t)xdisplay_time, &ipc_eyes);
 			} else {
 				// Compositor-less sessions (#449): headless clients
 				// like the WebXR bridge have no xcn — route the same
 				// RPC through the IPC system-compositor proxy so
 				// their derived isTracking (and the edge event) is
 				// truthful instead of constant-FALSE.
-				got = comp_ipc_client_system_compositor_get_predicted_eye_positions(sess->sys->xsysc,
-				                                                                    &ipc_eyes);
+				got = comp_ipc_client_system_compositor_get_predicted_eye_positions(
+				    sess->sys->xsysc, (int64_t)xdisplay_time, &ipc_eyes);
 			}
 			if (got) {
 				is_tracking = ipc_eyes.is_tracking;
 				from_ipc = true;
+				static bool logged_ipc_target = false;
+				if (!logged_ipc_target) {
+					logged_ipc_target = true;
+					U_LOG_W("N6: IPC eye query at displayTime (now %+.1f ms): valid=%d tracking=%d",
+					        (double)((int64_t)xdisplay_time - (int64_t)os_monotonic_get_ns()) / 1e6,
+					        (int)ipc_eyes.valid, (int)ipc_eyes.is_tracking);
+				}
 			}
 		}
 

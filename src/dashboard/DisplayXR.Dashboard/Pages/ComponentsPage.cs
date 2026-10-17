@@ -82,6 +82,9 @@ public sealed class ComponentsPage : Page
         foreach (var c in ComponentClasses.All)
         {
             sb.Append(Ctx.PolicyLoading(c)).Append(Ctx.PolicyUnsupported(c)).Append(Ctx.PolicyError(c));
+            // The class-level policy facts the rows do not carry: the lock and the per-task preferences.
+            if (Ctx.Policies.TryGetValue(c, out var pl))
+                sb.Append(pl.PolicyLock).Append(string.Join(",", pl.PreferredByTask.Select(kv => kv.Key + "=" + kv.Value)));
             if (Ctx.LastActionArea == PolicyCommands.Area(c)) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed).Append(_policyActionRow);
         }
         sb.Append(_machine).Append('|');
@@ -116,6 +119,9 @@ public sealed class ComponentsPage : Page
         var title = U.Flow(10, 4, U.Text(s.Title, "group"), count);
         var head = U.VStack(4, title, U.Wrapped(s.ConnectedLine, "dim"), U.Wrapped(s.Role, "desc"));
         var body = U.VStack(14, head);
+        // ADR-054 N3e: HKLM Policy\Lock makes per-user writes of this class inert; say so once, on the class.
+        if (PolicyList.ClassOfSection(s.Id) is { } sc && Ctx.Policies.TryGetValue(sc, out var spl) && spl.LockText is { } lockText)
+            body.Children.Add(U.Notice(Level.Info, "Locked by machine policy", lockText));
 
         bool collapsed = s.Collapsed && !_expanded.Contains(s.Id);
         if (s.IsEmpty)
@@ -227,12 +233,12 @@ public sealed class ComponentsPage : Page
                 }
                 var combo = new Hotkey(mods, name!).ToString();
                 _captureNote = null;
-                _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --hotkey {StatusText.Quote(combo)}");
+                _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--hotkey", combo));
                 Update(force: true);
             }, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         }
 
-        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --no-hotkey"), "quiet", "sm");
+        var clear = U.Button("Clear", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--no-hotkey")), "quiet", "sm");
         clear.IsEnabled = !busy && launch.Hotkey is { Length: > 0 };
 
         // (b) mode.
@@ -249,11 +255,11 @@ public sealed class ComponentsPage : Page
         mode.SelectionChanged += (_, _) =>
         {
             if (mode.SelectedIndex < 0 || mode.SelectedIndex == modeWas || Ctx.ActionRunning) return;
-            _ = Ctx.RunActionsAsync("workspace", $"workspace set {StatusText.Quote(id)} --mode {(mode.SelectedIndex == 1 ? "disabled" : "auto")}");
+            _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "set", id, "--mode", mode.SelectedIndex == 1 ? "disabled" : "auto"));
         };
 
         // (c) launch now.
-        var launchNow = U.Button("Launch now", () => _ = Ctx.RunActionsAsync("workspace", $"workspace launch {StatusText.Quote(id)}"), "primary", "sm");
+        var launchNow = U.Button("Launch now", () => _ = Ctx.RunActionsAsync("workspace", new CliArgs("workspace", "launch", id)), "primary", "sm");
         launchNow.IsEnabled = !busy && !launch.Disabled && !connected;
         ToolTip.SetTip(launchNow, launch.Disabled ? "Launching is disabled." : connected ? "Already connected." : "Start it now, the same way the hotkey does.");
 
@@ -301,20 +307,27 @@ public sealed class ComponentsPage : Page
         bool machine = _machine && elevated;
         var row = U.Flow(10, 6);
 
-        void Run(string command)
+        void Run(CliArgs command)
         {
             _policyActionRow = r.Id;
             _ = Ctx.RunActionsAsync(area, command);
         }
 
-        // (a) Enabled.
+        // Policy\Lock: a per-user write would be ignored, so the per-user controls are inert
+        // (a machine-wide write from an elevated dashboard still applies).
+        bool enabledLocked = list.LockHidesUserEnabled && !machine;
+        bool prefLocked = list.LockHidesUserPreference && !machine;
+        const string lockTip = "Locked by machine policy (HKLM Policy\\Lock): a per-user value is ignored. An administrator changes the machine-wide value (--machine).";
+
+        // (a) Enabled — never on the built-in adapter, which has no Enabled value (EnabledKnown).
         if (r.EnabledKnown)
         {
-            var enabled = new CheckBox { Content = "Enabled", IsChecked = r.Enabled, IsEnabled = !busy && !r.Untrusted, VerticalAlignment = VerticalAlignment.Center };
+            var enabled = new CheckBox { Content = "Enabled", IsChecked = r.Enabled, IsEnabled = !busy && !r.Untrusted && !enabledLocked, VerticalAlignment = VerticalAlignment.Center };
             Avalonia.Automation.AutomationProperties.SetName(enabled, $"Enabled: {r.Name}");
             ToolTip.SetTip(enabled, r.Untrusted
                 ? "Refused by the provenance gate: allowlist the binary first (the runtime log names the row to write)."
-                : $"displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, machine) : PolicyCommands.Enable(cls, r.Id, machine))}");
+                : enabledLocked ? lockTip
+                : $"displayxr-cli {PolicyCommands.Toggle(cls, r.Id, r.Enabled, machine)}");
             enabled.IsCheckedChanged += (_, _) =>
             {
                 if (Ctx.ActionRunning) return;
@@ -346,23 +359,21 @@ public sealed class ComponentsPage : Page
         }
         else
         {
-            foreach (var task in list.TasksOf(r.Id).Select(t => t.Task).Distinct())
+            foreach (var task in list.TaskNamesOf(r.Id))
             {
-                bool mine = list.PreferredByTask.TryGetValue(task, out var pref)
-                            && (pref == r.Id || pref.StartsWith(r.Id + "/", System.StringComparison.Ordinal));
-                if (mine)
+                if (list.IsPreferredFor(task, r.Id))
                 {
                     U.AddFlow(row, U.Chip($"preferred for {task}", Level.Info), 10, 6);
                     var reset = U.Button($"Reset {task}", () => Run(PolicyCommands.ResetTask(task, machine)), "quiet", "sm");
-                    reset.IsEnabled = !busy;
-                    ToolTip.SetTip(reset, $"displayxr-cli {PolicyCommands.ResetTask(task, machine)}");
+                    reset.IsEnabled = !busy && !prefLocked;
+                    ToolTip.SetTip(reset, prefLocked ? lockTip : $"displayxr-cli {PolicyCommands.ResetTask(task, machine)}");
                     U.AddFlow(row, reset, 10, 6);
                 }
-                else
+                else if (!r.BuiltIn) // the built-in adapter is never a provider to prefer
                 {
                     var prefer = U.Button($"Prefer for {task}", () => Run(PolicyCommands.PreferTask(task, r.Id, machine)), "quiet", "sm");
-                    prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted;
-                    ToolTip.SetTip(prefer, $"displayxr-cli {PolicyCommands.PreferTask(task, r.Id, machine)}");
+                    prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted && !prefLocked;
+                    ToolTip.SetTip(prefer, prefLocked ? lockTip : $"displayxr-cli {PolicyCommands.PreferTask(task, r.Id, machine)}");
                     U.AddFlow(row, prefer, 10, 6);
                 }
             }
@@ -379,10 +390,16 @@ public sealed class ComponentsPage : Page
 
         // (d) what a change means, and how an administrator does it machine-wide.
         var col = U.VStack(6, row);
+        if (r.BuiltIn)
+            col.Children.Add(U.Wrapped("Built-in adapter: it has no Enabled value and is not a provider to prefer. A registered provider hides it with Supersedes = dp-lift.", "meta"));
         string scope = machine ? "Machine-wide." : elevated ? "Per user." : "Per user; machine-wide needs an administrator prompt.";
         col.Children.Add(U.Wrapped($"{scope} {cls.AppliesNote()}", "meta"));
-        if (!elevated && r.EnabledKnown)
-            col.Children.Add(U.Wrapped($"Machine-wide: displayxr-cli {(r.Enabled ? PolicyCommands.Disable(cls, r.Id, true) : PolicyCommands.Enable(cls, r.Id, true))}", "mono"));
+        // Non-elevated: every control's machine-wide command (Enabled, Prefer, Reset), for an administrator.
+        if (!elevated && PolicyCommands.MachineHints(r, list) is { Count: > 0 } hints)
+        {
+            col.Children.Add(U.Wrapped("Machine-wide, from an administrator prompt:", "meta"));
+            foreach (var h in hints) col.Children.Add(U.Wrapped($"displayxr-cli {h}", "mono"));
+        }
         if (Ctx.LastActionArea == area && _policyActionRow == r.Id && Ctx.LastAction is { } la)
             col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("POLICY", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
         var box = new Border { Child = col, Margin = new Thickness(22, 8, 0, 0) };

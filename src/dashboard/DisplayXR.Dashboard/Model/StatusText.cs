@@ -233,13 +233,10 @@ public static class StatusText
             dp?.Screen(x.Key)?.EffectivePlugin ?? (x.Claim.IsClaimed ? x.Claim.PluginId : null),
             ForcedChip(x, dp))).ToList();
 
-    public static string Quote(string arg) => arg.Length == 0 || arg.Any(c => char.IsWhiteSpace(c) || c == '"')
-        ? "\"" + arg.Replace("\"", "\\\"") + "\"" : arg;
-
     /// <summary>The CLI verb a selector choice runs.</summary>
-    public static string DpVerb(string key, DpChoice choice) => choice.PluginId is null
-        ? $"dp reset --screen {Quote(key)}"
-        : $"dp use {Quote(choice.PluginId)} --screen {Quote(key)}";
+    public static CliArgs DpVerb(string key, DpChoice choice) => choice.PluginId is null
+        ? new CliArgs("dp", "reset", "--screen", key)
+        : new CliArgs("dp", "use", choice.PluginId, "--screen", key);
 
     /// <summary>"forced (user)" when an override forces this screen's claim.</summary>
     public static string? ForcedChip(Screen s, DpList? dp)

@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_eyes.h"
 #include "sim_display_settings.h"
 #include "sim_display_monitor_geometry.h"
 
@@ -160,6 +161,12 @@ sim_display_fake_tracking_is_tracking(void)
 bool
 sim_display_fake_tracking_sample(uint64_t *out_edges)
 {
+	return sim_display_fake_tracking_sample_at((int64_t)os_monotonic_get_ns(), out_edges);
+}
+
+bool
+sim_display_fake_tracking_sample_at(int64_t target_ns, uint64_t *out_edges)
+{
 	if (out_edges != NULL) {
 		*out_edges = 0;
 	}
@@ -174,18 +181,54 @@ sim_display_fake_tracking_sample(uint64_t *out_edges)
 			period_ms = 0;
 		}
 	}
-	if (period_ms == 0) {
-		return true; // Toggle on, no period: always tracking.
+	// Toggle on, no period: always tracking; else the square wave at the target.
+	return sim_fake_tracking_at(period_ms, target_ns, out_edges);
+}
+
+bool
+sim_display_eyes_at(struct xrt_eye_positions *out,
+                    uint32_t view_count,
+                    float nominal_x_m,
+                    float nominal_y_m,
+                    float nominal_z_m,
+                    float ipd_m,
+                    int64_t target_ns,
+                    bool *webcam_dp_ref)
+{
+	// The sway knobs (N6 Part 1): read once through the host iface
+	// (`dp set sim-display TRACKING_SWAY_MM 20`). Only a fake-tracked viewer
+	// moves — with TRACKING off the eyes are the static nominal viewer
+	// sim_display always reported.
+	static float sway_m = -1.0f;
+	static int64_t sway_period_ns = 0;
+	if (sway_m < 0.0f) {
+		float mm = sim_display_setting_float("TRACKING_SWAY_MM", 0.0f);
+		if (!(mm >= 0.0f) || mm > 500.0f) {
+			mm = 0.0f;
+		}
+		long period_ms = sim_display_setting_num("TRACKING_SWAY_PERIOD_MS", 4000);
+		if (period_ms < 100) {
+			period_ms = 100;
+		}
+		sway_period_ns = (int64_t)period_ms * 1000000;
+		sway_m = mm / 1000.0f;
 	}
 
-	// Square wave: tracking for one period, lost for the next. Every
-	// half-period boundary is one edge.
-	int64_t now_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
-	int64_t half_periods = now_ms / period_ms;
-	if (out_edges != NULL) {
-		*out_edges = (uint64_t)half_periods;
-	}
-	return (half_periods % 2) == 0;
+	struct sim_fake_eyes_params p = {
+	    .nominal_x_m = nominal_x_m,
+	    .nominal_y_m = nominal_y_m,
+	    .nominal_z_m = nominal_z_m,
+	    .ipd_m = ipd_m,
+	    .sway_m = sim_display_fake_tracking_enabled() ? sway_m : 0.0f,
+	    .sway_period_ns = sway_period_ns,
+	};
+	sim_fake_eyes_at(&p, view_count, target_ns, out);
+	out->is_tracking = sim_display_fake_tracking_sample_at(target_ns, NULL); // false unless TRACKING (#441)
+	// #1855: opt-in webcam tracking overrides the synthetic eyes (no-op unless
+	// WEBCAM_TRACKING; a screen-bound segment DP passes NULL and stays nominal).
+	sim_display_webcam_tracking_apply_at(out, nominal_x_m, nominal_y_m, nominal_z_m, ipd_m, target_ns,
+	                                     webcam_dp_ref);
+	return true;
 }
 
 void

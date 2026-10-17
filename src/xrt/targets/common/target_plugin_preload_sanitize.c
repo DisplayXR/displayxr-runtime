@@ -13,13 +13,16 @@
 #ifdef XRT_OS_WINDOWS
 
 #include "target_plugin_preload_sanitize.h"
+#include "target_component_loader.h"
 
 #include "util/u_logging.h"
+#include "util/u_sha256.h"
 
 #include <windows.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -311,16 +314,79 @@ sanitize_resolve_dependency(const char *name8,
  *
  */
 
+//! Open @p path for reading with FILE_SHARE_READ only: no writer, renamer or deleter while it is open.
+static HANDLE
+sanitize_open_locked(const wchar_t *path)
+{
+	return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+//! SHA-256 of everything @p h holds (positional reads; the file pointer is not used).
+static bool
+sanitize_sha256_handle(HANDLE h, uint8_t out[32])
+{
+	struct u_sha256 st;
+	u_sha256_init(&st);
+	static const size_t chunk = 64 * 1024;
+	uint8_t *buf = (uint8_t *)malloc(chunk);
+	if (buf == NULL) {
+		return false;
+	}
+	uint64_t off = 0;
+	bool ok = true;
+	for (;;) {
+		OVERLAPPED ov;
+		memset(&ov, 0, sizeof(ov));
+		ov.Offset = (DWORD)(off & 0xFFFFFFFFu);
+		ov.OffsetHigh = (DWORD)(off >> 32);
+		DWORD got = 0;
+		if (!ReadFile(h, buf, (DWORD)chunk, &got, &ov)) {
+			ok = GetLastError() == ERROR_HANDLE_EOF;
+			break;
+		}
+		if (got == 0) {
+			break;
+		}
+		u_sha256_update(&st, buf, got);
+		off += got;
+	}
+	free(buf);
+	if (ok) {
+		u_sha256_final(&st, out);
+	}
+	return ok;
+}
+
+//! Hash the file at @p path through a share-read-only handle (closed again).
+static bool
+sanitize_sha256_path(const wchar_t *path, uint8_t out[32])
+{
+	HANDLE h = sanitize_open_locked(path);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	const bool ok = sanitize_sha256_handle(h, out);
+	CloseHandle(h);
+	return ok;
+}
+
 /*!
  * Copy @p src into a per-user staging dir whose path contains the literal
  * "ThirdParty" segment (the engine-side filter is case-sensitive). The
  * version-keyed subdir (file size + mtime) sidesteps locked-file replace
  * and keeps the staged copy in lockstep with vendor-platform auto-updates;
  * stale sibling versions are garbage-collected best-effort.
+ *
+ * The staging dir is user-writable, so a staged copy is never trusted by
+ * name, size or mtime: it is reused only when its SHA-256 equals the
+ * source's, re-copied (and re-checked) otherwise, and handed back OPEN
+ * share-read-only in @p out_lock so it cannot change before the caller's
+ * LoadLibrary returns. The caller closes @p out_lock.
  */
 static bool
-sanitize_stage_copy(const wchar_t *src, const wchar_t *basename, wchar_t *out_staged, size_t out_cap)
+sanitize_stage_copy(const wchar_t *src, const wchar_t *basename, wchar_t *out_staged, size_t out_cap, HANDLE *out_lock)
 {
+	*out_lock = INVALID_HANDLE_VALUE;
 	wchar_t local[SANITIZE_PATH_CAP];
 	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, SANITIZE_PATH_CAP);
 	if (n == 0 || n >= SANITIZE_PATH_CAP) {
@@ -369,13 +435,39 @@ sanitize_stage_copy(const wchar_t *src, const wchar_t *basename, wchar_t *out_st
 		CreateDirectoryW(levels[i], NULL);
 	}
 
-	WIN32_FILE_ATTRIBUTE_DATA staged_fad;
-	bool fresh = GetFileAttributesExW(staged, GetFileExInfoStandard, &staged_fad) &&
-	             staged_fad.nFileSizeLow == fad.nFileSizeLow && staged_fad.nFileSizeHigh == fad.nFileSizeHigh;
-	if (!fresh && !CopyFileW(src, staged, FALSE)) {
-		U_LOG_W("plugin loader: sanitized pre-load: copy of %ls failed (err=%lu) — loading normally.", src,
+	uint8_t src_digest[32];
+	if (!sanitize_sha256_path(src, src_digest)) {
+		U_LOG_W("plugin loader: sanitized pre-load: could not read %ls (err=%lu) — loading normally.", src,
 		        GetLastError());
 		return false;
+	}
+
+	// Reuse the staged copy only if its BYTES are the source's.
+	uint8_t staged_digest[32];
+	HANDLE lock = sanitize_open_locked(staged);
+	bool fresh = lock != INVALID_HANDLE_VALUE && sanitize_sha256_handle(lock, staged_digest) &&
+	             memcmp(staged_digest, src_digest, sizeof(src_digest)) == 0;
+	if (!fresh) {
+		if (lock != INVALID_HANDLE_VALUE) {
+			CloseHandle(lock);
+		}
+		if (!CopyFileW(src, staged, FALSE)) {
+			U_LOG_W("plugin loader: sanitized pre-load: copy of %ls failed (err=%lu) — loading normally.",
+			        src, GetLastError());
+			return false;
+		}
+		lock = sanitize_open_locked(staged);
+		if (lock == INVALID_HANDLE_VALUE || !sanitize_sha256_handle(lock, staged_digest) ||
+		    memcmp(staged_digest, src_digest, sizeof(src_digest)) != 0) {
+			U_LOG_W(
+			    "plugin loader: sanitized pre-load: staged copy %ls does not match its source — loading "
+			    "normally.",
+			    staged);
+			if (lock != INVALID_HANDLE_VALUE) {
+				CloseHandle(lock);
+			}
+			return false;
+		}
 	}
 
 	// Best-effort GC of stale version dirs (in-use ones simply stay).
@@ -410,6 +502,7 @@ sanitize_stage_copy(const wchar_t *src, const wchar_t *basename, wchar_t *out_st
 
 	wcsncpy(out_staged, staged, out_cap - 1);
 	out_staged[out_cap - 1] = L'\0';
+	*out_lock = lock;
 	return true;
 }
 
@@ -450,13 +543,17 @@ sanitize_handle_dependency(const wchar_t *dep_path,
 	}
 
 	wchar_t staged[SANITIZE_PATH_CAP];
-	if (!sanitize_stage_copy(dep_path, dep_basename, staged, SANITIZE_PATH_CAP)) {
+	HANDLE lock = INVALID_HANDLE_VALUE;
+	if (!sanitize_stage_copy(dep_path, dep_basename, staged, SANITIZE_PATH_CAP, &lock)) {
 		return;
 	}
 
-	if (LoadLibraryExW(staged, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) == NULL) {
-		U_LOG_W("plugin loader: sanitized pre-load of %ls failed (err=%lu) — loading normally.", staged,
-		        GetLastError());
+	// Loaded while `lock` (share-read-only) pins the bytes just checked.
+	HMODULE mod = LoadLibraryExW(staged, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+	const DWORD gle = mod == NULL ? GetLastError() : 0;
+	CloseHandle(lock);
+	if (mod == NULL) {
+		U_LOG_W("plugin loader: sanitized pre-load of %ls failed (err=%lu) — loading normally.", staged, gle);
 		return;
 	}
 
@@ -570,6 +667,21 @@ void
 target_plugin_sanitized_preload(const wchar_t *plugin_binary_path)
 {
 	if (plugin_binary_path == NULL || plugin_binary_path[0] == L'\0') {
+		return;
+	}
+
+	// The staging dir is %LOCALAPPDATA%\DisplayXR\ThirdParty — user-writable,
+	// and under UAC an elevated process shares that %LOCALAPPDATA%, so a
+	// non-elevated process could plant what an elevated one pre-loads. An
+	// elevated host (the installer-restarted service, an admin prompt) skips
+	// the workaround: dependencies load the normal way, from where the
+	// plug-in's installer put them. The host-tracer crash this works around
+	// is an in-process engine-app problem (#434), not an elevated-service one.
+	if (target_component_process_elevated()) {
+		U_LOG_I(
+		    "plugin loader: sanitized pre-load skipped for %ls — process is elevated and the staging dir "
+		    "is user-writable (ADR-054 N4b).",
+		    plugin_binary_path);
 		return;
 	}
 

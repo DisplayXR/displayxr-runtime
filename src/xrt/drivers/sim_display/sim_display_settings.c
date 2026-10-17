@@ -38,6 +38,13 @@ static const struct knob g_knobs[] = {
     {{"TRACKING_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0",
       "square-wave is_tracking with this period to exercise tracking-loss edges; 0 = always tracking"},
      "FAKE_TRACKING_PERIOD_MS"},
+    // N6 Part 1 (#2144): a deterministic viewer motion so the target-time eye
+    // query (get_eye_positions_at) has something to predict; 0 = static.
+    {{"TRACKING_SWAY_MM", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0",
+      "fake tracking: sway the viewer sideways by this amplitude (mm) on a closed path; 0 = static"},
+     "FAKE_TRACKING_SWAY_MM"},
+    {{"TRACKING_SWAY_PERIOD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "4000", "fake tracking: sway period (>= 100)"},
+     "FAKE_TRACKING_SWAY_PERIOD_MS"},
     // Panel geometry + output.
     {{"OUTPUT", XRT_COMPONENT_SETTING_TYPE_ENUM, "blend",
       "initial output mode: 2d|passthrough, anaglyph, sbs, squeezed|squeezed_sbs, quad, interlaced, blend"},

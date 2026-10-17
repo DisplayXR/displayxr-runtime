@@ -2109,8 +2109,9 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max)
 		d->enabled = entries[i].enabled;
 		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", dp_enabled_source(&entries[i]));
 		// ADR-054 N4b: the load path classifies what it loads; a lister
-		// asks explicitly (cached per file + size + mtime, so the service's
-		// status snapshot re-enumerating on world events never re-hashes).
+		// asks explicitly (thread-safe: the service's status snapshot reaches
+		// this from IPC threads; it re-hashes, but the signature check is
+		// cached per file identity + digest).
 		(void)target_component_check_provenance(&g_dp_class, &entries[i]);
 		d->provenance = entries[i].provenance;
 		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", entries[i].provenance_reason);

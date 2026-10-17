@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using DisplayXR.Dashboard.Feed;
+using DisplayXR.Dashboard.Model;
 using Xunit;
 
 namespace DisplayXR.Dashboard.Tests;
@@ -78,7 +79,10 @@ internal sealed class FakeSource : IProcessSource
     }
 
     public readonly List<Child> Children = new();
+    /// <summary>Each run's readable command line (<see cref="CliArgs.ToString"/>).</summary>
     public readonly List<string> Runs = new();
+    /// <summary>Each run's argument vector, as the process would receive it.</summary>
+    public readonly List<CliArgs> Argv = new();
     public bool FailStart;
     public Func<string, CliResult> Run = _ => new CliResult(0, "", "", false, null);
 
@@ -92,10 +96,11 @@ internal sealed class FakeSource : IProcessSource
         return c;
     }
 
-    public Task<CliResult> RunAsync(string arguments, TimeSpan timeout, CancellationToken cancel = default)
+    public Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default)
     {
-        Runs.Add(arguments);
-        return Task.FromResult(Run(arguments));
+        Runs.Add(args.ToString());
+        Argv.Add(args);
+        return Task.FromResult(Run(args.ToString()));
     }
 }
 
@@ -343,16 +348,16 @@ public class StatusFeedTests
         DashboardLog.Disabled = true;
         var fx = new FixtureProcessSource(TestData.Path("two-panels.ndjson"), new FakeSource());
         string key = "edid:ACR-0001-QI012321D10117";
-        var list0 = fx.RunAsync("dp list --json", TimeSpan.FromSeconds(1)).Result;
+        var list0 = fx.RunAsync(CliArgs.Words("dp list --json"), TimeSpan.FromSeconds(1)).Result;
         Assert.True(Model.DpList.TryParse(list0.Stdout, out var dp0));
         Assert.False(dp0!.Screen(key)!.Forced);
-        Assert.True(fx.RunAsync($"dp use sim-display --screen {key}", TimeSpan.FromSeconds(1)).Result.Ok);
-        var snap = TestData.Parse(fx.RunAsync("status --json", TimeSpan.FromSeconds(1)).Result.Stdout);
+        Assert.True(fx.RunAsync(new CliArgs("dp", "use", "sim-display", "--screen", key), TimeSpan.FromSeconds(1)).Result.Ok);
+        var snap = TestData.Parse(fx.RunAsync(CliArgs.Words("status --json"), TimeSpan.FromSeconds(1)).Result.Stdout);
         var ds1 = snap.Screens.Single(s => s.Key == key);
         Assert.True(ds1.Claim.Forced);
         Assert.Equal("sim-display", ds1.Claim.PreferredPlugin);
-        Assert.True(fx.RunAsync("dp reset --screen all", TimeSpan.FromSeconds(1)).Result.Ok);
-        Assert.True(Model.DpList.TryParse(fx.RunAsync("dp list --json", TimeSpan.FromSeconds(1)).Result.Stdout, out var dp1));
+        Assert.True(fx.RunAsync(CliArgs.Words("dp reset --screen all"), TimeSpan.FromSeconds(1)).Result.Ok);
+        Assert.True(Model.DpList.TryParse(fx.RunAsync(CliArgs.Words("dp list --json"), TimeSpan.FromSeconds(1)).Result.Stdout, out var dp1));
         Assert.Null(dp1!.Screen(key)!.PreferredPlugin);
     }
 }

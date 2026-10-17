@@ -44,6 +44,7 @@
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_threading.h"
 
 #include "math/m_api.h"
@@ -277,6 +278,14 @@ struct comp_metal_compositor
 
 	//! Generic Metal display processor.
 	struct xrt_display_processor_metal *display_processor;
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the post-process_atlas cache, the HUD, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
+	 */
+	struct u_eye_history eye_hist;
 
 	//! Intermediate texture at content dims for DP input (crop from atlas).
 	id<MTLTexture> dp_input_texture;
@@ -6170,6 +6179,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    fresh_eyes.valid) {
 			c->cached_eye_pos = fresh_eyes;
 			c->have_cached_eye_pos = true;
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &fresh_eyes, (int64_t)os_monotonic_get_ns());
 		}
 	}
 
@@ -6469,6 +6481,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 
 	os_mutex_destroy(&c->seg_pub_mutex);
 	os_mutex_destroy(&c->mutex);
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	free(c);
 }
@@ -6756,6 +6769,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 
 	int ret = os_mutex_init(&c->mutex);
 	if (ret != 0) {
@@ -7023,7 +7037,35 @@ comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 		return false;
 	}
 
-	return xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	const bool ok = xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	if (ok && out_eye_pos->valid) {
+		// N6 Part 1 (#2144): keyed by the time it was asked.
+		u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+	}
+	return ok;
+}
+
+bool
+comp_metal_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	const bool has = xrt_display_processor_metal_has_eye_positions_at(c->display_processor);
+	if (has && xrt_display_processor_metal_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
+	    out_eye_pos->valid) {
+		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
+	return comp_metal_compositor_get_predicted_eye_positions(xc, out_eye_pos) && out_eye_pos->valid;
 }
 
 bool

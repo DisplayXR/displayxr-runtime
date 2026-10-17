@@ -267,7 +267,7 @@ public sealed class StatusFeed : IDisposable
         CliResult result;
         try
         {
-            result = await _source.RunAsync("status --json", PollTimeout).ConfigureAwait(false);
+            result = await _source.RunAsync(CliArgs.Words("status --json"), PollTimeout).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

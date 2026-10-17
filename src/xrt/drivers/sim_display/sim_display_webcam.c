@@ -26,6 +26,7 @@
 #include "sim_display_webcam_tracking.h"
 
 #include "xrt/xrt_display_metrics.h"
+#include "util/u_eye_history.h"
 #include "util/u_logging.h"
 #include "util/u_stereo_uvc.h"
 #include "os/os_threading.h"
@@ -40,6 +41,7 @@ static int32_t g_webcam_refs = 0;                          // guarded
 static struct sim_webcam_tracker *g_webcam_tracker = NULL; // guarded
 static struct sim_face_estimator *g_webcam_est = NULL;     // guarded
 static bool g_webcam_warned_no_estimator = false;          // guarded
+static struct u_eye_history g_webcam_hist;                 // guarded; lives with the tracker (N6 Part 1)
 
 bool
 sim_display_webcam_tracking_requested(void)
@@ -83,6 +85,7 @@ config_from_settings(struct sim_webcam_config *cfg)
 static void
 start_locked(void)
 {
+	u_eye_history_init(&g_webcam_hist); // paired with stop_locked, whatever happens below
 	if (!sim_face_estimator_default_available()) {
 		if (!g_webcam_warned_no_estimator) {
 			g_webcam_warned_no_estimator = true;
@@ -124,11 +127,25 @@ stop_locked(void)
 {
 	sim_webcam_tracker_destroy(&g_webcam_tracker); // joins: closes the camera
 	sim_face_estimator_destroy(&g_webcam_est);
+	u_eye_history_destroy(&g_webcam_hist);
 }
 
 bool
 sim_display_webcam_tracking_apply(
     struct xrt_eye_positions *out, float nominal_x_m, float nominal_y_m, float nominal_z_m, float ipd_m, bool *dp_ref)
+{
+	return sim_display_webcam_tracking_apply_at(out, nominal_x_m, nominal_y_m, nominal_z_m, ipd_m,
+	                                            (int64_t)os_monotonic_get_ns(), dp_ref);
+}
+
+bool
+sim_display_webcam_tracking_apply_at(struct xrt_eye_positions *out,
+                                     float nominal_x_m,
+                                     float nominal_y_m,
+                                     float nominal_z_m,
+                                     float ipd_m,
+                                     int64_t target_ns,
+                                     bool *dp_ref)
 {
 	if (!sim_display_webcam_tracking_requested() || dp_ref == NULL || out == NULL) {
 		return false;
@@ -150,10 +167,27 @@ sim_display_webcam_tracking_apply(
 	const struct xrt_vec3 nominal[2] = {{nominal_x_m - half, nominal_y_m, nominal_z_m},
 	                                    {nominal_x_m + half, nominal_y_m, nominal_z_m}};
 	struct sim_webcam_eyes eyes;
-	sim_webcam_tracker_sample(t, nominal, os_monotonic_get_ns(), &eyes);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	sim_webcam_tracker_sample(t, nominal, (uint64_t)now_ns, &eyes);
+
+	// N6 Part 1 (#2144): the tracker's pairs go through a ring sampled at
+	// the TARGET — interpolated between samples, carried forward on the last
+	// velocity, or "last known, not tracking" when the camera stalled.
+	struct xrt_eye_positions pair;
+	memset(&pair, 0, sizeof(pair));
+	pair.count = 2;
+	pair.eyes[0] = (struct xrt_eye_position){eyes.eyes[0].x, eyes.eyes[0].y, eyes.eyes[0].z};
+	pair.eyes[1] = (struct xrt_eye_position){eyes.eyes[1].x, eyes.eyes[1].y, eyes.eyes[1].z};
+	pair.valid = true;
+	pair.is_tracking = eyes.is_tracking;
+	pair.timestamp_ns = now_ns;
+	u_eye_history_push(&g_webcam_hist, &pair, now_ns);
+	struct xrt_eye_positions at = pair;
+	(void)u_eye_history_get(&g_webcam_hist, target_ns, &at); // never EMPTY right after a push
 	pthread_mutex_unlock(&g_webcam_lock);
 
-	const struct xrt_vec3 l = eyes.eyes[0], r = eyes.eyes[1];
+	const struct xrt_vec3 l = {at.eyes[0].x, at.eyes[0].y, at.eyes[0].z};
+	const struct xrt_vec3 r = {at.eyes[1].x, at.eyes[1].y, at.eyes[1].z};
 	if (out->count == 1) {
 		out->eyes[0] = (struct xrt_eye_position){(l.x + r.x) * 0.5f, (l.y + r.y) * 0.5f, (l.z + r.z) * 0.5f};
 	} else if (out->count >= 4) {
@@ -167,7 +201,8 @@ sim_display_webcam_tracking_apply(
 		out->eyes[1] = (struct xrt_eye_position){r.x, r.y, r.z};
 	}
 	out->valid = true;
-	out->is_tracking = eyes.is_tracking;
+	out->is_tracking = at.is_tracking;
+	out->timestamp_ns = at.timestamp_ns; // the sample time the answer is based on
 	return true;
 }
 

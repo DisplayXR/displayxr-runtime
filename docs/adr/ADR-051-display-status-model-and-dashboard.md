@@ -261,7 +261,16 @@ dashboard drives every change through the CLI. Step N3e makes the Components pag
   never what the click assumed.
 - Per user by default. The dashboard runs non-elevated by design, so machine-wide
   (`--machine`) writes are offered only when it happens to run elevated; otherwise
-  the row shows the `--machine` command for an administrator and attempts nothing.
+  the row shows the `--machine` command of each of its controls (Enabled, Prefer,
+  Reset) for an administrator and attempts nothing.
+- The controls follow what the CLI says, not what the dashboard guesses: a row's
+  source chip is the CLI's `enabled_source` (never invented); the built-in conversion
+  adapter (`built_in`) gets no Enabled and no Prefer control, because the CLI refuses
+  them; a class whose `policy.policy_lock` is set shows "Locked by machine policy" and
+  disables the per-user controls the lock makes inert (Enabled for every class, the
+  per-task preference for conversion). Every `note:` / `warning:` line of a write is
+  shown, and every CLI call is an argument vector (`ProcessStartInfo.ArgumentList`),
+  never a command line the dashboard quotes.
 - The rows are joined by registration id onto the sections the status snapshot and
   `info --json` already build; a CLI without the N3 verbs (no `enabled_source` in
   its rows) shows no controls and loses nothing. Still zero `Microsoft.Win32`

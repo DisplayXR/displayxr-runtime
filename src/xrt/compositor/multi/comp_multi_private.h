@@ -2058,6 +2058,25 @@ bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos);
 
 /*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (same source order as
+ * @ref multi_compositor_get_predicted_eye_positions), else that "latest"
+ * answer.
+ *
+ * @param mc          The multi_compositor.
+ * @param target_ns   When the pixels will be seen (monotonic ns).
+ * @param[out] out_eye_pos The eye positions (in meters).
+ * @return true if valid eye positions are available, false otherwise.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+bool
+multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
+                                      int64_t target_ns,
+                                      struct xrt_eye_positions *out_eye_pos);
+
+/*!
  * Create a Vulkan display processor through the plug-in factory. On Android
  * the call is marshalled onto the service main thread (the vendor DP's async
  * init needs a pumped Looper, #510 M2) with a 2 s bound (#1007): on timeout the

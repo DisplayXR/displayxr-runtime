@@ -153,7 +153,7 @@ HKLM\Software\DisplayXR\DisplayProcessors
 
 | Value             | Type        | Required | Purpose                                                                                                                                  |
 | ----------------- | ----------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `Binary`          | `REG_SZ`    | yes      | Absolute path to the plug-in DLL. Spaces in the path are allowed; the runtime does no shell-style splitting.                             |
+| `Binary`          | `REG_SZ`    | yes      | Absolute path to the plug-in DLL (`C:\…` or `\\server\…`; anything else makes the row malformed). Spaces allowed; no shell-style splitting. |
 | `DisplayName`     | `REG_SZ`    | yes      | Human-readable name; logged at probe attempt and at successful negotiate.                                                                |
 | `Vendor`          | `REG_SZ`    | no       | Publisher name (e.g. `"Leia Inc."`). Logged at probe attempt.                                                                            |
 | `Version`         | `REG_SZ`    | no       | Free-form vendor version string. Logged at successful negotiate.                                                                         |
@@ -274,7 +274,12 @@ per-user HKCU `Enabled` is in force, whatever its value; `machine` =
 disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX
 manifest; `default` = enabled with no per-user value), the `PreferredPlugin`
 override, the N4b provenance verdict, and `*` on the plug-in the loader
-would select — a disabled one is never `*`. `displayxr-cli selftest` reports
+would select — a disabled one is never `*`. The JSON also carries
+`policy.policy_lock` (bool; the same key `conv list --json` emits): HKLM
+`DisplayProcessors\Policy\Lock` = 1, so no row is `user` and a per-user
+`dp enable|disable` is ignored — the CLI says so in a `note:` line, and the
+dashboard disables its per-user Enabled control (a `PreferredPlugin` is not
+under the lock). Always false on POSIX. `displayxr-cli selftest` reports
 the better-ranked plug-ins discovery skipped because they are disabled
 (`display_processor.skipped_disabled` in `--json`; the `active_plugin`
 check's detail in text), so "sim-display is active" on a box with a vendor
@@ -447,7 +452,7 @@ Fields mirror the Windows registry schema:
 | `plugin.display_name` | `DisplayName`      | yes      | Logged at probe / negotiate.                                                          |
 | `plugin.vendor`       | `Vendor`           | no       | Publisher name.                                                                       |
 | `plugin.version`      | `Version`          | no       | Free-form version string.                                                             |
-| `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib`. Spaces allowed.                                |
+| `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib` (a relative one makes the manifest malformed — nothing resolves it against the manifest's directory). Spaces allowed. |
 | `plugin.probe_order`  | `ProbeOrder`       | no       | Default 100. Sim-display=200, vendors=50.                                             |
 | `plugin.enabled`      | `Enabled`          | no       | Boolean; `false` = the loader never tries this plug-in, in any scan (§1 step 3), and `dp list` shows it `no (manifest)`. A non-boolean rejects the manifest as malformed (the shared component loader's parser, ADR-054 N2). This is the POSIX switch — there is no per-user `Enabled` store, so `displayxr-cli dp enable\|disable` is refused here and points at this field. |
 | `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
@@ -878,18 +883,70 @@ these, first match wins (`target_component_provenance_classify`):
 
 | Verdict | Means | Where it comes from |
 |---|---|---|
-| `signed` | valid Authenticode chain to a trusted root | Windows, `WinVerifyTrust` (no UI, no network revocation) — any trusted root in v1, no publisher pinning |
-| `allowlisted` | the file's SHA-256 is in the **admin-only** allowlist | Windows: a value named `<sha256-hex>` under `HKLM\Software\DisplayXR\Trust\Allowlist` (data = a note); POSIX: a `<sha256-hex>` line in `/etc/displayxr/trust/allowlist` |
-| `platform-trusted` | the platform already vouches for it | Android: anything inside the runtime APK; `.deb`/package installs: root-owned, not group/world-writable, under `/usr` or `/opt` |
+| `signed` | valid Authenticode chain to a trusted root | Windows, `WinVerifyTrust` (no UI, no network revocation) — any trusted root in v1, no publisher pinning; a valid chain whose leaf has no subject CN is `signed` by `(unknown subject)` |
+| `allowlisted` | the file's SHA-256 is in the **admin-only** allowlist | Windows: a value named `<sha256-hex>` under `HKLM\Software\DisplayXR\Trust\Allowlist` (data = a note); POSIX: a `<sha256-hex>` line in `/etc/displayxr/trust/allowlist` (honoured only if the file and every parent directory are root-owned and not group/world-writable) |
+| `platform-trusted` | the platform already vouches for it | Android: anything inside the runtime APK; `.deb`/`.pkg` installs: the `realpath()`-resolved path under `/usr/`, `/opt/` or `/Library/Application Support/DisplayXR/`, and the file **and every directory up to `/`** root-owned and not group/world-writable |
 | `dev-override` | unsigned and unlisted, admitted by `DXR_ALLOW_DEV_PLUGIN_PATHS` | **non-elevated hosts only** — an elevated process (the installer-restarted service, CI runners, an admin prompt) gets no override |
 | `unverified` | none of the above | what the gate refuses once enforcing |
 
 The digest, signer and one-line reason (for `unverified`: the exact allowlist row
 to write) are kept on the registration and shown by `displayxr-cli info`,
 `selftest --json` (`plugins[].provenance` / `signer` / `provenance_reason`) and,
-through the N3 CLI passes, the `dp|input|conv list` tables. The check caches per
-file (path, size, mtime) for the process, so the service's re-probes do not
-re-hash.
+through the N3 CLI passes, the `dp|input|conv list` tables.
+
+**Signature policy, stated plainly.** Revocation is not checked
+(`WTD_REVOKE_NONE`, cache-only URL retrieval, so a load never waits on the
+network), and any code-signing certificate that chains to a trusted root
+passes — the gate does not yet pin a publisher (future work). `signed` means
+"some trusted publisher signed these bytes", not "DisplayXR or a known vendor
+signed them".
+
+**The same file, start to finish.** The load path opens the binary once and
+judges and loads *that* file. Windows: `CreateFileW(GENERIC_READ,
+FILE_SHARE_READ)`; the SHA-256 is read through the handle, `WinVerifyTrust`
+receives it as `WINTRUST_FILE_INFO.hFile`, and the handle stays open until
+`LoadLibraryExW` returns — the share mode refuses every writer, renamer and
+deleter meanwhile — and the mapped module is then compared to the handle by
+volume serial + file index (mismatch → `FreeLibrary`, `UNTRUSTED`). POSIX:
+`open(O_RDONLY|O_CLOEXEC)` + `fstat`, hashed through the descriptor, and the
+path must still name that descriptor's `st_dev`/`st_ino`/size/mtime just
+before and just after `dlopen` (else `dlclose`, `UNTRUSTED`). POSIX does not
+`dlopen("/proc/self/fd/N")`: that names the module `/proc/self/fd/N`, which
+breaks `$ORIGIN` and the `dladdr()` own-directory lookups plug-ins use for
+their resources. The residual POSIX window is a swap-and-swap-back during the
+`dlopen` call itself by someone who can write the file or its directory —
+which the `platform-trusted` rule's root-owned chain excludes. The listers
+(`dp|input|conv list`, `selftest`, `info`) run the same evaluation on a
+handle they open and close without loading.
+
+**What is cached.** The digest is recomputed through the open handle on every
+check (cheap next to `LoadLibrary`). Only the Authenticode result is cached
+for the process, keyed on the file's identity (volume serial + file index /
+`st_dev` + `st_ino`), size, mtime **and** that digest, so a file rewritten in
+place with its size and mtime restored is judged afresh; the allowlist and
+platform facts are re-evaluated every time (an admin may remove a row at any
+moment). One lock guards the cache: the DP refresh, the service's IPC status
+snapshots and the input / conversion loaders all reach it from their own
+threads.
+
+**A relative `Binary` is malformed.** A registry `Binary` that is not a
+drive-letter or UNC path, or a manifest `plugin.binary_path` that is not
+absolute, marks the row MALFORMED; it is never handed to `LoadLibrary` /
+`dlopen`, which would resolve it against the host's search order or cwd.
+
+**Dependencies are not provenance-gated.** Only the component binary itself
+is checked. The DLLs / shared objects it imports load by the platform's normal
+rules from wherever its installer put them — a vendor that wants its
+dependencies covered ships them signed, or in the root-owned / admin-only
+locations the platform already protects. One runtime mechanism used to stage
+copies of dependencies: the #434 sanitized pre-load copies a dependency with
+tracer-unsafe unwind data into the per-user, user-writable
+`%LOCALAPPDATA%\DisplayXR\ThirdParty\…` and loads it from there. Under UAC an
+elevated process shares that directory, so **on an elevated host the
+sanitized pre-load is skipped** (dependencies load normally); on a
+non-elevated host a staged copy is reused only if its SHA-256 equals the
+source's (re-copied otherwise) and is held open share-read-only until its
+load returns.
 
 **Enforcing on Windows (ADR-054 N4b PR B).** The gate shipped in audit mode in
 v2.44.2 and has **enforced by default on Windows** since the release after it:
@@ -904,7 +961,9 @@ same as absent. **POSIX stays in audit mode by default**: it has no signer check
 tarball's user-level install (`install.sh` without `--system`) puts an unsigned
 plug-in in a user-owned directory the platform rule cannot vouch for.
 `/etc/displayxr/trust/enforce` enforces unless its first non-blank byte is
-`0`; the `.deb` (`/usr/lib/displayxr/plugins`) and the macOS `.pkg`
+`0` (like the allowlist, it counts only if it and every parent directory are
+root-owned and not group/world-writable — otherwise it is ignored with one
+WARN and the platform default applies); the `.deb` (`/usr/lib/displayxr/plugins`) and the macOS `.pkg`
 (`/Library/Application Support/DisplayXR/…`) are root-owned and read
 `platform-trusted` either way. Android never enforces (everything is inside
 the APK). The pure decision is `target_component_trust_policy(knob_present,
@@ -917,7 +976,11 @@ signing provider missed — must have its SHA-256 written by the installer that
 ships it: the runtime installer does this for `DisplayXR-SimDisplay.dll`
 (`installer/gen_allowlist_nsh.cmake` hashes the exact bytes being packed into
 `!macro DXR_ALLOWLIST_WRITE` / `DXR_ALLOWLIST_REMOVE`; the uninstaller removes
-only the rows it wrote). A vendor installer that ships unsigned builds does the
+only the rows it wrote). Its row data is `<dll> (DisplayXR runtime installer
+<version>)`, and before writing a build's rows — and again at uninstall —
+it deletes every value whose data carries `(DisplayXR runtime installer `, so
+an in-place upgrade does not leave the previous build's digests admitting
+DLLs the box no longer ships; rows with any other note are never touched. A vendor installer that ships unsigned builds does the
 same under its own row data (see the vendor onboarding guide §5). Rows are
 value names under `HKLM\Software\DisplayXR\Trust\Allowlist`, data = a
 human note saying which installer wrote it and for what.

@@ -145,6 +145,39 @@ comp_d3d11_service_get_predicted_eye_positions_for_client(struct xrt_system_comp
                                                            struct xrt_vec3 *out_right);
 
 /*!
+ * Eye positions for a SPECIFIC client at a TARGET time (ADR-054 §4.1 /
+ * N6 Part 1, #2144): the client's DP (resolved exactly as
+ * @ref comp_d3d11_service_get_predicted_eye_positions_full_for_client) answers
+ * through its own get_eye_positions_at slot when it has one (if that slot
+ * fails, the ring of that DP's published answers — every query plus the
+ * render thread's per-frame viewer publish — is read at @p target_ns,
+ * clamped, never extrapolated). A DP WITHOUT the slot gets its "latest"
+ * answer unchanged — today's behaviour.
+ *
+ * @param target_ns When the pixels will be seen (os_monotonic_get_ns clock);
+ *                  0 = "latest" (the pre-N6 behaviour).
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_system_compositor *xsysc,
+                                                                  struct xrt_compositor *xc,
+                                                                  int64_t target_ns,
+                                                                  struct xrt_eye_positions *out_eyes);
+
+/*!
+ * @copydoc comp_d3d11_service_get_predicted_eye_positions_full_for_client_at
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client_at(struct xrt_system_compositor *xsysc,
+                                                             struct xrt_compositor *xc,
+                                                             int64_t target_ns,
+                                                             struct xrt_vec3 *out_left,
+                                                             struct xrt_vec3 *out_right);
+
+/*!
  * Get display dimensions from the D3D11 service compositor's SR weaver.
  *
  * @param xsysc The system compositor (must be D3D11 service compositor).

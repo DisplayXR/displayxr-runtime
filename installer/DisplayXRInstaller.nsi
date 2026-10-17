@@ -102,6 +102,67 @@ ShowUninstDetails show
 	!macroend
 !endif
 
+; ADR-054 N4b review: allowlist rows used to accumulate across in-place
+; upgrades — each build writes the digests of the DLLs IT ships, and only the
+; uninstaller removed rows, and only the current build's. So before writing
+; this build's rows (and again at uninstall), delete every value under
+; HKLM\Software\DisplayXR\Trust\Allowlist whose DATA carries this installer's
+; own note, "<dll> (DisplayXR runtime installer <version>)" — the text
+; installer/gen_allowlist_nsh.cmake writes. Rows any other installer, the
+; dev scripts or CI wrote carry other notes and are never touched. NSIS has no
+; regex: enumerate with EnumRegValue and scan the data with a case-sensitive
+; fixed-width window. Runs in whatever registry view the caller set (64-bit
+; in both sections, the view the loader reads).
+!define DXR_ALLOWLIST_KEY "Software\DisplayXR\Trust\Allowlist"
+!define DXR_ALLOWLIST_OWN_NOTE "(DisplayXR runtime installer "
+!macro DXR_ALLOWLIST_PURGE_OWN_FN PREFIX
+Function ${PREFIX}DxrAllowlistPurgeOwnRows
+	Push $0 ; value index
+	Push $1 ; value name
+	Push $2 ; value data
+	Push $3 ; note length
+	Push $4 ; data length
+	Push $5 ; scan position
+	Push $6 ; scan window / end
+	StrLen $3 "${DXR_ALLOWLIST_OWN_NOTE}"
+	StrCpy $0 0
+next_value:
+	ClearErrors
+	EnumRegValue $1 HKLM "${DXR_ALLOWLIST_KEY}" $0
+	IfErrors purge_done
+	StrCmp $1 "" purge_done
+	ClearErrors
+	ReadRegStr $2 HKLM "${DXR_ALLOWLIST_KEY}" $1
+	IfErrors keep_value ; not a string: not one of ours
+	StrLen $4 $2
+	StrCpy $5 0
+scan:
+	IntOp $6 $5 + $3
+	IntCmp $6 $4 0 0 keep_value ; window would run past the end
+	StrCpy $6 $2 $3 $5
+	StrCmpS $6 "${DXR_ALLOWLIST_OWN_NOTE}" own_value
+	IntOp $5 $5 + 1
+	Goto scan
+own_value:
+	DetailPrint "Allowlist: removing previous runtime-installer row $1 ($2)"
+	DeleteRegValue HKLM "${DXR_ALLOWLIST_KEY}" $1
+	Goto next_value ; the same index now names the next value
+keep_value:
+	IntOp $0 $0 + 1
+	Goto next_value
+purge_done:
+	Pop $6
+	Pop $5
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Pop $0
+FunctionEnd
+!macroend
+!insertmacro DXR_ALLOWLIST_PURGE_OWN_FN ""
+!insertmacro DXR_ALLOWLIST_PURGE_OWN_FN "un."
+
 ; Windows constants for PATH modification
 !ifndef HWND_BROADCAST
 	!define HWND_BROADCAST 0xFFFF
@@ -1111,6 +1172,9 @@ client_dll_ok:
 	; ADR-054 N4b: the digests of the three plug-in DLLs just written, so
 	; the enforcing provenance gate admits them even when this build is
 	; unsigned (installer/gen_allowlist_nsh.cmake, same list as above).
+	; Rows a previous runtime installer wrote go first: their DLLs were just
+	; overwritten, so their digests now admit nothing we ship.
+	Call DxrAllowlistPurgeOwnRows
 	!insertmacro DXR_ALLOWLIST_WRITE
 
 	; -----------------------------------------------------------------
@@ -1556,6 +1620,8 @@ Section "Uninstall"
 	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
 	; ADR-054 N4b: the allowlist rows this installer wrote for its own DLL(s);
 	; rows other installers or register_dev_plugin.bat wrote are left alone.
+	; The purge also catches rows an older runtime installer left behind.
+	Call un.DxrAllowlistPurgeOwnRows
 	!insertmacro DXR_ALLOWLIST_REMOVE
 	ReadRegStr $0 HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"
 	${If} $0 == "sim-display"

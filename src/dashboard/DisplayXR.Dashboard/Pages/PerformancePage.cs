@@ -64,7 +64,7 @@ public sealed class PerformancePage : Page
             var lines = U.VStack(2);
             foreach (var l in perf.Levers.Where(l => l.IsSet))
                 lines.Children.Add(U.Wrapped($"{l.Name} = {l.Value}   [{l.Source}]", "dev"));
-            var reset = U.Button("Reset all performance settings", () => _ = Ctx.RunActionsAsync("perf", "perf reset"), "warn", "sm");
+            var reset = U.Button("Reset all performance settings", () => _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset")), "warn", "sm");
             reset.IsEnabled = !Ctx.ActionRunning;
             var notice = U.Notice(Level.Warn,
                 $"Non-default performance settings are in force{(perf.UserWritten.Length > 0 ? " since " + perf.UserWritten : "")}",
@@ -123,9 +123,9 @@ public sealed class PerformancePage : Page
             body.Children.Add(Option(group, label, active, () =>
             {
                 if (value.Length == 0)
-                    _ = Ctx.RunActionsAsync("perf", "perf reset DXR_D3D_FORCE_GPU", "perf reset DXR_VK_FORCE_GPU");
+                    _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset DXR_D3D_FORCE_GPU"), CliArgs.Words("perf reset DXR_VK_FORCE_GPU"));
                 else
-                    _ = Ctx.RunActionsAsync("perf", $"perf set DXR_D3D_FORCE_GPU {value}", $"perf set DXR_VK_FORCE_GPU {value}");
+                    _ = Ctx.RunActionsAsync("perf", new CliArgs("perf", "set", "DXR_D3D_FORCE_GPU", value), new CliArgs("perf", "set", "DXR_VK_FORCE_GPU", value));
             }));
         }
         if (perf.SourceOf("DXR_D3D_FORCE_GPU") == "env")
@@ -139,9 +139,9 @@ public sealed class PerformancePage : Page
         string group = "mode" + Guid.NewGuid().ToString("N");
         var body = U.VStack(10, U.CardTitle("Mode", "For “the 3D looks wrong — is it the pipeline?”"),
             Option(group, "Balanced (default)", !compat, () =>
-                _ = Ctx.RunActionsAsync("perf", "perf reset DXR_WEAVE_ON_SCANOUT", "perf reset DXR_WEAVE_REPAINT")),
+                _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset DXR_WEAVE_ON_SCANOUT"), CliArgs.Words("perf reset DXR_WEAVE_REPAINT"))),
             Option(group, "Compatibility", compat, () =>
-                _ = Ctx.RunActionsAsync("perf", "perf set DXR_WEAVE_ON_SCANOUT 0", "perf set DXR_WEAVE_REPAINT 0")),
+                _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf set DXR_WEAVE_ON_SCANOUT 0"), CliArgs.Words("perf set DXR_WEAVE_REPAINT 0"))),
             U.Wrapped("Compatibility turns off the cross-adapter weave split and the repaint. It costs latency; it is not a faster setting. Leave it on Balanced unless you are diagnosing. Under the workspace / shell only the split half applies: the service weaves on its own clock, so its repaint is structural rather than a setting.", "desc"));
         return U.Card(body);
     }
@@ -152,9 +152,9 @@ public sealed class PerformancePage : Page
         string group = "diag" + Guid.NewGuid().ToString("N");
         var body = U.VStack(10, U.CardTitle("Diagnostics", "For bug reports."),
             Option(group, "Off", !on, () =>
-                _ = Ctx.RunActionsAsync("perf", "perf reset DXR_FRAME_WITNESS", "perf reset DXR_FRAME_STAGE_TIMING")),
+                _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf reset DXR_FRAME_WITNESS"), CliArgs.Words("perf reset DXR_FRAME_STAGE_TIMING"))),
             Option(group, "On (frame witness + stage timing)", on, () =>
-                _ = Ctx.RunActionsAsync("perf", "perf set DXR_FRAME_WITNESS 5", "perf set DXR_FRAME_STAGE_TIMING 1")),
+                _ = Ctx.RunActionsAsync("perf", CliArgs.Words("perf set DXR_FRAME_WITNESS 5"), CliArgs.Words("perf set DXR_FRAME_STAGE_TIMING 1"))),
             U.Wrapped("Adds frame / weave / present counters to each app's log. Changes no behaviour.", "desc"));
         return U.Card(body);
     }

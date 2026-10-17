@@ -30,6 +30,7 @@ set(tests
     tests_weave_snap_grid
     tests_lift_mailbox
     tests_sim_conversion
+    tests_remote_conversion
     tests_conversion_abi
     tests_conv_wire
     tests_conv_select
@@ -101,6 +102,9 @@ set(tests
     tests_target_screen_pin
     tests_u_setting_per_screen
     tests_u_file_socket_path
+    tests_u_eye_history
+    tests_sim_eyes
+    tests_dp_eye_positions_at
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -491,6 +495,13 @@ endif()
 
 # Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
 target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
+
+# ADR-054 §4.1 / N6 Part 1 (#2144): the trunk's eye-pair ring sampled at a
+# target time (exact / interpolate / bounded extrapolate / stale).
+target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
+# ... and the target-time slot on all five DP vtables: appended last, gated,
+# falling back to the vendor horizon.
+target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
 
 if(TARGET tests_sim_display_monitor_geometry)
 	# The pure pick is compiled straight in; the fixture path uses aux_os's
@@ -1473,6 +1484,21 @@ target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/
 target_link_libraries(tests_sim_conversion PRIVATE sim_conversion_static displayxr::conversion_store)
 set_target_properties(tests_sim_conversion PROPERTIES CXX_STANDARD 17)
 
+# ADR-057 S1 + S2: the remote conversion provider (remote_conversion_static)
+# against tests/conv_remote_test_server.py, a stdlib-only contract-v1 endpoint
+# on 127.0.0.1 started by the test; pack url / auth, the camera-block writer and
+# the off-box consent store. Without a Python 3 interpreter the endpoint cases
+# SKIP.
+target_link_libraries(tests_remote_conversion PRIVATE remote_conversion_static displayxr::conversion_store)
+set_target_properties(tests_remote_conversion PROPERTIES CXX_STANDARD 17)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+	target_compile_definitions(
+		tests_remote_conversion PRIVATE "DXR_TEST_PYTHON=\"${Python3_EXECUTABLE}\""
+		                                "DXR_TEST_SERVER_PY=\"${CMAKE_CURRENT_SOURCE_DIR}/conv_remote_test_server.py\""
+		)
+endif()
+
 # ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h) and the
 # conv_* wire family (xrt_conv_wire.h). The ABI test builds as C++17 on purpose
 # (the header promises C11 + C++17); the wire test carries a C11 TU so both
@@ -1571,6 +1597,13 @@ target_sources(
 		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_face_yunet.c
 	)
 target_include_directories(tests_sim_webcam_tracking PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+
+# N6 Part 1 (#2144): sim_display's synthetic viewer at a target time — the pure
+# half of its get_eye_positions_at slot (sway + square-wave tracking), pinned
+# host-side (it compiles into the plug-in).
+target_sources(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_eyes.c)
+target_include_directories(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+target_link_libraries(tests_sim_eyes PRIVATE xrt-interfaces)
 
 # ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
 # the ring / conversion / disparity-probe tests (it compiles into the plug-in).

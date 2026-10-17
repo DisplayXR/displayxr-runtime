@@ -496,6 +496,9 @@
 	},
 
 	"compositor_get_predicted_eye_positions": {
+		"in": [
+			{"name": "target_ns", "type": "int64_t"}
+		],
 		"out": [
 			{"name": "eye_positions", "type": "struct xrt_eye_positions"}
 		]

@@ -613,7 +613,7 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
 		d->enabled = e->enabled;
 		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", input_enabled_source(e));
 		// ADR-054 N4b: the load path classifies what it loads; a lister
-		// asks explicitly (cached per file + size + mtime).
+		// asks explicitly (signature check cached per file identity + digest).
 		(void)target_component_check_provenance(&g_input_class, entries + i);
 		d->provenance = e->provenance;
 		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", e->provenance_reason);

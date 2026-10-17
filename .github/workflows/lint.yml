@@ -136,6 +136,7 @@ jobs:
           # release. Add a key to the shim's table; never add a getenv.
           MATCHES=$(grep -rnE '\b_?w?getenv(_s)?\s*\(' \
             src/xrt/drivers/sim_display src/xrt/drivers/sim_input src/xrt/drivers/sim_conversion \
+            src/xrt/drivers/remote_conversion \
             --include='*.c' --include='*.cpp' --include='*.h' --include='*.hpp' --include='*.m' --include='*.mm' \
             | grep -vE '^src/xrt/drivers/(sim_display/sim_display_settings\.c|sim_input/sim_input_settings\.c):' \
             || true)

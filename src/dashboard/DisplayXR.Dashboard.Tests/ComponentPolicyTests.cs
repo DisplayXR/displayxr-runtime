@@ -66,7 +66,12 @@ public class ComponentPolicyTests
         Assert.Equal("dp-lift", lift.Id);
         Assert.Equal("BUILT_IN", lift.Load);
         Assert.True(lift.Enabled);
-        Assert.Equal("default", lift.EnabledSource); // conv rows always carry `enabled`
+        // This CLI (v2.44.6) predates `enabled_source` / `built_in` on conv rows: nothing is
+        // invented — the load verdict marks the built-in adapter, which gets no Enabled control.
+        Assert.Equal("", lift.EnabledSource);
+        Assert.True(lift.BuiltIn);
+        Assert.False(lift.EnabledKnown);
+        Assert.Null(lift.EnabledChip);
         Assert.Null(lift.ProvenanceChip);            // built-in: no binary, provenance "unknown"
         Assert.Empty(conv.PreferredByTask);
         Assert.Equal(new[] { "depth-mono", "depth-video", "views-mono" }, conv.TasksOf("dp-lift").Select(t => t.Task).Distinct());
@@ -77,7 +82,8 @@ public class ComponentPolicyTests
     public void ConvPolicy_PreferredByTask_IsRead()
     {
         Assert.True(PolicyList.TryParse(ComponentClass.Conversion, """
-            { "providers": [ { "id": "acme-conv", "name": "Acme", "enabled": false, "load": "NEGOTIATED",
+            { "providers": [ { "id": "acme-conv", "name": "Acme", "enabled": false, "enabled_source": "user", "load": "NEGOTIATED",
+                               "built_in": false,
                                "provenance": "unverified", "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\ab12)" } ],
               "tasks": [ { "task": "depth-mono", "provider": "acme-conv", "selected": false, "verdict": "disabled" } ],
               "policy": { "policy_lock": false, "preferred": { "depth-mono": "acme-conv/depth-a" } } }
@@ -85,7 +91,9 @@ public class ComponentPolicyTests
         Assert.Equal("acme-conv/depth-a", conv!.PreferredByTask["depth-mono"]);
         var row = Assert.Single(conv.Rows);
         Assert.False(row.Enabled);
-        Assert.Equal(("disabled (default)", Level.Plain), row.EnabledChip);
+        Assert.Equal("user", row.EnabledSource); // the CLI's word, read — never invented
+        Assert.Equal(("disabled (user)", Level.Plain), row.EnabledChip);
+        Assert.False(conv.PolicyLock);
         Assert.Equal(("unverified", Level.Warn), row.ProvenanceChip);
     }
 
@@ -129,21 +137,57 @@ public class ComponentPolicyTests
     }
 
     [Fact]
-    public void Commands_AreTheCliLines()
+    public void Commands_AreArgumentVectors()
     {
-        Assert.Equal("dp enable leia-sr", PolicyCommands.Enable(ComponentClass.Display, "leia-sr"));
-        Assert.Equal("dp disable leia-sr --machine", PolicyCommands.Disable(ComponentClass.Display, "leia-sr", machine: true));
-        Assert.Equal("input use sim-input", PolicyCommands.Prefer(ComponentClass.Input, "sim-input"));
-        Assert.Equal("input reset", PolicyCommands.Reset(ComponentClass.Input));
-        Assert.Equal("dp reset --machine", PolicyCommands.Reset(ComponentClass.Display, machine: true));
-        Assert.Equal("conv enable sim-conversion", PolicyCommands.Enable(ComponentClass.Conversion, "sim-conversion"));
-        Assert.Equal("conv use depth-mono acme-conv", PolicyCommands.PreferTask("depth-mono", "acme-conv"));
-        Assert.Equal("conv reset depth-mono --machine", PolicyCommands.ResetTask("depth-mono", machine: true));
-        Assert.Equal("conv reset all", PolicyCommands.Reset(ComponentClass.Conversion));
-        // Ids are quoted the way every other control quotes CLI arguments.
-        Assert.Equal("input disable \"odd id\"", PolicyCommands.Disable(ComponentClass.Input, "odd id"));
+        static string[] V(params string[] a) => a;
+        Assert.Equal(V("dp", "enable", "leia-sr"), PolicyCommands.Enable(ComponentClass.Display, "leia-sr").Args);
+        Assert.Equal(V("dp", "disable", "leia-sr", "--machine"), PolicyCommands.Disable(ComponentClass.Display, "leia-sr", machine: true).Args);
+        Assert.Equal(V("input", "use", "sim-input"), PolicyCommands.Prefer(ComponentClass.Input, "sim-input").Args);
+        Assert.Equal(V("input", "reset"), PolicyCommands.Reset(ComponentClass.Input).Args);
+        Assert.Equal(V("dp", "reset", "--machine"), PolicyCommands.Reset(ComponentClass.Display, machine: true).Args);
+        Assert.Equal(V("conv", "enable", "sim-conversion"), PolicyCommands.Enable(ComponentClass.Conversion, "sim-conversion").Args);
+        Assert.Equal(V("conv", "use", "depth-mono", "acme-conv"), PolicyCommands.PreferTask("depth-mono", "acme-conv").Args);
+        Assert.Equal(V("conv", "reset", "depth-mono", "--machine"), PolicyCommands.ResetTask("depth-mono", machine: true).Args);
+        Assert.Equal(V("conv", "reset", "all"), PolicyCommands.Reset(ComponentClass.Conversion).Args);
+        Assert.Equal(V("input", "disable", "x"), PolicyCommands.Toggle(ComponentClass.Input, "x", enabled: true).Args);
+        Assert.Equal(V("input", "enable", "x", "--machine"), PolicyCommands.Toggle(ComponentClass.Input, "x", enabled: false, machine: true).Args);
+        // The readable form (log pane, administrator hints).
+        Assert.Equal("conv use depth-mono acme-conv/depth-a", PolicyCommands.PreferTask("depth-mono", "acme-conv/depth-a").ToString());
         Assert.Equal(new[] { "policy-dp", "policy-input", "policy-conv" }, ComponentClasses.All.Select(PolicyCommands.Area));
         Assert.Equal(new[] { "display processor", "input provider", "conversion provider" }, ComponentClasses.All.Select(c => c.Noun()));
+    }
+
+    [Theory]
+    [InlineData("odd id")]
+    [InlineData("quote\"in\"id")]
+    [InlineData("trailing\\")]
+    [InlineData("back\\\"slash")]
+    [InlineData("")]
+    [InlineData("--machine")]
+    public void Ids_TravelAsOneArgument(string id)
+    {
+        // Whatever a (Linux) manifest put in an id, it is exactly one argument: no quoting
+        // rule between the dashboard and the CLI can split or merge it.
+        foreach (var c in ComponentClasses.All)
+        {
+            var cmd = PolicyCommands.Disable(c, id);
+            Assert.Equal(3, cmd.Args.Count);
+            Assert.Equal(id, cmd.Args[2]);
+        }
+        Assert.Equal(id, PolicyCommands.PreferTask("depth-mono", id).Args[3]);
+    }
+
+    [Theory]
+    [InlineData("plain", "plain")]
+    [InlineData("odd id", "\"odd id\"")]
+    [InlineData("a\"b", "\"a\\\"b\"")]
+    [InlineData("C:\\dir\\", "C:\\dir\\")]
+    [InlineData("C:\\my dir\\", "\"C:\\my dir\\\\\"")]
+    [InlineData("", "\"\"")]
+    public void ReadableForm_QuotesTheWayWindowsSplitsBack(string arg, string shown)
+    {
+        Assert.Equal(shown, CliArgs.Display(arg));
+        Assert.Equal(new CliArgs("a", "b"), CliArgs.Words(" a  b "));
     }
 
     [Fact]
