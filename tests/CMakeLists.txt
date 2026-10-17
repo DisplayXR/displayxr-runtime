@@ -278,6 +278,12 @@ if(TARGET comp_d3d11_conv_viewsyn)
 	# CPU march. SKIPs if no D3D11 device exists at all.
 	list(APPEND tests tests_conv_viewsyn_d3d11)
 endif()
+if(TARGET comp_vk_conv_viewsyn)
+	# ADR-053 P5 -- the Vulkan reference view synthesis against a CPU golden of
+	# the same passes, plus the D3D11 test's step-edge oracles. SKIPs with no
+	# Vulkan device.
+	list(APPEND tests tests_conv_viewsyn_vk)
+endif()
 if(TARGET comp_d3d11_conv_content)
 	# #2030 -- still-image dedupe of GPU PHOTO inputs on WARP: the content
 	# check's key drives the core (two identical inputs -> one convert, a
@@ -1407,6 +1413,9 @@ if(TARGET tests_conv_d3d11_xproc)
 endif()
 if(TARGET comp_d3d11_conv_viewsyn)
 	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
+if(TARGET tests_conv_viewsyn_vk)
+	target_link_libraries(tests_conv_viewsyn_vk PRIVATE comp_vk_conv_viewsyn comp_util aux_vk)
 endif()
 if(TARGET tests_conv_gpu_dedupe)
 	target_sources(tests_conv_gpu_dedupe PRIVATE conv_fake_provider.c)

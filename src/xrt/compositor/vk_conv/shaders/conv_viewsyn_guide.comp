@@ -1,0 +1,31 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// ADR-053 S5, pass 4 (GUIDE_FRAG): the colour box-filtered to depth
+// resolution (4 bilinear taps). Port of k_viewsyn_guide_ps.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t_color; // linear, clamp
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D o_dst;
+
+layout(push_constant) uniform Guide
+{
+	vec2 out_res;
+}
+pc;
+
+void
+main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= int(pc.out_res.x) || p.y >= int(pc.out_res.y)) {
+		return;
+	}
+	vec2 uv = (vec2(p) + 0.5) / pc.out_res;
+	vec2 h = 0.25 / pc.out_res;
+	vec3 c = textureLod(t_color, uv + vec2(-h.x, -h.y), 0.0).rgb + textureLod(t_color, uv + vec2(h.x, -h.y), 0.0).rgb +
+	         textureLod(t_color, uv + vec2(-h.x, h.y), 0.0).rgb + textureLod(t_color, uv + vec2(h.x, h.y), 0.0).rgb;
+	imageStore(o_dst, p, vec4(0.25 * c, 1.0));
+}

@@ -1,0 +1,137 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// ADR-053 S5, pass 7 (dibr.frag.glsl.js): one dispatch per view, into a
+// view-sized RGBA16F scratch. Coordinates in window HEIGHTS, origin at the
+// rect centre, +y up, +z toward the viewer (u_conv_viewsyn.h). Port of
+// k_viewsyn_main_ps with the viewport origin at 0 (the scratch is one view).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D t_color; // row 0 = top, linear clamp
+layout(set = 0, binding = 1) uniform sampler2D t_disp;  // r = unclamped normalised nearness, row 0 = top
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D o_dst;
+
+layout(push_constant) uniform Main
+{
+	vec2 vp_size;
+	vec2 disp_res; // DEPTH-grid size: sizes the disocclusion probe
+	float conv;    // n_conv
+	float qscale;
+	float taper;
+	float aspect;
+	float rear_k; // ADR-040 rear cap: scale on q < 0
+	int steps;
+	int debug;
+	float pad0;
+	vec4 eye; // xyz
+	vec4 cam; // xyz
+}
+pc;
+
+float
+qAt(vec2 uvs)
+{
+	float n = clamp(textureLod(t_disp, vec2(uvs.x, 1.0 - uvs.y), 0.0).r, 0.0, 1.0);
+	vec2 b = min(uvs, 1.0 - uvs);
+	float t = pc.taper > 0.0 ? smoothstep(0.0, pc.taper, min(b.x, b.y / pc.aspect)) : 1.0;
+	float q = pc.qscale * (n - pc.conv) * t;
+	return q < 0.0 ? q * pc.rear_k : q;
+}
+
+vec2
+srcUv(vec2 pp, float q)
+{
+	float z = q * pc.cam.z / (1.0 + q);
+	vec2 r = pc.eye.xy + (pp - pc.eye.xy) * ((pc.eye.z - z) / pc.eye.z);
+	vec2 xs = pc.cam.xy + (r - pc.cam.xy) * (1.0 + q);
+	return vec2(xs.x / pc.aspect + 0.5, xs.y + 0.5);
+}
+
+vec4
+colorAt(vec2 uv)
+{
+	return textureLod(t_color, vec2(uv.x, 1.0 - uv.y), 0.0);
+}
+
+void
+main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= int(pc.vp_size.x) || p.y >= int(pc.vp_size.y)) {
+		return;
+	}
+	vec2 pos = vec2(p) + 0.5;
+	vec2 vUv = vec2(pos.x / pc.vp_size.x, 1.0 - pos.y / pc.vp_size.y);
+	if (pc.debug == 1) {
+		float n = clamp(textureLod(t_disp, vec2(vUv.x, 1.0 - vUv.y), 0.0).r, 0.0, 1.0);
+		imageStore(o_dst, p, vec4(n, n, n, 1.0));
+		return;
+	}
+	vec2 pp = vec2((vUv.x - 0.5) * pc.aspect, vUv.y - 0.5);
+	float qNear = pc.qscale * (1.0 - pc.conv);
+	float qFar = pc.qscale * (0.0 - pc.conv);
+	if (qNear < 0.0) {
+		qNear *= pc.rear_k;
+	}
+	if (qFar < 0.0) {
+		qFar *= pc.rear_k;
+	}
+	qNear = max(qNear, 0.0);
+	qFar = min(qFar, 0.0);
+
+	// ---- coarse march, near -> far: first step where the surface is in front of the ray ----
+	float dq = (qNear - qFar) / float(pc.steps);
+	float q = qNear;
+	float qPrev = qNear;
+	bool hit = false;
+	for (int i = 0; i <= 64; i++) {
+		if (i > pc.steps) {
+			break;
+		}
+		q = qNear - dq * float(i);
+		if (qAt(srcUv(pp, q)) >= q) {
+			hit = true;
+			break;
+		}
+		qPrev = q;
+	}
+	if (!hit) {
+		q = qFar;
+	}
+	// ---- bisection refine between qPrev (ray in front of surface) and q (behind/on) ----
+	if (hit && q != qPrev) {
+		float a = qPrev, bb = q;
+		for (int k = 0; k < 6; k++) {
+			float m = 0.5 * (a + bb);
+			if (qAt(srcUv(pp, m)) >= m) {
+				bb = m;
+			} else {
+				a = m;
+			}
+		}
+		q = bb;
+	}
+	vec2 uv = srcUv(pp, q);
+
+	// ---- disocclusion: background-side gather (iw3 shift_fill equivalent) ----
+	vec2 off = pc.eye.xy - pc.cam.xy;
+	vec2 dir = length(off) > 1e-6 ? normalize(off) : vec2(1.0, 0.0);
+	vec2 texel = vec2(dir.x / pc.disp_res.x, dir.y / pc.disp_res.y);
+	vec2 dUv = texel * 2.0;
+	float qa = qAt(uv - dUv), qb = qAt(uv + dUv);
+	float jump = abs(qa - qb);
+	float edge = smoothstep(0.15, 0.5, jump / max(abs(pc.qscale), 1e-6));
+	edge *= clamp(2.0 * (max(qa, qb) - q) / max(jump, 1e-6), 0.0, 1.0);
+	vec4 col = colorAt(uv);
+	float hole = length(off) * jump;
+	if (edge > 0.0 && hole > 0.0) {
+		float side = qa < qb ? -1.0 : 1.0;
+		vec2 step1 = vec2(dir.x / pc.aspect, dir.y) * hole * side;
+		vec2 ub = uv + step1 + dUv * side;
+		vec4 bg = 0.5 * colorAt(ub) + 0.25 * colorAt(ub + step1 * 0.5) + 0.25 * colorAt(ub - step1 * 0.25);
+		col = mix(col, bg, edge * clamp(hole * pc.disp_res.y * 0.5, 0.0, 1.0));
+	}
+	imageStore(o_dst, p, vec4(col.rgb, 1.0));
+}
