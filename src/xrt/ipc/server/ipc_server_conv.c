@@ -505,7 +505,7 @@ bool
 ipc_server_conv_routes_properties(struct ipc_server_conv *sc)
 {
 	struct ipc_server_conv_io_ops io;
-	if (!get_io(sc, &io)) {
+	if (!get_io(sc, &io) || io.cpu_only) {
 		return false;
 	}
 	if (conv_core_task_has_candidate(sc->core, XRT_CONV_TASK_VIEWS_MONO) ||
@@ -520,7 +520,7 @@ bool
 ipc_server_conv_routes_create(struct ipc_server_conv *sc, uint32_t mode, uint32_t content_hint)
 {
 	struct ipc_server_conv_io_ops io;
-	if (!get_io(sc, &io)) {
+	if (!get_io(sc, &io) || io.cpu_only) {
 		return false;
 	}
 	if (mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
@@ -1620,6 +1620,11 @@ ipc_server_conv_v4_image_kinds(struct ipc_server_conv *sc, bool export_kinds)
 	if (!get_io(sc, &io)) {
 		return 0; // no GPU glue: no task is reachable yet
 	}
+	if (io.cpu_only) {
+		// The POSIX CPU glue: CPU bytes in, CPU bytes out, nothing else.
+		const bool ok = export_kinds ? io.export_cpu != NULL : io.import_input_ex != NULL;
+		return ok ? 1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU : 0;
+	}
 	// The v3 glue imports D3D11 NT / legacy DXGI shared textures and exports
 	// D3D11 NT textures + a shared fence: the kinds every spec-4 stream gets.
 	uint64_t kinds = 1ull << IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT;
@@ -1749,8 +1754,10 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 	}
 	struct ipc_server_conv_io_ops io;
 	const bool have_io = get_io(sc, &io);
-	const bool cpu_export = in->export_memory_kind == XRT_CONV_MEM_CPU;
-	if (in->export_memory_kind != 0 && in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE &&
+	// A CPU-only glue (POSIX) exports CPU bytes by default and nothing else.
+	const bool cpu_only = have_io && io.cpu_only;
+	const bool cpu_export = in->export_memory_kind == XRT_CONV_MEM_CPU || (cpu_only && in->export_memory_kind == 0);
+	if (in->export_memory_kind != 0 && (cpu_only || in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE) &&
 	    !(cpu_export && have_io && io.export_cpu != NULL)) {
 		return XRT_ERROR_INPUT_UNSUPPORTED; // an export kind no candidate offers
 	}

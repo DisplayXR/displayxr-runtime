@@ -14,17 +14,19 @@
  *
  *  - an IPC session uses its own connection (ipc_client_compositor.c hands it
  *    over — the symbol resolves at link time, the oxr_weave.c pattern);
- *  - an in-process D3D11 / D3D12 session on Windows (engine apps — the Unity
- *    display provider renders in-process on its own D3D12 device) uses a
- *    lift-only connection the session owns (ipc_client_lift_link.c), opened in
- *    the background on first use (ADR-049). Results come back as the same NT
- *    handles (texture + ID3D11Fence-created shared fence) a D3D12 device opens
- *    with OpenSharedHandle.
+ *  - an in-process session (engine apps — the Unity display provider renders
+ *    in-process on its own D3D12 device; Vulkan / GL / Metal apps on every
+ *    desktop OS) uses a lift-only connection the session owns
+ *    (ipc_client_lift_link.c), opened in the background on first use
+ *    (ADR-049). D3D11 / D3D12 sessions on Windows get results back as the same
+ *    NT handles (texture + ID3D11Fence-created shared fence) a D3D12 device
+ *    opens with OpenSharedHandle; every other in-process session takes and
+ *    gives CPU bytes (spec 4 only).
  *
- * Any other in-process session reports XR_ERROR_FEATURE_UNSUPPORTED from the
- * spec-3 calls; spec 4 enumerates the service's tasks to it with imageKinds /
- * exportKinds 0 (known, not reachable from that session yet). What depends on
- * the graphics API or Win32 lives in oxr_conv_gpu_d3d.c.
+ * The spec-3 calls are D3D11 shared textures by definition: in-process they
+ * serve D3D11 / D3D12 sessions on Windows only, any other in-process session
+ * gets XR_ERROR_FEATURE_UNSUPPORTED from them (spec 4 is its route). What
+ * depends on the graphics API or the OS lives in oxr_conv_gpu_d3d.c.
  *
  * Error contract (mirrors XR_DXR_weave §4b):
  *  - IPC session: a dead pipe (XRT_ERROR_IPC_FAILURE) marks the session lost →
@@ -176,8 +178,9 @@ lift_route_open(
 	}
 	if (!oxr_conv_inprocess_eligible(sess)) {
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "%s: in-process 2D→3D conversion is available to D3D11 / D3D12 sessions on Windows "
-		                 "only (other sessions: the out-of-process service path)",
+		                 "%s: in-process 2D→3D conversion has no transport for this session's graphics API on "
+		                 "this platform (in-process D3D11 / D3D12 / Vulkan / GL / Metal sessions on Windows, "
+		                 "desktop Linux and macOS have one)",
 		                 what);
 	}
 	struct ipc_client_lift_link *link = oxr_conv_link_get(sess);
@@ -196,6 +199,24 @@ lift_route_close(struct oxr_session *sess, struct lift_route *route, xrt_result_
 		ipc_client_lift_link_release(sess->lift_link, route->gen, last_xret == XRT_ERROR_IPC_FAILURE);
 	}
 	route->c = NULL;
+}
+
+/*!
+ * The spec-3 calls (properties, mode-typed create) take and give D3D11 shared
+ * textures: in-process they serve D3D11 / D3D12 sessions on Windows only. Any
+ * other in-process session reaches the service through the spec-4 task API.
+ */
+static XrResult
+lift_spec3_check(struct oxr_logger *log, struct oxr_session *sess, const char *what)
+{
+	if (lift_session_is_ipc(sess) || oxr_conv_v3_eligible(sess)) {
+		return XR_SUCCESS;
+	}
+	return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+	                 "%s: the spec-3 lift calls take D3D11 shared textures (in-process: D3D11 / D3D12 sessions on "
+	                 "Windows); this session converts through the spec-4 task API (xrEnumerateLiftTasksDXR, "
+	                 "XrLiftTaskStreamCreateInfoDXR, CPU images)",
+	                 what);
 }
 
 /*!
@@ -375,8 +396,9 @@ static XrResult
 oxr_lift_stream_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_lift_stream_dxr *st = (struct oxr_lift_stream_dxr *)hb;
-	oxr_conv_cpu_unmap(st->cpu_view);
+	oxr_conv_cpu_unmap(st->cpu_view, st->cpu_token);
 	st->cpu_view = NULL;
+	st->cpu_token = NULL;
 	// Best effort: a dead connection already took every stream with it.
 	if (st->sess != NULL && st->sess->xcn != NULL && !st->sess->has_lost) {
 		struct lift_route route;
@@ -598,7 +620,12 @@ lift_create_task_stream(struct oxr_logger *log,
 	uint64_t in_kinds = 0, out_kinds = 0;
 	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
 	uint32_t export_memory = 0;
-	if (t->exportKind != XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR) {
+	if (t->exportKind == XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR &&
+	    (out_kinds & (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR)) == 0 &&
+	    (out_kinds & (1ull << XR_LIFT_IMAGE_KIND_CPU_DXR)) != 0) {
+		// No D3D texture export from this session: its platform default is CPU bytes.
+		export_memory = XRT_CONV_MEM_CPU;
+	} else if (t->exportKind != XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR) {
 		if ((int)t->exportKind < 0 || (int)t->exportKind >= 64 ||
 		    (out_kinds & (1ull << (uint32_t)t->exportKind)) == 0) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: exportKind %d is not offered here", what,
@@ -737,7 +764,9 @@ lift_frame_images_resolve(struct oxr_logger *log,
 	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
 	XrLiftImageKindDXR kind = im->kind;
 	if (kind == XR_LIFT_IMAGE_KIND_PLATFORM_DEFAULT_DXR) {
-		kind = XR_LIFT_IMAGE_KIND_D3D11_NT_DXR;
+		// D3D11 NT where the session offers it, else CPU bytes (POSIX, Windows GL / Vulkan).
+		kind = (in_kinds & (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR)) != 0 ? XR_LIFT_IMAGE_KIND_D3D11_NT_DXR
+		                                                                   : XR_LIFT_IMAGE_KIND_CPU_DXR;
 	}
 	if ((int)kind < 0 || (int)kind >= 64 || (in_kinds & (1ull << (uint32_t)kind)) == 0) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR: kind %d is not offered here",
@@ -879,9 +908,13 @@ oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties)
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
 	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, properties, XR_TYPE_LIFT_PROPERTIES_DXR);
+	XrResult r = lift_spec3_check(&log, sess, "xrGetLiftPropertiesDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
 
 	struct lift_route route;
-	XrResult r = lift_route_open(&log, sess, 0, &route, "xrGetLiftPropertiesDXR");
+	r = lift_route_open(&log, sess, 0, &route, "xrGetLiftPropertiesDXR");
 	if (r != XR_SUCCESS) {
 		return r;
 	}
@@ -984,10 +1017,14 @@ oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *cr
 		                       ? (uint32_t)dreq->preferredFormat
 		                       : 0u;
 	}
+	XrResult r = lift_spec3_check(&log, sess, "xrCreateLiftStreamDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
 	// Creation is a setup call: in-process it may wait for the background
 	// connect (bounded by the connect's own service-starting window).
 	struct lift_route route;
-	XrResult r = lift_route_open(&log, sess, 6000, &route, "xrCreateLiftStreamDXR");
+	r = lift_route_open(&log, sess, 6000, &route, "xrCreateLiftStreamDXR");
 	if (r != XR_SUCCESS) {
 		return r;
 	}
@@ -1368,8 +1405,9 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 				lift_route_close(sess, &route, xret);
 				return lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR (CPU export)");
 			}
-			oxr_conv_cpu_unmap(st->cpu_view);
-			st->cpu_view = have ? oxr_conv_cpu_map((void *)(intptr_t)mh, cb) : NULL;
+			oxr_conv_cpu_unmap(st->cpu_view, st->cpu_token);
+			st->cpu_token = NULL;
+			st->cpu_view = have ? oxr_conv_cpu_map((void *)(intptr_t)mh, cb, &st->cpu_token) : NULL;
 			oxr_conv_close_handle((void *)(intptr_t)mh); // the view keeps the section alive
 			st->cpu_bytes = st->cpu_view != NULL ? cb : 0;
 		}

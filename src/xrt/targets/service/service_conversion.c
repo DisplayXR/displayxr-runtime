@@ -21,6 +21,9 @@
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_conv.h"
+#ifndef XRT_OS_WINDOWS
+#include "server/ipc_server_conv_cpu.h"
+#endif
 
 #include "target_component_loader.h"
 #include "target_conv_status.h"
@@ -1150,6 +1153,18 @@ service_conversion_start(void)
 	if (ipc_server_conv_create(g.core, &g.sc) == XRT_SUCCESS) {
 		ipc_server_conv_set_gpu_hook(g.sc, on_gpu, NULL);
 		ipc_server_set_conv(g.sc);
+#ifndef XRT_OS_WINDOWS
+		// No D3D11 device here to install a GPU glue: the CPU glue engages
+		// the core route for spec-4 streams with CPU images (roadmap §4.2,
+		// CPU-first v1). The images stay the service allocator's CPU memory.
+		struct ipc_server_conv_io_ops cpu_io;
+		if (ipc_server_conv_cpu_io_get(&cpu_io)) {
+			ipc_server_conv_set_io(g.sc, &cpu_io);
+			U_LOG_W("[conv] CPU I/O glue installed: spec-4 lift streams take and give CPU images");
+		} else {
+			U_LOG_W("[conv] no CPU image transport on this platform: no lift stream is reachable");
+		}
+#endif
 	}
 	static const struct ipc_server_conv_status_source source = {
 	    .fill = conv_status_fill,
