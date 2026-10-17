@@ -938,6 +938,20 @@ ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc);
 void
 ipc_server_conv_detach_d3d11(void);
 
+/*!
+ * ADR-053 P5: attach the conversion core's Vulkan glue (image allocation, the
+ * S5 reference view synthesis, S6 readback) to the system compositor's Vulkan
+ * device (macOS and desktop Linux: the multi system compositor's target
+ * service bundle). Called from init_all once the system compositor exists; a
+ * no-op without a core or without a Vulkan device. Detach before the system
+ * compositor is destroyed.
+ */
+void
+ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc);
+
+void
+ipc_server_conv_detach_vk(void);
+
 struct conv_core;
 
 /*!

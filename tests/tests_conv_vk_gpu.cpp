@@ -29,6 +29,10 @@
 #include "conv_fake_provider.h"
 
 #include "conversion/conv_core.h"
+#include "server/ipc_server_conv.h"
+#include "server/ipc_server_conv_cpu.h"
+#include "shared/ipc_cpu_buffer.h"
+#include "util/u_handles.h"
 #include "vk_conv/vk_conv_gpu.h"
 
 #include "os/os_time.h"
@@ -900,6 +904,209 @@ TEST_CASE("vk glue: a composed VIEWS_MONO conversion through conv_core (CPU dept
 		REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
 		conv_core_destroy(&core);
 	}
+	CHECK(tr.cpu_live == 0);
+	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
+	conv_fake_fini(&f);
+}
+
+namespace {
+
+bool
+hook_write(void *ud, const xrt_conv_image *dst, const void *px, uint32_t pitch)
+{
+	return vk_conv_gpu_write(static_cast<vk_conv_gpu *>(ud), dst, px, pitch);
+}
+
+bool
+hook_read(void *ud, const xrt_conv_image *src, void *px, uint32_t pitch)
+{
+	return vk_conv_gpu_read(static_cast<vk_conv_gpu *>(ud), src, px, pitch);
+}
+
+} // namespace
+
+TEST_CASE("vk glue under the CPU I/O table: one POSIX table, composed views exported as CPU bytes", "[conv_vk_gpu]")
+{
+	// The POSIX composition (ipc_server_conv_vk.c): the CPU I/O glue is the one
+	// I/O table (client CPU bytes in and out, cpu_only); the Vulkan glue owns
+	// allocation + S5 + S6 and lends the table its CPU <-> image copies.
+	ipc_server_conv_io_ops cpu_io;
+	if (!ipc_server_conv_cpu_io_get(&cpu_io)) {
+		SKIP("no CPU buffer transport on this platform");
+	}
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	conv_fake_provider f;
+	conv_fake_init(&f, "depth-only");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	c->state = XRT_CONV_STATE_READY;
+	c->cap.depth_kind = XRT_CONV_DEPTH_METRIC;
+
+	Tramp tr;
+	tr.gpu = x.ops;
+	conv_core_config cfg{};
+	cfg.alloc.alloc = tr_alloc;
+	cfg.alloc.free = tr_free;
+	cfg.alloc.upload = tr_upload;
+	cfg.alloc.ud = &tr;
+	cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+	cfg.prewarm_task_mask = 1ull << 63;
+	cfg.rear_cap_m = -1.0f;
+	cfg.tick_ms = 10;
+	conv_core *core = nullptr;
+	REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+	ipc_server_conv *sc = nullptr;
+	REQUIRE(ipc_server_conv_create(core, &sc) == XRT_SUCCESS);
+	// Service start: the CPU table alone (service_conversion.c).
+	ipc_server_conv_set_io(sc, &cpu_io);
+	CHECK(ipc_server_conv_v4_image_kinds(sc, false) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU));
+
+	// The attach, in ipc_server_conv_vk.c's order: copies, then the GPU side
+	// with the CPU table as its io (the route stays the CPU route).
+	ipc_server_conv_cpu_gpu copies{hook_write, hook_read, x.g};
+	ipc_server_conv_cpu_io_set_gpu(&copies);
+	ipc_server_conv_gpu gpu{};
+	gpu.alloc = x.ops; // the service hook would swap the trampoline's GPU half; Tramp already has it
+	gpu.viewsyn = x.vs;
+	gpu.readback = x.rb;
+	gpu.io = cpu_io;
+	ipc_server_conv_install_gpu(sc, &gpu);
+	CHECK(ipc_server_conv_v4_image_kinds(sc, false) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU));
+	CHECK(ipc_server_conv_v4_image_kinds(sc, true) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU));
+	CHECK_FALSE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_SBS, 0)); // cpu_only: no v3 route
+
+	conv_provider_desc d{};
+	d.id = f.id;
+	d.probe_order = 100;
+	d.enabled = true;
+	d.iface = &f.iface;
+	d.inst = conv_fake_inst(&f);
+	REQUIRE(conv_core_add_provider(core, &d) >= 0);
+	xrt_conv_wire_stream_desc sd{};
+	sd.struct_size = sizeof(sd);
+	sd.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+	sd.task = XRT_CONV_TASK_VIEWS_MONO;
+	sd.outputs = XRT_CONV_OUT_VIEWS;
+	sd.view_count = 2;
+	sd.views_layout = XRT_CONV_VIEWS_ROW;
+	sd.input_kind = XRT_CONV_INPUT_MONO;
+	xrt_conv_wire_stream_created cr{};
+	REQUIRE(conv_core_stream_create(core, 1, &sd, nullptr, &cr) == XRT_SUCCESS);
+	CHECK((cr.desc_flags & XRT_CONV_WIRE_DESC_COMPOSED) != 0u);
+
+	// S0 through the CPU table: client bytes (BGRA, flat 0x60 grey) into the slot.
+	conv_submit_layout lay{};
+	lay.image_count = 1;
+	lay.width[0] = 64;
+	lay.height[0] = 32;
+	lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+	lay.color_space[0] = XRT_CONV_CS_SRGB;
+	lay.role[0] = XRT_CONV_IMG_COLOR;
+	conv_submit_slot slot{};
+	REQUIRE(conv_core_stream_begin_submit(core, cr.stream_id, &lay, &slot) == XRT_SUCCESS);
+	std::vector<uint8_t> client((size_t)64 * 32 * 4, 0x60);
+	xrt_graphics_buffer_handle_t ch = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	REQUIRE(ipc_cpu_buffer_create(client.size(), &ch));
+	{
+		struct ipc_cpu_buffer_map m;
+		REQUIRE(ipc_cpu_buffer_map(ch, client.size(), true, &m));
+		std::memcpy(m.ptr, client.data(), client.size());
+		ipc_cpu_buffer_unmap(&m);
+	}
+	conv_input_import in{};
+	in.kind = CONV_INPUT_CPU;
+	in.handle = ch;
+	in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	in.w = 64;
+	in.h = 32;
+	in.cpu_row_pitch = 64 * 4;
+	in.cpu_bgra = true;
+	REQUIRE(cpu_io.import_input_ex(cpu_io.ud, cr.stream_id, &in, &slot) == XRT_SUCCESS);
+	conv_frame_submit fr{};
+	fr.source_time = (int64_t)now_ns();
+	fr.rect_valid = true;
+	fr.rect_w_m = 0.30f;
+	fr.rect_h_m = 0.20f;
+	uint64_t fid = 0;
+	REQUIRE(conv_core_stream_commit_submit(core, cr.stream_id, slot.slot, &fr, &fid) == XRT_SUCCESS);
+	conv_result res{};
+	REQUIRE(
+	    wait_until([&] { return conv_core_stream_acquire(core, cr.stream_id, true, &res) == XRT_SUCCESS; }, 3000));
+	REQUIRE(res.views.memory_kind != XRT_CONV_MEM_CPU); // the glue's composed views
+
+	// S8 through the CPU table: the GPU views read back into the export section.
+	ipc_server_conv_published pub{};
+	REQUIRE(cpu_io.publish_result(cpu_io.ud, cr.stream_id, &res, &pub) == XRT_SUCCESS);
+	conv_core_stream_release(core, cr.stream_id, res.ring_slot);
+	CHECK(pub.width == 128u);
+	CHECK(pub.height == 32u);
+	CHECK(pub.realloc);
+	xrt_graphics_buffer_handle_t eh = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	uint32_t w = 0, h = 0, fmt = 0;
+	uint64_t bytes = 0;
+	bool realloc = false;
+	REQUIRE(cpu_io.export_cpu(cpu_io.ud, cr.stream_id, false, &eh, &w, &h, &fmt, &bytes, &realloc));
+	REQUIRE(bytes == 128u * 32u * 4u);
+	{
+		struct ipc_cpu_buffer_map m;
+		REQUIRE(ipc_cpu_buffer_map(eh, bytes, false, &m));
+		const auto *p = static_cast<const uint8_t *>(m.ptr);
+		size_t off = 0;
+		for (size_t i = 0; i < bytes; i += 4) {
+			off += (std::abs((int)p[i] - 0x60) > 1 || p[i + 3] != 255) ? 1 : 0;
+		}
+		CHECK(off == 0u); // flat grey in, flat grey views out, every pixel drawn
+		ipc_cpu_buffer_unmap(&m);
+	}
+
+	// A GPU slot image (a provider given GPU inputs) is filled with the glue's write.
+	vk_conv_gpu_caps caps{};
+	vk_conv_gpu_get_caps(x.g, &caps);
+	if ((caps.memory_kinds & ~XRT_CONV_MEM_CPU) != 0) {
+		vk_conv_gpu_set_provider_kinds(x.g, caps.memory_kinds);
+		auto r = req_of(8, 4, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT, 1, caps.memory_kinds);
+		conv_submit_slot gs{};
+		gs.image_count = 1;
+		REQUIRE(x.ops.alloc(x.ops.ud, &r, &gs.images[0]));
+		std::vector<uint8_t> src((size_t)8 * 4 * 4);
+		for (size_t i = 0; i < src.size(); i++) {
+			src[i] = (uint8_t)i;
+		}
+		xrt_graphics_buffer_handle_t gh = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		REQUIRE(ipc_cpu_buffer_create(src.size(), &gh));
+		{
+			struct ipc_cpu_buffer_map m;
+			REQUIRE(ipc_cpu_buffer_map(gh, src.size(), true, &m));
+			std::memcpy(m.ptr, src.data(), src.size());
+			ipc_cpu_buffer_unmap(&m);
+		}
+		conv_input_import gi{};
+		gi.kind = CONV_INPUT_CPU;
+		gi.handle = gh;
+		gi.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		gi.w = 8;
+		gi.h = 4;
+		gi.cpu_row_pitch = 8 * 4;
+		REQUIRE(cpu_io.import_input_ex(cpu_io.ud, 99, &gi, &gs) == XRT_SUCCESS);
+		std::vector<uint8_t> back(src.size());
+		REQUIRE(vk_conv_gpu_read(x.g, &gs.images[0], back.data(), 0));
+		CHECK(back == src);
+		x.ops.free(x.ops.ud, &gs.images[0]);
+		vk_conv_gpu_set_provider_kinds(x.g, 0);
+	}
+
+	// The detach, in ipc_server_conv_vk.c's order; the CPU route outlives it.
+	cpu_io.stream_gone(cpu_io.ud, cr.stream_id);
+	REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
+	ipc_server_conv_install_gpu(sc, nullptr);
+	ipc_server_conv_cpu_io_set_gpu(nullptr);
+	ipc_server_conv_set_io(sc, &cpu_io);
+	CHECK(ipc_server_conv_v4_image_kinds(sc, false) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU));
+	ipc_server_conv_destroy(&sc);
+	conv_core_destroy(&core);
 	CHECK(tr.cpu_live == 0);
 	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
 	conv_fake_fini(&f);

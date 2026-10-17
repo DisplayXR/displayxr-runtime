@@ -49,7 +49,24 @@ static struct
 	struct os_mutex mtx;
 	bool mtx_ok;
 	struct cpu_io_stream streams[IPC_SERVER_CONV_MAX_STREAMS];
+	//! ADR-053 P5: a GPU glue's copies (guarded by mtx, held across a copy).
+	struct ipc_server_conv_cpu_gpu gpu;
 } g_cpu_io;
+
+static bool
+cpu_io_init(void)
+{
+	if (!g_cpu_io.mtx_ok) {
+		if (os_mutex_init(&g_cpu_io.mtx) != 0) {
+			return false;
+		}
+		g_cpu_io.mtx_ok = true; // process-lifetime, like the ops themselves
+		for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_STREAMS; i++) {
+			g_cpu_io.streams[i].handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		}
+	}
+	return true;
+}
 
 static uint32_t
 fmt_bpp(uint32_t conv_fmt)
@@ -169,8 +186,11 @@ cpu_io_import_input_ex(void *ud,
 	}
 	const struct xrt_conv_image *img = slot != NULL && slot->image_count > 0 ? &slot->images[0] : NULL;
 	const uint32_t x = in->x, y = in->y, w = in->w, hh = in->h, pitch = in->cpu_row_pitch;
-	if (img == NULL || img->memory_kind != XRT_CONV_MEM_CPU || img->cpu_ptr == NULL || img->width == 0 ||
-	    img->height == 0 || fmt_bpp(img->format) != 4 || w == 0 || hh == 0 || pitch < (x + w) * 4u) {
+	// A GPU slot image (a GPU glue that gives providers GPU inputs): staged
+	// through a CPU buffer and written with the glue's copy.
+	const bool gpu_slot = img != NULL && img->memory_kind != XRT_CONV_MEM_CPU;
+	if (img == NULL || (!gpu_slot && img->cpu_ptr == NULL) || img->width == 0 || img->height == 0 ||
+	    fmt_bpp(img->format) != 4 || w == 0 || hh == 0 || pitch < (x + w) * 4u) {
 		u_graphics_buffer_unref(&h);
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
@@ -184,11 +204,17 @@ cpu_io_import_input_ex(void *ud,
 	}
 	const uint8_t *base = (const uint8_t *)m.ptr + (size_t)y * pitch + (size_t)x * 4u;
 	const uint32_t dw = img->width, dh = img->height;
-	const uint32_t dstride = img->row_stride != 0 ? img->row_stride : dw * 4u;
+	const uint32_t dstride = gpu_slot ? dw * 4u : (img->row_stride != 0 ? img->row_stride : dw * 4u);
+	uint8_t *staging = gpu_slot ? malloc((size_t)dstride * dh) : NULL;
+	if (gpu_slot && staging == NULL) {
+		ipc_cpu_buffer_unmap(&m);
+		return XRT_ERROR_ALLOCATION;
+	}
+	uint8_t *dst_base = gpu_slot ? staging : (uint8_t *)img->cpu_ptr;
 	const bool swap =
 	    in->cpu_bgra != (img->format == XRT_CONV_FMT_BGRA8_UNORM || img->format == XRT_CONV_FMT_BGRA8_SRGB);
 	for (uint32_t yy = 0; yy < dh; yy++) {
-		uint8_t *dst = (uint8_t *)img->cpu_ptr + (size_t)yy * dstride;
+		uint8_t *dst = dst_base + (size_t)yy * dstride;
 		const uint8_t *src = base + (size_t)((uint64_t)yy * hh / dh) * pitch;
 		if (dw == w && !swap) {
 			memcpy(dst, src, (size_t)w * 4u);
@@ -203,6 +229,14 @@ cpu_io_import_input_ex(void *ud,
 		}
 	}
 	ipc_cpu_buffer_unmap(&m);
+	if (gpu_slot) {
+		os_mutex_lock(&g_cpu_io.mtx);
+		const bool ok =
+		    g_cpu_io.gpu.write != NULL && g_cpu_io.gpu.write(g_cpu_io.gpu.ud, img, staging, dstride);
+		os_mutex_unlock(&g_cpu_io.mtx);
+		free(staging);
+		return ok ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
 	return XRT_SUCCESS;
 }
 
@@ -219,15 +253,20 @@ cpu_io_publish_result(void *ud,
 	                                   : (res->written & XRT_CONV_OUT_DEPTH) != 0 ? &res->depth
 	                                                                              : NULL;
 	const uint32_t bpp = src != NULL ? fmt_bpp(src->format) : 0;
-	if (src == NULL || src->memory_kind != XRT_CONV_MEM_CPU || src->cpu_ptr == NULL || bpp == 0 ||
-	    src->width == 0 || src->height == 0) {
-		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // only CPU results exist on this glue
+	// A GPU result (the composed views or a mirror of a GPU glue): read back
+	// with the glue's copy, one layer only (the section holds one).
+	const bool gpu_src = src != NULL && src->memory_kind != XRT_CONV_MEM_CPU;
+	const bool layered = gpu_src && src == &res->views && res->views_info.layout == XRT_CONV_VIEWS_ARRAY &&
+	                     res->views_info.view_count > 1;
+	if (src == NULL || (!gpu_src && src->cpu_ptr == NULL) || layered || bpp == 0 || src->width == 0 ||
+	    src->height == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
 	const uint32_t w = src->width, h = src->height;
 	const uint32_t sstride = src->row_stride != 0 ? src->row_stride : w * bpp;
 	const uint64_t bytes = (uint64_t)w * h * bpp; // tightly packed rows
-	if (sstride < w * bpp ||
-	    (src->byte_size != 0 && (uint64_t)sstride * (h - 1) + (uint64_t)w * bpp > src->byte_size)) {
+	if (!gpu_src && (sstride < w * bpp ||
+	                 (src->byte_size != 0 && (uint64_t)sstride * (h - 1) + (uint64_t)w * bpp > src->byte_size))) {
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
 
@@ -256,9 +295,16 @@ cpu_io_publish_result(void *ud,
 		s->bytes = bytes;
 		realloc = true;
 	}
-	for (uint32_t y = 0; y < h; y++) {
-		memcpy((uint8_t *)s->map.ptr + (size_t)y * w * bpp, (const uint8_t *)src->cpu_ptr + (size_t)y * sstride,
-		       (size_t)w * bpp);
+	if (gpu_src) {
+		if (g_cpu_io.gpu.read == NULL || !g_cpu_io.gpu.read(g_cpu_io.gpu.ud, src, s->map.ptr, w * bpp)) {
+			os_mutex_unlock(&g_cpu_io.mtx);
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+	} else {
+		for (uint32_t y = 0; y < h; y++) {
+			memcpy((uint8_t *)s->map.ptr + (size_t)y * w * bpp,
+			       (const uint8_t *)src->cpu_ptr + (size_t)y * sstride, (size_t)w * bpp);
+		}
 	}
 	s->have_result = true;
 	out->width = w;
@@ -363,14 +409,8 @@ ipc_server_conv_cpu_io_get(struct ipc_server_conv_io_ops *out)
 	if (!ipc_cpu_buffer_supported()) {
 		return false;
 	}
-	if (!g_cpu_io.mtx_ok) {
-		if (os_mutex_init(&g_cpu_io.mtx) != 0) {
-			return false;
-		}
-		g_cpu_io.mtx_ok = true; // process-lifetime, like the ops themselves
-		for (uint32_t i = 0; i < IPC_SERVER_CONV_MAX_STREAMS; i++) {
-			g_cpu_io.streams[i].handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-		}
+	if (!cpu_io_init()) {
+		return false;
 	}
 	out->import_input = cpu_io_import_input;
 	out->release_input = cpu_io_release_input;
@@ -383,4 +423,19 @@ ipc_server_conv_cpu_io_get(struct ipc_server_conv_io_ops *out)
 	out->cpu_only = true;
 	out->ud = NULL;
 	return true;
+}
+
+void
+ipc_server_conv_cpu_io_set_gpu(const struct ipc_server_conv_cpu_gpu *gpu)
+{
+	if (!cpu_io_init()) {
+		return;
+	}
+	os_mutex_lock(&g_cpu_io.mtx); // a copy in flight holds it: clearing waits for it
+	if (gpu != NULL) {
+		g_cpu_io.gpu = *gpu;
+	} else {
+		memset(&g_cpu_io.gpu, 0, sizeof(g_cpu_io.gpu));
+	}
+	os_mutex_unlock(&g_cpu_io.mtx);
 }

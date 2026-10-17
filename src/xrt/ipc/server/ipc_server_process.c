@@ -319,6 +319,10 @@ teardown_all(struct ipc_server *s)
 	// ADR-053 P1a (#2003): the conversion core lets go of the GPU side first.
 	ipc_server_conv_detach_d3d11();
 #endif
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+	// ADR-053 P5: the same for the Vulkan glue (macOS / desktop Linux).
+	ipc_server_conv_detach_vk();
+#endif
 	xrt_syscomp_destroy(&s->xsysc);
 
 	teardown_idevs(s);
@@ -658,6 +662,10 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// ADR-053 P1a (#2003): the device exists now — attach its GPU side (and
 	// the dp-lift row) to the conversion core.
 	ipc_server_conv_attach_d3d11(s->xsysc);
+#endif
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+	// ADR-053 P5: the Vulkan device exists now (macOS / desktop Linux).
+	ipc_server_conv_attach_vk(s->xsysc);
 #endif
 
 	// Always succeeds.
