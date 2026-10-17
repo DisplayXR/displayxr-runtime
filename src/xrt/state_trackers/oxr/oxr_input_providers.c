@@ -28,6 +28,7 @@
 #include "oxr_logger.h"
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
+#include "oxr_input_providers_rule.h"
 
 #include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_system.h"
@@ -52,7 +53,7 @@ _Static_assert(XRT_INPUT_PROVIDER_ID_SIZE == XR_MAX_INPUT_PROVIDER_ID_SIZE_DXR, 
 _Static_assert(XRT_INPUT_PROVIDER_NAME_SIZE == XR_MAX_INPUT_PROVIDER_NAME_SIZE_DXR, "size mirror");
 
 //! Upper bound on providers one enumeration assembles (the loader's own row cap is lower).
-#define ENUM_MAX 64
+#define ENUM_MAX OXR_INPUT_PROVIDERS_VIEW_MAX
 
 //! Pages are re-read from the top when the client's generation moves mid-walk; give up after this many.
 #define ENUM_RETRIES 3
@@ -218,6 +219,28 @@ oxr_xrEnumerateInputProvidersDXR(XrInstance instance,
 	return XR_SUCCESS;
 }
 
+static bool
+read_pref_view(struct oxr_logger *log, struct oxr_system *sys, struct pref_view *v)
+{
+	memset(v, 0, sizeof(*v));
+	struct xrt_input_provider_info *list =
+	    (struct xrt_input_provider_info *)calloc(ENUM_MAX, sizeof(struct xrt_input_provider_info));
+	if (list == NULL) {
+		return false;
+	}
+	uint32_t n = 0;
+	const bool ok = gather(log, sys, list, ENUM_MAX, &n) == XR_SUCCESS;
+	for (uint32_t i = 0; ok && i < n; i++) {
+		memcpy(v->id[i], list[i].id, sizeof(v->id[i]));
+		v->current[i] = list[i].current_families;
+		v->requested[i] = list[i].requested_families;
+		v->pinned[i] = list[i].app_pinned;
+	}
+	v->n = ok ? n : 0;
+	free(list);
+	return ok;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPreferenceInfoDXR *info)
 {
@@ -247,13 +270,22 @@ oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPref
 	fill_self_client(&client);
 
 	const enum xrt_input_role_family family = (enum xrt_input_role_family)((int)info->family - 1);
+	struct pref_view *before = (struct pref_view *)calloc(2, sizeof(struct pref_view));
+	if (before == NULL) {
+		return oxr_error(&log, XR_ERROR_OUT_OF_MEMORY, "input provider view");
+	}
+	struct pref_view *after = before + 1;
+	const bool have_before = read_pref_view(&log, sess->sys, before);
 	const xrt_result_t xret =
 	    xrt_input_selection_set_preference(xis, &client, family, info->providerId, info->persist == XR_TRUE);
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
-		// Normal flow for a system / service without selection support: no oxr_error spam.
+		// Normal flow for a system / service without selection support, and for
+		// persist with no executable identity / per-user store: no oxr_error spam.
+		free(before);
 		return XR_ERROR_FEATURE_UNSUPPORTED;
 	}
 	if (xret != XRT_SUCCESS) {
+		free(before);
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "setting the input provider preference failed (%d)",
 		                 (int)xret);
 	}
@@ -262,11 +294,21 @@ oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPref
 	U_LOG_W("XR_DXR_input_providers: family %d -> '%s'%s.", (int)info->family,
 	        info->providerId[0] != '\0' ? info->providerId : "<default>", info->persist ? " (persisted)" : "");
 
-	// The roles move on the next xrSyncActions (which raises its own event
-	// for the families that actually moved); this one says "your preference
-	// was recorded — re-enumerate" even when nothing moved.
-	(void)oxr_event_push_XrEventDataInputProvidersChanged(
-	    &log, sess->sys->inst, (XrInputRoleFamilyFlagsDXR)XRT_INPUT_ROLE_FAMILY_BIT(family));
+	// Event discipline (spec §4): ONE event per actual change, none for a
+	// no-op. A holder move is announced by the next xrSyncActions, which sees
+	// the new roles generation (oxr_input_providers_roles_changed) — so the
+	// setter stays silent then, or the app would re-enumerate twice. The
+	// setter speaks only when the stored request / pin changed but no holder
+	// moved (e.g. a request for an absent provider), which xrSyncActions
+	// cannot see.
+	const bool have_after = read_pref_view(&log, sess->sys, after);
+	if (have_before && have_after) {
+		if (oxr_input_providers_setter_should_notify(before, after)) {
+			(void)oxr_event_push_XrEventDataInputProvidersChanged(
+			    &log, sess->sys->inst, (XrInputRoleFamilyFlagsDXR)XRT_INPUT_ROLE_FAMILY_BIT(family));
+		}
+	}
+	free(before);
 	return XR_SUCCESS;
 }
 

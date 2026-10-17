@@ -69,6 +69,7 @@ add_library(
 	oxr_stereo_camera.c
 	oxr_desktop_control.c
 	oxr_input_providers.c
+	oxr_input_providers_rule.h
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
 	oxr_workspace_window_linux.c

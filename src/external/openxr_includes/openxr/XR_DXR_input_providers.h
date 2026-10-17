@@ -82,9 +82,10 @@ extern "C" {
  * The id of the runtime's own emulated controller pair (keyboard / mouse).
  * Listed (when the pair exists) and requestable like any provider; it
  * supplies CONTROLLERS only. The ONE id an app may name in code — it is the
- * runtime's, not a vendor's.
+ * runtime's, not a vendor's, and it is stable: it names the runtime's emulated
+ * floor whatever sources feed it (keyboard / mouse today), never a driver.
  */
-#define XR_INPUT_PROVIDER_ID_EMULATED_CONTROLLERS_DXR "qwerty"
+#define XR_INPUT_PROVIDER_ID_EMULATED_CONTROLLERS_DXR "emulated"
 
 /*!
  * A role family: the unit a preference applies to.

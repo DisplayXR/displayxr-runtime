@@ -46,6 +46,7 @@
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_status.h"
+#include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_system.h"
 
@@ -842,7 +843,12 @@ tick(struct ipc_server *s, struct ipc_server_status *st)
 			st->live->conv_task_count = XRT_STATUS_MAX_CONV_TASKS;
 		}
 	}
-	const uint64_t lk = live_key(st->live);
+	uint64_t lk = live_key(st->live);
+	// ADR-034 Am.5: a per-client input holder moving (unplug, pin, request) is a
+	// status change — the snapshot's `input_holders` rows. The arbiter's
+	// selection generation is coalesced (one bump per changed resolution), so
+	// this folds in once per tick, never per poll.
+	mix_u64(&lk, xrt_input_selection_get_generation(s->xsysd != NULL ? s->xsysd->input_selection : NULL));
 	if (s->xsysc != NULL) {
 		// An unlocked copy, as the segments-enable path takes it: claim
 		// serials and per-API factory bits are display-only here.

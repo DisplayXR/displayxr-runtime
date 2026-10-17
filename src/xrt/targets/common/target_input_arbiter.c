@@ -163,6 +163,9 @@ struct t_input_client
 	//! g_arb.epoch at the last resolve; with @ref dirty, the only recompute triggers.
 	uint64_t seen_epoch;
 	bool dirty;
+
+	//! The first overlay-driven change of this client logged at WARN; later ones at INFO.
+	bool warned;
 };
 
 struct t_input_arbiter
@@ -212,6 +215,18 @@ struct t_input_arbiter
 	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
 
 	struct t_input_client clients[ARBITER_MAX_CLIENTS];
+
+	//! Moves when any client's resolved roles change or a client comes / goes (xrt_input_selection::get_generation).
+	uint64_t selection_generation;
+
+	/*!
+	 * Distinct clients refused an entry (table full), for `input list --json`
+	 * `clients_dropped`. Distinct by key over the last @ref dropped_keys, so a
+	 * refused client's per-frame get_roles counts once, not per frame.
+	 */
+	uint32_t clients_dropped;
+	uint64_t dropped_keys[8];
+	uint32_t dropped_next;
 };
 
 static struct t_input_arbiter g_arb = {0};
@@ -765,11 +780,24 @@ client_get_and_lock(const struct xrt_input_selection_client *ref)
 			return c;
 		}
 	}
-	static bool warned_full = false;
-	if (!warned_full) {
-		warned_full = true;
-		U_LOG_W("input arbiter: per-client table full (%d) — client %llu gets the system-wide roles.",
-		        ARBITER_MAX_CLIENTS, (unsigned long long)key);
+	// Table full. Count each refused client once (keys are monotonic over IPC;
+	// the small ring keeps a refused client's per-frame calls from recounting).
+	bool seen = false;
+	for (int i = 0; i < 8 && !seen; i++) {
+		seen = g_arb.dropped_keys[i] == key + 1; // +1: key 0 is a valid key, 0 is "empty"
+	}
+	if (!seen) {
+		g_arb.dropped_keys[g_arb.dropped_next++ % 8] = key + 1;
+		g_arb.clients_dropped++;
+		if (g_arb.clients_dropped == 1) {
+			U_LOG_W(
+			    "input arbiter: per-client table full (%d) — client %llu ('%s') gets the system-wide roles; its "
+			    "per-app pin and requests do not apply (see `input list --json` clients_dropped).",
+			    ARBITER_MAX_CLIENTS, (unsigned long long)key, exe);
+		} else {
+			U_LOG_I("input arbiter: per-client table full — client %llu dropped (%u so far).",
+			        (unsigned long long)key, (unsigned)g_arb.clients_dropped);
+		}
 	}
 	return NULL;
 }
@@ -884,11 +912,15 @@ resolve_client_locked(struct t_input_client *c)
 	next.generation_id = c->have_roles ? c->roles.generation_id + 1 : seed;
 	c->roles = next;
 	c->have_roles = true;
+	g_arb.selection_generation++; // a holder moved for this client (or it just attached): one status bump
 
 	if (any_overlay) {
 		// An overlay-driven assignment change: event-driven (a request, a pin, a
-		// presence edge), never per frame.
-		U_LOG_W(
+		// presence edge), never per frame — WARN the first time per client, INFO
+		// after, so a provider whose presence toggles often stays quiet.
+		const bool first = !c->warned;
+		c->warned = true;
+		U_LOG_IFL(first ? U_LOGGING_WARN : U_LOGGING_INFO, u_log_get_global_level(),
 		    "input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
 		    "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
 		    (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
@@ -1171,11 +1203,25 @@ sel_query_holders(struct xrt_input_selection *xis, uint32_t index, struct xrt_in
 			snprintf(out->preferred[f], sizeof(out->preferred[f]), "%s", overlay ? c->pref_id[f] : "");
 		}
 		out->generation = c->roles.generation_id;
+		out->clients_dropped = g_arb.clients_dropped;
 		os_mutex_unlock(&g_arb_mutex);
 		return XRT_SUCCESS;
 	}
 	os_mutex_unlock(&g_arb_mutex);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED; // past the end
+}
+
+static uint64_t
+sel_get_generation(struct xrt_input_selection *xis)
+{
+	(void)xis;
+	if (!g_arb_mutex_ready) {
+		return 0;
+	}
+	os_mutex_lock(&g_arb_mutex);
+	const uint64_t g = g_arb.selection_generation;
+	os_mutex_unlock(&g_arb_mutex);
+	return g;
 }
 
 static void
@@ -1189,6 +1235,7 @@ sel_client_detach(struct xrt_input_selection *xis, const struct xrt_input_select
 	struct t_input_client *c = client_find_locked(client->key);
 	if (c != NULL) {
 		memset(c, 0, sizeof(*c)); // requests die with the client; the user's pin stays in the store
+		g_arb.selection_generation++;
 	}
 	os_mutex_unlock(&g_arb_mutex);
 }
@@ -1223,6 +1270,13 @@ arbiter_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out
 	// ADR-034 Am.5: this process's own view — the implicit client (key 0),
 	// keyed by this process's executable. With no preference set, its walk
 	// is the default walk and the roles are the system-wide ones.
+	//
+	// In the SERVICE this makes the service itself a key-0 client keyed by
+	// its own executable (`displayxr-service`). That is deliberate and
+	// harmless: IPC clients are keyed by the server's client id (never 0),
+	// nobody pins the service, and its own role reads keep the default walk.
+	// Do not "fix" it by bypassing client_roles: the per-client generation
+	// is the one every in-process caller has always seen.
 	client_roles(NULL, out_roles);
 	return XRT_SUCCESS;
 }
@@ -1571,6 +1625,7 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 	g_arb_selection.set_preference = sel_set_preference;
 	g_arb_selection.query_holders = sel_query_holders;
 	g_arb_selection.client_detach = sel_client_detach;
+	g_arb_selection.get_generation = sel_get_generation;
 	xsysd->input_selection = &g_arb_selection;
 
 	os_mutex_unlock(&g_arb_mutex);

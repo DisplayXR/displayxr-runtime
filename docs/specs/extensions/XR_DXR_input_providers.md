@@ -32,7 +32,7 @@ that:
 Show the strings the runtime returns and let the user pick. A `providerId` is
 opaque: never parse it, never match on it, never ship a default that names
 one. The single exception is `XR_INPUT_PROVIDER_ID_EMULATED_CONTROLLERS_DXR`
-(`"qwerty"`), which names the runtime's own emulated pair, not a vendor's
+(`"emulated"`), which names the runtime's own emulated pair (stable: it names the floor, never the driver behind it), not a vendor's
 component. This is ADR-054 decision 8: *apps express preferences, never
 policy.*
 
@@ -55,7 +55,7 @@ Per family, top wins:
 | # | Level | Who sets it | Notes |
 |---|---|---|---|
 | 0 | `DXR_INPUT_PROVIDERS=0` in the hosting process, or `ForceQwerty` | CTS lanes, debug | No provider is resident; every level below is moot |
-| 1 | HKLM `InputProviders\Policy\Lock` = 1 | the machine's admin | Hides every per-user value of the class — the per-app pin, the app's request, and the per-user `PreferredPlugin` — so only the machine's `PreferredPlugin` and `ProbeOrder` decide. Windows only |
+| 1 | HKLM `InputProviders\Policy\Lock` = 1 | the machine's admin | Hides every per-user value of the class — the per-app pin, the app's request, and the per-user `PreferredPlugin` — so only the machine's `PreferredPlugin` and `ProbeOrder` decide. Windows only. **Behaviour change (#2181):** before this extension a lock hid only the per-user `Enabled` / `EmulatedControllers`; a per-user `input use <id>` now has no effect under a lock either (`input list` reports `preferred_source: "machine (locked)"`) |
 | 2 | **Per-app pin** | the user: Dashboard, `input use <id> --app <exe>`, or this app's request with `persist` | Windows HKCU `Software\DisplayXR\InputProviders\PerApp\<exe-basename>\PreferredPlugin`; POSIX `input-preferred-<exe-basename>` in the per-user manifest dir. Applies to every family the pinned provider supplies |
 | 3 | **Session request** | this app, `xrSetInputProviderPreferenceDXR` without `persist` | Per family; lasts for the instance |
 | 4 | User default | `input use <id>` (`PreferredPlugin`) | Already rank 0 of the default walk |
@@ -129,9 +129,17 @@ The call returns once the request is recorded; roles move on the next
 
 ### `XrEventDataInputProvidersChangedDXR`
 
-Instance-scoped (no session). Queued when this app's preference was set, and
-when `xrSyncActions` sees this app's controller / hand-tracking / gamepad role
-assignment change (`changedFamilies` names which). Presence of a provider that
+Instance-scoped (no session). **One event per actual change, none for a
+no-op:**
+
+- when `xrSyncActions` sees this app's controller / hand-tracking / gamepad
+  holder change (`changedFamilies` names which) — the single source for a
+  holder move, whether a request, a pin, a re-rank or an unplug caused it;
+- from `xrSetInputProviderPreferenceDXR` only when the stored request / pin
+  changed and **no** holder moved (e.g. a request for an absent provider) —
+  the one change `xrSyncActions` cannot see. A set that moves a holder is
+  announced once, by the next `xrSyncActions`; repeating the same set queues
+  nothing (`oxr_input_providers_rule.h`, `tests_oxr_input_providers_rule`). Presence of a provider that
 holds nothing for this app is current at enumeration time and does not raise
 the event on its own. Rebinding itself rides the core
 `XrEventDataInteractionProfileChanged`, unchanged.
@@ -142,12 +150,21 @@ the event on its own. Rebinding itself rides the core
   (`_handle` class) never gets the emulated qwerty controllers: the OpenXR
   layer skips them per session (`oxr_input.c`, `has_external_window`) so the
   keyboard stays the app's. That is a per-session policy *above* roles —
-  pinning a handle app to `"qwerty"` still yields no controllers.
+  pinning a handle app to `"emulated"` still yields no controllers.
 - **`xrGetSystemProperties` reads live roles.** It runs before any session, so
   a later request can change what its `trackingProperties` would have
   reported. Documented and accepted (ADR-034 Amendment 5, Consequences).
 - **The shell is untouched.** Service-side input routing goes by window focus,
   never by device index.
+- **Client cap.** The service resolves up to 40 clients individually (every
+  IPC connection — `IPC_MAX_CLIENTS` is 32 — plus slack). A client beyond the
+  cap gets the system-wide roles, so its pin and requests do not apply; the
+  service logs it once and `input list --json` counts it in
+  `clients_dropped`.
+- **Pins changed while an app runs** reach it live: the service's policy watch
+  (#2051) re-reads every attached client's pin and the client re-resolves on its
+  next `xrSyncActions`. An in-process app reads its pin at attach (it has no
+  policy watch — the class rule for in-process apps).
 - **No preference set ⇒ bit-identical to the default walk**; the CTS lane is
   unaffected (it suppresses providers per process with `DXR_INPUT_PROVIDERS=0`).
 

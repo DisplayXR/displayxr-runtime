@@ -77,9 +77,10 @@ struct xrt_system_roles;
  * (the qwerty floor, ADR-034 / ADR-054 N7). It is not a plug-in, but it can be
  * pinned like one — pinning an app to it keeps that app on keyboard/mouse
  * controllers while a hand tracker is resident. Claims CONTROLLERS only.
- * Mirrors `XR_INPUT_PROVIDER_ID_EMULATED_CONTROLLERS_DXR`.
+ * Mirrors `XR_INPUT_PROVIDER_ID_EMULATED_CONTROLLERS_DXR`. Public and stable:
+ * it names the floor, not the qwerty driver behind it.
  */
-#define XRT_INPUT_PROVIDER_ID_EMULATED "qwerty"
+#define XRT_INPUT_PROVIDER_ID_EMULATED "emulated"
 
 /*!
  * The role families a client can express a preference for. Values are bit
@@ -192,6 +193,12 @@ struct xrt_input_client_holders
 	//! The id this client's effective preference names per family ("" = default walk).
 	char preferred[XRT_INPUT_ROLE_FAMILY_COUNT][XRT_INPUT_PROVIDER_ID_SIZE];
 	uint64_t generation;
+	/*!
+	 * System-wide, repeated in every row: distinct clients refused a per-client
+	 * entry because the table was full (they get the system-wide roles; their
+	 * pins and requests do not apply). 0 in a healthy box.
+	 */
+	uint32_t clients_dropped;
 };
 
 /*!
@@ -254,6 +261,16 @@ struct xrt_input_selection
 	 * cached roles. Its per-app pin is the user's and stays.
 	 */
 	void (*client_detach)(struct xrt_input_selection *xis, const struct xrt_input_selection_client *client);
+
+	/*!
+	 * The selection generation: moves (monotonically) whenever ANY client's
+	 * resolved roles change — a holder moved (unplug, pin, request, re-rank) —
+	 * or a client attached / detached. Coalesced: one bump per resolution
+	 * that changed something, never per poll. The ADR-051 status tick folds
+	 * it into its `status` counter so `displayxr-cli status --watch` and the
+	 * Dashboard see holder changes. Cheap; any thread.
+	 */
+	uint64_t (*get_generation)(struct xrt_input_selection *xis);
 };
 
 //! @copydoc xrt_input_selection::enumerate
@@ -305,6 +322,13 @@ xrt_input_selection_get_roles(struct xrt_input_selection *xis,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	return xis->get_roles(xis, client, out_roles);
+}
+
+//! @copydoc xrt_input_selection::get_generation
+static inline uint64_t
+xrt_input_selection_get_generation(struct xrt_input_selection *xis)
+{
+	return (xis != NULL && xis->get_generation != NULL) ? xis->get_generation(xis) : 0;
 }
 
 //! @copydoc xrt_input_selection::client_detach

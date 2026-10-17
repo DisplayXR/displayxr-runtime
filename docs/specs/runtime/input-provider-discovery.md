@@ -125,7 +125,9 @@ The `Enabled` overlay is the shared component loader's
 kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
 machine value win for every row (conversion-provider-discovery.md §3.1) **and
 hides the per-user `EmulatedControllers`, the per-user `PreferredPlugin` and every
-per-app pin** (the root-policy read,
+per-app pin** (the last two since #2181 — a behaviour change: before, a lock did not
+stop a per-user `input use <id>`; `input list --json` now reports
+`preferred_source: "machine (locked)"`) (the root-policy read,
 `target_component_read_policy_dword`); the `Policy` subkey is reserved and
 never read as a provider row. A change to any of the three values reaches a
 running service live — as a **re-rank** of the
