@@ -41,6 +41,8 @@ public sealed class FixtureProcessSource : IProcessSource
     private string? _machinePreferred;
     // workspace-list.json beside the fixture: the phase-8 `workspace` verbs, simulated.
     private readonly JsonObject? _workspace;
+    // input-list.json beside the fixture (#2181): `input list --json` and the per-app pin verbs, simulated.
+    private readonly JsonObject? _input;
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
 
     public FixtureProcessSource(string path, IProcessSource real)
@@ -71,6 +73,9 @@ public sealed class FixtureProcessSource : IProcessSource
         string ws = Path.Combine(dir, "workspace-list.json");
         try { if (File.Exists(ws)) _workspace = JsonNode.Parse(File.ReadAllText(ws)) as JsonObject; }
         catch (Exception ex) { DashboardLog.Warn($"fixture workspace: {ex.Message}"); }
+        string il = Path.Combine(dir, "input-list.json");
+        try { if (File.Exists(il)) _input = JsonNode.Parse(File.ReadAllText(il)) as JsonObject; }
+        catch (Exception ex) { DashboardLog.Warn($"fixture input: {ex.Message}"); }
         DashboardLog.Info($"fixture mode: {_lines.Length} line(s) from {path}; {_screens.Count} keyed screen(s); workspace {(_workspace is null ? "absent" : "simulated")}");
     }
 
@@ -122,6 +127,8 @@ public sealed class FixtureProcessSource : IProcessSource
             return Task.FromResult(new CliResult(0, Apply(_lines[0]), "", false, null));
         if (_workspace is not null && a is ["workspace", ..])
             return Task.FromResult(Workspace(a));
+        if (_input is not null && (a is ["input", "list", "--json"] || a is ["input", "use" or "reset", .., "--app", _]))
+            return Task.FromResult(Input(a));
         if (_screens.Count > 0 && a is ["dp", ..])
             return Task.FromResult(Dp(a));
         return _real.RunAsync(args, timeout, cancel);
@@ -174,6 +181,43 @@ public sealed class FixtureProcessSource : IProcessSource
                 if (which == "all") _preferred.Clear();
                 else _preferred.Remove(which);
                 return new CliResult(0, $"Screen {which}: automatic display-processor selection", "", false, null);
+            }
+            return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
+        }
+    }
+
+    /// <summary>
+    /// #2181: <c>input list --json</c> from <c>input-list.json</c>, and <c>input use &lt;id&gt; --app &lt;exe&gt;</c> /
+    /// <c>input reset --app &lt;exe&gt;</c> against its <c>per_app</c> rows (a live holder follows a pin to a
+    /// provider that supplies the family, as the runtime's walk would, only roughly: controllers).
+    /// Every other <c>input</c> verb goes to the real CLI.
+    /// </summary>
+    private CliResult Input(string[] a)
+    {
+        lock (_gate)
+        {
+            var perApp = _input!["per_app"] as JsonArray ?? new JsonArray();
+            _input["per_app"] = perApp;
+            JsonObject? Pin(string exe) => perApp.OfType<JsonObject>().FirstOrDefault(p => p["app"]?.GetValue<string>() == exe);
+            if (a is [_, "list", "--json"]) return new CliResult(0, _input.ToJsonString(), "", false, null);
+            if (a is [_, "use", var id, "--app", var exe])
+            {
+                bool registered = id == PolicyList.EmulatedId
+                    || (_input["providers"] as JsonArray)?.OfType<JsonObject>().Any(p => p["id"]?.GetValue<string>() == id) == true;
+                if (Pin(exe) is { } row) row["preferred"] = id;
+                else perApp.Add(new JsonObject { ["app"] = exe, ["preferred"] = id, ["registered"] = registered });
+                foreach (var h in (_input["holders"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
+                    if (h["app"]?.GetValue<string>() == exe && h["holders"] is JsonObject held && h["preferred"] is JsonObject pref)
+                    {
+                        held["controllers"] = id;
+                        pref["controllers"] = id;
+                    }
+                return new CliResult(0, $"Per-app pin: {exe} -> '{id}'", "", false, null);
+            }
+            if (a is [_, "reset", "--app", var rexe])
+            {
+                if (Pin(rexe) is { } row) perApp.Remove(row);
+                return new CliResult(0, $"Per-app pin for {rexe} cleared", "", false, null);
             }
             return new CliResult(2, "", $"fixture: unsupported '{string.Join(' ', a)}'", false, null);
         }

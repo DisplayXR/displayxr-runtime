@@ -1,6 +1,7 @@
 // Copyright 2026, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -87,6 +88,13 @@ public sealed class ComponentsPage : Page
                 sb.Append(pl.PolicyLock).Append(string.Join(",", pl.PreferredByTask.Select(kv => kv.Key + "=" + kv.Value)));
             if (Ctx.LastActionArea == PolicyCommands.Area(c)) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed).Append(_policyActionRow);
         }
+        // #2181: the per-app table's inputs.
+        if (Ctx.Policies.TryGetValue(ComponentClass.Input, out var ip))
+        {
+            foreach (var r in ip.PerAppRows()) sb.Append(r.App).Append(r.FamilyKey).Append(r.PinId).Append(r.HolderId).Append(r.Running);
+            sb.Append(ip.ClientsDropped);
+        }
+        if (Ctx.LastActionArea == PolicyCommands.AppArea) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
         sb.Append(_machine).Append('|');
         foreach (var s in Sections())
         {
@@ -145,7 +153,83 @@ public sealed class ComponentsPage : Page
             body.Children.Add(list);
             if (s.Collapsed) body.Children.Add(U.Button("Hide", () => Toggle(s.Id), "link"));
         }
+        // ADR-034 Am.5 (#2181): per-app pins + who holds each role per app, under Input.
+        if (s.Id == ComponentClass.Input.SectionId() && Ctx.Policies.TryGetValue(ComponentClass.Input, out var ipl) && ipl.HasPerApp)
+            body.Children.Add(PerAppTable(ipl));
         return U.Card(body);
+    }
+
+    /// <summary>
+    /// ADR-034 Amendment 5 (#2181): the per-app table — each pinned or running app, per role
+    /// family, its pin ("default" when none) and the provider that holds the family for it now
+    /// (display name, from the running service). Prefer / Reset per app run
+    /// <c>input use &lt;id&gt; --app &lt;exe&gt;</c> / <c>input reset --app &lt;exe&gt;</c> through the same
+    /// action path as the other policy controls. Per user only: a per-app pin has no machine-wide
+    /// tier (Policy\Lock is the machine's say, and disables the controls).
+    /// </summary>
+    private Control PerAppTable(PolicyList list)
+    {
+        const string area = PolicyCommands.AppArea;
+        bool busy = Ctx.ActionRunning;
+        bool locked = list.PolicyLock;
+        var col = U.VStack(8, U.Text("Per app", "group"),
+            U.Wrapped("Which input provider each app uses, per role. A pin makes the app prefer a provider for every role it supplies; other roles, and an absent provider, fall back to the default order.", "desc"));
+        if (list.PerAppLockText is { } lt) col.Children.Add(U.Notice(Level.Info, "Locked by machine policy", lt));
+        if (list.ClientsDropped is > 0 and var dropped)
+            col.Children.Add(U.Notice(Level.Warn, "Some apps are not resolved per app",
+                $"{dropped:0} client(s) exceeded the service's per-client table: they use the default order and their pins do not apply."));
+        var rows = list.PerAppRows();
+        if (rows.Count == 0)
+        {
+            col.Children.Add(U.Wrapped(list.Holders is null
+                ? "No per-app pins. Running apps are listed when the DisplayXR service is reachable."
+                : "No per-app pins and no app attached to the service.", "empty"));
+        }
+        foreach (var app in rows.Select(r => r.App).Distinct())
+        {
+            var appRows = rows.Where(r => r.App == app).ToArray();
+            string? pin = appRows[0].PinId;
+            var head = U.Flow(10, 6, U.Text(app, "mono"), U.Chip(pin is null ? "default" : $"pinned: {appRows[0].Pin}", pin is null ? Level.Plain : Level.Info));
+            if (!appRows[0].Running) U.AddFlow(head, U.Chip("not running", Level.Plain), 10, 6);
+
+            void Run(CliArgs command) => _ = Ctx.RunActionsAsync(area, command);
+            var choices = list.PinChoices();
+            var pick = new ComboBox { ItemsSource = choices.Select(list.NameOf).ToArray(), SelectedIndex = pin is null ? -1 : Array.IndexOf(choices.ToArray(), pin), MinWidth = 200, IsEnabled = !busy && !locked };
+            pick.Classes.Add("field");
+            Avalonia.Automation.AutomationProperties.SetName(pick, $"Input provider for {app}");
+            pick.DropDownOpened += (_, _) => _openDropDowns++;
+            pick.DropDownClosed += (_, _) =>
+            {
+                _openDropDowns = System.Math.Max(0, _openDropDowns - 1);
+                Avalonia.Threading.Dispatcher.UIThread.Post(() => Update());
+            };
+            var prefer = U.Button("Prefer", () =>
+            {
+                if (pick.SelectedIndex >= 0 && pick.SelectedIndex < choices.Count) Run(PolicyCommands.PreferApp(choices[pick.SelectedIndex], app));
+            }, "quiet", "sm");
+            prefer.IsEnabled = !busy && !locked;
+            ToolTip.SetTip(prefer, locked ? list.PerAppLockText : $"displayxr-cli input use <id> --app {app}");
+            U.AddFlow(head, pick, 10, 6);
+            U.AddFlow(head, prefer, 10, 6);
+            if (pin is not null)
+            {
+                var reset = U.Button("Reset", () => Run(PolicyCommands.ResetApp(app)), "quiet", "sm");
+                reset.IsEnabled = !busy && !locked;
+                ToolTip.SetTip(reset, locked ? list.PerAppLockText : $"displayxr-cli {PolicyCommands.ResetApp(app)}");
+                U.AddFlow(head, reset, 10, 6);
+            }
+            var block = U.VStack(4, head);
+            foreach (var r in appRows)
+                block.Children.Add(U.Flow(10, 2, U.Text(r.Family, "dim"), U.Text("→", "dim"),
+                                          U.Text(r.Holder, r.HolderId is null ? "dim" : "soft")));
+            var box = new Border { Child = block, Margin = new Thickness(0, 6, 0, 0) };
+            box.Classes.Add("field");
+            col.Children.Add(box);
+        }
+        col.Children.Add(U.Wrapped("Per user. Applies at once to a running app when the service is running; in-process apps at their next launch.", "meta"));
+        if (Ctx.LastActionArea == area && Ctx.LastAction is { } la)
+            col.Children.Add(Ctx.LastActionFailed ? U.WarningRow(new StatusWarning("POLICY", WarningLevel.Warn, la)) : U.Wrapped(la, "soft"));
+        return col;
     }
 
     private static string EmptyText(ComponentSection s) => s.Id switch

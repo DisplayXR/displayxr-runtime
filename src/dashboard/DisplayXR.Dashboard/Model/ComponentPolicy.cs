@@ -104,6 +104,24 @@ public sealed record PolicyRow(ComponentClass Class, string Id, string Name, boo
     public bool Untrusted => string.Equals(Load, "UNTRUSTED", StringComparison.Ordinal);
 }
 
+/// <summary>
+/// ADR-034 Amendment 5 (#2181): a per-app pin as <c>input list --json</c> <c>per_app</c> lists it —
+/// the user's preferred input provider for one executable (every family that provider supplies).
+/// </summary>
+public sealed record AppPin(string App, string Preferred, bool Registered);
+
+/// <summary>
+/// One attached client's LIVE holder per role family (<c>input list --json</c> <c>holders</c>, from
+/// the running service): family key (<c>controllers</c> / <c>hand_tracking</c> / <c>gamepad</c>) →
+/// provider id, null = nobody holds it for that client.
+/// </summary>
+public sealed record AppHolder(double Client, string App, IReadOnlyDictionary<string, string?> Holders,
+                               IReadOnlyDictionary<string, string?> Preferred);
+
+/// <summary>One line of the per-app table: an executable, a role family, its pin and who holds it now.</summary>
+public sealed record PerAppRow(string App, string FamilyKey, string Family, string? PinId, string Pin, string? HolderId,
+                               string Holder, bool Running);
+
 /// <summary>A conversion task as <c>conv list --json</c> lists it: which provider offers it and whether selection picked that one.</summary>
 public sealed record PolicyTask(string Task, string Provider, bool Selected, string Verdict);
 
@@ -115,8 +133,61 @@ public sealed record PolicyTask(string Task, string Provider, bool Selected, str
 /// </summary>
 public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOnlyList<PolicyRow> Rows,
                                 IReadOnlyDictionary<string, string> PreferredByTask, IReadOnlyList<PolicyTask> Tasks,
-                                bool ForceQwerty = false, bool PolicyLock = false)
+                                bool ForceQwerty = false, bool PolicyLock = false,
+                                IReadOnlyList<AppPin>? PerApp = null, IReadOnlyList<AppHolder>? Holders = null,
+                                double? ClientsDropped = null)
 {
+    /// <summary>The input role families, in display order: the <c>holders</c> keys and their labels.</summary>
+    public static readonly (string Key, string Label)[] Families =
+        { ("controllers", "Controllers"), ("hand_tracking", "Hand tracking"), ("gamepad", "Gamepad") };
+
+    /// <summary>The runtime's own emulated controller pair: a pinnable id, not a plug-in row.</summary>
+    public const string EmulatedId = "emulated";
+
+    /// <summary>Whether this CLI reports per-app pins at all (input class, #2181): the table shows only then.</summary>
+    public bool HasPerApp => Class == ComponentClass.Input && PerApp is not null;
+
+    /// <summary>A provider id as the page shows it: the provider's own display name, verbatim.</summary>
+    public string NameOf(string id) => id == EmulatedId ? "Emulated controllers" : Row(id)?.Name ?? id;
+
+    /// <summary>
+    /// The per-app table (#2181): one row per (executable, family) for every app the user pinned and
+    /// every app attached to the running service, apps in name order. <c>Pin</c> is the pinned
+    /// provider's name or "default"; <c>Holder</c> is who holds the family for that app now, "none",
+    /// or "not running" (pinned, no live client — or no service reached).
+    /// </summary>
+    public IReadOnlyList<PerAppRow> PerAppRows()
+    {
+        var rows = new List<PerAppRow>();
+        if (!HasPerApp) return rows;
+        var apps = PerApp!.Select(p => p.App).Concat((Holders ?? Array.Empty<AppHolder>()).Select(h => h.App))
+            .Where(a => a.Length > 0).Distinct(StringComparer.Ordinal)
+            .OrderBy(a => a, StringComparer.OrdinalIgnoreCase).ToArray();
+        foreach (var app in apps)
+        {
+            var pin = PerApp!.FirstOrDefault(p => p.App == app)?.Preferred;
+            var live = Holders?.FirstOrDefault(h => h.App == app);
+            foreach (var (key, label) in Families)
+            {
+                string? holder = null;
+                live?.Holders.TryGetValue(key, out holder);
+                string holderText = live is null ? "not running" : holder is null ? "none" : NameOf(holder);
+                rows.Add(new PerAppRow(app, key, label, pin, pin is null ? "default" : NameOf(pin), holder, holderText,
+                                       live is not null));
+            }
+        }
+        return rows;
+    }
+
+    /// <summary>The ids a per-app pin may name: every enabled, trusted provider row, then the emulated pair.</summary>
+    public IReadOnlyList<string> PinChoices() =>
+        Rows.Where(r => r.Enabled && !r.Untrusted).Select(r => r.Id).Append(EmulatedId).Distinct().ToArray();
+
+    /// <summary>The per-app table's "locked" line: Policy\Lock hides every per-app pin.</summary>
+    public string? PerAppLockText => PolicyLock && HasPerApp
+        ? "Locked by machine policy (HKLM Policy\\Lock): per-app pins are ignored on this machine."
+        : null;
+
     /// <summary>
     /// What the lock hides from a per-user write: every class's per-user Enabled, and for
     /// conversion also the per-user per-task preference (conversion-provider-discovery.md
@@ -151,6 +222,13 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
     public static ComponentClass? ClassOfSection(string sectionId) =>
         ComponentClasses.All.Cast<ComponentClass?>().FirstOrDefault(c => c!.Value.SectionId() == sectionId);
 
+    private static IReadOnlyDictionary<string, string?> ReadFamilies(JsonElement e, string key)
+    {
+        var d = new Dictionary<string, string?>(StringComparer.Ordinal);
+        foreach (var (k, _) in PolicyList.Families) d[k] = e.Obj(key).StrOrNull(k);
+        return d;
+    }
+
     public static bool TryParse(ComponentClass cls, string? json, out PolicyList? list)
     {
         list = null;
@@ -183,8 +261,23 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                 tasks.AddRange(root.Arr("tasks").Where(t => t.ValueKind == JsonValueKind.Object && t.Str("task").Length > 0)
                     .Select(t => new PolicyTask(t.Str("task"), t.Str("provider"), t.Bool("selected"), t.Str("verdict"))));
             }
+            // ADR-034 Am.5 (#2181): per-app pins (stored) and live holders (from the service; null = none reached).
+            List<AppPin>? perApp = null;
+            List<AppHolder>? holders = null;
+            double? dropped = null;
+            if (cls == ComponentClass.Input && root.Has("per_app"))
+            {
+                perApp = root.Arr("per_app").Where(e => e.ValueKind == JsonValueKind.Object && e.Str("app").Length > 0)
+                    .Select(e => new AppPin(e.Str("app"), e.Str("preferred"), e.Bool("registered"))).ToList();
+                if (root.TryGetProperty("holders", out var h) && h.ValueKind == JsonValueKind.Array)
+                    holders = h.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.Object)
+                        .Select(e => new AppHolder(e.Num("client"), e.Str("app"), ReadFamilies(e, "holders"), ReadFamilies(e, "preferred")))
+                        .ToList();
+                if (root.TryGetProperty("clients_dropped", out var d) && d.ValueKind == JsonValueKind.Number)
+                    dropped = d.GetDouble();
+            }
             list = new PolicyList(cls, root.StrOrNull("preferred"), rows, byTask, tasks, root.Bool("force_qwerty"),
-                                  root.Obj("policy").Bool("policy_lock"));
+                                  root.Obj("policy").Bool("policy_lock"), perApp, holders, dropped);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }
@@ -216,6 +309,17 @@ public static class PolicyCommands
     /// <summary>Conversion prefers per task: <c>conv use &lt;task&gt; &lt;id&gt;</c> / <c>conv reset &lt;task&gt;</c>.</summary>
     public static CliArgs PreferTask(string task, string id, bool machine = false) => Cmd(machine, "conv", "use", task, id);
     public static CliArgs ResetTask(string task, bool machine = false) => Cmd(machine, "conv", "reset", task);
+
+    /// <summary>
+    /// ADR-034 Am.5 (#2181): the per-app pin — <c>input use &lt;id&gt; --app &lt;exe&gt;</c> /
+    /// <c>input reset --app &lt;exe&gt;</c>. Per user only: there is no machine-wide per-app pin (the CLI
+    /// refuses <c>--machine</c> with <c>--app</c>; HKLM <c>Policy\Lock</c> is the machine's override).
+    /// </summary>
+    public static CliArgs PreferApp(string id, string exe) => new("input", "use", id, "--app", exe);
+    public static CliArgs ResetApp(string exe) => new("input", "reset", "--app", exe);
+
+    /// <summary>The action area the per-app table's writes report under (re-reads <c>input list --json</c>).</summary>
+    public const string AppArea = "policy-input-app";
 
     /// <summary>The action area a class's writes report under (DashboardContext.RunActionsAsync).</summary>
     public static string Area(ComponentClass c) => "policy-" + c.Verb();

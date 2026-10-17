@@ -371,6 +371,8 @@ public sealed class DashboardContext
                 await LoadPolicyAsync(c, force: true);
                 if (c == ComponentClass.Display) await LoadDpAsync(force: true);
             }
+        // #2181: a per-app pin write re-reads the input list (pins + live holders).
+        if (area == PolicyCommands.AppArea) await LoadPolicyAsync(ComponentClass.Input, force: true);
     }
 
     private static string Tail(string s) => s.Length <= 400 ? s : s[^400..];
