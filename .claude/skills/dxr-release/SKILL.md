@@ -555,11 +555,26 @@ if [ "$COMPONENT" = unity ]; then
   # and the signer must be Leia. (unity v2.25.2 was released from a Linux box and
   # shipped unsigned for an hour because this helper only knew PowerShell.)
   verify_authenticode_file() {
-    local f="$1" ps out
-    if command -v pwsh >/dev/null 2>&1; then ps=pwsh
-    elif command -v powershell >/dev/null 2>&1; then ps=powershell
+    local f="$1" ps="" out
+    # PowerShell only on Windows (git-bash: cygpath present). Homebrew pwsh on a
+    # Mac has no Get-AuthenticodeSignature and no cygpath, so it must fall to
+    # osslsigncode instead of failing every verify.
+    if command -v cygpath >/dev/null 2>&1; then
+      if command -v pwsh >/dev/null 2>&1; then ps=pwsh
+      elif command -v powershell >/dev/null 2>&1; then ps=powershell; fi
+    fi
+    if [ -n "$ps" ]; then :
     elif command -v osslsigncode >/dev/null 2>&1; then
-      out=$(osslsigncode verify -in "$f" -CAfile /etc/ssl/certs/ca-certificates.crt 2>&1)
+      # CA bundle path is per-OS: Debian/Ubuntu, RHEL, macOS (system / Homebrew).
+      # A missing -CAfile fails every verify, so a macOS release box reported a
+      # good signature as unsigned (unity v2.27.0) until this probed for one.
+      local ca=""
+      for c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+               /etc/ssl/cert.pem /opt/homebrew/etc/ca-certificates/cert.pem /usr/local/etc/ca-certificates/cert.pem; do
+        [ -s "$c" ] && { ca="$c"; break; }
+      done
+      [ -n "$ca" ] || { echo "osslsigncode: no CA bundle found"; return 1; }
+      out=$(osslsigncode verify -in "$f" -CAfile "$ca" 2>&1)
       if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then echo "Valid"; return 0; fi
       echo "osslsigncode: $(grep -E -m1 'Failed|error|Error' <<<"$out" || echo not-valid)"; return 1
     else echo "no-powershell-no-osslsigncode (apt install osslsigncode)"; return 1; fi
