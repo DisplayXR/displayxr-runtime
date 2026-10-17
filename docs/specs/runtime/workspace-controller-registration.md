@@ -526,18 +526,152 @@ build-tree dir.
 
 ## Reference implementation
 
-See `displayxr-shell-pvt`'s installer for the canonical
-DisplayXR Shell registration (it does not live in this repo — CI's
-`shell-path-guard` fails any push reintroducing it). Third-party workspace apps should mirror
-its structure:
+Everything a third-party controller needs is in this section; no private
+repository is required. The examples register a fictional controller
+`acme-cockpit` whose binary is `acme-cockpit.exe` / `acme-cockpit`. Replace
+the id, names and paths; keep the structure.
 
-- `.onInit` reads the runtime's `InstallPath`, aborts if missing,
-  sets `$INSTDIR` to the runtime's install directory.
-- Single install section drops the binary, writes a self-uninstaller
-  with a distinct name (avoid colliding with `Uninstall.exe`),
-  populates the registration key, populates the Add/Remove entry.
-- Uninstall section removes only its own files + registry; does not
-  touch the runtime's `$INSTDIR` directory itself.
+### Windows — NSIS installer skeleton
+
+```nsis
+; acme-cockpit.nsi — installs a workspace controller INTO the runtime tree.
+!include "LogicLib.nsh"
+Name "Acme Cockpit"
+OutFile "AcmeCockpitSetup.exe"
+RequestExecutionLevel admin
+SetCompressor /SOLID lzma
+
+!define CTRL_ID   "acme-cockpit"
+!define CTRL_EXE  "acme-cockpit.exe"
+!define ARP_KEY   "Software\Microsoft\Windows\CurrentVersion\Uninstall\AcmeCockpit"
+!define REG_KEY   "Software\DisplayXR\WorkspaceControllers\${CTRL_ID}"
+
+Function .onInit
+  SetRegView 64
+  ; 1. The runtime is a hard prerequisite: its install tree hosts the binary.
+  ReadRegStr $INSTDIR HKLM "Software\DisplayXR\Runtime" "InstallPath"
+  ${If} $INSTDIR == ""
+    MessageBox MB_ICONSTOP|MB_OK "DisplayXR Runtime is not installed. Install it first."
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Section "Install"
+  SetRegView 64
+  ; 2. Files go next to displayxr-service.exe / the runtime DLLs.
+  SetOutPath "$INSTDIR"
+  File "${CTRL_EXE}"
+  ; A self-uninstaller with a DISTINCT name — never Uninstall.exe (that is the runtime's).
+  WriteUninstaller "$INSTDIR\Uninstall-AcmeCockpit.exe"
+  ; 3. Registration. Required: Binary, DisplayName, UninstallString (must honor /S).
+  WriteRegStr   HKLM "${REG_KEY}" "Binary"          "$INSTDIR\${CTRL_EXE}"
+  WriteRegStr   HKLM "${REG_KEY}" "DisplayName"     "Acme Cockpit"
+  WriteRegStr   HKLM "${REG_KEY}" "Vendor"          "Acme"
+  WriteRegStr   HKLM "${REG_KEY}" "Version"         "1.0.0"
+  WriteRegStr   HKLM "${REG_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
+  WriteRegDWORD HKLM "${REG_KEY}" "SupportsFileDialog" 0
+  ; Optional tray actions (see "Optional: published menu actions").
+  WriteRegStr   HKLM "${REG_KEY}\Actions\0" "Label" "Open Cockpit"
+  WriteRegStr   HKLM "${REG_KEY}\Actions\0" "Type"  "controller:open"
+  ; 4. Own Add/Remove Programs entry — never the runtime's.
+  WriteRegStr   HKLM "${ARP_KEY}" "DisplayName"     "Acme Cockpit"
+  WriteRegStr   HKLM "${ARP_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
+  WriteRegStr   HKLM "${ARP_KEY}" "Publisher"       "Acme"
+  WriteRegDWORD HKLM "${ARP_KEY}" "NoModify" 1
+  WriteRegDWORD HKLM "${ARP_KEY}" "NoRepair" 1
+SectionEnd
+
+Section "Uninstall"
+  SetRegView 64
+  ; Remove ONLY what this installer wrote. $INSTDIR is the runtime's directory: never RMDir it.
+  Delete "$INSTDIR\${CTRL_EXE}"
+  Delete "$INSTDIR\Uninstall-AcmeCockpit.exe"
+  DeleteRegKey HKLM "${REG_KEY}"
+  DeleteRegKey HKLM "${ARP_KEY}"
+SectionEnd
+```
+
+Rules the skeleton encodes, and why: the runtime's uninstaller runs every
+registered `UninstallString` with `/S` before removing its own files
+(*Cascade uninstall*), so the uninstaller must be silent-capable and must
+not touch the runtime tree; `SetRegView 64` because the service reads the
+64-bit view; the Add/Remove entry is the controller's own so a user can
+remove it without removing the runtime.
+
+**Dev registration without an installer** (elevated prompt; the service
+picks it up at its next spawn):
+
+```bat
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v Binary /t REG_SZ /d "C:\dev\acme\build\acme-cockpit.exe" /f
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v DisplayName /t REG_SZ /d "Acme Cockpit (dev)" /f
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v UninstallString /t REG_SZ /d "cmd /c exit 0" /f
+displayxr-cli workspace list --json
+reg delete "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /f   REM to unregister
+```
+
+A dev binary is subject to the provenance gate like any other component
+(`plugin-discovery.md` §4.3): on an enforcing box an unsigned controller
+exe needs the allowlist or `DXR_ALLOW_DEV_PLUGIN_PATHS`.
+
+### macOS / Linux — manifest + package hooks
+
+The manifest (schema above) is a plain file; the installer's only jobs are
+to drop the binary somewhere stable and to write the manifest into a search
+root. `acme-cockpit.json`:
+
+```json
+{
+  "file_format_version": "1.0",
+  "controller": {
+    "id": "acme-cockpit",
+    "binary": "/usr/libexec/acme-cockpit/acme-cockpit",
+    "display_name": "Acme Cockpit",
+    "vendor": "Acme",
+    "version": "1.0.0",
+    "uninstall_string": "",
+    "supports_file_dialog": false,
+    "actions": [ { "label": "Open Cockpit", "type": "controller:open" } ]
+  }
+}
+```
+
+- **Linux `.deb`:** ship the manifest as a package file at
+  `/usr/share/displayxr/WorkspaceControllers/acme-cockpit.json` (root #3) and
+  the binary under `/usr/libexec/<id>/` (or `/usr/bin`). No postinst is
+  needed for registration; dpkg's own file removal unregisters it. Declare
+  `Depends: displayxr-runtime` so the service exists. The binary must accept
+  `--service-managed` (§ *Linux*) and read `DISPLAYXR_WORKSPACE_SESSION` /
+  `DISPLAYXR_WORKSPACE_HOTKEY` from its environment.
+- **macOS `.pkg`:** install the app bundle under `/Applications` and the
+  manifest at `/Library/Application Support/DisplayXR/WorkspaceControllers/acme-cockpit.json`
+  (root #3) with `binary` pointing inside the bundle
+  (`/Applications/Acme Cockpit.app/Contents/MacOS/acme-cockpit`). A
+  `postinstall` that writes the manifest is acceptable when the path must be
+  computed; delete the manifest in your uninstall script.
+- **Dev registration:** put the manifest in a build-tree directory and run the
+  service with `XRT_WORKSPACE_CONTROLLER_PATH=<dir>` (root #1), or drop it in
+  the per-user root #2 — it shadows a system-wide install of the same `id`.
+  `displayxr-cli workspace list --json` shows what the service resolved.
+
+### Conformance checklist
+
+1. Registered key / manifest resolves: `displayxr-cli workspace list --json`
+   lists the id with the right `binary`.
+2. Hotkey spawn: `displayxr-cli workspace set <id> --hotkey ctrl+space`, press
+   it, the controller starts with `DISPLAYXR_WORKSPACE_SESSION=1` and, on
+   POSIX, `--service-managed`; a second press dismisses it; `workspace launch
+   <id>` starts it without the hotkey.
+3. Lifecycle: killing the controller leaves the service running; the next
+   hotkey press respawns it; `workspace set <id> --mode disabled` stops the
+   service from spawning it.
+4. Uninstall: Windows `<UninstallString> /S` exits 0 and leaves the runtime
+   tree intact; on POSIX removing the package removes the manifest and the
+   service no longer lists the id.
+5. Event handling per § *Required runtime → controller event handling*.
+
+The reference Android controller (`test_apps/workspace/workspace_controller_android`,
+§ *Android workspace controllers*) is the in-tree example of the controller
+side of the contract.
 
 ## Versioning
 
