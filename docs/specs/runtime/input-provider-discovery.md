@@ -186,6 +186,36 @@ There is no per-user `Enabled` store on POSIX (nor is there one for
 conversion providers): `displayxr-cli input enable|disable` reports that
 and points at the manifest's `enabled` field. `--machine` is Windows-only.
 
+### Android — file-name convention in the runtime APK (#132)
+
+Android discovery is the same convention the display-processor and
+conversion classes use (`plugin-discovery.md` §3.2), with its own prefix:
+the shared component loader scans the runtime APK's native lib dir (the
+directory `openxr_displayxr.so` was loaded from, plus `XRT_PLUGIN_SEARCH_PATH`
+if set) for
+
+```
+libdxri<NNN>_<id>.so        NNN = ProbeOrder (three digits), id = the row id until negotiate
+```
+
+`TARGET_PLUGIN_ANDROID_PREFIX_INPUT` = `libdxri` (`target_component_loader.h`),
+set on the input class row in `target_input_plugin_loader.c`. There is no
+manifest and no per-user dir: ProbeOrder in the file name is the only ranking,
+`Enabled` / `PreferredPlugin` do not exist (the CLI verbs report that), and the
+settings store's only tier is the environment — `debug.xrt.DXR_INPUT_<ID>_<KEY>`
+(§*Component settings*). A provider ships by being packaged into the runtime
+APK's `jniLibs` (ADR-038's rule for vendor plug-ins applies to this class too):
+`build.gradle`'s `cmake.targets` lists `drv_touch_input_plugin`, which CMake
+emits as `libdxri100_touch_input.so`. A vendor's tracking provider takes a
+lower number. The DP loader's sibling preload (#333) skips the `libdxri` prefix
+exactly as it skips `libdxrp` / `libdxrc`, so a provider is only ever loaded
+through the input class's own load path.
+
+The platform stubs that said "no input providers on Android" are gone: the
+class row has a prefix, the loader enumerates, `displayxr-cli selftest` /
+`info --json` (and the dashboard's `displayxr-diag` query, which runs the same
+headless probe) list what they find under `input_providers`.
+
 ### Component settings — the one options contract (ADR-054 decision 7, N3c)
 
 Every component class — display processors (plugin-discovery.md §2.3), input
@@ -794,6 +824,7 @@ gets `xrSyncActions` controllers for the first time.
 | `sim_input` | **Shipped and packaged** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`; the Windows installer registers the `sim-input` row and allowlists the DLL, the `.deb` / tarball / `.pkg` ship it with `200-sim-input-input-provider.json` — ADR-054 §2 clause 3; inert until `ENABLE` = 1) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `gamepad` | **Shipped and packaged** (`src/xrt/drivers/gamepad/`, plug-in DLL `DisplayXR-Gamepad`; the Windows installer registers the `gamepad` row at ProbeOrder 150 and allowlists the DLL; `build_macos.sh` / `build_linux.sh` stage `150-gamepad-input-provider.json`; Windows dev boxes: `register_dev_plugin.bat input gamepad`) | The one controller every desk has, on the existing input-provider class (§4c): a `XRT_DEVICE_TYPE_GAMEPAD` device on `microsoft/xbox_controller` (every button, stick, trigger and the four haptic outputs; `XR_EXT_dpad_binding` works over its sticks through the runtime's generic dpad emulation), a NAVIGATION device so a present pad drives the rig (§4b: left stick = translate in the rig's yaw frame, right stick = yaw / pitch, triggers = up / down, right-stick click = recenter — the durable level-with-timestamp of §4b.3, with the pose reset to F's origin in the same publication), and — `EMULATE_CONTROLLERS` = 1, the default — an emulated left / right `khr/simple_controller` pair at fixed display-plane-relative (`RIG_LOCAL`, §4b.4) poses: shoulders / X / A = select, View / Menu = menu, vibration → the pad's motors. **Presence-gated, so registered-by-default is inert:** `probe()` claims wherever the platform has a pad reader (XInput on Windows, GameController.framework on macOS with `shouldMonitorBackgroundEvents` so it is focus-independent too) and declines where it has none (desktop Linux — an evdev backend is the follow-up); `get_presence` follows the hub's hot-plug poll (250 Hz attached, 2 Hz detached) under the "last-used input wins" rule of §4c — touching a pad mid-session takes the gamepad, rig and hand roles at the arbiter's next presence poll; leaving it idle for `IDLE_TIMEOUT_S` (or unplugging it) hands them all back. Settings (ADR-054 decision 7, `displayxr-cli input options gamepad`): `DEADZONE` (radial, 0.15), `NAV_SPEED` (m/s, 1.0), `NAV_TURN_SPEED` (deg/s, 90), `NAV` (1), `EMULATE_CONTROLLERS` (1), `INVERT_LOOK_Y` (0), `IDLE_TIMEOUT_S` (20; the "last-used input wins" window of §4c — `0` = connected-only). The whole mapping policy is one table (`gamepad_map.c`, pinned by `tests/tests_gamepad_map.cpp`), so a per-title bindings mechanism (#1381) replaces the table, not the devices. |
+| `touch_input` | **Shipped on Android** (`src/xrt/drivers/touch_input/`; `libdxri100_touch_input.so` in the runtime APK, `DisplayXR-TouchInput` on desktop builds where it is a dev-only artefact — not staged, not registered, `probe()` declines unless `ENABLE` = 1 because nothing feeds pointer events there) | The first Android input provider (#132, §5.2): touch gestures → a `NAVIGATION` device (the rig role of §4b) + an emulated `khr/simple_controller` (`ANY_HAND`, aim ray under the finger, SELECT on tap / hold). ProbeOrder 100. Presence is unconditional — the touch screen is the hardware. Settings (§3): `ENABLE` (Android default 1, `0` withdraws it), `CONTROLLER` (default 1; `0` = navigation only), `SENSITIVITY` (orbit-rate multiplier, default 1.0). |
 | `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 
 **`sim_input` and the rig role (#1380).** A *second*, independent opt-in,
@@ -813,6 +844,63 @@ scripted pose in the same publication. All three are env vars, not registry
 values, for the reason `DXR_SIM_INPUT` is (§4.6): per-run developer switches,
 not machine configuration — and the process-level caveat applies, set them
 before launching the host process.
+
+### 5.2 touch_input — gestures, and where its events come from (#132)
+
+On a flat 3D display there is no tracked head or hand, so content needs a
+synthesised rig; on desktops the qwerty floor builds one from the keyboard and
+mouse, and on a tablet the only thing the user has is the touch screen. The
+touch provider is therefore first a **navigation** provider (§4b) and only
+second a controller.
+
+**Events reach it through the host iface, never through platform code of its
+own.** `xrt_input_plugin_host_iface::poll_pointer_events` (carved from
+`reserved[2]`, API major still 1, cover-check `struct_size` before use) drains
+a process-wide ring of `struct xrt_input_pointer_event` — `DOWN` / `MOVE` /
+`UP` / `CANCEL`, one event per pointer, surface pixels plus the surface extent
+— that every surface the runtime owns pushes into (`util/u_pointer_sink`):
+
+| Surface | Who pushes | Status |
+|---|---|---|
+| the runtime-spawned hosted `SurfaceView` (`_hosted`, in-process) | `MonadoView.onTouchEvent` → `nativeTouchEvent` (RegisterNatives in `android_custom_surface.cpp`); the app still receives every event through `Activity.dispatchTouchEvent` as before | **done** |
+| an app-owned surface (`XR_DXR_android_surface_binding`) | the app, with `xrSubmitAndroidInputEventDXR` (spec v3) — it owns its `MotionEvent`s, so it chooses which to submit | **done** (in-process sessions) |
+| the workspace overlay (ADR-036 D4): the controller owns the fullscreen surface | the controller, once #1996 settles how it forwards hit-tested events to a member client; the queue is per-process, so over IPC the events must cross to the service | **open — #1996** |
+
+The provider owns every gesture rule (ADR-034 Amendment 4: no gesture policy
+enters the runtime), in `touch_gesture.{h,c}` — platform-free, a pure function
+of the events and timestamps fed in, pinned by `tests_touch_gesture`:
+
+| Gesture | Effect |
+|---|---|
+| one-finger drag (past the slop) | **orbit** the rig about the pivot: yaw from dx (a full-width drag = half a turn), pitch from dy (full height = a quarter turn, clamped at ±85°) |
+| two-finger pinch | **dolly**: pivot distance `d = d_at_pinch_start * dist0 / dist`, clamped to 0.1–10 × the rest distance |
+| two-finger drag (centroid moves) | **pan**: the pivot slides in the rig's own XY plane, 1:1 with the fingers in display metres |
+| tap (up within 300 ms, inside the slop) | **SELECT click**: a 120 ms pulse — longer than one `xrSyncActions` interval at any frame rate, so a sweep never eats it |
+| press-and-hold (still past 300 ms) | **SELECT held** until the finger lifts; the aim ray follows the finger and the motion is *not* an orbit (a select-drag) |
+| double tap | **recenter**: orbit / pan / dolly reset, and the durable `NAVIGATION_RECENTER` level advances (§4b.3) |
+
+`N(t)` is absolute in the provider's frame F: F's origin is the rig at rest,
+and the orbit pivot starts `d0` metres straight ahead, where `d0` is the
+nominal viewer-to-panel distance from `get_display_geometry` (§4b.6) — so an
+untouched scene orbits about the display plane, which is where its content
+sits. `N = T(pivot) ∘ Ry(yaw) ∘ Rx(pitch) ∘ T(0,0,d)`; validity is
+unconditional (an untouched rig is at rest, not lost) and the runtime's
+alignment absorbs the initial pose (§4b.5). The controller is
+`XRT_TRACKING_TYPE_RIG_LOCAL` (§4b.4): AIM at the nominal viewer pointing
+through the finger's point on the display plane, GRIP at that point, MENU
+never, haptics accepted and dropped. The surface is mapped onto the whole
+panel — exact for a fullscreen `_hosted` surface, an approximation for a
+sub-panel window.
+
+**What makes it move the head.** The rig composer (§4b.5) is the head's pose
+source through the display plug-in's `set_pose_source` hook. Android has no
+qwerty, and the composer used to be created only on the qwerty path; the
+builder now binds it without a floor device whenever a `NAVIGATION` device
+exists (`target_builder_sim_display.c`), seeded from the head's own static
+pose so a box whose provider never takes the role is unchanged. That still
+needs the active DP to implement `set_pose_source`: `sim_display` does; a
+vendor Android DP that leaves the slot NULL gets the controller but not the
+rig — the plug-in's job to add, not the runtime's.
 
 ### 5.1 net_input wire protocol (v1)
 

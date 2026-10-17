@@ -805,7 +805,11 @@ foreground, the previous app later) — a frozen member shows its last frame, st
 current rect if the controller re-places it; the runtime cannot raise a client's importance
 from the service side, so members must stay visible (split-screen / freeform) or hold a
 foreground service of their own. Also: only clients that join *after* activation are composited (a satellite client
-stays per-window); nothing feeds pointer input to the workspace input queues on Android yet;
+stays per-window); nothing feeds pointer input to the workspace input queues on Android yet
+(#1996 — the touch input provider of #132 drains a *per-process* pointer queue that the
+hosted `SurfaceView` and `xrSubmitAndroidInputEventDXR` push into, so it serves in-process
+sessions; under the overlay the controller owns the surface and the queue it would need is
+the service's, which nothing fills);
 a content app that stops rendering when it loses its own window shows a frozen last frame;
 the vendor stack's "one core per process" behaviour (R2) is measured for creation only —
 the shared DP is held back while any per-session DP is alive in the main process.
