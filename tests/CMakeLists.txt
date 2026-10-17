@@ -284,6 +284,13 @@ if(TARGET comp_vk_conv_viewsyn)
 	# Vulkan device.
 	list(APPEND tests tests_conv_viewsyn_vk)
 endif()
+if(TARGET comp_vk_conv)
+	# ADR-053 P5 -- the Vulkan GPU glue: the allocation rule, exportable memory
+	# (opaque fd / dma-buf on Linux, IOSurface export + import on macOS), CPU <->
+	# image round trips, the mirror upload, S6 readback, S5 on CPU inputs, and a
+	# composed conversion through the core. SKIPs with no Vulkan device.
+	list(APPEND tests tests_conv_vk_gpu)
+endif()
 if(TARGET comp_d3d11_conv_content)
 	# #2030 -- still-image dedupe of GPU PHOTO inputs on WARP: the content
 	# check's key drives the core (two identical inputs -> one convert, a
@@ -1416,6 +1423,14 @@ if(TARGET comp_d3d11_conv_viewsyn)
 endif()
 if(TARGET tests_conv_viewsyn_vk)
 	target_link_libraries(tests_conv_viewsyn_vk PRIVATE comp_vk_conv_viewsyn comp_util aux_vk)
+endif()
+if(TARGET tests_conv_vk_gpu)
+	target_sources(tests_conv_vk_gpu PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_conv_vk_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_conv_vk_gpu PRIVATE comp_vk_conv comp_util aux_vk displayxr::conversion_runtime aux_os)
+	if(APPLE)
+		target_link_libraries(tests_conv_vk_gpu PRIVATE "-framework CoreFoundation" "-framework IOSurface")
+	endif()
 endif()
 if(TARGET tests_conv_gpu_dedupe)
 	target_sources(tests_conv_gpu_dedupe PRIVATE conv_fake_provider.c)

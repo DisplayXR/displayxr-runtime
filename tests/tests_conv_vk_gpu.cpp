@@ -1,0 +1,906 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  ADR-053 P5 — the conversion core's Vulkan GPU glue (vk_conv_gpu).
+ *
+ *  - caps: CPU always; which GPU memory kinds this device can export (logged);
+ *  - the allocation rule: providers stay on the CPU lane unless the provider
+ *    mask allows a kind; RENDER_TARGET / MIRROR images are always GPU;
+ *  - CPU <-> image round trips (RGBA8, R32F, R16F, array layers), the #2030
+ *    mirror upload;
+ *  - exportable memory: OPAQUE_FD export re-imported into a second VkImage
+ *    (Linux), IOSurface export read on the CPU and an IOSurface IMPORT
+ *    through VK_EXT_metal_objects (macOS) — the transports the docs call real;
+ *  - S6 readback cadence (fresh samples of an earlier copy, never a stall);
+ *  - S5 with CPU colour + CPU depth into a GPU target, and into a CPU target;
+ *  - a composed VIEWS_MONO conversion through conv_core: a CPU depth provider,
+ *    the glue as allocator + S5 + S6, a GPU views result.
+ *
+ * SKIPs when there is no Vulkan device.
+ *
+ * @ingroup tests
+ */
+
+#include "catch_amalgamated.hpp"
+
+#include "vktest_conv_bundle.hpp"
+
+#include "conv_fake_provider.h"
+
+#include "conversion/conv_core.h"
+#include "vk_conv/vk_conv_gpu.h"
+
+#include "os/os_time.h"
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurface.h>
+#endif
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+#include <unistd.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <thread>
+#include <vector>
+
+using namespace vktest_conv;
+
+namespace {
+
+struct Glue
+{
+	unique_bundle vk;
+	vk_conv_gpu *g = nullptr;
+	conv_image_alloc_ops ops{};
+	conv_viewsyn_ops vs{};
+	conv_depth_readback_ops rb{};
+
+	~Glue()
+	{
+		vk_conv_gpu_destroy(&g);
+	}
+};
+
+bool
+make_glue(Glue &x)
+{
+	x.vk = make_bundle();
+	if (!x.vk) {
+		return false;
+	}
+	REQUIRE(vk_conv_gpu_create(x.vk.get(), &x.g));
+	vk_conv_gpu_alloc_ops(x.g, &x.ops);
+	vk_conv_gpu_stage_ops(x.g, &x.vs, &x.rb);
+	return true;
+}
+
+conv_image_request
+req_of(uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage, uint32_t layers = 1, uint32_t mem = 0, uint64_t sid = 7)
+{
+	conv_image_request r{};
+	r.width = w;
+	r.height = h;
+	r.format = fmt;
+	r.array_layers = layers;
+	r.usage = usage;
+	r.stream_id = sid;
+	r.import_memory_kinds = mem;
+	r.role = fmt == XRT_CONV_FMT_R32_FLOAT || fmt == XRT_CONV_FMT_R16_FLOAT ? XRT_CONV_OUT_DEPTH : 0;
+	return r;
+}
+
+uint64_t
+now_ns()
+{
+	return os_monotonic_get_ns();
+}
+
+bool
+wait_until(const std::function<bool()> &pred, uint32_t timeout_ms)
+{
+	const uint64_t end = now_ns() + (uint64_t)timeout_ms * 1000000ull;
+	while (now_ns() < end) {
+		if (pred()) {
+			return true;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	return pred();
+}
+
+const char *
+kind_name(uint32_t k)
+{
+	switch (k) {
+	case XRT_CONV_MEM_CPU: return "CPU";
+	case XRT_CONV_MEM_VK_OPAQUE_FD: return "VK_OPAQUE_FD";
+	case XRT_CONV_MEM_DMABUF: return "DMABUF";
+	case XRT_CONV_MEM_IOSURFACE: return "IOSURFACE";
+	default: return "?";
+	}
+}
+
+} // namespace
+
+TEST_CASE("vk glue: caps name CPU always and the device's exportable kinds", "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	vk_conv_gpu_caps c{};
+	vk_conv_gpu_get_caps(x.g, &c);
+	CHECK((c.memory_kinds & XRT_CONV_MEM_CPU) != 0u);
+	CHECK((c.sync_kinds & (1u << XRT_CONV_SYNC_NONE)) != 0u);
+	std::string kinds;
+	for (uint32_t k : {XRT_CONV_MEM_CPU, XRT_CONV_MEM_VK_OPAQUE_FD, XRT_CONV_MEM_DMABUF, XRT_CONV_MEM_IOSURFACE}) {
+		if ((c.memory_kinds & k) != 0) {
+			kinds += std::string(kind_name(k)) + " ";
+		}
+	}
+	SUCCEED("memory kinds: " << kinds << " sync kinds 0x" << std::hex << c.sync_kinds << " timeline "
+	                         << c.timeline_semaphore);
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	// MoltenVK: no external_memory_fd, IOSurface through VK_EXT_metal_objects.
+	CHECK((c.memory_kinds & XRT_CONV_MEM_VK_OPAQUE_FD) == 0u);
+	CHECK((c.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0u);
+#endif
+}
+
+TEST_CASE("vk glue: providers stay on the CPU lane; runtime-only images are GPU", "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	vk_conv_gpu_caps c{};
+	vk_conv_gpu_get_caps(x.g, &c);
+	const uint32_t gpu_kinds = c.memory_kinds & ~XRT_CONV_MEM_CPU;
+	xrt_conv_image img{};
+
+	// Unknown import kinds (a composed binding): declined -> the CPU allocator.
+	auto r = req_of(64, 32, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+	CHECK_FALSE(x.ops.alloc(x.ops.ud, &r, &img));
+	// A provider that imports GPU kinds, default provider mask 0: declined.
+	r = req_of(64, 32, XRT_CONV_FMT_R32_FLOAT, CONV_IMAGE_USAGE_PROVIDER_OUT, 1, XRT_CONV_MEM_CPU | gpu_kinds);
+	CHECK_FALSE(x.ops.alloc(x.ops.ud, &r, &img));
+	// NV12 never (no conversion path): declined even for a render target.
+	r = req_of(64, 32, XRT_CONV_FMT_NV12, CONV_IMAGE_USAGE_RENDER_TARGET);
+	CHECK_FALSE(x.ops.alloc(x.ops.ud, &r, &img));
+
+	// The composed views: always a GPU image (exportable or private).
+	r = req_of(128, 32, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_EXPORT);
+	REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+	CHECK(img.memory_kind != XRT_CONV_MEM_CPU);
+	CHECK((img.import_key >> 63) == 0u);
+	CHECK(img.sync.kind == XRT_CONV_SYNC_NONE);
+	CHECK(img.color_space == XRT_CONV_CS_SRGB);
+	if (gpu_kinds != 0) {
+		CHECK(img.handle != VK_CONV_GPU_NO_HANDLE); // RGBA8 1 layer: exportable everywhere it can be
+	}
+	CHECK(vk_conv_gpu_image_count(x.g) == 1u);
+	x.ops.free(x.ops.ud, &img);
+	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
+
+	// ARRAY views (4 layers): GPU too; IOSurface is one layer, so private on macOS.
+	r = req_of(64, 32, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET, 4);
+	REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+	CHECK(img.memory_kind != XRT_CONV_MEM_CPU);
+	SUCCEED("4-layer render target: kind " << kind_name(img.memory_kind) << ", handle "
+	                                       << (img.handle == VK_CONV_GPU_NO_HANDLE ? "private" : "exportable"));
+	x.ops.free(x.ops.ud, &img);
+
+	// With the provider mask raised, a provider importing a GPU kind gets one.
+	if (gpu_kinds != 0) {
+		vk_conv_gpu_set_provider_kinds(x.g, gpu_kinds);
+		r = req_of(64, 32, XRT_CONV_FMT_R32_FLOAT, CONV_IMAGE_USAGE_PROVIDER_OUT, 1,
+		           XRT_CONV_MEM_CPU | gpu_kinds);
+		REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+		CHECK((img.memory_kind & gpu_kinds) != 0u);
+		CHECK(img.handle != VK_CONV_GPU_NO_HANDLE);
+		CHECK(img.color_space == XRT_CONV_CS_DATA);
+		x.ops.free(x.ops.ud, &img);
+		// A provider whose sync kinds exclude NONE: declined (every glue image is SYNC_NONE).
+		r.import_sync_kinds = 1u << XRT_CONV_SYNC_VK_SEMAPHORE_FD;
+		CHECK_FALSE(x.ops.alloc(x.ops.ud, &r, &img));
+	}
+}
+
+TEST_CASE("vk glue: CPU <-> image round trips and the mirror upload", "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	struct Case
+	{
+		uint32_t fmt, bpp, layers;
+	} cases[] = {
+	    {XRT_CONV_FMT_RGBA8_UNORM, 4, 1}, {XRT_CONV_FMT_RGBA8_SRGB, 4, 1}, {XRT_CONV_FMT_BGRA8_UNORM, 4, 1},
+	    {XRT_CONV_FMT_R32_FLOAT, 4, 1},   {XRT_CONV_FMT_R16_FLOAT, 2, 1},  {XRT_CONV_FMT_RGBA8_UNORM, 4, 3},
+	};
+	for (const Case &k : cases) {
+		INFO("fmt " << k.fmt << " layers " << k.layers);
+		const uint32_t w = 37, h = 19; // odd sizes: no row-pitch luck
+		auto r = req_of(w, h, k.fmt, CONV_IMAGE_USAGE_MIRROR | CONV_IMAGE_USAGE_EXPORT, k.layers);
+		xrt_conv_image img{};
+		REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+		std::vector<uint8_t> src((size_t)w * h * k.bpp * k.layers), back(src.size());
+		for (size_t i = 0; i < src.size(); i++) {
+			src[i] = (uint8_t)(i * 7 + 3);
+		}
+		REQUIRE(vk_conv_gpu_write(x.g, &img, src.data(), 0));
+		REQUIRE(vk_conv_gpu_read(x.g, &img, back.data(), 0));
+		CHECK(std::memcmp(src.data(), back.data(), src.size()) == 0);
+
+		// #2030 mirror: a CPU result (strided rows) uploaded through the ops.
+		const uint32_t pitch = w * k.bpp + 12;
+		std::vector<uint8_t> cpu((size_t)pitch * h * k.layers, 0);
+		for (uint32_t l = 0; l < k.layers; l++) {
+			for (uint32_t y = 0; y < h; y++) {
+				for (uint32_t b = 0; b < w * k.bpp; b++) {
+					cpu[((size_t)l * h + y) * pitch + b] = (uint8_t)(b + y * 3 + l * 50);
+				}
+			}
+		}
+		xrt_conv_image c{};
+		c.memory_kind = XRT_CONV_MEM_CPU;
+		c.cpu_ptr = cpu.data();
+		c.byte_size = cpu.size();
+		c.width = w;
+		c.height = h;
+		c.format = k.fmt;
+		c.row_stride = pitch;
+		c.import_key = (1ull << 63) | 5;
+		REQUIRE(x.ops.upload(x.ops.ud, &c, &img));
+		REQUIRE(vk_conv_gpu_read(x.g, &img, back.data(), 0));
+		bool same = true;
+		for (uint32_t l = 0; l < k.layers && same; l++) {
+			for (uint32_t y = 0; y < h && same; y++) {
+				same = std::memcmp(&cpu[((size_t)l * h + y) * pitch],
+				                   &back[((size_t)l * h + y) * w * k.bpp], w * k.bpp) == 0;
+			}
+		}
+		CHECK(same);
+		// Wrong extent: refused.
+		c.width = w - 1;
+		CHECK_FALSE(x.ops.upload(x.ops.ud, &c, &img));
+		x.ops.free(x.ops.ud, &img);
+	}
+	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
+}
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+TEST_CASE("vk glue (macOS): an exported IOSurface holds the image's bytes", "[conv_vk_gpu][iosurface]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	vk_conv_gpu_caps c{};
+	vk_conv_gpu_get_caps(x.g, &c);
+	REQUIRE((c.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0u);
+	const uint32_t w = 64, h = 16;
+	auto r = req_of(w, h, XRT_CONV_FMT_BGRA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_EXPORT);
+	xrt_conv_image img{};
+	REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+	REQUIRE(img.memory_kind == XRT_CONV_MEM_IOSURFACE);
+	REQUIRE(img.handle != VK_CONV_GPU_NO_HANDLE);
+	IOSurfaceRef surf = (IOSurfaceRef)(uintptr_t)img.handle;
+	CHECK(IOSurfaceGetWidth(surf) == w);
+	CHECK(IOSurfaceGetHeight(surf) == h);
+	std::vector<uint8_t> src((size_t)w * h * 4);
+	for (size_t i = 0; i < src.size(); i++) {
+		src[i] = (uint8_t)(i * 5 + 1);
+	}
+	REQUIRE(vk_conv_gpu_write(x.g, &img, src.data(), 0));
+	REQUIRE(IOSurfaceLock(surf, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess);
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+	const size_t bpr = IOSurfaceGetBytesPerRow(surf);
+	bool same = true;
+	for (uint32_t y = 0; y < h && same; y++) {
+		same = std::memcmp(base + y * bpr, &src[(size_t)y * w * 4], (size_t)w * 4) == 0;
+	}
+	IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
+	CHECK(same);
+	SUCCEED("IOSurface export: " << (same ? "bytes match" : "MISMATCH") << ", bytesPerRow " << bpr << ", fourcc 0x"
+	                             << std::hex << IOSurfaceGetPixelFormat(surf));
+	x.ops.free(x.ops.ud, &img);
+}
+
+TEST_CASE("vk glue (macOS): an IOSurface imports into a VkImage through VK_EXT_metal_objects",
+          "[conv_vk_gpu][iosurface]")
+{
+	// The import half the macOS transport needs (a client's IOSurface in):
+	// the comp_multi weave engine's pattern, verified against CPU bytes.
+	auto vkp = make_bundle();
+	if (!vkp) {
+		SKIP("no Vulkan device available");
+	}
+	struct vk_bundle *vk = vkp.get();
+	if (!vk->has_EXT_metal_objects || !vk->has_EXT_external_memory_metal) {
+		SKIP("VK_EXT_metal_objects / VK_EXT_external_memory_metal not available");
+	}
+	const int w = 48, h = 8;
+	CFMutableDictionaryRef props =
+	    CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int iw = w, ih = h, bpe = 4;
+	uint32_t fourcc = 'BGRA';
+	CFNumberRef nw = CFNumberCreate(nullptr, kCFNumberIntType, &iw);
+	CFNumberRef nh = CFNumberCreate(nullptr, kCFNumberIntType, &ih);
+	CFNumberRef nb = CFNumberCreate(nullptr, kCFNumberIntType, &bpe);
+	CFNumberRef nf = CFNumberCreate(nullptr, kCFNumberSInt32Type, &fourcc);
+	CFDictionarySetValue(props, kIOSurfaceWidth, nw);
+	CFDictionarySetValue(props, kIOSurfaceHeight, nh);
+	CFDictionarySetValue(props, kIOSurfaceBytesPerElement, nb);
+	CFDictionarySetValue(props, kIOSurfacePixelFormat, nf);
+	IOSurfaceRef surf = IOSurfaceCreate(props);
+	CFRelease(nw);
+	CFRelease(nh);
+	CFRelease(nb);
+	CFRelease(nf);
+	CFRelease(props);
+	REQUIRE(surf != nullptr);
+	REQUIRE(IOSurfaceLock(surf, 0, nullptr) == kIOReturnSuccess);
+	uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+	const size_t bpr = IOSurfaceGetBytesPerRow(surf);
+	for (int y = 0; y < h; y++) {
+		for (int b = 0; b < w * 4; b++) {
+			base[y * bpr + b] = (uint8_t)(b * 3 + y * 11);
+		}
+	}
+	IOSurfaceUnlock(surf, 0, nullptr);
+
+	VkExportMetalObjectCreateInfoEXT export_tex = {};
+	export_tex.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+	export_tex.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+	VkImportMetalIOSurfaceInfoEXT import_surf = {};
+	import_surf.sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT;
+	import_surf.pNext = &export_tex;
+	import_surf.ioSurface = surf;
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.pNext = &import_surf;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+	ici.extent = {(uint32_t)w, (uint32_t)h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	Image img;
+	img.vk = vk;
+	img.w = w;
+	img.h = h;
+	img.format = ici.format;
+	REQUIRE(vk->vkCreateImage(vk->device, &ici, nullptr, &img.image) == VK_SUCCESS);
+	VkExportMetalTextureInfoEXT et = {};
+	et.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT;
+	et.image = img.image;
+	et.plane = VK_IMAGE_ASPECT_PLANE_0_BIT; // the spec's value for a single-plane image (VUID-06799)
+	VkExportMetalObjectsInfoEXT eo = {};
+	eo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+	eo.pNext = &et;
+	vk->vkExportMetalObjectsEXT(vk->device, &eo);
+	REQUIRE(et.mtlTexture != nullptr);
+	VkMemoryMetalHandlePropertiesEXT mp = {};
+	mp.sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT;
+	REQUIRE(vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                                                et.mtlTexture, &mp) == VK_SUCCESS);
+	uint32_t type = 0;
+	while (type < 32 && (mp.memoryTypeBits & (1u << type)) == 0) {
+		type++;
+	}
+	REQUIRE(type < 32);
+	VkImportMemoryMetalHandleInfoEXT im = {};
+	im.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
+	im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+	im.handle = et.mtlTexture;
+	VkMemoryDedicatedAllocateInfoKHR ded = {};
+	ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR;
+	ded.pNext = &im;
+	ded.image = img.image;
+	VkMemoryAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	ai.pNext = &ded;
+	ai.allocationSize = 0; // an MTLTexture import with a dedicated image (VUID-VkMemoryAllocateInfo-pNext-10397)
+	ai.memoryTypeIndex = type;
+	REQUIRE(vk->vkAllocateMemory(vk->device, &ai, nullptr, &img.mem) == VK_SUCCESS);
+	REQUIRE(vk->vkBindImageMemory(vk->device, img.image, img.mem, 0) == VK_SUCCESS);
+
+	struct vk_cmd_pool pool = {};
+	REQUIRE(vk_cmd_pool_init(vk, &pool, 0) == VK_SUCCESS);
+	std::vector<uint8_t> back((size_t)w * h * 4);
+	// readback() expects GENERAL: the import carries the IOSurface's bytes in a
+	// "preinitialized" sense; an UNDEFINED -> GENERAL transition must not lose them on Metal.
+	REQUIRE(run_cmd(vk, &pool, [&](VkCommandBuffer cmd) {
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vk_cmd_image_barrier_locked(vk, cmd, img.image, 0, VK_ACCESS_TRANSFER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, range);
+		return true;
+	}));
+	REQUIRE(readback(vk, &pool, img, back.data(), back.size()));
+	vk_cmd_pool_destroy(vk, &pool);
+	bool same = true;
+	for (int y = 0; y < h && same; y++) {
+		for (int b = 0; b < w * 4 && same; b++) {
+			same = back[(size_t)y * w * 4 + b] == (uint8_t)(b * 3 + y * 11);
+		}
+	}
+	CHECK(same);
+	SUCCEED("IOSurface import through VK_EXT_metal_objects: " << (same ? "bytes match" : "MISMATCH"));
+	CFRelease(surf);
+}
+#endif
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+TEST_CASE("vk glue (Linux): an OPAQUE_FD export re-imports into a second image with the same bytes",
+          "[conv_vk_gpu][fd]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	vk_conv_gpu_caps c{};
+	vk_conv_gpu_get_caps(x.g, &c);
+	if ((c.memory_kinds & XRT_CONV_MEM_VK_OPAQUE_FD) == 0) {
+		SKIP("this device cannot export OPAQUE_FD images");
+	}
+	struct vk_bundle *vk = x.vk.get();
+	const uint32_t w = 40, h = 12;
+	auto r = req_of(w, h, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_EXPORT);
+	xrt_conv_image img{};
+	REQUIRE(x.ops.alloc(x.ops.ud, &r, &img));
+	REQUIRE(img.memory_kind == XRT_CONV_MEM_VK_OPAQUE_FD);
+	std::vector<uint8_t> src((size_t)w * h * 4), back(src.size());
+	for (size_t i = 0; i < src.size(); i++) {
+		src[i] = (uint8_t)(i * 13 + 2);
+	}
+	REQUIRE(vk_conv_gpu_write(x.g, &img, src.data(), 0));
+
+	// The importer's side: same create info, the fd (dup'ed: the handle is borrowed).
+	VkExternalMemoryImageCreateInfo ext = {};
+	ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+	ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.pNext = &ext;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+	ici.extent = {w, h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	Image imp;
+	imp.vk = vk;
+	imp.w = w;
+	imp.h = h;
+	imp.format = ici.format;
+	REQUIRE(vk->vkCreateImage(vk->device, &ici, nullptr, &imp.image) == VK_SUCCESS);
+	VkMemoryRequirements req;
+	vk->vkGetImageMemoryRequirements(vk->device, imp.image, &req);
+	VkImportMemoryFdInfoKHR ifd = {};
+	ifd.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+	ifd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+	ifd.fd = dup((int)img.handle);
+	VkMemoryDedicatedAllocateInfoKHR ded = {};
+	ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR;
+	ded.pNext = &ifd;
+	ded.image = imp.image;
+	uint32_t type = 0;
+	REQUIRE(vk_get_memory_type(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type));
+	VkMemoryAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	ai.pNext = &ded;
+	ai.allocationSize = img.byte_size;
+	ai.memoryTypeIndex = type;
+	REQUIRE(vk->vkAllocateMemory(vk->device, &ai, nullptr, &imp.mem) == VK_SUCCESS);
+	REQUIRE(vk->vkBindImageMemory(vk->device, imp.image, imp.mem, 0) == VK_SUCCESS);
+	struct vk_cmd_pool pool = {};
+	REQUIRE(vk_cmd_pool_init(vk, &pool, 0) == VK_SUCCESS);
+	// The exporter left it GENERAL; the importer adopts that layout (no discard).
+	REQUIRE(readback(vk, &pool, imp, back.data(), back.size()));
+	vk_cmd_pool_destroy(vk, &pool);
+	CHECK(std::memcmp(src.data(), back.data(), src.size()) == 0);
+	x.ops.free(x.ops.ud, &img);
+}
+#endif
+
+TEST_CASE("vk glue: S6 readback returns an earlier copy's samples, never stalling", "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	vk_conv_gpu_caps c{};
+	vk_conv_gpu_get_caps(x.g, &c);
+	// A GPU depth image: the mirror usage is always GPU.
+	for (uint32_t fmt : {XRT_CONV_FMT_R32_FLOAT, XRT_CONV_FMT_R16_FLOAT}) {
+		INFO("fmt " << fmt);
+		const uint32_t w = 33, h = 17;
+		auto r = req_of(w, h, fmt, CONV_IMAGE_USAGE_MIRROR);
+		xrt_conv_image d{};
+		REQUIRE(x.ops.alloc(x.ops.ud, &r, &d));
+		std::vector<float> v((size_t)w * h);
+		std::vector<uint16_t> hv(v.size());
+		for (size_t i = 0; i < v.size(); i++) {
+			v[i] = quantize_half(1.0f + (float)i / (float)v.size());
+			hv[i] = to_half_bits(v[i]);
+		}
+		REQUIRE(
+		    vk_conv_gpu_write(x.g, &d, fmt == XRT_CONV_FMT_R32_FLOAT ? (const void *)v.data() : hv.data(), 0));
+		const float *s = nullptr;
+		uint32_t sw = 0, sh = 0, stride = 0;
+		// First call: issues the copy, nothing fresh yet.
+		CHECK_FALSE(x.rb.read(x.rb.ud, &d, &s, &sw, &sh, &stride));
+		// A later call sees it (the copy finishes in microseconds).
+		REQUIRE(wait_until([&] { return x.rb.read(x.rb.ud, &d, &s, &sw, &sh, &stride); }, 2000));
+		REQUIRE(s != nullptr);
+		CHECK(sw == w);
+		CHECK(sh == h);
+		CHECK(stride == w);
+		bool same = true;
+		for (size_t i = 0; i < v.size() && same; i++) {
+			same = s[i] == v[i];
+		}
+		CHECK(same);
+		x.rb.release(x.rb.ud, s);
+		// Not every call: the next copy waits out the sample period.
+		CHECK_FALSE(x.rb.read(x.rb.ud, &d, &s, &sw, &sh, &stride));
+		x.ops.free(x.ops.ud, &d);
+	}
+	// A CPU image is not the readback's (S6 reads CPU depth directly).
+	xrt_conv_image cpu{};
+	cpu.memory_kind = XRT_CONV_MEM_CPU;
+	cpu.format = XRT_CONV_FMT_R32_FLOAT;
+	const float *s = nullptr;
+	uint32_t a = 0, b = 0, st = 0;
+	CHECK_FALSE(x.rb.read(x.rb.ud, &cpu, &s, &a, &b, &st));
+}
+
+namespace {
+
+//! A colour (RGBA8, encodes u in R) + a step depth (affine disparity) on the CPU.
+struct CpuScene
+{
+	static constexpr uint32_t W = 256, H = 144, DW = 64, DH = 36;
+	std::vector<uint8_t> color;
+	std::vector<float> depth;
+	xrt_conv_image c{}, d{};
+	xrt_conv_depth_info di{};
+
+	CpuScene()
+	{
+		color.resize((size_t)W * H * 4);
+		for (uint32_t y = 0; y < H; y++) {
+			for (uint32_t x = 0; x < W; x++) {
+				uint8_t *p = &color[((size_t)y * W + x) * 4];
+				p[0] = (uint8_t)std::lround((x + 0.5) / W * 255.0);
+				p[1] = (uint8_t)std::lround((1.0 - (y + 0.5) / H) * 255.0);
+				p[2] = (x >= 96 && x < 160 && y >= 48 && y < 96) ? 255 : 0;
+				p[3] = 255;
+			}
+		}
+		depth.assign((size_t)DW * DH, 0.0f);
+		for (uint32_t y = 12; y < 24; y++) {
+			for (uint32_t x = 24; x < 40; x++) {
+				depth[(size_t)y * DW + x] = 1.0f;
+			}
+		}
+		c.memory_kind = XRT_CONV_MEM_CPU;
+		c.cpu_ptr = color.data();
+		c.byte_size = color.size();
+		c.width = W;
+		c.height = H;
+		c.format = XRT_CONV_FMT_RGBA8_UNORM;
+		c.row_stride = W * 4;
+		c.import_key = (1ull << 63) | 11;
+		d.memory_kind = XRT_CONV_MEM_CPU;
+		d.cpu_ptr = depth.data();
+		d.byte_size = depth.size() * 4;
+		d.width = DW;
+		d.height = DH;
+		d.format = XRT_CONV_FMT_R32_FLOAT;
+		d.row_stride = DW * 4;
+		d.import_key = (1ull << 63) | 12;
+		di.kind = XRT_CONV_DEPTH_AFFINE_DISPARITY;
+		di.value_scale = 1.0f;
+		di.invalid_sample = NAN;
+	}
+
+	conv_viewsyn_request
+	request(const xrt_conv_image *target, uint32_t layout) const
+	{
+		conv_viewsyn_request q{};
+		q.color = &c;
+		q.depth = &d;
+		q.depth_info = &di;
+		q.view_count = 2;
+		q.viewpoints_m[0][0] = -0.0315f;
+		q.viewpoints_m[1][0] = 0.0315f;
+		q.viewpoints_m[0][2] = q.viewpoints_m[1][2] = 0.6f;
+		q.rect_width_m = 0.32f;
+		q.rect_height_m = 0.18f;
+		q.range_near = 1.0f;
+		q.range_far = 0.0f;
+		q.convergence = 0.5f;
+		q.budget = 0.1f;
+		q.rear_cap_m = -1.0f;
+		q.target = target;
+		q.layout = layout;
+		q.new_content = true;
+		return q;
+	}
+};
+
+} // namespace
+
+TEST_CASE("vk glue: S5 on CPU colour + CPU depth, into a GPU target and into a CPU target", "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	CpuScene sc;
+	const uint32_t W = CpuScene::W, H = CpuScene::H;
+
+	// GPU target (the composed views, ROW).
+	auto r = req_of(2 * W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_EXPORT, 1,
+	                0, 42);
+	xrt_conv_image t{};
+	REQUIRE(x.ops.alloc(x.ops.ud, &r, &t));
+	conv_viewsyn_request q = sc.request(&t, XRT_CONV_VIEWS_ROW);
+	REQUIRE(x.vs.render(x.vs.ud, &q));
+	std::vector<uint8_t> gpu((size_t)2 * W * H * 4);
+	REQUIRE(vk_conv_gpu_read(x.g, &t, gpu.data(), 0));
+	CHECK(vk_conv_gpu_viewsyn_prepass_count(x.g) == 1u);
+
+	// Each view: the far ground keeps its own u away from the square (taper
+	// band aside), and the near square moved in opposite directions.
+	auto blue_left_edge = [&](const std::vector<uint8_t> &img, uint32_t view, uint32_t row_w) {
+		const uint32_t y = 72;
+		for (uint32_t x = 1; x < W; x++) {
+			const uint8_t b0 = img[((size_t)y * row_w + view * W + x - 1) * 4 + 2];
+			const uint8_t b1 = img[((size_t)y * row_w + view * W + x) * 4 + 2];
+			if (b0 < 128 && b1 >= 128) {
+				return (int)x;
+			}
+		}
+		return -1;
+	};
+	const int e0 = blue_left_edge(gpu, 0, 2 * W), e1 = blue_left_edge(gpu, 1, 2 * W);
+	INFO("square's left edge: view 0 at " << e0 << ", view 1 at " << e1 << " (source 96)");
+	REQUIRE(e0 > 0);
+	REQUIRE(e1 > 0);
+	CHECK(e0 > 96); // the left eye sees the near square shifted right
+	CHECK(e1 < 96);
+	const uint8_t *ground = &gpu[((size_t)10 * 2 * W + 40) * 4]; // view 0, near the top-left, far ground
+	CHECK(std::abs((int)ground[0] - (int)std::lround(40.5 / W * 255.0)) <= 6);
+
+	// The same synthesis into a CPU target (the scratch + readback path) is
+	// the same pixels: the scratch target goes through the same blit.
+	std::vector<uint8_t> cpu_t(gpu.size(), 0);
+	xrt_conv_image ct{};
+	ct.memory_kind = XRT_CONV_MEM_CPU;
+	ct.cpu_ptr = cpu_t.data();
+	ct.byte_size = cpu_t.size();
+	ct.width = 2 * W;
+	ct.height = H;
+	ct.format = XRT_CONV_FMT_RGBA8_UNORM;
+	ct.row_stride = 2 * W * 4;
+	ct.import_key = (1ull << 63) | 13;
+	// Needs a glue image of the stream to hang the scratch on: the colour.
+	auto rc = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_MIRROR, 1, 0, 43);
+	xrt_conv_image gc{};
+	REQUIRE(x.ops.alloc(x.ops.ud, &rc, &gc));
+	REQUIRE(vk_conv_gpu_write(x.g, &gc, sc.color.data(), 0));
+	conv_viewsyn_request q2 = sc.request(&ct, XRT_CONV_VIEWS_ROW);
+	q2.color = &gc;
+	REQUIRE(x.vs.render(x.vs.ud, &q2));
+	CHECK(std::memcmp(cpu_t.data(), gpu.data(), gpu.size()) == 0);
+
+	// A request with only CPU images has no stream to hang scratch on: refused.
+	conv_viewsyn_request q3 = sc.request(&ct, XRT_CONV_VIEWS_ROW);
+	CHECK_FALSE(x.vs.render(x.vs.ud, &q3));
+
+	x.ops.free(x.ops.ud, &gc);
+	x.ops.free(x.ops.ud, &t);
+	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
+}
+
+namespace {
+
+//! The service trampoline's shape: the glue first, CPU memory when it declines.
+struct Tramp
+{
+	conv_image_alloc_ops gpu{};
+	std::atomic<uint64_t> key{1};
+	std::atomic<int> cpu_live{0};
+	std::atomic<int> gpu_allocs{0};
+};
+
+bool
+tr_alloc(void *ud, const conv_image_request *req, xrt_conv_image *out)
+{
+	auto *t = static_cast<Tramp *>(ud);
+	if (t->gpu.alloc(t->gpu.ud, req, out)) {
+		t->gpu_allocs++;
+		return true;
+	}
+	if (req->import_memory_kinds != 0 && (req->import_memory_kinds & XRT_CONV_MEM_CPU) == 0) {
+		return false;
+	}
+	uint32_t bpp = req->format == XRT_CONV_FMT_R8_UNORM                                               ? 1
+	               : (req->format == XRT_CONV_FMT_R16_FLOAT || req->format == XRT_CONV_FMT_R16_UNORM) ? 2
+	               : req->format == XRT_CONV_FMT_RGBA16_FLOAT                                         ? 8
+	                                                                                                  : 4;
+	const uint32_t layers = req->array_layers ? req->array_layers : 1;
+	const uint64_t size = (uint64_t)req->width * req->height * bpp * layers;
+	void *p = std::calloc(1, (size_t)size);
+	if (p == nullptr) {
+		return false;
+	}
+	std::memset(out, 0, sizeof(*out));
+	out->memory_kind = XRT_CONV_MEM_CPU;
+	out->cpu_ptr = p;
+	out->byte_size = size;
+	out->width = req->width;
+	out->height = req->height;
+	out->format = req->format;
+	out->row_stride = req->width * bpp;
+	out->import_key = (t->key++) | (1ull << 63);
+	out->color_space = req->role == 0 ? XRT_CONV_CS_SRGB : XRT_CONV_CS_DATA;
+	t->cpu_live++;
+	return true;
+}
+
+void
+tr_free(void *ud, xrt_conv_image *img)
+{
+	auto *t = static_cast<Tramp *>(ud);
+	if (img->memory_kind == XRT_CONV_MEM_CPU && (img->import_key >> 63) != 0) {
+		std::free(img->cpu_ptr);
+		img->cpu_ptr = nullptr;
+		t->cpu_live--;
+		return;
+	}
+	t->gpu.free(t->gpu.ud, img);
+}
+
+bool
+tr_upload(void *ud, const xrt_conv_image *src, const xrt_conv_image *dst)
+{
+	auto *t = static_cast<Tramp *>(ud);
+	return t->gpu.upload(t->gpu.ud, src, dst);
+}
+
+} // namespace
+
+TEST_CASE("vk glue: a composed VIEWS_MONO conversion through conv_core (CPU depth provider, GPU views)",
+          "[conv_vk_gpu]")
+{
+	Glue x;
+	if (!make_glue(x)) {
+		SKIP("no Vulkan device available");
+	}
+	conv_fake_provider f;
+	conv_fake_init(&f, "depth-only");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	c->state = XRT_CONV_STATE_READY;
+	c->cap.depth_kind = XRT_CONV_DEPTH_METRIC;
+
+	Tramp tr;
+	tr.gpu = x.ops;
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = tr_alloc;
+		cfg.alloc.free = tr_free;
+		cfg.alloc.upload = tr_upload;
+		cfg.alloc.ud = &tr;
+		cfg.viewsyn = x.vs;
+		cfg.readback = x.rb;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		conv_core *core = nullptr;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		conv_provider_desc d{};
+		d.id = f.id;
+		d.probe_order = 100;
+		d.enabled = true;
+		d.iface = &f.iface;
+		d.inst = conv_fake_inst(&f);
+		REQUIRE(conv_core_add_provider(core, &d) >= 0);
+
+		xrt_conv_wire_stream_desc sd{};
+		sd.struct_size = sizeof(sd);
+		sd.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+		sd.task = XRT_CONV_TASK_VIEWS_MONO;
+		sd.outputs = XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH;
+		sd.view_count = 2;
+		sd.views_layout = XRT_CONV_VIEWS_ROW;
+		sd.input_kind = XRT_CONV_INPUT_MONO;
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(conv_core_stream_create(core, 1, &sd, nullptr, &cr) == XRT_SUCCESS);
+		CHECK((cr.desc_flags & XRT_CONV_WIRE_DESC_COMPOSED) != 0u);
+
+		for (int frame = 0; frame < 3; frame++) {
+			conv_submit_layout lay{};
+			lay.image_count = 1;
+			lay.width[0] = 64;
+			lay.height[0] = 32;
+			lay.format[0] = XRT_CONV_FMT_RGBA8_UNORM;
+			lay.color_space[0] = XRT_CONV_CS_SRGB;
+			lay.role[0] = XRT_CONV_IMG_COLOR;
+			conv_submit_slot slot{};
+			REQUIRE(conv_core_stream_begin_submit(core, cr.stream_id, &lay, &slot) == XRT_SUCCESS);
+			// The input is CPU memory (a composed binding names no import kinds).
+			REQUIRE(slot.images[0].memory_kind == XRT_CONV_MEM_CPU);
+			std::memset(slot.images[0].cpu_ptr, 0x80, (size_t)slot.images[0].byte_size);
+			conv_frame_submit fr{};
+			fr.source_time = (int64_t)now_ns();
+			fr.rect_valid = true;
+			fr.rect_w_m = 0.30f;
+			fr.rect_h_m = 0.20f;
+			uint64_t fid = 0;
+			REQUIRE(conv_core_stream_commit_submit(core, cr.stream_id, slot.slot, &fr, &fid) ==
+			        XRT_SUCCESS);
+			conv_result res{};
+			REQUIRE(wait_until(
+			    [&] { return conv_core_stream_acquire(core, cr.stream_id, true, &res) == XRT_SUCCESS; },
+			    3000));
+			INFO("frame " << frame);
+			CHECK(res.written == (XRT_CONV_OUT_VIEWS | XRT_CONV_OUT_DEPTH));
+			CHECK(res.views_info.view_count == 2u);
+			// The composed views are the glue's GPU image; the provider wrote its
+			// depth on the CPU lane and the core published it through the
+			// glue's GPU mirror (#2030 upload).
+			CHECK(res.views.memory_kind != XRT_CONV_MEM_CPU);
+			CHECK(res.depth.memory_kind != XRT_CONV_MEM_CPU);
+			std::vector<float> dpx((size_t)res.depth.width * res.depth.height);
+			REQUIRE(vk_conv_gpu_read(x.g, &res.depth, dpx.data(), 0));
+			const auto mm = std::minmax_element(dpx.begin(), dpx.end());
+			CHECK(*mm.first >= 1.0f); // the fake provider's ramp, 1..2 m
+			CHECK(*mm.second <= 2.0f);
+			CHECK(*mm.second > *mm.first);
+			CHECK(res.views.width == 128u);
+			std::vector<uint8_t> px((size_t)res.views.width * res.views.height * 4);
+			REQUIRE(vk_conv_gpu_read(x.g, &res.views, px.data(), 0));
+			// A flat grey input synthesises flat grey views (every pixel drawn).
+			size_t off = 0;
+			for (size_t i = 0; i < px.size(); i += 4) {
+				off += (std::abs((int)px[i] - 0x80) > 1 || px[i + 3] != 255) ? 1 : 0;
+			}
+			CHECK(off == 0u);
+			conv_core_stream_release(core, cr.stream_id, res.ring_slot);
+		}
+		conv_stream_stats st{};
+		REQUIRE(conv_core_stream_get_stats(core, cr.stream_id, &st) == XRT_SUCCESS);
+		CHECK(st.converted >= 3u);
+		CHECK(st.failed == 0u);
+		CHECK(st.composed);
+		CHECK(tr.gpu_allocs >= 1);
+		CHECK(vk_conv_gpu_viewsyn_prepass_count(x.g) >= 3u);
+		REQUIRE(conv_core_stream_destroy(core, cr.stream_id) == XRT_SUCCESS);
+		conv_core_destroy(&core);
+	}
+	CHECK(tr.cpu_live == 0);
+	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
+	conv_fake_fini(&f);
+}
