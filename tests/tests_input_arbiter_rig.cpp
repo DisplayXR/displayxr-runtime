@@ -364,3 +364,83 @@ TEST_CASE("input arbiter: with no providers the rig parks at -1")
 
 	t_input_arbiter_reset();
 }
+
+TEST_CASE("input arbiter: the gamepad role follows presence like the rig, with no floor")
+{
+	t_input_arbiter_reset();
+	g_sys.reset();
+	init_provider(g_prov_a, "prov-a-pad");
+
+	// A pad-only provider: a gamepad device and nothing else. It is still
+	// a candidate (the arbiter installs itself for it, like for a lone
+	// navigating provider) and it never touches the hands.
+	struct xrt_device qwerty_left = make_device(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, "qwerty-left");
+	struct xrt_device qwerty_right = make_device(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, "qwerty-right");
+	struct xrt_device a_pad = make_device(XRT_DEVICE_TYPE_GAMEPAD, "a-pad");
+	a_pad.name = XRT_DEVICE_XBOX_CONTROLLER;
+
+	int32_t a_pad_index = g_sys.add(&a_pad);
+	int32_t qwerty_left_index = g_sys.add(&qwerty_left);
+	g_sys.add(&qwerty_right);
+
+	struct xrt_device *a_devs[] = {&a_pad};
+	t_input_arbiter_note_provider_pair(&g_prov_a.iface, instance_of(g_prov_a), 150, nullptr, nullptr);
+	t_input_arbiter_note_provider_gamepad(a_devs, 1);
+	t_input_arbiter_note_qwerty_pair(&qwerty_left, &qwerty_right);
+
+	t_input_arbiter_install(&g_sys.base);
+
+	auto wait_for_gamepad = [](int32_t want) {
+		struct xrt_system_roles roles = read_roles();
+		for (int i = 0; i < 200 && roles.gamepad != want; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(25));
+			roles = read_roles();
+		}
+		return roles;
+	};
+
+	struct xrt_system_roles roles = read_roles();
+	CHECK(roles.gamepad == a_pad_index);
+	CHECK(roles.gamepad_profile == XRT_DEVICE_XBOX_CONTROLLER);
+	CHECK(roles.left == qwerty_left_index); // the pad is not a hand
+	CHECK(roles.rig == -1);                 // nor a navigator
+	CHECK_FALSE(t_input_arbiter_provider_holds_roles());
+
+	// Unplug: the role parks at -1 (there is no qwerty gamepad), the
+	// profile clears, the generation moves; replug takes it back.
+	const uint64_t generation = roles.generation_id;
+	g_prov_a.present.store(false);
+	roles = wait_for_gamepad(-1);
+	CHECK(roles.gamepad == -1);
+	CHECK(roles.gamepad_profile == XRT_DEVICE_INVALID);
+	CHECK(roles.generation_id > generation);
+	CHECK(roles.left == qwerty_left_index);
+
+	g_prov_a.present.store(true);
+	roles = wait_for_gamepad(a_pad_index);
+	CHECK(roles.gamepad == a_pad_index);
+	CHECK(roles.gamepad_profile == XRT_DEVICE_XBOX_CONTROLLER);
+
+	t_input_arbiter_reset();
+}
+
+TEST_CASE("input arbiter: a second gamepad device from one provider is ignored")
+{
+	t_input_arbiter_reset();
+	g_sys.reset();
+	init_provider(g_prov_a, "prov-a-two-pads");
+
+	struct xrt_device a_pad1 = make_device(XRT_DEVICE_TYPE_GAMEPAD, "a-pad-1");
+	struct xrt_device a_pad2 = make_device(XRT_DEVICE_TYPE_GAMEPAD, "a-pad-2");
+	int32_t a_pad1_index = g_sys.add(&a_pad1);
+	g_sys.add(&a_pad2);
+
+	struct xrt_device *a_devs[] = {&a_pad1, &a_pad2};
+	t_input_arbiter_note_provider_pair(&g_prov_a.iface, instance_of(g_prov_a), 150, nullptr, nullptr);
+	t_input_arbiter_note_provider_gamepad(a_devs, 2);
+	t_input_arbiter_install(&g_sys.base);
+
+	CHECK(read_roles().gamepad == a_pad1_index);
+
+	t_input_arbiter_reset();
+}
