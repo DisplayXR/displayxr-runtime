@@ -348,6 +348,10 @@ if(TARGET ipc_server_conv)
 	# install, the depth-kind contract; and the four v3-observable shifts as
 	# golden tests (spec XR_DXR_lift.md section 14.2).
 	list(APPEND tests tests_ipc_conv_v4 tests_lift_v3_shifts)
+	if(NOT WIN32)
+		# The POSIX CPU I/O glue (spec-4 CPU kinds without a D3D11 device).
+		list(APPEND tests tests_ipc_conv_cpu)
+	endif()
 endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
@@ -1479,6 +1483,16 @@ if(TARGET tests_oxr_lift_startup)
 			$<TARGET_PROPERTY:ipc_client,INTERFACE_INCLUDE_DIRECTORIES>
 		)
 	target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-interfaces xrt-external-openxr aux_os)
+	if(NOT WIN32)
+		# The POSIX CPU kind's shared sections (oxr_conv_gpu_d3d.c): no fake,
+		# the real ones (they touch no IPC seam the fakes stand in for).
+		target_sources(
+			tests_oxr_lift_startup PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared/ipc_cpu_buffer.c
+			)
+		if(APPLE)
+			target_link_libraries(tests_oxr_lift_startup PRIVATE "-framework IOSurface" "-framework CoreFoundation")
+		endif()
+	endif()
 	if(TARGET Vulkan::Vulkan)
 		# oxr_objects.h pulls in xrt_vulkan_includes.h; st_oxr gets those headers
 		# through aux_vk, which this test deliberately does not link (macOS CI has
@@ -1506,6 +1520,10 @@ foreach(_t tests_ipc_conv_v4 tests_lift_v3_shifts)
 		set_target_properties(${_t} PROPERTIES CXX_STANDARD 17)
 	endif()
 endforeach()
+if(TARGET tests_ipc_conv_cpu)
+	target_link_libraries(tests_ipc_conv_cpu PRIVATE ipc_server_conv ipc_shared displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_ipc_conv_cpu PROPERTIES CXX_STANDARD 17)
+endif()
 if(TARGET tests_ipc_lift_core)
 	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
 	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

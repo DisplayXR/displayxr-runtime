@@ -4768,6 +4768,7 @@ struct oxr_lift_stream_dxr
 	uint32_t task; //!< spec 4: its XrLiftTaskDXR (0 = a spec-3 mode stream)
 	bool export_cpu;   //!< spec 4: exportKind CPU (results read from a mapping)
 	void *cpu_view;    //!< the mapped CPU export (valid until the next acquire)
+	void *cpu_token;   //!< oxr_conv_cpu_map's token for cpu_view (POSIX mapping state)
 	uint64_t cpu_bytes;
 };
 

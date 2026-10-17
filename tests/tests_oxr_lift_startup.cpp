@@ -39,6 +39,7 @@
 #include "shared/ipc_lift_caps.h"
 
 #include "oxr_api_funcs.h"
+#include "oxr_conv_gpu.h"
 
 #include <cstddef>
 #include <cstring>
@@ -293,6 +294,71 @@ TEST_CASE("lift startup: XR_DXR_lift not enabled, or an ineligible in-process se
 	CHECK(oxr_xrCreateLiftStreamDXR(session, &ci, &stream) == XR_ERROR_FEATURE_UNSUPPORTED);
 	CHECK(take_trace().empty());
 	lf_session_destroy();
+}
+
+TEST_CASE("lift eligibility: every in-process session reaches the service (spec 4); spec 3 stays D3D")
+{
+	const uint64_t cpu = 1ull << XR_LIFT_IMAGE_KIND_CPU_DXR;
+	const uint64_t d3d_in = (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR) |
+	                        (1ull << XR_LIFT_IMAGE_KIND_D3D11_DXGI_DXR) |
+	                        (1ull << XR_LIFT_IMAGE_KIND_D3D12_NT_DXR) | cpu;
+	const uint64_t d3d_out = (1ull << XR_LIFT_IMAGE_KIND_D3D11_NT_DXR) | cpu;
+
+	// An in-process GL session (Vulkan / Metal take the same branch): the
+	// lift-only link, CPU bytes in and out, no spec-3 calls.
+	lf_reset();
+	XrSession session = lf_session_create(LF_SESSION_INPROCESS_GL, true);
+	struct oxr_session *sess = (struct oxr_session *)(uintptr_t)session;
+	uint64_t in = 0, out = 0;
+	oxr_conv_session_image_kinds(sess, &in, &out);
+	CHECK_FALSE(oxr_conv_v3_eligible(sess));
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID))
+	CHECK(oxr_conv_inprocess_eligible(sess));
+	CHECK(in == cpu);
+	CHECK(out == cpu);
+	// Spec 4 rides the link (created lazily; here its connect is in flight).
+	uint32_t n = 99;
+	CHECK(oxr_xrEnumerateLiftTasksDXR(session, 0, &n, nullptr) == XR_SUCCESS);
+	CHECK(n == 0u);
+	CHECK(take_trace() == V{
+	                          "link:create",
+	                          "link:acquire_wait(timeout_ms=0) -> CONNECTING gen=0",
+	                      });
+#else
+	CHECK_FALSE(oxr_conv_inprocess_eligible(sess));
+	CHECK(in == 0u);
+	CHECK(out == 0u);
+#endif
+	lf_session_destroy();
+
+	// An IPC session: Windows D3D + CPU as before; POSIX CPU.
+	lf_reset();
+	session = lf_session_create(LF_SESSION_IPC, true);
+	sess = (struct oxr_session *)(uintptr_t)session;
+	oxr_conv_session_image_kinds(sess, &in, &out);
+#ifdef XRT_OS_WINDOWS
+	CHECK(in == d3d_in);
+	CHECK(out == d3d_out);
+#elif defined(XRT_OS_MACOS) || (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID))
+	CHECK(in == cpu);
+	CHECK(out == cpu);
+#endif
+	lf_session_destroy();
+
+#ifdef XRT_OS_WINDOWS
+	// In-process D3D11 / D3D12: byte-identical to before (D3D kinds, spec 3 allowed).
+	lf_reset();
+	session = lf_session_create(LF_SESSION_INPROCESS_D3D12, true);
+	sess = (struct oxr_session *)(uintptr_t)session;
+	oxr_conv_session_image_kinds(sess, &in, &out);
+	CHECK(oxr_conv_v3_eligible(sess));
+	CHECK(in == d3d_in);
+	CHECK(out == d3d_out);
+	lf_session_destroy();
+#else
+	(void)d3d_in;
+	(void)d3d_out;
+#endif
 }
 
 #ifdef XRT_OS_WINDOWS

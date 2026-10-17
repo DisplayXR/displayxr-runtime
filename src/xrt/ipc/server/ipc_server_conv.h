@@ -205,6 +205,16 @@ struct ipc_server_conv_io_ops
 	                   uint32_t *out_format,
 	                   uint64_t *out_bytes,
 	                   bool *out_realloc);
+
+	/*!
+	 * A glue with no D3D textures (the POSIX CPU glue,
+	 * ipc_server_conv_cpu.h): spec-4 streams take and give the CPU kind
+	 * only, a platform-default export is CPU, and the v3 route (D3D11
+	 * shared textures by definition) stays off — the v3 calls keep
+	 * answering modes 0 / UNAVAILABLE. import_input / export_output /
+	 * export_fence are refusing stubs.
+	 */
+	bool cpu_only;
 };
 
 /*!
