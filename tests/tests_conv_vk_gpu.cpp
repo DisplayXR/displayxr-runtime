@@ -1536,3 +1536,397 @@ TEST_CASE("vk_conv_weave: a stream destroyed with a weave in flight keeps its im
 	vk_conv_weave_destroy(&w);
 	vk_cmd_pool_destroy(vk, &pool);
 }
+
+
+/*
+ *
+ * Step C on the macOS Metal weave backend: vk_conv_weave as a host client,
+ * comp_multi_weave_metal_lift recording into a headless Metal device. The
+ * results stay the Vulkan glue's (MoltenVK) IOSurface exports, sampled in Metal.
+ *
+ */
+
+#ifdef CONV_TEST_HAVE_METAL_WEAVE
+
+#include "conv_metal_weave_rig.h"
+
+namespace {
+
+//! The planner the Metal engine uses, straight onto the helper (+ the last plan, for the oracle).
+struct HostPlanner
+{
+	vk_conv_weave *w = nullptr;
+	vk_conv_weave_client *c = nullptr;
+	struct vk_conv_weave_host_plan last
+	{
+	};
+	uint32_t plans = 0;
+
+	static bool
+	plan(void *ud, const vk_conv_weave_rect *r, struct vk_conv_weave_host_plan *out)
+	{
+		auto *hp = static_cast<HostPlanner *>(ud);
+		const bool ok = vk_conv_weave_host_plan(hp->w, hp->c, r, out);
+		hp->last = *out;
+		hp->plans++;
+		return ok;
+	}
+
+	static void
+	done(void *ud, uint64_t owner, uint64_t wire, const struct vk_conv_weave_host_done *d)
+	{
+		auto *hp = static_cast<HostPlanner *>(ud);
+		vk_conv_weave_host_done(hp->w, hp->c, owner, wire, d);
+	}
+
+	comp_multi_weave_metal_lift_planner
+	get()
+	{
+		return {plan, done, this};
+	}
+};
+
+//! Bilinear sample (texel centres at +0.5) of channel @p ch, R G B A order, from an 8-bit IOSurface view.
+float
+iosurface_bilinear(
+    const uint8_t *base, size_t pitch, bool bgra, float x, float y, uint32_t x0, uint32_t w, uint32_t h, int ch)
+{
+	const int map[4] = {bgra ? 2 : 0, 1, bgra ? 0 : 2, 3};
+	const float fx = std::min(std::max(x - 0.5f, 0.0f), (float)(w - 1));
+	const float fy = std::min(std::max(y - 0.5f, 0.0f), (float)(h - 1));
+	const uint32_t ix = (uint32_t)fx, iy = (uint32_t)fy;
+	const uint32_t jx = std::min(ix + 1, w - 1), jy = std::min(iy + 1, h - 1);
+	const float ax = fx - (float)ix, ay = fy - (float)iy;
+	auto t = [&](uint32_t px, uint32_t py) {
+		return (float)base[(size_t)py * pitch + (size_t)(x0 + px) * 4 + map[ch]];
+	};
+	return (1 - ay) * ((1 - ax) * t(ix, iy) + ax * t(jx, iy)) + ay * ((1 - ax) * t(ix, jy) + ax * t(jx, jy));
+}
+
+} // namespace
+
+TEST_CASE("Metal weave backend: a lifted batch rect -- flat, capped snapshot, the IOSurface result sampled, letterbox",
+          "[conv_vk_gpu][weave_rects][metal]")
+{
+	WeaveRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport available");
+	}
+	cmw_rig *mr = cmw_rig_create();
+	if (mr == nullptr) {
+		SKIP("no Metal device");
+	}
+	ipc_server_conv *sc = rig.sc;
+	ipc_server_conv_set_weave_rects(sc, true);
+	uint64_t wire = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) == XRT_SUCCESS);
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	REQUIRE(weave_resolve(sc, 1, wire, &core_id, &mode));
+
+	vk_conv_weave *w = nullptr;
+	REQUIRE(vk_conv_weave_create(rig.x.vk.get(), rig.x.g, &w));
+	vk_conv_weave_bridge b{};
+	b.core = rig.core;
+	b.resolve = weave_resolve;
+	b.match_weave = weave_match;
+	b.fit_rect = ipc_server_conv_submit_rect;
+	b.ud = sc;
+	vk_conv_weave_set_bridge(w, &b);
+	HostPlanner hp;
+	hp.w = w;
+	hp.c = vk_conv_weave_client_create(w, nullptr); // a host client
+	REQUIRE(hp.c != nullptr);
+	comp_multi_weave_metal_lift *ml = comp_multi_weave_metal_lift_create(cmw_rig_device(mr));
+	REQUIRE(ml != nullptr);
+	const comp_multi_weave_metal_lift_planner pl = hp.get();
+
+	// The engine's input (BGRA): red outside the rect; inside a 2400x1000
+	// rect, a film with 100-row black bars top and bottom. The SBS scratch
+	// (BGRA, 2W x H) starts transparent.
+	const uint32_t W = 2560, H = 1200;
+	const int32_t RX = 80, RY = 100;
+	const uint32_t RW = 2400, RH = 1000, BAR = 100;
+	std::vector<uint8_t> src((size_t)W * H * 4);
+	for (uint32_t y = 0; y < H; y++) {
+		for (uint32_t x = 0; x < W; x++) {
+			uint8_t *p = &src[((size_t)y * W + x) * 4];
+			const bool in_rect = (int32_t)x >= RX && x < RX + RW && (int32_t)y >= RY && y < RY + RH;
+			const uint32_t ry = y - RY;
+			if (!in_rect) {
+				p[0] = 0, p[1] = 0, p[2] = 255; // B G R: red
+			} else if (ry < BAR || ry >= RH - BAR) {
+				p[0] = 0, p[1] = 0, p[2] = 0; // the bars
+			} else {
+				p[0] = (uint8_t)(40 + x % 200), p[1] = 128, p[2] = (uint8_t)(40 + y % 200);
+			}
+			p[3] = 255;
+		}
+	}
+	void *in_tex = cmw_rig_texture(mr, W, H, true, src.data());
+	void *sbs = cmw_rig_texture(mr, 2 * W, H, true, nullptr);
+	REQUIRE(in_tex != nullptr);
+	REQUIRE(sbs != nullptr);
+
+	xrt_lift_weave_rect binding{};
+	binding.stream_id = wire;
+	vk_conv_weave_rect r{};
+	r.binding = &binding;
+	r.owner = 1;
+	r.src = {VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, W, H};
+	r.x = RX;
+	r.y = RY;
+	r.w = RW;
+	r.h = RH;
+	r.dst = {VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, 2 * W, H};
+	r.views = 2;
+	r.tile_columns = 2;
+	r.tile_w = W;
+	r.tile_h = H;
+	r.batch = true;
+	r.frame.valid = true;
+	r.frame.width_m = 0.30f;
+	r.frame.height_m = 0.125f;
+
+	// begin -> record + wait + frame_done -> (optional oracle) -> complete
+	std::function<void()> before_complete;
+	auto weave = [&]() {
+		vk_conv_weave_begin(w, hp.c);
+		const int n = cmw_rig_weave(mr, ml, &pl, in_tex, sbs, &r, 1);
+		if (before_complete) {
+			before_complete();
+		}
+		vk_conv_weave_complete(w, hp.c);
+		return n == 1;
+	};
+	std::vector<uint8_t> out((size_t)2 * W * H * 4);
+	auto px = [&](uint32_t x, uint32_t y) { return &out[((size_t)y * 2 * W + x) * 4]; }; // B G R A
+	auto src_eq = [&](uint32_t sx, uint32_t sy, const uint8_t *d) {
+		return memcmp(&src[((size_t)sy * W + sx) * 4], d, 4) == 0;
+	};
+
+	// 1. Flat until the first result; the snapshot is capped to the 1920 long edge.
+	REQUIRE(weave());
+	vk_conv_weave_stats st{};
+	REQUIRE(vk_conv_weave_client_stats(hp.c, wire, &st));
+	CHECK(st.active_w == RW);
+	CHECK(st.active_h == RH);
+	CHECK(st.snap_w == 1920u);
+	CHECK(st.snap_h == 800u);
+	CHECK(st.committed == 1u);
+	CHECK_FALSE(st.woven_result);
+	CHECK(hp.last.lines);
+	REQUIRE(cmw_rig_read(mr, sbs, out.data()));
+	CHECK(src_eq(580, 400, px(580, 400)));     // tile 0: the 2D frame, 1:1
+	CHECK(src_eq(580, 400, px(W + 580, 400))); // tile 1: the same pixels (flat)
+	CHECK(src_eq(RX, RY, px(RX, RY)));         // the rect's corners, exact
+	CHECK(src_eq(RX + RW - 1, RY + RH - 1, px(W + RX + RW - 1, RY + RH - 1)));
+	CHECK(px(10, 10)[3] == 0); // outside the rect: untouched
+	CHECK(px(RX - 1, RY + 10)[3] == 0);
+	CHECK(px(W + RX + RW, RY + 10)[3] == 0);
+
+	// 2. The conversion lands; the next weave samples the result's IOSurface
+	// into the rect. Oracle: the tile pixels equal the IOSurface's views,
+	// stretched (read on the CPU while the pin still holds it).
+	conv_stream_stats ss{};
+	REQUIRE(wait_until(
+	    [&] { return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted >= 1; },
+	    5000));
+	struct vk_conv_weave_host_plan seen
+	{
+	};
+	std::vector<uint8_t> res_copy;
+	size_t res_pitch = 0;
+	before_complete = [&]() {
+		seen = hp.last;
+		if (!seen.result) {
+			return;
+		}
+		IOSurfaceRef s = (IOSurfaceRef)seen.result_iosurface;
+		IOSurfaceLock(s, kIOSurfaceLockReadOnly, nullptr);
+		res_pitch = IOSurfaceGetBytesPerRow(s);
+		const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(s);
+		res_copy.assign(base, base + res_pitch * seen.result_h);
+		IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, nullptr);
+	};
+	REQUIRE(weave());
+	before_complete = nullptr;
+	REQUIRE(seen.result);
+	CHECK((seen.result_format == XRT_CONV_FMT_RGBA8_UNORM || seen.result_format == XRT_CONV_FMT_RGBA8_SRGB ||
+	       seen.result_format == XRT_CONV_FMT_BGRA8_UNORM || seen.result_format == XRT_CONV_FMT_BGRA8_SRGB));
+	CHECK(IOSurfaceGetPixelFormat((IOSurfaceRef)seen.result_iosurface) == 0u); // why the plan carries the format
+	REQUIRE(vk_conv_weave_client_stats(hp.c, wire, &st));
+	CHECK(st.woven_result);
+	CHECK(st.result_views == 2u);
+	CHECK(st.committed == 2u);
+	REQUIRE(cmw_rig_read(mr, sbs, out.data()));
+	{
+		const bool bgra =
+		    seen.result_format == XRT_CONV_FMT_BGRA8_UNORM || seen.result_format == XRT_CONV_FMT_BGRA8_SRGB;
+		const uint32_t vw = seen.result_w / seen.result_views;
+		const float aw = (float)(seen.ax1 - seen.ax0), ah = (float)(seen.ay1 - seen.ay0);
+		uint32_t checked = 0, close = 0;
+		for (uint32_t tile = 0; tile < 2; tile++) {
+			const uint32_t sv = seen.tile_view[tile];
+			for (uint32_t gy = 1; gy < 8; gy++) {
+				for (uint32_t gx = 1; gx < 8; gx++) {
+					const uint32_t dx = (uint32_t)seen.ax0 + (uint32_t)(aw * gx / 8.0f);
+					const uint32_t dy = (uint32_t)seen.ay0 + (uint32_t)(ah * gy / 8.0f);
+					const float u = ((float)(dx - seen.ax0) + 0.5f) / aw * (float)vw;
+					const float v = ((float)(dy - seen.ay0) + 0.5f) / ah * (float)seen.result_h;
+					const uint8_t *d = px(tile * W + dx, dy); // B G R A
+					const int dmap[4] = {2, 1, 0, 3};
+					bool ok = true;
+					for (int ch = 0; ch < 4; ch++) {
+						const float e = iosurface_bilinear(res_copy.data(), res_pitch, bgra, u,
+						                                   v, sv * vw, vw, seen.result_h, ch);
+						ok = ok && std::fabs(e - (float)d[dmap[ch]]) <= 2.0f;
+					}
+					checked++;
+					close += ok ? 1 : 0;
+				}
+			}
+		}
+		CHECK(close == checked);
+	}
+	CHECK(px(10, 10)[3] == 0); // still nothing outside the rect
+	CHECK(px(RX - 1, RY + 10)[3] == 0);
+	CHECK(px(W + RX + RW, RY + 10)[3] == 0);
+
+	// 3. The letterbox crop settles: the snapshot is the active area only, capped.
+	bool cropped = false;
+	for (int i = 0; i < 120 && !cropped; i++) {
+		REQUIRE(weave());
+		REQUIRE(vk_conv_weave_client_stats(hp.c, wire, &st));
+		cropped = st.active_h == RH - 2 * BAR;
+	}
+	REQUIRE(cropped);
+	CHECK(st.active_w == RW);
+	CHECK(st.snap_w == 1920u);
+	CHECK(st.snap_h == 640u);
+	// Once a result of the cropped input lands, the bars are the 2D input, flat.
+	const uint64_t done = ss.converted;
+	REQUIRE(wait_until(
+	    [&] {
+		    return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted > done + 1;
+	    },
+	    5000));
+	REQUIRE(weave());
+	REQUIRE(cmw_rig_read(mr, sbs, out.data()));
+	CHECK(src_eq(580, RY + 50, px(580, RY + 50)));
+	CHECK(src_eq(580, RY + 50, px(W + 580, RY + 50)));
+	CHECK(comp_multi_weave_metal_lift_stream_count(ml) == 1u);
+
+	comp_multi_weave_metal_lift_destroy(&ml);
+	vk_conv_weave_client_destroy(w, hp.c);
+	vk_conv_weave_destroy(&w);
+	cmw_rig_release(in_tex);
+	cmw_rig_release(sbs);
+	cmw_rig_destroy(mr);
+	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+}
+
+TEST_CASE("Metal weave backend: a stream destroyed with a weave in flight keeps its images until complete",
+          "[conv_vk_gpu][weave_rects][metal]")
+{
+	WeaveRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport available");
+	}
+	cmw_rig *mr = cmw_rig_create();
+	if (mr == nullptr) {
+		SKIP("no Metal device");
+	}
+	ipc_server_conv *sc = rig.sc;
+	ipc_server_conv_set_weave_rects(sc, true);
+	uint64_t wire = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) == XRT_SUCCESS);
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	REQUIRE(weave_resolve(sc, 1, wire, &core_id, &mode));
+	vk_conv_weave *w = nullptr;
+	REQUIRE(vk_conv_weave_create(rig.x.vk.get(), rig.x.g, &w));
+	vk_conv_weave_bridge b{};
+	b.core = rig.core;
+	b.resolve = weave_resolve;
+	b.match_weave = weave_match;
+	b.fit_rect = ipc_server_conv_submit_rect;
+	b.ud = sc;
+	vk_conv_weave_set_bridge(w, &b);
+	HostPlanner hp;
+	hp.w = w;
+	hp.c = vk_conv_weave_client_create(w, nullptr);
+	REQUIRE(hp.c != nullptr);
+	CHECK_FALSE(vk_conv_weave_record(w, hp.c, (VkCommandBuffer)1, nullptr)); // a host client never records Vulkan
+	comp_multi_weave_metal_lift *ml = comp_multi_weave_metal_lift_create(cmw_rig_device(mr));
+	REQUIRE(ml != nullptr);
+	const comp_multi_weave_metal_lift_planner pl = hp.get();
+
+	const uint32_t W = 640, H = 360;
+	std::vector<uint8_t> src((size_t)W * H * 4, 0x70);
+	void *in_tex = cmw_rig_texture(mr, W, H, true, src.data());
+	void *sbs = cmw_rig_texture(mr, 2 * W, H, true, nullptr);
+	REQUIRE(in_tex != nullptr);
+	REQUIRE(sbs != nullptr);
+
+	xrt_lift_weave_rect binding{};
+	binding.stream_id = wire;
+	vk_conv_weave_rect r{};
+	r.binding = &binding;
+	r.owner = 1;
+	r.src = {VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, W, H};
+	r.x = 64;
+	r.y = 32;
+	r.w = 320;
+	r.h = 180;
+	r.dst = {VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM, 2 * W, H};
+	r.views = 2;
+	r.tile_columns = 2;
+	r.tile_w = W;
+	r.tile_h = H;
+	r.batch = true;
+	r.frame.valid = false;
+	r.frame.width_m = 0.16f;
+	r.frame.height_m = 0.09f;
+
+	// Until a result is woven; that frame's complete is withheld (in flight).
+	vk_conv_weave_stats st{};
+	bool woven = false;
+	for (int i = 0; i < 200 && !woven; i++) {
+		vk_conv_weave_begin(w, hp.c);
+		REQUIRE(cmw_rig_weave(mr, ml, &pl, in_tex, sbs, &r, 1) == 1);
+		REQUIRE(vk_conv_weave_client_stats(hp.c, wire, &st));
+		woven = st.woven_result;
+		if (!woven) {
+			vk_conv_weave_complete(w, hp.c);
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	}
+	REQUIRE(woven);
+	const uint32_t images = vk_conv_gpu_image_count(rig.x.g);
+	REQUIRE(images > 0u);
+	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+	CHECK_FALSE(weave_resolve(sc, 1, wire, &core_id, &mode));
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	CHECK(vk_conv_gpu_image_count(rig.x.g) == images); // pinned: the reaper skips it
+
+	vk_conv_weave_complete(w, hp.c);
+	CHECK(wait_until([&] { return vk_conv_gpu_image_count(rig.x.g) == 0u; }, 3000));
+	CHECK_FALSE(vk_conv_weave_client_stats(hp.c, wire, &st));
+
+	// The next weave of the gone stream: flat, no plan pins anything.
+	vk_conv_weave_begin(w, hp.c);
+	REQUIRE(cmw_rig_weave(mr, ml, &pl, in_tex, sbs, &r, 1) == 1);
+	CHECK_FALSE(hp.last.result);
+	CHECK_FALSE(hp.last.snapshot);
+	vk_conv_weave_complete(w, hp.c);
+
+	comp_multi_weave_metal_lift_destroy(&ml);
+	vk_conv_weave_client_destroy(w, hp.c);
+	vk_conv_weave_destroy(&w);
+	cmw_rig_release(in_tex);
+	cmw_rig_release(sbs);
+	cmw_rig_destroy(mr);
+}
+
+#endif // CONV_TEST_HAVE_METAL_WEAVE
