@@ -73,6 +73,11 @@ struct gamepad_hub
 	bool rumble_dirty;
 	bool rumble_active;
 
+	//! Monotonic time of the last stick / button / trigger activity; 0 = none since plug-in.
+	int64_t last_activity_ns;
+	//! The idle verdict as of the last tick, for the one-off edge log.
+	bool was_active;
+
 	//! Diagnostics.
 	uint64_t connect_count;
 
@@ -115,7 +120,28 @@ hub_tick_locked(struct gamepad_hub *hub, const struct gamepad_state *fresh, int6
 			U_LOG_W("gamepad: pad detached — roles return to the floor (fly camera / qwerty).");
 			hub->rumble_active = false;
 		}
+		// A plug / unplug resets the idle clock: a freshly plugged pad is
+		// untouched until the user reaches for it.
+		hub->last_activity_ns = 0;
 	}
+
+	// "Last-used input wins": timestamp any touch; presence follows it.
+	if (gamepad_map_has_activity(&hub->state, hub->cfg.map.deadzone)) {
+		hub->last_activity_ns = now;
+	}
+	const bool active =
+	    hub->state.connected && gamepad_map_recently_active(now, hub->last_activity_ns, hub->cfg.idle_timeout_s);
+	if (active != hub->was_active && hub->state.connected && hub->cfg.idle_timeout_s > 0.0f) {
+		// One-off edge, never per frame: the idle rule moving the roles.
+		if (active) {
+			U_LOG_W("gamepad: pad touched — it takes its roles (idle timeout %.0f s).",
+			        (double)hub->cfg.idle_timeout_s);
+		} else {
+			U_LOG_W("gamepad: pad idle for %.0f s — roles return to the floor until it is touched again.",
+			        (double)hub->cfg.idle_timeout_s);
+		}
+	}
+	hub->was_active = active;
 
 	// Rig: integrate what the table says over the real elapsed time.
 	double dt = (double)(now - hub->nav_latched_ns) * 1e-9;
@@ -237,9 +263,10 @@ gamepad_hub_create(const struct gamepad_hub_config *cfg)
 	}
 
 	g_current = hub;
-	U_LOG_W("gamepad: hub up — deadzone %.2f, nav %.2f m/s, turn %.0f deg/s%s.", (double)cfg->map.deadzone,
-	        (double)cfg->map.nav_speed_mps, (double)cfg->map.nav_turn_dps,
-	        cfg->map.invert_look_y ? ", look-Y inverted" : "");
+	U_LOG_W("gamepad: hub up — deadzone %.2f, nav %.2f m/s, turn %.0f deg/s%s, idle timeout %.0f s%s.",
+	        (double)cfg->map.deadzone, (double)cfg->map.nav_speed_mps, (double)cfg->map.nav_turn_dps,
+	        cfg->map.invert_look_y ? ", look-Y inverted" : "", (double)cfg->idle_timeout_s,
+	        cfg->idle_timeout_s > 0.0f ? " (last-used input wins)" : " (connected-only)");
 	return hub;
 }
 
@@ -295,7 +322,13 @@ gamepad_hub_presence(struct gamepad_hub *hub)
 	if (!hub->backend_ok && hub->have_sample) {
 		p = XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
 	} else if (hub->have_sample) {
-		p = hub->state.connected ? XRT_INPUT_PROVIDER_PRESENCE_PRESENT : XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
+		// Connected AND recently touched (or the idle rule is off). The
+		// verdict is a pure function of the latched tick, so a client
+		// thread never runs provider code here.
+		const bool present =
+		    hub->state.connected && gamepad_map_recently_active((int64_t)os_monotonic_get_ns(),
+		                                                        hub->last_activity_ns, hub->cfg.idle_timeout_s);
+		p = present ? XRT_INPUT_PROVIDER_PRESENCE_PRESENT : XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
 	}
 	os_mutex_unlock(&hub->mutex);
 	return p;

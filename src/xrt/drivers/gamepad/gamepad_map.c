@@ -241,6 +241,41 @@ gamepad_map_nav_pose_to_xrt(const struct gamepad_nav_pose *pose, struct xrt_pose
 }
 
 bool
+gamepad_map_has_activity(const struct gamepad_state *state, float deadzone)
+{
+	if (state == NULL || !state->connected) {
+		return false;
+	}
+	if (state->buttons != 0) {
+		return true;
+	}
+	float x = 0.0f, y = 0.0f;
+	gamepad_map_apply_deadzone(state->left_x, state->left_y, deadzone, &x, &y);
+	if (x != 0.0f || y != 0.0f) {
+		return true;
+	}
+	gamepad_map_apply_deadzone(state->right_x, state->right_y, deadzone, &x, &y);
+	if (x != 0.0f || y != 0.0f) {
+		return true;
+	}
+	return clamp_01(state->left_trigger) > GAMEPAD_MAP_TRIGGER_ACTIVITY ||
+	       clamp_01(state->right_trigger) > GAMEPAD_MAP_TRIGGER_ACTIVITY;
+}
+
+bool
+gamepad_map_recently_active(int64_t now_ns, int64_t last_activity_ns, float idle_timeout_s)
+{
+	if (!(idle_timeout_s > 0.0f)) {
+		return true; // 0 (or NaN / negative): connected-only, no idle rule.
+	}
+	if (last_activity_ns <= 0) {
+		return false; // Never touched since plug-in.
+	}
+	const double idle_s = (double)(now_ns - last_activity_ns) * 1e-9;
+	return idle_s <= (double)idle_timeout_s;
+}
+
+bool
 gamepad_map_action_pressed(const struct gamepad_state *state,
                            const struct gamepad_map_table *table,
                            enum gamepad_map_action action)
