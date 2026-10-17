@@ -170,7 +170,7 @@ TEST_CASE("vk glue: providers stay on the CPU lane; runtime-only images are GPU"
 	const uint32_t gpu_kinds = c.memory_kinds & ~XRT_CONV_MEM_CPU;
 	xrt_conv_image img{};
 
-	// Unknown import kinds (a composed binding): declined -> the CPU allocator.
+	// Unknown import kinds: declined -> the CPU allocator.
 	auto r = req_of(64, 32, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
 	CHECK_FALSE(x.ops.alloc(x.ops.ud, &r, &img));
 	// A provider that imports GPU kinds, default provider mask 0: declined.
@@ -854,7 +854,7 @@ TEST_CASE("vk glue: a composed VIEWS_MONO conversion through conv_core (CPU dept
 			lay.role[0] = XRT_CONV_IMG_COLOR;
 			conv_submit_slot slot{};
 			REQUIRE(conv_core_stream_begin_submit(core, cr.stream_id, &lay, &slot) == XRT_SUCCESS);
-			// The input is CPU memory (a composed binding names no import kinds).
+			// The input is CPU memory (the depth provider imports CPU only; the provider mask is 0).
 			REQUIRE(slot.images[0].memory_kind == XRT_CONV_MEM_CPU);
 			std::memset(slot.images[0].cpu_ptr, 0x80, (size_t)slot.images[0].byte_size);
 			conv_frame_submit fr{};
