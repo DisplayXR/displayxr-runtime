@@ -368,6 +368,23 @@ TEST_CASE("proxy: the CPU lane end to end through a real host process", "[conv_p
 	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
 }
 
+TEST_CASE("proxy: CPU targets ask the host for CPU outputs (#2153)", "[conv_proxy]")
+{
+	// The core's targets here are CPU memory (the fixture's allocator). The
+	// scripted host refuses an output set that was not asked for as CPU, the
+	// way a real Windows host would otherwise hand back GPU textures the
+	// service cannot copy into those targets (every convert then failed with
+	// no WARN).
+	Fixture fx({"--fake-require-cpu-outputs", "1"});
+	const uint64_t sid = fx.stream();
+	conv_result r{};
+	REQUIRE(fx.convert(sid, 0x31, &r));
+	check_views(r, 0x31);
+	conv_core_stream_release(fx.c, sid, r.ring_slot);
+	CHECK(fx.stats(sid).failed == 0u);
+	REQUIRE(conv_core_stream_destroy(fx.c, sid) == XRT_SUCCESS);
+}
+
 TEST_CASE("proxy: kill mid-stream; the stream keeps its handle and recovers", "[conv_proxy]")
 {
 	const std::string marker = temp_marker();

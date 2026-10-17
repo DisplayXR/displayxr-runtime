@@ -541,8 +541,16 @@ struct conv_host_wire_alloc_outputs
 	uint64_t stream;
 	uint32_t width, height;
 	uint32_t set_count;
-	uint32_t reserved_0;
+	uint32_t flags; //!< CONV_HOST_ALLOC_OUTPUTS_* (was reserved_0: an older service sends 0)
 };
+
+/*!
+ * ALLOC_OUTPUTS flag: the service's targets for this stream are CPU memory —
+ * allocate CPU (shm) outputs even when the capability also imports GPU
+ * handles. The service has no path from a host GPU output into a CPU target
+ * (its GPU lane copies texture to texture only), #2153.
+ */
+#define CONV_HOST_ALLOC_OUTPUTS_CPU 1u
 
 /*!
  * OUTPUT_IMAGE (H -> S): one host-allocated output. Handles: [0] the image
