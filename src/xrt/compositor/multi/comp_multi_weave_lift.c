@@ -193,6 +193,33 @@ comp_multi_weave_lift_record(struct comp_multi_weave_lift *l, VkCommandBuffer cm
 	return ok;
 }
 
+bool
+comp_multi_weave_lift_host_plan(struct comp_multi_weave_lift *l,
+                                const struct vk_conv_weave_rect *r,
+                                struct vk_conv_weave_host_plan *out)
+{
+	memset(out, 0, sizeof(*out));
+	pthread_mutex_lock(&g_lift_mtx);
+	struct vk_conv_weave_client *c = client_locked(l);
+	const bool ok = c != NULL && l->in_flight && g_ops.host_plan != NULL && g_ops.host_plan(g_ops.ud, c, r, out);
+	pthread_mutex_unlock(&g_lift_mtx);
+	return ok;
+}
+
+void
+comp_multi_weave_lift_host_done(struct comp_multi_weave_lift *l,
+                                uint64_t owner,
+                                uint64_t wire_id,
+                                const struct vk_conv_weave_host_done *d)
+{
+	pthread_mutex_lock(&g_lift_mtx);
+	struct vk_conv_weave_client *c = client_locked(l);
+	if (c != NULL && l->in_flight && g_ops.host_done != NULL) {
+		g_ops.host_done(g_ops.ud, c, owner, wire_id, d);
+	}
+	pthread_mutex_unlock(&g_lift_mtx);
+}
+
 void
 comp_multi_weave_lift_complete(struct comp_multi_weave_lift *l)
 {

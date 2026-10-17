@@ -107,6 +107,13 @@ struct vkcw_stream
 	//! Result staging, per result view.
 	struct vkcw_img res[XRT_CONV_MAX_VIEWS];
 
+	//! @name Host client: the engine's own copies, valid from host_done to complete
+	//! @{
+	const void *host_snap;
+	const void *host_lines;
+	bool logged_export;
+	//! @}
+
 	//! @name Diagnostics of the last record
 	//! @{
 	bool woven_result;
@@ -128,6 +135,9 @@ struct vkcw_pin
 struct vk_conv_weave_client
 {
 	struct vk_conv_weave_client *next;
+	//! Created without a device: the engine records on another graphics API
+	//! (vk_conv_weave_host_plan / _host_done); never vk_conv_weave_record.
+	bool host;
 	struct vkcw_stream *streams;
 	struct vkcw_pin pins[VKCW_PINS_MAX];
 	uint32_t pin_count;
@@ -534,6 +544,42 @@ frame_fill(struct vkcw_stream *st,
 }
 
 /*!
+ * The area of the (clipped) rect the snapshot takes -- the letterbox crop once
+ * it settled -- and the extent it is sent at (the long-edge cap). True when
+ * capped.
+ */
+static bool
+snapshot_extent(const struct vk_conv_weave *w,
+                const struct vkcw_stream *st,
+                const struct vk_conv_weave_rect *r,
+                uint32_t *out_cx,
+                uint32_t *out_cy,
+                uint32_t *out_cw,
+                uint32_t *out_ch,
+                uint32_t *out_dw,
+                uint32_t *out_dh)
+{
+	const uint32_t x = (uint32_t)r->x, y = (uint32_t)r->y;
+	uint32_t cx = x, cy = y, cw = r->w, ch = r->h;
+	if (w->letterbox && st->lb.w == r->w && st->lb.h == r->h && u_lift_crop_active(&st->lb.committed)) {
+		const struct u_lift_crop *c = &st->lb.committed;
+		cx = x + c->left;
+		cy = y + c->top;
+		cw = r->w - c->left - c->right;
+		ch = r->h - c->top - c->bottom;
+	}
+	uint32_t dw = cw, dh = ch;
+	const bool capped = u_lift_cap_dims(cw, ch, w->max_input_edge, &dw, &dh);
+	*out_cx = cx;
+	*out_cy = cy;
+	*out_cw = cw;
+	*out_ch = ch;
+	*out_dw = dw;
+	*out_dh = dh;
+	return capped;
+}
+
+/*!
  * Snapshot the rect's (cropped) area into the chain and its final image into
  * the host buffer; measure the whole rect's lines for the letterbox.
  */
@@ -546,17 +592,9 @@ record_snapshot(struct vk_conv_weave *w,
 {
 	struct vk_bundle *vk = w->vk;
 	const uint32_t x = (uint32_t)r->x, y = (uint32_t)r->y;
-	uint32_t cx = x, cy = y, cw = r->w, ch = r->h;
 	const bool letterbox = w->letterbox;
-	if (letterbox && st->lb.w == r->w && st->lb.h == r->h && u_lift_crop_active(&st->lb.committed)) {
-		const struct u_lift_crop *c = &st->lb.committed;
-		cx = x + c->left;
-		cy = y + c->top;
-		cw = r->w - c->left - c->right;
-		ch = r->h - c->top - c->bottom;
-	}
-	uint32_t dw = cw, dh = ch;
-	const bool capped = u_lift_cap_dims(cw, ch, w->max_input_edge, &dw, &dh);
+	uint32_t cx, cy, cw, ch, dw, dh;
+	const bool capped = snapshot_extent(w, st, r, &cx, &cy, &cw, &ch, &dw, &dh);
 
 	// The chain: halving LINEAR blits while more than 2x away, then the final
 	// blit to dw x dh (NEAREST 1:1 when uncapped: exact texels, channel order
@@ -743,6 +781,53 @@ draw_flat(struct vk_conv_weave *w, VkCommandBuffer cmd, const struct vk_conv_wea
 	}
 }
 
+/*!
+ * The active part of the rect (letterbox) the result covers: integer edges in
+ * source pixels, the bars tile the rest of the rect exactly. False = empty.
+ */
+static bool
+active_area(const struct vk_conv_weave_rect *r,
+            const struct conv_result *res,
+            int32_t *out_x0,
+            int32_t *out_y0,
+            int32_t *out_x1,
+            int32_t *out_y1)
+{
+	const bool whole =
+	    res->active[0] == 0.0f && res->active[1] == 0.0f && res->active[2] == 0.0f && res->active[3] == 0.0f;
+	const float a0 = whole ? 0.0f : res->active[0], a1 = whole ? 0.0f : res->active[1];
+	const float a2 = whole ? 1.0f : res->active[2], a3 = whole ? 1.0f : res->active[3];
+	int32_t ax0 = r->x + (int32_t)lroundf(a0 * (float)r->w);
+	int32_t ay0 = r->y + (int32_t)lroundf(a1 * (float)r->h);
+	int32_t ax1 = r->x + (int32_t)lroundf(a2 * (float)r->w);
+	int32_t ay1 = r->y + (int32_t)lroundf(a3 * (float)r->h);
+	const int32_t rx1 = r->x + (int32_t)r->w, ry1 = r->y + (int32_t)r->h;
+	ax0 = ax0 < r->x ? r->x : (ax0 > rx1 ? rx1 : ax0);
+	ay0 = ay0 < r->y ? r->y : (ay0 > ry1 ? ry1 : ay0);
+	ax1 = ax1 < ax0 ? ax0 : (ax1 > rx1 ? rx1 : ax1);
+	ay1 = ay1 < ay0 ? ay0 : (ay1 > ry1 ? ry1 : ay1);
+	*out_x0 = ax0;
+	*out_y0 = ay0;
+	*out_x1 = ax1;
+	*out_y1 = ay1;
+	return ax1 > ax0 && ay1 > ay0;
+}
+
+//! The "woven" line: first time, and on a result extent or view-count change.
+static void
+log_woven(struct vkcw_stream *st, uint32_t res_w, uint32_t res_h)
+{
+	if (!st->logged_woven || st->logged_res_w != res_w || st->logged_res_h != res_h ||
+	    st->logged_res_views != st->result_views) {
+		st->logged_woven = true;
+		st->logged_res_w = res_w;
+		st->logged_res_h = res_h;
+		st->logged_res_views = st->result_views;
+		U_LOG_I("lift rect: stream 0x%llx woven %ux%u views %u", (unsigned long long)st->wire, res_w, res_h,
+		        st->result_views);
+	}
+}
+
 static bool
 draw_result(struct vk_conv_weave *w,
             struct vkcw_stream *st,
@@ -761,24 +846,11 @@ draw_result(struct vk_conv_weave *w,
 		}
 		return false;
 	}
-	// The active part of the rect (letterbox): integer edges, the bars tile
-	// the rest exactly.
-	const bool whole =
-	    res->active[0] == 0.0f && res->active[1] == 0.0f && res->active[2] == 0.0f && res->active[3] == 0.0f;
-	const float a0 = whole ? 0.0f : res->active[0], a1 = whole ? 0.0f : res->active[1];
-	const float a2 = whole ? 1.0f : res->active[2], a3 = whole ? 1.0f : res->active[3];
-	int32_t ax0 = r->x + (int32_t)lroundf(a0 * (float)r->w);
-	int32_t ay0 = r->y + (int32_t)lroundf(a1 * (float)r->h);
-	int32_t ax1 = r->x + (int32_t)lroundf(a2 * (float)r->w);
-	int32_t ay1 = r->y + (int32_t)lroundf(a3 * (float)r->h);
-	const int32_t rx1 = r->x + (int32_t)r->w, ry1 = r->y + (int32_t)r->h;
-	ax0 = ax0 < r->x ? r->x : (ax0 > rx1 ? rx1 : ax0);
-	ay0 = ay0 < r->y ? r->y : (ay0 > ry1 ? ry1 : ay0);
-	ax1 = ax1 < ax0 ? ax0 : (ax1 > rx1 ? rx1 : ax1);
-	ay1 = ay1 < ay0 ? ay0 : (ay1 > ry1 ? ry1 : ay1);
-	if (ax1 <= ax0 || ay1 <= ay0) {
+	int32_t ax0, ay0, ax1, ay1;
+	if (!active_area(r, res, &ax0, &ay0, &ax1, &ay1)) {
 		return false;
 	}
+	const int32_t rx1 = r->x + (int32_t)r->w, ry1 = r->y + (int32_t)r->h;
 
 	vk_conv_gpu_cmd_acquire(w->glue, cmd, ref);
 	bool staged[XRT_CONV_MAX_VIEWS] = {false};
@@ -849,10 +921,11 @@ vk_conv_weave_stream_mode(struct vk_conv_weave *w, uint64_t owner, uint64_t wire
 struct vk_conv_weave_client *
 vk_conv_weave_client_create(struct vk_conv_weave *w, struct vk_bundle *vk)
 {
-	if (w == NULL || vk != w->vk) {
+	if (w == NULL || (vk != NULL && vk != w->vk)) {
 		return NULL;
 	}
 	struct vk_conv_weave_client *c = U_TYPED_CALLOC(struct vk_conv_weave_client);
+	c->host = vk == NULL;
 	os_mutex_lock(&w->mtx);
 	c->next = w->clients;
 	w->clients = c;
@@ -908,6 +981,8 @@ vk_conv_weave_begin(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		st->snap_pending = false;
 		st->lb_pending = false;
 		st->used_this_frame = false;
+		st->host_snap = NULL;
+		st->host_lines = NULL;
 	}
 }
 
@@ -917,7 +992,7 @@ vk_conv_weave_record(struct vk_conv_weave *w,
                      VkCommandBuffer cmd,
                      const struct vk_conv_weave_rect *r)
 {
-	if (w == NULL || c == NULL || r == NULL || r->binding == NULL || cmd == VK_NULL_HANDLE ||
+	if (w == NULL || c == NULL || c->host || r == NULL || r->binding == NULL || cmd == VK_NULL_HANDLE ||
 	    r->src.image == VK_NULL_HANDLE || r->dst.image == VK_NULL_HANDLE || r->views == 0) {
 		return false;
 	}
@@ -974,15 +1049,7 @@ vk_conv_weave_record(struct vk_conv_weave *w,
 		if (woven) {
 			st->woven_result = true;
 			st->result_views = res.views_info.view_count != 0 ? res.views_info.view_count : 1;
-			if (!st->logged_woven || st->logged_res_w != ref.width || st->logged_res_h != ref.height ||
-			    st->logged_res_views != st->result_views) {
-				st->logged_woven = true;
-				st->logged_res_w = ref.width;
-				st->logged_res_h = ref.height;
-				st->logged_res_views = st->result_views;
-				U_LOG_I("lift rect: stream 0x%llx woven %ux%u views %u", (unsigned long long)wire,
-				        ref.width, ref.height, st->result_views);
-			}
+			log_woven(st, ref.width, ref.height);
 		}
 	}
 	if (!woven && rc.batch) {
@@ -1013,11 +1080,16 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		const bool alive = bridge_resolve(&b, st->owner, st->wire, &core_id);
 
 		// Letterbox: the measurement of the whole rect, now readable.
+		// (A host client's engine handed its copy over in host_done; none = it
+		// could not make one this frame.)
+		const uint8_t *base = c->host ? (const uint8_t *)st->host_lines : (const uint8_t *)st->lb_buf.map;
+		if (st->lb_pending && base == NULL) {
+			st->lb_pending = false;
+		}
 		if (st->lb_pending) {
 			st->lb_pending = false;
 			float *rows = c->lb_rows, *cols = c->lb_cols;
 			uint32_t nr = 0, nc = 0;
-			const uint8_t *base = (const uint8_t *)st->lb_buf.map;
 			u_lift_letterbox_profile_from_lines(
 			    base, base + (size_t)U_LIFT_LETTERBOX_LINE_SAMPLES * st->lb_h * 4u, st->lb_w, st->lb_h,
 			    st->lb_bgra, rows, &nr, cols, &nc);
@@ -1042,8 +1114,12 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		if (st->snap_pending) {
 			st->snap_pending = false;
 			const char *fail = NULL;
+			const uint8_t *snap =
+			    c->host ? (const uint8_t *)st->host_snap : (const uint8_t *)st->snap_buf.map;
 			if (!alive) {
 				fail = "resolve";
+			} else if (snap == NULL) {
+				fail = "copy"; // the host engine's snapshot never completed
 			} else {
 				struct conv_submit_layout lay;
 				memset(&lay, 0, sizeof(lay));
@@ -1067,14 +1143,12 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 						    img->byte_size == 0) {
 							for (uint32_t y = 0; y < st->snap_h; y++) {
 								memcpy((uint8_t *)img->cpu_ptr + (size_t)y * pitch,
-								       (const uint8_t *)st->snap_buf.map +
-								           (size_t)y * tight,
-								       tight);
+								       snap + (size_t)y * tight, tight);
 							}
 							ok = true;
 						}
 					} else {
-						ok = vk_conv_gpu_write(w->glue, img, st->snap_buf.map, tight);
+						ok = vk_conv_gpu_write(w->glue, img, snap, tight);
 					}
 					uint64_t frame_id = 0;
 					if (!ok) {
@@ -1103,6 +1177,8 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 			}
 		}
 		st->used_this_frame = false;
+		st->host_snap = NULL;
+		st->host_lines = NULL;
 
 		// A stream gone from the core, or idle for long, lets its images go
 		// (the GPU finished everything recorded for it).
@@ -1114,6 +1190,154 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		pp = &st->next;
 	}
 	pins_release(c, &b);
+}
+
+bool
+vk_conv_weave_host_plan(struct vk_conv_weave *w,
+                        struct vk_conv_weave_client *c,
+                        const struct vk_conv_weave_rect *r,
+                        struct vk_conv_weave_host_plan *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (w == NULL || c == NULL || !c->host || r == NULL || r->binding == NULL || r->views == 0 ||
+	    r->src.width == 0 || r->src.height == 0) {
+		return false;
+	}
+	// Clip to the source (vk_conv_weave_record's rule).
+	int32_t x0 = r->x < 0 ? 0 : r->x, y0 = r->y < 0 ? 0 : r->y;
+	int64_t x1 = (int64_t)r->x + r->w, y1 = (int64_t)r->y + r->h;
+	x1 = x1 > (int64_t)r->src.width ? (int64_t)r->src.width : x1;
+	y1 = y1 > (int64_t)r->src.height ? (int64_t)r->src.height : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return true; // nothing visible to lift; nothing to weave either (w == 0)
+	}
+	struct vk_conv_weave_rect rc = *r;
+	rc.x = x0;
+	rc.y = y0;
+	rc.w = (uint32_t)(x1 - x0);
+	rc.h = (uint32_t)(y1 - y0);
+	out->x = rc.x;
+	out->y = rc.y;
+	out->w = rc.w;
+	out->h = rc.h;
+
+	const struct vk_conv_weave_bridge b = bridge_get(w);
+	const uint64_t wire = rc.binding->stream_id;
+	uint64_t core_id = 0;
+	const bool resolved = bridge_resolve(&b, rc.owner, wire, &core_id);
+	struct vkcw_stream *st = stream_get(c, rc.owner, wire, true);
+	st->idle = 0;
+	st->woven_result = false;
+	st->result_views = 0;
+
+	// 1. The snapshot the engine records (once per stream per weave).
+	if (resolved && !st->used_this_frame) {
+		if (b.match_weave != NULL) {
+			b.match_weave(b.ud, rc.owner, wire, rc.views); // spec 4 viewCount 0 = match the weave
+		}
+		uint32_t cx, cy, cw, ch, dw, dh;
+		const bool capped = snapshot_extent(w, st, &rc, &cx, &cy, &cw, &ch, &dw, &dh);
+		out->snapshot = true;
+		out->cx = cx;
+		out->cy = cy;
+		out->cw = cw;
+		out->ch = ch;
+		out->dw = dw;
+		out->dh = dh;
+		st->snap_pending = true;
+		st->snap_w = dw;
+		st->snap_h = dh;
+		st->act_w = cw;
+		st->act_h = ch;
+		frame_fill(st, &b, &rc, cx, cy, cw, ch, dw, capped);
+		if (w->letterbox && !st->lb_pending) {
+			out->lines = true;
+			st->lb_pending = true;
+			st->lb_w = rc.w;
+			st->lb_h = rc.h;
+			st->lb_bgra = is_bgra(rc.src.format);
+		}
+		st->used_this_frame = true;
+	}
+
+	// 2. The latest result, exported as an IOSurface, or 3. flat (batch).
+	struct conv_result res;
+	struct vk_conv_gpu_image_ref ref;
+	memset(&res, 0, sizeof(res));
+	if (resolved && pin_latest(w, c, &b, core_id, &res, &ref)) {
+		const struct xrt_conv_image *v = &res.views;
+		const bool exported = v->memory_kind == XRT_CONV_MEM_IOSURFACE && v->handle != 0 &&
+		                      v->handle != VK_CONV_GPU_NO_HANDLE && ref.layers <= 1;
+		int32_t ax0, ay0, ax1, ay1;
+		if (!exported) {
+			// A device-private (or layered) result: the engine cannot sample it.
+			// The pin goes at complete; the rect is woven flat.
+			if (!st->logged_export) {
+				st->logged_export = true;
+				U_LOG_I(
+				    "lift rect: stream 0x%llx failed: export (the result is not an IOSurface); woven "
+				    "flat",
+				    (unsigned long long)wire);
+			}
+		} else if (unorm4(ref.format) == VK_FORMAT_UNDEFINED) {
+			if (!st->fmt_warned) {
+				st->fmt_warned = true;
+				U_LOG_W(
+				    "[lift] weave rect stream 0x%llx: result format %d is not 8-bit RGBA; woven flat",
+				    (unsigned long long)wire, (int)ref.format);
+			}
+		} else if (active_area(&rc, &res, &ax0, &ay0, &ax1, &ay1)) {
+			out->result = true;
+			out->result_iosurface = (void *)(uintptr_t)v->handle;
+			out->result_format = v->format;
+			out->result_w = ref.width;
+			out->result_h = ref.height;
+			out->result_views = res.views_info.view_count != 0 ? res.views_info.view_count : 1;
+			out->ax0 = ax0;
+			out->ay0 = ay0;
+			out->ax1 = ax1;
+			out->ay1 = ay1;
+			for (uint32_t t = 0; t < rc.views && t < XRT_CONV_MAX_VIEWS; t++) {
+				out->tile_view[t] = src_view_for(rc.batch, t, rc.views, out->result_views);
+			}
+		}
+	}
+	if (!resolved && !st->logged_unresolved) {
+		st->logged_unresolved = true;
+		U_LOG_I(
+		    "lift rect: stream 0x%llx failed: resolve (not a core-routed stream of this connection); woven "
+		    "flat",
+		    (unsigned long long)wire);
+	}
+	return true;
+}
+
+void
+vk_conv_weave_host_done(struct vk_conv_weave *w,
+                        struct vk_conv_weave_client *c,
+                        uint64_t owner,
+                        uint64_t wire_id,
+                        const struct vk_conv_weave_host_done *d)
+{
+	if (w == NULL || c == NULL || !c->host || d == NULL) {
+		return;
+	}
+	struct vkcw_stream *st = stream_get(c, owner, wire_id, false);
+	if (st == NULL) {
+		return;
+	}
+	// Several rects of one stream: only the one that recorded a copy hands it over.
+	if (st->snap_pending && d->snapshot != NULL) {
+		st->host_snap = d->snapshot;
+	}
+	if (st->lb_pending && d->lines != NULL) {
+		st->host_lines = d->lines;
+	}
+	if (d->woven_views > 0) {
+		st->woven_result = true;
+		st->result_views = d->woven_views;
+		log_woven(st, d->woven_w, d->woven_h);
+	}
 }
 
 bool
@@ -1181,6 +1405,22 @@ op_complete(void *ud, struct vk_conv_weave_client *c)
 	vk_conv_weave_complete((struct vk_conv_weave *)ud, c);
 }
 
+static bool
+op_host_plan(void *ud,
+             struct vk_conv_weave_client *c,
+             const struct vk_conv_weave_rect *r,
+             struct vk_conv_weave_host_plan *out)
+{
+	return vk_conv_weave_host_plan((struct vk_conv_weave *)ud, c, r, out);
+}
+
+static void
+op_host_done(
+    void *ud, struct vk_conv_weave_client *c, uint64_t owner, uint64_t wire_id, const struct vk_conv_weave_host_done *d)
+{
+	vk_conv_weave_host_done((struct vk_conv_weave *)ud, c, owner, wire_id, d);
+}
+
 void
 vk_conv_weave_get_ops(struct vk_conv_weave *w, struct vk_conv_weave_ops *out)
 {
@@ -1195,6 +1435,8 @@ vk_conv_weave_get_ops(struct vk_conv_weave *w, struct vk_conv_weave_ops *out)
 	out->begin = op_begin;
 	out->record = op_record;
 	out->complete = op_complete;
+	out->host_plan = op_host_plan;
+	out->host_done = op_host_done;
 }
 
 bool

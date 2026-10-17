@@ -95,7 +95,7 @@ comp_multi_weave_lift_set_rects(struct xrt_compositor *xc,
                                 uint32_t count,
                                 const struct xrt_lift_weave_rect *rects);
 
-//! @name The engines' side (comp_multi_weave_linux.c, comp_multi_weave_macos_vk.c)
+//! @name The engines' side (comp_multi_weave_linux.c, comp_multi_weave_macos_vk.c, comp_multi_weave_macos_metal.m)
 //! @{
 
 /*!
@@ -110,7 +110,9 @@ comp_multi_weave_lift_take(struct comp_multi_weave_lift *l,
 /*!
  * A weave with @p count lifted rects starts recording on @p vk. Drops what an
  * earlier weave left (never submitted). False = lift unavailable this submit
- * (no helper, another device): weave the rects as drawn.
+ * (no helper, another device): weave the rects as drawn. @p vk NULL: an engine
+ * that records on another graphics API (the Metal backend), which then uses
+ * _host_plan / _host_done instead of _record.
  */
 bool
 comp_multi_weave_lift_begin(struct comp_multi_weave_lift *l, struct vk_bundle *vk, uint32_t count);
@@ -118,6 +120,19 @@ comp_multi_weave_lift_begin(struct comp_multi_weave_lift *l, struct vk_bundle *v
 //! Record one rect (after a true _begin). False = weave it as drawn.
 bool
 comp_multi_weave_lift_record(struct comp_multi_weave_lift *l, VkCommandBuffer cmd, const struct vk_conv_weave_rect *r);
+
+//! Host engine: the plan for one rect (after a true _begin with vk NULL). False = weave it as drawn.
+bool
+comp_multi_weave_lift_host_plan(struct comp_multi_weave_lift *l,
+                                const struct vk_conv_weave_rect *r,
+                                struct vk_conv_weave_host_plan *out);
+
+//! Host engine: its GPU work for @p owner's stream @p wire_id completed; call _complete next.
+void
+comp_multi_weave_lift_host_done(struct comp_multi_weave_lift *l,
+                                uint64_t owner,
+                                uint64_t wire_id,
+                                const struct vk_conv_weave_host_done *d);
 
 //! The weave's fence signalled: everything recorded since _begin is done.
 void
