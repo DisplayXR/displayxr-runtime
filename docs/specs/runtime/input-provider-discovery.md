@@ -118,12 +118,14 @@ never inject a DLL.
 | `HKCU\…\InputProviders\<id>` (overrides `HKLM\…\InputProviders\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` (logged `disabled (Enabled=0, user|machine)`); absent = enabled | `displayxr-cli input enable|disable <id> [--machine]` |
 | `HKCU\…\InputProviders` root, then `HKLM\…\InputProviders` root | `PreferredPlugin` | REG_SZ | `<id>` is hoisted to the front of the ProbeOrder sort and noted at arbitration priority 0, so it holds the hand/rig roles whenever it is present. Unregistered → one WARN, ignored; disabled → skipped (`Enabled=0` is the stronger verb); declines → normal fall-through | `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` |
 | `HKCU\…\InputProviders\Policy`, then `HKLM\…\InputProviders\Policy` | `EmulatedControllers` | DWORD | **The N7 gate (§4 item 3b).** 0 = the qwerty emulated controller pair is not published (no qwerty left/right device; the hand roles stay unassigned whenever no provider holds them); absent = 1. The qwerty head is not affected. Lives under the class root on purpose — one root per class — so the service's policy watch and the `Policy\Lock` rule cover it with no new plumbing | `displayxr-cli input emulated on\|off [--machine]` |
+| `HKCU\…\InputProviders\PerApp\<exe-basename>` (HKCU only) | `PreferredPlugin` | REG_SZ | **Per-app pin (ADR-034 Amendment 5).** That app's controller / hand-tracking / gamepad roles prefer `<id>` for every family `<id>` supplies, ahead of the app's own request and of the root `PreferredPlugin`; presence-gated. `<exe-basename>` is the executable's file name with extension (`SampleGame.exe`), resolved from the process — never `applicationName`. `PerApp` is a reserved subkey (never a provider row). Hidden under `Policy\Lock` | `displayxr-cli input use <id> --app <exe>` / `input reset --app <exe>`; an app's persisted `xrSetInputProviderPreferenceDXR` |
 
 The `Enabled` overlay is the shared component loader's
 (`target_component_apply_user_overlay`, ADR-054 N2), so the conversion root's
 kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
 machine value win for every row (conversion-provider-discovery.md §3.1) **and
-hides the per-user `EmulatedControllers`** (the root-policy read,
+hides the per-user `EmulatedControllers`, the per-user `PreferredPlugin` and every
+per-app pin** (the root-policy read,
 `target_component_read_policy_dword`); the `Policy` subkey is reserved and
 never read as a provider row. A change to any of the three values reaches a
 running service live — as a **re-rank** of the
@@ -296,7 +298,8 @@ the service scanned is not resident and joins at the next service start
 (the service log names it), and in-process apps re-read at their next
 launch.
 
-**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — implementation pending).**
+**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — #2181: the store, CLI and
+`XR_DXR_input_providers` surface are in; the arbiter's per-client walk is in progress).**
 The ranked walk above is the *default*; the controller, hand-tracking and gamepad
 roles are resolved **per client** (IPC connection / in-process process) with an
 optional per-family preferred provider id layered on top: machine `Policy\Lock`
@@ -308,6 +311,12 @@ POSIX `input-preferred-<exe-basename>` in the per-user manifest dir; written by
 is still presence-gated. The rig role and the head are never per client. Each
 client gets its own monotonic `generation_id`. `DXR_INPUT_PROVIDERS=0` and
 `ForceQwerty` beat every pin.
+The precedence for one family is the pure `target_input_resolve_preference`
+(`target_input_plugin_loader.h`); the pin store is
+`target_input_plugin_{get,set,list}_app_pin(s)`. A pin write reaches a running
+service through the component-policy watch (the Windows watch covers the
+`PerApp` subtree; POSIX folds every `input-preferred-*` file into the input
+fingerprint). App-facing contract: [`XR_DXR_input_providers`](../extensions/XR_DXR_input_providers.md).
 
 ### Lifetime — the provider is per-process, its devices are per-instance
 
@@ -959,6 +968,13 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
   `input-preferred` file on POSIX, where `--machine` is refused). Every
   write says that it applies to processes started afterwards.
+- `displayxr-cli input use <id> --app <exe>` / `input reset --app <exe>` — the
+  per-app pin (ADR-034 Amendment 5, §3): per user only (`--machine` refused —
+  `Policy\Lock` is the machine's say); `--app` takes an executable name or a
+  path, reduced to its basename. `input list` prints the pins; `input list
+  --json` carries them as `per_app: [{app, preferred, registered}]` (what is
+  stored — `policy.policy_lock` says whether they apply). Per-client live
+  holders join in #2181 phase 2.
 - `displayxr-cli input emulated on|off [--machine]` — the N7
   `EmulatedControllers` gate (§4 item 3b): HKCU by default, the HKLM 64-bit
   view with `--machine` (POSIX: the per-user `emulated_controllers` file;

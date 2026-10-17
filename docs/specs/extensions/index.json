@@ -31,6 +31,11 @@
       "blurb": "How an app hands its native window to the runtime so the compositor can output into it."
     },
     {
+      "id": "input",
+      "title": "Input providers",
+      "blurb": "Which installed input provider drives an app's controllers, hands and gamepad, and how an app shows its user the choice and asks for one — while the user's own pins and defaults always win."
+    },
+    {
       "id": "workspace",
       "title": "Workspace controller surface",
       "blurb": "The contract that lets a workspace controller — the DisplayXR Shell, or any third-party / OEM / vertical / AI-agent equivalent — drive the spatial-desktop layer on top of the runtime. Activation is gated by orchestrator-PID match; the runtime trusts whatever binary it was configured to spawn."
@@ -116,6 +121,11 @@
       "group": "windowing",
       "title": "macOS OpenGL Binding",
       "summary": "macOS OpenGL graphics binding"
+    },
+    "XR_DXR_input_providers": {
+      "group": "input",
+      "title": "Input Providers",
+      "summary": "An app lists the resident input providers (the provider's own name, families it supplies, presence, which one holds this app's controllers / hands / gamepad) and requests one per family, optionally as the user's per-app pin"
     },
     "XR_DXR_spatial_workspace": {
       "group": "workspace",

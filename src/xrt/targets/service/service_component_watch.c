@@ -459,7 +459,8 @@ fingerprint_now(uint64_t out[WATCH_CLASSES])
 		// ADR-034 Am.5 (#2181): a per-app input pin (`input-preferred-<exe>`)
 		// is input policy — a write re-ranks live like `input-preferred`.
 		if (strncmp(ent->d_name, "input-preferred-", 16) == 0) {
-			out[TARGET_COMPONENT_CLASS_INPUT] = fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, ent->d_name);
+			out[TARGET_COMPONENT_CLASS_INPUT] =
+			    fold_path(out[TARGET_COMPONENT_CLASS_INPUT], dir, ent->d_name);
 			continue;
 		}
 		switch (target_plugin_classify_manifest(ent->d_name)) {

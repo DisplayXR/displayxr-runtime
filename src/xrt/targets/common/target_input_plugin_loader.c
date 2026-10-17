@@ -864,8 +864,8 @@ target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_i
 		return rc == ERROR_ACCESS_DENIED ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
 	}
 	wchar_t wid[64];
-	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, provider_id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <=
-	    0) {
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, provider_id, -1, wid,
+	                        (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
 		return TARGET_INPUT_PIN_WRITE_INVALID;
 	}
 	HKEY key = NULL;
