@@ -86,6 +86,8 @@ static unsigned g_update_after = 0;
 static const char *g_update_once = NULL;
 static uint32_t g_state = XRT_CONV_STATE_INSTALLED;
 static uint64_t g_luid = 0;
+//! --fake-require-cpu-outputs 1: refuse an ALLOC_OUTPUTS without CONV_HOST_ALLOC_OUTPUTS_CPU (#2153).
+static unsigned g_require_cpu_outputs = 0;
 
 struct img
 {
@@ -439,6 +441,12 @@ handle(const struct conv_host_wire_frame *f, const uint8_t *payload, const uint6
 	case CONV_HOST_MSG_ALLOC_OUTPUTS: {
 		struct conv_host_wire_alloc_outputs ao;
 		conv_host_wire_receive(&ao, sizeof(ao), payload, f->payload_bytes);
+		if (g_require_cpu_outputs != 0 && (ao.flags & CONV_HOST_ALLOC_OUTPUTS_CPU) == 0) {
+			// A real host on Windows would allocate GPU outputs here, which the
+			// service cannot copy into its CPU targets (#2153).
+			reply_status(f->type, rid, (int32_t)XRT_ERROR_ALLOCATION);
+			break;
+		}
 		for (uint32_t i = 0; i < MAX_OUT; i++) {
 			if (g_out[i].used && g_out[i].stream == ao.stream) {
 				g_out[i].used = false; // released after the reply (the mapping leaks: test host)
@@ -569,6 +577,8 @@ main(int argc, char **argv)
 			g_update_after = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-update-once") == 0) {
 			g_update_once = v;
+		} else if (strcmp(k, "--fake-require-cpu-outputs") == 0) {
+			g_require_cpu_outputs = (unsigned)strtoul(v, NULL, 10);
 		} else if (strcmp(k, "--fake-exit-at-start") == 0) {
 			return (int)strtol(v, NULL, 10);
 		}

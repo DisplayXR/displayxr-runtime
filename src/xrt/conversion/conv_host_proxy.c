@@ -246,7 +246,9 @@ struct px_stream
 	uint64_t id; //!< service id (cmd->stream)
 	uint32_t cap_id;
 	uint32_t out_w, out_h;      //!< extent the current output set was allocated for (0 = none)
+	bool out_cpu;               //!< the current set was asked for as CPU outputs
 	uint32_t out_request_id;    //!< the ALLOC_OUTPUTS whose set is current
+	uint32_t warned_stages;     //!< PX_STAGE_* already WARNed for this stream (one each)
 	bool desc_cached;
 	uint32_t desc_w, desc_h;
 	struct xrt_conv_output_desc desc;
@@ -2045,11 +2047,11 @@ exec_job(struct proxy *p, struct conv_host_cmd *c)
 
 //! A current output set for (stream, w, h): ALLOC_OUTPUTS when the extent changed.
 static bool
-ensure_outputs(struct proxy *p, uint64_t stream, uint32_t w, uint32_t h)
+ensure_outputs(struct proxy *p, uint64_t stream, uint32_t w, uint32_t h, bool cpu)
 {
 	os_mutex_lock(&p->m);
 	struct px_stream *s = stream_find_locked(p, stream);
-	const bool ok = s != NULL && s->out_w == w && s->out_h == h && s->out_request_id != 0;
+	const bool ok = s != NULL && s->out_w == w && s->out_h == h && s->out_cpu == cpu && s->out_request_id != 0;
 	os_mutex_unlock(&p->m);
 	if (ok) {
 		return true;
@@ -2060,6 +2062,7 @@ ensure_outputs(struct proxy *p, uint64_t stream, uint32_t w, uint32_t h)
 	ao.width = w;
 	ao.height = h;
 	ao.set_count = 1;
+	ao.flags = cpu ? CONV_HOST_ALLOC_OUTPUTS_CPU : 0u;
 	struct conv_host_wire_status st;
 	uint32_t rid = 0;
 	const xrt_result_t r = px_request(p, CONV_HOST_MSG_ALLOC_OUTPUTS, &ao, sizeof(ao), NULL, 0, &st, sizeof(st),
@@ -2075,6 +2078,7 @@ ensure_outputs(struct proxy *p, uint64_t stream, uint32_t w, uint32_t h)
 	if (s != NULL) {
 		s->out_w = w;
 		s->out_h = h;
+		s->out_cpu = cpu;
 		s->out_request_id = rid;
 	}
 	for (uint32_t i = 0; i < PX_MAX_OUTPUTS; i++) {
@@ -2218,6 +2222,59 @@ consume_outputs(struct proxy *p, uint64_t stream, const struct conv_host_wire_co
 	return true;
 }
 
+/*! @name Where a satellite convert failed (one WARN per stage per stream, #2153). @{ */
+#define PX_STAGE_INPUT 1u   //!< registering / copying an input into the host
+#define PX_STAGE_OUTPUTS 2u //!< allocating the host's output set
+#define PX_STAGE_CONVERT 4u //!< the host's convert (the provider, or the host's own input / output lookup)
+#define PX_STAGE_COPY 8u    //!< bringing the host's outputs into the service's targets
+/*! @} */
+
+/*!
+ * One WARN naming the failing stage of a satellite convert, the first time
+ * that stage fails for @p stream: a stream failing every frame logs once
+ * (the core counts the failures), a new stage logs again.
+ */
+static void
+warn_stage(struct proxy *p, uint64_t stream, uint32_t stage, xrt_result_t r)
+{
+	os_mutex_lock(&p->m);
+	struct px_stream *s = stream_find_locked(p, stream);
+	const bool first = s != NULL && (s->warned_stages & stage) == 0;
+	if (first) {
+		s->warned_stages |= stage;
+	}
+	os_mutex_unlock(&p->m);
+	if (!first) {
+		return;
+	}
+	const char *what = stage == PX_STAGE_INPUT     ? "input registration / copy into the host"
+	                   : stage == PX_STAGE_OUTPUTS ? "host output allocation"
+	                   : stage == PX_STAGE_CONVERT ? "the host's convert (provider or host lookup)"
+	                                               : "copying the host's outputs into the service targets";
+	U_LOG_W(
+	    "[conv:%s] stream %llu: satellite convert failed at %s (xrt_result %d); further failures at this "
+	    "stage are counted, not logged",
+	    p->provider_id, (unsigned long long)stream, what, (int)r);
+}
+
+//! Every target the core asked for is CPU memory (the host must then give CPU outputs).
+static bool
+targets_are_cpu(const struct xrt_conv_frame_out *fo)
+{
+	const struct xrt_conv_image *t[4] = {&fo->views, &fo->depth, &fo->confidence, &fo->disparity};
+	bool any = false;
+	for (uint32_t i = 0; i < 4; i++) {
+		if (t[i]->memory_kind == 0) {
+			continue;
+		}
+		if (t[i]->memory_kind != XRT_CONV_MEM_CPU) {
+			return false;
+		}
+		any = true;
+	}
+	return any;
+}
+
 static xrt_result_t
 exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 {
@@ -2231,6 +2288,7 @@ exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 	for (uint32_t i = 0; i < fin->image_count; i++) {
 		uint32_t slot = 0;
 		if (!push_input(p, &fin->images[i], fin->image_role[i], &slot)) {
+			warn_stage(p, c->stream, PX_STAGE_INPUT, XRT_ERROR_IPC_FAILURE);
 			return XRT_ERROR_IPC_FAILURE;
 		}
 		rec.in_image_idx[i] = slot;
@@ -2239,7 +2297,8 @@ exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 	for (uint32_t i = fin->image_count; i < XRT_CONV_MAX_FRAME_IMAGES; i++) {
 		rec.in_image_idx[i] = CONV_HOST_WIRE_NO_INDEX;
 	}
-	if (!ensure_outputs(p, c->stream, fin->images[0].width, fin->images[0].height)) {
+	if (!ensure_outputs(p, c->stream, fin->images[0].width, fin->images[0].height, targets_are_cpu(fo))) {
+		warn_stage(p, c->stream, PX_STAGE_OUTPUTS, XRT_ERROR_IPC_FAILURE);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	os_mutex_lock(&p->m);
@@ -2302,9 +2361,11 @@ exec_convert(struct proxy *p, struct conv_host_cmd *c, uint32_t epoch)
 		}
 	}
 	if ((xrt_result_t)done.status != XRT_SUCCESS) {
+		warn_stage(p, c->stream, PX_STAGE_CONVERT, (xrt_result_t)done.status);
 		return (xrt_result_t)done.status;
 	}
 	if (!consume_outputs(p, c->stream, &done, fo)) {
+		warn_stage(p, c->stream, PX_STAGE_COPY, XRT_ERROR_IPC_FAILURE);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	fo->written = done.written;

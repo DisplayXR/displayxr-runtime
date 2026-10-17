@@ -73,7 +73,14 @@ struct stream
 	uint32_t set_count;
 	uint32_t next_set;
 	uint32_t sets[MAX_SETS][CONV_HOST_WIRE_OUT_COUNT]; //!< output indices; NO_INDEX = none
+	uint32_t warned; //!< LANE_WARN_* already logged for this stream (one WARN each, #2153)
 };
+
+/*! @name lane_convert failures logged once per stream. @{ */
+#define LANE_WARN_STREAM 1u   //!< unknown / not ready / no output set
+#define LANE_WARN_INPUT 2u    //!< an input index the host cannot resolve (CPU: outside the lane section)
+#define LANE_WARN_PROVIDER 4u //!< the provider's convert returned an error
+/*! @} */
 
 struct in_image
 {
@@ -455,7 +462,10 @@ handle_alloc_outputs(struct conv_host_serve *s, uint32_t rid, const void *payloa
 		send_status(s, CONV_HOST_MSG_ALLOC_OUTPUTS, rid, r);
 		return;
 	}
-	const bool gpu = s->cfg->d3d11 != NULL && (cap_import_kinds(s, cap_id) & XRT_CONV_MEM_WIN32_NT_HANDLE) != 0;
+	// GPU outputs only when the service can take them: a CPU-target stream
+	// (CONV_HOST_ALLOC_OUTPUTS_CPU) gets shm outputs whatever the capability imports.
+	const bool gpu = s->cfg->d3d11 != NULL && (cap_import_kinds(s, cap_id) & XRT_CONV_MEM_WIN32_NT_HANDLE) != 0 &&
+	                 (a.flags & CONV_HOST_ALLOC_OUTPUTS_CPU) == 0;
 	const uint32_t layers = info.views_layout == XRT_CONV_VIEWS_ARRAY && info.view_count > 0 ? info.view_count : 1;
 
 	// Allocate the new sets; the previous ones go after the reply (§ wire).
@@ -898,11 +908,16 @@ lane_convert(struct lane *l, const struct conv_host_wire_submit_record *rec, str
 	bool gpu_out = false;
 	xrt_result_t r = XRT_SUCCESS;
 
+	uint32_t warn = 0;
 	os_mutex_lock(&s->mtx);
 	struct stream *st = stream_find_locked(s, rec->stream);
 	if (rec->op != CONV_HOST_RING_OP_CONVERT || st == NULL || !st->ready || st->set_count == 0 ||
 	    rec->image_count == 0 || rec->image_count > XRT_CONV_MAX_FRAME_IMAGES) {
 		r = XRT_ERROR_IPC_FAILURE;
+		if (st != NULL && (st->warned & LANE_WARN_STREAM) == 0) {
+			st->warned |= LANE_WARN_STREAM;
+			warn = LANE_WARN_STREAM;
+		}
 	} else {
 		handle = st->handle;
 		cap_id = st->cap_id;
@@ -919,6 +934,10 @@ lane_convert(struct lane *l, const struct conv_host_wire_submit_record *rec, str
 			if (!input_get_locked(s, l, rec->in_image_idx[i], rec->in_sync_idx, rec->in_fence_value,
 			                      &fin.images[i])) {
 				r = XRT_ERROR_IPC_FAILURE;
+				if ((st->warned & LANE_WARN_INPUT) == 0) {
+					st->warned |= LANE_WARN_INPUT;
+					warn = LANE_WARN_INPUT;
+				}
 			}
 		}
 		struct xrt_conv_image *targets[CONV_HOST_WIRE_OUT_COUNT] = {&fout.views, &fout.depth, &fout.confidence,
@@ -961,8 +980,28 @@ lane_convert(struct lane *l, const struct conv_host_wire_submit_record *rec, str
 		cmd.params = &params;
 		cmd.frame_out = &fout;
 		r = conv_host_call(s->host, &cmd);
+		if (r != XRT_SUCCESS) {
+			os_mutex_lock(&s->mtx);
+			struct stream *ws = stream_find_locked(s, rec->stream);
+			if (ws != NULL && (ws->warned & LANE_WARN_PROVIDER) == 0) {
+				ws->warned |= LANE_WARN_PROVIDER;
+				warn = LANE_WARN_PROVIDER;
+			}
+			os_mutex_unlock(&s->mtx);
+		}
 	}
 	c->end_ns = os_monotonic_get_ns();
+	if (warn != 0) {
+		U_LOG_W(
+		    "conversion host: lane %u stream %llu: convert failed at %s (xrt_result %d); counted, not logged, "
+		    "from now on",
+		    l->index, (unsigned long long)rec->stream,
+		    warn == LANE_WARN_STREAM  ? "the stream lookup (unknown, not ready, or no output set)"
+		    : warn == LANE_WARN_INPUT ? "the input lookup (unregistered index, or CPU bytes outside the lane "
+		                                "section)"
+		                              : "the provider's convert",
+		    (int)r);
+	}
 
 	c->status = (int32_t)r;
 	if (r == XRT_SUCCESS) {
