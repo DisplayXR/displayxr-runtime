@@ -113,7 +113,7 @@ Runtime + bridge + extension headers: BSL-1.0 (permissive, similar to MIT). Refe
 **Q: What's on the near-term roadmap?**
 - **Phase 2.A–2.H** (in progress): migrate launcher / chrome / capture / hit-test policy out of the runtime's compositor and into the workspace controller process, behind the as-yet-finalizing `XR_DXR_spatial_workspace.h` header.
 - **Phase 3**: separate the shell repo from the runtime repo entirely. After Phase 3, the shell is just one of N possible controllers from a code-locality standpoint, not just from a runtime-policy standpoint.
-- **macOS workspace controller**: Phase 6's spatial shell is Windows-only today. macOS port is on the M6 milestone.
+- **macOS workspace controller**: shipped — the DisplayXR Shell builds and releases for Windows and macOS (`displayxr-shell-pvt` CI, macOS `.pkg`). A Linux controller is not planned yet; Linux has the runtime-side workspace path and a test controller.
 
 **Q: How can I track progress / contribute?**
 - Public runtime: `github.com/DisplayXR/displayxr-runtime` (releases, public issues, milestones).

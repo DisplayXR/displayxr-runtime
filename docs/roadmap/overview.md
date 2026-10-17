@@ -13,41 +13,23 @@ Stripped Monado from 500+ files to ~150. Removed 34 VR drivers and the Vulkan se
 - Drivers: vendor display-processor plug-ins (e.g. a lenticular hardware DP), plus in-tree sim_display (simulation) and qwerty (keyboard/mouse)
 - Four app classes: handle, texture, hosted, IPC
 - Custom OpenXR extensions: `XR_DXR_display_info`, `XR_DXR_win32_window_binding`, `XR_DXR_cocoa_window_binding`
-- Platforms: Windows, macOS, and Android ship for most features; **Linux is hardware-validated in Preview** (Vulkan-only X11/XCB compositor, code-complete + rendering on real hardware, not yet GA — tarball only; see [Linux Support](linux-support.md))
+- Platforms: Windows, macOS, Linux and Android. Linux **ships** on Ubuntu 22.04/24.04/26.04 (Vulkan-only X11/XCB compositor, `.deb` on every release; see [Linux Support](linux-support.md)); Android ships the runtime APK but has no public release path yet (#1212)
 
-### Stabilization (M3 + M4) — In Progress (~60%)
+### Stabilization (M3 + M4) — Complete
 
-Test coverage and extension API lockdown.
+Test coverage and extension API lockdown: CTS harness (#33, one non-interactive arm in CI — the full matrix is epic #1523), the event system (#3), per-eye multiview helpers (#38), extension docs (#66) and the MANAGED/MANUAL eye-tracking contract (#81) all landed.
 
-| Issue | Status | Description |
-|-------|--------|-------------|
-| #33 | Open | OpenXR conformance testing (Khronos CTS) |
-| #3 | Open | Event system (display mode + eye tracking state changes) |
-| #38 | Open | Refactor stereo3d helpers to per-eye API for multiview |
-| #66 | Open | Update extension docs for M4 completion |
-| #81 | Open | Formalize MANAGED vs MANUAL eye tracking contract |
+### Standardization (M5) — Mostly complete
 
-### Standardization (M5) — In Progress (~22%)
+The display-processor interface is standardized across APIs (#45) and the upstream cherry-pick strategy is settled (#47, ADR-009). Open: #46 display spatial model (displays as spatial objects).
 
-Display processor interface standardization and upstream Monado integration.
+### Spatial Desktop (M6) — Shipping, one item open
 
-| Issue | Status | Description |
-|-------|--------|-------------|
-| #45 | Open | Standardize display processor interface across APIs |
-| #46 | Open | Display spatial model (displays as spatial objects) |
-| #47 | Open | Upstream Monado cherry-pick strategy |
+The platform-native multi compositor (#43), the 3D Shell (#44, now `displayxr-shell-pvt`, Windows + macOS), and the Metal (#48) and D3D11 (#49) service compositors shipped. Open: #69 multi-display compositing on a single machine (Phase 3; see [multi-screen](multi-screen.md)).
 
-### Spatial Desktop (M6) — In Progress (~23%)
+### Component model (ADR-054) — Shipping
 
-Multi-app spatial window manager — the long-term vision for 3D displays as a desktop platform.
-
-| Issue | Status | Description |
-|-------|--------|-------------|
-| #43 | Open | Spatial OS (platform-native multi compositor) |
-| #44 | Open | 3D Shell (spatial window manager) |
-| #48 | Open | Metal service compositor for macOS IPC |
-| #49 | Open | D3D11 service compositor for Windows |
-| #69 | Open | Multi-display compositing on single machine |
+Three plug-in classes (display processors, input providers, conversion providers) behind one shared loader, four verbs per class, a provenance gate (enforcing on Windows), and a per-class conformance cell in CI. Next: the viewer-tracking provider class (#2144) and the decode task family (#2145).
 
 ## Vision
 
@@ -55,7 +37,7 @@ The long-term goal is a **spatial desktop platform** where multiple OpenXR apps 
 
 ## Proposal Documents
 
-All documents in `docs/roadmap/` describe planned features that are not yet implemented:
+Documents in `docs/roadmap/` carry their own status line (shipped, in progress, or proposal); ADRs and specs are authoritative where they disagree:
 
 - [Spatial Desktop PRD](spatial-desktop-prd.md) — product requirements
 - [3D Capture](3d-capture.md) — capture pipeline

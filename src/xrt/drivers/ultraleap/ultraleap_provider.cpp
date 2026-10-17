@@ -16,9 +16,11 @@
  *   pattern), so `get_tracked_pose(at_time_ns)` predicts correctly;
  * - pinch → select click, grab → menu click (hysteresis so a wavering
  *   strength doesn't chatter);
- * - the full `xrt_hand_joint_set` is still filled per hand and served via
- *   `get_hand_tracking` — inert until the Tier-2 (#825) runtime wiring
- *   lands, at which point this provider needs no changes.
+ * - the full `xrt_hand_joint_set` is filled per hand and served via
+ *   `get_hand_tracking`; the Tier-2 (#825) runtime wiring is in place
+ *   (`claim_hand_tracking_roles` in target_builder_input_provider.c and the
+ *   arbiter's dynamic hand-tracking slots), so XR_EXT_hand_tracking is live
+ *   whenever this provider holds a role.
  *
  * Coordinate mapping: DESKTOP tracking mode (device on the desk, facing
  * up). Leap's desktop frame is right-handed, y up, z toward the user —

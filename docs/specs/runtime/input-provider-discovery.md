@@ -14,10 +14,10 @@ persistent host iface — is **implemented** (#1380, ADR-034 *Amendment 4*).
 The `Enabled` / `PreferredPlugin` pair and the `displayxr-cli input
 enable|disable|use|reset` verbs (§3, §6) are **implemented** (N3a of the
 ADR-054 component model: the same four verbs for every component class).
-Still planned: live re-select when either value changes under a running
-service (N3 step d — today a change applies to processes started after the
-write), and the per-client recenter lease under a workspace controller (§4b,
-ADR-035 D2).
+Live re-select when either value changes under a running service is
+**implemented** (N3 step d, #2051 / PR #2129: `service_component_watch` +
+`t_input_arbiter_rerank`). Still planned: the per-client recenter lease under
+a workspace controller (§4b, ADR-035 D2).
 The authoritative
 rationale is `docs/adr/ADR-034-input-provider-plugins.md`. This spec
 intentionally mirrors the display-processor contract
