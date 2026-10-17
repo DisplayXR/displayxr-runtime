@@ -49,7 +49,6 @@ if [[ ! -f "$BUILD/CMakeCache.txt" ]]; then
 	    -DXRT_FEATURE_TRACING=OFF \
 	    -DXRT_FEATURE_DEBUG_GUI=OFF \
 	    -DBUILD_TESTING=OFF \
-	    -DXRT_HAVE_LIBUSB=OFF \
 	    -DXRT_HAVE_OPENGL=OFF \
 	    -DXRT_HAVE_VULKAN=OFF \
 	    -DXRT_HAVE_SDL2=OFF \

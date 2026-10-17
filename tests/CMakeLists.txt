@@ -365,9 +365,6 @@ if(XRT_HAVE_OPENGL
 	set(_have_opengl_test ON)
 	list(APPEND tests tests_comp_client_opengl)
 endif()
-if(XRT_BUILD_DRIVER_HANDTRACKING)
-	list(APPEND tests tests_levenbergmarquardt)
-endif()
 # ADR-053 D5 (#2033) -- the conversion-host satellite binary, spawned with the
 # sim provider over a loopback channel; describe / warm / one submit through
 # the shm rings, and the exit-code table. Headless (CPU lane).
@@ -1193,18 +1190,6 @@ if(TARGET tests_service_hotkey_linux AND XRT_HAVE_DBUS)
 				)
 		endif()
 	endif()
-endif()
-
-if(XRT_BUILD_DRIVER_HANDTRACKING)
-	target_link_libraries(
-		tests_levenbergmarquardt
-		PRIVATE
-			aux_math
-			t_ht_mercury_includes
-			t_ht_mercury_kine_lm_includes
-			t_ht_mercury
-			t_ht_mercury_kine_lm
-		)
 endif()
 
 if(XRT_HAVE_D3D11)
