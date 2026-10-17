@@ -22,7 +22,8 @@ REM   scripts\register_dev_plugin.bat input sim        :: register the dev SIMUL
 REM                                                       (ProbeOrder 200). Synthetic controllers, NOT a
 REM                                                       product path -- it also needs DXR_SIM_INPUT=1 in
 REM                                                       the environment at run time before it will probe.
-REM   scripts\register_dev_plugin.bat unregister-input :: remove the dev sim-input entry
+REM   scripts\register_dev_plugin.bat input gamepad    :: register the dev GAMEPAD provider (XInput), ProbeOrder 150
+REM   scripts\register_dev_plugin.bat unregister-input :: remove the dev sim-input + gamepad entries
 REM   scripts\register_dev_plugin.bat conv <dll> [--probe-order N]
 REM                                                    :: register a CONVERSION provider (ADR-053),
 REM                                                       id = DLL basename, ProbeOrder 50 by default
@@ -113,6 +114,7 @@ if "%DLL%"=="" (
     echo ERROR: 'input' needs a target:
     echo   scripts\register_dev_plugin.bat input C:\path\to\DisplayXR-Vendor.dll   :: a real provider
     echo   scripts\register_dev_plugin.bat input sim                               :: the SIMULATED one
+    echo   scripts\register_dev_plugin.bat input gamepad                           :: the XInput GAMEPAD one
     exit /b 1
 )
 if /I "%DLL%"=="sim" (
@@ -121,6 +123,14 @@ if /I "%DLL%"=="sim" (
     set "IPNAME=DisplayXR Sim Input"
     set "IPORDER=200"
     set "IPSIM=1"
+) else if /I "%DLL%"=="gamepad" (
+    REM Presence-gated: inert until a pad is attached, then it takes the
+    REM gamepad role, drives the rig and (by default) the hand roles.
+    set "DLL=%REPO%\_package\bin\plugins\DisplayXR-Gamepad.dll"
+    set "IPKEY=HKLM\Software\DisplayXR\InputProviders\gamepad"
+    set "IPNAME=DisplayXR Gamepad"
+    set "IPORDER=150"
+    set "IPSIM="
 ) else (
     for %%F in ("%DLL%") do set "IPID=%%~nF"
     call set "IPKEY=HKLM\Software\DisplayXR\InputProviders\%%IPID%%"
@@ -147,7 +157,8 @@ goto :list
 
 :unregister_input
 reg delete "HKLM\Software\DisplayXR\InputProviders\sim-input" /f >nul 2>&1
-echo Removed sim-input dev registration.
+reg delete "HKLM\Software\DisplayXR\InputProviders\gamepad" /f >nul 2>&1
+echo Removed sim-input + gamepad dev registrations.
 goto :list
 
 :conv

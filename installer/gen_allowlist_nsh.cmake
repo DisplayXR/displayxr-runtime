@@ -27,6 +27,7 @@ endif()
 set(_shipped_plugins
 	"${BIN_DIR}/plugins/DisplayXR-SimDisplay.dll"
 	"${BIN_DIR}/plugins/DisplayXR-SimInput.dll"
+	"${BIN_DIR}/plugins/DisplayXR-Gamepad.dll"
 	"${BIN_DIR}/plugins/DisplayXR-SimConversion.dll"
 )
 
