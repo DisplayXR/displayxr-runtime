@@ -229,9 +229,20 @@ endif()
 # Prepare the installable manifest: will be generated completely at install time,
 # by a script we generate now.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-	# Windows: install manifest to top level with DisplayXR naming
-	# The installer copies everything to a flat directory, so use "." for the
-	# relative path (manifest and DLL will be in the same directory)
+	# Windows: install the manifest NEXT TO the DLL (_package/bin/), with a
+	# manifest-relative library_path ".\DisplayXRClient.dll". That relation
+	# (manifest and DLL in one directory) holds both in the staging tree and
+	# in the installer's flat layout, so ONE file serves both: the NSIS
+	# installer packs ${BIN_DIR}\DisplayXR_win64.json, and dev runs point
+	# XR_RUNTIME_JSON / `displayxr-cli runtime activate` at
+	# _package/bin/DisplayXR_win64.json (#852).
+	#
+	# There is deliberately NO top-level _package/DisplayXR_win64.json any
+	# more: it carried the installer's ".\DisplayXRClient.dll" while sitting
+	# one directory above the DLL, so inside the staging tree it pointed at
+	# nothing — `runtime activate` refused it, and the OpenXR loader given it
+	# via XR_RUNTIME_JSON silently fell back to the registry ActiveRuntime
+	# (apps run, look healthy, and measure the WRONG runtime).
 	set(_extra_args RUNTIME_DIR_RELATIVE_TO_MANIFEST .)
 	if(XRT_OPENXR_INSTALL_ABSOLUTE_RUNTIME_PATH)
 		set(_extra_args ABSOLUTE_RUNTIME_PATH)
@@ -239,24 +250,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	generate_openxr_runtime_manifest_at_install(
 		${_extra_args}
 		RUNTIME_TARGET ${RUNTIME_TARGET}
-		DESTINATION .
+		DESTINATION ${CMAKE_INSTALL_BINDIR}
 		RELATIVE_RUNTIME_DIR ${CMAKE_INSTALL_BINDIR}
 		OUT_FILENAME "DisplayXR_win64.json"
 		)
-	# #852 — also stage the manifest NEXT TO the DLL (_package/bin/). The
-	# top-level copy above is written for the installer's flat layout
-	# (library_path ".\DisplayXRClient.dll"), so inside the staging tree it
-	# points at a DLL that isn't there and the OpenXR loader silently falls
-	# back to the registry ActiveRuntime — apps run, look healthy, and
-	# measure the WRONG runtime. Copy the manifest beside the DLL, where the
-	# same relative (or absolute) library_path is valid in-tree; point
-	# XR_RUNTIME_JSON at _package/bin/DisplayXR_win64.json for dev runs
-	# (and always verify the per-app log's "loaded from:" line). A plain
-	# copy, not a second generate_openxr_runtime_manifest_at_install(): the
-	# helper keys its install script and intermediate file on the target
-	# name only, so two calls for one target overwrite each other.
+	# Sweep the broken top-level copy an older build left in an existing
+	# _package/ (install never deletes, so it would otherwise linger).
 	install(
-		CODE "file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\" TYPE FILE FILES \"\${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json\")"
+		CODE "file(REMOVE \"\${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json\")"
 		COMPONENT Runtime
 		)
 	install(
