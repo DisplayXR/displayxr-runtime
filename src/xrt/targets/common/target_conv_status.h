@@ -225,6 +225,18 @@ target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry 
                                              struct target_conv_status *out);
 
 /*!
+ * `conv run --provider`'s STRICT rule (#2178): the provider @p st's
+ * selection bound for @p task on @p lane (XRT_CONV_LANE_*; 0 = any). With
+ * @p want set ("<id>[/<cap or model>]", the hint the pass ran with) it must be
+ * that provider, bound BY the hint: a human named it, so an unknown, filtered
+ * or terminal one is a refusal with the reason in @p why, never the app
+ * fall-through. Returns the bound provider id (points into @p st), or NULL.
+ */
+const char *
+target_conv_status_bound_provider(
+    const struct target_conv_status *st, uint32_t task, uint32_t lane, const char *want, char *why, size_t why_size);
+
+/*!
  * The host iface the headless pass negotiates providers with: the loader's
  * default host, plus a get_setting that answers `DXR_CONV_<ID>_<KEY>` from the
  * environment, then the provider's registry `Settings` / manifest "settings".

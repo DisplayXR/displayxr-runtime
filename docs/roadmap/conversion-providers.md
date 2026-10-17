@@ -69,7 +69,7 @@ once (ADR-053).
 **What changes for whom.**
 
 - **Apps** keep `XR_DXR_lift`. v3 callers are served byte-for-byte. Spec 4 adds tasks, readiness
-  events and neutral images; spec 5 adds jobs. Apps never pick or see a model, and a non-READY task
+  events and neutral images; spec 5 (#2178) lists the candidate providers read-only and takes a per-create hint; spec 6 adds jobs. Apps never pick or see a model, and a non-READY task
   means wait, never fall back.
 - **Display vendors** stop carrying lift in their DP. The DP lift slots freeze in P1. A built-in
   legacy adapter, always in the service, serves them until the vendor ships its conversion module as
@@ -761,14 +761,14 @@ The full C is in [`conversion-providers-headers-draft.md`](conversion-providers-
 
 ### 7.1 Decision
 
-**`XR_DXR_lift` spec 4, then spec 5; no `XR_DXR_conversion` extension** (ADR-053). The browser's GPU
+**`XR_DXR_lift` spec 4, then spec 5 (candidates + hint, #2178), then spec 6 (jobs); no `XR_DXR_conversion` extension** (ADR-053). The browser's GPU
 process enables lift once in a pre-sandbox instance it can never re-create, and the weave-rect and
 cursor_depth chains take `XrLiftStreamDXR`. A second extension would need a second weave-rect struct
 and a cursor_depth v8 colliding with mac/cursor's in-flight work.
 
 ### 7.2 What each version adds
 
-| | Spec 4 (P3) | Spec 5 (P6) |
+| | Spec 4 (P3) | Spec 6 (P6; spec 5 is #2178's candidates + hint) |
 |---|---|---|
 | Model | task vocabulary (`XrLiftTaskDXR`), input kinds, a quality hint (the app's only lever) | — |
 | Discovery | `xrEnumerateLiftTasksDXR` (effective per-task capability, readiness, licence class), `xrRequestLiftTaskWarmDXR` | — |
@@ -1094,9 +1094,9 @@ Still open:
 
 Details: [`docs/reference/vulkan-conversion-glue.md`](../reference/vulkan-conversion-glue.md).
 
-### P6 — Lift spec 5 + job consumers
+### P6 — Lift spec 6 + job consumers
 
-Spec 5 (jobs, `XrLiftSplatsInfoDXR` with SPZ + camera block, stereo + depth input; DISPARITY_STEREO,
+Spec 6 (jobs, `XrLiftSplatsInfoDXR` with SPZ + camera block, stereo + depth input; DISPARITY_STEREO,
 SPLATS_STEREO, VIEWS_FROM_DEPTH); mediaplayer, gaussiansplat, Unity then Unreal, MCP. **Tests:** job
 progress monotonic, cancel within 1 s, destroy = cancel, a 300 MB PLY read in chunks, teardown reaps
 jobs; the splat camera block equals the SOG `meta.json`; per-consumer smoke tests. **Exit:** each

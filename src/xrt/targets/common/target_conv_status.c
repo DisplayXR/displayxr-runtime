@@ -850,6 +850,63 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 	free(extra);
 }
 
+const char *
+target_conv_status_bound_provider(
+    const struct target_conv_status *st, uint32_t task, uint32_t lane, const char *want, char *why, size_t why_size)
+{
+	if (why != NULL && why_size > 0) {
+		why[0] = '\0';
+	}
+	const char *bound = NULL;
+	for (uint32_t i = 0; i < st->task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		const struct xrt_status_conv_task *t = &st->tasks[i];
+		if (t->task == task && t->selected && t->provider < st->provider_count &&
+		    (lane == 0 || (t->lanes & lane) != 0)) {
+			bound = st->providers[t->provider].id;
+			break;
+		}
+	}
+	if (want == NULL || want[0] == '\0') {
+		if (bound == NULL && why != NULL) {
+			(void)snprintf(why, why_size, "no registered provider serves %s here", conv_task_name(task));
+		}
+		return bound;
+	}
+	const char *slash = strchr(want, '/');
+	const size_t id_len = slash != NULL ? (size_t)(slash - want) : strlen(want);
+	if (bound != NULL && st->hint_applied && strlen(bound) == id_len && strncmp(bound, want, id_len) == 0) {
+		return bound;
+	}
+	if (why == NULL) {
+		return NULL;
+	}
+	// Why the named provider was not bound: its best row for the task.
+	const struct xrt_status_conv_task *best = NULL;
+	for (uint32_t i = 0; i < st->task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+		const struct xrt_status_conv_task *t = &st->tasks[i];
+		if (t->task != task || t->provider >= st->provider_count) {
+			continue;
+		}
+		const char *id = st->providers[t->provider].id;
+		if (strlen(id) == id_len && strncmp(id, want, id_len) == 0) {
+			best = t;
+			break;
+		}
+	}
+	if (best == NULL) {
+		(void)snprintf(why, why_size, "%.*s is not a registered provider of %s", (int)id_len, want,
+		               conv_task_name(task));
+	} else if (lane != 0 && (best->lanes & lane) == 0) {
+		(void)snprintf(why, why_size, "%.*s does not serve %s on this lane", (int)id_len, want,
+		               conv_task_name(task));
+	} else {
+		(void)snprintf(why, why_size, "%.*s cannot be bound for %s: %s (%s%s%s)", (int)id_len, want,
+		               conv_task_name(task), best->verdict, best->state_name, best->reason != 0 ? ", " : "",
+		               best->reason != 0 ? best->reason_name : "");
+	}
+	return NULL;
+}
+
 void
 target_conv_status_fill_activity(struct target_conv_status *st, target_conv_activity_fn fn, void *ud)
 {

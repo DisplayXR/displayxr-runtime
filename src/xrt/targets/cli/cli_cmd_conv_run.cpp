@@ -363,8 +363,8 @@ usage_run(void)
 {
 	E("usage: displayxr-cli conv run splats-mono <in> <out.sog|.ply> [options]\n"
 	  "       displayxr-cli conv run splats-stereo <left> <right> <out> [options]   (or one SBS image with --sbs)\n"
-	  "  --provider <id>        prefer this provider (a hint: the runtime's selection still arbitrates;\n"
-	  "                         an unknown or terminal one falls through to the default)\n"
+	  "  --provider <id>[/<model>]  run on this provider; exit 5 with the reason when it cannot be bound\n"
+	  "                         (unknown, disabled, licence-gated, terminal: `conv candidates <task>`)\n"
 	  "  --format sog|ply       blob format (default from the output extension)\n"
 	  "  --baseline-m <m>       stereo baseline in metres; omitted = unknown (no metric result, never defaulted)\n"
 	  "  --rectified | --raw    declare the pair (stereo needs one; it is never guessed)\n"
@@ -491,49 +491,43 @@ cli_cmd_conv_run(int argc, const char **argv)
 	target_conv_policy sel_policy = policy;
 	sel_policy.allow_research_only = allow_research;
 	auto status = std::make_unique<target_conv_status>();
+	char why[192];
 	auto select = [&](const target_conv_policy &pol) -> const char * {
 		target_conv_status_build_from_entries_hinted(entries, n < 0 ? 0 : n, nullptr, &pol, task, want,
 		                                             status.get());
-		for (uint32_t i = 0; i < status->task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
-			const xrt_status_conv_task &t = status->tasks[i];
-			if (t.task == task && t.selected && t.provider < status->provider_count &&
-			    (t.lanes & XRT_CONV_LANE_JOB) != 0) {
-				return status->providers[t.provider].id;
-			}
-		}
-		return nullptr;
+		return target_conv_status_bound_provider(status.get(), task, XRT_CONV_LANE_JOB, want, why, sizeof(why));
 	};
 	const char *chosen = select(sel_policy);
 	if (chosen == nullptr && !allow_research) {
 		// Nothing eligible without the opt-in: rank once more with it, so a
 		// research-only provider is named (and refused below with its licence)
 		// rather than reported as missing.
+		char first_why[sizeof(why)];
+		memcpy(first_why, why, sizeof(why));
 		target_conv_policy research = sel_policy;
 		research.allow_research_only = true;
 		chosen = select(research);
+		if (chosen == nullptr) {
+			memcpy(why, first_why, sizeof(why));
+		}
 	}
-	if (want != nullptr && !status->hint_applied) {
-		// Never an error (lift spec 5): an unknown, filtered or terminal hint falls through.
-		E("conv run: --provider %s is not a usable candidate for %s (unknown, disabled, licence-gated or "
-		  "terminal: `displayxr-cli conv candidates %s`); using the runtime's selection\n",
-		  want, task_name, task_name);
+	if (chosen == nullptr) {
+		// STRICT (#2178): a human named the provider -- no app-style fall-through.
+		E("conv run: %s (see `displayxr-cli conv candidates %s`)\n", why, task_name);
+		free(entries);
+		return want != nullptr ? 5 : 1;
 	}
 	hosted h;
 	bool found = false;
-	for (int i = 0; i < n && !found && chosen != nullptr; i++) {
+	for (int i = 0; i < n && !found; i++) {
 		if (strcmp(entries[i].id, chosen) == 0) {
 			found = host_one(&entries[i], task, h);
 		}
 	}
 	if (!found) {
-		if (chosen != nullptr) {
-			E("conv run: the selected provider %s could not be hosted for %s on the job lane\n", chosen,
-			  task_name);
-		} else {
-			E("conv run: no registered provider serves %s on the job lane\n", task_name);
-		}
+		E("conv run: the selected provider %s could not be hosted for %s on the job lane\n", chosen, task_name);
 		free(entries);
-		return 1;
+		return want != nullptr ? 5 : 1;
 	}
 	const bool remote = (h.cap.flags & XRT_CONV_CAP_REMOTE) != 0;
 	E("conv run: %s via %s (cap %u, %s)%s\n", task_name, h.e->id, h.cap.cap_id, h.cap.display_name,

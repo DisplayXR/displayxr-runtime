@@ -81,7 +81,9 @@
  * default and whether a create would pick it -- and XrLiftProviderPreferenceDXR
  * chained on XrLiftTaskStreamCreateInfoDXR is a per-create HINT that reorders
  * the non-terminal candidates for that create only. The runtime still
- * arbitrates; an app never sets the user's default.
+ * arbitrates; an app never sets the user's default. Spec 6 (planned, not in
+ * this header): jobs, stereo-pair / image+depth input and splats over the
+ * extension (the 1004999360.. types).
  */
 #ifndef XR_DXR_LIFT_H
 #define XR_DXR_LIFT_H 1
@@ -121,7 +123,7 @@ extern "C" {
 #define XR_TYPE_LIFT_DEPTH_RESULT_DXR        ((XrStructureType)1004999284)
 #define XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR    ((XrStructureType)1004999285)
 // ---- Spec v4 (ADR-053: tasks, readiness, neutral transport) ----
-// Reserved 1004999340..369 (three decades, spec 4 + spec 5). Registry:
+// Reserved 1004999340..369 (three decades, spec 4, 5 and 6). Registry:
 // README.md in this directory. 1004999340 (held back when provider
 // enumeration was cut from spec 4) is spec 5's candidate struct; 353..359
 // are free.
@@ -701,17 +703,17 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetLiftStreamStatsDXR)(XrLiftStreamDXR stream
  * WHAT to compute. A fixed vocabulary; a task is served by at most one
  * provider at a time, chosen by the runtime (an app may HINT a provider per
  * create, spec 5; the runtime still decides). RESERVED values
- * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 5" are not
- * creatable on a spec-4 runtime.
+ * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 6" are not
+ * creatable on a spec-4 or spec-5 runtime.
  */
 typedef enum XrLiftTaskDXR {
     XR_LIFT_TASK_DEPTH_MONO_DXR        = 1,  //!< one image -> depth (stills; no temporal state)
     XR_LIFT_TASK_DEPTH_VIDEO_DXR       = 2,  //!< frames -> depth, temporally stable; reset on discontinuity
-    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 5)
+    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 6)
     XR_LIFT_TASK_VIEWS_MONO_DXR        = 4,  //!< image/frames -> N >= 2 views (+ same-inference aux depth)
-    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 5)
+    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 6)
     XR_LIFT_TASK_SPLATS_MONO_DXR       = 6,  //!< photo -> 3D Gaussian splats (job lane)
-    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 5, job lane)
+    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 6, job lane)
     XR_LIFT_TASK_SPLATS_VIDEO_DXR      = 8,  //!< RESERVED
     XR_LIFT_TASK_INPAINT_DXR           = 9,  //!< RESERVED (a provider sub-stage, never app-creatable)
     XR_LIFT_TASK_MAX_ENUM_DXR = 0x7FFFFFFF
@@ -720,8 +722,8 @@ typedef enum XrLiftTaskDXR {
 /*! The shape of the input a task stream consumes. */
 typedef enum XrLiftInputKindDXR {
     XR_LIFT_INPUT_KIND_MONO_DXR            = 1, //!< one colour image
-    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 5)
-    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 5)
+    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 6)
+    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 6)
     XR_LIFT_INPUT_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftInputKindDXR;
 typedef XrFlags64 XrLiftInputKindFlagsDXR; //!< bit (1 << XrLiftInputKindDXR)
@@ -783,7 +785,7 @@ typedef enum XrLiftQualityHintDXR {
 
 typedef XrFlags64 XrLiftLaneFlagsDXR;
 static const XrLiftLaneFlagsDXR XR_LIFT_LANE_STREAM_BIT_DXR = 0x00000001; //!< latest-wins streams
-static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 5)
+static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 6)
 
 typedef XrFlags64 XrLiftOutputFlagsDXR;
 static const XrLiftOutputFlagsDXR XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR           = 0x00000001; //!< views + same-inference depth
@@ -851,8 +853,8 @@ typedef enum XrLiftColorSpaceDXR {
 
 typedef enum XrLiftImageRoleDXR {
     XR_LIFT_IMAGE_ROLE_COLOR_DXR       = 1, //!< mono input, or the first/left eye, or a whole SBS pair
-    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 5)
-    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 5
+    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 6)
+    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 6
     XR_LIFT_IMAGE_ROLE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftImageRoleDXR;
 
@@ -863,7 +865,7 @@ typedef enum XrLiftDepthKindDXR {
     XR_LIFT_DEPTH_KIND_AFFINE_INVERSE_DEPTH_DXR = 3, //!< unknown scale+shift of 1/depth, larger = nearer (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DISPARITY_DXR     = 4, //!< disparity up to scale+shift (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DEPTH_DXR         = 5, //!< unknown scale+shift, larger = farther (v3: RELATIVE + LINEAR)
-    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 5)
+    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 6)
     XR_LIFT_DEPTH_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftDepthKindDXR;
 
