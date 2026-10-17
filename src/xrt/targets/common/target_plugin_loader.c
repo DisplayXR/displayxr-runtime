@@ -1261,6 +1261,9 @@ preload_runtime_lib_dir(const char *lib_dir)
 		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION, 7) == 0) {
 			continue;
 		}
+		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_INPUT, 7) == 0) {
+			continue;
+		}
 		/* Skip the runtime DLL: already loaded, dlopen of it is
 		 * harmless but the log line is noise. */
 		if (strncmp(name, "openxr_displayxr.so", 19) == 0 ||

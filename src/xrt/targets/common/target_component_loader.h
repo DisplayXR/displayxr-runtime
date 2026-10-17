@@ -115,6 +115,8 @@ target_component_class_id_str(uint32_t class_id);
 #define TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY "libdxrp"
 //! Android library prefix of a conversion provider (`libdxrc<NNN>_<id>.so`, ADR-053).
 #define TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION "libdxrc"
+//! Android library prefix of an input provider (`libdxri<NNN>_<id>.so`, ADR-034; first one #132).
+#define TARGET_PLUGIN_ANDROID_PREFIX_INPUT "libdxri"
 
 /*!
  * Parse an Android component library name `<prefix><NNN>_<id>.so` into its

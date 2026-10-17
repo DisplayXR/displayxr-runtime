@@ -367,7 +367,7 @@ preferred_file_path(char *out, size_t cap, bool create_dir)
 	(void)dir;
 	(void)create_dir;
 	out[0] = '\0';
-	return false; // no per-user store on Android (no input providers there in v1 either)
+	return false; // no per-user store on Android (ProbeOrder in the file name is the only ranking)
 #else
 	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return false;

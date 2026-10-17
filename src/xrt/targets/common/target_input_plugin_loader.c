@@ -31,6 +31,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "util/u_logging.h"
+#include "util/u_pointer_sink.h"
 
 #include "os/os_threading.h"
 
@@ -74,10 +75,11 @@ static const struct target_component_class g_input_class = {
     .abi_current = XRT_INPUT_PLUGIN_API_VERSION_CURRENT,
     .registry_root = "Software\\DisplayXR\\InputProviders",
     .manifest_kind = TARGET_PLUGIN_MANIFEST_INPUT,
-    // Android ships no input providers in v1 — the `libdxr*` convention is
-    // DP + conversion only for now; the qwerty fallback / shell-side input
-    // path is unaffected.
-    .android_prefix = NULL,
+    // Android: `libdxri<NNN>_<id>.so` in the runtime APK's lib dir, the same
+    // convention as the DP (`libdxrp`) and conversion (`libdxrc`) classes.
+    // The first one is the touch provider (`libdxri100_touch_input.so`,
+    // #132); a vendor's tracking provider ships at a lower ProbeOrder.
+    .android_prefix = TARGET_PLUGIN_ANDROID_PREFIX_INPUT,
     .is_reserved_subkey = input_is_reserved_subkey,
     .read_extra = NULL,
     .env_class = "INPUT", // DXR_INPUT_<ID>_<KEY> (N3c)
@@ -275,6 +277,11 @@ input_host_iface(void)
 		g_input_host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
 		g_input_host.get_display_geometry = input_host_get_display_geometry;
 		g_input_host.get_setting = input_host_get_setting;
+		// The pointer-event queue every runtime-owned surface pushes into
+		// (hosted SurfaceView, xrSubmitAndroidInputEventDXR, later the
+		// workspace controller's forwarded events — #1996). The slot IS
+		// the queue's poll; nothing provider-specific lives in between.
+		g_input_host.poll_pointer_events = u_pointer_sink_poll;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
@@ -735,7 +742,7 @@ target_input_plugin_get_preferred(char *out, size_t cap)
 	if (out != NULL && cap > 0) {
 		out[0] = '\0';
 	}
-	return false; // no providers, no override on Android in v1
+	return false; // no per-user store on Android: ProbeOrder (the file name) is the only ranking
 }
 
 #else /* POSIX: macOS / desktop Linux */
