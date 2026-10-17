@@ -506,7 +506,8 @@ oxr_xrEnumerateLiftTasksDXR(XrSession session,
 	}
 
 	uint64_t in_kinds = 0, out_kinds = 0;
-	oxr_conv_session_image_kinds(sess, &in_kinds, &out_kinds);
+	oxr_conv_session_image_kinds_offer(sess, &in_kinds, &out_kinds);
+	uint64_t svc_in = 0, svc_out = 0; // what the service's transport takes / gives, any task
 
 	struct xrt_conv_wire_task_desc found[XRT_CONV_TASK_RESERVED_FIRST];
 	uint64_t found_in[XRT_CONV_TASK_RESERVED_FIRST], found_out[XRT_CONV_TASK_RESERVED_FIRST];
@@ -528,6 +529,8 @@ oxr_xrEnumerateLiftTasksDXR(XrSession session,
 		found[n] = d;
 		found_in[n] = ik & in_kinds;
 		found_out[n] = ek & out_kinds;
+		svc_in |= ik;
+		svc_out |= ek;
 		n++;
 		if (t == XRT_CONV_TASK_VIEWS_MONO && d.max_views > 0) {
 			sess->lift_max_views = d.max_views > XR_LIFT_MAX_VIEWS_DXR ? XR_LIFT_MAX_VIEWS_DXR : d.max_views;
@@ -538,6 +541,7 @@ oxr_xrEnumerateLiftTasksDXR(XrSession session,
 	if (r != XR_SUCCESS) {
 		return r;
 	}
+	oxr_conv_learn_service_kinds(sess, svc_in, svc_out);
 
 	*countOutput = n;
 	if (capacityInput == 0) {
@@ -701,6 +705,14 @@ lift_create_task_stream(struct oxr_logger *log,
 			                 (int)t->exportKind);
 		}
 		export_memory = t->exportKind == XR_LIFT_IMAGE_KIND_CPU_DXR ? XRT_CONV_MEM_CPU : XRT_CONV_MEM_WIN32_NT_HANDLE;
+#ifndef XRT_OS_WINDOWS
+		// Step E: the POSIX GPU exports (offered only once the service gives them).
+		if (t->exportKind == XR_LIFT_IMAGE_KIND_IOSURFACE_DXR) {
+			export_memory = XRT_CONV_MEM_IOSURFACE;
+		} else if (t->exportKind == XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR) {
+			export_memory = XRT_CONV_MEM_VK_OPAQUE_FD;
+		}
+#endif
 	}
 	if (ci->contentHint != XR_LIFT_CONTENT_HINT_VIDEO_DXR && ci->contentHint != XR_LIFT_CONTENT_HINT_PHOTO_DXR) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: contentHint (%d) invalid", what,
@@ -787,6 +799,11 @@ lift_create_task_stream(struct oxr_logger *log,
 	st->v4 = true;
 	st->task = (uint32_t)t->task;
 	st->export_cpu = export_memory == XRT_CONV_MEM_CPU;
+#ifndef XRT_OS_WINDOWS
+	st->export_gpu_kind = export_memory == XRT_CONV_MEM_IOSURFACE      ? (uint32_t)XR_LIFT_IMAGE_KIND_IOSURFACE_DXR
+	                      : export_memory == XRT_CONV_MEM_VK_OPAQUE_FD ? (uint32_t)XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR
+	                                                                   : 0u;
+#endif
 	*stream = XRT_CAST_PTR_TO_OXR_HANDLE(XrLiftStreamDXR, st);
 	return XR_SUCCESS;
 }
@@ -823,10 +840,112 @@ lift_conv_fmt(XrLiftPixelFormatDXR f)
  * (keyed mutex, or a D3D fence), D3D12 NT (a D3D fence, or writes complete
  * before the call), CPU bytes (copied into a mapping before return).
  */
+#ifndef XRT_OS_WINDOWS
+/*!
+ * ADR-053 P5 step E: a POSIX GPU image (IOSURFACE on macOS; OPAQUE_FD / DMABUF
+ * on Linux) of an in-process Vulkan session. The handle crosses to the
+ * service as it is (borrowed: the transport sends the IOSurface's ID / dups
+ * the fd); the service copies the region on its GPU before the call returns.
+ */
+static XrResult
+lift_gpu_image_resolve(struct oxr_logger *log,
+                       const XrLiftImageDXR *im,
+                       XrLiftImageKindDXR kind,
+                       XrExtent2Di base_extent,
+                       struct lift_input *out)
+{
+	struct xrt_conv_wire_image *w = &out->image;
+	const uint32_t rx = out->region_x, ry = out->region_y, rw = w->width, rh = w->height;
+	if (w->format == 0) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftImageDXR: a GPU image needs an RGBA8 / BGRA8 format (UNORM or SRGB)");
+	}
+	// Sync: writes complete before the call everywhere; a sync_file or a
+	// timeline semaphore fd on Linux (waited for on the service's GPU).
+	bool sync_ok = im->syncKind == XR_LIFT_SYNC_KIND_NONE_DXR || im->syncKind == XR_LIFT_SYNC_KIND_CPU_COMPLETE_DXR;
+	w->sync_kind = XRT_CONV_SYNC_NONE;
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+	const int sync_fd = (int)(intptr_t)im->syncHandle;
+	if (im->syncKind == XR_LIFT_SYNC_KIND_SYNC_FILE_DXR) {
+		sync_ok = true;
+		if (sync_fd >= 0) { // -1 = already signalled: nothing to wait for
+			w->sync_kind = XRT_CONV_SYNC_SYNC_FD;
+			out->sync_handle = im->syncHandle;
+		}
+	} else if (im->syncKind == XR_LIFT_SYNC_KIND_VK_TIMELINE_DXR) {
+		sync_ok = sync_fd >= 0;
+		w->sync_kind = XRT_CONV_SYNC_VK_SEMAPHORE_FD;
+		w->sync_acquire_value = im->syncValue;
+		out->sync_handle = im->syncHandle;
+	}
+#endif
+	if (!sync_ok) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftImageDXR: syncKind %d does not fit kind %d here (NONE / CPU_COMPLETE; on Linux "
+		                 "also SYNC_FILE or VK_TIMELINE with an fd)",
+		                 (int)im->syncKind, (int)kind);
+	}
+	uint32_t iw = 0, ih = 0;
+	if (kind == XR_LIFT_IMAGE_KIND_IOSURFACE_DXR) {
+		if (!oxr_conv_iosurface_extent(im->handle, &iw, &ih)) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "XrLiftImageDXR::handle is not an IOSurface");
+		}
+		w->memory_kind = XRT_CONV_MEM_IOSURFACE;
+		out->handle = im->handle;
+	} else if (kind == XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR) {
+		if ((intptr_t)im->handle < 0) { // (void *)(intptr_t)fd: fd 0 is NULL and valid
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR::handle is not an fd");
+		}
+		// An OPAQUE_FD allocation does not describe itself: the image is
+		// XrLiftFrameSubmitInfoDXR::extent when given, else the region's
+		// bottom-right corner (XR_DXR_lift §4.5).
+		iw = base_extent.width > 0 ? (uint32_t)base_extent.width : rx + rw;
+		ih = base_extent.height > 0 ? (uint32_t)base_extent.height : ry + rh;
+		w->memory_kind = XRT_CONV_MEM_VK_OPAQUE_FD;
+		out->handle = im->handle;
+	} else {
+		const XrLiftImageDmabufDescDXR *d =
+		    OXR_GET_INPUT_FROM_CHAIN(im, XR_TYPE_LIFT_IMAGE_DMABUF_DESC_DXR, XrLiftImageDmabufDescDXR);
+		const bool bgra = w->format == XR_LIFT_PIXEL_FORMAT_BGRA8_UNORM_DXR ||
+		                  w->format == XR_LIFT_PIXEL_FORMAT_BGRA8_SRGB_DXR;
+		// DRM fourccs name a little-endian word: AB24 / XB24 = R,G,B,A bytes; AR24 / XR24 = B,G,R,A.
+		const uint32_t ab24 = 0x34324241u, xb24 = 0x34324258u, ar24 = 0x34325241u, xr24 = 0x34325258u;
+		const bool fourcc_ok = d != NULL && (bgra ? (d->drmFourcc == ar24 || d->drmFourcc == xr24)
+		                                          : (d->drmFourcc == ab24 || d->drmFourcc == xb24));
+		if (d == NULL || d->fd < 0 || d->planeCount != 1 || d->offsets[0] != 0 || d->width == 0 ||
+		    d->height == 0 || d->strides[0] < d->width * 4u || !fourcc_ok) {
+			return oxr_error(
+			    log, XR_ERROR_VALIDATION_FAILURE,
+			    "XrLiftImageDXR: a DMABUF image needs XrLiftImageDmabufDescDXR with one plane at "
+			    "offset 0, a stride >= width * 4 and a fourcc matching the format (AB24 / XB24 "
+			    "for RGBA8, AR24 / XR24 for BGRA8)");
+		}
+		iw = d->width;
+		ih = d->height;
+		w->memory_kind = XRT_CONV_MEM_DMABUF;
+		w->row_stride = d->strides[0];
+		w->drm_modifier = d->drmModifier;
+		out->handle = (void *)(intptr_t)d->fd;
+	}
+	if ((uint64_t)rx + rw > iw || (uint64_t)ry + rh > ih) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XrLiftImageDXR::region (%u,%u %ux%u) is not inside the %ux%u image", rx, ry, rw, rh,
+		                 iw, ih);
+	}
+	w->width = iw; // the whole image; the region rides beside it
+	w->height = ih;
+	out->owns_handle = false; // borrowed: the transport sends it, the app keeps it
+	out->v4 = true;
+	return XR_SUCCESS;
+}
+#endif
+
 static XrResult
 lift_frame_images_resolve(struct oxr_logger *log,
                           struct oxr_session *sess,
                           const XrLiftFrameImagesDXR *fi,
+                          XrExtent2Di base_extent,
                           struct lift_input *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -893,6 +1012,14 @@ lift_frame_images_resolve(struct oxr_logger *log,
 		return XR_SUCCESS;
 	}
 
+#ifndef XRT_OS_WINDOWS
+	if (kind == XR_LIFT_IMAGE_KIND_IOSURFACE_DXR || kind == XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR ||
+	    kind == XR_LIFT_IMAGE_KIND_DMABUF_DXR) {
+		return lift_gpu_image_resolve(log, im, kind, base_extent, out);
+	}
+#else
+	(void)base_extent;
+#endif
 	if (im->handle == NULL) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "XrLiftImageDXR::handle is NULL");
 	}
@@ -1178,7 +1305,7 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	const XrLiftFrameImagesDXR *frame_images =
 	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_LIFT_FRAME_IMAGES_DXR, XrLiftFrameImagesDXR);
 	if (frame_images != NULL) {
-		XrResult ir = lift_frame_images_resolve(&log, sess, frame_images, &li);
+		XrResult ir = lift_frame_images_resolve(&log, sess, frame_images, submitInfo->extent, &li);
 		if (ir != XR_SUCCESS) {
 			return ir;
 		}
@@ -1190,7 +1317,10 @@ oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR 
 	const bool discontinuity =
 	    frame_control != NULL && (frame_control->flags & XR_LIFT_FRAME_CONTROL_DISCONTINUITY_BIT_DXR) != 0;
 
-	if (in_texture == NULL) {
+	// (An fd kind's handle is (void *)(intptr_t)fd: fd 0 reads as NULL.)
+	const bool fd_kind =
+	    li.v4 && (li.image.memory_kind == XRT_CONV_MEM_VK_OPAQUE_FD || li.image.memory_kind == XRT_CONV_MEM_DMABUF);
+	if (in_texture == NULL && !fd_kind) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "XrLiftFrameSubmitInfoDXR::inputTexture is NULL");
 	}
 	// Every return below this point goes through the submit (which closes a
@@ -1432,7 +1562,11 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_DEPTH_INFO_DXR, XrLiftDepthInfoDXR);
 	XrLiftViewsInfoDXR *views_info =
 	    OXR_GET_OUTPUT_FROM_CHAIN(result, XR_TYPE_LIFT_VIEWS_INFO_DXR, XrLiftViewsInfoDXR);
-	const bool want_v4 = depth_info != NULL || views_info != NULL || st->export_cpu;
+	bool export_gpu = false;
+#ifndef XRT_OS_WINDOWS
+	export_gpu = st->export_gpu_kind != 0;
+#endif
+	const bool want_v4 = depth_info != NULL || views_info != NULL || st->export_cpu || export_gpu;
 
 	bool ready = false;
 	struct xrt_lift_result r;
@@ -1507,8 +1641,42 @@ oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result)
 		st->exported = true;
 	}
 
+#ifndef XRT_OS_WINDOWS
+	if (export_gpu) {
+		// Step E: the result in a per-stream IOSurface / OPAQUE_FD image the
+		// service copied it into on its GPU before this call returned
+		// (CPU_COMPLETE). The handle arrives under the §5.1 rule (first
+		// acquire, reallocation) and is the caller's: CFRelease the IOSurface
+		// / close the fd once imported.
+		if (r.output_realloc || !st->exported) {
+			bool have_tex = false;
+			xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+			xret = ipc_client_lift_get_output(route.c, st->id, &have_tex, NULL, NULL, NULL, &th);
+			if (xret != XRT_SUCCESS) {
+				lift_route_close(sess, &route, xret);
+				return lift_xret(&log, sess, &route, xret, "xrAcquireLiftResultDXR (GPU export)");
+			}
+			const bool got = have_tex && th != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+			if (got) {
+				result->outputTexture = (void *)(intptr_t)th;
+			}
+			st->exported = got; // a miss retries on the next acquire (#1427)
+		}
+		result->fence = NULL;
+		const int64_t dxgi = result->format;
+		result->format = 0; // XrLiftResultExportDXR is authoritative
+		if (export_info != NULL) {
+			export_info->kind = (XrLiftImageKindDXR)st->export_gpu_kind;
+			export_info->format = oxr_conv_pixel_format_from_dxgi(dxgi);
+			export_info->colorSpace = st->mode == XRT_DP_LIFT_MODE_DEPTH ? XR_LIFT_COLOR_SPACE_UNKNOWN_DXR
+			                                                             : XR_LIFT_COLOR_SPACE_SRGB_DXR;
+			export_info->syncKind = XR_LIFT_SYNC_KIND_CPU_COMPLETE_DXR;
+		}
+	}
+#endif
+
 	// Handles: first acquire and every reallocation (the weave output pattern).
-	if (!st->export_cpu && (r.output_realloc || !st->exported)) {
+	if (!st->export_cpu && !export_gpu && (r.output_realloc || !st->exported)) {
 		bool have_tex = false, have_fence = false;
 		xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 		xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
