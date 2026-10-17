@@ -101,6 +101,7 @@ target_link_libraries(cube_handle_vk_macos PRIVATE
     "-framework CoreGraphics"
     "-framework CoreText"
     "-framework CoreFoundation"
+    "-framework IOSurface"
 )
 
 # Copy texture files to build output directory

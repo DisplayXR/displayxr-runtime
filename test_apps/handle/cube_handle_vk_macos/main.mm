@@ -3041,6 +3041,18 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr,
             extensionStorage.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
         }
     }
+    // --lift-gpu: the IOSurface import / export extensions (ADR-053 P5 step E).
+    if (g_liftProbe.gpu) {
+        uint32_t n = 0;
+        const char *const *names = dxr_test::LiftCpuProbe::GpuDeviceExtensions(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            const bool have = std::find(extensionStorage.begin(), extensionStorage.end(), names[i]) !=
+                              extensionStorage.end();
+            if (!have && isAvailable(names[i])) {
+                extensionStorage.push_back(names[i]);
+            }
+        }
+    }
 
     // Phase 2: Build deviceExtensions pointers from final extensionStorage
     // (safe now since extensionStorage won't be modified again)
@@ -4042,6 +4054,7 @@ static void PollForwardedInput(AppXrSession& xr) {
 
 int main(int argc, char** argv) {
     g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
+    g_liftProbe.gpu = g_liftProbe.enabled && dxr_test::LiftCpuProbe::RequestedGpu(argc, argv);
     // Ensure logs appear immediately even when piped
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -4138,6 +4151,8 @@ int main(int argc, char** argv) {
         CleanupOpenXR(xr);
         return 1;
     }
+
+    g_liftProbe.SetVulkan(physDevice, vkDevice, graphicsQueue, queueFamilyIndex);
 
     // Step 4: Create OpenXR session WITH the external window binding
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
