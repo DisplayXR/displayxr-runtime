@@ -1431,6 +1431,18 @@ if(TARGET tests_conv_vk_gpu)
 	set_target_properties(tests_conv_vk_gpu PROPERTIES CXX_STANDARD 17)
 	if(APPLE)
 		target_link_libraries(tests_conv_vk_gpu PRIVATE "-framework CoreFoundation" "-framework IOSurface")
+		if(XRT_HAVE_METAL)
+			# The macOS Metal weave backend's lifted-rect recorder, on a
+			# headless Metal device (SKIPs without one).
+			target_sources(
+				tests_conv_vk_gpu
+				PRIVATE conv_metal_weave_rig.m
+					${PROJECT_SOURCE_DIR}/src/xrt/compositor/multi/comp_multi_weave_metal_lift.m
+				)
+			target_include_directories(tests_conv_vk_gpu PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+			target_compile_definitions(tests_conv_vk_gpu PRIVATE CONV_TEST_HAVE_METAL_WEAVE)
+			target_link_libraries(tests_conv_vk_gpu PRIVATE "-framework Metal" "-framework Foundation")
+		endif()
 	endif()
 endif()
 if(TARGET tests_conv_gpu_dedupe)
