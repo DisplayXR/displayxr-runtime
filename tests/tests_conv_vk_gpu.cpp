@@ -678,6 +678,24 @@ TEST_CASE("vk glue: S5 on CPU colour + CPU depth, into a GPU target and into a C
 	REQUIRE(x.ops.alloc(x.ops.ud, &r, &t));
 	conv_viewsyn_request q = sc.request(&t, XRT_CONV_VIEWS_ROW);
 	REQUIRE(x.vs.render(x.vs.ud, &q));
+	// macOS (step E): the render was handed over asynchronously, on the glue's
+	// MTLSharedEvent; the read below retires it first (same bytes either way).
+	{
+		vk_conv_gpu_caps caps{};
+		vk_conv_gpu_get_caps(x.g, &caps);
+		vk_conv_gpu_image_ref ref{};
+		REQUIRE(vk_conv_gpu_lookup(x.g, &t, &ref));
+		vk_conv_gpu_stats st{};
+		vk_conv_gpu_get_stats(x.g, &st);
+		if (caps.async_s5) {
+			CHECK(ref.mtl_shared_event != nullptr);
+			CHECK(ref.event_value == 1u);
+			CHECK(st.async_s5 == 1u);
+		} else {
+			CHECK(ref.mtl_shared_event == nullptr);
+			CHECK(st.async_s5 == 0u);
+		}
+	}
 	std::vector<uint8_t> gpu((size_t)2 * W * H * 4);
 	REQUIRE(vk_conv_gpu_read(x.g, &t, gpu.data(), 0));
 	CHECK(vk_conv_gpu_viewsyn_prepass_count(x.g) == 1u);
@@ -2291,6 +2309,17 @@ TEST_CASE("vk_conv_weave: a stream destroyed with a weave in flight keeps its im
 	}
 	REQUIRE(woven);
 	// The frame that wove it is "in flight" as far as the helper knows: no complete yet.
+	// Let the conversion of the snapshot this frame committed land first, so
+	// the count below is not raced by a ring target it allocates (with the
+	// asynchronous S5 hand-over on macOS the conversions run back to back).
+	conv_stream_stats ss{};
+	(void)wait_until(
+	    [&] {
+		    return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS &&
+		           ss.converted + ss.dropped + ss.failed >= ss.submitted;
+	    },
+	    3000);
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	const uint32_t images = vk_conv_gpu_image_count(rig.x.g);
 	REQUIRE(images > 0u);
 
@@ -2530,6 +2559,14 @@ TEST_CASE("Metal weave backend: a lifted batch rect -- flat, capped snapshot, th
 	CHECK((seen.result_format == XRT_CONV_FMT_RGBA8_UNORM || seen.result_format == XRT_CONV_FMT_RGBA8_SRGB ||
 	       seen.result_format == XRT_CONV_FMT_BGRA8_UNORM || seen.result_format == XRT_CONV_FMT_BGRA8_SRGB));
 	CHECK(IOSurfaceGetPixelFormat((IOSurfaceRef)seen.result_iosurface) == 0u); // why the plan carries the format
+	{
+		// Step E: the composed views were handed over on the glue's shared
+		// event; the Metal pass GPU-waited on it (no host stall before publish).
+		vk_conv_gpu_caps caps{};
+		vk_conv_gpu_get_caps(rig.x.g, &caps);
+		CHECK((seen.result_event != nullptr) == caps.async_s5);
+		CHECK((seen.result_event_value > 0) == caps.async_s5);
+	}
 	REQUIRE(vk_conv_weave_client_stats(hp.c, wire, &st));
 	CHECK(st.woven_result);
 	CHECK(st.result_views == 2u);

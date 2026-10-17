@@ -1318,6 +1318,9 @@ vk_conv_weave_host_plan(struct vk_conv_weave *w,
 		} else if (active_area(&rc, &res, &ax0, &ay0, &ax1, &ay1)) {
 			out->result = true;
 			out->result_iosurface = (void *)(uintptr_t)v->handle;
+			// Step E: an async S5 result completes on the glue's shared event.
+			out->result_event = ref.mtl_shared_event;
+			out->result_event_value = ref.event_value;
 			out->result_format = v->format;
 			out->result_w = ref.width;
 			out->result_h = ref.height;

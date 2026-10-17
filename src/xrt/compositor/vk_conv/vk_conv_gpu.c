@@ -72,6 +72,9 @@ struct vkc_img
 	uint64_t drm_modifier;
 	uint32_t row_stride; //!< DMABUF plane 0 stride
 	bool foreign;        //!< DMABUF: owned by VK_QUEUE_FAMILY_FOREIGN_EXT between glue accesses
+	//! macOS: the S5 timeline value whose signal completes the last S5 write
+	//! of this image (0 = never written by an async S5; tab_mtx).
+	uint64_t event_value;
 };
 
 //! Per-stream glue state: scratch for CPU images the S5 stage reads / writes, and S6.
@@ -103,6 +106,17 @@ struct vkc_sem
 	struct vkc_sem *next;
 	uint64_t key;
 	VkSemaphore sem;
+};
+
+//! Waits a submit carries (imported sync of the images it reads).
+#define VKC_MAX_WAITS 4u
+struct vkc_waits
+{
+	uint32_t count;
+	VkSemaphore sem[VKC_MAX_WAITS];
+	uint64_t value[VKC_MAX_WAITS];
+	bool timeline[VKC_MAX_WAITS];
+	bool temp[VKC_MAX_WAITS]; //!< destroy after the submit (SYNC_FD imports)
 };
 
 struct vk_conv_gpu
@@ -141,18 +155,30 @@ struct vk_conv_gpu
 	struct vkc_img *x_raw, *x_cpu;
 	//! Copies made, by direction (work_mtx).
 	struct vk_conv_gpu_stats stats;
+
+	/*!
+	 * @name The asynchronous S5 hand-over (macOS, step E)
+	 *
+	 * With a timeline semaphore MoltenVK exports as an MTLSharedEvent, an S5
+	 * render into a glue image returns once SUBMITTED: it signals @ref s5_sem
+	 * to the image's event_value, and the result is published without a host
+	 * wait. A Metal reader (the Metal weave backend) waits on the event on its
+	 * GPU (vk_conv_gpu_image_ref::mtl_shared_event); every Vulkan reader is on
+	 * the same queue, later in submission order. At most one such submit is
+	 * in flight: the next glue call retires it (work_lock) before it touches
+	 * the stage, the descriptor sets or an image.
+	 * @{
+	 */
+	VkSemaphore s5_sem;
+	void *s5_event; //!< id<MTLSharedEvent>, owned by s5_sem
+	uint64_t s5_value;
+	VkFence async_fence;
+	VkCommandBuffer async_cmd;
+	struct vkc_waits async_waits;
+	bool async_pending;
+	//! @}
 };
 
-//! Waits a submit carries (imported sync of the images it reads).
-#define VKC_MAX_WAITS 4u
-struct vkc_waits
-{
-	uint32_t count;
-	VkSemaphore sem[VKC_MAX_WAITS];
-	uint64_t value[VKC_MAX_WAITS];
-	bool timeline[VKC_MAX_WAITS];
-	bool temp[VKC_MAX_WAITS]; //!< destroy after the submit (SYNC_FD imports)
-};
 
 
 /*
@@ -375,6 +401,32 @@ cmd_submit_wait(struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_waits *wa
 		waits_release(g, waits);
 	}
 	return ok;
+}
+
+//! Retire the asynchronous S5 submit, if any (work_mtx held): wait, free.
+static void
+async_retire_locked(struct vk_conv_gpu *g)
+{
+	if (!g->async_pending) {
+		return;
+	}
+	struct vk_bundle *vk = g->vk;
+	if (vk->vkWaitForFences(vk->device, 1, &g->async_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+		U_LOG_E("[conv] Vulkan glue: async S5 fence wait failed; leaking one command buffer");
+	} else {
+		cmd_free(g, g->async_cmd);
+		waits_release(g, &g->async_waits);
+	}
+	g->async_cmd = VK_NULL_HANDLE;
+	g->async_pending = false;
+}
+
+//! Take the work mutex with nothing asynchronous in flight.
+static void
+work_lock(struct vk_conv_gpu *g)
+{
+	os_mutex_lock(&g->work_mtx);
+	async_retire_locked(g);
 }
 
 //! Order this submit after every earlier queue operation on the glue's images.
@@ -958,7 +1010,7 @@ glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image
 	    !pick_kind(g, req, layers, &kind, &private_ok) || !gate_enter(g)) {
 		return false;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = kind != 0 ? img_create(g, req->format, req->width, req->height, layers, kind) : NULL;
 	if (img == NULL && private_ok) {
 		img = img_create(g, req->format, req->width, req->height, layers, 0);
@@ -982,7 +1034,7 @@ glue_free(void *ud, struct xrt_conv_image *img)
 	if (!is_glue_image(img) || !gate_enter(g)) {
 		return;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	os_mutex_lock(&g->tab_mtx);
 	struct vkc_img **pp = &g->imgs;
 	while (*pp != NULL && (*pp)->key != img->import_key) {
@@ -1139,7 +1191,7 @@ vk_conv_gpu_write(struct vk_conv_gpu *g, const struct xrt_conv_image *dst, const
 		return false;
 	}
 	bool ok = false;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, dst->import_key);
 	if (img != NULL) {
 		ok = write_locked(g, img, pixels, row_pitch);
@@ -1156,7 +1208,7 @@ vk_conv_gpu_read(struct vk_conv_gpu *g, const struct xrt_conv_image *src, void *
 		return false;
 	}
 	bool ok = false;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, src->import_key);
 	if (img != NULL) {
 		ok = read_locked(g, img, pixels, row_pitch);
@@ -1267,6 +1319,82 @@ scratch_ensure(struct vk_conv_gpu *g, struct vkc_img **slot, uint32_t conv_fmt, 
 	return s;
 }
 
+/*!
+ * Submit @p cmd signalling the S5 timeline to a new value and the async fence,
+ * without waiting (work_mtx held, nothing pending). @p target's event_value
+ * names that value. False = not submitted (the caller submits it the
+ * synchronous way); @p waits is moved into the async slot on success.
+ */
+static bool
+async_submit_locked(
+    struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_waits *waits, struct vkc_img *target, bool *out_ok)
+{
+	*out_ok = false;
+#ifdef VK_KHR_timeline_semaphore
+	struct vk_bundle *vk = g->vk;
+	if (vk->vkResetFences(vk->device, 1, &g->async_fence) != VK_SUCCESS) {
+		return false; // not consumed: the caller submits it the synchronous way
+	}
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		cmd_free(g, cmd);
+		waits_release(g, waits);
+		return true; // consumed, failed
+	}
+	const uint64_t value = g->s5_value + 1;
+	VkPipelineStageFlags stages[VKC_MAX_WAITS];
+	uint64_t wait_values[VKC_MAX_WAITS];
+	for (uint32_t i = 0; i < waits->count; i++) {
+		stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		wait_values[i] = waits->timeline[i] ? waits->value[i] : 0;
+	}
+	VkTimelineSemaphoreSubmitInfoKHR tl = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+	    .waitSemaphoreValueCount = waits->count,
+	    .pWaitSemaphoreValues = waits->count > 0 ? wait_values : NULL,
+	    .signalSemaphoreValueCount = 1,
+	    .pSignalSemaphoreValues = &value,
+	};
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .pNext = &tl,
+	    .waitSemaphoreCount = waits->count,
+	    .pWaitSemaphores = waits->count > 0 ? waits->sem : NULL,
+	    .pWaitDstStageMask = waits->count > 0 ? stages : NULL,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &g->s5_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	const VkResult r = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, g->async_fence);
+	vk_queue_unlock(vk->main_queue);
+	if (r != VK_SUCCESS) {
+		// Ended but never submitted: free it here, the waits go too.
+		cmd_free(g, cmd);
+		waits_release(g, waits);
+		U_LOG_E("[conv] Vulkan glue: async S5 submit failed (%d)", (int)r);
+		return true; // consumed, failed
+	}
+	g->s5_value = value;
+	g->async_cmd = cmd;
+	g->async_waits = *waits;
+	waits->count = 0;
+	g->async_pending = true;
+	g->stats.async_s5++;
+	os_mutex_lock(&g->tab_mtx);
+	target->event_value = value;
+	os_mutex_unlock(&g->tab_mtx);
+	*out_ok = true;
+	return true;
+#else
+	(void)g;
+	(void)cmd;
+	(void)waits;
+	(void)target;
+	return false;
+#endif
+}
+
 static bool
 glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 {
@@ -1275,7 +1403,7 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		return false;
 	}
 	struct vk_bundle *vk = g->vk;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	if (g->viewsyn == NULL && !g->viewsyn_tried) {
 		g->viewsyn_tried = true;
 		g->viewsyn = vk_conv_viewsyn_create(vk);
@@ -1389,7 +1517,18 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		img_release_foreign(g, cmd, d);
 		img_release_foreign(g, cmd, t);
 	}
-	if (cmd != VK_NULL_HANDLE) {
+	// macOS (step E): a recorded synthesis into a glue image is handed over
+	// asynchronously -- signalled on the shared event, retired by the next
+	// glue call -- so publishing it costs no host wait.
+	bool async_ok = false;
+	if (cmd != VK_NULL_HANDLE && ok && recorded && g->s5_sem != VK_NULL_HANDLE && !is_cpu_image(req->target) &&
+	    async_submit_locked(g, cmd, &waits, t, &async_ok)) {
+		cmd = VK_NULL_HANDLE; // consumed (owned by the async slot, or freed on failure)
+		ok = async_ok;
+		if (!async_ok) {
+			vk_conv_viewsyn_invalidate(g->viewsyn);
+		}
+	} else if (cmd != VK_NULL_HANDLE) {
 		// Submit even a failed recording: its uploads / barriers are harmless,
 		// and the command buffer must go back to the pool.
 		const bool submitted = cmd_submit_wait(g, cmd, &waits);
@@ -1437,7 +1576,7 @@ glue_rb_read(void *ud,
 		return false;
 	}
 	struct vk_bundle *vk = g->vk;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, depth->import_key);
 	struct vkc_stream *s = NULL;
 	if (img != NULL) {
@@ -2136,7 +2275,7 @@ vk_conv_gpu_import_copy(struct vk_conv_gpu *g,
 	if (g == NULL || src == NULL || dst == NULL || w == 0 || h == 0 || !gate_enter(g)) {
 		return false;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_ext e;
 	bool ok = ext_import(g, src, &e);
 	// The wire is not trusted: the region lies inside the image.
@@ -2203,7 +2342,7 @@ vk_conv_gpu_copy_from_vk(struct vk_conv_gpu *g,
 	if (g == NULL || src == VK_NULL_HANDLE || dst == NULL || w == 0 || h == 0 || !gate_enter(g)) {
 		return false;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	bool ok = cmd_begin(g, &cmd);
 	if (ok) {
@@ -2289,7 +2428,7 @@ vk_conv_gpu_export_alloc(struct vk_conv_gpu *g,
 	    w == 0 || h == 0 || !gate_enter(g)) {
 		return false;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = NULL;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
 	if (kind == XRT_CONV_MEM_IOSURFACE) {
@@ -2333,7 +2472,7 @@ vk_conv_gpu_copy(struct vk_conv_gpu *g, const struct xrt_conv_image *src, const 
 		return false;
 	}
 	bool ok = false;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *d = img_find(g, dst->import_key);
 	if (d != NULL && is_cpu_image(src)) {
 		ok = src->width == d->w && src->height == d->h &&
@@ -2459,6 +2598,56 @@ probe_caps(struct vk_conv_gpu *g)
 #endif
 }
 
+/*!
+ * macOS: the S5 timeline exported as an MTLSharedEvent (VK_EXT_metal_objects,
+ * MoltenVK). Without it (no timeline semaphores, no export, or
+ * DXR_CONV_VK_ASYNC_S5=0) S5 stays synchronous, as on Linux.
+ */
+static void
+async_s5_init(struct vk_conv_gpu *g)
+{
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects) && defined(VK_KHR_timeline_semaphore)
+	struct vk_bundle *vk = g->vk;
+	const char *env = getenv("DXR_CONV_VK_ASYNC_S5");
+	if ((env != NULL && env[0] == '0') || !vk->has_EXT_metal_objects || !vk->features.timeline_semaphore ||
+	    vk->vkExportMetalObjectsEXT == NULL) {
+		return;
+	}
+	VkExportMetalObjectCreateInfoEXT export_ev = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT,
+	};
+	VkSemaphoreTypeCreateInfoKHR type = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR,
+	    .pNext = &export_ev,
+	    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR,
+	    .initialValue = 0,
+	};
+	VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+	VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	if (vk->vkCreateSemaphore(vk->device, &sci, NULL, &g->s5_sem) != VK_SUCCESS) {
+		g->s5_sem = VK_NULL_HANDLE;
+		return;
+	}
+	VkExportMetalSharedEventInfoEXT es = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT,
+	    .semaphore = g->s5_sem,
+	};
+	VkExportMetalObjectsInfoEXT eo = {.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, .pNext = &es};
+	vk->vkExportMetalObjectsEXT(vk->device, &eo);
+	if (es.mtlSharedEvent == NULL || vk->vkCreateFence(vk->device, &fci, NULL, &g->async_fence) != VK_SUCCESS) {
+		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
+		g->s5_sem = VK_NULL_HANDLE;
+		g->async_fence = VK_NULL_HANDLE;
+		return;
+	}
+	g->s5_event = (void *)es.mtlSharedEvent;
+	g->caps.async_s5 = true;
+#else
+	(void)g;
+#endif
+}
+
 bool
 vk_conv_gpu_create(struct vk_bundle *vk, struct vk_conv_gpu **out)
 {
@@ -2491,6 +2680,7 @@ vk_conv_gpu_create(struct vk_bundle *vk, struct vk_conv_gpu **out)
 		return false;
 	}
 	probe_caps(g);
+	async_s5_init(g);
 	*out = g;
 	return true;
 }
@@ -2510,7 +2700,7 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 	}
 	os_mutex_unlock(&g->gate_mtx);
 
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	while (g->streams != NULL) {
 		struct vkc_stream *s = g->streams;
 		g->streams = s->next;
@@ -2529,6 +2719,12 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 	}
 	img_destroy(g, g->x_raw);
 	img_destroy(g, g->x_cpu);
+	if (g->s5_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
+	}
+	if (g->async_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, g->async_fence, NULL);
+	}
 	vk_conv_viewsyn_destroy(&g->viewsyn);
 	buffer_free(vk, &g->stage_buf, &g->stage_mem, &g->stage_map);
 	vk->vkDestroyFence(vk->device, g->fence, NULL);
@@ -2558,6 +2754,13 @@ vk_conv_gpu_lookup(struct vk_conv_gpu *g, const struct xrt_conv_image *x, struct
 		out->height = img->h;
 		out->layers = img->layers;
 		out->foreign = img->foreign;
+		os_mutex_lock(&g->tab_mtx);
+		const uint64_t ev = img->event_value;
+		os_mutex_unlock(&g->tab_mtx);
+		if (ev != 0 && g->s5_event != NULL) {
+			out->mtl_shared_event = g->s5_event;
+			out->event_value = ev;
+		}
 	}
 	gate_leave(g);
 	return img != NULL;

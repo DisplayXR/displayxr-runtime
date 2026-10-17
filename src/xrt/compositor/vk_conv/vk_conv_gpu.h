@@ -96,6 +96,14 @@ struct vk_conv_gpu_caps
 	uint32_t sync_kinds;
 	//! Timeline semaphores are enabled on the bundle.
 	bool timeline_semaphore;
+	/*!
+	 * macOS: S5 renders into glue images are handed over asynchronously,
+	 * signalled on an MTLSharedEvent (vk_conv_gpu_image_ref::mtl_shared_event)
+	 * instead of a host fence wait before publish. Vulkan readers on this
+	 * bundle's main queue need nothing (submission order); another API waits
+	 * on the event. DXR_CONV_VK_ASYNC_S5=0 turns it off.
+	 */
+	bool async_s5;
 };
 
 /*!
@@ -163,6 +171,14 @@ struct vk_conv_gpu_image_ref
 	VkFormat format; //!< the creation format (an _SRGB one is copied, not blitted, to stay encoded)
 	uint32_t width, height, layers;
 	bool foreign;
+	/*!
+	 * macOS, caps.async_s5: the image's last S5 write completes when this
+	 * id<MTLSharedEvent> (the glue's; valid while the glue lives) reaches
+	 * @ref event_value. NULL = already complete when published (SYNC_NONE).
+	 * A Vulkan reader on the glue's queue ignores it (submission order).
+	 */
+	void *mtl_shared_event;
+	uint64_t event_value;
 };
 
 /*!
