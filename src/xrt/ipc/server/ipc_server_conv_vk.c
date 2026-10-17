@@ -180,10 +180,12 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	struct vk_conv_gpu_caps caps;
 	vk_conv_gpu_get_caps(g_conv_vk.glue, &caps);
 	U_LOG_W(
-	    "[conv] Vulkan glue attached: memory kinds 0x%x (CPU%s%s%s), sync kinds 0x%x; providers on the CPU lane",
+	    "[conv] Vulkan glue attached: memory kinds 0x%x (CPU%s%s%s), sync kinds 0x%x; providers on the CPU lane; "
+	    "S5 hand-over: %s",
 	    caps.memory_kinds, (caps.memory_kinds & XRT_CONV_MEM_VK_OPAQUE_FD) != 0 ? " OPAQUE_FD" : "",
 	    (caps.memory_kinds & XRT_CONV_MEM_DMABUF) != 0 ? " DMABUF" : "",
-	    (caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? " IOSURFACE" : "", caps.sync_kinds);
+	    (caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? " IOSURFACE" : "", caps.sync_kinds,
+	    caps.async_s5 ? "MTLSharedEvent (GPU wait, no host wait before publish)" : "host wait before publish");
 
 	// The copies first: by the time GPU results can exist, the CPU table can export them.
 	struct ipc_server_conv_cpu_gpu copies;

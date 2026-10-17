@@ -2822,7 +2822,6 @@ async_s5_init(struct vk_conv_gpu *g)
 	g->s5_event = (void *)es.mtlSharedEvent;
 	g->s5_value = 1;
 	g->caps.async_s5 = true;
-	U_LOG_I("[conv] Vulkan glue: S5 results hand over on an MTLSharedEvent (no host wait before publish)");
 #else
 	(void)g;
 #endif
