@@ -444,6 +444,7 @@ pins_release(struct vk_conv_weave_client *c, const struct vk_conv_weave_bridge *
  */
 static void
 frame_fill(struct vkcw_stream *st,
+           const struct vk_conv_weave_bridge *br,
            const struct vk_conv_weave_rect *r,
            uint32_t cx,
            uint32_t cy,
@@ -500,11 +501,17 @@ frame_fill(struct vkcw_stream *st,
 		fr->rig.m2v = b->rig.m2v;
 		u_lift_rig_sanitize(&fr->rig);
 	}
-	if (r->frame.valid) {
+	// No window metrics (no bound geometry): the rect's own aspect fitted in
+	// the panel, as a windowless spec-4 submit gets.
+	struct xrt_lift_rect_frame rf = r->frame;
+	if (!rf.valid && br->fit_rect != NULL) {
+		(void)br->fit_rect(&r->frame, r->w, r->h, &rf);
+	}
+	if (rf.valid) {
 		fr->rect_valid = true;
-		memcpy(fr->rect_center, r->frame.center, sizeof(fr->rect_center));
-		fr->rect_w_m = r->frame.width_m;
-		fr->rect_h_m = r->frame.height_m;
+		memcpy(fr->rect_center, rf.center, sizeof(fr->rect_center));
+		fr->rect_w_m = rf.width_m;
+		fr->rect_h_m = rf.height_m;
 	}
 	if (r->frame.eyes_dp_key != 0) {
 		fr->eyes_dp_set = true; // the DP that owns the woven rect (roadmap §5.2)
@@ -532,6 +539,7 @@ frame_fill(struct vkcw_stream *st,
  */
 static void
 record_snapshot(struct vk_conv_weave *w,
+                const struct vk_conv_weave_bridge *br,
                 struct vkcw_stream *st,
                 VkCommandBuffer cmd,
                 const struct vk_conv_weave_rect *r)
@@ -604,7 +612,7 @@ record_snapshot(struct vk_conv_weave *w,
 		st->snap_h = dh;
 		st->act_w = cw;
 		st->act_h = ch;
-		frame_fill(st, r, cx, cy, cw, ch, dw, capped);
+		frame_fill(st, br, r, cx, cy, cw, ch, dw, capped);
 	}
 
 	// The letterbox profile of the WHOLE rect (bars included): its sampled
@@ -947,7 +955,7 @@ vk_conv_weave_record(struct vk_conv_weave *w,
 		if (b.match_weave != NULL) {
 			b.match_weave(b.ud, rc.owner, wire, rc.views); // spec 4 viewCount 0 = match the weave
 		}
-		record_snapshot(w, st, cmd, &rc);
+		record_snapshot(w, &b, st, cmd, &rc);
 		st->used_this_frame = true;
 		// The snapshot's (and the letterbox copy's) reads finish before the
 		// result overwrites the tiles (v6: the same crop image).

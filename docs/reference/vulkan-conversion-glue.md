@@ -190,6 +190,24 @@ pending snapshots while the core's streams still exist. The glue teardown follow
 
 A submit without lifted rects records exactly what it recorded before.
 
+**Differences from the Windows path.**
+
+- **Draw order.** Lifted rects are drawn after the engine's squeezed rects, not in rect order.
+  This only shows where a lifted rect overlaps another rect.
+- **Rects without window metrics.** With no bound window geometry, the rect frame is the panel
+  (`valid = false`). The bridge's `fit_rect` (`ipc_server_conv_submit_rect`, the windowless
+  spec-4 rule) turns it into the rect's own aspect fitted in the panel. Without that, a composed
+  conversion (a depth-only provider plus S5) fails every frame.
+
+**Destroy while a weave is in flight.** On Linux stage B, the weave completes at the next submit.
+If the client destroys the stream in between, the stream is only marked dead. The helper still
+pins the result the in-flight weave reads, and the core's reaper skips a pinned stream (`dead &&
+!pinned`). So the stream's images, which belong to the glue, outlive the weave.
+`vk_conv_weave_complete` runs only after the fence. It drops the snapshot of the gone stream
+(`failed: resolve`) and the pins, and only then are the images released. `tests_conv_vk_gpu`
+destroys a stream with a weave in flight and checks that the glue's image count holds until
+complete, then drops to 0. The test is also clean under ASan.
+
 ### Service log lines (greppable)
 
 INFO lines, at most once per stream per change (never per frame). They need the service's log

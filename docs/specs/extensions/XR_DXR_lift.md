@@ -825,9 +825,11 @@ What the service does, inside the same `xrWeaveSubmitDXR`:
 2. **Weave the latest result at the CURRENT rect.** The stream's newest result (from an earlier
    frame) is stretched into the rect's current position — into its **active** part when the
    letterbox crop was in effect for that result; the bars (subtitles included) are then the 2D
-   frame, written identically into both views AFTER the result and a few pixels into the active
-   area (covering the profile's one-bucket edge slack and the module's edge seam) (v3), i.e.
-   flat on the screen plane, or left as
+   frame, written identically into both views, tiling the rect around the active area with no
+   overlap (the profile has one bucket per row, so the active area holds no bar rows; the
+   shipped behaviour is `lift_weave_rect_batch` in `comp_d3d11_service.cpp`, "The bars: the 2D
+   input, FLAT, tiling the rect exactly around the active area", measured by `k_lb_ps` in
+   `d3d11_conv_gpu.cpp`) (v3), i.e. flat on the screen plane, or left as
    the caller drew them (v6): the middle stereo pair into the SBS scratch's left/right tiles
    (v3), or view *v* of the result into tile *v* (v6; equal view counts map 1:1, otherwise
    proportionally). Then the ordinary single weave of the whole window runs.
@@ -846,6 +848,9 @@ copy, never the caller's texture).
 | macOS, Vulkan weave backend (`DXR_WEAVE_MAC_BACKEND=vk`, or `auto` with a plug-in that exports a Vulkan DP) | yes. The snapshot reaches a CPU-lane provider through host memory; same policy as Windows |
 | macOS, Metal weave backend | not yet: `lift_weave_rects` is refused and the rect is woven as drawn |
 | desktop Linux (the Vulkan weave engine) | yes (same code as macOS Vulkan; not yet run on hardware) |
+
+No cursor is drawn on the POSIX weave engines yet: the lift cursor mask is 0 (not drawn), and the
+app falls back to the OS cursor (`XR_DXR_cursor_depth` §2.7).
 
 On macOS and Linux a spec-3 SBS or NVIEW stream (`xrCreateLiftStreamDXR`) is available for lifted
 weave rects only. Its own `xrSubmitLiftFrameDXR` input and its result export are D3D11 textures,

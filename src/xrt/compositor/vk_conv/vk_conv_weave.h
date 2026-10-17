@@ -82,6 +82,15 @@ struct vk_conv_weave_bridge
 	bool (*resolve)(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode);
 	//! Spec 4 viewCount 0: the weave's view count for a lifted rect's stream (may be NULL).
 	void (*match_weave)(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views);
+	/*!
+	 * A rect frame without window metrics (valid = false, the panel's size) ->
+	 * the rect's own aspect fitted in the panel (ipc_server_conv_submit_rect,
+	 * the windowless spec-4 rule). May be NULL: the frame stays unknown.
+	 */
+	bool (*fit_rect)(const struct xrt_lift_rect_frame *frame,
+	                 uint32_t extent_w,
+	                 uint32_t extent_h,
+	                 struct xrt_lift_rect_frame *out);
 	void *ud;
 };
 
