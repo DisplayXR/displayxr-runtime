@@ -463,3 +463,68 @@ TEST_CASE("conv_select: policy resolution (HKCU over HKLM; Policy\\Lock pins HKL
 		CHECK(pick(rows, req(DEPTH), pref).row == 0);
 	}
 }
+
+TEST_CASE("conv_select: the per-create hint reorders non-terminal rows only (lift spec 5)")
+{
+	std::vector<conv_select_row> rows = {row("vendor", 50, DEPTH), row("open", 200, DEPTH),
+	                                     row("other", 100, DEPTH, XRT_CONV_STATE_INSTALLED)};
+	auto hinted = [&](const char *preferred, const char *hint, std::vector<uint32_t> *order = nullptr) {
+		conv_select_policy pol{preferred, false, hint};
+		if (order != nullptr) {
+			order->assign(rows.size(), 0xFFFFFFFFu);
+		}
+		auto q = req(DEPTH);
+		return conv_select(rows.data(), (uint32_t)rows.size(), &q, &pol, nullptr,
+		                   order != nullptr ? order->data() : nullptr);
+	};
+
+	SECTION("a hint to a READY non-default row selects it and moves it first")
+	{
+		std::vector<uint32_t> order;
+		auto r = hinted(nullptr, "open", &order);
+		CHECK(r.row == 1);
+		CHECK(r.hint_applied);
+		CHECK_FALSE(r.hint_missed);
+		CHECK(r.reason == CONV_SEL_OK_PREFERRED);
+		CHECK(order[0] == 1u); // then the rest in their own order
+		CHECK(order[1] == 0u);
+		CHECK(order[2] == 2u);
+	}
+	SECTION("a waiting (non-terminal) row is a valid hint target: the create waits")
+	{
+		auto r = hinted(nullptr, "other");
+		CHECK(r.row == 2);
+		CHECK(r.wait);
+		CHECK(r.hint_applied);
+	}
+	SECTION("a hint outranks the policy preference for that one selection")
+	{
+		auto r = hinted("vendor", "open");
+		CHECK(r.row == 1);
+		CHECK(r.hint_applied);
+	}
+	SECTION("a hint to a terminal row falls through to the normal selection")
+	{
+		rows[1].state = XRT_CONV_STATE_FAILED;
+		auto r = hinted(nullptr, "open");
+		CHECK(r.row == 0);
+		CHECK_FALSE(r.hint_applied);
+		CHECK(r.hint_missed);
+		CHECK(r.reason == CONV_SEL_OK_ORDER); // the hint's row is not counted as a fall-through
+		CHECK(r.fallthrough == 0u);
+	}
+	SECTION("an unknown hint changes nothing")
+	{
+		auto r = hinted("open", "nobody");
+		CHECK(r.row == 1); // the policy preference
+		CHECK(r.hint_missed);
+		CHECK(r.reason == CONV_SEL_OK_PREFERRED);
+	}
+	SECTION("a hint never outranks the filter (licence gate)")
+	{
+		rows[1].licence_class = XRT_CONV_LICENCE_RESEARCH_ONLY;
+		auto r = hinted(nullptr, "open");
+		CHECK(r.row == 0);
+		CHECK(r.hint_missed);
+	}
+}

@@ -226,8 +226,8 @@ gate_locked(struct conv_core *core, struct conv_job *j, uint32_t *out_reason)
 	if (g != JOB_GATE_READY) {
 		if (conv_state_is_terminal(state)) {
 			struct conv_binding nb;
-			if (conv_core_select_locked(core, j->task, XRT_CONV_LANE_JOB, j->in.input_kind, 0, NULL, &nb,
-			                            NULL) <= CONV_SEL_OK_FALLTHROUGH &&
+			if (conv_core_select_locked(core, j->task, XRT_CONV_LANE_JOB, j->in.input_kind, 0, NULL,
+			                            j->preferred_provider, &nb, NULL) <= CONV_SEL_OK_FALLTHROUGH &&
 			    (nb.provider != j->bind.provider || nb.cap_id != j->bind.cap_id)) {
 				j->bind = nb;
 				state = conv_core_row_state_locked(core, j->bind.provider, j->bind.cap_id);
@@ -563,8 +563,11 @@ conv_core_job_submit(struct conv_core *core,
 
 	struct conv_binding b;
 	os_mutex_lock(&core->registry_mtx);
+	char hint[sizeof(info->preferred_provider)];
+	memcpy(hint, info->preferred_provider, sizeof(hint));
+	hint[sizeof(hint) - 1] = '\0';
 	const uint32_t sel =
-	    conv_core_select_locked(core, info->task, XRT_CONV_LANE_JOB, info->input_kind, 0, busy, &b, NULL);
+	    conv_core_select_locked(core, info->task, XRT_CONV_LANE_JOB, info->input_kind, 0, busy, hint, &b, NULL);
 	if (sel > CONV_SEL_OK_FALLTHROUGH) {
 		os_mutex_unlock(&core->registry_mtx);
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
@@ -579,6 +582,7 @@ conv_core_job_submit(struct conv_core *core,
 	j->core = core;
 	j->client_id = client_id;
 	j->task = info->task;
+	memcpy(j->preferred_provider, hint, sizeof(j->preferred_provider));
 	j->priority = info->priority != 0 ? info->priority : CONV_JOB_PRIORITY_NORMAL;
 	j->bind = b;
 	j->progress = -1.0f;

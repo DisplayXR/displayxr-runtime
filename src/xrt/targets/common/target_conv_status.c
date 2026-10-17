@@ -14,6 +14,7 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_plugin.h"
 
+#include "conversion/conv_candidates.h"
 #include "conversion/conv_dp_lift_describe.h"
 #include "conversion/conv_registry.h"
 #include "conversion/conv_readiness.h"
@@ -535,30 +536,20 @@ static void
 build_task_rows(const struct conv_registry *reg,
                 const uint32_t *status_index, // registry provider -> status provider index (or NO_PROVIDER)
                 const struct target_conv_policy *policy,
+                uint32_t hint_task, // lift spec 5: the task @p hint applies to (0 = none)
+                const char *hint,   // its per-create preference hint
                 struct target_conv_status *out)
 {
-	struct conv_select_row cand[CONV_REGISTRY_MAX_ROWS * 2];
-	uint32_t cap_row[CONV_REGISTRY_MAX_ROWS * 2];
-	uint32_t verdicts[CONV_REGISTRY_MAX_ROWS * 2];
-	uint32_t order[CONV_REGISTRY_MAX_ROWS * 2];
-	const uint32_t max = CONV_REGISTRY_MAX_ROWS * 2;
+	// The same ranking a create runs and the app-facing candidate list is
+	// derived from (conv_candidates.h, lift spec 5): one code path.
+	struct conv_task_ranking *rk = calloc(1, sizeof(*rk));
+	if (rk == NULL) {
+		return;
+	}
 
 	for (uint32_t task = 1; task < XRT_CONV_TASK_RESERVED_FIRST; task++) {
 		if (!conv_task_is_served(task)) {
 			continue;
-		}
-		const uint32_t n = conv_registry_build_candidates(reg, task, true, cand, cap_row, max);
-		if (n == 0) {
-			continue;
-		}
-		// The registry's own rows carry the readiness; the select rows only copy it.
-		struct conv_select_request req;
-		memset(&req, 0, sizeof(req));
-		req.task = task;
-		// "Could this task be served at all": the smallest multi-view count.
-		// A real create resolves view_count from the weave (spec §3.4).
-		if (task == XRT_CONV_TASK_VIEWS_MONO || task == XRT_CONV_TASK_VIEWS_FROM_DEPTH) {
-			req.view_count = 2;
 		}
 		struct conv_select_policy pol;
 		memset(&pol, 0, sizeof(pol));
@@ -566,10 +557,27 @@ build_task_rows(const struct conv_registry *reg,
 		                    ? policy->preferred[task]
 		                    : NULL;
 		pol.allow_research_only = policy != NULL && policy->allow_research_only;
-		const struct conv_select_result res = conv_select(cand, n, &req, &pol, verdicts, order);
+		pol.hint = task == hint_task ? hint : NULL;
+		// "Could this task be served at all": the smallest multi-view count.
+		// A real create resolves view_count from the weave (spec §3.4).
+		const uint32_t views =
+		    task == XRT_CONV_TASK_VIEWS_MONO || task == XRT_CONV_TASK_VIEWS_FROM_DEPTH ? 2u : 0u;
+		conv_rank_task(reg, task, true, views, &pol, rk);
+		const uint32_t n = rk->count;
+		if (n == 0) {
+			continue;
+		}
+		const struct conv_select_result res = rk->res;
+		if (task == hint_task) {
+			out->hint_applied = res.hint_applied;
+		}
+		const struct conv_select_row *cand = rk->rows;
+		const uint32_t *cap_row = rk->cap_row;
+		const uint32_t *verdicts = rk->verdicts;
+		const uint32_t *order = rk->order;
 
 		// Ordered rows first (selection order), then the dropped ones.
-		uint32_t rank_of[CONV_REGISTRY_MAX_ROWS * 2];
+		uint32_t rank_of[CONV_RANK_MAX_ROWS];
 		for (uint32_t i = 0; i < n; i++) {
 			rank_of[i] = XRT_STATUS_CONV_NOT_ORDERED;
 		}
@@ -586,6 +594,7 @@ build_task_rows(const struct conv_registry *reg,
 					continue;
 				}
 				if (out->task_count >= XRT_STATUS_MAX_CONV_TASKS) {
+					free(rk);
 					return;
 				}
 				const struct conv_select_row *c = &cand[i];
@@ -615,6 +624,7 @@ build_task_rows(const struct conv_registry *reg,
 			}
 		}
 	}
+	free(rk);
 }
 
 static void
@@ -634,6 +644,18 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
                                       const struct xrt_plugin_iface *active_dp,
                                       const struct target_conv_policy *policy,
                                       struct target_conv_status *out)
+{
+	target_conv_status_build_from_entries_hinted(entries, count, active_dp, policy, 0, NULL, out);
+}
+
+void
+target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry *entries,
+                                             int count,
+                                             const struct xrt_plugin_iface *active_dp,
+                                             const struct target_conv_policy *policy,
+                                             uint32_t hint_task,
+                                             const char *hint,
+                                             struct target_conv_status *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (policy != NULL) {
@@ -764,7 +786,7 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
 		status_index[pi] = out->provider_count;
 		fill_provider_row(reg, pi, &extra[pi], policy, &out->providers[out->provider_count++]);
 	}
-	build_task_rows(reg, status_index, policy, out);
+	build_task_rows(reg, status_index, policy, hint_task, hint, out);
 
 	// Tear down: destroy each instance, then unload its binary. Nothing above
 	// keeps a pointer into a provider (every string was copied).
@@ -824,7 +846,7 @@ target_conv_status_from_registry(const struct conv_registry *reg,
 		fill_provider_row(reg, pi, x, policy, &out->providers[out->provider_count++]);
 		out->bad_descriptors += reg->providers[pi].bad_descriptors;
 	}
-	build_task_rows(reg, status_index, policy, out);
+	build_task_rows(reg, status_index, policy, 0, NULL, out);
 	free(extra);
 }
 

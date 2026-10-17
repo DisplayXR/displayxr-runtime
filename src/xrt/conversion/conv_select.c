@@ -259,7 +259,7 @@ conv_select(const struct conv_select_row *rows,
 	memset(&res, 0, sizeof(res));
 	res.row = -1;
 
-	struct conv_select_policy empty_policy = {NULL, false};
+	struct conv_select_policy empty_policy = {NULL, false, NULL};
 	if (policy == NULL) {
 		policy = &empty_policy;
 	}
@@ -314,6 +314,27 @@ conv_select(const struct conv_select_row *rows,
 		}
 	}
 
+	// Rule 3a: the per-create hint moves its first non-terminal row to the
+	// front. A terminal or unknown hint changes nothing: normal selection.
+	if (str_set(policy->hint)) {
+		uint32_t j = n;
+		for (uint32_t i = 0; i < n; i++) {
+			const struct conv_select_row *r = &rows[kept[i]];
+			if (!conv_state_is_terminal(r->state) && conv_select_preference_matches(policy->hint, r)) {
+				j = i;
+				break;
+			}
+		}
+		if (j < n) {
+			const uint32_t v = kept[j];
+			memmove(&kept[1], &kept[0], j * sizeof(uint32_t));
+			kept[0] = v;
+			res.hint_applied = true;
+		} else {
+			res.hint_missed = true;
+		}
+	}
+
 	if (order != NULL) {
 		memcpy(order, kept, n * sizeof(uint32_t));
 	}
@@ -332,7 +353,7 @@ conv_select(const struct conv_select_row *rows,
 		res.wait = r->state != XRT_CONV_STATE_READY;
 		if (res.fallthrough > 0) {
 			res.reason = CONV_SEL_OK_FALLTHROUGH;
-		} else if (conv_select_preference_matches(policy->preferred, r)) {
+		} else if (res.hint_applied || conv_select_preference_matches(policy->preferred, r)) {
 			res.reason = CONV_SEL_OK_PREFERRED;
 		} else {
 			res.reason = CONV_SEL_OK_ORDER;

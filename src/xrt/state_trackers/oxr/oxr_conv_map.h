@@ -74,6 +74,41 @@ oxr_conv_task_is_spec4(XrLiftTaskDXR task)
 	       task == XR_LIFT_TASK_VIEWS_MONO_DXR || task == XR_LIFT_TASK_SPLATS_MONO_DXR;
 }
 
+//! Spec 5: a task whose candidates may be listed (every non-reserved task; listing is read-only).
+static inline bool
+oxr_conv_task_is_listable(XrLiftTaskDXR task)
+{
+	return (int)task >= (int)XR_LIFT_TASK_DEPTH_MONO_DXR && (int)task <= (int)XR_LIFT_TASK_SPLATS_STEREO_DXR;
+}
+
+XRT_CONV_ABI_ASSERT((int)XR_LIFT_PROVIDER_HOSTING_LOCAL_IN_SERVICE_DXR == (int)XRT_CONV_WIRE_HOSTING_LOCAL_IN_SERVICE &&
+                        (int)XR_LIFT_PROVIDER_HOSTING_LOCAL_SATELLITE_DXR ==
+                            (int)XRT_CONV_WIRE_HOSTING_LOCAL_SATELLITE &&
+                        (int)XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR == (int)XRT_CONV_WIRE_HOSTING_REMOTE,
+                    "XrLiftProviderHostingDXR != the wire's hosting values");
+XRT_CONV_ABI_ASSERT(XR_LIFT_PROVIDER_ID_MAX_SIZE_DXR == XRT_CONV_WIRE_PROVIDER_ID_MAX, "provider id size mismatch");
+XRT_CONV_ABI_ASSERT(XR_LIFT_PROVIDER_NAME_MAX_SIZE_DXR == XRT_CONV_WIRE_DISPLAY_NAME_MAX,
+                    "provider name size mismatch");
+
+/*!
+ * One wire candidate -> the app's XrLiftTaskCandidateDXR (spec 5). type / next
+ * are left as the caller set them; the strings are copied verbatim.
+ */
+static inline void
+oxr_conv_candidate_from_wire(const struct xrt_conv_wire_candidate *w, XrLiftTaskCandidateDXR *c)
+{
+	memcpy(c->providerId, w->provider_id, sizeof(c->providerId));
+	c->providerId[sizeof(c->providerId) - 1] = '\0';
+	memcpy(c->displayName, w->display_name, sizeof(c->displayName));
+	c->displayName[sizeof(c->displayName) - 1] = '\0';
+	c->state = (XrLiftTaskStateDXR)w->state;
+	c->failureReason = (XrLiftFailureReasonDXR)w->failure_reason;
+	c->licenceClass = (XrLiftLicenceClassDXR)w->licence_class;
+	c->hosting = (XrLiftProviderHostingDXR)w->hosting;
+	c->isUserDefault = (w->candidate_flags & XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT) != 0 ? XR_TRUE : XR_FALSE;
+	c->isSelected = (w->candidate_flags & XRT_CONV_WIRE_CANDIDATE_SELECTED) != 0 ? XR_TRUE : XR_FALSE;
+}
+
 //! The v3 mode that matches a task (the graceful-degradation mode), or 0.
 static inline bool
 oxr_conv_mode_matches_task(uint32_t mode, XrLiftTaskDXR task)

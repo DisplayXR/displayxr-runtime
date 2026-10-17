@@ -31,6 +31,7 @@
 
 #pragma once
 
+#include "xrt/xrt_conv_wire.h"
 #include "xrt/xrt_conversion_plugin.h"
 
 #include "conv_stage.h"
@@ -86,6 +87,10 @@ struct conv_job_create_info
 	 * unknown, never defaulted). */
 	uint32_t job_flags;           //!< XRT_CONV_JOB_*
 	uint32_t max_input_long_side; //!< px; 0 = the provider's own
+
+	/*! Per-job preference HINT (lift spec 5, #2178), as
+	 *  conv_stream_options::preferred_provider. "" = none. */
+	char preferred_provider[XRT_CONV_WIRE_PREFERENCE_MAX];
 };
 
 struct conv_job_status

@@ -340,7 +340,7 @@ conv_streams_rebind_check(struct conv_core *core)
 			uint32_t ns = 0;
 			const uint32_t r =
 			    conv_core_select_locked(core, st->req.task, XRT_CONV_LANE_STREAM, st->req.input_kind,
-			                            st->pipe.view_count, NULL, &nb, &ns);
+			                            st->pipe.view_count, NULL, st->opts.preferred_provider, &nb, &ns);
 			if (r <= CONV_SEL_OK_FALLTHROUGH &&
 			    (nb.provider != st->bind.provider || nb.cap_id != st->bind.cap_id ||
 			     nb.composed != st->bind.composed)) {
@@ -1366,8 +1366,9 @@ conv_core_stream_create(struct conv_core *core,
 	uint32_t max_streams = 4;
 	os_mutex_lock(&core->registry_mtx);
 	uint32_t state = 0;
+	o.preferred_provider[sizeof(o.preferred_provider) - 1] = '\0';
 	const uint32_t sel = conv_core_select_locked(core, req.task, XRT_CONV_LANE_STREAM, req.input_kind,
-	                                             req.view_count, NULL, &b, &state);
+	                                             req.view_count, NULL, o.preferred_provider, &b, &state);
 	if (sel > CONV_SEL_OK_FALLTHROUGH) {
 		if (sel == CONV_SEL_NONE_ALL_TERMINAL) {
 			// The "create for an unserved task" retry trigger (FAILED > 30 s ago).
@@ -1405,7 +1406,7 @@ conv_core_stream_create(struct conv_core *core,
 				struct conv_binding pb;
 				if ((m & (1ull << task)) != 0 &&
 				    conv_core_select_locked(core, task, 0, 0, conv_task_produces_views(task) ? 2u : 0u,
-				                            NULL, &pb, NULL) <= CONV_SEL_OK_FALLTHROUGH) {
+				                            NULL, NULL, &pb, NULL) <= CONV_SEL_OK_FALLTHROUGH) {
 					conv_core_request_warm_locked(core, pb.provider, pb.cap_id,
 					                              CONV_EV_WARM_REQUESTED);
 				}

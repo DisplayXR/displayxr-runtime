@@ -7,6 +7,7 @@
  * @ingroup aux_conversion
  */
 
+#include "conv_candidates.h"
 #include "conv_core_internal.h"
 #include "conv_host_inproc.h"
 
@@ -523,6 +524,7 @@ conv_core_select_locked(struct conv_core *core,
                         uint32_t input_kind,
                         uint32_t view_count,
                         const bool *busy_providers,
+                        const char *hint,
                         struct conv_binding *out,
                         uint32_t *out_state)
 {
@@ -532,8 +534,15 @@ conv_core_select_locked(struct conv_core *core,
 	const uint32_t n = conv_registry_build_candidates(&core->reg, task, include_composed(core), rows, row_map,
 	                                                  CONV_REGISTRY_MAX_ROWS * 2);
 	struct conv_select_request req = {task, input_kind, lane, view_count};
-	struct conv_select_policy pol = {preferred_for(core, task), core->cfg.allow_research_only};
+	struct conv_select_policy pol = {preferred_for(core, task), core->cfg.allow_research_only, hint};
 	struct conv_select_result res = conv_select(rows, n, &req, &pol, NULL, order);
+	if (res.hint_missed && lane != 0) {
+		// Never an error (lift spec 5): the runtime arbitrates, the hint only
+		// reorders. Logged by the lane-typed (create / rebind) selection only,
+		// so a create's validation query does not log it a second time.
+		U_LOG_I("[conv] task %s: preference hint '%s' names no non-terminal candidate; normal selection",
+		        conv_task_name(task), hint);
+	}
 	if (res.row < 0) {
 		return res.reason;
 	}
@@ -574,12 +583,53 @@ conv_core_select_locked(struct conv_core *core,
 	return res.reason;
 }
 
+uint32_t
+conv_core_enum_candidates(struct conv_core *core, uint32_t task, struct xrt_conv_wire_candidate *out, uint32_t max)
+{
+	if (core == NULL || !conv_task_is_served(task)) {
+		return 0;
+	}
+	struct conv_task_ranking *rk = calloc(1, sizeof(*rk));
+	struct xrt_conv_wire_candidate *tmp = calloc(CONV_CANDIDATES_MAX, sizeof(*tmp));
+	if (rk == NULL || tmp == NULL) {
+		free(rk);
+		free(tmp);
+		return 0;
+	}
+	os_mutex_lock(&core->registry_mtx);
+	// Exactly the properties / `conv list` convention: two views for a view task.
+	struct conv_select_policy pol = {preferred_for(core, task), core->cfg.allow_research_only, NULL};
+	conv_rank_task(&core->reg, task, include_composed(core), conv_task_produces_views(task) ? 2u : 0u, &pol, rk);
+	const uint32_t n = conv_candidates_from_ranking(&core->reg, rk, pol.preferred, tmp, CONV_CANDIDATES_MAX);
+	// The live host knows its hosting better than the registration (Hosting = auto).
+	for (uint32_t i = 0; i < n; i++) {
+		const int32_t pi = conv_registry_find_provider(&core->reg, tmp[i].provider_id);
+		if (pi < 0 || tmp[i].hosting == XRT_CONV_WIRE_HOSTING_REMOTE) {
+			continue;
+		}
+		const struct conv_host *h = core->hosts[pi].host;
+		if (h != NULL) {
+			tmp[i].hosting = h->hosting == CONV_HOSTING_SATELLITE ? XRT_CONV_WIRE_HOSTING_LOCAL_SATELLITE
+			                                                      : XRT_CONV_WIRE_HOSTING_LOCAL_IN_SERVICE;
+		}
+	}
+	os_mutex_unlock(&core->registry_mtx);
+	const uint32_t w = n < max ? n : max;
+	if (out != NULL && w > 0) {
+		memcpy(out, tmp, w * sizeof(*out));
+	}
+	free(rk);
+	free(tmp);
+	return out != NULL ? w : n;
+}
+
 static bool
-select_simple_locked(struct conv_core *core, uint32_t task, struct conv_binding *out, uint32_t *out_state)
+select_simple_locked(
+    struct conv_core *core, uint32_t task, const char *hint, struct conv_binding *out, uint32_t *out_state)
 {
 	// Properties describe the default stream: two views for a view task.
 	const uint32_t views = conv_task_produces_views(task) ? 2u : 0u;
-	const uint32_t r = conv_core_select_locked(core, task, 0, 0, views, NULL, out, out_state);
+	const uint32_t r = conv_core_select_locked(core, task, 0, 0, views, NULL, hint, out, out_state);
 	return r <= CONV_SEL_OK_FALLTHROUGH;
 }
 
@@ -660,7 +710,7 @@ prewarm_locked(struct conv_core *core, uint64_t mask)
 			continue;
 		}
 		struct conv_binding b;
-		if (select_simple_locked(core, task, &b, NULL)) {
+		if (select_simple_locked(core, task, NULL, &b, NULL)) {
 			conv_core_request_warm_locked(core, b.provider, b.cap_id, CONV_EV_WARM_REQUESTED);
 		}
 	}
@@ -887,6 +937,15 @@ conv_core_get_generation(struct conv_core *core, struct xrt_conv_wire_generation
 bool
 conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_wire_task_desc *out)
 {
+	return conv_core_get_task_desc_hinted(core, task, NULL, out);
+}
+
+bool
+conv_core_get_task_desc_hinted(struct conv_core *core,
+                               uint32_t task,
+                               const char *hint,
+                               struct xrt_conv_wire_task_desc *out)
+{
 	if (!conv_task_is_served(task)) {
 		return false;
 	}
@@ -899,7 +958,7 @@ conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_w
 	os_mutex_lock(&core->registry_mtx);
 	struct conv_binding b;
 	uint32_t state = 0;
-	if (!select_simple_locked(core, task, &b, &state)) {
+	if (!select_simple_locked(core, task, hint, &b, &state)) {
 		out->state =
 		    conv_registry_discovery_settled(&core->reg) ? XRT_CONV_STATE_ABSENT : XRT_CONV_STATE_UNKNOWN;
 		// No candidate, but a provider declares the task: report why it cannot
@@ -979,7 +1038,7 @@ conv_core_task_state(struct conv_core *core, uint32_t task)
 	os_mutex_lock(&core->registry_mtx);
 	uint32_t state = XRT_CONV_STATE_UNKNOWN;
 	struct conv_binding b;
-	if (!select_simple_locked(core, task, &b, &state)) {
+	if (!select_simple_locked(core, task, NULL, &b, &state)) {
 		state = conv_registry_discovery_settled(&core->reg) ? XRT_CONV_STATE_ABSENT : XRT_CONV_STATE_UNKNOWN;
 	}
 	os_mutex_unlock(&core->registry_mtx);
@@ -1002,7 +1061,7 @@ conv_core_v3_state(struct conv_core *core, uint32_t v3_modes, bool photo_content
 		const uint32_t task = conv_legacy_mode_task(bit, photo_content);
 		struct conv_binding b;
 		uint32_t s = 0;
-		if (task != XRT_CONV_TASK_NONE && select_simple_locked(core, task, &b, &s)) {
+		if (task != XRT_CONV_TASK_NONE && select_simple_locked(core, task, NULL, &b, &s)) {
 			states[n++] = s;
 		}
 	}
@@ -1028,7 +1087,7 @@ conv_core_task_has_candidate(struct conv_core *core, uint32_t task)
 	}
 	os_mutex_lock(&core->registry_mtx);
 	struct conv_binding b;
-	const bool ok = select_simple_locked(core, task, &b, NULL);
+	const bool ok = select_simple_locked(core, task, NULL, &b, NULL);
 	os_mutex_unlock(&core->registry_mtx);
 	return ok;
 }
@@ -1104,7 +1163,7 @@ conv_core_warm_task(struct conv_core *core, uint32_t task)
 {
 	os_mutex_lock(&core->registry_mtx);
 	struct conv_binding b;
-	const bool ok = select_simple_locked(core, task, &b, NULL);
+	const bool ok = select_simple_locked(core, task, NULL, &b, NULL);
 	if (ok) {
 		conv_core_request_warm_locked(core, b.provider, b.cap_id, CONV_EV_WARM_REQUESTED);
 	}
@@ -1121,7 +1180,7 @@ conv_core_warm_task_explicit(struct conv_core *core, uint32_t task, uint32_t *ou
 		os_mutex_lock(&core->registry_mtx);
 		struct conv_binding b;
 		uint32_t state = 0;
-		bool have = select_simple_locked(core, task, &b, &state);
+		bool have = select_simple_locked(core, task, NULL, &b, &state);
 		prev = have ? state
 		            : (conv_registry_discovery_settled(&core->reg) ? XRT_CONV_STATE_ABSENT
 		                                                           : XRT_CONV_STATE_UNKNOWN);
@@ -1148,7 +1207,7 @@ conv_core_warm_task_explicit(struct conv_core *core, uint32_t task, uint32_t *ou
 				any = true;
 			}
 			if (any) {
-				have = select_simple_locked(core, task, &b, &state);
+				have = select_simple_locked(core, task, NULL, &b, &state);
 			}
 		}
 		if (have) {
@@ -1201,7 +1260,7 @@ conv_core_evict_task(struct conv_core *core, uint32_t task)
 	os_mutex_lock(&core->registry_mtx);
 	struct conv_binding b;
 	uint32_t state = 0;
-	const bool ok = select_simple_locked(core, task, &b, &state);
+	const bool ok = select_simple_locked(core, task, NULL, &b, &state);
 	os_mutex_unlock(&core->registry_mtx);
 	if (!ok || state != XRT_CONV_STATE_READY) {
 		return ok ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;

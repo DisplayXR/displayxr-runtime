@@ -10021,6 +10021,63 @@ ipc_handle_conv_stream_create(volatile struct ipc_client_state *ics,
 	                                        legacy_mode, input_scale, out_created);
 }
 
+/*
+ * XR_DXR_lift spec 5 (#2178): read-only candidates + the per-create
+ * preference hint. Same callers as the rest of the family.
+ */
+
+static_assert(sizeof(struct ipc_conv_enum_candidates_reply) <= IPC_BUF_SIZE,
+              "conv_enum_candidates reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_stream_create_v5_msg) <= IPC_BUF_SIZE,
+              "conv_stream_create_v5 exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_conv_enum_candidates(volatile struct ipc_client_state *ics,
+                                uint32_t task,
+                                uint32_t index,
+                                uint32_t *out_count,
+                                struct xrt_conv_wire_generation *out_generation,
+                                struct xrt_conv_wire_candidate *out_candidate)
+{
+	IPC_TRACE_MARKER();
+	*out_count = 0;
+	U_ZERO(out_generation);
+	U_ZERO(out_candidate);
+	xrt_result_t auth = require_lift_client(ics, "conv_enum_candidates");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	return ipc_server_conv_v5_enum_candidates(ipc_server_get_conv(), lift_owner(ics), task, index, out_count,
+	                                          out_generation, out_candidate);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_create_v5(volatile struct ipc_client_state *ics,
+                                 const struct xrt_conv_wire_stream_desc *desc,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const struct xrt_conv_wire_provider_pref *pref,
+                                 struct xrt_conv_wire_stream_created *out_created)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_created);
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_create_v5");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(desc->struct_size, desc->family_version, sizeof(*desc)) ||
+	    !conv_header_ok(pref->struct_size, pref->family_version, sizeof(*pref))) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	// Untrusted wire: terminate the string before anything reads it.
+	char hint[XRT_CONV_WIRE_PREFERENCE_MAX];
+	memcpy(hint, (const void *)pref->provider, sizeof(hint));
+	hint[sizeof(hint) - 1] = '\0';
+	return ipc_server_conv_v5_stream_create(ipc_server_get_conv(), lift_owner(ics), desc, required_outputs,
+	                                        legacy_mode, input_scale, hint, out_created);
+}
+
 xrt_result_t
 ipc_handle_conv_stream_reset(volatile struct ipc_client_state *ics, uint64_t stream_id)
 {

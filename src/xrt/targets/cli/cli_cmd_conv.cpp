@@ -5,6 +5,7 @@
  * @brief  `displayxr-cli conv` — conversion providers (ADR-053 §7.1).
  *
  *   conv list   [--json]                 providers x tasks, selection order, `selected`, reason per row
+ *   conv candidates <task> [--json]      what an app's xrEnumerateLiftTaskCandidatesDXR returns (lift spec 5)
  *   conv status [--json] [--watch [--interval ms]]   readiness, streams, jobs
  *   conv warm   <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]   explicit prewarm (service only)
  *   conv enable | disable <id> [--machine]           `Enabled` (HKCU; HKLM with --machine)
@@ -67,6 +68,7 @@
 #include "xrt/xrt_results.h"
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_lift.h"
 #include "ipc_client_generated.h"
 #endif
 
@@ -923,6 +925,123 @@ warm_one(struct ipc_connection *ipc_c, uint32_t task, const struct xrt_status_sn
 }
 #endif
 
+#ifdef CLI_HAVE_IPC
+const char *
+hosting_word(uint32_t h)
+{
+	switch (h) {
+	case XRT_CONV_WIRE_HOSTING_LOCAL_IN_SERVICE: return "local-in-service";
+	case XRT_CONV_WIRE_HOSTING_LOCAL_SATELLITE: return "local-satellite";
+	case XRT_CONV_WIRE_HOSTING_REMOTE: return "remote";
+	default: return "unknown";
+	}
+}
+
+const char *
+licence_class_word(uint32_t c)
+{
+	switch (c) {
+	case XRT_CONV_LICENCE_PERMISSIVE: return "permissive";
+	case XRT_CONV_LICENCE_COMMERCIAL: return "commercial";
+	case XRT_CONV_LICENCE_RESEARCH_ONLY: return "research-only";
+	default: return "unknown";
+	}
+}
+#endif
+
+/*!
+ * `conv candidates <task> [--json]` (lift spec 5, #2178): exactly the rows an
+ * app's xrEnumerateLiftTaskCandidatesDXR gets -- the same IPC call
+ * (conv_enum_candidates), over this CLI's own connection. Never headless: an
+ * app without a service sees no candidates, so neither does this.
+ */
+int
+cmd_candidates(int argc, const char **argv)
+{
+	if (argc < 4 || argv[3][0] == '-') {
+		P("usage: displayxr-cli conv candidates <task> [--json]\n");
+		return 1;
+	}
+	const uint32_t task = conv_task_from_name(argv[3]);
+	if (task == 0 || !conv_task_is_served(task)) {
+		P("error: '%s' is not a task this version lists (views-mono, depth-mono, depth-video, splats-mono, "
+		  "...).\n",
+		  argv[3]);
+		return 1;
+	}
+	const bool json = cli_has_flag(argc, argv, "--json");
+#ifdef CLI_HAVE_IPC
+	struct ipc_connection ipc_c;
+	if (!conv_connect(&ipc_c)) {
+		P("No DisplayXR service reachable: an app sees no candidates either (it reaches them through the "
+		  "service). `conv list` describes providers headless.\n");
+		return 1;
+	}
+	struct xrt_conv_wire_candidate c[XRT_CONV_WIRE_MAX_CANDIDATES];
+	uint32_t n = 0;
+	const xrt_result_t xr = ipc_client_conv_enum_candidates(&ipc_c, task, c, XRT_CONV_WIRE_MAX_CANDIDATES, &n);
+	ipc_client_connection_fini(&ipc_c);
+	if (xr != XRT_SUCCESS) {
+		P("The service refused the enumeration (xrt_result %d).\n", (int)xr);
+		return 1;
+	}
+	if (n > XRT_CONV_WIRE_MAX_CANDIDATES) {
+		n = XRT_CONV_WIRE_MAX_CANDIDATES;
+	}
+	if (json) {
+		cJSON *root = cJSON_CreateObject();
+		cJSON_AddStringToObject(root, "task", conv_task_name(task));
+		cJSON *arr = cJSON_AddArrayToObject(root, "candidates");
+		for (uint32_t i = 0; i < n; i++) {
+			char st[16];
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "provider_id", c[i].provider_id);
+			cJSON_AddStringToObject(o, "display_name", c[i].display_name);
+			cJSON_AddStringToObject(o, "state", state_upper(c[i].state, st, sizeof(st)));
+			cJSON_AddNumberToObject(o, "failure_reason", c[i].failure_reason);
+			cJSON_AddStringToObject(o, "licence_class", licence_class_word(c[i].licence_class));
+			cJSON_AddStringToObject(o, "hosting", hosting_word(c[i].hosting));
+			cJSON_AddBoolToObject(o, "is_user_default",
+			                      (c[i].candidate_flags & XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT) != 0);
+			cJSON_AddBoolToObject(o, "is_selected",
+			                      (c[i].candidate_flags & XRT_CONV_WIRE_CANDIDATE_SELECTED) != 0);
+			cJSON_AddItemToArray(arr, o);
+		}
+		char *text = cJSON_Print(root);
+		P("%s\n", text != nullptr ? text : "{}");
+		cJSON_free(text);
+		cJSON_Delete(root);
+		return 0;
+	}
+	if (n == 0) {
+		P("%s: no candidates (no provider can serve it here, or none is eligible).\n", conv_task_name(task));
+		return 0;
+	}
+	P("%s: %u candidate(s), in selection order (what an app enumerates)\n", conv_task_name(task), n);
+	P("  %-3s %-24s %-28s %-12s %-13s %-16s %s\n", "", "provider", "display name", "state", "licence", "hosting",
+	  "flags");
+	for (uint32_t i = 0; i < n; i++) {
+		char st[16];
+		std::string flags;
+		if ((c[i].candidate_flags & XRT_CONV_WIRE_CANDIDATE_SELECTED) != 0) {
+			flags += "selected";
+		}
+		if ((c[i].candidate_flags & XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT) != 0) {
+			flags += flags.empty() ? "user-default" : ", user-default";
+		}
+		P("  %-3s %-24s %-28s %-12s %-13s %-16s %s\n",
+		  (c[i].candidate_flags & XRT_CONV_WIRE_CANDIDATE_SELECTED) != 0 ? "*" : "", c[i].provider_id,
+		  c[i].display_name, state_upper(c[i].state, st, sizeof(st)), licence_class_word(c[i].licence_class),
+		  hosting_word(c[i].hosting), flags.c_str());
+	}
+	return 0;
+#else
+	(void)json;
+	P("This build has no IPC client: candidates come from the running service only.\n");
+	return 1;
+#endif
+}
+
 /*!
  * `conv warm <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]` (#2029):
  * the DIAG conv_warm call. It warms the TASK's selected capability (an id
@@ -1368,6 +1487,7 @@ usage(void)
 	P("Usage: displayxr-cli conv <verb>   (conversion providers, ADR-053)\n");
 	P("  list [--json]                       providers x tasks, selection order, selected, reason per row\n");
 	P("  status [--json] [--watch [--interval ms]]   readiness, streams, jobs (live from the service)\n");
+	P("  candidates <task> [--json]          the read-only candidates an app enumerates (lift spec 5)\n");
 	P("  warm <task> | <id>[/<cap>] [<task>] [--wait [--timeout s]]\n"
 	  "                                      explicit prewarm, through the running service (READY: no-op)\n");
 	P("  enable | disable <id> [--machine]   per-user (HKCU) Enabled; --machine = HKLM (admin)\n");
@@ -1404,6 +1524,9 @@ cli_cmd_conv(int argc, const char **argv)
 	}
 	if (strcmp(verb, "warm") == 0) {
 		return cmd_warm(argc, argv);
+	}
+	if (strcmp(verb, "candidates") == 0) {
+		return cmd_candidates(argc, argv);
 	}
 	if (strcmp(verb, "enable") == 0 || strcmp(verb, "disable") == 0) {
 		if (argc < 4) {

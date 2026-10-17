@@ -13,6 +13,8 @@ add_library(
 	conv_dp_lift_describe.h
 	conv_readiness.c
 	conv_readiness.h
+	conv_candidates.c
+	conv_candidates.h
 	conv_registry.c
 	conv_registry.h
 	conv_select.c

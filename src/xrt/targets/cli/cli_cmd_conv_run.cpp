@@ -62,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -362,7 +363,8 @@ usage_run(void)
 {
 	E("usage: displayxr-cli conv run splats-mono <in> <out.sog|.ply> [options]\n"
 	  "       displayxr-cli conv run splats-stereo <left> <right> <out> [options]   (or one SBS image with --sbs)\n"
-	  "  --provider <id>        use this provider (default: the first registered that serves the task)\n"
+	  "  --provider <id>        prefer this provider (a hint: the runtime's selection still arbitrates;\n"
+	  "                         an unknown or terminal one falls through to the default)\n"
 	  "  --format sog|ply       blob format (default from the output extension)\n"
 	  "  --baseline-m <m>       stereo baseline in metres; omitted = unknown (no metric result, never defaulted)\n"
 	  "  --rectified | --raw    declare the pair (stereo needs one; it is never guessed)\n"
@@ -472,7 +474,10 @@ cli_cmd_conv_run(int argc, const char **argv)
 		return 1;
 	}
 
-	// Providers: registered, in selection order (ProbeOrder, id), per-user Enabled applied.
+	// Providers: registered, ranked by the runtime's own selection (ProbeOrder,
+	// PreferredProvider, licence gate, readiness fall-through), per-user Enabled
+	// applied. --provider is the per-create preference HINT of lift spec 5: the
+	// same rule an app's XrLiftProviderPreferenceDXR goes through.
 	auto *entries =
 	    (xrt_conversion_plugin_entry *)calloc(XRT_CONV_LOADER_MAX_ENTRIES, sizeof(xrt_conversion_plugin_entry));
 	if (entries == nullptr) {
@@ -483,18 +488,50 @@ cli_cmd_conv_run(int argc, const char **argv)
 	const bool allow_research = policy.allow_research_only || cli_has_flag(argc, argv, "--allow-research-only");
 	const int n = target_conversion_plugin_enumerate(entries, XRT_CONV_LOADER_MAX_ENTRIES);
 	const char *want = value_of(argc, argv, "--provider");
+	target_conv_policy sel_policy = policy;
+	sel_policy.allow_research_only = allow_research;
+	auto status = std::make_unique<target_conv_status>();
+	auto select = [&](const target_conv_policy &pol) -> const char * {
+		target_conv_status_build_from_entries_hinted(entries, n < 0 ? 0 : n, nullptr, &pol, task, want,
+		                                             status.get());
+		for (uint32_t i = 0; i < status->task_count && i < XRT_STATUS_MAX_CONV_TASKS; i++) {
+			const xrt_status_conv_task &t = status->tasks[i];
+			if (t.task == task && t.selected && t.provider < status->provider_count &&
+			    (t.lanes & XRT_CONV_LANE_JOB) != 0) {
+				return status->providers[t.provider].id;
+			}
+		}
+		return nullptr;
+	};
+	const char *chosen = select(sel_policy);
+	if (chosen == nullptr && !allow_research) {
+		// Nothing eligible without the opt-in: rank once more with it, so a
+		// research-only provider is named (and refused below with its licence)
+		// rather than reported as missing.
+		target_conv_policy research = sel_policy;
+		research.allow_research_only = true;
+		chosen = select(research);
+	}
+	if (want != nullptr && !status->hint_applied) {
+		// Never an error (lift spec 5): an unknown, filtered or terminal hint falls through.
+		E("conv run: --provider %s is not a usable candidate for %s (unknown, disabled, licence-gated or "
+		  "terminal: `displayxr-cli conv candidates %s`); using the runtime's selection\n",
+		  want, task_name, task_name);
+	}
 	hosted h;
 	bool found = false;
-	for (int i = 0; i < n && !found; i++) {
-		(void)target_conv_policy_apply_override(&policy, &entries[i]);
-		if (want != nullptr && strcmp(entries[i].id, want) != 0) {
-			continue;
+	for (int i = 0; i < n && !found && chosen != nullptr; i++) {
+		if (strcmp(entries[i].id, chosen) == 0) {
+			found = host_one(&entries[i], task, h);
 		}
-		found = host_one(&entries[i], task, h);
 	}
 	if (!found) {
-		E("conv run: no registered provider serves %s on the job lane%s%s\n", task_name,
-		  want != nullptr ? " as " : "", want != nullptr ? want : "");
+		if (chosen != nullptr) {
+			E("conv run: the selected provider %s could not be hosted for %s on the job lane\n", chosen,
+			  task_name);
+		} else {
+			E("conv run: no registered provider serves %s on the job lane\n", task_name);
+		}
 		free(entries);
 		return 1;
 	}

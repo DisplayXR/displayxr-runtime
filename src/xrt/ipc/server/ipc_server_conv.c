@@ -10,6 +10,7 @@
 
 #include "shared/ipc_protocol.h"
 
+#include "conversion/conv_candidates.h"
 #include "conversion/conv_core.h"
 #include "conversion/conv_readiness.h"
 #include "conversion/conv_select.h"
@@ -21,6 +22,7 @@
 #include "util/u_lift_mailbox.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -93,6 +95,11 @@ struct sc_client_ev
 	uint32_t last_reason[XRT_CONV_TASK_RESERVED_FIRST];
 	float last_progress[XRT_CONV_TASK_RESERVED_FIRST];
 	uint64_t last_progress_ns[XRT_CONV_TASK_RESERVED_FIRST];
+	/* Lift spec 5 (#2178): what this connection last enumerated per task, so a
+	 * readiness change behind the selection that changes the candidate list
+	 * reaches it as PROVIDERS_CHANGED (the effective task state may not move). */
+	bool cand_seen[XRT_CONV_TASK_RESERVED_FIRST];
+	uint64_t cand_sig[XRT_CONV_TASK_RESERVED_FIRST];
 };
 
 struct ipc_server_conv
@@ -1508,6 +1515,73 @@ ipc_server_conv_on_event(struct ipc_server_conv *sc, uint64_t client_id, const s
 	os_mutex_unlock(&sc->ev_mtx);
 }
 
+/*!
+ * Recompute @p task's candidate signature for a connection that enumerated
+ * it; when it moved, queue PROVIDERS_CHANGED (deduplicated like every event)
+ * and remember the new one. No core lock may be held (it ranks the task).
+ */
+static void
+candidates_check(struct ipc_server_conv *sc, uint64_t client_id, uint32_t task)
+{
+	if (task == 0 || task >= XRT_CONV_TASK_RESERVED_FIRST) {
+		return;
+	}
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	const bool seen = e != NULL && e->cand_seen[task];
+	os_mutex_unlock(&sc->ev_mtx);
+	if (!seen) {
+		return;
+	}
+	struct xrt_conv_wire_candidate c[CONV_CANDIDATES_MAX];
+	const uint32_t n = conv_core_enum_candidates(sc->core, task, c, CONV_CANDIDATES_MAX);
+	const uint64_t sig = conv_candidates_signature(c, n);
+	os_mutex_lock(&sc->ev_mtx);
+	e = ev_slot_locked(sc, client_id, false);
+	if (e != NULL && e->cand_seen[task] && e->cand_sig[task] != sig) {
+		e->cand_sig[task] = sig;
+		ev_queue_locked(e, SC_EV_PROVIDERS);
+	}
+	os_mutex_unlock(&sc->ev_mtx);
+}
+
+xrt_result_t
+ipc_server_conv_v5_enum_candidates(struct ipc_server_conv *sc,
+                                   uint64_t client_id,
+                                   uint32_t task,
+                                   uint32_t index,
+                                   uint32_t *out_count,
+                                   struct xrt_conv_wire_generation *out_generation,
+                                   struct xrt_conv_wire_candidate *out_candidate)
+{
+	*out_count = 0;
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_conv_wire_begin(out_candidate, (uint32_t)sizeof(*out_candidate));
+	if (sc == NULL) {
+		return XRT_SUCCESS; // no conversion service: no candidates, never an error
+	}
+	ipc_server_conv_v4_latch(sc, client_id);
+	conv_core_get_generation(sc->core, out_generation);
+	if (task == 0 || task >= XRT_CONV_TASK_RESERVED_FIRST || !conv_task_is_served(task)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // reserved: VALIDATION_FAILURE
+	}
+	struct xrt_conv_wire_candidate c[CONV_CANDIDATES_MAX];
+	const uint32_t n = conv_core_enum_candidates(sc->core, task, c, CONV_CANDIDATES_MAX);
+	*out_count = n;
+	if (index < n) {
+		*out_candidate = c[index];
+	}
+	// The baseline the spec-5 event rule compares against (candidates_check).
+	os_mutex_lock(&sc->ev_mtx);
+	struct sc_client_ev *e = ev_slot_locked(sc, client_id, false);
+	if (e != NULL) {
+		e->cand_seen[task] = true;
+		e->cand_sig[task] = conv_candidates_signature(c, n);
+	}
+	os_mutex_unlock(&sc->ev_mtx);
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_server_conv_v4_poll_event(struct ipc_server_conv *sc,
                               uint64_t client_id,
@@ -1571,6 +1645,10 @@ ipc_server_conv_v4_poll_event(struct ipc_server_conv *sc,
 			reason = d.failure_reason;
 			progress = d.progress;
 		}
+		// Spec 5: the candidate list of the task may have changed even when
+		// its effective state did not (a provider behind the selection).
+		candidates_check(sc, client_id, id);
+
 		const uint64_t now = os_monotonic_get_ns();
 		bool deliver = false;
 		uint32_t prev = 0;
@@ -1735,6 +1813,20 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
                                  float input_scale,
                                  struct xrt_conv_wire_stream_created *out)
 {
+	return ipc_server_conv_v5_stream_create(sc, client_id, in, required_outputs, legacy_mode, input_scale, NULL,
+	                                        out);
+}
+
+xrt_result_t
+ipc_server_conv_v5_stream_create(struct ipc_server_conv *sc,
+                                 uint64_t client_id,
+                                 const struct xrt_conv_wire_stream_desc *in,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const char *preferred_provider,
+                                 struct xrt_conv_wire_stream_created *out)
+{
 	memset(out, 0, sizeof(*out));
 	if (sc == NULL) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
@@ -1774,7 +1866,7 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct xrt_conv_wire_task_desc d;
-	if (!conv_core_get_task_desc(sc->core, task, &d)) {
+	if (!conv_core_get_task_desc_hinted(sc->core, task, preferred_provider, &d)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (!conv_core_task_has_candidate(sc->core, task)) {
@@ -1841,6 +1933,10 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
 	opts.eyes_dp = 0;
 	opts.source_format = XRT_CONV_FMT_RGBA8_UNORM;
 	opts.auto_convergence = views;
+	if (preferred_provider != NULL) {
+		// The hint reorders this create's candidates only (lift spec 5); the core arbitrates.
+		(void)snprintf(opts.preferred_provider, sizeof(opts.preferred_provider), "%s", preferred_provider);
+	}
 	struct xrt_conv_wire_stream_created created;
 	memset(&created, 0, sizeof(created));
 	xrt_result_t xret = conv_core_stream_create(sc->core, client_id, &sd, &opts, &created);

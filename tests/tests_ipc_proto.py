@@ -37,6 +37,10 @@ def _load():
 #: XR_DXR_lift spec 4 (#2054): the conv_* family, appended in this order.
 SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm', 'conv_stream_create', 'conv_stream_reset',
                     'conv_acquire_result', 'conv_poll_event', 'conv_submit_frame', 'conv_get_cpu_output']
+#: XR_DXR_lift spec 5 (#2178): read-only candidates + the per-create preference
+#: hint, appended LAST (after #2181's input-selection family) in this order (conv_stream_create's
+#: desc has no room for a provider id, so the hinted create is its own call).
+SPEC5_CONV_CALLS = ['conv_enum_candidates', 'conv_stream_create_v5']
 
 #: ADR-034 Amendment 5 (#2181): per-client input selection, appended after the spec-4 family.
 INPUT_SELECTION_CALLS = ['input_providers_enumerate', 'input_set_provider_preference', 'system_get_input_holders']
@@ -173,7 +177,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_window_placement", "workspace_get_window_placement",
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
-                 "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS)
+                 "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS) + tuple(SPEC5_CONV_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -343,17 +347,23 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
-    def _names_before_input_selection(self):
-        """Command names up to #2181's input-selection family, appended LAST."""
+    def _names_before_spec5(self):
+        """Command names up to lift spec 5's two calls (#2178), appended LAST."""
         names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(SPEC5_CONV_CALLS):], SPEC5_CONV_CALLS)
+        return names[:-len(SPEC5_CONV_CALLS)]
+
+    def _names_before_input_selection(self):
+        """Command names up to #2181's input-selection family (only spec 5 follows it)."""
+        names = self._names_before_spec5()
         self.assertEqual(names[-len(INPUT_SELECTION_CALLS):], INPUT_SELECTION_CALLS)
         return names[:-len(INPUT_SELECTION_CALLS)]
 
     def test_input_selection_family_is_appended(self):
         # ADR-034 Amendment 5 (#2181): enumerate / set-preference ride a
         # session's connection; the holders read is DIAG. All three at the END,
-        # so every earlier command keeps its enum value.
-        names = [c.name for c in self.p.calls]
+        # so every earlier command keeps its enum value (only lift spec 5's two follow).
+        names = self._names_before_spec5()
         self.assertEqual(names[-len(INPUT_SELECTION_CALLS):], INPUT_SELECTION_CALLS)
         enum = self._call("input_providers_enumerate")
         self.assertEqual([(a.name, a.typename) for a in enum.in_args], [("start", "uint32_t")])
@@ -379,6 +389,33 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         names = self._names_before_input_selection()
         self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
         return names[:-len(SPEC4_CONV_CALLS)]
+
+    def test_spec5_conv_calls_are_appended(self):
+        # XR_DXR_lift spec 5 (#2178): candidate enumeration (one candidate per
+        # reply, by index, with the generation so a walk that straddles a
+        # change restarts) and the hinted create ride at the very END (after
+        # #2181's input-selection family), so every earlier call keeps its enum
+        # value and wire form.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(SPEC5_CONV_CALLS):], SPEC5_CONV_CALLS)
+        enum = self._call("conv_enum_candidates")
+        self.assertEqual([(a.name, a.typename) for a in enum.in_args], [("task", "uint32_t"), ("index", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in enum.out_args],
+                         [("count", "uint32_t"), ("generation", "struct xrt_conv_wire_generation"),
+                          ("candidate", "struct xrt_conv_wire_candidate")])
+        v5 = self._call("conv_stream_create_v5")
+        v4 = self._call("conv_stream_create")
+        # The v5 create is the v4 one plus a trailing preference, never a widened v4.
+        self.assertEqual([(a.name, a.typename) for a in v5.in_args][:-1],
+                         [(a.name, a.typename) for a in v4.in_args])
+        self.assertEqual((v5.in_args[-1].name, v5.in_args[-1].typename),
+                         ("pref", "struct xrt_conv_wire_provider_pref"))
+        self.assertEqual([(a.name, a.typename) for a in v5.out_args], [(a.name, a.typename) for a in v4.out_args])
+        for call in (enum, v5):
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, call.name)
+        text = self._generate("generate_server_c", "ipc_server_generated.c")
+        for name in SPEC5_CONV_CALLS:
+            self.assertIn("ipc_handle_%s(" % name, text)
 
     def test_spec4_conv_family_is_appended(self):
         # XR_DXR_lift spec 4 (#2054): the conv_* family rides at the END,

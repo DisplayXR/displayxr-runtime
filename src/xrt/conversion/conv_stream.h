@@ -38,6 +38,7 @@
 
 #pragma once
 
+#include "xrt/xrt_conv_wire.h"
 #include "xrt/xrt_conversion_plugin.h"
 #include "xrt/xrt_handles.h"
 
@@ -206,6 +207,10 @@ struct conv_stream_options
 	bool auto_convergence;  //!< S7 runtime auto-convergence (needs a configured observer)
 	uint64_t eyes_dp;       //!< DP whose eyes snapshot to read: a conv_core_eyes_publish key, CONV_EYES_DP_ANY or _NONE
 	uint32_t source_format; //!< XRT_CONV_FMT_* the producer snapshots; 0 = RGBA8
+	/*! Per-stream preference HINT (lift spec 5, #2178): "<provider-id>[/<cap_id
+	 *  or model_id>]", "" = none. Reorders the non-terminal candidates at
+	 *  create (and at a rebind of this stream); never the user's default. */
+	char preferred_provider[XRT_CONV_WIRE_PREFERENCE_MAX];
 };
 
 /*! @name conv_input_import::kind @{ */

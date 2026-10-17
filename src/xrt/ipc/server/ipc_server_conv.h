@@ -555,6 +555,43 @@ ipc_server_conv_v4_stream_create(struct ipc_server_conv *sc,
                                  float input_scale,
                                  struct xrt_conv_wire_stream_created *out);
 
+/*!
+ * conv_stream_create_v5 (lift spec 5, #2178): ipc_server_conv_v4_stream_create
+ * plus the per-create preference HINT @p preferred_provider
+ * ("<provider-id>[/<cap_id or model_id>]"; NULL / "" = none). The hint
+ * reorders the task's non-terminal candidates for this stream only (and for
+ * its rebinds); an unknown or terminal one falls through to the normal
+ * selection, never an error. It is never written to the user / machine
+ * default. The v4 call is this with no hint.
+ */
+xrt_result_t
+ipc_server_conv_v5_stream_create(struct ipc_server_conv *sc,
+                                 uint64_t client_id,
+                                 const struct xrt_conv_wire_stream_desc *in,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const char *preferred_provider,
+                                 struct xrt_conv_wire_stream_created *out);
+
+/*!
+ * conv_enum_candidates (lift spec 5, #2178; latches): the read-only candidate
+ * providers of @p task (conv_core_enum_candidates), one per call by @p index,
+ * with their count and the core's generations (a walk whose generation moved
+ * restarts). An index past the count returns the count and an empty
+ * candidate; zero providers = count 0, XRT_SUCCESS. A reserved / out-of-range
+ * task is XRT_ERROR_INPUT_UNSUPPORTED. Records what the connection saw: a
+ * later readiness change that changes the list queues PROVIDERS_CHANGED for it.
+ */
+xrt_result_t
+ipc_server_conv_v5_enum_candidates(struct ipc_server_conv *sc,
+                                   uint64_t client_id,
+                                   uint32_t task,
+                                   uint32_t index,
+                                   uint32_t *out_count,
+                                   struct xrt_conv_wire_generation *out_generation,
+                                   struct xrt_conv_wire_candidate *out_candidate);
+
 /*! conv_stream_reset: drop temporal state before the next frame (cut / seek). */
 xrt_result_t
 ipc_server_conv_v4_stream_reset(struct ipc_server_conv *sc, uint64_t client_id, uint64_t stream_id);

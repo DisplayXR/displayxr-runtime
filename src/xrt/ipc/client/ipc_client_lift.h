@@ -139,6 +139,7 @@ ipc_client_conv_hint_interest(struct ipc_connection *ipc_c, uint64_t task_mask);
  * Any of them latches this connection for the task / provider events.
  */
 
+struct xrt_conv_wire_candidate;
 struct xrt_conv_wire_event;
 struct xrt_conv_wire_result;
 struct xrt_conv_wire_stream_created;
@@ -163,6 +164,33 @@ ipc_client_conv_stream_create(struct ipc_connection *ipc_c,
                               uint32_t legacy_mode,
                               float input_scale,
                               struct xrt_conv_wire_stream_created *out_created);
+
+/*!
+ * Lift spec 5 (#2178): conv_stream_create plus a per-create preference hint
+ * ("<provider-id>[/<cap_id or model_id>]"). NULL / "" sends the plain spec-4
+ * create, so a caller without a hint puts nothing new on the wire.
+ */
+xrt_result_t
+ipc_client_conv_stream_create_v5(struct ipc_connection *ipc_c,
+                                 const struct xrt_conv_wire_stream_desc *desc,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const char *preferred_provider,
+                                 struct xrt_conv_wire_stream_created *out_created);
+
+/*!
+ * Lift spec 5 (#2178): every read-only candidate of @p task, walked one per
+ * call (conv_enum_candidates). A walk whose generation moves under it starts
+ * over (bounded). Writes at most @p max into @p out (may be NULL with max 0)
+ * and the full count into @p out_count; 0 candidates is XRT_SUCCESS.
+ */
+xrt_result_t
+ipc_client_conv_enum_candidates(struct ipc_connection *ipc_c,
+                                uint32_t task,
+                                struct xrt_conv_wire_candidate *out,
+                                uint32_t max,
+                                uint32_t *out_count);
 
 xrt_result_t
 ipc_client_conv_stream_reset(struct ipc_connection *ipc_c, uint64_t stream_id);
