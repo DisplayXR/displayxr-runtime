@@ -66,6 +66,7 @@ source (the provider declares it through `describe_settings`).
 | `CRASH_AFTER` | 0 | after N successful converts / jobs: in a satellite (`host_flags` bit 0) the process exits (`_Exit(70)`); in-service every capability reports `FAILED(CRASH_LOOP)` and work fails |
 | `DEVICE_LOST_EVERY` | 0 | every Nth convert / job fails and its capability reports `FAILED(DEVICE_LOST)`, retryable; the next `warm` reloads |
 | `LICENCE` | — | `research` ⇒ `RESEARCH_ONLY`, `commercial_ok = 0` (the `AllowResearchOnly` gate) |
+| `SCRATCH_TOUCH` | 0 | `probe()` asks `host->get_path(XRT_CONV_PATH_SCRATCH)` and writes `sim-scratch-touch` (the directory, one line) there, temp + rename: the test vehicle for the hosts' scratch directory (#2194) |
 | `SCRIPT` | — | the compact per-task script below; applied last, so it wins |
 
 ### `SCRIPT` grammar

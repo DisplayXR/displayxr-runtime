@@ -938,6 +938,43 @@ sc_get_provider_status(struct xrt_conv_provider_status *out)
 	return true;
 }
 
+/*!
+ * SCRATCH_TOUCH=1 (#2194): ask the host for XRT_CONV_PATH_SCRATCH and write
+ * `sim-scratch-touch` there (temp + rename, the §2.4 rule), so a test can
+ * see which directory a host hands a provider, across the satellite boundary.
+ */
+static void
+scratch_touch(void)
+{
+	char buf[16];
+	if (!setting("SCRATCH_TOUCH", buf, sizeof(buf)) || strtoul(buf, NULL, 10) == 0) {
+		return;
+	}
+	char dir[512];
+	if (g_host == NULL || !COVERS(g_host, struct xrt_conversion_plugin_host_iface, get_path) ||
+	    g_host->get_path == NULL || !g_host->get_path(XRT_CONV_PATH_SCRATCH, dir, sizeof(dir))) {
+		U_LOG_W("sim conversion: SCRATCH_TOUCH: the host gave no scratch directory");
+		return;
+	}
+	char tmp[600], fin[600];
+	(void)snprintf(tmp, sizeof(tmp), "%s/sim-scratch-touch.tmp", dir);
+	(void)snprintf(fin, sizeof(fin), "%s/sim-scratch-touch", dir);
+	FILE *f = fopen(tmp, "wb");
+	if (f == NULL) {
+		U_LOG_W("sim conversion: SCRATCH_TOUCH: cannot write %s", tmp);
+		return;
+	}
+	(void)fprintf(f, "%s\n", dir);
+	(void)fclose(f);
+	(void)remove(fin); // Windows rename does not replace
+	if (rename(tmp, fin) != 0) {
+		(void)remove(tmp);
+		U_LOG_W("sim conversion: SCRATCH_TOUCH: cannot rename into %s", fin);
+		return;
+	}
+	U_LOG_W("sim conversion: SCRATCH_TOUCH: wrote %s", fin);
+}
+
 static xrt_result_t
 sc_probe(struct xrt_conversion_plugin_instance **out_inst)
 {
@@ -954,6 +991,7 @@ sc_probe(struct xrt_conversion_plugin_instance **out_inst)
 		return XRT_ERROR_ALLOCATION;
 	}
 	load_settings(sc);
+	scratch_touch();
 	for (uint32_t c = 1; c <= SIM_CONV_CAP_COUNT; c++) {
 		sc->caps[c - 1].last_reported = cap_eval(sc, &sc->caps[c - 1], os_monotonic_get_ns()).state;
 	}
@@ -1992,6 +2030,8 @@ static const struct xrt_component_setting_desc g_sim_conv_settings[] = {
      "every Nth convert / job fails with FAILED(DEVICE_LOST), retryable"},
     {"LICENCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "",
      "research = RESEARCH_ONLY, commercial_ok 0 (AllowResearchOnly gate)"},
+    {"SCRATCH_TOUCH", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
+     "probe() writes sim-scratch-touch into host->get_path(SCRATCH) (tests)"},
     {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_STRING, "",
      "per-task script (README.md); applied last. STATE_<cap> = absent|incompatible|unlicensed|disabled|"
      "failed:<reason>|installed also works per capability"},
