@@ -29,12 +29,17 @@
  *    CPU table can export a GPU result (the composed views, a mirror) and
  *    fill a GPU slot image.
  *
+ *  - step C (lifted weave rects, XR_DXR_lift §6): the weave path's bridge to
+ *    core-routed streams (vk_conv_weave, installed into comp_multi as its ops
+ *    table -- comp_d3d11_service_conv_set_bridge's counterpart), spec-3 SBS /
+ *    NVIEW stream create under the CPU route for those rects
+ *    (ipc_server_conv_set_weave_rects), and the per-DP eyes sink
+ *    (comp_multi_set_conv_eyes_sink, comp_d3d11_service_set_conv_eyes_sink's
+ *    twin): every eye query comp_multi answers publishes the answering DP's
+ *    eyes into the core keyed by that DP; a destroyed DP retires its key.
+ *
  * Not installed:
  *
- *  - TODO(lift rects (step C)): the weave path's bridge to core-routed
- *    streams (comp_d3d11_service_conv_set_bridge's counterpart) and the
- *    per-DP eyes sink (comp_d3d11_service_set_conv_eyes_sink's) -- until then
- *    the core's streams read the nominal viewer;
  *  - the `dp-lift` backend: the display plug-in's lift slots are D3D11-only;
  *  - a GPU client transport (textures + fences to the app): CPU bytes only.
  *
@@ -48,9 +53,14 @@
 #include "server/ipc_server_conv.h"
 #include "server/ipc_server_conv_cpu.h"
 
-#include "multi/comp_multi_interface.h"
-#include "vk_conv/vk_conv_gpu.h"
+#include "conversion/conv_core.h"
 
+#include "multi/comp_multi_interface.h"
+#include "multi/comp_multi_weave_lift.h"
+#include "vk_conv/vk_conv_gpu.h"
+#include "vk_conv/vk_conv_weave.h"
+
+#include "os/os_time.h"
 #include "util/u_logging.h"
 
 #include <string.h>
@@ -59,7 +69,46 @@ static struct
 {
 	bool attached;
 	struct vk_conv_gpu *glue;
+	struct vk_conv_weave *weave;
 } g_conv_vk;
+
+static bool
+bridge_resolve(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode)
+{
+	return ipc_server_conv_resolve_stream((struct ipc_server_conv *)ud, owner, wire_id, out_core_id, out_mode);
+}
+
+static void
+bridge_match_weave(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views)
+{
+	ipc_server_conv_v4_match_weave((struct ipc_server_conv *)ud, owner, wire_id, views);
+}
+
+static void
+eyes_sink(void *ud, uint64_t dp_key, const struct xrt_eye_positions *e)
+{
+	struct conv_eyes ce;
+	memset(&ce, 0, sizeof(ce));
+	ce.valid = e->valid;
+	ce.is_tracking = e->is_tracking;
+	ce.count = e->count > CONV_EYES_MAX ? CONV_EYES_MAX : e->count;
+	for (uint32_t i = 0; i < ce.count; i++) {
+		ce.xyz[i][0] = e->eyes[i].x;
+		ce.xyz[i][1] = e->eyes[i].y;
+		ce.xyz[i][2] = e->eyes[i].z;
+	}
+	ce.timestamp_ns = os_monotonic_get_ns();
+	conv_core_eyes_publish((struct conv_core *)ud, dp_key, &ce);
+}
+
+static void
+eyes_retire(void *ud, uint64_t dp_key)
+{
+	conv_core_eyes_retire((struct conv_core *)ud, dp_key);
+}
+
+//! The weave stream tag the bridge resolves is the v3 route's (as on D3D11).
+_Static_assert(IPC_SERVER_CONV_STREAM_TAG == (1ull << 62), "the weave path's core-stream tag");
 
 static bool
 gpu_write(void *ud, const struct xrt_conv_image *dst, const void *pixels, uint32_t row_pitch)
@@ -103,7 +152,6 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	vk_conv_gpu_alloc_ops(g_conv_vk.glue, &gpu.alloc);
 	vk_conv_gpu_stage_ops(g_conv_vk.glue, &gpu.viewsyn, &gpu.readback);
 	// gpu.dp_lift: none (D3D11 only).
-	// TODO(lift rects (step C)): the weave bridge and the per-DP eyes sink.
 	gpu.nominal_z_m = xsysc->info.nominal_viewer_z_m;
 	gpu.adapter_luid = 0; // satellites are CPU-lane only on POSIX
 
@@ -119,6 +167,26 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	struct ipc_server_conv_cpu_gpu copies = {gpu_write, gpu_read, g_conv_vk.glue};
 	ipc_server_conv_cpu_io_set_gpu(&copies);
 	ipc_server_conv_install_gpu(sc, &gpu);
+
+	// Step C: the per-DP eyes sink, then lifted weave rects.
+	struct conv_core *core = ipc_server_conv_get_core(sc);
+	comp_multi_set_conv_eyes_sink(eyes_sink, eyes_retire, core);
+	if (vk_conv_weave_create(vk, g_conv_vk.glue, &g_conv_vk.weave)) {
+		struct vk_conv_weave_bridge b;
+		memset(&b, 0, sizeof(b));
+		b.core = core;
+		b.resolve = bridge_resolve;
+		b.match_weave = bridge_match_weave;
+		b.ud = sc;
+		vk_conv_weave_set_bridge(g_conv_vk.weave, &b);
+		struct vk_conv_weave_ops ops;
+		vk_conv_weave_get_ops(g_conv_vk.weave, &ops);
+		comp_multi_weave_set_lift_ops(&ops);
+		ipc_server_conv_set_weave_rects(sc, true);
+		U_LOG_W("[conv] Vulkan glue: lifted weave rects on (spec-3 SBS / NVIEW streams for weave rects)");
+	} else {
+		U_LOG_W("[conv] Vulkan glue: lifted weave rects unavailable (helper create failed); woven as drawn");
+	}
 	g_conv_vk.attached = true;
 }
 
@@ -129,6 +197,13 @@ ipc_server_conv_detach_vk(void)
 		return;
 	}
 	struct ipc_server_conv *sc = ipc_server_get_conv();
+	// Step C first: no new lifted rects, no more eyes; comp_multi lets go of
+	// the helper (waits for calls in flight), then the helper drops its pins
+	// and pending snapshots (the queue idle) while the core's streams exist.
+	ipc_server_conv_set_weave_rects(sc, false);
+	comp_multi_weave_set_lift_ops(NULL);
+	comp_multi_set_conv_eyes_sink(NULL, NULL, NULL);
+	vk_conv_weave_destroy(&g_conv_vk.weave);
 	// The core lets go first (the route, every core-routed stream -- their
 	// images are the glue's --, the allocator, S5 / S6), then the copies
 	// (waits for one in flight), then the glue.

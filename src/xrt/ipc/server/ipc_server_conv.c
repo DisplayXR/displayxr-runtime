@@ -112,6 +112,9 @@ struct ipc_server_conv
 	void *gpu_hook_ud;
 	uint64_t next_wire;
 	struct sc_stream streams[IPC_SERVER_CONV_MAX_STREAMS];
+	//! ADR-053 P5 step C: the CPU route (cpu_only) still serves spec-3 SBS /
+	//! NVIEW streams, for lifted weave rects only (ipc_server_conv_set_weave_rects).
+	bool weave_rects;
 
 	//! Spec-4 events: a leaf lock of its own, because the core calls
 	//! ipc_server_conv_on_event with its locks held while this module may hold
@@ -508,11 +511,32 @@ ipc_server_get_conv(void)
  *
  */
 
+void
+ipc_server_conv_set_weave_rects(struct ipc_server_conv *sc, bool enabled)
+{
+	if (sc == NULL) {
+		return;
+	}
+	os_mutex_lock(&sc->mtx);
+	sc->weave_rects = enabled;
+	os_mutex_unlock(&sc->mtx);
+}
+
+//! The CPU route (POSIX) serves spec 3 only as weave-rect streams: SBS / NVIEW.
+static bool
+cpu_route_v3_ok(struct ipc_server_conv *sc, uint32_t mode)
+{
+	os_mutex_lock(&sc->mtx);
+	const bool on = sc->weave_rects;
+	os_mutex_unlock(&sc->mtx);
+	return on && (mode == XRT_DP_LIFT_MODE_SBS || mode == XRT_DP_LIFT_MODE_NVIEW);
+}
+
 bool
 ipc_server_conv_routes_properties(struct ipc_server_conv *sc)
 {
 	struct ipc_server_conv_io_ops io;
-	if (!get_io(sc, &io) || io.cpu_only) {
+	if (!get_io(sc, &io) || (io.cpu_only && !cpu_route_v3_ok(sc, XRT_DP_LIFT_MODE_SBS))) {
 		return false;
 	}
 	if (conv_core_task_has_candidate(sc->core, XRT_CONV_TASK_VIEWS_MONO) ||
@@ -527,7 +551,7 @@ bool
 ipc_server_conv_routes_create(struct ipc_server_conv *sc, uint32_t mode, uint32_t content_hint)
 {
 	struct ipc_server_conv_io_ops io;
-	if (!get_io(sc, &io) || io.cpu_only) {
+	if (!get_io(sc, &io) || (io.cpu_only && !cpu_route_v3_ok(sc, mode))) {
 		return false;
 	}
 	if (mode == XRT_DP_LIFT_MODE_GAUSSIANS) {
@@ -697,6 +721,11 @@ ipc_server_conv_lift_properties(struct ipc_server_conv *sc, struct xrt_dp_lift_c
 	if (main != NULL) {
 		out->max_streams = main->max_streams;
 		out->typical_latency_ns = (uint64_t)main->est_latency_ms * 1000000ull;
+	}
+	// The CPU route (POSIX) serves spec 3 only as weave-rect streams.
+	if (get_io(sc, &io) && io.cpu_only) {
+		out->modes &= XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
+		out->aux_outputs = 0;
 	}
 	// No provider identity crosses the app API (ADR-053).
 	memcpy(out->backend, "conversion", sizeof("conversion"));
