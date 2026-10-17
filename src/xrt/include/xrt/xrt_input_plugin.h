@@ -218,6 +218,56 @@ struct xrt_input_host_display_geometry
 };
 
 /*!
+ * What happened to one pointer in a @ref xrt_input_pointer_event. The values
+ * are the platform-neutral subset every pointer source has (Android
+ * `MotionEvent` actions, Win32 / X11 / Cocoa mouse, pen); a source maps its
+ * own vocabulary onto these before publishing.
+ *
+ * @ingroup xrt_iface
+ */
+enum xrt_input_pointer_action
+{
+	//! A pointer went down. The first down of a gesture AND every later finger.
+	XRT_INPUT_POINTER_ACTION_DOWN = 1,
+	//! A pointer moved. One event per pointer that moved (never a batch).
+	XRT_INPUT_POINTER_ACTION_MOVE = 2,
+	//! A pointer went up (lifted / button released).
+	XRT_INPUT_POINTER_ACTION_UP = 3,
+	//! The gesture was taken away (Android `ACTION_CANCEL`, capture lost): every pointer is up.
+	XRT_INPUT_POINTER_ACTION_CANCEL = 4,
+};
+
+/*!
+ * One pointer event on a surface the runtime renders into, as drained by
+ * @ref xrt_input_plugin_host_iface::poll_pointer_events.
+ *
+ * Coordinates are SURFACE pixels, origin top-left, y down — exactly what
+ * the window system reports — together with the surface's extent at the
+ * time of the event, so a provider can normalise without a second query
+ * (and without ever learning where the surface sits on the panel). A
+ * provider that maps the surface onto the display plane assumes the
+ * surface fills the panel, which is exact for a fullscreen `_hosted`
+ * surface and an approximation for a sub-panel window.
+ *
+ * `struct_size` first, like every struct on this ABI (ADR-020): the queue
+ * element may grow at the end under its cover.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_input_pointer_event
+{
+	uint32_t struct_size;    //!< `sizeof(struct xrt_input_pointer_event)` at the publisher's compile time
+	uint32_t action;         //!< @ref xrt_input_pointer_action
+	int64_t timestamp_ns;    //!< Monotonic clock (`os_monotonic_get_ns` domain) of the event
+	uint32_t pointer_id;     //!< Stable id of this pointer across its DOWN..UP life (Android pointer id)
+	uint32_t pointer_count;  //!< Pointers down AFTER this event (0 after the last UP / a CANCEL)
+	float x;                 //!< Surface pixels, origin top-left
+	float y;                 //!< Surface pixels, y down
+	uint32_t surface_width;  //!< Surface extent in pixels at the time of the event; 0 = unknown
+	uint32_t surface_height; //!< Surface extent in pixels at the time of the event; 0 = unknown
+};
+
+/*!
  * Host-supplied callbacks the provider may call. Intentionally minimal in
  * v1 — logging, debug-var tracking, and metrics reach providers through
  * the runtime's aux export surface, same boundary discipline as
@@ -280,10 +330,38 @@ struct xrt_input_plugin_host_iface
 	xrt_component_get_setting_fn_t get_setting;
 
 	/*!
+	 * Drain the host's pointer-event queue (touch, mouse, pen — whatever the
+	 * surface the runtime renders into receives). The runtime OWNS the
+	 * surfaces and so is the only side that ever sees their input events:
+	 * its own hosted `SurfaceView` on Android, an app-owned surface fed
+	 * through `xrSubmitAndroidInputEventDXR`, and — later — a workspace
+	 * controller forwarding the events it hit-tests (#1996). A provider
+	 * that turns those events into devices (the touch provider's
+	 * navigation device + emulated controller) reads them ONLY here and
+	 * keeps every bit of gesture policy on its own side (ADR-034
+	 * Amendment 4: no gesture policy enters the runtime).
+	 *
+	 * Copies up to @p max events, oldest first, into @p out and returns how
+	 * many. Non-blocking, allocation-free, safe from any thread; call it
+	 * from `update_inputs`, which `xrSyncActions` sweeps at frame rate.
+	 * The queue is process-wide and single-consumer by convention (the
+	 * runtime loads at most one provider that consumes it), and it drops
+	 * the OLDEST event when it overflows — a stale MOVE is worth less than
+	 * the UP that follows it.
+	 *
+	 * Carved out of the former reserved[2], like the two slots above: size
+	 * and every other offset unchanged, the API major stays 1. An older
+	 * runtime leaves it NULL — providers MUST NULL-check (and cover-check
+	 * `struct_size`). Announced by
+	 * @ref XRT_INPUT_PLUGIN_HOST_HAS_POLL_POINTER_EVENTS.
+	 */
+	uint32_t (*poll_pointer_events)(struct xrt_input_pointer_event *out, uint32_t max);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Providers MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[12];
+	void *reserved[11];
 };
 
 /*!
@@ -294,18 +372,30 @@ struct xrt_input_plugin_host_iface
  */
 #define XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING 1
 
-// The get_display_geometry and get_setting slots were carved out of the former
-// reserved[0] / reserved[1]: the host iface's size and every other offset are
-// unchanged, so providers built against the previous header keep working and
-// the API major stays 1.
+/*!
+ * Defined when this header carries the
+ * @ref xrt_input_plugin_host_iface::poll_pointer_events slot, so a provider
+ * that must also compile against an older runtime header can `#ifdef`-guard
+ * its use.
+ */
+#define XRT_INPUT_PLUGIN_HOST_HAS_POLL_POINTER_EVENTS 1
+
+// The get_display_geometry, get_setting and poll_pointer_events slots were
+// carved out of the former reserved[0] / reserved[1] / reserved[2]: the host
+// iface's size and every other offset are unchanged, so providers built
+// against the previous header keep working and the API major stays 1.
 // clang-format off
 XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, get_setting) ==
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     sizeof(void *),
                             "xrt_input_plugin_host_iface: get_setting must occupy the former reserved[1]");
-XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, poll_pointer_events) ==
                                 offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
                                     2 * sizeof(void *),
+                            "xrt_input_plugin_host_iface: poll_pointer_events must occupy the former reserved[2]");
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+                                offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+                                    3 * sizeof(void *),
                             "xrt_input_plugin_host_iface: get_display_geometry must occupy the former reserved[0]");
 XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_host_iface) ==
                                 2 * sizeof(uint32_t) + 14 * sizeof(void *),
