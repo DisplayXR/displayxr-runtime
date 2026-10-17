@@ -32,6 +32,8 @@
 
 #include "xrt/xrt_input_plugin.h"
 
+#include "target_input_pref.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -313,49 +315,8 @@ struct target_input_app_pin
 int
 target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max);
 
-//! Where a family's effective preference came from (@ref target_input_resolve_preference).
-enum target_input_pref_source
-{
-	TARGET_INPUT_PREF_NONE = 0,         //!< default walk (ProbeOrder)
-	TARGET_INPUT_PREF_APP_PIN = 1,      //!< the user's per-app pin
-	TARGET_INPUT_PREF_REQUEST = 2,      //!< the client's non-persisted session request
-	TARGET_INPUT_PREF_USER_DEFAULT = 3, //!< `PreferredPlugin` (already priority 0 in the global rank)
-};
-
-/*!
- * Everything the per-family precedence needs, gathered by the caller. A
- * `*_claims` flag says whether that candidate supplies THIS family — a
- * preference never applies to a family its provider does not claim (ADR-034
- * Amendment 5 decision 2), so an unclaimed level falls through to the next.
- */
-struct target_input_pref_inputs
-{
-	//! `DXR_INPUT_PROVIDERS=0` or `ForceQwerty`: no provider is resident; every pin is moot.
-	bool providers_disabled;
-	//! HKLM `InputProviders\Policy\Lock` = 1: the per-user pin and the app's request are ignored.
-	bool lock;
-	const char *app_pin; //!< NULL / "" = none
-	bool app_pin_claims;
-	const char *request; //!< NULL / "" = none
-	bool request_claims;
-	const char *user_default; //!< NULL / "" = none
-	bool user_default_claims;
-};
-
-/*!
- * The precedence of ADR-034 Amendment 5 decision 3 for ONE family, pure:
- * `Policy\Lock` -> per-app pin -> session request -> `PreferredPlugin` ->
- * ProbeOrder, with `DXR_INPUT_PROVIDERS=0` / `ForceQwerty` beating all. Writes
- * the winning id to @p out ("" for NONE) and returns its source. Presence is
- * NOT decided here: the arbiter hoists the winner and its walk still skips it
- * while absent.
- */
-enum target_input_pref_source
-target_input_resolve_preference(const struct target_input_pref_inputs *in, char *out, size_t cap);
-
-//! Stable lower-case name of a @ref target_input_pref_source ("none", "app_pin", "request", "user_default").
-const char *
-target_input_pref_source_str(enum target_input_pref_source source);
+// The per-family precedence (`target_input_resolve_preference`) is pure and lives in
+// target_input_pref.h, so the arbiter and its standalone tests share it.
 
 /*!
  * ADR-054 N3d (#2051): re-read the class's policy — `PreferredPlugin` (HKCU

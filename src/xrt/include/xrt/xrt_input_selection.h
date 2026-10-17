@@ -51,6 +51,8 @@
 extern "C" {
 #endif
 
+struct xrt_system_roles;
+
 
 /*!
  * Size of a provider id, NUL included — the registration id (Windows subkey /
@@ -236,6 +238,18 @@ struct xrt_input_selection
 	                              struct xrt_input_client_holders *out_holders);
 
 	/*!
+	 * The dynamic roles as @p client resolves them: the controller, hand-tracking
+	 * and gamepad roles with the client's preference overlay applied, the rig
+	 * runtime-wide. `generation_id` is THIS client's — monotonic, seeded from
+	 * the system's, bumped only when this client's resolved roles change. The
+	 * IPC server answers `system_devices_get_roles` with it; in-process,
+	 * `xrt_system_devices::get_roles` is the implicit client's view.
+	 */
+	xrt_result_t (*get_roles)(struct xrt_input_selection *xis,
+	                          const struct xrt_input_selection_client *client,
+	                          struct xrt_system_roles *out_roles);
+
+	/*!
 	 * @p client is gone (IPC disconnect): drop its session requests and
 	 * cached roles. Its per-app pin is the user's and stays.
 	 */
@@ -279,6 +293,18 @@ xrt_input_selection_query_holders(struct xrt_input_selection *xis,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	return xis->query_holders(xis, index, out_holders);
+}
+
+//! @copydoc xrt_input_selection::get_roles
+static inline xrt_result_t
+xrt_input_selection_get_roles(struct xrt_input_selection *xis,
+                              const struct xrt_input_selection_client *client,
+                              struct xrt_system_roles *out_roles)
+{
+	if (xis == NULL || xis->get_roles == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xis->get_roles(xis, client, out_roles);
 }
 
 //! @copydoc xrt_input_selection::client_detach

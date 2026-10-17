@@ -71,6 +71,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -279,6 +280,72 @@ struct t_input_arbiter_rank
  */
 int
 t_input_arbiter_rerank(const struct t_input_arbiter_rank *ranks, int count);
+
+
+/*
+ *
+ * Per-client resolution (ADR-034 Amendment 5, #2181).
+ *
+ * The controller, hand-tracking and gamepad roles are resolved PER CLIENT: an
+ * IPC connection, or the implicit in-process client (key 0) whose view is what
+ * `xsysd->get_roles` returns. A client contributes at most one preferred
+ * provider id per role family — from the user's per-app pin or its own
+ * non-persisted request (the precedence in target_input_pref.h) — which
+ * hoists that candidate to the front of THAT family's walk for THAT client
+ * only, and only where the candidate supplies the family. Presence still
+ * gates: an absent preferred candidate falls through to the default walk. The
+ * rig role stays runtime-wide; the static hand-tracking roles are untouched.
+ *
+ * Each client's resolved roles are cached and recomputed only when the
+ * arbiter's state epoch (a presence edge, a re-rank, a floor withdrawal) or the
+ * client's own overlay moved; each client carries ONE monotonic generation,
+ * seeded from the system's and bumped only when its resolved roles change
+ * (the OpenXR layer refreshes on strict `<`). Nothing here runs on the
+ * presence poll thread (#958).
+ *
+ * The installed arbiter publishes all of this as
+ * `xsysd->input_selection` (`xrt/xrt_input_selection.h`).
+ *
+ */
+
+/*!
+ * Policy reads the arbiter needs but must not own (the plug-in loader's store;
+ * the arbiter's tests supply fakes). Every slot is optional. The arbiter calls
+ * them OFF its lock, never on the presence poll thread.
+ */
+struct t_input_arbiter_policy
+{
+	//! The user's per-app pin for @p exe_basename ("" + false when none, or hidden by Policy\Lock).
+	bool (*get_app_pin)(const char *exe_basename, char *out, size_t cap);
+	//! Write / clear (@p provider_id NULL or "") that pin. 0 = written; anything else = refused.
+	int (*set_app_pin)(const char *exe_basename, const char *provider_id);
+	//! HKLM `InputProviders\Policy\Lock` = 1: per-user pins and app requests are ignored.
+	bool (*get_policy_lock)(void);
+	//! The user default (`PreferredPlugin`, with the lock applied).
+	bool (*get_user_default)(char *out, size_t cap);
+	//! The REGISTRATION id of the provider that probed into @p inst ("" / NULL = use `iface->id`).
+	const char *(*row_id_for)(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst);
+	//! This process's executable basename (the implicit client's per-app key).
+	bool (*self_exe_basename)(char *out, size_t cap);
+};
+
+/*!
+ * Install the policy reads (copied; NULL clears them). Survives
+ * @ref t_input_arbiter_reset. The plug-in loader installs the real store at
+ * discovery.
+ */
+void
+t_input_arbiter_set_policy(const struct t_input_arbiter_policy *policy);
+
+/*!
+ * ADR-054 N3d hook for Amendment 5: the class policy changed — re-read the
+ * lock, the user default and every attached client's per-app pin (store I/O
+ * off the lock), then mark the clients for re-resolution. Called by
+ * @ref target_input_plugin_reread_policy after the re-rank. Returns the number
+ * of clients whose pin changed. Any thread except the presence poll thread.
+ */
+int
+t_input_arbiter_policy_changed(void);
 
 #ifdef __cplusplus
 }

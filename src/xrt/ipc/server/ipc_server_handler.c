@@ -9202,9 +9202,23 @@ ipc_handle_device_is_form_factor_available(volatile struct ipc_client_state *ics
 	return XRT_SUCCESS;
 }
 
+static void
+input_client_ref(volatile struct ipc_client_state *ics, struct xrt_input_selection_client *out);
+static struct xrt_input_selection *
+input_selection_of(volatile struct ipc_client_state *ics);
+
 xrt_result_t
 ipc_handle_system_devices_get_roles(volatile struct ipc_client_state *ics, struct xrt_system_roles *out_roles)
 {
+	// ADR-034 Am.5 (#2181): THIS connection's roles — its preference overlay
+	// applied, its own monotonic generation. Without selection support, the
+	// system-wide roles as before.
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	if (xis != NULL && xis->get_roles != NULL) {
+		struct xrt_input_selection_client client;
+		input_client_ref(ics, &client);
+		return xrt_input_selection_get_roles(xis, &client, out_roles);
+	}
 	return xrt_system_devices_get_roles(ics->server->xsysd, out_roles);
 }
 
