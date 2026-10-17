@@ -386,7 +386,7 @@ option(XRT_FEATURE_OPENXR_BODY_TRACKING_FB "Enable XR_FB_body_tracking" OFF)
 option(XRT_FEATURE_OPENXR_DISPLAY_REFRESH_RATE "Enable XR_FB_display_refresh_rate" ON)
 option(XRT_FEATURE_OPENXR_FACE_TRACKING2_FB "Enable XR_FB_face_tracking2" OFF)
 option(XRT_FEATURE_OPENXR_FACIAL_TRACKING_HTC "Enable XR_HTC_facial_tracking" OFF)
-option(XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL "Enable XR_MNDX_force_feedback_curl" ON)
+option(XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL "Enable XR_MNDX_force_feedback_curl" OFF)
 option(XRT_FEATURE_OPENXR_HAND_TRACKING_EXT "Enable XR_EXT_hand_tracking" ON)
 option_with_deps(XRT_FEATURE_OPENXR_HAND_TRACKING_DATA_SOURCE_EXT DEPENDS XRT_FEATURE_OPENXR_HAND_TRACKING_EXT)
 option(XRT_FEATURE_OPENXR_HAPTIC_PCM "Enable XR_FB_haptic_pcm" OFF)
@@ -394,7 +394,7 @@ option(XRT_FEATURE_OPENXR_HEADLESS "Enable XR_MND_headless" ON)
 option(XRT_FEATURE_OPENXR_OVERLAY "Enable XR_EXTX_overlay" ON)
 option(XRT_FEATURE_OPENXR_PERFORMANCE_SETTINGS "Enable XR_EXT_performance_settings" OFF)
 option(XRT_FEATURE_OPENXR_PLANE_DETECTION "Enable XR_EXT_plane_detection" OFF)
-option(XRT_FEATURE_OPENXR_USER_PRESENCE "Enable XR_EXT_user_presence" ON)
+option(XRT_FEATURE_OPENXR_USER_PRESENCE "Enable XR_EXT_user_presence" OFF)
 option(XRT_FEATURE_OPENXR_VISIBILITY_MASK "Enable XR_KHR_visibility_mask" ON)
 option(XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST "Enable XR_KHR_vulkan_swapchain_format_list" ON)
 option(XRT_FEATURE_OPENXR_XDEV_SPACE "Enable XR_MNDX_xdev_space" ON)
@@ -402,20 +402,29 @@ option_with_deps(XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META "Enable XR_META
 option_with_deps(XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META "Enable XR_META_body_tracking_calibration" DEPENDS XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META)
 
 # Interaction extension support.
-option(XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE "Enable XR_EXT_eye_gaze_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND "Enable XR_EXT_hand_interaction" ON)
+#
+# Default OFF for every extension / interaction profile no in-tree or planned
+# provider can serve (#703): the `eyes` role is never assigned, nothing creates
+# an XRT_DEVICE_EYE_GAZE_INTERACTION / HAND_INTERACTION device, and the vendor
+# controller profiles below describe headset controllers a 3D display never
+# sees. The qwerty floor + Ultraleap emulate simple / touch / index / vive /
+# WMR, which are core (not extension) profiles and stay. XR_EXT_hand_tracking
+# stays ON (Ultraleap serves it, gated at runtime by xrGetSystemProperties).
+# A vendor can flip any of these back on at configure time.
+option(XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE "Enable XR_EXT_eye_gaze_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND "Enable XR_EXT_hand_interaction" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_EXT_PALM_POSE "Enable XR_EXT_palm_pose" OFF)
-option(XRT_FEATURE_OPENXR_INTERACTION_ML2 "Enable XR_ML_ml2_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_MNDX "Enable XR_MNDX_ball_on_a_stick_controller, XR_MNDX_hydra and XR_MNDX_system_buttons" ON)
+option(XRT_FEATURE_OPENXR_INTERACTION_ML2 "Enable XR_ML_ml2_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_MNDX "Enable XR_MNDX_ball_on_a_stick_controller, XR_MNDX_hydra and XR_MNDX_system_buttons" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_MSFT_HAND "Enable XR_MSFT_hand_interaction" OFF)
-option(XRT_FEATURE_OPENXR_INTERACTION_OPPO "Enable XR_OPPO_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_WINMR "Enable XR_EXT_hp_mixed_reality_controller and XR_EXT_samsung_odyssey_controller" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE "Enable XR_BD_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS "Enable XR_HTC_vive_cosmos_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" ON)
+option(XRT_FEATURE_OPENXR_INTERACTION_OPPO "Enable XR_OPPO_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_WINMR "Enable XR_EXT_hp_mixed_reality_controller and XR_EXT_samsung_odyssey_controller" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE "Enable XR_BD_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS "Enable XR_HTC_vive_cosmos_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" OFF)
 
 # Defaults for OpenXR layer support
 # Off: DisplayXR is a flat lightfield display, not a reprojecting HMD, so a
