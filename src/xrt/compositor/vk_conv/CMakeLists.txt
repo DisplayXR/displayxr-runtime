@@ -36,7 +36,7 @@ target_include_directories(comp_vk_conv_viewsyn PRIVATE ${CMAKE_CURRENT_BINARY_D
 target_link_libraries(comp_vk_conv_viewsyn PUBLIC xrt-interfaces aux_vk PRIVATE aux_util)
 
 # Image allocation (exportable VkImages), CPU <-> image, S5 adapter, S6 readback.
-add_library(comp_vk_conv STATIC vk_conv_gpu.c vk_conv_gpu.h)
+add_library(comp_vk_conv STATIC vk_conv_gpu.c vk_conv_gpu.h vk_conv_weave.c vk_conv_weave.h)
 target_include_directories(comp_vk_conv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(
 	comp_vk_conv

@@ -1692,6 +1692,57 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 	*g_ptr = NULL;
 }
 
+bool
+vk_conv_gpu_lookup(struct vk_conv_gpu *g, const struct xrt_conv_image *x, struct vk_conv_gpu_image_ref *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (g == NULL || !is_glue_image(x) || !gate_enter(g)) {
+		return false;
+	}
+	struct vkc_img *img = img_find(g, x->import_key);
+	if (img != NULL) {
+		out->image = img->image;
+		out->format = img->format;
+		out->width = img->w;
+		out->height = img->h;
+		out->layers = img->layers;
+		out->foreign = img->foreign;
+	}
+	gate_leave(g);
+	return img != NULL;
+}
+
+void
+vk_conv_gpu_cmd_acquire(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vk_conv_gpu_image_ref *ref)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (g != NULL && ref != NULL && ref->foreign) {
+		vk_dmabuf_cmd_acquire_foreign(g->vk, cmd, ref->image, VK_IMAGE_LAYOUT_GENERAL,
+		                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		                              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+	}
+#else
+	(void)g;
+	(void)cmd;
+	(void)ref;
+#endif
+}
+
+void
+vk_conv_gpu_cmd_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vk_conv_gpu_image_ref *ref)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (g != NULL && ref != NULL && ref->foreign) {
+		vk_dmabuf_cmd_release_foreign(g->vk, cmd, ref->image, VK_IMAGE_LAYOUT_GENERAL,
+		                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT);
+	}
+#else
+	(void)g;
+	(void)cmd;
+	(void)ref;
+#endif
+}
+
 void
 vk_conv_gpu_get_caps(const struct vk_conv_gpu *g, struct vk_conv_gpu_caps *out)
 {

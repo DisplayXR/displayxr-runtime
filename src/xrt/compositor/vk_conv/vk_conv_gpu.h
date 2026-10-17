@@ -69,6 +69,7 @@
 #pragma once
 
 #include "xrt/xrt_conversion_plugin.h"
+#include "xrt/xrt_vulkan_includes.h"
 
 #include "conversion/conv_pipeline.h"
 #include "conversion/conv_stream.h"
@@ -148,6 +149,37 @@ vk_conv_gpu_write(struct vk_conv_gpu *g, const struct xrt_conv_image *dst, const
  */
 bool
 vk_conv_gpu_read(struct vk_conv_gpu *g, const struct xrt_conv_image *src, void *pixels, uint32_t row_pitch);
+
+/*!
+ * One glue image as another recorder on the same device sees it (the weave
+ * engines' lifted rects, vk_conv_weave): the image is in
+ * VK_IMAGE_LAYOUT_GENERAL between glue accesses, and a @ref foreign one
+ * (DMABUF) is owned by VK_QUEUE_FAMILY_FOREIGN_EXT between them -- bracket the
+ * access with vk_conv_gpu_cmd_acquire / vk_conv_gpu_cmd_release.
+ */
+struct vk_conv_gpu_image_ref
+{
+	VkImage image;
+	VkFormat format; //!< the creation format (an _SRGB one is copied, not blitted, to stay encoded)
+	uint32_t width, height, layers;
+	bool foreign;
+};
+
+/*!
+ * Look up @p x, an image this glue allocated (false for a CPU image or one it
+ * does not own). The image lives as long as the core holds it: the caller
+ * holds a pin or the slot it belongs to while the GPU uses it.
+ */
+bool
+vk_conv_gpu_lookup(struct vk_conv_gpu *g, const struct xrt_conv_image *x, struct vk_conv_gpu_image_ref *out);
+
+//! Record the acquire of a foreign @p ref into @p cmd (GENERAL; no-op for a non-foreign image).
+void
+vk_conv_gpu_cmd_acquire(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vk_conv_gpu_image_ref *ref);
+
+//! Record the release of a foreign @p ref back to VK_QUEUE_FAMILY_FOREIGN_EXT (no-op otherwise).
+void
+vk_conv_gpu_cmd_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vk_conv_gpu_image_ref *ref);
 
 //! Diagnostics: how many times the S5 stage ran its passes 1-6 (0 before the first S5).
 uint64_t
