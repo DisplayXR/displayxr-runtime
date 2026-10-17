@@ -30,6 +30,10 @@
 #include "conversion/conv_readiness.h"
 
 #include "server/ipc_server_conv.h"
+#ifndef _WIN32
+#include "server/ipc_server_conv_cpu.h"
+#include "shared/ipc_cpu_buffer.h"
+#endif
 #include "shared/ipc_protocol.h"
 
 #include "xrt/xrt_conv_wire.h"
@@ -39,6 +43,7 @@
 #include "os/os_time.h"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -863,6 +868,134 @@ TEST_CASE("composed binding: the depth stage's import kinds reach the allocator;
 	CHECK(g_live.load() == 0);
 	conv_fake_fini(&f);
 }
+
+TEST_CASE("windowless submit rect: the submitted extent's aspect inside the panel; a window rect unchanged",
+          "[ipc_lift_core]")
+{
+	xrt_lift_rect_frame out{};
+	// A window / weave rect passes through byte-identical.
+	xrt_lift_rect_frame win{};
+	win.center[0] = 0.05f;
+	win.center[1] = -0.02f;
+	win.width_m = 0.20f;
+	win.height_m = 0.10f;
+	win.valid = true;
+	win.eyes_dp_key = 77;
+	REQUIRE(ipc_server_conv_submit_rect(&win, 1280, 720, &out));
+	CHECK(std::memcmp(&out, &win, sizeof(win)) == 0);
+
+	// Windowless: the panel's size (invalid) + a 16:9 extent on a 5:3 panel:
+	// full panel width, the extent's aspect, centred, valid.
+	xrt_lift_rect_frame panel{};
+	panel.width_m = 0.50f;
+	panel.height_m = 0.30f;
+	panel.eyes_dp_key = 9;
+	REQUIRE(ipc_server_conv_submit_rect(&panel, 1280, 720, &out));
+	CHECK(out.valid);
+	CHECK(out.width_m == 0.50f);
+	CHECK(std::fabs(out.height_m - 0.50f * 720.0f / 1280.0f) < 1e-6f);
+	CHECK(out.center[0] == 0.0f);
+	CHECK(out.center[1] == 0.0f);
+	CHECK(out.eyes_dp_key == 9u);
+	// A taller-than-panel extent: full panel height.
+	REQUIRE(ipc_server_conv_submit_rect(&panel, 640, 640, &out));
+	CHECK(out.height_m == 0.30f);
+	CHECK(std::fabs(out.width_m - 0.30f) < 1e-6f);
+	// No panel size, no extent, no frame: the rect stays unknown (as before).
+	xrt_lift_rect_frame none{};
+	CHECK_FALSE(ipc_server_conv_submit_rect(&none, 1280, 720, &out));
+	CHECK_FALSE(ipc_server_conv_submit_rect(&panel, 0, 720, &out));
+	CHECK_FALSE(ipc_server_conv_submit_rect(nullptr, 1280, 720, &out));
+}
+
+#ifndef _WIN32
+TEST_CASE("spec-4 link stream (no window): converts at the submitted extent, against an extent-aspect rect",
+          "[ipc_lift_core]")
+{
+	// A windowless connection submits 320x180 on a 0.6 x 0.4 m panel: the
+	// provider sees a rect of the EXTENT's aspect (16:9, panel-wide), and the
+	// result is 2 x 320 wide -- the panel never sets the resolution. A
+	// windowed submit's rect reaches the provider unchanged.
+	ipc_server_conv_io_ops cpu_io;
+	if (!ipc_server_conv_cpu_io_get(&cpu_io)) {
+		SKIP("no CPU buffer transport on this platform");
+	}
+	conv_fake_provider f;
+	conv_fake_init(&f, "views");
+	conv_fake_cap *v =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	v->state = XRT_CONV_STATE_READY;
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		ipc_server_conv_set_io(fx.sc, &cpu_io);
+		REQUIRE(fx.add(f) >= 0);
+		xrt_conv_wire_stream_desc sd{};
+		sd.struct_size = sizeof(sd);
+		sd.family_version = XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+		sd.task = XRT_CONV_TASK_VIEWS_MONO;
+		sd.input_kind = XRT_CONV_INPUT_MONO;
+		sd.view_count = 2;
+		sd.content_hint = XRT_CONV_CONTENT_VIDEO;
+		xrt_conv_wire_stream_created cr{};
+		REQUIRE(ipc_server_conv_v4_stream_create(fx.sc, 1, &sd, 0, 0, 1.0f, &cr) == XRT_SUCCESS);
+
+		const uint32_t W = 320, H = 180;
+		auto convert = [&](const xrt_lift_rect_frame &frame, ipc_lift_result &r3) {
+			bool ready = false;
+			return wait_until(
+			    [&] {
+				    std::vector<uint8_t> px((size_t)W * H * 4, 0x50);
+				    xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+				    REQUIRE(ipc_cpu_buffer_create(px.size(), &h));
+				    conv_input_import in{};
+				    in.kind = CONV_INPUT_CPU;
+				    in.handle = h;
+				    in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+				    in.cpu_row_pitch = W * 4;
+				    ipc_arg_lift_submit a{};
+				    a.stream_id = cr.stream_id;
+				    a.source_time = 42;
+				    a.width = W;
+				    a.height = H;
+				    uint64_t fid = 0;
+				    (void)ipc_server_conv_v4_submit(fx.sc, 1, &a, &in, &frame, &fid);
+				    bool disc = false;
+				    xrt_conv_wire_result r4{};
+				    return ipc_server_conv_v4_acquire(fx.sc, 1, cr.stream_id, &ready, &disc, &r3, &r4) ==
+				               XRT_SUCCESS &&
+				           ready;
+			    },
+			    3000);
+		};
+
+		xrt_lift_rect_frame windowless{};
+		windowless.width_m = 0.60f; // the panel, invalid: what the handler fills
+		windowless.height_m = 0.40f;
+		ipc_lift_result r3{};
+		REQUIRE(convert(windowless, r3));
+		CHECK(r3.width == 2u * W); // output extent == input extent, per view
+		CHECK(r3.height == H);
+		os_mutex_lock(&f.mtx);
+		const float rw = f.last_params.rect_width_m, rh = f.last_params.rect_height_m;
+		os_mutex_unlock(&f.mtx);
+		CHECK(rw == 0.60f);
+		CHECK(std::fabs(rh - 0.60f * (float)H / (float)W) < 1e-5f);
+
+		xrt_lift_rect_frame win{};
+		win.width_m = 0.20f;
+		win.height_m = 0.12f;
+		win.valid = true;
+		REQUIRE(convert(win, r3));
+		os_mutex_lock(&f.mtx);
+		CHECK(f.last_params.rect_width_m == 0.20f);
+		CHECK(f.last_params.rect_height_m == 0.12f);
+		os_mutex_unlock(&f.mtx);
+
+		ipc_server_conv_set_io(fx.sc, nullptr);
+	}
+	conv_fake_fini(&f);
+}
+#endif
 
 TEST_CASE("roadmap 11.2: IPC handle capacity and reply sizes (measured)", "[ipc_lift_core]")
 {

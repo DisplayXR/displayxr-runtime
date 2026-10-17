@@ -1553,6 +1553,9 @@ if(TARGET tests_ipc_lift_core)
 	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
 	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	target_link_libraries(tests_ipc_lift_core PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
+	if(NOT WIN32)
+		target_link_libraries(tests_ipc_lift_core PRIVATE ipc_shared) # the CPU I/O glue's buffers
+	endif()
 	set_target_properties(tests_ipc_lift_core PROPERTIES CXX_STANDARD 17)
 endif()
 

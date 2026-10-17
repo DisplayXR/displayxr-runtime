@@ -10117,6 +10117,13 @@ ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
 		comp_d3d11_service_conv_rect_frame(fxsysc, ics->xc, &frame);
 	}
 #endif
+	// ADR-053 P5: no window (and no compositor helper filled the panel): the
+	// panel's size, still invalid -- ipc_server_conv_submit_rect fits the
+	// submitted extent's aspect inside it.
+	if (!frame.valid && !(frame.width_m > 0.0f) && ics->server != NULL && ics->server->xsysc != NULL) {
+		frame.width_m = ics->server->xsysc->info.display_width_m;
+		frame.height_m = ics->server->xsysc->info.display_height_m;
+	}
 	return ipc_server_conv_v4_submit(ipc_server_get_conv(), lift_owner(ics), args, &in, &frame, out_frame_id);
 }
 
