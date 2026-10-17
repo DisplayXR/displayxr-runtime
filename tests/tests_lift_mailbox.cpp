@@ -27,6 +27,7 @@
 #include "sim_conv_fake_ply.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -677,4 +678,129 @@ TEST_CASE("lift letterbox: no creep by a few pixels once cropped", "[lift][lette
 	}
 	CHECK(grew);
 	CHECK(lb.committed.top > first.top + 16);
+}
+
+namespace {
+
+//! The D3D11 reduction shader (k_lb_ps), transcribed: one bucket's value read
+//! straight from the whole image (R G B A, @p stride texels per row).
+float
+lb_shader_bucket(const std::vector<uint8_t> &img,
+                 uint32_t stride,
+                 uint32_t w,
+                 uint32_t h,
+                 bool rows,
+                 uint32_t i,
+                 uint32_t n)
+{
+	auto line_frac = [&](float a, float span) {
+		float cnt = 0.0f;
+		for (int k = 0; k < 96; k++) {
+			const float b = std::floor((k + 0.5f) * span / 96.0f);
+			const uint32_t x = rows ? (uint32_t)b : (uint32_t)a;
+			const uint32_t y = rows ? (uint32_t)a : (uint32_t)b;
+			const uint8_t *p = &img[((size_t)y * stride + x) * 4];
+			const float l = 0.2126f * p[0] / 255.0f + 0.7152f * p[1] / 255.0f + 0.0722f * p[2] / 255.0f;
+			cnt += l > 0.07f ? 1.0f : 0.0f;
+		}
+		return cnt / 96.0f;
+	};
+	const float len = rows ? (float)h : (float)w;
+	const float span = rows ? (float)w : (float)h;
+	const float a0 = std::floor(i * len / n);
+	const float a1 = std::max(a0, std::floor((i + 1) * len / n) - 1.0f);
+	const float am = std::floor((a0 + a1) * 0.5f);
+	return std::max(line_frac(a0, span), std::max(line_frac(am, span), line_frac(a1, span)));
+}
+
+//! The sampled lines of a w x h RGBA image, as a copy-only service reads them back.
+void
+lb_extract_lines(const std::vector<uint8_t> &img,
+                 uint32_t w,
+                 uint32_t h,
+                 std::vector<uint8_t> &cols,
+                 std::vector<uint8_t> &rows)
+{
+	const uint32_t n = U_LIFT_LETTERBOX_LINE_SAMPLES;
+	cols.assign((size_t)n * h * 4, 0);
+	rows.assign((size_t)n * w * 4, 0);
+	for (uint32_t k = 0; k < n; k++) {
+		const uint32_t x = u_lift_letterbox_sample_pos(k, w);
+		for (uint32_t y = 0; y < h; y++) {
+			memcpy(&cols[((size_t)k * h + y) * 4], &img[((size_t)y * w + x) * 4], 4);
+		}
+		const uint32_t y = u_lift_letterbox_sample_pos(k, h);
+		memcpy(&rows[(size_t)k * w * 4], &img[(size_t)y * w * 4], (size_t)w * 4);
+	}
+}
+
+} // namespace
+
+TEST_CASE("lift letterbox: the line-sample profile equals the D3D11 reduction", "[lift][letterbox]")
+{
+	// 2.39:1 film in a 1280x720 player: bars top/bottom, a caption in the bottom
+	// bar, a pillar of dark picture at the left edge.
+	const uint32_t w = 1280, h = 720;
+	std::vector<uint8_t> img((size_t)w * h * 4, 0);
+	const uint32_t top = 92, bottom = 92;
+	for (uint32_t y = top; y < h - bottom; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			uint8_t *p = &img[((size_t)y * w + x) * 4];
+			const uint8_t v = x < 40 ? 10 : (uint8_t)(60 + (x * 7 + y * 3) % 190);
+			p[0] = v;
+			p[1] = (uint8_t)(v / 2 + 30);
+			p[2] = (uint8_t)(255 - v);
+			p[3] = 255;
+		}
+	}
+	for (uint32_t y = h - 60; y < h - 40; y++) { // the caption
+		for (uint32_t x = 500; x < 780; x += 3) {
+			uint8_t *p = &img[((size_t)y * w + x) * 4];
+			p[0] = p[1] = p[2] = 240;
+			p[3] = 255;
+		}
+	}
+	std::vector<uint8_t> cl, rl;
+	lb_extract_lines(img, w, h, cl, rl);
+	std::vector<float> rows(U_LIFT_LETTERBOX_BINS_MAX), cols(U_LIFT_LETTERBOX_BINS_MAX);
+	uint32_t nr = 0, nc = 0;
+	u_lift_letterbox_profile_from_lines(cl.data(), rl.data(), w, h, false, rows.data(), &nr, cols.data(), &nc);
+	REQUIRE(nr == h);
+	REQUIRE(nc == w);
+	for (uint32_t i = 0; i < nr; i++) {
+		CHECK(rows[i] == lb_shader_bucket(img, w, w, h, true, i, nr));
+	}
+	for (uint32_t i = 0; i < nc; i++) {
+		CHECK(cols[i] == lb_shader_bucket(img, w, w, h, false, i, nc));
+	}
+	CHECK(rows[0] == 0.0f);
+	CHECK(rows[top] > U_LIFT_LETTERBOX_PICTURE_FRAC);
+
+	// The same pixels as B G R A give the same profile when flagged.
+	std::vector<uint8_t> bgra = img;
+	for (size_t i = 0; i < bgra.size(); i += 4) {
+		std::swap(bgra[i], bgra[i + 2]);
+	}
+	std::vector<uint8_t> cl2, rl2;
+	lb_extract_lines(bgra, w, h, cl2, rl2);
+	std::vector<float> rows2(U_LIFT_LETTERBOX_BINS_MAX), cols2(U_LIFT_LETTERBOX_BINS_MAX);
+	u_lift_letterbox_profile_from_lines(cl2.data(), rl2.data(), w, h, true, rows2.data(), &nr, cols2.data(), &nc);
+	CHECK(std::equal(rows.begin(), rows.begin() + nr, rows2.begin()));
+	CHECK(std::equal(cols.begin(), cols.begin() + nc, cols2.begin()));
+
+	// Fed to the crop state machine it settles on the film's bars.
+	u_lift_letterbox lb = {};
+	for (uint32_t f = 0; f < U_LIFT_LETTERBOX_SETTLE_FRAMES; f++) {
+		(void)u_lift_letterbox_update(&lb, w, h, rows.data(), nr, cols.data(), nc);
+	}
+	CHECK(lb.committed.top == top);
+	CHECK(lb.committed.bottom == bottom);
+	CHECK(lb.committed.left == 0);
+	CHECK(lb.committed.right == 0);
+
+	// Sample positions: floor((k + 0.5) * span / 96).
+	CHECK(u_lift_letterbox_sample_pos(0, 96) == 0);
+	CHECK(u_lift_letterbox_sample_pos(95, 96) == 95);
+	CHECK(u_lift_letterbox_sample_pos(0, 1920) == 10);
+	CHECK(u_lift_letterbox_sample_pos(95, 1920) == 1910);
 }

@@ -627,3 +627,80 @@ u_lift_letterbox_update(struct u_lift_letterbox *lb,
 	}
 	return changed;
 }
+
+
+/*
+ *
+ * Letterbox profile from line samples.
+ *
+ */
+
+uint32_t
+u_lift_letterbox_sample_pos(uint32_t k, uint32_t span)
+{
+	// floor((k + 0.5) * span / 96), exactly as the D3D11 reduction shader.
+	return (uint32_t)(((uint64_t)(2u * k + 1u) * span) / (2u * U_LIFT_LETTERBOX_LINE_SAMPLES));
+}
+
+static bool
+lb_lit(const uint8_t *px, bool bgra)
+{
+	const float r = (float)px[bgra ? 2 : 0] / 255.0f;
+	const float g = (float)px[1] / 255.0f;
+	const float b = (float)px[bgra ? 0 : 2] / 255.0f;
+	return 0.2126f * r + 0.7152f * g + 0.0722f * b > U_LIFT_LETTERBOX_LUMA_MIN;
+}
+
+/*!
+ * Non-black fraction of line @p a of one axis: sample k of that line is texel
+ * @p a of sampled line k, lines @p line_len texels long, back to back.
+ */
+static float
+lb_line_frac(const uint8_t *lines, uint32_t line_len, uint32_t a, bool bgra)
+{
+	uint32_t cnt = 0;
+	for (uint32_t k = 0; k < U_LIFT_LETTERBOX_LINE_SAMPLES; k++) {
+		cnt += lb_lit(lines + ((size_t)k * line_len + a) * 4u, bgra) ? 1u : 0u;
+	}
+	return (float)cnt / (float)U_LIFT_LETTERBOX_LINE_SAMPLES;
+}
+
+//! One axis: @p n buckets over @p len lines (the D3D11 shader's bucket edges).
+static void
+lb_axis(const uint8_t *lines, uint32_t len, uint32_t n, bool bgra, float *out)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		const uint32_t a0 = (uint32_t)(((uint64_t)i * len) / n);
+		uint32_t a1 = (uint32_t)(((uint64_t)(i + 1u) * len) / n);
+		a1 = a1 > a0 + 1u ? a1 - 1u : a0;
+		const uint32_t am = (a0 + a1) / 2u;
+		float f = lb_line_frac(lines, len, a0, bgra);
+		const float fm = lb_line_frac(lines, len, am, bgra);
+		const float f1 = lb_line_frac(lines, len, a1, bgra);
+		f = fm > f ? fm : f;
+		out[i] = f1 > f ? f1 : f;
+	}
+}
+
+void
+u_lift_letterbox_profile_from_lines(const uint8_t *col_px,
+                                    const uint8_t *row_px,
+                                    uint32_t w,
+                                    uint32_t h,
+                                    bool bgra,
+                                    float *rows,
+                                    uint32_t *out_nr,
+                                    float *cols,
+                                    uint32_t *out_nc)
+{
+	const uint32_t nr = h < U_LIFT_LETTERBOX_BINS_MAX ? h : U_LIFT_LETTERBOX_BINS_MAX;
+	const uint32_t nc = w < U_LIFT_LETTERBOX_BINS_MAX ? w : U_LIFT_LETTERBOX_BINS_MAX;
+	*out_nr = col_px != NULL ? nr : 0u;
+	*out_nc = row_px != NULL ? nc : 0u;
+	if (col_px != NULL) {
+		lb_axis(col_px, h, nr, bgra, rows);
+	}
+	if (row_px != NULL) {
+		lb_axis(row_px, w, nc, bgra, cols);
+	}
+}
