@@ -37,6 +37,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +50,7 @@
 #include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -483,6 +486,56 @@ TEST_CASE("conv_host: idle exit with no bound task", "[conv_host]")
 	CHECK(h.wait_exit(15000) == CONV_HOST_EXIT_ORDERLY);
 	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
 	CHECK(ms.count() >= 1000);
+}
+
+TEST_CASE("conv_host: the satellite answers get_path(SCRATCH) with the provider's own directory", "[conv_host]")
+{
+	// #2194: a satellite provider asking for its scratch directory gets one
+	// that exists, under the scratch root the service's environment resolves
+	// (DXR_CONV_SCRATCH_ROOT here, so the test never touches the real cache).
+	namespace fs = std::filesystem;
+	common_env();
+	const fs::path root =
+	    fs::temp_directory_path() /
+	    ("dxr_conv_scratch_" +
+	     std::to_string((unsigned long long)std::chrono::steady_clock::now().time_since_epoch().count()));
+	struct Cleanup
+	{
+		fs::path p;
+		~Cleanup()
+		{
+			std::error_code ec;
+			fs::remove_all(p, ec);
+			set_env("DXR_CONV_SCRATCH_ROOT", nullptr);
+			set_env("DXR_CONV_SIM_CONVERSION_SCRATCH_TOUCH", nullptr);
+		}
+	} cleanup{root};
+	set_env("DXR_CONV_SCRATCH_ROOT", root.u8string().c_str());
+	set_env("DXR_CONV_SIM_CONVERSION_SCRATCH_TOUCH", "1");
+
+	Host h;
+	auto a = sim_args(h);
+	a.push_back("--idle-exit-ms");
+	a.push_back("1500");
+	REQUIRE(h.spawn(a));
+	REQUIRE(h.chan != nullptr);
+	REQUIRE(handshake(h)); // probe() ran: it asked for the path and wrote there
+
+	const fs::path dir = root / "sim-conversion";
+	const fs::path touch = dir / "sim-scratch-touch";
+	CHECK(fs::is_directory(dir));
+	REQUIRE(fs::exists(touch));
+	std::ifstream f(touch);
+	std::string line;
+	std::getline(f, line);
+	CHECK(fs::path(line) == dir);
+	CHECK_FALSE(fs::exists(dir / "sim-scratch-touch.tmp"));
+#ifndef _WIN32
+	struct stat st = {};
+	REQUIRE(stat(dir.c_str(), &st) == 0);
+	CHECK((st.st_mode & 0777) == 0700); // owner-only
+#endif
+	CHECK(h.wait_exit(15000) == CONV_HOST_EXIT_ORDERLY);
 }
 
 TEST_CASE("conv_host: a warmed capability counts as bound; no idle exit until it is evicted", "[conv_host]")
