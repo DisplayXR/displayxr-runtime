@@ -165,6 +165,7 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 		b.core = core;
 		b.resolve = bridge_resolve;
 		b.match_weave = bridge_match_weave;
+		b.fit_rect = ipc_server_conv_submit_rect; // no window metrics: the windowless spec-4 rule
 		b.ud = sc;
 		vk_conv_weave_set_bridge(g_conv_vk.weave, &b);
 		struct vk_conv_weave_ops ops;

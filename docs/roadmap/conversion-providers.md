@@ -1113,6 +1113,14 @@ comp_multi (`comp_multi_weave_lift.c`), because the runtime client links comp_mu
 Providers run on the CPU lane on POSIX, so the snapshot goes GPU → host → slot. It is not
 GPU → GPU as on Windows. A GPU slot is filled through `vk_conv_gpu_write` from the same buffer.
 
+Two differences from the Windows path. Lifted rects are drawn after the squeezed ones, not in
+rect order; this only shows where rects overlap, which the browser's plane split prevents. And a
+rect with no window metrics (no bound geometry) converts against its own aspect fitted in the
+panel (`ipc_server_conv_submit_rect`, the windowless spec-4 rule); without that, a composed
+conversion fails every frame. A stream destroyed while a weave is still in flight keeps its
+images until that weave completes: the helper's pins on the result hold off the core's reaper
+(`tests_conv_vk_gpu`, also under ASan).
+
 Validated on a developer Mac (MoltenVK, vk backend, sim provider): `tests_conv_vk_gpu` and
 `weave_probe_vk_macos --lift`. The Linux engine is compiled only in a syntax check; it has not
 run.
@@ -1124,7 +1132,8 @@ Still open:
   `MTLTexture`s and read the snapshot back through a shared buffer.
 - The depth-aware cursor on lifted rects (ADR-046 Amendment 1). No POSIX weave engine draws a
   cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
-- A GPU → GPU snapshot once a POSIX provider takes GPU inputs.
+- A GPU → GPU snapshot once a POSIX provider takes GPU inputs. The zero-copy step (E) removes
+  the GPU → host → CPU snapshot copy that POSIX lifted weave rects make today.
 - Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
   second) and lavapipe in CI.
 

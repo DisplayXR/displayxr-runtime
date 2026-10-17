@@ -534,6 +534,17 @@ cpu_route_v3_ok(struct ipc_server_conv *sc, uint32_t mode)
 	return on && (mode == XRT_DP_LIFT_MODE_SBS || mode == XRT_DP_LIFT_MODE_NVIEW);
 }
 
+//! The CPU route (POSIX) serves spec 3 only as weave-rect streams: SBS / NVIEW, no aux depth.
+static void
+cpu_route_v3_caps(struct ipc_server_conv *sc, struct xrt_dp_lift_caps *out)
+{
+	struct ipc_server_conv_io_ops io;
+	if (get_io(sc, &io) && io.cpu_only) {
+		out->modes &= XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
+		out->aux_outputs = 0;
+	}
+}
+
 bool
 ipc_server_conv_routes_properties(struct ipc_server_conv *sc)
 {
@@ -752,11 +763,7 @@ ipc_server_conv_lift_properties(struct ipc_server_conv *sc, struct xrt_dp_lift_c
 		out->max_streams = main->max_streams;
 		out->typical_latency_ns = (uint64_t)main->est_latency_ms * 1000000ull;
 	}
-	// The CPU route (POSIX) serves spec 3 only as weave-rect streams.
-	if (get_io(sc, &io) && io.cpu_only) {
-		out->modes &= XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW;
-		out->aux_outputs = 0;
-	}
+	cpu_route_v3_caps(sc, out);
 	// No provider identity crosses the app API (ADR-053).
 	memcpy(out->backend, "conversion", sizeof("conversion"));
 }
