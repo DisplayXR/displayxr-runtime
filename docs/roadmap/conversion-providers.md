@@ -1152,12 +1152,16 @@ result until the Metal command buffer has completed. See the glue note's Metal s
   binding reports its depth stage's), the engine records no host copy and the glue copies the
   snapshot chain's last image into the slot at complete. Otherwise the GPU → host → slot path is
   unchanged — which is every POSIX provider today (the provider mask defaults to 0).
-- **No host stall before publish on macOS.** MoltenVK 1.4 exports a timeline semaphore as an
-  `MTLSharedEvent`. An S5 render into a glue image now returns once submitted, signalling the
-  glue's timeline; the result is published without a host fence wait, the Metal weave backend
-  encodes `encodeWaitForEvent:value:` before sampling it, and every Vulkan reader is ordered by
-  the shared queue. One such submit is in flight at most; the next glue call retires it.
-  `DXR_CONV_VK_ASYNC_S5=0` restores the old hand-over. Linux keeps the host wait.
+- **S5 publish: GPU wait on macOS, host wait on Linux (until a Linux equivalent lands).**
+  MoltenVK 1.4 exports a timeline semaphore as an `MTLSharedEvent`. An S5 render into a glue
+  image now returns once submitted, signalling the glue's timeline; the result is published
+  without a host fence wait, the Metal weave backend encodes `encodeWaitForEvent:value:` before
+  sampling it (the pin still drops only after its command buffer completed, the #2200 rule), and
+  every Vulkan reader is ordered by the shared queue. One such submit is in flight at most; the
+  next glue call retires it. It is the macOS default behind a capability check at glue create
+  (MoltenVK ≥ 1.4, the export, a signal round trip read back through the event); short of that
+  the glue keeps the host wait and logs one WARN. `DXR_CONV_VK_ASYNC_S5=0` is a diagnostic
+  switch.
 
 Measured on a developer Mac (MoltenVK, sim provider, 640×360 input, `cube_handle_vk_macos`):
 `--lift` and `--lift-gpu` convert at the same rate and latency (≈ 28 ms average both, direct);
