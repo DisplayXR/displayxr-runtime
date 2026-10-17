@@ -418,8 +418,12 @@ android {
             // gpu_debug_layer_app=<this package> (the loader scans this APK's
             // lib dir for libVkLayer*.so). Inert unless a loader is pointed at
             // it — the runtime's injection retries without it when absent.
+            // drv_touch_input_plugin: the first Android INPUT provider (#132,
+            // ADR-034). CMake emits libdxri100_touch_input.so and the input
+            // loader scans this APK's lib dir for the libdxri<NNN>_ prefix,
+            // exactly as the DP loader does for libdxrp.
             cmake.targets "openxr_displayxr", "displayxr-service",
-                "drv_sim_display_plugin", "displayxr-diag",
+                "drv_sim_display_plugin", "drv_touch_input_plugin", "displayxr-diag",
                 "VkLayer_DXR_queue_lock"
 
             // Cross-building Android on a host that has a system cJSON
