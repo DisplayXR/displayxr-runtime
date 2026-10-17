@@ -60,7 +60,7 @@
     "XR_DXR_view_rig": {
       "group": "rendering",
       "title": "View Rig",
-      "summary": "App declares a display or camera rig descriptor and consumes render-ready XrView{pose, fov}; the runtime owns the projection math"
+      "summary": "App declares a display or camera rig descriptor and consumes render-ready XrView{pose, fov}; the runtime owns the projection math — and, chained on the hand-joint locate, returns the joints in that same rig frame"
     },
     "XR_DXR_display_zones": {
       "group": "rendering",

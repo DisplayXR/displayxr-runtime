@@ -586,6 +586,32 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 }
 #endif // D3D11 service || Android || macOS || comp_multi weave (Linux) — fill_surplus_view_poses
 
+/*!
+ * XR_DXR_view_rig spec 4 (#2189): record in the rig reply the canvas this
+ * locate's eyes were rebased by and the physical display plane, so the client
+ * maps rig-scoped hand joints into the same frame as these views.
+ */
+XRT_MAYBE_UNUSED static void
+fill_rig_canvas(struct ipc_info_locate_views_rig *r,
+                float width_m,
+                float height_m,
+                struct xrt_vec3 center,
+                struct xrt_quat orientation,
+                bool has_orientation,
+                const struct xrt_vec3 *nominal,
+                const struct xrt_pose *phys_plane)
+{
+	r->canvas.valid = width_m > 0.0f && height_m > 0.0f ? 1u : 0u;
+	r->canvas.width_m = width_m;
+	r->canvas.height_m = height_m;
+	r->canvas.center = center;
+	r->canvas.orientation = orientation;
+	r->canvas.has_orientation = has_orientation ? 1u : 0u;
+	r->canvas.nominal_y_m = nominal->y;
+	r->canvas.nominal_z_m = nominal->z;
+	r->canvas.plane = *phys_plane;
+}
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
  * Try to get SR-aware view poses for IPC clients.
@@ -1200,6 +1226,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// is latched. Values arrive pre-clamped.
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
 	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
+	// #2189: the PHYSICAL display plane (before a rig pose replaces it) — what
+	// rig-scoped hand joints are undone by on the client.
+	const struct xrt_pose phys_plane = {display_ori, display_pos};
 	if (rig_display || rig_camera) {
 		// The wire pose is in the head device's TRACKING-ORIGIN space - the
 		// frame this math (and the qwerty pose above) runs in. The client
@@ -1260,6 +1289,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.display_pose = display_pose;
 		rig_reply->rig_applied =
 		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
+		// #2189: the canvas the eyes above were rebased by.
+		fill_rig_canvas(rig_reply, screen_width_m, screen_height_m,
+		                (struct xrt_vec3){eye_offset_x, eye_offset_y, eye_offset_z}, win_orient,
+		                win_has_orientation, &nominal_viewer, &phys_plane);
 	}
 
 	if (rig_camera) {
@@ -1933,20 +1966,27 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// keeps the identity head (a workspace tile). On Android the head pose is
 	// the nominal eye the per-client LOCAL is seeded from, so a LOCAL locate
 	// is byte-identical to the pre-#1370 result.
-	struct xrt_vec3 display_pos = {0, 0, 0};
-	struct xrt_quat display_ori = XRT_QUAT_IDENTITY;
-	if (rig_any) {
-		display_pos = rig->pose.position;
-		display_ori = rig->pose.orientation;
-	} else if (!placed_window && head != NULL) {
+	// #2189: the PHYSICAL plane is resolved whether or not a rig replaces it
+	// (rig-scoped hand joints are undone by it); the display pose is then the
+	// rig's, else that plane — exactly as before.
+	struct xrt_vec3 phys_pos = {0, 0, 0};
+	struct xrt_quat phys_ori = XRT_QUAT_IDENTITY;
+	if (!placed_window && head != NULL) {
 		struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, &head_rel);
 		const enum xrt_space_relation_flags head_valid = (enum xrt_space_relation_flags)(
 		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
 		if ((head_rel.relation_flags & head_valid) == head_valid) {
-			display_pos = head_rel.pose.position;
-			display_ori = head_rel.pose.orientation;
+			phys_pos = head_rel.pose.position;
+			phys_ori = head_rel.pose.orientation;
 		}
+	}
+	const struct xrt_pose phys_plane = {phys_ori, phys_pos};
+	struct xrt_vec3 display_pos = phys_pos;
+	struct xrt_quat display_ori = phys_ori;
+	if (rig_any) {
+		display_pos = rig->pose.position;
+		display_ori = rig->pose.orientation;
 	}
 
 	dxr_screen scr = {screen_width_m, screen_height_m};
@@ -2053,6 +2093,20 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.size_w_m = canvas_w_m;
 		rig_reply->raw.size_h_m = canvas_h_m;
 		rig_reply->raw.valid = 1;
+		// #2189: the canvas the render eyes were rebased by — the zone and window
+		// centre offsets, and (shared-surface builds) the window orientation.
+		{
+#ifdef COMP_MULTI_SHARED_SURFACE
+			const bool canvas_rotated = win_has_orientation;
+#else
+			const bool canvas_rotated = false;
+#endif
+			fill_rig_canvas(rig_reply, screen_width_m, screen_height_m,
+			                (struct xrt_vec3){zone_eye_offset_x + win_eye_offset_x,
+			                                  zone_eye_offset_y + win_eye_offset_y,
+			                                  zone_eye_offset_z + win_eye_offset_z},
+			                win_orient, canvas_rotated, &nominal_viewer, &phys_plane);
+		}
 		rig_reply->rig_applied =
 		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
 	}

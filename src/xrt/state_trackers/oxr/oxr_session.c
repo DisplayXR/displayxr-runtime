@@ -2090,17 +2090,14 @@ view_rig_clampf(float v, float lo, float hi, bool *clamped)
  * converts to half-tan.
  */
 static enum oxr_view_rig_type
-view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo)
+view_rig_parse_chain(struct oxr_view_rig_state *rig, const void *chain_head)
 {
-	const XrDisplayRigDXR *drig =
-	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_RIG_DXR, XrDisplayRigDXR);
-	const XrCameraRigDXR *crig =
-	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CAMERA_RIG_DXR, XrCameraRigDXR);
+	const XrDisplayRigDXR *drig = OXR_GET_INPUT_FROM_CHAIN(chain_head, XR_TYPE_DISPLAY_RIG_DXR, XrDisplayRigDXR);
+	const XrCameraRigDXR *crig = OXR_GET_INPUT_FROM_CHAIN(chain_head, XR_TYPE_CAMERA_RIG_DXR, XrCameraRigDXR);
 	if (drig == NULL && crig == NULL) {
 		return OXR_VIEW_RIG_NONE;
 	}
 
-	struct oxr_view_rig_state *rig = &sess->view_rig;
 	bool clamped = false;
 
 	// Workspace note: a non-controller workspace client's own rig is honored
@@ -2163,6 +2160,13 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 	}
 
 	return rig->type;
+}
+
+//! The view locate's rig: parsed into the per-session state the locate path reads.
+static enum oxr_view_rig_type
+view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo)
+{
+	return view_rig_parse_chain(&sess->view_rig, viewLocateInfo);
 }
 
 /*
@@ -3127,6 +3131,27 @@ struct oxr_locate_segment
 };
 
 /*!
+ * XR_DXR_view_rig spec 4 (#2189): publish the canvas + physical display plane a
+ * view locate just resolved, for rig-scoped hand joints (sess->rig_canvas).
+ */
+static void
+session_record_rig_canvas(struct oxr_session *sess,
+                          XrTime display_time,
+                          const struct m_view_rig_canvas *canvas,
+                          const struct xrt_pose *plane_origin)
+{
+	if (canvas == NULL || !canvas->valid) {
+		return;
+	}
+	os_mutex_lock(&sess->rig_canvas.lock);
+	sess->rig_canvas.valid = true;
+	sess->rig_canvas.display_time = display_time;
+	sess->rig_canvas.canvas = *canvas;
+	sess->rig_canvas.plane_origin = *plane_origin;
+	os_mutex_unlock(&sess->rig_canvas.lock);
+}
+
+/*!
  * The canvas a view locate resolves (#2189 refactor, no behaviour change): the
  * window / segment / zone metrics, the Kooima screen size (after the #499
  * portrait swap) and the canvas centre offset + orientation the eyes are
@@ -3195,17 +3220,15 @@ locate_resolve_canvas(struct oxr_session *sess,
 	if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
 		// Window-relative Kooima: use actual window dims as screen,
 		// offset eyes to be relative to window center (not display center)
-		screen_width_m  = wm.window_width_m;
+		screen_width_m = wm.window_width_m;
 		screen_height_m = wm.window_height_m;
 		eye_offset_x = wm.window_center_offset_x_m;
 		eye_offset_y = wm.window_center_offset_y_m;
 		eye_offset_z = wm.window_center_offset_z_m;
 		win_orient = wm.window_orientation;
 		// Check if orientation is non-identity
-		win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
-		                       fabsf(win_orient.y) > 0.0001f ||
-		                       fabsf(win_orient.z) > 0.0001f ||
-		                       fabsf(win_orient.w - 1.0f) > 0.0001f);
+		win_has_orientation = (fabsf(win_orient.x) > 0.0001f || fabsf(win_orient.y) > 0.0001f ||
+		                       fabsf(win_orient.z) > 0.0001f || fabsf(win_orient.w - 1.0f) > 0.0001f);
 
 		if (should_log) {
 			char seg_tag[40] = "";
@@ -3216,8 +3239,8 @@ locate_resolve_canvas(struct oxr_session *sess,
 			U_LOG_I(
 			    "Window-relative Kooima%s: screen=%.4fx%.4fm, "
 			    "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
-			    seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
-			    eye_offset_z, win_has_orientation);
+			    seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y, eye_offset_z,
+			    win_has_orientation);
 		}
 	} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 	           screen_width_m > 0.0f && screen_height_m > 0.0f) {
@@ -3233,8 +3256,8 @@ locate_resolve_canvas(struct oxr_session *sess,
 	// orientation disagrees with the physical-dims orientation, swap the
 	// meters. On Windows/macOS the window-metrics meters already track
 	// orientation, so this is a no-op there.
-	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0 &&
-	    screen_width_m > 0.0f && screen_height_m > 0.0f) {
+	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0 && screen_width_m > 0.0f &&
+	    screen_height_m > 0.0f) {
 		bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
 		bool dims_landscape = screen_width_m >= screen_height_m;
 		if (win_landscape != dims_landscape) {
@@ -3682,6 +3705,9 @@ locate_views_one(struct oxr_logger *log,
 	// and the identity default (external-window sessions). The app hands it
 	// over in the LOCATE space (XR_DXR_view_rig.h); the math below runs in
 	// the tracking-origin space - this is the IN leg of #1370.
+	// #2189: the PHYSICAL display plane (tracking-origin space), before a rig
+	// pose replaces it — what a rig-scoped hand joint is undone by.
+	const struct xrt_pose phys_plane_origin = {world_head_ori, world_head_pos};
 	if (rig_active) {
 		struct xrt_pose rig_origin = sess->view_rig.pose;
 		locate_views_pose_base_to_origin(&T_base_xdev, &sess->view_rig.pose, &rig_origin);
@@ -3902,6 +3928,16 @@ locate_views_one(struct oxr_logger *log,
 					nominal.y = seg->nominal_y_m;
 					nominal.z = seg->nominal_z_m;
 				}
+				// #2189: the canvas these views use, for rig-scoped hand joints —
+				// recorded for the one-view-set-per-window locates (a per-segment
+				// multiview canvas is that segment's, not the window's).
+				lc.canvas.nominal_y_m = nominal.y;
+				lc.canvas.nominal_z_m = nominal.z;
+				if (seg == NULL || (seg->side_effects && seg->rig_dx == 0.0f && seg->rig_dy == 0.0f &&
+				                    seg->vdh_scale <= 0.0f)) {
+					session_record_rig_canvas(sess, viewLocateInfo->displayTime, &lc.canvas,
+					                          &phys_plane_origin);
+				}
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
 				// The DP owns multi-view eye fill: it must report one eye
@@ -3928,7 +3964,8 @@ locate_views_one(struct oxr_logger *log,
 					// hand-joint locate shares, m_view_rig_point.h):
 					// 1. Subtract window position (eye relative to window center)
 					// 2. If rotated, apply inverse rotation (eye in window's local space)
-					const struct xrt_vec3 eye_display = {adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+					const struct xrt_vec3 eye_display = {adj_eyes[ei].x, adj_eyes[ei].y,
+					                                     adj_eyes[ei].z};
 					m_view_rig_canvas_rebase(&lc.canvas, &eye_display, &raw_eyes[ei]);
 				}
 				dxr_screen scr = {screen_width_m, screen_height_m};
@@ -4166,6 +4203,21 @@ locate_views_one(struct oxr_logger *log,
 		if (xret == XRT_SUCCESS) {
 			ipc_rig_done = true;
 			T_xdev_head = reply.head_relation;
+			// #2189: the canvas + physical plane the SERVICE resolved for these
+			// views — rig-scoped hand joints use it, never a local re-derivation.
+			if (reply.canvas.valid) {
+				const struct m_view_rig_canvas rc = {
+				    .valid = true,
+				    .width_m = reply.canvas.width_m,
+				    .height_m = reply.canvas.height_m,
+				    .center = reply.canvas.center,
+				    .orientation = reply.canvas.orientation,
+				    .has_orientation = reply.canvas.has_orientation != 0,
+				    .nominal_y_m = reply.canvas.nominal_y_m,
+				    .nominal_z_m = reply.canvas.nominal_z_m,
+				};
+				session_record_rig_canvas(sess, viewLocateInfo->displayTime, &rc, &reply.canvas.plane);
+			}
 			for (uint32_t i = 0; i < wire_views; i++) {
 				fovs[i] = reply.fovs[i];
 				poses[i] = reply.poses[i];
@@ -5824,6 +5876,7 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
 	os_mutex_destroy(&sess->view_space_offset_lock); // #1502
+	os_mutex_destroy(&sess->rig_canvas.lock);        // #2189
 #ifdef OXR_HAVE_DXR_desktop_control
 	os_mutex_destroy(&sess->desktop_control_mutex);
 #endif
@@ -5890,6 +5943,7 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	// is not a pose - seed the identity explicitly.
 	sess->view_space_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
 	os_mutex_init(&sess->view_space_offset_lock);
+	os_mutex_init(&sess->rig_canvas.lock); // #2189
 
 #ifdef OXR_HAVE_DXR_desktop_control
 	os_mutex_init(&sess->desktop_control_mutex);
@@ -7414,6 +7468,102 @@ oxr_hand_joints_report_inactive(XrHandJointLocationsEXT *locations,
 	}
 }
 
+#ifdef OXR_HAVE_DXR_view_rig
+/*!
+ * XR_DXR_view_rig spec 4 (#2189): everything a rig-scoped joint locate needs —
+ * the canvas the most recent view locate resolved (in service mode: the
+ * SERVICE's), the physical display plane in the joint locate's base space at
+ * the joint time, and the chained rig. Before the session's first view locate,
+ * the session's own canvas (in-process; the same helper the views use) or the
+ * full display (service mode — never a local window-rect derivation).
+ * Returns false when the plane cannot be related to the base space (the
+ * joints then stay in base space).
+ */
+static bool
+hand_joints_resolve_rig(struct oxr_logger *log,
+                        struct oxr_session *sess,
+                        struct oxr_space *base_spc,
+                        XrTime at_time,
+                        struct m_view_rig_canvas *out_canvas,
+                        struct xrt_pose *out_plane_base,
+                        struct m_view_rig *out_rig)
+{
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL) {
+		return false;
+	}
+
+	struct xrt_pose plane_origin = XRT_POSE_IDENTITY;
+	os_mutex_lock(&sess->rig_canvas.lock);
+	const bool recorded = sess->rig_canvas.valid;
+	if (recorded) {
+		*out_canvas = sess->rig_canvas.canvas;
+		plane_origin = sess->rig_canvas.plane_origin;
+	}
+	os_mutex_unlock(&sess->rig_canvas.lock);
+
+	if (!recorded) {
+		const bool service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+		memset(out_canvas, 0, sizeof(*out_canvas));
+		out_canvas->orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		if (!service_mode) {
+			struct oxr_locate_canvas lc;
+			locate_resolve_canvas(sess, NULL,
+#ifdef OXR_HAVE_DXR_display_zones
+			                      NULL,
+#endif
+			                      false, &lc);
+			*out_canvas = lc.canvas;
+		} else {
+			float w = 0.0f, h = 0.0f;
+			if (oxr_session_get_display_dimensions(sess, &w, &h)) {
+				out_canvas->valid = w > 0.0f && h > 0.0f;
+				out_canvas->width_m = w;
+				out_canvas->height_m = h;
+			}
+		}
+		oxr_session_get_nominal_viewer(sess, &out_canvas->nominal_y_m, &out_canvas->nominal_z_m);
+		if (!sess->has_external_window && !sess->is_bridge_relay) {
+			struct xrt_space_relation dr = XRT_SPACE_RELATION_ZERO;
+			const int64_t t_ns = time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, at_time);
+			xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, t_ns, &dr);
+			plane_origin = dr.pose;
+		}
+	}
+	if (!out_canvas->valid) {
+		return false;
+	}
+
+	// The plane in the JOINT locate's base space, at the joint time (#1370:
+	// the head device's tracking origin located in that space).
+	struct xrt_space_relation T_base_origin = XRT_SPACE_RELATION_ZERO;
+	if (oxr_space_locate_device(log, head, base_spc, at_time, &T_base_origin) != XR_SUCCESS) {
+		return false;
+	}
+	const enum xrt_space_relation_flags valid =
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	if ((T_base_origin.relation_flags & valid) != valid) {
+		if (!(sess->has_external_window || sess->is_bridge_relay)) {
+			return false;
+		}
+		T_base_origin.pose = (struct xrt_pose)XRT_POSE_IDENTITY; // as the view locate does for these
+	}
+	math_pose_transform(&T_base_origin.pose, &plane_origin, out_plane_base);
+
+	// The rig as chained (post-clamp), its pose in the base space.
+	const struct oxr_view_rig_state *jr = &sess->joint_rig;
+	memset(out_rig, 0, sizeof(*out_rig));
+	out_rig->kind = jr->type == OXR_VIEW_RIG_CAMERA ? M_VIEW_RIG_CAMERA : M_VIEW_RIG_DISPLAY;
+	out_rig->pose = jr->pose;
+	out_rig->virtual_display_height = jr->virtual_display_height;
+	out_rig->perspective_factor = jr->perspective_factor;
+	out_rig->m2v = jr->m2v;
+	out_rig->inv_convergence_distance = jr->inv_convergence_distance;
+	out_rig->half_tan_vfov = jr->half_tan_vfov;
+	return true;
+}
+#endif // OXR_HAVE_DXR_view_rig
+
 XrResult
 oxr_session_hand_joints(struct oxr_logger *log,
                         struct oxr_hand_tracker *hand_tracker,
@@ -7528,6 +7678,28 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		data_source_state->isActive = XR_TRUE;
 	}
 
+	// XR_DXR_view_rig spec 4 (#2189): a rig chained on the locate info returns
+	// the joints in the RIG frame — the transform its views get. Nothing
+	// chained: base-space metres, exactly as before.
+	bool rig_joints = false;
+#ifdef OXR_HAVE_DXR_view_rig
+	struct m_view_rig_canvas rig_canvas;
+	struct xrt_pose rig_plane_base;
+	struct m_view_rig rig;
+	if (inst->extensions.DXR_view_rig && view_rig_parse_chain(&sess->joint_rig, locateInfo) != OXR_VIEW_RIG_NONE) {
+		rig_joints = hand_joints_resolve_rig(log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig);
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("XR_DXR_view_rig: rig-scoped hand joints (%s rig)%s.",
+			        sess->joint_rig.type == OXR_VIEW_RIG_CAMERA ? "camera" : "display",
+			        rig_joints
+			            ? ""
+			            : " — display plane not relatable to the base space, joints stay in base space");
+		}
+	}
+#endif
+
 	for (uint32_t i = 0; i < locations->jointCount; i++) {
 		locations->jointLocations[i].locationFlags =
 		    xrt_to_xr_space_location_flags(value.values.hand_joint_set_default[i].relation.relation_flags);
@@ -7540,6 +7712,18 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		m_relation_chain_push_relation(&chain, &r);
 		m_relation_chain_push_relation(&chain, &T_base_hand);
 		m_relation_chain_resolve(&chain, &result);
+
+#ifdef OXR_HAVE_DXR_view_rig
+		if (rig_joints) {
+			struct xrt_space_relation mapped;
+			m_view_rig_map_relation(&rig_canvas, &rig, &rig_plane_base, &result,
+			                        locations->jointLocations[i].radius, &mapped,
+			                        &locations->jointLocations[i].radius);
+			result = mapped;
+		}
+#else
+		(void)rig_joints;
+#endif
 
 		xrt_to_xr_pose(&result.pose, &locations->jointLocations[i].pose);
 
