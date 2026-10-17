@@ -448,8 +448,7 @@ TEST_CASE("per-client: persist writes the per-app pin every client of that app s
 	}
 }
 
-TEST_CASE("per-client: a pin changed while the app is attached reaches it on the next get_roles",
-          "[input_per_client]")
+TEST_CASE("per-client: a pin changed while the app is attached reaches it on the next get_roles", "[input_per_client]")
 {
 	fixture f;
 	const struct xrt_system_roles before = f.roles(f.a); // attached, no pin

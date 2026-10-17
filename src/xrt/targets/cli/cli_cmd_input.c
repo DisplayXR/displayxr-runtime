@@ -229,7 +229,8 @@ cmd_list(int argc, const char **argv)
 			} else {
 				// Clients the service's per-client table refused (full): their pins
 				// and requests do not apply. Repeated in every row; 0 with no rows.
-				cJSON_AddNumberToObject(root, "clients_dropped", nl > 0 ? (double)live[0].clients_dropped : 0.0);
+				cJSON_AddNumberToObject(root, "clients_dropped",
+				                        nl > 0 ? (double)live[0].clients_dropped : 0.0);
 				cJSON *tmp = cJSON_CreateObject();
 				u_status_input_holders_add_cjson(tmp, live, (uint32_t)nl);
 				cJSON_AddItemToObject(root, "holders",
