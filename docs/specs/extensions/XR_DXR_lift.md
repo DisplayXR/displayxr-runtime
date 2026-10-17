@@ -880,9 +880,11 @@ UI rates.
   compositor session, which is what lets `displayxr-cli lift` drive them headless — and what lets
   an in-process session use lift (ADR-049): it opens a sessionless `APP` connection named
   `<exe> (in-process lift)` (`ipc_client_lift_link.c`, background connect, never launches the
-  service, retried at most every 5 s) and runs the same calls on it. WARN lines in the app's
-  log: `[lift] in-process: lift-only service connection up (generation N)`, `... no service
-  connection for 2D->3D conversion ...` (once), `... connection (generation N) is gone ...`.
+  service, retried at most every 5 s) and runs the same calls on it. Lines in the app's log:
+  `[lift] in-process: no conversion service (...); in-process conversion unavailable, retrying
+  quietly ...` (one WARN, then the retries log nothing until a connect succeeds),
+  `[lift] in-process: lift-only service connection up (generation N)` (INFO), and
+  `... connection (generation N) is gone ...` (WARN).
 
 ## 10. Error codes and connection loss
 
