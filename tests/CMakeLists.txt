@@ -113,6 +113,7 @@ set(tests
     tests_input_arbiter_rerank
     tests_input_arbiter_floor
     tests_sim_input_nav
+    tests_gamepad_map
     tests_comp_layer_view_camera
     tests_comp_color_policy
     tests_m_matrix_projection
@@ -823,6 +824,20 @@ target_include_directories(
 			    ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_sim_input_nav PRIVATE xrt-interfaces aux_os)
+
+# The gamepad input provider's mapping table (drivers/gamepad/gamepad_map.c):
+# stick -> rig velocity with deadzone, the integrator, the button actions.
+# Pure functions with no OS or device dependency, compiled straight into the
+# unit like tests_sim_input_nav — what is under test is the POLICY the
+# provider's devices trust, and it needs no pad.
+target_sources(
+	tests_gamepad_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad/gamepad_map.c
+	)
+target_include_directories(
+	tests_gamepad_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad
+			  ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_gamepad_map PRIVATE xrt-interfaces)
 
 # #1380 — the rig (navigation) role in the input arbiter. The arbiter is pure
 # decision logic over a candidate table, so the unit compiles it straight in
