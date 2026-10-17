@@ -1007,8 +1007,10 @@ client_dll_ok:
 	; every provider is hosted in the service (the documented fallback).
 	File /nonfatal "${BIN_DIR}\displayxr-conversion-host.exe"
 
-	; Install manifest
-	File "${OUTPUT_DIR}\DisplayXR_win64.json"
+	; Install manifest. Staged next to DisplayXRClient.dll in ${BIN_DIR}
+	; (library_path ".\DisplayXRClient.dll", valid in this flat layout too);
+	; the old top-level ${OUTPUT_DIR} copy is no longer produced.
+	File "${BIN_DIR}\DisplayXR_win64.json"
 
 	; Workspace controllers (the DisplayXR shell, third-party verticals, …)
 	; ship as their own products with dedicated installers — see
