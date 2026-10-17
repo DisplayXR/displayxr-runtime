@@ -181,6 +181,142 @@ vk_conv_gpu_cmd_acquire(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct
 void
 vk_conv_gpu_cmd_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vk_conv_gpu_image_ref *ref);
 
+/*
+ *
+ * The client transport (XR_DXR_lift spec 4 GPU kinds, ADR-053 P5 step E).
+ *
+ */
+
+/*!
+ * A client's image, as the IPC transport delivered it: an IOSurface (macOS,
+ * global: the transport carries its ID), a Vulkan OPAQUE_FD allocation or a
+ * single-plane dma-buf (Linux). Handles are BORROWED: the glue duplicates what
+ * it imports.
+ *
+ * OPAQUE_FD has no self-describing layout, so the exporter and the glue must
+ * create the image identically (the transport contract, XR_DXR_lift §4.5): 2D,
+ * 1 mip, 1 layer, VK_IMAGE_TILING_OPTIMAL, usage SAMPLED | TRANSFER_SRC |
+ * TRANSFER_DST, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT for an _SRGB format (else no
+ * flags), a dedicated allocation, @ref width x @ref height x @ref format.
+ */
+struct vk_conv_gpu_external
+{
+	uint32_t memory_kind;   //!< XRT_CONV_MEM_IOSURFACE / _VK_OPAQUE_FD / _DMABUF
+	uint64_t handle;        //!< IOSurfaceRef / fd (borrowed)
+	uint32_t width, height; //!< the whole image
+	uint32_t format;        //!< XRT_CONV_FMT_* (RGBA8 / BGRA8, UNORM or SRGB)
+	uint32_t row_stride;    //!< DMABUF: plane 0 stride (plane 0 offset is 0)
+	uint64_t drm_modifier;  //!< DMABUF
+	//! What to wait for before reading: NONE (writes complete before the call),
+	//! SYNC_FD (a sync_file) or VK_SEMAPHORE_FD (a timeline + value), Linux.
+	//! The handle is borrowed; imported temporarily, never cached.
+	struct xrt_conv_sync sync;
+};
+
+/*!
+ * Copy region @p x, @p y, @p w x @p h of client image @p src into @p dst, the
+ * stream's input slot image:
+ *  - a glue image: one GPU blit (scaled to @p dst's extent; channel order
+ *    converted), no host memory touched -- the zero-copy path;
+ *  - a CPU image (a provider on the CPU lane): the blit into a scratch image of
+ *    @p dst's extent, then one GPU -> host readback into dst->cpu_ptr.
+ * Synchronous (waits its own submit, so the slot is complete on return).
+ * @p src's sync is waited for on the GPU in the same submit.
+ */
+bool
+vk_conv_gpu_import_copy(struct vk_conv_gpu *g,
+                        const struct vk_conv_gpu_external *src,
+                        uint32_t x,
+                        uint32_t y,
+                        uint32_t w,
+                        uint32_t h,
+                        const struct xrt_conv_image *dst);
+
+/*!
+ * vk_conv_gpu_import_copy for a spec-4 input as the service's I/O table sees
+ * it (a CONV_INPUT_IOSURFACE / _OPAQUE_FD / _DMABUF conv_input_import; its
+ * handles stay the caller's): the region in->x, y, w, h into @p dst.
+ */
+bool
+vk_conv_gpu_import_input(struct vk_conv_gpu *g, const struct conv_input_import *in, const struct xrt_conv_image *dst);
+
+/*!
+ * The XRT_CONV_MEM_* kinds vk_conv_gpu_import_copy takes on this device
+ * (CPU excluded): IOSURFACE (macOS); VK_OPAQUE_FD, DMABUF (Linux).
+ */
+uint32_t
+vk_conv_gpu_import_kinds(const struct vk_conv_gpu *g);
+
+/*!
+ * The XRT_CONV_MEM_* kinds vk_conv_gpu_export_alloc makes on this device:
+ * IOSURFACE (macOS, a GLOBAL IOSurface the glue creates and imports, so a peer
+ * process can look its ID up -- the ones MoltenVK creates are not global) and
+ * VK_OPAQUE_FD (Linux). DMABUF is not offered: XrLiftResultExportDXR cannot
+ * describe a modifier / stride to the app.
+ */
+uint32_t
+vk_conv_gpu_export_kinds(const struct vk_conv_gpu *g);
+
+/*!
+ * A per-stream result export image of @p kind (one of vk_conv_gpu_export_kinds)
+ * -- a glue image like any other (free it with the alloc ops' free). Its
+ * handle is the glue's; the transport duplicates it into the client.
+ */
+bool
+vk_conv_gpu_export_alloc(struct vk_conv_gpu *g,
+                         uint32_t kind,
+                         uint32_t conv_fmt,
+                         uint32_t w,
+                         uint32_t h,
+                         uint64_t stream_id,
+                         struct xrt_conv_image *out);
+
+/*!
+ * Copy @p src into glue image @p dst (same extent and byte layout; one layer):
+ * a glue image is copied on the GPU, a CPU image is uploaded. Synchronous.
+ */
+bool
+vk_conv_gpu_copy(struct vk_conv_gpu *g, const struct xrt_conv_image *src, const struct xrt_conv_image *dst);
+
+/*!
+ * Copy region @p x, @p y, @p w x @p h of @p src -- a VkImage of another
+ * recorder on this device, in @p src_layout, not in use by the GPU any more
+ * (the weave engines' snapshot chain after their fence) -- into @p dst (a
+ * glue image: GPU only; a CPU image: through a host readback). Synchronous.
+ */
+bool
+vk_conv_gpu_copy_from_vk(struct vk_conv_gpu *g,
+                         VkImage src,
+                         VkImageLayout src_layout,
+                         VkFormat src_format,
+                         uint32_t x,
+                         uint32_t y,
+                         uint32_t w,
+                         uint32_t h,
+                         const struct xrt_conv_image *dst);
+
+/*!
+ * The memory kind the glue would give a stream's INPUT image whose binding
+ * imports @p import_memory_kinds / @p import_sync_kinds (glue_alloc's rule):
+ * a GPU XRT_CONV_MEM_* kind, or XRT_CONV_MEM_CPU when the CPU allocator would
+ * serve it (the default: providers on the CPU lane).
+ */
+uint32_t
+vk_conv_gpu_input_memory_kind(const struct vk_conv_gpu *g, uint32_t import_memory_kinds, uint32_t import_sync_kinds);
+
+//! Diagnostics: copies the glue made, by direction (monotonic counters).
+struct vk_conv_gpu_stats
+{
+	uint64_t host_writes; //!< CPU -> GPU image uploads (staged)
+	uint64_t host_reads;  //!< GPU image -> CPU readbacks (staged; S6 samples not counted)
+	uint64_t gpu_copies;  //!< GPU -> GPU copies / blits (client imports, exports, weave snapshots)
+	uint64_t imports;     //!< client images imported (vk_conv_gpu_import_copy)
+	uint64_t async_s5;    //!< S5 renders published before their GPU work finished (shared event)
+};
+
+void
+vk_conv_gpu_get_stats(struct vk_conv_gpu *g, struct vk_conv_gpu_stats *out);
+
 //! Diagnostics: how many times the S5 stage ran its passes 1-6 (0 before the first S5).
 uint64_t
 vk_conv_gpu_viewsyn_prepass_count(struct vk_conv_gpu *g);

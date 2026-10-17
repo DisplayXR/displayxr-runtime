@@ -35,6 +35,7 @@
 extern "C" {
 #endif
 
+struct conv_input_import;
 struct ipc_server_conv_io_ops;
 struct xrt_conv_image;
 
@@ -64,7 +65,54 @@ struct ipc_server_conv_cpu_gpu
 	//! @p src (the glue's GPU image) -> rows @p row_pitch apart (0 = tight).
 	bool (*read)(void *ud, const struct xrt_conv_image *src, void *pixels, uint32_t row_pitch);
 	void *ud;
+
+	/*!
+	 * @name Step E: the client GPU kinds (all optional; NULL / 0 = CPU only)
+	 *
+	 * The kinds a GPU glue takes from and gives to the client: the service
+	 * then lists them in imageKinds / exportKinds (beside CPU), and spec-4
+	 * streams may be created with a GPU export kind.
+	 * @{
+	 */
+	//! XRT_CONV_MEM_* the glue imports (import_copy) / exports (export_alloc).
+	uint32_t import_kinds;
+	uint32_t export_kinds;
+	/*!
+	 * Client image @p in (a CONV_INPUT_IOSURFACE / _OPAQUE_FD / _DMABUF; its
+	 * handles stay the caller's) -> slot image @p dst, a GPU or CPU image.
+	 * Synchronous; honours @p in's sync on the GPU.
+	 */
+	bool (*import_copy)(void *ud, const struct conv_input_import *in, const struct xrt_conv_image *dst);
+	//! A per-stream export image of @p kind (one of export_kinds); freed with export_free.
+	bool (*export_alloc)(void *ud,
+	                     uint32_t kind,
+	                     uint32_t conv_fmt,
+	                     uint32_t w,
+	                     uint32_t h,
+	                     uint64_t stream_id,
+	                     struct xrt_conv_image *out);
+	void (*export_free)(void *ud, struct xrt_conv_image *img);
+	//! @p src (a GPU or CPU result) -> export image @p dst, same extent. Synchronous.
+	bool (*copy)(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst);
+	//! @}
 };
+
+/*!
+ * The XrLiftImageKindDXR mask (1 << kind, IPC_SERVER_CONV_IMAGE_KIND_*) of
+ * the GPU kinds the installed GPU glue takes (@p export_kinds false) or gives;
+ * 0 without one. CPU is not included (the table always takes and gives it).
+ */
+uint64_t
+ipc_server_conv_cpu_io_gpu_image_kinds(bool export_kinds);
+
+/*!
+ * A spec-4 stream (@p wire_id) was created with GPU export kind @p mem_kind
+ * (XRT_CONV_MEM_IOSURFACE / _VK_OPAQUE_FD): publish_result copies its results
+ * into a per-stream export image of that kind (GPU -> GPU for a GPU result)
+ * and export_output hands its handle out. 0 = the CPU section (the default).
+ */
+void
+ipc_server_conv_cpu_io_stream_export(uint64_t wire_id, uint32_t mem_kind);
 
 /*!
  * Install (or, with NULL, clear) the GPU copies. Copied. Clearing waits for

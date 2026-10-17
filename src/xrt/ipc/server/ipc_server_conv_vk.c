@@ -54,6 +54,7 @@
 #include "server/ipc_server_conv_cpu.h"
 
 #include "conversion/conv_core.h"
+#include "conversion/conv_stream.h"
 
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_weave_lift.h"
@@ -110,6 +111,34 @@ gpu_read(void *ud, const struct xrt_conv_image *src, void *pixels, uint32_t row_
 	return vk_conv_gpu_read((struct vk_conv_gpu *)ud, src, pixels, row_pitch);
 }
 
+//! Step E: a client GPU image (the transport's handles, borrowed) -> the slot image.
+static bool
+gpu_import_copy(void *ud, const struct conv_input_import *in, const struct xrt_conv_image *dst)
+{
+	return vk_conv_gpu_import_input((struct vk_conv_gpu *)ud, in, dst);
+}
+
+static bool
+gpu_export_alloc(
+    void *ud, uint32_t kind, uint32_t conv_fmt, uint32_t w, uint32_t h, uint64_t stream_id, struct xrt_conv_image *out)
+{
+	return vk_conv_gpu_export_alloc((struct vk_conv_gpu *)ud, kind, conv_fmt, w, h, stream_id, out);
+}
+
+static void
+gpu_export_free(void *ud, struct xrt_conv_image *img)
+{
+	struct conv_image_alloc_ops ops;
+	vk_conv_gpu_alloc_ops((struct vk_conv_gpu *)ud, &ops);
+	ops.free(ops.ud, img);
+}
+
+static bool
+gpu_copy(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	return vk_conv_gpu_copy((struct vk_conv_gpu *)ud, src, dst);
+}
+
 void
 ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 {
@@ -152,8 +181,21 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	    (caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? " IOSURFACE" : "", caps.sync_kinds);
 
 	// The copies first: by the time GPU results can exist, the CPU table can export them.
-	struct ipc_server_conv_cpu_gpu copies = {gpu_write, gpu_read, g_conv_vk.glue};
+	struct ipc_server_conv_cpu_gpu copies;
+	memset(&copies, 0, sizeof(copies));
+	copies.write = gpu_write;
+	copies.read = gpu_read;
+	copies.ud = g_conv_vk.glue;
+	// Step E: the client GPU kinds (IOSurface on macOS; OPAQUE_FD / dma-buf on Linux).
+	copies.import_kinds = vk_conv_gpu_import_kinds(g_conv_vk.glue);
+	copies.export_kinds = vk_conv_gpu_export_kinds(g_conv_vk.glue);
+	copies.import_copy = gpu_import_copy;
+	copies.export_alloc = gpu_export_alloc;
+	copies.export_free = gpu_export_free;
+	copies.copy = gpu_copy;
 	ipc_server_conv_cpu_io_set_gpu(&copies);
+	U_LOG_W("[conv] Vulkan glue: client GPU kinds in 0x%x, out 0x%x (XRT_CONV_MEM_*; CPU always)",
+	        copies.import_kinds, copies.export_kinds);
 	ipc_server_conv_install_gpu(sc, &gpu);
 
 	// Step C: the per-DP eyes sink, then lifted weave rects.
