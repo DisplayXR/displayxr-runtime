@@ -67,6 +67,23 @@
  * both composed; the latch cleared (all woven again); and a v6 N-view submit
  * whose flat half comes back as the centre view.
  *
+ * --lift (XR_DXR_lift §6, ADR-053 P5 step C; the twin of the macOS probe's
+ * --lift): after the stage-A checks above, rect A holds a 2D frame (left half
+ * red, right half blue) flagged "lift me" on a spec-3 SBS stream
+ * (xrCreateLiftStreamDXR), with the browser's options (convergence AUTO,
+ * strength 1, inpaint, TRACKED, viewCount 2), for 90 submits. Woven as SBS the
+ * quarter point would read magenta (red left eye, blue right eye); lifted (flat
+ * until the first result, then the stream's views) it reads red; rect B (not
+ * lifted) stays cyan. For the lift leg the window is re-bound with rect A's
+ * centre on the panel's centre (XR_DXR_display_info), the on-axis geometry the
+ * macOS probe gets by binding no geometry: TRACKED viewpoints are the eyes
+ * rebased to the rect, so an off-axis rect is lifted with a large (correct)
+ * shift that moves the quarter point onto the blue half. The window goes back
+ * to the stage-A origin afterwards. Run the SERVICE with DXR_CONV_SIM_CONVERSION_ENABLE=1 (a
+ * provider) and XRT_LOG=info: the red reads the same flat or woven, so the
+ * service log's "lift rect: stream ... snapshot" / "... woven" lines are what
+ * prove a result. --service-log=PATH greps them (snapshot + woven required).
+ *
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=build/_plugins \
  *     build/src/xrt/targets/service/displayxr-service &
@@ -82,6 +99,7 @@
 #include <openxr/XR_DXR_weave.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_lift.h>
 
 // The dma-buf transport calls, shared with weave/weave_present_vk_linux.
 #include "weave_dmabuf_vk.h"
@@ -94,8 +112,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define LOG(...)                                                                                                       \
@@ -1744,12 +1764,260 @@ run_flat_regions(Vk &vk,
 	return pass;
 }
 
+/*
+ *
+ * --lift (XR_DXR_lift §6, ADR-053 P5 step C): rect A holds 2D and is lifted on
+ * a spec-3 SBS stream. The twin of the macOS probe's --lift leg.
+ *
+ */
+
+//! Current size of the service log (where this run's lines start); 0 if unreadable.
+static long
+lift_log_mark(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (f == nullptr) {
+		return 0;
+	}
+	fseek(f, 0, SEEK_END);
+	const long end = ftell(f);
+	fclose(f);
+	return end > 0 ? end : 0;
+}
+
+//! --service-log: the service's "lift rect: stream" lines since @p from (snapshot + woven required).
+static bool
+lift_log_check(const char *path, long from)
+{
+	FILE *f = fopen(path, "r");
+	if (f == nullptr) {
+		LOG("lift log: cannot open %s", path);
+		return false;
+	}
+	fseek(f, from, SEEK_SET);
+	int snapshots = 0, woven = 0, failed = 0;
+	char line[1024];
+	while (fgets(line, sizeof(line), f) != nullptr) {
+		if (strstr(line, "lift rect: stream") == nullptr) {
+			continue;
+		}
+		line[strcspn(line, "\n")] = '\0';
+		LOG("lift log: %s", line);
+		snapshots += strstr(line, " snapshot ") != nullptr ? 1 : 0;
+		woven += strstr(line, " woven ") != nullptr ? 1 : 0;
+		failed += strstr(line, " failed: ") != nullptr ? 1 : 0;
+	}
+	fclose(f);
+	const bool ok = snapshots > 0 && woven > 0;
+	LOG("lift log: %d snapshot / %d woven / %d failed line(s) (want snapshot + woven; the service needs "
+	    "XRT_LOG=info) -> %s",
+	    snapshots, woven, failed, ok ? "OK" : "WRONG");
+	return ok;
+}
+
+static bool
+run_lift(Vk &vk,
+         XrInstance instance,
+         XrSession session,
+         PFN_xrWeaveBindWindow2DXR pfn_bind2,
+         PFN_xrWeaveSubmitDXR pfn_submit,
+         const PanelRect &panel,
+         Image &fallback_out,
+         const char *service_log,
+         const std::string &dump_dir)
+{
+	bool lift_ok = true;
+	const long log_from = service_log != nullptr ? lift_log_mark(service_log) : 0;
+
+	// Put rect A's centre on the panel's centre. A lifted rect's TRACKED
+	// viewpoints are the eyes rebased to the rect centre, so the views' shift
+	// grows with the viewer's offset from the rect: at the stage-A origin
+	// (64,48) rect A sits ~0.12 m left of a laptop panel's centre, and the sim
+	// provider's synthetic parallax (0.1 x offset / rect width) pushes both
+	// views past the red half — rect A reads blue, a correct lift of an
+	// off-axis rect. The macOS probe binds no geometry, so its rect is fitted
+	// to the panel centre; this is the same on-axis geometry.
+	const int32_t ax = kRectA.offset.x + kRectA.extent.width / 2;
+	const int32_t ay = kRectA.offset.y + kRectA.extent.height / 2;
+	const int32_t lox = panel.left + (int32_t)panel.w / 2 - ax;
+	const int32_t loy = panel.top + (int32_t)panel.h / 2 - ay;
+	if (!span_bind(session, pfn_bind2, lox, loy, kWinW, kWinH)) {
+		LOG("lift FAIL: re-bind with rect A on the panel axis");
+		return false;
+	}
+	LOG("lift: window re-bound at (%d,%d): rect A centred on the panel (%d,%d %ux%u)", lox, loy, panel.left,
+	    panel.top, panel.w, panel.h);
+	PFN_xrGetLiftPropertiesDXR pfn_props = nullptr;
+	PFN_xrCreateLiftStreamDXR pfn_create = nullptr;
+	PFN_xrDestroyLiftStreamDXR pfn_destroy = nullptr;
+	xrGetInstanceProcAddr(instance, "xrGetLiftPropertiesDXR", (PFN_xrVoidFunction *)&pfn_props);
+	xrGetInstanceProcAddr(instance, "xrCreateLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_create);
+	xrGetInstanceProcAddr(instance, "xrDestroyLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_destroy);
+	XrLiftPropertiesDXR props = {XR_TYPE_LIFT_PROPERTIES_DXR};
+	XrLiftStreamDXR stream = XR_NULL_HANDLE;
+	if (pfn_props == nullptr || pfn_create == nullptr || pfn_destroy == nullptr) {
+		LOG("lift FAIL: XR_DXR_lift entry points missing");
+		lift_ok = false;
+	} else {
+		// Readiness: SBS appears once the service's provider is up (it may be ACTIVATING first).
+		for (int i = 0; i < 100; i++) {
+			if (XR_SUCCEEDED(pfn_props(session, &props)) &&
+			    (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR) != 0 &&
+			    props.state == XR_LIFT_STATE_READY_DXR) {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+		LOG("lift properties: modes=0x%llx state=%d maxViews=%u backend='%s'",
+		    (unsigned long long)props.supportedModes, (int)props.state, props.maxViews, props.backend);
+		XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+		ci.mode = XR_LIFT_MODE_SBS_DXR;
+		ci.inputScale = 1.0f;
+		XrResult cr = pfn_create(session, &ci, &stream);
+		if (XR_FAILED(cr)) {
+			LOG("lift FAIL: xrCreateLiftStreamDXR(SBS) -> %d (service needs a provider: "
+			    "DXR_CONV_SIM_CONVERSION_ENABLE=1)",
+			    (int)cr);
+			lift_ok = false;
+		}
+	}
+
+	// The input: the stage-A page (rect B still squeezed-SBS black|white) with
+	// rect A replaced by a 2D frame, left half red, right half blue. A fresh
+	// OPAQUE_FD image (the macOS probe rewrites its shared IOSurface in place).
+	Image lin;
+	if (lift_ok) {
+		std::vector<uint8_t> px((size_t)kWinW * kWinH * 4);
+		for (uint32_t y = 0; y < kWinH; y++) {
+			for (uint32_t x = 0; x < kWinW; x++) {
+				put_px(px, kWinW, (int)x, (int)y, 32, 32, 32);
+			}
+		}
+		fill_sbs_rect(px, kWinW, kRectB, /*left*/ 0x00, /*right*/ 0xFF); // -> CYAN after anaglyph
+		const int half = kRectA.extent.width / 2;
+		for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
+			for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width; x++) {
+				const bool left = (x - kRectA.offset.x) < half;
+				put_px(px, kWinW, x, y, left ? 0xFF : 0x00, 0x00, left ? 0x00 : 0xFF);
+			}
+		}
+		if (!create_exported_image(vk, kWinW, kWinH, lin) || !upload_and_release(vk, lin, px)) {
+			LOG("lift FAIL: input image setup");
+			lift_ok = false;
+		}
+	}
+
+	if (lift_ok) {
+		XrLiftOptionsDXR opt = {XR_TYPE_LIFT_OPTIONS_DXR};
+		opt.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+		opt.strength = 1.0f;
+		opt.inpaint = XR_TRUE;
+		opt.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+		opt.viewCount = 2;
+		XrWeaveRectLiftDXR lr = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+		lr.next = &opt;
+		lr.rectIndex = 0; // rect A
+		lr.stream = stream;
+		XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+		lifts.liftCount = 1;
+		lifts.lifts = &lr;
+		XrRect2Di rects[2] = {kRectA, kRectB};
+		XrWeaveSubmitRectsDXR lbatch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+		lbatch.next = &lifts;
+		lbatch.rectCount = 2;
+		lbatch.rects = rects;
+		XrWeaveSubmitInfoDXR lsubmit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+		lsubmit.next = &lbatch;
+		lsubmit.inputTexture = (void *)(intptr_t)lin.fd;
+		lsubmit.firstChunk = XR_TRUE;
+		const int kLiftFrames = 90; // ~1.5 s: results land well before
+		int accepted = 0;
+		Image lout;
+		uint32_t lw = 0, lh = 0;
+		for (int frame = 0; frame < kLiftFrames && lift_ok; frame++) {
+			XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+			XrResult r = pfn_submit(session, &lsubmit, &out);
+			if (XR_FAILED(r)) {
+				LOG("lift FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
+				lift_ok = false;
+				break;
+			}
+			accepted++;
+			lw = out.width;
+			lh = out.height;
+			if (out.weavedTexture != nullptr) {
+				// The output reallocated (the v6 leg left it content-view sized): import the new one.
+				if (lout.image != VK_NULL_HANDLE) {
+					destroy_image(vk, lout);
+				}
+				if (!import_output_image(vk, (int)(intptr_t)out.weavedTexture, out.width, out.height,
+				                         lout)) {
+					close((int)(intptr_t)out.weavedTexture);
+					LOG("lift FAIL: could not import the %ux%u output fd", out.width, out.height);
+					lift_ok = false;
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(16));
+		}
+		LOG("lift submits: %d/%d accepted, output %ux%u (%s)", accepted, kLiftFrames, lw, lh,
+		    lout.image != VK_NULL_HANDLE ? "new output fd" : "no new fd: the stage-A import");
+		Image &sample_from = lout.image != VK_NULL_HANDLE ? lout : fallback_out;
+		if (lift_ok && (sample_from.w != kWinW || sample_from.h != kWinH || lw != kWinW || lh != kWinH)) {
+			LOG("lift FAIL: output %ux%u (import %ux%u), want %ux%u", lw, lh, sample_from.w, sample_from.h,
+			    kWinW, kWinH);
+			lift_ok = false;
+		}
+		std::vector<uint8_t> px;
+		if (lift_ok && !readback(vk, sample_from, px)) {
+			LOG("lift FAIL: readback");
+			lift_ok = false;
+		}
+		if (lift_ok) {
+			dump_ppm(px, kWinW, kWinH, dump_dir + "/weave_probe_linux_lift_output.ppm");
+			const int qx = kRectA.offset.x + kRectA.extent.width / 4;
+			const int qy = kRectA.offset.y + kRectA.extent.height / 2;
+			uint8_t r, g, b, a;
+			sample(px, kWinW, qx, qy, &r, &g, &b, &a);
+			const bool red = r > 150 && g < 80 && b < 80;
+			LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) want red (lifted 2D; magenta = woven as SBS) -> "
+			    "%s",
+			    qx, qy, r, g, b, red ? "OK" : "WRONG");
+			lift_ok = red;
+			const int bx = kRectB.offset.x + kRectB.extent.width / 2;
+			const int by = kRectB.offset.y + kRectB.extent.height / 2;
+			sample(px, kWinW, bx, by, &r, &g, &b, &a);
+			const bool cyan = r < 80 && g > 150 && b > 150;
+			LOG("lift rect B (not lifted) @(%d,%d) = (%u,%u,%u) want cyan -> %s", bx, by, r, g, b,
+			    cyan ? "OK" : "WRONG");
+			lift_ok = lift_ok && cyan;
+		}
+		if (lout.image != VK_NULL_HANDLE) {
+			destroy_image(vk, lout);
+		}
+	}
+	if (stream != XR_NULL_HANDLE) {
+		pfn_destroy(stream);
+	}
+	if (lin.image != VK_NULL_HANDLE) {
+		destroy_image(vk, lin);
+	}
+	lift_ok = span_bind(session, pfn_bind2, kWinOrigin.x, kWinOrigin.y, kWinW, kWinH) && lift_ok;
+	if (service_log != nullptr) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(200)); // let the service flush its log
+		lift_ok = lift_log_check(service_log, log_from) && lift_ok;
+	}
+	LOG("lift: %s", lift_ok ? "PASS" : "FAIL");
+	return lift_ok;
+}
+
 int
 main(int argc, char **argv)
 {
 	int frames = 600;
 	long service_pid = 0;
 	bool dmabuf = false, release_wait = true, force_linear = false, span2d = false, flat_regions = false;
+	bool do_lift = false;           // --lift (XR_DXR_lift weave rects, ADR-053 P5 step C)
+	const char *lift_log = nullptr; // --service-log=PATH: grep its "lift rect: stream" lines
 	std::string dump_dir = "/tmp";
 	if (const char *t = getenv("TMPDIR")) {
 		dump_dir = t;
@@ -1771,9 +2039,13 @@ main(int argc, char **argv)
 			span2d = true; // off-panel flat 2D (#1654 on the service path)
 		} else if (strcmp(argv[i], "--flat-regions") == 0) {
 			flat_regions = true; // spec-v8 flat regions painted flat (desktop Linux)
+		} else if (strcmp(argv[i], "--lift") == 0) {
+			do_lift = true;
+		} else if (strncmp(argv[i], "--service-log=", 14) == 0) {
+			lift_log = argv[i] + 14;
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d] [--flat-regions]",
+			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]]",
 			    argv[0]);
 			return 2;
 		}
@@ -1781,14 +2053,23 @@ main(int argc, char **argv)
 	if (frames < 20) {
 		frames = 20;
 	}
+	if (do_lift && (dmabuf || span2d || flat_regions)) {
+		LOG("--lift runs on the stage-A run (not with --dmabuf / --span2d / --flat-regions)");
+		return 2;
+	}
+	if (lift_log != nullptr && !do_lift) {
+		LOG("--service-log needs --lift");
+		return 2;
+	}
 
 	// ---- Instance with the weave + vulkan-enable extensions.
 	uint32_t ext_count = 0;
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr));
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, exts.data()));
-	bool has_weave = false, has_vk = false, has_rig = false, has_display_info = false;
+	bool has_weave = false, has_vk = false, has_rig = false, has_display_info = false, has_lift = false;
 	for (const auto &e : exts) {
+		has_lift = has_lift || strcmp(e.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0;
 		has_weave = has_weave || strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0;
 		has_vk = has_vk || strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
 		has_rig = has_rig || strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0;
@@ -1816,6 +2097,17 @@ main(int argc, char **argv)
 		}
 		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
+	// --lift only, so the default run's instance is unchanged. It also reads
+	// the panel rect, to put rect A on the panel's axis (see run_lift).
+	if (do_lift) {
+		if (!has_lift || !has_display_info) {
+			LOG("--lift needs XR_DXR_lift (%d) + XR_DXR_display_info (%d)", (int)has_lift,
+			    (int)has_display_info);
+			return 1;
+		}
+		enabled.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	}
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
 	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
 	         "DXRWeaveProbeLinux");
@@ -1833,7 +2125,7 @@ main(int argc, char **argv)
 	XR_CHECK(xrGetSystem(instance, &sgi, &system_id));
 
 	PanelRect panel;
-	if (span2d || flat_regions) {
+	if (span2d || flat_regions || do_lift) {
 		XrDisplayDesktopPositionDXR pos = {XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR};
 		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
 		di.next = &pos;
@@ -1844,7 +2136,7 @@ main(int argc, char **argv)
 		panel.top = pos.top;
 		panel.w = di.displayPixelWidth;
 		panel.h = di.displayPixelHeight;
-		if (panel.w < kWinW || panel.h < kWinH) {
+		if ((span2d || flat_regions) && (panel.w < kWinW || panel.h < kWinH)) {
 			LOG("--span2d: panel %ux%u is smaller than the %ux%u window", panel.w, panel.h, kWinW, kWinH);
 			return 1;
 		}
@@ -2345,7 +2637,9 @@ main(int argc, char **argv)
 			destroy_image(vk, big_ov);
 		}
 	}
-	destroy_image(vk, output);
+	if (!do_lift) {
+		destroy_image(vk, output); // --lift keeps it (its fallback sample source) until the end
+	}
 
 	// ---- Snap through the service's weave DP (identity on sim_display's
 	// default period of 1 — the call must still succeed and return a rect).
@@ -2576,6 +2870,13 @@ main(int argc, char **argv)
 		LOG("v6 N-view atlas: %s", v6ok ? "PASS" : "FAIL");
 		pass = pass && v6ok;
 		destroy_image(vk, nv_input);
+	}
+
+	if (do_lift) {
+		const bool lift_ok =
+		    run_lift(vk, instance, session, pfn_bind2, pfn_submit, panel, output, lift_log, dump_dir);
+		pass = pass && lift_ok;
+		destroy_image(vk, output);
 	}
 
 	xrDestroySession(session);
