@@ -43,6 +43,16 @@
  * = displayId, else the display containing the origin, else main; pitch from
  * XR_DXR_display_info).
  *
+ * --lift (XR_DXR_lift §6, ADR-053 P5 step C): after the checks above, rect A
+ * holds a 2D frame (left half red, right half blue) flagged "lift me" on a
+ * spec-3 SBS stream (xrCreateLiftStreamDXR), with the browser's options
+ * (convergence AUTO, strength 1, inpaint, TRACKED, viewCount 2). Woven as SBS
+ * the quarter point would read magenta (red left eye, blue right eye); lifted
+ * (flat until the first result, then the stream's views) it reads red. Run the
+ * SERVICE with DXR_CONV_SIM_CONVERSION_ENABLE=1 (a provider) and grep its log
+ * for "lift rect: stream" (the snapshot / woven lines). vk backend only: the
+ * Metal backend refuses lifted rects for now.
+ *
  * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
  * (sim_display exports both DP families, so auto = vk); every check above holds
  * on both backends.
@@ -63,6 +73,7 @@
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
+#include <openxr/XR_DXR_lift.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +81,8 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 #define LOG(...)                                                                                                       \
@@ -545,8 +558,11 @@ main(int argc, char **argv)
 	bool do_snap = false;
 	int snap_period = 0; // 0/1 = expect identity
 	const char *views_log = NULL; // --views <service log>
+	bool do_lift = false;         // --lift
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
+		if (strcmp(argv[i], "--lift") == 0) {
+			do_lift = true;
+		} else if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
 			views_log = argv[++i];
 		} else if (strcmp(argv[i], "--snap") == 0) {
 			do_snap = true;
@@ -561,7 +577,8 @@ main(int argc, char **argv)
 			}
 			have_geometry = true;
 		} else {
-			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>]", argv[0]);
+			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>] [--lift]",
+			    argv[0]);
 			return 1;
 		}
 	}
@@ -576,7 +593,9 @@ main(int argc, char **argv)
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(NULL, ext_count, &ext_count, exts.data()));
 	bool has_weave = false, has_vk = false, has_rig = false, has_zones = false, has_info = false;
+	bool has_lift = false;
 	for (const auto &e : exts) {
+		has_lift = has_lift || strcmp(e.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0;
 		has_rig = has_rig || strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0;
 		has_zones = has_zones || strcmp(e.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0;
 		has_info = has_info || strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
@@ -607,8 +626,16 @@ main(int argc, char **argv)
 	ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = views_log != NULL ? 6 : 2; // display_zones requires local_3d_zone
-	ici.enabledExtensionNames = enabled;
+	std::vector<const char *> enabled_list(enabled, enabled + (views_log != NULL ? 6 : 2)); // zones need local_3d_zone
+	if (do_lift) {
+		if (!has_lift) {
+			LOG("--lift needs XR_DXR_lift");
+			return 1;
+		}
+		enabled_list.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+	}
+	ici.enabledExtensionCount = (uint32_t)enabled_list.size();
+	ici.enabledExtensionNames = enabled_list.data();
 	XrInstance instance = XR_NULL_HANDLE;
 	XR_CHECK(xrCreateInstance(&ici, &instance));
 
@@ -1021,6 +1048,122 @@ main(int argc, char **argv)
 			}
 			CFRelease(nv_input);
 		}
+	}
+
+	// ---- --lift: rect A holds 2D and is lifted on a spec-3 SBS stream.
+	if (do_lift) {
+		bool lift_ok = true;
+		PFN_xrGetLiftPropertiesDXR pfn_props = NULL;
+		PFN_xrCreateLiftStreamDXR pfn_create = NULL;
+		PFN_xrDestroyLiftStreamDXR pfn_destroy = NULL;
+		xrGetInstanceProcAddr(instance, "xrGetLiftPropertiesDXR", (PFN_xrVoidFunction *)&pfn_props);
+		xrGetInstanceProcAddr(instance, "xrCreateLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_create);
+		xrGetInstanceProcAddr(instance, "xrDestroyLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_destroy);
+		XrLiftPropertiesDXR props = {XR_TYPE_LIFT_PROPERTIES_DXR};
+		XrLiftStreamDXR stream = XR_NULL_HANDLE;
+		if (pfn_props == NULL || pfn_create == NULL || pfn_destroy == NULL) {
+			LOG("lift FAIL: XR_DXR_lift entry points missing");
+			lift_ok = false;
+		} else {
+			// Readiness: SBS appears once the service's provider is up (it may be ACTIVATING first).
+			for (int i = 0; i < 100; i++) {
+				if (XR_SUCCEEDED(pfn_props(session, &props)) && (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR) != 0 &&
+				    props.state == XR_LIFT_STATE_READY_DXR) {
+					break;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+			LOG("lift properties: modes=0x%llx state=%d maxViews=%u backend='%s'",
+			    (unsigned long long)props.supportedModes, (int)props.state, props.maxViews, props.backend);
+			XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+			ci.mode = XR_LIFT_MODE_SBS_DXR;
+			ci.inputScale = 1.0f;
+			XrResult cr = pfn_create(session, &ci, &stream);
+			if (XR_FAILED(cr)) {
+				LOG("lift FAIL: xrCreateLiftStreamDXR(SBS) -> %d (service needs a provider: "
+				    "DXR_CONV_SIM_CONVERSION_ENABLE=1)",
+				    (int)cr);
+				lift_ok = false;
+			}
+		}
+		if (lift_ok) {
+			IOSurfaceLock(input, 0, NULL);
+			const int half = kRectA.extent.width / 2;
+			for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
+				for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width; x++) {
+					const bool left = (x - kRectA.offset.x) < half;
+					put_px(base, stride, x, y, left ? 0xFF : 0x00, 0x00, left ? 0x00 : 0xFF);
+				}
+			}
+			IOSurfaceUnlock(input, 0, NULL);
+			XrLiftOptionsDXR opt = {XR_TYPE_LIFT_OPTIONS_DXR};
+			opt.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+			opt.strength = 1.0f;
+			opt.inpaint = XR_TRUE;
+			opt.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+			opt.viewCount = 2;
+			XrWeaveRectLiftDXR lr = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+			lr.next = &opt;
+			lr.rectIndex = 0; // rect A
+			lr.stream = stream;
+			XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+			lifts.liftCount = 1;
+			lifts.lifts = &lr;
+			XrWeaveSubmitRectsDXR lbatch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			lbatch.next = &lifts;
+			lbatch.rectCount = 2;
+			lbatch.rects = rects;
+			XrWeaveSubmitInfoDXR lsubmit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			lsubmit.next = &lbatch;
+			lsubmit.inputTexture = (void *)input;
+			lsubmit.inputIsDxgi = XR_FALSE;
+			lsubmit.firstChunk = XR_TRUE;
+			IOSurfaceRef lout = NULL;
+			for (int frame = 0; frame < 90 && lift_ok; frame++) { // ~1.5 s: results land well before
+				XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+				XrResult r = pfn_submit(session, &lsubmit, &out);
+				if (XR_FAILED(r)) {
+					LOG("lift FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
+					lift_ok = false;
+				}
+				if (out.weavedTexture != NULL && lout == NULL) {
+					lout = (IOSurfaceRef)out.weavedTexture;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+			}
+			IOSurfaceRef sample_from = lout != NULL ? lout : output;
+			if (lift_ok) {
+				dump_ppm(sample_from, "/tmp/weave_probe_macos_lift_output.ppm");
+				const int qx = kRectA.offset.x + kRectA.extent.width / 4;
+				const int qy = kRectA.offset.y + kRectA.extent.height / 2;
+				uint8_t r = 0, g = 0, b = 0;
+				if (sample_px(sample_from, qx, qy, &r, &g, &b)) {
+					const bool red = r > 150 && g < 80 && b < 80;
+					LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) want red (lifted 2D; magenta = woven as "
+					    "SBS) -> %s",
+					    qx, qy, r, g, b, red ? "OK" : "WRONG");
+					lift_ok = red;
+				} else {
+					lift_ok = false;
+				}
+				const int bx = kRectB.offset.x + kRectB.extent.width / 2;
+				const int by = kRectB.offset.y + kRectB.extent.height / 2;
+				if (sample_px(sample_from, bx, by, &r, &g, &b)) {
+					const bool cyan = r < 80 && g > 150 && b > 150;
+					LOG("lift rect B (not lifted) @(%d,%d) = (%u,%u,%u) want cyan -> %s", bx, by, r, g, b,
+					    cyan ? "OK" : "WRONG");
+					lift_ok = lift_ok && cyan;
+				}
+			}
+			if (lout != NULL) {
+				CFRelease(lout);
+			}
+		}
+		if (stream != XR_NULL_HANDLE) {
+			pfn_destroy(stream);
+		}
+		LOG("lift: %s", lift_ok ? "PASS" : "FAIL");
+		pass = pass && lift_ok;
 	}
 
 	xrDestroySession(session);
