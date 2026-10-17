@@ -244,7 +244,9 @@ three facts:
    command buffer that wrote the IOSurface has completed, and the Metal command buffer that reads
    it is committed later.
 2. The pin keeps the provider from writing that ring slot again until `complete`. The engine
-   calls `complete` only after its command buffer has completed.
+   calls `complete` only after its command buffer has completed (`waitUntilCompleted`), and that
+   is the only place a frame's pins are released. A detach (`comp_multi_weave_set_lift_ops`)
+   waits until every Metal frame in flight has completed before the helper frees its clients.
 3. The wrapped `MTLTexture` retains its IOSurface. Even a detach that frees the glue's image in
    the middle of a frame cannot free memory the command buffer still reads.
 
