@@ -1148,6 +1148,77 @@ Still open:
 
 Details: [`docs/reference/vulkan-conversion-glue.md`](../reference/vulkan-conversion-glue.md).
 
+**Landed (the open provider's POSIX blockers).**
+
+- **#2194 — `get_path`.** Both hosts answer it (`conv_host_paths.{h,c}`, discovery spec §2.7):
+  a per-provider scratch directory, created owner-only on first request, under
+  `~/Library/Caches/DisplayXR/Conversion` (macOS), `$XDG_CACHE_HOME/displayxr/conversion`
+  (Linux) or `%LOCALAPPDATA%\DisplayXR\Conversion` (Windows); plus the store root and the log
+  directory. A provider that compiles its model on first load (the Core ML execution provider)
+  keeps the compiled model there instead of recompiling on every warm-up.
+- **#2195 — the POSIX downloader.** The model store downloads `http(s)://` blobs on macOS and
+  desktop Linux with libcurl loaded at run time, through the same write protocol as WinHTTP
+  (discovery spec §5.4). An `https` pack now becomes READY on a user install with no pre-fetch.
+
+**Proposed: how the macOS `.pkg` and the `.deb` carry the open provider (not implemented).**
+
+1. **Ship it as the provider's own package, not inside the runtime's.** Same split as Windows,
+   where the runtime installer does not carry the provider and `DisplayXROpenConversionSetup-*.exe`
+   is its own release asset. Add two jobs to `displayxr-conversion-open`'s tag-triggered
+   `release.yml`: `DisplayXR-OpenConversion-<ver>.pkg` (macOS arm64; the official osx-arm64 ONNX
+   Runtime archive already includes the Core ML execution provider) and
+   `displayxr-open-conversion_<ver>_amd64.deb`, built in an `ubuntu:22.04` container like the
+   runtime's `.deb` (#1656 glibc floor). The `.deb` declares
+   `Depends: displayxr-runtime (>= <floor>)`, with the floor derived from the vendored-header pin
+   the way the vendor installers derive `MIN_RUNTIME_VERSION`. The `.pkg` checks for the runtime
+   in a `preinstall` and fails if it is missing. **Pin:** `versions.json` `conversion_open` already
+   exists and is auto-bumped on the provider's tag. On macOS, `setup-displayxr.sh` installs that
+   release's `.pkg` (it already installs a `.pkg` per pinned component). Linux has no
+   orchestrator, so the `.deb` is a release asset installed with `apt` next to the runtime's. The ABI coupling is
+   the existing `downstream-pins.json` `abi` track on `xrt_conversion_plugin.h`.
+   *Alternative:* the runtime's `build_installer.sh` / `package_deb_linux.sh` download the pinned
+   release asset at build time and embed it. Rejected: the runtime release would then wait on, and
+   re-ship, a provider release, and `versions.json` is bumped after the runtime tag, so the embedded
+   copy would always be one provider release behind.
+2. **Layout: a subdirectory per provider, the manifest beside the others.** macOS:
+   `/Library/Application Support/DisplayXR/lib/displayxr/plugins/open-conversion/` holds
+   `DisplayXR-OpenConversion.dylib`, `libonnxruntime.dylib` and `dxr-open-default.models.json`.
+   The manifest `200-open-conversion-conversion-provider.json` goes in
+   `/Library/Application Support/DisplayXR/DisplayProcessors/` with absolute `binary_path` and
+   `packs`. Linux: payload in `/usr/lib/displayxr/plugins/open-conversion/`, manifest in
+   `/usr/lib/displayxr/plugins/`. This proposes a subdirectory instead of the flat layout #2195
+   describes. The reason is that ONNX Runtime is loaded by name from the provider's own
+   directory, so a second provider shipping a different `libonnxruntime` cannot share that
+   directory. Both locations are root-owned, so the provenance gate (ADR-054 N4b) classifies the
+   provider as `platform-trusted`. The provider's current per-user tarball is `unverified`, which
+   is fine while POSIX only audits, but it would be refused once `/etc/displayxr/trust/enforce`
+   exists.
+3. **macOS signing.** Ad-hoc sign both dylibs (`codesign --force --sign -`), the same as the
+   runtime `.pkg`'s plug-in today. Files that Installer.app lays down carry no quarantine attribute,
+   so `dlopen` is not gated by Gatekeeper. The trap comes later: once `displayxr-service` /
+   `displayxr-conversion-host` get a Developer ID and the hardened runtime, library validation
+   refuses any dylib signed by another team, and ad-hoc counts as another team. When that
+   happens, either sign the provider and ONNX Runtime with the runtime's identity, or give
+   `displayxr-conversion-host` (satellite is the default hosting) and `displayxr-service`
+   (in-service hosting) `com.apple.security.cs.disable-library-validation`. Decide this with
+   the macOS signing work. Do not find out about it from a field report.
+4. **Models: on demand by default; pre-fetch only with a read-only packaged root.** With #2195 the
+   112.6 MB `prefetch` set downloads on the first warm-up and shows as `DOWNLOADING`. A
+   packaged pre-fetch does **not** work as the root order stands. The POSIX store resolves
+   `$XDG_DATA_HOME/displayxr/models` whenever that is writable, which it is on every desktop. A
+   post-install run as root (its `HOME` is `/root`) would therefore fill
+   `/var/lib/displayxr/models`, and the user's service would never look there and would download
+   everything again. Recommendation: ship no models component on POSIX for v1. If pre-fetch is
+   wanted later, first make the store treat `/var/lib/displayxr/models` (Linux) and
+   `/Library/Application Support/DisplayXR/Models` (macOS) as a **read-only secondary root**,
+   where a blob is used after the per-process hash check and never written. Then the post-install
+   runs `displayxr-cli conv models fetch <pack> --prefetch --installer --root <that root>` as root,
+   fail-soft like the NSIS section. The research-only rule (§5.3) is unchanged.
+5. **libcurl on Linux.** The runtime `.deb` should add `Recommends: libcurl4 | libcurl4t64`
+   (24.04 renamed the package) now that the store's downloader, not just the remote provider,
+   loads it. It is not a `Depends`: everything except downloads works without it, and the store
+   logs why a download failed.
+
 ### P6 — Lift spec 6 + job consumers
 
 Spec 6 (jobs, `XrLiftSplatsInfoDXR` with SPZ + camera block, stereo + depth input; DISPARITY_STEREO,
