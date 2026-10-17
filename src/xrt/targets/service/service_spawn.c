@@ -133,7 +133,7 @@ service_spawn_terminate(PROCESS_INFORMATION *pi, uint32_t exit_code, uint32_t wa
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifdef XRT_OS_APPLE
+#ifdef XRT_OS_MACOS
 #include <mach-o/dyld.h>
 #endif
 
@@ -144,7 +144,7 @@ service_spawn_sibling_path(const char *exe_name, char *buf, size_t buf_size)
 		return false;
 	}
 	char self_path[PATH_MAX];
-#ifdef XRT_OS_APPLE
+#ifdef XRT_OS_MACOS
 	uint32_t sz = (uint32_t)sizeof(self_path);
 	if (_NSGetExecutablePath(self_path, &sz) != 0) {
 		return false;
