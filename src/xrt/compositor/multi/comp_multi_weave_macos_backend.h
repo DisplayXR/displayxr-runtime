@@ -67,6 +67,13 @@ struct comp_multi_weave_macos_params
 	//! valid only when have_present_origin.
 	bool have_present_origin;
 	int32_t present_origin_x, present_origin_y;
+
+	//! @name XR_DXR_lift §6: this submit's lifted rects (0 unless lifts_rects)
+	//! @{
+	uint32_t lift_count;
+	uint64_t lift_owner;
+	const struct xrt_lift_weave_rect *lift_rects;
+	//! @}
 };
 
 struct comp_multi_weave_macos_backend
@@ -76,6 +83,11 @@ struct comp_multi_weave_macos_backend
 	//! Feeds the panel-relative present origin to its DP before every weave
 	//! (the Metal backend; the vk backend is unchanged and has no phase feed).
 	bool feeds_present_origin;
+
+	//! Lifts weave rects (XR_DXR_lift §6, comp_multi_weave_lift.h): the vk
+	//! backend. The Metal backend weaves them as drawn (TODO step C: a Metal
+	//! path through the results' IOSurface export).
+	bool lifts_rects;
 
 	//! Bring up the device objects + DP once; true when ready.
 	bool (*ensure_engine)(struct multi_compositor *mc);

@@ -569,12 +569,21 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_lift §6: this submit's lifted rects, taken NOW so every exit path
+	// below consumes them (a set is valid for exactly one submit).
+	struct xrt_lift_weave_rect lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	uint64_t lift_owner = 0;
+	uint32_t lift_count = comp_multi_weave_lift_take(&mc->weave.lift, &lift_owner, lift_rects);
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_backend_locked(mc)) {
 			break;
 		}
 		const struct comp_multi_weave_macos_backend *be = mc->weave.backend;
+		if (!be->lifts_rects) {
+			lift_count = 0; // this backend weaves them as drawn
+		}
 
 		// (Re)import the input on identity change (new IOSurface = new id).
 		if (mc->weave.in_iosurface == NULL || mc->weave.in_iosurface_id != surface_id) {
@@ -677,7 +686,10 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .want_h = want_h,
 		    .first_chunk = weave_frame_first,
 		    .nview = nview,
-		    .v6_zero_copy = nview && (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h),
+		    // A v6 frame carrying lifted rects never samples the caller's
+		    // texture in place: the lift writes into the crop copy (spec §6).
+		    .v6_zero_copy =
+		        nview && lift_count == 0 && (packed_w == mc->weave.in_w && packed_h == mc->weave.in_h),
 		    .cvw = cvw,
 		    .cvh = cvh,
 		    .packed_w = packed_w,
@@ -688,6 +700,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .have_present_origin = mc->weave.have_present_origin,
 		    .present_origin_x = mc->weave.present_origin_x,
 		    .present_origin_y = mc->weave.present_origin_y,
+		    .lift_count = lift_count,
+		    .lift_owner = lift_owner,
+		    .lift_rects = lift_rects,
 		};
 		if (!be->record_and_wait(mc, &params)) {
 			break;
@@ -704,6 +719,12 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		U_ZERO(out_eyes);
 		if (!be->get_eyes(mc, out_eyes)) {
 			U_ZERO(out_eyes);
+		} else {
+			// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's
+			// stream reads this DP's.
+			const void *dp_key = mc->weave.dp != NULL ? (const void *)mc->weave.dp
+			                                          : (const void *)mc->weave.dp_metal;
+			comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)dp_key, out_eyes);
 		}
 
 		ok = true;
