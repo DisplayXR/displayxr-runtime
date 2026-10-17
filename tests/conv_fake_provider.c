@@ -260,6 +260,9 @@ fake_stream_convert(struct xrt_conversion_plugin_instance *inst,
 	const bool fail = c != NULL && c->fail_converts;
 	f->converts++;
 	f->last_params = *params;
+	if (in != NULL && in->image_count > 0) {
+		f->last_input = in->images[0];
+	}
 	if ((params->frame_flags & XRT_CONV_FRAME_RESET) != 0) {
 		f->resets_seen++;
 	}

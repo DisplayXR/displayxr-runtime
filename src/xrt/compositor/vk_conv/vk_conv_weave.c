@@ -86,6 +86,10 @@ struct vkcw_stream
 	struct vkcw_img chain[VKCW_CHAIN_MAX];
 	struct vkcw_buf snap_buf;
 	bool snap_pending;
+	//! Step E: this frame's snapshot stays on the GPU (the slot will be a
+	//! glue image): no host copy recorded, complete copies chain[snap_level].
+	bool snap_gpu;
+	uint32_t snap_level;
 	uint32_t snap_w, snap_h; //!< after crop + cap
 	uint32_t act_w, act_h;   //!< the cropped area (before the cap)
 	struct conv_frame_submit fr;
@@ -587,6 +591,7 @@ static void
 record_snapshot(struct vk_conv_weave *w,
                 const struct vk_conv_weave_bridge *br,
                 struct vkcw_stream *st,
+                uint64_t core_id,
                 VkCommandBuffer cmd,
                 const struct vk_conv_weave_rect *r)
 {
@@ -612,7 +617,14 @@ record_snapshot(struct vk_conv_weave *w,
 	lw[levels] = dw;
 	lh[levels] = dh;
 	levels++;
-	bool ok = buf_ensure(vk, &st->snap_buf, (VkDeviceSize)dw * dh * 4u);
+	// Step E: when the stream's binding takes a GPU kind the glue would give
+	// its input slot (a composed pipeline whose depth stage imports GPU
+	// memory), the snapshot never leaves the GPU: complete copies the chain's
+	// last image into the slot. Otherwise GPU -> host -> slot, as before.
+	uint32_t in_mem = 0, in_sync = 0;
+	const bool gpu_snap = br->core != NULL && conv_core_stream_input_kinds(br->core, core_id, &in_mem, &in_sync) &&
+	                      vk_conv_gpu_input_memory_kind(w->glue, in_mem, in_sync) != XRT_CONV_MEM_CPU;
+	bool ok = gpu_snap || buf_ensure(vk, &st->snap_buf, (VkDeviceSize)dw * dh * 4u);
 	for (uint32_t i = 0; ok && i < levels; i++) {
 		ok = img_ensure(vk, &st->chain[i], lw[i], lh[i], VK_FORMAT_R8G8B8A8_UNORM);
 	}
@@ -638,13 +650,17 @@ record_snapshot(struct vk_conv_weave *w,
 			pw = (int32_t)li->w;
 			ph = (int32_t)li->h;
 		}
-		VkBufferImageCopy region = {
-		    .bufferOffset = 0,
-		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .imageExtent = {dw, dh, 1},
-		};
-		vk->vkCmdCopyImageToBuffer(cmd, st->chain[levels - 1].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                           st->snap_buf.buf, 1, &region);
+		if (!gpu_snap) {
+			VkBufferImageCopy region = {
+			    .bufferOffset = 0,
+			    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .imageExtent = {dw, dh, 1},
+			};
+			vk->vkCmdCopyImageToBuffer(cmd, st->chain[levels - 1].image,
+			                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, st->snap_buf.buf, 1, &region);
+		}
+		st->snap_gpu = gpu_snap;
+		st->snap_level = levels - 1;
 		st->snap_pending = true;
 		st->snap_w = dw;
 		st->snap_h = dh;
@@ -979,6 +995,7 @@ vk_conv_weave_begin(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 	pins_release(c, &b);
 	for (struct vkcw_stream *st = c->streams; st != NULL; st = st->next) {
 		st->snap_pending = false;
+		st->snap_gpu = false;
 		st->lb_pending = false;
 		st->used_this_frame = false;
 		st->host_snap = NULL;
@@ -1030,7 +1047,7 @@ vk_conv_weave_record(struct vk_conv_weave *w,
 		if (b.match_weave != NULL) {
 			b.match_weave(b.ud, rc.owner, wire, rc.views); // spec 4 viewCount 0 = match the weave
 		}
-		record_snapshot(w, &b, st, cmd, &rc);
+		record_snapshot(w, &b, st, core_id, cmd, &rc);
 		st->used_this_frame = true;
 		// The snapshot's (and the letterbox copy's) reads finish before the
 		// result overwrites the tiles (v6: the same crop image).
@@ -1114,11 +1131,12 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		if (st->snap_pending) {
 			st->snap_pending = false;
 			const char *fail = NULL;
+			const bool gpu_snap = !c->host && st->snap_gpu;
 			const uint8_t *snap =
 			    c->host ? (const uint8_t *)st->host_snap : (const uint8_t *)st->snap_buf.map;
 			if (!alive) {
 				fail = "resolve";
-			} else if (snap == NULL) {
+			} else if (snap == NULL && !gpu_snap) {
 				fail = "copy"; // the host engine's snapshot never completed
 			} else {
 				struct conv_submit_layout lay;
@@ -1137,7 +1155,14 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 					const struct xrt_conv_image *img = &slot.images[0];
 					const uint32_t tight = st->snap_w * 4u;
 					bool ok = false;
-					if (img->memory_kind == XRT_CONV_MEM_CPU && img->cpu_ptr != NULL) {
+					if (gpu_snap) {
+						// GPU -> GPU into a glue slot (no host buffer); a slot
+						// that turned out CPU (a rebind) is read back instead.
+						const struct vkcw_img *last = &st->chain[st->snap_level];
+						ok = vk_conv_gpu_copy_from_vk(
+						    w->glue, last->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+						    last->format, 0, 0, st->snap_w, st->snap_h, img);
+					} else if (img->memory_kind == XRT_CONV_MEM_CPU && img->cpu_ptr != NULL) {
 						const uint32_t pitch = img->row_stride != 0 ? img->row_stride : tight;
 						if ((uint64_t)pitch * st->snap_h <= img->byte_size ||
 						    img->byte_size == 0) {

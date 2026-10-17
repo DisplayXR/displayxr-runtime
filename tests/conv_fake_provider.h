@@ -68,6 +68,7 @@ struct conv_fake_provider
 	uint64_t first_frame_flags; //!< frame_flags of the first convert of the last created stream
 	bool first_frame_pending;
 	struct xrt_conv_params last_params;
+	struct xrt_conv_image last_input; //!< images[0] of the last convert (the slot image the runtime filled)
 	uint64_t job_cancel_seen_ns; //!< when job_execute observed is_cancelled
 	uint64_t job_started_ns;
 	bool job_running;
