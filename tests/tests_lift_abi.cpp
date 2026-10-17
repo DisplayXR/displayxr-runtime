@@ -427,3 +427,38 @@ TEST_CASE("lift ABI v4: entry points", "[lift_abi]")
 	STATIC_REQUIRE(std::is_same<decltype(&xrEnumerateLiftTasksDXR), PFN_xrEnumerateLiftTasksDXR>::value);
 	STATIC_REQUIRE(std::is_same<decltype(&xrRequestLiftTaskWarmDXR), PFN_xrRequestLiftTaskWarmDXR>::value);
 }
+
+/*
+ *
+ * Spec 5 (#2178): provider candidates + the per-create hint. Pinned at
+ * introduction; frozen once a release ships them.
+ *
+ */
+
+TEST_CASE("lift ABI v5: candidates and the preference hint", "[lift_abi]")
+{
+	STATIC_REQUIRE(XR_DXR_lift_SPEC_VERSION >= 5);
+	// 340 was held back from spec 4 for exactly this; 352 is the next free value.
+	STATIC_REQUIRE(XR_TYPE_LIFT_TASK_CANDIDATE_DXR == (XrStructureType)1004999340);
+	STATIC_REQUIRE(XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR == (XrStructureType)1004999352);
+	STATIC_REQUIRE(XR_LIFT_PROVIDER_HOSTING_LOCAL_IN_SERVICE_DXR == 0 &&
+	               XR_LIFT_PROVIDER_HOSTING_LOCAL_SATELLITE_DXR == 1 && XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR == 2);
+
+	CHECK(sizeof(XrLiftTaskCandidateDXR) == 168);
+	PIN_OFF(XrLiftTaskCandidateDXR, providerId, 16);
+	PIN_OFF(XrLiftTaskCandidateDXR, displayName, 80);
+	PIN_OFF(XrLiftTaskCandidateDXR, state, 144);
+	PIN_OFF(XrLiftTaskCandidateDXR, failureReason, 148);
+	PIN_OFF(XrLiftTaskCandidateDXR, licenceClass, 152);
+	PIN_OFF(XrLiftTaskCandidateDXR, hosting, 156);
+	PIN_OFF(XrLiftTaskCandidateDXR, isUserDefault, 160);
+	PIN_OFF(XrLiftTaskCandidateDXR, isSelected, 164);
+	CHECK(sizeof(XrLiftProviderPreferenceDXR) == 24);
+	PIN_OFF(XrLiftProviderPreferenceDXR, providerId, 16);
+
+	STATIC_REQUIRE(std::is_same<PFN_xrEnumerateLiftTaskCandidatesDXR,
+	                            XrResult(XRAPI_PTR *)(XrSession, XrLiftTaskDXR, uint32_t, uint32_t *,
+	                                                  XrLiftTaskCandidateDXR *)>::value);
+	STATIC_REQUIRE(
+	    std::is_same<decltype(&xrEnumerateLiftTaskCandidatesDXR), PFN_xrEnumerateLiftTaskCandidatesDXR>::value);
+}

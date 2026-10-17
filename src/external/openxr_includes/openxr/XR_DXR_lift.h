@@ -74,7 +74,16 @@
  * GAUSSIANS blob may be SOG where it was PLY; an affine-disparity aux depth
  * reads RELATIVE + INVERSE, so auxDepthSupported stays true; and the mode
  * check at create follows the declared capabilities, so a mode whose task is
- * still warming is accepted (its frames wait).
+ * still warming is accepted (its frames wait). 5 = provider candidates
+ * (#2178, ADR-054 decision 8): xrEnumerateLiftTaskCandidatesDXR lists, per
+ * task, the providers that could serve it -- READ-ONLY: id, the provider's own
+ * display name, readiness, licence class, hosting, whether it is the user's
+ * default and whether a create would pick it -- and XrLiftProviderPreferenceDXR
+ * chained on XrLiftTaskStreamCreateInfoDXR is a per-create HINT that reorders
+ * the non-terminal candidates for that create only. The runtime still
+ * arbitrates; an app never sets the user's default. Spec 6 (planned, not in
+ * this header): jobs, stereo-pair / image+depth input and splats over the
+ * extension (the 1004999360.. types).
  */
 #ifndef XR_DXR_LIFT_H
 #define XR_DXR_LIFT_H 1
@@ -87,7 +96,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_lift 1
-#define XR_DXR_lift_SPEC_VERSION 4
+#define XR_DXR_lift_SPEC_VERSION 5
 #define XR_DXR_LIFT_EXTENSION_NAME "XR_DXR_lift"
 
 // Reserved 1004999270..279. Allocation registry: README.md in this directory.
@@ -114,9 +123,10 @@ extern "C" {
 #define XR_TYPE_LIFT_DEPTH_RESULT_DXR        ((XrStructureType)1004999284)
 #define XR_TYPE_LIFT_DEPTH_PROPERTIES_DXR    ((XrStructureType)1004999285)
 // ---- Spec v4 (ADR-053: tasks, readiness, neutral transport) ----
-// Reserved 1004999340..369 (three decades, spec 4 + spec 5). Registry:
-// README.md in this directory. 1004999340 is unused (provider enumeration was
-// cut from the app API); 352..359 are free for spec-4 follow-ups.
+// Reserved 1004999340..369 (three decades, spec 4, 5 and 6). Registry:
+// README.md in this directory. 1004999340 (held back when provider
+// enumeration was cut from spec 4) is spec 5's candidate struct; 353..359
+// are free.
 #define XR_TYPE_LIFT_TASK_PROPERTIES_DXR               ((XrStructureType)1004999341)
 #define XR_TYPE_LIFT_TASK_STREAM_CREATE_INFO_DXR       ((XrStructureType)1004999342)
 #define XR_TYPE_LIFT_FRAME_IMAGES_DXR                  ((XrStructureType)1004999343)
@@ -128,6 +138,9 @@ extern "C" {
 #define XR_TYPE_LIFT_FRAME_CONTROL_DXR                 ((XrStructureType)1004999349)
 #define XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR ((XrStructureType)1004999350)
 #define XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR  ((XrStructureType)1004999351)
+// ---- Spec v5 (#2178: read-only provider candidates + a per-create hint) ----
+#define XR_TYPE_LIFT_TASK_CANDIDATE_DXR                ((XrStructureType)1004999340)
+#define XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR           ((XrStructureType)1004999352)
 
 //! Size of XrLiftPropertiesDXR::backend, NUL included.
 #define XR_LIFT_BACKEND_NAME_MAX_SIZE_DXR 32
@@ -138,6 +151,10 @@ extern "C" {
 #define XR_LIFT_CONVERGENCE_AUTO_DXR (-1.0f)
 //! Upper bound on lifted rects carried by one XrWeaveSubmitLiftRectsDXR.
 #define XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR 8
+//! Size of XrLiftTaskCandidateDXR::providerId, NUL included (spec 5).
+#define XR_LIFT_PROVIDER_ID_MAX_SIZE_DXR 64
+//! Size of XrLiftTaskCandidateDXR::displayName, NUL included (spec 5).
+#define XR_LIFT_PROVIDER_NAME_MAX_SIZE_DXR 64
 
 XR_DEFINE_HANDLE(XrLiftStreamDXR)
 
@@ -676,25 +693,27 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetLiftStreamStatsDXR)(XrLiftStreamDXR stream
  *
  * Everything below is APPENDED: every v3 struct, enum value and entry point
  * above is unchanged. Detect spec 4 with extensionVersion >= 4. Enums with a
- * conversion-plug-in ABI counterpart use that ABI's values. There is no
- * provider enumeration: an app sees TASKS, never providers.
+ * conversion-plug-in ABI counterpart use that ABI's values. In spec 4 an app
+ * sees TASKS, never providers; spec 5 (below) adds a READ-ONLY candidate list
+ * and a per-create HINT, never a way to choose for the user.
  * ===========================================================================
  */
 
 /*!
  * WHAT to compute. A fixed vocabulary; a task is served by at most one
- * provider at a time, chosen by the runtime, never by the app. RESERVED values
- * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 5" are not
- * creatable on a spec-4 runtime.
+ * provider at a time, chosen by the runtime (an app may HINT a provider per
+ * create, spec 5; the runtime still decides). RESERVED values
+ * are refused (XR_ERROR_VALIDATION_FAILURE). Tasks marked "spec 6" are not
+ * creatable on a spec-4 or spec-5 runtime.
  */
 typedef enum XrLiftTaskDXR {
     XR_LIFT_TASK_DEPTH_MONO_DXR        = 1,  //!< one image -> depth (stills; no temporal state)
     XR_LIFT_TASK_DEPTH_VIDEO_DXR       = 2,  //!< frames -> depth, temporally stable; reset on discontinuity
-    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 5)
+    XR_LIFT_TASK_DISPARITY_STEREO_DXR  = 3,  //!< rectified pair + calibration -> disparity / depth (spec 6)
     XR_LIFT_TASK_VIEWS_MONO_DXR        = 4,  //!< image/frames -> N >= 2 views (+ same-inference aux depth)
-    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 5)
+    XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR  = 5,  //!< image + depth -> N views (spec 6)
     XR_LIFT_TASK_SPLATS_MONO_DXR       = 6,  //!< photo -> 3D Gaussian splats (job lane)
-    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 5, job lane)
+    XR_LIFT_TASK_SPLATS_STEREO_DXR     = 7,  //!< pair + calibration -> metric splats (spec 6, job lane)
     XR_LIFT_TASK_SPLATS_VIDEO_DXR      = 8,  //!< RESERVED
     XR_LIFT_TASK_INPAINT_DXR           = 9,  //!< RESERVED (a provider sub-stage, never app-creatable)
     XR_LIFT_TASK_MAX_ENUM_DXR = 0x7FFFFFFF
@@ -703,8 +722,8 @@ typedef enum XrLiftTaskDXR {
 /*! The shape of the input a task stream consumes. */
 typedef enum XrLiftInputKindDXR {
     XR_LIFT_INPUT_KIND_MONO_DXR            = 1, //!< one colour image
-    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 5)
-    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 5)
+    XR_LIFT_INPUT_KIND_STEREO_PAIR_DXR     = 2, //!< rectified L/R pair (spec 6)
+    XR_LIFT_INPUT_KIND_IMAGE_AND_DEPTH_DXR = 3, //!< colour + depth image (spec 6)
     XR_LIFT_INPUT_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftInputKindDXR;
 typedef XrFlags64 XrLiftInputKindFlagsDXR; //!< bit (1 << XrLiftInputKindDXR)
@@ -766,7 +785,7 @@ typedef enum XrLiftQualityHintDXR {
 
 typedef XrFlags64 XrLiftLaneFlagsDXR;
 static const XrLiftLaneFlagsDXR XR_LIFT_LANE_STREAM_BIT_DXR = 0x00000001; //!< latest-wins streams
-static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 5)
+static const XrLiftLaneFlagsDXR XR_LIFT_LANE_JOB_BIT_DXR    = 0x00000002; //!< one-shot jobs (spec 6)
 
 typedef XrFlags64 XrLiftOutputFlagsDXR;
 static const XrLiftOutputFlagsDXR XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR           = 0x00000001; //!< views + same-inference depth
@@ -834,8 +853,8 @@ typedef enum XrLiftColorSpaceDXR {
 
 typedef enum XrLiftImageRoleDXR {
     XR_LIFT_IMAGE_ROLE_COLOR_DXR       = 1, //!< mono input, or the first/left eye, or a whole SBS pair
-    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 5)
-    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 5
+    XR_LIFT_IMAGE_ROLE_COLOR_RIGHT_DXR = 2, //!< second eye when the pair is two images (spec 6)
+    XR_LIFT_IMAGE_ROLE_DEPTH_DXR       = 3, //!< depth input (+ XrLiftDepthInfoDXR on next), spec 6
     XR_LIFT_IMAGE_ROLE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftImageRoleDXR;
 
@@ -846,7 +865,7 @@ typedef enum XrLiftDepthKindDXR {
     XR_LIFT_DEPTH_KIND_AFFINE_INVERSE_DEPTH_DXR = 3, //!< unknown scale+shift of 1/depth, larger = nearer (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DISPARITY_DXR     = 4, //!< disparity up to scale+shift (v3: RELATIVE + INVERSE)
     XR_LIFT_DEPTH_KIND_AFFINE_DEPTH_DXR         = 5, //!< unknown scale+shift, larger = farther (v3: RELATIVE + LINEAR)
-    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 5)
+    XR_LIFT_DEPTH_KIND_PIXEL_DISPARITY_DXR      = 6, //!< exact disparity in pixels of a rectified pair (spec 6)
     XR_LIFT_DEPTH_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrLiftDepthKindDXR;
 
@@ -944,7 +963,10 @@ typedef struct XrLiftTaskPropertiesDXR {
  * The provider set behind the tasks changed (install / uninstall / user
  * preference). Re-enumerate the tasks: their state, outputs and limits may
  * have changed. Live streams do not move. Delivered only to sessions that
- * made a spec-4 call (opt-in, see xrEnumerateLiftTasksDXR).
+ * made a spec-4 call (opt-in, see xrEnumerateLiftTasksDXR). Spec 5: also
+ * delivered when the candidate list a session enumerated
+ * (xrEnumerateLiftTaskCandidatesDXR) changed, e.g. a candidate behind the
+ * selection became READY or FAILED; re-enumerate the candidates too.
  */
 typedef struct XrEventDataLiftProvidersChangedDXR {
     XrStructureType          type;            //!< XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR
@@ -1190,6 +1212,99 @@ typedef XrResult (XRAPI_PTR *PFN_xrEnumerateLiftTasksDXR)(
     XrSession session, uint32_t capacityInput, uint32_t* countOutput, XrLiftTaskPropertiesDXR* tasks);
 typedef XrResult (XRAPI_PTR *PFN_xrRequestLiftTaskWarmDXR)(XrSession session, XrLiftTaskDXR task);
 
+/*
+ * ===========================================================================
+ * Spec v5 (#2178, ADR-054 decision 8): provider candidates and the per-create
+ * preference hint.
+ *
+ * APPENDED: every spec-4 struct, enum value and entry point is unchanged.
+ * Detect spec 5 with extensionVersion >= 5. A spec-4 runtime ignores
+ * XrLiftProviderPreferenceDXR on a create (the runtime's default applies) and
+ * does not expose xrEnumerateLiftTaskCandidatesDXR (xrGetInstanceProcAddr
+ * fails).
+ *
+ * Apps express preferences, never policy: the user's default per task is set
+ * in the Dashboard / CLI (`displayxr-cli conv use <task> <id>`), and nothing
+ * here writes it. Show the candidates' strings verbatim; never hardcode or
+ * recognise a provider id or name. A browser must not expose provider identity
+ * to web content (it shows at most waiting / ready / unavailable).
+ * ===========================================================================
+ */
+
+/*! Where a candidate runs (spec 5). */
+typedef enum XrLiftProviderHostingDXR {
+    //! Loaded in the runtime's service process, on this machine.
+    XR_LIFT_PROVIDER_HOSTING_LOCAL_IN_SERVICE_DXR = 0,
+    //! In its own supervised host process, on this machine.
+    XR_LIFT_PROVIDER_HOSTING_LOCAL_SATELLITE_DXR  = 1,
+    //! Pictures leave this machine (a remote endpoint; per-user consent applies).
+    XR_LIFT_PROVIDER_HOSTING_REMOTE_DXR           = 2,
+    XR_LIFT_PROVIDER_HOSTING_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrLiftProviderHostingDXR;
+
+/*!
+ * One provider that could serve a task (spec 5), READ-ONLY. One element per
+ * provider, in the runtime's selection order: the providers the runtime would
+ * consider for a create of the task (enabled, not superseded, licence-eligible
+ * -- a RESEARCH_ONLY / UNKNOWN-licence provider appears only when the USER
+ * opted in -- and able to serve the task's lane / view count), whatever their
+ * readiness. Array element: never grows (extend via @c next).
+ *
+ * @c providerId is the provider's registration id: the string to put in
+ * XrLiftProviderPreferenceDXR. @c displayName is the provider's own name for
+ * the capability that serves the task, VERBATIM (the runtime never names a
+ * provider). @c state / @c failureReason are that capability's readiness (the
+ * same vocabulary as XrLiftTaskPropertiesDXR; a terminal state means a hint to
+ * it falls through). @c isUserDefault: the user's per-task default
+ * (PreferredProvider) names this provider. @c isSelected: a create of the task
+ * WITHOUT a hint, made now, would bind this provider (at most one element;
+ * none when every candidate is terminal).
+ *
+ * The list changes with installs, uninstalls, the user's default and any
+ * candidate's readiness; each such change is announced by
+ * XrEventDataLiftProvidersChangedDXR to a session that has enumerated.
+ */
+typedef struct XrLiftTaskCandidateDXR {
+    XrStructureType          type;            //!< XR_TYPE_LIFT_TASK_CANDIDATE_DXR
+    void* XR_MAY_ALIAS       next;
+    char                     providerId[XR_LIFT_PROVIDER_ID_MAX_SIZE_DXR];
+    char                     displayName[XR_LIFT_PROVIDER_NAME_MAX_SIZE_DXR];
+    XrLiftTaskStateDXR       state;
+    XrLiftFailureReasonDXR   failureReason;   //!< NONE unless FAILED / DISABLED
+    XrLiftLicenceClassDXR    licenceClass;
+    XrLiftProviderHostingDXR hosting;
+    XrBool32                 isUserDefault;
+    XrBool32                 isSelected;
+} XrLiftTaskCandidateDXR;
+
+/*!
+ * Chain on XrLiftTaskStreamCreateInfoDXR::next (spec 5): a per-create HINT
+ * naming the provider this app would like for this stream. It applies to job
+ * creation too once the job API lands (it will chain on the job create info
+ * with the same meaning).
+ *
+ * @c providerId: a candidate's providerId, optionally "/<model id>" to name
+ * one of its capabilities. The hint moves the FIRST non-terminal candidate
+ * row it matches to the front of the selection for THIS create only (and for
+ * this stream's own rebinds after a terminal failure). The runtime still
+ * arbitrates: the user's and the machine's policy decide what is a candidate
+ * at all, and readiness falls through as usual. An unknown, filtered or
+ * terminal provider id is not an error: the create proceeds with the normal
+ * selection (the runtime logs one INFO line). NULL or "" = no hint. It never
+ * changes the user's / machine's default, and it does not move a live stream.
+ * The create's validation (view count, required outputs, limits) is checked
+ * against the provider the create binds.
+ */
+typedef struct XrLiftProviderPreferenceDXR {
+    XrStructureType          type;            //!< XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR
+    const void* XR_MAY_ALIAS next;
+    const char*              providerId;
+} XrLiftProviderPreferenceDXR;
+
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateLiftTaskCandidatesDXR)(
+    XrSession session, XrLiftTaskDXR task, uint32_t capacityInput, uint32_t* countOutput,
+    XrLiftTaskCandidateDXR* candidates);
+
 #ifndef XR_NO_PROTOTYPES
 
 //! Query the conversion module. Cheap and non-blocking: the first call may
@@ -1241,6 +1356,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateLiftTasksDXR(
 //! -> WARMING -> READY). Never blocks; progress arrives as events or on the
 //! next enumeration. XR_ERROR_VALIDATION_FAILURE for a reserved task.
 XRAPI_ATTR XrResult XRAPI_CALL xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task);
+
+//! Spec 5: the read-only candidate providers of @p task, in selection order
+//! (two-call idiom). Cheap: nothing is loaded or warmed by it. 0 candidates
+//! is XR_SUCCESS (no provider, or no service yet), never an error.
+//! XR_ERROR_VALIDATION_FAILURE for a reserved task. Like every spec-4 call it
+//! opts the session into the task / provider events.
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateLiftTaskCandidatesDXR(
+    XrSession session, XrLiftTaskDXR task, uint32_t capacityInput, uint32_t* countOutput,
+    XrLiftTaskCandidateDXR* candidates);
 
 #endif /* !XR_NO_PROTOTYPES */
 

@@ -152,6 +152,7 @@ struct conv_job
 	uint32_t task;
 	uint32_t priority;
 	struct conv_binding bind;
+	char preferred_provider[XRT_CONV_WIRE_PREFERENCE_MAX]; //!< per-job hint, kept for a rebind ("" = none)
 
 	uint32_t status; //!< CONV_JOB_*
 	uint32_t failure_reason;
@@ -331,6 +332,11 @@ conv_core_request_warm_locked(struct conv_core *core, uint32_t provider, uint32_
  * LANES_CONCURRENT on a busy provider is routed to the next selectable
  * candidate that either declares it or sits on an idle provider, when one
  * exists (discovery spec §2.3).
+ *
+ * @p hint: the per-create preference of the stream / job (lift spec 5,
+ * #2178; NULL / "" = none). It reorders the non-terminal candidates of this
+ * selection only (conv_select rule 3a); one that matches no non-terminal
+ * candidate falls through to the normal selection with one INFO line.
  */
 uint32_t
 conv_core_select_locked(struct conv_core *core,
@@ -339,6 +345,7 @@ conv_core_select_locked(struct conv_core *core,
                         uint32_t input_kind,
                         uint32_t view_count,
                         const bool *busy_providers,
+                        const char *hint,
                         struct conv_binding *out,
                         uint32_t *out_state);
 

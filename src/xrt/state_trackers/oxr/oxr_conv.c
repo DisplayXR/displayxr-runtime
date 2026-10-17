@@ -554,6 +554,75 @@ oxr_xrEnumerateLiftTasksDXR(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTaskCandidatesDXR(XrSession session,
+                                     XrLiftTaskDXR task,
+                                     uint32_t capacityInput,
+                                     uint32_t *countOutput,
+                                     XrLiftTaskCandidateDXR *candidates)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateLiftTaskCandidatesDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_lift);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (!oxr_conv_task_is_listable(task)) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrEnumerateLiftTaskCandidatesDXR: task %d is reserved", (int)task);
+	}
+	if (capacityInput > 0 && candidates == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrEnumerateLiftTaskCandidatesDXR: candidates is NULL");
+	}
+	for (uint32_t i = 0; i < capacityInput; i++) {
+		if (candidates[i].type != XR_TYPE_LIFT_TASK_CANDIDATE_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrEnumerateLiftTaskCandidatesDXR: candidates[%u].type is not "
+			                 "XR_TYPE_LIFT_TASK_CANDIDATE_DXR",
+			                 i);
+		}
+	}
+	*countOutput = 0;
+
+	struct lift_route route;
+	XrResult r = conv_query_route_open(&log, sess, &route, "xrEnumerateLiftTaskCandidatesDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	conv_latch(sess);
+	if (route.c == NULL) {
+		return XR_SUCCESS; // no service connection (yet): no candidates known; poll again
+	}
+	struct xrt_conv_wire_candidate found[XRT_CONV_WIRE_MAX_CANDIDATES];
+	uint32_t n = 0;
+	xrt_result_t xret =
+	    ipc_client_conv_enum_candidates(route.c, (uint32_t)task, found, XRT_CONV_WIRE_MAX_CANDIDATES, &n);
+	lift_route_close(sess, &route, xret);
+	r = conv_xret(&log, sess, &route, xret, "xrEnumerateLiftTaskCandidatesDXR");
+	if (r != XR_SUCCESS) {
+		return r;
+	}
+	if (n > XRT_CONV_WIRE_MAX_CANDIDATES) {
+		n = XRT_CONV_WIRE_MAX_CANDIDATES;
+	}
+
+	*countOutput = n;
+	if (capacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (capacityInput < n) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "xrEnumerateLiftTaskCandidatesDXR: capacity %u < %u",
+		                 capacityInput, n);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		oxr_conv_candidate_from_wire(&found[i], &candidates[i]);
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task)
 {
 	OXR_TRACE_MARKER();
@@ -652,6 +721,19 @@ lift_create_task_stream(struct oxr_logger *log,
 	if ((t->requiredOutputs & XR_LIFT_OUTPUT_AUX_DEPTH_BIT_DXR) != 0 && !views) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "%s: AUX_DEPTH is for VIEWS_MONO only", what);
 	}
+	// Spec 5: a per-create preference HINT on the task info's chain. The
+	// runtime still arbitrates; an unknown or terminal id is not an error.
+	const XrLiftProviderPreferenceDXR *pref =
+	    OXR_GET_INPUT_FROM_CHAIN(t, XR_TYPE_LIFT_PROVIDER_PREFERENCE_DXR, XrLiftProviderPreferenceDXR);
+	const char *hint = NULL;
+	if (pref != NULL && pref->providerId != NULL && pref->providerId[0] != '\0') {
+		if (strlen(pref->providerId) >= XRT_CONV_WIRE_PREFERENCE_MAX) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "%s: XrLiftProviderPreferenceDXR::providerId is longer than %u bytes", what,
+			                 (uint32_t)XRT_CONV_WIRE_PREFERENCE_MAX - 1);
+		}
+		hint = pref->providerId;
+	}
 
 	struct xrt_conv_wire_stream_desc sd;
 	memset(&sd, 0, sizeof(sd));
@@ -683,9 +765,9 @@ lift_create_task_stream(struct oxr_logger *log,
 	}
 	struct xrt_conv_wire_stream_created created;
 	memset(&created, 0, sizeof(created));
-	xrt_result_t xret = ipc_client_conv_stream_create(route.c, &sd, (uint64_t)t->requiredOutputs,
-	                                                (uint32_t)ci->mode,
-	                                                ci->inputScale > 0.0f ? ci->inputScale : 1.0f, &created);
+	xrt_result_t xret =
+	    ipc_client_conv_stream_create_v5(route.c, &sd, (uint64_t)t->requiredOutputs, (uint32_t)ci->mode,
+	                                     ci->inputScale > 0.0f ? ci->inputScale : 1.0f, hint, &created);
 	const uint32_t gen = route.gen;
 	lift_route_close(sess, &route, xret);
 	r = conv_xret(log, sess, &route, xret, what);

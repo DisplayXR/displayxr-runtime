@@ -911,3 +911,66 @@ TEST_CASE("conv snapshot: model-store pack rows from disk", "[conv_snapshot][jso
 	std::error_code ec;
 	fs::remove_all(dir, ec);
 }
+
+TEST_CASE("conv run --provider is strict: a named provider binds or the run is refused with the reason (#2178)",
+          "[conv_snapshot][conv_run]")
+{
+	auto st = std::make_unique<target_conv_status>();
+	std::memset(st.get(), 0, sizeof(*st));
+	st->provider_count = 3;
+	st->providers[0] = provider("vendor");
+	st->providers[1] = provider("open");
+	st->providers[2] = provider("broken");
+	const uint32_t T = XRT_CONV_TASK_SPLATS_MONO;
+	st->task_count = 3;
+	st->tasks[0] = task(0, T, "splats-mono", XRT_CONV_STATE_READY, true, 0);
+	st->tasks[1] = task(1, T, "splats-mono", XRT_CONV_STATE_READY, false, 1);
+	st->tasks[2] = task(2, T, "splats-mono", XRT_CONV_STATE_FAILED, false, 2);
+	cpy(st->tasks[2].state_name, sizeof(st->tasks[2].state_name), "FAILED");
+	cpy(st->tasks[2].verdict, sizeof(st->tasks[2].verdict), "fell-through");
+	for (uint32_t i = 0; i < 3; i++) {
+		st->tasks[i].lanes = XRT_CONV_LANE_JOB;
+	}
+	char why[192];
+
+	SECTION("no --provider: the runtime's selection")
+	{
+		const char *b =
+		    target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, nullptr, why, sizeof(why));
+		REQUIRE(b != nullptr);
+		CHECK(std::string(b) == "vendor");
+	}
+	SECTION("the named provider bound by the hint: accepted, also in the /model form")
+	{
+		st->tasks[0].selected = false;
+		st->tasks[1].selected = true;
+		st->hint_applied = true;
+		const char *b =
+		    target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, "open", why, sizeof(why));
+		REQUIRE(b != nullptr);
+		CHECK(std::string(b) == "open");
+		CHECK(target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, "open/fake", why,
+		                                        sizeof(why)) != nullptr);
+	}
+	SECTION("a terminal named provider: refused with its state, never the default")
+	{
+		st->hint_applied = false; // the hint fell through to "vendor" -- an app would accept that
+		CHECK(target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, "broken", why, sizeof(why)) ==
+		      nullptr);
+		CHECK(std::string(why).find("broken") != std::string::npos);
+		CHECK(std::string(why).find("FAILED") != std::string::npos);
+	}
+	SECTION("an unknown named provider: refused")
+	{
+		CHECK(target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, "nobody", why, sizeof(why)) ==
+		      nullptr);
+		CHECK(std::string(why).find("not a registered provider") != std::string::npos);
+	}
+	SECTION("a provider without the job lane: refused")
+	{
+		st->tasks[1].lanes = XRT_CONV_LANE_STREAM;
+		CHECK(target_conv_status_bound_provider(st.get(), T, XRT_CONV_LANE_JOB, "open", why, sizeof(why)) ==
+		      nullptr);
+		CHECK(std::string(why).find("lane") != std::string::npos);
+	}
+}

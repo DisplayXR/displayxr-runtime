@@ -100,6 +100,10 @@ struct target_conv_status
 	char kill_switch[16];
 
 	struct target_conv_policy policy; //!< what selection ran with
+
+	//! target_conv_status_build_from_entries_hinted: the hint chose the task's
+	//! `selected` row (false = no hint, or it fell through to normal selection).
+	bool hint_applied;
 };
 
 /*!
@@ -202,6 +206,35 @@ target_conv_status_build_from_entries(struct xrt_conversion_plugin_entry *entrie
                                       const struct xrt_plugin_iface *active_dp,
                                       const struct target_conv_policy *policy,
                                       struct target_conv_status *out);
+
+/*!
+ * As target_conv_status_build_from_entries, with a per-create preference
+ * @p hint (lift spec 5, "<provider-id>[/<cap_id or model_id>]") applied to
+ * @p hint_task's selection exactly as a hinted create applies it
+ * (conv_select rule 3a): the task's `selected` row is what such a create
+ * would bind. `conv run --provider` goes through this, so the CLI's provider
+ * choice and an app's XrLiftProviderPreferenceDXR are one rule.
+ */
+void
+target_conv_status_build_from_entries_hinted(struct xrt_conversion_plugin_entry *entries,
+                                             int count,
+                                             const struct xrt_plugin_iface *active_dp,
+                                             const struct target_conv_policy *policy,
+                                             uint32_t hint_task,
+                                             const char *hint,
+                                             struct target_conv_status *out);
+
+/*!
+ * `conv run --provider`'s STRICT rule (#2178): the provider @p st's
+ * selection bound for @p task on @p lane (XRT_CONV_LANE_*; 0 = any). With
+ * @p want set ("<id>[/<cap or model>]", the hint the pass ran with) it must be
+ * that provider, bound BY the hint: a human named it, so an unknown, filtered
+ * or terminal one is a refusal with the reason in @p why, never the app
+ * fall-through. Returns the bound provider id (points into @p st), or NULL.
+ */
+const char *
+target_conv_status_bound_provider(
+    const struct target_conv_status *st, uint32_t task, uint32_t lane, const char *want, char *why, size_t why_size);
 
 /*!
  * The host iface the headless pass negotiates providers with: the loader's

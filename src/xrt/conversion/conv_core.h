@@ -207,6 +207,28 @@ conv_core_get_generation(struct conv_core *core, struct xrt_conv_wire_generation
 bool
 conv_core_get_task_desc(struct conv_core *core, uint32_t task, struct xrt_conv_wire_task_desc *out);
 
+/*! conv_core_get_task_desc as a create carrying the per-create preference
+ *  @p hint (lift spec 5) would bind it: the capability a hinted create is
+ *  validated against. NULL / "" = conv_core_get_task_desc. */
+bool
+conv_core_get_task_desc_hinted(struct conv_core *core,
+                               uint32_t task,
+                               const char *hint,
+                               struct xrt_conv_wire_task_desc *out);
+
+/*!
+ * Lift spec 5 (#2178): the READ-ONLY candidate providers of @p task, one per
+ * provider in selection order -- the `conv list` rows of the task that
+ * survive selection's filter (conv_candidates.h: the same ranking). Each
+ * carries the provider's id and its own display name, readiness, licence
+ * class, hosting, whether it is the user's PreferredProvider and whether a
+ * create without a hint binds it. Returns the number written (at most
+ * @p max); 0 for a task v1 does not serve or with no provider -- never an
+ * error. @p out may be NULL with @p max 0 (count only).
+ */
+uint32_t
+conv_core_enum_candidates(struct conv_core *core, uint32_t task, struct xrt_conv_wire_candidate *out, uint32_t max);
+
 /*! XrLiftPropertiesDXR::state for a v3 caller asking about @p v3_modes
  *  (CONV_V3_MODE_* bits; 0 = all four). */
 uint32_t

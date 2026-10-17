@@ -66,6 +66,42 @@ ipc_call_conv_stream_create(struct ipc_connection *ipc_c,
 }
 
 xrt_result_t
+ipc_call_conv_stream_create_v5(struct ipc_connection *ipc_c,
+                               const struct xrt_conv_wire_stream_desc *desc,
+                               uint64_t required_outputs,
+                               uint32_t legacy_mode,
+                               float input_scale,
+                               const struct xrt_conv_wire_provider_pref *pref,
+                               struct xrt_conv_wire_stream_created *out_created)
+{
+	(void)ipc_c;
+	(void)desc;
+	(void)required_outputs;
+	(void)legacy_mode;
+	(void)input_scale;
+	(void)pref;
+	memset(out_created, 0, sizeof(*out_created));
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+xrt_result_t
+ipc_call_conv_enum_candidates(struct ipc_connection *ipc_c,
+                              uint32_t task,
+                              uint32_t index,
+                              uint32_t *out_count,
+                              struct xrt_conv_wire_generation *out_generation,
+                              struct xrt_conv_wire_candidate *out_candidate)
+{
+	(void)ipc_c;
+	(void)task;
+	(void)index;
+	*out_count = 0;
+	memset(out_generation, 0, sizeof(*out_generation));
+	memset(out_candidate, 0, sizeof(*out_candidate));
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_call_conv_stream_reset(struct ipc_connection *ipc_c, uint64_t stream_id)
 {
 	(void)ipc_c;

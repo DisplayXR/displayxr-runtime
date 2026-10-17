@@ -56,6 +56,8 @@
  * | conv_job_cancel                  | job id (u64)                  | –                              |
  * | conv_warm / conv_evict           | xrt_conv_wire_task_request    | –                              |
  * | events / conv_poll_event         | –                             | xrt_conv_wire_event            |
+ * | conv_enum_candidates (spec 5)    | task, index (u32, u32)        | count + xrt_conv_wire_candidate |
+ * | conv_stream_create_v5 (spec 5)   | stream desc + provider_pref   | xrt_conv_wire_stream_created   |
  *
  * conv_input_ring_get is P5 only and has no struct here yet.
  *
@@ -115,6 +117,25 @@ extern "C" {
 #define XRT_CONV_WIRE_DELIVERY_INLINE 1u //!< ≤ 1 MiB, in the reply's scratch shm section
 #define XRT_CONV_WIRE_DELIVERY_SHM 2u    //!< a dedicated shm handle rides the reply
 #define XRT_CONV_WIRE_DELIVERY_FILE 3u   //!< written to the caller's file handle
+/*! @} */
+
+/*! Bytes of a candidate's provider id and display name, NUL included. */
+#define XRT_CONV_WIRE_PROVIDER_ID_MAX 64u
+#define XRT_CONV_WIRE_DISPLAY_NAME_MAX 64u
+/*! Candidates one task lists at most (= CONV_REGISTRY_MAX_PROVIDERS: one per provider). */
+#define XRT_CONV_WIRE_MAX_CANDIDATES 16u
+/*! Bytes of a per-create preference, "<provider-id>[/<cap_id or model_id>]", NUL included. */
+#define XRT_CONV_WIRE_PREFERENCE_MAX 96u
+
+/*! @name xrt_conv_wire_candidate::hosting (= XrLiftProviderHostingDXR) @{ */
+#define XRT_CONV_WIRE_HOSTING_LOCAL_IN_SERVICE 0u //!< loaded in the service
+#define XRT_CONV_WIRE_HOSTING_LOCAL_SATELLITE 1u  //!< its own supervised host process, this machine
+#define XRT_CONV_WIRE_HOSTING_REMOTE 2u           //!< pictures leave this machine (XRT_CONV_CAP_REMOTE)
+/*! @} */
+
+/*! @name xrt_conv_wire_candidate::candidate_flags @{ */
+#define XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT (1u << 0) //!< matches the PreferredProvider policy of the task
+#define XRT_CONV_WIRE_CANDIDATE_SELECTED (1u << 1)     //!< the provider a create without a hint binds
 /*! @} */
 
 /*! @name xrt_conv_wire_event::kind @{ */
@@ -470,6 +491,39 @@ struct xrt_conv_wire_job_result
 	struct xrt_conv_wire_depth_info depth_info;
 	struct xrt_conv_wire_views_info views_info;
 	uint32_t reserved_1;
+};
+
+/*!
+ * conv_enum_candidates reply (lift spec 5, #2178): one READ-ONLY candidate
+ * provider of a task -- the rows `displayxr-cli conv list` shows for the task
+ * that survive selection's filter, one per provider, in selection order. The
+ * display name is the provider's own (its capability describe), verbatim: the
+ * runtime never names a provider itself. sizeof == 160.
+ */
+struct xrt_conv_wire_candidate
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	uint32_t task;            //!< XRT_CONV_TASK_*
+	uint32_t state;           //!< XRT_CONV_STATE_* of the row a hint to this provider binds
+	uint32_t failure_reason;  //!< XRT_CONV_FAIL_* (core-local reasons read 0)
+	uint32_t licence_class;   //!< XRT_CONV_LICENCE_*
+	uint32_t hosting;         //!< XRT_CONV_WIRE_HOSTING_*
+	uint32_t candidate_flags; //!< XRT_CONV_WIRE_CANDIDATE_*
+	char provider_id[XRT_CONV_WIRE_PROVIDER_ID_MAX];
+	char display_name[XRT_CONV_WIRE_DISPLAY_NAME_MAX];
+};
+
+/*!
+ * conv_stream_create_v5 request tail (lift spec 5, #2178): the per-create
+ * preference HINT. "" = none. Reorders the non-terminal candidates for that
+ * create only; never stored as the user / machine default. sizeof == 104.
+ */
+struct xrt_conv_wire_provider_pref
+{
+	uint32_t struct_size;
+	uint32_t family_version;
+	char provider[XRT_CONV_WIRE_PREFERENCE_MAX]; //!< "<provider-id>[/<cap_id or model_id>]", NUL-terminated
 };
 
 //! conv_warm / conv_evict request. sizeof == 16.
@@ -1378,6 +1432,8 @@ XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_job_result) == 368, "conv_job_fe
 XRT_CONV_ABI_ASSERT(offsetof(struct xrt_conv_wire_job_result, views_info) == 240, "conv_job_fetch: views_info at 240");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_task_request) == 16, "conv_warm / conv_evict size");
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_event) == 40, "conv event size");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_candidate) == 160, "conv_enum_candidates reply size");
+XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_provider_pref) == 104, "conv_stream_create_v5 preference size");
 
 /* Rule 3: every message fits one IPC buffer. */
 XRT_CONV_ABI_ASSERT(sizeof(struct xrt_conv_wire_submit) <= XRT_CONV_WIRE_MSG_MAX_BYTES, "conv_submit > IPC_BUF_SIZE");

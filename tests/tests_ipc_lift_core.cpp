@@ -210,12 +210,23 @@ struct Fixture
 	ipc_server_conv *sc = nullptr;
 	Glue glue;
 
-	explicit Fixture(uint32_t prewarm_on)
+	//! The service's wiring of the core's events into the spec-4 queues (service_conversion.c).
+	static void
+	fwd_event(void *ud, uint64_t client_id, const xrt_conv_wire_event *ev)
+	{
+		ipc_server_conv_on_event(*static_cast<ipc_server_conv **>(ud), client_id, ev);
+	}
+
+	explicit Fixture(uint32_t prewarm_on, bool events = false)
 	{
 		conv_core_config cfg{};
 		cfg.alloc.alloc = cpu_alloc;
 		cfg.alloc.free = cpu_free;
 		cfg.prewarm_on = prewarm_on;
+		if (events) {
+			cfg.on_event = fwd_event;
+			cfg.event_ud = &sc; // set below, before any provider exists
+		}
 		cfg.rear_cap_m = -1.0f;
 		cfg.tick_ms = 10;
 		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
@@ -1016,4 +1027,308 @@ TEST_CASE("roadmap 11.2: IPC handle capacity and reply sizes (measured)", "[ipc_
 	CHECK(sizeof(xrt_conv_wire_result) <= IPC_BUF_SIZE);
 	CHECK(sizeof(xrt_status_conv_provider) + sizeof(xrt_status_generation) + 16 <= IPC_BUF_SIZE);
 	CHECK(sizeof(xrt_status_conv_task) + sizeof(xrt_status_generation) + 16 <= IPC_BUF_SIZE);
+}
+
+
+/*
+ *
+ * Lift spec 5 (#2178): read-only candidates + the per-create preference hint,
+ * at the server-side adapter conv_enum_candidates / conv_stream_create_v5 call.
+ *
+ */
+
+namespace {
+
+constexpr uint32_t TASK = XRT_CONV_TASK_DEPTH_VIDEO;
+
+int32_t
+add_ordered(Fixture &fx, conv_fake_provider &f, uint32_t probe_order)
+{
+	conv_provider_desc d{};
+	d.id = f.id;
+	d.probe_order = probe_order;
+	d.enabled = true;
+	d.iface = &f.iface;
+	d.inst = conv_fake_inst(&f);
+	return conv_core_add_provider(fx.core, &d);
+}
+
+conv_fake_cap *
+depth_cap(conv_fake_provider &f, const char *display_name, uint32_t state)
+{
+	conv_fake_cap *c = conv_fake_add_cap(&f, 1, TASK, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	std::snprintf(c->cap.display_name, sizeof(c->cap.display_name), "%s", display_name);
+	c->state = state;
+	return c;
+}
+
+//! A spec-5 create for TASK on connection @p client with @p hint (nullptr = none).
+xrt_result_t
+create_v5(Fixture &fx, uint64_t client, const char *hint, uint64_t *out_id)
+{
+	xrt_conv_wire_stream_desc sd;
+	xrt_conv_wire_begin(&sd, (uint32_t)sizeof(sd));
+	sd.task = TASK;
+	sd.input_kind = XRT_CONV_INPUT_MONO;
+	xrt_conv_wire_stream_created c{};
+	const xrt_result_t r = ipc_server_conv_v5_stream_create(fx.sc, client, &sd, 0, 0, 1.0f, hint, &c);
+	*out_id = c.stream_id;
+	return r;
+}
+
+uint32_t
+streams_on(Fixture &fx, const char *provider)
+{
+	uint32_t streams = 0, jobs = 0;
+	conv_core_row_activity(fx.core, provider, 1, false, &streams, &jobs);
+	return streams;
+}
+
+std::vector<xrt_conv_wire_candidate>
+candidates(Fixture &fx, uint64_t client)
+{
+	std::vector<xrt_conv_wire_candidate> out;
+	uint32_t count = 0;
+	xrt_conv_wire_generation gen{};
+	xrt_conv_wire_candidate c{};
+	REQUIRE(ipc_server_conv_v5_enum_candidates(fx.sc, client, TASK, 0, &count, &gen, &c) == XRT_SUCCESS);
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t n = 0;
+		REQUIRE(ipc_server_conv_v5_enum_candidates(fx.sc, client, TASK, i, &n, &gen, &c) == XRT_SUCCESS);
+		REQUIRE(n == count);
+		out.push_back(c);
+	}
+	return out;
+}
+
+bool
+flag(const xrt_conv_wire_candidate &c, uint32_t f)
+{
+	return (c.candidate_flags & f) != 0;
+}
+
+void
+set_preferred(Fixture &fx, const char *id)
+{
+	const char *pref[XRT_CONV_TASK_RESERVED_FIRST] = {};
+	pref[TASK] = id;
+	(void)conv_core_set_policy(fx.core, pref, false);
+}
+
+} // namespace
+
+TEST_CASE("spec 5: enumeration lists every candidate, marks isSelected / isUserDefault", "[ipc_lift_core][lift_spec5]")
+{
+	conv_fake_provider a, b;
+	conv_fake_init(&a, "alpha");
+	conv_fake_init(&b, "beta");
+	depth_cap(a, "Alpha Depth (provider's own name)", XRT_CONV_STATE_READY);
+	depth_cap(b, "Beta Depth", XRT_CONV_STATE_READY);
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(add_ordered(fx, a, 50) >= 0);
+		REQUIRE(add_ordered(fx, b, 100) >= 0);
+
+		auto c = candidates(fx, 5);
+		REQUIRE(c.size() == 2u);
+		CHECK(std::strcmp(c[0].provider_id, "alpha") == 0); // selection order: ProbeOrder
+		CHECK(std::strcmp(c[1].provider_id, "beta") == 0);
+		CHECK(std::strcmp(c[0].display_name, "Alpha Depth (provider's own name)") == 0); // verbatim
+		CHECK(c[0].task == TASK);
+		CHECK(c[0].state == XRT_CONV_STATE_READY);
+		CHECK(c[0].licence_class == XRT_CONV_LICENCE_PERMISSIVE);
+		CHECK(c[0].hosting == XRT_CONV_WIRE_HOSTING_LOCAL_IN_SERVICE);
+		CHECK(flag(c[0], XRT_CONV_WIRE_CANDIDATE_SELECTED));
+		CHECK_FALSE(flag(c[1], XRT_CONV_WIRE_CANDIDATE_SELECTED));
+		CHECK_FALSE(flag(c[0], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT)); // no PreferredProvider set
+		CHECK_FALSE(flag(c[1], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT));
+
+		// The user's default (the CLI / dashboard verb) moves both flags.
+		set_preferred(fx, "beta");
+		c = candidates(fx, 5);
+		REQUIRE(c.size() == 2u);
+		CHECK(std::strcmp(c[0].provider_id, "beta") == 0);
+		CHECK(flag(c[0], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT));
+		CHECK(flag(c[0], XRT_CONV_WIRE_CANDIDATE_SELECTED));
+		CHECK_FALSE(flag(c[1], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT));
+		CHECK_FALSE(flag(c[1], XRT_CONV_WIRE_CANDIDATE_SELECTED));
+
+		// An index past the count is the count + an empty candidate, not an error.
+		uint32_t n = 0;
+		xrt_conv_wire_generation g{};
+		xrt_conv_wire_candidate e{};
+		CHECK(ipc_server_conv_v5_enum_candidates(fx.sc, 5, TASK, 7, &n, &g, &e) == XRT_SUCCESS);
+		CHECK(n == 2u);
+		CHECK(e.provider_id[0] == '\0');
+		// A reserved task is a validation failure.
+		CHECK(ipc_server_conv_v5_enum_candidates(fx.sc, 5, XRT_CONV_TASK_INPAINT, 0, &n, &g, &e) ==
+		      XRT_ERROR_INPUT_UNSUPPORTED);
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
+}
+
+TEST_CASE("spec 5: enumeration with zero providers returns 0, not an error", "[ipc_lift_core][lift_spec5]")
+{
+	uint32_t n = 99;
+	xrt_conv_wire_generation g{};
+	xrt_conv_wire_candidate c{};
+	// No conversion service at all.
+	CHECK(ipc_server_conv_v5_enum_candidates(nullptr, 1, TASK, 0, &n, &g, &c) == XRT_SUCCESS);
+	CHECK(n == 0u);
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		n = 99;
+		CHECK(ipc_server_conv_v5_enum_candidates(fx.sc, 1, TASK, 0, &n, &g, &c) == XRT_SUCCESS);
+		CHECK(n == 0u);
+		CHECK(conv_core_enum_candidates(fx.core, TASK, nullptr, 0) == 0u);
+	}
+}
+
+TEST_CASE("spec 5: a hint to a READY non-default provider selects it", "[ipc_lift_core][lift_spec5]")
+{
+	conv_fake_provider a, b;
+	conv_fake_init(&a, "alpha");
+	conv_fake_init(&b, "beta");
+	depth_cap(a, "Alpha", XRT_CONV_STATE_READY);
+	depth_cap(b, "Beta", XRT_CONV_STATE_READY);
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(add_ordered(fx, a, 50) >= 0);
+		REQUIRE(add_ordered(fx, b, 100) >= 0);
+		REQUIRE(conv_core_task_state(fx.core, TASK) == XRT_CONV_STATE_READY);
+
+		uint64_t plain = 0, hinted = 0;
+		REQUIRE(create_v5(fx, 3, nullptr, &plain) == XRT_SUCCESS);
+		CHECK(streams_on(fx, "alpha") == 1u); // no hint: the default
+		CHECK(streams_on(fx, "beta") == 0u);
+		REQUIRE(create_v5(fx, 3, "beta", &hinted) == XRT_SUCCESS);
+		CHECK(streams_on(fx, "beta") == 1u); // the hint, for this create only
+		CHECK(streams_on(fx, "alpha") == 1u);
+		// The "<id>/<model id>" form names the provider's capability.
+		uint64_t by_model = 0;
+		REQUIRE(create_v5(fx, 3, "beta/fake", &by_model) == XRT_SUCCESS);
+		CHECK(streams_on(fx, "beta") == 2u);
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 3, plain) == XRT_SUCCESS);
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 3, hinted) == XRT_SUCCESS);
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 3, by_model) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
+}
+
+TEST_CASE("spec 5: a hint to an absent or terminal provider falls through to the default",
+          "[ipc_lift_core][lift_spec5]")
+{
+	conv_fake_provider a, b;
+	conv_fake_init(&a, "alpha");
+	conv_fake_init(&b, "beta");
+	depth_cap(a, "Alpha", XRT_CONV_STATE_READY);
+	depth_cap(b, "Beta", XRT_CONV_STATE_ABSENT); // terminal: its model is not installed
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(add_ordered(fx, a, 50) >= 0);
+		REQUIRE(add_ordered(fx, b, 100) >= 0);
+
+		// Still listed (the app can show why), but a hint to it binds the default.
+		auto c = candidates(fx, 3);
+		REQUIRE(c.size() == 2u);
+		CHECK(std::strcmp(c[1].provider_id, "beta") == 0);
+		CHECK(c[1].state == XRT_CONV_STATE_ABSENT);
+
+		uint64_t id1 = 0, id2 = 0, id3 = 0;
+		CHECK(create_v5(fx, 3, "beta", &id1) == XRT_SUCCESS);             // terminal: never an error
+		CHECK(create_v5(fx, 3, "no-such-provider", &id2) == XRT_SUCCESS); // unknown: never an error
+		CHECK(create_v5(fx, 3, "", &id3) == XRT_SUCCESS);                 // empty = no hint
+		CHECK(streams_on(fx, "alpha") == 3u);
+		CHECK(streams_on(fx, "beta") == 0u);
+		for (uint64_t id : {id1, id2, id3}) {
+			CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 3, id) == XRT_SUCCESS);
+		}
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
+}
+
+TEST_CASE("spec 5: a hint never changes the policy preference", "[ipc_lift_core][lift_spec5]")
+{
+	conv_fake_provider a, b;
+	conv_fake_init(&a, "alpha");
+	conv_fake_init(&b, "beta");
+	depth_cap(a, "Alpha", XRT_CONV_STATE_READY);
+	depth_cap(b, "Beta", XRT_CONV_STATE_READY);
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE);
+		fx.install_glue();
+		REQUIRE(add_ordered(fx, a, 100) >= 0);
+		REQUIRE(add_ordered(fx, b, 50) >= 0);
+		set_preferred(fx, "alpha"); // the user's default outranks ProbeOrder
+
+		uint64_t hinted = 0, plain = 0;
+		REQUIRE(create_v5(fx, 4, "beta", &hinted) == XRT_SUCCESS);
+		CHECK(streams_on(fx, "beta") == 1u);
+
+		// The user's default is untouched: still alpha, and the next plain create binds it.
+		auto c = candidates(fx, 4);
+		REQUIRE(c.size() == 2u);
+		CHECK(std::strcmp(c[0].provider_id, "alpha") == 0);
+		CHECK(flag(c[0], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT));
+		CHECK(flag(c[0], XRT_CONV_WIRE_CANDIDATE_SELECTED));
+		CHECK_FALSE(flag(c[1], XRT_CONV_WIRE_CANDIDATE_USER_DEFAULT));
+		REQUIRE(create_v5(fx, 4, nullptr, &plain) == XRT_SUCCESS);
+		CHECK(streams_on(fx, "alpha") == 1u);
+		CHECK(streams_on(fx, "beta") == 1u);
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 4, hinted) == XRT_SUCCESS);
+		CHECK(ipc_server_conv_lift_stream_destroy(fx.sc, 4, plain) == XRT_SUCCESS);
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
+}
+
+TEST_CASE("spec 5: a change behind the selection reaches an enumerating session as PROVIDERS_CHANGED",
+          "[ipc_lift_core][lift_spec5]")
+{
+	conv_fake_provider a, b;
+	conv_fake_init(&a, "alpha");
+	conv_fake_init(&b, "beta");
+	depth_cap(a, "Alpha", XRT_CONV_STATE_READY);
+	depth_cap(b, "Beta", XRT_CONV_STATE_READY);
+	{
+		Fixture fx(CONV_PREWARM_FIRST_CREATE, /*events=*/true);
+		fx.install_glue();
+		REQUIRE(add_ordered(fx, a, 50) >= 0);
+		REQUIRE(add_ordered(fx, b, 100) >= 0);
+		auto drain = [&](bool *saw_providers) {
+			bool has = true;
+			while (has) {
+				xrt_conv_wire_event ev{};
+				REQUIRE(ipc_server_conv_v4_poll_event(fx.sc, 6, &has, &ev) == XRT_SUCCESS);
+				if (has && ev.kind == XRT_CONV_WIRE_EVENT_PROVIDERS_CHANGED &&
+				    saw_providers != nullptr) {
+					*saw_providers = true;
+				}
+			}
+		};
+		REQUIRE(candidates(fx, 6).size() == 2u); // latches the session + records what it saw
+		drain(nullptr);
+
+		// beta (behind the selection) is switched off: the task's EFFECTIVE
+		// state does not move (alpha is still READY), the candidate list does.
+		conv_core_set_provider_enabled(fx.core, "beta", false);
+		bool saw = false;
+		REQUIRE(wait_until(
+		    [&] {
+			    drain(&saw);
+			    return saw;
+		    },
+		    2000));
+		REQUIRE(candidates(fx, 6).size() == 1u);
+		CHECK(conv_core_task_state(fx.core, TASK) == XRT_CONV_STATE_READY);
+	}
+	conv_fake_fini(&a);
+	conv_fake_fini(&b);
 }

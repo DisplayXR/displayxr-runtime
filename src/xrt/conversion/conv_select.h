@@ -24,6 +24,11 @@
  *      whatever their ProbeOrder; then ProbeOrder ascending; then direct
  *      before composed; then provider id (strcmp; a cross-provider tie sets
  *      tie_warn); then cap_id.
+ *   3a. Per-create hint (XR_DXR_lift spec 5, #2178): the first row in that
+ *      order that matches conv_select_policy::hint and is NOT terminal moves
+ *      to the front. Nothing else moves; a hint that matches no row, or only
+ *      terminal ones, changes nothing (hint_missed is set). The hint never
+ *      outranks the filter (licence gate, Enabled, Supersedes, lane, views).
  *   4. Readiness never reorders: the first row that is READY or waited-for
  *      (INSTALLED / DOWNLOADING / WARMING / EVICTED) wins; ABSENT,
  *      INCOMPATIBLE, UNLICENSED, DISABLED and ANY FAILED fall through.
@@ -97,6 +102,10 @@ struct conv_select_policy
 {
 	const char *preferred;    //!< "<provider-id>[/<cap_id or model_id>]" for this task; NULL = none
 	bool allow_research_only; //!< AllowResearchOnly: RESEARCH_ONLY + UNKNOWN classes become eligible
+	/*! Per-create preference HINT (lift spec 5, #2178), same grammar as
+	 *  @ref preferred: reorders the non-terminal rows of this one selection
+	 *  (rule 3a). Never stored, never written back. NULL / "" = none. */
+	const char *hint;
 };
 
 /*! @name Per-row verdict (conv list "reason" column) @{ */
@@ -120,7 +129,7 @@ enum conv_row_verdict
 /*! @name Result reason @{ */
 enum conv_select_reason
 {
-	CONV_SEL_OK_PREFERRED = 0,   //!< the first ordered row, a preferred-provider match
+	CONV_SEL_OK_PREFERRED = 0,   //!< the first ordered row, a preferred-provider (or hint) match
 	CONV_SEL_OK_ORDER,           //!< the first ordered row, by ProbeOrder / tie-break
 	CONV_SEL_OK_FALLTHROUGH,     //!< chosen after ≥ 1 terminal row fell through (log one WARN)
 	CONV_SEL_NONE_RESERVED_TASK, //!< NONE / reserved / invalid task → VALIDATION_FAILURE
@@ -137,6 +146,8 @@ struct conv_select_result
 	bool tie_warn;            //!< two providers tied on ProbeOrder (log one WARN, the #1466 rule)
 	uint32_t fallthrough;     //!< terminal rows skipped before the choice
 	uint32_t candidate_count; //!< rows that survived the filter
+	bool hint_applied;        //!< the policy's hint chose the row (rule 3a)
+	bool hint_missed;         //!< a hint was given but matched no non-terminal candidate (log one INFO)
 };
 
 /*!
@@ -144,7 +155,8 @@ struct conv_select_result
  *
  * @param verdicts  optional, @p count entries: conv_row_verdict per row
  * @param order     optional, @p count entries: filtered rows in selection
- *                  order (result.candidate_count of them are written)
+ *                  order, after the hint (result.candidate_count of them
+ *                  are written)
  */
 struct conv_select_result
 conv_select(const struct conv_select_row *rows,

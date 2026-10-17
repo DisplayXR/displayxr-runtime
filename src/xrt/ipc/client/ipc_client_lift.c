@@ -18,6 +18,7 @@
 #include "ipc_client_generated.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -424,6 +425,75 @@ ipc_client_conv_stream_create(struct ipc_connection *ipc_c,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return ipc_call_conv_stream_create(ipc_c, desc, required_outputs, legacy_mode, input_scale, out_created);
+}
+
+xrt_result_t
+ipc_client_conv_stream_create_v5(struct ipc_connection *ipc_c,
+                                 const struct xrt_conv_wire_stream_desc *desc,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const char *preferred_provider,
+                                 struct xrt_conv_wire_stream_created *out_created)
+{
+	if (preferred_provider == NULL || preferred_provider[0] == '\0') {
+		return ipc_client_conv_stream_create(ipc_c, desc, required_outputs, legacy_mode, input_scale,
+		                                     out_created);
+	}
+	U_ZERO(out_created);
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_conv_wire_provider_pref pref;
+	xrt_conv_wire_begin(&pref, (uint32_t)sizeof(pref));
+	(void)snprintf(pref.provider, sizeof(pref.provider), "%s", preferred_provider);
+	return ipc_call_conv_stream_create_v5(ipc_c, desc, required_outputs, legacy_mode, input_scale, &pref,
+	                                      out_created);
+}
+
+xrt_result_t
+ipc_client_conv_enum_candidates(
+    struct ipc_connection *ipc_c, uint32_t task, struct xrt_conv_wire_candidate *out, uint32_t max, uint32_t *out_count)
+{
+	*out_count = 0;
+	if (ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// One candidate per reply. A walk that straddles a change restarts; after
+	// a few tries the last walk stands (the event tells the app to re-read).
+	xrt_result_t xret = XRT_SUCCESS;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		struct xrt_conv_wire_generation first;
+		struct xrt_conv_wire_candidate c;
+		uint32_t count = 0;
+		xret = ipc_call_conv_enum_candidates(ipc_c, task, 0, &count, &first, &c);
+		if (xret != XRT_SUCCESS) {
+			return xret;
+		}
+		bool moved = false;
+		for (uint32_t i = 0; i < count; i++) {
+			struct xrt_conv_wire_generation g = first;
+			uint32_t n = count;
+			if (i > 0) {
+				xret = ipc_call_conv_enum_candidates(ipc_c, task, i, &n, &g, &c);
+				if (xret != XRT_SUCCESS) {
+					return xret;
+				}
+			}
+			if (n != count || g.conv_gen != first.conv_gen || g.status_gen != first.status_gen) {
+				moved = true;
+				break;
+			}
+			if (out != NULL && i < max) {
+				out[i] = c;
+			}
+		}
+		*out_count = count;
+		if (!moved) {
+			break;
+		}
+	}
+	return xret;
 }
 
 xrt_result_t

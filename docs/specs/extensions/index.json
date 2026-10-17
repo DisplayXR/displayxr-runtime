@@ -90,7 +90,7 @@
     "XR_DXR_lift": {
       "group": "rendering",
       "title": "2D-to-3D Conversion",
-      "summary": "2D-to-3D conversion as a service: depth, video depth, stereo or N views, and photo-to-Gaussian-splats, served by whichever conversion provider the runtime selects per task (apps see tasks, never providers); enumerate tasks with their readiness and pushed state events, and wait for READY rather than fall back to an in-app converter; submit 2D frames (any platform image kind, explicit sync), acquire the latest result with its depth units and view metadata, or flag a weave rect as 2D so the service lifts it before weaving; the runtime owns the viewpoint policy, can derive the viewpoints from the app's own view rig, and returns depth from the same inference aligned to display space"
+      "summary": "2D-to-3D conversion as a service: depth, video depth, stereo or N views, and photo-to-Gaussian-splats, served by whichever conversion provider the runtime selects per task (apps see tasks; they may list the candidate providers read-only and hint one per stream, never set the user's default); enumerate tasks with their readiness and pushed state events, and wait for READY rather than fall back to an in-app converter; submit 2D frames (any platform image kind, explicit sync), acquire the latest result with its depth units and view metadata, or flag a weave rect as 2D so the service lifts it before weaving; the runtime owns the viewpoint policy, can derive the viewpoints from the app's own view rig, and returns depth from the same inference aligned to display space"
     },
     "XR_DXR_win32_window_binding": {
       "group": "windowing",

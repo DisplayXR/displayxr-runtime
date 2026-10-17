@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_lift` |
-| **Spec Version** | 4 (one extension; every earlier version's structs, values and behaviour are kept — §14) |
+| **Spec Version** | 5 (one extension; every earlier version's structs, values and behaviour are kept — §14) |
 | **Extension Type** | Instance extension. Conversion runs in the service, on whichever **conversion provider** the runtime selects per task (ADR-053). Reached by IPC sessions, and by in-process D3D11 / D3D12 sessions on Windows over a lift-only connection (ADR-049); advertised on every desktop platform, where a service with no provider reports nothing to convert with |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_lift.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional. Type values: `1004999270–285` (spec 1–3), `1004999340–369` (spec 4 and 5), pending Khronos registry |
-| **Decision records** | [ADR-053](../../adr/ADR-053-conversion-providers.md) (conversion providers, tasks, readiness, the consumer contract; amends ADR-042 and ADR-049) · [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) (pre-weave results, the asynchronous mailbox, scheduling) · [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) + Addendum A (viewpoint policy, app rig, auxiliary depth) · [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) (in-process sessions) |
+| **Decision records** | [ADR-053](../../adr/ADR-053-conversion-providers.md) (conversion providers, tasks, readiness, the consumer contract; amends ADR-042 and ADR-049) · [ADR-054](../../adr/ADR-054-component-model.md) decision 8 (apps enumerate and request, never set policy: spec 5) · [ADR-042](../../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) (pre-weave results, the asynchronous mailbox, scheduling) · [ADR-048](../../adr/ADR-048-lift-viewpoint-policy.md) + Addendum A (viewpoint policy, app rig, auxiliary depth) · [ADR-049](../../adr/ADR-049-in-process-lift-rides-the-service.md) (in-process sessions) |
 | **Provider contract** | [`conversion-provider-discovery.md`](../runtime/conversion-provider-discovery.md) + `src/xrt/include/xrt/xrt_conversion_plugin.h` (§11). The display-processor lift slots (`xrt_dp_lift.h`, `XRT_DP_D3D11_HAS_LIFT`) are frozen and reached only through the built-in `dp-lift` adapter |
 
 ## 1. What it is
@@ -87,11 +87,11 @@ populated from the first query of a boot. No call of this extension ever waits f
 |---|---|---|---|
 | `XR_LIFT_TASK_DEPTH_MONO_DXR` | 1 | one image → depth (no temporal state) | DEPTH + PHOTO |
 | `XR_LIFT_TASK_DEPTH_VIDEO_DXR` | 2 | frames → temporally stable depth; reset on a discontinuity | DEPTH + VIDEO |
-| `XR_LIFT_TASK_DISPARITY_STEREO_DXR` | 3 | rectified pair → disparity (spec 5) | — |
+| `XR_LIFT_TASK_DISPARITY_STEREO_DXR` | 3 | rectified pair → disparity (spec 6) | — |
 | `XR_LIFT_TASK_VIEWS_MONO_DXR` | 4 | image / frames → N ≥ 2 views, + same-inference depth | SBS, NVIEW |
-| `XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR` | 5 | image + depth → N views (spec 5) | — |
+| `XR_LIFT_TASK_VIEWS_FROM_DEPTH_DXR` | 5 | image + depth → N views (spec 6) | — |
 | `XR_LIFT_TASK_SPLATS_MONO_DXR` | 6 | photo → 3D Gaussian splats (job lane) | GAUSSIANS |
-| `XR_LIFT_TASK_SPLATS_STEREO_DXR` | 7 | pair → metric splats (spec 5) | — |
+| `XR_LIFT_TASK_SPLATS_STEREO_DXR` | 7 | pair → metric splats (spec 6) | — |
 | `SPLATS_VIDEO`, `INPAINT` | 8, 9 | **reserved**: never accepted | — |
 
 **`xrEnumerateLiftTasksDXR(session, capacityInput, &countOutput, tasks)`** (two-call idiom)
@@ -144,10 +144,11 @@ spec-3 app never receives an event type it does not know):
 - `XrEventDataLiftProvidersChangedDXR` — the provider set behind the tasks changed (an install,
   an uninstall, a user preference). Re-enumerate; live streams do not move.
 
-**No provider enumeration.** There is no app-visible provider list, id, model name or vendor:
-provider identity is diagnostics (`displayxr-cli conv`, the status snapshot, §12). A browser
-must not expose provider identity to web content; it exposes at most a coarse
-waiting / ready / unavailable state.
+**Tasks, not providers, decide what an app can do.** The effective capability above is all an
+app needs to convert. Spec 5 adds a read-only view of the providers behind a task and a
+per-create hint (§2.5), for an app that offers its user a choice; it never lets an app set the
+user's default. A browser must not expose provider identity to web content; it exposes at most
+a coarse waiting / ready / unavailable state.
 
 ### 2.3 The spec-3 view (`xrGetLiftPropertiesDXR`)
 
@@ -189,6 +190,65 @@ A consumer that must also run on older runtimes may keep a time-bounded in-app p
 runtime of spec 3 or older that reports no provider at all, and removes it once its minimum
 runtime is spec 4 (`consumer_floors`).
 
+### 2.5 Candidates and the preference hint (spec 5)
+
+ADR-054 decision 8: apps **express preferences, never policy**. Several providers can serve one
+task at once (a vendor module, an open model, a remote service). Which one a create binds is the
+runtime's selection (§3.2), governed by the user's per-task default (`displayxr-cli conv use
+<task> <id>`, the Dashboard) and the machine policy. Spec 5 lets an app *see* the candidates and
+*ask* for one for its own streams; nothing in it writes the default.
+
+**`xrEnumerateLiftTaskCandidatesDXR(session, task, capacityInput, &countOutput, candidates)`**
+(two-call idiom) returns one `XrLiftTaskCandidateDXR` per provider, in the runtime's selection
+order. The list is exactly the rows `displayxr-cli conv list` shows for the task that survive
+selection's filter: providers that are enabled, not superseded, licence-eligible (a
+`RESEARCH_ONLY` / `UNKNOWN`-licence provider appears only when the **user** opted in) and able to
+serve the task's lane and view count — whatever their readiness. `displayxr-cli conv candidates
+<task> [--json]` prints the same rows over the same IPC call.
+
+| Field | Meaning |
+|---|---|
+| `providerId` | the provider's registration id: the string a hint names |
+| `displayName` | the provider's **own** name for the capability that serves the task, verbatim. The runtime never names a provider; an app shows the string and never hardcodes or recognises it |
+| `state`, `failureReason` | that capability's readiness (§2.2 vocabulary). A terminal state means a hint to it falls through |
+| `licenceClass` | as in §2.2 |
+| `hosting` | `LOCAL_IN_SERVICE`, `LOCAL_SATELLITE` (its own supervised process) or `REMOTE` (pictures leave the machine; per-user consent applies) |
+| `isUserDefault` | the user's per-task default (`PreferredProvider\<task>`) names this provider. No default set = no element has it |
+| `isSelected` | a create of the task **without** a hint, made now, binds this provider (at most one element; none when every candidate is terminal) |
+
+**One element per provider, never per model.** Models are the provider's pack's business (ADR-057:
+a model is a pack entry), so the list does not expand a provider into its models; a hint may still
+name one with the `<id>/<model id>` form, which is accepted and matched exactly as `conv use`
+matches it.
+
+Zero candidates (no provider, a service with conversion off, or an in-process session with no
+service connection yet) is `XR_SUCCESS` with `countOutput = 0`; a reserved task is
+`XR_ERROR_VALIDATION_FAILURE`. Like every spec-4 call it opts the session into the events.
+**`XrEventDataLiftProvidersChangedDXR` is the refresh trigger**: it is delivered on an install,
+an uninstall or a change of the user's default (as in spec 4), and — spec 5 — whenever the
+candidate list a session enumerated changed, e.g. a candidate *behind* the selection became
+READY, FAILED or was disabled (the task's effective state, and so
+`XrEventDataLiftTaskStateChangedDXR`, may not move at all).
+
+**`XrLiftProviderPreferenceDXR`** chained on `XrLiftTaskStreamCreateInfoDXR::next` is a
+per-create **hint**: `providerId` = a candidate's `providerId`, optionally `/<model id>` (or
+`/<cap id>`) to name one of its capabilities — the grammar of `conv use`.
+
+| Rule | |
+|---|---|
+| Reorder, not override | the first non-terminal candidate row the hint matches moves to the front of **this** create's selection; everything else keeps its order |
+| The runtime still arbitrates | the filter (Enabled, Supersedes, the licence gate, lane, view count) decides what is a candidate at all, and a hint never outranks it |
+| Never an error | an unknown, filtered or terminal `providerId` falls through to the normal selection; the create proceeds and the runtime logs one INFO line. `NULL` / `""` = no hint |
+| Scope | this stream: its create, and its own rebinds after a terminal failure of the provider it bound (§3.2). A live stream never moves because of a hint, and other streams are not affected |
+| Never the default | it is not stored and never written to `PreferredProvider\<task>` (user or machine) |
+| Validation | the create's checks (`viewCount` against `maxViews`, `requiredOutputs` of a READY provider) are against the provider the hinted create binds |
+
+Jobs: the hint applies to job creation with the same meaning once the job API lands; it will
+chain on the job create info (spec 6). `displayxr-cli conv run --provider <id>` ranks with the
+same rule (`conv_select` rule 3a) but is **strict**: a human named the provider, so when the run
+cannot bind it the command exits non-zero with the reason instead of falling through
+(`conv candidates <task>` shows why).
+
 ## 3. Streams, modes and result layouts
 
 The spec-3 modes and their layouts (a spec-4 task stream returns the same layouts; §5.5 adds
@@ -229,7 +289,7 @@ Chain `XrLiftTaskStreamCreateInfoDXR` on `XrLiftStreamCreateInfoDXR`:
 | Field | Meaning |
 |---|---|
 | `task` | a stream-lane task (§2.2) |
-| `inputKind` | one of the task's `inputKinds` (`MONO` in spec 4; stereo pairs and image + depth arrive with spec 5) |
+| `inputKind` | one of the task's `inputKinds` (`MONO` in spec 4; stereo pairs and image + depth arrive with spec 6) |
 | `qualityHint` | `DEFAULT`, `LATENCY`, `BALANCED`, `QUALITY` — the only lever an app has on which variant runs |
 | `viewCount` | `VIEWS_*`: 2..`maxViews`, or **0 = match the weave** (on a lifted weave rect, the active mode's view count, and the service resizes the stream on a mode switch without a new handle; on a plain stream, 2) |
 | `requiredOutputs` | output bits to refuse rather than degrade (e.g. `METRIC`, `AUX_DEPTH`) |
@@ -240,7 +300,8 @@ Chain `XrLiftTaskStreamCreateInfoDXR` on `XrLiftStreamCreateInfoDXR`:
 `XR_ERROR_VALIDATION_FAILURE`. Setting the matching legacy mode makes the same create work on a
 spec-3 runtime, which ignores the chained struct. `contentHint` and `inputScale` keep their
 spec-3 meaning. `XrLiftDepthRequestDXR` may sit beside the task struct on a `VIEWS_MONO`
-stream; it is equivalent to `requiredOutputs |= AUX_DEPTH` but advisory.
+stream; it is equivalent to `requiredOutputs |= AUX_DEPTH` but advisory. Spec 5:
+`XrLiftProviderPreferenceDXR` on the task struct's `next` is a per-create provider hint (§2.5).
 
 **Create rules**, after selection has fallen through every terminal candidate:
 
@@ -515,7 +576,7 @@ Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
 
 | `XrLiftImageDXR` field | Meaning |
 |---|---|
-| `role` | `COLOR` (the mono input, or a whole SBS pair); `COLOR_RIGHT` and `DEPTH` arrive with spec 5 |
+| `role` | `COLOR` (the mono input, or a whole SBS pair); `COLOR_RIGHT` and `DEPTH` arrive with spec 6 |
 | `kind` | `D3D11_NT` (= spec 3 `inputTexture`, keyed mutex key 0), `D3D11_DXGI` (= `inputIsDxgi`), `D3D12_NT`, `VK_OPAQUE_WIN32`, `OPAQUE_FD`, `DMABUF` (+ `XrLiftImageDmabufDescDXR` on `next`), `IOSURFACE`, `AHARDWAREBUFFER`, `CPU`. Values 1–6 equal `XrWeaveHandleKindDXR`'s. Must be one of the task's `imageKinds` for this session |
 | `handle` / `cpuBytes` + `cpuRowPitch` | the image; handles are **borrowed** (the runtime duplicates what it keeps); CPU bytes are copied before the call returns |
 | `format`, `colorSpace` | `XrLiftPixelFormatDXR` (RGBA8 / BGRA8 UNORM or SRGB, NV12, …), `XrLiftColorSpaceDXR` (sRGB, linear, BT.709 limited / full) |
@@ -644,7 +705,7 @@ adapter is served through a CPU copy inside the runtime and never changes what t
 ### 5.5 What a result means: depth and views (spec 4)
 
 **`XrLiftDepthInfoDXR`** describes depth wherever it appears: chained on `XrLiftResultDXR` of a
-`DEPTH_*` stream, on `XrLiftDepthResultDXR` (auxiliary depth, §4.3), and (spec 5) on a depth
+`DEPTH_*` stream, on `XrLiftDepthResultDXR` (auxiliary depth, §4.3), and (spec 6) on a depth
 input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShift`, then read
 `v` by `kind`:
 
@@ -655,7 +716,7 @@ input image and a job result. Decode a sample `s` as `v = rawScale · s + rawShi
 | `AFFINE_INVERSE_DEPTH` | 3 | 1 / depth up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE |
 | `AFFINE_DISPARITY` | 4 | disparity up to an unknown scale and shift; larger = nearer | RELATIVE + INVERSE (§14.2 shift 3) |
 | `AFFINE_DEPTH` | 5 | depth up to an unknown scale and shift; larger = farther | RELATIVE + LINEAR |
-| `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 5) | never reaches a spec-3 result |
+| `PIXEL_DISPARITY` | 6 | exact disparity in pixels of a rectified pair (`DISPARITY_STEREO`, spec 6) | never reaches a spec-3 result |
 
 - `measure`: PLANAR (to the camera plane) or RAY (along the pixel ray).
 - `nearZ` / `farZ`: **depth readings** `d` (see the decoding table below), so `nearZ < farZ` for
@@ -995,13 +1056,17 @@ its minimum runtime in the same change (`consumer_floors`).
 | 2 | Viewpoint policy (ADR-048, §4.1): viewpoints relative to the lifted rect / submitting window centre (was: the panel centre), `XrLiftViewControlDXR` (ipd / parallax factors, axis mode, offset clamp, recentering; defaults X + EASE_BACK 1 s / 2 s), `XrLiftResultViewpointsDXR` echo. |
 | 3 | App camera + metric depth (ADR-048 Addendum A, §4.2–4.3): `XrDisplayRigDXR` / `XrCameraRigDXR` on `XrLiftOptionsDXR` / `XrWeaveRectLiftDXR` drive the TRACKED viewpoints with the `xrLocateViews` rig math; EXPLICIT viewpoints accepted on lifted weave rects; auxiliary depth for SBS / NVIEW streams — `XrLiftDepthRequestDXR`, `XrLiftDepthResultDXR` (texture + shared fence, units, encoding, intrinsics, convergence depth, viewpoint, `depthToDisplay`), `XrLiftDepthPropertiesDXR`. A separate version from 2 because v2 can ship on its own (#1864): an app tests `SPEC_VERSION >= 3` for these. |
 | 4 | Conversion providers (ADR-053, §2.2–2.4, §3.2, §4.5–4.6, §5.4–5.5, §6.1): the task vocabulary (`XrLiftTaskDXR`), input kinds and a quality hint; `xrEnumerateLiftTasksDXR` (the effective capability, readiness and licence class per task) and `xrRequestLiftTaskWarmDXR`; `XrLiftTaskStateDXR` + failure reason; `XrEventDataLiftTaskStateChangedDXR` / `XrEventDataLiftProvidersChangedDXR`, opt-in per session; `XrLiftTaskStreamCreateInfoDXR` (task, input kind, quality hint, `viewCount` 0 = match the weave, `requiredOutputs`, export kind); `XrLiftFrameImagesDXR` / `XrLiftImageDXR` with explicit sync, `XrLiftImageDmabufDescDXR`, `XrLiftFrameControlDXR` (discontinuity); `XrLiftResultExportDXR`, `XrLiftDepthInfoDXR`, `XrLiftViewsInfoDXR`. The consumer contract (§2.4) replaces ADR-042's "open default". Type values `1004999341–351`; enum values equal the plug-in ABI's. An app tests `SPEC_VERSION >= 4`. |
+| 5 | Provider candidates (#2178, ADR-054 decision 8, §2.5): `xrEnumerateLiftTaskCandidatesDXR` / `XrLiftTaskCandidateDXR` (read-only: id, the provider's own display name, readiness, licence class, hosting, `isUserDefault`, `isSelected`), `XrLiftProviderHostingDXR`, and `XrLiftProviderPreferenceDXR` on `XrLiftTaskStreamCreateInfoDXR` (a per-create hint that reorders the non-terminal candidates; an unknown or terminal one falls through). `XrEventDataLiftProvidersChangedDXR` is also sent when an enumerated candidate list changes. Type values `1004999340` (held back from spec 4 for exactly this) and `1004999352`. An app tests `SPEC_VERSION >= 5`. |
+| 6 | *Planned, not shipped:* jobs (`XrLiftJobDXR`, the 1004999360.. types), stereo-pair and image + depth input (`DISPARITY_STEREO`, `VIEWS_FROM_DEPTH`, `SPLATS_STEREO`) and splats over the extension. The header marks those tasks / enums "spec 6"; a spec-4 or spec-5 runtime refuses them. |
 
 ### 14.1 Spec 3 is frozen
 
 Every spec-3 struct, enum value, entry point and wire message is unchanged in spec 4, and a
 spec-3 caller is served by the fixed mapping of §2.3 / §3.1. `tests_lift_abi` pins every spec-3
 `sizeof`, `offsetof` and enum value (x64 and arm64); `tests_oxr_lift_startup` pins the spec-3
-startup sequence and is unchanged by spec 4. Spec 4 only appends.
+startup sequence and is unchanged by spec 4. Spec 4 only appends, and so does spec 5: no spec-4
+struct, value, entry point or wire message changes (the hinted create is its own IPC message,
+appended after the spec-4 family).
 
 ### 14.2 What a spec-3 caller can observe
 

@@ -1646,5 +1646,30 @@
 		"out": [
 			{"name": "holders", "type": "struct xrt_input_client_holders"}
 		]
+	},
+
+	"conv_enum_candidates": {
+		"in": [
+			{"name": "task", "type": "uint32_t"},
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "count", "type": "uint32_t"},
+			{"name": "generation", "type": "struct xrt_conv_wire_generation"},
+			{"name": "candidate", "type": "struct xrt_conv_wire_candidate"}
+		]
+	},
+
+	"conv_stream_create_v5": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_conv_wire_stream_desc"},
+			{"name": "required_outputs", "type": "uint64_t"},
+			{"name": "legacy_mode", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"},
+			{"name": "pref", "type": "struct xrt_conv_wire_provider_pref"}
+		],
+		"out": [
+			{"name": "created", "type": "struct xrt_conv_wire_stream_created"}
+		]
 	}
 }

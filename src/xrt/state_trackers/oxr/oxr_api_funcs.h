@@ -1151,6 +1151,14 @@ oxr_xrEnumerateLiftTasksDXR(XrSession session,
 //! OpenXR API function @ep{xrRequestLiftTaskWarmDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task);
+
+//! OpenXR API function @ep{xrEnumerateLiftTaskCandidatesDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTaskCandidatesDXR(XrSession session,
+                                     XrLiftTaskDXR task,
+                                     uint32_t capacityInput,
+                                     uint32_t *countOutput,
+                                     XrLiftTaskCandidateDXR *candidates);
 #endif
 
 #ifdef OXR_HAVE_DXR_stereo_camera
