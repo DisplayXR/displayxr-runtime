@@ -466,7 +466,12 @@ comp_multi_weave_metal_lift_record(struct comp_multi_weave_metal_lift *ml,
 
 		// 2. The results' Vulkan writes (an asynchronous S5 hand-over, step E)
 		// finish before the pass below samples them: a GPU wait on the glue's
-		// shared event, never a host stall.
+		// shared event, never a host stall. ORDER: this wait is encoded on the
+		// command buffer BEFORE step 3's render encoder, the first and only
+		// place a result texture is sampled. The pins taken in step 1's plans
+		// are NOT released here: they drop only in vk_conv_weave_complete,
+		// called after [cmd waitUntilCompleted] (comp_multi_weave_macos_metal.m,
+		// the #2200 rule) -- step E moved the publish point, not the release.
 		for (uint32_t i = 0; i < ml->entry_count; i++) {
 			const struct mlift_entry *e = &ml->entries[i];
 			if (e->result_tex == nil || e->plan.result_event == NULL) {

@@ -932,7 +932,11 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		// over, snapshots go to their streams, profiles are read, pins drop.
 		// This -- after waitUntilCompleted -- is the ONLY place a frame's result
 		// pins are released (vk_conv_weave_complete); a detach waits for it
-		// (comp_multi_weave_set_lift_ops).
+		// (comp_multi_weave_set_lift_ops). ADR-053 P5 step E moved only the
+		// PUBLISH point (an asynchronous S5 result is published once submitted,
+		// and the lift pass GPU-waits its MTLSharedEvent before sampling it,
+		// comp_multi_weave_metal_lift_record step 2). The #2200 rule is
+		// unchanged: the pin still holds until this command buffer completed.
 		if (lifting) {
 			const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
 			comp_multi_weave_metal_lift_frame_done(wm->lift, &pl, gpu_ok);
