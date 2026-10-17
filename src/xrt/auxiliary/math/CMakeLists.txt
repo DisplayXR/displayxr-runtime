@@ -65,6 +65,8 @@ add_library(
 	m_space.h
 	m_vec2.h
 	m_vec3.h
+	m_view_rig_point.c
+	m_view_rig_point.h
 	)
 target_link_libraries(
 	aux_math
