@@ -1763,3 +1763,178 @@ TEST_CASE("rig-scoped hand joints: a locate BEFORE the first view locate equals 
 
 	tear_down(rt);
 }
+
+namespace {
+
+//! Rotate @p v by the inverse of unit quaternion @p q.
+XrVector3f
+quat_inv_rotate(const XrQuaternionf &q, const XrVector3f &v)
+{
+	// v' = v + 2w(u x v) + 2 u x (u x v), with u = the conjugate's vector part.
+	const float ux = -q.x, uy = -q.y, uz = -q.z, w = q.w;
+	const float cx = uy * v.z - uz * v.y, cy = uz * v.x - ux * v.z, cz = ux * v.y - uy * v.x;
+	const float ccx = uy * cz - uz * cy, ccy = uz * cx - ux * cz, ccz = ux * cy - uy * cx;
+	return {v.x + 2.0f * (w * cx + ccx), v.y + 2.0f * (w * cy + ccy), v.z + 2.0f * (w * cz + ccz)};
+}
+
+} // namespace
+
+TEST_CASE("sim-input hands sit in front of the physical display plane (#2191)", "[oxr][view_space][rig_hands]")
+{
+	// #2191: the scripted hands must land where a default display rig shows
+	// them — about HAND_DISTANCE_M (0.25) in front of the glass, ±12 cm either
+	// side — measured END TO END: wrists located in LOCAL through
+	// xrLocateHandJointsEXT, re-expressed in the frame of the physical display
+	// plane xrLocateViews reports in LOCAL (XrViewDisplayRawDXR::
+	// displayPlanePose, nothing chained). Same process as the arm above.
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	const XrTime t = rt.now();
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, nullptr, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	std::printf("#2191 display plane in LOCAL: (%.3f, %.3f, %.3f) q(%.3f, %.3f, %.3f, %.3f)\n", plane.position.x,
+	            plane.position.y, plane.position.z, plane.orientation.x, plane.orientation.y, plane.orientation.z,
+	            plane.orientation.w);
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	const XrHandEXT hands[2] = {XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT};
+	for (XrHandEXT hand : hands) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = hand;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		XrHandJointLocationEXT locs[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT out = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		out.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		out.jointLocations = locs;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &out)));
+		REQUIRE(out.isActive);
+
+		const XrVector3f w = locs[XR_HAND_JOINT_WRIST_EXT].pose.position;
+		const XrVector3f d = quat_inv_rotate(
+		    plane.orientation, {w.x - plane.position.x, w.y - plane.position.y, w.z - plane.position.z});
+		const bool left = hand == XR_HAND_LEFT_EXT;
+		std::printf("#2191 %s wrist LOCAL (%.3f, %.3f, %.3f) -> display-plane (%.3f, %.3f, %.3f)\n",
+		            left ? "left " : "right", w.x, w.y, w.z, d.x, d.y, d.z);
+		CAPTURE(left, w.x, w.y, w.z, d.x, d.y, d.z);
+		// In front of the glass, about HAND_DISTANCE_M out (the circle and the
+		// wrist-to-root offset of the simulated hand both fit in ±10 cm).
+		CHECK(d.z > 0.15f);
+		CHECK(d.z < 0.35f);
+		// Left hand left of centre, right hand right of it, within the panel.
+		CHECK((left ? -d.x : d.x) > 0.02f);
+		CHECK(std::fabs(d.x) < 0.25f);
+		// Near panel-centre height, not a stage height away.
+		CHECK(std::fabs(d.y) < 0.15f);
+
+		destroyTracker(tracker);
+	}
+
+	tear_down(rt);
+}
+
+TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#2191)",
+          "[oxr][view_space][rig_hands_hold]")
+{
+	// The one-hand drag a gesture consumer could never exercise under the curl
+	// wave: tests_oxr_view_space_rig_hands_hold runs this process with
+	// DXR_INPUT_SIM_INPUT_HANDS=right + DXR_INPUT_SIM_INPUT_PINCH=hold.
+	const char *hands = std::getenv("DXR_INPUT_SIM_INPUT_HANDS");
+	const char *pinch = std::getenv("DXR_INPUT_SIM_INPUT_PINCH");
+	if (hands == nullptr || std::strcmp(hands, "right") != 0 || pinch == nullptr ||
+	    std::strcmp(pinch, "hold") != 0) {
+		WARN("this arm needs HANDS=right PINCH=hold - see tests_oxr_view_space_rig_hands_hold");
+		SUCCEED("not the rig-hands-hold process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_hand_tracking) {
+		WARN("XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	auto locate = [&](XrHandTrackerEXT tracker, XrTime t, XrHandJointLocationEXT *out) {
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT locs = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		locs.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		locs.jointLocations = out;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &locs)));
+		return locs.isActive;
+	};
+
+	XrHandTrackerEXT trackers[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+	for (int i = 0; i < 2; i++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = i == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &trackers[i])));
+	}
+
+	const XrTime t0 = rt.now();
+	float max_gap = 0.0f, min_x = 1.0f, max_x = -1.0f;
+	for (int k = 0; k < 40; k++) {
+		const XrTime t = t0 + (XrTime)k * 100000000; // 100 ms steps across one 4 s revolution
+		XrHandJointLocationEXT j[XR_HAND_JOINT_COUNT_EXT] = {};
+		CHECK_FALSE(locate(trackers[0], t, j)); // HANDS=right: the left hand never tracks
+		REQUIRE(locate(trackers[1], t, j));
+		const XrVector3f a = j[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position;
+		const XrVector3f b = j[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+		const float gap =
+		    std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+		max_gap = std::fmax(max_gap, gap);
+		min_x = std::fmin(min_x, j[XR_HAND_JOINT_WRIST_EXT].pose.position.x);
+		max_x = std::fmax(max_x, j[XR_HAND_JOINT_WRIST_EXT].pose.position.x);
+	}
+	std::printf("#2191 HANDS=right PINCH=hold: max thumb-index gap %.4f m, wrist x sweep %.3f..%.3f m\n", max_gap,
+	            min_x, max_x);
+	CHECK(max_gap < 0.015f);      // pinched the whole revolution
+	CHECK(max_x - min_x > 0.05f); // ...while the root moves: a drag
+	CHECK(min_x > 0.0f);          // on the right of the display centre
+
+	destroyTracker(trackers[0]);
+	destroyTracker(trackers[1]);
+	tear_down(rt);
+}

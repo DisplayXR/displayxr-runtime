@@ -32,6 +32,15 @@ static const struct xrt_component_setting_desc g_descs[] = {
     {"NAV_HOLD_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0",
      "every n ms the navigation pose reports invalid for 500 ms (composer hold / re-align); 0 = never"},
     {"NAV_RECENTER_MS", XRT_COMPONENT_SETTING_TYPE_INT, "0", "fire a scripted recenter every n ms; 0 = never"},
+    {"HANDS", XRT_COMPONENT_SETTING_TYPE_ENUM, "both",
+     "which simulated hands track: both | left | right | none (a hand left out stays a device but is never "
+     "active)"},
+    {"PINCH", XRT_COMPONENT_SETTING_TYPE_ENUM, "wave",
+     "what the fingers do: wave (open-fist curl wave, 3 s) | hold (thumb + index tips held pinched, other "
+     "fingers relaxed: with HANDS=right a sustained one-hand drag) | open (never pinches)"},
+    {"HAND_DISTANCE_M", XRT_COMPONENT_SETTING_TYPE_FLOAT, "0.25",
+     "how far in front of the display glass the hands' 4 cm circles are centred (metres; the hands sit 12 cm "
+     "left / right of the display centre)"},
 };
 
 //! KEY -> the DXR_SIM_INPUT* variable it replaces (one release; removed with the next major cleanup).
@@ -141,6 +150,21 @@ sim_input_setting_on(const char *key)
 		return false;
 	}
 	return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0 && strcmp(v, "off") != 0;
+}
+
+float
+sim_input_setting_float(const char *key, float fallback)
+{
+	char v[32];
+	if (!sim_input_setting(key, v, sizeof(v))) {
+		return fallback;
+	}
+	char *end = NULL;
+	const float f = strtof(v, &end);
+	if (end == v) {
+		return fallback;
+	}
+	return f;
 }
 
 int64_t

@@ -21,6 +21,8 @@
 
 #include "xrt/xrt_defines.h"
 
+#include "sim_input_hand_script.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -31,20 +33,33 @@ extern "C" {
 struct xrt_device;
 
 /*!
+ * Per-controller script settings (#2191), resolved from the provider's
+ * settings by the plug-in entry point.
+ */
+struct sim_input_controller_config
+{
+	//! `HANDS`: false = this hand is never tracked (device present, inactive).
+	bool active;
+	//! `PINCH`: wave | hold | open.
+	enum sim_input_pinch_mode pinch;
+	//! `HAND_DISTANCE_M`: circle centre in front of the glass; <= 0 = default.
+	float hand_distance_m;
+};
+
+/*!
  * Create one simulated motion controller.
  *
  * @param type `XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER` or
  *             `XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER` — drives the
  *             circle center, the button-script phase, and the role the
  *             builder assigns.
- * @param rig_local Publish DISPLAY-PLANE-RELATIVE poses
- *             (`XRT_TRACKING_TYPE_RIG_LOCAL`, #1380): origin at the display
- *             centre, +X right, +Y up, +Z toward the viewer, which is what a
- *             provider that also NAVIGATES must do (ADR-034 Amendment 4). The
- *             runtime anchors that origin at the initial rig, so
- *             `world = rig(t) o L`. False keeps the historical
- *             stage-anchored circle (`XRT_TRACKING_TYPE_OTHER`, centred just
- *             above the tabletop cube) byte-for-byte.
+ * @param config `HANDS` / `PINCH` / `HAND_DISTANCE_M` for this hand; NULL =
+ *             the defaults (active, curl wave, 0.25 m).
+ *
+ * Poses are DISPLAY-PLANE-RELATIVE (`XRT_TRACKING_TYPE_RIG_LOCAL`, #1380 /
+ * #2191): origin at the display centre, +X right, +Y up, +Z toward the
+ * viewer. The runtime anchors that origin at the initial rig, so
+ * `world = rig(t) o L` and the hands sit in front of the glass.
  *
  * The device binds the `khr/simple_controller` interaction profile
  * (`XRT_DEVICE_SIMPLE_CONTROLLER`): select + menu clicks, grip + aim
@@ -55,7 +70,7 @@ struct xrt_device;
  * @ingroup drv_sim_input
  */
 struct xrt_device *
-sim_input_create_controller(enum xrt_device_type type, bool rig_local);
+sim_input_create_controller(enum xrt_device_type type, const struct sim_input_controller_config *config);
 
 /*!
  * Create the simulated NAVIGATION device — the hardware-free reference rig

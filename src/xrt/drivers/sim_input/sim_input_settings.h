@@ -54,6 +54,10 @@ sim_input_setting(const char *key, char *buf, size_t cap);
 bool
 sim_input_setting_on(const char *key);
 
+//! A real-valued knob: @p fallback when unset / empty / unparseable.
+float
+sim_input_setting_float(const char *key, float fallback);
+
 //! A non-negative millisecond knob: 0 when unset / empty / unparseable / negative ("feature off").
 int64_t
 sim_input_setting_ms(const char *key);

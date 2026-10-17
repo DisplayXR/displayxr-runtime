@@ -14,8 +14,13 @@
  * future) with no relation-history buffer, and makes CI runs
  * reproducible.
  *
- * Motion script (period 4 s, radius 8 cm, circle centered per hand):
+ * Motion script (`sim_input_hand_script.c`, #2191): period 4 s, radius
+ * 4 cm, one circle per hand in the DISPLAY PLANE's XY, centred
+ * `HAND_DISTANCE_M` (0.25 m) in front of the glass and 12 cm to its side:
  *   position: center + r*(cos θ, sin θ, 0), θ = 2π·t/period + phase.
+ * Published on a `XRT_TRACKING_TYPE_RIG_LOCAL` origin (display-plane
+ * relative), so the hands land in front of the panel whatever the stage /
+ * LOCAL convention (input-provider-discovery.md §4b.4).
  * Button script:
  *   select: 1 s pressed / 1 s released square wave (left offset by half
  *           a cycle so the hands interleave);
@@ -45,6 +50,7 @@
 #include "util/u_hand_simulation.h"
 
 #include "sim_input_interface.h"
+#include "sim_input_hand_script.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -65,12 +71,6 @@
 //! #1633: `grip_surface` / `palm_ext`, derived from SIM_INPUT_GRIP.
 #define SIM_INPUT_PALM 5
 
-#define SIM_INPUT_CIRCLE_RADIUS_M 0.04f
-#define SIM_INPUT_CIRCLE_PERIOD_S 4.0
-
-//! Finger-curl wave period (#825 Tier 2): a full open→fist→open cycle.
-#define SIM_INPUT_CURL_PERIOD_S 3.0
-
 struct sim_input_device
 {
 	struct xrt_device base;
@@ -83,6 +83,9 @@ struct sim_input_device
 
 	//! Which hand this device serves (drives the simulated joint set).
 	enum xrt_hand hand;
+
+	//! #2191 `PINCH`: what the fingers of the simulated hand do.
+	enum sim_input_pinch_mode pinch;
 
 	bool active;
 
@@ -114,30 +117,7 @@ sim_input_device(struct xrt_device *xdev)
 static void
 script_relation(const struct sim_input_device *sd, int64_t at_timestamp_ns, struct xrt_space_relation *out_relation)
 {
-	const double omega = 2.0 * M_PI / SIM_INPUT_CIRCLE_PERIOD_S; // rad/s
-	double t = (double)at_timestamp_ns * 1e-9;
-	double theta = omega * t + sd->phase_rad;
-
-	float r = SIM_INPUT_CIRCLE_RADIUS_M;
-	float c = (float)cos(theta);
-	float s = (float)sin(theta);
-
-	struct xrt_pose pose = sd->center;
-	pose.position.x += r * c;
-	pose.position.y += r * s;
-
-	out_relation->pose = pose;
-	out_relation->linear_velocity = (struct xrt_vec3){
-	    (float)(-(double)r * omega) * s,
-	    (float)((double)r * omega) * c,
-	    0.0f,
-	};
-	out_relation->angular_velocity = (struct xrt_vec3)XRT_VEC3_ZERO;
-
-	out_relation->relation_flags = (enum xrt_space_relation_flags)(
-	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
-	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-	    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+	sim_input_hand_relation(&sd->center, sd->phase_rad, at_timestamp_ns, out_relation);
 }
 
 //! Scripted button state, a pure function of the monotonic time.
@@ -269,20 +249,11 @@ sim_input_get_hand_tracking(struct xrt_device *xdev,
 	struct xrt_space_relation root;
 	script_relation(sd, at_timestamp_ns, &root);
 
-	// Scripted curl wave: a full open→fist→open cycle every
-	// SIM_INPUT_CURL_PERIOD_S, fingers phase-staggered so the hand
-	// visibly ripples rather than pumping as one block.
-	double t = (double)at_timestamp_ns * 1e-9 + sd->phase_rad / (2.0 * M_PI) * SIM_INPUT_CIRCLE_PERIOD_S;
-	const double omega = 2.0 * M_PI / SIM_INPUT_CURL_PERIOD_S;
-#define SIM_CURL(i) (float)(0.5 - 0.5 * cos(omega * t - (double)(i) * 0.6))
-	struct u_hand_tracking_curl_values curls = {
-	    .little = SIM_CURL(4),
-	    .ring = SIM_CURL(3),
-	    .middle = SIM_CURL(2),
-	    .index = SIM_CURL(1),
-	    .thumb = SIM_CURL(0),
-	};
-#undef SIM_CURL
+	// #2191 `PINCH`: wave (the #825 curl wave), hold (thumb + index tips
+	// held together — a sustained pinch whose root rides the circle, i.e.
+	// a one-hand drag) or open.
+	struct u_hand_tracking_curl_values curls;
+	sim_input_hand_curls(sd->pinch, sd->phase_rad, at_timestamp_ns, &curls);
 
 	u_hand_sim_simulate_for_valve_index_knuckles(&curls, sd->hand, &root, out_value);
 
@@ -335,7 +306,7 @@ static enum xrt_output_name sim_input_outputs_array[] = {
  */
 
 struct xrt_device *
-sim_input_create_controller(enum xrt_device_type type, bool rig_local)
+sim_input_create_controller(enum xrt_device_type type, const struct sim_input_controller_config *config)
 {
 	bool is_left = false;
 	switch (type) {
@@ -370,14 +341,15 @@ sim_input_create_controller(enum xrt_device_type type, bool rig_local)
 	// offsets (±0.2, 1.3, −0.5) into NONE-typed origins, silently
 	// shifting every reported pose. Same rule as qwerty.
 	//
-	// #1380: a provider that ALSO navigates publishes its controllers
-	// DISPLAY-PLANE-relative instead (RIG_LOCAL), and the builder anchors
-	// that origin at the initial rig — so `world = rig(t) o L` and the
-	// hands follow the scripted navigation exactly as a real provider's
-	// would. With the nav knob off nothing here changes.
-	sd->base.tracking_origin->type = rig_local ? XRT_TRACKING_TYPE_RIG_LOCAL : XRT_TRACKING_TYPE_OTHER;
-	snprintf(sd->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s",
-	         rig_local ? "Sim Input Rig-Local Volume" : "Sim Input Tracker");
+	// #2191: always DISPLAY-PLANE-relative (RIG_LOCAL, §4b.4). The builder
+	// anchors the origin at the initial rig and the overseer composes the
+	// rig delta, so `world = rig(t) o L` — the hands sit HAND_DISTANCE_M in
+	// front of the glass in every reference space, with no stage height or
+	// mount offset to guess. (#1380 introduced this frame for the NAV knob;
+	// the stage-anchored circle it kept for NAV=0 sat behind the glass on
+	// some setups and ~1.45 m off on others, #2191.)
+	sd->base.tracking_origin->type = XRT_TRACKING_TYPE_RIG_LOCAL;
+	snprintf(sd->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Sim Input Rig-Local Volume");
 
 	snprintf(sd->base.str, sizeof(sd->base.str), "Simulated %s Motion Controller", is_left ? "Left" : "Right");
 	snprintf(sd->base.serial, sizeof(sd->base.serial), "SIM-INPUT-%s", is_left ? "L" : "R");
@@ -393,28 +365,19 @@ sim_input_create_controller(enum xrt_device_type type, bool rig_local)
 		sd->base.outputs[i].name = sim_input_outputs_array[i];
 	}
 
-	// Circle centers land in the tabletop-scale scene a 3D display
-	// actually shows: LOCAL space sits at stage height 1.6 m
-	// (T_stage_local), and test apps put their cube at the local origin
-	// — so stage-space y ≈ 1.65 maps to just above the cube. Chest-height
-	// VR placement (y 1.3) would render below the visible frustum.
-	//
-	// RIG_LOCAL (#1380) is a DIFFERENT frame — origin at the display
-	// centre, +Z toward the viewer — so the same "just in front of the
-	// panel, at hand height" placement is a different triple: a third of a
-	// metre out of the screen, a hand's width either side, slightly below
-	// centre.
-	sd->center = (struct xrt_pose){
-	    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
-	    .position = {is_left ? -0.10f : 0.10f, 1.65f, -0.05f},
-	};
-	if (rig_local) {
-		sd->center.position = (struct xrt_vec3){is_left ? -0.20f : 0.20f, -0.15f, 0.35f};
-	}
+	// #2191: circle centre in the display-plane frame — HAND_DISTANCE_M out
+	// of the glass, 12 cm to this hand's side, slightly below centre. The
+	// grip / aim / palm poses ride the same circle as the hand root, so
+	// marker cubes an app draws from the grip action land inside the hand.
+	sd->center = sim_input_hand_center(is_left, config != NULL ? config->hand_distance_m : 0.0f);
+	sd->pinch = config != NULL ? config->pinch : SIM_INPUT_PINCH_WAVE;
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).
 	sd->phase_rad = is_left ? M_PI : 0.0;
-	sd->active = true;
+	// #2191 `HANDS`: a hand left out stays a device (so role assignment and
+	// the button-script phase are unchanged) but never tracks — inactive
+	// inputs, invalid poses, `isActive` false on its joint set.
+	sd->active = config != NULL ? config->active : true;
 
 	u_var_add_root(sd, sd->base.str, true);
 	u_var_add_pose(sd, &sd->center, "center");

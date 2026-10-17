@@ -116,6 +116,7 @@ set(tests
     tests_input_arbiter_floor
     tests_input_arbiter_per_client
     tests_sim_input_nav
+    tests_sim_input_hands
     tests_gamepad_map
     tests_touch_gesture
     tests_comp_layer_view_camera
@@ -843,6 +844,13 @@ if(TARGET tests_oxr_view_space)
 		                 DXR_INPUT_SIM_INPUT_ENABLE=1 $<TARGET_FILE:tests_oxr_view_space> "[rig_hands]" --success
 		                 --allow-running-no-tests
 		         )
+		# #2191 — HANDS=right PINCH=hold: one tracked hand holding one pinch.
+		add_test(NAME tests_oxr_view_space_rig_hands_hold
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_rig_hands_dir}"
+		                 DXR_INPUT_SIM_INPUT_ENABLE=1 DXR_INPUT_SIM_INPUT_HANDS=right
+		                 DXR_INPUT_SIM_INPUT_PINCH=hold $<TARGET_FILE:tests_oxr_view_space> "[rig_hands_hold]"
+		                 --success --allow-running-no-tests
+		         )
 	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers
 		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests
@@ -876,6 +884,19 @@ target_include_directories(
 			    ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_sim_input_nav PRIVATE xrt-interfaces aux_os)
+
+# #2191 — the sim_input HAND script: placement relative to the display plane,
+# HANDS / PINCH / HAND_DISTANCE_M, and the pinch-hold tip gap through the real
+# u_hand_simulation. Pure functions, compiled straight in like the nav unit.
+# The end-to-end placement check is tests_oxr_view_space_rig_hands.
+target_sources(
+	tests_sim_input_hands PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input/sim_input_hand_script.c
+	)
+target_include_directories(
+	tests_sim_input_hands PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input
+			      ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_sim_input_hands PRIVATE xrt-interfaces aux_math)
 
 # The gamepad input provider's mapping table (drivers/gamepad/gamepad_map.c):
 # stick -> rig velocity with deadzone, the integrator, the button actions.
