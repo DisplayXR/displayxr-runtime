@@ -51,6 +51,13 @@ public sealed class StatusFeed : IDisposable
     /// and each one creates a vendor instance. Minimising stops it at once.
     /// </summary>
     public static readonly TimeSpan ReleaseLinger = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// A watch child that is up but has printed no line this long is reported
+    /// (log WARN + <see cref="Silent"/>): the CLI prints a snapshot at once, from
+    /// the service or headless, so silence means it is stuck — e.g. a service that
+    /// admits it but refuses the status read because it was demoted from DIAG.
+    /// </summary>
+    public static readonly TimeSpan SilenceWarn = TimeSpan.FromSeconds(10);
 
     private readonly IProcessSource _source;
     private readonly IFeedScheduler _sched;
@@ -71,6 +78,12 @@ public sealed class StatusFeed : IDisposable
     private bool _recovering;
     private IDisposable? _linger;
 
+    // Diagnostics, one-shot per child: the first line, the first drop, the silence watchdog.
+    private bool _childGotLine;
+    private bool _childDropLogged;
+    private bool _childFirstSnapshotLogged;
+    private IDisposable? _silenceTimer;
+
     public StatusFeed(IProcessSource source, IFeedScheduler scheduler)
     {
         _source = source;
@@ -88,6 +101,10 @@ public sealed class StatusFeed : IDisposable
     public DateTime? LastUpdate { get; private set; }
     public int ChildStarts { get; private set; }
     public int Holders => _holders;
+    /// <summary>The current watch child has printed nothing for <see cref="SilenceWarn"/> (cleared by its first line).</summary>
+    public bool Silent { get; private set; }
+    /// <summary>The newest note the watch child printed on stderr (<c>displayxr-cli status: …</c>), for the pill's tooltip.</summary>
+    public string? ChildNote { get; private set; }
     public bool IsRunning => Mode != FeedMode.Idle;
 
     /// <summary>Raised on the scheduler's thread after any visible state change.</summary>
@@ -170,11 +187,19 @@ public sealed class StatusFeed : IDisposable
         Mode = FeedMode.Watching;
         _childStarted = _sched.Now;
         ChildStarts++;
+        _childGotLine = false;
+        _childDropLogged = false;
+        _childFirstSnapshotLogged = false;
+        Silent = false;
+        ChildNote = null;
+        _silenceTimer?.Dispose();
+        _silenceTimer = _sched.Schedule(SilenceWarn, () => OnSilence(id));
         try
         {
             _child = _source.StartWatch(
                 line => _sched.Post(() => OnLine(id, line)),
-                code => _sched.Post(() => OnExit(id, code)));
+                code => _sched.Post(() => OnExit(id, code)),
+                note => _sched.Post(() => OnNote(id, note)));
         }
         catch (Exception ex)
         {
@@ -186,17 +211,62 @@ public sealed class StatusFeed : IDisposable
 
     private void OnLine(int id, string line)
     {
-        if (id != _childId || Mode != FeedMode.Watching || _disposed) return;
+        if (id != _childId || Mode != FeedMode.Watching || _disposed)
+        {
+            // Expected for a child that was just replaced; logged once per current child
+            // so a feed that drops EVERY line (the "connecting… forever" class) says so.
+            if (!_childDropLogged && !_disposed)
+            {
+                _childDropLogged = true;
+                DashboardLog.Info($"status --watch: dropped a {line.Length}-byte line (from child #{id}; current #{_childId}, mode {Mode})");
+            }
+            return;
+        }
         line = line.Trim();
         if (line.Length == 0) return;
         _recovering = false;
+        if (!_childGotLine)
+        {
+            _childGotLine = true;
+            _silenceTimer?.Dispose();
+            _silenceTimer = null;
+            if (Silent)
+            {
+                Silent = false;
+                DashboardLog.Info($"status --watch: first line {(_sched.Now - _childStarted).TotalSeconds:0.0} s after start");
+            }
+        }
         Accept(line);
+    }
+
+    private void OnNote(int id, string note)
+    {
+        if (id != _childId || _disposed || note == ChildNote) return;
+        ChildNote = note;
+        DashboardLog.Info($"status --watch says: {note}");
+        RaiseChanged();
+    }
+
+    private void OnSilence(int id)
+    {
+        _silenceTimer = null;
+        if (id != _childId || Mode != FeedMode.Watching || _disposed || _childGotLine) return;
+        Silent = true;
+        DashboardLog.Warn($"status --watch: no line {SilenceWarn.TotalSeconds:0} s after start (child #{id}: {_child?.State ?? "gone"})" +
+                          (ChildNote is null ? "; the CLI printed no note" : $"; last CLI note: {ChildNote.TrimEnd('.')}") +
+                          ". Compare: displayxr-cli status --watch --json by hand, and the service log's [CLASS] line for this pid.");
+        RaiseChanged();
     }
 
     private void Accept(string json)
     {
         if (StatusSnapshotParser.TryParse(json, out var snap, out var error))
         {
+            if (Mode == FeedMode.Watching && !_childFirstSnapshotLogged)
+            {
+                _childFirstSnapshotLogged = true;
+                DashboardLog.Info($"first snapshot: source={snap!.Source} gen={snap.Generation.Topology}/{snap.Generation.Status}/{snap.Generation.Conversion}");
+            }
             Snapshot = snap;
             LastReadFailed = false;
             LastReadError = null;
@@ -316,6 +386,10 @@ public sealed class StatusFeed : IDisposable
     private void StopAll(bool keepSnapshot)
     {
         CancelPolling();
+        _silenceTimer?.Dispose();
+        _silenceTimer = null;
+        Silent = false;
+        ChildNote = null;
         _childId++; // anything still in flight from the old child is now stale
         var child = _child;
         _child = null;

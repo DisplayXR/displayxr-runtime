@@ -101,6 +101,12 @@ parts (the job object, raising the first instance) are no-ops there.
 
 - The CLI is resolved next to the exe, then `C:\Program Files\DisplayXR\Runtime` (Linux:
   see above); `DXR_DASHBOARD_CLI=<path>` overrides it (development).
+- **Run the CLI that sits beside the running service.** The service admits a DIAG client
+  (the status feed) only from its own directory (#960); any other `displayxr-cli` is
+  admitted as APP and refused the status read. The CLI then says so on stderr and shows
+  the headless snapshot; the dashboard logs that note (`status --watch says: …`) and, if
+  a watch child prints nothing for 10 s, a WARN and a "no snapshot" pill. Mixing a
+  `_package\bin` dashboard with an installed service (or the reverse) is the usual way in.
 - `--version` prints the version and exits (no window).
 - `--page displays|windows|performance|developer|home` opens on that page.
 - `--fixture <file.ndjson>` replays snapshots from a file instead of `status --watch`

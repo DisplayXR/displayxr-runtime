@@ -109,17 +109,26 @@ public sealed class CliProcessSource : IProcessSource
         WorkingDirectory = Path.GetDirectoryName(CliPath) ?? AppContext.BaseDirectory,
     };
 
-    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit)
+    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote)
     {
         if (!CliExists) throw new FileNotFoundException($"{ExeName} not found (looked at {CliPath})");
         var p = new Process { StartInfo = Info(CliArgs.Words("status --watch --json"), stdin: true), EnableRaisingEvents = false };
         p.Start();
         ChildJob.Add(p);
-        DashboardLog.Info($"status --watch started (pid {p.Id})");
+        DashboardLog.Info($"status --watch started (pid {p.Id}, {CliPath})");
         // stderr carries the plug-in WARN lines; drain it so the child never blocks on a full pipe.
-        p.ErrorDataReceived += (_, _) => { };
+        // The CLI's own notes ("displayxr-cli status: the service refused the status read …")
+        // go to the feed: they are the only account of a child that is up but prints nothing.
+        p.ErrorDataReceived += (_, e) =>
+        {
+            string? l = e.Data?.Trim();
+            if (l is not null && l.StartsWith("displayxr-cli", StringComparison.Ordinal))
+            {
+                try { onNote(l); } catch { }
+            }
+        };
         p.BeginErrorReadLine();
-        var watch = new WatchProcess(p);
+        var watch = new WatchProcess(p, p.Id);
         _ = Task.Run(async () =>
         {
             int? code = null;
@@ -149,12 +158,16 @@ public sealed class CliProcessSource : IProcessSource
     private sealed class WatchProcess : IWatchProcess
     {
         private readonly Process _p;
+        private readonly int _pid;
         private int _exited;
         private int _stopping;
 
-        public WatchProcess(Process p) { _p = p; }
+        public WatchProcess(Process p, int pid) { _p = p; _pid = pid; }
 
         public void MarkExited() => Interlocked.Exchange(ref _exited, 1);
+
+        public string State =>
+            $"pid {_pid}, {(Volatile.Read(ref _exited) != 0 ? "exited" : Volatile.Read(ref _stopping) != 0 ? "stopping" : "running")}";
 
         public void Stop()
         {

@@ -71,6 +71,10 @@
 //! Keep the last service snapshot this long after losing the service before
 //! switching to the headless one (ADR-051 D5.4).
 #define STATUS_LOST_GRACE_MS 5000
+//! A service that refused the status read (this CLI was not admitted as DIAG)
+//! will refuse again — the class follows the executable's directory — so retry
+//! slowly; every retry is three WARN lines in the service log.
+#define STATUS_REFUSED_RETRY_MS 30000
 
 #ifdef CLI_HAVE_IPC
 //! A fetch that keeps straddling a rebuild gives up after this many tries.
@@ -235,10 +239,23 @@ cli_status_build_headless(struct xrt_status_snapshot *out)
 	status_build_headless(out);
 }
 
+//! Say why the service refused: the one cause is a CLI outside the service's directory (#960).
+static void
+note_refused(void)
+{
+	fprintf(stderr,
+	        "displayxr-cli status: the service refused the status read (not DIAG): it admits DIAG only from "
+	        "the displayxr-service directory, and this displayxr-cli is not there (#960). Run the "
+	        "displayxr-cli beside the running displayxr-service.\n");
+}
+
 //! Say why the snapshot is headless — on stderr, so stdout stays the snapshot.
 static void
 note_headless(xrt_result_t why)
 {
+	if (why == XRT_ERROR_NOT_AUTHORIZED) {
+		note_refused();
+	}
 	fprintf(stderr,
 	        "displayxr-cli status: no service reached (xrt_result=%d) — showing the HEADLESS snapshot (what a "
 	        "process starting now would get).%s\n",
@@ -407,6 +424,7 @@ status_watch(uint32_t interval_ms, bool json)
 	uint64_t lost_ns = 0;     // when the service went away (0 = never had it / still there)
 	bool printed_any = false; // anything printed at all
 	bool showing_headless = false;
+	bool refused = false; // the service admitted us but refuses the status read (not DIAG)
 
 	while (!g_stop && !stdin_closed()) {
 		const uint64_t now = os_monotonic_get_ns();
@@ -456,9 +474,24 @@ status_watch(uint32_t interval_ms, bool json)
 				lost_ns = os_monotonic_get_ns();
 				next_connect_ns = lost_ns + (uint64_t)STATUS_RECONNECT_MS * U_TIME_1MS_IN_NS;
 				if (xret == XRT_ERROR_NOT_AUTHORIZED) {
-					fprintf(
-					    stderr,
-					    "displayxr-cli status: the service refused the status read (not DIAG).\n");
+					// The connect succeeds, so the "no service" branch above never
+					// runs: without this a refused watch printed NOTHING, forever —
+					// the Dashboard sat on "connecting…" with a live child. Say why
+					// once, show the headless snapshot once, and retry slowly.
+					if (!refused) {
+						refused = true;
+						note_refused();
+					}
+					next_connect_ns =
+					    lost_ns + (uint64_t)STATUS_REFUSED_RETRY_MS * U_TIME_1MS_IN_NS;
+					if (!showing_headless && !printed_any) {
+						status_build_headless(snap);
+						if (!status_print(snap, json, true, redraw)) {
+							break;
+						}
+						printed_any = true;
+						showing_headless = true;
+					}
 				}
 			}
 		}

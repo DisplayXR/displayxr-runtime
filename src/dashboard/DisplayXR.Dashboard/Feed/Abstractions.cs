@@ -75,6 +75,9 @@ public interface IWatchProcess
 {
     /// <summary>End the child: close its stdin (its documented stop signal), then kill it if it lingers.</summary>
     void Stop();
+
+    /// <summary>One line on the child for the log ("pid 1234, running"); empty when unknown.</summary>
+    string State => "";
 }
 
 /// <summary>Where CLI processes come from. The app spawns <c>displayxr-cli</c>; the tests fake it.</summary>
@@ -83,9 +86,12 @@ public interface IProcessSource
     /// <summary>
     /// Start <c>status --watch --json</c>. <paramref name="onLine"/> gets each
     /// stdout line and <paramref name="onExit"/> fires once when the child is
-    /// gone (exit code, or null when it could not start); both on any thread.
+    /// gone (exit code, or null when it could not start); <paramref name="onNote"/>
+    /// gets the CLI's own stderr notes (<c>displayxr-cli status: …</c> — a
+    /// refused status read, "no service reached"), not the plug-in log lines.
+    /// All on any thread.
     /// </summary>
-    IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit);
+    IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote);
 
     /// <summary>Run one CLI verb to completion; <paramref name="args"/> is the argument vector, never a parsed string.</summary>
     Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default);

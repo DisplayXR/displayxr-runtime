@@ -334,7 +334,9 @@ public sealed class MainWindow : Window
         (Level level, string text, string tip) pill = _feed.Mode switch
         {
             FeedMode.Idle => (Level.Plain, "feed paused", "No status page is on screen, so no status child runs."),
-            _ when s is null => (Level.Info, "connecting…", "Waiting for the first snapshot from displayxr-cli."),
+            _ when s is null && _feed.Silent => (Level.Warn, "no snapshot",
+                (_feed.ChildNote ?? "displayxr-cli status --watch is running but has printed nothing.") + $" Details: {DashboardLog.Path}"),
+            _ when s is null => (Level.Info, "connecting…", _feed.ChildNote ?? "Waiting for the first snapshot from displayxr-cli."),
             FeedMode.Polling => (Level.Warn, "headless · every 30 s", _feed.FallbackReason ?? "The live feed is unavailable."),
             _ when s.IsService => (Level.Ok, StatusText.SourceLine(s), "Live: one long-lived 'displayxr-cli status --watch --json' child over the service's diagnostics connection."),
             _ => (Level.Warn, "source: headless", "No service reached: a snapshot built by the CLI itself."),
