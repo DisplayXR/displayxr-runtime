@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # XR_DXR_android_surface_binding
 
-**Status:** Implemented (runtime#1037, ADR-036 D2/D6; layout hint runtime#1396) · **Spec version:** 2
+**Status:** Implemented (runtime#1037, ADR-036 D2/D6; layout hint runtime#1396; input event runtime#132) · **Spec version:** 3
 **Platforms:** Android (`__ANDROID__`) · **Graphics APIs:** Vulkan (`comp_vk_native`)
 **Header:** [`src/external/openxr_includes/openxr/XR_DXR_android_surface_binding.h`](../../../src/external/openxr_includes/openxr/XR_DXR_android_surface_binding.h)
 
@@ -363,6 +363,84 @@ the whole mechanism, on both paths, for an A/B against the 2D fallback. It is
 cached deliberately: flipping it live re-sizes a surface underneath an in-flight
 weave, and the vendor `leia_cnsdk_weave` then parks forever in `vkWaitForFences`.
 
+### 2.7 XrAndroidInputEventDXR + xrSubmitAndroidInputEventDXR (spec v3, #132)
+
+```c
+#define XR_TYPE_ANDROID_INPUT_EVENT_DXR ((XrStructureType)1004999222)
+
+typedef enum XrAndroidInputActionDXR {
+    XR_ANDROID_INPUT_ACTION_DOWN_DXR   = 1,   // ACTION_DOWN / ACTION_POINTER_DOWN
+    XR_ANDROID_INPUT_ACTION_MOVE_DXR   = 2,   // ACTION_MOVE, one per pointer
+    XR_ANDROID_INPUT_ACTION_UP_DXR     = 3,   // ACTION_UP / ACTION_POINTER_UP
+    XR_ANDROID_INPUT_ACTION_CANCEL_DXR = 4,   // ACTION_CANCEL: every pointer is up
+} XrAndroidInputActionDXR;
+
+typedef struct XrAndroidInputEventDXR {
+    XrStructureType             type;
+    const void* XR_MAY_ALIAS    next;
+    XrAndroidInputActionDXR     action;
+    uint32_t                    pointerId;      // MotionEvent.getPointerId(i)
+    uint32_t                    pointerCount;   // pointers down AFTER this event
+    XrVector2f                  position;       // surface px, origin top-left, y down
+    XrExtent2Di                 surfaceExtent;  // {0,0} = last published windowRect extent
+    int64_t                     eventTimeNs;    // getEventTime() * 1e6; 0 = now
+} XrAndroidInputEventDXR;
+
+XrResult xrSubmitAndroidInputEventDXR(XrSession session, const XrAndroidInputEventDXR *event);
+```
+
+#### Why it exists
+
+The runtime ships a **touch input provider** (`docs/specs/runtime/input-provider-discovery.md`
+§5.2) that turns pointer events into the navigation rig — one-finger drag
+orbits, pinch dollies, two-finger drag pans, double tap recenters — and an
+emulated `khr/simple_controller` whose aim ray runs from the nominal viewer
+through the finger and whose SELECT is a tap or a press-and-hold. It reads a
+process-wide pointer-event queue that **surfaces the runtime owns** push into.
+The hosted `MonadoView` forwards its own touch, so a `_hosted` app gets all of
+this for free. An app that owns its Surface owns its `MotionEvent`s too — the
+runtime never sees them — so it submits the ones it wants the runtime to act
+on. Same split as §1's two functions: a fact only the app has, published by the
+app.
+
+#### Application obligations
+
+- Submit **one event per pointer**: `ACTION_MOVE` carries every finger, so
+  unroll it over `getPointerCount()`; `ACTION_POINTER_DOWN` / `_UP` name the
+  pointer at `getActionIndex()`. `pointerCount` is the number of pointers down
+  *after* the event (`getPointerCount()`, minus one for an UP, 0 for CANCEL).
+- Coordinates are the bound surface's pixels (`getX(i)` / `getY(i)` on the
+  `SurfaceView`; `AMotionEvent_getX/Y` in a `NativeActivity`), with the
+  surface's extent in `surfaceExtent` so the provider can normalise. `{0,0}`
+  falls back to the extent last published through `xrSetAndroidWindowGeometryDXR`;
+  an app that publishes neither leaves the provider unable to normalise and the
+  event is ignored.
+- `eventTimeNs` is `MotionEvent.getEventTime()` (uptime millis, i.e.
+  `CLOCK_MONOTONIC`) in nanoseconds, or `AMotionEvent_getEventTime()`. The
+  provider's tap / hold / double-tap timing runs on these stamps; 0 makes the
+  runtime stamp the call time, which is fine for events submitted as they
+  arrive.
+- Submit as they arrive, from the UI thread: the call is a mutex-guarded ring
+  write and the ring drops the **oldest** on overflow (a stale MOVE is worth
+  less than the UP behind it). Submitting is a **copy** — the app keeps
+  handling the events itself, and may submit only a subset (e.g. what its own
+  UI did not consume).
+
+#### Runtime behaviour
+
+- The event lands in the same queue the hosted view feeds
+  (`util/u_pointer_sink`); past that point the two paths are indistinguishable
+  and the provider never learns which kind of surface it is driving.
+- **In-process sessions only** (ADR-036 D2). Over IPC the input provider lives
+  in the service process and the queue is per-process; the call succeeds and
+  the events are dropped. Routing a client's events to the service is the
+  #1996 design (the workspace overlay has the same shape: the controller owns
+  the surface), and this function is the entry point it will reuse.
+- No touch provider resident (it declined, or an older runtime) ⟹ the events
+  are discarded; no error, nothing to retry.
+- Validation: `action` outside the enum and a negative `surfaceExtent` are
+  `XR_ERROR_VALIDATION_FAILURE`.
+
 ### 2.6 Sibling note — what a present-owner with no Activity does instead (#1403)
 
 **This is not part of the extension.** Nothing here is on the OpenXR wire and
@@ -538,5 +616,6 @@ engine shape) does not. The runtime WARNs with that guidance rather than hanging
 
 | Version | Change |
 |---|---|
+| 3 | Adds `XrAndroidInputEventDXR` + `xrSubmitAndroidInputEventDXR` (#132): the app feeds its surface's pointer events to the runtime's touch input provider, which drives the navigation rig and an emulated controller — the same queue the runtime's own hosted `SurfaceView` feeds. Purely additive. |
 | 2 | Adds `XrEventDataAndroidWindowLayoutHintDXR` (#1396): the runtime measures an OEM container scale and hands the app the exact-integer layout + buffer size that makes the composition 1:1, so an app that owns its Surface can weave inside a scaled mini-window instead of falling back to 2D. Purely additive — no existing struct, function or behaviour changes. |
 | 1 | Initial implementation (#1037). Replaces the "planned, not implemented" sketch in `XR_DXR_display_info.md` §4; adds `transparentBackgroundEnabled` to that sketch's struct, plus `XrAndroidWindowGeometryDXR`, `xrSetAndroidSurfaceDXR` and `xrSetAndroidWindowGeometryDXR`. |

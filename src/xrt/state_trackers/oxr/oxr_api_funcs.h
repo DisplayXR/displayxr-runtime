@@ -971,6 +971,10 @@ oxr_xrSetAndroidSurfaceDXR(XrSession session, const XrAndroidSurfaceBindingCreat
 //! OpenXR API function @ep{xrSetAndroidWindowGeometryDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeometryDXR *geometry);
+
+//! OpenXR API function @ep{xrSubmitAndroidInputEventDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitAndroidInputEventDXR(XrSession session, const XrAndroidInputEventDXR *event);
 #endif
 
 #ifdef OXR_HAVE_DXR_atlas_capture
