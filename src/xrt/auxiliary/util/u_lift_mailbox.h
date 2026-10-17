@@ -411,6 +411,53 @@ u_lift_letterbox_update(struct u_lift_letterbox *lb,
 bool
 u_lift_crop_active(const struct u_lift_crop *c);
 
+/*
+ * Letterbox profile from line samples (the measurement, CPU side).
+ *
+ * The profile a service feeds u_lift_letterbox_update: per bucket the
+ * non-black fraction of its first, middle and last line, each line sampled at
+ * U_LIFT_LETTERBOX_LINE_SAMPLES points across the rect (luma of the encoded
+ * value > U_LIFT_LETTERBOX_LUMA_MIN), the max of the three. The D3D11 service
+ * computes it in a pixel shader; a service that can only copy (the Vulkan weave
+ * engines on macOS and desktop Linux) reads back just the sampled lines -- the
+ * row profile only ever reads the U_LIFT_LETTERBOX_LINE_SAMPLES columns at
+ * u_lift_letterbox_sample_pos(k, w), the column profile only the rows at
+ * u_lift_letterbox_sample_pos(k, h) -- and this function turns them into the
+ * identical profile.
+ */
+
+//! Points sampled across one profile line.
+#define U_LIFT_LETTERBOX_LINE_SAMPLES 96u
+
+//! A sample is "picture" when its Rec. 709 luma (encoded, [0, 1]) exceeds this.
+#define U_LIFT_LETTERBOX_LUMA_MIN 0.07f
+
+//! The k-th sample position (0 <= k < U_LIFT_LETTERBOX_LINE_SAMPLES) across @p span texels.
+uint32_t
+u_lift_letterbox_sample_pos(uint32_t k, uint32_t span);
+
+/*!
+ * The profile of a @p w x @p h rect from its sampled lines.
+ *
+ * @p col_px holds the U_LIFT_LETTERBOX_LINE_SAMPLES sampled COLUMNS back to
+ * back (column k = x u_lift_letterbox_sample_pos(k, w), @p h texels top to
+ * bottom); @p row_px the sampled ROWS (row k = y
+ * u_lift_letterbox_sample_pos(k, h), @p w texels left to right). Texels are 4
+ * bytes, B G R A when @p bgra, else R G B A. Writes min(h, BINS_MAX) row
+ * buckets to @p rows (*out_nr) and min(w, BINS_MAX) column buckets to @p cols
+ * (*out_nc); both arrays hold U_LIFT_LETTERBOX_BINS_MAX floats.
+ */
+void
+u_lift_letterbox_profile_from_lines(const uint8_t *col_px,
+                                    const uint8_t *row_px,
+                                    uint32_t w,
+                                    uint32_t h,
+                                    bool bgra,
+                                    float *rows,
+                                    uint32_t *out_nr,
+                                    float *cols,
+                                    uint32_t *out_nc);
+
 
 #ifdef __cplusplus
 }
