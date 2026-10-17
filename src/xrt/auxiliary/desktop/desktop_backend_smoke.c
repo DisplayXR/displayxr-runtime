@@ -1,0 +1,366 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Drive the platform desktop-control backend directly — no OpenXR, no
+ *         policy layer. A developer / bring-up tool for u_desktop_*.{c,cpp,m}.
+ *
+ *   desktop_backend_smoke info                     name, caps, access, locked, idle
+ *   desktop_backend_smoke request                  ask for access (prompts!)
+ *   desktop_backend_smoke list                     windows, top-most first
+ *   desktop_backend_smoke pointer                  pointer + pick under it
+ *   desktop_backend_smoke pick X Y
+ *   desktop_backend_smoke focused
+ *   desktop_backend_smoke text X Y
+ *   desktop_backend_smoke op activate|minimize|restore|maximize|close WINDOW_ID
+ *   desktop_backend_smoke op move WINDOW_ID X Y [W H]
+ *   desktop_backend_smoke type "text"
+ *   desktop_backend_smoke key MODS KEY            MODS: bits ctrl=1 shift=2 alt=4 super=8
+ *   desktop_backend_smoke move X Y
+ *   desktop_backend_smoke click X Y [left|right|middle] [count]
+ *   desktop_backend_smoke scroll DX DY            at the current pointer
+ *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
+ *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
+ *                                                 OS grant from `request` lasts for the rest;
+ *                                                 needed on GNOME, where the portal grant lives
+ *                                                 in memory). Lines: the same commands, quotes
+ *                                                 for spaces, `sleep MS`, `#` comments.
+ *
+ * It bypasses EVERY safety check of the common layer (consent, kill switch, idle
+ * wait, target verification, audit): it is for the person sitting at the machine.
+ */
+
+#include "u_desktop.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+static void
+sleep_ms(unsigned ms)
+{
+	Sleep(ms);
+}
+#else
+#include <unistd.h>
+static void
+sleep_ms(unsigned ms)
+{
+	usleep(ms * 1000u);
+}
+#endif
+
+static const char *
+res_str(enum u_desktop_result r)
+{
+	switch (r) {
+	case U_DESKTOP_OK: return "ok";
+	case U_DESKTOP_ERR_UNSUPPORTED: return "unsupported";
+	case U_DESKTOP_ERR_NOT_GRANTED: return "not-granted";
+	case U_DESKTOP_ERR_WINDOW_LOST: return "window-lost";
+	case U_DESKTOP_ERR_REFUSED: return "refused";
+	case U_DESKTOP_ERR_TIMEOUT: return "timeout";
+	default: return "failed";
+	}
+}
+
+static const char *
+access_str(enum u_desktop_access a)
+{
+	switch (a) {
+	case U_DESKTOP_ACCESS_GRANTED: return "granted";
+	case U_DESKTOP_ACCESS_DENIED: return "denied";
+	case U_DESKTOP_ACCESS_PENDING: return "pending";
+	default: return "unknown";
+	}
+}
+
+static void
+print_window(const struct u_desktop_window *w)
+{
+	printf("  id=%llu parent=%llu pid=%u z=%u state=0x%x frame=(%d,%d %dx%d) app=\"%s\" title=\"%s\"\n",
+	       (unsigned long long)w->id, (unsigned long long)w->parent_id, w->pid, w->z, w->state, w->frame.x,
+	       w->frame.y, w->frame.w, w->frame.h, w->app_id, w->title);
+}
+
+static void
+print_pick(const struct u_desktop_pick *p)
+{
+	static const char *kinds[] = {"window", "desktop", "shell", "outside"};
+	printf("pick (%d,%d): %s\n", p->x, p->y, (unsigned)p->kind < 4 ? kinds[p->kind] : "?");
+	if (p->kind == U_DESKTOP_PICK_WINDOW) {
+		print_window(&p->window);
+	}
+}
+
+//! The smoke tool has no policy layer: the guard always allows, and targets the
+//! focused window (text / keys) or the window under the point (buttons / scroll),
+//! read at the moment the command starts. Set `target ID` in a script to pin one.
+static uint64_t g_target = 0;
+static bool
+smoke_still_allowed(void *ctx)
+{
+	(void)ctx;
+	return true;
+}
+static struct u_desktop_input_guard
+guard_for_focus(struct u_desktop_backend *b)
+{
+	uint64_t id = g_target;
+	if (id == 0 && b->focused_window) {
+		b->focused_window(b, &id);
+	}
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	return g;
+}
+static struct u_desktop_input_guard
+guard_for_point(struct u_desktop_backend *b, int32_t x, int32_t y)
+{
+	uint64_t id = g_target;
+	struct u_desktop_pick p;
+	if (id == 0 && b->pick && b->pick(b, x, y, &p) == U_DESKTOP_OK && p.kind == U_DESKTOP_PICK_WINDOW) {
+		id = p.window.id;
+	}
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	return g;
+}
+
+static volatile int g_done = 0;
+static enum u_desktop_access g_access = U_DESKTOP_ACCESS_UNKNOWN;
+
+static void
+on_access(void *ctx, enum u_desktop_access a)
+{
+	(void)ctx;
+	g_access = a;
+	g_done = 1;
+}
+
+static int
+done(enum u_desktop_result r, const char *msg)
+{
+	printf("result: %s%s%s\n", res_str(r), msg[0] ? " — " : "", msg);
+	return r == U_DESKTOP_OK ? 0 : 1;
+}
+
+static int
+run_cmd(struct u_desktop_backend *b, int argc, char **argv)
+{
+	const char *cmd = argv[1];
+	char msg[U_DESKTOP_MSG_SIZE] = {0};
+	enum u_desktop_result r = U_DESKTOP_ERR_UNSUPPORTED;
+	int rc = 0;
+
+	if (strcmp(cmd, "info") == 0) {
+		uint64_t idle = 0;
+		bool have_idle = b->user_idle_ms && b->user_idle_ms(b, &idle);
+		printf("backend=%s caps=0x%x remembers_in_store=%d access=%s locked=%d idle=%s%llu ms\n", b->name,
+		       b->caps, b->remembers_in_store, b->access_status ? access_str(b->access_status(b)) : "?",
+		       b->is_locked ? b->is_locked(b) : -1, have_idle ? "" : "unknown/",
+		       (unsigned long long)idle);
+	} else if (strcmp(cmd, "request") == 0) {
+		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test"};
+		b->request_access(b, &app, on_access, NULL);
+		for (int i = 0; i < 1200 && !g_done; i++) {
+			sleep_ms(100);
+		}
+		printf("access: %s\n", g_done ? access_str(g_access) : "no answer in 120 s");
+	} else if (strcmp(cmd, "list") == 0) {
+		struct u_desktop_window ws[256];
+		uint32_t n = 0;
+		r = b->list_windows(b, ws, 256, &n);
+		printf("%u window(s)\n", n);
+		for (uint32_t i = 0; i < n && i < 256; i++) {
+			print_window(&ws[i]);
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "pointer") == 0) {
+		int32_t x = 0, y = 0;
+		r = b->get_pointer(b, &x, &y);
+		printf("pointer: (%d,%d)\n", x, y);
+		if (r == U_DESKTOP_OK) {
+			struct u_desktop_pick p;
+			r = b->pick(b, x, y, &p);
+			if (r == U_DESKTOP_OK) {
+				print_pick(&p);
+			}
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "pick") == 0 && argc >= 4) {
+		struct u_desktop_pick p;
+		r = b->pick(b, atoi(argv[2]), atoi(argv[3]), &p);
+		if (r == U_DESKTOP_OK) {
+			print_pick(&p);
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "focused") == 0) {
+		uint64_t id = 0;
+		r = b->focused_window(b, &id);
+		printf("focused: %llu\n", (unsigned long long)id);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "text") == 0 && argc >= 4) {
+		char buf[4096] = {0};
+		r = b->text_at(b, atoi(argv[2]), atoi(argv[3]), buf, sizeof(buf), msg);
+		printf("text: \"%s\"\n", buf);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "op") == 0 && argc >= 4) {
+		static const char *ops[] = {"activate", "move", "minimize", "restore", "maximize", "close"};
+		int op = -1;
+		for (int i = 0; i < 6; i++) {
+			if (strcmp(argv[2], ops[i]) == 0) {
+				op = i;
+			}
+		}
+		if (op < 0) {
+			fprintf(stderr, "unknown op %s\n", argv[2]);
+			return 2;
+		}
+		uint64_t id = strtoull(argv[3], NULL, 10);
+		struct u_desktop_rect rect = {0, 0, 0, 0};
+		if (op == U_DESKTOP_OP_MOVE_RESIZE) {
+			if (argc < 6) {
+				return 2;
+			}
+			rect.x = atoi(argv[4]);
+			rect.y = atoi(argv[5]);
+			rect.w = argc > 6 ? atoi(argv[6]) : 0;
+			rect.h = argc > 7 ? atoi(argv[7]) : 0;
+		}
+		struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		r = b->window_op(b, &g, (enum u_desktop_window_op)op, id, &rect, msg);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "type") == 0 && argc >= 3) {
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_focus(b);
+		r = b->type_text(b, &g, argv[2], msg);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "key") == 0 && argc >= 4) {
+		struct u_desktop_chord c = {0};
+		c.mods = (uint32_t)strtoul(argv[2], NULL, 0);
+		snprintf(c.key, sizeof(c.key), "%s", argv[3]);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_focus(b);
+		r = b->key_chord(b, &g, &c, msg);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "move") == 0 && argc >= 4) {
+		r = b->pointer_move(b, atoi(argv[2]), atoi(argv[3]), msg);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "click") == 0 && argc >= 4) {
+		enum u_desktop_button btn = U_DESKTOP_BUTTON_LEFT;
+		if (argc > 4 && strcmp(argv[4], "right") == 0) {
+			btn = U_DESKTOP_BUTTON_RIGHT;
+		} else if (argc > 4 && strcmp(argv[4], "middle") == 0) {
+			btn = U_DESKTOP_BUTTON_MIDDLE;
+		}
+		int count = argc > 5 ? atoi(argv[5]) : 1;
+		int32_t x = atoi(argv[2]), y = atoi(argv[3]);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->pointer_move(b, x, y, msg);
+		for (int i = 0; r == U_DESKTOP_OK && i < count; i++) {
+			r = b->pointer_button(b, &g, btn, true, x, y, msg);
+			if (r == U_DESKTOP_OK) {
+				r = b->pointer_button(b, &g, btn, false, x, y, msg);
+			}
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
+		g_target = strtoull(argv[2], NULL, 10);
+		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);
+	} else if (strcmp(cmd, "scroll") == 0 && argc >= 4) {
+		int32_t x = 0, y = 0;
+		b->get_pointer(b, &x, &y);
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->scroll(b, &g, x, y, atoi(argv[2]), atoi(argv[3]), msg);
+		rc = done(r, msg);
+	} else {
+		fprintf(stderr, "unknown command / missing arguments: %s\n", cmd);
+		rc = 2;
+	}
+	return rc;
+}
+
+//! Split @p line in place into argv[1..] (argv[0] = @p prog); "double quotes" group.
+static int
+tokenize(char *line, const char *prog, char **argv, int max)
+{
+	int n = 0;
+	argv[n++] = (char *)prog;
+	char *p = line;
+	while (*p != '\0' && n < max) {
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+			p++;
+		}
+		if (*p == '\0' || *p == '#') {
+			break;
+		}
+		if (*p == '"') {
+			argv[n++] = ++p;
+			while (*p != '\0' && *p != '"') {
+				p++;
+			}
+		} else {
+			argv[n++] = p;
+			while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+				p++;
+			}
+		}
+		if (*p != '\0') {
+			*p++ = '\0';
+		}
+	}
+	return n;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr, "usage: see the header of desktop_backend_smoke.c\n");
+		return 2;
+	}
+	struct u_desktop_backend *b = u_desktop_backend_create_platform();
+	if (b == NULL) {
+		printf("no desktop-control backend on this OS / desktop\n");
+		return 3;
+	}
+	int rc = 0;
+	if (strcmp(argv[1], "script") == 0) {
+		char line[4096];
+		while (fgets(line, sizeof(line), stdin) != NULL) {
+			char *args[32];
+			int n = tokenize(line, argv[0], args, 32);
+			if (n < 2) {
+				continue;
+			}
+			printf("> %s\n", args[1]);
+			if (strcmp(args[1], "sleep") == 0 && n >= 3) {
+				sleep_ms((unsigned)atoi(args[2]));
+				continue;
+			}
+			int r = run_cmd(b, n, args);
+			if (r != 0) {
+				rc = r;
+			}
+			fflush(stdout);
+		}
+	} else {
+		rc = run_cmd(b, argc, argv);
+	}
+	b->destroy(b);
+	return rc;
+}

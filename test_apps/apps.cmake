@@ -13,7 +13,8 @@
 #                FEATURE modifier, NOT a class, so cube_zones_* live under
 #                handle/ and cube_zones_texture_* under texture/.
 #     api      = d3d11 | d3d12 | vk | gl | metal
-#     platform = SUFFIX: win | macos | android | linux  (drives the gate below)
+#     platform = SUFFIX: win | macos | android | linux  (drives the gate below);
+#                a headless probe with no API/platform ends in `_probe` (all desktops)
 
 # dxr_testapp_platform_ok(<app_dir_name> <out_var>)
 #   Sets <out_var> to ON iff the app's dir-name suffix matches the platform
@@ -38,6 +39,12 @@ function(dxr_testapp_platform_ok _app _out)
         endif()
     elseif(_app MATCHES "_linux$")
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+            set(_ok ON)
+        endif()
+    elseif(_app MATCHES "_probe$")
+        # Platform-neutral headless probes (no graphics API, no window, e.g.
+        # probes/desktop_control_probe): every desktop OS, never Android.
+        if(NOT ANDROID)
             set(_ok ON)
         endif()
     endif()

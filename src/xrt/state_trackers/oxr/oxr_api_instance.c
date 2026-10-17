@@ -316,6 +316,12 @@ oxr_xrResultToString(XrInstance instance, XrResult value, char buffer[XR_MAX_RES
 
 	switch (value) {
 		XR_LIST_ENUM_XrResult(MAKE_RESULT_CASE);
+#ifdef OXR_HAVE_DXR_desktop_control
+		// Provisional DXR codes are not in the Khronos XR_LIST_ENUM table.
+		MAKE_RESULT_CASE(XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR, _)
+		MAKE_RESULT_CASE(XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR, _)
+		MAKE_RESULT_CASE(XR_ERROR_DESKTOP_WINDOW_LOST_DXR, _)
+#endif
 	default:
 		snprintf(buffer, XR_MAX_RESULT_STRING_SIZE, "XR_UNKNOWN_%s_%d", value < 0 ? "FAILURE" : "SUCCESS",
 		         value);

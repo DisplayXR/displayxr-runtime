@@ -803,6 +803,26 @@
 
 
 /*
+ * XR_DXR_desktop_control
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks - keep them when regenerating). An app's agent operates
+ * the desktop through the OS's own consent, inside the app's process
+ * (ADR-056). Advertised on every desktop OS a backend can exist on; a build or
+ * session with no backend reports XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR.
+ * Never Android (gate on "Linux AND NOT Android", the XRT_OS_LINUX_DESKTOP rule).
+ */
+#if defined(XR_DXR_desktop_control) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) ||           \
+                                        (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
+#define OXR_HAVE_DXR_desktop_control
+#define OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \
+    _(DXR_desktop_control, DXR_DESKTOP_CONTROL)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_desktop_control(_)
+#endif
+
+
+/*
  * XR_DXR_workspace_file_dialog
  */
 #if defined(XR_DXR_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1319,6 +1339,7 @@
     OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
+    OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

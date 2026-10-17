@@ -132,6 +132,11 @@
       "title": "App MCP Tools",
       "summary": "An app registers its own MCP tools with the runtime's agent surface; calls arrive on the OpenXR event queue"
     },
+    "XR_DXR_desktop_control": {
+      "group": "agent",
+      "title": "Desktop Control",
+      "summary": "An app's agent observes and operates the desktop (windows, UI text, typing, clicks) through the OS's own consent, granted to the app, never to DisplayXR"
+    },
     "XR_DXR_atlas_capture": {
       "group": "capture",
       "title": "Atlas Capture",

@@ -108,6 +108,11 @@ cli_cmd_lift(int argc, const char **argv);
 int
 cli_cmd_camera(int argc, const char **argv);
 
+//! `desktop` — XR_DXR_desktop_control (ADR-056): `desktop status|stop|resume|allow|deny|forget|audit`
+//! over the user's store and audit log (local; never a backend, never the desktop).
+int
+cli_cmd_desktop(int argc, const char **argv);
+
 /*!
  * True if @p flag appears anywhere in argv[2..]. Commands take raw
  * argc/argv; this is the one shared option-scan (e.g. `--json`).
