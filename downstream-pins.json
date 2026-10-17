@@ -289,7 +289,7 @@
         "unreadable and the audit reports it rather than passing silently."
       ],
       "declared_floor": { "file": "installer/DisplayXRBrowserInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" },
-      "requires": { "weave": 8 },
+      "requires": { "weave": 8, "lift": 4 },
       "behavioural_floor": {
         "min_runtime": "v2.16.3",
         "commit": "9399479b49e7e7817d4ea732d8a59d197a2c5693",
@@ -302,6 +302,10 @@
         "series against Chromium, so XR_DXR_weave.h exists only after the patches",
         "are applied. Re-derive with:",
         "  git grep -h '^+#define XR_DXR_weave_SPEC_VERSION' main -- patches | sort -u | tail -1",
+        "  git grep -h '^+#define XR_DXR_lift_SPEC_VERSION' main -- patches | sort -u | tail -1",
+        "lift: 4 is what browser-pvt#291 vendors (ADR-053: the browser carries no",
+        "converter; the runtime converts). v2.45.0 is the first tag shipping lift",
+        "spec 4 (v2.44.1 has 3), which is the floor #291's installer declares.",
         "The audit cross-checks this number against requires_anchor's prose and",
         "emits a note (not a finding) when it cannot confirm it there."
       ]
