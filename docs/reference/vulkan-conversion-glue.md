@@ -23,7 +23,8 @@ surface, the macOS Vulkan weave backend and the desktop-Linux weave engine alrea
 and the glue submits on its main queue under the same queue mutex. So macOS and Linux share one
 glue, with MoltenVK underneath on macOS. That holds whichever macOS weave backend
 (`DXR_WEAVE_MAC_BACKEND`) is picked, because the Metal backend owns its own device and the glue
-never touches it.
+never touches it. The two meet only through the IOSurfaces the glue exports its results as (see
+[the Metal backend](#the-macos-metal-weave-backend)).
 
 The CMake gate is `XRT_HAVE_VULKAN AND (APPLE OR (XRT_HAVE_LINUX AND NOT ANDROID))`. It builds
 `comp_vk_conv_viewsyn` and `comp_vk_conv`, and the `ipc_server` block defines
@@ -140,9 +141,9 @@ Colour is always sampled through a UNORM view. That is the stage contract, for b
 ## Lifted weave rects (step C)
 
 A weave client (the DisplayXR Browser) flags a weave rect "lift me" with
-`XrWeaveSubmitLiftRectsDXR`. The wire is the one Windows uses. On macOS (the Vulkan weave
-backend) and desktop Linux the service lifts it with `vk_conv_weave`, following the D3D11
-service's policy.
+`XrWeaveSubmitLiftRectsDXR`. The wire is the one Windows uses. On macOS (both weave backends)
+and desktop Linux the service lifts it with `vk_conv_weave`, following the D3D11 service's
+policy. The macOS Metal backend records in Metal as a host client of the same helper (below).
 
 ### Wiring
 
@@ -150,9 +151,10 @@ service's policy.
 |---|---|---|
 | Bridge | `ipc_server_conv_vk.c` | Resolves a weave client's wire stream id, a core-routed v3 id carrying `IPC_SERVER_CONV_STREAM_TAG`, to its core stream for that connection only (`ipc_server_conv_resolve_stream`). Passes spec 4's "match the weave" view count on (`ipc_server_conv_v4_match_weave`). |
 | Spec-3 streams | `ipc_server_conv.c` | Under the CPU route (`cpu_only`) spec 3 stays off, except for SBS and NVIEW stream create and properties once the helper is attached (`ipc_server_conv_set_weave_rects`). Such a stream is fed only by lifted rects and read only by the weave. Its properties report SBS and NVIEW only. |
-| Ops seam | `multi/comp_multi_weave_lift.{c,h}` | comp_multi is linked into the runtime client too, so it never links the conversion core. The IPC layer installs the helper's ops table (`comp_multi_weave_set_lift_ops`). The handler forwards `lift_weave_rects` to `comp_multi_weave_lift_set_rects`, which refuses a stream that is not an SBS or NVIEW stream of the connection, and refuses on the Metal backend. |
+| Ops seam | `multi/comp_multi_weave_lift.{c,h}` | comp_multi is linked into the runtime client too, so it never links the conversion core. The IPC layer installs the helper's ops table (`comp_multi_weave_set_lift_ops`). The handler forwards `lift_weave_rects` to `comp_multi_weave_lift_set_rects`, which refuses a stream that is not an SBS or NVIEW stream of the connection. |
 | Per-DP eyes sink | `comp_multi_set_conv_eyes_sink` → `ipc_server_conv_eyes_publish` / `_retire` | Every eye query comp_multi answers publishes the answering DP's eyes, keyed by the DP's address. That covers `multi_compositor_get_predicted_eye_positions` and each weave submit's eyes. A destroyed session DP or weave DP retires its key. A lifted rect's frame names the weave engine's DP, so its stream reads that DP's eyes, not the nominal viewer. |
 | Engines | `comp_multi_weave_linux.c`, `comp_multi_weave_macos_vk.c` | Take the set at the top of each submit (one set, one submit), `begin` before recording, `record` per lifted rect, `complete` once the weave's fence has signalled. |
+| Metal engine | `comp_multi_weave_macos_metal.m` + `comp_multi_weave_metal_lift.{h,m}` | `begin` with no Vulkan device (a host client), `host_plan` per lifted rect, records the plan in Metal, `host_done` per stream once the command buffer completed, then `complete`. |
 
 Detach order: no new spec-3 streams, ops cleared (this waits for calls in flight), eyes sink
 cleared, then the helper is destroyed. Destroying it idles the main queue and drops pins and
@@ -199,6 +201,56 @@ A submit without lifted rects records exactly what it recorded before.
   spec-4 rule) turns it into the rect's own aspect fitted in the panel. Without that, a composed
   conversion (a depth-only provider plus S5) fails every frame.
 
+### The macOS Metal weave backend
+
+The Metal backend (`DXR_WEAVE_MAC_BACKEND=metal`, or `auto` with a plug-in that exports only a
+Metal display processor) owns its own `MTLDevice` and records no Vulkan commands. It is a
+**host client** of `vk_conv_weave`: a client created without a device. The stream policy stays in
+the helper, so the two macOS backends cannot drift apart.
+
+1. **Plan.** Per lifted rect, `vk_conv_weave_host_plan` resolves the stream, decides the
+   snapshot (letterbox crop, then the cap), fills the frame, and pins the latest result. These
+   are the same functions `vk_conv_weave_record` uses. It answers with a plan: the source area
+   and the snapshot extent, whether to copy the letterbox lines, and the result (its IOSurface,
+   format, extent, view count, active area and the view each tile shows).
+2. **Record** (`comp_multi_weave_metal_lift.m`, in the weave's own command buffer, after the
+   squeezed rects on the batch layout and after the crop copy on v6):
+   - The snapshot is resampled into an RGBA8 chain: halving linear passes (an exact 2x2 box),
+     then the final pass. The final pass is texel-exact when 1:1, and no pass samples outside the
+     area. It is then copied into a shared `MTLBuffer`. The letterbox lines go into a second one.
+   - The result is wrapped as an `MTLTexture` (`newTextureWithDescriptor:iosurface:plane:`) and
+     each needed view is stretched into the rect's active area of every tile. Sampling is
+     clamped to that view's own texels, so the neighbouring view never bleeds in. The bars
+     (batch) are the source, 1:1. Until the first result the batch layout writes the source into
+     both tiles (flat). Nothing outside the rect is written.
+3. **Hand over.** After `waitUntilCompleted`, `vk_conv_weave_host_done` points the helper at the
+   shared buffers. `complete` then copies the snapshot into the stream's input slot (begin, copy,
+   commit in one call, as on the Vulkan engines), reduces the lines on the CPU, and drops the pins.
+
+**The IOSurface-wrap rule.** The texture's pixel format comes from the plan's conversion format
+(`result_format`), never from `IOSurfaceGetPixelFormat`: an IOSurface MoltenVK created reports
+pixel format 0 (the test asserts this). The format is always the UNORM alias, so an `_SRGB` result
+is sampled raw and stays encoded, as the Vulkan path's raw copy keeps it. A result the glue could
+not export as an IOSurface is woven flat. That covers a device-private result and a layered
+(ARRAY) result, since an IOSurface has one layer. The line is `lift rect: stream 0x<id> failed:
+export`.
+
+**Sync ordering.** No `MTLSharedEvent` and no Vulkan semaphore are involved. The ordering rests on
+three facts:
+
+1. The glue publishes a result only after the Vulkan work writing it has completed. Every glue
+   call waits for its own submit ("producer finished before hand-over", `XRT_CONV_SYNC_NONE`), and
+   the #2030 mirror upload is a glue call too. So by the time `host_plan` pins a result, MoltenVK's
+   command buffer that wrote the IOSurface has completed, and the Metal command buffer that reads
+   it is committed later.
+2. The pin keeps the provider from writing that ring slot again until `complete`. The engine
+   calls `complete` only after its command buffer has completed.
+3. The wrapped `MTLTexture` retains its IOSurface. Even a detach that frees the glue's image in
+   the middle of a frame cannot free memory the command buffer still reads.
+
+The snapshot travels the other way: Metal writes a shared buffer, and the CPU reads it after
+`waitUntilCompleted`.
+
 **Destroy while a weave is in flight.** On Linux stage B, the weave completes at the next submit.
 If the client destroys the stream in between, the stream is only marked dead. The helper still
 pins the result the in-flight weave reads, and the core's reaper skips a pinned stream (`dead &&
@@ -231,7 +283,16 @@ logs `[conv] Vulkan glue: lifted weave rects on`.
     rect, the result in both tiles and nothing written outside the rect. The letterbox crop then
     settles to a 1920x640 snapshot and the bars are woven flat.
   - `weave_probe_vk_macos --lift` against a service with `DXR_CONV_SIM_CONVERSION_ENABLE=1`.
+- On a developer Mac (the Metal backend, `DXR_WEAVE_MAC_BACKEND=metal`):
+  - `tests_conv_vk_gpu "[weave_rects][metal]"` uses a headless Metal device and the MoltenVK
+    glue. The first frame is flat, with the rect's corners exact in both tiles. The snapshot is
+    1920x800. The result's IOSurface reports pixel format 0, and 98 sampled tile pixels match a
+    CPU bilinear read of that IOSurface's views within 2/255. Nothing outside the rect is
+    written. The letterbox crop settles to a 1920x640 snapshot with the bars flat. A stream
+    destroyed with a Metal weave in flight keeps the glue's images until complete.
+  - `weave_probe_vk_macos --lift` against the dev service with `DXR_WEAVE_MAC_BACKEND=metal
+    DXR_CONV_SIM_CONVERSION_ENABLE=1`: rect A reads red (lifted), rect B cyan. The service logged
+    `snapshot 320x180 (cap 1920)` and `woven 640x180 views 2`, with 90 submitted and 90 converted.
 - The desktop-Linux engine shares the helper but has only been syntax-checked; it has not run.
-- The macOS Metal backend refuses lifted rects (TODO in `comp_multi_weave_macos_metal.m`).
 - No POSIX weave engine draws a cursor, so `drawnLiftMask` stays 0. That is the spec's "not
   drawn" answer.
