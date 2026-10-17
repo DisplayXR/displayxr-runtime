@@ -50,8 +50,9 @@
  * the quarter point would read magenta (red left eye, blue right eye); lifted
  * (flat until the first result, then the stream's views) it reads red. Run the
  * SERVICE with DXR_CONV_SIM_CONVERSION_ENABLE=1 (a provider) and grep its log
- * for "lift rect: stream" (the snapshot / woven lines). vk backend only: the
- * Metal backend refuses lifted rects for now.
+ * for "lift rect: stream" (the snapshot / woven lines). Both weave backends
+ * lift (DXR_WEAVE_MAC_BACKEND=metal exercises the Metal path). The red reads
+ * the same flat or woven; the service's "woven" line is what proves a result.
  *
  * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
  * (sim_display exports both DP families, so auto = vk); every check above holds

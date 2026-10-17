@@ -84,9 +84,10 @@ struct comp_multi_weave_macos_backend
 	//! (the Metal backend; the vk backend is unchanged and has no phase feed).
 	bool feeds_present_origin;
 
-	//! Lifts weave rects (XR_DXR_lift §6, comp_multi_weave_lift.h): the vk
-	//! backend. The Metal backend weaves them as drawn (TODO step C: a Metal
-	//! path through the results' IOSurface export).
+	//! Lifts weave rects (XR_DXR_lift §6, comp_multi_weave_lift.h): both
+	//! backends -- vk records through vk_conv_weave, Metal through
+	//! comp_multi_weave_metal_lift as a vk_conv_weave host client (the results'
+	//! IOSurface export sampled in Metal).
 	bool lifts_rects;
 
 	//! Bring up the device objects + DP once; true when ready.

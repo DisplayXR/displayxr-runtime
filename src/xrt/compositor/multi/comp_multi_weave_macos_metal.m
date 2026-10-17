@@ -39,6 +39,12 @@
  *  - v4: a second pass blends the premultiplied overlay over the output
  *    (One / OneMinusSrcAlpha).
  *  - Sync: [cmd commit] + [cmd waitUntilCompleted] before the IPC reply.
+ *  - XR_DXR_lift §6 lifted rects: vk_conv_weave plans each rect (a host
+ *    client, through comp_multi_weave_lift) and comp_multi_weave_metal_lift
+ *    records it into this command buffer -- snapshot into a shared MTLBuffer,
+ *    the result's IOSurface sampled into the rect -- after the squeezed rects
+ *    (batch) / the crop copy (v6). Once the command buffer completed the
+ *    copies are handed over and the helper commits them.
  *
  * Shaders are compiled at runtime from a source string (no build-time
  * metallib), like sim_display_processor_metal.m. Manual retain/release (the
@@ -59,11 +65,13 @@
 
 #include "comp_multi_private.h"
 #include "comp_multi_weave_macos_backend.h"
+#include "comp_multi_weave_metal_lift.h"
 
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 
 /*
@@ -106,6 +114,10 @@ struct weave_metal
 	bool alpha_native;
 	bool tolerates_resample;
 	bool has_present_origin_slot;
+
+	//! XR_DXR_lift §6: the lifted-rect recorder (lazy, first lifted submit).
+	struct comp_multi_weave_metal_lift *lift;
+	bool lift_failed; //!< creation failed once: rects are woven as drawn
 };
 
 static inline struct weave_metal *
@@ -531,11 +543,24 @@ mtlb_ensure_output(struct multi_compositor *mc, uint32_t want_w, uint32_t want_h
 }
 
 //! v3 / legacy: un-squeeze every rect's SBS halves into the scratch tiles.
+//! The lift binding of batch rect @p rect_index, NULL = not lifted.
+static const struct xrt_lift_weave_rect *
+weave_metal_lift_binding(const struct comp_multi_weave_macos_params *p, uint32_t rect_index)
+{
+	for (uint32_t k = 0; k < p->lift_count; k++) {
+		if (p->lift_rects[k].rect_index == rect_index) {
+			return &p->lift_rects[k];
+		}
+	}
+	return NULL;
+}
+
 static void
 weave_metal_encode_unsqueeze(struct multi_compositor *mc,
                              struct weave_metal *wm,
                              id<MTLCommandBuffer> cmd,
-                             const struct comp_multi_weave_macos_params *p)
+                             const struct comp_multi_weave_macos_params *p,
+                             bool lifting)
 {
 	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 	rp.colorAttachments[0].texture = wm->sbs_tex;
@@ -579,6 +604,10 @@ weave_metal_encode_unsqueeze(struct multi_compositor *mc,
 		if (half <= 0) {
 			continue;
 		}
+		// XR_DXR_lift §6: a lifted rect holds 2D, not SBS (drawn by the lift).
+		if (lifting && p->rect_count > 0 && weave_metal_lift_binding(p, i) != NULL) {
+			continue;
+		}
 		// Left half -> left tile at the rect's window position (stretched to the
 		// full rect width); right half -> right tile (+out_w). Odd widths keep
 		// the vk backend's split: left = rw / 2, right = the rest.
@@ -597,6 +626,169 @@ weave_metal_encode_unsqueeze(struct multi_compositor *mc,
 		}
 	}
 	[enc endEncoding];
+}
+
+/*
+ *
+ * XR_DXR_lift §6: lifted weave rects (comp_multi_weave_metal_lift, planned by
+ * vk_conv_weave through comp_multi_weave_lift).
+ *
+ */
+
+static bool
+weave_metal_lift_plan(void *ud, const struct vk_conv_weave_rect *r, struct vk_conv_weave_host_plan *out)
+{
+	return comp_multi_weave_lift_host_plan((struct comp_multi_weave_lift *)ud, r, out);
+}
+
+static void
+weave_metal_lift_done(void *ud, uint64_t owner, uint64_t wire_id, const struct vk_conv_weave_host_done *d)
+{
+	comp_multi_weave_lift_host_done((struct comp_multi_weave_lift *)ud, owner, wire_id, d);
+}
+
+static struct comp_multi_weave_metal_lift_planner
+weave_metal_lift_planner(struct multi_compositor *mc)
+{
+	struct comp_multi_weave_metal_lift_planner pl = {
+	    .plan = weave_metal_lift_plan,
+	    .done = weave_metal_lift_done,
+	    .ud = &mc->weave.lift,
+	};
+	return pl;
+}
+
+//! The window size the caller's rects are in (the bound geometry, else @p fallback).
+static void
+weave_metal_lift_window(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h, uint32_t *out_w, uint32_t *out_h)
+{
+	const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+	*out_w = geo ? mc->weave.win_w : fb_w;
+	*out_h = geo ? mc->weave.win_h : fb_h;
+}
+
+/*!
+ * Batch layout: each lifted rect's 2D frame (the WHOLE rect of the input) is
+ * snapshotted and the stream's latest pair -- or the 2D frame, flat -- lands
+ * in both tiles of the SBS scratch, after the squeezed rects.
+ */
+static void
+weave_metal_lift_record_batch(struct multi_compositor *mc,
+                              struct weave_metal *wm,
+                              id<MTLCommandBuffer> cmd,
+                              const struct comp_multi_weave_macos_params *p)
+{
+	uint32_t win_w = 0, win_h = 0;
+	weave_metal_lift_window(mc, mc->weave.in_w, mc->weave.in_h, &win_w, &win_h);
+	struct vk_conv_weave_rect rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < p->lift_count && n < XRT_LIFT_WEAVE_RECTS_MAX; k++) {
+		const struct xrt_lift_weave_rect *b = &p->lift_rects[k];
+		if (b->rect_index >= p->rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &p->rects[b->rect_index];
+		if (rr->extent.w <= 0 || rr->extent.h <= 0) {
+			continue;
+		}
+		struct vk_conv_weave_rect *r = &rects[n++];
+		memset(r, 0, sizeof(*r));
+		r->binding = b;
+		r->owner = p->lift_owner;
+		// Images are ignored by a host client: the geometry + channel order count.
+		r->src = (struct vk_conv_weave_image){VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM,
+		                                      mc->weave.in_w, mc->weave.in_h};
+		r->x = rr->offset.w; // xrt_offset fields are named w/h
+		r->y = rr->offset.h;
+		r->w = (uint32_t)rr->extent.w;
+		r->h = (uint32_t)rr->extent.h;
+		r->dst = (struct vk_conv_weave_image){VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM,
+		                                      mc->weave.out_w * 2, mc->weave.out_h};
+		r->views = 2;
+		r->tile_columns = 2;
+		r->tile_w = mc->weave.out_w;
+		r->tile_h = mc->weave.out_h;
+		r->batch = true;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp_metal,
+		                                 &r->frame);
+	}
+	const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
+	(void)comp_multi_weave_metal_lift_record(wm->lift, &pl, (void *)cmd, (void *)wm->in_tex, (void *)wm->sbs_tex,
+	                                         rects, n);
+}
+
+/*!
+ * v6 layout: tile 0's copy of each lifted rect (the crop) is snapshotted and
+ * view v of the stream's latest result overwrites the rect in tile v; until
+ * the first result the caller's flat tiles stay.
+ */
+static void
+weave_metal_lift_record_nview(struct multi_compositor *mc,
+                              struct weave_metal *wm,
+                              id<MTLCommandBuffer> cmd,
+                              const struct comp_multi_weave_macos_params *p)
+{
+	uint32_t win_w = 0, win_h = 0;
+	weave_metal_lift_window(mc, p->cvw, p->cvh, &win_w, &win_h);
+	const float sx = (float)p->cvw / (float)win_w, sy = (float)p->cvh / (float)win_h;
+	struct vk_conv_weave_rect rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < p->lift_count && n < XRT_LIFT_WEAVE_RECTS_MAX; k++) {
+		const struct xrt_lift_weave_rect *b = &p->lift_rects[k];
+		if (b->rect_index >= p->rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &p->rects[b->rect_index];
+		// Tile-0 region, clipped to tile 0.
+		float fx0 = (float)rr->offset.w * sx, fy0 = (float)rr->offset.h * sy;
+		float fx1 = fx0 + (float)rr->extent.w * sx, fy1 = fy0 + (float)rr->extent.h * sy;
+		fx0 = fx0 < 0.0f ? 0.0f : fx0;
+		fy0 = fy0 < 0.0f ? 0.0f : fy0;
+		fx1 = fx1 > (float)p->cvw ? (float)p->cvw : fx1;
+		fy1 = fy1 > (float)p->cvh ? (float)p->cvh : fy1;
+		if (fx1 - fx0 < 1.0f || fy1 - fy0 < 1.0f) {
+			continue;
+		}
+		struct vk_conv_weave_rect *r = &rects[n++];
+		memset(r, 0, sizeof(*r));
+		r->binding = b;
+		r->owner = p->lift_owner;
+		r->src = (struct vk_conv_weave_image){VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_B8G8R8A8_UNORM,
+		                                      wm->crop_w, wm->crop_h};
+		r->x = (int32_t)fx0;
+		r->y = (int32_t)fy0;
+		r->w = (uint32_t)(fx1 - fx0);
+		r->h = (uint32_t)(fy1 - fy0);
+		r->dst = r->src;
+		r->views = p->view_count;
+		r->tile_columns = p->tile_columns;
+		r->tile_w = p->cvw;
+		r->tile_h = p->cvh;
+		r->batch = false;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp_metal,
+		                                 &r->frame);
+	}
+	const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
+	(void)comp_multi_weave_metal_lift_record(wm->lift, &pl, (void *)cmd, (void *)wm->crop_tex,
+	                                         (void *)wm->crop_tex, rects, n);
+}
+
+//! This submit lifts its rects: the recorder exists and the helper took the frame.
+static bool
+weave_metal_lift_begin(struct multi_compositor *mc, struct weave_metal *wm, const struct comp_multi_weave_macos_params *p)
+{
+	if (p->lift_count == 0) {
+		return false;
+	}
+	if (wm->lift == NULL && !wm->lift_failed) {
+		wm->lift = comp_multi_weave_metal_lift_create((void *)weave_metal_device());
+		if (wm->lift == NULL) {
+			wm->lift_failed = true;
+			U_LOG_W("weave(#759) metal: lifted-rect recorder creation failed; lifted rects woven as drawn");
+		}
+	}
+	// vk NULL: a host client (this engine records in Metal).
+	return wm->lift != NULL && comp_multi_weave_lift_begin(&mc->weave.lift, NULL, p->lift_count);
 }
 
 static bool
@@ -621,11 +813,16 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		// itself, or a packed-size crop of its top-left region (ADR-030).
 		id<MTLTexture> atlas = nil;
 		uint32_t view_w = 0, view_h = 0, cols = 2, rows = 1, view_count = 2;
+		if ((!p->nview && wm->sbs_tex == nil) || (p->nview && p->v6_zero_copy && p->lift_count > 0)) {
+			return false; // (the front end never asks for zero-copy with lifted rects)
+		}
+		// XR_DXR_lift §6: lifted rects of this submit (false = weave them as drawn).
+		const bool lifting = weave_metal_lift_begin(mc, wm, p);
 		if (!p->nview) {
-			if (wm->sbs_tex == nil) {
-				return false;
+			weave_metal_encode_unsqueeze(mc, wm, cmd, p, lifting);
+			if (lifting && p->rect_count > 0) {
+				weave_metal_lift_record_batch(mc, wm, cmd, p);
 			}
-			weave_metal_encode_unsqueeze(mc, wm, cmd, p);
 			atlas = wm->sbs_tex;
 			view_w = mc->weave.out_w;
 			view_h = mc->weave.out_h;
@@ -635,13 +832,18 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 			} else {
 				if (wm->crop_tex == nil || wm->crop_w != p->packed_w || wm->crop_h != p->packed_h) {
 					[wm->crop_tex release];
-					wm->crop_tex = weave_metal_private_texture(p->packed_w, p->packed_h,
-					                                           MTLTextureUsageShaderRead);
+					// RenderTarget too: lifted rects are drawn into the crop.
+					wm->crop_tex = weave_metal_private_texture(
+					    p->packed_w, p->packed_h, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
 					wm->crop_w = wm->crop_tex != nil ? p->packed_w : 0;
 					wm->crop_h = wm->crop_tex != nil ? p->packed_h : 0;
 					if (wm->crop_tex == nil) {
 						U_LOG_E("weave(#759) metal v6: crop texture (%ux%u) allocation failed",
 						        p->packed_w, p->packed_h);
+						if (lifting) {
+							comp_multi_weave_metal_lift_frame_done(wm->lift, NULL, false);
+							comp_multi_weave_lift_complete(&mc->weave.lift); // nothing recorded
+						}
 						return false;
 					}
 				}
@@ -657,6 +859,9 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 				        destinationLevel:0
 				       destinationOrigin:MTLOriginMake(0, 0, 0)];
 				[blit endEncoding];
+				if (lifting && p->rect_count > 0) {
+					weave_metal_lift_record_nview(mc, wm, cmd, p);
+				}
 				atlas = wm->crop_tex;
 			}
 			view_w = p->cvw;
@@ -722,7 +927,15 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		// Synchronous completion (the macOS contract).
 		[cmd commit];
 		[cmd waitUntilCompleted];
-		if ([cmd status] != MTLCommandBufferStatusCompleted) {
+		const bool gpu_ok = [cmd status] == MTLCommandBufferStatusCompleted;
+		// The weave (and every lifted rect in it) is done: the copies are handed
+		// over, snapshots go to their streams, profiles are read, pins drop.
+		if (lifting) {
+			const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
+			comp_multi_weave_metal_lift_frame_done(wm->lift, &pl, gpu_ok);
+			comp_multi_weave_lift_complete(&mc->weave.lift);
+		}
+		if (!gpu_ok) {
 			// Rate-limited: the first failure, then one line per 300.
 			const uint32_t n = ++wm->cmd_fail_count;
 			if (n == 1 || n % 300 == 0) {
@@ -804,9 +1017,12 @@ mtlb_fini(struct multi_compositor *mc)
 			comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp_metal); // roadmap §5.2
 			xrt_display_processor_metal_destroy(&mc->weave.dp_metal);
 		}
+		// XR_DXR_lift §6: pins + pending snapshots (submits are synchronous: idle).
+		comp_multi_weave_lift_fini(&mc->weave.lift);
 		if (wm == NULL) {
 			return;
 		}
+		comp_multi_weave_metal_lift_destroy(&wm->lift);
 		weave_metal_release_output(mc, wm);
 		[wm->in_tex release];
 		[wm->overlay_tex release];
@@ -825,11 +1041,8 @@ mtlb_fini(struct multi_compositor *mc)
 const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_metal = {
     .name = "metal",
     .feeds_present_origin = true,
-    // TODO(lift rects, step C): lift on the Metal backend too -- wrap the
-    // results' IOSurface export (XRT_CONV_MEM_IOSURFACE, vk_conv_gpu) as
-    // MTLTextures and read the snapshot back through a shared MTLBuffer. Until
-    // then comp_multi_weave_lift_set_rects refuses rects here (woven as drawn).
-    .lifts_rects = false,
+    // XR_DXR_lift §6: through comp_multi_weave_metal_lift (vk_conv_weave host client).
+    .lifts_rects = true,
     .ensure_engine = mtlb_ensure_engine,
     .import_input = mtlb_import_input,
     .release_input = mtlb_release_input,
