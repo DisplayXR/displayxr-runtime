@@ -13,6 +13,8 @@
 
 #include "catch_amalgamated.hpp"
 
+#include "math/m_mathinclude.h" // M_PI on MSVC
+
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_input_plugin.h"
 
@@ -78,7 +80,7 @@ fresh()
 }
 
 bool
-near(float a, float b, float eps = 1e-4f)
+approx_eq(float a, float b, float eps = 1e-4f)
 {
 	return std::fabs(a - b) <= eps;
 }
@@ -91,10 +93,10 @@ TEST_CASE("touch_gesture: at rest the rig is at F's origin, looking down -Z", "[
 	auto g = fresh();
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
-	CHECK(near(p.position.x, 0.0f));
-	CHECK(near(p.position.y, 0.0f));
-	CHECK(near(p.position.z, 0.0f));
-	CHECK(near(p.orientation.w, 1.0f));
+	CHECK(approx_eq(p.position.x, 0.0f));
+	CHECK(approx_eq(p.position.y, 0.0f));
+	CHECK(approx_eq(p.position.z, 0.0f));
+	CHECK(approx_eq(p.orientation.w, 1.0f));
 	CHECK(touch_gesture_mode(&g) == TOUCH_GESTURE_MODE_IDLE);
 	CHECK_FALSE(touch_gesture_select(&g, 0));
 	CHECK(touch_gesture_recenter_timestamp(&g) == 0);
@@ -112,15 +114,15 @@ TEST_CASE("touch_gesture: one-finger drag orbits about the pivot on the display 
 	touch_gesture_nav_pose(&g, &p);
 	const float d0 = 0.5f;
 	// pivot at (0,0,-d0); camera = pivot + Ry(-pi/4) * (0,0,d0) = (-d0 sin45, 0, -d0 + d0 cos45)
-	CHECK(near(p.position.x, -d0 * std::sin(M_PI / 4), 1e-3f));
-	CHECK(near(p.position.y, 0.0f, 1e-3f));
-	CHECK(near(p.position.z, -d0 + d0 * std::cos(M_PI / 4), 1e-3f));
+	CHECK(approx_eq(p.position.x, -d0 * std::sin(M_PI / 4), 1e-3f));
+	CHECK(approx_eq(p.position.y, 0.0f, 1e-3f));
+	CHECK(approx_eq(p.position.z, -d0 + d0 * std::cos(M_PI / 4), 1e-3f));
 	// Still the same distance from the pivot.
 	const float dx = p.position.x, dy = p.position.y, dz = p.position.z + d0;
-	CHECK(near(std::sqrt(dx * dx + dy * dy + dz * dz), d0, 1e-3f));
+	CHECK(approx_eq(std::sqrt(dx * dx + dy * dy + dz * dz), d0, 1e-3f));
 	// Orientation is a pure yaw of -pi/4.
-	CHECK(near(p.orientation.y, std::sin(-M_PI / 8), 1e-3f));
-	CHECK(near(p.orientation.w, std::cos(-M_PI / 8), 1e-3f));
+	CHECK(approx_eq(p.orientation.y, std::sin(-M_PI / 8), 1e-3f));
+	CHECK(approx_eq(p.orientation.w, std::cos(-M_PI / 8), 1e-3f));
 
 	// An orbit drag never clicks.
 	up(g, 0, 1000.0f + kW / 4.0f, 800.0f, 40 * kMs);
@@ -137,7 +139,7 @@ TEST_CASE("touch_gesture: drag down raises the camera (pitch is clamped)", "[tou
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
 	CHECK(p.position.y > 0.3f); // camera went UP
-	CHECK(near(p.position.x, 0.0f, 1e-3f));
+	CHECK(approx_eq(p.position.x, 0.0f, 1e-3f));
 
 	// Keep dragging: pitch clamps at 85 degrees, never flips over the pole.
 	move(g, 0, 100.0f, 100.0f + 10.0f * kH, 40 * kMs);
@@ -159,16 +161,16 @@ TEST_CASE("touch_gesture: pinch dollies, two-finger drag pans, clamped", "[touch
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
 	// Camera sits at pivot + (0,0,d) = (0,0,-0.5+0.25) = (0,0,-0.25)
-	CHECK(near(p.position.z, -0.25f, 1e-3f));
-	CHECK(near(p.orientation.w, 1.0f));
+	CHECK(approx_eq(p.position.z, -0.25f, 1e-3f));
+	CHECK(approx_eq(p.orientation.w, 1.0f));
 
 	// Drag both fingers right by a tenth of the width: content follows, the
 	// camera moves -X by a tenth of the display width (0.032 m).
 	move(g, 0, 800.0f + kW / 10.0f, 800.0f, 20 * kMs, 2);
 	move(g, 1, 1600.0f + kW / 10.0f, 800.0f, 21 * kMs, 2);
 	touch_gesture_nav_pose(&g, &p);
-	CHECK(near(p.position.x, -0.032f, 1e-3f));
-	CHECK(near(p.position.z, -0.25f, 1e-3f)); // dolly unchanged by a pure pan
+	CHECK(approx_eq(p.position.x, -0.032f, 1e-3f));
+	CHECK(approx_eq(p.position.z, -0.25f, 1e-3f)); // dolly unchanged by a pure pan
 
 	// Pinch in absurdly far: clamped at 10x d0.
 	move(g, 0, 1199.0f, 800.0f, 30 * kMs, 2);
@@ -204,12 +206,12 @@ TEST_CASE("touch_gesture: a tap pulses SELECT and the aim ray goes through the f
 	REQUIRE(touch_gesture_aim(&g, &aim, &grip));
 	// Aim starts at the nominal viewer (0,0,0.5) and points at the plane
 	// centre, i.e. straight down -Z: identity orientation.
-	CHECK(near(aim.position.z, 0.5f));
-	CHECK(near(aim.orientation.w, 1.0f, 1e-3f));
+	CHECK(approx_eq(aim.position.z, 0.5f));
+	CHECK(approx_eq(aim.orientation.w, 1.0f, 1e-3f));
 	// Grip sits on the plane, 3 px right / 2 px up of centre.
-	CHECK(near(grip.position.x, 3.0f / kW * 0.32f, 1e-5f));
-	CHECK(near(grip.position.y, 2.0f / kH * 0.20f, 1e-5f));
-	CHECK(near(grip.position.z, 0.0f));
+	CHECK(approx_eq(grip.position.x, 3.0f / kW * 0.32f, 1e-5f));
+	CHECK(approx_eq(grip.position.y, 2.0f / kH * 0.20f, 1e-5f));
+	CHECK(approx_eq(grip.position.z, 0.0f));
 
 	// A tap in the top-right quadrant tilts the ray up and right.
 	down(g, 0, kW * 0.9f, kH * 0.1f, 200 * kMs);
@@ -229,9 +231,9 @@ TEST_CASE("touch_gesture: a tap pulses SELECT and the aim ray goes through the f
 	tx /= tn;
 	ty /= tn;
 	tz /= tn;
-	CHECK(near(fx, tx, 1e-3f));
-	CHECK(near(fy, ty, 1e-3f));
-	CHECK(near(fz, tz, 1e-3f));
+	CHECK(approx_eq(fx, tx, 1e-3f));
+	CHECK(approx_eq(fy, ty, 1e-3f));
+	CHECK(approx_eq(fz, tz, 1e-3f));
 }
 
 TEST_CASE("touch_gesture: press-and-hold holds SELECT and does not orbit", "[touch]")
@@ -248,8 +250,8 @@ TEST_CASE("touch_gesture: press-and-hold holds SELECT and does not orbit", "[tou
 	move(g, 0, 1500.0f, 900.0f, 400 * kMs);
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
-	CHECK(near(p.position.x, 0.0f));
-	CHECK(near(p.orientation.w, 1.0f));
+	CHECK(approx_eq(p.position.x, 0.0f));
+	CHECK(approx_eq(p.orientation.w, 1.0f));
 	struct xrt_pose grip;
 	REQUIRE(touch_gesture_aim(&g, nullptr, &grip));
 	CHECK(grip.position.x > 0.0f);
@@ -270,7 +272,7 @@ TEST_CASE("touch_gesture: a double tap recenters and raises the durable recenter
 	up(g, 0, 900.0f, 700.0f, 40 * kMs);
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
-	REQUIRE_FALSE(near(p.position.x, 0.0f));
+	REQUIRE_FALSE(approx_eq(p.position.x, 0.0f));
 
 	// Tap, tap.
 	down(g, 0, 1000.0f, 800.0f, 1000 * kMs);
@@ -283,10 +285,10 @@ TEST_CASE("touch_gesture: a double tap recenters and raises the durable recenter
 	CHECK(touch_gesture_recenter_timestamp(&g) == 1240 * kMs);
 
 	touch_gesture_nav_pose(&g, &p);
-	CHECK(near(p.position.x, 0.0f));
-	CHECK(near(p.position.y, 0.0f));
-	CHECK(near(p.position.z, 0.0f));
-	CHECK(near(p.orientation.w, 1.0f));
+	CHECK(approx_eq(p.position.x, 0.0f));
+	CHECK(approx_eq(p.position.y, 0.0f));
+	CHECK(approx_eq(p.position.z, 0.0f));
+	CHECK(approx_eq(p.orientation.w, 1.0f));
 
 	// Two taps too far apart are two clicks, not a recenter; the level is unchanged.
 	down(g, 0, 1000.0f, 800.0f, 2000 * kMs);
@@ -323,8 +325,8 @@ TEST_CASE("touch_gesture: sensitivity scales the orbit", "[touch]")
 	move(g, 0, kW / 4.0f, 0.0f, 20 * kMs); // a quarter width at 2x = -pi/2 yaw
 	struct xrt_pose p;
 	touch_gesture_nav_pose(&g, &p);
-	CHECK(near(p.orientation.y, std::sin(-M_PI / 4), 1e-3f));
-	CHECK(near(p.orientation.w, std::cos(-M_PI / 4), 1e-3f));
+	CHECK(approx_eq(p.orientation.y, std::sin(-M_PI / 4), 1e-3f));
+	CHECK(approx_eq(p.orientation.w, std::cos(-M_PI / 4), 1e-3f));
 }
 
 TEST_CASE("u_pointer_sink: FIFO, drains, and drops the OLDEST on overflow", "[touch]")
