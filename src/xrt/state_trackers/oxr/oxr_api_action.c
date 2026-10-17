@@ -153,7 +153,10 @@ oxr_xrSyncActions(XrSession session, const XrActionsSyncInfo *syncInfo)
 	{
 		os_mutex_lock(&sess->sys->sync_actions_mutex);
 		if (sess->sys->dynamic_roles_cache.generation_id < sys_roles.generation_id) {
+			const struct xrt_system_roles old_roles = sess->sys->dynamic_roles_cache;
 			sess->sys->dynamic_roles_cache = sys_roles;
+			// ADR-034 Am.5: tell a provider selector which families moved.
+			oxr_input_providers_roles_changed(&log, sess->sys, &old_roles, &sys_roles);
 			oxr_session_update_action_bindings(&log, sess);
 		}
 		os_mutex_unlock(&sess->sys->sync_actions_mutex);

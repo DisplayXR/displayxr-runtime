@@ -22,6 +22,7 @@
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
+#include "util/u_exe_basename.h"
 #include "server/ipc_server_interface.h"
 #include "shared/ipc_lift_caps.h"
 #include "server/ipc_server_conv.h"
@@ -2368,6 +2369,8 @@ ipc_handle_instance_declare_peer(volatile struct ipc_client_state *ics,
 		ics->peer_declared = true;
 		ics->peer_pid = declared;
 		ics->client_state.pid = (int)declared;
+		// ADR-034 Am.5: the declared peer is the app whose per-app pin applies.
+		ipc_server_client_resolve_input_identity(ics, declared);
 		// The only site that actually changes behaviour: ipc_send_handles's
 		// open_target_process_dup_handle now duplicates into the declared peer
 		// instead of the pipe opener.
@@ -9417,6 +9420,103 @@ lift_xsysc(volatile struct ipc_client_state *ics)
 	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
 }
 #endif
+
+/*
+ *
+ * XR_DXR_input_providers (ADR-034 Amendment 5, #2181).
+ *
+ * The connection is the client. Its identity for the per-app pin is the peer
+ * executable resolved at accept (ics->input_exe_basename), its key the
+ * server's monotonic client id — never anything the client sent. The policy
+ * itself lives behind xsysd->input_selection (the arbiter, in this process):
+ * these handlers only build the client reference and forward.
+ *
+ */
+
+void
+ipc_server_client_resolve_input_identity(volatile struct ipc_client_state *ics, long pid)
+{
+	char exe_path[512];
+	char base[XRT_INPUT_EXE_BASENAME_SIZE] = {0};
+	if (pid != 0 && ipc_server_peer_exe_path(pid, exe_path, sizeof(exe_path))) {
+		(void)u_exe_basename_from_path(exe_path, base, sizeof(base));
+	}
+	memcpy((char *)ics->input_exe_basename, base, sizeof(base));
+}
+
+static void
+input_client_ref(volatile struct ipc_client_state *ics, struct xrt_input_selection_client *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->key = (uint64_t)ics->client_state.id; // ++id_generator: never 0, never reused
+	memcpy(out->exe_basename, (const char *)ics->input_exe_basename, sizeof(out->exe_basename));
+	out->exe_basename[sizeof(out->exe_basename) - 1] = '\0';
+}
+
+static struct xrt_input_selection *
+input_selection_of(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server *s = ics->server;
+	return (s != NULL && s->xsysd != NULL) ? s->xsysd->input_selection : NULL;
+}
+
+void
+ipc_server_client_input_release(volatile struct ipc_client_state *ics)
+{
+	struct xrt_input_selection *xis = ics != NULL ? input_selection_of(ics) : NULL;
+	if (xis == NULL) {
+		return;
+	}
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	xrt_input_selection_client_detach(xis, &client);
+}
+
+xrt_result_t
+ipc_handle_input_providers_enumerate(volatile struct ipc_client_state *ics,
+                                     uint32_t start,
+                                     struct xrt_input_provider_page *out_page)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_page, 0, sizeof(*out_page));
+	// TODO(#2181 phase 2): the service's xsysd gets its input_selection from
+	// the arbiter; until then every system reports "not supported" and the
+	// client lists no providers.
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	return xrt_input_selection_enumerate(xis, &client, start, out_page);
+}
+
+xrt_result_t
+ipc_handle_input_set_provider_preference(volatile struct ipc_client_state *ics,
+                                         uint32_t family,
+                                         const struct ipc_input_provider_id *provider,
+                                         bool persist)
+{
+	IPC_TRACE_MARKER();
+
+	if (family >= XRT_INPUT_ROLE_FAMILY_COUNT || provider == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char id[XRT_INPUT_PROVIDER_ID_SIZE];
+	memcpy(id, provider->id, sizeof(id));
+	id[sizeof(id) - 1] = '\0'; // the wire is untrusted
+
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	if (persist && client.exe_basename[0] == '\0') {
+		// No executable identity (a restricted-token peer): nothing to key a pin on.
+		IPC_WARN(ics->server,
+		         "input_set_provider_preference: client id=%u pid=%ld has no resolvable executable — "
+		         "a persisted pin cannot be keyed; refused (#2181).",
+		         ics->client_state.id, ics->peer_pid);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xrt_input_selection_set_preference(xis, &client, (enum xrt_input_role_family)family, id, persist);
+}
 
 void
 ipc_server_client_lift_release(volatile struct ipc_client_state *ics)

@@ -944,6 +944,30 @@ oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
 }
 #endif // OXR_HAVE_DXR_desktop_control
 
+#ifdef OXR_HAVE_DXR_input_providers
+XrResult
+oxr_event_push_XrEventDataInputProvidersChanged(struct oxr_logger *log,
+                                                struct oxr_instance *inst,
+                                                XrInputRoleFamilyFlagsDXR changed_families)
+{
+	XrEventDataInputProvidersChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_INPUT_PROVIDERS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->changedFamilies = changed_families;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_input_providers
+
 #ifdef OXR_HAVE_DXR_stereo_camera
 XrResult
 oxr_event_push_XrEventDataStereoCameraStateChanged(struct oxr_logger *log,

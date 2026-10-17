@@ -187,6 +187,17 @@ struct ipc_client_state
 	//! identity after gates have run against it.
 	bool peer_declared;
 
+	/*!
+	 * ADR-034 Amendment 5 (#2181): the per-app key of this connection — the
+	 * executable BASENAME of the peer process (`SampleGame.exe`), resolved by
+	 * the server from the OS-derived pid at accept and again when a peer
+	 * declaration moves @ref peer_pid. Never taken from anything the client
+	 * sends (`XrInstanceCreateInfo::applicationName` included). "" when the OS
+	 * would not tell us (a restricted-token peer): such a client has no
+	 * per-app pin and cannot persist one.
+	 */
+	char input_exe_basename[XRT_INPUT_EXE_BASENAME_SIZE];
+
 	//! browser#103 RC-1: a handle has already been duplicated to this client
 	//! (instance_get_shm_fd ran). A declaration arriving after this point is too
 	//! late to be honoured and is refused.
@@ -661,6 +672,23 @@ ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics
  */
 void
 ipc_server_client_lift_release(volatile struct ipc_client_state *ics);
+
+/*!
+ * ADR-034 Amendment 5 (#2181): resolve @p pid's executable basename into
+ * @p ics->input_exe_basename (the connection's per-app key). Best effort —
+ * "" when the OS will not say. Called at accept and on an accepted peer
+ * declaration; never under the server's global lock (it opens the process).
+ */
+void
+ipc_server_client_resolve_input_identity(volatile struct ipc_client_state *ics, long pid);
+
+/*!
+ * ADR-034 Amendment 5: drop this connection's session requests and cached
+ * per-client roles in the system's input selection. Called once at client
+ * teardown; the user's per-app pin is not touched.
+ */
+void
+ipc_server_client_input_release(volatile struct ipc_client_state *ics);
 
 /*!
  * @defgroup ipc_server_internals Server Internals

@@ -20,6 +20,15 @@
  *   input use <id> [--machine]          `PreferredPlugin` under the InputProviders
  *                                       root: ranked first, ahead of ProbeOrder.
  *   input reset [--machine]             Clear it.
+ *   input use <id> --app <exe>          ADR-034 Amendment 5 (#2181): the user's
+ *   input reset --app <exe>             per-app pin for executable <exe>
+ *                                       (`SampleGame.exe`; a path is reduced to its
+ *                                       basename): that app's controller / hand /
+ *                                       gamepad roles prefer <id> for every family
+ *                                       <id> supplies, ahead of the app's own
+ *                                       request and of PreferredPlugin. HKCU
+ *                                       `InputProviders\PerApp\<exe>\PreferredPlugin`
+ *                                       / POSIX `input-preferred-<exe>`. Per user only.
  *   input emulated on|off [--machine]   The `EmulatedControllers` gate (ADR-054
  *                                       N7): `InputProviders\Policy\
  *                                       EmulatedControllers`, HKCU by default,
@@ -76,6 +85,9 @@
 #include "target_component_loader.h"
 #include "target_input_plugin_loader.h"
 
+#include "util/u_exe_basename.h"
+#include "xrt/xrt_input_selection.h"
+
 #include <cjson/cJSON.h>
 
 #include <errno.h>
@@ -91,6 +103,7 @@
 #endif
 
 #define MAX_PROVIDERS 16
+#define MAX_APP_PINS 64
 
 //! Discovery root — the registry key the loader enumerates (Windows).
 #define INPUT_REG_ROOT "Software\\DisplayXR\\InputProviders"
@@ -142,6 +155,25 @@ cmd_list(int argc, const char **argv)
 		cJSON *pol = cJSON_AddObjectToObject(root, "policy");
 		cJSON_AddBoolToObject(pol, "policy_lock",
 		                      target_component_policy_lock(target_input_plugin_component_class()));
+		// ADR-034 Am.5 (#2181): the user's per-app pins as STORED (Policy\Lock,
+		// reported above, hides them from the resolver).
+		{
+			struct target_input_app_pin pins[MAX_APP_PINS];
+			const int np = target_input_plugin_list_app_pins(pins, MAX_APP_PINS);
+			cJSON *per_app = cJSON_AddArrayToObject(root, "per_app");
+			for (int i = 0; i < np; i++) {
+				cJSON *row = cJSON_CreateObject();
+				cJSON_AddStringToObject(row, "app", pins[i].exe_basename);
+				cJSON_AddStringToObject(row, "preferred", pins[i].provider_id);
+				cJSON_AddBoolToObject(row, "registered", provider_registered(pins[i].provider_id) ||
+				                                             strcmp(pins[i].provider_id,
+				                                                    XRT_INPUT_PROVIDER_ID_EMULATED) == 0);
+				cJSON_AddItemToArray(per_app, row);
+			}
+		}
+		// TODO(#2181 phase 2): `holders` — the per-client LIVE holder per family,
+		// from the service's input selection over DIAG IPC (and the ADR-051
+		// status snapshot). Phase 1 ships the stored pins only.
 		cJSON *arr = cJSON_AddArrayToObject(root, "providers");
 		for (int i = 0; i < n; i++) {
 			cJSON *p = cJSON_CreateObject();
@@ -199,6 +231,16 @@ cmd_list(int argc, const char **argv)
 		P("\t    %s\n", list[i].binary_path);
 	}
 	P("\t('*' = the provider the loader would rank first.)\n");
+	{
+		struct target_input_app_pin pins[MAX_APP_PINS];
+		const int np = target_input_plugin_list_app_pins(pins, MAX_APP_PINS);
+		if (np > 0) {
+			P("\tPer-app pins (input use <id> --app <exe>):\n");
+			for (int i = 0; i < np; i++) {
+				P("\t  %-32s -> %s\n", pins[i].exe_basename, pins[i].provider_id);
+			}
+		}
+	}
 	return 0;
 }
 
@@ -617,6 +659,87 @@ cmd_reset(bool machine)
 	return 0;
 }
 
+//! The value after @p flag, or NULL (absent, or followed by another flag / nothing).
+static const char *
+flag_value(int argc, const char **argv, const char *flag)
+{
+	for (int i = 0; i + 1 < argc; i++) {
+		if (strcmp(argv[i], flag) == 0 && argv[i + 1][0] != '-') {
+			return argv[i + 1];
+		}
+	}
+	return NULL;
+}
+
+//! `--app <exe>`: reduce a path to its basename and validate it as a per-app key.
+static bool
+app_key_from_arg(const char *arg, char *out, size_t cap)
+{
+	if (arg == NULL || !u_exe_basename_from_path(arg, out, cap)) {
+		P("error: '--app' needs an executable name such as SampleGame.exe (got '%s').\n", arg != NULL ? arg : "");
+		return false;
+	}
+	return true;
+}
+
+static int
+pin_write_result(enum target_input_pin_write r)
+{
+	switch (r) {
+	case TARGET_INPUT_PIN_WRITE_OK: return 0;
+	case TARGET_INPUT_PIN_WRITE_INVALID: P("FAIL: not a valid provider id / executable name — nothing written.\n"); return 1;
+	case TARGET_INPUT_PIN_WRITE_DENIED: P("FAIL: the per-user store refused the write.\n"); return 1;
+	case TARGET_INPUT_PIN_WRITE_UNSUPPORTED: P("FAIL: there is no per-user store on this platform.\n"); return 1;
+	case TARGET_INPUT_PIN_WRITE_FAILED:
+	default: P("FAIL: writing the per-app pin failed.\n"); return 1;
+	}
+}
+
+/*!
+ * `input use <id> --app <exe>` / `input reset --app <exe>` (ADR-034 Amendment
+ * 5, #2181): the user's per-app pin. Per user only — `--machine` is refused
+ * (there is no machine tier; `Policy\Lock` is the machine's say).
+ */
+static int
+cmd_app_pin(const char *id, const char *app_arg, bool machine)
+{
+	if (machine) {
+		P("FAIL: per-app pins are per user — drop --machine (HKLM Policy\\Lock is the machine's override).\n");
+		return 1;
+	}
+	char app[XRT_INPUT_EXE_BASENAME_SIZE];
+	if (!app_key_from_arg(app_arg, app, sizeof(app))) {
+		return 1;
+	}
+	if (id != NULL) {
+		if (!cli_input_id_valid(id)) {
+			P("error: '%s' is not a provider id.\n", id);
+			return 1;
+		}
+		if (!provider_registered(id) && strcmp(id, XRT_INPUT_PROVIDER_ID_EMULATED) != 0) {
+			P("warning: '%s' is not a registered input provider; the pin is ignored until it is.\n", id);
+		}
+	}
+	const int rc = pin_write_result(target_input_plugin_set_app_pin(app, id));
+	if (rc != 0) {
+		return rc;
+	}
+	if (id != NULL) {
+		P("Per-app pin: %s -> '%s' — that app's controller / hand / gamepad roles prefer it for every\n", app,
+		  id);
+		P("family it supplies (other families keep the default walk; an absent provider falls through).\n");
+	} else {
+		P("Per-app pin for %s cleared — the app's own request / the default apply again.\n", app);
+	}
+	if (target_component_policy_lock(target_input_plugin_component_class())) {
+		P("note: HKLM Policy\\Lock is set, so per-app pins are ignored on this machine.\n");
+	}
+	// TODO(#2181 phase 2): the per-client overlay applies the pin live; until it lands
+	// the pin is stored and read by nothing that changes roles.
+	note_pickup(NULL);
+	return 0;
+}
+
 /*!
  * `input emulated on|off [--machine]` — the `EmulatedControllers` gate (ADR-054
  * N7, #2143). Same store rules as `enable|disable`: HKCU by default, the HKLM
@@ -789,6 +912,9 @@ print_usage(void)
 	P("  use <id> [--machine]         PreferredPlugin override: <id> is ranked first, ahead of\n");
 	P("                               ProbeOrder (per user; --machine = HKLM).\n");
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
+	P("  use <id> --app <exe>         Per-app pin: that app's controller / hand / gamepad roles prefer <id>\n");
+	P("                               (families <id> supplies), ahead of the app's own request (per user).\n");
+	P("  reset --app <exe>            Clear that app's pin.\n");
 	P("  emulated on | off [--machine]\n");
 	P("                               EmulatedControllers gate: off = no qwerty left/right pair, hand\n");
 	P("                               roles unassigned when no provider holds them (per user; --machine\n");
@@ -822,14 +948,21 @@ cli_cmd_input(int argc, const char **argv)
 		}
 		return cmd_enable(argv[3], strcmp(verb, "enable") == 0, machine);
 	}
+	const bool per_app = cli_has_flag(argc, argv, "--app");
 	if (strcmp(verb, "use") == 0) {
 		if (argc < 4 || argv[3][0] == '-') {
 			P("error: 'input use' needs a provider id.\n\n");
 			return print_usage();
 		}
+		if (per_app) {
+			return cmd_app_pin(argv[3], flag_value(argc, argv, "--app"), machine);
+		}
 		return cmd_use(argv[3], machine);
 	}
 	if (strcmp(verb, "reset") == 0) {
+		if (per_app) {
+			return cmd_app_pin(NULL, flag_value(argc, argv, "--app"), machine);
+		}
 		return cmd_reset(machine);
 	}
 	if (strcmp(verb, "emulated") == 0) {

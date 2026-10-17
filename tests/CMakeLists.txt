@@ -158,6 +158,10 @@ if(TARGET target_lists)
 	# resolve rule (user over machine, under Policy\Lock) and the input
 	# loader's live POSIX per-user file read with HOME redirected.
 	list(APPEND tests tests_input_emulated_controllers)
+	# ADR-034 Amendment 5 (#2181) -- per-client input selection policy: the
+	# per-family precedence (Lock > per-app pin > request > PreferredPlugin),
+	# the exe-basename per-app key, and the live POSIX per-app pin file.
+	list(APPEND tests tests_input_selection_policy)
 	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
 	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
 	# headless pass + selftest exit-13 path on stub providers.
@@ -627,6 +631,9 @@ if(TARGET tests_component_settings)
 endif()
 if(TARGET tests_input_emulated_controllers)
 	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_input_selection_policy)
+	target_link_libraries(tests_input_selection_policy PRIVATE target_lists xrt-interfaces aux_util)
 endif()
 if(TARGET tests_component_loader)
 	target_link_libraries(tests_component_loader PRIVATE target_lists xrt-interfaces aux_util)

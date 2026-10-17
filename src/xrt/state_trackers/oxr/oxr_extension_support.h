@@ -823,6 +823,24 @@
 
 
 /*
+ * XR_DXR_input_providers
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks - keep them when regenerating). Per-client input-provider
+ * selection (ADR-034 Amendment 5, #2181): enumerate the resident providers as
+ * this client sees them and request one per role family. Advertised on every
+ * platform; a system with no selection support lists no providers.
+ */
+#if defined(XR_DXR_input_providers)
+#define OXR_HAVE_DXR_input_providers
+#define OXR_EXTENSION_SUPPORT_DXR_input_providers(_) \
+    _(DXR_input_providers, DXR_INPUT_PROVIDERS)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_input_providers(_)
+#endif
+
+
+/*
  * XR_DXR_workspace_file_dialog
  */
 #if defined(XR_DXR_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1340,6 +1358,7 @@
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \
+    OXR_EXTENSION_SUPPORT_DXR_input_providers(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

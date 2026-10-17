@@ -1524,6 +1524,24 @@
 			{"name": "component_class", "type": "uint32_t"}
 		]
 	},
+
+	"input_providers_enumerate": {
+		"in": [
+			{"name": "start", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "page", "type": "struct xrt_input_provider_page"}
+		]
+	},
+
+	"input_set_provider_preference": {
+		"in": [
+			{"name": "family", "type": "uint32_t"},
+			{"name": "provider", "type": "struct ipc_input_provider_id"},
+			{"name": "persist", "type": "bool"}
+		]
+	},
+
 	"conv_warm": {
 		"in": [
 			{"name": "request", "type": "struct xrt_conv_wire_task_request"}

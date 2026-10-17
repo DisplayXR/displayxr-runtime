@@ -29,6 +29,7 @@
 #include "xrt/xrt_conv_wire.h"
 #include "xrt/xrt_stereo_camera.h"
 #include "xrt/xrt_screen.h"
+#include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_config_build.h"
 
 #include <assert.h>
@@ -359,6 +360,26 @@ struct ipc_client_list
 	uint32_t ids[IPC_MAX_CLIENTS];
 	uint32_t id_count;
 };
+
+/*!
+ * XR_DXR_input_providers (ADR-034 Amendment 5, #2181): the provider id an
+ * `input_set_provider_preference` names ("" = back to the default walk). A
+ * struct so the generator copies the fixed array by value.
+ *
+ * The connection is the client: nothing here identifies it. The service keys
+ * the per-app pin on the executable it resolved from the PEER process at
+ * accept (`ipc_client_state::input_exe_basename`).
+ *
+ * @ingroup ipc
+ */
+struct ipc_input_provider_id
+{
+	char id[XRT_INPUT_PROVIDER_ID_SIZE];
+};
+
+// One enumeration page is one reply: result + page must fit the message buffer.
+static_assert(sizeof(struct xrt_input_provider_page) + 16 <= IPC_BUF_SIZE,
+              "xrt_input_provider_page no longer fits one IPC reply — lower XRT_INPUT_PROVIDER_PAGE_MAX");
 
 /*!
  * XR_DXR_workspace_file_dialog wire format. Flat IPC translation of

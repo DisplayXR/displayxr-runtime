@@ -557,6 +557,11 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSubmitDesktopActionDXR, DXR_desktop_control);
 #endif
 
+#ifdef OXR_HAVE_DXR_input_providers
+	ENTRY_IF_EXT(xrEnumerateInputProvidersDXR, DXR_input_providers);
+	ENTRY_IF_EXT(xrSetInputProviderPreferenceDXR, DXR_input_providers);
+#endif
+
 #ifdef OXR_HAVE_DXR_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerDXR, DXR_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestDXR, DXR_workspace_file_dialog);

@@ -29,8 +29,10 @@
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_input_selection.h"
 
 #include "util/u_logging.h"
+#include "util/u_exe_basename.h"
 #include "util/u_pointer_sink.h"
 
 #include "os/os_threading.h"
@@ -54,18 +56,27 @@
  * conversion class's reserved names.
  */
 static bool
-input_is_reserved_subkey(const char *name)
+input_name_ieq(const char *name, const char *lower)
 {
-	static const char policy[] = "policy";
 	for (size_t i = 0;; i++) {
 		const char a = (char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + ('a' - 'A') : name[i]);
-		if (a != policy[i]) {
+		if (a != lower[i]) {
 			return false;
 		}
 		if (a == '\0') {
 			return true;
 		}
 	}
+}
+
+/*!
+ * `PerApp` holds the per-app pins (ADR-034 Amendment 5) — reserved too, so a
+ * machine-side `PerApp` key can never be read as a provider row.
+ */
+static bool
+input_is_reserved_subkey(const char *name)
+{
+	return input_name_ieq(name, "policy") || input_name_ieq(name, "perapp");
 }
 
 static const struct target_component_class g_input_class = {
@@ -643,6 +654,68 @@ target_input_plugin_get_row_id(int index)
 
 /*
  *
+ * Per-client selection policy (ADR-034 Amendment 5, #2181) — the pure part.
+ *
+ */
+
+static bool
+input_pref_set(const char *id)
+{
+	return id != NULL && id[0] != '\0';
+}
+
+enum target_input_pref_source
+target_input_resolve_preference(const struct target_input_pref_inputs *in, char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	if (in == NULL || in->providers_disabled) {
+		return TARGET_INPUT_PREF_NONE;
+	}
+	const char *id = NULL;
+	enum target_input_pref_source src = TARGET_INPUT_PREF_NONE;
+	// Under Policy\Lock the per-user pin and the app's own request are both
+	// invisible: the machine's PreferredPlugin (which the caller read with the
+	// lock applied) and ProbeOrder decide.
+	if (!in->lock && input_pref_set(in->app_pin) && in->app_pin_claims) {
+		id = in->app_pin;
+		src = TARGET_INPUT_PREF_APP_PIN;
+	} else if (!in->lock && input_pref_set(in->request) && in->request_claims) {
+		id = in->request;
+		src = TARGET_INPUT_PREF_REQUEST;
+	} else if (input_pref_set(in->user_default) && in->user_default_claims) {
+		id = in->user_default;
+		src = TARGET_INPUT_PREF_USER_DEFAULT;
+	}
+	if (id != NULL && out != NULL && cap > 0) {
+		snprintf(out, cap, "%s", id);
+	}
+	return src;
+}
+
+const char *
+target_input_pref_source_str(enum target_input_pref_source source)
+{
+	switch (source) {
+	case TARGET_INPUT_PREF_APP_PIN: return "app_pin";
+	case TARGET_INPUT_PREF_REQUEST: return "request";
+	case TARGET_INPUT_PREF_USER_DEFAULT: return "user_default";
+	case TARGET_INPUT_PREF_NONE:
+	default: return "none";
+	}
+}
+
+//! A provider id a pin may name: the CLI's rule (non-empty, fits, no separators / control chars).
+static bool
+input_pin_id_valid(const char *id)
+{
+	return u_exe_basename_valid(id, XRT_INPUT_PROVIDER_ID_SIZE);
+}
+
+
+/*
+ *
  * The ForceQwerty + EmulatedControllers gates (class-specific; the one
  * platform split left here).
  *
@@ -703,8 +776,13 @@ target_input_plugin_get_preferred(char *out, size_t cap)
 
 	wchar_t wbuf[64];
 	DWORD wbuf_bytes = sizeof(wbuf);
-	LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
-	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	// ADR-034 Am.5 precedence: `Policy\Lock` sits above every per-user value of
+	// the class, the user default included — under it only HKLM is read.
+	LSTATUS rc = ERROR_FILE_NOT_FOUND;
+	if (!target_component_policy_lock(&g_input_class)) {
+		rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	}
 	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
 		wbuf_bytes = sizeof(wbuf);
 		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
@@ -717,6 +795,131 @@ target_input_plugin_get_preferred(char *out, size_t cap)
 		out[0] = '\0';
 	}
 	return out[0] != '\0';
+}
+
+/*
+ * ADR-034 Am.5: the per-app pin — HKCU `InputProviders\PerApp\<exe>\PreferredPlugin`,
+ * hidden under `Policy\Lock` (HKCU is invisible to every rule of this class then).
+ */
+#define INPUT_PERAPP_ROOT_W L"Software\\DisplayXR\\InputProviders\\PerApp"
+
+static bool
+input_perapp_key_path(const char *exe_basename, wchar_t *out, size_t cap_chars)
+{
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return false;
+	}
+	wchar_t wexe[XRT_INPUT_EXE_BASENAME_SIZE];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, exe_basename, -1, wexe,
+	                        (int)(sizeof(wexe) / sizeof(wexe[0]))) <= 0) {
+		return false;
+	}
+	return _snwprintf(out, cap_chars, L"%ls\\%ls", INPUT_PERAPP_ROOT_W, wexe) > 0;
+}
+
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (target_component_policy_lock(&g_input_class)) {
+		return false;
+	}
+	wchar_t path[256];
+	if (!input_perapp_key_path(exe_basename, path, sizeof(path) / sizeof(path[0]))) {
+		return false;
+	}
+	wchar_t wbuf[64];
+	DWORD bytes = sizeof(wbuf);
+	if (RegGetValueW(HKEY_CURRENT_USER, path, L"PreferredPlugin", RRF_RT_REG_SZ, NULL, wbuf, &bytes) !=
+	        ERROR_SUCCESS ||
+	    wbuf[0] == L'\0') {
+		return false;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
+		out[0] = '\0';
+	}
+	return out[0] != '\0';
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	const bool clear = provider_id == NULL || provider_id[0] == '\0';
+	if (!clear && !input_pin_id_valid(provider_id)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	wchar_t path[256];
+	if (!input_perapp_key_path(exe_basename, path, sizeof(path) / sizeof(path[0]))) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	if (clear) {
+		// Remove the app's whole key: it holds nothing but the pin.
+		const LSTATUS rc = RegDeleteTreeW(HKEY_CURRENT_USER, path);
+		if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) {
+			return TARGET_INPUT_PIN_WRITE_OK;
+		}
+		return rc == ERROR_ACCESS_DENIED ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+	}
+	wchar_t wid[64];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, provider_id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <=
+	    0) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	HKEY key = NULL;
+	LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
+	if (rc == ERROR_SUCCESS) {
+		rc = RegSetValueExW(key, L"PreferredPlugin", 0, REG_SZ, (const BYTE *)wid,
+		                    (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t)));
+		RegCloseKey(key);
+	}
+	if (rc == ERROR_SUCCESS) {
+		return TARGET_INPUT_PIN_WRITE_OK;
+	}
+	return rc == ERROR_ACCESS_DENIED ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+}
+
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	HKEY root = NULL;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, INPUT_PERAPP_ROOT_W, 0, KEY_READ, &root) != ERROR_SUCCESS) {
+		return 0;
+	}
+	int n = 0;
+	for (DWORD i = 0; n < max; i++) {
+		wchar_t name[256];
+		DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+		const LSTATUS rc = RegEnumKeyExW(root, i, name, &name_len, NULL, NULL, NULL, NULL);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS) {
+			continue;
+		}
+		wchar_t wbuf[64];
+		DWORD bytes = sizeof(wbuf);
+		if (RegGetValueW(root, name, L"PreferredPlugin", RRF_RT_REG_SZ, NULL, wbuf, &bytes) != ERROR_SUCCESS ||
+		    wbuf[0] == L'\0') {
+			continue;
+		}
+		struct target_input_app_pin *pin = &out[n];
+		memset(pin, 0, sizeof(*pin));
+		if (WideCharToMultiByte(CP_UTF8, 0, name, -1, pin->exe_basename, (int)sizeof(pin->exe_basename), NULL,
+		                        NULL) <= 0 ||
+		    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, pin->provider_id, (int)sizeof(pin->provider_id), NULL,
+		                        NULL) <= 0) {
+			continue;
+		}
+		n++;
+	}
+	RegCloseKey(root);
+	return n;
 }
 
 #elif defined(XRT_OS_ANDROID)
@@ -745,9 +948,38 @@ target_input_plugin_get_preferred(char *out, size_t cap)
 	return false; // no per-user store on Android: ProbeOrder (the file name) is the only ranking
 }
 
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	(void)exe_basename;
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	return false; // no per-user store on Android
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	(void)exe_basename;
+	(void)provider_id;
+	return TARGET_INPUT_PIN_WRITE_UNSUPPORTED;
+}
+
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
+{
+	(void)out;
+	(void)max;
+	return 0;
+}
+
 #else /* POSIX: macOS / desktop Linux */
 
+#include <dirent.h>
+#include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 bool
 target_input_plugin_get_force_qwerty(void)
@@ -842,6 +1074,139 @@ target_input_plugin_get_preferred(char *out, size_t cap)
 	}
 	snprintf(out, cap, "%s", buf);
 	return out[0] != '\0';
+}
+
+/*
+ * ADR-034 Am.5: the per-app pin — a one-line `input-preferred-<exe-basename>`
+ * file next to `input-preferred` (same trim rule). No lock tier on POSIX.
+ */
+#define INPUT_PERAPP_PREFIX "input-preferred-"
+
+static bool
+input_perapp_file(const char *exe_basename, char *out, size_t cap, bool create_dir)
+{
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return false;
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	if (create_dir) {
+		// Best-effort mkdir -p: a fresh box has no per-user dir yet.
+		char tmp[PATH_MAX];
+		snprintf(tmp, sizeof(tmp), "%s", dir);
+		for (char *p = tmp + 1; *p != '\0'; p++) {
+			if (*p == '/') {
+				*p = '\0';
+				(void)mkdir(tmp, 0755);
+				*p = '/';
+			}
+		}
+		(void)mkdir(tmp, 0755);
+	}
+	const int n = snprintf(out, cap, "%s/" INPUT_PERAPP_PREFIX "%s", dir, exe_basename);
+	return n > 0 && (size_t)n < cap;
+}
+
+//! Read a one-line id file, trimmed; "" when absent / empty.
+static bool
+input_read_id_file(const char *path, char *out, size_t cap)
+{
+	out[0] = '\0';
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[64] = {0};
+	size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[got] = '\0';
+	size_t len = strlen(buf);
+	while (len > 0 &&
+	       (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+		buf[--len] = '\0';
+	}
+	snprintf(out, cap, "%s", buf);
+	return out[0] != '\0';
+}
+
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	char path[PATH_MAX];
+	if (!input_perapp_file(exe_basename, path, sizeof(path), false)) {
+		return false;
+	}
+	return input_read_id_file(path, out, cap);
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	const bool clear = provider_id == NULL || provider_id[0] == '\0';
+	if (!clear && !input_pin_id_valid(provider_id)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	char path[PATH_MAX];
+	if (!input_perapp_file(exe_basename, path, sizeof(path), !clear)) {
+		return clear ? TARGET_INPUT_PIN_WRITE_OK : TARGET_INPUT_PIN_WRITE_UNSUPPORTED;
+	}
+	if (clear) {
+		if (remove(path) != 0 && errno != ENOENT) {
+			return errno == EACCES ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+		}
+		return TARGET_INPUT_PIN_WRITE_OK;
+	}
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return errno == EACCES ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+	}
+	fprintf(f, "%s\n", provider_id);
+	fclose(f);
+	return TARGET_INPUT_PIN_WRITE_OK;
+}
+
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return 0;
+	}
+	DIR *d = opendir(dir);
+	if (d == NULL) {
+		return 0;
+	}
+	int n = 0;
+	const size_t plen = strlen(INPUT_PERAPP_PREFIX);
+	struct dirent *ent;
+	while (n < max && (ent = readdir(d)) != NULL) {
+		if (strncmp(ent->d_name, INPUT_PERAPP_PREFIX, plen) != 0) {
+			continue;
+		}
+		const char *exe = ent->d_name + plen;
+		struct target_input_app_pin *pin = &out[n];
+		memset(pin, 0, sizeof(*pin));
+		if (!u_exe_basename_valid(exe, sizeof(pin->exe_basename)) ||
+		    !target_input_plugin_get_app_pin(exe, pin->provider_id, sizeof(pin->provider_id))) {
+			continue;
+		}
+		snprintf(pin->exe_basename, sizeof(pin->exe_basename), "%s", exe);
+		n++;
+	}
+	closedir(d);
+	return n;
 }
 
 #endif /* platform-specific gate */
