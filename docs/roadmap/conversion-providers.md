@@ -528,7 +528,7 @@ again after 551 ms.
 | Win · D3D11 IPC session (browser) | session IPC | NT-handle snapshot slot / NT export texture | keyed mutex on the input import; `ID3D11Fence` NT | **yes** (v3) |
 | Win · D3D12 / D3D11 in-process (Unity, Unreal) | ADR-049 lift link | app texture as NT handle / NT texture + fence | D3D fence | **yes** |
 | Win · OpenGL, Vulkan | generalised link | v1: CPU bytes (a file mapping) in and out. Later: runtime-allocated NT input ring, imported via `GL_EXT_memory_object_win32` / `VK_KHR_external_memory_win32` | v1: none (`CPU_COMPLETE`). Later: external semaphore on a D3D fence | v1 **yes** (CPU); GPU P5 |
-| Linux · Vulkan / GL | session or link | CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out, every session. In-process **Vulkan** sessions also: an `OPAQUE_FD` allocation or a single-plane dma-buf in, an `OPAQUE_FD` export image out (no dma-buf export: `XrLiftResultExportDXR` cannot carry a modifier) | in: `CPU_COMPLETE`, sync_file, timeline semaphore fd (waited for on the service's GPU); out: `CPU_COMPLETE` | CPU v1 **yes** (built, not run on a Linux box yet). GPU kinds **done in code (step E)**, compiled in a container and their tests compiled in; **not run on Linux hardware** (Intel / Mesa first). Providers on the CPU lane |
+| Linux · Vulkan / GL | session or link | CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out, every session. In-process **Vulkan** sessions also: an `OPAQUE_FD` allocation or a single-plane dma-buf in, an `OPAQUE_FD` export image out (no dma-buf export: `XrLiftResultExportDXR` cannot carry a modifier) | in: `CPU_COMPLETE`, sync_file, timeline semaphore fd (waited for on the service's GPU); out: `CPU_COMPLETE` | CPU v1 **yes** (built, not run on a Linux box yet). GPU kinds **done in code (step E)**: the glue's OPAQUE_FD in / out cases pass on lavapipe in a container, dma-buf SKIPs there (no modifiers); **not run on Linux hardware** (Intel / Mesa first), nor the fd transfer and sync waits end to end. Providers on the CPU lane |
 | macOS · Metal / MoltenVK / GL | session or link | CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out, every session. In-process **Vulkan** sessions also: a global IOSurface in, a global IOSurface export out (`VK_EXT_metal_objects`; **no opaque fd: MoltenVK has no `VK_KHR_external_memory_fd`**) | in / out: `CPU_COMPLETE` (`MTLSharedEvent` input not taken yet); the service's own S5 results hand over on an `MTLSharedEvent` to the Metal weave backend | **yes (step E)**: verified with the sim provider, direct and composed, `cube_handle_vk_macos --lift-gpu` (IOSurface over AF_UNIX by global ID, export byte-exact) |
 | Android · Vulkan | binder bootstrap to `:conversion`, then a socketpair | AHardwareBuffer | sync_fd | P5 |
 | any · CPU (CLI, MCP, jobs) | DIAG / APP connection | shm image / inline, shm or caller handle | none | partial |
@@ -1178,8 +1178,9 @@ Still open:
 - The depth-aware cursor on lifted rects (ADR-046 Amendment 1). No POSIX weave engine draws a
   cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
 - Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
-  second) and lavapipe in CI. The step E Linux paths (OPAQUE_FD / DMABUF import, OPAQUE_FD
-  export, sync_file / timeline waits) have only been compiled.
+  second) and lavapipe in CI. Of the step E Linux paths only the glue's OPAQUE_FD import /
+  export has run (lavapipe, in a container); dma-buf import, the sync_file / timeline waits and
+  the client fd path have only been compiled.
 
 Details: [`docs/reference/vulkan-conversion-glue.md`](../reference/vulkan-conversion-glue.md).
 

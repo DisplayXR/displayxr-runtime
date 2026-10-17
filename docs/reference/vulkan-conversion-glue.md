@@ -344,7 +344,12 @@ logs `[conv] Vulkan glue: lifted weave rects on`.
     `--lift`, the export IOSurface imported by the app, its rows byte-exact against the surface's
     CPU view. `weave_probe_vk_macos --lift` with `DXR_WEAVE_MAC_BACKEND=metal` on the composed
     path (asynchronous S5): PASS.
-- Linux: the step E paths are compiled (an Ubuntu 24.04 container) but have not run on hardware.
+- Linux, in an Ubuntu 24.04 container on lavapipe (arm64): the whole tree builds, and
+  `tests_conv_vk_gpu` passes 14 of 15 cases. The OPAQUE_FD transport cases (an image in the
+  contract's shape into CPU and GPU slots, an OPAQUE_FD export re-imported byte-exact) and the
+  weave GPU snapshot with an OPAQUE_FD slot pass; the dma-buf case SKIPs (lavapipe offers no DRM
+  format modifiers). Not run: real Linux hardware (Intel / Mesa first), the fd transfer over the
+  IPC socket, the oxr client path, and the sync_file / timeline waits.
 
 ### Validated
 
