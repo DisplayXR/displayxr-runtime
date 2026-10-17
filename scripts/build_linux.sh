@@ -250,6 +250,29 @@ else
   echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
 fi
 
+# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux has no pad reader
+# yet (evdev follow-up): the provider DECLINES at probe, so staging the
+# manifest costs nothing and the dev tree matches macOS / Windows.
+GAMEPAD_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f | head -1)"
+if [ -n "$GAMEPAD_PLUGIN" ]; then
+  cp "$GAMEPAD_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-Gamepad.so",
+        "probe_order":  150
+    }
+}
+EOF
+else
+  echo "Note: DisplayXR-Gamepad.so not found — no gamepad provider staged."
+fi
+
 # Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
 # Same search dir; the `-conversion-provider.json` suffix routes the manifest
 # to the conversion loader (the DP and input loaders skip it). Staging it is

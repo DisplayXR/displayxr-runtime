@@ -1132,6 +1132,12 @@ client_dll_ok:
 	SetOutPath "$INSTDIR\plugins"
 	File "${BIN_DIR}\plugins\DisplayXR-SimInput.dll"
 	File "${BIN_DIR}\plugins\DisplayXR-SimConversion.dll"
+	; The gamepad input provider (ADR-034 / ADR-054): XInput, presence-gated
+	; — inert until a pad is attached, then the pad takes the gamepad role,
+	; drives the rig and (by default) holds the hand roles with an emulated
+	; controller pair. ProbeOrder 150: a real tracking vendor (50) outranks
+	; it, it outranks sim-input (200). Allowlisted below with the sims.
+	File "${BIN_DIR}\plugins\DisplayXR-Gamepad.dll"
 	; ADR-053 P4 (#2108): the sim's fake model pack (its DOWNLOAD_MS knob
 	; drives the model store's write protocol through it).
 	File "${BIN_DIR}\plugins\sim-conversion.models.json"
@@ -1149,6 +1155,17 @@ client_dll_ok:
 		"ProbeOrder" 200
 	; Version LAST — the "row complete" marker (input-provider-discovery.md §3).
 	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Version" "${VERSION}"
+
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-Gamepad.dll"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"DisplayName" "DisplayXR Gamepad"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"ProbeOrder" 150
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
 		"Version" "${VERSION}"
 
 	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
@@ -1615,6 +1632,7 @@ Section "Uninstall"
 	; under the same roots belongs to its own installer (#1803), and the
 	; roots themselves are dropped only when nothing else is left in them.
 	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\sim-input"
+	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\gamepad"
 	DeleteRegKey HKLM "Software\DisplayXR\ConversionProviders\sim-conversion"
 	DeleteRegKey /ifempty HKLM "Software\DisplayXR\InputProviders"
 	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"

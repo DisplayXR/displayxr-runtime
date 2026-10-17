@@ -213,6 +213,32 @@ else
   echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
 fi
 
+# Gamepad input provider (ADR-034 / ADR-054): GameController.framework on
+# macOS. Presence-gated — staging it changes nothing until a pad is paired,
+# then the pad takes the gamepad role, drives the rig and (by default) holds
+# the hand roles with an emulated controller pair. ProbeOrder 150: below a
+# real tracking vendor (50), above sim-input (200).
+GAMEPAD_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.dylib" -type f | head -1)
+if [ -n "$GAMEPAD_PLUGIN" ] && [ -f "$GAMEPAD_PLUGIN" ]; then
+  cp "$GAMEPAD_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-Gamepad.dylib",
+        "probe_order":  150
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-Gamepad.dylib" 2>/dev/null || true
+else
+  echo "Note: DisplayXR-Gamepad.dylib not found — no gamepad provider in dev tree."
+fi
+
 # Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
 # The `-conversion-provider.json` suffix routes the manifest to the conversion
 # loader. Harmless to stage: probe() declines unless its ENABLE setting is 1
