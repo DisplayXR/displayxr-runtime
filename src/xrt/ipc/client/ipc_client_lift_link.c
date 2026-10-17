@@ -94,7 +94,13 @@ connect_run(void *ptr)
 			// An ordinary APP connection that never creates a session: the
 			// service's lift handlers admit APP, and nothing else is asked of it.
 			ii.app_info.declared_client_class = XRT_CLIENT_CLASS_APP;
-			xret = ipc_client_connection_init(c, U_LOGGING_ERROR, &ii);
+			// Dial quietly: with no service every retry would otherwise log
+			// the connect helpers' two ERRORs. connect_run's one WARN says it
+			// instead; a made connection logs its errors as usual.
+			xret = ipc_client_connection_init(c, U_LOGGING_RAW, &ii);
+			if (xret == XRT_SUCCESS) {
+				c->imc.log_level = U_LOGGING_ERROR;
+			}
 		}
 	}
 
@@ -111,16 +117,18 @@ connect_run(void *ptr)
 		link->gen++;
 		link->state = IPC_CLIENT_LIFT_LINK_CONNECTED;
 		link->warned_unavailable = false;
-		U_LOG_W("[lift] in-process: lift-only service connection up (generation %u)", link->gen);
+		U_LOG_I("[lift] in-process: lift-only service connection up (generation %u)", link->gen);
 	} else {
 		free(c); // init already finalised a half-made connection
 		link->state = IPC_CLIENT_LIFT_LINK_FAILED;
 		link->retry_after_ns = os_monotonic_get_ns() + LIFT_LINK_RETRY_NS;
 		if (!link->warned_unavailable) {
 			link->warned_unavailable = true;
+			// Once until the next successful connect: the retries are quiet.
 			U_LOG_W(
-			    "[lift] in-process: no service connection for 2D->3D conversion (%s) — lift reports "
-			    "UNAVAILABLE; retrying every %u s",
+			    "[lift] in-process: no conversion service (%s); in-process conversion unavailable, "
+			    "retrying "
+			    "quietly every %u s",
 			    c == NULL ? "service not running" : "connect refused or failed",
 			    (unsigned)(LIFT_LINK_RETRY_NS / 1000000000ull));
 		}
