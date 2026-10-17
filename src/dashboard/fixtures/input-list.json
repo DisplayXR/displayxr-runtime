@@ -1,0 +1,31 @@
+{
+ "force_qwerty": false,
+ "emulated_controllers": {"value": 1, "source": "default"},
+ "preferred": null,
+ "preferred_source": "user over machine",
+ "policy": {"policy_lock": false},
+ "per_app": [
+  {"app": "MediaPlayer.exe", "preferred": "sim-input", "registered": true},
+  {"app": "Viewer.exe", "preferred": "emulated", "registered": true}
+ ],
+ "holders": [
+  {"client": 3, "app": "MediaPlayer.exe", "generation": 4,
+   "holders": {"controllers": "sim-input", "hand_tracking": "hand-tracker", "gamepad": null},
+   "preferred": {"controllers": "sim-input", "hand_tracking": null, "gamepad": null}},
+  {"client": 5, "app": "Earth.exe", "generation": 2,
+   "holders": {"controllers": "hand-tracker", "hand_tracking": "hand-tracker", "gamepad": "gamepad"},
+   "preferred": {"controllers": null, "hand_tracking": null, "gamepad": null}}
+ ],
+ "clients_dropped": 0,
+ "providers": [
+  {"id": "hand-tracker", "display_name": "Desk Hand Tracker", "vendor": "", "version": "1.0.0", "probe_order": 50,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Input\\HandTracker.dll", "enabled": true, "enabled_source": "default",
+   "provenance": "signed", "provenance_reason": "Authenticode", "signer": "Example Signer", "preferred": false, "active": true},
+  {"id": "gamepad", "display_name": "Gamepad", "vendor": "DisplayXR", "version": "1.0.0", "probe_order": 150,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR-Gamepad.dll", "enabled": true, "enabled_source": "default",
+   "provenance": "allowlisted", "provenance_reason": "allowlisted by the installer", "signer": "", "preferred": false, "active": false},
+  {"id": "sim-input", "display_name": "DisplayXR Sim Input", "vendor": "DisplayXR", "version": "dev", "probe_order": 200,
+   "binary_path": "C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR-SimInput.dll", "enabled": true, "enabled_source": "default",
+   "provenance": "allowlisted", "provenance_reason": "allowlisted by the installer", "signer": "", "preferred": false, "active": false}
+ ]
+}
