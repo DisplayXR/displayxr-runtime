@@ -1121,6 +1121,640 @@ TEST_CASE("vk glue under the CPU I/O table: one POSIX table, composed views expo
 	conv_fake_fini(&f);
 }
 
+/*
+ *
+ * Step E: the client GPU transport (IOSurface on macOS; OPAQUE_FD / dma-buf on
+ * Linux) through the CPU I/O table, with the glue's hooks.
+ *
+ */
+
+namespace {
+
+bool
+t_import(void *ud, const conv_input_import *in, const xrt_conv_image *dst)
+{
+	return vk_conv_gpu_import_input(static_cast<vk_conv_gpu *>(ud), in, dst);
+}
+
+bool
+t_export_alloc(void *ud, uint32_t kind, uint32_t fmt, uint32_t w, uint32_t h, uint64_t sid, xrt_conv_image *out)
+{
+	return vk_conv_gpu_export_alloc(static_cast<vk_conv_gpu *>(ud), kind, fmt, w, h, sid, out);
+}
+
+void
+t_export_free(void *ud, xrt_conv_image *img)
+{
+	conv_image_alloc_ops ops{};
+	vk_conv_gpu_alloc_ops(static_cast<vk_conv_gpu *>(ud), &ops);
+	ops.free(ops.ud, img);
+}
+
+bool
+t_copy(void *ud, const xrt_conv_image *src, const xrt_conv_image *dst)
+{
+	return vk_conv_gpu_copy(static_cast<vk_conv_gpu *>(ud), src, dst);
+}
+
+//! The POSIX service's I/O composition (ipc_server_conv_vk.c) without a core.
+struct TransportRig
+{
+	Glue x;
+	Tramp tr;
+	ipc_server_conv_io_ops cpu_io{};
+	bool ok = false;
+
+	bool
+	init()
+	{
+		if (!ipc_server_conv_cpu_io_get(&cpu_io) || !make_glue(x)) {
+			return false;
+		}
+		tr.gpu = x.ops;
+		ipc_server_conv_cpu_gpu h{};
+		h.write = hook_write;
+		h.read = hook_read;
+		h.ud = x.g;
+		h.import_kinds = vk_conv_gpu_import_kinds(x.g);
+		h.export_kinds = vk_conv_gpu_export_kinds(x.g);
+		h.import_copy = t_import;
+		h.export_alloc = t_export_alloc;
+		h.export_free = t_export_free;
+		h.copy = t_copy;
+		ipc_server_conv_cpu_io_set_gpu(&h);
+		ok = true;
+		return true;
+	}
+
+	~TransportRig()
+	{
+		if (ok) {
+			ipc_server_conv_cpu_io_set_gpu(nullptr);
+		}
+	}
+
+	vk_conv_gpu_stats
+	stats()
+	{
+		vk_conv_gpu_stats s{};
+		vk_conv_gpu_get_stats(x.g, &s);
+		return s;
+	}
+};
+
+//! Bytes that differ (0 = byte-exact); logs the first difference.
+size_t
+bytes_off(const std::vector<uint8_t> &got, const std::vector<uint8_t> &want)
+{
+	if (got.size() != want.size()) {
+		UNSCOPED_INFO("size " << got.size() << " != " << want.size());
+		return SIZE_MAX;
+	}
+	size_t n = 0;
+	for (size_t i = 0; i < got.size(); i++) {
+		if (got[i] != want[i]) {
+			if (n == 0) {
+				UNSCOPED_INFO("first difference at byte " << i << " (px " << i / 4 << " ch " << i % 4
+				                                          << "): got " << (int)got[i] << " want "
+				                                          << (int)want[i]);
+			}
+			n++;
+		}
+	}
+	return n;
+}
+
+//! A tightly packed RGBA8 pattern.
+std::vector<uint8_t>
+pattern(uint32_t w, uint32_t h, uint32_t salt)
+{
+	std::vector<uint8_t> px((size_t)w * h * 4);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			uint8_t *p = &px[((size_t)y * w + x) * 4];
+			p[0] = (uint8_t)(x * 7 + salt);
+			p[1] = (uint8_t)(y * 13 + salt * 3);
+			p[2] = (uint8_t)(x * y + salt);
+			p[3] = (uint8_t)(255 - x);
+		}
+	}
+	return px;
+}
+
+//! Region (@p x0, @p y0, @p w x @p h) of a @p sw wide RGBA8 / BGRA8 source, as RGBA8.
+std::vector<uint8_t>
+expect_region(const std::vector<uint8_t> &src, uint32_t sw, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, bool bgra)
+{
+	std::vector<uint8_t> out((size_t)w * h * 4);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			const uint8_t *s = &src[((size_t)(y0 + y) * sw + x0 + x) * 4];
+			uint8_t *d = &out[((size_t)y * w + x) * 4];
+			d[0] = bgra ? s[2] : s[0];
+			d[1] = s[1];
+			d[2] = bgra ? s[0] : s[2];
+			d[3] = s[3];
+		}
+	}
+	return out;
+}
+
+} // namespace
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+namespace {
+
+//! A global IOSurface (as an app hands one in: the transport carries its ID) holding @p px.
+IOSurfaceRef
+make_global_iosurface(uint32_t w, uint32_t h, uint32_t fourcc, const std::vector<uint8_t> &px)
+{
+	CFMutableDictionaryRef props =
+	    CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int iw = (int)w, ih = (int)h, bpe = 4;
+	CFNumberRef nw = CFNumberCreate(nullptr, kCFNumberIntType, &iw);
+	CFNumberRef nh = CFNumberCreate(nullptr, kCFNumberIntType, &ih);
+	CFNumberRef nb = CFNumberCreate(nullptr, kCFNumberIntType, &bpe);
+	CFNumberRef nf = CFNumberCreate(nullptr, kCFNumberSInt32Type, &fourcc);
+	CFDictionarySetValue(props, kIOSurfaceWidth, nw);
+	CFDictionarySetValue(props, kIOSurfaceHeight, nh);
+	CFDictionarySetValue(props, kIOSurfaceBytesPerElement, nb);
+	CFDictionarySetValue(props, kIOSurfacePixelFormat, nf);
+	CFDictionarySetValue(props, CFSTR("IOSurfaceIsGlobal"), kCFBooleanTrue);
+	IOSurfaceRef s = IOSurfaceCreate(props);
+	CFRelease(nw);
+	CFRelease(nh);
+	CFRelease(nb);
+	CFRelease(nf);
+	CFRelease(props);
+	if (s == nullptr) {
+		return nullptr;
+	}
+	IOSurfaceLock(s, 0, nullptr);
+	uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(s);
+	const size_t bpr = IOSurfaceGetBytesPerRow(s);
+	for (uint32_t y = 0; y < h; y++) {
+		memcpy(base + y * bpr, &px[(size_t)y * w * 4], (size_t)w * 4);
+	}
+	IOSurfaceUnlock(s, 0, nullptr);
+	return s;
+}
+
+//! An app's import of an IOSurface: VkImportMetalIOSurfaceInfoEXT, then the MTLTexture memory import.
+bool
+import_iosurface_app(struct vk_bundle *vk, IOSurfaceRef surf, VkFormat format, Image &img)
+{
+	VkExportMetalObjectCreateInfoEXT export_tex = {};
+	export_tex.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+	export_tex.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+	VkImportMetalIOSurfaceInfoEXT imp = {};
+	imp.sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT;
+	imp.pNext = &export_tex;
+	imp.ioSurface = surf;
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.pNext = &imp;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = format;
+	ici.extent = {(uint32_t)IOSurfaceGetWidth(surf), (uint32_t)IOSurfaceGetHeight(surf), 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	img.vk = vk;
+	img.w = ici.extent.width;
+	img.h = ici.extent.height;
+	img.format = format;
+	if (vk->vkCreateImage(vk->device, &ici, nullptr, &img.image) != VK_SUCCESS) {
+		return false;
+	}
+	VkExportMetalTextureInfoEXT et = {};
+	et.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT;
+	et.image = img.image;
+	et.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+	VkExportMetalObjectsInfoEXT eo = {};
+	eo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+	eo.pNext = &et;
+	vk->vkExportMetalObjectsEXT(vk->device, &eo);
+	VkMemoryMetalHandlePropertiesEXT mp = {};
+	mp.sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT;
+	if (et.mtlTexture == nullptr ||
+	    vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                                            et.mtlTexture, &mp) != VK_SUCCESS) {
+		return false;
+	}
+	uint32_t type = 0;
+	while (type < 32 && (mp.memoryTypeBits & (1u << type)) == 0) {
+		type++;
+	}
+	VkImportMemoryMetalHandleInfoEXT im = {};
+	im.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
+	im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+	im.handle = et.mtlTexture;
+	VkMemoryDedicatedAllocateInfoKHR ded = {};
+	ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR;
+	ded.pNext = &im;
+	ded.image = img.image;
+	VkMemoryAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	ai.pNext = &ded;
+	ai.allocationSize = 0;
+	ai.memoryTypeIndex = type;
+	return type < 32 && vk->vkAllocateMemory(vk->device, &ai, nullptr, &img.mem) == VK_SUCCESS &&
+	       vk->vkBindImageMemory(vk->device, img.image, img.mem, 0) == VK_SUCCESS;
+}
+
+//! The IOSurface's bytes, tightly packed.
+std::vector<uint8_t>
+iosurface_bytes(IOSurfaceRef s)
+{
+	const size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), bpr = IOSurfaceGetBytesPerRow(s);
+	std::vector<uint8_t> out(w * h * 4);
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, nullptr);
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(s);
+	for (size_t y = 0; y < h; y++) {
+		memcpy(&out[y * w * 4], base + y * bpr, w * 4);
+	}
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, nullptr);
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("transport (macOS): an IOSurface submit fills the slot -- a GPU slot with no host copy, a CPU slot with one",
+          "[conv_vk_gpu][transport][iosurface]")
+{
+	TransportRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport");
+	}
+	if ((vk_conv_gpu_import_kinds(rig.x.g) & XRT_CONV_MEM_IOSURFACE) == 0) {
+		SKIP("VK_EXT_metal_objects / VK_EXT_external_memory_metal not available");
+	}
+	CHECK(ipc_server_conv_cpu_io_gpu_image_kinds(false) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_IOSURFACE));
+	CHECK(ipc_server_conv_cpu_io_gpu_image_kinds(true) == (1ull << IPC_SERVER_CONV_IMAGE_KIND_IOSURFACE));
+
+	// A 40x24 BGRA IOSurface; the region (4,2 32x16) is what converts.
+	const uint32_t W = 40, H = 24, X = 4, Y = 2, RW = 32, RH = 16;
+	const std::vector<uint8_t> src = pattern(W, H, 5);
+	const std::vector<uint8_t> want = expect_region(src, W, X, Y, RW, RH, /*bgra*/ true);
+
+	auto submit = [&](const xrt_conv_image &dst) {
+		IOSurfaceRef s = make_global_iosurface(W, H, 'BGRA', src);
+		REQUIRE(s != nullptr);
+		conv_input_import in{};
+		in.kind = CONV_INPUT_IOSURFACE;
+		in.handle = (xrt_graphics_buffer_handle_t)s; // the table releases it, as the transport's lookup ref
+		in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		in.x = X;
+		in.y = Y;
+		in.w = RW;
+		in.h = RH;
+		in.img_w = W;
+		in.img_h = H;
+		in.img_format = XRT_CONV_FMT_BGRA8_UNORM;
+		conv_submit_slot slot{};
+		slot.image_count = 1;
+		slot.images[0] = dst;
+		return rig.cpu_io.import_input_ex(rig.cpu_io.ud, 1, &in, &slot);
+	};
+
+	SECTION("CPU slot (a provider on the CPU lane): one GPU blit, one readback, no upload")
+	{
+		auto r = req_of(RW, RH, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+		xrt_conv_image slot{};
+		REQUIRE(tr_alloc(&rig.tr, &r, &slot));
+		REQUIRE(slot.memory_kind == XRT_CONV_MEM_CPU);
+		const vk_conv_gpu_stats a = rig.stats();
+		REQUIRE(submit(slot) == XRT_SUCCESS);
+		const vk_conv_gpu_stats b = rig.stats();
+		CHECK(b.imports - a.imports == 1u);
+		CHECK(b.gpu_copies - a.gpu_copies == 1u);
+		CHECK(b.host_reads - a.host_reads == 1u);
+		CHECK(b.host_writes - a.host_writes == 0u);
+		std::vector<uint8_t> got((const uint8_t *)slot.cpu_ptr, (const uint8_t *)slot.cpu_ptr + want.size());
+		CHECK(bytes_off(got, want) == 0u);
+		tr_free(&rig.tr, &slot);
+	}
+	SECTION("GPU slot (a provider that imports IOSurfaces): the region copied GPU -> GPU, no host memory")
+	{
+		vk_conv_gpu_set_provider_kinds(rig.x.g, XRT_CONV_MEM_IOSURFACE);
+		CHECK(vk_conv_gpu_input_memory_kind(rig.x.g, XRT_CONV_MEM_IOSURFACE, 0) == XRT_CONV_MEM_IOSURFACE);
+		auto r = req_of(RW, RH, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT, 1, XRT_CONV_MEM_IOSURFACE);
+		xrt_conv_image slot{};
+		REQUIRE(rig.x.ops.alloc(rig.x.ops.ud, &r, &slot));
+		REQUIRE(slot.memory_kind == XRT_CONV_MEM_IOSURFACE);
+		const vk_conv_gpu_stats a = rig.stats();
+		REQUIRE(submit(slot) == XRT_SUCCESS);
+		const vk_conv_gpu_stats b = rig.stats();
+		CHECK(b.imports - a.imports == 1u);
+		CHECK(b.gpu_copies - a.gpu_copies == 1u);
+		CHECK(b.host_reads - a.host_reads == 0u); // the zero-copy claim: no host buffer touched
+		CHECK(b.host_writes - a.host_writes == 0u);
+		std::vector<uint8_t> got(want.size());
+		REQUIRE(vk_conv_gpu_read(rig.x.g, &slot, got.data(), 0));
+		CHECK(bytes_off(got, want) == 0u);
+		rig.x.ops.free(rig.x.ops.ud, &slot);
+		vk_conv_gpu_set_provider_kinds(rig.x.g, 0);
+	}
+	SECTION("a region outside the image is refused (the wire is not trusted)")
+	{
+		auto r = req_of(RW, RH, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+		xrt_conv_image slot{};
+		REQUIRE(tr_alloc(&rig.tr, &r, &slot));
+		IOSurfaceRef s = make_global_iosurface(16, 8, 'BGRA', pattern(16, 8, 1));
+		conv_input_import in{};
+		in.kind = CONV_INPUT_IOSURFACE;
+		in.handle = (xrt_graphics_buffer_handle_t)s;
+		in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		in.w = RW;
+		in.h = RH;
+		in.img_w = W; // a lie: the surface is 16x8
+		in.img_h = H;
+		in.img_format = XRT_CONV_FMT_BGRA8_UNORM;
+		conv_submit_slot cs{};
+		cs.image_count = 1;
+		cs.images[0] = slot;
+		CHECK(rig.cpu_io.import_input_ex(rig.cpu_io.ud, 1, &in, &cs) == XRT_ERROR_OUTPUT_REQUEST_FAILURE);
+		tr_free(&rig.tr, &slot);
+	}
+	CHECK(vk_conv_gpu_image_count(rig.x.g) == 0u);
+}
+
+TEST_CASE("transport (macOS): a GPU result exported as a global IOSurface, GPU -> GPU, and imported back byte-exact",
+          "[conv_vk_gpu][transport][iosurface]")
+{
+	TransportRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport");
+	}
+	if ((vk_conv_gpu_export_kinds(rig.x.g) & XRT_CONV_MEM_IOSURFACE) == 0) {
+		SKIP("VK_EXT_metal_objects / VK_EXT_external_memory_metal not available");
+	}
+	struct vk_bundle *vk = rig.x.vk.get();
+	// The composed views as S5 leaves them: a runtime-only GPU image, 2 views in a row.
+	const uint32_t W = 64, H = 16;
+	auto r = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET, 1, 0, 77);
+	r.role = XRT_CONV_OUT_VIEWS;
+	xrt_conv_image views{};
+	REQUIRE(rig.x.ops.alloc(rig.x.ops.ud, &r, &views));
+	const std::vector<uint8_t> px = pattern(W, H, 9);
+	REQUIRE(vk_conv_gpu_write(rig.x.g, &views, px.data(), 0));
+
+	const uint64_t sid = 77;
+	ipc_server_conv_cpu_io_stream_export(sid, XRT_CONV_MEM_IOSURFACE);
+	conv_result res{};
+	res.written = XRT_CONV_OUT_VIEWS;
+	res.views = views;
+	res.views_info.layout = XRT_CONV_VIEWS_ROW;
+	res.views_info.view_count = 2;
+
+	const vk_conv_gpu_stats a = rig.stats();
+	ipc_server_conv_published pub{};
+	REQUIRE(rig.cpu_io.publish_result(rig.cpu_io.ud, sid, &res, &pub) == XRT_SUCCESS);
+	const vk_conv_gpu_stats b = rig.stats();
+	CHECK(pub.realloc);
+	CHECK(pub.width == W);
+	CHECK(pub.height == H);
+	CHECK(b.gpu_copies - a.gpu_copies == 1u); // the result -> the export image, on the GPU
+	CHECK(b.host_reads - a.host_reads == 0u); // no readback (the CPU export reads one back)
+	CHECK(b.host_writes - a.host_writes == 0u);
+
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	uint32_t ew = 0, eh = 0, ef = 0;
+	REQUIRE(rig.cpu_io.export_output(rig.cpu_io.ud, sid, false, &h, &ew, &eh, &ef));
+	CHECK(ew == W);
+	CHECK(eh == H);
+	CHECK(ef == 28u); // DXGI_FORMAT_R8G8B8A8_UNORM, as the CPU export reports it
+	IOSurfaceRef surf = (IOSurfaceRef)h;
+	REQUIRE(surf != nullptr);
+	// Global: a peer process finds it by ID (what the transport carries).
+	IOSurfaceRef looked = IOSurfaceLookup(IOSurfaceGetID(surf));
+	REQUIRE(looked != nullptr);
+	CFRelease(looked);
+	CHECK(bytes_off(iosurface_bytes(surf), px) == 0u); // the CPU view of the export
+
+	// The app's side: import the IOSurface into its own VkImage and read it
+	// (VkImportMetalIOSurfaceInfoEXT + the MTLTexture memory import).
+	Image app;
+	REQUIRE(import_iosurface_app(vk, surf, VK_FORMAT_R8G8B8A8_UNORM, app));
+	struct vk_cmd_pool pool = {};
+	REQUIRE(vk_cmd_pool_init(vk, &pool, 0) == VK_SUCCESS);
+	REQUIRE(run_cmd(vk, &pool, [&](VkCommandBuffer cmd) {
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vk_cmd_image_barrier_locked(vk, cmd, app.image, 0, VK_ACCESS_TRANSFER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, range);
+		return true;
+	}));
+	std::vector<uint8_t> back(px.size());
+	REQUIRE(readback(vk, &pool, app, back.data(), back.size()));
+	vk_cmd_pool_destroy(vk, &pool);
+	CHECK(bytes_off(back, px) == 0u);
+
+	// The next result of the same extent reuses the image (no realloc, same surface).
+	const std::vector<uint8_t> px2 = pattern(W, H, 33);
+	REQUIRE(vk_conv_gpu_write(rig.x.g, &views, px2.data(), 0));
+	ipc_server_conv_published pub2{};
+	REQUIRE(rig.cpu_io.publish_result(rig.cpu_io.ud, sid, &res, &pub2) == XRT_SUCCESS);
+	CHECK_FALSE(pub2.realloc);
+	xrt_graphics_buffer_handle_t h2 = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	REQUIRE(rig.cpu_io.export_output(rig.cpu_io.ud, sid, false, &h2, nullptr, nullptr, nullptr));
+	CHECK(h2 == h);
+	CHECK(bytes_off(iosurface_bytes(surf), px2) == 0u);
+
+	// A CPU-memory result (a provider that emits views itself) is uploaded into it.
+	std::vector<uint8_t> cpu_px = pattern(W, H, 71);
+	conv_result cres = res;
+	cres.views.memory_kind = XRT_CONV_MEM_CPU;
+	cres.views.cpu_ptr = cpu_px.data();
+	cres.views.byte_size = cpu_px.size();
+	cres.views.row_stride = W * 4;
+	cres.views.import_key = 1ull << 63;
+	ipc_server_conv_published pub3{};
+	REQUIRE(rig.cpu_io.publish_result(rig.cpu_io.ud, sid, &cres, &pub3) == XRT_SUCCESS);
+	CHECK(bytes_off(iosurface_bytes(surf), cpu_px) == 0u);
+
+	rig.cpu_io.stream_gone(rig.cpu_io.ud, sid);
+	rig.x.ops.free(rig.x.ops.ud, &views);
+	CHECK(vk_conv_gpu_image_count(rig.x.g) == 0u); // the export image went with the stream
+}
+#endif // XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+TEST_CASE("transport (Linux): an OPAQUE_FD image in the contract's shape fills the slot, CPU and GPU",
+          "[conv_vk_gpu][transport][opaque_fd]")
+{
+	TransportRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport");
+	}
+	if ((vk_conv_gpu_import_kinds(rig.x.g) & XRT_CONV_MEM_VK_OPAQUE_FD) == 0 ||
+	    (vk_conv_gpu_export_kinds(rig.x.g) & XRT_CONV_MEM_VK_OPAQUE_FD) == 0) {
+		SKIP("VK_KHR_external_memory_fd not available (OPAQUE_FD)");
+	}
+	// The app's image: the glue's own OPAQUE_FD export has the contract's
+	// creation parameters, so it stands in for the app's allocation.
+	const uint32_t W = 40, H = 24, X = 4, Y = 2, RW = 32, RH = 16;
+	xrt_conv_image app{};
+	REQUIRE(vk_conv_gpu_export_alloc(rig.x.g, XRT_CONV_MEM_VK_OPAQUE_FD, XRT_CONV_FMT_RGBA8_UNORM, W, H, 5, &app));
+	const std::vector<uint8_t> src = pattern(W, H, 3);
+	REQUIRE(vk_conv_gpu_write(rig.x.g, &app, src.data(), 0));
+	const std::vector<uint8_t> want = expect_region(src, W, X, Y, RW, RH, false);
+
+	auto submit = [&](const xrt_conv_image &dst) {
+		conv_input_import in{};
+		in.kind = CONV_INPUT_OPAQUE_FD;
+		in.handle = dup((int)app.handle); // what the transport delivers: the table closes it
+		in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		in.x = X;
+		in.y = Y;
+		in.w = RW;
+		in.h = RH;
+		in.img_w = W;
+		in.img_h = H;
+		in.img_format = XRT_CONV_FMT_RGBA8_UNORM;
+		conv_submit_slot slot{};
+		slot.image_count = 1;
+		slot.images[0] = dst;
+		return rig.cpu_io.import_input_ex(rig.cpu_io.ud, 1, &in, &slot);
+	};
+	{
+		auto r = req_of(RW, RH, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+		xrt_conv_image slot{};
+		REQUIRE(tr_alloc(&rig.tr, &r, &slot));
+		REQUIRE(submit(slot) == XRT_SUCCESS);
+		std::vector<uint8_t> got((const uint8_t *)slot.cpu_ptr, (const uint8_t *)slot.cpu_ptr + want.size());
+		CHECK(bytes_off(got, want) == 0u);
+		tr_free(&rig.tr, &slot);
+	}
+	{
+		vk_conv_gpu_set_provider_kinds(rig.x.g, XRT_CONV_MEM_VK_OPAQUE_FD);
+		auto r = req_of(RW, RH, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT, 1, XRT_CONV_MEM_VK_OPAQUE_FD);
+		xrt_conv_image slot{};
+		REQUIRE(rig.x.ops.alloc(rig.x.ops.ud, &r, &slot));
+		const vk_conv_gpu_stats a = rig.stats();
+		REQUIRE(submit(slot) == XRT_SUCCESS);
+		const vk_conv_gpu_stats b = rig.stats();
+		CHECK(b.host_reads - a.host_reads == 0u);
+		CHECK(b.host_writes - a.host_writes == 0u);
+		std::vector<uint8_t> got(want.size());
+		REQUIRE(vk_conv_gpu_read(rig.x.g, &slot, got.data(), 0));
+		CHECK(bytes_off(got, want) == 0u);
+		rig.x.ops.free(rig.x.ops.ud, &slot);
+		vk_conv_gpu_set_provider_kinds(rig.x.g, 0);
+	}
+	t_export_free(rig.x.g, &app);
+	CHECK(vk_conv_gpu_image_count(rig.x.g) == 0u);
+}
+
+TEST_CASE("transport (Linux): an OPAQUE_FD result export re-imports with the contract's parameters",
+          "[conv_vk_gpu][transport][opaque_fd]")
+{
+	TransportRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport");
+	}
+	if ((vk_conv_gpu_export_kinds(rig.x.g) & XRT_CONV_MEM_VK_OPAQUE_FD) == 0) {
+		SKIP("VK_KHR_external_memory_fd not available (OPAQUE_FD)");
+	}
+	CHECK((ipc_server_conv_cpu_io_gpu_image_kinds(true) & (1ull << IPC_SERVER_CONV_IMAGE_KIND_DMABUF)) == 0u);
+	const uint32_t W = 64, H = 16;
+	auto r = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_RENDER_TARGET, 1, 0, 88);
+	r.role = XRT_CONV_OUT_VIEWS;
+	xrt_conv_image views{};
+	REQUIRE(rig.x.ops.alloc(rig.x.ops.ud, &r, &views));
+	const std::vector<uint8_t> px = pattern(W, H, 17);
+	REQUIRE(vk_conv_gpu_write(rig.x.g, &views, px.data(), 0));
+	ipc_server_conv_cpu_io_stream_export(88, XRT_CONV_MEM_VK_OPAQUE_FD);
+	conv_result res{};
+	res.written = XRT_CONV_OUT_VIEWS;
+	res.views = views;
+	res.views_info.layout = XRT_CONV_VIEWS_ROW;
+	res.views_info.view_count = 2;
+	const vk_conv_gpu_stats a = rig.stats();
+	ipc_server_conv_published pub{};
+	REQUIRE(rig.cpu_io.publish_result(rig.cpu_io.ud, 88, &res, &pub) == XRT_SUCCESS);
+	const vk_conv_gpu_stats b = rig.stats();
+	CHECK(b.host_reads - a.host_reads == 0u);
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	REQUIRE(rig.cpu_io.export_output(rig.cpu_io.ud, 88, false, &h, nullptr, nullptr, nullptr));
+	REQUIRE(h >= 0);
+	// The app's side: the export fd into a slot through the import path (the
+	// contract's creation parameters on both ends), compared byte-exact.
+	auto sr = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+	xrt_conv_image slot{};
+	REQUIRE(tr_alloc(&rig.tr, &sr, &slot));
+	conv_input_import in{};
+	in.kind = CONV_INPUT_OPAQUE_FD;
+	in.handle = dup(h);
+	in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	in.w = W;
+	in.h = H;
+	in.img_w = W;
+	in.img_h = H;
+	in.img_format = XRT_CONV_FMT_RGBA8_UNORM;
+	conv_submit_slot cs{};
+	cs.image_count = 1;
+	cs.images[0] = slot;
+	REQUIRE(rig.cpu_io.import_input_ex(rig.cpu_io.ud, 1, &in, &cs) == XRT_SUCCESS);
+	std::vector<uint8_t> got((const uint8_t *)slot.cpu_ptr, (const uint8_t *)slot.cpu_ptr + px.size());
+	CHECK(bytes_off(got, px) == 0u);
+	tr_free(&rig.tr, &slot);
+	rig.cpu_io.stream_gone(rig.cpu_io.ud, 88);
+	rig.x.ops.free(rig.x.ops.ud, &views);
+	CHECK(vk_conv_gpu_image_count(rig.x.g) == 0u);
+}
+#endif // XRT_GRAPHICS_BUFFER_HANDLE_IS_FD
+
+#if defined(XRT_OS_LINUX_DESKTOP)
+TEST_CASE("transport (Linux): a single-plane dma-buf fills the slot", "[conv_vk_gpu][transport][dmabuf]")
+{
+	TransportRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport");
+	}
+	if ((vk_conv_gpu_import_kinds(rig.x.g) & XRT_CONV_MEM_DMABUF) == 0) {
+		SKIP("VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier not available");
+	}
+	// The app's dma-buf: a glue DMABUF image (single-plane modifier, offset 0).
+	vk_conv_gpu_set_provider_kinds(rig.x.g, XRT_CONV_MEM_DMABUF);
+	const uint32_t W = 40, H = 24;
+	auto ar = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT, 1, XRT_CONV_MEM_DMABUF, 6);
+	xrt_conv_image app{};
+	if (!rig.x.ops.alloc(rig.x.ops.ud, &ar, &app) || app.memory_kind != XRT_CONV_MEM_DMABUF) {
+		vk_conv_gpu_set_provider_kinds(rig.x.g, 0);
+		SKIP("no exportable single-plane dma-buf modifier for RGBA8");
+	}
+	vk_conv_gpu_set_provider_kinds(rig.x.g, 0);
+	const std::vector<uint8_t> src = pattern(W, H, 11);
+	REQUIRE(vk_conv_gpu_write(rig.x.g, &app, src.data(), 0));
+	auto sr = req_of(W, H, XRT_CONV_FMT_RGBA8_UNORM, CONV_IMAGE_USAGE_INPUT);
+	xrt_conv_image slot{};
+	REQUIRE(tr_alloc(&rig.tr, &sr, &slot));
+	conv_input_import in{};
+	in.kind = CONV_INPUT_DMABUF;
+	in.handle = dup((int)app.handle);
+	in.sync_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	in.w = W;
+	in.h = H;
+	in.img_w = W;
+	in.img_h = H;
+	in.img_format = XRT_CONV_FMT_RGBA8_UNORM;
+	in.cpu_row_pitch = app.row_stride;
+	in.drm_modifier = app.drm_modifier;
+	conv_submit_slot cs{};
+	cs.image_count = 1;
+	cs.images[0] = slot;
+	REQUIRE(rig.cpu_io.import_input_ex(rig.cpu_io.ud, 1, &in, &cs) == XRT_SUCCESS);
+	std::vector<uint8_t> got((const uint8_t *)slot.cpu_ptr, (const uint8_t *)slot.cpu_ptr + src.size());
+	CHECK(bytes_off(got, src) == 0u);
+	tr_free(&rig.tr, &slot);
+	rig.x.ops.free(rig.x.ops.ud, &app);
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
 
 /*
  *
