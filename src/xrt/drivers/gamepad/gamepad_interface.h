@@ -59,6 +59,15 @@ struct gamepad_hub_config
 {
 	const struct gamepad_map_table *table;
 	struct gamepad_map_config map;
+
+	/*!
+	 * "Last-used input wins" (the `IDLE_TIMEOUT_S` setting): the pad is
+	 * PRESENT only while connected AND touched within this many seconds;
+	 * untouched longer, it reports ABSENT and every role it held returns
+	 * to the floor (fly camera / qwerty) until the next touch. 0 = the
+	 * connected-only rule (a plugged-in pad holds its roles indefinitely).
+	 */
+	float idle_timeout_s;
 };
 
 /*!
@@ -82,7 +91,12 @@ gamepad_hub_release(struct gamepad_hub *hub);
 struct gamepad_hub *
 gamepad_hub_current(void);
 
-//! The arbiter's question: is a pad attached RIGHT NOW? (ABSENT while nothing is, UNKNOWN before the first poll.)
+/*!
+ * The arbiter's question — is the pad there RIGHT NOW? PRESENT only while a
+ * pad is connected AND, with a non-zero `idle_timeout_s`, was touched within
+ * that window (@ref gamepad_map_recently_active); ABSENT otherwise; UNKNOWN
+ * before the first poll.
+ */
 enum xrt_input_provider_presence
 gamepad_hub_presence(struct gamepad_hub *hub);
 

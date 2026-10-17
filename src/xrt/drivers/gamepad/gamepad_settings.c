@@ -27,6 +27,10 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "select, View / Menu = menu), so handle apps get xrSyncActions controllers; a present pad then holds the "
      "hand roles over qwerty. 0 = hands untouched"},
     {"INVERT_LOOK_Y", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "flip the right stick's pitch direction"},
+    {"IDLE_TIMEOUT_S", XRT_COMPONENT_SETTING_TYPE_FLOAT, "20",
+     "last-used input wins: the pad holds its roles (gamepad, rig, hands) only while connected AND touched within "
+     "this many seconds; untouched longer, the floor (fly camera / qwerty) takes them back until the next touch. "
+     "0 = connected-only (a plugged-in pad holds them indefinitely)"},
 };
 
 static xrt_component_get_setting_fn_t g_get_setting = NULL;

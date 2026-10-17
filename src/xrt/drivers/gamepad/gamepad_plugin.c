@@ -18,8 +18,16 @@
  *
  * Settings (ADR-054 decision 7, through the host iface only —
  * `displayxr-cli input options gamepad`): `DEADZONE`, `NAV_SPEED`,
- * `NAV_TURN_SPEED`, `NAV`, `EMULATE_CONTROLLERS`, `INVERT_LOOK_Y`
- * (`gamepad_settings.c`). Read at `create_devices`, not per frame.
+ * `NAV_TURN_SPEED`, `NAV`, `EMULATE_CONTROLLERS`, `INVERT_LOOK_Y`,
+ * `IDLE_TIMEOUT_S` (`gamepad_settings.c`). Read at `create_devices`, not
+ * per frame.
+ *
+ * Presence is "last-used input wins", not "plugged in": a pad is PRESENT
+ * only while connected AND touched within `IDLE_TIMEOUT_S` (default 20 s).
+ * Otherwise a pad that merely lives in a USB port would hold the rig and
+ * (with EMULATE_CONTROLLERS) the hands forever and silently disable WASD /
+ * mouse-look. Touch the pad and it takes the roles at the arbiter's next
+ * presence poll; leave it and the floor comes back.
  *
  * @author David Fattal
  * @ingroup drv_gamepad
@@ -83,6 +91,7 @@ gamepad_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	cfg.map.nav_speed_mps = gamepad_setting_float("NAV_SPEED", cfg.map.nav_speed_mps, 0.01f, 20.0f);
 	cfg.map.nav_turn_dps = gamepad_setting_float("NAV_TURN_SPEED", cfg.map.nav_turn_dps, 1.0f, 720.0f);
 	cfg.map.invert_look_y = gamepad_setting_on("INVERT_LOOK_Y", false);
+	cfg.idle_timeout_s = gamepad_setting_float("IDLE_TIMEOUT_S", 20.0f, 0.0f, 3600.0f);
 
 	struct gamepad_hub *hub = gamepad_hub_create(&cfg);
 	if (hub == NULL) {

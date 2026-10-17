@@ -241,6 +241,61 @@ TEST_CASE("gamepad map: the xrt pose is yaw about +Y then pitch about +X", "[gam
 	CHECK(std::fabs(n - 1.0f) < 1e-5f);
 }
 
+TEST_CASE("gamepad map: activity is any button, a stick past the deadzone, or a trigger pull", "[gamepad_map]")
+{
+	const float dz = 0.15f;
+	struct gamepad_state s = connected_state();
+
+	CHECK_FALSE(gamepad_map_has_activity(&s, dz)); // at rest
+
+	s.left_x = 0.10f; // inside the deadzone: a resting stick, not a touch
+	s.right_y = -0.12f;
+	CHECK_FALSE(gamepad_map_has_activity(&s, dz));
+
+	s.left_x = 0.3f;
+	CHECK(gamepad_map_has_activity(&s, dz));
+
+	s = connected_state();
+	s.right_y = -0.5f;
+	CHECK(gamepad_map_has_activity(&s, dz));
+
+	s = connected_state();
+	s.buttons = GAMEPAD_BTN_DPAD_LEFT;
+	CHECK(gamepad_map_has_activity(&s, dz));
+
+	s = connected_state();
+	s.right_trigger = 0.02f; // trigger noise
+	CHECK_FALSE(gamepad_map_has_activity(&s, dz));
+	s.right_trigger = 0.2f;
+	CHECK(gamepad_map_has_activity(&s, dz));
+
+	s.connected = false; // nothing counts on a disconnected pad
+	s.buttons = GAMEPAD_BTN_A;
+	CHECK_FALSE(gamepad_map_has_activity(&s, dz));
+}
+
+TEST_CASE("gamepad map: last-used input wins — the idle rule behind presence", "[gamepad_map]")
+{
+	constexpr int64_t kSecond = 1000LL * 1000 * 1000;
+	const int64_t now = 100 * kSecond;
+
+	// Timeout 0 = connected-only: always active, even never touched.
+	CHECK(gamepad_map_recently_active(now, 0, 0.0f));
+	CHECK(gamepad_map_recently_active(now, 0, -1.0f));
+
+	// With a timeout, a pad never touched since plug-in is NOT active.
+	CHECK_FALSE(gamepad_map_recently_active(now, 0, 20.0f));
+
+	// Touched inside the window: active; at the edge: still active; past it: idle.
+	CHECK(gamepad_map_recently_active(now, now - 1 * kSecond, 20.0f));
+	CHECK(gamepad_map_recently_active(now, now - 20 * kSecond, 20.0f));
+	CHECK_FALSE(gamepad_map_recently_active(now, now - 21 * kSecond, 20.0f));
+
+	// Touching again re-arms it: the verdict is a pure function of the
+	// latest activity timestamp, nothing latches.
+	CHECK(gamepad_map_recently_active(now + 30 * kSecond, now + 25 * kSecond, 20.0f));
+}
+
 TEST_CASE("gamepad map: button actions follow the table", "[gamepad_map]")
 {
 	const struct gamepad_map_table *t = &gamepad_map_default_table;

@@ -251,6 +251,29 @@ gamepad_map_action_pressed(const struct gamepad_state *state,
                            const struct gamepad_map_table *table,
                            enum gamepad_map_action action);
 
+/*!
+ * Is the user TOUCHING the pad in @p state? Any button down, any stick
+ * outside the radial @p deadzone, or any trigger past
+ * @ref GAMEPAD_MAP_TRIGGER_ACTIVITY. A disconnected state is never active.
+ * This is what "last-used input wins" keys on: the hub timestamps it and
+ * presence follows the timestamp (@ref gamepad_map_recently_active).
+ */
+bool
+gamepad_map_has_activity(const struct gamepad_state *state, float deadzone);
+
+//! Trigger pull counted as activity (0..1) — above a resting trigger's noise.
+#define GAMEPAD_MAP_TRIGGER_ACTIVITY 0.05f
+
+/*!
+ * The idle rule behind presence: true when @p idle_timeout_s <= 0 (the
+ * connected-only behaviour), else when @p last_activity_ns is non-zero and
+ * no more than @p idle_timeout_s before @p now_ns. A pad that was never
+ * touched since it was plugged in (last_activity_ns == 0) is NOT active,
+ * so plugging in alone takes no role — touching the pad does.
+ */
+bool
+gamepad_map_recently_active(int64_t now_ns, int64_t last_activity_ns, float idle_timeout_s);
+
 #ifdef __cplusplus
 }
 #endif
