@@ -888,12 +888,13 @@ resolve_client_locked(struct t_input_client *c)
 	if (any_overlay) {
 		// An overlay-driven assignment change: event-driven (a request, a pin, a
 		// presence edge), never per frame.
-		U_LOG_W("input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
-		        "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
-		        (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
-		        ht[ARB_HT_UNOBSTRUCTED_RIGHT], c->pref_id[0][0] ? c->pref_id[0] : "-",
-		        c->pref_id[1][0] ? c->pref_id[1] : "-", c->pref_id[2][0] ? c->pref_id[2] : "-",
-		        (unsigned long long)next.generation_id);
+		U_LOG_W(
+		    "input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
+		    "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
+		    (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
+		    ht[ARB_HT_UNOBSTRUCTED_RIGHT], gamepad, c->pref_id[0][0] ? c->pref_id[0] : "-",
+		    c->pref_id[1][0] ? c->pref_id[1] : "-", c->pref_id[2][0] ? c->pref_id[2] : "-",
+		    (unsigned long long)next.generation_id);
 	}
 }
 
@@ -1068,8 +1069,8 @@ sel_enumerate(struct xrt_input_selection *xis,
 		info->present = candidate_is_present_locked((struct t_input_candidate *)cand);
 		info->user_default = g_arb.user_default[0] != '\0' && strcmp(g_arb.user_default, id) == 0;
 		if (c != NULL) {
-			info->app_pinned = !g_arb.policy_lock && c->pin[0] != '\0' &&
-			                   candidate_by_id_locked(c->pin) == cand;
+			info->app_pinned =
+			    !g_arb.policy_lock && c->pin[0] != '\0' && candidate_by_id_locked(c->pin) == cand;
 			for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
 				if (c->request[f][0] != '\0' && candidate_by_id_locked(c->request[f]) == cand) {
 					info->requested_families |= XRT_INPUT_ROLE_FAMILY_BIT(f);
@@ -1163,7 +1164,8 @@ sel_query_holders(struct xrt_input_selection *xis, uint32_t index, struct xrt_in
 		out->key = c->key;
 		snprintf(out->exe_basename, sizeof(out->exe_basename), "%s", c->exe);
 		for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
-			holder_of_locked(&c->roles, (enum xrt_input_role_family)f, out->holder[f], sizeof(out->holder[f]));
+			holder_of_locked(&c->roles, (enum xrt_input_role_family)f, out->holder[f],
+			                 sizeof(out->holder[f]));
 			const bool overlay =
 			    c->pref_src[f] == TARGET_INPUT_PREF_APP_PIN || c->pref_src[f] == TARGET_INPUT_PREF_REQUEST;
 			snprintf(out->preferred[f], sizeof(out->preferred[f]), "%s", overlay ? c->pref_id[f] : "");
@@ -1755,8 +1757,8 @@ t_input_arbiter_policy_changed(void)
 			continue; // detached meanwhile
 		}
 		if (strcmp(c->pin, snap[i].pin) != 0) {
-			U_LOG_W("input arbiter: client %llu ('%s') per-app pin '%s' -> '%s'.", (unsigned long long)c->key,
-			        c->exe, c->pin, snap[i].pin);
+			U_LOG_W("input arbiter: client %llu ('%s') per-app pin '%s' -> '%s'.",
+			        (unsigned long long)c->key, c->exe, c->pin, snap[i].pin);
 			snprintf(c->pin, sizeof(c->pin), "%s", snap[i].pin);
 			changed++;
 		}

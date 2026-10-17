@@ -166,6 +166,15 @@ status_fetch_over(struct ipc_connection *ipc_c, struct xrt_status_snapshot *out)
 			consistent = u_status_generation_equal(&g, &head.generation);
 		}
 		if (consistent) {
+			// ADR-034 Am.5: per-client live input holders, one per reply, until the
+			// service says "past the end" (or has no per-client selection).
+			out->input_holder_count = 0;
+			while (out->input_holder_count < XRT_STATUS_MAX_CLIENTS &&
+			       ipc_call_system_get_input_holders(ipc_c, out->input_holder_count,
+			                                         &out->input_holders[out->input_holder_count]) ==
+			           XRT_SUCCESS) {
+				out->input_holder_count++;
+			}
 			return XRT_SUCCESS;
 		}
 		xret = XRT_ERROR_IPC_FAILURE;

@@ -1525,23 +1525,6 @@
 		]
 	},
 
-	"input_providers_enumerate": {
-		"in": [
-			{"name": "start", "type": "uint32_t"}
-		],
-		"out": [
-			{"name": "page", "type": "struct xrt_input_provider_page"}
-		]
-	},
-
-	"input_set_provider_preference": {
-		"in": [
-			{"name": "family", "type": "uint32_t"},
-			{"name": "provider", "type": "struct ipc_input_provider_id"},
-			{"name": "persist", "type": "bool"}
-		]
-	},
-
 	"conv_warm": {
 		"in": [
 			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
@@ -1637,5 +1620,31 @@
 			{"name": "bytes", "type": "uint64_t"}
 		],
 		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"input_providers_enumerate": {
+		"in": [
+			{"name": "start", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "page", "type": "struct xrt_input_provider_page"}
+		]
+	},
+
+	"input_set_provider_preference": {
+		"in": [
+			{"name": "family", "type": "uint32_t"},
+			{"name": "provider", "type": "struct ipc_input_provider_id"},
+			{"name": "persist", "type": "bool"}
+		]
+	},
+
+	"system_get_input_holders": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "holders", "type": "struct xrt_input_client_holders"}
+		]
 	}
 }

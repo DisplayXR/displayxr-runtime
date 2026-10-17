@@ -9494,13 +9494,36 @@ ipc_handle_input_providers_enumerate(volatile struct ipc_client_state *ics,
 	IPC_TRACE_MARKER();
 
 	memset(out_page, 0, sizeof(*out_page));
-	// TODO(#2181 phase 2): the service's xsysd gets its input_selection from
-	// the arbiter; until then every system reports "not supported" and the
-	// client lists no providers.
+	// The service's arbiter publishes xsysd->input_selection when it is
+	// installed; without one (no provider resident) the client lists none.
 	struct xrt_input_selection *xis = input_selection_of(ics);
 	struct xrt_input_selection_client client;
 	input_client_ref(ics, &client);
 	return xrt_input_selection_enumerate(xis, &client, start, out_page);
+}
+
+static_assert(sizeof(struct xrt_input_client_holders) + 16 <= IPC_BUF_SIZE,
+              "system_get_input_holders reply exceeds IPC_BUF_SIZE");
+
+/*!
+ * ADR-034 Am.5 decision 6: one attached client's LIVE holder per family, for
+ * `displayxr-cli input list --json` and the ADR-051 status snapshot. DIAG only
+ * (it names other apps' executables). XRT_ERROR_FEATURE_NOT_SUPPORTED past the
+ * end, or when the system has no per-client selection.
+ */
+xrt_result_t
+ipc_handle_system_get_input_holders(volatile struct ipc_client_state *ics,
+                                    uint32_t index,
+                                    struct xrt_input_client_holders *out_holders)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_holders, 0, sizeof(*out_holders));
+	xrt_result_t xret = require_status_diag(ics, "system_get_input_holders");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return xrt_input_selection_query_holders(input_selection_of(ics), index, out_holders);
 }
 
 xrt_result_t

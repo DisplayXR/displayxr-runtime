@@ -88,6 +88,15 @@
 #include "util/u_exe_basename.h"
 #include "xrt/xrt_input_selection.h"
 
+#include "util/u_status_snapshot.h"
+
+#ifdef CLI_HAVE_IPC
+#include "xrt/xrt_instance.h"
+#include "client/ipc_client_connection.h"
+#include "client/ipc_client.h"
+#include "ipc_client_generated.h"
+#endif
+
 #include <cjson/cJSON.h>
 
 #include <errno.h>
@@ -116,6 +125,37 @@
  * list
  *
  */
+
+/*!
+ * ADR-034 Am.5 decision 6: the running service's per-client LIVE holders, one
+ * row per DIAG reply. Returns the count, or -1 when no service is reachable
+ * (JSON `holders: null`).
+ */
+static int
+fetch_live_holders(struct xrt_input_client_holders *out, int max)
+{
+#ifdef CLI_HAVE_IPC
+	struct xrt_instance_info ii;
+	memset(&ii, 0, sizeof(ii));
+	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
+	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
+	struct ipc_connection ipc_c;
+	memset(&ipc_c, 0, sizeof(ipc_c));
+	if (cli_ipc_connect(&ipc_c, U_LOGGING_ERROR, &ii) != XRT_SUCCESS) {
+		return -1;
+	}
+	int n = 0;
+	while (n < max && ipc_call_system_get_input_holders(&ipc_c, (uint32_t)n, &out[n]) == XRT_SUCCESS) {
+		n++;
+	}
+	ipc_client_connection_fini(&ipc_c);
+	return n;
+#else
+	(void)out;
+	(void)max;
+	return -1;
+#endif
+}
 
 static bool
 provider_registered(const char *id)
@@ -172,9 +212,21 @@ cmd_list(int argc, const char **argv)
 				cJSON_AddItemToArray(per_app, row);
 			}
 		}
-		// TODO(#2181 phase 2): `holders` — the per-client LIVE holder per family,
-		// from the service's input selection over DIAG IPC (and the ADR-051
-		// status snapshot). Phase 1 ships the stored pins only.
+		// ADR-034 Am.5: the per-client LIVE holder per family, from the running
+		// service (null = no service reached; [] = no client attached).
+		{
+			struct xrt_input_client_holders live[32];
+			const int nl = fetch_live_holders(live, 32);
+			if (nl < 0) {
+				cJSON_AddNullToObject(root, "holders");
+			} else {
+				cJSON *tmp = cJSON_CreateObject();
+				u_status_input_holders_add_cjson(tmp, live, (uint32_t)nl);
+				cJSON_AddItemToObject(root, "holders",
+				                      cJSON_DetachItemFromObject(tmp, "input_holders"));
+				cJSON_Delete(tmp);
+			}
+		}
 		cJSON *arr = cJSON_AddArrayToObject(root, "providers");
 		for (int i = 0; i < n; i++) {
 			cJSON *p = cJSON_CreateObject();
@@ -738,8 +790,6 @@ cmd_app_pin(const char *id, const char *app_arg, bool machine)
 	if (target_component_policy_lock(target_input_plugin_component_class())) {
 		P("note: HKLM Policy\\Lock is set, so per-app pins are ignored on this machine.\n");
 	}
-	// TODO(#2181 phase 2): the per-client overlay applies the pin live; until it lands
-	// the pin is stored and read by nothing that changes roles.
 	note_pickup(NULL);
 	return 0;
 }

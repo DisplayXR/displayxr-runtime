@@ -24,9 +24,12 @@
 #include "target_input_plugin_loader.h"
 
 #include "util/u_exe_basename.h"
+#include "util/u_status_snapshot.h"
 #include "xrt/xrt_input_selection.h"
 
 #include "catch_amalgamated.hpp"
+
+#include <cjson/cJSON.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -196,6 +199,39 @@ TEST_CASE("input selection: the per-app key is the executable basename", "[input
 		REQUIRE(u_exe_basename_self(out, sizeof(out)));
 		CHECK(std::string(out).find("tests_input_selection_policy") != std::string::npos);
 	}
+}
+
+TEST_CASE("input selection: live holders as JSON (status snapshot / input list)", "[input_selection]")
+{
+	struct xrt_input_client_holders rows[2];
+	std::memset(rows, 0, sizeof(rows));
+	rows[0].key = 7;
+	std::snprintf(rows[0].exe_basename, sizeof(rows[0].exe_basename), "%s", "A.exe");
+	std::snprintf(rows[0].holder[XRT_INPUT_ROLE_FAMILY_CONTROLLERS], XRT_INPUT_PROVIDER_ID_SIZE, "%s", "ctl");
+	std::snprintf(rows[0].preferred[XRT_INPUT_ROLE_FAMILY_CONTROLLERS], XRT_INPUT_PROVIDER_ID_SIZE, "%s", "ctl");
+	std::snprintf(rows[0].holder[XRT_INPUT_ROLE_FAMILY_HAND_TRACKING], XRT_INPUT_PROVIDER_ID_SIZE, "%s", "hands");
+	rows[0].generation = 5;
+	rows[1].key = 8; // a client nobody holds anything for
+
+	cJSON *root = cJSON_CreateObject();
+	u_status_input_holders_add_cjson(root, rows, 2);
+	cJSON *arr = cJSON_GetObjectItem(root, "input_holders");
+	REQUIRE(cJSON_IsArray(arr));
+	REQUIRE(cJSON_GetArraySize(arr) == 2);
+	cJSON *a = cJSON_GetArrayItem(arr, 0);
+	CHECK(cJSON_GetObjectItem(a, "client")->valuedouble == 7);
+	CHECK(std::string(cJSON_GetObjectItem(a, "app")->valuestring) == "A.exe");
+	CHECK(cJSON_GetObjectItem(a, "generation")->valuedouble == 5);
+	cJSON *held = cJSON_GetObjectItem(a, "holders");
+	CHECK(std::string(cJSON_GetObjectItem(held, "controllers")->valuestring) == "ctl");
+	CHECK(std::string(cJSON_GetObjectItem(held, "hand_tracking")->valuestring) == "hands");
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(held, "gamepad")));
+	cJSON *pref = cJSON_GetObjectItem(a, "preferred");
+	CHECK(std::string(cJSON_GetObjectItem(pref, "controllers")->valuestring) == "ctl");
+	CHECK(cJSON_IsNull(cJSON_GetObjectItem(pref, "hand_tracking")));
+	CHECK(cJSON_IsNull(
+	    cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetArrayItem(arr, 1), "holders"), "controllers")));
+	cJSON_Delete(root);
 }
 
 #if !defined(_WIN32) && !defined(__ANDROID__)

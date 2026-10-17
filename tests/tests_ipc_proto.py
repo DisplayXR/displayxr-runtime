@@ -38,6 +38,9 @@ def _load():
 SPEC4_CONV_CALLS = ['conv_get_generation', 'conv_enum_task', 'conv_request_warm', 'conv_stream_create', 'conv_stream_reset',
                     'conv_acquire_result', 'conv_poll_event', 'conv_submit_frame', 'conv_get_cpu_output']
 
+#: ADR-034 Amendment 5 (#2181): per-client input selection, appended after the spec-4 family.
+INPUT_SELECTION_CALLS = ['input_providers_enumerate', 'input_set_provider_preference', 'system_get_input_holders']
+
 class GeneratorMixedHandlesTest(unittest.TestCase):
 
     @classmethod
@@ -170,7 +173,7 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
                  "workspace_set_window_placement", "workspace_get_window_placement",
                  "workspace_set_overlay_on_screen", "conv_hint_interest", "compositor_set_cursor_draw_request",
                  "compositor_set_cursor_measure_request", "system_request_component_reselect",
-                 "conv_warm") + tuple(SPEC4_CONV_CALLS)
+                 "conv_warm") + tuple(SPEC4_CONV_CALLS) + tuple(INPUT_SELECTION_CALLS)
         self.assertTrue(all(n.startswith("system_get_") or n in later
                             for n in names[i + 3:]), names[i + 3:])
         enable = self._call("compositor_segments_enable")
@@ -340,20 +343,48 @@ class GeneratorMixedHandlesTest(unittest.TestCase):
         self.assertIn("ipc_handle_system_get_conv_provider_row(", text)
         self.assertIn("ipc_handle_system_get_conv_task_row(", text)
 
+    def _names_before_input_selection(self):
+        """Command names up to #2181's input-selection family, appended LAST."""
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(INPUT_SELECTION_CALLS):], INPUT_SELECTION_CALLS)
+        return names[:-len(INPUT_SELECTION_CALLS)]
+
+    def test_input_selection_family_is_appended(self):
+        # ADR-034 Amendment 5 (#2181): enumerate / set-preference ride a
+        # session's connection; the holders read is DIAG. All three at the END,
+        # so every earlier command keeps its enum value.
+        names = [c.name for c in self.p.calls]
+        self.assertEqual(names[-len(INPUT_SELECTION_CALLS):], INPUT_SELECTION_CALLS)
+        enum = self._call("input_providers_enumerate")
+        self.assertEqual([(a.name, a.typename) for a in enum.in_args], [("start", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in enum.out_args],
+                         [("page", "struct xrt_input_provider_page")])
+        pref = self._call("input_set_provider_preference")
+        self.assertEqual([(a.name, a.typename) for a in pref.in_args],
+                         [("family", "uint32_t"), ("provider", "struct ipc_input_provider_id"),
+                          ("persist", "bool")])
+        self.assertEqual(pref.out_args, [])
+        held = self._call("system_get_input_holders")
+        self.assertEqual([(a.name, a.typename) for a in held.in_args], [("index", "uint32_t")])
+        self.assertEqual([(a.name, a.typename) for a in held.out_args],
+                         [("holders", "struct xrt_input_client_holders")])
+        for call in (enum, pref, held):
+            self.assertFalse(call.in_handles or call.out_handles or call.varlen, call.name)
+
     def _names_before_spec4(self):
         """Command names up to the spec-4 conv_* family (#2054), which is
         appended LAST (after conv_hint_interest, the two cursor calls, #2051's reselect
         and #2029's DIAG conv_warm); the older end-relative pins read
         against this prefix."""
-        names = [c.name for c in self.p.calls]
+        names = self._names_before_input_selection()
         self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
         return names[:-len(SPEC4_CONV_CALLS)]
 
     def test_spec4_conv_family_is_appended(self):
         # XR_DXR_lift spec 4 (#2054): the conv_* family rides at the END,
         # after conv_hint_interest, so every v3 lift_* message keeps its enum
-        # value and wire form.
-        names = [c.name for c in self.p.calls]
+        # value and wire form. (#2181's input-selection family follows it.)
+        names = self._names_before_input_selection()
         self.assertEqual(names[-len(SPEC4_CONV_CALLS):], SPEC4_CONV_CALLS)
         self.assertLess(names.index("conv_hint_interest"), names.index(SPEC4_CONV_CALLS[0]))
         for name in SPEC4_CONV_CALLS:
