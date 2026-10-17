@@ -33,6 +33,7 @@
 #include <openxr/XR_DXR_cursor_depth.h>
 #include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
+#include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
 #include <openxr/XR_DXR_spatial_workspace.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
@@ -71,6 +72,9 @@
 #define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+//! --lift / DISPLAYXR_LIFT_PROBE=1 (test_apps/common/lift_cpu_probe.h).
+static dxr_test::LiftCpuProbe g_liftProbe;
 
 #define XR_CHECK(call) \
     do { \
@@ -2673,8 +2677,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
     bool hasVulkan = false;
+    bool hasLift = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) hasLift = true;
         if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasCocoaWindowBinding = true;
         }
@@ -2751,6 +2757,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         enabledExtensions.push_back(XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME);
     }
     LOG_INFO("XR_DXR_spatial_workspace: %s", xr.hasSpatialWorkspaceExt ? "available" : "not available");
+    if (g_liftProbe.enabled) {
+        if (hasLift) {
+            enabledExtensions.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+        } else {
+            LOG_WARN("--lift: XR_DXR_lift not advertised by the runtime; probe off");
+            g_liftProbe.enabled = false;
+        }
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "SimCubeExtMacOS", XR_MAX_APPLICATION_NAME_SIZE);
@@ -2761,6 +2775,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created");
+    g_liftProbe.OnInstance(xr.instance);
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
     sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -3267,6 +3282,7 @@ static bool PollEvents(AppXrSession& xr) {
             break;
         }
         default:
+            g_liftProbe.OnEvent(event);
             break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -3917,6 +3933,7 @@ static bool EndFrameWithQuads(AppXrSession& xr, XrTime displayTime,
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
+    g_liftProbe.Shutdown();
     if (xr.cursorSpriteSwapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(xr.cursorSpriteSwapchain);
     }
@@ -4013,7 +4030,8 @@ static void PollForwardedInput(AppXrSession& xr) {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
     // Ensure logs appear immediately even when piped
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -4513,6 +4531,10 @@ int main() {
         }
 
         PollEvents(xr);
+
+        if (xr.sessionRunning && g_liftProbe.Tick(xr.session)) {
+            xrRequestExitSession(xr.session); // DISPLAYXR_LIFT_PROBE_FRAMES reached
+        }
 
         if (xr.sessionRunning) {
             XrFrameState frameState;

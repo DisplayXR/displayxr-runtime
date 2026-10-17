@@ -70,6 +70,7 @@
 // xrLocateViews returned, so the views this fixed-SBS app does not render
 // alias view 0's subimage.
 #include "dxr_view_config.h"
+#include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
 
 #include <cmath>
 #include <csignal>
@@ -102,6 +103,9 @@
 #define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+//! --lift / DISPLAYXR_LIFT_PROBE=1 (test_apps/common/lift_cpu_probe.h).
+static dxr_test::LiftCpuProbe g_liftProbe;
 
 #define XR_CHECK(call) \
     do { \
@@ -2076,7 +2080,11 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
     bool hasWeave = false;
+    bool hasLift = false;
     for (const auto& ext : extensions) {
+        if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
+            hasLift = true;
+        }
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
@@ -2190,6 +2198,15 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                  xr.hasCursorDepthExt ? "ENABLED (scripted cursor, runtime draws)" : "off", xr.cursorDepthSpecVersion);
     }
 
+    if (g_liftProbe.enabled) {
+        if (hasLift) {
+            enabledExtensions.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+        } else {
+            LOG_WARN("--lift: XR_DXR_lift not advertised by the runtime; probe off");
+            g_liftProbe.enabled = false;
+        }
+    }
+
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "CubeHandleVkLinux",
             sizeof(createInfo.applicationInfo.applicationName) - 1);
@@ -2203,6 +2220,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
 
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created");
+    g_liftProbe.OnInstance(xr.instance);
 
     // Rendering-mode entry points (keys V / 0-8). Absent extension or function
     // leaves them null and the keys become no-ops (logged once at session).
@@ -2770,6 +2788,7 @@ static bool PollEvents(AppXrSession& xr) {
             LOG_INFO("Rendering mode request denied by the runtime (workspace-locked or unsupported)");
             break;
         default:
+            g_liftProbe.OnEvent(event);
             break;
         }
 
@@ -2838,6 +2857,7 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLa
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
+    g_liftProbe.Shutdown();
     if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(xr.swapchain.swapchain);
         xr.swapchain.swapchain = XR_NULL_HANDLE;
@@ -2872,7 +2892,7 @@ static void SignalHandler(int sig) {
 
 static void PrintUsage(const char* argv0) {
     fprintf(stdout,
-        "Usage: %s [--platform=x11|wayland|auto] [--windowed] [--help]\n"
+        "Usage: %s [--platform=x11|wayland|auto] [--windowed] [--lift] [--help]\n"
         "\n"
         "  --platform=x11     app-owned X11 window, XR_DXR_xlib_window_binding\n"
         "  --platform=wayland app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
@@ -2889,6 +2909,9 @@ static void PrintUsage(const char* argv0) {
         "                     the window instead of resizing the window to the panel.\n"
         "                     The weave PHASE still needs the compositor geometry\n"
         "                     service (window-geometry@displayxr.org).\n"
+        "  --lift             XR_DXR_lift probe: a VIEWS_MONO stream over CPU images\n"
+        "                     from this in-process session; logs \"[lift-probe]\" lines\n"
+        "                     (DISPLAYXR_LIFT_PROBE_EVERY / _FRAMES tune it).\n"
         "\n"
         "Env: DXR_WINDOW_BACKEND=x11|wayland|auto (an explicit request; --platform wins)\n"
         "     DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative\n"
@@ -2912,6 +2935,7 @@ static void PrintUsage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
     // Line-buffer stdout even when redirected: LOG_INFO writes are otherwise block-
     // buffered and vanish when `timeout` SIGTERMs the process (every INFO line of a
     // redirected run was lost; the runtime's stderr log survived, the app's did not).
@@ -2938,6 +2962,8 @@ int main(int argc, char** argv) {
             }
         } else if (strcmp(a, "--windowed") == 0) {
             waylandWindowed = true;
+        } else if (strcmp(a, "--lift") == 0) {
+            // XR_DXR_lift CPU probe (g_liftProbe, set above).
         } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
             PrintUsage(argv[0]);
             return 0;
@@ -3269,6 +3295,10 @@ int main(int argc, char** argv) {
             }
         }
         PollEvents(xr);
+
+        if (xr.sessionRunning && g_liftProbe.Tick(xr.session)) {
+            xrRequestExitSession(xr.session); // DISPLAYXR_LIFT_PROBE_FRAMES reached
+        }
 
         if (xr.sessionRunning) {
             XrFrameState frameState;
