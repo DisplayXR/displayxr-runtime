@@ -264,7 +264,8 @@ launch a fresh app.
 `displayxr-cli input set sim-input ENABLE 1` (or
 `DXR_INPUT_SIM_INPUT_ENABLE=1` in the hosting process) replaces the former
 `DXR_SIM_INPUT=1`; `NAV`, `NAV_HOLD_MS`, `NAV_RECENTER_MS` replace
-`DXR_SIM_INPUT_NAV*` (§5). The old names stay aliases for **one release**
+`DXR_SIM_INPUT_NAV*` (§5); `HANDS`, `PINCH`, `HAND_DISTANCE_M` (#2191, §5) are
+new and have no alias. The old names stay aliases for **one release**
 (deprecation WARN once per key), read in `drivers/sim_input/sim_input_settings.c`
 and nowhere else — `lint.yml`'s `sim-plugin-getenv-guard` fails any other
 `getenv` under the reference plug-ins.
@@ -837,7 +838,7 @@ gets `xrSyncActions` controllers for the first time.
 
 | Provider | Status | Purpose |
 |---|---|---|
-| `sim_input` | **Shipped and packaged** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`; the Windows installer registers the `sim-input` row and allowlists the DLL, the `.deb` / tarball / `.pkg` ship it with `200-sim-input-input-provider.json` — ADR-054 §2 clause 3; inert until `ENABLE` = 1) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
+| `sim_input` | **Shipped and packaged** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`; the Windows installer registers the `sim-input` row and allowlists the DLL, the `.deb` / tarball / `.pkg` ship it with `200-sim-input-input-provider.json` — ADR-054 §2 clause 3; inert until `ENABLE` = 1) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. Hands and controllers are **display-plane-relative** (`RIG_LOCAL`, §4b.4) and placed in front of the glass; `HANDS` / `PINCH` / `HAND_DISTANCE_M` shape them (below, #2191). ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `gamepad` | **Shipped and packaged** (`src/xrt/drivers/gamepad/`, plug-in DLL `DisplayXR-Gamepad`; the Windows installer registers the `gamepad` row at ProbeOrder 150 and allowlists the DLL; `build_macos.sh` / `build_linux.sh` stage `150-gamepad-input-provider.json`; Windows dev boxes: `register_dev_plugin.bat input gamepad`) | The one controller every desk has, on the existing input-provider class (§4c): a `XRT_DEVICE_TYPE_GAMEPAD` device on `microsoft/xbox_controller` (every button, stick, trigger and the four haptic outputs; `XR_EXT_dpad_binding` works over its sticks through the runtime's generic dpad emulation), a NAVIGATION device so a present pad drives the rig (§4b: left stick = translate in the rig's yaw frame, right stick = yaw / pitch, triggers = up / down, right-stick click = recenter — the durable level-with-timestamp of §4b.3, with the pose reset to F's origin in the same publication), and — `EMULATE_CONTROLLERS` = 1, the default — an emulated left / right `khr/simple_controller` pair at fixed display-plane-relative (`RIG_LOCAL`, §4b.4) poses: shoulders / X / A = select, View / Menu = menu, vibration → the pad's motors. **Presence-gated, so registered-by-default is inert:** `probe()` claims wherever the platform has a pad reader (XInput on Windows, GameController.framework on macOS with `shouldMonitorBackgroundEvents` so it is focus-independent too) and declines where it has none (desktop Linux — an evdev backend is the follow-up); `get_presence` follows the hub's hot-plug poll (250 Hz attached, 2 Hz detached) under the "last-used input wins" rule of §4c — touching a pad mid-session takes the gamepad, rig and hand roles at the arbiter's next presence poll; leaving it idle for `IDLE_TIMEOUT_S` (or unplugging it) hands them all back. Settings (ADR-054 decision 7, `displayxr-cli input options gamepad`): `DEADZONE` (radial, 0.15), `NAV_SPEED` (m/s, 1.0), `NAV_TURN_SPEED` (deg/s, 90), `NAV` (1), `EMULATE_CONTROLLERS` (1), `INVERT_LOOK_Y` (0), `IDLE_TIMEOUT_S` (20; the "last-used input wins" window of §4c — `0` = connected-only). The whole mapping policy is one table (`gamepad_map.c`, pinned by `tests/tests_gamepad_map.cpp`), so a per-title bindings mechanism (#1381) replaces the table, not the devices. |
 | `touch_input` | **Shipped on Android** (`src/xrt/drivers/touch_input/`; `libdxri100_touch_input.so` in the runtime APK, `DisplayXR-TouchInput` on desktop builds where it is a dev-only artefact — not staged, not registered, `probe()` declines unless `ENABLE` = 1 because nothing feeds pointer events there) | The first Android input provider (#132, §5.2): touch gestures → a `NAVIGATION` device (the rig role of §4b) + an emulated `khr/simple_controller` (`ANY_HAND`, aim ray under the finger, SELECT on tap / hold). ProbeOrder 100. Presence is unconditional — the touch screen is the hardware. Settings (§3): `ENABLE` (Android default 1, `0` withdraws it), `CONTROLLER` (default 1; `0` = navigation only), `SENSITIVITY` (orbit-rate multiplier, default 1.0). |
@@ -849,9 +850,10 @@ gets `xrSyncActions` controllers for the first time.
 so every pre-existing `DXR_SIM_INPUT=1` run is byte-for-byte unchanged: no
 navigation device, the rig stays on the qwerty floor. With it on, `N(t)` is a
 slow figure-eight plus yaw in the provider's own frame F — a pure function of
-the requested timestamp, so prediction is exact and CI is reproducible — and
-the controllers switch to `XRT_TRACKING_TYPE_RIG_LOCAL`, because a provider
-that navigates publishes display-plane-relative poses (§4b). Two optional
+the requested timestamp, so prediction is exact and CI is reproducible. The
+controllers are `XRT_TRACKING_TYPE_RIG_LOCAL` either way (since #2191; with
+`NAV` = 1 that is what the contract *requires* of a provider that navigates,
+§4b.4). Two optional
 fault knobs, both off by default: `DXR_SIM_INPUT_NAV_HOLD_MS=<n>` makes the
 pose report invalid for 500 ms every *n* ms (the composer's hold / re-align
 path) and `DXR_SIM_INPUT_NAV_RECENTER_MS=<n>` fires a scripted reset every *n*
@@ -860,6 +862,30 @@ scripted pose in the same publication. All three are env vars, not registry
 values, for the reason `DXR_SIM_INPUT` is (§4.6): per-run developer switches,
 not machine configuration — and the process-level caveat applies, set them
 before launching the host process.
+
+**`sim_input` hands (#2191).** Each hand's root — and the grip / aim / palm
+poses, which ride the same circle so a marker drawn from the grip action lands
+inside the rendered hand — sweeps a 4 cm circle (4 s period) in the display
+plane's XY, centred `HAND_DISTANCE_M` in front of the glass, 12 cm left / right
+of the display centre and 3 cm below it, published on a `RIG_LOCAL` origin so
+`world = rig(t) ∘ L` puts them in front of the panel in every reference space.
+(Before #2191 a NAV-off run kept a stage-anchored circle that ended up 5 cm
+*behind* the glass on a headless sim-display system and far out of view on
+others.) The plug-in logs the resolved script once at `create_devices`
+(`sim-input: hands=LR pinch=wave; circle centres (display-plane frame, …)`).
+Settings, through the options contract above (no legacy aliases — they are
+new):
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `HANDS` | enum | `both` | `both` \| `left` \| `right` \| `none` — which hands track. A hand left out stays a device (roles unchanged) but is never active: invalid poses, `isActive` false. |
+| `PINCH` | enum | `wave` | `wave` — the #825 open→fist curl wave (3 s), both hands staggered half a cycle; `hold` — thumb and index tips held pinched (≈ 6.5 mm apart), other fingers relaxed; `open` — every finger relaxed, never a pinch. `HANDS=right PINCH=hold` is a single sustained pinch whose root moves on the circle: a one-hand drag. |
+| `HAND_DISTANCE_M` | float | `0.25` | distance of the circle centres in front of the glass, metres; ≤ 0 / unparseable = the default |
+
+Pinned by `tests/tests_sim_input_hands.cpp` (the pure script: placement, the
+pinch-hold tip gap through the real `u_hand_simulation`) and end to end by the
+`[rig_hands]` / `[rig_hands_hold]` arms of `tests_oxr_view_space` (wrists
+located in LOCAL against the `displayPlanePose` `xrLocateViews` reports).
 
 ### 5.2 touch_input — gestures, and where its events come from (#132)
 

@@ -43,6 +43,13 @@
  *   - `NAV_RECENTER_MS` = n (alias `DXR_SIM_INPUT_NAV_RECENTER_MS`) — fire a
  *                           scripted recenter every n ms. Default 0 = never.
  *
+ * Hand-script knobs (#2191; new, so no legacy aliases):
+ *
+ *   - `HANDS` = both | left | right | none — which hands track (default both).
+ *   - `PINCH` = wave | hold | open — the curl wave (default), a held
+ *                           thumb+index pinch, or never pinching.
+ *   - `HAND_DISTANCE_M` = m — circle centres in front of the glass (0.25).
+ *
  * @author David Fattal
  * @ingroup drv_sim_input
  */
@@ -102,8 +109,7 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	/* #1380: the scripted NAVIGATION device is a SECOND opt-in on top of
 	 * ENABLE. Default OFF, so every existing selftest / CI run that only
 	 * asks for simulated hands keeps exactly the behaviour it had — the
-	 * rig stays on the qwerty floor and the controllers keep their
-	 * stage-anchored circle. With it on, this provider drives the rig
+	 * rig stays on the qwerty floor. With it on, this provider drives the rig
 	 * role end-to-end with no hardware. */
 	const bool nav = sim_input_setting_on("NAV");
 	const uint32_t needed = nav ? 3 : 2;
@@ -111,12 +117,37 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	/* A provider that navigates publishes its controllers
-	 * display-plane-relative (ADR-034 Amendment 4) — so the knob moves the
-	 * controllers' frame too, which is the whole point: the reference
-	 * provider must model the contract, not half of it. */
-	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, nav);
-	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, nav);
+	/* #2191: the hand script. The controllers are display-plane-relative
+	 * (RIG_LOCAL) with or without NAV: what a navigating provider must do
+	 * (ADR-034 Amendment 4), and what puts the hands in front of the glass
+	 * for everyone else. */
+	char v[32];
+	enum sim_input_hands_mode hands = SIM_INPUT_HANDS_BOTH;
+	if (sim_input_setting("HANDS", v, sizeof(v)) && !sim_input_parse_hands(v, &hands)) {
+		U_LOG_W("sim-input: HANDS='%s' is not both|left|right|none - using both.", v);
+	}
+	enum sim_input_pinch_mode pinch = SIM_INPUT_PINCH_WAVE;
+	if (sim_input_setting("PINCH", v, sizeof(v)) && !sim_input_parse_pinch(v, &pinch)) {
+		U_LOG_W("sim-input: PINCH='%s' is not wave|hold|open - using wave.", v);
+	}
+	const float distance = sim_input_setting_float("HAND_DISTANCE_M", SIM_INPUT_HAND_DISTANCE_DEFAULT_M);
+
+	struct sim_input_controller_config lcfg = {sim_input_hand_enabled(hands, true), pinch, distance};
+	struct sim_input_controller_config rcfg = {sim_input_hand_enabled(hands, false), pinch, distance};
+	{
+		const struct xrt_pose lc = sim_input_hand_center(true, distance);
+		const struct xrt_pose rc = sim_input_hand_center(false, distance);
+		U_LOG_W(
+		    "sim-input: hands=%s%s pinch=%s; circle centres (display-plane frame, +Z toward the viewer) "
+		    "L(%.3f, %.3f, %.3f) R(%.3f, %.3f, %.3f), r=%.3f m.",
+		    lcfg.active ? "L" : "-", rcfg.active ? "R" : "-",
+		    pinch == SIM_INPUT_PINCH_HOLD ? "hold" : (pinch == SIM_INPUT_PINCH_OPEN ? "open" : "wave"),
+		    (double)lc.position.x, (double)lc.position.y, (double)lc.position.z, (double)rc.position.x,
+		    (double)rc.position.y, (double)rc.position.z, (double)SIM_INPUT_CIRCLE_RADIUS_M);
+	}
+
+	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &lcfg);
+	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, &rcfg);
 	struct xrt_device *navdev = NULL;
 	if (nav) {
 		navdev = sim_input_create_navigation(sim_input_setting_ms("NAV_HOLD_MS"),

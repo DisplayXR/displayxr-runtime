@@ -516,6 +516,8 @@ endif() # XRT_FEATURE_OPENXR — DisplayXR-TouchInput block
 if(XRT_FEATURE_OPENXR AND NOT ANDROID)
 add_library(drv_sim_input_plugin SHARED
 	sim_input/sim_input_device.c
+	sim_input/sim_input_hand_script.c
+	sim_input/sim_input_hand_script.h
 	sim_input/sim_input_nav.c
 	sim_input/sim_input_interface.h
 	sim_input/sim_input_plugin.c
