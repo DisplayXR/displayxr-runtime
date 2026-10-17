@@ -1,7 +1,7 @@
 ---
 status: Design
 owner: David Fattal
-updated: 2026-10-12
+updated: 2026-10-17
 adr: ADR-053
 issues: []
 code-paths: [src/xrt/include/xrt/xrt_conversion_plugin.h, src/xrt/conversion/, src/xrt/targets/conversion_host/, src/xrt/compositor/d3d11_service/d3d11_lift.cpp, src/xrt/state_trackers/oxr/oxr_lift.c, src/xrt/ipc/, src/xrt/targets/cli/, src/xrt/drivers/sim_display/]
@@ -9,8 +9,10 @@ code-paths: [src/xrt/include/xrt/xrt_conversion_plugin.h, src/xrt/conversion/, s
 
 # Conversion providers — plan (ADR-053)
 
-**Status:** Design complete 2026-10-12, red-team amendments applied; nothing implemented. Phases
-per ADR-053 (§9).
+**Status:** Design complete 2026-10-12, red-team amendments applied. Implementation is under way
+per ADR-053's phases (§9): the conversion core, the loader, `dp-lift`, the sim provider, the
+satellite host and XR_DXR_lift spec 4 ship (see the discovery spec's status line); the generalised
+in-process link (§4.2) ships CPU-first on Windows, desktop Linux and macOS.
 
 - Decision record: [ADR-053](../adr/ADR-053-conversion-providers.md).
 - Provider-facing contract and registration: [`conversion-provider-discovery.md`](../specs/runtime/conversion-provider-discovery.md).
@@ -525,9 +527,9 @@ again after 551 ms.
 |---|---|---|---|---|
 | Win · D3D11 IPC session (browser) | session IPC | NT-handle snapshot slot / NT export texture | keyed mutex on the input import; `ID3D11Fence` NT | **yes** (v3) |
 | Win · D3D12 / D3D11 in-process (Unity, Unreal) | ADR-049 lift link | app texture as NT handle / NT texture + fence | D3D fence | **yes** |
-| Win · OpenGL, Vulkan | generalised link | runtime-allocated NT input ring, imported via `GL_EXT_memory_object_win32` / `VK_KHR_external_memory_win32` | external semaphore on a D3D fence | P5 |
-| Linux · Vulkan | session or link | opaque fd or dma-buf / exportable VK image fd | timeline semaphore fd; sync_fd | P5 |
-| macOS · Metal / MoltenVK | session or link | IOSurface (zero-copy for a CoreML EP) | `MTLSharedEvent` | P5; AF_UNIX transfer unverified |
+| Win · OpenGL, Vulkan | generalised link | v1: CPU bytes (a file mapping) in and out. Later: runtime-allocated NT input ring, imported via `GL_EXT_memory_object_win32` / `VK_KHR_external_memory_win32` | v1: none (`CPU_COMPLETE`). Later: external semaphore on a D3D fence | v1 **yes** (CPU); GPU P5 |
+| Linux · Vulkan / GL | session or link | v1: CPU bytes (an unlinked shm fd over `SCM_RIGHTS`) in and out. Later: opaque fd or dma-buf / exportable VK image fd | v1: none. Later: timeline semaphore fd; sync_fd | v1 **yes** (CPU; built, not run on a Linux box yet); GPU P5 |
+| macOS · Metal / MoltenVK / GL | session or link | v1: CPU bytes (a global IOSurface used as a byte buffer, its ID over the socket) in and out. Later: IOSurface textures (zero-copy for a CoreML EP) | v1: none. Later: `MTLSharedEvent` | v1 **yes** (CPU, verified with the sim provider); GPU P5 |
 | Android · Vulkan | binder bootstrap to `:conversion`, then a socketpair | AHardwareBuffer | sync_fd | P5 |
 | any · CPU (CLI, MCP, jobs) | DIAG / APP connection | shm image / inline, shm or caller handle | none | partial |
 
@@ -535,17 +537,39 @@ Per stream the core picks the cheapest pairing of the source memory kind and the
 `import_kinds`: a direct pairing, else a GPU copy, else CPU staging (one WARN, counted, raised as
 `CONV_CPU_STAGING`).
 
-**No GL, Vulkan or Metal link code lands before P5** — no input rings, no `conv_input_ring_get`, no
-`oxr_conv_gpu_{gl,vk,metal}.c` — until mediaplayer is a real consumer.
+**No GL, Vulkan or Metal GPU link code lands before P5** — no input rings, no
+`conv_input_ring_get`, no `oxr_conv_gpu_{gl,vk,metal}.c` — until mediaplayer is a real consumer.
+The link itself and its CPU v1 did land (§4.2).
 
-### 4.2 The generalised in-process link (P5)
+### 4.2 The generalised in-process link (P5; CPU v1 shipped)
 
 ADR-049's rule extends to every in-process API: one model per machine, reached through a
 sessionless `APP` connection opened on a background thread, which sends `conv_hint_interest` when it
 opens. Windows: the link never launches the service (the dashboard-job trap). Linux: socket
-activation launches it. macOS: dial only if running. With no service, in-process sessions report
-ABSENT(`no_conversion_service`) and never host a provider themselves; the headless CLI may, for
-`conv probe` and descriptor checks only.
+activation launches it. macOS: dial only if running (the installed service is launchd-started; a
+plain socket connect never starts one). With no service, in-process sessions report
+ABSENT(`no_conversion_service`) — no task is listed — and never host a provider themselves; the
+headless CLI may, for `conv probe` and descriptor checks only.
+
+**v1 is CPU-first, in this order:**
+
+1. **Done: the link for every in-process session** (D3D11 / D3D12 / Vulkan / GL / Metal on
+   Windows, desktop Linux and macOS) and **CPU kinds** on it: `imageKinds` = `exportKinds` = `CPU`
+   off D3D (`oxr_conv_gpu_d3d.c`). The bytes ride the ordinary graphics-buffer transport in a shared
+   section (`ipc_cpu_buffer`: an unlinked shm fd on Linux, a global IOSurface used as bytes on
+   macOS, a file mapping on Windows). The spec-3 calls stay D3D-only.
+2. **Done: the POSIX service's CPU I/O glue** (`ipc_server_conv_cpu`): CPU bytes into the core's CPU
+   slot images, the published result out into a per-stream section. Before it nothing installed an
+   I/O glue on POSIX, so no stream could be created there at all.
+3. **Next (step B): the Vulkan GPU glue** — GPU slot images, GPU export, and the core's reference
+   view synthesis on POSIX.
+
+**What v1 can serve.** The core has **no CPU view synthesis**: the composed VIEWS path (a depth
+provider plus the runtime's reference view synthesis) needs the GPU glue. Until step B lands, a
+VIEWS task on POSIX is served only by a provider that **emits views itself** — the sim provider
+does, so the whole route is testable hardware-free (`cube_handle_vk_macos --lift`, 2 views of a
+640×360 input with the sim's synthetic ±6 px shift, 30/30 converted through the satellite host).
+A depth-only provider gives DEPTH tasks on POSIX, but no SBS, until step B.
 
 **Linux idle exit.** The socket-activated service exits 30 s after its last client, which bounds
 keep-alive whatever `KeepAliveSec` says: the first lift after an idle gap cold-warms. The discovery
@@ -887,7 +911,7 @@ interval" (§7.4) is the fix, and the cold-boot smoke test is its regression tes
 
 | Consumer | Plan | ≈ lines |
 |---|---|---|
-| demo-mediaplayer (Vulkan, four OSes) | stereo auto-convergence stays in-app. Mono→3D via `LiftClient`: VIEWS_MONO, `viewCount = 0`, the decoded VkImage as the platform's kind with timeline / sync-file sync, discontinuity on seek; hidden until P5. LIF via VIEWS_FROM_DEPTH at P6 | +450, +120 |
+| demo-mediaplayer (Vulkan, four OSes) | stereo auto-convergence stays in-app. Mono→3D via `LiftClient`: VIEWS_MONO, `viewCount = 0`, discontinuity on seek. **CPU-first:** v1 hands the decoded frame in as CPU bytes and takes the views back as CPU bytes (the §4.2 link, usable now on Windows / Linux / macOS — but SBS on POSIX needs a views-emitting provider until step B's Vulkan GPU glue brings the composed views path); then the decoded VkImage as the platform's kind with timeline / sync-file sync at P5. LIF via VIEWS_FROM_DEPTH at P6 | +450, +120 |
 | demo-gaussiansplat | SPLATS_MONO job (SPLATS_STEREO with a typed baseline); `stb_image` pixels downscaled to `maxInputExtent`; `preferredFormat = SOG` so `gs_sog_loader` consumes it unchanged; relative-scene heuristic when `metricSource == NONE`; progress, Cancel, "Save .sog" via a caller handle | +350 |
 | Unity | VIEWS_MONO, 2 views, aux depth required (provisional outputs make this safe during warm-up); double-buffered `D3D12_NT` input with D3D fence sync (closes ADR-049's submit-fence follow-up); C# `DisplayXRLiftSource` | +600, +350 |
 | Unreal | follows Unity; SBS feeds `SideBySideCoords`; adaptive N-view uses `viewCount = 0` | +500 |

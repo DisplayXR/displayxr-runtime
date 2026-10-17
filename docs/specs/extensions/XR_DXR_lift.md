@@ -68,8 +68,11 @@ xrCreateLiftStreamDXR(session, &ci, &stream);
 | Situation | Spec 3: `xrGetLiftPropertiesDXR` | Spec 4: `xrEnumerateLiftTasksDXR` |
 |---|---|---|
 | IPC session (any platform with a service) | the service's view (§2.3) | one element per task some provider can serve (§2.2) |
-| In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's view, over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection | the same, over the same connection |
-| Any other in-process session (GL, Vulkan, Metal; any non-Windows platform) | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks with `imageKinds` / `exportKinds` = 0: known, not yet reachable from this session (the non-D3D transports land without a spec bump; ADR-053 P5) |
+| In-process D3D11 / D3D12 session on Windows (engine apps, e.g. the Unity display provider) | the service's view, over a lift-only connection the session opens in the background on its first lift call (ADR-049): `ACTIVATING` while it connects; `UNAVAILABLE` when no service is running (it is never launched for this) or the service refuses the connection | the same, over the same connection; `imageKinds` = `D3D11_NT`, `D3D11_DXGI`, `D3D12_NT`, `CPU`; `exportKinds` = `D3D11_NT`, `CPU` |
+| In-process GL / Vulkan session on Windows | `XR_ERROR_FEATURE_UNSUPPORTED` (spec 3 is D3D11 shared textures) | the service's tasks over the same kind of lift-only connection, with `imageKinds` = `exportKinds` = `CPU` |
+| In-process Vulkan / GL / Metal session on desktop Linux or macOS | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | the service's tasks over a lift-only connection (a plain socket connect: the service is never launched for it; no service = no tasks), with `imageKinds` = `exportKinds` = `CPU` |
+| IPC session on desktop Linux or macOS | the service's view: modes 0 / `UNAVAILABLE` (the POSIX service has no D3D11 textures to serve spec 3 with) | one element per task, `imageKinds` = `exportKinds` = `CPU` |
+| Any other in-process session (Android) | `XR_ERROR_FEATURE_UNSUPPORTED`, as in spec 3 | nothing known yet (no lift-only connection on that platform; the transport lands without a spec bump, ADR-053 P5) |
 | A service with no provider (no plug-in registered, or `DXR_LIFT=0`) | `XR_SUCCESS`, `supportedModes = 0`, `UNAVAILABLE` | `countOutput = 0` |
 
 **Readiness starts early.** An instance that enables `XR_DXR_lift` tells the service it is
@@ -529,6 +532,12 @@ Chain `XrLiftFrameImagesDXR` (1..3 `XrLiftImageDXR`, at most one per role) on
 
 **What `imageKinds` lists today.** On Windows (IPC sessions and in-process D3D11 / D3D12
 sessions): `D3D11_NT`, `D3D11_DXGI`, `D3D12_NT` and `CPU`, with any `region` inside the image.
+Everywhere else a session can reach the service from — in-process GL / Vulkan on Windows, and
+in-process Vulkan / GL / Metal plus IPC sessions on desktop Linux and macOS — `CPU` only, in
+and out (§2.1); a `PLATFORM_DEFAULT` input or export on such a session means `CPU`. The CPU
+bytes cross to the service in a shared section the runtime makes (a file mapping on Windows,
+an unlinked shared-memory fd on Linux, an IOSurface used as a byte buffer on macOS); the app
+only ever sees `cpuBytes` going in and a mapped `outputTexture` pointer coming out.
 `D3D12_NT` takes `D3D_FENCE` (the service waits for `syncValue` on the GPU before its
 snapshot) or `CPU_COMPLETE`; `D3D11_*` take their keyed mutex or `D3D_FENCE`; `CPU` takes
 `NONE` / `CPU_COMPLETE`, RGBA8 or BGRA8, `cpuRowPitch ≥ (region x + width) · 4`, and the
@@ -610,12 +619,12 @@ The handles are D3D12-consumable as they are: the export texture is an NT-handle
 
 ### 5.4 Result export (spec 4)
 
-`exportKinds` lists `D3D11_NT` and `CPU` today (Vulkan / dma-buf / IOSurface / AHB exports
-with P5). A **CPU** export: `outputTexture` is a pointer to the result's bytes, tightly packed
+`exportKinds` lists `D3D11_NT` and `CPU` on Windows D3D11 / D3D12 and IPC sessions, `CPU`
+alone everywhere else (§2.1; Vulkan / dma-buf / IOSurface / AHB exports with P5). A **CPU** export: `outputTexture` is a pointer to the result's bytes, tightly packed
 (`extent.width ·` bytes per pixel per row), runtime-owned and valid until the next acquire on the
 stream; `fence` is NULL; `XrLiftResultExportDXR` says `kind = CPU`, the format, and
 `syncKind = CPU_COMPLETE` (the bytes are complete when the acquire returns). An auxiliary depth
-map keeps its D3D11 NT export.
+map keeps its D3D11 NT export (on a CPU-only session there is no auxiliary depth export yet).
 
 A stream created with an `exportKind` other than D3D11_NT returns its results through the same
 `outputTexture` / `fence` fields, described by `XrLiftResultExportDXR` chained on
