@@ -14,12 +14,6 @@ if(BUILD_TESTING)
 	endif()
 endif()
 
-# OpenVR
-add_library(xrt-external-openvr INTERFACE)
-target_include_directories(
-	xrt-external-openvr SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openvr_includes
-	)
-
 # cJSON
 add_library(xrt-external-cjson INTERFACE)
 if(XRT_HAVE_SYSTEM_CJSON)
@@ -57,12 +51,6 @@ target_include_directories(
 	xrt-external-glad SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/glad/include
 	)
 
-# Hungarian graph algorithm
-add_library(xrt-external-hungarian INTERFACE)
-target_include_directories(
-	xrt-external-hungarian SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/hungarian
-	)
-
 # JNIPP and Android JNI wrappers
 if(ANDROID)
 	add_library(xrt-external-jnipp STATIC jnipp/jnipp.cpp)
@@ -98,14 +86,6 @@ add_library(xrt-external-openxr INTERFACE)
 target_include_directories(
 	xrt-external-openxr INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openxr_includes
 	)
-
-# External VIT interface
-if(XRT_FEATURE_SLAM)
-	add_library(xrt-external-vit INTERFACE)
-	target_include_directories(
-		xrt-external-vit INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/vit_includes
-		)
-endif()
 
 # SDL
 if(XRT_HAVE_SDL2)
@@ -209,12 +189,6 @@ if(XRT_HAVE_OPENGL)
 
 endif()
 
-# tinyceres
-add_library(xrt-external-tinyceres INTERFACE)
-target_include_directories(
-	xrt-external-tinyceres SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tinyceres/include
-	)
-
 # Tracy
 if(XRT_HAVE_TRACY)
 	add_library(xrt-external-tracy STATIC tracy/TracyClient.cpp)
@@ -224,9 +198,3 @@ if(XRT_HAVE_TRACY)
 	target_compile_definitions(xrt-external-tracy PRIVATE TRACY_ENABLE)
 	target_link_libraries(xrt-external-tracy PRIVATE ${CMAKE_DL_LIBS})
 endif()
-
-# Valve VDF parser
-add_library(xrt-external-vdf INTERFACE)
-target_include_directories(
-	xrt-external-vdf SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/valve-file-vdf
-	)
