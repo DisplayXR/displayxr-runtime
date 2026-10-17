@@ -172,6 +172,15 @@ if(WIN32 AND XRT_FEATURE_HYBRID_MODE)
 	target_sources(ipc_server PRIVATE server/ipc_server_conv_d3d11.c)
 endif()
 
+# ADR-053 P5: the POSIX counterpart -- the conversion core's Vulkan glue
+# (vk_conv: image allocation, S5 view synthesis, S6 readback) attached to the
+# system compositor's Vulkan device on macOS and desktop Linux.
+if(TARGET comp_vk_conv AND (APPLE OR (XRT_HAVE_LINUX AND NOT ANDROID)))
+	target_link_libraries(ipc_server PRIVATE comp_vk_conv)
+	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_VK_CONV_SERVICE)
+	target_sources(ipc_server PRIVATE server/ipc_server_conv_vk.c)
+endif()
+
 # Qwerty driver stereo state access for camera-centric controls
 if(XRT_BUILD_DRIVER_QWERTY)
 	target_include_directories(ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drivers/qwerty)

@@ -7548,6 +7548,19 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	return XRT_SUCCESS;
 }
 
+struct vk_bundle *
+comp_multi_system_get_vk(struct xrt_system_compositor *xsysc)
+{
+	// Only a multi system compositor is a multi_system_compositor. Identified
+	// by create_native_compositor, NOT destroy: target_instance hooks destroy
+	// (display hotplug, t_syscomp_destroy_hook) on the service's instance.
+	if (xsysc == NULL || xsysc->create_native_compositor != system_compositor_create_native_compositor) {
+		return NULL;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	return comp_target_service_get_vk(msc->target_service);
+}
+
 bool
 multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d)
 {

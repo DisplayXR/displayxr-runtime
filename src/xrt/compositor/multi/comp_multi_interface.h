@@ -143,6 +143,20 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     struct xrt_system_compositor **out_xsysc);
 
 
+struct vk_bundle;
+
+/*!
+ * ADR-053 P5: the Vulkan bundle the system compositor's target service owns
+ * (the null compositor's device on macOS and desktop Linux), for service-side
+ * GPU work that is not a session's (the conversion core's Vulkan glue).
+ * NULL when @p xsysc is not a multi system compositor or has no Vulkan device.
+ * Borrowed: valid until @p xsysc is destroyed.
+ *
+ * @public @memberof multi_system_compositor
+ */
+struct vk_bundle *
+comp_multi_system_get_vk(struct xrt_system_compositor *xsysc);
+
 #ifdef __cplusplus
 }
 #endif

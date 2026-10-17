@@ -579,7 +579,14 @@ ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_
 			hook(hook_ud, gpu); // allocator + the dp-lift row
 		}
 		ipc_server_conv_set_io(sc, &gpu->io); // the route engages last
-		U_LOG_W("[conv] GPU glue installed: the v3 lift route goes through the conversion core");
+		if (gpu->io.cpu_only) {
+			// ADR-053 P5: a GPU side (POSIX Vulkan glue) under the CPU I/O table.
+			U_LOG_W(
+			    "[conv] GPU glue installed under the CPU route (cpu_only): spec-4 CPU streams, composed "
+			    "pipelines on; no v3 route");
+		} else {
+			U_LOG_W("[conv] GPU glue installed: the v3 lift route goes through the conversion core");
+		}
 		return;
 	}
 
