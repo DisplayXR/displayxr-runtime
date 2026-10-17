@@ -587,7 +587,13 @@ ipc_client_conv_submit_frame(struct ipc_connection *ipc_c,
 		handles[0] = (HANDLE)((size_t)handles[0] | 1);
 	}
 #endif
-	const uint32_t count = image->sync_kind == XRT_CONV_SYNC_FENCE_NT ? 2u : 1u;
+	uint32_t count = image->sync_kind == XRT_CONV_SYNC_FENCE_NT ? 2u : 1u;
+#if !defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	// ADR-053 P5 step E: a sync_file / timeline semaphore fd rides second.
+	if (image->sync_kind == XRT_CONV_SYNC_SYNC_FD || image->sync_kind == XRT_CONV_SYNC_VK_SEMAPHORE_FD) {
+		count = 2u;
+	}
+#endif
 	return ipc_call_conv_submit_frame(ipc_c, &args, image, region_x, region_y, handles, count, out_frame_id);
 }
 

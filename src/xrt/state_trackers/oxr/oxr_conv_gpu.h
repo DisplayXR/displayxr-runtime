@@ -35,9 +35,27 @@ oxr_conv_v3_eligible(struct oxr_session *sess);
 struct ipc_client_lift_link *
 oxr_conv_link_get(struct oxr_session *sess);
 
-/*! XrLiftImageKindDXR masks (1 << kind) this session can hand in / take out. */
+/*! XrLiftImageKindDXR masks (1 << kind) this session can hand in / take out:
+ *  the offer below, a POSIX GPU kind only once the service reported it. */
 void
 oxr_conv_session_image_kinds(struct oxr_session *sess, uint64_t *out_in_kinds, uint64_t *out_export_kinds);
+
+/*! What this session could hand in / take out if the service takes it (what
+ *  xrEnumerateLiftTasksDXR intersects with the service's per-task kinds). On
+ *  Windows the same as oxr_conv_session_image_kinds. */
+void
+oxr_conv_session_image_kinds_offer(struct oxr_session *sess, uint64_t *out_in_kinds, uint64_t *out_export_kinds);
+
+/*! The service's per-task kinds of the last enumeration, unioned (step E: the
+ *  POSIX GPU kinds are offered only once the service took them). No-op on
+ *  Windows, whose kinds are static. */
+void
+oxr_conv_learn_service_kinds(struct oxr_session *sess, uint64_t in_kinds, uint64_t export_kinds);
+
+/*! Step E: the extent of an IOSurface the app handed in (macOS); false for a
+ *  NULL / foreign object or on another platform. */
+bool
+oxr_conv_iosurface_extent(void *iosurface, uint32_t *out_w, uint32_t *out_h);
 
 /*! CPU input: copy the region (@p x, @p y, @p w x @p h of @p bytes, @p pitch)
  *  tightly packed into a new shared section (Windows: a file mapping; POSIX:

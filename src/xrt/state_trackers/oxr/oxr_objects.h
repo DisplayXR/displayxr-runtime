@@ -2953,6 +2953,18 @@ struct oxr_session
 	 */
 	uint32_t lift_max_views;
 
+#ifndef XRT_OS_WINDOWS
+	/*!
+	 * XR_DXR_lift spec 4, ADR-053 P5 step E: the GPU image kinds (1 << kind)
+	 * the service's transport reported for this session's tasks at the last
+	 * xrEnumerateLiftTasksDXR (the union over tasks; CPU is not tracked). A
+	 * POSIX session offers a GPU kind only once the service took it: the
+	 * handshake Windows does per enumeration, remembered for submit / create.
+	 */
+	uint64_t lift_service_in_kinds;
+	uint64_t lift_service_export_kinds;
+#endif
+
 	/*!
 	 * XR_DXR_lift spec 4 (#2054): the session made a spec-4 call, so it is
 	 * opted into the task / provider events (a spec-3 app never receives an
@@ -4806,6 +4818,10 @@ struct oxr_lift_stream_dxr
 	void *cpu_view;    //!< the mapped CPU export (valid until the next acquire)
 	void *cpu_token;   //!< oxr_conv_cpu_map's token for cpu_view (POSIX mapping state)
 	uint64_t cpu_bytes;
+#ifndef XRT_OS_WINDOWS
+	//! Step E: exportKind IOSURFACE / OPAQUE_FD (an XrLiftImageKindDXR; 0 = not a GPU export).
+	uint32_t export_gpu_kind;
+#endif
 };
 
 //! Spec 4: at most this often does xrPollEvent ask the service for lift events.
