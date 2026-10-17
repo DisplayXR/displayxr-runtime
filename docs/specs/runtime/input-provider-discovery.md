@@ -137,8 +137,10 @@ ships at **50** and `sim_input` at **200**. Equal values are broken
 deterministically by provider id (`strcmp`) and the loader logs one WARN
 naming both ids, because which of the two then outranks the other is an
 alphabetical accident rather than anyone's decision (#1466).
-A `PreferredPlugin` override mirroring DP spec §2.1 is *planned, not yet
-implemented* — v1 selection is pure ProbeOrder.
+The `PreferredPlugin` override mirroring DP spec §2.1 is implemented (ADR-054
+N3a; `displayxr-cli input use <id> [--machine]`, see the table above and the
+loader's `target_input_plugin_loader.h`): the preferred id is hoisted ahead of
+the ProbeOrder sort; without one, selection is pure ProbeOrder.
 
 `scripts\register_dev_plugin.bat input [dll]` registers the freshly-built
 sim-input (or a vendor DLL) from an elevated prompt;
