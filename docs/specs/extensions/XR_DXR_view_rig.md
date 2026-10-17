@@ -77,10 +77,24 @@ locate, carried back in the view reply (`ipc_view_rig_canvas`, stamped with
 the locate's predicted display time). It is never re-derived from window
 rects in the app.
 
+**Staleness is the consumer's contract, not bounded by the runtime.** The
+runtime does not refuse or re-resolve an old canvas: joints follow the most
+recent view locate, however long ago it ran. A consumer whose canvas can move
+(window drag, zone rect, layout animation) must call `xrLocateViews` before
+`xrLocateHandJointsEXT` **every frame**. The runtime logs the canvas age once
+per verdict change per session.
+
 So locate views before joints in a frame. Before a session's first view
 locate, the runtime uses the session's own canvas in-process, and the full
 display in service mode. The display plane is re-expressed in the joint
 locate's base space at the joint time.
+
+**Gate on the spec version, not on the extension's presence.** A runtime
+older than spec 4 ignores a rig chained on `XrHandJointsLocateInfoEXT` and
+returns base-space joints with no error. A consumer must read `XR_DXR_view_rig`'s
+`extensionVersion` from `xrEnumerateInstanceExtensionProperties` and rely on
+rig-frame joints only when it is **≥ 4**; below that, keep joints in base space
+or skip rig-scoped hand features.
 
 ## 3. Version history
 

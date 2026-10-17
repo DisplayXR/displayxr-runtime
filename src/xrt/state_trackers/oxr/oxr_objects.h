@@ -3145,9 +3145,15 @@ struct oxr_session
 	/*!
 	 * XR_DXR_view_rig spec 4 (#2189): the rig last chained on
 	 * XrHandJointsLocateInfoEXT — the same parse + clamps as @ref view_rig,
-	 * kept apart so a joint locate never changes what the views use.
+	 * kept apart so a joint locate never changes what the views use. Never
+	 * read by the view path (and @ref view_rig never by the joint path): do
+	 * not unify them — they are written on different threads.
 	 */
 	struct oxr_view_rig_state joint_rig;
+
+	//! #2189: the last rig-joints verdict logged for this session (-1 = none yet,
+	//! 0 = joints stayed in base space, 1 = mapped) — a WARN on every change.
+	int32_t rig_joints_verdict;
 
 	/*!
 	 * #1502: the VIEW reference space's eye-centroid offset, expressed in the
