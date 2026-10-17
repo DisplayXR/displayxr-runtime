@@ -86,4 +86,7 @@ add_library(displayxr::conversion_store ALIAS conv_store)
 target_link_libraries(conv_store PUBLIC conv_core aux_util aux_os xrt-external-cjson)
 if(WIN32)
 	target_link_libraries(conv_store PRIVATE winhttp advapi32)
+else()
+	# #2195: libcurl is dlopen()ed at run time, never linked.
+	target_link_libraries(conv_store PRIVATE ${CMAKE_DL_LIBS})
 endif()

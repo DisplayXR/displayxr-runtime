@@ -637,9 +637,19 @@ environment, not a client's). Layout:
 
 **Packs.** Each registered provider's `Packs` (registry `REG_MULTI_SZ`) / `packs[]` (manifest),
 a path relative to the provider binary's directory unless absolute. A relative `blobBaseUrl`
-resolves against the manifest's directory (`file://`); `https://` downloads use WinHTTP on
-Windows (redirects followed); POSIX has no network downloader yet (P5), so a missing blob there
-is `FAILED(NETWORK)` unless its pack is served from `file://`. The host ops carry no provider
+resolves against the manifest's directory (`file://`). `http(s)://` downloads use WinHTTP on
+Windows and **libcurl on macOS and desktop Linux** (#2195), loaded at run time with `dlopen`
+(`/usr/lib/libcurl.4.dylib`, which macOS always ships; `libcurl.so.4` on Linux), so nothing
+links it: a Linux box without libcurl still runs, and a missing blob there is
+`FAILED(NETWORK)` with the reason logged (`conv_model_store_http_available()`). Both downloaders
+feed the same sink, so the write protocol — `<sha256>.<nonce>.part`, size then sha256 while
+streaming, rename without replace, `.ok` stamp (`"<sha256> <size>\n"`) last — is one code path
+(`blob_protocol`) on every platform, byte-identical to what the browser writes on Windows. Both
+follow redirects (at most 5; libcurl restricted to http / https), give up on a connect after
+15 s or a receive stalled for 30 s with no total limit, and report progress per received chunk
+into `DOWNLOADING`; a store shutdown aborts a transfer, stalled or not. **As built, neither
+resumes with `Range`** (§5.1's contract): an interrupted download restarts from byte 0 under a
+new nonce, and the metered-network ask is not implemented on any platform. The host ops carry no provider
 context, so a host's store serves the union of the packs it was configured with: the service
 every registered provider's, a satellite its own provider's.
 
@@ -730,9 +740,10 @@ Two optional model keys, so a pack can point at an upstream file (a vendor CDN, 
   it. With its own `url`, the auth applies to that file; without one, to every file of the model.
 - A missing, unreadable or refused credential is **`CONV_STORE_BLOB_AUTH`** → `FAILED(NETWORK)`,
   retryable: adding the credential and requesting again fixes it.
-- **As built:** Windows downloads with WinHTTP (`fetch_http`). POSIX still has no network
-  downloader (P5), so `url` / `auth` are parsed and validated there but an `https` blob stays
-  `FAILED(NETWORK)` until P5 lands.
+- **As built:** `fetch_http` — WinHTTP on Windows, libcurl (loaded at run time) on macOS and
+  desktop Linux (#2195). With a credential each downloader follows redirects itself and sends
+  the token only over https to the host the pack named; libcurl copies the header line and
+  frees it without wiping (the local copy is wiped), the same caveat as the remote provider.
 - Research-only weights are still never bundled, mirrored or pre-fetched (§5.3); `url` exists so the
   user's own download can come from the official source.
 
