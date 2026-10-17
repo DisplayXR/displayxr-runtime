@@ -825,19 +825,24 @@ if(TARGET tests_oxr_view_space)
 	# sim-input plug-in through a generated manifest, in its own process (the
 	# provider scan is one-shot per process).
 	if(TARGET drv_sim_input_plugin)
+		# Per-config directory: the manifest names the plug-in binary through
+		# $<TARGET_FILE>, which differs per configuration on a multi-config
+		# generator (Visual Studio), and file(GENERATE) must not write one path
+		# with two contents. The environment rides in the COMMAND (cmake -E env),
+		# where generator expressions are evaluated per configuration too.
+		set(_rig_hands_dir "${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins/$<CONFIG>")
 		file(GENERATE
-		     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins/200-sim-input-input-provider.json
+		     OUTPUT "${_rig_hands_dir}/200-sim-input-input-provider.json"
 		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-input\",\n    \"display_name\": \"DisplayXR Sim Input\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_input_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
 		     )
 		add_dependencies(tests_oxr_view_space drv_sim_input_plugin)
+		# POSIX discovery reads XRT_PLUGIN_SEARCH_PATH; Windows discovery is
+		# registry-only, so there the arm finds no provider and SUCCEEDs with a WARN.
 		add_test(NAME tests_oxr_view_space_rig_hands
-		         COMMAND tests_oxr_view_space "[rig_hands]" --success --allow-running-no-tests
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_rig_hands_dir}"
+		                 DXR_INPUT_SIM_INPUT_ENABLE=1 $<TARGET_FILE:tests_oxr_view_space> "[rig_hands]" --success
+		                 --allow-running-no-tests
 		         )
-		set_tests_properties(
-			tests_oxr_view_space_rig_hands
-			PROPERTIES ENVIRONMENT
-			"XRT_PLUGIN_SEARCH_PATH=${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins;DXR_INPUT_SIM_INPUT_ENABLE=1"
-			)
 	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers
 		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests
