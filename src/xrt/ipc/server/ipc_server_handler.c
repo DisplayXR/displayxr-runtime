@@ -70,6 +70,11 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+// XR_DXR_lift §6 on the macOS / desktop-Linux weave engines (lift_weave_rects).
+#include "multi/comp_multi_weave_lift.h"
+#endif
+
 #if defined(COMP_MULTI_SHARED_SURFACE)
 // Shared-surface service input forwarding (macOS #48, desktop Linux #710): drain
 // the generic per-target queues fed by the service window's input capture
@@ -10274,7 +10279,9 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 	if (args->count > IPC_LIFT_WEAVE_RECTS_MAX) {
 		return XRT_ERROR_IPC_FAILURE; // untrusted wire
 	}
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_HAVE_VK_CONV_SERVICE)
+	// The POSIX arm (ADR-053 P5 step C): the macOS / desktop-Linux Vulkan weave
+	// engines lift through vk_conv_weave; the wire and this conversion are shared.
 	struct xrt_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
 	for (uint32_t i = 0; i < args->count; i++) {
 		const struct ipc_lift_weave_rect *w = &args->rects[i];
@@ -10309,7 +10316,11 @@ ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct 
 		}
 	}
 	ics->lift_staged_vps_count = 0;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+#else
+	if (!comp_multi_weave_lift_set_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+#endif
 		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
 		// one): refused, non-fatal. The submit then weaves those rects as drawn.
 		return XRT_ERROR_WEAVE_REFUSED;

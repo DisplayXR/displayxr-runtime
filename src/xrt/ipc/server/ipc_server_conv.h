@@ -257,6 +257,17 @@ void
 ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_conv_gpu *gpu);
 
 /*!
+ * ADR-053 P5 step C: under the CPU route (cpu_only, POSIX) spec 3 is off --
+ * its submit and export kinds are D3D11 textures -- EXCEPT for SBS / NVIEW
+ * stream create and properties once a weave engine can lift rects
+ * (@p enabled; ipc_server_conv_vk.c sets it with the weave bridge). Such a
+ * stream is only ever fed by lifted weave rects (the weave path's snapshot)
+ * and only ever read by the weave; its properties report SBS / NVIEW only.
+ */
+void
+ipc_server_conv_set_weave_rects(struct ipc_server_conv *sc, bool enabled);
+
+/*!
  * The weave path's resolver (#2003): a v3 stream id this module minted for
  * @p client_id -> its core stream and v3 mode. False = not ours.
  */
