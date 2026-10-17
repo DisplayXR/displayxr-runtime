@@ -11,6 +11,7 @@
 #include "conv_host_log.h"
 
 #include "conversion/conv_host_inproc.h"
+#include "conversion/conv_host_paths.h"
 #include "conversion/conv_model_store.h"
 #include "target_component_loader.h"
 #include "target_conv_status.h"
@@ -136,6 +137,19 @@ host_get_consent(uint32_t kind)
 	return kind == XRT_CONV_CONSENT_OFFBOX && u_offbox_consent_granted(id);
 }
 
+/*! #2194: get_path for this host's one provider, the same answer the
+ *  service's in-process host gives (conv_host_paths.h): this process runs with
+ *  the service's environment, so it resolves the same scratch root. */
+static bool
+host_get_path(uint32_t kind, char *buf, uint32_t buf_size)
+{
+	char id[sizeof(g_cfg.provider_id)];
+	cfg_lock();
+	(void)snprintf(id, sizeof(id), "%s", g_cfg.provider_id);
+	cfg_unlock();
+	return conv_host_get_path(id, kind, conv_host_log_path(), buf, buf_size);
+}
+
 static void
 host_notify_changed(uint32_t cap_id)
 {
@@ -158,6 +172,7 @@ init_iface(void)
 	g_iface.get_adapter_hint = host_get_adapter_hint;
 	g_iface.notify_changed = host_notify_changed;
 	g_iface.get_consent = host_get_consent;
+	g_iface.get_path = host_get_path;
 	// ADR-053 P4 (#2108): the host performs downloads and verification itself,
 	// into the runtime-owned store, under the store's ACL as this (user) process.
 	g_iface.model_resolve = conv_store_host_model_resolve;

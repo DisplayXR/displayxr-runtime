@@ -14,6 +14,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "conversion/conv_core.h"
+#include "conversion/conv_host_paths.h"
 #include "conversion/conv_model_store.h"
 #include "conversion/conv_observer_autoconv.h"
 #include "conversion/conv_provider_legacy_dp.h"
@@ -31,6 +32,7 @@
 
 #include "os/os_threading.h"
 #include "util/u_camera_consent.h"
+#include "util/u_file_logging.h"
 #include "util/u_logging.h"
 
 #include <ctype.h>
@@ -511,6 +513,49 @@ HOST_GET_CONSENT(13)
 HOST_GET_CONSENT(14)
 HOST_GET_CONSENT(15)
 
+/*! #2194: get_path for the slot's provider (conv_host_paths.h): its own
+ *  scratch directory, the process store's root, the service log's directory.
+ *  The satellite host answers the same paths for its provider. */
+static bool
+host_get_path_slot(uint32_t slot, uint32_t kind, char *buf, uint32_t buf_size)
+{
+	if (slot >= HOST_SLOTS || !g_host_slot[slot].used) {
+		if (buf != NULL && buf_size > 0) {
+			buf[0] = '\0';
+		}
+		return false;
+	}
+	return conv_host_get_path(g_host_slot[slot].id, kind, u_file_logging_get_path(), buf, buf_size);
+}
+
+#define HOST_GET_PATH(i)                                                                                               \
+	static bool host_get_path_##i(uint32_t kind, char *buf, uint32_t buf_size)                                     \
+	{                                                                                                              \
+		return host_get_path_slot(i, kind, buf, buf_size);                                                     \
+	}
+HOST_GET_PATH(0)
+HOST_GET_PATH(1)
+HOST_GET_PATH(2)
+HOST_GET_PATH(3)
+HOST_GET_PATH(4)
+HOST_GET_PATH(5)
+HOST_GET_PATH(6)
+HOST_GET_PATH(7)
+HOST_GET_PATH(8)
+HOST_GET_PATH(9)
+HOST_GET_PATH(10)
+HOST_GET_PATH(11)
+HOST_GET_PATH(12)
+HOST_GET_PATH(13)
+HOST_GET_PATH(14)
+HOST_GET_PATH(15)
+
+static bool (*const k_host_get_path[HOST_SLOTS])(uint32_t, char *, uint32_t) = {
+    host_get_path_0,  host_get_path_1,  host_get_path_2,  host_get_path_3,  host_get_path_4,  host_get_path_5,
+    host_get_path_6,  host_get_path_7,  host_get_path_8,  host_get_path_9,  host_get_path_10, host_get_path_11,
+    host_get_path_12, host_get_path_13, host_get_path_14, host_get_path_15,
+};
+
 static bool (*const k_host_get_consent[HOST_SLOTS])(uint32_t) = {
     host_get_consent_0,  host_get_consent_1,  host_get_consent_2,  host_get_consent_3,
     host_get_consent_4,  host_get_consent_5,  host_get_consent_6,  host_get_consent_7,
@@ -554,6 +599,7 @@ host_for_entry(const struct xrt_conversion_plugin_entry *e)
 	g_hosts[slot] = g_host;
 	g_hosts[slot].get_setting = k_host_get_setting[slot];
 	g_hosts[slot].get_consent = k_host_get_consent[slot];
+	g_hosts[slot].get_path = k_host_get_path[slot];
 	return &g_hosts[slot];
 }
 
