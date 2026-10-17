@@ -114,6 +114,7 @@ set(tests
     tests_input_arbiter_floor
     tests_sim_input_nav
     tests_gamepad_map
+    tests_touch_gesture
     tests_comp_layer_view_camera
     tests_comp_color_policy
     tests_m_matrix_projection
@@ -835,6 +836,18 @@ target_include_directories(
 			  ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_gamepad_map PRIVATE xrt-interfaces)
+# #132 — the touch provider's gesture recogniser + rig/aim math, and the
+# pointer-event ring it is fed from. Compiled straight in for the same reason
+# as tests_sim_input_nav: what is under test is the mapping table (pure
+# functions of the events and timestamps fed in), not discovery.
+target_sources(
+	tests_touch_gesture PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/touch_input/touch_gesture.c
+	)
+target_include_directories(
+	tests_touch_gesture PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/touch_input
+			     ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_touch_gesture PRIVATE xrt-interfaces aux_util aux_os)
 
 # #1380 — the rig (navigation) role in the input arbiter. The arbiter is pure
 # decision logic over a candidate table, so the unit compiles it straight in

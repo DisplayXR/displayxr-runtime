@@ -414,14 +414,105 @@ endif()
 endif() # XRT_FEATURE_OPENXR — DisplayXR-SimDisplay plug-in block
 
 ####
+# DisplayXR-TouchInput input-provider plug-in (ADR-034 / #132).
+#
+# The first ANDROID input provider: touch gestures -> a NAVIGATION device
+# (orbit / pinch / pan / double-tap recenter) + an emulated
+# khr/simple_controller (aim ray under the finger, select = tap or hold). The
+# events come from the host's pointer queue (xrt_input_plugin_host_iface::
+# poll_pointer_events), which the runtime's own surfaces push into, so the
+# plug-in has no platform code of its own and builds EVERYWHERE: Android is
+# the shipping target (libdxri100_touch_input.so, discovered by the
+# `libdxri<NNN>_` prefix exactly like libdxrp for DPs), desktop builds get
+# DisplayXR-TouchInput for development — its probe() declines there unless
+# ENABLE=1, because nothing feeds the queue on a desktop yet. Build model as
+# sim-input below: self-contained static aux + version script on ELF (Android
+# included), XRT_USING_RUNTIME_DLL + runtime import lib on Windows/macOS.
+if(XRT_FEATURE_OPENXR)
+add_library(drv_touch_input_plugin SHARED
+	touch_input/touch_gesture.c
+	touch_input/touch_gesture.h
+	touch_input/touch_input_controller.c
+	touch_input/touch_input_interface.h
+	touch_input/touch_input_nav.c
+	touch_input/touch_input_plugin.c
+	touch_input/touch_input_provider.h
+	touch_input/touch_input_settings.c
+	touch_input/touch_input_settings.h
+	)
+if(ANDROID OR XRT_HAVE_LINUX)
+	target_link_libraries(drv_touch_input_plugin PRIVATE xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_touch_input_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_touch_input_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_touch_input_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_touch_input_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/touch_input
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+if(ANDROID)
+	# Convention-driven discovery: the input loader scans the runtime APK's
+	# lib dir for libdxri<NNN>_<id>.so, NNN = ProbeOrder. 100: a vendor's
+	# tracking provider (50) outranks touch; sim-input (200) would not.
+	set_target_properties(drv_touch_input_plugin PROPERTIES
+		OUTPUT_NAME "dxri100_touch_input"
+		LINKER_LANGUAGE CXX
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+else()
+	set_target_properties(drv_touch_input_plugin PROPERTIES
+		OUTPUT_NAME "DisplayXR-TouchInput"
+		PREFIX ""
+		LINKER_LANGUAGE CXX
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+endif()
+# Single-symbol export filter: xrtInputPluginNegotiate only (Android included —
+# the statically-linked aux copies must not interpose the runtime's, #496).
+if(APPLE)
+	target_link_options(drv_touch_input_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_touch_input_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_touch_input_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+elseif(NOT ANDROID)
+	install(
+		TARGETS drv_touch_input_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR — DisplayXR-TouchInput block
+
+####
 # DisplayXR-SimInput input-provider plug-in DLL (ADR-034 / #823).
 #
 # The in-tree reference INPUT provider — deterministic synthetic motion
 # controllers for the hardware-free CI gate. Same build model as the
 # sim-display plug-in above (XRT_USING_RUNTIME_DLL + runtime import lib on
 # Windows/macOS; self-contained static-aux + version script on ELF), but a
-# much smaller dependency set: no DP factories, no graphics APIs. Android
-# ships no input providers in v1 (loader stubs), so the target is desktop-only.
+# much smaller dependency set: no DP factories, no graphics APIs. The only
+# Android input provider is the touch provider above; the simulated
+# controllers stay desktop-only.
 if(XRT_FEATURE_OPENXR AND NOT ANDROID)
 add_library(drv_sim_input_plugin SHARED
 	sim_input/sim_input_device.c
@@ -505,7 +596,7 @@ endif()
 # copy_if_different keeps it a no-op when nothing changed. The manifests stay
 # the script's job — they carry absolute paths and never go stale.
 if(XRT_HAVE_LINUX AND NOT ANDROID)
-	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin)
+	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin)
 		add_custom_command(
 			TARGET ${_dxr_staged_plugin}
 			POST_BUILD
