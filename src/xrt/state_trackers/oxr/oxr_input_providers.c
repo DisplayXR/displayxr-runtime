@@ -46,8 +46,7 @@ _Static_assert(XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_CONTROLLERS) == 0
 _Static_assert(XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_HAND_TRACKING) == 0x2, "family bit mirror");
 _Static_assert(XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_GAMEPAD) == 0x4, "family bit mirror");
 _Static_assert((int)XR_INPUT_ROLE_FAMILY_CONTROLLERS_DXR == XRT_INPUT_ROLE_FAMILY_CONTROLLERS + 1, "family mirror");
-_Static_assert((int)XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR == XRT_INPUT_ROLE_FAMILY_HAND_TRACKING + 1,
-               "family mirror");
+_Static_assert((int)XR_INPUT_ROLE_FAMILY_HAND_TRACKING_DXR == XRT_INPUT_ROLE_FAMILY_HAND_TRACKING + 1, "family mirror");
 _Static_assert((int)XR_INPUT_ROLE_FAMILY_GAMEPAD_DXR == XRT_INPUT_ROLE_FAMILY_GAMEPAD + 1, "family mirror");
 _Static_assert(XRT_INPUT_PROVIDER_ID_SIZE == XR_MAX_INPUT_PROVIDER_ID_SIZE_DXR, "size mirror");
 _Static_assert(XRT_INPUT_PROVIDER_NAME_SIZE == XR_MAX_INPUT_PROVIDER_NAME_SIZE_DXR, "size mirror");
@@ -136,7 +135,8 @@ gather(struct oxr_logger *log, struct oxr_system *sys, struct xrt_input_provider
 				restart = true;
 				break;
 			}
-			const uint32_t count = page.count < XRT_INPUT_PROVIDER_PAGE_MAX ? page.count : XRT_INPUT_PROVIDER_PAGE_MAX;
+			const uint32_t count =
+			    page.count < XRT_INPUT_PROVIDER_PAGE_MAX ? page.count : XRT_INPUT_PROVIDER_PAGE_MAX;
 			for (uint32_t i = 0; i < count && got < cap; i++) {
 				out[got++] = page.items[i];
 			}
@@ -265,8 +265,8 @@ oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPref
 	// The roles move on the next xrSyncActions (which raises its own event
 	// for the families that actually moved); this one says "your preference
 	// was recorded — re-enumerate" even when nothing moved.
-	(void)oxr_event_push_XrEventDataInputProvidersChanged(&log, sess->sys->inst,
-	                                                      (XrInputRoleFamilyFlagsDXR)XRT_INPUT_ROLE_FAMILY_BIT(family));
+	(void)oxr_event_push_XrEventDataInputProvidersChanged(
+	    &log, sess->sys->inst, (XrInputRoleFamilyFlagsDXR)XRT_INPUT_ROLE_FAMILY_BIT(family));
 	return XR_SUCCESS;
 }
 

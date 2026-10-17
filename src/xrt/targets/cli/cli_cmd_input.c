@@ -165,9 +165,10 @@ cmd_list(int argc, const char **argv)
 				cJSON *row = cJSON_CreateObject();
 				cJSON_AddStringToObject(row, "app", pins[i].exe_basename);
 				cJSON_AddStringToObject(row, "preferred", pins[i].provider_id);
-				cJSON_AddBoolToObject(row, "registered", provider_registered(pins[i].provider_id) ||
-				                                             strcmp(pins[i].provider_id,
-				                                                    XRT_INPUT_PROVIDER_ID_EMULATED) == 0);
+				cJSON_AddBoolToObject(row, "registered",
+				                      provider_registered(pins[i].provider_id) ||
+				                          strcmp(pins[i].provider_id, XRT_INPUT_PROVIDER_ID_EMULATED) ==
+				                              0);
 				cJSON_AddItemToArray(per_app, row);
 			}
 		}
@@ -676,7 +677,8 @@ static bool
 app_key_from_arg(const char *arg, char *out, size_t cap)
 {
 	if (arg == NULL || !u_exe_basename_from_path(arg, out, cap)) {
-		P("error: '--app' needs an executable name such as SampleGame.exe (got '%s').\n", arg != NULL ? arg : "");
+		P("error: '--app' needs an executable name such as SampleGame.exe (got '%s').\n",
+		  arg != NULL ? arg : "");
 		return false;
 	}
 	return true;
@@ -687,7 +689,9 @@ pin_write_result(enum target_input_pin_write r)
 {
 	switch (r) {
 	case TARGET_INPUT_PIN_WRITE_OK: return 0;
-	case TARGET_INPUT_PIN_WRITE_INVALID: P("FAIL: not a valid provider id / executable name — nothing written.\n"); return 1;
+	case TARGET_INPUT_PIN_WRITE_INVALID:
+		P("FAIL: not a valid provider id / executable name — nothing written.\n");
+		return 1;
 	case TARGET_INPUT_PIN_WRITE_DENIED: P("FAIL: the per-user store refused the write.\n"); return 1;
 	case TARGET_INPUT_PIN_WRITE_UNSUPPORTED: P("FAIL: there is no per-user store on this platform.\n"); return 1;
 	case TARGET_INPUT_PIN_WRITE_FAILED:
