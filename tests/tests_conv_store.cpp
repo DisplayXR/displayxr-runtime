@@ -18,10 +18,14 @@
  *  - Windows: a root the store creates is readable by BUILTIN\Users and by
  *    AppContainer processes, writable (create files) by the logged-in user,
  *    and the blobs inside it are not writable by other users.
+ *  - #2194: get_path. The scratch root per platform, a provider's scratch
+ *    directory created owner-only on first request, MODEL_STORE = the
+ *    process store's root, LOGS = the log file's directory.
  */
 
 #include "catch_amalgamated.hpp"
 
+#include "conversion/conv_host_paths.h"
 #include "conversion/conv_model_store.h"
 #include "util/u_sha256.h"
 
@@ -40,6 +44,8 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -647,3 +653,155 @@ TEST_CASE("conv_store: the ACL of a root the store creates (Windows)")
 	CHECK(fs::exists(other.path / "blobs"));
 }
 #endif
+
+
+/*
+ *
+ * #2194: get_path (conv_host_paths.h).
+ *
+ */
+
+namespace {
+
+void
+set_env(const char *name, const char *value)
+{
+#ifdef XRT_OS_WINDOWS
+	_putenv_s(name, value != nullptr ? value : "");
+	SetEnvironmentVariableA(name, value);
+#else
+	if (value != nullptr) {
+		setenv(name, value, 1);
+	} else {
+		unsetenv(name);
+	}
+#endif
+}
+
+} // namespace
+
+TEST_CASE("conv_paths: the scratch root per platform")
+{
+	char out[512];
+	conv_scratch_root_inputs in{};
+
+	in.os = CONV_SCRATCH_OS_MACOS;
+	in.home = "/Users/u";
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "/Users/u/Library/Caches/DisplayXR/Conversion");
+
+	in = conv_scratch_root_inputs{};
+	in.os = CONV_SCRATCH_OS_LINUX;
+	in.home = "/home/u";
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "/home/u/.cache/displayxr/conversion");
+	in.xdg_cache_home = "/var/cache/u";
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "/var/cache/u/displayxr/conversion");
+	in.xdg_cache_home = "relative/cache"; // invalid per XDG: ignored
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "/home/u/.cache/displayxr/conversion");
+
+	in = conv_scratch_root_inputs{};
+	in.os = CONV_SCRATCH_OS_WINDOWS;
+	in.local_app_data = "C:\\Users\\u\\AppData\\Local";
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "C:\\Users\\u\\AppData\\Local\\DisplayXR\\Conversion");
+
+	in.env_override = "/tmp/x";
+	REQUIRE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(std::string(out) == "/tmp/x");
+
+	in = conv_scratch_root_inputs{};
+	in.os = CONV_SCRATCH_OS_WINDOWS; // no LOCALAPPDATA
+	CHECK_FALSE(conv_scratch_root_from(&in, out, sizeof(out)));
+	CHECK(out[0] == '\0');
+	in.os = CONV_SCRATCH_OS_LINUX; // no HOME, no XDG
+	CHECK_FALSE(conv_scratch_root_from(&in, out, sizeof(out)));
+	in.home = "/home/u";
+	char tiny[8];
+	CHECK_FALSE(conv_scratch_root_from(&in, tiny, sizeof(tiny))); // never truncated
+	CHECK(tiny[0] == '\0');
+}
+
+TEST_CASE("conv_paths: a provider id is one path component")
+{
+	CHECK(conv_scratch_id_valid("open-conversion"));
+	CHECK(conv_scratch_id_valid("sim_conversion.2"));
+	CHECK_FALSE(conv_scratch_id_valid(nullptr));
+	CHECK_FALSE(conv_scratch_id_valid(""));
+	CHECK_FALSE(conv_scratch_id_valid("."));
+	CHECK_FALSE(conv_scratch_id_valid(".."));
+	CHECK_FALSE(conv_scratch_id_valid("a/b"));
+	CHECK_FALSE(conv_scratch_id_valid("a\\b"));
+	CHECK_FALSE(conv_scratch_id_valid("a b"));
+	CHECK_FALSE(conv_scratch_id_valid(std::string(64, 'a').c_str()));
+	CHECK(conv_scratch_id_valid(std::string(63, 'a').c_str()));
+}
+
+TEST_CASE("conv_paths: get_path answers a provider's scratch dir, the store root and the log dir")
+{
+	temp_dir t;
+	const fs::path root = t.path / "scratch-root"; // does not exist yet
+	set_env("DXR_CONV_SCRATCH_ROOT", root.u8string().c_str());
+	struct Restore
+	{
+		~Restore()
+		{
+			set_env("DXR_CONV_SCRATCH_ROOT", nullptr);
+		}
+	} restore;
+
+	char buf[512];
+	REQUIRE(conv_host_get_path("open-conversion", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+	const fs::path dir = root / "open-conversion";
+	CHECK(fs::path(buf) == dir);
+	CHECK(fs::is_directory(dir)); // created on first request
+#ifndef XRT_OS_WINDOWS
+	struct stat st = {};
+	REQUIRE(stat(dir.c_str(), &st) == 0);
+	CHECK((st.st_mode & 0777) == 0700);
+#endif
+	// Idempotent, and a provider's files survive the next request.
+	write_file(dir / "cache.bin", "x");
+	REQUIRE(conv_host_get_path("open-conversion", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+	CHECK(fs::exists(dir / "cache.bin"));
+	// Each provider its own.
+	REQUIRE(conv_host_get_path("other", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+	CHECK(fs::path(buf) == root / "other");
+
+	// Refusals: no id, an id that names a path, a buffer too small, an unknown kind.
+	CHECK_FALSE(conv_host_get_path("", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+	CHECK(buf[0] == '\0');
+	CHECK_FALSE(conv_host_get_path("../escape", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+	CHECK_FALSE(fs::exists(t.path / "escape"));
+	char tiny[8];
+	CHECK_FALSE(conv_host_get_path("open-conversion", XRT_CONV_PATH_SCRATCH, nullptr, tiny, sizeof(tiny)));
+	CHECK(tiny[0] == '\0');
+	CHECK_FALSE(conv_host_get_path("open-conversion", 99u, nullptr, buf, sizeof(buf)));
+
+	SECTION("a root that cannot be created is a false, not a path")
+	{
+		write_file(t.path / "a-file", "x");
+		set_env("DXR_CONV_SCRATCH_ROOT", (t.path / "a-file" / "sub").u8string().c_str());
+		CHECK_FALSE(conv_host_get_path("open-conversion", XRT_CONV_PATH_SCRATCH, nullptr, buf, sizeof(buf)));
+		CHECK(buf[0] == '\0');
+	}
+
+	SECTION("MODEL_STORE: the process store's root (what it would resolve before it exists)")
+	{
+		const fs::path models = t.path / "Models";
+		set_env("DXR_CONV_MODELS_ROOT", models.u8string().c_str());
+		REQUIRE(conv_host_get_path("open-conversion", XRT_CONV_PATH_MODEL_STORE, nullptr, buf, sizeof(buf)));
+		CHECK(fs::path(buf) == models);
+		set_env("DXR_CONV_MODELS_ROOT", nullptr);
+	}
+
+	SECTION("LOGS: the directory of the host's log file; none without one")
+	{
+		const std::string log = (t.path / "logs" / "DisplayXR_x.log").u8string();
+		REQUIRE(conv_host_get_path("open-conversion", XRT_CONV_PATH_LOGS, log.c_str(), buf, sizeof(buf)));
+		CHECK(fs::path(buf) == t.path / "logs");
+		CHECK_FALSE(conv_host_get_path("open-conversion", XRT_CONV_PATH_LOGS, "", buf, sizeof(buf)));
+	}
+}

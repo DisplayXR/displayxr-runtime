@@ -189,6 +189,30 @@ A splat result carries three kinds of information with three owners (ADR-057 §3
 
 **The convenience camera-block writer** (`conversion/conv_camera_block.{h,c}`; `displayxr-cli conv run --camera-block auto`, `conv camera-block`) turns facts + suggestions into a SOG `meta.json` `camera` block, v2 shape: `convention`, `rig` (`"camera"`, the auto writer's default), `rest` (identity), `intrinsics`, `stereo.baseline_m` **only for a metric result**, `metric` (the fit), `focus` (the suggestion, `source: "auto"`), `dxr` (neutral factors) — the whole block marked **`"source": "auto"`**. It never overwrites a block it did not write: an existing `camera` whose `source` is not `"auto"` is the author's and the file is left byte-for-byte untouched (`kept-authored`); an earlier auto block is replaced. A bundled `.sog` is rewritten entry by entry (every other entry keeps its compressed bytes; `meta.json` written stored, inserted after `count`, ≤ 64 KiB); an unbundled `meta.json` or its directory is edited in place, atomically.
 
+### 2.7 Host paths: `get_path` (#2194)
+
+`host->get_path(kind, buf, buf_size)` is answered by **both** hosts with the same values
+(`src/xrt/conversion/conv_host_paths.{h,c}`; the in-service host binds it per provider slot like
+`get_setting`, the satellite answers for its one provider). The satellite is started with the
+service's environment, so it resolves the same directories. A failure writes `""` and returns
+false, never a truncated path.
+
+| `kind` | Answer |
+|---|---|
+| `XRT_CONV_PATH_SCRATCH` | The provider's **own** writable directory, created on the first request (and any missing parent): macOS `~/Library/Caches/DisplayXR/Conversion/<id>`, Linux `$XDG_CACHE_HOME/displayxr/conversion/<id>` (default `~/.cache`; a relative `XDG_CACHE_HOME` is ignored), Windows `%LOCALAPPDATA%\DisplayXR\Conversion\<id>`. Owner-only (`0700`) on POSIX; the profile's inherited ACL on Windows. False when the id is not one path component (`[A-Za-z0-9._-]`, ≤ 63 bytes, not `.` / `..`), no root resolves (no `HOME` / `LOCALAPPDATA`), or the directory cannot be created. `DXR_CONV_SCRATCH_ROOT` in the hosting process's environment replaces the root (`<root>/<id>`): tests and dev boxes only |
+| `XRT_CONV_PATH_MODEL_STORE` | The process model store's root (§5.4), read-only to providers. It may not exist yet: the store creates it with its first blob |
+| `XRT_CONV_PATH_LOGS` | The directory of the host's log file (informational). Unanswered where the host has no log file (the service on POSIX logs to stderr) |
+
+**Scratch is a cache.** The runtime or the user may delete it at any time, with no provider
+running or while one is; a provider must survive that and rebuild what it kept (compiled
+models, tuned kernels). It writes there only, atomically (temp + rename, or temp directory +
+completion stamp + rename for a tree), and never assumes another provider's directory. The
+reason it exists: an inference runtime that compiles a model on first load (a Core ML or
+TensorRT style execution provider) otherwise recompiles on every warm-up, which can take a
+minute where a cached load takes seconds, and the runtime warms after prewarm, eviction and
+every `FAILED(DEVICE_LOST)`. `sim-conversion`'s `SCRATCH_TOUCH` setting exercises the path
+(`tests_conv_host_satellite`); `tests_conv_store` covers the per-platform roots and refusals.
+
 ---
 
 ## 3. Discovery
