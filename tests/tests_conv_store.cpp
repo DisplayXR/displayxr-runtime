@@ -1100,6 +1100,39 @@ TEST_CASE("conv_store: the POSIX downloader fetches over http, verifies, stamps 
 		CHECK(conv_model_store_fetch_model(h.s, &p, m, nullptr, true) == CONV_STORE_BLOB_SKIPPED);
 	}
 
+	SECTION("a research-only model is never fetched without AllowResearchOnly: no request reaches the server")
+	{
+		// The licence AND of the pack's model + dependencies is false for "research".
+		fake_pack fp(blob_bytes(), false, srv.base());
+		fs::copy_file(fp.src / (fp.sha_r + ".bin"), srv_dir.path / (fp.sha_r + ".bin"));
+		{
+			store_handle h(store_root, true, false); // downloads on, research-only off
+			REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+			CHECK_FALSE(conv_model_store_request(h.s, "sim/research"));
+			REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+			const auto loc = resolve(h.s, "sim/research");
+			CHECK(loc.state == XRT_CONV_STATE_ABSENT);
+			CHECK(loc.failure_reason == XRT_CONV_FAIL_POLICY);
+			// The synchronous path (conv models fetch) refuses too.
+			conv_pack p{};
+			char err[256];
+			REQUIRE(conv_pack_load(fp.manifest.u8string().c_str(), &p, err, sizeof(err)));
+			const conv_pack_model *m = conv_pack_find_model(&p, "research");
+			REQUIRE(m != nullptr);
+			CHECK(conv_model_store_fetch_model(h.s, &p, m, nullptr, false) == CONV_STORE_BLOB_POLICY);
+			CHECK(srv.hits.load() == 0);
+			CHECK_FALSE(fs::exists(blobs / fp.sha_r));
+			CHECK_FALSE(has_part(blobs));
+		}
+		// With the opt-in the same model downloads.
+		store_handle h(store_root, true, true);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/research"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		CHECK(resolve(h.s, "sim/research").state == XRT_CONV_STATE_READY);
+		CHECK(srv.hits.load() == 1);
+	}
+
 	SECTION("a remote pack manifest loads over http")
 	{
 		fake_pack fp(blob_bytes(), false, srv.base());
