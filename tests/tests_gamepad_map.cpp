@@ -16,6 +16,8 @@
 
 #include "catch_amalgamated.hpp"
 
+#include "math/m_mathinclude.h" // M_PI on MSVC
+
 #include "gamepad_map.h"
 
 #include <cmath>
