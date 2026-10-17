@@ -91,8 +91,9 @@ target is an Intel integrated GPU on Mesa (ANV); proprietary drivers come second
 - **`INPUT` and `PROVIDER_OUT` images.** A provider imports these. They are GPU images only for
   kinds in `vk_conv_gpu_set_provider_kinds()`'s mask, which defaults to 0. No POSIX
   conversion-host GPU lane exists (`conv_host_proxy` refuses a GPU image for a satellite
-  without one), so every provider stays on the CPU lane. A composed binding reports no import
-  kinds at all, so its input and depth are CPU memory regardless.
+  without one), so every provider stays on the CPU lane. A composed binding reports its depth
+  stage's import kinds, so the same rule covers its input and depth; the composed views target
+  carries no import kinds, because only the runtime touches it.
 
 The S5 adapter therefore accepts CPU colour and depth: it uploads them into per-stream scratch
 images first. It also accepts a CPU target, which it reads back after the synthesis. A

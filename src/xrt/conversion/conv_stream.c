@@ -90,7 +90,13 @@ free_image(struct conv_core *core, struct xrt_conv_image *img)
 	memset(img, 0, sizeof(*img));
 }
 
-//! The bound capability's import kinds (no lock held on entry).
+/*!
+ * The bound capability's import kinds (no lock held on entry). A composed
+ * binding's provider / cap_id are its depth stage's row: that provider
+ * consumes the stream's input and writes its depth, so its kinds apply to
+ * them exactly as to a direct binding (the composed views are the runtime's,
+ * see alloc_image).
+ */
 static void
 bound_import_kinds(struct conv_core *core, const struct conv_binding *b, uint32_t *mem, uint32_t *sync)
 {
@@ -98,7 +104,7 @@ bound_import_kinds(struct conv_core *core, const struct conv_binding *b, uint32_
 	*sync = 0;
 	os_mutex_lock(&core->registry_mtx);
 	struct xrt_conv_capability cap;
-	if (!b->composed && conv_core_row_cap_locked(core, b->provider, b->cap_id, &cap)) {
+	if (conv_core_row_cap_locked(core, b->provider, b->cap_id, &cap)) {
 		*mem = cap.import_memory_kinds;
 		*sync = cap.import_sync_kinds;
 	}
@@ -130,7 +136,11 @@ alloc_image(struct conv_core *core,
 	req.usage = usage;
 	req.stream_id = st->id;
 	struct conv_binding b = st->bind;
-	bound_import_kinds(core, &b, &req.import_memory_kinds, &req.import_sync_kinds);
+	// The composed views target is rendered by the runtime's S5, never seen
+	// by the provider: no import constraint (the glue decides).
+	if (!(b.composed && (usage & CONV_IMAGE_USAGE_RENDER_TARGET) != 0)) {
+		bound_import_kinds(core, &b, &req.import_memory_kinds, &req.import_sync_kinds);
+	}
 	return core->cfg.alloc.alloc(core->cfg.alloc.ud, &req, out) && out->memory_kind != 0;
 }
 

@@ -717,6 +717,153 @@ TEST_CASE("connection teardown: conv_core_client_gone drops only that connection
 	conv_fake_fini(&f);
 }
 
+namespace {
+
+//! Every allocation request the core made (composed-binding import kinds).
+struct ReqLog
+{
+	std::mutex m;
+	std::vector<conv_image_request> reqs;
+} g_reqs;
+
+bool
+rec_alloc(void *ud, const conv_image_request *req, xrt_conv_image *out)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_reqs.m);
+		g_reqs.reqs.push_back(*req);
+	}
+	return cpu_alloc(ud, req, out);
+}
+
+//! A CPU view synthesis: the composed pipeline exists only with one.
+bool
+cpu_render(void *, const conv_viewsyn_request *r)
+{
+	const xrt_conv_image *t = r->target;
+	if (t->memory_kind != XRT_CONV_MEM_CPU || t->cpu_ptr == nullptr) {
+		return false;
+	}
+	std::memset(t->cpu_ptr, 0x40, (size_t)t->byte_size);
+	return true;
+}
+
+} // namespace
+
+TEST_CASE("composed binding: the depth stage's import kinds reach the allocator; the views target carries none",
+          "[ipc_lift_core]")
+{
+	// A depth-only provider that imports GPU kinds besides CPU (the shape of
+	// an in-service Vulkan provider): an SBS stream over it is COMPOSED (its
+	// depth + the runtime's S5). The input it consumes and the depth it writes
+	// must be requested with its import kinds -- they used to be 0 because
+	// bound_import_kinds skipped composed bindings, which the D3D11 glue (it
+	// only checked for NT + keyed mutex) hid -- and the views target the
+	// runtime renders must carry none.
+	const uint32_t kinds = XRT_CONV_MEM_CPU | XRT_CONV_MEM_VK_OPAQUE_FD | XRT_CONV_MEM_IOSURFACE;
+	const uint32_t syncs = (1u << XRT_CONV_SYNC_NONE) | (1u << XRT_CONV_SYNC_VK_SEMAPHORE_FD);
+	conv_fake_provider f;
+	conv_fake_init(&f, "depth-vk");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	c->state = XRT_CONV_STATE_READY;
+	c->cap.import_memory_kinds = kinds;
+	c->cap.import_sync_kinds = syncs;
+	{
+		std::lock_guard<std::mutex> lk(g_reqs.m);
+		g_reqs.reqs.clear();
+	}
+	{
+		conv_core_config cfg{};
+		cfg.alloc.alloc = rec_alloc;
+		cfg.alloc.free = cpu_free;
+		cfg.viewsyn.render = cpu_render;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		conv_core *core = nullptr;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		ipc_server_conv *sc = nullptr;
+		REQUIRE(ipc_server_conv_create(core, &sc) == XRT_SUCCESS);
+		ipc_server_set_conv(sc);
+		Glue glue;
+		{
+			ipc_server_conv_io_ops io{};
+			io.import_input = g_import;
+			io.release_input = g_release;
+			io.publish_result = g_publish;
+			io.export_output = g_export;
+			io.export_fence = g_fence;
+			io.stream_gone = g_gone;
+			io.ud = &glue;
+			ipc_server_conv_set_io(sc, &io);
+		}
+		conv_provider_desc d{};
+		d.id = f.id;
+		d.probe_order = 100;
+		d.enabled = true;
+		d.iface = &f.iface;
+		d.inst = conv_fake_inst(&f);
+		REQUIRE(conv_core_add_provider(core, &d) >= 0);
+
+		REQUIRE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_SBS, 0));
+		uint64_t id = 0;
+		REQUIRE(ipc_server_conv_lift_stream_create(sc, 7, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &id) ==
+		        XRT_SUCCESS);
+		uint64_t core_id = 0;
+		uint32_t mode = 0;
+		REQUIRE(ipc_server_conv_resolve_stream(sc, 7, id, &core_id, &mode));
+		bool ready = false;
+		ipc_lift_result r{};
+		REQUIRE(wait_until(
+		    [&] {
+			    ipc_arg_lift_submit a{};
+			    a.stream_id = id;
+			    a.source_time = 42;
+			    a.width = 64;
+			    a.height = 32;
+			    uint64_t fid = 0;
+			    (void)ipc_server_conv_lift_submit(sc, 7, &a, fake_buffer(0x1234), false, &fid);
+			    return ipc_server_conv_lift_acquire(sc, 7, id, &ready, &r) == XRT_SUCCESS && ready;
+		    },
+		    3000));
+		conv_stream_stats st{};
+		REQUIRE(conv_core_stream_get_stats(core, core_id, &st) == XRT_SUCCESS);
+		CHECK(st.composed);
+
+		int inputs = 0, depths = 0, views = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_reqs.m);
+			for (const conv_image_request &q : g_reqs.reqs) {
+				if ((q.usage & CONV_IMAGE_USAGE_INPUT) != 0) {
+					inputs++;
+					CHECK(q.import_memory_kinds == kinds);
+					CHECK(q.import_sync_kinds == syncs);
+				} else if ((q.usage & CONV_IMAGE_USAGE_RENDER_TARGET) != 0) {
+					views++;
+					CHECK(q.import_memory_kinds == 0u); // the runtime's S5 renders it
+					CHECK(q.import_sync_kinds == 0u);
+				} else if ((q.usage & CONV_IMAGE_USAGE_PROVIDER_OUT) != 0 && q.role == XRT_CONV_OUT_DEPTH) {
+					depths++;
+					CHECK(q.import_memory_kinds == kinds);
+					CHECK(q.import_sync_kinds == syncs);
+				}
+			}
+		}
+		CHECK(inputs >= 1);
+		CHECK(depths >= 1);
+		CHECK(views >= 1);
+
+		ipc_server_conv_set_io(sc, nullptr);
+		(void)conv_core_stream_destroy(core, core_id);
+		ipc_server_set_conv(nullptr);
+		ipc_server_conv_destroy(&sc);
+		conv_core_destroy(&core);
+	}
+	CHECK(g_live.load() == 0);
+	conv_fake_fini(&f);
+}
+
 TEST_CASE("roadmap 11.2: IPC handle capacity and reply sizes (measured)", "[ipc_lift_core]")
 {
 	// One line per measured limit; the static_asserts above are the gate.

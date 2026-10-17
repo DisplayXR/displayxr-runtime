@@ -45,8 +45,8 @@
  *    in vk_conv_gpu_set_provider_kinds()'s mask; that mask is 0 by default,
  *    because no POSIX conversion-host lane exists yet (conv_host_proxy refuses
  *    a GPU image for a satellite without one), so every provider is served on
- *    the CPU lane. A composed binding reports no import kinds (conv_stream's
- *    bound_import_kinds), so its inputs and depth are always CPU.
+ *    the CPU lane. A composed binding reports its depth stage's import
+ *    kinds (conv_stream's bound_import_kinds), so the same rule applies.
  *
  * ## Sync
  *
