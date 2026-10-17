@@ -2936,6 +2936,7 @@ static void PrintUsage(const char* argv0) {
 
 int main(int argc, char** argv) {
     g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
+    g_liftProbe.gpu = g_liftProbe.enabled && dxr_test::LiftCpuProbe::RequestedGpu(argc, argv);
     // Line-buffer stdout even when redirected: LOG_INFO writes are otherwise block-
     // buffered and vanish when `timeout` SIGTERMs the process (every INFO line of a
     // redirected run was lost; the runtime's stderr log survived, the app's did not).
@@ -3122,6 +3123,36 @@ int main(int argc, char** argv) {
     // Without this extension, negative viewport height is undefined in Vulkan 1.0.
     deviceExtensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
 
+    // --lift-gpu (ADR-053 P5 step E): the fd / dma-buf export + import
+    // extensions, each when the device offers it.
+    if (g_liftProbe.gpu) {
+        uint32_t availCount = 0;
+        vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
+        std::vector<VkExtensionProperties> avail(availCount);
+        vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, avail.data());
+        auto has = [&](const char *name) {
+            for (const auto &e : avail) {
+                if (strcmp(e.extensionName, name) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        uint32_t n = 0;
+        const char *const *names = dxr_test::LiftCpuProbe::GpuDeviceExtensions(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (has(names[i])) {
+                deviceExtensions.push_back(names[i]);
+            }
+        }
+        g_liftProbe.dmabuf_ext = has("VK_EXT_external_memory_dma_buf") && has("VK_EXT_image_drm_format_modifier") &&
+                                 has("VK_KHR_image_format_list");
+        g_liftProbe.foreign_ext = has("VK_EXT_queue_family_foreign");
+        LOG_INFO("--lift-gpu: dma-buf input %s, queue family foreign %s",
+                 g_liftProbe.dmabuf_ext ? "available" : "not available (OPAQUE_FD input)",
+                 g_liftProbe.foreign_ext ? "yes" : "no");
+    }
+
     // Find graphics queue
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
@@ -3138,6 +3169,8 @@ int main(int argc, char** argv) {
         CleanupOpenXR(xr);
         return 1;
     }
+
+    g_liftProbe.SetVulkan(physDevice, vkDevice, graphicsQueue, queueFamilyIndex);
 
     // Create session
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
