@@ -51,6 +51,7 @@
 #include "util/u_camera_profile.h"
 
 #include "math/m_api.h"
+#include "math/m_view_rig_point.h"
 #include "math/m_mathinclude.h"
 #include "math/m_space.h"
 
@@ -3125,6 +3126,135 @@ struct oxr_locate_segment
 	bool skip_cursor_depth;
 };
 
+/*!
+ * The canvas a view locate resolves (#2189 refactor, no behaviour change): the
+ * window / segment / zone metrics, the Kooima screen size (after the #499
+ * portrait swap) and the canvas centre offset + orientation the eyes are
+ * rebased by. Factored out of locate_views_one so the hand-joint locate
+ * (XR_DXR_view_rig spec 4) resolves the SAME canvas the views use.
+ */
+struct oxr_locate_canvas
+{
+	struct m_view_rig_canvas canvas; //!< size, centre, orientation (nominal filled by the caller)
+	struct xrt_window_metrics wm;
+	bool have_wm;
+};
+
+static void
+locate_resolve_canvas(struct oxr_session *sess,
+                      const struct oxr_locate_segment *seg,
+#ifdef OXR_HAVE_DXR_display_zones
+                      const XrDisplayZoneDXR *zone,
+#endif
+                      bool should_log,
+                      struct oxr_locate_canvas *out)
+{
+	float screen_width_m = 0.0f;
+	float screen_height_m = 0.0f;
+	float eye_offset_x = 0.0f; // window center offset from display center (meters)
+	float eye_offset_y = 0.0f;
+	float eye_offset_z = 0.0f;
+	struct xrt_quat win_orient = {0, 0, 0, 1}; // identity
+	bool win_has_orientation = false;
+
+	struct xrt_window_metrics wm = {0};
+	bool have_wm = false;
+	if (seg != NULL) {
+		// Multi-screen M3: the segment (or, stereo, the whole window
+		// framed from the majority screen) instead of the session
+		// DP's window metrics.
+		wm = seg->wm;
+		have_wm = wm.valid;
+	} else {
+		have_wm = oxr_session_get_window_metrics(sess, &wm);
+	}
+
+#ifdef OXR_HAVE_DXR_display_zones
+	// Zone-scoped locate: rebase the window metrics to the
+	// zone rect — the rect IS the canvas. Everything below
+	// (Kooima meters, eye offsets, the raw channel) then
+	// describes the zone with zero further changes.
+	//
+	// @todo P2: for _texture sessions get_window_metrics has
+	// already applied the session output rect, so the zone
+	// composes relative to that rect rather than the client
+	// window; zones frames ignore the output rect at the
+	// compositor in P2 (ADR-027 rule 2).
+	if (zone != NULL && have_wm && wm.valid) {
+		struct u_canvas_rect zone_canvas = {
+		    .valid = true,
+		    .x = zone->rect.offset.x,
+		    .y = zone->rect.offset.y,
+		    .w = (uint32_t)zone->rect.extent.width,
+		    .h = (uint32_t)zone->rect.extent.height,
+		};
+		u_canvas_apply_to_metrics(&wm, &zone_canvas);
+	}
+#endif
+
+	if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+		// Window-relative Kooima: use actual window dims as screen,
+		// offset eyes to be relative to window center (not display center)
+		screen_width_m  = wm.window_width_m;
+		screen_height_m = wm.window_height_m;
+		eye_offset_x = wm.window_center_offset_x_m;
+		eye_offset_y = wm.window_center_offset_y_m;
+		eye_offset_z = wm.window_center_offset_z_m;
+		win_orient = wm.window_orientation;
+		// Check if orientation is non-identity
+		win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
+		                       fabsf(win_orient.y) > 0.0001f ||
+		                       fabsf(win_orient.z) > 0.0001f ||
+		                       fabsf(win_orient.w - 1.0f) > 0.0001f);
+
+		if (should_log) {
+			char seg_tag[40] = "";
+			if (seg != NULL) {
+				snprintf(seg_tag, sizeof(seg_tag), " [segment 0x%016llx]",
+				         (unsigned long long)seg->screen_id);
+			}
+			U_LOG_I(
+			    "Window-relative Kooima%s: screen=%.4fx%.4fm, "
+			    "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
+			    seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
+			    eye_offset_z, win_has_orientation);
+		}
+	} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
+	           screen_width_m > 0.0f && screen_height_m > 0.0f) {
+		// Fallback: full display dimensions (fullscreen or no window metrics)
+		// eye_offset stays (0,0) — identity behavior
+	}
+
+	// #499 portrait: a vendor DP can report a FIXED (landscape-major)
+	// physical size while the live surface rotates (e.g. the Leia CNSDK
+	// plug-in on the portrait-natural nubia). CNSDK weaves to the panel
+	// in either orientation; the runtime only needs the Kooima FOV
+	// aspect to match the held orientation. So if the live window px
+	// orientation disagrees with the physical-dims orientation, swap the
+	// meters. On Windows/macOS the window-metrics meters already track
+	// orientation, so this is a no-op there.
+	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0 &&
+	    screen_width_m > 0.0f && screen_height_m > 0.0f) {
+		bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
+		bool dims_landscape = screen_width_m >= screen_height_m;
+		if (win_landscape != dims_landscape) {
+			float tmp = screen_width_m;
+			screen_width_m = screen_height_m;
+			screen_height_m = tmp;
+		}
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->wm = wm;
+	out->have_wm = have_wm;
+	out->canvas.valid = screen_width_m > 0.0f && screen_height_m > 0.0f;
+	out->canvas.width_m = screen_width_m;
+	out->canvas.height_m = screen_height_m;
+	out->canvas.center = (struct xrt_vec3){eye_offset_x, eye_offset_y, eye_offset_z};
+	out->canvas.orientation = win_orient;
+	out->canvas.has_orientation = win_has_orientation;
+}
+
 static XrResult
 locate_views_one(struct oxr_logger *log,
                  struct oxr_session *sess,
@@ -3714,100 +3844,16 @@ locate_views_one(struct oxr_logger *log,
 		}
 
 		if (have_eye_positions) {
-			float screen_width_m = 0.0f;
-			float screen_height_m = 0.0f;
-			float eye_offset_x = 0.0f; // window center offset from display center (meters)
-			float eye_offset_y = 0.0f;
-			float eye_offset_z = 0.0f;
-			struct xrt_quat win_orient = {0, 0, 0, 1}; // identity
-			bool win_has_orientation = false;
-
-			struct xrt_window_metrics wm = {0};
-			bool have_wm = false;
-			if (seg != NULL) {
-				// Multi-screen M3: the segment (or, stereo, the whole window
-				// framed from the majority screen) instead of the session
-				// DP's window metrics.
-				wm = seg->wm;
-				have_wm = wm.valid;
-			} else {
-				have_wm = oxr_session_get_window_metrics(sess, &wm);
-			}
-
+			struct oxr_locate_canvas lc;
+			locate_resolve_canvas(sess, seg,
 #ifdef OXR_HAVE_DXR_display_zones
-			// Zone-scoped locate: rebase the window metrics to the
-			// zone rect — the rect IS the canvas. Everything below
-			// (Kooima meters, eye offsets, the raw channel) then
-			// describes the zone with zero further changes.
-			//
-			// @todo P2: for _texture sessions get_window_metrics has
-			// already applied the session output rect, so the zone
-			// composes relative to that rect rather than the client
-			// window; zones frames ignore the output rect at the
-			// compositor in P2 (ADR-027 rule 2).
-			if (zone != NULL && have_wm && wm.valid) {
-				struct u_canvas_rect zone_canvas = {
-				    .valid = true,
-				    .x = zone->rect.offset.x,
-				    .y = zone->rect.offset.y,
-				    .w = (uint32_t)zone->rect.extent.width,
-				    .h = (uint32_t)zone->rect.extent.height,
-				};
-				u_canvas_apply_to_metrics(&wm, &zone_canvas);
-			}
+			                      zone,
 #endif
-
-			if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
-				// Window-relative Kooima: use actual window dims as screen,
-				// offset eyes to be relative to window center (not display center)
-				screen_width_m  = wm.window_width_m;
-				screen_height_m = wm.window_height_m;
-				eye_offset_x = wm.window_center_offset_x_m;
-				eye_offset_y = wm.window_center_offset_y_m;
-				eye_offset_z = wm.window_center_offset_z_m;
-				win_orient = wm.window_orientation;
-				// Check if orientation is non-identity
-				win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
-				                       fabsf(win_orient.y) > 0.0001f ||
-				                       fabsf(win_orient.z) > 0.0001f ||
-				                       fabsf(win_orient.w - 1.0f) > 0.0001f);
-
-				if (should_log) {
-					char seg_tag[40] = "";
-					if (seg != NULL) {
-						snprintf(seg_tag, sizeof(seg_tag), " [segment 0x%016llx]",
-						         (unsigned long long)seg->screen_id);
-					}
-					U_LOG_I(
-					    "Window-relative Kooima%s: screen=%.4fx%.4fm, "
-					    "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
-					    seg_tag, screen_width_m, screen_height_m, eye_offset_x, eye_offset_y,
-					    eye_offset_z, win_has_orientation);
-				}
-			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
-			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				// Fallback: full display dimensions (fullscreen or no window metrics)
-				// eye_offset stays (0,0) — identity behavior
-			}
-
-			// #499 portrait: a vendor DP can report a FIXED (landscape-major)
-			// physical size while the live surface rotates (e.g. the Leia CNSDK
-			// plug-in on the portrait-natural nubia). CNSDK weaves to the panel
-			// in either orientation; the runtime only needs the Kooima FOV
-			// aspect to match the held orientation. So if the live window px
-			// orientation disagrees with the physical-dims orientation, swap the
-			// meters. On Windows/macOS the window-metrics meters already track
-			// orientation, so this is a no-op there.
-			if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0 &&
-			    screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
-				bool dims_landscape = screen_width_m >= screen_height_m;
-				if (win_landscape != dims_landscape) {
-					float tmp = screen_width_m;
-					screen_width_m = screen_height_m;
-					screen_height_m = tmp;
-				}
-			}
+			                      should_log, &lc);
+			float screen_width_m = lc.canvas.width_m;
+			float screen_height_m = lc.canvas.height_m;
+			struct xrt_window_metrics wm = lc.wm;
+			bool have_wm = lc.have_wm;
 
 #ifdef OXR_HAVE_DXR_view_rig
 			// XR_DXR_view_rig raw channel: the effective canvas + display
@@ -3878,20 +3924,12 @@ locate_views_one(struct oxr_logger *log,
 				}
 
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
-					// Transform eye to window-local frame:
+					// Transform eye to window-local frame (the canvas rebase the
+					// hand-joint locate shares, m_view_rig_point.h):
 					// 1. Subtract window position (eye relative to window center)
 					// 2. If rotated, apply inverse rotation (eye in window's local space)
-					struct xrt_vec3 delta = {
-					    adj_eyes[ei].x - eye_offset_x,
-					    adj_eyes[ei].y - eye_offset_y,
-					    adj_eyes[ei].z - eye_offset_z};
-					if (win_has_orientation) {
-						struct xrt_quat inv_q;
-						math_quat_invert(&win_orient, &inv_q);
-						math_quat_rotate_vec3(&inv_q, &delta, &raw_eyes[ei]);
-					} else {
-						raw_eyes[ei] = delta;
-					}
+					const struct xrt_vec3 eye_display = {adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+					m_view_rig_canvas_rebase(&lc.canvas, &eye_display, &raw_eyes[ei]);
 				}
 				dxr_screen scr = {screen_width_m, screen_height_m};
 				struct xrt_pose display_pose = {
