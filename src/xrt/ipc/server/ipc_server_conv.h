@@ -498,6 +498,9 @@ ipc_server_conv_client_gone(struct ipc_server_conv *sc, uint64_t client_id);
 /*! @name XrLiftImageKindDXR values the service's glue takes / gives (masks are 1 << kind) @{ */
 #define IPC_SERVER_CONV_IMAGE_KIND_D3D11_NT 1u
 #define IPC_SERVER_CONV_IMAGE_KIND_D3D11_DXGI 2u
+#define IPC_SERVER_CONV_IMAGE_KIND_IOSURFACE 3u //!< POSIX GPU glue (macOS), step E
+#define IPC_SERVER_CONV_IMAGE_KIND_DMABUF 5u    //!< POSIX GPU glue (Linux), input only
+#define IPC_SERVER_CONV_IMAGE_KIND_OPAQUE_FD 6u //!< POSIX GPU glue (Linux)
 #define IPC_SERVER_CONV_IMAGE_KIND_D3D12_NT 7u //!< with import_input_ex
 #define IPC_SERVER_CONV_IMAGE_KIND_CPU 16u     //!< input with import_input_ex, export with export_cpu
 /*! @} */

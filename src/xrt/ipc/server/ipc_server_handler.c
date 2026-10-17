@@ -10192,7 +10192,11 @@ ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
 		weave_submit_release_handles(handles, handle_count);
 		return auth;
 	}
-	const bool fence = image->sync_kind == XRT_CONV_SYNC_FENCE_NT;
+	bool fence = image->sync_kind == XRT_CONV_SYNC_FENCE_NT;
+#if !defined(XRT_OS_WINDOWS)
+	// Step E: a sync_file or a timeline semaphore fd rides as the second handle.
+	fence = fence || image->sync_kind == XRT_CONV_SYNC_SYNC_FD || image->sync_kind == XRT_CONV_SYNC_VK_SEMAPHORE_FD;
+#endif
 	if (handle_count < (fence ? 2u : 1u) || !ipc_server_conv_owns_stream(ipc_server_get_conv(), args->stream_id)) {
 		weave_submit_release_handles(handles, handle_count);
 		return handle_count < 1 ? XRT_ERROR_IPC_FAILURE : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
@@ -10212,6 +10216,12 @@ ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
 #endif
 		break;
 	case XRT_CONV_MEM_CPU: in.kind = CONV_INPUT_CPU; break;
+#if !defined(XRT_OS_WINDOWS)
+	// Step E: the POSIX GPU kinds (the CPU table's GPU glue imports them).
+	case XRT_CONV_MEM_IOSURFACE: in.kind = CONV_INPUT_IOSURFACE; break;
+	case XRT_CONV_MEM_VK_OPAQUE_FD: in.kind = CONV_INPUT_OPAQUE_FD; break;
+	case XRT_CONV_MEM_DMABUF: in.kind = CONV_INPUT_DMABUF; break;
+#endif
 	default:
 		weave_submit_release_handles(handles, handle_count);
 		return XRT_ERROR_INPUT_UNSUPPORTED; // a kind the service does not take (validated client-side)
@@ -10225,6 +10235,12 @@ ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
 	in.y = region_y;
 	in.cpu_row_pitch = image->row_stride;
 	in.cpu_bgra = image->format == XRT_CONV_FMT_BGRA8_UNORM || image->format == XRT_CONV_FMT_BGRA8_SRGB;
+#if !defined(XRT_OS_WINDOWS)
+	in.img_w = image->width;
+	in.img_h = image->height;
+	in.img_format = image->format;
+	in.drm_modifier = image->drm_modifier;
+#endif
 	// ADR-048: the session's window is the lifted rect, as for the v3 submit.
 	struct xrt_lift_rect_frame frame = {0};
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)

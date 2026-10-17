@@ -6,7 +6,12 @@
  * @ingroup ipc_server
  */
 
+#include "xrt/xrt_config_os.h"
+
 #include "server/ipc_server_conv.h"
+#if !defined(XRT_OS_WINDOWS)
+#include "server/ipc_server_conv_cpu.h"
+#endif
 
 #include "shared/ipc_protocol.h"
 
@@ -1772,9 +1777,16 @@ ipc_server_conv_v4_image_kinds(struct ipc_server_conv *sc, bool export_kinds)
 		return 0; // no GPU glue: no task is reachable yet
 	}
 	if (io.cpu_only) {
-		// The POSIX CPU glue: CPU bytes in, CPU bytes out, nothing else.
+		// The POSIX CPU glue: CPU bytes in, CPU bytes out, plus (step E) the
+		// GPU kinds a Vulkan glue attached under it takes / gives.
 		const bool ok = export_kinds ? io.export_cpu != NULL : io.import_input_ex != NULL;
-		return ok ? 1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU : 0;
+		uint64_t kinds = ok ? 1ull << IPC_SERVER_CONV_IMAGE_KIND_CPU : 0;
+#if !defined(XRT_OS_WINDOWS)
+		if (ok) {
+			kinds |= ipc_server_conv_cpu_io_gpu_image_kinds(export_kinds);
+		}
+#endif
+		return kinds;
 	}
 	// The v3 glue imports D3D11 NT / legacy DXGI shared textures and exports
 	// D3D11 NT textures + a shared fence: the kinds every spec-4 stream gets.
@@ -1922,8 +1934,19 @@ ipc_server_conv_v5_stream_create(struct ipc_server_conv *sc,
 	// A CPU-only glue (POSIX) exports CPU bytes by default and nothing else.
 	const bool cpu_only = have_io && io.cpu_only;
 	const bool cpu_export = in->export_memory_kind == XRT_CONV_MEM_CPU || (cpu_only && in->export_memory_kind == 0);
+	uint32_t gpu_export = 0;
+#if !defined(XRT_OS_WINDOWS)
+	// Step E: a GPU export kind the CPU table's GPU glue gives (IOSurface, OPAQUE_FD).
+	if (cpu_only && io.export_cpu != NULL &&
+	    ((in->export_memory_kind == XRT_CONV_MEM_IOSURFACE &&
+	      (ipc_server_conv_cpu_io_gpu_image_kinds(true) & (1ull << IPC_SERVER_CONV_IMAGE_KIND_IOSURFACE)) != 0) ||
+	     (in->export_memory_kind == XRT_CONV_MEM_VK_OPAQUE_FD &&
+	      (ipc_server_conv_cpu_io_gpu_image_kinds(true) & (1ull << IPC_SERVER_CONV_IMAGE_KIND_OPAQUE_FD)) != 0))) {
+		gpu_export = in->export_memory_kind;
+	}
+#endif
 	if (in->export_memory_kind != 0 && (cpu_only || in->export_memory_kind != XRT_CONV_MEM_WIN32_NT_HANDLE) &&
-	    !(cpu_export && have_io && io.export_cpu != NULL)) {
+	    !(cpu_export && have_io && io.export_cpu != NULL) && gpu_export == 0) {
 		return XRT_ERROR_INPUT_UNSUPPORTED; // an export kind no candidate offers
 	}
 
@@ -2026,6 +2049,13 @@ ipc_server_conv_v5_stream_create(struct ipc_server_conv *sc,
 		(void)conv_core_stream_destroy(sc->core, st.core_id);
 		return XRT_ERROR_CLIENT_LIMIT_REACHED;
 	}
+#if !defined(XRT_OS_WINDOWS)
+	if (gpu_export != 0) {
+		ipc_server_conv_cpu_io_stream_export(st.wire_id, gpu_export);
+	}
+#else
+	(void)gpu_export;
+#endif
 
 	*out = created;
 	out->struct_size = (uint32_t)sizeof(*out);

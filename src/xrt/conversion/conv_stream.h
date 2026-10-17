@@ -217,6 +217,10 @@ struct conv_stream_options
 #define CONV_INPUT_NT 1u   //!< a D3D11 or D3D12 shared NT texture handle (keyed mutex if it has one)
 #define CONV_INPUT_DXGI 2u //!< a legacy global DXGI shared handle (process-independent)
 #define CONV_INPUT_CPU 3u  //!< a file mapping holding the bytes (RGBA8 / BGRA8, cpu_row_pitch)
+//! ADR-053 P5 step E, the POSIX GPU kinds (a GPU glue imports them; img_* fields):
+#define CONV_INPUT_IOSURFACE 4u //!< a global IOSurface (macOS)
+#define CONV_INPUT_OPAQUE_FD 5u //!< a Vulkan OPAQUE_FD allocation (Linux; the transport contract's image)
+#define CONV_INPUT_DMABUF 6u    //!< a single-plane dma-buf, plane 0 at offset 0 (Linux)
 /*! @} */
 
 /*!
@@ -232,8 +236,14 @@ struct conv_input_import
 	xrt_graphics_buffer_handle_t sync_handle; //!< FENCE_NT: a shared D3D fence; else invalid
 	uint64_t sync_value;                      //!< FENCE_NT: wait for this value
 	uint32_t x, y, w, h;                      //!< the region of the image to convert
-	uint32_t cpu_row_pitch;                   //!< CPU: bytes per row of the mapping
+	uint32_t cpu_row_pitch;                   //!< CPU: bytes per row of the mapping; DMABUF: plane 0 stride
 	bool cpu_bgra;                            //!< CPU: BGRA8 rather than RGBA8
+	//! @name GPU kinds (CONV_INPUT_IOSURFACE / _OPAQUE_FD / _DMABUF)
+	//! @{
+	uint32_t img_w, img_h; //!< the whole image (the region lies inside it)
+	uint32_t img_format;   //!< XRT_CONV_FMT_*
+	uint64_t drm_modifier; //!< DMABUF
+	                       //! @}
 };
 
 #ifdef __cplusplus
