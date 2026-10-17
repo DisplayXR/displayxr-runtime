@@ -51,9 +51,12 @@ bytes in, a composed conversion, the GPU views exported as CPU bytes.
 With this, a depth-only provider serves the composed tasks (`VIEWS_MONO`, `VIEWS_FROM_DEPTH`) on
 POSIX.
 
+3. Step E: the same `set_gpu` call lends the table the client transport hooks (`import_copy`,
+   `export_alloc` / `export_free`, `copy`) and the kinds behind them, so the service lists the
+   platform's GPU kinds beside CPU (see [The client transport](#the-client-transport-step-e)).
+
 Not installed yet:
 
-- A GPU client transport (textures and fences to the app). The client gets CPU bytes only.
 - The `dp-lift` backend, because the display plug-in's lift slots are D3D11-only.
 
 ## Memory kinds: what is real
@@ -81,6 +84,43 @@ All of these need only core Vulkan 1.0 plus widely available extensions, each ch
 with the CPU lane as the fallback. Nothing assumes a particular GPU vendor. The first Linux
 target is an Intel integrated GPU on Mesa (ANV); proprietary drivers come second.
 
+## The client transport (step E)
+
+In-process Vulkan sessions hand their own images in and take results out as the platform's GPU
+kind (XR_DXR_lift §4.5 / §5.4). Everything stays inside the one CPU I/O table.
+
+| Direction | macOS | Linux |
+|---|---|---|
+| In | a **global** IOSurface (the transport carries its ID; the service looks it up) | an `OPAQUE_FD` allocation in the spec's creation shape, or a single-plane dma-buf at offset 0 |
+| Out | a global IOSurface the glue creates and imports (`vk_conv_gpu_export_alloc`) | an `OPAQUE_FD` image (`img_create`, the same creation shape) |
+| Sync in | `CPU_COMPLETE` | `CPU_COMPLETE`, sync_file, timeline semaphore fd (imported per submit, waited for on the GPU) |
+| Sync out | `CPU_COMPLETE` (the copy is done when acquire returns) | the same |
+
+- **Handshake.** `ipc_server_conv_v4_image_kinds` ORs the hooks' kinds into the CPU table's
+  answer; the session intersects them with its offer at each `xrEnumerateLiftTasksDXR` and
+  remembers the result for submit and stream create, as Windows does with D3D kinds.
+- **Input.** `vk_conv_gpu_import_copy` imports the image and blits the region into the stream's
+  slot image: GPU → GPU into a glue slot; into a CPU slot (a CPU-lane provider) the blit goes to
+  a scratch image and its readback rides the same submit. An SRGB source is copied raw through a
+  UNORM scratch, so the bytes stay encoded as the CPU kind's do. Client IOSurfaces are cached by
+  `IOSurfaceID` (4 entries, dropped after 2 s unused); the cached image's `MTLTexture` retains its
+  surface, so the ID cannot be reused under it.
+- **Output.** A spec-4 stream created with `exportKind` IOSURFACE / OPAQUE_FD is registered with
+  the table (`ipc_server_conv_cpu_io_stream_export`); `publish_result` copies each result into the
+  stream's export image (`vk_conv_gpu_copy`: GPU → GPU, or an upload for a CPU result) and
+  `export_output` hands its handle out on the first acquire and on reallocation.
+- **Why the glue creates the export IOSurface.** An IOSurface MoltenVK creates
+  (`VkExportMetalObjectCreateInfoEXT`) is not global, and `IOSurfaceLookup` of a non-global
+  surface from another process returns NULL (checked on this macOS). Importing a global surface
+  the glue made keeps the ID transport working.
+- **IOSurface import recipe.** `VkImportMetalIOSurfaceInfoEXT` at image create, then a dedicated
+  `VkImportMemoryMetalHandleInfoEXT` of the image's exported `MTLTexture` (allocation size 0).
+  Binding plain host-coherent memory instead (`vk_create_image_from_native`'s recipe) read back
+  zeros through Vulkan in the tests here, though writes reached the surface; apps importing the
+  export should use the same recipe (`test_apps/common/lift_cpu_probe.h`, `GpuImport`).
+- **Counters.** `vk_conv_gpu_get_stats` counts host writes, host reads, GPU copies, imports and
+  asynchronous S5 hand-overs; the tests use them to prove the zero-copy claims.
+
 ## Who gets GPU memory
 
 - **`RENDER_TARGET` (the composed views) and `MIRROR` images.** The runtime is their only
@@ -102,9 +142,17 @@ Windows.
 
 ## Sync
 
-- **Images the glue hands out** always carry `XRT_CONV_SYNC_NONE`. Every glue call submits on
-  the main queue and waits for its own work before it returns ("SYNC_NONE meaning the producer
-  finished before hand-over", discovery spec §2.4).
+- **Images the glue hands out** carry `XRT_CONV_SYNC_NONE`. Every glue call submits on the main
+  queue and waits for its own work before it returns ("SYNC_NONE meaning the producer finished
+  before hand-over", discovery spec §2.4) — with one exception on macOS:
+- **S5 on macOS (`caps.async_s5`).** The glue's timeline semaphore is exported as an
+  `MTLSharedEvent` (MoltenVK 1.4, `VK_EXT_metal_objects`). An S5 render into a glue image returns
+  once submitted, signalling the timeline to a new value recorded on the image; the result is
+  published without a host wait. Vulkan readers need nothing: they share the bundle's main queue,
+  later in submission order. A Metal reader takes the event and value from
+  `vk_conv_gpu_image_ref` and waits on its GPU. At most one such submit is in flight; every other
+  glue call (`work_lock`) retires it first, so the stage, the descriptor sets and freed images are
+  never touched under the GPU. `DXR_CONV_VK_ASYNC_S5=0` turns it off; Linux keeps the host wait.
 - **Images the glue reads** may carry `XRT_CONV_SYNC_VK_SEMAPHORE_FD` (a timeline semaphore,
   opaque fd, imported once per `import_key`) or `XRT_CONV_SYNC_SYNC_FD` (a binary sync_file,
   imported temporarily). The glue waits on either on the GPU, in the same submit. These kinds
@@ -174,8 +222,12 @@ pending snapshots while the core's streams still exist. The glue teardown follow
      commit happen in one call, so no slot is held across frames. The frame carries the D3D11
      path's sticky options, explicit viewpoints, view control, rig, the rect's display-space
      frame, the eyes DP and the active fractions.
-   - POSIX providers run on the CPU lane, so this is GPU → host → slot, not GPU → GPU. A GPU
-     slot is filled with `vk_conv_gpu_write` from the same buffer.
+   - GPU → GPU when the stream's binding takes a GPU kind the glue would give its slot
+     (`conv_core_stream_input_kinds` + `vk_conv_gpu_input_memory_kind`; a composed binding reports
+     its depth stage's kinds): the engine records no host copy, and at complete the glue copies the
+     chain's last image into the slot (`vk_conv_gpu_copy_from_vk`). Otherwise — every POSIX
+     provider today, on the CPU lane — GPU → host → slot as before. A slot that turns out CPU after
+     all (a rebind between record and complete) is read back from the chain image.
 2. **Letterbox.** The 96 sampled columns and rows of the whole rect, bars included, are copied to
    a second buffer. On completion `u_lift_letterbox_profile_from_lines` reduces them on the CPU.
    It produces bucket for bucket the profile of the D3D11 reduction shader (pinned by
@@ -235,14 +287,14 @@ not export as an IOSurface is woven flat. That covers a device-private result an
 (ARRAY) result, since an IOSurface has one layer. The line is `lift rect: stream 0x<id> failed:
 export`.
 
-**Sync ordering.** No `MTLSharedEvent` and no Vulkan semaphore are involved. The ordering rests on
-three facts:
+**Sync ordering.** The ordering rests on three facts:
 
-1. The glue publishes a result only after the Vulkan work writing it has completed. Every glue
-   call waits for its own submit ("producer finished before hand-over", `XRT_CONV_SYNC_NONE`), and
-   the #2030 mirror upload is a glue call too. So by the time `host_plan` pins a result, MoltenVK's
-   command buffer that wrote the IOSurface has completed, and the Metal command buffer that reads
-   it is committed later.
+1. The Vulkan write of a result is ordered before the Metal read. An S5 result is handed over on
+   the glue's `MTLSharedEvent` (step E): the plan carries `result_event` / `result_event_value`, and
+   the Metal pass encodes `encodeWaitForEvent:value:` before sampling — a GPU wait, never a host
+   stall (an event of another `MTLDevice` falls back to a bounded host poll). Every other result
+   (the #2030 mirror, any glue call without the event) was complete before it was published
+   (`XRT_CONV_SYNC_NONE`), and its plan carries no event.
 2. The pin keeps the provider from writing that ring slot again until `complete`. The engine
    calls `complete` only after its command buffer has completed (`waitUntilCompleted`), and that
    is the only place a frame's pins are released. A detach (`comp_multi_weave_set_lift_ops`)
@@ -277,6 +329,22 @@ level at `info`, for example `XRT_LOG=info`:
 Plus WARNs, once per change, as on Windows: `[lift] stream 0x<id>: letterbox crop ...`, and the
 non-default `DXR_LIFT_MAX_INPUT_EDGE` / `DXR_LIFT_LETTERBOX=0` at attach. At attach the service
 logs `[conv] Vulkan glue: lifted weave rects on`.
+
+### Validated (step E)
+
+- On a developer Mac (MoltenVK):
+  - `tests_conv_vk_gpu "[transport]"`: an IOSurface submit into a CPU slot (1 blit, 1 readback, no
+    upload) and a GPU slot (1 blit, no host memory touched), byte-exact with the BGRA → RGBA swap;
+    a GPU result exported as a global IOSurface (1 GPU copy, no readback), looked up by ID,
+    imported back into an app VkImage byte-exact. `"[weave_gpu_snap]"`: the weave snapshot into a
+    GPU slot touches no host memory and hands the provider the same bytes as the host path. The
+    S5 and Metal weave cases see the shared event. The whole binary is clean under ASan.
+  - `cube_handle_vk_macos --lift-gpu` against the dev service with the sim provider, direct and
+    composed (`DXR_CONV_SIM_CONVERSION_STATE_VIEWS_MONO=disabled`): same views and shift as
+    `--lift`, the export IOSurface imported by the app, its rows byte-exact against the surface's
+    CPU view. `weave_probe_vk_macos --lift` with `DXR_WEAVE_MAC_BACKEND=metal` on the composed
+    path (asynchronous S5): PASS.
+- Linux: the step E paths are compiled (an Ubuntu 24.04 container) but have not run on hardware.
 
 ### Validated
 

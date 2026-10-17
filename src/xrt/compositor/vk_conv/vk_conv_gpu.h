@@ -52,7 +52,9 @@
  *
  * Every image this glue hands out carries XRT_CONV_SYNC_NONE: each glue call
  * submits and waits for its own GPU work before returning (the discovery
- * spec's "SYNC_NONE meaning the producer finished before hand-over"). An
+ * spec's "SYNC_NONE meaning the producer finished before hand-over") -- except
+ * an S5 render on macOS (caps.async_s5), handed over on an MTLSharedEvent the
+ * image ref names (Vulkan readers on the main queue need nothing). An
  * image the glue READS whose sync is XRT_CONV_SYNC_VK_SEMAPHORE_FD (timeline,
  * opaque fd, imported once per import_key) or XRT_CONV_SYNC_SYNC_FD (binary
  * sync_file, temporary import) is waited for on the GPU in the same submit;
