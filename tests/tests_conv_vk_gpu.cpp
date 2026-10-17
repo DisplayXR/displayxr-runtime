@@ -1776,7 +1776,7 @@ struct WeaveRig
 	bool ok = false;
 
 	bool
-	init()
+	init(uint32_t extra_import_kinds = 0)
 	{
 		if (!ipc_server_conv_cpu_io_get(&cpu_io) || !make_glue(x)) {
 			return false;
@@ -1786,6 +1786,7 @@ struct WeaveRig
 		    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
 		c->state = XRT_CONV_STATE_READY;
 		c->cap.depth_kind = XRT_CONV_DEPTH_METRIC;
+		c->cap.import_memory_kinds |= extra_import_kinds;
 		tr.gpu = x.ops;
 		conv_core_config cfg{};
 		cfg.alloc.alloc = tr_alloc;
@@ -2067,6 +2068,146 @@ TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven re
 	vk_conv_weave_destroy(&w);
 	vk_cmd_pool_destroy(vk, &pool);
 	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+}
+
+TEST_CASE("vk_conv_weave: the snapshot goes GPU -> GPU when the binding takes a GPU kind, host path otherwise",
+          "[conv_vk_gpu][weave_rects][weave_gpu_snap]")
+{
+	// Step E: a composed binding whose depth stage imports a GPU kind gets a
+	// GPU slot; the weave's snapshot then never touches host memory. Same
+	// pixels as the host path (an uncapped, uncropped rect: the snapshot is
+	// the rect's texels, BGRA -> RGBA).
+	for (int arm = 0; arm < 2; arm++) {
+		const bool gpu = arm == 1;
+		DYNAMIC_SECTION((gpu ? "GPU slot" : "CPU slot (host path)"))
+		{
+			Glue probe;
+			if (!make_glue(probe)) {
+				SKIP("no Vulkan device available");
+			}
+			vk_conv_gpu_caps pc{};
+			vk_conv_gpu_get_caps(probe.g, &pc);
+			const uint32_t gk = pc.memory_kinds & ~XRT_CONV_MEM_CPU;
+			if (gpu && gk == 0) {
+				SKIP("no exportable GPU memory kind on this device");
+			}
+			WeaveRig rig;
+			if (!rig.init(gpu ? gk : 0)) {
+				SKIP("no Vulkan device / CPU transport available");
+			}
+			rig.f.caps[0].convert_ms = 0;
+			// The service's policy hook: providers may take these kinds (in process).
+			vk_conv_gpu_set_provider_kinds(rig.x.g, gpu ? gk : 0);
+			struct vk_bundle *vk = rig.x.vk.get();
+			ipc_server_conv *sc = rig.sc;
+			ipc_server_conv_set_weave_rects(sc, true);
+			uint64_t wire = 0;
+			REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) ==
+			        XRT_SUCCESS);
+			uint64_t core_id = 0;
+			uint32_t mode = 0;
+			REQUIRE(weave_resolve(sc, 1, wire, &core_id, &mode));
+			uint32_t im = 0, is = 0;
+			REQUIRE(conv_core_stream_input_kinds(rig.core, core_id, &im, &is));
+			CHECK((vk_conv_gpu_input_memory_kind(rig.x.g, im, is) != XRT_CONV_MEM_CPU) == gpu);
+
+			vk_conv_weave *w = nullptr;
+			REQUIRE(vk_conv_weave_create(vk, rig.x.g, &w));
+			vk_conv_weave_bridge b{};
+			b.core = rig.core;
+			b.resolve = weave_resolve;
+			b.match_weave = weave_match;
+			b.fit_rect = ipc_server_conv_submit_rect;
+			b.ud = sc;
+			vk_conv_weave_set_bridge(w, &b);
+			vk_conv_weave_client *c = vk_conv_weave_client_create(w, vk);
+			REQUIRE(c != nullptr);
+
+			const uint32_t W = 256, H = 128;
+			const int32_t RX = 40, RY = 20;
+			const uint32_t RW = 160, RH = 80;
+			const std::vector<uint8_t> src = pattern(W, H, 21); // read as B,G,R,A
+			Image in_img, sbs;
+			REQUIRE(make_image(vk, in_img, W, H, 1, VK_FORMAT_B8G8R8A8_UNORM));
+			REQUIRE(make_image(vk, sbs, 2 * W, H, 1, VK_FORMAT_R8G8B8A8_UNORM));
+			vk_cmd_pool pool{};
+			REQUIRE(vk_cmd_pool_init(vk, &pool, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) ==
+			        VK_SUCCESS);
+			REQUIRE(upload(vk, &pool, in_img, src.data(), src.size()));
+			std::vector<uint8_t> zeros((size_t)2 * W * H * 4, 0);
+			REQUIRE(upload(vk, &pool, sbs, zeros.data(), zeros.size()));
+			xrt_lift_weave_rect binding{};
+			binding.stream_id = wire;
+			vk_conv_weave_rect r{};
+			r.binding = &binding;
+			r.owner = 1;
+			r.src = {in_img.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_B8G8R8A8_UNORM, W, H};
+			r.x = RX;
+			r.y = RY;
+			r.w = RW;
+			r.h = RH;
+			r.dst = {sbs.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, 2 * W, H};
+			r.views = 2;
+			r.tile_columns = 2;
+			r.tile_w = W;
+			r.tile_h = H;
+			r.batch = true;
+			r.frame.valid = true;
+			r.frame.width_m = 0.30f;
+			r.frame.height_m = 0.15f;
+
+			vk_conv_gpu_stats a{}, z{};
+			vk_conv_gpu_get_stats(rig.x.g, &a);
+			vk_conv_weave_begin(w, c);
+			REQUIRE(run_cmd(vk, &pool,
+			                [&](VkCommandBuffer cmd) { return vk_conv_weave_record(w, c, cmd, &r); }));
+			vk_conv_weave_complete(w, c);
+			vk_conv_gpu_get_stats(rig.x.g, &z);
+			vk_conv_weave_stats st{};
+			REQUIRE(vk_conv_weave_client_stats(c, wire, &st));
+			CHECK(st.committed == 1u);
+			CHECK(st.snap_w == RW);
+			CHECK(st.snap_h == RH);
+			if (gpu) {
+				CHECK(z.gpu_copies - a.gpu_copies == 1u);   // the chain's image -> the GPU slot
+				CHECK(z.host_writes - a.host_writes == 0u); // no host buffer, no upload
+				CHECK(z.host_reads - a.host_reads == 0u);
+			} else {
+				CHECK(z.gpu_copies - a.gpu_copies == 0u); // host buffer -> the CPU slot (a memcpy)
+			}
+
+			// What the provider was handed: the snapshot, byte-exact on both paths.
+			REQUIRE(wait_until(
+			    [&] {
+				    os_mutex_lock(&rig.f.mtx);
+				    const bool seen = rig.f.converts >= 1;
+				    os_mutex_unlock(&rig.f.mtx);
+				    return seen;
+			    },
+			    5000));
+			os_mutex_lock(&rig.f.mtx);
+			const xrt_conv_image in = rig.f.last_input;
+			os_mutex_unlock(&rig.f.mtx);
+			const std::vector<uint8_t> want =
+			    expect_region(src, W, (uint32_t)RX, (uint32_t)RY, RW, RH, true);
+			std::vector<uint8_t> got(want.size());
+			if (gpu) {
+				REQUIRE(in.memory_kind != XRT_CONV_MEM_CPU);
+				REQUIRE(vk_conv_gpu_read(rig.x.g, &in, got.data(), 0));
+			} else {
+				REQUIRE(in.memory_kind == XRT_CONV_MEM_CPU);
+				REQUIRE(in.cpu_ptr != nullptr);
+				memcpy(got.data(), in.cpu_ptr, got.size());
+			}
+			CHECK(bytes_off(got, want) == 0u);
+
+			vk_conv_weave_client_destroy(w, c);
+			vk_conv_weave_destroy(&w);
+			vk_cmd_pool_destroy(vk, &pool);
+			CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+			vk_conv_gpu_set_provider_kinds(rig.x.g, 0);
+		}
+	}
 }
 
 TEST_CASE("vk_conv_weave: a stream destroyed with a weave in flight keeps its images until the frame completes",
