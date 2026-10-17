@@ -8,9 +8,11 @@
 
 #include "target_input_arbiter.h"
 #include "target_input_plugin_loader.h"
+#include "target_input_pref.h"
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_input_plugin.h"
+#include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_system.h"
 
 #include "os/os_threading.h"
@@ -19,6 +21,7 @@
 #include "util/u_logging.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 
@@ -36,6 +39,16 @@
  * registered provider plus the qwerty floor.
  */
 #define ARBITER_MAX_CANDIDATES 17
+
+/*!
+ * ADR-034 Amendment 5: clients with their own resolution — every IPC
+ * connection (IPC_MAX_CLIENTS = 32) plus the implicit in-process client, with
+ * slack. A client that finds the table full gets the system-wide roles.
+ */
+#define ARBITER_MAX_CLIENTS 40
+
+//! Display name of the emulated-controller floor in an enumeration (runtime-owned, vendor-neutral).
+#define ARBITER_FLOOR_DISPLAY_NAME "Emulated controllers (keyboard and mouse)"
 
 /*!
  * One competitor for the hand roles. Qwerty is a candidate like any
@@ -94,6 +107,13 @@ struct t_input_candidate
 	//! Index for @ref gamepad, resolved at install. -1 = absent.
 	int32_t gamepad_index;
 
+	/*!
+	 * ADR-034 Am.5: the REGISTRATION id (registry subkey / manifest id) — what
+	 * a pin or a request names; resolved at install from the loader ("" =
+	 * fall back to `iface->id`; the floor is XRT_INPUT_PROVIDER_ID_EMULATED).
+	 */
+	char row_id[XRT_INPUT_PROVIDER_ID_SIZE];
+
 	//! Cached presence verdict for this candidate.
 	bool present;
 	bool have_verdict;
@@ -114,6 +134,35 @@ enum
 	ARB_HT_UNOBSTRUCTED_RIGHT = 1,
 	ARB_HT_CONFORMING_LEFT = 2,
 	ARB_HT_CONFORMING_RIGHT = 3,
+};
+
+/*!
+ * ADR-034 Amendment 5: one client's preference overlay and resolved roles.
+ * Lives under g_arb_mutex.
+ */
+struct t_input_client
+{
+	bool used;
+	uint64_t key; //!< xrt_input_selection_client::key (0 = in-process)
+	char exe[XRT_INPUT_EXE_BASENAME_SIZE];
+
+	//! The user's per-app pin for @ref exe ("" = none), cached; re-read on a policy change.
+	char pin[XRT_INPUT_PROVIDER_ID_SIZE];
+
+	//! Non-persisted session requests, per family ("" = none).
+	char request[XRT_INPUT_ROLE_FAMILY_COUNT][XRT_INPUT_PROVIDER_ID_SIZE];
+
+	//! The effective preference per family at the last resolve, and where it came from.
+	char pref_id[XRT_INPUT_ROLE_FAMILY_COUNT][XRT_INPUT_PROVIDER_ID_SIZE];
+	enum target_input_pref_source pref_src[XRT_INPUT_ROLE_FAMILY_COUNT];
+
+	//! The resolved roles; generation_id is this client's own, monotonic.
+	struct xrt_system_roles roles;
+	bool have_roles;
+
+	//! g_arb.epoch at the last resolve; with @ref dirty, the only recompute triggers.
+	uint64_t seen_epoch;
+	bool dirty;
 };
 
 struct t_input_arbiter
@@ -150,6 +199,19 @@ struct t_input_arbiter
 
 	//! N7: a qwerty pair was noted for this build (a floor candidate exists).
 	bool floor_noted;
+
+	/*!
+	 * ADR-034 Am.5: bumped on every change a client's resolution depends on —
+	 * a presence edge, a re-rank, a floor withdrawal, install. A client
+	 * re-resolves only when this moved (or its own overlay did).
+	 */
+	uint64_t epoch;
+
+	//! Cached class policy (refreshed by t_input_arbiter_policy_changed, off the hot path).
+	bool policy_lock;
+	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
+
+	struct t_input_client clients[ARBITER_MAX_CLIENTS];
 };
 
 static struct t_input_arbiter g_arb = {0};
@@ -173,6 +235,12 @@ static bool g_arb_mutex_ready = false;
  */
 static struct os_thread_helper g_arb_poll;
 static bool g_arb_poll_ready = false;
+
+//! ADR-034 Am.5: the policy reads (the loader's store). Outside g_arb so a reset keeps them.
+static struct t_input_arbiter_policy g_policy;
+
+//! ADR-034 Am.5: the selection object published as xsysd->input_selection. Static, filled at install.
+static struct xrt_input_selection g_arb_selection;
 
 
 /*
@@ -297,6 +365,9 @@ candidate_store_verdict_locked(struct t_input_candidate *cand, bool present)
 {
 	if (cand->have_verdict && present != cand->present) {
 		U_LOG_W("input arbiter: '%s' hardware %s.", candidate_name(cand), present ? "present again" : "gone");
+	}
+	if (!cand->have_verdict || present != cand->present) {
+		g_arb.epoch++; // ADR-034 Am.5: every client's resolution may have moved
 	}
 	cand->present = present;
 	cand->have_verdict = true;
@@ -559,6 +630,581 @@ refresh_roles_locked(void)
 	    gamepad_xdev != NULL ? gamepad_xdev->str : "<none>", (unsigned)generation);
 }
 
+/*
+ *
+ * Per-client resolution (ADR-034 Amendment 5, #2181).
+ *
+ */
+
+//! The id a pin / request names this candidate by.
+static const char *
+candidate_id(const struct t_input_candidate *cand)
+{
+	if (cand->iface == NULL) {
+		return XRT_INPUT_PROVIDER_ID_EMULATED;
+	}
+	if (cand->row_id[0] != '\0') {
+		return cand->row_id;
+	}
+	return cand->iface->id != NULL ? cand->iface->id : "";
+}
+
+//! The candidate a preference id names (registration id first, then the binary's own id), or NULL.
+static struct t_input_candidate *
+candidate_by_id_locked(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return NULL;
+	}
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (strcmp(candidate_id(cand), id) == 0) {
+			return cand;
+		}
+	}
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->iface != NULL && cand->iface->id != NULL && strcmp(cand->iface->id, id) == 0) {
+			return cand;
+		}
+	}
+	return NULL;
+}
+
+//! Does @p cand supply devices of @p family? (Decision 2: a preference applies only where it does.)
+static bool
+candidate_claims(const struct t_input_candidate *cand, enum xrt_input_role_family family)
+{
+	if (cand == NULL) {
+		return false;
+	}
+	switch (family) {
+	case XRT_INPUT_ROLE_FAMILY_CONTROLLERS: return cand->left_index >= 0 || cand->right_index >= 0;
+	case XRT_INPUT_ROLE_FAMILY_HAND_TRACKING:
+		for (int k = 0; k < 4; k++) {
+			if (cand->ht_indices[k] >= 0) {
+				return true;
+			}
+		}
+		return false;
+	case XRT_INPUT_ROLE_FAMILY_GAMEPAD: return cand->gamepad_index >= 0;
+	default: return false;
+	}
+}
+
+static uint32_t
+candidate_claimable_bits(const struct t_input_candidate *cand)
+{
+	uint32_t bits = 0;
+	for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
+		if (candidate_claims(cand, (enum xrt_input_role_family)f)) {
+			bits |= XRT_INPUT_ROLE_FAMILY_BIT(f);
+		}
+	}
+	return bits;
+}
+
+static struct t_input_client *
+client_find_locked(uint64_t key)
+{
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		if (g_arb.clients[i].used && g_arb.clients[i].key == key) {
+			return &g_arb.clients[i];
+		}
+	}
+	return NULL;
+}
+
+/*!
+ * The client for @p ref (NULL = the in-process implicit client), creating it
+ * on first use. Returns with g_arb_mutex HELD — also when it returns NULL
+ * (table full). The store reads a new client needs (its executable, its pin)
+ * happen before the lock is taken, never under it.
+ */
+static struct t_input_client *
+client_get_and_lock(const struct xrt_input_selection_client *ref)
+{
+	const uint64_t key = ref != NULL ? ref->key : 0;
+
+	os_mutex_lock(&g_arb_mutex);
+	struct t_input_client *c = client_find_locked(key);
+	if (c != NULL) {
+		return c;
+	}
+	os_mutex_unlock(&g_arb_mutex);
+
+	char exe[XRT_INPUT_EXE_BASENAME_SIZE] = {0};
+	if (ref != NULL && ref->exe_basename[0] != '\0') {
+		snprintf(exe, sizeof(exe), "%s", ref->exe_basename);
+	} else if (key == 0 && g_policy.self_exe_basename != NULL) {
+		(void)g_policy.self_exe_basename(exe, sizeof(exe));
+	}
+	char pin[XRT_INPUT_PROVIDER_ID_SIZE] = {0};
+	if (exe[0] != '\0' && g_policy.get_app_pin != NULL) {
+		(void)g_policy.get_app_pin(exe, pin, sizeof(pin));
+	}
+
+	os_mutex_lock(&g_arb_mutex);
+	c = client_find_locked(key); // another thread may have attached it meanwhile
+	if (c != NULL) {
+		return c;
+	}
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		if (!g_arb.clients[i].used) {
+			c = &g_arb.clients[i];
+			memset(c, 0, sizeof(*c));
+			c->used = true;
+			c->key = key;
+			snprintf(c->exe, sizeof(c->exe), "%s", exe);
+			snprintf(c->pin, sizeof(c->pin), "%s", pin);
+			c->dirty = true;
+			if (pin[0] != '\0') {
+				U_LOG_W("input arbiter: client %llu ('%s') attached with per-app pin '%s'.",
+				        (unsigned long long)key, exe, pin);
+			}
+			return c;
+		}
+	}
+	static bool warned_full = false;
+	if (!warned_full) {
+		warned_full = true;
+		U_LOG_W("input arbiter: per-client table full (%d) — client %llu gets the system-wide roles.",
+		        ARBITER_MAX_CLIENTS, (unsigned long long)key);
+	}
+	return NULL;
+}
+
+//! @p hoisted when it supplies @p index_of_hoisted (>= 0) and is present, else NULL.
+static struct t_input_candidate *
+hoisted_if_present_locked(struct t_input_candidate *hoisted, int32_t index_of_hoisted)
+{
+	if (hoisted == NULL || index_of_hoisted < 0) {
+		return NULL;
+	}
+	return candidate_is_present_locked(hoisted) ? hoisted : NULL;
+}
+
+static bool
+roles_equal(const struct xrt_system_roles *a, const struct xrt_system_roles *b)
+{
+	return a->left == b->left && a->right == b->right && a->gamepad == b->gamepad &&
+	       a->left_profile == b->left_profile && a->right_profile == b->right_profile &&
+	       a->gamepad_profile == b->gamepad_profile &&
+	       a->hand_tracking.unobstructed.left == b->hand_tracking.unobstructed.left &&
+	       a->hand_tracking.unobstructed.right == b->hand_tracking.unobstructed.right &&
+	       a->hand_tracking.conforming.left == b->hand_tracking.conforming.left &&
+	       a->hand_tracking.conforming.right == b->hand_tracking.conforming.right && a->rig == b->rig;
+}
+
+static struct xrt_device *
+xdev_at_locked(int32_t index)
+{
+	return (index >= 0 && (size_t)index < g_arb.xsysd->xdev_count) ? g_arb.xsysd->xdevs[index] : NULL;
+}
+
+/*!
+ * Re-resolve @p c's roles when the arbiter's state or its own overlay moved
+ * since the last time; a no-op otherwise (so `get_roles` stays a cache read).
+ * Caller holds the mutex; never the presence poll thread.
+ */
+static void
+resolve_client_locked(struct t_input_client *c)
+{
+	refresh_roles_locked(); // the system-wide walk: the rig, and the generation a new client seeds from
+	if (c->have_roles && !c->dirty && c->seen_epoch == g_arb.epoch) {
+		return;
+	}
+
+	// The preferred candidate per family (decision 3's precedence, decision 2's claim gate).
+	struct t_input_candidate *hoist[XRT_INPUT_ROLE_FAMILY_COUNT] = {0};
+	bool any_overlay = false;
+	for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
+		const enum xrt_input_role_family fam = (enum xrt_input_role_family)f;
+		struct target_input_pref_inputs in;
+		memset(&in, 0, sizeof(in));
+		in.lock = g_arb.policy_lock;
+		in.app_pin = c->pin;
+		in.app_pin_claims = candidate_claims(candidate_by_id_locked(c->pin), fam);
+		in.request = c->request[f];
+		in.request_claims = candidate_claims(candidate_by_id_locked(c->request[f]), fam);
+		in.user_default = g_arb.user_default;
+		in.user_default_claims = candidate_claims(candidate_by_id_locked(g_arb.user_default), fam);
+		c->pref_src[f] = target_input_resolve_preference(&in, c->pref_id[f], sizeof(c->pref_id[f]));
+		// The user default is already rank 0 of the default walk: only a pin or a
+		// request hoists anything.
+		if (c->pref_src[f] == TARGET_INPUT_PREF_APP_PIN || c->pref_src[f] == TARGET_INPUT_PREF_REQUEST) {
+			hoist[f] = candidate_by_id_locked(c->pref_id[f]);
+			any_overlay = any_overlay || hoist[f] != NULL;
+		}
+	}
+
+	struct t_input_candidate *hc = hoist[XRT_INPUT_ROLE_FAMILY_CONTROLLERS];
+	struct t_input_candidate *left_cand = hoisted_if_present_locked(hc, hc != NULL ? hc->left_index : -1);
+	if (left_cand == NULL) {
+		left_cand = pick_for_hand_locked(true);
+	}
+	struct t_input_candidate *right_cand = hoisted_if_present_locked(hc, hc != NULL ? hc->right_index : -1);
+	if (right_cand == NULL) {
+		right_cand = pick_for_hand_locked(false);
+	}
+	const int32_t left = left_cand != NULL ? left_cand->left_index : -1;
+	const int32_t right = right_cand != NULL ? right_cand->right_index : -1;
+
+	int32_t ht[4];
+	struct t_input_candidate *hh = hoist[XRT_INPUT_ROLE_FAMILY_HAND_TRACKING];
+	for (int k = 0; k < 4; k++) {
+		struct t_input_candidate *w = hoisted_if_present_locked(hh, hh != NULL ? hh->ht_indices[k] : -1);
+		ht[k] = w != NULL ? w->ht_indices[k] : pick_ht_slot_locked(k);
+	}
+
+	struct t_input_candidate *hg = hoist[XRT_INPUT_ROLE_FAMILY_GAMEPAD];
+	struct t_input_candidate *gw = hoisted_if_present_locked(hg, hg != NULL ? hg->gamepad_index : -1);
+	const int32_t gamepad = gw != NULL ? gw->gamepad_index : pick_gamepad_locked();
+
+	struct xrt_system_roles next = XRT_SYSTEM_ROLES_INIT;
+	next.left = left;
+	next.right = right;
+	next.left_profile = profile_to_report_locked(left_cand, xdev_at_locked(left), true);
+	next.right_profile = profile_to_report_locked(right_cand, xdev_at_locked(right), false);
+	next.hand_tracking.unobstructed.left = ht[ARB_HT_UNOBSTRUCTED_LEFT];
+	next.hand_tracking.unobstructed.right = ht[ARB_HT_UNOBSTRUCTED_RIGHT];
+	next.hand_tracking.conforming.left = ht[ARB_HT_CONFORMING_LEFT];
+	next.hand_tracking.conforming.right = ht[ARB_HT_CONFORMING_RIGHT];
+	next.gamepad = gamepad;
+	next.gamepad_profile = name_of(xdev_at_locked(gamepad));
+	next.rig = g_arb.roles.rig; // runtime-wide, never per client
+
+	c->seen_epoch = g_arb.epoch;
+	c->dirty = false;
+	if (c->have_roles && roles_equal(&next, &c->roles)) {
+		return; // nothing moved for THIS client: its generation stays
+	}
+	// Decision 4: one monotonic generation per client, seeded from the system's.
+	const uint64_t seed = g_arb.roles.generation_id > 0 ? g_arb.roles.generation_id : 1;
+	next.generation_id = c->have_roles ? c->roles.generation_id + 1 : seed;
+	c->roles = next;
+	c->have_roles = true;
+
+	if (any_overlay) {
+		// An overlay-driven assignment change: event-driven (a request, a pin, a
+		// presence edge), never per frame.
+		U_LOG_W("input arbiter: client %llu ('%s') roles -> left %d right %d hands %d/%d gamepad %d "
+		        "(controllers '%s', hands '%s', gamepad '%s'), generation %llu.",
+		        (unsigned long long)c->key, c->exe, left, right, ht[ARB_HT_UNOBSTRUCTED_LEFT],
+		        ht[ARB_HT_UNOBSTRUCTED_RIGHT], c->pref_id[0][0] ? c->pref_id[0] : "-",
+		        c->pref_id[1][0] ? c->pref_id[1] : "-", c->pref_id[2][0] ? c->pref_id[2] : "-",
+		        (unsigned long long)next.generation_id);
+	}
+}
+
+/*!
+ * The roles for @p ref, through the per-client overlay. Falls back to the
+ * system-wide roles when the client table is full.
+ */
+static void
+client_roles(const struct xrt_input_selection_client *ref, struct xrt_system_roles *out_roles)
+{
+	struct t_input_client *c = client_get_and_lock(ref); // returns locked
+	if (c == NULL) {
+		refresh_roles_locked();
+		*out_roles = g_arb.roles;
+	} else {
+		resolve_client_locked(c);
+		*out_roles = c->roles;
+	}
+	os_mutex_unlock(&g_arb_mutex);
+}
+
+//! The candidate that owns system-device index @p index for @p family, or NULL.
+static const struct t_input_candidate *
+owner_of_locked(int32_t index, enum xrt_input_role_family family)
+{
+	if (index < 0) {
+		return NULL;
+	}
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		const struct t_input_candidate *cand = &g_arb.candidates[i];
+		switch (family) {
+		case XRT_INPUT_ROLE_FAMILY_CONTROLLERS:
+			if (cand->left_index == index || cand->right_index == index) {
+				return cand;
+			}
+			break;
+		case XRT_INPUT_ROLE_FAMILY_HAND_TRACKING:
+			for (int k = 0; k < 4; k++) {
+				if (cand->ht_indices[k] == index) {
+					return cand;
+				}
+			}
+			break;
+		case XRT_INPUT_ROLE_FAMILY_GAMEPAD:
+			if (cand->gamepad_index == index) {
+				return cand;
+			}
+			break;
+		default: break;
+		}
+	}
+	return NULL;
+}
+
+//! Families of @p roles held by @p cand.
+static uint32_t
+current_bits_locked(const struct t_input_candidate *cand, const struct xrt_system_roles *roles)
+{
+	uint32_t bits = 0;
+	if (owner_of_locked(roles->left, XRT_INPUT_ROLE_FAMILY_CONTROLLERS) == cand ||
+	    owner_of_locked(roles->right, XRT_INPUT_ROLE_FAMILY_CONTROLLERS) == cand) {
+		bits |= XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_CONTROLLERS);
+	}
+	const int32_t ht[4] = {roles->hand_tracking.unobstructed.left, roles->hand_tracking.unobstructed.right,
+	                       roles->hand_tracking.conforming.left, roles->hand_tracking.conforming.right};
+	for (int k = 0; k < 4; k++) {
+		if (owner_of_locked(ht[k], XRT_INPUT_ROLE_FAMILY_HAND_TRACKING) == cand) {
+			bits |= XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_HAND_TRACKING);
+			break;
+		}
+	}
+	if (owner_of_locked(roles->gamepad, XRT_INPUT_ROLE_FAMILY_GAMEPAD) == cand) {
+		bits |= XRT_INPUT_ROLE_FAMILY_BIT(XRT_INPUT_ROLE_FAMILY_GAMEPAD);
+	}
+	return bits;
+}
+
+//! Holder id of @p family in @p roles ("" = nobody).
+static void
+holder_of_locked(const struct xrt_system_roles *roles, enum xrt_input_role_family family, char *out, size_t cap)
+{
+	const struct t_input_candidate *cand = NULL;
+	switch (family) {
+	case XRT_INPUT_ROLE_FAMILY_CONTROLLERS:
+		cand = owner_of_locked(roles->left, family);
+		if (cand == NULL) {
+			cand = owner_of_locked(roles->right, family);
+		}
+		break;
+	case XRT_INPUT_ROLE_FAMILY_HAND_TRACKING: {
+		const int32_t ht[4] = {roles->hand_tracking.unobstructed.left, roles->hand_tracking.unobstructed.right,
+		                       roles->hand_tracking.conforming.left, roles->hand_tracking.conforming.right};
+		for (int k = 0; k < 4 && cand == NULL; k++) {
+			cand = owner_of_locked(ht[k], family);
+		}
+		break;
+	}
+	case XRT_INPUT_ROLE_FAMILY_GAMEPAD: cand = owner_of_locked(roles->gamepad, family); break;
+	default: break;
+	}
+	snprintf(out, cap, "%s", cand != NULL ? candidate_id(cand) : "");
+}
+
+
+/*
+ *
+ * The xrt_input_selection published as xsysd->input_selection.
+ *
+ */
+
+static xrt_result_t
+sel_get_roles(struct xrt_input_selection *xis,
+              const struct xrt_input_selection_client *client,
+              struct xrt_system_roles *out_roles)
+{
+	(void)xis;
+	if (out_roles == NULL || g_arb.xsysd == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	client_roles(client, out_roles);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+sel_enumerate(struct xrt_input_selection *xis,
+              const struct xrt_input_selection_client *client,
+              uint32_t start,
+              struct xrt_input_provider_page *out_page)
+{
+	(void)xis;
+	if (out_page == NULL || g_arb.xsysd == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	memset(out_page, 0, sizeof(*out_page));
+	out_page->start = start;
+
+	struct t_input_client *c = client_get_and_lock(client); // returns locked
+	struct xrt_system_roles roles;
+	if (c != NULL) {
+		resolve_client_locked(c);
+		roles = c->roles;
+	} else {
+		refresh_roles_locked();
+		roles = g_arb.roles;
+	}
+	out_page->generation = roles.generation_id;
+
+	uint32_t listed = 0;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		const struct t_input_candidate *cand = ranked_locked(i);
+		const uint32_t claimable = candidate_claimable_bits(cand);
+		if (cand->withdrawn || claimable == 0) {
+			continue; // disabled by policy, or navigation-only: not a choice for any family
+		}
+		const uint32_t pos = listed++;
+		if (pos < start || out_page->count >= XRT_INPUT_PROVIDER_PAGE_MAX) {
+			continue;
+		}
+		struct xrt_input_provider_info *info = &out_page->items[out_page->count++];
+		memset(info, 0, sizeof(*info));
+		const char *id = candidate_id(cand);
+		snprintf(info->id, sizeof(info->id), "%s", id);
+		if (cand->iface == NULL) {
+			snprintf(info->display_name, sizeof(info->display_name), "%s", ARBITER_FLOOR_DISPLAY_NAME);
+			info->builtin = true;
+		} else {
+			snprintf(info->display_name, sizeof(info->display_name), "%s",
+			         cand->iface->display_name != NULL ? cand->iface->display_name : id);
+		}
+		info->claimable_families = claimable;
+		info->current_families = current_bits_locked(cand, &roles);
+		info->present = candidate_is_present_locked((struct t_input_candidate *)cand);
+		info->user_default = g_arb.user_default[0] != '\0' && strcmp(g_arb.user_default, id) == 0;
+		if (c != NULL) {
+			info->app_pinned = !g_arb.policy_lock && c->pin[0] != '\0' &&
+			                   candidate_by_id_locked(c->pin) == cand;
+			for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
+				if (c->request[f][0] != '\0' && candidate_by_id_locked(c->request[f]) == cand) {
+					info->requested_families |= XRT_INPUT_ROLE_FAMILY_BIT(f);
+				}
+			}
+		}
+	}
+	out_page->total = listed;
+	os_mutex_unlock(&g_arb_mutex);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+sel_set_preference(struct xrt_input_selection *xis,
+                   const struct xrt_input_selection_client *client,
+                   enum xrt_input_role_family family,
+                   const char *provider_id,
+                   bool persist)
+{
+	(void)xis;
+	if ((int)family < 0 || family >= XRT_INPUT_ROLE_FAMILY_COUNT || g_arb.xsysd == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char id[XRT_INPUT_PROVIDER_ID_SIZE] = {0};
+	if (provider_id != NULL) {
+		snprintf(id, sizeof(id), "%s", provider_id);
+	}
+
+	struct t_input_client *c = client_get_and_lock(client); // returns locked
+	if (c == NULL) {
+		os_mutex_unlock(&g_arb_mutex);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	const uint64_t key = c->key;
+	char exe[XRT_INPUT_EXE_BASENAME_SIZE];
+	snprintf(exe, sizeof(exe), "%s", c->exe);
+	if (!persist || id[0] == '\0') {
+		// A clear (persisted or not) clears the session request too.
+		snprintf(c->request[family], sizeof(c->request[family]), "%s", persist ? "" : id);
+		c->dirty = true;
+	}
+	os_mutex_unlock(&g_arb_mutex);
+
+	if (!persist) {
+		U_LOG_W("input arbiter: client %llu ('%s') requests family %d -> '%s'.", (unsigned long long)key, exe,
+		        (int)family, id[0] != '\0' ? id : "<default>");
+		return XRT_SUCCESS;
+	}
+
+	// Persist = the user's per-app pin record (the Dashboard's), written off the lock.
+	if (exe[0] == '\0' || g_policy.set_app_pin == NULL || g_policy.set_app_pin(exe, id) != 0) {
+		U_LOG_W("input arbiter: client %llu: per-app pin for '%s' could not be written — refused.",
+		        (unsigned long long)key, exe[0] != '\0' ? exe : "<unknown executable>");
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char pin[XRT_INPUT_PROVIDER_ID_SIZE] = {0};
+	if (g_policy.get_app_pin != NULL) {
+		(void)g_policy.get_app_pin(exe, pin, sizeof(pin)); // re-read: Policy\Lock may hide it
+	}
+	os_mutex_lock(&g_arb_mutex);
+	// Every client of the same executable shares the pin (the record is per app).
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		struct t_input_client *o = &g_arb.clients[i];
+		if (o->used && strcmp(o->exe, exe) == 0) {
+			snprintf(o->pin, sizeof(o->pin), "%s", pin);
+			o->dirty = true;
+		}
+	}
+	os_mutex_unlock(&g_arb_mutex);
+	U_LOG_W("input arbiter: per-app pin for '%s' %s '%s' (by client %llu).", exe, id[0] ? "set to" : "cleared",
+	        id[0] ? id : "", (unsigned long long)key);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+sel_query_holders(struct xrt_input_selection *xis, uint32_t index, struct xrt_input_client_holders *out)
+{
+	(void)xis;
+	if (out == NULL || g_arb.xsysd == NULL || !g_arb_mutex_ready) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	memset(out, 0, sizeof(*out));
+	os_mutex_lock(&g_arb_mutex);
+	uint32_t seen = 0;
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		struct t_input_client *c = &g_arb.clients[i];
+		if (!c->used || seen++ != index) {
+			continue;
+		}
+		resolve_client_locked(c);
+		out->key = c->key;
+		snprintf(out->exe_basename, sizeof(out->exe_basename), "%s", c->exe);
+		for (int f = 0; f < XRT_INPUT_ROLE_FAMILY_COUNT; f++) {
+			holder_of_locked(&c->roles, (enum xrt_input_role_family)f, out->holder[f], sizeof(out->holder[f]));
+			const bool overlay =
+			    c->pref_src[f] == TARGET_INPUT_PREF_APP_PIN || c->pref_src[f] == TARGET_INPUT_PREF_REQUEST;
+			snprintf(out->preferred[f], sizeof(out->preferred[f]), "%s", overlay ? c->pref_id[f] : "");
+		}
+		out->generation = c->roles.generation_id;
+		os_mutex_unlock(&g_arb_mutex);
+		return XRT_SUCCESS;
+	}
+	os_mutex_unlock(&g_arb_mutex);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED; // past the end
+}
+
+static void
+sel_client_detach(struct xrt_input_selection *xis, const struct xrt_input_selection_client *client)
+{
+	(void)xis;
+	if (client == NULL || !g_arb_mutex_ready) {
+		return;
+	}
+	os_mutex_lock(&g_arb_mutex);
+	struct t_input_client *c = client_find_locked(client->key);
+	if (c != NULL) {
+		memset(c, 0, sizeof(*c)); // requests die with the client; the user's pin stays in the store
+	}
+	os_mutex_unlock(&g_arb_mutex);
+}
+
+/*!
+ * Re-read the cached class policy (lock, user default) — store I/O, so never
+ * under the lock. Install and @ref t_input_arbiter_policy_changed call it.
+ */
+static void
+read_class_policy(bool *out_lock, char *out_default, size_t cap)
+{
+	*out_lock = g_policy.get_policy_lock != NULL && g_policy.get_policy_lock();
+	out_default[0] = '\0';
+	if (g_policy.get_user_default != NULL) {
+		(void)g_policy.get_user_default(out_default, cap);
+	}
+}
+
 static xrt_result_t
 arbiter_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles)
 {
@@ -572,11 +1218,10 @@ arbiter_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out
 		return XRT_SUCCESS;
 	}
 
-	os_mutex_lock(&g_arb_mutex);
-	refresh_roles_locked();
-	*out_roles = g_arb.roles;
-	os_mutex_unlock(&g_arb_mutex);
-
+	// ADR-034 Am.5: this process's own view — the implicit client (key 0),
+	// keyed by this process's executable. With no preference set, its walk
+	// is the default walk and the roles are the system-wide ones.
+	client_roles(NULL, out_roles);
 	return XRT_SUCCESS;
 }
 
@@ -619,6 +1264,9 @@ arbiter_destroy(struct xrt_system_devices *xsysd)
 {
 	if (g_arb_poll_ready) {
 		os_thread_helper_stop_and_wait(&g_arb_poll);
+	}
+	if (xsysd != NULL && xsysd->input_selection == &g_arb_selection) {
+		xsysd->input_selection = NULL;
 	}
 	if (g_arb.fallback_destroy != NULL) {
 		g_arb.fallback_destroy(xsysd);
@@ -870,7 +1518,24 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		return;
 	}
 
+	// ADR-034 Am.5: what pins and requests name — the registration id — and the
+	// class policy they resolve under. Store reads, so before the lock.
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		const char *row = (cand->iface != NULL && g_policy.row_id_for != NULL)
+		                      ? g_policy.row_id_for(cand->iface, cand->inst)
+		                      : NULL;
+		snprintf(cand->row_id, sizeof(cand->row_id), "%s", row != NULL ? row : "");
+	}
+	bool policy_lock = false;
+	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
+	read_class_policy(&policy_lock, user_default, sizeof(user_default));
+
 	os_mutex_lock(&g_arb_mutex);
+
+	g_arb.policy_lock = policy_lock;
+	snprintf(g_arb.user_default, sizeof(g_arb.user_default), "%s", user_default);
+	g_arb.epoch++;
 
 	g_arb.xsysd = xsysd;
 	g_arb.fallback_get_roles = xsysd->get_roles;
@@ -896,6 +1561,15 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 
 	xsysd->get_roles = arbiter_get_roles;
 	xsysd->destroy = arbiter_destroy; // #958: stop the poll thread before providers free
+
+	// ADR-034 Am.5: per-client selection, for the OpenXR layer (in-process) and
+	// the IPC server (on each connection's behalf).
+	g_arb_selection.get_roles = sel_get_roles;
+	g_arb_selection.enumerate = sel_enumerate;
+	g_arb_selection.set_preference = sel_set_preference;
+	g_arb_selection.query_holders = sel_query_holders;
+	g_arb_selection.client_detach = sel_client_detach;
+	xsysd->input_selection = &g_arb_selection;
 
 	os_mutex_unlock(&g_arb_mutex);
 
@@ -959,6 +1633,7 @@ t_input_arbiter_set_floor_withdrawn(bool withdrawn)
 		changed++;
 	}
 	if (changed > 0) {
+		g_arb.epoch++;
 		refresh_roles_locked(); // bumps generation_id and logs when the assignment moved
 	}
 	os_mutex_unlock(&g_arb_mutex);
@@ -1013,8 +1688,85 @@ t_input_arbiter_rerank(const struct t_input_arbiter_rank *ranks, int count)
 		}
 	}
 	if (changed > 0) {
+		g_arb.epoch++;
 		rebuild_order_locked();
 		refresh_roles_locked(); // bumps generation_id and logs when the assignment moved
+	}
+	os_mutex_unlock(&g_arb_mutex);
+	return changed;
+}
+
+void
+t_input_arbiter_set_policy(const struct t_input_arbiter_policy *policy)
+{
+	if (policy != NULL) {
+		g_policy = *policy;
+	} else {
+		memset(&g_policy, 0, sizeof(g_policy));
+	}
+}
+
+int
+t_input_arbiter_policy_changed(void)
+{
+	if (!g_arb_mutex_ready) {
+		return 0;
+	}
+	bool policy_lock = false;
+	char user_default[XRT_INPUT_PROVIDER_ID_SIZE];
+	read_class_policy(&policy_lock, user_default, sizeof(user_default));
+
+	// Snapshot who is attached, read their pins off the lock, apply by key.
+	struct
+	{
+		uint64_t key;
+		char exe[XRT_INPUT_EXE_BASENAME_SIZE];
+		char pin[XRT_INPUT_PROVIDER_ID_SIZE];
+	} snap[ARBITER_MAX_CLIENTS];
+	int n = 0;
+	os_mutex_lock(&g_arb_mutex);
+	if (g_arb.xsysd == NULL) {
+		os_mutex_unlock(&g_arb_mutex);
+		return 0; // not installed: nothing resolves per client
+	}
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		if (g_arb.clients[i].used) {
+			snap[n].key = g_arb.clients[i].key;
+			snprintf(snap[n].exe, sizeof(snap[n].exe), "%s", g_arb.clients[i].exe);
+			snap[n].pin[0] = '\0';
+			n++;
+		}
+	}
+	os_mutex_unlock(&g_arb_mutex);
+
+	for (int i = 0; i < n; i++) {
+		if (snap[i].exe[0] != '\0' && g_policy.get_app_pin != NULL) {
+			(void)g_policy.get_app_pin(snap[i].exe, snap[i].pin, sizeof(snap[i].pin));
+		}
+	}
+
+	int changed = 0;
+	os_mutex_lock(&g_arb_mutex);
+	g_arb.policy_lock = policy_lock;
+	snprintf(g_arb.user_default, sizeof(g_arb.user_default), "%s", user_default);
+	for (int i = 0; i < n; i++) {
+		struct t_input_client *c = client_find_locked(snap[i].key);
+		if (c == NULL) {
+			continue; // detached meanwhile
+		}
+		if (strcmp(c->pin, snap[i].pin) != 0) {
+			U_LOG_W("input arbiter: client %llu ('%s') per-app pin '%s' -> '%s'.", (unsigned long long)c->key,
+			        c->exe, c->pin, snap[i].pin);
+			snprintf(c->pin, sizeof(c->pin), "%s", snap[i].pin);
+			changed++;
+		}
+	}
+	// The lock or the user default may have moved too: every client re-resolves
+	// at its next get_roles (never here, never on the poll thread).
+	for (int i = 0; i < ARBITER_MAX_CLIENTS; i++) {
+		if (g_arb.clients[i].used) {
+			g_arb.clients[i].dirty = true;
+		}
 	}
 	os_mutex_unlock(&g_arb_mutex);
 	return changed;

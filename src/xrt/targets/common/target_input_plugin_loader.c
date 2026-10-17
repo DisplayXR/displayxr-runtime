@@ -658,54 +658,6 @@ target_input_plugin_get_row_id(int index)
  *
  */
 
-static bool
-input_pref_set(const char *id)
-{
-	return id != NULL && id[0] != '\0';
-}
-
-enum target_input_pref_source
-target_input_resolve_preference(const struct target_input_pref_inputs *in, char *out, size_t cap)
-{
-	if (out != NULL && cap > 0) {
-		out[0] = '\0';
-	}
-	if (in == NULL || in->providers_disabled) {
-		return TARGET_INPUT_PREF_NONE;
-	}
-	const char *id = NULL;
-	enum target_input_pref_source src = TARGET_INPUT_PREF_NONE;
-	// Under Policy\Lock the per-user pin and the app's own request are both
-	// invisible: the machine's PreferredPlugin (which the caller read with the
-	// lock applied) and ProbeOrder decide.
-	if (!in->lock && input_pref_set(in->app_pin) && in->app_pin_claims) {
-		id = in->app_pin;
-		src = TARGET_INPUT_PREF_APP_PIN;
-	} else if (!in->lock && input_pref_set(in->request) && in->request_claims) {
-		id = in->request;
-		src = TARGET_INPUT_PREF_REQUEST;
-	} else if (input_pref_set(in->user_default) && in->user_default_claims) {
-		id = in->user_default;
-		src = TARGET_INPUT_PREF_USER_DEFAULT;
-	}
-	if (id != NULL && out != NULL && cap > 0) {
-		snprintf(out, cap, "%s", id);
-	}
-	return src;
-}
-
-const char *
-target_input_pref_source_str(enum target_input_pref_source source)
-{
-	switch (source) {
-	case TARGET_INPUT_PREF_APP_PIN: return "app_pin";
-	case TARGET_INPUT_PREF_REQUEST: return "request";
-	case TARGET_INPUT_PREF_USER_DEFAULT: return "user_default";
-	case TARGET_INPUT_PREF_NONE:
-	default: return "none";
-	}
-}
-
 //! A provider id a pin may name: the CLI's rule (non-empty, fits, no separators / control chars).
 static bool
 input_pin_id_valid(const char *id)
@@ -1246,11 +1198,54 @@ input_providers_disabled_by_env(void)
 	return env != NULL && env[0] == '0' && env[1] == '\0';
 }
 
+/*
+ * ADR-034 Am.5: the store reads the arbiter's per-client walk needs, installed
+ * once at discovery. Kept here (not in the arbiter) so the arbiter stays
+ * store-free and its tests can fake every read.
+ */
+static int
+input_policy_set_app_pin(const char *exe, const char *id)
+{
+	return target_input_plugin_set_app_pin(exe, id) == TARGET_INPUT_PIN_WRITE_OK ? 0 : 1;
+}
+
+static bool
+input_policy_lock(void)
+{
+	return target_component_policy_lock(&g_input_class);
+}
+
+static const char *
+input_policy_row_id_for(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst)
+{
+	for (int p = 0; p < g_input_provider_count; p++) {
+		if (g_input_providers[p].iface == iface && g_input_providers[p].inst == inst) {
+			return g_input_providers[p].row_id;
+		}
+	}
+	return NULL;
+}
+
+static void
+input_install_arbiter_policy(void)
+{
+	const struct t_input_arbiter_policy policy = {
+	    .get_app_pin = target_input_plugin_get_app_pin,
+	    .set_app_pin = input_policy_set_app_pin,
+	    .get_policy_lock = input_policy_lock,
+	    .get_user_default = target_input_plugin_get_preferred,
+	    .row_id_for = input_policy_row_id_for,
+	    .self_exe_basename = u_exe_basename_self,
+	};
+	t_input_arbiter_set_policy(&policy);
+}
+
 const struct xrt_input_plugin_iface *
 target_input_plugin_get_iface(int index)
 {
 	if (!g_input_load_attempted) {
 		g_input_load_attempted = 1;
+		input_install_arbiter_policy();
 		if (input_providers_disabled_by_env()) {
 			/* One WARN, once per process: the scan is one-shot, so
 			 * this cannot bloat a log even across the hundreds of
@@ -1473,6 +1468,12 @@ target_input_plugin_reread_policy(void)
 	}
 	free(entries);
 	const int changed = t_input_arbiter_rerank(ranks, rank_count);
+	// ADR-034 Am.5: per-app pins (and the lock / default they resolve under).
+	const int pins_changed = t_input_arbiter_policy_changed();
+	if (pins_changed > 0) {
+		U_LOG_W("input plugin loader: policy re-read — %d client(s) picked up a changed per-app pin.",
+		        pins_changed);
+	}
 	U_LOG_W("input plugin loader: policy re-read — PreferredPlugin=%s, %d resident provider(s), %d re-ranked.",
 	        have_pref ? preferred : "<unset>", rank_count, changed);
 	return changed + floor_changed;

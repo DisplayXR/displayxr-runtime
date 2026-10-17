@@ -12,7 +12,7 @@ add_library(
 			    target_lists.c target_lists.h
 			    target_input_arbiter.c target_input_arbiter.h
 			    target_component_loader.c target_component_loader.h
-			    target_input_plugin_loader.c target_input_plugin_loader.h
+			    target_input_plugin_loader.c target_input_plugin_loader.h target_input_pref.h
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_conv_status.c target_conv_status.h
 			    target_conv_store.c
