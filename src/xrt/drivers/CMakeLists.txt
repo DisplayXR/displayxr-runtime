@@ -832,6 +832,113 @@ else()
 		)
 endif()
 ####
+# DisplayXR-Gamepad input-provider plug-in DLL (ADR-034 / ADR-054, existing
+# input-provider class).
+#
+# The one controller every desk has, turned into the three things a flat 3D
+# display needs with no tracked head or hands: the `/user/gamepad` role
+# (`microsoft/xbox_controller`), the RIG role (left stick = move, right stick
+# = look, ADR-034 Amendment 4), and an optional emulated khr/simple_controller
+# pair so HANDLE apps — denied the qwerty pair because their own window owns
+# the keyboard — get xrSyncActions controllers at all. Platform readers:
+# XInput (Windows), GameController.framework (macOS); desktop Linux is a stub
+# that declines at probe (evdev follow-up). Presence-gated: registered by
+# the installer, inert without a pad. Same build model as sim-input above.
+#
+# drv_gamepad_sources / drv_gamepad_static: the sources also compile as a
+# plain OBJECT library outside the OpenXR gate, which is what
+# scripts/build-mingw-check.sh builds to compile-check the XInput backend
+# from a Mac / Linux box (the plug-in proper needs the runtime import lib).
+set(DRV_GAMEPAD_SOURCES
+	gamepad/gamepad_backend.h
+	gamepad/gamepad_backend_stub.c
+	gamepad/gamepad_backend_xinput.c
+	gamepad/gamepad_device.c
+	gamepad/gamepad_emu.c
+	gamepad/gamepad_hub.c
+	gamepad/gamepad_interface.h
+	gamepad/gamepad_map.c
+	gamepad/gamepad_map.h
+	gamepad/gamepad_nav.c
+	gamepad/gamepad_plugin.c
+	gamepad/gamepad_settings.c
+	gamepad/gamepad_settings.h
+	)
+if(APPLE)
+	list(APPEND DRV_GAMEPAD_SOURCES gamepad/gamepad_backend_gc.m)
+endif()
+
+add_library(drv_gamepad_plugin SHARED ${DRV_GAMEPAD_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_gamepad_plugin PRIVATE
+		xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_gamepad_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_gamepad_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_gamepad_plugin ${RUNTIME_TARGET})
+endif()
+if(WIN32)
+	# xinput9_1_0: the Windows-7-and-later XInput import every SDK carries.
+	target_link_libraries(drv_gamepad_plugin PRIVATE xinput9_1_0)
+elseif(APPLE)
+	target_link_libraries(drv_gamepad_plugin PRIVATE "-framework GameController" "-framework Foundation")
+endif()
+target_include_directories(drv_gamepad_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/gamepad
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+
+# LINKER_LANGUAGE CXX: same rule as net_input (static-link paths pull C++ aux).
+set_target_properties(drv_gamepad_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-Gamepad"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+if(APPLE)
+	target_link_options(drv_gamepad_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_gamepad_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_gamepad_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_gamepad_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+if(XRT_HAVE_LINUX)
+	add_custom_command(
+		TARGET drv_gamepad_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_gamepad_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_gamepad_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+
+####
 # DisplayXR-Ultraleap input-provider plug-in DLL (#825 Tier 1).
 #
 # Hand-as-motion-controller provider on the ADR-034 channel: LeapC palm
@@ -947,6 +1054,33 @@ else()
 endif() # LeapC SDK found
 
 endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — input-provider plug-in blocks
+
+# The gamepad provider's sources as a plain OBJECT library, outside the
+# OpenXR gate: the compile-only target scripts/build-mingw-check.sh builds
+# (`drv_gamepad_static`) to catch Win32 / XInput typos from a non-Windows box.
+# Nothing links it in a normal build.
+if(NOT ANDROID)
+	set(DRV_GAMEPAD_STATIC_SOURCES
+		gamepad/gamepad_backend_stub.c
+		gamepad/gamepad_backend_xinput.c
+		gamepad/gamepad_device.c
+		gamepad/gamepad_emu.c
+		gamepad/gamepad_hub.c
+		gamepad/gamepad_map.c
+		gamepad/gamepad_nav.c
+		gamepad/gamepad_plugin.c
+		gamepad/gamepad_settings.c
+		)
+	if(APPLE)
+		list(APPEND DRV_GAMEPAD_STATIC_SOURCES gamepad/gamepad_backend_gc.m)
+	endif()
+	add_library(drv_gamepad_static OBJECT EXCLUDE_FROM_ALL ${DRV_GAMEPAD_STATIC_SOURCES})
+	target_link_libraries(drv_gamepad_static PUBLIC xrt-interfaces aux_util aux_os drv_includes)
+	target_include_directories(drv_gamepad_static PUBLIC
+		${CMAKE_CURRENT_SOURCE_DIR}/gamepad
+		${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+		)
+endif()
 
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)
