@@ -588,6 +588,27 @@ ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
                           const struct xrt_lift_rect_frame *frame,
                           uint64_t *out_frame_id);
 
+/*!
+ * ADR-048 / ADR-053 P5: the lifted rect a spec-4 submit converts against.
+ *
+ * - @p frame valid (a session window or a flagged weave rect): @p frame,
+ *   unchanged.
+ * - Otherwise (a link or windowless connection): the rect has the SUBMITTED
+ *   extent's aspect (@p extent_w x @p extent_h), fitted inside the size
+ *   @p frame carries while invalid (the panel, in metres: what the handler
+ *   fills for a windowless connection), centred on the panel. Geometry only:
+ *   the view synthesis always runs at the submitted extent (output extent ==
+ *   input extent), never at the panel's resolution.
+ *
+ * False (the rect stays unknown, as before) when @p frame is NULL, or invalid
+ * with no size, or the extent is 0.
+ */
+bool
+ipc_server_conv_submit_rect(const struct xrt_lift_rect_frame *frame,
+                            uint32_t extent_w,
+                            uint32_t extent_h,
+                            struct xrt_lift_rect_frame *out);
+
 /*! conv_get_cpu_output: a CPU-export stream's current mapping (glue-owned:
  *  the transport duplicates it) and its tightly packed layout. */
 bool

@@ -2056,13 +2056,46 @@ ipc_server_conv_v4_submit(struct ipc_server_conv *sc,
 	if (st.input_scale < 1.0f && fr.focal_px > 0.0f) {
 		fr.focal_px *= (float)sw / (float)args->width;
 	}
-	if (frame != NULL && frame->valid) {
+	// ADR-053 P5: a windowless submit converts against a rect of its extent's aspect.
+	struct xrt_lift_rect_frame rect;
+	if (ipc_server_conv_submit_rect(frame, args->width, args->height, &rect)) {
 		fr.rect_valid = true;
-		memcpy(fr.rect_center, frame->center, sizeof(fr.rect_center));
-		fr.rect_w_m = frame->width_m;
-		fr.rect_h_m = frame->height_m;
+		memcpy(fr.rect_center, rect.center, sizeof(fr.rect_center));
+		fr.rect_w_m = rect.width_m;
+		fr.rect_h_m = rect.height_m;
 	}
 	return conv_core_stream_commit_submit(sc->core, st.core_id, slot.slot, &fr, out_frame_id);
+}
+
+bool
+ipc_server_conv_submit_rect(const struct xrt_lift_rect_frame *frame,
+                            uint32_t extent_w,
+                            uint32_t extent_h,
+                            struct xrt_lift_rect_frame *out)
+{
+	if (frame == NULL) {
+		return false;
+	}
+	*out = *frame;
+	if (frame->valid) {
+		return true; // a window / weave rect: unchanged
+	}
+	const float pw = frame->width_m, ph = frame->height_m;
+	if (!(pw > 0.0f) || !(ph > 0.0f) || extent_w == 0 || extent_h == 0) {
+		return false;
+	}
+	// The extent's aspect, fitted inside the panel, centred on it.
+	const float a = (float)extent_w / (float)extent_h;
+	if (a >= pw / ph) {
+		out->width_m = pw;
+		out->height_m = pw / a;
+	} else {
+		out->height_m = ph;
+		out->width_m = ph * a;
+	}
+	memset(out->center, 0, sizeof(out->center));
+	out->valid = true;
+	return true;
 }
 
 bool
