@@ -37,6 +37,8 @@
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
+#include <objc/message.h> // -[MTLSharedEvent signaledValue] at init (async S5 capability check)
+#include <objc/runtime.h>
 #endif
 
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD) || defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
@@ -44,6 +46,7 @@
 #endif
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2689,19 +2692,74 @@ probe_caps(struct vk_conv_gpu *g)
 
 /*!
  * macOS: the S5 timeline exported as an MTLSharedEvent (VK_EXT_metal_objects,
- * MoltenVK). Without it (no timeline semaphores, no export, or
- * DXR_CONV_VK_ASYNC_S5=0) S5 stays synchronous, as on Linux.
+ * MoltenVK). The asynchronous hand-over is the DEFAULT, behind a runtime
+ * capability check: MoltenVK >= 1.4, timeline semaphores, the export, and a
+ * round trip at init -- the queue signals the timeline to 1 and the exported
+ * event must read 1 (-[MTLSharedEvent signaledValue]). Anything short of that
+ * falls back to the host wait with ONE WARN. DXR_CONV_VK_ASYNC_S5=0 is a
+ * diagnostic switch (also one WARN), not the safety net.
  */
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects) && defined(VK_KHR_timeline_semaphore)
+//! -[MTLSharedEvent signaledValue] from C.
+static uint64_t
+mtl_event_signaled_value(void *event)
+{
+	typedef uint64_t (*msg_u64_fn)(void *, SEL);
+	return ((msg_u64_fn)objc_msgSend)(event, sel_registerName("signaledValue"));
+}
+
+static void
+async_s5_fail(struct vk_conv_gpu *g, const char *why)
+{
+	struct vk_bundle *vk = g->vk;
+	if (g->s5_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
+	}
+	if (g->async_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, g->async_fence, NULL);
+	}
+	g->s5_sem = VK_NULL_HANDLE;
+	g->async_fence = VK_NULL_HANDLE;
+	g->s5_event = NULL;
+	g->s5_value = 0;
+	g->caps.async_s5 = false;
+	U_LOG_W("[conv] Vulkan glue: S5 results keep the host wait before publish (%s)", why);
+}
+#endif
+
 static void
 async_s5_init(struct vk_conv_gpu *g)
 {
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects) && defined(VK_KHR_timeline_semaphore)
 	struct vk_bundle *vk = g->vk;
 	const char *env = getenv("DXR_CONV_VK_ASYNC_S5");
-	if ((env != NULL && env[0] == '0') || !vk->has_EXT_metal_objects || !vk->features.timeline_semaphore ||
-	    vk->vkExportMetalObjectsEXT == NULL) {
+	if (env != NULL && env[0] == '0') {
+		async_s5_fail(g, "DXR_CONV_VK_ASYNC_S5=0, a diagnostic switch");
 		return;
 	}
+	if (!vk->has_EXT_metal_objects || vk->vkExportMetalObjectsEXT == NULL) {
+		async_s5_fail(g, "no VK_EXT_metal_objects: cannot export an MTLSharedEvent");
+		return;
+	}
+	if (!vk->features.timeline_semaphore) {
+		async_s5_fail(g, "no timeline semaphores on the device");
+		return;
+	}
+#ifdef VK_KHR_driver_properties
+	if (vk->vkGetPhysicalDeviceProperties2 != NULL) {
+		VkPhysicalDeviceDriverPropertiesKHR drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR};
+		VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+		vk->vkGetPhysicalDeviceProperties2(vk->physical_device, &p2);
+		// MoltenVK's driverVersion is major * 10000 + minor * 100 + patch.
+		if (drv.driverID == VK_DRIVER_ID_MOLTENVK && p2.properties.driverVersion < 10400) {
+			char why[96];
+			snprintf(why, sizeof(why), "MoltenVK %u.%u.%u < 1.4", p2.properties.driverVersion / 10000,
+			         (p2.properties.driverVersion / 100) % 100, p2.properties.driverVersion % 100);
+			async_s5_fail(g, why);
+			return;
+		}
+	}
+#endif
 	VkExportMetalObjectCreateInfoEXT export_ev = {
 	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
 	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT,
@@ -2716,6 +2774,12 @@ async_s5_init(struct vk_conv_gpu *g)
 	VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 	if (vk->vkCreateSemaphore(vk->device, &sci, NULL, &g->s5_sem) != VK_SUCCESS) {
 		g->s5_sem = VK_NULL_HANDLE;
+		async_s5_fail(g, "the exportable timeline semaphore could not be created");
+		return;
+	}
+	if (vk->vkCreateFence(vk->device, &fci, NULL, &g->async_fence) != VK_SUCCESS) {
+		g->async_fence = VK_NULL_HANDLE;
+		async_s5_fail(g, "no fence");
 		return;
 	}
 	VkExportMetalSharedEventInfoEXT es = {
@@ -2724,14 +2788,41 @@ async_s5_init(struct vk_conv_gpu *g)
 	};
 	VkExportMetalObjectsInfoEXT eo = {.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, .pNext = &es};
 	vk->vkExportMetalObjectsEXT(vk->device, &eo);
-	if (es.mtlSharedEvent == NULL || vk->vkCreateFence(vk->device, &fci, NULL, &g->async_fence) != VK_SUCCESS) {
-		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
-		g->s5_sem = VK_NULL_HANDLE;
-		g->async_fence = VK_NULL_HANDLE;
+	if (es.mtlSharedEvent == NULL) {
+		async_s5_fail(g, "the timeline semaphore did not export an MTLSharedEvent");
+		return;
+	}
+	// Round trip: the queue signals 1, the Metal side must see 1.
+	const uint64_t one = 1;
+	VkTimelineSemaphoreSubmitInfoKHR tl = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+	    .signalSemaphoreValueCount = 1,
+	    .pSignalSemaphoreValues = &one,
+	};
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .pNext = &tl,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &g->s5_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	VkResult r = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, g->async_fence);
+	vk_queue_unlock(vk->main_queue);
+	if (r == VK_SUCCESS) {
+		r = vk->vkWaitForFences(vk->device, 1, &g->async_fence, VK_TRUE, 1000ull * 1000ull * 1000ull);
+	}
+	const uint64_t seen = r == VK_SUCCESS ? mtl_event_signaled_value((void *)es.mtlSharedEvent) : 0;
+	if (r != VK_SUCCESS || seen < 1) {
+		char why[96];
+		snprintf(why, sizeof(why), "the MTLSharedEvent round trip failed (vk %d, event %llu)", (int)r,
+		         (unsigned long long)seen);
+		async_s5_fail(g, why);
 		return;
 	}
 	g->s5_event = (void *)es.mtlSharedEvent;
+	g->s5_value = 1;
 	g->caps.async_s5 = true;
+	U_LOG_I("[conv] Vulkan glue: S5 results hand over on an MTLSharedEvent (no host wait before publish)");
 #else
 	(void)g;
 #endif

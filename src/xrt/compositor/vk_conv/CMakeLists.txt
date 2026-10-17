@@ -44,5 +44,5 @@ target_link_libraries(
 	PRIVATE aux_util aux_os
 	)
 if(APPLE)
-	target_link_libraries(comp_vk_conv PRIVATE "-framework CoreFoundation" "-framework IOSurface")
+	target_link_libraries(comp_vk_conv PRIVATE "-framework CoreFoundation" "-framework IOSurface" objc)
 endif()

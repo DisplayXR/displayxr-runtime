@@ -689,7 +689,7 @@ TEST_CASE("vk glue: S5 on CPU colour + CPU depth, into a GPU target and into a C
 		vk_conv_gpu_get_stats(x.g, &st);
 		if (caps.async_s5) {
 			CHECK(ref.mtl_shared_event != nullptr);
-			CHECK(ref.event_value == 1u);
+			CHECK(ref.event_value == 2u); // 1 = the init round trip
 			CHECK(st.async_s5 == 1u);
 		} else {
 			CHECK(ref.mtl_shared_event == nullptr);

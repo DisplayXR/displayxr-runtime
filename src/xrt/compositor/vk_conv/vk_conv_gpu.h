@@ -103,7 +103,10 @@ struct vk_conv_gpu_caps
 	 * signalled on an MTLSharedEvent (vk_conv_gpu_image_ref::mtl_shared_event)
 	 * instead of a host fence wait before publish. Vulkan readers on this
 	 * bundle's main queue need nothing (submission order); another API waits
-	 * on the event. DXR_CONV_VK_ASYNC_S5=0 turns it off.
+	 * on the event. The default, behind a capability check at create
+	 * (MoltenVK >= 1.4, the export, a signal round trip); short of that the
+	 * glue keeps the host wait and logs one WARN. DXR_CONV_VK_ASYNC_S5=0 is a
+	 * diagnostic switch.
 	 */
 	bool async_s5;
 };
