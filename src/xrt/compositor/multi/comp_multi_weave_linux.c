@@ -1515,6 +1515,9 @@ weave_wait_prev_frame(struct vk_bundle *vk, struct multi_compositor *mc)
 	}
 	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
 	mc->weave.fence_pending = false;
+	// XR_DXR_lift §6: that weave's lifted rects are done -- snapshots go to
+	// their streams, profiles are read, pins drop (no-op without lifted rects).
+	comp_multi_weave_lift_complete(&mc->weave.lift);
 	return true;
 }
 
@@ -1926,6 +1929,140 @@ weave_paint_offpanel(struct vk_bundle *vk,
  * Called with the engine lock held, after weave_wait_prev_frame succeeded.
  * *out_release_fd is written only on the asynchronous path.
  */
+/*
+ *
+ * XR_DXR_lift §6: lifted weave rects (vk_conv_weave through comp_multi_weave_lift).
+ *
+ */
+
+//! This submit's lifted rects (taken at the top of the submit: valid for exactly one).
+struct weave_lift_set
+{
+	uint32_t count;
+	uint64_t owner;
+	struct xrt_lift_weave_rect rects[XRT_LIFT_WEAVE_RECTS_MAX];
+};
+
+static const struct xrt_lift_weave_rect *
+weave_lift_binding(const struct weave_lift_set *lift, uint32_t rect_index)
+{
+	for (uint32_t k = 0; k < lift->count; k++) {
+		if (lift->rects[k].rect_index == rect_index) {
+			return &lift->rects[k];
+		}
+	}
+	return NULL;
+}
+
+//! The window size the caller's rects are in (the bound geometry, else @p fb_w x @p fb_h).
+static void
+weave_lift_window(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h, uint32_t *out_w, uint32_t *out_h)
+{
+	const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+	*out_w = geo ? mc->weave.win_w : fb_w;
+	*out_h = geo ? mc->weave.win_h : fb_h;
+}
+
+/*!
+ * Batch layout: each lifted rect's 2D frame (the WHOLE rect of the input,
+ * GENERAL) is snapshotted into its stream, and the stream's latest pair -- or
+ * the 2D frame, flat -- lands in both tiles of the SBS scratch
+ * (TRANSFER_DST_OPTIMAL).
+ */
+static void
+weave_lift_record_batch(struct multi_compositor *mc,
+                        VkCommandBuffer cmd,
+                        const struct comp_multi_weave_linux_slot *in,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects,
+                        const struct weave_lift_set *lift)
+{
+	uint32_t win_w = 0, win_h = 0;
+	weave_lift_window(mc, mc->weave.out_w, mc->weave.out_h, &win_w, &win_h);
+	for (uint32_t k = 0; k < lift->count; k++) {
+		const struct xrt_lift_weave_rect *b = &lift->rects[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &rects[b->rect_index];
+		if (rr->extent.w <= 0 || rr->extent.h <= 0) {
+			continue;
+		}
+		struct vk_conv_weave_rect r;
+		memset(&r, 0, sizeof(r));
+		r.binding = b;
+		r.owner = lift->owner;
+		r.src = (struct vk_conv_weave_image){in->image, VK_IMAGE_LAYOUT_GENERAL, in->format, in->w, in->h};
+		r.x = rr->offset.w; // xrt_offset fields are named w/h
+		r.y = rr->offset.h;
+		r.w = (uint32_t)rr->extent.w;
+		r.h = (uint32_t)rr->extent.h;
+		r.dst = (struct vk_conv_weave_image){mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                                     WEAVE_VK_FORMAT, mc->weave.sbs_w, mc->weave.sbs_h};
+		r.views = 2;
+		r.tile_columns = 2;
+		r.tile_w = mc->weave.out_w;
+		r.tile_h = mc->weave.out_h;
+		r.batch = true;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
+	}
+}
+
+/*!
+ * v6 layout: tile 0's copy of each lifted rect (the crop, GENERAL) is
+ * snapshotted and view v of the stream's latest result overwrites the rect in
+ * tile v; until the first result the caller's flat tiles stay as drawn.
+ */
+static void
+weave_lift_record_nview(struct multi_compositor *mc,
+                        VkCommandBuffer cmd,
+                        const struct xrt_weave_atlas_layout *layout,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects,
+                        const struct weave_lift_set *lift)
+{
+	const uint32_t cvw = layout->content_view_w, cvh = layout->content_view_h;
+	uint32_t win_w = 0, win_h = 0;
+	weave_lift_window(mc, cvw, cvh, &win_w, &win_h);
+	const float sx = (float)cvw / (float)win_w, sy = (float)cvh / (float)win_h;
+	for (uint32_t k = 0; k < lift->count; k++) {
+		const struct xrt_lift_weave_rect *b = &lift->rects[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &rects[b->rect_index];
+		// Tile-0 region, clipped to tile 0.
+		float fx0 = (float)rr->offset.w * sx, fy0 = (float)rr->offset.h * sy;
+		float fx1 = fx0 + (float)rr->extent.w * sx, fy1 = fy0 + (float)rr->extent.h * sy;
+		fx0 = fx0 < 0.0f ? 0.0f : fx0;
+		fy0 = fy0 < 0.0f ? 0.0f : fy0;
+		fx1 = fx1 > (float)cvw ? (float)cvw : fx1;
+		fy1 = fy1 > (float)cvh ? (float)cvh : fy1;
+		if (fx1 - fx0 < 1.0f || fy1 - fy0 < 1.0f) {
+			continue;
+		}
+		struct vk_conv_weave_rect r;
+		memset(&r, 0, sizeof(r));
+		r.binding = b;
+		r.owner = lift->owner;
+		r.src = (struct vk_conv_weave_image){mc->weave.crop_image, VK_IMAGE_LAYOUT_GENERAL, WEAVE_VK_FORMAT,
+		                                     mc->weave.crop_w, mc->weave.crop_h};
+		r.x = (int32_t)fx0;
+		r.y = (int32_t)fy0;
+		r.w = (uint32_t)(fx1 - fx0);
+		r.h = (uint32_t)(fy1 - fy0);
+		r.dst = r.src;
+		r.views = layout->view_count;
+		r.tile_columns = layout->tile_columns;
+		r.tile_w = cvw;
+		r.tile_h = cvh;
+		r.batch = false;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
+	}
+}
+
 static bool
 weave_run_frame(struct vk_bundle *vk,
                 struct multi_compositor *mc,
@@ -1941,6 +2078,7 @@ weave_run_frame(struct vk_bundle *vk,
                 const struct xrt_weave_atlas_layout *layout,
                 uint32_t flat_rect_count,
                 const struct xrt_rect *flat_rects,
+                const struct weave_lift_set *lift,
                 bool want_dmabuf_out,
                 bool wait_acquire,
                 bool want_release_fd,
@@ -2019,7 +2157,10 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// v6 crop staging: (re)create when the packed region is smaller than the
 	// input. Zero-copy (packed == input) samples the input directly.
-	const bool v6_zero_copy = nview && (packed_w == in->w && packed_h == in->h);
+	// A v6 frame carrying lifted rects never samples the caller's buffer in
+	// place: the lift writes into the crop copy (XR_DXR_lift §6).
+	const bool lift_requested = lift != NULL && lift->count > 0;
+	const bool v6_zero_copy = nview && !lift_requested && (packed_w == in->w && packed_h == in->h);
 	if (nview && !v6_zero_copy &&
 	    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w || mc->weave.crop_h != packed_h)) {
 		weave_queue_wait_idle(vk);
@@ -2051,6 +2192,8 @@ weave_run_frame(struct vk_bundle *vk,
 	if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
 		return false;
 	}
+	// XR_DXR_lift §6: lift this submit's rects (false = weave them as drawn).
+	const bool lifting = lift_requested && comp_multi_weave_lift_begin(&mc->weave.lift, vk, lift->count);
 
 	VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
 
@@ -2124,7 +2267,17 @@ weave_run_frame(struct vk_bundle *vk,
 				                   VK_FILTER_NEAREST);
 			}
 
-			weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VkImageLayout crop_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			if (lifting) {
+				// The lift reads tile 0 and writes every tile of the crop: GENERAL.
+				weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+				                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+				                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+				weave_lift_record_nview(mc, cmd, layout, rect_count, rects, lift);
+				crop_layout = VK_IMAGE_LAYOUT_GENERAL;
+			}
+			weave_layout_barrier(vk, cmd, mc->weave.crop_image, crop_layout,
 			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 			                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -2210,6 +2363,10 @@ weave_run_frame(struct vk_bundle *vk,
 			if (half <= 0) {
 				continue;
 			}
+			// XR_DXR_lift §6: a lifted rect holds 2D, not SBS (drawn below).
+			if (lifting && rect_count > 0 && weave_lift_binding(lift, i) != NULL) {
+				continue;
+			}
 
 			// Tile position = the rect's own window position (1:1 vertically).
 			const int32_t dx0 = rx;
@@ -2288,6 +2445,11 @@ weave_run_frame(struct vk_bundle *vk,
 			    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
 			vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
 			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k], VK_FILTER_LINEAR);
+		}
+
+		// XR_DXR_lift §6: the lifted rects, after the squeezed ones.
+		if (lifting && rect_count > 0) {
+			weave_lift_record_batch(mc, cmd, in, rect_count, rects, lift);
 		}
 
 		// Scratch -> SHADER_READ for the DP sample.
@@ -2697,6 +2859,10 @@ weave_run_frame(struct vk_bundle *vk,
 	U_ZERO(out_eyes);
 	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
 		U_ZERO(out_eyes);
+	} else {
+		// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's
+		// stream reads this DP's.
+		comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)mc->weave.dp, out_eyes);
 	}
 
 	return true;
@@ -2836,6 +3002,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_lift §6: this submit's lifted rects, taken NOW so every exit path
+	// consumes them (a set is valid for exactly one submit).
+	struct weave_lift_set lift;
+	lift.count = comp_multi_weave_lift_take(&mc->weave.lift, &lift.owner, lift.rects);
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_engine(vk, mc) || !weave_wait_prev_frame(vk, mc)) {
@@ -2886,7 +3057,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, false);
 		int unused_release_fd = -1;
 		if (!weave_run_frame(vk, mc, in, ov, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, &lift, want_dmabuf_out,
 		                     false /* no acquire sem */, false /* synchronous */, &unused_release_fd, out_width,
 		                     out_height, out_fence_value, out_eyes, NULL /* v12: dma-buf path only */)) {
 			break;
@@ -3005,6 +3176,10 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_lift §6: this submit's lifted rects (valid for exactly one submit).
+	struct weave_lift_set lift;
+	lift.count = comp_multi_weave_lift_take(&mc->weave.lift, &lift.owner, lift.rects);
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_engine(vk, mc)) {
@@ -3066,7 +3241,7 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, true);
 		int release_fd = -1;
 		if (!weave_run_frame(vk, mc, in_slot, ov_slot, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, flat_rect_count, flat_rects, want_dmabuf_out,
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, &lift, want_dmabuf_out,
 		                     wait_acquire, true /* release sync_file */, &release_fd, out_width, out_height,
 		                     out_fence_value, out_eyes, out_origin)) {
 			if (wait_acquire) {
@@ -3262,6 +3437,8 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			weave_queue_wait_idle(vk);
 			mc->weave.fence_pending = false;
 		}
+		// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
+		comp_multi_weave_lift_fini(&mc->weave.lift);
 		weave_slots_release_all(vk, mc->weave.in_slots);
 		weave_slots_release_all(vk, mc->weave.ov_slots);
 		weave_release_scratch(vk, mc);
@@ -3272,6 +3449,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			mc->weave.overlay_blend_initialized = false;
 		}
 		if (mc->weave.dp != NULL) {
+			comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp); // its eyes key (roadmap §5.2)
 			xrt_display_processor_destroy(&mc->weave.dp);
 		}
 		if (mc->weave.render_pass != VK_NULL_HANDLE) {
