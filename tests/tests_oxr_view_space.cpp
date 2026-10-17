@@ -284,6 +284,7 @@ struct Runtime
 	XrSpace view = XR_NULL_HANDLE;
 	bool have_view_rig = false;
 	bool have_display_info = false;
+	bool have_hand_tracking = false; //!< #2189: XR_EXT_hand_tracking enabled
 	//! XrViewActivityStateDXR::activeViewCount of the last views() call (0 = not reported).
 	uint32_t last_active = 0;
 
@@ -589,6 +590,8 @@ struct BringUp
 	bool display_info = false;
 	//! The primaryViewConfigurationType handed to xrBeginSession.
 	XrViewConfigurationType begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	//! #2189: enable XR_EXT_hand_tracking when the runtime advertises it.
+	bool hand_tracking = false;
 };
 
 //! Returns false (after SKIP-ing the test) when the runtime cannot come up
@@ -631,6 +634,10 @@ bring_up(Runtime &rt, const BringUp &opt = BringUp{})
 	}
 	if (rt.have_display_info) {
 		exts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	}
+	rt.have_hand_tracking = opt.hand_tracking && has(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+	if (rt.have_hand_tracking) {
+		exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 	}
 
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1656,6 +1663,103 @@ TEST_CASE("the CTS configuration (no input providers) still reports tracking (#1
 	WARN("built without the qwerty driver - no tracked role device, so FALSE is correct here");
 	SUCCEED("no role devices in this build; the rule itself is pinned on the host");
 #endif
+
+	tear_down(rt);
+}
+
+TEST_CASE("rig-scoped hand joints: a locate BEFORE the first view locate equals one after it (#2189)",
+          "[oxr][view_space][rig_hands]")
+{
+	// XR_DXR_view_rig spec 4: joints chained with a rig come back in the rig
+	// frame. Before the session's first xrLocateViews there is no recorded
+	// canvas, so the in-process runtime resolves the session's own canvas
+	// through the same helper the views use — the result must be what the
+	// joints read once a view locate has recorded it. Needs a hand-tracking
+	// provider: the sim-input plug-in, in its own process
+	// (tests_oxr_view_space_rig_hands: a generated manifest +
+	// DXR_INPUT_SIM_INPUT_ENABLE=1; the provider scan is one-shot).
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+		// binary as "the headless runtime did not come up" (#1370).
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+	XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+	hci.hand = XR_HAND_LEFT_EXT;
+	hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+	XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+	REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+	// A scaled, posed display rig: a missed rig shows up as base-space metres.
+	XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+	rig.pose = {{0, 0, 0, 1}, {0.5f, 1.0f, -2.0f}};
+	rig.virtualDisplayHeight = 3.0f;
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	const XrTime t = rt.now();
+	auto joints = [&](const void *chain, XrHandJointLocationEXT *out, XrBool32 *active) {
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.next = chain;
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT locs = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		locs.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		locs.jointLocations = out;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &locs)));
+		*active = locs.isActive;
+	};
+
+	XrHandJointLocationEXT base[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrHandJointLocationEXT before[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrHandJointLocationEXT after[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrBool32 a0 = XR_FALSE, a1 = XR_FALSE, a2 = XR_FALSE;
+	joints(nullptr, base, &a0);
+	joints(&rig, before, &a1); // no view locate yet on this session
+	if (!a0 || !a1) {
+		WARN("the hand is not active (provider present but not tracking) - nothing to compare");
+		SUCCEED("inactive hand");
+		tear_down(rt);
+		return;
+	}
+	(void)rt.views(rt.local, t, &rig, nullptr); // records the canvas
+	joints(&rig, after, &a2);
+	REQUIRE(a2);
+
+	const XrVector3f &pb = base[XR_HAND_JOINT_PALM_EXT].pose.position;
+	const XrVector3f &p1 = before[XR_HAND_JOINT_PALM_EXT].pose.position;
+	INFO("base (" << pb.x << "," << pb.y << "," << pb.z << ") before-views (" << p1.x << "," << p1.y << "," << p1.z
+	              << ")");
+	// The rig applied before any view locate (the review's case): not base-space metres.
+	CHECK(std::fabs(p1.z - pb.z) > 0.1f);
+	for (uint32_t i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+		CAPTURE(i);
+		CHECK(before[i].pose.position.x == Catch::Approx(after[i].pose.position.x).margin(1e-4));
+		CHECK(before[i].pose.position.y == Catch::Approx(after[i].pose.position.y).margin(1e-4));
+		CHECK(before[i].pose.position.z == Catch::Approx(after[i].pose.position.z).margin(1e-4));
+		CHECK(before[i].radius == Catch::Approx(after[i].radius).margin(1e-6));
+	}
 
 	tear_down(rt);
 }

@@ -5944,6 +5944,7 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	sess->view_space_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
 	os_mutex_init(&sess->view_space_offset_lock);
 	os_mutex_init(&sess->rig_canvas.lock); // #2189
+	sess->rig_joints_verdict = -1;
 
 #ifdef OXR_HAVE_DXR_desktop_control
 	os_mutex_init(&sess->desktop_control_mutex);
@@ -7486,8 +7487,10 @@ hand_joints_resolve_rig(struct oxr_logger *log,
                         XrTime at_time,
                         struct m_view_rig_canvas *out_canvas,
                         struct xrt_pose *out_plane_base,
-                        struct m_view_rig *out_rig)
+                        struct m_view_rig *out_rig,
+                        int64_t *out_canvas_age_ns)
 {
+	*out_canvas_age_ns = -1; // no recorded canvas
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 	if (head == NULL) {
 		return false;
@@ -7499,6 +7502,7 @@ hand_joints_resolve_rig(struct oxr_logger *log,
 	if (recorded) {
 		*out_canvas = sess->rig_canvas.canvas;
 		plane_origin = sess->rig_canvas.plane_origin;
+		*out_canvas_age_ns = (int64_t)(at_time - sess->rig_canvas.display_time);
 	}
 	os_mutex_unlock(&sess->rig_canvas.lock);
 
@@ -7687,15 +7691,27 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	struct xrt_pose rig_plane_base;
 	struct m_view_rig rig;
 	if (inst->extensions.DXR_view_rig && view_rig_parse_chain(&sess->joint_rig, locateInfo) != OXR_VIEW_RIG_NONE) {
-		rig_joints = hand_joints_resolve_rig(log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig);
-		static bool logged = false;
-		if (!logged) {
-			logged = true;
-			U_LOG_W("XR_DXR_view_rig: rig-scoped hand joints (%s rig)%s.",
+		int64_t age_ns = -1;
+		rig_joints =
+		    hand_joints_resolve_rig(log, sess, baseSpc, at_time, &rig_canvas, &rig_plane_base, &rig, &age_ns);
+		// Per session, on every verdict change (never per frame).
+		const int32_t verdict = rig_joints ? 1 : 0;
+		if (verdict != sess->rig_joints_verdict) {
+			sess->rig_joints_verdict = verdict;
+			U_LOG_W("XR_DXR_view_rig: rig-scoped hand joints (%s rig) %s; canvas %s.",
 			        sess->joint_rig.type == OXR_VIEW_RIG_CAMERA ? "camera" : "display",
-			        rig_joints
-			            ? ""
-			            : " — display plane not relatable to the base space, joints stay in base space");
+			        rig_joints ? "mapped into the rig frame"
+			                   : "NOT mapped (no canvas, or the display plane is not relatable to the base "
+			                     "space) - joints stay in base space",
+			        age_ns < 0 ? "resolved for this locate (no view locate yet)"
+			                   : "from the latest view locate");
+			if (age_ns >= 0) {
+				U_LOG_W(
+				    "XR_DXR_view_rig: that canvas is %.1f ms older than the joint time - joints follow "
+				    "the "
+				    "most recent xrLocateViews; locate views first each frame.",
+				    (double)age_ns / 1e6);
+			}
 		}
 	}
 #endif

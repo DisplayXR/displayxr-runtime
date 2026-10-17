@@ -821,6 +821,24 @@ if(TARGET tests_oxr_view_space)
 	# stay on qwerty, and that is precisely the configuration in which the
 	# dynamic-role CACHE (empty until xrSyncActions) used to make
 	# xrGetSystemProperties answer XR_FALSE.
+	# #2189 — rig-scoped hand joints need a hand-tracking provider resident: the
+	# sim-input plug-in through a generated manifest, in its own process (the
+	# provider scan is one-shot per process).
+	if(TARGET drv_sim_input_plugin)
+		file(GENERATE
+		     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins/200-sim-input-input-provider.json
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-input\",\n    \"display_name\": \"DisplayXR Sim Input\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_input_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		add_dependencies(tests_oxr_view_space drv_sim_input_plugin)
+		add_test(NAME tests_oxr_view_space_rig_hands
+		         COMMAND tests_oxr_view_space "[rig_hands]" --success --allow-running-no-tests
+		         )
+		set_tests_properties(
+			tests_oxr_view_space_rig_hands
+			PROPERTIES ENVIRONMENT
+			"XRT_PLUGIN_SEARCH_PATH=${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins;DXR_INPUT_SIM_INPUT_ENABLE=1"
+			)
+	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers
 		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests
 		)
