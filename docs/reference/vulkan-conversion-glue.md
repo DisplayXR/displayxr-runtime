@@ -152,7 +152,12 @@ Windows.
   later in submission order. A Metal reader takes the event and value from
   `vk_conv_gpu_image_ref` and waits on its GPU. At most one such submit is in flight; every other
   glue call (`work_lock`) retires it first, so the stage, the descriptor sets and freed images are
-  never touched under the GPU. `DXR_CONV_VK_ASYNC_S5=0` turns it off; Linux keeps the host wait.
+  never touched under the GPU. GPU wait on macOS, host wait on Linux (until a Linux equivalent
+  lands). It is the default behind a capability check at create: MoltenVK ≥ 1.4 (driverID +
+  driverVersion), timeline semaphores, the export, and a round trip — the queue signals 1 and
+  `-[MTLSharedEvent signaledValue]` must read 1. Short of any of that the glue keeps the host
+  wait and logs one WARN saying why; the attach WARN names the hand-over in effect.
+  `DXR_CONV_VK_ASYNC_S5=0` is a diagnostic switch, not the safety net.
 - **Images the glue reads** may carry `XRT_CONV_SYNC_VK_SEMAPHORE_FD` (a timeline semaphore,
   opaque fd, imported once per `import_key`) or `XRT_CONV_SYNC_SYNC_FD` (a binary sync_file,
   imported temporarily). The glue waits on either on the GPU, in the same submit. These kinds

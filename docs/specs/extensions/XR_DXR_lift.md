@@ -1148,6 +1148,13 @@ pinned by a golden test (`tests/tests_lift_v3_shifts.cpp`, tag `[lift_v3_shift]`
   sessions on macOS (`IOSURFACE`) and desktop Linux (`OPAQUE_FD`, `DMABUF` in; `OPAQUE_FD` out)
   got theirs this way (ADR-053 P5 step E, §4.5 / §5.4); an older service never lists them.
 
+### 14.4 Open items
+
+- **DMABUF out needs modifier + stride on `XrLiftResultExportDXR` (spec 6).** A dma-buf export
+  cannot be imported without its DRM modifier and plane stride, and the struct has no fields
+  for them; no fields are added now. Until then `DMABUF` is never an export kind (§5.4) and
+  Linux results leave as `OPAQUE_FD` or `CPU`.
+
 ## Probing on a Windows box — gotchas
 
 - **Choosing the provider.** `displayxr-cli conv list` shows which provider serves each task and
