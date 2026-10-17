@@ -29,7 +29,6 @@ struct xrt_prober;
 struct xrt_fs;
 struct xrt_frame_sink;
 struct xrt_frame_context;
-struct xrt_settings_tracking;
 struct time_state;
 struct gui_scene_manager;
 struct xrt_system_devices;
@@ -199,14 +198,6 @@ void
 gui_scene_main_menu(struct gui_program *p);
 
 /*!
- * Shows a UI that lets you select a video device and mode for calibration.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_select_video_calibrate(struct gui_program *p);
-
-/*!
  * Shows a UI that lets you set up tracking overrides.
  *
  * @public @memberof gui_program
@@ -221,53 +212,6 @@ gui_scene_tracking_overrides(struct gui_program *p);
  */
 void
 gui_scene_debug(struct gui_program *p);
-
-/*!
- * Small hand-tracking demo.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_hand_tracking_demo(struct gui_program *p);
-
-/*!
- * EuRoC recorder for DepthAI cameras
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_record_euroc(struct gui_program *p);
-
-/*!
- * Create a recording view scene.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_record(struct gui_program *p, const char *camera);
-
-/*!
- * Remote control debugging UI.
- *
- * @param p self
- * @param address Optional address.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_remote(struct gui_program *p, const char *address);
-
-/*!
- * Given the frameserver runs the calibration code on it.
- * Claims ownership of @p s.
- *
- * @public @memberof gui_program
- */
-void
-gui_scene_calibrate(struct gui_program *p,
-                    struct xrt_frame_context *xfctx,
-                    struct xrt_fs *xfs,
-                    struct xrt_settings_tracking *s);
 
 void
 gui_scene_resampler_test(struct gui_program *p);

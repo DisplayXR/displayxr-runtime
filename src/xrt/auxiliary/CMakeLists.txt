@@ -27,12 +27,7 @@ add_subdirectory(math)
 # OS library.
 add_subdirectory(os)
 
-# GStreamer library.
-if(XRT_HAVE_GST)
-	add_subdirectory(gstreamer)
-endif()
-
-# Tracking library.
+# Tracking library (IMU fusion only).
 add_subdirectory(tracking)
 
 # Util library.

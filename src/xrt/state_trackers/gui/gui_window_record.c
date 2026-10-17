@@ -29,11 +29,6 @@
 
 #include "gui_window_record.h"
 
-#ifdef XRT_HAVE_GST
-#include "gstreamer/gst_sink.h"
-#include "gstreamer/gst_pipeline.h"
-#endif
-
 #include "gui_ogl.h"
 #include "gui_imgui.h"
 #include "gui_common.h"
@@ -42,154 +37,6 @@
 #include "stb_image_write.h"
 
 #include <assert.h>
-
-
-/*
- *
- * GStreamer functions.
- *
- */
-
-#ifdef XRT_HAVE_GST
-static void
-create_pipeline(struct gui_record_window *rw)
-{
-	const char *source_name = "source_name";
-	const char *bitrate = NULL;
-	const char *speed_preset = NULL;
-
-	char pipeline_string[2048];
-
-	switch (rw->gst.bitrate) {
-	default:
-	case GUI_RECORD_BITRATE_32768: bitrate = "32768"; break;
-	case GUI_RECORD_BITRATE_4096: bitrate = "4096"; break;
-	case GUI_RECORD_BITRATE_2048: bitrate = "2048"; break;
-	case GUI_RECORD_BITRATE_1024: bitrate = "1024"; break;
-	}
-
-	switch (rw->gst.pipeline) {
-	case GUI_RECORD_PIPELINE_SOFTWARE_ULTRAFAST: speed_preset = "ultrafast"; break;
-	case GUI_RECORD_PIPELINE_SOFTWARE_VERYFAST: speed_preset = "veryfast"; break;
-	case GUI_RECORD_PIPELINE_SOFTWARE_FAST: speed_preset = "fast"; break;
-	case GUI_RECORD_PIPELINE_SOFTWARE_MEDIUM: speed_preset = "medium"; break;
-	case GUI_RECORD_PIPELINE_SOFTWARE_SLOW: speed_preset = "slow"; break;
-	case GUI_RECORD_PIPELINE_SOFTWARE_VERYSLOW: speed_preset = "veryslow"; break;
-	default: break;
-	}
-
-	if (speed_preset != NULL) {
-		snprintf(pipeline_string,         //
-		         sizeof(pipeline_string), //
-		         "appsrc name=\"%s\" ! "
-		         "queue ! "
-		         "videoconvert ! "
-		         "videobox name=vbox ! "
-		         "x264enc bitrate=\"%s\" speed-preset=\"%s\" ! "
-		         "video/x-h264,profile=main ! "
-		         "h264parse ! "
-		         "queue ! "
-		         "mp4mux ! "
-		         "filesink location=\"%s\"",
-		         source_name, bitrate, speed_preset, rw->gst.filename);
-	} else {
-		snprintf(pipeline_string,         //
-		         sizeof(pipeline_string), //
-		         "appsrc name=\"%s\" ! "
-		         "queue ! "
-		         "videoconvert ! "
-		         "video/x-raw,format=NV12 ! "
-		         "queue ! "
-		         "vaapih264enc rate-control=cbr bitrate=\"%s\" tune=high-compression ! "
-		         "video/x-h264,profile=main ! "
-		         "h264parse ! "
-		         "queue ! "
-		         "mp4mux ! "
-		         "filesink location=\"%s\"",
-		         source_name, bitrate, rw->gst.filename);
-	}
-
-	struct xrt_frame_sink *tmp = NULL;
-	struct gstreamer_pipeline *gp = NULL;
-
-	gstreamer_pipeline_create_from_string(&rw->gst.xfctx, pipeline_string, &gp);
-
-	uint32_t width = rw->source.width;
-	uint32_t height = rw->source.height;
-	enum xrt_format format = rw->source.format;
-
-	bool do_convert = false;
-	if (format == XRT_FORMAT_MJPEG) {
-		format = XRT_FORMAT_R8G8B8;
-		do_convert = true;
-	}
-	if (format == XRT_FORMAT_BC4) {
-		format = XRT_FORMAT_L8;
-		do_convert = true;
-	}
-
-	struct gstreamer_sink *gs = NULL;
-	gstreamer_sink_create_with_pipeline(gp, width, height, format, source_name, &gs, &tmp);
-	if (do_convert) {
-		u_sink_create_to_r8g8b8_or_l8(&rw->gst.xfctx, tmp, &tmp);
-	}
-	u_sink_simple_queue_create(&rw->gst.xfctx, tmp, &tmp);
-
-	os_mutex_lock(&rw->gst.mutex);
-	rw->gst.gs = gs;
-	rw->gst.sink = tmp;
-	rw->gst.gp = gp;
-	gstreamer_pipeline_play(rw->gst.gp);
-	os_mutex_unlock(&rw->gst.mutex);
-}
-
-static void
-destroy_pipeline(struct gui_record_window *rw)
-{
-	U_LOG_D("Called");
-
-	// Make sure we are not streaming any more frames into the pipeline.
-	os_mutex_lock(&rw->gst.mutex);
-	rw->gst.gs = NULL;
-	rw->gst.sink = NULL;
-	os_mutex_unlock(&rw->gst.mutex);
-
-	// Stop the pipeline.
-	gstreamer_pipeline_stop(rw->gst.gp);
-	rw->gst.gp = NULL;
-
-	xrt_frame_context_destroy_nodes(&rw->gst.xfctx);
-}
-
-static void
-draw_gst(struct gui_record_window *rw)
-{
-	static ImVec2 button_dims = {0, 0};
-
-	if (!igCollapsingHeader_BoolPtr("Record", NULL, ImGuiTreeNodeFlags_None)) {
-		return;
-	}
-
-	os_mutex_lock(&rw->gst.mutex);
-	bool recording = rw->gst.gp != NULL;
-	os_mutex_unlock(&rw->gst.mutex);
-
-	igCombo_Str("Pipeline", (int *)&rw->gst.pipeline,
-	            "SW Ultrafast\0SW Veryfast\0SW Fast\0SW Medium\0SW Slow\0SW Veryslow\0VAAPI H264\0\0", 5);
-	igCombo_Str("Bitrate", (int *)&rw->gst.bitrate, "32768bps (Be careful!)\0004096bps\0002048bps\0001024bps\0\0",
-	            3);
-
-	igInputText("Filename", rw->gst.filename, sizeof(rw->gst.filename), 0, NULL, NULL);
-
-	if (!recording && igButton("Start", button_dims)) {
-		create_pipeline(rw);
-	}
-
-	if (recording && igButton("Stop", button_dims)) {
-		destroy_pipeline(rw);
-	}
-}
-#endif
 
 
 /*
@@ -261,14 +108,6 @@ window_frame(struct xrt_frame_sink *xfs, struct xrt_frame *xf)
 		rw->source.format = xf->format;
 	}
 
-#ifdef XRT_HAVE_GST
-	os_mutex_lock(&rw->gst.mutex);
-	if (rw->gst.sink != NULL) {
-		xrt_sink_push_frame(rw->gst.sink, xf);
-	}
-	os_mutex_unlock(&rw->gst.mutex);
-#endif
-
 	xrt_sink_push_frame(rw->texture.sink, xf);
 }
 
@@ -284,19 +123,6 @@ gui_window_record_init(struct gui_record_window *rw)
 {
 	// Basic init.
 	rw->sink.push_frame = window_frame;
-
-	// Mutex first.
-#ifdef XRT_HAVE_GST
-	int ret = os_mutex_init(&rw->gst.mutex);
-	if (ret < 0) {
-		return false;
-	}
-
-	snprintf(rw->gst.filename, sizeof(rw->gst.filename), "/tmp/capture.mp4");
-	rw->gst.bitrate = GUI_RECORD_BITRATE_4096;
-	rw->gst.pipeline = GUI_RECORD_PIPELINE_SOFTWARE_FAST;
-#endif
-
 
 	// Setup the preview texture.
 	// 50% scale.
@@ -344,12 +170,6 @@ gui_window_record_render(struct gui_record_window *rw, struct gui_program *p)
 	    rw->texture.rotate_180,     // rotate_180
 	    false);                     // flip_y
 
-
-#ifdef XRT_HAVE_GST
-	draw_gst(rw);
-#endif
-
-
 	// Pop the ID making everything unique.
 	igPopID();
 }
@@ -357,20 +177,6 @@ gui_window_record_render(struct gui_record_window *rw, struct gui_program *p)
 void
 gui_window_record_close(struct gui_record_window *rw)
 {
-	// Stop and remove the recording pipeline first.
-#ifdef XRT_HAVE_GST
-	if (rw->gst.gp != NULL) {
-		os_mutex_lock(&rw->gst.mutex);
-		rw->gst.gs = NULL;
-		rw->gst.sink = NULL;
-		os_mutex_unlock(&rw->gst.mutex);
-
-		gstreamer_pipeline_stop(rw->gst.gp);
-		rw->gst.gp = NULL;
-		xrt_frame_context_destroy_nodes(&rw->gst.xfctx);
-	}
-#endif
-
 	xrt_frame_context_destroy_nodes(&rw->texture.xfctx);
 
 	/*
@@ -379,8 +185,4 @@ gui_window_record_close(struct gui_record_window *rw)
 	 */
 	rw->texture.sink = NULL;
 	rw->texture.ogl = NULL;
-
-#ifdef XRT_HAVE_GST
-	os_mutex_destroy(&rw->gst.mutex);
-#endif
 }

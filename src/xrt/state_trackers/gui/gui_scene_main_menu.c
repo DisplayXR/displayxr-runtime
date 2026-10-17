@@ -29,11 +29,6 @@ scene_render(struct gui_scene *scene, struct gui_program *p)
 {
 	igBegin("Main Menu", NULL, 0);
 
-	if (igButton("Calibrate", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_select_video_calibrate(p);
-	}
-
 	if (igButton("Tracking Overrides", button_dims)) {
 		gui_scene_delete_me(p, scene);
 
@@ -49,26 +44,6 @@ scene_render(struct gui_scene *scene, struct gui_program *p)
 		}
 
 		gui_scene_debug(p);
-	}
-
-	if (igButton("Record (DepthAI Monocular)", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_record(p, "depthai-monocular");
-	}
-
-	if (igButton("Record (DepthAI Stereo)", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_record(p, "depthai-stereo");
-	}
-
-	if (igButton("Record (Index)", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_record(p, "index");
-	}
-
-	if (igButton("Record (Leap Motion)", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_record(p, "leap_motion");
 	}
 
 	if (igButton("Resampler Test", button_dims)) {

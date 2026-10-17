@@ -18,10 +18,6 @@
 #include "util/u_debug.h"
 #include "util/u_native_images_debug.h"
 
-#ifdef XRT_HAVE_OPENCV
-#include "tracking/t_tracking.h"
-#endif
-
 #include "xrt/xrt_frame.h"
 #include "xrt/xrt_prober.h"
 #include "xrt/xrt_tracking.h"
