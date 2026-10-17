@@ -41,7 +41,7 @@ Each graphics API gets a native compositor — no interop, no Vulkan intermediar
 - **include/xrt/** — Core interface headers (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, …)
 - **auxiliary/** — Shared utilities: math (`m_*`), util (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`)
 - **compositor/** — Native compositors: `d3d11`, `d3d12`, `metal`, `gl`, `vk_native`, plus `multi`, `client`, `null` (headless, for testing). See `docs/architecture/project-structure.md`.
-- **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019.
+- **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse), and the in-tree input providers (ADR-034 / ADR-054 class, plug-in DLLs): `sim_input/` (scripted reference), `net_input/` (loopback-TCP feeder), `ultraleap/` (SDK-gated hands), `gamepad/` (XInput / GameController pad → `/user/gamepad` role + rig navigation + optional emulated controllers; Linux stub). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019.
 - **state_trackers/oxr/** — OpenXR API implementation
 - **ipc/** — IPC for service mode (preserve for `_ipc` apps, WebXR, multi-app shell)
 - **targets/** — Build targets (runtime library, `displayxr-cli`, `displayxr-service`)

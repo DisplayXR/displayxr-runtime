@@ -707,12 +707,65 @@ report shows whether providers ever got geometry at all.
 handover and the recenter path are exercised in CI with no hardware — see §5
 for the device and the `DXR_SIM_INPUT*` environment gates that drive it.
 
+## 4c. Gamepad role
+
+**Normative.** Implemented in `target_input_arbiter.c` (the role) and
+`target_builder_input_provider.c` (the device-type case); filled in-tree by the
+`gamepad` provider (§5).
+
+A provider may supply ONE device of type `XRT_DEVICE_TYPE_GAMEPAD` whose
+`name` selects a gamepad interaction profile (`XRT_DEVICE_XBOX_CONTROLLER` =
+`microsoft/xbox_controller`, the only one in `bindings.json`). It fills
+`xrt_system_roles::gamepad` / `::gamepad_profile` — the `/user/gamepad` top
+level path the action system has carried since Monado — which the legacy
+builder assigned statically and the component path never assigned at all.
+
+The role is arbitrated by the same presence-ranked walk as the hands and the
+rig, under the same `generation_id` and over the same IPC `get_roles`
+forwarding:
+
+> `xrt_system_roles::gamepad` is the `xsysd->xdevs` index of the gamepad
+> device of the **highest-priority present candidate that has one**.
+> Otherwise **-1**, and `gamepad_profile` is `XRT_DEVICE_INVALID`.
+
+What differs from the hands: **there is no floor candidate** (qwerty has no
+pad), so -1 is the ordinary state of a box without a pad provider or with its
+pad unplugged; the OpenXR layer then reports `XR_NULL_PATH` for
+`/user/gamepad`, exactly as it does for an unassigned hand under N7. What
+differs from the rig: the builder DOES seed a static assignment
+(`u_builder_roles_helper::gamepad`, the highest-ranked candidate's device),
+because `u_builder_setup_tracking_origins` and the static-roles cache expect
+one — and the arbiter installs itself whenever a gamepad candidate exists
+(like a lone navigating provider forces it in, §4b.1) so that seed is
+presence-gated from the first `get_roles` on. A seeded-but-unplugged pad reads
+-1 before any app can see it.
+
+At most one gamepad device per provider; a second is a provider bug (warned,
+first kept), same rule as the navigation device. The gamepad device is NOT
+rig-composed through the space graph (it has no pose), and it is not a hand:
+`t_input_arbiter_provider_holds_roles` — the "does a provider hold the
+HANDS" question `selftest` asks — ignores it, so a pad-only provider leaves
+the hands to the floor and does not fail the self-test.
+
+Why this matters on a flat 3D display: there is no tracked head and no
+tracked hands, so VR-authored content needs a synthesised rig, and the
+in-tree qwerty fly camera is withheld from HANDLE apps because their own
+window owns the keyboard (`oxr_input.c`, `has_external_window`). A pad is
+focus-independent, so one provider can fill all three roles for such an app at
+once: `/user/gamepad` (this section), the rig (§4b — left stick = translate,
+right stick = look / orbit, triggers = up / down, following the rig rule of
+ADR-034 *Amendment 2*: navigation moves the rig, eye-tracked head parallax is
+applied separately at view level and never enters N), and, optionally, an
+emulated `khr/simple_controller` pair driven by the pad's buttons so the app
+gets `xrSyncActions` controllers for the first time.
+
 ## 5. In-tree reference providers
 
 | Provider | Status | Purpose |
 |---|---|---|
 | `sim_input` | **Shipped and packaged** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`; the Windows installer registers the `sim-input` row and allowlists the DLL, the `.deb` / tarball / `.pkg` ship it with `200-sim-input-input-provider.json` — ADR-054 §2 clause 3; inert until `ENABLE` = 1) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
+| `gamepad` | **Shipped and packaged** (`src/xrt/drivers/gamepad/`, plug-in DLL `DisplayXR-Gamepad`; the Windows installer registers the `gamepad` row at ProbeOrder 150 and allowlists the DLL; `build_macos.sh` / `build_linux.sh` stage `150-gamepad-input-provider.json`; Windows dev boxes: `register_dev_plugin.bat input gamepad`) | The one controller every desk has, on the existing input-provider class (§4c): a `XRT_DEVICE_TYPE_GAMEPAD` device on `microsoft/xbox_controller` (every button, stick, trigger and the four haptic outputs; `XR_EXT_dpad_binding` works over its sticks through the runtime's generic dpad emulation), a NAVIGATION device so a present pad drives the rig (§4b: left stick = translate in the rig's yaw frame, right stick = yaw / pitch, triggers = up / down, right-stick click = recenter — the durable level-with-timestamp of §4b.3, with the pose reset to F's origin in the same publication), and — `EMULATE_CONTROLLERS` = 1, the default — an emulated left / right `khr/simple_controller` pair at fixed display-plane-relative (`RIG_LOCAL`, §4b.4) poses: shoulders / X / A = select, View / Menu = menu, vibration → the pad's motors. **Presence-gated, so registered-by-default is inert:** `probe()` claims wherever the platform has a pad reader (XInput on Windows, GameController.framework on macOS with `shouldMonitorBackgroundEvents` so it is focus-independent too) and declines where it has none (desktop Linux — an evdev backend is the follow-up); `get_presence` follows the hub's hot-plug poll (250 Hz attached, 2 Hz detached), so plugging a pad in mid-session takes the gamepad, rig and hand roles and unplugging hands them all back. Settings (ADR-054 decision 7, `displayxr-cli input options gamepad`): `DEADZONE` (radial, 0.15), `NAV_SPEED` (m/s, 1.0), `NAV_TURN_SPEED` (deg/s, 90), `NAV` (1), `EMULATE_CONTROLLERS` (1), `INVERT_LOOK_Y` (0). The whole mapping policy is one table (`gamepad_map.c`, pinned by `tests/tests_gamepad_map.cpp`), so a per-title bindings mechanism (#1381) replaces the table, not the devices. |
 | `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 
 **`sim_input` and the rig role (#1380).** A *second*, independent opt-in,
@@ -809,6 +862,12 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
   to `Settings\<KEY>` on the provider's row (HKCU; HKLM with `--machine`) or
   the POSIX per-user `<id>.settings.json`, and the provider reads them at
   its next init.
+- The gamepad role has no self-test arm of its own yet: `selftest --json` /
+  `info --json` show the pad through `input_providers.devices` (a
+  `{str: "Gamepad", type: XRT_DEVICE_TYPE_GAMEPAD}` row) and the provider
+  through `input_providers.ranked` / `active_id` like any other, and the
+  service log's `input arbiter: hand roles -> … gamepad -> '…'` line says who
+  holds it. A pad-only provider never fails the hand-role check (§4c).
 - `displayxr-cli selftest` — when a provider is registered and not
   ForceQwerty-overridden (the `EmulatedControllers` gate does not change the
   verdict: a present provider must still yield its pair, and with the gate
