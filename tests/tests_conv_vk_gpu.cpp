@@ -15,7 +15,12 @@
  *  - S6 readback cadence (fresh samples of an earlier copy, never a stall);
  *  - S5 with CPU colour + CPU depth into a GPU target, and into a CPU target;
  *  - a composed VIEWS_MONO conversion through conv_core: a CPU depth provider,
- *    the glue as allocator + S5 + S6, a GPU views result.
+ *    the glue as allocator + S5 + S6, a GPU views result;
+ *  - step C (lifted weave rects): the CPU route serves spec-3 SBS streams for
+ *    weave rects only, the bridge resolves their tagged ids, the per-DP eyes
+ *    sink publishes / retires; and vk_conv_weave on a lifted rect -- flat until
+ *    the first result, a snapshot capped to the 1920 long edge, the result
+ *    woven into the rect, nothing written outside it, the letterbox crop.
  *
  * SKIPs when there is no Vulkan device.
  *
@@ -34,6 +39,10 @@
 #include "shared/ipc_cpu_buffer.h"
 #include "util/u_handles.h"
 #include "vk_conv/vk_conv_gpu.h"
+#include "vk_conv/vk_conv_weave.h"
+
+#include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_dp_lift.h"
 
 #include "os/os_time.h"
 
@@ -1110,4 +1119,314 @@ TEST_CASE("vk glue under the CPU I/O table: one POSIX table, composed views expo
 	CHECK(tr.cpu_live == 0);
 	CHECK(vk_conv_gpu_image_count(x.g) == 0u);
 	conv_fake_fini(&f);
+}
+
+
+/*
+ *
+ * Step C: lifted weave rects (vk_conv_weave + the POSIX bridge).
+ *
+ */
+
+namespace {
+
+//! The POSIX service's composition (ipc_server_conv_vk.c) around a depth-only provider.
+struct WeaveRig
+{
+	Glue x;
+	conv_fake_provider f{};
+	Tramp tr;
+	conv_core *core = nullptr;
+	ipc_server_conv *sc = nullptr;
+	ipc_server_conv_io_ops cpu_io{};
+	bool ok = false;
+
+	bool
+	init()
+	{
+		if (!ipc_server_conv_cpu_io_get(&cpu_io) || !make_glue(x)) {
+			return false;
+		}
+		conv_fake_init(&f, "depth-only");
+		conv_fake_cap *c =
+		    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+		c->state = XRT_CONV_STATE_READY;
+		c->cap.depth_kind = XRT_CONV_DEPTH_METRIC;
+		tr.gpu = x.ops;
+		conv_core_config cfg{};
+		cfg.alloc.alloc = tr_alloc;
+		cfg.alloc.free = tr_free;
+		cfg.alloc.upload = tr_upload;
+		cfg.alloc.ud = &tr;
+		cfg.prewarm_on = CONV_PREWARM_FIRST_CREATE;
+		cfg.prewarm_task_mask = 1ull << 63;
+		cfg.rear_cap_m = -1.0f;
+		cfg.tick_ms = 10;
+		REQUIRE(conv_core_create(&cfg, &core) == XRT_SUCCESS);
+		REQUIRE(ipc_server_conv_create(core, &sc) == XRT_SUCCESS);
+		ipc_server_conv_set_io(sc, &cpu_io);
+		ipc_server_conv_cpu_gpu copies{hook_write, hook_read, x.g};
+		ipc_server_conv_cpu_io_set_gpu(&copies);
+		ipc_server_conv_gpu gpu{};
+		gpu.alloc = x.ops;
+		gpu.viewsyn = x.vs;
+		gpu.readback = x.rb;
+		gpu.io = cpu_io;
+		ipc_server_conv_install_gpu(sc, &gpu);
+		conv_provider_desc d{};
+		d.id = f.id;
+		d.probe_order = 100;
+		d.enabled = true;
+		d.iface = &f.iface;
+		d.inst = conv_fake_inst(&f);
+		REQUIRE(conv_core_add_provider(core, &d) >= 0);
+		ok = true;
+		return true;
+	}
+
+	~WeaveRig()
+	{
+		if (!ok) {
+			return;
+		}
+		ipc_server_conv_set_weave_rects(sc, false);
+		ipc_server_conv_install_gpu(sc, nullptr);
+		ipc_server_conv_cpu_io_set_gpu(nullptr);
+		ipc_server_conv_destroy(&sc);
+		conv_core_destroy(&core);
+		conv_fake_fini(&f);
+	}
+};
+
+bool
+weave_resolve(void *ud, uint64_t owner, uint64_t wire_id, uint64_t *out_core_id, uint32_t *out_mode)
+{
+	return ipc_server_conv_resolve_stream(static_cast<ipc_server_conv *>(ud), owner, wire_id, out_core_id,
+	                                      out_mode);
+}
+
+void
+weave_match(void *ud, uint64_t owner, uint64_t wire_id, uint32_t views)
+{
+	ipc_server_conv_v4_match_weave(static_cast<ipc_server_conv *>(ud), owner, wire_id, views);
+}
+
+} // namespace
+
+TEST_CASE("weave rects under the CPU route: spec-3 SBS streams, tagged ids through the bridge, per-DP eyes",
+          "[conv_vk_gpu][weave_rects]")
+{
+	WeaveRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport available");
+	}
+	ipc_server_conv *sc = rig.sc;
+	// cpu_only: spec 3 is off until a weave engine can lift rects.
+	CHECK_FALSE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_SBS, 0));
+	CHECK_FALSE(ipc_server_conv_routes_properties(sc));
+	ipc_server_conv_set_weave_rects(sc, true);
+	CHECK(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_SBS, 0));
+	CHECK_FALSE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_DEPTH, 0));
+	CHECK_FALSE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_GAUSSIANS, 0));
+	CHECK(ipc_server_conv_routes_properties(sc));
+	xrt_dp_lift_caps caps{};
+	ipc_server_conv_lift_properties(sc, &caps);
+	CHECK((caps.modes & XRT_DP_LIFT_MODE_SBS) != 0u);
+	CHECK((caps.modes & (XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_GAUSSIANS)) == 0u);
+
+	// The weave client's spec-3 SBS stream: a tagged wire id the bridge resolves
+	// for its owner only.
+	uint64_t wire = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) == XRT_SUCCESS);
+	CHECK((wire & IPC_SERVER_CONV_STREAM_TAG) != 0u);
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	CHECK(weave_resolve(sc, 1, wire, &core_id, &mode));
+	CHECK(core_id != 0u);
+	CHECK(mode == XRT_DP_LIFT_MODE_SBS);
+	CHECK_FALSE(weave_resolve(sc, 2, wire, &core_id, &mode));
+	CHECK_FALSE(weave_resolve(sc, 1, wire & ~IPC_SERVER_CONV_STREAM_TAG, &core_id, &mode));
+
+	// The per-DP eyes sink: published under the DP's key, read back, retired.
+	xrt_eye_positions e{};
+	e.valid = true;
+	e.is_tracking = true;
+	e.count = 2;
+	e.eyes[0].x = -0.031f;
+	e.eyes[0].z = 0.6f;
+	e.eyes[1].x = 0.031f;
+	e.eyes[1].z = 0.6f;
+	const uint64_t dp_a = 0x1000, dp_b = 0x2000;
+	ipc_server_conv_eyes_publish(sc, dp_a, &e);
+	e.eyes[0].x = -0.5f;
+	ipc_server_conv_eyes_publish(sc, dp_b, &e);
+	conv_eyes ce{};
+	REQUIRE(conv_core_eyes_read(rig.core, dp_a, now_ns(), &ce));
+	CHECK(ce.valid);
+	CHECK(ce.count == 2u);
+	CHECK(ce.xyz[0][0] == -0.031f);
+	CHECK(ce.xyz[1][2] == 0.6f);
+	REQUIRE(conv_core_eyes_read(rig.core, dp_b, now_ns(), &ce));
+	CHECK(ce.xyz[0][0] == -0.5f); // per DP, never another screen's
+	ipc_server_conv_eyes_retire(sc, dp_a);
+	CHECK_FALSE(conv_core_eyes_read(rig.core, dp_a, now_ns(), &ce));
+	CHECK(conv_core_eyes_read(rig.core, dp_b, now_ns(), &ce));
+
+	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
+	CHECK_FALSE(weave_resolve(sc, 1, wire, &core_id, &mode));
+	ipc_server_conv_set_weave_rects(sc, false);
+	CHECK_FALSE(ipc_server_conv_routes_create(sc, XRT_DP_LIFT_MODE_SBS, 0));
+}
+
+TEST_CASE("vk_conv_weave: a lifted batch rect -- flat, capped snapshot, woven result, letterbox crop",
+          "[conv_vk_gpu][weave_rects]")
+{
+	WeaveRig rig;
+	if (!rig.init()) {
+		SKIP("no Vulkan device / CPU transport available");
+	}
+	struct vk_bundle *vk = rig.x.vk.get();
+	ipc_server_conv *sc = rig.sc;
+	ipc_server_conv_set_weave_rects(sc, true);
+	uint64_t wire = 0;
+	REQUIRE(ipc_server_conv_lift_stream_create(sc, 1, XRT_DP_LIFT_MODE_SBS, 0, 1.0f, 0, 0, &wire) == XRT_SUCCESS);
+	uint64_t core_id = 0;
+	uint32_t mode = 0;
+	REQUIRE(weave_resolve(sc, 1, wire, &core_id, &mode));
+
+	vk_conv_weave *w = nullptr;
+	REQUIRE(vk_conv_weave_create(vk, rig.x.g, &w));
+	vk_conv_weave_bridge b{};
+	b.core = rig.core;
+	b.resolve = weave_resolve;
+	b.match_weave = weave_match;
+	b.ud = sc;
+	vk_conv_weave_set_bridge(w, &b);
+	CHECK(vk_conv_weave_stream_mode(w, 1, wire) == XRT_DP_LIFT_MODE_SBS);
+	CHECK(vk_conv_weave_stream_mode(w, 2, wire) == 0u);
+	vk_conv_weave_client *c = vk_conv_weave_client_create(w, vk);
+	REQUIRE(c != nullptr);
+
+	// The window-sized input (BGRA, the Linux / macOS weave input contract):
+	// red outside the rect; inside a 2400x1000 rect, a film with 100-row black
+	// bars top and bottom.
+	const uint32_t W = 2560, H = 1200;
+	const int32_t RX = 80, RY = 100;
+	const uint32_t RW = 2400, RH = 1000, BAR = 100;
+	std::vector<uint8_t> src((size_t)W * H * 4);
+	for (uint32_t y = 0; y < H; y++) {
+		for (uint32_t x = 0; x < W; x++) {
+			uint8_t *p = &src[((size_t)y * W + x) * 4];
+			const bool in_rect = (int32_t)x >= RX && x < RX + RW && (int32_t)y >= RY && y < RY + RH;
+			const uint32_t ry = y - RY;
+			if (!in_rect) {
+				p[0] = 0, p[1] = 0, p[2] = 255; // B G R: red
+			} else if (ry < BAR || ry >= RH - BAR) {
+				p[0] = 0, p[1] = 0, p[2] = 0; // the bars
+			} else {
+				p[0] = (uint8_t)(40 + x % 200), p[1] = 128, p[2] = (uint8_t)(40 + y % 200);
+			}
+			p[3] = 255;
+		}
+	}
+	Image in_img, sbs;
+	REQUIRE(make_image(vk, in_img, W, H, 1, VK_FORMAT_B8G8R8A8_UNORM));
+	REQUIRE(make_image(vk, sbs, 2 * W, H, 1, VK_FORMAT_R8G8B8A8_UNORM));
+	vk_cmd_pool pool{};
+	REQUIRE(vk_cmd_pool_init(vk, &pool, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) == VK_SUCCESS);
+	REQUIRE(upload(vk, &pool, in_img, src.data(), src.size()));
+	std::vector<uint8_t> zeros((size_t)2 * W * H * 4, 0);
+	REQUIRE(upload(vk, &pool, sbs, zeros.data(), zeros.size()));
+
+	xrt_lift_weave_rect binding{};
+	binding.stream_id = wire;
+	binding.rect_index = 0;
+	vk_conv_weave_rect r{};
+	r.binding = &binding;
+	r.owner = 1;
+	r.src = {in_img.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_B8G8R8A8_UNORM, W, H};
+	r.x = RX;
+	r.y = RY;
+	r.w = RW;
+	r.h = RH;
+	r.dst = {sbs.image, VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, 2 * W, H};
+	r.views = 2;
+	r.tile_columns = 2;
+	r.tile_w = W;
+	r.tile_h = H;
+	r.batch = true;
+	r.frame.valid = true;
+	r.frame.width_m = 0.30f;
+	r.frame.height_m = 0.125f;
+
+	auto weave = [&]() {
+		vk_conv_weave_begin(w, c);
+		const bool rec = run_cmd(vk, &pool, [&](VkCommandBuffer cmd) { return vk_conv_weave_record(w, c, cmd, &r); });
+		vk_conv_weave_complete(w, c); // the "fence" signalled: run_cmd waited
+		return rec;
+	};
+	std::vector<uint8_t> out((size_t)2 * W * H * 4);
+	auto px = [&](uint32_t x, uint32_t y) { return &out[((size_t)y * 2 * W + x) * 4]; };
+	auto src_rgba_eq = [&](uint32_t sx, uint32_t sy, const uint8_t *d) {
+		const uint8_t *s = &src[((size_t)sy * W + sx) * 4];
+		return d[0] == s[2] && d[1] == s[1] && d[2] == s[0] && d[3] == s[3];
+	};
+
+	// 1. Flat until the first result; the snapshot is capped to the 1920 long edge.
+	REQUIRE(weave());
+	vk_conv_weave_stats st{};
+	REQUIRE(vk_conv_weave_client_stats(c, wire, &st));
+	CHECK(st.active_w == RW);
+	CHECK(st.active_h == RH);
+	CHECK(st.snap_w == 1920u);
+	CHECK(st.snap_h == 800u);
+	CHECK(st.committed == 1u);
+	CHECK_FALSE(st.woven_result);
+	REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));
+	CHECK(src_rgba_eq(580, 400, px(580, 400)));         // tile 0: the 2D frame, 1:1
+	CHECK(src_rgba_eq(580, 400, px(W + 580, 400)));     // tile 1: the same pixels (flat)
+	CHECK(px(10, 10)[3] == 0);                          // outside the rect: untouched
+	CHECK(px(W + RX + RW + 10, RY + 10)[3] == 0);
+
+	// 2. The conversion lands; the next weave samples it into the rect.
+	conv_stream_stats ss{};
+	REQUIRE(wait_until(
+	    [&] { return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted >= 1; },
+	    5000));
+	REQUIRE(weave());
+	REQUIRE(vk_conv_weave_client_stats(c, wire, &st));
+	CHECK(st.woven_result);
+	CHECK(st.result_views == 2u);
+	CHECK(st.committed == 2u);
+	REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));
+	CHECK(px(580, 400)[3] == 255); // the result, opaque, inside the rect in both tiles
+	CHECK(px(W + 580, 400)[3] == 255);
+	CHECK(px(10, 10)[3] == 0); // still nothing outside it
+	CHECK(px(W + RX + RW + 10, RY + 10)[3] == 0);
+
+	// 3. The letterbox crop settles: the snapshot is the active area only, capped.
+	bool cropped = false;
+	for (int i = 0; i < 120 && !cropped; i++) {
+		REQUIRE(weave());
+		REQUIRE(vk_conv_weave_client_stats(c, wire, &st));
+		cropped = st.active_h == RH - 2 * BAR;
+	}
+	REQUIRE(cropped);
+	CHECK(st.active_w == RW);
+	CHECK(st.snap_w == 1920u);
+	CHECK(st.snap_h == 640u);
+	// Once a result of the cropped input lands, the bars are the 2D input, flat.
+	const uint64_t done = ss.converted;
+	REQUIRE(wait_until(
+	    [&] { return conv_core_stream_get_stats(rig.core, core_id, &ss) == XRT_SUCCESS && ss.converted > done + 1; },
+	    5000));
+	REQUIRE(weave());
+	REQUIRE(readback(vk, &pool, sbs, out.data(), out.size()));
+	CHECK(src_rgba_eq(580, RY + 50, px(580, RY + 50)));
+	CHECK(src_rgba_eq(580, RY + 50, px(W + 580, RY + 50)));
+
+	vk_conv_weave_client_destroy(w, c);
+	vk_conv_weave_destroy(&w);
+	vk_cmd_pool_destroy(vk, &pool);
+	CHECK(ipc_server_conv_lift_stream_destroy(sc, 1, wire) == XRT_SUCCESS);
 }
