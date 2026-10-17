@@ -74,6 +74,14 @@ if(TARGET ${RUNTIME_TARGET} AND (WIN32 OR APPLE))
 	set_target_properties(
 		displayxr-conversion-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>"
 		)
+	if(APPLE)
+		# macOS has no loader pre-load: a provider's @rpath/openxr_displayxr.dylib
+		# resolves through the host's rpath. The staged / installed host gets
+		# @executable_path/../lib (build_macos.sh); in the build tree the
+		# runtime sits beside it. Without this every provider (the sim one in
+		# tests_conv_host_satellite included) failed to dlopen in-tree.
+		set_property(TARGET displayxr-conversion-host APPEND PROPERTY BUILD_RPATH "@executable_path")
+	endif()
 endif()
 
 install(TARGETS displayxr-conversion-host RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
