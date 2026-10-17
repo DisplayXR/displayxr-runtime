@@ -18,6 +18,10 @@
  *  - Windows: a root the store creates is readable by BUILTIN\Users and by
  *    AppContainer processes, writable (create files) by the logged-in user,
  *    and the blobs inside it are not writable by other users.
+ *  - #2195: the POSIX downloader. A blob served over http by a loopback
+ *    server in this test goes download -> verify -> rename -> stamp, shows
+ *    DOWNLOADING with progress, follows a redirect; wrong bytes are rejected
+ *    with no blob, stamp or part left; a 404 is a retryable network failure.
  *  - #2194: get_path. The scratch root per platform, a provider's scratch
  *    directory created owner-only on first request, MODEL_STORE = the
  *    process store's root, LOGS = the log file's directory.
@@ -29,6 +33,7 @@
 #include "conversion/conv_model_store.h"
 #include "util/u_sha256.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -45,7 +50,14 @@
 #include <aclapi.h>
 #include <sddl.h>
 #else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#include <atomic>
 #endif
 
 namespace fs = std::filesystem;
@@ -120,7 +132,9 @@ struct fake_pack
 	fs::path manifest; //!< sim.models.json
 	std::string sha, sha_r;
 
-	explicit fake_pack(const std::string &bytes = blob_bytes(), bool relative_base = false)
+	explicit fake_pack(const std::string &bytes = blob_bytes(),
+	                   bool relative_base = false,
+	                   const std::string &base_override = std::string())
 	{
 		src = dir.path / "src";
 		fs::create_directories(src);
@@ -129,7 +143,9 @@ struct fake_pack
 		const std::string rbytes = blob_bytes('R');
 		sha_r = sha_hex(rbytes);
 		write_file(src / (sha_r + ".bin"), rbytes);
-		const std::string base = relative_base ? std::string("src") : "file://" + src.generic_u8string();
+		const std::string base = !base_override.empty() ? base_override
+		                         : relative_base        ? std::string("src")
+		                                                : "file://" + src.generic_u8string();
 		const std::string json = R"({
   "schema": 2, "pack": "sim", "provider": "sim-conversion", "generated": "2026-10-14",
   "blobBaseUrl": ")" + base + R"(",
@@ -805,3 +821,293 @@ TEST_CASE("conv_paths: get_path answers a provider's scratch dir, the store root
 		CHECK_FALSE(conv_host_get_path("open-conversion", XRT_CONV_PATH_LOGS, "", buf, sizeof(buf)));
 	}
 }
+
+
+/*
+ *
+ * #2195: the POSIX downloader (libcurl at run time) against a loopback server.
+ *
+ */
+
+#ifndef XRT_OS_WINDOWS
+namespace {
+
+/*!
+ * A minimal HTTP/1.0 server on 127.0.0.1:<ephemeral> serving the files of
+ * @p root: `GET /<name>` = the file (sent in 64-byte pieces, 5 ms apart, so a
+ * download is observably in flight), `GET /redirect/<name>` = 302 to
+ * `/<name>`, anything else 404. One connection at a time, Connection: close.
+ */
+struct http_server
+{
+	fs::path root;
+	int fd = -1;
+	int port = 0;
+	std::atomic<bool> stop{false};
+	std::atomic<int> hits{0};
+	std::thread th;
+
+	explicit http_server(fs::path r) : root(std::move(r))
+	{
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(fd >= 0);
+		int one = 1;
+		(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		a.sin_port = 0;
+		REQUIRE(bind(fd, (sockaddr *)&a, sizeof(a)) == 0);
+		REQUIRE(listen(fd, 8) == 0);
+		socklen_t len = sizeof(a);
+		REQUIRE(getsockname(fd, (sockaddr *)&a, &len) == 0);
+		port = ntohs(a.sin_port);
+		th = std::thread([this] { loop(); });
+	}
+
+	~http_server()
+	{
+		stop = true;
+		th.join();
+		close(fd);
+	}
+
+	std::string
+	base() const
+	{
+		return "http://127.0.0.1:" + std::to_string(port);
+	}
+
+	static bool
+	send_all(int c, const char *p, size_t n)
+	{
+		while (n > 0) {
+#ifdef MSG_NOSIGNAL
+			const ssize_t w = send(c, p, n, MSG_NOSIGNAL);
+#else
+			const ssize_t w = send(c, p, n, 0);
+#endif
+			if (w <= 0) {
+				return false;
+			}
+			p += w;
+			n -= (size_t)w;
+		}
+		return true;
+	}
+
+	void
+	serve(int c)
+	{
+#ifdef SO_NOSIGPIPE
+		int one = 1;
+		(void)setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+		std::string req;
+		char buf[1024];
+		while (req.find("\r\n\r\n") == std::string::npos && req.size() < 8192) {
+			pollfd p{c, POLLIN, 0};
+			if (poll(&p, 1, 2000) <= 0) {
+				return;
+			}
+			const ssize_t n = recv(c, buf, sizeof(buf), 0);
+			if (n <= 0) {
+				return;
+			}
+			req.append(buf, (size_t)n);
+		}
+		hits++;
+		const size_t sp1 = req.find(' ');
+		const size_t sp2 = req.find(' ', sp1 + 1);
+		const std::string path = sp1 == std::string::npos ? "" : req.substr(sp1 + 1, sp2 - sp1 - 1);
+		const std::string redirect = "/redirect/";
+		if (path.rfind(redirect, 0) == 0) {
+			const std::string h = "HTTP/1.0 302 Found\r\nLocation: " + base() + "/" +
+			                      path.substr(redirect.size()) +
+			                      "\r\nContent-Length: 5\r\nConnection: close\r\n\r\nmoved";
+			(void)send_all(c, h.data(), h.size());
+			return;
+		}
+		const fs::path file = root / (path.size() > 1 ? path.substr(1) : std::string("-"));
+		if (path.find("..") != std::string::npos || !fs::is_regular_file(file)) {
+			const std::string h =
+			    "HTTP/1.0 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found";
+			(void)send_all(c, h.data(), h.size());
+			return;
+		}
+		const std::string body = read_file(file);
+		const std::string h = "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
+		                      std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+		if (!send_all(c, h.data(), h.size())) {
+			return;
+		}
+		for (size_t off = 0; off < body.size() && !stop; off += 64) {
+			if (!send_all(c, body.data() + off, std::min<size_t>(64, body.size() - off))) {
+				return;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	}
+
+	void
+	loop()
+	{
+		while (!stop) {
+			pollfd p{fd, POLLIN, 0};
+			if (poll(&p, 1, 50) <= 0) {
+				continue;
+			}
+			const int c = accept(fd, nullptr, nullptr);
+			if (c < 0) {
+				continue;
+			}
+			serve(c);
+			close(c);
+		}
+	}
+};
+
+xrt_conv_model_location
+wait_settled(conv_model_store *s, const char *ref, bool *saw_downloading, float *max_progress)
+{
+	xrt_conv_model_location loc{};
+	for (int i = 0; i < 1000; i++) {
+		loc = resolve(s, ref);
+		if (loc.state == XRT_CONV_STATE_DOWNLOADING) {
+			*saw_downloading = true;
+			*max_progress = std::max(*max_progress, loc.progress);
+		}
+		if (loc.state == XRT_CONV_STATE_READY || loc.state == XRT_CONV_STATE_FAILED) {
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	return loc;
+}
+
+} // namespace
+
+TEST_CASE("conv_store: the POSIX downloader fetches over http, verifies, stamps last")
+{
+	char why[160];
+	if (!conv_model_store_http_available(why, sizeof(why))) {
+		SKIP(why); // a Linux box without libcurl.so.4
+	}
+	temp_dir srv_dir;
+	http_server srv(srv_dir.path);
+	temp_dir root;
+	const fs::path store_root = root.path / "Models";
+	const fs::path blobs = store_root / "blobs";
+
+	SECTION("download -> verify -> rename -> stamp, DOWNLOADING with progress")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base());
+		fs::copy_file(fp.src / (fp.sha + ".bin"), srv_dir.path / (fp.sha + ".bin"));
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		bool saw = false;
+		float maxp = -1.0f;
+		const auto loc = wait_settled(h.s, "sim/fake", &saw, &maxp);
+		REQUIRE(loc.state == XRT_CONV_STATE_READY);
+		CHECK(saw);
+		CHECK(maxp > 0.0f);
+		CHECK(maxp <= 1.0f);
+		CHECK(fs::path(loc.path) == blobs / fp.sha);
+		CHECK(read_file(blobs / fp.sha) == blob_bytes());
+		// The browser contract's stamp, byte for byte.
+		CHECK(read_file(blobs / (fp.sha + ".ok")) == fp.sha + " 1024\n");
+		CHECK_FALSE(has_part(blobs));
+		CHECK(fs::exists(store_root / CONV_STORE_OWNER_MARKER));
+		CHECK(srv.hits.load() == 1);
+	}
+
+	SECTION("a redirect is followed")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base() + "/redirect");
+		fs::copy_file(fp.src / (fp.sha + ".bin"), srv_dir.path / (fp.sha + ".bin"));
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+		CHECK(read_file(blobs / fp.sha) == blob_bytes());
+		CHECK(srv.hits.load() == 2);
+	}
+
+	SECTION("wrong bytes (same size, wrong sha256) never become a blob: no blob, no stamp, no part")
+	{
+		fake_pack fp(blob_bytes('B'), false, srv.base());
+		fs::copy_file(fp.src / (fp.sha + ".bin"), srv_dir.path / (fp.sha + ".bin")); // the 'B' bytes
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		const auto loc = resolve(h.s, "sim/fake");
+		CHECK(loc.state == XRT_CONV_STATE_FAILED);
+		CHECK(loc.failure_reason == XRT_CONV_FAIL_MODEL);
+		CHECK_FALSE(fs::exists(blobs / fp.sha));
+		CHECK_FALSE(fs::exists(blobs / (fp.sha + ".ok")));
+		CHECK_FALSE(has_part(blobs));
+	}
+
+	SECTION("a longer body than the pack says is cut off and rejected")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base());
+		write_file(srv_dir.path / (fp.sha + ".bin"), blob_bytes() + "extra");
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		CHECK(resolve(h.s, "sim/fake").failure_reason == XRT_CONV_FAIL_MODEL);
+		CHECK_FALSE(fs::exists(blobs / fp.sha));
+		CHECK_FALSE(fs::exists(blobs / (fp.sha + ".ok")));
+		CHECK_FALSE(has_part(blobs));
+	}
+
+	SECTION("a 404 is a retryable network failure, nothing written")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base()); // nothing copied to the server
+		store_handle h(store_root);
+		REQUIRE(conv_model_store_add_pack_file(h.s, fp.manifest.u8string().c_str()));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		const auto loc = resolve(h.s, "sim/fake");
+		CHECK(loc.state == XRT_CONV_STATE_FAILED);
+		CHECK(loc.failure_reason == XRT_CONV_FAIL_NETWORK);
+		CHECK_FALSE(fs::exists(blobs / fp.sha));
+		CHECK_FALSE(has_part(blobs));
+
+		// Served now: a new request retries and succeeds.
+		fs::copy_file(fp.src / (fp.sha + ".bin"), srv_dir.path / (fp.sha + ".bin"));
+		REQUIRE(conv_model_store_request(h.s, "sim/fake"));
+		REQUIRE(conv_model_store_wait_idle(h.s, 10000));
+		CHECK(resolve(h.s, "sim/fake").state == XRT_CONV_STATE_READY);
+	}
+
+	SECTION("the synchronous path (conv models fetch / installer pre-fetch) uses it too")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base());
+		fs::copy_file(fp.src / (fp.sha + ".bin"), srv_dir.path / (fp.sha + ".bin"));
+		store_handle h(store_root);
+		conv_pack p{};
+		char err[256];
+		REQUIRE(conv_pack_load(fp.manifest.u8string().c_str(), &p, err, sizeof(err)));
+		const conv_pack_model *m = conv_pack_find_model(&p, "fake");
+		REQUIRE(m != nullptr);
+		CHECK(conv_model_store_fetch_model(h.s, &p, m, nullptr, true) == CONV_STORE_BLOB_OK);
+		CHECK(read_file(blobs / (fp.sha + ".ok")) == fp.sha + " 1024\n");
+		CHECK(conv_model_store_fetch_model(h.s, &p, m, nullptr, true) == CONV_STORE_BLOB_SKIPPED);
+	}
+
+	SECTION("a remote pack manifest loads over http")
+	{
+		fake_pack fp(blob_bytes(), false, srv.base());
+		fs::copy_file(fp.manifest, srv_dir.path / "sim.models.json");
+		conv_pack p{};
+		char err[256];
+		REQUIRE(conv_pack_load_url((srv.base() + "/sim.models.json").c_str(), &p, err, sizeof(err)));
+		CHECK(std::string(p.pack) == "sim");
+	}
+}
+#endif

@@ -27,6 +27,10 @@
  *   `DXR_CONV_MODELS_ROOT` (environment of the process that owns the store)
  *   overrides all of them: tests and dev boxes only.
  *
+ * Downloader: `file://` everywhere; `http(s)://` with WinHTTP on Windows and
+ * libcurl, loaded at run time (no link-time dependency), on macOS and desktop
+ * Linux (#2195). Both feed the same write protocol below.
+ *
  * Write protocol (host, CLI `conv models fetch`, installer pre-fetch):
  * download to `<sha>.<nonce>.part`, check the size, then the sha256 (mismatch:
  * delete the part), rename without replace (target exists: another writer won,
@@ -223,9 +227,10 @@ bool
 conv_pack_auth_kind_parse(const char *s, uint32_t *out);
 
 /*!
- * conv_pack_load() of a local path, a `file://` URL, or (Windows) an
- * `http(s)://` URL fetched into memory; a remote manifest's relative
- * `blobBaseUrl` resolves against the manifest URL's directory.
+ * conv_pack_load() of a local path, a `file://` URL, or an `http(s)://` URL
+ * fetched into memory (WinHTTP on Windows, libcurl loaded at run time on
+ * POSIX); a remote manifest's relative `blobBaseUrl` resolves against the
+ * manifest URL's directory.
  */
 bool
 conv_pack_load_url(const char *url_or_path, struct conv_pack *out, char *err, size_t err_size);
@@ -348,6 +353,14 @@ enum conv_store_blob_result
 
 const char *
 conv_store_blob_result_str(enum conv_store_blob_result r);
+
+/*!
+ * Can this process download `http(s)://` blobs? Windows: always (WinHTTP).
+ * POSIX: libcurl could be loaded; false with @p why filled otherwise (a Linux
+ * box without libcurl.so.4), and such a download ends CONV_STORE_BLOB_NETWORK.
+ */
+bool
+conv_model_store_http_available(char *why, size_t why_size);
 
 /*!
  * Fetch every file of @p m (variant @p variant, NULL = every variant) with

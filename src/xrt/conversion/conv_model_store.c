@@ -30,7 +30,10 @@
 #include <winhttp.h>
 #else
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1379,6 +1382,322 @@ out:
 	}
 	return r;
 }
+
+bool
+conv_model_store_http_available(char *why, size_t why_size)
+{
+	cpy(why, why_size, "");
+	return true; // WinHTTP is part of the OS
+}
+
+#else
+
+/*
+ * macOS / desktop Linux (#2195): libcurl, loaded at run time, so nothing links
+ * it and a Linux box without libcurl.so.4 still runs everything else (a
+ * missing blob is then FAILED(NETWORK) with the reason logged). The same
+ * pattern as the remote provider's client (remote_conv_http.c): only libcurl's
+ * stable ABI entry points and option numbers (7.32+). The bytes go through the
+ * same sink as WinHTTP's, so the write protocol (part, size, sha256, rename,
+ * stamp last) is the one blob_protocol() runs for every platform.
+ */
+
+typedef void CURL;
+struct curl_slist;
+typedef CURL *(*curl_easy_init_fn)(void);
+typedef int (*curl_easy_setopt_fn)(CURL *, int, ...);
+typedef int (*curl_easy_perform_fn)(CURL *);
+typedef int (*curl_easy_getinfo_fn)(CURL *, int, ...);
+typedef void (*curl_easy_cleanup_fn)(CURL *);
+typedef const char *(*curl_easy_strerror_fn)(int);
+typedef struct curl_slist *(*curl_slist_append_fn)(struct curl_slist *, const char *);
+typedef void (*curl_slist_free_fn)(struct curl_slist *);
+typedef int (*curl_global_init_fn)(long);
+
+#define CS_CURLOPT_WRITEDATA 10001
+#define CS_CURLOPT_URL 10002
+#define CS_CURLOPT_USERAGENT 10018
+#define CS_CURLOPT_HTTPHEADER 10023
+#define CS_CURLOPT_XFERINFODATA 10057
+#define CS_CURLOPT_PROTOCOLS_STR 10318       // 7.85+
+#define CS_CURLOPT_REDIR_PROTOCOLS_STR 10319 // 7.85+
+#define CS_CURLOPT_WRITEFUNCTION 20011
+#define CS_CURLOPT_XFERINFOFUNCTION 20219
+#define CS_CURLOPT_LOW_SPEED_LIMIT 19
+#define CS_CURLOPT_LOW_SPEED_TIME 20
+#define CS_CURLOPT_NOPROGRESS 43
+#define CS_CURLOPT_FOLLOWLOCATION 52
+#define CS_CURLOPT_MAXREDIRS 68
+#define CS_CURLOPT_HTTPGET 80
+#define CS_CURLOPT_NOSIGNAL 99
+#define CS_CURLOPT_CONNECTTIMEOUT_MS 156
+#define CS_CURLOPT_PROTOCOLS 181       // deprecated in 7.85, the fallback for older libcurl
+#define CS_CURLOPT_REDIR_PROTOCOLS 182 // idem
+#define CS_CURLPROTO_HTTP_HTTPS 3L
+#define CS_CURLINFO_RESPONSE_CODE 0x200002
+#define CS_CURLINFO_REDIRECT_URL 0x10001F
+#define CS_CURLE_OK 0
+#define CS_CURL_GLOBAL_ALL 3L
+
+static struct
+{
+	bool tried;
+	bool ok;
+	char why[160];
+	void *lib;
+	curl_easy_init_fn init;
+	curl_easy_setopt_fn setopt;
+	curl_easy_perform_fn perform;
+	curl_easy_getinfo_fn getinfo;
+	curl_easy_cleanup_fn cleanup;
+	curl_easy_strerror_fn strerror;
+	curl_slist_append_fn slist_append;
+	curl_slist_free_fn slist_free;
+} g_curl;
+
+static pthread_mutex_t g_curl_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+//! Under g_curl_mtx. Tried once per process.
+static bool
+curl_load_locked(void)
+{
+	if (g_curl.tried) {
+		return g_curl.ok;
+	}
+	g_curl.tried = true;
+#if defined(XRT_OS_MACOS)
+	static const char *names[] = {"/usr/lib/libcurl.4.dylib", "libcurl.4.dylib", "libcurl.dylib", NULL};
+#else
+	static const char *names[] = {"libcurl.so.4", "libcurl-gnutls.so.4", "libcurl-nss.so.4", NULL};
+#endif
+	for (int i = 0; names[i] != NULL && g_curl.lib == NULL; i++) {
+		g_curl.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+	}
+	if (g_curl.lib == NULL) {
+		cpy(g_curl.why, sizeof(g_curl.why),
+		    "libcurl (libcurl.so.4) is not installed: models cannot be downloaded");
+		return false;
+	}
+	g_curl.init = (curl_easy_init_fn)dlsym(g_curl.lib, "curl_easy_init");
+	g_curl.setopt = (curl_easy_setopt_fn)dlsym(g_curl.lib, "curl_easy_setopt");
+	g_curl.perform = (curl_easy_perform_fn)dlsym(g_curl.lib, "curl_easy_perform");
+	g_curl.getinfo = (curl_easy_getinfo_fn)dlsym(g_curl.lib, "curl_easy_getinfo");
+	g_curl.cleanup = (curl_easy_cleanup_fn)dlsym(g_curl.lib, "curl_easy_cleanup");
+	g_curl.strerror = (curl_easy_strerror_fn)dlsym(g_curl.lib, "curl_easy_strerror");
+	g_curl.slist_append = (curl_slist_append_fn)dlsym(g_curl.lib, "curl_slist_append");
+	g_curl.slist_free = (curl_slist_free_fn)dlsym(g_curl.lib, "curl_slist_free_all");
+	curl_global_init_fn global_init = (curl_global_init_fn)dlsym(g_curl.lib, "curl_global_init");
+	if (g_curl.init == NULL || g_curl.setopt == NULL || g_curl.perform == NULL || g_curl.getinfo == NULL ||
+	    g_curl.cleanup == NULL || g_curl.slist_append == NULL || g_curl.slist_free == NULL || global_init == NULL) {
+		cpy(g_curl.why, sizeof(g_curl.why), "libcurl is missing required entry points");
+		return false;
+	}
+	if (global_init(CS_CURL_GLOBAL_ALL) != CS_CURLE_OK) {
+		cpy(g_curl.why, sizeof(g_curl.why), "curl_global_init failed");
+		return false;
+	}
+	g_curl.ok = true;
+	return true;
+}
+
+bool
+conv_model_store_http_available(char *why, size_t why_size)
+{
+	pthread_mutex_lock(&g_curl_mtx);
+	const bool ok = curl_load_locked();
+	cpy(why, why_size, ok ? "" : g_curl.why);
+	pthread_mutex_unlock(&g_curl_mtx);
+	return ok;
+}
+
+//! The host part of @p url ("https://user@Host:443/x" -> "Host"); "" when there is none.
+static void
+url_host(const char *url, char *out, size_t n)
+{
+	cpy(out, n, "");
+	const char *p = strstr(url, "://");
+	if (p == NULL) {
+		return;
+	}
+	p += 3;
+	size_t len = strcspn(p, "/?#");
+	const char *at = memchr(p, '@', len);
+	if (at != NULL) {
+		len -= (size_t)(at + 1 - p);
+		p = at + 1;
+	}
+	if (p[0] == '[') {
+		const char *rb = memchr(p, ']', len);
+		len = rb != NULL ? (size_t)(rb + 1 - p) : len;
+	} else {
+		const char *colon = memchr(p, ':', len);
+		len = colon != NULL ? (size_t)(colon - p) : len;
+	}
+	if (len >= n) {
+		return;
+	}
+	memcpy(out, p, len);
+	out[len] = '\0';
+}
+
+struct curl_dl
+{
+	struct conv_model_store *s;
+	struct sink *k;
+	struct xfer *x;
+	CURL *h;
+	enum conv_store_blob_result fail; //!< a sink failure (BAD_DOWNLOAD / IO); OK = none
+	bool cancelled;
+};
+
+static size_t
+curl_dl_body(char *ptr, size_t size, size_t nmemb, void *ud)
+{
+	struct curl_dl *c = (struct curl_dl *)ud;
+	const size_t n = size * nmemb;
+	long status = 0;
+	(void)g_curl.getinfo(c->h, CS_CURLINFO_RESPONSE_CODE, &status);
+	if (status != 200) {
+		return n; // a redirect's or an error's body: never model bytes
+	}
+	if (!sink_write(c->k, ptr, n)) {
+		c->fail = c->k->over ? CONV_STORE_BLOB_BAD_DOWNLOAD : CONV_STORE_BLOB_IO;
+		return 0; // CURLE_WRITE_ERROR
+	}
+	xfer_progress(c->x, c->k->written, false);
+	sleep_ms(c->s->cfg.throttle_ms);
+	if (cancelled(c->s)) {
+		c->cancelled = true;
+		return 0;
+	}
+	return n;
+}
+
+static int
+curl_dl_xferinfo(void *ud, int64_t dltotal, int64_t dlnow, int64_t ultotal, int64_t ulnow)
+{
+	(void)dltotal;
+	(void)dlnow;
+	(void)ultotal;
+	(void)ulnow;
+	struct curl_dl *c = (struct curl_dl *)ud;
+	if (cancelled(c->s)) {
+		c->cancelled = true;
+		return 1; // abort a stalled transfer too, not only one that delivers bytes
+	}
+	return 0;
+}
+
+static enum conv_store_blob_result
+fetch_http(struct conv_model_store *s, const char *url, const char *bearer, struct sink *k, struct xfer *x)
+{
+	char why[160];
+	if (!conv_model_store_http_available(why, sizeof(why))) {
+		U_LOG_W("[conv-store] cannot download %s: %s", url, why);
+		return CONV_STORE_BLOB_NETWORK;
+	}
+	// ADR-057 §5, as WinHTTP does it: with a credential the redirects are
+	// followed HERE, so the token goes only to the host the pack named (a gated
+	// repository redirects to a CDN that must never see it). Without one,
+	// libcurl follows them itself (http / https only, at most 5).
+	char cur[2048], origin_host[256];
+	cpy(cur, sizeof(cur), url);
+	url_host(url, origin_host, sizeof(origin_host));
+	struct curl_dl c;
+	memset(&c, 0, sizeof(c));
+	c.s = s;
+	c.k = k;
+	c.x = x;
+	c.fail = CONV_STORE_BLOB_OK;
+	long status = 0;
+	int rc = CS_CURLE_OK;
+	for (int hop = 0; hop < 6; hop++) {
+		CURL *h = g_curl.init();
+		if (h == NULL) {
+			U_LOG_W("[conv-store] curl_easy_init failed");
+			return CONV_STORE_BLOB_NETWORK;
+		}
+		c.h = h;
+		g_curl.setopt(h, CS_CURLOPT_URL, cur);
+		g_curl.setopt(h, CS_CURLOPT_NOSIGNAL, 1L);
+		g_curl.setopt(h, CS_CURLOPT_USERAGENT, "DisplayXR-ModelStore/1.0");
+		g_curl.setopt(h, CS_CURLOPT_HTTPGET, 1L);
+		// WinHTTP's timeouts: 15 s to connect, a receive that stalls for 30 s fails.
+		// No total limit: a model is hundreds of MB on a slow link.
+		g_curl.setopt(h, CS_CURLOPT_CONNECTTIMEOUT_MS, 15000L);
+		g_curl.setopt(h, CS_CURLOPT_LOW_SPEED_LIMIT, 1L);
+		g_curl.setopt(h, CS_CURLOPT_LOW_SPEED_TIME, 30L);
+		if (g_curl.setopt(h, CS_CURLOPT_PROTOCOLS_STR, "http,https") != CS_CURLE_OK) {
+			g_curl.setopt(h, CS_CURLOPT_PROTOCOLS, CS_CURLPROTO_HTTP_HTTPS);
+		}
+		if (g_curl.setopt(h, CS_CURLOPT_REDIR_PROTOCOLS_STR, "http,https") != CS_CURLE_OK) {
+			g_curl.setopt(h, CS_CURLOPT_REDIR_PROTOCOLS, CS_CURLPROTO_HTTP_HTTPS);
+		}
+		g_curl.setopt(h, CS_CURLOPT_FOLLOWLOCATION, bearer != NULL ? 0L : 1L);
+		g_curl.setopt(h, CS_CURLOPT_MAXREDIRS, 5L);
+		g_curl.setopt(h, CS_CURLOPT_WRITEFUNCTION, curl_dl_body);
+		g_curl.setopt(h, CS_CURLOPT_WRITEDATA, (void *)&c);
+		g_curl.setopt(h, CS_CURLOPT_XFERINFOFUNCTION, curl_dl_xferinfo);
+		g_curl.setopt(h, CS_CURLOPT_XFERINFODATA, (void *)&c);
+		g_curl.setopt(h, CS_CURLOPT_NOPROGRESS, 0L);
+
+		char host[256];
+		url_host(cur, host, sizeof(host));
+		const bool send_token =
+		    bearer != NULL && strncmp(cur, "https://", 8) == 0 && strcasecmp(host, origin_host) == 0;
+		struct curl_slist *hdrs = NULL;
+		if (send_token) {
+			char line[U_CREDENTIAL_SECRET_MAX + 32];
+			(void)snprintf(line, sizeof(line), "Authorization: Bearer %s", bearer);
+			hdrs = g_curl.slist_append(NULL, line); // libcurl copies (and later frees, not wipes) it
+			u_credential_wipe(line, sizeof(line));
+			if (hdrs == NULL) {
+				g_curl.cleanup(h);
+				return CONV_STORE_BLOB_NETWORK;
+			}
+			g_curl.setopt(h, CS_CURLOPT_HTTPHEADER, hdrs);
+		}
+		rc = g_curl.perform(h);
+		status = 0;
+		(void)g_curl.getinfo(h, CS_CURLINFO_RESPONSE_CODE, &status);
+		const bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+		char next[2048];
+		next[0] = '\0';
+		if (rc == CS_CURLE_OK && redirect && bearer != NULL) {
+			const char *loc = NULL;
+			(void)g_curl.getinfo(h, CS_CURLINFO_REDIRECT_URL, &loc);
+			cpy(next, sizeof(next), loc);
+		}
+		g_curl.cleanup(h);
+		if (hdrs != NULL) {
+			g_curl.slist_free(hdrs);
+		}
+		c.h = NULL;
+		if (next[0] == '\0') {
+			break;
+		}
+		cpy(cur, sizeof(cur), next);
+	}
+	if (c.cancelled) {
+		return CONV_STORE_BLOB_CANCELLED;
+	}
+	if (c.fail != CONV_STORE_BLOB_OK) {
+		return c.fail;
+	}
+	if (rc != CS_CURLE_OK) {
+		U_LOG_W("[conv-store] %s: %s", url, g_curl.strerror != NULL ? g_curl.strerror(rc) : "transfer failed");
+		return CONV_STORE_BLOB_NETWORK;
+	}
+	if (status == 401 || status == 403) {
+		U_LOG_W("[conv-store] %s: HTTP %ld (the credential was refused or is missing)", url, status);
+		return bearer != NULL ? CONV_STORE_BLOB_AUTH : CONV_STORE_BLOB_NETWORK;
+	}
+	if (status != 200) {
+		U_LOG_W("[conv-store] %s: HTTP %ld", url, status);
+		return CONV_STORE_BLOB_NETWORK;
+	}
+	return CONV_STORE_BLOB_OK;
+}
 #endif
 
 static enum conv_store_blob_result
@@ -1406,13 +1725,10 @@ fetch_url(
 		}
 	}
 	enum conv_store_blob_result r = CONV_STORE_BLOB_NETWORK;
-#ifdef XRT_OS_WINDOWS
 	if (strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0) {
 		r = fetch_http(s, url, token[0] != '\0' ? token : NULL, k, x);
-	} else
-#endif
-	{
-		U_LOG_W("[conv-store] no downloader for %s on this platform", url);
+	} else {
+		U_LOG_W("[conv-store] no downloader for %s", url);
 	}
 	u_credential_wipe(token, sizeof(token));
 	return r;
