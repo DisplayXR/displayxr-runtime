@@ -1260,7 +1260,11 @@ vk_conv_weave_host_plan(struct vk_conv_weave *w,
 		st->used_this_frame = true;
 	}
 
-	// 2. The latest result, exported as an IOSurface, or 3. flat (batch).
+	// 2. The latest result, exported as an IOSurface, or 3. flat (batch). It was
+	// published only after a host-side fence wait on the Vulkan work that wrote
+	// it (vk_conv_gpu.c cmd_submit_wait); the pin taken here is released only by
+	// vk_conv_weave_complete, which the Metal engine calls after its command
+	// buffer's waitUntilCompleted.
 	struct conv_result res;
 	struct vk_conv_gpu_image_ref ref;
 	memset(&res, 0, sizeof(res));

@@ -1141,6 +1141,8 @@ Still open:
   cursor, so `drawnLiftMask` stays 0 there, which is the spec's "not drawn" answer.
 - A GPU → GPU snapshot once a POSIX provider takes GPU inputs. The zero-copy step (E) removes
   the GPU → host → CPU snapshot copy that POSIX lifted weave rects make today.
+- MTLSharedEvent import removes the host stall. Today the glue's host fence wait before publish
+  is what orders the Vulkan result write before the Metal backend's read.
 - Validation on the Linux targets (an Intel integrated GPU on Mesa first, proprietary drivers
   second) and lavapipe in CI.
 

@@ -930,6 +930,9 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 		const bool gpu_ok = [cmd status] == MTLCommandBufferStatusCompleted;
 		// The weave (and every lifted rect in it) is done: the copies are handed
 		// over, snapshots go to their streams, profiles are read, pins drop.
+		// This -- after waitUntilCompleted -- is the ONLY place a frame's result
+		// pins are released (vk_conv_weave_complete); a detach waits for it
+		// (comp_multi_weave_set_lift_ops).
 		if (lifting) {
 			const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
 			comp_multi_weave_metal_lift_frame_done(wm->lift, &pl, gpu_ok);
