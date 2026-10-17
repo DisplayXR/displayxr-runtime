@@ -838,6 +838,20 @@ So position and size are always this frame's, and only the depth is one conversi
 A v6 frame carrying lift rects never takes the zero-copy path (the service writes into its crop
 copy, never the caller's texture).
 
+**Platforms.**
+
+| Service | Lifted weave rects |
+|---|---|
+| Windows (D3D11 service) | yes |
+| macOS, Vulkan weave backend (`DXR_WEAVE_MAC_BACKEND=vk`, or `auto` with a plug-in that exports a Vulkan DP) | yes. The snapshot reaches a CPU-lane provider through host memory; same policy as Windows |
+| macOS, Metal weave backend | not yet: `lift_weave_rects` is refused and the rect is woven as drawn |
+| desktop Linux (the Vulkan weave engine) | yes (same code as macOS Vulkan; not yet run on hardware) |
+
+On macOS and Linux a spec-3 SBS or NVIEW stream (`xrCreateLiftStreamDXR`) is available for lifted
+weave rects only. Its own `xrSubmitLiftFrameDXR` input and its result export are D3D11 textures,
+which those services cannot serve, so `xrGetLiftPropertiesDXR` reports SBS and NVIEW only, and
+only once a weave engine can lift.
+
 **Wire.** The lifted-rect set travels as its own IPC call (`lift_weave_rects`) immediately
 before the `weave_submit` it belongs to, on the same connection; the service consumes it with
 that one submit. The weave wire itself is byte-identical. A rect naming a stream the connection

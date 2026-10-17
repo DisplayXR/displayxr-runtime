@@ -13,6 +13,7 @@ says what attaches where, which transports are real, and how the CPU lane fits i
 |---|---|---|
 | S5 stage | `vk_conv/vk_conv_viewsyn.{c,h}` + `vk_conv/shaders/conv_viewsyn_*.comp` | Port of the D3D11 stage, pass for pass, as GLSL compute shaders. It only records into the caller's command buffer: it owns no queue, takes no lock, and logs nothing per frame. |
 | GPU glue | `vk_conv/vk_conv_gpu.{c,h}` | Allocation, CPU ↔ image copies, the S5 adapter and S6 readback, on a borrowed `vk_bundle` |
+| Weave-rect helper | `vk_conv/vk_conv_weave.{c,h}` | Lifted weave rects (XR_DXR_lift §6) recorded into a weave engine's command buffer: snapshot, letterbox measurement, the pinned result drawn into the rect. See [Lifted weave rects](#lifted-weave-rects-step-c). |
 | Service attach | `ipc/server/ipc_server_conv_vk.c` | Creates the glue on the system compositor's Vulkan device once `init_all` has created the compositor, and installs it with `ipc_server_conv_install_gpu`. Detaches in `teardown_all` before the compositor is destroyed. |
 
 On macOS and desktop Linux the service's system compositor is the multi system compositor over
@@ -52,8 +53,6 @@ POSIX.
 Not installed yet:
 
 - A GPU client transport (textures and fences to the app). The client gets CPU bytes only.
-- The weave-rect bridge and the per-DP eyes sink (step C). Until they land, core streams read
-  the nominal viewer.
 - The `dp-lift` backend, because the display plug-in's lift slots are D3D11-only.
 
 ## Memory kinds: what is real
@@ -137,3 +136,84 @@ Two deliberate deviations from the D3D11 stage:
    format therefore works, and an SRGB target is encoded on the blit, as a D3D11 SRGB RTV is.
 
 Colour is always sampled through a UNORM view. That is the stage contract, for browser parity.
+
+## Lifted weave rects (step C)
+
+A weave client (the DisplayXR Browser) flags a weave rect "lift me" with
+`XrWeaveSubmitLiftRectsDXR`. The wire is the one Windows uses. On macOS (the Vulkan weave
+backend) and desktop Linux the service lifts it with `vk_conv_weave`, following the D3D11
+service's policy.
+
+### Wiring
+
+| Piece | File | Role |
+|---|---|---|
+| Bridge | `ipc_server_conv_vk.c` | Resolves a weave client's wire stream id, a core-routed v3 id carrying `IPC_SERVER_CONV_STREAM_TAG`, to its core stream for that connection only (`ipc_server_conv_resolve_stream`). Passes spec 4's "match the weave" view count on (`ipc_server_conv_v4_match_weave`). |
+| Spec-3 streams | `ipc_server_conv.c` | Under the CPU route (`cpu_only`) spec 3 stays off, except for SBS and NVIEW stream create and properties once the helper is attached (`ipc_server_conv_set_weave_rects`). Such a stream is fed only by lifted rects and read only by the weave. Its properties report SBS and NVIEW only. |
+| Ops seam | `multi/comp_multi_weave_lift.{c,h}` | comp_multi is linked into the runtime client too, so it never links the conversion core. The IPC layer installs the helper's ops table (`comp_multi_weave_set_lift_ops`). The handler forwards `lift_weave_rects` to `comp_multi_weave_lift_set_rects`, which refuses a stream that is not an SBS or NVIEW stream of the connection, and refuses on the Metal backend. |
+| Per-DP eyes sink | `comp_multi_set_conv_eyes_sink` → `ipc_server_conv_eyes_publish` / `_retire` | Every eye query comp_multi answers publishes the answering DP's eyes, keyed by the DP's address. That covers `multi_compositor_get_predicted_eye_positions` and each weave submit's eyes. A destroyed session DP or weave DP retires its key. A lifted rect's frame names the weave engine's DP, so its stream reads that DP's eyes, not the nominal viewer. |
+| Engines | `comp_multi_weave_linux.c`, `comp_multi_weave_macos_vk.c` | Take the set at the top of each submit (one set, one submit), `begin` before recording, `record` per lifted rect, `complete` once the weave's fence has signalled. |
+
+Detach order: no new spec-3 streams, ops cleared (this waits for calls in flight), eyes sink
+cleared, then the helper is destroyed. Destroying it idles the main queue and drops pins and
+pending snapshots while the core's streams still exist. The glue teardown follows.
+
+### Per lifted rect
+
+1. **Snapshot.**
+   - The source is the rect's 2D frame: the input in the batch layout, tile 0 of the crop in v6.
+     A v6 frame with lifted rects never takes the zero-copy path.
+   - The letterbox-cropped active area is blitted into a staging chain and capped to the
+     `DXR_LIFT_MAX_INPUT_EDGE` long edge (default 1920, `u_lift_cap_dims`). Halving `LINEAR`
+     blits do the downsample; a 2x step is an exact 2x2 box and samples nothing outside the
+     rect. The final image is RGBA8 UNORM, copied to a host buffer in the engine's command
+     buffer.
+   - Once the frame completes, the pixels go into the stream's input slot. Begin, copy and
+     commit happen in one call, so no slot is held across frames. The frame carries the D3D11
+     path's sticky options, explicit viewpoints, view control, rig, the rect's display-space
+     frame, the eyes DP and the active fractions.
+   - POSIX providers run on the CPU lane, so this is GPU → host → slot, not GPU → GPU. A GPU
+     slot is filled with `vk_conv_gpu_write` from the same buffer.
+2. **Letterbox.** The 96 sampled columns and rows of the whole rect, bars included, are copied to
+   a second buffer. On completion `u_lift_letterbox_profile_from_lines` reduces them on the CPU.
+   It produces bucket for bucket the profile of the D3D11 reduction shader (pinned by
+   `tests_lift_mailbox`), and feeds `u_lift_letterbox_update`.
+3. **Result.**
+   - The stream's latest GPU result (an S5 render target or a #2030 mirror) is pinned until the
+     frame completes.
+   - Each needed view is copied raw into a UNORM staging image, so an `_SRGB` result stays
+     encoded. It is then stretched into the rect's active area of each tile.
+   - Batch layout: the middle stereo pair, and the bars are the 2D input, flat in both tiles.
+     v6: view *v* → tile *v*, proportionally when the counts differ.
+   - Until the first result the batch layout writes the 2D frame into both tiles (flat). v6
+     leaves the caller's tiles as drawn.
+
+A submit without lifted rects records exactly what it recorded before.
+
+### Service log lines (greppable)
+
+INFO lines, at most once per stream per change (never per frame). They need the service's log
+level at `info`, for example `XRT_LOG=info`:
+
+| When | Line |
+|---|---|
+| A snapshot is committed, first time and on each extent change | `lift rect: stream 0x<id> snapshot <w>x<h> (cap <n>)` (`<w>x<h>` after crop and cap; `<n>` = the long-edge cap, 0 = uncapped) |
+| A result is first woven into the rect, and again on a result extent or view-count change | `lift rect: stream 0x<id> woven <W>x<H> views <n>` (`<W>x<H>` = the result image, views side by side) |
+| A stage fails (logged once until it recovers) | `lift rect: stream 0x<id> failed: <stage>`, where `<stage>` is `resolve` (the stream is gone), `slot` (both input slots busy, latest wins), `copy` or `commit` |
+| The rect names no core-routed stream of the connection | `lift rect: stream 0x<id> failed: resolve (not a core-routed stream of this connection); woven flat` |
+
+Plus WARNs, once per change, as on Windows: `[lift] stream 0x<id>: letterbox crop ...`, and the
+non-default `DXR_LIFT_MAX_INPUT_EDGE` / `DXR_LIFT_LETTERBOX=0` at attach. At attach the service
+logs `[conv] Vulkan glue: lifted weave rects on`.
+
+### Validated
+
+- On a developer Mac (MoltenVK, the vk backend):
+  - `tests_conv_vk_gpu "[weave_rects]"`: flat first, then a 1920x800 snapshot of a 2400x1000
+    rect, the result in both tiles and nothing written outside the rect. The letterbox crop then
+    settles to a 1920x640 snapshot and the bars are woven flat.
+  - `weave_probe_vk_macos --lift` against a service with `DXR_CONV_SIM_CONVERSION_ENABLE=1`.
+- The desktop-Linux engine shares the helper but has only been syntax-checked; it has not run.
+- The macOS Metal backend refuses lifted rects (TODO in `comp_multi_weave_macos_metal.m`).
+- No POSIX weave engine draws a cursor, so `drawnLiftMask` stays 0. That is the spec's "not
+  drawn" answer.
