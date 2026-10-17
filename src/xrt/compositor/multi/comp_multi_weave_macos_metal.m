@@ -801,6 +801,7 @@ mtlb_fini(struct multi_compositor *mc)
 		// The DP first: a vendor DP destroys its weaver (created on our device +
 		// queue) before its own SDK instance, and both must go before the queue.
 		if (mc->weave.dp_metal != NULL) {
+			comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp_metal); // roadmap §5.2
 			xrt_display_processor_metal_destroy(&mc->weave.dp_metal);
 		}
 		if (wm == NULL) {
@@ -824,6 +825,11 @@ mtlb_fini(struct multi_compositor *mc)
 const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_metal = {
     .name = "metal",
     .feeds_present_origin = true,
+    // TODO(lift rects, step C): lift on the Metal backend too -- wrap the
+    // results' IOSurface export (XRT_CONV_MEM_IOSURFACE, vk_conv_gpu) as
+    // MTLTextures and read the snapshot back through a shared MTLBuffer. Until
+    // then comp_multi_weave_lift_set_rects refuses rects here (woven as drawn).
+    .lifts_rects = false,
     .ensure_engine = mtlb_ensure_engine,
     .import_input = mtlb_import_input,
     .release_input = mtlb_release_input,
