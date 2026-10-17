@@ -364,6 +364,18 @@ conv_core_stream_release(struct conv_core *core, uint64_t stream_id, uint32_t ri
 xrt_result_t
 conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct conv_stream_stats *out);
 
+/*!
+ * The import kinds of @p stream_id's bound capability (a composed binding:
+ * its depth stage's) -- what the allocator is asked for when the stream's
+ * INPUT images are (re)allocated (ADR-053 P5 step E: a producer picks a GPU
+ * -> GPU copy when the slot will be a GPU image). False = no such stream.
+ */
+bool
+conv_core_stream_input_kinds(struct conv_core *core,
+                             uint64_t stream_id,
+                             uint32_t *out_memory_kinds,
+                             uint32_t *out_sync_kinds);
+
 
 /*
  *

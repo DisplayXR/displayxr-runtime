@@ -1710,6 +1710,28 @@ conv_core_stream_release(struct conv_core *core, uint64_t stream_id, uint32_t ri
 	os_mutex_unlock(&core->streams_mtx);
 }
 
+bool
+conv_core_stream_input_kinds(struct conv_core *core,
+                             uint64_t stream_id,
+                             uint32_t *out_memory_kinds,
+                             uint32_t *out_sync_kinds)
+{
+	*out_memory_kinds = 0;
+	*out_sync_kinds = 0;
+	os_mutex_lock(&core->streams_mtx);
+	struct conv_stream *st = find_locked(core, stream_id);
+	const bool found = st != NULL;
+	struct conv_binding b;
+	if (found) {
+		b = st->bind;
+	}
+	os_mutex_unlock(&core->streams_mtx);
+	if (found) {
+		bound_import_kinds(core, &b, out_memory_kinds, out_sync_kinds);
+	}
+	return found;
+}
+
 xrt_result_t
 conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct conv_stream_stats *out)
 {

@@ -44,6 +44,8 @@
 #include <stdlib.h>
 #endif
 #ifdef XRT_OS_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
@@ -198,6 +200,32 @@ oxr_conv_link_get(struct oxr_session *sess)
 void
 oxr_conv_session_image_kinds(struct oxr_session *sess, uint64_t *out_in_kinds, uint64_t *out_export_kinds)
 {
+	oxr_conv_session_image_kinds_offer(sess, out_in_kinds, out_export_kinds);
+#ifndef XRT_OS_WINDOWS
+	// Step E: a GPU kind only once the service reported it takes / gives it.
+	const uint64_t cpu = 1ull << XR_LIFT_IMAGE_KIND_CPU_DXR;
+	*out_in_kinds &= cpu | sess->lift_service_in_kinds;
+	*out_export_kinds &= cpu | sess->lift_service_export_kinds;
+#endif
+}
+
+void
+oxr_conv_learn_service_kinds(struct oxr_session *sess, uint64_t in_kinds, uint64_t export_kinds)
+{
+#ifndef XRT_OS_WINDOWS
+	const uint64_t cpu = 1ull << XR_LIFT_IMAGE_KIND_CPU_DXR;
+	sess->lift_service_in_kinds = in_kinds & ~cpu;
+	sess->lift_service_export_kinds = export_kinds & ~cpu;
+#else
+	(void)sess;
+	(void)in_kinds;
+	(void)export_kinds;
+#endif
+}
+
+void
+oxr_conv_session_image_kinds_offer(struct oxr_session *sess, uint64_t *out_in_kinds, uint64_t *out_export_kinds)
+{
 	*out_in_kinds = 0;
 	*out_export_kinds = 0;
 	const uint64_t cpu = 1ull << XR_LIFT_IMAGE_KIND_CPU_DXR;
@@ -224,6 +252,40 @@ oxr_conv_session_image_kinds(struct oxr_session *sess, uint64_t *out_in_kinds, u
 		*out_in_kinds = cpu;
 		*out_export_kinds = cpu;
 	}
+	// ADR-053 P5 step E: an in-process Vulkan session can hand its own images
+	// in and import results as the platform's GPU kind -- an IOSurface
+	// (VK_EXT_metal_objects) on macOS; an OPAQUE_FD allocation or a dma-buf
+	// (VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf) on Linux.
+	// Results leave as OPAQUE_FD only: XrLiftResultExportDXR cannot describe a
+	// dma-buf's modifier / stride. The service masks what its glue takes.
+	if (session_is_inprocess(sess) && sess->is_vk_native_compositor && oxr_conv_inprocess_eligible(sess)) {
+#if defined(XRT_OS_MACOS)
+		*out_in_kinds |= 1ull << XR_LIFT_IMAGE_KIND_IOSURFACE_DXR;
+		*out_export_kinds |= 1ull << XR_LIFT_IMAGE_KIND_IOSURFACE_DXR;
+#elif defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+		*out_in_kinds |= (1ull << XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR) | (1ull << XR_LIFT_IMAGE_KIND_DMABUF_DXR);
+		*out_export_kinds |= 1ull << XR_LIFT_IMAGE_KIND_OPAQUE_FD_DXR;
+#endif
+	}
+#endif
+}
+
+bool
+oxr_conv_iosurface_extent(void *iosurface, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+#if defined(XRT_OS_MACOS)
+	IOSurfaceRef s = (IOSurfaceRef)iosurface;
+	if (s == NULL || CFGetTypeID(s) != IOSurfaceGetTypeID()) {
+		return false;
+	}
+	*out_w = (uint32_t)IOSurfaceGetWidth(s);
+	*out_h = (uint32_t)IOSurfaceGetHeight(s);
+	return *out_w > 0 && *out_h > 0;
+#else
+	(void)iosurface;
+	return false;
 #endif
 }
 

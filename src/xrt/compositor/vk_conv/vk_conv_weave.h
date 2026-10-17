@@ -36,9 +36,11 @@
  *     both tiles; v6 leaves the caller's identical tiles as drawn.
  *
  * Providers on POSIX run on the CPU lane (vk_conv_gpu.h), so a stream's input
- * slot is CPU memory: the snapshot is GPU -> host buffer -> slot. A GPU slot
- * (a provider kind raised with vk_conv_gpu_set_provider_kinds) is filled from
- * the same host buffer through vk_conv_gpu_write, synchronously, at completion.
+ * slot is CPU memory: the snapshot is GPU -> host buffer -> slot. When the
+ * stream's binding takes a GPU kind the glue would give its slot (a provider
+ * kind raised with vk_conv_gpu_set_provider_kinds; ADR-053 P5 step E) no host
+ * copy is recorded: at completion the glue copies the chain's last image into
+ * the GPU slot (vk_conv_gpu_copy_from_vk), synchronously.
  * Results are GPU images on the same device (S5 render targets, #2030
  * mirrors), sampled in place.
  *
@@ -54,10 +56,12 @@
  * draw itself, and once its GPU work completed hands its CPU-visible copies
  * over with vk_conv_weave_host_done, then calls complete as usual. The result
  * is reachable only as the IOSurface the glue exported it as (a device-private
- * or layered result is woven flat, "failed: export"); the glue publishes a
- * result only after its own GPU work on it finished (SYNC_NONE, "producer
- * finished before hand-over"), and the pin keeps the provider off it until
- * complete, so the engine needs no cross-API semaphore.
+ * or layered result is woven flat, "failed: export"). On macOS the glue hands
+ * an S5 result over asynchronously: the plan names the MTLSharedEvent value
+ * its Vulkan write signals (result_event), and the engine encodes a GPU wait
+ * on it before sampling; a result planned without an event was complete
+ * before it was published (SYNC_NONE). The pin keeps the provider off it until
+ * complete.
  *
  * Threads: a client's calls come from its IPC thread under the engine's lock;
  * clients are independent. Never logs per frame.
@@ -189,6 +193,14 @@ struct vk_conv_weave_host_plan
 	//! The result view of weave tile v (batch: the middle stereo pair; v6:
 	//! proportional), for v < min(views, XRT_CONV_MAX_VIEWS).
 	uint32_t tile_view[XRT_CONV_MAX_VIEWS];
+	/*!
+	 * ADR-053 P5 step E: the result's Vulkan write completes when this
+	 * id<MTLSharedEvent> reaches @ref result_event_value -- encode a GPU wait
+	 * on it before sampling the result (NULL: complete when planned, the
+	 * glue's SYNC_NONE hand-over). The glue owns it; valid until complete.
+	 */
+	void *result_event;
+	uint64_t result_event_value;
 };
 
 //! A host client's frame completed (vk_conv_weave_host_done), per planned stream.

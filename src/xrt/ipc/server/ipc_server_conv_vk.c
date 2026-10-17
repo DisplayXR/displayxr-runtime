@@ -38,10 +38,15 @@
  *    twin): every eye query comp_multi answers publishes the answering DP's
  *    eyes into the core keyed by that DP; a destroyed DP retires its key.
  *
+ *  - step E (the client GPU kinds): the same set_gpu call lends the CPU table
+ *    the glue's transport -- a client IOSurface (macOS) / OPAQUE_FD / dma-buf
+ *    (Linux) imported into the input slot, results exported as an IOSurface /
+ *    OPAQUE_FD image -- and the kinds behind it, which the service then lists
+ *    beside CPU in imageKinds / exportKinds.
+ *
  * Not installed:
  *
- *  - the `dp-lift` backend: the display plug-in's lift slots are D3D11-only;
- *  - a GPU client transport (textures + fences to the app): CPU bytes only.
+ *  - the `dp-lift` backend: the display plug-in's lift slots are D3D11-only.
  *
  * Detach runs in teardown_all BEFORE the system compositor (and its Vulkan
  * bundle) is destroyed.
@@ -54,6 +59,7 @@
 #include "server/ipc_server_conv_cpu.h"
 
 #include "conversion/conv_core.h"
+#include "conversion/conv_stream.h"
 
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_weave_lift.h"
@@ -110,6 +116,34 @@ gpu_read(void *ud, const struct xrt_conv_image *src, void *pixels, uint32_t row_
 	return vk_conv_gpu_read((struct vk_conv_gpu *)ud, src, pixels, row_pitch);
 }
 
+//! Step E: a client GPU image (the transport's handles, borrowed) -> the slot image.
+static bool
+gpu_import_copy(void *ud, const struct conv_input_import *in, const struct xrt_conv_image *dst)
+{
+	return vk_conv_gpu_import_input((struct vk_conv_gpu *)ud, in, dst);
+}
+
+static bool
+gpu_export_alloc(
+    void *ud, uint32_t kind, uint32_t conv_fmt, uint32_t w, uint32_t h, uint64_t stream_id, struct xrt_conv_image *out)
+{
+	return vk_conv_gpu_export_alloc((struct vk_conv_gpu *)ud, kind, conv_fmt, w, h, stream_id, out);
+}
+
+static void
+gpu_export_free(void *ud, struct xrt_conv_image *img)
+{
+	struct conv_image_alloc_ops ops;
+	vk_conv_gpu_alloc_ops((struct vk_conv_gpu *)ud, &ops);
+	ops.free(ops.ud, img);
+}
+
+static bool
+gpu_copy(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	return vk_conv_gpu_copy((struct vk_conv_gpu *)ud, src, dst);
+}
+
 void
 ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 {
@@ -146,14 +180,29 @@ ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc)
 	struct vk_conv_gpu_caps caps;
 	vk_conv_gpu_get_caps(g_conv_vk.glue, &caps);
 	U_LOG_W(
-	    "[conv] Vulkan glue attached: memory kinds 0x%x (CPU%s%s%s), sync kinds 0x%x; providers on the CPU lane",
+	    "[conv] Vulkan glue attached: memory kinds 0x%x (CPU%s%s%s), sync kinds 0x%x; providers on the CPU lane; "
+	    "S5 hand-over: %s",
 	    caps.memory_kinds, (caps.memory_kinds & XRT_CONV_MEM_VK_OPAQUE_FD) != 0 ? " OPAQUE_FD" : "",
 	    (caps.memory_kinds & XRT_CONV_MEM_DMABUF) != 0 ? " DMABUF" : "",
-	    (caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? " IOSURFACE" : "", caps.sync_kinds);
+	    (caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? " IOSURFACE" : "", caps.sync_kinds,
+	    caps.async_s5 ? "MTLSharedEvent (GPU wait, no host wait before publish)" : "host wait before publish");
 
 	// The copies first: by the time GPU results can exist, the CPU table can export them.
-	struct ipc_server_conv_cpu_gpu copies = {gpu_write, gpu_read, g_conv_vk.glue};
+	struct ipc_server_conv_cpu_gpu copies;
+	memset(&copies, 0, sizeof(copies));
+	copies.write = gpu_write;
+	copies.read = gpu_read;
+	copies.ud = g_conv_vk.glue;
+	// Step E: the client GPU kinds (IOSurface on macOS; OPAQUE_FD / dma-buf on Linux).
+	copies.import_kinds = vk_conv_gpu_import_kinds(g_conv_vk.glue);
+	copies.export_kinds = vk_conv_gpu_export_kinds(g_conv_vk.glue);
+	copies.import_copy = gpu_import_copy;
+	copies.export_alloc = gpu_export_alloc;
+	copies.export_free = gpu_export_free;
+	copies.copy = gpu_copy;
 	ipc_server_conv_cpu_io_set_gpu(&copies);
+	U_LOG_W("[conv] Vulkan glue: client GPU kinds in 0x%x, out 0x%x (XRT_CONV_MEM_*; CPU always)",
+	        copies.import_kinds, copies.export_kinds);
 	ipc_server_conv_install_gpu(sc, &gpu);
 
 	// Step C: the per-DP eyes sink, then lifted weave rects.

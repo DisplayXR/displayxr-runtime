@@ -14,6 +14,7 @@
 
 #include "comp_multi_weave_metal_lift.h"
 
+#include "os/os_time.h"
 #include "util/u_lift_mailbox.h"
 #include "util/u_logging.h"
 
@@ -463,7 +464,33 @@ comp_multi_weave_metal_lift_record(struct comp_multi_weave_metal_lift *ml,
 			}
 		}
 
-		// 2. One pass into the destination: results (or flat), bars.
+		// 2. The results' Vulkan writes (an asynchronous S5 hand-over, step E)
+		// finish before the pass below samples them: a GPU wait on the glue's
+		// shared event, never a host stall. ORDER: this wait is encoded on the
+		// command buffer BEFORE step 3's render encoder, the first and only
+		// place a result texture is sampled. The pins taken in step 1's plans
+		// are NOT released here: they drop only in vk_conv_weave_complete,
+		// called after [cmd waitUntilCompleted] (comp_multi_weave_macos_metal.m,
+		// the #2200 rule) -- step E moved the publish point, not the release.
+		for (uint32_t i = 0; i < ml->entry_count; i++) {
+			const struct mlift_entry *e = &ml->entries[i];
+			if (e->result_tex == nil || e->plan.result_event == NULL) {
+				continue;
+			}
+			id<MTLSharedEvent> ev = (id<MTLSharedEvent>)e->plan.result_event;
+			if (ev.device == ml->device) {
+				[cmd encodeWaitForEvent:ev value:e->plan.result_event_value];
+			} else {
+				// Another device's event cannot be encoded here: wait on the host,
+				// bounded (the Vulkan submit was already made when it was planned).
+				const uint64_t until = os_monotonic_get_ns() + 100ull * 1000ull * 1000ull;
+				while (ev.signaledValue < e->plan.result_event_value && os_monotonic_get_ns() < until) {
+					os_nanosleep(200 * 1000);
+				}
+			}
+		}
+
+		// 3. One pass into the destination: results (or flat), bars.
 		if (ml->entry_count > 0) {
 			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
 			rp.colorAttachments[0].texture = dst;

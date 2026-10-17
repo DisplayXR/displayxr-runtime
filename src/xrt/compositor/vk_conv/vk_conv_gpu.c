@@ -37,6 +37,8 @@
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
+#include <objc/message.h> // -[MTLSharedEvent signaledValue] at init (async S5 capability check)
+#include <objc/runtime.h>
 #endif
 
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD) || defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
@@ -44,6 +46,7 @@
 #endif
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -72,6 +75,9 @@ struct vkc_img
 	uint64_t drm_modifier;
 	uint32_t row_stride; //!< DMABUF plane 0 stride
 	bool foreign;        //!< DMABUF: owned by VK_QUEUE_FAMILY_FOREIGN_EXT between glue accesses
+	//! macOS: the S5 timeline value whose signal completes the last S5 write
+	//! of this image (0 = never written by an async S5; tab_mtx).
+	uint64_t event_value;
 };
 
 //! Per-stream glue state: scratch for CPU images the S5 stage reads / writes, and S6.
@@ -105,6 +111,47 @@ struct vkc_sem
 	VkSemaphore sem;
 };
 
+//! A client image imported for one copy (work_mtx held); ext_free releases it.
+struct vkc_ext
+{
+	VkImage image;
+	VkDeviceMemory mem;
+	VkFormat format;
+	uint32_t w, h;
+	uint32_t kind;
+	bool cached; //!< owned by the import cache: ext_free leaves it
+	bool primed; //!< used before: left in GENERAL by the last copy (a cached IOSurface)
+};
+
+/*!
+ * Imported client IOSurfaces, by IOSurfaceID (an app submits the same few
+ * surfaces every frame; importing one costs a VkImage + an MTLTexture
+ * import). The cached image's MTLTexture retains its IOSurface, so the ID
+ * cannot be reused while it is cached; an entry unused for
+ * VKC_EXT_CACHE_IDLE_NS is dropped (and the app's surface with it).
+ */
+#define VKC_EXT_CACHE_SIZE 4u
+#define VKC_EXT_CACHE_IDLE_NS (2ull * 1000ull * 1000ull * 1000ull)
+struct vkc_ext_cache_entry
+{
+	uint64_t key; //!< IOSurfaceID; 0 = empty
+	uint32_t format;
+	uint64_t last_use_ns;
+	struct vkc_ext e;
+};
+
+
+//! Waits a submit carries (imported sync of the images it reads).
+#define VKC_MAX_WAITS 4u
+struct vkc_waits
+{
+	uint32_t count;
+	VkSemaphore sem[VKC_MAX_WAITS];
+	uint64_t value[VKC_MAX_WAITS];
+	bool timeline[VKC_MAX_WAITS];
+	bool temp[VKC_MAX_WAITS]; //!< destroy after the submit (SYNC_FD imports)
+};
+
 struct vk_conv_gpu
 {
 	struct vk_bundle *vk;
@@ -135,18 +182,38 @@ struct vk_conv_gpu
 	struct vkc_sem *sems;
 	struct vk_conv_viewsyn *viewsyn;
 	bool viewsyn_tried;
+
+	//! Client transport scratch (work_mtx): a raw (UNORM) copy of an _SRGB
+	//! source, and the blit target of a copy into a CPU slot.
+	struct vkc_img *x_raw, *x_cpu;
+	//! Client IOSurfaces already imported (work_mtx).
+	struct vkc_ext_cache_entry ext_cache[VKC_EXT_CACHE_SIZE];
+	//! Copies made, by direction (work_mtx).
+	struct vk_conv_gpu_stats stats;
+
+	/*!
+	 * @name The asynchronous S5 hand-over (macOS, step E)
+	 *
+	 * With a timeline semaphore MoltenVK exports as an MTLSharedEvent, an S5
+	 * render into a glue image returns once SUBMITTED: it signals @ref s5_sem
+	 * to the image's event_value, and the result is published without a host
+	 * wait. A Metal reader (the Metal weave backend) waits on the event on its
+	 * GPU (vk_conv_gpu_image_ref::mtl_shared_event); every Vulkan reader is on
+	 * the same queue, later in submission order. At most one such submit is
+	 * in flight: the next glue call retires it (work_lock) before it touches
+	 * the stage, the descriptor sets or an image.
+	 * @{
+	 */
+	VkSemaphore s5_sem;
+	void *s5_event; //!< id<MTLSharedEvent>, owned by s5_sem
+	uint64_t s5_value;
+	VkFence async_fence;
+	VkCommandBuffer async_cmd;
+	struct vkc_waits async_waits;
+	bool async_pending;
+	//! @}
 };
 
-//! Waits a submit carries (imported sync of the images it reads).
-#define VKC_MAX_WAITS 4u
-struct vkc_waits
-{
-	uint32_t count;
-	VkSemaphore sem[VKC_MAX_WAITS];
-	uint64_t value[VKC_MAX_WAITS];
-	bool timeline[VKC_MAX_WAITS];
-	bool temp[VKC_MAX_WAITS]; //!< destroy after the submit (SYNC_FD imports)
-};
 
 
 /*
@@ -369,6 +436,32 @@ cmd_submit_wait(struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_waits *wa
 		waits_release(g, waits);
 	}
 	return ok;
+}
+
+//! Retire the asynchronous S5 submit, if any (work_mtx held): wait, free.
+static void
+async_retire_locked(struct vk_conv_gpu *g)
+{
+	if (!g->async_pending) {
+		return;
+	}
+	struct vk_bundle *vk = g->vk;
+	if (vk->vkWaitForFences(vk->device, 1, &g->async_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+		U_LOG_E("[conv] Vulkan glue: async S5 fence wait failed; leaking one command buffer");
+	} else {
+		cmd_free(g, g->async_cmd);
+		waits_release(g, &g->async_waits);
+	}
+	g->async_cmd = VK_NULL_HANDLE;
+	g->async_pending = false;
+}
+
+//! Take the work mutex with nothing asynchronous in flight.
+static void
+work_lock(struct vk_conv_gpu *g)
+{
+	os_mutex_lock(&g->work_mtx);
+	async_retire_locked(g);
 }
 
 //! Order this submit after every earlier queue operation on the glue's images.
@@ -938,6 +1031,9 @@ pick_kind(struct vk_conv_gpu *g,
 	return true;
 }
 
+static void
+img_publish(struct vk_conv_gpu *g, struct vkc_img *img, uint64_t stream_id, uint32_t cs, struct xrt_conv_image *out);
+
 static bool
 glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image *out)
 {
@@ -949,7 +1045,7 @@ glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image
 	    !pick_kind(g, req, layers, &kind, &private_ok) || !gate_enter(g)) {
 		return false;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = kind != 0 ? img_create(g, req->format, req->width, req->height, layers, kind) : NULL;
 	if (img == NULL && private_ok) {
 		img = img_create(g, req->format, req->width, req->height, layers, 0);
@@ -960,31 +1056,8 @@ glue_alloc(void *ud, const struct conv_image_request *req, struct xrt_conv_image
 		gate_leave(g);
 		return false;
 	}
-	img->stream_id = req->stream_id;
-	os_mutex_lock(&g->tab_mtx);
-	img->key = ++g->next_key; // bit 63 clear: disjoint from the service CPU allocator's keys
-	img->next = g->imgs;
-	g->imgs = img;
-	g->img_count++;
-	os_mutex_unlock(&g->tab_mtx);
-
-	memset(out, 0, sizeof(*out));
-	out->memory_kind = img->kind != 0                                         ? img->kind
-	                   : (g->caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? XRT_CONV_MEM_IOSURFACE
-	                                                                          : XRT_CONV_MEM_VK_OPAQUE_FD;
-	out->handle = img->handle;
-	out->import_key = img->key;
-	out->byte_size = img->byte_size;
-	out->width = img->w;
-	out->height = img->h;
-	out->format = req->format;
-	out->color_space = (req->role == 0 || req->role == XRT_CONV_OUT_VIEWS) ? XRT_CONV_CS_SRGB : XRT_CONV_CS_DATA;
-	out->row_stride = img->row_stride;
-	out->drm_modifier = img->drm_modifier;
-	out->adapter_luid = 0;
-	out->sync.kind = XRT_CONV_SYNC_NONE;
-	out->sync.handle = 0;
-	out->sync.import_key = img->key;
+	img_publish(g, img, req->stream_id,
+	            (req->role == 0 || req->role == XRT_CONV_OUT_VIEWS) ? XRT_CONV_CS_SRGB : XRT_CONV_CS_DATA, out);
 	gate_leave(g);
 	return true;
 }
@@ -996,7 +1069,7 @@ glue_free(void *ud, struct xrt_conv_image *img)
 	if (!is_glue_image(img) || !gate_enter(g)) {
 		return;
 	}
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	os_mutex_lock(&g->tab_mtx);
 	struct vkc_img **pp = &g->imgs;
 	while (*pp != NULL && (*pp)->key != img->import_key) {
@@ -1096,6 +1169,7 @@ record_upload(struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_img *img, c
 		copy_rows((uint8_t *)g->stage_map + layer_bytes * l, row_bytes,
 		          (const uint8_t *)pixels + (size_t)pitch * img->h * l, pitch, row_bytes, img->h);
 	}
+	g->stats.host_writes++;
 	img_acquire_foreign(g, cmd, img);
 	record_buffer_image(g->vk, cmd, g->stage_buf, img, true);
 	cmd_global_barrier(g->vk, cmd);
@@ -1129,6 +1203,7 @@ read_locked(struct vk_conv_gpu *g, struct vkc_img *img, void *pixels, uint32_t r
 	if (!stage_ensure(g, layer_bytes * img->layers) || !cmd_begin(g, &cmd)) {
 		return false;
 	}
+	g->stats.host_reads++;
 	cmd_global_barrier(g->vk, cmd);
 	img_acquire_foreign(g, cmd, img);
 	record_buffer_image(g->vk, cmd, g->stage_buf, img, false);
@@ -1151,7 +1226,7 @@ vk_conv_gpu_write(struct vk_conv_gpu *g, const struct xrt_conv_image *dst, const
 		return false;
 	}
 	bool ok = false;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, dst->import_key);
 	if (img != NULL) {
 		ok = write_locked(g, img, pixels, row_pitch);
@@ -1168,7 +1243,7 @@ vk_conv_gpu_read(struct vk_conv_gpu *g, const struct xrt_conv_image *src, void *
 		return false;
 	}
 	bool ok = false;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, src->import_key);
 	if (img != NULL) {
 		ok = read_locked(g, img, pixels, row_pitch);
@@ -1279,6 +1354,82 @@ scratch_ensure(struct vk_conv_gpu *g, struct vkc_img **slot, uint32_t conv_fmt, 
 	return s;
 }
 
+/*!
+ * Submit @p cmd signalling the S5 timeline to a new value and the async fence,
+ * without waiting (work_mtx held, nothing pending). @p target's event_value
+ * names that value. False = not submitted (the caller submits it the
+ * synchronous way); @p waits is moved into the async slot on success.
+ */
+static bool
+async_submit_locked(
+    struct vk_conv_gpu *g, VkCommandBuffer cmd, struct vkc_waits *waits, struct vkc_img *target, bool *out_ok)
+{
+	*out_ok = false;
+#ifdef VK_KHR_timeline_semaphore
+	struct vk_bundle *vk = g->vk;
+	if (vk->vkResetFences(vk->device, 1, &g->async_fence) != VK_SUCCESS) {
+		return false; // not consumed: the caller submits it the synchronous way
+	}
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		cmd_free(g, cmd);
+		waits_release(g, waits);
+		return true; // consumed, failed
+	}
+	const uint64_t value = g->s5_value + 1;
+	VkPipelineStageFlags stages[VKC_MAX_WAITS];
+	uint64_t wait_values[VKC_MAX_WAITS];
+	for (uint32_t i = 0; i < waits->count; i++) {
+		stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		wait_values[i] = waits->timeline[i] ? waits->value[i] : 0;
+	}
+	VkTimelineSemaphoreSubmitInfoKHR tl = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+	    .waitSemaphoreValueCount = waits->count,
+	    .pWaitSemaphoreValues = waits->count > 0 ? wait_values : NULL,
+	    .signalSemaphoreValueCount = 1,
+	    .pSignalSemaphoreValues = &value,
+	};
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .pNext = &tl,
+	    .waitSemaphoreCount = waits->count,
+	    .pWaitSemaphores = waits->count > 0 ? waits->sem : NULL,
+	    .pWaitDstStageMask = waits->count > 0 ? stages : NULL,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &g->s5_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	const VkResult r = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, g->async_fence);
+	vk_queue_unlock(vk->main_queue);
+	if (r != VK_SUCCESS) {
+		// Ended but never submitted: free it here, the waits go too.
+		cmd_free(g, cmd);
+		waits_release(g, waits);
+		U_LOG_E("[conv] Vulkan glue: async S5 submit failed (%d)", (int)r);
+		return true; // consumed, failed
+	}
+	g->s5_value = value;
+	g->async_cmd = cmd;
+	g->async_waits = *waits;
+	waits->count = 0;
+	g->async_pending = true;
+	g->stats.async_s5++;
+	os_mutex_lock(&g->tab_mtx);
+	target->event_value = value;
+	os_mutex_unlock(&g->tab_mtx);
+	*out_ok = true;
+	return true;
+#else
+	(void)g;
+	(void)cmd;
+	(void)waits;
+	(void)target;
+	return false;
+#endif
+}
+
 static bool
 glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 {
@@ -1287,7 +1438,7 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		return false;
 	}
 	struct vk_bundle *vk = g->vk;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	if (g->viewsyn == NULL && !g->viewsyn_tried) {
 		g->viewsyn_tried = true;
 		g->viewsyn = vk_conv_viewsyn_create(vk);
@@ -1401,7 +1552,18 @@ glue_viewsyn_render(void *ud, const struct conv_viewsyn_request *req)
 		img_release_foreign(g, cmd, d);
 		img_release_foreign(g, cmd, t);
 	}
-	if (cmd != VK_NULL_HANDLE) {
+	// macOS (step E): a recorded synthesis into a glue image is handed over
+	// asynchronously -- signalled on the shared event, retired by the next
+	// glue call -- so publishing it costs no host wait.
+	bool async_ok = false;
+	if (cmd != VK_NULL_HANDLE && ok && recorded && g->s5_sem != VK_NULL_HANDLE && !is_cpu_image(req->target) &&
+	    async_submit_locked(g, cmd, &waits, t, &async_ok)) {
+		cmd = VK_NULL_HANDLE; // consumed (owned by the async slot, or freed on failure)
+		ok = async_ok;
+		if (!async_ok) {
+			vk_conv_viewsyn_invalidate(g->viewsyn);
+		}
+	} else if (cmd != VK_NULL_HANDLE) {
 		// Submit even a failed recording: its uploads / barriers are harmless,
 		// and the command buffer must go back to the pool.
 		const bool submitted = cmd_submit_wait(g, cmd, &waits);
@@ -1449,7 +1611,7 @@ glue_rb_read(void *ud,
 		return false;
 	}
 	struct vk_bundle *vk = g->vk;
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	struct vkc_img *img = img_find(g, depth->import_key);
 	struct vkc_stream *s = NULL;
 	if (img != NULL) {
@@ -1567,6 +1729,910 @@ vk_conv_gpu_stage_ops(struct vk_conv_gpu *g, struct conv_viewsyn_ops *viewsyn, s
 
 /*
  *
+ * The client transport (step E): client images in, per-stream exports out.
+ *
+ */
+
+
+static void
+ext_free(struct vk_conv_gpu *g, struct vkc_ext *e)
+{
+	struct vk_bundle *vk = g->vk;
+	if (e->cached) {
+		memset(e, 0, sizeof(*e));
+		return; // the cache keeps it
+	}
+	if (e->image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, e->image, NULL);
+	}
+	if (e->mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, e->mem, NULL);
+	}
+	memset(e, 0, sizeof(*e));
+}
+
+static bool
+fmt_is_rgba8_family(uint32_t f)
+{
+	return f == XRT_CONV_FMT_RGBA8_UNORM || f == XRT_CONV_FMT_RGBA8_SRGB || f == XRT_CONV_FMT_BGRA8_UNORM ||
+	       f == XRT_CONV_FMT_BGRA8_SRGB;
+}
+
+static VkImageUsageFlags
+ext_usage(void)
+{
+	return VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+}
+
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
+/*!
+ * An IOSurface as a VkImage of @p format (the vk_create_image_from_native
+ * recipe: VkImportMetalIOSurfaceInfoEXT at create, then host-coherent memory,
+ * not dedicated, so MoltenVK's MTLTexture is Shared). The IOSurface is
+ * borrowed: the MTLTexture MoltenVK makes retains it for the image's life.
+ */
+static bool
+iosurface_image(struct vk_conv_gpu *g,
+                IOSurfaceRef surf,
+                VkFormat format,
+                uint32_t w,
+                uint32_t h,
+                VkImageCreateFlags flags,
+                VkImage *out_image,
+                VkDeviceMemory *out_mem,
+                uint64_t *out_size)
+{
+	struct vk_bundle *vk = g->vk;
+	*out_image = VK_NULL_HANDLE;
+	*out_mem = VK_NULL_HANDLE;
+	if (!vk->has_EXT_metal_objects || surf == NULL) {
+		return false;
+	}
+	VkExportMetalObjectCreateInfoEXT export_tex = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+	};
+	VkImportMetalIOSurfaceInfoEXT import_surf = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
+	    .pNext = &export_tex,
+	    .ioSurface = surf,
+	};
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &import_surf,
+	    .flags = flags,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = format,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = ext_usage(),
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	if (vk->vkCreateImage(vk->device, &ici, NULL, out_image) != VK_SUCCESS) {
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	// The memory is the IOSurface's MTLTexture, imported (the recipe
+	// tests_conv_vk_gpu proves byte-exact in both directions). Binding plain
+	// host-coherent memory instead (vk_create_image_from_native's recipe)
+	// leaves MoltenVK sampling a texture that reads back zeros here.
+	VkExportMetalTextureInfoEXT et = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+	    .image = *out_image,
+	    .plane = VK_IMAGE_ASPECT_PLANE_0_BIT, // the spec's value for a single-plane image (VUID-06799)
+	};
+	VkExportMetalObjectsInfoEXT eo = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+	    .pNext = &et,
+	};
+	vk->vkExportMetalObjectsEXT(vk->device, &eo);
+	VkMemoryMetalHandlePropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT};
+	uint32_t type = 0;
+	if (et.mtlTexture == NULL || vk->vkGetMemoryMetalHandlePropertiesEXT == NULL ||
+	    vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                                            et.mtlTexture, &mp) != VK_SUCCESS) {
+		vk->vkDestroyImage(vk->device, *out_image, NULL);
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	while (type < 32 && (mp.memoryTypeBits & (1u << type)) == 0) {
+		type++;
+	}
+	VkImportMemoryMetalHandleInfoEXT im = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	    .handle = et.mtlTexture,
+	};
+	VkMemoryDedicatedAllocateInfoKHR ded = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &im,
+	    .image = *out_image,
+	};
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &ded,
+	    .allocationSize = 0, // an MTLTexture import with a dedicated image (VUID-VkMemoryAllocateInfo-pNext-10397)
+	    .memoryTypeIndex = type,
+	};
+	if (type >= 32) {
+		vk->vkDestroyImage(vk->device, *out_image, NULL);
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, out_mem) != VK_SUCCESS) {
+		*out_mem = VK_NULL_HANDLE;
+		vk->vkDestroyImage(vk->device, *out_image, NULL);
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	if (vk->vkBindImageMemory(vk->device, *out_image, *out_mem, 0) != VK_SUCCESS) {
+		vk->vkFreeMemory(vk->device, *out_mem, NULL);
+		vk->vkDestroyImage(vk->device, *out_image, NULL);
+		*out_mem = VK_NULL_HANDLE;
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	if (out_size != NULL) {
+		*out_size = (uint64_t)IOSurfaceGetAllocSize(surf);
+	}
+	return true;
+}
+
+static CFNumberRef
+cf_i32(int32_t v)
+{
+	return CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
+}
+
+/*!
+ * A GLOBAL IOSurface (kIOSurfaceIsGlobal: the IPC transport carries the bare
+ * ID and the peer's IOSurfaceLookup must find it -- an IOSurface MoltenVK
+ * exports is not global) of @p conv_fmt.
+ */
+static IOSurfaceRef
+iosurface_create_global(uint32_t conv_fmt, uint32_t w, uint32_t h)
+{
+	int32_t fourcc = 'RGBA';
+	switch (conv_fmt) {
+	case XRT_CONV_FMT_BGRA8_UNORM:
+	case XRT_CONV_FMT_BGRA8_SRGB: fourcc = 'BGRA'; break;
+	case XRT_CONV_FMT_R8_UNORM: fourcc = 'L008'; break;
+	case XRT_CONV_FMT_R16_UNORM: fourcc = 'L016'; break;
+	case XRT_CONV_FMT_R16_FLOAT: fourcc = 'L00h'; break;
+	case XRT_CONV_FMT_R32_FLOAT: fourcc = 'L00f'; break;
+	case XRT_CONV_FMT_RGBA16_FLOAT: fourcc = 'RGhA'; break;
+	default: break;
+	}
+	CFStringRef keys[5] = {CFSTR("IOSurfaceWidth"), CFSTR("IOSurfaceHeight"), CFSTR("IOSurfaceBytesPerElement"),
+	                       CFSTR("IOSurfacePixelFormat"), CFSTR("IOSurfaceIsGlobal")};
+	CFNumberRef nums[4] = {cf_i32((int32_t)w), cf_i32((int32_t)h), cf_i32((int32_t)conv_fmt_bytes(conv_fmt)),
+	                       cf_i32(fourcc)};
+	CFTypeRef values[5] = {nums[0], nums[1], nums[2], nums[3], kCFBooleanTrue};
+	CFDictionaryRef props = CFDictionaryCreate(NULL, (const void **)keys, (const void **)values, 5,
+	                                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	for (int i = 0; i < 4; i++) {
+		CFRelease(nums[i]);
+	}
+	if (props == NULL) {
+		return NULL;
+	}
+	IOSurfaceRef s = IOSurfaceCreate(props);
+	CFRelease(props);
+	return s;
+}
+#endif
+
+/*!
+ * Import client image @p src (work_mtx held). The image's content is the
+ * producer's; ext_acquire records its hand-over before the first read.
+ */
+static bool
+ext_import(struct vk_conv_gpu *g, const struct vk_conv_gpu_external *src, struct vkc_ext *out)
+{
+	struct vk_bundle *vk = g->vk;
+	(void)vk; // unused on macOS
+	memset(out, 0, sizeof(*out));
+	if (!fmt_is_rgba8_family(src->format) || (vk_conv_gpu_import_kinds(g) & src->memory_kind) == 0) {
+		return false;
+	}
+	out->kind = src->memory_kind;
+	out->w = src->width;
+	out->h = src->height;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
+	if (src->memory_kind == XRT_CONV_MEM_IOSURFACE) {
+		IOSurfaceRef surf = (IOSurfaceRef)(uintptr_t)src->handle;
+		if (surf == NULL || CFGetTypeID(surf) != IOSurfaceGetTypeID()) {
+			return false;
+		}
+		// The surface knows its own size; the wire's is advisory.
+		out->w = (uint32_t)IOSurfaceGetWidth(surf);
+		out->h = (uint32_t)IOSurfaceGetHeight(surf);
+		if (out->w == 0 || out->h == 0 || IOSurfaceGetBytesPerElement(surf) != 4) {
+			return false;
+		}
+		// Imported as the UNORM alias: the bytes are copied raw (an _SRGB
+		// input stays encoded, as the CPU kind's bytes do).
+		out->format = unorm_alias(conv_to_vk(src->format));
+		const uint64_t key = (uint64_t)IOSurfaceGetID(surf);
+		const uint64_t now = os_monotonic_get_ns();
+		struct vkc_ext_cache_entry *slot = NULL, *lru = NULL;
+		for (uint32_t i = 0; i < VKC_EXT_CACHE_SIZE; i++) {
+			struct vkc_ext_cache_entry *c = &g->ext_cache[i];
+			if (c->key != 0 && now - c->last_use_ns > VKC_EXT_CACHE_IDLE_NS) {
+				c->e.cached = false;
+				ext_free(g, &c->e);
+				memset(c, 0, sizeof(*c));
+			}
+			if (c->key == key && c->format == src->format && c->e.w == out->w && c->e.h == out->h) {
+				slot = c;
+			}
+			if (lru == NULL || c->key == 0 || (lru->key != 0 && c->last_use_ns < lru->last_use_ns)) {
+				lru = c;
+			}
+		}
+		if (slot == NULL) {
+			if (!iosurface_image(g, surf, out->format, out->w, out->h, 0, &out->image, &out->mem, NULL)) {
+				return false;
+			}
+			if (lru->key != 0) {
+				lru->e.cached = false;
+				ext_free(g, &lru->e);
+			}
+			lru->key = key;
+			lru->format = src->format;
+			lru->e = *out;
+			lru->e.cached = true;
+			slot = lru;
+			*out = slot->e;
+		} else {
+			*out = slot->e;
+			out->primed = true;
+		}
+		slot->last_use_ns = now;
+		return true;
+	}
+#endif
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+	if (src->memory_kind == XRT_CONV_MEM_VK_OPAQUE_FD) {
+		// The contract's creation parameters, exactly (vk_conv_gpu.h).
+		const int fd_in = (int)(int64_t)src->handle;
+		if (fd_in < 0 || out->w == 0 || out->h == 0) {
+			return false;
+		}
+		out->format = conv_to_vk(src->format);
+		VkExternalMemoryImageCreateInfo ext_ici = {
+		    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+		    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+		};
+		VkImageCreateInfo ici = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		    .pNext = &ext_ici,
+		    .flags = unorm_alias(out->format) != out->format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
+		    .imageType = VK_IMAGE_TYPE_2D,
+		    .format = out->format,
+		    .extent = {out->w, out->h, 1},
+		    .mipLevels = 1,
+		    .arrayLayers = 1,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .tiling = VK_IMAGE_TILING_OPTIMAL,
+		    .usage = ext_usage(),
+		    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		};
+		if (vk->vkCreateImage(vk->device, &ici, NULL, &out->image) != VK_SUCCESS) {
+			out->image = VK_NULL_HANDLE;
+			return false;
+		}
+		VkMemoryRequirements req;
+		vk->vkGetImageMemoryRequirements(vk->device, out->image, &req);
+		uint32_t type = 0;
+		if (!vk_get_memory_type(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)) {
+			ext_free(g, out);
+			return false;
+		}
+		// The import takes ownership of the fd on success only: a duplicate.
+		const int fd = dup(fd_in);
+		if (fd < 0) {
+			ext_free(g, out);
+			return false;
+		}
+		VkImportMemoryFdInfoKHR imp = {
+		    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+		    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+		    .fd = fd,
+		};
+		VkMemoryDedicatedAllocateInfoKHR ded = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+		    .pNext = &imp,
+		    .image = out->image,
+		};
+		VkMemoryAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .pNext = &ded,
+		    .allocationSize = req.size,
+		    .memoryTypeIndex = type,
+		};
+		if (vk->vkAllocateMemory(vk->device, &ai, NULL, &out->mem) != VK_SUCCESS) {
+			out->mem = VK_NULL_HANDLE;
+			close(fd);
+			ext_free(g, out);
+			return false;
+		}
+		if (vk->vkBindImageMemory(vk->device, out->image, out->mem, 0) != VK_SUCCESS) {
+			ext_free(g, out);
+			return false;
+		}
+		return true;
+	}
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (src->memory_kind == XRT_CONV_MEM_DMABUF) {
+		const int fd_in = (int)(int64_t)src->handle;
+		if (fd_in < 0 || out->w == 0 || out->h == 0) {
+			return false;
+		}
+		const bool bgra = src->format == XRT_CONV_FMT_BGRA8_UNORM || src->format == XRT_CONV_FMT_BGRA8_SRGB;
+		struct xrt_weave_dmabuf_desc d;
+		memset(&d, 0, sizeof(d));
+		d.fd = dup(fd_in); // always consumed by the helper
+		if (d.fd < 0) {
+			return false;
+		}
+		d.width = out->w;
+		d.height = out->h;
+		d.drm_fourcc =
+		    vk_dmabuf_vk_format_to_fourcc(bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, true);
+		d.drm_modifier = src->drm_modifier;
+		d.plane_count = 1;
+		d.offsets[0] = 0;
+		d.strides[0] = src->row_stride;
+		if (vk_create_image_from_dmabuf(vk, &d, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &out->image, &out->mem,
+		                                &out->format) != VK_SUCCESS) {
+			out->image = VK_NULL_HANDLE;
+			out->mem = VK_NULL_HANDLE;
+			return false;
+		}
+		return true;
+	}
+#endif
+	return false;
+}
+
+//! Hand the client image over to this queue, in TRANSFER_SRC_OPTIMAL.
+static void
+ext_acquire(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_ext *e)
+{
+	struct vk_bundle *vk = g->vk;
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (e->kind == XRT_CONV_MEM_DMABUF) {
+		vk_dmabuf_cmd_acquire_foreign(vk, cmd, e->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		return;
+	}
+#endif
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    // OPAQUE_FD: the producer leaves the image in GENERAL (the contract) and
+	    // releases it to VK_QUEUE_FAMILY_EXTERNAL. IOSurface: a fresh import is
+	    // UNDEFINED (MoltenVK keeps the surface's bytes across it), a cached
+	    // one was left GENERAL by ext_release.
+	    .oldLayout = (e->kind == XRT_CONV_MEM_VK_OPAQUE_FD || e->primed) ? VK_IMAGE_LAYOUT_GENERAL
+	                                                                     : VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = e->image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+	if (e->kind == XRT_CONV_MEM_VK_OPAQUE_FD) {
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+		b.dstQueueFamilyIndex = vk->main_queue->family_index;
+	}
+#endif
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &b);
+}
+
+//! Give the client image back (its producer reuses it): GENERAL, released.
+static void
+ext_release(struct vk_conv_gpu *g, VkCommandBuffer cmd, const struct vkc_ext *e)
+{
+	struct vk_bundle *vk = g->vk;
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (e->kind == XRT_CONV_MEM_DMABUF) {
+		vk_dmabuf_cmd_release_foreign(vk, cmd, e->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		return;
+	}
+#endif
+	if (e->kind == XRT_CONV_MEM_IOSURFACE) {
+		// Cached for the next submit of the same surface: back to GENERAL.
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = e->image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &b);
+		return;
+	}
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+	if (e->kind == XRT_CONV_MEM_VK_OPAQUE_FD) {
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .srcQueueFamilyIndex = vk->main_queue->family_index,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+		    .image = e->image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &b);
+	}
+#endif
+}
+
+/*!
+ * The client image's sync as a wait of this submit: imported temporarily
+ * (destroyed after the submit), never cached -- a client sync handle has no
+ * stable identity across frames. False = a kind this device cannot wait for.
+ */
+static bool
+ext_waits(struct vk_conv_gpu *g, const struct xrt_conv_sync *sync, struct vkc_waits *w)
+{
+	if (sync->kind == XRT_CONV_SYNC_NONE) {
+		return true;
+	}
+	if ((g->caps.sync_kinds & (1u << sync->kind)) == 0 || w->count >= VKC_MAX_WAITS) {
+		return false;
+	}
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	if (sync->kind == XRT_CONV_SYNC_VK_SEMAPHORE_FD) {
+		const int fd = dup((int)(int64_t)sync->handle);
+		VkSemaphore sem = VK_NULL_HANDLE;
+		if (fd < 0 || vk_create_timeline_semaphore_from_native(g->vk, fd, &sem) != VK_SUCCESS) {
+			if (fd >= 0) {
+				close(fd);
+			}
+			return false;
+		}
+		w->sem[w->count] = sem;
+		w->value[w->count] = sync->acquire_value;
+		w->timeline[w->count] = true;
+		w->temp[w->count] = true;
+		w->count++;
+		return true;
+	}
+	if (sync->kind == XRT_CONV_SYNC_SYNC_FD) {
+		// waits_add's SYNC_FD import is already temporary.
+		struct xrt_conv_image x;
+		memset(&x, 0, sizeof(x));
+		x.sync = *sync;
+		return waits_add(g, w, &x);
+	}
+#endif
+	return false;
+}
+
+/*!
+ * Record a raw-byte blit of @p src's region into @p dst (a glue image in
+ * GENERAL, UNORM view format == format): scaled to dst's extent, channel order
+ * converted. @p src must be a UNORM (raw) format in @p src_layout.
+ */
+static void
+record_region_blit(struct vk_conv_gpu *g,
+                   VkCommandBuffer cmd,
+                   VkImage src,
+                   VkImageLayout src_layout,
+                   uint32_t x,
+                   uint32_t y,
+                   uint32_t w,
+                   uint32_t h,
+                   struct vkc_img *dst)
+{
+	const bool scaled = w != dst->w || h != dst->h;
+	VkImageBlit region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{(int32_t)x, (int32_t)y, 0}, {(int32_t)(x + w), (int32_t)(y + h), 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)dst->w, (int32_t)dst->h, 1}},
+	};
+	img_acquire_foreign(g, cmd, dst);
+	g->vk->vkCmdBlitImage(cmd, src, src_layout, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region,
+	                      scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+	cmd_global_barrier(g->vk, cmd);
+	img_release_foreign(g, cmd, dst);
+}
+
+/*!
+ * The shared tail of the client and weave copies (work_mtx held, @p cmd begun,
+ * @p src readable in @p src_layout): region -> @p dst. A glue destination is
+ * blitted; a CPU one goes through x_cpu and a readback. An _SRGB source is
+ * first copied raw into x_raw. Submits (with @p waits) and waits.
+ */
+static bool
+region_to_dst_locked(struct vk_conv_gpu *g,
+                     VkCommandBuffer cmd,
+                     struct vkc_waits *waits,
+                     VkImage src,
+                     VkImageLayout src_layout,
+                     VkFormat src_format,
+                     uint32_t x,
+                     uint32_t y,
+                     uint32_t w,
+                     uint32_t h,
+                     const struct xrt_conv_image *dst,
+                     void (*before_submit)(struct vk_conv_gpu *g, VkCommandBuffer cmd, const void *ctx),
+                     const void *ctx)
+{
+	struct vk_bundle *vk = g->vk;
+	struct vkc_img *target = NULL;
+	const bool cpu_dst = is_cpu_image(dst);
+	bool ok = true;
+	if (cpu_dst) {
+		ok =
+		    fmt_is_rgba8_family(dst->format) && unorm_alias(conv_to_vk(dst->format)) == conv_to_vk(dst->format);
+		target = ok ? scratch_ensure(g, &g->x_cpu, dst->format, dst->width, dst->height, 1) : NULL;
+	} else if (is_glue_image(dst)) {
+		target = img_find(g, dst->import_key);
+		ok = target != NULL && target->layers >= 1 && target->format == target->view_format &&
+		     fmt_is_rgba8_family(target->conv_fmt);
+	}
+	ok = ok && target != NULL;
+	VkImage blit_src = src;
+	VkImageLayout blit_layout = src_layout;
+	uint32_t bx = x, by = y;
+	if (ok && unorm_alias(src_format) != src_format) {
+		// Raw bytes: a blit from an _SRGB image would decode it.
+		uint32_t raw_fmt = XRT_CONV_FMT_RGBA8_UNORM;
+		if (src_format == VK_FORMAT_B8G8R8A8_SRGB) {
+			raw_fmt = XRT_CONV_FMT_BGRA8_UNORM;
+		}
+		struct vkc_img *raw = scratch_ensure(g, &g->x_raw, raw_fmt, w, h, 1);
+		ok = raw != NULL;
+		if (ok) {
+			VkImageCopy c = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .srcOffset = {(int32_t)x, (int32_t)y, 0},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .extent = {w, h, 1},
+			};
+			vk->vkCmdCopyImage(cmd, src, src_layout, raw->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+			cmd_global_barrier(vk, cmd);
+			blit_src = raw->image;
+			blit_layout = VK_IMAGE_LAYOUT_GENERAL;
+			bx = 0;
+			by = 0;
+		}
+	}
+	const uint32_t pitch =
+	    cpu_dst && dst->row_stride != 0 ? dst->row_stride : (target != NULL ? target->w * 4u : 0);
+	if (ok && cpu_dst) {
+		ok = (dst->byte_size == 0 || dst->byte_size >= (uint64_t)pitch * target->h) &&
+		     stage_ensure(g, (VkDeviceSize)target->w * 4u * target->h);
+	}
+	if (ok) {
+		record_region_blit(g, cmd, blit_src, blit_layout, bx, by, w, h, target);
+		g->stats.gpu_copies++;
+		if (cpu_dst) {
+			// The readback rides the same submit (one round trip, not two).
+			record_buffer_image(vk, cmd, g->stage_buf, target, false);
+			cmd_global_barrier(vk, cmd);
+			g->stats.host_reads++;
+		}
+	}
+	if (before_submit != NULL) {
+		before_submit(g, cmd, ctx);
+	}
+	const bool submitted = cmd_submit_wait(g, cmd, waits);
+	ok = ok && submitted;
+	if (ok && cpu_dst) {
+		copy_rows((uint8_t *)dst->cpu_ptr, pitch, (const uint8_t *)g->stage_map, target->w * 4u, target->w * 4u,
+		          target->h);
+	}
+	return ok;
+}
+
+static void
+ext_release_cb(struct vk_conv_gpu *g, VkCommandBuffer cmd, const void *ctx)
+{
+	ext_release(g, cmd, (const struct vkc_ext *)ctx);
+}
+
+bool
+vk_conv_gpu_import_copy(struct vk_conv_gpu *g,
+                        const struct vk_conv_gpu_external *src,
+                        uint32_t x,
+                        uint32_t y,
+                        uint32_t w,
+                        uint32_t h,
+                        const struct xrt_conv_image *dst)
+{
+	if (g == NULL || src == NULL || dst == NULL || w == 0 || h == 0 || !gate_enter(g)) {
+		return false;
+	}
+	work_lock(g);
+	struct vkc_ext e;
+	bool ok = ext_import(g, src, &e);
+	// The wire is not trusted: the region lies inside the image.
+	ok = ok && (uint64_t)x + w <= e.w && (uint64_t)y + h <= e.h;
+	struct vkc_waits waits;
+	memset(&waits, 0, sizeof(waits));
+	ok = ok && ext_waits(g, &src->sync, &waits);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	ok = ok && cmd_begin(g, &cmd);
+	if (ok) {
+		g->stats.imports++;
+		cmd_global_barrier(g->vk, cmd);
+		ext_acquire(g, cmd, &e);
+		ok = region_to_dst_locked(g, cmd, &waits, e.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e.format, x, y,
+		                          w, h, dst, ext_release_cb, &e);
+	} else {
+		waits_release(g, &waits);
+	}
+	ext_free(g, &e);
+	os_mutex_unlock(&g->work_mtx);
+	gate_leave(g);
+	return ok;
+}
+
+bool
+vk_conv_gpu_import_input(struct vk_conv_gpu *g, const struct conv_input_import *in, const struct xrt_conv_image *dst)
+{
+	if (in == NULL) {
+		return false;
+	}
+	struct vk_conv_gpu_external e;
+	memset(&e, 0, sizeof(e));
+	switch (in->kind) {
+	case CONV_INPUT_IOSURFACE: e.memory_kind = XRT_CONV_MEM_IOSURFACE; break;
+	case CONV_INPUT_OPAQUE_FD: e.memory_kind = XRT_CONV_MEM_VK_OPAQUE_FD; break;
+	case CONV_INPUT_DMABUF: e.memory_kind = XRT_CONV_MEM_DMABUF; break;
+	default: return false;
+	}
+	e.handle = (uint64_t)(intptr_t)in->handle;
+	e.width = in->img_w;
+	e.height = in->img_h;
+	e.format = in->img_format;
+	e.row_stride = in->cpu_row_pitch;
+	e.drm_modifier = in->drm_modifier;
+	if (in->sync_kind == XRT_CONV_SYNC_SYNC_FD || in->sync_kind == XRT_CONV_SYNC_VK_SEMAPHORE_FD) {
+		e.sync.kind = in->sync_kind;
+		e.sync.handle = (uint64_t)(intptr_t)in->sync_handle;
+		e.sync.acquire_value = in->sync_value;
+	}
+	return vk_conv_gpu_import_copy(g, &e, in->x, in->y, in->w, in->h, dst);
+}
+
+bool
+vk_conv_gpu_copy_from_vk(struct vk_conv_gpu *g,
+                         VkImage src,
+                         VkImageLayout src_layout,
+                         VkFormat src_format,
+                         uint32_t x,
+                         uint32_t y,
+                         uint32_t w,
+                         uint32_t h,
+                         const struct xrt_conv_image *dst)
+{
+	if (g == NULL || src == VK_NULL_HANDLE || dst == NULL || w == 0 || h == 0 || !gate_enter(g)) {
+		return false;
+	}
+	work_lock(g);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	bool ok = cmd_begin(g, &cmd);
+	if (ok) {
+		cmd_global_barrier(g->vk, cmd);
+		ok = region_to_dst_locked(g, cmd, NULL, src, src_layout, src_format, x, y, w, h, dst, NULL, NULL);
+	}
+	os_mutex_unlock(&g->work_mtx);
+	gate_leave(g);
+	return ok;
+}
+
+uint32_t
+vk_conv_gpu_import_kinds(const struct vk_conv_gpu *g)
+{
+	if (g == NULL) {
+		return 0;
+	}
+	uint32_t k = 0;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	k |= g->caps.memory_kinds & XRT_CONV_MEM_IOSURFACE;
+#endif
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+	// Export implies import for OPAQUE_FD on every driver that offers it.
+	k |= g->caps.memory_kinds & XRT_CONV_MEM_VK_OPAQUE_FD;
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	k |= g->caps.memory_kinds & XRT_CONV_MEM_DMABUF;
+#endif
+	return k;
+}
+
+uint32_t
+vk_conv_gpu_export_kinds(const struct vk_conv_gpu *g)
+{
+	if (g == NULL) {
+		return 0;
+	}
+	return g->caps.memory_kinds & (XRT_CONV_MEM_IOSURFACE | XRT_CONV_MEM_VK_OPAQUE_FD);
+}
+
+//! Enter @p img into the table and describe it (gate held; work_mtx not held).
+static void
+img_publish(struct vk_conv_gpu *g, struct vkc_img *img, uint64_t stream_id, uint32_t cs, struct xrt_conv_image *out)
+{
+	img->stream_id = stream_id;
+	os_mutex_lock(&g->tab_mtx);
+	img->key = ++g->next_key; // bit 63 clear: disjoint from the service CPU allocator's keys
+	img->next = g->imgs;
+	g->imgs = img;
+	g->img_count++;
+	os_mutex_unlock(&g->tab_mtx);
+
+	memset(out, 0, sizeof(*out));
+	out->memory_kind = img->kind != 0                                         ? img->kind
+	                   : (g->caps.memory_kinds & XRT_CONV_MEM_IOSURFACE) != 0 ? XRT_CONV_MEM_IOSURFACE
+	                                                                          : XRT_CONV_MEM_VK_OPAQUE_FD;
+	out->handle = img->handle;
+	out->import_key = img->key;
+	out->byte_size = img->byte_size;
+	out->width = img->w;
+	out->height = img->h;
+	out->format = img->conv_fmt;
+	out->color_space = cs;
+	out->row_stride = img->row_stride;
+	out->drm_modifier = img->drm_modifier;
+	out->adapter_luid = 0;
+	out->sync.kind = XRT_CONV_SYNC_NONE;
+	out->sync.handle = 0;
+	out->sync.import_key = img->key;
+}
+
+bool
+vk_conv_gpu_export_alloc(struct vk_conv_gpu *g,
+                         uint32_t kind,
+                         uint32_t conv_fmt,
+                         uint32_t w,
+                         uint32_t h,
+                         uint64_t stream_id,
+                         struct xrt_conv_image *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (g == NULL || (vk_conv_gpu_export_kinds(g) & kind) == 0 || conv_to_vk(conv_fmt) == VK_FORMAT_UNDEFINED ||
+	    w == 0 || h == 0 || !gate_enter(g)) {
+		return false;
+	}
+	work_lock(g);
+	struct vkc_img *img = NULL;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
+	if (kind == XRT_CONV_MEM_IOSURFACE) {
+		IOSurfaceRef surf = iosurface_create_global(conv_fmt, w, h);
+		if (surf != NULL) {
+			img = U_TYPED_CALLOC(struct vkc_img);
+			img->conv_fmt = conv_fmt;
+			img->w = w;
+			img->h = h;
+			img->layers = 1;
+			img->kind = XRT_CONV_MEM_IOSURFACE;
+			img->format = conv_to_vk(conv_fmt);
+			img->view_format = unorm_alias(img->format);
+			img->handle = (uint64_t)(uintptr_t)surf; // the glue's reference, released at img_destroy
+			const VkImageCreateFlags flags =
+			    img->view_format != img->format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+			if (!iosurface_image(g, surf, img->format, w, h, flags, &img->image, &img->mem,
+			                     &img->byte_size)) {
+				img_destroy(g, img);
+				img = NULL;
+			}
+		}
+	}
+#endif
+	if (kind == XRT_CONV_MEM_VK_OPAQUE_FD) {
+		img = img_create(g, conv_fmt, w, h, 1, kind);
+	}
+	const bool ok = img != NULL && img_finish(g, img);
+	os_mutex_unlock(&g->work_mtx);
+	if (ok) {
+		img_publish(g, img, stream_id, XRT_CONV_CS_SRGB, out);
+	}
+	gate_leave(g);
+	return ok;
+}
+
+bool
+vk_conv_gpu_copy(struct vk_conv_gpu *g, const struct xrt_conv_image *src, const struct xrt_conv_image *dst)
+{
+	if (g == NULL || src == NULL || !is_glue_image(dst) || !gate_enter(g)) {
+		return false;
+	}
+	bool ok = false;
+	work_lock(g);
+	struct vkc_img *d = img_find(g, dst->import_key);
+	if (d != NULL && is_cpu_image(src)) {
+		ok = src->width == d->w && src->height == d->h &&
+		     conv_fmt_bytes(src->format) == conv_fmt_bytes(d->conv_fmt) &&
+		     write_locked(g, d, src->cpu_ptr, src->row_stride);
+	} else if (d != NULL && is_glue_image(src)) {
+		struct vkc_img *s = img_find(g, src->import_key);
+		VkCommandBuffer cmd = VK_NULL_HANDLE;
+		ok = s != NULL && s->w == d->w && s->h == d->h && s->layers == 1 &&
+		     conv_fmt_bytes(s->conv_fmt) == conv_fmt_bytes(d->conv_fmt) && cmd_begin(g, &cmd);
+		if (ok) {
+			VkImageCopy c = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .extent = {d->w, d->h, 1},
+			};
+			cmd_global_barrier(g->vk, cmd);
+			img_acquire_foreign(g, cmd, s);
+			img_acquire_foreign(g, cmd, d);
+			g->vk->vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL,
+			                      1, &c);
+			cmd_global_barrier(g->vk, cmd);
+			img_release_foreign(g, cmd, s);
+			img_release_foreign(g, cmd, d);
+			g->stats.gpu_copies++;
+			ok = cmd_submit_wait(g, cmd, NULL);
+		}
+	}
+	os_mutex_unlock(&g->work_mtx);
+	gate_leave(g);
+	return ok;
+}
+
+uint32_t
+vk_conv_gpu_input_memory_kind(const struct vk_conv_gpu *g, uint32_t import_memory_kinds, uint32_t import_sync_kinds)
+{
+	if (g == NULL || import_memory_kinds == 0) {
+		return XRT_CONV_MEM_CPU;
+	}
+	const uint32_t allowed = import_memory_kinds & g->provider_kinds & g->caps.memory_kinds & ~XRT_CONV_MEM_CPU;
+	if (allowed == 0 || (import_sync_kinds != 0 && (import_sync_kinds & (1u << XRT_CONV_SYNC_NONE)) == 0)) {
+		return XRT_CONV_MEM_CPU;
+	}
+	// pick_kind's preference, one layer.
+	if ((allowed & XRT_CONV_MEM_VK_OPAQUE_FD) != 0) {
+		return XRT_CONV_MEM_VK_OPAQUE_FD;
+	}
+	if ((allowed & XRT_CONV_MEM_DMABUF) != 0) {
+		return XRT_CONV_MEM_DMABUF;
+	}
+	return (allowed & XRT_CONV_MEM_IOSURFACE) != 0 ? XRT_CONV_MEM_IOSURFACE : XRT_CONV_MEM_CPU;
+}
+
+void
+vk_conv_gpu_get_stats(struct vk_conv_gpu *g, struct vk_conv_gpu_stats *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (g == NULL) {
+		return;
+	}
+	os_mutex_lock(&g->work_mtx);
+	*out = g->stats;
+	os_mutex_unlock(&g->work_mtx);
+}
+
+
+/*
+ *
  * Lifecycle.
  *
  */
@@ -1624,6 +2690,143 @@ probe_caps(struct vk_conv_gpu *g)
 #endif
 }
 
+/*!
+ * macOS: the S5 timeline exported as an MTLSharedEvent (VK_EXT_metal_objects,
+ * MoltenVK). The asynchronous hand-over is the DEFAULT, behind a runtime
+ * capability check: MoltenVK >= 1.4, timeline semaphores, the export, and a
+ * round trip at init -- the queue signals the timeline to 1 and the exported
+ * event must read 1 (-[MTLSharedEvent signaledValue]). Anything short of that
+ * falls back to the host wait with ONE WARN. DXR_CONV_VK_ASYNC_S5=0 is a
+ * diagnostic switch (also one WARN), not the safety net.
+ */
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects) && defined(VK_KHR_timeline_semaphore)
+//! -[MTLSharedEvent signaledValue] from C.
+static uint64_t
+mtl_event_signaled_value(void *event)
+{
+	typedef uint64_t (*msg_u64_fn)(void *, SEL);
+	return ((msg_u64_fn)objc_msgSend)(event, sel_registerName("signaledValue"));
+}
+
+static void
+async_s5_fail(struct vk_conv_gpu *g, const char *why)
+{
+	struct vk_bundle *vk = g->vk;
+	if (g->s5_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
+	}
+	if (g->async_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, g->async_fence, NULL);
+	}
+	g->s5_sem = VK_NULL_HANDLE;
+	g->async_fence = VK_NULL_HANDLE;
+	g->s5_event = NULL;
+	g->s5_value = 0;
+	g->caps.async_s5 = false;
+	U_LOG_W("[conv] Vulkan glue: S5 results keep the host wait before publish (%s)", why);
+}
+#endif
+
+static void
+async_s5_init(struct vk_conv_gpu *g)
+{
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects) && defined(VK_KHR_timeline_semaphore)
+	struct vk_bundle *vk = g->vk;
+	const char *env = getenv("DXR_CONV_VK_ASYNC_S5");
+	if (env != NULL && env[0] == '0') {
+		async_s5_fail(g, "DXR_CONV_VK_ASYNC_S5=0, a diagnostic switch");
+		return;
+	}
+	if (!vk->has_EXT_metal_objects || vk->vkExportMetalObjectsEXT == NULL) {
+		async_s5_fail(g, "no VK_EXT_metal_objects: cannot export an MTLSharedEvent");
+		return;
+	}
+	if (!vk->features.timeline_semaphore) {
+		async_s5_fail(g, "no timeline semaphores on the device");
+		return;
+	}
+#ifdef VK_KHR_driver_properties
+	if (vk->vkGetPhysicalDeviceProperties2 != NULL) {
+		VkPhysicalDeviceDriverPropertiesKHR drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR};
+		VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+		vk->vkGetPhysicalDeviceProperties2(vk->physical_device, &p2);
+		// MoltenVK's driverVersion is major * 10000 + minor * 100 + patch.
+		if (drv.driverID == VK_DRIVER_ID_MOLTENVK && p2.properties.driverVersion < 10400) {
+			char why[96];
+			snprintf(why, sizeof(why), "MoltenVK %u.%u.%u < 1.4", p2.properties.driverVersion / 10000,
+			         (p2.properties.driverVersion / 100) % 100, p2.properties.driverVersion % 100);
+			async_s5_fail(g, why);
+			return;
+		}
+	}
+#endif
+	VkExportMetalObjectCreateInfoEXT export_ev = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT,
+	};
+	VkSemaphoreTypeCreateInfoKHR type = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR,
+	    .pNext = &export_ev,
+	    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR,
+	    .initialValue = 0,
+	};
+	VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+	VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	if (vk->vkCreateSemaphore(vk->device, &sci, NULL, &g->s5_sem) != VK_SUCCESS) {
+		g->s5_sem = VK_NULL_HANDLE;
+		async_s5_fail(g, "the exportable timeline semaphore could not be created");
+		return;
+	}
+	if (vk->vkCreateFence(vk->device, &fci, NULL, &g->async_fence) != VK_SUCCESS) {
+		g->async_fence = VK_NULL_HANDLE;
+		async_s5_fail(g, "no fence");
+		return;
+	}
+	VkExportMetalSharedEventInfoEXT es = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT,
+	    .semaphore = g->s5_sem,
+	};
+	VkExportMetalObjectsInfoEXT eo = {.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, .pNext = &es};
+	vk->vkExportMetalObjectsEXT(vk->device, &eo);
+	if (es.mtlSharedEvent == NULL) {
+		async_s5_fail(g, "the timeline semaphore did not export an MTLSharedEvent");
+		return;
+	}
+	// Round trip: the queue signals 1, the Metal side must see 1.
+	const uint64_t one = 1;
+	VkTimelineSemaphoreSubmitInfoKHR tl = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+	    .signalSemaphoreValueCount = 1,
+	    .pSignalSemaphoreValues = &one,
+	};
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .pNext = &tl,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &g->s5_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	VkResult r = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, g->async_fence);
+	vk_queue_unlock(vk->main_queue);
+	if (r == VK_SUCCESS) {
+		r = vk->vkWaitForFences(vk->device, 1, &g->async_fence, VK_TRUE, 1000ull * 1000ull * 1000ull);
+	}
+	const uint64_t seen = r == VK_SUCCESS ? mtl_event_signaled_value((void *)es.mtlSharedEvent) : 0;
+	if (r != VK_SUCCESS || seen < 1) {
+		char why[96];
+		snprintf(why, sizeof(why), "the MTLSharedEvent round trip failed (vk %d, event %llu)", (int)r,
+		         (unsigned long long)seen);
+		async_s5_fail(g, why);
+		return;
+	}
+	g->s5_event = (void *)es.mtlSharedEvent;
+	g->s5_value = 1;
+	g->caps.async_s5 = true;
+#else
+	(void)g;
+#endif
+}
+
 bool
 vk_conv_gpu_create(struct vk_bundle *vk, struct vk_conv_gpu **out)
 {
@@ -1656,6 +2859,7 @@ vk_conv_gpu_create(struct vk_bundle *vk, struct vk_conv_gpu **out)
 		return false;
 	}
 	probe_caps(g);
+	async_s5_init(g);
 	*out = g;
 	return true;
 }
@@ -1675,7 +2879,7 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 	}
 	os_mutex_unlock(&g->gate_mtx);
 
-	os_mutex_lock(&g->work_mtx);
+	work_lock(g);
 	while (g->streams != NULL) {
 		struct vkc_stream *s = g->streams;
 		g->streams = s->next;
@@ -1691,6 +2895,18 @@ vk_conv_gpu_destroy(struct vk_conv_gpu **g_ptr)
 		g->sems = s->next;
 		vk->vkDestroySemaphore(vk->device, s->sem, NULL);
 		free(s);
+	}
+	img_destroy(g, g->x_raw);
+	img_destroy(g, g->x_cpu);
+	for (uint32_t i = 0; i < VKC_EXT_CACHE_SIZE; i++) {
+		g->ext_cache[i].e.cached = false;
+		ext_free(g, &g->ext_cache[i].e);
+	}
+	if (g->s5_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, g->s5_sem, NULL);
+	}
+	if (g->async_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, g->async_fence, NULL);
 	}
 	vk_conv_viewsyn_destroy(&g->viewsyn);
 	buffer_free(vk, &g->stage_buf, &g->stage_mem, &g->stage_map);
@@ -1721,6 +2937,13 @@ vk_conv_gpu_lookup(struct vk_conv_gpu *g, const struct xrt_conv_image *x, struct
 		out->height = img->h;
 		out->layers = img->layers;
 		out->foreign = img->foreign;
+		os_mutex_lock(&g->tab_mtx);
+		const uint64_t ev = img->event_value;
+		os_mutex_unlock(&g->tab_mtx);
+		if (ev != 0 && g->s5_event != NULL) {
+			out->mtl_shared_event = g->s5_event;
+			out->event_value = ev;
+		}
 	}
 	gate_leave(g);
 	return img != NULL;
