@@ -266,6 +266,19 @@ the service scanned is not resident and joins at the next service start
 (the service log names it), and in-process apps re-read at their next
 launch.
 
+**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — implementation pending).**
+The ranked walk above is the *default*; the controller, hand-tracking and gamepad
+roles are resolved **per client** (IPC connection / in-process process) with an
+optional per-family preferred provider id layered on top: machine `Policy\Lock`
+→ per-app pin (`HKCU\…\InputProviders\PerApp\<exe-basename>\PreferredPlugin`;
+POSIX `input-preferred-<exe-basename>` in the per-user manifest dir; written by
+`displayxr-cli input use <id> --app <exe>` and by an app's persisted request)
+→ the app's session request (`XR_DXR_input_providers`) → `PreferredPlugin` →
+`ProbeOrder`. A pin applies only to the families the pinned provider claims and
+is still presence-gated. The rig role and the head are never per client. Each
+client gets its own monotonic `generation_id`. `DXR_INPUT_PROVIDERS=0` and
+`ForceQwerty` beat every pin.
+
 ### Lifetime — the provider is per-process, its devices are per-instance
 
 A provider is loaded, negotiated and probed **once per process** and then
