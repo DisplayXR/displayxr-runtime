@@ -1803,6 +1803,18 @@ if(WIN32 AND TARGET aux_os_uvc)
 	add_test(NAME tests_uvc_capture_mf COMMAND tests_uvc_capture_mf --success --allow-running-no-tests)
 endif()
 
+# ADR-043 Amendment 4, desktop Linux: the V4L2 UVC backend's hardware-free
+# parts — enumeration from a fake sysfs/udev tree, format selection, the MJPEG
+# decoder (standard-DHT insertion, scale choice, chroma, the built-in decoder;
+# libturbojpeg when it loads) and the real backend on a file: MJPEG stream.
+# Never opens a camera.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND TARGET aux_os_uvc)
+	add_executable(tests_uvc_capture_v4l2 tests_uvc_capture_v4l2.cpp)
+	target_link_libraries(tests_uvc_capture_v4l2 PRIVATE xrt-external-catch2 aux_util aux_os aux_os_uvc)
+	target_include_directories(tests_uvc_capture_v4l2 PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+	add_test(NAME tests_uvc_capture_v4l2 COMMAND tests_uvc_capture_v4l2 --success --allow-running-no-tests)
+endif()
+
 # Shared-surface FRAME_TICK coalescing into the controller's input queue
 # (macOS + desktop Linux; the queue is pthread-based, so POSIX only). Compiles
 # the queue and the comp_multi workspace registry straight into the unit.

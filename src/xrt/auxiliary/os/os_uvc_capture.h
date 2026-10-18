@@ -12,7 +12,13 @@
  *    an ASYNC IMFSourceReader per open device whose callback keeps only the
  *    newest sample; MJPEG / YUY2 / NV12 are decoded / converted to NV12 by the
  *    reader's own decoder MFT (advanced video processing), never by us.
- *  - Linux desktop: V4L2 — TODO (os_uvc_capture_stubs.c reports no backend).
+ *  - Linux desktop: V4L2 (os_uvc_capture_v4l2.c) — devices from sysfs + the
+ *    udev database (no node is opened to list them), modes from
+ *    VIDIOC_ENUM_FMT / FRAMESIZES / FRAMEINTERVALS (the node is opened, never
+ *    started), and per open device mmap'd buffers drained latest-wins on the
+ *    caller's thread; NV12 / YUYV are handed over as delivered, MJPEG is
+ *    decoded to NV12 on the CPU (os_uvc_mjpeg.h: libturbojpeg, dlopen'd, else
+ *    the built-in stb_image).
  *  - Everything else: no backend; the source then only ever sees the fake.
  *
  * A separate static library (aux_os_uvc) so the capture DLL imports land only

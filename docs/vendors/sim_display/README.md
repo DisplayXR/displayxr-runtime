@@ -219,7 +219,9 @@ reports the viewer's eye positions in the panel's frame.
 **Pipeline.** The camera is captured through the runtime's existing UVC
 source: Media Foundation on Windows, with the same backend as the
 `XR_DXR_stereo_camera` UVC source, and the capture DLLs are delay-loaded.
-Linux uses V4L2, which is still a stub there (so Linux has no capture yet).
+Desktop Linux uses the same source's V4L2 backend (MJPEG decoded on the CPU
+by libturbojpeg when it is installed, else a slower built-in decoder); the
+webcam-tracking path itself has not been run against a Linux camera yet.
 The tracker picks the capture mode closest to 640 px wide at up to 60 fps and
 runs the estimator on every frame on its own thread. Each result is mapped,
 smoothed with a one-euro filter and stored as the latest state. The display

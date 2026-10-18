@@ -57,8 +57,8 @@
  *     operations as the plug-in camera slots (enumerate, calibration, open,
  *     wait_frame, release_frame, close), over a capture BACKEND
  *     (@ref u_stereo_uvc_backend). The backend is the only OS-specific part:
- *     Media Foundation on Windows (os_uvc_capture_mf.cpp), V4L2 on Linux (a
- *     stub for now), and @ref u_stereo_uvc_fake_backend_init — a synthetic SBS
+ *     Media Foundation on Windows (os_uvc_capture_mf.cpp), V4L2 on desktop
+ *     Linux (os_uvc_capture_v4l2.c), and @ref u_stereo_uvc_fake_backend_init — a synthetic SBS
  *     camera with a known disparity and vertical misalignment, for tests and
  *     hardware-free development (`"fake": {...}` in the config).
  *

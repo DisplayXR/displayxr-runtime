@@ -130,7 +130,16 @@ if(WIN32)
 	# d3d11 + dxgi: the hardware MJPEG decode path (IMFDXGIDeviceManager on the
 	# adapter that has a hardware MJPEG decoder MFT; staging readback).
 	target_link_libraries(aux_os_uvc PRIVATE mf mfplat mfreadwrite mfuuid ole32 d3d11 dxgi)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux: V4L2 (kernel uapi headers only) + an MJPEG decoder that
+	# dlopens libturbojpeg when present and otherwise uses the in-tree
+	# stb_image — no new DT_NEEDED (the .deb's STABLE_SONAMES list is unchanged).
+	target_sources(
+		aux_os_uvc PRIVATE os_uvc_capture_v4l2.c os_uvc_capture_v4l2.h os_uvc_mjpeg.c os_uvc_mjpeg.h
+		)
+	target_include_directories(aux_os_uvc PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+	target_link_libraries(aux_os_uvc PRIVATE ${CMAKE_DL_LIBS} xrt-pthreads)
 else()
-	# Desktop Linux: V4L2 is a TODO (see the file); everything else has none.
+	# Everything else has no capture backend.
 	target_sources(aux_os_uvc PRIVATE os_uvc_capture_stubs.c)
 endif()

@@ -32,10 +32,12 @@
  *                                                config (stereo-cameras.json) + the capture devices
  *                                                present, each marked with the entry claiming it;
  *                                                --modes lists the modes of CLAIMED devices only;
- *                                                --decoder: the MJPEG decode path (hardware MFT
- *                                                + adapter, or software) — touches no camera
+ *                                                --decoder: the MJPEG decode path (Windows: hardware
+ *                                                MFT + adapter, or software; Linux: libturbojpeg or
+ *                                                the built-in decoder) — touches no camera
  *   camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N] [--verbose]
- *                                                a media file (4K MJPEG AVI) through the identical
+ *                                                a media file (Windows: a 4K MJPEG AVI; Linux: a
+ *                                                concatenated .mjpeg stream) through the identical
  *                                                webcam decode / readback / split path, no camera
  *
  * `list` prints each camera's source: "plugin" (the display plug-in's slots) or
@@ -1377,8 +1379,8 @@ cmd_uvc_devices(int argc, const char **argv)
 		os_uvc_capture_decoder_report(report, sizeof(report));
 		printf("UVC MJPEG decode path:\n%s", report);
 		printf(
-		    "(the service log line \"uvc capture (Media Foundation): started ... decoder ...\" confirms "
-		    "the decoder MF actually inserted, per open)\n\n");
+		    "(the service log line \"uvc capture (<backend>): started ... decoder ...\" confirms the "
+		    "decoder actually used, per open)\n\n");
 	}
 	struct u_stereo_uvc_config cfg;
 	char path[1024], err[256] = {0};
@@ -1414,7 +1416,7 @@ cmd_uvc_devices(int argc, const char **argv)
 	if (cfg.fake) {
 		u_stereo_uvc_fake_backend_init(&backend, &cfg.fake_params);
 	} else if (!os_uvc_capture_backend(&backend)) {
-		printf("capture backend: none on this platform (Linux V4L2 is a TODO)\n");
+		printf("capture backend: none on this platform\n");
 		return 0;
 	}
 	struct u_stereo_uvc_device devs[U_STEREO_UVC_MAX_DEVICES];
@@ -1481,10 +1483,11 @@ cmd_uvc_devices(int argc, const char **argv)
 
 /*!
  * `camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N]`:
- * decode a media FILE (e.g. a 4K MJPEG AVI) through the exact open / read
- * path the service uses for a UVC webcam (same decoder policy, GPU decode +
- * scale, staging readback, then the source's split), unpaced, and report the
- * throughput. No camera, no service. DXR_STEREO_CAMERA_UVC_DECODER applies.
+ * decode a media FILE (Windows: e.g. a 4K MJPEG AVI, through the GPU decode +
+ * scale and staging readback; Linux: a concatenated MJPEG stream such as
+ * `ffmpeg -f mjpeg` writes, through the CPU decoder) along the exact open /
+ * read path the service uses for a UVC webcam (same decoder policy, then the
+ * source's split), unpaced, and report the throughput. No camera, no service. DXR_STEREO_CAMERA_UVC_DECODER applies.
  */
 static int
 cmd_uvc_decode_bench(int argc, const char **argv)

@@ -6,7 +6,7 @@
 | **Spec Version** | 4 |
 | **Extension Type** | Instance extension, service path only (an in-process instance enumerates zero cameras) |
 | **Header** | [`src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h`](../../../src/external/openxr_includes/openxr/XR_DXR_stereo_camera.h) (+ its `index.json` catalog note) |
-| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation, Linux V4L2 to follow. Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
+| **Status** | **R1 implemented** (runtime, hardware-free): header, plug-in slots, service camera manager, IPC, OpenXR entry points, sim_display fake, `displayxr-cli camera`, selftest check. **R2 implemented**: the service-side rectifier (`u_stereo_rectify`, CPU) — RECTIFIED frames + rectified calibration from any CALIBRATED source, golden-tested against OpenCV, and a distorted sim fake with ground truth. **Not yet:** consent / indicator / foreground rule (R3 — deny-by-default hooks in place), GPU transports (the rectifier has the seam), state-change events, the Leia provider (L1), the browser (B1). **Amendment 4 implemented** (2026-10-07): a vendor-neutral, service-owned source for plain UVC side-by-side stereo webcams (§9a) — Windows Media Foundation; desktop Linux V4L2 since 2026-10-18 (§9a; no SBS webcam has run on it yet). Provisional type values `1004999300–310` (relocated from `290–300` when `XR_DXR_weave` v14 took `290`; `XR_DXR_lift` holds `270–289`), pending Khronos registry |
 | **R1 decisions** | stereo-only (names/structs kept open: `viewCount`, next chains) · camera provider = `xrt_plugin_iface` slots · service clients only (in-process enumerates zero) · raw frames never reach web pages (`RAW` refused to `PRESENT_OWNER` clients) — see [roadmap §G](../../roadmap/stereo-camera-source.md#g-open-questions--maintainer-decisions) |
 | **Decision record** | [ADR-043](../../adr/ADR-043-stereo-camera-source.md) |
 | **Plug-in contract** | appended `xrt_plugin_iface` camera slots, `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA` (§9) |
@@ -757,8 +757,37 @@ a bright 3840×2160@60 half-SBS MJPEG file, out 2560×720, no bars on any path):
 60.0 Hz (readback 0.7 ms), hardware NVIDIA 51–53 Hz (readback 6–7 ms — a file lets the
 asynchronous NVIDIA MFT decode ~5× ahead of the paced requests and the copies queue behind that
 backlog; a 60 Hz camera has none), software with MF scaling 59.7 Hz (0 superseded, CPU-heavy); the source's own 4K → 2 × 1280×720 resample,
-used only when no scaler is available, costs ~25 ms (was ~110 ms), a pre-scaled frame 0.3 ms. Linux: V4L2 is a TODO
-(`os_uvc_capture_stubs.c` records the plan); other platforms: none. A config with `"fake": true`
+used only when no scaler is available, costs ~25 ms (was ~110 ms), a pre-scaled frame 0.3 ms.
+
+Desktop Linux: **V4L2** (`os_uvc_capture_v4l2.c`, kernel uapi headers only, linked into the same two
+processes plus the sim_display plug-in). *Enumerate* reads sysfs + udev's database only — no
+`/dev/video*` node is opened to list devices (capture vs metadata node from udev's
+`ID_V4L_CAPABILITIES`, else the sysfs `index`; USB VID:PID + product from the interface's parent;
+the name is the V4L2 card name, or `<USB product> (<card>)` when the kernel's 31-byte card name
+lost the product, so a `match` written against the Windows friendly name works on both; USB nodes
+are listed before platform/ISP nodes so the 16-device cap never drops a webcam; the id is
+`/dev/videoN`). *List modes* opens the matched node for `ENUM_FMT` / `ENUM_FRAMESIZES` /
+`ENUM_FRAMEINTERVALS` and closes it — no format set, no stream. *Open*: the exact size at the
+closest rate, NV12 > YUYV > MJPEG on ties (Windows' rule), `S_FMT` + `S_PARM`, 4 mmap'd buffers,
+`STREAMON`; *read* polls, drains every completed buffer and keeps the newest (latest-wins without a
+reader thread); NV12 / YUYV planes point into the dequeued buffer until the next read. MJPEG is
+decoded on the CPU (`os_uvc_mjpeg.c`): **libturbojpeg** (`dlopen`'d — no new `DT_NEEDED`, the
+`.deb` soname list is unchanged) straight to the JPEG's Y/Cb/Cr planes with DCT-domain downscaling
+towards the source's output size, else a built-in **stb_image** decoder (full size, slow; one WARN
+at open naming the `libturbojpeg` package); frames without Huffman tables (UVC's AVI1 convention)
+get the Annex K tables inserted. `DXR_STEREO_CAMERA_UVC_DECODER=hardware` refuses MJPEG modes
+(there is no hardware decoder on Linux), `auto` = `software`. Kernel `CLOCK_MONOTONIC` buffer
+timestamps are used as-is (`time_is_exposure` when the driver flags start-of-exposure). Unplug:
+`POLLERR`/`POLLHUP` + `ENODEV` → `READ_ERROR` (one WARN) → the manager ends the stream, as on
+Windows. `uvc-decode-bench` takes a concatenated `.mjpeg` stream there. Tests:
+`tests_uvc_capture_v4l2` (enumeration from a fake sysfs/udev tree, format selection, the decoder
+incl. DHT insertion and both decoders, the real backend on a `file:` stream). **Validated on
+hardware** only against a mono laptop webcam forced through an `sbs-full` entry (ds1-linux,
+2026-10-18): enumeration opened no node, 2880×1800 MJPEG at the camera's own ~16.7 Hz
+(low light) with libturbojpeg (18 ms/frame decode, 0 superseded) vs 8.9 Hz with the built-in
+decoder (97 ms/frame), 640×480 YUYV raw at 16.7 Hz, frames correct in the probe PNGs. **Not
+validated:** a real SBS stereo webcam (no `--rectified` pass is possible on a mono camera),
+hot-unplug, NV12-native devices, the sim_display webcam tracker on Linux. Other platforms: none. A config with `"fake": true`
 (or `{"disparity": 0.04, "dy": 0.005, "pixel": "nv12"|"yuy2", "fps": 30}`, fractions of the eye
 width / height) REPLACES real capture with a synthetic device ("DisplayXR synthetic SBS camera",
 id `dxr-fake-uvc`) that renders a known disparity and a known right-eye vertical offset in any
