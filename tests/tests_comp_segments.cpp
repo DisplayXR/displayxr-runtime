@@ -1069,6 +1069,52 @@ TEST_CASE("content ring: a split slot finds the partition of the frame that fill
 	CHECK_FALSE(comp_segments_content_ring_get(&ring, 0, &out));
 }
 
+TEST_CASE("weave latch: a weave partitions at the window rect read at the weave (#1883)", "[comp_segments]")
+{
+	// Committed at the commit's start; the window has since moved 12 px right
+	// (a drag, during the late-weave pace or before a repaint).
+	const comp_seg_rect committed = {1500, 200, 1000, 600};
+	const comp_seg_rect moved = {1512, 200, 1000, 600};
+	comp_seg_rect out{};
+
+	REQUIRE(comp_segments_latch_window(&committed, &moved, &out));
+	CHECK(out.x == 1512);
+	CHECK(out.y == 200);
+	CHECK(out.w == 1000);
+	CHECK(out.h == 600);
+
+	// The table built from the latch puts the seam where the window IS: with
+	// the seam at desktop x 1920 the primary segment is 1920 - 1512 = 408 px.
+	const comp_segments_screen screens[2] = {
+	    screen(1, 0, 0, 1920, 1080, 1920, 1080, true),
+	    screen(2, 1920, 0, 3840, 2160, 3840, 2160, false),
+	};
+	const comp_seg_rect canvas = {0, 0, out.w, out.h};
+	comp_segment_table t{};
+	comp_segments_compute(&out, &canvas, screens, 2, &t);
+	REQUIRE(t.count == 2);
+	CHECK(t.seg[0].window_rect.w == 408);
+	CHECK(t.seg[1].window_rect.x == 408);
+
+	// A resize in flight (or a read in another DPI-virtualisation space, which
+	// differs in size): keep the committed rect the back buffer was made for.
+	const comp_seg_rect resized = {1512, 200, 1010, 600};
+	CHECK_FALSE(comp_segments_latch_window(&committed, &resized, &out));
+	CHECK(out.x == 1500);
+	CHECK(out.w == 1000);
+
+	// No live read (window gone, minimised to 0x0): committed.
+	CHECK_FALSE(comp_segments_latch_window(&committed, nullptr, &out));
+	CHECK(out.x == 1500);
+	const comp_seg_rect empty = {1512, 200, 0, 0};
+	CHECK_FALSE(comp_segments_latch_window(&committed, &empty, &out));
+	CHECK(out.x == 1500);
+
+	// At rest the latch is the committed rect: unchanged behaviour.
+	REQUIRE(comp_segments_latch_window(&committed, &committed, &out));
+	CHECK(out.x == committed.x);
+}
+
 TEST_CASE("GL segments: top-left rects flip into the bottom-left framebuffer", "[comp_segments][gl]")
 {
 	// The right half of a 1920x1080 window: same x, y counted from the bottom.
