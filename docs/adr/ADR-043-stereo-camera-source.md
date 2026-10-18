@@ -186,8 +186,8 @@ device is a standard UVC camera; the only device-specific facts are its SBS layo
 
 1. **Runtime-owned, vendor-neutral capture code** (`auxiliary/util/u_stereo_uvc.{h,c}` for
    config, matching, the SBS split and the nominal model — pure, tested on every OS;
-   `auxiliary/os/os_uvc_capture*.{h,c,cpp}` for the OS call: Media Foundation on Windows, a
-   V4L2 stub on Linux to follow). It has exactly the six-operation shape of the plug-in camera
+   `auxiliary/os/os_uvc_capture*.{h,c,cpp}` for the OS call: Media Foundation on Windows, V4L2
+   on desktop Linux — added 2026-10-18, see the note at the end of this amendment). It has exactly the six-operation shape of the plug-in camera
    slots, and the camera manager dispatches on a per-camera source tag in one place; consent,
    `CAMERA_CONSUMER` rules, the foreground rule, the in-use indicator, linger, rings,
    rectification and refinement are one code path for both sources. No vendor names, no SDK.
@@ -238,6 +238,18 @@ SBS webcam needs no vendor code, so it lives in the runtime.
 webcam is decoded on the GPU by default (a hardware MJPEG decoder MFT on the adapter that has one,
 via a DXGI device manager, scaled to the output size before it crosses to the CPU), with MF's
 software decoder as the logged fallback; the first hardware run, before that path, delivered
-11.3 Hz. **−** Linux has no backend yet (V4L2 is a TODO). **−** A
+11.3 Hz. **−** ~~Linux has no backend yet~~ (V4L2 landed 2026-10-18, below). **−** A
 loose `match` could claim the wrong webcam; the ambiguity rule and `uvc-devices` mitigate, the
 config is still the user's statement of which device is a stereo pair.
+
+**Linux V4L2 follow-up (2026-10-18).** `auxiliary/os/os_uvc_capture_v4l2.c` fills the same
+backend shape on desktop Linux (`XRT_OS_LINUX_DESKTOP`; `os_uvc_capture_stubs.c` now covers only
+macOS / Android). Matching is the shared rule over V4L2 devices: VID:PID from sysfs, the name from
+the V4L2 card / USB product, id `/dev/videoN`. Enumeration reads sysfs + udev only and never opens a
+node — stronger than "never activates": a rescan cannot touch an eye tracker's camera. Formats
+follow Windows (NV12 > YUYV > MJPEG); MJPEG is a CPU decode (libturbojpeg `dlopen`'d with DCT
+scaling, else the built-in stb_image) because Linux has no MF-style decoder to hand it to; no
+hardware MJPEG decode yet, so `DXR_STEREO_CAMERA_UVC_DECODER=hardware` refuses MJPEG modes. The
+runtime takes no new library dependency. Hardware validation so far: a mono laptop webcam forced
+through an `sbs-full` entry (capture, decode, split, start/stop); a real SBS webcam,
+`--rectified`, and hot-unplug remain owner runs (spec §9a).
