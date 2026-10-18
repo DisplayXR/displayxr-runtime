@@ -483,6 +483,11 @@ if(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
 	# comp_multi already links aux_vk PRIVATE on every platform above, so the
 	# engine needs no extra link here.
 	target_sources(comp_multi PRIVATE multi/comp_multi_weave_linux.c)
+	# #2207: the engine's file-trigger capture (input / atlas / woven PNGs).
+	target_sources(
+		comp_multi PRIVATE multi/comp_multi_weave_capture.c multi/comp_multi_weave_capture.h
+		)
+	target_link_libraries(comp_multi PRIVATE xrt-external-stb)
 endif()
 
 ###

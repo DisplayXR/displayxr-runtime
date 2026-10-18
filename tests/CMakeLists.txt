@@ -200,6 +200,9 @@ if(TARGET target_workspace_config AND NOT WIN32)
 endif()
 # MCP capability marker paths per platform (desktop Linux: XDG config, /etc).
 list(APPEND tests tests_u_mcp_capability)
+# #2207 -- the capture-trigger plumbing the service weave engine uses: the
+# per-client tag trigger, the input/atlas/woven sibling names, RGBA8 readback.
+list(APPEND tests tests_u_capture_intent_tag)
 # Desktop-Linux workspace orchestrator (spawn / respawn / hotkey arming, with a
 # stubbed hotkey backend and a shell-script controller) and the Linux hotkey
 # worker built without its D-Bus / X11 backends -- neither touches the desktop.

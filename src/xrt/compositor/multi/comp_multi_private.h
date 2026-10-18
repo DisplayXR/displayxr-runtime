@@ -42,6 +42,9 @@
 #include "multi/comp_multi_content_blend.h"
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 #include "multi/comp_multi_weave_lift.h"
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "multi/comp_multi_weave_capture.h"
+#endif
 #endif
 
 #include "render/render_interface.h"
@@ -1276,6 +1279,10 @@ struct multi_compositor
 
 		//! XR_DXR_lift §6: lifted weave rects (comp_multi_weave_lift.h).
 		struct comp_multi_weave_lift lift;
+
+		//! #2207: file-trigger capture (input / atlas / woven PNGs) —
+		//! comp_multi_weave_capture.h. Guarded by the weave mutex.
+		struct comp_multi_weave_capture capture;
 	} weave;
 #endif
 };
@@ -2027,6 +2034,16 @@ comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d
  */
 void
 comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * #2207: the weave client's executable basename (the IPC server's OS-derived
+ * per-connection key), the tag of its per-client capture trigger
+ * `$TMPDIR/displayxr_atlas_trigger.<tag>` (comp_multi_weave_capture.h). The IPC
+ * handler sets it before every submit; a NULL / empty tag polls only the
+ * service-process and global triggers.
+ */
+void
+comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *tag);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 
