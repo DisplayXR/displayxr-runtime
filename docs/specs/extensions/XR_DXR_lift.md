@@ -1028,6 +1028,7 @@ displayxr-cli lift caps [--json] [--wait S] [--timeout S]
 displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]
                          [--views N] [--strength F] [--convergence F] [--focal PX]
                          [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR]
+                         [--wait S] [--timeout S] [--content photo|video]
 ```
 
 `conv list` / `conv status` read the running service's status snapshot over DIAG; with no
@@ -1041,7 +1042,14 @@ submits the image(s) through a shared keyed-mutex texture exactly as a browser d
 result back through the export texture + fence and writes `lift_out_<i>.png` (depth normalised
 to 8-bit grey) or `lift_out_<i>.ply`. It prints per frame the submit → acquire latency seen by
 the caller and the service's own latency, and at the end the stream stats and a latency summary.
-`--pipelined` submits at `--fps` without waiting, to measure throughput and drops. `lift caps`
+`--pipelined` submits at `--fps` without waiting, to measure throughput and drops. `--timeout S`
+bounds the **whole** probe (#2151): at the deadline it stops submitting, still prints the stream
+stats and the module's readiness, and exits 5 (a blocking IPC call that never returns is cut 5 s
+later); a frame the service counts as failed is reported the moment the stream's `failed` count
+moves instead of sitting out its 5 s deadline, so a provider that fails every convert finishes in
+seconds with `submitted=N failed=N`. A result that could not be read back says why
+(`(not written: export texture not opened)`, with the `OpenSharedResource1` HRESULT and this
+process's adapter printed once) instead of a bare `(not written)`. `lift caps`
 polls through ACTIVATING for `--wait` seconds (default 8) and is hard-bounded by `--timeout`
 (default `max(10, wait + 2)` s): a service that never answers prints `TIMEOUT` and exits 4
 instead of blocking (#1812). The service answers from its last-known state and never waits on a
