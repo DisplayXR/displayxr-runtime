@@ -8,10 +8,13 @@
  *   displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians]
  *                            [--n N] [--views N] [--strength F] [--convergence F]
  *                            [--focal PX] [--priority paused|low|normal|high]
- *                            [--pipelined] [--fps F] [--out DIR] [--wait S]
+ *                            [--pipelined] [--fps F] [--out DIR] [--wait S] [--timeout S]
  *                            [--content photo|video]
-	 *   --no-write          skip all readback/encode (measure pure submit->acquire; PNG encode of a 4K SBS takes seconds)
-	 *   --write-every N     write only every Nth result (default 1)
+ *   --no-write          skip all readback/encode (measure pure submit->acquire; PNG encode of a 4K SBS takes seconds)
+ *   --write-every N     write only every Nth result (default 1)
+ *   --timeout S         bound the WHOLE probe (#2151): after S seconds it stops submitting, prints the
+ *                       stream stats + the module's last readiness state and exits 5. A frame the
+ *                       service counts as failed is reported at once instead of waiting its deadline.
  *
  * Connects to the running service over IPC as a DIAG client (lift streams are
  * owned by the connection, no session needed) — run it from a NON-elevated
@@ -155,7 +158,11 @@ dxr_utf8_trim_partial(char *s)
 		return;
 	}
 	const unsigned char lead = (unsigned char)s[i - 1];
-	const size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+	const size_t need = (lead & 0x80) == 0      ? 1
+	                    : (lead & 0xE0) == 0xC0 ? 2
+	                    : (lead & 0xF0) == 0xE0 ? 3
+	                    : (lead & 0xF8) == 0xF0 ? 4
+	                                            : 0;
 	if (need == 0 || back + 1 < need) {
 		s[i - 1] = '\0';
 	}
@@ -316,6 +323,69 @@ private:
 	std::thread thread_;
 };
 
+/*!
+ * The hard bound for `lift probe --timeout S` (#2151). cmd_probe itself stops
+ * submitting at the deadline and prints what the stream did; this thread fires
+ * only when a blocking IPC call (connect, caps, submit, acquire, stats) never
+ * returns — a wedged service — @p slack_s after the deadline, since that call
+ * cannot be cancelled from another thread.
+ */
+class probe_watchdog
+{
+public:
+	probe_watchdog(double timeout_s, double slack_s) : timeout_s_(timeout_s)
+	{
+		if (timeout_s_ > 0.0) {
+			limit_s_ = timeout_s_ + slack_s;
+			thread_ = std::thread([this] { run(); });
+		}
+	}
+
+	~probe_watchdog()
+	{
+		{
+			std::lock_guard<std::mutex> g(m_);
+			done_ = true;
+		}
+		cv_.notify_all();
+		if (thread_.joinable()) {
+			thread_.join();
+		}
+	}
+
+	//! @p what must outlive the watchdog (string literals).
+	void
+	set_phase(const char *what)
+	{
+		phase_.store(what);
+	}
+
+private:
+	void
+	run()
+	{
+		std::unique_lock<std::mutex> lk(m_);
+		auto ms = std::chrono::milliseconds((long long)(limit_s_ * 1000.0));
+		if (cv_.wait_for(lk, ms, [this] { return done_; })) {
+			return;
+		}
+		printf(
+		    "displayxr-cli lift probe: --timeout %.1f s passed and the service still has not answered (%s).\n",
+		    timeout_s_, phase_.load());
+		printf("  The service may be wedged; its '[lift]' / '[conv:' log lines say which. No stream stats.\n");
+		fflush(stdout);
+		std::_Exit(5);
+	}
+
+	double timeout_s_;
+	double limit_s_ = 0.0;
+	std::atomic<const char *> phase_{"connecting"};
+	std::mutex m_;
+	std::condition_variable cv_;
+	bool done_ = false;
+	std::thread thread_;
+};
+
 int
 cmd_caps(int argc, const char **argv)
 {
@@ -389,6 +459,11 @@ struct probe_gpu
 	ID3D11Texture2D *staging = nullptr;
 	uint32_t st_w = 0, st_h = 0, st_fmt = 0;
 
+	//! Which adapter this process's device is on (the export must be opened on
+	//! the service's render adapter; a mismatch is the silent "(not written)").
+	char adapter[192] = "(unknown adapter)";
+	bool warned_open = false, warned_fence = false, warned_have = false;
+
 	~probe_gpu()
 	{
 		rel(staging);
@@ -420,6 +495,20 @@ gpu_init(probe_gpu &g)
 	g.dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&g.dev1);
 	g.dev->QueryInterface(__uuidof(ID3D11Device5), (void **)&g.dev5);
 	g.ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&g.ctx4);
+	IDXGIDevice *dxd = nullptr;
+	IDXGIAdapter *ad = nullptr;
+	if (SUCCEEDED(g.dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxd)) && SUCCEEDED(dxd->GetAdapter(&ad))) {
+		DXGI_ADAPTER_DESC d = {};
+		if (SUCCEEDED(ad->GetDesc(&d))) {
+			char name[128] = {0};
+			WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+			snprintf(g.adapter, sizeof(g.adapter), "%s (LUID %08lx:%08lx)", name,
+			         (unsigned long)d.AdapterLuid.HighPart, (unsigned long)d.AdapterLuid.LowPart);
+		}
+	}
+	rel(ad);
+	rel(dxd);
+	printf("D3D11 device: %s\n", g.adapter);
 	return g.dev1 != nullptr && g.dev5 != nullptr && g.ctx4 != nullptr;
 }
 
@@ -474,10 +563,17 @@ upload(probe_gpu &g, const uint8_t *rgba, uint32_t w, uint32_t h)
 }
 
 //! Read the export texture back (after waiting its fence) and write a PNG.
+//! False = not written; @p why says what stopped it (#2153's zero-PNG runs).
 bool
-read_back_png(probe_gpu &g, uint64_t fence_value, uint32_t w, uint32_t h, uint32_t fmt, const std::string &path)
+read_back_png(
+    probe_gpu &g, uint64_t fence_value, uint32_t w, uint32_t h, uint32_t fmt, const std::string &path, std::string *why)
 {
-	if (g.out_tex == nullptr || g.out_fence == nullptr) {
+	if (g.out_tex == nullptr) {
+		*why = "export texture not opened";
+		return false;
+	}
+	if (g.out_fence == nullptr) {
+		*why = "export fence not opened";
 		return false;
 	}
 	if (g.staging == nullptr || g.st_w != w || g.st_h != h || g.st_fmt != fmt) {
@@ -491,8 +587,12 @@ read_back_png(probe_gpu &g, uint64_t fence_value, uint32_t w, uint32_t h, uint32
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_STAGING;
 		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		if (FAILED(g.dev->CreateTexture2D(&td, nullptr, &g.staging))) {
-			printf("  staging %ux%u fmt=%u create failed\n", w, h, fmt);
+		HRESULT hr = g.dev->CreateTexture2D(&td, nullptr, &g.staging);
+		if (FAILED(hr)) {
+			char b[96];
+			snprintf(b, sizeof(b), "staging %ux%u fmt=%u create failed hr=0x%08lx", w, h, fmt,
+			         (unsigned long)hr);
+			*why = b;
 			return false;
 		}
 		g.st_w = w;
@@ -502,7 +602,11 @@ read_back_png(probe_gpu &g, uint64_t fence_value, uint32_t w, uint32_t h, uint32
 	g.ctx4->Wait(g.out_fence, fence_value);
 	g.ctx->CopyResource(g.staging, g.out_tex);
 	D3D11_MAPPED_SUBRESOURCE m = {};
-	if (FAILED(g.ctx->Map(g.staging, 0, D3D11_MAP_READ, 0, &m))) {
+	HRESULT mhr = g.ctx->Map(g.staging, 0, D3D11_MAP_READ, 0, &m);
+	if (FAILED(mhr)) {
+		char b[64];
+		snprintf(b, sizeof(b), "staging map failed hr=0x%08lx", (unsigned long)mhr);
+		*why = b;
 		return false;
 	}
 	std::vector<uint8_t> rgba((size_t)w * h * 4);
@@ -548,11 +652,17 @@ read_back_png(probe_gpu &g, uint64_t fence_value, uint32_t w, uint32_t h, uint32
 		}
 	} else {
 		g.ctx->Unmap(g.staging, 0);
-		printf("  (format %u not written as PNG)\n", fmt);
+		char b[48];
+		snprintf(b, sizeof(b), "format %u not written as PNG", fmt);
+		*why = b;
 		return false;
 	}
 	g.ctx->Unmap(g.staging, 0);
-	return stbi_write_png(path.c_str(), (int)w, (int)h, 4, rgba.data(), (int)w * 4) != 0;
+	if (stbi_write_png(path.c_str(), (int)w, (int)h, 4, rgba.data(), (int)w * 4) == 0) {
+		*why = "stbi_write_png failed (does --out exist?)";
+		return false;
+	}
+	return true;
 }
 
 std::vector<std::string>
@@ -597,6 +707,7 @@ cmd_probe(int argc, const char **argv)
 		    "usage: displayxr-cli lift probe <image|frames_dir> [--mode depth|sbs|nview|gaussians] [--n N]\n"
 		    "       [--views N] [--strength F] [--convergence F] [--focal PX]\n"
 		    "       [--priority paused|low|normal|high] [--pipelined] [--fps F] [--out DIR] [--wait S]\n"
+		    "       [--timeout S]             (bound the whole probe; prints the stream stats, exits 5)\n"
 		    "       [--content photo|video]   (default video; photo: --mode depth is served by DEPTH_MONO)\n");
 		return 1;
 	}
@@ -609,6 +720,9 @@ cmd_probe(int argc, const char **argv)
 	const int write_every = std::max(1, atoi(opt_value(argc, argv, "--write-every", "1")));
 	const double fps = atof(opt_value(argc, argv, "--fps", "30"));
 	const double wait_s = atof(opt_value(argc, argv, "--wait", "30"));
+	// #2151: --timeout bounds the WHOLE probe (connect, caps, every frame, the
+	// stats), not only the caps wait. 0 = no bound beyond the per-frame deadline.
+	const double timeout_s = atof(opt_value(argc, argv, "--timeout", "0"));
 	const std::string prio_s = opt_value(argc, argv, "--priority", "normal");
 	// The content hint: VIDEO (default) keeps temporal state, so DEPTH is served
 	// by DEPTH_VIDEO; PHOTO selects DEPTH_MONO (a stills-only provider). GAUSSIANS
@@ -647,13 +761,31 @@ cmd_probe(int argc, const char **argv)
 		return 1;
 	}
 
+	// The soft deadline: checked between IPC calls, so the stream's stats and
+	// the module's state still get printed. The watchdog is for a call that
+	// never returns. A redirected stdout is fully buffered, hence the flushes:
+	// a probe that has to be killed must leave its lines behind.
+	const uint64_t t_start = os_monotonic_get_ns();
+	const uint64_t probe_deadline = timeout_s > 0.0 ? t_start + (uint64_t)(timeout_s * 1e9) : UINT64_MAX;
+	auto past_deadline = [&]() { return (uint64_t)os_monotonic_get_ns() > probe_deadline; };
+	auto remaining_s = [&]() {
+		const uint64_t now = os_monotonic_get_ns();
+		return probe_deadline == UINT64_MAX
+		           ? 1e9
+		           : (now >= probe_deadline ? 0.0 : (double)(probe_deadline - now) / 1e9);
+	};
+	probe_watchdog wd(timeout_s, 5.0);
+
 	struct ipc_connection ipc_c = {};
 	if (!connect(&ipc_c)) {
 		return 2;
 	}
+	wd.set_phase("waiting for the conversion module's capabilities");
 	struct xrt_dp_lift_caps caps;
-	printf("waiting for the conversion module (up to %.0f s)...\n", wait_s);
-	if (!wait_caps(&ipc_c, wait_s, &caps, true)) {
+	const double caps_wait_s = std::min(wait_s, remaining_s());
+	printf("waiting for the conversion module (up to %.0f s)...\n", caps_wait_s);
+	fflush(stdout);
+	if (!wait_caps(&ipc_c, caps_wait_s, &caps, true)) {
 		ipc_client_connection_fini(&ipc_c);
 		return 2;
 	}
@@ -661,7 +793,7 @@ cmd_probe(int argc, const char **argv)
 	if (caps.state != XRT_DP_LIFT_STATE_READY || (caps.modes & mode) == 0) {
 		printf("module not READY for mode %s — nothing to probe.\n", mode_s.c_str());
 		ipc_client_connection_fini(&ipc_c);
-		return 3;
+		return past_deadline() ? 5 : 3;
 	}
 
 	probe_gpu g;
@@ -670,12 +802,13 @@ cmd_probe(int argc, const char **argv)
 		return 2;
 	}
 
+	wd.set_phase("creating the stream");
 	uint64_t sid = 0;
-	xrt_result_t xret = ipc_client_lift_stream_create(
-	    &ipc_c, mode,
-	    mode == XRT_DP_LIFT_MODE_GAUSSIANS || content_s == "photo" ? XRT_DP_LIFT_CONTENT_PHOTO
-	                                                               : XRT_DP_LIFT_CONTENT_VIDEO,
-	    1.0f, /*aux_outputs*/ 0, /*aux_depth_format*/ 0, &sid);
+	xrt_result_t xret = ipc_client_lift_stream_create(&ipc_c, mode,
+	                                                  mode == XRT_DP_LIFT_MODE_GAUSSIANS || content_s == "photo"
+	                                                      ? XRT_DP_LIFT_CONTENT_PHOTO
+	                                                      : XRT_DP_LIFT_CONTENT_VIDEO,
+	                                                  1.0f, /*aux_outputs*/ 0, /*aux_depth_format*/ 0, &sid);
 	if (xret != XRT_SUCCESS) {
 		printf("lift_stream_create failed: %d\n", (int)xret);
 		ipc_client_connection_fini(&ipc_c);
@@ -686,14 +819,23 @@ cmd_probe(int argc, const char **argv)
 	       mode_s.c_str(), prio_s.c_str(), n_frames, frames.size(),
 	       pipelined ? "pipelined (latest wins)" : "sequential (wait for each result)");
 	printf("%6s %10s %12s %12s %12s  %s\n", "frame", "frame_id", "submit->acq", "svc_latency", "out", "file");
+	fflush(stdout);
 
 	std::vector<double> lat_ms;
 	int written = 0;
+	int failed_frames = 0;
+	bool hit_deadline = false;
 	int cached_idx = -1;
 	int iw = 0, ih = 0;
 	stbi_uc *pixels = nullptr;
 	uint64_t next_submit_ns = os_monotonic_get_ns();
+	wd.set_phase("submitting a frame / waiting for its result");
 	for (int i = 0; i < n_frames; i++) {
+		if (past_deadline()) {
+			printf("--timeout %.1f s passed after %d frame(s): stopping.\n", timeout_s, i);
+			hit_deadline = true;
+			break;
+		}
 		int idx = (int)(i % frames.size());
 		if (idx != cached_idx) {
 			if (pixels != nullptr) {
@@ -718,6 +860,13 @@ cmd_probe(int argc, const char **argv)
 			}
 			next_submit_ns += (uint64_t)(1e9 / (fps > 0 ? fps : 30));
 		}
+		// #2151: a convert the service counts as failed never yields a result;
+		// without this every such frame sat out its whole deadline (100 frames
+		// x 5 s looked like a hang). The stream's failed count before the
+		// submit is the baseline; the wait below polls it.
+		struct xrt_lift_stream_stats before = {};
+		(void)ipc_client_lift_stats(&ipc_c, sid, &before);
+
 		uint64_t t_submit = os_monotonic_get_ns();
 		uint64_t frame_id = 0;
 		xret =
@@ -725,12 +874,14 @@ cmd_probe(int argc, const char **argv)
 		                           (uint32_t)ih, (int64_t)i, &params, nullptr, 0, nullptr, nullptr, &frame_id);
 		if (xret != XRT_SUCCESS) {
 			printf("%6d submit refused (xrt_result=%d) — retrying next frame\n", i, (int)xret);
+			fflush(stdout);
 			continue;
 		}
 
 		// Sequential: wait (bounded) for THIS frame's result. Pipelined: take
 		// whatever is newest right now.
 		const uint64_t deadline = t_submit + (uint64_t)(mode == XRT_DP_LIFT_MODE_GAUSSIANS ? 30e9 : 5e9);
+		uint64_t next_stats_ns = t_submit + 200ull * 1000ull * 1000ull;
 		for (;;) {
 			bool got = false;
 			uint64_t t_acq = 0; // stamped when the result is acquired, BEFORE any readback/encode
@@ -781,32 +932,69 @@ cmd_probe(int argc, const char **argv)
 					if (r.output_realloc || g.out_tex == nullptr) {
 						rel(g.out_tex);
 						rel(g.out_fence);
+						// Every failure here used to be silent and ended as a
+						// bare "(not written)" on each frame (#2153): say what
+						// the service handed over and what this device made of it.
 						bool have = false;
 						xrt_graphics_buffer_handle_t th = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 						uint32_t ow = 0, oh = 0, of = 0;
-						if (ipc_client_lift_get_output(&ipc_c, sid, &have, &ow, &oh, &of,
-						                               &th) == XRT_SUCCESS &&
-						    have) {
-							g.dev1->OpenSharedResource1(
+						xrt_result_t gr =
+						    ipc_client_lift_get_output(&ipc_c, sid, &have, &ow, &oh, &of, &th);
+						if (gr == XRT_SUCCESS && have) {
+							HRESULT hr = g.dev1->OpenSharedResource1(
 							    (HANDLE)th, __uuidof(ID3D11Texture2D), (void **)&g.out_tex);
 							CloseHandle((HANDLE)th);
+							if (FAILED(hr) && !g.warned_open) {
+								g.warned_open = true;
+								g.out_tex = nullptr;
+								printf(
+								    "  export texture %ux%u fmt %u: "
+								    "OpenSharedResource1 failed hr=0x%08lx on %s\n"
+								    "  (the export lives on the service's render "
+								    "adapter; a cross-adapter open "
+								    "fails this way)\n",
+								    ow, oh, of, (unsigned long)hr, g.adapter);
+							}
+						} else if (!g.warned_have) {
+							g.warned_have = true;
+							printf(
+							    "  the service exported no output texture "
+							    "(lift_get_output: xrt_result %d, "
+							    "have=%d)\n",
+							    (int)gr, have ? 1 : 0);
 						}
 						xrt_graphics_sync_handle_t fh = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
-						if (ipc_client_lift_get_fence(&ipc_c, sid, &have, &fh) == XRT_SUCCESS &&
-						    have) {
-							g.dev5->OpenSharedFence((HANDLE)fh, __uuidof(ID3D11Fence),
-							                        (void **)&g.out_fence);
+						gr = ipc_client_lift_get_fence(&ipc_c, sid, &have, &fh);
+						if (gr == XRT_SUCCESS && have) {
+							HRESULT hr = g.dev5->OpenSharedFence(
+							    (HANDLE)fh, __uuidof(ID3D11Fence), (void **)&g.out_fence);
 							CloseHandle((HANDLE)fh);
+							if (FAILED(hr) && !g.warned_fence) {
+								g.warned_fence = true;
+								g.out_fence = nullptr;
+								printf(
+								    "  export fence: OpenSharedFence failed hr=0x%08lx "
+								    "on %s\n",
+								    (unsigned long)hr, g.adapter);
+							}
+						} else if (!g.warned_fence) {
+							g.warned_fence = true;
+							printf(
+							    "  the service exported no fence (lift_get_fence: "
+							    "xrt_result %d, have=%d)\n",
+							    (int)gr, have ? 1 : 0);
 						}
 					}
 					char name[64];
 					snprintf(name, sizeof(name), "lift_out_%d.png", i);
 					file = out_dir + "\\" + name;
 					const bool want_write = !no_write && (i % write_every == 0);
-					if (want_write && read_back_png(g, r.fence_value, r.width, r.height, r.format, file)) {
+					std::string why;
+					if (want_write &&
+					    read_back_png(g, r.fence_value, r.width, r.height, r.format, file, &why)) {
 						written++;
 					} else {
-						file = "(not written)";
+						file = want_write ? "(not written: " + why + ")" : "(not written)";
 					}
 					char d[64];
 					snprintf(d, sizeof(d), "%ux%u/%uv", r.width, r.height, r.view_count);
@@ -818,15 +1006,34 @@ cmd_probe(int argc, const char **argv)
 				break;
 			}
 			if (got && (pipelined || got_id >= frame_id)) {
-				double ms = (double)((t_acq ? t_acq : (uint64_t)os_monotonic_get_ns()) - t_submit) / 1e6;
+				double ms =
+				    (double)((t_acq ? t_acq : (uint64_t)os_monotonic_get_ns()) - t_submit) / 1e6;
 				lat_ms.push_back(ms);
 				printf("%6d %10llu %10.2fms %10.2fms %12s  %s\n", i, (unsigned long long)got_id, ms,
 				       (double)svc_lat / 1e6, outdesc.c_str(), file.c_str());
+				fflush(stdout);
 				break;
 			}
-			if (pipelined || (uint64_t)os_monotonic_get_ns() > deadline) {
-				if (!pipelined) {
+			const uint64_t now = os_monotonic_get_ns();
+			if (!pipelined && now >= next_stats_ns) {
+				next_stats_ns = now + 200ull * 1000ull * 1000ull;
+				struct xrt_lift_stream_stats cur = {};
+				if (ipc_client_lift_stats(&ipc_c, sid, &cur) == XRT_SUCCESS &&
+				    cur.failed > before.failed) {
+					failed_frames++;
+					printf(
+					    "%6d FAILED in the service (stream failed=%llu); its '[conv:' / '[lift]' "
+					    "WARN "
+					    "lines name the stage\n",
+					    i, (unsigned long long)cur.failed);
+					fflush(stdout);
+					break;
+				}
+			}
+			if (pipelined || now > deadline || past_deadline()) {
+				if (!pipelined && !past_deadline()) {
 					printf("%6d no result within the deadline\n", i);
+					fflush(stdout);
 				}
 				break;
 			}
@@ -836,6 +1043,7 @@ cmd_probe(int argc, const char **argv)
 	if (pixels != nullptr) {
 		stbi_image_free(pixels);
 	}
+	wd.set_phase("reading the stream stats");
 
 	struct xrt_lift_stream_stats st = {};
 	if (ipc_client_lift_stats(&ipc_c, sid, &st) == XRT_SUCCESS) {
@@ -857,8 +1065,30 @@ cmd_probe(int argc, const char **argv)
 		       s.size(), sum / s.size(), s[s.size() / 2], s[(size_t)(s.size() * 0.95)], s.front(), s.back(),
 		       written);
 	}
+	if (failed_frames > 0) {
+		printf(
+		    "%d frame(s) failed in the service; `displayxr-cli conv status` names the provider and its "
+		    "readiness, the service log the stage.\n",
+		    failed_frames);
+	}
+	// The module's readiness as the probe leaves it: a provider that went
+	// FAILED / UNAVAILABLE mid-stream shows here, next to the stats.
+	struct xrt_dp_lift_caps last;
+	if (ipc_client_lift_get_properties(&ipc_c, &last) == XRT_SUCCESS) {
+		const char *ms = xrt_dp_lift_module_status_str(last.module_status);
+		char ver[sizeof(last.module_version)];
+		snprintf(ver, sizeof(ver), "%s", last.module_version);
+		dxr_utf8_trim_partial(ver);
+		printf("module now: %s, backend %s%s%s%s%s\n", state_str(last.state),
+		       last.backend[0] != '\0' ? last.backend : "(none)", ms != nullptr ? ", " : "",
+		       ms != nullptr ? ms : "", ver[0] != '\0' ? " " : "", ver);
+	}
+	fflush(stdout);
 	(void)ipc_client_lift_stream_destroy(&ipc_c, sid);
 	ipc_client_connection_fini(&ipc_c);
+	if (hit_deadline) {
+		return 5;
+	}
 	return lat_ms.empty() ? 4 : 0;
 }
 
