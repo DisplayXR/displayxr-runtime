@@ -257,6 +257,16 @@ bool
 sim_display_webcam_tracking_status(bool *out_tracking, uint64_t *out_edges);
 
 /*!
+ * ADR-043 Amendment 5 (xrt_plugin_iface::get_claimed_cameras): the webcam
+ * the opt-in eye tracker reads, so the service's UVC stereo source never
+ * claims it. Requested tracking only (SIM_DISPLAY_WEBCAM_TRACKING); the
+ * device is resolved by the tracker's own selection over an enumeration that
+ * opens nothing. Writes the OS device id. @return the count (0 or 1).
+ */
+uint32_t
+sim_display_webcam_claimed_cameras(uint32_t capacity, char (*out_ids)[256]);
+
+/*!
  * The eye-tracking control contracts the session display advertises:
  * MANUAL under SIM_DISPLAY_FAKE_TRACKING, MANAGED under enabled webcam
  * tracking (the default when both), none otherwise.

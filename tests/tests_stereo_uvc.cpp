@@ -317,6 +317,57 @@ TEST_CASE("uvc matching: a plug-in's camera is never claimed", "[stereo_uvc]")
 	CHECK(u == nullptr);
 }
 
+TEST_CASE("uvc denylist: tracker cameras are refused whatever the config says", "[stereo_uvc][denylist]")
+{
+	// ADR-043 Amendment 5.
+	u_stereo_uvc_device webcam{};
+	snprintf(webcam.name, sizeof(webcam.name), "Integrated Camera: Integrated C");
+	snprintf(webcam.id, sizeof(webcam.id), "/dev/video0");
+	webcam.has_vid_pid = true;
+	webcam.vid = 0x04f2;
+	webcam.pid = 0xb87a;
+	CHECK_FALSE(u_stereo_uvc_builtin_tracker_refusal(&webcam));
+	CHECK(u_stereo_uvc_refusal(&webcam, nullptr) == U_STEREO_UVC_REFUSAL_NONE);
+
+	// Built-in: VID:PIDs plug-ins reported as tracker cameras, and generic names.
+	u_stereo_uvc_device t1 = webcam;
+	t1.pid = 0xb70c;
+	CHECK(u_stereo_uvc_refusal(&t1, nullptr) == U_STEREO_UVC_REFUSAL_BUILTIN);
+	u_stereo_uvc_device t2 = webcam;
+	t2.vid = 0x04e8;
+	t2.pid = 0x20d7;
+	CHECK(u_stereo_uvc_builtin_tracker_refusal(&t2));
+	u_stereo_uvc_device t3{};
+	snprintf(t3.name, sizeof(t3.name), "USB Eye Tracking Camera");
+	CHECK(u_stereo_uvc_builtin_tracker_refusal(&t3));
+	snprintf(t3.name, sizeof(t3.name), "Panel TRACKING CAMERA");
+	CHECK(u_stereo_uvc_builtin_tracker_refusal(&t3));
+	snprintf(t3.name, sizeof(t3.name), "Stereo Webcam 3D");
+	CHECK_FALSE(u_stereo_uvc_builtin_tracker_refusal(&t3));
+
+	// Plug-in camera hint first, then the plug-in's declaration, then the built-in list.
+	const char *hints[] = {"/dev/video0"};
+	const char *declared[] = {"04f2:b87a"};
+	u_stereo_uvc_denylist dl{hints, 1, declared, 1};
+	CHECK(u_stereo_uvc_refusal(&webcam, &dl) == U_STEREO_UVC_REFUSAL_PLUGIN_CAMERA);
+	u_stereo_uvc_denylist dl2{nullptr, 0, declared, 1};
+	CHECK(u_stereo_uvc_refusal(&webcam, &dl2) == U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED);
+	CHECK(std::string(u_stereo_uvc_refusal_str(U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED)).find("plug-in") !=
+	      std::string::npos);
+
+	// Through the source (fake backend, device id "dxr-fake-uvc"): an EXPLICIT
+	// match claims nothing once the display plug-in declares the device.
+	u_stereo_uvc_config cfg = parse_ok(R"({"fake": true, "uvc": [{"match": "DisplayXR synthetic SBS camera"}]})");
+	const char *fake_claim[] = {"dxr-fake-uvc"};
+	u_stereo_uvc_denylist dl3{nullptr, 0, fake_claim, 1};
+	u_stereo_uvc *u = u_stereo_uvc_create_ex(&cfg, nullptr, &dl3);
+	CHECK(u_stereo_uvc_enumerate(u, 0, nullptr) == 0);
+	u_stereo_uvc_destroy(&u);
+	u = u_stereo_uvc_create_ex(&cfg, nullptr, nullptr);
+	CHECK(u_stereo_uvc_enumerate(u, 0, nullptr) == 1);
+	u_stereo_uvc_destroy(&u);
+}
+
 TEST_CASE("uvc geometry: per-eye output size", "[stereo_uvc]")
 {
 	uint32_t w = 0, h = 0;

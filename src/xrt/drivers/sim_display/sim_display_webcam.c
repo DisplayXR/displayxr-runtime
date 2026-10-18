@@ -33,6 +33,7 @@
 #include "os/os_time.h"
 #include "os/os_uvc_capture.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +49,37 @@ sim_display_webcam_tracking_requested(void)
 {
 	// Through the host iface (N3c, sim_display_settings.h; cached per process).
 	return sim_display_setting_on("WEBCAM_TRACKING");
+}
+
+uint32_t
+sim_display_webcam_claimed_cameras(uint32_t capacity, char (*out_ids)[256])
+{
+	if (!sim_display_webcam_tracking_requested()) {
+		return 0;
+	}
+	struct u_stereo_uvc_backend backend;
+	if (!os_uvc_capture_backend(&backend) || backend.enumerate == NULL) {
+		return 0;
+	}
+	struct u_stereo_uvc_device *devs =
+	    (struct u_stereo_uvc_device *)calloc(U_STEREO_UVC_MAX_DEVICES, sizeof(*devs));
+	if (devs == NULL) {
+		return 0;
+	}
+	uint32_t n = backend.enumerate(backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES); // lists, opens nothing
+	n = n > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : n;
+	char device[256];
+	const char *sel = sim_display_setting("WEBCAM_DEVICE", device, sizeof(device)) ? device : NULL;
+	const int32_t idx = sim_webcam_select_device(devs, n, sel);
+	uint32_t count = 0;
+	if (idx >= 0 && devs[idx].id[0] != '\0') {
+		if (capacity > 0 && out_ids != NULL) {
+			snprintf(out_ids[0], 256, "%s", devs[idx].id);
+		}
+		count = 1;
+	}
+	free(devs);
+	return count;
 }
 
 bool

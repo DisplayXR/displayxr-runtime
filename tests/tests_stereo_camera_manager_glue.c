@@ -296,6 +296,44 @@ scm_create_fake_plugin(void)
 	return create_with(NULL, &g_fake_xinst, -1); // the test drives every rescan
 }
 
+static struct
+{
+	uint32_t count;
+	char ids[XRT_PLUGIN_CLAIMED_CAMERAS_MAX][XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX];
+} g_claims;
+
+static uint32_t
+fake_get_claimed_cameras(struct xrt_plugin_instance *inst,
+                         uint32_t capacity,
+                         char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX])
+{
+	(void)inst;
+	for (uint32_t i = 0; i < g_claims.count && i < capacity && out_ids != NULL; i++) {
+		snprintf(out_ids[i], XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX, "%s", g_claims.ids[i]);
+	}
+	return g_claims.count;
+}
+
+void
+scm_fake_claims_set(const char *const *ids, uint32_t count)
+{
+	g_claims.count = count > XRT_PLUGIN_CLAIMED_CAMERAS_MAX ? XRT_PLUGIN_CLAIMED_CAMERAS_MAX : count;
+	for (uint32_t i = 0; i < g_claims.count; i++) {
+		snprintf(g_claims.ids[i], sizeof(g_claims.ids[i]), "%s", ids[i]);
+	}
+}
+
+struct scm_fixture *
+scm_create_claiming_plugin(const struct u_stereo_uvc_config *cfg)
+{
+	memset(&g_fake_iface, 0, sizeof(g_fake_iface));
+	g_fake_iface.struct_size = (uint32_t)sizeof(g_fake_iface);
+	g_fake_iface.get_claimed_cameras = fake_get_claimed_cameras; // no camera slots at all
+	memset(&g_fake_xinst, 0, sizeof(g_fake_xinst));
+	g_fake_xinst.get_active_plugin = fake_get_active_plugin;
+	return create_with(cfg, &g_fake_xinst, -1);
+}
+
 bool
 scm_rescan(struct scm_fixture *f)
 {

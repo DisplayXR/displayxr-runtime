@@ -794,6 +794,16 @@ id `dxr-fake-uvc`) that renders a known disparity and a known right-eye vertical
 layout — the hardware-free path through the whole manager (`tests_stereo_camera_manager`, and
 `camera probe --rectified` against a service on any OS).
 
+**Tracker-camera denylist (ADR-043 Amendment 5).** Before any config entry is matched, the source
+marks unavailable every device that (1) a plug-in camera names in `platform_device_hint`, (2) the
+active display plug-in declares through `xrt_plugin_iface::get_claimed_cameras` (USB `"vvvv:pppp"`
+or OS device ids; optional slot, ADR-020 append-only, `XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS`), or
+(3) is on the runtime's small built-in list (a few VID:PIDs plug-ins already reported as tracker
+cameras; the generic names "tracking camera" / "eye track"). The denylist wins over every entry,
+an explicit `vid_pid` included: such a device is never claimed or opened, and each entry that
+would have matched logs `stereo camera (uvc): config entry N matches "<name>" (VID:PID …, <id>)
+— REFUSED: <reason>`. `camera uvc-devices` marks built-in refusals.
+
 **Diagnostics.** (See also the decode-path tools above.) `displayxr-cli camera list` tags each camera `(source: plugin|uvc)` (`"source"` in
 `--json`; the wire carries it in the former `reserved` word of the properties — the OpenXR struct
 is unchanged). `displayxr-cli camera uvc-devices [--modes]` runs locally (no service): the config

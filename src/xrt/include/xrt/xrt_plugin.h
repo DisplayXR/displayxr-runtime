@@ -944,6 +944,11 @@ struct xrt_plugin_stereo_camera_frame
 //! Opaque plug-in-owned open camera.
 struct xrt_plugin_stereo_camera;
 
+//! Bytes per id of @ref xrt_plugin_iface::get_claimed_cameras (NUL included).
+#define XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX 256
+//! Ids the runtime asks @ref xrt_plugin_iface::get_claimed_cameras for at most.
+#define XRT_PLUGIN_CLAIMED_CAMERAS_MAX 8
+
 
 /*!
  * @name Per-screen vendor status (ADR-051 D2)
@@ -1718,7 +1723,66 @@ struct xrt_plugin_iface
 	 * @ref XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
 	 */
 	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*!
+	 * The capture devices this plug-in's display owns — above all the camera
+	 * its EYE TRACKER reads (ADR-043 Amendment 5). The service's own UVC
+	 * stereo webcam source (Amendment 4, util/u_stereo_uvc.h) never claims a
+	 * device listed here, whatever the user's stereo-cameras.json matches:
+	 * the denylist wins over every config entry, explicit VID:PID included.
+	 *
+	 * Fill up to @p capacity ids (@p out_ids may be NULL when @p capacity is
+	 * 0) and return how many the plug-in claims (it may exceed @p capacity;
+	 * the extra are dropped). Each id is NUL-terminated, at most
+	 * @ref XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX bytes, in the same forms as
+	 * @ref xrt_plugin_stereo_camera_info::platform_device_hint:
+	 *   - a USB `"vvvv:pppp"` (hex VID:PID) — the preferred form: it names
+	 *     every unit of that model and needs no enumeration; or
+	 *   - the OS device id (Windows: the device interface / Media Foundation
+	 *     symbolic link; Linux: `/dev/videoN`).
+	 *
+	 * Unlike the stereo camera slots this is a DECLARATION, not a resolution:
+	 * list the camera(s) the tracker may use even when none is attached or
+	 * the tracker is not running, and every candidate when several could be
+	 * it (a denylist does not need the ambiguity rule a hint does).
+	 *
+	 * Contract: pure and cheap (the service calls it on every camera rescan,
+	 * every ~2 s while a client listens); callable from any thread, with
+	 * @p inst NULL for a plug-in without instance state; MUST NOT open,
+	 * activate or start any capture device.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * declares nothing; the runtime still refuses its own conservative
+	 * built-in list (u_stereo_uvc_builtin_tracker_refusal) and every plug-in
+	 * camera's platform_device_hint. Appended per ADR-020 (append-only within
+	 * a major; gated by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT
+	 * bump) after @ref describe_settings. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS.
+	 */
+	uint32_t (*get_claimed_cameras)(struct xrt_plugin_instance *inst,
+	                                uint32_t capacity,
+	                                char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]);
 };
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_claimed_cameras (ADR-043 Amendment 5), so a plug-in
+ * built against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_claimed_cameras
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_claimed_cameras(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_claimed_cameras) + sizeof(iface->get_claimed_cameras) &&
+	       iface->get_claimed_cameras != NULL;
+}
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

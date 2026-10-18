@@ -267,6 +267,36 @@ drain(scm_fixture *f, uint32_t kind)
 
 } // namespace
 
+TEST_CASE("tracker-camera denylist: a display plug-in's declared camera is never claimed",
+          "[stereo_camera_manager][denylist]")
+{
+	// ADR-043 Amendment 5: the config names the device EXPLICITLY, yet the
+	// active plug-in declares it as its tracker's camera -> refused.
+	u_stereo_uvc_config cfg = fake_config();
+	const char *claimed[] = {"dxr-fake-uvc"};
+	scm_fake_claims_set(claimed, 1);
+	scm_fixture *f = scm_create_claiming_plugin(&cfg);
+	REQUIRE(f != nullptr);
+	CHECK(scm_count(f) == 0);
+
+	// The plug-in stops declaring it (another camera now): the webcam is ours.
+	const char *other[] = {"04e8:20d7"};
+	scm_fake_claims_set(other, 1);
+	CHECK(scm_rescan(f));
+	REQUIRE(scm_count(f) == 1);
+	xrt_stereo_camera_properties p;
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.source == XRT_STEREO_CAMERA_SOURCE_UVC);
+
+	// Declared again: the camera goes away on the next rescan.
+	scm_fake_claims_set(claimed, 1);
+	CHECK(scm_rescan(f));
+	REQUIRE(scm_properties(f, 0, &p) == XRT_SUCCESS);
+	CHECK(p.state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+	scm_destroy(f);
+	scm_fake_claims_set(nullptr, 0);
+}
+
 TEST_CASE("re-enumeration: stable ids, appended, vanished in place, event", "[stereo_camera_manager][rescan]")
 {
 	const char *ids_a[] = {"test:A"};

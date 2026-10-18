@@ -76,6 +76,19 @@ scm_fake_plugin_enumerate_calls(void);
 struct scm_fixture *
 scm_create_fake_plugin(void);
 
+/*
+ * ADR-043 Amendment 5: a fake display plug-in with NO camera slots that only
+ * DECLARES the cameras its display owns (get_claimed_cameras), next to the
+ * UVC source on @p cfg (a "fake" config; the synthetic device's id is
+ * "dxr-fake-uvc"). Background rescan off.
+ */
+struct scm_fixture *
+scm_create_claiming_plugin(const struct u_stereo_uvc_config *cfg);
+
+//! The ids the claiming plug-in declares from now on.
+void
+scm_fake_claims_set(const char *const *ids, uint32_t count);
+
 //! Forced re-enumeration; true if the camera set changed.
 bool
 scm_rescan(struct scm_fixture *f);
