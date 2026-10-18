@@ -894,7 +894,7 @@ rescan(void)
 		const bool reregistered = k >= 0 && (strcmp(g.entries[k].version, e->version) != 0 ||
 		                                     strcmp(g.entries[k].binary_path, e->binary_path) != 0);
 		struct conv_host *sat = NULL;
-		for (uint32_t j = 0; reregistered && j < g.sat_count; j++) {
+		for (uint32_t j = 0; k >= 0 && j < g.sat_count; j++) {
 			if (strcmp(g.sat_ids[j], e->id) == 0) {
 				sat = g.sat_hosts[j];
 			}
@@ -906,7 +906,28 @@ rescan(void)
 		os_mutex_unlock(&g.mtx);
 #ifdef CONV_HAVE_HOST_PROXY
 		if (sat != NULL) {
-			conv_host_proxy_config_changed(sat);
+			bool clear_gate = reregistered;
+			if (!clear_gate) {
+				// #2153 (found live): a satellite whose host failed to LOAD --
+				// its probe declined (`Settings\ENABLE` unset, a licence gate),
+				// negotiate refused -- sits FAILED "until a configuration
+				// change", and the change that fixes it is `conv set <id> KEY
+				// value` or `conv enable <id>`: neither touches Version or
+				// Binary, so rule (i) above never fired and the provider could
+				// not be enabled without a service restart. Any edit under the
+				// conversion store clears a load failure: the retry is one
+				// short spawn (a declining host exits within milliseconds), and
+				// the core's REGISTRY_CHANGED re-warm below is the demand that
+				// spawns it. A crash loop keeps the own-row rule.
+				struct conv_supervisor_status st;
+				long pid = 0;
+				conv_host_proxy_get_status(sat, &st, &pid);
+				clear_gate =
+				    st.state == CONV_SUP_FAILED && st.failure_reason != XRT_CONV_FAIL_CRASH_LOOP;
+			}
+			if (clear_gate) {
+				conv_host_proxy_config_changed(sat);
+			}
 		}
 #else
 		(void)sat;
@@ -1036,7 +1057,8 @@ on_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
 	}
 	if (reason == SERVICE_COMPONENT_WATCH_PROVIDER_NOTIFY) {
 		redescribe_all();
-		return;	}
+		return;
+	}
 	os_mutex_lock(&g.mtx);
 	target_conv_policy_read(&g.policy);
 	os_mutex_unlock(&g.mtx);
