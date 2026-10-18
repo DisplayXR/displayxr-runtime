@@ -253,3 +253,39 @@ hardware MJPEG decode yet, so `DXR_STEREO_CAMERA_UVC_DECODER=hardware` refuses M
 runtime takes no new library dependency. Hardware validation so far: a mono laptop webcam forced
 through an `sbs-full` entry (capture, decode, split, start/stop); a real SBS webcam,
 `--rectified`, and hot-unplug remain owner runs (spec §9a).
+
+## Amendment 5 (2026-10-18) — a hard tracker-camera denylist for the UVC source
+
+Amendment 4 kept a display's tracker camera off the UVC source in one way only: a device a plug-in
+camera named in its `platform_device_hint` was skipped. That covered a plug-in that exposes stereo
+camera slots, has resolved its camera, and found it unambiguous — and nothing else. A display
+plug-in without camera slots, a tracker that is not running yet, or two candidate cameras (the
+hint is then empty by design) left the eye tracker's camera claimable by a `stereo-cameras.json`
+entry, and claiming means opening: on Linux, open/close cycles on a tracker camera have wedged
+it until a power cycle.
+
+**Decision.** The UVC source refuses a device on a **denylist that wins over every match**, an
+explicit `vid_pid` included, and logs one WARN per config entry that would have matched, naming
+the device and the reason. A refused device is never claimed and never opened (it is marked
+unavailable before matching, so `list_modes` never runs on it). Three inputs, checked in order
+(`u_stereo_uvc_refusal`, shared by all three OSes):
+
+1. **Plug-in camera hints** — as before.
+2. **Plug-in declarations** — a new optional, append-only `xrt_plugin_iface::get_claimed_cameras`
+   slot (ADR-020: gated by `struct_size`, no API bump, announced by
+   `XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS`). The plug-in lists the capture devices its display owns
+   as USB `"vvvv:pppp"` (preferred) or OS device ids. It is a declaration, not a resolution: every
+   candidate, attached or not, no ambiguity rule, no device opened. The service asks the active
+   plug-in on every rescan, and a changed declaration re-resolves the source. sim_display
+   implements it for the webcam its opt-in eye tracker reads.
+3. **A built-in conservative fallback**, always applied, so a runtime paired with an older plug-in
+   is still safe: a couple of USB VID:PIDs that display plug-ins have already reported as their
+   tracker cameras (numbers only — the runtime carries no vendor names), and the generic friendly
+   names "tracking camera" / "eye track". It is deliberately small, because refusing a real
+   stereo webcam is the failure mode here.
+
+**Not done.** Only the active plug-in is asked; on a multi-screen box with several DPs the
+others' trackers are covered by the built-in list only. The Leia plug-in still has to implement
+the slot (its known-camera table and name rule map onto it directly). `displayxr-cli camera
+uvc-devices` applies the built-in list only (it cannot see the service's plug-in).
+

@@ -368,6 +368,17 @@ sim_display_plugin_get_platform_state(struct xrt_plugin_platform_status *out_sta
 	return true;
 }
 
+//! ADR-043 Amendment 5: the cameras this display owns — the webcam the opt-in tracker reads.
+_Static_assert(XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX == 256, "sim_display_webcam_claimed_cameras writes 256-byte ids");
+static uint32_t
+sim_display_plugin_get_claimed_cameras(struct xrt_plugin_instance *inst,
+                                       uint32_t capacity,
+                                       char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX])
+{
+	(void)inst;
+	return sim_display_webcam_claimed_cameras(capacity, out_ids);
+}
+
 static struct xrt_plugin_iface g_sim_display_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
@@ -496,6 +507,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 
     /* N3c (ADR-054 decision 7): what `displayxr-cli dp options sim-display` lists. */
     .describe_settings = sim_display_describe_settings,
+
+    /* ADR-043 Amendment 5: the opt-in webcam tracker's camera is never the UVC source's. */
+    .get_claimed_cameras = sim_display_plugin_get_claimed_cameras,
 };
 
 

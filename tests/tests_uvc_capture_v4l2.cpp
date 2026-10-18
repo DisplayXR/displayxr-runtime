@@ -327,6 +327,13 @@ TEST_CASE("v4l2: enumeration from sysfs + udev, no device opened")
 		CHECK(u_stereo_uvc_device_claimed_by_hint(&devs[0], "/dev/video0"));
 		CHECK(u_stereo_uvc_device_claimed_by_hint(&devs[0], "1234:ABCD"));
 		CHECK_FALSE(u_stereo_uvc_device_claimed_by_hint(&devs[1], "/dev/video0"));
+
+		// ADR-043 Amendment 5: a declared tracker camera is refused even for an
+		// explicit VID:PID entry (the CLI and the service share this rule).
+		const char *declared[] = {"1234:abcd"};
+		u_stereo_uvc_denylist dl{nullptr, 0, declared, 1};
+		CHECK(u_stereo_uvc_refusal(&devs[0], &dl) == U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED);
+		CHECK(u_stereo_uvc_refusal(&devs[1], &dl) == U_STEREO_UVC_REFUSAL_NONE);
 	}
 }
 

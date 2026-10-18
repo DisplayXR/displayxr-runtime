@@ -222,6 +222,9 @@ source: Media Foundation on Windows, with the same backend as the
 Desktop Linux uses the same source's V4L2 backend (MJPEG decoded on the CPU
 by libturbojpeg when it is installed, else a slower built-in decoder); the
 webcam-tracking path itself has not been run against a Linux camera yet.
+With tracking requested, sim_display declares that webcam through
+`get_claimed_cameras` (ADR-043 Amendment 5), so the service's UVC stereo
+source never claims it.
 The tracker picks the capture mode closest to 640 px wide at up to 60 fps and
 runs the estimator on every frame on its own thread. Each result is mapped,
 smoothed with a one-euro filter and stored as the latest state. The display

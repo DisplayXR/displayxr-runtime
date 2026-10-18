@@ -319,7 +319,8 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	// create_dp_d3d12_for_screen right after that, then the ADR-051 dashboard
 	// get_screen_status right after that, then M6 OpenGL
 	// create_dp_gl_for_screen right after that, then the ADR-054 N3c
-	// describe_settings right after that; it now ends the struct.
+	// describe_settings right after that, then ADR-043 Amendment 5
+	// get_claimed_cameras right after that; it now ends the struct.
 	CHECK(offsetof(xrt_plugin_iface, get_display_info_for_monitor) ==
 	      offsetof(xrt_plugin_iface, stereo_camera_close) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, create_dp_vk_for_screen) ==
@@ -336,7 +337,20 @@ TEST_CASE("plug-in iface: camera slots are appended after lift and platform-stat
 	      offsetof(xrt_plugin_iface, get_screen_status) + sizeof(void *));
 	CHECK(offsetof(xrt_plugin_iface, describe_settings) ==
 	      offsetof(xrt_plugin_iface, create_dp_gl_for_screen) + sizeof(void *));
-	CHECK(offsetof(xrt_plugin_iface, describe_settings) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	CHECK(offsetof(xrt_plugin_iface, get_claimed_cameras) ==
+	      offsetof(xrt_plugin_iface, describe_settings) + sizeof(void *));
+	CHECK(offsetof(xrt_plugin_iface, get_claimed_cameras) + sizeof(void *) == sizeof(xrt_plugin_iface));
+	{
+		// An older plug-in (struct_size ends before the slot) declares nothing.
+		xrt_plugin_iface older{};
+		older.get_claimed_cameras = [](xrt_plugin_instance *, uint32_t,
+		                               char (*)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]) -> uint32_t { return 1; };
+		older.struct_size = (uint32_t)offsetof(xrt_plugin_iface, get_claimed_cameras);
+		CHECK_FALSE(xrt_plugin_iface_has_claimed_cameras(&older));
+		older.struct_size = (uint32_t)sizeof(xrt_plugin_iface);
+		CHECK(xrt_plugin_iface_has_claimed_cameras(&older));
+		CHECK_FALSE(xrt_plugin_iface_has_claimed_cameras(nullptr));
+	}
 
 	xrt_plugin_iface iface{};
 	iface.struct_size = (uint32_t)offsetof(xrt_plugin_iface, stereo_camera_enumerate);

@@ -464,6 +464,12 @@ struct ipc_server_stereo_camera
 	const struct xrt_plugin_iface *iface;
 	struct xrt_plugin_instance *inst;
 	/*!
+	 * Amendment 5: the active plug-in when it declares the cameras its display
+	 * owns (get_claimed_cameras) — independent of whether it has camera slots.
+	 */
+	const struct xrt_plugin_iface *claims_iface;
+	struct xrt_plugin_instance *claims_inst;
+	/*!
 	 * Amendment 4: the service's own UVC side-by-side source. Each rescan that
 	 * finds the UVC inputs changed resolves a NEW u_stereo_uvc (an open stream
 	 * keeps the one it was opened from); every object some camera still
@@ -2098,6 +2104,25 @@ scan_uvc(struct ipc_server_stereo_camera *m,
 			hints[nh++] = plugin[i].info.platform_device_hint;
 		}
 	}
+	// Amendment 5: the cameras the active plug-in declares as its display's
+	// (the eye tracker's) — refused like the plug-in cameras' hints, and part
+	// of the fingerprint so a declaration that appears later re-resolves.
+	char declared_buf[XRT_PLUGIN_CLAIMED_CAMERAS_MAX][XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX];
+	const char *declared[XRT_PLUGIN_CLAIMED_CAMERAS_MAX];
+	uint32_t nd_claims = 0;
+	if (m->claims_iface != NULL) {
+		memset(declared_buf, 0, sizeof(declared_buf));
+		uint32_t n =
+		    m->claims_iface->get_claimed_cameras(m->claims_inst, XRT_PLUGIN_CLAIMED_CAMERAS_MAX, declared_buf);
+		n = n > XRT_PLUGIN_CLAIMED_CAMERAS_MAX ? XRT_PLUGIN_CLAIMED_CAMERAS_MAX : n;
+		for (uint32_t i = 0; i < n; i++) {
+			declared_buf[i][XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX - 1] = '\0';
+			if (declared_buf[i][0] != '\0') {
+				declared[nd_claims++] = declared_buf[i];
+			}
+		}
+	}
+
 	struct u_stereo_uvc_backend os_backend;
 	const struct u_stereo_uvc_backend *backend = NULL;
 	if (m->have_uvc_backend) {
@@ -2113,6 +2138,9 @@ scan_uvc(struct ipc_server_stereo_camera *m,
 		fp = uvc_config_hash(fp, &cfg);
 		for (uint32_t i = 0; i < nh; i++) {
 			fp = fnv1a_str(fp, hints[i]);
+		}
+		for (uint32_t i = 0; i < nd_claims; i++) {
+			fp = fnv1a_str(fp, declared[i]);
 		}
 		if (!cfg.fake && backend != NULL && backend->enumerate != NULL) {
 			struct u_stereo_uvc_device devs[U_STEREO_UVC_MAX_DEVICES];
@@ -2151,7 +2179,12 @@ scan_uvc(struct ipc_server_stereo_camera *m,
 		return true;
 	}
 
-	struct u_stereo_uvc *obj = u_stereo_uvc_create(&cfg, backend, hints, nh);
+	if (nd_claims > 0) {
+		U_LOG_I("stereo camera (uvc): the display plug-in declares %u tracker camera id(s) — never claimed",
+		        nd_claims);
+	}
+	const struct u_stereo_uvc_denylist dl = {hints, nh, declared, nd_claims};
+	struct u_stereo_uvc *obj = u_stereo_uvc_create_ex(&cfg, backend, &dl);
 	struct xrt_plugin_stereo_camera_info infos[XRT_STEREO_CAMERA_MAX_CAMERAS];
 	memset(infos, 0, sizeof(infos));
 	for (uint32_t i = 0; i < XRT_STEREO_CAMERA_MAX_CAMERAS; i++) {
@@ -2648,6 +2681,15 @@ ipc_server_stereo_camera_create_ex(struct xrt_instance *xinst, const struct ipc_
 		m->inst = inst;
 	} else {
 		U_LOG_I("stereo camera: the active plug-in provides no camera source");
+	}
+	// Amendment 5: a plug-in declares its display's cameras with or without
+	// camera slots of its own.
+	const struct xrt_plugin_iface *ci = NULL;
+	struct xrt_plugin_instance *cinst = NULL;
+	if (xinst != NULL && xinst->get_active_plugin != NULL && xinst->get_active_plugin(xinst, &ci, &cinst) &&
+	    xrt_plugin_iface_has_claimed_cameras(ci)) {
+		m->claims_iface = ci;
+		m->claims_inst = cinst;
 	}
 	// Plug-in cameras first: their platform_device_hints keep the UVC source
 	// off the devices they own.

@@ -527,6 +527,75 @@ u_stereo_uvc_device_claimed_by_hint(const struct u_stereo_uvc_device *d, const c
 	return d->has_vid_pid && u_stereo_uvc_parse_vid_pid(hint, &vid, &pid) && vid == d->vid && pid == d->pid;
 }
 
+/*
+ * ADR-043 Amendment 5: the built-in tracker-camera fallback. VID:PIDs only
+ * (no names: the runtime carries no vendor identifiers), each one a camera a
+ * display plug-in has reported as its eye tracker's. Keep it SMALL.
+ */
+static const uint16_t k_builtin_tracker_vid_pid[][2] = {
+    {0x04f2, 0xb70c},
+    {0x04e8, 0x20d7},
+};
+
+//! Generic words that say a device is a tracking camera, not a webcam.
+static const char *const k_builtin_tracker_names[] = {
+    "tracking camera",
+    "eye track",
+};
+
+bool
+u_stereo_uvc_builtin_tracker_refusal(const struct u_stereo_uvc_device *d)
+{
+	if (d == NULL) {
+		return false;
+	}
+	if (d->has_vid_pid) {
+		for (size_t i = 0; i < sizeof(k_builtin_tracker_vid_pid) / sizeof(k_builtin_tracker_vid_pid[0]); i++) {
+			if (d->vid == k_builtin_tracker_vid_pid[i][0] && d->pid == k_builtin_tracker_vid_pid[i][1]) {
+				return true;
+			}
+		}
+	}
+	for (size_t i = 0; i < sizeof(k_builtin_tracker_names) / sizeof(k_builtin_tracker_names[0]); i++) {
+		if (strcasestr_ascii(d->name, k_builtin_tracker_names[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+enum u_stereo_uvc_refusal
+u_stereo_uvc_refusal(const struct u_stereo_uvc_device *d, const struct u_stereo_uvc_denylist *dl)
+{
+	if (d == NULL) {
+		return U_STEREO_UVC_REFUSAL_NONE;
+	}
+	if (dl != NULL) {
+		for (uint32_t i = 0; dl->camera_hints != NULL && i < dl->camera_hint_count; i++) {
+			if (u_stereo_uvc_device_claimed_by_hint(d, dl->camera_hints[i])) {
+				return U_STEREO_UVC_REFUSAL_PLUGIN_CAMERA;
+			}
+		}
+		for (uint32_t i = 0; dl->declared != NULL && i < dl->declared_count; i++) {
+			if (u_stereo_uvc_device_claimed_by_hint(d, dl->declared[i])) {
+				return U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED;
+			}
+		}
+	}
+	return u_stereo_uvc_builtin_tracker_refusal(d) ? U_STEREO_UVC_REFUSAL_BUILTIN : U_STEREO_UVC_REFUSAL_NONE;
+}
+
+const char *
+u_stereo_uvc_refusal_str(enum u_stereo_uvc_refusal r)
+{
+	switch (r) {
+	case U_STEREO_UVC_REFUSAL_PLUGIN_CAMERA: return "a display plug-in's stereo camera (its platform_device_hint)";
+	case U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED: return "claimed by the active display plug-in (get_claimed_cameras)";
+	case U_STEREO_UVC_REFUSAL_BUILTIN: return "on the runtime's built-in tracker-camera list";
+	default: return "not refused";
+	}
+}
+
 
 /*
  *
@@ -1470,6 +1539,15 @@ u_stereo_uvc_create(const struct u_stereo_uvc_config *cfg,
                     const char *const *exclude_hints,
                     uint32_t exclude_count)
 {
+	struct u_stereo_uvc_denylist dl = {exclude_hints, exclude_count, NULL, 0};
+	return u_stereo_uvc_create_ex(cfg, backend, &dl);
+}
+
+struct u_stereo_uvc *
+u_stereo_uvc_create_ex(const struct u_stereo_uvc_config *cfg,
+                       const struct u_stereo_uvc_backend *backend,
+                       const struct u_stereo_uvc_denylist *dl)
+{
 	struct u_stereo_uvc *u = (struct u_stereo_uvc *)calloc(1, sizeof(*u));
 	if (u == NULL || cfg == NULL) {
 		return u;
@@ -1495,17 +1573,37 @@ u_stereo_uvc_create(const struct u_stereo_uvc_config *cfg,
 	uint32_t nd = u->backend.enumerate(u->backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES);
 	nd = nd > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : nd;
 	bool used[U_STEREO_UVC_MAX_DEVICES] = {0};
+	enum u_stereo_uvc_refusal refused[U_STEREO_UVC_MAX_DEVICES] = {U_STEREO_UVC_REFUSAL_NONE};
 	for (uint32_t i = 0; i < nd; i++) {
 		devs[i].name[sizeof(devs[i].name) - 1] = '\0';
 		devs[i].id[sizeof(devs[i].id) - 1] = '\0';
 		if (!devs[i].has_vid_pid) {
 			devs[i].has_vid_pid = u_stereo_uvc_parse_vid_pid(devs[i].id, &devs[i].vid, &devs[i].pid);
 		}
-		for (uint32_t h = 0; h < exclude_count; h++) {
-			if (u_stereo_uvc_device_claimed_by_hint(&devs[i], exclude_hints[h])) {
-				used[i] = true; // a plug-in's camera (the tracker's): never ours
-				U_LOG_I("stereo camera (uvc): \"%s\" is a display plug-in's camera — never claimed",
-				        devs[i].name);
+		// The tracker-camera denylist (Amendment 5): a display's camera is
+		// never ours, whatever the config says — marked unavailable BEFORE
+		// matching, so no entry claims it and list_modes never opens it.
+		refused[i] = u_stereo_uvc_refusal(&devs[i], dl);
+		if (refused[i] != U_STEREO_UVC_REFUSAL_NONE) {
+			used[i] = true;
+			bool wanted = false;
+			for (uint32_t e = 0; e < cfg->count; e++) {
+				if (u_stereo_uvc_entry_matches(&cfg->entries[e], &devs[i])) {
+					wanted = true;
+					char vp[24] = "no VID:PID";
+					if (devs[i].has_vid_pid) {
+						snprintf(vp, sizeof(vp), "VID:PID %04x:%04x", devs[i].vid, devs[i].pid);
+					}
+					U_LOG_W(
+					    "stereo camera (uvc): config entry %u matches \"%s\" (%s, %s) — REFUSED: "
+					    "%s. "
+					    "A tracker camera is never claimed or opened, whatever the config says",
+					    e, devs[i].name, vp, devs[i].id, u_stereo_uvc_refusal_str(refused[i]));
+				}
+			}
+			if (!wanted) {
+				U_LOG_I("stereo camera (uvc): \"%s\" refused (%s)", devs[i].name,
+				        u_stereo_uvc_refusal_str(refused[i]));
 			}
 		}
 	}

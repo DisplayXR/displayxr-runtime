@@ -547,6 +547,17 @@ Declare the keys your plug-in reads through the host's `get_setting` so `display
 
 **NULL is allowed** — the store's keys are still listed, just undeclared. Appended per ADR-020 after `create_dp_gl_for_screen` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`, test with `xrt_plugin_iface_has_describe_settings()`. Reference implementation: `sim_display_describe_settings` (`drivers/sim_display/sim_display_settings.c`, 36 keys — the same table the shim resolves them from).
 
+### `get_claimed_cameras` (tracker-camera denylist, ADR-043 Amendment 5)
+
+```c
+uint32_t (*get_claimed_cameras)(struct xrt_plugin_instance *inst, uint32_t capacity,
+                                char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]);
+```
+
+Declare the capture devices your display owns — above all the camera your eye tracker reads — so the service's own UVC side-by-side stereo webcam source (ADR-043 Amendment 4) never claims or opens them. The denylist wins over every `stereo-cameras.json` entry, an explicit `vid_pid` included; a refused match logs one WARN naming the device. Fill up to `capacity` NUL-terminated ids (≤ 256 bytes) and return how many you claim; each is a USB `"vvvv:pppp"` (preferred: it names every unit of the model, needs no enumeration) or the OS device id (Windows device interface / MF symbolic link, Linux `/dev/videoN`) — the same forms as `platform_device_hint`. It is a **declaration**, not a resolution: list every camera the tracker may use, attached or not, running or not; no ambiguity rule. Pure, cheap (called on every camera rescan, ~2 s while a client listens), any thread, `inst` may be NULL, and it **must not open any capture device**.
+
+**NULL is allowed** (declares nothing). The runtime still refuses every plug-in camera's `platform_device_hint` and its own small built-in list (`u_stereo_uvc_builtin_tracker_refusal`: a few VID:PIDs plug-ins already reported as tracker cameras, and the generic names "tracking camera" / "eye track"), so an older plug-in is covered conservatively. Appended per ADR-020 after `describe_settings` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS`, test with `xrt_plugin_iface_has_claimed_cameras()`. Reference implementation: sim_display returns the webcam its opt-in eye tracker would read (`sim_display_webcam_claimed_cameras`). Today the service asks the **active** plug-in only.
+
 ## Forward-compatibility rules
 
 The iface is designed to evolve without breaking older plug-ins:

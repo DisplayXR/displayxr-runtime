@@ -41,9 +41,12 @@
  *     A built-in device allowlist is deliberately empty: none is shipped
  *     without a public spec for the device's SBS layout.
  *  2. **Matching** (@ref u_stereo_uvc_entry_matches): name substring and/or
- *     USB VID:PID. A device a display plug-in already reports as its camera
- *     (its platform_device_hint) is never claimed — the tracker camera belongs
- *     to the plug-in and its eye tracker (@ref u_stereo_uvc_device_claimed_by_hint).
+ *     USB VID:PID. A TRACKER-CAMERA DENYLIST wins over every match, explicit
+ *     VID:PID included (ADR-043 Amendment 5, @ref u_stereo_uvc_refusal): a
+ *     device a display plug-in reports as its camera (platform_device_hint),
+ *     one it declares as claimed (xrt_plugin_iface::get_claimed_cameras), or
+ *     one on the runtime's conservative built-in list is never claimed or
+ *     opened — the tracker camera belongs to the display and its eye tracker.
  *  3. **Geometry**: the SBS split (@ref u_stereo_uvc_split: either eye order,
  *     full or half SBS, resampled to square-pixel eyes, NV12 out) and, for an
  *     uncalibrated device, a NOMINAL pinhole (@ref
@@ -252,6 +255,52 @@ u_stereo_uvc_assign(const struct u_stereo_uvc_config *cfg,
 bool
 u_stereo_uvc_device_claimed_by_hint(const struct u_stereo_uvc_device *d, const char *hint);
 
+/*!
+ * Why the denylist refuses a device (ADR-043 Amendment 5). Checked in this
+ * order; the first that applies is reported.
+ */
+enum u_stereo_uvc_refusal
+{
+	U_STEREO_UVC_REFUSAL_NONE = 0,
+	//! A display plug-in's stereo camera names it (platform_device_hint).
+	U_STEREO_UVC_REFUSAL_PLUGIN_CAMERA = 1,
+	//! The active display plug-in declares it (xrt_plugin_iface::get_claimed_cameras).
+	U_STEREO_UVC_REFUSAL_PLUGIN_DECLARED = 2,
+	//! The runtime's own conservative list (@ref u_stereo_uvc_builtin_tracker_refusal).
+	U_STEREO_UVC_REFUSAL_BUILTIN = 3,
+};
+
+//! The devices the UVC source must never claim, besides the built-in list.
+struct u_stereo_uvc_denylist
+{
+	//! Plug-in cameras' platform_device_hints (ids or "vvvv:pppp"); may be NULL.
+	const char *const *camera_hints;
+	uint32_t camera_hint_count;
+	//! Ids the active plug-in declares via get_claimed_cameras; may be NULL.
+	const char *const *declared;
+	uint32_t declared_count;
+};
+
+/*!
+ * The runtime's built-in fallback, applied whatever the plug-in declares (an
+ * older plug-in declares nothing): a USB VID:PID that display plug-ins have
+ * reported as their eye tracker's camera, or a friendly name that says what
+ * the device is ("tracking camera", "eye track", case-insensitive). Kept
+ * deliberately small and conservative — refusing a real stereo webcam here
+ * is the failure mode, so names stay generic and only IDs plug-ins already
+ * reported are listed.
+ */
+bool
+u_stereo_uvc_builtin_tracker_refusal(const struct u_stereo_uvc_device *d);
+
+//! The first refusal that applies to @p d (@p dl may be NULL: the built-in list only).
+enum u_stereo_uvc_refusal
+u_stereo_uvc_refusal(const struct u_stereo_uvc_device *d, const struct u_stereo_uvc_denylist *dl);
+
+//! Human-readable reason, for logs and `camera uvc-devices`.
+const char *
+u_stereo_uvc_refusal_str(enum u_stereo_uvc_refusal r);
+
 
 /*
  *
@@ -431,7 +480,8 @@ struct u_stereo_uvc_stream;
  * Resolve the config against the devices present. @p backend NULL = no OS
  * backend (only a fake device, if configured, can match). Devices whose id /
  * VID:PID equals one of @p exclude_hints (the plug-ins' platform_device_hint)
- * are skipped. One camera per config entry: the first matching, unclaimed
+ * are skipped, as are those on the built-in denylist (= @ref
+ * u_stereo_uvc_create_ex with only camera_hints). One camera per config entry: the first matching, unclaimed
  * device. Always returns an object (zero cameras when nothing matched).
  */
 struct u_stereo_uvc *
@@ -439,6 +489,18 @@ u_stereo_uvc_create(const struct u_stereo_uvc_config *cfg,
                     const struct u_stereo_uvc_backend *backend,
                     const char *const *exclude_hints,
                     uint32_t exclude_count);
+
+/*!
+ * @ref u_stereo_uvc_create with the full tracker-camera denylist (ADR-043
+ * Amendment 5): a device @ref u_stereo_uvc_refusal refuses is never claimed
+ * nor opened (list_modes included), and every config entry that would have
+ * matched it logs one WARN naming the device and the reason. @p dl may be
+ * NULL (built-in list only).
+ */
+struct u_stereo_uvc *
+u_stereo_uvc_create_ex(const struct u_stereo_uvc_config *cfg,
+                       const struct u_stereo_uvc_backend *backend,
+                       const struct u_stereo_uvc_denylist *dl);
 
 void
 u_stereo_uvc_destroy(struct u_stereo_uvc **uvc_ptr);

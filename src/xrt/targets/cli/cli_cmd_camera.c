@@ -1445,10 +1445,15 @@ cmd_uvc_devices(int argc, const char **argv)
 	uint32_t n = backend.enumerate(backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES);
 	n = n > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : n;
 	printf("capture backend: %s, %u device(s)\n", backend.name, n);
-	// The service's own rule (u_stereo_uvc_assign), minus the plug-in exclusion
-	// the CLI cannot see without the service.
+	// The service's own rule (u_stereo_uvc_assign) with the built-in
+	// tracker-camera denylist (Amendment 5); the plug-in's own camera hints and
+	// declared cameras are applied by the service, which the CLI cannot see.
+	bool refused[U_STEREO_UVC_MAX_DEVICES] = {0};
+	for (uint32_t i = 0; i < n; i++) {
+		refused[i] = u_stereo_uvc_refusal(&devs[i], NULL) != U_STEREO_UVC_REFUSAL_NONE;
+	}
 	int32_t assigned[U_STEREO_UVC_MAX_ENTRIES];
-	u_stereo_uvc_assign(&cfg, devs, n, NULL, assigned);
+	u_stereo_uvc_assign(&cfg, devs, n, refused, assigned);
 	for (uint32_t e = 0; e < cfg.count; e++) {
 		if (assigned[e] == U_STEREO_UVC_ASSIGN_AMBIGUOUS) {
 			printf(
@@ -1472,12 +1477,16 @@ cmd_uvc_devices(int argc, const char **argv)
 			snprintf(vp, sizeof(vp), "%04x:%04x", d->vid, d->pid);
 		}
 		printf("  [%u] \"%s\"  VID:PID %s  %s\n", i, d->name, vp,
-		       entry >= 0 ? "<- CLAIMED by the config" : "(not claimed: never touched)");
+		       refused[i]   ? "REFUSED: built-in tracker-camera denylist (never claimed or opened)"
+		       : entry >= 0 ? "<- CLAIMED by the config"
+		                    : "(not claimed: never touched)");
 		printf("       id %s\n", d->id);
 		if (entry >= 0) {
 			const struct u_stereo_uvc_entry *en = &cfg.entries[entry];
-			printf("       entry %d; the service skips it if a display plug-in reports it as its camera\n",
-			       entry);
+			printf(
+			    "       entry %d; the service refuses it if the display plug-in reports or declares it as "
+			    "its (tracker) camera\n",
+			    entry);
 			if (modes && backend.list_modes != NULL) {
 				struct u_stereo_uvc_mode ms[U_STEREO_UVC_MAX_MODES];
 				uint32_t nm = backend.list_modes(backend.ctx, d->id, ms, U_STEREO_UVC_MAX_MODES);
