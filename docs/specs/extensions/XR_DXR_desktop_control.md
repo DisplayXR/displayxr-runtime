@@ -4,7 +4,7 @@
 |---|---|
 | **Name** | `XR_DXR_desktop_control` |
 | **Spec version** | 1 |
-| **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. |
+| **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. Screen capture is **proposed** for spec version 2 (§10, ADR-056 Amendment 1), and nothing of it is implemented. |
 | **Header** | [`XR_DXR_desktop_control.h`](../../../src/external/openxr_includes/openxr/XR_DXR_desktop_control.h) |
 | **Decision** | [ADR-056](../../adr/ADR-056-desktop-control-runs-in-the-app.md) |
 | **Code** | `src/xrt/auxiliary/desktop/` (common layer + one OS backend), `src/xrt/state_trackers/oxr/oxr_desktop_control.c` |
@@ -217,7 +217,7 @@ counts as delivered only when the target read the agent's text after the paste k
 
 ## 8. Not in v1
 
-Window capture (screenshots), a DisplayXR-drawn in-use indicator on Windows / macOS and a
+Window capture (screenshots) — now **proposed** for spec version 2, see §10. A DisplayXR-drawn in-use indicator on Windows / macOS and a
 global kill-switch hotkey (both planned in the service tray, as the stereo camera's §7.3–7.4),
 X11 sessions, KDE window listing, Flatpak-sandboxed apps on GNOME.
 
@@ -353,3 +353,257 @@ is dropped instead of touching freed memory.
 
 **Probe.** `test_apps/probes/desktop_control_probe` (headless, every desktop OS) exposes every
 call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-end run.
+
+## 10. Screen capture (PROPOSED — spec version 2)
+
+> **PROPOSED. Not implemented, not in the header.** This section specifies a planned
+> `XR_DXR_desktop_control_SPEC_VERSION 2`. Nothing in it is available until the header
+> declares version 2. The decision record is
+> [ADR-056 Amendment 1](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-1--screen-capture-is-its-own-scope-in-the-same-session-proposed-2026-10-19),
+> and its open decisions may still change the names and limits below. Sections 1–9 describe
+> version 1 and are unchanged by this one.
+
+### 10.1 Additions to the header (proposed)
+
+Structure types use the four remaining values of this extension's block (1004999400–409; see
+`src/external/openxr_includes/openxr/README.md`, which is updated when the header lands):
+
+```c
+#define XR_DXR_desktop_control_SPEC_VERSION 2
+
+#define XR_TYPE_DESKTOP_CAPTURE_INFO_DXR                      ((XrStructureType)1004999406)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR      ((XrStructureType)1004999407)
+#define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR             ((XrStructureType)1004999408)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR  ((XrStructureType)1004999409)
+
+// The backend can capture screen pixels (and the platform has the libraries for it).
+static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR = 0x00000040;
+
+typedef XrFlags64 XrDesktopControlScopeFlagsDXR;
+//! Everything in spec version 1: observation, window actions, input.
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR = 0x00000001;
+//! Screen pixels (§10).
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR = 0x00000002;
+
+//! Chained on XrDesktopControlRequestInfoDXR::next. Absent = CONTROL only (version 1 behaviour).
+typedef struct XrDesktopControlRequestScopeDXR {
+    XrStructureType                type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR
+    const void* XR_MAY_ALIAS       next;
+    XrDesktopControlScopeFlagsDXR  scopes; //!< non-zero
+} XrDesktopControlRequestScopeDXR;
+
+typedef enum XrDesktopCaptureTargetDXR {
+    XR_DESKTOP_CAPTURE_TARGET_DESKTOP_DXR = 0, //!< the union of every monitor
+    XR_DESKTOP_CAPTURE_TARGET_REGION_DXR  = 1, //!< `region`, desktop coordinates
+    XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR  = 2, //!< `windowId`'s frame as it is on screen
+    XR_DESKTOP_CAPTURE_TARGET_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopCaptureTargetDXR;
+
+typedef struct XrDesktopCaptureInfoDXR {
+    XrStructureType            type;      //!< XR_TYPE_DESKTOP_CAPTURE_INFO_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrDesktopCaptureTargetDXR  target;
+    uint64_t                   windowId;  //!< WINDOW
+    XrRect2Di                  region;    //!< REGION
+    uint32_t                   maxWidth;  //!< 1..8192: the image is scaled down to fit, never up
+    uint32_t                   maxHeight; //!< 1..8192
+} XrDesktopCaptureInfoDXR;
+
+typedef struct XrEventDataDesktopCaptureCompletedDXR {
+    XrStructureType            type;       //!< XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrSession                  session;
+    uint64_t                   captureId;
+    XrResult                   result;     //!< XR_SUCCESS or an XR_ERROR_* (as for actions)
+    uint32_t                   width;      //!< image size (0 on failure)
+    uint32_t                   height;
+    XrRect2Di                  sourceRect; //!< what the image covers, desktop coordinates
+    XrTime                     frameTime;  //!< when these pixels were current
+    char                       message[XR_MAX_DESKTOP_MESSAGE_SIZE_DXR];
+} XrEventDataDesktopCaptureCompletedDXR;
+
+typedef struct XrEventDataDesktopCaptureStateChangedDXR {
+    XrStructureType            type;  //!< XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrSession                  session;
+    XrDesktopControlStateDXR   state; //!< the CAPTURE scope's state
+} XrEventDataDesktopCaptureStateChangedDXR;
+
+//! The CAPTURE scope's state. Never gated, like xrGetDesktopControlStateDXR (which keeps
+//! reporting the CONTROL scope, plus the capability bits, CAPTURE_BIT included).
+XrResult xrGetDesktopCaptureStateDXR(XrSession session, XrDesktopControlStateDXR* state);
+
+//! Start one capture. Returns at once with a captureId (never 0); exactly one
+//! XrEventDataDesktopCaptureCompletedDXR follows while the session exists.
+XrResult xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR* info, uint64_t* captureId);
+
+//! Fetch the image of a completed capture (two-call idiom, in BYTES:
+//! countOutput = width * height * 4).
+XrResult xrGetDesktopCaptureImageDXR(XrSession session, uint64_t captureId,
+                                     uint32_t capacityInput, uint32_t* countOutput, uint8_t* rgba);
+```
+
+`xrGetDesktopControlStateDXR` and `XrEventDataDesktopControlStateChangedDXR` keep their
+version-1 meaning: the CONTROL scope. A version-1 app sees no change.
+
+### 10.2 Consent (per scope)
+
+Each scope has its own state, evaluated with the §3 table. Rows 1–7 are shared by both
+scopes. Rows 8–10 read that scope's own grant:
+
+- **Requesting.** `xrRequestDesktopControlDXR` with an `XrDesktopControlRequestScopeDXR`
+  chained asks for the listed scopes in **one** OS / DisplayXR prompt and announces each
+  listed scope's outcome on that scope's event (the §9 "always announce" rule applies per
+  scope). A scope already `GRANTED` is not asked for again. A request is a no-op only while a
+  scope it lists is `PENDING`. `xrCaptureDesktopDXR` **never prompts**.
+- **GNOME.** One portal session carries both scopes. The `Start` response decides each one
+  separately: `devices` non-zero ⇒ CONTROL granted, `streams` non-empty ⇒ CAPTURE granted.
+  Asking for a scope later opens a **new** combined session, and the dialog asks about input
+  again (a restore token cannot be widened). Apps that will capture should ask for both
+  scopes in their first request. A silent restore that fails (revoked, or the shared
+  monitors changed) puts **both** scopes in `DENIED`, as in v1.
+- **Windows.** The existing consent MessageBox. Its text lists only the scopes asked for
+  ("see your screen", "type and click in other apps"). The answer is stored per scope (§10.6).
+- **macOS.** CAPTURE's OS grant is Screen Recording (`CGPreflightScreenCaptureAccess`,
+  requested with `CGRequestScreenCaptureAccess`). CONTROL already asks for it, so CAPTURE is
+  usually granted without a new prompt.
+- **Revocation.** A backend capture call that returns `NOT_GRANTED` puts CAPTURE in `DENIED`
+  (event), and only CAPTURE, except on GNOME where it closes the shared session (both).
+
+### 10.3 Capture behaviour
+
+- **Validation** at `xrCaptureDesktopDXR`: `target` known; `maxWidth` / `maxHeight` in
+  1..8192; REGION with `width` / `height` > 0 and the §9 coordinate limits; WINDOW with a
+  non-zero `windowId`. A bad call returns `XR_ERROR_VALIDATION_FAILURE` and no id.
+- **Gating.** It needs CAPTURE `GRANTED`, else `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
+  (CONTROL is not required). It needs the CAPTURE capability bit, else
+  `XR_ERROR_FEATURE_UNSUPPORTED`.
+- **One in flight.** A second `xrCaptureDesktopDXR` while one is pending returns
+  `XR_ERROR_LIMIT_REACHED`. Starts are at least 250 ms apart (4 Hz per session). An earlier
+  call is accepted and waits, and the wait counts toward the completion time.
+- **Its own worker.** Captures run on a per-session capture thread, never queued behind
+  actions, and not subject to the §5 idle wait (capture injects nothing).
+- **Checks** (re-evaluated just before the OS capture, and again before the frame is
+  handed over): state `GRANTED`, kill switch off, not locked, no secure desktop. On failure
+  the capture completes with `XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR` and the §9 message
+  (`"kill switch"`, `"screen locked"`, ...), and any frame already taken is discarded.
+- **Target resolution.**
+  - DESKTOP is the bounding box of every monitor.
+  - REGION is clipped to that box. A region entirely outside it is refused
+    (`"found nothing: outside every monitor"`).
+  - WINDOW is the window's current frame from the backend's window list (`WINDOW_LOST` if it
+    is gone, `REFUSED` `"the window is minimized"` if minimized), captured **as on screen**:
+    windows overlapping it are in the image.
+- **Freshness.** The pixels were current at or after the call (`frameTime`). On GNOME a stream
+  with no frame since the call is current, because mutter sends frames on damage only. The
+  first frame of a newly started stream is always awaited (bounded: 2 s, else `TIMEOUT` →
+  `XR_ERROR_RUNTIME_FAILURE`).
+- **The image.**
+  - RGBA8, sRGB-encoded, straight alpha, row-major, top row first, stride `width * 4`.
+  - Scaled down with an area filter so that `width ≤ maxWidth` and `height ≤ maxHeight`,
+    keeping the aspect ratio. Never scaled up: a source smaller than the maximum comes back
+    at its own size, in **device** pixels where the OS gives them.
+  - Every real pixel has alpha 255. **Withheld** pixels are `(0,0,0,0)`: off every monitor,
+    on a monitor the user did not share (GNOME), or inside an excluded window (§10.4).
+  - Mapping back to desktop coordinates:
+    `x = sourceRect.x + (px + 0.5) * sourceRect.width / width` (and the same for y). The
+    result can be fed straight to `xrPickDesktopDXR` or a pointer action.
+- **Retention.** The runtime keeps the image of the **most recent** successful capture only,
+  until it is fetched, the next capture completes, the session ends, or 10 s pass. Fetching
+  any other id, or an expired one, returns `XR_ERROR_VALIDATION_FAILURE`. One fetch may be
+  repeated (two-call idiom). The memory is freed when retention ends.
+- **The 3D panel.** A region over a spatial display returns the panel's **woven** pixels,
+  which is what is scanned out. Substituting views is out of scope (ADR-056 Amendment 1, open
+  decision 5).
+
+### 10.4 Privacy
+
+- **No disk, no logs.** The runtime never writes a frame, a thumbnail or a hash to disk or to a
+  log at any level. Messages name failures, never content.
+- **Exclusion.**
+  - Windows: Windows.Graphics.Capture returns `WDA_EXCLUDEFROMCAPTURE` windows as the OS
+    renders them for capture, and the runtime adds nothing.
+  - macOS: what ScreenCaptureKit returns for `NSWindowSharingNone` windows is to be measured
+    (§10.7) and documented here.
+  - GNOME: every window that the extension's `GetAllWindows` reports as `capture_excluded`
+    is withheld over its whole frame, because portal monitor streams contain them
+    (wayland-window-geometry §6.2). When the extension is missing or the window list cannot
+    be read, the capture is refused (`"cannot honour capture exclusion"`) and never returned
+    unmasked.
+- **Audit (§6.2).** One record per capture **burst** (closed after 2 s without a capture):
+  `{"action":"capture","target":{...},"w":1280,"h":720,"count":7,"result":"ok"}` plus the
+  first and last time. A failure always closes its burst with its own record. Consent records
+  carry `scope`.
+- **Not re-exported.** An app must not hand captured frames to other processes over MCP or
+  IPC (ADR-056 D4, and the app rules).
+
+### 10.5 Backends
+
+| | GNOME Wayland | Windows | macOS |
+|---|---|---|---|
+| capture | the RemoteDesktop session of §7 plus `ScreenCast.SelectSources` (MONITOR, `multiple`, cursor HIDDEN, no persist keys) before `Start`; `OpenPipeWireRemote` → PipeWire streams, SHM (BGRx/BGRA) only | Windows.Graphics.Capture `CreateForMonitor` per touched monitor, a one-frame pool on the backend's own D3D11 device, staging read-back | `SCScreenshotManager` (macOS 14+) with a display `SCContentFilter`, cursor hidden |
+| CAPTURE only (no CONTROL) | a standalone ScreenCast portal session (`persist_mode` 2 on `SelectSources`) | as above | as above |
+| library | `libpipewire-0.3.so.0` dlopen'd, no `DT_NEEDED` (absent ⇒ no CAPTURE bit) | Windows 10 1903+ | ScreenCaptureKit, weak-linked (macOS < 14 ⇒ no CAPTURE bit) |
+| indicator | GNOME's screen-sharing indicator while the session is open | the Windows.Graphics.Capture border (kept on) | the system screen-recording indicator |
+| coordinates | stage px; stream `position` / `size` from the `Start` response map stage → stream px | physical px (per-monitor-v2 DPI context) | points; the display's scale gives pixels |
+
+The backend interface (`u_desktop.h`) gains, in the implementation PR: a per-scope
+`access_status` / `request_access`, and a `capture` call made only from the capture worker,
+which fills a runtime-owned RGBA buffer and is bounded (2 s plus any session restore).
+
+### 10.6 Store v2 and CLI
+
+`"version": 2`. An app's entry is either a string (v1: the CONTROL answer) or an object
+`{"control": "allow" | "deny", "capture": "allow" | "deny"}`. v1 files are read as is and
+rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget <exe>` take
+`--scope control|capture|all` (default `all` for `deny` / `forget`, `control` for `allow`).
+`status` lists each scope. The kill switch covers both.
+
+### 10.7 Test plan delta
+
+- **Every OS (CI, fake backend).** `DXR_DESKTOP_BACKEND=fake` returns a deterministic
+  pattern. Unit tests cover:
+  - validation, the one-in-flight and 4 Hz rules, retention and expiry;
+  - scaling and the `sourceRect` → pixel mapping, and alpha 0 for withheld areas;
+  - the per-scope state machine (a v1 request ⇒ CONTROL only);
+  - the kill switch and the lock arriving between the capture and the hand-over (the frame
+    is dropped);
+  - audit coalescing, with no pixel data in any record;
+  - store v1 → v2.
+
+  Add a capture script to `desktop_control_probe` (`e2e_fake.txt`). The probe writes a PNG
+  only with `--save`.
+- **GNOME (Ubuntu 24.04 and 26.04, plus a 22.04 Wayland session for the oldest
+  portal).**
+  - One dialog covers both scopes. Captures in a loop show **no flash**, and `dbus-monitor`
+    shows no `org.gnome.Shell.Screenshot` call.
+  - The screen-sharing indicator is up only during bursts. Silent restore works within the
+    process.
+  - The user unticks remote interaction ⇒ CONTROL `DENIED`, CAPTURE `GRANTED`.
+  - With one of two monitors shared, a region outside it comes back with alpha 0.
+  - Hotplugging a shared monitor ⇒ re-prompt, both scopes `DENIED` until requested again.
+  - At 100 %, 125 % and 200 % (mixed) scale: capture → find a button → `CLICK` at the
+    mapped point lands on it.
+  - Masking: a `capture_excluded` window (a transparent DisplayXR app) is alpha 0. With the
+    extension disabled the capture is refused.
+  - Lock ⇒ refused.
+  - With `libpipewire` uninstalled ⇒ no CAPTURE bit.
+  - No file is created (an `inotifywait -r` on `$HOME` and `/tmp` during a 100-capture run).
+    The logs contain no frame data.
+- **Windows (11, and 10 22H2).**
+  - The consent text lists the scopes. `allow` / `deny` are stored per scope.
+  - The yellow capture border is visible during a burst.
+  - A `WDA_EXCLUDEFROMCAPTURE` window comes back as the OS renders it for capture.
+  - Mixed-DPI monitors: the mapped click lands.
+  - A UAC prompt or a lock ⇒ refused.
+  - The hybrid-GPU box: the panel on the iGPU, the app on the dGPU.
+  - The app's D3D device and queue are untouched (the D3D11 debug layer stays clean).
+- **macOS (14, 15, 26).**
+  - Screen Recording denied ⇒ `NOT_GRANTED`. Revoked in System Settings mid-session ⇒
+    `DENIED` on the next capture.
+  - Retina and a non-Retina external display: the mapping is right.
+  - The menu-bar indicator appears.
+  - **Measure** what `NSWindowSharingNone` windows of another app look like (reports suggest
+    macOS 15 no longer hides them from ScreenCaptureKit), and record the result in §10.4.
+  - Record whether macOS 15's periodic "continue to allow screen recording" confirmation
+    fires for a ScreenCaptureKit still.
