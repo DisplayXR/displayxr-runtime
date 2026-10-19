@@ -15,6 +15,11 @@
 # `version: latest` the wrong fix rather than the easy one.
 #
 # Manifest: downstream-pins.json      Spec: docs/specs/runtime/downstream-pin-bump.md
+#
+# A second job checks the runtime installer's default conversion model pack
+# (#2234): the open provider's packs/dxr-open-default.models.json at the tag
+# versions.json pins as conversion_open. That pin moves by a publish-bot commit
+# with no PR, so a weekly check is where a rename or a deleted tag surfaces.
 name: pin-rot-canary
 
 on:
@@ -151,4 +156,53 @@ jobs:
 
       - name: Fail the run so the schedule surfaces it
         if: steps.check.outputs.failed == '1'
+        run: exit 1
+
+  models-pack:
+    if: github.repository == 'DisplayXR/displayxr-runtime'
+    runs-on: ubuntu-latest
+    env:
+      PACK_ISSUE_TITLE: 'pin-rot canary: the installer default model-pack URL does not resolve'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Default model-pack URL resolves
+        id: pack
+        run: |
+          set -uo pipefail
+          if python3 scripts/check_models_pack_url.py --network | tee pack.log; then
+            echo "failed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: File or update the tracking issue
+        if: steps.pack.outputs.failed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ISSUE="$RUNNER_TEMP/pack-issue.md"
+          {
+            echo "The runtime installer's default conversion model pack URL no longer resolves."
+            echo ""
+            echo '```'
+            cat pack.log
+            echo '```'
+            echo ""
+            echo "The URL is derived from versions.json[conversion_open] and the template in"
+            echo "installer/DisplayXRInstaller.nsi (#2234). Fix whichever moved: the pack file in"
+            echo "DisplayXR/displayxr-conversion-open, the pinned tag, or the template."
+            echo ""
+            echo "Run: https://github.com/DisplayXR/displayxr-runtime/actions/runs/${GITHUB_RUN_ID}"
+          } > "$ISSUE"
+          EXISTING=$(gh issue list --repo DisplayXR/displayxr-runtime --state open --search "\"$PACK_ISSUE_TITLE\" in:title" --json number -q '.[0].number' || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" --repo DisplayXR/displayxr-runtime --body-file "$ISSUE"
+          else
+            gh issue create --repo DisplayXR/displayxr-runtime --title "$PACK_ISSUE_TITLE" --body-file "$ISSUE"
+          fi
+
+      - name: Fail the run so the schedule surfaces it
+        if: steps.pack.outputs.failed == '1'
         run: exit 1

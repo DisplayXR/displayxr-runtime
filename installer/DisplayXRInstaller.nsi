@@ -175,15 +175,33 @@ FunctionEnd
 ; Conversion model store (ADR-053 P4, #2108)
 ;
 ; The runtime owns the machine's conversion model store. The default pack
-; manifest is published by the open conversion provider (its own repository);
+; manifest is published by the open conversion provider (its own repository,
+; DisplayXR/displayxr-conversion-open, packs/dxr-open-default.models.json);
 ; the installer pre-fetches only that pack's `prefetch: true` models, and only
 ; the commercial ones: `displayxr-cli conv models fetch --installer` never
-; fetches a non-commercial blob, whatever AllowResearchOnly says. Both URLs
-; can be overridden at build time (-DDXR_MODELS_PACK_URL=...) or at install
-; time (/MODELSPACK=<url-or-path>); /NOMODELS deselects the default pack.
-!ifndef DXR_MODELS_PACK_URL
-	!define DXR_MODELS_PACK_URL "https://github.com/DisplayXR/displayxr-models/releases/download/packs/dxr-open-default.models.json"
+; fetches a non-commercial blob, whatever AllowResearchOnly says.
+;
+; Where the pack comes from (#2234), first match wins:
+;   1. /MODELSPACK=<url-or-path> on the command line;
+;   2. -DDXR_MODELS_PACK_URL=<url-or-path> at build time;
+;   3. the installed open provider's own copy: the first entry of its
+;      registry row's Packs (REG_MULTI_SZ, 64-bit view), if that file exists;
+;   4. the pack file in the provider's repository at the tag versions.json
+;      pins (`conversion_open`), injected as DXR_CONVERSION_OPEN_TAG by
+;      installer/CMakeLists.txt. A raw.githubusercontent.com URL at a tag is
+;      immutable and resolves (CI: scripts/check_models_pack_url.py), unlike the
+;      displayxr-models "packs" release this used to name, which never existed.
+; /NOMODELS deselects the default pack.
+!ifndef DXR_CONVERSION_OPEN_TAG
+	!define DXR_CONVERSION_OPEN_TAG "v0.1.1"
 !endif
+!ifdef DXR_MODELS_PACK_URL
+	!define DXR_MODELS_PACK_URL_OVERRIDDEN
+!else
+	!define DXR_MODELS_PACK_URL "https://raw.githubusercontent.com/DisplayXR/displayxr-conversion-open/${DXR_CONVERSION_OPEN_TAG}/packs/dxr-open-default.models.json"
+!endif
+; The open provider's registry row (its installer writes Packs there).
+!define DXR_OPEN_CONVERSION_ROW "Software\DisplayXR\ConversionProviders\open-conversion"
 !ifndef DXR_MODELS_LARGE_STILL
 	!define DXR_MODELS_LARGE_STILL "depth-still-large"
 !endif
@@ -1441,6 +1459,44 @@ client_dll_ok:
 
 SectionEnd
 
+; #2234: resolve the default conversion pack into $R2 (precedence in the
+; "Conversion model store" block near the top). Scratch: $R4-$R7.
+Function DxrResolveModelsPack
+	${GetParameters} $R4
+	ClearErrors
+	${GetOptions} $R4 "/MODELSPACK=" $R5
+	${IfNot} ${Errors}
+		StrCpy $R2 $R5
+		DetailPrint "Conversion models: pack from /MODELSPACK=: $R2"
+		Return
+	${EndIf}
+!ifdef DXR_MODELS_PACK_URL_OVERRIDDEN
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	DetailPrint "Conversion models: pack from the build-time DXR_MODELS_PACK_URL: $R2"
+	Return
+!endif
+	; The installed open provider's Packs value. NSIS's ReadRegStr cannot read
+	; a REG_MULTI_SZ, so RegGetValueW: RRF_RT_REG_MULTI_SZ (0x20) |
+	; RRF_SUBKEY_WOW6464KEY (0x10000) reads the 64-bit view without touching
+	; SetRegView, and the buffer's first NUL-terminated string is the first
+	; entry. HKLM = 0x80000002 (this installer is a 32-bit process). Size is
+	; in bytes: NSIS_MAX_STRLEN UTF-16 units, what System allocates for w .R5.
+	StrCpy $R5 ""
+	IntOp $R6 ${NSIS_MAX_STRLEN} * 2
+	System::Call 'advapi32::RegGetValueW(p 0x80000002, w "${DXR_OPEN_CONVERSION_ROW}", w "Packs", i 0x00010020, p 0, w .R5, *i R6 R6) i .R7'
+	${If} $R7 == 0
+	${AndIf} $R5 != ""
+		${If} ${FileExists} "$R5"
+			StrCpy $R2 $R5
+			DetailPrint "Conversion models: pack from the installed open provider (Packs): $R2"
+			Return
+		${EndIf}
+		DetailPrint "Conversion models: the open provider's Packs entry $R5 does not exist; using the pinned pack URL."
+	${EndIf}
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	DetailPrint "Conversion models: pack from displayxr-conversion-open ${DXR_CONVERSION_OPEN_TAG}: $R2"
+FunctionEnd
+
 ; ADR-053 P4 (#2108): pre-fetch the default conversion pack (the small video-
 ; and still-depth models and the inpainter). Fail soft: a blob that does not
 ; download is fetched on first use (it shows as DOWNLOADING), and the install
@@ -1454,12 +1510,7 @@ Section "Conversion models (default pack)" SecModels
 		DetailPrint "Conversion models: skipped (/NOMODELS)."
 		Goto models_done
 	${EndIf}
-	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
-	ClearErrors
-	${GetOptions} $R0 "/MODELSPACK=" $R1
-	${IfNot} ${Errors}
-		StrCpy $R2 $R1
-	${EndIf}
+	Call DxrResolveModelsPack
 	DetailPrint "Conversion models: pre-fetching the default pack from $R2"
 	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --prefetch --installer'
 	Pop $R3
@@ -1471,13 +1522,7 @@ SectionEnd
 
 ; The large still-depth model: on demand otherwise (DOWNLOADING on first use).
 Section /o "Large still-depth model (on demand otherwise)" SecModelsLarge
-	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
-	${GetParameters} $R0
-	ClearErrors
-	${GetOptions} $R0 "/MODELSPACK=" $R1
-	${IfNot} ${Errors}
-		StrCpy $R2 $R1
-	${EndIf}
+	Call DxrResolveModelsPack
 	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --model "${DXR_MODELS_LARGE_STILL}" --installer'
 	Pop $R3
 	${If} $R3 != 0

@@ -23,6 +23,10 @@ name: lint
 #   plug-in built against another apiVersion and every in-process app
 #   silently runs in 2D. See scripts/check_cnsdk_pins.py.
 #
+# - Model-pack URL guard: the runtime installer's default conversion pack
+#   URL is derived from versions.json[conversion_open] (#2234). See
+#   scripts/check_models_pack_url.py.
+#
 # - GNOME Shell extension guard: contrib/gnome-shell/ has to load on
 #   every GNOME our .deb installs on, and those straddle the GNOME 45
 #   ES-module break (Ubuntu 22.04 is GNOME 42, 26.04 is GNOME 50). The
@@ -283,6 +287,14 @@ jobs:
         # be a weaker duplicate of that. Rationale in full: the docstring of
         # scripts/check_cnsdk_pins.py.
         run: python3 scripts/check_cnsdk_pins.py
+
+      - name: Default model-pack URL is derived from versions.json
+        # Offline, same reasoning as the CNSDK step: the Windows installer's
+        # fallback conversion pack URL must be built from the conversion_open
+        # pin CMake injects, not a hand-typed URL (#2234: the old one 404'd for
+        # every install). Whether the URL actually resolves is a network
+        # question, checked weekly by pin-rot-canary.yml.
+        run: python3 scripts/check_models_pack_url.py
 
   downstream-pin-guard:
     runs-on: ubuntu-latest
