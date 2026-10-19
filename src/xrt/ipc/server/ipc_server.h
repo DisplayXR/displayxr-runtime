@@ -181,6 +181,16 @@ struct ipc_client_state
 	//! connection. Equal to peer_pid until a peer declaration is accepted, after
 	//! which peer_pid becomes the DECLARED target and this stays the authoriser.
 	long opener_pid;
+	//! Input focus follows the APPLICATION (ipc_app_group.h): the peer's
+	//! executable and parent pid, read once at describe_client (best-effort,
+	//! "" / 0 = unknown), so a sibling connection of the focused client can be
+	//! recognised without a syscall on the per-frame path.
+	char peer_exe_path[512];
+	long peer_parent_pid;
+	//! This connection is NOT the focused one but belongs to the focused
+	//! client's application, so its device reads are live (client_input_allowed).
+	//! Written under global_state.lock on flush, read racily per frame.
+	bool input_focus_shared;
 
 	//! browser#103 RC-1: a peer declaration has been settled on this connection.
 	//! Settled ONCE — a second declaration is refused, so no client can move its
@@ -838,6 +848,7 @@ struct ipc_service_health_slot
 	bool session_active;                      //!< Session flags.
 	bool session_visible;                     //!< See @ref session_active.
 	bool session_focused;                     //!< See @ref session_active.
+	bool input_focus_shared;                  //!< Input focus shared from the focused sibling (ipc_app_group.h).
 	bool io_active;                           //!< Input routed to this client.
 	bool primary_application;                 //!< Primary application.
 	uint32_t swapchain_count;                 //!< Live swapchains.

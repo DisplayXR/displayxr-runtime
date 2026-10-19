@@ -77,6 +77,7 @@ set(tests
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
     tests_aux_screen_info
+    tests_ipc_app_group
     tests_status_snapshot
     tests_status_ipc
     tests_aux_display_edid_parse
@@ -503,6 +504,11 @@ target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 # system-default / plug-in per-monitor slot / EDID-derived rules. Header only;
 # it reads the plug-in ABI structs, hence xrt-interfaces.
 target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
+
+# Input focus follows the application (#962 follow-up): the pure sibling rule
+# in ipc/shared/ipc_app_group.h — name, process tree, executable tie-break.
+target_link_libraries(tests_ipc_app_group PRIVATE xrt-interfaces)
+target_include_directories(tests_ipc_app_group PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc)
 
 # ADR-051 -- the display status snapshot: §4 warning rules, §3 JSON shape, §7
 # text formatter (util/u_status_snapshot.h). Pure; synthetic snapshots only.

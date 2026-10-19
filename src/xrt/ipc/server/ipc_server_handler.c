@@ -2477,6 +2477,10 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	if (!ics->class_verified) {
 		char exe[512];
 		ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+		// Input focus by application (ipc_app_group.h): keep the peer's
+		// executable and parent for the sibling test on flush.
+		snprintf((char *)ics->peer_exe_path, sizeof(ics->peer_exe_path), "%s", exe);
+		ics->peer_parent_pid = ipc_server_peer_parent_pid(ics->peer_pid);
 		uint32_t verified = verify_client_class(ics, client_desc->info.declared_client_class, exe);
 
 		struct ipc_server *s = ics->server;
@@ -8546,13 +8550,15 @@ ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, u
 
 // #962: server-side input focus. A client's device reads are live only while
 // it holds focus (session_focused — controller / relay / overlay sessions are
-// always focused, see handle_focused_client_events) and its io is not muted.
-// Reads session_focused racily on purpose: it is a bool written under
+// always focused, see handle_focused_client_events) — or, since input focus
+// follows the APPLICATION (ipc_app_group.h), while it is a sibling connection
+// of the focused client (input_focus_shared) — and its io is not muted.
+// Reads both bools racily on purpose: they are written under
 // global_state.lock on flush; this is the per-frame hot path and must not lock.
 static inline bool
 client_input_allowed(volatile struct ipc_client_state *ics)
 {
-	return ics->io_active && ics->client_state.session_focused;
+	return ics->io_active && (ics->client_state.session_focused || ics->input_focus_shared);
 }
 
 xrt_result_t
