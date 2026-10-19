@@ -1263,7 +1263,13 @@ physical size and nominal viewer become the session's display-scoped Kooima inpu
 changes nothing. Swapchain sizing stays the system's worst case (ADR-010). **Since
 runtime #2218** an in-process session bound to a display is woven by **that display's**
 display processor: the compositor creates it from the bound monitor's registry entry, and
-a bound session is not segmented by where its window sits. Over IPC the service still
+a bound session is not segmented by where its window sits. The `displayId` is the one
+`xrEnumerateDisplaysDXR` reports — the same id space the display-processor registry and
+the segment table key monitors by on every platform (on macOS the CGDirectDisplayID-derived
+key, on desktop Linux the EDID + connector key, on Windows the registry monitor key); an id
+from any other space is rejected at `xrCreateSession`, and a bound id whose monitor has no
+registry entry for the session's graphics API falls back to the active plug-in's factory
+exactly as an unbound session does. Over IPC the service still
 weaves a bound session with its own display processor (the remaining half of #2218);
 per-view display bindings are M3.
 `XrSystemProperties` is not affected by a session's binding.
