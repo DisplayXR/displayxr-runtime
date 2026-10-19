@@ -58,6 +58,8 @@
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 
+#include <stddef.h>
+
 #include "util/u_logging.h"
 
 #include "sim_input_interface.h"
@@ -96,6 +98,32 @@ sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 	return XRT_SUCCESS;
 }
 
+/*! The host iface (process-lifetime runtime storage, §4b.6); set at negotiate. */
+static const struct xrt_input_plugin_host_iface *g_host = NULL;
+
+/*!
+ * The physical display height from the host's display geometry (the display
+ * plug-in's `get_display_info`, published by the builder before
+ * `create_devices`), or 0 when the host cannot say — the hand script then
+ * uses its fallback height.
+ */
+static float
+sim_input_display_height_m(void)
+{
+	if (g_host == NULL ||
+	    g_host->struct_size < offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+	                              sizeof(g_host->get_display_geometry) ||
+	    g_host->get_display_geometry == NULL) {
+		return 0.0f;
+	}
+	struct xrt_input_host_display_geometry geo = {0};
+	geo.struct_size = (uint32_t)sizeof(geo);
+	if (g_host->get_display_geometry(&geo) != XRT_SUCCESS) {
+		return 0.0f;
+	}
+	return geo.display_height_m;
+}
+
 static xrt_result_t
 sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
                                 struct xrt_device **out_devices,
@@ -132,18 +160,22 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	}
 	const float distance = sim_input_setting_float("HAND_DISTANCE_M", SIM_INPUT_HAND_DISTANCE_DEFAULT_M);
 
-	struct sim_input_controller_config lcfg = {sim_input_hand_enabled(hands, true), pinch, distance};
-	struct sim_input_controller_config rcfg = {sim_input_hand_enabled(hands, false), pinch, distance};
+	const float display_h = sim_input_display_height_m();
+
+	struct sim_input_controller_config lcfg = {sim_input_hand_enabled(hands, true), pinch, distance, display_h};
+	struct sim_input_controller_config rcfg = {sim_input_hand_enabled(hands, false), pinch, distance, display_h};
 	{
-		const struct xrt_pose lc = sim_input_hand_center(true, distance);
-		const struct xrt_pose rc = sim_input_hand_center(false, distance);
+		const struct xrt_pose lc = sim_input_hand_center(true, distance, display_h);
+		const struct xrt_pose rc = sim_input_hand_center(false, distance, display_h);
 		U_LOG_W(
-		    "sim-input: hands=%s%s pinch=%s; circle centres (display-plane frame, +Z toward the viewer) "
-		    "L(%.3f, %.3f, %.3f) R(%.3f, %.3f, %.3f), r=%.3f m.",
+		    "sim-input: hands=%s%s pinch=%s; display height %.3f m (%s); circle centres (display-plane frame, "
+		    "+Z toward the viewer) L(%.3f, %.3f, %.3f) R(%.3f, %.3f, %.3f), r=%.3f m.",
 		    lcfg.active ? "L" : "-", rcfg.active ? "R" : "-",
 		    pinch == SIM_INPUT_PINCH_HOLD ? "hold" : (pinch == SIM_INPUT_PINCH_OPEN ? "open" : "wave"),
+		    (double)(display_h > 0.0f ? display_h : SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M),
+		    display_h > 0.0f ? "host display geometry" : "fallback - host published none",
 		    (double)lc.position.x, (double)lc.position.y, (double)lc.position.z, (double)rc.position.x,
-		    (double)rc.position.y, (double)rc.position.z, (double)SIM_INPUT_CIRCLE_RADIUS_M);
+		    (double)rc.position.y, (double)rc.position.z, (double)sim_input_hand_radius(display_h));
 	}
 
 	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &lcfg);
@@ -246,6 +278,7 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 	/* N3c: settings come through the host from now on (the pointer lives
 	 * in the runtime for the life of the process; a provider may keep it). */
 	sim_input_settings_bind(host);
+	g_host = host;
 
 	*out_iface = &g_sim_input_iface;
 	return XRT_SUCCESS;

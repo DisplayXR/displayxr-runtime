@@ -118,6 +118,128 @@ get_xrt_space_action(struct oxr_logger *log, struct oxr_space *spc, struct xrt_s
 	return XR_SUCCESS;
 }
 
+
+/*
+ *
+ * RIG_LOCAL re-base: rig-local devices sit on the display plane THIS session
+ * sees (input-provider-discovery.md §4b.4).
+ *
+ */
+
+static bool
+xdev_is_rig_local(const struct xrt_device *xdev)
+{
+	return xdev != NULL && xdev->tracking_origin != NULL &&
+	       xdev->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL;
+}
+
+//! Is @p spc a pose space on a RIG_LOCAL device? (After get_xrt_space resolved it.)
+static bool
+space_is_rig_local(const struct oxr_space *spc)
+{
+	switch (spc->space_type) {
+	case OXR_SPACE_TYPE_ACTION: return xdev_is_rig_local(spc->action.xdev);
+	case OXR_SPACE_TYPE_XDEV_POSE: return xdev_is_rig_local(spc->xdev_pose.xdev);
+	default: return false;
+	}
+}
+
+/*!
+ * The correction that moves a RIG_LOCAL device from where the space graph puts
+ * it onto the display plane @p sess sees, as a pose in the (uncorrected) base
+ * frame @p xbase o @p base_offset, to be LEFT-multiplied onto a relation in
+ * that base. Returns false when no correction applies.
+ *
+ * The space graph is session-agnostic: `u_builders.c::anchor_rig_local_origins`
+ * anchors every RIG_LOCAL origin at the initial rig and the rig delta carries
+ * it, so the graph resolves a rig-local pose L to
+ *
+ *     T_root_origin o head_pose(t) o L
+ *
+ * — the head DEVICE pose, which is the display plane of a runtime-window
+ * session (oxr_session_locate_views, oxr_space_display_create). An
+ * external-window (`_handle` / `_texture`) or bridge-relay session's plane is
+ * instead the IDENTITY at the head's tracking origin, and for those sessions
+ * the head pose is the qwerty fly camera (bridge relay) or the DP's static
+ * nominal viewer (EXT_APP_MODE) — neither is the plane. So for them:
+ *
+ *     C_B = T_B_origin o inv(head_pose(t)) o inv(T_B_origin)
+ *
+ * which turns the graph's result into T_B_origin o L. Done here, per session,
+ * because one space graph serves sessions of both kinds (several IPC clients;
+ * EXT_APP_MODE flips the head pose at xrCreateSession, after the builder ran).
+ */
+static bool
+rig_local_plane_correction(struct oxr_session *sess,
+                           struct xrt_space *xbase,
+                           const struct xrt_pose *base_offset,
+                           int64_t at_timestamp_ns,
+                           struct xrt_pose *out_c)
+{
+	if (!sess->has_external_window && !sess->is_bridge_relay) {
+		return false; // The plane IS the head device pose: the graph is right.
+	}
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL || xbase == NULL) {
+		return false;
+	}
+
+	const enum xrt_space_relation_flags valid =
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+
+	struct xrt_space_relation hp = XRT_SPACE_RELATION_ZERO;
+	xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, &hp);
+	if ((hp.relation_flags & valid) != valid) {
+		return false; // No rig delta composed either; nothing to undo.
+	}
+
+	struct xrt_space_relation T_B_origin = XRT_SPACE_RELATION_ZERO;
+	xrt_space_overseer_locate_device(sess->sys->xso, xbase, base_offset, at_timestamp_ns, head, &T_B_origin);
+	if ((T_B_origin.relation_flags & valid) != valid) {
+		// As xrLocateViews does for these sessions.
+		T_B_origin.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+	}
+
+	struct xrt_pose inv_hp, inv_origin, tmp;
+	math_pose_invert(&hp.pose, &inv_hp);
+	math_pose_invert(&T_B_origin.pose, &inv_origin);
+	math_pose_transform(&inv_hp, &inv_origin, &tmp);
+	math_pose_transform(&T_B_origin.pose, &tmp, out_c);
+	return true;
+}
+
+/*!
+ * Apply the RIG_LOCAL re-base to @p rel (target located in base, both as the
+ * space graph saw them). A rig-local TARGET is moved by C, a rig-local BASE by
+ * inv(C); both rig-local, or neither, cancels.
+ */
+static void
+rig_local_rebase(struct oxr_session *sess,
+                 bool target_rig_local,
+                 bool base_rig_local,
+                 struct xrt_space *xbase,
+                 const struct xrt_pose *base_offset,
+                 int64_t at_timestamp_ns,
+                 struct xrt_space_relation *rel)
+{
+	if (target_rig_local == base_rig_local || rel->relation_flags == 0) {
+		return;
+	}
+	struct xrt_pose c;
+	if (!rig_local_plane_correction(sess, xbase, base_offset, at_timestamp_ns, &c)) {
+		return;
+	}
+	if (base_rig_local) {
+		struct xrt_pose inv;
+		math_pose_invert(&c, &inv);
+		c = inv;
+	}
+	struct xrt_relation_chain xrc = {0};
+	m_relation_chain_push_relation(&xrc, rel);
+	m_relation_chain_push_pose(&xrc, &c);
+	m_relation_chain_resolve(&xrc, rel);
+}
+
 static XrResult
 get_xrt_space(struct oxr_logger *log, struct oxr_space *spc, struct xrt_space **out_xspace)
 {
@@ -329,6 +451,7 @@ oxr_space_xdev_pose_create(struct oxr_logger *log,
 	spc->space_type = OXR_SPACE_TYPE_XDEV_POSE;
 	xrt_space_reference(&spc->xdev_pose.xs, xspace);
 	xrt_space_reference(&xspace, NULL);
+	spc->xdev_pose.xdev = xdev;
 
 	*out_space = spc;
 
@@ -502,6 +625,14 @@ oxr_spaces_locate(struct oxr_logger *log,
 		    spc_count,                                           //
 		    offsets,                                             //
 		    results);                                            //
+		if (xret == XRT_SUCCESS) {
+			// RIG_LOCAL devices sit on THIS session's display plane.
+			const bool base_rl = space_is_rig_local(baseSpc);
+			for (uint32_t i = 0; i < spc_count; i++) {
+				rig_local_rebase(baseSpc->sess, space_is_rig_local(spcs[i]), base_rl, xbase,
+				                 &base_offset, (int64_t)at_timestamp_ns, &results[i]);
+			}
+		}
 		if (xret != XRT_SUCCESS) {
 			//! @todo  results locationFlags should still be 0. But should this hard fail? goto "Print"?
 			oxr_warn(log, "Failed to locate spaces (%d)", xret);
@@ -656,6 +787,10 @@ oxr_space_locate(
 		    xtarget,                     //
 		    &target_offset,              //
 		    &result);                    //
+
+		// RIG_LOCAL devices sit on THIS session's display plane.
+		rig_local_rebase(spc->sess, space_is_rig_local(spc), space_is_rig_local(baseSpc), xbase, &base_offset,
+		                 (int64_t)at_timestamp_ns, &result);
 	}
 
 	/*
@@ -797,6 +932,11 @@ oxr_space_locate_device(struct oxr_logger *log,
 	    at_timestamp_ns,              //
 	    xdev,                         //
 	    out_relation);                //
+
+	// RIG_LOCAL devices sit on THIS session's display plane (the hand-joint
+	// base goes through here).
+	rig_local_rebase(baseSpc->sess, xdev_is_rig_local(xdev), space_is_rig_local(baseSpc), xbase, &base_offset,
+	                 (int64_t)at_timestamp_ns, out_relation);
 
 	return ret;
 }

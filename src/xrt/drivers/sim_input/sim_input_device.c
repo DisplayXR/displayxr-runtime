@@ -78,6 +78,9 @@ struct sim_input_device
 	//! Circle center for this hand.
 	struct xrt_pose center;
 
+	//! Circle radius (scales with the display height).
+	float radius_m;
+
 	//! Per-hand phase offset in radians (interleaves the two hands).
 	double phase_rad;
 
@@ -117,7 +120,7 @@ sim_input_device(struct xrt_device *xdev)
 static void
 script_relation(const struct sim_input_device *sd, int64_t at_timestamp_ns, struct xrt_space_relation *out_relation)
 {
-	sim_input_hand_relation(&sd->center, sd->phase_rad, at_timestamp_ns, out_relation);
+	sim_input_hand_relation(&sd->center, sd->radius_m, sd->phase_rad, at_timestamp_ns, out_relation);
 }
 
 //! Scripted button state, a pure function of the monotonic time.
@@ -343,8 +346,9 @@ sim_input_create_controller(enum xrt_device_type type, const struct sim_input_co
 	//
 	// #2191: always DISPLAY-PLANE-relative (RIG_LOCAL, §4b.4). The builder
 	// anchors the origin at the initial rig and the overseer composes the
-	// rig delta, so `world = rig(t) o L` — the hands sit HAND_DISTANCE_M in
-	// front of the glass in every reference space, with no stage height or
+	// rig delta, so `world = rig(t) o L`; the state tracker re-bases it onto
+	// an external-window / bridge-relay session's own plane (§4b.4) — the
+	// hands sit HAND_DISTANCE_M in front of the glass in every reference space, with no stage height or
 	// mount offset to guess. (#1380 introduced this frame for the NAV knob;
 	// the stage-anchored circle it kept for NAV=0 sat behind the glass on
 	// some setups and ~1.45 m off on others, #2191.)
@@ -366,10 +370,13 @@ sim_input_create_controller(enum xrt_device_type type, const struct sim_input_co
 	}
 
 	// #2191: circle centre in the display-plane frame — HAND_DISTANCE_M out
-	// of the glass, 12 cm to this hand's side, slightly below centre. The
+	// of the glass, 0.30 x display height to this hand's side, 0.10 x height
+	// below centre (so small panels still show both hands). The
 	// grip / aim / palm poses ride the same circle as the hand root, so
 	// marker cubes an app draws from the grip action land inside the hand.
-	sd->center = sim_input_hand_center(is_left, config != NULL ? config->hand_distance_m : 0.0f);
+	const float display_h = config != NULL ? config->display_height_m : 0.0f;
+	sd->center = sim_input_hand_center(is_left, config != NULL ? config->hand_distance_m : 0.0f, display_h);
+	sd->radius_m = sim_input_hand_radius(display_h);
 	sd->pinch = config != NULL ? config->pinch : SIM_INPUT_PINCH_WAVE;
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).

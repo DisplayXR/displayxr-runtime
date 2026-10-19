@@ -1862,6 +1862,233 @@ TEST_CASE("sim-input hands sit in front of the physical display plane (#2191)", 
 	tear_down(rt);
 }
 
+namespace {
+
+/*!
+ * One instant on the host's monotonic clock, re-expressible as an XrTime in
+ * ANY instance (each instance has its own XrTime offset). The sim-input script
+ * is a pure function of the monotonic timestamp, so two instances asked about
+ * the same Instant see the same scripted hands — which is what lets the
+ * session classes below be compared to the millimetre.
+ */
+struct Instant
+{
+#if defined(_WIN32)
+	LARGE_INTEGER qpc;
+#else
+	struct timespec ts;
+#endif
+};
+
+/*!
+ * An Instant 10 s in the FUTURE. Each instance's XrTime is offset from the
+ * moment it was created, so an instant taken before a later instance exists
+ * would map to a negative (invalid) XrTime there. The hand script is a pure
+ * function of the timestamp, so a predicted time is as good as a present one.
+ */
+Instant
+instant_ahead()
+{
+	Instant i{};
+#if defined(_WIN32)
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&i.qpc);
+	i.qpc.QuadPart += f.QuadPart * 10;
+#else
+	clock_gettime(CLOCK_MONOTONIC, &i.ts);
+	i.ts.tv_sec += 10;
+#endif
+	return i;
+}
+
+XrTime
+instant_to_xr(Runtime &rt, const Instant &i)
+{
+	XrTime t = 0;
+#if defined(_WIN32)
+	auto convert =
+	    rt.fn<PFN_xrConvertWin32PerformanceCounterToTimeKHR>("xrConvertWin32PerformanceCounterToTimeKHR");
+	REQUIRE(XR_SUCCEEDED(convert(rt.instance, &i.qpc, &t)));
+#else
+	auto convert = rt.fn<PFN_xrConvertTimespecTimeToTimeKHR>("xrConvertTimespecTimeToTimeKHR");
+	REQUIRE(XR_SUCCEEDED(convert(rt.instance, &i.ts, &t)));
+#endif
+	return t;
+}
+
+//! Wrist + palm of both hands, in the display-plane frame.
+struct PlaneHands
+{
+	XrVector3f wrist[2];
+	XrVector3f palm[2];
+};
+
+/*!
+ * Locate both hands' wrist + palm in @p base and re-express them in the frame
+ * of the display plane xrLocateViews reports in that same base
+ * (XrViewDisplayRawDXR::displayPlanePose, nothing chained). Returns false when
+ * a hand is not active.
+ */
+bool
+measure_plane_hands(Runtime &rt, XrSpace base, XrTime t, PlaneHands *out, XrPosef *out_plane)
+{
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(base, t, nullptr, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	const XrPosef inv_plane = pinv(plane);
+	if (out_plane != nullptr) {
+		*out_plane = plane;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	bool all_active = true;
+	for (int h = 0; h < 2; h++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = h == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		XrHandJointLocationEXT locs[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = base;
+		li.time = t;
+		XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		jl.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		jl.jointLocations = locs;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &jl)));
+		all_active = all_active && jl.isActive;
+
+		out->wrist[h] = pmul(inv_plane, locs[XR_HAND_JOINT_WRIST_EXT].pose).position;
+		out->palm[h] = pmul(inv_plane, locs[XR_HAND_JOINT_PALM_EXT].pose).position;
+		destroyTracker(tracker);
+	}
+	return all_active;
+}
+
+//! One session class's measurement of the same Instant, in LOCAL and STAGE.
+struct ClassResult
+{
+	bool ran = false;
+	PlaneHands local{};
+	PlaneHands stage{};
+};
+
+ClassResult
+measure_session_class(const char *name, bool display_info, const Instant &at)
+{
+	ClassResult r;
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	opt.display_info = display_info;
+	if (!bring_up(rt, opt)) {
+		return r;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking || (display_info && !rt.have_display_info)) {
+		WARN(name << ": XR_DXR_view_rig / XR_EXT_hand_tracking / XR_DXR_display_info not advertised");
+		tear_down(rt);
+		return r;
+	}
+	const XrTime t = instant_to_xr(rt, at);
+	XrPosef plane_local{}, plane_stage{};
+	const bool a0 = measure_plane_hands(rt, rt.local, t, &r.local, &plane_local);
+	const bool a1 = measure_plane_hands(rt, rt.stage, t, &r.stage, &plane_stage);
+	REQUIRE(a0);
+	REQUIRE(a1);
+	for (int h = 0; h < 2; h++) {
+		std::printf(
+		    "RIG_LOCAL %-12s %s wrist plane-frame (%.3f, %.3f, %.3f) palm (%.3f, %.3f, %.3f) | plane in "
+		    "LOCAL %s\n",
+		    name, h == 0 ? "L" : "R", r.local.wrist[h].x, r.local.wrist[h].y, r.local.wrist[h].z,
+		    r.local.palm[h].x, r.local.palm[h].y, r.local.palm[h].z, pstr(plane_local).c_str());
+	}
+	r.ran = true;
+	tear_down(rt);
+	return r;
+}
+
+void
+check_in_front_of_plane(const char *name, const PlaneHands &p)
+{
+	for (int h = 0; h < 2; h++) {
+		const bool left = h == 0;
+		const XrVector3f d = p.wrist[h];
+		CAPTURE(name, left, d.x, d.y, d.z);
+		// In front of the glass, about HAND_DISTANCE_M (0.25) out.
+		CHECK(d.z > 0.15f);
+		CHECK(d.z < 0.35f);
+		// Left hand left of centre, right hand right of it, on the panel.
+		CHECK((left ? -d.x : d.x) > 0.01f);
+		CHECK(std::fabs(d.x) < 0.25f);
+		// Near panel-centre height — not a standing height, not a viewer offset.
+		CHECK(std::fabs(d.y) < 0.15f);
+	}
+}
+
+void
+check_same_hands(const char *what, const PlaneHands &a, const PlaneHands &b, float tol_m)
+{
+	for (int h = 0; h < 2; h++) {
+		CAPTURE(what, h);
+		CHECK(vdist(a.wrist[h], b.wrist[h]) < tol_m);
+		CHECK(vdist(a.palm[h], b.palm[h]) < tol_m);
+	}
+}
+
+} // namespace
+
+TEST_CASE("RIG_LOCAL hands sit on the display plane the SESSION sees, in every session class",
+          "[oxr][view_space][rig_hands]")
+{
+	// RIG_LOCAL contract (input-provider-discovery.md §4b.4): a joint the
+	// provider publishes at display-plane point L is located at
+	// displayPlanePose o L — in whatever base the app locates in, and for every
+	// session class. Field evidence (2026-10-18): an external-window session
+	// (modelviewer, `_handle`) on a no-qwerty Linux build had the palms 1.47 m
+	// below and 0.54 m in front of where they belong, because the builder
+	// anchored RIG_LOCAL at the head DEVICE pose — the display plane only for
+	// runtime-window sessions.
+	//
+	// Headless classes reachable in-process:
+	//   - runtime-window (no XR_DXR_display_info): plane = head device pose;
+	//   - bridge relay (XR_DXR_display_info + headless): plane = identity at the
+	//     head's tracking origin — the SAME plane rule an external-window
+	//     (`_handle` / `_texture`) session gets (oxr_session.c, the
+	//     `!has_external_window && !is_bridge_relay` gate).
+	// Both measure the same monotonic Instant, so their plane-frame hands must
+	// agree to the millimetre, not just be "roughly in front".
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	const Instant at = instant_ahead();
+	const ClassResult hosted = measure_session_class("runtime-win", false, at);
+	const ClassResult relay = measure_session_class("bridge-relay", true, at);
+	if (!hosted.ran || !relay.ran) {
+		SUCCEED("a session class could not come up headlessly - nothing to compare");
+		return;
+	}
+
+	// Each class: the hands are in front of ITS display plane.
+	check_in_front_of_plane("runtime-win", hosted.local);
+	check_in_front_of_plane("bridge-relay", relay.local);
+	// Each class: the plane-frame hands do not depend on the base space.
+	check_same_hands("runtime-win LOCAL vs STAGE", hosted.local, hosted.stage, kPosTolM);
+	check_same_hands("bridge-relay LOCAL vs STAGE", relay.local, relay.stage, kPosTolM);
+	// The classes agree: RIG_LOCAL is the display plane, not the head device pose.
+	check_same_hands("runtime-win vs bridge-relay", hosted.local, relay.local, 0.002f);
+}
+
 TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#2191)",
           "[oxr][view_space][rig_hands_hold]")
 {
@@ -1931,7 +2158,10 @@ TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#219
 	std::printf("#2191 HANDS=right PINCH=hold: max thumb-index gap %.4f m, wrist x sweep %.3f..%.3f m\n", max_gap,
 	            min_x, max_x);
 	CHECK(max_gap < 0.015f);      // pinched the whole revolution
-	CHECK(max_x - min_x > 0.05f); // ...while the root moves: a drag
+	// ...while the root moves: a drag. The circle diameter is 0.20 x the
+	// display height, capped at 8 cm (sim_input_hand_radius), so > 2 cm on
+	// any panel taller than 0.10 m.
+	CHECK(max_x - min_x > 0.02f);
 	CHECK(min_x > 0.0f);          // on the right of the display centre
 
 	destroyTracker(trackers[0]);

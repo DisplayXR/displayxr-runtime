@@ -86,22 +86,40 @@ sim_input_hand_enabled(enum sim_input_hands_mode mode, bool left)
 	}
 }
 
+static float
+display_height_or_fallback(float display_height_m)
+{
+	if (!(display_height_m > 0.0f) || !isfinite(display_height_m)) {
+		return SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M;
+	}
+	return display_height_m;
+}
+
 struct xrt_pose
-sim_input_hand_center(bool left, float distance_m)
+sim_input_hand_center(bool left, float distance_m, float display_height_m)
 {
 	if (!(distance_m > 0.0f) || !isfinite(distance_m)) {
 		distance_m = SIM_INPUT_HAND_DISTANCE_DEFAULT_M;
 	}
+	const float h = display_height_or_fallback(display_height_m);
+	const float lateral = SIM_INPUT_HAND_LATERAL_FRAC * h;
 	struct xrt_pose p = {
 	    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
-	    .position = {left ? -SIM_INPUT_HAND_LATERAL_M : SIM_INPUT_HAND_LATERAL_M, SIM_INPUT_HAND_HEIGHT_M,
-	                 distance_m},
+	    .position = {left ? -lateral : lateral, SIM_INPUT_HAND_HEIGHT_FRAC * h, distance_m},
 	};
 	return p;
 }
 
+float
+sim_input_hand_radius(float display_height_m)
+{
+	const float r = SIM_INPUT_CIRCLE_RADIUS_FRAC * display_height_or_fallback(display_height_m);
+	return r < SIM_INPUT_CIRCLE_RADIUS_M ? r : SIM_INPUT_CIRCLE_RADIUS_M;
+}
+
 void
 sim_input_hand_relation(const struct xrt_pose *center,
+                        float radius_m,
                         double phase_rad,
                         int64_t at_timestamp_ns,
                         struct xrt_space_relation *out_relation)
@@ -110,7 +128,7 @@ sim_input_hand_relation(const struct xrt_pose *center,
 	double t = (double)at_timestamp_ns * 1e-9;
 	double theta = omega * t + phase_rad;
 
-	float r = SIM_INPUT_CIRCLE_RADIUS_M;
+	float r = radius_m;
 	float c = (float)cos(theta);
 	float s = (float)sin(theta);
 

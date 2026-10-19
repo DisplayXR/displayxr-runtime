@@ -667,6 +667,33 @@ changes. Anchoring happens after the head's own tracking origin is settled and
 before the space overseer freezes each origin offset into a space; a head with
 no valid pose anchors at identity.
 
+**Where RIG_LOCAL lands, per session.** `L` is relative to the display plane
+**the session sees** — the same plane `xrLocateViews` reports as
+`XrViewDisplayRawDXR::displayPlanePose` and `XR_DXR_display_info`'s DISPLAY
+space resolves to:
+
+| Session | Its display plane | A RIG_LOCAL pose `L` is located at | Follows rig motion? |
+|---|---|---|---|
+| Runtime-window (`_hosted`, legacy, headless without `XR_DXR_display_info`) — in-process or IPC | the head **device** pose, `rig(t)` (the head device *is* the display; qwerty / the composer move it) | `rig(t) ∘ L` | yes — WASD / mouse-look / a navigating provider carry the hands (*Amendment 2*) |
+| External-window (`_handle`, `_texture`, the Unity / Unreal providers) — in-process or IPC | the **identity at the head's tracking origin** (the app owns its camera) | `T_origin ∘ L` | no — the plane does not move for these sessions, so neither do the hands; an app that navigates declares it through `XR_DXR_view_rig` |
+| Bridge relay (`XR_DXR_display_info` + headless) | the identity at the head's tracking origin | `T_origin ∘ L` | no |
+
+The space graph is session-agnostic and resolves every RIG_LOCAL pose to the
+first row's `rig(t) ∘ L`. For the other two rows the state tracker re-bases it
+(`oxr_space.c::rig_local_plane_correction`, applied in `xrLocateSpace(s)` and
+in the hand-joint base): `C = T_origin ∘ inv(head_pose(t)) ∘ inv(T_origin)`,
+left-multiplied, in the locate's base space. It has to be per session: one
+graph serves sessions of both kinds (several IPC clients), and an
+external-window session flips the head device into `EXT_APP_MODE` — which
+replaces the fly-camera pose with the display plug-in's static nominal viewer —
+at `xrCreateSession`, long after the builder anchored the origin. Before this
+re-base, an external-window session on a no-qwerty build saw the hands offset
+by exactly that nominal viewer (≈ +0.1 m up, +0.6 m out), and on a qwerty build
+by the 1.6 m fly-camera height. Pinned by
+`tests_oxr_view_space_rig_hands` ("RIG_LOCAL hands sit on the display plane
+the SESSION sees"): the runtime-window and bridge-relay classes must put the
+same scripted hands at the same display-plane point to the millimetre.
+
 **The recipe for a solver that already outputs world poses.** If your tracking
 stack produces product poses `C_W` in its own world `W` that *already* contains
 your navigation `P(t)` — which is the normal shape for a camera-drag solver —
@@ -865,14 +892,20 @@ before launching the host process.
 
 **`sim_input` hands (#2191).** Each hand's root — and the grip / aim / palm
 poses, which ride the same circle so a marker drawn from the grip action lands
-inside the rendered hand — sweeps a 4 cm circle (4 s period) in the display
-plane's XY, centred `HAND_DISTANCE_M` in front of the glass, 12 cm left / right
-of the display centre and 3 cm below it, published on a `RIG_LOCAL` origin so
-`world = rig(t) ∘ L` puts them in front of the panel in every reference space.
+inside the rendered hand — sweeps a circle (4 s period) in the display
+plane's XY, centred `HAND_DISTANCE_M` in front of the glass. The lateral and
+vertical offsets scale with the **physical display height H** so small panels
+still show both hands: centres at ±0.30·H left / right of the display centre
+and 0.10·H below it, radius 0.10·H capped at 4 cm. H is the panel height from
+`host->get_display_geometry` (§4b.6 — the display plug-in's
+`get_display_info`); a host that publishes none falls back to H = 0.40 m,
+which is the previous fixed placement (±12 cm, 4 cm circle). `HAND_DISTANCE_M`
+stays metres. The poses are published on a `RIG_LOCAL` origin, so they sit in
+front of the panel the session sees in every reference space (§4b.4).
 (Before #2191 a NAV-off run kept a stage-anchored circle that ended up 5 cm
 *behind* the glass on a headless sim-display system and far out of view on
 others.) The plug-in logs the resolved script once at `create_devices`
-(`sim-input: hands=LR pinch=wave; circle centres (display-plane frame, …)`).
+(`sim-input: hands=LR pinch=wave; display height 0.196 m (host display geometry); circle centres (display-plane frame, …)`).
 Settings, through the options contract above (no legacy aliases — they are
 new):
 
