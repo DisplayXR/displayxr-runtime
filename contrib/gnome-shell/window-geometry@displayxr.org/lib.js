@@ -1077,7 +1077,8 @@
          * from it since (Alt+Tab, Super+H, minimizing it from the dock, a
          * click elsewhere — a click elsewhere is also newer input). Otherwise
          * nothing changes but the window is flagged as demanding attention
-         * (GNOME shows "… is ready"; a minimized window stays minimized), which
+         * (mutter flags it only when covered, minimized or on another
+         * workspace; GNOME then shows "… is ready"), which
          * is what GNOME does for any app that asks from the background. That
          * is mutter's own focus-stealing rule, applied with the time of the
          * app's last input instead of "now". It also limits the rate by
