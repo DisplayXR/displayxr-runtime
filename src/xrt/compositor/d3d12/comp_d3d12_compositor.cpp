@@ -1898,6 +1898,13 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 
 	c->reroute.active = true;
 	c->split_off_reason = NULL;
+	// #2218 (#3): the arm segments the window with its own manager (ADR-047
+	// Amendment 1, the VK tier's shape). A screen list handed over before the
+	// arm stood up is replayed into it; later ones are forwarded by
+	// comp_d3d12_compositor_set_screens.
+	if (c->seg_screens != nullptr && c->seg_sys_info != nullptr) {
+		comp_vk_split_set_screens(c->reroute.split, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
+	}
 	U_LOG_W(
 	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
 	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
@@ -3974,12 +3981,19 @@ d3d12_projection_layer_view_count(const struct comp_layer_accum *layers)
  * Multi-screen M6 (ADR-047 D2, D3D12): does this window span monitors? The
  * twin of the D3D11 compositor's pre-split gate — only off the zero-copy path
  * (the atlas must be ours to crop: a repaint is never armed on it), off the
- * #918 split and the #1264 reroute (another device owns the weave there), for
- * a whole-window canvas (a zones / Local2D frame keeps the single-DP path) and
- * while the back buffer matches the client area (the segment rects are window
- * px). A window on the primary screen only stays single-DP, byte for byte.
- * Publishes the table it took for the next xrLocateViews (M3). Weave thread,
- * under c->mutex.
+ * #1264 reroute (the d3d11 fill arm owns the weave there and segments with its
+ * own manager, comp_vk_split), for a whole-window canvas (a zones / Local2D
+ * frame keeps the single-DP path) and while the back buffer matches the client
+ * area (the segment rects are window px). A window on the primary screen only
+ * stays single-DP, byte for byte. Publishes the table it took for the next
+ * xrLocateViews (M3). Weave thread, under c->mutex.
+ *
+ * #2218 (#3): under the #918 own-legs split this weave still runs HERE, on the
+ * OUTPUT device — the manager is made on d3d12_out_device()/queue, the egress
+ * slot it crops is an output-device resource in COMMON (what the recorder
+ * expects, exactly like the single-device atlas after its barrier), and
+ * zero-copy is never taken under the split — so the split is no longer an
+ * exclusion: a window off the primary screen is woven per screen there too.
  *
  * @param[out] out_window  The window's client area in desktop device px.
  * @return true = this weave takes the split path.
@@ -3999,7 +4013,7 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 	// #2218: the manager exists and "does this window need the per-screen weave" is
 	// answered on every weave, before and independently of zero-copy / the canvas;
 	// only the split itself needs an atlas that is ours and a whole-window canvas.
-	if (!c->split_active && !c->reroute.active && c->hwnd != nullptr && c->seg_screens != nullptr) {
+	if (!c->reroute.active && c->hwnd != nullptr && c->seg_screens != nullptr) {
 		// Device px — every DisplayXR executable is per-monitor DPI aware
 		// (#1201), the same space the screen registry's monitor rects are in.
 		RECT rc;
@@ -5967,6 +5981,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		struct comp_vk_deposit_handoff rr_handoff = {};
 		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
+			// #1883 / #2218 (#3): the slot carries this frame's segment
+			// partition (by its seq), so the arm crops each segment's views
+			// where this atlas painted them.
+			comp_vk_split_stage_segment_content(c->reroute.split, &c->seg_content);
 			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
 			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
 			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
@@ -7580,6 +7598,14 @@ comp_d3d12_compositor_set_screens(struct xrt_compositor *xc,
 	free(c->seg_sys_info);
 	c->seg_sys_info = info_copy;
 	c->seg_pinned_display_id = pinned_display_id;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #2218 (#3): under the #1264 reroute the d3d11 fill arm weaves and
+	// segments the window; it rebuilds its manager on its next weave (the VK
+	// tier's shape). The copy above stays for the tier's own path.
+	if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_set_screens(c->reroute.split, list, info, pinned_display_id);
+	}
+#endif
 	// ...and nothing may frame views from the old table meanwhile.
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
@@ -7596,6 +7622,14 @@ comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 		return false;
 	}
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #2218 (#3): under the #1264 reroute the d3d11 fill arm segments with its
+	// own manager and publishes its own table (eyes filled per query, like
+	// below) — the VK tier's shape.
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_get_segment_metrics(c->reroute.split, out) && out->count > 0;
+	}
+#endif
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	*out = c->seg_pub;
 	// The eyes are predicted NOW, per segment: the primary from the session's
