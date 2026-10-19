@@ -527,10 +527,12 @@ Provider-facing consequences:
   This holds *especially* for a provider that also drives the rig (§4b): the
   rig role is what makes pre-compensating look attractive, and the runtime is
   about to add exactly the transform you would be subtracting.
-- Your mount offset stays in **stage** space (e.g. a desk-mounted Leap at
-  y≈1.45). Do not express it relative to the head. A provider that navigates
-  can skip the mount offset entirely by publishing `XRT_TRACKING_TYPE_RIG_LOCAL`
-  origins instead — see §4b.
+- A mount offset on an `OTHER` / `NONE` origin stays in **stage** space. Do
+  not express it relative to the head. Any provider — navigating or not — can
+  skip the stage mount offset entirely by publishing `XRT_TRACKING_TYPE_RIG_LOCAL`
+  origins instead (§4b.4), and on a 3D display that is the better frame: the
+  sensor sits on the desk next to the panel, not at a standing height.
+  `sim_input` (#2191) and `ultraleap` (§5) both do.
 - Devices that already follow the camera themselves are excluded — qwerty's
   controllers parent to the qwerty HMD (`follow_hmd`) and are never marked.
 - Applies uniformly to grip/aim action spaces, `xrLocateSpace`, and the
@@ -842,7 +844,7 @@ gets `xrSyncActions` controllers for the first time.
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `gamepad` | **Shipped and packaged** (`src/xrt/drivers/gamepad/`, plug-in DLL `DisplayXR-Gamepad`; the Windows installer registers the `gamepad` row at ProbeOrder 150 and allowlists the DLL; `build_macos.sh` / `build_linux.sh` stage `150-gamepad-input-provider.json`; Windows dev boxes: `register_dev_plugin.bat input gamepad`) | The one controller every desk has, on the existing input-provider class (§4c): a `XRT_DEVICE_TYPE_GAMEPAD` device on `microsoft/xbox_controller` (every button, stick, trigger and the four haptic outputs; `XR_EXT_dpad_binding` works over its sticks through the runtime's generic dpad emulation), a NAVIGATION device so a present pad drives the rig (§4b: left stick = translate in the rig's yaw frame, right stick = yaw / pitch, triggers = up / down, right-stick click = recenter — the durable level-with-timestamp of §4b.3, with the pose reset to F's origin in the same publication), and — `EMULATE_CONTROLLERS` = 1, the default — an emulated left / right `khr/simple_controller` pair at fixed display-plane-relative (`RIG_LOCAL`, §4b.4) poses: shoulders / X / A = select, View / Menu = menu, vibration → the pad's motors. **Presence-gated, so registered-by-default is inert:** `probe()` claims wherever the platform has a pad reader (XInput on Windows, GameController.framework on macOS with `shouldMonitorBackgroundEvents` so it is focus-independent too) and declines where it has none (desktop Linux — an evdev backend is the follow-up); `get_presence` follows the hub's hot-plug poll (250 Hz attached, 2 Hz detached) under the "last-used input wins" rule of §4c — touching a pad mid-session takes the gamepad, rig and hand roles at the arbiter's next presence poll; leaving it idle for `IDLE_TIMEOUT_S` (or unplugging it) hands them all back. Settings (ADR-054 decision 7, `displayxr-cli input options gamepad`): `DEADZONE` (radial, 0.15), `NAV_SPEED` (m/s, 1.0), `NAV_TURN_SPEED` (deg/s, 90), `NAV` (1), `EMULATE_CONTROLLERS` (1), `INVERT_LOOK_Y` (0), `IDLE_TIMEOUT_S` (20; the "last-used input wins" window of §4c — `0` = connected-only). The whole mapping policy is one table (`gamepad_map.c`, pinned by `tests/tests_gamepad_map.cpp`), so a per-title bindings mechanism (#1381) replaces the table, not the devices. |
 | `touch_input` | **Shipped on Android** (`src/xrt/drivers/touch_input/`; `libdxri100_touch_input.so` in the runtime APK, `DisplayXR-TouchInput` on desktop builds where it is a dev-only artefact — not staged, not registered, `probe()` declines unless `ENABLE` = 1 because nothing feeds pointer events there) | The first Android input provider (#132, §5.2): touch gestures → a `NAVIGATION` device (the rig role of §4b) + an emulated `khr/simple_controller` (`ANY_HAND`, aim ray under the finger, SELECT on tap / hold). ProbeOrder 100. Presence is unconditional — the touch screen is the hardware. Settings (§3): `ENABLE` (Android default 1, `0` withdraws it), `CONTROLLER` (default 1; `0` = navigation only), `SENSITIVITY` (orbit-rate multiplier, default 1.0). |
-| `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
+| `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. Hands, joints and controllers are **display-plane-relative** (`RIG_LOCAL`, §4b.4), placed by a **relative** mapping in display heights by default (`MAPPING` / `ANCHOR_*_H` / `GAIN_H_PER_M`, or `physical` + `MOUNT_*_M`; below). On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 
 **`sim_input` and the rig role (#1380).** A *second*, independent opt-in,
 `DXR_SIM_INPUT_NAV=1`, adds one scripted `XRT_DEVICE_TYPE_NAVIGATION` device
@@ -886,6 +888,57 @@ Pinned by `tests/tests_sim_input_hands.cpp` (the pure script: placement, the
 pinch-hold tip gap through the real `u_hand_simulation`) and end to end by the
 `[rig_hands]` / `[rig_hands_hold]` arms of `tests_oxr_view_space` (wrists
 located in LOCAL against the `displayPlanePose` `xrLocateViews` reports).
+
+**`ultraleap` placement (display plane, relative mapping).** The Leap runs in
+DESKTOP tracking mode (device on the desk, facing up). Its frame — +X right,
++Y up, +Z toward the user, millimetres — has the display plane's axes, so
+every joint, palm, grip / aim pose is published on a `RIG_LOCAL` origin
+(§4b.4) with orientations passed through unchanged and only positions mapped.
+On a 3D display the Leap's physical pose relative to the panel is usually not
+known, so the default mapping is **relative**, expressed in **display heights
+`H`** (the physical panel height from the host's `get_display_geometry`,
+§4b.6) so the hands feel the same on any panel size:
+
+```
+p_display = H · anchor_h + H · gain_h_per_m · leap_m
+```
+
+The defaults come from the reference viewer app's scene (a Leap desktop
+provider and its ghost hands parented to one root under a 60° 2D camera): the
+Leap origin sits **on the display plane, 0.20 H below the display centre**,
+and hand motion maps at **0.81 H per metre** — so a hand held ~25 cm above the
+device lands at the display centre. Joint radii and the palm's linear
+velocity scale by the same gain, so the hand is drawn at the scene's scale and
+prediction moves it at that scale. A user who has measured the setup can pick
+`physical` instead: 1:1 metres from an explicit mount, relative to the display
+centre (no stage height — the old stage offset `{0, 1.45, -0.10}` was an
+HMD / standing-VR assumption and is gone). With no display geometry (a host
+predating the slot, or no display plug-in) the relative mapping falls back to
+a nominal 0.194 m panel and logs it. The resolved mapping is logged once per
+`create_devices` (`ultraleap: mapping = relative, display height … m: anchor
+… H = … m, gain … H/m …`). Settings, through the options contract (§3; read
+at `create_devices`, so a change applies to the next session):
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `MAPPING` | enum | `relative` | `relative` \| `physical` |
+| `ANCHOR_X_H` | float | `0.0` | relative: Leap origin right of the display centre, display heights |
+| `ANCHOR_Y_H` | float | `-0.20` | relative: Leap origin above the display centre, display heights |
+| `ANCHOR_Z_H` | float | `0.0` | relative: Leap origin in front of the glass, display heights (0 = on the plane) |
+| `GAIN_H_PER_M` | float | `0.81` | relative: display heights per metre of hand motion; ≤ 0 = default |
+| `MOUNT_X_M` / `MOUNT_Y_M` / `MOUNT_Z_M` | float | `0.0` / `-0.15` / `0.10` | physical: Leap origin relative to the display centre, metres |
+
+The provider owns only `L` (the display-plane pose); where the display plane
+lands in the world is the builder's `RIG_LOCAL` anchoring (§4b.4), shared with
+`sim_input` — an anchoring defect moves both providers' hands identically.
+
+The same values are u_var debug tunables on the "Ultraleap Input Hub" root
+(`mapping_physical`, `anchor_h`, `gain_h_per_m`, `mount_m`,
+`display_height_m`), re-resolved every tracking frame. The mapping is the pure
+`ultraleap_map.c`, pinned by `tests/tests_ultraleap_map.cpp` (both modes, the
+25 cm-above-the-device → display-centre placement, panel-size invariance,
+radius / velocity gain, the settings parse) — compiled on every box, since CI
+carries no Leap SDK and never builds the plug-in itself.
 
 ### 5.2 touch_input — gestures, and where its events come from (#132)
 

@@ -17,6 +17,11 @@
  * honestly, the runtime moves the hand roles between this provider and
  * qwerty as the hardware comes and goes.
  *
+ * Settings (the one options contract, ADR-054 decision 7) and the display
+ * height (host `get_display_geometry`, #1380) reach the provider only here,
+ * through the host iface retained at negotiate; `create_devices` reads both
+ * and hands the hub a resolved display-plane mapping (`ultraleap_map.h`).
+ *
  * Register with `register_dev_plugin.bat input <path>\DisplayXR-Ultraleap.dll`
  * (Windows) or an `NNN-ultraleap-input-provider.json` manifest (POSIX).
  *
@@ -29,8 +34,57 @@
 #include "xrt/xrt_results.h"
 
 #include "ultraleap_interface.h"
+#include "ultraleap_map.h"
+
+#include "util/u_logging.h"
 
 #include <stddef.h>
+
+
+/*
+ *
+ * Host iface slots (process-lifetime storage on the host's side, §4b.6).
+ *
+ */
+
+static xrt_component_get_setting_fn_t g_ul_get_setting = NULL;
+static xrt_result_t (*g_ul_get_geometry)(struct xrt_input_host_display_geometry *inout) = NULL;
+
+static void
+ul_plugin_bind_host(const struct xrt_input_plugin_host_iface *host)
+{
+	g_ul_get_setting = NULL;
+	g_ul_get_geometry = NULL;
+	if (host == NULL) {
+		return;
+	}
+	// Both carved from the former reserved[]: an older runtime leaves them
+	// NULL, and one older than the slot has a struct_size that does not
+	// even cover it.
+	if (host->struct_size >=
+	    offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) + sizeof(host->get_display_geometry)) {
+		g_ul_get_geometry = host->get_display_geometry;
+	}
+	if (host->struct_size >=
+	    offsetof(struct xrt_input_plugin_host_iface, get_setting) + sizeof(host->get_setting)) {
+		g_ul_get_setting = host->get_setting;
+	}
+}
+
+//! Physical display height from the host, or 0 when the runtime cannot say.
+static float
+ul_plugin_display_height_m(void)
+{
+	if (g_ul_get_geometry == NULL) {
+		return 0.0f;
+	}
+	struct xrt_input_host_display_geometry geo = {0};
+	geo.struct_size = (uint32_t)sizeof(geo);
+	if (g_ul_get_geometry(&geo) != XRT_SUCCESS) {
+		return 0.0f;
+	}
+	return geo.display_height_m;
+}
 
 
 /*
@@ -59,9 +113,22 @@ ul_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// Per system: the settings (read at init, never per frame) and the
+	// display height the relative mapping is expressed in. The geometry
+	// cache is published before any provider's create_devices (§4b.6).
+	struct ul_map_config map_cfg;
+	ul_map_config_from_settings(g_ul_get_setting, &map_cfg);
+	const float display_height_m = ul_plugin_display_height_m();
+	if (display_height_m <= 0.0f && map_cfg.mode == UL_MAPPING_RELATIVE) {
+		U_LOG_W(
+		    "ultraleap: no display geometry from the runtime — relative mapping uses a nominal %.3f m "
+		    "panel height.",
+		    (double)UL_MAP_FALLBACK_DISPLAY_HEIGHT_M);
+	}
+
 	struct xrt_device *left = NULL;
 	struct xrt_device *right = NULL;
-	xrt_result_t xret = ul_create_devices(&left, &right);
+	xrt_result_t xret = ul_create_devices(&map_cfg, display_height_m, &left, &right);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -116,6 +183,8 @@ static struct xrt_input_plugin_iface g_ul_iface = {
     .destroy = ul_plugin_destroy,
 
     .get_presence = ul_plugin_get_presence,
+
+    .describe_settings = ul_map_describe_settings,
 };
 
 
@@ -131,14 +200,14 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
                         struct xrt_input_plugin_iface **out_iface,
                         uint32_t *out_plugin_api_version)
 {
-	(void)host;
-
 	*out_plugin_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
 
 	if (runtime_api_version != XRT_INPUT_PLUGIN_API_VERSION_CURRENT) {
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+
+	ul_plugin_bind_host(host);
 
 	*out_iface = &g_ul_iface;
 	return XRT_SUCCESS;

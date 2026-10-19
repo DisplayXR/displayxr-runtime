@@ -1054,6 +1054,8 @@ find_library(LEAPC_LIBRARY NAMES LeapC
 if(LEAPC_INCLUDE_DIR AND LEAPC_LIBRARY)
 add_library(drv_ultraleap_plugin SHARED
 	ultraleap/ultraleap_interface.h
+	ultraleap/ultraleap_map.c
+	ultraleap/ultraleap_map.h
 	ultraleap/ultraleap_plugin.c
 	ultraleap/ultraleap_provider.cpp
 	)
