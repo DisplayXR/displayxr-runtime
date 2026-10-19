@@ -15,6 +15,7 @@
 
 #include <stdlib.h>
 
+#include "util/comp_dp_factory.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
@@ -101,6 +102,7 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   bool offscreen,
                                   void *shared_texture_handle,
                                   bool transparent_background,
+                                  uint64_t bound_display_id,
                                   struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -109,7 +111,8 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 	// Get Metal display processor factory from system compositor info
 	void *dp_factory_metal = NULL;
 	if (sys->xsysc != NULL) {
-		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
+		// #2218: a session bound to a display takes that monitor's plug-in.
+		dp_factory_metal = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_METAL);
 	}
 
 	// Create the Metal native compositor

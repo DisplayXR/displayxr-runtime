@@ -165,6 +165,27 @@ comp_dp_factory_for_window(const struct xrt_system_compositor_info *info,
 	return (chosen != NULL) ? chosen : scalar;
 }
 
+/*!
+ * #2218: the factory for an in-process SESSION. A session bound to a display
+ * (XrSessionDisplayBindingDXR, @ref xrt_session_info::bound_display_id) takes
+ * that monitor's registry entry via @ref comp_dp_factory_for_window — an app
+ * pinned to another vendor's screen is woven by that vendor. An unbound session
+ * keeps the scalar `dp_factory_<api>`, byte for byte what shipped.
+ */
+static inline void *
+comp_dp_factory_for_session(const struct xrt_system_compositor_info *info,
+                            uint64_t bound_display_id,
+                            enum comp_dp_api api)
+{
+	if (info == NULL) {
+		return NULL;
+	}
+	if (bound_display_id != 0) {
+		return comp_dp_factory_for_window(info, bound_display_id, api);
+	}
+	return comp_dp_scalar_for_api(info, api);
+}
+
 #ifdef __cplusplus
 }
 #endif

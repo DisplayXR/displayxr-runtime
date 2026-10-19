@@ -15,6 +15,7 @@
 
 #include <stdlib.h>
 
+#include "util/comp_dp_factory.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
@@ -93,6 +94,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
+                                   uint64_t bound_display_id,
                                    struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -106,8 +108,9 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	if (sys->xsysc != NULL) {
-		dp_factory_d3d12 = sys->xsysc->info.dp_factory_d3d12;
-		dp_factory_d3d11 = sys->xsysc->info.dp_factory_d3d11;
+		// #2218: a session bound to a display takes that monitor's plug-in (both arms).
+		dp_factory_d3d12 = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_D3D12);
+		dp_factory_d3d11 = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_D3D11);
 		display_screen_left = sys->xsysc->info.display_screen_left;
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}

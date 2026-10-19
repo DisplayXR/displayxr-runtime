@@ -40,6 +40,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                void *window_handle,
                                void *shared_iosurface,
                                bool transparent_background,
+                               uint64_t bound_display_id,
                                struct oxr_session *sess)
 {
 	const XrGraphicsBindingOpenGLMacOSDXR *next = (const XrGraphicsBindingOpenGLMacOSDXR *)next_ptr;
@@ -64,7 +65,9 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	    next->cglContext,     // App's CGLContextObj for texture sharing
 	    NULL,                 // gl_display (not used on macOS)
 	    (sys->xsysc != NULL)
-	        ? comp_dp_factory_for_window(&sys->xsysc->info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_GL)
+	        ? comp_dp_factory_for_window(&sys->xsysc->info,
+	                                     bound_display_id != 0 ? bound_display_id : COMP_DP_PRIMARY_MONITOR, // #2218
+	                                     COMP_DP_API_GL)
 	        : NULL,
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
 	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
@@ -124,6 +127,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                const void *next_ptr,
                                void *window_handle,
                                void *shared_iosurface,
+                               uint64_t bound_display_id,
                                struct oxr_session *sess)
 {
 	const XrGraphicsBindingOpenGLMacOSDXR *next = (const XrGraphicsBindingOpenGLMacOSDXR *)next_ptr;
@@ -132,7 +136,8 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 
 	void *dp_factory_metal = NULL;
 	if (sys->xsysc != NULL) {
-		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
+		// #2218: a session bound to a display takes that monitor's plug-in.
+		dp_factory_metal = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_METAL);
 	}
 
 	bool offscreen = (window_handle == NULL && shared_iosurface != NULL);

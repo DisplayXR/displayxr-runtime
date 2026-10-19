@@ -1260,9 +1260,12 @@ with `XR_ERROR_VALIDATION_FAILURE`; `0` is the same as not chaining it). **v22 e
 when the bound display is not the system default and its physical size is known, its
 physical size and nominal viewer become the session's display-scoped Kooima inputs
 (the projection used before window metrics are known); binding to the system default
-changes nothing. Swapchain sizing stays the system's worst case (ADR-010) and the
-display processor that weaves the session is still the system default's — honouring
-the binding in the compositor (segments, per-view display bindings) is M2/M3.
+changes nothing. Swapchain sizing stays the system's worst case (ADR-010). **Since
+runtime #2218** an in-process session bound to a display is woven by **that display's**
+display processor: the compositor creates it from the bound monitor's registry entry, and
+a bound session is not segmented by where its window sits. Over IPC the service still
+weaves a bound session with its own display processor (the remaining half of #2218);
+per-view display bindings are M3.
 `XrSystemProperties` is not affected by a session's binding.
 
 #### Per-segment views and view display bindings (v22, multi-screen M3)

@@ -80,6 +80,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 void *gl_display,
                                 void *shared_texture_handle,
                                 bool transparent_background,
+                                uint64_t bound_display_id,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -87,7 +88,9 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 
 	// Get GL display processor factory and display top-left from system compositor info
 	void *dp_factory_gl = (sys->xsysc != NULL)
-	    ? comp_dp_factory_for_window(&sys->xsysc->info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_GL)
+	    ? comp_dp_factory_for_window(&sys->xsysc->info,
+	                                 bound_display_id != 0 ? bound_display_id : COMP_DP_PRIMARY_MONITOR, // #2218
+	                                 COMP_DP_API_GL)
 	    : NULL;
 	int32_t display_screen_left = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_left : 0;
 	int32_t display_screen_top = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_top : 0;
