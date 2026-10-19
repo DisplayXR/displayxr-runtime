@@ -481,6 +481,17 @@ comp_d3d12_segments_set_screens(struct comp_d3d12_segments *segs,
 }
 
 extern "C" bool
+comp_d3d12_segments_would_split(const struct comp_d3d12_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return false;
+	}
+	return comp_segments_window_is_split(window_desktop, canvas, segs->screens, segs->screen_count);
+}
+
+extern "C" bool
 comp_d3d12_segments_enabled(const struct comp_d3d12_segments *segs)
 {
 	return segs != nullptr && segs->enabled;

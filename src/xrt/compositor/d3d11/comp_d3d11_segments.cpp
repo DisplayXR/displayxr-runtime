@@ -672,6 +672,17 @@ comp_d3d11_segments_set_hwnd_hooks(struct comp_d3d11_segments *segs, const struc
 }
 
 extern "C" bool
+comp_d3d11_segments_would_split(const struct comp_d3d11_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return false;
+	}
+	return comp_segments_window_is_split(window_desktop, canvas, segs->screens, segs->screen_count);
+}
+
+extern "C" bool
 comp_d3d11_segments_enabled(const struct comp_d3d11_segments *segs)
 {
 	return segs != nullptr && segs->enabled;

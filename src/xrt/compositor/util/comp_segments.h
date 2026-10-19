@@ -269,6 +269,21 @@ bool
 comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas_w, uint32_t canvas_h);
 
 /*!
+ * #2218: would @p window_desktop take the split path at all — is it anything
+ * other than wholly on the primary screen? Pure: computes a scratch table and
+ * asks @ref comp_segments_table_is_split; no lifecycle, no DPs. The
+ * compositors ask this BEFORE deciding zero-copy, so a stereo frame that
+ * qualifies for zero-copy is still composed (and woven per screen) when its
+ * window is not on the primary screen; before, zero-copy skipped segmentation
+ * and the primary screen's DP wove the window wherever it was.
+ */
+bool
+comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
+                              const struct comp_seg_rect *canvas,
+                              const struct comp_segments_screen *screens,
+                              uint32_t screen_count);
+
+/*!
  * The refuse-rather-than-resample policy for one segment.
  *
  * - No DP for the segment → flat 2D.

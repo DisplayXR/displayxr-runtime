@@ -118,6 +118,18 @@ bool
 comp_d3d11_segments_enabled(const struct comp_d3d11_segments *segs);
 
 /*!
+ * #2218: would this window take the split path (not wholly on the primary
+ * screen)? Pure (@ref comp_segments_window_is_split on the manager's screens):
+ * no lifecycle, no DPs. The weave publishes the answer for the compose step,
+ * which withholds zero-copy while it is true so the frame reaches
+ * @ref comp_d3d11_segments_update instead of the primary DP.
+ */
+bool
+comp_d3d11_segments_would_split(const struct comp_d3d11_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas);
+
+/*!
  * One metric update: recompute the segment table for the window, run the DP
  * lifecycle (create/destroy secondary DPs with hysteresis), log a table change
  * once at INFO. Call once per weave, before deciding which path records.

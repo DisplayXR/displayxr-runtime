@@ -468,6 +468,9 @@ struct comp_d3d12_compositor
 	 */
 	std::mutex seg_pub_mutex;
 	struct xrt_segment_metrics seg_pub;            //!< the table the last weave took (count 0 = one view set)
+	//! #2218: the last weave found the window not wholly on the primary screen — the compose step
+	//! withholds zero-copy so the frame composes and weaves per screen. Under seg_pub_mutex.
+	bool seg_zero_copy_withheld;
 	struct xrt_segment_view_routing seg_route;     //!< the routing the last locate handed out
 	struct comp_d3d12_eff_layout seg_route_logged; //!< change-only logging of the routed layout
 	//! #1883: the partition this frame's atlas is painted with (eff_layout's routing; count 0 = unrouted).
@@ -3992,8 +3995,11 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 	bool seg_split = false;
 	struct comp_seg_rect win = {0, 0, 0, 0};
 	bool have_win = false;
-	if (atlas_is_ours && !c->split_active && !c->reroute.active && !eff_canvas->valid && c->hwnd != nullptr &&
-	    c->seg_screens != nullptr) {
+	bool seg_would_split = false;
+	// #2218: the manager exists and "does this window need the per-screen weave" is
+	// answered on every weave, before and independently of zero-copy / the canvas;
+	// only the split itself needs an atlas that is ours and a whole-window canvas.
+	if (!c->split_active && !c->reroute.active && c->hwnd != nullptr && c->seg_screens != nullptr) {
 		// Device px — every DisplayXR executable is per-monitor DPI aware
 		// (#1201), the same space the screen registry's monitor rects are in.
 		RECT rc;
@@ -4024,12 +4030,15 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 		}
 		if (comp_d3d12_segments_enabled(c->segments)) {
 			const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
-			const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
-			                                ? c->xdev->hmd->active_rendering_mode_index
-			                                : 0;
-			seg_split = comp_d3d12_segments_update(c->segments, &win, &canvas, mode_index);
-			// Every segment DP follows the session's 2D/3D mode, like the primary.
-			comp_d3d12_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			seg_would_split = comp_d3d12_segments_would_split(c->segments, &win, &canvas);
+			if (atlas_is_ours && !eff_canvas->valid) {
+				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
+				                                ? c->xdev->hmd->active_rendering_mode_index
+				                                : 0;
+				seg_split = comp_d3d12_segments_update(c->segments, &win, &canvas, mode_index);
+				// Every segment DP follows the session's 2D/3D mode, like the primary.
+				comp_d3d12_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			}
 		}
 	}
 
@@ -4050,6 +4059,12 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 			m.generation++;
 		}
 		c->seg_pub = m;
+		if (c->seg_zero_copy_withheld != seg_would_split) {
+			c->seg_zero_copy_withheld = seg_would_split;
+			U_LOG_W("segments: window %s the primary screen — zero-copy %s (#2218)",
+			        seg_would_split ? "left" : "is back on",
+			        seg_would_split ? "withheld: frames compose and weave per screen" : "allowed again");
+		}
 	}
 	*out_window = win;
 	return seg_split;
@@ -5660,6 +5675,17 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->eff_layout.route_count > 0) {
 		zero_copy = false;
 		zc_resource = nullptr;
+	}
+
+	// #2218: a window not wholly on the primary screen is woven per screen, so
+	// its frame must be composed into our atlas for the segments to crop (one-
+	// frame lag: decided by the last weave).
+	{
+		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+		if (c->seg_zero_copy_withheld) {
+			zero_copy = false;
+			zc_resource = nullptr;
+		}
 	}
 
 	// XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor composes

@@ -1150,3 +1150,35 @@ TEST_CASE("GL segments: a partial-height segment lands at the right rows inside 
 	const comp_seg_rect v = comp_segments_gl_flip(&t, 800);
 	CHECK(v.y == a.y);
 }
+
+TEST_CASE("comp_segments: window_is_split — the zero-copy gate (#2218)", "[comp_segments]")
+{
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3456, 2160, 3456, 2160, false),
+	    screen(DS1, 3456, 0, 3840, 2160, 3840, 2160, true),
+	};
+	SECTION("wholly on the primary: not split — zero-copy stays available")
+	{
+		comp_seg_rect win{4000, 100, 1280, 720};
+		CHECK_FALSE(comp_segments_window_is_split(&win, nullptr, scr, 2));
+		comp_seg_rect canvas{0, 0, 1280, 720};
+		CHECK_FALSE(comp_segments_window_is_split(&win, &canvas, scr, 2));
+	}
+	SECTION("wholly on a secondary screen: split — zero-copy must be withheld")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		CHECK(comp_segments_window_is_split(&win, nullptr, scr, 2));
+	}
+	SECTION("straddling the seam: split")
+	{
+		comp_seg_rect win{3000, 200, 1280, 720};
+		CHECK(comp_segments_window_is_split(&win, nullptr, scr, 2));
+	}
+	SECTION("degenerate inputs never split")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		CHECK_FALSE(comp_segments_window_is_split(nullptr, nullptr, scr, 2));
+		CHECK_FALSE(comp_segments_window_is_split(&win, nullptr, nullptr, 2));
+		CHECK_FALSE(comp_segments_window_is_split(&win, nullptr, scr, 0));
+	}
+}
