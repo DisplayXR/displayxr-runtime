@@ -393,13 +393,17 @@ comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsys
 
 /*!
  * Display dashboard phase 7: the screen registry was re-resolved (a display
- * re-probe — e.g. after a per-screen DP preference changed). For every client
- * that enabled segments, a screen whose plug-in changed gets its segment DP
- * recreated: the client's manager is rebuilt from @p list on its next weave,
- * and the lifecycle's hysteresis makes each DP again. The client's primary
+ * re-probe — after a per-screen DP preference changed, or a monitor was
+ * plugged, unplugged or moved: WM_DISPLAYCHANGE feeds the same worker). For
+ * every client that enabled segments, the client's manager is rebuilt from
+ * @p list on its next weave — the old segment DPs are released and the
+ * lifecycle's hysteresis makes each again from its screen's (new) registry
+ * entry — when a screen's plug-in changed, or (#2218 #9) a screen joined or
+ * left the registry, or moved / resized / changed role. The client's primary
  * (system-default) screen keeps the registry entry its session started with —
- * the session's own DP never swaps live — so a change there only applies to
- * the next session. A list with no plug-in change is a no-op.
+ * the session's own DP never swaps live — so a claimant change there only
+ * applies to the next session. A list identical in membership, geometry and
+ * claimants is a no-op.
  *
  * @ingroup comp_d3d11_service
  */
