@@ -1440,13 +1440,27 @@ plugin (`displayxr_linux_set_keep_above` / `_activate_window` / `_set_minimized`
 ### 11.3 Mutter policy a consumer should know
 
 - **Keep-above changes focus for new windows** (mutter's rule, the same for a user's
-  own "Always on Top"). A window that opens underneath a kept-above window on the same
-  workspace, while some window has focus, does not get focus; it is stacked under the
-  focused window and flagged as demanding attention. mutter 47+: when about 60 % or
-  more of it is covered (`window_would_mostly_be_covered_by_always_above_window`,
-  visible area ≤ 40 %); mutter 42–46: any overlap (`window_would_be_covered`).
-  Coverage is measured on the kept-above window's frame rectangle, not its visible
-  pixels — a transparent avatar window counts as its whole rectangle.
+  own "Always on Top"). While some window has focus, a new window that mutter finds
+  covered by a kept-above window does not get focus; it is stacked under the focused
+  window (and flagged as demanding attention if it overlaps that one). Coverage is
+  measured on the kept-above window's frame rectangle, not its visible pixels — a
+  transparent avatar window counts as its whole rectangle. Which rectangle of the
+  new window is tested depends on the version (measured, below):
+  - **mutter 47+** (GNOME 47+, Ubuntu 26.04): the window where it opens, denied
+    when about 60 % or more of it is covered
+    (`window_would_mostly_be_covered_by_always_above_window`, visible area ≤ 40 %).
+  - **mutter 42–46** (Ubuntu 22.04, 24.04): `window_would_be_covered()` runs before
+    the window is placed, on the rectangle `(work-area x, work-area y, W, H)` — the
+    top-left corner of the primary monitor's work area with the new window's size.
+    Any overlap of that rectangle with a kept-above window denies focus, wherever
+    the window then opens; coverage of its final position does not matter (100 %
+    covered still gets focus). In practice: a kept-above avatar on a secondary
+    monitor (the 3D panel, typically) never takes focus from new windows; one on
+    the primary monitor takes it from every new window large enough to reach the
+    avatar from the top-left corner. Measured on mutter 42.9 and 46.2 with 1-px
+    probes (edges at exactly `x + W` and `y + H`), Wayland and Xwayland clients
+    alike, two monitors (the rectangle stays on the primary / (0,0) monitor; a
+    layout where those differ was not tested).
 - **Keep-above and maximize:** a window made above and maximized afterwards stays in
   the top layer only until the next relayer (any window opening), then drops to the
   normal layer while `is_above()` still reads true.
@@ -1490,8 +1504,18 @@ Unity plugin as the caller:
   keep-above re-sent after the drop (done);
 - minimize, then restore from the Ubuntu dock: the weave shows correctly again.
 
-Not verified: GNOME 42–49 at run time (the calls exist in the mutter sources from
-42.0; maximize's API change is handled by an existence check).
+GNOME 42.9 and 46.2 (Ubuntu 22.04 / 24.04 in rootless containers, headless, software
+rendering, GTK4 test windows; extension versions 16 and 17, installed as the
+packages do — on 42 the legacy entry point): the extension loads with no JS errors
+(capabilities 231 on 42, without the move-sync bits as designed; 255 on 46); keep-above
+on and off holds the stack while another window has focus; activate (same
+workspace, from minimized, across workspaces), minimize and restore, MoveWindow; a
+maximized window's keep-above is refused; the undo on disconnect leaves a user's own
+"Always on Top" alone; all four members refused for another process naming the pid
+(version 16; version 17 the same, except that activation from the background is
+refused and flagged by its focus policy, §11.6). The keep-above focus rule was
+measured there too (§11.3). Not verified: GNOME 47–49
+at run time, and anything on real hardware before 50.
 
 ### 11.6 ActivateWindow's focus policy (extension version 17)
 
