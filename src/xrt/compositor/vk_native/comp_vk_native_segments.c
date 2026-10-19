@@ -940,6 +940,17 @@ comp_vk_native_segments_enabled(const struct comp_vk_native_segments *segs)
 }
 
 bool
+comp_vk_native_segments_would_split(const struct comp_vk_native_segments *segs,
+                                    const struct comp_seg_rect *window_desktop,
+                                    const struct comp_seg_rect *canvas)
+{
+	if (segs == NULL || !segs->enabled) {
+		return false;
+	}
+	return comp_segments_window_is_split(window_desktop, canvas, segs->screens, segs->screen_count);
+}
+
+bool
 comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
                                const struct comp_seg_rect *window_desktop,
                                const struct comp_seg_rect *canvas,
