@@ -340,9 +340,16 @@ produce the verdicts.
    9. an app-facing OpenXR extension (an API does not imply a provider class);
    10. an external registered **consumer** over IPC or shared memory (spatial audio reading
        viewer poses, §4.3);
-   11. an independently hosted service speaking an established protocol (the remote
-       conversion endpoint, ADR-057 §6);
+   11. an independently hosted service or process speaking an established protocol (the
+       remote conversion endpoint, ADR-057 §6; a workspace controller, the process contract
+       over IPC of §2 and `workspace-controller-registration.md` — shells and verticals land
+       here, not on rung 12);
    12. a new component class — only when none of the above captures the requirement.
+
+   The rungs are a **decision menu, not mutually exclusive layers**: one capability may use
+   several at once (stereo capture today is an OpenXR extension, a display plug-in's optional
+   slot, a runtime-owned generic source and a web-SDK primitive together). The analysis asks
+   only whether the part that would become a class is already served by a lower rung.
 
 3. **A proposal declares its selection scope** (decision 8) and its hosting: display
    processors select per screen, conversion providers per task and per stream or job, input
@@ -370,22 +377,28 @@ produce the verdicts.
      sound field never disagree. Its lifecycle decouples consumer churn from sensor start and
      stop (minimum on-time and linger; the service's own subscription counts as a consumer;
      "tracking with no consumer" is a visible state), because sub-second sensor open/close
-     cycles have wedged real tracking cameras.
+     cycles have wedged real tracking cameras. It also coordinates with the display platform's
+     own idle teardown (a vendor tracker may disable its camera after an idle linger, 300 s on
+     the first vendor; a consumer that starts after that waits for the camera to re-enable) —
+     the display plug-in's "tracking without a weaver, indicator lit" mode is the prerequisite
+     (displayxr-leia-plugin#409).
    - **Stereo cameras — the existing sources (rung 8 and a runtime module), not a class
      yet.** A display's own camera comes through the display plug-in's stereo-camera slots;
      ordinary USB side-by-side cameras through the runtime's vendor-neutral UVC source
      (ADR-043 Amendment 4), which must never match a sensor an active display processor
-     claims. **Named trigger** (replaces "when a standalone camera exists"): the Pro media
-     player's SDI capture card *is* a standalone stereo source today and stays in-app (one
-     consumer, broadcast-monitoring semantics); the moment a **second consumer** wants that
-     feed, it becomes the first camera provider, hosted per ADR-053's satellite template with
-     shareable GPU frames, behind the same camera manager, consent and `XR_DXR_stereo_camera`
-     API — an internal change with no new consumer API.
+     claims. **Named trigger** (replaces "when a standalone camera exists"): a first-party app's
+     broadcast SDI capture path *is* a standalone stereo source today and stays in-app (one
+     consumer, monitoring semantics). A **second consumer** of that feed is the trigger to
+     **re-evaluate** a camera-provider class under all three tests — not an admission. If it
+     passes, the provider is hosted per ADR-053's satellite template with shareable GPU frames,
+     behind the same camera manager, consent and `XR_DXR_stereo_camera` API — an internal
+     change with no new consumer API.
    - **Media decoding — a task family inside conversion (rung 7, #2145).** Unchanged.
    - **Display profiles and reference weaving — inside the display processor (§4.2).**
      Unchanged.
    - **Viewer tracking — the fourth class (§4.1).** Passes all three: the trunk selects the
-     pose source per screen, the display's own tracker and an independent provider are
+     pose source per screen and per viewer relationship (the eye-pair ring is keyed by the
+     screen/active-viewer pair, so one tracker per monitor is not assumed), the display's own tracker and an independent provider are
      interchangeable, and the contract is specifiable (target-time eye query and the eye-pair
      ring have landed). The reference provider is a webcam-driven simulated tracker.
    - **An external tracking feed into a display processor — not a class and not yet a
