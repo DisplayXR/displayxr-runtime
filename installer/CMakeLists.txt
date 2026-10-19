@@ -58,6 +58,17 @@ configure_file(
 # Paths to build artifacts (use install prefix, not build dir)
 set(DISPLAYXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
+# #2234: the default conversion model pack is the open provider's
+# packs/dxr-open-default.models.json at the tag versions.json pins
+# (`conversion_open`, auto-bumped on every provider release), so the URL the
+# installer falls back to always names a file that exists. The .nsi keeps a
+# literal default for a makensis run outside CMake.
+file(READ "${CMAKE_SOURCE_DIR}/versions.json" _dxr_versions_json)
+string(JSON DXR_CONVERSION_OPEN_TAG ERROR_VARIABLE _dxr_conv_open_err GET "${_dxr_versions_json}" conversion_open)
+if(_dxr_conv_open_err)
+	message(FATAL_ERROR "versions.json has no conversion_open pin: ${_dxr_conv_open_err}")
+endif()
+
 # Create installer target
 # White icon is set via MUI_ICON in the .nsi script (visible in dark mode Explorer).
 # Do NOT use rcedit post-build — it corrupts NSIS self-extracting executables.
@@ -85,6 +96,7 @@ add_custom_target(installer
 		"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
 		"/DSIGN_CMD=${SIGN_CMD}"
 		"/DALLOWLIST_NSH=${DISPLAYXR_ALLOWLIST_NSH_NATIVE}"
+		"/DDXR_CONVERSION_OPEN_TAG=${DXR_CONVERSION_OPEN_TAG}"
 		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRInstaller.nsi"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 	COMMENT "Building DisplayXR installer..."
