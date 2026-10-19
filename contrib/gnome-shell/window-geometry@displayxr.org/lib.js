@@ -52,6 +52,16 @@
 // The session-mode test is Main.sessionMode.isLocked (not currentMode, which is
 // 'ubuntu' rather than 'user' on Ubuntu), followed through its 'updated' signal.
 //
+// ── The rule: other apps' windows are read-only (spec §12.4) ───────────────
+//
+// Every member that changes a window acts on the CALLER's own window, found by
+// the caller's PID from the bus daemon. Other apps' windows are only read
+// (GetWindows, GetAllWindows, GetPointer, GetWindowAt). Never add a member that
+// moves, focuses, minimizes, closes, restacks or types into another process's
+// window, not even behind a flag: this extension answers every process of the
+// user, so such a member would skip the consent GNOME asks for. Desktop control
+// goes through XR_DXR_desktop_control (ADR-056) instead.
+//
 // ── The D-Bus surface ───────────────────────────────────────────────────────
 //
 // Wayland never tells a client where its surface sits on the desktop, but the
