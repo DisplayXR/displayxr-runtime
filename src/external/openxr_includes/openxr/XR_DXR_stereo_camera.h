@@ -84,7 +84,13 @@ extern "C" {
 #endif
 
 #define XR_DXR_stereo_camera 1
-#define XR_DXR_stereo_camera_SPEC_VERSION 5
+// 6 = XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR (appended, nothing renumbered):
+//     a started stream whose source cannot START -- the device is held by another
+//     process, errors on its first read, or (UVC) delivers nothing within 5 s of
+//     opening -- ends with this reason instead of staying started at 0 fps; the camera
+//     reads UNAVAILABLE and a new start is XR_ERROR_STEREO_CAMERA_BUSY_DXR until the
+//     service's retry succeeds (runtime #2221).
+#define XR_DXR_stereo_camera_SPEC_VERSION 6
 #define XR_DXR_STEREO_CAMERA_EXTENSION_NAME "XR_DXR_stereo_camera"
 
 // Reserved 1004999300..319 (relocated from 290..309 on the post-lift rebase: 290 was taken by XR_DXR_weave v14). Allocation registry: README.md in this directory.
@@ -406,6 +412,10 @@ typedef enum XrStereoCameraStreamEndReasonDXR {
     XR_STEREO_CAMERA_STREAM_END_REASON_DISABLED_DXR = 2,
     //! The camera is gone (plug-in removed it / the service is shutting it down).
     XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_LOST_DXR = 3,
+    //! The source could not start (the device is held by another process, errored on its
+    //! first read, or never delivered a frame); the camera is UNAVAILABLE until the
+    //! service's retry succeeds, and a new start is XR_ERROR_STEREO_CAMERA_BUSY_DXR meanwhile.
+    XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR = 4,
     XR_STEREO_CAMERA_STREAM_END_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrStereoCameraStreamEndReasonDXR;
 

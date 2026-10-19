@@ -179,6 +179,12 @@ DEBUG_GET_ONCE_NUM_OPTION(stereo_camera_prompt_timeout_ms, "DXR_STEREO_CAMERA_PR
 #define WAIT_TIMEOUT_NS (100ll * 1000 * 1000)
 #define SUSPEND_AFTER_NS (1000ll * 1000 * 1000)
 #define REOPEN_BACKOFF_NS (1000ll * 1000 * 1000)
+/*!
+ * #2221: a UVC source that opened but delivered nothing for this long is treated as
+ * one that could not start (the device is really someone else's). UVC only: a
+ * plug-in camera may legitimately take seconds after a tracker unpause.
+ */
+#define FIRST_FRAME_DEADLINE_NS (5000ll * 1000 * 1000)
 #define STATS_LOG_NS (5000ll * 1000 * 1000)
 #define REFINE_SAMPLES 512 //!< matches one measurement may return
 #define VISIBILITY_TTL_NS (250ll * 1000 * 1000) //!< foreground-rule cache per stream
@@ -426,6 +432,8 @@ struct scam_camera
 	int64_t linger_deadline_ns;
 	int64_t last_frame_ns;
 	int64_t retry_after_ns;
+	//! When the current source opened (#2221: the UVC first-frame deadline counts from here).
+	int64_t opened_ns;
 	float source_rate;
 	//! Measured over the first frames after each open; what the descriptor
 	//! reports once known (the plug-in's enumerate-time rate is a guess, and
@@ -1674,6 +1682,9 @@ publish_locked(struct ipc_server_stereo_camera *m,
 	}
 }
 
+static void
+end_started_streams_busy_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam, const char *why);
+
 static void *
 camera_thread(void *ptr)
 {
@@ -1730,6 +1741,7 @@ camera_thread(void *ptr)
 				U_LOG_W("stereo camera %llu: %s source open failed (%d); retrying in 1 s",
 				        (unsigned long long)cam->camera_id, source_str(cam->source), (int)xret);
 				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+				end_started_streams_busy_locked(m, cam, "source open failed");
 				cam->retry_after_ns = os_monotonic_get_ns() + REOPEN_BACKOFF_NS;
 				continue;
 			}
@@ -1741,6 +1753,7 @@ camera_thread(void *ptr)
 			}
 			cam->src = src;
 			cam->last_frame_ns = 0;
+			cam->opened_ns = os_monotonic_get_ns();
 			u_stereo_camera_rate_meter_restart(&cam->rate_meter);
 			if (cam->rect != NULL && cam->rect->refine) {
 				// Keep the correction, re-verify it at the settling cadence.
@@ -1785,7 +1798,22 @@ camera_thread(void *ptr)
 			break;
 		}
 		case XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT:
-			if (cam->last_frame_ns == 0) {
+			if (cam->last_frame_ns == 0 && cam->source == XRT_STEREO_CAMERA_SOURCE_UVC &&
+			    now - cam->opened_ns > FIRST_FRAME_DEADLINE_NS) {
+				// #2221: opened, never delivered — the device is not really ours.
+				U_LOG_W(
+				    "stereo camera %llu: %s source delivered nothing for %lld ms after open; closing, "
+				    "retry in 1 s",
+				    (unsigned long long)cam->camera_id, source_str(cam->source),
+				    (long long)(FIRST_FRAME_DEADLINE_NS / 1000000));
+				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+				end_started_streams_busy_locked(m, cam, "no first frame");
+				cam->src = NULL;
+				os_mutex_unlock(&m->lock);
+				src_close(m, cam, src);
+				os_mutex_lock(&m->lock);
+				cam->retry_after_ns = os_monotonic_get_ns() + REOPEN_BACKOFF_NS;
+			} else if (cam->last_frame_ns == 0) {
 				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_WAITING);
 			} else if (now - cam->last_frame_ns > SUSPEND_AFTER_NS) {
 				set_state_locked(cam, XRT_STEREO_CAMERA_STATE_SUSPENDED);
@@ -1799,6 +1827,11 @@ camera_thread(void *ptr)
 			U_LOG_W("stereo camera %llu: %s source reported an error; closing, retry in 1 s",
 			        (unsigned long long)cam->camera_id, source_str(cam->source));
 			set_state_locked(cam, XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+			if (cam->last_frame_ns == 0) {
+				// #2221: it never delivered — a device another process holds errors on its first read.
+				end_started_streams_busy_locked(
+				    m, cam, "source failed before its first frame (held by another process?)");
+			}
 			cam->src = NULL;
 			os_mutex_unlock(&m->lock);
 			src_close(m, cam, src);
@@ -1849,6 +1882,32 @@ camera_thread(void *ptr)
 
 static void
 stream_end_locked(struct ipc_server_stereo_camera *m, struct scam_stream *s, uint32_t reason);
+
+/*!
+ * #2221: a source that cannot START (held by another process, unplugged between
+ * enumerate and open, a driver that errors on its first read, or one that never
+ * delivers) must not leave a started stream waiting at 0 fps. Every started stream
+ * on the camera ends with SOURCE_BUSY (the browser maps it to NotReadableError),
+ * the camera reads UNAVAILABLE, and the retry keeps running so a later start
+ * succeeds once the device is free. A source that stops AFTER it delivered keeps
+ * the old behaviour (streams wait through the retry).
+ */
+static void
+end_started_streams_busy_locked(struct ipc_server_stereo_camera *m, struct scam_camera *cam, const char *why)
+{
+	uint32_t ended = 0;
+	for (uint32_t i = 0; i < MAX_STREAMS; i++) {
+		struct scam_stream *s = &m->streams[i];
+		if (s->used && s->camera == cam->index && s->started && !s->ended) {
+			stream_end_locked(m, s, XRT_STEREO_CAMERA_END_SOURCE_BUSY);
+			ended++;
+		}
+	}
+	if (ended > 0) {
+		U_LOG_W("stereo camera %llu \"%s\": %s — %u started stream(s) ended with SOURCE_BUSY",
+		        (unsigned long long)cam->camera_id, cam->info.display_name, why, ended);
+	}
+}
 
 //! One camera as its source lists it, staged outside the manager lock.
 struct scam_candidate

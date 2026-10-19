@@ -548,7 +548,7 @@ The service queues, per connection (16 deep, oldest dropped), and the client dra
 - `XrEventDataStereoCameraStateChangedDXR` — the camera's **effective** state to every connection
   with a stream on it: the source state, or `SUSPENDED` while the session is locked / sharing is
   off.
-- `XrEventDataStereoCameraStreamEndedDXR` — a stream the service ended (§7.4), with the handle
+- `XrEventDataStereoCameraStreamEndedDXR` — a stream the service ended (§7.4; reasons `USER_STOPPED`, `DISABLED`, `SOURCE_LOST`, `SOURCE_BUSY`), with the handle
   and the reason.
 - `XrEventDataStereoCamerasChangedDXR` (spec v4) — the enumerated set changed (§3, "The list
   is live"): to every connection that has enumerated or created a stream. Coalesced: at most one
@@ -908,6 +908,7 @@ camera state change and per stream start/stop with the peer executable; INFO sta
 
 | Version | Change |
 |---|---|
+| 6 | `XR_STEREO_CAMERA_STREAM_END_REASON_SOURCE_BUSY_DXR` = 4 (appended, nothing renumbered). A started stream whose source cannot start — the device is held by another process, errors on its first read (Media Foundation's shape for a busy UVC device), or (UVC source) delivers nothing within 5 s of opening — ends with this reason and the camera reads `UNAVAILABLE` until the service's retry succeeds; a new start meanwhile is `XR_ERROR_STEREO_CAMERA_BUSY_DXR` (a browser maps both to `NotReadableError`). Before this the stream stayed started at 0 fps with no error (runtime #2221). A source that stops after it delivered is unchanged (its streams wait through the retry). |
 | 5 | `XrStereoCameraDisplayDXR` (`XR_TYPE_STEREO_CAMERA_DISPLAY_DXR` = 1004999317), chained on `XrStereoCameraPropertiesDXR::next`: the `XrDisplayDXR::displayId` of the screen a camera belongs to, 0 = unknown (§3). Plug-in contract (§9): appended `xrt_plugin_stereo_camera_info::monitor_id` (`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID`). A display topology change wakes the re-enumeration at once. `displayxr-cli camera list` prints the display. Nothing renumbered, no struct changes size (#1961) |
 | 4 | No struct change. The camera list is live (§3): the service re-enumerates its sources during its run (on enumerate, at most once a second, and every ~2 s while a client listens), keeping each camera's index / `cameraId` / `persistentId`; new cameras are appended, vanished ones stay listed as `UNAVAILABLE` (streams end with `SOURCE_LOST`, start is `BUSY`) and come back with their id. `XrEventDataStereoCamerasChangedDXR` is delivered (it was reserved) to every instance that enumerated. Plug-in contract (§9): `enumerate` may be called repeatedly; calibration is per camera index, not "the active device" (#1961) |
 | 3 (Amendment 4) | No API change. The service's own vendor-neutral UVC side-by-side source (§9a): opt-in per device by `stereo-cameras.json`, never a plug-in's camera; an uncalibrated pair is reported without `CALIBRATED`, its RAW calibration is refused, its RECTIFIED output is a pass-through aligned by the online refinement — so RECTIFIED now requires a camera the service can rectify rather than `CALIBRATED \| NATIVELY_RECTIFIED`. `displayxr-cli camera list` shows the source; new `camera uvc-devices` |

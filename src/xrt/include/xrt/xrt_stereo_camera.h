@@ -226,6 +226,9 @@ enum xrt_stereo_camera_end_reason
 	XRT_STEREO_CAMERA_END_USER_STOPPED = 1,
 	XRT_STEREO_CAMERA_END_DISABLED = 2,
 	XRT_STEREO_CAMERA_END_SOURCE_LOST = 3,
+	//! The source could not start (held by another process / errored before its first
+	//! frame / never delivered): UNAVAILABLE until the retry succeeds (#2221).
+	XRT_STEREO_CAMERA_END_SOURCE_BUSY = 4,
 };
 
 /*!

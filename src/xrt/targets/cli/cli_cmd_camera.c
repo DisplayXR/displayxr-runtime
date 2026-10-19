@@ -131,6 +131,20 @@ state_str(uint32_t s)
 	}
 }
 
+//! Why the service ended a stream (XrStereoCameraStreamEndReasonDXR).
+static const char *
+end_reason_str(uint32_t r)
+{
+	switch (r) {
+	case XRT_STEREO_CAMERA_END_USER_STOPPED: return "USER_STOPPED";
+	case XRT_STEREO_CAMERA_END_DISABLED: return "DISABLED";
+	case XRT_STEREO_CAMERA_END_SOURCE_LOST: return "SOURCE_LOST";
+	case XRT_STEREO_CAMERA_END_SOURCE_BUSY:
+		return "SOURCE_BUSY (the device could not start: held by another process, or no first frame)";
+	default: return "?";
+	}
+}
+
 static const char *
 format_str(uint32_t f)
 {
@@ -178,7 +192,7 @@ result_hint(xrt_result_t x)
 		return " = DISABLED (camera sharing is off: tray toggle or DXR_STEREO_CAMERA=0)";
 	case XRT_ERROR_STEREO_CAMERA_BUSY: return " = BUSY (the source cannot be opened right now; retry)";
 	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:
-		return " = STREAM_ENDED (the service ended this stream: user stop / sharing off)";
+		return " = STREAM_ENDED (the service ended this stream: user stop / sharing off / source lost or busy)";
 	case XRT_ERROR_FEATURE_NOT_SUPPORTED: return " = FEATURE_NOT_SUPPORTED";
 	case XRT_ERROR_INPUT_UNSUPPORTED: return " = INPUT_UNSUPPORTED (bad id / format / output)";
 	case XRT_ERROR_CLIENT_LIMIT_REACHED: return " = LIMIT_REACHED (8 streams per camera)";
@@ -808,6 +822,7 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	int got = 0, wakes = 0, not_ready = 0;
 	bool rows_ok = true;
 	bool ended = false;
+	uint32_t end_reason = 0;
 	int events = 0;
 	uint64_t first_index = 0, last_index = 0, gaps = 0;
 	int64_t t_first = 0, t_last = 0;
@@ -829,11 +844,11 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 				       state_str(ev.value));
 			} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
 				printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
-				       (unsigned long long)ev.stream_id, ev.value,
-				       ev.value == XRT_STEREO_CAMERA_END_USER_STOPPED ? "USER_STOPPED"
-				       : ev.value == XRT_STEREO_CAMERA_END_DISABLED  ? "DISABLED"
-				                                                     : "SOURCE_LOST");
-				ended = ended || ev.stream_id == sid;
+				       (unsigned long long)ev.stream_id, ev.value, end_reason_str(ev.value));
+				if (ev.stream_id == sid) {
+					ended = true;
+					end_reason = ev.value;
+				}
 			} else {
 				printf("[%6.2f s] event: cameras changed\n", t);
 			}
@@ -885,11 +900,11 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 		double t = (double)(os_monotonic_get_ns() - t_start) * 1e-9;
 		if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
 			printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
-			       (unsigned long long)ev.stream_id, ev.value,
-			       ev.value == XRT_STEREO_CAMERA_END_USER_STOPPED ? "USER_STOPPED"
-			       : ev.value == XRT_STEREO_CAMERA_END_DISABLED  ? "DISABLED"
-			                                                     : "SOURCE_LOST");
-			ended = ended || ev.stream_id == sid;
+			       (unsigned long long)ev.stream_id, ev.value, end_reason_str(ev.value));
+			if (ev.stream_id == sid) {
+				ended = true;
+				end_reason = ev.value;
+			}
 		} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERA_STATE) {
 			printf("[%6.2f s] event: camera %llu state -> %s\n", t, (unsigned long long)ev.camera_id,
 			       state_str(ev.value));
@@ -1048,7 +1063,13 @@ cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv)
 	ipc_client_stereo_camera_stream_stop(ipc_c, sid);
 	ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
 	if (ended) {
-		return 8; // the service ended the stream (user stop / sharing off)
+		if (end_reason == XRT_STEREO_CAMERA_END_SOURCE_BUSY) {
+			printf(
+			    "stream ended: SOURCE_BUSY — the device could not start (held by another process, or no "
+			    "first frame); the camera reads UNAVAILABLE until the service's retry succeeds\n");
+			return 7; // same code as a BUSY refusal: a script treats both as "retry later"
+		}
+		return 8; // the service ended the stream (user stop / sharing off / source lost)
 	}
 	if (got == 0) {
 		return 9;

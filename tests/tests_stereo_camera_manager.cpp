@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -448,4 +449,104 @@ TEST_CASE("re-enumeration: the enumerate path is throttled", "[stereo_camera_man
 	CHECK(scm_count(f) == 2);
 	CHECK(scm_fake_plugin_enumerate_calls() == calls + 1);
 	scm_destroy(f);
+}
+
+TEST_CASE(
+    "manager + UVC fake: a source that cannot start ends the stream with SOURCE_BUSY, start is BUSY, and "
+    "it recovers (#2221)",
+    "[stereo_camera_manager][busy]")
+{
+	// Three shapes of "the device is not really ours": open fails; open succeeds and the
+	// first read errors (Media Foundation on a device another process holds); open
+	// succeeds and nothing ever arrives (the UVC first-frame deadline, 5 s).
+	struct fault_t
+	{
+		uint32_t fault;
+		const char *name;
+		double max_wait_s;
+	};
+	const fault_t faults[] = {
+	    {U_STEREO_UVC_FAKE_FAULT_READ_ERROR, "read-error", 4.0},
+	    {U_STEREO_UVC_FAKE_FAULT_OPEN_FAILS, "open-fails", 4.0},
+	    {U_STEREO_UVC_FAKE_FAULT_NEVER_DELIVERS, "never-delivers", 9.0},
+	};
+	for (const fault_t &fl : faults) {
+		DYNAMIC_SECTION("fault " << fl.name)
+		{
+			u_stereo_uvc_fake_set_fault(fl.fault);
+			u_stereo_uvc_config cfg = fake_config();
+			scm_fixture *f = scm_create(&cfg);
+			REQUIRE(f != nullptr);
+			REQUIRE(scm_count(f) == 1);
+			const props_t a = props_at(f, 0);
+			xrt_stereo_camera_stream_request req = {a.id, XRT_STEREO_CAMERA_OUTPUT_RAW,
+			                                        XRT_STEREO_CAMERA_FORMAT_GRAY8,
+			                                        XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY, 0.0f};
+			uint64_t sid = 0;
+			REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+			(void)drain(f, 0);
+			const xrt_result_t first = scm_stream_start(f, sid);
+			if (first == XRT_SUCCESS) {
+				// Started before anything tried the device: the camera thread opens, fails,
+				// and must END the stream — never leave it started at 0 fps.
+				bool ended = false;
+				uint32_t reason = 0;
+				const int64_t deadline = os_monotonic_get_ns() + (int64_t)(fl.max_wait_s * 1e9);
+				while (!ended && os_monotonic_get_ns() < deadline) {
+					xrt_stereo_camera_event ev;
+					while (scm_poll_event(f, &ev)) {
+						if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED &&
+						    ev.stream_id == sid) {
+							ended = true;
+							reason = ev.value;
+						}
+					}
+					if (!ended) {
+						os_nanosleep(20 * 1000 * 1000);
+					}
+				}
+				CHECK(ended);
+				CHECK(reason == XRT_STEREO_CAMERA_END_SOURCE_BUSY);
+				bool ready = true;
+				xrt_stereo_camera_frame_info fi;
+				const uint8_t *slot = nullptr;
+				CHECK(scm_acquire(f, sid, &ready, &fi, &slot) == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED);
+			} else {
+				// The manager already tried the device (rate measurement at create): refused outright.
+				CHECK(first == XRT_ERROR_STEREO_CAMERA_BUSY);
+			}
+			CHECK(props_at(f, 0).state == XRT_STEREO_CAMERA_STATE_UNAVAILABLE);
+			CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+
+			// While the retry is pending a new start is BUSY — distinct from "started, 0 fps".
+			REQUIRE(scm_stream_create(f, &req, &sid) == XRT_SUCCESS);
+			CHECK(scm_stream_start(f, sid) == XRT_ERROR_STEREO_CAMERA_BUSY);
+
+			// The device is freed: the background retry succeeds and a start flows again.
+			u_stereo_uvc_fake_set_fault(U_STEREO_UVC_FAKE_FAULT_NONE);
+			xrt_result_t sr = XRT_ERROR_STEREO_CAMERA_BUSY;
+			const int64_t deadline2 = os_monotonic_get_ns() + 6000ll * 1000 * 1000;
+			while (sr == XRT_ERROR_STEREO_CAMERA_BUSY && os_monotonic_get_ns() < deadline2) {
+				os_nanosleep(100 * 1000 * 1000);
+				sr = scm_stream_start(f, sid);
+			}
+			CHECK(sr == XRT_SUCCESS);
+			bool got = false;
+			const int64_t deadline3 = os_monotonic_get_ns() + 6000ll * 1000 * 1000;
+			while (!got && os_monotonic_get_ns() < deadline3) {
+				bool ready = false;
+				xrt_stereo_camera_frame_info fi;
+				const uint8_t *slot = nullptr;
+				if (scm_acquire(f, sid, &ready, &fi, &slot) == XRT_SUCCESS && ready) {
+					got = true;
+				} else {
+					os_nanosleep(20 * 1000 * 1000);
+				}
+			}
+			CHECK(got);
+			CHECK(scm_stream_destroy(f, sid) == XRT_SUCCESS);
+			scm_destroy(f);
+			u_stereo_uvc_fake_set_fault(U_STEREO_UVC_FAKE_FAULT_UNSET);
+		}
+	}
 }
