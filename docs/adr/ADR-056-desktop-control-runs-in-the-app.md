@@ -226,8 +226,8 @@ desktop control already holds.
   back asynchronously. The image is RGBA8 sRGB, top-down and tightly packed. It is downscaled
   to fit the maximum size and never upscaled. It comes with the source rectangle in desktop
   coordinates, so the app can map an image pixel back to a click point. Pixels the runtime
-  withholds have alpha 0: off every screen, on a screen the user did not share, or inside an
-  excluded window. **Latest-frame semantics:** the frame is no older than the request. At
+  withholds have alpha 0: off every screen, on a screen the user did not share, inside an
+  excluded window, or inside one of the app's own windows (decision 7). **Latest-frame semantics:** the frame is no older than the request. At
   most one capture is in flight per session, and the runtime keeps at most one result per
   session until the app fetches it, the next capture completes, or 10 s pass.
 - **No continuous stream reaches the app.** No PipeWire node or fd, no `IDXGISurface`, no
@@ -342,31 +342,36 @@ fight the user.
 - **P1b — GNOME** (the motivating case) **and Windows**.
 - **P3b — macOS**, together with the P3 macOS backend.
 
-### Open decisions (for David)
+### Decisions (DECIDED 2026-10-19, David)
 
-1. **Capture without CONTROL.** Allow it, which costs a second GNOME code path (a standalone
-   ScreenCast session)? Or require CONTROL, so GNOME has only the combined session?
-   *Proposed: allow it.* The smaller grant should not cost the bigger one.
-2. **Asking for CAPTURE later.** Keep "the app asks for its scopes, the runtime never prompts
-   on its own", and accept that asking later on GNOME shows a second, combined dialog?
-   *Proposed: yes*, and the spec tells apps to ask for both at once.
-3. **What a WINDOW capture means.** "The window's frame as it is on screen", including
-   anything overlapping it, is the same on all three OSes and matches what the user sees and
-   what a click would hit. An "occluded content" mode (Windows.Graphics.Capture
-   `CreateForWindow`, SCK window filter) is not possible on GNOME without asking the user to
-   pick that window. *Proposed: on-screen only in v2.*
-4. **Rate cap and retention.** 4 Hz and 10 s: fixed, or settings in the store
-   (`capture_max_hz`)?
-5. **The 3D panel in a capture shows woven pixels**, which an agent cannot read. Should a
-   later revision put the composed center view of DisplayXR windows in their place? The
-   runtime has it for the app's own window, and the service has it for composed clients.
-   *Proposed: out of scope for v2*, with the panel region marked in the result so an agent
-   knows.
-6. **Windows.Graphics.Capture border.** Keep it on, so it serves as the indicator (proposed),
-   or ask for borderless (Windows 11, `GraphicsCaptureAccess`) and draw DisplayXR's own
-   indicator once the tray indicator ships?
-7. **The app's own windows.** Today whether the agent sees its own avatar depends on the
-   display processor. A DP that composes transparency excludes the app's window (on Windows
-   with `WDA_EXCLUDEFROMCAPTURE`, on GNOME with `CaptureExclusion1`), so the window is
-   masked. Otherwise it is visible. Should the runtime always mask the app's own windows on
-   every OS (`OWN` bit), so agents see the same thing everywhere? *Proposed: yes, alpha 0.*
+These were open questions when the amendment was drafted. David accepted every proposed answer
+on 2026-10-19. The amendment stays **Proposed** until it is implemented, but these points are
+no longer open.
+
+1. **Capture works without CONTROL.** An app may ask for CAPTURE alone. On GNOME this costs a
+   second code path, a standalone ScreenCast portal session, because the smaller grant should
+   not cost the bigger one.
+2. **Asking for CAPTURE later is allowed.** The app asks for its scopes and the runtime never
+   prompts on its own. On GNOME a later CAPTURE request shows a second, combined dialog (a
+   restore token cannot be widened). The spec tells apps to ask for both scopes at once.
+3. **A WINDOW capture is the window's frame as it is on screen**, including anything
+   overlapping it. That is the same on all three OSes and matches what the user sees and what
+   a click would hit. There is no "occluded content" mode (Windows.Graphics.Capture
+   `CreateForWindow`, an SCK window filter) in v2. GNOME cannot offer one without asking the
+   user to pick that window.
+4. **The limits are fixed in v2:** 4 capture starts per second per session, and the result is
+   kept for 10 s. They are not store settings.
+5. **Swapping woven 3D-panel pixels out is not in v2.** A capture over a spatial display
+   returns the woven pixels that are scanned out. A future revision may put in the composed
+   center view of DisplayXR windows. The runtime has that view for the app's own window, and
+   the service has it for composed clients.
+6. **The Windows.Graphics.Capture yellow border stays on.** It is the capture indicator Windows
+   otherwise lacks (D3.1). Borderless capture (Windows 11, `GraphicsCaptureAccess`) is not
+   used.
+7. **The app's own windows are always masked**, on every OS. Every window with the `OWN` bit
+   comes back as alpha 0, whether or not the display processor excluded it, so agents see the
+   same thing everywhere.
+8. **Two macOS behaviours are left for hardware.** Whether ScreenCaptureKit on macOS 15+ still
+   hides `NSWindowSharingNone` windows, and whether macOS 15's periodic "continue to allow
+   screen recording" confirmation fires for one-shot stills, are both measured on hardware
+   (spec §10.7). The results are recorded in spec §10.4.

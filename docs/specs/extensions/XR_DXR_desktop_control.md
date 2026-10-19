@@ -360,7 +360,8 @@ call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-
 > `XR_DXR_desktop_control_SPEC_VERSION 2`. Nothing in it is available until the header
 > declares version 2. The decision record is
 > [ADR-056 Amendment 1](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-1--screen-capture-is-its-own-scope-in-the-same-session-proposed-2026-10-19),
-> and its open decisions may still change the names and limits below. Sections 1–9 describe
+> and its design decisions were DECIDED by David on 2026-10-19 (listed in §10.8). Names and
+> numeric values may still change when the header lands. Sections 1–9 describe
 > version 1 and are unchanged by this one.
 
 ### 10.1 Additions to the header (proposed)
@@ -504,7 +505,8 @@ scopes. Rows 8–10 read that scope's own grant:
     keeping the aspect ratio. Never scaled up: a source smaller than the maximum comes back
     at its own size, in **device** pixels where the OS gives them.
   - Every real pixel has alpha 255. **Withheld** pixels are `(0,0,0,0)`: off every monitor,
-    on a monitor the user did not share (GNOME), or inside an excluded window (§10.4).
+    on a monitor the user did not share (GNOME), inside an excluded window (§10.4), or inside
+    one of the app's own windows (`OWN` bit, every OS).
   - Mapping back to desktop coordinates:
     `x = sourceRect.x + (px + 0.5) * sourceRect.width / width` (and the same for y). The
     result can be fed straight to `xrPickDesktopDXR` or a pointer action.
@@ -513,7 +515,7 @@ scopes. Rows 8–10 read that scope's own grant:
   any other id, or an expired one, returns `XR_ERROR_VALIDATION_FAILURE`. One fetch may be
   repeated (two-call idiom). The memory is freed when retention ends.
 - **The 3D panel.** A region over a spatial display returns the panel's **woven** pixels,
-  which is what is scanned out. Substituting views is out of scope (ADR-056 Amendment 1, open
+  which is what is scanned out. Substituting views is not in v2 and is future work (§10.8,
   decision 5).
 
 ### 10.4 Privacy
@@ -521,6 +523,8 @@ scopes. Rows 8–10 read that scope's own grant:
 - **No disk, no logs.** The runtime never writes a frame, a thumbnail or a hash to disk or to a
   log at any level. Messages name failures, never content.
 - **Exclusion.**
+  - Every OS: the app's own windows (`OWN` bit) are always withheld over their whole frame,
+    whether or not the display processor excluded them (§10.8, decision 7).
   - Windows: Windows.Graphics.Capture returns `WDA_EXCLUDEFROMCAPTURE` windows as the OS
     renders them for capture, and the runtime adds nothing.
   - macOS: what ScreenCaptureKit returns for `NSWindowSharingNone` windows is to be measured
@@ -598,7 +602,7 @@ rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget 
   - A UAC prompt or a lock ⇒ refused.
   - The hybrid-GPU box: the panel on the iGPU, the app on the dGPU.
   - The app's D3D device and queue are untouched (the D3D11 debug layer stays clean).
-- **macOS (14, 15, 26).**
+- **macOS (14, 15, 26).** The last two items below are decision 8's hardware checks.
   - Screen Recording denied ⇒ `NOT_GRANTED`. Revoked in System Settings mid-session ⇒
     `DENIED` on the next capture.
   - Retina and a non-Retina external display: the mapping is right.
@@ -607,3 +611,20 @@ rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget 
     macOS 15 no longer hides them from ScreenCaptureKit), and record the result in §10.4.
   - Record whether macOS 15's periodic "continue to allow screen recording" confirmation
     fires for a ScreenCaptureKit still.
+
+### 10.8 Decisions (DECIDED 2026-10-19, David)
+
+The section stays **PROPOSED** until implemented. These design points are no longer open
+(ADR-056 Amendment 1, "Decisions"):
+
+1. CAPTURE is usable without CONTROL. GNOME gets a second path, a standalone ScreenCast
+   portal session (§10.5).
+2. A later CAPTURE request is allowed. On GNOME it shows a second, combined dialog (§10.2).
+3. A WINDOW capture is the window's frame as it is on screen. There is no occluded-content
+   mode (§10.3).
+4. The 4 Hz start cap and 10 s retention are fixed in v2, not settings (§10.3).
+5. Swapping woven 3D-panel pixels for unwoven views is not in v2 and is future work (§10.3).
+6. The Windows.Graphics.Capture yellow border stays on as the indicator (§10.5).
+7. The app's own windows are always masked (alpha 0) on every OS (§10.3, §10.4).
+8. The two macOS ScreenCaptureKit behaviours (`NSWindowSharingNone`, macOS 15's periodic
+   confirmation) stay hardware-verification items (§10.7).
