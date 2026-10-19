@@ -182,3 +182,196 @@ Open questions.
    where the remembered grant is stored (per user, per app id).
 4. **Service-mode (IPC) apps.** The client library is still in the app's process, so D2 holds;
    confirm nothing routes desktop control through `displayxr-service`.
+
+## Amendment 1 — Screen capture is its own scope, in the same session (PROPOSED, 2026-10-19)
+
+**Status:** Proposed — design only, no code. Spec text:
+[`XR_DXR_desktop_control.md` §10](../specs/extensions/XR_DXR_desktop_control.md#10-screen-capture-proposed--spec-version-2)
+(a proposed spec-version 2).
+
+**Why an amendment and not a new ADR.** D1 already lists "capture a window" under *observe*,
+D2 already names ScreenCaptureKit and Screen Recording for macOS, and spec §8 deferred capture
+from v1. Capture runs in the app's process, under the app's consent, behind the same safety
+layer, kill switch and audit log. A new ADR would repeat D2–D4. What is new is a second
+consent **scope**, a path that hands pixels to app code, and one new GNOME dependency
+(PipeWire). Those are recorded here.
+
+### Context: the white flash
+
+The first app to use desktop control, a desktop-avatar agent on GNOME Wayland (3DLuma), lets
+its agent see the screen through the xdg **Screenshot** portal with `interactive=false`. Every
+call plays gnome-shell's white screenshot flash. The cause is in xdg-desktop-portal-gnome, not
+in the app. On `main` (read 2026-10-19), the non-interactive path builds a `ScreenshotDialog`
+whose constructor calls `do_take_screenshot()` at once. That calls
+`org.gnome.Shell.Screenshot.Screenshot(include_pointer, TRUE, "Screenshot")`, and the second
+argument is `flash`. `permission_store_checked` only skips *showing* the dialog. It does not
+change the call. `ScreenshotWindow` and `ScreenshotArea` also pass `flash = TRUE`. Nothing an
+app passes turns the flash off. **Confidence: high** for current xdg-desktop-portal-gnome,
+because this was read from the source. **Medium** for the older builds that ship on Ubuntu
+22.04 and 24.04, which were not checked line by line. The Screenshot portal has two other
+problems. It also returns a **file URI**: gnome-shell writes the frame to disk before the app
+reads it. And it is a **second consent**, separate from the RemoteDesktop approval that
+desktop control already holds.
+
+### D6. Capture is a capability and a consent scope of desktop control
+
+- A new capability bit `CAPTURE`, and a new **scope** next to the v1 one. `CONTROL` covers
+  everything in v1. `CAPTURE` covers screen pixels. Each scope has its own state
+  (`XrDesktopControlStateDXR` values), its own state-changed event and its own store entry.
+  `CAPTURE` does not require `CONTROL`, so a "look at my screen" assistant can ask for pixels
+  only. Targeting a window by id still needs an id, and ids come from the window list, which
+  is under `CONTROL`.
+- **The API is still frames on request.** The app asks for one frame of a desktop region,
+  a window's on-screen frame, or the whole desktop, and gives a maximum size. The result comes
+  back asynchronously. The image is RGBA8 sRGB, top-down and tightly packed. It is downscaled
+  to fit the maximum size and never upscaled. It comes with the source rectangle in desktop
+  coordinates, so the app can map an image pixel back to a click point. Pixels the runtime
+  withholds have alpha 0: off every screen, on a screen the user did not share, inside an
+  excluded window, or inside one of the app's own windows (decision 7). **Latest-frame semantics:** the frame is no older than the request. At
+  most one capture is in flight per session, and the runtime keeps at most one result per
+  session until the app fetches it, the next capture completes, or 10 s pass.
+- **No continuous stream reaches the app.** No PipeWire node or fd, no `IDXGISurface`, no
+  `SCStream`. A backend may keep its OS stream open between stills in a burst, because that is
+  how GNOME delivers frames, but the app only ever receives stills. Starts are capped at 4 Hz
+  per session, and a faster request waits. This keeps the work bounded and keeps "stills"
+  true. If an agent ever needs live video, that needs its own ADR.
+
+### D7. Consent: the app asks for its scopes; the runtime never prompts on its own
+
+`xrRequestDesktopControlDXR` takes the scopes in a chained struct. Without the struct, the
+request is for `CONTROL` only, which is the v1 behaviour. The runtime prompts only from that
+call and never from `xrCaptureDesktopDXR`, keeping the v1 rule that a prompt follows a user
+gesture. Per OS:
+
+| OS | what the user sees | asking for CAPTURE after CONTROL |
+|---|---|---|
+| GNOME | **One** portal dialog for both: a screen picker plus "allow remote interaction". The approval is remembered for the life of the process (the restore token stays in memory, as in v1). | A new dialog. A restore token cannot be widened, so the new combined session asks about input again. **Apps that will capture should ask for both scopes at once.** |
+| Windows | DisplayXR's existing consent MessageBox, with text that names the scopes asked for ("see your screen", "type and click in other apps"). The answer is stored per scope. | A second, capture-only prompt. |
+| macOS | Screen Recording (TCC). v1 already requests it at `CONTROL` time (for window titles), so it is usually already granted. | Usually no prompt. |
+
+On GNOME the user can untick remote interaction, or share only some monitors. The `Start`
+response says what was granted (`devices`, `streams`), so `CONTROL` can be `DENIED` while
+`CAPTURE` is `GRANTED`, and a region outside the shared monitors comes back as alpha 0 or is
+refused.
+
+**Honesty about strength.** On Windows, and on macOS once Screen Recording is granted, an app
+could capture through the OS directly. There, the `CAPTURE` scope is a DisplayXR contract, not
+an OS enforcement point, which is the same as v1's Windows prompt. It gives the user a visible
+"yes", the kill switch, the audit log and the same behaviour on every OS. On GNOME it is
+enforced: the portal is the only consented path an app has.
+
+### D8. Privacy rules for capture
+
+1. **Frames never touch disk.** The runtime does not write, cache or log any pixel. Frames
+   live in process memory until the app fetches them or they expire. The only file this
+   feature can ever produce is one the app writes itself (the probe does this behind an
+   explicit flag).
+2. **The audit log records the event, not the content.** One record per capture *burst*
+   (closed after 2 s idle, like the GNOME session): `action: "capture"`, the target (region, or
+   the window's app and title), output size, count and result. It never stores pixels,
+   thumbnails or hashes, because a hash is a fingerprint.
+3. **Capture-excluded windows stay excluded.** Where the OS honours an exclusion, the runtime
+   uses only capture APIs that honour it. On Windows, Windows.Graphics.Capture respects
+   `WDA_EXCLUDEFROMCAPTURE`. GNOME has no OS-level exclusion. DisplayXR's own
+   `CaptureExclusion1` (wayland-window-geometry spec §6) hides windows from *off-screen*
+   paints, but a portal **monitor** stream copies the on-screen view and still contains them
+   (§6.2 "Scope"). So the GNOME backend **masks** every window that the extension's
+   `GetAllWindows` reports as `capture_excluded`: its whole frame comes back as alpha 0, even
+   where another window overlaps it. When the mask cannot be computed, for example when the
+   extension is missing, the capture is refused, because a frame that might contain an
+   excluded window is never returned. The runtime never tries to recover excluded content.
+4. **Locked screen means refused.** The same applies on a secure desktop or UAC prompt, and
+   with the kill switch on. These are checked when the capture starts and again before the
+   frame is handed over. A frame finished just as the screen locks is dropped.
+5. **D4 applies.** Apps must not re-export capture over MCP or any other IPC. The app-rules
+   entry for D4 names capture explicitly.
+6. **An OS indicator is visible during capture on every OS:** GNOME's screen-sharing indicator
+   (shown while the portal session is open), Windows.Graphics.Capture's yellow border (kept
+   on, because it is the indicator Windows otherwise lacks, D3.1), and macOS's
+   screen-recording indicator in the menu bar.
+
+### D9. Per-OS backends
+
+| | GNOME Wayland | Windows | macOS |
+|---|---|---|---|
+| source | ScreenCast **inside the v1 RemoteDesktop session**: `CreateSession` → `SelectDevices` (`persist_mode` 2, `restore_token`) → **`ScreenCast.SelectSources`** (`types` MONITOR, `multiple` true, `cursor_mode` HIDDEN, **no** persist options, because the portal spec says persistence for a combined session belongs only to `SelectDevices`) → `RequestClipboard` → `Start` → `ConnectToEIS` + **`ScreenCast.OpenPipeWireRemote`**. CAPTURE without CONTROL uses a standalone ScreenCast portal session (persist options on `SelectSources`). | **Windows.Graphics.Capture**: `CreateForMonitor` per monitor the region touches (`CreateForWindow` is never used, so WINDOW means "what is on screen there" on every OS), a one-frame `Direct3D11CaptureFramePool` on the backend's **own** D3D11 device (never the app's device or queue), CPU read-back. | **ScreenCaptureKit** `SCScreenshotManager` (macOS 14+, one-shot, no stream), `SCContentFilter` over the display(s), `showsCursor` false. |
+| pixels | PipeWire, **dlopen'd** (`libpipewire-0.3.so.0`, no `DT_NEEDED`, like libei). SHM buffers only (MemFd/MemPtr, BGRx/BGRA), so there is no DMA-BUF import and no GPU dependency. One stream per shared monitor, placed by the `Start` response's `position` / `size` (logical px; the stream is device px, which gives the scale). Mutter sends frames on damage, so with no new frame since the stream went live, the last frame *is* the current screen. | BGRA8 → RGBA8, crop, scale. | CGImage → RGBA8, crop, scale. |
+| consent | the portal dialog (D7) | the DisplayXR MessageBox (D7), store per scope | Screen Recording TCC |
+| exclusion | mask `capture_excluded` windows (D8.3) | OS (`WDA_EXCLUDEFROMCAPTURE`) | OS (`NSWindowSharingNone`): **to verify** on macOS 15+ (D8.3, test plan) |
+| not available | no `libpipewire` / no ScreenCast portal ⇒ no CAPTURE bit | DXGI Desktop Duplication: not used (one duplication per output per process, no indicator) | macOS < 14 ⇒ no CAPTURE bit |
+
+The **GNOME session lifetime** is unchanged. It is opened per burst and closed after 2 s idle,
+and a capture counts as use. A capture that needs the session re-opened pays the silent
+restore (0.3–9 s) plus the first PipeWire frame. If the shared monitor set changed since the
+token was issued (hotplug), the portal prompts instead of restoring silently. v1 already
+treats that as a revocation, so both scopes go `DENIED` and the app asks again.
+
+Capture runs on its **own worker** per session, never behind the action worker. A 13 s
+`TYPE_TEXT` must not delay a still, and a still must not run between an action's target
+verification and its injection. It skips the idle wait: capture injects nothing, so it cannot
+fight the user.
+
+### Rejected alternatives
+
+1. **The Screenshot portal (status quo).** It plays the white flash on every call (above),
+   writes a file to disk, and needs a second consent unrelated to desktop control.
+2. **Capture inside the DisplayXR GNOME Shell extension.** It would have no flash and no
+   dialog. But the extension answers **every** process of the user over D-Bus, so any local
+   program could silently capture the whole desktop. That contradicts the extension's rule
+   that other apps' windows are read-only (runtime PR #2225, wayland-window-geometry spec
+   §12.4) and D2. It is the same reasoning that keeps control out of the extension.
+3. **`org.gnome.Mutter.ScreenCast` directly from the runtime.** It shows no dialog, and any
+   session process can call it, which is how the Leia plug-in's Linux background capture
+   works (`leia_mutter_capture_linux.c`: `RecordArea` over the 3D panel's rectangle). That
+   case is **narrower and different**. It records only the panel area behind the app's own
+   window, its pixels go to the display processor's compose-under-transparency pass and never
+   to app code, and it needs `RecordArea` because only off-screen paints honour the capture
+   exclusion. Desktop control hands pixels to the app's **agent**. Taking them through a path
+   with no consent attributed to the app is exactly what D2 rules out. The DP's use is not a
+   precedent.
+4. **Handing the app a PipeWire node, fd or OS stream.** It would turn "a still on request"
+   into covert video with nothing for the runtime to rate-limit, audit or cut off at the kill
+   switch.
+5. **Routing capture through `displayxr-service`.** Ruled out by D2 / open question 4: the
+   grant would no longer belong to the app.
+
+### Phasing (amends the list above)
+
+- **P0b — spec v2 + header**, the fake backend's capture (a deterministic test pattern), the
+  probe, and the store v2 migration.
+- **P1b — GNOME** (the motivating case) **and Windows**.
+- **P3b — macOS**, together with the P3 macOS backend.
+
+### Decisions (DECIDED 2026-10-19, David)
+
+These were open questions when the amendment was drafted. David accepted every proposed answer
+on 2026-10-19. The amendment stays **Proposed** until it is implemented, but these points are
+no longer open.
+
+1. **Capture works without CONTROL.** An app may ask for CAPTURE alone. On GNOME this costs a
+   second code path, a standalone ScreenCast portal session, because the smaller grant should
+   not cost the bigger one.
+2. **Asking for CAPTURE later is allowed.** The app asks for its scopes and the runtime never
+   prompts on its own. On GNOME a later CAPTURE request shows a second, combined dialog (a
+   restore token cannot be widened). The spec tells apps to ask for both scopes at once.
+3. **A WINDOW capture is the window's frame as it is on screen**, including anything
+   overlapping it. That is the same on all three OSes and matches what the user sees and what
+   a click would hit. There is no "occluded content" mode (Windows.Graphics.Capture
+   `CreateForWindow`, an SCK window filter) in v2. GNOME cannot offer one without asking the
+   user to pick that window.
+4. **The limits are fixed in v2:** 4 capture starts per second per session, and the result is
+   kept for 10 s. They are not store settings.
+5. **Swapping woven 3D-panel pixels out is not in v2.** A capture over a spatial display
+   returns the woven pixels that are scanned out. A future revision may put in the composed
+   center view of DisplayXR windows. The runtime has that view for the app's own window, and
+   the service has it for composed clients.
+6. **The Windows.Graphics.Capture yellow border stays on.** It is the capture indicator Windows
+   otherwise lacks (D3.1). Borderless capture (Windows 11, `GraphicsCaptureAccess`) is not
+   used.
+7. **The app's own windows are always masked**, on every OS. Every window with the `OWN` bit
+   comes back as alpha 0, whether or not the display processor excluded it, so agents see the
+   same thing everywhere.
+8. **Two macOS behaviours are left for hardware.** Whether ScreenCaptureKit on macOS 15+ still
+   hides `NSWindowSharingNone` windows, and whether macOS 15's periodic "continue to allow
+   screen recording" confirmation fires for one-shot stills, are both measured on hardware
+   (spec §10.7). The results are recorded in spec §10.4.
