@@ -1428,9 +1428,9 @@ On `org.displayxr.WindowPlacement1`, each with its own placement capability bit:
   `Main.activateWindow()` would also close the Overview and the calendar. A
   server-roundtrip timestamp brings the window to the front with focus, restores it
   from minimized and switches to its workspace. It is newer than any user input, so
-  focus-stealing prevention does not hold it back: an app takes keyboard focus even
-  while the user is typing in another app (measured, §11.5). Whether to allow that
-  as is, or only after recent input in the app, is a policy choice for the caller.
+  focus-stealing prevention does not hold it back: in version 15 an app took
+  keyboard focus even while the user was typing in another app (measured, §11.5).
+  Version 17 decides first whether the app may take focus at all (§11.6).
 
 The pure part (gate, keep-above bookkeeping, maximized on both sides of mutter 49's
 API change, minimize) is the `OwnWindow` object in `lib.js`, unit-tested by
@@ -1492,6 +1492,65 @@ Unity plugin as the caller:
 
 Not verified: GNOME 42–49 at run time (the calls exist in the mutter sources from
 42.0; maximize's API change is handled by an existence check).
+
+### 11.6 ActivateWindow's focus policy (extension version 17)
+
+Version 15 let an app take keyboard focus at any time, also while the user was typing
+in another app (§11.5). From version 17, `ActivateWindow` takes focus only from the
+app itself:
+
+- **Focus** when the user's latest key press or click went to one of the app's
+  windows, and the user has not moved focus away from it since. Then it behaves as
+  before: to the front, restored from minimized, its workspace switched to.
+- **Otherwise no focus:** nothing changes except that mutter flags the window as
+  demanding attention (GNOME shows "… is ready"; a window in full view is not
+  flagged, mutter's rule). A minimized window stays minimized. `ok` is `false`.
+  This is what GNOME does for any app that asks from the background.
+
+"Input" is mutter's per-window user time (`Meta.Window.get_user_time()`): mutter
+stamps it on every key press, button press and touch on a window, before shortcuts
+are handled (`core/events.c`), and a new window starts at its creation time. So:
+
+| what the user did last | ActivateWindow |
+|---|---|
+| typed or clicked in another app | no focus |
+| another app's window came up (no input) | no focus |
+| clicked the app, then Alt+Tab / Super+H / minimized it from the dock / clicked elsewhere | no focus ("left it") |
+| clicked or typed in the app, and the app minimized **itself** (SetMinimized) | focus (the app stepped aside; the user did not leave) |
+| clicked or typed in the app, nothing since | focus |
+| came back to the app (new input in it) after leaving | focus |
+
+It is mutter's own focus-stealing rule, applied with the time of the app's last
+input instead of "now". It also limits the rate by itself: once the user is
+elsewhere, nothing the app does takes focus until the user comes back to it, so no
+separate rate limit is needed. Input injected through the RemoteDesktop portal
+counts like the user's own. An app that wants its window back on screen anyway
+restores it with `SetMinimized(false)`, which never takes focus.
+
+Consumers:
+
+- The DisplayXR Unity plugin (`displayxr_linux_activate_window`) logs
+  "window activate: refused" for a `false`; nothing is retried (as before).
+- `XR_DXR_desktop_control` (ADR-056), the app's own window: when `ActivateWindow`
+  refuses, the agent does what the user would, a Super+click on the window through
+  the app's portal session (restored first if minimized), as it already does for any
+  other window. The agent has the user's consent, and its safety layer (idle wait,
+  kill switch, lock) applies to the gesture.
+
+The pure part is `OwnWindow.mayTakeFocus` / `focusMoved` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_own_window.js` (section 6).
+
+Verified (private headless GNOME Shell 50.1, GTK4 test windows, input through that
+instance's `org.gnome.Mutter.RemoteDesktop`): the user types in B, A asks → `false`,
+B keeps focus; the user clicks A, A minimizes itself, A asks → `true`, restored with
+focus; the same but the user types in B after the minimize → `false`, A stays
+minimized and flagged; the user clicks A and presses Super+H → `false`; the user
+clicks A, then minimizes it without a key on it (the dock) → `false`; the user
+clicks A and stays → `true`; the user clicks A, then B opens → `false`; the user
+clicks A, then B, then A again, A minimizes itself and asks → `true`; the user
+clicks A, then Alt+Tab to B → `false`. The version 15 suite passes except its two
+"activate from the background" cases, which now answer `false` and flag the window
+— the change itself. No JS errors.
 
 ## 12. The pointer — `WindowGeometry1.GetPointer` (extension version 16)
 

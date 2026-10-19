@@ -457,12 +457,43 @@ placement_call(struct gnome_backend *g, const char *method, bool with_bool, bool
 	dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &ok, DBUS_TYPE_INVALID);
 	dbus_message_unref(reply);
 	if (!ok) {
-		gnome_set_msg(
-		    msg, "the GNOME extension refused %s (a move / pointer drag in progress, or the screen is locked)",
-		    method);
+		if (strcmp(method, "ActivateWindow") == 0) {
+			gnome_set_msg(msg,
+			              "the GNOME extension did not give the window focus (another app has the user's "
+			              "latest input, a move / pointer drag is in progress, or the screen is locked)");
+		} else {
+			gnome_set_msg(
+			    msg, "the GNOME extension refused %s (a move / pointer drag in progress, or the screen is locked)",
+			    method);
+		}
 		return U_DESKTOP_ERR_REFUSED;
 	}
 	return U_DESKTOP_OK;
+}
+
+/*!
+ * The app's own window to the front with focus. Extension 17+ gives focus only when the app
+ * had the user's latest input (ActivateWindow's focus policy), so after the agent has typed
+ * into another app it refuses and only flags the window. The agent acts with the user's
+ * consent: it then does what the user would, a Super+click on the window, as for any other
+ * window (restored first if @p minimized — SetMinimized never takes focus).
+ */
+static enum u_desktop_result
+own_activate(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, bool minimized, char *msg)
+{
+	enum u_desktop_result r = placement_call(g, "ActivateWindow", false, false, msg);
+	if (r != U_DESKTOP_ERR_REFUSED || !gnome_can_input(g, NULL)) {
+		return r;
+	}
+	if (minimized) {
+		r = placement_call(g, "SetMinimized", true, false, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		// Let the restored window map before the gesture looks for a visible part of it.
+		gdbus_sleep_ms(GRAB_SETTLE_MS);
+	}
+	return activate_other(g, guard, id, msg);
 }
 
 static enum u_desktop_result
@@ -518,14 +549,15 @@ gnome_window_op(struct u_desktop_backend *b,
 	struct u_desktop_window target = *w;
 	free(ws);
 	bool own = (target.state & U_DESKTOP_WINDOW_OWN) != 0;
+	bool minimized = (target.state & U_DESKTOP_WINDOW_MINIMIZED) != 0;
 
 	if (own) {
 		switch (op) {
-		case U_DESKTOP_OP_ACTIVATE: return placement_call(g, "ActivateWindow", false, false, msg);
+		case U_DESKTOP_OP_ACTIVATE: return own_activate(g, guard, window_id, minimized, msg);
 		case U_DESKTOP_OP_MINIMIZE: return placement_call(g, "SetMinimized", true, true, msg);
 		case U_DESKTOP_OP_RESTORE:
 			r = placement_call(g, "SetMinimized", true, false, msg);
-			return r == U_DESKTOP_OK ? placement_call(g, "ActivateWindow", false, false, msg) : r;
+			return r == U_DESKTOP_OK ? own_activate(g, guard, window_id, false, msg) : r;
 		case U_DESKTOP_OP_MAXIMIZE:
 			gnome_set_msg(msg, "maximizing the app's own window would fight DisplayXR's window placement");
 			return U_DESKTOP_ERR_UNSUPPORTED;
@@ -539,7 +571,7 @@ gnome_window_op(struct u_desktop_backend *b,
 			if (!gnome_can_input(g, msg)) {
 				return U_DESKTOP_ERR_UNSUPPORTED;
 			}
-			r = placement_call(g, "ActivateWindow", false, false, msg);
+			r = own_activate(g, guard, window_id, minimized, msg);
 			if (r == U_DESKTOP_OK && !wait_focus(g, window_id, 1000)) {
 				gnome_set_msg(msg, "the window did not take focus");
 				return U_DESKTOP_ERR_TIMEOUT;

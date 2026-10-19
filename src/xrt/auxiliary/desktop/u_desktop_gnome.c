@@ -36,6 +36,9 @@
  *
  * WindowPlacement1 (extension v15): MoveWindow, ActivateWindow, SetMinimized —
  * no portal. Maximizing it is UNSUPPORTED (it would fight DisplayXR's placement).
+ * Extension v17 gives ActivateWindow focus only when the app had the user's
+ * latest input; when it refuses, the agent falls back to a Super+click through
+ * the portal, as for any other window (own_activate).
  */
 
 #include "u_desktop_gnome.h"

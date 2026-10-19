@@ -25,6 +25,11 @@
 //      went away.
 //   5. SetMinimized minimizes and restores, refuses a window mutter says
 //      cannot be minimized, and is idempotent.
+//   6. ActivateWindow's focus policy (version 17): 32-bit time order with
+//      wrap-around; focus is taken only when the app had the user's latest
+//      input and the user has not left it since (Alt+Tab, Super+H, the dock,
+//      a click elsewhere); the app minimizing itself is not the user leaving;
+//      coming back to the app (new input) lifts it.
 'use strict';
 
 const GLib = imports.gi.GLib;
@@ -188,6 +193,64 @@ print('5. SetMinimized');
     const fixed = new Win({canMinimize: false});
     check(!OW.minimize(fixed, true) && !fixed.minimized && fixed.calls.length === 0,
         'a window mutter cannot minimize: refused, untouched');
+}
+
+print('6. ActivateWindow focus policy (version 17)');
+{
+    check(OW.timeBefore(100, 200) && !OW.timeBefore(200, 100) && !OW.timeBefore(5, 5), 'time order');
+    check(OW.timeBefore(0xfffffff0, 0x10) && !OW.timeBefore(0x10, 0xfffffff0), 'time order across the 32-bit wrap');
+    check(OW.timeBefore(0, 1) && OW.timeBefore(0, 0xf0000000) && !OW.timeBefore(1, 0), '0 = never set: before any time');
+    check(OW.latestTime([]) === 0 && OW.latestTime([5, 900, 30]) === 900, 'latest of several');
+    check(OW.latestTime([0xfffffff0, 0x10, 0xffffff00]) === 0x10, 'latest across the wrap');
+
+    const APP = 100, ED = 200;
+    // The user typed in the editor after the app's last input: refused.
+    let st = OW.newFocusState();
+    check(!OW.mayTakeFocus(st, APP, 1000, 1500), 'the user\'s latest input is in another app: no focus');
+    // The app had the latest input (the user clicked it, nothing since): allowed.
+    check(OW.mayTakeFocus(st, APP, 1500, 1500), 'the app had the latest input: focus');
+    // No input anywhere yet: nothing to take it from.
+    check(OW.mayTakeFocus(st, APP, 0, 0), 'no input anywhere: focus');
+
+    // Alt+Tab away: the keys were the app's input, then focus left it.
+    OW.focusMoved(st, APP, ED, 1500, false);
+    check(!OW.mayTakeFocus(st, APP, 1500, 1500), 'left with Alt+Tab / Super+H (no newer input): no focus');
+    // The user clicks the app again: newer input than the leave, and focus returns.
+    OW.focusMoved(st, ED, APP, 1500, false);
+    check(OW.mayTakeFocus(st, APP, 1600, 1600) && !st.away.has(APP), 'back in the app: focus, the leave is forgotten');
+
+    // Minimized from the dock (a shell click: no window input), focus to the editor.
+    st = OW.newFocusState();
+    OW.focusMoved(st, APP, ED, 1600, false);
+    check(!OW.mayTakeFocus(st, APP, 1600, 1600), 'minimized by the user from the dock: no focus');
+    // A newer input in the app (it comes back) lifts it even if focus went elsewhere.
+    check(OW.mayTakeFocus(st, APP, 1700, 1700), 'newer input in the app since the leave: focus');
+
+    // The app minimized itself: focus moving away is not the user leaving.
+    st = OW.newFocusState();
+    const w = new Win();
+    OW.minimize(w, true, st);
+    check(st.selfMinimized.has(w), 'its own minimize is recorded');
+    OW.focusMoved(st, APP, ED, 1600, st.selfMinimized.has(w) && w.minimized);
+    check(OW.mayTakeFocus(st, APP, 1600, 1600), 'after minimizing itself, nothing newer: focus');
+    check(!OW.mayTakeFocus(st, APP, 1600, 1700), 'after minimizing itself, the user typed elsewhere: no focus');
+    OW.minimize(w, false, st);
+    check(!st.selfMinimized.has(w), 'a restore ends "minimized by its own app"');
+    const userMin = new Win({minimized: true});
+    OW.minimize(userMin, true, st);
+    check(!st.selfMinimized.has(userMin), 'already minimized (by the user): not recorded as its own');
+
+    // Focus to no window (the desktop, the lock screen) counts as leaving.
+    st = OW.newFocusState();
+    OW.focusMoved(st, APP, 0, 1800, false);
+    check(!OW.mayTakeFocus(st, APP, 1800, 1800), 'focus to no window: left');
+    // Focus between two windows of the same app is not leaving it.
+    st = OW.newFocusState();
+    OW.focusMoved(st, APP, APP, 1800, false);
+    check(OW.mayTakeFocus(st, APP, 1800, 1800), 'focus between the app\'s own windows: not left');
+    // Another app's leave does not affect this one.
+    OW.focusMoved(st, ED, APP, 1900, false);
+    check(OW.mayTakeFocus(st, APP, 1900, 1900) && !OW.mayTakeFocus(st, ED, 1800, 1900), 'per app');
 }
 
 if (failed) {
