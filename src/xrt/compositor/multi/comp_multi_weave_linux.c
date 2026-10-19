@@ -114,6 +114,7 @@
 #include "util/u_handles.h"
 #include "util/u_debug.h"
 #include "util/u_weave_span2d.h"
+#include "util/u_weave_present_origin.h"
 #include "util/u_weave_flat.h"
 
 #include "vk/vk_helpers.h"
@@ -1564,11 +1565,43 @@ weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int 
 }
 
 /*!
+ * The present-owner's client origin on the panel, panel-relative DEVICE px —
+ * the ONE origin both the DP phase slot (weave_feed_dp_geometry) and the
+ * off-panel bands (weave_offpanel_bands) use, so the two never disagree.
+ *
+ * Not `win_x - display_screen_left`: the panel origin is in the X11
+ * window-placement space, which under XWayland is the logical layout times
+ * the X root's global scale, while the bound geometry is device px. The two
+ * agree only when the X root scale equals the panel's scale (a 200 % panel on
+ * a 2x root); at 125/150/175 % the difference fed the DP a phase hundreds of
+ * px off — inverted eyes. u_weave_present_origin.h has the rule and
+ * tests_aux_weave_present_origin pins it.
+ */
+static enum u_weave_origin_source
+weave_panel_relative_origin(struct multi_compositor *mc, int32_t *out_x, int32_t *out_y)
+{
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	const struct u_weave_panel_frame panel = {
+	    .screen_left = info->display_screen_left,
+	    .screen_top = info->display_screen_top,
+	    .desktop_w = info->display_desktop_width,
+	    .desktop_h = info->display_desktop_height,
+	    .native_w = info->display_desktop_native_width,
+	    .native_h = info->display_desktop_native_height,
+	    .scale = (double)info->display_desktop_scale,
+	};
+	const struct xrt_weave_logical_origin *lo = &mc->weave.win_logical;
+	return u_weave_panel_relative_origin(&panel, mc->weave.win_x, mc->weave.win_y, lo->valid, lo->x, lo->y,
+	                                     lo->scale, out_x, out_y);
+}
+
+/*!
  * Per-window weave phase: hand the DP the present-owner's client origin on the
- * panel (`set_present_origin`, panel-relative; (0,0) = display-scoped) — the
- * slot the Linux vendor DP honours, and the same value the in-process vk_native
- * compositor feeds (window − display screen origin). Re-asserted every submit so
- * a moved window keeps its phase; no-op for a DP without the slot (sim_display).
+ * panel (`set_present_origin`, panel-relative device px; (0,0) =
+ * display-scoped) — the slot the Linux vendor DP honours, and the same value
+ * the in-process vk_native compositor feeds (wl_geom's monitor-relative device
+ * origin). Re-asserted every submit so a moved window keeps its phase; no-op
+ * for a DP without the slot (sim_display).
  */
 static void
 weave_feed_dp_geometry(struct multi_compositor *mc)
@@ -1576,15 +1609,21 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	if (!mc->weave.have_geometry || mc->weave.dp == NULL) {
 		return;
 	}
-	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-	const int32_t ox = mc->weave.win_x - info->display_screen_left;
-	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	int32_t ox = 0, oy = 0;
+	const enum u_weave_origin_source src = weave_panel_relative_origin(mc, &ox, &oy);
 	const bool fed =
 	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)mc->weave.dp, ox, oy);
 	if (mc->weave.geometry_dirty) {
 		mc->weave.geometry_dirty = false;
-		U_LOG_W("weave(#1699): present origin (%d,%d) panel-relative %s the DP phase slot", ox, oy,
-		        fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)");
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		U_LOG_W(
+		    "weave(#1699): present origin (%d,%d) panel-relative (from %s; window %d,%d, panel X11 origin "
+		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot",
+		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, info->display_screen_left,
+		    info->display_screen_top, info->display_desktop_width, info->display_desktop_height,
+		    info->display_desktop_native_width, info->display_desktop_native_height,
+		    (double)info->display_desktop_scale,
+		    fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)");
 	}
 }
 
@@ -1695,8 +1734,8 @@ weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_p
 		}
 	}
 
-	const int32_t ox = mc->weave.win_x - info->display_screen_left;
-	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	int32_t ox = 0, oy = 0;
+	(void)weave_panel_relative_origin(mc, &ox, &oy);
 	struct u_wl_rect_px win_bands[4];
 	const uint32_t win_count =
 	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, mc->weave.win_w, mc->weave.win_h, win_bands);

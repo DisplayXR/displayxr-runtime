@@ -848,7 +848,7 @@ frame. Two different buffers must never share a non-zero `bufferId` within a ses
 
 | Contract point | macOS / Android (comp_multi Vulkan) | Desktop Linux (comp_multi Vulkan, v10) |
 |---|---|---|
-| Window binding | opaque id / explicit geometry | explicit geometry (`xrWeaveBindWindow2DXR` + `XrWeaveWindowGeometryDXR`), device pixels, desktop-absolute; required under Wayland, where the compositor never tells the client its position |
+| Window binding | opaque id / explicit geometry | explicit geometry (`xrWeaveBindWindow2DXR` + `XrWeaveWindowGeometryDXR`), device pixels, desktop-absolute (defined below); required under Wayland, where the compositor never tells the client its position |
 | `inputTexture` | IOSurfaceRef / `AHardwareBuffer *` | ignored under `DMABUF` (the fd is in `XrWeaveDmabufDescDXR`); `(void*)(intptr_t)fd` under `OPAQUE_FD` |
 | Handle kind | `IOSURFACE` / `AHARDWAREBUFFER` | `DMABUF` or `OPAQUE_FD` |
 | Input-ready sync | caller finishes writes before submit | acquire `sync_file` (GPU wait), or caller finishes writes before submit |
@@ -856,6 +856,23 @@ frame. Two different buffers must never share a non-zero `bufferId` within a ses
 | `fence` / `fenceValue` | no fence, synchronous; `fenceValue` monotonic | `fence` never set; per-frame release `sync_file` in `XrWeaveOutputSyncDXR`, or synchronous without it; `fenceValue` monotonic |
 | `xrWeaveSnapWindowRectDXR` | identity | the Vulkan DP's `snap_window_rect` (§5c) |
 | Without the service's engine | n/a | submit: `XR_ERROR_FEATURE_UNSUPPORTED` |
+
+**"Device pixels, desktop-absolute" on a scaled desktop.** A mixed-scale Wayland desktop
+has no single device-pixel grid, so the frame is defined per monitor: `windowOriginOnScreen` is
+the window's monitor's **logical (Mutter stage) origin × that monitor's stage→device factor**, plus
+the monitor-relative logical offset of the content × the same factor (each term rounded half away
+from zero — `u_wl_window_rect_px_on_monitor`; the factor is the monitor scale in Mutter's LOGICAL
+layout mode, 1 in PHYSICAL). Under X11 with no scaling it is the root-window position. It is
+**not** the XWayland root position, and not `XrDisplayDesktopInfoDXR::desktopRect`'s space: on a
+scaled desktop XWayland's root is the stage × one global factor, so a 3840×2160 panel at 150 % right
+of a 1728-logical laptop is at X11 x = 3456 while its device origin in this frame is 2592. The
+runtime converts the panel origin into this frame itself (`u_weave_present_origin.h`: X11 origin ÷
+the X root factor × the panel scale) before forming the panel-relative phase origin, and when the
+bind also carries a v12 `XrWeaveWindowLogicalOriginDXR` it takes the phase origin from that instead
+— the panel-relative stage offset × the panel's factor, the same value the in-process Vulkan
+compositor feeds. A client therefore never needs the panel's device origin; it must only use one
+monitor's factor consistently for one rect. `displayId` is unused on desktop Linux (a present-owner
+passes `-1`).
 
 **Wire (runtime-internal, for reviewers).** Two IPC calls, not a grown `weave_submit`, so the
 shipping Windows/macOS/Android wire is byte-identical: `weave_submit_dmabuf` (the unchanged
