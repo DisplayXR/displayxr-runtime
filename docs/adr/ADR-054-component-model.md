@@ -123,6 +123,10 @@ of these is true:
 - a **second implementer exists** or is contracted — a vendor who is not the display vendor
   needs an entry point.
 
+> **Superseded by Amendment 1 (2026-10-18)** below: the "either / or" test proved too
+> permissive. The three-part test and the alternatives ladder there are the admission rule;
+> the two clauses above survive as *evidence*, not criteria.
+
 Hot-path-ness does **not** decide admission. It decides **hosting**: a component that must
 run on the frame thread loads in-process and is contained (the DP, ADR-035 D4); one that can
 be a frame late runs in a supervised satellite reached over shared memory (conversion,
@@ -285,3 +289,133 @@ free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 ite
   hosting for a task that already fits its transport.
 - **Qwerty as an input-provider DLL.** Clean on paper; in practice it removes the floor the
   arbiter, WebXR profiles and the CTS all stand on. A gate gives the user the same control.
+
+## Amendment 1 — Admission: the three-part test, the alternatives ladder, and the applied verdicts (2026-10-18)
+
+**Status:** Accepted (owner decision after the 2026-10-18 architecture review; agreed by the
+Windows and Linux validation sessions). Replaces §3's admission rule; §2's seven properties,
+§4's verdicts and §5 stand, and decision 8 (selection scope) is restated here as part of what a
+proposal must declare.
+
+### What was wrong
+
+§3 admitted a class when **either** its failure domain had to be separable from the service
+**or** a second implementer existed. Both clauses are satisfiable without a class: ADR-053's
+satellite host isolates any provider's failure domain without a new ABI, and a second
+implementer of an *audio engine* or a *neural model* is served by a pose consumer or a
+conversion pack. Used literally, §3 would have admitted spatial audio and media decoders — the
+two candidates §4 refuses. The rule and the verdicts disagreed; this amendment makes the rule
+produce the verdicts.
+
+### Decision
+
+1. **A class is admitted only when all three hold.**
+   1. **Distinct, runtime-managed responsibility.** The runtime must *invoke, schedule, select
+      or arbitrate* the capability itself, and that responsibility cannot be expressed cleanly
+      inside an existing class (a task, a device role, a model pack, an optional slot) or by any
+      other mechanism on the ladder below.
+   2. **Interchangeable implementations or independently managed domains have real value.**
+      Competing suppliers, per-capability selection and fallback, distinct licensing, or an
+      independently supervised failure domain — *and* that value is not already obtained by
+      hosting a provider of an existing class in a satellite.
+   3. **A stable vendor-neutral contract can be specified now.** Semantics, ownership,
+      selection scope, timing, lifecycle, state vocabulary, security and consent, and a
+      simulated reference implementation — all of it, before the first vendor binary.
+
+   "A second implementer exists" and "the failure domain must be separable" are **evidence**
+   for criteria 2 and 1 respectively, never sufficient on their own.
+
+2. **The alternatives ladder is the mandatory analysis.** Every new-class proposal carries a
+   one-page section that walks the ladder in order and says why each lower rung does not fit:
+   1. an existing OS or platform facility (standard webcam capture, OS audio);
+   2. application or web-SDK functionality needing no runtime coordination;
+   3. runtime **policy** (convergence, depth budget, cursor, arbitration — §4.6);
+   4. an internal runtime module (shared implementation, not replaceable);
+   5. a data, calibration or configuration profile;
+   6. a model or asset pack inside an existing engine (ADR-057: model = pack);
+   7. a new **task** or role inside an existing class (decoding under conversion, #2145;
+      gamepad under input);
+   8. an optional capability on an existing provider (the stereo-camera slots on a display
+      plug-in, ADR-043);
+   9. an app-facing OpenXR extension (an API does not imply a provider class);
+   10. an external registered **consumer** over IPC or shared memory (spatial audio reading
+       viewer poses, §4.3);
+   11. an independently hosted service or process speaking an established protocol (the
+       remote conversion endpoint, ADR-057 §6; a workspace controller, the process contract
+       over IPC of §2 and `workspace-controller-registration.md` — shells and verticals land
+       here, not on rung 12);
+   12. a new component class — only when none of the above captures the requirement.
+
+   The rungs are a **decision menu, not mutually exclusive layers**: one capability may use
+   several at once (stereo capture today is an OpenXR extension, a display plug-in's optional
+   slot, a runtime-owned generic source and a web-SDK primitive together). The analysis asks
+   only whether the part that would become a class is already served by a lower rung.
+
+3. **A proposal declares its selection scope** (decision 8) and its hosting: display
+   processors select per screen, conversion providers per task and per stream or job, input
+   providers per role family and per client; a new class names its scope before it ships its
+   `prefer` verb, and says whether it loads in-process (frame-critical, contained) or in a
+   supervised satellite (§3's hosting rule is unchanged).
+
+4. **Admission deliverables** stay what N4 demands — a shipped simulated provider, the
+   per-class conformance step in CI (ABI-major rejection and fall-through, `Enabled=0`
+   fall-back, `Preferred` wins), provenance classification, and the four verbs in the CLI and
+   the Dashboard — plus two learned this week:
+   - **one cross-class integration test** on the route the class touches (input → consumer,
+     tracking → renderer → display processor, camera → rectification → browser track,
+     conversion → synthesized views → compositing). Every defect the validation boxes found in
+     the input batch sat on a seam between classes, not inside one.
+   - **the same capture trigger on every compositing route** the class adds or extends, so a
+     pixel oracle exists on every platform (the POSIX weave engines lacked one, #2207).
+
+5. **Applied verdicts**, restated under the new test so the rule and §4 agree:
+   - **Spatial or directional audio — a registered pose consumer (§4.3, ladder rung 10), not
+     a class.** The runtime never invokes it (criterion 1 fails). The pose-feed design (N8)
+     is one shared seqlock *pose page* primitive used in both directions — service → consumer,
+     and input satellite → service — with sample-at-target-time semantics that are the *same*
+     authority the display processor's eye query and `xrLocateViews` use, so the image and the
+     sound field never disagree. Its lifecycle decouples consumer churn from sensor start and
+     stop (minimum on-time and linger; the service's own subscription counts as a consumer;
+     "tracking with no consumer" is a visible state), because sub-second sensor open/close
+     cycles have wedged real tracking cameras. It also coordinates with the display platform's
+     own idle teardown (a vendor tracker may disable its camera after an idle linger, 300 s on
+     the first vendor; a consumer that starts after that waits for the camera to re-enable) —
+     the display plug-in's "tracking without a weaver, indicator lit" mode is the prerequisite
+     (displayxr-leia-plugin#409).
+   - **Stereo cameras — the existing sources (rung 8 and a runtime module), not a class
+     yet.** A display's own camera comes through the display plug-in's stereo-camera slots;
+     ordinary USB side-by-side cameras through the runtime's vendor-neutral UVC source
+     (ADR-043 Amendment 4), which must never match a sensor an active display processor
+     claims. **Named trigger** (replaces "when a standalone camera exists"): a first-party app's
+     broadcast SDI capture path *is* a standalone stereo source today and stays in-app (one
+     consumer, monitoring semantics). A **second consumer** of that feed is the trigger to
+     **re-evaluate** a camera-provider class under all three tests — not an admission. If it
+     passes, the provider is hosted per ADR-053's satellite template with shareable GPU frames,
+     behind the same camera manager, consent and `XR_DXR_stereo_camera` API — an internal
+     change with no new consumer API.
+   - **Media decoding — a task family inside conversion (rung 7, #2145).** Unchanged.
+   - **Display profiles and reference weaving — inside the display processor (§4.2).**
+     Unchanged.
+   - **Viewer tracking — the fourth class (§4.1).** Passes all three: the trunk selects the
+     pose source per screen and per viewer relationship (the eye-pair ring is keyed by the
+     screen/active-viewer pair, so one tracker per monitor is not assumed), the display's own tracker and an independent provider are
+     interchangeable, and the contract is specifiable (target-time eye query and the eye-pair
+     ring have landed). The reference provider is a webcam-driven simulated tracker.
+   - **An external tracking feed into a display processor — not a class and not yet a
+     rule change.** §4.1's "no `set_viewer_eyes` on the DP" stands; a display processor that
+     *declares* itself external-tracker-capable may, as a **vendor-backed experiment** with
+     explicit sensor-to-screen calibration and frame-time tests, consume the selected
+     viewer-pose source. The ABI is not changed speculatively.
+   - **Policy — the trunk (§4.6).** Unchanged.
+
+### Consequences
+
+- Admission gets slower and rarer, on purpose: a one-page ladder analysis is the cost of a
+  class, and most proposals end on rungs 7–11.
+- The next admissions in order: the viewer-tracking class (#2144, after the external
+  tracking-vendor input), the pose-page primitive (N8), input-provider satellite hosting
+  (ADR-035 D4; after the satellite host's hardening, optical hand tracker first).
+- Remaining per-screen residue (implicit-primary paths in render, status and hotplug) is a
+  completion audit, not design; it is tracked as its own issue with a two-vendor crossing
+  test on a dual-screen box.
+
