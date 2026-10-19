@@ -140,7 +140,22 @@ struct u_stereo_uvc_fake_params
 	//! Raw pixel format the fake delivers: 1 = NV12, 2 = YUY2 (enum u_stereo_uvc_pixel).
 	uint32_t pixel;
 	float fps;
+	/*!
+	 * Fault injection (tests, #2221): U_STEREO_UVC_FAKE_FAULT_NONE; _OPEN_FAILS (open
+	 * returns false); _READ_ERROR (open succeeds, the first read reports an error — what
+	 * Media Foundation does for a device another process holds); _NEVER_DELIVERS (open
+	 * succeeds, every read times out). Config key "fault": "open-fails" | "read-error" |
+	 * "never-delivers". @ref u_stereo_uvc_fake_set_fault overrides it live.
+	 */
+	uint32_t fault;
 };
+
+#define U_STEREO_UVC_FAKE_FAULT_NONE 0u
+#define U_STEREO_UVC_FAKE_FAULT_OPEN_FAILS 1u
+#define U_STEREO_UVC_FAKE_FAULT_READ_ERROR 2u
+#define U_STEREO_UVC_FAKE_FAULT_NEVER_DELIVERS 3u
+//! @ref u_stereo_uvc_fake_set_fault: use the configured value again.
+#define U_STEREO_UVC_FAKE_FAULT_UNSET 0xffffffffu
 
 struct u_stereo_uvc_config
 {
@@ -392,6 +407,15 @@ struct u_stereo_uvc_backend
  */
 void
 u_stereo_uvc_fake_backend_init(struct u_stereo_uvc_backend *out, const struct u_stereo_uvc_fake_params *params);
+
+/*!
+ * Test hook (#2221): override the fault of every fake handle, live, process-wide —
+ * the manager copies its config, so a test flips the device between "held by
+ * someone else" and "free" through this instead. U_STEREO_UVC_FAKE_FAULT_UNSET
+ * restores the configured value.
+ */
+void
+u_stereo_uvc_fake_set_fault(uint32_t fault);
 
 
 /*

@@ -320,6 +320,16 @@ u_stereo_uvc_config_parse(const char *json, struct u_stereo_uvc_config *out, cha
 			if (cJSON_IsNumber(v) && v->valuedouble >= 1.0 && v->valuedouble <= 240.0) {
 				out->fake_params.fps = (float)v->valuedouble;
 			}
+			v = cJSON_GetObjectItemCaseSensitive(fake, "fault");
+			if (cJSON_IsString(v)) {
+				if (strcmp(v->valuestring, "open-fails") == 0) {
+					out->fake_params.fault = U_STEREO_UVC_FAKE_FAULT_OPEN_FAILS;
+				} else if (strcmp(v->valuestring, "read-error") == 0) {
+					out->fake_params.fault = U_STEREO_UVC_FAKE_FAULT_READ_ERROR;
+				} else if (strcmp(v->valuestring, "never-delivers") == 0) {
+					out->fake_params.fault = U_STEREO_UVC_FAKE_FAULT_NEVER_DELIVERS;
+				}
+			}
 		} else {
 			seterr(err, err_cap, "\"fake\" must be true/false or an object");
 			ok = false;
@@ -1163,6 +1173,25 @@ fake_render(struct fake_handle *f)
 	}
 }
 
+//! #2221: live override of every handle's fault (tests); UNSET = the configured value.
+static volatile uint32_t fake_fault_override = U_STEREO_UVC_FAKE_FAULT_UNSET;
+
+void
+u_stereo_uvc_fake_set_fault(uint32_t fault)
+{
+	fake_fault_override = fault;
+}
+
+static uint32_t
+fake_fault(const struct u_stereo_uvc_fake_params *p)
+{
+	const uint32_t o = fake_fault_override;
+	if (o != U_STEREO_UVC_FAKE_FAULT_UNSET) {
+		return o;
+	}
+	return p != NULL ? p->fault : U_STEREO_UVC_FAKE_FAULT_NONE;
+}
+
 static uint32_t
 fake_enumerate(void *ctx, struct u_stereo_uvc_device *out, uint32_t cap)
 {
@@ -1208,6 +1237,9 @@ fake_open(
 	    mode->height < 32 || (mode->height % 2) != 0 || mode->width > 8192 || mode->height > 8192) {
 		return false;
 	}
+	if (fake_fault(p) == U_STEREO_UVC_FAKE_FAULT_OPEN_FAILS) {
+		return false; // #2221: "the OS would not hand the device over"
+	}
 	struct fake_handle *f = (struct fake_handle *)calloc(1, sizeof(*f));
 	if (f == NULL) {
 		return false;
@@ -1240,6 +1272,16 @@ static uint32_t
 fake_read(void *handle, int64_t timeout_ns, struct u_stereo_uvc_raw_frame *out)
 {
 	struct fake_handle *f = (struct fake_handle *)handle;
+	const uint32_t fault = fake_fault(&f->p);
+	if (fault == U_STEREO_UVC_FAKE_FAULT_READ_ERROR) {
+		return U_STEREO_UVC_READ_ERROR; // #2221: Media Foundation's shape for a held device
+	}
+	if (fault == U_STEREO_UVC_FAKE_FAULT_NEVER_DELIVERS) {
+		if (timeout_ns > 0) {
+			os_nanosleep(timeout_ns);
+		}
+		return U_STEREO_UVC_READ_TIMEOUT;
+	}
 	int64_t due = f->t0_ns + (int64_t)(f->seq + 1) * f->period_ns;
 	int64_t now = os_monotonic_get_ns();
 	if (due - now > timeout_ns) {
