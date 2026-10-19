@@ -532,6 +532,13 @@ struct comp_d3d11_compositor
 	struct comp_seg_rect seg_window; //!< the window's client area in desktop device px
 	bool have_seg_window;
 	/*!
+	 * #2218: the last weave found the window NOT wholly on the primary screen,
+	 * so the compose step must not hand the app's image to the DP as-is
+	 * (zero-copy) — the frame is composed into our atlas and woven per screen.
+	 * Written by the weave thread, read by layer_commit, under seg_pub_mutex.
+	 */
+	bool seg_zero_copy_withheld;
+	/*!
 	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
 	 * back (xrEndFrame) while the weave thread owns the segment manager —
 	 * a small lock of its own, never c->mutex (the repaint thread holds that
@@ -2870,8 +2877,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 * one-frame lag the single-DP split weave has.
 	 */
 	bool seg_split = false;
-	if (!zero_copy && !eff_canvas.valid && c->have_seg_window && c->seg_screens != nullptr &&
-	    atlas_srv != nullptr) {
+	bool seg_would_split = false;
+	// #2218: the manager exists, and "does this window need the per-screen weave"
+	// is answered, on EVERY weave — before and independently of zero-copy. Only
+	// the split itself still needs an atlas that is ours to crop.
+	if (c->have_seg_window && c->seg_screens != nullptr) {
 		if (c->seg_rebuild || c->segments == nullptr) {
 			// The app thread reads c->segments for eyes (M3): swap under the lock.
 			std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
@@ -2912,12 +2922,16 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		}
 		if (comp_d3d11_segments_enabled(c->segments)) {
 			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
-			const uint32_t mode_index =
-			    (c->xdev != nullptr && c->xdev->hmd != nullptr) ? c->xdev->hmd->active_rendering_mode_index : 0;
-			seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas, d3d11_out_context(c),
-			                                       mode_index);
-			// Every segment DP follows the session's 2D/3D mode, like the primary.
-			comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			seg_would_split = comp_d3d11_segments_would_split(c->segments, &c->seg_window, &canvas);
+			if (!zero_copy && !eff_canvas.valid && atlas_srv != nullptr) {
+				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
+				                                ? c->xdev->hmd->active_rendering_mode_index
+				                                : 0;
+				seg_split = comp_d3d11_segments_update(c->segments, &c->seg_window, &canvas,
+				                                       d3d11_out_context(c), mode_index);
+				// Every segment DP follows the session's 2D/3D mode, like the primary.
+				comp_d3d11_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			}
 		}
 	}
 
@@ -2942,6 +2956,12 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			m.generation++;
 		}
 		c->seg_pub = m;
+		if (c->seg_zero_copy_withheld != seg_would_split) {
+			c->seg_zero_copy_withheld = seg_would_split;
+			U_LOG_W("segments: window %s the primary screen — zero-copy %s (#2218)",
+			        seg_would_split ? "left" : "is back on",
+			        seg_would_split ? "withheld: frames compose and weave per screen" : "allowed again");
+		}
 	}
 
 	if (seg_split) {
@@ -4320,6 +4340,18 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->eff_layout.route_count > 0) {
 		zero_copy = false;
 		zc_srv = nullptr;
+	}
+
+	// #2218: a window that is not wholly on the primary screen is woven per
+	// screen, so its frame must be composed into our atlas for the segments to
+	// crop; handed to the primary DP as-is it would be woven by the wrong
+	// vendor wherever it sits. Decided by the last weave (one-frame lag).
+	{
+		std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
+		if (c->seg_zero_copy_withheld) {
+			zero_copy = false;
+			zc_srv = nullptr;
+		}
 	}
 
 	// XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor composes

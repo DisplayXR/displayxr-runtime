@@ -82,6 +82,12 @@ comp_d3d12_segments_set_screens(struct comp_d3d12_segments *segs,
 bool
 comp_d3d12_segments_enabled(const struct comp_d3d12_segments *segs);
 
+//! #2218: would this window take the split path (not wholly on the primary screen)? Pure; see the D3D11 twin.
+bool
+comp_d3d12_segments_would_split(const struct comp_d3d12_segments *segs,
+                                const struct comp_seg_rect *window_desktop,
+                                const struct comp_seg_rect *canvas);
+
 /*!
  * One metric update: recompute the segment table for the window, run the DP
  * lifecycle (create/destroy secondary DPs with hysteresis), log a table change

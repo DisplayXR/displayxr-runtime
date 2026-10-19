@@ -168,6 +168,23 @@ comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas
 	return false;
 }
 
+bool
+comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
+                              const struct comp_seg_rect *canvas,
+                              const struct comp_segments_screen *screens,
+                              uint32_t screen_count)
+{
+	struct comp_segment_table t;
+	if (window_desktop == NULL || screens == NULL || screen_count == 0) {
+		return false;
+	}
+	memset(&t, 0, sizeof(t));
+	comp_segments_compute(window_desktop, canvas, screens, screen_count, &t);
+	const uint32_t cw = canvas != NULL && canvas->w > 0 ? canvas->w : window_desktop->w;
+	const uint32_t ch = canvas != NULL && canvas->h > 0 ? canvas->h : window_desktop->h;
+	return comp_segments_table_is_split(&t, cw, ch);
+}
+
 enum comp_seg_render
 comp_segments_decide(bool have_dp, bool dp_tolerates_resample, enum comp_seg_1to1 screen_1to1)
 {
