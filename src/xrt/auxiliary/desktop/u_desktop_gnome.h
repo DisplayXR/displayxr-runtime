@@ -154,6 +154,14 @@ enum u_desktop_result
 gnome_portal_scroll(struct gnome_portal *p, int32_t dx, int32_t dy, char *msg);
 
 #define GNOME_PORTAL_MAX_KEYS 16
+#define GNOME_MAX_MONITORS 8
+
+/*!
+ * The monitors as the session's absolute pointer sees them (its libei regions,
+ * stage px). Needs an open session (never reopens one).
+ */
+enum u_desktop_result
+gnome_portal_monitors(struct gnome_portal *p, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg);
 
 //! A key press/release sequence of evdev codes, sent in order with a short gap.
 enum u_desktop_result
@@ -234,6 +242,15 @@ gnome_atspi_text_at(struct gnome_atspi *a,
                     size_t cap,
                     char *msg);
 
+/*!
+ * Whether the app of process @p pid is answering: 1 it answered an AT-SPI call
+ * on its application object (served by its main loop), 0 it did not within
+ * @p budget_ms (busy / hung), -1 cannot tell (no accessibility tree for it, or
+ * no accessibility bus).
+ */
+int
+gnome_atspi_app_responds(struct gnome_atspi *a, uint32_t pid, uint32_t budget_ms);
+
 /*
  * The backend object and what its files share (u_desktop_gnome.c,
  * u_desktop_gnome_windows.c)
@@ -283,6 +300,16 @@ gnome_find_window(const struct u_desktop_window *ws, uint32_t n, uint64_t id);
 //! -1 unknown (no extension 16, the window is gone, the call failed).
 int
 gnome_window_above(struct gnome_backend *g, uint64_t id);
+
+/*!
+ * Window @p id's "moving" flag (an interactive move / resize grab, from the
+ * extension) and @p size_scale: what its frame size divides by to compare sizes
+ * across monitors — the monitor scale in mutter's PHYSICAL layout (stage px are
+ * device px there), else 1. False when the window is not listed or the extension
+ * did not answer.
+ */
+bool
+gnome_window_info(struct gnome_backend *g, uint64_t id, bool *moving, double *size_scale);
 
 enum u_desktop_result
 gnome_pick_msg(struct gnome_backend *g, int32_t x, int32_t y, struct u_desktop_pick *out, char *msg);

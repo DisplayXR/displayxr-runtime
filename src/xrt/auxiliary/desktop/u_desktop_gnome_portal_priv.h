@@ -27,7 +27,9 @@
 //! A restore (Start answered silently) plus ConnectToEIS fits in this.
 #define ACTION_TIMEOUT_MS (RESTORE_START_TIMEOUT_MS + 6000)
 //! After prepare_input, keep the session open this long (verification + the
-//! common layer's idle wait, at most 10 s, run before the injection).
+//! common layer's idle wait, at most 10 s, run before the injection). The first
+//! injection ends the hold: from then on the session closes after
+//! SESSION_IDLE_CLOSE_MS (2 s) without input, taking the indicator with it.
 #define GNOME_PREPARE_HOLD_MS 12000
 
 struct gp_cmd;
@@ -54,6 +56,8 @@ struct gp_cmd
 	//! restoring between the check and the injection — it refuses instead.
 	bool restore;
 	uint32_t out_mods, out_code; //!< resolved chord
+	struct u_desktop_rect mon[GNOME_MAX_MONITORS]; //!< monitors: the pointer's regions
+	uint32_t nmon;
 	u_desktop_access_done_fn done;
 	void *done_ctx;
 

@@ -78,6 +78,119 @@ rect_has(const struct u_desktop_rect *r, int32_t x, int32_t y, int32_t inset)
 	return x >= r->x + inset && y >= r->y + inset && x < r->x + r->w - inset && y < r->y + r->h - inset;
 }
 
+/*
+ * Monitors and pointer paths.
+ *
+ * A Super+drag must never let the pointer touch the zones where GNOME acts on a
+ * moving window or blocks the pointer: mutter's edge tiling / maximize (the top
+ * edge, the sides of each monitor's work area — also where two monitors meet),
+ * Ubuntu's Tiling Assistant (its edge + corner zones: a quarter tile at a
+ * monitor's top-left was seen on hardware), and the pointer barriers of the hot
+ * corner and the dock (an absolute motion is constrained along its segment, so
+ * a jump from one monitor to another near the top stopped AT the boundary).
+ * So: the drop point is kept DROP_MARGIN_PX inside its monitor, and a path that
+ * changes monitors goes through waypoints WAYPOINT_MARGIN_PX inside each one,
+ * crossing between them through the middle of their shared edge.
+ */
+
+#define DROP_MARGIN_PX 48
+#define WAYPOINT_MARGIN_PX 96
+#define MAX_WAYPOINTS 2
+
+struct monitors
+{
+	struct u_desktop_rect r[GNOME_MAX_MONITORS];
+	uint32_t n;
+};
+
+//! The monitors, from the session's pointer regions; false when unknown (then
+//! the pick-based fallback is used).
+static bool
+get_monitors(struct gnome_backend *g, struct monitors *m)
+{
+	char tmp[U_DESKTOP_MSG_SIZE];
+	m->n = 0;
+	return gnome_portal_monitors(g->portal, m->r, GNOME_MAX_MONITORS, &m->n, tmp) == U_DESKTOP_OK && m->n > 0;
+}
+
+static int
+monitor_of(const struct monitors *m, int32_t x, int32_t y)
+{
+	for (uint32_t i = 0; i < m->n; i++) {
+		if (rect_has(&m->r[i], x, y, 0)) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+static int32_t
+clamp_i(int32_t v, int32_t lo, int32_t hi)
+{
+	return v < lo ? lo : v > hi ? hi : v;
+}
+
+//! (x, y) moved to the nearest point of @p r at least @p margin inside (its centre
+//! on an axis too small for the margin).
+static void
+clamp_into(const struct u_desktop_rect *r, int32_t margin, int32_t *x, int32_t *y)
+{
+	if (r->w > 2 * margin) {
+		*x = clamp_i(*x, r->x + margin, r->x + r->w - 1 - margin);
+	} else {
+		*x = r->x + r->w / 2;
+	}
+	if (r->h > 2 * margin) {
+		*y = clamp_i(*y, r->y + margin, r->y + r->h - 1 - margin);
+	} else {
+		*y = r->y + r->h / 2;
+	}
+}
+
+//! (x, y) is on a monitor and at least @p margin from that monitor's edges.
+static bool
+safe_on_monitor(const struct monitors *m, int32_t x, int32_t y, int32_t margin)
+{
+	int i = monitor_of(m, x, y);
+	return i >= 0 && rect_has(&m->r[i], x, y, margin);
+}
+
+/*!
+ * Waypoints from (fx, fy) to (tx, ty) when they are on different monitors (none
+ * when on the same one, or when either is on no monitor — the motion itself then
+ * refuses). Each waypoint is WAYPOINT_MARGIN_PX inside its monitor; the leg
+ * between them crosses the monitors' shared span at a constant y (side by side)
+ * or x (stacked), away from the corners.
+ */
+static uint32_t
+route(const struct monitors *m, int32_t fx, int32_t fy, int32_t tx, int32_t ty, int32_t out[MAX_WAYPOINTS][2])
+{
+	int ia = monitor_of(m, fx, fy), ib = monitor_of(m, tx, ty);
+	if (ia < 0 || ib < 0 || ia == ib) {
+		return 0;
+	}
+	const struct u_desktop_rect *a = &m->r[ia], *b = &m->r[ib];
+	const int32_t mg = WAYPOINT_MARGIN_PX;
+	int32_t ax = fx, ay = fy, bx = tx, by = ty;
+	clamp_into(a, mg, &ax, &ay);
+	clamp_into(b, mg, &bx, &by);
+	int32_t ylo = (a->y > b->y ? a->y : b->y) + mg;
+	int32_t yhi = (a->y + a->h < b->y + b->h ? a->y + a->h : b->y + b->h) - 1 - mg;
+	int32_t xlo = (a->x > b->x ? a->x : b->x) + mg;
+	int32_t xhi = (a->x + a->w < b->x + b->w ? a->x + a->w : b->x + b->w) - 1 - mg;
+	if (ylo <= yhi) {
+		ay = by = clamp_i(ay, ylo, yhi); // side by side: cross at one y
+	} else if (xlo <= xhi) {
+		ax = bx = clamp_i(ax, xlo, xhi); // stacked: cross at one x
+	} else {
+		ax = a->x + a->w / 2, ay = a->y + a->h / 2; // diagonal: centre to centre
+		bx = b->x + b->w / 2, by = b->y + b->h / 2;
+	}
+	out[0][0] = ax, out[0][1] = ay;
+	out[1][0] = bx, out[1][1] = by;
+	return 2;
+}
+
 //! True when (x, y) is on a monitor at least @p margin px from its outer edges.
 static bool
 inside_screen(struct gnome_backend *g, int32_t x, int32_t y, int32_t margin)
@@ -93,13 +206,19 @@ inside_screen(struct gnome_backend *g, int32_t x, int32_t y, int32_t margin)
 	return true;
 }
 
+//! Candidate grid per axis: 0.05, 0.15 … 0.95 of the frame (finer than the old 5x5,
+//! so a sliver of a mostly-covered window is still found).
+#define GRID_N 10
+
 /*!
  * A point on window @p idx (of @p ws, top-most first) that a click would meet —
- * confirmed with GetWindowAt. With @p drag, the point displaced by (dx, dy)
- * must also be well inside a monitor (no edge tiling, no pointer clamp).
+ * confirmed with GetWindowAt. With @p drag, the point displaced by (dx, dy) — the
+ * drop point — must also be DROP_MARGIN_PX inside a monitor (@p mon, when known;
+ * else probed with picks): no edge tiling, no pointer barrier, no clamp.
  */
 static bool
 visible_point(struct gnome_backend *g,
+              const struct monitors *mon,
               const struct u_desktop_window *ws,
               uint32_t idx,
               bool drag,
@@ -115,7 +234,7 @@ visible_point(struct gnome_backend *g,
 	// The title-bar area first (a click there does nothing in the app), then the centre, then
 	// a grid. The centre early: a transparent, click-through window (a DisplayXR avatar
 	// overlay) is clickable only where it draws, and that is mostly in the middle.
-	int32_t cand[2 + 25][2];
+	int32_t cand[2 + GRID_N * GRID_N][2];
 	int nc = 0;
 	cand[nc][0] = f->x + f->w / 2;
 	cand[nc][1] = f->y + (f->h / 4 < 16 ? f->h / 4 : 16);
@@ -123,15 +242,15 @@ visible_point(struct gnome_backend *g,
 	cand[nc][0] = f->x + f->w / 2;
 	cand[nc][1] = f->y + f->h / 2;
 	nc++;
-	for (int j = 0; j < 5; j++) {
-		for (int i = 0; i < 5; i++) {
-			cand[nc][0] = f->x + (int32_t)((double)f->w * (0.1 + 0.2 * i));
-			cand[nc][1] = f->y + (int32_t)((double)f->h * (0.1 + 0.2 * j));
+	for (int j = 0; j < GRID_N; j++) {
+		for (int i = 0; i < GRID_N; i++) {
+			cand[nc][0] = f->x + (int32_t)((double)f->w * (0.05 + 0.1 * i));
+			cand[nc][1] = f->y + (int32_t)((double)f->h * (0.05 + 0.1 * j));
 			nc++;
 		}
 	}
 	// Uncovered (by the frames above) first; the pick is the judge either way.
-	int order[2 + 25], no = 0;
+	int order[2 + GRID_N * GRID_N], no = 0;
 	for (int pass = 0; pass < 2; pass++) {
 		for (int c = 0; c < nc; c++) {
 			bool covered = false;
@@ -151,8 +270,12 @@ visible_point(struct gnome_backend *g,
 		if (!rect_has(f, x, y, 4)) {
 			continue;
 		}
-		if (drag && !inside_screen(g, x + dx, y + dy, 12)) {
-			continue;
+		if (drag) {
+			bool ok = mon->n > 0 ? safe_on_monitor(mon, x + dx, y + dy, DROP_MARGIN_PX)
+			                     : inside_screen(g, x + dx, y + dy, DROP_MARGIN_PX);
+			if (!ok) {
+				continue;
+			}
 		}
 		struct u_desktop_pick p;
 		if (gnome_pick_msg(g, x, y, &p, NULL) == U_DESKTOP_OK && p.kind == U_DESKTOP_PICK_WINDOW &&
@@ -175,6 +298,7 @@ visible_point(struct gnome_backend *g,
 static enum u_desktop_result
 super_gesture(struct gnome_backend *g,
               const struct u_desktop_input_guard *guard,
+              const struct monitors *mon,
               uint64_t target,
               int32_t x,
               int32_t y,
@@ -186,6 +310,18 @@ super_gesture(struct gnome_backend *g,
 	const uint32_t super_key[1] = {KEY_LEFTMETA};
 	const bool t[1] = {true}, f[1] = {false};
 	char tmp[U_DESKTOP_MSG_SIZE];
+	// Bring the pointer onto the window's monitor first, through the middle of the
+	// shared edge (a straight jump from another monitor can stop at a barrier).
+	int32_t wp[MAX_WAYPOINTS][2];
+	int32_t px = 0, py = 0;
+	uint32_t nwp =
+	    mon->n > 0 && gnome_get_pointer_msg(g, &px, &py, NULL) == U_DESKTOP_OK ? route(mon, px, py, x, y, wp) : 0;
+	for (uint32_t i = 0; i < nwp; i++) {
+		enum u_desktop_result r = gnome_move_verified(g, wp[i][0], wp[i][1], msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
 	enum u_desktop_result r = gnome_move_verified(g, x, y, msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
@@ -208,11 +344,24 @@ super_gesture(struct gnome_backend *g,
 			gnome_set_msg(msg, "stopped: desktop control was suspended, revoked or the screen locked");
 			r = U_DESKTOP_ERR_REFUSED;
 		} else {
-			// Jump: a slow drag across a monitor edge pops the tiling assistant.
-			// Past verification: a closed session is never reopened here (that
-			// would put seconds between the check and the drop) — it refuses.
-			r = gnome_portal_motion_ex(g->portal, x + dx, y + dy, false, msg);
-			gdbus_sleep_ms(60);
+			// Jumps, never a slow drag (that would sweep the tiling zones): to the
+			// drop point directly on one monitor, else through the waypoints —
+			// each verified, so a pointer stopped by a barrier fails the move here
+			// instead of dropping the window where it stopped. Past verification:
+			// a closed session is never reopened (that would put seconds between
+			// the check and the drop) — it refuses.
+			nwp = mon->n > 0 ? route(mon, x, y, x + dx, y + dy, wp) : 0;
+			for (uint32_t i = 0; i < nwp && r == U_DESKTOP_OK; i++) {
+				r = gnome_portal_motion_ex(g->portal, wp[i][0], wp[i][1], false, msg);
+				gdbus_sleep_ms(30);
+				if (r == U_DESKTOP_OK) {
+					r = gnome_move_verified_ex(g, wp[i][0], wp[i][1], false, msg);
+				}
+			}
+			if (r == U_DESKTOP_OK) {
+				r = gnome_portal_motion_ex(g->portal, x + dx, y + dy, false, msg);
+				gdbus_sleep_ms(60);
+			}
 			if (r == U_DESKTOP_OK) {
 				r = gnome_move_verified_ex(g, x + dx, y + dy, false, msg);
 			}
@@ -274,6 +423,24 @@ restore_pointer(struct gnome_backend *g, bool have, int32_t x, int32_t y)
 //! GNOME's unminimize animation is 250 ms; the pick needs the window settled on screen.
 #define OWN_RESTORE_SETTLE_MS 400
 
+/*!
+ * After a gesture: mutter's grab from the Super+click / Super+drag (keys sent
+ * before it ends are lost, and a frame read during it is not final). At least
+ * GRAB_SETTLE_MS, then until the extension no longer reports the window as
+ * "moving" (bounded).
+ */
+static void
+wait_grab_end(struct gnome_backend *g, uint64_t id)
+{
+	gdbus_sleep_ms(GRAB_SETTLE_MS);
+	uint64_t deadline = gdbus_now_ms() + 1000;
+	bool moving = false;
+	double scale = 1.0;
+	while (gnome_window_info(g, id, &moving, &scale) && moving && gdbus_now_ms() < deadline) {
+		gdbus_sleep_ms(30);
+	}
+}
+
 //! Super+click on a visible point of @p id, then wait for focus.
 static enum u_desktop_result
 activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, char *msg)
@@ -302,8 +469,10 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 		gnome_set_msg(msg, "minimized windows of other apps cannot be restored on GNOME");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
+	struct monitors mon;
+	get_monitors(g, &mon);
 	int32_t x, y;
-	bool found = visible_point(g, ws, idx, false, 0, 0, &x, &y);
+	bool found = visible_point(g, &mon, ws, idx, false, 0, 0, &x, &y);
 	free(ws);
 	if (!found) {
 		gnome_set_msg(msg, "no visible part of the window to click (covered, or on another workspace)");
@@ -311,14 +480,13 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 	}
 	int32_t ox = 0, oy = 0;
 	bool have_orig = gnome_get_pointer_msg(g, &ox, &oy, NULL) == U_DESKTOP_OK;
-	r = super_gesture(g, guard, id, x, y, false, 0, 0, msg);
+	r = super_gesture(g, guard, &mon, id, x, y, false, 0, 0, msg);
 	if (r != U_DESKTOP_OK) {
 		// Refused / failed: super_gesture released what it pressed; send nothing more
 		// (no Escape, no pointer restore).
 		return r;
 	}
-	// mutter's grab from the Super+click: keys sent before it ends are lost.
-	gdbus_sleep_ms(GRAB_SETTLE_MS);
+	wait_grab_end(g, id);
 	tidy_after_gesture(g, guard, false);
 	restore_pointer(g, have_orig, ox, oy);
 	if (!wait_focus(g, id, 1000)) {
@@ -326,6 +494,28 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 		return U_DESKTOP_ERR_TIMEOUT;
 	}
 	return U_DESKTOP_OK;
+}
+
+//! How far a frame size may drift (after normalising for the monitor scale) and
+//! still be "the same size": a size change beyond it is edge tiling's doing.
+#define SIZE_TOLERANCE_PX 4
+
+//! Window @p id's frame size in units comparable across monitors (see gnome_window_info).
+static void
+norm_size(struct gnome_backend *g, uint64_t id, const struct u_desktop_rect *f, double *w, double *h)
+{
+	bool moving = false;
+	double scale = 1.0;
+	gnome_window_info(g, id, &moving, &scale);
+	*w = f->w / scale;
+	*h = f->h / scale;
+}
+
+static bool
+size_changed(double w0, double h0, double w1, double h1)
+{
+	return w1 - w0 > SIZE_TOLERANCE_PX || w0 - w1 > SIZE_TOLERANCE_PX || h1 - h0 > SIZE_TOLERANCE_PX ||
+	       h0 - h1 > SIZE_TOLERANCE_PX;
 }
 
 //! Keep window arithmetic far from int32 overflow (an app can pass any rect).
@@ -351,7 +541,16 @@ move_other(struct gnome_backend *g,
 	enum u_desktop_result r = U_DESKTOP_OK;
 	bool gesture_failed = false; //!< then nothing more is sent (no Escape, no pointer restore)
 	struct u_desktop_rect frame = {0, 0, 0, 0};
-	for (int attempt = 0; attempt < 2; attempt++) {
+	struct u_desktop_rect orig = {0, 0, 0, 0}; //!< the frame before the first gesture
+	double orig_w = 0, orig_h = 0;             //!< its size, normalised (norm_size)
+	struct monitors mon;
+	get_monitors(g, &mon);
+	// One gesture + one read-back correction; one more when a gesture got snapped
+	// by edge tiling (the next drag un-tiles it, which restores its size and so
+	// lands off by the rescale; the last one corrects that).
+	int attempts = 2;
+	bool snapped = false;
+	for (int attempt = 0; attempt < attempts; attempt++) {
 		struct u_desktop_window *ws;
 		uint32_t n;
 		r = gnome_snapshot(g, &ws, &n, msg);
@@ -370,6 +569,22 @@ move_other(struct gnome_backend *g,
 		}
 		frame = ws[idx].frame;
 		uint32_t st = ws[idx].state;
+		double now_w = 0, now_h = 0;
+		norm_size(g, id, &frame, &now_w, &now_h);
+		if (attempt == 0) {
+			orig = frame;
+			orig_w = now_w;
+			orig_h = now_h;
+		} else if (!snapped &&
+		           ((st & U_DESKTOP_WINDOW_MAXIMIZED) || size_changed(orig_w, orig_h, now_w, now_h))) {
+			// The window changed size: edge tiling / the Tiling Assistant took
+			// the drop. Correct it (drags only — no keybinding that a tiling
+			// extension may have rebound).
+			snapped = true;
+			attempts = 3;
+			U_LOG_I("desktop/gnome: a move was snapped by edge tiling (now %dx%d, was %dx%d) — correcting",
+			        frame.w, frame.h, orig.w, orig.h);
+		}
 		if (attempt == 0 && (st & U_DESKTOP_WINDOW_MINIMIZED)) {
 			free(ws);
 			gnome_set_msg(msg, "the window is minimized");
@@ -396,7 +611,7 @@ move_other(struct gnome_backend *g,
 			break;
 		}
 		int32_t x, y;
-		bool found = visible_point(g, ws, idx, true, dx, dy, &x, &y);
+		bool found = visible_point(g, &mon, ws, idx, true, dx, dy, &x, &y);
 		free(ws);
 		if (!found) {
 			gnome_set_msg(
@@ -406,12 +621,12 @@ move_other(struct gnome_backend *g,
 			r = U_DESKTOP_ERR_REFUSED;
 			break;
 		}
-		r = super_gesture(g, guard, id, x, y, true, dx, dy, msg);
+		r = super_gesture(g, guard, &mon, id, x, y, true, dx, dy, msg);
 		if (r != U_DESKTOP_OK) {
 			gesture_failed = true;
 			break;
 		}
-		gdbus_sleep_ms(GRAB_SETTLE_MS);
+		wait_grab_end(g, id);
 		tidy_after_gesture(g, guard, true);
 		// FAILED = "verify by read-back": the next attempt re-reads the frame and
 		// corrects by the residual; after the last one, the read-back below decides.
@@ -423,11 +638,23 @@ move_other(struct gnome_backend *g,
 		uint32_t n;
 		if (gnome_snapshot(g, &ws, &n, msg) == U_DESKTOP_OK) {
 			const struct u_desktop_window *w = gnome_find_window(ws, n, id);
+			double now_w = 0, now_h = 0;
+			if (w != NULL) {
+				norm_size(g, id, &w->frame, &now_w, &now_h);
+			}
+			bool tiled = w != NULL && ((w->state & U_DESKTOP_WINDOW_MAXIMIZED) ||
+			                           size_changed(orig_w, orig_h, now_w, now_h));
 			if (w == NULL) {
 				r = U_DESKTOP_ERR_WINDOW_LOST;
-			} else if (llabs((int64_t)w->frame.x - rect->x) <= POINTER_TOLERANCE_PX &&
+			} else if (!tiled && llabs((int64_t)w->frame.x - rect->x) <= POINTER_TOLERANCE_PX &&
 			           llabs((int64_t)w->frame.y - rect->y) <= POINTER_TOLERANCE_PX) {
 				r = U_DESKTOP_OK;
+			} else if (tiled) {
+				gnome_set_msg(
+				    msg,
+				    "edge tiling snapped the window (now %d,%d %dx%d, was %dx%d) and it could not be "
+				    "corrected",
+				    w->frame.x, w->frame.y, w->frame.w, w->frame.h, orig.w, orig.h);
 			} else {
 				gnome_set_msg(msg, "the window landed at (%d,%d), not (%d,%d) — mutter constrained it",
 				              w->frame.x, w->frame.y, rect->x, rect->y);
@@ -699,7 +926,22 @@ gnome_window_op(struct u_desktop_backend *b,
 			}
 			gdbus_sleep_ms(50);
 		} while (gdbus_now_ms() < deadline);
-		gnome_set_msg(msg, "the window is still open after Alt+F4");
+		// Still open, and no separate dialog: libadwaita (AdwAlertDialog) and other
+		// toolkits put the "Save changes?" prompt INSIDE the window. If the app is
+		// alive (it answers AT-SPI from its main loop), that is the app asking for
+		// confirmation — the same outcome as a dialog window. A hung app, or one we
+		// cannot ask, stays a timeout.
+		int alive = g->atspi != NULL ? gnome_atspi_app_responds(g->atspi, target.pid, 800) : -1;
+		if (alive == 1) {
+			gnome_set_msg(msg,
+			              "the app asked for confirmation (its window stayed open and is responding — an "
+			              "in-window prompt such as \"save changes?\")");
+			return U_DESKTOP_OK;
+		}
+		gnome_set_msg(msg, alive == 0
+		                       ? "the window is still open after Alt+F4 and its app is not responding"
+		                       : "the window is still open after Alt+F4 (its app exposes no accessibility "
+		                         "tree, so an in-window confirmation prompt cannot be told apart)");
 		return U_DESKTOP_ERR_TIMEOUT;
 	}
 	default: gnome_set_msg(msg, "unknown window op"); return U_DESKTOP_ERR_FAILED;

@@ -441,3 +441,41 @@ out:
 	pthread_mutex_unlock(&a->lock);
 	return r;
 }
+
+int
+gnome_atspi_app_responds(struct gnome_atspi *a, uint32_t pid, uint32_t budget_ms)
+{
+	struct budget b = {gdbus_now_ms() + budget_ms};
+	pthread_mutex_lock(&a->lock);
+	if (!connect_locked(a)) {
+		pthread_mutex_unlock(&a->lock);
+		return -1;
+	}
+	gdbus_drain(a->c);
+	int r = -1;
+	struct atspi_ref app;
+	// find_app talks to the registry and the bus daemon only, never to the app.
+	if (find_app(a, pid, &app, &b) && left_ms(&b) > 2) {
+		// A property read on the app object is answered by the app's own main loop
+		// (GTK dispatches its AT-SPI objects there): an answer — even an error — is
+		// a live app; no answer within the budget is a busy or hung one.
+		const char *iface = ATSPI_ACCESSIBLE, *prop = "Name";
+		struct gdbus_err err;
+		DBusMessage *reply =
+		    gdbus_call(a->c, app.bus, app.path, "org.freedesktop.DBus.Properties", "Get", left_ms(&b), &err,
+		               DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+		if (reply != NULL) {
+			dbus_message_unref(reply);
+			r = 1;
+		} else if (strcmp(err.name, DBUS_ERROR_NO_REPLY) == 0 || strcmp(err.name, DBUS_ERROR_TIMEOUT) == 0) {
+			r = 0;
+		} else if (strcmp(err.name, DBUS_ERROR_SERVICE_UNKNOWN) == 0 ||
+		           strcmp(err.name, DBUS_ERROR_NAME_HAS_NO_OWNER) == 0) {
+			forget_app(a, pid); // a stale cache entry: cannot tell
+		} else if (err.name[0] != '\0') {
+			r = 1; // the app itself answered, with an error
+		}
+	}
+	pthread_mutex_unlock(&a->lock);
+	return r;
+}

@@ -26,6 +26,25 @@
 #define CLIP_MAX_BYTES (1u << 20)
 //! Gap between consecutive key / button events, so every client sees each one.
 #define KEY_GAP_MS 8
+//! The agent's text stays the clipboard at least this long after the paste keystroke.
+#define PASTE_SERVE_MS 1200
+//! A write arriving late keeps serving this much longer (more mime types may follow).
+#define PASTE_QUIET_MS 150
+//! The whole paste, at most; no write of the agent's text by then = not delivered.
+#define PASTE_MAX_MS 2500
+
+/*!
+ * Input was injected: the idle close counts from now, and prepare_input's hold
+ * (kept for the verification + idle wait BEFORE the injection) is over — so
+ * GNOME's remote-access indicator goes away SESSION_IDLE_CLOSE_MS after the
+ * last action, not GNOME_PREPARE_HOLD_MS after the last prepare.
+ */
+static void
+injected(struct gnome_portal *p)
+{
+	p->last_use_ms = gdbus_now_ms();
+	p->hold_until_ms = 0;
+}
 
 static bool
 is_text_mime(const char *mime)
@@ -147,7 +166,7 @@ cmd_motion(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	g_ei.motion_absolute(d, (double)c->x, (double)c->y);
 	g_ei.device_frame(d, g_ei.now(p->ei));
-	p->last_use_ms = gdbus_now_ms();
+	injected(p);
 	return U_DESKTOP_OK;
 }
 
@@ -166,7 +185,7 @@ cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 	g_ei.button_button(d, c->code, c->down);
 	g_ei.device_frame(d, g_ei.now(p->ei));
 	gdbus_sleep_ms(KEY_GAP_MS);
-	p->last_use_ms = gdbus_now_ms();
+	injected(p);
 	return U_DESKTOP_OK;
 }
 
@@ -184,7 +203,7 @@ cmd_scroll(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	g_ei.scroll_discrete(d, c->x * 120, c->y * 120);
 	g_ei.device_frame(d, g_ei.now(p->ei));
-	p->last_use_ms = gdbus_now_ms();
+	injected(p);
 	return U_DESKTOP_OK;
 }
 
@@ -201,7 +220,7 @@ send_keys(struct gnome_portal *p, const uint32_t *codes, const bool *press, uint
 		g_ei.device_frame(d, g_ei.now(p->ei));
 		gdbus_sleep_ms(KEY_GAP_MS);
 	}
-	p->last_use_ms = gdbus_now_ms();
+	injected(p);
 	return U_DESKTOP_OK;
 }
 
@@ -592,23 +611,34 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 		return r;
 	}
 
-	// Serve the paste: one write of our text, then a short quiet period (a
-	// client may ask for several mime types).
-	uint64_t deadline = gdbus_now_ms() + 2000;
-	uint64_t quiet_until = 0;
+	// Serve the paste. The agent's text stays the clipboard for PASTE_SERVE_MS
+	// after the keystroke whoever reads it first: a clipboard manager often reads
+	// the new selection before the target does, and restoring the previous text
+	// after THAT read would let a slow target paste the user's previous clipboard
+	// (and a trailing "\n" would then submit it). Every SelectionTransfer in the
+	// window gets the agent's text; a write still arriving late extends it by
+	// PASTE_QUIET_MS (a client may ask for several mime types), up to
+	// PASTE_MAX_MS. No write at all by PASTE_MAX_MS: the target never asked.
+	uint64_t start = gdbus_now_ms();
+	uint64_t serve_until = start + PASTE_SERVE_MS;
+	uint64_t hard_stop = start + PASTE_MAX_MS;
 	uint32_t seen = 0;
-	while (gdbus_now_ms() < deadline && p->session_open && !gp_quitting(p)) {
+	while (p->session_open && !gp_quitting(p)) {
+		uint64_t now = gdbus_now_ms();
+		if (now >= hard_stop || (now >= serve_until && p->paste_writes > 0)) {
+			break;
+		}
 		gp_pump(p, 10);
 		if (p->paste_writes != seen) {
 			seen = p->paste_writes;
-			quiet_until = gdbus_now_ms() + 150;
-		}
-		if (quiet_until != 0 && gdbus_now_ms() >= quiet_until) {
-			break;
+			uint64_t quiet = gdbus_now_ms() + PASTE_QUIET_MS;
+			if (quiet > serve_until) {
+				serve_until = quiet;
+			}
 		}
 	}
 	p->paste_armed = false;
-	p->last_use_ms = gdbus_now_ms();
+	injected(p);
 	bool served = p->paste_writes > 0;
 	clipboard_restore(p);
 	if (!served) {
@@ -624,6 +654,48 @@ cmd_clip_restore(struct gnome_portal *p, struct gp_cmd *c)
 	(void)c;
 	clipboard_restore(p);
 	return U_DESKTOP_OK;
+}
+
+//! The absolute pointer's regions (one per monitor, stage px), into c->text as packed rects.
+static enum u_desktop_result
+cmd_monitors(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	struct ei_device *d = gp_find_dev(p, EIX_CAP_POINTER_ABSOLUTE, false);
+	if (d == NULL) {
+		gp_set_msg(c->msg, "the remote-desktop session has no absolute pointer");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	struct ei_region *reg;
+	uint32_t n = 0;
+	for (size_t i = 0; n < GNOME_MAX_MONITORS && (reg = g_ei.device_get_region(d, i)) != NULL; i++) {
+		c->mon[n++] =
+		    (struct u_desktop_rect){(int32_t)g_ei.region_get_x(reg), (int32_t)g_ei.region_get_y(reg),
+		                            (int32_t)g_ei.region_get_width(reg), (int32_t)g_ei.region_get_height(reg)};
+	}
+	c->nmon = n;
+	return n > 0 ? U_DESKTOP_OK : U_DESKTOP_ERR_FAILED;
+}
+
+enum u_desktop_result
+gnome_portal_monitors(struct gnome_portal *p, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg)
+{
+	*count = 0;
+	struct gp_cmd *c = gp_cmd_new(cmd_monitors);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	struct gp_cmd copy;
+	enum u_desktop_result r = gp_run_sync_keep(p, c, ACTION_TIMEOUT_MS, msg, &copy);
+	if (r == U_DESKTOP_OK) {
+		uint32_t n = copy.nmon < cap ? copy.nmon : cap;
+		memcpy(out, copy.mon, n * sizeof(*out));
+		*count = n;
+	}
+	return r;
 }
 
 enum u_desktop_result

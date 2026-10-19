@@ -245,6 +245,11 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		struct u_desktop_chord c = {0};
 		c.mods = (uint32_t)strtoul(argv[2], NULL, 0);
 		snprintf(c.key, sizeof(c.key), "%s", argv[3]);
+		for (char *k = c.key; *k; k++) {
+			if (*k >= 'A' && *k <= 'Z') {
+				*k = (char)(*k - 'A' + 'a'); // canonical, as u_desktop_chord_parse makes it
+			}
+		}
 		if (b->prepare_input) {
 			b->prepare_input(b, msg);
 		}
