@@ -150,7 +150,11 @@ static const XrRect2Di kRectB = {{700, 400}, {400, 200}};
 // v4 overlay: an opaque magenta bar in a gap that overlaps neither rect.
 static const XrRect2Di kOverlayBar = {{200, 30}, {800, 40}};
 // A fake on-screen origin for the bound window (fed to the DP phase slot).
-static const XrOffset2Di kWinOrigin = {64, 48};
+static XrOffset2Di kWinOrigin = {64, 48}; // --bind-origin=X,Y overrides it
+// --bind-logical=LX,LY,SCALE: chain an XrWeaveWindowLogicalOriginDXR (v12) on the first bind.
+static bool g_bind_logical = false;
+static XrOffset2Di g_bind_logical_origin = {0, 0};
+static float g_bind_logical_scale = 0.0f;
 
 static const VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
 static const VkImageUsageFlags kUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2043,9 +2047,19 @@ main(int argc, char **argv)
 			do_lift = true;
 		} else if (strncmp(argv[i], "--service-log=", 14) == 0) {
 			lift_log = argv[i] + 14;
+		} else if (strncmp(argv[i], "--bind-origin=", 14) == 0 &&
+		           sscanf(argv[i] + 14, "%d,%d", &kWinOrigin.x, &kWinOrigin.y) == 2) {
+			// The bound windowOriginOnScreen (weave geometry frame: device px,
+			// the window's monitor's logical origin x its scale) — for checking
+			// the service's logged panel-relative present origin on a real layout.
+		} else if (strncmp(argv[i], "--bind-logical=", 15) == 0 &&
+		           sscanf(argv[i] + 15, "%d,%d,%f", &g_bind_logical_origin.x, &g_bind_logical_origin.y,
+		                  &g_bind_logical_scale) == 3) {
+			g_bind_logical = true;
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
-			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]]",
+			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]] [--bind-origin=X,Y] "
+			    "[--bind-logical=LX,LY,SCALE]",
 			    argv[0]);
 			return 2;
 		}
@@ -2309,11 +2323,18 @@ main(int argc, char **argv)
 	geom.windowOriginOnScreen = kWinOrigin;
 	geom.clientSize = {(int32_t)kWinW, (int32_t)kWinH};
 	geom.displayId = -1;
+	XrWeaveWindowLogicalOriginDXR logical = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR};
+	logical.logicalOrigin = g_bind_logical_origin;
+	logical.scale = g_bind_logical_scale;
+	if (g_bind_logical) {
+		geom.next = &logical;
+	}
 	XrWeaveBindWindowInfoDXR bind = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
 	bind.next = &geom;
 	bind.windowHandle = (void *)(uintptr_t)0x1;
 	XR_CHECK(pfn_bind2(session, &bind));
-	LOG("bound fake window 0x1 at (%d,%d) %ux%u", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH);
+	LOG("bound fake window 0x1 at (%d,%d) %ux%u%s", kWinOrigin.x, kWinOrigin.y, kWinW, kWinH,
+	    g_bind_logical ? " (+ v12 logical origin)" : "");
 
 	if (flat_regions) {
 		PFN_xrWeaveSetScreenFlatRegionsDXR pfn_set_flat = nullptr;

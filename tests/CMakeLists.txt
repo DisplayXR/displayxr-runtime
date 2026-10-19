@@ -85,6 +85,7 @@ set(tests
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
     tests_aux_weave_span2d
+    tests_aux_weave_present_origin
     tests_aux_weave_flat
     tests_aux_display_mode_hold
     tests_aux_tracking_any
