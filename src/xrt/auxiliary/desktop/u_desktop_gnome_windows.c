@@ -112,11 +112,16 @@ visible_point(struct gnome_backend *g,
 	if (f->w <= 8 || f->h <= 8) {
 		return false;
 	}
-	// The title-bar area first (a click there does nothing in the app), then a grid.
-	int32_t cand[1 + 25][2];
+	// The title-bar area first (a click there does nothing in the app), then the centre, then
+	// a grid. The centre early: a transparent, click-through window (a DisplayXR avatar
+	// overlay) is clickable only where it draws, and that is mostly in the middle.
+	int32_t cand[2 + 25][2];
 	int nc = 0;
 	cand[nc][0] = f->x + f->w / 2;
 	cand[nc][1] = f->y + (f->h / 4 < 16 ? f->h / 4 : 16);
+	nc++;
+	cand[nc][0] = f->x + f->w / 2;
+	cand[nc][1] = f->y + f->h / 2;
 	nc++;
 	for (int j = 0; j < 5; j++) {
 		for (int i = 0; i < 5; i++) {
@@ -126,7 +131,7 @@ visible_point(struct gnome_backend *g,
 		}
 	}
 	// Uncovered (by the frames above) first; the pick is the judge either way.
-	int order[1 + 25], no = 0;
+	int order[2 + 25], no = 0;
 	for (int pass = 0; pass < 2; pass++) {
 		for (int c = 0; c < nc; c++) {
 			bool covered = false;
@@ -139,8 +144,9 @@ visible_point(struct gnome_backend *g,
 			}
 		}
 	}
-	int probes = 0;
-	for (int o = 0; o < no && probes < 10; o++) {
+	// Every candidate may be probed (one GetWindowAt each): on a click-through window most of
+	// them land on the window behind, so a short budget gave up before reaching its content.
+	for (int o = 0; o < no; o++) {
 		int32_t x = cand[order[o]][0], y = cand[order[o]][1];
 		if (!rect_has(f, x, y, 4)) {
 			continue;
@@ -148,7 +154,6 @@ visible_point(struct gnome_backend *g,
 		if (drag && !inside_screen(g, x + dx, y + dy, 12)) {
 			continue;
 		}
-		probes++;
 		struct u_desktop_pick p;
 		if (gnome_pick_msg(g, x, y, &p, NULL) == U_DESKTOP_OK && p.kind == U_DESKTOP_PICK_WINDOW &&
 		    p.window.id == ws[idx].id) {
@@ -503,6 +508,11 @@ own_activate(struct gnome_backend *g, const struct u_desktop_input_guard *guard,
 	bool raised = false;
 	if (gnome_window_above(g, id) == 0) {
 		raised = placement_call(g, "SetKeepAbove", true, true, NULL) == U_DESKTOP_OK;
+		if (raised) {
+			// The pick can lag the restack until the output repaints: on a 3D panel at
+			// 23.976 Hz the covered case failed twice with no wait, at 60 Hz it passed.
+			gdbus_sleep_ms(GRAB_SETTLE_MS);
+		}
 	}
 	r = activate_other(g, guard, id, msg);
 	if (raised) {
