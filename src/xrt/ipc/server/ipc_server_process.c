@@ -33,6 +33,7 @@
 #include "util/u_setting.h"
 #include "util/u_exe_basename.h"
 
+#include "shared/ipc_app_group.h" // input focus follows the application
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
@@ -42,7 +43,6 @@
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h" // #962: focused-slot authority
-#include "shared/ipc_app_group.h"              // input focus follows the application
 #include "xrt/xrt_display_processor_d3d11.h"  // XRT_DP_BACKEND_STATE_* for the [HEALTH] dp= word
 #else
 #include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
