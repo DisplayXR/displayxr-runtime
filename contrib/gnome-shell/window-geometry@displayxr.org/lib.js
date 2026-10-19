@@ -1086,11 +1086,21 @@
          * on screen anyway restores it with SetMinimized(false) first, which
          * never takes focus.
          *
-         * "Input" is mutter's per-window user time (Meta.Window.get_user_time):
-         * mutter stamps it on every key press, button press and touch on a
-         * window (core/events.c), before shortcuts are handled, and a new
-         * window starts at its creation time. Input injected through the
-         * RemoteDesktop portal counts like the user's own.
+         * "Input" is mutter's per-window user time: mutter stamps it on every
+         * key press, button press and touch on a window (core/events.c), before
+         * shortcuts are handled, and on every activation. For the APP only
+         * those stamps count (notify::user-time); a new window's starting
+         * value (its creation time, not a stamp) does not, so recreating a
+         * window or opening a new one earns no focus. For everyone else
+         * (lastInput) the starting value counts too, so another app's window
+         * that just came up wins, as does mutter's own newest input
+         * (Meta.Display.get_last_user_time), which a closed window cannot take
+         * back. Input injected through the RemoteDesktop portal counts like
+         * the user's own.
+         *
+         * Not covered: an app summoned by a global shortcut while the user is
+         * in another app. mutter stamps the press on the focused window, so
+         * the app is refused and flagged.
          */
 
         //! mutter's 32-bit event times wrap; @p a is before @p b the way
@@ -1105,8 +1115,25 @@
             return ((b - a) >>> 0) < 0x80000000;
         },
 
-        //! The newest of @p times (0 when there is none).
-        latestTime(times) {
+        //! The newest of @p times (0 when there is none). With @p now, by age
+        //! (now - t, mod 2^32): a time 2^31 ms (24.8 days) or more away from
+        //! now is dropped — the 32-bit order is not transitive across that
+        //! distance, so an untouched old window could otherwise read as newer
+        //! than everything. If that drops every time (a clock that does not
+        //! match), the plain order decides.
+        latestTime(times, now = 0) {
+            if (now) {
+                let best = 0, bestAge = 0x80000000;
+                for (const x of times) {
+                    const age = (now - x) >>> 0;
+                    if (x !== 0 && age < bestAge) {
+                        best = x;
+                        bestAge = age;
+                    }
+                }
+                if (best !== 0)
+                    return best;
+            }
             let t = 0;
             for (const x of times) {
                 if (OwnWindow.timeBefore(t, x))
@@ -1135,10 +1162,11 @@
         },
 
         //! Whether app @p pid may take focus: @p appInput, its newest input,
-        //! is not older than @p lastInput, everyone's newest, and is newer
-        //! than the moment the user last left it.
-        mayTakeFocus(st, pid, appInput, lastInput) {
-            if (OwnWindow.timeBefore(appInput, lastInput))
+        //! is not older than @p lastInput, every other app's newest — or no
+        //! window has focus (@p nobodyFocused: nothing to take it from) — and
+        //! the user has not left the app since its last input.
+        mayTakeFocus(st, pid, appInput, lastInput, nobodyFocused = false) {
+            if (!nobodyFocused && OwnWindow.timeBefore(appInput, lastInput))
                 return false;
             const away = st.away.get(pid);
             return away === undefined || OwnWindow.timeBefore(away, appInput);
@@ -2667,10 +2695,19 @@
                 this._above = OwnWindow.newTracker();
                 this._aboveWatch = new Map();
                 //! Version 17: ActivateWindow's focus policy (OwnWindow.mayTakeFocus).
+                //! _stamps: pid -> the newest time mutter stamped on its windows
+                //! (input, activation; not a window's starting value).
                 this._focus = OwnWindow.newFocusState();
+                this._stamps = new Map();
+                this._stampSignals = new Map();
                 this._focusWin = global.display.focus_window;
                 this._focusId = global.display.connect('notify::focus-window',
                     () => this._onFocusWindow());
+                this._createdId = global.display.connect('window-created',
+                    (_d, win) => this._watchStamps(win));
+                // Windows from before: no stamp until their next input.
+                for (const win of this._allWindows())
+                    this._watchStamps(win);
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
@@ -2942,6 +2979,15 @@
                     global.display.disconnect(this._focusId);
                     this._focusId = 0;
                 }
+                if (this._createdId) {
+                    global.display.disconnect(this._createdId);
+                    this._createdId = 0;
+                }
+                for (const [win, ids] of this._stampSignals) {
+                    for (const id of ids)
+                        win.disconnect(id);
+                }
+                this._stampSignals.clear();
                 this._focusWin = null;
                 this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
@@ -3042,19 +3088,53 @@
                 });
             }
 
-            //! The newest input time (Meta.Window.get_user_time) of the windows
-            //! of @p pid, or of every window when @p pid is 0.
-            _latestInput(pid) {
-                const wins = typeof global.display.list_all_windows === 'function'
+            _allWindows() {
+                return (typeof global.display.list_all_windows === 'function'
                     ? global.display.list_all_windows()
-                    : global.get_window_actors().map(a => a.meta_window);
-                const times = [];
-                for (const win of wins) {
-                    if (!win || win.is_override_redirect() || (pid > 0 && win.get_pid() !== pid))
-                        continue;
-                    times.push(win.get_user_time());
-                }
-                return OwnWindow.latestTime(times);
+                    : global.get_window_actors().map(a => a.meta_window)).filter(w => !!w);
+            }
+
+            //! Follow the times mutter stamps on @p win (notify::user-time is
+            //! emitted only by meta_window_set_user_time: input, activation).
+            _watchStamps(win) {
+                if (this._stampSignals.has(win) || win.is_override_redirect())
+                    return;
+                this._stampSignals.set(win, [
+                    win.connect('notify::user-time', () => {
+                        const pid = win.get_pid();
+                        if (pid > 0) {
+                            this._stamps.set(pid, OwnWindow.latestTime(
+                                [this._stamps.get(pid) ?? 0, win.get_user_time()]));
+                        }
+                    }),
+                    win.connect('unmanaged', () => {
+                        const pid = win.get_pid();
+                        for (const id of this._stampSignals.get(win) ?? [])
+                            win.disconnect(id);
+                        this._stampSignals.delete(win);
+                        // The app's last window is gone: forget it (a new process
+                        // may get the same pid).
+                        if (pid > 0 && !this._allWindows().some(w => w !== win && w.get_pid() === pid)) {
+                            this._stamps.delete(pid);
+                            this._focus.away.delete(pid);
+                        }
+                    }),
+                ]);
+            }
+
+            //! The newest input time of everyone: mutter's own high-water mark
+            //! and the user time of every window not of @p exceptPid, including
+            //! a new window's starting value (another app's window that just
+            //! came up wins; the app's own starting values are neither its input
+            //! nor anyone else's).
+            _lastInput(exceptPid = 0) {
+                const now = global.display.get_current_time_roundtrip();
+                const times = this._allWindows()
+                    .filter(w => !w.is_override_redirect() && (exceptPid <= 0 || w.get_pid() !== exceptPid))
+                    .map(w => w.get_user_time());
+                if (typeof global.display.get_last_user_time === 'function')
+                    times.push(global.display.get_last_user_time());
+                return OwnWindow.latestTime(times, now);
             }
 
             _onFocusWindow() {
@@ -3064,12 +3144,15 @@
                 try {
                     // A window that just closed may already be gone.
                     fromPid = from ? from.get_pid() : 0;
-                    selfMinimized = !!from && from.minimized && this._focus.selfMinimized.has(from);
+                    // The app's dialog had focus while the app minimized its
+                    // main window: judge by the window it belongs to.
+                    const root = from?.find_root_ancestor?.() ?? from;
+                    selfMinimized = !!root && root.minimized && this._focus.selfMinimized.has(root);
                 } catch (e) {
                     fromPid = 0;
                 }
                 toPid = to ? to.get_pid() : 0;
-                OwnWindow.focusMoved(this._focus, fromPid, toPid, this._latestInput(0), selfMinimized);
+                OwnWindow.focusMoved(this._focus, fromPid, toPid, this._lastInput(), selfMinimized);
             }
 
             ActivateWindowAsync([pid], invocation) {
@@ -3080,7 +3163,8 @@
                     // the background; ok = false (no focus).
                     const app = win.get_pid();
                     if (!win.has_focus() && !OwnWindow.mayTakeFocus(this._focus, app,
-                        this._latestInput(app), this._latestInput(0))) {
+                        this._stamps.get(app) ?? 0, this._lastInput(app),
+                        global.display.focus_window === null)) {
                         win.set_demands_attention();
                         return false;
                     }

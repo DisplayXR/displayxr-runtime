@@ -1507,17 +1507,30 @@ app itself:
   flagged, mutter's rule). A minimized window stays minimized. `ok` is `false`.
   This is what GNOME does for any app that asks from the background.
 
-"Input" is mutter's per-window user time (`Meta.Window.get_user_time()`): mutter
-stamps it on every key press, button press and touch on a window, before shortcuts
-are handled (`core/events.c`), and a new window starts at its creation time. So:
+"Input" is mutter's per-window user time: mutter stamps it on every key press,
+button press and touch on a window, before shortcuts are handled (`core/events.c`),
+and on every activation.
+
+- For the **app**, only those stamps count (`notify::user-time`, which only
+  `meta_window_set_user_time` emits). A new window's starting value — its creation
+  time, not a stamp — does not: recreating a window or opening a new one earns no
+  focus.
+- For **every other app** the starting value counts too (another app's window that
+  just came up wins; a dialog starts at its parent's time), and so does mutter's own
+  newest input (`Meta.Display.get_last_user_time()`), which a window that closes
+  cannot take back. A time 2^31 ms (24.8 days) or more from now is ignored: the
+  32-bit order does not hold across that distance.
+
+So:
 
 | what the user did last | ActivateWindow |
 |---|---|
 | typed or clicked in another app | no focus |
 | another app's window came up (no input) | no focus |
 | clicked the app, then Alt+Tab / Super+H / minimized it from the dock / clicked elsewhere | no focus ("left it") |
-| clicked or typed in the app, and the app minimized **itself** (SetMinimized) | focus (the app stepped aside; the user did not leave) |
+| clicked or typed in the app, and the app minimized **itself** through `SetMinimized` (also while its dialog had focus) | focus (the app stepped aside; the user did not leave) |
 | clicked or typed in the app, nothing since | focus |
+| no window has focus (and the user has not left the app) | focus (nothing to take it from) |
 | came back to the app (new input in it) after leaving | focus |
 
 It is mutter's own focus-stealing rule, applied with the time of the app's last
@@ -1525,7 +1538,15 @@ input instead of "now". It also limits the rate by itself: once the user is
 elsewhere, nothing the app does takes focus until the user comes back to it, so no
 separate rate limit is needed. Input injected through the RemoteDesktop portal
 counts like the user's own. An app that wants its window back on screen anyway
-restores it with `SetMinimized(false)`, which never takes focus.
+restores it with `SetMinimized(false)`, which never takes focus. A minimize the app
+does any other way (`xdg_toplevel.set_minimized`, a minimize button in its own
+title bar) counts as the user leaving.
+
+**Not covered: a global shortcut that summons the app.** mutter stamps the press on
+the window that has focus (another app's), before the shortcut runs, so an app that
+calls `ActivateWindow` in response is refused and flagged. No current caller does
+this; letting the extension's own `WorkspaceHotkey1` client through for its press
+(the extension knows both) would be the natural follow-up if one does.
 
 Consumers:
 
@@ -1533,9 +1554,12 @@ Consumers:
   "window activate: refused" for a `false`; nothing is retried (as before).
 - `XR_DXR_desktop_control` (ADR-056), the app's own window: when `ActivateWindow`
   refuses, the agent does what the user would, a Super+click on the window through
-  the app's portal session (restored first if minimized), as it already does for any
-  other window. The agent has the user's consent, and its safety layer (idle wait,
-  kill switch, lock) applies to the gesture.
+  the app's portal session, as it already does for any other window: restored first
+  if minimized, and kept above for the click if it is not already (put back
+  afterwards), so a window covered by another one is reachable. A window on another
+  workspace is not (no visible part to click). `RESTORE` succeeds once the window is
+  restored; focus is best effort. The agent has the user's consent, and its safety
+  layer (idle wait, kill switch, lock) applies to the gesture.
 
 The pure part is `OwnWindow.mayTakeFocus` / `focusMoved` in `lib.js`, unit-tested by
 `scripts/test_gnome_extension_own_window.js` (section 6).

@@ -400,6 +400,31 @@ gnome_snapshot(struct gnome_backend *g, struct u_desktop_window **out, uint32_t 
 	return U_DESKTOP_OK;
 }
 
+int
+gnome_window_above(struct gnome_backend *g, uint64_t id)
+{
+	if (!g->have_ext16) {
+		return -1;
+	}
+	cJSON *root = ext_json(g, "GetAllWindows", false, 0, 0, NULL);
+	if (root == NULL) {
+		return -1;
+	}
+	int above = -1;
+	const cJSON *arr = u_json_get(root, "windows");
+	int total = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+	for (int i = 0; i < total; i++) {
+		const cJSON *w = cJSON_GetArrayItem(arr, i);
+		if (w != NULL && json_u64(u_json_get(w, "id")) == id) {
+			const cJSON *a = u_json_get(w, "above");
+			above = a == NULL ? -1 : json_bool(a) ? 1 : 0;
+			break;
+		}
+	}
+	cJSON_Delete(root);
+	return above;
+}
+
 const struct u_desktop_window *
 gnome_find_window(const struct u_desktop_window *ws, uint32_t n, uint64_t id)
 {

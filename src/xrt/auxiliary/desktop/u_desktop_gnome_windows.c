@@ -266,6 +266,9 @@ restore_pointer(struct gnome_backend *g, bool have, int32_t x, int32_t y)
 	}
 }
 
+//! GNOME's unminimize animation is 250 ms; the pick needs the window settled on screen.
+#define OWN_RESTORE_SETTLE_MS 400
+
 //! Super+click on a visible point of @p id, then wait for focus.
 static enum u_desktop_result
 activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, char *msg)
@@ -459,8 +462,8 @@ placement_call(struct gnome_backend *g, const char *method, bool with_bool, bool
 	if (!ok) {
 		if (strcmp(method, "ActivateWindow") == 0) {
 			gnome_set_msg(msg,
-			              "the GNOME extension did not give the window focus (another app has the user's "
-			              "latest input, a move / pointer drag is in progress, or the screen is locked)");
+			              "the GNOME extension did not give the window focus (extension 17+: another app "
+			              "has the user's latest input; or a move / pointer drag, or the screen is locked)");
 		} else {
 			gnome_set_msg(
 			    msg, "the GNOME extension refused %s (a move / pointer drag in progress, or the screen is locked)",
@@ -476,7 +479,10 @@ placement_call(struct gnome_backend *g, const char *method, bool with_bool, bool
  * had the user's latest input (ActivateWindow's focus policy), so after the agent has typed
  * into another app it refuses and only flags the window. The agent acts with the user's
  * consent: it then does what the user would, a Super+click on the window, as for any other
- * window (restored first if @p minimized — SetMinimized never takes focus).
+ * window — restored first if @p minimized (SetMinimized never takes focus), and kept above
+ * for the click if it is not already, so a window covered by another one can be clicked
+ * (put back afterwards; never a keep-above the app or the user set). A window on another
+ * workspace still has no visible part to click.
  */
 static enum u_desktop_result
 own_activate(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, bool minimized, char *msg)
@@ -490,10 +496,19 @@ own_activate(struct gnome_backend *g, const struct u_desktop_input_guard *guard,
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
-		// Let the restored window map before the gesture looks for a visible part of it.
-		gdbus_sleep_ms(GRAB_SETTLE_MS);
+		// Let the restored window map and GNOME's unminimize animation end before the
+		// gesture looks for a visible part of it.
+		gdbus_sleep_ms(OWN_RESTORE_SETTLE_MS);
 	}
-	return activate_other(g, guard, id, msg);
+	bool raised = false;
+	if (gnome_window_above(g, id) == 0) {
+		raised = placement_call(g, "SetKeepAbove", true, true, NULL) == U_DESKTOP_OK;
+	}
+	r = activate_other(g, guard, id, msg);
+	if (raised) {
+		placement_call(g, "SetKeepAbove", true, false, NULL);
+	}
+	return r;
 }
 
 static enum u_desktop_result
@@ -557,7 +572,13 @@ gnome_window_op(struct u_desktop_backend *b,
 		case U_DESKTOP_OP_MINIMIZE: return placement_call(g, "SetMinimized", true, true, msg);
 		case U_DESKTOP_OP_RESTORE:
 			r = placement_call(g, "SetMinimized", true, false, msg);
-			return r == U_DESKTOP_OK ? own_activate(g, guard, window_id, false, msg) : r;
+			if (r != U_DESKTOP_OK) {
+				return r;
+			}
+			// Restored. Focus is best effort (extension 17+ may keep it with the app the
+			// user is in); an action that needs focus checks it before typing anyway.
+			own_activate(g, guard, window_id, false, NULL);
+			return U_DESKTOP_OK;
 		case U_DESKTOP_OP_MAXIMIZE:
 			gnome_set_msg(msg, "maximizing the app's own window would fight DisplayXR's window placement");
 			return U_DESKTOP_ERR_UNSUPPORTED;

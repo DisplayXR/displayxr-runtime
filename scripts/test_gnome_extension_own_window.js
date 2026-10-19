@@ -202,6 +202,14 @@ print('6. ActivateWindow focus policy (version 17)');
     check(OW.timeBefore(0, 1) && OW.timeBefore(0, 0xf0000000) && !OW.timeBefore(1, 0), '0 = never set: before any time');
     check(OW.latestTime([]) === 0 && OW.latestTime([5, 900, 30]) === 900, 'latest of several');
     check(OW.latestTime([0xfffffff0, 0x10, 0xffffff00]) === 0x10, 'latest across the wrap');
+    // 25 days awake: a window untouched since boot is 2^31 ms or more behind and must not
+    // read as the newest (the plain order would say it is, against a time 2^31+ ahead).
+    const now = 0x90000000;
+    check(OW.latestTime([5, 0x8ff00000, 0x8fff0000], now) === 0x8fff0000, 'with now: newest by age');
+    check(OW.latestTime([0x10000000, 0x8fff0000], now) === 0x8fff0000 &&
+        OW.latestTime([0x8fff0000, 0x10000000], now) === 0x8fff0000, 'with now: an ancient time is dropped, any order');
+    check(OW.latestTime([0, 0], now) === 0, 'with now: nothing set -> 0');
+    check(OW.latestTime([0x20, 0x30], 0x10) === 0x30, 'with now: every time dropped -> the plain order');
 
     const APP = 100, ED = 200;
     // The user typed in the editor after the app's last input: refused.
@@ -211,6 +219,8 @@ print('6. ActivateWindow focus policy (version 17)');
     check(OW.mayTakeFocus(st, APP, 1500, 1500), 'the app had the latest input: focus');
     // No input anywhere yet: nothing to take it from.
     check(OW.mayTakeFocus(st, APP, 0, 0), 'no input anywhere: focus');
+    // No window has focus (the app minimized itself, nothing else open): nothing to take.
+    check(OW.mayTakeFocus(st, APP, 0, 1500, true), 'no window has focus: focus');
 
     // Alt+Tab away: the keys were the app's input, then focus left it.
     OW.focusMoved(st, APP, ED, 1500, false);
@@ -244,6 +254,7 @@ print('6. ActivateWindow focus policy (version 17)');
     st = OW.newFocusState();
     OW.focusMoved(st, APP, 0, 1800, false);
     check(!OW.mayTakeFocus(st, APP, 1800, 1800), 'focus to no window: left');
+    check(!OW.mayTakeFocus(st, APP, 1800, 1800, true), 'left, then nothing has focus: still no focus');
     // Focus between two windows of the same app is not leaving it.
     st = OW.newFocusState();
     OW.focusMoved(st, APP, APP, 1800, false);

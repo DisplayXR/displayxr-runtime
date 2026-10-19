@@ -332,11 +332,14 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
 - Version 17, `WindowPlacement1`: **`ActivateWindow`'s focus policy.** It takes
   focus only when the user's latest key press or click went to the app and the
   user has not left it since (Alt+Tab, Super+H, the dock, a click elsewhere);
-  the app minimizing itself does not count as the user leaving. Otherwise the
+  the app minimizing itself through `SetMinimized` does not count as the user
+  leaving, and a newly created window of the app earns nothing. Otherwise the
   window is only flagged as demanding attention (GNOME shows "… is ready"),
   stays minimized if it was, and the reply is `false` — what GNOME does for any
   app that asks from the background. Version 15 took focus even while the user
-  typed in another app. Same method, no new capability bit. See the spec, §11.6.
+  typed in another app. Not covered: an app summoned by a global shortcut while
+  the user is in another app (the press is stamped on that app's window). Same
+  method, no new capability bit. See the spec, §11.6.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then

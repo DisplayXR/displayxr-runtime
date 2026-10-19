@@ -279,6 +279,11 @@ gnome_snapshot(struct gnome_backend *g, struct u_desktop_window **out, uint32_t 
 const struct u_desktop_window *
 gnome_find_window(const struct u_desktop_window *ws, uint32_t n, uint64_t id);
 
+//! Whether window @p id is kept above (the extension's "above", v15+): 1 yes, 0 no,
+//! -1 unknown (no extension 16, the window is gone, the call failed).
+int
+gnome_window_above(struct gnome_backend *g, uint64_t id);
+
 enum u_desktop_result
 gnome_pick_msg(struct gnome_backend *g, int32_t x, int32_t y, struct u_desktop_pick *out, char *msg);
 
