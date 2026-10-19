@@ -6269,6 +6269,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			                                       (void *)opengl_win32->hDC,
 			                                       shared_texture_handle,
 			                                       xsi->transparent_background_enabled,
+			                                       xsi->bound_display_id,
 			                                       *out_session);
 		}
 #endif
@@ -6306,7 +6307,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 					shared_iosurface = (void *)cocoa_binding->sharedIOSurface;
 				}
 			}
-			XrResult ret = oxr_session_populate_gl_macos(log, sys, opengl_macos, window_handle, shared_iosurface, xsi->transparent_background_enabled, *out_session);
+			XrResult ret = oxr_session_populate_gl_macos(log, sys, opengl_macos, window_handle, shared_iosurface, xsi->transparent_background_enabled, xsi->bound_display_id, *out_session);
 			if (ret == XR_SUCCESS && window_handle != NULL) {
 				(*out_session)->has_external_window = true;
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
@@ -6476,7 +6477,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			return oxr_session_populate_vk_native(
 			    log, sys, vulkan, window_handle, window_is_wayland, shared_texture_handle,
-			    xsi->transparent_background_enabled, *out_session);
+			    xsi->transparent_background_enabled, xsi->bound_display_id, *out_session);
 		}
 #endif
 
@@ -6586,6 +6587,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle,
 			                                          xsi->shared_texture_handle,
 			                                          xsi->transparent_background_enabled,
+			                                          xsi->bound_display_id,
 			                                          *out_session);
 		}
 #else
@@ -6634,6 +6636,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_d3d12_native(log, sys, d3d12, xsi->external_window_handle,
 			                                         xsi->shared_texture_handle,
 			                                         xsi->transparent_background_enabled,
+			                                         xsi->bound_display_id,
 			                                         *out_session);
 		}
 #else
@@ -6695,7 +6698,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 
 			XrResult mret = oxr_session_populate_metal_native(
 			    log, sys, metal, xsi->external_window_handle, offscreen, xsi->shared_texture_handle,
-			    xsi->transparent_background_enabled, *out_session);
+			    xsi->transparent_background_enabled, xsi->bound_display_id, *out_session);
 			if (mret != XR_SUCCESS) {
 				return mret;
 			}
@@ -7125,6 +7128,11 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_display_info
+	// #2218: the in-process compositor creates its display processor from the bound display.
+	xsi.bound_display_id = bound_display_id;
+#endif
+
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
 	if (ret != XR_SUCCESS) {
@@ -7224,8 +7232,9 @@ oxr_session_create(struct oxr_logger *log,
 		const bool is_default = (bound_display.flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0;
 		// Bound to the system default = today's behaviour exactly. Bound
 		// elsewhere: that display's size and nominal viewer drive the
-		// session's display-scoped Kooima (M1); the DP that weaves is
-		// unchanged until multi-display segmentation (M2/M3).
+		// session's display-scoped Kooima (M1); an in-process compositor weaves
+		// with that display's plug-in (#2218); over IPC the service's own DP still
+		// does, and per-view display bindings are M3.
 		sess->bound_display_overrides =
 		    !is_default && bound_display.info.width_m > 0.0f && bound_display.info.height_m > 0.0f;
 		sess->bound_display_info = bound_display.info;
@@ -7237,8 +7246,9 @@ oxr_session_create(struct oxr_logger *log,
 		    bound_display.info.width_m, bound_display.info.height_m, bound_display.info.nominal_viewer_z_m,
 		    is_default ? " — the system default display, nothing changes"
 		    : sess->bound_display_overrides
-		        ? " — its size + nominal viewer back this session's display-scoped Kooima; weaving still "
-		          "follows the system default display (multi-screen M1)"
+		        ? " — its size + nominal viewer back this session's display-scoped Kooima; an in-process "
+		          "session weaves with this display's plug-in (#2218), over IPC the service still weaves "
+		          "with its own display processor"
 		        : " — its physical size is unknown, so the session keeps the system default display's "
 		          "Kooima inputs");
 	}

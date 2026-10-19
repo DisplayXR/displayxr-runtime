@@ -1063,6 +1063,14 @@ struct xrt_session_info
 	bool is_overlay;
 	//! alignas for 32 bit client support, see @ref ipc-design
 	XRT_ALIGNAS(8) uint64_t flags;
+	/*!
+	 * XR_DXR_display_info `XrSessionDisplayBindingDXR::displayId` (0 = not bound): the
+	 * display the app pinned the session to. An in-process compositor creates its
+	 * display processor from THAT monitor's registry entry (#2218), so a session bound
+	 * to another vendor's screen is woven by that vendor; over IPC the service still
+	 * weaves it with its own processor.
+	 */
+	XRT_ALIGNAS(8) uint64_t bound_display_id;
 	uint32_t z_order;
 
 	//! External window handle for session target extension (HWND on Windows)
