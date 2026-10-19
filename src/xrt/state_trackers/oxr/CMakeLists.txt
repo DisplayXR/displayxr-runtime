@@ -41,6 +41,8 @@ add_library(
 	oxr_local_3d_zone.c
 	oxr_logger.c
 	oxr_logger.h
+	oxr_mcp_app_result.c
+	oxr_mcp_app_result.h
 	oxr_mcp_app_tools.c
 	oxr_mcp_tools.c
 	oxr_mcp_tools.h

@@ -203,7 +203,10 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsDXR)(
  * @brief Answer a pending tool call.
  *
  * @param success     XR_TRUE → @p resultJson becomes the tool result;
- *                    XR_FALSE → the agent receives a tool error.
+ *                    XR_FALSE → the agent receives a tool error carrying
+ *                    @p resultJson (e.g. `{"error":"unknown behavior"}`)
+ *                    with `"isError":true` added — an MCP result with
+ *                    `isError` set, not a JSON-RPC error.
  * @param resultJson  NUL-terminated JSON value (object recommended).
  *                    NULL/empty is treated as `{}`. Copied.
  * @return XR_SUCCESS (also for late results on an expired callId —

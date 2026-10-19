@@ -95,6 +95,7 @@ set(tests
     tests_comp_overlay_2d_vk
     tests_dp_vk_weave_sync
     tests_oxr_weave_latch
+    tests_oxr_mcp_app_result
     tests_oxr_layer_space
     tests_oxr_view_config_rule
     tests_oxr_segment_views
@@ -982,6 +983,15 @@ target_link_libraries(tests_input_arbiter_per_client PRIVATE xrt-interfaces aux_
 # else.
 target_include_directories(
 	tests_oxr_weave_latch PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# XR_DXR_mcp_tools result shaping (an XR_FALSE submit keeps the app's message as
+# an isError result). Pure cJSON -- compiled straight in; aux_util brings cJSON.
+target_sources(
+	tests_oxr_mcp_app_result PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_mcp_app_result.c
+	)
+target_include_directories(
+	tests_oxr_mcp_app_result PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # #1486 — the two xrEndFrame projection-layer viewCount rules (tight
