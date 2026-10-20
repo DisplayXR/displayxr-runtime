@@ -69,6 +69,15 @@ bool
 ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len);
 
 /*!
+ * The parent process id of @p pid, or 0 when it cannot be derived (unknown
+ * platform, the process is gone, or we may not open it). Best-effort, read
+ * once at describe_client: it feeds the "same application, several
+ * connections" input-focus rule (ipc_app_group.h), never a privilege gate.
+ */
+long
+ipc_server_peer_parent_pid(long pid);
+
+/*!
  * browser#103 RC-1: **the enforcement point for the IL-monotonicity rule.**
  *
  * May the process that OPENED this connection hand it over to @p declared_pid?

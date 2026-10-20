@@ -33,6 +33,7 @@
 #include "util/u_setting.h"
 #include "util/u_exe_basename.h"
 
+#include "shared/ipc_app_group.h" // input focus follows the application
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
@@ -744,6 +745,7 @@ fill_health_locked(struct ipc_server *s, struct ipc_service_health *out)
 		h->session_active = cs->session_active;
 		h->session_visible = cs->session_visible;
 		h->session_focused = cs->session_focused;
+		h->input_focus_shared = ics->input_focus_shared;
 		h->io_active = ics->io_active;
 		h->primary_application = cs->primary_application;
 		h->swapchain_count = ics->swapchain_count;
@@ -813,7 +815,8 @@ emit_health_if_elapsed(struct ipc_server *s)
 		    "[HEALTH] slot=%u id=%u pid=%d class=%s name='%s' session=%c%c%c io=%c primary=%c%s "
 		    "swapchains=%u spaces=%u",
 		    sl->slot, sl->id, (int)sl->pid, kind, name, sl->session_active ? 'a' : '-',
-		    sl->session_visible ? 'v' : '-', sl->session_focused ? 'f' : '-', sl->io_active ? 'y' : 'n',
+		    sl->session_visible ? 'v' : '-', sl->session_focused ? 'f' : (sl->input_focus_shared ? 's' : '-'),
+		    sl->io_active ? 'y' : 'n',
 		    sl->primary_application ? 'y' : 'n', ((int32_t)sl->slot == h.active_idx) ? " ACTIVE" : "",
 		    sl->swapchain_count, sl->space_count);
 	}
@@ -1427,6 +1430,37 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	ics->client_state.session_visible = visible;
 	ics->client_state.session_focused = focused;
 	ics->client_state.z_order = z_order;
+
+	/*
+	 * Input focus follows the APPLICATION, not the connection (#962 follow-up,
+	 * ipc_app_group.h). A connection that is not the focused one but belongs
+	 * to the focused client's application — same declared name, same process
+	 * tree — gets its device reads (actions, hand tracking) while the sibling
+	 * is focused. The browser presents from its GPU process and owns the hand
+	 * trackers from the browser process; without this the trackers' session
+	 * was VISIBLE, never FOCUSED, and every joint set came back inactive.
+	 * ONLY input is shared: the session state the sibling sees, the presenter
+	 * and the workspace's focused slot are untouched.
+	 */
+	bool shared = false;
+	if (!focused && active_id >= 0 && active_id < (int)IPC_MAX_CLIENTS && ics->server_thread_index != active_id &&
+	    ics->class_verified) {
+		volatile struct ipc_client_state *act = &ics->server->threads[active_id].ics;
+		if (act->server_thread_index >= 0 && act->class_verified) {
+			shared = ipc_app_group_same((const char *)ics->client_state.info.application_name,
+			                            (const char *)ics->peer_exe_path, ics->peer_pid, ics->peer_parent_pid,
+			                            (const char *)act->client_state.info.application_name,
+			                            (const char *)act->peer_exe_path, act->peer_pid, act->peer_parent_pid);
+		}
+	}
+	if (shared != ics->input_focus_shared) {
+		ics->input_focus_shared = shared;
+		// Lifecycle (a focus change), never per frame.
+		U_LOG_W("input focus: client id=%u pid=%ld ('%s') %s the focused client's application — device reads %s",
+		        ics->client_state.id, ics->peer_pid, (const char *)ics->client_state.info.application_name,
+		        shared ? "is a sibling connection of" : "is no longer a sibling connection of",
+		        shared ? "live (shared input focus)" : "gated by its own focus again");
+	}
 
 	if (ics->xc != NULL) {
 		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, visible, focused);

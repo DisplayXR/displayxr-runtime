@@ -437,6 +437,9 @@ struct xrt_status_client_flags
 	bool visible; //!< Session visible.
 	bool focused; //!< Session focused.
 	bool overlay; //!< Overlay session.
+	//! Device reads are live for this client: focused, or a sibling connection
+	//! of the focused client's application (input focus follows the application).
+	bool input_focused;
 };
 
 //! A client's window rect (phase 2).

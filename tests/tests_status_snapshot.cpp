@@ -775,7 +775,7 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(str(cl, "presenter") == "APP_HWND");
 	CHECK(str(cl, "lease") == "slot");
 	CHECK(str(cl, "owner_screen") == "0xb72ea4c616544d01");
-	CHECK(keys(cJSON_GetObjectItem(cl, "flags")) == V{"active", "visible", "focused", "overlay"});
+	CHECK(keys(cJSON_GetObjectItem(cl, "flags")) == V{"active", "visible", "focused", "overlay", "input_focused"});
 	CHECK(keys(cJSON_GetObjectItem(cl, "window")) == V{"left", "top", "width", "height"});
 	const cJSON *sg = cJSON_GetObjectItem(cl, "segments");
 	CHECK(keys(sg) == V{"generation", "split", "items"});

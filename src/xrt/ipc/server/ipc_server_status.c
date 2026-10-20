@@ -303,7 +303,8 @@ live_key(const struct xrt_status_live *live)
 		mix_u64(&h, c->class_verified);
 		mix_str(&h, c->name);
 		mix_u64(&h, (uint64_t)c->flags.active | ((uint64_t)c->flags.visible << 1) |
-		                ((uint64_t)c->flags.focused << 2) | ((uint64_t)c->flags.overlay << 3));
+		                ((uint64_t)c->flags.focused << 2) | ((uint64_t)c->flags.overlay << 3) |
+		                ((uint64_t)c->flags.input_focused << 4));
 		mix_u64(&h, (uint64_t)c->presenter);
 		mix_u64(&h, (uint64_t)c->lease);
 		mix_u64(&h, c->window.valid);
@@ -581,6 +582,7 @@ gather_live(struct ipc_server *s, struct ipc_server_status *st, uint64_t now_ns)
 		c->flags.visible = sl->session_visible;
 		c->flags.focused = sl->session_focused;
 		c->flags.overlay = overlay[k];
+		c->flags.input_focused = sl->session_focused || sl->input_focus_shared;
 		c->presenter = XRT_STATUS_PRESENTER_NONE;
 		if (h->lease == IPC_SERVICE_LEASE_CONTROLLER) {
 			c->lease = XRT_STATUS_LEASE_CONTROLLER;

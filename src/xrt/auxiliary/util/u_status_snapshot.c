@@ -936,6 +936,7 @@ client_to_cjson(const struct xrt_status_client *c)
 	cJSON_AddBoolToObject(fl, "visible", c->flags.visible);
 	cJSON_AddBoolToObject(fl, "focused", c->flags.focused);
 	cJSON_AddBoolToObject(fl, "overlay", c->flags.overlay);
+	cJSON_AddBoolToObject(fl, "input_focused", c->flags.input_focused);
 
 	cJSON_AddStringToObject(o, "presenter", u_status_presenter_str(c->presenter));
 	cJSON_AddStringToObject(o, "lease", u_status_lease_str(c->lease));

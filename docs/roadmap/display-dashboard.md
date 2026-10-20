@@ -102,7 +102,7 @@ service RPCs in §5 expose. The last row is what the plug-in slot in §6 carries
   ],
   "clients": [
     { "id": 3, "pid": 24416, "class": "APP", "name": "cube_handle_d3d11_win.exe",
-      "flags": { "active": true, "visible": true, "focused": true, "overlay": false },
+      "flags": { "active": true, "visible": true, "focused": true, "overlay": false, "input_focused": true },
       "presenter": "APP_HWND",                                   // APP_HWND | CLIENT_TEXTURE | NONE
       "lease": "slot",                                           // controller | slot | none
       "window": { "left": 3018, "top": 285, "width": 1664, "height": 2093 },

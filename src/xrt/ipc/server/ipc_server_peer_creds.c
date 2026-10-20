@@ -25,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 
 long
 ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns)
@@ -91,6 +92,33 @@ ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
 	}
 	out_path[n] = 0;
 	return true;
+}
+
+long
+ipc_server_peer_parent_pid(long pid)
+{
+	if (pid <= 0) {
+		return 0;
+	}
+	// Toolhelp needs no extra import library and no process handle on the
+	// peer (works for a Low-integrity child we could not open).
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	PROCESSENTRY32W pe;
+	pe.dwSize = sizeof(pe);
+	long ppid = 0;
+	if (Process32FirstW(snap, &pe)) {
+		do {
+			if ((long)pe.th32ProcessID == pid) {
+				ppid = (long)pe.th32ParentProcessID;
+				break;
+			}
+		} while (Process32NextW(snap, &pe));
+	}
+	CloseHandle(snap);
+	return ppid;
 }
 
 /*!
@@ -290,6 +318,49 @@ ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
 	return true;
 #else
 	return false;
+#endif
+}
+
+long
+ipc_server_peer_parent_pid(long pid)
+{
+	if (pid <= 0) {
+		return 0;
+	}
+#if defined(XRT_OS_LINUX)
+	// /proc/<pid>/stat: "pid (comm) state ppid ..." — comm may hold spaces
+	// and parens, so parse from the LAST ')'.
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%ld/stat", pid);
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return 0;
+	}
+	char line[512];
+	const char *got = fgets(line, sizeof(line), f);
+	fclose(f);
+	if (got == NULL) {
+		return 0;
+	}
+	const char *rp = strrchr(line, ')');
+	if (rp == NULL) {
+		return 0;
+	}
+	char state = 0;
+	long ppid = 0;
+	if (sscanf(rp + 1, " %c %ld", &state, &ppid) != 2) {
+		return 0;
+	}
+	return ppid > 0 ? ppid : 0;
+#elif defined(XRT_OS_MACOS)
+	struct proc_bsdinfo bi;
+	int n = proc_pidinfo((int)pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi));
+	if (n != (int)sizeof(bi)) {
+		return 0;
+	}
+	return (long)bi.pbi_ppid;
+#else
+	return 0;
 #endif
 }
 
