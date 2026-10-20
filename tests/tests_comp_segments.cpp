@@ -1368,3 +1368,96 @@ TEST_CASE("comp_segments: mask_crop_rect — a segment's share of the zone mask 
 		CHECK_FALSE(comp_segments_mask_crop_rect(nullptr, 1280, 720, 1280, 720, &out));
 	}
 }
+
+TEST_CASE("comp_segments: a window is paced at its majority screen's refresh rate (#2245)", "[comp_segments]")
+{
+	// The panel (primary, 60 Hz) at the origin, a 165 Hz monitor to its left.
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3840, 2160, 3840, 2160, true),
+	    screen(DS1, -3840, 0, 3840, 2160, 3840, 2160, false),
+	};
+	const float hz[2] = {59.0f, 165.0f}; // the primary's re-read deliberately differs from today's value
+	const float today = 60.0f;
+	uint32_t idx = 0;
+
+	SECTION("wholly on the primary: today's value, not a re-read")
+	{
+		const comp_seg_rect w = {100, 100, 1600, 900};
+		CHECK(comp_segments_window_refresh_hz(&w, scr, hz, 2, today, &idx) == today);
+		CHECK(idx == 0);
+	}
+	SECTION("wholly on the other screen: its rate")
+	{
+		const comp_seg_rect w = {-3000, 400, 2000, 1200};
+		CHECK(comp_segments_window_refresh_hz(&w, scr, hz, 2, today, &idx) == 165.0f);
+		CHECK(idx == 1);
+	}
+	SECTION("straddling: the majority screen's rate")
+	{
+		const comp_seg_rect mostly_left = {-1200, 0, 1600, 900}; // 1200 px left, 400 px right
+		CHECK(comp_segments_window_refresh_hz(&mostly_left, scr, hz, 2, today, &idx) == 165.0f);
+		CHECK(idx == 1);
+		const comp_seg_rect mostly_right = {-400, 0, 1600, 900};
+		CHECK(comp_segments_window_refresh_hz(&mostly_right, scr, hz, 2, today, &idx) == today);
+		CHECK(idx == 0);
+	}
+	SECTION("an exact tie goes to the primary")
+	{
+		const comp_seg_rect w = {-800, 0, 1600, 900};
+		CHECK(comp_segments_window_refresh_hz(&w, scr, hz, 2, today, &idx) == today);
+		CHECK(idx == 0);
+	}
+	SECTION("unknown answers fall back to today's value")
+	{
+		const comp_seg_rect off = {20000, 20000, 100, 100};
+		CHECK(comp_segments_window_refresh_hz(&off, scr, hz, 2, today, &idx) == today);
+		CHECK(idx == UINT32_MAX);
+		const comp_seg_rect left = {-3000, 400, 2000, 1200};
+		const float unknown[2] = {59.0f, 0.0f};
+		CHECK(comp_segments_window_refresh_hz(&left, scr, unknown, 2, today, &idx) == today);
+		CHECK(idx == 1);
+		CHECK(comp_segments_window_refresh_hz(&left, scr, nullptr, 2, today, nullptr) == today);
+		CHECK(comp_segments_window_refresh_hz(nullptr, scr, hz, 2, today, nullptr) == today);
+		CHECK(comp_segments_window_refresh_hz(&left, scr, hz, 0, today, nullptr) == today);
+	}
+}
+
+TEST_CASE("comp_segments: a registry screen finds its monitor's refresh rate by its centre (#2245)", "[comp_segments]")
+{
+	comp_segments_screen mon[2] = {
+	    screen(EDP, 0, 0, 3840, 2160, 3840, 2160, true),
+	    screen(DS1, -3840, 0, 3840, 2160, 3840, 2160, false),
+	};
+	const float hz[2] = {60.0f, 165.0f};
+	const comp_seg_rect left = {-3840, 0, 3840, 2160};
+	const comp_seg_rect panel = {0, 0, 3840, 2160};
+	const comp_seg_rect nowhere = {9000, 0, 100, 100};
+	CHECK(comp_segments_screen_refresh_hz(&left, mon, hz, 2) == 165.0f);
+	CHECK(comp_segments_screen_refresh_hz(&panel, mon, hz, 2) == 60.0f);
+	CHECK(comp_segments_screen_refresh_hz(&nowhere, mon, hz, 2) == 0.0f);
+	const float unknown[2] = {60.0f, -1.0f};
+	CHECK(comp_segments_screen_refresh_hz(&left, mon, unknown, 2) == 0.0f);
+	CHECK(comp_segments_screen_refresh_hz(&left, mon, nullptr, 2) == 0.0f);
+}
+
+TEST_CASE("comp_segments: a screen's own rate only on the chain's own adapter (#2245 gate)", "[comp_segments]")
+{
+	const uint64_t igpu = 0x0000000100001234ull;
+	const uint64_t dgpu = 0x0000000100005678ull;
+	bool other = true;
+	// Same adapter: the screen's own rate.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, &other) == 165.0f);
+	CHECK_FALSE(other);
+	// Another adapter: the primary's, flagged for the caller's log.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, igpu, 60.0f, &other) == 60.0f);
+	CHECK(other);
+	// Unknown adapter on either side: the primary's, not flagged.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, 0, igpu, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, 0, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	// Unknown rate on the right adapter: the primary's.
+	CHECK(comp_segments_gated_refresh_hz(0.0f, dgpu, dgpu, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, nullptr) == 165.0f);
+}
