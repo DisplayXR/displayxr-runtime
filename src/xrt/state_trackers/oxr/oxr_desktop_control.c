@@ -62,7 +62,8 @@ _Static_assert((int)U_DESKTOP_PICK_OUTSIDE == (int)XR_DESKTOP_PICK_KIND_OUTSIDE_
 _Static_assert(U_DESKTOP_APP_ID_SIZE == XR_MAX_DESKTOP_APP_ID_SIZE_DXR, "size mirror");
 _Static_assert(U_DESKTOP_TITLE_SIZE == XR_MAX_DESKTOP_TITLE_SIZE_DXR, "size mirror");
 _Static_assert(U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT == XR_ERROR_SIZE_INSUFFICIENT, "result mirror");
-_Static_assert(U_DESKTOP_CAP_CAPTURE == 0x40 /* XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR (a static const) */, "caps mirror");
+_Static_assert(U_DESKTOP_CAP_CAPTURE == 0x40 /* XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR (a static const) */,
+               "caps mirror");
 _Static_assert(U_DESKTOP_SCOPE_CONTROL == 0x1 /* XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR */, "scope mirror");
 _Static_assert(U_DESKTOP_SCOPE_CAPTURE == 0x2 /* XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR */, "scope mirror");
 _Static_assert(U_DESKTOP_SCOPE_REASK == 0x100 /* XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR */, "scope mirror");

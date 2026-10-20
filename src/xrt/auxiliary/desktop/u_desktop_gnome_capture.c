@@ -107,8 +107,7 @@ static bool
 dc_read(DBusConnection *c, struct dc_state *out)
 {
 	memset(out, 0, sizeof(*out));
-	DBusMessage *reply =
-	    gdbus_call(c, DC_DEST, DC_PATH, DC_DEST, "GetCurrentState", 1500, NULL, DBUS_TYPE_INVALID);
+	DBusMessage *reply = gdbus_call(c, DC_DEST, DC_PATH, DC_DEST, "GetCurrentState", 1500, NULL, DBUS_TYPE_INVALID);
 	if (reply == NULL) {
 		return false;
 	}
@@ -429,7 +428,8 @@ gp_cap_select_sources(struct gnome_portal *p, bool interactive, char *msg)
 			return U_DESKTOP_OK;
 		}
 		// Restoring without the screens would save an input-only approval.
-		gp_set_msg(msg, "the ScreenCast portal is not answering yet — not restoring without the screens; retry");
+		gp_set_msg(msg,
+		           "the ScreenCast portal is not answering yet — not restoring without the screens; retry");
 		return U_DESKTOP_ERR_TIMEOUT;
 	}
 	char token[64];
@@ -642,9 +642,10 @@ gp_cap_before_restore(struct gnome_portal *p, char *msg)
 		}
 		if (now - start >= LAYOUT_WAIT_MAX_MS || gp_quitting(p)) {
 			gp_set_msg(msg,
-			           missing > 0 ? "a monitor the screen grant covers is missing — not restoring (retry when "
-			                         "it is back)"
-			                       : "the monitor layout is still changing — retry");
+			           missing > 0
+			               ? "a monitor the screen grant covers is missing — not restoring (retry when "
+			                 "it is back)"
+			               : "the monitor layout is still changing — retry");
 			return U_DESKTOP_ERR_TIMEOUT;
 		}
 		gp_pump(p, 100);
@@ -786,11 +787,13 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 			return U_DESKTOP_ERR_TIMEOUT;
 		}
 		cap_revoke(p);
-		gp_set_msg(msg, "the portal did not restore screen sharing silently (grant gone?) — request access again");
+		gp_set_msg(msg,
+		           "the portal did not restore screen sharing silently (grant gone?) — request access again");
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
 	if (p->resp_code != 0) {
-		gp_set_msg(msg, p->resp_code == 1 ? "the user declined screen sharing" : "the portal refused the session");
+		gp_set_msg(msg,
+		           p->resp_code == 1 ? "the user declined screen sharing" : "the portal refused the session");
 		gp_session_close(p);
 		if (!interactive) {
 			cap_revoke(p);
@@ -1052,8 +1055,9 @@ static bool
 obs_locked_now(struct gnome_backend *g)
 {
 	pthread_mutex_lock(&g->obs_lock);
-	DBusMessage *reply = gdbus_call(g->obs, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
-	                                "org.gnome.ScreenSaver", "GetActive", GNOME_OBS_TIMEOUT_MS, NULL, DBUS_TYPE_INVALID);
+	DBusMessage *reply =
+	    gdbus_call(g->obs, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver", "GetActive",
+	               GNOME_OBS_TIMEOUT_MS, NULL, DBUS_TYPE_INVALID);
 	pthread_mutex_unlock(&g->obs_lock);
 	dbus_bool_t active = TRUE; // no answer: fail closed
 	if (reply != NULL) {
@@ -1096,8 +1100,8 @@ mask_excluded(struct gnome_backend *g, struct u_desktop_image *img, const struct
 	}
 	struct gdbus_err err;
 	pthread_mutex_lock(&g->obs_lock);
-	DBusMessage *reply =
-	    gdbus_call(g->obs, WLG_BUS, WLG_PATH_, WLG_IFACE_, "GetAllWindows", GNOME_OBS_TIMEOUT_MS, &err, DBUS_TYPE_INVALID);
+	DBusMessage *reply = gdbus_call(g->obs, WLG_BUS, WLG_PATH_, WLG_IFACE_, "GetAllWindows", GNOME_OBS_TIMEOUT_MS,
+	                                &err, DBUS_TYPE_INVALID);
 	gdbus_drain(g->obs);
 	pthread_mutex_unlock(&g->obs_lock);
 	const char *json = NULL;
@@ -1243,7 +1247,8 @@ gnome_capture_init(struct gnome_backend *g)
 	}
 	g->portal->cap.pipewire = gnome_pw_available();
 	if (!g->portal->cap.pipewire) {
-		U_LOG_W("desktop/gnome: no libpipewire-0.3 — no screen capture (a screen grant is still never downgraded)");
+		U_LOG_W(
+		    "desktop/gnome: no libpipewire-0.3 — no screen capture (a screen grant is still never downgraded)");
 		return 0;
 	}
 	g->base.capture_access_status = gnome_capture_access_status;

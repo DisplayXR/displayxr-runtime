@@ -311,7 +311,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 	} else if (strcmp(cmd, "request-scopes") == 0 && argc >= 3) {
 		uint32_t scopes = strncmp(argv[2], "capture", 7) == 0 ? U_DESKTOP_SCOPE_CAPTURE
 		                  : strncmp(argv[2], "all", 3) == 0 ? U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE
-		                                                     : U_DESKTOP_SCOPE_CONTROL;
+		                                                    : U_DESKTOP_SCOPE_CONTROL;
 		if (strstr(argv[2], "+again") != NULL) {
 			scopes |= U_DESKTOP_SCOPE_REASK;
 		}

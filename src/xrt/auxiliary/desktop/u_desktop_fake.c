@@ -991,8 +991,8 @@ fake_capture(struct u_desktop_backend *b, const struct u_desktop_rect *src, stru
 		for (uint32_t fy = 0; fy < fh; fy++) {
 			for (uint32_t fx = 0; fx < fw; fx++) {
 				uint8_t px[4];
-				expected_pixel_locked(f, m->rect.x + (int32_t)(fx / m->scale), m->rect.y + (int32_t)(fy / m->scale),
-				                      px);
+				expected_pixel_locked(f, m->rect.x + (int32_t)(fx / m->scale),
+				                      m->rect.y + (int32_t)(fy / m->scale), px);
 				uint8_t *d = frame + ((size_t)fy * fw + fx) * 4;
 				d[0] = px[2]; // BGRx, as mutter's SHM streams
 				d[1] = px[1];

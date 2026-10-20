@@ -299,7 +299,8 @@ on_process(void *data)
 		if (!fmt_ok) {
 			g->failed = true;
 			snprintf(g->why, sizeof(g->why), "unsupported pixel format %u", g->format);
-		} else if (d->data != NULL && c != NULL && c->size > 0 && (c->flags & U_SPA_CHUNK_FLAG_CORRUPTED) == 0) {
+		} else if (d->data != NULL && c != NULL && c->size > 0 &&
+		           (c->flags & U_SPA_CHUNK_FLAG_CORRUPTED) == 0) {
 			uint32_t stride = c->stride > 0 ? (uint32_t)c->stride : g->w * 4;
 			uint64_t need = (uint64_t)stride * (g->h - 1) + (uint64_t)g->w * 4;
 			if (stride >= g->w * 4 && (uint64_t)c->offset + need <= d->maxsize) {

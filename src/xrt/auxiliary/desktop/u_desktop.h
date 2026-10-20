@@ -420,11 +420,8 @@ struct u_desktop_backend
 	 * The monitors, desktop coordinates (every monitor, shared or not). Fills up to
 	 * @p cap, sets @p count to the total. Observation-class: any thread, fast.
 	 */
-	enum u_desktop_result (*monitors)(struct u_desktop_backend *b,
-	                                  struct u_desktop_rect *out,
-	                                  uint32_t cap,
-	                                  uint32_t *count,
-	                                  char *msg);
+	enum u_desktop_result (*monitors)(
+	    struct u_desktop_backend *b, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg);
 
 	/*!
 	 * One still of @p src (desktop coordinates, already clipped to the monitors) at
