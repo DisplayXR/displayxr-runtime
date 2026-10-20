@@ -224,8 +224,8 @@ cmd_app(const char *op, int argc, const char **argv)
 	                                                          : U_DESKTOP_APP_NONE;
 	// Spec v2 §10.6: allow defaults to CONTROL (granting pixels must be asked for by
 	// name); deny / forget default to every scope.
-	uint32_t scopes = d == U_DESKTOP_APP_ALLOW ? U_DESKTOP_SCOPE_CONTROL
-	                                           : U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	uint32_t scopes =
+	    d == U_DESKTOP_APP_ALLOW ? U_DESKTOP_SCOPE_CONTROL : U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
 	for (int i = 4; i < argc; i++) {
 		if (strcmp(argv[i], "--scope") != 0) {
 			continue;
@@ -294,7 +294,8 @@ print_audit_line(void *ctx, const char *line)
 		printf(" -> %s", kind->valuestring);
 		if (cJSON_IsArray(rect) && cJSON_GetArraySize(rect) == 4) {
 			printf(" (%d,%d %dx%d)", (int)cJSON_GetArrayItem(rect, 0)->valuedouble,
-			       (int)cJSON_GetArrayItem(rect, 1)->valuedouble, (int)cJSON_GetArrayItem(rect, 2)->valuedouble,
+			       (int)cJSON_GetArrayItem(rect, 1)->valuedouble,
+			       (int)cJSON_GetArrayItem(rect, 2)->valuedouble,
 			       (int)cJSON_GetArrayItem(rect, 3)->valuedouble);
 		}
 	} else if (cJSON_IsObject(target)) {

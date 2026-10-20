@@ -297,7 +297,9 @@ u_desktop_control_capture(struct u_desktop_control *c, const struct u_desktop_ca
  * fixes them at 10 s and 2 s, §10.8 decision 4). 0 keeps the spec value.
  */
 void
-u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c, uint64_t retention_ns, uint64_t burst_gap_ns);
+u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c,
+                                               uint64_t retention_ns,
+                                               uint64_t burst_gap_ns);
 
 int32_t
 u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba);

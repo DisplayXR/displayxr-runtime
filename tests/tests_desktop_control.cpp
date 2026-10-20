@@ -2320,8 +2320,7 @@ TEST_CASE("capture_helpers: fit never scales up and keeps the aspect ratio", "[d
 	CHECK((w == 100 && h == 1)); // never 0
 }
 
-TEST_CASE("capture_helpers: area downscale averages, withheld pixels never darken real ones",
-          "[desktop][capture]")
+TEST_CASE("capture_helpers: area downscale averages, withheld pixels never darken real ones", "[desktop][capture]")
 {
 	u_desktop_image in;
 	REQUIRE(u_desktop_image_alloc(&in, 4, 2));
@@ -2416,13 +2415,13 @@ TEST_CASE("capture_scope: CAPTURE works without CONTROL; one prompt for both; GR
 	SECTION("both in one prompt, then nothing to ask")
 	{
 		u_desktop_fake_set_request_answer(h.fake, U_DESKTOP_ACCESS_GRANTED, true);
-		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr,
-		                                         U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) ==
-		        U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(
+		            h.c, nullptr, U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
 		CHECK(h.state() == U_DESKTOP_STATE_PENDING);
 		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_PENDING);
 		// A request while a listed scope is PENDING is a no-op.
-		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
 		uint32_t n = 0;
 		CHECK(u_desktop_fake_last_request_scopes(h.fake, &n) ==
 		      (U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE));
@@ -2431,9 +2430,8 @@ TEST_CASE("capture_scope: CAPTURE works without CONTROL; one prompt for both; GR
 		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
 		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
 		uint32_t before = u_desktop_fake_request_count(h.fake);
-		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr,
-		                                         U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) ==
-		        U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(
+		            h.c, nullptr, U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
 		CHECK(u_desktop_fake_request_count(h.fake) == before); // nothing asked again
 	}
 	SECTION("the dialog decides both: input unticked -> CONTROL DENIED, CAPTURE GRANTED")
@@ -2441,7 +2439,8 @@ TEST_CASE("capture_scope: CAPTURE works without CONTROL; one prompt for both; GR
 		h.grant();
 		u_desktop_fake_set_request_answer(h.fake, U_DESKTOP_ACCESS_DENIED, false);
 		u_desktop_fake_set_capture_request_answer(h.fake, U_DESKTOP_ACCESS_GRANTED, true);
-		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
 		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) == U_DESKTOP_SCOPE_CAPTURE);
 		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
 		CHECK(h.state() == U_DESKTOP_STATE_DENIED);
@@ -2477,7 +2476,8 @@ TEST_CASE("capture_scope: the store answers per scope; Windows-model prompt writ
 		REQUIRE(u_desktop_policy_set_app_scope(kExe, U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_DENY, "test"));
 		h.grant();
 		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DISABLED_BY_USER);
-		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
 		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) == 0); // never prompted
 		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
 	}
@@ -2809,14 +2809,16 @@ TEST_CASE("capture_limits: one in flight, 4 Hz start cap, retention", "[desktop]
 		c = capture(h, info);
 		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
 		std::this_thread::sleep_for(400ms);
-		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
 
 		// The next capture replaces the last one.
 		c = capture(h, info);
 		uint64_t first = c.id;
 		std::this_thread::sleep_for(260ms);
 		c = capture(h, info);
-		CHECK(u_desktop_control_capture_image(h.c, first, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_capture_image(h.c, first, 0, &n, nullptr) ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
 		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
 	}
 }

@@ -360,8 +360,8 @@ evaluate_scope_locked(struct u_desktop_control *c, int idx, enum reason *out_rea
 	enum u_desktop_control_state s;
 	struct scope_state *sc = &c->sc[idx];
 
-	if (c->b == NULL || (idx == SC_CAPTURE && ((c->b->caps & U_DESKTOP_CAP_CAPTURE) == 0 ||
-	                                           c->b->capture == NULL || c->b->monitors == NULL))) { // 1
+	if (c->b == NULL || (idx == SC_CAPTURE && ((c->b->caps & U_DESKTOP_CAP_CAPTURE) == 0 || c->b->capture == NULL ||
+	                                           c->b->monitors == NULL))) { // 1
 		r = R_NO_BACKEND;
 		s = U_DESKTOP_STATE_UNSUPPORTED;
 		goto out;
@@ -414,7 +414,8 @@ evaluate_scope_locked(struct u_desktop_control *c, int idx, enum reason *out_rea
 		// 8. The DisplayXR store is the ONLY grant for a backend whose OS has
 		// no consent of its own (Windows): an OS "granted" means nothing there.
 		// The in-memory answer counts only if persisting it failed.
-		if (d == U_DESKTOP_APP_ALLOW || (sc->store_write_failed && sc->req_result == U_DESKTOP_ACCESS_GRANTED)) {
+		if (d == U_DESKTOP_APP_ALLOW ||
+		    (sc->store_write_failed && sc->req_result == U_DESKTOP_ACCESS_GRANTED)) {
 			r = R_STORE_ALLOW;
 			s = U_DESKTOP_STATE_GRANTED;
 			goto out;
@@ -693,8 +694,7 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 
 	// A prompt is already up for a listed scope: never stack a second one.
 	for (int idx = 0; idx < SC_COUNT; idx++) {
-		if ((scopes & scope_bit(idx)) != 0 &&
-		    evaluate_scope_locked(c, idx, NULL) == U_DESKTOP_STATE_PENDING) {
+		if ((scopes & scope_bit(idx)) != 0 && evaluate_scope_locked(c, idx, NULL) == U_DESKTOP_STATE_PENDING) {
 			os_mutex_unlock(&c->mutex);
 			return U_DESKTOP_XR_SUCCESS;
 		}
@@ -783,7 +783,8 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 	struct u_desktop_app_info app = {c->exe, c->name, reason};
 	// Either may call the done function before returning.
 	if (via_scopes) {
-		b->request_scopes(b, &app, ask | (reask ? (uint32_t)U_DESKTOP_SCOPE_REASK : 0u), request_scopes_done, t);
+		b->request_scopes(b, &app, ask | (reask ? (uint32_t)U_DESKTOP_SCOPE_REASK : 0u), request_scopes_done,
+		                  t);
 	} else {
 		b->request_access(b, &app, request_done, t);
 	}
@@ -1958,7 +1959,9 @@ expire_kept_locked(struct u_desktop_control *c, uint64_t now_ns)
 }
 
 void
-u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c, uint64_t retention_ns, uint64_t burst_gap_ns)
+u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c,
+                                               uint64_t retention_ns,
+                                               uint64_t burst_gap_ns)
 {
 	os_mutex_lock(&c->mutex);
 	if (retention_ns != 0) {
@@ -2213,7 +2216,8 @@ run_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *in
 		if (br != U_DESKTOP_OK) {
 			result = map_backend_result(br, msg, MSG_CAP);
 			if (br == U_DESKTOP_ERR_UNSUPPORTED) {
-				snprintf(msg, sizeof(msg), "cannot find the window: this desktop backend cannot list windows");
+				snprintf(msg, sizeof(msg),
+				         "cannot find the window: this desktop backend cannot list windows");
 			}
 			goto done;
 		}
@@ -2325,8 +2329,7 @@ run_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *in
 	memset(&out, 0, sizeof(out));
 	c->kept_id = id;
 	c->kept_until_ns = os_monotonic_get_ns() + c->cap_retention_ns;
-	struct u_desktop_capture_done d = {id, U_DESKTOP_XR_SUCCESS, c->kept.w, c->kept.h, src,
-	                                   c->kept.frame_ns, "ok"};
+	struct u_desktop_capture_done d = {id, U_DESKTOP_XR_SUCCESS, c->kept.w, c->kept.h, src, c->kept.frame_ns, "ok"};
 	os_mutex_unlock(&c->mutex);
 
 	audit_capture_ok(c, info, have_win ? &win : NULL, &src, d.w, d.h);

@@ -65,8 +65,8 @@ struct gp_cap
 
 	// ---- the ScreenCast portal, probed on the portal thread, RETRIED until it
 	// ---- answers (a slow portal at login must not be cached as "none") ----
-	bool sc_known;        //!< a probe answered
-	bool sc_ok;           //!< ScreenCast v4+ records monitors
+	bool sc_known; //!< a probe answered
+	bool sc_ok;    //!< ScreenCast v4+ records monitors
 	uint32_t sc_version;
 	uint32_t cursor_mode; //!< HIDDEN if offered, else EMBEDDED, else 0 (not sent)
 	uint64_t sc_next_probe_ms;
@@ -79,14 +79,14 @@ struct gp_cap
 	bool reask;             //!< the pending request asks again even if granted
 
 	// ---- shared, under gnome_portal::lock ----
-	bool token_sc;      //!< the restore token is a standalone ScreenCast session's
-	bool token_devices; //!< the token's grant covers input (RemoteDesktop tokens)
-	bool token_screens; //!< the token's grant covers monitors
-	bool open_streams;  //!< the open session has monitor streams
-	bool open_devices;  //!< the open session has input devices
-	bool pending;       //!< a CAPTURE request is in flight
+	bool token_sc;                //!< the restore token is a standalone ScreenCast session's
+	bool token_devices;           //!< the token's grant covers input (RemoteDesktop tokens)
+	bool token_screens;           //!< the token's grant covers monitors
+	bool open_streams;            //!< the open session has monitor streams
+	bool open_devices;            //!< the open session has input devices
+	bool pending;                 //!< a CAPTURE request is in flight
 	enum u_desktop_access access; //!< CAPTURE's last outcome (when no token / session says more)
-	int handoff_fd;     //!< prepare → caller: a dup of the PipeWire remote (-1: none)
+	int handoff_fd;               //!< prepare → caller: a dup of the PipeWire remote (-1: none)
 	struct gnome_pw_stream handoff[8];
 	uint32_t handoff_n;
 

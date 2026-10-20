@@ -87,7 +87,10 @@ u_desktop_image_draw_frame(struct u_desktop_image *img,
  * the input size. When they are equal it is a copy. @p out is allocated.
  */
 bool
-u_desktop_image_downscale(const struct u_desktop_image *in, uint32_t out_w, uint32_t out_h, struct u_desktop_image *out);
+u_desktop_image_downscale(const struct u_desktop_image *in,
+                          uint32_t out_w,
+                          uint32_t out_h,
+                          struct u_desktop_image *out);
 
 #ifdef __cplusplus
 }
