@@ -191,6 +191,11 @@ struct ipc_client_state
 	//! client's application, so its device reads are live (client_input_allowed).
 	//! Written under global_state.lock on flush, read racily per frame.
 	bool input_focus_shared;
+	//! #2262: the session-state event the server itself pushed for a shared
+	//! sibling (FOCUSED, so the app's xrSyncActions runs) — what it last said,
+	//! so a repeat flush pushes nothing and a change pushes once.
+	bool shared_focus_event_sent;
+	bool shared_focus_event_visible;
 
 	//! browser#103 RC-1: a peer declaration has been settled on this connection.
 	//! Settled ONCE — a second declaration is refused, so no client can move its
