@@ -556,6 +556,9 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrPickDesktopDXR, DXR_desktop_control);
 	ENTRY_IF_EXT(xrGetDesktopTextAtDXR, DXR_desktop_control);
 	ENTRY_IF_EXT(xrSubmitDesktopActionDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopCaptureStateDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrCaptureDesktopDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopCaptureImageDXR, DXR_desktop_control);
 #endif
 
 #ifdef OXR_HAVE_DXR_input_providers

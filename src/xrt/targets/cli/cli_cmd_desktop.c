@@ -7,8 +7,11 @@
  *
  *   desktop status [--json]          kill switch, idle_ms, per-app decisions, paths
  *   desktop stop | resume            the kill switch (every session sees it on its next call)
- *   desktop allow|deny|forget <exe>  per-app decision (allow is meaningful on Windows,
- *                                    where DisplayXR's own prompt is the consent)
+ *   desktop allow|deny|forget <exe> [--scope control|capture|all]
+ *                                    per-app decision (allow is meaningful on Windows,
+ *                                    where DisplayXR's own prompt is the consent). Spec
+ *                                    v2: one answer per scope; default `control` for
+ *                                    allow, `all` for deny / forget
  *   desktop audit [--tail N] [--json]  the last N audit records (default 20)
  *
  * Reads and writes the store and the audit log ONLY (u_desktop_policy) — it
@@ -19,6 +22,7 @@
 
 #include "xrt/xrt_config_os.h"
 
+#include "desktop/u_desktop.h"
 #include "desktop/u_desktop_policy.h"
 #include "os/os_time.h"
 
@@ -39,7 +43,9 @@ usage(void)
 	printf(
 	    "usage: displayxr-cli desktop status [--json]\n"
 	    "       desktop stop | resume              kill switch for every app's desktop control\n"
-	    "       desktop allow|deny|forget <exe>    per-app decision (full executable path)\n"
+	    "       desktop allow|deny|forget <exe> [--scope control|capture|all]\n"
+	    "                                          per-app decision (full executable path); default\n"
+	    "                                          scope: control for allow, all for deny / forget\n"
 	    "       desktop audit [--tail N] [--json]  last N audit records (default 20)\n");
 }
 
@@ -86,17 +92,32 @@ decision_str(enum u_desktop_app_decision d)
 	}
 }
 
-static void
-print_app(void *ctx, const char *exe, enum u_desktop_app_decision d)
+static const char *
+decision_or_dash(enum u_desktop_app_decision d)
 {
-	(void)ctx;
-	printf("  %-6s %s\n", decision_str(d), exe);
+	return d == U_DESKTOP_APP_NONE ? "-" : decision_str(d);
 }
 
 static void
-json_app(void *ctx, const char *exe, enum u_desktop_app_decision d)
+print_app(void *ctx, const char *exe, enum u_desktop_app_decision control, enum u_desktop_app_decision capture)
 {
-	cJSON_AddStringToObject((cJSON *)ctx, exe, decision_str(d));
+	(void)ctx;
+	printf("  control %-5s capture %-5s %s\n", decision_or_dash(control), decision_or_dash(capture), exe);
+}
+
+static void
+json_app(void *ctx, const char *exe, enum u_desktop_app_decision control, enum u_desktop_app_decision capture)
+{
+	cJSON *e = cJSON_AddObjectToObject((cJSON *)ctx, exe);
+	if (e == NULL) {
+		return;
+	}
+	if (control != U_DESKTOP_APP_NONE) {
+		cJSON_AddStringToObject(e, "control", decision_str(control));
+	}
+	if (capture != U_DESKTOP_APP_NONE) {
+		cJSON_AddStringToObject(e, "capture", decision_str(capture));
+	}
 }
 
 static int
@@ -122,7 +143,7 @@ cmd_status(bool json)
 		                          getenv(U_DESKTOP_POLICY_DIR_ENV)[0] != '\0');
 		cJSON_AddNumberToObject(o, "idle_ms", u_desktop_policy_idle_ms(p));
 		cJSON *apps = cJSON_AddObjectToObject(o, "apps");
-		u_desktop_policy_for_each_app(p, json_app, apps);
+		u_desktop_policy_for_each_app_scopes(p, json_app, apps);
 		cJSON_AddStringToObject(o, "store", store);
 		cJSON_AddStringToObject(o, "audit", audit);
 		cJSON_AddBoolToObject(o, "env_disabled", env_off);
@@ -153,7 +174,7 @@ cmd_status(bool json)
 		printf("  store:        %s\n", store);
 		printf("  audit log:    %s\n", audit);
 		printf("  apps:\n");
-		u_desktop_policy_for_each_app(p, print_app, NULL);
+		u_desktop_policy_for_each_app_scopes(p, print_app, NULL);
 	}
 	u_desktop_policy_destroy(&p);
 	return 0;
@@ -201,14 +222,34 @@ cmd_app(const char *op, int argc, const char **argv)
 	enum u_desktop_app_decision d = strcmp(op, "allow") == 0  ? U_DESKTOP_APP_ALLOW
 	                                : strcmp(op, "deny") == 0 ? U_DESKTOP_APP_DENY
 	                                                          : U_DESKTOP_APP_NONE;
-	if (!u_desktop_policy_set_app(exe, d, "cli")) {
+	// Spec v2 §10.6: allow defaults to CONTROL (granting pixels must be asked for by
+	// name); deny / forget default to every scope.
+	uint32_t scopes = d == U_DESKTOP_APP_ALLOW ? U_DESKTOP_SCOPE_CONTROL
+	                                           : U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	for (int i = 4; i < argc; i++) {
+		if (strcmp(argv[i], "--scope") != 0) {
+			continue;
+		}
+		const char *v = i + 1 < argc ? argv[i + 1] : "";
+		if (strcmp(v, "control") == 0) {
+			scopes = U_DESKTOP_SCOPE_CONTROL;
+		} else if (strcmp(v, "capture") == 0) {
+			scopes = U_DESKTOP_SCOPE_CAPTURE;
+		} else if (strcmp(v, "all") == 0) {
+			scopes = U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+		} else {
+			usage();
+			return 2;
+		}
+	}
+	if (!u_desktop_policy_set_app_scope(exe, scopes, d, "cli")) {
 		char store[1024] = {0};
 		u_desktop_policy_store_path(store, sizeof(store));
 		fprintf(stderr, "desktop: could not write the store %s (if it cannot be parsed, fix or remove it)\n",
 		        store);
 		return 1;
 	}
-	printf("%s: %s\n", op, exe);
+	printf("%s (%s): %s\n", op, u_desktop_scope_str(scopes), exe);
 	return 0;
 }
 
@@ -234,6 +275,10 @@ print_audit_line(void *ctx, const char *line)
 	const cJSON *keys = cJSON_GetObjectItemCaseSensitive(o, "keys");
 	const cJSON *msg = cJSON_GetObjectItemCaseSensitive(o, "message");
 	const cJSON *subject = cJSON_GetObjectItemCaseSensitive(o, "subject");
+	const cJSON *scope = cJSON_GetObjectItemCaseSensitive(o, "scope");
+	const cJSON *count = cJSON_GetObjectItemCaseSensitive(o, "count");
+	const cJSON *ow = cJSON_GetObjectItemCaseSensitive(o, "w");
+	const cJSON *oh = cJSON_GetObjectItemCaseSensitive(o, "h");
 
 	const char *base = cJSON_IsString(exe) ? exe->valuestring : "?";
 	for (const char *p = base; *p != '\0'; p++) {
@@ -243,12 +288,30 @@ print_audit_line(void *ctx, const char *line)
 	}
 	printf("%s  %-14s %-12s %-11s", cJSON_IsString(t) ? t->valuestring : "?", base,
 	       cJSON_IsString(action) ? action->valuestring : "?", cJSON_IsString(result) ? result->valuestring : "");
-	if (cJSON_IsObject(target)) {
+	const cJSON *kind = cJSON_IsObject(target) ? cJSON_GetObjectItemCaseSensitive(target, "kind") : NULL;
+	if (cJSON_IsObject(target) && cJSON_IsString(kind) && strcmp(kind->valuestring, "window") != 0) {
+		const cJSON *rect = cJSON_GetObjectItemCaseSensitive(target, "rect");
+		printf(" -> %s", kind->valuestring);
+		if (cJSON_IsArray(rect) && cJSON_GetArraySize(rect) == 4) {
+			printf(" (%d,%d %dx%d)", (int)cJSON_GetArrayItem(rect, 0)->valuedouble,
+			       (int)cJSON_GetArrayItem(rect, 1)->valuedouble, (int)cJSON_GetArrayItem(rect, 2)->valuedouble,
+			       (int)cJSON_GetArrayItem(rect, 3)->valuedouble);
+		}
+	} else if (cJSON_IsObject(target)) {
 		const cJSON *app = cJSON_GetObjectItemCaseSensitive(target, "app");
 		const cJSON *title = cJSON_GetObjectItemCaseSensitive(target, "title");
 		const cJSON *id = cJSON_GetObjectItemCaseSensitive(target, "id");
 		printf(" -> %s \"%s\" (%s)", cJSON_IsString(app) ? app->valuestring : "?",
 		       cJSON_IsString(title) ? title->valuestring : "", cJSON_IsString(id) ? id->valuestring : "?");
+	}
+	if (cJSON_IsString(scope)) {
+		printf(" [%s]", scope->valuestring);
+	}
+	if (cJSON_IsNumber(ow) && cJSON_IsNumber(oh)) {
+		printf(" %dx%d", (int)ow->valuedouble, (int)oh->valuedouble);
+	}
+	if (cJSON_IsNumber(count)) {
+		printf(" x%d", (int)count->valuedouble);
 	}
 	if (cJSON_IsString(subject)) {
 		printf(" %s", subject->valuestring);

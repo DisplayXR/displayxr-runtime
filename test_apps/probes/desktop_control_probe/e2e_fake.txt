@@ -62,3 +62,28 @@ run displayxr-cli desktop resume
 expect-state GRANTED
 act key target=102 keys=ctrl+w
 expect XR_SUCCESS
+# spec v2: screen capture — its own consent scope, stills on request, never on disk
+expect-capture-state NOT_REQUESTED
+capture desktop
+expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+request-scopes capture so the probe can see your screen
+expect-capture-state GRANTED
+expect-state GRANTED
+capture desktop max=960x960
+expect-capture XR_SUCCESS 960x540
+capture region 1900 1060 100 100
+expect-capture XR_SUCCESS 20x20
+expect-desktop-pixel 1910 1070 118 46 128 255
+capture region 5000 5000 10 10
+expect-capture XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+run displayxr-cli desktop stop
+capture desktop
+expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+expect-capture-state SUSPENDED
+run displayxr-cli desktop resume
+expect-capture-state GRANTED
+capture window 102 max=400x400
+expect-capture XR_SUCCESS
+run displayxr-cli desktop status
+sleep 2500
+run displayxr-cli desktop audit --tail 8

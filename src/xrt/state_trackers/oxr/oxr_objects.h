@@ -4931,6 +4931,24 @@ oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
                                                  XrResult result,
                                                  const char *message);
 
+//! Spec v2: the CAPTURE scope's state changed.
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state);
+
+//! Spec v2: a capture completed. @p frameTime is already an XrTime.
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureCompleted(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  uint64_t captureId,
+                                                  XrResult result,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  XrRect2Di sourceRect,
+                                                  XrTime frameTime,
+                                                  const char *message);
+
 //! Session destroy: stop the worker, drop queued actions (no events). Before the event drain.
 void
 oxr_desktop_control_session_fini(struct oxr_session *sess);
