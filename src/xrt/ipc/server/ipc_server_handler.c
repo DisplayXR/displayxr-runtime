@@ -7669,6 +7669,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
 	// v14/v15: per submit, read only when the DP composites the overlay.
 	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
+	// #2207: the client's exe basename tags its per-client capture trigger.
+	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
 #elif defined(XRT_OS_ANDROID)
 	// v14/v15: same per-submit hints for the Android weave (2D under the lens).
 	comp_multi_weave_android_set_overlay_hints(ics->xc, args->overlay_unchanged != 0,
@@ -8093,6 +8095,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
 	// v14/v15: per submit, read only when the DP composites the overlay.
 	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
+	// #2207: the client's exe basename tags its per-client capture trigger.
+	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //

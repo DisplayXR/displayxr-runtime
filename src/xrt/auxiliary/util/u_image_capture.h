@@ -83,6 +83,35 @@ u_image_force_opaque_rgba8(uint8_t *pixels, uint32_t width, uint32_t height, siz
 	}
 }
 
+/*!
+ * Copy a 4-byte-per-pixel readback into a tight RGBA8 buffer for the PNG
+ * encoder: optionally swapping R and B (a BGRA8 source), and stamping A=255
+ * unless @p keep_alpha (pass @ref u_image_capture_raw_alpha()).
+ *
+ * @param dst          Tight RGBA8 output, width*height*4 bytes.
+ * @param src          Source rows, @p src_stride bytes apart (>= width*4).
+ * @param swap_rb      True for a B8G8R8A8 source.
+ * @param keep_alpha   True keeps the source alpha (the raw-alpha oracle).
+ */
+static inline void
+u_image_capture_to_rgba8(
+    uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, size_t src_stride, bool swap_rb, bool keep_alpha)
+{
+	if (dst == NULL || src == NULL) {
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t *s = src + (size_t)y * src_stride;
+		uint8_t *d = dst + (size_t)y * width * 4;
+		for (uint32_t x = 0; x < width; x++, s += 4, d += 4) {
+			d[0] = swap_rb ? s[2] : s[0];
+			d[1] = s[1];
+			d[2] = swap_rb ? s[0] : s[2];
+			d[3] = keep_alpha ? s[3] : 255;
+		}
+	}
+}
+
 #ifdef __cplusplus
 }
 #endif

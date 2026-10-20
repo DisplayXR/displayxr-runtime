@@ -1142,6 +1142,38 @@ that screen's eyes and the zone's `canvasRectPx` relative to that screen. A zone
 seam is still located from the primary screen; rendering it per part needs a view set per part,
 which no locate returns today.
 
+## 5h. Capturing the weave on desktop Linux (#2207, diagnostics — not API)
+
+The desktop-Linux service engine honours the runtime's file-trigger capture
+(`u_capture_intent.h`, the same names the in-process vk_native compositor uses), so a
+headless box can verify a weave — lifted rects included — without a desktop screenshot.
+The engine runs in `displayxr-service`, so the triggers live in **the service's**
+`$TMPDIR` (default `/tmp`):
+
+| trigger | files written (same directory) |
+|---|---|
+| `displayxr_atlas_trigger` | `displayxr_atlas.input.png`, `displayxr_atlas.png`, `displayxr_atlas.woven.png` |
+| `displayxr_atlas_trigger.projection` | `displayxr_atlas.projection.png` (DP input only) |
+| `displayxr_atlas_trigger.<client-exe>[.projection]` | the same, as `displayxr_atlas.<client-exe>[…].png` |
+
+- **input** — the caller's submitted buffer exactly as received (the browser's page, the
+  squeezed-SBS or N-view atlas), before any un-squeeze, crop or lift.
+- **atlas** — what the display processor consumed: the 2x1 SBS scratch (batch / legacy;
+  regions outside every rect are cleared transparent) or the cropped N-view grid (v6),
+  with lifted rects' views composed in. Pre-weave.
+- **woven** — the output handed back, post-weave, including the off-panel / flat-region
+  2D and the v4 overlay.
+
+`<client-exe>` is the weave client's executable basename as the service resolves it from
+the peer pid (`chrome` for the browser, `weave_probe_vk_linux` for the probe); per-client
+triggers are checked before the service-process / global pair, and among several weave
+clients the first submit to poll a global trigger takes it. The trigger is consumed by one
+submit: on a multi-chunk frame (`firstChunk`) that is one chunk's rects. One WARN per
+capture (`weave capture (#2207) client=… : input … | atlas … | woven …`); the per-submit
+cost otherwise is a few `stat` calls. `DXR_ATLAS_CAPTURE_RAW_ALPHA=1` (in the service's
+environment) keeps the true alpha. MCP `capture_frame` and `xrCaptureAtlasDXR` do not
+reach this route.
+
 ## 6. Version history
 
 | Version | Change |

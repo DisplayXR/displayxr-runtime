@@ -262,6 +262,144 @@ u_capture_intent_poll(struct u_capture_intent *intent,
 }
 
 /*!
+ * The capture directory, resolved exactly as @ref u_capture_intent_poll does
+ * (`%TEMP%` / `$TMPDIR`, falling back to `C:\Temp` / `/tmp`, trailing
+ * separators trimmed) into @p out. Never fails; @p out is always terminated.
+ */
+static inline void
+u_capture_intent_dir(char *out, size_t out_size)
+{
+	if (out == NULL || out_size == 0) {
+		return;
+	}
+#ifdef XRT_OS_WINDOWS
+	const char *tmp = getenv("TEMP");
+	const char *fallback = "C:\\Temp";
+#else
+	const char *tmp = getenv("TMPDIR");
+	const char *fallback = "/tmp";
+#endif
+	if (tmp == NULL || tmp[0] == '\0') {
+		tmp = fallback;
+	}
+	snprintf(out, out_size, "%s", tmp);
+	size_t len = strlen(out);
+	while (len > 1 && (out[len - 1] == '/' || out[len - 1] == '\\')) {
+		out[--len] = '\0';
+	}
+}
+
+/*!
+ * Poll ONLY the per-tag trigger pair for an explicitly named target:
+ *   - "displayxr_atlas_trigger.<tag>"            → POST_COMPOSE,
+ *     output "displayxr_atlas.<tag>.png"
+ *   - "displayxr_atlas_trigger.<tag>.projection" → PROJECTION_ONLY,
+ *     output "displayxr_atlas.<tag>.projection.png"
+ * in the @ref u_capture_intent_dir directory — the same names the per-exe
+ * variants of @ref u_capture_intent_poll use, but with the tag supplied by the
+ * caller instead of this process's own basename.
+ *
+ * For a compositor running in ANOTHER process than the app it composes — the
+ * service-side weave engine, where this process is `displayxr-service` but the
+ * pixels are a client's (#2207) — the tag is the client's executable basename,
+ * so `displayxr_atlas_trigger.<client-exe>` still targets that one app. A
+ * trailing ".exe" is stripped (the per-exe convention). A tag that is empty or
+ * contains a path separator is never polled.
+ *
+ * Resets @p intent first, like @ref u_capture_intent_poll. Returns true iff a
+ * trigger was consumed (it is deleted). Rebuilds the two paths per call — two
+ * snprintf + two stat, cheap next to the frame it gates.
+ */
+static inline bool
+u_capture_intent_poll_tag(struct u_capture_intent *intent, const char *tag)
+{
+	intent->pending = false;
+	intent->from_mcp = false;
+	intent->mode = MCP_CAPTURE_MODE_POST_COMPOSE;
+	intent->path[0] = '\0';
+
+	if (tag == NULL || tag[0] == '\0' || strchr(tag, '/') != NULL || strchr(tag, '\\') != NULL) {
+		return false;
+	}
+	char t[128];
+	snprintf(t, sizeof(t), "%s", tag);
+	size_t tl = strlen(t);
+	if (tl > 4 && (strcmp(t + tl - 4, ".exe") == 0 || strcmp(t + tl - 4, ".EXE") == 0)) {
+		t[tl - 4] = '\0';
+	}
+
+	char dir[MCP_CAPTURE_PATH_MAX];
+	u_capture_intent_dir(dir, sizeof(dir));
+#ifdef XRT_OS_WINDOWS
+	const char sep = '\\';
+#else
+	const char sep = '/';
+#endif
+	char tg[MCP_CAPTURE_PATH_MAX + 160];
+	const char *suffix[2] = {".projection", ""};
+	const uint32_t mode[2] = {MCP_CAPTURE_MODE_PROJECTION_ONLY, MCP_CAPTURE_MODE_POST_COMPOSE};
+	// Projection-only first: the same priority the global pair has.
+	for (int i = 0; i < 2; i++) {
+		snprintf(tg, sizeof(tg), "%s%cdisplayxr_atlas_trigger.%s%s", dir, sep, t, suffix[i]);
+#ifdef XRT_OS_WINDOWS
+		if (GetFileAttributesA(tg) == INVALID_FILE_ATTRIBUTES) {
+			continue;
+		}
+		DeleteFileA(tg);
+#else
+		struct stat st;
+		if (stat(tg, &st) != 0) {
+			continue;
+		}
+		unlink(tg);
+#endif
+		int n = snprintf(intent->path, sizeof(intent->path), "%s%cdisplayxr_atlas.%s%s.png", dir, sep, t,
+		                 suffix[i]);
+		if (n <= 0 || (size_t)n >= sizeof(intent->path)) {
+			intent->path[0] = '\0';
+			return false; // the trigger is consumed; an output that cannot be named is not written
+		}
+		intent->pending = true;
+		intent->mode = mode[i];
+		return true;
+	}
+	return false;
+}
+
+/*!
+ * Derive a sibling output from a capture path: insert @p infix before the
+ * extension of @p png_path ("…/displayxr_atlas.png" + ".woven" →
+ * "…/displayxr_atlas.woven.png"). A path without an extension in its last
+ * component gets the infix appended plus ".png". Used where one trigger writes
+ * several stages (the weave engine's input / atlas / woven trio, #2207).
+ */
+static inline void
+u_capture_intent_sibling_path(const char *png_path, const char *infix, char *out, size_t out_size)
+{
+	if (out == NULL || out_size == 0) {
+		return;
+	}
+	if (png_path == NULL || infix == NULL) {
+		out[0] = '\0';
+		return;
+	}
+	const char *dot = strrchr(png_path, '.');
+	const char *slash = strrchr(png_path, '/');
+	const char *bslash = strrchr(png_path, '\\');
+	if (bslash != NULL && (slash == NULL || bslash > slash)) {
+		slash = bslash;
+	}
+	if (dot != NULL && slash != NULL && dot < slash) {
+		dot = NULL; // a dot in a directory name, not an extension
+	}
+	if (dot == NULL) {
+		snprintf(out, out_size, "%s%s.png", png_path, infix);
+		return;
+	}
+	snprintf(out, out_size, "%.*s%s%s", (int)(dot - png_path), png_path, infix, dot);
+}
+
+/*!
  * Returns true iff there is a pending capture matching @p mode_filter.
  * Caller should run its capture_atlas_to_png with @c intent->path on
  * true and then call @ref u_capture_intent_complete.

@@ -466,6 +466,7 @@ directory from **`$TMPDIR`** — and on macOS `$TMPDIR` is a *per-user*
 |---|---|---|
 | Metal, GL | `/tmp/dxr_atlas_trigger` | `/tmp/dxr_atlas.png` |
 | vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
+| Linux service weave engine (`XR_DXR_weave`: the DisplayXR Browser, weave probes) | the **service's** `$TMPDIR/displayxr_atlas_trigger` (or `…_trigger.<client-exe>`) | `displayxr_atlas.input.png` (caller's buffer) + `displayxr_atlas.png` (DP input, lifted views in) + `displayxr_atlas.woven.png` (post-weave) |
 
 ```bash
 rm -f "$TMPDIR/displayxr_atlas.png" "$TMPDIR/displayxr_atlas_trigger"
@@ -478,6 +479,16 @@ suffixes, and MCP / `xrCaptureAtlasDXR` — see `u_capture_intent.h`. Touching t
 Metal/GL path while running a Vulkan app looks exactly like a broken capture: the
 trigger file simply stays on disk, unconsumed. **Do not unify the two paths
 casually** — the Metal/GL names are baked into existing recipes and notes.
+
+The **desktop-Linux service weave engine** (`comp_multi_weave_linux.c`, #2207)
+uses the same `u_capture_intent` names, but it runs in `displayxr-service`, so
+the trigger goes in the **service's** `$TMPDIR` (set it explicitly on a dev
+service). A per-client trigger names the **client's** executable, not the
+service's: `displayxr_atlas_trigger.chrome` / `.weave_probe_vk_linux` →
+`displayxr_atlas.<exe>{.input,,.woven}.png`. A POST trigger writes all three
+stages; `.projection` writes only the DP input (`displayxr_atlas[.<exe>].projection.png`).
+One WARN per capture (`weave capture (#2207)`). MCP / `xrCaptureAtlasDXR` do
+**not** reach this route. Details: `src/xrt/compositor/multi/comp_multi_weave_capture.h`.
 
 **Alpha is forced opaque by default in every capture** (`u_image_force_opaque_rgba8`,
 issue #425: undefined swapchain alpha otherwise renders the PNG black). That is right

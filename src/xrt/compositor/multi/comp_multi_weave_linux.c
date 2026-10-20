@@ -854,7 +854,8 @@ weave_create_local(
 {
 	VkExtent2D extent = {.width = w, .height = h};
 	// TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
-	// segment's views OUT of this atlas, and flat-blits from it.
+	// segment's views OUT of this atlas and flat-blits from it, and the
+	// #2207 capture reads the atlas back.
 	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
 	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
 	                                          VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -2463,6 +2464,11 @@ weave_run_frame(struct vk_bundle *vk,
 		mc->weave.crop_first_use = true;
 	}
 
+	// #2207: file-trigger capture. One poll per submit; only a submit that
+	// consumed a trigger records readbacks (input / atlas / woven) below and
+	// writes the PNGs after its own completion.
+	const bool capturing = comp_multi_weave_capture_begin(&mc->weave.capture, vk);
+
 	// ---- Record ----
 	// Stage B: the caller's acquire sync_file, imported into acquire_sem, is
 	// waited by this frame's FIRST submit at ALL_COMMANDS — not just TRANSFER |
@@ -2495,6 +2501,11 @@ weave_run_frame(struct vk_bundle *vk,
 	const VkAccessFlags in_access = v6_zero_copy ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
 	weave_acquire_slot(vk, cmd, in, in_stage, in_access);
 	in->first_use = false;
+	if (capturing) {
+		// The caller's buffer exactly as received (GENERAL, just acquired).
+		comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_INPUT, in->image,
+		                                in->w, in->h, in->format, VK_IMAGE_LAYOUT_GENERAL, in_stage, in_access);
+	}
 
 	VkImage dp_src_image = mc->weave.sbs_image;
 	VkImageView dp_src_view = mc->weave.sbs_view;
@@ -2872,6 +2883,16 @@ weave_run_frame(struct vk_bundle *vk,
 		}
 	}
 
+	// #2207: the atlas the DP is about to consume (SBS scratch / v6 crop / the
+	// zero-copy input — all in SHADER_READ_ONLY here), lifted views included.
+	// Recorded before the self-submitting split, so it reads what the DP reads.
+	if (capturing) {
+		comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS,
+		                                dp_src_image, dp_src_w, dp_src_h, dp_src_format,
+		                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	}
+
 	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
 	// DP that submits its own batch during process_atlas would otherwise
 	// execute BEFORE this frame's blits (still unsubmitted in cmd). Flush
@@ -3122,6 +3143,14 @@ weave_run_frame(struct vk_bundle *vk,
 		}
 	}
 
+	// #2207: the woven output, everything drawn (weave, flat bands, overlay).
+	if (capturing) {
+		comp_multi_weave_capture_record(
+		    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_WOVEN, mc->weave.out_image, mc->weave.out_w,
+		    mc->weave.out_h, WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	}
+
 	// Output handed to the caller in GENERAL. A stage-B dma-buf goes to
 	// VK_QUEUE_FAMILY_FOREIGN_EXT (any API / process reads it); a stage-A
 	// OPAQUE_FD to VK_QUEUE_FAMILY_EXTERNAL (a same-driver Vulkan / GL peer).
@@ -3196,6 +3225,24 @@ weave_run_frame(struct vk_bundle *vk,
 	}
 
 	mc->weave.fence_value++;
+
+	// #2207: a capturing submit waits its OWN fence (stage B otherwise leaves
+	// it to the next submit) — without resetting it, so the next submit's
+	// weave_wait_prev_frame still retires it as usual — then encodes the PNGs.
+	// Diagnostic frames only; a timeout leaves the buffers to the next begin.
+	if (capturing) {
+		const bool done =
+		    !mc->weave.fence_pending ||
+		    vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS) == VK_SUCCESS;
+		if (done) {
+			char what[160];
+			snprintf(what, sizeof(what), "client=%s %s layout, output %ux%u",
+			         mc->weave.capture.tag[0] != 0 ? mc->weave.capture.tag : "?",
+			         nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"), mc->weave.out_w,
+			         mc->weave.out_h);
+			comp_multi_weave_capture_finish(&mc->weave.capture, vk, what);
+		}
+	}
 
 	// v12: this output now exists, woven for `woven`.
 	mc->weave.woven_origin = woven;
@@ -3793,6 +3840,19 @@ comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay
 }
 
 void
+comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *tag)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	snprintf(mc->weave.capture.tag, sizeof(mc->weave.capture.tag), "%s", tag != NULL ? tag : "");
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
 comp_multi_weave_fini(struct multi_compositor *mc)
 {
 	if (mc == NULL || !mc->weave.mutex_initialized) {
@@ -3809,6 +3869,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		}
 		// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
 		comp_multi_weave_lift_fini(&mc->weave.lift);
+		comp_multi_weave_capture_release(&mc->weave.capture, vk); // #2207 (idle above)
 		weave_slots_release_all(vk, mc->weave.in_slots);
 		weave_slots_release_all(vk, mc->weave.ov_slots);
 		weave_release_scratch(vk, mc);
