@@ -93,6 +93,13 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// workspace-mode controller and tear down workspace overlay state.
 	unsigned long this_client_pid = (unsigned long)ics->client_state.pid;
 
+	// XR_DXR_input_providers (ADR-034 Am.5): this client's per-client role
+	// overlay is keyed by client_state.id, so it must be released BEFORE
+	// client_state is zeroed below — after the memset the key reads 0, which
+	// is the service's own implicit client, and the departed client's holder
+	// rows stayed listed forever (win-box row 6, 2026-10-19).
+	ipc_server_client_input_release(ics);
+
 	/*
 	 * Remove the thread from the server.
 	 */
@@ -143,9 +150,6 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 	// XR_DXR_stereo_camera (ADR-043): streams are owned by the connection.
 	ipc_server_client_stereo_camera_release(ics);
-
-	// XR_DXR_input_providers (ADR-034 Am.5): session requests die with the connection.
-	ipc_server_client_input_release(ics);
 
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {

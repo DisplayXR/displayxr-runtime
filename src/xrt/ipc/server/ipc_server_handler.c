@@ -9552,6 +9552,13 @@ ipc_server_client_input_release(volatile struct ipc_client_state *ics)
 	}
 	struct xrt_input_selection_client client;
 	input_client_ref(ics, &client);
+	if (client.key == 0) {
+		// Key 0 is the service's own implicit client; a connection never owns
+		// it. Reaching here means client_state was already cleared — refuse
+		// rather than wipe the service's row (the stale-holder bug, row 6).
+		U_LOG_W("input selection: release on a connection with no client id — skipped");
+		return;
+	}
 	xrt_input_selection_client_detach(xis, &client);
 }
 
