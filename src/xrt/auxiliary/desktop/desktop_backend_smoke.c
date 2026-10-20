@@ -30,6 +30,8 @@
  *   desktop_backend_smoke monitors                every monitor, desktop coordinates
  *   desktop_backend_smoke capture X Y W H [OUT.ppm]  one still (native density); stats only,
  *                                                 the pixels go to OUT.ppm only when given
+ *   desktop_backend_smoke sck-stream on|off       (macOS, script) take later captures through a
+ *                                                 one-shot SCStream, the macOS 12.3–13 path
  *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
  *                                                 OS grant from `request` lasts for the rest;
  *                                                 needed on GNOME, where the portal grant lives
@@ -41,6 +43,9 @@
  */
 
 #include "u_desktop.h"
+#ifdef __APPLE__
+#include "u_desktop_macos_capture.h"
+#endif
 
 #include <ctype.h>
 #include <stdio.h>
@@ -402,6 +407,11 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			memcpy(g_parent, tmp, o + 1);
 			printf("parent window: [%s] (%zu bytes)\n", g_parent, o);
 		}
+#ifdef __APPLE__
+	} else if (strcmp(cmd, "sck-stream") == 0 && argc >= 3) {
+		u_desktop_macos_sck_force_stream(strcmp(argv[2], "on") == 0);
+		printf("ScreenCaptureKit path: %s\n", strcmp(argv[2], "on") == 0 ? "one-shot SCStream" : "default");
+#endif
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
 		g_target = strtoull(argv[2], NULL, 10);
 		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);
