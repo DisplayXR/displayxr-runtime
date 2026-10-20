@@ -296,6 +296,47 @@ comp_d3d11_segments_get_metrics(const struct comp_d3d11_segments *segs,
                                 bool primary_has_dp,
                                 struct xrt_segment_metrics *out);
 
+/*!
+ * #2218 (#4): publish the session's local zone mask to every segment DP that
+ * is not the session's own (the primary / the window owner, which the
+ * compositor publishes to itself). The vendor's local-zone verdict is per
+ * PANEL — any 3D pixel on a screen puts that screen's lens in 3D — so each
+ * segment DP receives the mask CROPPED to its segment
+ * (@ref comp_segments_mask_crop_rect), tagged with a generation that changes
+ * with the mask generation and with the crop rect, so the vendor re-evaluates
+ * exactly when either moved. A segment DP without local-zone support, or a
+ * screen the window has left, is cleared instead.
+ *
+ * @param d3d11_context  The context of the device the manager was created on
+ *                       (the output device under the split) — the mask SRV must
+ *                       live on that device, like the atlas.
+ * @param mask_srv       The published mask (R8_UNORM), spanning the window.
+ * @param mask_w/mask_h  Mask dimensions (mask px; may differ from the window).
+ * @param win_w/win_h    The client window in window px (the mask's extent).
+ * @param seq            The mask content generation (the compositor's
+ *                       zone_publish_seq).
+ *
+ * Weave thread, after @ref comp_d3d11_segments_update of the same frame (it
+ * reads the table that update produced).
+ */
+void
+comp_d3d11_segments_publish_zone_mask(struct comp_d3d11_segments *segs,
+                                      void *d3d11_context,
+                                      void *mask_srv,
+                                      uint32_t mask_w,
+                                      uint32_t mask_h,
+                                      uint32_t win_w,
+                                      uint32_t win_h,
+                                      uint64_t seq);
+
+/*!
+ * #2218 (#4): withdraw the zone mask from every segment DP that has one
+ * published (the frame is no longer a zones frame, or the session is tearing
+ * down). Idempotent; a manager with nothing published is a no-op.
+ */
+void
+comp_d3d11_segments_clear_zone_mask(struct comp_d3d11_segments *segs);
+
 #ifdef __cplusplus
 }
 #endif

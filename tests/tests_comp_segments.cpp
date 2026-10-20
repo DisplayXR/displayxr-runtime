@@ -1326,3 +1326,45 @@ TEST_CASE("comp_segments: the lens dead band — 2D after the hand-off dwell, 3D
 		CHECK(comp_segments_cover_dwell_covered(&d, 1));
 	}
 }
+
+TEST_CASE("comp_segments: mask_crop_rect — a segment's share of the zone mask (#2218 #4)", "[comp_segments]")
+{
+	comp_seg_rect out{};
+	SECTION("mask at window resolution: the crop is the segment itself")
+	{
+		comp_seg_rect seg{300, 0, 980, 720};
+		REQUIRE(comp_segments_mask_crop_rect(&seg, 1280, 720, 1280, 720, &out));
+		CHECK(out.x == 300);
+		CHECK(out.y == 0);
+		CHECK(out.w == 980);
+		CHECK(out.h == 720);
+	}
+	SECTION("mask rastered at half resolution: scaled, edges rounded outward")
+	{
+		comp_seg_rect seg{301, 0, 979, 720}; // 301/2 = 150.5 -> 150 .. (1280/2 = 640)
+		REQUIRE(comp_segments_mask_crop_rect(&seg, 1280, 720, 640, 360, &out));
+		CHECK(out.x == 150);
+		CHECK(out.y == 0);
+		CHECK(out.x + out.w == 640);
+		CHECK(out.h == 360);
+	}
+	SECTION("a one-pixel sliver survives the scale")
+	{
+		comp_seg_rect seg{1279, 0, 1, 720};
+		REQUIRE(comp_segments_mask_crop_rect(&seg, 1280, 720, 320, 180, &out));
+		CHECK(out.w >= 1);
+		CHECK(out.x + out.w <= 320);
+	}
+	SECTION("clamped to the mask; empty inputs refuse")
+	{
+		comp_seg_rect seg{1200, 700, 500, 500};
+		REQUIRE(comp_segments_mask_crop_rect(&seg, 1280, 720, 1280, 720, &out));
+		CHECK(out.x + out.w == 1280);
+		CHECK(out.y + out.h == 720);
+		comp_seg_rect empty{0, 0, 0, 720};
+		CHECK_FALSE(comp_segments_mask_crop_rect(&empty, 1280, 720, 1280, 720, &out));
+		CHECK_FALSE(comp_segments_mask_crop_rect(&seg, 0, 720, 1280, 720, &out));
+		CHECK_FALSE(comp_segments_mask_crop_rect(&seg, 1280, 720, 0, 720, &out));
+		CHECK_FALSE(comp_segments_mask_crop_rect(nullptr, 1280, 720, 1280, 720, &out));
+	}
+}

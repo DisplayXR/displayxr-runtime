@@ -336,6 +336,26 @@ comp_segments_cover_dwell_covered(const struct comp_segments_cover_dwell *d, uin
 }
 
 /*!
+ * #2218 (#4): the part of a window-spanning zone mask that belongs to one
+ * segment, in MASK pixels. A zones / Local2D frame's mask covers the whole
+ * client window (@p win_w × @p win_h window px) at its own resolution
+ * (@p mask_w × @p mask_h); the vendor's local-zone verdict is per PANEL (any
+ * 3D pixel on that screen ⟹ that screen's lens goes 3D), so each segment DP
+ * must see only the mask pixels that land on ITS screen. Scales
+ * @p segment_window (window px, @ref comp_segment::window_rect) into mask
+ * space, clamped to the mask and never empty when the segment is not.
+ *
+ * @return false when any dimension is zero (nothing to publish).
+ */
+bool
+comp_segments_mask_crop_rect(const struct comp_seg_rect *segment_window,
+                             uint32_t win_w,
+                             uint32_t win_h,
+                             uint32_t mask_w,
+                             uint32_t mask_h,
+                             struct comp_seg_rect *out_mask_rect);
+
+/*!
  * #2218: would @p window_desktop take the split path at all — is it anything
  * other than wholly on the primary screen? Pure: computes a scratch table and
  * asks @ref comp_segments_table_is_split; no lifecycle, no DPs. The

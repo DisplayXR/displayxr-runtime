@@ -917,6 +917,49 @@ comp_segments_content_ring_put(struct comp_segments_content_ring *r,
 }
 
 bool
+comp_segments_mask_crop_rect(const struct comp_seg_rect *segment_window,
+                             uint32_t win_w,
+                             uint32_t win_h,
+                             uint32_t mask_w,
+                             uint32_t mask_h,
+                             struct comp_seg_rect *out_mask_rect)
+{
+	if (out_mask_rect == NULL) {
+		return false;
+	}
+	memset(out_mask_rect, 0, sizeof(*out_mask_rect));
+	if (segment_window == NULL || win_w == 0 || win_h == 0 || mask_w == 0 || mask_h == 0 ||
+	    segment_window->w == 0 || segment_window->h == 0) {
+		return false;
+	}
+	// Window px -> mask px, edges rounded outward so a sliver of a 3D zone on a
+	// screen is never dropped (the verdict is any-nonzero, so over-covering by
+	// one pixel costs nothing; under-covering loses a zone).
+	const int64_t x0 = ((int64_t)segment_window->x * (int64_t)mask_w) / (int64_t)win_w;
+	const int64_t y0 = ((int64_t)segment_window->y * (int64_t)mask_h) / (int64_t)win_h;
+	int64_t x1 = (((int64_t)segment_window->x + (int64_t)segment_window->w) * (int64_t)mask_w + (int64_t)win_w - 1) /
+	             (int64_t)win_w;
+	int64_t y1 = (((int64_t)segment_window->y + (int64_t)segment_window->h) * (int64_t)mask_h + (int64_t)win_h - 1) /
+	             (int64_t)win_h;
+	int64_t cx0 = x0 < 0 ? 0 : (x0 > (int64_t)mask_w ? (int64_t)mask_w : x0);
+	int64_t cy0 = y0 < 0 ? 0 : (y0 > (int64_t)mask_h ? (int64_t)mask_h : y0);
+	if (x1 > (int64_t)mask_w) {
+		x1 = (int64_t)mask_w;
+	}
+	if (y1 > (int64_t)mask_h) {
+		y1 = (int64_t)mask_h;
+	}
+	if (x1 <= cx0 || y1 <= cy0) {
+		return false;
+	}
+	out_mask_rect->x = (int32_t)cx0;
+	out_mask_rect->y = (int32_t)cy0;
+	out_mask_rect->w = (uint32_t)(x1 - cx0);
+	out_mask_rect->h = (uint32_t)(y1 - cy0);
+	return true;
+}
+
+bool
 comp_segments_content_ring_get(const struct comp_segments_content_ring *r,
                                uint64_t seq,
                                struct comp_segments_content *out)

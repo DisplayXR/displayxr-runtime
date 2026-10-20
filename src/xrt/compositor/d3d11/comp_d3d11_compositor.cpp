@@ -2961,7 +2961,12 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		if (comp_d3d11_segments_enabled(c->segments)) {
 			const struct comp_seg_rect canvas = {0, 0, c->seg_window.w, c->seg_window.h};
 			seg_would_split = comp_d3d11_segments_would_split(c->segments, &c->seg_window, &canvas);
-			if (!zero_copy && !eff_canvas.valid && atlas_srv != nullptr) {
+			// #2218 (#4): a zones / Local2D / explicit-mask frame splits like any
+			// other — its effective canvas IS the whole client window (the table
+			// is exact), the 2D/3D composite runs on the back buffer after the
+			// per-segment weave exactly as after the single-DP weave, and each
+			// segment DP gets its share of the zone mask (d3d11_sync_zone_mask_to_dp).
+			if (!zero_copy && atlas_srv != nullptr) {
 				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
 				                                ? c->xdev->hmd->active_rendering_mode_index
 				                                : 0;
@@ -6815,6 +6820,8 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 		if (c->zone_published) {
 			xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
+			// #2218 (#4): every segment DP too.
+			comp_d3d11_segments_clear_zone_mask(c->segments);
 		}
 		return;
 	}
@@ -6840,6 +6847,12 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	if (ok) {
 		c->zone_published = true;
 	}
+	// #2218 (#4): a window spanning screens — each segment DP gets the mask
+	// cropped to its screen, so a 2D zone on screen B stays 2D there even when
+	// screen A has a 3D zone (the vendor's verdict is per panel). The manager
+	// is created and swapped on this same thread (the weave's), so no lock.
+	comp_d3d11_segments_publish_zone_mask(c->segments, d3d11_out_context(c), srv, mask_w, mask_h,
+	                                      (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
 }
 
 // #439 Phase 3 — like comp_d3d11_outcomp's SRV-only scratch but

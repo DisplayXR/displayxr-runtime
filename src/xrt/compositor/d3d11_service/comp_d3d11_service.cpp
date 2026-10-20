@@ -14781,8 +14781,11 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	memset(&m, 0, sizeof(m)); // memcmp'd by the publish: padding too
 	bool split = false;
 	struct comp_seg_rect win = {};
+	// #2218 (#4): a zones frame (fc->zone_published) no longer keeps the single-DP
+	// path — the per-segment weave is exact for it, and each segment DP gets its
+	// share of the wish mask from service_update_zone_wish_publish.
 	if (kind == PRESENTER_APP_HWND && fc->segments != nullptr && comp_d3d11_segments_enabled(fc->segments) &&
-	    dp != nullptr && dp_input_srv != nullptr && !fc->zone_published && present_rtv != nullptr &&
+	    dp != nullptr && dp_input_srv != nullptr && present_rtv != nullptr &&
 	    svc_seg_window_rect(present_hwnd, &win)) {
 		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
 		const uint32_t mode_index = (sys->xdev != nullptr && sys->xdev->hmd != nullptr)
@@ -22058,6 +22061,11 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 			render_mutex_fair_lock lock(sys);
 			xrt_display_processor_d3d11_clear_local_zone_mask(dp);
 			c->zone_published = false;
+			{
+				// #2218 (#4): the segment DPs too (manager swapped under seg_mutex).
+				std::lock_guard<std::mutex> lk(c->seg_mutex);
+				comp_d3d11_segments_clear_zone_mask(c->segments);
+			}
 			// #1017: never withdraw a panel-wide resource silently — a stale
 			// mask left on the shared DP is invisible otherwise.
 			U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (non-zones frame)",
@@ -22139,6 +22147,17 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	                                                              mask_w, mask_h, (int32_t)origin.x,
 	                                                              (int32_t)origin.y, w, h, c->zone_publish_seq);
 	if (ok) {
+		// #2218 (#4): a window spanning screens — the segment DPs get the wish
+		// cropped to their screens. Same device as the mask (the manager lives
+		// on seg_device; under the split that is the output device, where the
+		// client's weave DP and its mask already are — the tripwire above).
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			if (c->segments != nullptr && c->seg_device == mask_dev) {
+				comp_d3d11_segments_publish_zone_mask(c->segments, svc_context_for_device(sys, mask_dev), srv,
+				                                      mask_w, mask_h, w, h, c->zone_publish_seq);
+			}
+		}
 		if (!c->zone_published) {
 			// #1017: this said "per-client DP", which does not exist on the
 			// pipeline path and sent the zones wedge hunt looking for a limbo
