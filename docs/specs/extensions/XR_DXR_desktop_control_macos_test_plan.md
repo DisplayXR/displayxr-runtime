@@ -50,7 +50,7 @@ Consequences for testing and for ADR-056:
 
 | # | command | expected | observed here |
 |---|---|---|---|
-| O1 | `$S info` | `backend=macos caps=0x3f remembers_in_store=0 access=granted\|denied locked=0 idle=N ms` | `backend=macos caps=0x3f remembers_in_store=0 access=granted locked=0 idle=56047 ms` [verified] |
+| O1 | `$S info` | `backend=macos caps=0x7f remembers_in_store=0 access=granted\|denied locked=0 idle=N ms` (`0x3f` before spec v2, or on a macOS without ScreenCaptureKit) | `backend=macos caps=0x3f remembers_in_store=0 access=granted locked=0 idle=56047 ms` [verified, 2026-10-16, before capture]; `caps=0x7f` [verified, 2026-10-20] |
 | O2 | `$S list` | layer-0 on-screen windows, front-to-back, `z` = index; bundle id as `app`; `FOCUSED` (0x1) on the key window; `MAXIMIZED` (0x4) on windows filling the visible frame; minimized windows of regular apps appended last with `0x2` and their last frame | 17 windows; Cursor's front window `state=0x1`; Photos/Slack/Chrome at `(0,33 1512x855)` `state=0x4` [verified]; a minimized TextEdit window listed last with `state=0x2` [verified] |
 | O3 | `$S pointer` | pointer in top-left global points + its pick | `pointer: (1306,547)` → `window id=37 … title="displayxr-runtime"` [verified] |
 | O4 | `$S pick 500 10` (menu bar) | `shell` | `shell` [verified] |
@@ -158,3 +158,58 @@ control “TextEdit.app”") on the unattended screen; it was not answered, `osa
 clear it: System Settings ▸ Privacy & Security ▸ Automation ▸ Cursor, or
 `tccutil reset AppleEvents com.todesktop.230313mzl4w4u92` (resets all of Cursor's
 Automation answers). This is why §4 opens the document with `open -a` instead.
+
+## 7. Screen capture (spec v2 §10, ADR-056 Amendment 1)
+
+Backend: `u_desktop_macos_capture.m` (ScreenCaptureKit), geometry in
+`u_desktop_macos_logic.c` (unit-tested on every OS: `tests_desktop_control "[macos]"`).
+Capture injects nothing, so it is safe to run while someone uses the Mac — but it needs
+**Screen Recording** for the responsible process (§1: the terminal / IDE for the smoke tool
+and the probe, the `.app` for a real app). Check before running anything:
+`CGPreflightScreenCaptureAccess()` (a three-line C program, or `$S request-scopes capture`
+only if you accept a prompt). The backend never prompts from a capture.
+
+Saved images (`$S capture … OUT.ppm`, the probe's `--save`) can contain private screen
+content: keep them in a scratch directory, never attach or post them, delete them after.
+Statistics (`withheld px`, sizes, timings) are enough for every check below.
+
+```bash
+$S info                                   # caps=0x7f
+$S monitors                               # global points, top-left of the primary display
+$S capture 0 0 3432 1080                  # whole desktop: WxH device px, withheld = layout gaps
+$S capture 100 100 400 300                # region on the 2x built-in display: 800x600
+$S script <<'X'                           # warm timings + the macOS 12.3-13 path
+capture 100 100 400 300
+capture 100 100 400 300
+sck-stream on
+capture 100 100 400 300
+X
+# Through OpenXR, with the safety layer (in-process runtime + sim-display from the build dir):
+XRT_FORCE_MODE=native XRT_PLUGIN_SEARCH_PATH=build/src/xrt/drivers \
+XR_RUNTIME_JSON=build/openxr_displayxr-dev.json desktop_control_probe script caps.txt
+#   caps.txt: request-scopes capture / capture desktop / capture region 100 100 400 300 /
+#             capture window <id from `list`> max=640x640 / capture region 5000 5000 100 100
+```
+
+| # | check | expected | observed here (macOS 26.3, MBP 1512×982 pt 2× + external 1920×1080 pt 2×, 2026-10-20) |
+|---|---|---|---|
+| C1 | `$S info` | `caps=0x7f` | `caps=0x7f` [verified] |
+| C2 | `$S monitors` | one rect per display, mirrors left out | `(0,0 1512x982)`, `(1512,0 1920x1080)` [verified] |
+| C3 | desktop capture | the bounding box at the densest scale; the strip under the shorter display is withheld | `6864x2160`, `592704 withheld px` = 1512 × 98 pt × 4 exactly [verified] |
+| C4 | region on one display | region × that display's backing scale | `800x600` for 400×300 pt on either display [verified] |
+| C5 | region across both displays, over the gap | gap pixels alpha 0 | `1400 900 300 150` → `600x300`, `30464 withheld px` = 112 × 68 pt × 4 exactly [verified] |
+| C6 | geometry: a region vs the same rect cut from a desktop capture, and vs `screencapture -x -R` | identical | byte-identical (mean \|Δ\| 0.00) for both; shifting by 1 pt gives \|Δ\| ≈ 5 [verified] |
+| C7 | timings | well under the 2 s bound | region ~120 ms warm, ~270 ms first in a process; desktop ~280 ms warm; through OpenXR (probe) desktop 1.1 s first, region 0.2–0.35 s [verified] |
+| C8 | `sck-stream on` (the one-shot `SCStream` path of macOS 12.3–13) | same image | byte-identical to `SCScreenshotManager`; region 165–215 ms [verified] |
+| C9 | the app's own window | alpha 0 over its whole frame | a 200×120 pt window of the capturing process → exactly `96000 withheld px` (= 400×240 px), no window pixel visible, for `NSWindowSharingReadOnly` and `None` alike [verified] |
+| C10 | **another app's `NSWindowSharingNone` window** (decision 8) | not shown | macOS 26.3: CGWindowList reports it with `kCGWindowSharingState` 0 to other processes; raw ScreenCaptureKit (`captureImageInRect`) shows **none** of its pixels (what is beneath shows); the backend withholds its whole frame (`96000 withheld px`), 8/8 runs with the window up; the very first run, the freshly built test binary's first launch, captured `0 withheld px` with the raw grab also showing no window pixels — most likely before the window was on screen [verified]. A `ReadOnly` window of the same app is captured normally [verified]. **Open: macOS 14 and 15** |
+| C11 | probe: `request-scopes capture` with Screen Recording granted | `PENDING` → `GRANTED`, no prompt | as expected [verified] |
+| C12 | probe: `capture window <id>` / `max=640x640` / unknown id / region off every display | the window's frame as on screen / scaled down / `WINDOW_LOST` / `REFUSED "found nothing: outside every monitor"` | `1840x928` from `(447,76 920x464)`; `640x323`; `WINDOW_LOST`; `REFUSED` [verified] |
+| C13 | lock the screen, capture | `refused — screen locked` | `$S capture` while the screen was locked: `refused — screen locked`; `monitors` still answered from the online displays [verified] |
+| C14 | Screen Recording **not** granted, `$S capture …` | `not-granted — Screen Recording permission is not granted`, **no prompt** | not run (this terminal holds the grant) |
+| C15 | revoke Screen Recording in System Settings while a probe session runs, capture | `NOT_GRANTED`, CAPTURE `DENIED` (event); later `request-scopes capture` does not prompt again | not run |
+| C16 | `request-scopes capture+again` in the probe | System Settings opens on Privacy & Security ▸ Screen Recording; answered at once when already granted | not run (would open System Settings on a working screen) |
+| C17 | the menu-bar screen-recording indicator | shows during a capture burst | not observed (no one looking at the screen) |
+| C18 | macOS 15's periodic "continue to allow screen recording" confirmation (decision 8) | record whether it fires for stills | not observable on 26.3 in one session; open on 15 |
+| C19 | a non-Retina (1×) external display | region × 1 on it; a region spanning 1× and 2× is ×2 with the 1× part sampled up | not run (both displays here are 2×); the geometry is pinned by the unit test |
+| C20 | macOS < 12.3 (or without ScreenCaptureKit) | runtime loads, `caps=0x3f`, CAPTURE `UNSUPPORTED` | not run; `otool -L` shows ScreenCaptureKit as `LC_LOAD_WEAK_DYLIB` [verified] |
