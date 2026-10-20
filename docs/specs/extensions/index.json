@@ -145,7 +145,7 @@
     "XR_DXR_desktop_control": {
       "group": "agent",
       "title": "Desktop Control",
-      "summary": "An app's agent observes and operates the desktop (windows, UI text, typing, clicks) through the OS's own consent, granted to the app, never to DisplayXR"
+      "summary": "An app's agent observes and operates the desktop (windows, UI text, typing, clicks) and, as a separate consent scope, captures screen stills, through the OS's own consent, granted to the app, never to DisplayXR"
     },
     "XR_DXR_atlas_capture": {
       "group": "capture",

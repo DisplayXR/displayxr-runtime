@@ -48,6 +48,10 @@
  * the result arrives as XrEventDataDesktopActionCompletedDXR through xrPollEvent.
  * Observation calls are synchronous and cheap.
  *
+ * Spec version 2 adds screen capture as a second consent SCOPE (CAPTURE, next to
+ * CONTROL = everything in version 1): stills on request, never a stream, never
+ * written to disk by the runtime, behind the same kill switch, lock check and audit log.
+ *
  * Spec: displayxr-runtime docs/specs/extensions/XR_DXR_desktop_control.md
  * Decision: docs/adr/ADR-056-desktop-control-runs-in-the-app.md
  */
@@ -61,7 +65,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_desktop_control 1
-#define XR_DXR_desktop_control_SPEC_VERSION 1
+#define XR_DXR_desktop_control_SPEC_VERSION 2
 #define XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME "XR_DXR_desktop_control"
 
 #define XR_TYPE_DESKTOP_WINDOW_DXR                          ((XrStructureType)1004999400)
@@ -70,6 +74,11 @@ extern "C" {
 #define XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR     ((XrStructureType)1004999403)
 #define XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR ((XrStructureType)1004999404)
 #define XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR            ((XrStructureType)1004999405)
+// Spec version 2 (screen capture, spec §10, ADR-056 Amendment 1).
+#define XR_TYPE_DESKTOP_CAPTURE_INFO_DXR                     ((XrStructureType)1004999406)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR     ((XrStructureType)1004999407)
+#define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR            ((XrStructureType)1004999408)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
 
 //! The operation is refused by the safety layer (lock screen, kill switch, the
 //! user is typing and the wait timed out, target verification failed). The
@@ -111,6 +120,19 @@ static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_PI
 static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_READ_TEXT_BIT_DXR = 0x00000008;
 static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_WINDOW_ACTIONS_BIT_DXR = 0x00000010;
 static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_INPUT_BIT_DXR = 0x00000020;
+//! Spec version 2: the backend can capture screen pixels (and this system has the
+//! libraries for it). Without it the CAPTURE scope is UNSUPPORTED.
+static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR = 0x00000040;
+
+/*!
+ * Spec version 2: the consent scopes. Each has its own state (XrDesktopControlStateDXR
+ * values), its own state-changed event and its own entry in the user's store.
+ */
+typedef XrFlags64 XrDesktopControlScopeFlagsDXR;
+//! Everything in spec version 1: observation, window actions, input.
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR = 0x00000001;
+//! Screen pixels (xrCaptureDesktopDXR).
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR = 0x00000002;
 
 typedef XrFlags64 XrDesktopWindowStateFlagsDXR;
 static const XrDesktopWindowStateFlagsDXR XR_DESKTOP_WINDOW_STATE_FOCUSED_BIT_DXR    = 0x00000001;
@@ -208,13 +230,74 @@ typedef struct XrDesktopActionDXR {
 /*!
  * Optional argument of xrRequestDesktopControlDXR (pass NULL for none). `reason` is
  * shown to the user in the DisplayXR prompt where DisplayXR draws one (Windows) and
- * written to the audit log. `next` must be NULL in spec version 1.
+ * written to the audit log. Spec version 2: `next` may carry an
+ * XrDesktopControlRequestScopeDXR (other structures in the chain are ignored).
  */
 typedef struct XrDesktopControlRequestInfoDXR {
     XrStructureType            type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR
     const void* XR_MAY_ALIAS   next;
     const char*                reason; //!< UTF-8, e.g. "so Lumo can open apps and type for you"
 } XrDesktopControlRequestInfoDXR;
+
+/*!
+ * Spec version 2. Chained on XrDesktopControlRequestInfoDXR::next: the scopes asked for,
+ * in ONE prompt. Absent = CONTROL only (the version 1 behaviour). A scope already
+ * GRANTED is not asked again. On GNOME one portal dialog covers both scopes, but a
+ * restore token cannot be widened: asking for CAPTURE after CONTROL shows a second,
+ * combined dialog that asks about input again — apps that will capture should ask for
+ * both scopes in their first request.
+ */
+typedef struct XrDesktopControlRequestScopeDXR {
+    XrStructureType                type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR
+    const void* XR_MAY_ALIAS       next;
+    XrDesktopControlScopeFlagsDXR  scopes; //!< non-zero, known bits only
+} XrDesktopControlRequestScopeDXR;
+
+//! Spec version 2: what xrCaptureDesktopDXR captures.
+typedef enum XrDesktopCaptureTargetDXR {
+    XR_DESKTOP_CAPTURE_TARGET_DESKTOP_DXR = 0, //!< the bounding box of every monitor
+    XR_DESKTOP_CAPTURE_TARGET_REGION_DXR  = 1, //!< `region`, desktop coordinates (clipped to the monitors)
+    XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR  = 2, //!< `windowId`'s frame as it is on screen (overlapping windows included)
+    XR_DESKTOP_CAPTURE_TARGET_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopCaptureTargetDXR;
+
+/*!
+ * Spec version 2: one still. The image is RGBA8, sRGB-encoded, straight alpha, top row
+ * first, stride width * 4, scaled down (area filter) to fit maxWidth x maxHeight keeping
+ * the aspect ratio, never up. Withheld pixels — off every monitor, on a monitor the user
+ * did not share, inside a capture-excluded window or one of the app's own windows — are
+ * (0,0,0,0); every other pixel has alpha 255. Map an image pixel back to desktop
+ * coordinates with x = sourceRect.x + (px + 0.5) * sourceRect.width / width (same for y).
+ */
+typedef struct XrDesktopCaptureInfoDXR {
+    XrStructureType            type;      //!< XR_TYPE_DESKTOP_CAPTURE_INFO_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrDesktopCaptureTargetDXR  target;
+    uint64_t                   windowId;  //!< WINDOW
+    XrRect2Di                  region;    //!< REGION
+    uint32_t                   maxWidth;  //!< 1..8192: the image is scaled down to fit, never up
+    uint32_t                   maxHeight; //!< 1..8192
+} XrDesktopCaptureInfoDXR;
+
+typedef struct XrEventDataDesktopCaptureCompletedDXR {
+    XrStructureType            type;       //!< XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrSession                  session;
+    uint64_t                   captureId;
+    XrResult                   result;     //!< XR_SUCCESS or an XR_ERROR_* (as for actions)
+    uint32_t                   width;      //!< image size (0 on failure)
+    uint32_t                   height;
+    XrRect2Di                  sourceRect; //!< what the image covers, desktop coordinates
+    XrTime                     frameTime;  //!< when these pixels were current
+    char                       message[XR_MAX_DESKTOP_MESSAGE_SIZE_DXR];
+} XrEventDataDesktopCaptureCompletedDXR;
+
+typedef struct XrEventDataDesktopCaptureStateChangedDXR {
+    XrStructureType            type;  //!< XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR
+    const void* XR_MAY_ALIAS   next;
+    XrSession                  session;
+    XrDesktopControlStateDXR   state; //!< the CAPTURE scope's state
+} XrEventDataDesktopCaptureStateChangedDXR;
 
 typedef struct XrEventDataDesktopActionCompletedDXR {
     XrStructureType            type;   //!< XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR
@@ -288,6 +371,33 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitDesktopActionDXR)(
     const XrDesktopActionDXR*  action,
     uint64_t*                  actionId);
 
+//! Spec version 2: the CAPTURE scope's state. Never gated, like
+//! xrGetDesktopControlStateDXR (which keeps reporting the CONTROL scope, plus the
+//! capability bits, CAPTURE_BIT included).
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureStateDXR)(
+    XrSession                  session,
+    XrDesktopControlStateDXR*  state);
+
+//! Spec version 2: start one capture. Returns at once with @p captureId (never 0);
+//! exactly one XrEventDataDesktopCaptureCompletedDXR follows while the session exists.
+//! Needs the CAPTURE scope GRANTED (CONTROL is not required) and never prompts. One
+//! capture in flight per session (XR_ERROR_LIMIT_REACHED otherwise); starts are at
+//! least 250 ms apart (an earlier call is accepted and waits).
+typedef XrResult (XRAPI_PTR *PFN_xrCaptureDesktopDXR)(
+    XrSession                       session,
+    const XrDesktopCaptureInfoDXR*  info,
+    uint64_t*                       captureId);
+
+//! Spec version 2: the image of the most recent successful capture (two-call idiom, in
+//! BYTES: countOutput = width * height * 4). Kept until a call copies it out, the next
+//! capture completes, the session ends or 10 s pass; any other id fails validation.
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureImageDXR)(
+    XrSession  session,
+    uint64_t   captureId,
+    uint32_t   capacityInput,
+    uint32_t*  countOutput,
+    uint8_t*   rgba);
+
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrGetDesktopControlStateDXR(XrSession session, XrDesktopControlStateDXR* state, XrDesktopControlCapabilityFlagsDXR* capabilities);
 XRAPI_ATTR XrResult XRAPI_CALL xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestInfoDXR* info);
@@ -296,6 +406,9 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetDesktopPointerDXR(XrSession session, XrDeskt
 XRAPI_ATTR XrResult XRAPI_CALL xrPickDesktopDXR(XrSession session, XrOffset2Di point, XrDesktopPickDXR* pick);
 XRAPI_ATTR XrResult XRAPI_CALL xrGetDesktopTextAtDXR(XrSession session, XrOffset2Di point, uint32_t capacityInput, uint32_t* countOutput, char* buffer);
 XRAPI_ATTR XrResult XRAPI_CALL xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR* action, uint64_t* actionId);
+XRAPI_ATTR XrResult XRAPI_CALL xrGetDesktopCaptureStateDXR(XrSession session, XrDesktopControlStateDXR* state);
+XRAPI_ATTR XrResult XRAPI_CALL xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR* info, uint64_t* captureId);
+XRAPI_ATTR XrResult XRAPI_CALL xrGetDesktopCaptureImageDXR(XrSession session, uint64_t captureId, uint32_t capacityInput, uint32_t* countOutput, uint8_t* rgba);
 #endif
 
 #ifdef __cplusplus
