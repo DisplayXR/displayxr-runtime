@@ -96,6 +96,7 @@
 
 #include <cjson/cJSON.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,18 +600,47 @@ poke_service(void)
 	P("No DisplayXR service reachable — applies at the next session (in-process apps: their next launch).\n");
 }
 
-//! Is @p key a connected screen's key? (Enumeration only — no plug-in is loaded.)
 static bool
-screen_key_connected(const char *key)
+key_ieq(const char *a, const char *b)
 {
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+			return false;
+		}
+	}
+	return *a == *b;
+}
+
+/*!
+ * Find the connected screen @p key names — by its current key or, #2250, by
+ * its EDID-form legacy key. On a hit @p out_key gets the current key and
+ * @p out_legacy the legacy one ("" when it is the same). Runs the full claim
+ * resolution (loads the registered plug-ins, like `displays --claims`): a
+ * vendor-serial key only exists once a plug-in has claimed the screen.
+ */
+static bool
+screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_legacy, size_t legacy_cap)
+{
+	out_key[0] = '\0';
+	out_legacy[0] = '\0';
 	struct os_display_edid_list edid;
 	memset(&edid, 0, sizeof(edid));
 	os_display_edid_enumerate(&edid);
 	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
 	const uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
+	struct xrt_dp_factory_registry reg;
+	memset(&reg, 0, sizeof(reg));
+	target_plugin_resolve_displays(descs, dn, &reg);
 	for (uint32_t i = 0; i < dn; i++) {
-		char k[TARGET_SCREEN_KEY_MAX];
-		if (target_plugin_get_monitor_key(descs[i].monitor_id, k, sizeof(k), NULL, 0) && strcmp(k, key) == 0) {
+		char k[TARGET_SCREEN_KEY_MAX] = {0};
+		char lk[TARGET_SCREEN_KEY_MAX] = {0};
+		if (!target_plugin_get_monitor_key(descs[i].monitor_id, k, sizeof(k), NULL, 0)) {
+			continue;
+		}
+		(void)target_plugin_get_monitor_legacy_key(descs[i].monitor_id, lk, sizeof(lk));
+		if (key_ieq(k, key) || (lk[0] != '\0' && key_ieq(lk, key))) {
+			(void)snprintf(out_key, key_cap, "%s", k);
+			(void)snprintf(out_legacy, legacy_cap, "%s", lk);
 			return true;
 		}
 	}
@@ -649,9 +679,17 @@ cmd_use_screen(const char *id, const char *key, bool machine)
 		P("error: 'dp use --screen' needs one screen key ('all' is for 'dp reset').\n");
 		return 1;
 	}
-	if (!screen_key_connected(key)) {
+	char cur[TARGET_SCREEN_KEY_MAX];
+	char legacy[TARGET_SCREEN_KEY_MAX];
+	if (!screen_key_lookup(key, cur, sizeof(cur), legacy, sizeof(legacy))) {
 		P("note: no connected screen has the key '%s' (see 'dp list'); the preference is stored anyway.\n",
 		  key);
+		legacy[0] = '\0';
+	} else if (!key_ieq(cur, key)) {
+		// #2250: the screen's legacy EDID key — store under the current one.
+		P("note: '%s' is that screen's legacy key; storing the preference under its current key '%s'.\n", key,
+		  cur);
+		key = cur;
 	}
 	if (!plugin_registered(id)) {
 		P("note: '%s' is not a registered display processor; the preference is ignored until it is.\n", id);
@@ -662,6 +700,10 @@ cmd_use_screen(const char *id, const char *key, bool machine)
 		if (rc != 0) {
 			return rc;
 		}
+		if (legacy[0] != '\0') {
+			// One preference per screen: drop a copy under its legacy key (#2250).
+			(void)u_setting_machine_set_preferred_plugin_for_screen(legacy, NULL);
+		}
 		P("Machine-wide per-screen preference set: screen '%s' -> '%s' (a per-user preference for it still "
 		  "wins).\n",
 		  key, id);
@@ -669,6 +711,9 @@ cmd_use_screen(const char *id, const char *key, bool machine)
 		if (!u_setting_user_set_preferred_plugin_for_screen(key, id)) {
 			P("FAIL: could not write the per-user settings file (invalid key, or I/O error).\n");
 			return 1;
+		}
+		if (legacy[0] != '\0') {
+			(void)u_setting_user_set_preferred_plugin_for_screen(legacy, NULL);
 		}
 		char path[512] = {0};
 		(void)u_setting_user_path(path, sizeof(path));
@@ -682,19 +727,38 @@ static int
 cmd_reset_screen(const char *key, bool machine)
 {
 	const bool all = strcmp(key, "all") == 0;
+	// #2250: a connected screen's other key (current <-> legacy EDID form),
+	// cleared along with the one typed, so either spelling clears the screen.
+	char other[TARGET_SCREEN_KEY_MAX] = {0};
+	if (!all) {
+		char cur[TARGET_SCREEN_KEY_MAX];
+		char legacy[TARGET_SCREEN_KEY_MAX];
+		if (screen_key_lookup(key, cur, sizeof(cur), legacy, sizeof(legacy)) && legacy[0] != '\0') {
+			(void)snprintf(other, sizeof(other), "%s", key_ieq(cur, key) ? legacy : cur);
+		}
+	}
 	if (machine) {
 		const int rc = machine_result(u_setting_machine_set_preferred_plugin_for_screen(all ? NULL : key, NULL),
 		                              "clearing the machine-wide per-screen preference");
 		if (rc != 0) {
 			return rc;
 		}
+		if (other[0] != '\0') {
+			(void)u_setting_machine_set_preferred_plugin_for_screen(other, NULL);
+		}
 	} else {
-		const bool ok = all ? u_setting_user_clear_preferred_plugin_per_screen()
-		                    : u_setting_user_set_preferred_plugin_for_screen(key, NULL);
+		bool ok = all ? u_setting_user_clear_preferred_plugin_per_screen()
+		              : u_setting_user_set_preferred_plugin_for_screen(key, NULL);
+		if (ok && other[0] != '\0') {
+			ok = u_setting_user_set_preferred_plugin_for_screen(other, NULL);
+		}
 		if (!ok) {
 			P("FAIL: could not update the per-user settings file.\n");
 			return 1;
 		}
+	}
+	if (other[0] != '\0') {
+		P("(also cleared under the same screen's other key '%s')\n", other);
 	}
 	P("%s per-screen preference%s cleared%s%s%s.\n", machine ? "Machine-wide" : "Per-user", all ? "s" : "",
 	  all ? "" : " for screen '", all ? "" : key, all ? "" : "'");

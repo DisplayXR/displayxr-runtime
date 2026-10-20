@@ -318,22 +318,93 @@ key_base(const struct target_screen_key_input *m, char *out, size_t cap)
 	(void)snprintf(out, cap, "%s-%04X-%08X", pnp, (unsigned)m->product_id, (unsigned)m->serial);
 }
 
-void
-target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, char (*out)[TARGET_SCREEN_KEY_MAX])
+bool
+target_screen_key_sanitize_serial(const char *in, char *out, size_t cap)
 {
-	if (in == NULL || out == NULL) {
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (in == NULL) {
+		return false;
+	}
+	size_t n = 0;
+	for (const char *c = in; *c != '\0' && n + 1 < cap && n < TARGET_SCREEN_KEY_SERIAL_MAX; c++) {
+		const unsigned char ch = (unsigned char)*c;
+		const bool keep = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+		                  ch == '.' || ch == '_' || ch == '-';
+		if (keep && !(ch == '-' && n == 0)) {
+			out[n++] = (char)ch;
+		}
+	}
+	while (n > 0 && out[n - 1] == '-') {
+		n--;
+	}
+	out[n] = '\0';
+	return n > 0;
+}
+
+int
+target_screen_key_serial_pick(const uint32_t *confidences, const char *const *serials, uint32_t n)
+{
+	if (confidences == NULL || serials == NULL) {
+		return -1;
+	}
+	int best = -1;
+	for (uint32_t i = 0; i < n; i++) {
+		char tmp[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+		if (confidences[i] <= (uint32_t)XRT_DISPLAY_CLAIM_FALLBACK ||
+		    !target_screen_key_sanitize_serial(serials[i], tmp, sizeof(tmp))) {
+			continue;
+		}
+		if (best < 0 || confidences[i] > confidences[best]) {
+			best = (int)i;
+		}
+	}
+	return best;
+}
+
+/*!
+ * The unqualified key of @p m: with @p use_vendor, the vendor form when it
+ * applies (#2250; @p out_vendor_form says so), else the EDID form.
+ */
+static void
+key_base_ex(const struct target_screen_key_input *m, bool use_vendor, char *out, size_t cap, bool *out_vendor_form)
+{
+	char vs[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+	const bool vendor =
+	    use_vendor && m->serial == 0 && target_screen_key_sanitize_serial(m->vendor_serial, vs, sizeof(vs));
+	if (out_vendor_form != NULL) {
+		*out_vendor_form = vendor;
+	}
+	if (vendor) {
+		char pnp[4];
+		target_screen_pnp_code(m->manufacturer_id, pnp);
+		(void)snprintf(out, cap, "%s-%s", pnp, vs);
 		return;
 	}
+	key_base(m, out, cap);
+}
+
+static void
+keys_build_form(const struct target_screen_key_input *in,
+                uint32_t n,
+                bool use_vendor,
+                char (*out)[TARGET_SCREEN_KEY_MAX])
+{
 	for (uint32_t i = 0; i < n; i++) {
 		char base[TARGET_SCREEN_KEY_MAX];
-		key_base(&in[i], base, sizeof(base));
-		bool qualify = in[i].serial == 0;
+		bool vendor_form = false;
+		key_base_ex(&in[i], use_vendor, base, sizeof(base), &vendor_form);
+		// A zero EDID serial names no panel, so the EDID form is always
+		// qualified; a vendor serial does, so only a collision qualifies it.
+		bool qualify = in[i].serial == 0 && !vendor_form;
 		for (uint32_t j = 0; j < n && !qualify; j++) {
 			if (j == i) {
 				continue;
 			}
 			char other[TARGET_SCREEN_KEY_MAX];
-			key_base(&in[j], other, sizeof(other));
+			key_base_ex(&in[j], use_vendor, other, sizeof(other), NULL);
 			qualify = strcmp(base, other) == 0;
 		}
 		const char *dev = in[i].device_name;
@@ -348,6 +419,59 @@ target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, c
 		} else {
 			(void)snprintf(out[i], TARGET_SCREEN_KEY_MAX, "%s", base);
 		}
+	}
+}
+
+void
+target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, char (*out)[TARGET_SCREEN_KEY_MAX])
+{
+	if (in == NULL || out == NULL) {
+		return;
+	}
+	keys_build_form(in, n, false, out);
+}
+
+static bool
+key_ieq(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+			return false;
+		}
+	}
+	return *a == *b;
+}
+
+enum target_screen_key_match
+target_screen_key_pref_match(const char *key, const char *legacy_key, target_screen_key_has_fn has, void *userdata)
+{
+	if (has == NULL) {
+		return TARGET_SCREEN_KEY_MATCH_NONE;
+	}
+	if (key != NULL && key[0] != '\0' && has(key, userdata)) {
+		return TARGET_SCREEN_KEY_MATCH_CURRENT;
+	}
+	if (legacy_key != NULL && legacy_key[0] != '\0' && (key == NULL || !key_ieq(key, legacy_key)) &&
+	    has(legacy_key, userdata)) {
+		return TARGET_SCREEN_KEY_MATCH_LEGACY;
+	}
+	return TARGET_SCREEN_KEY_MATCH_NONE;
+}
+
+void
+target_screen_keys_build_ex(const struct target_screen_key_input *in,
+                            uint32_t n,
+                            char (*out)[TARGET_SCREEN_KEY_MAX],
+                            char (*legacy_out)[TARGET_SCREEN_KEY_MAX])
+{
+	if (in == NULL) {
+		return;
+	}
+	if (out != NULL) {
+		keys_build_form(in, n, true, out);
+	}
+	if (legacy_out != NULL) {
+		keys_build_form(in, n, false, legacy_out);
 	}
 }
 

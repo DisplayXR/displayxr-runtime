@@ -2514,8 +2514,12 @@ static struct
 	uint64_t monitor_id;
 	struct os_display_edid_monitor mon;
 	struct xrt_display_descriptor desc;
-	//! Stable screen key (target_screen_keys_build), the per-screen preference's identity.
+	//! Stable screen key (target_screen_keys_build_ex), the per-screen preference's identity.
 	char key[TARGET_SCREEN_KEY_MAX];
+	//! The EDID-form key (pre-#2250); equals @ref key unless a vendor serial keys the monitor.
+	char legacy_key[TARGET_SCREEN_KEY_MAX];
+	//! Sanitised vendor serial from a claim (target_screen_key_serial_pick), "" = none; kept across re-probes.
+	char vendor_serial[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
 	//! OS device name the key was qualified with (Windows GDI name, else output / connector).
 	char device_name[64];
 	//! Every plug-in that claimed this monitor in the last resolve, in source order (dashboard).
@@ -2529,6 +2533,32 @@ static struct
 	bool edid_carried;
 } g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_monitor_side_count = 0;
+
+/*!
+ * (Re)derive every side-table monitor's screen key and EDID-form key from its
+ * EDID identity, device name and remembered vendor serial (#2250). Caller
+ * holds @ref g_refresh_mutex.
+ */
+static void
+monitor_side_rebuild_keys(void)
+{
+	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
+	char keys[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	char legacy[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	const uint32_t n = g_monitor_side_count;
+	for (uint32_t i = 0; i < n; i++) {
+		key_in[i].manufacturer_id = g_monitor_side[i].mon.manufacturer_id;
+		key_in[i].product_id = g_monitor_side[i].mon.product_id;
+		key_in[i].serial = g_monitor_side[i].mon.serial_number;
+		key_in[i].device_name = g_monitor_side[i].device_name;
+		key_in[i].vendor_serial = g_monitor_side[i].vendor_serial;
+	}
+	target_screen_keys_build_ex(key_in, n, keys, legacy);
+	for (uint32_t i = 0; i < n; i++) {
+		(void)snprintf(g_monitor_side[i].key, sizeof(g_monitor_side[i].key), "%s", keys[i]);
+		(void)snprintf(g_monitor_side[i].legacy_key, sizeof(g_monitor_side[i].legacy_key), "%s", legacy[i]);
+	}
+}
 
 /*!
  * What the ACTIVE plug-in said about its panel (`get_display_info`), noted by
@@ -2783,9 +2813,26 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		d->flags = m->is_primary ? 1u : 0u;
 	}
 
+	// #2250: what the last resolve learned of each monitor's vendor serial,
+	// by EDID-form key, so the key does not drop back to the EDID form
+	// between this enumeration and the next resolve (or while the claim that
+	// carried the serial is momentarily absent, e.g. present-not-ready).
+	struct
+	{
+		char legacy_key[TARGET_SCREEN_KEY_MAX];
+		char vendor_serial[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+	} prev_serial[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t prev_count = g_monitor_side_count;
+	for (uint32_t i = 0; i < prev_count; i++) {
+		(void)snprintf(prev_serial[i].legacy_key, sizeof(prev_serial[i].legacy_key), "%s",
+		               g_monitor_side[i].legacy_key);
+		(void)snprintf(prev_serial[i].vendor_serial, sizeof(prev_serial[i].vendor_serial), "%s",
+		               g_monitor_side[i].vendor_serial);
+	}
+
 	g_monitor_side_count = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
-	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		g_monitor_side[i].vendor_serial[0] = '\0';
 		g_monitor_side[i].monitor_id = out[i].monitor_id;
 		g_monitor_side[i].cand_count = 0;
 		g_monitor_side[i].cands_valid = false;
@@ -2794,18 +2841,22 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		g_monitor_side[i].edid_read_ns = read_ns[i];
 		g_monitor_side[i].edid_carried = carried[i];
 		monitor_device_name(&mons[i], g_monitor_side[i].device_name, sizeof(g_monitor_side[i].device_name));
-		key_in[i].manufacturer_id = mons[i].manufacturer_id;
-		key_in[i].product_id = mons[i].product_id;
-		key_in[i].serial = mons[i].serial_number;
-		key_in[i].device_name = g_monitor_side[i].device_name;
 	}
 	// Display dashboard phase 7: the stable key a per-screen preference is
-	// stored under (the monitor id is per boot).
-	char keys[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
-	target_screen_keys_build(key_in, g_monitor_side_count, keys);
+	// stored under (the monitor id is per boot). First the EDID form, which
+	// finds each monitor's remembered vendor serial, then the real keys.
+	monitor_side_rebuild_keys();
 	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
-		(void)snprintf(g_monitor_side[i].key, sizeof(g_monitor_side[i].key), "%s", keys[i]);
+		for (uint32_t j = 0; j < prev_count; j++) {
+			if (prev_serial[j].vendor_serial[0] != '\0' &&
+			    strcmp(prev_serial[j].legacy_key, g_monitor_side[i].legacy_key) == 0) {
+				(void)snprintf(g_monitor_side[i].vendor_serial, sizeof(g_monitor_side[i].vendor_serial),
+				               "%s", prev_serial[j].vendor_serial);
+				break;
+			}
+		}
 	}
+	monitor_side_rebuild_keys();
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
@@ -2846,6 +2897,33 @@ target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap
 		os_mutex_unlock(&g_refresh_mutex);
 	}
 	return found;
+}
+
+bool
+target_plugin_get_monitor_legacy_key(uint64_t monitor_id, char *out_key, size_t key_cap)
+{
+	bool differs = false;
+	if (out_key != NULL && key_cap > 0) {
+		out_key[0] = '\0';
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		differs = g_monitor_side[i].legacy_key[0] != '\0' &&
+		          strcmp(g_monitor_side[i].legacy_key, g_monitor_side[i].key) != 0;
+		if (differs && out_key != NULL && key_cap > 0) {
+			(void)snprintf(out_key, key_cap, "%s", g_monitor_side[i].legacy_key);
+		}
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return differs;
 }
 
 bool
@@ -3432,6 +3510,72 @@ dp_sources_apply_enabled(bool *withdrawn, uint32_t src_count)
 static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_not_ready_prev_count = 0;
 
+struct screen_pref_probe
+{
+	char *buf;
+	size_t cap;
+	enum u_setting_source source;
+};
+
+static bool
+screen_pref_has(const char *key, void *userdata)
+{
+	struct screen_pref_probe *p = (struct screen_pref_probe *)userdata;
+	return u_setting_get_preferred_plugin_for_screen(key, p->buf, p->cap, &p->source) != NULL;
+}
+
+/*!
+ * The per-screen preference for a monitor, by its current key, else by its
+ * EDID-form @p legacy_key (#2250: a preference stored before the key moved to
+ * the vendor serial keeps applying). A per-user legacy match is re-keyed in
+ * the store (one WARN; the next probe matches the current key directly); an
+ * env / machine one cannot be (no write access from here), so it is WARNed
+ * once per process with the command that re-stores it. Caller holds
+ * @ref g_refresh_mutex (it also guards the WARN latch).
+ */
+static bool
+screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t cap, enum u_setting_source *out_source)
+{
+	struct screen_pref_probe probe = {buf, cap, U_SETTING_SOURCE_DEFAULT};
+	const enum target_screen_key_match m = target_screen_key_pref_match(key, legacy_key, screen_pref_has, &probe);
+	*out_source = probe.source;
+	if (m == TARGET_SCREEN_KEY_MATCH_NONE) {
+		buf[0] = '\0';
+		*out_source = U_SETTING_SOURCE_DEFAULT;
+		return false;
+	}
+	if (m == TARGET_SCREEN_KEY_MATCH_CURRENT) {
+		return true;
+	}
+	if (probe.source == U_SETTING_SOURCE_USER && u_setting_user_set_preferred_plugin_for_screen(key, buf) &&
+	    u_setting_user_set_preferred_plugin_for_screen(legacy_key, NULL)) {
+		U_LOG_W(
+		    "plugin loader: per-screen preference '%s' -> '%s' re-keyed to '%s' (per-user store): the screen "
+		    "is now keyed by its vendor serial, which survives a cable or port change (#2250)",
+		    legacy_key, buf, key);
+		return true;
+	}
+	static char s_warned[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	static uint32_t s_warned_count = 0;
+	for (uint32_t i = 0; i < s_warned_count; i++) {
+		if (strcmp(s_warned[i], legacy_key) == 0) {
+			return true;
+		}
+	}
+	if (s_warned_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
+		(void)snprintf(s_warned[s_warned_count++], TARGET_SCREEN_KEY_MAX, "%s", legacy_key);
+	}
+	U_LOG_W(
+	    "plugin loader: per-screen preference '%s' -> '%s' (%s) matched by the screen's legacy EDID key; its "
+	    "key is now '%s' (vendor serial, #2250)%s",
+	    legacy_key, buf, u_setting_source_str(probe.source), key,
+	    probe.source == U_SETTING_SOURCE_MACHINE ? " — re-store it with 'displayxr-cli dp use <id> --screen <key> "
+	                                               "--machine' (admin)"
+	    : probe.source == U_SETTING_SOURCE_ENV ? " — update " U_SETTING_PER_SCREEN_ENV
+	                                           : " — re-keying the per-user store failed");
+	return true;
+}
+
 void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
@@ -3499,6 +3643,37 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		src_view[s].confidences = src_conf[s];
 		src_view[s].count = src_claim_count[s];
 	}
+
+	// #2250: a monitor with no EDID serial is keyed by a claim's vendor
+	// serial, which names the panel whatever cable it is on (its EDID product
+	// code can differ per input). Picked from every claim, not the winner:
+	// the key decides the per-screen preference, which decides the winner.
+	// No qualifying claim this time keeps the remembered serial.
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		uint32_t conf[TARGET_PLUGIN_MAX_SOURCES];
+		char ser_buf[TARGET_PLUGIN_MAX_SOURCES][sizeof(src_claims[0][0].serial)];
+		const char *ser[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t k = 0;
+		for (uint32_t s = 0; s < src_count && k < TARGET_PLUGIN_MAX_SOURCES; s++) {
+			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+				if (src_claims[s][c].monitor_id != g_monitor_side[i].monitor_id) {
+					continue;
+				}
+				conf[k] = (uint32_t)src_claims[s][c].confidence;
+				(void)snprintf(ser_buf[k], sizeof(ser_buf[k]), "%.*s", (int)sizeof(ser_buf[k]) - 1,
+				               src_claims[s][c].serial);
+				ser[k] = ser_buf[k];
+				k++;
+				break;
+			}
+		}
+		const int sp = target_screen_key_serial_pick(conf, ser, k);
+		if (sp >= 0) {
+			(void)target_screen_key_sanitize_serial(ser[sp], g_monitor_side[i].vendor_serial,
+			                                        sizeof(g_monitor_side[i].vendor_serial));
+		}
+	}
+	monitor_side_rebuild_keys();
 
 	// #791: an explicit PreferredPlugin override (`displayxr-cli dp use <id>`,
 	// or XRT_PREFERRED_PLUGIN_ID off-Windows) must force the WEAVING DP too, not
@@ -3590,17 +3765,18 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		// Display dashboard phase 7: the per-screen preference, by the
 		// monitor's stable key (env > per-user file > machine).
 		const char *screen_key = "";
+		const char *legacy_key = "";
 		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
 			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
 				screen_key = g_monitor_side[i].key;
+				legacy_key = g_monitor_side[i].legacy_key;
 				break;
 			}
 		}
 		char screen_pref[64] = {0};
 		enum u_setting_source pref_source = U_SETTING_SOURCE_DEFAULT;
 		const bool have_screen_pref =
-		    screen_key[0] != '\0' && u_setting_get_preferred_plugin_for_screen(
-		                                 screen_key, screen_pref, sizeof(screen_pref), &pref_source) != NULL;
+		    screen_pref_lookup(screen_key, legacy_key, screen_pref, sizeof(screen_pref), &pref_source);
 
 		const int pin_idx = target_screen_pin_find(&pins, desc->monitor_id, out_name, conn_name);
 		const char *pin_plugin = pin_idx >= 0 ? pins.pin[pin_idx].plugin_id : NULL;

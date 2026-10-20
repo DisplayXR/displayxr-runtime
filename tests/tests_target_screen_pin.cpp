@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 TEST_CASE("DXR_SCREEN_PLUGIN parses match=id pairs", "[target][screen_pin]")
 {
@@ -408,4 +409,165 @@ TEST_CASE("screen key: PNP-PROD-SERIAL, qualified on a zero serial or a collisio
 		CHECK(std::strlen(keys[0]) == TARGET_SCREEN_KEY_MAX - 1);
 		CHECK(std::string(keys[0]).rfind("AUO-1234-00000000@D", 0) == 0);
 	}
+}
+
+TEST_CASE("screen key: a vendor serial keys a zero-EDID-serial screen across inputs (#2250)", "[target][screen_key]")
+{
+	// "SAM" packed as the EDID stores it: 0x4C2D -> bytes 2D 4C.
+	const uint16_t sam = 0x2D4C;
+	char pnp[4];
+	target_screen_pnp_code(sam, pnp);
+	REQUIRE(std::string(pnp) == "SAM");
+
+	char keys[4][TARGET_SCREEN_KEY_MAX];
+	char legacy[4][TARGET_SCREEN_KEY_MAX];
+
+	SECTION("the same panel on HDMI and on DisplayPort: one key, two legacy keys")
+	{
+		const target_screen_key_input hdmi[] = {{sam, 0x785F, 0, "\\\\.\\DISPLAY5", "VN022513ET0212"}};
+		const target_screen_key_input dp[] = {{sam, 0x7860, 0, "\\\\.\\DISPLAY6", "VN022513ET0212"}};
+		target_screen_keys_build_ex(hdmi, 1, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-VN022513ET0212");
+		CHECK(std::string(legacy[0]) == "SAM-785F-00000000@DISPLAY5");
+		const std::string on_hdmi = keys[0];
+		target_screen_keys_build_ex(dp, 1, keys, legacy);
+		CHECK(std::string(keys[0]) == on_hdmi);
+		CHECK(std::string(legacy[0]) == "SAM-7860-00000000@DISPLAY6");
+	}
+
+	SECTION("no claim serial: today's EDID form, current == legacy")
+	{
+		const target_screen_key_input in[] = {
+		    {sam, 0x785F, 0, "\\\\.\\DISPLAY5", nullptr},
+		    {sam, 0x7860, 0, "\\\\.\\DISPLAY6", ""},
+		};
+		target_screen_keys_build_ex(in, 2, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-785F-00000000@DISPLAY5");
+		CHECK(std::string(keys[1]) == "SAM-7860-00000000@DISPLAY6");
+		CHECK(std::string(keys[0]) == std::string(legacy[0]));
+		CHECK(std::string(keys[1]) == std::string(legacy[1]));
+	}
+
+	SECTION("a non-zero EDID serial keeps the EDID form whatever the claim serial")
+	{
+		const target_screen_key_input in[] = {{sam, 0x785F, 0x0000ABCD, "\\\\.\\DISPLAY5", "VN022513ET0212"}};
+		target_screen_keys_build_ex(in, 1, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-785F-0000ABCD");
+		CHECK(std::string(legacy[0]) == "SAM-785F-0000ABCD");
+	}
+
+	SECTION("the legacy form is exactly target_screen_keys_build")
+	{
+		const target_screen_key_input in[] = {
+		    {sam, 0x785F, 0, "\\\\.\\DISPLAY5", "VN1"},
+		    {sam, 0x785F, 0x01010101, "\\\\.\\DISPLAY1", nullptr},
+		    {sam, 0x785F, 0x01010101, "\\\\.\\DISPLAY3", "VN2"},
+		};
+		char plain[4][TARGET_SCREEN_KEY_MAX];
+		target_screen_keys_build(in, 3, plain);
+		target_screen_keys_build_ex(in, 3, keys, legacy);
+		for (int i = 0; i < 3; i++) {
+			CHECK(std::string(plain[i]) == std::string(legacy[i]));
+		}
+		CHECK(std::string(keys[0]) == "SAM-VN1");
+		CHECK(std::string(keys[1]) == "SAM-785F-01010101@DISPLAY1");
+		CHECK(std::string(keys[2]) == "SAM-785F-01010101@DISPLAY3");
+	}
+
+	SECTION("two screens reporting the same vendor serial are both qualified")
+	{
+		const target_screen_key_input in[] = {
+		    {sam, 0x785F, 0, "\\\\.\\DISPLAY5", "VN1"},
+		    {sam, 0x7860, 0, "\\\\.\\DISPLAY6", "VN1"},
+		};
+		target_screen_keys_build_ex(in, 2, keys, nullptr);
+		CHECK(std::string(keys[0]) == "SAM-VN1@DISPLAY5");
+		CHECK(std::string(keys[1]) == "SAM-VN1@DISPLAY6");
+	}
+
+	SECTION("the serial is reduced to key-safe characters; nothing left = EDID form")
+	{
+		const target_screen_key_input in[] = {
+		    {sam, 0x785F, 0, "\\\\.\\DISPLAY5", " -VN 02=25;13@ET 0212- "},
+		    {sam, 0x7860, 0, "\\\\.\\DISPLAY6", " =;@ "},
+		};
+		target_screen_keys_build_ex(in, 2, keys, legacy);
+		CHECK(std::string(keys[0]) == "SAM-VN022513ET0212");
+		CHECK(std::string(keys[1]) == "SAM-7860-00000000@DISPLAY6");
+
+		char out[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+		const std::string longserial(200, 'A');
+		CHECK(target_screen_key_sanitize_serial(longserial.c_str(), out, sizeof(out)));
+		CHECK(std::strlen(out) == TARGET_SCREEN_KEY_SERIAL_MAX);
+		CHECK_FALSE(target_screen_key_sanitize_serial(nullptr, out, sizeof(out)));
+		CHECK(std::string(out).empty());
+	}
+}
+
+TEST_CASE("screen key: which claim's serial keys the screen (#2250)", "[target][screen_key]")
+{
+	SECTION("the highest confidence above FALLBACK with a serial; ties to the earlier claim")
+	{
+		const uint32_t conf[] = {10, 50, 100, 100};
+		const char *const ser[] = {"SIM", "EDIDSER", "VER1", "VER2"};
+		CHECK(target_screen_key_serial_pick(conf, ser, 4) == 2);
+	}
+	SECTION("a FALLBACK claim's serial never keys a screen")
+	{
+		const uint32_t conf[] = {10};
+		const char *const ser[] = {"SIM"};
+		CHECK(target_screen_key_serial_pick(conf, ser, 1) == -1);
+	}
+	SECTION("a claim without a (usable) serial is skipped")
+	{
+		const uint32_t conf[] = {100, 50, 20};
+		const char *const ser[] = {"", " ", "NR1"};
+		CHECK(target_screen_key_serial_pick(conf, ser, 3) == 2);
+	}
+	SECTION("nothing to pick")
+	{
+		CHECK(target_screen_key_serial_pick(nullptr, nullptr, 0) == -1);
+		const uint32_t conf[] = {100};
+		const char *const ser[] = {""};
+		CHECK(target_screen_key_serial_pick(conf, ser, 1) == -1);
+	}
+}
+
+namespace {
+struct FakeStore
+{
+	std::vector<std::string> keys;
+};
+bool
+fake_has(const char *key, void *ud)
+{
+	const auto *s = static_cast<const FakeStore *>(ud);
+	for (const auto &k : s->keys) {
+		if (k == key) {
+			return true;
+		}
+	}
+	return false;
+}
+} // namespace
+
+TEST_CASE("screen key: a preference stored under the legacy key still matches (#2250)", "[target][screen_key]")
+{
+	const char *cur = "SAM-VN022513ET0212";
+	const char *old_hdmi = "SAM-785F-00000000@DISPLAY5";
+
+	FakeStore none;
+	CHECK(target_screen_key_pref_match(cur, old_hdmi, fake_has, &none) == TARGET_SCREEN_KEY_MATCH_NONE);
+
+	FakeStore legacy_only{{old_hdmi}};
+	CHECK(target_screen_key_pref_match(cur, old_hdmi, fake_has, &legacy_only) == TARGET_SCREEN_KEY_MATCH_LEGACY);
+
+	FakeStore both{{old_hdmi, cur}};
+	CHECK(target_screen_key_pref_match(cur, old_hdmi, fake_has, &both) == TARGET_SCREEN_KEY_MATCH_CURRENT);
+
+	// No vendor serial: current == legacy, so it is a plain current match.
+	FakeStore edid{{old_hdmi}};
+	CHECK(target_screen_key_pref_match(old_hdmi, old_hdmi, fake_has, &edid) == TARGET_SCREEN_KEY_MATCH_CURRENT);
+	CHECK(target_screen_key_pref_match(cur, "", fake_has, &legacy_only) == TARGET_SCREEN_KEY_MATCH_NONE);
+	CHECK(target_screen_key_pref_match(cur, old_hdmi, nullptr, &legacy_only) == TARGET_SCREEN_KEY_MATCH_NONE);
 }

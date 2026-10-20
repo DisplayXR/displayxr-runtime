@@ -506,18 +506,30 @@ Every screen has a `key` that survives a reboot, unlike the per-boot `monitor_id
 ```
 <PNP>-<PROD>-<SERIAL>            e.g.  AUO-B194-0000ABCD
 <PNP>-<PROD>-<SERIAL>@<device>   when the EDID serial is 0, or two screens would collide
+<PNP>-<vendor serial>            EDID serial 0 and a claim carries a vendor serial (#2250)
 ```
 
 `<PNP>` is the 3-letter EDID manufacturer code, `<PROD>` the product code as 4 upper-case
 hex digits, `<SERIAL>` the EDID serial as 8. `<device>` is the OS device name — Windows
 `DISPLAYn` (the GDI name without its `\\.\` namespace, so the key needs no shell escaping),
 the Linux connector, the macOS display UUID. On the two-panel rig both serials are 0:
-`AUO-B194-00000000@DISPLAY1`, `ACR-0001-00000000@DISPLAY5`. Derivation:
-`target_screen_keys_build` (`targets/common/target_screen_pin.h`), unit-tested.
+`AUO-B194-00000000@DISPLAY1`, `ACR-0001-00000000@DISPLAY5`.
+
+**Vendor serial (#2250).** A screen whose EDID serial is 0 is keyed
+`<PNP>-<vendor serial>` (e.g. `SAM-VN022513ET0212`, qualified with `@<device>` only on a
+collision) when a plug-in's claim on it carries a serial — the highest-confidence claim
+above `FALLBACK`, whichever plug-in wins the screen — because a panel can report a
+different EDID product code per input and the device name can move with the port, while
+the vendor serial names the panel. A preference stored under the EDID ("legacy") key keeps
+matching: a per-user one is re-keyed in place with one WARN, an env / machine one is WARNed
+once per process, `dp use --screen <legacy key>` stores under the current key, and
+`dp reset --screen` clears either spelling. Derivation: `target_screen_keys_build_ex`
+(`targets/common/target_screen_pin.h`), unit-tested.
 
 It appears as `screens[*].key` in the snapshot, `claims[*].key` in
-`displays --claims --json` (additive, `schema` stays 1) and `screens[*].key` in
-`dp list --json`. Treat it as an opaque string.
+`displays --claims --json` (additive, `schema` stays 1; `claims[*].legacy_key` is the
+EDID form when it differs, else null — text output prints `legacy='…'`) and
+`screens[*].key` in `dp list --json`. Treat it as an opaque string.
 
 ### 12.2 Store and precedence
 

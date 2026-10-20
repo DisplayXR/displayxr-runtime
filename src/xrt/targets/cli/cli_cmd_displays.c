@@ -173,6 +173,13 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 			} else {
 				cJSON_AddNullToObject(c, "key");
 			}
+			// #2250: the EDID-form key a stored preference may still use (additive).
+			char legacy_key[64] = {0};
+			if (target_plugin_get_monitor_legacy_key(e->monitor_id, legacy_key, sizeof(legacy_key))) {
+				cJSON_AddStringToObject(c, "legacy_key", legacy_key);
+			} else {
+				cJSON_AddNullToObject(c, "legacy_key");
+			}
 			cJSON_AddBoolToObject(c, "forced", e->forced);
 			if (e->forced) {
 				cJSON_AddStringToObject(c, "forced_source",
@@ -240,7 +247,12 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 		   apis, e->serial[0] != '\0' ? "  serial=" : "", e->serial);
 		char key[64] = {0};
 		if (target_plugin_get_monitor_key(e->monitor_id, key, sizeof(key), NULL, 0)) {
-			PT("    key='%s'%s%s%s%s\n", key, e->forced ? "  forced by a per-screen preference (" : "",
+			// #2250: the EDID-form key, when the vendor serial keys the screen.
+			char legacy_key[64] = {0};
+			const bool has_legacy =
+			    target_plugin_get_monitor_legacy_key(e->monitor_id, legacy_key, sizeof(legacy_key));
+			PT("    key='%s'%s%s%s%s%s%s%s\n", key, has_legacy ? "  legacy='" : "", legacy_key,
+			   has_legacy ? "'" : "", e->forced ? "  forced by a per-screen preference (" : "",
 			   e->forced ? u_setting_source_str((enum u_setting_source)e->forced_source) : "",
 			   e->forced ? ")" : "",
 			   (!e->forced && e->preferred_plugin[0] != '\0') ? "  (per-screen preference ignored)" : "");

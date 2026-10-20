@@ -509,13 +509,25 @@ target_plugin_get_monitor_record(uint64_t monitor_id,
  * The stable screen key of a monitor from the last
  * @ref target_plugin_build_descriptors (display dashboard phase 7):
  * `"<PNP>-<PROD>-<SERIAL>"`, `"@<device>"`-qualified when the serial is 0 or
- * two monitors would collide (`target_screen_keys_build`). The identity a
- * per-screen display-processor preference is stored under — unlike the
- * per-boot monitor id it survives a reboot. @p out_device (may be NULL)
+ * two monitors would collide; `"<PNP>-<vendor serial>"` when the EDID serial
+ * is 0 and a plug-in's claim carries a vendor serial (#2250 —
+ * `target_screen_keys_build_ex`; known after the first
+ * @ref target_plugin_resolve_displays, then remembered across re-probes). The
+ * identity a per-screen display-processor preference is stored under — unlike
+ * the per-boot monitor id it survives a reboot. @p out_device (may be NULL)
  * receives the OS device name used to qualify it. False when the id is unknown.
  */
 bool
 target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap);
+
+/*!
+ * The EDID-form ("legacy", pre-#2250) key of a monitor whose current key is
+ * the vendor-serial form. True — and @p out_key filled — only when it differs
+ * from @ref target_plugin_get_monitor_key's; else false and @p out_key = "".
+ * A preference stored under it still applies (and is re-keyed, per user).
+ */
+bool
+target_plugin_get_monitor_legacy_key(uint64_t monitor_id, char *out_key, size_t key_cap);
 
 /*!
  * One plug-in that claimed a monitor (at any confidence) in the last

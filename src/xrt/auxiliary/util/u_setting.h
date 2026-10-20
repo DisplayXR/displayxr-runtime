@@ -162,7 +162,7 @@ u_setting_reload(void);
  *   3. machine       HKLM\Software\DisplayXR\DisplayProcessors\PreferredPlugin,
  *                    value "<key>" (REG_SZ, admin; Windows only)
  *
- * `<key>` is the stable screen key (`target_screen_keys_build`). Every failure
+ * `<key>` is the stable screen key (`target_screen_keys_build_ex`). Every failure
  * is "not set". The stores are read once per process; a long-lived process
  * that must see a newer write (the service, on a display re-probe) calls
  * @ref u_setting_per_screen_reload.
