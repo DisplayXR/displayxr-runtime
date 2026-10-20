@@ -22,6 +22,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -247,6 +248,8 @@ struct target_screen_key_input
 	uint16_t product_id;      //!< EDID product code.
 	uint32_t serial;          //!< EDID serial number (0 = none).
 	const char *device_name;  //!< OS device name (Windows GDI name, Linux connector, macOS display UUID).
+	//! Vendor serial from a plug-in's claim on this monitor (NULL / "" = none), #2250.
+	const char *vendor_serial;
 };
 
 /*!
@@ -266,10 +269,77 @@ target_screen_pnp_code(uint16_t manufacturer_id, char out[4]);
  * would get the same key, that monitor's key gets `"@<device_name>"` appended
  * (`"AUO-1234-00000000@DISPLAY2"`), unique as long as the OS device names are.
  * A Windows GDI name loses its `\\.\` namespace prefix there, so a key never
- * needs shell escaping. Pure.
+ * needs shell escaping. Ignores @ref target_screen_key_input::vendor_serial —
+ * this is the EDID ("legacy") form. Pure.
  */
 void
 target_screen_keys_build(const struct target_screen_key_input *in, uint32_t n, char (*out)[TARGET_SCREEN_KEY_MAX]);
+
+/*!
+ * @ref target_screen_keys_build with the vendor-serial rule (#2250). A monitor
+ * whose EDID serial is 0 and whose @ref target_screen_key_input::vendor_serial
+ * is non-empty is keyed `"<PNP>-<vendor serial>"` instead: the product code
+ * and the `"@<device>"` qualifier are dropped, because both can move with the
+ * cable (a panel can report a different EDID product code per input) while the
+ * vendor serial names the panel itself. It is still `"@<device>"`-qualified
+ * when two monitors of @p in would get the same key. The serial is reduced by
+ * @ref target_screen_key_sanitize_serial; one that reduces to nothing keeps
+ * the EDID form. A monitor with a non-zero EDID serial keeps the EDID form
+ * whatever its vendor serial.
+ *
+ * @p legacy_out (may be NULL) receives every monitor's EDID-form key — exactly
+ * what @ref target_screen_keys_build gives — so a preference stored under it
+ * can still be matched. Pure.
+ */
+void
+target_screen_keys_build_ex(const struct target_screen_key_input *in,
+                            uint32_t n,
+                            char (*out)[TARGET_SCREEN_KEY_MAX],
+                            char (*legacy_out)[TARGET_SCREEN_KEY_MAX]);
+
+//! Longest vendor serial a key keeps (characters), so a key has room for `"@<device>"`.
+#define TARGET_SCREEN_KEY_SERIAL_MAX 40
+
+/*!
+ * Reduce a claim's vendor serial to what a screen key may carry: ASCII
+ * letters, digits, `.`, `_` and `-` are kept, every other byte is dropped, and
+ * leading / trailing `-` are trimmed; at most @ref TARGET_SCREEN_KEY_SERIAL_MAX
+ * characters. False (and @p out = "") when nothing is left. Pure.
+ */
+bool
+target_screen_key_sanitize_serial(const char *in, char *out, size_t cap);
+
+/*!
+ * Which claim's serial keys a monitor (#2250): among @p n claims on it (in
+ * source order = ascending ProbeOrder), the highest-confidence one above
+ * `XRT_DISPLAY_CLAIM_FALLBACK` whose serial survives
+ * @ref target_screen_key_sanitize_serial; a tie goes to the earlier claim. It
+ * does NOT depend on which claim wins the monitor: the key decides the
+ * per-screen preference, so it must not follow from it. Returns the index, or
+ * -1 when no claim qualifies. Pure.
+ */
+int
+target_screen_key_serial_pick(const uint32_t *confidences, const char *const *serials, uint32_t n);
+
+//! Which of a monitor's keys a stored per-screen preference was found under.
+enum target_screen_key_match
+{
+	TARGET_SCREEN_KEY_MATCH_NONE = 0, //!< Neither key has a preference.
+	TARGET_SCREEN_KEY_MATCH_CURRENT,  //!< Found under the current key.
+	TARGET_SCREEN_KEY_MATCH_LEGACY,   //!< Found only under the EDID-form (pre-#2250) key.
+};
+
+//! "Does the store hold a preference for @p key?" — @ref target_screen_key_pref_match's probe.
+typedef bool (*target_screen_key_has_fn)(const char *key, void *userdata);
+
+/*!
+ * Match a monitor's keys against the preference store (#2250): the current
+ * @p key first, then — when it differs (case-insensitively) and is non-empty —
+ * its EDID-form @p legacy_key, so a preference stored before the key moved to
+ * the vendor serial keeps applying. Pure apart from @p has.
+ */
+enum target_screen_key_match
+target_screen_key_pref_match(const char *key, const char *legacy_key, target_screen_key_has_fn has, void *userdata);
 
 #ifdef __cplusplus
 }
