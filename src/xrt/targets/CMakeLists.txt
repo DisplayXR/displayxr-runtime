@@ -33,6 +33,12 @@ if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	endif()
 endif()
 
+# #2264: the macOS live-desktop producer for transparent sessions on a
+# weaving DP (holds the one Screen Recording grant; launchd on demand).
+if(APPLE AND NOT IOS)
+	add_subdirectory(desktop_capture_macos)
+endif()
+
 # ADR-053 D5 (#2033): the conversion-provider satellite host. Desktop only
 # (Android hosts providers in the runtime APK's :conversion process).
 if(XRT_FEATURE_SERVICE AND NOT ANDROID)

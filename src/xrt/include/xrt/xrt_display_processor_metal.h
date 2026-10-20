@@ -203,6 +203,17 @@ struct xrt_display_processor_metal
 	 *
 	 * Pass NULL (or width/height 0) to clear — desktop-only background.
 	 *
+	 * **macOS live desktop (#2264).** A DP that is not alpha-native gets no
+	 * desktop capture of its own on macOS (every capture API there needs the
+	 * Screen Recording grant, which the runtime's displayxr-desktop-capture
+	 * helper holds once for all apps). While a transparent session's content
+	 * is actually transparent, the runtime puts the live desktop behind the
+	 * window UNDER the flattened 2D-under layers, so this texture is then the
+	 * complete background: desktop, then Local2D-under, opaque wherever the
+	 * capture covers the window. The DP composites the atlas OVER it, weaves,
+	 * and alpha-gates. NULL ⟹ content is opaque (or no capture yet): weave
+	 * without compose-under.
+	 *
 	 * Optional — absent slot or NULL ⟹ no-op (part-1-only behavior). Appended
 	 * per ADR-020 (append-only within a major).
 	 *
