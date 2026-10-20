@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Per-screen display processors for a service-side XR_DXR_weave
- *         present-owner on desktop Linux (#2218 item 6): the screens and the
+ *         present-owner on desktop Linux and macOS (#2218 item 6): the screens and the
  *         window placed in ONE pixel frame, so the segment table
  *         (util/comp_segments.h) can be cut for them.
  * @ingroup comp_util
@@ -41,6 +41,27 @@
  *    desktop rects are then used verbatim. Any converted screen makes the
  *    frame ambiguous and the projection refuses (NONE): the window keeps the
  *    single-DP weave it had before.
+ *
+ * ## macOS (the CG frame)
+ *
+ * The macOS service's present-owner reports its window in global CoreGraphics
+ * space (top-left of the main display, y DOWN — AppKit's y-up frame flipped
+ * by the caller, XR_DXR_weave §5d spec v7) in BACKING px of the display the
+ * window is on: points x that display's backing scale. The screen list holds
+ * each display's CGDisplayBounds in POINTS plus its backing scale and native
+ * mode (target_screens, the in-process Metal compositor's convention). So the
+ * whole desktop is placed at the WINDOW's backing scale S
+ * (@ref comp_weave_screens_project_cg): a screen's rect in the window's pixel
+ * frame is its point rect x S (edges rounded independently, so neighbours
+ * share their seam), the window rect is the reported one verbatim, and
+ * `window - screen` is then exactly the single-panel present origin the
+ * engine already feeds a DP (window origin minus the panel's
+ * `lround(points x scale)` origin, comp_multi_weave_macos.c) on every screen
+ * whose own scale is S. A screen at another scale — or whose points x scale
+ * is not its native mode ("looks like" scaled modes) — resamples the window:
+ * flat 2D unless its DP tolerates it, the same policy as everywhere else.
+ * Displays left of / above the main display have negative point origins and
+ * stay negative here.
  *
  * Pure arithmetic, no platform guard, no Vulkan; pinned by
  * tests_comp_weave_screens.
@@ -86,9 +107,11 @@ enum comp_weave_frame
 	COMP_WEAVE_FRAME_LOGICAL = 1,
 	//! The screens' desktop rects are device rects (pure X11 / PHYSICAL layout).
 	COMP_WEAVE_FRAME_DEVICE = 2,
+	//! macOS: CoreGraphics points x the window's backing scale.
+	COMP_WEAVE_FRAME_CG = 3,
 };
 
-//! A short word for @p f ("none", "logical", "device").
+//! A short word for @p f ("none", "logical", "device", "CG").
 const char *
 comp_weave_frame_str(enum comp_weave_frame f);
 
@@ -113,6 +136,45 @@ comp_weave_screens_project(const struct xrt_screen_list *in,
                            struct xrt_screen_list *out,
                            struct comp_seg_rect *out_window);
 
+/*!
+ * The macOS present-owner's window as the bind published it (spec v7
+ * XrWeaveWindowGeometryDXR on macOS).
+ */
+struct comp_weave_window_cg
+{
+	//! windowOriginOnScreen: global CoreGraphics space (y down), backing px of
+	//! the window's display (its points x @ref scale).
+	int32_t x, y;
+	//! Client size, backing px.
+	uint32_t w, h;
+	//! The window's backing scale: the scale of the display its origin was
+	//! resolved on (the reported displayId, else the containing display).
+	float scale;
+};
+
+/*!
+ * macOS: place @p in's screens (CGDisplayBounds points + backing scale) and the
+ * window in the window's own backing-px frame (see "macOS" in the file
+ * comment). Same output contract as @ref comp_weave_screens_project: only the
+ * segment-math fields of @p out are rewritten, so a manager built from @p in
+ * keeps its screen indices.
+ *
+ * @return COMP_WEAVE_FRAME_CG, or COMP_WEAVE_FRAME_NONE for a degenerate window
+ *         or scale (then @p out is a copy of @p in: do not segment).
+ */
+enum comp_weave_frame
+comp_weave_screens_project_cg(const struct xrt_screen_list *in,
+                              const struct comp_weave_window_cg *win,
+                              struct xrt_screen_list *out,
+                              struct comp_seg_rect *out_window);
+
+/*!
+ * A screen's backing scale as the CG projection reads it: the enumerated
+ * desktop scale, else native width / point width, else 1.
+ */
+float
+comp_weave_screens_cg_scale(const struct xrt_screen *s);
+
 //! How two screen lists differ (@ref comp_weave_screens_compare).
 enum comp_weave_screens_change
 {
@@ -124,10 +186,18 @@ enum comp_weave_screens_change
 	//! A screen joined or left, the order changed, or a screen's claimant,
 	//! claim level or role flags changed: the manager is rebuilt.
 	COMP_WEAVE_SCREENS_MEMBERSHIP = 2,
+	//! Nothing but a screen's EDID physical size moved (macOS: CoreGraphics'
+	//! size until IOKit publishes the EDID blob ~0.5-1 s after a plug-in,
+	//! #2097). Not a new screen table — rebuilding a vendor weaver (and
+	//! re-acquiring its eye tracker) for it is wrong, the rule
+	//! comp_segments_dp_key_keeps and the hotplug sweep's generation apply —
+	//! but a holder should keep the refined list.
+	COMP_WEAVE_SCREENS_PHYSICAL_SIZE = 3,
 };
 
 /*!
- * Compare two lists. NULL is the empty list.
+ * Compare two lists. NULL is the empty list. MEMBERSHIP wins over GEOMETRY,
+ * GEOMETRY over PHYSICAL_SIZE.
  */
 enum comp_weave_screens_change
 comp_weave_screens_compare(const struct xrt_screen_list *a, const struct xrt_screen_list *b);

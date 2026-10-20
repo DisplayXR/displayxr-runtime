@@ -697,8 +697,81 @@ vendor. `comp_multi_weave_linux.c` now segments the same way as the Windows sect
   (`xrWeaveSnapWindowRectDXR`) still snaps on the engine's DP; status rows show the engine DP only;
   the shared spatial surface (the Linux workspace) is unchanged — it is fullscreen on the
   system-default screen, the workspace's primary presenter (the Windows "not a finding"), and
-  Linux has no secondary-screen workspace presenter (ADR-052) yet. The macOS weave backends (VK and
-  Metal) and Android keep one DP for now: the macOS VK backend could take the same manager, but its
-  window frame is CoreGraphics global points × backing scale (a different projection, and the
-  service is fed no screen list there yet); the Metal backend needs `comp_metal_segments`; Android
-  has one panel.
+  Linux has no secondary-screen workspace presenter (ADR-052) yet. The macOS weave backends do the
+  same (next section); Android keeps one DP (one panel).
+
+## Present-owners on the macOS service (#2218 item 6)
+
+The macOS twin of the section above. The macOS service's `XR_DXR_weave` engine
+(`comp_multi_weave_macos.c` over a `vk` (MoltenVK, `dp_factory_vk`) or `metal` (`dp_factory_metal`,
+the Leia macOS plug-in's only family) backend) used to weave every present-owner window with ONE
+display processor — the backend's own, from the active plug-in's scalar factory — phased against
+whichever panel the window's origin resolved to. A window wholly on another vendor's screen was
+never woven by that vendor, and a per-screen preference had no effect on it. Now:
+
+- **Screens.** The same feed as Linux (`comp_multi_system_set_screens`, gated
+  `XRT_OS_LINUX_DESKTOP || XRT_OS_MACOS`): at start-up, after every display re-probe (a
+  `dp use --screen` re-claim, the policy watch, the fallback timer), and — macOS only in practice —
+  whenever the display-topology generation moves. On macOS the service's displays change through
+  the in-process hotplug sweep (`target_display_hotplug`, ADR-047 Amendment 8, on by default there),
+  which publishes a new table by bumping `xrt_instance_get_display_generation`; the IPC main loop
+  polls that generation every tick (one mutex read) and refreshes the weave engines when it moved.
+- **EDID refinement is not a new table (#2097).** CoreGraphics lists a hot-plugged monitor's
+  physical size ~0.5–1 s before IOKit publishes the EDID blob (598x341 mm → 600x340 mm). The sweep
+  never bumps its generation for that, and `comp_weave_screens_compare` now classifies it as
+  `COMP_WEAVE_SCREENS_PHYSICAL_SIZE`: the system compositor keeps the refined list but does not
+  move its generation, so no engine rebuilds a vendor weaver (and re-acquires its eye tracker) for
+  it. This applies to Linux as well.
+- **The frame (CG).** The present-owner reports its window in global CoreGraphics space — top-left
+  of the main display, y DOWN (AppKit's y-up frame flipped by the caller, spec v7) — in BACKING px
+  of the display the window is on (points × that display's scale). The screen list holds each
+  display's `CGDisplayBounds` in points plus its backing scale and native mode. The engine already
+  resolves the window's panel (the reported `displayId`, else the containing display); that panel's
+  scale S is the window's. The whole desktop is placed in the window's own px frame at S
+  (`comp_weave_screens_project_cg`): a screen's rect is its point rect × S with each edge rounded
+  like the engine rounds a display's backing origin (`lround`, so neighbours share their seam), and
+  the window rect is the reported one verbatim. `window − screen` is then exactly the present
+  origin the single-DP weave already feeds (`origin − lround(panel points × scale)`) on every screen
+  whose own scale is S — the in-process Metal rule (`comp_metal_segments`: phase = origin + canvas
+  offset = the segment's top-left in that panel's backing px) and what `srWeaverSetPresentOrigin`
+  takes. A screen at another scale (a 1x external next to a 2x laptop), or whose points × scale is
+  not its native mode (a "looks like" scaled mode), resamples the window: flat unless its DP
+  tolerates a resample. Displays left of / above the main display have negative point origins and
+  stay negative (this box's 3D panel at −1920,0).
+- **Managers.** `vk` backend: `comp_vk_native_segments` (`comp_vk_segs`, as on Linux), fed the CG
+  projection through `set_screen_geometry`, per-screen DPs via `create_dp_vk_for_screen`, rebuilt on
+  a generation change. `metal` backend: `comp_metal_segments`, now its own library
+  (`comp_metal_segs`) so `comp_multi` links it, per-screen DPs via `create_dp_metal_for_screen`. Its
+  window is handed in its backing-px mode (`comp_metal_seg_window::px_per_pt` = S: the table is cut
+  in backing px from the screens' points × S, so a window at a half-point position keeps an exact
+  phase); a generation change re-tables the live manager, which keeps every segment DP whose screen
+  is still listed the same way (`comp_segments_dp_key_keeps`).
+- **Which submits.** v3 batch and v6 whose output IS the window — v6 on the `metal` backend with a
+  non-resample-tolerant DP (output sized to the window), or any v6 whose content view equals the
+  window; the `vk` backend sizes v6 to one content view, so it segments a v6 submit only at
+  viewScale 1. Never a legacy single-rect submit, a self-submitting VK DP, or a window whose panel
+  (and so scale) has not been resolved. A window wholly on the system-default screen, and every
+  one-screen system, is the single-DP weave, byte for byte (the `metal` backend keeps feeding the
+  front end's present origin there; the `vk` backend still feeds none).
+- **The weave.** The manager's `record` replaces the one `process_atlas`: the backend's own DP weaves
+  the default screen's segment (the `metal` backend phases it with its segment's origin relative to
+  the default screen — `primary_present_origin`), each other screen's DP its own segment at its own
+  present origin; the flat fill covers the rest. The `vk` path transitions the target back from
+  `PRESENT_SRC_KHR` and continues (v4 overlay blend, `GENERAL` for the caller) unchanged; the
+  `metal` path's post-weave alpha pass and v4 overlay pass run unchanged over the woven output. Every
+  per-screen DP follows the session's confirmed 2D/3D state.
+- **Eyes out.** As on Linux: macOS reports no v19 parts (`segmentCount` 0), so the base eyes are the
+  majority segment's DP's when that is not the default screen.
+- **Log.** `weave(#2218): present-owner screen table generation N (K screen(s), <vk|metal> backend) —
+  …` once per table; `weave(#2218): window X,Y WxH woven per screen (CG frame, scale S, <backend>
+  backend) — [k] screen 0x… by '<plug-in>' (the engine's own DP | a per-screen DP) canvas … present
+  origin …` once per change of the screens a window covers; `… is wholly on the default screen
+  again — single-DP weave` on leaving; plus the managers' own `segments: created a segment DP for
+  screen 0x… … via create_dp_{vk,metal}_for_screen`.
+- **Not yet:** v19 parts on the wire; the drag snap (`xrWeaveSnapWindowRectDXR`, the `metal`
+  backend's `snap_window_rect`) still snaps on the engine's DP; status rows show the engine DP only;
+  the macOS shared spatial surface (the workspace) is unchanged; no session identity is recorded for
+  the engine's DP (`comp_segments_session_dp`), so after a hotplug that moves the system default
+  the engine's DP weaves whatever screen is now the default (the in-process rule keeps it on its own
+  panel) — the engine is per present-owner and short-lived next to a session, so this is left for a
+  follow-up.

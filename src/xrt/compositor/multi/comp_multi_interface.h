@@ -157,18 +157,20 @@ struct vk_bundle;
 struct vk_bundle *
 comp_multi_system_get_vk(struct xrt_system_compositor *xsysc);
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 struct xrt_screen_list;
 
 /*!
  * #2218 item 6: hand the system's screens (xrt_instance_enumerate_displays)
  * to the multi system compositor, together with the DP registry as it stands
- * in @p xsysc's info right now. The desktop-Linux XR_DXR_weave engines weave
- * each present-owner window with the display processor of every screen it
- * covers, against this list. Called by the IPC server at start-up and after
- * every display re-probe; a call that changes nothing (the 10 s fallback
- * re-probe) does not disturb a live engine. No-op when @p xsysc is not a
- * multi system compositor.
+ * in @p xsysc's info right now. The desktop-Linux and macOS XR_DXR_weave
+ * engines weave each present-owner window with the display processor of every
+ * screen it covers, against this list. Called by the IPC server at start-up,
+ * after every display re-probe and whenever the display-topology generation
+ * moves (the macOS hotplug sweep); a call that changes nothing (the 10 s
+ * fallback re-probe), or only refines a screen's EDID physical size (#2097),
+ * does not disturb a live engine. No-op when @p xsysc is not a multi system
+ * compositor.
  *
  * @public @memberof multi_system_compositor
  */

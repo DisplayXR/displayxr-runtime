@@ -6,12 +6,33 @@
 #
 
 if(APPLE AND XRT_HAVE_METAL)
+	# Multi-screen segment manager (ADR-047 D2), its own library so the macOS
+	# service's XR_DXR_weave Metal engine (comp_multi, #2218 item 6) links it
+	# without the whole in-process compositor — the comp_vk_segs /
+	# comp_d3d11_segs pattern. MRR like the rest of the library.
+	add_library(comp_metal_segs STATIC comp_metal_segments.m comp_metal_segments.h)
+	target_link_libraries(
+		comp_metal_segs
+		PUBLIC xrt-interfaces
+		PRIVATE
+			comp_util
+			aux_util
+			aux_os
+			xrt-external-stb
+			"-framework Metal"
+			"-framework Foundation"
+			"-framework CoreFoundation"
+		)
+	target_include_directories(comp_metal_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+	if(TARGET comp_multi)
+		target_link_libraries(comp_multi PRIVATE comp_metal_segs)
+		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS)
+	endif()
+
 	add_library(
 		comp_metal STATIC
 		comp_metal_compositor.m
 		comp_metal_compositor.h
-		comp_metal_segments.m
-		comp_metal_segments.h
 		comp_metal_placement.m
 		comp_metal_placement.h
 		)
@@ -27,6 +48,7 @@ if(APPLE AND XRT_HAVE_METAL)
 		PUBLIC xrt-interfaces
 		PRIVATE
 			comp_util
+			comp_metal_segs
 			aux_util
 			aux_os
 			aux_math

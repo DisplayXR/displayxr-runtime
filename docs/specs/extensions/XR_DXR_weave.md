@@ -1093,6 +1093,14 @@ without it). It does not report the parts yet: `segmentCount` stays 0, and the b
 `XrWeaveOutputDXR::eyes` are those of the screen holding the majority of the window — so a window
 wholly on one screen gets that screen's viewer.
 
+**macOS (#2218).** The macOS service applies the same rule on both weave backends (Vulkan and
+Metal). The window is placed against the screens from `XrWeaveWindowGeometryDXR` as it already is
+(global CoreGraphics space, y down, backing px of the display named by `displayId` or containing the
+origin — that display's backing scale is the window's); a screen at another backing scale, or in a
+"looks like" scaled mode, resamples the window, so its part is flat unless its display processor
+tolerates a resample. Callers on a mixed-scale desktop should chain `displayId`, as before. Parts
+are not reported (`segmentCount` 0) and the base eyes are those of the majority screen, as on Linux.
+
 **What the caller gets.** Chain a zero-initialised `XrWeaveOutputRectPartsDXR` on
 `XrWeaveOutputDXR::next`:
 

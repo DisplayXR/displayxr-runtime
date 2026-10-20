@@ -117,7 +117,9 @@ struct comp_metal_segments
 	struct comp_segment_table table; //!< window_rect / screen_rect / origin in px
 	struct seg_px px[COMP_SEGMENTS_MAX];
 	struct comp_metal_seg_window win;
-	double sx, sy; //!< drawable px per window point
+	double sx, sy; //!< drawable px per table unit (window point, or px with px_per_pt)
+	//! Table units per point: 1 (points), or win.px_per_pt (the service's px frame).
+	double tu;
 
 	struct comp_segments_lifecycle lc;
 	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
@@ -328,6 +330,8 @@ convert_table(struct comp_metal_segments *segs)
 		const uint32_t i = g->screen_index;
 		const struct comp_segments_screen *scr = &segs->screens[i];
 		const double s_scr = segs->scale[i];
+		// Table unit -> that screen's backing px.
+		const double s_unit = s_scr / segs->tu;
 
 		// Window rect (pt, relative to the window) -> drawable px.
 		const int32_t x0 = edge_px((double)g->window_rect.x, sx, segs->win.drawable_w);
@@ -336,11 +340,11 @@ convert_table(struct comp_metal_segments *segs)
 		const int32_t y1 = edge_px((double)g->window_rect.y + g->window_rect.h, sy, segs->win.drawable_h);
 		p->window_px = (struct comp_seg_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
 
-		// Screen rect (pt, relative to the screen) -> that screen's backing px.
-		const int32_t s0x = round_i((double)g->screen_rect.x * s_scr);
-		const int32_t s0y = round_i((double)g->screen_rect.y * s_scr);
-		const int32_t s1x = round_i(((double)g->screen_rect.x + g->screen_rect.w) * s_scr);
-		const int32_t s1y = round_i(((double)g->screen_rect.y + g->screen_rect.h) * s_scr);
+		// Screen rect (table units, relative to the screen) -> that screen's backing px.
+		const int32_t s0x = round_i((double)g->screen_rect.x * s_unit);
+		const int32_t s0y = round_i((double)g->screen_rect.y * s_unit);
+		const int32_t s1x = round_i(((double)g->screen_rect.x + g->screen_rect.w) * s_unit);
+		const int32_t s1y = round_i(((double)g->screen_rect.y + g->screen_rect.h) * s_unit);
 		p->screen_px = (struct comp_seg_rect){s0x, s0y, (uint32_t)(s1x - s0x), (uint32_t)(s1y - s0y)};
 
 		// Present origin: origin + canvas offset == the segment's top-left on
@@ -360,7 +364,8 @@ convert_table(struct comp_metal_segments *segs)
 		if (scr->native_w == 0 || scr->native_h == 0 || s_scr <= 0.0) {
 			p->screen_1to1 = COMP_SEG_1TO1_UNKNOWN;
 		} else {
-			const bool same_scale = fabs(sx - s_scr) < 0.01 && fabs(sy - s_scr) < 0.01;
+			const bool same_scale =
+			    fabs(sx * segs->tu - s_scr) < 0.01 && fabs(sy * segs->tu - s_scr) < 0.01;
 			const bool native = round_i((double)scr->desktop.w * s_scr) == (int32_t)scr->native_w &&
 			                    round_i((double)scr->desktop.h * s_scr) == (int32_t)scr->native_h;
 			p->screen_1to1 = (same_scale && native) ? COMP_SEG_1TO1_YES : COMP_SEG_1TO1_NO;
@@ -468,6 +473,7 @@ comp_metal_segments_create(void *mtl_device, void *command_queue)
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
 	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->mode_index = UINT32_MAX;
+	segs->tu = 1.0;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		segs->st[i].mode_sent = -1;
 	}
@@ -843,8 +849,26 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 	segs->win = *win;
 	segs->sx = (double)win->drawable_w / (double)win->frame_pt.w;
 	segs->sy = (double)win->drawable_h / (double)win->frame_pt.h;
+	segs->tu = win->px_per_pt > 0.0 ? win->px_per_pt : 1.0;
 
-	comp_segments_compute(&win->frame_pt, NULL, segs->screens, segs->screen_count, &segs->table_pt);
+	if (win->px_per_pt > 0.0) {
+		// The service's px frame (#2218 item 6): every screen's point rect at
+		// the window's scale, edges rounded independently (a shared seam stays
+		// shared), lround like the engine's display backing origin.
+		struct comp_segments_screen px[COMP_SEGMENTS_MAX_SCREENS];
+		for (uint32_t i = 0; i < segs->screen_count; i++) {
+			const struct comp_seg_rect *d = &segs->screens[i].desktop;
+			const int32_t x0 = (int32_t)lround((double)d->x * segs->tu);
+			const int32_t y0 = (int32_t)lround((double)d->y * segs->tu);
+			const int32_t x1 = (int32_t)lround((double)(d->x + (int32_t)d->w) * segs->tu);
+			const int32_t y1 = (int32_t)lround((double)(d->y + (int32_t)d->h) * segs->tu);
+			px[i] = segs->screens[i];
+			px[i].desktop = (struct comp_seg_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
+		}
+		comp_segments_compute(&win->frame_pt, NULL, px, segs->screen_count, &segs->table_pt);
+	} else {
+		comp_segments_compute(&win->frame_pt, NULL, segs->screens, segs->screen_count, &segs->table_pt);
+	}
 	// #2247: advance each screen's lens dead band (the hand-off's dwell).
 	(void)comp_segments_cover_dwell_update(&segs->cover, &segs->table_pt, segs->screens, segs->screen_count,
 	                                       os_monotonic_get_ns());
@@ -894,8 +918,9 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 	if (table_changed) {
 		char buf[768];
 		comp_segments_table_format(&segs->table, buf, sizeof(buf));
-		U_LOG_I("segments: window %d,%d %ux%u pt (drawable %ux%u px) -> %s", win->frame_pt.x, win->frame_pt.y,
-		        win->frame_pt.w, win->frame_pt.h, win->drawable_w, win->drawable_h, buf);
+		U_LOG_I("segments: window %d,%d %ux%u %s (drawable %ux%u px) -> %s", win->frame_pt.x, win->frame_pt.y,
+		        win->frame_pt.w, win->frame_pt.h, win->px_per_pt > 0.0 ? "backing px" : "pt", win->drawable_w,
+		        win->drawable_h, buf);
 		for (uint32_t k = 0; k < segs->table.count; k++) {
 			const struct seg_px *p = &segs->px[k];
 			U_LOG_I("segments:  [%u] screen 0x%016llx canvas %d,%d %ux%u px -> panel %d,%d %ux%u px, "
@@ -1179,6 +1204,12 @@ comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enab
 	}
 }
 
+const struct comp_segment_table *
+comp_metal_segments_get_table(const struct comp_metal_segments *segs)
+{
+	return segs != NULL ? &segs->table : NULL;
+}
+
 bool
 comp_metal_segments_get_metrics(const struct comp_metal_segments *segs,
                                 bool primary_has_dp,
@@ -1213,10 +1244,10 @@ comp_metal_segments_get_metrics(const struct comp_metal_segments *segs,
 		m->screen_rect.offset.h = p->metric_screen.y;
 		m->screen_rect.extent.w = (int)p->metric_screen.w;
 		m->screen_rect.extent.h = (int)p->metric_screen.h;
-		m->screen_desktop_left = round_i((double)scr->desktop.x * sx);
-		m->screen_desktop_top = round_i((double)scr->desktop.y * sy);
-		m->screen_desktop_width = (uint32_t)round_i((double)scr->desktop.w * sx);
-		m->screen_desktop_height = (uint32_t)round_i((double)scr->desktop.h * sy);
+		m->screen_desktop_left = round_i((double)scr->desktop.x * sx * segs->tu);
+		m->screen_desktop_top = round_i((double)scr->desktop.y * sy * segs->tu);
+		m->screen_desktop_width = (uint32_t)round_i((double)scr->desktop.w * sx * segs->tu);
+		m->screen_desktop_height = (uint32_t)round_i((double)scr->desktop.h * sy * segs->tu);
 		m->screen_width_m = segs->info[i].width_m;
 		m->screen_height_m = segs->info[i].height_m;
 		m->nominal_viewer_x_m = segs->info[i].nominal_viewer_x_m;

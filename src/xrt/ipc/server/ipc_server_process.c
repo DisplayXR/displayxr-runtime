@@ -76,11 +76,13 @@
 #include "server/ipc_server_linux_input.h" // service-surface input → workspace queues (#710)
 #endif
 
-#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "xrt/xrt_screen.h"
 struct ipc_server;
 static void
 multi_weave_screens_refresh(struct ipc_server *s); // #2218 item 6, defined with the re-probe worker
+static void
+multi_weave_screens_follow_generation(struct ipc_server *s);
 #endif
 
 
@@ -666,8 +668,9 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// ADR-051 D3: the display status snapshot + generation counters.
 	ipc_server_status_init(s);
 
-#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// #2218 item 6: the screens the present-owner weave engines segment against.
+	multi_weave_screens_follow_generation(s); // records the generation it describes
 	multi_weave_screens_refresh(s);
 #endif
 
@@ -949,7 +952,7 @@ repull_display_info_if_unknown(struct ipc_server *s)
 //! that is just reconnecting is not raced.
 #define ADOPTION_RESTART_IDLE_NS ((uint64_t)2 * U_TIME_1S_IN_NS)
 
-#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
  * #2218 item 6: hand the system's screens (with the DP registry as it stands
  * now) to the multi system compositor, whose XR_DXR_weave present-owner
@@ -968,6 +971,37 @@ multi_weave_screens_refresh(struct ipc_server *s)
 		comp_multi_system_set_screens(s->xsysc, list);
 	}
 	free(list);
+}
+
+//! The display-topology generation the weave engines' table was last refreshed for.
+static uint64_t g_weave_screens_display_generation = 0;
+
+/*!
+ * #2218 item 6: the in-process display hotplug sweep (target_display_hotplug,
+ * ADR-047 Amendment 8 — on by default on macOS, where the service has no
+ * other display-change source) publishes a new screen table by moving the
+ * display-topology generation; nothing else tells the weave engines. Polled
+ * from the main loop: one mutex read per tick, a refresh only when it moved.
+ * The sweep never moves it for an EDID physical-size refinement alone
+ * (#2097), and comp_multi_system_set_screens keeps that rule too.
+ */
+static void
+multi_weave_screens_follow_generation(struct ipc_server *s)
+{
+	if (s == NULL || s->xinst == NULL || s->xsysc == NULL) {
+		return;
+	}
+	const uint64_t gen = xrt_instance_get_display_generation(s->xinst);
+	if (gen == g_weave_screens_display_generation) {
+		return;
+	}
+	const bool first = g_weave_screens_display_generation == 0;
+	g_weave_screens_display_generation = gen;
+	if (!first) {
+		U_LOG_I("weave(#2218): display topology generation %llu — refreshing the present-owner screen table",
+		        (unsigned long long)gen);
+		multi_weave_screens_refresh(s);
+	}
 }
 #endif
 
@@ -1040,8 +1074,8 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 		free(list);
 	}
 #endif
-#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	// #2218 item 6: ...and to the desktop-Linux present-owner weave engines.
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #2218 item 6: ...and to the desktop-Linux / macOS present-owner weave engines.
 	multi_weave_screens_refresh(s);
 #endif
 	// ADR-051 D6: a re-probe is a topology event only when it changed the
@@ -1228,6 +1262,12 @@ main_loop(struct ipc_server *s)
 
 		// #962: mirror the compositor's focus into the IPC layer (controller policy).
 		sync_focus_from_compositor(s);
+
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// #2218 item 6: a hotplug the in-process sweep published reaches the
+		// present-owner weave engines.
+		multi_weave_screens_follow_generation(s);
+#endif
 
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
