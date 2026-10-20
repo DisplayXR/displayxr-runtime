@@ -335,6 +335,18 @@ user through the RemoteDesktop portal. See the spec, §12.4.
   id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double),
   `maximized` and `fullscreen`, and, for a transient window such as a popup menu,
   `parent_id`. See the spec, §12.
+- Version 17, `WindowPlacement1`: **`ActivateWindow`'s focus policy.** It takes
+  focus only when the user's latest key press or click went to the app and the
+  user has not left it since (Alt+Tab, Super+H, the dock, a click elsewhere);
+  the app minimizing itself through `SetMinimized` does not count as the user
+  leaving, and a newly created window of the app earns nothing. Otherwise focus
+  stays where it is, the window stays minimized if it was, and the reply is
+  `false`; mutter flags the window as demanding attention if it is covered,
+  minimized or on another workspace (GNOME shows "… is ready") — what GNOME
+  does for any app that asks from the background. Version 15 took focus even while the user
+  typed in another app. Not covered: an app summoned by a global shortcut while
+  the user is in another app (the press is stamped on that app's window). Same
+  method, no new capability bit. See the spec, §11.6.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then

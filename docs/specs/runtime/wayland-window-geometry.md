@@ -1428,9 +1428,9 @@ On `org.displayxr.WindowPlacement1`, each with its own placement capability bit:
   `Main.activateWindow()` would also close the Overview and the calendar. A
   server-roundtrip timestamp brings the window to the front with focus, restores it
   from minimized and switches to its workspace. It is newer than any user input, so
-  focus-stealing prevention does not hold it back: an app takes keyboard focus even
-  while the user is typing in another app (measured, §11.5). Whether to allow that
-  as is, or only after recent input in the app, is a policy choice for the caller.
+  focus-stealing prevention does not hold it back: in version 15 an app took
+  keyboard focus even while the user was typing in another app (measured, §11.5).
+  Version 17 decides first whether the app may take focus at all (§11.6).
 
 The pure part (gate, keep-above bookkeeping, maximized on both sides of mutter 49's
 API change, minimize) is the `OwnWindow` object in `lib.js`, unit-tested by
@@ -1440,13 +1440,27 @@ plugin (`displayxr_linux_set_keep_above` / `_activate_window` / `_set_minimized`
 ### 11.3 Mutter policy a consumer should know
 
 - **Keep-above changes focus for new windows** (mutter's rule, the same for a user's
-  own "Always on Top"). A window that opens underneath a kept-above window on the same
-  workspace, while some window has focus, does not get focus; it is stacked under the
-  focused window and flagged as demanding attention. mutter 47+: when about 60 % or
-  more of it is covered (`window_would_mostly_be_covered_by_always_above_window`,
-  visible area ≤ 40 %); mutter 42–46: any overlap (`window_would_be_covered`).
-  Coverage is measured on the kept-above window's frame rectangle, not its visible
-  pixels — a transparent avatar window counts as its whole rectangle.
+  own "Always on Top"). While some window has focus, a new window that mutter finds
+  covered by a kept-above window does not get focus; it is stacked under the focused
+  window (and flagged as demanding attention if it overlaps that one). Coverage is
+  measured on the kept-above window's frame rectangle, not its visible pixels — a
+  transparent avatar window counts as its whole rectangle. Which rectangle of the
+  new window is tested depends on the version (measured, below):
+  - **mutter 47+** (GNOME 47+, Ubuntu 26.04): the window where it opens, denied
+    when about 60 % or more of it is covered
+    (`window_would_mostly_be_covered_by_always_above_window`, visible area ≤ 40 %).
+  - **mutter 42–46** (Ubuntu 22.04, 24.04): `window_would_be_covered()` runs before
+    the window is placed, on the rectangle `(work-area x, work-area y, W, H)` — the
+    top-left corner of the primary monitor's work area with the new window's size.
+    Any overlap of that rectangle with a kept-above window denies focus, wherever
+    the window then opens; coverage of its final position does not matter (100 %
+    covered still gets focus). In practice: a kept-above avatar on a secondary
+    monitor (the 3D panel, typically) never takes focus from new windows; one on
+    the primary monitor takes it from every new window large enough to reach the
+    avatar from the top-left corner. Measured on mutter 42.9 and 46.2 with 1-px
+    probes (edges at exactly `x + W` and `y + H`), Wayland and Xwayland clients
+    alike, two monitors (the rectangle stays on the primary / (0,0) monitor; a
+    layout where those differ was not tested).
 - **Keep-above and maximize:** a window made above and maximized afterwards stays in
   the top layer only until the next relayer (any window opening), then drops to the
   normal layer while `is_above()` still reads true.
@@ -1490,8 +1504,101 @@ Unity plugin as the caller:
   keep-above re-sent after the drop (done);
 - minimize, then restore from the Ubuntu dock: the weave shows correctly again.
 
-Not verified: GNOME 42–49 at run time (the calls exist in the mutter sources from
-42.0; maximize's API change is handled by an existence check).
+GNOME 42.9 and 46.2 (Ubuntu 22.04 / 24.04 in rootless containers, headless, software
+rendering, GTK4 test windows; extension versions 16 and 17, installed as the
+packages do — on 42 the legacy entry point): the extension loads with no JS errors
+(capabilities 231 on 42, without the move-sync bits as designed; 255 on 46); keep-above
+on and off holds the stack while another window has focus; activate (same
+workspace, from minimized, across workspaces), minimize and restore, MoveWindow; a
+maximized window's keep-above is refused; the undo on disconnect leaves a user's own
+"Always on Top" alone; all four members refused for another process naming the pid
+(version 16; version 17 the same, except that activation from the background is
+refused and flagged by its focus policy, §11.6). The keep-above focus rule was
+measured there too (§11.3). Not verified: GNOME 47–49
+at run time, and anything on real hardware before 50.
+
+### 11.6 ActivateWindow's focus policy (extension version 17)
+
+Version 15 let an app take keyboard focus at any time, also while the user was typing
+in another app (§11.5). From version 17, `ActivateWindow` takes focus only from the
+app itself:
+
+- **Focus** when the user's latest key press or click went to one of the app's
+  windows, and the user has not moved focus away from it since. Then it behaves as
+  before: to the front, restored from minimized, its workspace switched to.
+- **Otherwise no focus:** nothing changes except that mutter flags the window as
+  demanding attention (GNOME shows "… is ready"; a window in full view is not
+  flagged, mutter's rule). A minimized window stays minimized. `ok` is `false`.
+  This is what GNOME does for any app that asks from the background.
+
+"Input" is mutter's per-window user time: mutter stamps it on every key press,
+button press and touch on a window, before shortcuts are handled (`core/events.c`),
+and on every activation.
+
+- For the **app**, only those stamps count (`notify::user-time`, which only
+  `meta_window_set_user_time` emits). A new window's starting value — its creation
+  time, not a stamp — does not: recreating a window or opening a new one earns no
+  focus.
+- For **every other app** the starting value counts too (another app's window that
+  just came up wins; a dialog starts at its parent's time), and so does mutter's own
+  newest input (`Meta.Display.get_last_user_time()`), which a window that closes
+  cannot take back. A time 2^31 ms (24.8 days) or more from now is ignored: the
+  32-bit order does not hold across that distance.
+
+So:
+
+| what the user did last | ActivateWindow |
+|---|---|
+| typed or clicked in another app | no focus |
+| another app's window came up (no input) | no focus |
+| clicked the app, then Alt+Tab / Super+H / minimized it from the dock / clicked elsewhere | no focus ("left it") |
+| clicked or typed in the app, and the app minimized **itself** through `SetMinimized` (also while its dialog had focus) | focus (the app stepped aside; the user did not leave) |
+| clicked or typed in the app, nothing since | focus |
+| no window has focus (and the user has not left the app) | focus (nothing to take it from) |
+| came back to the app (new input in it) after leaving | focus |
+
+It is mutter's own focus-stealing rule, applied with the time of the app's last
+input instead of "now". It also limits the rate by itself: once the user is
+elsewhere, nothing the app does takes focus until the user comes back to it, so no
+separate rate limit is needed. Input injected through the RemoteDesktop portal
+counts like the user's own. An app that wants its window back on screen anyway
+restores it with `SetMinimized(false)`, which never takes focus. A minimize the app
+does any other way (`xdg_toplevel.set_minimized`, a minimize button in its own
+title bar) counts as the user leaving.
+
+**Not covered: a global shortcut that summons the app.** mutter stamps the press on
+the window that has focus (another app's), before the shortcut runs, so an app that
+calls `ActivateWindow` in response is refused and flagged. No current caller does
+this; letting the extension's own `WorkspaceHotkey1` client through for its press
+(the extension knows both) would be the natural follow-up if one does.
+
+Consumers:
+
+- The DisplayXR Unity plugin (`displayxr_linux_activate_window`) logs
+  "window activate: refused" for a `false`; nothing is retried (as before).
+- `XR_DXR_desktop_control` (ADR-056), the app's own window: when `ActivateWindow`
+  refuses, the agent does what the user would, a Super+click on the window through
+  the app's portal session, as it already does for any other window: restored first
+  if minimized, and kept above for the click if it is not already (put back
+  afterwards), so a window covered by another one is reachable. A window on another
+  workspace is not (no visible part to click). `RESTORE` succeeds once the window is
+  restored; focus is best effort. The agent has the user's consent, and its safety
+  layer (idle wait, kill switch, lock) applies to the gesture.
+
+The pure part is `OwnWindow.mayTakeFocus` / `focusMoved` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_own_window.js` (section 6).
+
+Verified (private headless GNOME Shell 50.1, GTK4 test windows, input through that
+instance's `org.gnome.Mutter.RemoteDesktop`): the user types in B, A asks → `false`,
+B keeps focus; the user clicks A, A minimizes itself, A asks → `true`, restored with
+focus; the same but the user types in B after the minimize → `false`, A stays
+minimized and flagged; the user clicks A and presses Super+H → `false`; the user
+clicks A, then minimizes it without a key on it (the dock) → `false`; the user
+clicks A and stays → `true`; the user clicks A, then B opens → `false`; the user
+clicks A, then B, then A again, A minimizes itself and asks → `true`; the user
+clicks A, then Alt+Tab to B → `false`. The version 15 suite passes except its two
+"activate from the background" cases, which now answer `false` and flag the window
+— the change itself. No JS errors.
 
 ## 12. The pointer — `WindowGeometry1.GetPointer` (extension version 16)
 

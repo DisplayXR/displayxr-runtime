@@ -147,6 +147,9 @@
 //             `button` is held, with no grab (see "The pointer drag").
 //   Method  SetKeepAbove(u pid, b above) -> (b ok)           (version 15)
 //   Method  ActivateWindow(u pid) -> (b ok)                  (version 15)
+//             Version 17: takes focus only when the app had the user's
+//             latest input and the user has not left it since; otherwise
+//             only flags the window as demanding attention (ok false).
 //   Method  SetMinimized(u pid, b minimized) -> (b ok)       (version 15)
 //             What a Wayland client cannot do for its own window: keep it
 //             above other windows, bring it to the front with focus (from the
@@ -1054,18 +1057,130 @@
 
         //! SetMinimized on the caller's @p win. Restoring does not focus: an app
         //! that wants its window back in front asks for ActivateWindow, which
-        //! restores it as well.
-        minimize(win, minimized) {
+        //! restores it as well. With @p focus (a newFocusState()), a minimize
+        //! this request made is recorded as the app's own (see focusMoved).
+        minimize(win, minimized, focus = null) {
             if (minimized) {
                 if (typeof win.can_minimize === 'function' && !win.can_minimize())
                     return false;
-                if (!win.minimized)
+                if (!win.minimized) {
                     win.minimize();
+                    if (win.minimized)
+                        focus?.selfMinimized.add(win);
+                }
                 return win.minimized === true;
             }
             if (win.minimized)
                 win.unminimize();
+            focus?.selfMinimized.delete(win);
             return win.minimized === false;
+        },
+
+        /*
+         * ── ActivateWindow's focus policy (version 17) ──
+         *
+         * Version 15 activated with a server timestamp, newer than any input,
+         * so an app took keyboard focus even while the user was typing in
+         * another app (measured; spec §11.5). From version 17 an app takes
+         * focus only from itself: when the user's latest key press or click
+         * went to one of its windows, and the user has not moved focus away
+         * from it since (Alt+Tab, Super+H, minimizing it from the dock, a
+         * click elsewhere — a click elsewhere is also newer input). Otherwise
+         * nothing changes but the window is flagged as demanding attention
+         * (mutter flags it only when covered, minimized or on another
+         * workspace; GNOME then shows "… is ready"), which
+         * is what GNOME does for any app that asks from the background. That
+         * is mutter's own focus-stealing rule, applied with the time of the
+         * app's last input instead of "now". It also limits the rate by
+         * itself: once the user is elsewhere, nothing the app does takes focus
+         * until the user comes back to it. An app that wants its window back
+         * on screen anyway restores it with SetMinimized(false) first, which
+         * never takes focus.
+         *
+         * "Input" is mutter's per-window user time: mutter stamps it on every
+         * key press, button press and touch on a window (core/events.c), before
+         * shortcuts are handled, and on every activation. For the APP only
+         * those stamps count (notify::user-time); a new window's starting
+         * value (its creation time, not a stamp) does not, so recreating a
+         * window or opening a new one earns no focus. For everyone else
+         * (lastInput) the starting value counts too, so another app's window
+         * that just came up wins, as does mutter's own newest input
+         * (Meta.Display.get_last_user_time), which a closed window cannot take
+         * back. Input injected through the RemoteDesktop portal counts like
+         * the user's own.
+         *
+         * Not covered: an app summoned by a global shortcut while the user is
+         * in another app. mutter stamps the press on the focused window, so
+         * the app is refused and flagged.
+         */
+
+        //! mutter's 32-bit event times wrap; @p a is before @p b the way
+        //! XSERVER_TIME_IS_BEFORE reads it. 0 (never set) is before any time.
+        timeBefore(a, b) {
+            if (a === b)
+                return false;
+            if (a === 0)
+                return true;
+            if (b === 0)
+                return false;
+            return ((b - a) >>> 0) < 0x80000000;
+        },
+
+        //! The newest of @p times (0 when there is none). With @p now, by age
+        //! (now - t, mod 2^32): a time 2^31 ms (24.8 days) or more away from
+        //! now is dropped — the 32-bit order is not transitive across that
+        //! distance, so an untouched old window could otherwise read as newer
+        //! than everything. If that drops every time (a clock that does not
+        //! match), the plain order decides.
+        latestTime(times, now = 0) {
+            if (now) {
+                let best = 0, bestAge = 0x80000000;
+                for (const x of times) {
+                    const age = (now - x) >>> 0;
+                    if (x !== 0 && age < bestAge) {
+                        best = x;
+                        bestAge = age;
+                    }
+                }
+                if (best !== 0)
+                    return best;
+            }
+            let t = 0;
+            for (const x of times) {
+                if (OwnWindow.timeBefore(t, x))
+                    t = x;
+            }
+            return t;
+        },
+
+        //! away: pid -> the newest input time when focus left that app's
+        //! window. selfMinimized: windows minimized by their app's own request.
+        newFocusState() {
+            return {away: new Map(), selfMinimized: new WeakSet()};
+        },
+
+        //! Focus moved from a window of @p fromPid to one of @p toPid (0: no
+        //! window). @p lastInput: the newest input time at that moment.
+        //! @p fromSelfMinimized: the window losing focus is minimized by its
+        //! app's own SetMinimized — the app stepped aside, the user did not
+        //! leave it.
+        focusMoved(st, fromPid, toPid, lastInput, fromSelfMinimized) {
+            if (toPid > 0)
+                st.away.delete(toPid);
+            if (fromPid <= 0 || fromPid === toPid || fromSelfMinimized)
+                return;
+            st.away.set(fromPid, lastInput);
+        },
+
+        //! Whether app @p pid may take focus: @p appInput, its newest input,
+        //! is not older than @p lastInput, every other app's newest — or no
+        //! window has focus (@p nobodyFocused: nothing to take it from) — and
+        //! the user has not left the app since its last input.
+        mayTakeFocus(st, pid, appInput, lastInput, nobodyFocused = false) {
+            if (!nobodyFocused && OwnWindow.timeBefore(appInput, lastInput))
+                return false;
+            const away = st.away.get(pid);
+            return away === undefined || OwnWindow.timeBefore(away, appInput);
         },
     };
 
@@ -2590,6 +2705,20 @@
                 //! watch on each such client's bus name (sender -> watch id).
                 this._above = OwnWindow.newTracker();
                 this._aboveWatch = new Map();
+                //! Version 17: ActivateWindow's focus policy (OwnWindow.mayTakeFocus).
+                //! _stamps: pid -> the newest time mutter stamped on its windows
+                //! (input, activation; not a window's starting value).
+                this._focus = OwnWindow.newFocusState();
+                this._stamps = new Map();
+                this._stampSignals = new Map();
+                this._focusWin = global.display.focus_window;
+                this._focusId = global.display.connect('notify::focus-window',
+                    () => this._onFocusWindow());
+                this._createdId = global.display.connect('window-created',
+                    (_d, win) => this._watchStamps(win));
+                // Windows from before: no stamp until their next input.
+                for (const win of this._allWindows())
+                    this._watchStamps(win);
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
@@ -2623,6 +2752,13 @@
             //! Keep-above went off on @p win, whoever cleared it.
             onKeepAboveCleared(win) {
                 OwnWindow.forgetWindow(this._above, win);
+            }
+
+            //! @p win was minimized or restored, by anyone: a restore ends
+            //! "minimized by its own app".
+            onMinimizedChanged(win) {
+                if (!win.minimized)
+                    this._focus.selfMinimized.delete(win);
             }
 
             onWindowUnmanaged(win) {
@@ -2850,6 +2986,20 @@
                 this._destroyed = true;
                 for (const sender of [...this._above.keys()])
                     this._dropAboveClient(sender);
+                if (this._focusId) {
+                    global.display.disconnect(this._focusId);
+                    this._focusId = 0;
+                }
+                if (this._createdId) {
+                    global.display.disconnect(this._createdId);
+                    this._createdId = 0;
+                }
+                for (const [win, ids] of this._stampSignals) {
+                    for (const id of ids)
+                        win.disconnect(id);
+                }
+                this._stampSignals.clear();
+                this._focusWin = null;
                 this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
                 this._lattice = null;
@@ -2949,8 +3099,86 @@
                 });
             }
 
+            _allWindows() {
+                return (typeof global.display.list_all_windows === 'function'
+                    ? global.display.list_all_windows()
+                    : global.get_window_actors().map(a => a.meta_window)).filter(w => !!w);
+            }
+
+            //! Follow the times mutter stamps on @p win (notify::user-time is
+            //! emitted only by meta_window_set_user_time: input, activation).
+            _watchStamps(win) {
+                if (this._stampSignals.has(win) || win.is_override_redirect())
+                    return;
+                this._stampSignals.set(win, [
+                    win.connect('notify::user-time', () => {
+                        const pid = win.get_pid();
+                        if (pid > 0) {
+                            this._stamps.set(pid, OwnWindow.latestTime(
+                                [this._stamps.get(pid) ?? 0, win.get_user_time()]));
+                        }
+                    }),
+                    win.connect('unmanaged', () => {
+                        const pid = win.get_pid();
+                        for (const id of this._stampSignals.get(win) ?? [])
+                            win.disconnect(id);
+                        this._stampSignals.delete(win);
+                        // The app's last window is gone: forget it (a new process
+                        // may get the same pid).
+                        if (pid > 0 && !this._allWindows().some(w => w !== win && w.get_pid() === pid)) {
+                            this._stamps.delete(pid);
+                            this._focus.away.delete(pid);
+                        }
+                    }),
+                ]);
+            }
+
+            //! The newest input time of everyone: mutter's own high-water mark
+            //! and the user time of every window not of @p exceptPid, including
+            //! a new window's starting value (another app's window that just
+            //! came up wins; the app's own starting values are neither its input
+            //! nor anyone else's).
+            _lastInput(exceptPid = 0) {
+                const now = global.display.get_current_time_roundtrip();
+                const times = this._allWindows()
+                    .filter(w => !w.is_override_redirect() && (exceptPid <= 0 || w.get_pid() !== exceptPid))
+                    .map(w => w.get_user_time());
+                if (typeof global.display.get_last_user_time === 'function')
+                    times.push(global.display.get_last_user_time());
+                return OwnWindow.latestTime(times, now);
+            }
+
+            _onFocusWindow() {
+                const from = this._focusWin, to = global.display.focus_window;
+                this._focusWin = to;
+                let fromPid = 0, toPid = 0, selfMinimized = false;
+                try {
+                    // A window that just closed may already be gone.
+                    fromPid = from ? from.get_pid() : 0;
+                    // The app's dialog had focus while the app minimized its
+                    // main window: judge by the window it belongs to.
+                    const root = from?.find_root_ancestor?.() ?? from;
+                    selfMinimized = !!root && root.minimized && this._focus.selfMinimized.has(root);
+                } catch (e) {
+                    fromPid = 0;
+                }
+                toPid = to ? to.get_pid() : 0;
+                OwnWindow.focusMoved(this._focus, fromPid, toPid, this._lastInput(), selfMinimized);
+            }
+
             ActivateWindowAsync([pid], invocation) {
                 this._ownWindowAsync(pid, invocation, win => {
+                    // Version 17: take focus only from the app itself (see the
+                    // focus policy next to OwnWindow.mayTakeFocus). Otherwise
+                    // only flag it, as GNOME does for an app that asks from
+                    // the background; ok = false (no focus).
+                    const app = win.get_pid();
+                    if (!win.has_focus() && !OwnWindow.mayTakeFocus(this._focus, app,
+                        this._stamps.get(app) ?? 0, this._lastInput(app),
+                        global.display.focus_window === null)) {
+                        win.set_demands_attention();
+                        return false;
+                    }
                     // A server timestamp, not 0: activate(0) skips the
                     // focus-stealing check but, for a window on another
                     // workspace, only marks it as demanding attention.
@@ -2962,7 +3190,8 @@
             }
 
             SetMinimizedAsync([pid, minimized], invocation) {
-                this._ownWindowAsync(pid, invocation, win => OwnWindow.minimize(win, minimized));
+                this._ownWindowAsync(pid, invocation,
+                    win => OwnWindow.minimize(win, minimized, this._focus));
             }
 
             MoveWindowAsync([pid, x, y], invocation) {
@@ -3478,7 +3707,10 @@
                     // v15: the snapshot reports both (an app reads its own window's
                     // state back; the user may change either from the dock or
                     // the window menu).
-                    win.connect('notify::minimized', () => this._queueEmit()),
+                    win.connect('notify::minimized', () => {
+                        this._placement?.onMinimizedChanged(win);
+                        this._queueEmit();
+                    }),
                     win.connect('notify::above', () => {
                         // Cleared (by the user from the window menu, or on request):
                         // no longer the extension's to undo — if the user sets it

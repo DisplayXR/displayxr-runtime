@@ -36,6 +36,9 @@
  *
  * WindowPlacement1 (extension v15): MoveWindow, ActivateWindow, SetMinimized —
  * no portal. Maximizing it is UNSUPPORTED (it would fight DisplayXR's placement).
+ * Extension v17 gives ActivateWindow focus only when the app had the user's
+ * latest input; when it refuses, the agent falls back to a Super+click through
+ * the portal, as for any other window (own_activate).
  */
 
 #include "u_desktop_gnome.h"
@@ -395,6 +398,31 @@ gnome_snapshot(struct gnome_backend *g, struct u_desktop_window **out, uint32_t 
 	*out = ws;
 	*n = k;
 	return U_DESKTOP_OK;
+}
+
+int
+gnome_window_above(struct gnome_backend *g, uint64_t id)
+{
+	if (!g->have_ext16) {
+		return -1;
+	}
+	cJSON *root = ext_json(g, "GetAllWindows", false, 0, 0, NULL);
+	if (root == NULL) {
+		return -1;
+	}
+	int above = -1;
+	const cJSON *arr = u_json_get(root, "windows");
+	int total = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+	for (int i = 0; i < total; i++) {
+		const cJSON *w = cJSON_GetArrayItem(arr, i);
+		if (w != NULL && json_u64(u_json_get(w, "id")) == id) {
+			const cJSON *a = u_json_get(w, "above");
+			above = a == NULL ? -1 : json_bool(a) ? 1 : 0;
+			break;
+		}
+	}
+	cJSON_Delete(root);
+	return above;
 }
 
 const struct u_desktop_window *
