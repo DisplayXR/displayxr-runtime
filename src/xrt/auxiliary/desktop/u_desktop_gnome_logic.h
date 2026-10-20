@@ -41,6 +41,9 @@ enum u_desktop_paste_verdict
 	U_DESKTOP_PASTE_LOST_UNCERTAIN,  //!< the user copied after the keystroke: outcome unknown
 	U_DESKTOP_PASTE_NOT_ASKED,       //!< nobody read the agent's text
 	U_DESKTOP_PASTE_FIELD_UNCHANGED, //!< read, but the focused text field did not change
+	//! The user copied after the keystroke and the agent's text was never read:
+	//! the target can only have been handed the user's clipboard.
+	U_DESKTOP_PASTE_LOST_NOT_SERVED,
 };
 
 //! The focused text field seen through AT-SPI: its length, its caret and a hash
@@ -66,6 +69,17 @@ u_desktop_fnv1a(const char *s, size_t len);
  * The verdict, and (@p restore) whether the previous clipboard may be offered
  * again: never once the selection changed hands — that would overwrite what the
  * user just copied.
+ *
+ * | lost      | writes | field    | verdict                         |
+ * |-----------|--------|----------|---------------------------------|
+ * | before    | any    | any      | CHANGED_HANDS (refused)         |
+ * | after     | 0      | any      | LOST_NOT_SERVED (failed)        |
+ * | after     | > 0    | changed  | DELIVERED                       |
+ * | after     | > 0    | else     | LOST_UNCERTAIN (failed)         |
+ * | no        | any    | changed  | DELIVERED                       |
+ * | no        | 0      | else     | NOT_ASKED (failed)              |
+ * | no        | > 0    | same     | FIELD_UNCHANGED (failed)        |
+ * | no        | > 0    | no field | UNVERIFIED (ok, unverified)     |
  */
 enum u_desktop_paste_verdict
 u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore);

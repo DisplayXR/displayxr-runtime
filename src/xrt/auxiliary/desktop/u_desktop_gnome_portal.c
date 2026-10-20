@@ -51,9 +51,12 @@
  * (SelectionRead) and offered again ~1.2 s after the paste keystroke (every read
  * until then gets the agent's text, so a clipboard manager reading first cannot
  * make a slow target paste the previous text). The selection changing hands
- * (SelectionOwnerChanged, session_is_owner false: the user copied) before the
- * keystroke cancels the paste; after it, the outcome is unknown; either way
- * the previous text is never offered over the user's. Delivery is confirmed by
+ * (SelectionOwnerChanged, session_is_owner false: the user copied) at any time
+ * from before SelectionRead through SetSelection, up to the check after Ctrl is
+ * down and before V, cancels the paste (Ctrl released without V); after V it
+ * fails — "the user's clipboard, not the agent's text" when the agent's text was
+ * never read, else unknown unless read AND the field changed; either way the
+ * previous text is never offered over the user's. Delivery is confirmed by
  * the focused AT-SPI text field changing when there is one; else a read after
  * the keystroke (possibly a clipboard manager's) gives "ok (unverified)". A
  * reader closing its fd mid-write is EPIPE (SIGPIPE blocked for the write, on
@@ -454,6 +457,9 @@ handle_message(struct gnome_portal *p, DBusMessage *m)
 				}
 			}
 			dbus_message_iter_next(&dict);
+		}
+		if (!owner) {
+			p->clip_foreign_gen++;
 		}
 		if (!owner && p->clip_owner && p->clip_is_paste) {
 			// Someone else took the selection while it held the agent's text.

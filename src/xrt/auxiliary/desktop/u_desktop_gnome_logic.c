@@ -47,11 +47,17 @@ u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore)
 	if (o->lost_before_key) {
 		return U_DESKTOP_PASTE_CHANGED_HANDS;
 	}
-	if (o->text_check > 0) {
-		return U_DESKTOP_PASTE_DELIVERED; // seen in the field, whoever owns the clipboard now
-	}
 	if (o->lost_after_key) {
-		return U_DESKTOP_PASTE_LOST_UNCERTAIN;
+		// The user copied after the keystroke. A field that changed proves
+		// nothing on its own: the target may have read the USER's new clipboard
+		// (GNOME 50.1: 37/80 such trials changed the field with the user's text).
+		if (o->writes_after_key == 0) {
+			return U_DESKTOP_PASTE_LOST_NOT_SERVED; // nobody ever got the agent's text
+		}
+		return o->text_check > 0 ? U_DESKTOP_PASTE_DELIVERED : U_DESKTOP_PASTE_LOST_UNCERTAIN;
+	}
+	if (o->text_check > 0) {
+		return U_DESKTOP_PASTE_DELIVERED;
 	}
 	if (o->writes_after_key == 0) {
 		return U_DESKTOP_PASTE_NOT_ASKED;
@@ -91,6 +97,10 @@ u_desktop_paste_message(enum u_desktop_paste_verdict v)
 		return "the focused window did not ask for the pasted text (does it accept text?)";
 	case U_DESKTOP_PASTE_FIELD_UNCHANGED:
 		return "the focused text field did not change — the paste was not seen to arrive";
+	case U_DESKTOP_PASTE_LOST_NOT_SERVED:
+		return "the clipboard changed hands right after the paste keystroke (the user copied something) "
+		       "and the agent's text was never read — whatever the window pasted was the user's "
+		       "clipboard, not the agent's text; the user's clipboard was left as is";
 	}
 	return "";
 }

@@ -575,6 +575,17 @@ clipboard_offer(struct gnome_portal *p, const char *text, bool is_paste)
 }
 
 /*!
+ * The user copied since this type started — from before the previous text was
+ * read, through our SetSelection, the keystroke and the serve: any of it means
+ * the selection is theirs now, and must neither be pasted nor overwritten.
+ */
+static bool
+clip_changed_hands(const struct gnome_portal *p)
+{
+	return p->clip_foreign_gen != p->clip_take_gen;
+}
+
+/*!
  * Offer the clipboard text from before the paste again (best effort) — unless
  * the selection changed hands meanwhile: then the user copied something newer,
  * and offering the old text would overwrite it. Either way the agent's text is
@@ -584,7 +595,7 @@ static void
 clipboard_restore(struct gnome_portal *p)
 {
 	gp_pump(p, 0); // a SelectionOwnerChanged already queued counts
-	if (p->clip_lost || (p->clip_is_paste && !p->clip_owner)) {
+	if (p->clip_lost || clip_changed_hands(p) || (p->clip_is_paste && !p->clip_owner)) {
 		free(p->clip_prev);
 		p->clip_prev = NULL;
 		free(p->clip_text);
@@ -609,6 +620,7 @@ clipboard_restore(struct gnome_portal *p)
 static enum u_desktop_result
 cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 {
+	bool was_open = p->session_open;
 	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
@@ -619,6 +631,20 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 		           "is never typed as key codes");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
+	// Ownership changes count from HERE, before the previous text is read: a copy
+	// between SelectionRead and our SetSelection would otherwise be overwritten
+	// by the agent's text (and its signal, arriving while we were not the owner
+	// yet, would not set clip_lost). A session opened just now first gets a
+	// moment for the portal's initial owner state to arrive, so it is not taken
+	// for a copy.
+	if (!was_open) {
+		uint64_t settle = gdbus_now_ms() + 50;
+		while (gdbus_now_ms() < settle && p->session_open) {
+			gp_pump(p, 10);
+		}
+	}
+	gp_pump(p, 0);
+	p->clip_take_gen = p->clip_foreign_gen;
 	// The previous text: if we still own the selection, what we were serving
 	// (reading from ourselves would deadlock this thread), else the owner's.
 	free(p->clip_prev);
@@ -628,7 +654,25 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 	} else if (!p->clip_owner) {
 		p->clip_prev = clipboard_read(p);
 	}
-	if (!clipboard_offer(p, c->text, true)) {
+	// Signals queued while SelectionRead blocked: a copy now is the user's.
+	gp_pump(p, 0);
+	if (clip_changed_hands(p)) {
+		clipboard_restore(p); // offers nothing: the selection is the user's
+		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	bool owned = clipboard_offer(p, c->text, true);
+	gp_pump(p, 0);
+	if (clip_changed_hands(p)) {
+		// The user copied between the read and our SetSelection (or right after
+		// it): too late not to have offered, but never paste and never restore —
+		// the old text would overwrite theirs again.
+		U_LOG_W("desktop/gnome: the clipboard changed hands while taking it — not pasting");
+		clipboard_restore(p);
+		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (!owned) {
 		clipboard_restore(p);
 		gp_set_msg(c->msg, "the portal did not make this session the clipboard owner — not pasting");
 		return U_DESKTOP_ERR_FAILED;
@@ -653,7 +697,7 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	// (the user copied after we took the selection) must be seen NOW — Ctrl+V
 	// would paste the user's new clipboard into the target.
 	gp_pump(p, 0);
-	if (p->clip_lost || !p->clip_owner || !p->clip_is_paste) {
+	if (p->clip_lost || clip_changed_hands(p) || !p->clip_owner || !p->clip_is_paste) {
 		c->obs.lost_before_key = true;
 		clipboard_restore(p); // never offers the old text over the user's new one
 		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
@@ -666,22 +710,39 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 		clipboard_restore(p);
 		return r;
 	}
-	uint32_t codes[GNOME_PORTAL_MAX_KEYS];
-	bool press[GNOME_PORTAL_MAX_KEYS];
-	uint32_t mc[4];
-	uint32_t nm = gnome_chord_mod_codes(mods, mc), n = 0;
+	uint32_t mc[4], mup[4];
+	bool down[4] = {true, true, true, true}, up[4] = {false, false, false, false};
+	uint32_t nm = gnome_chord_mod_codes(mods, mc);
 	for (uint32_t i = 0; i < nm; i++) {
-		codes[n] = mc[i], press[n++] = true;
+		mup[i] = mc[nm - 1 - i];
 	}
-	codes[n] = code, press[n++] = true;
-	codes[n] = code, press[n++] = false;
-	for (uint32_t i = nm; i-- > 0;) {
-		codes[n] = mc[i], press[n++] = false;
+	r = send_keys(p, mc, down, nm, c->msg);
+	if (r != U_DESKTOP_OK) {
+		clipboard_restore(p);
+		return r;
+	}
+	// The modifiers are down; V is next. Look once more, as late as possible: a
+	// SelectionOwnerChanged queued during the modifier gaps (GNOME 50.1: it
+	// arrived ~9 ms before V reached the target) means V would paste the user's
+	// new clipboard. Then release the modifiers without V: nothing pasted. From
+	// this check to V there is only the libei frame — no sleep, no D-Bus call.
+	gp_pump(p, 0);
+	if (p->clip_lost || clip_changed_hands(p) || !p->clip_owner) {
+		send_keys(p, mup, up, nm, c->msg);
+		c->obs.lost_before_key = true;
+		clipboard_restore(p);
+		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
+		return U_DESKTOP_ERR_REFUSED;
 	}
 	p->paste_armed = true;
 	p->paste_writes = 0;
 	p->paste_have_serial = false;
-	r = send_keys(p, codes, press, n, c->msg);
+	uint32_t vk[2] = {code, code};
+	bool vp[2] = {true, false};
+	r = send_keys(p, vk, vp, 2, c->msg);
+	if (r == U_DESKTOP_OK) {
+		r = send_keys(p, mup, up, nm, c->msg);
+	}
 	if (r != U_DESKTOP_OK) {
 		p->paste_armed = false;
 		clipboard_restore(p);
@@ -701,7 +762,7 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	uint64_t serve_until = start + PASTE_SERVE_MS;
 	uint64_t hard_stop = start + PASTE_MAX_MS;
 	uint32_t seen = 0;
-	while (p->session_open && !gp_quitting(p) && !p->clip_lost) {
+	while (p->session_open && !gp_quitting(p) && !p->clip_lost && !clip_changed_hands(p)) {
 		uint64_t now = gdbus_now_ms();
 		if (now >= hard_stop || (now >= serve_until && p->paste_writes > 0)) {
 			break;
@@ -715,9 +776,10 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 			}
 		}
 	}
+	gp_pump(p, 0); // a copy (or a write) queued at the very end still counts
 	p->paste_armed = false;
 	injected(p);
-	c->obs.lost_after_key = p->clip_lost;
+	c->obs.lost_after_key = p->clip_lost || clip_changed_hands(p);
 	c->obs.writes_after_key = p->paste_writes;
 	return U_DESKTOP_OK;
 }

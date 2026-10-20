@@ -126,6 +126,14 @@ struct gnome_portal
 	//! unknown, and the previous text must NOT be offered again over the user's.
 	bool clip_lost;
 	char *clip_prev;       //!< the clipboard text before the paste, to offer again
+	//! SelectionOwnerChanged signals saying another client owns the selection
+	//! (the user copied), counted whatever we held — so a copy between reading
+	//! the previous text and our SetSelection is seen too (clip_lost needs us to
+	//! have been the owner already).
+	uint32_t clip_foreign_gen;
+	//! clip_foreign_gen when the type started (before SelectionRead): any change
+	//! since = the user copied; never paste over it / offer the old text over it.
+	uint32_t clip_take_gen;
 	bool paste_armed;      //!< the paste keystroke was sent: transfers now count
 	uint32_t paste_writes; //!< successful writes of the agent's text since armed
 	bool paste_lost_before; //!< the last paste: the selection changed hands before its keystroke

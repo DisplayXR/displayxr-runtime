@@ -212,12 +212,22 @@ GNOME notes: text reaches the target through the clipboard (the portal has no "c
 string" path that survives an IME), so on GNOME **the agent's typed text passes through the
 clipboard, where clipboard managers and clipboard history can see and keep it**; the previous
 clipboard text is offered again afterwards, best effort, while the portal session lives. The
-paste is sent only after the portal confirms the session owns the selection, and only if it
-still does right before the keystroke: a user who copied in between gets their own clipboard
-left alone and the action is `REFUSED` ("the clipboard changed hands (the user copied
-something); nothing was pasted"); losing the selection after the keystroke completes
-`RUNTIME_FAILURE` ("… whether the text arrived is unknown") and the previous text is not
-offered again over the user's. Delivery: when the focused window exposes a focused text field
+paste is sent only after the portal confirms the session owns the selection (otherwise
+`RUNTIME_FAILURE`, "the portal did not make this session the clipboard owner — not pasting":
+nothing is pasted and the user's clipboard is kept — observed on GNOME 50.1 in ~8% of types
+racing a user copy, when the portal never reported this session as the owner), and only if it
+still does right before the paste key: ownership is tracked from before the previous clipboard
+text is read, through taking the selection, to the moment after Ctrl is down and before V is
+sent. A user who copied anywhere in that span gets their own clipboard left alone (never
+overwritten by the agent's text, nor later by the restored previous text) and the action is
+`REFUSED` ("the clipboard changed hands (the user copied something); nothing was pasted").
+Losing the selection after the paste key completes `RUNTIME_FAILURE` — "… the agent's text was
+never read — whatever the window pasted was the user's clipboard" when the agent's text was
+never served, else "… whether the text arrived is unknown" unless the agent's text was served
+**and** the focused field changed — and the previous text is never offered again over the
+user's. A residual race remains: a copy whose ownership signal reaches this process only after
+V was sent is seen after the key (one of those two failures, never a plain success unless the
+agent's text was read). Delivery: when the focused window exposes a focused text field
 over AT-SPI, the action succeeds only if that field changed; otherwise a read of the agent's
 text after the keystroke is the only evidence, and **a clipboard manager reads too** — so the
 action succeeds with the message `"ok (unverified: …)"` (same `XR_SUCCESS`; no new result

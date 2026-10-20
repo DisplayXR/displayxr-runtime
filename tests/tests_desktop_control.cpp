@@ -1947,16 +1947,31 @@ TEST_CASE("gnome_paste: the user copying before the keystroke = refused, nothing
 	      std::string::npos);
 }
 
-TEST_CASE("gnome_paste: losing the clipboard after the keystroke = uncertain, never 'did not ask', no restore",
-          "[desktop][gnome][paste]")
+TEST_CASE(
+    "gnome_paste: losing the clipboard after the keystroke = never delivered unless OUR text was read, no restore",
+    "[desktop][gnome][paste]")
 {
 	bool restore = true;
-	CHECK(decide(false, true, 0, -1, &restore) == U_DESKTOP_PASTE_LOST_UNCERTAIN);
+	// Never read: the target was handed the user's clipboard. A changed field is
+	// the USER's text arriving (GNOME 50.1 re-check: 37/80 trials 8-25 ms after
+	// type start reported plain ok here) — failed, said honestly, whatever the field.
+	CHECK(decide(false, true, 0, -1, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
 	CHECK_FALSE(restore);
+	CHECK(decide(false, true, 0, 0, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
+	CHECK(decide(false, true, 0, 1, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
+	CHECK_FALSE(restore);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_LOST_NOT_SERVED) == U_DESKTOP_ERR_FAILED);
+	CHECK(std::string(u_desktop_paste_message(U_DESKTOP_PASTE_LOST_NOT_SERVED)).find("user's clipboard") !=
+	      std::string::npos);
+	// Read, but nothing confirms which text landed: unknown.
 	CHECK(decide(false, true, 3, -1, &restore) == U_DESKTOP_PASTE_LOST_UNCERTAIN);
+	CHECK(decide(false, true, 1, 0, &restore) == U_DESKTOP_PASTE_LOST_UNCERTAIN);
 	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_LOST_UNCERTAIN) == U_DESKTOP_ERR_FAILED);
-	// ... unless the field visibly changed: delivered, but the user's new clipboard stays.
+	// Our text was served AND the field changed: delivered, the user's new clipboard stays.
 	CHECK(decide(false, true, 1, 1, &restore) == U_DESKTOP_PASTE_DELIVERED);
+	CHECK_FALSE(restore);
+	// Lost before the key wins over everything else.
+	CHECK(decide(true, true, 2, 1, &restore) == U_DESKTOP_PASTE_CHANGED_HANDS);
 	CHECK_FALSE(restore);
 }
 
@@ -1978,7 +1993,7 @@ TEST_CASE("gnome_paste: a clipboard-manager read alone is never 'verified'", "[d
 	CHECK(decide(false, false, 0, -1, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
 	CHECK(decide(false, false, 0, 0, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
 	// Messages never name text; they are all non-empty except delivered.
-	for (int v = U_DESKTOP_PASTE_UNVERIFIED; v <= U_DESKTOP_PASTE_FIELD_UNCHANGED; v++) {
+	for (int v = U_DESKTOP_PASTE_UNVERIFIED; v <= U_DESKTOP_PASTE_LOST_NOT_SERVED; v++) {
 		CHECK(std::strlen(u_desktop_paste_message((u_desktop_paste_verdict)v)) > 0);
 	}
 }

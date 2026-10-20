@@ -189,10 +189,21 @@ $SMOKE type "Hello, 世界 — ünïcödé"        # into gedit
   |---|---|
   | the process | never dies (it used to die of SIGPIPE at ~8–10 ms: EPIPE on the SelectionWrite fd is now a cancelled transfer) |
   | the copy landed before the paste keystroke | `refused — the clipboard changed hands (the user copied something); nothing was pasted`, nothing appears in gedit, and the clipboard afterwards is `USERTEXT` (not restored over) |
-  | the copy landed after the keystroke | `failed — lost the clipboard during the paste … whether the text arrived is unknown`, or `ok` if gedit's text visibly changed; the clipboard afterwards is `USERTEXT` |
-  | never | `USERTEXT` pasted into gedit with the result `failed — did not ask` (the old 7/40) |
+  | the copy landed after the keystroke, the agent's text never read | `failed — the clipboard changed hands right after the paste keystroke … whatever the window pasted was the user's clipboard, not the agent's text`; the clipboard afterwards is `USERTEXT` |
+  | the copy landed after the keystroke, the agent's text read | `failed — lost the clipboard during the paste … whether the text arrived is unknown`, or `ok` only if gedit's text visibly changed; the clipboard afterwards is `USERTEXT` |
+  | the portal never reported this session as the owner | `failed — the portal did not make this session the clipboard owner — not pasting`; nothing pasted, clipboard `USERTEXT` (honest; re-check 2 saw 12/145) |
+  | never | `USERTEXT` pasted into gedit with a plain `ok` (re-check 2: 37/80 at D = 8–25 ms, 10/10 at 15 ms) or `failed — did not ask` (the old 7/40) |
   Count how often each row occurs per D. `USERTEXT` appearing in gedit is acceptable only
-  with the "lost the clipboard … unknown" result (the copy raced the keystroke itself).
+  with one of the two "after the keystroke" failures (the copy raced the keystroke itself) —
+  never with `ok`.
+- **Re-check 2 rows (fixes for item 3).** Same helper, gedit, plus a clipboard manager:
+  | case | how | expected |
+  |---|---|---|
+  | (a) copy lands between Ctrl-down and V | D = 8, 11, 15, 22, 25 ms, 20× each (the owner-change signal arrived ~9 ms before V in the D-Bus trace) | `refused — the clipboard changed hands …; nothing was pasted`, Ctrl released with no V (nothing typed, nothing pasted); never `ok` with `USERTEXT` in gedit. Count residual `ok` + `USERTEXT` (a signal reaching the app only after V was sent): expected ~0 |
+  | (b) copy lands after V, target reads late | a target that reads the clipboard 300 ms after the key (re-check 2: 20/20 pasted `USERTEXT` with `ok`), 20× | `failed — … whatever the window pasted was the user's clipboard, not the agent's text` (the agent's text was never read); never `ok` |
+  | (b') random timing | D uniform in 0–60 ms, 40× (re-check 2: 8/40 `ok` + `USERTEXT`) | no `ok` with `USERTEXT` in gedit; every failure message is one of the rows above |
+  | (c) copy between reading the previous clipboard and taking it | D = 0–5 ms, or a helper copying the moment `SelectionRead` shows on `dbus-monitor` (re-check 2: 7/185 restored the previous text over the user's copy) | `refused — the clipboard changed hands …`; the clipboard afterwards is `USERTEXT` — never the previous text, never the agent's |
+  | (c') copy after the key, during the ~1.2 s serve | D = 500–1500 ms | the clipboard afterwards is `USERTEXT`, never the previous text |
 
 ### 4b. Clicks with a moving pointer (re-run item 5)
 
@@ -242,7 +253,8 @@ in the script to give you the window).
   `unsupported`, and the target must NOT receive "SECRET".
 - **Clipboard changes hands before Ctrl+V.** Run `type "AGENT"` with a clipboard manager or a
   script that copies "OTHER" at the same instant; either "AGENT" is pasted or the result is
-  `refused — lost the clipboard before the paste`; "OTHER" must never be pasted.
+  `refused — the clipboard changed hands …` (or one of the two "after the keystroke" failures);
+  "OTHER" must never be pasted with an `ok`.
 - **A clipboard manager reading first never makes the target paste the previous clipboard.**
   Copy "PREVIOUS" in gedit; with GPaste / Clipboard Indicator running, `type "AGENT\n"` into a
   slow target (a large gnome-text-editor document, or a terminal under load): "AGENT" is
