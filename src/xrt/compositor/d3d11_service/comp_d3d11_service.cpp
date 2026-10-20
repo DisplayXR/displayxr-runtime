@@ -34702,6 +34702,19 @@ svc_seg_find_screen(const struct xrt_screen_list *list, uint64_t id)
 	return nullptr;
 }
 
+/*!
+ * #2218 (#9): did a screen move, resize or change role between two registry
+ * reads? Everything the segment table is computed from (desktop rect, device
+ * mode, the system-default flag) — the claimant is compared separately.
+ */
+static bool
+svc_seg_screen_geometry_differs(const struct xrt_screen *a, const struct xrt_screen *b)
+{
+	return a->desktop_left != b->desktop_left || a->desktop_top != b->desktop_top ||
+	       a->desktop_width != b->desktop_width || a->desktop_height != b->desktop_height ||
+	       a->native_width != b->native_width || a->native_height != b->native_height || a->flags != b->flags;
+}
+
 //! The registry entry of @p reg for monitor @p id, or nullptr.
 static struct xrt_dp_registry_entry *
 svc_seg_find_entry(struct xrt_dp_factory_registry *reg, uint64_t id)
@@ -34742,10 +34755,43 @@ comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, 
 		}
 
 		bool changed = false;
+		// #2218 (#9): a screen that LEFT the registry (unplugged) — its segment
+		// DP must go, and the table must stop cutting the window at its edge.
+		for (uint32_t i = 0; i < old->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			const struct xrt_screen *os = &old->screens[i];
+			if (svc_seg_find_screen(list, os->id) != nullptr) {
+				continue;
+			}
+			U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx ('%s') left the registry — "
+			        "segment table rebuilt%s",
+			        (void *)c, c->client_pid, (unsigned long long)os->id, os->plugin_id,
+			        os->id == primary_id ? " (its primary screen: the session's own DP stays)" : "");
+			changed = true;
+		}
 		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
 			const struct xrt_screen *ns = &list->screens[i];
 			const struct xrt_screen *os = svc_seg_find_screen(old, ns->id);
-			if (os == nullptr || strcmp(os->plugin_id, ns->plugin_id) == 0) {
+			if (os == nullptr) {
+				// #2218 (#9): a screen that JOINED (plugged in) — reachable by
+				// the window from now on; the lifecycle makes its DP on demand.
+				U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx ('%s', %ux%u at %d,%d) joined "
+				        "the registry — segment table rebuilt",
+				        (void *)c, c->client_pid, (unsigned long long)ns->id, ns->plugin_id,
+				        ns->desktop_width, ns->desktop_height, ns->desktop_left, ns->desktop_top);
+				changed = true;
+				continue;
+			}
+			if (strcmp(os->plugin_id, ns->plugin_id) == 0) {
+				// #2218 (#9): same claimant — did it move, resize or change
+				// role? The table is cut from these rects.
+				if (svc_seg_screen_geometry_differs(os, ns)) {
+					U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx moved/resized "
+					        "(%ux%u at %d,%d -> %ux%u at %d,%d, flags 0x%x -> 0x%x) — segment table rebuilt",
+					        (void *)c, c->client_pid, (unsigned long long)ns->id, os->desktop_width,
+					        os->desktop_height, os->desktop_left, os->desktop_top, ns->desktop_width,
+					        ns->desktop_height, ns->desktop_left, ns->desktop_top, os->flags, ns->flags);
+					changed = true;
+				}
 				continue;
 			}
 			if (ns->id == primary_id) {
