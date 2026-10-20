@@ -385,9 +385,9 @@ call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-
 
 ## 10. Screen capture (spec version 2)
 
-> **Implemented: the common layer, the fake backend, the probe, the CLI and GNOME.**
-> Windows (Windows.Graphics.Capture) and macOS (ScreenCaptureKit) are not implemented yet:
-> those backends report no `CAPTURE_BIT`, so the CAPTURE scope is `UNSUPPORTED` there. The
+> **Implemented: the common layer, the fake backend, the probe, the CLI, GNOME and macOS
+> (ScreenCaptureKit).** Windows (Windows.Graphics.Capture) is not implemented yet: that
+> backend reports no `CAPTURE_BIT`, so the CAPTURE scope is `UNSUPPORTED` there. The
 > decision record is
 > [ADR-056 Amendment 1](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-1--screen-capture-is-its-own-scope-in-the-same-session-accepted-2026-10-20),
 > with David's decisions of 2026-10-19 (§10.8). Sections 1–9 describe version 1 and are
@@ -541,7 +541,14 @@ scopes. Rows 8–10 read that scope's own grant:
   ("see your screen", "type and click in other apps"). The answer is stored per scope (§10.6).
 - **macOS.** CAPTURE's OS grant is Screen Recording (`CGPreflightScreenCaptureAccess`,
   requested with `CGRequestScreenCaptureAccess`). CONTROL already asks for it, so CAPTURE is
-  usually granted without a new prompt.
+  usually granted without a new prompt. TCC shows each prompt **once** per responsible
+  process; after that only System Settings changes the answer. So on macOS
+  `ASK_AGAIN` opens System Settings ▸ Privacy & Security ▸ **Screen Recording** (▸
+  Accessibility when only CONTROL is asked for) instead of a prompt, and the request is
+  answered when every listed scope is granted there (at once if it already is), or `DENIED`
+  after 120 s. A revocation in that pane is seen live (the scope's state reads TCC on every
+  evaluation). A capture checks `CGPreflightScreenCaptureAccess` before ScreenCaptureKit is
+  touched, because ScreenCaptureKit would show the TCC prompt itself.
 - **Revocation.** A backend capture call that returns `NOT_GRANTED` puts CAPTURE in `DENIED`
   (event), and only CAPTURE, except on GNOME where it closes the shared session (both).
 
@@ -606,8 +613,14 @@ scopes. Rows 8–10 read that scope's own grant:
     whether or not the display processor excluded them (§10.8, decision 7).
   - Windows: Windows.Graphics.Capture returns `WDA_EXCLUDEFROMCAPTURE` windows as the OS
     renders them for capture, and the runtime adds nothing.
-  - macOS: what ScreenCaptureKit returns for `NSWindowSharingNone` windows is to be measured
-    (§10.7) and documented here.
+  - macOS: every on-screen window that CGWindowList reports as `kCGWindowSharingNone`
+    (`NSWindowSharingNone`) is withheld over its whole frame, and so is every window of the
+    app's own process on every layer (the common layer's `OWN` mask only covers the layer-0
+    windows it lists); a window list that cannot be read refuses the capture. Measured on
+    macOS 26.3 (2026-10-20): CGWindowList reports another app's `NSWindowSharingNone` window
+    with `kCGWindowSharingState` 0, and ScreenCaptureKit leaves it out of the picture (the
+    windows beneath it show), so the runtime's mask is a second line, not the only one. The
+    same check on macOS 14 and 15 is still open (§10.7).
   - GNOME: every window that the extension's `GetAllWindows` reports as `capture_excluded`
     is withheld over its whole frame, because portal monitor streams contain them
     (wayland-window-geometry §6.2). When the extension is missing or the window list cannot
@@ -624,11 +637,11 @@ scopes. Rows 8–10 read that scope's own grant:
 
 | | GNOME Wayland | Windows | macOS |
 |---|---|---|---|
-| capture | the RemoteDesktop session of §7 plus `ScreenCast.SelectSources` (MONITOR, `multiple`, cursor HIDDEN, no persist keys) before `Start`; `OpenPipeWireRemote` → PipeWire streams, SHM (BGRx/BGRA) only | Windows.Graphics.Capture `CreateForMonitor` per touched monitor, a one-frame pool on the backend's own D3D11 device, staging read-back | `SCScreenshotManager` (macOS 14+) with a display `SCContentFilter`, cursor hidden |
+| capture | the RemoteDesktop session of §7 plus `ScreenCast.SelectSources` (MONITOR, `multiple`, cursor HIDDEN, no persist keys) before `Start`; `OpenPipeWireRemote` → PipeWire streams, SHM (BGRx/BGRA) only | Windows.Graphics.Capture `CreateForMonitor` per touched monitor, a one-frame pool on the backend's own D3D11 device, staging read-back | `SCScreenshotManager` (macOS 14+; a one-shot `SCStream` on 12.3–13) with one display `SCContentFilter` per display the region touches, the app's own applications excluded, cursor hidden, BGRA in sRGB |
 | CAPTURE only (no CONTROL) | a standalone ScreenCast portal session (`persist_mode` 2 on `SelectSources`) | as above | as above |
-| library | `libpipewire-0.3.so.0` dlopen'd, no `DT_NEEDED` (absent ⇒ no CAPTURE bit) | Windows 10 1903+ | ScreenCaptureKit, weak-linked (macOS < 14 ⇒ no CAPTURE bit) |
+| library | `libpipewire-0.3.so.0` dlopen'd, no `DT_NEEDED` (absent ⇒ no CAPTURE bit) | Windows 10 1903+ | ScreenCaptureKit, weak-linked (macOS < 12.3 ⇒ no CAPTURE bit) |
 | indicator | GNOME's screen-sharing indicator while the session is open | the Windows.Graphics.Capture border (kept on) | the system screen-recording indicator |
-| coordinates | stage px; stream `position` / `size` from the `Start` response map stage → stream px | physical px (per-monitor-v2 DPI context) | points; the display's scale gives pixels |
+| coordinates | stage px; stream `position` / `size` from the `Start` response map stage → stream px | physical px (per-monitor-v2 DPI context) | points; the image is the region at the highest backing scale among the displays it touches (`CGDisplayModeGetPixelWidth` ÷ `GetWidth`) |
 
 The backend interface (`u_desktop.h`) gains, in the implementation PR: a per-scope
 `access_status` / `request_access`, and a `capture` call made only from the capture worker,
@@ -694,6 +707,9 @@ rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget 
   - The menu-bar indicator appears.
   - **Measure** what `NSWindowSharingNone` windows of another app look like (reports suggest
     macOS 15 no longer hides them from ScreenCaptureKit), and record the result in §10.4.
+    Done on macOS 26.3 (hidden by ScreenCaptureKit, and withheld by the runtime); open on 14
+    and 15. The macOS test plan (`XR_DXR_desktop_control_macos_test_plan.md` §7) has the
+    steps.
   - Record whether macOS 15's periodic "continue to allow screen recording" confirmation
     fires for a ScreenCaptureKit still.
 
@@ -716,7 +732,8 @@ These design points are settled (ADR-056 Amendment 1, "Decisions"):
 ### 10.9 Implementation notes (spec version 2)
 
 Decisions this section left open, as implemented in `u_desktop_control.c`,
-`u_desktop_capture.c`, `u_desktop_policy.c` and `u_desktop_gnome_capture.c`:
+`u_desktop_capture.c`, `u_desktop_policy.c`, `u_desktop_gnome_capture.c` and
+`u_desktop_macos_capture.m`:
 
 **Common layer.**
 - Each scope has its own request bookkeeping (requested / pending / revoked / last answer).
@@ -802,3 +819,34 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   unresolvable handle is logged by xdg-desktop-portal-gnome and the dialog opens unparented
   — the request does not fail. The Unity plug-in obtains the string with
   `displayxr_linux_window_handle` (displayxr-unity#385).
+
+**macOS.**
+- Capability: `CAPTURE_BIT` when ScreenCaptureKit is present (weak-linked,
+  `-weak_framework ScreenCaptureKit`; `SCShareableContent` / `SCStream` resolve). The runtime
+  loads on any macOS; without it the scope is `UNSUPPORTED`.
+- One still per display the region touches: `SCShareableContent` (desktop windows included,
+  on-screen only) → a display `SCContentFilter` that excludes the calling process's own
+  `SCRunningApplication`s → `sourceRect` = the part in display-local points, `width` /
+  `height` = the part at the display's backing scale, `showsCursor` NO, BGRA,
+  `colorSpaceName` sRGB, `captureResolution` Best and `shouldBeOpaque` on 14+. macOS 14+:
+  `SCScreenshotManager captureSampleBufferWithFilter`. macOS 12.3–13: a one-shot `SCStream`
+  (the first frame whose `SCStreamFrameInfoStatus` is Complete, then stop);
+  `desktop_backend_smoke sck-stream on` forces that path on a newer Mac for testing. Both paths
+  gave byte-identical images on macOS 26.3.
+- Every ScreenCaptureKit completion handler may outlive the 2 s bound, so each async step
+  meets the caller through a reference-counted rendezvous (never the caller's stack); a late
+  answer is dropped.
+- Error mapping: no Screen Recording grant (preflight) or `SCStreamErrorUserDeclined` ⇒
+  `NOT_GRANTED` (CAPTURE `DENIED`); no frame in time ⇒ `TIMEOUT`; anything else ⇒ `FAILED`
+  with the error code only. Locked (`CGSSessionScreenIsLocked`, or not the console session)
+  ⇒ `REFUSED` "screen locked", checked before and after the grab.
+- `XrDesktopControlParentWindowDXR` is ignored: the Screen Recording prompt is System
+  Settings, not a dialog the app can parent.
+- Monitors: `CGGetActiveDisplayList` with mirrors left out, or the online displays while
+  every display sleeps.
+- Measured on macOS 26.3, MacBook Pro (1512×982 pt, 2×) + an external 1920×1080 pt HiDPI
+  display (2×), 2026-10-20: a 400×300 pt region → 800×600 px in ~120 ms warm (~270 ms for
+  the first capture of a process), the whole 3432×1080 pt desktop → 6864×2160 px in ~280 ms
+  warm; the 98 pt strip under the built-in display (a gap of the layout) came back as exactly
+  592,704 withheld pixels; a region and the same rect cut from a desktop capture matched
+  byte for byte, and so did `screencapture -R` of the same rect.

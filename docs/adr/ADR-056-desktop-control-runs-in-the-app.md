@@ -186,8 +186,8 @@ Open questions.
 ## Amendment 1 — Screen capture is its own scope, in the same session (ACCEPTED, 2026-10-20)
 
 **Status:** Accepted — spec version 2. Implemented: the common layer, the fake backend, the
-probe, the CLI and GNOME (P0b + the GNOME half of P1b); Windows and macOS capture are still to
-do and report no CAPTURE capability until then. Spec text:
+probe, the CLI, GNOME (P0b + the GNOME half of P1b) and macOS (ScreenCaptureKit); Windows
+capture is still to do and reports no CAPTURE capability until then. Spec text:
 [`XR_DXR_desktop_control.md` §10](../specs/extensions/XR_DXR_desktop_control.md#10-screen-capture-spec-version-2).
 
 **Why an amendment and not a new ADR.** D1 already lists "capture a window" under *observe*,
@@ -301,11 +301,11 @@ enforced: the portal is the only consented path an app has.
 
 | | GNOME Wayland | Windows | macOS |
 |---|---|---|---|
-| source | ScreenCast **inside the v1 RemoteDesktop session**: `CreateSession` → `SelectDevices` (`persist_mode` 2, `restore_token`) → **`ScreenCast.SelectSources`** (`types` MONITOR, `multiple` true, `cursor_mode` HIDDEN, **no** persist options, because the portal spec says persistence for a combined session belongs only to `SelectDevices`) → `RequestClipboard` → `Start` → `ConnectToEIS` + **`ScreenCast.OpenPipeWireRemote`**. CAPTURE without CONTROL uses a standalone ScreenCast portal session (persist options on `SelectSources`). | **Windows.Graphics.Capture**: `CreateForMonitor` per monitor the region touches (`CreateForWindow` is never used, so WINDOW means "what is on screen there" on every OS), a one-frame `Direct3D11CaptureFramePool` on the backend's **own** D3D11 device (never the app's device or queue), CPU read-back. | **ScreenCaptureKit** `SCScreenshotManager` (macOS 14+, one-shot, no stream), `SCContentFilter` over the display(s), `showsCursor` false. |
-| pixels | PipeWire, **dlopen'd** (`libpipewire-0.3.so.0`, no `DT_NEEDED`, like libei). SHM buffers only (MemFd/MemPtr, BGRx/BGRA), so there is no DMA-BUF import and no GPU dependency. One stream per shared monitor, placed by the `Start` response's `position` / `size` (logical px; the stream is device px, which gives the scale). Mutter sends frames on damage, so with no new frame since the stream went live, the last frame *is* the current screen. | BGRA8 → RGBA8, crop, scale. | CGImage → RGBA8, crop, scale. |
+| source | ScreenCast **inside the v1 RemoteDesktop session**: `CreateSession` → `SelectDevices` (`persist_mode` 2, `restore_token`) → **`ScreenCast.SelectSources`** (`types` MONITOR, `multiple` true, `cursor_mode` HIDDEN, **no** persist options, because the portal spec says persistence for a combined session belongs only to `SelectDevices`) → `RequestClipboard` → `Start` → `ConnectToEIS` + **`ScreenCast.OpenPipeWireRemote`**. CAPTURE without CONTROL uses a standalone ScreenCast portal session (persist options on `SelectSources`). | **Windows.Graphics.Capture**: `CreateForMonitor` per monitor the region touches (`CreateForWindow` is never used, so WINDOW means "what is on screen there" on every OS), a one-frame `Direct3D11CaptureFramePool` on the backend's **own** D3D11 device (never the app's device or queue), CPU read-back. | **ScreenCaptureKit** `SCScreenshotManager` (macOS 14+, one-shot, no stream; a one-shot `SCStream` on 12.3–13), one display `SCContentFilter` per display the region touches, excluding the app's own applications, `showsCursor` false. |
+| pixels | PipeWire, **dlopen'd** (`libpipewire-0.3.so.0`, no `DT_NEEDED`, like libei). SHM buffers only (MemFd/MemPtr, BGRx/BGRA), so there is no DMA-BUF import and no GPU dependency. One stream per shared monitor, placed by the `Start` response's `position` / `size` (logical px; the stream is device px, which gives the scale). Mutter sends frames on damage, so with no new frame since the stream went live, the last frame *is* the current screen. | BGRA8 → RGBA8, crop, scale. | BGRA `CVPixelBuffer` in sRGB at the display's backing scale (SCK crops with `sourceRect`) → RGBA8, scale. |
 | consent | the portal dialog (D7) | the DisplayXR MessageBox (D7), store per scope | Screen Recording TCC |
-| exclusion | mask `capture_excluded` windows (D8.3) | OS (`WDA_EXCLUDEFROMCAPTURE`) | OS (`NSWindowSharingNone`): **to verify** on macOS 15+ (D8.3, test plan) |
-| not available | no `libpipewire` / no ScreenCast portal ⇒ no CAPTURE bit | DXGI Desktop Duplication: not used (one duplication per output per process, no indicator) | macOS < 14 ⇒ no CAPTURE bit |
+| exclusion | mask `capture_excluded` windows (D8.3) | OS (`WDA_EXCLUDEFROMCAPTURE`) | `NSWindowSharingNone` windows (`kCGWindowSharingNone` in CGWindowList) withheld over their whole frame by the runtime; ScreenCaptureKit itself also leaves them out (measured on macOS 26.3, spec §10.4) |
+| not available | no `libpipewire` / no ScreenCast portal ⇒ no CAPTURE bit | DXGI Desktop Duplication: not used (one duplication per output per process, no indicator) | macOS < 12.3 (no ScreenCaptureKit, weak-linked) ⇒ no CAPTURE bit |
 
 The **GNOME session lifetime** is unchanged. It is opened per burst and closed after 2 s idle,
 and a capture counts as use. A capture that needs the session re-opened pays the silent
