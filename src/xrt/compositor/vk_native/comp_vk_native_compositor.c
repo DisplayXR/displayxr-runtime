@@ -867,6 +867,16 @@ struct comp_vk_native_compositor
 	 */
 	struct comp_segments_content seg_content;
 #endif // VK_NATIVE_HAVE_SEGMENTS
+	/*!
+	 * #2247: the last weave's table does not cover the primary screen (the
+	 * window has been off it for the hand-off's dwell), so the session's DP —
+	 * which weaves the primary — is asked for 2D whatever the session's mode,
+	 * and gets the session's mode back when the window returns. Written by
+	 * the segment weave (VK_NATIVE_HAVE_SEGMENTS); read on every platform by
+	 * vk_dp_request_display_mode, so declared unconditionally (always false
+	 * where there are no segments).
+	 */
+	bool seg_primary_uncovered;
 
 	/*!
 	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
@@ -5822,6 +5832,45 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 }
 
 #ifdef VK_NATIVE_HAVE_SEGMENTS
+/*!
+ * #2247: the session's DP weaves the primary screen, so its lens wish is the
+ * session's mode while the window covers the primary and 2D once the window
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_vk_native_segments_primary_covered); covered again, the session's mode
+ * is re-sent at once. Sends @p dp that wish on a coverage edge, or always with
+ * @p force (a freshly swapped-in DP). Not while the desktop-Linux NOT_1TO1
+ * hold keeps the panel 2D: its release asks for the session's choice through
+ * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
+ * Weave thread.
+ */
+static void
+vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_processor *dp, bool force)
+{
+	if (dp == NULL) {
+		return;
+	}
+	const bool uncovered = !comp_vk_native_segments_primary_covered(c->segments);
+	const bool edge = uncovered != c->seg_primary_uncovered;
+	if (!edge && !force) {
+		return;
+	}
+	c->seg_primary_uncovered = uncovered;
+	const bool want = c->hardware_display_3d && !uncovered;
+#ifdef XRT_OS_LINUX_DESKTOP
+	const bool held = c->display_mode_hold.held;
+#else
+	const bool held = false;
+#endif
+	if (!held) {
+		(void)xrt_display_processor_request_display_mode(dp, want);
+	}
+	if (edge) {
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)%s",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D",
+		        held ? " — held 2D (NOT_1TO1) for now" : "");
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
 /*!
  * ADR-047 Amendment 2 hook (multi-screen M6, Vulkan): install @p dp as the
@@ -5845,7 +5894,8 @@ vk_segments_swap_primary_cb(void *userdata, struct xrt_display_processor *dp)
 		c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(vdp);
 		xrt_display_processor_vk_set_transparent_background(vdp, c->transparent_background, false);
 		xrt_display_processor_vk_set_shared_texture_present(vdp, c->has_shared_texture);
-		xrt_display_processor_request_display_mode(dp, c->hardware_display_3d);
+		// #2247: the session's mode, but not on a primary screen the window left.
+		vk_seg_primary_lens(c, dp, true);
 		if (c->eye_tracking_mode_set) {
 			xrt_display_processor_set_eye_tracking_mode(dp, c->eye_tracking_mode);
 		}
@@ -5966,8 +6016,9 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	const bool split = comp_vk_native_segments_update(
 	    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
 	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
-	// Every segment DP follows the session's 2D/3D mode, like the primary
-	// (a DP created by the update above gets it here, before it weaves).
+	// Every segment DP follows the session's 2D/3D mode on the screens the
+	// window covers, 2D on one it left (#2247) — a DP created by the update
+	// above gets it here, before it weaves.
 	comp_vk_native_segments_set_display_mode(c->segments, c->hardware_display_3d);
 	return split;
 }
@@ -5982,6 +6033,9 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 	bool would_split = false;
 	const bool split =
 	    vk_segments_frame_update_split(c, dp_canvas, zero_copy, dp_self_submits, dp_render_pass, &would_split);
+	// #2247: the primary screen's lens follows coverage too. Edges only: a
+	// window wholly on the primary never leaves "covered", so this never runs.
+	vk_seg_primary_lens(c, c->display_processor, false);
 
 	/*
 	 * Multi-screen M3: publish the table this weave took, for the next
@@ -16092,6 +16146,10 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 static bool
 vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 {
+	// #2247: the session's DP weaves the primary screen; while the window has
+	// wholly left it, that screen stays 2D (the weave restores the session's
+	// mode when it returns). The split's weaver applies its own gate.
+	const bool dp_3d = enable_3d && !c->seg_primary_uncovered;
 	U_LOG_W("HW3D_DBG vk_native request enable_3d=%d dp=%p has_slot=%d slot=%p", (int)enable_3d,
 	        (void *)c->display_processor,
 	        c->display_processor ? (int)XRT_DP_HAS_SLOT(c->display_processor, request_display_mode) : -1,
@@ -16101,7 +16159,7 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 		// ADR-047 Amendment 2: never call into a primary DP being swapped.
 		os_mutex_lock(&c->dp_swap_mutex);
 		struct xrt_display_processor *dp = c->display_processor;
-		const bool ok = dp != NULL && xrt_display_processor_request_display_mode(dp, enable_3d);
+		const bool ok = dp != NULL && xrt_display_processor_request_display_mode(dp, dp_3d);
 		os_mutex_unlock(&c->dp_swap_mutex);
 		if (dp != NULL) {
 			return ok;
@@ -16109,7 +16167,7 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 	}
 #else
 	if (c->display_processor != NULL) {
-		return xrt_display_processor_request_display_mode(c->display_processor, enable_3d);
+		return xrt_display_processor_request_display_mode(c->display_processor, dp_3d);
 	}
 #endif
 #ifdef XRT_OS_WINDOWS

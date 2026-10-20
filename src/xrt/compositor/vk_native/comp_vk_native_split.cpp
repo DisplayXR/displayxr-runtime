@@ -85,6 +85,13 @@ struct comp_vk_split
 	 * hybrid; the panel itself switched fine — the flag lied).
 	 */
 	bool mode_3d;
+	/*!
+	 * #2247: the last weave's table does not cover the primary screen (the
+	 * window has wholly left it): the split's DP, which weaves the primary,
+	 * is asked for 2D whatever @ref mode_3d says, and gets @ref mode_3d back
+	 * when the window returns. Under dp_mutex.
+	 */
+	bool seg_primary_uncovered;
 
 	//! @name The SCANOUT adapter — everything the weave and the present touch.
 	//! @{
@@ -747,6 +754,34 @@ split_destroy_mutexes(struct comp_vk_split *s)
  */
 
 /*!
+ * #2247: the split's DP weaves the primary screen, so its lens wish is the
+ * session's mode while the window covers the primary and 2D once the window
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_d3d11_segments_primary_covered); covered again, the session's mode is
+ * re-sent at once. Sends it on a coverage edge, or always with @p force (a
+ * freshly swapped-in DP). One WARN per edge. Weave thread.
+ */
+static void
+split_seg_primary_lens(struct comp_vk_split *s, bool force)
+{
+	const bool uncovered = !comp_d3d11_segments_primary_covered(s->segments);
+	os_mutex_lock(&s->dp_mutex);
+	const bool edge = uncovered != s->seg_primary_uncovered;
+	const bool want = s->mode_3d && !uncovered;
+	if (edge || force) {
+		s->seg_primary_uncovered = uncovered;
+		if (s->dp != nullptr) {
+			xrt_display_processor_d3d11_request_display_mode(s->dp, want);
+		}
+	}
+	os_mutex_unlock(&s->dp_mutex);
+	if (edge) {
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247, VK split)",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D");
+	}
+}
+
+/*!
  * Amendment 2 hook: install @p dp as the split's weaver (weave thread, the
  * compositor lock held) and return the previous one for the segment manager
  * to destroy. Re-sends the session-level state a new DP has not seen; the
@@ -765,10 +800,11 @@ split_seg_swap_primary_cb(void *userdata, struct xrt_display_processor_d3d11 *dp
 		xrt_display_processor_d3d11_set_transparent_background(dp, s->transparent_background,
 		                                                       /*client_presents=*/false);
 		xrt_display_processor_d3d11_set_shared_texture_present(dp, false);
-		xrt_display_processor_d3d11_request_display_mode(dp, s->mode_3d);
 		if (s->eye_tracking_mode_set) {
 			xrt_display_processor_d3d11_set_eye_tracking_mode(dp, s->eye_tracking_mode);
 		}
+		// #2247: the session's mode, but not on a primary screen the window left.
+		split_seg_primary_lens(s, true);
 	}
 	// A zone wish published to the old DP goes with it; the next publish
 	// starts fresh instead of clearing a mask the new DP never saw.
@@ -865,10 +901,13 @@ split_segments_update(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h, s
 			                                ? s->xdev->hmd->active_rendering_mode_index
 			                                : 0;
 			split = comp_d3d11_segments_update(s->segments, &win, &canvas, s->out_ctx, mode_index);
-			// Every segment DP follows the session's 2D/3D mode, like the primary.
+			// Every segment DP follows the session's 2D/3D mode on the
+			// screens the window covers, 2D on one it left (#2247).
 			comp_d3d11_segments_set_display_mode(s->segments, s->mode_3d);
 		}
 	}
+	// #2247: the primary screen's lens follows coverage too (edges only).
+	split_seg_primary_lens(s, false);
 
 	// Multi-screen M3: publish the table this weave took (count 0 = one view set).
 	struct xrt_segment_metrics m;
@@ -2818,7 +2857,10 @@ comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 		return false;
 	}
 	os_mutex_lock(&s->dp_mutex);
-	const bool ok = s->dp != nullptr && xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	// #2247: the primary screen stays 2D while the window has wholly left it;
+	// the weave restores mode_3d when it returns.
+	const bool ok = s->dp != nullptr &&
+	                xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d && !s->seg_primary_uncovered);
 	if (ok) {
 		// The weave marks' mode_3d source — see the field doc.
 		s->mode_3d = enable_3d;

@@ -67,6 +67,7 @@ reason clears.
 | Zones tier-1 fallback (vk_native) | No, only ever requests 3D | n/a | No change. While a hold is on, its 3D request is recorded and applied at release. |
 | Deferred request at DP creation (`hw3d_request_pending`) | Only if the session asked for 2D before the DP existed | It is the session's own choice | No change. |
 | Multi-compositor / service path (`multi_compositor_request_display_mode`, IPC) | Only on app request, V key or session end | As above | No change. Its visibility / weave-idle `on_pause` (#1039, #1278) is Android-only. |
+| Multi-screen coverage (#2247, vk_native X11 segments) | Yes, `request_display_mode(false)` to a screen's DP when the window wholly leaves that screen | Yes: the screen's DP is asked for the session's mode when the window covers it again; for the session's own DP the restore is skipped while the NOT_1TO1 hold is on, whose release applies the same coverage gate | New with #2247. |
 | Focus loss, visibility change, tracking loss | No path on desktop Linux reaches the lens | n/a | Nothing to fix. MANAGED tracking loss is the weaver's own output decision, not a lens call. |
 
 Out of scope, same shape: the Android `vk_android_update_container_scaled()` degrade also restores

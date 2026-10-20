@@ -169,6 +169,71 @@ comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas
 }
 
 bool
+comp_segments_screen_covered(const struct comp_segment_table *t, uint64_t screen_id)
+{
+	if (t == NULL || t->count == 0) {
+		return true; // no coverage information: the session's own wish
+	}
+	for (uint32_t k = 0; k < t->count && k < COMP_SEGMENTS_MAX; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		if (g->screen_id == screen_id && g->window_rect.w > 0 && g->window_rect.h > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void
+comp_segments_cover_dwell_init(struct comp_segments_cover_dwell *d, uint64_t hold_ns)
+{
+	if (d == NULL) {
+		return;
+	}
+	memset(d, 0, sizeof(*d));
+	d->hold_ns = hold_ns > 0 ? hold_ns : COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS;
+}
+
+uint32_t
+comp_segments_cover_dwell_update(struct comp_segments_cover_dwell *d,
+                                 const struct comp_segment_table *t,
+                                 const struct comp_segments_screen *screens,
+                                 uint32_t screen_count,
+                                 uint64_t now_ns)
+{
+	if (d == NULL || screens == NULL) {
+		return 0;
+	}
+	if (d->hold_ns == 0) {
+		d->hold_ns = COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS; // zero-initialised: the default
+	}
+	if (screen_count > COMP_SEGMENTS_MAX_SCREENS) {
+		screen_count = COMP_SEGMENTS_MAX_SCREENS;
+	}
+	uint32_t changed = 0;
+	for (uint32_t i = 0; i < screen_count; i++) {
+		const bool was_uncovered = d->uncovered[i];
+		if (comp_segments_screen_covered(t, screens[i].id)) {
+			// Covered: at once, cancelling any pending 2D.
+			d->pending[i] = false;
+			d->uncovered[i] = false;
+		} else if (!d->uncovered[i]) {
+			if (!d->pending[i]) {
+				d->pending[i] = true;
+				d->since_ns[i] = now_ns;
+			}
+			if (now_ns - d->since_ns[i] >= d->hold_ns) {
+				d->pending[i] = false;
+				d->uncovered[i] = true;
+			}
+		}
+		if (d->uncovered[i] != was_uncovered) {
+			changed |= 1u << i;
+		}
+	}
+	return changed;
+}
+
+bool
 comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
                               const struct comp_seg_rect *canvas,
                               const struct comp_segments_screen *screens,

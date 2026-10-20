@@ -1182,3 +1182,147 @@ TEST_CASE("comp_segments: window_is_split — the zero-copy gate (#2218)", "[com
 		CHECK_FALSE(comp_segments_window_is_split(&win, nullptr, scr, 0));
 	}
 }
+
+TEST_CASE("comp_segments: lens wish follows coverage (#2247)")
+{
+	// DS1 is the primary; eDP to its left.
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3456, 2160, 3456, 2160, false),
+	    screen(DS1, 3456, 0, 3840, 2160, 3840, 2160, true),
+	};
+	comp_segment_table t{};
+
+	SECTION("window wholly on the primary: only the primary is covered")
+	{
+		comp_seg_rect win{4000, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK(comp_segments_screen_covered(&t, DS1));
+		CHECK_FALSE(comp_segments_screen_covered(&t, EDP));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, true));
+	}
+
+	SECTION("window wholly on the other screen: the primary it left wishes 2D")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK(comp_segments_screen_covered(&t, EDP));
+		CHECK_FALSE(comp_segments_screen_covered(&t, DS1));
+		CHECK(comp_segments_lens_wish(&t, EDP, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, true));
+	}
+
+	SECTION("window straddling the seam: both screens covered, both follow the session")
+	{
+		comp_seg_rect win{3000, 200, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 2);
+		CHECK(comp_segments_lens_wish(&t, EDP, true));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, false));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, false));
+	}
+
+	SECTION("a session in 2D wishes 2D everywhere, covered or not")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, false));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, false));
+	}
+
+	SECTION("no table (window on no screen) carries no coverage: the session's wish stands")
+	{
+		comp_seg_rect win{-5000, -5000, 100, 100};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 0);
+		CHECK(comp_segments_screen_covered(&t, EDP));
+		CHECK(comp_segments_screen_covered(&t, DS1));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK(comp_segments_screen_covered(nullptr, DS1));
+	}
+
+	SECTION("an unknown screen is uncovered once a table exists")
+	{
+		comp_seg_rect win{4000, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK_FALSE(comp_segments_screen_covered(&t, 0x9999));
+	}
+}
+
+TEST_CASE("comp_segments: the lens dead band — 2D after the hand-off dwell, 3D at once (#2247)")
+{
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3456, 2160, 3456, 2160, false),
+	    screen(DS1, 3456, 0, 3840, 2160, 3840, 2160, true),
+	};
+	const uint64_t ms = 1000ull * 1000ull;
+	comp_segments_cover_dwell d;
+	comp_segments_cover_dwell_init(&d, 0);
+	CHECK(d.hold_ns == COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS);
+
+	comp_segment_table on_primary{}, on_edp{}, straddle{};
+	comp_seg_rect w1{4000, 100, 1280, 720};
+	comp_seg_rect w2{100, 100, 1280, 720};
+	comp_seg_rect w3{3000, 200, 1280, 720};
+	REQUIRE(comp_segments_compute(&w1, nullptr, scr, 2, &on_primary) == 1);
+	REQUIRE(comp_segments_compute(&w2, nullptr, scr, 2, &on_edp) == 1);
+	REQUIRE(comp_segments_compute(&w3, nullptr, scr, 2, &straddle) == 2);
+
+	// Start straddling: both covered.
+	CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 1000 * ms) == 0);
+	CHECK(comp_segments_cover_dwell_covered(&d, 0));
+	CHECK(comp_segments_cover_dwell_covered(&d, 1));
+
+	SECTION("off the primary: covered until the dwell has elapsed, then 2D once")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1599 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1600 * ms) == (1u << 1));
+		CHECK_FALSE(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_covered(&d, 0));
+		// Steady: no further edges.
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 5000 * ms) == 0);
+
+		// Back: covered at once.
+		CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 5001 * ms) == (1u << 1));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+
+	SECTION("a drag back and forth across the seam never reaches 2D")
+	{
+		uint64_t t = 1000 * ms;
+		for (int i = 0; i < 20; i++) {
+			t += 300 * ms;
+			CHECK(comp_segments_cover_dwell_update(&d, (i % 2) ? &straddle : &on_edp, scr, 2, t) == 0);
+			CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		}
+	}
+
+	SECTION("a pending 2D is cancelled by a return and its clock restarts")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 1500 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1700 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 2100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 2200 * ms) == (1u << 1));
+	}
+
+	SECTION("both screens run their own dwell")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_primary, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_primary, scr, 2, 1600 * ms) == (1u << 0));
+		CHECK_FALSE(comp_segments_cover_dwell_covered(&d, 0));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+
+	SECTION("an empty table carries no coverage: nothing goes 2D")
+	{
+		comp_segment_table empty{};
+		CHECK(comp_segments_cover_dwell_update(&d, &empty, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &empty, scr, 2, 9000 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 0));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+}

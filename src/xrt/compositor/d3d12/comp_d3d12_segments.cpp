@@ -31,6 +31,7 @@
 #include "comp_d3d12_renderer.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "xrt/xrt_plugin.h"
@@ -66,6 +67,7 @@ struct seg_screen_state
 	bool configured;                        //!< set_background_2d(NULL) sent once.
 	int transparent_latched;                //!< last transparency declared, -1 = none.
 	int mode_sent;                          //!< last 2D/3D mode sent, -1 = none.
+	bool uncovered;                         //!< #2247: the window had wholly left this screen.
 	bool tolerates_resample;
 	struct seg_crop crop;
 };
@@ -90,6 +92,8 @@ struct comp_d3d12_segments
 
 	struct comp_segment_table table;
 	struct comp_segments_lifecycle lc;
+	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
+	struct comp_segments_cover_dwell cover;
 
 	//! The app thread reads st[i].dp for eyes; the weave creates/destroys it.
 	struct os_mutex dp_mutex;
@@ -212,6 +216,7 @@ dp_release(struct comp_d3d12_segments *segs, uint32_t i)
 	st->configured = false;
 	st->transparent_latched = -1;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	st->tolerates_resample = false;
 	crop_destroy(&st->crop);
 }
@@ -259,6 +264,7 @@ dp_create(struct comp_d3d12_segments *segs, uint32_t i)
 	st->configured = false;
 	st->transparent_latched = -1;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	// Lifecycle event (hysteresis-gated), not per frame.
 	U_LOG_W(
 	    "segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via "
@@ -316,6 +322,7 @@ comp_d3d12_segments_create(void *d3d12_device, void *d3d12_queue)
 
 	os_mutex_init(&segs->dp_mutex);
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->mode_index = UINT32_MAX;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		segs->st[i].transparent_latched = -1;
@@ -356,6 +363,7 @@ comp_d3d12_segments_set_screens(struct comp_d3d12_segments *segs,
 		dp_release(segs, i);
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->enabled = false;
 	segs->screen_count = 0;
 	segs->have_logged_table = false;
@@ -508,6 +516,9 @@ comp_d3d12_segments_update(struct comp_d3d12_segments *segs,
 	}
 
 	comp_segments_compute(window_desktop, canvas, segs->screens, segs->screen_count, &segs->table);
+	// #2247: advance each screen's lens dead band (the hand-off's dwell).
+	(void)comp_segments_cover_dwell_update(&segs->cover, &segs->table, segs->screens, segs->screen_count,
+	                                       os_monotonic_get_ns());
 
 	struct comp_segments_actions act;
 	comp_segments_lifecycle_update(&segs->lc, &segs->table, &act);
@@ -768,11 +779,40 @@ comp_d3d12_segments_set_display_mode(struct comp_d3d12_segments *segs, bool enab
 	segs->mode_3d = enable_3d;
 	for (uint32_t i = 0; i < segs->screen_count; i++) {
 		struct seg_screen_state *st = &segs->st[i];
-		if (st->dp != nullptr && st->mode_sent != (int)enable_3d) {
-			st->mode_sent = (int)enable_3d;
-			xrt_display_processor_d3d12_request_display_mode(st->dp, enable_3d);
+		if (st->dp == nullptr) {
+			continue;
+		}
+		// #2247: the lens wish follows coverage — 2D on a screen the window
+		// has wholly left for the hand-off's dwell, the session's mode on the
+		// screens it covers (at once when it returns).
+		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
+		const bool want = enable_3d && covered;
+		if (covered == st->uncovered) {
+			st->uncovered = !covered;
+			// A coverage edge for a live DP: lifecycle, not per frame.
+			U_LOG_W("segments: screen 0x%016llx ('%s') %s — lens wish %s (#2247)",
+			        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
+			        covered ? "covered again" : "uncovered for 0.5 s", want ? "3D" : "2D");
+		}
+		if (st->mode_sent != (int)want) {
+			st->mode_sent = (int)want;
+			xrt_display_processor_d3d12_request_display_mode(st->dp, want);
 		}
 	}
+}
+
+extern "C" bool
+comp_d3d12_segments_primary_covered(const struct comp_d3d12_segments *segs)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return true;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		if (segs->screens[i].is_primary) {
+			return comp_segments_cover_dwell_covered(&segs->cover, i);
+		}
+	}
+	return true;
 }
 
 extern "C" bool
