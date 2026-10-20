@@ -17,6 +17,8 @@
 add_library(
 	aux_desktop STATIC
 	u_desktop.h
+	u_desktop_capture.c
+	u_desktop_capture.h
 	u_desktop_chord.c
 	u_desktop_chord.h
 	u_desktop_control.c

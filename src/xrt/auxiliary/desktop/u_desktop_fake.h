@@ -31,8 +31,13 @@
  *
  * Environment knobs when selected through `DXR_DESKTOP_BACKEND=fake`:
  *   DXR_DESKTOP_FAKE_ANSWER=deny     the consent request is refused
+ *   DXR_DESKTOP_FAKE_CAPTURE_ANSWER=deny  the CAPTURE scope is refused (spec v2)
  *   DXR_DESKTOP_FAKE_STORE=1         behave like Windows (remembers_in_store)
  *   DXR_DESKTOP_FAKE_LOCKED=1        the screen is locked
+ *
+ * The batch hook (below) also fires "capture" right before a capture takes its
+ * picture and "captured" right after, so a test can flip the kill switch or the
+ * lock between the capture and the hand-over.
  */
 
 #pragma once
@@ -199,6 +204,71 @@ struct u_desktop_fake_orphan
  */
 void
 u_desktop_fake_set_orphan_on_destroy(struct u_desktop_fake *f, struct u_desktop_fake_orphan *orphan);
+
+// --- spec v2: screen capture ---------------------------------------------------
+//
+// The fake's capture draws a deterministic picture of its desktop, monitor by
+// monitor at each monitor's scale (device px = desktop px x scale), through the
+// same u_desktop_image_draw_frame a real backend uses, then withholds every
+// capture-excluded window. The picture of desktop point (x, y) (whole desktop px):
+//   inside window W (top-most, not minimized):  R 0x10, G = W.id & 0xff, B 0xF0
+//   elsewhere (the background):                 R = x & 0xff, G = y & 0xff, B 0x80
+// all with alpha 255. An unshared monitor and the space between monitors stay
+// (0,0,0,0). It never touches a real screen.
+
+#define U_DESKTOP_FAKE_MAX_MONITORS 4
+
+struct u_desktop_fake_monitor
+{
+	struct u_desktop_rect rect; //!< desktop coordinates
+	uint32_t scale;             //!< device px per desktop px (1, 2, ...)
+	bool shared;                //!< false: the user did not share it (GNOME) — withheld
+};
+
+//! Replace the monitors (default: one 1920x1080 at scale 1, shared).
+void
+u_desktop_fake_set_monitors(struct u_desktop_fake *f, const struct u_desktop_fake_monitor *m, uint32_t n);
+
+//! Mark window @p id capture-excluded (withheld from every capture) or not.
+void
+u_desktop_fake_set_capture_excluded(struct u_desktop_fake *f, uint64_t id, bool excluded);
+
+//! true: the fake cannot tell which windows are excluded — it refuses every capture.
+void
+u_desktop_fake_set_exclusion_unknown(struct u_desktop_fake *f, bool unknown);
+
+//! What capture_access_status() reports right now (default UNKNOWN).
+void
+u_desktop_fake_set_capture_access(struct u_desktop_fake *f, enum u_desktop_access a);
+
+/*!
+ * How request_scopes answers the CAPTURE scope (default GRANTED; the CONTROL scope
+ * follows u_desktop_fake_set_request_answer, deferral included). With
+ * @p report_all, an answer reports BOTH scopes even when only one was asked (the
+ * GNOME combined dialog).
+ */
+void
+u_desktop_fake_set_capture_request_answer(struct u_desktop_fake *f, enum u_desktop_access answer, bool report_all);
+
+//! The scopes of the last request_scopes call, and how many there were.
+uint32_t
+u_desktop_fake_last_request_scopes(struct u_desktop_fake *f, uint32_t *count);
+
+//! The next captures fail with @p r (OK = normal).
+void
+u_desktop_fake_set_capture_result(struct u_desktop_fake *f, enum u_desktop_result r);
+
+//! Every capture sleeps @p ms first.
+void
+u_desktop_fake_set_capture_delay_ms(struct u_desktop_fake *f, uint32_t ms);
+
+//! Captures the backend actually took.
+uint32_t
+u_desktop_fake_capture_count(struct u_desktop_fake *f);
+
+//! The fake's picture of desktop point (@p x, @p y), RGBA — what a test expects.
+void
+u_desktop_fake_expected_pixel(struct u_desktop_fake *f, int32_t x, int32_t y, uint8_t out[4]);
 
 #ifdef __cplusplus
 }

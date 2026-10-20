@@ -126,6 +126,14 @@ enum u_desktop_caps
 	U_DESKTOP_CAP_READ_TEXT = 0x08,
 	U_DESKTOP_CAP_WINDOW_ACTIONS = 0x10,
 	U_DESKTOP_CAP_INPUT = 0x20,
+	U_DESKTOP_CAP_CAPTURE = 0x40, //!< spec v2: screen stills (the `capture` op)
+};
+
+//! The consent scopes (spec v2, same bits as XrDesktopControlScopeFlagsDXR).
+enum u_desktop_scope
+{
+	U_DESKTOP_SCOPE_CONTROL = 0x1, //!< everything in spec v1
+	U_DESKTOP_SCOPE_CAPTURE = 0x2, //!< screen pixels
 };
 
 //! Same bit values as XrDesktopWindowStateFlagsDXR.
@@ -242,6 +250,34 @@ struct u_desktop_app_info
 typedef void (*u_desktop_access_done_fn)(void *ctx, enum u_desktop_access result);
 
 /*!
+ * The answer to request_scopes (spec v2): one result per scope. A scope the prompt
+ * said nothing about is U_DESKTOP_ACCESS_UNKNOWN (left as it was). A backend may
+ * report a scope it was not asked for when the OS dialog decided it anyway (GNOME:
+ * one Start response decides input AND screens).
+ */
+typedef void (*u_desktop_scopes_done_fn)(void *ctx, enum u_desktop_access control, enum u_desktop_access capture);
+
+/*!
+ * A captured image (spec v2 §10.3): RGBA8, sRGB, straight alpha, top row first,
+ * stride w * 4. Withheld pixels are (0,0,0,0). Allocate with u_desktop_image_alloc
+ * (zeroed: everything withheld until written), free with u_desktop_image_free.
+ * NEVER written to disk or a log (privacy, spec §10.4).
+ */
+struct u_desktop_image
+{
+	uint8_t *rgba;
+	uint32_t w, h;
+	uint64_t frame_ns; //!< os_monotonic_get_ns() time at which these pixels were current
+};
+
+//! Zeroed w x h image (all withheld). False on a bad size / no memory.
+bool
+u_desktop_image_alloc(struct u_desktop_image *img, uint32_t w, uint32_t h);
+
+void
+u_desktop_image_free(struct u_desktop_image *img);
+
+/*!
  * Handed to every injecting backend call (see "Delivery guarantee").
  */
 struct u_desktop_input_guard
@@ -356,6 +392,53 @@ struct u_desktop_backend
 	                                int32_t dx,
 	                                int32_t dy,
 	                                char *msg);
+
+	// ---- spec v2: screen capture. All optional (NULL = no capture; then the backend
+	// ---- must not set U_DESKTOP_CAP_CAPTURE). See "Capture" below.
+
+	/*!
+	 * The CAPTURE scope's grant as the OS sees it now, without prompting (as
+	 * access_status is for CONTROL).
+	 */
+	enum u_desktop_access (*capture_access_status)(struct u_desktop_backend *b);
+
+	/*!
+	 * Ask for @p scopes (enum u_desktop_scope bits) in ONE prompt. Calls @p done
+	 * exactly once (any thread, possibly before returning) with a result per scope.
+	 * When NULL, the common layer uses request_access for CONTROL-only requests.
+	 */
+	void (*request_scopes)(struct u_desktop_backend *b,
+	                       const struct u_desktop_app_info *app,
+	                       uint32_t scopes,
+	                       u_desktop_scopes_done_fn done,
+	                       void *ctx);
+
+	/*!
+	 * The monitors, desktop coordinates (every monitor, shared or not). Fills up to
+	 * @p cap, sets @p count to the total. Observation-class: any thread, fast.
+	 */
+	enum u_desktop_result (*monitors)(struct u_desktop_backend *b,
+	                                  struct u_desktop_rect *out,
+	                                  uint32_t cap,
+	                                  uint32_t *count,
+	                                  char *msg);
+
+	/*!
+	 * One still of @p src (desktop coordinates, already clipped to the monitors) at
+	 * the backend's native density: img->w x img->h device px where the OS has them
+	 * (GNOME: the highest monitor scale in the region). Allocates @p img with
+	 * u_desktop_image_alloc; pixels it cannot show (off every monitor, an unshared
+	 * monitor, a window the OS / the DisplayXR extension excludes from capture) stay
+	 * (0,0,0,0) — and when the backend cannot tell which windows are excluded it
+	 * REFUSES ("cannot honour capture exclusion") rather than return them unmasked.
+	 * The common layer masks the app's OWN windows itself. Called only from the
+	 * session's capture worker, never concurrently with itself; bounded (2 s plus any
+	 * session restore). Must refuse while locked. Never writes pixels anywhere else.
+	 */
+	enum u_desktop_result (*capture)(struct u_desktop_backend *b,
+	                                 const struct u_desktop_rect *src,
+	                                 struct u_desktop_image *img,
+	                                 char *msg);
 
 	//! See "Lifetime": never returns while a consent answer is owed.
 	void (*destroy)(struct u_desktop_backend *b);
