@@ -58,6 +58,9 @@ struct seg_crop
 	ID3D12Resource *texture; //!< plain 2D, COMMON between frames
 	uint32_t w, h;
 	DXGI_FORMAT format;
+	//! The state the texture rests in between uses: COMMON for the atlas crops,
+	//! PIXEL_SHADER_RESOURCE for the zone-mask crop (the publish contract).
+	D3D12_RESOURCE_STATES state;
 };
 
 //! Per-screen runtime state (indexed like comp_d3d12_segments::screens).
@@ -70,6 +73,12 @@ struct seg_screen_state
 	bool uncovered;                         //!< #2247: the window had wholly left this screen.
 	bool tolerates_resample;
 	struct seg_crop crop;
+	//! #2218 (#4): the zone mask cropped to this segment, and whether this DP
+	//! currently holds a publish; zone_caps 0 = unqueried, 1 = supported, 2 = no.
+	struct seg_crop mask_crop;
+	bool zone_published;
+	int zone_caps;
+	uint64_t zone_seq_sent;
 };
 
 struct comp_d3d12_segments
@@ -100,6 +109,15 @@ struct comp_d3d12_segments
 
 	bool mode_3d;
 	uint32_t mode_index;
+
+	//! #2218 (#4): a private one-shot list for the per-segment mask crops. The
+	//! zone-mask sync runs AFTER the weave's fence wait, when the weave list is
+	//! closed, so the crop cannot ride it; created lazily, waited on here.
+	ID3D12CommandAllocator *mask_alloc;
+	ID3D12GraphicsCommandList *mask_list;
+	ID3D12Fence *mask_fence;
+	HANDLE mask_event;
+	uint64_t mask_fence_value;
 
 	// Change-only logging.
 	bool have_logged_table;
@@ -165,6 +183,7 @@ crop_ensure(ID3D12Device *dev, struct seg_crop *c, uint32_t w, uint32_t h, DXGI_
 	c->w = w;
 	c->h = h;
 	c->format = format;
+	c->state = D3D12_RESOURCE_STATE_COMMON;
 	return true;
 }
 
@@ -219,6 +238,11 @@ dp_release(struct comp_d3d12_segments *segs, uint32_t i)
 	st->uncovered = false;
 	st->tolerates_resample = false;
 	crop_destroy(&st->crop);
+	// #2218 (#4): the DP is gone, and with it its publish.
+	crop_destroy(&st->mask_crop);
+	st->zone_published = false;
+	st->zone_caps = 0;
+	st->zone_seq_sent = 0;
 }
 
 /*!
@@ -344,6 +368,18 @@ comp_d3d12_segments_destroy(struct comp_d3d12_segments **segs_ptr)
 	if (segs->srv_heap != nullptr) {
 		segs->srv_heap->Release();
 		segs->srv_heap = nullptr;
+	}
+	if (segs->mask_list != nullptr) {
+		segs->mask_list->Release();
+	}
+	if (segs->mask_alloc != nullptr) {
+		segs->mask_alloc->Release();
+	}
+	if (segs->mask_fence != nullptr) {
+		segs->mask_fence->Release();
+	}
+	if (segs->mask_event != nullptr) {
+		CloseHandle(segs->mask_event);
 	}
 	os_mutex_destroy(&segs->dp_mutex);
 	free(segs);
@@ -485,6 +521,224 @@ comp_d3d12_segments_set_screens(struct comp_d3d12_segments *segs,
 		    "segments: %u screens, plug-in '%s' — a window spanning monitors is woven per monitor "
 		    "(multi-screen M6, D3D12)",
 		    n, primary_entry->plugin_id);
+	}
+}
+
+/*
+ *
+ * #2218 (#4): the zone mask, per screen.
+ *
+ */
+
+static bool
+seg_dp_supports_zones(struct seg_screen_state *st)
+{
+	if (st->dp == nullptr) {
+		return false;
+	}
+	if (st->zone_caps == 0) {
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		const bool ok = xrt_display_processor_d3d12_get_local_zone_caps(st->dp, &caps);
+		st->zone_caps = (ok && caps.supported != 0) ? 1 : 2;
+	}
+	return st->zone_caps == 1;
+}
+
+//! Lazily create the private crop list (see comp_d3d12_segments::mask_list).
+static bool
+mask_list_ensure(struct comp_d3d12_segments *segs)
+{
+	if (segs->mask_list != nullptr) {
+		return true;
+	}
+	if (FAILED(segs->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	                                                IID_PPV_ARGS(&segs->mask_alloc))) ||
+	    FAILED(segs->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, segs->mask_alloc, nullptr,
+	                                           IID_PPV_ARGS(&segs->mask_list))) ||
+	    (segs->mask_fence == nullptr &&
+	     FAILED(segs->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&segs->mask_fence))))) {
+		U_LOG_E("segments: D3D12 zone-mask crop list failed to create");
+		if (segs->mask_list != nullptr) {
+			segs->mask_list->Release();
+			segs->mask_list = nullptr;
+		}
+		if (segs->mask_alloc != nullptr) {
+			segs->mask_alloc->Release();
+			segs->mask_alloc = nullptr;
+		}
+		return false;
+	}
+	segs->mask_list->Close(); // created open; every use starts with a Reset
+	if (segs->mask_event == nullptr) {
+		segs->mask_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	}
+	if (segs->mask_event == nullptr) {
+		segs->mask_list->Release();
+		segs->mask_list = nullptr;
+		segs->mask_alloc->Release();
+		segs->mask_alloc = nullptr;
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Copy @p box of @p mask into @p crop on the private list and wait for it
+ * (bounded). @p mask is in PIXEL_SHADER_RESOURCE on entry and on return (the
+ * publish contract); @p crop ends in PIXEL_SHADER_RESOURCE, the state the
+ * vendor is handed.
+ */
+static bool
+mask_crop_copy(struct comp_d3d12_segments *segs, ID3D12Resource *mask, struct seg_crop *crop, const D3D12_BOX *box)
+{
+	if (!mask_list_ensure(segs)) {
+		return false;
+	}
+	if (FAILED(segs->mask_alloc->Reset()) || FAILED(segs->mask_list->Reset(segs->mask_alloc, nullptr))) {
+		return false;
+	}
+	ID3D12GraphicsCommandList *cl = segs->mask_list;
+	transition(cl, mask, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	transition(cl, crop->texture, crop->state, D3D12_RESOURCE_STATE_COPY_DEST);
+	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+	dst_loc.pResource = crop->texture;
+	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+	src_loc.pResource = mask;
+	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, box);
+	transition(cl, crop->texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	transition(cl, mask, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	if (FAILED(cl->Close())) {
+		return false;
+	}
+	ID3D12CommandList *lists[] = {cl};
+	segs->queue->ExecuteCommandLists(1, lists);
+	const uint64_t v = ++segs->mask_fence_value;
+	if (FAILED(segs->queue->Signal(segs->mask_fence, v))) {
+		return false;
+	}
+	if (segs->mask_fence->GetCompletedValue() < v) {
+		segs->mask_fence->SetEventOnCompletion(v, segs->mask_event);
+		if (WaitForSingleObject(segs->mask_event, 2000) != WAIT_OBJECT_0) {
+			U_LOG_W("segments: zone-mask crop did not finish within 2 s, publish skipped (#2218 #4)");
+			return false;
+		}
+	}
+	crop->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	return true;
+}
+
+extern "C" void
+comp_d3d12_segments_publish_zone_mask(struct comp_d3d12_segments *segs,
+                                      void *mask_resource,
+                                      uint32_t mask_w,
+                                      uint32_t mask_h,
+                                      uint32_t win_w,
+                                      uint32_t win_h,
+                                      uint64_t seq)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return;
+	}
+	auto *mask_res = static_cast<ID3D12Resource *>(mask_resource);
+	if (mask_res == nullptr || mask_w == 0 || mask_h == 0 || win_w == 0 || win_h == 0) {
+		comp_d3d12_segments_clear_zone_mask(segs);
+		return;
+	}
+	const D3D12_RESOURCE_DESC md = mask_res->GetDesc();
+	if (md.Width < mask_w || md.Height < mask_h) {
+		return; // the declared dims do not describe this resource, publish nothing
+	}
+	const struct comp_segment_table *t = &segs->table;
+	bool in_table[COMP_SEGMENTS_MAX_SCREENS] = {};
+	for (uint32_t k = 0; k < t->count; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		const int i = (int)g->screen_index;
+		if (i < 0 || (uint32_t)i >= segs->screen_count) {
+			continue;
+		}
+		struct seg_screen_state *st = &segs->st[i];
+		// The session's own DP (the primary) is published by the compositor itself.
+		if (g->is_primary || st->dp == nullptr) {
+			continue;
+		}
+		in_table[i] = true;
+		if (!seg_dp_supports_zones(st)) {
+			continue;
+		}
+		struct comp_seg_rect mr;
+		if (!comp_segments_mask_crop_rect(&g->window_rect, win_w, win_h, mask_w, mask_h, &mr)) {
+			continue;
+		}
+		// One generation per (content, crop): the vendor evaluates the content
+		// once per generation and ignores the anchor, so a crop that moved
+		// must look like new content to it.
+		const uint64_t gen = seq * 1000003ull ^ ((uint64_t)(uint32_t)mr.x << 1) ^ ((uint64_t)(uint32_t)mr.y << 17) ^
+		                     ((uint64_t)mr.w << 33) ^ ((uint64_t)mr.h << 49);
+		const bool fresh = st->mask_crop.texture == nullptr || st->mask_crop.w != mr.w || st->mask_crop.h != mr.h;
+		if (!crop_ensure(segs->device, &st->mask_crop, mr.w, mr.h, DXGI_FORMAT_R8_UNORM)) {
+			continue;
+		}
+		// The copy (a queue submit + wait) is only worth doing when the vendor
+		// will look at the pixels: a new generation, a new crop texture, or
+		// nothing published yet. The publish itself is repeated every frame
+		// like the primary's.
+		if (fresh || !st->zone_published || st->zone_seq_sent != gen) {
+			D3D12_BOX box = {};
+			box.left = (UINT)mr.x;
+			box.top = (UINT)mr.y;
+			box.right = (UINT)(mr.x + (int32_t)mr.w);
+			box.bottom = (UINT)(mr.y + (int32_t)mr.h);
+			box.front = 0;
+			box.back = 1;
+			if (!mask_crop_copy(segs, mask_res, &st->mask_crop, &box)) {
+				continue;
+			}
+		}
+		const bool ok = xrt_display_processor_d3d12_publish_local_zone_mask(
+		    st->dp, st->mask_crop.texture, mr.w, mr.h, g->screen_rect.x, g->screen_rect.y, g->screen_rect.w,
+		    g->screen_rect.h, gen);
+		if (ok) {
+			if (!st->zone_published) {
+				// Lifecycle (first publish to this DP); later generations at INFO.
+				U_LOG_W("segments: zone mask now published to the D3D12 segment DP of screen 0x%016llx - "
+				        "%ux%u of %ux%u mask px, gen %llu (#2218 #4)",
+				        (unsigned long long)segs->screens[i].id, mr.w, mr.h, mask_w, mask_h,
+				        (unsigned long long)gen);
+			} else if (st->zone_seq_sent != gen) {
+				U_LOG_I("segments: zone mask re-published to screen 0x%016llx - %ux%u, gen %llu",
+				        (unsigned long long)segs->screens[i].id, mr.w, mr.h, (unsigned long long)gen);
+			}
+			st->zone_published = true;
+			st->zone_seq_sent = gen;
+		}
+	}
+	// A screen the window has left keeps no stale wish.
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		struct seg_screen_state *st = &segs->st[i];
+		if (!in_table[i] && st->zone_published && st->dp != nullptr) {
+			xrt_display_processor_d3d12_clear_local_zone_mask(st->dp);
+			st->zone_published = false;
+			st->zone_seq_sent = 0;
+		}
+	}
+}
+
+extern "C" void
+comp_d3d12_segments_clear_zone_mask(struct comp_d3d12_segments *segs)
+{
+	if (segs == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		struct seg_screen_state *st = &segs->st[i];
+		if (st->zone_published && st->dp != nullptr) {
+			xrt_display_processor_d3d12_clear_local_zone_mask(st->dp);
+		}
+		st->zone_published = false;
+		st->zone_seq_sent = 0;
 	}
 }
 

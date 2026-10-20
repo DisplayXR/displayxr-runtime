@@ -205,6 +205,41 @@ comp_d3d12_segments_get_metrics(const struct comp_d3d12_segments *segs,
                                 bool primary_has_dp,
                                 struct xrt_segment_metrics *out);
 
+/*!
+ * #2218 (#4): publish the session's local zone mask to every segment DP that
+ * is not the session's own (the primary, which the compositor publishes to
+ * itself). The vendor's local-zone verdict is per PANEL, so each segment DP
+ * receives the mask CROPPED to its segment (@ref comp_segments_mask_crop_rect),
+ * tagged with a generation that changes with the mask generation and the crop
+ * rect. A segment DP without local-zone support, or a screen the window has
+ * left, is cleared instead. The D3D12 twin of
+ * comp_d3d11_segments_publish_zone_mask.
+ *
+ * Call AFTER the weave's fence wait (the same contract as the primary's
+ * publish): @p mask_resource (ID3D12Resource*, R8_UNORM, spanning the window,
+ * on the manager's device) is GPU-complete and in PIXEL_SHADER_RESOURCE, and
+ * is left there. The crop runs on a private list and waits (bounded) here.
+ *
+ * @param mask_w/mask_h  Mask dimensions (mask px; may differ from the window).
+ * @param win_w/win_h    The client window in window px (the mask's extent).
+ * @param seq            The mask content generation (zone_publish_seq).
+ */
+void
+comp_d3d12_segments_publish_zone_mask(struct comp_d3d12_segments *segs,
+                                      void *mask_resource,
+                                      uint32_t mask_w,
+                                      uint32_t mask_h,
+                                      uint32_t win_w,
+                                      uint32_t win_h,
+                                      uint64_t seq);
+
+/*!
+ * #2218 (#4): withdraw the zone mask from every segment DP that has one
+ * published. Idempotent; a manager with nothing published is a no-op.
+ */
+void
+comp_d3d12_segments_clear_zone_mask(struct comp_d3d12_segments *segs);
+
 #ifdef __cplusplus
 }
 #endif
