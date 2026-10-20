@@ -689,14 +689,15 @@ gnome_request_access(struct u_desktop_backend *b,
                      u_desktop_access_done_fn done,
                      void *ctx)
 {
-	(void)app; // the portal names the app by its app id (see the portal file)
+	// The portal names the app by its app id (see the portal file); only the
+	// dialog's parent window is used.
 	struct gnome_backend *g = gnome(b);
 	if (g->portal == NULL) {
 		U_LOG_W("desktop/gnome: no RemoteDesktop portal — there is no OS consent path to ask through");
 		done(ctx, U_DESKTOP_ACCESS_DENIED);
 		return;
 	}
-	gnome_portal_request(g->portal, done, ctx);
+	gnome_portal_request(g->portal, app != NULL ? app->parent_window : NULL, done, ctx);
 }
 
 /*

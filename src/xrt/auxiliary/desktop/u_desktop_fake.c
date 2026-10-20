@@ -87,6 +87,9 @@ struct u_desktop_fake
 	uint32_t pending_scopes;
 	uint32_t scopes_request_count;
 	uint32_t last_scopes;
+	//! The parent_window of the last request_access / request_scopes call ("" = none).
+	char last_parent_window[U_DESKTOP_PARENT_WINDOW_SIZE];
+	bool last_parent_window_null; //!< ...and whether the app info carried NULL
 	bool exclusion_unknown; //!< the capture cannot tell which windows are excluded
 	enum u_desktop_result capture_result;
 	uint32_t capture_delay_ms;
@@ -364,10 +367,12 @@ fake_request_access(struct u_desktop_backend *b,
                     u_desktop_access_done_fn done,
                     void *ctx)
 {
-	(void)app;
 	struct u_desktop_fake *f = fake(b);
 	os_mutex_lock(&f->mutex);
 	f->request_count++;
+	f->last_parent_window_null = app == NULL || app->parent_window == NULL;
+	snprintf(f->last_parent_window, sizeof(f->last_parent_window), "%s",
+	         f->last_parent_window_null ? "" : app->parent_window);
 	enum u_desktop_access answer = f->answer;
 	if (f->deferred) {
 		f->pending_done = done;
@@ -881,12 +886,14 @@ fake_request_scopes(struct u_desktop_backend *b,
                     u_desktop_scopes_done_fn done,
                     void *ctx)
 {
-	(void)app;
 	struct u_desktop_fake *f = fake(b);
 	os_mutex_lock(&f->mutex);
 	f->request_count++;
 	f->scopes_request_count++;
 	f->last_scopes = scopes;
+	f->last_parent_window_null = app == NULL || app->parent_window == NULL;
+	snprintf(f->last_parent_window, sizeof(f->last_parent_window), "%s",
+	         f->last_parent_window_null ? "" : app->parent_window);
 	if (f->deferred) {
 		f->pending_scopes_done = done;
 		f->pending_ctx = ctx;
@@ -1463,6 +1470,18 @@ u_desktop_fake_last_request_scopes(struct u_desktop_fake *f, uint32_t *count)
 	}
 	os_mutex_unlock(&f->mutex);
 	return s;
+}
+
+bool
+u_desktop_fake_last_parent_window(struct u_desktop_fake *f, char *out, size_t cap)
+{
+	os_mutex_lock(&f->mutex);
+	bool was_null = f->last_parent_window_null;
+	if (out != NULL && cap > 0) {
+		snprintf(out, cap, "%s", f->last_parent_window);
+	}
+	os_mutex_unlock(&f->mutex);
+	return !was_null;
 }
 
 void

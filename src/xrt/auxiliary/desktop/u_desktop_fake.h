@@ -254,6 +254,14 @@ u_desktop_fake_set_capture_request_answer(struct u_desktop_fake *f, enum u_deskt
 uint32_t
 u_desktop_fake_last_request_scopes(struct u_desktop_fake *f, uint32_t *count);
 
+/*!
+ * The parent_window the last request_access / request_scopes call carried, copied
+ * into @p out ("" when none). Returns false when the app info's field was NULL (the
+ * common layer always passes a string, "" for none).
+ */
+bool
+u_desktop_fake_last_parent_window(struct u_desktop_fake *f, char *out, size_t cap);
+
 //! The next captures fail with @p r (OK = normal).
 void
 u_desktop_fake_set_capture_result(struct u_desktop_fake *f, enum u_desktop_result r);

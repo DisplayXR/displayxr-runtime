@@ -397,7 +397,9 @@ call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-
 ### 10.1 Additions to the header
 
 Structure types use the last four values of this extension's block (1004999406–409; the
-1004999400–409 decade is now full, see `src/external/openxr_includes/openxr/README.md`):
+1004999400–409 decade is now full) and the first value of a second decade claimed for it,
+1004999420–429 (410–419 is `XR_DXR_input_providers`'; see
+`src/external/openxr_includes/openxr/README.md`):
 
 ```c
 #define XR_DXR_desktop_control_SPEC_VERSION 2
@@ -406,6 +408,9 @@ Structure types use the last four values of this extension's block (1004999406�
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR      ((XrStructureType)1004999407)
 #define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR             ((XrStructureType)1004999408)
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR  ((XrStructureType)1004999409)
+#define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR             ((XrStructureType)1004999420)
+
+#define XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR 256
 
 // The backend can capture screen pixels (and the platform has the libraries for it).
 static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR = 0x00000040;
@@ -424,6 +429,14 @@ typedef struct XrDesktopControlRequestScopeDXR {
     const void* XR_MAY_ALIAS       next;
     XrDesktopControlScopeFlagsDXR  scopes; //!< at least one scope bit; known bits only
 } XrDesktopControlRequestScopeDXR;
+
+//! Chained on XrDesktopControlRequestInfoDXR::next (§10.2 "Parent window"): the app window
+//! the consent dialog belongs to. Absent, NULL or "" = none.
+typedef struct XrDesktopControlParentWindowDXR {
+    XrStructureType            type;         //!< XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR
+    const void* XR_MAY_ALIAS   next;
+    const char*                parentWindow; //!< "wayland:<handle>" | "x11:<hex XID>" | "" / NULL
+} XrDesktopControlParentWindowDXR;
 
 typedef enum XrDesktopCaptureTargetDXR {
     XR_DESKTOP_CAPTURE_TARGET_DESKTOP_DXR = 0, //!< the union of every monitor
@@ -495,6 +508,24 @@ scopes. Rows 8–10 read that scope's own grant:
   `xrCaptureDesktopDXR` **never prompts**: on GNOME a silent restore that turns into a dialog
   (the saved approval is gone) has that dialog closed at once (`Request.Close` on the pending
   request — closing the session alone leaves it up) and completes `NOT_GRANTED`.
+- **Parent window.** A request may chain an `XrDesktopControlParentWindowDXR`: the app
+  window the consent dialog belongs to, so the OS opens the dialog on top of it rather than
+  wherever new windows land (an agent app that is fullscreen or always-on-top otherwise
+  hides the dialog, and the user never sees the question). The string is the
+  xdg-desktop-portal `parent_window` convention verbatim: `"wayland:<handle>"`, the handle
+  the app got from exporting its toplevel with the xdg-foreign protocol
+  (`zxdg_exporter_v2`), or `"x11:<XID in hexadecimal>"` (an optional `0x` is tolerated).
+  Absent, `NULL` or `""` means no parent. Anything else — another prefix, an empty handle,
+  a space or control character, a non-hex XID, more than 16 hex digits, 256 bytes or
+  more — is `XR_ERROR_VALIDATION_FAILURE` and nothing is asked. It is a placement hint
+  only: it never changes what is asked or granted, it applies to that request only (a
+  later request without one has no parent), and a handle the OS cannot resolve (an
+  export the app has since dropped) is the OS's to ignore, never a failure. Used on
+  GNOME / KDE, where it is the `parent_window` argument of the portals' `Start`.
+  Ignored on macOS (the prompt is System Settings) and Windows (DisplayXR's own dialog);
+  a platform handle form for those is reserved for a later revision and, until one is
+  specified, any other prefix is refused rather than ignored, so it cannot ship with a
+  meaning of its own.
 - **GNOME.** One portal session carries both scopes. The `Start` response decides each one
   separately: `devices` non-zero ⇒ CONTROL granted, `streams` non-empty ⇒ CAPTURE granted.
   Asking for a scope later opens a **new** combined session, and the dialog asks about input
@@ -619,9 +650,15 @@ rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget 
   - store v1 → v2.
 
   Add a capture script to `desktop_control_probe` (`e2e_fake.txt`). The probe writes a PNG
-  only with `--save`.
+  only with `--save`. The parent window: validation (both forms, the length bound, refused
+  prefixes), pass-through to the backend per request, absent ⇒ `""` (unit tests, and
+  `expect-rejected request-scopes … --parent=…` in the probe script).
 - **GNOME (Ubuntu 24.04 and 26.04, plus a 22.04 Wayland session for the oldest
   portal).**
+  - Parent window ([GNOME test plan](XR_DXR_desktop_control_gnome_test_plan.md) row): the
+    dialog opens centred on the app's window with a Wayland (xdg-foreign) handle and with an
+    X11 one; a stale or invalid handle ⇒ GNOME opens it unparented, the request still
+    completes.
   - One dialog covers both scopes. Captures in a loop show **no flash**, and `dbus-monitor`
     shows no `org.gnome.Shell.Screenshot` call.
   - The screen-sharing indicator is up only during bursts. Silent restore works within the
@@ -689,9 +726,14 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   `request_scopes`, which answers per scope; a backend may also answer a scope it was not asked
   for when the OS dialog decided it (GNOME's Start response), and the common layer takes that
   answer.
-- Validation of `xrRequestDesktopControlDXR`: `next` is walked for the scope structure; other
-  structures are ignored (version 1 rejected any `next`). `scopes` needs a scope bit and no
-  unknown bit (ASK_AGAIN alone is invalid).
+- Validation of `xrRequestDesktopControlDXR`: `next` is walked for the scope and the
+  parent-window structures (the first of each counts); other structures are ignored
+  (version 1 rejected any `next`). `scopes` needs a scope bit and no unknown bit (ASK_AGAIN
+  alone is invalid). `parentWindow` is checked by `u_desktop_parent_window_valid` (§10.2),
+  in the state tracker and again in the common layer (`u_desktop_control_request_ex`).
+- The parent window travels with its request only: `u_desktop_app_info::parent_window`
+  (`""` when none, never `NULL`) for that one `request_access` / `request_scopes` call. A
+  backend keeps a copy if it needs one later.
 - `xrCaptureDesktopDXR`: validation, then `FEATURE_UNSUPPORTED` without the capability, then
   `NOT_GRANTED` unless CAPTURE is `GRANTED` (audited once per state, like a refused action),
   then `LIMIT_REACHED` with one in flight. WINDOW resolves through the backend's window list
@@ -745,3 +787,13 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   `request-scopes all` shows two dialogs there.
 - `capture_excluded` windows are withheld over their `frame` and `buffer` rects; without the
   extension (or without its answer) the capture is refused.
+- **Parent window.** Each request's `parent_window` is copied onto the portal thread and is
+  the `parent_window` argument of every `Start` until the next request — the combined
+  `RemoteDesktop.Start` and the standalone `ScreenCast.Start` alike (it is an argument of
+  `Start` only; `CreateSession` / `SelectDevices` / `SelectSources` take none), silent
+  restores included, since a restore can still turn into a dialog. Before this,
+  xdg-desktop-portal-gnome logged `Failed to associate portal window with parent window ''`
+  and opened the dialog wherever new windows land, sometimes behind the app. An
+  unresolvable handle is logged by xdg-desktop-portal-gnome and the dialog opens unparented
+  — the request does not fail. The Unity plug-in obtains the string with
+  `displayxr_linux_window_handle` (displayxr-unity#385).

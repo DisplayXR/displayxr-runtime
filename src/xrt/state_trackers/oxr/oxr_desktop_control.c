@@ -67,6 +67,7 @@ _Static_assert(U_DESKTOP_CAP_CAPTURE == 0x40 /* XR_DESKTOP_CONTROL_CAPABILITY_CA
 _Static_assert(U_DESKTOP_SCOPE_CONTROL == 0x1 /* XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR */, "scope mirror");
 _Static_assert(U_DESKTOP_SCOPE_CAPTURE == 0x2 /* XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR */, "scope mirror");
 _Static_assert(U_DESKTOP_SCOPE_REASK == 0x100 /* XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR */, "scope mirror");
+_Static_assert(U_DESKTOP_PARENT_WINDOW_SIZE == XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR, "parent window size mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_WINDOW == (int)XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR, "target mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_REGION == (int)XR_DESKTOP_CAPTURE_TARGET_REGION_DXR, "target mirror");
 
@@ -249,24 +250,40 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDesktopControlDXR");
 	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
 	OXR_VERIFY_ARG_TYPE_CAN_BE_NULL(&log, info, XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR);
-	// Spec v2: the scopes, chained on info->next (absent = CONTROL only, as in v1).
-	// Other structures in the chain are ignored, as OpenXR does.
+	// Spec v2: the scopes (absent = CONTROL only, as in v1) and the consent dialog's
+	// parent window, chained on info->next. Other structures in the chain are
+	// ignored, as OpenXR does; the first of each kind counts.
 	uint32_t scopes = U_DESKTOP_SCOPE_CONTROL;
+	bool have_scopes = false, have_parent = false;
+	char parent[U_DESKTOP_PARENT_WINDOW_SIZE] = {0};
 	for (const XrBaseInStructure *n = info != NULL ? (const XrBaseInStructure *)info->next : NULL; n != NULL;
 	     n = n->next) {
-		if (n->type != XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR) {
-			continue;
+		if (n->type == XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR && !have_scopes) {
+			have_scopes = true;
+			XrDesktopControlScopeFlagsDXR s = ((const XrDesktopControlRequestScopeDXR *)n)->scopes;
+			const XrDesktopControlScopeFlagsDXR scope_bits =
+			    XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR | XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR;
+			const XrDesktopControlScopeFlagsDXR known =
+			    scope_bits | XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR;
+			if ((s & scope_bits) == 0 || (s & ~known) != 0) {
+				return oxr_error(
+				    &log, XR_ERROR_VALIDATION_FAILURE,
+				    "(XrDesktopControlRequestScopeDXR::scopes) must be non-zero, known bits only");
+			}
+			scopes = (uint32_t)s;
+		} else if (n->type == XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR && !have_parent) {
+			have_parent = true;
+			const char *pw = ((const XrDesktopControlParentWindowDXR *)n)->parentWindow;
+			if (!u_desktop_parent_window_valid(pw)) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "(XrDesktopControlParentWindowDXR::parentWindow) must be \"\", "
+				                 "\"wayland:<handle>\" or \"x11:<hex>\", shorter than %d bytes",
+				                 XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR);
+			}
+			if (pw != NULL) {
+				snprintf(parent, sizeof(parent), "%s", pw);
+			}
 		}
-		XrDesktopControlScopeFlagsDXR s = ((const XrDesktopControlRequestScopeDXR *)n)->scopes;
-		const XrDesktopControlScopeFlagsDXR scope_bits =
-		    XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR | XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR;
-		const XrDesktopControlScopeFlagsDXR known = scope_bits | XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR;
-		if ((s & scope_bits) == 0 || (s & ~known) != 0) {
-			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(XrDesktopControlRequestScopeDXR::scopes) must be non-zero, known bits only");
-		}
-		scopes = (uint32_t)s;
-		break;
 	}
 
 	struct u_desktop_control *dc = get_dc(sess);
@@ -277,7 +294,7 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 	if (info != NULL && info->reason != NULL) {
 		snprintf(reason, sizeof(reason), "%s", info->reason);
 	}
-	return gate_result(&log, u_desktop_control_request_scopes(dc, reason[0] != '\0' ? reason : NULL, scopes));
+	return gate_result(&log, u_desktop_control_request_ex(dc, reason[0] != '\0' ? reason : NULL, scopes, parent));
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL

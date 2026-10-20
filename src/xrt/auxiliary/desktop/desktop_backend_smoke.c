@@ -20,6 +20,9 @@
  *   desktop_backend_smoke click X Y [left|right|middle] [count]
  *   desktop_backend_smoke scroll DX DY            at the current pointer
  *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
+ *   desktop_backend_smoke parent [HANDLE]         (script) the consent dialog's parent window for
+ *                                                 request / request-scopes: wayland:H | x11:HEX
+ *                                                 (unvalidated here); none = clear
  *   desktop_backend_smoke request-scopes control|capture|all[+again]   spec v2 consent (prompts!)
  *   desktop_backend_smoke monitors                every monitor, desktop coordinates
  *   desktop_backend_smoke capture X Y W H [OUT.ppm]  one still (native density); stats only,
@@ -104,6 +107,8 @@ print_pick(const struct u_desktop_pick *p)
 //! focused window (text / keys) or the window under the point (buttons / scroll),
 //! read at the moment the command starts. Set `target ID` in a script to pin one.
 static uint64_t g_target = 0;
+//! `parent HANDLE`: the consent dialog's parent window for request / request-scopes.
+static char g_parent[U_DESKTOP_PARENT_WINDOW_SIZE] = "";
 static bool
 smoke_still_allowed(void *ctx)
 {
@@ -186,7 +191,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		       b->is_locked ? b->is_locked(b) : -1, have_idle ? "" : "unknown/",
 		       (unsigned long long)idle);
 	} else if (strcmp(cmd, "request") == 0) {
-		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test"};
+		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test", g_parent};
 		// Each request waits for ITS answer (the REPL issues several).
 		g_done = 0;
 		g_access = U_DESKTOP_ACCESS_UNKNOWN;
@@ -319,7 +324,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			printf("this backend has no request_scopes (no capture)\n");
 			return 1;
 		}
-		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test"};
+		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test", g_parent};
 		g_scopes_done = 0;
 		b->request_scopes(b, &app, scopes, on_scopes, NULL);
 		for (int i = 0; i < 1200 && !g_scopes_done; i++) {
@@ -366,6 +371,11 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			u_desktop_image_free(&img);
 		}
 		rc = done(r, msg);
+	} else if (strcmp(cmd, "parent") == 0) {
+		// Unvalidated on purpose: the backend is driven directly, so a stale or
+		// malformed handle can be fed to the portal to see it fall back.
+		snprintf(g_parent, sizeof(g_parent), "%s", argc >= 3 ? argv[2] : "");
+		printf("parent window: \"%s\"\n", g_parent);
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
 		g_target = strtoull(argv[2], NULL, 10);
 		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);

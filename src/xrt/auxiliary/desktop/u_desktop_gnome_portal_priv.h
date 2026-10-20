@@ -62,6 +62,8 @@ struct gp_cmd
 	struct u_desktop_paste_obs obs; //!< clip_paste: what the paste saw
 	u_desktop_access_done_fn done;
 	void *done_ctx;
+	//! request / request_scopes: the consent dialog's parent window ("" = none).
+	char parent_window[U_DESKTOP_PARENT_WINDOW_SIZE];
 
 	// Result.
 	enum u_desktop_result result;
@@ -109,6 +111,10 @@ struct gnome_portal
 
 	char session[512];
 	bool session_open;
+	//! The last request's consent-dialog parent window (xdg-desktop-portal form, ""
+	//! = none): the parent_window argument of every Start — RemoteDesktop and
+	//! ScreenCast, a silent restore included (it may still turn into a dialog).
+	char parent_window[U_DESKTOP_PARENT_WINDOW_SIZE];
 	bool clipboard_enabled;
 
 	char wait_path[512];

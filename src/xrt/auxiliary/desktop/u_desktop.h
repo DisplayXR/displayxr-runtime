@@ -105,6 +105,8 @@ extern "C" {
 #define U_DESKTOP_APP_ID_SIZE 128
 #define U_DESKTOP_TITLE_SIZE 256
 #define U_DESKTOP_MSG_SIZE 256
+//! A consent dialog's parent window, terminator included (XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR).
+#define U_DESKTOP_PARENT_WINDOW_SIZE 256
 
 enum u_desktop_result
 {
@@ -248,6 +250,13 @@ struct u_desktop_app_info
 	const char *exe_path;     //!< full path of the process executable (identity for the store)
 	const char *display_name; //!< human name for a prompt (product / bundle name, else exe base name)
 	const char *reason;       //!< app-supplied, may be NULL
+	/*!
+	 * Spec v2: the app window the consent dialog belongs to, in the xdg-desktop-portal
+	 * "parent_window" form ("wayland:<handle>" / "x11:<hex XID>"); NULL or "" = none.
+	 * Already validated (u_desktop_parent_window_valid). A placement hint only: a
+	 * backend without a use for it ignores it. Valid for the call only — copy to keep.
+	 */
+	const char *parent_window;
 };
 
 typedef void (*u_desktop_access_done_fn)(void *ctx, enum u_desktop_access result);

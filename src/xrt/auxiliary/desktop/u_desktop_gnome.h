@@ -133,8 +133,9 @@ enum u_desktop_access
 gnome_portal_access(struct gnome_portal *p);
 
 //! Open a session interactively (the portal's dialog). Calls @p done once.
+//! @p parent_window: the dialog's parent ("wayland:…" / "x11:…"; NULL or "" = none).
 void
-gnome_portal_request(struct gnome_portal *p, u_desktop_access_done_fn done, void *ctx);
+gnome_portal_request(struct gnome_portal *p, const char *parent_window, u_desktop_access_done_fn done, void *ctx);
 
 //! libei absolute motion to stage point (x, y). REFUSED when no input region holds it.
 //! May silently restore a closed session (only valid BEFORE verification).
