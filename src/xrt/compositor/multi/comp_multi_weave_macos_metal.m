@@ -378,6 +378,9 @@ mtlb_ensure_engine(struct multi_compositor *mc)
 		wm->objects_ready = true;
 	}
 
+	// TODO(#2218 item 6): one Metal DP for the whole window. Per-screen weaving
+	// here would drive comp_metal_segments (the in-process Metal compositor's
+	// manager) the way the desktop-Linux engine drives comp_vk_native_segments.
 	xrt_dp_factory_metal_fn_t factory = (xrt_dp_factory_metal_fn_t)mc->msc->base.info.dp_factory_metal;
 	if (factory == NULL) {
 		U_LOG_E("weave(#759) metal: the plug-in has no Metal DP factory — cannot weave");

@@ -76,6 +76,13 @@
 #include "server/ipc_server_linux_input.h" // service-surface input → workspace queues (#710)
 #endif
 
+#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#include "xrt/xrt_screen.h"
+struct ipc_server;
+static void
+multi_weave_screens_refresh(struct ipc_server *s); // #2218 item 6, defined with the re-probe worker
+#endif
+
 
 /*
  *
@@ -659,6 +666,11 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// ADR-051 D3: the display status snapshot + generation counters.
 	ipc_server_status_init(s);
 
+#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #2218 item 6: the screens the present-owner weave engines segment against.
+	multi_weave_screens_refresh(s);
+#endif
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// ADR-053 P1a (#2003): the device exists now — attach its GPU side (and
 	// the dp-lift row) to the conversion core.
@@ -937,6 +949,28 @@ repull_display_info_if_unknown(struct ipc_server *s)
 //! that is just reconnecting is not raced.
 #define ADOPTION_RESTART_IDLE_NS ((uint64_t)2 * U_TIME_1S_IN_NS)
 
+#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*!
+ * #2218 item 6: hand the system's screens (with the DP registry as it stands
+ * now) to the multi system compositor, whose XR_DXR_weave present-owner
+ * engines weave each window with the display processor of every screen it
+ * covers. At start-up and after every re-probe; a call that changes nothing
+ * leaves the live engines alone.
+ */
+static void
+multi_weave_screens_refresh(struct ipc_server *s)
+{
+	if (s == NULL || s->xinst == NULL || s->xsysc == NULL) {
+		return;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		comp_multi_system_set_screens(s->xsysc, list);
+	}
+	free(list);
+}
+#endif
+
 static struct os_mutex g_reprobe_mutex;
 static struct os_cond g_reprobe_cond;
 static struct os_thread g_reprobe_thread;
@@ -1005,6 +1039,10 @@ reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
 		}
 		free(list);
 	}
+#endif
+#if defined(XRT_OS_LINUX_DESKTOP) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #2218 item 6: ...and to the desktop-Linux present-owner weave engines.
+	multi_weave_screens_refresh(s);
 #endif
 	// ADR-051 D6: a re-probe is a topology event only when it changed the
 	// topology — the published screen table (its generation moved) or the

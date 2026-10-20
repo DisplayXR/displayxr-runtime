@@ -903,6 +903,11 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 
 	// The DP that weaves — same Vulkan plug-in factory family the macOS
 	// shared-surface path drives (sim_display anaglyph runs on MoltenVK).
+	// TODO(#2218 item 6): one DP for the whole window. The desktop-Linux engine
+	// weaves a window per screen with comp_vk_native_segments; the same manager
+	// fits here, but needs the service fed a screen list on macOS and the window
+	// placed in CoreGraphics global points x backing scale (not the Linux
+	// weave-geometry projection, util/comp_weave_screens.h).
 	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 	if (factory == NULL) {
 		U_LOG_E("weave(#759): no Vulkan DP factory — cannot weave");

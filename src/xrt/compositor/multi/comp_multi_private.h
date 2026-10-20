@@ -54,6 +54,8 @@ struct comp_multi_weave_macos_backend;
 struct android_custom_surface;
 struct xrt_window_metrics;
 struct xrt_system_devices;
+struct xrt_screen_list;
+struct comp_vk_native_segments;
 
 #ifdef XRT_OS_WINDOWS
 struct comp_d3d11_window;
@@ -1119,6 +1121,29 @@ struct multi_compositor
 		//! @{
 		struct comp_multi_weave_linux_slot in_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
 		struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+
+		/*!
+		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
+		 * A bound window that is not wholly on the system-default screen is
+		 * woven per screen: each screen's part by the DP of THAT screen
+		 * (a windowless per-screen DP from its own registry claimant, per-
+		 * screen preference included), the default screen's part by
+		 * @ref dp. The manager (comp_vk_native_segments, shared with the
+		 * in-process Vulkan compositor) is built from the system's screen
+		 * list snapshot and rebuilt when it changes (hotplug, re-claim). A
+		 * one-screen system never enables it: byte for byte the single-DP
+		 * weave. Touched only under @ref mutex.
+		 * @{
+		 */
+		struct comp_vk_native_segments *segs;
+		uint64_t segs_generation;                     //!< msc weave_screens generation it was built from
+		struct xrt_screen_list *segs_list;            //!< that list (heap)
+		struct xrt_system_compositor_info *segs_info; //!< and its registry (heap)
+		struct xrt_screen_list *segs_proj;            //!< last projection handed to the manager (heap)
+		int segs_frame;                               //!< last enum comp_weave_frame (-1 = none yet)
+		bool segs_split;                              //!< the last submit was woven per screen
+		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
+		//! @}
 		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
 		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
 		uint32_t imports_logged; //!< Import WARNs emitted (capped; a re-importing producer would spam).
@@ -1601,6 +1626,25 @@ struct multi_system_compositor
 	bool shared_deco_logged;        //!< The one-time regime WARN has been emitted.
 	//! @}
 #endif // COMP_MULTI_SHARED_SURFACE
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*!
+	 * #2218 item 6: the screen list + DP registry the XR_DXR_weave
+	 * present-owner engines segment against (one DP per screen a window
+	 * covers). Handed in by the IPC server (comp_multi_system_set_screens) at
+	 * start-up and after every display re-probe; each engine snapshots it
+	 * when @ref generation moved (multi_system_weave_screens_snapshot).
+	 * Leaf lock: taken alone, never while holding a compositor lock.
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		bool mutex_initialized;
+		struct xrt_screen_list *list;            //!< NULL until the first set
+		struct xrt_system_compositor_info *info; //!< the registry it was resolved with
+		uint64_t generation;                     //!< 0 = never set; bumps on a real change only
+	} weave_screens;
+#endif
 };
 
 /*!
@@ -2274,6 +2318,23 @@ multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
 
 /*! @} */
 #endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2218 item 6: copy the system's screen list + registry into @p out_list /
+ * @p out_info when its generation differs from @p have_generation. Returns the
+ * current generation (0 = never set: nothing copied); the copies are written
+ * only when it differs from @p have_generation. Takes the weave_screens leaf
+ * lock only.
+ *
+ * @ingroup comp_multi
+ */
+uint64_t
+multi_system_weave_screens_snapshot(struct multi_system_compositor *msc,
+                                    uint64_t have_generation,
+                                    struct xrt_screen_list *out_list,
+                                    struct xrt_system_compositor_info *out_info);
+#endif
 
 
 #ifdef __cplusplus

@@ -605,3 +605,71 @@ pixels into a handback texture on its own IPC thread. That submit is segmented b
   screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
   reported unsegmented (one eye set); a straddling element's views stay the primary's
   (per-part views need a view set per part, displayxr-browser-pvt#272).
+
+## Present-owners on the desktop-Linux service (#2218 item 6)
+
+The Linux / macOS service runs `null_compositor` + `comp_multi`, so before #2218 every
+`XR_DXR_weave` present-owner there (the DisplayXR Browser on Linux, `weave_probe_vk_linux`) was woven
+by ONE display processor: the weave engine's own, from the active plug-in's scalar
+`dp_factory_vk`, phased against the system-default panel, with the rest of the window painted flat
+(#1654's off-panel rule) — a window wholly on another vendor's screen was never woven by that
+vendor. `comp_multi_weave_linux.c` now segments the same way as the Windows section above:
+
+- **Screens.** The IPC server hands the multi system compositor its screen list
+  (`xrt_instance_enumerate_displays`) plus the DP registry as it stands
+  (`comp_multi_system_set_screens`) at start-up and after every display re-probe — the DRM
+  hotplug feeder, a `dp use --screen` re-claim, the fallback timer. The generation moves only on a
+  real change (`comp_weave_screens_compare` / `_registry_changed`), so the 10 s fallback re-probe
+  never disturbs a live engine. Each engine snapshots the list when the generation moved and
+  rebuilds its manager then (hotplug, re-claim = rebuild; DPs are not carried over as the D3D11
+  service's Amendment 8 adoption does — a hotplug is rare enough).
+- **Manager.** The in-process Vulkan manager, unchanged: `comp_vk_native_segments`, now its own
+  library (`comp_vk_segs`) so `comp_multi` links it. One per present-owner, windowless (no hooks),
+  the engine's own DP (`mc->weave.dp`) as the primary. Per-screen DPs come from each screen's own
+  registry claimant through `create_dp_vk_for_screen` (a per-screen preference decides it, exactly
+  as on the other paths); the same lifecycle hysteresis, crop-before-DP and flat fill.
+- **The frame.** A present-owner publishes its window in the weave geometry frame (device px, the
+  window's monitor's logical origin × that monitor's factor), which on a mixed-scale Wayland
+  desktop is not one global grid: the laptop's and the panel's device rects overlap in it. So the
+  screens are re-projected into the WINDOW's own pixel frame every submit
+  (`util/comp_weave_screens.h`, `comp_weave_screens_project`): with the v12 logical origin, each
+  screen's stage rect from the single-panel phase rule (`u_weave_present_origin.h` rules 1 + 2)
+  scaled by the window's factor and anchored on the window, so `window − screen` is exactly the
+  rule-2 present origin for that screen; a screen whose factor differs from the window's shows the
+  window resampled (its "device mode" ≠ its rect there), so its segment is flat unless its DP
+  tolerates a resample — the refuse-rather-than-resample rule. Without the logical origin only a
+  pure X11 / Mutter PHYSICAL layout (every X11 rect IS its device rect) is placed; anything else is
+  ambiguous and keeps the single-DP weave. The projection reaches the manager through
+  `comp_vk_native_segments_set_screen_geometry` (segment math only: DPs, lifecycle and the
+  bindings the DPs were created with — the OS's own desktop rects — are untouched).
+- **Which submits.** v3 batch and v6 N-view whose output IS the window (v6 at viewScale 1): both
+  weave the whole window as one canvas. Never a legacy single-rect submit, mono-in-2D (v13) or a
+  self-submitting DP. A window wholly on the system-default screen is `!is_split`: the single-DP
+  weave, byte for byte; so is every one-screen system (the manager never enables).
+- **The weave.** `comp_vk_native_segments_record` replaces the one `process_atlas` (the engine's DP
+  weaves the default screen's segment, phased by `weave_feed_dp_geometry` as before; each other
+  screen's DP its own segment at its own present origin); the off-panel bands step aside (the
+  record's flat fill covers every part no DP weaves); the v4 overlay is not offered to a DP that
+  frame and is blended post-weave over the whole output (the Windows rule). The record leaves the
+  target in `PRESENT_SRC_KHR` (the DP contract); the engine transitions it back to
+  `COLOR_ATTACHMENT_OPTIMAL` and continues unchanged. 2D/3D: every per-screen DP follows the
+  session's confirmed hardware state.
+- **A window straddling a seam** is cut per screen (one segment per screen it covers) — the
+  Windows / in-process rule, not an owner-screen rule.
+- **Eyes out.** Linux does not report v19 `XrWeaveOutputRectPartsDXR` yet (`segmentCount` 0: the
+  dma-buf submit reply has no segment count), so the base eyes are the MAJORITY segment's DP's
+  (`comp_weave_screens_eye_screen`): a window wholly on another screen is framed for that screen's
+  viewer.
+- **Log.** One WARN per change of what the weave does per screen (split or not, which screens) —
+  `weave(#2218): window X,Y WxH woven per screen (logical frame) — [k] screen 0x… by '<plug-in>'
+  (the engine's own DP | a per-screen DP) canvas … present origin …` — plus the manager's own
+  `created a segment DP for screen 0x… ('<output>', plug-in '<id>')`.
+- **Not yet:** v19 rect parts + per-screen eyes on the wire; the drag snap
+  (`xrWeaveSnapWindowRectDXR`) still snaps on the engine's DP; status rows show the engine DP only;
+  the shared spatial surface (the Linux workspace) is unchanged — it is fullscreen on the
+  system-default screen, the workspace's primary presenter (the Windows "not a finding"), and
+  Linux has no secondary-screen workspace presenter (ADR-052) yet. The macOS weave backends (VK and
+  Metal) and Android keep one DP for now: the macOS VK backend could take the same manager, but its
+  window frame is CoreGraphics global points × backing scale (a different projection, and the
+  service is fed no screen list there yet); the Metal backend needs `comp_metal_segments`; Android
+  has one panel.
