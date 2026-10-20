@@ -7,9 +7,11 @@
  * Mechanism only (u_desktop.h): CGWindowList for windows / z-order / hit tests,
  * the Accessibility API (AX) for text, window actions and the CGWindowID <->
  * AXUIElement bridge, CGEvent for input. Consent is TCC's: Accessibility (needed
- * for everything that mutates, for AX reads and for posting events) and Screen
- * Recording (only makes other apps' window titles visible in CGWindowList; we
- * fall back to AXTitle without it). TCC attributes both to the RESPONSIBLE
+ * for everything that mutates, for AX reads and for posting events: the CONTROL
+ * scope) and Screen Recording (the CAPTURE scope of spec v2 — ScreenCaptureKit
+ * stills, u_desktop_macos_capture.m; for CONTROL it only makes other apps' window
+ * titles visible in CGWindowList, with AXTitle as the fallback). TCC attributes
+ * both to the RESPONSIBLE
  * process — the app bundle, or the terminal when launched from one — see
  * docs/specs/extensions/XR_DXR_desktop_control_macos_test_plan.md.
  *
@@ -29,6 +31,9 @@
  */
 
 #include "u_desktop.h"
+#include "u_desktop_capture.h"
+#include "u_desktop_macos_capture.h"
+#include "u_desktop_macos_logic.h"
 #include "u_desktop_mini_cache.h"
 #include "os/os_time.h"
 
@@ -418,7 +423,9 @@ struct macos_backend
 	bool access_thread_started;
 	bool access_cancel;
 	bool access_delivered;
-	u_desktop_access_done_fn access_done;
+	u_desktop_access_done_fn access_done;        //!< a CONTROL-only request_access, or
+	u_desktop_scopes_done_fn access_scopes_done; //!< a request_scopes
+	uint32_t access_scopes;                      //!< the scopes being polled
 	void *access_ctx;
 
 	// Worker-thread-only input state.
@@ -1477,30 +1484,75 @@ mac_access_status(struct u_desktop_backend *b)
 	return trusted() ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
 }
 
+//! The CAPTURE scope's grant: Screen Recording (spec §10.2). TCC has no "not asked
+//! yet" answer without prompting, so a missing grant reads DENIED, as Accessibility
+//! does for CONTROL.
+static enum u_desktop_access
+mac_capture_access_status(struct u_desktop_backend *b)
+{
+	(void)b;
+	return CGPreflightScreenCaptureAccess() ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+}
+
+//! TCC's current answer for each scope in @p scopes (UNKNOWN for the others).
+static void
+tcc_answers(uint32_t scopes, enum u_desktop_access *ctl, enum u_desktop_access *cap)
+{
+	*ctl = U_DESKTOP_ACCESS_UNKNOWN;
+	*cap = U_DESKTOP_ACCESS_UNKNOWN;
+	if ((scopes & U_DESKTOP_SCOPE_CONTROL) != 0) {
+		// Reflects a grant made in System Settings without a relaunch [assumed].
+		*ctl = AXIsProcessTrusted() ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+	}
+	if ((scopes & U_DESKTOP_SCOPE_CAPTURE) != 0) {
+		*cap = CGPreflightScreenCaptureAccess() ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+	}
+}
+
+static bool
+all_granted(uint32_t scopes, enum u_desktop_access ctl, enum u_desktop_access cap)
+{
+	return ((scopes & U_DESKTOP_SCOPE_CONTROL) == 0 || ctl == U_DESKTOP_ACCESS_GRANTED) &&
+	       ((scopes & U_DESKTOP_SCOPE_CAPTURE) == 0 || cap == U_DESKTOP_ACCESS_GRANTED);
+}
+
+//! Hand the answer to whichever callback the request came with (access_lock NOT held).
+static void
+access_deliver(u_desktop_access_done_fn done,
+               u_desktop_scopes_done_fn scopes_done,
+               void *ctx,
+               enum u_desktop_access ctl,
+               enum u_desktop_access cap)
+{
+	if (scopes_done != NULL) {
+		scopes_done(ctx, ctl, cap);
+	} else if (done != NULL) {
+		done(ctx, ctl);
+	}
+}
+
 /*
  * The consent poll (TCC has no completion callback). One joinable thread per
- * request; destroy() cancels it through access_cond, joins it, and answers
- * UNKNOWN for it if it never answered (u_desktop.h "Lifetime"). done() is called
- * by exactly one party: the thread, or the canceller after the join.
+ * request; it polls the scopes the request asked for until every one is granted
+ * or 120 s pass (then the ungranted ones are DENIED). destroy() cancels it through
+ * access_cond, joins it, and answers UNKNOWN for it if it never answered
+ * (u_desktop.h "Lifetime"). done() is called by exactly one party: the thread, or
+ * the canceller after the join.
  */
 static void *
 access_wait_thread(void *p)
 {
 	struct macos_backend *m = p;
-	enum u_desktop_access res = U_DESKTOP_ACCESS_DENIED;
 	uint64_t deadline = now_ns() + 120ull * 1000 * 1000 * 1000;
+	enum u_desktop_access ctl = U_DESKTOP_ACCESS_UNKNOWN, cap = U_DESKTOP_ACCESS_UNKNOWN;
 
 	pthread_mutex_lock(&m->access_lock);
+	uint32_t scopes = m->access_scopes;
 	while (!m->access_cancel) {
 		pthread_mutex_unlock(&m->access_lock);
-		// Reflects a grant made in System Settings without a relaunch [assumed].
-		bool ok = AXIsProcessTrusted();
+		tcc_answers(scopes, &ctl, &cap);
 		pthread_mutex_lock(&m->access_lock);
-		if (ok) {
-			res = U_DESKTOP_ACCESS_GRANTED;
-			break;
-		}
-		if (now_ns() >= deadline) {
+		if (all_granted(scopes, ctl, cap) || now_ns() >= deadline) {
 			break;
 		}
 		struct timespec ts;
@@ -1517,10 +1569,11 @@ access_wait_thread(void *p)
 		m->access_delivered = true;
 	}
 	u_desktop_access_done_fn done = m->access_done;
+	u_desktop_scopes_done_fn scopes_done = m->access_scopes_done;
 	void *ctx = m->access_ctx;
 	pthread_mutex_unlock(&m->access_lock);
 	if (deliver) {
-		done(ctx, res);
+		access_deliver(done, scopes_done, ctx, ctl, cap);
 	}
 	return NULL;
 }
@@ -1543,44 +1596,91 @@ access_cancel_join(struct macos_backend *m)
 	m->access_delivered = true;
 	m->access_thread_started = false;
 	u_desktop_access_done_fn done = m->access_done;
+	u_desktop_scopes_done_fn scopes_done = m->access_scopes_done;
 	void *ctx = m->access_ctx;
 	pthread_mutex_unlock(&m->access_lock);
-	if (owed && done != NULL) {
-		done(ctx, U_DESKTOP_ACCESS_UNKNOWN);
+	if (owed) {
+		access_deliver(done, scopes_done, ctx, U_DESKTOP_ACCESS_UNKNOWN, U_DESKTOP_ACCESS_UNKNOWN);
 	}
 }
 
-static void
-mac_request_access(struct u_desktop_backend *b,
-                   const struct u_desktop_app_info *app,
-                   u_desktop_access_done_fn done,
-                   void *ctx)
+//! Show the Accessibility prompt (once per responsible process; then only System
+//! Settings can change the answer). True when already trusted.
+static bool
+ax_prompt(void)
 {
-	struct macos_backend *m = mb(b);
-	(void)app; // TCC names the responsible process itself; we cannot (and must not) relabel it.
-
-	// A previous request still polling: retire it (it answers UNKNOWN) first.
-	access_cancel_join(m);
-
-	if (!CGPreflightScreenCaptureAccess()) {
-		// Optional (titles only). Shows the system prompt once per responsible
-		// process, then only System Settings can change the answer.
-		CGRequestScreenCaptureAccess();
-	}
-
 	const void *keys[1] = {kAXTrustedCheckOptionPrompt};
 	const void *vals[1] = {kCFBooleanTrue};
 	CFDictionaryRef opts =
 	    CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 	bool now = AXIsProcessTrustedWithOptions(opts);
 	CFRelease(opts);
-	if (now) {
-		done(ctx, U_DESKTOP_ACCESS_GRANTED);
+	return now;
+}
+
+/*!
+ * ASK_AGAIN (spec §10.2): TCC never shows its prompt twice, so asking again opens
+ * the System Settings pane where the user changes the answer (Privacy & Security >
+ * Screen Recording when CAPTURE is asked for, else > Accessibility). The request
+ * is then answered like any other: at once when every scope is already granted (a
+ * later revocation in that pane is seen live through access_status /
+ * capture_access_status), else when the user grants it there (or DENIED after
+ * 120 s).
+ */
+static void
+open_privacy_pane(uint32_t scopes)
+{
+	const char *url = (scopes & U_DESKTOP_SCOPE_CAPTURE) != 0
+	                      ? "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+	                      : "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+	@autoreleasepool {
+		NSURL *u = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+		if (u != nil) {
+			[[NSWorkspace sharedWorkspace] openURL:u];
+		}
+	}
+}
+
+//! Start a consent request for @p scopes (REASK bit allowed); answers through
+//! exactly one of @p done / @p scopes_done.
+static void
+access_start(struct macos_backend *m,
+             uint32_t scopes,
+             u_desktop_access_done_fn done,
+             u_desktop_scopes_done_fn scopes_done,
+             void *ctx)
+{
+	// A previous request still polling: retire it (it answers UNKNOWN) first.
+	access_cancel_join(m);
+
+	bool reask = (scopes & U_DESKTOP_SCOPE_REASK) != 0;
+	scopes &= U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+
+	if (reask) {
+		open_privacy_pane(scopes);
+	} else {
+		if (!CGPreflightScreenCaptureAccess()) {
+			// CAPTURE's grant (and, for CONTROL, other apps' window titles). Shows
+			// the system prompt once per responsible process; after that only
+			// System Settings can change the answer (ASK_AGAIN opens it).
+			CGRequestScreenCaptureAccess();
+		}
+		if ((scopes & U_DESKTOP_SCOPE_CONTROL) != 0) {
+			ax_prompt();
+		}
+	}
+
+	enum u_desktop_access ctl, cap;
+	tcc_answers(scopes, &ctl, &cap);
+	if (all_granted(scopes, ctl, cap)) {
+		access_deliver(done, scopes_done, ctx, ctl, cap);
 		return;
 	}
 
 	pthread_mutex_lock(&m->access_lock);
 	m->access_done = done;
+	m->access_scopes_done = scopes_done;
+	m->access_scopes = scopes;
 	m->access_ctx = ctx;
 	m->access_cancel = false;
 	m->access_delivered = false;
@@ -1591,8 +1691,30 @@ mac_request_access(struct u_desktop_backend *b,
 	}
 	pthread_mutex_unlock(&m->access_lock);
 	if (!started) {
-		done(ctx, U_DESKTOP_ACCESS_DENIED);
+		access_deliver(done, scopes_done, ctx, ctl, cap);
 	}
+}
+
+static void
+mac_request_access(struct u_desktop_backend *b,
+                   const struct u_desktop_app_info *app,
+                   u_desktop_access_done_fn done,
+                   void *ctx)
+{
+	(void)app; // TCC names the responsible process itself; we cannot (and must not) relabel it.
+	access_start(mb(b), U_DESKTOP_SCOPE_CONTROL, done, NULL, ctx);
+}
+
+//! Spec v2: CONTROL → Accessibility, CAPTURE → Screen Recording, in one request.
+static void
+mac_request_scopes(struct u_desktop_backend *b,
+                   const struct u_desktop_app_info *app,
+                   uint32_t scopes,
+                   u_desktop_scopes_done_fn done,
+                   void *ctx)
+{
+	(void)app;
+	access_start(mb(b), scopes, NULL, done, ctx);
 }
 
 static bool
@@ -3003,6 +3125,143 @@ mac_scroll(struct u_desktop_backend *b,
  *
  */
 
+/*
+ *
+ * Spec v2: screen capture (ScreenCaptureKit stills in u_desktop_macos_capture.m).
+ *
+ */
+
+//! The active displays, mirrors left out (a mirror shows another display's
+//! picture in the same place). Any thread: CGDisplay only.
+static uint32_t
+displays_get(struct u_desktop_macos_display *out, uint32_t cap)
+{
+	CGDirectDisplayID ids[U_DESKTOP_MACOS_MAX_DISPLAYS];
+	uint32_t dn = 0;
+	if (CGGetActiveDisplayList(U_DESKTOP_MACOS_MAX_DISPLAYS, ids, &dn) != kCGErrorSuccess) {
+		dn = 0;
+	}
+	if (dn == 0) {
+		// Every display asleep (the lock screen after its timeout): the layout is
+		// still the online displays' (a capture is refused while locked anyway).
+		if (CGGetOnlineDisplayList(U_DESKTOP_MACOS_MAX_DISPLAYS, ids, &dn) != kCGErrorSuccess) {
+			return 0;
+		}
+	}
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < dn && n < cap; i++) {
+		if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) {
+			continue;
+		}
+		double scale = 1.0;
+		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(ids[i]);
+		if (mode != NULL) {
+			scale = u_desktop_macos_display_scale((uint32_t)CGDisplayModeGetPixelWidth(mode),
+			                                      (uint32_t)CGDisplayModeGetWidth(mode));
+			CGDisplayModeRelease(mode);
+		}
+		out[n].id = ids[i];
+		out[n].bounds = rect_from_cg(CGDisplayBounds(ids[i]));
+		out[n].scale = scale;
+		n++;
+	}
+	return n;
+}
+
+static enum u_desktop_result
+mac_monitors(struct u_desktop_backend *b, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg)
+{
+	(void)b;
+	struct u_desktop_macos_display d[U_DESKTOP_MACOS_MAX_DISPLAYS];
+	uint32_t n = displays_get(d, U_DESKTOP_MACOS_MAX_DISPLAYS);
+	if (n == 0) {
+		*count = 0;
+		set_msg(msg, "cannot read the display layout");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	for (uint32_t i = 0; i < n && i < cap; i++) {
+		out[i] = d[i].bounds;
+	}
+	*count = n;
+	return U_DESKTOP_OK;
+}
+
+/*!
+ * Withhold every on-screen window a capture must not show
+ * (u_desktop_macos_capture_withholds): the calling process's own windows on every
+ * layer, and every window marked NSWindowSharingNone. False when the window list
+ * cannot be read — then the capture is refused, never returned unmasked.
+ */
+static bool
+withhold_windows(struct u_desktop_image *img, const struct u_desktop_rect *src)
+{
+	CFArrayRef all = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+	if (all == NULL) {
+		return false;
+	}
+	uint32_t me = (uint32_t)getpid();
+	for (CFIndex i = 0; i < CFArrayGetCount(all); i++) {
+		CFDictionaryRef d = CFArrayGetValueAtIndex(all, i);
+		struct u_desktop_macos_window_info w = {
+		    .pid = (uint32_t)dict_int(d, kCGWindowOwnerPID, 0),
+		    // Absent = the default (read-only): the key is documented as always set.
+		    .sharing = (int32_t)dict_int(d, kCGWindowSharingState, kCGWindowSharingReadOnly),
+		    .alpha = dict_double(d, kCGWindowAlpha, 1.0),
+		    .frame = rect_from_cg(dict_bounds(d)),
+		};
+		if (u_desktop_macos_capture_withholds(&w, me)) {
+			u_desktop_image_withhold(img, src, &w.frame);
+		}
+	}
+	CFRelease(all);
+	return true;
+}
+
+static enum u_desktop_result
+mac_capture(struct u_desktop_backend *b, const struct u_desktop_rect *src, struct u_desktop_image *img, char *msg)
+{
+	if (mac_is_locked(b)) {
+		set_msg(msg, "screen locked");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	// Checked before ScreenCaptureKit is touched: SCK itself would show the TCC
+	// prompt, and a capture never prompts (spec §10.2).
+	if (!CGPreflightScreenCaptureAccess()) {
+		set_msg(msg, "Screen Recording permission is not granted");
+		return U_DESKTOP_ERR_NOT_GRANTED;
+	}
+	uint64_t t0 = os_monotonic_get_ns();
+
+	struct u_desktop_macos_display d[U_DESKTOP_MACOS_MAX_DISPLAYS];
+	uint32_t nd = displays_get(d, U_DESKTOP_MACOS_MAX_DISPLAYS);
+	struct u_desktop_macos_capture_part parts[U_DESKTOP_MACOS_MAX_DISPLAYS];
+	uint32_t np = 0, w = 0, h = 0;
+	if (!u_desktop_macos_capture_plan(src, d, nd, parts, U_DESKTOP_MACOS_MAX_DISPLAYS, &np, &w, &h)) {
+		set_msg(msg, nd == 0 ? "cannot read the display layout" : "found nothing: outside every display");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (!u_desktop_image_alloc(img, w, h)) {
+		set_msg(msg, "out of memory");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	img->frame_ns = t0;
+
+	enum u_desktop_result r =
+	    u_desktop_macos_sck_grab(src, d, parts, np, img, t0 + 2000ull * 1000 * 1000, msg);
+	if (r == U_DESKTOP_OK && !withhold_windows(img, src)) {
+		set_msg(msg, "cannot honour capture exclusion");
+		r = U_DESKTOP_ERR_REFUSED;
+	}
+	if (r == U_DESKTOP_OK && mac_is_locked(b)) {
+		set_msg(msg, "screen locked");
+		r = U_DESKTOP_ERR_REFUSED;
+	}
+	if (r != U_DESKTOP_OK) {
+		u_desktop_image_free(img);
+	}
+	return r;
+}
+
 static void
 mac_destroy(struct u_desktop_backend *b)
 {
@@ -3074,5 +3333,14 @@ u_desktop_backend_create_platform(void)
 	b->pointer_button = mac_pointer_button;
 	b->scroll = mac_scroll;
 	b->destroy = mac_destroy;
+	// Spec v2: consent per scope (ASK_AGAIN opens System Settings) and the display
+	// layout always; screen capture only where ScreenCaptureKit exists (weak-linked).
+	b->request_scopes = mac_request_scopes;
+	b->monitors = mac_monitors;
+	if (u_desktop_macos_sck_available()) {
+		b->caps |= U_DESKTOP_CAP_CAPTURE;
+		b->capture_access_status = mac_capture_access_status;
+		b->capture = mac_capture;
+	}
 	return b;
 }
