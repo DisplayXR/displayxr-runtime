@@ -565,6 +565,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 #include "service_orchestrator.h"
 // ADR-051 D6: DRM connector hotplug -> the display re-probe worker.
 #include "service_drm_hotplug_linux.h"
+// #2251: Mutter MonitorsChanged (a live display-scale change) -> the same worker.
+#include "service_display_layout_linux.h"
 
 static void
 drm_hotplug_to_reprobe(const char *reason)
@@ -641,6 +643,10 @@ main(int argc, char *argv[])
 	// WM_DISPLAYCHANGE feed — a monitor plugged or unplugged re-probes the
 	// screen registry and bumps the status topology generation.
 	(void)service_drm_hotplug_start(drm_hotplug_to_reprobe);
+	// #2251: a display-scale / arrangement change touches no connector (no
+	// uevent) — Mutter's MonitorsChanged re-probes, so the panel's desktop
+	// geometry and the weave present origin follow without a restart.
+	(void)service_display_layout_start(drm_hotplug_to_reprobe);
 #endif
 
 	// #960: class verification (controller manifests are cross-platform; the
@@ -687,6 +693,7 @@ main(int argc, char *argv[])
 	// Stop the DRM hotplug feeder (it only posts to the re-probe worker,
 	// which ipc_server_main has already stopped).
 	service_drm_hotplug_stop();
+	service_display_layout_stop();
 	// Release the hotkey, terminate the managed controller, join the watcher.
 	service_orchestrator_shutdown();
 #endif

@@ -269,10 +269,10 @@ target_screens_change_format(const struct xrt_screen_list *before,
 			APPEND("%s0x%016llx '%s' claimant '%s' -> '%s'", used > 0 ? "; " : "",
 			       (unsigned long long)a->id, a->device_name, b->plugin_id, a->plugin_id);
 		} else if (!geometry_equal(a, b)) {
-			APPEND("%s0x%016llx '%s' %d,%d %ux%u -> %d,%d %ux%u", used > 0 ? "; " : "",
+			APPEND("%s0x%016llx '%s' %d,%d %ux%u x%.2f -> %d,%d %ux%u x%.2f", used > 0 ? "; " : "",
 			       (unsigned long long)a->id, a->device_name, b->desktop_left, b->desktop_top,
-			       b->desktop_width, b->desktop_height, a->desktop_left, a->desktop_top, a->desktop_width,
-			       a->desktop_height);
+			       b->desktop_width, b->desktop_height, (double)b->desktop_scale, a->desktop_left,
+			       a->desktop_top, a->desktop_width, a->desktop_height, (double)a->desktop_scale);
 		} else if (a->confidence != b->confidence) {
 			APPEND("%s0x%016llx '%s' claim level %u -> %u", used > 0 ? "; " : "", (unsigned long long)a->id,
 			       a->device_name, b->confidence, a->confidence);

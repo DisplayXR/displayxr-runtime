@@ -87,6 +87,7 @@ set(tests
     tests_comp_wl_move_sync_tag
     tests_aux_weave_span2d
     tests_aux_weave_present_origin
+    tests_aux_display_live_rescale
     tests_aux_weave_flat
     tests_aux_display_mode_hold
     tests_aux_tracking_any
@@ -1281,6 +1282,7 @@ if(TARGET tests_service_drm_hotplug_linux)
 	target_sources(
 		tests_service_drm_hotplug_linux
 		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_drm_hotplug_linux.c
+		        ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_display_layout_linux.c
 		)
 	target_include_directories(
 		tests_service_drm_hotplug_linux PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service

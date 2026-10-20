@@ -1009,9 +1009,22 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 {
 	struct os_display_desktop_info desktop = {0};
 	struct os_display_panel_match match = {0};
+	// The origin the PLUG-IN reported, not info->display_screen_left: this
+	// function overwrites that field below with the resolver's answer, so on a
+	// re-resolve (a world event — a hotplug, a live display-scale or
+	// arrangement change, #2251) the field holds the PREVIOUS layout's panel
+	// origin. Fed back as the hint it reads as a reported position, flips the
+	// rule to ORIGIN (nearest monitor to a stale point: after a laptop-scale
+	// change that is the laptop, or the panel by luck) and is never corrected.
+	// The plug-in's own answer re-runs exactly the rule instance create ran.
+	const bool have_plugin_origin = g_display_info_applied_valid;
+	const int32_t plugin_left =
+	    have_plugin_origin ? g_display_info_applied.display_screen_left : info->display_screen_left;
+	const int32_t plugin_top =
+	    have_plugin_origin ? g_display_info_applied.display_screen_top : info->display_screen_top;
 	const struct os_display_panel_hint hint = {
-	    .screen_left = info->display_screen_left,
-	    .screen_top = info->display_screen_top,
+	    .screen_left = plugin_left,
+	    .screen_top = plugin_top,
 	    .pixel_width = info->display_pixel_width,
 	    .pixel_height = info->display_pixel_height,
 	    .width_m = info->display_width_m,
@@ -1080,7 +1093,7 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 		    "Plug-in reported panel origin (%d, %d); the desktop resolver found the panel at "
 		    "(%d, %d) on '%s' by %s — using that. Window placement and the weave present "
 		    "origin both follow the resolver.",
-		    (int)info->display_screen_left, (int)info->display_screen_top, (int)desktop.left, (int)desktop.top,
+		    (int)plugin_left, (int)plugin_top, (int)desktop.left, (int)desktop.top,
 		    desktop.device_name[0] != '\0' ? desktop.device_name : "?",
 		    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ? "its connector's mode" : "size");
 	}
@@ -1104,20 +1117,32 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	}
 
 	const int one_to_one = os_display_desktop_info_is_1to1(&desktop);
-	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s%s", desktop.width,
-	        desktop.height, (int)desktop.left, (int)desktop.top,
-	        desktop.device_name[0] != '\0' ? desktop.device_name : "?", desktop.is_primary ? ", primary" : "",
-	        os_display_desktop_rule_str(match.rule), device_mode,
-	        info->display_desktop_rect_is_panel ? ""
-	        : (match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE && one_to_one == 0)
-	            ? " (panel identified; its X11 rect is not device pixels — X11 windows there are resampled)"
-	            : " (size != panel native — not panel-confirmed)");
+	char line[512];
+	(void)snprintf(line, sizeof(line), "XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s%s",
+	               desktop.width, desktop.height, (int)desktop.left, (int)desktop.top,
+	               desktop.device_name[0] != '\0' ? desktop.device_name : "?",
+	               desktop.is_primary ? ", primary" : "", os_display_desktop_rule_str(match.rule), device_mode,
+	               info->display_desktop_rect_is_panel ? ""
+	               : (match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE && one_to_one == 0)
+	                   ? " (panel identified; its X11 rect is not device pixels — X11 windows there are resampled)"
+	                   : " (size != panel native — not panel-confirmed)");
+	// One WARN per distinct answer: world-event re-resolves (a hotplug, a live
+	// display-scale change and its follow-up, #2251) repeat it unchanged.
+	static char last_line[sizeof(line)] = "";
+	const bool line_changed = strcmp(line, last_line) != 0;
+	if (line_changed) {
+		(void)snprintf(last_line, sizeof(last_line), "%s", line);
+		U_LOG_W("%s", line);
+	} else {
+		U_LOG_I("%s (unchanged)", line);
+	}
 
 	// Two monitors matched the panel's pixel size, so the pick was a
 	// tie-break (closest physical size, else the non-primary one) rather than
 	// a deduction. Say so once, at init: it is the one case where the rect
 	// above could be the wrong monitor while still looking confident.
-	if ((match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
+	if (line_changed &&
+	    (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
 	     match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
 	    match.candidate_count > 1) {
 		U_LOG_W(
