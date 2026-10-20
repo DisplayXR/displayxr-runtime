@@ -5833,8 +5833,9 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 /*!
  * #2247: the session's DP weaves the primary screen, so its lens wish is the
  * session's mode while the window covers the primary and 2D once the window
- * has wholly left it (comp_vk_native_segments_primary_covered, from the last
- * update's table). Sends @p dp that wish on a coverage edge, or always with
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_vk_native_segments_primary_covered); covered again, the session's mode
+ * is re-sent at once. Sends @p dp that wish on a coverage edge, or always with
  * @p force (a freshly swapped-in DP). Not while the desktop-Linux NOT_1TO1
  * hold keeps the panel 2D: its release asks for the session's choice through
  * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
@@ -5862,8 +5863,8 @@ vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_proc
 		(void)xrt_display_processor_request_display_mode(dp, want);
 	}
 	if (edge) {
-		U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247)%s",
-		        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D",
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)%s",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D",
 		        held ? " — held 2D (NOT_1TO1) for now" : "");
 	}
 }

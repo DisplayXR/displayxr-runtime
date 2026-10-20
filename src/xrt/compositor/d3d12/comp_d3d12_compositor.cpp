@@ -4080,8 +4080,9 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 			// the request_display_mode entry point does (an edge, not per frame).
 			gpu_wait_idle_out(c);
 			xrt_display_processor_d3d12_request_display_mode(c->display_processor, want);
-			U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247)",
-			        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D");
+			U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)",
+			        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "",
+			        want ? "3D" : "2D");
 		}
 	}
 

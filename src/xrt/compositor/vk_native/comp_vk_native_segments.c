@@ -123,6 +123,8 @@ struct comp_vk_native_segments
 	struct seg_screen_state st[COMP_SEGMENTS_MAX_SCREENS];
 
 	struct comp_segments_lifecycle lc;
+	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
+	struct comp_segments_cover_dwell cover;
 	struct comp_segment_table table;
 	struct comp_segment_table logged_table;
 	bool have_logged_table;
@@ -703,6 +705,7 @@ comp_vk_native_segments_create(struct vk_bundle *vk, VkCommandPool cmd_pool, VkQ
 		segs->st[i].mode_sent = -1;
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	if (os_mutex_init(&segs->dp_mutex) != 0) {
 		free(segs);
 		return NULL;
@@ -723,6 +726,7 @@ comp_vk_native_segments_destroy(struct comp_vk_native_segments **segs_ptr)
 	// DP first (no hooks = compositor teardown, where the primary DP goes
 	// too). An empty table: the old owner needs no windowless replacement.
 	segs->table.count = 0;
+	comp_segments_cover_dwell_init(&segs->cover, 0); // #2247: the hand-back DP gets the session's mode
 	hwnd_return_to_primary(segs);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
@@ -748,11 +752,13 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 	// owner needs no windowless replacement). Deferred releases only: a fill
 	// may be in flight.
 	segs->table.count = 0;
+	comp_segments_cover_dwell_init(&segs->cover, 0); // #2247: the hand-back DP gets the session's mode
 	hwnd_return_to_primary(segs);
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		dp_release(segs, i);
 	}
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->primary_index = UINT32_MAX;
 	segs->owner_index = -1;
 	segs->primary_for_screen = false;
@@ -976,6 +982,9 @@ comp_vk_native_segments_update(struct comp_vk_native_segments *segs,
 	segs->have_target_format = true;
 
 	comp_segments_compute(window_desktop, canvas, segs->screens, segs->screen_count, &segs->table);
+	// #2247: advance each screen's lens dead band (the hand-off's dwell).
+	(void)comp_segments_cover_dwell_update(&segs->cover, &segs->table, segs->screens, segs->screen_count,
+	                                       os_monotonic_get_ns());
 
 	struct comp_segments_actions act;
 	comp_segments_lifecycle_update(&segs->lc, &segs->table, &act);
@@ -1453,15 +1462,16 @@ comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, b
 			continue;
 		}
 		// #2247: the lens wish follows coverage — 2D on a screen the window
-		// has wholly left, the session's mode on the screens it covers.
-		const bool covered = comp_segments_screen_covered(&segs->table, segs->screens[i].id);
+		// has wholly left for the hand-off's dwell, the session's mode on the
+		// screens it covers (at once when it returns).
+		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
 		const int want = (enable_3d && covered) ? 1 : 0;
 		if (covered == st->uncovered) {
 			st->uncovered = !covered;
 			// A coverage edge for a live DP: lifecycle, not per frame.
 			U_LOG_W("segments: screen 0x%016llx ('%s') %s — lens wish %s (#2247)",
 			        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
-			        covered ? "covered again" : "uncovered", want ? "3D" : "2D");
+			        covered ? "covered again" : "uncovered for 0.5 s", want ? "3D" : "2D");
 		}
 		if (st->mode_sent == want) {
 			continue;
@@ -1481,5 +1491,5 @@ comp_vk_native_segments_primary_covered(const struct comp_vk_native_segments *se
 	if (segs == NULL || !segs->enabled || segs->primary_index == UINT32_MAX) {
 		return true;
 	}
-	return comp_segments_screen_covered(&segs->table, segs->screens[segs->primary_index].id);
+	return comp_segments_cover_dwell_covered(&segs->cover, segs->primary_index);
 }

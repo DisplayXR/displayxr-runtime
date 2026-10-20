@@ -18,6 +18,7 @@
 #include "comp_metal_segments.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "xrt/xrt_plugin.h"
@@ -119,6 +120,8 @@ struct comp_metal_segments
 	double sx, sy; //!< drawable px per window point
 
 	struct comp_segments_lifecycle lc;
+	//! #2247: a screen's lens wish goes 2D only after it has been uncovered for the hand-off dwell.
+	struct comp_segments_cover_dwell cover;
 
 	//! The app thread reads st[i].dp for eyes; the weave creates/destroys it.
 	struct os_mutex dp_mutex;
@@ -463,6 +466,7 @@ comp_metal_segments_create(void *mtl_device, void *command_queue)
 	segs->queue = (__bridge id<MTLCommandQueue>)command_queue;
 	os_mutex_init(&segs->dp_mutex);
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->mode_index = UINT32_MAX;
 	for (uint32_t i = 0; i < COMP_SEGMENTS_MAX_SCREENS; i++) {
 		segs->st[i].mode_sent = -1;
@@ -558,6 +562,7 @@ comp_metal_segments_set_screens(struct comp_metal_segments *segs,
 	}
 
 	comp_segments_lifecycle_init(&segs->lc, 0, 0);
+	comp_segments_cover_dwell_init(&segs->cover, 0);
 	segs->enabled = false;
 	segs->session_owns = true;
 	segs->screen_count = 0;
@@ -840,6 +845,9 @@ comp_metal_segments_update(struct comp_metal_segments *segs, const struct comp_m
 	segs->sy = (double)win->drawable_h / (double)win->frame_pt.h;
 
 	comp_segments_compute(&win->frame_pt, NULL, segs->screens, segs->screen_count, &segs->table_pt);
+	// #2247: advance each screen's lens dead band (the hand-off's dwell).
+	(void)comp_segments_cover_dwell_update(&segs->cover, &segs->table_pt, segs->screens, segs->screen_count,
+	                                       os_monotonic_get_ns());
 
 	struct comp_segments_actions act;
 	comp_segments_lifecycle_update(&segs->lc, &segs->table_pt, &act);
@@ -1153,15 +1161,16 @@ comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enab
 			continue;
 		}
 		// #2247: the lens wish follows coverage — 2D on a screen the window
-		// has wholly left, the session's mode on the screens it covers.
-		const bool covered = comp_segments_screen_covered(&segs->table, segs->screens[i].id);
+		// has wholly left for the hand-off's dwell, the session's mode on the
+		// screens it covers (at once when it returns).
+		const bool covered = comp_segments_cover_dwell_covered(&segs->cover, i);
 		const bool want = enable_3d && covered;
 		if (covered == st->uncovered) {
 			st->uncovered = !covered;
 			// A coverage edge for a live DP: lifecycle, not per frame.
 			U_LOG_W("segments: screen 0x%016llx ('%s') %s — lens wish %s (#2247)",
 			        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
-			        covered ? "covered again" : "uncovered", want ? "3D" : "2D");
+			        covered ? "covered again" : "uncovered for 0.5 s", want ? "3D" : "2D");
 		}
 		if (st->mode_sent != (int)want) {
 			st->mode_sent = (int)want;

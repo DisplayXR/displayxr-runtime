@@ -129,20 +129,24 @@ why M2 could not be shown there without this.
 
 ## The lens wish follows coverage (#2247)
 
-A screen's DP is asked for the session's 2D/3D mode only while the window covers that
-screen; a screen the window has **wholly left** is asked for 2D (it shows the desktop
-there, not a woven window), and gets the session's mode back when the window returns.
-Pure rule: `comp_segments_lens_wish(table, screen, session_3d)` =
-`session_3d && comp_segments_screen_covered(table, screen)`, unit-tested; an empty table
-(the window on no screen) carries no coverage and leaves the session's mode everywhere.
+A screen's DP is asked for the session's 2D/3D mode while the window covers that
+screen; a screen the window has been **wholly off for 0.5 s** is asked for 2D (it shows
+the desktop there, not a woven window), and gets the session's mode back **at once** when
+the window returns. Coverage is `comp_segments_screen_covered(table, screen)` (pure); the
+dead band is `comp_segments_cover_dwell`, one per manager, advanced on every update next to
+the hand-off hysteresis and with the same dwell (`COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS`;
+coverage is binary, so the hand-off's majority margin does not apply). A lens switch is a
+physical toggle, so a drag across a seam must not flap it. Both are unit-tested; an empty
+table (the window on no screen) carries no coverage and leaves the session's mode
+everywhere.
 
 - **Segment DPs** — every manager's `*_set_display_mode()` applies it per screen, so a DP
   kept alive after its segment went away (the lifecycle's ~0.5 s hysteresis, or the DP
   holding the window handle before the hand-back) is sent 2D. One WARN per coverage edge:
-  `segments: screen 0x… ('…') uncovered — lens wish 2D (#2247)` / `covered again`.
+  `segments: screen 0x… ('…') uncovered for 0.5 s — lens wish 2D (#2247)` / `covered again`.
 - **The session's own DP** (the primary screen's) — the compositor asks the manager
   `*_primary_covered()` on every weave and, on an edge, sends `session_3d && covered`
-  (`segments: the window has wholly left the primary screen — its lens wish 2D (#2247)`);
+  (`segments: the window has been off the primary screen for 0.5 s — its lens wish 2D (#2247)`);
   its `request_display_mode` entry point and the `swap_primary` hook (a windowless primary
   DP made by the hand-off) apply the same gate, so the re-created weaver never replays a 3D
   wish for a screen the window left. In-process D3D11, D3D12, Vulkan and OpenGL, and the

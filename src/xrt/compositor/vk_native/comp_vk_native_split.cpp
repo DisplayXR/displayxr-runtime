@@ -756,8 +756,9 @@ split_destroy_mutexes(struct comp_vk_split *s)
 /*!
  * #2247: the split's DP weaves the primary screen, so its lens wish is the
  * session's mode while the window covers the primary and 2D once the window
- * has wholly left it (comp_d3d11_segments_primary_covered, from the last
- * update's table). Sends it on a coverage edge, or always with @p force (a
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_d3d11_segments_primary_covered); covered again, the session's mode is
+ * re-sent at once. Sends it on a coverage edge, or always with @p force (a
  * freshly swapped-in DP). One WARN per edge. Weave thread.
  */
 static void
@@ -775,8 +776,8 @@ split_seg_primary_lens(struct comp_vk_split *s, bool force)
 	}
 	os_mutex_unlock(&s->dp_mutex);
 	if (edge) {
-		U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247, VK split)",
-		        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D");
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247, VK split)",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D");
 	}
 }
 

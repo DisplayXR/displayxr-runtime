@@ -1247,3 +1247,82 @@ TEST_CASE("comp_segments: lens wish follows coverage (#2247)")
 		CHECK_FALSE(comp_segments_screen_covered(&t, 0x9999));
 	}
 }
+
+TEST_CASE("comp_segments: the lens dead band — 2D after the hand-off dwell, 3D at once (#2247)")
+{
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3456, 2160, 3456, 2160, false),
+	    screen(DS1, 3456, 0, 3840, 2160, 3840, 2160, true),
+	};
+	const uint64_t ms = 1000ull * 1000ull;
+	comp_segments_cover_dwell d;
+	comp_segments_cover_dwell_init(&d, 0);
+	CHECK(d.hold_ns == COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS);
+
+	comp_segment_table on_primary{}, on_edp{}, straddle{};
+	comp_seg_rect w1{4000, 100, 1280, 720};
+	comp_seg_rect w2{100, 100, 1280, 720};
+	comp_seg_rect w3{3000, 200, 1280, 720};
+	REQUIRE(comp_segments_compute(&w1, nullptr, scr, 2, &on_primary) == 1);
+	REQUIRE(comp_segments_compute(&w2, nullptr, scr, 2, &on_edp) == 1);
+	REQUIRE(comp_segments_compute(&w3, nullptr, scr, 2, &straddle) == 2);
+
+	// Start straddling: both covered.
+	CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 1000 * ms) == 0);
+	CHECK(comp_segments_cover_dwell_covered(&d, 0));
+	CHECK(comp_segments_cover_dwell_covered(&d, 1));
+
+	SECTION("off the primary: covered until the dwell has elapsed, then 2D once")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1599 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1600 * ms) == (1u << 1));
+		CHECK_FALSE(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_covered(&d, 0));
+		// Steady: no further edges.
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 5000 * ms) == 0);
+
+		// Back: covered at once.
+		CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 5001 * ms) == (1u << 1));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+
+	SECTION("a drag back and forth across the seam never reaches 2D")
+	{
+		uint64_t t = 1000 * ms;
+		for (int i = 0; i < 20; i++) {
+			t += 300 * ms;
+			CHECK(comp_segments_cover_dwell_update(&d, (i % 2) ? &straddle : &on_edp, scr, 2, t) == 0);
+			CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		}
+	}
+
+	SECTION("a pending 2D is cancelled by a return and its clock restarts")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &straddle, scr, 2, 1500 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 1700 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 2100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+		CHECK(comp_segments_cover_dwell_update(&d, &on_edp, scr, 2, 2200 * ms) == (1u << 1));
+	}
+
+	SECTION("both screens run their own dwell")
+	{
+		CHECK(comp_segments_cover_dwell_update(&d, &on_primary, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &on_primary, scr, 2, 1600 * ms) == (1u << 0));
+		CHECK_FALSE(comp_segments_cover_dwell_covered(&d, 0));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+
+	SECTION("an empty table carries no coverage: nothing goes 2D")
+	{
+		comp_segment_table empty{};
+		CHECK(comp_segments_cover_dwell_update(&d, &empty, scr, 2, 1100 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_update(&d, &empty, scr, 2, 9000 * ms) == 0);
+		CHECK(comp_segments_cover_dwell_covered(&d, 0));
+		CHECK(comp_segments_cover_dwell_covered(&d, 1));
+	}
+}

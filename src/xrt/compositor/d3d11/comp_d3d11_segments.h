@@ -218,7 +218,8 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
  * The session-wide hardware 2D/3D mode. Each segment DP's lens wish follows
  * it ON THE SCREENS THE WINDOW COVERS (#2247): @p enable_3d where the last
  * update's table has a segment on the DP's screen, 2D on a screen the window
- * has wholly left (comp_segments_lens_wish). Sent to each live DP on a change
+ * has wholly left for the hand-off's 0.5 s dwell
+ * (comp_segments_cover_dwell); covered again, at once. Sent to each live DP on a change
  * and to every newly created one. The primary DP gets its wish from the
  * compositor's own request path, gated by
  * @ref comp_d3d11_segments_primary_covered. Weave thread, after
@@ -229,7 +230,8 @@ comp_d3d11_segments_set_display_mode(struct comp_d3d11_segments *segs, bool enab
 
 /*!
  * #2247: does the window cover the PRIMARY screen, per the last update's
- * table? True when segmentation is off, there is no primary screen, or the
+ * table and the hand-off's 0.5 s dead band (comp_segments_cover_dwell:
+ * uncovered only after that long off it, covered again at once)? True when segmentation is off, there is no primary screen, or the
  * table is empty (no coverage information) — so a window wholly on the
  * primary, and every single-screen session, keep the shipped behaviour. A
  * compositor whose session DP weaves the primary sends that DP

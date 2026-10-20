@@ -940,10 +940,11 @@ d3d11_compositor_snap_window_rect_cb(void *userdata,
 /*!
  * #2247: the session's own DP weaves the primary screen, so its lens wish is
  * the session's mode while the window covers the primary and 2D once the
- * window has wholly left it (comp_d3d11_segments_primary_covered, from the
- * last update's table). Sends @p dp that wish on a coverage edge, or always
- * with @p force (a freshly swapped-in DP that has seen no wish). One WARN per
- * edge. Weave thread.
+ * window has been off it for the hand-off's 0.5 s dwell
+ * (comp_d3d11_segments_primary_covered); covered again, the session's mode is
+ * re-sent at once. Sends @p dp that wish on a coverage edge, or always with @p
+ * force (a freshly swapped-in DP that has seen no wish). One WARN per edge.
+ * Weave thread.
  */
 static void
 d3d11_seg_primary_lens(struct comp_d3d11_compositor *c, struct xrt_display_processor_d3d11 *dp, bool force)
@@ -959,8 +960,8 @@ d3d11_seg_primary_lens(struct comp_d3d11_compositor *c, struct xrt_display_proce
 		xrt_display_processor_d3d11_request_display_mode(dp, want);
 	}
 	if (edge) {
-		U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247)",
-		        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D");
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D");
 	}
 }
 

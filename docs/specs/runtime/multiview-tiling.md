@@ -347,8 +347,11 @@ The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_c
 A window spanning screens is cropped and woven per screen, one DP per screen (ADR-047,
 `docs/architecture/comp-segments.md`). The 2D/3D wish each screen's DP is sent follows the
 segment table, not the session alone (#2247): **a screen's DP wishes the session's mode
-while the window covers that screen, and 2D once the window has wholly left it** —
-`comp_segments_lens_wish()` = `session_3d && comp_segments_screen_covered()`. That holds for
+while the window covers that screen, and 2D once the window has been wholly off it for the
+window-handle hand-off's dwell (0.5 s); covered again, the session's mode is re-sent at
+once** — coverage is `comp_segments_screen_covered()`, the dead band
+`comp_segments_cover_dwell` (a lens switch is a physical toggle, so a drag across a seam must
+not flap it; the plug-in's own 2D dwell is the vendor's safety net, not this rule). That holds for
 the session's own DP on the primary screen too (the in-process D3D11, D3D12, Vulkan and
 OpenGL compositors and the #918 Vulkan/D3D12 split gate every request to it, and re-send the
 session's mode when the window returns), and for a segment DP kept alive by the lifecycle's

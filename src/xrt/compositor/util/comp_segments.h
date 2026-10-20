@@ -294,6 +294,48 @@ comp_segments_lens_wish(const struct comp_segment_table *t, uint64_t screen_id, 
 }
 
 /*!
+ * #2247: the dead band on a screen's lens wish. A lens switch is a physical
+ * toggle, so a window dragged across a seam must not flap it: a screen counts
+ * as uncovered (its wish goes 2D) only once the window has left it
+ * continuously for @ref hold_ns — the window-handle hand-off's dwell,
+ * @ref COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS (coverage is binary, so the
+ * hand-off's majority margin does not apply) — and counts as covered again
+ * the moment the window returns (a pending 2D is cancelled). Indexed like the
+ * manager's screen list. Pure state: the caller owns the clock and the DPs.
+ */
+struct comp_segments_cover_dwell
+{
+	uint64_t hold_ns;
+	bool pending[COMP_SEGMENTS_MAX_SCREENS];      //!< uncovered, dwell running
+	uint64_t since_ns[COMP_SEGMENTS_MAX_SCREENS]; //!< when the dwell started
+	bool uncovered[COMP_SEGMENTS_MAX_SCREENS];    //!< dwell elapsed: the wish is 2D
+};
+
+//! Every screen covered; @p hold_ns 0 = @ref COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS.
+void
+comp_segments_cover_dwell_init(struct comp_segments_cover_dwell *d, uint64_t hold_ns);
+
+/*!
+ * Advance one metric update with table @p t at @p now_ns, for @p screen_count
+ * screens with ids @p screens[i].id (coverage from
+ * @ref comp_segments_screen_covered). Returns a bit per screen index whose
+ * @ref comp_segments_cover_dwell_covered answer changed on this update.
+ */
+uint32_t
+comp_segments_cover_dwell_update(struct comp_segments_cover_dwell *d,
+                                 const struct comp_segment_table *t,
+                                 const struct comp_segments_screen *screens,
+                                 uint32_t screen_count,
+                                 uint64_t now_ns);
+
+//! Screen @p i's lens counts as covered (true until its dwell has elapsed).
+static inline bool
+comp_segments_cover_dwell_covered(const struct comp_segments_cover_dwell *d, uint32_t i)
+{
+	return d == NULL || i >= COMP_SEGMENTS_MAX_SCREENS || !d->uncovered[i];
+}
+
+/*!
  * #2218: would @p window_desktop take the split path at all — is it anything
  * other than wholly on the primary screen? Pure: computes a scratch table and
  * asks @ref comp_segments_table_is_split; no lifecycle, no DPs. The
