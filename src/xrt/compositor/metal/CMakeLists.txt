@@ -35,6 +35,10 @@ if(APPLE AND XRT_HAVE_METAL)
 		comp_metal_compositor.h
 		comp_metal_placement.m
 		comp_metal_placement.h
+		comp_metal_desktop_bg.m
+		comp_metal_desktop_bg.h
+		comp_metal_alpha_probe.m
+		comp_metal_alpha_probe.h
 		)
 
 	# Runtime-owned window placement (ADR-050) holds WEAK references to the
@@ -42,6 +46,11 @@ if(APPLE AND XRT_HAVE_METAL)
 	# nothing from os/os_threading.h (whose inlines are not ARC-clean), so it
 	# alone is compiled with ARC; the rest of the library stays MRR.
 	set_source_files_properties(comp_metal_placement.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+	# #2264: the desktop-capture client and the lazy-transparency probe are
+	# self-contained (no os_threading.h) and ARC like the placement.
+	set_source_files_properties(
+		comp_metal_desktop_bg.m comp_metal_alpha_probe.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+		)
 
 	target_link_libraries(
 		comp_metal

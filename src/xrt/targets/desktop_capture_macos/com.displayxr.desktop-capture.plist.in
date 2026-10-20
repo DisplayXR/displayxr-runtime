@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.displayxr.desktop-capture</string>
+	<key>Program</key>
+	<string>@CMAKE_CURRENT_BINARY_DIR@/DisplayXRDesktopCapture.app/Contents/MacOS/DisplayXRDesktopCapture</string>
+	<!-- On demand only: launchd starts the helper when a compositor connects. -->
+	<key>MachServices</key>
+	<dict>
+		<key>com.displayxr.desktop-capture</key>
+		<true/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/displayxr-desktop-capture.log</string>
+</dict>
+</plist>

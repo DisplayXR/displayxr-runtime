@@ -22,6 +22,8 @@
 #include "comp_metal_compositor.h"
 #include "comp_metal_segments.h" // multi-screen on macOS
 #include "comp_metal_placement.h" // runtime-owned window placement (ADR-050)
+#include "comp_metal_desktop_bg.h" // live desktop behind a transparent window (#2264)
+#include "comp_metal_alpha_probe.h" // lazy transparency (#2264)
 
 #include "util/comp_cursor_look.h"
 #include "util/comp_layer_accum.h"
@@ -373,6 +375,18 @@ struct comp_metal_compositor
 	id<MTLTexture> backdrop_scratch_srgb; //!< its `_sRGB` view (#1795, as local2d_scratch_srgb)
 	uint32_t backdrop_w;                //!< Current backdrop scratch width (0 = none)
 	uint32_t backdrop_h;
+
+	//! #2264 — the live desktop behind the window, for a transparent session
+	//! on a DP that cannot present alpha (it weaves the app OVER this, then
+	//! alpha-gates). NULL unless eligible (@ref metal_desktop_bg_init).
+	struct comp_metal_desktop_bg *desktop_bg;
+	//! Lazy transparency: is the content actually transparent right now?
+	//! Read off the atlas; capture runs only while it is.
+	struct comp_metal_alpha_probe *alpha_probe;
+	bool transparency_active;
+	uint32_t opaque_streak;
+	//! CGDirectDisplayID under the window's content (0 = unknown), per frame.
+	uint32_t desktop_display;
 
 	//! Pipelines for the Local2D flatten (premultiplied over / unpremultiplied
 	//! source) and the masked composite pass.
@@ -3331,6 +3345,174 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 	[src_view release];
 }
 
+/*
+ *
+ * #2264 — live desktop background for a transparent session on a DP that
+ * cannot present alpha. The capture itself lives in the out-of-process
+ * displayxr-desktop-capture helper (the one holder of the Screen Recording
+ * grant); this side decides when it is wanted and crops the panel frame to
+ * the window. See comp_metal_desktop_bg.h.
+ *
+ */
+
+//! Frames of fully opaque content before transparency counts as idle again
+//! (the Linux lazy-transparency hysteresis).
+#define METAL_TRANSPARENCY_IDLE_FRAMES 60
+
+static void
+metal_desktop_bg_init(struct comp_metal_compositor *c)
+{
+	// DXR_MACOS_DESKTOP_BG: unset = auto (a transparent session on a DP that
+	// is not alpha-native and takes a background), 0 = never, 1 = force (any
+	// DP — for exercising the capture with sim_display, which needs none).
+	const char *e = getenv("DXR_MACOS_DESKTOP_BG");
+	const bool forced_on = e != NULL && e[0] == '1';
+	const bool forced_off = e != NULL && e[0] == '0';
+	if (!c->transparent_background || c->offscreen || c->shared_iosurface != NULL || forced_off) {
+		return;
+	}
+	struct xrt_display_processor_metal *dp = c->display_processor;
+	const bool takes_bg = dp != NULL && XRT_DP_HAS_SLOT(dp, set_background_2d) && dp->set_background_2d != NULL;
+	const bool alpha_native = dp != NULL && xrt_display_processor_metal_is_alpha_native(dp);
+	if (!forced_on && (dp == NULL || alpha_native || !takes_bg)) {
+		U_LOG_I("desktop background: not needed (%s)",
+		        dp == NULL ? "no DP" : alpha_native ? "DP presents alpha natively" : "DP takes no background");
+		return;
+	}
+	c->desktop_bg = comp_metal_desktop_bg_create((__bridge void *)c->device);
+	c->alpha_probe = comp_metal_alpha_probe_create((__bridge void *)c->device);
+	U_LOG_W("desktop background: eligible (%s) — the live desktop behind the window is captured only while the "
+	        "content is transparent",
+	        forced_on ? "forced by DXR_MACOS_DESKTOP_BG=1" : "DP weaves without alpha");
+}
+
+//! The window's content rect in top-down global points (the CGDisplayBounds space).
+static bool
+metal_content_rect_points(struct comp_metal_compositor *c, CGRect *out)
+{
+	if (c->placement_frame_valid) {
+		*out = CGRectMake(c->placement_frame.content_x, c->placement_frame.content_y,
+		                  c->placement_frame.content_w, c->placement_frame.content_h);
+		return out->size.width > 0 && out->size.height > 0;
+	}
+	if (c->window == nil || c->view == nil) {
+		return false;
+	}
+	// AppKit-owned placement: read the frame (read-only, as the render path
+	// already does for backingScaleFactor) and flip to top-down.
+	NSRect r = [c->window convertRectToScreen:[c->view convertRect:c->view.bounds toView:nil]];
+	CGFloat main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
+	*out = CGRectMake(r.origin.x, main_h - (r.origin.y + r.size.height), r.size.width, r.size.height);
+	return r.size.width > 0 && r.size.height > 0;
+}
+
+/*!
+ * Per frame, before the backdrop flatten: read the previous probe, update the
+ * lazy-transparency state, probe this frame's atlas, and tell the capture
+ * client whether (and for which display) the desktop is wanted.
+ */
+static void
+metal_desktop_bg_probe(
+    struct comp_metal_compositor *c, id<MTLCommandBuffer> cmd_buf, id<MTLTexture> atlas, uint32_t w, uint32_t h)
+{
+	if (c->desktop_bg == NULL) {
+		return;
+	}
+	if (c->alpha_probe == NULL) {
+		c->transparency_active = true; // no probe: assume transparent (always-on)
+	} else {
+		uint32_t n = 0;
+		if (comp_metal_alpha_probe_read(c->alpha_probe, &n)) {
+			if (n > 0) {
+				if (!c->transparency_active) {
+					U_LOG_W("desktop background: content turned transparent — capture wanted");
+				}
+				c->transparency_active = true;
+				c->opaque_streak = 0;
+			} else if (c->transparency_active && ++c->opaque_streak >= METAL_TRANSPARENCY_IDLE_FRAMES) {
+				U_LOG_W("desktop background: content opaque for %u frames — capture released",
+				        METAL_TRANSPARENCY_IDLE_FRAMES);
+				c->transparency_active = false;
+				c->opaque_streak = 0;
+			}
+		}
+		comp_metal_alpha_probe_record(c->alpha_probe, (__bridge void *)cmd_buf, (__bridge void *)atlas,
+		                              MIN(w, (uint32_t)atlas.width), MIN(h, (uint32_t)atlas.height));
+	}
+
+	c->desktop_display = 0;
+	CGRect r;
+	if (metal_content_rect_points(c, &r)) {
+		CGDirectDisplayID id = 0;
+		uint32_t n = 0;
+		CGPoint mid = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+		if (CGGetDisplaysWithPoint(mid, 1, &id, &n) == kCGErrorSuccess && n > 0) {
+			c->desktop_display = id;
+		}
+	}
+	comp_metal_desktop_bg_want(c->desktop_bg, c->transparency_active && c->desktop_display != 0,
+	                           c->desktop_display);
+}
+
+/*!
+ * The desktop under the window, as a copy region from the panel frame into a
+ * @p dst_w x @p dst_h backdrop (device pixels). False when there is none yet.
+ * @p out_full: the region covers the whole backdrop (no clear needed).
+ */
+static bool
+metal_desktop_bg_crop(struct comp_metal_compositor *c,
+                      id<MTLCommandBuffer> cmd_buf,
+                      uint32_t dst_w,
+                      uint32_t dst_h,
+                      id<MTLTexture> *out_tex,
+                      MTLOrigin *out_src,
+                      MTLOrigin *out_dst,
+                      MTLSize *out_size,
+                      bool *out_full)
+{
+	if (c->desktop_bg == NULL || !c->transparency_active || c->desktop_display == 0) {
+		return false;
+	}
+	CGRect r;
+	if (!metal_content_rect_points(c, &r)) {
+		return false;
+	}
+	uint32_t fw = 0, fh = 0;
+	id<MTLTexture> frame = (__bridge id<MTLTexture>)comp_metal_desktop_bg_acquire(
+	    c->desktop_bg, (__bridge void *)cmd_buf, c->desktop_display, &fw, &fh);
+	if (frame == nil || fw == 0 || fh == 0) {
+		return false;
+	}
+	CGRect b = CGDisplayBounds(c->desktop_display);
+	static bool geo_logged = false;
+	if (!geo_logged) {
+		geo_logged = true;
+		U_LOG_W("desktop background: crop window %.0f,%.0f %.0fx%.0f pt from display %u bounds %.0f,%.0f %.0fx%.0f "
+		        "(frame %ux%u px) into %ux%u",
+		        r.origin.x, r.origin.y, r.size.width, r.size.height, c->desktop_display, b.origin.x, b.origin.y,
+		        b.size.width, b.size.height, fw, fh, dst_w, dst_h);
+	}
+	if (b.size.width <= 0 || b.size.height <= 0) {
+		return false;
+	}
+	// Panel frame px per point; equals the window's backing scale on the panel.
+	const double sx = fw / b.size.width;
+	const double sy = fh / b.size.height;
+	const int64_t ox = llround((r.origin.x - b.origin.x) * sx);
+	const int64_t oy = llround((r.origin.y - b.origin.y) * sy);
+	const int64_t x0 = MAX(ox, 0), y0 = MAX(oy, 0);
+	const int64_t x1 = MIN(ox + (int64_t)dst_w, (int64_t)fw), y1 = MIN(oy + (int64_t)dst_h, (int64_t)fh);
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	*out_tex = frame;
+	*out_src = MTLOriginMake((NSUInteger)x0, (NSUInteger)y0, 0);
+	*out_dst = MTLOriginMake((NSUInteger)(x0 - ox), (NSUInteger)(y0 - oy), 0);
+	*out_size = MTLSizeMake((NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0), 1);
+	*out_full = out_dst->x == 0 && out_dst->y == 0 && out_size->width == dst_w && out_size->height == dst_h;
+	return true;
+}
+
 // #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
 // projection in list order) into backdrop_scratch PRE-weave and return it (+
 // region dims) so the caller hands it to the DP via set_background_2d (the DP
@@ -3347,7 +3529,18 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 {
 	*out_w = 0;
 	*out_h = 0;
-	if (!c->local_2d_last_frame || dst_w == 0 || dst_h == 0) {
+	if (dst_w == 0 || dst_h == 0) {
+		return nil;
+	}
+
+	// #2264: the live desktop behind the window goes UNDER everything else.
+	id<MTLTexture> desk = nil;
+	MTLOrigin desk_src, desk_dst;
+	MTLSize desk_size;
+	bool desk_full = false;
+	const bool have_desk =
+	    metal_desktop_bg_crop(c, cmd_buf, dst_w, dst_h, &desk, &desk_src, &desk_dst, &desk_size, &desk_full);
+	if (!c->local_2d_last_frame && !have_desk) {
 		return nil;
 	}
 
@@ -3360,17 +3553,17 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 			break;
 		}
 	}
-	if (proj_idx < 0) {
+	if (proj_idx < 0 && !have_desk) {
 		return nil;
 	}
 	bool have_under = false;
-	for (int32_t i = 0; i < proj_idx; i++) {
+	for (int32_t i = 0; c->local_2d_last_frame && i < proj_idx; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			have_under = true;
 			break;
 		}
 	}
-	if (!have_under) {
+	if (!have_under && !have_desk) {
 		return nil;
 	}
 
@@ -3383,9 +3576,33 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 	// #1795: through the `_sRGB` view when honest (the clear is (0,0,0,0),
 	// a fixed point of the transfer function, so it needs no decode).
 	const bool honest = c->backdrop_scratch_srgb != nil && metal_local2d_honest(c);
+	if (have_desk) {
+		// Both are BGRA8Unorm holding sRGB-ENCODED bytes, so a straight copy
+		// keeps the encoding the Local2D pass below and the DP expect.
+		if (!desk_full) {
+			MTLRenderPassDescriptor *clr = [MTLRenderPassDescriptor renderPassDescriptor];
+			clr.colorAttachments[0].texture = c->backdrop_scratch;
+			clr.colorAttachments[0].loadAction = MTLLoadActionClear;
+			clr.colorAttachments[0].storeAction = MTLStoreActionStore;
+			clr.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+			[[cmd_buf renderCommandEncoderWithDescriptor:clr] endEncoding];
+		}
+		id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+		[blit copyFromTexture:desk
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:desk_src
+		           sourceSize:desk_size
+		            toTexture:c->backdrop_scratch
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:desk_dst];
+		[blit endEncoding];
+	}
+
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 	pass.colorAttachments[0].texture = honest ? c->backdrop_scratch_srgb : c->backdrop_scratch;
-	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].loadAction = have_desk ? MTLLoadActionLoad : MTLLoadActionClear;
 	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
@@ -3400,14 +3617,73 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 	[enc endEncoding];
 
 	static bool logged = false;
-	if (!logged) {
+	if (!logged && have_under) {
 		logged = true;
 		U_LOG_W("Metal #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)", w, h);
+	}
+	static bool desk_logged = false;
+	if (!desk_logged && have_desk) {
+		desk_logged = true;
+		U_LOG_W("desktop background: first live-desktop backdrop %ux%u (crop %lux%lu from panel frame, handed to "
+		        "DP set_background_2d)",
+		        w, h, (unsigned long)desk_size.width, (unsigned long)desk_size.height);
 	}
 
 	*out_w = w;
 	*out_h = h;
 	return c->backdrop_scratch;
+}
+
+/*!
+ * `touch /tmp/dxr_backdrop_trigger`: the next frame's DP background (desktop +
+ * 2D-under, what set_background_2d receives) is written to
+ * /tmp/dxr_backdrop.png — the #2264 counterpart of /tmp/dxr_atlas_trigger,
+ * written from the command buffer's completion so the frame never stalls.
+ */
+static void
+metal_backdrop_dump_if_triggered(
+    struct comp_metal_compositor *c, id<MTLCommandBuffer> cmd_buf, id<MTLTexture> tex, uint32_t w, uint32_t h)
+{
+	const char *trigger = "/tmp/dxr_backdrop_trigger";
+	struct stat st;
+	if (tex == nil || w == 0 || h == 0 || stat(trigger, &st) != 0) {
+		return;
+	}
+	unlink(trigger);
+	const size_t pitch = (size_t)w * 4;
+	const size_t bytes = pitch * h;
+	id<MTLBuffer> stg = [c->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+	if (stg == nil) {
+		return;
+	}
+	id<MTLBlitCommandEncoder> bl = [cmd_buf blitCommandEncoder];
+	[bl copyFromTexture:tex
+	                 sourceSlice:0
+	                 sourceLevel:0
+	                sourceOrigin:MTLOriginMake(0, 0, 0)
+	                  sourceSize:MTLSizeMake(w, h, 1)
+	                    toBuffer:stg
+	           destinationOffset:0
+	      destinationBytesPerRow:pitch
+	    destinationBytesPerImage:bytes];
+	[bl endEncoding];
+	[cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+	  (void)done;
+	  const uint8_t *src = (const uint8_t *)stg.contents;
+	  uint8_t *out = malloc(bytes);
+	  if (out != NULL) {
+		  for (size_t i = 0; i < bytes; i += 4) {
+			  out[i + 0] = src[i + 2];
+			  out[i + 1] = src[i + 1];
+			  out[i + 2] = src[i + 0];
+			  out[i + 3] = src[i + 3];
+		  }
+		  stbi_write_png("/tmp/dxr_backdrop.png", (int)w, (int)h, 4, out, (int)pitch);
+		  free(out);
+		  U_LOG_W("desktop background: wrote /tmp/dxr_backdrop.png (%ux%u)", w, h);
+	  }
+	  [stg release];
+	}];
 }
 
 /*!
@@ -6022,9 +6298,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// before process_atlas. (Code-only on Windows — macOS CI gates the
 		// compile; visual needs a Mac+Leia eyeball.)
 		{
+			metal_desktop_bg_probe(c, cmd_buf, dp_src, atlas_cols * atlas_view_w, atlas_rows * atlas_view_h);
 			uint32_t bd_w = 0, bd_h = 0;
 			id<MTLTexture> bd_tex =
 			    metal_flatten_backdrop_2d(c, cmd_buf, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			metal_backdrop_dump_if_triggered(c, cmd_buf, bd_tex, bd_w, bd_h);
 			xrt_display_processor_metal_set_background_2d(c->display_processor,
 			                                              (__bridge void *)bd_tex, bd_w, bd_h);
 		}
@@ -6307,6 +6585,10 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->seg_screens = NULL;
 	free(c->seg_sys_info);
 	c->seg_sys_info = NULL;
+
+	// 3c. Live desktop background (#2264): drop the capture first.
+	comp_metal_desktop_bg_destroy(&c->desktop_bg);
+	comp_metal_alpha_probe_destroy(&c->alpha_probe);
 
 	// 4. Destroy display processor — first withdrawing this client's zone
 	// contribution from the vendor's union (#224 P4 clear-on-teardown edge).
@@ -6966,6 +7248,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("Display processor creation failed, continuing without it");
 		}
 	}
+	metal_desktop_bg_init(c);
 	c->hardware_display_3d = true; // Start in 3D mode (session begin will confirm)
 
 	// Multi-screen: the published segment table + routing (M3).
