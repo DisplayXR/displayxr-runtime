@@ -43,10 +43,19 @@ if(WIN32)
 	target_sources(aux_desktop PRIVATE u_desktop_win32.cpp)
 	target_link_libraries(aux_desktop PRIVATE user32 advapi32 ole32 oleaut32 uuid dwmapi)
 elseif(APPLE)
-	target_sources(aux_desktop PRIVATE u_desktop_macos.m)
+	target_sources(aux_desktop PRIVATE u_desktop_macos.m u_desktop_macos_capture.m u_desktop_macos_capture.h)
+	# ScreenCaptureKit is WEAK-linked (macOS 12.3+): on an older macOS the runtime
+	# still loads and the backend reports no CAPTURE capability.
 	target_link_libraries(
-		aux_desktop PRIVATE "-framework ApplicationServices" "-framework AppKit" "-framework CoreGraphics"
-				    "-framework CoreFoundation" "-framework Carbon"
+		aux_desktop
+		PRIVATE "-framework ApplicationServices"
+			"-framework AppKit"
+			"-framework CoreGraphics"
+			"-framework CoreFoundation"
+			"-framework Carbon"
+			"-framework CoreMedia"
+			"-framework CoreVideo"
+			"-weak_framework ScreenCaptureKit"
 		)
 elseif(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_DBUS)
 	# GNOME Wayland: RemoteDesktop portal + libei (dlopen'd: no DT_NEEDED, libei is
