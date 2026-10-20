@@ -34,6 +34,7 @@
 #include "util/u_exe_basename.h"
 
 #include "shared/ipc_app_group.h" // input focus follows the application
+#include "util/u_session.h"        // #2262: the server pushes the sibling's FOCUSED state itself
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
@@ -1517,8 +1518,14 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	 * is focused. The browser presents from its GPU process and owns the hand
 	 * trackers from the browser process; without this the trackers' session
 	 * was VISIBLE, never FOCUSED, and every joint set came back inactive.
-	 * ONLY input is shared: the session state the sibling sees, the presenter
-	 * and the workspace's focused slot are untouched.
+	 * What is shared: the input gate (client_input_allowed) and, #2262, the
+	 * SESSION STATE the sibling's app sees — OpenXR lets xrSyncActions act
+	 * only in XR_SESSION_STATE_FOCUSED, so a sibling left at VISIBLE got hand
+	 * joints but no action state. The compositor's own bookkeeping is NOT
+	 * touched: it still sees the sibling as focused=false (the panel lease,
+	 * the presenter and the workspace's focused slot key off that), and the
+	 * FOCUSED event is pushed by the server straight into the sibling's
+	 * session below.
 	 */
 	bool shared = false;
 	if (!focused && active_id >= 0 && active_id < (int)IPC_MAX_CLIENTS && ics->server_thread_index != active_id &&
@@ -1543,6 +1550,34 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	if (ics->xc != NULL) {
 		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, visible, focused);
 		xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, z_order);
+	}
+
+	/*
+	 * #2262: a shared sibling's app must see FOCUSED (xrSyncActions is a no-op
+	 * at VISIBLE) while the compositor keeps seeing it as unfocused. The
+	 * compositor's set_state above pushes its own {visible, false} only when
+	 * ITS cached state changes, so the server adds the app-facing event here:
+	 * FOCUSED when the sharing starts (or visible flips while it lasts),
+	 * back to the compositor's truth when it ends. Idempotent across flushes.
+	 */
+	if (ics->xs != NULL && !focused) {
+		union xrt_session_event xse = XRT_STRUCT_INIT;
+		xse.type = XRT_SESSION_EVENT_STATE_CHANGE;
+		xse.state.visible = visible;
+		if (shared && (!ics->shared_focus_event_sent || ics->shared_focus_event_visible != visible)) {
+			xse.state.focused = true;
+			(void)u_session_event_push((struct u_session *)ics->xs, &xse);
+			ics->shared_focus_event_sent = true;
+			ics->shared_focus_event_visible = visible;
+		} else if (!shared && ics->shared_focus_event_sent) {
+			xse.state.focused = false;
+			(void)u_session_event_push((struct u_session *)ics->xs, &xse);
+			ics->shared_focus_event_sent = false;
+		}
+	} else if (ics->shared_focus_event_sent) {
+		// The connection became the focused one itself (or lost its session):
+		// the compositor's event now carries FOCUSED; nothing of ours to undo.
+		ics->shared_focus_event_sent = false;
 	}
 }
 

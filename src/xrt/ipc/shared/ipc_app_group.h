@@ -16,9 +16,11 @@
  * belong to one application — and the non-active one shares the active one's
  * INPUT focus — when they declare the same application name AND come from the
  * same process tree (parent / child / siblings under one parent), with the
- * executable path as the tie-break where the tree is unknown. Only INPUT focus
- * is shared: the session state the sibling sees (FOCUSED / VISIBLE events), the
- * presenter and the workspace's focused slot are unchanged.
+ * executable path as the tie-break where the tree is unknown. Shared: the
+ * input gate and (#2262) the session state the sibling's APP sees — it reads
+ * FOCUSED, since OpenXR syncs actions only in XR_SESSION_STATE_FOCUSED. Not
+ * shared: the compositor's view of focus (the panel lease, the presenter and
+ * the workspace's focused slot still key off the one focused connection).
  *
  * Pure, header-only, so it is unit-tested without the server.
  */
