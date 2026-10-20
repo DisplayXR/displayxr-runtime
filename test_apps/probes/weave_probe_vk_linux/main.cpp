@@ -155,6 +155,19 @@ static XrOffset2Di kWinOrigin = {64, 48}; // --bind-origin=X,Y overrides it
 static bool g_bind_logical = false;
 static XrOffset2Di g_bind_logical_origin = {0, 0};
 static float g_bind_logical_scale = 0.0f;
+// --move-to=X,Y,LX,LY,SCALE (repeatable, up to 4; #2218 item 6): re-bind the window
+// there (device origin + v12 logical origin) during the main submit loop, at evenly
+// spaced frames — a present-owner moved across screens within ONE session, so the
+// service's per-screen DP resolution is exercised live. The final output is still
+// checked as usual (it is woven at the last position).
+struct probe_move
+{
+	XrOffset2Di origin;
+	XrOffset2Di logical;
+	float scale;
+};
+static probe_move g_moves[4];
+static int g_move_count = 0;
 
 static const VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
 static const VkImageUsageFlags kUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2056,10 +2069,15 @@ main(int argc, char **argv)
 		           sscanf(argv[i] + 15, "%d,%d,%f", &g_bind_logical_origin.x, &g_bind_logical_origin.y,
 		                  &g_bind_logical_scale) == 3) {
 			g_bind_logical = true;
+		} else if (strncmp(argv[i], "--move-to=", 10) == 0 && g_move_count < 4 &&
+		           sscanf(argv[i] + 10, "%d,%d,%d,%d,%f", &g_moves[g_move_count].origin.x,
+		                  &g_moves[g_move_count].origin.y, &g_moves[g_move_count].logical.x,
+		                  &g_moves[g_move_count].logical.y, &g_moves[g_move_count].scale) == 5) {
+			g_move_count++;
 		} else {
 			LOG("usage: %s [--frames=N] [--service-pid=PID] [--dump-dir=DIR] [--dmabuf [--no-release-wait] "
 			    "[--linear]] [--span2d] [--flat-regions] [--lift [--service-log=PATH]] [--bind-origin=X,Y] "
-			    "[--bind-logical=LX,LY,SCALE]",
+			    "[--bind-logical=LX,LY,SCALE] [--move-to=X,Y,LX,LY,SCALE]...",
 			    argv[0]);
 			return 2;
 		}
@@ -2434,6 +2452,29 @@ main(int argc, char **argv)
 	for (int frame = 0; frame < frames; frame++) {
 		// Alternate the two inputs: a rotating pool must hit the cache, not re-import.
 		submit.inputTexture = (void *)(intptr_t)input[frame & 1].fd;
+		// --move-to: the window moves between frames, as a dragged window does.
+		for (int m = 0; m < g_move_count; m++) {
+			if (frame != (frames * (m + 1)) / (g_move_count + 1)) {
+				continue;
+			}
+			XrWeaveWindowGeometryDXR mg = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
+			mg.windowOriginOnScreen = g_moves[m].origin;
+			mg.clientSize = {(int32_t)kWinW, (int32_t)kWinH};
+			mg.displayId = -1;
+			XrWeaveWindowLogicalOriginDXR ml = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR};
+			ml.logicalOrigin = g_moves[m].logical;
+			ml.scale = g_moves[m].scale;
+			mg.next = &ml;
+			XrWeaveBindWindowInfoDXR mb = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
+			mb.next = &mg;
+			mb.windowHandle = (void *)(uintptr_t)0x1;
+			if (XR_FAILED(pfn_bind2(session, &mb))) {
+				LOG("FAIL: --move-to re-bind at frame %d", frame);
+				pass = false;
+			}
+			LOG("frame %d: moved the window to (%d,%d) logical (%d,%d) @ %.4f", frame, g_moves[m].origin.x,
+			    g_moves[m].origin.y, g_moves[m].logical.x, g_moves[m].logical.y, (double)g_moves[m].scale);
+		}
 		XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
 		XrResult r = pfn_submit(session, &submit, &out);
 		if (XR_FAILED(r)) {
