@@ -20,6 +20,10 @@
  *   desktop_backend_smoke click X Y [left|right|middle] [count]
  *   desktop_backend_smoke scroll DX DY            at the current pointer
  *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
+ *   desktop_backend_smoke request-scopes control|capture|all[+again]   spec v2 consent (prompts!)
+ *   desktop_backend_smoke monitors                every monitor, desktop coordinates
+ *   desktop_backend_smoke capture X Y W H [OUT.ppm]  one still (native density); stats only,
+ *                                                 the pixels go to OUT.ppm only when given
  *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
  *                                                 OS grant from `request` lasts for the rest;
  *                                                 needed on GNOME, where the portal grant lives
@@ -35,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -136,6 +141,26 @@ on_access(void *ctx, enum u_desktop_access a)
 	(void)ctx;
 	g_access = a;
 	g_done = 1;
+}
+
+static volatile int g_scopes_done = 0;
+static enum u_desktop_access g_ctl = U_DESKTOP_ACCESS_UNKNOWN, g_cap = U_DESKTOP_ACCESS_UNKNOWN;
+
+static void
+on_scopes(void *ctx, enum u_desktop_access control, enum u_desktop_access capture)
+{
+	(void)ctx;
+	g_ctl = control;
+	g_cap = capture;
+	g_scopes_done = 1;
+}
+
+static uint64_t
+smoke_now_ms(void)
+{
+	struct timespec ts;
+	timespec_get(&ts, TIME_UTC);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
 static int
@@ -281,6 +306,64 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			if (r == U_DESKTOP_OK) {
 				r = b->pointer_button(b, &g, btn, false, x, y, msg);
 			}
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "request-scopes") == 0 && argc >= 3) {
+		uint32_t scopes = strncmp(argv[2], "capture", 7) == 0 ? U_DESKTOP_SCOPE_CAPTURE
+		                  : strncmp(argv[2], "all", 3) == 0 ? U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE
+		                                                     : U_DESKTOP_SCOPE_CONTROL;
+		if (strstr(argv[2], "+again") != NULL) {
+			scopes |= U_DESKTOP_SCOPE_REASK;
+		}
+		if (b->request_scopes == NULL) {
+			printf("this backend has no request_scopes (no capture)\n");
+			return 1;
+		}
+		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test"};
+		g_scopes_done = 0;
+		b->request_scopes(b, &app, scopes, on_scopes, NULL);
+		for (int i = 0; i < 1200 && !g_scopes_done; i++) {
+			sleep_ms(100);
+		}
+		printf("access: control %s, capture %s\n", g_scopes_done ? access_str(g_ctl) : "no answer",
+		       g_scopes_done ? access_str(g_cap) : "no answer");
+		printf("now: control %s, capture %s\n", b->access_status ? access_str(b->access_status(b)) : "?",
+		       b->capture_access_status ? access_str(b->capture_access_status(b)) : "?");
+	} else if (strcmp(cmd, "monitors") == 0) {
+		struct u_desktop_rect m[16];
+		uint32_t n = 0;
+		r = b->monitors != NULL ? b->monitors(b, m, 16, &n, msg) : U_DESKTOP_ERR_UNSUPPORTED;
+		for (uint32_t i = 0; i < n && i < 16 && r == U_DESKTOP_OK; i++) {
+			printf("  monitor %u: (%d,%d %dx%d)\n", i, m[i].x, m[i].y, m[i].w, m[i].h);
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "capture") == 0 && argc >= 6) {
+		struct u_desktop_rect src = {atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5])};
+		struct u_desktop_image img;
+		memset(&img, 0, sizeof(img));
+		uint64_t t0 = smoke_now_ms();
+		r = b->capture != NULL ? b->capture(b, &src, &img, msg) : U_DESKTOP_ERR_UNSUPPORTED;
+		uint64_t t1 = smoke_now_ms();
+		if (r == U_DESKTOP_OK) {
+			size_t withheld = 0;
+			for (size_t i = 0; i < (size_t)img.w * img.h; i++) {
+				withheld += img.rgba[i * 4 + 3] == 0 ? 1 : 0;
+			}
+			printf("capture: %ux%u in %llu ms, %zu withheld px\n", img.w, img.h,
+			       (unsigned long long)(t1 - t0), withheld);
+			if (argc >= 7) {
+				// Only on request: the person running the tool asked for the pixels.
+				FILE *f = fopen(argv[6], "wb");
+				if (f != NULL) {
+					fprintf(f, "P6\n%u %u\n255\n", img.w, img.h);
+					for (size_t i = 0; i < (size_t)img.w * img.h; i++) {
+						fwrite(img.rgba + i * 4, 1, 3, f);
+					}
+					fclose(f);
+					printf("saved %s\n", argv[6]);
+				}
+			}
+			u_desktop_image_free(&img);
 		}
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
