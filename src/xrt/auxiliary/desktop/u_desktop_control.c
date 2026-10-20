@@ -170,6 +170,8 @@ struct u_desktop_control
 	struct u_desktop_image kept; //!< the most recent successful capture's image
 	uint64_t kept_id;
 	uint64_t kept_until_ns;
+	uint64_t cap_retention_ns; //!< U_DESKTOP_CAPTURE_RETENTION_MS (tests may shorten it)
+	uint64_t cap_burst_gap_ns; //!< U_DESKTOP_CAPTURE_BURST_GAP_MS (tests may shorten it)
 	// --- capture worker only ---
 	struct capture_burst burst;
 
@@ -1953,6 +1955,20 @@ expire_kept_locked(struct u_desktop_control *c, uint64_t now_ns)
 	}
 }
 
+void
+u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c, uint64_t retention_ns, uint64_t burst_gap_ns)
+{
+	os_mutex_lock(&c->mutex);
+	if (retention_ns != 0) {
+		c->cap_retention_ns = retention_ns;
+	}
+	if (burst_gap_ns != 0) {
+		c->cap_burst_gap_ns = burst_gap_ns;
+	}
+	os_cond_broadcast(&c->cap_cond);
+	os_mutex_unlock(&c->mutex);
+}
+
 int32_t
 u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba)
 {
@@ -2306,7 +2322,7 @@ run_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *in
 	c->kept = out;
 	memset(&out, 0, sizeof(out));
 	c->kept_id = id;
-	c->kept_until_ns = os_monotonic_get_ns() + (uint64_t)U_DESKTOP_CAPTURE_RETENTION_MS * NS_PER_MS;
+	c->kept_until_ns = os_monotonic_get_ns() + c->cap_retention_ns;
 	struct u_desktop_capture_done d = {id, U_DESKTOP_XR_SUCCESS, c->kept.w, c->kept.h, src,
 	                                   c->kept.frame_ns, "ok"};
 	os_mutex_unlock(&c->mutex);
@@ -2343,12 +2359,12 @@ capture_worker(void *ptr)
 {
 	struct u_desktop_control *c = (struct u_desktop_control *)ptr;
 	const uint64_t interval = (uint64_t)U_DESKTOP_CAPTURE_MIN_INTERVAL_MS * NS_PER_MS;
-	const uint64_t gap = (uint64_t)U_DESKTOP_CAPTURE_BURST_GAP_MS * NS_PER_MS;
 	os_mutex_lock(&c->mutex);
 	for (;;) {
 		if (c->stop) {
 			break;
 		}
+		const uint64_t gap = c->cap_burst_gap_ns;
 		uint64_t now = os_monotonic_get_ns();
 		expire_kept_locked(c, now);
 		if (c->burst.open && now - c->burst.last_ns >= gap) {
@@ -2438,6 +2454,8 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->timing.own_grace_ns = timing != NULL && timing->own_grace_ns != 0 ? timing->own_grace_ns : DEFAULT_GRACE_NS;
 	c->timing.idle_max_wait_ns =
 	    timing != NULL && timing->idle_max_wait_ns != 0 ? timing->idle_max_wait_ns : DEFAULT_MAX_WAIT_NS;
+	c->cap_retention_ns = (uint64_t)U_DESKTOP_CAPTURE_RETENTION_MS * NS_PER_MS;
+	c->cap_burst_gap_ns = (uint64_t)U_DESKTOP_CAPTURE_BURST_GAP_MS * NS_PER_MS;
 	c->sc[SC_CONTROL].req_result = U_DESKTOP_ACCESS_UNKNOWN;
 	c->sc[SC_CAPTURE].req_result = U_DESKTOP_ACCESS_UNKNOWN;
 	c->policy = u_desktop_policy_create();

@@ -23,6 +23,7 @@
 #include "catch_amalgamated.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -144,10 +145,76 @@ struct Recorder
 		std::string message;
 	};
 
+	struct Capture
+	{
+		uint64_t id;
+		int32_t result;
+		uint32_t w, h;
+		u_desktop_rect source;
+		uint64_t frame_ns;
+		std::string message;
+	};
+
 	std::mutex m;
 	std::condition_variable cv;
 	std::vector<u_desktop_control_state> states;
 	std::vector<Completion> done;
+	std::vector<u_desktop_control_state> capture_states;
+	std::vector<Capture> captures;
+
+	static void
+	on_capture_state(void *ctx, u_desktop_control_state s)
+	{
+		auto *r = static_cast<Recorder *>(ctx);
+		std::lock_guard<std::mutex> g(r->m);
+		r->capture_states.push_back(s);
+		r->cv.notify_all();
+	}
+
+	static void
+	on_capture_done(void *ctx, const u_desktop_capture_done *d)
+	{
+		auto *r = static_cast<Recorder *>(ctx);
+		std::lock_guard<std::mutex> g(r->m);
+		r->captures.push_back({d->capture_id, d->result, d->w, d->h, d->source, d->frame_ns,
+		                       d->message != nullptr ? d->message : ""});
+		r->cv.notify_all();
+	}
+
+	bool
+	wait_captures(size_t n, std::chrono::milliseconds timeout = 5000ms)
+	{
+		std::unique_lock<std::mutex> l(m);
+		return cv.wait_for(l, timeout, [&] { return captures.size() >= n; });
+	}
+
+	bool
+	wait_capture_state(u_desktop_control_state s, std::chrono::milliseconds timeout = 2000ms)
+	{
+		std::unique_lock<std::mutex> l(m);
+		return cv.wait_for(l, timeout, [&] {
+			for (auto x : capture_states) {
+				if (x == s) {
+					return true;
+				}
+			}
+			return false;
+		});
+	}
+
+	size_t
+	capture_count()
+	{
+		std::lock_guard<std::mutex> g(m);
+		return captures.size();
+	}
+
+	Capture
+	last_capture()
+	{
+		std::lock_guard<std::mutex> g(m);
+		return captures.empty() ? Capture{0, 1, 0, 0, {0, 0, 0, 0}, 0, "<none>"} : captures.back();
+	}
 
 	static void
 	on_state(void *ctx, u_desktop_control_state s)
@@ -170,7 +237,7 @@ struct Recorder
 	u_desktop_control_callbacks
 	callbacks()
 	{
-		return {on_state, on_done, this};
+		return {on_state, on_done, this, on_capture_state, on_capture_done};
 	}
 
 	bool
@@ -2137,3 +2204,744 @@ TEST_CASE("gnome_clipboard: a reader that went away is EPIPE, never a SIGPIPE, d
 	close(fds[1]);
 }
 #endif
+
+/*
+ *
+ * Spec v2: screen capture (§10, ADR-056 Amendment 1) — over the fake backend.
+ *
+ */
+
+#include "desktop/u_desktop_capture.h"
+
+namespace {
+
+u_desktop_capture_info
+cap_desktop(uint32_t max_w = 8192, uint32_t max_h = 8192)
+{
+	u_desktop_capture_info i;
+	memset(&i, 0, sizeof(i));
+	i.target = U_DESKTOP_CAPTURE_DESKTOP;
+	i.max_w = max_w;
+	i.max_h = max_h;
+	return i;
+}
+
+u_desktop_capture_info
+cap_region(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t max_w = 8192, uint32_t max_h = 8192)
+{
+	u_desktop_capture_info i = cap_desktop(max_w, max_h);
+	i.target = U_DESKTOP_CAPTURE_REGION;
+	i.region = {x, y, w, h};
+	return i;
+}
+
+u_desktop_capture_info
+cap_window(uint64_t id, uint32_t max_w = 8192, uint32_t max_h = 8192)
+{
+	u_desktop_capture_info i = cap_desktop(max_w, max_h);
+	i.target = U_DESKTOP_CAPTURE_WINDOW;
+	i.window_id = id;
+	return i;
+}
+
+void
+grant_capture(Harness &h)
+{
+	REQUIRE(u_desktop_control_request_scopes(h.c, "tests", U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+	REQUIRE(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
+}
+
+//! One capture, waited for. The image (if any) is fetched into @p img.
+Recorder::Capture
+capture(Harness &h, const u_desktop_capture_info &info, std::vector<uint8_t> *img = nullptr)
+{
+	size_t before = h.rec.capture_count();
+	uint64_t id = 0;
+	REQUIRE(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_SUCCESS);
+	REQUIRE(id != 0);
+	REQUIRE(h.rec.wait_captures(before + 1));
+	Recorder::Capture c = h.rec.last_capture();
+	REQUIRE(c.id == id);
+	if (img != nullptr && c.result == U_DESKTOP_XR_SUCCESS) {
+		uint32_t n = 0;
+		REQUIRE(u_desktop_control_capture_image(h.c, id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(n == c.w * c.h * 4);
+		img->assign(n, 0);
+		REQUIRE(u_desktop_control_capture_image(h.c, id, n, &n, img->data()) == U_DESKTOP_XR_SUCCESS);
+	}
+	return c;
+}
+
+const uint8_t *
+px(const std::vector<uint8_t> &img, const Recorder::Capture &c, uint32_t x, uint32_t y)
+{
+	return &img[((size_t)y * c.w + x) * 4];
+}
+
+//! The desktop point image pixel (x, y) maps to (spec §10.3).
+void
+map_back(const Recorder::Capture &c, uint32_t x, uint32_t y, int32_t *dx, int32_t *dy)
+{
+	*dx = (int32_t)std::floor(c.source.x + (x + 0.5) * c.source.w / (double)c.w);
+	*dy = (int32_t)std::floor(c.source.y + (y + 0.5) * c.source.h / (double)c.h);
+}
+
+std::vector<std::string>
+audit_lines(const TempDir &dir)
+{
+	std::vector<std::string> out;
+	std::stringstream ss(slurp(dir.file("desktop_control_audit.jsonl")));
+	std::string line;
+	while (std::getline(ss, line)) {
+		out.push_back(line);
+	}
+	return out;
+}
+
+//! Captures with a short retention (300 ms) and burst gap (600 ms > the 250 ms start cap).
+void
+fast_capture_timing(Harness &h)
+{
+	u_desktop_control_set_capture_timing_for_tests(h.c, 300ull * 1000000ull, 600ull * 1000000ull);
+}
+
+} // namespace
+
+TEST_CASE("capture_helpers: fit never scales up and keeps the aspect ratio", "[desktop][capture]")
+{
+	uint32_t w = 0, h = 0;
+	u_desktop_capture_fit(1920, 1080, 8192, 8192, &w, &h);
+	CHECK((w == 1920 && h == 1080));
+	u_desktop_capture_fit(1920, 1080, 960, 960, &w, &h);
+	CHECK((w == 960 && h == 540));
+	u_desktop_capture_fit(1920, 1080, 4000, 270, &w, &h);
+	CHECK((w == 480 && h == 270));
+	u_desktop_capture_fit(5000, 3, 100, 100, &w, &h);
+	CHECK((w == 100 && h == 1)); // never 0
+}
+
+TEST_CASE("capture_helpers: area downscale averages, withheld pixels never darken real ones",
+          "[desktop][capture]")
+{
+	u_desktop_image in;
+	REQUIRE(u_desktop_image_alloc(&in, 4, 2));
+	// Left 2x2 block: 0 and 200 in R, opaque. Right 2x2: one real pixel (R 100), three withheld.
+	const uint8_t vals[4][4] = {{0, 0, 0, 255}, {200, 0, 0, 255}, {100, 50, 25, 255}, {0, 0, 0, 0}};
+	auto set = [&](uint32_t x, uint32_t y, const uint8_t *v) { memcpy(in.rgba + (y * 4 + x) * 4, v, 4); };
+	set(0, 0, vals[0]);
+	set(1, 0, vals[1]);
+	set(0, 1, vals[0]);
+	set(1, 1, vals[1]);
+	set(2, 0, vals[2]);
+	set(3, 0, vals[3]);
+	set(2, 1, vals[3]);
+	set(3, 1, vals[3]);
+	u_desktop_image out;
+	REQUIRE(u_desktop_image_downscale(&in, 2, 1, &out));
+	CHECK(out.rgba[0] == 100); // the mean of 0 and 200
+	CHECK(out.rgba[3] == 255);
+	CHECK(out.rgba[4] == 100); // only the real pixel's colour: never pulled to black
+	CHECK(out.rgba[5] == 50);
+	CHECK(out.rgba[7] == 64); // a quarter of the footprint is real
+	u_desktop_image_free(&out);
+
+	// Wholly withheld stays (0,0,0,0).
+	memset(in.rgba + 2 * 4, 0, 8);
+	memset(in.rgba + (4 + 2) * 4, 0, 8);
+	REQUIRE(u_desktop_image_downscale(&in, 2, 1, &out));
+	CHECK((out.rgba[4] == 0 && out.rgba[5] == 0 && out.rgba[6] == 0 && out.rgba[7] == 0));
+	u_desktop_image_free(&out);
+	u_desktop_image_free(&in);
+}
+
+TEST_CASE("capture_helpers: withholding rounds outwards", "[desktop][capture]")
+{
+	u_desktop_image img;
+	REQUIRE(u_desktop_image_alloc(&img, 10, 10));
+	memset(img.rgba, 255, 400);
+	u_desktop_rect src = {0, 0, 20, 20}; // 2 desktop px per image px
+	u_desktop_rect r = {3, 3, 2, 2};     // desktop 3..5 -> image px 1..2 (partially covered)
+	u_desktop_image_withhold(&img, &src, &r);
+	for (uint32_t y = 0; y < 10; y++) {
+		for (uint32_t x = 0; x < 10; x++) {
+			bool held = x >= 1 && x <= 2 && y >= 1 && y <= 2;
+			CHECK((img.rgba[(y * 10 + x) * 4 + 3] == 0) == held);
+		}
+	}
+	u_desktop_image_free(&img);
+}
+
+TEST_CASE("capture_scope: a v1 request is CONTROL only; CAPTURE has its own state and events",
+          "[desktop][capture][state]")
+{
+	TempDir dir;
+	Harness h;
+	uint32_t caps = 0;
+	u_desktop_control_get_state(h.c, &caps);
+	CHECK((caps & U_DESKTOP_CAP_CAPTURE) != 0);
+	h.grant();
+	// No capture event for an app that never touched the scope.
+	{
+		std::lock_guard<std::mutex> g(h.rec.m);
+		CHECK(h.rec.capture_states.empty());
+	}
+	CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_NOT_REQUESTED);
+	u_desktop_capture_info info = cap_desktop();
+	uint64_t id = 0;
+	CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	CHECK(id == 0);
+
+	grant_capture(h);
+	CHECK(h.rec.wait_capture_state(U_DESKTOP_STATE_GRANTED));
+	CHECK(h.state() == U_DESKTOP_STATE_GRANTED); // CONTROL untouched
+
+	// The consent records name the scope.
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(audit.find("\"action\":\"request\",\"scope\":\"capture\"") != std::string::npos);
+	CHECK(audit.find("\"action\":\"granted\",\"scope\":\"capture\"") != std::string::npos);
+}
+
+TEST_CASE("capture_scope: CAPTURE works without CONTROL; one prompt for both; GRANTED is not asked again",
+          "[desktop][capture][state]")
+{
+	TempDir dir;
+	Harness h;
+	SECTION("capture alone")
+	{
+		grant_capture(h);
+		CHECK(h.state() == U_DESKTOP_STATE_NOT_REQUESTED);
+		Recorder::Capture c = capture(h, cap_desktop());
+		CHECK(c.result == U_DESKTOP_XR_SUCCESS);
+	}
+	SECTION("both in one prompt, then nothing to ask")
+	{
+		u_desktop_fake_set_request_answer(h.fake, U_DESKTOP_ACCESS_GRANTED, true);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr,
+		                                         U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
+		CHECK(h.state() == U_DESKTOP_STATE_PENDING);
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_PENDING);
+		// A request while a listed scope is PENDING is a no-op.
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		uint32_t n = 0;
+		CHECK(u_desktop_fake_last_request_scopes(h.fake, &n) ==
+		      (U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE));
+		CHECK(n == 1);
+		REQUIRE(u_desktop_fake_complete_request(h.fake));
+		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
+		uint32_t before = u_desktop_fake_request_count(h.fake);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr,
+		                                         U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_request_count(h.fake) == before); // nothing asked again
+	}
+	SECTION("the dialog decides both: input unticked -> CONTROL DENIED, CAPTURE GRANTED")
+	{
+		h.grant();
+		u_desktop_fake_set_request_answer(h.fake, U_DESKTOP_ACCESS_DENIED, false);
+		u_desktop_fake_set_capture_request_answer(h.fake, U_DESKTOP_ACCESS_GRANTED, true);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) == U_DESKTOP_SCOPE_CAPTURE);
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
+		CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+	}
+	SECTION("bad scopes")
+	{
+		CHECK(u_desktop_control_request_scopes(h.c, nullptr, 0) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_request_scopes(h.c, nullptr, 0x4) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	}
+}
+
+TEST_CASE("capture_scope: no capture capability -> UNSUPPORTED and FEATURE_UNSUPPORTED", "[desktop][capture]")
+{
+	TempDir dir;
+	Harness h;
+	u_desktop_fake_set_caps(h.fake, U_DESKTOP_CAP_LIST_WINDOWS | U_DESKTOP_CAP_PICK | U_DESKTOP_CAP_INPUT);
+	CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_UNSUPPORTED);
+	REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_request_count(h.fake) == 0);
+	CHECK(h.rec.wait_capture_state(U_DESKTOP_STATE_UNSUPPORTED));
+	u_desktop_capture_info info = cap_desktop();
+	uint64_t id = 0;
+	CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED);
+}
+
+TEST_CASE("capture_scope: the store answers per scope; Windows-model prompt writes the CAPTURE answer",
+          "[desktop][capture][store]")
+{
+	TempDir dir;
+	Harness h;
+	SECTION("a capture deny leaves CONTROL alone")
+	{
+		REQUIRE(u_desktop_policy_set_app_scope(kExe, U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_DENY, "test"));
+		h.grant();
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DISABLED_BY_USER);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) == 0); // never prompted
+		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+	}
+	SECTION("remembers_in_store: allow written per scope, a remembered allow needs no prompt")
+	{
+		u_desktop_fake_set_remembers_in_store(h.fake, true);
+		grant_capture(h);
+		u_desktop_policy *pol = u_desktop_policy_create();
+		CHECK(u_desktop_policy_app_scope(pol, kExe, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_APP_ALLOW);
+		CHECK(u_desktop_policy_app(pol, kExe) == U_DESKTOP_APP_NONE);
+		u_desktop_policy_destroy(&pol);
+
+		Harness h2;
+		u_desktop_fake_set_remembers_in_store(h2.fake, true);
+		REQUIRE(u_desktop_control_request_scopes(h2.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_request_count(h2.fake) == 0);
+		CHECK(u_desktop_control_get_capture_state(h2.c) == U_DESKTOP_STATE_GRANTED);
+		// `desktop forget --scope capture` revokes it at once.
+		REQUIRE(u_desktop_policy_set_app_scope(kExe, U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_NONE, "test"));
+		CHECK(u_desktop_control_get_capture_state(h2.c) == U_DESKTOP_STATE_DENIED);
+	}
+}
+
+TEST_CASE("capture_store: v1 entries are read as is; a write makes the file v2, strings stay strings",
+          "[desktop][capture][store]")
+{
+	TempDir dir;
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "{\"version\":1,\"suspended\":false,\"idle_ms\":600,\"apps\":{\"/a\":\"deny\",\"/b\":\"allow\"}}";
+	}
+	u_desktop_policy *p = u_desktop_policy_create();
+	CHECK(u_desktop_policy_app(p, "/a") == U_DESKTOP_APP_DENY);
+	CHECK(u_desktop_policy_app_scope(p, "/a", U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_APP_NONE);
+	u_desktop_policy_destroy(&p);
+
+	REQUIRE(u_desktop_policy_set_app_scope("/b", U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_DENY, "test"));
+	std::string txt = slurp(dir.file("desktop_control.json"));
+	CHECK(txt.find("\"version\":\t2") != std::string::npos);
+	CHECK(txt.find("\"/a\":\t\"deny\"") != std::string::npos); // untouched v1 entry stays a string
+	p = u_desktop_policy_create();
+	CHECK(u_desktop_policy_app(p, "/b") == U_DESKTOP_APP_ALLOW);
+	CHECK(u_desktop_policy_app_scope(p, "/b", U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_APP_DENY);
+	u_desktop_policy_destroy(&p);
+
+	// Forgetting the capture answer turns the entry back into the v1 string.
+	REQUIRE(u_desktop_policy_set_app_scope("/b", U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_NONE, "test"));
+	txt = slurp(dir.file("desktop_control.json"));
+	CHECK(txt.find("\"/b\":\t\"allow\"") != std::string::npos);
+	// Forget all removes the entry.
+	REQUIRE(u_desktop_policy_set_app_scope("/b", U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE,
+	                                       U_DESKTOP_APP_NONE, "test"));
+	txt = slurp(dir.file("desktop_control.json"));
+	CHECK(txt.find("\"/b\"") == std::string::npos);
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(audit.find("\"action\":\"deny\",\"subject\":\"/b\",\"scope\":\"capture\"") != std::string::npos);
+}
+
+TEST_CASE("capture_validate: submit-time validation (spec §10.3)", "[desktop][capture][validate]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	auto bad = [&](u_desktop_capture_info i) {
+		uint64_t id = 7;
+		CHECK(u_desktop_control_capture(h.c, &i, &id) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(id == 0);
+	};
+	u_desktop_capture_info i = cap_desktop();
+	i.target = 3;
+	bad(i);
+	bad(cap_desktop(0, 100));
+	bad(cap_desktop(100, 8193));
+	bad(cap_region(0, 0, 0, 10));
+	bad(cap_region(0, 0, 10, -1));
+	bad(cap_region(2000000, 0, 10, 10));
+	bad(cap_window(0));
+	CHECK(u_desktop_control_capture(h.c, nullptr, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	CHECK(u_desktop_fake_capture_count(h.fake) == 0);
+}
+
+TEST_CASE("capture_modes: desktop, region (clipped), window frame as on screen, and the mapping back",
+          "[desktop][capture]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	std::vector<uint8_t> img;
+
+	SECTION("desktop: every monitor's bounding box, 1:1")
+	{
+		Recorder::Capture c = capture(h, cap_desktop(), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.w == 1920 && c.h == 1080));
+		CHECK((c.source.x == 0 && c.source.y == 0 && c.source.w == 1920 && c.source.h == 1080));
+		CHECK(c.frame_ns != 0);
+		// Every pixel maps back to the desktop point it shows.
+		for (uint32_t y = 0; y < c.h; y += 37) {
+			for (uint32_t x = 0; x < c.w; x += 41) {
+				int32_t dx, dy;
+				map_back(c, x, y, &dx, &dy);
+				uint8_t want[4];
+				u_desktop_fake_expected_pixel(h.fake, dx, dy, want);
+				REQUIRE(memcmp(px(img, c, x, y), want, 4) == 0);
+			}
+		}
+	}
+	SECTION("region: clipped to the monitors; wholly outside is refused")
+	{
+		Recorder::Capture c = capture(h, cap_region(1800, 1000, 400, 400), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.source.x == 1800 && c.source.y == 1000 && c.source.w == 120 && c.source.h == 80));
+		CHECK((c.w == 120 && c.h == 80));
+		std::this_thread::sleep_for(260ms);
+		c = capture(h, cap_region(3000, 0, 100, 100));
+		CHECK(c.result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(c.message == "found nothing: outside every monitor");
+		CHECK((c.w == 0 && c.h == 0));
+	}
+	SECTION("window: its frame as on screen — the window on top of it is in the image")
+	{
+		// 101 (100,100 800x600) is on top of 102 (1000,200 800x600)? No: they do not
+		// overlap; move 101 over 102's corner.
+		u_desktop_window w;
+		memset(&w, 0, sizeof(w));
+		w.id = 104;
+		w.pid = 1004;
+		snprintf(w.app_id, sizeof(w.app_id), "popup");
+		w.frame = {1100, 250, 100, 100};
+		u_desktop_fake_add_window(h.fake, &w);
+		Recorder::Capture c = capture(h, cap_window(102), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.source.x == 1000 && c.source.y == 200 && c.source.w == 800 && c.source.h == 600));
+		const uint8_t *p = px(img, c, 150, 100); // desktop (1150, 300): the popup
+		CHECK((p[0] == 0x10 && p[1] == 104 && p[3] == 255));
+		p = px(img, c, 10, 10); // desktop (1010, 210): window 102 itself
+		CHECK((p[0] == 0x10 && p[1] == 102));
+	}
+	SECTION("window: gone / minimized")
+	{
+		Recorder::Capture c = capture(h, cap_window(999));
+		CHECK(c.result == U_DESKTOP_XR_ERROR_WINDOW_LOST);
+		u_desktop_window w;
+		memset(&w, 0, sizeof(w));
+		w.id = 105;
+		w.pid = 1005;
+		w.state = U_DESKTOP_WINDOW_MINIMIZED;
+		w.frame = {10, 10, 100, 100};
+		u_desktop_fake_add_window(h.fake, &w);
+		std::this_thread::sleep_for(260ms);
+		c = capture(h, cap_window(105));
+		CHECK(c.result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(c.message == "the window is minimized");
+	}
+}
+
+TEST_CASE("capture_scale: scaled down to fit, never up; device px on a HiDPI monitor; mapping holds",
+          "[desktop][capture]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	std::vector<uint8_t> img;
+
+	SECTION("downscale to the max size keeps the aspect ratio")
+	{
+		Recorder::Capture c = capture(h, cap_desktop(960, 960), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.w == 960 && c.h == 540));
+		CHECK((c.source.w == 1920 && c.source.h == 1080));
+		// Background at desktop (1900..1901, 40..41): R averages x & 0xff of the two columns.
+		int32_t dx, dy;
+		map_back(c, 950, 20, &dx, &dy);
+		CHECK((dx == 1901 && dy == 41)); // the footprint is 1900..1901 x 40..41
+		const uint8_t *p = px(img, c, 950, 20);
+		uint8_t a[4], b[4];
+		u_desktop_fake_expected_pixel(h.fake, 1900, 40, a);
+		u_desktop_fake_expected_pixel(h.fake, 1901, 41, b);
+		CHECK(std::abs((int)p[0] - (a[0] + b[0] + 1) / 2) <= 1);
+		CHECK(std::abs((int)p[1] - (a[1] + b[1] + 1) / 2) <= 1);
+		CHECK(p[3] == 255);
+	}
+	SECTION("a small region is never scaled up")
+	{
+		Recorder::Capture c = capture(h, cap_region(950, 50, 30, 20, 4000, 4000), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.w == 30 && c.h == 20));
+	}
+	SECTION("a 200 % monitor: device px, and the mapping still lands")
+	{
+		u_desktop_fake_monitor m[2] = {{{0, 0, 1920, 1080}, 1, true}, {{1920, 0, 1280, 800}, 2, true}};
+		u_desktop_fake_set_monitors(h.fake, m, 2);
+		Recorder::Capture c = capture(h, cap_region(2000, 100, 100, 50), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.w == 200 && c.h == 100)); // device px
+		for (uint32_t y = 0; y < c.h; y += 7) {
+			for (uint32_t x = 0; x < c.w; x += 9) {
+				int32_t dx, dy;
+				map_back(c, x, y, &dx, &dy);
+				uint8_t want[4];
+				u_desktop_fake_expected_pixel(h.fake, dx, dy, want);
+				REQUIRE(memcmp(px(img, c, x, y), want, 4) == 0);
+			}
+		}
+		// The whole desktop: the bounding box of both, at the densest scale; the
+		// part below the smaller monitor is on no monitor -> withheld.
+		std::this_thread::sleep_for(260ms);
+		c = capture(h, cap_desktop(), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK((c.source.w == 3200 && c.source.h == 1080));
+		CHECK((c.w == 6400 && c.h == 2160));
+		const uint8_t *off = px(img, c, 2 * 2500, 2 * 1000); // desktop (2500, 1000): no monitor
+		CHECK((off[0] == 0 && off[3] == 0));
+	}
+}
+
+TEST_CASE("capture_privacy: own windows and capture-excluded windows are withheld; unknown exclusion refuses",
+          "[desktop][capture][privacy]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	std::vector<uint8_t> img;
+
+	u_desktop_window own;
+	memset(&own, 0, sizeof(own));
+	own.id = 200;
+	own.pid = 4242;
+	own.state = U_DESKTOP_WINDOW_OWN;
+	own.frame = {1300, 850, 200, 100};
+	u_desktop_fake_add_window(h.fake, &own);
+	u_desktop_fake_set_capture_excluded(h.fake, 102, true);
+
+	Recorder::Capture c = capture(h, cap_desktop(), &img);
+	REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+	auto at = [&](int32_t x, int32_t y) { return px(img, c, (uint32_t)x, (uint32_t)y); };
+	// Own window: whole frame (0,0,0,0).
+	CHECK((at(1300, 850)[3] == 0 && at(1499, 949)[3] == 0 && at(1400, 900)[0] == 0));
+	// Excluded window 102 (1000,200 800x600): whole frame, even where it is visible.
+	CHECK((at(1000, 200)[3] == 0 && at(1799, 799)[3] == 0 && at(1500, 500)[1] == 0));
+	// Neighbours untouched.
+	CHECK(at(999, 199)[3] == 255);
+	CHECK(at(1299, 849)[3] == 255);
+
+	std::this_thread::sleep_for(260ms);
+	u_desktop_fake_set_exclusion_unknown(h.fake, true);
+	c = capture(h, cap_desktop());
+	CHECK(c.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(c.message == "cannot honour capture exclusion");
+	uint32_t n = 0;
+	CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+
+	SECTION("an unshared monitor is withheld")
+	{
+		u_desktop_fake_set_exclusion_unknown(h.fake, false);
+		u_desktop_fake_monitor m[2] = {{{0, 0, 1920, 1080}, 1, true}, {{1920, 0, 1920, 1080}, 1, false}};
+		u_desktop_fake_set_monitors(h.fake, m, 2);
+		std::this_thread::sleep_for(260ms);
+		c = capture(h, cap_region(1900, 500, 40, 10), &img);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		CHECK(px(img, c, 10, 5)[3] == 255); // desktop 1910: shared
+		CHECK(px(img, c, 30, 5)[3] == 0);   // desktop 1930: not shared
+	}
+}
+
+TEST_CASE("capture_limits: one in flight, 4 Hz start cap, retention", "[desktop][capture][limits]")
+{
+	TempDir dir;
+	Harness h;
+	fast_capture_timing(h);
+	grant_capture(h);
+	u_desktop_capture_info info = cap_region(0, 0, 64, 64);
+
+	SECTION("a second capture while one is pending is LIMIT_REACHED")
+	{
+		u_desktop_fake_set_capture_delay_ms(h.fake, 200);
+		uint64_t a = 0, b = 0;
+		REQUIRE(u_desktop_control_capture(h.c, &info, &a) == U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_control_capture(h.c, &info, &b) == U_DESKTOP_XR_ERROR_LIMIT_REACHED);
+		CHECK(b == 0);
+		REQUIRE(h.rec.wait_captures(1));
+		REQUIRE(u_desktop_control_capture(h.c, &info, &b) == U_DESKTOP_XR_SUCCESS);
+		CHECK(b != a);
+		REQUIRE(h.rec.wait_captures(2));
+	}
+	SECTION("starts are at least 250 ms apart; an early call is accepted and waits")
+	{
+		std::vector<Clock::time_point> starts;
+		std::mutex m;
+		auto hook = [](void *ctx, const char *op, uint32_t) {
+			if (strcmp(op, "capture") == 0) {
+				auto *v = static_cast<std::pair<std::mutex *, std::vector<Clock::time_point> *> *>(ctx);
+				std::lock_guard<std::mutex> g(*v->first);
+				v->second->push_back(Clock::now());
+			}
+		};
+		std::pair<std::mutex *, std::vector<Clock::time_point> *> ctx{&m, &starts};
+		u_desktop_fake_set_batch_hook(h.fake, hook, &ctx);
+		for (int i = 0; i < 3; i++) {
+			Recorder::Capture c = capture(h, info);
+			CHECK(c.result == U_DESKTOP_XR_SUCCESS);
+		}
+		u_desktop_fake_set_batch_hook(h.fake, nullptr, nullptr);
+		REQUIRE(starts.size() == 3);
+		for (size_t i = 1; i < starts.size(); i++) {
+			CHECK(starts[i] - starts[i - 1] >= 245ms);
+		}
+	}
+	SECTION("retention: size queries keep it, a copy ends it, other ids fail, it expires")
+	{
+		std::vector<uint8_t> img;
+		Recorder::Capture c = capture(h, info);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		uint32_t n = 0;
+		CHECK(u_desktop_control_capture_image(h.c, c.id + 1, 0, &n, nullptr) ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
+		CHECK(n == 64 * 64 * 4);
+		img.assign(n, 0);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, n - 1, &n, img.data()) ==
+		      U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, n, &n, img.data()) == U_DESKTOP_XR_SUCCESS);
+		CHECK(img[3] == 255);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, n, &n, img.data()) ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+
+		// Expiry (300 ms in this harness; 10 s in the spec).
+		c = capture(h, info);
+		REQUIRE(c.result == U_DESKTOP_XR_SUCCESS);
+		std::this_thread::sleep_for(400ms);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+
+		// The next capture replaces the last one.
+		c = capture(h, info);
+		uint64_t first = c.id;
+		std::this_thread::sleep_for(260ms);
+		c = capture(h, info);
+		CHECK(u_desktop_control_capture_image(h.c, first, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
+	}
+}
+
+TEST_CASE("capture_safety: kill switch, lock and deny refuse; a frame finished as they land is dropped",
+          "[desktop][capture][safety]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	u_desktop_capture_info info = cap_region(0, 0, 32, 32);
+
+	SECTION("kill switch / lock at submit: NOT_GRANTED, the backend is never reached")
+	{
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		uint64_t id = 0;
+		CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		CHECK(h.rec.wait_capture_state(U_DESKTOP_STATE_SUSPENDED));
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		u_desktop_fake_set_locked(h.fake, true);
+		CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		CHECK(u_desktop_fake_capture_count(h.fake) == 0);
+		u_desktop_fake_set_locked(h.fake, false);
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
+	}
+	struct Flip
+	{
+		int what; // 0 kill switch, 1 lock, 2 capture deny
+		u_desktop_fake *fake;
+	};
+	auto hook = [](void *ctx, const char *op, uint32_t) {
+		auto *fl = static_cast<Flip *>(ctx);
+		if (strcmp(op, "captured") != 0) {
+			return;
+		}
+		if (fl->what == 0) {
+			u_desktop_policy_set_suspended(true, "test");
+		} else if (fl->what == 1) {
+			u_desktop_fake_set_locked(fl->fake, true);
+		} else {
+			u_desktop_policy_set_app_scope(kExe, U_DESKTOP_SCOPE_CAPTURE, U_DESKTOP_APP_DENY, "test");
+		}
+	};
+	const char *expect[3] = {"kill switch", "screen locked", "disabled by the user"};
+	for (int what = 0; what < 3; what++) {
+		DYNAMIC_SECTION("between the capture and the hand-over: " << expect[what])
+		{
+			Flip fl{what, h.fake};
+			u_desktop_fake_set_batch_hook(h.fake, hook, &fl);
+			Recorder::Capture c = capture(h, info);
+			u_desktop_fake_set_batch_hook(h.fake, nullptr, nullptr);
+			CHECK(u_desktop_fake_capture_count(h.fake) == 1); // the OS capture happened ...
+			CHECK(c.result == U_DESKTOP_XR_ERROR_REFUSED);    // ... and the frame was dropped
+			CHECK(c.message == expect[what]);
+			CHECK((c.w == 0 && c.h == 0));
+			uint32_t n = 0;
+			CHECK(u_desktop_control_capture_image(h.c, c.id, 0, &n, nullptr) ==
+			      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		}
+	}
+	SECTION("the OS revokes it: NOT_GRANTED, CAPTURE DENIED until requested again")
+	{
+		u_desktop_fake_set_capture_result(h.fake, U_DESKTOP_ERR_NOT_GRANTED);
+		Recorder::Capture c = capture(h, info);
+		CHECK(c.result == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		CHECK(h.rec.wait_capture_state(U_DESKTOP_STATE_DENIED));
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DENIED);
+		uint64_t id = 0;
+		CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		u_desktop_fake_set_capture_result(h.fake, U_DESKTOP_OK);
+		grant_capture(h);
+	}
+}
+
+TEST_CASE("capture_audit: one record per burst, failures on their own, never a pixel", "[desktop][capture][audit]")
+{
+	TempDir dir;
+	Harness h;
+	fast_capture_timing(h);
+	grant_capture(h);
+	u_desktop_capture_info info = cap_region(100, 100, 64, 32);
+	for (int i = 0; i < 3; i++) {
+		REQUIRE(capture(h, info).result == U_DESKTOP_XR_SUCCESS);
+	}
+	// A failure closes the burst and gets its own record.
+	REQUIRE(capture(h, cap_region(5000, 5000, 10, 10)).result == U_DESKTOP_XR_ERROR_REFUSED);
+	REQUIRE(capture(h, info).result == U_DESKTOP_XR_SUCCESS);
+	std::this_thread::sleep_for(900ms); // > the 600 ms burst gap of this harness
+
+	std::vector<std::string> caps;
+	for (const std::string &l : audit_lines(dir)) {
+		if (l.find("\"action\":\"capture\"") != std::string::npos) {
+			caps.push_back(l);
+		}
+	}
+	REQUIRE(caps.size() == 3);
+	CHECK(caps[0].find("\"count\":3") != std::string::npos);
+	CHECK(caps[0].find("\"kind\":\"region\"") != std::string::npos);
+	CHECK(caps[0].find("\"rect\":[100,100,64,32]") != std::string::npos);
+	CHECK(caps[0].find("\"w\":64,\"h\":32") != std::string::npos);
+	CHECK(caps[0].find("\"first\"") != std::string::npos);
+	CHECK(caps[0].find("\"last\"") != std::string::npos);
+	CHECK(caps[0].find("\"result\":\"ok\"") != std::string::npos);
+	CHECK(caps[1].find("\"result\":\"refused\"") != std::string::npos);
+	CHECK(caps[1].find("outside every monitor") != std::string::npos);
+	CHECK(caps[2].find("\"count\":1") != std::string::npos);
+	for (const std::string &l : caps) {
+		// Only what, how big, how often: no pixel data, no hash, no thumbnail.
+		CHECK(l.size() < 600);
+		CHECK(l.find("rgba") == std::string::npos);
+		CHECK(l.find("hash") == std::string::npos);
+	}
+}
+
+TEST_CASE("capture_lifecycle: destroy with a capture in flight drops it without an event", "[desktop][capture]")
+{
+	TempDir dir;
+	auto *h = new Harness();
+	grant_capture(*h);
+	u_desktop_fake_set_capture_delay_ms(h->fake, 150);
+	u_desktop_capture_info info = cap_desktop();
+	uint64_t id = 0;
+	REQUIRE(u_desktop_control_capture(h->c, &info, &id) == U_DESKTOP_XR_SUCCESS);
+	std::this_thread::sleep_for(30ms);
+	u_desktop_control_destroy(&h->c);
+	CHECK(h->rec.capture_count() == 0);
+	delete h;
+}
