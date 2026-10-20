@@ -342,6 +342,22 @@ The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_c
 
 ---
 
+## Multi-screen segments: a screen's lens wish follows coverage
+
+A window spanning screens is cropped and woven per screen, one DP per screen (ADR-047,
+`docs/architecture/comp-segments.md`). The 2D/3D wish each screen's DP is sent follows the
+segment table, not the session alone (#2247): **a screen's DP wishes the session's mode
+while the window covers that screen, and 2D once the window has wholly left it** —
+`comp_segments_lens_wish()` = `session_3d && comp_segments_screen_covered()`. That holds for
+the session's own DP on the primary screen too (the in-process D3D11, D3D12, Vulkan and
+OpenGL compositors and the #918 Vulkan/D3D12 split gate every request to it, and re-send the
+session's mode when the window returns), and for a segment DP kept alive by the lifecycle's
+hysteresis or by the window handle (ADR-047 Amendment 2) after the window left its screen.
+An empty table carries no coverage and leaves every wish at the session's mode, and a window
+wholly on one screen covers only that screen, so the single-screen path is unchanged. Not
+yet: the service's shared panel DP and the multi-client union ("no 3D client covers this
+screen"), and the Metal session DP — their segment DPs already follow the rule.
+
 ## Shell Mode: Two-Stage Atlas Pipeline
 
 The single-stage pipeline above (app swapchain → crop → DP) describes the

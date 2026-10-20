@@ -169,6 +169,21 @@ comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas
 }
 
 bool
+comp_segments_screen_covered(const struct comp_segment_table *t, uint64_t screen_id)
+{
+	if (t == NULL || t->count == 0) {
+		return true; // no coverage information: the session's own wish
+	}
+	for (uint32_t k = 0; k < t->count && k < COMP_SEGMENTS_MAX; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		if (g->screen_id == screen_id && g->window_rect.w > 0 && g->window_rect.h > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
 comp_segments_window_is_split(const struct comp_seg_rect *window_desktop,
                               const struct comp_seg_rect *canvas,
                               const struct comp_segments_screen *screens,

@@ -49,7 +49,8 @@ half-open, so a window flush to a seam belongs to exactly one screen.
   It is windowless (NULL window): its phase is `set_present_origin`, fed per frame,
   ADR-033. A plug-in's DP made for a screen describes that screen
   (`get_display_dimensions` / `get_display_pixel_info`). Every segment DP follows the
-  session's 2D/3D mode (`request_display_mode`, on creation and on every change).
+  session's 2D/3D mode on the screens the window covers (`request_display_mode`, on
+  creation and on every change) — see *The lens wish follows coverage* below.
 - A window entirely on the primary screen — the common case — never leaves the
   single-DP path: `comp_segments_table_is_split()` is false and the frame is
   byte-for-byte what shipped before.
@@ -125,6 +126,30 @@ The primary segment keeps the session-level gates, which now also let a tolerant
 primary DP weave (the X11 gate of #1831 and the resample reasons of the Wayland
 gate of #1595). On `ds1-linux` both monitors are resampled under XWayland, which is
 why M2 could not be shown there without this.
+
+## The lens wish follows coverage (#2247)
+
+A screen's DP is asked for the session's 2D/3D mode only while the window covers that
+screen; a screen the window has **wholly left** is asked for 2D (it shows the desktop
+there, not a woven window), and gets the session's mode back when the window returns.
+Pure rule: `comp_segments_lens_wish(table, screen, session_3d)` =
+`session_3d && comp_segments_screen_covered(table, screen)`, unit-tested; an empty table
+(the window on no screen) carries no coverage and leaves the session's mode everywhere.
+
+- **Segment DPs** — every manager's `*_set_display_mode()` applies it per screen, so a DP
+  kept alive after its segment went away (the lifecycle's ~0.5 s hysteresis, or the DP
+  holding the window handle before the hand-back) is sent 2D. One WARN per coverage edge:
+  `segments: screen 0x… ('…') uncovered — lens wish 2D (#2247)` / `covered again`.
+- **The session's own DP** (the primary screen's) — the compositor asks the manager
+  `*_primary_covered()` on every weave and, on an edge, sends `session_3d && covered`
+  (`segments: the window has wholly left the primary screen — its lens wish 2D (#2247)`);
+  its `request_display_mode` entry point and the `swap_primary` hook (a windowless primary
+  DP made by the hand-off) apply the same gate, so the re-created weaver never replays a 3D
+  wish for a screen the window left. In-process D3D11, D3D12, Vulkan and OpenGL, and the
+  #918 Vulkan/D3D12 split. On desktop Linux the NOT_1TO1 hold wins while it is held.
+- **Not yet:** the service's panel DP (shared between clients — the right rule there is
+  "no 3D client covers this screen", the union over the service's clients) and the macOS
+  Metal session DP. Their segment DPs already follow the rule.
 
 ## Lifecycle
 

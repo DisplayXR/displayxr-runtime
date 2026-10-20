@@ -1182,3 +1182,68 @@ TEST_CASE("comp_segments: window_is_split — the zero-copy gate (#2218)", "[com
 		CHECK_FALSE(comp_segments_window_is_split(&win, nullptr, scr, 0));
 	}
 }
+
+TEST_CASE("comp_segments: lens wish follows coverage (#2247)")
+{
+	// DS1 is the primary; eDP to its left.
+	comp_segments_screen scr[2] = {
+	    screen(EDP, 0, 0, 3456, 2160, 3456, 2160, false),
+	    screen(DS1, 3456, 0, 3840, 2160, 3840, 2160, true),
+	};
+	comp_segment_table t{};
+
+	SECTION("window wholly on the primary: only the primary is covered")
+	{
+		comp_seg_rect win{4000, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK(comp_segments_screen_covered(&t, DS1));
+		CHECK_FALSE(comp_segments_screen_covered(&t, EDP));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, true));
+	}
+
+	SECTION("window wholly on the other screen: the primary it left wishes 2D")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK(comp_segments_screen_covered(&t, EDP));
+		CHECK_FALSE(comp_segments_screen_covered(&t, DS1));
+		CHECK(comp_segments_lens_wish(&t, EDP, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, true));
+	}
+
+	SECTION("window straddling the seam: both screens covered, both follow the session")
+	{
+		comp_seg_rect win{3000, 200, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 2);
+		CHECK(comp_segments_lens_wish(&t, EDP, true));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, false));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, false));
+	}
+
+	SECTION("a session in 2D wishes 2D everywhere, covered or not")
+	{
+		comp_seg_rect win{100, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK_FALSE(comp_segments_lens_wish(&t, EDP, false));
+		CHECK_FALSE(comp_segments_lens_wish(&t, DS1, false));
+	}
+
+	SECTION("no table (window on no screen) carries no coverage: the session's wish stands")
+	{
+		comp_seg_rect win{-5000, -5000, 100, 100};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 0);
+		CHECK(comp_segments_screen_covered(&t, EDP));
+		CHECK(comp_segments_screen_covered(&t, DS1));
+		CHECK(comp_segments_lens_wish(&t, DS1, true));
+		CHECK(comp_segments_screen_covered(nullptr, DS1));
+	}
+
+	SECTION("an unknown screen is uncovered once a table exists")
+	{
+		comp_seg_rect win{4000, 100, 1280, 720};
+		REQUIRE(comp_segments_compute(&win, nullptr, scr, 2, &t) == 1);
+		CHECK_FALSE(comp_segments_screen_covered(&t, 0x9999));
+	}
+}

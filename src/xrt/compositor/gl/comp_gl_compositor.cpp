@@ -1203,6 +1203,11 @@ struct comp_gl_compositor
 	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
+	//! #2247: the last weave's table does not cover the primary screen (the
+	//! window has wholly left it): the session's DP is asked for 2D there,
+	//! and gets the session's mode back when the window returns. Written by
+	//! the weave, read by comp_gl_compositor_request_display_mode.
+	bool seg_primary_uncovered;
 	struct os_mutex seg_pub_mutex;
 	struct xrt_segment_metrics seg_pub;               //!< the table the last weave took (count 0 = one view set)
 	struct xrt_segment_view_routing seg_route;        //!< the routing the last locate handed out
@@ -5025,6 +5030,32 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 
 #ifdef XRT_OS_WINDOWS
 /*!
+ * #2247: the session's DP weaves the primary screen, so its lens wish is the
+ * session's mode while the window covers the primary and 2D once the window
+ * has wholly left it (comp_gl_segments_primary_covered, from the last
+ * update's table). Sends @p dp that wish on a coverage edge, or always with
+ * @p force (a freshly swapped-in DP). One WARN per edge. Weave thread.
+ */
+static void
+gl_seg_primary_lens(struct comp_gl_compositor *c, struct xrt_display_processor_gl *dp, bool force)
+{
+	const bool uncovered = !comp_gl_segments_primary_covered(c->segments);
+	const bool edge = uncovered != c->seg_primary_uncovered;
+	if (!edge && !force) {
+		return;
+	}
+	c->seg_primary_uncovered = uncovered;
+	const bool want = c->hardware_display_3d && !uncovered;
+	if (dp != NULL) {
+		xrt_display_processor_gl_request_display_mode(dp, want);
+	}
+	if (edge) {
+		U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247)",
+		        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D");
+	}
+}
+
+/*!
  * ADR-047 Amendment 2 hook: install @p dp as the session's primary DP (weave
  * thread, c->mutex held, GL context current) and return the previous one for
  * the segment manager to destroy. Re-sends the session-level state a new DP
@@ -5041,7 +5072,8 @@ gl_segments_swap_primary_cb(void *userdata, struct xrt_display_processor_gl *dp)
 	if (dp != NULL) {
 		xrt_display_processor_gl_set_transparent_background(dp, c->transparent_background, false);
 		xrt_display_processor_gl_set_shared_texture_present(dp, c->has_shared_texture);
-		xrt_display_processor_gl_request_display_mode(dp, c->hardware_display_3d);
+		// #2247: the session's mode, but not on a primary screen the window left.
+		gl_seg_primary_lens(c, dp, true);
 		if (c->eye_tracking_mode_set) {
 			xrt_display_processor_gl_set_eye_tracking_mode(dp, c->eye_tracking_mode);
 		}
@@ -5113,10 +5145,14 @@ gl_segments_tick(struct comp_gl_compositor *c, bool eligible, uint32_t present_w
 			const uint32_t mode_index =
 			    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0;
 			seg_split = comp_gl_segments_update(c->segments, &win, &canvas, mode_index);
-			// Every segment DP follows the session's 2D/3D mode, like the primary.
+			// Every segment DP follows the session's 2D/3D mode on the
+			// screens the window covers, 2D on one it left (#2247).
 			comp_gl_segments_set_display_mode(c->segments, c->hardware_display_3d);
 		}
 	}
+	// #2247: the primary screen's lens follows coverage too. Edges only: a
+	// window wholly on the primary never leaves "covered", so this never runs.
+	gl_seg_primary_lens(c, c->display_processor, false);
 
 	/*
 	 * Multi-screen M3: publish the table this weave took, for the next
@@ -8617,7 +8653,13 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 	os_mutex_lock(&c->dp_swap_mutex);
 	bool ok = false;
 	if (c->display_processor != NULL) {
-		ok = xrt_display_processor_gl_request_display_mode(c->display_processor, enable_3d);
+		bool dp_3d = enable_3d;
+#ifdef XRT_OS_WINDOWS
+		// #2247: the primary screen stays 2D while the window has wholly left
+		// it; the weave restores the session's mode when it returns.
+		dp_3d = dp_3d && !c->seg_primary_uncovered;
+#endif
+		ok = xrt_display_processor_gl_request_display_mode(c->display_processor, dp_3d);
 	}
 	os_mutex_unlock(&c->dp_swap_mutex);
 	return ok;

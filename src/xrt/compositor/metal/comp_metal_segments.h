@@ -165,7 +165,12 @@ bool
 comp_metal_segments_record(struct comp_metal_segments *segs, const struct comp_metal_segments_frame *f);
 
 /*!
- * The session-wide hardware 2D/3D mode; every segment DP follows it.
+ * The session-wide hardware 2D/3D mode. Each segment DP's lens wish follows
+ * it on the screens the window covers and is 2D on a screen the window has
+ * wholly left (#2247, comp_segments_lens_wish): sent to each live DP on a
+ * change and to every newly created one. The session DP keeps the session's
+ * own mode (its coverage gate is a follow-up on macOS). Weave thread, after
+ * the update.
  */
 void
 comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enable_3d);

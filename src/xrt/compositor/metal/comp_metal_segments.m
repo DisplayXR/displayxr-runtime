@@ -73,6 +73,7 @@ struct seg_screen_state
 	struct xrt_display_processor_metal *dp; //!< NULL until the lifecycle creates it.
 	bool configured;                        //!< set_background_2d(NULL) sent once.
 	int mode_sent;                          //!< last 2D/3D mode sent, -1 = none.
+	bool uncovered;                         //!< #2247: the window had wholly left this screen.
 	bool tolerates_resample;
 	id<MTLTexture> crop; //!< retained; the atlas tiles cut down to one segment
 	uint32_t crop_w, crop_h;
@@ -196,6 +197,7 @@ dp_release(struct comp_metal_segments *segs, uint32_t i)
 	}
 	st->configured = false;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	st->tolerates_resample = false;
 	crop_destroy(st);
 }
@@ -234,6 +236,7 @@ dp_create(struct comp_metal_segments *segs, uint32_t i)
 	st->tolerates_resample = xrt_display_processor_metal_tolerates_resample(dp);
 	st->configured = false;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	// Lifecycle event (hysteresis-gated), not per frame.
 	U_LOG_W(
 	    "segments: created a segment DP for screen 0x%016llx ('%s', plug-in '%s') via "
@@ -1146,9 +1149,23 @@ comp_metal_segments_set_display_mode(struct comp_metal_segments *segs, bool enab
 	segs->mode_3d = enable_3d;
 	for (uint32_t i = 0; i < segs->screen_count; i++) {
 		struct seg_screen_state *st = &segs->st[i];
-		if (st->dp != NULL && st->mode_sent != (int)enable_3d) {
-			st->mode_sent = (int)enable_3d;
-			xrt_display_processor_metal_request_display_mode(st->dp, enable_3d);
+		if (st->dp == NULL) {
+			continue;
+		}
+		// #2247: the lens wish follows coverage — 2D on a screen the window
+		// has wholly left, the session's mode on the screens it covers.
+		const bool covered = comp_segments_screen_covered(&segs->table, segs->screens[i].id);
+		const bool want = enable_3d && covered;
+		if (covered == st->uncovered) {
+			st->uncovered = !covered;
+			// A coverage edge for a live DP: lifecycle, not per frame.
+			U_LOG_W("segments: screen 0x%016llx ('%s') %s — lens wish %s (#2247)",
+			        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
+			        covered ? "covered again" : "uncovered", want ? "3D" : "2D");
+		}
+		if (st->mode_sent != (int)want) {
+			st->mode_sent = (int)want;
+			xrt_display_processor_metal_request_display_mode(st->dp, want);
 		}
 	}
 }

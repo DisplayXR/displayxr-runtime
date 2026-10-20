@@ -269,6 +269,31 @@ bool
 comp_segments_table_is_split(const struct comp_segment_table *t, uint32_t canvas_w, uint32_t canvas_h);
 
 /*!
+ * #2247: does the window cover screen @p screen_id — does @p t hold a
+ * non-empty segment on it? A screen's lens wish follows this: a session in 3D
+ * wishes 3D only on the screens its window covers, and 2D on a screen it has
+ * wholly left (the screen shows the desktop there, not a woven window).
+ *
+ * An EMPTY table (the window on no screen at all, or no table yet) carries no
+ * coverage information and answers true for every screen, so the wish is the
+ * session's own — exactly what shipped before the rule. A window wholly on one
+ * screen covers that screen alone.
+ */
+bool
+comp_segments_screen_covered(const struct comp_segment_table *t, uint64_t screen_id);
+
+/*!
+ * #2247: the 2D/3D wish to send screen @p screen_id's DP — the session's
+ * @p session_3d, but 2D on a screen the window does not cover
+ * (@ref comp_segments_screen_covered).
+ */
+static inline bool
+comp_segments_lens_wish(const struct comp_segment_table *t, uint64_t screen_id, bool session_3d)
+{
+	return session_3d && comp_segments_screen_covered(t, screen_id);
+}
+
+/*!
  * #2218: would @p window_desktop take the split path at all — is it anything
  * other than wholly on the primary screen? Pure: computes a scratch table and
  * asks @ref comp_segments_table_is_split; no lifecycle, no DPs. The

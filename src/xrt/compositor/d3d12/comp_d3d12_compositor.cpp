@@ -461,6 +461,14 @@ struct comp_d3d12_compositor
 	bool seg_rebuild;                                //!< a new list arrived: rebuild on the next weave
 	uint64_t seg_pinned_display_id;
 	/*!
+	 * #2247: the last weave's table does not cover the primary screen (the
+	 * window has wholly left it), so the session's DP — which weaves the
+	 * primary — is asked for 2D whatever the session's mode, and gets the
+	 * session's mode back when the window returns. Written by the weave
+	 * thread; read by the request_display_mode / begin_session paths.
+	 */
+	std::atomic<bool> seg_primary_uncovered{false};
+	/*!
 	 * Multi-screen M3: what the app thread reads (xrLocateViews) and hands
 	 * back (xrEndFrame) while the weave thread owns the segment manager — a
 	 * small lock of its own, never c->mutex (the repaint thread holds that
@@ -2653,9 +2661,10 @@ d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 
 	U_LOG_I("D3D12 compositor session begin");
 
-	// Switch display to 3D mode
+	// Switch display to 3D mode (#2247: not a primary screen the window has left)
 	if (c->display_processor != nullptr) {
-		xrt_display_processor_d3d12_request_display_mode(c->display_processor, true);
+		xrt_display_processor_d3d12_request_display_mode(c->display_processor,
+		                                                 !c->seg_primary_uncovered.load());
 	}
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 	else if (c->reroute.active && c->reroute.split != NULL) {
@@ -4050,9 +4059,29 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 				                                ? c->xdev->hmd->active_rendering_mode_index
 				                                : 0;
 				seg_split = comp_d3d12_segments_update(c->segments, &win, &canvas, mode_index);
-				// Every segment DP follows the session's 2D/3D mode, like the primary.
+				// Every segment DP follows the session's 2D/3D mode on the
+				// screens the window covers, 2D on one it left (#2247).
 				comp_d3d12_segments_set_display_mode(c->segments, c->hardware_display_3d);
 			}
+		}
+	}
+
+	/*
+	 * #2247: the primary screen's lens follows coverage too — the session's
+	 * DP weaves it. Edges only: a window wholly on the primary (and every
+	 * single-screen session) never leaves "covered", so this never runs there.
+	 */
+	if (c->display_processor != nullptr) {
+		const bool uncovered = !comp_d3d12_segments_primary_covered(c->segments);
+		if (uncovered != c->seg_primary_uncovered.load()) {
+			c->seg_primary_uncovered = uncovered;
+			const bool want = c->hardware_display_3d && !uncovered;
+			// A mode switch perturbs the display: drain the present first, as
+			// the request_display_mode entry point does (an edge, not per frame).
+			gpu_wait_idle_out(c);
+			xrt_display_processor_d3d12_request_display_mode(c->display_processor, want);
+			U_LOG_W("segments: the window %s the primary screen — its lens wish %s (#2247)",
+			        uncovered ? "has wholly left" : "is back on", want ? "3D" : "2D");
 		}
 	}
 
@@ -7566,7 +7595,10 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 		                                                                       : XRT_ERROR_D3D12;
 	}
 #endif
-	return xrt_display_processor_d3d12_request_display_mode(c->display_processor, enable_3d);
+	// #2247: the primary screen stays 2D while the window has wholly left it;
+	// the weave restores the session's mode when it returns.
+	return xrt_display_processor_d3d12_request_display_mode(c->display_processor,
+	                                                        enable_3d && !c->seg_primary_uncovered.load());
 }
 
 extern "C" void

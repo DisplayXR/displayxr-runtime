@@ -61,6 +61,7 @@ struct seg_screen_state
 	bool configured;                     //!< set_background_2d(0) sent once.
 	int transparent_latched;             //!< last transparency declared, -1 = none.
 	int mode_sent;                       //!< last 2D/3D mode sent, -1 = none.
+	bool uncovered;                      //!< #2247: the window had wholly left this screen.
 	bool tolerates_resample;
 	bool has_hwnd; //!< this DP holds the session's window (the owner).
 	struct seg_crop crop;
@@ -178,6 +179,7 @@ dp_release(struct comp_gl_segments *segs, uint32_t i)
 	st->configured = false;
 	st->transparent_latched = -1;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	st->tolerates_resample = false;
 	st->has_hwnd = false;
 	crop_destroy(&st->crop);
@@ -241,6 +243,7 @@ dp_install(struct comp_gl_segments *segs, uint32_t i, struct xrt_display_process
 	st->configured = false;
 	st->transparent_latched = -1;
 	st->mode_sent = -1;
+	st->uncovered = false;
 	if (dp == nullptr) {
 		crop_destroy(&st->crop);
 	}
@@ -941,11 +944,39 @@ comp_gl_segments_set_display_mode(struct comp_gl_segments *segs, bool enable_3d)
 	segs->mode_3d = enable_3d;
 	for (uint32_t i = 0; i < segs->screen_count; i++) {
 		struct seg_screen_state *st = &segs->st[i];
-		if (st->dp != nullptr && st->mode_sent != (int)enable_3d) {
-			st->mode_sent = (int)enable_3d;
-			xrt_display_processor_gl_request_display_mode(st->dp, enable_3d);
+		if (st->dp == nullptr) {
+			continue;
+		}
+		// #2247: the lens wish follows coverage — 2D on a screen the window
+		// has wholly left, the session's mode on the screens it covers.
+		const bool covered = comp_segments_screen_covered(&segs->table, segs->screens[i].id);
+		const bool want = enable_3d && covered;
+		if (covered == st->uncovered) {
+			st->uncovered = !covered;
+			// A coverage edge for a live DP: lifecycle, not per frame.
+			U_LOG_W("segments: screen 0x%016llx ('%s') %s — lens wish %s (#2247)",
+			        (unsigned long long)segs->screens[i].id, segs->bindings[i].device_name,
+			        covered ? "covered again" : "uncovered", want ? "3D" : "2D");
+		}
+		if (st->mode_sent != (int)want) {
+			st->mode_sent = (int)want;
+			xrt_display_processor_gl_request_display_mode(st->dp, want);
 		}
 	}
+}
+
+extern "C" bool
+comp_gl_segments_primary_covered(const struct comp_gl_segments *segs)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return true;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		if (segs->screens[i].is_primary) {
+			return comp_segments_screen_covered(&segs->table, segs->screens[i].id);
+		}
+	}
+	return true;
 }
 
 extern "C" bool

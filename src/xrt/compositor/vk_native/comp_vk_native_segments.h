@@ -267,12 +267,24 @@ comp_vk_native_segments_get_capture(const struct comp_vk_native_segments *segs,
                                     bool *out_woven);
 
 /*!
- * The session-wide hardware 2D/3D mode. Every segment DP follows it: sent to
- * each live DP on a change and to every newly created one (the primary DP
- * gets it from the compositor's own request path). Weave thread.
+ * The session-wide hardware 2D/3D mode. Each segment DP's lens wish follows
+ * it on the screens the window covers and is 2D on a screen the window has
+ * wholly left (#2247, comp_segments_lens_wish): sent to each live DP on a
+ * change and to every newly created one. The primary DP gets its wish from
+ * the compositor's own request path, gated by @ref comp_vk_native_segments_primary_covered.
+ * Weave thread, after the update.
  */
 void
 comp_vk_native_segments_set_display_mode(struct comp_vk_native_segments *segs, bool enable_3d);
+
+/*!
+ * #2247: does the window cover the PRIMARY screen, per the last update's
+ * table? True when segmentation is off or the table is empty (no coverage
+ * information), so a window wholly on the primary keeps the shipped
+ * behaviour. Weave thread.
+ */
+bool
+comp_vk_native_segments_primary_covered(const struct comp_vk_native_segments *segs);
 
 /*!
  * Multi-screen M3: the last update's segment table as per-segment view

@@ -14765,7 +14765,10 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 		                                ? sys->xdev->hmd->active_rendering_mode_index
 		                                : 0;
 		split = comp_d3d11_segments_update(fc->segments, &win, &canvas, ctx, mode_index);
-		// Every segment DP follows the panel's 2D/3D state, like the panel DP.
+		// Every segment DP follows the panel's 2D/3D state on the screens the
+		// window covers, 2D on one it left (#2247). The panel DP itself keeps
+		// the panel's state: it is shared, and "no 3D client covers the
+		// primary" needs the union over the service's clients (follow-up).
 		comp_d3d11_segments_set_display_mode(fc->segments, sys->hardware_display_3d);
 		if (split) {
 			(void)comp_d3d11_segments_get_metrics(fc->segments, &win, &canvas, /*primary_has_dp*/ true, &m);
@@ -30171,7 +30174,9 @@ weave_seg_update(struct d3d11_service_system *sys,
 	const uint32_t mode_index =
 	    (sys->xdev != nullptr && sys->xdev->hmd != nullptr) ? sys->xdev->hmd->active_rendering_mode_index : 0;
 	const bool split = comp_d3d11_segments_update(c->weave_segs, &win, &canvas, ctx, mode_index);
-	// Every segment DP follows the panel's 2D/3D state, like the panel DP.
+	// Every segment DP follows the panel's 2D/3D state on the screens the
+	// window covers, 2D on one it left (#2247); the client's weave DP on the
+	// primary keeps the panel's state (the multi-client union is a follow-up).
 	comp_d3d11_segments_set_display_mode(c->weave_segs, sys->hardware_display_3d);
 	*out_win = win;
 	return split;
