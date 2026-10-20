@@ -574,7 +574,18 @@ if [ "$COMPONENT" = unity ]; then
         [ -s "$c" ] && { ca="$c"; break; }
       done
       [ -n "$ca" ] || { echo "osslsigncode: no CA bundle found"; return 1; }
-      out=$(osslsigncode verify -in "$f" -CAfile "$ca" 2>&1)
+      # osslsigncode fetches the certificates' CRLs itself, with no timeout: on a
+      # slow or VPN'd link it hung for 10+ min (unity v2.28.0). Bound it at 90 s
+      # (perl alarm: macOS has no `timeout`); if it times out, verify chain +
+      # signature + timestamp with -ignore-crl and say revocation wasn't checked.
+      # The signing runner has already fail-closed-verified the same file online.
+      out=$(perl -e 'alarm 90; exec @ARGV' osslsigncode verify -in "$f" -CAfile "$ca" 2>&1); local rc=$?
+      if [ "$rc" = 142 ] && osslsigncode --help 2>&1 | grep -q -- '-ignore-crl'; then
+        out=$(perl -e 'alarm 90; exec @ARGV' osslsigncode verify -in "$f" -CAfile "$ca" -ignore-crl 2>&1)
+        if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then
+          echo "Valid (CRL fetch timed out; revocation not checked here)"; return 0
+        fi
+      fi
       if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then echo "Valid"; return 0; fi
       echo "osslsigncode: $(grep -E -m1 'Failed|error|Error' <<<"$out" || echo not-valid)"; return 1
     else echo "no-powershell-no-osslsigncode (apt install osslsigncode)"; return 1; fi
