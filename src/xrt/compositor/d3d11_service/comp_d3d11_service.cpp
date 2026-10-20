@@ -1130,6 +1130,9 @@ struct d3d11_service_compositor
 	//! thread, once per commit); 0 = not evaluated yet = `sys->refresh_rate`.
 	//! Read by the render thread and predict / wait frame (svc_client_hz).
 	std::atomic<float> screen_hz{0.0f};
+	//! #2245 gate: the monitor last held at the primary's rate because another
+	//! adapter scans it out (0 = none) — change-only logging, the IPC thread.
+	uint64_t screen_gated_monitor;
 
 	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
 	//! client's own claim). Set by the IPC server right after session create.
@@ -9130,6 +9133,13 @@ compositor_end_session(struct xrt_compositor *xc)
  * also raises. A window wholly on the primary keeps `sys->refresh_rate` itself,
  * not a re-read (comp_segments_window_refresh_hz).
  *
+ * The adapter gate (comp_segments_gated_refresh_hz): a screen's own rate is
+ * used only when the adapter that scans it out (QueryDisplayConfig's path
+ * adapterId) is the adapter the presenting chain and the segment DPs live on
+ * (`svc_out_device`). Until phase B gives each screen its own output adapter,
+ * a screen on the other adapter is reached through a cross-adapter copy and a
+ * DWM composition, and pacing it faster than the primary is wasted work.
+ *
  */
 
 struct svc_screen_rates
@@ -9139,6 +9149,14 @@ struct svc_screen_rates
 	uint32_t count = 0;
 	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS] = {};
 	float hz[COMP_SEGMENTS_MAX_SCREENS] = {};
+	//! The adapter scanning each monitor out (packed LUID, 0 = unknown).
+	uint64_t luid[COMP_SEGMENTS_MAX_SCREENS] = {};
+	//! Each monitor's GDI device name (MONITORINFOEXW::szDevice), to join
+	//! QueryDisplayConfig's paths.
+	wchar_t device[COMP_SEGMENTS_MAX_SCREENS][CCHDEVICENAME] = {};
+	//! The output device whose adapter LUID is cached below (process-latched).
+	ID3D11Device *luid_device = nullptr;
+	uint64_t device_luid = 0;
 };
 
 static svc_screen_rates g_svc_screen_rates;
@@ -9167,6 +9185,8 @@ svc_screen_rates_enum_cb(HMONITOR mon, HDC hdc, LPRECT rect, LPARAM lp)
 	sc->desktop.w = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
 	sc->desktop.h = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
 	sc->is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+	memcpy(r->device[r->count], mi.szDevice, sizeof(r->device[r->count]));
+	r->luid[r->count] = 0;
 	DEVMODEW dm;
 	memset(&dm, 0, sizeof(dm));
 	dm.dmSize = sizeof(dm);
@@ -9189,7 +9209,63 @@ svc_screen_rates_ensure_locked(void)
 	}
 	r.count = 0;
 	(void)EnumDisplayMonitors(nullptr, nullptr, svc_screen_rates_enum_cb, (LPARAM)&r);
+
+	// Which adapter scans each monitor out: the active display paths' source
+	// adapter, joined by GDI device name. A monitor left at 0 is "unknown",
+	// which the gate treats as another adapter (it keeps the primary's rate).
+	UINT32 path_count = 0;
+	UINT32 mode_count = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) == ERROR_SUCCESS &&
+	    path_count > 0) {
+		std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+		std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count > 0 ? mode_count : 1);
+		if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(),
+		                       nullptr) == ERROR_SUCCESS) {
+			for (UINT32 pi = 0; pi < path_count; pi++) {
+				DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+				sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+				sn.header.size = sizeof(sn);
+				sn.header.adapterId = paths[pi].sourceInfo.adapterId;
+				sn.header.id = paths[pi].sourceInfo.id;
+				if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) {
+					continue;
+				}
+				const LUID a = paths[pi].sourceInfo.adapterId;
+				for (uint32_t i = 0; i < r.count; i++) {
+					if (wcsncmp(r.device[i], sn.viewGdiDeviceName, CCHDEVICENAME) == 0) {
+						r.luid[i] =
+						    ((uint64_t)(uint32_t)a.HighPart << 32) | (uint64_t)a.LowPart;
+					}
+				}
+			}
+		}
+	}
 	r.valid = true; // an empty answer is cached too: every window then keeps today's period
+}
+
+//! The adapter @p dev lives on (packed LUID, 0 = unknown). Caller holds the
+//! rates mutex; cached per device (the output device is process-latched).
+static uint64_t
+svc_screen_rates_device_luid_locked(ID3D11Device *dev)
+{
+	svc_screen_rates &r = g_svc_screen_rates;
+	if (dev == nullptr) {
+		return 0;
+	}
+	if (r.luid_device == dev) {
+		return r.device_luid;
+	}
+	uint64_t packed = 0;
+	wil::com_ptr<IDXGIDevice> dxgi_dev;
+	wil::com_ptr<IDXGIAdapter> adapter;
+	DXGI_ADAPTER_DESC desc = {};
+	if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+	    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(&desc))) {
+		packed = ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32) | (uint64_t)desc.AdapterLuid.LowPart;
+	}
+	r.luid_device = dev;
+	r.device_luid = packed;
+	return packed;
 }
 
 //! The display re-probe: re-read every monitor's rate on next use.
@@ -9200,15 +9276,21 @@ svc_screen_rates_invalidate(void)
 	g_svc_screen_rates.valid = false;
 }
 
-//! A copy of the monitors and their rates (for a segment frame). Returns the count.
+//! A copy of the monitors and their rates for a segment frame, each rate
+//! already gated against @p dev (the segment DPs' device): a monitor scanned
+//! out by another adapter carries @p primary_hz. Returns the count.
 static uint32_t
-svc_screen_rates_copy(struct comp_segments_screen *out_screens, float *out_hz)
+svc_screen_rates_copy(ID3D11Device *dev, float primary_hz, struct comp_segments_screen *out_screens, float *out_hz)
 {
 	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
 	svc_screen_rates_ensure_locked();
+	const uint64_t dev_luid = svc_screen_rates_device_luid_locked(dev);
 	const uint32_t n = g_svc_screen_rates.count;
 	memcpy(out_screens, g_svc_screen_rates.screens, sizeof(out_screens[0]) * n);
-	memcpy(out_hz, g_svc_screen_rates.hz, sizeof(out_hz[0]) * n);
+	for (uint32_t i = 0; i < n; i++) {
+		out_hz[i] = comp_segments_gated_refresh_hz(g_svc_screen_rates.hz[i], g_svc_screen_rates.luid[i],
+		                                           dev_luid, primary_hz, nullptr);
+	}
 	return n;
 }
 
@@ -9219,9 +9301,10 @@ svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out);
 //! The rate a window is paced at: its majority screen's; `sys->refresh_rate`
 //! when that is the primary, unknown, or the window cannot be read.
 static float
-svc_window_refresh_hz(struct d3d11_service_system *sys, HWND hwnd, uint64_t *out_monitor)
+svc_window_refresh_hz(struct d3d11_service_system *sys, HWND hwnd, uint64_t *out_monitor, bool *out_other_adapter)
 {
 	*out_monitor = 0;
+	*out_other_adapter = false;
 	struct comp_seg_rect win = {};
 	if (hwnd == nullptr || !svc_seg_window_rect(hwnd, &win)) {
 		return sys->refresh_rate;
@@ -9229,10 +9312,17 @@ svc_window_refresh_hz(struct d3d11_service_system *sys, HWND hwnd, uint64_t *out
 	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
 	svc_screen_rates_ensure_locked();
 	uint32_t idx = UINT32_MAX;
-	const float hz = comp_segments_window_refresh_hz(&win, g_svc_screen_rates.screens, g_svc_screen_rates.hz,
-	                                                 g_svc_screen_rates.count, sys->refresh_rate, &idx);
+	float hz = comp_segments_window_refresh_hz(&win, g_svc_screen_rates.screens, g_svc_screen_rates.hz,
+	                                           g_svc_screen_rates.count, sys->refresh_rate, &idx);
 	if (idx != UINT32_MAX) {
 		*out_monitor = g_svc_screen_rates.screens[idx].id;
+		if (!g_svc_screen_rates.screens[idx].is_primary) {
+			// The gate: the chain lives on the output device (APP_HWND chains
+			// are made on svc_out_device).
+			hz = comp_segments_gated_refresh_hz(hz, g_svc_screen_rates.luid[idx],
+			                                    svc_screen_rates_device_luid_locked(svc_out_device(sys)),
+			                                    sys->refresh_rate, out_other_adapter);
+		}
 	}
 	return hz;
 }
@@ -9257,8 +9347,19 @@ svc_client_update_screen_hz(struct d3d11_service_system *sys, struct d3d11_servi
 {
 	float hz = sys->refresh_rate;
 	uint64_t mon = 0;
+	bool other_adapter = false;
 	if (!sys->workspace_mode && c->presenter == PRESENTER_APP_HWND) {
-		hz = svc_window_refresh_hz(sys, c->render.hwnd, &mon);
+		hz = svc_window_refresh_hz(sys, c->render.hwnd, &mon, &other_adapter);
+	}
+	const uint64_t gated = other_adapter ? mon : 0;
+	if (gated != c->screen_gated_monitor) {
+		c->screen_gated_monitor = gated;
+		if (gated != 0) {
+			U_LOG_W(
+			    "pipeline: client %p (pid %ld) — screen 0x%llx is on another adapter — paced at the "
+			    "primary's %.2f Hz until the per-screen output adapter (phase B, ADR-047 Amendment 9)",
+			    (void *)c, c->client_pid, (unsigned long long)gated, sys->refresh_rate);
+		}
 	}
 	const float stored = c->screen_hz.exchange(hz, std::memory_order_relaxed);
 	const float was = stored > 0.0f ? stored : sys->refresh_rate;
@@ -14995,7 +15096,7 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	// #2245: every segment DP paced at its own screen's period.
 	struct comp_segments_screen rate_screens[COMP_SEGMENTS_MAX_SCREENS];
 	float rate_hz[COMP_SEGMENTS_MAX_SCREENS];
-	sf.rate_count = svc_screen_rates_copy(rate_screens, rate_hz);
+	sf.rate_count = svc_screen_rates_copy(dev, sys->refresh_rate, rate_screens, rate_hz);
 	sf.rate_screens = rate_screens;
 	sf.rate_hz = rate_hz;
 	comp_d3d11_segments_record(fc->segments, &sf);

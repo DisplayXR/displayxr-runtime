@@ -1439,3 +1439,25 @@ TEST_CASE("comp_segments: a registry screen finds its monitor's refresh rate by 
 	CHECK(comp_segments_screen_refresh_hz(&left, mon, unknown, 2) == 0.0f);
 	CHECK(comp_segments_screen_refresh_hz(&left, mon, nullptr, 2) == 0.0f);
 }
+
+TEST_CASE("comp_segments: a screen's own rate only on the chain's own adapter (#2245 gate)", "[comp_segments]")
+{
+	const uint64_t igpu = 0x0000000100001234ull;
+	const uint64_t dgpu = 0x0000000100005678ull;
+	bool other = true;
+	// Same adapter: the screen's own rate.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, &other) == 165.0f);
+	CHECK_FALSE(other);
+	// Another adapter: the primary's, flagged for the caller's log.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, igpu, 60.0f, &other) == 60.0f);
+	CHECK(other);
+	// Unknown adapter on either side: the primary's, not flagged.
+	CHECK(comp_segments_gated_refresh_hz(165.0f, 0, igpu, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, 0, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	// Unknown rate on the right adapter: the primary's.
+	CHECK(comp_segments_gated_refresh_hz(0.0f, dgpu, dgpu, 60.0f, &other) == 60.0f);
+	CHECK_FALSE(other);
+	CHECK(comp_segments_gated_refresh_hz(165.0f, dgpu, dgpu, 60.0f, nullptr) == 165.0f);
+}

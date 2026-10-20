@@ -723,6 +723,31 @@ comp_segments_window_refresh_hz(const struct comp_seg_rect *window_desktop,
                                 uint32_t *out_screen_index);
 
 /*!
+ * #2245 (ADR-047 Amendment 9, the phase-A adapter gate): may a window or a
+ * segment be paced at its screen's own rate? Only when that screen is scanned
+ * out by the SAME adapter the presenting chain (or the segment DP's device)
+ * lives on. Until each screen has its own output adapter (phase B), a screen
+ * scanned out by another adapter is reached through a cross-adapter copy and
+ * a DWM composition, so pacing it faster than the primary is wasted work.
+ *
+ * @param screen_hz            The screen's current rate (0 = unknown).
+ * @param screen_adapter_luid  The adapter scanning that screen out (packed LUID, 0 = unknown).
+ * @param chain_adapter_luid   The adapter the chain / DP device lives on (packed LUID, 0 = unknown).
+ * @param primary_hz           Today's (the primary's) rate.
+ * @param[out] out_other_adapter  Optional: true when both adapters are known
+ *                             and differ — the case the caller logs.
+ * @return @p screen_hz when the adapters are known and equal and the rate is
+ *         known; @p primary_hz otherwise (an unknown adapter is not proof of
+ *         a local present).
+ */
+float
+comp_segments_gated_refresh_hz(float screen_hz,
+                               uint64_t screen_adapter_luid,
+                               uint64_t chain_adapter_luid,
+                               float primary_hz,
+                               bool *out_other_adapter);
+
+/*!
  * #2245: the refresh rate of the screen in @p screens whose desktop rect holds
  * the centre of @p screen_desktop — how a registry screen (a segment's) finds
  * its OS monitor's rate. 0 when none holds it or its rate is unknown.

@@ -550,11 +550,22 @@ and DWM composes its present instead of flipping it (#2245 has the measurement).
    adapter.
 3. **The primary screen is unchanged byte for byte.** A window wholly on the primary screen gets
    exactly today's period (the value read at create, not a re-read), device, egress ring and DP.
-4. **Rates are read from the OS, cached, and re-read on a display change.** The cache is dropped on
+4. **Until a screen has its own output adapter, its own rate needs the chain's adapter.** A
+   window (or segment) is paced at its screen's own rate only when that screen is scanned out by
+   the adapter its presenting chain (or segment DP device) lives on — the monitor's adapter LUID
+   from `QueryDisplayConfig`'s active path, compared with the device's. Otherwise it keeps the
+   primary's period: the frame still crosses adapters and DWM composes it, so pacing it faster is
+   wasted work. One WARN per transition says so ("screen 0x… is on another adapter — paced at
+   the primary's … Hz until the per-screen output adapter (phase B)"). An unknown adapter on
+   either side counts as "another". Phase B removes the gate's reason for most screens.
+5. **Rates are read from the OS, cached, and re-read on a display change.** The cache is dropped on
    the service's display re-probe (`WM_DISPLAYCHANGE` → `ipc_server_request_display_reprobe` →
    `comp_d3d11_service_refresh_segment_screens`), which also covers a rate-only mode change.
 
 ### Phases
+
+Order: A, then C's period half (the #2245 measurement is an in-process app), then B, then C's
+adapter half.
 
 - **Phase A — per-screen frame period (D3D11 service: direct pipeline and segment DPs).** The
   period handed to the session DP, the commit backpressure and the predicted display period follow
@@ -562,11 +573,13 @@ and DWM composes its present instead of flipping it (#2245 has the measurement).
   period and an unknown residual (0, the DP's heuristic — the residual measured on the presenting
   chain describes the primary's scanout, not that screen's). A client that segments keeps the
   primary's period on the session DP, because under segmentation the session DP weaves only the
-  primary screen's segment. The render loop and the egress ring are untouched — the loop already
-  paces on the presenting chain's waitable — so this phase is separable from B. *Risk:* low. Until
-  B the presenting chain still lives on the primary's adapter, so a client paced faster than that
-  chain can flip has frames composed away by DWM; the render side stays bounded by the chain's
-  waitable. A window whose rect cannot be read falls back to the primary's period, i.e. today.
+  primary screen's segment. Every one of these goes through rule 4's adapter gate
+(`comp_segments_gated_refresh_hz`): on the measured hybrid box, where the service's output
+device is the panel's adapter and the second monitor is on the other one, the window keeps the
+primary's period until B. The render loop and the egress ring are untouched — the loop already
+  paces on the presenting chain's waitable — so this phase is separable from B. *Risk:* low; the
+  gate keeps a screen on another adapter at today's period, and a window whose rect cannot be read
+  falls back to the primary's period, i.e. today.
 - **Phase B — per-screen output adapter (service segment DPs and per-screen presenters).** The
   output side becomes per adapter: one output device, egress ring and fence set per scanout adapter
   in use, created on demand and released with the last segment on it; a segment manager keyed by

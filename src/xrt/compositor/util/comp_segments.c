@@ -715,6 +715,24 @@ comp_segments_window_refresh_hz(const struct comp_seg_rect *window_desktop,
 }
 
 float
+comp_segments_gated_refresh_hz(float screen_hz,
+                               uint64_t screen_adapter_luid,
+                               uint64_t chain_adapter_luid,
+                               float primary_hz,
+                               bool *out_other_adapter)
+{
+	const bool known = screen_adapter_luid != 0 && chain_adapter_luid != 0;
+	const bool other = known && screen_adapter_luid != chain_adapter_luid;
+	if (out_other_adapter != NULL) {
+		*out_other_adapter = other;
+	}
+	if (!known || other || screen_hz <= 0.0f) {
+		return primary_hz;
+	}
+	return screen_hz;
+}
+
+float
 comp_segments_screen_refresh_hz(const struct comp_seg_rect *screen_desktop,
                                 const struct comp_segments_screen *screens,
                                 const float *screen_hz,
