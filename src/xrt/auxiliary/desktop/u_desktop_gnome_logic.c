@@ -68,13 +68,26 @@ u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore)
 	return U_DESKTOP_PASTE_UNVERIFIED;
 }
 
+enum u_desktop_clip_end
+u_desktop_clip_end_decide(bool changed_hands, bool owner, bool have_prev)
+{
+	if (!owner) {
+		return U_DESKTOP_CLIP_END_LEAVE; // someone else's (the user's), or nobody's
+	}
+	if (changed_hands || !have_prev) {
+		return U_DESKTOP_CLIP_END_RELEASE; // never the old text over a user copy; never owned + empty
+	}
+	return U_DESKTOP_CLIP_END_RESTORE;
+}
+
 enum u_desktop_result
 u_desktop_paste_result(enum u_desktop_paste_verdict v)
 {
 	switch (v) {
 	case U_DESKTOP_PASTE_DELIVERED:
 	case U_DESKTOP_PASTE_UNVERIFIED: return U_DESKTOP_OK;
-	case U_DESKTOP_PASTE_CHANGED_HANDS: return U_DESKTOP_ERR_REFUSED;
+	case U_DESKTOP_PASTE_CHANGED_HANDS:
+	case U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED: return U_DESKTOP_ERR_REFUSED;
 	default: return U_DESKTOP_ERR_FAILED;
 	}
 }
@@ -97,6 +110,10 @@ u_desktop_paste_message(enum u_desktop_paste_verdict v)
 		return "the focused window did not ask for the pasted text (does it accept text?)";
 	case U_DESKTOP_PASTE_FIELD_UNCHANGED:
 		return "the focused text field did not change — the paste was not seen to arrive";
+	case U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED:
+		return "the clipboard changed hands (the user copied something) just as the agent's text was "
+		       "being offered — nothing was pasted, but the offer had already replaced what the user "
+		       "copied, which is gone (copy it again); the clipboard was released and is empty";
 	case U_DESKTOP_PASTE_LOST_NOT_SERVED:
 		return "the clipboard changed hands right after the paste keystroke (the user copied something) "
 		       "and the agent's text was never read — whatever the window pasted was the user's "

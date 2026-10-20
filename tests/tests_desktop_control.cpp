@@ -1975,6 +1975,28 @@ TEST_CASE(
 	CHECK_FALSE(restore);
 }
 
+TEST_CASE("gnome_paste: the end of a type never leaves the selection owned and empty", "[desktop][gnome][paste]")
+{
+	// Untouched, a previous text read: offer it again.
+	CHECK(u_desktop_clip_end_decide(false, true, true) == U_DESKTOP_CLIP_END_RESTORE);
+	// Untouched, nothing to restore: release, never sit on it serving nothing.
+	CHECK(u_desktop_clip_end_decide(false, true, false) == U_DESKTOP_CLIP_END_RELEASE);
+	// Changed hands while we still own it (the user's copy landed between
+	// SelectionRead and our SetSelection — re-check 2 N1, 9/185): release; the old
+	// text is never offered over the user's.
+	CHECK(u_desktop_clip_end_decide(true, true, true) == U_DESKTOP_CLIP_END_RELEASE);
+	CHECK(u_desktop_clip_end_decide(true, true, false) == U_DESKTOP_CLIP_END_RELEASE);
+	// Someone else owns it: it is the user's — leave it.
+	CHECK(u_desktop_clip_end_decide(true, false, true) == U_DESKTOP_CLIP_END_LEAVE);
+	CHECK(u_desktop_clip_end_decide(false, false, true) == U_DESKTOP_CLIP_END_LEAVE);
+	CHECK(u_desktop_clip_end_decide(false, false, false) == U_DESKTOP_CLIP_END_LEAVE);
+	// The refusal that replaced the user's copy says so.
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED) == U_DESKTOP_ERR_REFUSED);
+	const std::string m = u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED);
+	CHECK(m.find("gone") != std::string::npos);
+	CHECK(m.find("nothing was pasted") != std::string::npos);
+}
+
 TEST_CASE("gnome_paste: a clipboard-manager read alone is never 'verified'", "[desktop][gnome][paste]")
 {
 	bool restore = false;
@@ -1993,7 +2015,7 @@ TEST_CASE("gnome_paste: a clipboard-manager read alone is never 'verified'", "[d
 	CHECK(decide(false, false, 0, -1, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
 	CHECK(decide(false, false, 0, 0, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
 	// Messages never name text; they are all non-empty except delivered.
-	for (int v = U_DESKTOP_PASTE_UNVERIFIED; v <= U_DESKTOP_PASTE_LOST_NOT_SERVED; v++) {
+	for (int v = U_DESKTOP_PASTE_UNVERIFIED; v <= U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED; v++) {
 		CHECK(std::strlen(u_desktop_paste_message((u_desktop_paste_verdict)v)) > 0);
 	}
 }

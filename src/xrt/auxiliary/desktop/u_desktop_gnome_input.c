@@ -97,7 +97,15 @@ void
 gp_serve_transfer(struct gnome_portal *p, const char *mime, uint32_t serial)
 {
 	bool ok = false;
-	if (p->clip_text != NULL && is_text_mime(mime)) {
+	// Never hand out the agent's text once the selection changed hands during
+	// this type: a read now is of a selection we set over the user's copy
+	// (mutter's clipboard manager keeping a copy of it, typically) — the agent's
+	// text must not become what the clipboard holds after we release it.
+	bool withheld = p->clip_is_paste && p->clip_foreign_gen != p->clip_take_gen;
+	if (withheld) {
+		U_LOG_I("desktop/gnome: not serving the agent's text — the clipboard changed hands");
+	}
+	if (!withheld && p->clip_text != NULL && is_text_mime(mime)) {
 		// SelectionWrite(o session, u serial) -> (h fd)
 		DBusMessage *m = dbus_message_new_method_call(PORTAL_DEST, PORTAL_PATH, CLIP_IFACE, "SelectionWrite");
 		const char *s = p->session;
@@ -586,35 +594,62 @@ clip_changed_hands(const struct gnome_portal *p)
 }
 
 /*!
- * Offer the clipboard text from before the paste again (best effort) — unless
- * the selection changed hands meanwhile: then the user copied something newer,
- * and offering the old text would overwrite it. Either way the agent's text is
+ * Give up the selection: SetSelection with no mime_types (the portal passes
+ * the empty options on; mutter then unsets this session's source — a no-op if
+ * another client already owns the selection). Waits briefly for the portal's
+ * SelectionOwnerChanged, so it is not taken for a user copy by the next type.
+ */
+static void
+clipboard_release(struct gnome_portal *p)
+{
+	p->clip_is_paste = false; // our own release is not a loss of the agent's text
+	free(p->clip_text);
+	p->clip_text = NULL;
+	struct pmsg pm;
+	gp_pmsg_begin(&pm, CLIP_IFACE, "SetSelection", p->session, NULL);
+	struct gdbus_err err;
+	DBusMessage *reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
+	if (reply == NULL) {
+		U_LOG_W("desktop/gnome: releasing the clipboard (SetSelection, no mime types) failed: %s", err.name);
+		return;
+	}
+	dbus_message_unref(reply);
+	uint64_t deadline = gdbus_now_ms() + 100;
+	while (p->clip_owner && gdbus_now_ms() < deadline && p->session_open && !gp_quitting(p)) {
+		gp_pump(p, 10);
+	}
+	gp_pump(p, 0);
+}
+
+/*!
+ * The end of a type for the clipboard (u_desktop_clip_end_decide): offer the
+ * text from before the paste again — unless the selection changed hands at any
+ * time since the type began (the user copied something newer, and the old text
+ * would overwrite it). A selection we still hold but won't restore is RELEASED,
+ * never kept serving nothing (owned and empty). Either way the agent's text is
  * no longer served.
  */
 static void
 clipboard_restore(struct gnome_portal *p)
 {
 	gp_pump(p, 0); // a SelectionOwnerChanged already queued counts
-	if (p->clip_lost || clip_changed_hands(p) || (p->clip_is_paste && !p->clip_owner)) {
-		free(p->clip_prev);
-		p->clip_prev = NULL;
+	bool changed = p->clip_lost || clip_changed_hands(p);
+	enum u_desktop_clip_end end = p->session_open
+	                                  ? u_desktop_clip_end_decide(changed, p->clip_owner, p->clip_prev != NULL)
+	                                  : U_DESKTOP_CLIP_END_LEAVE;
+	char *prev = p->clip_prev;
+	p->clip_prev = NULL;
+	p->clip_lost = false;
+	switch (end) {
+	case U_DESKTOP_CLIP_END_RESTORE: clipboard_offer(p, prev, false); break;
+	case U_DESKTOP_CLIP_END_RELEASE: clipboard_release(p); break;
+	case U_DESKTOP_CLIP_END_LEAVE:
 		free(p->clip_text);
 		p->clip_text = NULL;
 		p->clip_is_paste = false;
-		p->clip_lost = false;
-		return;
+		break;
 	}
-	if (p->session_open && p->clip_prev != NULL) {
-		char *prev = p->clip_prev;
-		p->clip_prev = NULL;
-		clipboard_offer(p, prev, false);
-		free(prev);
-	} else if (p->clip_is_paste) {
-		// Nothing to restore: stop serving the agent's text at least.
-		free(p->clip_text);
-		p->clip_text = NULL;
-		p->clip_is_paste = false;
-	}
+	free(prev);
 }
 
 static enum u_desktop_result
@@ -667,9 +702,17 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 		// The user copied between the read and our SetSelection (or right after
 		// it): too late not to have offered, but never paste and never restore —
 		// the old text would overwrite theirs again.
-		U_LOG_W("desktop/gnome: the clipboard changed hands while taking it — not pasting");
-		clipboard_restore(p);
-		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
+		// Still the owner: the user's copy came BEFORE our SetSelection, which
+		// replaced it — that data is gone (mutter dropped its copy of it for
+		// ours, and we never serve ours now). Not the owner: the user copied
+		// after it and their copy stands.
+		bool replaced = p->clip_owner;
+		U_LOG_W("desktop/gnome: the clipboard changed hands while taking it — not pasting%s",
+		        replaced ? " (our offer replaced the user's copy; releasing)" : "");
+		clipboard_restore(p); // releases a selection we still hold
+		gp_set_msg(c->msg, "%s",
+		           u_desktop_paste_message(replaced ? U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED
+		                                            : U_DESKTOP_PASTE_CHANGED_HANDS));
 		return U_DESKTOP_ERR_REFUSED;
 	}
 	if (!owned) {

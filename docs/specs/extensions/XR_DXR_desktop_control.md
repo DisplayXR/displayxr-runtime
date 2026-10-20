@@ -221,6 +221,15 @@ text is read, through taking the selection, to the moment after Ctrl is down and
 sent. A user who copied anywhere in that span gets their own clipboard left alone (never
 overwritten by the agent's text, nor later by the restored previous text) and the action is
 `REFUSED` ("the clipboard changed hands (the user copied something); nothing was pasted").
+One window is the exception: a copy landing in the ~1.5 ms between reading the previous text and
+the portal applying the agent's `SetSelection` is replaced by that `SetSelection` — the user's
+copied data is gone, and "the clipboard is the user's afterwards" cannot hold. The action is
+still `REFUSED`, its message says the copy is gone and must be made again, the agent's text is
+never handed to any reader, and the selection is released (`SetSelection` with no `mime_types`:
+mutter unsets the session's source), so the clipboard is left empty rather than owned and
+silent. More generally the session never keeps a selection it will not serve: when there is no
+previous text to offer again, it is released too (mutter's own clipboard keeper may then keep the
+agent's text as the clipboard, as it would after the session closes).
 Losing the selection after the paste key completes `RUNTIME_FAILURE` — "… the agent's text was
 never read — whatever the window pasted was the user's clipboard" when the agent's text was
 never served, else "… whether the text arrived is unknown" unless the agent's text was served

@@ -44,6 +44,10 @@ enum u_desktop_paste_verdict
 	//! The user copied after the keystroke and the agent's text was never read:
 	//! the target can only have been handed the user's clipboard.
 	U_DESKTOP_PASTE_LOST_NOT_SERVED,
+	//! The user copied in the ~1.5 ms between reading the previous clipboard and
+	//! our SetSelection: refused, but our SetSelection had already replaced the
+	//! user's copy (gone); the selection is released, the clipboard left empty.
+	U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED,
 };
 
 //! The focused text field seen through AT-SPI: its length, its caret and a hash
@@ -83,6 +87,25 @@ u_desktop_fnv1a(const char *s, size_t len);
  */
 enum u_desktop_paste_verdict
 u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore);
+
+/*!
+ * The end of a type, for the clipboard: offer the previous text again
+ * (RESTORE), RELEASE the selection we still hold (SetSelection with no
+ * mime_types — never sit on it serving nothing: the clipboard would be owned and
+ * empty), or LEAVE it (another client owns it: it is the user's).
+ * @p changed_hands: the selection changed hands at any time since the type began
+ * (clip_lost included); @p owner: this session owns the selection now;
+ * @p have_prev: a previous text was read.
+ */
+enum u_desktop_clip_end
+{
+	U_DESKTOP_CLIP_END_RESTORE = 0,
+	U_DESKTOP_CLIP_END_RELEASE,
+	U_DESKTOP_CLIP_END_LEAVE,
+};
+
+enum u_desktop_clip_end
+u_desktop_clip_end_decide(bool changed_hands, bool owner, bool have_prev);
 
 //! The result code of a verdict (existing codes only).
 enum u_desktop_result
