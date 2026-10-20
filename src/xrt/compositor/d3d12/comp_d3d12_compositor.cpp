@@ -3991,8 +3991,7 @@ d3d12_projection_layer_view_count(const struct comp_layer_accum *layers)
  * twin of the D3D11 compositor's pre-split gate — only off the zero-copy path
  * (the atlas must be ours to crop: a repaint is never armed on it), off the
  * #1264 reroute (the d3d11 fill arm owns the weave there and segments with its
- * own manager, comp_vk_split), for a whole-window canvas (a zones / Local2D
- * frame keeps the single-DP path) and while the back buffer matches the client
+ * own manager, comp_vk_split) and while the back buffer matches the client
  * area (the segment rects are window px). A window on the primary screen only
  * stays single-DP, byte for byte. Publishes the table it took for the next
  * xrLocateViews (M3). Weave thread, under c->mutex.
@@ -4054,7 +4053,12 @@ d3d12_segments_tick(struct comp_d3d12_compositor *c,
 		if (comp_d3d12_segments_enabled(c->segments)) {
 			const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
 			seg_would_split = comp_d3d12_segments_would_split(c->segments, &win, &canvas);
-			if (atlas_is_ours && !eff_canvas->valid) {
+			// #2218 (#4): a zones / Local2D / explicit-mask frame splits like any
+			// other. Its effective canvas IS the whole client window (the table is
+			// exact), the 2D/3D composite runs on the back buffer after the
+			// per-segment weave exactly as after the single-DP weave, and each
+			// segment DP gets its share of the zone mask (d3d12_sync_zone_mask_to_dp).
+			if (atlas_is_ours) {
 				const uint32_t mode_index = (c->xdev != nullptr && c->xdev->hmd != nullptr)
 				                                ? c->xdev->hmd->active_rendering_mode_index
 				                                : 0;
@@ -8278,6 +8282,9 @@ d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 			xrt_display_processor_d3d12_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
 		}
+		// #2218 (#4): every segment DP too. The manager is created and swapped
+		// on this same (weave) thread, under c->mutex.
+		comp_d3d12_segments_clear_zone_mask(c->segments);
 		return;
 	}
 
@@ -8298,6 +8305,12 @@ d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 	if (ok) {
 		c->zone_published = true;
 	}
+	// #2218 (#4): a window spanning screens: each segment DP gets the mask
+	// cropped to its screen, so a 2D zone on screen B stays 2D there even when
+	// screen A has a 3D zone (the vendor's verdict is per panel). Same
+	// post-fence, PIXEL_SHADER_RESOURCE contract as the primary publish above.
+	comp_d3d12_segments_publish_zone_mask(c->segments, res, mask_w, mask_h, (uint32_t)r.right, (uint32_t)r.bottom,
+	                                      c->zone_publish_seq);
 
 	d3d12_phase_debug_dump(c, "publish_zone_mask");
 }
