@@ -267,6 +267,28 @@ u_desktop_control_state_str(enum u_desktop_control_state s);
 int32_t
 u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason, uint32_t scopes);
 
+/*!
+ * u_desktop_control_request_scopes with an XrDesktopControlParentWindowDXR: the app
+ * window the consent dialog belongs to (@p parent_window NULL or "" = none), handed
+ * to the backend with this request only. VALIDATION_FAILURE when it is not a valid
+ * parent window (u_desktop_parent_window_valid); nothing is asked then.
+ */
+int32_t
+u_desktop_control_request_ex(struct u_desktop_control *c,
+                             const char *reason,
+                             uint32_t scopes,
+                             const char *parent_window);
+
+/*!
+ * True for an acceptable XrDesktopControlParentWindowDXR::parentWindow: NULL, "", or
+ * shorter than U_DESKTOP_PARENT_WINDOW_SIZE and either "wayland:" + a non-empty
+ * handle of printable, non-space ASCII, or "x11:" + 1–16 hex digits (an optional
+ * "0x" tolerated) — the xdg-desktop-portal parent_window forms. Anything else is
+ * refused, never passed on.
+ */
+bool
+u_desktop_parent_window_valid(const char *parent_window);
+
 //! The CAPTURE scope's state (§3 re-evaluated now for that scope; a change fires
 //! capture_state_changed). Never gated.
 enum u_desktop_control_state

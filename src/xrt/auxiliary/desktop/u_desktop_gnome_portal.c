@@ -865,7 +865,9 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	// Start — the dialog (or a silent restore).
 	next_token(p, token, sizeof(token));
 	expect_response(p, token);
-	gp_pmsg_begin(&pm, RD_IFACE, "Start", p->session, "");
+	// parent_window ("" = none): GNOME opens the dialog on the app's window; a handle
+	// it cannot resolve (a stale xdg-foreign export) is logged and ignored there.
+	gp_pmsg_begin(&pm, RD_IFACE, "Start", p->session, p->parent_window);
 	dict_add_str(&pm.dict, "handle_token", token);
 	reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
 	if (reply == NULL) {
@@ -1002,6 +1004,7 @@ static enum u_desktop_result
 cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 {
 	enum u_desktop_access acc;
+	snprintf(p->parent_window, sizeof(p->parent_window), "%s", c->parent_window);
 	pthread_mutex_lock(&p->lock);
 	bool already = gp_cap_control_granted_locked(p) || p->consent_only_granted;
 	pthread_mutex_unlock(&p->lock);
@@ -1364,13 +1367,14 @@ gnome_portal_access(struct gnome_portal *p)
 }
 
 void
-gnome_portal_request(struct gnome_portal *p, u_desktop_access_done_fn done, void *ctx)
+gnome_portal_request(struct gnome_portal *p, const char *parent_window, u_desktop_access_done_fn done, void *ctx)
 {
 	struct gp_cmd *c = gp_cmd_new(cmd_request);
 	if (c == NULL) {
 		done(ctx, U_DESKTOP_ACCESS_DENIED);
 		return;
 	}
+	snprintf(c->parent_window, sizeof(c->parent_window), "%s", parent_window != NULL ? parent_window : "");
 	c->async = true;
 	c->done = done;
 	c->done_ctx = ctx;

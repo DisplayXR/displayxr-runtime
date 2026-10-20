@@ -19,6 +19,8 @@
  *
  * Spec v2 (screen capture):
  *   desktop_control_probe request-scopes control|capture|all[+again] [reason...]
+ *   (request and request-scopes take --parent=HANDLE: the consent dialog's parent
+ *    window, "wayland:<xdg-foreign handle>" or "x11:<hex XID>" — GNOME opens it there)
  *   desktop_control_probe capture-state
  *   desktop_control_probe capture desktop|region X Y W H|window ID [max=WxH] [--save FILE.png]
  *                         waits for the completion event, fetches the image and prints its
@@ -37,6 +39,8 @@
  *   expect RESULT               fail unless the last act ended with RESULT
  *                               (XR_SUCCESS, XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR, ...)
  *   expect-text X Y "TEXT"      fail unless the text at X Y is TEXT
+ *   expect-rejected request...  fail unless that request / request-scopes is
+ *                               XR_ERROR_VALIDATION_FAILURE (e.g. a bad --parent=)
  *   expect-capture-state STATE  fail unless xrGetDesktopCaptureStateDXR says STATE
  *   expect-capture RESULT [WxH] fail unless the last capture ended with RESULT (and size)
  *   expect-desktop-pixel X Y R G B A
@@ -556,8 +560,27 @@ cmd_capture(const std::vector<std::string> &args)
 int run_line(const std::string &line);
 
 int
-run_command(const std::vector<std::string> &args)
+run_command(const std::vector<std::string> &all_args)
 {
+	// request / request-scopes: `--parent=HANDLE` (anywhere) chains an
+	// XrDesktopControlParentWindowDXR — "wayland:<handle>", "x11:<hex>", or "" (empty).
+	std::vector<std::string> args;
+	std::string parent;
+	bool have_parent = false;
+	bool is_request = !all_args.empty() && (all_args[0] == "request" || all_args[0] == "request-scopes");
+	for (const std::string &a : all_args) {
+		if (is_request && a.rfind("--parent=", 0) == 0) {
+			parent = a.substr(9);
+			have_parent = true;
+		} else {
+			args.push_back(a);
+		}
+	}
+	if (args.empty()) {
+		return 0;
+	}
+	XrDesktopControlParentWindowDXR pw = {XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR};
+	pw.parentWindow = parent.c_str();
 	const std::string &c = args[0];
 	if (c == "state") {
 		XrDesktopControlCapabilityFlagsDXR caps = 0;
@@ -572,8 +595,10 @@ run_command(const std::vector<std::string> &args)
 			reason += (i > 1 ? " " : "") + args[i];
 		}
 		XrDesktopControlRequestInfoDXR info = {XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR};
+		info.next = have_parent ? &pw : nullptr;
 		info.reason = reason.c_str();
-		XrResult r = pRequest(g_session, reason.empty() ? nullptr : &info);
+		XrResult r = pRequest(g_session, reason.empty() && !have_parent ? nullptr : &info);
+		g_last_act = r;
 		printf("request: %s\n", result_name(r).c_str());
 		if (XR_FAILED(r)) {
 			return 1;
@@ -666,9 +691,11 @@ run_command(const std::vector<std::string> &args)
 			reason += (i > 2 ? " " : "") + args[i];
 		}
 		XrDesktopControlRequestInfoDXR info = {XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR};
+		sc.next = have_parent ? &pw : nullptr;
 		info.next = &sc;
 		info.reason = reason.empty() ? nullptr : reason.c_str();
 		XrResult r = pRequest(g_session, &info);
+		g_last_act = r;
 		printf("request-scopes: %s\n", result_name(r).c_str());
 		if (XR_FAILED(r)) {
 			return 1;
@@ -773,6 +800,17 @@ run_command(const std::vector<std::string> &args)
 		bool ok = args.size() > 1 && args[1] == result_name(g_last_act);
 		printf("expect %s: %s (was %s)\n", args.size() > 1 ? args[1].c_str() : "?", ok ? "PASS" : "FAIL",
 		       result_name(g_last_act).c_str());
+		return ok ? 0 : 1;
+	}
+	if (c == "expect-rejected") {
+		// expect-rejected <request|request-scopes ...>: the call must fail validation.
+		std::vector<std::string> rest(args.begin() + 1, args.end());
+		g_last_act = XR_SUCCESS;
+		if (!rest.empty() && (rest[0] == "request" || rest[0] == "request-scopes")) {
+			(void)run_command(rest);
+		}
+		bool ok = g_last_act == XR_ERROR_VALIDATION_FAILURE;
+		printf("expect-rejected: %s (was %s)\n", ok ? "PASS" : "FAIL", result_name(g_last_act).c_str());
 		return ok ? 0 : 1;
 	}
 	if (c == "expect-text") {
@@ -902,6 +940,7 @@ main(int argc, char **argv)
 		        "usage: desktop_control_probe state | request [reason] | list | pointer | pick X Y |\n"
 		        "       text X Y | act TYPE key=value... | script FILE |\n"
 		        "       request-scopes control|capture|all [reason] | capture-state |\n"
+		        "       (request / request-scopes: --parent=wayland:HANDLE|x11:HEX) |\n"
 		        "       capture desktop|region X Y W H|window ID [max=WxH] [--save FILE.png]\n");
 		return 2;
 	}

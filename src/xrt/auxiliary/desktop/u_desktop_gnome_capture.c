@@ -769,7 +769,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 
 	gp_next_token(p, token, sizeof(token));
 	gp_expect_response(p, token);
-	gp_pmsg_begin(&pm, GP_SC_IFACE, "Start", p->session, "");
+	gp_pmsg_begin(&pm, GP_SC_IFACE, "Start", p->session, p->parent_window); // see open_session
 	gp_dict_add_str(&pm.dict, "handle_token", token);
 	reply = gp_pmsg_send(p, &pm, CALL_TIMEOUT_MS, &err);
 	if (reply == NULL) {
@@ -844,6 +844,7 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 {
 	struct scopes_req *req = (struct scopes_req *)c->done_ctx;
 	c->done = NULL; // answered here, never by the drain
+	snprintf(p->parent_window, sizeof(p->parent_window), "%s", c->parent_window);
 	c->async = true;
 	uint32_t scopes = req->scopes;
 	bool want_ctl = (scopes & U_DESKTOP_SCOPE_CONTROL) != 0;
@@ -1014,7 +1015,7 @@ gnome_request_scopes(struct u_desktop_backend *b,
                      u_desktop_scopes_done_fn done,
                      void *ctx)
 {
-	(void)app; // the portal names the app by its app id
+	// The portal names the app by its app id; only the dialog's parent window is used.
 	struct gnome_portal *p = gnome(b)->portal;
 	struct scopes_req *req = calloc(1, sizeof(*req));
 	struct gp_cmd *c = p != NULL ? gp_cmd_new(cmd_request_scopes) : NULL;
@@ -1031,6 +1032,8 @@ gnome_request_scopes(struct u_desktop_backend *b,
 	req->scopes = scopes & (U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE);
 	c->done = scopes_tramp;
 	c->done_ctx = req;
+	snprintf(c->parent_window, sizeof(c->parent_window), "%s",
+	         app != NULL && app->parent_window != NULL ? app->parent_window : "");
 	pthread_mutex_lock(&p->lock);
 	if ((scopes & U_DESKTOP_SCOPE_CONTROL) != 0) {
 		p->pending = true;

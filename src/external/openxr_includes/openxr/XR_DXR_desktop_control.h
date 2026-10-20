@@ -79,6 +79,8 @@ extern "C" {
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR     ((XrStructureType)1004999407)
 #define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR            ((XrStructureType)1004999408)
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
+// Spec version 2, continued in a fresh decade (400–409 is full).
+#define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR            ((XrStructureType)1004999420)
 
 //! The operation is refused by the safety layer (lock screen, kill switch, the
 //! user is typing and the wait timed out, target verification failed). The
@@ -92,6 +94,8 @@ extern "C" {
 #define XR_MAX_DESKTOP_APP_ID_SIZE_DXR 128
 #define XR_MAX_DESKTOP_TITLE_SIZE_DXR 256
 #define XR_MAX_DESKTOP_MESSAGE_SIZE_DXR 256
+//! Spec version 2: XrDesktopControlParentWindowDXR::parentWindow, terminator included.
+#define XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR 256
 
 /*!
  * Where the app stands with desktop control. Only GRANTED allows operations.
@@ -235,7 +239,8 @@ typedef struct XrDesktopActionDXR {
  * Optional argument of xrRequestDesktopControlDXR (pass NULL for none). `reason` is
  * shown to the user in the DisplayXR prompt where DisplayXR draws one (Windows) and
  * written to the audit log. Spec version 2: `next` may carry an
- * XrDesktopControlRequestScopeDXR (other structures in the chain are ignored).
+ * XrDesktopControlRequestScopeDXR and an XrDesktopControlParentWindowDXR (other
+ * structures in the chain are ignored).
  */
 typedef struct XrDesktopControlRequestInfoDXR {
     XrStructureType            type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR
@@ -256,6 +261,28 @@ typedef struct XrDesktopControlRequestScopeDXR {
     const void* XR_MAY_ALIAS       next;
     XrDesktopControlScopeFlagsDXR  scopes; //!< at least one scope bit; known bits only
 } XrDesktopControlRequestScopeDXR;
+
+/*!
+ * Spec version 2. Chained on XrDesktopControlRequestInfoDXR::next: the app window the
+ * OS consent dialog belongs to, so the OS can open it on top of that window instead of
+ * wherever new windows land (possibly behind the app). Optional; absent, NULL or "" =
+ * no parent. Purely a placement hint: it never changes what is asked or granted, and a
+ * handle the OS cannot resolve (a stale export) is ignored by the OS, not an error.
+ *
+ * Format: the xdg-desktop-portal "parent_window" string convention, verbatim —
+ * "wayland:<handle>" (a handle from the xdg-foreign protocol's zxdg_exporter_v2 export
+ * of the app's toplevel) or "x11:<XID in hexadecimal>". At most
+ * XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR - 1 bytes; anything else, including another
+ * prefix, is XR_ERROR_VALIDATION_FAILURE. Used on GNOME / KDE (the RemoteDesktop and
+ * ScreenCast portals' Start). Ignored elsewhere: the macOS prompt is System Settings and
+ * the Windows prompt is DisplayXR's own; a platform handle format for them is reserved
+ * for a later revision, and until then any other prefix is refused, never ignored.
+ */
+typedef struct XrDesktopControlParentWindowDXR {
+    XrStructureType            type;         //!< XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR
+    const void* XR_MAY_ALIAS   next;
+    const char*                parentWindow; //!< e.g. "wayland:A1b2…" or "x11:4a00007"; NULL / "" = none
+} XrDesktopControlParentWindowDXR;
 
 //! Spec version 2: what xrCaptureDesktopDXR captures.
 typedef enum XrDesktopCaptureTargetDXR {

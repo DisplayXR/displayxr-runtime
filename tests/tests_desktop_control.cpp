@@ -2452,6 +2452,75 @@ TEST_CASE("capture_scope: CAPTURE works without CONTROL; one prompt for both; GR
 	}
 }
 
+TEST_CASE("parent_window: the xdg-desktop-portal forms only", "[desktop][capture]")
+{
+	CHECK(u_desktop_parent_window_valid(nullptr));
+	CHECK(u_desktop_parent_window_valid(""));
+	CHECK(u_desktop_parent_window_valid("x11:4a00007"));
+	CHECK(u_desktop_parent_window_valid("x11:0x4A00007"));
+	CHECK(u_desktop_parent_window_valid("wayland:0a1b2c3d-handle_XYZ"));
+	CHECK_FALSE(u_desktop_parent_window_valid("x11:"));
+	CHECK_FALSE(u_desktop_parent_window_valid("x11:0x"));
+	CHECK_FALSE(u_desktop_parent_window_valid("x11:4a0000g"));
+	CHECK_FALSE(u_desktop_parent_window_valid("x11:12345678901234567")); // 17 digits
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:"));
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:has space"));
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:new\nline"));
+	CHECK_FALSE(u_desktop_parent_window_valid("4a00007"));
+	CHECK_FALSE(u_desktop_parent_window_valid("X11:4a00007"));
+	CHECK_FALSE(u_desktop_parent_window_valid("hwnd:1234")); // reserved, not invented
+	std::string longest = "wayland:" + std::string(U_DESKTOP_PARENT_WINDOW_SIZE - 1 - 8, 'a');
+	CHECK(u_desktop_parent_window_valid(longest.c_str()));
+	std::string too_long = longest + "a";
+	CHECK_FALSE(u_desktop_parent_window_valid(too_long.c_str()));
+}
+
+TEST_CASE("parent_window: passed to the backend with its request, absent -> \"\"", "[desktop][capture]")
+{
+	TempDir dir;
+	Harness h;
+	char pw[U_DESKTOP_PARENT_WINDOW_SIZE];
+	SECTION("CONTROL alone (request_access)")
+	{
+		REQUIRE(u_desktop_control_request_ex(h.c, nullptr, U_DESKTOP_SCOPE_CONTROL, "x11:4a00007") ==
+		        U_DESKTOP_XR_SUCCESS);
+		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+		CHECK(u_desktop_fake_last_parent_window(h.fake, pw, sizeof(pw)));
+		CHECK(std::string(pw) == "x11:4a00007");
+	}
+	SECTION("CAPTURE (request_scopes)")
+	{
+		REQUIRE(u_desktop_control_request_ex(h.c, "tests", U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE,
+		                                     "wayland:abc-123") == U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) ==
+		      (U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE));
+		CHECK(u_desktop_fake_last_parent_window(h.fake, pw, sizeof(pw)));
+		CHECK(std::string(pw) == "wayland:abc-123");
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
+	}
+	SECTION("absent: the backend gets \"\", never NULL; a later request does not inherit")
+	{
+		REQUIRE(u_desktop_control_request_ex(h.c, nullptr, U_DESKTOP_SCOPE_CONTROL, "x11:1") ==
+		        U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) ==
+		        U_DESKTOP_XR_SUCCESS);
+		CHECK(u_desktop_fake_last_request_scopes(h.fake, nullptr) == U_DESKTOP_SCOPE_CAPTURE);
+		CHECK(u_desktop_fake_last_parent_window(h.fake, pw, sizeof(pw)));
+		CHECK(std::string(pw).empty());
+	}
+	SECTION("invalid: VALIDATION_FAILURE, nothing asked")
+	{
+		uint32_t before = u_desktop_fake_request_count(h.fake);
+		CHECK(u_desktop_control_request_ex(h.c, nullptr, U_DESKTOP_SCOPE_CONTROL, "bogus:1") ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_control_request_ex(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE, "wayland:") ==
+		      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+		CHECK(u_desktop_fake_request_count(h.fake) == before);
+		CHECK(h.state() == U_DESKTOP_STATE_NOT_REQUESTED);
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_NOT_REQUESTED);
+	}
+}
+
 TEST_CASE("capture_scope: no capture capability -> UNSUPPORTED and FEATURE_UNSUPPORTED", "[desktop][capture]")
 {
 	TempDir dir;

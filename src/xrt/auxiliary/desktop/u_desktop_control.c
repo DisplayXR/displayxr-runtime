@@ -24,6 +24,7 @@
 #include "os/os_time.h"
 #include "util/u_logging.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -677,13 +678,60 @@ blocks_request(enum reason why)
 	       why == R_STORE_DENY || why == R_LOCKED;
 }
 
+bool
+u_desktop_parent_window_valid(const char *pw)
+{
+	if (pw == NULL || pw[0] == '\0') {
+		return true;
+	}
+	size_t n = strnlen(pw, U_DESKTOP_PARENT_WINDOW_SIZE);
+	if (n >= U_DESKTOP_PARENT_WINDOW_SIZE) {
+		return false;
+	}
+	if (strncmp(pw, "wayland:", 8) == 0) {
+		const char *h = pw + 8;
+		if (*h == '\0') {
+			return false;
+		}
+		for (; *h != '\0'; h++) {
+			if ((unsigned char)*h <= 0x20 || (unsigned char)*h >= 0x7f) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (strncmp(pw, "x11:", 4) == 0) {
+		const char *h = pw + 4;
+		if (h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) {
+			h += 2;
+		}
+		size_t digits = 0;
+		for (; *h != '\0'; h++, digits++) {
+			if (!isxdigit((unsigned char)*h)) {
+				return false;
+			}
+		}
+		return digits >= 1 && digits <= 16;
+	}
+	return false;
+}
+
 int32_t
 u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason, uint32_t scopes)
+{
+	return u_desktop_control_request_ex(c, reason, scopes, NULL);
+}
+
+int32_t
+u_desktop_control_request_ex(struct u_desktop_control *c,
+                             const char *reason,
+                             uint32_t scopes,
+                             const char *parent_window)
 {
 	const uint32_t known = U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
 	bool reask = (scopes & U_DESKTOP_SCOPE_REASK) != 0;
 	scopes &= ~(uint32_t)U_DESKTOP_SCOPE_REASK;
-	if (scopes == 0 || (scopes & ~known) != 0) {
+	if (scopes == 0 || (scopes & ~known) != 0 || !u_desktop_parent_window_valid(parent_window)) {
 		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
 	}
 	probe_locked(c); // row 5 needs a fresh answer: a locked session is never prompted
@@ -780,7 +828,7 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 	t->rq = rq;
 	t->asked = ask;
 
-	struct u_desktop_app_info app = {c->exe, c->name, reason};
+	struct u_desktop_app_info app = {c->exe, c->name, reason, parent_window != NULL ? parent_window : ""};
 	// Either may call the done function before returning.
 	if (via_scopes) {
 		b->request_scopes(b, &app, ask | (reask ? (uint32_t)U_DESKTOP_SCOPE_REASK : 0u), request_scopes_done,

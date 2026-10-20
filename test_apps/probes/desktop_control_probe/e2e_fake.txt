@@ -66,7 +66,11 @@ expect XR_SUCCESS
 expect-capture-state NOT_REQUESTED
 capture desktop
 expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
-request-scopes capture so the probe can see your screen
+# the consent dialog's parent window (xdg-desktop-portal form); anything else is refused
+expect-rejected request-scopes capture --parent=hwnd:1234 so the probe can see your screen
+expect-rejected request-scopes capture --parent=wayland: so the probe can see your screen
+expect-capture-state NOT_REQUESTED
+request-scopes capture --parent=x11:4a00007 so the probe can see your screen
 expect-capture-state GRANTED
 expect-state GRANTED
 capture desktop max=960x960

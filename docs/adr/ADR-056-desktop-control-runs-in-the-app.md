@@ -255,6 +255,12 @@ response says what was granted (`devices`, `streams`), so `CONTROL` can be `DENI
 `CAPTURE` is `GRANTED`, and a region outside the shared monitors comes back as alpha 0 or is
 refused.
 
+**The dialog opens on the app's window.** A request may name the app window the consent
+dialog belongs to (`XrDesktopControlParentWindowDXR`, decision 9). On GNOME it is the portal's
+`parent_window`, so the dialog opens centred on and modal to that window. Without it the
+dialog opens wherever new windows land, which for an agent app that is fullscreen or kept on
+top can be behind it, and the user never sees the question (seen on a Lenovo user's machine).
+
 **Honesty about strength.** On Windows, and on macOS once Screen Recording is granted, an app
 could capture through the OS directly. There, the `CAPTURE` scope is a DisplayXR contract, not
 an OS enforcement point, which is the same as v1's Windows prompt. It gives the user a visible
@@ -375,3 +381,16 @@ on 2026-10-19.
    hides `NSWindowSharingNone` windows, and whether macOS 15's periodic "continue to allow
    screen recording" confirmation fires for one-shot stills, are both measured on hardware
    (spec §10.7). The results are recorded in spec §10.4.
+9. **The consent dialog takes a parent window** (DECIDED 2026-10-20, David). A request may
+   chain `XrDesktopControlParentWindowDXR` (structure type 1004999420, the first of a second
+   decade for this extension because 1004999400–409 is full), whose string is the
+   xdg-desktop-portal `parent_window` convention verbatim: `"wayland:<xdg-foreign handle>"` or
+   `"x11:<hex XID>"`, `""` / absent for none. A chained struct keeps
+   `XrDesktopControlRequestInfoDXR`'s layout as in v1. It is a placement hint for that one
+   request: it never changes what is asked or granted, and a handle the OS cannot resolve is
+   the OS's to ignore, never a failure. A malformed string is a validation error. On GNOME it
+   is the `parent_window` argument of `Start`, both the combined `RemoteDesktop.Start` and the
+   standalone `ScreenCast.Start` (the portals take it there, not in `CreateSession`). macOS and
+   Windows ignore it today. A handle form of their own is reserved for a later revision, and
+   until one is specified any other prefix is refused, not ignored. The Unity plug-in gets the
+   string from `displayxr_linux_window_handle` (displayxr-unity#385).
