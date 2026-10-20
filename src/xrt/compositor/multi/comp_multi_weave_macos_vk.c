@@ -24,6 +24,13 @@
  *    comes from the plug-in's Vulkan factory (dp_factory_vk) — sim_display's
  *    anaglyph SPIR-V pipeline runs on MoltenVK.
  *  - Completion is synchronous: vkWaitForFences before the IPC reply.
+ *  - Multi-screen (#2218 item 6): that DP weaves the system-default screen. A
+ *    window not wholly on it is woven per screen — each other screen's part
+ *    by a windowless create_dp_vk_for_screen DP from THAT screen's registry
+ *    claimant, through comp_vk_native_segments (the in-process Vulkan
+ *    compositor's manager, the desktop-Linux engine's too), the window placed
+ *    in the CG frame (util/comp_weave_screens.h). See "Per-screen display
+ *    processors" below.
  */
 
 #include "xrt/xrt_compositor.h"
@@ -38,6 +45,12 @@
 
 #include "comp_multi_private.h"
 #include "comp_multi_weave_macos_backend.h"
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+#include "vk_native/comp_vk_native_segments.h" // #2218 item 6: per-screen DPs
+#include "util/comp_segments.h"
+#include "util/comp_weave_screens.h"
+#endif
 
 #ifdef XRT_OS_MACOS
 
@@ -444,7 +457,9 @@ weave_create_scratch(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    // TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
+	    // segment's views OUT of this atlas, and flat-blits from it.
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
@@ -614,7 +629,8 @@ weave_create_crop(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w,
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    // TRANSFER_SRC: the per-screen crop reads from it (#2218 item 6).
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
@@ -903,11 +919,8 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 
 	// The DP that weaves — same Vulkan plug-in factory family the macOS
 	// shared-surface path drives (sim_display anaglyph runs on MoltenVK).
-	// TODO(#2218 item 6): one DP for the whole window. The desktop-Linux engine
-	// weaves a window per screen with comp_vk_native_segments; the same manager
-	// fits here, but needs the service fed a screen list on macOS and the window
-	// placed in CoreGraphics global points x backing scale (not the Linux
-	// weave-geometry projection, util/comp_weave_screens.h).
+	// It weaves the system-default screen; a window not wholly on that screen
+	// is woven per screen (#2218 item 6, "Per-screen display processors").
 	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 	if (factory == NULL) {
 		U_LOG_E("weave(#759): no Vulkan DP factory — cannot weave");
@@ -927,6 +940,127 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	U_LOG_W("weave(#759): macOS weave engine initialized (BGRA8, synchronous)");
 	return true;
 }
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+/*
+ *
+ * Per-screen display processors (#2218 item 6, ADR-047 D2 / Amendment 4 on the
+ * macOS service).
+ *
+ * A bound window that is not wholly on the system-default screen is woven per
+ * screen, the rule the Windows and desktop-Linux services apply to the same
+ * present-owner: each screen's part (segment = window ∩ screen) by the display
+ * processor of THAT screen — a windowless create_dp_vk_for_screen DP from the
+ * screen's own registry claimant, so a per-screen preference (`dp use <id>
+ * --screen <key>`) decides it — with that screen's present origin, scissored
+ * into the one woven output; the default screen's part by this engine's own DP
+ * (mc->weave.dp), exactly as before (this backend feeds it no phase). A
+ * segment no DP can weave (no claimant, no per-screen factory, or a DP needing
+ * 1:1 pixels on a screen that resamples the window — another backing scale, a
+ * "looks like" mode) and the part of the window on no screen are painted flat.
+ * The manager is comp_vk_native_segments: same table, same DP lifecycle
+ * hysteresis, same crop-before-DP, same flat fill as in-process / Linux.
+ *
+ */
+
+static struct comp_vk_native_segments *
+vkb_segs(struct multi_compositor *mc)
+{
+	return (struct comp_vk_native_segments *)mc->weave.segs;
+}
+
+//! Destroy the manager (its DPs and crop images). Rare: a screen-table change
+//! or teardown — waits the queue idle first (the manager's destroy contract).
+static void
+vkb_segs_release(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.segs != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		struct comp_vk_native_segments *segs = vkb_segs(mc);
+		comp_vk_native_segments_destroy(&segs);
+		mc->weave.segs = NULL;
+	}
+	mc->weave.segs_split = false;
+	mc->weave.segs_logged_key = 0;
+}
+
+/*!
+ * (Re)build the manager when the system's screen table moved (start-up, a
+ * hotplug, a re-claim, a per-screen preference). Built once per generation,
+ * successful or not, so a hopeless table is not retried every frame. A refined
+ * EDID size alone never moves the generation (#2097), so it rebuilds nothing.
+ *
+ * @return true when the manager exists and segments.
+ */
+static bool
+vkb_segs_sync(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	const uint64_t gen = comp_multi_weave_macos_segs_snapshot(mc);
+	if (gen == 0) {
+		return false; // never handed a screen table: the single-DP weave
+	}
+	if (gen != mc->weave.segs_generation) {
+		vkb_segs_release(vk, mc);
+		mc->weave.segs_generation = gen;
+		memset(mc->weave.segs_proj, 0, sizeof(*mc->weave.segs_proj));
+		struct comp_vk_native_segments *segs =
+		    comp_vk_native_segments_create(vk, mc->weave.cmd_pool, VK_NULL_HANDLE /* the DPs see main_queue */);
+		if (segs != NULL) {
+			comp_vk_native_segments_set_screens(segs, mc->weave.segs_list, mc->weave.segs_info, 0);
+		}
+		mc->weave.segs = segs;
+		const bool on = segs != NULL && comp_vk_native_segments_enabled(segs);
+		// Lifecycle: once per screen-table generation, per present-owner.
+		U_LOG_W("weave(#2218): present-owner screen table generation %llu (%u screen(s), vk backend) — %s",
+		        (unsigned long long)gen, mc->weave.segs_list->count,
+		        on ? "a window not wholly on the default screen is woven by each screen's own DP"
+		           : "per-screen weaving off (fewer than two placed screens, no registry entry for the "
+		             "default screen, or DXR_SEGMENTS=0): single-DP weave");
+	}
+	return mc->weave.segs != NULL && comp_vk_native_segments_enabled(vkb_segs(mc));
+}
+
+/*!
+ * One metric update of the per-screen weave: place the screens in the
+ * window's CG frame, hand a moved projection to the manager without
+ * disturbing its DPs, recompute the table and run the DP lifecycle.
+ *
+ * @return true when this submit must be woven per screen.
+ */
+static bool
+vkb_segs_update(struct vk_bundle *vk, struct multi_compositor *mc, const struct comp_multi_weave_macos_params *p)
+{
+	// Never with a self-submitting DP: its own submit could not be ordered
+	// after the per-segment crops.
+	if (!comp_multi_weave_macos_segs_eligible(mc, p) || xrt_display_processor_is_self_submitting(mc->weave.dp) ||
+	    !vkb_segs_sync(vk, mc)) {
+		return false;
+	}
+	struct comp_weave_window_cg win;
+	comp_multi_weave_macos_segs_window(mc, &win);
+	struct xrt_screen_list proj;
+	struct comp_seg_rect wr;
+	if (comp_weave_screens_project_cg(mc->weave.segs_list, &win, &proj, &wr) == COMP_WEAVE_FRAME_NONE) {
+		return false;
+	}
+	if (comp_weave_screens_compare(mc->weave.segs_proj, &proj) != COMP_WEAVE_SCREENS_SAME) {
+		if (!comp_vk_native_segments_set_screen_geometry(vkb_segs(mc), &proj)) {
+			return false; // cannot happen (same list, same filter): stay single-DP
+		}
+		*mc->weave.segs_proj = proj;
+	}
+	const struct comp_seg_rect canvas = {0, 0, wr.w, wr.h};
+	// Submits are synchronous: nothing of ours is in flight, release is safe.
+	const bool split =
+	    comp_vk_native_segments_update(vkb_segs(mc), &wr, &canvas, (int32_t)WEAVE_VK_FORMAT, true, 0);
+	// Every per-screen DP follows this session's confirmed 2D/3D state, like
+	// the engine's own DP (a DP the update just created gets it here).
+	comp_vk_native_segments_set_display_mode(vkb_segs(mc), !mc->weave.hw_2d_confirmed);
+	comp_multi_weave_macos_segs_log(mc, comp_vk_native_segments_get_table(vkb_segs(mc)), split);
+	return split;
+}
+#endif // COMP_MULTI_WEAVE_HAVE_SEGMENTS
+
 
 /*
  *
@@ -1144,6 +1278,16 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 	const bool nview = p->nview;
 	const bool v6_zero_copy = p->v6_zero_copy;
 	const uint32_t cvw = p->cvw, cvh = p->cvh, packed_w = p->packed_w, packed_h = p->packed_h;
+
+	// #2218 item 6: woven per screen? Decided before recording (the update
+	// may create or retire segment DPs). Every one-screen system, every
+	// window wholly on the default screen and every legacy single-rect submit
+	// is the single-DP weave below, byte for byte.
+	bool seg_split = false;
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	seg_split = vkb_segs_update(vk, mc, p);
+	mc->weave.segs_split = seg_split;
+#endif
 
 	bool ok = false;
 	do {
@@ -1521,6 +1665,53 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 		// ONE process_atlas per submit. Legacy/batch: 2x1 SBS, per-eye dims = the
 		// window. v6: the caller's grid at content_view dims — output is one
 		// content view (cvw x cvh = the whole window).
+		if (seg_split) {
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+			// #2218 item 6: crop each segment's views, weave each with its
+			// screen's DP over its canvas (the engine's DP first, for the
+			// default screen's part), flat 2D where nothing can weave.
+			xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+			const struct comp_vk_native_segments_frame sf = {
+			    .cmd = cmd,
+			    .is_repaint = false,
+			    .src_image = dp_src_image,
+			    .src_format = WEAVE_VK_FORMAT,
+			    .view_width = atlas_view_w,
+			    .view_height = atlas_view_h,
+			    .tile_columns = grid_cols,
+			    .tile_rows = grid_rows,
+			    .target_fb = mc->weave.out_fb,
+			    .target_image = mc->weave.out_image,
+			    .target_view = mc->weave.out_view,
+			    .target_width = mc->weave.out_w,
+			    .target_height = mc->weave.out_h,
+			    .target_format = WEAVE_VK_FORMAT,
+			    .canvas = {0, 0, mc->weave.out_w, mc->weave.out_h},
+			    .content = NULL,                 // one view set (no per-segment views on this path)
+			    .transparent_background = false, // the engine never declares transparency to its DP
+			    .atlas_encoding = -1,            // nor an atlas encoding
+			    .primary_dp = mc->weave.dp,
+			};
+			(void)comp_vk_native_segments_record(vkb_segs(mc), &sf);
+			// The record leaves the target in PRESENT_SRC_KHR (the DP contract
+			// it shares with the in-process compositor); everything below
+			// continues from COLOR_ATTACHMENT_OPTIMAL.
+			VkImageMemoryBarrier seg_to_attach = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .image = mc->weave.out_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(cmd,
+			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+			                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+			                         &seg_to_attach);
+#endif
+		} else {
 		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
 		xrt_display_processor_process_atlas(mc->weave.dp, cmd,                             //
 		                                    (VkImage_XDP)dp_src_image, dp_src_view,        //
@@ -1532,6 +1723,7 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 		                                    mc->weave.out_w, mc->weave.out_h,              //
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                 //
 		                                    0, 0, 0, 0);
+		} // single-DP weave
 
 		// v6: restore the input atlas to GENERAL so the next frame's barrier
 		// (oldLayout=GENERAL) is correct and the caller's external Metal writes
@@ -1667,6 +1859,21 @@ vkb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_m
 static bool
 vkb_get_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out_eyes)
 {
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	// #2218 item 6: woven per screen, the base eyes are the majority screen's
+	// DP's (the macOS reply carries no v19 per-screen table: segmentCount 0),
+	// so a window wholly on another screen is rendered for THAT screen's
+	// viewer, not the default screen's.
+	if (mc->weave.segs_split && mc->weave.segs != NULL) {
+		bool on_primary = true;
+		const uint64_t eye_screen =
+		    comp_weave_screens_eye_screen(comp_vk_native_segments_get_table(vkb_segs(mc)), &on_primary);
+		if (eye_screen != 0 && !on_primary &&
+		    comp_vk_native_segments_get_eyes(vkb_segs(mc), eye_screen, out_eyes)) {
+			return true;
+		}
+	}
+#endif
 	return mc->weave.dp != NULL && xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes);
 }
 
@@ -1707,6 +1914,11 @@ vkb_fini(struct multi_compositor *mc)
 		vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 		mc->weave.overlay_blend_initialized = false;
 	}
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	// #2218 item 6: the per-screen DPs + crops (before the pool they use).
+	vkb_segs_release(vk, mc);
+#endif
+	comp_multi_weave_macos_segs_free(mc);
 	if (mc->weave.dp != NULL) {
 		comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp); // its eyes key (roadmap §5.2)
 		xrt_display_processor_destroy(&mc->weave.dp);

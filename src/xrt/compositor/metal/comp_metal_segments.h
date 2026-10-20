@@ -37,6 +37,14 @@
  * primary screen's segment. A window entirely on the primary screen never
  * enters this module's record path: that case stays the single-DP path.
  *
+ * Also used OUT of process (#2218 item 6): the macOS service's XR_DXR_weave
+ * present-owner engine (compositor/multi/comp_multi_weave_macos_metal.m)
+ * builds one manager per present-owner, windowless, with its own engine DP as
+ * the primary. That window arrives in BACKING px (the caller's
+ * windowOriginOnScreen, points x the window's scale), not points: see
+ * @ref comp_metal_seg_window::px_per_pt. Built as its own small library
+ * (comp_metal_segs) so comp_multi links it without the in-process compositor.
+ *
  * Design note: docs/architecture/comp-segments.md (§ macOS / Metal).
  */
 #pragma once
@@ -110,10 +118,22 @@ struct comp_metal_seg_window
 {
 	//! The content view in top-down global POINTS (origin = the main
 	//! display's top-left, the CGDisplayBounds space), rounded to whole points.
+	//! With @ref px_per_pt set: in that many px per point instead (see there).
 	struct comp_seg_rect frame_pt;
 	//! The drawable (the target), px.
 	uint32_t drawable_w;
 	uint32_t drawable_h;
+	/*!
+	 * 0 (the in-process compositor): @ref frame_pt is in points. > 0 (the
+	 * macOS service's weave, #2218 item 6): @ref frame_pt is the window in
+	 * global CG BACKING px at this scale (its windowOriginOnScreen and client
+	 * size, unrounded to points), and the table is cut in that px frame — each
+	 * screen's point rect x this scale, edges rounded like the engine rounds a
+	 * display's backing origin — so a present origin is exact even for a
+	 * window at a half-point position (util/comp_weave_screens.h,
+	 * comp_weave_screens_project_cg, is the same placement).
+	 */
+	double px_per_pt;
 };
 
 /*!
@@ -196,6 +216,14 @@ comp_metal_segments_snap_dp_at(struct comp_metal_segments *segs,
                                struct xrt_display_processor_metal *primary_dp,
                                double x_pt,
                                double y_pt);
+
+/*!
+ * The last @ref comp_metal_segments_update's table, converted (window rects in
+ * drawable px, screen rects in each screen's own backing px, present origins);
+ * count 0 before the first. Weave thread.
+ */
+const struct comp_segment_table *
+comp_metal_segments_get_table(const struct comp_metal_segments *segs);
 
 /*!
  * M3: the last update's table as per-segment view metrics (window rects in

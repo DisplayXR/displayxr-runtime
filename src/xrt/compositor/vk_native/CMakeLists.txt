@@ -35,7 +35,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		PRIVATE comp_util aux_vk aux_util aux_os
 		)
 	target_include_directories(comp_vk_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-	if(TARGET comp_multi AND XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
+	# ...and the macOS service's Vulkan (MoltenVK) weave backend.
+	if(TARGET comp_multi AND (XRT_FEATURE_COMP_MULTI_WEAVE_LINUX OR APPLE))
 		target_link_libraries(comp_multi PRIVATE comp_vk_segs)
 		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_SEGMENTS)
 	endif()

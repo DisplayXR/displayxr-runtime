@@ -23,6 +23,7 @@ comp_weave_frame_str(enum comp_weave_frame f)
 	switch (f) {
 	case COMP_WEAVE_FRAME_LOGICAL: return "logical";
 	case COMP_WEAVE_FRAME_DEVICE: return "device";
+	case COMP_WEAVE_FRAME_CG: return "CG";
 	default: return "none";
 	}
 }
@@ -160,6 +161,95 @@ comp_weave_screens_project(const struct xrt_screen_list *in,
 	return COMP_WEAVE_FRAME_LOGICAL;
 }
 
+float
+comp_weave_screens_cg_scale(const struct xrt_screen *s)
+{
+	if (s == NULL) {
+		return 1.0f;
+	}
+	if (s->desktop_scale > 0.0f) {
+		return s->desktop_scale;
+	}
+	if (s->native_width > 0 && s->desktop_width > 0) {
+		return (float)s->native_width / (float)s->desktop_width;
+	}
+	return 1.0f;
+}
+
+//! Points -> the window's backing px: the rounding the macOS engine uses for a
+//! display's backing origin (lround, comp_multi_weave_macos.c).
+static int32_t
+cg_px(int32_t pt, double scale)
+{
+	return (int32_t)lround((double)pt * scale);
+}
+
+enum comp_weave_frame
+comp_weave_screens_project_cg(const struct xrt_screen_list *in,
+                              const struct comp_weave_window_cg *win,
+                              struct xrt_screen_list *out,
+                              struct comp_seg_rect *out_window)
+{
+	if (out == NULL || out_window == NULL) {
+		return COMP_WEAVE_FRAME_NONE;
+	}
+	memset(out_window, 0, sizeof(*out_window));
+	if (in == NULL) {
+		memset(out, 0, sizeof(*out));
+		return COMP_WEAVE_FRAME_NONE;
+	}
+	*out = *in;
+	if (win == NULL || win->w == 0 || win->h == 0 || !(win->scale > 0.0f) || win->scale > 8.0f) {
+		return COMP_WEAVE_FRAME_NONE;
+	}
+	*out_window = (struct comp_seg_rect){win->x, win->y, win->w, win->h};
+
+	const double S = (double)win->scale;
+	for (uint32_t i = 0; i < in->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *s = &in->screens[i];
+		struct xrt_screen *o = &out->screens[i];
+		if (!screen_placed(s)) {
+			continue; // keeps its zero rect: the manager's filter skips it alike
+		}
+		// Edges rounded independently: two displays sharing a seam in points
+		// share it in px, so the cut has no gap and no overlap.
+		const int32_t x0 = cg_px(s->desktop_left, S);
+		const int32_t y0 = cg_px(s->desktop_top, S);
+		const int32_t x1 = cg_px(s->desktop_left + (int32_t)s->desktop_width, S);
+		const int32_t y1 = cg_px(s->desktop_top + (int32_t)s->desktop_height, S);
+		o->desktop_left = x0;
+		o->desktop_top = y0;
+		o->desktop_width = x1 > x0 ? (uint32_t)(x1 - x0) : 0u;
+		o->desktop_height = y1 > y0 ? (uint32_t)(y1 - y0) : 0u;
+
+		// 1:1 exactly when the display's backing scale is the window's AND its
+		// points x scale are its native mode (not a "looks like" scaled mode,
+		// which the WindowServer resamples to the panel). An unknown native
+		// mode stays unknown (never degrades).
+		if (s->native_width == 0 || s->native_height == 0) {
+			o->native_width = 0;
+			o->native_height = 0;
+			continue;
+		}
+		const double si = (double)comp_weave_screens_cg_scale(s);
+		const bool same_scale = fabs(si - S) < 0.01;
+		const bool native = lround((double)s->desktop_width * si) == (long)s->native_width &&
+		                    lround((double)s->desktop_height * si) == (long)s->native_height;
+		if (same_scale && native) {
+			o->native_width = o->desktop_width;
+			o->native_height = o->desktop_height;
+		} else {
+			o->native_width = s->native_width;
+			o->native_height = s->native_height;
+			if (o->native_width == o->desktop_width && o->native_height == o->desktop_height) {
+				// A rounding coincidence must not read as 1:1.
+				o->native_width = o->desktop_width + 1;
+			}
+		}
+	}
+	return COMP_WEAVE_FRAME_CG;
+}
+
 static bool
 same_identity(const struct xrt_screen *a, const struct xrt_screen *b)
 {
@@ -175,8 +265,16 @@ same_geometry(const struct xrt_screen *a, const struct xrt_screen *b)
 	return a->desktop_left == b->desktop_left && a->desktop_top == b->desktop_top &&
 	       a->desktop_width == b->desktop_width && a->desktop_height == b->desktop_height &&
 	       a->native_width == b->native_width && a->native_height == b->native_height &&
-	       a->desktop_scale == b->desktop_scale && a->physical_width_mm == b->physical_width_mm &&
-	       a->physical_height_mm == b->physical_height_mm;
+	       a->desktop_scale == b->desktop_scale;
+}
+
+//! The EDID physical size (and what is derived from it) — see
+//! COMP_WEAVE_SCREENS_PHYSICAL_SIZE.
+static bool
+same_physical_size(const struct xrt_screen *a, const struct xrt_screen *b)
+{
+	return a->physical_width_mm == b->physical_width_mm && a->physical_height_mm == b->physical_height_mm &&
+	       memcmp(&a->info, &b->info, sizeof(a->info)) == 0;
 }
 
 enum comp_weave_screens_change
@@ -187,16 +285,23 @@ comp_weave_screens_compare(const struct xrt_screen_list *a, const struct xrt_scr
 	if (na != nb) {
 		return COMP_WEAVE_SCREENS_MEMBERSHIP;
 	}
-	enum comp_weave_screens_change r = COMP_WEAVE_SCREENS_SAME;
+	bool geometry = false;
+	bool physical = false;
 	for (uint32_t i = 0; i < na; i++) {
 		if (!same_identity(&a->screens[i], &b->screens[i])) {
 			return COMP_WEAVE_SCREENS_MEMBERSHIP;
 		}
 		if (!same_geometry(&a->screens[i], &b->screens[i])) {
-			r = COMP_WEAVE_SCREENS_GEOMETRY;
+			geometry = true;
+		}
+		if (!same_physical_size(&a->screens[i], &b->screens[i])) {
+			physical = true;
 		}
 	}
-	return r;
+	if (geometry) {
+		return COMP_WEAVE_SCREENS_GEOMETRY;
+	}
+	return physical ? COMP_WEAVE_SCREENS_PHYSICAL_SIZE : COMP_WEAVE_SCREENS_SAME;
 }
 
 static bool

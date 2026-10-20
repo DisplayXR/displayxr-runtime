@@ -46,6 +46,15 @@
  *            macOS plug-in exports).
  * DXR_WEAVE_MAC_BACKEND=auto|metal|vk picks it once per client (auto: metal
  * iff the plug-in has no Vulkan DP factory but has a Metal one).
+ *
+ * Multi-screen (#2218 item 6): the backend's DP weaves the system-default
+ * screen. A window not wholly on it is woven per screen — each other screen's
+ * part by a windowless per-screen DP from THAT screen's registry claimant,
+ * through the in-process compositor's manager of the backend's API
+ * (comp_vk_native_segments / comp_metal_segments). The window is placed
+ * against the screens in the CG frame (util/comp_weave_screens.h). The shared
+ * half is "Per-screen display processors" below; docs/architecture/
+ * comp-segments.md § macOS service.
  */
 
 #include "xrt/xrt_compositor.h"
@@ -63,6 +72,9 @@
 #include "comp_multi_weave_macos_backend.h"
 
 #include "os/os_display_macos.h"
+
+#include "util/comp_segments.h"
+#include "util/comp_weave_screens.h" // #2218 item 6: the window against the screens (CG frame)
 
 #ifdef XRT_OS_MACOS
 
@@ -410,6 +422,112 @@ weave_ensure_backend_locked(struct multi_compositor *mc)
 		}
 	}
 	return true;
+}
+
+
+/*
+ *
+ * Per-screen display processors (#2218 item 6) — shared by both backends.
+ *
+ */
+
+uint64_t
+comp_multi_weave_macos_segs_snapshot(struct multi_compositor *mc)
+{
+	if (mc->weave.segs_list == NULL) {
+		mc->weave.segs_list = U_TYPED_CALLOC(struct xrt_screen_list);
+		mc->weave.segs_info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		mc->weave.segs_proj = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (mc->weave.segs_list == NULL || mc->weave.segs_info == NULL || mc->weave.segs_proj == NULL) {
+			comp_multi_weave_macos_segs_free(mc);
+			return 0;
+		}
+	}
+	return multi_system_weave_screens_snapshot(mc->msc, mc->weave.segs_generation, mc->weave.segs_list,
+	                                           mc->weave.segs_info);
+}
+
+void
+comp_multi_weave_macos_segs_free(struct multi_compositor *mc)
+{
+	free(mc->weave.segs_list);
+	free(mc->weave.segs_info);
+	free(mc->weave.segs_proj);
+	mc->weave.segs_list = NULL;
+	mc->weave.segs_info = NULL;
+	mc->weave.segs_proj = NULL;
+	mc->weave.segs_generation = 0;
+	mc->weave.segs_split = false;
+	mc->weave.segs_logged_key = 0;
+}
+
+bool
+comp_multi_weave_macos_segs_eligible(const struct multi_compositor *mc, const struct comp_multi_weave_macos_params *p)
+{
+	return (p->nview || p->rect_count > 0) && mc->weave.have_geometry && mc->weave.have_present_origin &&
+	       mc->weave.present_panel_scale > 0.0 && mc->weave.win_w != 0 && mc->weave.win_h != 0 &&
+	       mc->weave.out_w == mc->weave.win_w && mc->weave.out_h == mc->weave.win_h;
+}
+
+void
+comp_multi_weave_macos_segs_window(const struct multi_compositor *mc, struct comp_weave_window_cg *out)
+{
+	out->x = mc->weave.win_x;
+	out->y = mc->weave.win_y;
+	out->w = mc->weave.win_w;
+	out->h = mc->weave.win_h;
+	// The window's backing scale: the scale of the display its origin was
+	// resolved on (the reported displayId, else the containing display) —
+	// the same panel the single-DP present origin is resolved against.
+	out->scale = (float)mc->weave.present_panel_scale;
+}
+
+void
+comp_multi_weave_macos_segs_log(struct multi_compositor *mc, const struct comp_segment_table *t, bool split)
+{
+	uint64_t key = split ? 1u : 0u;
+	if (split && t != NULL) {
+		key ^= (uint64_t)t->count << 1;
+		for (uint32_t k = 0; k < t->count; k++) {
+			key = key * 1099511628211ull ^ t->seg[k].screen_id;
+		}
+		key |= 1u;
+	}
+	if (key == mc->weave.segs_logged_key) {
+		return;
+	}
+	const bool was_split = (mc->weave.segs_logged_key & 1u) != 0;
+	mc->weave.segs_logged_key = key;
+	if (!split) {
+		if (was_split) {
+			U_LOG_W(
+			    "weave(#2218): window %d,%d %ux%u is wholly on the default screen again — single-DP weave",
+			    mc->weave.win_x, mc->weave.win_y, mc->weave.win_w, mc->weave.win_h);
+		}
+		return;
+	}
+	struct comp_weave_segment_owner own[COMP_SEGMENTS_MAX];
+	const uint32_t n = comp_weave_screens_owners(t, mc->weave.segs_list, own, COMP_SEGMENTS_MAX);
+	char buf[768];
+	size_t used = 0;
+	buf[0] = '\0';
+	for (uint32_t k = 0; k < n && used + 1 < sizeof(buf); k++) {
+		const int w = snprintf(buf + used, sizeof(buf) - used,
+		                       "%s[%u] screen 0x%016llx by '%s' (%s) canvas %d,%d %ux%u present origin %d,%d%s",
+		                       k > 0 ? "; " : "", k, (unsigned long long)own[k].screen_id,
+		                       own[k].plugin_id[0] != '\0' ? own[k].plugin_id : "(no claimant: flat 2D)",
+		                       own[k].session_dp ? "the engine's own DP" : "a per-screen DP",
+		                       own[k].window_rect.x, own[k].window_rect.y, own[k].window_rect.w,
+		                       own[k].window_rect.h, own[k].present_origin_x, own[k].present_origin_y,
+		                       own[k].one_to_one ? "" : " (resampled: flat unless the DP tolerates it)");
+		if (w < 0) {
+			break;
+		}
+		used += (size_t)w < sizeof(buf) - used ? (size_t)w : sizeof(buf) - used - 1;
+	}
+	U_LOG_W("weave(#2218): window %d,%d %ux%u woven per screen (CG frame, scale %.2f, %s backend) — %s",
+	        mc->weave.win_x, mc->weave.win_y, mc->weave.win_w, mc->weave.win_h, mc->weave.present_panel_scale,
+	        mc->weave.backend != NULL ? mc->weave.backend->name : "?", buf);
 }
 
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief comp_weave_screens (#2218 item 6): a desktop-Linux XR_DXR_weave
+ * @brief comp_weave_screens (#2218 item 6): a desktop-Linux / macOS XR_DXR_weave
  *        present-owner's window placed against the screens — which screen's
  *        display processor weaves which part, with which present origin,
  *        across moves, hotplug and per-screen preference changes, and the
@@ -16,6 +16,7 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -430,4 +431,335 @@ TEST_CASE("weave_screens: an unplaced screen keeps its slot")
 	CHECK(proj.count == 3);
 	CHECK(proj.screens[2].desktop_width == 0); // still skipped by the manager's filter
 	CHECK(proj.screens[2].id == 0x3003);
+}
+
+
+/*
+ *
+ * macOS: the CG frame (comp_weave_screens_project_cg).
+ *
+ * The screen list holds CGDisplayBounds (top-down POINTS, origin = the main
+ * display's top-left) + each display's backing scale and native mode; the
+ * present-owner reports its window in BACKING px of the display it is on
+ * (points x that display's scale, y down — AppKit's y-up frame flipped by
+ * the caller, XR_DXR_weave spec v7).
+ *
+ */
+
+namespace {
+
+const uint64_t MBP = 0x3003;  // the laptop panel, main display (CG origin)
+const uint64_t ODY = 0x4004;  // the 3D panel, system default (the active plug-in's)
+const uint64_t EXT1 = 0x5005; // a 1x external monitor
+
+/*!
+ * This box's layout (mac, 2026-10): the 3D panel LEFT of the laptop at
+ * x = -1920 pt (negative CG x), both at 2x; a 1x external right of the laptop.
+ *  - ODY  : 1920x1080 pt at (-1920, 0), 2x, native 3840x2160 — system default
+ *  - MBP  : 1512x982 pt at (0, 0), 2x, native 3024x1964 — main display
+ *  - EXT1 : 1920x1080 pt at (1512, 0), 1x, native 1920x1080
+ */
+xrt_screen_list
+mac_desk(const char *ody_plugin = "leia-sr", const char *mbp_plugin = "sim-display")
+{
+	xrt_screen_list l{};
+	l.count = 3;
+	l.screens[0] =
+	    mk_screen(ODY, XRT_SCREEN_FLAG_SYSTEM_DEFAULT, -1920, 0, 1920, 1080, 3840, 2160, 2.0f, ody_plugin);
+	l.screens[1] = mk_screen(MBP, XRT_SCREEN_FLAG_PRIMARY, 0, 0, 1512, 982, 3024, 1964, 2.0f, mbp_plugin);
+	l.screens[2] = mk_screen(EXT1, 0, 1512, 0, 1920, 1080, 1920, 1080, 1.0f, "sim-display");
+	return l;
+}
+
+//! The window as the browser reports it: its CG point rect x the scale of its display.
+comp_weave_window_cg
+win_cg(int32_t x_pt, int32_t y_pt, uint32_t w_pt, uint32_t h_pt, float scale)
+{
+	comp_weave_window_cg w{};
+	w.x = (int32_t)lround((double)x_pt * scale);
+	w.y = (int32_t)lround((double)y_pt * scale);
+	w.w = (uint32_t)lround((double)w_pt * scale);
+	w.h = (uint32_t)lround((double)h_pt * scale);
+	w.scale = scale;
+	return w;
+}
+
+//! The single-panel present origin the macOS engine already feeds a DP
+//! (comp_multi_weave_macos.c): window origin - lround(panel points x scale).
+void
+mac_rule_origin(const xrt_screen &s, const comp_weave_window_cg &w, int32_t *ox, int32_t *oy)
+{
+	const double sc = (double)comp_weave_screens_cg_scale(&s);
+	*ox = w.x - (int32_t)lround((double)s.desktop_left * sc);
+	*oy = w.y - (int32_t)lround((double)s.desktop_top * sc);
+}
+
+cut
+place_cg(const xrt_screen_list &l, const comp_weave_window_cg &w)
+{
+	cut c{};
+	c.frame = comp_weave_screens_project_cg(&l, &w, &c.proj, &c.win);
+	comp_segments_screen scr[COMP_SEGMENTS_MAX_SCREENS];
+	const uint32_t n = seg_screens(c.proj, scr);
+	const comp_seg_rect canvas = {0, 0, c.win.w, c.win.h};
+	comp_segments_compute(&c.win, &canvas, scr, n, &c.t);
+	c.split = comp_segments_table_is_split(&c.t, c.win.w, c.win.h);
+	return c;
+}
+
+} // namespace
+
+TEST_CASE("weave_screens CG: a window wholly on the default (3D) panel keeps the single-DP path")
+{
+	const xrt_screen_list l = mac_desk();
+	// On the panel, left of the main display: negative CG x.
+	const comp_weave_window_cg w = win_cg(-1500, 200, 800, 500, 2.0f);
+	CHECK(w.x == -3000);
+	const cut c = place_cg(l, w);
+	REQUIRE(c.frame == COMP_WEAVE_FRAME_CG);
+	CHECK(c.proj.screens[0].desktop_left == -3840);
+	CHECK(c.proj.screens[0].desktop_width == 3840);
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].screen_id == ODY);
+	CHECK(c.t.seg[0].is_primary);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	CHECK_FALSE(c.split); // byte for byte the pre-#2218 weave
+
+	// The origin the table carries is exactly the one the engine feeds today.
+	int32_t ox = 0, oy = 0;
+	mac_rule_origin(l.screens[0], w, &ox, &oy);
+	CHECK(c.t.seg[0].present_origin_x == ox);
+	CHECK(c.t.seg[0].present_origin_y == oy);
+	CHECK(ox == 840);
+	CHECK(oy == 400);
+}
+
+TEST_CASE("weave_screens CG: a window wholly on the laptop is woven by the laptop's DP")
+{
+	const xrt_screen_list l = mac_desk();
+	const comp_weave_window_cg w = win_cg(100, 50, 800, 500, 2.0f);
+	const cut c = place_cg(l, w);
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].screen_id == MBP);
+	CHECK_FALSE(c.t.seg[0].is_primary);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	CHECK(c.split); // not on the default screen: leaves the single-DP path
+
+	comp_weave_segment_owner own[4];
+	REQUIRE(comp_weave_screens_owners(&c.t, &l, own, 4) == 1);
+	CHECK(std::strcmp(own[0].plugin_id, "sim-display") == 0);
+	CHECK_FALSE(own[0].session_dp);
+	CHECK(own[0].present_origin_x == 200);
+	CHECK(own[0].present_origin_y == 100);
+
+	bool prim = true;
+	CHECK(comp_weave_screens_eye_screen(&c.t, &prim) == MBP);
+	CHECK_FALSE(prim);
+}
+
+TEST_CASE("weave_screens CG: straddling the 3D panel / laptop seam (both 2x) is cut per screen")
+{
+	const xrt_screen_list l = mac_desk();
+	// 300 pt on the panel, 500 pt on the laptop.
+	const comp_weave_window_cg w = win_cg(-300, 100, 800, 400, 2.0f);
+	const cut c = place_cg(l, w);
+	REQUIRE(c.t.count == 2);
+	CHECK(c.split);
+	// Left to right: the panel's part, then the laptop's.
+	CHECK(c.t.seg[0].screen_id == ODY);
+	CHECK(c.t.seg[1].screen_id == MBP);
+	CHECK(c.t.seg[0].window_rect.x == 0);
+	CHECK(c.t.seg[0].window_rect.w == 600);
+	CHECK(c.t.seg[1].window_rect.x == 600);
+	CHECK(c.t.seg[0].window_rect.w + c.t.seg[1].window_rect.w == 1600); // no gap, no overlap
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	CHECK(c.t.seg[1].screen_1to1 == COMP_SEG_1TO1_YES);
+
+	// Present origin per screen: each screen's own backing px. phase =
+	// origin + canvas offset = the segment's top-left on that panel.
+	int32_t ox = 0, oy = 0;
+	mac_rule_origin(l.screens[0], w, &ox, &oy);
+	CHECK(c.t.seg[0].present_origin_x == ox);
+	CHECK(ox == 3240); // 3840 - 600: the window's left edge on the panel
+	mac_rule_origin(l.screens[1], w, &ox, &oy);
+	CHECK(c.t.seg[1].present_origin_x == ox);
+	CHECK(ox == -600);
+	CHECK(c.t.seg[1].present_origin_x + c.t.seg[1].window_rect.x == 0); // lands at the laptop's x = 0
+
+	comp_weave_segment_owner own[4];
+	REQUIRE(comp_weave_screens_owners(&c.t, &l, own, 4) == 2);
+	CHECK(std::strcmp(own[0].plugin_id, "leia-sr") == 0);
+	CHECK(own[0].session_dp);
+	CHECK(std::strcmp(own[1].plugin_id, "sim-display") == 0);
+	// Majority: 1000 px on the laptop.
+	bool prim = true;
+	CHECK(comp_weave_screens_eye_screen(&c.t, &prim) == MBP);
+	CHECK_FALSE(prim);
+}
+
+TEST_CASE("weave_screens CG: a 2x window straddling onto a 1x external resamples that part")
+{
+	const xrt_screen_list l = mac_desk();
+	// On the laptop (2x), its right 200 pt hanging over the 1x external.
+	const comp_weave_window_cg w = win_cg(1112, 100, 600, 400, 2.0f);
+	const cut c = place_cg(l, w);
+	REQUIRE(c.t.count == 2);
+	CHECK(c.t.seg[0].screen_id == MBP);
+	CHECK(c.t.seg[1].screen_id == EXT1);
+	CHECK(c.t.seg[0].window_rect.w == 800);
+	CHECK(c.t.seg[1].window_rect.w == 400);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	// The WindowServer resamples the 2x window on the 1x display: flat unless
+	// its DP tolerates it, never phased in the wrong units.
+	CHECK(c.t.seg[1].screen_1to1 == COMP_SEG_1TO1_NO);
+	CHECK(comp_segments_decide(true, false, c.t.seg[1].screen_1to1) == COMP_SEG_RENDER_FLAT_2D);
+	CHECK(comp_segments_decide(true, true, c.t.seg[1].screen_1to1) == COMP_SEG_RENDER_WEAVE);
+}
+
+TEST_CASE("weave_screens CG: a 1x window on the external sees the 2x displays resampled")
+{
+	const xrt_screen_list l = mac_desk();
+	const comp_weave_window_cg w = win_cg(1600, 100, 600, 400, 1.0f);
+	const cut c = place_cg(l, w);
+	CHECK(c.proj.screens[2].native_width == c.proj.screens[2].desktop_width); // EXT1 1:1 at 1x
+	CHECK(c.proj.screens[1].native_width != c.proj.screens[1].desktop_width); // MBP is 2x
+	CHECK(c.proj.screens[0].native_width != c.proj.screens[0].desktop_width); // ODY is 2x
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].screen_id == EXT1);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_YES);
+	CHECK(c.t.seg[0].present_origin_x == 88);
+	CHECK(c.split);
+}
+
+TEST_CASE("weave_screens CG: a 3D panel above the laptop (flipped AppKit y, negative CG y)")
+{
+	// Panel ABOVE the main display: AppKit puts it at y = +982 (y up from the
+	// main display's bottom-left), CoreGraphics at y = -1080 (y down from its
+	// top-left). The screen list and the window are both CG.
+	xrt_screen_list l{};
+	l.count = 2;
+	l.screens[0] =
+	    mk_screen(ODY, XRT_SCREEN_FLAG_SYSTEM_DEFAULT, 0, -1080, 1920, 1080, 3840, 2160, 2.0f, "leia-sr");
+	l.screens[1] = mk_screen(MBP, XRT_SCREEN_FLAG_PRIMARY, 0, 0, 1512, 982, 3024, 1964, 2.0f, "sim-display");
+
+	// An NSWindow content frame in AppKit points: (200, 882) 600x300, i.e.
+	// its top 200 pt on the panel, its bottom 100 pt on the laptop.
+	const int32_t main_h_pt = 982;
+	const int32_t ak_x = 200, ak_y = 882, wpt = 600, hpt = 300;
+	const int32_t cg_y = main_h_pt - (ak_y + hpt); // the caller's flip
+	CHECK(cg_y == -200);
+	const comp_weave_window_cg w = win_cg(ak_x, cg_y, wpt, hpt, 2.0f);
+	const cut c = place_cg(l, w);
+	REQUIRE(c.t.count == 2);
+	CHECK(c.split);
+	// Top to bottom: the panel's band, then the laptop's — full width each.
+	CHECK(c.t.seg[0].screen_id == ODY);
+	CHECK(c.t.seg[0].window_rect.y == 0);
+	CHECK(c.t.seg[0].window_rect.h == 400);
+	CHECK(c.t.seg[1].screen_id == MBP);
+	CHECK(c.t.seg[1].window_rect.y == 400);
+	CHECK(c.t.seg[1].window_rect.h == 200);
+	// The panel band lands at the panel's bottom rows: origin 2160 - 400.
+	CHECK(c.t.seg[0].present_origin_y == 1760);
+	CHECK(c.t.seg[1].present_origin_y == -400);
+	CHECK(c.t.seg[1].present_origin_y + c.t.seg[1].window_rect.y == 0);
+}
+
+TEST_CASE("weave_screens CG: a window at a half-point position keeps an exact present origin")
+{
+	const xrt_screen_list l = mac_desk();
+	comp_weave_window_cg w = win_cg(-1000, 100, 400, 300, 2.0f);
+	w.x += 1; // backing-aligned at a half point
+	w.y += 1;
+	const cut c = place_cg(l, w);
+	REQUIRE(c.t.count == 1);
+	int32_t ox = 0, oy = 0;
+	mac_rule_origin(l.screens[0], w, &ox, &oy);
+	CHECK(c.t.seg[0].present_origin_x == ox);
+	CHECK(c.t.seg[0].present_origin_y == oy);
+	CHECK(ox == 1841);
+	CHECK(oy == 201);
+}
+
+TEST_CASE("weave_screens CG: present origin is the engine's phase rule on every 1:1 screen")
+{
+	const xrt_screen_list l = mac_desk();
+	for (int32_t x = -2100; x < 1500; x += 97) {
+		for (int32_t y = -50; y < 900; y += 131) {
+			const comp_weave_window_cg w = win_cg(x, y, 400, 240, 2.0f);
+			const cut c = place_cg(l, w);
+			uint32_t covered = 0;
+			for (uint32_t k = 0; k < c.t.count; k++) {
+				const comp_segment &g = c.t.seg[k];
+				if (g.screen_1to1 != COMP_SEG_1TO1_YES) {
+					continue;
+				}
+				const xrt_screen *s = xrt_screen_list_find(&l, g.screen_id);
+				REQUIRE(s != nullptr);
+				int32_t ox = 0, oy = 0;
+				mac_rule_origin(*s, w, &ox, &oy);
+				CHECK(g.present_origin_x == ox);
+				CHECK(g.present_origin_y == oy);
+				covered += g.window_rect.w * g.window_rect.h;
+			}
+			CHECK(covered <= w.w * w.h);
+		}
+	}
+}
+
+TEST_CASE("weave_screens CG: a single screen is never split, a degenerate window or scale refuses")
+{
+	xrt_screen_list l{};
+	l.count = 1;
+	l.screens[0] = mk_screen(ODY, XRT_SCREEN_FLAG_SYSTEM_DEFAULT | XRT_SCREEN_FLAG_PRIMARY, 0, 0, 1920, 1080, 3840,
+	                         2160, 2.0f, "leia-sr");
+	for (int32_t x = 0; x + 400 <= 1920; x += 211) {
+		const cut c = place_cg(l, win_cg(x, 30, 400, 300, 2.0f));
+		REQUIRE(c.t.count == 1);
+		CHECK(c.t.seg[0].is_primary);
+		CHECK_FALSE(c.split);
+	}
+	const xrt_screen_list m = mac_desk();
+	xrt_screen_list proj{};
+	comp_seg_rect wr{};
+	comp_weave_window_cg w = win_cg(0, 0, 400, 300, 2.0f);
+	w.scale = 0.0f;
+	CHECK(comp_weave_screens_project_cg(&m, &w, &proj, &wr) == COMP_WEAVE_FRAME_NONE);
+	CHECK(std::memcmp(&proj, &m, sizeof(m)) == 0); // untouched copy
+	w = win_cg(0, 0, 400, 300, 2.0f);
+	w.w = 0;
+	CHECK(comp_weave_screens_project_cg(&m, &w, &proj, &wr) == COMP_WEAVE_FRAME_NONE);
+}
+
+TEST_CASE("weave_screens CG: a 'looks like' scaled mode is not 1:1 at its own scale")
+{
+	xrt_screen_list l = mac_desk();
+	// The laptop at "more space": 1800x1169 pt at 2x = 3600x2338 backing,
+	// down-sampled by the WindowServer to the 3024x1964 panel.
+	l.screens[1].desktop_width = 1800;
+	l.screens[1].desktop_height = 1169;
+	l.screens[2].desktop_left = 1800;
+	const cut c = place_cg(l, win_cg(100, 100, 400, 300, 2.0f));
+	REQUIRE(c.t.count == 1);
+	CHECK(c.t.seg[0].screen_id == MBP);
+	CHECK(c.t.seg[0].screen_1to1 == COMP_SEG_1TO1_NO);
+}
+
+TEST_CASE("weave_screens: an EDID physical-size refinement alone is not a new table (#2097)")
+{
+	const xrt_screen_list a = mac_desk();
+	xrt_screen_list b = a;
+	// CoreGraphics' 598x341 mm, then IOKit's EDID 600x340 mm ~1 s later.
+	b.screens[0].physical_width_mm = 600;
+	b.screens[0].physical_height_mm = 340;
+	CHECK(comp_weave_screens_compare(&a, &b) == COMP_WEAVE_SCREENS_PHYSICAL_SIZE);
+	// The derived metres move with it: still only that.
+	b.screens[0].info.width_m = 0.600f;
+	CHECK(comp_weave_screens_compare(&a, &b) == COMP_WEAVE_SCREENS_PHYSICAL_SIZE);
+	// Combined with a real move it is a geometry change...
+	b.screens[0].desktop_left = -1800;
+	CHECK(comp_weave_screens_compare(&a, &b) == COMP_WEAVE_SCREENS_GEOMETRY);
+	// ...and a re-claim wins over both.
+	b.screens[0].confidence = 1;
+	CHECK(comp_weave_screens_compare(&a, &b) == COMP_WEAVE_SCREENS_MEMBERSHIP);
 }

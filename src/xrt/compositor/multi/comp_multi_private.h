@@ -744,6 +744,27 @@ struct multi_compositor
 
 		//! XR_DXR_lift §6: lifted weave rects (vk backend; comp_multi_weave_lift.h).
 		struct comp_multi_weave_lift lift;
+
+		/*!
+		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
+		 * A bound window not wholly on the system-default screen is woven per
+		 * screen: each screen's part by the DP of THAT screen (a windowless
+		 * per-screen DP from its own registry claimant, per-screen preference
+		 * included), the default screen's part by the backend's own DP. The
+		 * manager is the in-process compositor's of the backend's API —
+		 * comp_vk_native_segments (vk) or comp_metal_segments (metal) — built
+		 * from the system's screen-list snapshot. A one-screen system never
+		 * enables it: byte for byte the single-DP weave. Under @ref mutex.
+		 * @{
+		 */
+		void *segs;                                   //!< the backend's manager (opaque here)
+		uint64_t segs_generation;                     //!< msc weave_screens generation it was built from
+		struct xrt_screen_list *segs_list;            //!< that list (heap; CGDisplayBounds points)
+		struct xrt_system_compositor_info *segs_info; //!< and its registry (heap)
+		struct xrt_screen_list *segs_proj;            //!< vk: last CG projection handed to the manager (heap)
+		bool segs_split;                              //!< the last submit was woven per screen
+		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
+		//! @}
 	} weave;
 #endif
 
@@ -1627,7 +1648,7 @@ struct multi_system_compositor
 	//! @}
 #endif // COMP_MULTI_SHARED_SURFACE
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 	/*!
 	 * #2218 item 6: the screen list + DP registry the XR_DXR_weave
 	 * present-owner engines segment against (one DP per screen a window
@@ -2319,7 +2340,7 @@ multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
 /*! @} */
 #endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 /*!
  * #2218 item 6: copy the system's screen list + registry into @p out_list /
  * @p out_info when its generation differs from @p have_generation. Returns the

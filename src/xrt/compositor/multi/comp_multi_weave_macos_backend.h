@@ -138,6 +138,57 @@ struct comp_multi_weave_macos_backend
 	void (*fini)(struct multi_compositor *mc);
 };
 
+/*
+ *
+ * Per-screen display processors (#2218 item 6) — the front-end half both
+ * backends share (comp_multi_weave_macos.c). The backend owns the manager
+ * (mc->weave.segs: comp_vk_native_segments or comp_metal_segments); these
+ * keep the screen-table snapshot, the eligibility rule, the window in CG
+ * terms and the change-only log in one place.
+ *
+ */
+
+struct comp_segment_table;
+struct comp_weave_window_cg;
+
+/*!
+ * Snapshot the system's screen table (comp_multi_system_set_screens) into
+ * mc->weave.segs_list / segs_info when its generation moved past
+ * mc->weave.segs_generation. Does NOT update segs_generation: the backend
+ * compares and rebuilds (or re-tables) its manager, then stores it.
+ *
+ * @return the current generation; 0 = never handed a table (single-DP weave).
+ */
+uint64_t
+comp_multi_weave_macos_segs_snapshot(struct multi_compositor *mc);
+
+//! Free the snapshot lists (the backend destroys its manager first).
+void
+comp_multi_weave_macos_segs_free(struct multi_compositor *mc);
+
+/*!
+ * May this submit be woven per screen at all? Batch (v3) or v6 only — both
+ * weave the WHOLE window as one canvas, which is what the segment table cuts —
+ * with a reported geometry and a resolved panel (its backing scale is the
+ * window's), and only while the output IS the window (v6 at viewScale 1, or a
+ * non-resample-tolerant DP's window-sized v6 output). A legacy single-rect
+ * submit, or anything else, keeps the single-DP weave.
+ */
+bool
+comp_multi_weave_macos_segs_eligible(const struct multi_compositor *mc, const struct comp_multi_weave_macos_params *p);
+
+//! The window as the CG projection reads it (backing px + the resolved panel's scale).
+void
+comp_multi_weave_macos_segs_window(const struct multi_compositor *mc, struct comp_weave_window_cg *out);
+
+/*!
+ * One WARN when what the weave does per screen changes — split or not, and
+ * which screens — never per drag step. @p t is the manager's last table in
+ * window px.
+ */
+void
+comp_multi_weave_macos_segs_log(struct multi_compositor *mc, const struct comp_segment_table *t, bool split);
+
 extern const struct comp_multi_weave_macos_backend comp_multi_weave_macos_backend_vk;
 
 #ifdef COMP_MULTI_WEAVE_HAVE_METAL

@@ -7424,7 +7424,7 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	os_mutex_destroy(&msc->list_and_timing_lock);
 	os_mutex_destroy(&msc->render_lock);
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 	// #2218 item 6: every client (and so every weave engine) is gone.
 	if (msc->weave_screens.mutex_initialized) {
 		os_mutex_destroy(&msc->weave_screens.mutex);
@@ -7540,7 +7540,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 
 	os_mutex_init(&msc->list_and_timing_lock);
 	os_mutex_init(&msc->render_lock);
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 	msc->weave_screens.mutex_initialized = os_mutex_init(&msc->weave_screens.mutex) == 0;
 #endif
 
@@ -7575,7 +7575,7 @@ comp_multi_system_get_vk(struct xrt_system_compositor *xsysc)
 	return comp_target_service_get_vk(msc->target_service);
 }
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
 void
 comp_multi_system_set_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list)
 {
@@ -7603,13 +7603,18 @@ comp_multi_system_set_screens(struct xrt_system_compositor *xsysc, const struct 
 	// Bump only on a real change: the fallback timer re-probes every 10 s
 	// while the fallback plug-in is active, and a bump rebuilds every live
 	// engine's segment DPs.
+	// A refined EDID physical size alone (macOS, #2097) is kept but is not a
+	// new table: no generation bump, so no engine rebuilds a vendor weaver.
 	const bool first = msc->weave_screens.generation == 0;
+	const enum comp_weave_screens_change diff = comp_weave_screens_compare(msc->weave_screens.list, list);
 	const bool changed =
-	    first || comp_weave_screens_compare(msc->weave_screens.list, list) != COMP_WEAVE_SCREENS_SAME ||
+	    first || (diff != COMP_WEAVE_SCREENS_SAME && diff != COMP_WEAVE_SCREENS_PHYSICAL_SIZE) ||
 	    comp_weave_screens_registry_changed(&msc->weave_screens.info->dp_registry, &xsysc->info.dp_registry);
-	if (changed) {
+	if (changed || diff == COMP_WEAVE_SCREENS_PHYSICAL_SIZE) {
 		*msc->weave_screens.list = *list;
 		*msc->weave_screens.info = xsysc->info;
+	}
+	if (changed) {
 		msc->weave_screens.generation++;
 	}
 	const uint64_t gen = msc->weave_screens.generation;
@@ -7650,7 +7655,7 @@ multi_system_weave_screens_snapshot(struct multi_system_compositor *msc,
 	os_mutex_unlock(&msc->weave_screens.mutex);
 	return gen;
 }
-#endif // XRT_OS_LINUX_DESKTOP
+#endif // XRT_OS_LINUX_DESKTOP || XRT_OS_MACOS
 
 bool
 multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d)

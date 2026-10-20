@@ -46,6 +46,12 @@
  *    (batch) / the crop copy (v6). Once the command buffer completed the
  *    copies are handed over and the helper commits them.
  *
+ * Multi-screen (#2218 item 6): that DP weaves the system-default screen. A
+ * window not wholly on it is woven per screen — each other screen's part by a
+ * windowless create_dp_metal_for_screen DP from THAT screen's registry
+ * claimant, through comp_metal_segments (the in-process Metal compositor's
+ * manager) in its backing-px window mode. See "Per-screen display processors".
+ *
  * Shaders are compiled at runtime from a source string (no build-time
  * metallib), like sim_display_processor_metal.m. Manual retain/release (the
  * runtime's .m files are not ARC). Everything runs on the client's IPC thread
@@ -66,6 +72,12 @@
 #include "comp_multi_private.h"
 #include "comp_multi_weave_macos_backend.h"
 #include "comp_multi_weave_metal_lift.h"
+
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+#include "metal/comp_metal_segments.h" // #2218 item 6: per-screen DPs
+#include "util/comp_segments.h"
+#include "util/comp_weave_screens.h"
+#endif
 
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -378,9 +390,8 @@ mtlb_ensure_engine(struct multi_compositor *mc)
 		wm->objects_ready = true;
 	}
 
-	// TODO(#2218 item 6): one Metal DP for the whole window. Per-screen weaving
-	// here would drive comp_metal_segments (the in-process Metal compositor's
-	// manager) the way the desktop-Linux engine drives comp_vk_native_segments.
+	// This DP weaves the system-default screen; a window not wholly on it is
+	// woven per screen (#2218 item 6, "Per-screen display processors").
 	xrt_dp_factory_metal_fn_t factory = (xrt_dp_factory_metal_fn_t)mc->msc->base.info.dp_factory_metal;
 	if (factory == NULL) {
 		U_LOG_E("weave(#759) metal: the plug-in has no Metal DP factory — cannot weave");
@@ -794,6 +805,116 @@ weave_metal_lift_begin(struct multi_compositor *mc, struct weave_metal *wm, cons
 	return wm->lift != NULL && comp_multi_weave_lift_begin(&mc->weave.lift, NULL, p->lift_count);
 }
 
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+/*
+ *
+ * Per-screen display processors (#2218 item 6, ADR-047 D2 / Amendment 4 on the
+ * macOS service).
+ *
+ * A bound window that is not wholly on the system-default screen is woven per
+ * screen: each screen's part by the display processor of THAT screen — a
+ * windowless create_dp_metal_for_screen DP from the screen's own registry
+ * claimant (per-screen preference included), phased by that screen's present
+ * origin — the default screen's part by this engine's own DP (dp_metal),
+ * phased by its segment's origin (relative to the default screen, which is
+ * exactly the origin the front end feeds it when the window is on that screen).
+ * Parts no DP can weave (no claimant, no per-screen factory, a DP needing 1:1
+ * pixels on a screen that resamples the window: another backing scale, a
+ * "looks like" mode) and the part on no screen are painted flat. The manager is
+ * comp_metal_segments in its backing-px window mode (px_per_pt = the window's
+ * scale): same table, lifecycle hysteresis, crop-before-DP and flat fill as the
+ * in-process Metal compositor, and a re-table on a screen-table change keeps
+ * every segment DP whose screen is still listed the same way (display hotplug,
+ * an EDID refinement — comp_segments_dp_key_keeps).
+ *
+ */
+
+static struct comp_metal_segments *
+mtlb_segs(struct multi_compositor *mc)
+{
+	return (struct comp_metal_segments *)mc->weave.segs;
+}
+
+//! Destroy the manager and its DPs (teardown: before the queue they use).
+static void
+mtlb_segs_destroy(struct multi_compositor *mc)
+{
+	if (mc->weave.segs != NULL) {
+		struct comp_metal_segments *segs = mtlb_segs(mc);
+		comp_metal_segments_destroy(&segs);
+		mc->weave.segs = NULL;
+	}
+	mc->weave.segs_split = false;
+	mc->weave.segs_logged_key = 0;
+}
+
+/*!
+ * Create the manager on the first screen table, re-table it in place on every
+ * later one (generation moved: a hotplug, a re-claim, a per-screen preference).
+ *
+ * @return true when the manager exists and segments.
+ */
+static bool
+mtlb_segs_sync(struct multi_compositor *mc, struct weave_metal *wm)
+{
+	const uint64_t gen = comp_multi_weave_macos_segs_snapshot(mc);
+	if (gen == 0) {
+		return false; // never handed a screen table: the single-DP weave
+	}
+	if (gen != mc->weave.segs_generation) {
+		if (mc->weave.segs == NULL) {
+			mc->weave.segs = comp_metal_segments_create((void *)weave_metal_device(), (void *)wm->queue);
+		}
+		if (mc->weave.segs != NULL) {
+			// No session identity: the primary is the system-default
+			// screen, whose DP is the engine's own (the scalar factory).
+			comp_metal_segments_set_screens(mtlb_segs(mc), mc->weave.segs_list, mc->weave.segs_info, 0, NULL);
+		}
+		mc->weave.segs_generation = gen;
+		mc->weave.segs_logged_key = 0;
+		const bool on = mc->weave.segs != NULL && comp_metal_segments_enabled(mtlb_segs(mc));
+		// Lifecycle: once per screen-table generation, per present-owner.
+		U_LOG_W("weave(#2218): present-owner screen table generation %llu (%u screen(s), metal backend) — %s",
+		        (unsigned long long)gen, mc->weave.segs_list->count,
+		        on ? "a window not wholly on the default screen is woven by each screen's own DP"
+		           : "per-screen weaving off (fewer than two placed screens, no registry entry for the "
+		             "default screen, or DXR_SEGMENTS=0): single-DP weave");
+	}
+	return mc->weave.segs != NULL && comp_metal_segments_enabled(mtlb_segs(mc));
+}
+
+/*!
+ * One metric update: the window in backing px at its own scale against the
+ * screens, the table, the DP lifecycle. Inside the record's autorelease pool
+ * (a vendor DP may be created here).
+ *
+ * @return true when this submit must be woven per screen.
+ */
+static bool
+mtlb_segs_update(struct multi_compositor *mc, struct weave_metal *wm, const struct comp_multi_weave_macos_params *p)
+{
+	if (!comp_multi_weave_macos_segs_eligible(mc, p) || !mtlb_segs_sync(mc, wm)) {
+		return false;
+	}
+	struct comp_weave_window_cg win;
+	comp_multi_weave_macos_segs_window(mc, &win);
+	if (!(win.scale > 0.0f)) {
+		return false;
+	}
+	const struct comp_metal_seg_window sw = {
+	    .frame_pt = {win.x, win.y, win.w, win.h}, // backing px (px_per_pt below)
+	    .drawable_w = mc->weave.out_w,
+	    .drawable_h = mc->weave.out_h,
+	    .px_per_pt = (double)win.scale,
+	};
+	const bool split = comp_metal_segments_update(mtlb_segs(mc), &sw, 0);
+	// Every per-screen DP follows this session's confirmed 2D/3D state.
+	comp_metal_segments_set_display_mode(mtlb_segs(mc), !mc->weave.hw_2d_confirmed);
+	comp_multi_weave_macos_segs_log(mc, comp_metal_segments_get_table(mtlb_segs(mc)), split);
+	return split;
+}
+#endif // COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+
 static bool
 mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_macos_params *p)
 {
@@ -874,17 +995,49 @@ mtlb_record_and_wait(struct multi_compositor *mc, const struct comp_multi_weave_
 			view_count = p->view_count;
 		}
 
-		// Phase: re-asserted every submit so a moved window keeps its lattice
-		// (the helper is a no-op for a DP without the slot).
-		if (p->have_present_origin) {
-			xrt_display_processor_metal_set_present_origin(dp, p->present_origin_x, p->present_origin_y);
+		// #2218 item 6: woven per screen? Every one-screen system, every window
+		// wholly on the default screen and every legacy single-rect submit is
+		// the single-DP weave below, byte for byte.
+		bool seg_split = false;
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+		seg_split = mtlb_segs_update(mc, wm, p);
+		mc->weave.segs_split = seg_split;
+		if (seg_split) {
+			// Crop each segment's views, weave each with its screen's DP over
+			// its canvas (the engine's DP first, phased by its segment's
+			// origin), flat 2D where nothing can weave.
+			const struct comp_metal_segments_frame sf = {
+			    .command_buffer = (void *)cmd,
+			    .src_texture = (void *)atlas,
+			    .view_width = view_w,
+			    .view_height = view_h,
+			    .tile_columns = cols,
+			    .tile_rows = rows,
+			    .target_texture = (void *)wm->out_tex,
+			    .target_width = mc->weave.out_w,
+			    .target_height = mc->weave.out_h,
+			    .transparent_background = false, // every pixel is woven or flat-filled
+			    .primary_dp = dp,
+			    .primary_present_origin = true,
+			};
+			(void)comp_metal_segments_record(mtlb_segs(mc), &sf);
 		}
+#endif
 
-		// ONE process_atlas per submit; the DP encodes its own pass into the
-		// target. Target = the whole output, no canvas sub-rect.
-		xrt_display_processor_metal_process_atlas(dp, (void *)cmd, (void *)atlas, view_w, view_h, cols, rows,
-		                                          (uint32_t)MTLPixelFormatBGRA8Unorm, (void *)wm->out_tex,
-		                                          mc->weave.out_w, mc->weave.out_h, 0, 0, 0, 0);
+		if (!seg_split) {
+			// Phase: re-asserted every submit so a moved window keeps its lattice
+			// (the helper is a no-op for a DP without the slot).
+			if (p->have_present_origin) {
+				xrt_display_processor_metal_set_present_origin(dp, p->present_origin_x, p->present_origin_y);
+			}
+
+			// ONE process_atlas per submit; the DP encodes its own pass into the
+			// target. Target = the whole output, no canvas sub-rect.
+			xrt_display_processor_metal_process_atlas(dp, (void *)cmd, (void *)atlas, view_w, view_h, cols,
+			                                          rows, (uint32_t)MTLPixelFormatBGRA8Unorm,
+			                                          (void *)wm->out_tex, mc->weave.out_w, mc->weave.out_h, 0,
+			                                          0, 0, 0);
+		}
 
 		// A DP that is not alpha-native writes opaque pixels; rebuild the alpha
 		// from the views so cleared gaps stay transparent for the caller's
@@ -976,6 +1129,22 @@ comp_multi_weave_macos_metal_predicted_eyes(struct xrt_display_processor_metal *
 static bool
 mtlb_get_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out_eyes)
 {
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+	// #2218 item 6: woven per screen, the base eyes are the majority screen's
+	// DP's (the macOS reply carries no v19 per-screen table: segmentCount 0).
+	if (mc->weave.segs_split && mc->weave.segs != NULL) {
+		bool on_primary = true;
+		const uint64_t eye_screen =
+		    comp_weave_screens_eye_screen(comp_metal_segments_get_table(mtlb_segs(mc)), &on_primary);
+		if (eye_screen != 0 && !on_primary) {
+			@autoreleasepool {
+				if (comp_metal_segments_get_eyes(mtlb_segs(mc), eye_screen, out_eyes)) {
+					return true;
+				}
+			}
+		}
+	}
+#endif
 	return comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eyes);
 }
 
@@ -1021,6 +1190,11 @@ mtlb_fini(struct multi_compositor *mc)
 {
 	@autoreleasepool {
 		struct weave_metal *wm = wm_of(mc);
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS
+		// #2218 item 6: the per-screen DPs, created on our device + queue too.
+		mtlb_segs_destroy(mc);
+#endif
+		comp_multi_weave_macos_segs_free(mc);
 		// The DP first: a vendor DP destroys its weaver (created on our device +
 		// queue) before its own SDK instance, and both must go before the queue.
 		if (mc->weave.dp_metal != NULL) {
