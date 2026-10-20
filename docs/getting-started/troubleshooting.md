@@ -435,6 +435,49 @@ camera specifically.
 
 ---
 
+## Samsung Odyssey 3D: the panel stays 2D, or the 3D colours are wrong at 60 Hz
+
+The Samsung Odyssey 3D (e.g. the G90XF) is a common DisplayXR panel, and two of its
+**on-screen-menu (OSD) settings** can defeat 3D while every piece of software reports
+success. Check both before debugging the runtime or the plug-in. Both apply to every OS
+and every app, because the monitor itself decides.
+
+**1. "3D PC selection" must match the video port the computer is on.**
+
+- **Symptom.** The panel never switches to 3D: the app weaves and eye tracking works, but
+  the image stays flat. Power-cycling or unplugging the other cable doesn't help.
+- **How to recognise it.** The DisplayXR side looks healthy: the log shows the vendor DP
+  weaving and fresh eye positions. The vendor service keeps re-requesting the lens. LeiaSR's
+  SR Service logs `LensSwitchBehavior: switching the lens mode to enable three-dimensional
+  viewing` about once a second, indefinitely. The board accepts the command, but the
+  monitor's firmware holds the lens off.
+- **Fix.** In the Odyssey's OSD, set **3D PC selection** to the input the computer is
+  connected to (the HDMI or the DisplayPort input). The lens switches within a second; no
+  restart is needed.
+- **Watch out when swapping units.** The setting is per monitor, so it is the first thing
+  to check on a newly connected unit.
+
+**2. On HDMI, the input must be set to HDMI 2.0, not HDMI 1.4.**
+
+- **Symptom.** 3D works, but the woven image is full of colour. This shows up at 4K
+  **60 Hz**; at 30 Hz the colours are correct. Seen on Windows and macOS alike.
+- **Cause.** In HDMI 1.4 mode the input can't carry full-colour (RGB) 4K60, so the signal
+  arrives chroma-subsampled. Subsampling averages colour across neighbouring pixels, which
+  destroys the per-subpixel view interleave the weave relies on.
+- **Fix.** Set that HDMI input to **HDMI 2.0** in the Odyssey's OSD. If you can't, fall
+  back to 4K at 30 Hz. DisplayPort doesn't have this limit and also allows refresh rates
+  above 60 Hz.
+- **macOS note.** Changing the HDMI mode re-enumerates the monitor, and macOS may bring it
+  back **mirroring** the laptop. Turn mirroring off again in *System Settings → Displays*
+  (the runtime handles the change live; ADR-047 Amendment 8).
+- **How to judge it.** Use a woven left-white / right-black pattern with a fixed viewer
+  rather than app content. On the macOS Metal path, set
+  `DXR_DEBUG_ATLAS_PATTERN=lr_white_black`; with LeiaSR, also set
+  `SR_SIMULATED_VIEWER="0,100,600,63"`. Each eye should see a clean white or a clean black.
+  A colourful mix in both means the link is the problem, not the runtime.
+
+---
+
 ## Wrong runtime loads, or `XR_RUNTIME_JSON` is ignored
 
 **Symptom.** You set `XR_RUNTIME_JSON` to point at a specific (e.g. dev) runtime, but the
