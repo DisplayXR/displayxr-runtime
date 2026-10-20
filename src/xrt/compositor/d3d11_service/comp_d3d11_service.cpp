@@ -14666,6 +14666,30 @@ static void
 weave_seg_release(struct d3d11_service_compositor *c);
 
 /*!
+ * #2244: a tick that does NOT weave (the presenter has no free back buffer,
+ * the split bridge has nothing weavable) must not let the published segment
+ * table age out. The reader (`SVC_SEG_PUB_FRESH_NS`) treats a table older than
+ * 250 ms as "not the direct presenter" and hands the client ONE view set, so a
+ * presenter that skips for longer than that (a 30 Hz secondary, the 1 s
+ * occlusion backoff) made `segments.split` alternate false (stale) / true (the
+ * next weave republished) with the window standing still. The table itself is
+ * left exactly as the last weave published it; only its freshness is renewed,
+ * and only for a table that exists (count 0 = not split needs no keep-alive:
+ * stale and empty read the same). A window that genuinely leaves the split
+ * state republishes empty on its next weave, as before.
+ *
+ * Render thread, focused client's compositor.
+ */
+static void
+pipeline_segments_keepalive(struct d3d11_service_compositor *fc)
+{
+	std::lock_guard<std::mutex> lk(fc->seg_mutex);
+	if (fc->segments != nullptr && fc->seg_pub.count > 0) {
+		fc->seg_pub_ns = (int64_t)os_monotonic_get_ns();
+	}
+}
+
+/*!
  * The direct pipeline's segment path for the focused client: when its window
  * spans monitors, weave it per screen into the presenter's back buffer — the
  * panel DP (bound to the app's HWND, so it keeps the vendor's phase-snap) on
@@ -15099,6 +15123,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		if (active_backoff) {
 			sys->render_diag_pipe_active_backoff.fetch_add(1, std::memory_order_relaxed);
 		}
+		pipeline_segments_keepalive(fc); // #2244: a skipped weave keeps its table fresh
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		static std::atomic<int64_t> s_last_skip_log_ns{0};
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
@@ -15226,6 +15251,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			 * survive — this return is what drained the hosted chain under
 			 * the split (see pipeline_return_app_grant).
 			 */
+			pipeline_segments_keepalive(fc); // #2244
 			pipeline_return_app_grant(mc, fc, kind);
 			return;
 		}
