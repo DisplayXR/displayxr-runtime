@@ -2039,6 +2039,27 @@ TEST_CASE("gnome_move: the drop waits >= 250 ms on the target monitor after the 
 	CHECK(u_desktop_cross_dwell_left_ms(1000, 900, 300) == 300); // clock went backwards
 }
 
+TEST_CASE("gnome_activate: a press after a monitor crossing settles first; a moved frame is caught",
+          "[desktop][gnome][activate]")
+{
+	// The press settle reuses the crossing dwell: no crossing = no wait.
+	CHECK(U_DESKTOP_PRESS_SETTLE_MS >= 250);
+	CHECK(u_desktop_cross_dwell_left_ms(0, 5000, U_DESKTOP_PRESS_SETTLE_MS) == 0);
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1004, U_DESKTOP_PRESS_SETTLE_MS) > 0); // the 4-5 ms jump
+	const u_desktop_rect before = {100, 200, 800, 600};
+	const u_desktop_rect same = {102, 197, 800, 600};     // within tolerance
+	const u_desktop_rect jumped = {2020, 180, 800, 600};  // relocated to the other monitor
+	const u_desktop_rect resized = {100, 200, 960, 1080}; // tiled
+	const u_desktop_rect nudged = {100, 200, 800, 605};   // one edge past tolerance
+	CHECK_FALSE(u_desktop_frame_moved(&before, &before, 4));
+	CHECK_FALSE(u_desktop_frame_moved(&before, &same, 4));
+	CHECK(u_desktop_frame_moved(&before, &jumped, 4));
+	CHECK(u_desktop_frame_moved(&before, &resized, 4));
+	CHECK(u_desktop_frame_moved(&before, &nudged, 4));
+	const u_desktop_rect huge = {INT32_MIN, INT32_MIN, INT32_MAX, INT32_MAX}; // no overflow
+	CHECK(u_desktop_frame_moved(&before, &huge, 4));
+}
+
 TEST_CASE("gnome_move: only shell UI the gesture opened is dismissed", "[desktop][gnome][move]")
 {
 	const uint8_t W = U_DESKTOP_PICK_WINDOW, D = U_DESKTOP_PICK_DESKTOP, S = U_DESKTOP_PICK_SHELL,

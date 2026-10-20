@@ -117,6 +117,24 @@ u_desktop_success_message(const char *backend_msg, char *out, size_t cap);
  */
 #define U_DESKTOP_CROSS_DWELL_MS 300
 
+/*!
+ * A Super+click right after the pointer changed monitors can be applied with a
+ * STALE pointer position: in Ubuntu's session (Tiling Assistant + dock) mutter's
+ * grab relocated the window ~4–5 ms after the press, to where the first waypoint
+ * from the other monitor would put it (GNOME 50.1: 4/65 activates, 4/18 with the
+ * avatar window). The press waits this long on the target monitor after the last
+ * crossing, at the press point, before Super goes down.
+ */
+#define U_DESKTOP_PRESS_SETTLE_MS U_DESKTOP_CROSS_DWELL_MS
+
+/*!
+ * The frame moved (or changed size) by more than @p tol px on any edge. An
+ * ACTIVATE must never return a plain success with the window moved: it is put
+ * back (a verified move to @p before) or the activate fails saying so.
+ */
+bool
+u_desktop_frame_moved(const struct u_desktop_rect *before, const struct u_desktop_rect *after, int32_t tol);
+
 //! How much longer to wait before releasing: 0 when @p dwell_ms have passed
 //! since @p crossed_at_ms (0 = no crossing).
 uint32_t

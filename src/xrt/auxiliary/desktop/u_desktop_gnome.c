@@ -22,17 +22,21 @@
  * The extension never mutates another app's window (ADR-056 D5), so window ops on
  * them are done as the user would, through the app's own portal session:
  * ACTIVATE = Super+click on a visible part of the window (a point GetWindowAt
- * confirms picks it), then wait for mutter's short grab to end (keys sent during
- * it are lost) and confirm focus; MINIMIZE = activate + Super+H; MAXIMIZE =
- * activate + Super+Up; RESTORE = activate + Super+Down (a minimized window of
- * another app cannot be reached this way: UNSUPPORTED); CLOSE = activate + Alt+F4
- * (a window still open but whose app answers AT-SPI is asking for confirmation in
- * its own window — libadwaita's prompt — and reports like a dialog would);
- * MOVE = Super+drag from a visible point whose drop point keeps clear of every
+ * confirms picks it; after a monitor crossing the pointer first settles
+ * U_DESKTOP_PRESS_SETTLE_MS at that point — a press right after the crossing
+ * had mutter's grab apply a stale pointer position and move the window), then
+ * wait for mutter's short grab to end (keys sent during it are lost), read the
+ * frame back (moved = put back by a verified move, or fail saying so) and
+ * confirm focus; MINIMIZE = activate + Super+H; MAXIMIZE = activate + Super+Up;
+ * RESTORE = activate + Super+Down (a minimized window of another app cannot be
+ * reached this way: UNSUPPORTED); CLOSE = activate + Alt+F4 (a window still
+ * open but whose app answers AT-SPI is asking for confirmation in its own
+ * window — libadwaita's prompt — and reports like a dialog would); MOVE =
+ * Super+drag from a visible point whose drop point keeps clear of every
  * monitor's edges, jumping the pointer (a slow drag over a monitor edge pops
  * Ubuntu's tiling assistant, which grabs the keyboard — Escape if one is up)
- * through waypoints inside each monitor when it changes monitors (a straight jump
- * near the top was stopped at the boundary by a pointer barrier), dwelling
+ * through waypoints inside each monitor when it changes monitors (a straight
+ * jump near the top was stopped at the boundary by a pointer barrier), dwelling
  * U_DESKTOP_CROSS_DWELL_MS on the target monitor after the last crossing before
  * the release (Tiling Assistant judges a drop against the PREVIOUS monitor for
  * 150 ms after a crossing), read back and corrected once — twice when edge

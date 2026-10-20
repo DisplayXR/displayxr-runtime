@@ -395,6 +395,20 @@ super_gesture(struct gnome_backend *g,
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
+	// Just came from another monitor: let the pointer settle at the press point
+	// before Super goes down. In Ubuntu's session (Tiling Assistant + dock) a
+	// press right after the crossing had mutter's grab apply a STALE pointer
+	// position — the window jumped to where the first waypoint would put it,
+	// ~4-5 ms into the grab. Then put the pointer at the press point once more
+	// (verified; same monitor, no new crossing).
+	uint32_t settle = u_desktop_cross_dwell_left_ms(crossed_at, gdbus_now_ms(), U_DESKTOP_PRESS_SETTLE_MS);
+	if (settle > 0) {
+		gdbus_sleep_ms(settle);
+		r = gnome_move_verified(g, x, y, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
 	// The last look before the gesture: the guard, the pointer, the pick.
 	r = gnome_guard_point(g, guard, target, x, y, msg);
 	if (r != U_DESKTOP_OK) {
@@ -531,7 +545,20 @@ wait_grab_end(struct gnome_backend *g, uint64_t id)
 	}
 }
 
-//! Super+click on a visible point of @p id, then wait for focus.
+static enum u_desktop_result
+move_other(struct gnome_backend *g,
+           const struct u_desktop_input_guard *guard,
+           uint64_t id,
+           const struct u_desktop_rect *rect_in,
+           char *msg);
+
+/*!
+ * Super+click on a visible point of @p id, then wait for focus. The frame is
+ * read back: a click that moved the window (a stale pointer position applied to
+ * mutter's grab — see U_DESKTOP_PRESS_SETTLE_MS) is put back by a verified move,
+ * or the activate fails saying where the window went. Never a plain success with
+ * the window moved.
+ */
 static enum u_desktop_result
 activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guard, uint64_t id, char *msg)
 {
@@ -559,6 +586,8 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 		gnome_set_msg(msg, "minimized windows of other apps cannot be restored on GNOME");
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
+	const struct u_desktop_rect before = ws[idx].frame;
+	const bool before_max = (ws[idx].state & (U_DESKTOP_WINDOW_MAXIMIZED | U_DESKTOP_WINDOW_FULLSCREEN)) != 0;
 	struct monitors mon;
 	get_monitors(g, &mon);
 	int32_t x, y;
@@ -579,6 +608,37 @@ activate_other(struct gnome_backend *g, const struct u_desktop_input_guard *guar
 	wait_grab_end(g, id);
 	tidy_after_gesture(g, guard, false);
 	restore_pointer(g, have_orig, ox, oy);
+	// Did the click move it? (Read after the grab ended: a frame read during it is not final.)
+	struct u_desktop_rect after = before;
+	bool after_max = before_max;
+	if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
+		const struct u_desktop_window *w = gnome_find_window(ws, n, id);
+		if (w != NULL) {
+			after = w->frame;
+			after_max = (w->state & (U_DESKTOP_WINDOW_MAXIMIZED | U_DESKTOP_WINDOW_FULLSCREEN)) != 0;
+		}
+		free(ws);
+	}
+	if (after_max == before_max && u_desktop_frame_moved(&before, &after, POINTER_TOLERANCE_PX)) {
+		U_LOG_W("desktop/gnome: activating moved the window (%d,%d %dx%d -> %d,%d %dx%d) — putting it back",
+		        before.x, before.y, before.w, before.h, after.x, after.y, after.w, after.h);
+		char why[U_DESKTOP_MSG_SIZE] = "";
+		// Only a plain move can be undone by a drag (same size, not maximized).
+		bool can = !before_max && before.w == after.w && before.h == after.h;
+		r = can ? move_other(g, guard, id, &before, why) : U_DESKTOP_ERR_FAILED;
+		if (r != U_DESKTOP_OK) {
+			gnome_set_msg(
+			    msg,
+			    "the Super+click moved the window from (%d,%d %dx%d) to (%d,%d %dx%d) and it could "
+			    "not be put back%s%s",
+			    before.x, before.y, before.w, before.h, after.x, after.y, after.w, after.h,
+			    why[0] != '\0' ? ": " : "", why);
+			return r == U_DESKTOP_ERR_REFUSED || r == U_DESKTOP_ERR_WINDOW_LOST ? r : U_DESKTOP_ERR_FAILED;
+		}
+	} else if (after_max != before_max) {
+		gnome_set_msg(msg, "the Super+click changed the window's maximized state — not activated cleanly");
+		return U_DESKTOP_ERR_FAILED;
+	}
 	if (!wait_focus(g, id, 1000)) {
 		gnome_set_msg(msg, "the window did not take focus");
 		return U_DESKTOP_ERR_TIMEOUT;

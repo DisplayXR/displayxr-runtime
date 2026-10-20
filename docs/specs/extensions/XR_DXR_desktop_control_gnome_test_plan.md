@@ -341,6 +341,24 @@ either `ok` (corrected) or `refused`/`failed` with the reason — never a popup 
 And once with a polkit / password prompt already on screen before the move: it must NOT be
 dismissed (it was shell UI before the gesture).
 
+**Activate with the pointer starting on the other monitor (merge-check M1).** In Ubuntu's
+session (Tiling Assistant + dock) a Super+click right after the pointer changed monitors
+sometimes MOVED the window to the other monitor and still returned `ok`: mutter's grab took a
+stale pointer position ~4–5 ms after the press, putting the window where the first waypoint from
+the other monitor would (eb1379b47: 4/65; with the avatar window 4/18; plain GNOME 0/25). Now
+the pointer settles ≥ 300 ms at the press point after the last crossing before Super goes down,
+and the frame is read back after every activate: a moved window is put back by a verified move
+(log: `activating moved the window … — putting it back`) or the activate fails with
+`failed — the Super+click moved the window from (…) to (…) and it could not be put back: …`.
+Before each run, park the pointer on the monitor the window is NOT on (`$SMOKE move X Y`):
+| session | window | runs | expected |
+|---|---|---|---|
+| Ubuntu (Tiling Assistant + dock) | gedit, partly covered | 25 | 25/25 `ok` with the frame unchanged (`list` within 2 px of before); 0 jumps; count any `putting it back` log lines (each must end with the frame back) |
+| Ubuntu (Tiling Assistant + dock) | the avatar window (the app's own window via the Super+click fallback, and another app's avatar) | 25 | same; the old 4/18 must be 0 |
+| plain GNOME | gedit | 25 | same (control) |
+| any | a window whose put-back is impossible (force it: maximize the target first, or note any natural case) | — | `failed — the Super+click moved the window …` or `… changed the window's maximized state …`, never a plain `ok` |
+Each activate after a crossing now takes ~300 ms longer — expected.
+
 ## 9. Window ops on the app's own window
 
 Needs an app with a window (the smoke tool has none): run a DisplayXR test app using the

@@ -129,6 +129,20 @@ u_desktop_cross_dwell_left_ms(uint64_t crossed_at_ms, uint64_t now_ms, uint32_t 
 }
 
 bool
+u_desktop_frame_moved(const struct u_desktop_rect *before, const struct u_desktop_rect *after, int32_t tol)
+{
+	const int64_t a[4] = {before->x, before->y, (int64_t)before->x + before->w, (int64_t)before->y + before->h};
+	const int64_t b[4] = {after->x, after->y, (int64_t)after->x + after->w, (int64_t)after->y + after->h};
+	for (int i = 0; i < 4; i++) {
+		int64_t d = a[i] - b[i];
+		if (d > tol || -d > tol) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
 u_desktop_shell_cover_appeared(const uint8_t *before, const uint8_t *after, uint32_t n)
 {
 	for (uint32_t i = 0; i < n; i++) {
