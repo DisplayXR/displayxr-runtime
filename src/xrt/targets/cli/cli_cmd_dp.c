@@ -623,6 +623,8 @@ screen_key_lookup(const char *key, char *out_key, size_t key_cap, char *out_lega
 {
 	out_key[0] = '\0';
 	out_legacy[0] = '\0';
+	// #2250: the CLI may re-key a legacy per-user preference while it resolves.
+	target_plugin_set_screen_key_rekey(true);
 	struct os_display_edid_list edid;
 	memset(&edid, 0, sizeof(edid));
 	os_display_edid_enumerate(&edid);

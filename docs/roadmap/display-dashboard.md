@@ -521,7 +521,7 @@ collision) when a plug-in's claim on it carries a serial — the highest-confide
 above `FALLBACK`, whichever plug-in wins the screen — because a panel can report a
 different EDID product code per input and the device name can move with the port, while
 the vendor serial names the panel. A preference stored under the EDID ("legacy") key keeps
-matching: a per-user one is re-keyed in place with one WARN, an env / machine one is WARNed
+matching: the service and the CLI re-key a per-user one in place with one WARN; an app, or an env / machine one, is WARNed
 once per process, `dp use --screen <legacy key>` stores under the current key, and
 `dp reset --screen` clears either spelling. Derivation: `target_screen_keys_build_ex`
 (`targets/common/target_screen_pin.h`), unit-tested.

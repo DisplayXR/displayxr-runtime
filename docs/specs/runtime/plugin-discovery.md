@@ -131,8 +131,8 @@ the next session / service start. The screen key is the EDID form
 is keyed `<PNP>-<vendor serial>` as soon as any plug-in's claim on it (above
 `FALLBACK`) carries a serial — the product code and device name can change
 with the cable or port, the vendor serial cannot (#2250). A preference stored
-under a screen's EDID-form ("legacy") key still matches it: the loader re-keys
-a per-user one in place (one WARN) and WARNs once for an env / machine one,
+under a screen's EDID-form ("legacy") key still matches it: the service and the CLI re-key
+a per-user one in place (one WARN; an app only WARNs, as for an env / machine one),
 and `dp reset --screen` accepts either spelling. Key format, store and the
 hot/next-session matrix: `docs/roadmap/display-dashboard.md` §12.
 

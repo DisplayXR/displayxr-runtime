@@ -530,6 +530,16 @@ bool
 target_plugin_get_monitor_legacy_key(uint64_t monitor_id, char *out_key, size_t key_cap);
 
 /*!
+ * Let this process re-key a per-user per-screen preference stored under a
+ * monitor's legacy key (#2250) — rewrite the user's settings file during
+ * @ref target_plugin_resolve_displays. Off by default: only displayxr-service
+ * and the CLI (`dp use/reset --screen`, `displays --claims`) turn it on; an
+ * app's in-process runtime never rewrites the file, it only WARNs once.
+ */
+void
+target_plugin_set_screen_key_rekey(bool allowed);
+
+/*!
  * One plug-in that claimed a monitor (at any confidence) in the last
  * @ref target_plugin_resolve_displays: a plug-in that can drive it.
  */

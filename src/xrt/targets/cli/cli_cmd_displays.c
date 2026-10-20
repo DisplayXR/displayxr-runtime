@@ -135,6 +135,8 @@ static int
 cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 {
 	note_active_panel_headless();
+	// #2250: the CLI may re-key a legacy per-user screen preference while it resolves.
+	target_plugin_set_screen_key_rekey(true);
 
 	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t dn = target_plugin_build_descriptors(list, descs, XRT_DP_REGISTRY_MAX_ENTRIES);

@@ -3510,6 +3510,15 @@ dp_sources_apply_enabled(bool *withdrawn, uint32_t src_count)
 static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
 static uint32_t g_not_ready_prev_count = 0;
 
+//! #2250: this process may rewrite the per-user store to re-key a legacy screen key (service, CLI).
+static bool g_screen_key_rekey_allowed = false;
+
+void
+target_plugin_set_screen_key_rekey(bool allowed)
+{
+	g_screen_key_rekey_allowed = allowed;
+}
+
 struct screen_pref_probe
 {
 	char *buf;
@@ -3528,9 +3537,12 @@ screen_pref_has(const char *key, void *userdata)
  * The per-screen preference for a monitor, by its current key, else by its
  * EDID-form @p legacy_key (#2250: a preference stored before the key moved to
  * the vendor serial keeps applying). A per-user legacy match is re-keyed in
- * the store (one WARN; the next probe matches the current key directly); an
- * env / machine one cannot be (no write access from here), so it is WARNed
- * once per process with the command that re-stores it. Caller holds
+ * the store (one WARN; the next probe matches the current key directly) — but
+ * only in a process that opted in (@ref target_plugin_set_screen_key_rekey:
+ * the service and the CLI; an app never rewrites the user's settings file).
+ * Anywhere else, and for an env / machine match (no write access from here),
+ * the legacy match applies and is WARNed once per process with the command
+ * that re-stores it. Caller holds
  * @ref g_refresh_mutex (it also guards the WARN latch).
  */
 static bool
@@ -3547,7 +3559,8 @@ screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t ca
 	if (m == TARGET_SCREEN_KEY_MATCH_CURRENT) {
 		return true;
 	}
-	if (probe.source == U_SETTING_SOURCE_USER && u_setting_user_set_preferred_plugin_for_screen(key, buf) &&
+	if (probe.source == U_SETTING_SOURCE_USER && g_screen_key_rekey_allowed &&
+	    u_setting_user_set_preferred_plugin_for_screen(key, buf) &&
 	    u_setting_user_set_preferred_plugin_for_screen(legacy_key, NULL)) {
 		U_LOG_W(
 		    "plugin loader: per-screen preference '%s' -> '%s' re-keyed to '%s' (per-user store): the screen "
@@ -3565,14 +3578,19 @@ screen_pref_lookup(const char *key, const char *legacy_key, char *buf, size_t ca
 	if (s_warned_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
 		(void)snprintf(s_warned[s_warned_count++], TARGET_SCREEN_KEY_MAX, "%s", legacy_key);
 	}
+	const char *hint =
+	    " — the service or 'displayxr-cli dp use <id> --screen <key>' re-stores it under the new key";
+	if (probe.source == U_SETTING_SOURCE_MACHINE) {
+		hint = " — re-store it with 'displayxr-cli dp use <id> --screen <key> --machine' (admin)";
+	} else if (probe.source == U_SETTING_SOURCE_ENV) {
+		hint = " — update " U_SETTING_PER_SCREEN_ENV;
+	} else if (g_screen_key_rekey_allowed) {
+		hint = " — re-keying the per-user store failed";
+	}
 	U_LOG_W(
 	    "plugin loader: per-screen preference '%s' -> '%s' (%s) matched by the screen's legacy EDID key; its "
 	    "key is now '%s' (vendor serial, #2250)%s",
-	    legacy_key, buf, u_setting_source_str(probe.source), key,
-	    probe.source == U_SETTING_SOURCE_MACHINE ? " — re-store it with 'displayxr-cli dp use <id> --screen <key> "
-	                                               "--machine' (admin)"
-	    : probe.source == U_SETTING_SOURCE_ENV ? " — update " U_SETTING_PER_SCREEN_ENV
-	                                           : " — re-keying the per-user store failed");
+	    legacy_key, buf, u_setting_source_str(probe.source), key, hint);
 	return true;
 }
 

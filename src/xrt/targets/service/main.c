@@ -53,6 +53,7 @@ workspace_launch_provider(const char *controller_id)
 #include "target_lists.h"
 #include "target_status_snapshot.h"     // ADR-051 D3: the status provider
 #include "target_display_hotplug.h"     // ADR-051 D6: the display-identity follow-up sink
+#include "target_plugin_loader.h"       // #2250: screen-key re-key permission
 #include "target_component_loader.h"    // ADR-054: the component class ids
 #include "target_input_plugin_loader.h" // ADR-054 N3d: input policy re-read -> arbiter re-rank
 #include "service_conversion.h"         // ADR-053: the conversion core
@@ -484,6 +485,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
+	target_plugin_set_screen_key_rekey(true);
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
 	service_conversion_start();
 	// ADR-054 N3d (#2051): after the conversion core subscribed.
@@ -648,6 +651,8 @@ main(int argc, char *argv[])
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 	register_status_provider();
 	register_display_followup();
+	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
+	target_plugin_set_screen_key_rekey(true);
 	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
 	service_conversion_start();
 	// ADR-054 N3d (#2051): after the conversion core subscribed.
