@@ -56,6 +56,7 @@
  */
 
 #include "u_desktop_gnome.h"
+#include "u_desktop_gnome_capture.h"
 
 #include "util/u_json.h"
 #include "util/u_logging.h"
@@ -1327,6 +1328,8 @@ u_desktop_backend_create_platform(void)
 			caps |= U_DESKTOP_CAP_WINDOW_ACTIONS;
 		}
 	}
+
+	caps |= gnome_capture_init(g); // screen capture (u_desktop_gnome_capture.c)
 
 	g->base.name = "gnome";
 	g->base.caps = caps;

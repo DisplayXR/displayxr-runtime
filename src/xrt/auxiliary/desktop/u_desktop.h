@@ -134,6 +134,9 @@ enum u_desktop_scope
 {
 	U_DESKTOP_SCOPE_CONTROL = 0x1, //!< everything in spec v1
 	U_DESKTOP_SCOPE_CAPTURE = 0x2, //!< screen pixels
+	//! Not a scope: ask again even for a GRANTED scope (the user may change what is
+	//! shared, or decline). Passed through to request_scopes.
+	U_DESKTOP_SCOPE_REASK = 0x100,
 };
 
 //! Same bit values as XrDesktopWindowStateFlagsDXR.

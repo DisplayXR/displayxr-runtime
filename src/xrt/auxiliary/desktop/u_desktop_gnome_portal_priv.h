@@ -11,6 +11,7 @@
 #pragma once
 
 #include "u_desktop_gnome.h"
+#include "u_desktop_gnome_capture.h"
 #include "u_desktop_gnome_libs.h"
 
 #include <dbus/dbus.h>
@@ -155,6 +156,9 @@ struct gnome_portal
 		struct ei_device *dev;
 		bool resumed;
 	} devs[GP_MAX_DEVICES];
+
+	//! Screen capture (u_desktop_gnome_capture.c): the session's ScreenCast side.
+	struct gp_cap cap;
 	uint32_t seq;
 	uint64_t last_use_ms;
 
@@ -230,6 +234,44 @@ gp_quitting(struct gnome_portal *p);
 //! u_desktop_gnome_input.c: answer a SelectionTransfer (the paste asking for our text).
 void
 gp_serve_transfer(struct gnome_portal *p, const char *mime, uint32_t serial);
+
+/*
+ * Session plumbing shared with u_desktop_gnome_capture.c (portal thread only).
+ */
+
+enum u_desktop_result
+gp_open_session(struct gnome_portal *p, bool interactive, char *msg);
+
+void
+gp_session_close(struct gnome_portal *p);
+
+void
+gp_register_app(struct gnome_portal *p);
+
+void
+gp_next_token(struct gnome_portal *p, char *out, size_t cap);
+
+void
+gp_expect_response(struct gnome_portal *p, const char *token);
+
+bool
+gp_wait_response(struct gnome_portal *p, uint32_t timeout_ms);
+
+void
+gp_take_request_handle(struct gnome_portal *p, DBusMessage *reply);
+
+void
+gp_dict_add_str(DBusMessageIter *dict, const char *key, const char *val);
+
+void
+gp_dict_add_u32(DBusMessageIter *dict, const char *key, uint32_t val);
+
+void
+gp_dict_add_bool(DBusMessageIter *dict, const char *key, bool val);
+
+//! Queue @p c (async: the thread frees it) and wake the thread. False when shutting down.
+bool
+gp_enqueue_async(struct gnome_portal *p, struct gp_cmd *c);
 
 //! u_desktop_gnome_input.c: drop the compiled keymap.
 void

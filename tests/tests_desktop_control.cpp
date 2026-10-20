@@ -2945,3 +2945,46 @@ TEST_CASE("capture_lifecycle: destroy with a capture in flight drops it without 
 	CHECK(h->rec.capture_count() == 0);
 	delete h;
 }
+
+#include "desktop/u_desktop_spa_pod.h"
+
+TEST_CASE("capture_spa: the hand-built pods are well formed and the format parses back", "[desktop][capture][spa]")
+{
+	alignas(8) uint8_t buf[U_SPA_POD_BUF];
+	size_t n = u_spa_build_enum_format(buf, sizeof(buf));
+	REQUIRE(n > 0);
+	CHECK(n % 8 == 0);
+	uint32_t size = 0, type = 0;
+	memcpy(&size, buf, 4);
+	memcpy(&type, buf + 4, 4);
+	CHECK(size + 8 == n);
+	CHECK(type == U_SPA_TYPE_Object);
+	// The parser reads a Choice as its default: 1920x1080 BGRx.
+	uint32_t w = 0, h = 0, fmt = 0;
+	REQUIRE(u_spa_parse_video_format(buf, n, &w, &h, &fmt));
+	CHECK((w == 1920 && h == 1080 && fmt == U_SPA_VIDEO_FORMAT_BGRx));
+	CHECK(u_spa_build_enum_format(buf, 40) == 0); // never overflows
+	n = u_spa_build_buffers(buf, sizeof(buf));
+	REQUIRE(n > 0);
+	CHECK(n % 8 == 0);
+	CHECK(!u_spa_parse_video_format(buf, n, &w, &h, &fmt)); // not a Format object
+}
+
+TEST_CASE("capture_scope: ASK_AGAIN re-asks a GRANTED scope; the store's allow does not short-circuit it",
+          "[desktop][capture][state]")
+{
+	TempDir dir;
+	Harness h;
+	grant_capture(h);
+	uint32_t before = u_desktop_fake_request_count(h.fake);
+	REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE) == U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_request_count(h.fake) == before);
+	u_desktop_fake_set_capture_request_answer(h.fake, U_DESKTOP_ACCESS_DENIED, false);
+	REQUIRE(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_CAPTURE | U_DESKTOP_SCOPE_REASK) ==
+	        U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_request_count(h.fake) == before + 1);
+	CHECK((u_desktop_fake_last_request_scopes(h.fake, nullptr) & U_DESKTOP_SCOPE_REASK) != 0);
+	CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DENIED); // the user declined this time
+	CHECK(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_REASK) ==
+	      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE); // a modifier alone asks for nothing
+}

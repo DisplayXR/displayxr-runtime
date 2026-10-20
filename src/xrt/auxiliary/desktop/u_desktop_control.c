@@ -680,6 +680,8 @@ int32_t
 u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason, uint32_t scopes)
 {
 	const uint32_t known = U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	bool reask = (scopes & U_DESKTOP_SCOPE_REASK) != 0;
+	scopes &= ~(uint32_t)U_DESKTOP_SCOPE_REASK;
 	if (scopes == 0 || (scopes & ~known) != 0) {
 		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
 	}
@@ -705,7 +707,7 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 		}
 		enum reason why;
 		enum u_desktop_control_state s = evaluate_scope_locked(c, idx, &why);
-		if (blocks_request(why) || s == U_DESKTOP_STATE_GRANTED) {
+		if (blocks_request(why) || (s == U_DESKTOP_STATE_GRANTED && !reask)) {
 			// Rows 1–5: resolved without prompting; a scope already GRANTED is not
 			// asked again. Either way the state is announced.
 			update_scope_locked(c, idx, NULL, true);
@@ -726,8 +728,8 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 		}
 	}
 
-	// Remembered grant: no prompt (row 8).
-	if (c->b->remembers_in_store) {
+	// Remembered grant: no prompt (row 8) — unless the app asks again.
+	if (c->b->remembers_in_store && !reask) {
 		for (int idx = 0; idx < SC_COUNT; idx++) {
 			if ((ask & scope_bit(idx)) != 0 &&
 			    u_desktop_policy_app_scope(c->policy, c->exe, scope_bit(idx)) == U_DESKTOP_APP_ALLOW) {
@@ -743,7 +745,7 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 
 	struct u_desktop_backend *b = c->b;
 	// CONTROL alone goes through request_access, exactly as in spec v1.
-	bool via_scopes = b->request_scopes != NULL && (ask & U_DESKTOP_SCOPE_CAPTURE) != 0;
+	bool via_scopes = b->request_scopes != NULL && ((ask & U_DESKTOP_SCOPE_CAPTURE) != 0 || reask);
 	if (b->request_scopes == NULL && (ask & U_DESKTOP_SCOPE_CAPTURE) != 0) {
 		// A capture-capable backend implements request_scopes; one that does not
 		// cannot ask for CAPTURE (never reached: CAPTURE is UNSUPPORTED there).
@@ -781,7 +783,7 @@ u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason
 	struct u_desktop_app_info app = {c->exe, c->name, reason};
 	// Either may call the done function before returning.
 	if (via_scopes) {
-		b->request_scopes(b, &app, ask, request_scopes_done, t);
+		b->request_scopes(b, &app, ask | (reask ? (uint32_t)U_DESKTOP_SCOPE_REASK : 0u), request_scopes_done, t);
 	} else {
 		b->request_access(b, &app, request_done, t);
 	}
