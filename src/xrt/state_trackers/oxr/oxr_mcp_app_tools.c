@@ -16,8 +16,9 @@
  * each tool's handler parks the JSON-RPC request in a pending-call
  * slot, pushes an XrEventDataMCPToolCallDXR, and blocks on a condvar
  * until the app answers via xrSubmitMCPToolResultDXR — or until the
- * 5 s timeout, after which the agent gets a tool error and a late
- * result is silently dropped.
+ * 5 s timeout, after which the agent gets a JSON-RPC error and a late
+ * result is silently dropped. An XR_FALSE submit is a tool error that
+ * keeps the app's message (oxr_mcp_app_result.h).
  *
  * Threading: one global lock (g_lock) guards both tables. The
  * trampoline blocks on g_cond while holding nothing the app's API
@@ -31,6 +32,7 @@
 #include "oxr_handle.h"
 #include "oxr_api_verify.h"
 #include "oxr_mcp_tools.h"
+#include "oxr_mcp_app_result.h"
 
 #ifdef OXR_HAVE_DXR_mcp_tools
 
@@ -229,15 +231,10 @@ tool_trampoline(const cJSON *params, void *userdata)
 			break; // Torn down (session destroy / unregister).
 		}
 		if (pc->completed) {
-			if (pc->success) {
-				out = pc->result_json != NULL ? cJSON_Parse(pc->result_json) : cJSON_CreateObject();
-				if (out == NULL) {
-					// App submitted unparseable JSON; surface raw.
-					out = cJSON_CreateObject();
-					cJSON_AddStringToObject(out, "raw",
-					                        pc->result_json != NULL ? pc->result_json : "");
-				}
-			}
+			// XR_FALSE is a tool error that keeps the app's message
+			// ("isError":true), not NULL: NULL is the framework's bare
+			// JSON-RPC -32000 "tool handler failed", which drops it.
+			out = oxr_mcp_app_tool_result(pc->success, pc->result_json);
 			pending_free_locked(pc);
 			break;
 		}
@@ -251,7 +248,7 @@ tool_trampoline(const cJSON *params, void *userdata)
 		}
 	}
 	pthread_mutex_unlock(&g_lock);
-	return out; // NULL → framework replies with a JSON-RPC tool error.
+	return out; // NULL (timeout/teardown/saturated) → framework replies with a JSON-RPC error.
 }
 
 /*

@@ -44,7 +44,7 @@ header; semantics summary:
 | `xrRegisterMCPToolDXR(session, tool)` | Register `{name, description, inputSchemaJson}`. Strings are copied. Bare name: `^[a-z0-9][a-z0-9_-]{0,62}$`, no `__`. Duplicate → `XR_ERROR_NAME_DUPLICATED`; budget (32/process) → `XR_ERROR_LIMIT_REACHED`. Late registration is first-class: connected agents get `tools/list_changed`. |
 | `xrUnregisterMCPToolDXR(session, name)` | Remove a tool; in-flight calls on it fail to the agent. |
 | `xrGetMCPToolCallArgsDXR(session, callId, cap, count, buf)` | Two-call idiom fetch of a pending call's JSON arguments (`argsSize` in the event is the required capacity). |
-| `xrSubmitMCPToolResultDXR(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error. Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
+| `xrSubmitMCPToolResultDXR(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error that keeps `resultJson` (e.g. `{"error":"…"}`), flagged `"isError":true` (MCP `result.isError` with displayxr-mcp ≥ v0.5.6). Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
 
 **Event** `XrEventDataMCPToolCallDXR` `{session, callId, toolName[64],
 argsSize}` — delivered through the session's normal `xrPollEvent`
