@@ -837,6 +837,13 @@ struct comp_vk_native_compositor
 	//! set_screens() handed over a new list; the manager is rebuilt on the
 	//! next weave with no fill in flight.
 	bool seg_rebuild;
+	/*!
+	 * #2218: the last weave found the window NOT wholly on the primary screen,
+	 * so the compose step must not hand the app's image to the DP as-is
+	 * (zero-copy) — the frame is composed into our atlas and woven per screen.
+	 * Written by the weave, read by layer_commit, under seg_pub_mutex.
+	 */
+	bool seg_zero_copy_withheld;
 
 	/*!
 	 * Multi-screen M3: per-segment views. @ref seg_pub is the segment table
@@ -5882,14 +5889,21 @@ vk_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_proce
  * - a self-submitting DP or one with no render pass (the split path records
  *   every segment DP into our command buffer, sharing our framebuffer);
  * - no screens handed over, one screen, a pinned session, mixed vendors.
+ *
+ * #2218: @p out_would_split is answered on EVERY weave the manager exists for
+ * — before and independently of zero-copy / the DP's submission mode — so the
+ * compose step can withhold zero-copy for a window off the primary screen.
+ * Only the split itself still needs an atlas that is ours to crop.
  */
 static bool
 vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
                                const struct xrt_rect *dp_canvas,
                                bool zero_copy,
                                bool dp_self_submits,
-                               VkRenderPass dp_render_pass)
+                               VkRenderPass dp_render_pass,
+                               bool *out_would_split)
 {
+	*out_would_split = false;
 	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE ||
 	    !c->have_seg_window) {
 		return false;
@@ -5936,8 +5950,7 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 		c->segments = segs;
 		os_mutex_unlock(&c->seg_pub_mutex);
 	}
-	if (!comp_vk_native_segments_enabled(c->segments) || zero_copy || dp_self_submits ||
-	    dp_render_pass == VK_NULL_HANDLE) {
+	if (!comp_vk_native_segments_enabled(c->segments)) {
 		return false;
 	}
 	struct comp_seg_rect canvas = {
@@ -5946,6 +5959,10 @@ vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
 	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
 	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
 	};
+	*out_would_split = comp_vk_native_segments_would_split(c->segments, &c->seg_window, &canvas);
+	if (zero_copy || dp_self_submits || dp_render_pass == VK_NULL_HANDLE) {
+		return false;
+	}
 	const bool split = comp_vk_native_segments_update(
 	    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
 	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
@@ -5962,7 +5979,9 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
                          bool dp_self_submits,
                          VkRenderPass dp_render_pass)
 {
-	const bool split = vk_segments_frame_update_split(c, dp_canvas, zero_copy, dp_self_submits, dp_render_pass);
+	bool would_split = false;
+	const bool split =
+	    vk_segments_frame_update_split(c, dp_canvas, zero_copy, dp_self_submits, dp_render_pass, &would_split);
 
 	/*
 	 * Multi-screen M3: publish the table this weave took, for the next
@@ -5997,7 +6016,14 @@ vk_segments_frame_update(struct comp_vk_native_compositor *c,
 		m.generation++;
 	}
 	c->seg_pub = m;
+	const bool withheld_changed = c->seg_zero_copy_withheld != would_split;
+	c->seg_zero_copy_withheld = would_split;
 	os_mutex_unlock(&c->seg_pub_mutex);
+	if (withheld_changed) {
+		U_LOG_W("segments: window %s the primary screen — zero-copy %s (#2218)",
+		        would_split ? "left" : "is back on",
+		        would_split ? "withheld: frames compose and weave per screen" : "allowed again");
+	}
 	return split;
 }
 
@@ -11701,6 +11727,22 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	/*
+	 * #2218: a window that is not wholly on the primary screen is woven per
+	 * screen, so its frame must be composed into our atlas for the segments
+	 * to crop; handed to the primary DP as-is it would be woven by the wrong
+	 * vendor wherever it sits. Decided by the last weave (one-frame lag, like
+	 * the split's own R2 resize lag). Same shape as the guards above: a fact
+	 * applied to the RESULT of `u_tiling_can_zero_copy()` (ADR-030).
+	 */
+	os_mutex_lock(&c->seg_pub_mutex);
+	if (c->seg_zero_copy_withheld) {
+		zero_copy = false;
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+#endif
+
 	/*
 	 * XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor
 	 * composes into the atlas - the cursor is drawn there, never into the
@@ -16264,6 +16306,7 @@ comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
 	// ...and nothing may frame views from the old table meanwhile.
 	os_mutex_lock(&c->seg_pub_mutex);
 	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	c->seg_zero_copy_withheld = false; // #2218: re-answered by the next weave
 	os_mutex_unlock(&c->seg_pub_mutex);
 	free(c->seg_screens);
 	c->seg_screens = copy;
