@@ -3,8 +3,8 @@
 | Field | Value |
 |---|---|
 | **Name** | `XR_DXR_desktop_control` |
-| **Spec version** | 1 |
-| **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. Screen capture is **proposed** for spec version 2 (§10, ADR-056 Amendment 1), and nothing of it is implemented. |
+| **Spec version** | 2 (screen capture, §10) |
+| **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. Screen capture (spec version 2, §10, ADR-056 Amendment 1): the common layer, the fake backend, the probe, the CLI and the **GNOME** backend are implemented; GNOME capture awaits its hardware run (gnome test plan §11). Windows and macOS report no CAPTURE capability yet (the CAPTURE scope is `UNSUPPORTED` there). |
 | **Header** | [`XR_DXR_desktop_control.h`](../../../src/external/openxr_includes/openxr/XR_DXR_desktop_control.h) |
 | **Decision** | [ADR-056](../../adr/ADR-056-desktop-control-runs-in-the-app.md) |
 | **Code** | `src/xrt/auxiliary/desktop/` (common layer + one OS backend), `src/xrt/state_trackers/oxr/oxr_desktop_control.c` |
@@ -244,7 +244,7 @@ code). No read at all fails ("the focused window did not ask for the pasted text
 
 ## 8. Not in v1
 
-Window capture (screenshots) — now **proposed** for spec version 2, see §10. A DisplayXR-drawn in-use indicator on Windows / macOS and a
+Window capture (screenshots) — added in spec version 2, see §10. A DisplayXR-drawn in-use indicator on Windows / macOS and a
 global kill-switch hotkey (both planned in the service tray, as the stereo camera's §7.3–7.4),
 X11 sessions, KDE window listing, Flatpak-sandboxed apps on GNOME.
 
@@ -383,20 +383,21 @@ is dropped instead of touching freed memory.
 **Probe.** `test_apps/probes/desktop_control_probe` (headless, every desktop OS) exposes every
 call and runs self-verifying scripts; `e2e_fake.txt` is the fake-backend end-to-end run.
 
-## 10. Screen capture (PROPOSED — spec version 2)
+## 10. Screen capture (spec version 2)
 
-> **PROPOSED. Not implemented, not in the header.** This section specifies a planned
-> `XR_DXR_desktop_control_SPEC_VERSION 2`. Nothing in it is available until the header
-> declares version 2. The decision record is
-> [ADR-056 Amendment 1](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-1--screen-capture-is-its-own-scope-in-the-same-session-proposed-2026-10-19),
-> and its design decisions were DECIDED by David on 2026-10-19 (listed in §10.8). Names and
-> numeric values may still change when the header lands. Sections 1–9 describe
-> version 1 and are unchanged by this one.
+> **Implemented: the common layer, the fake backend, the probe, the CLI and GNOME.**
+> Windows (Windows.Graphics.Capture) and macOS (ScreenCaptureKit) are not implemented yet:
+> those backends report no `CAPTURE_BIT`, so the CAPTURE scope is `UNSUPPORTED` there. The
+> decision record is
+> [ADR-056 Amendment 1](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-1--screen-capture-is-its-own-scope-in-the-same-session-accepted-2026-10-20),
+> with David's decisions of 2026-10-19 (§10.8). Sections 1–9 describe version 1 and are
+> unchanged by this one; §10.9 records what the implementation decided where this section
+> left room.
 
-### 10.1 Additions to the header (proposed)
+### 10.1 Additions to the header
 
-Structure types use the four remaining values of this extension's block (1004999400–409; see
-`src/external/openxr_includes/openxr/README.md`, which is updated when the header lands):
+Structure types use the last four values of this extension's block (1004999406–409; the
+1004999400–409 decade is now full, see `src/external/openxr_includes/openxr/README.md`):
 
 ```c
 #define XR_DXR_desktop_control_SPEC_VERSION 2
@@ -414,12 +415,14 @@ typedef XrFlags64 XrDesktopControlScopeFlagsDXR;
 static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR = 0x00000001;
 //! Screen pixels (§10).
 static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR = 0x00000002;
+//! Not a scope: a request modifier — ask again even for GRANTED scopes (§10.2).
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR = 0x00000100;
 
 //! Chained on XrDesktopControlRequestInfoDXR::next. Absent = CONTROL only (version 1 behaviour).
 typedef struct XrDesktopControlRequestScopeDXR {
     XrStructureType                type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR
     const void* XR_MAY_ALIAS       next;
-    XrDesktopControlScopeFlagsDXR  scopes; //!< non-zero
+    XrDesktopControlScopeFlagsDXR  scopes; //!< at least one scope bit; known bits only
 } XrDesktopControlRequestScopeDXR;
 
 typedef enum XrDesktopCaptureTargetDXR {
@@ -484,8 +487,14 @@ scopes. Rows 8–10 read that scope's own grant:
 - **Requesting.** `xrRequestDesktopControlDXR` with an `XrDesktopControlRequestScopeDXR`
   chained asks for the listed scopes in **one** OS / DisplayXR prompt and announces each
   listed scope's outcome on that scope's event (the §9 "always announce" rule applies per
-  scope). A scope already `GRANTED` is not asked for again. A request is a no-op only while a
-  scope it lists is `PENDING`. `xrCaptureDesktopDXR` **never prompts**.
+  scope). A scope already `GRANTED` is not asked for again — unless the request carries
+  `XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR`, which shows the OS / DisplayXR prompt again
+  so the user can change what is shared (GNOME: which monitors) or decline; its answer
+  replaces the grant. Apps use it only on an explicit user gesture ("change what the
+  assistant can see"). A request is a no-op only while a scope it lists is `PENDING`.
+  `xrCaptureDesktopDXR` **never prompts**: on GNOME a silent restore that turns into a dialog
+  (the saved approval is gone) has that dialog closed at once (`Request.Close` on the pending
+  request — closing the session alone leaves it up) and completes `NOT_GRANTED`.
 - **GNOME.** One portal session carries both scopes. The `Start` response decides each one
   separately: `devices` non-zero ⇒ CONTROL granted, `streams` non-empty ⇒ CAPTURE granted.
   Asking for a scope later opens a **new** combined session, and the dialog asks about input
@@ -533,16 +542,21 @@ scopes. Rows 8–10 read that scope's own grant:
   - Scaled down with an area filter so that `width ≤ maxWidth` and `height ≤ maxHeight`,
     keeping the aspect ratio. Never scaled up: a source smaller than the maximum comes back
     at its own size, in **device** pixels where the OS gives them.
-  - Every real pixel has alpha 255. **Withheld** pixels are `(0,0,0,0)`: off every monitor,
-    on a monitor the user did not share (GNOME), inside an excluded window (§10.4), or inside
-    one of the app's own windows (`OWN` bit, every OS).
+  - Every real pixel has alpha 255. **Withheld** pixels are transparent black `(0,0,0,0)`:
+    off every monitor (including the gaps of a non-rectangular layout inside the bounding box —
+    never opaque black), on a monitor the user did not share (GNOME), inside an excluded window
+    (§10.4), or inside one of the app's own windows (`OWN` bit, every OS). Where downscaling
+    mixes real and withheld pixels, the colour is the average of the real ones only and the
+    alpha is the real share of the footprint.
   - Mapping back to desktop coordinates:
     `x = sourceRect.x + (px + 0.5) * sourceRect.width / width` (and the same for y). The
     result can be fed straight to `xrPickDesktopDXR` or a pointer action.
 - **Retention.** The runtime keeps the image of the **most recent** successful capture only,
-  until it is fetched, the next capture completes, the session ends, or 10 s pass. Fetching
-  any other id, or an expired one, returns `XR_ERROR_VALIDATION_FAILURE`. One fetch may be
-  repeated (two-call idiom). The memory is freed when retention ends.
+  until it is fetched, the next capture completes, the session ends, or 10 s pass. "Fetched"
+  means a call that copied it out: the size query (`capacityInput` 0) and a too-small buffer
+  (`XR_ERROR_SIZE_INSUFFICIENT`) keep it, so the two-call idiom works. Fetching any other id,
+  or an expired or already copied one, returns `XR_ERROR_VALIDATION_FAILURE`. The memory is
+  freed when retention ends.
 - **The 3D panel.** A region over a spatial display returns the panel's **woven** pixels,
   which is what is scanned out. Substituting views is not in v2 and is future work (§10.8,
   decision 5).
@@ -643,8 +657,7 @@ rewritten as v2 on the next write. `displayxr-cli desktop allow | deny | forget 
 
 ### 10.8 Decisions (DECIDED 2026-10-19, David)
 
-The section stays **PROPOSED** until implemented. These design points are no longer open
-(ADR-056 Amendment 1, "Decisions"):
+These design points are settled (ADR-056 Amendment 1, "Decisions"):
 
 1. CAPTURE is usable without CONTROL. GNOME gets a second path, a standalone ScreenCast
    portal session (§10.5).
@@ -657,3 +670,78 @@ The section stays **PROPOSED** until implemented. These design points are no lon
 7. The app's own windows are always masked (alpha 0) on every OS (§10.3, §10.4).
 8. The two macOS ScreenCaptureKit behaviours (`NSWindowSharingNone`, macOS 15's periodic
    confirmation) stay hardware-verification items (§10.7).
+
+### 10.9 Implementation notes (spec version 2)
+
+Decisions this section left open, as implemented in `u_desktop_control.c`,
+`u_desktop_capture.c`, `u_desktop_policy.c` and `u_desktop_gnome_capture.c`:
+
+**Common layer.**
+- Each scope has its own request bookkeeping (requested / pending / revoked / last answer).
+  Rows 1–5 are the same checks for both; row 4 and rows 8–10 read the scope's own store answer
+  and OS grant. The CAPTURE scope is `UNSUPPORTED` (row 1) when the backend lacks the capture
+  ops or `CAPTURE_BIT`.
+- `XrEventDataDesktopCaptureStateChangedDXR` is sent only once the app has touched the CAPTURE
+  scope (asked for it, queried it, captured): a version-1 app never sees one. After that, a
+  kill switch or a lock is announced on both scopes at the next call.
+- A request for CONTROL alone still goes through the backend's `request_access`, exactly as
+  in version 1. A request that lists CAPTURE (or carries ASK_AGAIN) goes through
+  `request_scopes`, which answers per scope; a backend may also answer a scope it was not asked
+  for when the OS dialog decided it (GNOME's Start response), and the common layer takes that
+  answer.
+- Validation of `xrRequestDesktopControlDXR`: `next` is walked for the scope structure; other
+  structures are ignored (version 1 rejected any `next`). `scopes` needs a scope bit and no
+  unknown bit (ASK_AGAIN alone is invalid).
+- `xrCaptureDesktopDXR`: validation, then `FEATURE_UNSUPPORTED` without the capability, then
+  `NOT_GRANTED` unless CAPTURE is `GRANTED` (audited once per state, like a refused action),
+  then `LIMIT_REACHED` with one in flight. WINDOW resolves through the backend's window list
+  (so it needs `LIST_WINDOWS`, which is under the backend, not the CONTROL grant) and is
+  clipped to the monitors' bounding box like a region.
+- The app's own windows are withheld from the backend's window list (`OWN`, not minimized,
+  their frame); if the list cannot be read the capture is refused ("cannot honour capture
+  exclusion (the app's own windows)").
+- The capture worker is started on the first capture; checks run before the target is
+  resolved, before the OS capture and before the hand-over (a frame finished as the kill
+  switch, a lock or a deny lands is dropped, with that reason).
+- `frameTime` is the time the backend's grab started (never earlier than the call).
+- Audit: a burst is closed by 2 s without a capture **or by a different target** (kind, window
+  id, or source rect), so one record names one target. Records carry `scope`, `target`
+  (`kind`, `rect`, and `id` / `app` / `title` for a window), `w`, `h`, `count`, `first`,
+  `last`, `result`, `message` on failure. Consent records carry `scope` when CAPTURE is
+  involved.
+- Store v2: an entry without a CAPTURE answer is written as the version-1 string, so an older
+  runtime reading the file still sees a CONTROL `deny`. `displayxr-cli desktop deny|forget`
+  default to `--scope all`, `allow` to `--scope control`.
+
+**GNOME.**
+- Capability: `CAPTURE_BIT` when `libpipewire-0.3.so.0` loads (dlopen'd, no `DT_NEEDED`). The
+  ScreenCast portal is probed on the portal thread when first needed and **re-probed every
+  10 s until it answers** — a portal still starting at login is never cached as absent.
+- Frames: `pw_stream` directly (no GStreamer), a fresh stream per monitor the region touches,
+  SHM buffers only (MemFd / MemPtr, BGRx / BGRA / RGBx / RGBA), the first frame awaited
+  (2 s), streams torn down before the capture returns. The SPA pods are hand-built
+  (`u_desktop_spa_pod.c`), byte-identical to libspa 1.6.2's builder.
+- The image is the region in stage px × the highest scale among the monitors it touches
+  (frame px ÷ stream size); lower-density monitors are sampled up (nearest).
+- **Never downgrade.** xdg-desktop-portal-gnome restores exactly the shape a token was issued
+  for. A grant that covers the screens is restored with `SelectSources` every time — for input
+  actions too, and even in a process without libpipewire. A request that adds a scope (or
+  ASK_AGAIN) opens a new combined session interactively, asking for the screens again whenever
+  the old grant had them; the old token is not passed (so not consumed) and is put back if the
+  dialog fails.
+- **Monitor blink.** Before a silent restore of a grant that covers screens, the backend reads
+  `org.gnome.Mutter.DisplayConfig.GetCurrentState`: it waits (at most 6 s) until the layout
+  serial has been stable for 2 s and every monitor (connector) the grant covered is present,
+  else it does not restore (`TIMEOUT`, the grant is kept) — restoring with a monitor missing
+  (the DS1's HDMI handshake after boot) gives a session without it, and GNOME saves that
+  reduced approval. (Changes are detected by polling the serial at restore time, not by the
+  `MonitorsChanged` signal.)
+- A restore that is not silent within 5 s — a dialog — is closed with `Request.Close`, and the
+  grant is treated as revoked (both scopes `DENIED`, as in version 1).
+- The user may untick remote interaction (`devices` 0): CONTROL `DENIED`, CAPTURE `GRANTED`,
+  the session stays open without libei. A screens-only token never restores for input.
+- CAPTURE alone is a standalone ScreenCast session (`persist_mode` 2 on `SelectSources`,
+  portal v4+). On Ubuntu 22.04 (RemoteDesktop v1, no libei) CAPTURE always takes this path, so
+  `request-scopes all` shows two dialogs there.
+- `capture_excluded` windows are withheld over their `frame` and `buffer` rects; without the
+  extension (or without its answer) the capture is refused.

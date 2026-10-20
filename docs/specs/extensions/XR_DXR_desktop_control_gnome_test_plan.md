@@ -384,3 +384,58 @@ which read as "without a grant" — it is the input path that differs, not the c
 
 Report per box: the `info` line, a pass/fail per section, and for failures the backend's log
 lines (`XRT_LOG=info`).
+
+## 11. Screen capture (spec v2 §10, ADR-056 Amendment 1) — the capture delta
+
+Untested on hardware when it landed: the portal / PipeWire path compiled on Ubuntu 22.04 and
+26.04, the SPA pods were checked byte for byte against libspa 1.6.2 and the stream ABI against
+the 26.04 headers, but **no frame has been grabbed by this code yet**. The Python prototype in
+the Lenovo app class (GStreamer, DS1, GNOME 50) is the reference: pull 82–204 ms, compose
+~165 ms at 7680x2400, 0.3–0.45 s per capture. This C path (libpipewire directly, no GStreamer,
+nearest-sample compose) should beat the compose figure; report both numbers.
+
+Setup: `libpipewire-0.3-0` installed (`info` shows caps `0x7f` on box A/B; without it `0x3f`).
+The DS1 headless GNOME harness is fine for everything but the dialogs (answer those by hand, or
+with the harness's portal-dialog driver). Run in ONE `script` process, as in §0, with
+`XRT_LOG=info`. Both the smoke tool (backend, no safety layer) and `desktop_control_probe`
+(the OpenXR API, with the safety layer) have capture commands:
+
+```bash
+$SMOKE script <<'S'
+request-scopes all
+monitors
+capture 0 0 7680 2400 /tmp/desk.ppm
+capture 100 100 400 300
+S
+# through OpenXR (fake-free): consent, 4 Hz cap, audit, masking of the app's own windows
+desktop_control_probe script my_capture.txt   # request-scopes all / capture desktop max=1920x1080 --save /tmp/a.png
+```
+
+| # | Check | Expected |
+|---|---|---|
+| 11.1 | `request-scopes all` on a fresh process | ONE dialog: a screen picker + "allow remote interaction". `access: control GRANTED, capture GRANTED` |
+| 11.2 | 20 captures in a loop (`capture …` × 20, or the probe at 4 Hz) | **no white flash**, `dbus-monitor --session "interface='org.gnome.Shell.Screenshot'"` silent; per-capture time logged |
+| 11.3 | The screen-sharing / remote indicator | up during the burst, gone ~2 s after the last capture |
+| 11.4 | `capture` after 3 s idle (session closed) | restores silently (no dialog), first frame arrives on an idle screen |
+| 11.5 | Untick "remote interaction" in the dialog (`request-scopes all+again`) | `control DENIED, capture GRANTED`; input actions refused, captures work |
+| 11.6 | Share one of two monitors | a region over the unshared one comes back with alpha 0 (`withheld px` = its area) |
+| 11.7 | Mixed scale (1x + 2x, and 1.33x + 2x) | `capture` over both: size = region × 2; `--save` image lines up; the probe's `expect-desktop-pixel` on a known button maps to it, and a CLICK at the mapped point lands on it |
+| 11.8 | Gaps of a non-rectangular layout (monitors of different heights) | alpha 0 there (never opaque black) |
+| 11.9 | A capture-excluded window (a transparent DisplayXR app, or `CaptureExclusion1` on a test window) | alpha 0 over its whole frame. Disable the extension → `refused: cannot honour capture exclusion` |
+| 11.10 | The app's own window (probe run from a DisplayXR app / harness window) | alpha 0 over its frame |
+| 11.11 | Lock the screen, capture | `refused: screen locked` (common layer: NOT_GRANTED at submit, state SUSPENDED); after unlock captures resume without a dialog |
+| 11.12 | Uninstall libpipewire (`sudo dpkg -r --force-depends libpipewire-0.3-0` in a container, or `LD_LIBRARY_PATH` to an empty dir does not hide it — use the container) | caps without `0x40`; capture state UNSUPPORTED; an existing screen grant is still restored WITH screens (log: SelectSources sent) |
+| 11.13 | **Never downgrade**: grant `all`, then only input actions for a while (sessions restore), then capture | the capture restores silently with screens; GNOME's saved approval still includes the screens (`flatpak permission-show` / the portal permission store) |
+| 11.14 | **Monitor blink**: reboot the DS1 (HDMI handshake), capture right after login | no restore while the panel is missing (log: `a monitor the screen grant covers is missing`), then a silent restore once it is back; the saved approval still lists BOTH monitors |
+| 11.15 | Unplug a shared monitor, capture | refused (TIMEOUT: monitor missing), the grant is kept; replug → works again |
+| 11.16 | **Stale approval**: delete the approval from the permission store, then capture | no dialog stays up (the restore's dialog is closed with `Request.Close`), result NOT_GRANTED, capture state DENIED; `request-scopes capture` then shows the dialog |
+| 11.17 | CAPTURE only, no CONTROL (`request-scopes capture` in a fresh process) | a ScreenCast-only dialog (no input question); captures work; input actions not granted |
+| 11.18 | CAPTURE after CONTROL (`request-scopes control`, then `request-scopes capture`) | a second, combined dialog that asks about input again; cancelling it keeps the CONTROL grant |
+| 11.19 | `request-scopes capture+again` while granted | the dialog again; choose different monitors → the next capture shows the new set |
+| 11.20 | Slow portal at login: capture immediately after login | a ScreenCast probe that times out is retried (log: `retrying in 10 s`), never a session restored without the screens |
+| 11.21 | No file written | `inotifywait -m -r $HOME /tmp` during 100 captures without `--save`: nothing but the audit log line(s) |
+| 11.22 | Audit | `displayxr-cli desktop audit --tail 5`: one `capture` record per burst with `count`, `w`/`h`, target, first/last — no pixel data |
+| 11.23 | 22.04 Wayland session (box C) | CAPTURE works through the standalone ScreenCast session (RemoteDesktop v1 has no persistence); `request-scopes all` shows two dialogs there (consent-only remote desktop + screen cast) |
+
+Report per box: the `info` caps, pass/fail per row, capture times (min / median / max for
+11.2), and the backend log for every failure.
