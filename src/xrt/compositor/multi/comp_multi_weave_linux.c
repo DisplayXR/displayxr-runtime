@@ -20,6 +20,12 @@
  * macOS / Android engines. The snap and the phase feed therefore go through
  * this engine's DP, not through any compositor's.
  *
+ * Multi-screen (#2218 item 6): that DP weaves the system-default screen. A
+ * window not wholly on it is woven per screen — each other screen's part by a
+ * windowless per-screen DP from THAT screen's registry claimant
+ * (comp_vk_native_segments, the in-process Vulkan compositor's manager), see
+ * "Per-screen display processors" below and docs/architecture/comp-segments.md.
+ *
  * Linux platform mapping (vs the Android original):
  *
  *  - Handles are fds (XRT_GRAPHICS_BUFFER_HANDLE_IS_FD,
@@ -123,6 +129,11 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "comp_multi_private.h"
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+#include "vk_native/comp_vk_native_segments.h" // #2218 item 6: per-screen DPs
+#include "util/comp_weave_screens.h"
+#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 
@@ -842,9 +853,12 @@ weave_create_local(
     struct vk_bundle *vk, uint32_t w, uint32_t h, VkImage *out_image, VkDeviceMemory *out_memory, VkImageView *out_view)
 {
 	VkExtent2D extent = {.width = w, .height = h};
-	VkResult ret =
-	    vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
-	                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out_memory, out_image);
+	// TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
+	// segment's views OUT of this atlas, and flat-blits from it.
+	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
+	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	                                          VK_IMAGE_USAGE_SAMPLED_BIT,
+	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
 		return false;
@@ -1627,6 +1641,216 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	}
 }
 
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+/*
+ *
+ * Per-screen display processors (#2218 item 6, ADR-047 D2 / Amendment 4 on
+ * desktop Linux).
+ *
+ * A bound window that is not wholly on the system-default screen is woven per
+ * screen, the rule the Windows service applies to the same present-owner
+ * (#1884) and the in-process compositors apply to their own windows: each
+ * screen's part (segment = window ∩ screen) by the display processor of THAT
+ * screen — a windowless per-screen DP (create_dp_vk_for_screen) from the
+ * screen's own registry claimant, so a per-screen preference (`dp use <id>
+ * --screen <key>`) decides it — with that screen's present origin, scissored
+ * into the one woven output; the default screen's part by this engine's own DP
+ * (mc->weave.dp), phased exactly as before. A segment no DP can weave (no
+ * claimant, no per-screen factory, or a DP needing 1:1 pixels on a screen that
+ * resamples the window) and the part of the window on no screen are painted
+ * flat — the #1654 off-panel rule, now per screen. The manager is the
+ * in-process Vulkan compositor's (comp_vk_native_segments): same table, same
+ * DP lifecycle hysteresis, same crop-before-DP, same flat fill.
+ *
+ */
+
+//! Destroy the manager (its DPs and crop images). Rare: a screen-table change
+//! or teardown — waits the queue idle first (the manager's destroy contract).
+static void
+weave_segs_release(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.segs != NULL) {
+		weave_queue_wait_idle(vk);
+		comp_vk_native_segments_destroy(&mc->weave.segs);
+	}
+	mc->weave.segs_split = false;
+	mc->weave.segs_logged_key = 0;
+}
+
+static void
+weave_segs_free(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	weave_segs_release(vk, mc);
+	free(mc->weave.segs_list);
+	free(mc->weave.segs_info);
+	free(mc->weave.segs_proj);
+	mc->weave.segs_list = NULL;
+	mc->weave.segs_info = NULL;
+	mc->weave.segs_proj = NULL;
+	mc->weave.segs_generation = 0;
+}
+
+/*!
+ * (Re)build the manager when the system's screen table moved (start-up, a
+ * hotplug, a re-claim, a per-screen preference). Built once per generation,
+ * successful or not, so a hopeless table is not retried every frame.
+ *
+ * @return true when the manager exists and segments (>= 2 placed screens and
+ *         a registry entry for the system-default screen).
+ */
+static bool
+weave_segs_sync(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.segs_list == NULL) {
+		mc->weave.segs_list = U_TYPED_CALLOC(struct xrt_screen_list);
+		mc->weave.segs_info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		mc->weave.segs_proj = U_TYPED_CALLOC(struct xrt_screen_list);
+		mc->weave.segs_frame = -1;
+		if (mc->weave.segs_list == NULL || mc->weave.segs_info == NULL || mc->weave.segs_proj == NULL) {
+			weave_segs_free(vk, mc);
+			return false;
+		}
+	}
+	const uint64_t gen = multi_system_weave_screens_snapshot(mc->msc, mc->weave.segs_generation,
+	                                                         mc->weave.segs_list, mc->weave.segs_info);
+	if (gen == 0) {
+		return false; // never handed a screen table: the single-DP weave
+	}
+	if (gen != mc->weave.segs_generation) {
+		weave_segs_release(vk, mc);
+		mc->weave.segs_generation = gen;
+		memset(mc->weave.segs_proj, 0, sizeof(*mc->weave.segs_proj));
+		struct comp_vk_native_segments *segs =
+		    comp_vk_native_segments_create(vk, mc->weave.cmd_pool, VK_NULL_HANDLE /* the DPs see main_queue */);
+		if (segs != NULL) {
+			comp_vk_native_segments_set_screens(segs, mc->weave.segs_list, mc->weave.segs_info, 0);
+		}
+		mc->weave.segs = segs;
+		const bool on = segs != NULL && comp_vk_native_segments_enabled(segs);
+		// Lifecycle: once per screen-table generation, per present-owner.
+		U_LOG_W("weave(#2218): present-owner screen table generation %llu (%u screen(s)) — %s",
+		        (unsigned long long)gen, mc->weave.segs_list->count,
+		        on ? "a window not wholly on the default screen is woven by each screen's own DP"
+		           : "per-screen weaving off (fewer than two placed screens, no registry entry for the "
+		             "default screen, or DXR_SEGMENTS=0): single-DP weave");
+	}
+	return mc->weave.segs != NULL && comp_vk_native_segments_enabled(mc->weave.segs);
+}
+
+/*!
+ * One WARN when what the weave does per screen changes — split or not, and
+ * which screens — never per drag step (the geometry moves every frame of a
+ * drag; the screens a window covers change at a human rate).
+ */
+static void
+weave_segs_log(struct multi_compositor *mc, bool split)
+{
+	const struct comp_segment_table *t = comp_vk_native_segments_get_table(mc->weave.segs);
+	uint64_t key = split ? 1u : 0u;
+	if (split && t != NULL) {
+		key ^= (uint64_t)t->count << 1;
+		for (uint32_t k = 0; k < t->count; k++) {
+			key = key * 1099511628211ull ^ t->seg[k].screen_id;
+		}
+		key |= 1u;
+	}
+	if (key == mc->weave.segs_logged_key) {
+		return;
+	}
+	const bool was_split = (mc->weave.segs_logged_key & 1u) != 0;
+	mc->weave.segs_logged_key = key;
+	if (!split) {
+		if (was_split) {
+			U_LOG_W(
+			    "weave(#2218): window %d,%d %ux%u is wholly on the default screen again — single-DP weave",
+			    mc->weave.win_x, mc->weave.win_y, mc->weave.win_w, mc->weave.win_h);
+		}
+		return;
+	}
+	struct comp_weave_segment_owner own[COMP_SEGMENTS_MAX];
+	const uint32_t n = comp_weave_screens_owners(t, mc->weave.segs_list, own, COMP_SEGMENTS_MAX);
+	char buf[768];
+	size_t used = 0;
+	buf[0] = '\0';
+	for (uint32_t k = 0; k < n && used + 1 < sizeof(buf); k++) {
+		const int w = snprintf(buf + used, sizeof(buf) - used,
+		                       "%s[%u] screen 0x%016llx by '%s' (%s) canvas %d,%d %ux%u present origin %d,%d%s",
+		                       k > 0 ? "; " : "", k, (unsigned long long)own[k].screen_id,
+		                       own[k].plugin_id[0] != '\0' ? own[k].plugin_id : "(no claimant: flat 2D)",
+		                       own[k].session_dp ? "the engine's own DP" : "a per-screen DP",
+		                       own[k].window_rect.x, own[k].window_rect.y, own[k].window_rect.w,
+		                       own[k].window_rect.h, own[k].present_origin_x, own[k].present_origin_y,
+		                       own[k].one_to_one ? "" : " (resampled: flat unless the DP tolerates it)");
+		if (w < 0) {
+			break;
+		}
+		used += (size_t)w < sizeof(buf) - used ? (size_t)w : sizeof(buf) - used - 1;
+	}
+	U_LOG_W("weave(#2218): window %d,%d %ux%u woven per screen (%s frame) — %s", mc->weave.win_x, mc->weave.win_y,
+	        mc->weave.win_w, mc->weave.win_h, comp_weave_frame_str((enum comp_weave_frame)mc->weave.segs_frame),
+	        buf);
+}
+
+/*!
+ * One metric update of the per-screen weave: place the screens in the
+ * window's frame (comp_weave_screens_project), hand a moved projection to the
+ * manager without disturbing its DPs, recompute the table and run the DP
+ * lifecycle (hysteresis: a DP is created after 2 updates on its screen and
+ * retired ~30 updates after the window left it).
+ *
+ * Holding weave.mutex, the previous frame waited.
+ *
+ * @return true when this submit must be woven per screen.
+ */
+static bool
+weave_segs_update(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!weave_segs_sync(vk, mc)) {
+		return false;
+	}
+	const struct comp_weave_window win = {
+	    .x = mc->weave.win_x,
+	    .y = mc->weave.win_y,
+	    .w = mc->weave.win_w,
+	    .h = mc->weave.win_h,
+	    .logical_valid = mc->weave.win_logical.valid,
+	    .logical_x = mc->weave.win_logical.x,
+	    .logical_y = mc->weave.win_logical.y,
+	    .logical_scale = mc->weave.win_logical.scale,
+	};
+	struct xrt_screen_list proj;
+	struct comp_seg_rect wr;
+	const enum comp_weave_frame frame = comp_weave_screens_project(mc->weave.segs_list, &win, &proj, &wr);
+	if ((int)frame != mc->weave.segs_frame) {
+		mc->weave.segs_frame = (int)frame;
+		// Human-rate: changes with the bind's shape (v12 logical origin or not).
+		U_LOG_W("weave(#2218): window placed against the screens in the %s frame%s",
+		        comp_weave_frame_str(frame),
+		        frame == COMP_WEAVE_FRAME_NONE
+		            ? " — no v12 logical origin on a scaled desktop: the device frame is ambiguous, single-DP "
+		              "weave with the off-panel 2D rule"
+		            : "");
+	}
+	if (frame == COMP_WEAVE_FRAME_NONE) {
+		return false;
+	}
+	if (comp_weave_screens_compare(mc->weave.segs_proj, &proj) != COMP_WEAVE_SCREENS_SAME) {
+		if (!comp_vk_native_segments_set_screen_geometry(mc->weave.segs, &proj)) {
+			return false; // cannot happen (same list, same filter): stay single-DP
+		}
+		*mc->weave.segs_proj = proj;
+	}
+	const struct comp_seg_rect canvas = {0, 0, wr.w, wr.h};
+	const bool split = comp_vk_native_segments_update(mc->weave.segs, &wr, &canvas, (int32_t)WEAVE_VK_FORMAT,
+	                                                  !mc->weave.fence_pending, 0);
+	// Every per-screen DP follows this session's confirmed 2D/3D state, like
+	// the engine's own DP (a DP the update just created gets it here).
+	comp_vk_native_segments_set_display_mode(mc->weave.segs, !mc->weave.hw_2d_confirmed);
+	weave_segs_log(mc, split);
+	return split;
+}
+#endif // COMP_MULTI_WEAVE_HAVE_SEGMENTS
 
 /*!
  * Which output kind to (re)allocate. A client's explicit request (an export of
@@ -2523,12 +2747,34 @@ weave_run_frame(struct vk_bundle *vk,
 	    .serial = 0, // assigned on success
 	};
 
+	// #2218 item 6: per-screen display processors. Batch / v6 only (both weave
+	// the WHOLE window as one canvas, which is what the segment table cuts) and
+	// only while the output IS the window (v6 at viewScale 1); never in mono 2D
+	// (one flat view, no weave) or with a self-submitting DP (its own submit
+	// could not be ordered after the per-segment crops). Every other frame —
+	// and every one-screen system, where the manager never enables — is the
+	// single-DP weave below, byte for byte.
+	bool seg_split = false;
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	{
+		const bool mono_frame = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
+		const bool whole_window = (nview || rect_count > 0) && mc->weave.have_geometry &&
+		                          mc->weave.out_w == mc->weave.win_w && mc->weave.out_h == mc->weave.win_h;
+		if (whole_window && !mono_frame && !xrt_display_processor_is_self_submitting(mc->weave.dp)) {
+			seg_split = weave_segs_update(vk, mc);
+		}
+		mc->weave.segs_split = seg_split;
+	}
+#endif
+
 	// Off-panel 2D (#1654): the bands of the output that are not on the panel.
 	// A window entirely off the panel is one band covering the whole output,
-	// and then the weave is skipped — nothing of it would be seen.
+	// and then the weave is skipped — nothing of it would be seen. A window
+	// woven per screen (above) takes the per-screen rule instead: its parts off
+	// every DP-backed screen are painted flat by the segment record.
 	struct u_wl_rect_px offpanel[4];
 	bool skip_weave = false;
-	uint32_t offpanel_count = weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
+	uint32_t offpanel_count = seg_split ? 0u : weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
 	bool blend_begun = false;
 
 	// Spec v13 (XrWeaveSubmitMonoIn2DDXR): mono while the hardware is 2D. The
@@ -2568,7 +2814,10 @@ weave_run_frame(struct vk_bundle *vk,
 	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
 	bool ov_acquired = false; // ov taken from the producer and in SHADER_READ_ONLY_OPTIMAL
 	bool ov_in_dp = false;    // the DP composites ov in this frame's process_atlas
-	if (ov != NULL && !skip_weave && ov->w == mc->weave.out_w && ov->h == mc->weave.out_h &&
+	// Not while woven per screen: the layer is window-sized and a DP composites
+	// it over its whole target, which no segment DP covers — the post-weave
+	// blend composites it instead (the Windows #1884 rule).
+	if (ov != NULL && !skip_weave && !seg_split && ov->w == mc->weave.out_w && ov->h == mc->weave.out_h &&
 	    xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
 		weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 		weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
@@ -2649,7 +2898,46 @@ weave_run_frame(struct vk_bundle *vk,
 	// the window. v6: the caller's grid at content_view dims. A
 	// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
 	// contract; it records into its own buffer).
-	if (!skip_weave) {
+	if (seg_split) {
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+		// #2218 item 6: crop each segment's views, weave each with its
+		// screen's DP over its canvas (the engine's DP first, for the default
+		// screen's part, phased by weave_feed_dp_geometry above), flat 2D
+		// where nothing can weave.
+		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+		const struct comp_vk_native_segments_frame sf = {
+		    .cmd = cmd,
+		    .is_repaint = false,
+		    .src_image = dp_src_image,
+		    .src_format = dp_src_format,
+		    .view_width = atlas_view_w,
+		    .view_height = atlas_view_h,
+		    .tile_columns = grid_cols,
+		    .tile_rows = grid_rows,
+		    .target_fb = mc->weave.out_fb,
+		    .target_image = mc->weave.out_image,
+		    .target_view = mc->weave.out_view,
+		    .target_width = mc->weave.out_w,
+		    .target_height = mc->weave.out_h,
+		    .target_format = WEAVE_VK_FORMAT,
+		    .canvas = {0, 0, mc->weave.out_w, mc->weave.out_h},
+		    .content = NULL,                 // one view set (no per-segment views on this path)
+		    .transparent_background = false, // the engine never declares transparency to its DP
+		    .atlas_encoding = -1,            // nor an atlas encoding
+		    .primary_dp = mc->weave.dp,
+		};
+		(void)comp_vk_native_segments_record(mc->weave.segs, &sf);
+		// The record leaves the target in PRESENT_SRC_KHR (the DP contract it
+		// shares with the in-process compositor); everything below continues
+		// from COLOR_ATTACHMENT_OPTIMAL.
+		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+		                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+#endif
+	} else if (!skip_weave) {
 		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
 		xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
 		                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
@@ -2897,6 +3185,22 @@ weave_run_frame(struct vk_bundle *vk,
 	// Eyes flow OUT for the caller's next off-axis frame; the weave itself
 	// reads the tracker DP-internally.
 	U_ZERO(out_eyes);
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	// #2218 item 6: woven per screen, the base eyes are the majority screen's
+	// DP's (desktop Linux reports v19 segmentCount 0, so the caller frames
+	// every rect from these) — a window wholly on another screen is rendered
+	// for THAT screen's viewer, not the default screen's.
+	if (seg_split) {
+		bool on_primary = true;
+		const uint64_t eye_screen =
+		    comp_weave_screens_eye_screen(comp_vk_native_segments_get_table(mc->weave.segs), &on_primary);
+		if (eye_screen != 0 && !on_primary &&
+		    comp_vk_native_segments_get_eyes(mc->weave.segs, eye_screen, out_eyes)) {
+			return true;
+		}
+		U_ZERO(out_eyes);
+	}
+#endif
 	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
 		U_ZERO(out_eyes);
 	} else {
@@ -3488,6 +3792,10 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 			mc->weave.overlay_blend_initialized = false;
 		}
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+		// #2218 item 6: the per-screen DPs + crops (the queue is idle above).
+		weave_segs_free(vk, mc);
+#endif
 		if (mc->weave.dp != NULL) {
 			comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp); // its eyes key (roadmap §5.2)
 			xrt_display_processor_destroy(&mc->weave.dp);

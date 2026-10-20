@@ -27,6 +27,13 @@
  * window-geometry service reports a desktop rect
  * (docs/specs/runtime/wayland-window-geometry.md, follow-up).
  *
+ * Also used OUT of process (#2218 item 6): the desktop-Linux service's
+ * XR_DXR_weave present-owner engine (compositor/multi/comp_multi_weave_linux.c)
+ * builds one manager per present-owner, windowless (no hooks), with its own
+ * engine DP as the primary, its window placed in the weave geometry frame by
+ * util/comp_weave_screens.h. Built as its own small library (comp_vk_segs) so
+ * comp_multi links it without the in-process compositor.
+ *
  * Windows only: the real HWND (and so the vendor's drag phase-snap) follows the
  * screen holding the majority of the window (ADR-047 Amendment 2), through
  * @ref comp_vk_native_segments_hwnd_hooks — the same policy the D3D11 manager
@@ -136,6 +143,30 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
                                     const struct xrt_screen_list *list,
                                     const struct xrt_system_compositor_info *info,
                                     uint64_t pinned_display_id);
+
+/*!
+ * #2218 item 6: replace the screens' segment-math geometry (desktop rect +
+ * device mode) without touching anything else — not the DPs, not the
+ * lifecycle, not the bindings the DPs were created with (those keep
+ * describing each screen to its plug-in in the OS's own desktop space).
+ *
+ * The desktop-Linux service's XR_DXR_weave present-owner places its window in
+ * the weave geometry frame, so its screens are re-projected into that frame
+ * (util/comp_weave_screens.h) on every move; this hands the projection over.
+ *
+ * @p list must hold the same placed screens, in the same order, as the list
+ * the manager was built from (@ref comp_vk_native_segments_set_screens);
+ * otherwise nothing changes and false is returned (the caller rebuilds).
+ */
+bool
+comp_vk_native_segments_set_screen_geometry(struct comp_vk_native_segments *segs, const struct xrt_screen_list *list);
+
+/*!
+ * The last @ref comp_vk_native_segments_update's segment table (count 0 before
+ * the first). Weave thread.
+ */
+const struct comp_segment_table *
+comp_vk_native_segments_get_table(const struct comp_vk_native_segments *segs);
 
 /*!
  * Is segmentation possible at all for this session?

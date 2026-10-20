@@ -52,6 +52,7 @@
 
 // Per-session rendering support (Phase 4)
 #include "util/comp_swapchain.h"
+#include "util/comp_weave_screens.h" // #2218 item 6: the weave engines' screen table
 #include "util/comp_render_helpers.h"
 #include "util/u_tiling.h"
 
@@ -7423,6 +7424,16 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	os_mutex_destroy(&msc->list_and_timing_lock);
 	os_mutex_destroy(&msc->render_lock);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2218 item 6: every client (and so every weave engine) is gone.
+	if (msc->weave_screens.mutex_initialized) {
+		os_mutex_destroy(&msc->weave_screens.mutex);
+		msc->weave_screens.mutex_initialized = false;
+	}
+	free(msc->weave_screens.list);
+	free(msc->weave_screens.info);
+#endif
+
 	free(msc);
 }
 
@@ -7529,6 +7540,9 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 
 	os_mutex_init(&msc->list_and_timing_lock);
 	os_mutex_init(&msc->render_lock);
+#ifdef XRT_OS_LINUX_DESKTOP
+	msc->weave_screens.mutex_initialized = os_mutex_init(&msc->weave_screens.mutex) == 0;
+#endif
 
 	//! @todo Make the clients not go from IDLE to READY before we have completed a first frame.
 	// Make sure there is at least some sort of valid frame data here.
@@ -7560,6 +7574,83 @@ comp_multi_system_get_vk(struct xrt_system_compositor *xsysc)
 	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
 	return comp_target_service_get_vk(msc->target_service);
 }
+
+#ifdef XRT_OS_LINUX_DESKTOP
+void
+comp_multi_system_set_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list)
+{
+	if (xsysc == NULL || list == NULL ||
+	    xsysc->create_native_compositor != system_compositor_create_native_compositor) {
+		return;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	if (!msc->weave_screens.mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&msc->weave_screens.mutex);
+	if (msc->weave_screens.list == NULL) {
+		msc->weave_screens.list = U_TYPED_CALLOC(struct xrt_screen_list);
+		msc->weave_screens.info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	}
+	if (msc->weave_screens.list == NULL || msc->weave_screens.info == NULL) {
+		free(msc->weave_screens.list);
+		free(msc->weave_screens.info);
+		msc->weave_screens.list = NULL;
+		msc->weave_screens.info = NULL;
+		os_mutex_unlock(&msc->weave_screens.mutex);
+		return;
+	}
+	// Bump only on a real change: the fallback timer re-probes every 10 s
+	// while the fallback plug-in is active, and a bump rebuilds every live
+	// engine's segment DPs.
+	const bool first = msc->weave_screens.generation == 0;
+	const bool changed =
+	    first || comp_weave_screens_compare(msc->weave_screens.list, list) != COMP_WEAVE_SCREENS_SAME ||
+	    comp_weave_screens_registry_changed(&msc->weave_screens.info->dp_registry, &xsysc->info.dp_registry);
+	if (changed) {
+		*msc->weave_screens.list = *list;
+		*msc->weave_screens.info = xsysc->info;
+		msc->weave_screens.generation++;
+	}
+	const uint64_t gen = msc->weave_screens.generation;
+	os_mutex_unlock(&msc->weave_screens.mutex);
+	if (changed) {
+		// Lifecycle (start-up, a hotplug, a re-claim) — never per frame.
+		uint32_t with_vk = 0;
+		for (uint32_t e = 0; e < xsysc->info.dp_registry.entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+			if (xsysc->info.dp_registry.entries[e].dp_factory_vk != NULL) {
+				with_vk++;
+			}
+		}
+		U_LOG_W(
+		    "weave(#2218): screen table generation %llu — %u screen(s), %u with a Vulkan DP factory; "
+		    "XR_DXR_weave present-owner windows are woven %s",
+		    (unsigned long long)gen, list->count, with_vk,
+		    list->count >= 2 ? "by the DP of each screen they cover"
+		                     : "by the one DP (single screen: per-screen weaving off)");
+	}
+}
+
+uint64_t
+multi_system_weave_screens_snapshot(struct multi_system_compositor *msc,
+                                    uint64_t have_generation,
+                                    struct xrt_screen_list *out_list,
+                                    struct xrt_system_compositor_info *out_info)
+{
+	if (msc == NULL || !msc->weave_screens.mutex_initialized) {
+		return 0;
+	}
+	os_mutex_lock(&msc->weave_screens.mutex);
+	const uint64_t gen = msc->weave_screens.generation;
+	if (gen != 0 && gen != have_generation && msc->weave_screens.list != NULL && out_list != NULL &&
+	    out_info != NULL) {
+		*out_list = *msc->weave_screens.list;
+		*out_info = *msc->weave_screens.info;
+	}
+	os_mutex_unlock(&msc->weave_screens.mutex);
+	return gen;
+}
+#endif // XRT_OS_LINUX_DESKTOP
 
 bool
 multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d)

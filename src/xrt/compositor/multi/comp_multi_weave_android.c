@@ -809,6 +809,8 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	// and renders into whatever we hand it via set_target_color_view. Its async
 	// init must be kicked off from a Looper-bearing thread, and we are on an IPC
 	// handler thread — so hop to the service main thread (#510 M2).
+	// One DP by design (#2218 item 6 audit): an Android device has one panel;
+	// per-screen weaving is the desktop-Linux engine's (comp_multi_weave_linux.c).
 	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 	if (factory == NULL) {
 		U_LOG_E("weave(#1036): no Vulkan DP factory — cannot weave");

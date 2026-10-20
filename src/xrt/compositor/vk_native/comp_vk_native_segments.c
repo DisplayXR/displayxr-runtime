@@ -909,6 +909,48 @@ comp_vk_native_segments_set_screens(struct comp_vk_native_segments *segs,
 	}
 }
 
+bool
+comp_vk_native_segments_set_screen_geometry(struct comp_vk_native_segments *segs, const struct xrt_screen_list *list)
+{
+	if (segs == NULL || list == NULL) {
+		return false;
+	}
+	// Same filter, same order as set_screens: the n-th placed screen of the
+	// list must be the n-th screen of the table. Validate everything before
+	// touching anything.
+	struct comp_seg_rect rect[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t nw[COMP_SEGMENTS_MAX_SCREENS], nh[COMP_SEGMENTS_MAX_SCREENS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *s = &list->screens[i];
+		if (s->desktop_width == 0 || s->desktop_height == 0) {
+			continue;
+		}
+		if (n >= segs->screen_count || segs->screens[n].id != s->id) {
+			return false;
+		}
+		rect[n] = (struct comp_seg_rect){s->desktop_left, s->desktop_top, s->desktop_width, s->desktop_height};
+		nw[n] = s->native_width;
+		nh[n] = s->native_height;
+		n++;
+	}
+	if (n != segs->screen_count) {
+		return false;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		segs->screens[i].desktop = rect[i];
+		segs->screens[i].native_w = nw[i];
+		segs->screens[i].native_h = nh[i];
+	}
+	return true;
+}
+
+const struct comp_segment_table *
+comp_vk_native_segments_get_table(const struct comp_vk_native_segments *segs)
+{
+	return segs != NULL ? &segs->table : NULL;
+}
+
 void
 comp_vk_native_segments_set_hwnd_hooks(struct comp_vk_native_segments *segs,
                                        const struct comp_vk_native_segments_hwnd_hooks *hooks)

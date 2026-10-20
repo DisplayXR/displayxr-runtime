@@ -24,6 +24,22 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/alpha_probe.comp
 		)
 
+	# Multi-screen segment manager (ADR-047 D2), its own library so the
+	# desktop-Linux service's XR_DXR_weave engine (comp_multi, #2218 item 6)
+	# links it without the whole in-process compositor — the comp_d3d11_segs
+	# pattern.
+	add_library(comp_vk_segs STATIC comp_vk_native_segments.c comp_vk_native_segments.h)
+	target_link_libraries(
+		comp_vk_segs
+		PUBLIC xrt-interfaces
+		PRIVATE comp_util aux_vk aux_util aux_os
+		)
+	target_include_directories(comp_vk_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+	if(TARGET comp_multi AND XRT_FEATURE_COMP_MULTI_WEAVE_LINUX)
+		target_link_libraries(comp_multi PRIVATE comp_vk_segs)
+		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_SEGMENTS)
+	endif()
+
 	add_library(
 		comp_vk_native STATIC
 		${VK_NATIVE_SHADER_HEADERS}
@@ -36,8 +52,6 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_equirect2.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
-		comp_vk_native_segments.c
-		comp_vk_native_segments.h
 		comp_vk_native_split.cpp
 		comp_vk_native_split.h
 		comp_vk_native_swapchain.c
@@ -80,6 +94,7 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		PUBLIC xrt-interfaces
 		PRIVATE
 			comp_util
+			comp_vk_segs
 			aux_vk
 			aux_util
 			aux_os

@@ -1085,6 +1085,14 @@ the segment); a segment no DP can weave shows one view flat (the left view of a 
 middle view of an N-view atlas). A legacy single-rect submit is never segmented. The v4 overlay is
 composited over the whole handback after the per-screen weave.
 
+**Desktop Linux (#2218).** The Linux service weaves a batch / v6 submit per screen by the same rule
+(each screen's part by that screen's display processor, per-screen preference included; a v6
+submit only while its output is the window, i.e. at viewScale 1; the window is placed against the
+screens through the v12 `XrWeaveWindowLogicalOriginDXR`, or on an unscaled X11 / PHYSICAL layout
+without it). It does not report the parts yet: `segmentCount` stays 0, and the base
+`XrWeaveOutputDXR::eyes` are those of the screen holding the majority of the window — so a window
+wholly on one screen gets that screen's viewer.
+
 **What the caller gets.** Chain a zero-initialised `XrWeaveOutputRectPartsDXR` on
 `XrWeaveOutputDXR::next`:
 
