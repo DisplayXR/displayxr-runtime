@@ -38,6 +38,7 @@
 #include "desktop/u_desktop_policy.h"
 
 #include "util/u_logging.h"
+#include "util/u_time.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,12 @@ _Static_assert((int)U_DESKTOP_ACTION_CLOSE == (int)XR_DESKTOP_ACTION_TYPE_CLOSE_
 _Static_assert((int)U_DESKTOP_PICK_OUTSIDE == (int)XR_DESKTOP_PICK_KIND_OUTSIDE_DXR, "pick mirror");
 _Static_assert(U_DESKTOP_APP_ID_SIZE == XR_MAX_DESKTOP_APP_ID_SIZE_DXR, "size mirror");
 _Static_assert(U_DESKTOP_TITLE_SIZE == XR_MAX_DESKTOP_TITLE_SIZE_DXR, "size mirror");
+_Static_assert(U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT == XR_ERROR_SIZE_INSUFFICIENT, "result mirror");
+_Static_assert(U_DESKTOP_CAP_CAPTURE == XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR, "caps mirror");
+_Static_assert(U_DESKTOP_SCOPE_CONTROL == XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR, "scope mirror");
+_Static_assert(U_DESKTOP_SCOPE_CAPTURE == XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR, "scope mirror");
+_Static_assert((int)U_DESKTOP_CAPTURE_WINDOW == (int)XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR, "target mirror");
+_Static_assert((int)U_DESKTOP_CAPTURE_REGION == (int)XR_DESKTOP_CAPTURE_TARGET_REGION_DXR, "target mirror");
 
 //! Largest text xrGetDesktopTextAtDXR returns (bytes incl. NUL); longer text is cut on a code point.
 #define TEXT_AT_MAX 16384
@@ -90,6 +97,28 @@ on_action_completed(void *ctx, uint64_t action_id, int32_t result, const char *m
 	oxr_event_push_XrEventDataDesktopActionCompleted(&log, sess, action_id, (XrResult)result, message);
 }
 
+static void
+on_capture_state_changed(void *ctx, enum u_desktop_control_state state)
+{
+	struct oxr_session *sess = (struct oxr_session *)ctx;
+	struct oxr_logger log;
+	oxr_log_init(&log, "xrDesktopControl(capture state)");
+	U_LOG_I("desktop_control: capture state -> %s", u_desktop_control_state_str(state));
+	oxr_event_push_XrEventDataDesktopCaptureStateChanged(&log, sess, (XrDesktopControlStateDXR)state);
+}
+
+static void
+on_capture_completed(void *ctx, const struct u_desktop_capture_done *d)
+{
+	struct oxr_session *sess = (struct oxr_session *)ctx;
+	struct oxr_logger log;
+	oxr_log_init(&log, "xrDesktopControl(capture)");
+	XrRect2Di src = {{d->source.x, d->source.y}, {d->source.w, d->source.h}};
+	XrTime t = d->frame_ns != 0 ? time_state_monotonic_to_ts_ns(sess->sys->inst->timekeeping, d->frame_ns) : 0;
+	oxr_event_push_XrEventDataDesktopCaptureCompleted(&log, sess, d->capture_id, (XrResult)d->result, d->w, d->h,
+	                                                  src, t, d->message);
+}
+
 
 /*
  *
@@ -109,7 +138,8 @@ get_dc(struct oxr_session *sess)
 			snprintf(name, sizeof(name), "this app");
 		}
 		struct u_desktop_app_info app = {exe, name, NULL};
-		struct u_desktop_control_callbacks cb = {on_state_changed, on_action_completed, sess};
+		struct u_desktop_control_callbacks cb = {on_state_changed, on_action_completed, sess,
+		                                         on_capture_state_changed, on_capture_completed};
 		u_desktop_control_create(u_desktop_backend_create(), &app, &cb, NULL, &sess->desktop_control);
 	}
 	struct u_desktop_control *dc = sess->desktop_control;
@@ -217,8 +247,23 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDesktopControlDXR");
 	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
 	OXR_VERIFY_ARG_TYPE_CAN_BE_NULL(&log, info, XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR);
-	if (info != NULL && info->next != NULL) {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(info->next) must be NULL in spec version 1");
+	// Spec v2: the scopes, chained on info->next (absent = CONTROL only, as in v1).
+	// Other structures in the chain are ignored, as OpenXR does.
+	uint32_t scopes = U_DESKTOP_SCOPE_CONTROL;
+	for (const XrBaseInStructure *n = info != NULL ? (const XrBaseInStructure *)info->next : NULL; n != NULL;
+	     n = n->next) {
+		if (n->type != XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR) {
+			continue;
+		}
+		XrDesktopControlScopeFlagsDXR s = ((const XrDesktopControlRequestScopeDXR *)n)->scopes;
+		const XrDesktopControlScopeFlagsDXR known =
+		    XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR | XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR;
+		if (s == 0 || (s & ~known) != 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(XrDesktopControlRequestScopeDXR::scopes) must be non-zero, known bits only");
+		}
+		scopes = (uint32_t)s;
+		break;
 	}
 
 	struct u_desktop_control *dc = get_dc(sess);
@@ -229,7 +274,7 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 	if (info != NULL && info->reason != NULL) {
 		snprintf(reason, sizeof(reason), "%s", info->reason);
 	}
-	return gate_result(&log, u_desktop_control_request(dc, reason[0] != '\0' ? reason : NULL));
+	return gate_result(&log, u_desktop_control_request_scopes(dc, reason[0] != '\0' ? reason : NULL, scopes));
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -423,6 +468,97 @@ oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action
 		                 U_DESKTOP_CONTROL_QUEUE_SIZE);
 	}
 	return gate_result(&log, r);
+}
+
+
+/*
+ *
+ * Spec v2: screen capture (§10).
+ *
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureStateDXR(XrSession session, XrDesktopControlStateDXR *state)
+{
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDesktopCaptureStateDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
+	OXR_VERIFY_ARG_NOT_NULL(&log, state);
+
+	// Never gated, like xrGetDesktopControlStateDXR.
+	struct u_desktop_control *dc = get_dc(sess);
+	*state = dc != NULL ? (XrDesktopControlStateDXR)u_desktop_control_get_capture_state(dc)
+	                    : XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR;
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR *info, uint64_t *captureId)
+{
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureDesktopDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, info, XR_TYPE_DESKTOP_CAPTURE_INFO_DXR);
+	OXR_VERIFY_ARG_NOT_NULL(&log, captureId);
+	*captureId = 0;
+
+	struct u_desktop_control *dc = get_dc(sess);
+	if (dc == NULL) {
+		return XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR;
+	}
+	struct u_desktop_capture_info ci;
+	memset(&ci, 0, sizeof(ci));
+	ci.target = (uint32_t)info->target;
+	ci.window_id = info->windowId;
+	ci.region.x = info->region.offset.x;
+	ci.region.y = info->region.offset.y;
+	ci.region.w = info->region.extent.width;
+	ci.region.h = info->region.extent.height;
+	ci.max_w = info->maxWidth;
+	ci.max_h = info->maxHeight;
+
+	int32_t r = u_desktop_control_capture(dc, &ci, captureId);
+	if (r == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE) {
+		char why[160];
+		u_desktop_control_capture_validate(&ci, why, sizeof(why));
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "%s", why);
+	}
+	if (r == U_DESKTOP_XR_ERROR_LIMIT_REACHED) {
+		// Normal flow for an agent polling faster than its captures complete: no log.
+		return XR_ERROR_LIMIT_REACHED;
+	}
+	return gate_result(&log, r);
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureImageDXR(
+    XrSession session, uint64_t captureId, uint32_t capacityInput, uint32_t *countOutput, uint8_t *rgba)
+{
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDesktopCaptureImageDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (capacityInput > 0) {
+		OXR_VERIFY_ARG_NOT_NULL(&log, rgba);
+	}
+
+	struct u_desktop_control *dc = get_dc(sess);
+	if (dc == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "no capture with that id");
+	}
+	int32_t r = u_desktop_control_capture_image(dc, captureId, capacityInput, countOutput, rgba);
+	switch (r) {
+	case U_DESKTOP_XR_SUCCESS: return XR_SUCCESS;
+	case U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT: return XR_ERROR_SIZE_INSUFFICIENT;
+	case U_DESKTOP_XR_ERROR_VALIDATION_FAILURE:
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(captureId) is not the most recent successful capture, or its image was "
+		                 "already fetched or expired (10 s)");
+	default: return oxr_error(&log, (XrResult)r, "desktop capture image failed");
+	}
 }
 
 #endif // OXR_HAVE_DXR_desktop_control

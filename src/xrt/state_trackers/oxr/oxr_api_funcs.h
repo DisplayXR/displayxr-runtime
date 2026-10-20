@@ -1239,6 +1239,19 @@ oxr_xrGetDesktopTextAtDXR(
 //! OpenXR API function @ep{xrSubmitDesktopActionDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action, uint64_t *actionId);
+
+//! OpenXR API function @ep{xrGetDesktopCaptureStateDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureStateDXR(XrSession session, XrDesktopControlStateDXR *state);
+
+//! OpenXR API function @ep{xrCaptureDesktopDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR *info, uint64_t *captureId);
+
+//! OpenXR API function @ep{xrGetDesktopCaptureImageDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureImageDXR(
+    XrSession session, uint64_t captureId, uint32_t capacityInput, uint32_t *countOutput, uint8_t *rgba);
 #endif
 
 #ifdef OXR_HAVE_DXR_input_providers

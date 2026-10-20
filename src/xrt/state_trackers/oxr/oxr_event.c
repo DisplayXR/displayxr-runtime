@@ -186,6 +186,14 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataDesktopActionCompletedDXR *done = (XrEventDataDesktopActionCompletedDXR *)type;
 		return done->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR: {
+		XrEventDataDesktopCaptureStateChangedDXR *changed = (XrEventDataDesktopCaptureStateChangedDXR *)type;
+		return changed->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR: {
+		XrEventDataDesktopCaptureCompletedDXR *done = (XrEventDataDesktopCaptureCompletedDXR *)type;
+		return done->session == session;
+	}
 #endif
 #ifdef OXR_HAVE_DXR_lift
 	case XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR: {
@@ -928,6 +936,71 @@ oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
 	done->session = oxr_session_to_openxr(sess);
 	done->actionId = actionId;
 	done->result = result;
+	// message[] was already zero-initialised by ALLOC.
+	if (message != NULL) {
+		size_t len = strnlen(message, XR_MAX_DESKTOP_MESSAGE_SIZE_DXR - 1);
+		memcpy(done->message, message, len);
+		done->message[len] = '\0';
+	}
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopCaptureStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->state = state;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureCompleted(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  uint64_t captureId,
+                                                  XrResult result,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  XrRect2Di sourceRect,
+                                                  XrTime frameTime,
+                                                  const char *message)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopCaptureCompletedDXR *done;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &done);
+
+	done->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR;
+	done->next = NULL;
+	done->session = oxr_session_to_openxr(sess);
+	done->captureId = captureId;
+	done->result = result;
+	done->width = width;
+	done->height = height;
+	done->sourceRect = sourceRect;
+	done->frameTime = frameTime;
 	// message[] was already zero-initialised by ALLOC.
 	if (message != NULL) {
 		size_t len = strnlen(message, XR_MAX_DESKTOP_MESSAGE_SIZE_DXR - 1);
