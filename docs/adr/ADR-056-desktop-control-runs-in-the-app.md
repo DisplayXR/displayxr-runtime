@@ -183,11 +183,12 @@ Open questions.
 4. **Service-mode (IPC) apps.** The client library is still in the app's process, so D2 holds;
    confirm nothing routes desktop control through `displayxr-service`.
 
-## Amendment 1 — Screen capture is its own scope, in the same session (PROPOSED, 2026-10-19)
+## Amendment 1 — Screen capture is its own scope, in the same session (ACCEPTED, 2026-10-20)
 
-**Status:** Proposed — design only, no code. Spec text:
-[`XR_DXR_desktop_control.md` §10](../specs/extensions/XR_DXR_desktop_control.md#10-screen-capture-proposed--spec-version-2)
-(a proposed spec-version 2).
+**Status:** Accepted — spec version 2. Implemented: the common layer, the fake backend, the
+probe, the CLI and GNOME (P0b + the GNOME half of P1b); Windows and macOS capture are still to
+do and report no CAPTURE capability until then. Spec text:
+[`XR_DXR_desktop_control.md` §10](../specs/extensions/XR_DXR_desktop_control.md#10-screen-capture-spec-version-2).
 
 **Why an amendment and not a new ADR.** D1 already lists "capture a window" under *observe*,
 D2 already names ScreenCaptureKit and Screen Recording for macOS, and spec §8 deferred capture
@@ -345,8 +346,7 @@ fight the user.
 ### Decisions (DECIDED 2026-10-19, David)
 
 These were open questions when the amendment was drafted. David accepted every proposed answer
-on 2026-10-19. The amendment stays **Proposed** until it is implemented, but these points are
-no longer open.
+on 2026-10-19.
 
 1. **Capture works without CONTROL.** An app may ask for CAPTURE alone. On GNOME this costs a
    second code path, a standalone ScreenCast portal session, because the smaller grant should
