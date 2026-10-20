@@ -844,14 +844,6 @@ struct comp_vk_native_compositor
 	 * Written by the weave, read by layer_commit, under seg_pub_mutex.
 	 */
 	bool seg_zero_copy_withheld;
-	/*!
-	 * #2247: the last weave's table does not cover the primary screen (the
-	 * window has wholly left it), so the session's DP — which weaves the
-	 * primary — is asked for 2D whatever the session's mode, and gets the
-	 * session's mode back when the window returns. Written by the weave,
-	 * read by vk_dp_request_display_mode.
-	 */
-	bool seg_primary_uncovered;
 
 	/*!
 	 * Multi-screen M3: per-segment views. @ref seg_pub is the segment table
@@ -875,6 +867,16 @@ struct comp_vk_native_compositor
 	 */
 	struct comp_segments_content seg_content;
 #endif // VK_NATIVE_HAVE_SEGMENTS
+	/*!
+	 * #2247: the last weave's table does not cover the primary screen (the
+	 * window has been off it for the hand-off's dwell), so the session's DP —
+	 * which weaves the primary — is asked for 2D whatever the session's mode,
+	 * and gets the session's mode back when the window returns. Written by
+	 * the segment weave (VK_NATIVE_HAVE_SEGMENTS); read on every platform by
+	 * vk_dp_request_display_mode, so declared unconditionally (always false
+	 * where there are no segments).
+	 */
+	bool seg_primary_uncovered;
 
 	/*!
 	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
