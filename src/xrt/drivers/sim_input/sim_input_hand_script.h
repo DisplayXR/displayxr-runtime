@@ -13,10 +13,11 @@
  * PLANE: origin at the display centre, +X right, +Y up, +Z toward the viewer
  * (the `XRT_TRACKING_TYPE_RIG_LOCAL` frame of input-provider-discovery.md
  * §4b.4). Each hand's root rides a small circle centred
- * `HAND_DISTANCE_M` in front of the glass and @ref SIM_INPUT_HAND_LATERAL_M
- * to its side, so a default display rig shows both hands without any
+ * `HAND_DISTANCE_M` in front of the glass and a fraction of the display height
+ * to its side (@ref SIM_INPUT_HAND_LATERAL_FRAC), so a default display rig shows both hands without any
  * app-side offset. The device publishes these poses on a RIG_LOCAL origin,
- * which the builder anchors at the display plane (`u_builders.c`).
+ * which the runtime resolves onto the display plane each session sees
+ * (input-provider-discovery.md §4b.4).
  *
  * @ingroup drv_sim_input
  */
@@ -34,17 +35,31 @@
 extern "C" {
 #endif
 
-//! Radius of each hand's circle (metres).
+//! Radius of each hand's circle (metres), the cap of @ref sim_input_hand_radius.
 #define SIM_INPUT_CIRCLE_RADIUS_M 0.04f
 //! One revolution of the circle (seconds).
 #define SIM_INPUT_CIRCLE_PERIOD_S 4.0
 //! Finger-curl wave period (#825 Tier 2): a full open→fist→open cycle.
 #define SIM_INPUT_CURL_PERIOD_S 3.0
-//! Circle centre's distance left/right of the display centre (metres).
-#define SIM_INPUT_HAND_LATERAL_M 0.12f
-//! Circle centre's height relative to the display centre (metres): slightly below.
-#define SIM_INPUT_HAND_HEIGHT_M (-0.03f)
-//! Default `HAND_DISTANCE_M`: circle centre's distance in front of the glass.
+/*!
+ * Placement is a fraction of the PHYSICAL DISPLAY HEIGHT H, so the hands stay
+ * on small panels (a 0.30 x 0.19 m panel viewed from 0.6 m sees only
+ * |x| < ~0.088 m at z = 0.25 — fixed ±0.12 m was off-screen). H comes from
+ * the host iface's `get_display_geometry` (the display plug-in's
+ * `get_display_info`, published by the builder before `create_devices`).
+ */
+//! Circle centre's distance left/right of the display centre, as a fraction of H.
+#define SIM_INPUT_HAND_LATERAL_FRAC 0.30f
+//! Circle centre's height relative to the display centre, as a fraction of H: slightly below.
+#define SIM_INPUT_HAND_HEIGHT_FRAC (-0.10f)
+//! Circle radius as a fraction of H (capped at @ref SIM_INPUT_CIRCLE_RADIUS_M).
+#define SIM_INPUT_CIRCLE_RADIUS_FRAC 0.10f
+/*!
+ * H when the host reports no geometry (older runtime, not yet published):
+ * 0.40 m reproduces the previous fixed placement (±0.12 m, 4 cm circle).
+ */
+#define SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M 0.40f
+//! Default `HAND_DISTANCE_M`: circle centre's distance in front of the glass (metres, NOT scaled).
 #define SIM_INPUT_HAND_DISTANCE_DEFAULT_M 0.25f
 
 //! `HANDS` setting: which hands are tracked.
@@ -94,20 +109,28 @@ bool
 sim_input_hand_enabled(enum sim_input_hands_mode mode, bool left);
 
 /*!
- * The circle centre of one hand in the display-plane (RIG_LOCAL) frame.
- * @p distance_m <= 0 or non-finite falls back to the default.
+ * The circle centre of one hand in the display-plane (RIG_LOCAL) frame:
+ * ±@ref SIM_INPUT_HAND_LATERAL_FRAC · H to its side,
+ * @ref SIM_INPUT_HAND_HEIGHT_FRAC · H up, @p distance_m out of the glass.
+ * @p distance_m <= 0 or non-finite falls back to the default; so does
+ * @p display_height_m (to @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M).
  */
 struct xrt_pose
-sim_input_hand_center(bool left, float distance_m);
+sim_input_hand_center(bool left, float distance_m, float display_height_m);
+
+//! The circle radius for a display @p display_height_m tall (same fallback).
+float
+sim_input_hand_radius(float display_height_m);
 
 /*!
  * The scripted root/grip relation at @p at_timestamp_ns: @p center plus a
- * circle of @ref SIM_INPUT_CIRCLE_RADIUS_M in the display plane's XY,
- * phase-shifted by @p phase_rad. Pure function of the timestamp, velocity
- * included, so prediction for any requested time is exact.
+ * circle of @p radius_m in the display plane's XY, phase-shifted by
+ * @p phase_rad. Pure function of the timestamp, velocity included, so
+ * prediction for any requested time is exact.
  */
 void
 sim_input_hand_relation(const struct xrt_pose *center,
+                        float radius_m,
                         double phase_rad,
                         int64_t at_timestamp_ns,
                         struct xrt_space_relation *out_relation);

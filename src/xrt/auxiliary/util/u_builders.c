@@ -66,6 +66,12 @@ apply_offset(struct xrt_vec3 *position, struct xrt_vec3 *offset)
  *
  * Origins of any other type (OTHER, NONE, …) are left exactly as they were:
  * a stage-anchored provider keeps its own mount offset.
+ *
+ * This puts RIG_LOCAL on the head DEVICE pose, which is the display plane of a
+ * runtime-window session only. The graph cannot know the session: an
+ * external-window or bridge-relay session's plane is the identity at the
+ * head's tracking origin, and the state tracker re-bases RIG_LOCAL onto it per
+ * session (`oxr_space.c::rig_local_plane_correction`, spec §4b.4).
  */
 static void
 anchor_rig_local_origins(struct xrt_device *head, struct xrt_device **xdevs, uint32_t xdev_count)

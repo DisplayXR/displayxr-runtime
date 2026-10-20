@@ -4153,6 +4153,10 @@ struct oxr_space
 	struct
 	{
 		struct xrt_space *xs;
+		//! The device the pose space follows; NULL for a DISPLAY space
+		//! (whose plane is not a device pose). Read for the RIG_LOCAL
+		//! re-base in oxr_space.c.
+		struct xrt_device *xdev;
 	} xdev_pose;
 };
 

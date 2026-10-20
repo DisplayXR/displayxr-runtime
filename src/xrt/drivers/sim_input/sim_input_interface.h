@@ -44,6 +44,10 @@ struct sim_input_controller_config
 	enum sim_input_pinch_mode pinch;
 	//! `HAND_DISTANCE_M`: circle centre in front of the glass; <= 0 = default.
 	float hand_distance_m;
+	//! Physical display height (metres) the lateral/height offsets and the
+	//! circle radius scale with (host `get_display_geometry`); <= 0 = the
+	//! script's fallback height.
+	float display_height_m;
 };
 
 /*!
