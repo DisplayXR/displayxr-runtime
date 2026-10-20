@@ -3131,3 +3131,115 @@ TEST_CASE("layout settle: counts from the last change and from the monitors' ret
 	CHECK(u_desktop_layout_settle_step(&s, 20400, 500, 0, 2000) == 2000);
 	CHECK(u_desktop_layout_settle_step(&s, 22400, 500, 0, 2000) == 0);
 }
+
+/*
+ * macOS capture backend geometry (u_desktop_macos_logic.h) — pure, so pinned on every OS.
+ */
+
+#include "desktop/u_desktop_macos_logic.h"
+
+TEST_CASE("capture_macos: display backing scale", "[desktop][capture][macos]")
+{
+	CHECK(u_desktop_macos_display_scale(3024, 1512) == 2.0); // Retina
+	CHECK(u_desktop_macos_display_scale(1920, 1920) == 1.0);
+	CHECK(u_desktop_macos_display_scale(2880, 1920) == 1.5);
+	CHECK(u_desktop_macos_display_scale(0, 1512) == 1.0);    // unknown
+	CHECK(u_desktop_macos_display_scale(800, 1600) == 1.0);  // never below 1
+	CHECK(u_desktop_macos_display_scale(100000, 10) == 8.0); // clamped
+}
+
+TEST_CASE("capture_macos: plan over a Retina + external layout; gaps stay withheld; mapping holds",
+          "[desktop][capture][macos]")
+{
+	// A 2x built-in display and a 1x external one to its right, both top-aligned,
+	// so the region below the built-in one's bottom edge is a gap of the layout.
+	const u_desktop_macos_display d[2] = {
+	    {1, {0, 0, 1512, 982}, 2.0},
+	    {2, {1512, 0, 1920, 1080}, 1.0},
+	};
+	u_desktop_macos_capture_part parts[4];
+	uint32_t np = 0, w = 0, h = 0;
+
+	const u_desktop_rect src = {1400, 900, 300, 150};
+	REQUIRE(u_desktop_macos_capture_plan(&src, d, 2, parts, 4, &np, &w, &h));
+	REQUIRE(np == 2);
+	CHECK((w == 600 && h == 300)); // the densest display's scale
+	CHECK(parts[0].display == 0);
+	CHECK((parts[0].rect.x == 1400 && parts[0].rect.y == 900 && parts[0].rect.w == 112 && parts[0].rect.h == 82));
+	CHECK((parts[0].local.x == 1400 && parts[0].local.y == 900));
+	CHECK((parts[0].px_w == 224 && parts[0].px_h == 164));
+	CHECK(parts[1].display == 1);
+	CHECK((parts[1].rect.x == 1512 && parts[1].rect.w == 188 && parts[1].rect.h == 150));
+	CHECK((parts[1].local.x == 0 && parts[1].local.y == 900)); // display-local points
+	CHECK((parts[1].px_w == 188 && parts[1].px_h == 150));
+
+	// Compose solid frames as the backend does: each part's frame fills only its rect.
+	u_desktop_image img;
+	REQUIRE(u_desktop_image_alloc(&img, w, h));
+	for (uint32_t i = 0; i < np; i++) {
+		std::vector<uint8_t> frame((size_t)parts[i].px_w * parts[i].px_h * 4);
+		for (uint32_t y = 0; y < parts[i].px_h; y++) {
+			for (uint32_t x = 0; x < parts[i].px_w; x++) {
+				uint8_t *p = &frame[((size_t)y * parts[i].px_w + x) * 4];
+				p[0] = (uint8_t)(i == 0 ? 0 : 200); // B
+				p[1] = (uint8_t)(x & 0xff);         // G: the frame column
+				p[2] = (uint8_t)(i == 0 ? 50 : 0);  // R
+				p[3] = 0;                           // ignored
+			}
+		}
+		u_desktop_image_draw_frame(&img, &src, &parts[i].rect, frame.data(), parts[i].px_w, parts[i].px_h,
+		                           parts[i].px_w * 4, U_DESKTOP_PIXFMT_BGRA);
+	}
+	auto px = [&](uint32_t x, uint32_t y) { return img.rgba + ((size_t)y * w + x) * 4; };
+	auto desk = [](uint32_t p, int32_t o, int32_t len, uint32_t n) { return o + (p + 0.5) * len / n; };
+	// Top-left image pixel: the built-in display, opaque.
+	CHECK((px(0, 0)[0] == 50 && px(0, 0)[3] == 255));
+	// Below the built-in display (desktop y >= 982, x < 1512): the gap, transparent black.
+	CHECK(desk(10, src.x, src.w, w) < 1512);
+	CHECK(desk(250, src.y, src.h, h) >= 982);
+	const uint8_t *g = px(10, 250);
+	CHECK((g[0] == 0 && g[1] == 0 && g[2] == 0 && g[3] == 0));
+	// The external display: the image pixel maps back (spec §10.3) to the frame column
+	// under it.
+	double x = desk(400, src.x, src.w, w);
+	CHECK(x > 1600.0);
+	CHECK((px(400, 250)[2] == 200 && px(400, 250)[3] == 255));
+	CHECK(px(400, 250)[1] == (uint8_t)(int)(x - 1512));
+	u_desktop_image_free(&img);
+
+	// Only on the external display: its own 1x density.
+	const u_desktop_rect ext = {2000, 100, 64, 32};
+	REQUIRE(u_desktop_macos_capture_plan(&ext, d, 2, parts, 4, &np, &w, &h));
+	CHECK((np == 1 && parts[0].display == 1 && w == 64 && h == 32));
+	CHECK((parts[0].local.x == 488 && parts[0].local.y == 100));
+
+	// Outside every display, or empty.
+	const u_desktop_rect off = {0, 2000, 100, 100};
+	CHECK(!u_desktop_macos_capture_plan(&off, d, 2, parts, 4, &np, &w, &h));
+	const u_desktop_rect empty = {0, 0, 0, 10};
+	CHECK(!u_desktop_macos_capture_plan(&empty, d, 2, parts, 4, &np, &w, &h));
+
+	// A display left of the primary one has negative coordinates; local stays >= 0.
+	const u_desktop_macos_display left[2] = {{1, {0, 0, 1512, 982}, 2.0}, {3, {-1920, -98, 1920, 1080}, 1.0}};
+	const u_desktop_rect l = {-100, 0, 200, 10};
+	REQUIRE(u_desktop_macos_capture_plan(&l, left, 2, parts, 4, &np, &w, &h));
+	REQUIRE(np == 2);
+	CHECK((w == 400 && h == 20));
+	CHECK((parts[1].display == 1 && parts[1].local.x == 1820 && parts[1].local.y == 98));
+}
+
+TEST_CASE("capture_macos: which windows a capture withholds", "[desktop][capture][macos]")
+{
+	const uint32_t me = 4242;
+	u_desktop_macos_window_info w = {me, 1, 1.0, {10, 10, 100, 100}};
+	CHECK(u_desktop_macos_capture_withholds(&w, me)); // own window, any layer, shareable or not
+	w.pid = 7;
+	CHECK(!u_desktop_macos_capture_withholds(&w, me)); // another app's ordinary window
+	w.sharing = 0;                                     // NSWindowSharingNone
+	CHECK(u_desktop_macos_capture_withholds(&w, me));
+	w.alpha = 0.0; // not drawn
+	CHECK(!u_desktop_macos_capture_withholds(&w, me));
+	w.alpha = 1.0;
+	w.frame.w = 0;
+	CHECK(!u_desktop_macos_capture_withholds(&w, me));
+}
