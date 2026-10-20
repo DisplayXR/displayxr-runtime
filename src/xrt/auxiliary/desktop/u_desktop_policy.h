@@ -7,8 +7,15 @@
  *
  * Store — one JSON file per user, `desktop_control.json`:
  *
- *     { "version": 1, "suspended": false, "idle_ms": 600,
- *       "apps": { "<executable full path>": "allow" | "deny" } }
+ *     { "version": 2, "suspended": false, "idle_ms": 600,
+ *       "apps": { "<executable full path>": "allow" | "deny"
+ *                 | { "control": "allow" | "deny", "capture": "allow" | "deny" } } }
+ *
+ * Spec v2 (§10.6): an app's entry is a string (v1: the CONTROL answer) or an
+ * object with one answer per scope. v1 files are read as is; every write
+ * rewrites the file as version 2, and an entry with no CAPTURE answer is kept as
+ * a plain string (so an older runtime reading the file still sees its CONTROL
+ * deny). The kill switch covers both scopes.
  *
  *   Windows  %LOCALAPPDATA%\DisplayXR\
  *   macOS    ~/Library/Application Support/DisplayXR/
@@ -108,13 +115,33 @@ u_desktop_policy_is_unreadable(const struct u_desktop_policy *p);
 uint32_t
 u_desktop_policy_idle_ms(const struct u_desktop_policy *p);
 
+//! The CONTROL answer for @p exe (spec v1 meaning).
 enum u_desktop_app_decision
 u_desktop_policy_app(const struct u_desktop_policy *p, const char *exe);
 
+//! The answer for @p exe in ONE @p scope (enum u_desktop_scope). A deny under any
+//! spelling of the executable wins.
+enum u_desktop_app_decision
+u_desktop_policy_app_scope(const struct u_desktop_policy *p, const char *exe, uint32_t scope);
+
+//! One call per entry with its CONTROL answer (v1 callers).
 typedef void (*u_desktop_policy_app_fn)(void *ctx, const char *exe, enum u_desktop_app_decision d);
 
 void
 u_desktop_policy_for_each_app(const struct u_desktop_policy *p, u_desktop_policy_app_fn fn, void *ctx);
+
+//! One call per entry with both answers (NONE where the entry has none).
+typedef void (*u_desktop_policy_app_scopes_fn)(void *ctx,
+                                               const char *exe,
+                                               enum u_desktop_app_decision control,
+                                               enum u_desktop_app_decision capture);
+
+void
+u_desktop_policy_for_each_app_scopes(const struct u_desktop_policy *p, u_desktop_policy_app_scopes_fn fn, void *ctx);
+
+//! "control", "capture", "all" (both) — for messages and the audit log.
+const char *
+u_desktop_scope_str(uint32_t scopes);
 
 
 /*
@@ -129,6 +156,14 @@ u_desktop_policy_for_each_app(const struct u_desktop_policy *p, u_desktop_policy
  */
 bool
 u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const char *by);
+
+/*!
+ * As u_desktop_policy_set_app, for the scopes in @p scopes (enum u_desktop_scope
+ * bits; the others keep their answer). NONE removes those scopes' answers; the
+ * entry goes away when no answer is left. The audit record names the scope.
+ */
+bool
+u_desktop_policy_set_app_scope(const char *exe, uint32_t scopes, enum u_desktop_app_decision d, const char *by);
 
 //! Flip the kill switch. Audited as "suspended" / "resumed".
 bool
@@ -165,7 +200,24 @@ struct u_desktop_audit_record
 	const char *reason;  //!< app-supplied consent reason ("request")
 	const char *by;      //!< writer of a store change ("cli", "prompt")
 	const char *subject; //!< the executable a store change is about (allow/deny/forget)
+	//! Spec v2: "control" / "capture" / "all" — consent records and store changes.
+	const char *scope;
+
+	// ---- spec v2: one record per capture BURST (spec §10.4). Never a pixel,
+	// ---- a thumbnail or a hash: only what was captured, how big, how often.
+	const char *target_kind; //!< "desktop" / "region" / "window" (target object)
+	bool has_rect;
+	int32_t rx, ry, rw, rh; //!< the source rect, desktop coordinates ("rect")
+	bool has_size;
+	uint32_t w, h;       //!< output image size
+	uint32_t count;      //!< captures in the burst (0: field absent)
+	const char *first_t; //!< UTC time of the burst's first / last capture
+	const char *last_t;
 };
+
+//! Now, as the audit log writes it ("2026-10-16T18:02:11Z").
+void
+u_desktop_audit_utc_now(char *out, size_t cap);
 
 //! Append one line (rotating at 1 MiB). Creates the directory. Best effort.
 bool

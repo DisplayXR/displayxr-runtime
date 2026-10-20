@@ -7,6 +7,7 @@
  */
 
 #include "u_desktop_policy.h"
+#include "u_desktop.h"
 
 #include "xrt/xrt_config_os.h"
 
@@ -545,6 +546,31 @@ decision_from_json(const cJSON *v)
 	return U_DESKTOP_APP_NONE;
 }
 
+//! An entry's answer for ONE scope: a string is the CONTROL answer (v1), an object
+//! has one field per scope (v2).
+static enum u_desktop_app_decision
+decision_for_scope(const cJSON *v, uint32_t scope)
+{
+	if (cJSON_IsString(v)) {
+		return scope == U_DESKTOP_SCOPE_CONTROL ? decision_from_json(v) : U_DESKTOP_APP_NONE;
+	}
+	if (cJSON_IsObject(v)) {
+		const char *key = scope == U_DESKTOP_SCOPE_CAPTURE ? "capture" : "control";
+		return decision_from_json(cJSON_GetObjectItemCaseSensitive(v, key));
+	}
+	return U_DESKTOP_APP_NONE;
+}
+
+const char *
+u_desktop_scope_str(uint32_t scopes)
+{
+	uint32_t both = U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	if ((scopes & both) == both) {
+		return "all";
+	}
+	return (scopes & U_DESKTOP_SCOPE_CAPTURE) != 0 ? "capture" : "control";
+}
+
 //! Parse @p root (may be NULL) into @p p.
 static void
 policy_from_json(struct u_desktop_policy *p, const cJSON *root)
@@ -707,7 +733,7 @@ normalised_root(cJSON *old)
 		return NULL;
 	}
 	cJSON_DeleteItemFromObjectCaseSensitive(root, "version");
-	cJSON_AddNumberToObject(root, "version", 1);
+	cJSON_AddNumberToObject(root, "version", 2); // spec v2: entries may be per-scope objects
 	if (!cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "suspended"))) {
 		cJSON_DeleteItemFromObjectCaseSensitive(root, "suspended");
 		cJSON_AddBoolToObject(root, "suspended", false);
@@ -805,21 +831,18 @@ u_desktop_policy_idle_ms(const struct u_desktop_policy *p)
 	return p != NULL ? p->idle_ms : U_DESKTOP_POLICY_DEFAULT_IDLE_MS;
 }
 
-enum u_desktop_app_decision
-u_desktop_policy_app(const struct u_desktop_policy *p, const char *exe)
+//! Every spelling of @p exe in @p apps, one scope; a deny anywhere wins.
+static enum u_desktop_app_decision
+apps_decision(const cJSON *apps, const char *exe, uint32_t scope)
 {
-	if (p == NULL || p->apps == NULL || exe == NULL) {
-		return U_DESKTOP_APP_NONE;
-	}
-	// A deny anywhere wins over an allow written under another spelling.
 	enum u_desktop_app_decision best = U_DESKTOP_APP_NONE;
 	const cJSON *it = NULL;
-	cJSON_ArrayForEach(it, p->apps)
+	cJSON_ArrayForEach(it, apps)
 	{
 		if (it->string == NULL || !u_desktop_policy_exe_equal(it->string, exe)) {
 			continue;
 		}
-		enum u_desktop_app_decision d = decision_from_json(it);
+		enum u_desktop_app_decision d = decision_for_scope(it, scope);
 		if (d == U_DESKTOP_APP_DENY) {
 			return d;
 		}
@@ -828,6 +851,22 @@ u_desktop_policy_app(const struct u_desktop_policy *p, const char *exe)
 		}
 	}
 	return best;
+}
+
+enum u_desktop_app_decision
+u_desktop_policy_app_scope(const struct u_desktop_policy *p, const char *exe, uint32_t scope)
+{
+	if (p == NULL || p->apps == NULL || exe == NULL) {
+		return U_DESKTOP_APP_NONE;
+	}
+	// A deny anywhere wins over an allow written under another spelling.
+	return apps_decision(p->apps, exe, scope);
+}
+
+enum u_desktop_app_decision
+u_desktop_policy_app(const struct u_desktop_policy *p, const char *exe)
+{
+	return u_desktop_policy_app_scope(p, exe, U_DESKTOP_SCOPE_CONTROL);
 }
 
 void
@@ -840,7 +879,23 @@ u_desktop_policy_for_each_app(const struct u_desktop_policy *p, u_desktop_policy
 	cJSON_ArrayForEach(it, p->apps)
 	{
 		if (it->string != NULL) {
-			fn(ctx, it->string, decision_from_json(it));
+			fn(ctx, it->string, decision_for_scope(it, U_DESKTOP_SCOPE_CONTROL));
+		}
+	}
+}
+
+void
+u_desktop_policy_for_each_app_scopes(const struct u_desktop_policy *p, u_desktop_policy_app_scopes_fn fn, void *ctx)
+{
+	if (p == NULL || p->apps == NULL || fn == NULL) {
+		return;
+	}
+	const cJSON *it = NULL;
+	cJSON_ArrayForEach(it, p->apps)
+	{
+		if (it->string != NULL) {
+			fn(ctx, it->string, decision_for_scope(it, U_DESKTOP_SCOPE_CONTROL),
+			   decision_for_scope(it, U_DESKTOP_SCOPE_CAPTURE));
 		}
 	}
 }
@@ -855,7 +910,20 @@ u_desktop_policy_for_each_app(const struct u_desktop_policy *p, u_desktop_policy
 bool
 u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const char *by)
 {
-	if (exe == NULL || exe[0] == '\0') {
+	return u_desktop_policy_set_app_scope(exe, U_DESKTOP_SCOPE_CONTROL, d, by);
+}
+
+static const char *
+decision_word(enum u_desktop_app_decision d)
+{
+	return d == U_DESKTOP_APP_ALLOW ? "allow" : "deny";
+}
+
+bool
+u_desktop_policy_set_app_scope(const char *exe, uint32_t scopes, enum u_desktop_app_decision d, const char *by)
+{
+	scopes &= U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	if (exe == NULL || exe[0] == '\0' || scopes == 0) {
 		return false;
 	}
 	char path[PATH_CAP];
@@ -883,7 +951,19 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 	}
 	cJSON *apps = cJSON_GetObjectItemCaseSensitive(root, "apps");
 
-	// Drop every spelling of this executable, then add the new entry.
+	// The answers this executable has now (every spelling; a deny wins), with the
+	// change applied to the scopes asked for.
+	enum u_desktop_app_decision ctl = apps_decision(apps, exe, U_DESKTOP_SCOPE_CONTROL);
+	enum u_desktop_app_decision cap = apps_decision(apps, exe, U_DESKTOP_SCOPE_CAPTURE);
+	bool had = ctl != U_DESKTOP_APP_NONE || cap != U_DESKTOP_APP_NONE;
+	if (scopes & U_DESKTOP_SCOPE_CONTROL) {
+		ctl = d;
+	}
+	if (scopes & U_DESKTOP_SCOPE_CAPTURE) {
+		cap = d;
+	}
+
+	// Drop every spelling of this executable, then add the merged entry.
 	bool removed = false;
 	for (cJSON *it = apps->child; it != NULL;) {
 		cJSON *next = it->next;
@@ -893,20 +973,30 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 		}
 		it = next;
 	}
-	if (d != U_DESKTOP_APP_NONE) {
-		cJSON_AddStringToObject(apps, exe, d == U_DESKTOP_APP_ALLOW ? "allow" : "deny");
+	if (cap == U_DESKTOP_APP_NONE && ctl != U_DESKTOP_APP_NONE) {
+		// No CAPTURE answer: the v1 string form, which a v1 runtime still reads.
+		cJSON_AddStringToObject(apps, exe, decision_word(ctl));
+	} else if (cap != U_DESKTOP_APP_NONE) {
+		cJSON *e = cJSON_AddObjectToObject(apps, exe);
+		if (e != NULL && ctl != U_DESKTOP_APP_NONE) {
+			cJSON_AddStringToObject(e, "control", decision_word(ctl));
+		}
+		if (e != NULL) {
+			cJSON_AddStringToObject(e, "capture", decision_word(cap));
+		}
 	}
 	bool ok = save_root_atomic(path, root);
 	cJSON_Delete(root);
 	store_unlock(lk);
 
-	if (ok && (d != U_DESKTOP_APP_NONE || removed)) {
+	if (ok && (d != U_DESKTOP_APP_NONE || (removed && had))) {
 		struct u_desktop_audit_record r;
 		memset(&r, 0, sizeof(r));
 		r.action = d == U_DESKTOP_APP_ALLOW ? "allow" : d == U_DESKTOP_APP_DENY ? "deny" : "forget";
 		r.chars = -1;
 		r.subject = exe;
 		r.by = by;
+		r.scope = u_desktop_scope_str(scopes);
 		r.result = "ok";
 		u_desktop_audit_append(&r);
 	}
@@ -992,6 +1082,15 @@ utc_now(char *out, size_t cap)
 	strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
+void
+u_desktop_audit_utc_now(char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+		utc_now(out, cap);
+	}
+}
+
 bool
 u_desktop_audit_append(const struct u_desktop_audit_record *r)
 {
@@ -1025,7 +1124,31 @@ u_desktop_audit_append(const struct u_desktop_audit_record *r)
 	if (r->subject != NULL) {
 		cJSON_AddStringToObject(o, "subject", r->subject);
 	}
-	if (r->has_target) {
+	if (r->scope != NULL) {
+		cJSON_AddStringToObject(o, "scope", r->scope);
+	}
+	if (r->target_kind != NULL) {
+		// A capture: what was captured (a region, the desktop, a window's frame).
+		cJSON *tg = cJSON_AddObjectToObject(o, "target");
+		if (tg != NULL) {
+			cJSON_AddStringToObject(tg, "kind", r->target_kind);
+			if (r->has_target) {
+				char id[24];
+				snprintf(id, sizeof(id), "%llu", (unsigned long long)r->target_id);
+				cJSON_AddStringToObject(tg, "id", id);
+			}
+			if (r->target_app != NULL) {
+				cJSON_AddStringToObject(tg, "app", r->target_app);
+			}
+			if (r->target_title != NULL) {
+				cJSON_AddStringToObject(tg, "title", r->target_title);
+			}
+			if (r->has_rect) {
+				int rect[4] = {r->rx, r->ry, r->rw, r->rh};
+				cJSON_AddItemToObject(tg, "rect", cJSON_CreateIntArray(rect, 4));
+			}
+		}
+	} else if (r->has_target) {
 		cJSON *tg = cJSON_AddObjectToObject(o, "target");
 		if (tg != NULL) {
 			char id[24];
@@ -1045,6 +1168,19 @@ u_desktop_audit_append(const struct u_desktop_audit_record *r)
 	}
 	if (r->chars >= 0) {
 		cJSON_AddNumberToObject(o, "chars", (double)r->chars);
+	}
+	if (r->has_size) {
+		cJSON_AddNumberToObject(o, "w", r->w);
+		cJSON_AddNumberToObject(o, "h", r->h);
+	}
+	if (r->count > 0) {
+		cJSON_AddNumberToObject(o, "count", r->count);
+	}
+	if (r->first_t != NULL) {
+		cJSON_AddStringToObject(o, "first", r->first_t);
+	}
+	if (r->last_t != NULL) {
+		cJSON_AddStringToObject(o, "last", r->last_t);
 	}
 	if (r->keys != NULL) {
 		cJSON_AddStringToObject(o, "keys", r->keys);

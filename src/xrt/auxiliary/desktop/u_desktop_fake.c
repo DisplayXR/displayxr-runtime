@@ -6,6 +6,7 @@
  */
 
 #include "u_desktop_fake.h"
+#include "u_desktop_capture.h"
 #include "u_desktop_chord.h"
 
 #include "os/os_threading.h"
@@ -27,6 +28,7 @@ struct fake_window
 {
 	struct u_desktop_window w; //!< z is recomputed from the array order
 	char content[FAKE_CONTENT_SIZE];
+	bool capture_excluded; //!< withheld from captures (the GNOME extension's capture_excluded)
 };
 
 struct u_desktop_fake
@@ -74,6 +76,21 @@ struct u_desktop_fake
 	char log[FAKE_LOG_SIZE];
 	size_t log_len;
 	uint32_t op_count;
+
+	// spec v2: screen capture
+	struct u_desktop_fake_monitor monitors[U_DESKTOP_FAKE_MAX_MONITORS];
+	uint32_t monitor_count;
+	enum u_desktop_access capture_access;
+	enum u_desktop_access capture_answer;
+	bool scopes_report_all; //!< a request_scopes answer decides both scopes (GNOME's combined dialog)
+	u_desktop_scopes_done_fn pending_scopes_done;
+	uint32_t pending_scopes;
+	uint32_t scopes_request_count;
+	uint32_t last_scopes;
+	bool exclusion_unknown; //!< the capture cannot tell which windows are excluded
+	enum u_desktop_result capture_result;
+	uint32_t capture_delay_ms;
+	uint32_t capture_count;
 };
 
 static struct u_desktop_fake *
@@ -824,16 +841,197 @@ fake_scroll(struct u_desktop_backend *b,
 	return r;
 }
 
+/*
+ *
+ * Spec v2: screen capture.
+ *
+ */
+
+static enum u_desktop_access
+fake_capture_access_status(struct u_desktop_backend *b)
+{
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	enum u_desktop_access a = f->capture_access;
+	os_mutex_unlock(&f->mutex);
+	return a;
+}
+
+//! The answers a request for @p scopes gets (mutex held).
+static void
+scopes_answer_locked(struct u_desktop_fake *f, uint32_t scopes, enum u_desktop_access *ctl, enum u_desktop_access *cap)
+{
+	bool all = f->scopes_report_all;
+	*ctl = (scopes & U_DESKTOP_SCOPE_CONTROL) != 0 || all ? f->answer : U_DESKTOP_ACCESS_UNKNOWN;
+	*cap = (scopes & U_DESKTOP_SCOPE_CAPTURE) != 0 || all ? f->capture_answer : U_DESKTOP_ACCESS_UNKNOWN;
+	if (!f->base.remembers_in_store) {
+		if (*ctl != U_DESKTOP_ACCESS_UNKNOWN) {
+			f->access = *ctl;
+		}
+		if (*cap != U_DESKTOP_ACCESS_UNKNOWN) {
+			f->capture_access = *cap;
+		}
+	}
+}
+
+static void
+fake_request_scopes(struct u_desktop_backend *b,
+                    const struct u_desktop_app_info *app,
+                    uint32_t scopes,
+                    u_desktop_scopes_done_fn done,
+                    void *ctx)
+{
+	(void)app;
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	f->request_count++;
+	f->scopes_request_count++;
+	f->last_scopes = scopes;
+	if (f->deferred) {
+		f->pending_scopes_done = done;
+		f->pending_ctx = ctx;
+		f->pending_scopes = scopes;
+		os_mutex_unlock(&f->mutex);
+		return;
+	}
+	enum u_desktop_access ctl, cap;
+	scopes_answer_locked(f, scopes, &ctl, &cap);
+	os_mutex_unlock(&f->mutex);
+	done(ctx, ctl, cap);
+}
+
+static enum u_desktop_result
+fake_monitors(struct u_desktop_backend *b, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg)
+{
+	(void)msg;
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	for (uint32_t i = 0; i < f->monitor_count && i < cap; i++) {
+		out[i] = f->monitors[i].rect;
+	}
+	*count = f->monitor_count;
+	os_mutex_unlock(&f->mutex);
+	return U_DESKTOP_OK;
+}
+
+//! The picture of desktop point (x, y) (mutex held). See u_desktop_fake.h.
+static void
+expected_pixel_locked(struct u_desktop_fake *f, int32_t x, int32_t y, uint8_t out[4])
+{
+	for (uint32_t i = 0; i < f->window_count; i++) {
+		const struct u_desktop_window *w = &f->windows[i].w;
+		if ((w->state & U_DESKTOP_WINDOW_MINIMIZED) == 0 && contains(&w->frame, x, y)) {
+			out[0] = 0x10;
+			out[1] = (uint8_t)(w->id & 0xff);
+			out[2] = 0xF0;
+			out[3] = 255;
+			return;
+		}
+	}
+	out[0] = (uint8_t)(x & 0xff);
+	out[1] = (uint8_t)(y & 0xff);
+	out[2] = 0x80;
+	out[3] = 255;
+}
+
+static enum u_desktop_result
+fake_capture(struct u_desktop_backend *b, const struct u_desktop_rect *src, struct u_desktop_image *img, char *msg)
+{
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	uint32_t delay = f->capture_delay_ms;
+	os_mutex_unlock(&f->mutex);
+	if (delay > 0) {
+		os_nanosleep((int64_t)delay * 1000000);
+	}
+	batch_hook(f, "capture", 0);
+
+	os_mutex_lock(&f->mutex);
+	enum u_desktop_result r = f->capture_result;
+	if (r == U_DESKTOP_OK && f->locked) {
+		snprintf(msg, U_DESKTOP_MSG_SIZE, "screen locked");
+		r = U_DESKTOP_ERR_REFUSED;
+	} else if (r == U_DESKTOP_OK && f->exclusion_unknown) {
+		snprintf(msg, U_DESKTOP_MSG_SIZE, "cannot honour capture exclusion");
+		r = U_DESKTOP_ERR_REFUSED;
+	} else if (r != U_DESKTOP_OK) {
+		snprintf(msg, U_DESKTOP_MSG_SIZE, "fake: forced capture failure");
+	}
+	if (r != U_DESKTOP_OK) {
+		os_mutex_unlock(&f->mutex);
+		return r;
+	}
+	// The native density: the highest scale among the monitors the region touches.
+	uint32_t scale = 1;
+	for (uint32_t i = 0; i < f->monitor_count; i++) {
+		struct u_desktop_rect tmp;
+		if (u_desktop_rect_intersect(&f->monitors[i].rect, src, &tmp) && f->monitors[i].scale > scale) {
+			scale = f->monitors[i].scale;
+		}
+	}
+	if (!u_desktop_image_alloc(img, (uint32_t)src->w * scale, (uint32_t)src->h * scale)) {
+		os_mutex_unlock(&f->mutex);
+		snprintf(msg, U_DESKTOP_MSG_SIZE, "fake: image too large");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	img->frame_ns = os_monotonic_get_ns();
+	recompute_z(f);
+	for (uint32_t i = 0; i < f->monitor_count; i++) {
+		const struct u_desktop_fake_monitor *m = &f->monitors[i];
+		struct u_desktop_rect part;
+		if (!m->shared || m->scale == 0 || !u_desktop_rect_intersect(&m->rect, src, &part)) {
+			continue;
+		}
+		// The monitor's own frame, at its own scale, like a PipeWire stream's.
+		uint32_t fw = (uint32_t)m->rect.w * m->scale, fh = (uint32_t)m->rect.h * m->scale;
+		uint8_t *frame = (uint8_t *)malloc((size_t)fw * fh * 4);
+		if (frame == NULL) {
+			continue;
+		}
+		for (uint32_t fy = 0; fy < fh; fy++) {
+			for (uint32_t fx = 0; fx < fw; fx++) {
+				uint8_t px[4];
+				expected_pixel_locked(f, m->rect.x + (int32_t)(fx / m->scale), m->rect.y + (int32_t)(fy / m->scale),
+				                      px);
+				uint8_t *d = frame + ((size_t)fy * fw + fx) * 4;
+				d[0] = px[2]; // BGRx, as mutter's SHM streams
+				d[1] = px[1];
+				d[2] = px[0];
+				d[3] = 0;
+			}
+		}
+		u_desktop_image_draw_frame(img, src, &m->rect, frame, fw, fh, fw * 4, U_DESKTOP_PIXFMT_BGRX);
+		free(frame);
+	}
+	// Capture-excluded windows are withheld over their whole frame.
+	for (uint32_t i = 0; i < f->window_count; i++) {
+		const struct fake_window *w = &f->windows[i];
+		if (w->capture_excluded && (w->w.state & U_DESKTOP_WINDOW_MINIMIZED) == 0) {
+			u_desktop_image_withhold(img, src, &w->w.frame);
+		}
+	}
+	f->capture_count++;
+	os_mutex_unlock(&f->mutex);
+	batch_hook(f, "captured", 0);
+	return U_DESKTOP_OK;
+}
+
 static void
 fake_destroy(struct u_desktop_backend *b)
 {
 	struct u_desktop_fake *f = fake(b);
 	os_mutex_lock(&f->mutex);
 	u_desktop_access_done_fn done = f->pending_done;
+	u_desktop_scopes_done_fn sdone = f->pending_scopes_done;
 	void *ctx = f->pending_ctx;
 	f->pending_done = NULL;
+	f->pending_scopes_done = NULL;
 	struct u_desktop_fake_orphan *orphan = f->orphan;
 	os_mutex_unlock(&f->mutex);
+	if (sdone != NULL) {
+		// The contract: deliver the owed answer before returning.
+		sdone(ctx, U_DESKTOP_ACCESS_UNKNOWN, U_DESKTOP_ACCESS_UNKNOWN);
+	}
 	if (done != NULL) {
 		if (orphan != NULL) {
 			// Test knob: BREAK the Lifetime contract on purpose and hand the owed
@@ -873,7 +1071,8 @@ u_desktop_fake_create(void)
 	os_mutex_init(&f->mutex);
 	f->base.name = "fake";
 	f->base.caps = U_DESKTOP_CAP_LIST_WINDOWS | U_DESKTOP_CAP_POINTER_POSITION | U_DESKTOP_CAP_PICK |
-	               U_DESKTOP_CAP_READ_TEXT | U_DESKTOP_CAP_WINDOW_ACTIONS | U_DESKTOP_CAP_INPUT;
+	               U_DESKTOP_CAP_READ_TEXT | U_DESKTOP_CAP_WINDOW_ACTIONS | U_DESKTOP_CAP_INPUT |
+	               U_DESKTOP_CAP_CAPTURE;
 	f->base.remembers_in_store = env_is("DXR_DESKTOP_FAKE_STORE", "1");
 	f->base.access_status = fake_access_status;
 	f->base.request_access = fake_request_access;
@@ -891,11 +1090,22 @@ u_desktop_fake_create(void)
 	f->base.pointer_move = fake_pointer_move;
 	f->base.pointer_button = fake_pointer_button;
 	f->base.scroll = fake_scroll;
+	f->base.capture_access_status = fake_capture_access_status;
+	f->base.request_scopes = fake_request_scopes;
+	f->base.monitors = fake_monitors;
+	f->base.capture = fake_capture;
 	f->base.destroy = fake_destroy;
 
 	f->access = U_DESKTOP_ACCESS_UNKNOWN;
 	f->answer = env_is("DXR_DESKTOP_FAKE_ANSWER", "deny") ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_GRANTED;
 	f->locked = env_is("DXR_DESKTOP_FAKE_LOCKED", "1");
+	f->capture_access = U_DESKTOP_ACCESS_UNKNOWN;
+	f->capture_answer =
+	    env_is("DXR_DESKTOP_FAKE_CAPTURE_ANSWER", "deny") ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_GRANTED;
+	f->monitor_count = 1;
+	f->monitors[0].rect = (struct u_desktop_rect){0, 0, SCREEN_W, SCREEN_H};
+	f->monitors[0].scale = 1;
+	f->monitors[0].shared = true;
 	f->injection_is_input = true;
 	// The user last touched the machine long ago: no idle wait by default.
 	uint64_t now = os_monotonic_get_ns();
@@ -992,13 +1202,23 @@ u_desktop_fake_complete_request(struct u_desktop_fake *f)
 {
 	os_mutex_lock(&f->mutex);
 	u_desktop_access_done_fn done = f->pending_done;
+	u_desktop_scopes_done_fn sdone = f->pending_scopes_done;
 	void *ctx = f->pending_ctx;
 	enum u_desktop_access answer = f->answer;
 	f->pending_done = NULL;
+	f->pending_scopes_done = NULL;
 	if (done != NULL && !f->base.remembers_in_store) {
 		f->access = answer;
 	}
+	enum u_desktop_access ctl = U_DESKTOP_ACCESS_UNKNOWN, cap = U_DESKTOP_ACCESS_UNKNOWN;
+	if (sdone != NULL) {
+		scopes_answer_locked(f, f->pending_scopes, &ctl, &cap);
+	}
 	os_mutex_unlock(&f->mutex);
+	if (sdone != NULL) {
+		sdone(ctx, ctl, cap);
+		return true;
+	}
 	if (done == NULL) {
 		return false;
 	}
@@ -1182,5 +1402,99 @@ u_desktop_fake_set_orphan_on_destroy(struct u_desktop_fake *f, struct u_desktop_
 {
 	os_mutex_lock(&f->mutex);
 	f->orphan = orphan;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_monitors(struct u_desktop_fake *f, const struct u_desktop_fake_monitor *m, uint32_t n)
+{
+	os_mutex_lock(&f->mutex);
+	n = n > U_DESKTOP_FAKE_MAX_MONITORS ? U_DESKTOP_FAKE_MAX_MONITORS : n;
+	for (uint32_t i = 0; i < n; i++) {
+		f->monitors[i] = m[i];
+	}
+	f->monitor_count = n;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_capture_excluded(struct u_desktop_fake *f, uint64_t id, bool excluded)
+{
+	os_mutex_lock(&f->mutex);
+	int idx = find_index(f, id);
+	if (idx >= 0) {
+		f->windows[idx].capture_excluded = excluded;
+	}
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_exclusion_unknown(struct u_desktop_fake *f, bool unknown)
+{
+	os_mutex_lock(&f->mutex);
+	f->exclusion_unknown = unknown;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_capture_access(struct u_desktop_fake *f, enum u_desktop_access a)
+{
+	os_mutex_lock(&f->mutex);
+	f->capture_access = a;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_capture_request_answer(struct u_desktop_fake *f, enum u_desktop_access answer, bool report_all)
+{
+	os_mutex_lock(&f->mutex);
+	f->capture_answer = answer;
+	f->scopes_report_all = report_all;
+	os_mutex_unlock(&f->mutex);
+}
+
+uint32_t
+u_desktop_fake_last_request_scopes(struct u_desktop_fake *f, uint32_t *count)
+{
+	os_mutex_lock(&f->mutex);
+	uint32_t s = f->last_scopes;
+	if (count != NULL) {
+		*count = f->scopes_request_count;
+	}
+	os_mutex_unlock(&f->mutex);
+	return s;
+}
+
+void
+u_desktop_fake_set_capture_result(struct u_desktop_fake *f, enum u_desktop_result r)
+{
+	os_mutex_lock(&f->mutex);
+	f->capture_result = r;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_capture_delay_ms(struct u_desktop_fake *f, uint32_t ms)
+{
+	os_mutex_lock(&f->mutex);
+	f->capture_delay_ms = ms;
+	os_mutex_unlock(&f->mutex);
+}
+
+uint32_t
+u_desktop_fake_capture_count(struct u_desktop_fake *f)
+{
+	os_mutex_lock(&f->mutex);
+	uint32_t n = f->capture_count;
+	os_mutex_unlock(&f->mutex);
+	return n;
+}
+
+void
+u_desktop_fake_expected_pixel(struct u_desktop_fake *f, int32_t x, int32_t y, uint8_t out[4])
+{
+	os_mutex_lock(&f->mutex);
+	recompute_z(f);
+	expected_pixel_locked(f, x, y, out);
 	os_mutex_unlock(&f->mutex);
 }

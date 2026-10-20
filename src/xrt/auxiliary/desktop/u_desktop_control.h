@@ -39,6 +39,7 @@ extern "C" {
 #define U_DESKTOP_XR_ERROR_RUNTIME_FAILURE (-2)
 #define U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED (-8)
 #define U_DESKTOP_XR_ERROR_LIMIT_REACHED (-10)
+#define U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT (-11)
 #define U_DESKTOP_XR_ERROR_REFUSED (-1004999400)
 #define U_DESKTOP_XR_ERROR_NOT_GRANTED (-1004999401)
 #define U_DESKTOP_XR_ERROR_WINDOW_LOST (-1004999402)
@@ -101,11 +102,56 @@ struct u_desktop_action
 typedef void (*u_desktop_state_fn)(void *ctx, enum u_desktop_control_state state);
 typedef void (*u_desktop_completed_fn)(void *ctx, uint64_t action_id, int32_t result, const char *message);
 
+/*
+ * Spec v2: screen capture (§10).
+ */
+
+//! Same values as XrDesktopCaptureTargetDXR.
+enum u_desktop_capture_target
+{
+	U_DESKTOP_CAPTURE_DESKTOP = 0,
+	U_DESKTOP_CAPTURE_REGION = 1,
+	U_DESKTOP_CAPTURE_WINDOW = 2,
+};
+
+//! Mirror of XrDesktopCaptureInfoDXR.
+struct u_desktop_capture_info
+{
+	uint32_t target; //!< enum u_desktop_capture_target (validated: may hold any value)
+	uint64_t window_id;
+	struct u_desktop_rect region;
+	uint32_t max_w, max_h;
+};
+
+//! What XrEventDataDesktopCaptureCompletedDXR carries.
+struct u_desktop_capture_done
+{
+	uint64_t capture_id;
+	int32_t result;
+	uint32_t w, h;                //!< 0 on failure
+	struct u_desktop_rect source; //!< desktop coordinates
+	uint64_t frame_ns;            //!< os_monotonic_get_ns() time the pixels were current (0 on failure)
+	const char *message;
+};
+
+typedef void (*u_desktop_capture_done_fn)(void *ctx, const struct u_desktop_capture_done *done);
+
+//! At least this long between two capture starts (4 Hz per session, spec §10.3).
+#define U_DESKTOP_CAPTURE_MIN_INTERVAL_MS 250
+//! The last successful image is kept this long at most (spec §10.3).
+#define U_DESKTOP_CAPTURE_RETENTION_MS 10000
+//! A capture burst's audit record is written after this long without a capture (spec §10.4).
+#define U_DESKTOP_CAPTURE_BURST_GAP_MS 2000
+
 struct u_desktop_control_callbacks
 {
 	u_desktop_state_fn state_changed;
 	u_desktop_completed_fn action_completed;
 	void *ctx;
+	//! Spec v2 (may be NULL): the CAPTURE scope's state changed.
+	u_desktop_state_fn capture_state_changed;
+	//! Spec v2 (may be NULL): a capture completed (exactly one per accepted capture).
+	u_desktop_capture_done_fn capture_completed;
 };
 
 //! The safety layer's timing (spec §5 step 2). Zero fields take the default.
@@ -205,6 +251,50 @@ u_desktop_utf8_trim_partial(const char *s, size_t len);
 //! "UNSUPPORTED", "GRANTED", ...
 const char *
 u_desktop_control_state_str(enum u_desktop_control_state s);
+
+
+// --- spec v2: scopes and screen capture (§10) -------------------------------
+
+/*!
+ * xrRequestDesktopControlDXR with an XrDesktopControlRequestScopeDXR: ask for
+ * @p scopes (enum u_desktop_scope bits, non-zero) in ONE prompt. Per listed scope:
+ * rows 1–5 resolve without prompting, a scope already GRANTED is not asked again,
+ * a remembered store grant resolves without a prompt; each listed scope's outcome
+ * is always announced on its own callback. A no-op while a listed scope is
+ * PENDING. u_desktop_control_request() is this with CONTROL only. Returns SUCCESS,
+ * or VALIDATION_FAILURE for 0 / unknown bits.
+ */
+int32_t
+u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason, uint32_t scopes);
+
+//! The CAPTURE scope's state (§3 re-evaluated now for that scope; a change fires
+//! capture_state_changed). Never gated.
+enum u_desktop_control_state
+u_desktop_control_get_capture_state(struct u_desktop_control *c);
+
+//! Capture validation alone (§10.3). Fills @p why on failure.
+bool
+u_desktop_control_capture_validate(const struct u_desktop_capture_info *info, char *why, size_t why_cap);
+
+/*!
+ * xrCaptureDesktopDXR: validate, gate (FEATURE_UNSUPPORTED without the capture
+ * capability, NOT_GRANTED unless CAPTURE is GRANTED), one in flight
+ * (LIMIT_REACHED), then hand to the session's capture worker. On SUCCESS
+ * @p out_id is set (never 0) and exactly one capture_completed callback follows
+ * (unless the object is destroyed first). Never prompts.
+ */
+int32_t
+u_desktop_control_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *info, uint64_t *out_id);
+
+/*!
+ * xrGetDesktopCaptureImageDXR: the retained image of capture @p id (two-call idiom,
+ * BYTES). @p count is set to w * h * 4. A call that copies the image out ends its
+ * retention; a size query or a too-small buffer (SIZE_INSUFFICIENT) does not. Any
+ * other id, an expired or already-fetched one: VALIDATION_FAILURE.
+ */
+int32_t
+u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba);
+
 
 #ifdef __cplusplus
 }

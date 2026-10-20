@@ -15,6 +15,7 @@
  */
 
 #include "u_desktop_control.h"
+#include "u_desktop_capture.h"
 #include "u_desktop_chord.h"
 #include "u_desktop_gnome_logic.h"
 #include "u_desktop_policy.h"
@@ -73,6 +74,54 @@ struct request_ctx
 	struct u_desktop_control *c; //!< NULL once the control is dying
 };
 
+/*!
+ * One request in flight: the context handed to the backend's request_access /
+ * request_scopes. Holds a reference on the request_ctx and remembers which scopes
+ * THIS request asked for (two requests for different scopes may overlap).
+ */
+struct request_ticket
+{
+	struct request_ctx *rq;
+	uint32_t asked; //!< enum u_desktop_scope bits
+};
+
+//! Indices into u_desktop_control::sc.
+enum
+{
+	SC_CONTROL = 0,
+	SC_CAPTURE = 1,
+	SC_COUNT = 2,
+};
+
+//! One consent scope's request bookkeeping (spec v2 §10.2: each scope has its own state).
+struct scope_state
+{
+	bool requested;
+	bool pending;
+	bool revoked; //!< the backend reported NOT_GRANTED: DENIED until a new request
+	enum u_desktop_access req_result;
+	bool store_write_failed;
+	enum u_desktop_control_state last_state;
+	//! state + 1 of the last submit refused for state (0 = none since the last accepted
+	//! submit): refusals are audited once per state, so a spamming app cannot flood the log.
+	int refused_audit_state_plus1;
+};
+
+//! The audit record of the current capture burst (spec §10.4), capture worker only.
+struct capture_burst
+{
+	bool open;
+	uint32_t count;
+	uint64_t last_ns;
+	char first_t[32], last_t[32];
+	uint32_t target;
+	uint64_t window_id;
+	char app[U_DESKTOP_APP_ID_SIZE];
+	char title[U_DESKTOP_TITLE_SIZE];
+	struct u_desktop_rect rect;
+	uint32_t w, h;
+};
+
 struct queued_action
 {
 	uint64_t id;
@@ -96,22 +145,33 @@ struct u_desktop_control
 	struct request_ctx *rq; //!< see struct request_ctx
 
 	// --- under mutex ---
-	bool dying;   //!< set before backend->destroy: consent answers are ignored from here on
-	bool revoked; //!< the backend reported NOT_GRANTED: DENIED until a new request
+	bool dying; //!< set before backend->destroy: consent answers are ignored from here on
 	struct u_desktop_policy *policy;
-	bool requested;
-	bool pending;
-	enum u_desktop_access req_result;
-	bool store_write_failed;
-	enum u_desktop_control_state last_state;
+	struct scope_state sc[SC_COUNT];
+	//! The app has touched the CAPTURE scope (asked, queried, captured): only then
+	//! are its state changes announced (a v1 app never sees a capture event).
+	bool capture_seen;
 	//! Last backend->is_locked answer (probed with the mutex released, see probe_locked)
 	//! and the ticket of the probe that produced it: an older probe finishing late never
 	//! overwrites a newer answer.
 	bool locked_snapshot;
 	uint64_t locked_seq_issued, locked_seq_stored;
-	//! state + 1 of the last submit refused for state (0 = none since the last accepted
-	//! submit): refusals are audited once per state, so a spamming app cannot flood the log.
-	int refused_audit_state_plus1;
+
+	// --- capture (spec v2 §10), under mutex ---
+	struct os_cond cap_cond;
+	struct os_thread cap_thread;
+	bool cap_thread_started;
+	bool cap_job_pending; //!< accepted, not started yet
+	bool cap_in_flight;   //!< accepted, completion not delivered yet
+	struct u_desktop_capture_info cap_job;
+	uint64_t cap_job_id;
+	uint64_t cap_next_id;
+	uint64_t cap_last_start_ns;
+	struct u_desktop_image kept; //!< the most recent successful capture's image
+	uint64_t kept_id;
+	uint64_t kept_until_ns;
+	// --- capture worker only ---
+	struct capture_burst burst;
 
 	struct queued_action q[U_DESKTOP_CONTROL_QUEUE_SIZE];
 	uint32_t q_head, q_count;
@@ -277,13 +337,29 @@ result_str(int32_t r)
  *
  */
 
+static uint32_t
+scope_bit(int idx)
+{
+	return idx == SC_CAPTURE ? U_DESKTOP_SCOPE_CAPTURE : U_DESKTOP_SCOPE_CONTROL;
+}
+
+static const char *
+scope_name(int idx)
+{
+	return idx == SC_CAPTURE ? "capture" : "control";
+}
+
+//! The §3 table for scope @p idx (spec v2 §10.2: rows 1–7 are the same checks; rows 4
+//! and 8–10 read that scope's own store answer and grant).
 static enum u_desktop_control_state
-evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
+evaluate_scope_locked(struct u_desktop_control *c, int idx, enum reason *out_reason)
 {
 	enum reason r;
 	enum u_desktop_control_state s;
+	struct scope_state *sc = &c->sc[idx];
 
-	if (c->b == NULL) { // 1
+	if (c->b == NULL || (idx == SC_CAPTURE && ((c->b->caps & U_DESKTOP_CAP_CAPTURE) == 0 ||
+	                                           c->b->capture == NULL || c->b->monitors == NULL))) { // 1
 		r = R_NO_BACKEND;
 		s = U_DESKTOP_STATE_UNSUPPORTED;
 		goto out;
@@ -304,7 +380,7 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		s = U_DESKTOP_STATE_SUSPENDED;
 		goto out;
 	}
-	enum u_desktop_app_decision d = u_desktop_policy_app(c->policy, c->exe);
+	enum u_desktop_app_decision d = u_desktop_policy_app_scope(c->policy, c->exe, scope_bit(idx));
 	if (d == U_DESKTOP_APP_DENY) { // 4
 		r = R_STORE_DENY;
 		s = U_DESKTOP_STATE_DISABLED_BY_USER;
@@ -315,17 +391,17 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		s = U_DESKTOP_STATE_SUSPENDED;
 		goto out;
 	}
-	if (!c->requested) { // 6
+	if (!sc->requested) { // 6
 		r = R_NOT_REQUESTED;
 		s = U_DESKTOP_STATE_NOT_REQUESTED;
 		goto out;
 	}
-	if (c->pending) { // 7
+	if (sc->pending) { // 7
 		r = R_PENDING;
 		s = U_DESKTOP_STATE_PENDING;
 		goto out;
 	}
-	if (c->revoked) {
+	if (sc->revoked) {
 		// The OS took the permission back mid-session (backend NOT_GRANTED):
 		// refuse everything without reaching the OS until a new request.
 		r = R_REVOKED;
@@ -336,7 +412,7 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 		// 8. The DisplayXR store is the ONLY grant for a backend whose OS has
 		// no consent of its own (Windows): an OS "granted" means nothing there.
 		// The in-memory answer counts only if persisting it failed.
-		if (d == U_DESKTOP_APP_ALLOW || (c->store_write_failed && c->req_result == U_DESKTOP_ACCESS_GRANTED)) {
+		if (d == U_DESKTOP_APP_ALLOW || (sc->store_write_failed && sc->req_result == U_DESKTOP_ACCESS_GRANTED)) {
 			r = R_STORE_ALLOW;
 			s = U_DESKTOP_STATE_GRANTED;
 			goto out;
@@ -344,10 +420,11 @@ evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
 	} else {
 		// 9. The OS's view, else (when it cannot tell without prompting) the
 		// answer to this session's request.
-		enum u_desktop_access a =
-		    c->b->access_status != NULL ? c->b->access_status(c->b) : U_DESKTOP_ACCESS_UNKNOWN;
+		enum u_desktop_access (*status)(struct u_desktop_backend *) =
+		    idx == SC_CAPTURE ? c->b->capture_access_status : c->b->access_status;
+		enum u_desktop_access a = status != NULL ? status(c->b) : U_DESKTOP_ACCESS_UNKNOWN;
 		if (a == U_DESKTOP_ACCESS_GRANTED ||
-		    (a == U_DESKTOP_ACCESS_UNKNOWN && c->req_result == U_DESKTOP_ACCESS_GRANTED)) {
+		    (a == U_DESKTOP_ACCESS_UNKNOWN && sc->req_result == U_DESKTOP_ACCESS_GRANTED)) {
 			r = R_OS_GRANTED;
 			s = U_DESKTOP_STATE_GRANTED;
 			goto out;
@@ -363,20 +440,40 @@ out:
 	return s;
 }
 
-//! Evaluate; fire state_changed on a change (or always, with @p force).
+static enum u_desktop_control_state
+evaluate_locked(struct u_desktop_control *c, enum reason *out_reason)
+{
+	return evaluate_scope_locked(c, SC_CONTROL, out_reason);
+}
+
+//! Evaluate scope @p idx; fire its state callback on a change (or always, with @p force).
+static enum u_desktop_control_state
+update_scope_locked(struct u_desktop_control *c, int idx, enum reason *out_reason, bool force)
+{
+	struct scope_state *sc = &c->sc[idx];
+	enum u_desktop_control_state s = evaluate_scope_locked(c, idx, out_reason);
+	bool announce = idx == SC_CONTROL || c->capture_seen;
+	if ((s != sc->last_state || force) && !c->stop && announce) {
+		sc->last_state = s;
+		u_desktop_state_fn fn = idx == SC_CAPTURE ? c->cb.capture_state_changed : c->cb.state_changed;
+		if (fn != NULL) {
+			fn(c->cb.ctx, s);
+		}
+	} else {
+		sc->last_state = s;
+	}
+	return s;
+}
+
+//! The CONTROL scope (and, once the app touched it, the CAPTURE scope: a kill switch
+//! or a lock is announced on both at the next call).
 static enum u_desktop_control_state
 update_state_locked(struct u_desktop_control *c, enum reason *out_reason, bool force)
 {
-	enum u_desktop_control_state s = evaluate_locked(c, out_reason);
-	if ((s != c->last_state || force) && !c->stop) {
-		c->last_state = s;
-		if (c->cb.state_changed != NULL) {
-			c->cb.state_changed(c->cb.ctx, s);
-		}
-	} else {
-		c->last_state = s;
+	if (c->capture_seen) {
+		update_scope_locked(c, SC_CAPTURE, NULL, false);
 	}
-	return s;
+	return update_scope_locked(c, SC_CONTROL, out_reason, force);
 }
 
 /*!
@@ -415,6 +512,19 @@ update_state(struct u_desktop_control *c, enum reason *out_reason)
 	return s;
 }
 
+//! The CAPTURE scope, with a fresh lock probe (and the CONTROL scope's event too).
+static enum u_desktop_control_state
+update_capture_state(struct u_desktop_control *c, enum reason *out_reason)
+{
+	probe_locked(c);
+	os_mutex_lock(&c->mutex);
+	c->capture_seen = true;
+	update_scope_locked(c, SC_CONTROL, NULL, false);
+	enum u_desktop_control_state s = update_scope_locked(c, SC_CAPTURE, out_reason, false);
+	os_mutex_unlock(&c->mutex);
+	return s;
+}
+
 //! Result + message for an action/observation refused by the state (§5 step 1).
 static int32_t
 refusal_for_state(enum u_desktop_control_state s, enum reason r, char *msg, size_t cap)
@@ -440,7 +550,7 @@ refusal_for_state(enum u_desktop_control_state s, enum reason r, char *msg, size
  */
 
 static void
-audit_consent(struct u_desktop_control *c, const char *what, const char *reason)
+audit_consent(struct u_desktop_control *c, const char *what, const char *reason, const char *scope)
 {
 	struct u_desktop_audit_record r;
 	memset(&r, 0, sizeof(r));
@@ -448,6 +558,7 @@ audit_consent(struct u_desktop_control *c, const char *what, const char *reason)
 	r.action = what;
 	r.chars = -1;
 	r.reason = reason;
+	r.scope = scope;
 	r.result = "ok";
 	u_desktop_audit_append(&r);
 }
@@ -465,96 +576,220 @@ request_ctx_unref(struct request_ctx *rq)
 }
 
 static void
-request_done_locked(struct u_desktop_control *c, enum u_desktop_access result);
+request_done_locked(struct u_desktop_control *c,
+                    uint32_t asked,
+                    enum u_desktop_access control,
+                    enum u_desktop_access capture);
 
 static void
-request_done(void *ctx, enum u_desktop_access result)
+ticket_done(struct request_ticket *t, enum u_desktop_access control, enum u_desktop_access capture)
 {
-	struct request_ctx *rq = (struct request_ctx *)ctx;
+	struct request_ctx *rq = t->rq;
 	// Held across the handling: destroy clears rq->c under this mutex, so it
 	// waits for an answer being handled and every later answer sees NULL.
 	os_mutex_lock(&rq->mutex);
 	struct u_desktop_control *c = rq->c;
 	if (c != NULL) {
 		os_mutex_lock(&c->mutex);
-		request_done_locked(c, result);
+		request_done_locked(c, t->asked, control, capture);
 		os_mutex_unlock(&c->mutex);
 	}
 	os_mutex_unlock(&rq->mutex);
 	request_ctx_unref(rq); // the in-flight request's reference
+	free(t);
+}
+
+//! u_desktop_access_done_fn: a CONTROL-only request through request_access.
+static void
+request_done(void *ctx, enum u_desktop_access result)
+{
+	ticket_done((struct request_ticket *)ctx, result, U_DESKTOP_ACCESS_UNKNOWN);
+}
+
+//! u_desktop_scopes_done_fn: a request through request_scopes.
+static void
+request_scopes_done(void *ctx, enum u_desktop_access control, enum u_desktop_access capture)
+{
+	ticket_done((struct request_ticket *)ctx, control, capture);
 }
 
 static void
-request_done_locked(struct u_desktop_control *c, enum u_desktop_access result)
+request_done_locked(struct u_desktop_control *c,
+                    uint32_t asked,
+                    enum u_desktop_access control,
+                    enum u_desktop_access capture)
 {
-	c->pending = false;
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if ((asked & scope_bit(idx)) != 0) {
+			c->sc[idx].pending = false;
+		}
+	}
 	if (c->dying || c->stop) {
 		// Owed answer delivered from the backend's destroy: nobody is asking.
 		return;
 	}
-	c->req_result = result;
-	if (c->b != NULL && c->b->remembers_in_store &&
-	    (result == U_DESKTOP_ACCESS_GRANTED || result == U_DESKTOP_ACCESS_DENIED)) {
-		// Windows: DisplayXR's own prompt — the answer is remembered in the store.
-		bool ok = u_desktop_policy_set_app(
-		    c->exe, result == U_DESKTOP_ACCESS_GRANTED ? U_DESKTOP_APP_ALLOW : U_DESKTOP_APP_DENY, "prompt");
-		c->store_write_failed = !ok;
-		if (!ok) {
-			U_LOG_W("desktop_control: could not persist the consent answer in the store");
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		struct scope_state *sc = &c->sc[idx];
+		enum u_desktop_access result = idx == SC_CAPTURE ? capture : control;
+		bool was_asked = (asked & scope_bit(idx)) != 0;
+		bool definite = result == U_DESKTOP_ACCESS_GRANTED || result == U_DESKTOP_ACCESS_DENIED;
+		if (!was_asked && !definite) {
+			continue; // the prompt said nothing about this scope
+		}
+		if (!was_asked) {
+			// One OS dialog decided a scope the app did not list (GNOME: the Start
+			// response decides input and screens together): take its answer.
+			sc->requested = true;
+			sc->revoked = false;
+		}
+		sc->req_result = result;
+		if (c->b != NULL && c->b->remembers_in_store && definite) {
+			// Windows: DisplayXR's own prompt — the answer is remembered in the store.
+			bool ok = u_desktop_policy_set_app_scope(
+			    c->exe, scope_bit(idx),
+			    result == U_DESKTOP_ACCESS_GRANTED ? U_DESKTOP_APP_ALLOW : U_DESKTOP_APP_DENY, "prompt");
+			sc->store_write_failed = !ok;
+			if (!ok) {
+				U_LOG_W("desktop_control: could not persist the %s consent answer in the store",
+				        scope_name(idx));
+			}
+		}
+		audit_consent(c, result == U_DESKTOP_ACCESS_GRANTED ? "granted" : "denied", NULL,
+		              idx == SC_CAPTURE || asked != U_DESKTOP_SCOPE_CONTROL ? scope_name(idx) : NULL);
+		U_LOG_W("desktop_control: %s consent %s for %s", scope_name(idx),
+		        result == U_DESKTOP_ACCESS_GRANTED ? "granted" : "denied", c->name);
+		if (idx == SC_CAPTURE) {
+			c->capture_seen = true;
+		}
+		// Always announce the outcome, even when it equals the previous state.
+		update_scope_locked(c, idx, NULL, true);
+	}
+}
+
+//! Rows that resolve a request without prompting (§3 rows 1–5).
+static bool
+blocks_request(enum reason why)
+{
+	return why == R_NO_BACKEND || why == R_ENV_OFF || why == R_STORE_UNREADABLE || why == R_KILL_SWITCH ||
+	       why == R_STORE_DENY || why == R_LOCKED;
+}
+
+int32_t
+u_desktop_control_request_scopes(struct u_desktop_control *c, const char *reason, uint32_t scopes)
+{
+	const uint32_t known = U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE;
+	if (scopes == 0 || (scopes & ~known) != 0) {
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	probe_locked(c); // row 5 needs a fresh answer: a locked session is never prompted
+	os_mutex_lock(&c->mutex);
+	if ((scopes & U_DESKTOP_SCOPE_CAPTURE) != 0) {
+		c->capture_seen = true;
+	}
+
+	// A prompt is already up for a listed scope: never stack a second one.
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if ((scopes & scope_bit(idx)) != 0 &&
+		    evaluate_scope_locked(c, idx, NULL) == U_DESKTOP_STATE_PENDING) {
+			os_mutex_unlock(&c->mutex);
+			return U_DESKTOP_XR_SUCCESS;
 		}
 	}
-	audit_consent(c, result == U_DESKTOP_ACCESS_GRANTED ? "granted" : "denied", NULL);
-	U_LOG_W("desktop_control: consent %s for %s", result == U_DESKTOP_ACCESS_GRANTED ? "granted" : "denied",
-	        c->name);
-	// Always announce the outcome, even when it equals the previous state.
-	update_state_locked(c, NULL, true);
+
+	uint32_t ask = 0;
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if ((scopes & scope_bit(idx)) == 0) {
+			continue;
+		}
+		enum reason why;
+		enum u_desktop_control_state s = evaluate_scope_locked(c, idx, &why);
+		if (blocks_request(why) || s == U_DESKTOP_STATE_GRANTED) {
+			// Rows 1–5: resolved without prompting; a scope already GRANTED is not
+			// asked again. Either way the state is announced.
+			update_scope_locked(c, idx, NULL, true);
+			continue;
+		}
+		ask |= scope_bit(idx);
+	}
+	if (ask == 0) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_SUCCESS;
+	}
+
+	audit_consent(c, "request", reason, ask == U_DESKTOP_SCOPE_CONTROL ? NULL : u_desktop_scope_str(ask));
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if ((ask & scope_bit(idx)) != 0) {
+			c->sc[idx].requested = true;
+			c->sc[idx].revoked = false; // a new request on a user gesture re-asks the OS
+		}
+	}
+
+	// Remembered grant: no prompt (row 8).
+	if (c->b->remembers_in_store) {
+		for (int idx = 0; idx < SC_COUNT; idx++) {
+			if ((ask & scope_bit(idx)) != 0 &&
+			    u_desktop_policy_app_scope(c->policy, c->exe, scope_bit(idx)) == U_DESKTOP_APP_ALLOW) {
+				ask &= ~scope_bit(idx);
+				update_scope_locked(c, idx, NULL, true);
+			}
+		}
+		if (ask == 0) {
+			os_mutex_unlock(&c->mutex);
+			return U_DESKTOP_XR_SUCCESS;
+		}
+	}
+
+	struct u_desktop_backend *b = c->b;
+	// CONTROL alone goes through request_access, exactly as in spec v1.
+	bool via_scopes = b->request_scopes != NULL && (ask & U_DESKTOP_SCOPE_CAPTURE) != 0;
+	if (b->request_scopes == NULL && (ask & U_DESKTOP_SCOPE_CAPTURE) != 0) {
+		// A capture-capable backend implements request_scopes; one that does not
+		// cannot ask for CAPTURE (never reached: CAPTURE is UNSUPPORTED there).
+		c->sc[SC_CAPTURE].req_result = U_DESKTOP_ACCESS_DENIED;
+		update_scope_locked(c, SC_CAPTURE, NULL, true);
+		ask &= ~(uint32_t)U_DESKTOP_SCOPE_CAPTURE;
+		if (ask == 0) {
+			os_mutex_unlock(&c->mutex);
+			return U_DESKTOP_XR_SUCCESS;
+		}
+	}
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if ((ask & scope_bit(idx)) != 0) {
+			c->sc[idx].pending = true;
+			update_scope_locked(c, idx, NULL, true);
+		}
+	}
+	struct request_ctx *rq = c->rq;
+	os_mutex_unlock(&c->mutex);
+
+	struct request_ticket *t = (struct request_ticket *)calloc(1, sizeof(*t));
+	if (t == NULL) {
+		os_mutex_lock(&c->mutex);
+		request_done_locked(c, ask, U_DESKTOP_ACCESS_DENIED, U_DESKTOP_ACCESS_DENIED);
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_SUCCESS;
+	}
+	// After releasing c->mutex: ticket_done takes rq->mutex THEN c->mutex.
+	os_mutex_lock(&rq->mutex);
+	rq->refs++; // the in-flight request's reference, dropped by ticket_done
+	os_mutex_unlock(&rq->mutex);
+	t->rq = rq;
+	t->asked = ask;
+
+	struct u_desktop_app_info app = {c->exe, c->name, reason};
+	// Either may call the done function before returning.
+	if (via_scopes) {
+		b->request_scopes(b, &app, ask, request_scopes_done, t);
+	} else {
+		b->request_access(b, &app, request_done, t);
+	}
+	return U_DESKTOP_XR_SUCCESS;
 }
 
 int32_t
 u_desktop_control_request(struct u_desktop_control *c, const char *reason)
 {
-	probe_locked(c); // row 5 needs a fresh answer: a locked session is never prompted
-	os_mutex_lock(&c->mutex);
-	enum reason why;
-	enum u_desktop_control_state s = evaluate_locked(c, &why);
-
-	// Rows 1–5: resolved without prompting; announce the blocking state.
-	if (why == R_NO_BACKEND || why == R_ENV_OFF || why == R_STORE_UNREADABLE || why == R_KILL_SWITCH ||
-	    why == R_STORE_DENY || why == R_LOCKED) {
-		update_state_locked(c, NULL, true);
-		os_mutex_unlock(&c->mutex);
-		return U_DESKTOP_XR_SUCCESS;
-	}
-	// A prompt is already up: never stack a second one.
-	if (s == U_DESKTOP_STATE_PENDING) {
-		os_mutex_unlock(&c->mutex);
-		return U_DESKTOP_XR_SUCCESS;
-	}
-
-	audit_consent(c, "request", reason);
-	c->requested = true;
-	c->revoked = false; // a new request on a user gesture re-asks the OS
-
-	// Remembered grant: no prompt (row 8).
-	if (c->b->remembers_in_store && u_desktop_policy_app(c->policy, c->exe) == U_DESKTOP_APP_ALLOW) {
-		update_state_locked(c, NULL, true);
-		os_mutex_unlock(&c->mutex);
-		return U_DESKTOP_XR_SUCCESS;
-	}
-
-	c->pending = true;
-	update_state_locked(c, NULL, true);
-	struct u_desktop_backend *b = c->b;
-	struct request_ctx *rq = c->rq;
-	os_mutex_unlock(&c->mutex);
-	// After releasing c->mutex: request_done takes rq->mutex THEN c->mutex.
-	os_mutex_lock(&rq->mutex);
-	rq->refs++; // the in-flight request's reference, dropped by request_done
-	os_mutex_unlock(&rq->mutex);
-
-	struct u_desktop_app_info app = {c->exe, c->name, reason};
-	b->request_access(b, &app, request_done, rq); // may call request_done before returning
-	return U_DESKTOP_XR_SUCCESS;
+	return u_desktop_control_request_scopes(c, reason, U_DESKTOP_SCOPE_CONTROL);
 }
 
 
@@ -775,8 +1010,8 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 		// An attempt while suspended / disabled / not granted is what a user reading
 		// the audit log most wants to see (spec §5 step 6) — once per state.
 		os_mutex_lock(&c->mutex);
-		bool first = c->refused_audit_state_plus1 != (int)st + 1;
-		c->refused_audit_state_plus1 = (int)st + 1;
+		bool first = c->sc[SC_CONTROL].refused_audit_state_plus1 != (int)st + 1;
+		c->sc[SC_CONTROL].refused_audit_state_plus1 = (int)st + 1;
 		os_mutex_unlock(&c->mutex);
 		if (first) {
 			struct u_desktop_audit_record r;
@@ -794,7 +1029,7 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 		return U_DESKTOP_XR_ERROR_NOT_GRANTED;
 	}
 	os_mutex_lock(&c->mutex);
-	c->refused_audit_state_plus1 = 0;
+	c->sc[SC_CONTROL].refused_audit_state_plus1 = 0;
 	os_mutex_unlock(&c->mutex);
 	if (!u_desktop_control_validate(a, NULL, 0)) {
 		if (a != NULL && action_name(a->type) == NULL) {
@@ -957,8 +1192,8 @@ static void
 mark_revoked(struct u_desktop_control *c)
 {
 	os_mutex_lock(&c->mutex);
-	if (!c->revoked) {
-		c->revoked = true;
+	if (!c->sc[SC_CONTROL].revoked) {
+		c->sc[SC_CONTROL].revoked = true;
 		U_LOG_W("desktop_control: the OS revoked desktop control for %s", c->name);
 	}
 	update_state_locked(c, NULL, false);
@@ -1185,7 +1420,7 @@ guard_still_allowed(void *ctx)
 		} else if (locked) {
 			ok = false;
 			why = R_LOCKED;
-		} else if (c->revoked) {
+		} else if (c->sc[SC_CONTROL].revoked) {
 			ok = false;
 			why = R_REVOKED;
 		}
@@ -1586,6 +1821,578 @@ worker(void *ptr)
 
 /*
  *
+ * Screen capture (spec v2 §10) — its own worker per session, never queued
+ * behind actions and never subject to the idle wait (capture injects nothing).
+ *
+ */
+
+enum u_desktop_control_state
+u_desktop_control_get_capture_state(struct u_desktop_control *c)
+{
+	return update_capture_state(c, NULL);
+}
+
+bool
+u_desktop_control_capture_validate(const struct u_desktop_capture_info *info, char *why, size_t why_cap)
+{
+	char dummy[8];
+	if (why == NULL || why_cap == 0) {
+		why = dummy;
+		why_cap = sizeof(dummy);
+	}
+	why[0] = '\0';
+	if (info == NULL) {
+		snprintf(why, why_cap, "no capture info");
+		return false;
+	}
+	if (info->target > U_DESKTOP_CAPTURE_WINDOW) {
+		snprintf(why, why_cap, "unknown target %u", info->target);
+		return false;
+	}
+	if (info->max_w < 1 || info->max_w > U_DESKTOP_CAPTURE_MAX_DIM || info->max_h < 1 ||
+	    info->max_h > U_DESKTOP_CAPTURE_MAX_DIM) {
+		snprintf(why, why_cap, "maxWidth / maxHeight must be 1..%u", U_DESKTOP_CAPTURE_MAX_DIM);
+		return false;
+	}
+	if (info->target == U_DESKTOP_CAPTURE_REGION) {
+		const int32_t L = U_DESKTOP_CONTROL_MAX_COORD;
+		const struct u_desktop_rect *r = &info->region;
+		if (r->w <= 0 || r->h <= 0) {
+			snprintf(why, why_cap, "region width / height must be > 0");
+			return false;
+		}
+		if (r->x < -L || r->x > L || r->y < -L || r->y > L || r->w > L || r->h > L) {
+			snprintf(why, why_cap, "coordinates are limited to +/-%d", L);
+			return false;
+		}
+	}
+	if (info->target == U_DESKTOP_CAPTURE_WINDOW && info->window_id == 0) {
+		snprintf(why, why_cap, "windowId is required");
+		return false;
+	}
+	return true;
+}
+
+static void *
+capture_worker(void *ptr);
+
+int32_t
+u_desktop_control_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *info, uint64_t *out_id)
+{
+	if (out_id != NULL) {
+		*out_id = 0;
+	}
+	if (!u_desktop_control_capture_validate(info, NULL, 0)) {
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	if (c->b == NULL || (c->b->caps & U_DESKTOP_CAP_CAPTURE) == 0 || c->b->capture == NULL ||
+	    c->b->monitors == NULL) {
+		return U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+	}
+	enum u_desktop_control_state st = update_capture_state(c, NULL);
+	if (st != U_DESKTOP_STATE_GRANTED) {
+		// Audited once per state, like a refused action submit (spec §5 step 6).
+		os_mutex_lock(&c->mutex);
+		bool first = c->sc[SC_CAPTURE].refused_audit_state_plus1 != (int)st + 1;
+		c->sc[SC_CAPTURE].refused_audit_state_plus1 = (int)st + 1;
+		os_mutex_unlock(&c->mutex);
+		if (first) {
+			struct u_desktop_audit_record r;
+			memset(&r, 0, sizeof(r));
+			r.exe = c->exe;
+			r.action = "capture";
+			r.chars = -1;
+			r.result = "not_granted";
+			r.message = u_desktop_control_state_str(st);
+			u_desktop_audit_append(&r);
+		}
+		return U_DESKTOP_XR_ERROR_NOT_GRANTED;
+	}
+
+	os_mutex_lock(&c->mutex);
+	c->sc[SC_CAPTURE].refused_audit_state_plus1 = 0;
+	if (c->stop) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+	}
+	if (c->cap_in_flight) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_LIMIT_REACHED;
+	}
+	if (!c->cap_thread_started) {
+		os_thread_init(&c->cap_thread);
+		if (os_thread_start(&c->cap_thread, capture_worker, c) != 0) {
+			os_thread_destroy(&c->cap_thread);
+			os_mutex_unlock(&c->mutex);
+			return U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		}
+		c->cap_thread_started = true;
+		os_thread_name(&c->cap_thread, "dxr: capture");
+	}
+	c->cap_job = *info;
+	c->cap_job_id = ++c->cap_next_id;
+	c->cap_job_pending = true;
+	c->cap_in_flight = true;
+	uint64_t id = c->cap_job_id;
+	os_cond_broadcast(&c->cap_cond);
+	os_mutex_unlock(&c->mutex);
+
+	if (out_id != NULL) {
+		*out_id = id;
+	}
+	return U_DESKTOP_XR_SUCCESS;
+}
+
+//! Drop the retained image if its time is up (mutex held).
+static void
+expire_kept_locked(struct u_desktop_control *c, uint64_t now_ns)
+{
+	if (c->kept.rgba != NULL && now_ns >= c->kept_until_ns) {
+		u_desktop_image_free(&c->kept);
+		c->kept_id = 0;
+	}
+}
+
+int32_t
+u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba)
+{
+	if (count == NULL || (cap > 0 && rgba == NULL)) {
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	*count = 0;
+	os_mutex_lock(&c->mutex);
+	expire_kept_locked(c, os_monotonic_get_ns());
+	if (id == 0 || c->kept.rgba == NULL || c->kept_id != id) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	uint32_t size = c->kept.w * c->kept.h * 4u;
+	*count = size;
+	if (cap == 0) {
+		os_mutex_unlock(&c->mutex); // a size query: the image stays
+		return U_DESKTOP_XR_SUCCESS;
+	}
+	if (cap < size) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT;
+	}
+	// Copied out: retention ends. Take ownership so the copy runs unlocked.
+	struct u_desktop_image img = c->kept;
+	memset(&c->kept, 0, sizeof(c->kept));
+	c->kept_id = 0;
+	os_mutex_unlock(&c->mutex);
+	memcpy(rgba, img.rgba, size);
+	u_desktop_image_free(&img);
+	return U_DESKTOP_XR_SUCCESS;
+}
+
+static const char *
+capture_kind(uint32_t target)
+{
+	switch (target) {
+	case U_DESKTOP_CAPTURE_REGION: return "region";
+	case U_DESKTOP_CAPTURE_WINDOW: return "window";
+	default: return "desktop";
+	}
+}
+
+//! Write the open burst's record (one per burst, spec §10.4). Capture worker / destroy.
+static void
+flush_burst(struct u_desktop_control *c)
+{
+	struct capture_burst *bu = &c->burst;
+	if (!bu->open) {
+		return;
+	}
+	struct u_desktop_audit_record r;
+	memset(&r, 0, sizeof(r));
+	r.exe = c->exe;
+	r.action = "capture";
+	r.chars = -1;
+	r.scope = "capture";
+	r.target_kind = capture_kind(bu->target);
+	r.has_target = bu->target == U_DESKTOP_CAPTURE_WINDOW;
+	r.target_id = bu->window_id;
+	r.target_app = bu->target == U_DESKTOP_CAPTURE_WINDOW ? bu->app : NULL;
+	r.target_title = bu->target == U_DESKTOP_CAPTURE_WINDOW ? bu->title : NULL;
+	r.has_rect = true;
+	r.rx = bu->rect.x;
+	r.ry = bu->rect.y;
+	r.rw = bu->rect.w;
+	r.rh = bu->rect.h;
+	r.has_size = true;
+	r.w = bu->w;
+	r.h = bu->h;
+	r.count = bu->count;
+	r.first_t = bu->first_t;
+	r.last_t = bu->last_t;
+	r.result = "ok";
+	u_desktop_audit_append(&r);
+	memset(bu, 0, sizeof(*bu));
+}
+
+//! A successful capture joins the open burst, or opens one (a different target closes it).
+static void
+audit_capture_ok(struct u_desktop_control *c,
+                 const struct u_desktop_capture_info *info,
+                 const struct u_desktop_window *win,
+                 const struct u_desktop_rect *src,
+                 uint32_t w,
+                 uint32_t h)
+{
+	struct capture_burst *bu = &c->burst;
+	bool same = bu->open && bu->target == info->target &&
+	            (info->target != U_DESKTOP_CAPTURE_WINDOW || bu->window_id == info->window_id) &&
+	            (info->target == U_DESKTOP_CAPTURE_WINDOW || memcmp(&bu->rect, src, sizeof(*src)) == 0);
+	if (!same) {
+		flush_burst(c);
+		bu->open = true;
+		bu->target = info->target;
+		bu->window_id = info->target == U_DESKTOP_CAPTURE_WINDOW ? info->window_id : 0;
+		u_desktop_audit_utc_now(bu->first_t, sizeof(bu->first_t));
+	}
+	if (win != NULL) {
+		snprintf(bu->app, sizeof(bu->app), "%s", win->app_id);
+		snprintf(bu->title, sizeof(bu->title), "%s", win->title);
+	}
+	bu->rect = *src;
+	bu->w = w;
+	bu->h = h;
+	bu->count++;
+	bu->last_ns = os_monotonic_get_ns();
+	u_desktop_audit_utc_now(bu->last_t, sizeof(bu->last_t));
+}
+
+//! A failure closes the open burst and gets its own record (spec §10.4).
+static void
+audit_capture_fail(struct u_desktop_control *c,
+                   const struct u_desktop_capture_info *info,
+                   const struct u_desktop_window *win,
+                   int32_t result,
+                   const char *msg)
+{
+	flush_burst(c);
+	struct u_desktop_audit_record r;
+	memset(&r, 0, sizeof(r));
+	r.exe = c->exe;
+	r.action = "capture";
+	r.chars = -1;
+	r.scope = "capture";
+	r.target_kind = capture_kind(info->target);
+	r.has_target = info->target == U_DESKTOP_CAPTURE_WINDOW;
+	r.target_id = info->window_id;
+	if (win != NULL) {
+		r.target_app = win->app_id;
+		r.target_title = win->title;
+	}
+	if (info->target == U_DESKTOP_CAPTURE_REGION) {
+		r.has_rect = true;
+		r.rx = info->region.x;
+		r.ry = info->region.y;
+		r.rw = info->region.w;
+		r.rh = info->region.h;
+	}
+	r.count = 1;
+	r.result = result_str(result);
+	r.message = msg;
+	u_desktop_audit_append(&r);
+}
+
+//! The backend took the CAPTURE permission back: DENIED (event) until a new request.
+static void
+mark_capture_revoked(struct u_desktop_control *c)
+{
+	os_mutex_lock(&c->mutex);
+	if (!c->sc[SC_CAPTURE].revoked) {
+		c->sc[SC_CAPTURE].revoked = true;
+		U_LOG_W("desktop_control: the OS revoked screen capture for %s", c->name);
+	}
+	update_scope_locked(c, SC_CAPTURE, NULL, false);
+	// On GNOME both scopes share one portal session: the CONTROL scope's own
+	// access_status says so, and is announced here too.
+	update_scope_locked(c, SC_CONTROL, NULL, false);
+	os_mutex_unlock(&c->mutex);
+}
+
+//! Spec §10.3 "Checks": state GRANTED, kill switch off, not locked, no secure desktop.
+static bool
+capture_allowed(struct u_desktop_control *c, int32_t *result, char *msg)
+{
+	enum reason why;
+	enum u_desktop_control_state s = update_capture_state(c, &why);
+	if (s == U_DESKTOP_STATE_GRANTED) {
+		return true;
+	}
+	*result = refusal_for_state(s, why, msg, MSG_CAP);
+	return false;
+}
+
+//! The window list (malloc'd, caller frees) — the capture worker's own copy.
+static enum u_desktop_result
+capture_list(struct u_desktop_control *c, struct u_desktop_window **out, uint32_t *n)
+{
+	*out = NULL;
+	*n = 0;
+	if ((c->b->caps & U_DESKTOP_CAP_LIST_WINDOWS) == 0 || c->b->list_windows == NULL) {
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	uint32_t cap = 64;
+	for (int attempt = 0; attempt < 3; attempt++) {
+		struct u_desktop_window *ws = (struct u_desktop_window *)calloc(cap, sizeof(*ws));
+		if (ws == NULL) {
+			return U_DESKTOP_ERR_FAILED;
+		}
+		uint32_t count = 0;
+		enum u_desktop_result r = c->b->list_windows(c->b, ws, cap, &count);
+		if (r != U_DESKTOP_OK) {
+			free(ws);
+			return r;
+		}
+		if (count <= cap) {
+			*out = ws;
+			*n = count;
+			return U_DESKTOP_OK;
+		}
+		free(ws);
+		cap = count + 16;
+	}
+	return U_DESKTOP_ERR_FAILED;
+}
+
+#define CAPTURE_MAX_MONITORS 16
+
+static void
+run_capture(struct u_desktop_control *c, const struct u_desktop_capture_info *info, uint64_t id)
+{
+	int32_t result = U_DESKTOP_XR_SUCCESS;
+	char msg[MSG_CAP] = {0};
+	struct u_desktop_rect src = {0, 0, 0, 0};
+	struct u_desktop_window win;
+	bool have_win = false;
+	struct u_desktop_image img = {0};
+	struct u_desktop_image out = {0};
+	struct u_desktop_window *ws = NULL;
+	uint32_t nws = 0;
+	enum u_desktop_result br;
+
+	// Checks before anything is resolved.
+	if (!capture_allowed(c, &result, msg)) {
+		goto done;
+	}
+
+	// Target resolution (§10.3).
+	struct u_desktop_rect mons[CAPTURE_MAX_MONITORS];
+	uint32_t nmon = 0;
+	br = c->b->monitors(c->b, mons, CAPTURE_MAX_MONITORS, &nmon, msg);
+	if (br != U_DESKTOP_OK) {
+		result = map_backend_result(br, msg, MSG_CAP);
+		goto done;
+	}
+	nmon = nmon > CAPTURE_MAX_MONITORS ? CAPTURE_MAX_MONITORS : nmon;
+	struct u_desktop_rect bounds = u_desktop_rect_bounds(mons, nmon);
+	if (info->target == U_DESKTOP_CAPTURE_WINDOW) {
+		br = capture_list(c, &ws, &nws);
+		if (br != U_DESKTOP_OK) {
+			result = map_backend_result(br, msg, MSG_CAP);
+			if (br == U_DESKTOP_ERR_UNSUPPORTED) {
+				snprintf(msg, sizeof(msg), "cannot find the window: this desktop backend cannot list windows");
+			}
+			goto done;
+		}
+		const struct u_desktop_window *w = NULL;
+		for (uint32_t i = 0; i < nws; i++) {
+			if (ws[i].id == info->window_id) {
+				w = &ws[i];
+				break;
+			}
+		}
+		if (w == NULL) {
+			result = U_DESKTOP_XR_ERROR_WINDOW_LOST;
+			snprintf(msg, sizeof(msg), "the target window no longer exists");
+			goto done;
+		}
+		win = *w;
+		have_win = true;
+		if ((w->state & U_DESKTOP_WINDOW_MINIMIZED) != 0) {
+			result = U_DESKTOP_XR_ERROR_REFUSED;
+			snprintf(msg, sizeof(msg), "the window is minimized");
+			goto done;
+		}
+		if (!u_desktop_rect_intersect(&w->frame, &bounds, &src)) {
+			result = U_DESKTOP_XR_ERROR_REFUSED;
+			snprintf(msg, sizeof(msg), "found nothing: outside every monitor");
+			goto done;
+		}
+	} else if (info->target == U_DESKTOP_CAPTURE_REGION) {
+		if (!u_desktop_rect_intersect(&info->region, &bounds, &src)) {
+			result = U_DESKTOP_XR_ERROR_REFUSED;
+			snprintf(msg, sizeof(msg), "found nothing: outside every monitor");
+			goto done;
+		}
+	} else {
+		src = bounds;
+		if (src.w <= 0 || src.h <= 0) {
+			result = U_DESKTOP_XR_ERROR_REFUSED;
+			snprintf(msg, sizeof(msg), "found nothing: no monitor");
+			goto done;
+		}
+	}
+
+	// Re-checked just before the OS capture.
+	if (stopping(c)) {
+		return;
+	}
+	if (!capture_allowed(c, &result, msg)) {
+		goto done;
+	}
+	msg[0] = '\0';
+	uint64_t t_call = os_monotonic_get_ns();
+	br = c->b->capture(c->b, &src, &img, msg);
+	if (br != U_DESKTOP_OK || img.rgba == NULL || img.w == 0 || img.h == 0) {
+		u_desktop_image_free(&img);
+		if (br == U_DESKTOP_OK) {
+			br = U_DESKTOP_ERR_FAILED;
+			snprintf(msg, sizeof(msg), "the backend returned no image");
+		}
+		if (br == U_DESKTOP_ERR_NOT_GRANTED) {
+			mark_capture_revoked(c);
+		}
+		result = map_backend_result(br, msg, MSG_CAP);
+		goto done;
+	}
+	if (img.frame_ns == 0 || img.frame_ns < t_call) {
+		// Freshness (§10.3): never older than the call.
+		img.frame_ns = t_call;
+	}
+
+	// The app's own windows are always withheld, on every OS (decision 7).
+	free(ws);
+	ws = NULL;
+	br = capture_list(c, &ws, &nws);
+	if (br != U_DESKTOP_OK) {
+		result = U_DESKTOP_XR_ERROR_REFUSED;
+		snprintf(msg, sizeof(msg), "cannot honour capture exclusion (the app's own windows)");
+		goto done;
+	}
+	for (uint32_t i = 0; i < nws; i++) {
+		if ((ws[i].state & U_DESKTOP_WINDOW_OWN) != 0 && (ws[i].state & U_DESKTOP_WINDOW_MINIMIZED) == 0) {
+			u_desktop_image_withhold(&img, &src, &ws[i].frame);
+		}
+	}
+
+	// Scale down to fit.
+	uint32_t ow = 0, oh = 0;
+	u_desktop_capture_fit(img.w, img.h, info->max_w, info->max_h, &ow, &oh);
+	if (!u_desktop_image_downscale(&img, ow, oh, &out)) {
+		result = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		snprintf(msg, sizeof(msg), "out of memory");
+		goto done;
+	}
+	u_desktop_image_free(&img);
+
+	// Re-checked before the hand-over: a frame finished as the screen locks (or the
+	// kill switch lands) is dropped.
+	if (stopping(c)) {
+		u_desktop_image_free(&out);
+		free(ws);
+		return;
+	}
+	if (!capture_allowed(c, &result, msg)) {
+		goto done;
+	}
+
+	os_mutex_lock(&c->mutex);
+	u_desktop_image_free(&c->kept);
+	c->kept = out;
+	memset(&out, 0, sizeof(out));
+	c->kept_id = id;
+	c->kept_until_ns = os_monotonic_get_ns() + (uint64_t)U_DESKTOP_CAPTURE_RETENTION_MS * NS_PER_MS;
+	struct u_desktop_capture_done d = {id, U_DESKTOP_XR_SUCCESS, c->kept.w, c->kept.h, src,
+	                                   c->kept.frame_ns, "ok"};
+	os_mutex_unlock(&c->mutex);
+
+	audit_capture_ok(c, info, have_win ? &win : NULL, &src, d.w, d.h);
+	free(ws);
+	os_mutex_lock(&c->mutex);
+	bool stop = c->stop;
+	os_mutex_unlock(&c->mutex);
+	if (!stop && c->cb.capture_completed != NULL) {
+		c->cb.capture_completed(c->cb.ctx, &d);
+	}
+	return;
+
+done:
+	u_desktop_image_free(&img);
+	u_desktop_image_free(&out);
+	free(ws);
+	if (msg[0] == '\0') {
+		map_backend_result(U_DESKTOP_ERR_FAILED, msg, MSG_CAP);
+	}
+	audit_capture_fail(c, info, have_win ? &win : NULL, result, msg);
+	os_mutex_lock(&c->mutex);
+	bool stopped = c->stop;
+	os_mutex_unlock(&c->mutex);
+	if (!stopped && c->cb.capture_completed != NULL) {
+		struct u_desktop_capture_done d = {id, result, 0, 0, src, 0, msg};
+		c->cb.capture_completed(c->cb.ctx, &d);
+	}
+}
+
+static void *
+capture_worker(void *ptr)
+{
+	struct u_desktop_control *c = (struct u_desktop_control *)ptr;
+	const uint64_t interval = (uint64_t)U_DESKTOP_CAPTURE_MIN_INTERVAL_MS * NS_PER_MS;
+	const uint64_t gap = (uint64_t)U_DESKTOP_CAPTURE_BURST_GAP_MS * NS_PER_MS;
+	os_mutex_lock(&c->mutex);
+	for (;;) {
+		if (c->stop) {
+			break;
+		}
+		uint64_t now = os_monotonic_get_ns();
+		expire_kept_locked(c, now);
+		if (c->burst.open && now - c->burst.last_ns >= gap) {
+			os_mutex_unlock(&c->mutex);
+			flush_burst(c);
+			os_mutex_lock(&c->mutex);
+			continue;
+		}
+		uint64_t wake = UINT64_MAX;
+		if (c->cap_job_pending) {
+			// 4 Hz per session: an earlier call is accepted and waits here.
+			uint64_t due = c->cap_last_start_ns != 0 ? c->cap_last_start_ns + interval : 0;
+			if (now >= due) {
+				struct u_desktop_capture_info job = c->cap_job;
+				uint64_t id = c->cap_job_id;
+				c->cap_job_pending = false;
+				c->cap_last_start_ns = now;
+				os_mutex_unlock(&c->mutex);
+				run_capture(c, &job, id);
+				os_mutex_lock(&c->mutex);
+				c->cap_in_flight = false;
+				continue;
+			}
+			wake = due;
+		}
+		if (c->kept.rgba != NULL && c->kept_until_ns < wake) {
+			wake = c->kept_until_ns;
+		}
+		if (c->burst.open && c->burst.last_ns + gap < wake) {
+			wake = c->burst.last_ns + gap;
+		}
+		if (wake == UINT64_MAX) {
+			os_cond_wait(&c->cap_cond, &c->mutex);
+		} else if (wake > now) {
+			os_cond_wait_timeout_ns(&c->cap_cond, &c->mutex, wake - now);
+		}
+	}
+	os_mutex_unlock(&c->mutex);
+	return NULL;
+}
+
+
+/*
+ *
  * Lifecycle.
  *
  */
@@ -1631,17 +2438,20 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->timing.own_grace_ns = timing != NULL && timing->own_grace_ns != 0 ? timing->own_grace_ns : DEFAULT_GRACE_NS;
 	c->timing.idle_max_wait_ns =
 	    timing != NULL && timing->idle_max_wait_ns != 0 ? timing->idle_max_wait_ns : DEFAULT_MAX_WAIT_NS;
-	c->req_result = U_DESKTOP_ACCESS_UNKNOWN;
+	c->sc[SC_CONTROL].req_result = U_DESKTOP_ACCESS_UNKNOWN;
+	c->sc[SC_CAPTURE].req_result = U_DESKTOP_ACCESS_UNKNOWN;
 	c->policy = u_desktop_policy_create();
 	c->list_cap = 64;
 	c->list_buf = (struct u_desktop_window *)calloc(c->list_cap, sizeof(struct u_desktop_window));
 
 	os_mutex_init(&c->mutex);
 	os_cond_init(&c->cond);
+	os_cond_init(&c->cap_cond);
 
 	// Initial state: no event (nothing has changed yet from the app's view).
 	os_mutex_lock(&c->mutex);
-	c->last_state = evaluate_locked(c, NULL);
+	c->sc[SC_CONTROL].last_state = evaluate_locked(c, NULL);
+	c->sc[SC_CAPTURE].last_state = evaluate_scope_locked(c, SC_CAPTURE, NULL);
 	os_mutex_unlock(&c->mutex);
 
 	os_thread_init(&c->thread);
@@ -1651,7 +2461,7 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	}
 
 	U_LOG_I("desktop_control: created for %s (backend %s, state %s)", c->name, c->b != NULL ? c->b->name : "none",
-	        u_desktop_control_state_str(c->last_state));
+	        u_desktop_control_state_str(c->sc[SC_CONTROL].last_state));
 	*out = c;
 	return 0;
 }
@@ -1674,6 +2484,8 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 		c->q_count--;
 	}
 	os_cond_broadcast(&c->cond);
+	os_cond_broadcast(&c->cap_cond);
+	bool cap_started = c->cap_thread_started;
 	os_mutex_unlock(&c->mutex);
 
 	// An action mid-flight finishes its current backend call first (its guard
@@ -1682,6 +2494,13 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 		os_thread_join(&c->thread);
 	}
 	os_thread_destroy(&c->thread);
+	// A capture mid-flight finishes its backend call (bounded) and is dropped.
+	if (cap_started) {
+		os_thread_join(&c->cap_thread);
+		os_thread_destroy(&c->cap_thread);
+	}
+	flush_burst(c);
+	u_desktop_image_free(&c->kept); // retention ends with the session
 
 	// From here on a consent answer is ignored ...
 	os_mutex_lock(&c->mutex);
@@ -1705,6 +2524,7 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 	request_ctx_unref(rq);
 
 	u_desktop_policy_destroy(&c->policy);
+	os_cond_destroy(&c->cap_cond);
 	os_cond_destroy(&c->cond);
 	os_mutex_destroy(&c->mutex);
 	free(c->list_buf);
