@@ -32,8 +32,13 @@
  * monitor's edges, jumping the pointer (a slow drag over a monitor edge pops
  * Ubuntu's tiling assistant, which grabs the keyboard — Escape if one is up)
  * through waypoints inside each monitor when it changes monitors (a straight jump
- * near the top was stopped at the boundary by a pointer barrier), read back and
- * corrected once — twice when edge tiling snapped it. Resizing them is UNSUPPORTED.
+ * near the top was stopped at the boundary by a pointer barrier), dwelling
+ * U_DESKTOP_CROSS_DWELL_MS on the target monitor after the last crossing before
+ * the release (Tiling Assistant judges a drop against the PREVIOUS monitor for
+ * 150 ms after a crossing), read back and corrected once — twice when edge
+ * tiling snapped it; shell UI the drop opened over the screen (Tiling
+ * Assistant's popup) is dismissed with Escape before any correction, or the
+ * move stops. Resizing them is UNSUPPORTED.
  * A Super gesture can leave the overview open; it is closed with Escape.
  * The pointer is put back where it was after a gesture.
  *
@@ -64,6 +69,10 @@
 #include <time.h>
 #include <unistd.h>
 
+//! Each AT-SPI look at the focused text field (before / after a paste).
+#define PASTE_ATSPI_BUDGET_MS 250
+//! After the paste was served: how long the focused text field may take to change.
+#define PASTE_VERIFY_MS 600
 #define WLG_PATH "/org/displayxr/WindowGeometry"
 #define WLG_IFACE "org.displayxr.WindowGeometry1"
 #define WLG_SCHEMA_MAX 1
@@ -719,6 +728,9 @@ gnome_move_verified_ex(struct gnome_backend *g, int32_t x, int32_t y, bool resto
 		do {
 			if (gnome_get_pointer_msg(g, &px, &py, NULL) == U_DESKTOP_OK &&
 			    abs(px - x) <= POINTER_TOLERANCE_PX && abs(py - y) <= POINTER_TOLERANCE_PX) {
+				if (msg != NULL) {
+					msg[0] = '\0'; // a first attempt's "did not arrive" is not the outcome
+				}
 				return U_DESKTOP_OK;
 			}
 			gdbus_sleep_ms(10);
@@ -920,6 +932,9 @@ gnome_pointer_button(struct u_desktop_backend *b,
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
+		// The press carries the verified point itself (motion + press in one
+		// frame): a user moving the mouse since the check cannot shift it.
+		return gnome_portal_press_at(g->portal, code, x, y, msg);
 	}
 	// A release is never refused: a button must not stay down.
 	return gnome_portal_button(g->portal, code, down, msg);
@@ -1111,16 +1126,27 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 			return U_DESKTOP_ERR_FAILED;
 		}
 		bool terminal = false;
+		uint32_t fpid = 0;
+		char ftitle[U_DESKTOP_TITLE_SIZE] = "";
 		struct u_desktop_window *ws;
 		uint32_t n;
 		if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
 			for (uint32_t i = 0; i < n; i++) {
 				if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
 					terminal = is_terminal(ws[i].app_id);
+					fpid = ws[i].pid;
+					snprintf(ftitle, sizeof(ftitle), "%s", ws[i].title);
 					break;
 				}
 			}
 			free(ws);
+		}
+		// 0. The focused text field before the paste (AT-SPI, when the app exposes
+		// one): the only evidence that the text ARRIVED — a read of the clipboard
+		// after the keystroke may be a clipboard manager's, not the target's.
+		struct u_desktop_text_state before = {0}, after = {0};
+		if (g->atspi != NULL && fpid != 0) {
+			gnome_atspi_focused_text(g->atspi, fpid, ftitle, PASTE_ATSPI_BUDGET_MS, &before);
 		}
 		// 1. Take the clipboard (slow: read the old text, offer ours, wait to own it).
 		enum u_desktop_result r = gnome_portal_clip_take(g->portal, body, msg);
@@ -1135,8 +1161,37 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 			gnome_portal_clip_restore(g->portal);
 			return r;
 		}
-		// 3. Paste (refused there if the clipboard changed hands meanwhile).
-		r = gnome_portal_clip_paste(g->portal, terminal, msg);
+		// 3. Paste (refused there if the clipboard changed hands meanwhile — the
+		// user copied: nothing pasted, the user's clipboard untouched).
+		struct u_desktop_paste_obs obs;
+		r = gnome_portal_clip_paste(g->portal, terminal, &obs, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		// 4. Did it arrive? The field must change (bounded poll: an app updates its
+		// accessible text from its own main loop).
+		if (before.found) {
+			uint64_t deadline = gdbus_now_ms() + PASTE_VERIFY_MS;
+			do {
+				gnome_atspi_focused_text(g->atspi, fpid, ftitle, PASTE_ATSPI_BUDGET_MS, &after);
+				obs.text_check = u_desktop_text_check(&before, &after);
+				if (obs.text_check != 0) {
+					break;
+				}
+				gdbus_sleep_ms(50);
+			} while (gdbus_now_ms() < deadline);
+		}
+		bool restore = true;
+		enum u_desktop_paste_verdict v = u_desktop_paste_decide(&obs, &restore);
+		// Stop serving our text; the previous text comes back only if the selection
+		// never changed hands (the portal side re-checks that too).
+		gnome_portal_clip_restore(g->portal);
+		r = u_desktop_paste_result(v);
+		if (v != U_DESKTOP_PASTE_DELIVERED) {
+			gnome_set_msg(msg, "%s", u_desktop_paste_message(v));
+		}
+		U_LOG_I("desktop/gnome: paste verdict %d (writes %u, lost %d/%d, field %d)", (int)v,
+		        obs.writes_after_key, obs.lost_before_key, obs.lost_after_key, obs.text_check);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}

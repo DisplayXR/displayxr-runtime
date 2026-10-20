@@ -9,6 +9,7 @@
  */
 
 #include "u_desktop_gnome_portal_priv.h"
+#include "u_desktop_gnome_logic.h"
 
 #include "util/u_logging.h"
 
@@ -54,7 +55,12 @@ is_text_mime(const char *mime)
 	        strcmp(mime, "UTF8_STRING") == 0 || strcmp(mime, "STRING") == 0 || strcmp(mime, "TEXT") == 0);
 }
 
-//! Write all of @p data to @p fd within @p timeout_ms.
+/*!
+ * Write all of @p data to @p fd within @p timeout_ms. The reader can go away
+ * mid-write (the selection changed hands ~10 ms into a type): EPIPE is "the
+ * transfer was cancelled", never a SIGPIPE — this runs in the APP's process, so
+ * the write blocks SIGPIPE for this thread only (u_desktop_write_nosigpipe).
+ */
 static bool
 write_all(int fd, const char *data, size_t len, uint32_t timeout_ms)
 {
@@ -65,10 +71,14 @@ write_all(int fd, const char *data, size_t len, uint32_t timeout_ms)
 		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 	}
 	while (off < len) {
-		ssize_t w = write(fd, data + off, len - off);
+		ptrdiff_t w = u_desktop_write_nosigpipe(fd, data + off, len - off);
 		if (w > 0) {
 			off += (size_t)w;
 			continue;
+		}
+		if (w < 0 && errno == EPIPE) {
+			U_LOG_I("desktop/gnome: a clipboard reader went away mid-transfer (cancelled)");
+			return false;
 		}
 		if (w < 0 && errno != EAGAIN && errno != EINTR) {
 			return false;
@@ -184,6 +194,47 @@ cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	g_ei.button_button(d, c->code, c->down);
 	g_ei.device_frame(d, g_ei.now(p->ei));
+	gdbus_sleep_ms(KEY_GAP_MS);
+	injected(p);
+	return U_DESKTOP_OK;
+}
+
+/*!
+ * A button press AT (x, y): the absolute motion and the press in ONE libei frame
+ * on a device that has both, so pointer motion from the user (a wiggling mouse)
+ * cannot land between them and move the press off the verified point. A
+ * session with no such device sends the motion frame, then the press frame.
+ */
+static enum u_desktop_result
+cmd_press_at(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	struct ei_device *d = gp_find_dev(p, EIX_CAP_POINTER_ABSOLUTE, false);
+	struct ei_device *bd = gp_find_dev(p, EIX_CAP_BUTTON, true);
+	if (d == NULL || bd == NULL) {
+		gp_set_msg(c->msg, "the remote-desktop session has no absolute pointer with buttons");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	bool inside = false;
+	struct ei_region *reg;
+	for (size_t i = 0; !inside && (reg = g_ei.device_get_region(d, i)) != NULL; i++) {
+		int64_t rx = g_ei.region_get_x(reg), ry = g_ei.region_get_y(reg);
+		int64_t rw = g_ei.region_get_width(reg), rh = g_ei.region_get_height(reg);
+		inside = c->x >= rx && c->y >= ry && c->x < rx + rw && c->y < ry + rh;
+	}
+	if (!inside) {
+		gp_set_msg(c->msg, "(%d,%d) is on no monitor", c->x, c->y);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	g_ei.motion_absolute(d, (double)c->x, (double)c->y);
+	if (bd != d) {
+		g_ei.device_frame(d, g_ei.now(p->ei));
+	}
+	g_ei.button_button(bd, c->code, true);
+	g_ei.device_frame(bd, g_ei.now(p->ei));
 	gdbus_sleep_ms(KEY_GAP_MS);
 	injected(p);
 	return U_DESKTOP_OK;
@@ -500,6 +551,7 @@ clipboard_offer(struct gnome_portal *p, const char *text, bool is_paste)
 	p->clip_text = strdup(text);
 	p->clip_is_paste = is_paste && p->clip_text != NULL;
 	p->clip_owner = false;
+	p->clip_lost = false;
 	if (p->clip_text == NULL) {
 		return false;
 	}
@@ -522,10 +574,25 @@ clipboard_offer(struct gnome_portal *p, const char *text, bool is_paste)
 	return p->session_open && p->clip_owner;
 }
 
-//! Offer the clipboard text from before the paste again (best effort).
+/*!
+ * Offer the clipboard text from before the paste again (best effort) — unless
+ * the selection changed hands meanwhile: then the user copied something newer,
+ * and offering the old text would overwrite it. Either way the agent's text is
+ * no longer served.
+ */
 static void
 clipboard_restore(struct gnome_portal *p)
 {
+	gp_pump(p, 0); // a SelectionOwnerChanged already queued counts
+	if (p->clip_lost || (p->clip_is_paste && !p->clip_owner)) {
+		free(p->clip_prev);
+		p->clip_prev = NULL;
+		free(p->clip_text);
+		p->clip_text = NULL;
+		p->clip_is_paste = false;
+		p->clip_lost = false;
+		return;
+	}
 	if (p->session_open && p->clip_prev != NULL) {
 		char *prev = p->clip_prev;
 		p->clip_prev = NULL;
@@ -569,6 +636,12 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 	return U_DESKTOP_OK;
 }
 
+/*!
+ * The paste keystroke, then serving the paste. Fills c->obs; the caller decides
+ * the outcome (u_desktop_paste_decide, with its own AT-SPI check) and then
+ * restores the previous clipboard (cmd_clip_restore) — the agent's text is
+ * served until then.
+ */
 static enum u_desktop_result
 cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 {
@@ -576,10 +649,14 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
-	if (!p->clip_owner || !p->clip_is_paste) {
-		// Someone copied in between: Ctrl+V would paste THEIR content.
-		clipboard_restore(p);
-		gp_set_msg(c->msg, "lost the clipboard before the paste — not pasting");
+	// The last look before the keystroke: a SelectionOwnerChanged already queued
+	// (the user copied after we took the selection) must be seen NOW — Ctrl+V
+	// would paste the user's new clipboard into the target.
+	gp_pump(p, 0);
+	if (p->clip_lost || !p->clip_owner || !p->clip_is_paste) {
+		c->obs.lost_before_key = true;
+		clipboard_restore(p); // never offers the old text over the user's new one
+		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
 		return U_DESKTOP_ERR_REFUSED;
 	}
 	uint32_t mods = 0, code = 0;
@@ -618,12 +695,13 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	// (and a trailing "\n" would then submit it). Every SelectionTransfer in the
 	// window gets the agent's text; a write still arriving late extends it by
 	// PASTE_QUIET_MS (a client may ask for several mime types), up to
-	// PASTE_MAX_MS. No write at all by PASTE_MAX_MS: the target never asked.
+	// PASTE_MAX_MS. No write at all by PASTE_MAX_MS: nobody asked. Losing the
+	// selection (the user copied) ends it: nothing more will be asked of us.
 	uint64_t start = gdbus_now_ms();
 	uint64_t serve_until = start + PASTE_SERVE_MS;
 	uint64_t hard_stop = start + PASTE_MAX_MS;
 	uint32_t seen = 0;
-	while (p->session_open && !gp_quitting(p)) {
+	while (p->session_open && !gp_quitting(p) && !p->clip_lost) {
 		uint64_t now = gdbus_now_ms();
 		if (now >= hard_stop || (now >= serve_until && p->paste_writes > 0)) {
 			break;
@@ -639,12 +717,8 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	p->paste_armed = false;
 	injected(p);
-	bool served = p->paste_writes > 0;
-	clipboard_restore(p);
-	if (!served) {
-		gp_set_msg(c->msg, "the focused window did not ask for the pasted text (does it accept text?)");
-		return U_DESKTOP_ERR_FAILED;
-	}
+	c->obs.lost_after_key = p->clip_lost;
+	c->obs.writes_after_key = p->paste_writes;
 	return U_DESKTOP_OK;
 }
 
@@ -730,6 +804,19 @@ gnome_portal_button(struct gnome_portal *p, uint32_t evdev_button, bool down, ch
 }
 
 enum u_desktop_result
+gnome_portal_press_at(struct gnome_portal *p, uint32_t evdev_button, int32_t x, int32_t y, char *msg)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_press_at);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	c->code = evdev_button;
+	c->x = x;
+	c->y = y;
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+enum u_desktop_result
 gnome_portal_scroll(struct gnome_portal *p, int32_t dx, int32_t dy, char *msg)
 {
 	struct gp_cmd *c = gp_cmd_new(cmd_scroll);
@@ -810,14 +897,23 @@ gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg)
 }
 
 enum u_desktop_result
-gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, char *msg)
+gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, struct u_desktop_paste_obs *obs, char *msg)
 {
+	memset(obs, 0, sizeof(*obs));
+	obs->text_check = -1;
 	struct gp_cmd *c = gp_cmd_new(cmd_clip_paste);
 	if (c == NULL) {
 		return U_DESKTOP_ERR_FAILED;
 	}
 	c->terminal = terminal;
-	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+	struct gp_cmd copy;
+	enum u_desktop_result r = gp_run_sync_keep(p, c, ACTION_TIMEOUT_MS, msg, &copy);
+	if (r == U_DESKTOP_OK || r == U_DESKTOP_ERR_REFUSED) {
+		obs->lost_before_key = copy.obs.lost_before_key;
+		obs->lost_after_key = copy.obs.lost_after_key;
+		obs->writes_after_key = copy.obs.writes_after_key;
+	}
+	return r;
 }
 
 void

@@ -162,6 +162,9 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		       (unsigned long long)idle);
 	} else if (strcmp(cmd, "request") == 0) {
 		struct u_desktop_app_info app = {argv[0], "desktop_backend_smoke", "bring-up test"};
+		// Each request waits for ITS answer (the REPL issues several).
+		g_done = 0;
+		g_access = U_DESKTOP_ACCESS_UNKNOWN;
 		b->request_access(b, &app, on_access, NULL);
 		for (int i = 0; i < 1200 && !g_done; i++) {
 			sleep_ms(100);

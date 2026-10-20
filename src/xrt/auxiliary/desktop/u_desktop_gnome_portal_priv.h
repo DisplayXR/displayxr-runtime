@@ -58,6 +58,7 @@ struct gp_cmd
 	uint32_t out_mods, out_code; //!< resolved chord
 	struct u_desktop_rect mon[GNOME_MAX_MONITORS]; //!< monitors: the pointer's regions
 	uint32_t nmon;
+	struct u_desktop_paste_obs obs; //!< clip_paste: what the paste saw
 	u_desktop_access_done_fn done;
 	void *done_ctx;
 
@@ -120,9 +121,15 @@ struct gnome_portal
 	char *clip_text;       //!< what we serve on SelectionTransfer
 	bool clip_owner;       //!< SelectionOwnerChanged (from the portal) said session_is_owner
 	bool clip_is_paste;    //!< clip_text is the agent's text (not the restored previous one)
+	//! While serving the agent's text, the portal said another client took the
+	//! selection (the user copied): the paste must not happen / its outcome is
+	//! unknown, and the previous text must NOT be offered again over the user's.
+	bool clip_lost;
 	char *clip_prev;       //!< the clipboard text before the paste, to offer again
 	bool paste_armed;      //!< the paste keystroke was sent: transfers now count
 	uint32_t paste_writes; //!< successful writes of the agent's text since armed
+	bool paste_lost_before; //!< the last paste: the selection changed hands before its keystroke
+	bool paste_lost_after;  //!< ... after it
 	uint32_t paste_last_serial;
 	bool paste_have_serial;
 

@@ -212,8 +212,16 @@ GNOME notes: text reaches the target through the clipboard (the portal has no "c
 string" path that survives an IME), so on GNOME **the agent's typed text passes through the
 clipboard, where clipboard managers and clipboard history can see and keep it**; the previous
 clipboard text is offered again afterwards, best effort, while the portal session lives. The
-paste is sent only after the portal confirms the session owns the selection, and an action
-counts as delivered only when the target read the agent's text after the paste keystroke.
+paste is sent only after the portal confirms the session owns the selection, and only if it
+still does right before the keystroke: a user who copied in between gets their own clipboard
+left alone and the action is `REFUSED` ("the clipboard changed hands (the user copied
+something); nothing was pasted"); losing the selection after the keystroke completes
+`RUNTIME_FAILURE` ("… whether the text arrived is unknown") and the previous text is not
+offered again over the user's. Delivery: when the focused window exposes a focused text field
+over AT-SPI, the action succeeds only if that field changed; otherwise a read of the agent's
+text after the keystroke is the only evidence, and **a clipboard manager reads too** — so the
+action succeeds with the message `"ok (unverified: …)"` (same `XR_SUCCESS`; no new result
+code). No read at all fails ("the focused window did not ask for the pasted text").
 
 ## 8. Not in v1
 
@@ -297,7 +305,9 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   `"the user is active"`, `"target is not under the point (found <app>: <title>)"` (or
   `found the desktop` / `found the shell` / `found nothing: outside every monitor`),
   `"target window does not have focus — ACTIVATE it first"`,
-  `"the target window no longer exists"`; success is `"ok"`. A state that is not
+  `"the target window no longer exists"`; success is `"ok"`, or `"ok (unverified: <reason>)"`
+when the backend delivered but could not confirm the effect (today: GNOME text with no
+accessible text field). A state that is not
   granted for any other reason completes with `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
   `"desktop control is not granted (state <STATE>)"`.
 - Backend errors map to: `UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED`, `NOT_GRANTED` →

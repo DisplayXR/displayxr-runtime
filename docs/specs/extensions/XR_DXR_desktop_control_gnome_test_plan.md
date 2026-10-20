@@ -166,6 +166,43 @@ $SMOKE type "Hello, 世界 — ünïcödé"        # into gedit
   with its session). Record what you see.
 - A window that takes no text (Settings' sidebar) → `failed — the focused window did not ask
   for the pasted text`.
+- **Delivery evidence (re-run item 4).** A clipboard read after the keystroke is not proof: a
+  clipboard manager reads too. When the focused window exposes a focused text field over
+  AT-SPI, the paste counts only if that field changed (length, caret or the text around the
+  caret); with no such field a read gives `ok (unverified: …)` through the extension (the
+  smoke tool prints the backend message `unverified: …` after `result: ok`). Run with a
+  clipboard manager (GPaste, or the Clipboard Indicator extension) enabled:
+  | focus | expected |
+  |---|---|
+  | gedit / gnome-text-editor text | `ok` (verified; no message) |
+  | gnome-terminal prompt | `ok` (VTE exposes its text) |
+  | Settings' sidebar, Files' icon view (no text field) | `ok` + `unverified: …` (was a plain `ok`), never a crash |
+  | a GTK text entry with the text `abc` selected, `type "abc"` | `failed — the focused text field did not change` is ACCEPTABLE (identical replacement); record it |
+  | an app with toolkit accessibility off (an Electron app without a11y) | `ok` + `unverified: …` |
+  Record any case where the text visibly arrived but the result is `failed — … did not change`
+  (a field whose AT-SPI text updates late or never): that is a false failure to fix.
+- **Clipboard changing hands mid-type (re-run items 2 + 3).** A helper copies on a timer
+  after `type` starts, e.g. `wl-copy USERTEXT` from a script that sleeps D ms after launching
+  the smoke tool's `type "agent text"` (or `xdotool`-free: `gdbus`-driven wl-copy). Run 10× for
+  each D in 8, 11, 15, 22, 25 ms, into gedit:
+  | outcome | expected |
+  |---|---|
+  | the process | never dies (it used to die of SIGPIPE at ~8–10 ms: EPIPE on the SelectionWrite fd is now a cancelled transfer) |
+  | the copy landed before the paste keystroke | `refused — the clipboard changed hands (the user copied something); nothing was pasted`, nothing appears in gedit, and the clipboard afterwards is `USERTEXT` (not restored over) |
+  | the copy landed after the keystroke | `failed — lost the clipboard during the paste … whether the text arrived is unknown`, or `ok` if gedit's text visibly changed; the clipboard afterwards is `USERTEXT` |
+  | never | `USERTEXT` pasted into gedit with the result `failed — did not ask` (the old 7/40) |
+  Count how often each row occurs per D. `USERTEXT` appearing in gedit is acceptable only
+  with the "lost the clipboard … unknown" result (the copy raced the keystroke itself).
+
+### 4b. Clicks with a moving pointer (re-run item 5)
+
+While a helper wiggles the real mouse (a USB mouse on a stand-held vibrator, or a second
+libei / `ydotool` client sending ±5 px relative motion every 5 ms), click a 10×10 px target
+20 times: `$SMOKE click X Y`. Expected: every `ok` click lands on the target's exact pixel
+(was 3/20 landing 3 px off); a click whose pointer was moved off the verified point before the
+press → `refused — the pointer moved off the verified point` (never `ok` elsewhere). The press
+now carries its own absolute motion in the same libei frame, so it cannot be shifted after the
+check; record the count of `ok` vs `refused`.
 
 ## 7. Session lifetime and consent
 
@@ -271,6 +308,26 @@ pointer now crosses between monitors through the middle of their shared edge and
 stays ≥ 48 px inside its monitor. If a move still fails, the result must be `refused` /
 `timeout` with the reason, never `ok` with the window elsewhere; record the log lines. Activate a window that is entirely covered → `refused — no
 visible part of the window to click`; a window on another workspace → the same.
+
+**Cross-monitor move under Ubuntu's Tiling Assistant (re-run item 1).** Tiling Assistant's
+`monitor-switch-grace-period` (on by default) judges a drag against the PREVIOUS monitor for
+150 ms after the pointer changes monitors; the drop now dwells ≥ 300 ms on the target monitor
+after the last crossing. And a Tiling Assistant popup (or any shell UI) that a move opens over
+the screen is now detected (picks that saw windows / the desktop before the gesture see shell
+UI after it), dismissed with Escape and re-checked before any correction; if it stays up the
+move is `refused — the move opened shell UI … not correcting through it`. Run 10 cross-monitor
+moves (5 each direction, alternating the pointer's starting monitor) for each of:
+| Tiling Assistant | grace period | expected |
+|---|---|---|
+| enabled (Ubuntu default) | default (on) | 10/10 `ok`, exact, not tiled (base f1651f7d8 was 8/10; the first fix pass was 0/10) |
+| enabled | off (`gsettings set org.gnome.shell.extensions.tiling-assistant monitor-switch-grace-period false`) | 10/10 |
+| disabled | — | 10/10 |
+Also once: a window dragged so that it DOES get tiled (drop near the target monitor's left
+edge by hand with `op move` to x = monitor.x + 50) — the log shows `shell UI (a tiling
+popup?) … Escape` when the popup came up, the popup is gone afterwards, and the result is
+either `ok` (corrected) or `refused`/`failed` with the reason — never a popup left on screen.
+And once with a polkit / password prompt already on screen before the move: it must NOT be
+dismissed (it was shell UI before the gesture).
 
 ## 9. Window ops on the app's own window
 

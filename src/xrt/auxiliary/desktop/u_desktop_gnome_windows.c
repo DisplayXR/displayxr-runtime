@@ -9,6 +9,7 @@
  */
 
 #include "u_desktop_gnome.h"
+#include "u_desktop_gnome_logic.h"
 
 #include "util/u_logging.h"
 
@@ -288,6 +289,70 @@ visible_point(struct gnome_backend *g,
 	return false;
 }
 
+/*
+ * Shell UI our gesture opened. Ubuntu's Tiling Assistant opens a popup after it
+ * tiles a window (offering the other windows for the free half) that covers the
+ * screen and holds the keyboard, while mutter still reports the window focused —
+ * so neither the focus check nor a pick of the window sees it, and a correcting
+ * drag finds no visible point. It is seen as shell UI where, before the gesture,
+ * picks found a window or the desktop.
+ */
+
+//! Sample points per monitor (centre + the four quarter points).
+#define COVER_POINTS_PER_MONITOR 5
+#define COVER_MAX_POINTS (GNOME_MAX_MONITORS * COVER_POINTS_PER_MONITOR)
+
+//! The pick kind at each sample point (U_DESKTOP_COVER_UNKNOWN when a pick fails).
+static uint32_t
+sample_cover(struct gnome_backend *g, const struct monitors *mon, uint8_t kinds[COVER_MAX_POINTS])
+{
+	static const int frac[COVER_POINTS_PER_MONITOR][2] = {{2, 2}, {1, 1}, {3, 1}, {1, 3}, {3, 3}}; // quarters
+	uint32_t n = 0;
+	for (uint32_t m = 0; m < mon->n; m++) {
+		const struct u_desktop_rect *r = &mon->r[m];
+		for (int k = 0; k < COVER_POINTS_PER_MONITOR; k++) {
+			struct u_desktop_pick pk;
+			int32_t x = r->x + (int32_t)((int64_t)r->w * frac[k][0] / 4);
+			int32_t y = r->y + (int32_t)((int64_t)r->h * frac[k][1] / 4);
+			kinds[n++] = gnome_pick_msg(g, x, y, &pk, NULL) == U_DESKTOP_OK
+			                 ? (uint8_t)pk.kind
+			                 : (uint8_t)U_DESKTOP_COVER_UNKNOWN;
+		}
+	}
+	return n;
+}
+
+/*!
+ * After a gesture: if shell UI now covers points that @p before (sampled before
+ * the gesture) saw as windows / desktop, press Escape (under the guard) and look
+ * again, at most twice. False when it is still there: the caller stops — a
+ * correction cannot see through it, and more input would go to it.
+ */
+static bool
+dismiss_new_cover(struct gnome_backend *g,
+                  const struct u_desktop_input_guard *guard,
+                  const struct monitors *mon,
+                  const uint8_t *before,
+                  uint32_t nbefore)
+{
+	if (nbefore == 0) {
+		return true; // monitors unknown: nothing to compare
+	}
+	uint8_t after[COVER_MAX_POINTS];
+	for (int tries = 0; tries < 3; tries++) {
+		uint32_t n = sample_cover(g, mon, after);
+		if (n != nbefore || !u_desktop_shell_cover_appeared(before, after, n)) {
+			return true;
+		}
+		if (tries == 2 || !guard->still_allowed(guard->ctx)) {
+			break;
+		}
+		U_LOG_I("desktop/gnome: shell UI (a tiling popup?) opened by the move covers the screen — Escape");
+		press_escape(g, guard);
+	}
+	return false;
+}
+
 /*!
  * Super + left press at (x, y) (+ an optional drag to (x+dx, y+dy)) + releases,
  * under the guard. Super is held only across the button press (~20 ms), not the
@@ -316,10 +381,14 @@ super_gesture(struct gnome_backend *g,
 	int32_t px = 0, py = 0;
 	uint32_t nwp =
 	    mon->n > 0 && gnome_get_pointer_msg(g, &px, &py, NULL) == U_DESKTOP_OK ? route(mon, px, py, x, y, wp) : 0;
+	uint64_t crossed_at = 0; //!< when the pointer last changed monitors (0: it did not)
 	for (uint32_t i = 0; i < nwp; i++) {
 		enum u_desktop_result r = gnome_move_verified(g, wp[i][0], wp[i][1], msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
+		}
+		if (i == nwp - 1) {
+			crossed_at = gdbus_now_ms(); // onto the window's monitor, before the press
 		}
 	}
 	enum u_desktop_result r = gnome_move_verified(g, x, y, msg);
@@ -336,7 +405,7 @@ super_gesture(struct gnome_backend *g,
 		gnome_portal_keys(g->portal, super_key, f, 1, tmp);
 		return r;
 	}
-	r = gnome_portal_button(g->portal, BTN_LEFT, true, msg);
+	r = gnome_portal_press_at(g->portal, BTN_LEFT, x, y, msg);
 	gnome_portal_keys(g->portal, super_key, f, 1, tmp);
 	if (r == U_DESKTOP_OK && drag) {
 		gdbus_sleep_ms(40);
@@ -353,6 +422,9 @@ super_gesture(struct gnome_backend *g,
 			nwp = mon->n > 0 ? route(mon, x, y, x + dx, y + dy, wp) : 0;
 			for (uint32_t i = 0; i < nwp && r == U_DESKTOP_OK; i++) {
 				r = gnome_portal_motion_ex(g->portal, wp[i][0], wp[i][1], false, msg);
+				if (i == nwp - 1) {
+					crossed_at = gdbus_now_ms(); // the last waypoint is on the target monitor
+				}
 				gdbus_sleep_ms(30);
 				if (r == U_DESKTOP_OK) {
 					r = gnome_move_verified_ex(g, wp[i][0], wp[i][1], false, msg);
@@ -364,6 +436,24 @@ super_gesture(struct gnome_backend *g,
 			}
 			if (r == U_DESKTOP_OK) {
 				r = gnome_move_verified_ex(g, x + dx, y + dy, false, msg);
+			}
+			// Dwell on the target monitor before the release: Ubuntu's Tiling
+			// Assistant still judges the drop against the PREVIOUS monitor for
+			// 150 ms after a crossing and would tile the window into it. The
+			// crossing may be the drag's or the jump onto the window's monitor
+			// before the press (a drop on that same monitor right after it).
+			uint32_t left =
+			    u_desktop_cross_dwell_left_ms(crossed_at, gdbus_now_ms(), U_DESKTOP_CROSS_DWELL_MS);
+			if (r == U_DESKTOP_OK && left > 0) {
+				gdbus_sleep_ms(left);
+				// Still at the drop point (the user may have moved the mouse)? Back
+				// to it if not — on the same monitor, so no new crossing.
+				int32_t qx = 0, qy = 0;
+				if (gnome_get_pointer_msg(g, &qx, &qy, NULL) != U_DESKTOP_OK ||
+				    abs(qx - (x + dx)) > POINTER_TOLERANCE_PX ||
+				    abs(qy - (y + dy)) > POINTER_TOLERANCE_PX) {
+					r = gnome_move_verified_ex(g, x + dx, y + dy, false, msg);
+				}
 			}
 		}
 	}
@@ -621,6 +711,8 @@ move_other(struct gnome_backend *g,
 			r = U_DESKTOP_ERR_REFUSED;
 			break;
 		}
+		uint8_t cover_before[COVER_MAX_POINTS];
+		uint32_t ncover = sample_cover(g, &mon, cover_before);
 		r = super_gesture(g, guard, &mon, id, x, y, true, dx, dy, msg);
 		if (r != U_DESKTOP_OK) {
 			gesture_failed = true;
@@ -628,6 +720,14 @@ move_other(struct gnome_backend *g,
 		}
 		wait_grab_end(g, id);
 		tidy_after_gesture(g, guard, true);
+		// Before reading back or correcting: a tiling popup our drop opened.
+		if (!dismiss_new_cover(g, guard, &mon, cover_before, ncover)) {
+			gnome_set_msg(msg,
+			              "the move opened shell UI (a tiling popup?) over the screen that Escape did not "
+			              "dismiss — not correcting through it");
+			r = U_DESKTOP_ERR_REFUSED;
+			break;
+		}
 		// FAILED = "verify by read-back": the next attempt re-reads the frame and
 		// corrects by the residual; after the last one, the read-back below decides.
 		r = U_DESKTOP_ERR_FAILED;

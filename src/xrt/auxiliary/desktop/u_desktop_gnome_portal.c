@@ -50,7 +50,14 @@
  * Ctrl+Shift+V in a terminal. The previous clipboard text is read first
  * (SelectionRead) and offered again ~1.2 s after the paste keystroke (every read
  * until then gets the agent's text, so a clipboard manager reading first cannot
- * make a slow target paste the previous text). LIMITATION: a portal
+ * make a slow target paste the previous text). The selection changing hands
+ * (SelectionOwnerChanged, session_is_owner false: the user copied) before the
+ * keystroke cancels the paste; after it, the outcome is unknown; either way
+ * the previous text is never offered over the user's. Delivery is confirmed by
+ * the focused AT-SPI text field changing when there is one; else a read after
+ * the keystroke (possibly a clipboard manager's) gives "ok (unverified)". A
+ * reader closing its fd mid-write is EPIPE (SIGPIPE blocked for the write, on
+ * this thread only — this is the app's process). LIMITATION: a portal
  * session's selection dies with the session, so ~2 s after the burst (the idle
  * close) GNOME's clipboard no longer holds either text unless a clipboard manager
  * kept a copy.
@@ -447,6 +454,10 @@ handle_message(struct gnome_portal *p, DBusMessage *m)
 				}
 			}
 			dbus_message_iter_next(&dict);
+		}
+		if (!owner && p->clip_owner && p->clip_is_paste) {
+			// Someone else took the selection while it held the agent's text.
+			p->clip_lost = true;
 		}
 		p->clip_owner = owner;
 	}
