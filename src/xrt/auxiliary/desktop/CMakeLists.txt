@@ -32,6 +32,8 @@ add_library(
 	u_desktop_policy.c
 	u_desktop_policy.h
 	u_desktop_select.c
+	u_desktop_spa_pod.c
+	u_desktop_spa_pod.h
 	)
 target_link_libraries(aux_desktop PUBLIC aux-includes aux_os PRIVATE aux_util xrt-external-cjson)
 
@@ -51,7 +53,8 @@ elseif(XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_DBUS)
 	target_sources(
 		aux_desktop PRIVATE u_desktop_gnome.c u_desktop_gnome.h u_desktop_gnome_portal.c u_desktop_gnome_atspi.c
 		u_desktop_gnome_libs.c u_desktop_gnome_libs.h u_desktop_gnome_input.c u_desktop_gnome_portal_priv.h
-		u_desktop_gnome_windows.c
+		u_desktop_gnome_windows.c u_desktop_gnome_capture.c u_desktop_gnome_capture.h u_desktop_gnome_pipewire.c
+		u_desktop_gnome_pipewire.h
 		)
 	target_include_directories(aux_desktop SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
 	target_link_libraries(aux_desktop PRIVATE ${DBUS_LIBRARIES} ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT})

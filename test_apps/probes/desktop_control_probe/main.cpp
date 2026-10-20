@@ -18,7 +18,7 @@
  *   desktop_control_probe script FILE                one command per line, one session
  *
  * Spec v2 (screen capture):
- *   desktop_control_probe request-scopes control|capture|all [reason...]
+ *   desktop_control_probe request-scopes control|capture|all[+again] [reason...]
  *   desktop_control_probe capture-state
  *   desktop_control_probe capture desktop|region X Y W H|window ID [max=WxH] [--save FILE.png]
  *                         waits for the completion event, fetches the image and prints its
@@ -646,10 +646,21 @@ run_command(const std::vector<std::string> &args)
 			return 1;
 		}
 		XrDesktopControlRequestScopeDXR sc = {XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR};
-		sc.scopes = args[1] == "capture" ? XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR
-		            : args[1] == "all"
+		// control | capture | all, optionally "+again" (ask again even if granted).
+		std::string what = args[1];
+		bool again = false;
+		size_t plus = what.find("+again");
+		if (plus != std::string::npos) {
+			again = true;
+			what = what.substr(0, plus);
+		}
+		sc.scopes = what == "capture" ? XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR
+		            : what == "all"
 		                ? XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR | XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR
 		                : XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR;
+		if (again) {
+			sc.scopes |= XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR;
+		}
 		std::string reason;
 		for (size_t i = 2; i < args.size(); i++) {
 			reason += (i > 2 ? " " : "") + args[i];

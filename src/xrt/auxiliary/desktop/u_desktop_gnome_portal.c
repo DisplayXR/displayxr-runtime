@@ -263,6 +263,8 @@ parse_results(struct gnome_portal *p, DBusMessageIter *arr)
 				dbus_bool_t b = FALSE;
 				dbus_message_iter_get_basic(&var, &b);
 				p->resp_clip = b;
+			} else if (key != NULL) {
+				gp_cap_parse_result(p, key, &var); // "devices", "streams" (screen capture)
 			}
 		}
 		dbus_message_iter_next(&dict);
@@ -291,6 +293,7 @@ ei_teardown(struct gnome_portal *p)
 void
 gp_session_forget(struct gnome_portal *p)
 {
+	gp_cap_forget(p);
 	ei_teardown(p);
 	p->session_open = false;
 	p->session[0] = '\0';
@@ -381,6 +384,7 @@ session_closed_by_portal(struct gnome_portal *p)
 	p->have_token = false;
 	memset(p->token, 0, sizeof(p->token));
 	p->access = U_DESKTOP_ACCESS_DENIED;
+	gp_cap_revoked_locked(p); // one session carries both scopes
 	pthread_mutex_unlock(&p->lock);
 }
 
@@ -645,6 +649,7 @@ expect_response(struct gnome_portal *p, const char *token)
 	p->resp_token[0] = '\0';
 	p->resp_has_token = false;
 	p->resp_clip = false;
+	gp_cap_expect(p);
 }
 
 //! The request handle the method returned (older portals may not follow the token convention).
@@ -772,6 +777,14 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	}
 	register_app_once(p);
 	session_close(p);
+	if (!interactive) {
+		// Never restore a screen grant while a monitor it covers is missing or the
+		// layout just changed: GNOME would save the reduced approval.
+		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
+		if (rr != U_DESKTOP_OK) {
+			return rr;
+		}
+	}
 
 	char token[64], stoken[64];
 	struct gdbus_err err;
@@ -830,6 +843,13 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 		return U_DESKTOP_ERR_FAILED;
 	}
 
+	// The screens, in the same session and the same dialog (screen capture).
+	enum u_desktop_result sr = gp_cap_select_sources(p, interactive, msg);
+	if (sr != U_DESKTOP_OK) {
+		session_close(p);
+		return sr;
+	}
+
 	// RequestClipboard — before Start. No Request object, no response.
 	if (p->have_clipboard_portal && p->input) {
 		gp_pmsg_begin(&pm, CLIP_IFACE, "RequestClipboard", p->session, NULL);
@@ -857,6 +877,9 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	dbus_message_unref(reply);
 	uint32_t start_timeout = interactive ? INTERACTIVE_START_TIMEOUT_MS : RESTORE_START_TIMEOUT_MS;
 	if (!wait_response(p, start_timeout)) {
+		// Closing the session alone leaves a portal dialog up (seen on GNOME 50):
+		// close the pending request first.
+		gp_cap_close_request(p);
 		session_close(p); // also dismisses a dialog nobody is answering
 		if (interactive) {
 			gp_set_msg(msg, "no answer to the remote-desktop dialog");
@@ -869,6 +892,7 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 		p->have_token = false;
 		memset(p->token, 0, sizeof(p->token));
 		p->access = U_DESKTOP_ACCESS_DENIED;
+		gp_cap_revoked_locked(p);
 		pthread_mutex_unlock(&p->lock);
 		gp_set_msg(msg,
 		           "the portal did not restore the session silently (grant revoked?) — request access again");
@@ -884,6 +908,7 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 			p->have_token = false;
 			memset(p->token, 0, sizeof(p->token));
 			p->access = U_DESKTOP_ACCESS_DENIED;
+			gp_cap_revoked_locked(p);
 			pthread_mutex_unlock(&p->lock);
 		}
 		return U_DESKTOP_ERR_NOT_GRANTED;
@@ -896,6 +921,8 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	p->session_open_shared = true;
 	bool have_token = p->have_token;
 	pthread_mutex_unlock(&p->lock);
+	// What the Start response granted (input? screens?) + the PipeWire remote.
+	bool devices = gp_cap_after_start(p);
 	if (!p->input) {
 		// Consent only: the user answered; nothing to drive.
 		U_LOG_I("desktop/gnome: remote-control consent granted (no libei: observation only)");
@@ -911,6 +938,12 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	}
 	if (!p->clipboard_enabled && p->have_clipboard_portal) {
 		U_LOG_W("desktop/gnome: the session has no clipboard access — type_text unavailable");
+	}
+	if (!devices) {
+		// The user left "allow remote interaction" off: screens only, no libei.
+		U_LOG_W("desktop/gnome: the session grants no input (remote interaction left off)");
+		p->last_use_ms = gdbus_now_ms();
+		return U_DESKTOP_OK;
 	}
 
 	enum u_desktop_result r = connect_eis(p, msg);
@@ -931,7 +964,8 @@ gp_ensure_session(struct gnome_portal *p, bool restore, char *msg)
 		return U_DESKTOP_ERR_UNSUPPORTED;
 	}
 	pthread_mutex_lock(&p->lock);
-	bool have_token = p->have_token;
+	// Only a grant that covers input restores for input (not a screens-only one).
+	bool have_token = p->have_token && !p->cap.token_sc && p->cap.token_devices;
 	enum u_desktop_access acc = p->access;
 	pthread_mutex_unlock(&p->lock);
 	if (acc == U_DESKTOP_ACCESS_DENIED) {
@@ -941,6 +975,9 @@ gp_ensure_session(struct gnome_portal *p, bool restore, char *msg)
 	if (p->session_open && p->ei != NULL) {
 		p->last_use_ms = gdbus_now_ms();
 		return U_DESKTOP_OK;
+	}
+	if (p->session_open && p->cap.session_sc) {
+		gp_session_close(p); // a screens-only session: reopened below as RemoteDesktop
 	}
 	if (!have_token) {
 		gp_set_msg(msg, acc == U_DESKTOP_ACCESS_GRANTED
@@ -966,13 +1003,21 @@ cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 {
 	enum u_desktop_access acc;
 	pthread_mutex_lock(&p->lock);
-	bool already = p->have_token || p->session_open_shared || p->consent_only_granted;
+	bool already = gp_cap_control_granted_locked(p) || p->consent_only_granted;
 	pthread_mutex_unlock(&p->lock);
 	if (already) {
 		acc = U_DESKTOP_ACCESS_GRANTED;
 	} else {
+		// A screens-only grant cannot be widened: ask fresh, keeping the screens
+		// in the dialog (never downgrade), and the old grant if this one fails.
+		struct gp_cap_saved saved;
+		gp_cap_begin_upgrade(p, &saved);
 		enum u_desktop_result r = open_session(p, true, c->msg);
-		acc = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		gp_cap_end_upgrade(p, &saved, r == U_DESKTOP_OK);
+		pthread_mutex_lock(&p->lock);
+		bool granted = r == U_DESKTOP_OK && (gp_cap_control_granted_locked(p) || !p->input);
+		pthread_mutex_unlock(&p->lock);
+		acc = granted ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
 		if (r != U_DESKTOP_OK && gp_quitting(p)) {
 			acc = U_DESKTOP_ACCESS_UNKNOWN; // torn down before the user answered
 		}
@@ -1271,6 +1316,7 @@ gnome_portal_create(uint32_t rd_version, bool have_clipboard)
 	p->have_clipboard_portal = have_clipboard;
 	p->input = rd_version >= 2 && gnome_portal_libei_available();
 	p->access = U_DESKTOP_ACCESS_UNKNOWN;
+	gp_cap_construct(p);
 	return p;
 }
 
@@ -1310,7 +1356,7 @@ gnome_portal_access(struct gnome_portal *p)
 	enum u_desktop_access a = p->access;
 	if (p->pending) {
 		a = U_DESKTOP_ACCESS_PENDING;
-	} else if (p->have_token || p->session_open_shared || p->consent_only_granted) {
+	} else if (gp_cap_control_granted_locked(p) || p->consent_only_granted) {
 		a = U_DESKTOP_ACCESS_GRANTED;
 	}
 	pthread_mutex_unlock(&p->lock);
@@ -1339,4 +1385,85 @@ gnome_portal_request(struct gnome_portal *p, u_desktop_access_done_fn done, void
 	enqueue_locked(p, c);
 	pthread_mutex_unlock(&p->lock);
 	wake_thread(p);
+}
+
+
+/*
+ * Session plumbing for u_desktop_gnome_capture.c (u_desktop_gnome_portal_priv.h).
+ */
+
+enum u_desktop_result
+gp_open_session(struct gnome_portal *p, bool interactive, char *msg)
+{
+	return open_session(p, interactive, msg);
+}
+
+void
+gp_session_close(struct gnome_portal *p)
+{
+	session_close(p);
+}
+
+void
+gp_register_app(struct gnome_portal *p)
+{
+	register_app_once(p);
+}
+
+void
+gp_next_token(struct gnome_portal *p, char *out, size_t cap)
+{
+	next_token(p, out, cap);
+}
+
+void
+gp_expect_response(struct gnome_portal *p, const char *token)
+{
+	expect_response(p, token);
+}
+
+bool
+gp_wait_response(struct gnome_portal *p, uint32_t timeout_ms)
+{
+	return wait_response(p, timeout_ms);
+}
+
+void
+gp_take_request_handle(struct gnome_portal *p, DBusMessage *reply)
+{
+	take_request_handle(p, reply);
+}
+
+void
+gp_dict_add_str(DBusMessageIter *dict, const char *key, const char *val)
+{
+	dict_add_str(dict, key, val);
+}
+
+void
+gp_dict_add_u32(DBusMessageIter *dict, const char *key, uint32_t val)
+{
+	dict_add_u32(dict, key, val);
+}
+
+void
+gp_dict_add_bool(DBusMessageIter *dict, const char *key, bool val)
+{
+	dbus_bool_t b = val ? TRUE : FALSE;
+	dict_add_basic(dict, key, DBUS_TYPE_BOOLEAN, "b", &b);
+}
+
+bool
+gp_enqueue_async(struct gnome_portal *p, struct gp_cmd *c)
+{
+	c->async = true;
+	pthread_mutex_lock(&p->lock);
+	if (p->quit || !ensure_thread_locked(p)) {
+		pthread_mutex_unlock(&p->lock);
+		return false;
+	}
+	enqueue_locked(p, c);
+	pthread_mutex_unlock(&p->lock);
+	wake_thread(p);
+	return true;
 }

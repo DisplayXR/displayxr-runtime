@@ -62,9 +62,10 @@ _Static_assert((int)U_DESKTOP_PICK_OUTSIDE == (int)XR_DESKTOP_PICK_KIND_OUTSIDE_
 _Static_assert(U_DESKTOP_APP_ID_SIZE == XR_MAX_DESKTOP_APP_ID_SIZE_DXR, "size mirror");
 _Static_assert(U_DESKTOP_TITLE_SIZE == XR_MAX_DESKTOP_TITLE_SIZE_DXR, "size mirror");
 _Static_assert(U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT == XR_ERROR_SIZE_INSUFFICIENT, "result mirror");
-_Static_assert(U_DESKTOP_CAP_CAPTURE == XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR, "caps mirror");
-_Static_assert(U_DESKTOP_SCOPE_CONTROL == XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR, "scope mirror");
-_Static_assert(U_DESKTOP_SCOPE_CAPTURE == XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR, "scope mirror");
+_Static_assert(U_DESKTOP_CAP_CAPTURE == 0x40 /* XR_DESKTOP_CONTROL_CAPABILITY_CAPTURE_BIT_DXR (a static const) */, "caps mirror");
+_Static_assert(U_DESKTOP_SCOPE_CONTROL == 0x1 /* XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR */, "scope mirror");
+_Static_assert(U_DESKTOP_SCOPE_CAPTURE == 0x2 /* XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR */, "scope mirror");
+_Static_assert(U_DESKTOP_SCOPE_REASK == 0x100 /* XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR */, "scope mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_WINDOW == (int)XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR, "target mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_REGION == (int)XR_DESKTOP_CAPTURE_TARGET_REGION_DXR, "target mirror");
 
@@ -256,9 +257,10 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 			continue;
 		}
 		XrDesktopControlScopeFlagsDXR s = ((const XrDesktopControlRequestScopeDXR *)n)->scopes;
-		const XrDesktopControlScopeFlagsDXR known =
+		const XrDesktopControlScopeFlagsDXR scope_bits =
 		    XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR | XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR;
-		if (s == 0 || (s & ~known) != 0) {
+		const XrDesktopControlScopeFlagsDXR known = scope_bits | XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR;
+		if ((s & scope_bits) == 0 || (s & ~known) != 0) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 			                 "(XrDesktopControlRequestScopeDXR::scopes) must be non-zero, known bits only");
 		}

@@ -133,6 +133,10 @@ typedef XrFlags64 XrDesktopControlScopeFlagsDXR;
 static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR = 0x00000001;
 //! Screen pixels (xrCaptureDesktopDXR).
 static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR = 0x00000002;
+//! Not a scope — a modifier of a request: ask again even for scopes already GRANTED,
+//! so the user can change what is shared (GNOME: which screens) or decline. Use it
+//! only on an explicit user gesture ("change what the assistant can see").
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR = 0x00000100;
 
 typedef XrFlags64 XrDesktopWindowStateFlagsDXR;
 static const XrDesktopWindowStateFlagsDXR XR_DESKTOP_WINDOW_STATE_FOCUSED_BIT_DXR    = 0x00000001;
@@ -250,7 +254,7 @@ typedef struct XrDesktopControlRequestInfoDXR {
 typedef struct XrDesktopControlRequestScopeDXR {
     XrStructureType                type;   //!< XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR
     const void* XR_MAY_ALIAS       next;
-    XrDesktopControlScopeFlagsDXR  scopes; //!< non-zero, known bits only
+    XrDesktopControlScopeFlagsDXR  scopes; //!< at least one scope bit; known bits only
 } XrDesktopControlRequestScopeDXR;
 
 //! Spec version 2: what xrCaptureDesktopDXR captures.
