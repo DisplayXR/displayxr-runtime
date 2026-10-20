@@ -36,6 +36,14 @@
 #define ATSPI_COMPONENT "org.a11y.atspi.Component"
 #define ATSPI_TEXT "org.a11y.atspi.Text"
 #define ATSPI_COORD_TYPE_WINDOW 1u
+// AtspiStateType bits (GetState's "au": bit n of word n / 32).
+#define ATSPI_STATE_FOCUSED 12u
+#define ATSPI_STATE_SHOWING 25u
+#define ATSPI_STATE_MANAGES_DESCENDANTS 31u
+//! The focused-text walk visits at most this many accessibles.
+#define FOCUS_WALK_MAX_NODES 400u
+//! Hash this much text on each side of the caret.
+#define FOCUS_HASH_SPAN 1024
 
 #define APP_CACHE 32
 
@@ -438,6 +446,187 @@ gnome_atspi_text_at(struct gnome_atspi *a,
 	}
 out:
 	free(frames);
+	pthread_mutex_unlock(&a->lock);
+	return r;
+}
+
+//! Accessible.GetState as a 64-bit mask; false on no answer.
+static bool
+get_state(struct gnome_atspi *a, const struct atspi_ref *r, uint64_t *mask, struct budget *b)
+{
+	DBusMessage *reply =
+	    gdbus_call(a->c, r->bus, r->path, ATSPI_ACCESSIBLE, "GetState", left_ms(b), NULL, DBUS_TYPE_INVALID);
+	if (reply == NULL) {
+		return false;
+	}
+	*mask = 0;
+	DBusMessageIter it, arr;
+	if (dbus_message_iter_init(reply, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
+		dbus_message_iter_recurse(&it, &arr);
+		for (int w = 0; w < 2 && dbus_message_iter_get_arg_type(&arr) == DBUS_TYPE_UINT32; w++) {
+			dbus_uint32_t v = 0;
+			dbus_message_iter_get_basic(&arr, &v);
+			*mask |= (uint64_t)v << (32 * w);
+			dbus_message_iter_next(&arr);
+		}
+	}
+	dbus_message_unref(reply);
+	return true;
+}
+
+//! An int32 property of org.a11y.atspi.Text.
+static bool
+get_text_prop(struct gnome_atspi *a, const struct atspi_ref *r, const char *prop, int32_t *out, struct budget *b)
+{
+	const char *iface = ATSPI_TEXT;
+	DBusMessage *reply = gdbus_call(a->c, r->bus, r->path, "org.freedesktop.DBus.Properties", "Get", left_ms(b),
+	                                NULL, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+	if (reply == NULL) {
+		return false;
+	}
+	bool ok = false;
+	DBusMessageIter it, var;
+	if (dbus_message_iter_init(reply, &it) && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_VARIANT) {
+		dbus_message_iter_recurse(&it, &var);
+		if (dbus_message_iter_get_arg_type(&var) == DBUS_TYPE_INT32) {
+			dbus_int32_t v = 0;
+			dbus_message_iter_get_basic(&var, &v);
+			*out = v;
+			ok = true;
+		}
+	}
+	dbus_message_unref(reply);
+	return ok;
+}
+
+void
+gnome_atspi_focused_text(
+    struct gnome_atspi *a, uint32_t pid, const char *title, uint32_t budget_ms, struct u_desktop_text_state *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (a == NULL || title == NULL || title[0] == '\0') {
+		return;
+	}
+	struct budget b = {gdbus_now_ms() + budget_ms};
+	pthread_mutex_lock(&a->lock);
+	struct atspi_ref app;
+	struct atspi_ref *q = NULL;
+	if (!connect_locked(a)) {
+		goto out;
+	}
+	gdbus_drain(a->c);
+	if (!find_app(a, pid, &app, &b)) {
+		goto out;
+	}
+	q = calloc(FOCUS_WALK_MAX_NODES + 64, sizeof(*q)); // per call
+	if (q == NULL) {
+		goto out;
+	}
+	// The window's frame, by title (as text_at: never another window's).
+	uint32_t nf = children(a, &app, q, 64, &b);
+	int frame = -1;
+	for (uint32_t i = 0; i < nf && frame < 0 && left_ms(&b) > 2; i++) {
+		char name[U_DESKTOP_TITLE_SIZE];
+		if (get_name(a, &q[i], name, sizeof(name), &b) && strcmp(name, title) == 0) {
+			frame = (int)i;
+		}
+	}
+	if (frame < 0) {
+		goto out;
+	}
+	q[0] = q[frame];
+	// Breadth-first over the showing subtree until the FOCUSED accessible.
+	uint32_t head = 0, tail = 1;
+	while (head < tail && head < FOCUS_WALK_MAX_NODES && left_ms(&b) > 2) {
+		struct atspi_ref cur = q[head++];
+		uint64_t st = 0;
+		if (!get_state(a, &cur, &st, &b)) {
+			continue;
+		}
+		if (st & (1ull << ATSPI_STATE_FOCUSED)) {
+			// The focus. Text or not, the walk ends here.
+			if (!has_interface(a, &cur, ATSPI_TEXT, &b)) {
+				goto out;
+			}
+			int32_t count = 0, caret = 0;
+			if (!get_text_prop(a, &cur, "CharacterCount", &count, &b) ||
+			    !get_text_prop(a, &cur, "CaretOffset", &caret, &b)) {
+				goto out;
+			}
+			dbus_int32_t s0 = caret > FOCUS_HASH_SPAN ? caret - FOCUS_HASH_SPAN : 0;
+			dbus_int32_t s1 = caret + FOCUS_HASH_SPAN;
+			DBusMessage *reply =
+			    gdbus_call(a->c, cur.bus, cur.path, ATSPI_TEXT, "GetText", left_ms(&b), NULL,
+			               DBUS_TYPE_INT32, &s0, DBUS_TYPE_INT32, &s1, DBUS_TYPE_INVALID);
+			const char *txt = NULL;
+			uint64_t h = 0;
+			if (reply != NULL &&
+			    dbus_message_get_args(reply, NULL, DBUS_TYPE_STRING, &txt, DBUS_TYPE_INVALID) &&
+			    txt != NULL) {
+				h = u_desktop_fnv1a(txt, strlen(txt));
+			}
+			if (reply != NULL) {
+				dbus_message_unref(reply);
+			}
+			out->found = true;
+			out->count = count;
+			out->caret = caret;
+			out->hash = h;
+			goto out;
+		}
+		// A list that manages its descendants can hold thousands of rows: not where
+		// a text field's focus lives.
+		if (!(st & (1ull << ATSPI_STATE_SHOWING)) || (st & (1ull << ATSPI_STATE_MANAGES_DESCENDANTS))) {
+			continue;
+		}
+		uint32_t room = FOCUS_WALK_MAX_NODES + 64 - tail;
+		if (room > 64) {
+			room = 64;
+		}
+		if (room == 0) {
+			continue;
+		}
+		tail += children(a, &cur, &q[tail], room, &b);
+	}
+out:
+	free(q);
+	pthread_mutex_unlock(&a->lock);
+}
+
+int
+gnome_atspi_app_responds(struct gnome_atspi *a, uint32_t pid, uint32_t budget_ms)
+{
+	struct budget b = {gdbus_now_ms() + budget_ms};
+	pthread_mutex_lock(&a->lock);
+	if (!connect_locked(a)) {
+		pthread_mutex_unlock(&a->lock);
+		return -1;
+	}
+	gdbus_drain(a->c);
+	int r = -1;
+	struct atspi_ref app;
+	// find_app talks to the registry and the bus daemon only, never to the app.
+	if (find_app(a, pid, &app, &b) && left_ms(&b) > 2) {
+		// A property read on the app object is answered by the app's own main loop
+		// (GTK dispatches its AT-SPI objects there): an answer — even an error — is
+		// a live app; no answer within the budget is a busy or hung one.
+		const char *iface = ATSPI_ACCESSIBLE, *prop = "Name";
+		struct gdbus_err err;
+		DBusMessage *reply =
+		    gdbus_call(a->c, app.bus, app.path, "org.freedesktop.DBus.Properties", "Get", left_ms(&b), &err,
+		               DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID);
+		if (reply != NULL) {
+			dbus_message_unref(reply);
+			r = 1;
+		} else if (strcmp(err.name, DBUS_ERROR_NO_REPLY) == 0 || strcmp(err.name, DBUS_ERROR_TIMEOUT) == 0) {
+			r = 0;
+		} else if (strcmp(err.name, DBUS_ERROR_SERVICE_UNKNOWN) == 0 ||
+		           strcmp(err.name, DBUS_ERROR_NAME_HAS_NO_OWNER) == 0) {
+			forget_app(a, pid); // a stale cache entry: cannot tell
+		} else if (err.name[0] != '\0') {
+			r = 1; // the app itself answered, with an error
+		}
+	}
 	pthread_mutex_unlock(&a->lock);
 	return r;
 }

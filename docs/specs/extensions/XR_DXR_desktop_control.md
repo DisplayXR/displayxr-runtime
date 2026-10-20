@@ -212,8 +212,35 @@ GNOME notes: text reaches the target through the clipboard (the portal has no "c
 string" path that survives an IME), so on GNOME **the agent's typed text passes through the
 clipboard, where clipboard managers and clipboard history can see and keep it**; the previous
 clipboard text is offered again afterwards, best effort, while the portal session lives. The
-paste is sent only after the portal confirms the session owns the selection, and an action
-counts as delivered only when the target read the agent's text after the paste keystroke.
+paste is sent only after the portal confirms the session owns the selection (otherwise
+`RUNTIME_FAILURE`, "the portal did not make this session the clipboard owner — not pasting":
+nothing is pasted and the user's clipboard is kept — observed on GNOME 50.1 in ~8% of types
+racing a user copy, when the portal never reported this session as the owner), and only if it
+still does right before the paste key: ownership is tracked from before the previous clipboard
+text is read, through taking the selection, to the moment after Ctrl is down and before V is
+sent. A user who copied anywhere in that span gets their own clipboard left alone (never
+overwritten by the agent's text, nor later by the restored previous text) and the action is
+`REFUSED` ("the clipboard changed hands (the user copied something); nothing was pasted").
+One window is the exception: a copy landing in the ~1.5 ms between reading the previous text and
+the portal applying the agent's `SetSelection` is replaced by that `SetSelection` — the user's
+copied data is gone, and "the clipboard is the user's afterwards" cannot hold. The action is
+still `REFUSED`, its message says the copy is gone and must be made again, the agent's text is
+never handed to any reader, and the selection is released (`SetSelection` with no `mime_types`:
+mutter unsets the session's source), so the clipboard is left empty rather than owned and
+silent. More generally the session never keeps a selection it will not serve: when there is no
+previous text to offer again, it is released too (mutter's own clipboard keeper may then keep the
+agent's text as the clipboard, as it would after the session closes).
+Losing the selection after the paste key completes `RUNTIME_FAILURE` — "… the agent's text was
+never read — whatever the window pasted was the user's clipboard" when the agent's text was
+never served, else "… whether the text arrived is unknown" unless the agent's text was served
+**and** the focused field changed — and the previous text is never offered again over the
+user's. A residual race remains: a copy whose ownership signal reaches this process only after
+V was sent is seen after the key (one of those two failures, never a plain success unless the
+agent's text was read). Delivery: when the focused window exposes a focused text field
+over AT-SPI, the action succeeds only if that field changed; otherwise a read of the agent's
+text after the keystroke is the only evidence, and **a clipboard manager reads too** — so the
+action succeeds with the message `"ok (unverified: …)"` (same `XR_SUCCESS`; no new result
+code). No read at all fails ("the focused window did not ask for the pasted text").
 
 ## 8. Not in v1
 
@@ -297,7 +324,9 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   `"the user is active"`, `"target is not under the point (found <app>: <title>)"` (or
   `found the desktop` / `found the shell` / `found nothing: outside every monitor`),
   `"target window does not have focus — ACTIVATE it first"`,
-  `"the target window no longer exists"`; success is `"ok"`. A state that is not
+  `"the target window no longer exists"`; success is `"ok"`, or `"ok (unverified: <reason>)"`
+when the backend delivered but could not confirm the effect (today: GNOME text with no
+accessible text field). A state that is not
   granted for any other reason completes with `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
   `"desktop control is not granted (state <STATE>)"`.
 - Backend errors map to: `UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED`, `NOT_GRANTED` →

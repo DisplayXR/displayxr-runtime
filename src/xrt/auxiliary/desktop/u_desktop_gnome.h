@@ -24,6 +24,7 @@
 #pragma once
 
 #include "u_desktop.h"
+#include "u_desktop_gnome_logic.h"
 
 #include <dbus/dbus.h>
 
@@ -150,10 +151,23 @@ enum u_desktop_result
 gnome_portal_button(struct gnome_portal *p, uint32_t evdev_button, bool down, char *msg);
 
 //! Notches, +x right, +y down.
+//! Press @p evdev_button AT (@p x, @p y): the absolute motion and the press in
+//! one libei frame, so no other pointer motion can land between them.
+enum u_desktop_result
+gnome_portal_press_at(struct gnome_portal *p, uint32_t evdev_button, int32_t x, int32_t y, char *msg);
+
 enum u_desktop_result
 gnome_portal_scroll(struct gnome_portal *p, int32_t dx, int32_t dy, char *msg);
 
 #define GNOME_PORTAL_MAX_KEYS 16
+#define GNOME_MAX_MONITORS 8
+
+/*!
+ * The monitors as the session's absolute pointer sees them (its libei regions,
+ * stage px). Needs an open session (never reopens one).
+ */
+enum u_desktop_result
+gnome_portal_monitors(struct gnome_portal *p, struct u_desktop_rect *out, uint32_t cap, uint32_t *count, char *msg);
 
 //! A key press/release sequence of evdev codes, sent in order with a short gap.
 enum u_desktop_result
@@ -194,14 +208,18 @@ gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg);
 
 /*!
  * Text, step 2 (after the caller re-checked the guard): if we still own the
- * selection, press Ctrl+V (Ctrl+Shift+V when @p terminal), serve the paste
- * (only writes of our text after the keystroke count), then offer the previous
- * text again. REFUSED when the clipboard was lost in between.
+ * selection, press Ctrl+V (Ctrl+Shift+V when @p terminal) and serve the paste.
+ * REFUSED (obs->lost_before_key) when the selection changed hands before the
+ * keystroke — nothing was pasted. OK: the keystroke went out and @p obs says
+ * what happened after it (reads of our text, losing the selection); the
+ * caller decides the outcome and then calls gnome_portal_clip_restore — our
+ * text is served until then.
  */
 enum u_desktop_result
-gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, char *msg);
+gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, struct u_desktop_paste_obs *obs, char *msg);
 
-//! Text, abort: offer the previous clipboard text again (best effort).
+//! Text, end / abort: stop serving the agent's text and offer the previous
+//! clipboard text again (best effort) — never once the selection changed hands.
 void
 gnome_portal_clip_restore(struct gnome_portal *p);
 
@@ -233,6 +251,27 @@ gnome_atspi_text_at(struct gnome_atspi *a,
                     char *buf,
                     size_t cap,
                     char *msg);
+
+/*!
+ * The focused accessible with a Text interface in the window of process @p pid
+ * titled @p title (a bounded walk of the SHOWING subtree, at most @p budget_ms):
+ * its character count, caret offset and a hash of the text around the caret.
+ * out->found false: none (accessibility off for the app, the focus is not on
+ * text, no frame matched, or no answer in time). Used to confirm a paste
+ * arrived; the text itself is never kept.
+ */
+void
+gnome_atspi_focused_text(
+    struct gnome_atspi *a, uint32_t pid, const char *title, uint32_t budget_ms, struct u_desktop_text_state *out);
+
+/*!
+ * Whether the app of process @p pid is answering: 1 it answered an AT-SPI call
+ * on its application object (served by its main loop), 0 it did not within
+ * @p budget_ms (busy / hung), -1 cannot tell (no accessibility tree for it, or
+ * no accessibility bus).
+ */
+int
+gnome_atspi_app_responds(struct gnome_atspi *a, uint32_t pid, uint32_t budget_ms);
 
 /*
  * The backend object and what its files share (u_desktop_gnome.c,
@@ -283,6 +322,16 @@ gnome_find_window(const struct u_desktop_window *ws, uint32_t n, uint64_t id);
 //! -1 unknown (no extension 16, the window is gone, the call failed).
 int
 gnome_window_above(struct gnome_backend *g, uint64_t id);
+
+/*!
+ * Window @p id's "moving" flag (an interactive move / resize grab, from the
+ * extension) and @p size_scale: what its frame size divides by to compare sizes
+ * across monitors — the monitor scale in mutter's PHYSICAL layout (stage px are
+ * device px there), else 1. False when the window is not listed or the extension
+ * did not answer.
+ */
+bool
+gnome_window_info(struct gnome_backend *g, uint64_t id, bool *moving, double *size_scale);
 
 enum u_desktop_result
 gnome_pick_msg(struct gnome_backend *g, int32_t x, int32_t y, struct u_desktop_pick *out, char *msg);

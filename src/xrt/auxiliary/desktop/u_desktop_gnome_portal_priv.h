@@ -27,7 +27,9 @@
 //! A restore (Start answered silently) plus ConnectToEIS fits in this.
 #define ACTION_TIMEOUT_MS (RESTORE_START_TIMEOUT_MS + 6000)
 //! After prepare_input, keep the session open this long (verification + the
-//! common layer's idle wait, at most 10 s, run before the injection).
+//! common layer's idle wait, at most 10 s, run before the injection). The first
+//! injection ends the hold: from then on the session closes after
+//! SESSION_IDLE_CLOSE_MS (2 s) without input, taking the indicator with it.
 #define GNOME_PREPARE_HOLD_MS 12000
 
 struct gp_cmd;
@@ -54,6 +56,9 @@ struct gp_cmd
 	//! restoring between the check and the injection — it refuses instead.
 	bool restore;
 	uint32_t out_mods, out_code; //!< resolved chord
+	struct u_desktop_rect mon[GNOME_MAX_MONITORS]; //!< monitors: the pointer's regions
+	uint32_t nmon;
+	struct u_desktop_paste_obs obs; //!< clip_paste: what the paste saw
 	u_desktop_access_done_fn done;
 	void *done_ctx;
 
@@ -116,9 +121,23 @@ struct gnome_portal
 	char *clip_text;       //!< what we serve on SelectionTransfer
 	bool clip_owner;       //!< SelectionOwnerChanged (from the portal) said session_is_owner
 	bool clip_is_paste;    //!< clip_text is the agent's text (not the restored previous one)
+	//! While serving the agent's text, the portal said another client took the
+	//! selection (the user copied): the paste must not happen / its outcome is
+	//! unknown, and the previous text must NOT be offered again over the user's.
+	bool clip_lost;
 	char *clip_prev;       //!< the clipboard text before the paste, to offer again
+	//! SelectionOwnerChanged signals saying another client owns the selection
+	//! (the user copied), counted whatever we held — so a copy between reading
+	//! the previous text and our SetSelection is seen too (clip_lost needs us to
+	//! have been the owner already).
+	uint32_t clip_foreign_gen;
+	//! clip_foreign_gen when the type started (before SelectionRead): any change
+	//! since = the user copied; never paste over it / offer the old text over it.
+	uint32_t clip_take_gen;
 	bool paste_armed;      //!< the paste keystroke was sent: transfers now count
 	uint32_t paste_writes; //!< successful writes of the agent's text since armed
+	bool paste_lost_before; //!< the last paste: the selection changed hands before its keystroke
+	bool paste_lost_after;  //!< ... after it
 	uint32_t paste_last_serial;
 	bool paste_have_serial;
 

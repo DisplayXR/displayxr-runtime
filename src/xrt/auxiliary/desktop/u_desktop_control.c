@@ -16,6 +16,7 @@
 
 #include "u_desktop_control.h"
 #include "u_desktop_chord.h"
+#include "u_desktop_gnome_logic.h"
 #include "u_desktop_policy.h"
 
 #include "os/os_threading.h"
@@ -1541,7 +1542,11 @@ done:
 		return; // destroyed: the session's event queue is going away
 	}
 	if (result == U_DESKTOP_XR_SUCCESS) {
-		snprintf(msg, sizeof(msg), "ok");
+		// "ok", or "ok (unverified: …)" when the backend could not confirm the
+		// effect (U_DESKTOP_MSG_UNVERIFIED) — same success code either way.
+		char ok[sizeof(msg)];
+		u_desktop_success_message(msg, ok, sizeof(ok));
+		snprintf(msg, sizeof(msg), "%s", ok);
 	}
 	os_mutex_lock(&c->mutex);
 	bool stop = c->stop;

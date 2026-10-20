@@ -22,13 +22,27 @@
  * The extension never mutates another app's window (ADR-056 D5), so window ops on
  * them are done as the user would, through the app's own portal session:
  * ACTIVATE = Super+click on a visible part of the window (a point GetWindowAt
- * confirms picks it), then wait for mutter's short grab to end (keys sent during
- * it are lost) and confirm focus; MINIMIZE = activate + Super+H; MAXIMIZE =
- * activate + Super+Up; RESTORE = activate + Super+Down (a minimized window of
- * another app cannot be reached this way: UNSUPPORTED); CLOSE = activate + Alt+F4;
- * MOVE = Super+drag from a visible point, jumping the pointer (a slow drag over a
- * monitor edge pops Ubuntu's tiling assistant, which grabs the keyboard — Escape
- * if one is up), read back and corrected once. Resizing them is UNSUPPORTED.
+ * confirms picks it; after a monitor crossing the pointer first settles
+ * U_DESKTOP_PRESS_SETTLE_MS at that point — a press right after the crossing
+ * had mutter's grab apply a stale pointer position and move the window), then
+ * wait for mutter's short grab to end (keys sent during it are lost), read the
+ * frame back (moved = put back by a verified move, or fail saying so) and
+ * confirm focus; MINIMIZE = activate + Super+H; MAXIMIZE = activate + Super+Up;
+ * RESTORE = activate + Super+Down (a minimized window of another app cannot be
+ * reached this way: UNSUPPORTED); CLOSE = activate + Alt+F4 (a window still
+ * open but whose app answers AT-SPI is asking for confirmation in its own
+ * window — libadwaita's prompt — and reports like a dialog would); MOVE =
+ * Super+drag from a visible point whose drop point keeps clear of every
+ * monitor's edges, jumping the pointer (a slow drag over a monitor edge pops
+ * Ubuntu's tiling assistant, which grabs the keyboard — Escape if one is up)
+ * through waypoints inside each monitor when it changes monitors (a straight
+ * jump near the top was stopped at the boundary by a pointer barrier), dwelling
+ * U_DESKTOP_CROSS_DWELL_MS on the target monitor after the last crossing before
+ * the release (Tiling Assistant judges a drop against the PREVIOUS monitor for
+ * 150 ms after a crossing), read back and corrected once — twice when edge
+ * tiling snapped it; shell UI the drop opened over the screen (Tiling
+ * Assistant's popup) is dismissed with Escape before any correction, or the
+ * move stops. Resizing them is UNSUPPORTED.
  * A Super gesture can leave the overview open; it is closed with Escape.
  * The pointer is put back where it was after a gesture.
  *
@@ -59,6 +73,10 @@
 #include <time.h>
 #include <unistd.h>
 
+//! Each AT-SPI look at the focused text field (before / after a paste).
+#define PASTE_ATSPI_BUDGET_MS 250
+//! After the paste was served: how long the focused text field may take to change.
+#define PASTE_VERIFY_MS 600
 #define WLG_PATH "/org/displayxr/WindowGeometry"
 #define WLG_IFACE "org.displayxr.WindowGeometry1"
 #define WLG_SCHEMA_MAX 1
@@ -436,6 +454,39 @@ gnome_find_window(const struct u_desktop_window *ws, uint32_t n, uint64_t id)
 	return NULL;
 }
 
+bool
+gnome_window_info(struct gnome_backend *g, uint64_t id, bool *moving, double *size_scale)
+{
+	*moving = false;
+	*size_scale = 1.0;
+	if (!g->have_ext16) {
+		return false;
+	}
+	cJSON *root = ext_json(g, "GetAllWindows", false, 0, 0, NULL);
+	if (root == NULL) {
+		return false;
+	}
+	const cJSON *lm = u_json_get(root, "layout_mode");
+	bool physical = cJSON_IsString(lm) && strcmp(lm->valuestring, "physical") == 0;
+	bool found = false;
+	const cJSON *arr = u_json_get(root, "windows");
+	int total = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+	for (int i = 0; i < total && !found; i++) {
+		const cJSON *w = cJSON_GetArrayItem(arr, i);
+		if (w == NULL || json_u64(u_json_get(w, "id")) != id) {
+			continue;
+		}
+		found = true;
+		*moving = json_bool(u_json_get(w, "moving"));
+		const cJSON *sc = u_json_get(u_json_get(w, "monitor"), "scale");
+		if (physical && cJSON_IsNumber(sc) && sc->valuedouble > 0.0) {
+			*size_scale = sc->valuedouble;
+		}
+	}
+	cJSON_Delete(root);
+	return found;
+}
+
 /*
  * Observation
  */
@@ -681,6 +732,9 @@ gnome_move_verified_ex(struct gnome_backend *g, int32_t x, int32_t y, bool resto
 		do {
 			if (gnome_get_pointer_msg(g, &px, &py, NULL) == U_DESKTOP_OK &&
 			    abs(px - x) <= POINTER_TOLERANCE_PX && abs(py - y) <= POINTER_TOLERANCE_PX) {
+				if (msg != NULL) {
+					msg[0] = '\0'; // a first attempt's "did not arrive" is not the outcome
+				}
 				return U_DESKTOP_OK;
 			}
 			gdbus_sleep_ms(10);
@@ -732,7 +786,13 @@ gnome_guard_focus(struct gnome_backend *g, const struct u_desktop_input_guard *g
 			break;
 		}
 	}
+	const struct u_desktop_window *tw = gnome_find_window(ws, n, target);
+	bool minimized = tw != NULL && (tw->state & U_DESKTOP_WINDOW_MINIMIZED);
 	free(ws);
+	if (!ok && minimized) {
+		gnome_set_msg(msg, "the target window is minimized — RESTORE it first");
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	if (!ok) {
 		gnome_set_msg(msg, "focus moved — the target window no longer has keyboard focus");
 		return U_DESKTOP_ERR_REFUSED;
@@ -876,6 +936,9 @@ gnome_pointer_button(struct u_desktop_backend *b,
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
+		// The press carries the verified point itself (motion + press in one
+		// frame): a user moving the mouse since the check cannot shift it.
+		return gnome_portal_press_at(g->portal, code, x, y, msg);
 	}
 	// A release is never refused: a button must not stay down.
 	return gnome_portal_button(g->portal, code, down, msg);
@@ -901,7 +964,9 @@ gnome_scroll(struct u_desktop_backend *b,
 	return gnome_portal_scroll(g->portal, dx, dy, msg);
 }
 
-//! Named (layout-independent) keys → evdev. Characters are resolved on the keymap.
+//! Named (layout-independent) keys → evdev, case-insensitively ("Escape" = "escape":
+//! the chord parser lower-cases, but the backend is also driven directly, e.g. by
+//! desktop_backend_smoke). Characters are resolved on the keymap.
 static uint32_t
 named_key(const char *k)
 {
@@ -930,11 +995,11 @@ named_key(const char *k)
 	    {"menu", KEY_COMPOSE},
 	};
 	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
-		if (strcmp(k, t[i].name) == 0) {
+		if (strcasecmp(k, t[i].name) == 0) {
 			return t[i].code;
 		}
 	}
-	if (k[0] == 'f' && isdigit((unsigned char)k[1])) {
+	if ((k[0] == 'f' || k[0] == 'F') && isdigit((unsigned char)k[1])) {
 		int n = atoi(k + 1);
 		if (n >= 1 && n <= 10) {
 			return KEY_F1 + (uint32_t)(n - 1);
@@ -959,6 +1024,9 @@ char_key(const char *k)
 	if (strlen(k) == 1 && ((k[0] >= 'a' && k[0] <= 'z') || (k[0] >= '0' && k[0] <= '9'))) {
 		return (uint32_t)k[0];
 	}
+	if (strlen(k) == 1 && k[0] >= 'A' && k[0] <= 'Z') {
+		return (uint32_t)(k[0] - 'A' + 'a'); // the key, not Shift+key: modifiers are explicit
+	}
 	static const struct
 	{
 		const char *name;
@@ -969,7 +1037,7 @@ char_key(const char *k)
 	    {"bracketleft", '['}, {"bracketright", ']'}, {"grave", '`'},
 	};
 	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
-		if (strcmp(k, t[i].name) == 0) {
+		if (strcasecmp(k, t[i].name) == 0) {
 			return (uint32_t)(unsigned char)t[i].ch;
 		}
 	}
@@ -1062,16 +1130,27 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 			return U_DESKTOP_ERR_FAILED;
 		}
 		bool terminal = false;
+		uint32_t fpid = 0;
+		char ftitle[U_DESKTOP_TITLE_SIZE] = "";
 		struct u_desktop_window *ws;
 		uint32_t n;
 		if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
 			for (uint32_t i = 0; i < n; i++) {
 				if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
 					terminal = is_terminal(ws[i].app_id);
+					fpid = ws[i].pid;
+					snprintf(ftitle, sizeof(ftitle), "%s", ws[i].title);
 					break;
 				}
 			}
 			free(ws);
+		}
+		// 0. The focused text field before the paste (AT-SPI, when the app exposes
+		// one): the only evidence that the text ARRIVED — a read of the clipboard
+		// after the keystroke may be a clipboard manager's, not the target's.
+		struct u_desktop_text_state before = {0}, after = {0};
+		if (g->atspi != NULL && fpid != 0) {
+			gnome_atspi_focused_text(g->atspi, fpid, ftitle, PASTE_ATSPI_BUDGET_MS, &before);
 		}
 		// 1. Take the clipboard (slow: read the old text, offer ours, wait to own it).
 		enum u_desktop_result r = gnome_portal_clip_take(g->portal, body, msg);
@@ -1086,8 +1165,37 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 			gnome_portal_clip_restore(g->portal);
 			return r;
 		}
-		// 3. Paste (refused there if the clipboard changed hands meanwhile).
-		r = gnome_portal_clip_paste(g->portal, terminal, msg);
+		// 3. Paste (refused there if the clipboard changed hands meanwhile — the
+		// user copied: nothing pasted, the user's clipboard untouched).
+		struct u_desktop_paste_obs obs;
+		r = gnome_portal_clip_paste(g->portal, terminal, &obs, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		// 4. Did it arrive? The field must change (bounded poll: an app updates its
+		// accessible text from its own main loop).
+		if (before.found) {
+			uint64_t deadline = gdbus_now_ms() + PASTE_VERIFY_MS;
+			do {
+				gnome_atspi_focused_text(g->atspi, fpid, ftitle, PASTE_ATSPI_BUDGET_MS, &after);
+				obs.text_check = u_desktop_text_check(&before, &after);
+				if (obs.text_check != 0) {
+					break;
+				}
+				gdbus_sleep_ms(50);
+			} while (gdbus_now_ms() < deadline);
+		}
+		bool restore = true;
+		enum u_desktop_paste_verdict v = u_desktop_paste_decide(&obs, &restore);
+		// Stop serving our text; the previous text comes back only if the selection
+		// never changed hands (the portal side re-checks that too).
+		gnome_portal_clip_restore(g->portal);
+		r = u_desktop_paste_result(v);
+		if (v != U_DESKTOP_PASTE_DELIVERED) {
+			gnome_set_msg(msg, "%s", u_desktop_paste_message(v));
+		}
+		U_LOG_I("desktop/gnome: paste verdict %d (writes %u, lost %d/%d, field %d)", (int)v,
+		        obs.writes_after_key, obs.lost_before_key, obs.lost_after_key, obs.text_check);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}

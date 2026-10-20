@@ -16,6 +16,7 @@
 #include "desktop/u_desktop_chord.h"
 #include "desktop/u_desktop_control.h"
 #include "desktop/u_desktop_fake.h"
+#include "desktop/u_desktop_gnome_logic.h"
 #include "desktop/u_desktop_mini_cache.h"
 #include "desktop/u_desktop_policy.h"
 
@@ -39,6 +40,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <cerrno>
+#include <csignal>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -1919,3 +1922,218 @@ TEST_CASE("polish11_mini: a full cache never overwrites an entry with a pin", "[
 	CHECK(mini_has(c, 100 + U_DESKTOP_MINI_CACHE_MAX - 1));
 	CHECK_FALSE(mini_has(c, 9999));
 }
+
+/*
+ * GNOME backend decisions (u_desktop_gnome_logic.h) — pure, so pinned on every OS.
+ */
+
+namespace {
+u_desktop_paste_verdict
+decide(bool lost_before, bool lost_after, uint32_t writes, int text_check, bool *restore)
+{
+	u_desktop_paste_obs o = {lost_before, lost_after, writes, text_check};
+	return u_desktop_paste_decide(&o, restore);
+}
+} // namespace
+
+TEST_CASE("gnome_paste: the user copying before the keystroke = refused, nothing pasted, clipboard untouched",
+          "[desktop][gnome][paste]")
+{
+	bool restore = true;
+	CHECK(decide(true, false, 0, -1, &restore) == U_DESKTOP_PASTE_CHANGED_HANDS);
+	CHECK_FALSE(restore);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_CHANGED_HANDS) == U_DESKTOP_ERR_REFUSED);
+	CHECK(std::string(u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS)).find("changed hands") !=
+	      std::string::npos);
+}
+
+TEST_CASE(
+    "gnome_paste: losing the clipboard after the keystroke = never delivered unless OUR text was read, no restore",
+    "[desktop][gnome][paste]")
+{
+	bool restore = true;
+	// Never read: the target was handed the user's clipboard. A changed field is
+	// the USER's text arriving (GNOME 50.1 re-check: 37/80 trials 8-25 ms after
+	// type start reported plain ok here) — failed, said honestly, whatever the field.
+	CHECK(decide(false, true, 0, -1, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
+	CHECK_FALSE(restore);
+	CHECK(decide(false, true, 0, 0, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
+	CHECK(decide(false, true, 0, 1, &restore) == U_DESKTOP_PASTE_LOST_NOT_SERVED);
+	CHECK_FALSE(restore);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_LOST_NOT_SERVED) == U_DESKTOP_ERR_FAILED);
+	CHECK(std::string(u_desktop_paste_message(U_DESKTOP_PASTE_LOST_NOT_SERVED)).find("user's clipboard") !=
+	      std::string::npos);
+	// Read, but nothing confirms which text landed: unknown.
+	CHECK(decide(false, true, 3, -1, &restore) == U_DESKTOP_PASTE_LOST_UNCERTAIN);
+	CHECK(decide(false, true, 1, 0, &restore) == U_DESKTOP_PASTE_LOST_UNCERTAIN);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_LOST_UNCERTAIN) == U_DESKTOP_ERR_FAILED);
+	// Our text was served AND the field changed: delivered, the user's new clipboard stays.
+	CHECK(decide(false, true, 1, 1, &restore) == U_DESKTOP_PASTE_DELIVERED);
+	CHECK_FALSE(restore);
+	// Lost before the key wins over everything else.
+	CHECK(decide(true, true, 2, 1, &restore) == U_DESKTOP_PASTE_CHANGED_HANDS);
+	CHECK_FALSE(restore);
+}
+
+TEST_CASE("gnome_paste: the end of a type never leaves the selection owned and empty", "[desktop][gnome][paste]")
+{
+	// Untouched, a previous text read: offer it again.
+	CHECK(u_desktop_clip_end_decide(false, true, true) == U_DESKTOP_CLIP_END_RESTORE);
+	// Untouched, nothing to restore: release, never sit on it serving nothing.
+	CHECK(u_desktop_clip_end_decide(false, true, false) == U_DESKTOP_CLIP_END_RELEASE);
+	// Changed hands while we still own it (the user's copy landed between
+	// SelectionRead and our SetSelection — re-check 2 N1, 9/185): release; the old
+	// text is never offered over the user's.
+	CHECK(u_desktop_clip_end_decide(true, true, true) == U_DESKTOP_CLIP_END_RELEASE);
+	CHECK(u_desktop_clip_end_decide(true, true, false) == U_DESKTOP_CLIP_END_RELEASE);
+	// Someone else owns it: it is the user's — leave it.
+	CHECK(u_desktop_clip_end_decide(true, false, true) == U_DESKTOP_CLIP_END_LEAVE);
+	CHECK(u_desktop_clip_end_decide(false, false, true) == U_DESKTOP_CLIP_END_LEAVE);
+	CHECK(u_desktop_clip_end_decide(false, false, false) == U_DESKTOP_CLIP_END_LEAVE);
+	// The refusal that replaced the user's copy says so.
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED) == U_DESKTOP_ERR_REFUSED);
+	const std::string m = u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED);
+	CHECK(m.find("gone") != std::string::npos);
+	CHECK(m.find("nothing was pasted") != std::string::npos);
+}
+
+TEST_CASE("gnome_paste: a clipboard-manager read alone is never 'verified'", "[desktop][gnome][paste]")
+{
+	bool restore = false;
+	// No accessible text field: a read is all there is -> ok, but unverified.
+	CHECK(decide(false, false, 1, -1, &restore) == U_DESKTOP_PASTE_UNVERIFIED);
+	CHECK(restore);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_UNVERIFIED) == U_DESKTOP_OK);
+	CHECK(std::string(u_desktop_paste_message(U_DESKTOP_PASTE_UNVERIFIED)).rfind(U_DESKTOP_MSG_UNVERIFIED, 0) == 0);
+	// A focused text field that did not change: the read was not the target's.
+	CHECK(decide(false, false, 2, 0, &restore) == U_DESKTOP_PASTE_FIELD_UNCHANGED);
+	CHECK(u_desktop_paste_result(U_DESKTOP_PASTE_FIELD_UNCHANGED) == U_DESKTOP_ERR_FAILED);
+	// It changed: delivered.
+	CHECK(decide(false, false, 1, 1, &restore) == U_DESKTOP_PASTE_DELIVERED);
+	CHECK(restore);
+	// Nobody read at all.
+	CHECK(decide(false, false, 0, -1, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
+	CHECK(decide(false, false, 0, 0, &restore) == U_DESKTOP_PASTE_NOT_ASKED);
+	// Messages never name text; they are all non-empty except delivered.
+	for (int v = U_DESKTOP_PASTE_UNVERIFIED; v <= U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED; v++) {
+		CHECK(std::strlen(u_desktop_paste_message((u_desktop_paste_verdict)v)) > 0);
+	}
+}
+
+TEST_CASE("gnome_paste: the focused text field comparison", "[desktop][gnome][paste]")
+{
+	u_desktop_text_state none = {false, 0, 0, 0};
+	u_desktop_text_state a = {true, 10, 10, u_desktop_fnv1a("hello", 5)};
+	u_desktop_text_state same = a;
+	u_desktop_text_state longer = {true, 15, 15, u_desktop_fnv1a("hello world", 11)};
+	u_desktop_text_state replaced = {true, 10, 10, u_desktop_fnv1a("hallo", 5)};
+	CHECK(u_desktop_text_check(&none, &a) == -1);
+	CHECK(u_desktop_text_check(&a, &none) == -1);
+	CHECK(u_desktop_text_check(&a, &same) == 0);
+	CHECK(u_desktop_text_check(&a, &longer) == 1);
+	CHECK(u_desktop_text_check(&a, &replaced) == 1); // a selection replaced by text of equal length
+	CHECK(u_desktop_fnv1a("", 0) != u_desktop_fnv1a("a", 1));
+}
+
+TEST_CASE("gnome_paste: success message — plain ok, or ok (unverified: …)", "[desktop][gnome][paste]")
+{
+	char out[U_DESKTOP_MSG_SIZE];
+	u_desktop_success_message("", out, sizeof(out));
+	CHECK(std::string(out) == "ok");
+	u_desktop_success_message(nullptr, out, sizeof(out));
+	CHECK(std::string(out) == "ok");
+	// A stale failure message from a retried step is not the outcome.
+	u_desktop_success_message("the pointer did not arrive at (1,2)", out, sizeof(out));
+	CHECK(std::string(out) == "ok");
+	u_desktop_success_message(U_DESKTOP_MSG_UNVERIFIED "nothing confirmed it", out, sizeof(out));
+	CHECK(std::string(out) == "ok (unverified: nothing confirmed it)");
+}
+
+TEST_CASE("gnome_move: the drop waits >= 250 ms on the target monitor after the last crossing",
+          "[desktop][gnome][move]")
+{
+	CHECK(U_DESKTOP_CROSS_DWELL_MS >= 250);
+	CHECK(u_desktop_cross_dwell_left_ms(0, 5000, U_DESKTOP_CROSS_DWELL_MS) == 0); // no crossing
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1000, 300) == 300);
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1090, 300) == 210); // the PR's old 30-90 ms release
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1299, 300) == 1);
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1300, 300) == 0);
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 900, 300) == 300); // clock went backwards
+}
+
+TEST_CASE("gnome_activate: a press after a monitor crossing settles first; a moved frame is caught",
+          "[desktop][gnome][activate]")
+{
+	// The press settle reuses the crossing dwell: no crossing = no wait.
+	CHECK(U_DESKTOP_PRESS_SETTLE_MS >= 250);
+	CHECK(u_desktop_cross_dwell_left_ms(0, 5000, U_DESKTOP_PRESS_SETTLE_MS) == 0);
+	CHECK(u_desktop_cross_dwell_left_ms(1000, 1004, U_DESKTOP_PRESS_SETTLE_MS) > 0); // the 4-5 ms jump
+	const u_desktop_rect before = {100, 200, 800, 600};
+	const u_desktop_rect same = {102, 197, 800, 600};     // within tolerance
+	const u_desktop_rect jumped = {2020, 180, 800, 600};  // relocated to the other monitor
+	const u_desktop_rect resized = {100, 200, 960, 1080}; // tiled
+	const u_desktop_rect nudged = {100, 200, 800, 605};   // one edge past tolerance
+	CHECK_FALSE(u_desktop_frame_moved(&before, &before, 4));
+	CHECK_FALSE(u_desktop_frame_moved(&before, &same, 4));
+	CHECK(u_desktop_frame_moved(&before, &jumped, 4));
+	CHECK(u_desktop_frame_moved(&before, &resized, 4));
+	CHECK(u_desktop_frame_moved(&before, &nudged, 4));
+	const u_desktop_rect huge = {INT32_MIN, INT32_MIN, INT32_MAX, INT32_MAX}; // no overflow
+	CHECK(u_desktop_frame_moved(&before, &huge, 4));
+}
+
+TEST_CASE("gnome_move: only shell UI the gesture opened is dismissed", "[desktop][gnome][move]")
+{
+	const uint8_t W = U_DESKTOP_PICK_WINDOW, D = U_DESKTOP_PICK_DESKTOP, S = U_DESKTOP_PICK_SHELL,
+	              U = (uint8_t)U_DESKTOP_COVER_UNKNOWN;
+	const uint8_t before[5] = {W, D, W, S, U};
+	const uint8_t same[5] = {W, D, W, S, U};
+	const uint8_t popup[5] = {S, S, W, S, U};     // a tiling popup over the free half
+	const uint8_t was_shell[5] = {W, D, W, S, S}; // the user's dialog / unknown point
+	CHECK_FALSE(u_desktop_shell_cover_appeared(before, same, 5));
+	CHECK(u_desktop_shell_cover_appeared(before, popup, 5));
+	CHECK_FALSE(u_desktop_shell_cover_appeared(before, was_shell, 5));
+	CHECK_FALSE(u_desktop_shell_cover_appeared(before, popup, 0));
+}
+
+#ifndef _WIN32
+TEST_CASE("gnome_clipboard: a reader that went away is EPIPE, never a SIGPIPE, disposition untouched",
+          "[desktop][gnome][sigpipe]")
+{
+	struct sigaction before_sa = {};
+	REQUIRE(sigaction(SIGPIPE, nullptr, &before_sa) == 0);
+	sigset_t mask_before;
+	pthread_sigmask(SIG_SETMASK, nullptr, &mask_before);
+
+	int fds[2];
+	REQUIRE(pipe(fds) == 0);
+	close(fds[0]); // the reader is gone (the selection changed hands)
+	const char data[] = "agent text";
+	errno = 0;
+	ptrdiff_t w = u_desktop_write_nosigpipe(fds[1], data, sizeof(data) - 1);
+	int e = errno;
+	close(fds[1]);
+	// Still alive here (the default disposition would have killed the process).
+	CHECK(w == -1);
+	CHECK(e == EPIPE);
+
+	// No SIGPIPE left pending, the thread's mask and the process disposition unchanged.
+	sigset_t pending;
+	sigpending(&pending);
+	CHECK(sigismember(&pending, SIGPIPE) == 0);
+	sigset_t mask_after;
+	pthread_sigmask(SIG_SETMASK, nullptr, &mask_after);
+	CHECK(sigismember(&mask_after, SIGPIPE) == sigismember(&mask_before, SIGPIPE));
+	struct sigaction after_sa = {};
+	REQUIRE(sigaction(SIGPIPE, nullptr, &after_sa) == 0);
+	CHECK(after_sa.sa_handler == before_sa.sa_handler);
+
+	// A reader that is there still gets the bytes.
+	REQUIRE(pipe(fds) == 0);
+	CHECK(u_desktop_write_nosigpipe(fds[1], data, sizeof(data) - 1) == (ptrdiff_t)(sizeof(data) - 1));
+	char buf[32] = {0};
+	CHECK(read(fds[0], buf, sizeof(buf)) == (ssize_t)(sizeof(data) - 1));
+	close(fds[0]);
+	close(fds[1]);
+}
+#endif

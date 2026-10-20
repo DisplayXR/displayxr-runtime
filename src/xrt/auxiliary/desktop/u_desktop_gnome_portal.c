@@ -22,8 +22,9 @@
  * A session is opened per action burst and closed after 2 s without input, so
  * GNOME's remote-access indicator is up only while the agent acts. Re-opening
  * restores silently with the (single-use, renewed every Start) token. Locking the
- * screen closes portal sessions (the Session's Closed signal); the next action
- * re-opens one. Without a token (a portal that did not persist) the session is
+ * screen closes portal sessions (the Session's Closed signal, sent as the lock
+ * starts — before ScreenSaver.GetActive says so, hence session_closed_by_portal's
+ * 3 s wait); the next action after unlock re-opens one. Without a token (a portal that did not persist) the session is
  * kept open instead, since re-opening would prompt.
  *
  * ## Input
@@ -47,7 +48,19 @@
  * offered on the clipboard through the portal (SetSelection; SelectionTransfer →
  * SelectionWrite → write → SelectionWriteDone) and pasted with Ctrl+V, or
  * Ctrl+Shift+V in a terminal. The previous clipboard text is read first
- * (SelectionRead) and offered again after the paste. LIMITATION: a portal
+ * (SelectionRead) and offered again ~1.2 s after the paste keystroke (every read
+ * until then gets the agent's text, so a clipboard manager reading first cannot
+ * make a slow target paste the previous text). The selection changing hands
+ * (SelectionOwnerChanged, session_is_owner false: the user copied) at any time
+ * from before SelectionRead through SetSelection, up to the check after Ctrl is
+ * down and before V, cancels the paste (Ctrl released without V); after V it
+ * fails — "the user's clipboard, not the agent's text" when the agent's text was
+ * never read, else unknown unless read AND the field changed; either way the
+ * previous text is never offered over the user's. Delivery is confirmed by
+ * the focused AT-SPI text field changing when there is one; else a read after
+ * the keystroke (possibly a clipboard manager's) gives "ok (unverified)". A
+ * reader closing its fd mid-write is EPIPE (SIGPIPE blocked for the write, on
+ * this thread only — this is the app's process). LIMITATION: a portal
  * session's selection dies with the session, so ~2 s after the burst (the idle
  * close) GNOME's clipboard no longer holds either text unless a clipboard manager
  * kept a copy.
@@ -91,6 +104,10 @@
 #define SESSION_IDLE_CLOSE_MS 2000
 //! The interactive dialog.
 #define INTERACTIVE_START_TIMEOUT_MS (10 * 60 * 1000)
+//! After the portal closed our session: how long a lock may take to show up in
+//! org.gnome.ScreenSaver.GetActive before the close is read as the user's Stop.
+#define LOCK_SETTLE_MS 3000
+#define LOCK_POLL_MS 100
 
 bool
 gnome_portal_libei_available(void)
@@ -332,15 +349,25 @@ screen_locked_now(struct gnome_portal *p)
 	return active;
 }
 
-//! The portal's session went away under us: a lock (restorable) or the user
-//! stopping it from GNOME's indicator (a revocation — never restored silently).
+/*!
+ * The portal's session went away under us: a lock (restorable) or the user
+ * stopping it from GNOME's indicator (a revocation — never restored silently).
+ *
+ * The portal closes its sessions as the lock BEGINS, while the shield is still
+ * animating in: GetActive reads false for a while after the Closed signal (seen
+ * at +300 ms on GNOME 50). So a close is classified as a Stop only after
+ * GetActive stayed false for LOCK_SETTLE_MS — a lock read at any point in that
+ * window keeps the token (the next action after unlock restores silently, as a
+ * lock with no session open already did).
+ */
 static void
 session_closed_by_portal(struct gnome_portal *p)
 {
 	gp_session_forget(p);
 	bool locked = screen_locked_now(p);
-	if (!locked) {
-		gdbus_sleep_ms(300); // the lock screen may come up just after the close
+	uint64_t deadline = gdbus_now_ms() + LOCK_SETTLE_MS;
+	while (!locked && gdbus_now_ms() < deadline && !gp_quitting(p)) {
+		gdbus_sleep_ms(LOCK_POLL_MS);
 		locked = screen_locked_now(p);
 	}
 	if (locked) {
@@ -430,6 +457,13 @@ handle_message(struct gnome_portal *p, DBusMessage *m)
 				}
 			}
 			dbus_message_iter_next(&dict);
+		}
+		if (!owner) {
+			p->clip_foreign_gen++;
+		}
+		if (!owner && p->clip_owner && p->clip_is_paste) {
+			// Someone else took the selection while it held the agent's text.
+			p->clip_lost = true;
 		}
 		p->clip_owner = owner;
 	}

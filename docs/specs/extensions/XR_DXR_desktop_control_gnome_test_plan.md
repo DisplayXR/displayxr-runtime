@@ -127,7 +127,8 @@ Expected: `result: ok` and the click lands **exactly** on the target on the 1x D
 1.33x laptop panel and on a 2x panel (the prototype's check — the portal's own
 NotifyPointerMotionAbsolute path clicked the wrong window here; libei must not). A point
 between monitors → `refused — (x,y) is on no monitor`. The GNOME remote-access indicator
-appears in the top bar while acting and disappears ~2 s after the last command.
+appears in the top bar while acting and disappears ~2 s after the last command — after `key`,
+`type` and `scroll` too (it used to stay ~12 s: prepare_input's hold outlived the injection).
 
 ## 5. Keys — layout-aware chords
 
@@ -139,6 +140,7 @@ $SMOKE key 1 c          # Ctrl+C
 $SMOKE key 0 end
 $SMOKE key 1 z          # Ctrl+Z
 $SMOKE key 8 ""         # Super alone: the overview opens (Escape it)
+$SMOKE key 0 Escape     # key names are case-insensitive: Escape = escape, F5 = f5
 ```
 
 Then switch the input source to **French (AZERTY)** and repeat `key 1 z` and `key 1 a`: they must
@@ -164,6 +166,56 @@ $SMOKE type "Hello, 世界 — ünïcödé"        # into gedit
   with its session). Record what you see.
 - A window that takes no text (Settings' sidebar) → `failed — the focused window did not ask
   for the pasted text`.
+- **Delivery evidence (re-run item 4).** A clipboard read after the keystroke is not proof: a
+  clipboard manager reads too. When the focused window exposes a focused text field over
+  AT-SPI, the paste counts only if that field changed (length, caret or the text around the
+  caret); with no such field a read gives `ok (unverified: …)` through the extension (the
+  smoke tool prints the backend message `unverified: …` after `result: ok`). Run with a
+  clipboard manager (GPaste, or the Clipboard Indicator extension) enabled:
+  | focus | expected |
+  |---|---|
+  | gedit / gnome-text-editor text | `ok` (verified; no message) |
+  | gnome-terminal prompt | `ok` (VTE exposes its text) |
+  | Settings' sidebar, Files' icon view (no text field) | `ok` + `unverified: …` (was a plain `ok`), never a crash |
+  | a GTK text entry with the text `abc` selected, `type "abc"` | `failed — the focused text field did not change` is ACCEPTABLE (identical replacement); record it |
+  | an app with toolkit accessibility off (an Electron app without a11y) | `ok` + `unverified: …` |
+  Record any case where the text visibly arrived but the result is `failed — … did not change`
+  (a field whose AT-SPI text updates late or never): that is a false failure to fix.
+- **Clipboard changing hands mid-type (re-run items 2 + 3).** A helper copies on a timer
+  after `type` starts, e.g. `wl-copy USERTEXT` from a script that sleeps D ms after launching
+  the smoke tool's `type "agent text"` (or `xdotool`-free: `gdbus`-driven wl-copy). Run 10× for
+  each D in 8, 11, 15, 22, 25 ms, into gedit:
+  | outcome | expected |
+  |---|---|
+  | the process | never dies (it used to die of SIGPIPE at ~8–10 ms: EPIPE on the SelectionWrite fd is now a cancelled transfer) |
+  | the copy landed before the paste keystroke | `refused — the clipboard changed hands (the user copied something); nothing was pasted`, nothing appears in gedit, and the clipboard afterwards is `USERTEXT` (not restored over) |
+  | the copy landed after the keystroke, the agent's text never read | `failed — the clipboard changed hands right after the paste keystroke … whatever the window pasted was the user's clipboard, not the agent's text`; the clipboard afterwards is `USERTEXT` |
+  | the copy landed after the keystroke, the agent's text read | `failed — lost the clipboard during the paste … whether the text arrived is unknown`, or `ok` only if gedit's text visibly changed; the clipboard afterwards is `USERTEXT` |
+  | the portal never reported this session as the owner | `failed — the portal did not make this session the clipboard owner — not pasting`; nothing pasted, clipboard `USERTEXT` (honest; re-check 2 saw 12/145) |
+  | never | `USERTEXT` pasted into gedit with a plain `ok` (re-check 2: 37/80 at D = 8–25 ms, 10/10 at 15 ms) or `failed — did not ask` (the old 7/40) |
+  Count how often each row occurs per D. `USERTEXT` appearing in gedit is acceptable only
+  with one of the two "after the keystroke" failures (the copy raced the keystroke itself) —
+  never with `ok`.
+- **Re-check 2 rows (fixes for item 3).** Same helper, gedit, plus a clipboard manager:
+  | case | how | expected |
+  |---|---|---|
+  | (a) copy lands between Ctrl-down and V | D = 8, 11, 15, 22, 25 ms, 20× each (the owner-change signal arrived ~9 ms before V in the D-Bus trace) | `refused — the clipboard changed hands …; nothing was pasted`, Ctrl released with no V (nothing typed, nothing pasted); never `ok` with `USERTEXT` in gedit. Count residual `ok` + `USERTEXT` (a signal reaching the app only after V was sent): expected ~0 |
+  | (b) copy lands after V, target reads late | a target that reads the clipboard 300 ms after the key (re-check 2: 20/20 pasted `USERTEXT` with `ok`), 20× | `failed — … whatever the window pasted was the user's clipboard, not the agent's text` (the agent's text was never read); never `ok` |
+  | (b') random timing | D uniform in 0–60 ms, 40× (re-check 2: 8/40 `ok` + `USERTEXT`) | no `ok` with `USERTEXT` in gedit; every failure message is one of the rows above |
+  | (c) copy between reading the previous clipboard and taking it | D = 0–5 ms, or a helper copying the moment `SelectionRead` shows on `dbus-monitor` (re-check 2: 7/185 restored the previous text over the user's copy) | `refused — the clipboard changed hands …`; the clipboard afterwards is `USERTEXT` — never the previous text, never the agent's |
+  | (c') copy after the key, during the ~1.2 s serve | D = 500–1500 ms | the clipboard afterwards is `USERTEXT`, never the previous text |
+  | (N1) copy between reading the previous clipboard and our SetSelection (re-check 3: 9/185 at 10.4–12.5 ms after the command; refused correctly but the clipboard was left owned and EMPTY — reads unanswered for 3 s) | D ≈ 10–13 ms, 40× (log: `our offer replaced the user's copy; releasing`) | `refused — … the offer had already replaced what the user copied, which is gone (copy it again); the clipboard was released and is empty`; afterwards `wl-paste` returns at once with no owner / empty — never a 3 s hang, never the agent's text, never the previous text. `USERTEXT` is NOT expected: it is gone. This ~1.5 ms window is the one place "the clipboard is the user's afterwards" cannot hold |
+  | nothing to restore | `wl-copy --clear` so the clipboard is empty, then `type "x"` | `ok`; afterwards `wl-paste` answers at once (empty, or "x" kept by mutter's clipboard keeper) — never a hang |
+
+### 4b. Clicks with a moving pointer (re-run item 5)
+
+While a helper wiggles the real mouse (a USB mouse on a stand-held vibrator, or a second
+libei / `ydotool` client sending ±5 px relative motion every 5 ms), click a 10×10 px target
+20 times: `$SMOKE click X Y`. Expected: every `ok` click lands on the target's exact pixel
+(was 3/20 landing 3 px off); a click whose pointer was moved off the verified point before the
+press → `refused — the pointer moved off the verified point` (never `ok` elsewhere). The press
+now carries its own absolute motion in the same libei frame, so it cannot be shifted after the
+check; record the count of `ok` vs `refused`.
 
 ## 7. Session lifetime and consent
 
@@ -174,11 +226,16 @@ $SMOKE request
 - Click **Cancel** → `access: denied`. Click **Share** → `access: granted`.
 - Inside an app (Unity / native, through the runtime): grant once; act; wait > 2 s (indicator
   goes away); act again → **no dialog** (silent restore with the in-memory token), indicator back.
-- Lock the screen while a session is open, unlock, act again → still no dialog; the log shows
-  `the screen lock closed the RemoteDesktop session` then `session restored`.
+- Lock the screen **while a session is open** (act, then Super+L within 2 s — the indicator is
+  still up), unlock, act again → still no dialog and `ok`, never `not-granted`; the log shows
+  `the screen lock closed the RemoteDesktop session` then `session restored`. (The portal closes
+  the session as the lock starts, before `org.gnome.ScreenSaver.GetActive` turns true; the
+  backend waits up to 3 s for it before reading the close as a Stop.) Repeat with a lock that
+  happens with no session open: same result.
 - **Stop from GNOME's indicator** (top bar → remote-access menu → Stop) while a session is
-  open, then act → `not-granted — remote control was declined or revoked` **immediately** (no
-  15 s wait, no silent restore — the log says `treating it as a revoked grant`); `request` asks again.
+  open, then act → `not-granted — remote control was declined or revoked` within ~3 s (the lock
+  check above; no 15 s wait, no silent restore — the log says `treating it as a revoked grant`);
+  `request` asks again.
 - Revoke the permission (Settings → Apps → the app, or `flatpak permission-reset`), act → the
   first action returns `not-granted` within ~5 s (`did not restore the session silently`), the
   next ones at once.
@@ -198,7 +255,13 @@ in the script to give you the window).
   `unsupported`, and the target must NOT receive "SECRET".
 - **Clipboard changes hands before Ctrl+V.** Run `type "AGENT"` with a clipboard manager or a
   script that copies "OTHER" at the same instant; either "AGENT" is pasted or the result is
-  `refused — lost the clipboard before the paste`; "OTHER" must never be pasted.
+  `refused — the clipboard changed hands …` (or one of the two "after the keystroke" failures);
+  "OTHER" must never be pasted with an `ok`.
+- **A clipboard manager reading first never makes the target paste the previous clipboard.**
+  Copy "PREVIOUS" in gedit; with GPaste / Clipboard Indicator running, `type "AGENT\n"` into a
+  slow target (a large gnome-text-editor document, or a terminal under load): "AGENT" is
+  pasted, never "PREVIOUS" (the agent's text is served to every reader for ~1.2 s after Ctrl+V,
+  only then is "PREVIOUS" offered again). `type` takes ~1.2 s longer than before — expected.
 - **A clipboard manager is not a delivery.** With GPaste / Clipboard Indicator running, `type`
   into a window that takes no text (Settings sidebar): result `failed — the focused window did
   not ask for the pasted text`, not `ok`.
@@ -239,20 +302,76 @@ $SMOKE op restore ID        # → unsupported — minimized windows of other app
 $SMOKE op move ID 200 150   # Super+drag; list shows frame=(200,150 ...) within 2 px
 $SMOKE op move ID 200 150 800 600   # → unsupported (resize of other windows)
 $SMOKE op close ID          # gedit with unsaved text: ok — "the app asked for confirmation"
+$SMOKE op close ID          # gnome-text-editor (libadwaita) with unsaved text: the prompt is
+                            # INSIDE the window — still ok — "the app asked for confirmation
+                            # (its window stayed open and is responding …)"
 ```
+
+`close` of a window whose app is hung (`kill -STOP <pid>` first) → `timeout — … its app is not
+responding`; of an app without an accessibility tree that shows an in-window prompt →
+`timeout — … cannot be told apart` (record which apps do this).
 
 Move specifically: move a window **across the boundary** between the DS1 and the laptop panel
 (different scales) and to just below the top bar of the other monitor; the result must be exact
-(one read-back correction allowed), Ubuntu's tiling popup must not stay up, and no window may
-end up maximized by edge tiling. Activate a window that is entirely covered → `refused — no
+(one read-back correction allowed — two when the log says `snapped by edge tiling`), Ubuntu's
+tiling popup must not stay up, and no window may end up maximized or tiled by edge tiling. Do
+each move **twice: once with the pointer on the window's monitor, once with it parked on the
+other monitor** (the hardware run failed this way: Tiling Assistant quarter-tiled the window at
+the monitor's top-left, then `pointer did not arrive at (2400,16) — it is at (1920,16)`). The
+pointer now crosses between monitors through the middle of their shared edge and the drop point
+stays ≥ 48 px inside its monitor. If a move still fails, the result must be `refused` /
+`timeout` with the reason, never `ok` with the window elsewhere; record the log lines. Activate a window that is entirely covered → `refused — no
 visible part of the window to click`; a window on another workspace → the same.
+
+**Cross-monitor move under Ubuntu's Tiling Assistant (re-run item 1).** Tiling Assistant's
+`monitor-switch-grace-period` (on by default) judges a drag against the PREVIOUS monitor for
+150 ms after the pointer changes monitors; the drop now dwells ≥ 300 ms on the target monitor
+after the last crossing. And a Tiling Assistant popup (or any shell UI) that a move opens over
+the screen is now detected (picks that saw windows / the desktop before the gesture see shell
+UI after it), dismissed with Escape and re-checked before any correction; if it stays up the
+move is `refused — the move opened shell UI … not correcting through it`. Run 10 cross-monitor
+moves (5 each direction, alternating the pointer's starting monitor) for each of:
+| Tiling Assistant | grace period | expected |
+|---|---|---|
+| enabled (Ubuntu default) | default (on) | 10/10 `ok`, exact, not tiled (base f1651f7d8 was 8/10; the first fix pass was 0/10) |
+| enabled | off (`gsettings set org.gnome.shell.extensions.tiling-assistant monitor-switch-grace-period false`) | 10/10 |
+| disabled | — | 10/10 |
+Also once: a window dragged so that it DOES get tiled (drop near the target monitor's left
+edge by hand with `op move` to x = monitor.x + 50) — the log shows `shell UI (a tiling
+popup?) … Escape` when the popup came up, the popup is gone afterwards, and the result is
+either `ok` (corrected) or `refused`/`failed` with the reason — never a popup left on screen.
+And once with a polkit / password prompt already on screen before the move: it must NOT be
+dismissed (it was shell UI before the gesture).
+
+**Activate with the pointer starting on the other monitor (merge-check M1).** In Ubuntu's
+session (Tiling Assistant + dock) a Super+click right after the pointer changed monitors
+sometimes MOVED the window to the other monitor and still returned `ok`: mutter's grab took a
+stale pointer position ~4–5 ms after the press, putting the window where the first waypoint from
+the other monitor would (eb1379b47: 4/65; with the avatar window 4/18; plain GNOME 0/25). Now
+the pointer settles ≥ 300 ms at the press point after the last crossing before Super goes down,
+and the frame is read back after every activate: a moved window is put back by a verified move
+(log: `activating moved the window … — putting it back`) or the activate fails with
+`failed — the Super+click moved the window from (…) to (…) and it could not be put back: …`.
+Before each run, park the pointer on the monitor the window is NOT on (`$SMOKE move X Y`):
+| session | window | runs | expected |
+|---|---|---|---|
+| Ubuntu (Tiling Assistant + dock) | gedit, partly covered | 25 | 25/25 `ok` with the frame unchanged (`list` within 2 px of before); 0 jumps; count any `putting it back` log lines (each must end with the frame back) |
+| Ubuntu (Tiling Assistant + dock) | the avatar window (the app's own window via the Super+click fallback, and another app's avatar) | 25 | same; the old 4/18 must be 0 |
+| plain GNOME | gedit | 25 | same (control) |
+| any | a window whose put-back is impossible (force it: maximize the target first, or note any natural case) | — | `failed — the Super+click moved the window …` or `… changed the window's maximized state …`, never a plain `ok` |
+Each activate after a crossing now takes ~300 ms longer — expected.
 
 ## 9. Window ops on the app's own window
 
 Needs an app with a window (the smoke tool has none): run a DisplayXR test app using the
 extension (e.g. `cube_handle_vk_linux` under Wayland) with an agent harness, or the Unity
-binding. Expected: `ACTIVATE` / `MINIMIZE` / `RESTORE` / `MOVE` go through WindowPlacement1
-**without** the portal dialog; `MAXIMIZE` → unsupported; a resize → unsupported.
+binding. Expected, **once access is granted**: `ACTIVATE` / `MINIMIZE` / `RESTORE` / `MOVE` go
+through WindowPlacement1 with no portal session (no remote-access indicator, no input
+injected); `MAXIMIZE` → unsupported; a resize → unsupported; `CLOSE` of a minimized own window
+un-minimizes it first. **Without** a grant every one of them → `not-granted`, like any other
+action (spec §4: all operations require `GRANTED`; the consent table has no own-window
+exception). An earlier version of this section said they work "without the portal dialog",
+which read as "without a grant" — it is the input path that differs, not the consent.
 
 ## 10. Extension-version matrix
 
