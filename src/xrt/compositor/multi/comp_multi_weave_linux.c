@@ -1591,9 +1591,12 @@ weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int 
  * px off — inverted eyes. u_weave_present_origin.h has the rule and
  * tests_aux_weave_present_origin pins it.
  */
-static enum u_weave_origin_source
-weave_panel_relative_origin(struct multi_compositor *mc, int32_t *out_x, int32_t *out_y)
+static struct u_weave_panel_frame
+weave_panel_frame(const struct multi_compositor *mc)
 {
+	// Read live, every submit: the service re-resolves this info when the
+	// desktop layout changes (a hotplug, a live display-scale or arrangement
+	// change, #2251), so a bound window follows without re-binding.
 	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
 	const struct u_weave_panel_frame panel = {
 	    .screen_left = info->display_screen_left,
@@ -1604,9 +1607,25 @@ weave_panel_relative_origin(struct multi_compositor *mc, int32_t *out_x, int32_t
 	    .native_h = info->display_desktop_native_height,
 	    .scale = (double)info->display_desktop_scale,
 	};
+	return panel;
+}
+
+static enum u_weave_origin_source
+weave_panel_relative_origin_in(const struct multi_compositor *mc,
+                               const struct u_weave_panel_frame *panel,
+                               int32_t *out_x,
+                               int32_t *out_y)
+{
 	const struct xrt_weave_logical_origin *lo = &mc->weave.win_logical;
-	return u_weave_panel_relative_origin(&panel, mc->weave.win_x, mc->weave.win_y, lo->valid, lo->x, lo->y,
+	return u_weave_panel_relative_origin(panel, mc->weave.win_x, mc->weave.win_y, lo->valid, lo->x, lo->y,
 	                                     lo->scale, out_x, out_y);
+}
+
+static enum u_weave_origin_source
+weave_panel_relative_origin(struct multi_compositor *mc, int32_t *out_x, int32_t *out_y)
+{
+	const struct u_weave_panel_frame panel = weave_panel_frame(mc);
+	return weave_panel_relative_origin_in(mc, &panel, out_x, out_y);
 }
 
 /*!
@@ -1623,21 +1642,28 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	if (!mc->weave.have_geometry || mc->weave.dp == NULL) {
 		return;
 	}
+	// One snapshot of the panel frame per submit: the value fed, the change
+	// test and the log line all describe the same frame.
+	const struct u_weave_panel_frame panel = weave_panel_frame(mc);
+	const bool panel_moved =
+	    mc->weave.have_panel_frame && !u_weave_panel_frame_equal(&mc->weave.panel_frame, &panel);
 	int32_t ox = 0, oy = 0;
-	const enum u_weave_origin_source src = weave_panel_relative_origin(mc, &ox, &oy);
+	const enum u_weave_origin_source src = weave_panel_relative_origin_in(mc, &panel, &ox, &oy);
 	const bool fed =
 	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)mc->weave.dp, ox, oy);
-	if (mc->weave.geometry_dirty) {
+	if (mc->weave.geometry_dirty || panel_moved || !mc->weave.have_panel_frame) {
 		mc->weave.geometry_dirty = false;
-		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		mc->weave.panel_frame = panel;
+		mc->weave.have_panel_frame = true;
 		U_LOG_W(
 		    "weave(#1699): present origin (%d,%d) panel-relative (from %s; window %d,%d, panel X11 origin "
-		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot",
-		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, info->display_screen_left,
-		    info->display_screen_top, info->display_desktop_width, info->display_desktop_height,
-		    info->display_desktop_native_width, info->display_desktop_native_height,
-		    (double)info->display_desktop_scale,
-		    fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)");
+		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot%s",
+		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, panel.screen_left,
+		    panel.screen_top, panel.desktop_w, panel.desktop_h, panel.native_w, panel.native_h, panel.scale,
+		    fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)",
+		    panel_moved ? " — the panel's desktop geometry changed under the bound window (live display-scale "
+		                  "/ arrangement change, #2251)"
+		                : "");
 	}
 }
 

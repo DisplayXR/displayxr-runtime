@@ -105,10 +105,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 		service_hotkey_linux.h
 		service_drm_hotplug_linux.c
 		service_drm_hotplug_linux.h
+		service_display_layout_linux.c
+		service_display_layout_linux.h
 	)
 	target_link_libraries(displayxr-service PRIVATE aux_os xrt-pthreads)
 	if(XRT_HAVE_DBUS)
-		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_DBUS)
+		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_DBUS SERVICE_HAVE_DBUS)
 		target_include_directories(displayxr-service SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
 		target_link_libraries(displayxr-service PRIVATE ${DBUS_LIBRARIES})
 	endif()

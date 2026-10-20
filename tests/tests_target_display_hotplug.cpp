@@ -378,6 +378,25 @@ TEST_CASE("hotplug screens: what counts as a change", "[target][hotplug]")
 	target_screens_change_format(&plugged, &claimed, line, sizeof(line));
 	CHECK(std::strstr(line, "claimant 'sim-display' -> 'leia-sr'") != nullptr);
 
+	// A live display-scale change (#2251): the same screen, same claimant,
+	// a new X11 extent and factor — a geometry change, so a new generation.
+	xrt_screen_list rescaled = claimed;
+	rescaled.screens[1].desktop_width = 5120;
+	rescaled.screens[1].desktop_height = 2880;
+	rescaled.screens[1].desktop_scale = 1.5f;
+	REQUIRE(target_screens_compare(&claimed, &rescaled, &c));
+	CHECK(c.geometry_changed == 1);
+	CHECK(c.added == 0);
+	CHECK(c.claimant_changed == 0);
+	char scale_line[512];
+	target_screens_change_format(&claimed, &rescaled, scale_line, sizeof(scale_line));
+	CHECK(std::strstr(scale_line, "1512,0 3840x1080 x2.00 -> 1512,0 5120x2880 x1.50") != nullptr);
+	// The factor alone (PHYSICAL layout: no pixel moves) still counts.
+	xrt_screen_list refactored = claimed;
+	refactored.screens[1].desktop_scale = 1.0f;
+	REQUIRE(target_screens_compare(&claimed, &refactored, &c));
+	CHECK(c.geometry_changed == 1);
+
 	// Rearranged: geometry.
 	xrt_screen_list moved = claimed;
 	moved.screens[1].desktop_left = -3840;

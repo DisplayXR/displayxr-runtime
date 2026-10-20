@@ -31,6 +31,7 @@
 #include "util/u_pacing.h"
 #include "util/comp_bg2d.h"
 #include "util/comp_target_service.h"
+#include "util/u_weave_present_origin.h"
 #include "multi/comp_multi_interface.h"
 
 // Vulkan types needed for Y-flip SBS image and display processor support
@@ -1053,6 +1054,12 @@ struct multi_compositor
 		int32_t win_display_id;
 		bool geometry_dirty; //!< Log the change once, not per frame.
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+		//! The panel frame (the system info's desktop description of the
+		//! panel) the present origin was last logged against. A live
+		//! display-scale / arrangement change re-resolves that info under the
+		//! running engine (#2251); a differing frame re-logs the origin.
+		struct u_weave_panel_frame panel_frame;
+		bool have_panel_frame;
 		//! v12 (browser-pvt#180): the caller's logical origin + scale, latched
 		//! verbatim with the device geometry above by the same bind (a bind
 		//! without one clears it).

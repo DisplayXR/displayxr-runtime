@@ -11,6 +11,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "service_drm_hotplug_linux.h"
+#include "service_display_layout_linux.h"
 
 #include <string>
 
@@ -96,4 +97,13 @@ TEST_CASE("Polling fallback: the status hash moves with any connector", "[servic
 	const char *n2[] = {"a"};
 	const char *s2[] = {"bc"};
 	CHECK(service_drm_status_hash(n1, s1, 1) != service_drm_status_hash(n2, s2, 1));
+}
+
+TEST_CASE("Layout feeder: only Mutter's MonitorsChanged is a layout change (#2251)", "[service][layout]")
+{
+	CHECK(service_display_layout_is_change_signal("org.gnome.Mutter.DisplayConfig", "MonitorsChanged"));
+	CHECK_FALSE(service_display_layout_is_change_signal("org.gnome.Mutter.DisplayConfig", "GetCurrentState"));
+	CHECK_FALSE(service_display_layout_is_change_signal("org.displayxr.WindowGeometry1", "MonitorsChanged"));
+	CHECK_FALSE(service_display_layout_is_change_signal(nullptr, "MonitorsChanged"));
+	CHECK_FALSE(service_display_layout_is_change_signal("org.gnome.Mutter.DisplayConfig", nullptr));
 }

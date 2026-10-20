@@ -80,6 +80,22 @@ struct u_weave_panel_frame
 	double scale;
 };
 
+/*!
+ * Do two panel frames describe the same desktop placement? The weave engine
+ * re-logs the present origin when the system info's frame changes under it —
+ * a live display-scale or arrangement change re-resolved by the service
+ * (#2251) — and must stay quiet on a re-probe that changed nothing (the 10 s
+ * fallback timer, #2020).
+ */
+static inline bool
+u_weave_panel_frame_equal(const struct u_weave_panel_frame *a, const struct u_weave_panel_frame *b)
+{
+	const double ds = a->scale - b->scale;
+	return a->screen_left == b->screen_left && a->screen_top == b->screen_top && a->desktop_w == b->desktop_w &&
+	       a->desktop_h == b->desktop_h && a->native_w == b->native_w && a->native_h == b->native_h && ds < 1e-4 &&
+	       ds > -1e-4;
+}
+
 //! Which rule produced the origin (for the log).
 enum u_weave_origin_source
 {
