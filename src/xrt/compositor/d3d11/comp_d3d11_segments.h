@@ -201,6 +201,17 @@ struct comp_d3d11_segments_frame
 	//! set_transparent_background's `client_presents`, like the session DP's.
 	//! False (zero-init) for a compositor that presents its own back buffer.
 	bool client_presents;
+	/*!
+	 * #2245 (ADR-047 Amendment 9): the OS monitors and their current refresh
+	 * rates (parallel arrays, 0 Hz = unknown). When set, every segment DP but
+	 * the primary's is handed its own screen's frame period through
+	 * set_frame_timing (residual 0 = unknown, the DP's heuristic) — the
+	 * screen is matched to a monitor by its centre. NULL (zero-init) feeds
+	 * segment DPs no timing, as before.
+	 */
+	const struct comp_segments_screen *rate_screens;
+	const float *rate_hz;
+	uint32_t rate_count;
 };
 
 /*!

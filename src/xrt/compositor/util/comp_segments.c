@@ -682,6 +682,60 @@ comp_segments_majority(const struct comp_segment_table *t)
 	return best;
 }
 
+float
+comp_segments_window_refresh_hz(const struct comp_seg_rect *window_desktop,
+                                const struct comp_segments_screen *screens,
+                                const float *screen_hz,
+                                uint32_t screen_count,
+                                float primary_hz,
+                                uint32_t *out_screen_index)
+{
+	if (out_screen_index != NULL) {
+		*out_screen_index = UINT32_MAX;
+	}
+	if (screen_hz == NULL) {
+		return primary_hz;
+	}
+	struct comp_segment_table t;
+	if (comp_segments_compute(window_desktop, NULL, screens, screen_count, &t) == 0) {
+		return primary_hz;
+	}
+	const uint32_t k = comp_segments_majority(&t);
+	if (k == UINT32_MAX) {
+		return primary_hz;
+	}
+	const uint32_t i = t.seg[k].screen_index;
+	if (out_screen_index != NULL) {
+		*out_screen_index = i;
+	}
+	if (t.seg[k].is_primary || screen_hz[i] <= 0.0f) {
+		return primary_hz;
+	}
+	return screen_hz[i];
+}
+
+float
+comp_segments_screen_refresh_hz(const struct comp_seg_rect *screen_desktop,
+                                const struct comp_segments_screen *screens,
+                                const float *screen_hz,
+                                uint32_t screen_count)
+{
+	if (screen_desktop == NULL || screens == NULL || screen_hz == NULL || screen_desktop->w == 0 ||
+	    screen_desktop->h == 0) {
+		return 0.0f;
+	}
+	const int64_t cx = (int64_t)screen_desktop->x + (int64_t)(screen_desktop->w / 2);
+	const int64_t cy = (int64_t)screen_desktop->y + (int64_t)(screen_desktop->h / 2);
+	for (uint32_t i = 0; i < screen_count; i++) {
+		const struct comp_seg_rect *d = &screens[i].desktop;
+		if (cx >= d->x && cx < (int64_t)d->x + (int64_t)d->w && cy >= d->y &&
+		    cy < (int64_t)d->y + (int64_t)d->h) {
+			return screen_hz[i] > 0.0f ? screen_hz[i] : 0.0f;
+		}
+	}
+	return 0.0f;
+}
+
 void
 comp_segments_owner_init(struct comp_segments_owner *o, uint64_t primary_id, uint64_t hold_ns, uint32_t margin_pct)
 {

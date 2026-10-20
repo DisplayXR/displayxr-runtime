@@ -1125,6 +1125,12 @@ struct d3d11_service_compositor
 	//! period and lands the presenter at half rate.
 	int64_t pace_deadline_ns;
 
+	//! #2245 (ADR-047 Amendment 9): the refresh rate this client is paced at —
+	//! its window's majority screen's (svc_client_update_screen_hz, its IPC
+	//! thread, once per commit); 0 = not evaluated yet = `sys->refresh_rate`.
+	//! Read by the render thread and predict / wait frame (svc_client_hz).
+	std::atomic<float> screen_hz{0.0f};
+
 	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
 	//! client's own claim). Set by the IPC server right after session create.
 	//! Used to match the OS foreground window to a client by PROCESS when no
@@ -9110,6 +9116,161 @@ compositor_end_session(struct xrt_compositor *xc)
 	return XRT_SUCCESS;
 }
 
+/*
+ *
+ * #2245 (ADR-047 Amendment 9, phase A): a window's frame period is its screen's.
+ *
+ * `sys->refresh_rate` is the OS primary monitor's current rate, read once at
+ * create. A window on another monitor at another rate was paced at it anyway:
+ * the commit backpressure, the predicted display period and the period handed
+ * to the display processor all came from the primary. The rates of every OS
+ * monitor are cached here (EnumDisplayMonitors + EnumDisplaySettingsW, current
+ * mode) and dropped on the display re-probe (WM_DISPLAYCHANGE ->
+ * comp_d3d11_service_refresh_segment_screens), which a rate-only mode change
+ * also raises. A window wholly on the primary keeps `sys->refresh_rate` itself,
+ * not a re-read (comp_segments_window_refresh_hz).
+ *
+ */
+
+struct svc_screen_rates
+{
+	std::mutex mutex;
+	bool valid = false;
+	uint32_t count = 0;
+	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS] = {};
+	float hz[COMP_SEGMENTS_MAX_SCREENS] = {};
+};
+
+static svc_screen_rates g_svc_screen_rates;
+
+static BOOL CALLBACK
+svc_screen_rates_enum_cb(HMONITOR mon, HDC hdc, LPRECT rect, LPARAM lp)
+{
+	(void)hdc;
+	(void)rect;
+	auto *r = reinterpret_cast<svc_screen_rates *>(lp);
+	if (r->count >= COMP_SEGMENTS_MAX_SCREENS) {
+		return FALSE;
+	}
+	MONITORINFOEXW mi;
+	memset(&mi, 0, sizeof(mi));
+	mi.cbSize = sizeof(mi);
+	if (!GetMonitorInfoW(mon, (MONITORINFO *)&mi) || mi.rcMonitor.right <= mi.rcMonitor.left ||
+	    mi.rcMonitor.bottom <= mi.rcMonitor.top) {
+		return TRUE;
+	}
+	struct comp_segments_screen *sc = &r->screens[r->count];
+	memset(sc, 0, sizeof(*sc));
+	sc->id = (uint64_t)(uintptr_t)mon; // only ever compared and logged; never 0
+	sc->desktop.x = mi.rcMonitor.left;
+	sc->desktop.y = mi.rcMonitor.top;
+	sc->desktop.w = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
+	sc->desktop.h = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+	sc->is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+	DEVMODEW dm;
+	memset(&dm, 0, sizeof(dm));
+	dm.dmSize = sizeof(dm);
+	// dmDisplayFrequency 0 / 1 = "hardware default": unknown, as in
+	// comp_display_refresh_hz_win.
+	r->hz[r->count] = (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+	                      ? (float)dm.dmDisplayFrequency
+	                      : 0.0f;
+	r->count++;
+	return TRUE;
+}
+
+//! Caller holds g_svc_screen_rates.mutex.
+static void
+svc_screen_rates_ensure_locked(void)
+{
+	svc_screen_rates &r = g_svc_screen_rates;
+	if (r.valid) {
+		return;
+	}
+	r.count = 0;
+	(void)EnumDisplayMonitors(nullptr, nullptr, svc_screen_rates_enum_cb, (LPARAM)&r);
+	r.valid = true; // an empty answer is cached too: every window then keeps today's period
+}
+
+//! The display re-probe: re-read every monitor's rate on next use.
+static void
+svc_screen_rates_invalidate(void)
+{
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	g_svc_screen_rates.valid = false;
+}
+
+//! A copy of the monitors and their rates (for a segment frame). Returns the count.
+static uint32_t
+svc_screen_rates_copy(struct comp_segments_screen *out_screens, float *out_hz)
+{
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	svc_screen_rates_ensure_locked();
+	const uint32_t n = g_svc_screen_rates.count;
+	memcpy(out_screens, g_svc_screen_rates.screens, sizeof(out_screens[0]) * n);
+	memcpy(out_hz, g_svc_screen_rates.hz, sizeof(out_hz[0]) * n);
+	return n;
+}
+
+// Defined with the segment path.
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out);
+
+//! The rate a window is paced at: its majority screen's; `sys->refresh_rate`
+//! when that is the primary, unknown, or the window cannot be read.
+static float
+svc_window_refresh_hz(struct d3d11_service_system *sys, HWND hwnd, uint64_t *out_monitor)
+{
+	*out_monitor = 0;
+	struct comp_seg_rect win = {};
+	if (hwnd == nullptr || !svc_seg_window_rect(hwnd, &win)) {
+		return sys->refresh_rate;
+	}
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	svc_screen_rates_ensure_locked();
+	uint32_t idx = UINT32_MAX;
+	const float hz = comp_segments_window_refresh_hz(&win, g_svc_screen_rates.screens, g_svc_screen_rates.hz,
+	                                                 g_svc_screen_rates.count, sys->refresh_rate, &idx);
+	if (idx != UINT32_MAX) {
+		*out_monitor = g_svc_screen_rates.screens[idx].id;
+	}
+	return hz;
+}
+
+//! The rate this client is paced at (any thread).
+static inline float
+svc_client_hz(const struct d3d11_service_compositor *c)
+{
+	const float hz = c->screen_hz.load(std::memory_order_relaxed);
+	return hz > 0.0f ? hz : c->sys->refresh_rate;
+}
+
+/*!
+ * Re-evaluate the client's rate from where its window is now. The client's IPC
+ * thread, once per commit (the writer of `c->render.hwnd`). Only an app-owned
+ * window on the direct pipeline can sit on another screen; everything else (the
+ * service window, a client texture, the workspace) keeps the primary's rate.
+ * One WARN per change, never per frame.
+ */
+static float
+svc_client_update_screen_hz(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	float hz = sys->refresh_rate;
+	uint64_t mon = 0;
+	if (!sys->workspace_mode && c->presenter == PRESENTER_APP_HWND) {
+		hz = svc_window_refresh_hz(sys, c->render.hwnd, &mon);
+	}
+	const float stored = c->screen_hz.exchange(hz, std::memory_order_relaxed);
+	const float was = stored > 0.0f ? stored : sys->refresh_rate;
+	if (hz != was) {
+		U_LOG_W(
+		    "pipeline: client %p (pid %ld) paced at %.2f Hz from screen 0x%llx (was %.2f) — its window's "
+		    "majority screen (ADR-047 Amendment 9)",
+		    (void *)c, c->client_pid, hz, (unsigned long long)mon, was);
+	}
+	return hz;
+}
+
 // Per-client frame-rate cap (spec_version 14, xrSetWorkspaceClientFrameRateCapDXR).
 //
 // Reads the controller-supplied cap for this compositor's slot and converts it
@@ -9190,7 +9351,8 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	*out_frame_id = c->frame_id;
 
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+	// #2245: the period of the screen the client's window is on.
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / svc_client_hz(c));
 
 	// IPC clients drive xrWaitFrame entirely via predict_frame's out_wake_time_ns
 	// (see ipc_client_compositor.c:ipc_compositor_wait_frame — client sleeps
@@ -9239,7 +9401,7 @@ compositor_wait_frame(struct xrt_compositor *xc,
 	*out_frame_id = c->frame_id;
 
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / svc_client_hz(c)); // #2245
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
@@ -14830,6 +14992,12 @@ pipeline_segments_weave(struct d3d11_service_system *sys,
 	sf.atlas_encoding = (int)service_single_client_atlas_encoding(fc);
 	sf.primary_dp = dp;
 	sf.outcomp = fc->seg_outcomp;
+	// #2245: every segment DP paced at its own screen's period.
+	struct comp_segments_screen rate_screens[COMP_SEGMENTS_MAX_SCREENS];
+	float rate_hz[COMP_SEGMENTS_MAX_SCREENS];
+	sf.rate_count = svc_screen_rates_copy(rate_screens, rate_hz);
+	sf.rate_screens = rate_screens;
+	sf.rate_hz = rate_hz;
 	comp_d3d11_segments_record(fc->segments, &sf);
 
 	// Leave exactly the state the single-DP path leaves: the back buffer
@@ -15342,8 +15510,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			QueryPerformanceCounter(&pq);
 			mc->panel_r_qpc = (uint64_t)pq.QuadPart;
 		}
-		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
-		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		/*
+		 * #2245 (ADR-047 Amendment 9): an app window is paced at its majority
+		 * screen's period. A client that segments keeps the primary's: its
+		 * session DP then weaves only the primary screen's segment, and each
+		 * segment DP is handed its own screen's (pipeline_segments_weave).
+		 */
+		const bool dp_weaves_window = kind == PRESENTER_APP_HWND &&
+		                              !(fc->segments != nullptr && comp_d3d11_segments_enabled(fc->segments));
+		const float dp_hz = dp_weaves_window ? svc_client_hz(fc) : sys->refresh_rate;
+		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns, (uint64_t)(U_TIME_1S_IN_NS / dp_hz));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
 		// Multi-screen M6 (ADR-047 Amendment 3): a window across a seam is
 		// woven per screen; anything else (and every client that never
@@ -26305,7 +26481,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		 * client) so we never try to "catch up" by not sleeping at all for a
 		 * burst of frames.
 		 */
-		const int64_t pace_period_ns = (int64_t)(1e9 / (sys->refresh_rate > 0.0f ? sys->refresh_rate : 60.0f));
+		// #2245: the period of the screen the client's window is on (the
+		// primary's, byte for byte, while it is on the primary).
+		const float pace_hz = svc_client_update_screen_hz(sys, c);
+		const int64_t pace_period_ns = (int64_t)(1e9 / (pace_hz > 0.0f ? pace_hz : 60.0f));
 		// DXR_COMMIT_PACE=0 turns the backpressure off (A/B lever, and the
 		// escape hatch if a client turns out to need to run free).
 		static int pace_on = -1;
@@ -34784,6 +34963,10 @@ comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, 
 		return;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// #2245: a display change (a rate-only mode change included) re-reads
+	// every monitor's refresh rate on next use.
+	svc_screen_rates_invalidate();
 
 	// Lifetime: a compositor found in all_clients under clients_mutex stays
 	// whole (compositor_destroy leaves the list first). seg_mutex is a leaf.

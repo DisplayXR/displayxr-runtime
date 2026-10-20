@@ -695,6 +695,45 @@ uint32_t
 comp_segments_majority(const struct comp_segment_table *t);
 
 /*!
+ * #2245 (ADR-047 Amendment 9): the refresh rate a window is paced at — that of
+ * the screen holding most of it (@ref comp_segments_majority over
+ * @ref comp_segments_compute, so the same screen a single view set is framed
+ * from and the same tie rule).
+ *
+ * @p primary_hz is returned whenever the answer would be the primary screen's,
+ * or is unknown: the window is on no screen, its majority screen is the
+ * primary, or that screen's rate is not known (<= 0). The caller passes the
+ * period it uses today, so a window on the primary screen keeps exactly that
+ * value rather than a re-read of the same monitor.
+ *
+ * @param window_desktop  The window's client area in desktop coordinates.
+ * @param screens         The screens (desktop rect + primary flag are read).
+ * @param screen_hz       Parallel to @p screens: each one's current refresh rate, 0 = unknown.
+ * @param screen_count    Number of screens.
+ * @param primary_hz      The primary screen's period-defining rate (today's value).
+ * @param[out] out_screen_index  Optional: the majority screen's index into
+ *                        @p screens, UINT32_MAX when the window is on none.
+ */
+float
+comp_segments_window_refresh_hz(const struct comp_seg_rect *window_desktop,
+                                const struct comp_segments_screen *screens,
+                                const float *screen_hz,
+                                uint32_t screen_count,
+                                float primary_hz,
+                                uint32_t *out_screen_index);
+
+/*!
+ * #2245: the refresh rate of the screen in @p screens whose desktop rect holds
+ * the centre of @p screen_desktop — how a registry screen (a segment's) finds
+ * its OS monitor's rate. 0 when none holds it or its rate is unknown.
+ */
+float
+comp_segments_screen_refresh_hz(const struct comp_seg_rect *screen_desktop,
+                                const struct comp_segments_screen *screens,
+                                const float *screen_hz,
+                                uint32_t screen_count);
+
+/*!
  * Which screen's display processor holds the window's real handle (the
  * vendor's drag phase-snap and window-scoped behaviour follow it). Every other
  * segment's DP is windowless and is phased by `set_present_origin`.

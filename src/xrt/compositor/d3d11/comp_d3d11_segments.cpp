@@ -1060,6 +1060,17 @@ comp_d3d11_segments_record(struct comp_d3d11_segments *segs, const struct comp_d
 					st->mode_sent = (int)segs->mode_3d;
 					xrt_display_processor_d3d11_request_display_mode(dp, segs->mode_3d);
 				}
+				// #2245: this screen's frame period, not the primary's.
+				if (f->rate_screens != nullptr && f->rate_hz != nullptr &&
+				    g->screen_index < segs->screen_count) {
+					const float hz =
+					    comp_segments_screen_refresh_hz(&segs->screens[g->screen_index].desktop,
+					                                    f->rate_screens, f->rate_hz, f->rate_count);
+					if (hz > 0.0f) {
+						xrt_display_processor_d3d11_set_frame_timing(
+						    dp, 0, (uint64_t)((double)U_TIME_1S_IN_NS / (double)hz));
+					}
+				}
 				// Phase only where window px ARE device px; a resampled
 				// screen's origin is in the wrong units (and only a
 				// resample-tolerant DP weaves there, which has no phase).

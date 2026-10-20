@@ -478,7 +478,7 @@ generation is not forwarded to clients (macOS IPC sessions do not segment). Deta
 
 ## Amendment 9 (2026-10-20): a screen's frame period and scanout adapter are its own
 
-**Status: plan (#2245; #2218 audit items 17 and 18).**
+**Status: plan; phase A implemented for the D3D11 service (#2245; #2218 audit items 17 and 18).**
 
 Decision 2 gave every segment its own DP, eyes and frustum, but two values are still decided once,
 from the OS primary screen, and handed to every window and every segment: the **frame period** and
