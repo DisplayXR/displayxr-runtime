@@ -677,7 +677,7 @@ gp_cap_close_request(struct gnome_portal *p)
  */
 
 static void
-revoke(struct gnome_portal *p)
+cap_revoke(struct gnome_portal *p)
 {
 	pthread_mutex_lock(&p->lock);
 	p->have_token = false;
@@ -785,7 +785,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 			gp_set_msg(msg, "no answer to the screen-sharing dialog");
 			return U_DESKTOP_ERR_TIMEOUT;
 		}
-		revoke(p);
+		cap_revoke(p);
 		gp_set_msg(msg, "the portal did not restore screen sharing silently (grant gone?) — request access again");
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
@@ -793,7 +793,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 		gp_set_msg(msg, p->resp_code == 1 ? "the user declined screen sharing" : "the portal refused the session");
 		gp_session_close(p);
 		if (!interactive) {
-			revoke(p);
+			cap_revoke(p);
 		}
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
@@ -948,7 +948,7 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 			return r;
 		}
 		if (cp->nstreams == 0) {
-			revoke(p);
+			cap_revoke(p);
 			gp_session_close(p);
 			gp_set_msg(c->msg, "the portal restored no screen — request access again");
 			return U_DESKTOP_ERR_NOT_GRANTED;
