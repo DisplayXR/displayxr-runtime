@@ -174,6 +174,12 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
 
 ## D-Bus surface
 
+**Rule: other apps' windows are read-only here.** Every member that changes a
+window acts on the caller's own window only, and no member that controls
+another app's window will be added — not even behind a flag. An app that must
+act on other windows uses `XR_DXR_desktop_control` (ADR-056), which asks the
+user through the RemoteDesktop portal. See the spec, §12.4.
+
 - Service `org.displayxr.WindowGeometry`, object
   `/org/displayxr/WindowGeometry`, interface `org.displayxr.WindowGeometry1`.
 - `GetWindows() -> (s)`: JSON snapshot of all normal windows.

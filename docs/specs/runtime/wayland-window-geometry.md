@@ -1582,3 +1582,38 @@ Pointer driven through that instance's `org.gnome.Mutter.RemoteDesktop`:
   unit-tested); the top bar: `over: shell`; a point on no monitor: `outside`;
 - a click-through window (empty input region) on top: the window behind it is
   reported, and a real click at the same point is received by that window behind.
+
+### 12.4 The rule: read-only for other apps' windows
+
+The extension reads other apps' windows and never changes them. This is a rule for
+every future version, not only a description of this one.
+
+- **Reading** other apps' windows: `GetWindows`, `WindowsChanged`, `GetAllWindows`,
+  `GetPointer`, `GetWindowAt`. They report; nothing else.
+- **Changing** a window: `MoveWindow` and the drag members (§7–§9),
+  `CaptureExclusion1` (§6), `SetKeepAbove` / `ActivateWindow` / `SetMinimized` (§11).
+  Each acts only on the caller's own window, found by the caller's PID from the bus
+  daemon; an argument can name only the caller.
+- **Never added:** a member that moves, resizes, raises, focuses, minimizes,
+  maximizes, closes, hides or restacks another process's window, excludes it from
+  capture, or sends it input — not behind a flag, an allow-list or a setting either.
+  A reviewer's test: a new member that takes another window's id, a point or a title
+  and changes something there is out of scope.
+
+**Why.** The extension ships enabled with every DisplayXR install and answers every
+process of the user on the session bus. A member that controlled other windows would
+let any program the user runs drive any window, and GNOME would never ask the user:
+the question the RemoteDesktop portal asks ("may this app control your computer?")
+would be skipped for every app at once. ADR-056 ("Why DisplayXR must not just 'do
+it' in a shared component", D5) has the full argument.
+
+**Where it goes instead.** An app that must act on other apps' windows uses
+`XR_DXR_desktop_control` (ADR-056). The runtime, inside the app's own process, gets
+the user's consent through the RemoteDesktop portal, sends input through libei, and
+moves other windows the way the user would (Super gestures, the user's shortcuts),
+with the kill switch, the lock-screen pause and the audit log. It reads the results
+back through the read-only members above.
+
+**Changing the rule takes an ADR first.** The one open candidate is ADR-056 open
+question 1: a primitive gated on proof that the caller holds an approved
+RemoteDesktop session, which mutter cannot give today.
