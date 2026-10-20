@@ -475,3 +475,121 @@ Vulkan manager's `set_screens` are in place. Both: `DXR_DISPLAY_HOTPLUG=1` runs 
 there. The service / IPC path: the service's own registry is rebuilt by the sweep, but the
 generation is not forwarded to clients (macOS IPC sessions do not segment). Detail:
 `docs/architecture/comp-segments.md` § *Display hotplug*.
+
+## Amendment 9 (2026-10-20): a screen's frame period and scanout adapter are its own
+
+**Status: plan (#2245; #2218 audit items 17 and 18).**
+
+Decision 2 gave every segment its own DP, eyes and frustum, but two values are still decided once,
+from the OS primary screen, and handed to every window and every segment: the **frame period** and
+the **output (scanout) adapter** of the #918 split. On a hybrid box where the panel is scanned out
+by one adapter at 60 Hz and a second monitor by the other adapter at a higher rate, a window wholly
+on the second monitor is paced at the panel's period and woven and presented on the panel's
+adapter, crossing adapters twice per frame (render → output adapter → the monitor's own adapter),
+and DWM composes its present instead of flipping it (#2245 has the measurement).
+
+### Today (main `5f81bdccd`; the quoted code is the anchor when lines drift)
+
+*The period.*
+
+- `compositor/util/comp_display_refresh_win.h:41-79` — `comp_display_refresh_hz_win(hwnd)` reads
+  `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` for the monitor holding `hwnd`; `NULL` resolves
+  `MonitorFromPoint({0,0}, MONITOR_DEFAULTTOPRIMARY)`.
+- `d3d11_service/comp_d3d11_service.cpp:32478-32486` — the service calls it with `NULL` once, in
+  `create_system`, into `sys->refresh_rate` ("Display refresh rate: … Hz"). Nothing re-reads it.
+- That one number is the period of every client and every DP: the direct pipeline's
+  `set_frame_timing` (`:15313-15314`), the compose path's (`:20187-20188`), the
+  `CLIENT_TEXTURE` weave's (`:22635-22636`), the legacy per-client weave's (`:26554-26556`), the
+  IPC commit backpressure's absolute deadline (`pace_period_ns`, `:26260`), and the predicted
+  display period / time that `compositor_predict_frame` and `compositor_wait_frame` return to the
+  client (`:9193`, `:9232`, `:9242`) — the horizon the client predicts its poses for.
+- Segment DPs are never handed a period at all: `comp_d3d11_segments_record`
+  (`d3d11/comp_d3d11_segments.cpp:775`) feeds them encoding, transparency, mode and phase, and
+  leaves timing at the DP's default.
+- The direct pipeline's render loop does **not** pace on the period: with an `APP_HWND` presenter
+  it waits on that presenter's own frame-latency waitable (`capture_render_thread_func`,
+  `:10597-10624`), so it follows whatever the presenting chain is allowed to flip at.
+- In-process: `display_refresh_rate` is read once at compositor create from the window's monitor
+  (`d3d11/comp_d3d11_compositor.cpp:5790-5796`, `d3d12/comp_d3d12_compositor.cpp:7088-7094`,
+  `vk_native/comp_vk_native_compositor.c:13890-13895`), so a window created on the panel and then
+  moved keeps the panel's period.
+
+*The adapter.*
+
+- `service_split_stage_a` (`comp_d3d11_service.cpp:2697`) resolves the scanout adapter with
+  `getScanoutAdapter(panel_left, panel_top, …)` (`:2746`) where the origin is still the pre-DP
+  `0,0`, i.e. the OS primary monitor — in its own words (`:2717-2727`), "If the service ever drives
+  a non-primary panel this has to move". The verdict and the one output device are latched for the
+  process (`sys->split_available`; `svc_out_device()` at `:2471-2474`); the ingest adapter is
+  resolved from the same origin (`:32520-32533`).
+- The service's segment managers are created on that output device (`pipeline_segments_weave`,
+  `:14714` / `:14728`), so every segment DP — whatever adapter scans its screen out — weaves on the
+  panel's adapter: Amendment 1's rule, "a segment DP lives on the device that presents", applied
+  with one presenting device per process. The #918 egress ring (`sys->xbridge`, allocated
+  worst-case at `:2854`) is likewise one ring, render → that adapter.
+- The workspace's per-screen presenters (`svc_ws_presenter`, `:19197`, ADR-052) create their chain
+  on the render device (`:19380`) and their DP through `create_dp_d3d11_for_screen` (`:19481`).
+- In-process #918 Stage A resolves the scanout adapter from the session's display rect the same way
+  (`d3d11/comp_d3d11_compositor.cpp:5408`, `d3d12/comp_d3d12_compositor.cpp:2164`,
+  `vk_native/comp_vk_native_split.cpp:1032`) and creates the segment managers on that output device
+  (`comp_d3d11_compositor.cpp:2893`, `comp_d3d12_compositor.cpp:4038`,
+  `comp_vk_native_split.cpp:831`).
+
+### Rule
+
+1. **The frame period of a window is its screen's.** A window's period is the current refresh
+   rate of the screen holding most of it (`comp_segments_majority`'s rule: largest area, an exact
+   tie to the primary). A segment DP is handed its own screen's period; a per-screen presenter
+   paces at its screen's. A window straddling two screens at two rates is paced at the majority
+   screen's period; each segment DP still learns its own screen's period for its eye predictor.
+2. **A screen's output adapter is the adapter that scans it out.** A segment DP and a per-screen
+   presenter for a screen are created on that screen's scanout adapter — the monitor → adapter LUID
+   mapping (`IDXGIOutput` / `DISPLAYCONFIG`) that Stage A already derives for the primary. A window
+   wholly on a screen scanned out by the render adapter renders, weaves and presents there with no
+   crossing; a straddling window pays a crossing only for the segment whose screen is on the other
+   adapter.
+3. **The primary screen is unchanged byte for byte.** A window wholly on the primary screen gets
+   exactly today's period (the value read at create, not a re-read), device, egress ring and DP.
+4. **Rates are read from the OS, cached, and re-read on a display change.** The cache is dropped on
+   the service's display re-probe (`WM_DISPLAYCHANGE` → `ipc_server_request_display_reprobe` →
+   `comp_d3d11_service_refresh_segment_screens`), which also covers a rate-only mode change.
+
+### Phases
+
+- **Phase A — per-screen frame period (D3D11 service: direct pipeline and segment DPs).** The
+  period handed to the session DP, the commit backpressure and the predicted display period follow
+  the window's majority screen; each segment DP gets `set_frame_timing` with its own screen's
+  period and an unknown residual (0, the DP's heuristic — the residual measured on the presenting
+  chain describes the primary's scanout, not that screen's). A client that segments keeps the
+  primary's period on the session DP, because under segmentation the session DP weaves only the
+  primary screen's segment. The render loop and the egress ring are untouched — the loop already
+  paces on the presenting chain's waitable — so this phase is separable from B. *Risk:* low. Until
+  B the presenting chain still lives on the primary's adapter, so a client paced faster than that
+  chain can flip has frames composed away by DWM; the render side stays bounded by the chain's
+  waitable. A window whose rect cannot be read falls back to the primary's period, i.e. today.
+- **Phase B — per-screen output adapter (service segment DPs and per-screen presenters).** The
+  output side becomes per adapter: one output device, egress ring and fence set per scanout adapter
+  in use, created on demand and released with the last segment on it; a segment manager keyed by
+  (screen, adapter) creates each segment DP on its screen's adapter and crops from that adapter's
+  egress slot; a segment on the render adapter crops the render-side atlas directly (no ring). The
+  presenter for a window wholly on the render adapter's screen moves its chain to the render device.
+  *Risk:* high — resource ownership moves: the atlas crop, the zones mask, the Local2D backdrop and
+  the flat-2D unit each need a copy (or a source) on every adapter that weaves; the HWND hand-off
+  (Amendment 2) now swaps a DP across devices; the latched `split_available` verdict becomes per
+  adapter, and every `svc_assert_same_device(…, svc_out_device(sys))` site has to name which output
+  device it means. Needs the two-adapter box for every step.
+- **Phase C — the in-process compositors.** The same two rules for the in-process D3D11, D3D12 and
+  Vulkan (split) compositors: the period re-evaluated from the window's majority screen when it
+  moves, and Stage A's output device chosen per screen (B's per-adapter output side, in process).
+  The measurement in #2245 is an in-process D3D11 app, so it is this phase, not A, that changes it.
+  *Risk:* medium for the period (one value per compositor today, read in the DP handoff and the
+  frame predictor), high for the adapter (each compositor's split owns its own bridge and repaint
+  path).
+
+### Out of scope
+
+Linux and macOS (one adapter per desktop on the shipping configurations; their compositors read the
+period from their own surface); a window straddling two adapters at two rates beyond rule 1's
+"the majority screen's period" — it is not paced per segment; variable-refresh pacing; the workspace
+compose path's presenter set (ADR-052), whose period follows once B gives each presenter its
+screen; the `CLIENT_TEXTURE` and legacy per-client weaves, which keep the primary's period.
