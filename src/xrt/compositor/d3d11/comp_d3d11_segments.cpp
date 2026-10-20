@@ -58,6 +58,12 @@ struct seg_screen_state
 	bool tolerates_resample;
 	bool has_hwnd; //!< this DP holds the session's window (the owner).
 	struct seg_crop crop;
+	//! #2218 (#4): the zone mask cropped to this segment, and whether this DP
+	//! currently holds a publish; zone_caps 0 = unqueried, 1 = supported, 2 = no.
+	struct seg_crop mask_crop;
+	bool zone_published;
+	int zone_caps;
+	uint64_t zone_seq_sent;
 };
 
 struct comp_d3d11_segments
@@ -203,6 +209,11 @@ dp_release(struct comp_d3d11_segments *segs, uint32_t i)
 	st->tolerates_resample = false;
 	st->has_hwnd = false;
 	crop_destroy(&st->crop);
+	// #2218 (#4): the DP is gone, and with it its publish.
+	crop_destroy(&st->mask_crop);
+	st->zone_published = false;
+	st->zone_caps = 0;
+	st->zone_seq_sent = 0;
 }
 
 /*!
@@ -678,6 +689,135 @@ comp_d3d11_segments_set_hwnd_hooks(struct comp_d3d11_segments *segs, const struc
 		return;
 	}
 	segs->hooks = *hooks;
+}
+
+/*
+ *
+ * #2218 (#4): the zone mask, per screen.
+ *
+ */
+
+static bool
+seg_dp_supports_zones(struct seg_screen_state *st)
+{
+	if (st->dp == nullptr) {
+		return false;
+	}
+	if (st->zone_caps == 0) {
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		const bool ok = xrt_display_processor_d3d11_get_local_zone_caps(st->dp, &caps);
+		st->zone_caps = (ok && caps.supported != 0) ? 1 : 2;
+	}
+	return st->zone_caps == 1;
+}
+
+extern "C" void
+comp_d3d11_segments_publish_zone_mask(struct comp_d3d11_segments *segs,
+                                      void *d3d11_context,
+                                      void *mask_srv,
+                                      uint32_t mask_w,
+                                      uint32_t mask_h,
+                                      uint32_t win_w,
+                                      uint32_t win_h,
+                                      uint64_t seq)
+{
+	if (segs == nullptr || !segs->enabled) {
+		return;
+	}
+	auto *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(mask_srv);
+	if (ctx == nullptr || srv == nullptr || mask_w == 0 || mask_h == 0 || win_w == 0 || win_h == 0) {
+		comp_d3d11_segments_clear_zone_mask(segs);
+		return;
+	}
+	ID3D11Resource *mask_res = nullptr;
+	srv->GetResource(&mask_res);
+	if (mask_res == nullptr) {
+		return;
+	}
+	const struct comp_segment_table *t = &segs->table;
+	bool in_table[COMP_SEGMENTS_MAX_SCREENS] = {};
+	for (uint32_t k = 0; k < t->count; k++) {
+		const struct comp_segment *g = &t->seg[k];
+		const int i = (int)g->screen_index;
+		if (i < 0 || (uint32_t)i >= segs->screen_count) {
+			continue;
+		}
+		struct seg_screen_state *st = &segs->st[i];
+		// The session's own DP (the primary, or the window's owner after an
+		// Amendment-2 swap) is published by the compositor itself.
+		if (g->is_primary || st->has_hwnd || st->dp == nullptr) {
+			continue;
+		}
+		in_table[i] = true;
+		if (!seg_dp_supports_zones(st)) {
+			continue;
+		}
+		struct comp_seg_rect mr;
+		if (!comp_segments_mask_crop_rect(&g->window_rect, win_w, win_h, mask_w, mask_h, &mr)) {
+			continue;
+		}
+		if (!crop_ensure(segs->device, &st->mask_crop, mr.w, mr.h, DXGI_FORMAT_R8_UNORM)) {
+			continue;
+		}
+		D3D11_BOX box = {};
+		box.left = (UINT)mr.x;
+		box.top = (UINT)mr.y;
+		box.right = (UINT)(mr.x + (int32_t)mr.w);
+		box.bottom = (UINT)(mr.y + (int32_t)mr.h);
+		box.front = 0;
+		box.back = 1;
+		ctx->CopySubresourceRegion(st->mask_crop.texture, 0, 0, 0, 0, mask_res, 0, &box);
+		// One generation per (content, crop): the vendor evaluates the content
+		// once per generation and ignores the anchor, so a crop that moved
+		// must look like new content to it.
+		const uint64_t gen = seq * 1000003ull ^ ((uint64_t)(uint32_t)mr.x << 1) ^ ((uint64_t)(uint32_t)mr.y << 17) ^
+		                     ((uint64_t)mr.w << 33) ^ ((uint64_t)mr.h << 49);
+		const bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
+		    st->dp, ctx, st->mask_crop.srv, mr.w, mr.h, g->screen_rect.x, g->screen_rect.y, g->screen_rect.w,
+		    g->screen_rect.h, gen);
+		if (ok) {
+			if (!st->zone_published) {
+				// Lifecycle (first publish to this DP); later generations at INFO.
+				U_LOG_W("segments: zone mask now published to the segment DP of screen 0x%016llx — %ux%u of "
+				        "%ux%u mask px, gen %llu (#2218 #4)",
+				        (unsigned long long)segs->screens[i].id, mr.w, mr.h, mask_w, mask_h,
+				        (unsigned long long)gen);
+			} else if (st->zone_seq_sent != gen) {
+				U_LOG_I("segments: zone mask re-published to screen 0x%016llx — %ux%u, gen %llu",
+				        (unsigned long long)segs->screens[i].id, mr.w, mr.h, (unsigned long long)gen);
+			}
+			st->zone_published = true;
+			st->zone_seq_sent = gen;
+		}
+	}
+	mask_res->Release();
+	// A screen the window has left keeps no stale wish.
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		struct seg_screen_state *st = &segs->st[i];
+		if (!in_table[i] && st->zone_published && st->dp != nullptr) {
+			xrt_display_processor_d3d11_clear_local_zone_mask(st->dp);
+			st->zone_published = false;
+			st->zone_seq_sent = 0;
+		}
+	}
+}
+
+extern "C" void
+comp_d3d11_segments_clear_zone_mask(struct comp_d3d11_segments *segs)
+{
+	if (segs == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < segs->screen_count; i++) {
+		struct seg_screen_state *st = &segs->st[i];
+		if (st->zone_published && st->dp != nullptr) {
+			xrt_display_processor_d3d11_clear_local_zone_mask(st->dp);
+		}
+		st->zone_published = false;
+		st->zone_seq_sent = 0;
+	}
 }
 
 extern "C" bool
