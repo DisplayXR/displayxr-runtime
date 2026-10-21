@@ -25,7 +25,7 @@
  *    on SelectSources (decision 1); in a combined session persistence stays on
  *    SelectDevices, as the portal spec requires.
  * The token and this shape (which portal, input, screens, the covered monitors)
- * are saved per registered app id for the next launch (spec §6.4,
+ * are saved per app (its app id, or its executable) for the next launch (spec §6.4,
  * u_desktop_gnome_grant.h), so a new process restores exactly the same shape.
  *
  * ## Frames

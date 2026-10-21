@@ -36,21 +36,20 @@ If the extension is older, install it from `contrib/gnome-shell/window-geometry@
 into `~/.local/share/gnome-shell/extensions/`, then **log out and in** (Wayland cannot restart
 the shell in place).
 
-Optional, to see portal attribution / persistence by app id (xdg-desktop-portal >= 1.19):
+Optional, to have the dialog name the app (xdg-desktop-portal >= 1.19) and to keep each run's state private:
 
 ```bash
-export DXR_DESKTOP_APP_ID=org.displayxr.SmokeTest   # else: "no app id" WARN, the grant is not saved across runs
+export DXR_DESKTOP_APP_ID=org.displayxr.SmokeTest   # else: "no app id" WARN; the grant is kept per executable
 export DXR_DESKTOP_CONTROL_DIR=/tmp/dc-smoke        # a private store / audit / saved-grant dir for the run
-# The portal accepts an app id only with an installed .desktop file ("App info not found" otherwise):
+# The portal registers an app id only with an installed .desktop file ("App info not found" otherwise);
+# without it the grant is still kept (under the id), the dialog just names no app:
 printf '[Desktop Entry]\nType=Application\nName=SmokeTest\nExec=/bin/true\nNoDisplay=true\n' \
     > ~/.local/share/applications/org.displayxr.SmokeTest.desktop
 ```
 
-**One grant per process — unless an app id is registered.** Without `DXR_DESKTOP_APP_ID` (or a
-`.desktop` launch) the restore token lives in the process's memory only and a new process asks
-again. With one, the grant is saved per app id (spec §6.4) and the next process restores it
-without the dialog: §7a tests that; for the sections below either works. Run every input /
-window-op section below in **one** smoke process with `script` mode, starting with `request`
+**One grant per app.** The grant is saved per app (spec §6.4): its registered app id, else
+`DXR_DESKTOP_APP_ID`, else the executable — so a new smoke process restores it without the dialog
+when started the same way (§7a). Run every input / window-op section below in **one** smoke process with `script` mode, starting with `request`
 (answer the dialog with "Share"):
 
 ```bash
@@ -246,33 +245,36 @@ $SMOKE request
 - Revoke the permission (Settings → Apps → the app, or `flatpak permission-reset`), act → the
   first action returns `not-granted` within ~5 s (`did not restore the session silently`), the
   next ones at once.
-- Restart the app **without an app id** → the dialog comes back once (nothing is saved:
-  `no app id … the grant is not saved across runs`). With `DXR_DESKTOP_APP_ID` registered on
-  xdg-desktop-portal >= 1.19 the dialog names that app, and the grant is saved: §7a.
+- Restart the app → **no dialog** (the saved grant, §7a), with or without an app id. With
+  `DXR_DESKTOP_APP_ID` registered on xdg-desktop-portal >= 1.19 the dialog names that app.
 
 ## 7a. The saved grant across launches (spec §6.4, ADR-056 Amendment 2)
 
-Every row uses a **new process** unless it says otherwise, `DXR_DESKTOP_APP_ID` set (one id per
-row group) and a private `DXR_DESKTOP_CONTROL_DIR`. The file is
-`$DXR_DESKTOP_CONTROL_DIR/desktop-control/<app id>.json` (normally
+Every row uses a **new process** unless it says otherwise, a private `DXR_DESKTOP_CONTROL_DIR`,
+and (except 7a.14) `DXR_DESKTOP_APP_ID` set with its `.desktop` file installed (one id per row
+group). The file is
+`$DXR_DESKTOP_CONTROL_DIR/desktop-control/<key>.json` (normally
 `~/.local/state/displayxr/desktop-control/`). Watch the dialogs and the log lines; never paste
 the file's `restore_token` anywhere.
 
 | # | Steps | Expected |
 |---|---|---|
-| 7a.1 | `request` → Share; exit | one dialog; the file exists, `-rw-------` in a `drwx------` directory, `"portal": "remote_desktop"`, `"devices": true`; the portal's permission store lists the app id (`flatpak permission-show` / `busctl --user call org.freedesktop.impl.portal.PermissionStore …`) |
-| 7a.2 | second launch: `request`, then `key 0 end`, idle > 2 s, `key 0 end` | **no dialog**; `access: granted` at once; log `using the saved grant`, then `RemoteDesktop session restored` per action; `saved the grant` after each restore, with whatever token the portal returned (1.21.1 returns the same one; a portal that renews it must not cost a dialog on the next launch) |
+| 7a.1 | `request` → Share; exit | one dialog; the file exists, `-rw-------` in a `drwx------` directory, `"portal": "remote_desktop"`, `"devices": true`, `"key_source": "registered"`, `"portal_app_id"` = the id; the portal's permission store lists the app id (`flatpak permission-show` / `busctl --user call org.freedesktop.impl.portal.PermissionStore …`) |
+| 7a.2 | second launch: `request`, then `key 0 end`, idle > 2 s, `key 0 end` | **no dialog**; `access: granted` after a silent restore (the verifying restore: the remote-access indicator shows ~2 s); log `using the saved grant`, then `RemoteDesktop session restored` per restore; `saved the grant` after each restore, with whatever token the portal returned (1.21.1 returns the same one; a portal that renews it must not cost a dialog on the next launch) |
 | 7a.3 | `request-scopes control+again` → **Cancel**; then `key 0 end` | one dialog; `access: control denied`; `key` → `not-granted`; log `removed the saved grant … (the user declined to share again)`; the file is gone |
 | 7a.4 | next launch: `request` | the dialog again |
 | 7a.5 | with a saved grant: `displayxr-cli desktop stop` (same `DXR_DESKTOP_CONTROL_DIR`), `resume`; next launch: `request` → Cancel | `stop` prints `removed 1 saved grant(s)`; the file is gone; one dialog; `access: denied`; still no file; the launch after that asks again |
 | 7a.6 | a process holding the grant across `stop` / `resume`: `key 0 end` after the resume | `ok` (the grant lives on in memory, as before); log `was removed … no longer saves it`; no file re-created; the next launch asks |
 | 7a.7 | Stop from the indicator while a session is open, then `key 0 end` | `not-granted` (as §7); the file is gone |
-| 7a.8 | saved grant, then withdraw the approval (Settings → Apps → the app, or delete the permission-store entries); next launch: `request`, `key 0 end`, `request` | `request` → granted (from the file, no portal call); `key` → `not-granted` after the restore's dialog is closed at once (≤ 5 s); the file is gone; the second `request` shows the dialog |
+| 7a.8 | saved grant, then withdraw the approval (Settings → Apps → the app, or delete the permission-store entries); next launch: `request` → Share; `key 0 end` | `request` shows the dialog (the verifying restore: the portal no longer honours the token) and, after Share, is granted with a NEW token saved; the key works. A process that acts without a request (the smoke tool: `key 0 end` first) gets `not-granted` after ≤ 5 s, the restore's dialog closed at once, the file removed |
 | 7a.9 | `request-scopes all` (share every monitor) → Share; next launch: `capture …` (no request), then `key 0 end` | the file has `"screens": true` and one connector per monitor; the capture restores **with the screens** (`SelectSources` on `dbus-monitor`), no dialog; the key works |
 | 7a.10 | 7a.9's grant, a covered monitor unplugged, next launch: `capture …` | `timeout — a monitor the screen grant covers is missing` (the saved connectors feed the monitor-blink guard, §11.14); the file is kept; replug → silent restore |
 | 7a.11 | two processes of the same app id at once: both `request`, then act in turns, each after the other's session closed | no dialog in either (each takes the grant the other renewed — log `took the grant another process … saved since`); acting at the same instant may cost one `not-granted` (a single-use token raced), never a dialog left up |
 | 7a.12 | the file `chmod 644`, or replaced by a symlink; next launch: `request` | log `ignored the saved grant … (unsafe …)`; the dialog; after Share the file is a private file again |
 | 7a.13 | the file truncated / not JSON; next launch | log `ignored the saved grant … (corrupt: removed)`; the dialog; a new file after Share |
+| 7a.14 | **no registry**: `DXR_DESKTOP_APP_ID` set but no `.desktop` file (registration fails), and again with no app id at all; two launches each | one dialog each pair; the file is `<app id>.json` (`"key_source": "app_id"`) resp. `exe-<name>-<hash>.json` (`"executable"`); `launch_scope` shows the launcher's unit; Ubuntu 24.04 (no registry) behaves the same |
+| 7a.15 | **another launch context**: a grant saved by a process the portal attributed one way (unregistered, from a terminal / IDE), then a launch attributed another way (the `.desktop` installed, so it registers; or started from the dock) | that launch's `request` shows the dialog once (the verifying restore); after Share the new token replaces the saved one; the next launch from the same context is silent |
+| 7a.16 | two different executables, no app id | two files (`exe-<name>-<hash>`), each launch silent for its own executable; removing one leaves the other |
 
 ## 7b. Delivery guarantee (contract v2) — must hold
 

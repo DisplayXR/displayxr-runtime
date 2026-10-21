@@ -191,35 +191,48 @@ removes every saved OS grant (§6.4); `status` shows how many there are and wher
 On GNOME the OS consent is the RemoteDesktop / ScreenCast portal dialog, and the portal hands
 the app a **restore token** for the grant (`persist_mode` 2). Passing it back restores the grant
 without the dialog. The GNOME backend saves that token so that the dialog appears **once per
-app**, not once per launch (ADR-056 Amendment 2):
+app**, not once per launch (ADR-056 Amendment 2) — on every portal that issues restore tokens
+(RemoteDesktop v2 / ScreenCast v4, so Ubuntu 24.04's 1.18 too), with or without an app id:
 
 | | |
 |---|---|
 | what | the restore token and the grant's shape: which portal issued it (RemoteDesktop or a standalone ScreenCast), whether it covers input and the screens, and the connectors of the monitors it covered |
-| key | the app id that `org.freedesktop.host.portal.Registry.Register` **accepted** (from `DXR_DESKTOP_APP_ID`, else the basename of `GIO_LAUNCHED_DESKTOP_FILE`) — the id the portal binds the token to. xdg-desktop-portal accepts an id only when a `<app id>.desktop` file is installed (it looks up the app's info: "App info not found" otherwise) |
-| where | `$XDG_STATE_HOME/displayxr/desktop-control/<app id>.json` (default `~/.local/state/displayxr/desktop-control/`); `$DXR_DESKTOP_CONTROL_DIR/desktop-control/` when that override is set |
-| how | directory 0700 (tightened when looser), file 0600, written atomically (an `O_EXCL` temp file, `fsync`, `rename`); read only when it is a regular file of this user (not a symlink) with no group / other bits, in a directory nobody else can write; never logged |
-| read | at the app's first request or restore in a process; again before every later restore (another process of the same app may have renewed it, spending the old one) |
+| key | the app's own identity, first that applies: **(1)** the app id `org.freedesktop.host.portal.Registry.Register` accepted; **(2)** the app's own id (`DXR_DESKTOP_APP_ID`, else the basename of `GIO_LAUNCHED_DESKTOP_FILE`) when registration failed or the portal has no registry; **(3)** the executable: `exe-<basename>-<16 hex digits of a hash of its absolute path>` (two executables never share a grant) |
+| where | `$XDG_STATE_HOME/displayxr/desktop-control/<key>.json` (default `~/.local/state/displayxr/desktop-control/`); `$DXR_DESKTOP_CONTROL_DIR/desktop-control/` when that override is set |
+| how | directory 0700 (tightened when looser), file 0600, written atomically (an `O_EXCL` temp file, `fsync`, `rename`); read only when it is a regular file of this user (not a symlink) with no group / other bits, in a directory nobody else can write; never logged. Diagnostics next to the grant, never read back: `key_source`, `portal_app_id` (the id the portal bound the token to, when registration told us), `exe`, `launch_scope` (the systemd unit the process ran in) |
+| read | at the app's first request or restore in a process; again before every later restore (another process of the same app may have renewed it) |
+| verified | the first request of a process that found a saved grant **restores it, with the dialog allowed**: silent where the portal honours the token, else the portal's dialog, whose answer is the request's (a new token replaces the saved one; Cancel removes it) |
 | written | after every successful `Start`, with the token it returned (the portal documents tokens as single use and may hand out a new one per `Start`; xdg-desktop-portal 1.21.1 handed back the same token on every restore in the headless run) |
-| removed | the user declines a dialog that had no grant to keep; the user declines an `ASK_AGAIN` (§10.2); a restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant) |
-| not saved | without an app id the portal accepted (none set, no installed `.desktop` file for it, or xdg-desktop-portal < 1.19): the portal then attributes the session by the process's systemd scope — the terminal, IDE or launcher that started it (seen in the headless run: `com.microsoft.VSCode`) — or to no app, so the token is not the app's; nothing is saved and every new process asks again, as before |
+| removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant) |
+
+**The portal stays the judge.** It honours a token only for the app id it bound it to: the
+registered id when the app registered, otherwise one it derives from the launch context — the
+systemd scope the process runs in (the launcher, terminal or IDE that started it; seen in the
+headless run: `com.microsoft.VSCode`), or none. The key only says whose file it is. An app
+launched from another context (from its `.desktop` file one day, a terminal the next) gets the
+dialog once at its first request, and the new token replaces the saved one. **Launch the app the
+same way, ideally from its `.desktop` file, to avoid a second dialog.** Installing
+`<app id>.desktop` (so registration succeeds) is not needed for "ask once"; it makes GNOME name
+the app in its dialog and in Settings, and binds the approval to the app rather than to whatever
+launched it.
 
 A process whose saved grant is removed under it (the kill switch, by hand) keeps its grant in
 memory until it exits, as before, but never writes the file again: after a kill switch the next
-**launch** of every app asks again. A request finds a saved grant without asking the portal, so
-an approval the user withdrew in GNOME Settings shows up at the first action: that restore is
-not silent, its dialog is closed at once, the action completes `NOT_GRANTED`, the file is
-removed, and the next request shows the dialog (exactly what happens in a process that already
-held the grant).
+**launch** of every app asks again. An approval the user withdrew in GNOME Settings shows up at
+the next request as the dialog (the verifying restore); in a process that skips the request
+(the smoke tool), at the first action: that restore is not silent, its dialog is closed at once,
+the action completes `NOT_GRANTED` and the file is removed.
 
-**What a saved grant gives away.** The token on disk lets any process of the same user that can
-claim the same app id — call `Registry.Register` with it — restore the grant silently. The portal
-binds the token to that app id: a process registered under another id, a sandboxed app, or
-another user cannot use it. Same-user processes are not a security boundary on the desktop (they
-can read the app's files and, with `ptrace` permitted, its memory); the in-memory token of
-version 1 was safe from a same-user process only where Yama `ptrace_scope` ≥ 1 (Ubuntu's
-default). The kill switch, `ASK_AGAIN`, the indicator's Stop and GNOME Settings each end the
-grant.
+**What a saved grant gives away.** The file holds a restore token. A process of the same user
+that reads it (0600 keeps out other users, not the same one) and replays it from a context the
+portal accepts — the same launch context, or, for a registered app, a process that registers
+the same app id (any same-user process can, once a `.desktop` file with that id exists, and the
+user can install one) — restores the grant without a dialog. That is the same exposure whether
+the app registered or not, and the same as any app that persists a portal restore token (OBS
+Studio, the app-side helper this replaces). The portal still refuses the token to a process it
+attributes to another app id, to sandboxed apps and to other users, and GNOME's indicator shows
+every session. The kill switch, `ASK_AGAIN`, the indicator's Stop and GNOME Settings each end
+the grant.
 
 ## 7. Backends
 
@@ -231,7 +244,7 @@ grant.
 | window ops | `SetForegroundWindow` (+ attach-input), `SetWindowPos`, `ShowWindow`, `WM_CLOSE` | AX raise / position / size / minimized / close button | portal input as the user would: Super+click to activate, mutter keybindings, Super+drag with read-back |
 | text | `SendInput` `KEYEVENTF_UNICODE` | `CGEventKeyboardSetUnicodeString` | portal clipboard + Ctrl+V (Ctrl+Shift+V in terminals) |
 | keys / pointer | `SendInput` | `CGEvent` | libei (from the portal's `ConnectToEIS`) |
-| consent | DisplayXR dialog (store) | `AXIsProcessTrustedWithOptions` + `CGRequestScreenCaptureAccess` | RemoteDesktop portal, `persist_mode` 2, restore token saved per registered app id (§6.4; in memory only without one) |
+| consent | DisplayXR dialog (store) | `AXIsProcessTrustedWithOptions` + `CGRequestScreenCaptureAccess` | RemoteDesktop portal, `persist_mode` 2, restore token saved per app (its app id or its executable, §6.4) |
 | lock | `OpenInputDesktop` fails / WTS session locked | `CGSessionCopyCurrentDictionary` `CGSSessionScreenIsLocked` | `org.gnome.ScreenSaver.GetActive` |
 | idle | `GetLastInputInfo` | `CGEventSourceSecondsSinceLastEventType` | `org.gnome.Mutter.IdleMonitor.GetIdletime` |
 
@@ -575,8 +588,8 @@ scopes. Rows 8–10 read that scope's own grant:
   monitors changed) puts **both** scopes in `DENIED`, as in v1. A declined `ASK_AGAIN` (the
   user cancels the dialog) is that answer: the grant it would have replaced is dropped (both of
   its scopes `DENIED`, its saved copy removed, §6.4); a declined request that only **adds** a
-  scope keeps the old grant. The grant outlives the process for an app with a registered app
-  id (§6.4).
+  scope keeps the old grant. The grant outlives the process (§6.4): a new process's first
+  request restores it, silently when launched the same way.
 - **Windows.** The existing consent MessageBox. Its text lists only the scopes asked for
   ("see your screen", "type and click in other apps"). The answer is stored per scope (§10.6).
 - **macOS.** CAPTURE's OS grant is Screen Recording (`CGPreflightScreenCaptureAccess`,
@@ -834,10 +847,12 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   combined session interactively, asking for the screens again whenever the old grant had them;
   the old token is not passed (so not consumed) and is put back if the dialog fails — except
   after a declined ASK_AGAIN, whose answer replaces the grant (§10.2).
-- **Saved grant (§6.4).** Per registered app id, `u_desktop_gnome_grant.c` (the file format and
-  the keep / save / remove table, `u_desktop_gnome_grant_after_request`) over
-  `u_desktop_grant_*` in `u_desktop_policy.c` (the private, atomic file). The monitor-blink
-  guard below uses the saved connectors in a new process too.
+- **Saved grant (§6.4).** Per app (`u_desktop_gnome_grant_key`: registered id, own id,
+  executable), `u_desktop_gnome_grant.c` (the file format and the keep / save / remove table,
+  `u_desktop_gnome_grant_after_request`) over `u_desktop_grant_*` in `u_desktop_policy.c` (the
+  private, atomic file). A saved grant not yet used in the process is restored by the first
+  request with the dialog allowed (`GP_OPEN_RESTORE_OR_ASK`); every other restore stays silent
+  or fails. The monitor-blink guard below uses the saved connectors in a new process too.
 - **Monitor blink.** Before a silent restore of a grant that covers screens, the backend reads
   `org.gnome.Mutter.DisplayConfig.GetCurrentState`: it waits (at most 6 s) until the layout
   serial has been stable for 2 s and every monitor (connector) the grant covered is present,

@@ -710,8 +710,12 @@ cap_revoke(struct gnome_portal *p, const char *why)
 }
 
 static enum u_desktop_result
-open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
+open_sc_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 {
+	// As open_session: restoring = the token and the monitor-blink guard; interactive =
+	// a dialog may be shown and waited for.
+	const bool restoring = mode != GP_OPEN_ASK;
+	const bool interactive = mode != GP_OPEN_RESTORE;
 	if (p->c == NULL) {
 		gp_set_msg(msg, "no D-Bus session bus");
 		return U_DESKTOP_ERR_FAILED;
@@ -723,7 +727,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 	gp_register_app(p);
 	gp_session_close(p);
 	p->start_declined = false;
-	if (!interactive) {
+	if (restoring) {
 		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
 		if (rr != U_DESKTOP_OK) {
 			return rr;
@@ -819,8 +823,10 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 		gp_set_msg(msg,
 		           p->resp_code == 1 ? "the user declined screen sharing" : "the portal refused the session");
 		gp_session_close(p);
-		if (!interactive) {
-			cap_revoke(p, "the portal refused to restore it");
+		if (restoring) {
+			cap_revoke(p, mode == GP_OPEN_RESTORE ? "the portal refused to restore it"
+			              : p->start_declined     ? "the user declined the restore's dialog"
+			                                      : "the portal refused it");
 		}
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
@@ -836,7 +842,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 		gp_session_close(p);
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
-	U_LOG_I("desktop/gnome: ScreenCast session %s (%s)", interactive ? "granted" : "restored", p->session);
+	U_LOG_I("desktop/gnome: ScreenCast session %s (%s)", restoring ? "restored" : "granted", p->session);
 	return U_DESKTOP_OK;
 }
 
@@ -862,6 +868,20 @@ scopes_tramp(void *ctx, enum u_desktop_access a)
 	struct scopes_req *r = (struct scopes_req *)ctx;
 	r->done(r->ctx, U_DESKTOP_ACCESS_UNKNOWN, U_DESKTOP_ACCESS_UNKNOWN);
 	free(r);
+}
+
+enum u_desktop_result
+gp_grant_verify(struct gnome_portal *p, char *msg)
+{
+	pthread_mutex_lock(&p->lock);
+	bool sc = p->have_token && p->cap.token_sc;
+	pthread_mutex_unlock(&p->lock);
+	enum u_desktop_result r =
+	    sc ? open_sc_session(p, GP_OPEN_RESTORE_OR_ASK, msg) : gp_open_session_mode(p, GP_OPEN_RESTORE_OR_ASK, msg);
+	if (r == U_DESKTOP_OK) {
+		p->last_use_ms = gdbus_now_ms(); // the idle close (2 s) counts from here
+	}
+	return r;
 }
 
 /*!
@@ -935,7 +955,26 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 
 	enum u_desktop_access ctl = U_DESKTOP_ACCESS_UNKNOWN, cap = U_DESKTOP_ACCESS_UNKNOWN;
 	char msg[U_DESKTOP_MSG_SIZE] = {0};
-	if (!reask && (!want_ctl || ctl_now) && (!want_cap || cap_now)) {
+	if (!reask && (!want_ctl || ctl_now) && (!want_cap || cap_now) && p->saved.unverified && !p->session_open) {
+		// A saved grant this process has not used: the portal's answer, now (silent
+		// when launched as it was issued, else its dialog once). Both of its scopes
+		// follow it.
+		pthread_mutex_lock(&p->lock);
+		bool had_dev = gp_cap_control_granted_locked(p), had_scr = p->have_token && p->cap.token_screens;
+		pthread_mutex_unlock(&p->lock);
+		enum u_desktop_result r = gp_grant_verify(p, msg);
+		pthread_mutex_lock(&p->lock);
+		bool dev = gp_cap_control_granted_locked(p);
+		bool scr = (p->have_token && p->cap.token_screens) || p->cap.open_streams;
+		pthread_mutex_unlock(&p->lock);
+		ctl = want_ctl || had_dev ? (dev ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED)
+		                          : U_DESKTOP_ACCESS_UNKNOWN;
+		cap = want_cap || had_scr ? (scr ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED)
+		                          : U_DESKTOP_ACCESS_UNKNOWN;
+		if (r != U_DESKTOP_OK) {
+			U_LOG_W("desktop/gnome: access request (saved grant): %s", msg);
+		}
+	} else if (!reask && (!want_ctl || ctl_now) && (!want_cap || cap_now)) {
 		ctl = want_ctl ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_UNKNOWN;
 		cap = want_cap ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_UNKNOWN;
 	} else if (p->input && (want_ctl || (ctl_now && !p->consent_only_granted))) {
@@ -971,7 +1010,7 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 			struct gp_cap_saved saved;
 			gp_cap_begin_upgrade(p, &saved);
 			struct declined_grant dg = declined_grant_begin(&saved);
-			enum u_desktop_result r = open_sc_session(p, true, msg);
+			enum u_desktop_result r = open_sc_session(p, GP_OPEN_ASK, msg);
 			declined_grant_end(p, &dg, &saved, r, reask);
 			cap = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED
 			      : gp_quitting(p)  ? U_DESKTOP_ACCESS_UNKNOWN
@@ -1030,7 +1069,8 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 			gp_set_msg(c->msg, "screen capture is not granted to this app — request access first");
 			return U_DESKTOP_ERR_NOT_GRANTED;
 		}
-		enum u_desktop_result r = sc ? open_sc_session(p, false, c->msg) : gp_open_session(p, false, c->msg);
+		enum u_desktop_result r =
+		    sc ? open_sc_session(p, GP_OPEN_RESTORE, c->msg) : gp_open_session(p, false, c->msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}

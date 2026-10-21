@@ -20,8 +20,9 @@
  * shows DisplayXR's own prompt naming the app (and `remembers_in_store` is true
  * so the common layer persists the answer). A backend never forwards or shares a
  * grant, and never exposes these operations outside the process. The one grant a
- * backend stores is GNOME's portal restore token, for the same app id only, so the
- * app's next launch restores it without the dialog (spec §6.4, u_desktop_gnome_grant.h).
+ * backend stores is GNOME's portal restore token, in a private file of the same app
+ * (its app id, or its executable), so the app's next launch restores it without the
+ * dialog (spec §6.4, u_desktop_gnome_grant.h).
  *
  * ## Coordinates
  *

@@ -6,6 +6,7 @@
  */
 
 #include "u_desktop_gnome_grant.h"
+#include "u_desktop_gnome_logic.h"
 #include "u_desktop_policy.h"
 
 #include <cjson/cJSON.h>
@@ -28,6 +29,90 @@ u_desktop_gnome_grant_status_str(enum u_desktop_gnome_grant_status s)
 	case U_DESKTOP_GNOME_GRANT_UNSAFE: return "unsafe";
 	default: return "?";
 	}
+}
+
+const char *
+u_desktop_gnome_key_source_str(enum u_desktop_gnome_key_source s)
+{
+	switch (s) {
+	case U_DESKTOP_GNOME_KEY_REGISTERED: return "registered";
+	case U_DESKTOP_GNOME_KEY_APP_ID: return "app_id";
+	case U_DESKTOP_GNOME_KEY_EXECUTABLE: return "executable";
+	default: return "none";
+	}
+}
+
+enum u_desktop_gnome_key_source
+u_desktop_gnome_grant_key(const char *registered_id, const char *app_id, const char *exe_path, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return U_DESKTOP_GNOME_KEY_NONE;
+	}
+	out[0] = '\0';
+	if (u_desktop_grant_key_valid(registered_id) && strlen(registered_id) < cap) {
+		snprintf(out, cap, "%s", registered_id);
+		return U_DESKTOP_GNOME_KEY_REGISTERED;
+	}
+	if (u_desktop_grant_key_valid(app_id) && strlen(app_id) < cap) {
+		snprintf(out, cap, "%s", app_id);
+		return U_DESKTOP_GNOME_KEY_APP_ID;
+	}
+	if (exe_path == NULL || exe_path[0] != '/') {
+		return U_DESKTOP_GNOME_KEY_NONE;
+	}
+	const char *base = strrchr(exe_path, '/') + 1;
+	char name[49];
+	size_t n = 0;
+	for (; base[n] != '\0' && n + 1 < sizeof(name); n++) {
+		char c = base[n];
+		bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+		          c == '_' || c == '-';
+		name[n] = ok ? c : '_';
+	}
+	name[n] = '\0';
+	if (n == 0) {
+		return U_DESKTOP_GNOME_KEY_NONE; // a path ending in '/'
+	}
+	int w =
+	    snprintf(out, cap, "exe-%s-%016llx", name, (unsigned long long)u_desktop_fnv1a(exe_path, strlen(exe_path)));
+	if (w <= 0 || (size_t)w >= cap || !u_desktop_grant_key_valid(out)) {
+		out[0] = '\0';
+		return U_DESKTOP_GNOME_KEY_NONE;
+	}
+	return U_DESKTOP_GNOME_KEY_EXECUTABLE;
+}
+
+bool
+u_desktop_gnome_launch_scope(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+#ifdef __linux__
+	FILE *f = fopen("/proc/self/cgroup", "r");
+	if (f == NULL) {
+		return false;
+	}
+	char line[1024];
+	bool found = false;
+	while (!found && fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, "0::", 3) != 0) {
+			continue; // cgroup v2 only
+		}
+		line[strcspn(line, "\n")] = '\0';
+		const char *leaf = strrchr(line, '/');
+		leaf = leaf != NULL ? leaf + 1 : line + 3;
+		if (leaf[0] != '\0') {
+			snprintf(out, cap, "%s", leaf);
+			found = true;
+		}
+	}
+	fclose(f);
+	return found;
+#else
+	return false;
+#endif
 }
 
 //! 1..cap-1 bytes, every one printable ASCII without the space (portal tokens are UUIDs).
@@ -65,9 +150,11 @@ shape_ok(const struct u_desktop_gnome_grant *g)
 }
 
 char *
-u_desktop_gnome_grant_encode(const char *app_id, const struct u_desktop_gnome_grant *g)
+u_desktop_gnome_grant_encode(const char *key,
+                             const struct u_desktop_gnome_grant *g,
+                             const struct u_desktop_gnome_grant_origin *origin)
 {
-	if (g == NULL || !u_desktop_grant_key_valid(app_id) || !token_ok(g->token, sizeof(g->token)) || !shape_ok(g)) {
+	if (g == NULL || !u_desktop_grant_key_valid(key) || !token_ok(g->token, sizeof(g->token)) || !shape_ok(g)) {
 		return NULL;
 	}
 	cJSON *o = cJSON_CreateObject();
@@ -77,7 +164,10 @@ u_desktop_gnome_grant_encode(const char *app_id, const struct u_desktop_gnome_gr
 	char now[32];
 	u_desktop_audit_utc_now(now, sizeof(now));
 	cJSON_AddNumberToObject(o, "version", U_DESKTOP_GNOME_GRANT_VERSION);
-	cJSON_AddStringToObject(o, "app_id", app_id);
+	cJSON_AddStringToObject(o, "key", key);
+	if (origin != NULL && origin->source != U_DESKTOP_GNOME_KEY_NONE) {
+		cJSON_AddStringToObject(o, "key_source", u_desktop_gnome_key_source_str(origin->source));
+	}
 	cJSON_AddStringToObject(o, "portal", g->screencast ? PORTAL_SC : PORTAL_RD);
 	cJSON_AddStringToObject(o, "restore_token", g->token);
 	cJSON_AddBoolToObject(o, "devices", g->devices);
@@ -89,6 +179,16 @@ u_desktop_gnome_grant_encode(const char *app_id, const struct u_desktop_gnome_gr
 		}
 	}
 	cJSON_AddStringToObject(o, "saved", now);
+	// Diagnostics: which id the portal bound the token to (when known), what ran.
+	if (origin != NULL && origin->portal_app_id != NULL && origin->portal_app_id[0] != '\0') {
+		cJSON_AddStringToObject(o, "portal_app_id", origin->portal_app_id);
+	}
+	if (origin != NULL && origin->exe != NULL && origin->exe[0] != '\0') {
+		cJSON_AddStringToObject(o, "exe", origin->exe);
+	}
+	if (origin != NULL && origin->launch_scope != NULL && origin->launch_scope[0] != '\0') {
+		cJSON_AddStringToObject(o, "launch_scope", origin->launch_scope);
+	}
 	char *txt = cJSON_Print(o);
 	// cJSON keeps its own copy of the token in the tree: wipe it before freeing.
 	cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
@@ -125,10 +225,10 @@ get_bool(const cJSON *o, const char *key, bool *out)
 }
 
 enum u_desktop_gnome_grant_status
-u_desktop_gnome_grant_decode(const char *json, const char *app_id, struct u_desktop_gnome_grant *out)
+u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop_gnome_grant *out)
 {
 	memset(out, 0, sizeof(*out));
-	if (json == NULL || app_id == NULL) {
+	if (json == NULL || key == NULL) {
 		return U_DESKTOP_GNOME_GRANT_CORRUPT;
 	}
 	cJSON *o = cJSON_Parse(json);
@@ -140,7 +240,7 @@ u_desktop_gnome_grant_decode(const char *json, const char *app_id, struct u_desk
 	struct u_desktop_gnome_grant g;
 	memset(&g, 0, sizeof(g));
 	const cJSON *ver = cJSON_GetObjectItemCaseSensitive(o, "version");
-	const cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "app_id");
+	const cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "key");
 	const cJSON *portal = cJSON_GetObjectItemCaseSensitive(o, "portal");
 	const cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
 	const cJSON *mons = cJSON_GetObjectItemCaseSensitive(o, "monitors");
@@ -151,7 +251,7 @@ u_desktop_gnome_grant_decode(const char *json, const char *app_id, struct u_desk
 		st = U_DESKTOP_GNOME_GRANT_NEWER;
 		goto done;
 	}
-	if (!cJSON_IsString(id) || strcmp(id->valuestring, app_id) != 0) {
+	if (!cJSON_IsString(id) || strcmp(id->valuestring, key) != 0) {
 		goto done; // a file under our name that is not ours
 	}
 	if (!cJSON_IsString(portal) ||
@@ -210,56 +310,58 @@ free_secret(char *s)
 }
 
 enum u_desktop_gnome_grant_status
-u_desktop_gnome_grant_load(const char *app_id, struct u_desktop_gnome_grant *out)
+u_desktop_gnome_grant_load(const char *key, struct u_desktop_gnome_grant *out)
 {
 	memset(out, 0, sizeof(*out));
 	char *txt = NULL;
-	enum u_desktop_grant_read_result rr = u_desktop_grant_read(app_id, &txt);
+	enum u_desktop_grant_read_result rr = u_desktop_grant_read(key, &txt);
 	if (rr == U_DESKTOP_GRANT_READ_NONE) {
 		return U_DESKTOP_GNOME_GRANT_NONE;
 	}
 	if (rr == U_DESKTOP_GRANT_READ_UNSAFE) {
 		return U_DESKTOP_GNOME_GRANT_UNSAFE;
 	}
-	enum u_desktop_gnome_grant_status st = u_desktop_gnome_grant_decode(txt, app_id, out);
+	enum u_desktop_gnome_grant_status st = u_desktop_gnome_grant_decode(txt, key, out);
 	free_secret(txt);
 	if (st == U_DESKTOP_GNOME_GRANT_CORRUPT) {
-		u_desktop_grant_remove(app_id);
+		u_desktop_grant_remove(key);
 	}
 	return st;
 }
 
 bool
-u_desktop_gnome_grant_save(const char *app_id, const struct u_desktop_gnome_grant *g)
+u_desktop_gnome_grant_save(const char *key,
+                           const struct u_desktop_gnome_grant *g,
+                           const struct u_desktop_gnome_grant_origin *origin)
 {
-	char *txt = u_desktop_gnome_grant_encode(app_id, g);
+	char *txt = u_desktop_gnome_grant_encode(key, g, origin);
 	if (txt == NULL) {
 		return false;
 	}
-	bool ok = u_desktop_grant_write(app_id, txt);
+	bool ok = u_desktop_grant_write(key, txt);
 	free_secret(txt);
 	return ok;
 }
 
 bool
-u_desktop_gnome_grant_forget(const char *app_id, const char *token)
+u_desktop_gnome_grant_forget(const char *key, const char *token)
 {
-	if (!u_desktop_grant_key_valid(app_id)) {
+	if (!u_desktop_grant_key_valid(key)) {
 		return false;
 	}
 	if (token == NULL) {
-		return u_desktop_grant_remove(app_id);
+		return u_desktop_grant_remove(key);
 	}
 	char *txt = NULL;
-	if (u_desktop_grant_read(app_id, &txt) != U_DESKTOP_GRANT_READ_OK) {
+	if (u_desktop_grant_read(key, &txt) != U_DESKTOP_GRANT_READ_OK) {
 		return false;
 	}
 	struct u_desktop_gnome_grant g;
 	bool mine =
-	    u_desktop_gnome_grant_decode(txt, app_id, &g) == U_DESKTOP_GNOME_GRANT_OK && strcmp(g.token, token) == 0;
+	    u_desktop_gnome_grant_decode(txt, key, &g) == U_DESKTOP_GNOME_GRANT_OK && strcmp(g.token, token) == 0;
 	free_secret(txt);
 	memset(&g, 0, sizeof(g));
-	return mine && u_desktop_grant_remove(app_id);
+	return mine && u_desktop_grant_remove(key);
 }
 
 enum u_desktop_gnome_grant_action

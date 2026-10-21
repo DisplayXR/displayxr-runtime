@@ -14,33 +14,35 @@
  *
  * Before the first portal call the connection registers the host app id with
  * org.freedesktop.host.portal.Registry (xdg-desktop-portal >= 1.19) — from
- * `DXR_DESKTOP_APP_ID`, else from the basename of `GIO_LAUNCHED_DESKTOP_FILE` —
- * so the portal attributes the request, and binds the approval and its restore
- * token, to that app id.
+ * `DXR_DESKTOP_APP_ID`, else from the basename of `GIO_LAUNCHED_DESKTOP_FILE`.
+ * The portal accepts it only when <app id>.desktop is installed; then it names the
+ * app in its dialog and in Settings and binds the approval and its restore token
+ * to that id. Otherwise (no id, no .desktop file, a portal < 1.19) the portal
+ * attributes the session by the process's systemd scope (the launcher, terminal
+ * or IDE that started it), or to no app.
  *
  * The grant survives a restart of the app (spec §6.4, ADR-056 Amendment 2): the
- * restore token and what it covers (input, the screens, which monitors) are
- * saved per REGISTERED app id in a private file (u_desktop_gnome_grant.h,
- * $XDG_STATE_HOME/displayxr/desktop-control/<app id>.json, 0600 in a 0700
- * directory, written atomically), read at the first request or restore, and
- * rewritten after every Start (the portal may hand out a new token each time). So the user sees the
- * dialog once per app, not once per launch. The file is removed when the user
- * declines a dialog that had no grant to keep or declines an ASK_AGAIN, when a
- * restore is not silent (the portal no longer honours the token) or is refused,
- * when the session is stopped from GNOME's indicator (any close that is not a
- * lock, as below), and by the kill switch (`displayxr-cli desktop stop` removes
- * every saved grant). Without an app id the portal accepted (none set, no
- * installed <app id>.desktop — xdg-desktop-portal looks its app info up — or a
- * portal older than 1.19) nothing is saved: the portal then attributes the session
- * by the process's systemd scope (the terminal or IDE that started it) or to no
- * app, so the token is not this app's, and the dialog asks again in every new
- * process, as before. A process whose file
- * is removed under it keeps its grant in memory until it exits but never writes
- * the file again.
+ * restore token and what it covers (input, the screens, which monitors) are saved
+ * in a private file (u_desktop_gnome_grant.h, 0600 in a 0700 directory, written
+ * atomically under $XDG_STATE_HOME/displayxr/desktop-control/) keyed by the app's
+ * own identity — its registered app id, else its own app id, else its executable
+ * path — read at the first request or restore and rewritten after every Start. So
+ * the user sees the dialog once per app, not once per launch. The portal stays the
+ * judge: it honours the token only for the id it bound it to, so the first request
+ * of a process restores the saved grant with a dialog allowed
+ * (GP_OPEN_RESTORE_OR_ASK) — silent when launched the same way, the dialog once when
+ * launched from another context, whose new token then replaces the saved one. The
+ * file is removed when the user declines a dialog that had no grant to keep,
+ * declines the restore's dialog, or declines an ASK_AGAIN; when a silent restore
+ * is not silent (the portal no longer honours the token) or is refused; when the
+ * session is stopped from GNOME's indicator (any close that is not a lock, as
+ * below); and by the kill switch (`displayxr-cli desktop stop` removes every saved
+ * grant). A process whose file is removed under it keeps its grant in memory until
+ * it exits but never writes the file again.
  *
  * A session is opened per action burst and closed after 2 s without input, so
  * GNOME's remote-access indicator is up only while the agent acts. Re-opening
- * restores silently with the (single-use, renewed every Start) token. Locking the
+ * restores silently with the token (whatever the last Start returned). Locking the
  * screen closes portal sessions (the Session's Closed signal, sent as the lock
  * starts — before ScreenSaver.GetActive says so, hence session_closed_by_portal's
  * 3 s wait); the next action after unlock re-opens one. Without a token (a portal that did not persist) the session is
@@ -723,7 +725,8 @@ register_app_once(struct gnome_portal *p)
 	if (app_id[0] == '\0') {
 		U_LOG_W(
 		    "desktop/gnome: no app id (set DXR_DESKTOP_APP_ID, or launch from a .desktop file) — the "
-		    "portal cannot attribute the request to an app, and the grant is not saved across runs");
+		    "portal attributes the request to the launch context and its dialog names no app; the grant is "
+		    "kept per executable");
 		return;
 	}
 	struct pmsg pm;
@@ -737,7 +740,8 @@ register_app_once(struct gnome_portal *p)
 	} else {
 		U_LOG_W(
 		    "desktop/gnome: could not register app id \"%s\" with the portal (%s%s%s) — needs "
-		    "xdg-desktop-portal >= 1.19 and an installed %s.desktop; the grant is not saved across runs",
+		    "xdg-desktop-portal >= 1.19 and an installed %s.desktop; the portal attributes the request to "
+		    "the launch context and its dialog names no app (the grant is still kept, under that id)",
 		    app_id, err.name, err.message[0] ? ": " : "", err.message, app_id);
 	}
 }
@@ -801,20 +805,26 @@ gp_grant_sync(struct gnome_portal *p)
 	bool first = !p->saved.inited;
 	if (first) {
 		p->saved.inited = true;
-		// Nothing is saved without an app id the portal accepted: the token would be
-		// bound to no app (register_app_once logs why).
+		// The app's own identity: its registered app id, else its own app id (even
+		// unregistered), else its executable. The portal judges the token; the key
+		// only says whose file it is.
 		if (p->c != NULL) {
 			register_app_once(p);
 		}
-		if (p->registered_id[0] == '\0') {
+		char env_id[256];
+		app_id_from_env(env_id, sizeof(env_id));
+		u_desktop_self_identity(p->saved.exe, sizeof(p->saved.exe), NULL, 0);
+		u_desktop_gnome_launch_scope(p->saved.scope, sizeof(p->saved.scope));
+		p->saved.source = u_desktop_gnome_grant_key(p->registered_id, env_id, p->saved.exe, p->saved.key,
+		                                            sizeof(p->saved.key));
+		if (p->saved.source == U_DESKTOP_GNOME_KEY_NONE) {
+			U_LOG_W(
+			    "desktop/gnome: nothing to key a saved grant by (no app id, no executable path) — not "
+			    "saved");
 			return;
 		}
-		if (!u_desktop_grant_key_valid(p->registered_id)) {
-			U_LOG_W("desktop/gnome: the app id \"%s\" cannot name a saved grant — the grant is not saved",
-			        p->registered_id);
-			return;
-		}
-		snprintf(p->saved.key, sizeof(p->saved.key), "%s", p->registered_id);
+		U_LOG_I("desktop/gnome: the grant is kept under \"%s\" (%s)", p->saved.key,
+		        u_desktop_gnome_key_source_str(p->saved.source));
 	}
 	if (p->saved.key[0] == '\0' || p->saved.disowned) {
 		return;
@@ -855,6 +865,7 @@ gp_grant_sync(struct gnome_portal *p)
 	if (take) {
 		grant_adopt_monitors(p, &g);
 		p->saved.on_disk = true;
+		p->saved.unverified = true; // the portal has not seen it in this process yet
 		snprintf(p->saved.token, sizeof(p->saved.token), "%s", g.token);
 		if (!have) {
 			U_LOG_W(
@@ -872,6 +883,7 @@ gp_grant_sync(struct gnome_portal *p)
 void
 gp_grant_save(struct gnome_portal *p)
 {
+	p->saved.unverified = false; // a Start succeeded: what is in memory is the portal's answer here
 	if (p->saved.key[0] == '\0' || p->saved.disowned) {
 		return;
 	}
@@ -904,11 +916,18 @@ gp_grant_save(struct gnome_portal *p)
 			snprintf(g.monitors[i], sizeof(g.monitors[0]), "%s", p->cap.covered[i]);
 		}
 	}
+	// Diagnostics in the file: whose key, which id the portal used (when known), what ran.
+	const struct u_desktop_gnome_grant_origin origin = {
+	    .source = p->saved.source,
+	    .portal_app_id = p->registered_id,
+	    .exe = p->saved.exe,
+	    .launch_scope = p->saved.scope,
+	};
 	if (p->saved.on_disk && !u_desktop_grant_exists(p->saved.key)) {
 		grant_disown(p); // removed under us: never brought back by this process
 	} else if (kill_switch_on()) {
 		U_LOG_W("desktop/gnome: the kill switch is on — the grant is not saved");
-	} else if (u_desktop_gnome_grant_save(p->saved.key, &g)) {
+	} else if (u_desktop_gnome_grant_save(p->saved.key, &g, &origin)) {
 		p->saved.on_disk = true;
 		snprintf(p->saved.token, sizeof(p->saved.token), "%s", g.token);
 		U_LOG_I("desktop/gnome: saved the grant of \"%s\" for its next launch", p->saved.key);
@@ -984,10 +1003,13 @@ connect_eis(struct gnome_portal *p, char *msg)
 	return U_DESKTOP_OK;
 }
 
-//! CreateSession → SelectDevices → RequestClipboard → Start → ConnectToEIS.
+//! CreateSession → SelectDevices → RequestClipboard → Start → ConnectToEIS. See enum gp_open.
 static enum u_desktop_result
-open_session(struct gnome_portal *p, bool interactive, char *msg)
+open_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 {
+	// Restoring: the token's shape and the monitor-blink guard. A dialog: the long wait.
+	const bool restoring = mode != GP_OPEN_ASK;
+	const bool interactive = mode != GP_OPEN_RESTORE;
 	if (p->c == NULL) {
 		gp_set_msg(msg, "no D-Bus session bus");
 		return U_DESKTOP_ERR_FAILED;
@@ -995,7 +1017,7 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	register_app_once(p);
 	session_close(p);
 	p->start_declined = false;
-	if (!interactive) {
+	if (restoring) {
 		// Never restore a screen grant while a monitor it covers is missing or the
 		// layout just changed: GNOME would save the reduced approval.
 		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
@@ -1062,7 +1084,7 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 	}
 
 	// The screens, in the same session and the same dialog (screen capture).
-	enum u_desktop_result sr = gp_cap_select_sources(p, interactive, msg);
+	enum u_desktop_result sr = gp_cap_select_sources(p, !restoring, msg);
 	if (sr != U_DESKTOP_OK) {
 		session_close(p);
 		return sr;
@@ -1125,15 +1147,19 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 		p->start_declined = cancelled;
 		gp_set_msg(msg, cancelled ? "the user declined remote control" : "the portal refused the session");
 		session_close(p);
-		if (!interactive) {
-			// The token is no good any more (nor its saved copy).
+		if (restoring) {
+			// The token is no good any more (nor its saved copy). After a restore that
+			// showed its dialog (GP_OPEN_RESTORE_OR_ASK), a Cancel is the user's no.
 			pthread_mutex_lock(&p->lock);
 			p->have_token = false;
 			memset(p->token, 0, sizeof(p->token));
 			p->access = U_DESKTOP_ACCESS_DENIED;
 			gp_cap_revoked_locked(p);
 			pthread_mutex_unlock(&p->lock);
-			gp_grant_forget(p, restore, "the portal refused to restore it");
+			gp_grant_forget(p, restore,
+			                mode == GP_OPEN_RESTORE ? "the portal refused to restore it"
+			                : cancelled             ? "the user declined the restore's dialog"
+			                                        : "the portal refused it");
 		}
 		memset(restore, 0, sizeof(restore));
 		return U_DESKTOP_ERR_NOT_GRANTED;
@@ -1180,7 +1206,7 @@ open_session(struct gnome_portal *p, bool interactive, char *msg)
 		return r;
 	}
 	p->last_use_ms = gdbus_now_ms();
-	U_LOG_I("desktop/gnome: RemoteDesktop session %s (%s)", interactive ? "granted" : "restored", p->session);
+	U_LOG_I("desktop/gnome: RemoteDesktop session %s (%s)", restoring ? "restored" : "granted", p->session);
 	return U_DESKTOP_OK;
 }
 
@@ -1222,7 +1248,7 @@ gp_ensure_session(struct gnome_portal *p, bool restore, char *msg)
 		gp_set_msg(msg, "the remote-desktop session closed mid-action (screen lock?) — retry");
 		return U_DESKTOP_ERR_REFUSED;
 	}
-	return open_session(p, false, msg);
+	return open_session(p, GP_OPEN_RESTORE, msg);
 }
 
 /*
@@ -1238,7 +1264,18 @@ cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 	pthread_mutex_lock(&p->lock);
 	bool already = gp_cap_control_granted_locked(p) || p->consent_only_granted;
 	pthread_mutex_unlock(&p->lock);
-	if (already) {
+	if (already && p->saved.unverified && !p->session_open) {
+		// A saved grant this process has not used: the portal's answer, now —
+		// silent when launched as it was issued, else its dialog once.
+		enum u_desktop_result r = gp_grant_verify(p, c->msg);
+		pthread_mutex_lock(&p->lock);
+		bool still = gp_cap_control_granted_locked(p);
+		pthread_mutex_unlock(&p->lock);
+		acc = still ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
+		if (r != U_DESKTOP_OK) {
+			U_LOG_W("desktop/gnome: access request (saved grant): %s", c->msg);
+		}
+	} else if (already) {
 		acc = U_DESKTOP_ACCESS_GRANTED;
 	} else {
 		// A screens-only grant cannot be widened: ask fresh, keeping the screens
@@ -1246,7 +1283,7 @@ cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 		struct gp_cap_saved saved;
 		gp_cap_begin_upgrade(p, &saved);
 		bool had = saved.have_token;
-		enum u_desktop_result r = open_session(p, true, c->msg);
+		enum u_desktop_result r = open_session(p, GP_OPEN_ASK, c->msg);
 		bool declined = r != U_DESKTOP_OK && p->start_declined;
 		gp_cap_end_upgrade(p, &saved, r == U_DESKTOP_OK);
 		// A Cancel with no grant to keep: nothing of this app's is saved any more.
@@ -1642,7 +1679,13 @@ gnome_portal_request(struct gnome_portal *p, const char *parent_window, u_deskto
 enum u_desktop_result
 gp_open_session(struct gnome_portal *p, bool interactive, char *msg)
 {
-	return open_session(p, interactive, msg);
+	return open_session(p, interactive ? GP_OPEN_ASK : GP_OPEN_RESTORE, msg);
+}
+
+enum u_desktop_result
+gp_open_session_mode(struct gnome_portal *p, enum gp_open mode, char *msg)
+{
+	return open_session(p, mode, msg);
 }
 
 void

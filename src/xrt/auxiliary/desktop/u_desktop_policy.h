@@ -26,7 +26,7 @@
  * rotated to `.1` at 1 MiB. The record type has NO text field: typed text can
  * never reach the log, only its length (`chars`).
  *
- * Saved OS grants — one private file per app id under `desktop-control/` next
+ * Saved OS grants — one private file per app under `desktop-control/` next
  * to the audit log (Linux: $XDG_STATE_HOME/displayxr/desktop-control/, default
  * ~/.local/state/displayxr/desktop-control/). Only the GNOME backend saves one
  * (its portal restore token, u_desktop_gnome_grant.h); the kill switch removes
@@ -186,7 +186,7 @@ u_desktop_policy_set_suspended(bool suspended, const char *by);
  *
  * Saved OS grants (spec §6.4, ADR-056 Amendment 2).
  *
- * One small file per key (an app id) that a backend writes so that the OS consent
+ * One small file per key (an app id, or "exe-…" for an app without one) that a backend writes so that the OS consent
  * survives a restart of the app. Only the GNOME backend writes one today: the
  * portal's restore token and what it covers (u_desktop_gnome_grant.h). This layer
  * only stores bytes, privately:

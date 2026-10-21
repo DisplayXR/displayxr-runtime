@@ -3337,7 +3337,7 @@ grant_json(const std::string &field = "", const std::string &value = "")
 {
 	std::map<std::string, std::string> f = {
 	    {"version", "1"},
-	    {"app_id", "\"org.displayxr.GrantTest\""},
+	    {"key", "\"org.displayxr.GrantTest\""},
 	    {"portal", "\"remote_desktop\""},
 	    {"restore_token", "\"0f8e3c1a-2b4d-4e6f-8a9b-0c1d2e3f4a5b\""},
 	    {"devices", "true"},
@@ -3509,7 +3509,7 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 	SECTION("RemoteDesktop: input + two monitors")
 	{
 		u_desktop_gnome_grant g = make_grant(false, true, true, {"DP-1", "HDMI-1"});
-		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
 		REQUIRE(txt != nullptr);
 		std::string json = txt;
 		free(txt);
@@ -3529,7 +3529,7 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 	SECTION("RemoteDesktop with remote interaction unticked: screens only")
 	{
 		u_desktop_gnome_grant g = make_grant(false, false, true, {"eDP-1"});
-		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
 		REQUIRE(txt != nullptr);
 		u_desktop_gnome_grant back{};
 		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
@@ -3540,7 +3540,7 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 	SECTION("a standalone ScreenCast grant; input only drops the monitors")
 	{
 		u_desktop_gnome_grant g = make_grant(true, false, true, {"Meta-0"});
-		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
 		REQUIRE(txt != nullptr);
 		u_desktop_gnome_grant back{};
 		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
@@ -3549,7 +3549,7 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 		CHECK(back.nmonitors == 1);
 
 		g = make_grant(false, true, false, {"DP-1"});
-		txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
 		REQUIRE(txt != nullptr);
 		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
 		free(txt);
@@ -3558,16 +3558,16 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 	SECTION("nothing that cannot be restored is encoded")
 	{
 		u_desktop_gnome_grant g = make_grant(false, false, false); // covers nothing
-		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g, nullptr) == nullptr);
 		g = make_grant(true, true, true); // a ScreenCast token cannot cover input
-		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g, nullptr) == nullptr);
 		g = make_grant(false, true, true, {}, "");
-		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g, nullptr) == nullptr);
 		g = make_grant(false, true, true, {}, "has space");
-		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g, nullptr) == nullptr);
 		g = make_grant(false, true, true);
-		CHECK(u_desktop_gnome_grant_encode("not/an/app/id", &g) == nullptr);
-		CHECK(u_desktop_gnome_grant_encode(kAppId, nullptr) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode("not/an/app/id", &g, nullptr) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, nullptr, nullptr) == nullptr);
 	}
 }
 
@@ -3580,8 +3580,8 @@ TEST_CASE("desktop_gnome_grant: decode refuses anything it did not write", "[des
 	    {"version", "1.5"},
 	    {"version", "\"1\""},
 	    {"version", ""},
-	    {"app_id", "\"org.other.App\""}, // a file under our name that is not ours
-	    {"app_id", ""},
+	    {"key", "\"org.other.App\""}, // a file under our name that is not ours
+	    {"key", ""},
 	    {"portal", "\"screenshot\""},
 	    {"portal", ""},
 	    {"restore_token", "\"\""},
@@ -3634,7 +3634,7 @@ TEST_CASE("desktop_gnome_grant: load / save / forget", "[desktop][grant]")
 	u_desktop_gnome_grant out;
 
 	CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NONE);
-	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g, nullptr));
 	CHECK(mode_of(grant_file(dir)) == 0600);
 	REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
 	CHECK(std::string(out.token) == "token-A");
@@ -3647,7 +3647,7 @@ TEST_CASE("desktop_gnome_grant: load / save / forget", "[desktop][grant]")
 	SECTION("a renewed token replaces the old one")
 	{
 		g = make_grant(false, true, true, {"DP-1"}, "token-B");
-		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g, nullptr));
 		REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
 		CHECK(std::string(out.token) == "token-B");
 	}
@@ -3674,7 +3674,7 @@ TEST_CASE("desktop_gnome_grant: load / save / forget", "[desktop][grant]")
 		CHECK(out.token[0] == '\0');
 		CHECK_FALSE(exists(grant_file(dir)));
 		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NONE);
-		write_raw(grant_file(dir), grant_json("app_id", "\"org.other.App\""), 0600);
+		write_raw(grant_file(dir), grant_json("key", "\"org.other.App\""), 0600);
 		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_CORRUPT);
 		CHECK_FALSE(exists(grant_file(dir)));
 	}
@@ -3686,21 +3686,21 @@ TEST_CASE("desktop_gnome_grant: load / save / forget", "[desktop][grant]")
 		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NEWER);
 		CHECK(exists(grant_file(dir)));
 
-		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g, nullptr));
 		REQUIRE(chmod(grant_file(dir).c_str(), 0644) == 0);
 		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_UNSAFE);
 		CHECK(out.token[0] == '\0');
 		CHECK(exists(grant_file(dir)));
 		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, "token-A")); // unreadable: never "ours"
 		// The next grant replaces it, privately.
-		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g, nullptr));
 		CHECK(mode_of(grant_file(dir)) == 0600);
 		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
 	}
 	SECTION("an unsaveable grant leaves the old one")
 	{
 		u_desktop_gnome_grant bad = make_grant(false, false, false, {}, "token-C");
-		CHECK_FALSE(u_desktop_gnome_grant_save(kAppId, &bad));
+		CHECK_FALSE(u_desktop_gnome_grant_save(kAppId, &bad, nullptr));
 		REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
 		CHECK(std::string(out.token) == "token-A");
 	}
@@ -3734,7 +3734,7 @@ TEST_CASE("desktop_grant: the kill switch removes every saved grant, and only th
 	TempDir dir;
 	for (const char *k : {"org.a.One", "org.b.Two", "org.c.Three"}) {
 		u_desktop_gnome_grant g = make_grant(false, true, false);
-		REQUIRE(u_desktop_gnome_grant_save(k, &g));
+		REQUIRE(u_desktop_gnome_grant_save(k, &g, nullptr));
 	}
 	const std::string gd = dir.file(U_DESKTOP_GRANT_DIR_NAME);
 	write_raw(gd + "/org.a.One.json.tmp.4242", "a writer's leftover", 0600);
@@ -3756,7 +3756,7 @@ TEST_CASE("desktop_grant: the kill switch removes every saved grant, and only th
 	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
 	CHECK(u_desktop_grant_count() == 0);
 	u_desktop_gnome_grant g = make_grant(false, true, false);
-	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g, nullptr));
 	CHECK(u_desktop_grant_count() == 1);
 	// A stop over an unreadable store (which it moves aside) still removes them.
 	write_raw(dir.file("desktop_control.json"), "{ not json", 0600);
@@ -3764,5 +3764,98 @@ TEST_CASE("desktop_grant: the kill switch removes every saved grant, and only th
 	CHECK(u_desktop_grant_count() == 0);
 	std::remove(dir.file("desktop_control.json.corrupt").c_str());
 	u_desktop_policy_destroy(&pol);
+}
+
+TEST_CASE("desktop_gnome_grant: the key is the app's own identity", "[desktop][grant]")
+{
+	char key[U_DESKTOP_GRANT_KEY_MAX + 1];
+	const char *exe = "/opt/Example Corp/Agent App/AgentApp.x86_64";
+
+	// 1. The app id the portal's registry accepted.
+	CHECK(u_desktop_gnome_grant_key("org.example.Agent", "org.example.Agent", exe, key, sizeof(key)) ==
+	      U_DESKTOP_GNOME_KEY_REGISTERED);
+	CHECK(std::string(key) == "org.example.Agent");
+	// 2. The app's own id when registration failed (no .desktop file, portal < 1.19).
+	CHECK(u_desktop_gnome_grant_key("", "org.example.Agent", exe, key, sizeof(key)) == U_DESKTOP_GNOME_KEY_APP_ID);
+	CHECK(std::string(key) == "org.example.Agent");
+	CHECK(u_desktop_gnome_grant_key(nullptr, "org.example.Agent", exe, key, sizeof(key)) ==
+	      U_DESKTOP_GNOME_KEY_APP_ID);
+	// 3. No usable app id: the executable.
+	for (const char *id : {"", "My Agent", "../evil", ".hidden"}) {
+		INFO("app id '" << id << "'");
+		REQUIRE(u_desktop_gnome_grant_key("", id, exe, key, sizeof(key)) == U_DESKTOP_GNOME_KEY_EXECUTABLE);
+		CHECK(u_desktop_grant_key_valid(key));
+		CHECK(std::string(key).rfind("exe-AgentApp.x86_64-", 0) == 0);
+		CHECK(std::string(key).size() == strlen("exe-AgentApp.x86_64-") + 16);
+	}
+	// Stable for one path; different for another executable, even with the same name.
+	char a[U_DESKTOP_GRANT_KEY_MAX + 1], b[U_DESKTOP_GRANT_KEY_MAX + 1], c[U_DESKTOP_GRANT_KEY_MAX + 1];
+	u_desktop_gnome_grant_key(nullptr, nullptr, "/opt/a/Agent", a, sizeof(a));
+	u_desktop_gnome_grant_key(nullptr, nullptr, "/opt/a/Agent", b, sizeof(b));
+	u_desktop_gnome_grant_key(nullptr, nullptr, "/home/u/build/Agent", c, sizeof(c));
+	CHECK(std::string(a) == b);
+	CHECK(std::string(a) != c);
+	CHECK(std::string(a).substr(0, 10) == std::string(c).substr(0, 10)); // "exe-Agent-"
+	u_desktop_gnome_grant_key(nullptr, nullptr, "/opt/a/Other", c, sizeof(c));
+	CHECK(std::string(a) != c);
+	// A name that is not key material is sanitised, and kept short.
+	REQUIRE(u_desktop_gnome_grant_key(nullptr, nullptr, "/x/my app (beta)\u00e9", key, sizeof(key)) ==
+	        U_DESKTOP_GNOME_KEY_EXECUTABLE);
+	CHECK(u_desktop_grant_key_valid(key));
+	CHECK(std::string(key).rfind("exe-my_app__beta__", 0) == 0);
+	std::string long_name = "/opt/" + std::string(300, 'n');
+	REQUIRE(u_desktop_gnome_grant_key(nullptr, nullptr, long_name.c_str(), key, sizeof(key)) ==
+	        U_DESKTOP_GNOME_KEY_EXECUTABLE);
+	CHECK(std::string(key).size() == 4 + 48 + 1 + 16);
+	// Nothing to key it by.
+	for (const char *e : {"", "relative/path", "/opt/dir/"}) {
+		INFO("exe '" << e << "'");
+		CHECK(u_desktop_gnome_grant_key(nullptr, nullptr, e, key, sizeof(key)) == U_DESKTOP_GNOME_KEY_NONE);
+		CHECK(key[0] == '\0');
+	}
+	CHECK(u_desktop_gnome_grant_key(nullptr, nullptr, nullptr, key, sizeof(key)) == U_DESKTOP_GNOME_KEY_NONE);
+	CHECK(std::string(u_desktop_gnome_key_source_str(U_DESKTOP_GNOME_KEY_REGISTERED)) == "registered");
+	CHECK(std::string(u_desktop_gnome_key_source_str(U_DESKTOP_GNOME_KEY_APP_ID)) == "app_id");
+	CHECK(std::string(u_desktop_gnome_key_source_str(U_DESKTOP_GNOME_KEY_EXECUTABLE)) == "executable");
+}
+
+TEST_CASE("desktop_gnome_grant: two executables keep two grants; diagnostics are written, never read back",
+          "[desktop][grant]")
+{
+	TempDir dir;
+	char ka[U_DESKTOP_GRANT_KEY_MAX + 1], kb[U_DESKTOP_GRANT_KEY_MAX + 1];
+	REQUIRE(u_desktop_gnome_grant_key(nullptr, nullptr, "/opt/one/Agent", ka, sizeof(ka)) ==
+	        U_DESKTOP_GNOME_KEY_EXECUTABLE);
+	REQUIRE(u_desktop_gnome_grant_key(nullptr, nullptr, "/opt/two/Agent", kb, sizeof(kb)) ==
+	        U_DESKTOP_GNOME_KEY_EXECUTABLE);
+	u_desktop_gnome_grant ga = make_grant(false, true, false, {}, "token-one");
+	u_desktop_gnome_grant gb = make_grant(false, true, false, {}, "token-two");
+	u_desktop_gnome_grant_origin oa = {U_DESKTOP_GNOME_KEY_EXECUTABLE, "", "/opt/one/Agent",
+	                                   "app-gnome-Agent-1234.scope"};
+	u_desktop_gnome_grant_origin ob = {U_DESKTOP_GNOME_KEY_REGISTERED, "org.example.Two", "/opt/two/Agent", ""};
+	REQUIRE(u_desktop_gnome_grant_save(ka, &ga, &oa));
+	REQUIRE(u_desktop_gnome_grant_save(kb, &gb, &ob));
+	CHECK(u_desktop_grant_count() == 2);
+	u_desktop_gnome_grant out;
+	REQUIRE(u_desktop_gnome_grant_load(ka, &out) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(std::string(out.token) == "token-one");
+	REQUIRE(u_desktop_gnome_grant_load(kb, &out) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(std::string(out.token) == "token-two");
+
+	std::string fa = slurp(grant_file(dir, ka)), fb = slurp(grant_file(dir, kb));
+	CHECK(fa.find("\"key_source\":\t\"executable\"") != std::string::npos);
+	CHECK(fa.find("\"exe\":\t\"/opt/one/Agent\"") != std::string::npos);
+	CHECK(fa.find("\"launch_scope\":\t\"app-gnome-Agent-1234.scope\"") != std::string::npos);
+	CHECK(fa.find("portal_app_id") == std::string::npos); // not known: not written
+	CHECK(fb.find("\"key_source\":\t\"registered\"") != std::string::npos);
+	CHECK(fb.find("\"portal_app_id\":\t\"org.example.Two\"") != std::string::npos);
+	CHECK(fb.find("launch_scope") == std::string::npos);
+	// The diagnostics never decide anything: a file without them (or with junk in them) loads.
+	std::string junk = grant_json("exe", "42");
+	CHECK(decode(junk) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(decode(grant_json("key_source", "[1]")) == U_DESKTOP_GNOME_GRANT_OK);
+	// Removing one app's grant leaves the other's.
+	CHECK(u_desktop_gnome_grant_forget(ka, "token-one"));
+	CHECK(u_desktop_gnome_grant_load(kb, &out) == U_DESKTOP_GNOME_GRANT_OK);
 }
 #endif // !_WIN32

@@ -93,7 +93,7 @@ struct gnome_portal
 	bool session_open_shared;
 	bool have_token;
 	//! The restore token. Saved for the next launch only through gp_grant_* (spec
-	//! §6.4: per registered app id, a private file); never logged.
+	//! §6.4: per app, a private file); never logged.
 	char token[U_DESKTOP_GNOME_TOKEN_SIZE];
 	bool consent_only_granted; //!< !input: the user approved the dialog in this process
 
@@ -112,7 +112,7 @@ struct gnome_portal
 	bool registered_tried;
 	//! The app id org.freedesktop.host.portal.Registry accepted ("" = none: no app
 	//! id, or a portal < 1.19). The portal binds restore tokens to it.
-	char registered_id[U_DESKTOP_GRANT_KEY_MAX + 1];
+	char registered_id[256];
 	uint32_t token_counter;
 	bool warned_no_token;
 
@@ -120,9 +120,18 @@ struct gnome_portal
 	//! knows of the file. Its own token is p->token / p->cap.token_* as always.
 	struct
 	{
-		bool inited;                           //!< the first request / restore looked for it
-		char key[U_DESKTOP_GRANT_KEY_MAX + 1]; //!< registered_id; "" = nothing is saved
-		bool on_disk;                          //!< the file holds a grant this process loaded or wrote
+		bool inited; //!< the first request / restore looked for it
+		//! The app's key (u_desktop_gnome_grant_key): its registered app id, else its
+		//! own app id, else its executable. "" = nothing is saved.
+		char key[U_DESKTOP_GRANT_KEY_MAX + 1];
+		enum u_desktop_gnome_key_source source;
+		char exe[1024];  //!< this process's executable (diagnostics in the file)
+		char scope[256]; //!< its systemd unit (diagnostics: how an unregistered app is attributed)
+		bool on_disk;    //!< the file holds a grant this process loaded or wrote
+		//! The grant in memory came from the file and no Start has used it in this
+		//! process yet: a request restores it with a dialog allowed (GP_OPEN_RESTORE_OR_ASK),
+		//! since the portal honours it only in the launch context it was issued for.
+		bool unverified;
 		//! That file was removed by someone else (the kill switch, the user) while
 		//! this process held its grant: the grant lives on in memory until the
 		//! process exits, but this process never writes the file again.
@@ -268,8 +277,27 @@ gp_serve_transfer(struct gnome_portal *p, const char *mime, uint32_t serial);
  * Session plumbing shared with u_desktop_gnome_capture.c (portal thread only).
  */
 
+//! How a session is opened.
+enum gp_open
+{
+	//! A request's dialog. No token is passed (a token cannot be widened); a timeout
+	//! or a Cancel leaves the grant set aside by gp_cap_begin_upgrade to the caller.
+	GP_OPEN_ASK = 0,
+	//! A silent restore with the token. A dialog (the portal no longer honours it) is
+	//! closed at once and the grant revoked; a refusal revokes it.
+	GP_OPEN_RESTORE,
+	//! A request's restore of a SAVED grant: the token is passed, and when the portal
+	//! does not honour it in this launch context its dialog is shown and is the answer
+	//! (the new token replaces the saved one; a Cancel revokes and removes it).
+	GP_OPEN_RESTORE_OR_ASK,
+};
+
+//! open_session with @p interactive ? GP_OPEN_ASK : GP_OPEN_RESTORE.
 enum u_desktop_result
 gp_open_session(struct gnome_portal *p, bool interactive, char *msg);
+
+enum u_desktop_result
+gp_open_session_mode(struct gnome_portal *p, enum gp_open mode, char *msg);
 
 void
 gp_session_close(struct gnome_portal *p);
@@ -326,6 +354,15 @@ gp_grant_save(struct gnome_portal *p);
  */
 void
 gp_grant_forget(struct gnome_portal *p, const char *token, const char *why);
+
+/*!
+ * A request found a saved grant this process has not used yet: restore it now
+ * (GP_OPEN_RESTORE_OR_ASK, the RemoteDesktop or the ScreenCast portal as the token
+ * says), so the answer is the portal's. Silent in the launch context the token was
+ * issued for; elsewhere the dialog once. u_desktop_gnome_capture.c.
+ */
+enum u_desktop_result
+gp_grant_verify(struct gnome_portal *p, char *msg);
 
 //! u_desktop_gnome_input.c: drop the compiled keymap.
 void
