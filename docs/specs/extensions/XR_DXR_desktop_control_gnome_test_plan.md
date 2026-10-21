@@ -509,3 +509,35 @@ desktop_control_probe script my_capture.txt   # request-scopes all / capture des
 
 Report per box: the `info` caps, pass/fail per row, capture times (min / median / max for
 11.2), and the backend log for every failure.
+
+## 12. Spec version 3 (PROPOSED, spec §11, ADR-056 Amendment 3)
+
+Held input, the shell target and the clipboard. Hardware-free first: the isolated headless
+GNOME harness (`~/dxr-rc/dc-headless`, `session.sh`, AT-SPI consent automation) with a GTK4 key
+logger (`harness/tools/keylog.js`, prints every key event with its keysym and keycode) and a
+GTK4 list for multi-select. Both tools: the smoke tool (backend, no safety layer: `keydown`,
+`keyup`, `buttondown`, `buttonup`, `modclick`) and `desktop_control_probe` (the OpenXR API with
+the safety layer: `act key-down|key-up|button-down|button-up`, `mods=` on click / drag /
+scroll). Run each block in ONE process.
+
+### 12a. Held input (§11.2–11.4)
+
+Observed: the isolated headless GNOME 50 harness, one 1920x1080 monitor, the probe through the
+in-process runtime with `DXR_PLUGIN_EXCLUSIVE=sim-display`, 2026-10-21 (`feat/desktop-control-v3`).
+
+| # | Check | Expected | Observed (harness) |
+|---|---|---|---|
+| 12.1 | Key logger focused; `keydown a`, wait 1.5 s, `keyup a` | one key-down, client autorepeat visible in the logger after the repeat delay (GTK repeats a held key itself), one key-up | 35 key-presses in 1517 ms (the first, then every 30 ms from 500 ms), one release. First run: released after ~550 ms "the user is active" — mutter's own repeat resets the idle counter; fixed with `holds_repeating_key` (spec §11.3) |
+| 12.2 | Alt held across several Tabs: `key-down alt`, (`key-down tab`, `key-up tab`) × 2, `key-up alt` (probe), five windows | the Alt+Tab switcher stays up while Alt is held and moves one window per Tab; releasing Alt switches; no key left down | `modal` 1 (the switcher) after each Tab with the logger still mutter's focus window, `modal` 0 after the release and the window two back focused (`T-THIRD`). First run: released at the first `key-up tab` — the hold read our own key-down as the user (the clock was read before the lock / idle queries); fixed (spec §11.3) |
+| 12.3 | modifier+click: a GTK list (selection MULTIPLE); `click` row 0, then `click … mods=ctrl` rows 2 and 4 (probe) | rows 0, 2, 4 selected | `[0] → [0, 2] → [0, 2, 4]` |
+| 12.4 | `button-down` at A, `move-pointer` B, C, `button-up` at D, all over the target (probe) | a drag A→B→C→D (motion events with the button down); the button released at D | press (40,40); motion (140,90), (240,140), (300,200) with BUTTON1; release (300,200) |
+| 12.5 | `button-up` at a point over another window | released where the pointer is (no move onto the other window), `REFUSED "target is not under the point (found …)"` | `REFUSED "target is not under the point (found gjs: T-LIST)"`; press and release at the same point, no motion |
+| 12.6 | Auto-release after the maximum hold: `key-down shift`, then a `move-pointer` every 0.9 s for 12 s | Shift released at ~10 s (logger: Shift_L up), audit `release … held for the maximum time (10000 ms)`; the next `key-up shift` says "it was released: …" | Shift_L down → up 10.06 s later; `key-up`: `REFUSED "the key is not held (it was released: held for the maximum time (10000 ms))"` |
+| 12.7 | Auto-release at the end of the burst: `key-down shift`, nothing for 3 s | released at ~2 s; the portal session closes ~2 s later (indicator gone), not before | Shift_L up 2.06 s after the press; "(2000 ms without an action)"; the RemoteDesktop session stayed open across the gap and closed only later |
+| 12.8 | Auto-release on the kill switch: `key-down ctrl`, then `displayxr-cli desktop stop` | Control_L up in the logger within ~100 ms; state SUSPENDED; audit `release … kill switch` | released, "it was released: kill switch", state SUSPENDED → GRANTED after `resume` |
+| 12.9 | The user types while a key is held (the harness's user-input session presses a key) | the held key released at once ("the user is active"); every queued action after it `REFUSED "held input was released …"` | the user's key arrived as `Q` (our Shift was still down), Shift_L up 18 ms later; "it was released: the user is active". The one key the user pressed during the hold is combined with it — the hold is released at the next check (≤ 50 ms), never waited out |
+| 12.10 | Focus moves to another app while Ctrl is held (raise another window) | Ctrl released ("focus moved to another window (<app>)") | not run in the harness (unit test `v3_release: keyboard focus …`) |
+| 12.11 | Lock the screen with a key held | released (the lock closes the portal session; mutter releases the device's keys); after unlock no key is down | released within ~0.1 s, reason "the user is active" (the shield resets the idle counter before ScreenSaver.GetActive says locked); the portal closed the session ("the screen lock closed the RemoteDesktop session") |
+| 12.12 | Kill the probe process (`kill -9`) with a key held | the EIS connection closes and mutter releases the device's keys: logger shows the key-up; nothing stuck | Shift_L up 8 ms after the kill |
+| 12.13 | GNOME session idle close with a key held | the session is NOT closed while the key is held | covered by 12.7: no close before the runtime's release at 2.06 s |
+

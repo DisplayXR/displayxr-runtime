@@ -42,6 +42,10 @@
 #define NAME_CAP 256
 #define MSG_CAP U_DESKTOP_MSG_SIZE
 #define U_DESKTOP_CONTROL_INJECTION_HISTORY 32
+//! Spec v3: every key and button the session can hold at once.
+#define HOLD_CAP (U_DESKTOP_HOLD_MAX_KEYS + 3)
+//! Spec v3: targets the input of one hold went to (focus moving to one is not "away").
+#define HOLD_OK_CAP 16
 
 static const char k_em_dash[] = "\xe2\x80\x94";
 
@@ -124,6 +128,19 @@ struct capture_burst
 	uint32_t w, h;
 };
 
+/*!
+ * Spec v3 (§11.2): one key or button this session holds — pressed by KEY_DOWN /
+ * BUTTON_DOWN and not released yet.
+ */
+struct held_input
+{
+	bool is_button;
+	struct u_desktop_chord key;   //!< !is_button: exactly one modifier bit or one key name
+	enum u_desktop_button button; //!< is_button
+	uint64_t target;              //!< the target it was pressed for
+	uint64_t pressed_ns;
+};
+
 struct queued_action
 {
 	uint64_t id;
@@ -201,6 +218,29 @@ struct u_desktop_control
 	uint32_t inj_next, inj_count;
 	struct u_desktop_window *list_buf;
 	uint32_t list_cap;
+
+	// --- spec v3: held input (§11.2–11.3), worker only ---
+	struct held_input held[HOLD_CAP]; //!< in press order; released last-first
+	uint32_t held_count;
+	uint64_t hold_start_ns; //!< the first press of the current hold
+	uint64_t hold_focus;    //!< the keyboard focus the hold last accepted
+	//! Targets of the input delivered during the hold: focus moving to one of them
+	//! (or a dialog of it) is our own doing, not focus moving away.
+	uint64_t hold_ok[HOLD_OK_CAP];
+	uint32_t hold_ok_count;
+	int32_t hold_px, hold_py; //!< where we last put the pointer while a button is held
+	uint64_t last_action_ns;  //!< when the last action finished (the burst-end clock)
+	uint64_t hold_max_ns;       //!< U_DESKTOP_HOLD_MAX_MS (tests may shorten it)
+	uint64_t hold_burst_gap_ns; //!< U_DESKTOP_HOLD_BURST_GAP_MS (tests may shorten it)
+	//! What the last auto-release let go of, and why (KEY_UP / BUTTON_UP explain it).
+	char released_reason[96];
+	struct u_desktop_chord released_keys[HOLD_CAP];
+	uint32_t released_key_count;
+	uint32_t released_buttons; //!< bit per enum u_desktop_button
+	//! Actions with an id up to this one were queued when held input was released
+	//! automatically: they assumed the hold, so they are refused (with drop_msg).
+	uint64_t drop_through_id;
+	char drop_msg[MSG_CAP];
 };
 
 
@@ -241,6 +281,10 @@ action_name(uint32_t type)
 	case U_DESKTOP_ACTION_CLICK: return "click";
 	case U_DESKTOP_ACTION_DRAG: return "drag";
 	case U_DESKTOP_ACTION_SCROLL: return "scroll";
+	case U_DESKTOP_ACTION_KEY_DOWN: return "key_down";
+	case U_DESKTOP_ACTION_KEY_UP: return "key_up";
+	case U_DESKTOP_ACTION_BUTTON_DOWN: return "button_down";
+	case U_DESKTOP_ACTION_BUTTON_UP: return "button_up";
 	default: return NULL;
 	}
 }
@@ -255,13 +299,30 @@ static bool
 is_pointer_action(uint32_t t)
 {
 	return t == U_DESKTOP_ACTION_POINTER_MOVE || t == U_DESKTOP_ACTION_CLICK || t == U_DESKTOP_ACTION_DRAG ||
-	       t == U_DESKTOP_ACTION_SCROLL;
+	       t == U_DESKTOP_ACTION_SCROLL || t == U_DESKTOP_ACTION_BUTTON_DOWN || t == U_DESKTOP_ACTION_BUTTON_UP;
 }
 
 static bool
 is_keyboard_action(uint32_t t)
 {
-	return t == U_DESKTOP_ACTION_TYPE_TEXT || t == U_DESKTOP_ACTION_KEY_CHORD;
+	return t == U_DESKTOP_ACTION_TYPE_TEXT || t == U_DESKTOP_ACTION_KEY_CHORD || t == U_DESKTOP_ACTION_KEY_DOWN ||
+	       t == U_DESKTOP_ACTION_KEY_UP;
+}
+
+//! Spec v3: the releases (never refused for focus, never wait for the user).
+static bool
+is_release_action(uint32_t t)
+{
+	return t == U_DESKTOP_ACTION_KEY_UP || t == U_DESKTOP_ACTION_BUTTON_UP;
+}
+
+//! Spec v3: KEY_DOWN / KEY_UP name exactly one key or one modifier.
+static bool
+chord_is_single(const struct u_desktop_chord *ch)
+{
+	uint32_t m = ch->mods & 0xFu;
+	bool one_mod = m != 0 && (m & (m - 1)) == 0;
+	return (one_mod && ch->key[0] == '\0') || (m == 0 && ch->key[0] != '\0');
 }
 
 //! Code points in valid UTF-8, or -1 if invalid.
@@ -1059,6 +1120,18 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		snprintf(why, why_cap, "coordinates are limited to +/-%d", L);
 		return false;
 	}
+	// Spec v3: modifiers held around a pointer action (XrDesktopActionModifiersDXR).
+	if (a->mods != 0) {
+		if ((a->mods & ~0xFu) != 0) {
+			snprintf(why, why_cap, "unknown modifier bits 0x%x", a->mods & ~0xFu);
+			return false;
+		}
+		if (a->type != U_DESKTOP_ACTION_CLICK && a->type != U_DESKTOP_ACTION_DRAG &&
+		    a->type != U_DESKTOP_ACTION_SCROLL) {
+			snprintf(why, why_cap, "modifiers apply to CLICK, DRAG and SCROLL only");
+			return false;
+		}
+	}
 	switch (a->type) {
 	case U_DESKTOP_ACTION_MOVE_RESIZE:
 		if (a->rect.w < 0 || a->rect.h < 0) {
@@ -1095,6 +1168,27 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		}
 		break;
 	}
+	case U_DESKTOP_ACTION_KEY_DOWN:
+	case U_DESKTOP_ACTION_KEY_UP: {
+		struct u_desktop_chord ch;
+		if (a->keys == NULL || a->keys[0] == '\0') {
+			snprintf(why, why_cap, "keys is required");
+			return false;
+		}
+		if (!u_desktop_chord_parse(a->keys, &ch) || !chord_is_single(&ch)) {
+			// Never echo the input (a key can be a character the user typed).
+			snprintf(why, why_cap, "keys must name exactly one key or one modifier");
+			return false;
+		}
+		break;
+	}
+	case U_DESKTOP_ACTION_BUTTON_DOWN:
+	case U_DESKTOP_ACTION_BUTTON_UP:
+		if (a->button > U_DESKTOP_BUTTON_MIDDLE) {
+			snprintf(why, why_cap, "unknown button %u", a->button);
+			return false;
+		}
+		break;
 	case U_DESKTOP_ACTION_CLICK:
 		if (a->click_count > U_DESKTOP_CONTROL_MAX_CLICKS) {
 			snprintf(why, why_cap, "clickCount must be 0..%u", U_DESKTOP_CONTROL_MAX_CLICKS);
@@ -1197,7 +1291,8 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 		memcpy(qa.text, a->text, len + 1);
 		qa.a.text = qa.text;
 	}
-	if (a->type == U_DESKTOP_ACTION_KEY_CHORD) {
+	if (a->type == U_DESKTOP_ACTION_KEY_CHORD || a->type == U_DESKTOP_ACTION_KEY_DOWN ||
+	    a->type == U_DESKTOP_ACTION_KEY_UP) {
 		size_t len = strlen(a->keys);
 		qa.keys = (char *)malloc(len + 1);
 		if (qa.keys == NULL) {
@@ -1354,6 +1449,14 @@ check_state(struct u_desktop_control *c, int32_t *result, char *msg)
 	return STEP_FAIL;
 }
 
+// Spec v3 held input (defined with the rest of it, below).
+static bool
+hold_should_release(struct u_desktop_control *c, bool between, char *why, size_t cap);
+static bool
+own_repeat_active(struct u_desktop_control *c);
+static void
+hold_release_all(struct u_desktop_control *c, const char *why, bool drop);
+
 //! §5 step 2: wait until the user has been idle for idle_ms (our own input excluded).
 static enum step_outcome
 wait_for_idle(struct u_desktop_control *c, int32_t *result, char *msg)
@@ -1362,6 +1465,17 @@ wait_for_idle(struct u_desktop_control *c, int32_t *result, char *msg)
 	for (;;) {
 		if (stopping(c)) {
 			return STEP_ABORT;
+		}
+		// Spec v3: while input is held, the user's own input (or a kill switch, a lock,
+		// a focus change, the maximum hold) releases it at once — never waited out.
+		if (c->held_count > 0) {
+			char why[96] = {0};
+			if (hold_should_release(c, false, why, sizeof(why))) {
+				hold_release_all(c, why, true);
+				*result = U_DESKTOP_XR_ERROR_REFUSED;
+				snprintf(msg, MSG_CAP, "%s", c->drop_msg);
+				return STEP_FAIL;
+			}
 		}
 		enum step_outcome so = check_state(c, result, msg);
 		if (so != STEP_OK) {
@@ -1378,6 +1492,9 @@ wait_for_idle(struct u_desktop_control *c, int32_t *result, char *msg)
 		uint64_t idle_ms = 0;
 		if (c->b->user_idle_ms == NULL || !c->b->user_idle_ms(c->b, &idle_ms)) {
 			return STEP_OK; // unknown: cannot wait on what we cannot see
+		}
+		if (own_repeat_active(c)) {
+			return STEP_OK; // the idle counter shows our own key repeat (spec §11.3): unknown
 		}
 		uint64_t now = os_monotonic_get_ns();
 		uint64_t idle_ns = idle_ms * NS_PER_MS;
@@ -1716,6 +1833,534 @@ release_button(struct u_desktop_control *c,
 	injection_end(c, t0);
 }
 
+
+/*
+ *
+ * Spec v3: held input (§11.2–11.3) — worker thread only.
+ *
+ * KEY_DOWN / BUTTON_DOWN leave a key or button pressed across actions. Everything
+ * held is released together (last pressed first) by the first of: the app's own
+ * KEY_UP / BUTTON_UP, the end of the action burst, the session ending, the state
+ * leaving GRANTED (kill switch, lock, deny, revocation), the maximum hold time,
+ * the user's own input, and keyboard focus moving to another app's window. An
+ * automatic release also refuses every action still queued at that moment: they
+ * were submitted assuming the hold, and must not run without it.
+ *
+ */
+
+static bool
+chord_is_shortcut(const struct u_desktop_chord *ch);
+
+static bool
+guard_release_ok(void *ctx)
+{
+	(void)ctx;
+	return true; // a release never asks (u_desktop.h: releasing what we hold is always allowed)
+}
+
+static bool
+chord_equal(const struct u_desktop_chord *a, const struct u_desktop_chord *b)
+{
+	return (a->mods & 0xFu) == (b->mods & 0xFu) && strncmp(a->key, b->key, sizeof(a->key)) == 0;
+}
+
+static int
+held_key_index(const struct u_desktop_control *c, const struct u_desktop_chord *k)
+{
+	for (uint32_t i = 0; i < c->held_count; i++) {
+		if (!c->held[i].is_button && chord_equal(&c->held[i].key, k)) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+static int
+held_button_index(const struct u_desktop_control *c, uint32_t button)
+{
+	for (uint32_t i = 0; i < c->held_count; i++) {
+		if (c->held[i].is_button && (uint32_t)c->held[i].button == button) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+static uint32_t
+held_key_count(const struct u_desktop_control *c)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < c->held_count; i++) {
+		n += c->held[i].is_button ? 0u : 1u;
+	}
+	return n;
+}
+
+//! The modifiers the session holds (enum u_desktop_mod bits).
+static uint32_t
+held_mods(const struct u_desktop_control *c)
+{
+	uint32_t m = 0;
+	for (uint32_t i = 0; i < c->held_count; i++) {
+		if (!c->held[i].is_button) {
+			m |= c->held[i].key.mods & 0xFu;
+		}
+	}
+	return m;
+}
+
+static bool
+hold_ok_has(const struct u_desktop_control *c, uint64_t id)
+{
+	for (uint32_t i = 0; i < c->hold_ok_count; i++) {
+		if (id != 0 && c->hold_ok[i] == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Input went to @p target during the hold: focus moving there is our own doing.
+static void
+hold_ok_add(struct u_desktop_control *c, uint64_t target)
+{
+	if (c->held_count == 0 || target == 0 || hold_ok_has(c, target)) {
+		return;
+	}
+	if (c->hold_ok_count < HOLD_OK_CAP) {
+		c->hold_ok[c->hold_ok_count++] = target;
+	} else {
+		memmove(&c->hold_ok[0], &c->hold_ok[1], sizeof(c->hold_ok[0]) * (HOLD_OK_CAP - 1));
+		c->hold_ok[HOLD_OK_CAP - 1] = target;
+	}
+}
+
+//! A press succeeded: the key / button is held from now on.
+static void
+hold_add(struct u_desktop_control *c, const struct held_input *h)
+{
+	if (c->held_count >= HOLD_CAP) {
+		return; // never reached: KEY_DOWN / BUTTON_DOWN refuse beyond the caps first
+	}
+	if (c->held_count == 0) {
+		c->hold_start_ns = h->pressed_ns;
+		c->hold_ok_count = 0;
+		uint64_t f = 0;
+		if (c->b->focused_window != NULL && c->b->focused_window(c->b, &f) == U_DESKTOP_OK) {
+			c->hold_focus = f;
+		} else {
+			c->hold_focus = 0;
+		}
+	}
+	c->held[c->held_count++] = *h;
+	hold_ok_add(c, h->target);
+}
+
+static void
+hold_remove(struct u_desktop_control *c, uint32_t idx)
+{
+	if (idx >= c->held_count) {
+		return;
+	}
+	memmove(&c->held[idx], &c->held[idx + 1], sizeof(c->held[0]) * (c->held_count - idx - 1));
+	c->held_count--;
+}
+
+//! A key is loggable as such: a modifier, or a key the held modifiers make a shortcut
+//! (the chord rule, spec §9). Anything else would be a character the agent typed.
+static bool
+hold_key_loggable(const struct u_desktop_control *c, const struct u_desktop_chord *k)
+{
+	if (k->key[0] == '\0') {
+		return true;
+	}
+	struct u_desktop_chord ch = *k;
+	ch.mods |= held_mods(c);
+	return chord_is_shortcut(&ch);
+}
+
+/*!
+ * Release everything held, last pressed first, ungated (also while suspended or
+ * locked). With @p drop, every action already submitted is refused when its turn
+ * comes ("held input was released (<why>) …"). One audit record.
+ */
+static void
+hold_release_all(struct u_desktop_control *c, const char *why, bool drop)
+{
+	if (c->held_count == 0) {
+		return;
+	}
+	struct u_desktop_input_guard guard = {c->held[0].target, guard_release_ok, NULL};
+	int32_t px = c->hold_px, py = c->hold_py;
+	if (c->b->get_pointer != NULL) {
+		// Release where the pointer IS: never drag the user's pointer back to ours.
+		int32_t x = 0, y = 0;
+		if (c->b->get_pointer(c->b, &x, &y) == U_DESKTOP_OK) {
+			px = x;
+			py = y;
+		}
+	}
+	uint32_t n = c->held_count;
+	c->released_key_count = 0;
+	c->released_buttons = 0;
+	for (uint32_t i = n; i > 0; i--) {
+		const struct held_input *h = &c->held[i - 1];
+		char m[MSG_CAP] = {0};
+		uint64_t t0 = injection_begin();
+		if (h->is_button) {
+			c->b->pointer_button(c->b, &guard, h->button, false, px, py, m);
+			c->released_buttons |= 1u << (uint32_t)h->button;
+		} else {
+			if (c->b->key_event != NULL) {
+				c->b->key_event(c->b, &guard, &h->key, false, false, m);
+			}
+			c->released_keys[c->released_key_count++] = h->key;
+		}
+		injection_end(c, t0);
+	}
+	c->held_count = 0;
+	c->hold_ok_count = 0;
+	snprintf(c->released_reason, sizeof(c->released_reason), "%s", why);
+
+	struct u_desktop_audit_record r;
+	memset(&r, 0, sizeof(r));
+	r.exe = c->exe;
+	r.action = "release";
+	r.chars = -1;
+	r.count = n;
+	r.result = "ok";
+	r.message = why;
+	u_desktop_audit_append(&r);
+	U_LOG_I("desktop_control: released %u held key(s) / button(s): %s", n, why);
+
+	if (drop) {
+		os_mutex_lock(&c->mutex);
+		c->drop_through_id = c->next_id;
+		os_mutex_unlock(&c->mutex);
+		snprintf(c->drop_msg, sizeof(c->drop_msg),
+		         "held input was released (%s); the input queued after it was dropped", why);
+	}
+}
+
+//! A key we hold is being auto-repeated by the OS as input (GNOME): the idle counter
+//! then shows our repeat, and the user's input cannot be told from it.
+static bool
+own_repeat_active(struct u_desktop_control *c)
+{
+	return c->held_count > 0 && c->b->holds_repeating_key != NULL && c->b->holds_repeating_key(c->b);
+}
+
+//! The user's own input since the hold began (not one of our injections).
+static bool
+hold_user_active(struct u_desktop_control *c)
+{
+	if (own_repeat_active(c)) {
+		return false; // cannot see the user under our own repeat (spec §11.3 residual)
+	}
+	uint64_t idle_ms = 0;
+	if (c->b->user_idle_ms == NULL || !c->b->user_idle_ms(c->b, &idle_ms)) {
+		return false; // unknown: cannot see the user
+	}
+	// The clock AFTER the query, as in the idle wait: a query that took a while then
+	// dates the input later, never earlier than it was (earlier would put our own
+	// injection outside its window and read it as the user's).
+	uint64_t now = os_monotonic_get_ns();
+	uint64_t idle_ns = idle_ms * NS_PER_MS;
+	uint64_t last = now > idle_ns ? now - idle_ns : 0;
+	if (last <= c->hold_start_ns + NS_PER_MS) {
+		return false; // older than the hold (an OS that does not count our injections)
+	}
+	uint64_t closes = 0;
+	// Inside one of our injection windows: ours (a keystroke inside its grace is the
+	// residual window, spec §9).
+	if (input_is_ours(c, last, &closes)) {
+		return false;
+	}
+	uint64_t newest_end = 0;
+	for (uint32_t k = 0; k < c->inj_count; k++) {
+		newest_end = c->inj[k].end_ns > newest_end ? c->inj[k].end_ns : newest_end;
+	}
+	U_LOG_I("desktop_control: hold: input %llu ms ago (the hold began %llu ms ago, our last injection ended %lld ms "
+	        "ago)",
+	        (unsigned long long)idle_ms, (unsigned long long)((now - c->hold_start_ns) / NS_PER_MS),
+	        newest_end != 0 ? (long long)((int64_t)(now - newest_end) / (int64_t)NS_PER_MS) : -1LL);
+	return true;
+}
+
+//! Keyboard focus went to an app window the hold's input did not go to.
+static bool
+hold_focus_moved(struct u_desktop_control *c, char *why, size_t cap)
+{
+	if (c->b->focused_window == NULL) {
+		return false;
+	}
+	uint64_t f = 0;
+	if (c->b->focused_window(c->b, &f) != U_DESKTOP_OK) {
+		snprintf(why, cap, "cannot tell where keyboard focus is");
+		return true;
+	}
+	if (f == c->hold_focus) {
+		return false;
+	}
+	if (f == 0 || hold_ok_has(c, f)) {
+		c->hold_focus = f; // nothing has the keyboard, or our own target does
+		return false;
+	}
+	// A dialog of a target, or no app window at all (shell UI, a switcher)?
+	char m[MSG_CAP] = {0};
+	uint32_t count = 0;
+	if (refresh_window_list(c, &count, m) != U_DESKTOP_XR_SUCCESS) {
+		snprintf(why, cap, "cannot tell where keyboard focus is");
+		return true;
+	}
+	const struct u_desktop_window *w = find_window(c, count, f);
+	if (w == NULL || hold_ok_has(c, w->parent_id)) {
+		c->hold_focus = f;
+		return false;
+	}
+	snprintf(why, cap, "focus moved to another window (%.60s)", w->app_id);
+	return true;
+}
+
+/*!
+ * Spec §11.3: must what the session holds be released now? @p between: the queue is
+ * empty (the burst-end clock runs). Fills @p why. Call only while something is held.
+ */
+static bool
+hold_should_release(struct u_desktop_control *c, bool between, char *why, size_t cap)
+{
+	uint64_t now = os_monotonic_get_ns();
+	enum reason r;
+	enum u_desktop_control_state s = update_state(c, &r);
+	if (s != U_DESKTOP_STATE_GRANTED) {
+		refusal_for_state(s, r, why, cap); // "kill switch", "screen locked", ...
+		return true;
+	}
+	uint64_t oldest = now;
+	for (uint32_t i = 0; i < c->held_count; i++) {
+		oldest = c->held[i].pressed_ns < oldest ? c->held[i].pressed_ns : oldest;
+	}
+	if (now - oldest >= c->hold_max_ns) {
+		snprintf(why, cap, "held for the maximum time (%llu ms)",
+		         (unsigned long long)(c->hold_max_ns / NS_PER_MS));
+		return true;
+	}
+	if (between && now - c->last_action_ns >= c->hold_burst_gap_ns) {
+		snprintf(why, cap, "the action burst ended (%llu ms without an action)",
+		         (unsigned long long)(c->hold_burst_gap_ns / NS_PER_MS));
+		return true;
+	}
+	if (hold_user_active(c)) {
+		snprintf(why, cap, "the user is active");
+		return true;
+	}
+	return hold_focus_moved(c, why, cap);
+}
+
+//! The worker's watch while the queue is empty and something is held.
+static void
+hold_watch(struct u_desktop_control *c)
+{
+	char why[96] = {0};
+	if (c->held_count > 0 && hold_should_release(c, true, why, sizeof(why))) {
+		hold_release_all(c, why, true);
+	}
+}
+
+//! Release ONE held key (KEY_UP) — never refused, never waits.
+static enum step_outcome
+run_key_up(struct u_desktop_control *c, const struct queued_action *qa, int32_t *result, char *msg)
+{
+	int idx = held_key_index(c, &qa->chord);
+	if (idx < 0) {
+		bool released = false;
+		for (uint32_t i = 0; i < c->released_key_count; i++) {
+			released = released || chord_equal(&c->released_keys[i], &qa->chord);
+		}
+		*result = U_DESKTOP_XR_ERROR_REFUSED;
+		if (released) {
+			snprintf(msg, MSG_CAP, "the key is not held (it was released: %s)", c->released_reason);
+		} else {
+			snprintf(msg, MSG_CAP, "the key is not held");
+		}
+		return STEP_FAIL;
+	}
+	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL};
+	uint64_t t0 = injection_begin();
+	enum u_desktop_result r = c->b->key_event(c->b, &guard, &qa->chord, false, false, msg);
+	injection_end(c, t0);
+	hold_remove(c, (uint32_t)idx); // whatever the OS said: the next release must not retry it forever
+	*result = r == U_DESKTOP_OK ? U_DESKTOP_XR_SUCCESS : U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+	if (r != U_DESKTOP_OK) {
+		snprintf(msg, MSG_CAP, "the key could not be released");
+	}
+	return *result == U_DESKTOP_XR_SUCCESS ? STEP_OK : STEP_FAIL;
+}
+
+/*!
+ * Release a held button at the action's point (BUTTON_UP): the pick there must be
+ * the target (as for a press) and the pointer moves there first, the button held (a
+ * drag motion). A release is never left undone: when the point does not verify, or
+ * the move fails, the button is released where the pointer is, and the action fails.
+ */
+static enum step_outcome
+run_button_up(struct u_desktop_control *c, const struct queued_action *qa, int32_t *result, char *msg)
+{
+	const struct u_desktop_action *a = &qa->a;
+	int idx = held_button_index(c, a->button);
+	if (idx < 0) {
+		*result = U_DESKTOP_XR_ERROR_REFUSED;
+		if ((c->released_buttons & (1u << a->button)) != 0) {
+			snprintf(msg, MSG_CAP, "the button is not held (it was released: %s)", c->released_reason);
+		} else {
+			snprintf(msg, MSG_CAP, "the button is not held");
+		}
+		return STEP_FAIL;
+	}
+	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL};
+	int32_t rx = c->hold_px, ry = c->hold_py;
+	enum step_outcome so = verify_pointer_target(c, a->target_window_id, a->x, a->y, result, msg);
+	if (so == STEP_OK) {
+		uint64_t t0 = injection_begin();
+		enum u_desktop_result rm = c->b->pointer_move(c->b, a->x, a->y, msg);
+		injection_end(c, t0);
+		if (rm == U_DESKTOP_OK) {
+			rx = a->x;
+			ry = a->y;
+			*result = U_DESKTOP_XR_SUCCESS;
+		} else {
+			*result = map_backend_result(rm, msg, MSG_CAP);
+			so = STEP_FAIL;
+		}
+	} else if (c->b->get_pointer != NULL) {
+		int32_t x = 0, y = 0;
+		if (c->b->get_pointer(c->b, &x, &y) == U_DESKTOP_OK) {
+			rx = x; // released where the pointer is: never moved onto an unverified point
+			ry = y;
+		}
+	}
+	char m[MSG_CAP] = {0};
+	uint64_t t0 = injection_begin();
+	enum u_desktop_result r = c->b->pointer_button(c->b, &guard, (enum u_desktop_button)a->button, false, rx, ry,
+	                                               so == STEP_OK ? msg : m);
+	injection_end(c, t0);
+	hold_remove(c, (uint32_t)idx);
+	if (so == STEP_OK && r != U_DESKTOP_OK) {
+		*result = map_backend_result(r, msg, MSG_CAP);
+		so = STEP_FAIL;
+	}
+	if (so == STEP_OK) {
+		hold_ok_add(c, a->target_window_id);
+	}
+	return so;
+}
+
+/*!
+ * What an action may not do while the session holds input (spec §11.2), checked
+ * before it waits for anything. REFUSED with @p msg, or STEP_OK.
+ */
+static enum step_outcome
+hold_conflicts(struct u_desktop_control *c, const struct queued_action *qa, int32_t *result, char *msg)
+{
+	const struct u_desktop_action *a = &qa->a;
+	const char *why = NULL;
+	switch (a->type) {
+	case U_DESKTOP_ACTION_KEY_DOWN:
+		if (held_key_index(c, &qa->chord) >= 0) {
+			why = "the key is already held";
+		} else if (held_key_count(c) >= U_DESKTOP_HOLD_MAX_KEYS) {
+			why = "too many keys held";
+		}
+		break;
+	case U_DESKTOP_ACTION_KEY_CHORD:
+		// Its modifiers may be held already (they are then not pressed again); its key may not.
+		for (uint32_t i = 0; qa->chord.key[0] != '\0' && i < c->held_count; i++) {
+			if (!c->held[i].is_button && c->held[i].key.key[0] != '\0' &&
+			    strncmp(c->held[i].key.key, qa->chord.key, sizeof(qa->chord.key)) == 0) {
+				why = "the chord's key is already held";
+			}
+		}
+		break;
+	case U_DESKTOP_ACTION_BUTTON_DOWN:
+	case U_DESKTOP_ACTION_CLICK:
+	case U_DESKTOP_ACTION_DRAG:
+		if (held_button_index(c, a->button) >= 0) {
+			why = a->type == U_DESKTOP_ACTION_BUTTON_DOWN ? "the button is already held"
+			                                              : "the button is held " "\xe2\x80\x94" " BUTTON_UP first";
+		}
+		break;
+	case U_DESKTOP_ACTION_TYPE_TEXT:
+		if (c->held_count > 0) {
+			why = "keys or buttons are held " "\xe2\x80\x94" " release them before typing text";
+		}
+		break;
+	default:
+		if (is_window_action(a->type) && c->held_count > 0) {
+			why = "keys or buttons are held " "\xe2\x80\x94" " release them before a window action";
+		}
+		break;
+	}
+	if (why == NULL) {
+		return STEP_OK;
+	}
+	*result = U_DESKTOP_XR_ERROR_REFUSED;
+	snprintf(msg, MSG_CAP, "%s", why);
+	return STEP_FAIL;
+}
+
+/*!
+ * Press the modifiers of a CLICK / DRAG / SCROLL (those not already held), in the
+ * order ctrl, shift, alt, super. Returns the ones pressed (release them with
+ * release_mods, always). On failure the ones pressed so far are released.
+ */
+static enum u_desktop_result
+press_mods(struct u_desktop_control *c,
+           const struct u_desktop_input_guard *guard,
+           uint32_t mods,
+           uint32_t *pressed,
+           char *msg)
+{
+	*pressed = 0;
+	static const uint32_t order[4] = {U_DESKTOP_MOD_CTRL, U_DESKTOP_MOD_SHIFT, U_DESKTOP_MOD_ALT,
+	                                  U_DESKTOP_MOD_SUPER};
+	for (int i = 0; i < 4; i++) {
+		if ((mods & order[i]) == 0) {
+			continue;
+		}
+		struct u_desktop_chord k;
+		memset(&k, 0, sizeof(k));
+		k.mods = order[i];
+		uint64_t t0 = injection_begin();
+		enum u_desktop_result r = c->b->key_event(c->b, guard, &k, true, false, msg);
+		injection_end(c, t0);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+		*pressed |= order[i];
+	}
+	return U_DESKTOP_OK;
+}
+
+static void
+release_mods(struct u_desktop_control *c, uint32_t pressed)
+{
+	static const uint32_t order[4] = {U_DESKTOP_MOD_SUPER, U_DESKTOP_MOD_ALT, U_DESKTOP_MOD_SHIFT,
+	                                  U_DESKTOP_MOD_CTRL};
+	struct u_desktop_input_guard guard = {1, guard_release_ok, NULL};
+	for (int i = 0; i < 4; i++) {
+		if ((pressed & order[i]) == 0) {
+			continue;
+		}
+		struct u_desktop_chord k;
+		memset(&k, 0, sizeof(k));
+		k.mods = order[i];
+		char m[MSG_CAP] = {0};
+		uint64_t t0 = injection_begin();
+		c->b->key_event(c->b, &guard, &k, false, false, m);
+		injection_end(c, t0);
+	}
+}
+
 //! §5 step 5. Called only after steps 1–4 passed.
 static enum step_outcome
 execute(struct u_desktop_control *c,
@@ -1731,6 +2376,7 @@ execute(struct u_desktop_control *c,
 	enum step_outcome so;
 	enum u_desktop_button btn = (enum u_desktop_button)a->button;
 	uint64_t t0;
+	uint32_t mods_pressed = 0; //!< spec v3: modifiers pressed around a pointer action
 
 	switch (a->type) {
 	case U_DESKTOP_ACTION_ACTIVATE:
@@ -1749,21 +2395,58 @@ execute(struct u_desktop_control *c,
 		r = b->type_text(b, guard, a->text, msg);
 		injection_end(c, t0);
 		break;
-	case U_DESKTOP_ACTION_KEY_CHORD:
+	case U_DESKTOP_ACTION_KEY_CHORD: {
+		// Spec v3: modifiers the session holds are down already (not pressed again).
+		struct u_desktop_chord ch = qa->chord;
+		ch.mods &= ~held_mods(c);
+		if (ch.mods == 0 && ch.key[0] == '\0') {
+			break; // every key of the chord is held: nothing to press
+		}
 		t0 = injection_begin();
-		r = b->key_chord(b, guard, &qa->chord, msg);
+		r = b->key_chord(b, guard, &ch, msg);
 		injection_end(c, t0);
+		break;
+	}
+	case U_DESKTOP_ACTION_KEY_DOWN:
+		t0 = injection_begin();
+		r = b->key_event(b, guard, &qa->chord, true, true, msg);
+		injection_end(c, t0);
+		if (r == U_DESKTOP_OK) {
+			struct held_input h = {false, qa->chord, U_DESKTOP_BUTTON_LEFT, a->target_window_id,
+			                       os_monotonic_get_ns()};
+			hold_add(c, &h);
+		}
+		break;
+	case U_DESKTOP_ACTION_BUTTON_DOWN:
+		so = move_and_reverify(c, a->target_window_id, a->x, a->y, result, msg);
+		if (so != STEP_OK) {
+			return so;
+		}
+		t0 = injection_begin();
+		r = b->pointer_button(b, guard, btn, true, a->x, a->y, msg);
+		injection_end(c, t0);
+		if (r == U_DESKTOP_OK) {
+			struct held_input h = {true, {0, {0}}, btn, a->target_window_id, os_monotonic_get_ns()};
+			hold_add(c, &h);
+			c->hold_px = a->x;
+			c->hold_py = a->y;
+		}
 		break;
 	case U_DESKTOP_ACTION_POINTER_MOVE:
 		t0 = injection_begin();
 		r = b->pointer_move(b, a->x, a->y, msg);
 		injection_end(c, t0);
+		if (r == U_DESKTOP_OK) {
+			c->hold_px = a->x; // a held button is dragged along
+			c->hold_py = a->y;
+		}
 		break;
 	case U_DESKTOP_ACTION_CLICK:
 		so = move_and_reverify(c, a->target_window_id, a->x, a->y, result, msg);
 		if (so != STEP_OK) {
 			return so;
 		}
+		r = press_mods(c, guard, a->mods & ~held_mods(c), &mods_pressed, msg);
 		for (uint32_t i = 0; i < a->click_count && r == U_DESKTOP_OK; i++) {
 			t0 = injection_begin();
 			r = b->pointer_button(b, guard, btn, true, a->x, a->y, msg);
@@ -1780,6 +2463,10 @@ execute(struct u_desktop_control *c,
 		so = move_and_reverify(c, a->target_window_id, a->x, a->y, result, msg);
 		if (so != STEP_OK) {
 			return so;
+		}
+		r = press_mods(c, guard, a->mods & ~held_mods(c), &mods_pressed, msg);
+		if (r != U_DESKTOP_OK) {
+			break;
 		}
 		t0 = injection_begin();
 		r = b->pointer_button(b, guard, btn, true, a->x, a->y, msg);
@@ -1807,11 +2494,20 @@ execute(struct u_desktop_control *c,
 		if (so != STEP_OK) {
 			return so;
 		}
+		r = press_mods(c, guard, a->mods & ~held_mods(c), &mods_pressed, msg);
+		if (r != U_DESKTOP_OK) {
+			break;
+		}
 		t0 = injection_begin();
 		r = b->scroll(b, guard, a->x, a->y, a->scroll_x, a->scroll_y, msg);
 		injection_end(c, t0);
 		break;
 	default: r = U_DESKTOP_ERR_UNSUPPORTED; break;
+	}
+	// Modifiers held around a pointer action are always released, whatever happened.
+	release_mods(c, mods_pressed);
+	if (r == U_DESKTOP_OK) {
+		hold_ok_add(c, a->target_window_id); // during a hold: focus may follow our input
 	}
 
 	*result = injection_result(c, g, a->type, r, msg);
@@ -1856,9 +2552,26 @@ audit_action(struct u_desktop_control *c,
 	}
 	r.chars = a->type == U_DESKTOP_ACTION_TYPE_TEXT ? utf8_count(a->text) : -1;
 	char keys[64];
-	if (a->type == U_DESKTOP_ACTION_KEY_CHORD && chord_is_shortcut(&qa->chord) &&
-	    u_desktop_chord_format(&qa->chord, keys, sizeof(keys))) {
+	if (a->type == U_DESKTOP_ACTION_KEY_CHORD) {
+		// With the modifiers the session holds (spec v3): a shortcut is judged by
+		// everything that was down.
+		struct u_desktop_chord ch = qa->chord;
+		ch.mods |= held_mods(c);
+		if (chord_is_shortcut(&ch) && u_desktop_chord_format(&ch, keys, sizeof(keys))) {
+			r.keys = keys;
+		}
+	} else if ((a->type == U_DESKTOP_ACTION_KEY_DOWN || a->type == U_DESKTOP_ACTION_KEY_UP) &&
+	           hold_key_loggable(c, &qa->chord) && u_desktop_chord_format(&qa->chord, keys, sizeof(keys))) {
+		// A modifier, or a key the held modifiers make a shortcut — never a character.
 		r.keys = keys;
+	} else if (a->mods != 0) {
+		// The modifiers held around a click / drag / scroll: never text.
+		struct u_desktop_chord ch;
+		memset(&ch, 0, sizeof(ch));
+		ch.mods = a->mods;
+		if (u_desktop_chord_format(&ch, keys, sizeof(keys))) {
+			r.keys = keys;
+		}
 	}
 	r.result = aborted ? "aborted" : result_str(result);
 	r.message = result == U_DESKTOP_XR_SUCCESS ? NULL : msg;
@@ -1878,6 +2591,56 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 	// success message comes from its verdict (below, after "done").
 	struct guard_ctx g = {c, false, R_OS_GRANTED, 0, U_DESKTOP_VERDICT_NONE};
 
+	// Spec v3 (§11.3): queued when held input was released automatically — it assumed
+	// the hold, so it never runs without it.
+	if (qa->id <= c->drop_through_id) {
+		result = U_DESKTOP_XR_ERROR_REFUSED;
+		snprintf(msg, sizeof(msg), "%s", c->drop_msg);
+		so = STEP_FAIL;
+		goto done;
+	}
+	// Held input: let go of it first if anything says so (this action is then dropped
+	// with the rest of the queue).
+	if (c->held_count > 0) {
+		char why[96] = {0};
+		if (hold_should_release(c, false, why, sizeof(why))) {
+			hold_release_all(c, why, true);
+			result = U_DESKTOP_XR_ERROR_REFUSED;
+			snprintf(msg, sizeof(msg), "%s", c->drop_msg);
+			so = STEP_FAIL;
+			goto done;
+		}
+	}
+	so = hold_conflicts(c, qa, &result, msg);
+	if (so != STEP_OK) {
+		goto done;
+	}
+	// A release (KEY_UP / BUTTON_UP) never waits and is never refused for focus: the
+	// hold check above already let go of everything if the state, the user or the
+	// focus says so.
+	if (is_release_action(a->type)) {
+		if (a->type == U_DESKTOP_ACTION_KEY_UP && c->b->key_event == NULL) {
+			result = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+			snprintf(msg, sizeof(msg), "this desktop backend cannot hold keys");
+			so = STEP_FAIL;
+			goto done;
+		}
+		so = a->type == U_DESKTOP_ACTION_KEY_UP ? run_key_up(c, qa, &result, msg)
+		                                        : run_button_up(c, qa, &result, msg);
+		// The audit names the target as for any action (after the release: never before it).
+		uint32_t n = 0;
+		char lm[MSG_CAP] = {0};
+		if ((c->b->caps & U_DESKTOP_CAP_LIST_WINDOWS) != 0 &&
+		    refresh_window_list(c, &n, lm) == U_DESKTOP_XR_SUCCESS) {
+			const struct u_desktop_window *tw = find_window(c, n, a->target_window_id);
+			if (tw != NULL) {
+				target_copy = *tw;
+				target = &target_copy;
+			}
+		}
+		goto done;
+	}
+
 	// 1. State.
 	so = check_state(c, &result, msg);
 	if (so != STEP_OK) {
@@ -1890,6 +2653,12 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 		result = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
 		snprintf(msg, sizeof(msg), "this desktop backend cannot %s",
 		         is_window_action(a->type) ? "act on windows" : "inject input");
+		so = STEP_FAIL;
+		goto done;
+	}
+	if ((a->type == U_DESKTOP_ACTION_KEY_DOWN || a->mods != 0) && c->b->key_event == NULL) {
+		result = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+		snprintf(msg, sizeof(msg), "this desktop backend cannot hold keys");
 		so = STEP_FAIL;
 		goto done;
 	}
@@ -1964,6 +2733,7 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 	so = execute(c, qa, &guard, &g, &result, msg);
 
 done:
+	c->last_action_ns = os_monotonic_get_ns(); // spec v3: the burst-end clock
 	// 6. Audit — every action, whatever its result.
 	audit_action(c, qa, target, result, msg, so == STEP_ABORT);
 	if (so == STEP_ABORT) {
@@ -1999,7 +2769,19 @@ worker(void *ptr)
 	os_mutex_lock(&c->mutex);
 	for (;;) {
 		while (!c->stop && c->q_count == 0) {
-			os_cond_wait(&c->cond, &c->mutex);
+			if (c->held_count == 0) {
+				os_cond_wait(&c->cond, &c->mutex);
+				continue;
+			}
+			// Spec v3: something is held and nothing is queued — watch for a reason
+			// to let go of it (the burst ended, the kill switch, the user, ...).
+			os_cond_wait_timeout_ns(&c->cond, &c->mutex, c->timing.idle_poll_ns);
+			if (c->stop || c->q_count > 0) {
+				break;
+			}
+			os_mutex_unlock(&c->mutex);
+			hold_watch(c);
+			os_mutex_lock(&c->mutex);
 		}
 		if (c->stop) {
 			break;
@@ -2016,6 +2798,8 @@ worker(void *ptr)
 		os_mutex_lock(&c->mutex);
 	}
 	os_mutex_unlock(&c->mutex);
+	// Spec v3: nothing stays held past the session (the backend is still alive here).
+	hold_release_all(c, "the session ended", false);
 	return NULL;
 }
 
@@ -2167,6 +2951,20 @@ u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c,
 		c->cap_burst_gap_ns = burst_gap_ns;
 	}
 	os_cond_broadcast(&c->cap_cond);
+	os_mutex_unlock(&c->mutex);
+}
+
+void
+u_desktop_control_set_hold_timing_for_tests(struct u_desktop_control *c, uint64_t max_ns, uint64_t burst_gap_ns)
+{
+	// Read by the worker only between actions; set before the first one.
+	os_mutex_lock(&c->mutex);
+	if (max_ns != 0) {
+		c->hold_max_ns = max_ns;
+	}
+	if (burst_gap_ns != 0) {
+		c->hold_burst_gap_ns = burst_gap_ns;
+	}
 	os_mutex_unlock(&c->mutex);
 }
 
@@ -2655,6 +3453,8 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->timing.own_grace_ns = timing != NULL && timing->own_grace_ns != 0 ? timing->own_grace_ns : DEFAULT_GRACE_NS;
 	c->timing.idle_max_wait_ns =
 	    timing != NULL && timing->idle_max_wait_ns != 0 ? timing->idle_max_wait_ns : DEFAULT_MAX_WAIT_NS;
+	c->hold_max_ns = (uint64_t)U_DESKTOP_HOLD_MAX_MS * NS_PER_MS;
+	c->hold_burst_gap_ns = (uint64_t)U_DESKTOP_HOLD_BURST_GAP_MS * NS_PER_MS;
 	c->cap_retention_ns = (uint64_t)U_DESKTOP_CAPTURE_RETENTION_MS * NS_PER_MS;
 	c->cap_burst_gap_ns = (uint64_t)U_DESKTOP_CAPTURE_BURST_GAP_MS * NS_PER_MS;
 	c->sc[SC_CONTROL].req_result = U_DESKTOP_ACCESS_UNKNOWN;

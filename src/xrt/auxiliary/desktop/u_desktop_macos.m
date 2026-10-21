@@ -435,6 +435,17 @@ struct macos_backend
 	uint64_t last_click_ns;
 	CGPoint last_click_pt;
 	int64_t click_count;
+	//! Spec v3: keys held by key_event (the code each was pressed as), and the
+	//! modifier flags they make — set on every event we post while they are down.
+	struct
+	{
+		struct u_desktop_chord key;
+		uint16_t code;
+		CGEventFlags flag; //!< the modifier's flag, 0 for a key
+		CGEventFlags extra; //!< SecondaryFn / NumericPad the key's events carry
+	} held[16];
+	uint32_t nheld;
+	CGEventFlags held_flags;
 };
 
 static inline struct macos_backend *
@@ -2920,7 +2931,7 @@ mac_key_chord(struct u_desktop_backend *b,
 	    {U_DESKTOP_MOD_SHIFT, KVK_SHIFT, kCGEventFlagMaskShift},
 	    {U_DESKTOP_MOD_SUPER, KVK_COMMAND, kCGEventFlagMaskCommand},
 	};
-	CGEventFlags flags = 0;
+	CGEventFlags flags = m->held_flags; // spec v3: modifiers the session holds stay down
 	bool ok = true;
 	uint32_t pressed = 0; // modifiers we pressed, released on every exit path
 	r = U_DESKTOP_OK;
@@ -3007,6 +3018,9 @@ mac_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 		set_msg(msg, "CGEvent creation failed");
 		return U_DESKTOP_ERR_FAILED;
 	}
+	if (m->held_flags != 0) {
+		CGEventSetFlags(e, m->held_flags); // spec v3: a drag with modifiers held
+	}
 	CGEventPost(kCGHIDEventTap, e);
 	CFRelease(e);
 	for (int i = 0; i < 20; i++) {
@@ -3084,6 +3098,9 @@ mac_pointer_button(struct u_desktop_backend *b,
 		return U_DESKTOP_ERR_FAILED;
 	}
 	CGEventSetIntegerValueField(e, kCGMouseEventClickState, m->click_count > 0 ? m->click_count : 1);
+	if (m->held_flags != 0) {
+		CGEventSetFlags(e, m->held_flags); // spec v3: cmd+click, shift+click, ...
+	}
 	if (button == U_DESKTOP_BUTTON_MIDDLE) {
 		CGEventSetIntegerValueField(e, kCGMouseEventButtonNumber, 2);
 	}
@@ -3125,9 +3142,124 @@ mac_scroll(struct u_desktop_backend *b,
 		return U_DESKTOP_ERR_FAILED;
 	}
 	CGEventSetLocation(e, CGPointMake(x, y));
+	if (m->held_flags != 0) {
+		CGEventSetFlags(e, m->held_flags); // spec v3: ctrl / cmd + scroll
+	}
 	CGEventPost(kCGHIDEventTap, e);
 	CFRelease(e);
 	return check_permission(msg);
+}
+
+/*!
+ * Spec v3: one key down or up, left so (u_desktop.h key_event). A modifier's flag is
+ * added to every event posted while it is held (chords, clicks, drags, scrolls), as
+ * the hardware would. A character key is the key producing it on the active layout,
+ * without the Shift the layout may put it on.
+ */
+static enum u_desktop_result
+mac_key_event(struct u_desktop_backend *b,
+              const struct u_desktop_input_guard *guard,
+              const struct u_desktop_chord *key,
+              bool down,
+              bool verify_focus,
+              char *msg)
+{
+	struct macos_backend *m = mb(b);
+	int slot = -1;
+	for (uint32_t i = 0; i < m->nheld; i++) {
+		if (m->held[i].key.mods == key->mods && strncmp(m->held[i].key.key, key->key, sizeof(key->key)) == 0) {
+			slot = (int)i;
+		}
+	}
+	if (!down) {
+		if (slot < 0) {
+			return U_DESKTOP_OK; // not held by us
+		}
+		uint16_t code = m->held[slot].code;
+		CGEventFlags extra = m->held[slot].extra;
+		m->held_flags &= ~m->held[slot].flag;
+		m->held[slot] = m->held[--m->nheld];
+		// Always posted (a release is never refused); a revoke drops it, but then the
+		// OS dropped the press as well.
+		if (!post_key(m, code, false, m->held_flags | extra)) {
+			set_msg(msg, "CGEvent creation failed");
+			return U_DESKTOP_ERR_FAILED;
+		}
+		return U_DESKTOP_OK;
+	}
+	if (slot >= 0) {
+		return U_DESKTOP_OK; // already down
+	}
+	if (m->nheld >= sizeof(m->held) / sizeof(m->held[0])) {
+		set_msg(msg, "too many keys held");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	static const struct
+	{
+		uint32_t mod;
+		uint16_t code;
+		CGEventFlags flag;
+	} mods[] = {
+	    {U_DESKTOP_MOD_CTRL, KVK_CONTROL, kCGEventFlagMaskControl},
+	    {U_DESKTOP_MOD_ALT, KVK_OPTION, kCGEventFlagMaskAlternate},
+	    {U_DESKTOP_MOD_SHIFT, KVK_SHIFT, kCGEventFlagMaskShift},
+	    {U_DESKTOP_MOD_SUPER, KVK_COMMAND, kCGEventFlagMaskCommand},
+	};
+	uint16_t code = 0;
+	CGEventFlags flag = 0, extra = 0;
+	if (key->key[0] == '\0') {
+		for (size_t i = 0; i < 4; i++) {
+			if (key->mods == mods[i].mod) {
+				code = mods[i].code;
+				flag = mods[i].flag;
+			}
+		}
+		if (flag == 0) {
+			set_msg(msg, "exactly one key or modifier");
+			return U_DESKTOP_ERR_FAILED;
+		}
+	} else {
+		const struct key_map *k = NULL;
+		for (size_t i = 0; i < sizeof(g_keys) / sizeof(g_keys[0]); i++) {
+			if (strcmp(g_keys[i].name, key->key) == 0) {
+				k = &g_keys[i];
+				break;
+			}
+		}
+		if (k != NULL) {
+			code = k->code;
+			extra = (k->fn ? kCGEventFlagMaskSecondaryFn : 0) | (k->np ? kCGEventFlagMaskNumericPad : 0);
+		} else {
+			UniChar ch = chord_char(key->key);
+			bool shift = false;
+			if (ch == 0) {
+				set_msg(msg, "this key has no macOS key code");
+				return U_DESKTOP_ERR_UNSUPPORTED;
+			}
+			if (!layout_char_to_key(m, ch, &code, &shift, msg)) {
+				return U_DESKTOP_ERR_UNSUPPORTED;
+			}
+		}
+	}
+	enum u_desktop_result r = verify_focus ? check_focus(m, guard, msg) : check_guard(guard, msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (!post_key(m, code, true, m->held_flags | flag | extra)) {
+		set_msg(msg, "CGEvent creation failed");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	r = check_permission(msg);
+	if (r != U_DESKTOP_OK) {
+		return r; // the OS dropped the press: nothing is held
+	}
+	m->held[m->nheld].key = *key;
+	m->held[m->nheld].code = code;
+	m->held[m->nheld].flag = flag;
+	m->held[m->nheld].extra = extra;
+	m->nheld++;
+	m->held_flags |= flag;
+	return U_DESKTOP_OK;
 }
 
 /*
@@ -3281,6 +3413,13 @@ mac_destroy(struct u_desktop_backend *b)
 		return;
 	}
 	access_cancel_join(m); // u_desktop.h "Lifetime": no answer may arrive after destroy
+	// Spec v3: nothing stays held past the backend (the common layer released it
+	// already; this is the second line).
+	while (m->nheld > 0 && m->src != NULL) {
+		m->nheld--;
+		m->held_flags &= ~m->held[m->nheld].flag;
+		post_key(m, m->held[m->nheld].code, false, m->held_flags | m->held[m->nheld].extra);
+	}
 	pthread_mutex_lock(&m->lock);
 	m->stop = true;
 	pthread_cond_broadcast(&m->cond);
@@ -3343,6 +3482,7 @@ u_desktop_backend_create_platform(void)
 	b->pointer_move = mac_pointer_move;
 	b->pointer_button = mac_pointer_button;
 	b->scroll = mac_scroll;
+	b->key_event = mac_key_event; // spec v3: KEY_DOWN / KEY_UP, modifiers around a pointer action
 	b->destroy = mac_destroy;
 	// Spec v2: consent per scope (ASK_AGAIN opens System Settings) and the display
 	// layout always; screen capture only where ScreenCaptureKit exists (weak-linked).

@@ -437,6 +437,8 @@ target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SO
 
 if(TARGET tests_desktop_control)
 	target_link_libraries(tests_desktop_control PRIVATE aux_desktop)
+	# Spec version 3 (ADR-056 Amendment 3): held input, the shell target, the clipboard.
+	target_sources(tests_desktop_control PRIVATE tests_desktop_control_v3.cpp)
 endif()
 
 # #1594 -- compiles oxr_layer_space.c straight into the unit and injects the

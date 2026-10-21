@@ -320,6 +320,9 @@ gp_session_forget(struct gnome_portal *p)
 	p->session_open = false;
 	p->session[0] = '\0';
 	p->clipboard_enabled = false;
+	// The device that held them is gone with the session (mutter releases its keys).
+	p->npressed_keys = 0;
+	p->pressed_buttons = 0;
 	p->clip_owner = false;
 	p->clip_is_paste = false;
 	p->paste_armed = false;
@@ -344,6 +347,8 @@ session_close(struct gnome_portal *p)
 		ei_teardown(p);
 		return;
 	}
+	// Spec v3: never leave a key or a button down behind a closing session.
+	gp_release_pressed(p);
 	ei_teardown(p);
 	if (p->session[0] != '\0' && p->c != NULL) {
 		DBusMessage *m = dbus_message_new_method_call(PORTAL_DEST, p->session, SESSION_IFACE, "Close");
@@ -1439,6 +1444,10 @@ portal_thread(void *arg)
 			uint64_t idle = now > last_use ? now - last_use : 0;
 			if (grabbing) {
 				// A capture is reading the streams; its end wakes the thread.
+				timeout = 250;
+			} else if (gp_anything_pressed(p)) {
+				// Spec v3: a held key / button keeps the session (and libei) open; the
+				// common layer releases it (burst end, max hold, ...), then this closes.
 				timeout = 250;
 			} else if (now < p->hold_until_ms) {
 				// prepare_input asked to keep it (verification / idle wait in progress).

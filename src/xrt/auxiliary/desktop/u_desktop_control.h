@@ -55,6 +55,16 @@ extern "C" {
 //! |point|, |point2|, |rect.offset| and rect.extent above this fail validation.
 #define U_DESKTOP_CONTROL_MAX_COORD 1000000
 
+/*
+ * Spec v3: held input (spec §11.2–11.4).
+ */
+//! Held keys and buttons are released once the oldest has been held this long.
+#define U_DESKTOP_HOLD_MAX_MS 10000
+//! ... or once the queue has been empty this long (the action burst ended).
+#define U_DESKTOP_HOLD_BURST_GAP_MS 2000
+//! At most this many keys held at once (KEY_DOWN beyond: REFUSED).
+#define U_DESKTOP_HOLD_MAX_KEYS 8
+
 //! Same values as XrDesktopControlStateDXR.
 enum u_desktop_control_state
 {
@@ -82,6 +92,11 @@ enum u_desktop_action_type
 	U_DESKTOP_ACTION_CLICK = 13,
 	U_DESKTOP_ACTION_DRAG = 14,
 	U_DESKTOP_ACTION_SCROLL = 15,
+	// Spec v3 (§11.2): held input.
+	U_DESKTOP_ACTION_KEY_DOWN = 16,
+	U_DESKTOP_ACTION_KEY_UP = 17,
+	U_DESKTOP_ACTION_BUTTON_DOWN = 18,
+	U_DESKTOP_ACTION_BUTTON_UP = 19,
 };
 
 //! Mirror of XrDesktopActionDXR. Strings are copied at submit.
@@ -96,7 +111,10 @@ struct u_desktop_action
 	uint32_t click_count;
 	int32_t scroll_x, scroll_y;
 	const char *text;
-	const char *keys;
+	const char *keys; //!< KEY_CHORD; spec v3: KEY_DOWN / KEY_UP (exactly one key or modifier)
+	//! Spec v3 (XrDesktopActionModifiersDXR): enum u_desktop_mod bits held around a
+	//! CLICK, DRAG or SCROLL; 0 = none (any other action type: validation failure).
+	uint32_t mods;
 };
 
 typedef void (*u_desktop_state_fn)(void *ctx, enum u_desktop_control_state state);
@@ -335,6 +353,17 @@ u_desktop_control_set_capture_timing_for_tests(struct u_desktop_control *c,
 
 int32_t
 u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba);
+
+
+// --- spec v3: held input (§11.2–11.3) ---------------------------------------
+
+/*!
+ * Tests only: shorten the maximum hold time and the burst gap after which held
+ * input is released (the spec fixes them at 10 s and 2 s). 0 keeps the spec value.
+ * Call before the first action.
+ */
+void
+u_desktop_control_set_hold_timing_for_tests(struct u_desktop_control *c, uint64_t max_ns, uint64_t burst_gap_ns);
 
 
 #ifdef __cplusplus

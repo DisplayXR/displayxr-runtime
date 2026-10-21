@@ -498,3 +498,65 @@ runtime made the product worse on exactly the OS where the dialog is the consent
 - The kill switch ends the grant of a process already running (decision 6), on every OS.
 - `displayxr-cli desktop forget <exe>` also removes the saved grants recorded for that
   executable, and `desktop status` lists the saved grants (decision 4).
+
+## Amendment 3 — Held input, the shell target and the clipboard (PROPOSED, 2026-10-21)
+
+**Status:** Proposed — spec version 3, not decided. Implemented on `feat/desktop-control-v3` for
+review (common layer, fake backend, probe, GNOME; Windows and macOS compiled, not yet run on
+hardware). Spec text:
+[`XR_DXR_desktop_control.md` §11](../specs/extensions/XR_DXR_desktop_control.md#11-spec-version-3-proposed).
+
+**Why an amendment and not a new ADR.** D1 already lists "key chords, pointer
+move/click/drag/scroll" under *input*; what is new is that input can now outlive one action
+(a key or a button held across several), that input can be meant for no app at all (the
+desktop shell), and a clipboard API. Everything runs in the app's process, under the CONTROL
+consent, behind the same kill switch, lock check, idle rule and audit log. Each addition widens
+what an agent can do, so each comes with the rule that keeps D3 true.
+
+### Context
+
+An app's agent is moving off its own helper process (a Python portal helper on GNOME) onto the
+runtime. That helper could hold keys and buttons (Alt over several Tabs in the switcher,
+shift+click on several items, a drag with stops), act where there is no app window (the top bar,
+the dock, the desktop, Super with nothing focused) and read and write the clipboard. Version 2
+has only whole chords, CLICK and DRAG, refuses pointer and key input with no app window under
+the point or focused, and has no clipboard API. Without these, the agent keeps its own helper —
+which holds a portal grant of its own, outside the kill switch and the audit log.
+
+### D10. Held input, released automatically
+
+KEY_DOWN / KEY_UP and BUTTON_DOWN / BUTTON_UP leave a key or a button pressed across actions;
+CLICK, DRAG and SCROLL take modifiers held around them. A held key is the most dangerous state
+input can be in: every key the *user* presses while it is down becomes a shortcut (Alt held + the
+user's F4 closes their window), and a key left down by a crashed or confused agent breaks the
+keyboard until the user finds it. So:
+
+1. **The runtime tracks everything the session holds** and releases it — all of it, last
+   pressed first — on the app's own up, at the end of the action burst (2 s without an action),
+   after 10 s, on the kill switch, a lock, a deny or a revocation, on the user's own input, on
+   keyboard focus moving to another app's window, and when the session ends. A release is never
+   gated and never waits: it is the one input the runtime sends while suspended.
+2. **The user's input releases, it is never waited out.** Version 1's idle rule waits for an
+   active user before injecting; with a key held, waiting is not enough — the user's keystrokes
+   are combining with ours already. The same timestamp test as §5 step 2 decides what is the
+   user's.
+3. **What was queued behind an automatic release is dropped.** Those actions were submitted
+   assuming the hold; run without it they mean something else (a Tab instead of Alt+Tab).
+4. **No text while anything is held**, and no window actions: held modifiers turn text into
+   shortcuts, and on GNOME a window action is itself a gesture of keys and clicks.
+5. **The hold is short by construction.** A 2 s burst gap means a hold cannot span an agent's
+   thinking turn: an agent submits a held sequence in one go, and the user never shares the
+   keyboard with a held key for long.
+6. **Second line in every backend**: a backend releases what it holds when its OS session ends
+   or it is destroyed; on GNOME a held key keeps the portal session open and is released before
+   the session closes, and mutter releases an EIS device's keys when the app dies.
+7. **Where the user cannot be seen, say so.** On GNOME mutter repeats a held letter or arrow as
+   input, which resets the only user-activity signal a client has (the IdleMonitor). The
+   user-input trigger is blind while such a key is held; the time limits and every state
+   trigger still apply. Held modifiers — the common case — do not repeat.
+
+Rejected: *a hold that lasts until KEY_UP with no automatic release* (a crashed agent leaves the
+user's keyboard broken); *releasing only the expired item* (releasing Alt while Shift stays down
+changes the meaning of what remains — everything goes together); *an event per automatic
+release* (useful, but the completion of the app's next KEY_UP and of every dropped action
+already says what happened — left as an option, spec §11.10).

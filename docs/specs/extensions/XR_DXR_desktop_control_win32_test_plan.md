@@ -226,6 +226,22 @@ modifier stays held (type in the terminal afterwards: plain lowercase letters).
   dialog (Ctrl+F, same process) must be accepted: `target NP`, open Find, `type "abc"` →
   `ok`, text lands in the Find box.
 
+## 11. Spec version 3 (PROPOSED, spec §11) — held input
+
+Through `desktop_control_probe` (the safety layer) against Notepad (`NP`) unless noted.
+
+| # | Check | Expected |
+|---|---|---|
+| 11.1 | `act key-down target=NP keys=shift`, `act key-down target=NP keys=a`, wait 1 s, `act key-up target=NP keys=a`, `act key-up target=NP keys=shift` | one capital A (injected key-downs do not auto-repeat), Shift up afterwards (`GetAsyncKeyState(VK_SHIFT)` 0; typing by hand gives lowercase) |
+| 11.2 | Alt held across Tabs: `key-down alt`, `key-down tab`, `key-up tab`, then the next Tabs (the switcher takes the foreground on Windows 10/11, so the target window no longer has focus: record what the next `key-down tab` answers), `key-up alt` | the switcher stays up and steps; releasing Alt switches; no Alt left down |
+| 11.3 | ctrl+click in Explorer's file list: `act click … mods=ctrl` on three files | three selected |
+| 11.4 | `button-down` / `move-pointer` × 2 / `button-up` on a Paint canvas | a polyline drawn through the stops |
+| 11.5 | `key-down ctrl`, then `displayxr-cli desktop stop` | Ctrl released within ~100 ms |
+| 11.6 | `key-down shift`, then type on the physical keyboard | Shift released at once; queued actions refused "held input was released (the user is active)" |
+| 11.7 | `key-down shift`, nothing for 3 s; `key-down shift` with a `move-pointer` every second for 12 s | released at ~2 s; released at ~10 s |
+| 11.8 | Elevated foreground (UIPI) and `key-down` | `REFUSED` (`target runs as administrator`), nothing pressed |
+| 11.9 | Kill the probe with a key held | the key stays logically down until pressed physically (an OS limitation: record it) — at most until the user presses it |
+
 ## What to send back
 
 The full stdout of each step, the Windows build (`winver`), the per-monitor scale factors,

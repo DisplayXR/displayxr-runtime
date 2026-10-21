@@ -98,6 +98,13 @@ struct u_desktop_fake
 	enum u_desktop_result capture_result;
 	uint32_t capture_delay_ms;
 	uint32_t capture_count;
+
+	// spec v3: held keys (key_event), in press order
+	struct u_desktop_chord held_keys[16];
+	uint32_t held_key_count;
+	//! spec v3: like GNOME, a held non-modifier key is auto-repeated as input (every
+	//! repeat resets the idle counter) and holds_repeating_key says so.
+	bool key_repeat;
 };
 
 static struct u_desktop_fake *
@@ -392,6 +399,28 @@ fake_request_access(struct u_desktop_backend *b,
 	done(ctx, answer);
 }
 
+//! Spec v3: a held key the fake auto-repeats (key_repeat on, a non-modifier key held).
+static bool
+fake_repeating_locked(struct u_desktop_fake *f)
+{
+	for (uint32_t i = 0; f->key_repeat && i < f->held_key_count; i++) {
+		if (f->held_keys[i].key[0] != '\0') {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+fake_holds_repeating_key(struct u_desktop_backend *b)
+{
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	bool r = fake_repeating_locked(f);
+	os_mutex_unlock(&f->mutex);
+	return r;
+}
+
 static bool
 fake_is_locked(struct u_desktop_backend *b)
 {
@@ -414,8 +443,8 @@ fake_user_idle_ms(struct u_desktop_backend *b, uint64_t *out_ms)
 	struct u_desktop_fake *f = fake(b);
 	os_mutex_lock(&f->mutex);
 	uint64_t now = os_monotonic_get_ns();
-	if (f->user_active) {
-		f->last_input_ns = now;
+	if (f->user_active || fake_repeating_locked(f)) {
+		f->last_input_ns = now; // the user, or (spec v3) the OS repeating a key we hold
 	}
 	bool known = !f->idle_unknown;
 	uint64_t ms = (now - f->last_input_ns) / 1000000;
@@ -753,6 +782,60 @@ fake_key_chord(struct u_desktop_backend *b,
 	} else if (pressed > 0) {
 		// A stop releases every key it pressed.
 		log_line(f, "keys released %u", pressed);
+	}
+	os_mutex_unlock(&f->mutex);
+	return r;
+}
+
+/*!
+ * Spec v3: press / release ONE key and leave it so. A press is a batch ("keydown"
+ * hook, still_allowed, the focus re-check with @p check_focus); a release always
+ * happens (a key not held: no-op OK). Log: "keydown <name>" / "keyup <name>".
+ */
+static enum u_desktop_result
+fake_key_event(struct u_desktop_backend *b,
+               const struct u_desktop_input_guard *guard,
+               const struct u_desktop_chord *key,
+               bool down,
+               bool check_focus,
+               char *msg)
+{
+	struct u_desktop_fake *f = fake(b);
+	count_call(f);
+	action_delay(f);
+	char name[48] = {0};
+	u_desktop_chord_format(key, name, sizeof(name));
+	if (!down) {
+		os_mutex_lock(&f->mutex);
+		for (uint32_t i = 0; i < f->held_key_count; i++) {
+			if (f->held_keys[i].mods == key->mods && strcmp(f->held_keys[i].key, key->key) == 0) {
+				memmove(&f->held_keys[i], &f->held_keys[i + 1],
+				        sizeof(f->held_keys[0]) * (f->held_key_count - i - 1));
+				f->held_key_count--;
+				log_line(f, "keyup %s", name);
+				note_input_locked(f);
+				break;
+			}
+		}
+		os_mutex_unlock(&f->mutex);
+		return U_DESKTOP_OK;
+	}
+	batch_hook(f, "keydown", 0);
+	if (guard == NULL || !guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	os_mutex_lock(&f->mutex);
+	enum u_desktop_result r = forced_failure(f, "key_event", msg);
+	if (r == U_DESKTOP_OK && check_focus && !focus_ok_locked(f, guard->target_id)) {
+		r = U_DESKTOP_ERR_REFUSED;
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "focus moved");
+		}
+	}
+	if (r == U_DESKTOP_OK && f->held_key_count < sizeof(f->held_keys) / sizeof(f->held_keys[0])) {
+		f->held_keys[f->held_key_count++] = *key;
+		log_line(f, "keydown %s", name);
+		note_input_locked(f);
 	}
 	os_mutex_unlock(&f->mutex);
 	return r;
@@ -1153,6 +1236,8 @@ u_desktop_fake_create(void)
 	f->base.pointer_move = fake_pointer_move;
 	f->base.pointer_button = fake_pointer_button;
 	f->base.scroll = fake_scroll;
+	f->base.key_event = fake_key_event;
+	f->base.holds_repeating_key = fake_holds_repeating_key;
 	f->base.capture_access_status = fake_capture_access_status;
 	f->base.request_scopes = fake_request_scopes;
 	f->base.monitors = fake_monitors;
@@ -1582,5 +1667,50 @@ u_desktop_fake_expected_pixel(struct u_desktop_fake *f, int32_t x, int32_t y, ui
 	os_mutex_lock(&f->mutex);
 	recompute_z(f);
 	expected_pixel_locked(f, x, y, out);
+	os_mutex_unlock(&f->mutex);
+}
+
+
+/*
+ *
+ * Spec v3: held keys.
+ *
+ */
+
+size_t
+u_desktop_fake_held_keys(struct u_desktop_fake *f, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return 0;
+	}
+	out[0] = '\0';
+	size_t n = 0;
+	os_mutex_lock(&f->mutex);
+	for (uint32_t i = 0; i < f->held_key_count; i++) {
+		char name[48] = {0};
+		u_desktop_chord_format(&f->held_keys[i], name, sizeof(name));
+		int w = snprintf(out + n, cap - n, "%s%s", n > 0 ? " " : "", name);
+		if (w < 0 || (size_t)w >= cap - n) {
+			break;
+		}
+		n += (size_t)w;
+	}
+	os_mutex_unlock(&f->mutex);
+	return n;
+}
+
+void
+u_desktop_fake_set_key_event_supported(struct u_desktop_fake *f, bool supported)
+{
+	os_mutex_lock(&f->mutex);
+	f->base.key_event = supported ? fake_key_event : NULL;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat)
+{
+	os_mutex_lock(&f->mutex);
+	f->key_repeat = repeat;
 	os_mutex_unlock(&f->mutex);
 }

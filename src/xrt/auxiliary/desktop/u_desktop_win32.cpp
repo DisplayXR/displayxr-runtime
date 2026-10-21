@@ -679,6 +679,16 @@ struct win32_backend
 
 	SRWLOCK prompt_lock;
 	struct prompt_state *prompt; // the consent prompt (joinable), or NULL
+
+	// Spec v3, worker only: keys held by key_event, with the virtual key and layout
+	// each was pressed with (its release sends the same scan code).
+	struct held_key
+	{
+		struct u_desktop_chord key;
+		WORD vk;
+		HKL hkl;
+	} held[16];
+	uint32_t nheld;
 };
 
 static inline win32_backend *
@@ -2080,6 +2090,93 @@ win32_key_chord(struct u_desktop_backend *b,
 	return r;
 }
 
+/*!
+ * Spec v3: one key down or up, left so (u_desktop.h key_event). SendInput keeps
+ * Windows' key state: a modifier held here applies to every later click, chord and
+ * scroll, as a physical one would. A character key is the key producing it on the
+ * foreground thread's layout, without the Shift the layout may put it on. Injected
+ * key-downs do not auto-repeat (the typematic repeat is the keyboard's).
+ */
+static enum u_desktop_result
+win32_key_event(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
+                const struct u_desktop_chord *key,
+                bool down,
+                bool verify_focus,
+                char *msg)
+{
+	win32_backend *wb = win32(b);
+	int slot = -1;
+	for (uint32_t i = 0; i < wb->nheld; i++) {
+		if (wb->held[i].key.mods == key->mods && strncmp(wb->held[i].key.key, key->key, sizeof(key->key)) == 0) {
+			slot = (int)i;
+		}
+	}
+	if (!down) {
+		if (slot < 0) {
+			return U_DESKTOP_OK; // not held by us
+		}
+		INPUT in;
+		key_vk_hkl(&in, wb->held[slot].vk, wb->held[slot].hkl, true);
+		wb->held[slot] = wb->held[--wb->nheld];
+		// Never gated: a release always goes out (retried once, like a chord's).
+		enum u_desktop_result r = send_inputs(&in, 1, msg);
+		if (r != U_DESKTOP_OK) {
+			SendInput(1, &in, sizeof(INPUT));
+		}
+		return r;
+	}
+	if (slot >= 0) {
+		return U_DESKTOP_OK; // already down
+	}
+	if (wb->nheld >= sizeof(wb->held) / sizeof(wb->held[0])) {
+		set_msg(msg, "too many keys held");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	HWND fg = root_of(GetForegroundWindow());
+	if (window_above_us(fg)) {
+		set_msg(msg, "%s", k_msg_elevated);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	HKL hkl = GetKeyboardLayout(fg != NULL ? GetWindowThreadProcessId(fg, NULL) : 0);
+	WORD vk = 0;
+	if (key->key[0] == '\0') {
+		switch (key->mods) {
+		case U_DESKTOP_MOD_CTRL: vk = VK_LCONTROL; break;
+		case U_DESKTOP_MOD_SHIFT: vk = VK_LSHIFT; break;
+		case U_DESKTOP_MOD_ALT: vk = VK_LMENU; break;
+		case U_DESKTOP_MOD_SUPER: vk = VK_LWIN; break;
+		default: set_msg(msg, "exactly one key or modifier"); return U_DESKTOP_ERR_FAILED;
+		}
+	} else {
+		char name[sizeof(key->key) + 1];
+		snprintf(name, sizeof(name), "%.*s", (int)sizeof(key->key), key->key);
+		bool need_shift = false; // modifiers are explicit for a held key
+		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &need_shift, msg);
+		if (r != U_DESKTOP_OK) {
+			return r;
+		}
+	}
+	enum u_desktop_result r = verify_focus ? check_focus(guard, msg) : U_DESKTOP_OK;
+	if (!verify_focus && !guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		r = U_DESKTOP_ERR_REFUSED;
+	}
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	INPUT in;
+	key_vk_hkl(&in, vk, hkl, false);
+	r = send_inputs(&in, 1, msg);
+	if (r == U_DESKTOP_OK) {
+		wb->held[wb->nheld].key = *key;
+		wb->held[wb->nheld].vk = vk;
+		wb->held[wb->nheld].hkl = hkl;
+		wb->nheld++;
+	}
+	return r;
+}
+
 static enum u_desktop_result
 win32_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 {
@@ -2193,6 +2290,15 @@ win32_destroy(struct u_desktop_backend *b)
 {
 	win32_backend *wb = win32(b);
 
+	// Spec v3: nothing stays held past the backend (the common layer released it
+	// already; this is the second line).
+	while (wb->nheld > 0) {
+		wb->nheld--;
+		INPUT in;
+		key_vk_hkl(&in, wb->held[wb->nheld].vk, wb->held[wb->nheld].hkl, true);
+		SendInput(1, &in, sizeof(INPUT));
+	}
+
 	// Lifetime (u_desktop.h): never return while a consent answer is owed.
 	AcquireSRWLockExclusive(&wb->prompt_lock);
 	prompt_state *p = wb->prompt;
@@ -2254,6 +2360,7 @@ u_desktop_backend_create_platform(void)
 	b->pointer_move = win32_pointer_move;
 	b->pointer_button = win32_pointer_button;
 	b->scroll = win32_scroll;
+	b->key_event = win32_key_event; // spec v3: KEY_DOWN / KEY_UP, modifiers around a pointer action
 	b->destroy = win32_destroy;
 	return b;
 }

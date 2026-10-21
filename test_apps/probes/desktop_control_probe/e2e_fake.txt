@@ -106,3 +106,37 @@ expect-capture XR_SUCCESS
 run displayxr-cli desktop status
 sleep 2500
 run displayxr-cli desktop audit --tail 8
+# spec v3 (§11): held input — keys and buttons stay down across actions until released
+act key-down target=102 keys=alt
+expect XR_SUCCESS
+act key-down target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=tab
+expect XR_SUCCESS
+act key-down target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=alt
+expect XR_SUCCESS
+act key-up target=102 keys=alt
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key-down target=102 keys=ctrl+a
+expect XR_ERROR_VALIDATION_FAILURE
+act click target=102 x=1100 y=300 mods=ctrl+shift
+expect XR_SUCCESS
+act key mods=ctrl target=102 keys=a
+expect XR_ERROR_VALIDATION_FAILURE
+act button-down target=102 x=1100 y=300
+expect XR_SUCCESS
+act move-pointer target=102 x=1200 y=350
+expect XR_SUCCESS
+act button-up target=102 x=1300 y=400
+expect XR_SUCCESS
+# the burst ends (2 s without an action): what is held is released by the runtime
+act key-down target=102 keys=shift
+expect XR_SUCCESS
+sleep 2600
+act key-up target=102 keys=shift
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+run displayxr-cli desktop audit --tail 6

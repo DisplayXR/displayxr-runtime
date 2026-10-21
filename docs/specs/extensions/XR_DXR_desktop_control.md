@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Name** | `XR_DXR_desktop_control` |
-| **Spec version** | 2 (screen capture, §10) |
+| **Spec version** | 3 (PROPOSED: held input, the shell target and the clipboard, §11) — 2 (screen capture, §10) is the last decided version |
 | **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. Screen capture (spec version 2, §10, ADR-056 Amendment 1): the common layer, the fake backend, the probe, the CLI and the **GNOME** backend are implemented; GNOME capture awaits its hardware run (gnome test plan §11). Windows and macOS report no CAPTURE capability yet (the CAPTURE scope is `UNSUPPORTED` there). |
 | **Header** | [`XR_DXR_desktop_control.h`](../../../src/external/openxr_includes/openxr/XR_DXR_desktop_control.h) |
 | **Decision** | [ADR-056](../../adr/ADR-056-desktop-control-runs-in-the-app.md) |
@@ -971,3 +971,198 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   warm; the 98 pt strip under the built-in display (a gap of the layout) came back as exactly
   592,704 withheld pixels; a region and the same rect cut from a desktop capture matched
   byte for byte, and so did `screencapture -R` of the same rect.
+
+## 11. Spec version 3 (PROPOSED)
+
+> **PROPOSED — not decided** ([ADR-056 Amendment 3](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-3--held-input-the-shell-target-and-the-clipboard-proposed-2026-10-21)).
+> Implemented on `feat/desktop-control-v3` so it can be reviewed and tried: the common layer,
+> the fake backend, the probe, the smoke tool and the GNOME backend (run in the headless GNOME
+> harness, [GNOME test plan](XR_DXR_desktop_control_gnome_test_plan.md) §12); Windows and macOS
+> are implemented and compiled by CI but not run on hardware yet. §11.10 lists what needs the
+> maintainer's decision. Sections 1–10 are unchanged by this one.
+
+An app's agent that moves off its own helper process onto the runtime needs what that helper
+could do and version 2 cannot: keys and buttons **held** across steps (Alt held over several
+Tabs, shift+click on several items, a drag with stops), input **where there is no app window**
+(the top bar, the dock, the desktop, keys with nothing focused) and the **clipboard**. Each
+comes with a safety rule of its own; everything in §5 still applies.
+
+### 11.1 Additions to the header
+
+Structure types continue the 1004999420–429 decade (421 onwards):
+
+```c
+#define XR_DXR_desktop_control_SPEC_VERSION 3
+
+#define XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR  ((XrStructureType)1004999421)
+
+typedef enum XrDesktopActionTypeDXR {
+    ...                                          // 0–15 as in version 1
+    XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR    = 16, // press and hold one key (`keys`)
+    XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR      = 17, // release a held key
+    XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR = 18, // press and hold `button` at `point`
+    XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR   = 19, // release a held `button` at `point`
+} XrDesktopActionTypeDXR;
+
+typedef XrFlags64 XrDesktopKeyModifierFlagsDXR;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR  = 0x1;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR = 0x2;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR   = 0x4; // Option
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR = 0x8; // Win / Command
+
+//! Chained on XrDesktopActionDXR::next of a CLICK, DRAG or SCROLL (§11.4).
+typedef struct XrDesktopActionModifiersDXR {
+    XrStructureType               type;      // XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR
+    const void* XR_MAY_ALIAS      next;
+    XrDesktopKeyModifierFlagsDXR  modifiers;
+} XrDesktopActionModifiersDXR;
+```
+
+`XrDesktopActionDXR` keeps its layout; `keys` also carries the one key of KEY_DOWN / KEY_UP.
+
+### 11.2 Held keys and buttons
+
+| Action | Fields | Runs like | Then |
+|---|---|---|---|
+| `KEY_DOWN` | `targetWindowId`, `keys` | a `KEY_CHORD`: §5 steps 1–5 (state, idle wait, target exists, **keyboard focus on the target**) | the key stays down |
+| `KEY_UP` | `targetWindowId`, `keys` | **never waits and is never refused for focus** (§5 steps 2 and 4 do not apply) | the key is up |
+| `BUTTON_DOWN` | `targetWindowId`, `point`, `button` | a `CLICK`'s press: the pick at `point` is the target, move, re-pick, press | the button stays down |
+| `BUTTON_UP` | `targetWindowId`, `point`, `button` | never waits; the pick at `point` is verified like a `CLICK`'s | released at `point` |
+
+- **`keys`** names exactly **one** key or **one** modifier, in the chord grammar (§5): `shift`,
+  `alt`, `ctrl`, `super` (and their aliases), or one key name (`tab`, `f5`, `a`). Two names
+  (`ctrl+a`, `ctrl+shift`), an empty string or an unknown name is `XR_ERROR_VALIDATION_FAILURE`
+  at submit; the message never echoes the input. A character key (a letter, digit or
+  punctuation name) presses the key that produces that character on the active layout,
+  **without** adding the Shift the layout may put it on: modifiers are always explicit here.
+- `KEY_DOWN` of a key the session holds already: `REFUSED` "the key is already held". At most 8
+  keys held at once (`REFUSED` "too many keys held"). `BUTTON_DOWN` of a held button: `REFUSED`
+  "the button is already held".
+- `KEY_UP` / `BUTTON_UP` of something the session does not hold: `REFUSED` "the key is not held"
+  / "the button is not held", with "(it was released: <why>)" when an automatic release (§11.3)
+  let go of it.
+- `BUTTON_UP`: when the pick at `point` verifies, the pointer moves there with the button down
+  (a drag motion) and the button is released there. When it does not, the button is released
+  **where the pointer is** — it is never moved onto an unverified point — and the action
+  completes `REFUSED` with the pick message (§9). A failed move releases where the pointer is,
+  with the move's error. A release always happens.
+- `POINTER_MOVE` while a button is held drags it; its point is verified as always (the window
+  under the destination), which makes a drag with stops a sequence of verified moves.
+- While the session holds input:
+  - `KEY_CHORD` presses only what is not held (`ctrl+shift+a` with `shift` held presses Ctrl and
+    A); a chord whose key is held is `REFUSED`;
+  - `TYPE_TEXT` and every window action are `REFUSED` ("keys or buttons are held — release them
+    …"): held modifiers would turn text into shortcuts, and the GNOME window gestures are input;
+  - `CLICK` / `DRAG` of a held button is `REFUSED` ("the button is held — BUTTON_UP first").
+- **Autorepeat** is the OS's, as for a physical key: on GNOME the focused Wayland client (and
+  Xwayland for X11 apps) repeats a held key itself — measured in the headless harness: a letter
+  held 1.5 s gave a GTK4 window 35 key-presses (the first, then one every 30 ms from 500 ms) and
+  one release. mutter also repeats the key for the shell, and **each of its repeats resets the
+  idle counter** (§11.3). Windows does not repeat injected key-downs (the typematic repeat is the
+  keyboard's); macOS was not measured.
+
+### 11.3 Automatic release
+
+Everything the session holds is released **together, last pressed first**, by the first of:
+
+| Trigger | Checked | Reason (audit `message`, `KEY_UP` / `BUTTON_UP` "it was released: …") |
+|---|---|---|
+| The action burst ends: the queue has been empty for **2 s** | every 50 ms while the queue is empty | "the action burst ended (2000 ms without an action)" |
+| The oldest held item has been held for **10 s** | before every action, every 50 ms between them, during the idle wait | "held for the maximum time (10000 ms)" |
+| The state leaves `GRANTED`: kill switch, lock, a deny, revocation, an unreadable store | same | "kill switch", "screen locked", "disabled by the user", … (§9) |
+| The user's own input since the first press: input whose OS timestamp is outside every injection window of ours (§5 step 2's rule, grace included) | same | "the user is active" |
+| Keyboard focus moves to an app window that none of the hold's input went to, nor a dialog of one | same | "focus moved to another window (<app id>)" |
+| The session ends (`xrDestroySession`) | at destroy, after the action in flight | "the session ended" |
+
+- A release is never gated: it goes out while the kill switch is on or the screen is locked —
+  releasing what the agent holds is the only input the runtime sends then.
+- Focus moving to **nothing**, to **shell UI** that is not an app window (the Windows Alt+Tab
+  switcher), to a window the hold's own input went to (shift held, a verified click on another
+  window focuses it), or to a dialog of one, is not "away".
+- **The user's input** is judged as in §5 step 2, by the OS's last-input timestamp against our
+  injection windows, with the clock read **after** the idle query (a slow query then dates an
+  input later, never earlier — earlier put our own key-down outside its window in the first
+  harness run and released every hold within ~150 ms). A screen lock often reads as input too
+  (the shield resets the counter): the hold is released either way.
+- **A key the OS repeats as input** (GNOME: a held letter, digit, Tab, an arrow — not a modifier
+  or a lock key) resets the idle counter every ~30 ms; the user's own input cannot be told from
+  it then. While the session holds such a key the user-input trigger is blind, and the idle wait
+  of the next actions does not wait (it would wait for our own repeat): the burst end, the
+  10 s maximum, the kill switch, the lock, a deny and a focus change still release it. Holding
+  modifiers (the common case: Alt+Tab, shift / ctrl + click) keeps the user-input trigger.
+- **Queued input is dropped.** An automatic release (any trigger but the session end) refuses
+  every action already submitted at that moment, when its turn comes: `REFUSED` "held input was
+  released (<why>); the input queued after it was dropped". They were submitted assuming the
+  hold; a queued `KEY_DOWN tab` must not run as a plain Tab once Alt is gone. Actions submitted
+  after the release run normally, so an app that submits one step at a time checks each
+  completion before it submits the next.
+- Second line: each backend tracks what it holds and releases it when its OS session ends or on
+  destroy; on GNOME a held key or button keeps the portal session open (no idle close) and is
+  released before the session is closed.
+- **Residual windows, stated plainly:** the user's first keystroke during a hold is combined with
+  what is held (measured on GNOME: a `q` typed with the agent's Shift down arrived as `Q`; Shift
+  was released 18 ms later) — the release comes at the next check, at most one 50 ms poll later;
+  a user keystroke inside one of our injection windows or its 30 ms grace is not seen (§9); on
+  GNOME the user is not seen at all while a repeating key is held (above); a hold can exceed 10 s by the length of one action (the check runs between
+  actions); the 2 s burst gap means a hold cannot span an agent's "thinking" turn — an agent
+  submits a held sequence in one go.
+- **The process dies with a key held** (crash, `kill -9`): on GNOME the EIS connection closes
+  and mutter releases the device's keys (measured: Shift released 8 ms after the kill). On
+  Windows and macOS an injected key-down stays logically down until a key-up of that key —
+  bounded by nothing but the user pressing it (to be measured, Windows test plan 11.9).
+
+### 11.4 Modifiers around a click, drag or scroll
+
+`XrDesktopActionModifiersDXR`, chained on a `CLICK`, `DRAG` or `SCROLL`, holds its modifiers
+around it: the pointer moves to `point` and the pick is re-verified, then the modifiers are
+pressed (ctrl, shift, alt, super), then the click / drag / scroll runs (its press re-verified as
+in §5), then the modifiers are released in reverse order — **always**, whatever happened in
+between (a refused press releases them with nothing clicked). A modifier the session already
+holds (`KEY_DOWN`) is neither pressed again nor released. On any other action type, or with an
+unknown bit, it is `XR_ERROR_VALIDATION_FAILURE`; the first such structure in the chain counts.
+Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+scroll to zoom.
+
+### 11.7 Version gating and errors
+
+- A version 2 runtime refuses `KEY_DOWN`, `KEY_UP`, `BUTTON_DOWN` and `BUTTON_UP` at submit
+  (`XR_ERROR_VALIDATION_FAILURE`, unknown `actionType`). It **ignores** a chained
+  `XrDesktopActionModifiersDXR` (OpenXR's rule for unknown structures) and would run the plain
+  click. Apps read the extension's `specVersion` (`xrEnumerateInstanceExtensionProperties`) and
+  use any of §11 only when it is 3 or more.
+- New completion results, all existing codes: `REFUSED` for the hold rules above and for every
+  dropped action; `FEATURE_UNSUPPORTED` "this desktop backend cannot hold keys" where a backend
+  has no `key_event` (none today); keyboard results keep §9's fixed strings.
+
+### 11.8 Audit
+
+- `key_down` / `key_up` records name the key by the chord rule (§9): a modifier always; any other
+  key only when the modifiers held with it make a shortcut (ctrl or super, not ctrl+alt) — a key
+  that would type a character is recorded without `keys`.
+- `click` / `drag` / `scroll` records carry their modifiers in `keys` ("ctrl+shift").
+- `button_down` / `button_up` carry `x` / `y` and the target like a click.
+- Every automatic release is one `release` record with `count` (items released) and the reason
+  as `message`; the dropped actions are each audited `refused` with the drop message.
+
+### 11.9 Backends
+
+| | GNOME Wayland | Windows | macOS |
+|---|---|---|---|
+| key down / up | libei `keyboard_key` on the portal session's keyboard (one key per frame); the evdev code of the press is kept for the release; a held non-modifier key is reported as repeating (`holds_repeating_key`, §11.3) | `SendInput` of the left-hand modifier VK or the layout's VK (same scan code on release) | `CGEvent` key events; a held modifier's flag is set on every event posted while it is down (chords, clicks, drags, scrolls) |
+| button down / up | libei button on the absolute pointer, the press carrying the verified point (as in v2) | `SendInput` `MOUSEEVENTF_*DOWN/UP` at the verified point | `CGEvent` mouse down / up, drags while held |
+| modifiers around a pointer action | the same key events | the same `SendInput` key events (Windows' key state applies them to the click) | the flags on the mouse events |
+| second line | keys / buttons libei holds are released before the portal session closes; the session is not closed idle while one is held | held keys released on destroy | held keys released on destroy |
+
+### 11.10 Needs the maintainer's decision
+
+1. **The limits**: 10 s maximum hold, a 2 s burst gap, 8 keys — fixed in the spec (like the
+   capture limits), or store settings?
+2. **Dropping queued input** after an automatic release (§11.3), versus running it without the
+   hold. Dropping is proposed (a queued key must not change meaning); an alternative is an event
+   announcing the release, which this proposal does not add.
+3. **Modifiers as a chained structure** (OpenXR's usual extension of an input structure; a
+   version 2 runtime ignores it) versus new action types (refused by version 2, but a second
+   CLICK / DRAG / SCROLL each). Chained is proposed; apps gate on the spec version anyway.
+4. **`SCROLL` takes modifiers too.** The request was for CLICK and DRAG; SCROLL is added
+   because ctrl+scroll (zoom) is the same mechanism and a common agent step.
+5. **Focus moving to shell UI** (not an app window) is not "away" (§11.3), so a Windows Alt+Tab
+   switcher does not end an Alt hold. Stricter: any focus change releases.

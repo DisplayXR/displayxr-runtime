@@ -133,7 +133,7 @@ u_desktop_fake_set_idle_unknown(struct u_desktop_fake *f, bool unknown);
 void
 u_desktop_fake_set_action_delay_ms(struct u_desktop_fake *f, uint32_t ms);
 
-//! Make the next action calls of kind @p op ("window_op", "type_text", "key_chord",
+//! Make the next action calls of kind @p op ("window_op", "type_text", "key_chord", "key_event",
 //! "pointer_move", "pointer_button", "scroll"; NULL = all) fail with @p r.
 void
 u_desktop_fake_set_action_result(struct u_desktop_fake *f, const char *op, enum u_desktop_result r);
@@ -177,7 +177,7 @@ u_desktop_fake_clear_log(struct u_desktop_fake *f);
 
 /*!
  * Called before every injection batch (outside the fake's lock — it may change
- * the desktop or the store): @p op is "prepare", "type", "key", "press",
+ * the desktop or the store): @p op is "prepare", "type", "key", "keydown" (spec v3), "press",
  * "scroll" or "window_op"; @p index counts batches within the call. One more op,
  * "pressed", fires AFTER a button press was delivered (the button is held).
  */
@@ -288,6 +288,25 @@ u_desktop_fake_capture_count(struct u_desktop_fake *f);
 //! The fake's picture of desktop point (@p x, @p y), RGBA — what a test expects.
 void
 u_desktop_fake_expected_pixel(struct u_desktop_fake *f, int32_t x, int32_t y, uint8_t out[4]);
+
+// --- spec v3: held keys ----------------------------------------------------------
+//
+// key_event logs "keydown <name>" / "keyup <name>" (canonical chord form, e.g.
+// "shift", "tab"); its press is a batch ("keydown" hook). Buttons held by
+// BUTTON_DOWN are u_desktop_fake_pressed_buttons().
+
+//! The keys the fake holds, in press order, space-separated ("shift tab"); "" none.
+size_t
+u_desktop_fake_held_keys(struct u_desktop_fake *f, char *out, size_t cap);
+
+//! false: no key_event (KEY_DOWN / KEY_UP / modifiers are UNSUPPORTED). Default true.
+void
+u_desktop_fake_set_key_event_supported(struct u_desktop_fake *f, bool supported);
+
+//! true: like GNOME, a held non-modifier key is auto-repeated AS INPUT — the idle
+//! counter reads 0 while one is held, and holds_repeating_key says so. Default false.
+void
+u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat);
 
 #ifdef __cplusplus
 }

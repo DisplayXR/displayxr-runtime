@@ -180,6 +180,13 @@ enum u_desktop_result
 gnome_portal_keys(struct gnome_portal *p, const uint32_t *codes, const bool *press, uint32_t n, char *msg);
 
 /*!
+ * Spec v3: one key down or up, left so (KEY_DOWN / KEY_UP, a modifier around a click).
+ * A release of a key libei no longer holds (its session closed) is a no-op OK.
+ */
+enum u_desktop_result
+gnome_portal_key(struct gnome_portal *p, uint32_t evdev_code, bool down, char *msg);
+
+/*!
  * Open or silently restore the session (the only slow step), before the common
  * layer verifies the target; keeps it open for the verification + idle wait.
  */
@@ -313,6 +320,15 @@ struct gnome_backend
 	struct gnome_portal *portal; //!< NULL: no RemoteDesktop portal (no consent path)
 	struct gnome_atspi *atspi;   //!< NULL: no a11y bus
 	bool warned_schema;
+
+	//! Spec v3, worker only: the evdev code each held key was pressed as, so its
+	//! release sends the same code even if the layout changed meanwhile.
+	struct
+	{
+		struct u_desktop_chord key;
+		uint32_t code;
+	} held[GNOME_PORTAL_MAX_KEYS];
+	uint32_t nheld;
 };
 
 static inline struct gnome_backend *
