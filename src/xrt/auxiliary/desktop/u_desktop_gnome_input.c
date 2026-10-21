@@ -27,6 +27,17 @@
 #define CLIP_MAX_BYTES (1u << 20)
 //! Gap between consecutive key / button events, so every client sees each one.
 #define KEY_GAP_MS 8
+/*!
+ * A new session's virtual keyboard: no key until it has been resumed this long.
+ * Every RemoteDesktop session (also the silent restore after
+ * SESSION_IDLE_CLOSE_MS without input) brings a new libei keyboard. While mutter
+ * switches to it, the focused client gets wl_keyboard.leave, and enter again
+ * 1-9 ms after the device is resumed (GNOME 50, nested shell, 18 of 18). A key
+ * sent right after the resume raced that enter: 4 of 21 first keys after a
+ * restore were lost, and a GtkEntry selects all on the enter, so a key that did
+ * arrive replaced the field. Only a session's first keys wait; a burst does not.
+ */
+#define GNOME_KEYBOARD_SETTLE_MS 300
 //! The agent's text stays the clipboard at least this long after the paste keystroke.
 #define PASTE_SERVE_MS 1200
 //! A write arriving late keeps serving this much longer (more mime types may follow).
@@ -273,6 +284,10 @@ send_keys(struct gnome_portal *p, const uint32_t *codes, const bool *press, uint
 	if (d == NULL) {
 		gp_set_msg(msg, "the remote-desktop session has no keyboard");
 		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	uint64_t now = gdbus_now_ms();
+	if (p->kbd_resumed_ms != 0 && now < p->kbd_resumed_ms + GNOME_KEYBOARD_SETTLE_MS) {
+		gdbus_sleep_ms((uint32_t)(p->kbd_resumed_ms + GNOME_KEYBOARD_SETTLE_MS - now));
 	}
 	for (uint32_t i = 0; i < n; i++) {
 		g_ei.keyboard_key(d, codes[i], press[i]);
