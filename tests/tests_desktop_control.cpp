@@ -46,6 +46,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <linux/input-event-codes.h>
+#endif
 
 namespace {
 
@@ -434,6 +437,162 @@ TEST_CASE("desktop_chord: valid chords parse to mods + one canonical key", "[des
 	REQUIRE(u_desktop_chord_parse("shift+alt+ctrl+super+f5", &c));
 	REQUIRE(u_desktop_chord_format(&c, out, sizeof(out)));
 	CHECK(std::string(out) == "ctrl+shift+alt+super+f5");
+}
+
+TEST_CASE("desktop_chord: keypad, lock, media and right-hand modifier keys", "[desktop][chord]")
+{
+	u_desktop_chord c;
+	std::vector<std::string> added = {
+	    "numpad0",         "numpad1",
+	    "numpad2",         "numpad3",
+	    "numpad4",         "numpad5",
+	    "numpad6",         "numpad7",
+	    "numpad8",         "numpad9",
+	    "numpadmultiply",  "numpadadd",
+	    "numpadsubtract",  "numpaddivide",
+	    "numpaddecimal",   "numpadenter",
+	    "pause",           "numlock",
+	    "scrolllock",      "mediaplaypause",
+	    "mediatracknext",  "mediatrackprevious",
+	    "mediastop",       "audiovolumeup",
+	    "audiovolumedown", "audiovolumemute",
+	    "rightctrl",       "rightshift",
+	    "rightalt",        "rightsuper",
+	};
+	for (const auto &k : added) {
+		INFO(k);
+		REQUIRE(u_desktop_chord_parse(k.c_str(), &c));
+		CHECK(c.mods == 0);
+		CHECK(std::string(c.key) == k);
+		// Every one is in the list the backends' maps are checked against.
+		bool listed = false;
+		for (size_t i = 0; u_desktop_chord_named_key(i) != nullptr; i++) {
+			listed = listed || k == u_desktop_chord_named_key(i);
+		}
+		CHECK(listed);
+	}
+	// Case-insensitive, combined with modifiers, formatted canonically.
+	REQUIRE(u_desktop_chord_parse("Ctrl+NumpadAdd", &c));
+	CHECK(c.mods == U_DESKTOP_MOD_CTRL);
+	CHECK(std::string(c.key) == "numpadadd");
+	REQUIRE(u_desktop_chord_parse("shift + RightAlt", &c));
+	CHECK(c.mods == U_DESKTOP_MOD_SHIFT);
+	CHECK(std::string(c.key) == "rightalt");
+	char out[64];
+	REQUIRE(u_desktop_chord_parse("super+alt+ctrl+mediatrackprevious", &c));
+	REQUIRE(u_desktop_chord_format(&c, out, sizeof(out)));
+	CHECK(std::string(out) == "ctrl+alt+super+mediatrackprevious");
+	// A right-hand modifier is a KEY: one per chord, and never a modifier of another key.
+	CHECK_FALSE(u_desktop_chord_parse("rightctrl+c", &c));
+	CHECK_FALSE(u_desktop_chord_parse("rightshift+rightalt", &c));
+	// Near misses are not keys (no aliases: one canonical name each).
+	for (const char *s :
+	     {"numpad",      "numpad10", "numpad-1", "kp1",        "kp_add",       "numpadplus",   "numpadminus",
+	      "numpadequal", "multiply", "rctrl",    "right_ctrl", "rightcontrol", "controlright", "rightmeta",
+	      "altgr",       "break",    "scroll",   "volumeup",   "playpause",    "mute",         "nexttrack"}) {
+		INFO("key '" << s << "'");
+		CHECK_FALSE(u_desktop_chord_parse(s, &c));
+	}
+}
+
+TEST_CASE("desktop_chord: every key name has a GNOME (libei) key", "[desktop][chord]")
+{
+	// Named keys: a fixed evdev code, or (punctuation) a character found on the layout.
+	size_t n = 0;
+	for (size_t i = 0; u_desktop_chord_named_key(i) != nullptr; i++, n++) {
+		const char *k = u_desktop_chord_named_key(i);
+		INFO(k);
+		CHECK((u_desktop_gnome_key_code(k) != 0) != (u_desktop_gnome_key_char(k) != 0)); // exactly one
+	}
+	CHECK(n == 59);
+	for (char ch = 'a'; ch <= 'z'; ch++) {
+		const char k[2] = {ch, '\0'};
+		CHECK(u_desktop_gnome_key_char(k) == (uint32_t)ch);
+		CHECK(u_desktop_gnome_key_code(k) == 0);
+	}
+	for (char ch = '0'; ch <= '9'; ch++) {
+		const char k[2] = {ch, '\0'};
+		CHECK(u_desktop_gnome_key_char(k) == (uint32_t)ch);
+	}
+	for (int f = 1; f <= 24; f++) {
+		std::string k = "f" + std::to_string(f);
+		INFO(k);
+		CHECK(u_desktop_gnome_key_code(k.c_str()) != 0);
+	}
+	// The smoke tool drives the backend directly: names stay case-insensitive there.
+	CHECK(u_desktop_gnome_key_code("Escape") == u_desktop_gnome_key_code("escape"));
+	CHECK(u_desktop_gnome_key_code("NumpadEnter") == u_desktop_gnome_key_code("numpadenter"));
+	CHECK(u_desktop_gnome_key_code("F12") == u_desktop_gnome_key_code("f12"));
+	CHECK(u_desktop_gnome_key_char("Z") == 'z');
+	for (const char *bad : {"", "f0", "f25", "f01", "f123", "numpad10", "nope"}) {
+		INFO(bad);
+		CHECK(u_desktop_gnome_key_code(bad) == 0);
+	}
+	CHECK(u_desktop_gnome_key_code(nullptr) == 0);
+	CHECK(u_desktop_gnome_key_char(nullptr) == 0);
+#ifdef __linux__
+	// The literal evdev codes ARE linux/input-event-codes.h's.
+	const std::vector<std::pair<const char *, uint32_t>> evdev = {
+	    {"enter", KEY_ENTER},
+	    {"tab", KEY_TAB},
+	    {"escape", KEY_ESC},
+	    {"backspace", KEY_BACKSPACE},
+	    {"delete", KEY_DELETE},
+	    {"insert", KEY_INSERT},
+	    {"home", KEY_HOME},
+	    {"end", KEY_END},
+	    {"pageup", KEY_PAGEUP},
+	    {"pagedown", KEY_PAGEDOWN},
+	    {"left", KEY_LEFT},
+	    {"right", KEY_RIGHT},
+	    {"up", KEY_UP},
+	    {"down", KEY_DOWN},
+	    {"space", KEY_SPACE},
+	    {"capslock", KEY_CAPSLOCK},
+	    {"printscreen", KEY_SYSRQ},
+	    {"menu", KEY_COMPOSE},
+	    {"numpad0", KEY_KP0},
+	    {"numpad1", KEY_KP1},
+	    {"numpad2", KEY_KP2},
+	    {"numpad3", KEY_KP3},
+	    {"numpad4", KEY_KP4},
+	    {"numpad5", KEY_KP5},
+	    {"numpad6", KEY_KP6},
+	    {"numpad7", KEY_KP7},
+	    {"numpad8", KEY_KP8},
+	    {"numpad9", KEY_KP9},
+	    {"numpadmultiply", KEY_KPASTERISK},
+	    {"numpadadd", KEY_KPPLUS},
+	    {"numpadsubtract", KEY_KPMINUS},
+	    {"numpaddivide", KEY_KPSLASH},
+	    {"numpaddecimal", KEY_KPDOT},
+	    {"numpadenter", KEY_KPENTER},
+	    {"pause", KEY_PAUSE},
+	    {"numlock", KEY_NUMLOCK},
+	    {"scrolllock", KEY_SCROLLLOCK},
+	    {"mediaplaypause", KEY_PLAYPAUSE},
+	    {"mediatracknext", KEY_NEXTSONG},
+	    {"mediatrackprevious", KEY_PREVIOUSSONG},
+	    {"mediastop", KEY_STOPCD},
+	    {"audiovolumeup", KEY_VOLUMEUP},
+	    {"audiovolumedown", KEY_VOLUMEDOWN},
+	    {"audiovolumemute", KEY_MUTE},
+	    {"rightctrl", KEY_RIGHTCTRL},
+	    {"rightshift", KEY_RIGHTSHIFT},
+	    {"rightalt", KEY_RIGHTALT},
+	    {"rightsuper", KEY_RIGHTMETA},
+	    {"f1", KEY_F1},
+	    {"f10", KEY_F10},
+	    {"f11", KEY_F11},
+	    {"f12", KEY_F12},
+	    {"f13", KEY_F13},
+	    {"f24", KEY_F24},
+	};
+	for (const auto &e : evdev) {
+		INFO(e.first);
+		CHECK(u_desktop_gnome_key_code(e.first) == e.second);
+	}
+#endif
 }
 
 TEST_CASE("desktop_chord: malformed chords are rejected", "[desktop][chord]")
@@ -1592,20 +1751,24 @@ TEST_CASE("fix6_privacy: only real shortcuts are audited — never AltGr / Optio
 	TempDir dir;
 	Harness h(&kFast);
 	h.grant();
-	for (const char *k : {"ctrl+alt+q", "alt+e", "option+shift+2", "ctrl+alt+super+e", "shift+a", "q"}) {
+	for (const char *k : {"ctrl+alt+q", "alt+e", "option+shift+2", "ctrl+alt+super+e", "shift+a", "q",
+	                      // A keypad digit types a digit; a bare right-hand Alt is AltGr / an IME toggle.
+	                      "numpad5", "shift+numpadadd", "rightalt", "ctrl+alt+numpad1", "audiovolumeup"}) {
 		CHECK(h.run(chord(101, k)).result == U_DESKTOP_XR_SUCCESS);
 	}
 	CHECK(h.run(chord(101, "ctrl+s")).result == U_DESKTOP_XR_SUCCESS);
 	CHECK(h.run(chord(101, "super+shift+s")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(chord(101, "ctrl+numpadadd")).result == U_DESKTOP_XR_SUCCESS); // zoom in: a shortcut
 	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
 	INFO(audit);
 	CHECK(audit.find("\"keys\":\"ctrl+s\"") != std::string::npos);
 	CHECK(audit.find("\"keys\":\"shift+super+s\"") != std::string::npos);
+	CHECK(audit.find("\"keys\":\"ctrl+numpadadd\"") != std::string::npos);
 	size_t n = 0;
 	for (size_t p = audit.find("\"keys\""); p != std::string::npos; p = audit.find("\"keys\"", p + 1)) {
 		n++;
 	}
-	CHECK(n == 2);
+	CHECK(n == 3);
 }
 
 // --- 7. robustness ---------------------------------------------------------------

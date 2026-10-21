@@ -10,12 +10,83 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Every canonical key name besides "a".."z", "0".."9" and "f1".."f24" (u_desktop.h).
+ * Names after the punctuation follow the W3C UI Events KeyboardEvent.code values,
+ * lower-cased; the right-hand modifiers follow this API's modifier names.
+ */
 static const char *const k_named_keys[] = {
-    "enter",        "tab",      "escape",   "backspace",   "delete",    "insert",    "home",  "end",
-    "pageup",       "pagedown", "left",     "right",       "up",        "down",      "space", "minus",
-    "equal",        "comma",    "period",   "slash",       "backslash", "semicolon", "quote", "bracketleft",
-    "bracketright", "grave",    "capslock", "printscreen", "menu",
+    // Navigation, editing, punctuation (spec version 1).
+    "enter",
+    "tab",
+    "escape",
+    "backspace",
+    "delete",
+    "insert",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "left",
+    "right",
+    "up",
+    "down",
+    "space",
+    "minus",
+    "equal",
+    "comma",
+    "period",
+    "slash",
+    "backslash",
+    "semicolon",
+    "quote",
+    "bracketleft",
+    "bracketright",
+    "grave",
+    "capslock",
+    "printscreen",
+    "menu",
+    // The numeric keypad.
+    "numpad0",
+    "numpad1",
+    "numpad2",
+    "numpad3",
+    "numpad4",
+    "numpad5",
+    "numpad6",
+    "numpad7",
+    "numpad8",
+    "numpad9",
+    "numpadmultiply",
+    "numpadadd",
+    "numpadsubtract",
+    "numpaddivide",
+    "numpaddecimal",
+    "numpadenter",
+    // Locks and Pause.
+    "pause",
+    "numlock",
+    "scrolllock",
+    // Media keys.
+    "mediaplaypause",
+    "mediatracknext",
+    "mediatrackprevious",
+    "mediastop",
+    "audiovolumeup",
+    "audiovolumedown",
+    "audiovolumemute",
+    // Right-hand modifiers, pressed as the chord's KEY ("rightalt" alone, "ctrl+rightshift").
+    "rightctrl",
+    "rightshift",
+    "rightalt",
+    "rightsuper",
 };
+
+const char *
+u_desktop_chord_named_key(size_t i)
+{
+	return i < sizeof(k_named_keys) / sizeof(k_named_keys[0]) ? k_named_keys[i] : NULL;
+}
 
 static bool
 is_canonical_key(const char *k)

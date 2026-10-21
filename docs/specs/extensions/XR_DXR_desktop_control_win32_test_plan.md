@@ -142,6 +142,22 @@ US-position Ctrl+W would do); `key 1 a` selects all; the last prints
 (Shift+`:` on AZERTY) must send Ctrl+Shift+that key. Switch back to US and repeat `key 1 z`:
 undo again.
 
+The keypad, lock, media and right-hand modifier names (spec §5). A key viewer that shows the
+VK, the scan code and the extended flag (Microsoft's `Keyboard` demo, PowerToys Keyboard
+Manager's "Select" box, or a `WM_KEYDOWN` logger) next to Notepad:
+
+```bat
+%SMOKE% op activate NP && %SMOKE% key 0 numpad7      :: types 7 — with NumLock OFF too (VK_NUMPAD7)
+%SMOKE% op activate NP && %SMOKE% key 0 numpadenter  :: a line break; the viewer: VK_RETURN, extended (Num Enter)
+%SMOKE% op activate NP && %SMOKE% key 1 numpadadd    :: Notepad zooms in
+%SMOKE% key 0 pause                                  :: VK_PAUSE, scan 0x45, NOT extended (not Right Ctrl)
+%SMOKE% key 0 numlock                                :: NumLock toggles (VK_NUMLOCK, extended)
+%SMOKE% key 0 audiovolumeup                          :: the volume flyout
+%SMOKE% key 0 mediaplaypause                         :: a playing video (Media Player) pauses
+%SMOKE% op activate NP && %SMOKE% key 0 rightalt     :: with the Korean IME: 한/영 toggles
+%SMOKE% key 0 rightsuper                             :: the Start menu (VK_RWIN)
+```
+
 ```bat
 %SMOKE% move X Y                   :: X,Y = a point in Notepad's text
 %SMOKE% click X Y                  :: caret moves there

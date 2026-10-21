@@ -114,6 +114,8 @@ every input step.
 | A3 | Cmd+A from a non-main thread in a process whose main queue is not serviced | works, ~300 ms slower (layout lookup times out on the main queue and runs locally) | `r=0`, 340 ms [verified] |
 | A4 | `$S key 8 f21` | `unsupported — key "f21" has no macOS key code` | [verified] |
 | A5 | AZERTY: switch input source to French, `$S key 8 z` in the doc | the key labelled Z is pressed (undo) — not the US-Z position (W) | not run (single layout on this machine) |
+| A5b | `$S key 0 numpad7`, `$S key 0 numpadenter`, `$S key 8 numpadadd` in the doc | `7` typed (kVK_ANSI_Keypad7, numeric-pad flag); a line break; zoom in | not run yet (added with the keypad names) |
+| A5c | `$S key 0 pause`, `numlock`, `scrolllock`, `mediaplaypause`, `audiovolumeup`, `rightalt`, `rightsuper` | `unsupported — this key has no macOS key code` (no key code for them on macOS) | not run yet |
 | A6 | `$S op move W 300 200 700 450` then `$S list` | `ok`; list shows `(300,200 700x450)` immediately | [verified] |
 | A7 | `$S op move W 320 220` | `ok`, size kept | `(320,220 700x450)` [verified] |
 | A8 | `$S op maximize W` | fills the visible frame (below the menu bar, above the Dock), `state` has `0x4`; **not** a full-screen Space | `(0,33 1512x854)` `state=0x5` [verified] (TextEdit rounds its height to 854 of 855) |
@@ -146,7 +148,10 @@ every input step.
   `failed — window not reachable through Accessibility`.
 - Without Accessibility and with the Dock visible, pick on the bare Dock strip says `shell`
   (heuristic: outside every visible frame).
-- `printscreen`, `f21`–`f24`: no macOS key → `unsupported`.
+- `printscreen`, `f21`–`f24`, `pause`, `numlock`, `scrolllock`, the media keys and the
+  right-hand modifiers (`rightctrl` …): no macOS key code here → `unsupported`. Media keys are
+  system-defined events (`NX_KEYTYPE_*`), not key codes, and a right-hand modifier's key-down
+  would need its device-specific modifier flag; both are possible later, untested now.
 
 ## 6. Incident note from the automated run (2026-10-16)
 
