@@ -25,7 +25,8 @@
  *   desktop_backend_smoke buttondown X Y [left|right|middle]   move there, press, keep it down
  *   desktop_backend_smoke buttonup X Y [left|right|middle]     move there (a drag), release
  *   desktop_backend_smoke modclick MODS X Y [left|right|middle]  MODS bits held around one click
- *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
+ *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto;
+ *                                                 `shell` = the spec v3 shell target
  *   desktop_backend_smoke parent [HANDLE]         (script) the consent dialog's parent window for
  *                                                 request / request-scopes: wayland:H | x11:HEX
  *                                                 (unvalidated here); none = clear. A
@@ -508,7 +509,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		}
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
-		g_target = strtoull(argv[2], NULL, 10);
+		g_target = strcmp(argv[2], "shell") == 0 ? U_DESKTOP_TARGET_SHELL : strtoull(argv[2], NULL, 10);
 		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);
 	} else if (strcmp(cmd, "scroll") == 0 && argc >= 4) {
 		int32_t x = 0, y = 0;

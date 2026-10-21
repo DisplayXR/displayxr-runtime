@@ -860,3 +860,172 @@ TEST_CASE("v3_audit: held keys are logged by the chord rule, modifiers always", 
 	CHECK(lines_with(audit, "\"action\":\"key_down\"").size() == 5);
 	CHECK(lines_with(audit, "\"action\":\"key_up\"").size() == 5);
 }
+
+
+/*
+ *
+ * Item 2: the shell target (§11.5) — input where there is no app window, only on
+ * explicit request.
+ *
+ */
+
+namespace {
+
+const uint64_t kShell = U_DESKTOP_TARGET_SHELL;
+
+} // namespace
+
+TEST_CASE("v3_shell: input actions only; window actions with it fail validation", "[desktop][v3][shell]")
+{
+	CHECK(valid(click(kShell, 100, 10)));
+	CHECK(valid(button(U_DESKTOP_ACTION_POINTER_MOVE, kShell, 100, 10)));
+	CHECK(valid(button(U_DESKTOP_ACTION_BUTTON_DOWN, kShell, 100, 10)));
+	CHECK(valid(key_down(kShell, "super")));
+	CHECK(valid(chord(kShell, "alt+f2")));
+	u_desktop_action t = act(U_DESKTOP_ACTION_TYPE_TEXT, kShell);
+	t.text = "terminal";
+	CHECK(valid(t));
+	char why[160];
+	for (uint32_t op = U_DESKTOP_ACTION_ACTIVATE; op <= U_DESKTOP_ACTION_CLOSE; op++) {
+		u_desktop_action w = act(op, kShell);
+		CHECK_FALSE(u_desktop_control_validate(&w, why, sizeof(why)));
+		CHECK(std::string(why) == "the shell target takes input actions only");
+	}
+}
+
+TEST_CASE("v3_shell: pointer input — the shell, the desktop, never an app window", "[desktop][v3][shell]")
+{
+	TempDir dir;
+	Harness h;
+	// The top panel (pick SHELL) and the desktop background (pick DESKTOP).
+	CHECK(h.run(click(kShell, 500, 10)).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(click(kShell, 960, 1050)).result == U_DESKTOP_XR_SUCCESS);
+	u_desktop_action s = button(U_DESKTOP_ACTION_SCROLL, kShell, 500, 10);
+	s.scroll_y = 1;
+	CHECK(h.run(s).result == U_DESKTOP_XR_SUCCESS);
+	// An app window there: refused, nothing clicked.
+	u_desktop_fake_clear_log(h.fake);
+	auto r = h.run(click(kShell, 300, 300));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "the shell is not under the point (found gedit: notes.txt - Text Editor)");
+	CHECK(lines_with(h.log(), "button").empty());
+	// Without the shell target, version 2's refusal stays.
+	r = h.run(click(101, 500, 10));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "target is not under the point (found the shell)");
+	r = h.run(click(101, 960, 1050));
+	CHECK(r.message == "target is not under the point (found the desktop)");
+
+	// A window popping up over the point between the move and the press: refused.
+	struct Ctx
+	{
+		u_desktop_fake *f;
+	} ctx{h.fake};
+	u_desktop_fake_set_batch_hook(
+	    h.fake,
+	    [](void *p, const char *op, uint32_t) {
+		    if (strcmp(op, "press") == 0) {
+			    u_desktop_window w;
+			    memset(&w, 0, sizeof(w));
+			    w.id = 107;
+			    w.pid = 1007;
+			    snprintf(w.app_id, sizeof(w.app_id), "notification");
+			    w.frame = {900, 1000, 300, 80};
+			    u_desktop_fake_add_window(static_cast<Ctx *>(p)->f, &w);
+		    }
+	    },
+	    &ctx);
+	r = h.run(click(kShell, 960, 1050));
+	u_desktop_fake_set_batch_hook(h.fake, nullptr, nullptr);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(u_desktop_fake_pressed_buttons(h.fake) == 0u);
+}
+
+TEST_CASE("v3_shell: keys — only while no app window holds the keyboard", "[desktop][v3][shell]")
+{
+	TempDir dir;
+	Harness h;
+	// gedit has focus: keys for the shell would land in it.
+	auto r = h.run(chord(kShell, "super"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message.find("an app window has keyboard focus (gedit)") != std::string::npos);
+	// Nothing focused: Super, Alt+Tab, shell shortcuts go to the shell.
+	u_desktop_fake_set_focus(h.fake, 0);
+	CHECK(h.run(chord(kShell, "super")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(key_down(kShell, "alt")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(key_down(kShell, "tab")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(key_up(kShell, "tab")).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(key_up(kShell, "alt")).result == U_DESKTOP_XR_SUCCESS);
+	// Without the shell target nothing changed: no window, no keys.
+	r = h.run(chord(101, "super"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message.find("does not have focus") != std::string::npos);
+}
+
+TEST_CASE("v3_shell: the overview holds the keyboard — keys for the shell, never for a window",
+          "[desktop][v3][shell]")
+{
+	TempDir dir;
+	Harness h;
+	// The overview is open (the backend reports the shell holds the keyboard), while
+	// gedit is still mutter's focus window.
+	u_desktop_fake_set_shell_keyboard(h.fake, true);
+	u_desktop_action t = act(U_DESKTOP_ACTION_TYPE_TEXT, kShell);
+	t.text = "terminal\n";
+	CHECK(h.run(t).result == U_DESKTOP_XR_SUCCESS);
+	auto r = h.run(chord(101, "ctrl+a"));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message.find("the shell holds the keyboard") != std::string::npos);
+	// Focus moving to the shell while a key is held (Super opened the overview) is not "away".
+	u_desktop_fake_set_shell_keyboard(h.fake, false);
+	CHECK(h.run(key_down(101, "ctrl")).result == U_DESKTOP_XR_SUCCESS);
+	u_desktop_fake_set_shell_keyboard(h.fake, true);
+	std::this_thread::sleep_for(60ms);
+	CHECK(h.held_keys() == "ctrl");
+	u_desktop_fake_set_shell_keyboard(h.fake, false);
+	CHECK(h.run(key_up(101, "ctrl")).result == U_DESKTOP_XR_SUCCESS);
+}
+
+TEST_CASE("v3_shell: held buttons and drags to the shell; every other guard still holds",
+          "[desktop][v3][shell]")
+{
+	TempDir dir;
+	Harness h;
+	// Drag from an app window onto the desktop: the press is the window's, the drop the shell's.
+	CHECK(h.run(button(U_DESKTOP_ACTION_BUTTON_DOWN, 101, 300, 300)).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(button(U_DESKTOP_ACTION_POINTER_MOVE, kShell, 960, 900)).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(button(U_DESKTOP_ACTION_BUTTON_UP, kShell, 960, 1000)).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_pressed_buttons(h.fake) == 0u);
+
+	// The kill switch, the lock and a deny refuse the shell target like any other.
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	uint64_t id = 0;
+	u_desktop_action k = click(kShell, 500, 10);
+	CHECK(u_desktop_control_submit(h.c, &k, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
+	u_desktop_fake_set_locked(h.fake, true);
+	CHECK(u_desktop_control_submit(h.c, &k, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	CHECK(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_SUSPENDED);
+	u_desktop_fake_set_locked(h.fake, false);
+	REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
+}
+
+TEST_CASE("v3_shell: the user is waited for, the audit names the shell", "[desktop][v3][shell][audit]")
+{
+	TempDir dir;
+	u_desktop_control_timing t = kFast;
+	t.idle_max_wait_ns = 150ull * 1000000ull;
+	Harness h(&t);
+	u_desktop_fake_set_user_active(h.fake, true);
+	auto r = h.run(click(kShell, 500, 10));
+	CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(r.message == "the user is active");
+	u_desktop_fake_set_user_active(h.fake, false);
+	std::this_thread::sleep_for(700ms); // idle_ms (600) since the user's last input
+	CHECK(h.run(click(kShell, 500, 10)).result == U_DESKTOP_XR_SUCCESS);
+	std::string audit = dir.audit();
+	INFO(audit);
+	CHECK(audit.find("\"target\":{\"kind\":\"shell\"}") != std::string::npos);
+	CHECK(audit.find("18446744073709551615") == std::string::npos); // never the raw id
+}

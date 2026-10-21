@@ -140,3 +140,14 @@ sleep 2600
 act key-up target=102 keys=shift
 expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
 run displayxr-cli desktop audit --tail 6
+# spec v3 (§11.5): the shell target — input where no app window is, only on request
+act click target=shell x=500 y=10
+expect XR_SUCCESS
+act click target=101 x=500 y=10
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act click target=shell x=300 y=300
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key target=shell keys=super
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act maximize target=shell
+expect XR_ERROR_VALIDATION_FAILURE

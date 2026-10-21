@@ -37,7 +37,8 @@
  * act TYPE: activate | move | minimize | restore | maximize | close | type | key |
  *           move-pointer | click | drag | scroll
  *           spec v3: key-down | key-up (keys=ONE key or modifier) | button-down | button-up
- * act keys: target=ID  x=  y=  x2=  y2=  rect=X,Y,W,H  button=left|right|middle
+ * act keys: target=ID|shell (spec v3: shell = XR_DESKTOP_TARGET_SHELL_DXR)  x=  y=  x2=  y2=
+ *           rect=X,Y,W,H  button=left|right|middle
  *           count=N  sx=  sy=  text="..."  keys=ctrl+s
  *           spec v3: mods=ctrl+shift (chains XrDesktopActionModifiersDXR: click / drag / scroll)
  *
@@ -319,7 +320,8 @@ cmd_act(const std::vector<std::string> &args)
 		std::string k = args[i].substr(0, eq), v = args[i].substr(eq + 1);
 		long n = strtol(v.c_str(), nullptr, 10);
 		if (k == "target" || k == "id") {
-			a.targetWindowId = strtoull(v.c_str(), nullptr, 10);
+			// spec v3: target=shell is XR_DESKTOP_TARGET_SHELL_DXR
+			a.targetWindowId = v == "shell" ? XR_DESKTOP_TARGET_SHELL_DXR : strtoull(v.c_str(), nullptr, 10);
 		} else if (k == "x") {
 			a.point.x = (int32_t)n;
 		} else if (k == "y") {

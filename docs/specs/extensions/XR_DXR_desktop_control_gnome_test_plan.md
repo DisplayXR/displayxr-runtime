@@ -541,3 +541,18 @@ in-process runtime with `DXR_PLUGIN_EXCLUSIVE=sim-display`, 2026-10-21 (`feat/de
 | 12.12 | Kill the probe process (`kill -9`) with a key held | the EIS connection closes and mutter releases the device's keys: logger shows the key-up; nothing stuck | Shift_L up 8 ms after the kill |
 | 12.13 | GNOME session idle close with a key held | the session is NOT closed while the key is held | covered by 12.7: no close before the runtime's release at 2.06 s |
 
+### 12b. The shell target (§11.5)
+
+| # | Check | Expected |
+|---|---|---|
+| 12.20 | A window focused; `act key target=shell keys=super` (probe) | `REFUSED "an app window has keyboard focus (<app>) …"`, the overview stays closed |
+| 12.21 | Nothing focused (click the desktop first), `act key target=shell keys=super` | the overview opens |
+| 12.22 | Overview open: `act type target=shell text="Files"` then `act key target=shell keys=enter` | the search shows Files; Enter launches it; the type completes `ok (unverified: …)` |
+| 12.23 | Overview open: `act key target=<a window> keys=ctrl+a` | `REFUSED "… the shell holds the keyboard (the overview?)"` — nothing typed into the search (version 2 typed it there) |
+| 12.24 | Overview open: `act click target=shell` on a window preview | the window is activated, the overview closes |
+| 12.25 | `act click target=shell` on the top bar (the clock) and on the dash / dock (Ubuntu session, `DXRH_MODE=dxrubuntu`) | the calendar opens; the app launches / focuses |
+| 12.26 | The same clicks with a window target (or `target=<id>` of any window) | `REFUSED "target is not under the point (found the shell)"` — version 2's refusal stays without the shell target |
+| 12.27 | `act click target=shell` over an app window | `REFUSED "the shell is not under the point (found <app>: <title>)"`, no click |
+| 12.28 | `act move-pointer target=shell` to a gap between two monitors of different heights (`DXRH_MONITORS="1920x1200 1280x800"`) | verification passes (pick `outside`), the move fails (`(x,y) is on no monitor`), the pointer does not move |
+| 12.29 | Kill switch / lock while an action for the shell is queued | refused as for any target; the audit shows `"target":{"kind":"shell"}` |
+| 12.30 | Alt+Tab from a focused window: `act key-down target=<it> keys=alt`, `act key-down target=<it> keys=tab` × 2 (key-up between), `act key-up target=<it> keys=alt` | the switcher steps (mutter keeps the window focused while its switcher grab is up), the switch happens on the release |

@@ -371,6 +371,15 @@ gnome_get_pointer_msg(struct gnome_backend *g, int32_t *x, int32_t *y, char *msg
 enum u_desktop_result
 gnome_focused_window(struct u_desktop_backend *b, uint64_t *out_id);
 
+/*!
+ * Spec v3: the shell holds the keyboard over every window — the overview (Activities,
+ * the app grid) is open, so keys go to its search whatever window mutter calls
+ * focused. (The Alt+Tab switcher, the run dialog and panel menus grab the keyboard
+ * too, but nothing outside the shell can see them; only the overview is known.)
+ */
+bool
+gnome_shell_has_keyboard(struct gnome_backend *g);
+
 //! Move, then confirm with the extension that the pointer arrived (within 2 px).
 enum u_desktop_result
 gnome_move_verified(struct gnome_backend *g, int32_t x, int32_t y, char *msg);

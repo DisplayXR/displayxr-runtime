@@ -1016,6 +1016,9 @@ typedef struct XrDesktopActionModifiersDXR {
     const void* XR_MAY_ALIAS      next;
     XrDesktopKeyModifierFlagsDXR  modifiers;
 } XrDesktopActionModifiersDXR;
+
+//! XrDesktopActionDXR::targetWindowId of input meant for the desktop shell (§11.5).
+#define XR_DESKTOP_TARGET_SHELL_DXR ((uint64_t)0xFFFFFFFFFFFFFFFFull)
 ```
 
 `XrDesktopActionDXR` keeps its layout; `keys` also carries the one key of KEY_DOWN / KEY_UP.
@@ -1122,6 +1125,46 @@ holds (`KEY_DOWN`) is neither pressed again nor released. On any other action ty
 unknown bit, it is `XR_ERROR_VALIDATION_FAILURE`; the first such structure in the chain counts.
 Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+scroll to zoom.
 
+### 11.5 The shell target
+
+`targetWindowId = XR_DESKTOP_TARGET_SHELL_DXR` asks for input where there is **no app window**:
+the top bar / taskbar, the dock, the desktop background, the gaps between monitors, the GNOME
+overview (Activities), and keys with no app window focused (Super, Alt+Tab, shell shortcuts).
+It is the app's explicit, per-action opt-in: without it, input where no app window is stays
+refused exactly as in version 2 ("target is not under the point (found the shell)"). Nothing
+else is relaxed — §5 steps 1, 2, 5 and 6 (state, the idle wait, the input guard, the audit) and
+the kill switch, the lock, the consent and the read-only rule for other apps' windows (the shell
+target is never an app window) all apply as for any target.
+
+- **Input actions only**: `POINTER_MOVE`, `CLICK`, `DRAG`, `SCROLL`, `BUTTON_DOWN`, `BUTTON_UP`,
+  `KEY_CHORD`, `KEY_DOWN`, `KEY_UP`, `TYPE_TEXT`. A window action with it is
+  `XR_ERROR_VALIDATION_FAILURE` ("the shell target takes input actions only").
+- **Verified the other way round** (§5 step 4, and again by the backend before every injection
+  batch, the delivery guarantee):
+  - pointer: the pick at the point is **not** an app window — `SHELL`, `DESKTOP` or `OUTSIDE`. A
+    point outside every monitor passes verification but the pointer cannot get there: the move
+    fails (it is never clamped onto a window). An app window there: `REFUSED` "the shell is not
+    under the point (found <app>: <title>)".
+  - keys and text: **no app window holds the keyboard** — nothing is focused, the shell holds it
+    (the backend reports `focused_window` = the shell: the GNOME overview), or the focused window
+    is not an app window (not in the window list: the Windows taskbar after a click on it, a
+    switcher). An app window with focus: `REFUSED` "an app window has keyboard focus (<app>) —
+    target it, not the shell".
+- §5 step 3 (target exists) does not apply: the shell is not a window.
+- **The GNOME overview**: its window previews are shell actors, so a pick there is `SHELL` —
+  clicks into the overview need the shell target (as before, a window target is refused there).
+  While the overview is open it holds the keyboard: keys and text for the shell go to its
+  search; keys and text for **a window** are now `REFUSED` "focus moved — the overview is open"
+  (before version 3 they went into the overview's search although mutter still called the
+  window focused). The overview is the only shell grab the runtime can see: the Alt+Tab
+  switcher, the run dialog (Alt+F2) and panel menus grab the keyboard too, invisibly — keys
+  verified against a window while one of those is up still go to it, as in version 2.
+- Text for the shell on GNOME is pasted like any text (§7 GNOME notes) but cannot be confirmed
+  over AT-SPI (no window's text field): a read of it succeeds as "ok (unverified: …)".
+- Typical sequences: `KEY_CHORD super` (shell) → the overview; `TYPE_TEXT "terminal\n"` (shell)
+  → search and launch; `CLICK` on the dock or the top bar (shell); a drag from a window
+  (`BUTTON_DOWN` on the window) dropped on the desktop (`BUTTON_UP` with the shell target).
+
 ### 11.7 Version gating and errors
 
 - A version 2 runtime refuses `KEY_DOWN`, `KEY_UP`, `BUTTON_DOWN` and `BUTTON_UP` at submit
@@ -1129,9 +1172,12 @@ Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+s
   `XrDesktopActionModifiersDXR` (OpenXR's rule for unknown structures) and would run the plain
   click. Apps read the extension's `specVersion` (`xrEnumerateInstanceExtensionProperties`) and
   use any of §11 only when it is 3 or more.
-- New completion results, all existing codes: `REFUSED` for the hold rules above and for every
-  dropped action; `FEATURE_UNSUPPORTED` "this desktop backend cannot hold keys" where a backend
-  has no `key_event` (none today); keyboard results keep §9's fixed strings.
+- A version 2 runtime has no window with the id `XR_DESKTOP_TARGET_SHELL_DXR`: an action with the
+  shell target completes `XR_ERROR_DESKTOP_WINDOW_LOST_DXR` there (§5 step 3), never delivered.
+- New completion results, all existing codes: `REFUSED` for the hold rules above, for every
+  dropped action and for the shell target's verification; `FEATURE_UNSUPPORTED` "this desktop
+  backend cannot hold keys" where a backend has no `key_event` (none today) and for keys for the
+  shell on macOS; keyboard results keep §9's fixed strings.
 
 ### 11.8 Audit
 
@@ -1140,6 +1186,7 @@ Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+s
   that would type a character is recorded without `keys`.
 - `click` / `drag` / `scroll` records carry their modifiers in `keys` ("ctrl+shift").
 - `button_down` / `button_up` carry `x` / `y` and the target like a click.
+- An action for the shell target names it as `"target":{"kind":"shell"}` (never the raw id).
 - Every automatic release is one `release` record with `count` (items released) and the reason
   as `message`; the dropped actions are each audited `refused` with the drop message.
 
@@ -1151,6 +1198,8 @@ Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+s
 | button down / up | libei button on the absolute pointer, the press carrying the verified point (as in v2) | `SendInput` `MOUSEEVENTF_*DOWN/UP` at the verified point | `CGEvent` mouse down / up, drags while held |
 | modifiers around a pointer action | the same key events | the same `SendInput` key events (Windows' key state applies them to the click) | the flags on the mouse events |
 | second line | keys / buttons libei holds are released before the portal session closes; the session is not closed idle while one is held | held keys released on destroy | held keys released on destroy |
+| shell target, pointer | the extension's pick: `shell` (top bar, dash / dock, overview, popups) or `desktop` (background, desktop icons) | `WindowFromPoint` root: `Shell_TrayWnd` & co. (taskbar), `Progman` / `WorkerW` (desktop) | CGWindowList layer > 0 (Dock, menu bar) or the desktop |
+| shell target, keys | no window has mutter's focus, or `org.gnome.Shell.OverviewActive` (the overview holds the keyboard) | the foreground root is the taskbar / desktop class or not a listed window; a `NULL` foreground is refused (in transition) | **UNSUPPORTED**: macOS always has a frontmost app taking the keys, and an unknown focus would read as none |
 
 ### 11.10 Needs the maintainer's decision
 
@@ -1166,3 +1215,12 @@ Typical uses: ctrl+click / shift+click to select several items, alt+drag, ctrl+s
    because ctrl+scroll (zoom) is the same mechanism and a common agent step.
 5. **Focus moving to shell UI** (not an app window) is not "away" (§11.3), so a Windows Alt+Tab
    switcher does not end an Alt hold. Stricter: any focus change releases.
+6. **The shell target as a reserved window id** (fails safe on version 2 — `WINDOW_LOST`) versus
+   a flag in a chained structure (a version 2 runtime would ignore the flag and use whatever id
+   the app put there). The reserved id is proposed.
+7. **Text for the shell** (`TYPE_TEXT`): the request named pointer input and keys; text is
+   included because "Super, type the app's name, Enter" is the common launch sequence and the
+   same keyboard rule covers it. It could be left out (keys only).
+8. **Window-targeted keys refused while the GNOME overview is open** (§11.5): a behaviour change
+   for version 2 apps on GNOME, proposed as a fix (they went into the overview's search).
+9. **macOS keys for the shell** are UNSUPPORTED (§11.9); pointer input for the shell works.

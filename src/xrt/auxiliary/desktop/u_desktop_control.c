@@ -1112,6 +1112,12 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		snprintf(why, why_cap, "targetWindowId is required");
 		return false;
 	}
+	// Spec v3 (§11.5): the shell target takes input, never a window action.
+	if (a->target_window_id == U_DESKTOP_TARGET_SHELL && !is_pointer_action(a->type) &&
+	    !is_keyboard_action(a->type)) {
+		snprintf(why, why_cap, "the shell target takes input actions only");
+		return false;
+	}
 	// Coordinates far outside any desktop are a bug (or an overflow waiting to
 	// happen in a backend's arithmetic): reject them for every action type.
 	const int32_t L = U_DESKTOP_CONTROL_MAX_COORD;
@@ -1247,8 +1253,9 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 			const char *name = a != NULL ? action_name(a->type) : NULL;
 			r.action = name != NULL ? name : "unknown"; // never drop the record
 			r.chars = -1;
-			r.has_target = a != NULL;
+			r.has_target = a != NULL && a->target_window_id != U_DESKTOP_TARGET_SHELL;
 			r.target_id = a != NULL ? a->target_window_id : 0;
+			r.target_kind = a != NULL && a->target_window_id == U_DESKTOP_TARGET_SHELL ? "shell" : NULL;
 			r.result = "not_granted";
 			r.message = u_desktop_control_state_str(st);
 			u_desktop_audit_append(&r);
@@ -1580,14 +1587,14 @@ verify_pointer_target(struct u_desktop_control *c, uint64_t target, int32_t x, i
 		*result = map_backend_result(r, msg, MSG_CAP);
 		return STEP_FAIL;
 	}
-	if (p.kind == U_DESKTOP_PICK_WINDOW && (p.window.id == target || p.window.parent_id == target)) {
-		return STEP_OK;
+	if (u_desktop_pick_matches(&p, target)) {
+		return STEP_OK; // the target or its dialog; for the shell target, no app window
 	}
 	*result = U_DESKTOP_XR_ERROR_REFUSED;
 	switch (p.kind) {
 	case U_DESKTOP_PICK_WINDOW:
-		snprintf(msg, MSG_CAP, "target is not under the point (found %.60s: %.120s)", p.window.app_id,
-		         p.window.title);
+		snprintf(msg, MSG_CAP, "%s is not under the point (found %.60s: %.120s)",
+		         target == U_DESKTOP_TARGET_SHELL ? "the shell" : "target", p.window.app_id, p.window.title);
 		break;
 	case U_DESKTOP_PICK_DESKTOP: snprintf(msg, MSG_CAP, "target is not under the point (found the desktop)"); break;
 	case U_DESKTOP_PICK_SHELL: snprintf(msg, MSG_CAP, "target is not under the point (found the shell)"); break;
@@ -1612,17 +1619,21 @@ verify_keyboard_target(struct u_desktop_control *c, uint64_t target, uint32_t co
 		*result = map_backend_result(r, msg, MSG_CAP);
 		return STEP_FAIL;
 	}
-	if (focused != 0 && focused == target) {
-		return STEP_OK;
-	}
-	if (focused != 0) {
-		const struct u_desktop_window *fw = find_window(c, count, focused);
-		if (fw != NULL && fw->parent_id == target) {
-			return STEP_OK;
-		}
+	const struct u_desktop_window *fw =
+	    focused != 0 && focused != U_DESKTOP_TARGET_SHELL ? find_window(c, count, focused) : NULL;
+	if (u_desktop_focus_matches(target, focused, fw != NULL ? fw->parent_id : 0, fw != NULL)) {
+		return STEP_OK; // the target or its dialog; for the shell target, no app window
 	}
 	*result = U_DESKTOP_XR_ERROR_REFUSED;
-	snprintf(msg, MSG_CAP, "target window does not have focus %s ACTIVATE it first", k_em_dash);
+	if (target == U_DESKTOP_TARGET_SHELL) {
+		snprintf(msg, MSG_CAP, "an app window has keyboard focus (%.60s) %s target it, not the shell",
+		         fw != NULL ? fw->app_id : "?", k_em_dash);
+	} else if (focused == U_DESKTOP_TARGET_SHELL) {
+		snprintf(msg, MSG_CAP, "target window does not have focus %s the shell holds the keyboard (the overview?)",
+		         k_em_dash);
+	} else {
+		snprintf(msg, MSG_CAP, "target window does not have focus %s ACTIVATE it first", k_em_dash);
+	}
 	return STEP_FAIL;
 }
 
@@ -2102,8 +2113,8 @@ hold_focus_moved(struct u_desktop_control *c, char *why, size_t cap)
 	if (f == c->hold_focus) {
 		return false;
 	}
-	if (f == 0 || hold_ok_has(c, f)) {
-		c->hold_focus = f; // nothing has the keyboard, or our own target does
+	if (f == 0 || f == U_DESKTOP_TARGET_SHELL || hold_ok_has(c, f)) {
+		c->hold_focus = f; // nothing / the shell has the keyboard, or our own target does
 		return false;
 	}
 	// A dialog of a target, or no app window at all (shell UI, a switcher)?
@@ -2539,8 +2550,11 @@ audit_action(struct u_desktop_control *c,
 	r.exe = c->exe;
 	const char *name = action_name(a->type);
 	r.action = name != NULL ? name : "unknown";
-	r.has_target = true;
+	r.has_target = a->target_window_id != U_DESKTOP_TARGET_SHELL;
 	r.target_id = a->target_window_id;
+	if (a->target_window_id == U_DESKTOP_TARGET_SHELL) {
+		r.target_kind = "shell"; // spec v3: "target":{"kind":"shell"}
+	}
 	if (target != NULL) {
 		r.target_app = target->app_id;
 		r.target_title = target->title;
@@ -2699,15 +2713,17 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 		so = STEP_FAIL;
 		goto done;
 	}
-	const struct u_desktop_window *w = find_window(c, count, a->target_window_id);
-	if (w == NULL) {
-		result = U_DESKTOP_XR_ERROR_WINDOW_LOST;
-		snprintf(msg, sizeof(msg), "the target window no longer exists");
-		so = STEP_FAIL;
-		goto done;
+	if (a->target_window_id != U_DESKTOP_TARGET_SHELL) { // spec v3: the shell is not a window
+		const struct u_desktop_window *w = find_window(c, count, a->target_window_id);
+		if (w == NULL) {
+			result = U_DESKTOP_XR_ERROR_WINDOW_LOST;
+			snprintf(msg, sizeof(msg), "the target window no longer exists");
+			so = STEP_FAIL;
+			goto done;
+		}
+		target_copy = *w;
+		target = &target_copy;
 	}
-	target_copy = *w;
-	target = &target_copy;
 
 	if (stopping(c)) {
 		so = STEP_ABORT;

@@ -88,6 +88,8 @@
  *      (text, chords: the focused window is guard->target_id or a window whose
  *      parent_id is it) or the pick at the point (buttons, scroll, gestures) — and stop
  *      with U_DESKTOP_ERR_REFUSED "focus moved" / "target no longer under the point".
+ *      Spec v3: guard->target_id may be U_DESKTOP_TARGET_SHELL — then the re-check is
+ *      that NO app window is there (u_desktop_pick_matches / u_desktop_focus_matches).
  * Anything already injected stays injected; a stop must release every key and button
  * the backend pressed. A backend must never report OK for input the OS dropped (e.g. a
  * revoked permission): re-check the OS permission before injecting and return
@@ -178,6 +180,15 @@ struct u_desktop_window
 	uint32_t z;                         //!< 0 = top-most (list order)
 };
 
+/*!
+ * Spec v3: the reserved target id XR_DESKTOP_TARGET_SHELL_DXR — input meant for the
+ * desktop shell (top bar / taskbar, dock, desktop background, overview), never for an
+ * app window. A backend's delivery checks honour it through u_desktop_pick_matches /
+ * u_desktop_focus_matches. Never a real window id (HWNDs, CGWindowIDs and mutter ids
+ * are all far below it).
+ */
+#define U_DESKTOP_TARGET_SHELL UINT64_MAX
+
 //! Same values as XrDesktopPickKindDXR.
 enum u_desktop_pick_kind
 {
@@ -193,6 +204,40 @@ struct u_desktop_pick
 	enum u_desktop_pick_kind kind;
 	struct u_desktop_window window; //!< valid when kind == U_DESKTOP_PICK_WINDOW
 };
+
+/*!
+ * Spec v3: what a click at a point meets is what an action for @p target may act on —
+ * the target window or a dialog of it, or, for U_DESKTOP_TARGET_SHELL, anything that
+ * is NOT an app window (the shell, the desktop, outside every monitor: a pointer that
+ * cannot get there fails to move, it is never clamped onto a window).
+ */
+static inline bool
+u_desktop_pick_matches(const struct u_desktop_pick *p, uint64_t target)
+{
+	if (target == U_DESKTOP_TARGET_SHELL) {
+		return p->kind != U_DESKTOP_PICK_WINDOW;
+	}
+	return target != 0 && p->kind == U_DESKTOP_PICK_WINDOW &&
+	       (p->window.id == target || p->window.parent_id == target);
+}
+
+/*!
+ * Spec v3: the keyboard is where an action for @p target may type — @p focused (a
+ * focused_window answer) is the target or a dialog of it (@p focused_parent is its
+ * parent_id), or, for U_DESKTOP_TARGET_SHELL, no app window holds the keyboard:
+ * nothing is focused, the shell holds it (@p focused == U_DESKTOP_TARGET_SHELL, e.g.
+ * the GNOME overview), or the focused window is not an app window (@p focused_listed
+ * false: not in list_windows, e.g. the Windows taskbar after a click on it).
+ */
+static inline bool
+u_desktop_focus_matches(uint64_t target, uint64_t focused, uint64_t focused_parent, bool focused_listed)
+{
+	if (target == U_DESKTOP_TARGET_SHELL) {
+		return focused == 0 || focused == U_DESKTOP_TARGET_SHELL || !focused_listed;
+	}
+	return target != 0 && focused != 0 && focused != U_DESKTOP_TARGET_SHELL &&
+	       (focused == target || (focused_parent != 0 && focused_parent == target));
+}
 
 //! Same values as the window subset of XrDesktopActionTypeDXR.
 enum u_desktop_window_op
@@ -448,7 +493,9 @@ struct u_desktop_backend
 	//! The OS hit test at (x, y): what a click there would meet.
 	enum u_desktop_result (*pick)(struct u_desktop_backend *b, int32_t x, int32_t y, struct u_desktop_pick *out);
 
-	//! The window with keyboard focus (0 if none / unknown).
+	//! The window with keyboard focus (0 if none / unknown). Spec v3: or
+	//! U_DESKTOP_TARGET_SHELL when the shell holds the keyboard over the windows (the
+	//! GNOME overview), so keys go there whatever window mutter calls focused.
 	enum u_desktop_result (*focused_window)(struct u_desktop_backend *b, uint64_t *out_id);
 
 	//! Accessible name/value of the UI element at (x, y), UTF-8. "" if none.
