@@ -1805,3 +1805,27 @@ No other consumer in this repository reads titles (the geometry provider
 desktop info (#389) leaves them out by design. A consumer that needs other apps'
 titles holds the user's desktop-control grant and reads them through
 `XR_DXR_desktop_control`.
+
+**Verified (private headless GNOME Shell 50.1, sim_display only).** Two test
+windows, one with capture exclusion. Each check is a fresh bus connection or the
+probe (`desktop_control_probe`, the runtime in its process):
+
+- With no grant, every member and every `WindowsChanged` emitted while a window
+  opened and closed had entries and no `title` key.
+- `SetTitleAccess` with another process's PID was refused; with 0 or the caller's
+  own PID it was granted. Only that one connection got titles (GetWindowAt and
+  GetState included); two other connections of the same process got none. A revoke
+  took effect at once, and closing the connection removed it.
+- On the lock screen the granted connection got entries without titles and a new
+  grant was refused. After unlock its titles were back without asking again.
+- The granted runtime listed the real titles and read the text at a point, while a
+  client in another process saw no title at any step. The extension listed exactly
+  one connection, the probe's, only while GRANTED: not after `desktop stop`, again
+  after `resume`, not after `desktop deny`, again after `forget`, and nobody after
+  the probe exited.
+- The extension was disabled and enabled while granted. The new instance had no
+  record of the grant; the runtime's next list asked again ("granted again") and
+  had the titles.
+- A v2.50 runtime against version 18 was GRANTED, listed every title empty and read
+  `""` at the point that this runtime read. This runtime against version 17 listed
+  the titles, logged the older extension once and logged no warning.
