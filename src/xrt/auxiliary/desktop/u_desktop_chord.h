@@ -17,6 +17,7 @@
 #include "u_desktop.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +29,14 @@ extern "C" {
  */
 bool
 u_desktop_chord_parse(const char *s, struct u_desktop_chord *out);
+
+/*!
+ * The @p i-th canonical named key ("enter", "numpadadd", "rightctrl", ...; not the
+ * letters, digits and f-keys), NULL past the last one. For tests and docs: every
+ * backend's key map is checked against this list.
+ */
+const char *
+u_desktop_chord_named_key(size_t i);
 
 /*!
  * Format @p chord canonically ("ctrl+shift+v", modifiers in the order ctrl,

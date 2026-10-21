@@ -149,6 +149,22 @@ Ctrl+W = close the tab). On AZERTY `key 1 1` presses Shift+& (the digit is on th
 level). A character the layout lacks (e.g. `key 1 grave` on a layout with no ` key without
 AltGr) → `unsupported — no key produces '`' on the active keyboard layout`.
 
+**Keypad, locks, media and right-hand modifiers** (spec §5 key names). Watch what arrives with
+`wev` (or `xev` in an Xwayland window) next to gedit:
+
+| command | expected |
+|---|---|
+| `key 0 numpad7` with NumLock on | `KP_7`, gedit types 7 |
+| `key 0 numlock`, then `key 0 numpad7` | NumLock toggles (the shell's indicator / LED); `KP_Home`: the caret goes to the line start |
+| `key 1 numpadadd` / `key 1 numpadsubtract` | gedit zooms in / out (Ctrl+KP_Add / KP_Subtract) |
+| `key 0 numpadenter`, `numpadmultiply`, `numpaddivide`, `numpaddecimal` | `KP_Enter` (a line break), `KP_Multiply`, `KP_Divide`, `KP_Decimal` / `KP_Delete` by NumLock |
+| `key 0 pause`, `key 0 scrolllock` | `Pause`, `Scroll_Lock` |
+| `key 0 audiovolumeup` / `audiovolumedown` / `audiovolumemute` | GNOME's volume OSD moves / mutes |
+| `key 0 mediaplaypause` / `mediatracknext` / `mediatrackprevious` / `mediastop` with a player (Videos, Rhythmbox) playing | play/pause, next, previous, stop |
+| `key 0 rightalt` with the Korean input source (Hangul on Right Alt) | Hangul / English toggles; on US-intl it is AltGr (nothing typed by itself) |
+| `key 2 rightctrl`, `key 0 rightshift`, `key 0 rightsuper` | `Shift_L` + `Control_R`; `Shift_R`; `Super_R` (the overview opens: Escape it) |
+| the probe: `act key target=ID keys=rightctrl+c` | `XR_ERROR_VALIDATION_FAILURE` at submit (two keys) |
+
 ## 6. Text — IME-safe paste
 
 ```bash

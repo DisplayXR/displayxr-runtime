@@ -966,86 +966,6 @@ gnome_scroll(struct u_desktop_backend *b,
 	return gnome_portal_scroll(g->portal, dx, dy, msg);
 }
 
-//! Named (layout-independent) keys → evdev, case-insensitively ("Escape" = "escape":
-//! the chord parser lower-cases, but the backend is also driven directly, e.g. by
-//! desktop_backend_smoke). Characters are resolved on the keymap.
-static uint32_t
-named_key(const char *k)
-{
-	static const struct
-	{
-		const char *name;
-		uint32_t code;
-	} t[] = {
-	    {"enter", KEY_ENTER},
-	    {"tab", KEY_TAB},
-	    {"escape", KEY_ESC},
-	    {"backspace", KEY_BACKSPACE},
-	    {"delete", KEY_DELETE},
-	    {"insert", KEY_INSERT},
-	    {"home", KEY_HOME},
-	    {"end", KEY_END},
-	    {"pageup", KEY_PAGEUP},
-	    {"pagedown", KEY_PAGEDOWN},
-	    {"left", KEY_LEFT},
-	    {"right", KEY_RIGHT},
-	    {"up", KEY_UP},
-	    {"down", KEY_DOWN},
-	    {"space", KEY_SPACE},
-	    {"capslock", KEY_CAPSLOCK},
-	    {"printscreen", KEY_SYSRQ},
-	    {"menu", KEY_COMPOSE},
-	};
-	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
-		if (strcasecmp(k, t[i].name) == 0) {
-			return t[i].code;
-		}
-	}
-	if ((k[0] == 'f' || k[0] == 'F') && isdigit((unsigned char)k[1])) {
-		int n = atoi(k + 1);
-		if (n >= 1 && n <= 10) {
-			return KEY_F1 + (uint32_t)(n - 1);
-		}
-		if (n == 11) {
-			return KEY_F11;
-		}
-		if (n == 12) {
-			return KEY_F12;
-		}
-		if (n >= 13 && n <= 24) {
-			return KEY_F13 + (uint32_t)(n - 13);
-		}
-	}
-	return 0;
-}
-
-//! Canonical character key names → the character.
-static uint32_t
-char_key(const char *k)
-{
-	if (strlen(k) == 1 && ((k[0] >= 'a' && k[0] <= 'z') || (k[0] >= '0' && k[0] <= '9'))) {
-		return (uint32_t)k[0];
-	}
-	if (strlen(k) == 1 && k[0] >= 'A' && k[0] <= 'Z') {
-		return (uint32_t)(k[0] - 'A' + 'a'); // the key, not Shift+key: modifiers are explicit
-	}
-	static const struct
-	{
-		const char *name;
-		char ch;
-	} t[] = {
-	    {"minus", '-'},       {"equal", '='},        {"comma", ','},     {"period", '.'},
-	    {"slash", '/'},       {"backslash", '\\'},   {"semicolon", ';'}, {"quote", '\''},
-	    {"bracketleft", '['}, {"bracketright", ']'}, {"grave", '`'},
-	};
-	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
-		if (strcasecmp(k, t[i].name) == 0) {
-			return (uint32_t)(unsigned char)t[i].ch;
-		}
-	}
-	return 0;
-}
-
 static enum u_desktop_result
 gnome_key_chord(struct u_desktop_backend *b,
                 const struct u_desktop_input_guard *guard,
@@ -1058,9 +978,12 @@ gnome_key_chord(struct u_desktop_backend *b,
 	}
 	uint32_t code = 0, ch = 0;
 	if (chord->key[0] != '\0') {
-		code = named_key(chord->key);
+		// Named (layout-independent) keys are fixed evdev codes; letters, digits and
+		// punctuation are characters, found on the active layout. Case-insensitive
+		// (the parser lower-cases, but the smoke tool drives the backend directly).
+		code = u_desktop_gnome_key_code(chord->key);
 		if (code == 0) {
-			ch = char_key(chord->key);
+			ch = u_desktop_gnome_key_char(chord->key);
 		}
 		if (code == 0 && ch == 0) {
 			gnome_set_msg(msg, "unknown key name"); // privacy: never echo the key

@@ -1807,6 +1807,38 @@ static const named_key k_named_keys[] = {
     {"capslock", VK_CAPITAL},
     {"printscreen", VK_SNAPSHOT},
     {"menu", VK_APPS},
+    // The keypad: its own VKs, so the digits are digits whatever NumLock says.
+    {"numpad0", VK_NUMPAD0},
+    {"numpad1", VK_NUMPAD1},
+    {"numpad2", VK_NUMPAD2},
+    {"numpad3", VK_NUMPAD3},
+    {"numpad4", VK_NUMPAD4},
+    {"numpad5", VK_NUMPAD5},
+    {"numpad6", VK_NUMPAD6},
+    {"numpad7", VK_NUMPAD7},
+    {"numpad8", VK_NUMPAD8},
+    {"numpad9", VK_NUMPAD9},
+    {"numpadmultiply", VK_MULTIPLY},
+    {"numpadadd", VK_ADD},
+    {"numpadsubtract", VK_SUBTRACT},
+    {"numpaddivide", VK_DIVIDE},
+    {"numpaddecimal", VK_DECIMAL},
+    {"numpadenter", VK_RETURN}, // + the E0 prefix: resolve_chord_key
+    {"pause", VK_PAUSE},
+    {"numlock", VK_NUMLOCK},
+    {"scrolllock", VK_SCROLL},
+    {"mediaplaypause", VK_MEDIA_PLAY_PAUSE},
+    {"mediatracknext", VK_MEDIA_NEXT_TRACK},
+    {"mediatrackprevious", VK_MEDIA_PREV_TRACK},
+    {"mediastop", VK_MEDIA_STOP},
+    {"audiovolumeup", VK_VOLUME_UP},
+    {"audiovolumedown", VK_VOLUME_DOWN},
+    {"audiovolumemute", VK_VOLUME_MUTE},
+    // Right-hand modifiers pressed as the chord's key (the modifiers bits are left-hand).
+    {"rightctrl", VK_RCONTROL},
+    {"rightshift", VK_RSHIFT},
+    {"rightalt", VK_RMENU},
+    {"rightsuper", VK_RWIN},
 };
 
 //! Character keys: the canonical name -> the character it stands for.
@@ -1842,17 +1874,32 @@ vk_is_extended(WORD vk)
 	case VK_RCONTROL:
 	case VK_RMENU:
 	case VK_DIVIDE:
-	case VK_NUMLOCK: return true;
+	case VK_NUMLOCK:
+	case VK_MEDIA_PLAY_PAUSE:
+	case VK_MEDIA_NEXT_TRACK:
+	case VK_MEDIA_PREV_TRACK:
+	case VK_MEDIA_STOP:
+	case VK_VOLUME_UP:
+	case VK_VOLUME_DOWN:
+	case VK_VOLUME_MUTE: return true;
 	default: return false;
 	}
 }
 
-//! A key event by virtual key, with the scan code of the active layout.
+//! A key event by virtual key, with the scan code of the active layout. @p force_ext:
+//! the E0 prefix whatever the VK says (the keypad's Enter).
 static void
-key_vk_hkl(INPUT *in, WORD vk, HKL hkl, bool up)
+key_vk_hkl(INPUT *in, WORD vk, HKL hkl, bool up, bool force_ext = false)
 {
 	UINT sc = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, hkl);
-	bool ext = vk_is_extended(vk) || ((sc >> 8) & 0xFF) == 0xE0 || ((sc >> 8) & 0xFF) == 0xE1;
+	bool ext = force_ext || vk_is_extended(vk) || ((sc >> 8) & 0xFF) == 0xE0 || ((sc >> 8) & 0xFF) == 0xE1;
+	if (vk == VK_PAUSE) {
+		// Pause is the E1 1D 45 sequence; MAPVK_VK_TO_VSC_EX reports 0xE11D, whose low
+		// byte with the E0 flag would read as Right Ctrl to anything that looks at scan
+		// codes. Windows reports a real Pause as scan 0x45, not extended.
+		sc = 0x45;
+		ext = false;
+	}
 	memset(in, 0, sizeof(*in));
 	in->type = INPUT_KEYBOARD;
 	in->ki.wVk = vk;
@@ -1866,12 +1913,15 @@ key_vk_hkl(INPUT *in, WORD vk, HKL hkl, bool up)
  * character sits on the Shift level of its key.
  */
 static enum u_desktop_result
-resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *need_shift, char *msg)
+resolve_chord_key(const char *name, HKL hkl, WORD *out_vk, bool *out_ext, bool *need_shift, char *msg)
 {
 	*need_shift = false;
+	*out_ext = false;
 	for (const named_key &k : k_named_keys) {
 		if (strcmp(k.name, name) == 0) {
 			*out_vk = k.vk;
+			// The keypad's Enter is VK_RETURN with the E0 prefix (the main Enter has none).
+			*out_ext = strcmp(name, "numpadenter") == 0;
 			return U_DESKTOP_OK;
 		}
 	}
@@ -1946,11 +1996,12 @@ win32_key_chord(struct u_desktop_backend *b,
 
 	bool have_key = chord->key[0] != '\0';
 	WORD vk = 0;
+	bool vk_ext = false;
 	bool need_shift = false;
 	if (have_key) {
 		char name[sizeof(chord->key) + 1];
 		snprintf(name, sizeof(name), "%.*s", (int)sizeof(chord->key), chord->key);
-		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &need_shift, msg);
+		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &vk_ext, &need_shift, msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
@@ -2006,8 +2057,8 @@ win32_key_chord(struct u_desktop_backend *b,
 		enum u_desktop_result r = check_focus(guard, msg);
 		if (r == U_DESKTOP_OK) {
 			INPUT in[2];
-			key_vk_hkl(&in[0], vk, hkl, false);
-			key_vk_hkl(&in[1], vk, hkl, true);
+			key_vk_hkl(&in[0], vk, hkl, false, vk_ext);
+			key_vk_hkl(&in[1], vk, hkl, true, vk_ext);
 			r = send_inputs(in, 2, msg);
 		}
 		if (r != U_DESKTOP_OK) {

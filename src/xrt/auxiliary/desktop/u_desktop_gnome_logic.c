@@ -28,6 +28,140 @@ u_desktop_text_check(const struct u_desktop_text_state *before, const struct u_d
 	return before->count != after->count || before->caret != after->caret || before->hash != after->hash ? 1 : 0;
 }
 
+//! ASCII case-insensitive equality (strcasecmp is POSIX; this file builds everywhere).
+static bool
+ascii_ieq(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		char x = *a >= 'A' && *a <= 'Z' ? (char)(*a - 'A' + 'a') : *a;
+		char y = *b >= 'A' && *b <= 'Z' ? (char)(*b - 'A' + 'a') : *b;
+		if (x != y) {
+			return false;
+		}
+	}
+	return *a == *b;
+}
+
+uint32_t
+u_desktop_gnome_key_code(const char *name)
+{
+	// evdev codes (linux/input-event-codes.h — a stable kernel ABI; the values are
+	// spelled out because this file builds on every OS, and tests_desktop_control
+	// checks each against the header on Linux).
+	static const struct
+	{
+		const char *name;
+		uint32_t code;
+	} t[] = {
+	    {"enter", 28},               // KEY_ENTER
+	    {"tab", 15},                 // KEY_TAB
+	    {"escape", 1},               // KEY_ESC
+	    {"backspace", 14},           // KEY_BACKSPACE
+	    {"delete", 111},             // KEY_DELETE
+	    {"insert", 110},             // KEY_INSERT
+	    {"home", 102},               // KEY_HOME
+	    {"end", 107},                // KEY_END
+	    {"pageup", 104},             // KEY_PAGEUP
+	    {"pagedown", 109},           // KEY_PAGEDOWN
+	    {"left", 105},               // KEY_LEFT
+	    {"right", 106},              // KEY_RIGHT
+	    {"up", 103},                 // KEY_UP
+	    {"down", 108},               // KEY_DOWN
+	    {"space", 57},               // KEY_SPACE
+	    {"capslock", 58},            // KEY_CAPSLOCK
+	    {"printscreen", 99},         // KEY_SYSRQ
+	    {"menu", 127},               // KEY_COMPOSE
+	    {"numpad0", 82},             // KEY_KP0
+	    {"numpad1", 79},             // KEY_KP1
+	    {"numpad2", 80},             // KEY_KP2
+	    {"numpad3", 81},             // KEY_KP3
+	    {"numpad4", 75},             // KEY_KP4
+	    {"numpad5", 76},             // KEY_KP5
+	    {"numpad6", 77},             // KEY_KP6
+	    {"numpad7", 71},             // KEY_KP7
+	    {"numpad8", 72},             // KEY_KP8
+	    {"numpad9", 73},             // KEY_KP9
+	    {"numpadmultiply", 55},      // KEY_KPASTERISK
+	    {"numpadadd", 78},           // KEY_KPPLUS
+	    {"numpadsubtract", 74},      // KEY_KPMINUS
+	    {"numpaddivide", 98},        // KEY_KPSLASH
+	    {"numpaddecimal", 83},       // KEY_KPDOT
+	    {"numpadenter", 96},         // KEY_KPENTER
+	    {"pause", 119},              // KEY_PAUSE
+	    {"numlock", 69},             // KEY_NUMLOCK
+	    {"scrolllock", 70},          // KEY_SCROLLLOCK
+	    {"mediaplaypause", 164},     // KEY_PLAYPAUSE
+	    {"mediatracknext", 163},     // KEY_NEXTSONG
+	    {"mediatrackprevious", 165}, // KEY_PREVIOUSSONG
+	    {"mediastop", 166},          // KEY_STOPCD
+	    {"audiovolumeup", 115},      // KEY_VOLUMEUP
+	    {"audiovolumedown", 114},    // KEY_VOLUMEDOWN
+	    {"audiovolumemute", 113},    // KEY_MUTE
+	    {"rightctrl", 97},           // KEY_RIGHTCTRL
+	    {"rightshift", 54},          // KEY_RIGHTSHIFT
+	    {"rightalt", 100},           // KEY_RIGHTALT
+	    {"rightsuper", 126},         // KEY_RIGHTMETA
+	};
+	if (name == NULL) {
+		return 0;
+	}
+	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		if (ascii_ieq(name, t[i].name)) {
+			return t[i].code;
+		}
+	}
+	// f1..f24: KEY_F1..KEY_F10 = 59..68, KEY_F11 = 87, KEY_F12 = 88, KEY_F13..KEY_F24 = 183..194.
+	if ((name[0] == 'f' || name[0] == 'F') && name[1] >= '1' && name[1] <= '9' &&
+	    (name[2] == '\0' || (name[2] >= '0' && name[2] <= '9' && name[3] == '\0'))) {
+		int n = name[1] - '0';
+		if (name[2] != '\0') {
+			n = n * 10 + (name[2] - '0');
+		}
+		if (n >= 1 && n <= 10) {
+			return 59u + (uint32_t)(n - 1);
+		}
+		if (n == 11) {
+			return 87;
+		}
+		if (n == 12) {
+			return 88;
+		}
+		if (n >= 13 && n <= 24) {
+			return 183u + (uint32_t)(n - 13);
+		}
+	}
+	return 0;
+}
+
+uint32_t
+u_desktop_gnome_key_char(const char *name)
+{
+	if (name == NULL) {
+		return 0;
+	}
+	if (strlen(name) == 1 && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= '0' && name[0] <= '9'))) {
+		return (uint32_t)name[0];
+	}
+	if (strlen(name) == 1 && name[0] >= 'A' && name[0] <= 'Z') {
+		return (uint32_t)(name[0] - 'A' + 'a'); // the key, not Shift+key: modifiers are explicit
+	}
+	static const struct
+	{
+		const char *name;
+		char ch;
+	} t[] = {
+	    {"minus", '-'},       {"equal", '='},        {"comma", ','},     {"period", '.'},
+	    {"slash", '/'},       {"backslash", '\\'},   {"semicolon", ';'}, {"quote", '\''},
+	    {"bracketleft", '['}, {"bracketright", ']'}, {"grave", '`'},
+	};
+	for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		if (ascii_ieq(name, t[i].name)) {
+			return (uint32_t)(unsigned char)t[i].ch;
+		}
+	}
+	return 0;
+}
+
 uint64_t
 u_desktop_fnv1a(const char *s, size_t len)
 {

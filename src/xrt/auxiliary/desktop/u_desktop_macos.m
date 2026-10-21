@@ -2500,7 +2500,7 @@ struct key_map
 	const char *name;
 	uint16_t code;
 	bool fn; //!< hardware sets kCGEventFlagMaskSecondaryFn on these
-	bool np; //!< ... and kCGEventFlagMaskNumericPad (arrows)
+	bool np; //!< hardware sets kCGEventFlagMaskNumericPad on these (arrows, the keypad)
 };
 
 // Named keys: layout-independent kVK_* codes (HIToolbox/Events.h).
@@ -2515,6 +2515,17 @@ static const struct key_map g_keys[] = {
     {"f12", 0x6F, 1, 0},      {"f13", 0x69, 1, 0},      {"f14", 0x6B, 1, 0},       {"f15", 0x71, 1, 0},
     {"f16", 0x6A, 1, 0},      {"f17", 0x40, 1, 0},      {"f18", 0x4F, 1, 0},       {"f19", 0x50, 1, 0},
     {"f20", 0x5A, 1, 0},
+    // The keypad (kVK_ANSI_Keypad*): hardware flags these with the numeric pad bit. A Mac
+    // keypad has no NumLock (Clear sits there), so the digits are always digits.
+    {"numpad0", 0x52, 0, 1},  {"numpad1", 0x53, 0, 1},  {"numpad2", 0x54, 0, 1},  {"numpad3", 0x55, 0, 1},
+    {"numpad4", 0x56, 0, 1},  {"numpad5", 0x57, 0, 1},  {"numpad6", 0x58, 0, 1},  {"numpad7", 0x59, 0, 1},
+    {"numpad8", 0x5B, 0, 1},  {"numpad9", 0x5C, 0, 1},  {"numpaddecimal", 0x41, 0, 1},
+    {"numpadmultiply", 0x43, 0, 1}, {"numpadadd", 0x45, 0, 1}, {"numpaddivide", 0x4B, 0, 1},
+    {"numpadenter", 0x4C, 0, 1}, {"numpadsubtract", 0x4E, 0, 1},
+    // Not here, so UNSUPPORTED ("this key has no macOS key code"): pause / numlock /
+    // scrolllock (Apple keyboards have none; f13..f15 sit in their place), the media
+    // keys (system-defined NX_KEYTYPE_* events, not key codes) and the right-hand
+    // modifiers (their key-down would need the device-specific modifier flags too).
 };
 
 //! Character keys: the chord names a CHARACTER on the active layout (u_desktop.h).

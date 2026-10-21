@@ -216,8 +216,17 @@ enum u_desktop_mod
  * "enter", "tab", "escape", "backspace", "delete", "insert", "home", "end",
  * "pageup", "pagedown", "left", "right", "up", "down", "space", "minus",
  * "equal", "comma", "period", "slash", "backslash", "semicolon", "quote",
- * "bracketleft", "bracketright", "grave", "capslock", "printscreen", "menu".
- * An empty key means "modifiers only" (e.g. "super" alone).
+ * "bracketleft", "bracketright", "grave", "capslock", "printscreen", "menu",
+ * the keypad "numpad0".."numpad9", "numpadmultiply", "numpadadd",
+ * "numpadsubtract", "numpaddivide", "numpaddecimal", "numpadenter",
+ * "pause", "numlock", "scrolllock", the media keys "mediaplaypause",
+ * "mediatracknext", "mediatrackprevious", "mediastop", "audiovolumeup",
+ * "audiovolumedown", "audiovolumemute", and the right-hand modifiers as keys
+ * "rightctrl", "rightshift", "rightalt", "rightsuper" (u_desktop_chord_named_key
+ * lists the named ones; spec §5 has the table and what each OS does with them).
+ * An empty key means "modifiers only" (e.g. "super" alone). A backend with no key
+ * for a name (macOS has no Pause, lock, media or right-hand modifier key codes
+ * here) fails with U_DESKTOP_ERR_UNSUPPORTED.
  *
  * Letters, digits and punctuation name the CHARACTER on the user's ACTIVE keyboard
  * layout, because that is how every OS matches shortcuts: "ctrl+z" must press the

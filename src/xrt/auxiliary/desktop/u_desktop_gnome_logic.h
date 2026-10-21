@@ -128,6 +128,29 @@ void
 u_desktop_success_message(const char *backend_msg, char *out, size_t cap);
 
 /*
+ * Chord keys (libei key codes).
+ */
+
+/*!
+ * The evdev key code (linux/input-event-codes.h, what libei sends) of a named,
+ * layout-independent key ("enter", "f5", "numpadadd", "mediaplaypause",
+ * "rightctrl", ...), case-insensitively; 0 when @p name is not one (a letter,
+ * digit or punctuation name is a CHARACTER: u_desktop_gnome_key_char). Every name
+ * u_desktop_chord_named_key lists resolves here or there.
+ */
+uint32_t
+u_desktop_gnome_key_code(const char *name);
+
+/*!
+ * The character a character key name stands for ("a".."z", "0".."9" and the
+ * punctuation names: "minus" → '-'), resolved on the active layout's keymap by the
+ * backend; 0 when @p name is not one. "A".."Z" give the lower-case letter (the key;
+ * Shift is always explicit).
+ */
+uint32_t
+u_desktop_gnome_key_char(const char *name);
+
+/*
  * Window moves across monitors.
  */
 

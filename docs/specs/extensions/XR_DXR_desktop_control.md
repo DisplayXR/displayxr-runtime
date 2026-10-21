@@ -140,6 +140,33 @@ Chords are parsed by `u_desktop_chord_parse()`: `+`-separated, case-insensitive;
 `ctrl`/`control`, `shift`, `alt`/`option`, `super`/`win`/`cmd`/`command`/`meta`; at most one
 key from the canonical list in `u_desktop.h`. Letters, digits and punctuation name the character on the user's **active keyboard layout** (as every OS matches shortcuts: `ctrl+z` presses the key labelled Z on AZERTY too); named keys are layout-independent.
 
+**Key names.** One canonical, lower-case name per key, no aliases (`esc`, `return`, `kp1`,
+`volumeup` are rejected at submit with `XR_ERROR_VALIDATION_FAILURE`). The names after the
+punctuation follow the W3C UI Events `KeyboardEvent.code` values, lower-cased; the right-hand
+modifiers follow this API's modifier names. A name the OS has no key for completes with
+`XR_ERROR_FEATURE_UNSUPPORTED` ("this desktop backend cannot deliver this input", §9).
+
+| Group | Names | Windows | macOS | GNOME (libei, evdev) |
+|---|---|---|---|---|
+| characters | `a`–`z`, `0`–`9`, `minus` `equal` `comma` `period` `slash` `backslash` `semicolon` `quote` `bracketleft` `bracketright` `grave` | the key producing the character on the active layout | same | same |
+| function | `f1`–`f24` | `VK_F1`–`VK_F24` | `f1`–`f20`; `f21`–`f24` unsupported | `KEY_F1`–`KEY_F24` |
+| navigation, editing | `enter` `tab` `escape` `backspace` `delete` `insert` `home` `end` `pageup` `pagedown` `left` `right` `up` `down` `space` `capslock` `printscreen` `menu` | fixed VKs | `insert` is Help; `printscreen` unsupported | fixed codes (`printscreen` = `KEY_SYSRQ`, `menu` = `KEY_COMPOSE`) |
+| keypad | `numpad0`–`numpad9` `numpadmultiply` `numpadadd` `numpadsubtract` `numpaddivide` `numpaddecimal` `numpadenter` | `VK_NUMPAD0`–`9`, `VK_MULTIPLY` … `VK_DECIMAL`: digits **whatever NumLock says**; `numpadenter` = `VK_RETURN` with the E0 prefix | `kVK_ANSI_Keypad*` (a Mac keypad has no NumLock) | `KEY_KP*`: the digits and `numpaddecimal` follow **NumLock**, as the physical keys do (off: `numpad7` is Home) |
+| locks | `pause` `numlock` `scrolllock` | `VK_PAUSE` (scan 0x45), `VK_NUMLOCK`, `VK_SCROLL` | unsupported (no such keys; Apple keyboards have F13–F15 there) | `KEY_PAUSE`, `KEY_NUMLOCK`, `KEY_SCROLLLOCK` |
+| media | `mediaplaypause` `mediatracknext` `mediatrackprevious` `mediastop` `audiovolumeup` `audiovolumedown` `audiovolumemute` | `VK_MEDIA_*`, `VK_VOLUME_*` | unsupported (system-defined events, not key codes) | `KEY_PLAYPAUSE`, `KEY_NEXTSONG`, `KEY_PREVIOUSSONG`, `KEY_STOPCD`, `KEY_VOLUMEUP`, `KEY_VOLUMEDOWN`, `KEY_MUTE` |
+| right-hand modifiers | `rightctrl` `rightshift` `rightalt` `rightsuper` | `VK_RCONTROL`, `VK_RSHIFT`, `VK_RMENU`, `VK_RWIN` | unsupported | `KEY_RIGHTCTRL`, `KEY_RIGHTSHIFT`, `KEY_RIGHTALT`, `KEY_RIGHTMETA` |
+
+The right-hand modifiers are the chord's **key**, pressed and released like any other key with
+the chord's (left-hand) modifiers held around it: `rightalt` alone taps Right Alt, which is
+AltGr on many layouts and the Hangul / English toggle on a Korean one. They never modify
+another key: `rightctrl+c` is two keys and is rejected (use `ctrl+c`). Media keys go wherever
+the OS sends them (GNOME's media-keys handler, the active player), not necessarily to the
+target window; the target still has to hold focus when they are sent. These names arrived after
+the first release of spec version 2, without a version bump: a runtime that predates them
+rejects them at submit with `XR_ERROR_VALIDATION_FAILURE`, so an app can fall back. The audit
+rule is unchanged (§9): a bare keypad digit or `rightalt` is not a shortcut and is not logged,
+`ctrl+numpadadd` is.
+
 ## 6. The store and the audit log
 
 ### 6.1 Store
