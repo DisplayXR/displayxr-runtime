@@ -108,6 +108,9 @@ struct u_desktop_fake
 	//! spec v3: the shell holds the keyboard (the GNOME overview): focused_window
 	//! reports U_DESKTOP_TARGET_SHELL.
 	bool shell_keyboard;
+	//! spec v3: the clipboard's text (NULL: no text on it).
+	char *clipboard;
+	uint32_t clipboard_sets;
 };
 
 static struct u_desktop_fake *
@@ -841,6 +844,72 @@ fake_key_event(struct u_desktop_backend *b,
 	return r;
 }
 
+/*!
+ * Spec v3: the clipboard — a string in memory. The log records sizes only
+ * ("clipboard set 12 bytes", "clipboard get 12 bytes"); the batch hook fires
+ * "clipboard" before each read / write.
+ */
+static enum u_desktop_result
+fake_clipboard_get(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, char **out, size_t *len,
+                   char *msg)
+{
+	struct u_desktop_fake *f = fake(b);
+	*out = NULL;
+	*len = 0;
+	count_call(f);
+	action_delay(f);
+	batch_hook(f, "clipboard", 0);
+	if (guard != NULL && !guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	os_mutex_lock(&f->mutex);
+	enum u_desktop_result r = forced_failure(f, "clipboard_get", msg);
+	if (r == U_DESKTOP_OK && f->clipboard != NULL) {
+		size_t n = strlen(f->clipboard);
+		size_t take = n > U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 ? U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 : n;
+		*out = (char *)malloc(take + 1);
+		if (*out == NULL) {
+			r = U_DESKTOP_ERR_FAILED;
+		} else {
+			memcpy(*out, f->clipboard, take);
+			(*out)[take] = '\0';
+			*len = take;
+		}
+	}
+	if (r == U_DESKTOP_OK) {
+		log_line(f, "clipboard get %zu bytes", *len);
+	}
+	os_mutex_unlock(&f->mutex);
+	return r;
+}
+
+static enum u_desktop_result
+fake_clipboard_set(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
+{
+	struct u_desktop_fake *f = fake(b);
+	count_call(f);
+	action_delay(f);
+	batch_hook(f, "clipboard", 0);
+	if (guard != NULL && !guard->still_allowed(guard->ctx)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	os_mutex_lock(&f->mutex);
+	enum u_desktop_result r = forced_failure(f, "clipboard_set", msg);
+	if (r == U_DESKTOP_OK) {
+		char *copy = strdup(utf8);
+		if (copy == NULL) {
+			r = U_DESKTOP_ERR_FAILED;
+		} else {
+			free(f->clipboard);
+			f->clipboard = copy;
+			f->clipboard_sets++;
+			log_line(f, "clipboard set %zu bytes", strlen(utf8));
+		}
+	}
+	os_mutex_unlock(&f->mutex);
+	return r;
+}
+
 static enum u_desktop_result
 fake_pointer_move(struct u_desktop_backend *b, int32_t x, int32_t y, char *msg)
 {
@@ -1190,6 +1259,7 @@ fake_destroy(struct u_desktop_backend *b)
 		}
 	}
 	os_mutex_destroy(&f->mutex);
+	free(f->clipboard);
 	free(f);
 }
 
@@ -1218,7 +1288,7 @@ u_desktop_fake_create(void)
 	f->base.name = "fake";
 	f->base.caps = U_DESKTOP_CAP_LIST_WINDOWS | U_DESKTOP_CAP_POINTER_POSITION | U_DESKTOP_CAP_PICK |
 	               U_DESKTOP_CAP_READ_TEXT | U_DESKTOP_CAP_WINDOW_ACTIONS | U_DESKTOP_CAP_INPUT |
-	               U_DESKTOP_CAP_CAPTURE;
+	               U_DESKTOP_CAP_CAPTURE | U_DESKTOP_CAP_CLIPBOARD;
 	f->base.remembers_in_store = env_is("DXR_DESKTOP_FAKE_STORE", "1");
 	f->base.access_status = fake_access_status;
 	f->base.request_access = fake_request_access;
@@ -1238,6 +1308,8 @@ u_desktop_fake_create(void)
 	f->base.scroll = fake_scroll;
 	f->base.key_event = fake_key_event;
 	f->base.holds_repeating_key = fake_holds_repeating_key;
+	f->base.clipboard_get = fake_clipboard_get;
+	f->base.clipboard_set = fake_clipboard_set;
 	f->base.capture_access_status = fake_capture_access_status;
 	f->base.request_scopes = fake_request_scopes;
 	f->base.monitors = fake_monitors;
@@ -1708,17 +1780,38 @@ u_desktop_fake_set_key_event_supported(struct u_desktop_fake *f, bool supported)
 }
 
 void
-u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat)
-{
-	os_mutex_lock(&f->mutex);
-	f->key_repeat = repeat;
-	os_mutex_unlock(&f->mutex);
-}
-
-void
 u_desktop_fake_set_shell_keyboard(struct u_desktop_fake *f, bool shell)
 {
 	os_mutex_lock(&f->mutex);
 	f->shell_keyboard = shell;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_clipboard(struct u_desktop_fake *f, const char *text)
+{
+	os_mutex_lock(&f->mutex);
+	free(f->clipboard);
+	f->clipboard = text != NULL ? strdup(text) : NULL;
+	os_mutex_unlock(&f->mutex);
+}
+
+bool
+u_desktop_fake_clipboard(struct u_desktop_fake *f, char *out, size_t cap)
+{
+	os_mutex_lock(&f->mutex);
+	bool has = f->clipboard != NULL;
+	if (out != NULL && cap > 0) {
+		snprintf(out, cap, "%s", has ? f->clipboard : "");
+	}
+	os_mutex_unlock(&f->mutex);
+	return has;
+}
+
+void
+u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat)
+{
+	os_mutex_lock(&f->mutex);
+	f->key_repeat = repeat;
 	os_mutex_unlock(&f->mutex);
 }

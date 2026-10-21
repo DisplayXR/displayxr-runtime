@@ -556,3 +556,17 @@ in-process runtime with `DXR_PLUGIN_EXCLUSIVE=sim-display`, 2026-10-21 (`feat/de
 | 12.28 | `act move-pointer target=shell` to a gap between two monitors of different heights (`DXRH_MONITORS="1920x1200 1280x800"`) | verification passes (pick `outside`), the move fails (`(x,y) is on no monitor`), the pointer does not move |
 | 12.29 | Kill switch / lock while an action for the shell is queued | refused as for any target; the audit shows `"target":{"kind":"shell"}` |
 | 12.30 | Alt+Tab from a focused window: `act key-down target=<it> keys=alt`, `act key-down target=<it> keys=tab` × 2 (key-up between), `act key-up target=<it> keys=alt` | the switcher steps (mutter keeps the window focused while its switcher grab is up), the switch happens on the release |
+
+### 12c. Clipboard text (§11.6)
+
+| # | Check | Expected | Observed (harness) |
+|---|---|---|---|
+| 12.40 | The app (probe) NOT focused, another window focused: `act clip-set text="…"`, then paste by hand (Ctrl+V in a GTK entry, the harness's user-input session) | the text is pasted; the audit has `clipboard_set` with `bytes`, no text | clip-set while the probe (no window) is not focused: the shell reads it back (`clip-is`) — PASS; a hand paste not run |
+| 12.41 | `act clip-get` after the user copies "X" in another app | `expect-clipboard "X"` — the user's copy | PASS (`USER_COPY_1`, then `USER_COPY_2` after an agent SET) |
+| 12.42 | `clip-set "A"`, then wait 5 s (the session closes idle), then `clip-get` from a fresh probe | "A" (mutter's clipboard manager kept it past the session) | PASS: the session closed during the 5 s, the shell and a later GET both read `AGENT_SET_2` |
+| 12.43 | `act type target=<entry> text="typed"` then `act clip-get` with the clipboard holding "U" before | the type pastes "typed"; the GET returns "U" (the type's restore), never "typed" | PASS: the entry got `typed_by_agent`, the GET returned the SET before it (`AGENT_SET_1`) |
+| 12.44 | `act clip-set text="S"`, `act type …`, `act clip-get` (queued at once) | the type pastes its own text; the GET returns "S" (a SET is never overwritten by a type's restore, nor pastes into the type) | not run as one queue in the harness (unit test `v3_clipboard: in order with typing`) |
+| 12.45 | Empty clipboard / an image copied | `ok (the clipboard holds no text)`, fetched text "" | not run |
+| 12.46 | A 2 MiB text copied by the user | `XR_ERROR_LIMIT_REACHED`; nothing fetched | see §12d run |
+| 12.47 | Kill switch on, `act clip-get` | refused (NOT_GRANTED at submit / REFUSED "kill switch" if it lands while queued) | not run (kill switch covered by 12.8; unit test for a GET) |
+| 12.48 | `grep` the runtime log (`XRT_LOG=debug`) and the audit for the clipboard text after 12.40–12.44 | absent | PASS: none of the clipboard or typed texts in the runtime log or the audit (`bytes` only) |

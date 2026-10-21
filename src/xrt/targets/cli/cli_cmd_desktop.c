@@ -340,6 +340,7 @@ print_audit_line(void *ctx, const char *line)
 	const cJSON *subject = cJSON_GetObjectItemCaseSensitive(o, "subject");
 	const cJSON *scope = cJSON_GetObjectItemCaseSensitive(o, "scope");
 	const cJSON *count = cJSON_GetObjectItemCaseSensitive(o, "count");
+	const cJSON *bytes = cJSON_GetObjectItemCaseSensitive(o, "bytes");
 	const cJSON *ow = cJSON_GetObjectItemCaseSensitive(o, "w");
 	const cJSON *oh = cJSON_GetObjectItemCaseSensitive(o, "h");
 
@@ -382,6 +383,9 @@ print_audit_line(void *ctx, const char *line)
 	}
 	if (cJSON_IsNumber(chars)) {
 		printf(" chars=%d", (int)chars->valuedouble);
+	}
+	if (cJSON_IsNumber(bytes)) {
+		printf(" bytes=%.0f", bytes->valuedouble);
 	}
 	if (cJSON_IsString(keys)) {
 		printf(" keys=%s", keys->valuestring);

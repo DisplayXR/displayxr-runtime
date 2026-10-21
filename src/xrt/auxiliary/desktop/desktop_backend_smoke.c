@@ -25,6 +25,10 @@
  *   desktop_backend_smoke buttondown X Y [left|right|middle]   move there, press, keep it down
  *   desktop_backend_smoke buttonup X Y [left|right|middle]     move there (a drag), release
  *   desktop_backend_smoke modclick MODS X Y [left|right|middle]  MODS bits held around one click
+ *   desktop_backend_smoke clip-set "text"        the clipboard's text (in a script: one process,
+ *                                                 so GNOME's session serves it; it outlives the
+ *                                                 session through mutter's clipboard manager)
+ *   desktop_backend_smoke clip-get [show]        its size; the text itself only with `show`
  *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto;
  *                                                 `shell` = the spec v3 shell target
  *   desktop_backend_smoke parent [HANDLE]         (script) the consent dialog's parent window for
@@ -506,6 +510,39 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 				char m2[U_DESKTOP_MSG_SIZE] = {0};
 				b->key_event(b, &g, &k, false, false, m2);
 			}
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "clip-set") == 0 && argc >= 3) {
+		if (b->clipboard_set == NULL) {
+			return done(U_DESKTOP_ERR_UNSUPPORTED, "no clipboard on this backend");
+		}
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+			msg[0] = '\0';
+		}
+		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL};
+		r = b->clipboard_set(b, &g, argv[2], msg);
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "clip-get") == 0) {
+		if (b->clipboard_get == NULL) {
+			return done(U_DESKTOP_ERR_UNSUPPORTED, "no clipboard on this backend");
+		}
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+			msg[0] = '\0';
+		}
+		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL};
+		char *text = NULL;
+		size_t len = 0;
+		r = b->clipboard_get(b, &g, &text, &len, msg);
+		if (r == U_DESKTOP_OK) {
+			bool show = argc >= 3 && strcmp(argv[2], "show") == 0;
+			printf("clipboard: %s%zu bytes%s%s%s\n", text == NULL ? "no text, " : "", len, show ? " \"" : "",
+			       show && text != NULL ? text : "", show ? "\"" : "");
+		}
+		if (text != NULL) {
+			memset(text, 0, len);
+			free(text);
 		}
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {

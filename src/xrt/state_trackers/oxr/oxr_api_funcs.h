@@ -1252,6 +1252,11 @@ oxr_xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR *info, 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetDesktopCaptureImageDXR(
     XrSession session, uint64_t captureId, uint32_t capacityInput, uint32_t *countOutput, uint8_t *rgba);
+
+//! OpenXR API function @ep{xrGetDesktopClipboardTextDXR} (spec v3)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopClipboardTextDXR(
+    XrSession session, uint64_t actionId, uint32_t capacityInput, uint32_t *countOutput, char *buffer);
 #endif
 
 #ifdef OXR_HAVE_DXR_input_providers

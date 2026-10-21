@@ -241,6 +241,13 @@ struct u_desktop_control
 	//! automatically: they assumed the hold, so they are refused (with drop_msg).
 	uint64_t drop_through_id;
 	char drop_msg[MSG_CAP];
+
+	// --- spec v3: clipboard text (§11.6), under mutex ---
+	char *clip_kept;        //!< the most recent successful GET's text (NUL-terminated), or NULL
+	size_t clip_kept_len;   //!< its length (terminator excluded)
+	uint64_t clip_kept_id;  //!< the GET action's id
+	uint64_t clip_kept_until_ns;
+	uint64_t clip_retention_ns; //!< U_DESKTOP_CLIPBOARD_RETENTION_MS (tests may shorten it)
 };
 
 
@@ -285,6 +292,8 @@ action_name(uint32_t type)
 	case U_DESKTOP_ACTION_KEY_UP: return "key_up";
 	case U_DESKTOP_ACTION_BUTTON_DOWN: return "button_down";
 	case U_DESKTOP_ACTION_BUTTON_UP: return "button_up";
+	case U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT: return "clipboard_set";
+	case U_DESKTOP_ACTION_GET_CLIPBOARD_TEXT: return "clipboard_get";
 	default: return NULL;
 	}
 }
@@ -307,6 +316,13 @@ is_keyboard_action(uint32_t t)
 {
 	return t == U_DESKTOP_ACTION_TYPE_TEXT || t == U_DESKTOP_ACTION_KEY_CHORD || t == U_DESKTOP_ACTION_KEY_DOWN ||
 	       t == U_DESKTOP_ACTION_KEY_UP;
+}
+
+//! Spec v3: clipboard text (no target window, no injected input).
+static bool
+is_clipboard_action(uint32_t t)
+{
+	return t == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT || t == U_DESKTOP_ACTION_GET_CLIPBOARD_TEXT;
 }
 
 //! Spec v3: the releases (never refused for focus, never wait for the user).
@@ -1108,7 +1124,13 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		snprintf(why, why_cap, "unknown actionType %u", a->type);
 		return false;
 	}
-	if (a->target_window_id == 0) {
+	if (is_clipboard_action(a->type)) {
+		// Spec v3 (§11.6): the clipboard is no window's.
+		if (a->target_window_id != 0) {
+			snprintf(why, why_cap, "targetWindowId must be 0 for a clipboard action");
+			return false;
+		}
+	} else if (a->target_window_id == 0) {
 		snprintf(why, why_cap, "targetWindowId is required");
 		return false;
 	}
@@ -1174,6 +1196,22 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 		}
 		break;
 	}
+	case U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT: {
+		if (a->text == NULL || a->text[0] == '\0') {
+			snprintf(why, why_cap, "text is required");
+			return false;
+		}
+		size_t len = strnlen(a->text, U_DESKTOP_CLIPBOARD_MAX_BYTES + 1);
+		if (len > U_DESKTOP_CLIPBOARD_MAX_BYTES) {
+			snprintf(why, why_cap, "text is longer than %u bytes", U_DESKTOP_CLIPBOARD_MAX_BYTES);
+			return false;
+		}
+		if (utf8_count(a->text) < 0) {
+			snprintf(why, why_cap, "text is not valid UTF-8");
+			return false;
+		}
+		break;
+	}
 	case U_DESKTOP_ACTION_KEY_DOWN:
 	case U_DESKTOP_ACTION_KEY_UP: {
 		struct u_desktop_chord ch;
@@ -1226,6 +1264,10 @@ u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t w
 static void
 free_queued(struct queued_action *qa)
 {
+	if (qa->text != NULL) {
+		// Typed or clipboard text: never left behind in freed memory (spec v3 §11.6).
+		memset(qa->text, 0, strlen(qa->text));
+	}
 	free(qa->text);
 	free(qa->keys);
 	qa->text = NULL;
@@ -1289,7 +1331,7 @@ u_desktop_control_submit(struct u_desktop_control *c, const struct u_desktop_act
 	qa.a = *a;
 	qa.a.text = NULL;
 	qa.a.keys = NULL;
-	if (a->type == U_DESKTOP_ACTION_TYPE_TEXT) {
+	if (a->type == U_DESKTOP_ACTION_TYPE_TEXT || a->type == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT) {
 		size_t len = strlen(a->text);
 		qa.text = (char *)malloc(len + 1);
 		if (qa.text == NULL) {
@@ -2372,6 +2414,204 @@ release_mods(struct u_desktop_control *c, uint32_t pressed)
 	}
 }
 
+
+/*
+ *
+ * Spec v3: clipboard text (§11.6) — worker thread, in submission order with every
+ * other action (so a SET never lands in the middle of a paste on GNOME, where text
+ * travels through the clipboard). Sizes reach the audit, the text never does.
+ *
+ */
+
+//! Wipe and free @p text (@p len bytes + terminator).
+static void
+clip_wipe_free(char *text, size_t len)
+{
+	if (text != NULL) {
+		memset(text, 0, len + 1);
+		free(text);
+	}
+}
+
+//! Drop the kept GET text if its time is up (mutex held).
+static void
+clip_expire_locked(struct u_desktop_control *c, uint64_t now_ns)
+{
+	if (c->clip_kept != NULL && now_ns >= c->clip_kept_until_ns) {
+		clip_wipe_free(c->clip_kept, c->clip_kept_len);
+		c->clip_kept = NULL;
+		c->clip_kept_len = 0;
+		c->clip_kept_id = 0;
+	}
+}
+
+/*!
+ * A clipboard action's result, with a FIXED message (privacy: a backend's own message
+ * is never passed on — it could have quoted the text). A guard stop reads as its reason.
+ */
+static int32_t
+clipboard_result(struct u_desktop_control *c, const struct guard_ctx *g, bool set, enum u_desktop_result r, char *msg)
+{
+	if (r == U_DESKTOP_OK) {
+		return U_DESKTOP_XR_SUCCESS;
+	}
+	if (r == U_DESKTOP_ERR_NOT_GRANTED) {
+		mark_revoked(c);
+	}
+	if (g != NULL && g->stopped && r == U_DESKTOP_ERR_REFUSED) {
+		return injection_result(c, g, U_DESKTOP_ACTION_POINTER_MOVE, r, msg); // the guard's reason
+	}
+	const char *fixed;
+	int32_t x;
+	switch (r) {
+	case U_DESKTOP_ERR_NOT_GRANTED:
+		fixed = "the OS refused: permission missing or revoked";
+		x = U_DESKTOP_XR_ERROR_NOT_GRANTED;
+		break;
+	case U_DESKTOP_ERR_UNSUPPORTED:
+		fixed = "this desktop backend has no clipboard access";
+		x = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+		break;
+	case U_DESKTOP_ERR_REFUSED:
+		fixed = set ? "the clipboard did not take the text" : "the clipboard owner refused the read";
+		x = U_DESKTOP_XR_ERROR_REFUSED;
+		break;
+	case U_DESKTOP_ERR_TIMEOUT:
+		fixed = "the clipboard did not answer in time";
+		x = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		break;
+	default:
+		fixed = set ? "the clipboard could not be written" : "the clipboard could not be read";
+		x = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		break;
+	}
+	snprintf(msg, MSG_CAP, "%s", fixed);
+	return x;
+}
+
+/*!
+ * SET_CLIPBOARD_TEXT / GET_CLIPBOARD_TEXT after §5 step 1 (and, for SET, the idle
+ * wait): the guard, then the backend. A GET's text is kept for
+ * u_desktop_control_clipboard_text. @p bytes: the size the audit records.
+ */
+static enum step_outcome
+run_clipboard(struct u_desktop_control *c,
+              const struct queued_action *qa,
+              int32_t *result,
+              char *msg,
+              int64_t *bytes,
+              bool *no_text)
+{
+	*no_text = false;
+	const struct u_desktop_action *a = &qa->a;
+	struct guard_ctx g = {c, false, R_OS_GRANTED, 0};
+	struct u_desktop_input_guard guard = {0, guard_still_allowed, &g};
+	enum u_desktop_result r;
+	*bytes = -1;
+	if (a->type == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT) {
+		uint64_t t0 = injection_begin();
+		r = c->b->clipboard_set(c->b, &guard, a->text, msg);
+		injection_end(c, t0);
+		*result = clipboard_result(c, &g, true, r, msg);
+		if (*result == U_DESKTOP_XR_SUCCESS) {
+			*bytes = (int64_t)strlen(a->text);
+		}
+		return *result == U_DESKTOP_XR_SUCCESS ? STEP_OK : STEP_FAIL;
+	}
+
+	char *text = NULL;
+	size_t len = 0;
+	r = c->b->clipboard_get(c->b, &guard, &text, &len, msg);
+	*result = clipboard_result(c, &g, false, r, msg);
+	if (*result != U_DESKTOP_XR_SUCCESS) {
+		clip_wipe_free(text, len);
+		return STEP_FAIL;
+	}
+	bool none = text == NULL;
+	if (none) {
+		text = (char *)calloc(1, 1); // no text: fetched as ""
+		len = 0;
+		if (text == NULL) {
+			*result = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+			snprintf(msg, MSG_CAP, "out of memory");
+			return STEP_FAIL;
+		}
+	}
+	size_t used = strnlen(text, len); // a NUL inside ends the text (it is a C string)
+	if (len > U_DESKTOP_CLIPBOARD_MAX_BYTES) {
+		clip_wipe_free(text, len);
+		*result = U_DESKTOP_XR_ERROR_LIMIT_REACHED;
+		snprintf(msg, MSG_CAP, "the clipboard text is larger than %u bytes", U_DESKTOP_CLIPBOARD_MAX_BYTES);
+		return STEP_FAIL;
+	}
+	if (used < len) {
+		memset(text + used, 0, len - used);
+		len = used;
+	}
+	if (utf8_count(text) < 0) {
+		clip_wipe_free(text, len);
+		*result = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		snprintf(msg, MSG_CAP, "the clipboard text is not valid UTF-8");
+		return STEP_FAIL;
+	}
+	os_mutex_lock(&c->mutex);
+	clip_wipe_free(c->clip_kept, c->clip_kept_len);
+	c->clip_kept = text;
+	c->clip_kept_len = len;
+	c->clip_kept_id = qa->id;
+	c->clip_kept_until_ns = os_monotonic_get_ns() + c->clip_retention_ns;
+	os_cond_broadcast(&c->cond); // the worker expires it
+	os_mutex_unlock(&c->mutex);
+	*bytes = (int64_t)len;
+	*no_text = none;
+	return STEP_OK;
+}
+
+void
+u_desktop_control_set_clipboard_retention_for_tests(struct u_desktop_control *c, uint64_t retention_ns)
+{
+	os_mutex_lock(&c->mutex);
+	if (retention_ns != 0) {
+		c->clip_retention_ns = retention_ns;
+	}
+	os_mutex_unlock(&c->mutex);
+}
+
+int32_t
+u_desktop_control_clipboard_text(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, char *buf)
+{
+	if (count == NULL || (cap > 0 && buf == NULL)) {
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	*count = 0;
+	os_mutex_lock(&c->mutex);
+	clip_expire_locked(c, os_monotonic_get_ns());
+	if (id == 0 || c->clip_kept == NULL || c->clip_kept_id != id) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_VALIDATION_FAILURE;
+	}
+	uint32_t size = (uint32_t)c->clip_kept_len + 1;
+	*count = size;
+	if (cap == 0) {
+		os_mutex_unlock(&c->mutex); // a size query: the text stays
+		return U_DESKTOP_XR_SUCCESS;
+	}
+	if (cap < size) {
+		os_mutex_unlock(&c->mutex);
+		return U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT;
+	}
+	// Copied out: retention ends.
+	char *text = c->clip_kept;
+	size_t len = c->clip_kept_len;
+	c->clip_kept = NULL;
+	c->clip_kept_len = 0;
+	c->clip_kept_id = 0;
+	os_mutex_unlock(&c->mutex);
+	memcpy(buf, text, size);
+	clip_wipe_free(text, len);
+	return U_DESKTOP_XR_SUCCESS;
+}
+
 //! §5 step 5. Called only after steps 1–4 passed.
 static enum step_outcome
 execute(struct u_desktop_control *c,
@@ -2542,7 +2782,8 @@ audit_action(struct u_desktop_control *c,
              const struct u_desktop_window *target,
              int32_t result,
              const char *msg,
-             bool aborted)
+             bool aborted,
+             int64_t clip_bytes)
 {
 	const struct u_desktop_action *a = &qa->a;
 	struct u_desktop_audit_record r;
@@ -2550,7 +2791,10 @@ audit_action(struct u_desktop_control *c,
 	r.exe = c->exe;
 	const char *name = action_name(a->type);
 	r.action = name != NULL ? name : "unknown";
-	r.has_target = a->target_window_id != U_DESKTOP_TARGET_SHELL;
+	// Spec v3: a clipboard action has no target; its record has the size, never the text.
+	r.has_target = a->target_window_id != U_DESKTOP_TARGET_SHELL && !is_clipboard_action(a->type);
+	r.has_bytes = clip_bytes >= 0;
+	r.bytes = clip_bytes >= 0 ? (uint64_t)clip_bytes : 0;
 	r.target_id = a->target_window_id;
 	if (a->target_window_id == U_DESKTOP_TARGET_SHELL) {
 		r.target_kind = "shell"; // spec v3: "target":{"kind":"shell"}
@@ -2598,6 +2842,8 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 	const struct u_desktop_action *a = &qa->a;
 	int32_t result = U_DESKTOP_XR_SUCCESS;
 	char msg[MSG_CAP] = {0};
+	int64_t clip_bytes = -1;   //!< spec v3: the clipboard text's size, for the audit
+	bool clip_no_text = false; //!< spec v3: a GET found no text on the clipboard
 	struct u_desktop_window target_copy;
 	const struct u_desktop_window *target = NULL;
 	enum step_outcome so;
@@ -2652,6 +2898,45 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 				target = &target_copy;
 			}
 		}
+		goto done;
+	}
+
+	// Spec v3 (§11.6): clipboard text — the state, the backend's setup, the idle
+	// wait for a SET (it changes what the user would paste; a GET changes nothing),
+	// then the guard and the backend. No target window, no injected input.
+	if (is_clipboard_action(a->type)) {
+		so = check_state(c, &result, msg);
+		if (so != STEP_OK) {
+			goto done;
+		}
+		if ((c->b->caps & U_DESKTOP_CAP_CLIPBOARD) == 0 || c->b->clipboard_get == NULL ||
+		    c->b->clipboard_set == NULL) {
+			result = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+			snprintf(msg, sizeof(msg), "this desktop backend has no clipboard access");
+			so = STEP_FAIL;
+			goto done;
+		}
+		if (c->b->prepare_input != NULL) {
+			char pmsg[MSG_CAP] = {0};
+			enum u_desktop_result pr = c->b->prepare_input(c->b, pmsg);
+			if (pr != U_DESKTOP_OK) {
+				result = clipboard_result(c, NULL, a->type == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT, pr, msg);
+				so = STEP_FAIL;
+				goto done;
+			}
+			if (stopping(c)) {
+				so = STEP_ABORT;
+				goto done;
+			}
+		}
+		if (a->type == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT) {
+			so = wait_for_idle(c, &result, msg);
+			if (so != STEP_OK) {
+				goto done;
+			}
+		}
+		msg[0] = '\0';
+		so = run_clipboard(c, qa, &result, msg, &clip_bytes, &clip_no_text);
 		goto done;
 	}
 
@@ -2751,7 +3036,7 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 done:
 	c->last_action_ns = os_monotonic_get_ns(); // spec v3: the burst-end clock
 	// 6. Audit — every action, whatever its result.
-	audit_action(c, qa, target, result, msg, so == STEP_ABORT);
+	audit_action(c, qa, target, result, msg, so == STEP_ABORT, clip_bytes);
 	if (so == STEP_ABORT) {
 		return; // destroyed: the session's event queue is going away
 	}
@@ -2770,6 +3055,9 @@ done:
 		}
 		snprintf(msg, sizeof(msg), "%s", ok);
 	}
+	if (result == U_DESKTOP_XR_SUCCESS && clip_no_text) {
+		snprintf(msg, sizeof(msg), "ok (the clipboard holds no text)"); // spec v3, a GET
+	}
 	os_mutex_lock(&c->mutex);
 	bool stop = c->stop;
 	os_mutex_unlock(&c->mutex);
@@ -2785,16 +3073,26 @@ worker(void *ptr)
 	os_mutex_lock(&c->mutex);
 	for (;;) {
 		while (!c->stop && c->q_count == 0) {
-			if (c->held_count == 0) {
+			// Spec v3: a clipboard text kept for the app is wiped when its time is up.
+			uint64_t now = os_monotonic_get_ns();
+			clip_expire_locked(c, now);
+			uint64_t wait = UINT64_MAX;
+			if (c->held_count > 0) {
+				wait = c->timing.idle_poll_ns;
+			}
+			if (c->clip_kept != NULL && c->clip_kept_until_ns - now < wait) {
+				wait = c->clip_kept_until_ns - now;
+			}
+			if (wait == UINT64_MAX) {
 				os_cond_wait(&c->cond, &c->mutex);
+				continue;
+			}
+			os_cond_wait_timeout_ns(&c->cond, &c->mutex, wait > 0 ? wait : 1);
+			if (c->stop || c->q_count > 0 || c->held_count == 0) {
 				continue;
 			}
 			// Spec v3: something is held and nothing is queued — watch for a reason
 			// to let go of it (the burst ended, the kill switch, the user, ...).
-			os_cond_wait_timeout_ns(&c->cond, &c->mutex, c->timing.idle_poll_ns);
-			if (c->stop || c->q_count > 0) {
-				break;
-			}
 			os_mutex_unlock(&c->mutex);
 			hold_watch(c);
 			os_mutex_lock(&c->mutex);
@@ -3470,6 +3768,7 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->timing.idle_max_wait_ns =
 	    timing != NULL && timing->idle_max_wait_ns != 0 ? timing->idle_max_wait_ns : DEFAULT_MAX_WAIT_NS;
 	c->hold_max_ns = (uint64_t)U_DESKTOP_HOLD_MAX_MS * NS_PER_MS;
+	c->clip_retention_ns = (uint64_t)U_DESKTOP_CLIPBOARD_RETENTION_MS * NS_PER_MS;
 	c->hold_burst_gap_ns = (uint64_t)U_DESKTOP_HOLD_BURST_GAP_MS * NS_PER_MS;
 	c->cap_retention_ns = (uint64_t)U_DESKTOP_CAPTURE_RETENTION_MS * NS_PER_MS;
 	c->cap_burst_gap_ns = (uint64_t)U_DESKTOP_CAPTURE_BURST_GAP_MS * NS_PER_MS;
@@ -3539,6 +3838,8 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 	}
 	flush_burst(c);
 	u_desktop_image_free(&c->kept); // retention ends with the session
+	clip_wipe_free(c->clip_kept, c->clip_kept_len); // spec v3: and so does a kept clipboard text
+	c->clip_kept = NULL;
 
 	// From here on a consent answer is ignored ...
 	os_mutex_lock(&c->mutex);

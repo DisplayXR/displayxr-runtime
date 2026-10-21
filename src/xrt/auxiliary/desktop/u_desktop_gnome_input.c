@@ -950,6 +950,163 @@ cmd_clip_paste(struct gnome_portal *p, struct gp_cmd *c)
 	return U_DESKTOP_OK;
 }
 
+/*!
+ * Spec v3: read the clipboard's text for GET_CLIPBOARD_TEXT. SelectionRead of
+ * text/plain;charset=utf-8 from whoever owns the selection — the user's app, or
+ * mutter's clipboard manager once that app is gone. An error reply means the owner
+ * offers no text (OK, nothing read). Bounded: the reply 1 s, the read 1 s.
+ */
+static enum u_desktop_result
+clipboard_read_text(struct gnome_portal *p, char **out, size_t *out_len, char *msg)
+{
+	*out = NULL;
+	*out_len = 0;
+	DBusMessage *m = dbus_message_new_method_call(PORTAL_DEST, PORTAL_PATH, CLIP_IFACE, "SelectionRead");
+	if (m == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	const char *s = p->session;
+	const char *mime = "text/plain;charset=utf-8";
+	dbus_message_append_args(m, DBUS_TYPE_OBJECT_PATH, &s, DBUS_TYPE_STRING, &mime, DBUS_TYPE_INVALID);
+	DBusError e;
+	dbus_error_init(&e);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(p->c, m, 1000, &e);
+	dbus_message_unref(m);
+	int fd = -1;
+	if (reply == NULL) {
+		bool timeout = dbus_error_is_set(&e) && (strcmp(e.name, DBUS_ERROR_NO_REPLY) == 0 ||
+		                                         strcmp(e.name, DBUS_ERROR_TIMEOUT) == 0);
+		bool not_allowed = dbus_error_is_set(&e) && strstr(e.name, "NotAllowed") != NULL;
+		U_LOG_I("desktop/gnome: SelectionRead: %s", dbus_error_is_set(&e) ? e.name : "no reply");
+		dbus_error_free(&e);
+		if (timeout) {
+			gp_set_msg(msg, "the clipboard owner did not answer");
+			return U_DESKTOP_ERR_TIMEOUT;
+		}
+		if (not_allowed) {
+			gp_set_msg(msg, "the session has no clipboard access");
+			return U_DESKTOP_ERR_UNSUPPORTED;
+		}
+		return U_DESKTOP_OK; // no text offered (empty clipboard, an image, ...)
+	}
+	dbus_error_free(&e);
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_UNIX_FD, &fd, DBUS_TYPE_INVALID) || fd < 0) {
+		dbus_message_unref(reply);
+		return U_DESKTOP_OK;
+	}
+	dbus_message_unref(reply);
+	const size_t limit = U_DESKTOP_CLIPBOARD_MAX_BYTES + 1; // one more: "too large" is the caller's to say
+	size_t cap = 4096, len = 0;
+	char *buf = malloc(cap + 1);
+	uint64_t deadline = gdbus_now_ms() + 1000;
+	bool eof = false;
+	while (buf != NULL && !eof && len < limit) {
+		uint64_t now = gdbus_now_ms();
+		if (now >= deadline) {
+			break;
+		}
+		struct pollfd pfd = {fd, POLLIN, 0};
+		if (poll(&pfd, 1, (int)(deadline - now)) <= 0) {
+			break;
+		}
+		if (len == cap) {
+			size_t ncap = cap * 2 > limit ? limit : cap * 2;
+			char *nb = realloc(buf, ncap + 1);
+			if (nb == NULL) {
+				break;
+			}
+			buf = nb;
+			cap = ncap;
+		}
+		ssize_t r = read(fd, buf + len, cap - len);
+		if (r > 0) {
+			len += (size_t)r;
+		} else if (r == 0) {
+			eof = true;
+		} else if (errno != EINTR && errno != EAGAIN) {
+			break;
+		}
+	}
+	close(fd);
+	if (buf == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	if (!eof && len < limit) {
+		memset(buf, 0, len); // a partial read is never handed out
+		free(buf);
+		gp_set_msg(msg, "the clipboard owner did not finish sending the text");
+		return U_DESKTOP_ERR_TIMEOUT;
+	}
+	buf[len] = '\0';
+	*out = buf;
+	*out_len = len;
+	return U_DESKTOP_OK;
+}
+
+static enum u_desktop_result
+cmd_clip_get(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (!p->have_clipboard_portal || !p->clipboard_enabled) {
+		gp_set_msg(c->msg, "no portal clipboard in this session");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	gp_pump(p, 0); // a copy already announced (SelectionOwnerChanged) is the user's: read theirs
+	if (p->clip_owner) {
+		// Our own selection — a SET, or the previous text offered again after a type.
+		// Reading it through the portal would ask THIS thread to serve it: deadlock.
+		if (p->clip_text != NULL && !p->clip_is_paste) {
+			c->out_text = strdup(p->clip_text);
+			c->out_len = c->out_text != NULL ? strlen(c->out_text) : 0;
+			injected(p);
+			return c->out_text != NULL ? U_DESKTOP_OK : U_DESKTOP_ERR_FAILED;
+		}
+		injected(p);
+		return U_DESKTOP_OK; // owned, serving nothing: no text
+	}
+	r = clipboard_read_text(p, &c->out_text, &c->out_len, c->msg);
+	injected(p); // done: the idle close counts from now, prepare's hold is over
+	return r;
+}
+
+/*!
+ * Spec v3: SET_CLIPBOARD_TEXT. The text is offered as the selection (as a copy) and
+ * served until another client takes it; mutter's clipboard manager reads a copy at
+ * once, so it outlives this session. A previous text queued for a restore is
+ * superseded (a type's restore offers what was there before the type, which is this).
+ */
+static enum u_desktop_result
+cmd_clip_set(struct gnome_portal *p, struct gp_cmd *c)
+{
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (!p->have_clipboard_portal || !p->clipboard_enabled) {
+		gp_set_msg(c->msg, "no portal clipboard in this session");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	free(p->clip_prev);
+	p->clip_prev = NULL;
+	bool owned = clipboard_offer(p, c->text, false);
+	if (!owned) {
+		free(p->clip_text);
+		p->clip_text = NULL;
+		gp_set_msg(c->msg, "the portal did not make this session the clipboard owner");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	// Serve mutter's clipboard manager (it reads a copy right after the owner changes).
+	uint64_t until = gdbus_now_ms() + 150;
+	while (gdbus_now_ms() < until && p->session_open && !gp_quitting(p)) {
+		gp_pump(p, 10);
+	}
+	injected(p); // done: the idle close counts from now, prepare's hold is over
+	return U_DESKTOP_OK;
+}
+
 static enum u_desktop_result
 cmd_clip_restore(struct gnome_portal *p, struct gp_cmd *c)
 {
@@ -1162,6 +1319,43 @@ gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, struct u_desktop_
 		obs->writes_after_key = copy.obs.writes_after_key;
 	}
 	return r;
+}
+
+enum u_desktop_result
+gnome_portal_clip_get(struct gnome_portal *p, char **out, size_t *len, char *msg)
+{
+	*out = NULL;
+	*len = 0;
+	struct gp_cmd *c = gp_cmd_new(cmd_clip_get);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	struct gp_cmd copy;
+	memset(&copy, 0, sizeof(copy));
+	enum u_desktop_result r = gp_run_sync_keep(p, c, ACTION_TIMEOUT_MS, msg, &copy);
+	if (r == U_DESKTOP_OK) {
+		*out = copy.out_text;
+		*len = copy.out_len;
+	} else if (copy.out_text != NULL) {
+		memset(copy.out_text, 0, copy.out_len);
+		free(copy.out_text);
+	}
+	return r;
+}
+
+enum u_desktop_result
+gnome_portal_clip_set(struct gnome_portal *p, const char *utf8, char *msg)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_clip_set);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	c->text = strdup(utf8);
+	if (c->text == NULL) {
+		gp_cmd_free(c);
+		return U_DESKTOP_ERR_FAILED;
+	}
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
 }
 
 void

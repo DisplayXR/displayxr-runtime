@@ -97,6 +97,9 @@ enum u_desktop_action_type
 	U_DESKTOP_ACTION_KEY_UP = 17,
 	U_DESKTOP_ACTION_BUTTON_DOWN = 18,
 	U_DESKTOP_ACTION_BUTTON_UP = 19,
+	// Spec v3 (§11.6): clipboard text (targetWindowId must be 0).
+	U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT = 20,
+	U_DESKTOP_ACTION_GET_CLIPBOARD_TEXT = 21,
 };
 
 //! Mirror of XrDesktopActionDXR. Strings are copied at submit.
@@ -110,7 +113,7 @@ struct u_desktop_action
 	uint32_t button; //!< enum u_desktop_button (validated)
 	uint32_t click_count;
 	int32_t scroll_x, scroll_y;
-	const char *text;
+	const char *text; //!< TYPE_TEXT; spec v3: SET_CLIPBOARD_TEXT
 	const char *keys; //!< KEY_CHORD; spec v3: KEY_DOWN / KEY_UP (exactly one key or modifier)
 	//! Spec v3 (XrDesktopActionModifiersDXR): enum u_desktop_mod bits held around a
 	//! CLICK, DRAG or SCROLL; 0 = none (any other action type: validation failure).
@@ -364,6 +367,27 @@ u_desktop_control_capture_image(struct u_desktop_control *c, uint64_t id, uint32
  */
 void
 u_desktop_control_set_hold_timing_for_tests(struct u_desktop_control *c, uint64_t max_ns, uint64_t burst_gap_ns);
+
+
+// --- spec v3: clipboard text (§11.6) ------------------------------------------
+
+//! A GET_CLIPBOARD_TEXT result is kept this long at most (like a capture image).
+#define U_DESKTOP_CLIPBOARD_RETENTION_MS 10000
+
+/*!
+ * xrGetDesktopClipboardTextDXR: the text a successful GET_CLIPBOARD_TEXT action @p id
+ * read (two-call idiom, bytes, the terminator included: @p count = length + 1). Only
+ * the most recent successful GET is kept, until a call copies it out, the next GET
+ * completes, the session ends or 10 s pass; a size query or a too-small buffer
+ * (SIZE_INSUFFICIENT) keeps it. Any other id: VALIDATION_FAILURE. The memory is wiped
+ * when retention ends.
+ */
+int32_t
+u_desktop_control_clipboard_text(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, char *buf);
+
+//! Tests only: shorten the clipboard retention (the spec fixes it at 10 s). 0 keeps it.
+void
+u_desktop_control_set_clipboard_retention_for_tests(struct u_desktop_control *c, uint64_t retention_ns);
 
 
 #ifdef __cplusplus

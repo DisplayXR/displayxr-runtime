@@ -151,3 +151,12 @@ act key target=shell keys=super
 expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
 act maximize target=shell
 expect XR_ERROR_VALIDATION_FAILURE
+# spec v3 (§11.6): clipboard text — sizes in the audit, never the text
+act clip-set text="from the probe ✓"
+expect XR_SUCCESS
+act clip-get
+expect XR_SUCCESS
+expect-clipboard "from the probe ✓"
+act clip-get target=101
+expect XR_ERROR_VALIDATION_FAILURE
+run displayxr-cli desktop audit --tail 4
