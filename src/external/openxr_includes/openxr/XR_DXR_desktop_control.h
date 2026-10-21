@@ -52,6 +52,13 @@
  * CONTROL = everything in version 1): stills on request, never a stream, never
  * written to disk by the runtime, behind the same kill switch, lock check and audit log.
  *
+ * Spec version 3 (PROPOSED, ADR-056 Amendment 3) adds held input — KEY_DOWN / KEY_UP,
+ * BUTTON_DOWN / BUTTON_UP and modifiers around a click, drag or scroll — with every
+ * key and button the agent holds released automatically (spec §11). Apps check the
+ * extension's specVersion before using any of it: a version 2 runtime refuses the new
+ * action types, but ignores a chained XrDesktopActionModifiersDXR (OpenXR's rule for
+ * unknown structures) and would click without the modifiers.
+ *
  * Spec: displayxr-runtime docs/specs/extensions/XR_DXR_desktop_control.md
  * Decision: docs/adr/ADR-056-desktop-control-runs-in-the-app.md
  */
@@ -65,7 +72,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_desktop_control 1
-#define XR_DXR_desktop_control_SPEC_VERSION 2
+#define XR_DXR_desktop_control_SPEC_VERSION 3
 #define XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME "XR_DXR_desktop_control"
 
 #define XR_TYPE_DESKTOP_WINDOW_DXR                          ((XrStructureType)1004999400)
@@ -81,6 +88,8 @@ extern "C" {
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
 // Spec version 2, continued in a fresh decade (400–409 is full).
 #define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR            ((XrStructureType)1004999420)
+// Spec version 3 (spec §11, ADR-056 Amendment 3, proposed).
+#define XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR                 ((XrStructureType)1004999421)
 
 //! The operation is refused by the safety layer (lock screen, kill switch, the
 //! user is typing and the wait timed out, target verification failed). The
@@ -202,6 +211,23 @@ typedef enum XrDesktopActionTypeDXR {
     XR_DESKTOP_ACTION_TYPE_CLICK_DXR         = 13, //!< `button` × `clickCount` at `point`
     XR_DESKTOP_ACTION_TYPE_DRAG_DXR          = 14, //!< `button` held from `point` to `point2`
     XR_DESKTOP_ACTION_TYPE_SCROLL_DXR        = 15, //!< `scrollX`/`scrollY` notches at `point`
+    // --- spec version 3: held input (spec §11.2). What the session holds is released
+    // --- automatically: on the app's KEY_UP / BUTTON_UP, at the end of the action burst
+    // --- (2 s without an action), after 10 s, on the kill switch, a lock, the user's own
+    // --- input, focus moving to another app's window, and when the session ends.
+    //! Press and HOLD one key: `keys` names exactly one key or one modifier ("shift",
+    //! "alt", "tab", "a"). Verified like a chord (the target has keyboard focus).
+    XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR      = 16,
+    //! Release a key this session holds (`keys` as for KEY_DOWN). Never refused for
+    //! focus and never waits for the user; REFUSED when the key is not held.
+    XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR        = 17,
+    //! Press and HOLD `button` at `point` (targeting as CLICK). A POINTER_MOVE while it
+    //! is held drags it.
+    XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR   = 18,
+    //! Release a held `button` at `point`: the pointer drags there first when the point
+    //! verifies like a CLICK's; otherwise the button is released where the pointer is
+    //! and the action is REFUSED. Never waits for the user.
+    XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR     = 19,
     XR_DESKTOP_ACTION_TYPE_MAX_ENUM_DXR      = 0x7FFFFFFF
 } XrDesktopActionTypeDXR;
 
@@ -213,8 +239,20 @@ typedef enum XrDesktopPointerButtonDXR {
 } XrDesktopPointerButtonDXR;
 
 /*!
+ * Spec version 3: the modifier keys held around a CLICK, DRAG or SCROLL.
+ */
+typedef XrFlags64 XrDesktopKeyModifierFlagsDXR;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR  = 0x00000001;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR = 0x00000002;
+//! Option on macOS.
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR   = 0x00000004;
+//! The Windows key / Command / Super.
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR = 0x00000008;
+
+/*!
  * One action. Fields not used by `actionType` are ignored. Strings are copied at
- * submit time.
+ * submit time. Spec version 3: `next` may carry an XrDesktopActionModifiersDXR (other
+ * structures in the chain are ignored).
  */
 typedef struct XrDesktopActionDXR {
     XrStructureType            type;   //!< XR_TYPE_DESKTOP_ACTION_DXR
@@ -232,8 +270,23 @@ typedef struct XrDesktopActionDXR {
     int32_t                    scrollX;    //!< SCROLL, notches, +right
     int32_t                    scrollY;    //!< SCROLL, notches, +down
     const char*                text;       //!< TYPE_TEXT
-    const char*                keys;       //!< KEY_CHORD
+    const char*                keys;       //!< KEY_CHORD; spec version 3: KEY_DOWN / KEY_UP (one key or modifier)
 } XrDesktopActionDXR;
+
+/*!
+ * Spec version 3. Chained on XrDesktopActionDXR::next of a CLICK, DRAG or SCROLL: the
+ * modifiers pressed after the pointer reached `point` (and verified), held for the
+ * click / drag / scroll, and always released after it — whatever happened (ctrl+click,
+ * shift+click, alt+drag, ctrl+scroll). A modifier the session already holds (KEY_DOWN)
+ * is neither pressed again nor released. Chained on any other action type, or with an
+ * unknown bit: XR_ERROR_VALIDATION_FAILURE. A version 2 runtime ignores it (check the
+ * spec version first).
+ */
+typedef struct XrDesktopActionModifiersDXR {
+    XrStructureType               type;      //!< XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR
+    const void* XR_MAY_ALIAS      next;
+    XrDesktopKeyModifierFlagsDXR  modifiers; //!< 0 = none
+} XrDesktopActionModifiersDXR;
 
 /*!
  * Optional argument of xrRequestDesktopControlDXR (pass NULL for none). `reason` is

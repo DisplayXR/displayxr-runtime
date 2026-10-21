@@ -33,8 +33,8 @@
  *
  * ## Threading
  *
- * - Action calls (window_action, type_text, key_chord, pointer_*, scroll) are
- *   made from ONE worker thread per backend, never concurrently with each other.
+ * - Action calls (window_action, type_text, key_chord, pointer_*, scroll, key_event)
+ *   are made from ONE worker thread per backend, never concurrently with each other.
  *   They may block (portal round trips, waiting for a grab to end) and must be
  *   bounded: a few seconds for everything but text. type_text takes time
  *   proportional to its length (chunk pacing, about 1 s per 2 KiB worst case:
@@ -509,6 +509,41 @@ struct u_desktop_backend
 	                                int32_t dx,
 	                                int32_t dy,
 	                                char *msg);
+
+	// ---- spec v3: held input (worker thread only). Optional: NULL = KEY_DOWN / KEY_UP
+	// ---- and modifiers around a pointer action are UNSUPPORTED on this backend.
+
+	/*!
+	 * Press (@p down) or release ONE key and leave it so: @p key carries exactly one
+	 * modifier bit and no key name ("shift"), or no modifier and one canonical key
+	 * name ("tab", "a"; a character key presses the key producing that character on
+	 * the active layout, WITHOUT adding Shift — modifiers are always explicit here).
+	 *
+	 * A press is an injection batch: first guard->still_allowed, then, with
+	 * @p check_focus, the keyboard re-check against guard->target_id (as for a chord's
+	 * key-down). Without it (a modifier held around a pointer action, whose button
+	 * press re-checks the point) only still_allowed. A release is NEVER refused and
+	 * never consults the guard: releasing what we hold is always allowed, also while
+	 * suspended or locked; releasing a key this backend does not hold is a no-op OK.
+	 *
+	 * The common layer tracks what it holds and releases it (spec §11.3); a backend
+	 * still releases whatever it holds when its OS session ends or on destroy.
+	 */
+	enum u_desktop_result (*key_event)(struct u_desktop_backend *b,
+	                                   const struct u_desktop_input_guard *guard,
+	                                   const struct u_desktop_chord *key,
+	                                   bool down,
+	                                   bool check_focus,
+	                                   char *msg);
+
+	/*!
+	 * Optional (NULL = never). True while this backend holds a key that the OS
+	 * auto-repeats AS INPUT — every repeat resets the idle counter user_idle_ms reads
+	 * (GNOME: mutter repeats a held non-modifier libei key every ~30 ms after 500 ms).
+	 * The user's own input cannot be told from that repeat then: the common layer stops
+	 * reading the idle counter as the user's while it is true (spec §11.3). Worker only.
+	 */
+	bool (*holds_repeating_key)(struct u_desktop_backend *b);
 
 	// ---- spec v2: screen capture. All optional (NULL = no capture; then the backend
 	// ---- must not set U_DESKTOP_CAP_CAPTURE). See "Capture" below.

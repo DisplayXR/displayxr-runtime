@@ -19,6 +19,12 @@
  *   desktop_backend_smoke move X Y
  *   desktop_backend_smoke click X Y [left|right|middle] [count]
  *   desktop_backend_smoke scroll DX DY            at the current pointer
+ * Spec v3 (held input; the key stays down until keyup — in a script, one process):
+ *   desktop_backend_smoke keydown NAME            one key or modifier: shift | alt | tab | a ...
+ *   desktop_backend_smoke keyup NAME
+ *   desktop_backend_smoke buttondown X Y [left|right|middle]   move there, press, keep it down
+ *   desktop_backend_smoke buttonup X Y [left|right|middle]     move there (a drag), release
+ *   desktop_backend_smoke modclick MODS X Y [left|right|middle]  MODS bits held around one click
  *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
  *   desktop_backend_smoke parent [HANDLE]         (script) the consent dialog's parent window for
  *                                                 request / request-scopes: wayland:H | x11:HEX
@@ -45,6 +51,7 @@
  */
 
 #include "u_desktop.h"
+#include "u_desktop_chord.h"
 #ifdef __APPLE__
 #include "u_desktop_macos_capture.h"
 #endif
@@ -184,6 +191,18 @@ done(enum u_desktop_result r, const char *msg)
 {
 	printf("result: %s%s%s\n", res_str(r), msg[0] ? " — " : "", msg);
 	return r == U_DESKTOP_OK ? 0 : 1;
+}
+
+static enum u_desktop_button
+parse_button(int argc, char **argv, int i)
+{
+	if (argc > i && strcmp(argv[i], "right") == 0) {
+		return U_DESKTOP_BUTTON_RIGHT;
+	}
+	if (argc > i && strcmp(argv[i], "middle") == 0) {
+		return U_DESKTOP_BUTTON_MIDDLE;
+	}
+	return U_DESKTOP_BUTTON_LEFT;
 }
 
 static int
@@ -421,6 +440,73 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		u_desktop_macos_sck_force_stream(strcmp(argv[2], "on") == 0);
 		printf("ScreenCaptureKit path: %s\n", strcmp(argv[2], "on") == 0 ? "one-shot SCStream" : "default");
 #endif
+	} else if ((strcmp(cmd, "keydown") == 0 || strcmp(cmd, "keyup") == 0) && argc >= 3) {
+		bool down = strcmp(cmd, "keydown") == 0;
+		struct u_desktop_chord c;
+		if (!u_desktop_chord_parse(argv[2], &c)) {
+			printf("not a key name\n");
+			return 2;
+		}
+		if (b->key_event == NULL) {
+			return done(U_DESKTOP_ERR_UNSUPPORTED, "no key_event on this backend");
+		}
+		if (down && b->prepare_input) {
+			b->prepare_input(b, msg);
+			msg[0] = '\0';
+		}
+		struct u_desktop_input_guard g = guard_for_focus(b);
+		r = b->key_event(b, &g, &c, down, down, msg);
+		rc = done(r, msg);
+	} else if ((strcmp(cmd, "buttondown") == 0 || strcmp(cmd, "buttonup") == 0) && argc >= 4) {
+		bool down = strcmp(cmd, "buttondown") == 0;
+		int32_t x = atoi(argv[2]), y = atoi(argv[3]);
+		enum u_desktop_button btn = parse_button(argc, argv, 4);
+		if (down && b->prepare_input) {
+			b->prepare_input(b, msg);
+			msg[0] = '\0';
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->pointer_move(b, x, y, msg); // with the button held: a drag motion
+		if (r == U_DESKTOP_OK || !down) {
+			enum u_desktop_result rb = b->pointer_button(b, &g, btn, down, x, y, msg);
+			r = r == U_DESKTOP_OK ? rb : r;
+		}
+		rc = done(r, msg);
+	} else if (strcmp(cmd, "modclick") == 0 && argc >= 5) {
+		uint32_t mods = (uint32_t)strtoul(argv[2], NULL, 0) & 0xFu;
+		int32_t x = atoi(argv[3]), y = atoi(argv[4]);
+		enum u_desktop_button btn = parse_button(argc, argv, 5);
+		if (b->key_event == NULL) {
+			return done(U_DESKTOP_ERR_UNSUPPORTED, "no key_event on this backend");
+		}
+		if (b->prepare_input) {
+			b->prepare_input(b, msg);
+			msg[0] = '\0';
+		}
+		struct u_desktop_input_guard g = guard_for_point(b, x, y);
+		r = b->pointer_move(b, x, y, msg);
+		uint32_t pressed = 0;
+		for (uint32_t bit = 1; r == U_DESKTOP_OK && bit <= 8; bit <<= 1) {
+			if (mods & bit) {
+				struct u_desktop_chord k = {bit, {0}};
+				r = b->key_event(b, &g, &k, true, false, msg);
+				pressed |= r == U_DESKTOP_OK ? bit : 0u;
+			}
+		}
+		if (r == U_DESKTOP_OK) {
+			r = b->pointer_button(b, &g, btn, true, x, y, msg);
+			if (r == U_DESKTOP_OK) {
+				r = b->pointer_button(b, &g, btn, false, x, y, msg);
+			}
+		}
+		for (uint32_t bit = 8; bit != 0; bit >>= 1) {
+			if (pressed & bit) {
+				struct u_desktop_chord k = {bit, {0}};
+				char m2[U_DESKTOP_MSG_SIZE] = {0};
+				b->key_event(b, &g, &k, false, false, m2);
+			}
+		}
+		rc = done(r, msg);
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
 		g_target = strtoull(argv[2], NULL, 10);
 		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);

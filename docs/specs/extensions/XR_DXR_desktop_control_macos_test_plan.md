@@ -218,3 +218,16 @@ XR_RUNTIME_JSON=build/openxr_displayxr-dev.json desktop_control_probe script cap
 | C18 | macOS 15's periodic "continue to allow screen recording" confirmation (decision 8) | record whether it fires for stills | not observable on 26.3 in one session; open on 15 |
 | C19 | a non-Retina (1×) external display | region × 1 on it; a region spanning 1× and 2× is ×2 with the 1× part sampled up | not run (both displays here are 2×); the geometry is pinned by the unit test |
 | C20 | macOS < 12.3 (or without ScreenCaptureKit) | runtime loads, `caps=0x3f`, CAPTURE `UNSUPPORTED` | not run; `otool -L` shows ScreenCaptureKit as `LC_LOAD_WEAK_DYLIB` [verified] |
+
+## 8. Spec version 3 (PROPOSED, spec §11) — held input
+
+Needs Accessibility, like §4. Through `desktop_control_probe` against TextEdit unless noted.
+
+| # | check | expected |
+|---|---|---|
+| H1 | `act key-down keys=shift`, `act key-down keys=a`, wait 1 s, `act key-up keys=a`, `act key-up keys=shift` | one capital A (record whether a posted key-down auto-repeats), Shift up afterwards |
+| H2 | cmd+click in a Finder list: `act click … mods=super` on three files | three selected (the click events carry the Command flag) |
+| H3 | `act key-down keys=super`, `act key-down keys=tab` × 3 (key-up between), `act key-up keys=super` | the Command-Tab switcher steps and switches |
+| H4 | `button-down` / `move-pointer` / `button-up` in a drawing canvas | a drag through the stops |
+| H5 | ctrl+scroll (`act scroll … sy=-3 mods=ctrl`) with Accessibility zoom on | the screen zooms (the scroll events carry the Control flag) |
+| H6 | kill switch / lock / user typing / 2 s idle / 10 s while a key is held | released each time (as the Windows plan §11) |

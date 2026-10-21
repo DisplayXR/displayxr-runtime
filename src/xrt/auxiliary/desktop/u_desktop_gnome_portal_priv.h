@@ -202,6 +202,12 @@ struct gnome_portal
 	uint32_t seq;
 	uint64_t last_use_ms;
 
+	//! Spec v3: keys and buttons libei has pressed and not released (evdev codes):
+	//! a held key keeps the session open, and is released before the session closes.
+	uint32_t pressed_keys[GNOME_PORTAL_MAX_KEYS];
+	uint32_t npressed_keys;
+	uint32_t pressed_buttons; //!< bit (code - BTN_LEFT) per held BTN_LEFT / BTN_RIGHT / BTN_MIDDLE
+
 	//! The keyboard device's keymap, compiled (lazily) for char → key lookups.
 	struct ei_device *xkb_dev;
 	struct xkb_context *xkb_ctx;
@@ -369,3 +375,14 @@ gp_grant_verify(struct gnome_portal *p, char *msg);
 //! u_desktop_gnome_input.c: drop the compiled keymap.
 void
 gp_xkb_forget(struct gnome_portal *p);
+
+//! u_desktop_gnome_input.c: anything libei holds pressed (spec v3)?
+bool
+gp_anything_pressed(const struct gnome_portal *p);
+
+/*!
+ * u_desktop_gnome_input.c: release every key and button libei holds (spec v3), while
+ * the EIS connection lives — before a session closes. Forgets them either way.
+ */
+void
+gp_release_pressed(struct gnome_portal *p);

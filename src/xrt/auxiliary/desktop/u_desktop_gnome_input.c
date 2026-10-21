@@ -170,6 +170,80 @@ gp_xkb_forget(struct gnome_portal *p)
 	p->xkb_tried = false;
 }
 
+/*
+ * Spec v3: what libei holds pressed — chords and clicks press and release within one
+ * command, KEY_DOWN / BUTTON_DOWN leave a key / button down across commands.
+ */
+
+static void
+note_key(struct gnome_portal *p, uint32_t code, bool press)
+{
+	for (uint32_t i = 0; i < p->npressed_keys; i++) {
+		if (p->pressed_keys[i] == code) {
+			if (!press) {
+				p->pressed_keys[i] = p->pressed_keys[--p->npressed_keys];
+			}
+			return;
+		}
+	}
+	if (press && p->npressed_keys < GNOME_PORTAL_MAX_KEYS) {
+		p->pressed_keys[p->npressed_keys++] = code;
+	}
+}
+
+static void
+note_button(struct gnome_portal *p, uint32_t code, bool press)
+{
+	if (code < BTN_LEFT || code > BTN_MIDDLE) {
+		return;
+	}
+	uint32_t bit = 1u << (code - BTN_LEFT);
+	p->pressed_buttons = press ? (p->pressed_buttons | bit) : (p->pressed_buttons & ~bit);
+}
+
+static bool
+key_is_pressed(const struct gnome_portal *p, uint32_t code)
+{
+	for (uint32_t i = 0; i < p->npressed_keys; i++) {
+		if (p->pressed_keys[i] == code) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+gp_anything_pressed(const struct gnome_portal *p)
+{
+	return p->npressed_keys > 0 || p->pressed_buttons != 0;
+}
+
+void
+gp_release_pressed(struct gnome_portal *p)
+{
+	if (!gp_anything_pressed(p)) {
+		return;
+	}
+	if (p->ei != NULL && !p->ei_dead) {
+		struct ei_device *bd = gp_find_dev(p, EIX_CAP_BUTTON, true);
+		for (uint32_t b = 0; bd != NULL && b < 3; b++) {
+			if (p->pressed_buttons & (1u << b)) {
+				g_ei.button_button(bd, BTN_LEFT + b, false);
+				g_ei.device_frame(bd, g_ei.now(p->ei));
+			}
+		}
+		struct ei_device *kd = gp_find_dev(p, EIX_CAP_KEYBOARD, false);
+		for (uint32_t i = p->npressed_keys; kd != NULL && i > 0; i--) {
+			g_ei.keyboard_key(kd, p->pressed_keys[i - 1], false);
+			g_ei.device_frame(kd, g_ei.now(p->ei));
+		}
+		U_LOG_I("desktop/gnome: released %u held key(s) and buttons 0x%x before closing the session",
+		        p->npressed_keys, p->pressed_buttons);
+	}
+	p->npressed_keys = 0;
+	p->pressed_buttons = 0;
+}
+
 static enum u_desktop_result
 cmd_motion(struct gnome_portal *p, struct gp_cmd *c)
 {
@@ -202,6 +276,11 @@ cmd_motion(struct gnome_portal *p, struct gp_cmd *c)
 static enum u_desktop_result
 cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 {
+	if (!c->down && (!p->session_open || p->ei == NULL)) {
+		// The session (and its device, which held the button) is gone: nothing to release.
+		note_button(p, c->code, false);
+		return U_DESKTOP_OK;
+	}
 	enum u_desktop_result r = gp_ensure_session(p, c->restore, c->msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
@@ -213,6 +292,7 @@ cmd_button(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	g_ei.button_button(d, c->code, c->down);
 	g_ei.device_frame(d, g_ei.now(p->ei));
+	note_button(p, c->code, c->down);
 	gdbus_sleep_ms(KEY_GAP_MS);
 	injected(p);
 	return U_DESKTOP_OK;
@@ -254,6 +334,7 @@ cmd_press_at(struct gnome_portal *p, struct gp_cmd *c)
 	}
 	g_ei.button_button(bd, c->code, true);
 	g_ei.device_frame(bd, g_ei.now(p->ei));
+	note_button(p, c->code, true);
 	gdbus_sleep_ms(KEY_GAP_MS);
 	injected(p);
 	return U_DESKTOP_OK;
@@ -292,6 +373,7 @@ send_keys(struct gnome_portal *p, const uint32_t *codes, const bool *press, uint
 	for (uint32_t i = 0; i < n; i++) {
 		g_ei.keyboard_key(d, codes[i], press[i]);
 		g_ei.device_frame(d, g_ei.now(p->ei));
+		note_key(p, codes[i], press[i]);
 		gdbus_sleep_ms(KEY_GAP_MS);
 	}
 	injected(p);
@@ -403,6 +485,29 @@ us_code_for_char(uint32_t ch)
 }
 
 
+
+/*!
+ * Spec v3: one key down or up, left so. A release of a key libei does not hold (the
+ * session that held it closed meanwhile) is a no-op: nothing is pressed any more.
+ */
+static enum u_desktop_result
+cmd_key(struct gnome_portal *p, struct gp_cmd *c)
+{
+	if (!c->down) {
+		if (!key_is_pressed(p, c->code) || !p->session_open || p->ei == NULL) {
+			note_key(p, c->code, false);
+			return U_DESKTOP_OK;
+		}
+	}
+	enum u_desktop_result r = gp_ensure_session(p, false, c->msg);
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	if (c->down && key_is_pressed(p, c->code)) {
+		return U_DESKTOP_OK; // already down
+	}
+	return send_keys(p, &c->code, &c->down, 1, c->msg);
+}
 
 static enum u_desktop_result
 cmd_keys(struct gnome_portal *p, struct gp_cmd *c)
@@ -965,6 +1070,18 @@ gnome_portal_keys(struct gnome_portal *p, const uint32_t *codes, const bool *pre
 	memcpy(c->keys, codes, n * sizeof(codes[0]));
 	memcpy(c->press, press, n * sizeof(press[0]));
 	c->nkeys = n;
+	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+}
+
+enum u_desktop_result
+gnome_portal_key(struct gnome_portal *p, uint32_t evdev_code, bool down, char *msg)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_key);
+	if (c == NULL) {
+		return U_DESKTOP_ERR_FAILED;
+	}
+	c->code = evdev_code;
+	c->down = down;
 	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
 }
 

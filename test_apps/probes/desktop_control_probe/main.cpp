@@ -36,8 +36,10 @@
  *
  * act TYPE: activate | move | minimize | restore | maximize | close | type | key |
  *           move-pointer | click | drag | scroll
+ *           spec v3: key-down | key-up (keys=ONE key or modifier) | button-down | button-up
  * act keys: target=ID  x=  y=  x2=  y2=  rect=X,Y,W,H  button=left|right|middle
  *           count=N  sx=  sy=  text="..."  keys=ctrl+s
+ *           spec v3: mods=ctrl+shift (chains XrDesktopActionModifiersDXR: click / drag / scroll)
  *
  * Script-only commands (E2E runs):
  *   run <shell command>         e.g. `run displayxr-cli desktop stop`
@@ -278,6 +280,10 @@ parse_type(const std::string &t, XrDesktopActionTypeDXR *out)
 	    {"click", XR_DESKTOP_ACTION_TYPE_CLICK_DXR},
 	    {"drag", XR_DESKTOP_ACTION_TYPE_DRAG_DXR},
 	    {"scroll", XR_DESKTOP_ACTION_TYPE_SCROLL_DXR},
+	    {"key-down", XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR},
+	    {"key-up", XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR},
+	    {"button-down", XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR},
+	    {"button-up", XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR},
 	};
 	for (const auto &e : table) {
 		if (t == e.n) {
@@ -302,6 +308,8 @@ cmd_act(const std::vector<std::string> &args)
 	}
 	std::string text, keys;
 	bool have_text = false, have_keys = false;
+	XrDesktopActionModifiersDXR mods = {XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR};
+	bool have_mods = false;
 	for (size_t i = 2; i < args.size(); i++) {
 		size_t eq = args[i].find('=');
 		if (eq == std::string::npos) {
@@ -340,6 +348,22 @@ cmd_act(const std::vector<std::string> &args)
 		} else if (k == "keys") {
 			keys = v;
 			have_keys = true;
+		} else if (k == "mods") {
+			// "ctrl+shift" (or a number): chained XrDesktopActionModifiersDXR (spec v3).
+			have_mods = true;
+			if (!v.empty() && v[0] >= '0' && v[0] <= '9') {
+				mods.modifiers = strtoull(v.c_str(), nullptr, 0);
+			}
+			for (size_t p = 0; p < v.size();) {
+				size_t e = v.find('+', p);
+				std::string m = v.substr(p, e == std::string::npos ? std::string::npos : e - p);
+				mods.modifiers |= m == "ctrl"    ? XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR
+				                  : m == "shift" ? XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR
+				                  : m == "alt"   ? XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR
+				                  : m == "super" ? XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR
+				                                 : 0;
+				p = e == std::string::npos ? v.size() : e + 1;
+			}
 		} else {
 			printf("act: unknown key '%s'\n", k.c_str());
 			return 1;
@@ -347,6 +371,7 @@ cmd_act(const std::vector<std::string> &args)
 	}
 	a.text = have_text ? text.c_str() : nullptr;
 	a.keys = have_keys ? keys.c_str() : nullptr;
+	a.next = have_mods ? &mods : nullptr;
 
 	uint64_t id = 0;
 	XrResult r = pSubmit(g_session, &a, &id);

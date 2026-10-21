@@ -1128,6 +1128,122 @@ gnome_key_chord(struct u_desktop_backend *b,
 	return gnome_send_chord(g, guard, guard->target_id, chord->mods, code, ch, msg);
 }
 
+/*!
+ * Spec v3: one key down or up, left so (u_desktop.h key_event). A character key is
+ * the key producing it on the active layout, pressed WITHOUT the Shift the layout
+ * may put it on (modifiers are explicit here). The release sends the code the press
+ * used. libei's keys are mutter's: they reach the focused surface, or the shell's
+ * own grab (the Alt+Tab switcher, the overview) while one is up.
+ */
+static enum u_desktop_result
+gnome_key_event(struct u_desktop_backend *b,
+                const struct u_desktop_input_guard *guard,
+                const struct u_desktop_chord *key,
+                bool down,
+                bool check_focus,
+                char *msg)
+{
+	struct gnome_backend *g = gnome(b);
+	if (!gnome_can_input(g, msg)) {
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	int slot = -1;
+	for (uint32_t i = 0; i < g->nheld; i++) {
+		if (g->held[i].key.mods == key->mods && strncmp(g->held[i].key.key, key->key, sizeof(key->key)) == 0) {
+			slot = (int)i;
+		}
+	}
+	if (!down) {
+		if (slot < 0) {
+			return U_DESKTOP_OK; // not held by us
+		}
+		uint32_t code = g->held[slot].code;
+		g->held[slot] = g->held[--g->nheld];
+		enum u_desktop_result r = gnome_portal_key(g->portal, code, false, msg);
+		if (r != U_DESKTOP_OK) {
+			r = gnome_portal_key(g->portal, code, false, msg); // a held key is worse than a retry
+		}
+		return r;
+	}
+	if (slot >= 0) {
+		return U_DESKTOP_OK; // already down
+	}
+	if (g->nheld >= GNOME_PORTAL_MAX_KEYS) {
+		gnome_set_msg(msg, "too many keys held");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	uint32_t code = 0;
+	if (key->key[0] == '\0') {
+		uint32_t mc[4];
+		if (gnome_chord_mod_codes(key->mods, mc) != 1) {
+			gnome_set_msg(msg, "exactly one key or modifier");
+			return U_DESKTOP_ERR_FAILED;
+		}
+		code = mc[0];
+	} else {
+		code = named_key(key->key);
+		uint32_t ch = code == 0 ? char_key(key->key) : 0;
+		if (code == 0 && ch == 0) {
+			gnome_set_msg(msg, "unknown key name"); // privacy: never echo the key
+			return U_DESKTOP_ERR_FAILED;
+		}
+		if (ch != 0) {
+			uint32_t rm = 0;
+			enum u_desktop_result r = gnome_portal_resolve_chord(g->portal, 0, 0, ch, &rm, &code, msg);
+			if (r != U_DESKTOP_OK) {
+				return r;
+			}
+		}
+	}
+	// The injection batch: the guard, and (a keyboard action) the focus.
+	enum u_desktop_result r = U_DESKTOP_OK;
+	if (check_focus) {
+		r = gnome_guard_focus(g, guard, guard != NULL ? guard->target_id : 0, msg);
+	} else if (!guard_allows(guard, msg)) {
+		r = U_DESKTOP_ERR_REFUSED;
+	}
+	if (r != U_DESKTOP_OK) {
+		return r;
+	}
+	r = gnome_portal_key(g->portal, code, true, msg);
+	if (r == U_DESKTOP_OK) {
+		g->held[g->nheld].key = *key;
+		g->held[g->nheld].code = code;
+		g->nheld++;
+	}
+	return r;
+}
+
+/*!
+ * Spec v3: mutter auto-repeats a held key itself (for Clutter / the shell; Wayland
+ * clients repeat on their own) and every repeat resets its IdleMonitor — measured in
+ * the headless harness: idle stays below ~30 ms from 500 ms after the press while a
+ * letter or Tab is held, grows normally while Shift is held. Modifiers and the locks
+ * do not repeat.
+ */
+static bool
+gnome_holds_repeating_key(struct u_desktop_backend *b)
+{
+	struct gnome_backend *g = gnome(b);
+	for (uint32_t i = 0; i < g->nheld; i++) {
+		switch (g->held[i].code) {
+		case KEY_LEFTCTRL:
+		case KEY_RIGHTCTRL:
+		case KEY_LEFTSHIFT:
+		case KEY_RIGHTSHIFT:
+		case KEY_LEFTALT:
+		case KEY_RIGHTALT:
+		case KEY_LEFTMETA:
+		case KEY_RIGHTMETA:
+		case KEY_CAPSLOCK:
+		case KEY_NUMLOCK:
+		case KEY_SCROLLLOCK: break;
+		default: return true;
+		}
+	}
+	return false;
+}
+
 //! A terminal pastes with Ctrl+Shift+V.
 static bool
 is_terminal(const char *app_id)
@@ -1424,6 +1540,8 @@ u_desktop_backend_create_platform(void)
 	g->base.prepare_input = gnome_prepare_input;
 	g->base.window_op = gnome_window_op;
 	g->base.type_text = gnome_type_text;
+	g->base.key_event = gnome_key_event;
+	g->base.holds_repeating_key = gnome_holds_repeating_key;
 	g->base.key_chord = gnome_key_chord;
 	g->base.pointer_move = gnome_pointer_move;
 	g->base.pointer_button = gnome_pointer_button;

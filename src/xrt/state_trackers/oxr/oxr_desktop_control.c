@@ -70,6 +70,15 @@ _Static_assert(U_DESKTOP_SCOPE_REASK == 0x100 /* XR_DESKTOP_CONTROL_SCOPE_ASK_AG
 _Static_assert(U_DESKTOP_PARENT_WINDOW_SIZE == XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR, "parent window size mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_WINDOW == (int)XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR, "target mirror");
 _Static_assert((int)U_DESKTOP_CAPTURE_REGION == (int)XR_DESKTOP_CAPTURE_TARGET_REGION_DXR, "target mirror");
+// Spec v3.
+_Static_assert((int)U_DESKTOP_ACTION_KEY_DOWN == (int)XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR, "action mirror");
+_Static_assert((int)U_DESKTOP_ACTION_KEY_UP == (int)XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR, "action mirror");
+_Static_assert((int)U_DESKTOP_ACTION_BUTTON_DOWN == (int)XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR, "action mirror");
+_Static_assert((int)U_DESKTOP_ACTION_BUTTON_UP == (int)XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR, "action mirror");
+_Static_assert(U_DESKTOP_MOD_CTRL == 0x1 /* XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR */, "modifier mirror");
+_Static_assert(U_DESKTOP_MOD_SHIFT == 0x2 /* XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR */, "modifier mirror");
+_Static_assert(U_DESKTOP_MOD_ALT == 0x4 /* XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR */, "modifier mirror");
+_Static_assert(U_DESKTOP_MOD_SUPER == 0x8 /* XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR */, "modifier mirror");
 
 //! Largest text xrGetDesktopTextAtDXR returns (bytes incl. NUL); longer text is cut on a code point.
 #define TEXT_AT_MAX 16384
@@ -478,6 +487,19 @@ oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action
 	a.scroll_y = action->scrollY;
 	a.text = action->text;
 	a.keys = action->keys;
+	// Spec v3: the modifiers held around a CLICK / DRAG / SCROLL, chained on next (the
+	// first one counts; other structures are ignored, as OpenXR does).
+	for (const XrBaseInStructure *n = (const XrBaseInStructure *)action->next; n != NULL; n = n->next) {
+		if (n->type == XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR) {
+			XrDesktopKeyModifierFlagsDXR m = ((const XrDesktopActionModifiersDXR *)n)->modifiers;
+			if ((m & ~(XrDesktopKeyModifierFlagsDXR)0xF) != 0) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "(XrDesktopActionModifiersDXR::modifiers) has unknown bits");
+			}
+			a.mods = (uint32_t)m;
+			break;
+		}
+	}
 
 	int32_t r = u_desktop_control_submit(dc, &a, actionId);
 	if (r == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE) {
