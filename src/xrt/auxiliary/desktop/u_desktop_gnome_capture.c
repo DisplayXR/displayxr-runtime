@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 #define SC_PROPS_TIMEOUT_MS 3000
-#define SC_PROBE_RETRY_MS 10000
+#define SC_PROBE_RETRY_MS U_DESKTOP_PORTAL_RETRY_MS
 #define INTERACTIVE_TIMEOUT_MS (10 * 60 * 1000)
 #define RESTORE_TIMEOUT_MS 5000
 //! A layout change this recent: do not restore yet (spec §10.5, the DS1's HDMI blink).
@@ -34,8 +34,6 @@
 #define LAYOUT_WAIT_MAX_MS 6000
 //! The first frame of a fresh stream (spec §10.3).
 #define FRAME_TIMEOUT_MS 2000
-//! prepare → grab: keep the session open across the grab.
-#define CAPTURE_HOLD_MS 4000
 
 #define WLG_PATH_ "/org/displayxr/WindowGeometry"
 #define WLG_IFACE_ "org.displayxr.WindowGeometry1"
@@ -62,6 +60,23 @@ struct dc_state
 	uint32_t n;
 	struct dc_monitor m[8];
 };
+
+//! Everything about the layout a restore cares about: mutter's serial AND the
+//! logical monitors themselves (a monitor can come back without the serial moving
+//! between two of our reads). Never 0.
+static uint64_t
+dc_fingerprint(const struct dc_state *dc)
+{
+	uint64_t h = u_desktop_fnv1a((const char *)&dc->serial, sizeof(dc->serial));
+	h ^= u_desktop_fnv1a((const char *)&dc->n, sizeof(dc->n)) * 31u;
+	for (uint32_t i = 0; i < dc->n && i < 8; i++) {
+		h = h * 1099511628211ull ^
+		    u_desktop_fnv1a(dc->m[i].conn, strnlen(dc->m[i].conn, sizeof(dc->m[i].conn)));
+		const int32_t r[4] = {dc->m[i].rect.x, dc->m[i].rect.y, dc->m[i].rect.w, dc->m[i].rect.h};
+		h = h * 1099511628211ull ^ u_desktop_fnv1a((const char *)r, sizeof(r));
+	}
+	return h != 0 ? h : 1;
+}
 
 struct dc_mode
 {
@@ -501,7 +516,7 @@ record_covered(struct gnome_portal *p)
 		}
 	}
 	p->cap.ncovered = n;
-	p->cap.dc_serial = dc.serial;
+	u_desktop_layout_settle_reset(&p->cap.layout, dc_fingerprint(&dc));
 }
 
 bool
@@ -624,11 +639,6 @@ gp_cap_before_restore(struct gnome_portal *p, char *msg)
 			return U_DESKTOP_OK; // cannot tell: no worse than before
 		}
 		uint64_t now = gdbus_now_ms();
-		if (dc.serial != p->cap.dc_serial) {
-			p->cap.dc_serial = dc.serial;
-			p->cap.dc_changed_ms = now;
-		}
-		bool settled = p->cap.dc_changed_ms == 0 || now - p->cap.dc_changed_ms >= LAYOUT_SETTLE_MS;
 		uint32_t missing = 0;
 		for (uint32_t i = 0; i < p->cap.ncovered; i++) {
 			bool found = false;
@@ -637,7 +647,12 @@ gp_cap_before_restore(struct gnome_portal *p, char *msg)
 			}
 			missing += found ? 0 : 1;
 		}
-		if (settled && missing == 0) {
+		// Settled = LAYOUT_SETTLE_MS since the LAST layout change and since every
+		// covered monitor is back (§11 run N4: a returning monitor was restored on
+		// after ~0.4 s, measured from an earlier change).
+		uint32_t left =
+		    u_desktop_layout_settle_step(&p->cap.layout, now, dc_fingerprint(&dc), missing, LAYOUT_SETTLE_MS);
+		if (left == 0) {
 			return U_DESKTOP_OK;
 		}
 		if (now - start >= LAYOUT_WAIT_MAX_MS || gp_quitting(p)) {
@@ -975,11 +990,13 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 	cp->handoff_n = cp->nstreams;
 	memcpy(cp->handoff, cp->streams, sizeof(cp->handoff));
 	pthread_mutex_unlock(&p->lock);
-	uint64_t now = gdbus_now_ms();
-	p->last_use_ms = now; // a capture counts as use (spec §10.5 lifetime)
-	if (p->hold_until_ms < now + CAPTURE_HOLD_MS) {
-		p->hold_until_ms = now + CAPTURE_HOLD_MS;
-	}
+	// A capture counts as use (spec §10.5 lifetime). The caller's grab then holds the
+	// session open (gp_cap::grabs) for exactly as long as it runs — no fixed hold, so
+	// the screen-sharing indicator goes SESSION_IDLE_CLOSE_MS (~2 s) after the last
+	// capture, as after the last input action (§11 run N2: a 4 s hold kept it ~3.9 s).
+	pthread_mutex_lock(&p->lock);
+	p->last_use_ms = gdbus_now_ms();
+	pthread_mutex_unlock(&p->lock);
 	return U_DESKTOP_OK;
 }
 
@@ -1182,6 +1199,12 @@ gnome_capture(struct u_desktop_backend *b, const struct u_desktop_rect *src, str
 		gnome_set_msg(msg, "the screen session went away");
 		return U_DESKTOP_ERR_FAILED;
 	}
+	// Keep the session open while the grab runs (its idle close is held off until
+	// grabs drops to 0). prepare just stamped last_use, so the idle close cannot
+	// have fired in between.
+	pthread_mutex_lock(&p->lock);
+	p->cap.grabs++;
+	pthread_mutex_unlock(&p->lock);
 
 	// Only the streams of monitors the region touches.
 	struct gnome_pw_stream sel[MAX_STREAMS];
@@ -1199,12 +1222,14 @@ gnome_capture(struct u_desktop_backend *b, const struct u_desktop_rect *src, str
 		r = gnome_pw_grab(fd, sel, n, FRAME_TIMEOUT_MS, frames, msg);
 	}
 	close(fd);
+	// The idle close counts from the end of the grab.
+	pthread_mutex_lock(&p->lock);
+	p->cap.grabs--;
+	p->last_use_ms = gdbus_now_ms();
+	pthread_mutex_unlock(&p->lock);
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
-	pthread_mutex_lock(&p->lock);
-	p->last_use_ms = gdbus_now_ms();
-	pthread_mutex_unlock(&p->lock);
 
 	// The image: the region × the densest scale among the monitors it touches (as
 	// GNOME's own screenshots); a region only on unshared monitors stays withheld.

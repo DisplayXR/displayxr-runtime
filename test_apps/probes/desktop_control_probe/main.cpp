@@ -20,7 +20,14 @@
  * Spec v2 (screen capture):
  *   desktop_control_probe request-scopes control|capture|all[+again] [reason...]
  *   (request and request-scopes take --parent=HANDLE: the consent dialog's parent
- *    window, "wayland:<xdg-foreign handle>" or "x11:<hex XID>" — GNOME opens it there)
+ *    window, "wayland:<xdg-foreign handle>" or "x11:<hex XID>" — GNOME opens it there.
+ *    A mutter handle is 32 random printable ASCII characters and often contains a SPACE
+ *    (or a quote, '#', '\'); it is passed verbatim, so quote the whole argument:
+ *    from a shell  --parent='wayland:ab cd…'  ; in a script  --parent="wayland:ab cd…"
+ *    (double quotes group; a handle containing '"' cannot be written there). Any handle,
+ *    whatever it contains, round-trips as --parent-hex=<hex of the bytes>, e.g.
+ *    --parent-hex=$(printf '%s' "$H" | xxd -p -c 256). The probe echoes what it chains as
+ *    `parent window: [..] (N bytes)` so leading / trailing spaces are visible.)
  *   desktop_control_probe capture-state
  *   desktop_control_probe capture desktop|region X Y W H|window ID [max=WxH] [--save FILE.png]
  *                         waits for the completion event, fetches the image and prints its
@@ -559,6 +566,32 @@ cmd_capture(const std::vector<std::string> &args)
 
 int run_line(const std::string &line);
 
+//! "77613a" -> "wa:"; false on odd length or a non-hex digit.
+bool
+hex_decode(const std::string &hex, std::string *out)
+{
+	if (hex.size() % 2 != 0) {
+		return false;
+	}
+	out->clear();
+	for (size_t i = 0; i < hex.size(); i += 2) {
+		int v = 0;
+		for (size_t k = i; k < i + 2; k++) {
+			char ch = hex[k];
+			int d = ch >= '0' && ch <= '9'   ? ch - '0'
+			        : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+			        : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+			                                 : -1;
+			if (d < 0) {
+				return false;
+			}
+			v = v * 16 + d;
+		}
+		out->push_back((char)v);
+	}
+	return true;
+}
+
 int
 run_command(const std::vector<std::string> &all_args)
 {
@@ -572,6 +605,12 @@ run_command(const std::vector<std::string> &all_args)
 		if (is_request && a.rfind("--parent=", 0) == 0) {
 			parent = a.substr(9);
 			have_parent = true;
+		} else if (is_request && a.rfind("--parent-hex=", 0) == 0) {
+			if (!hex_decode(a.substr(13), &parent)) {
+				printf("--parent-hex: not an even-length hex string\n");
+				return 1;
+			}
+			have_parent = true;
 		} else {
 			args.push_back(a);
 		}
@@ -581,6 +620,10 @@ run_command(const std::vector<std::string> &all_args)
 	}
 	XrDesktopControlParentWindowDXR pw = {XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR};
 	pw.parentWindow = parent.c_str();
+	if (have_parent) {
+		// Brackets so a leading / trailing space is visible: the handle is verbatim.
+		printf("parent window: [%s] (%zu bytes)\n", parent.c_str(), parent.size());
+	}
 	const std::string &c = args[0];
 	if (c == "state") {
 		XrDesktopControlCapabilityFlagsDXR caps = 0;
@@ -940,7 +983,8 @@ main(int argc, char **argv)
 		        "usage: desktop_control_probe state | request [reason] | list | pointer | pick X Y |\n"
 		        "       text X Y | act TYPE key=value... | script FILE |\n"
 		        "       request-scopes control|capture|all [reason] | capture-state |\n"
-		        "       (request / request-scopes: --parent=wayland:HANDLE|x11:HEX) |\n"
+		        "       (request / request-scopes: --parent=wayland:HANDLE|x11:HEX, quoted if the\n"
+		        "        handle has spaces, or --parent-hex=HEX_OF_THE_STRING) |\n"
 		        "       capture desktop|region X Y W H|window ID [max=WxH] [--save FILE.png]\n");
 		return 2;
 	}

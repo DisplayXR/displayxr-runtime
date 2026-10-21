@@ -160,6 +160,81 @@ u_desktop_frame_moved(const struct u_desktop_rect *before, const struct u_deskto
 }
 
 bool
+u_desktop_dbus_error_is_no_answer(const char *error_name)
+{
+	if (error_name == NULL || error_name[0] == '\0') {
+		return true;
+	}
+	// The portal (or the bus on its behalf) answered: it does not have this.
+	static const char *const answers[] = {
+	    "org.freedesktop.DBus.Error.UnknownInterface", "org.freedesktop.DBus.Error.UnknownProperty",
+	    "org.freedesktop.DBus.Error.UnknownObject",    "org.freedesktop.DBus.Error.UnknownMethod",
+	    "org.freedesktop.DBus.Error.InvalidArgs", // GDBus: "No such interface …" on Properties.Get
+	    "org.freedesktop.DBus.Error.AccessDenied",
+	};
+	for (size_t i = 0; i < sizeof(answers) / sizeof(answers[0]); i++) {
+		if (strcmp(error_name, answers[i]) == 0) {
+			return false;
+		}
+	}
+	// NoReply / Timeout / TimedOut / ServiceUnknown / NameHasNoOwner / Spawn.* /
+	// Disconnected / NoMemory / anything unknown: no answer yet — retry.
+	return true;
+}
+
+bool
+u_desktop_retry_due(const struct u_desktop_retry *r, uint64_t now_ms)
+{
+	return !r->known && now_ms >= r->next_ms;
+}
+
+void
+u_desktop_retry_record(struct u_desktop_retry *r, bool answered, uint64_t now_ms, uint32_t period_ms)
+{
+	if (answered) {
+		r->known = true;
+		r->next_ms = 0;
+	} else {
+		r->next_ms = now_ms + period_ms;
+	}
+}
+
+void
+u_desktop_layout_settle_reset(struct u_desktop_layout_settle *s, uint64_t fingerprint)
+{
+	s->fingerprint = fingerprint;
+	s->changed_ms = 0;
+	s->present_ms = 0;
+	s->was_missing = false;
+}
+
+uint32_t
+u_desktop_layout_settle_step(
+    struct u_desktop_layout_settle *s, uint64_t now_ms, uint64_t fingerprint, uint32_t missing, uint32_t settle_ms)
+{
+	if (s->fingerprint != 0 && fingerprint != s->fingerprint) {
+		s->changed_ms = now_ms; // the LAST change, not the first
+	}
+	s->fingerprint = fingerprint;
+	if (missing > 0) {
+		s->was_missing = true;
+		return U_DESKTOP_LAYOUT_MISSING;
+	}
+	if (s->was_missing) {
+		s->was_missing = false;
+		s->present_ms = now_ms; // all covered monitors present from now
+	}
+	uint64_t since = s->changed_ms > s->present_ms ? s->changed_ms : s->present_ms;
+	if (since == 0 || now_ms >= since + settle_ms) {
+		return 0;
+	}
+	if (now_ms < since) {
+		return settle_ms; // a clock that went backwards: wait the whole time
+	}
+	return (uint32_t)(since + settle_ms - now_ms);
+}
+
+bool
 u_desktop_shell_cover_appeared(const uint8_t *before, const uint8_t *after, uint32_t n)
 {
 	for (uint32_t i = 0; i < n; i++) {

@@ -297,7 +297,7 @@ struct Harness
 			backend = u_desktop_fake_create();
 			fake = u_desktop_fake_from_backend(backend);
 		}
-		u_desktop_app_info app = {kExe, "agent-app", nullptr};
+		u_desktop_app_info app = {kExe, "agent-app", nullptr, nullptr};
 		u_desktop_control_callbacks cb = rec.callbacks();
 		REQUIRE(u_desktop_control_create(backend, &app, &cb, timing, &c) == 0);
 	}
@@ -2464,8 +2464,10 @@ TEST_CASE("parent_window: the xdg-desktop-portal forms only", "[desktop][capture
 	CHECK_FALSE(u_desktop_parent_window_valid("x11:4a0000g"));
 	CHECK_FALSE(u_desktop_parent_window_valid("x11:12345678901234567")); // 17 digits
 	CHECK_FALSE(u_desktop_parent_window_valid("wayland:"));
-	CHECK_FALSE(u_desktop_parent_window_valid("wayland:has space"));
 	CHECK_FALSE(u_desktop_parent_window_valid("wayland:new\nline"));
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:tab\there"));
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:del\x7f"));
+	CHECK_FALSE(u_desktop_parent_window_valid("wayland:caf\xc3\xa9")); // non-ASCII
 	CHECK_FALSE(u_desktop_parent_window_valid("4a00007"));
 	CHECK_FALSE(u_desktop_parent_window_valid("X11:4a00007"));
 	CHECK_FALSE(u_desktop_parent_window_valid("hwnd:1234")); // reserved, not invented
@@ -2473,6 +2475,49 @@ TEST_CASE("parent_window: the xdg-desktop-portal forms only", "[desktop][capture
 	CHECK(u_desktop_parent_window_valid(longest.c_str()));
 	std::string too_long = longest + "a";
 	CHECK_FALSE(u_desktop_parent_window_valid(too_long.c_str()));
+}
+
+// GNOME §11 run N1: mutter's xdg-foreign handles are 32 random printable ASCII characters
+// (0x20..0x7E), so a SPACE is common (5 of 10 real handles) — anywhere, the ends included.
+TEST_CASE("parent_window: a mutter handle with spaces is valid and travels verbatim", "[desktop][capture]")
+{
+	// Shapes seen on the panel: inner, leading and trailing spaces, quotes, '#', '\\'.
+	const char *handles[] = {
+	    "wayland:x;Hq3 v!Pz]k^0@T`9e~r(Jm%Ld&uBy{N=g",
+	    "wayland: leading-space-handle-0123456789abcdef",
+	    "wayland:trailing-space-handle-0123456789abcde ",
+	    "wayland: \"q\"#\\ inner  doubled spaces ",
+	    "wayland: ", // a lone space is still a (one-byte) handle
+	};
+	for (const char *hd : handles) {
+		INFO(hd);
+		CHECK(u_desktop_parent_window_valid(hd));
+	}
+	// The whole printable range is accepted, byte by byte.
+	for (int ch = 0x20; ch <= 0x7e; ch++) {
+		std::string hd = std::string("wayland:") + (char)ch;
+		INFO(ch);
+		CHECK(u_desktop_parent_window_valid(hd.c_str()));
+	}
+	for (int ch = 0x01; ch < 0x20; ch++) {
+		std::string hd = std::string("wayland:ab") + (char)ch + "cd";
+		INFO(ch);
+		CHECK_FALSE(u_desktop_parent_window_valid(hd.c_str()));
+	}
+	// x11 stays strict: a space is not a hex digit.
+	CHECK_FALSE(u_desktop_parent_window_valid("x11:4a 00007"));
+	CHECK_FALSE(u_desktop_parent_window_valid("x11: 4a00007"));
+
+	// ...and reaches the backend byte for byte (no trimming at either end).
+	TempDir dir;
+	Harness h;
+	char pw[U_DESKTOP_PARENT_WINDOW_SIZE];
+	const char *hd = "wayland: a b  c ";
+	REQUIRE(u_desktop_control_request_ex(h.c, "tests", U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE, hd) ==
+	        U_DESKTOP_XR_SUCCESS);
+	CHECK(u_desktop_fake_last_parent_window(h.fake, pw, sizeof(pw)));
+	CHECK(std::string(pw) == hd);
+	CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_GRANTED);
 }
 
 TEST_CASE("parent_window: passed to the backend with its request, absent -> \"\"", "[desktop][capture]")
@@ -3058,4 +3103,31 @@ TEST_CASE("capture_scope: ASK_AGAIN re-asks a GRANTED scope; the store's allow d
 	CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DENIED); // the user declined this time
 	CHECK(u_desktop_control_request_scopes(h.c, nullptr, U_DESKTOP_SCOPE_REASK) ==
 	      U_DESKTOP_XR_ERROR_VALIDATION_FAILURE); // a modifier alone asks for nothing
+}
+
+// GNOME §11 run N4: restore waits LAYOUT_SETTLE_MS after the LAST layout change AND after
+// every covered monitor is back — not ~0.4 s after the monitor returned.
+TEST_CASE("layout settle: counts from the last change and from the monitors' return", "[desktop][capture]")
+{
+	struct u_desktop_layout_settle s;
+	u_desktop_layout_settle_reset(&s, 100);
+	// Nothing changed since the grant: restore at once.
+	CHECK(u_desktop_layout_settle_step(&s, 5000, 100, 0, 2000) == 0);
+
+	// The panel blinks: the layout changes and a covered monitor goes missing.
+	CHECK(u_desktop_layout_settle_step(&s, 10000, 200, 1, 2000) == U_DESKTOP_LAYOUT_MISSING);
+	CHECK(u_desktop_layout_settle_step(&s, 11000, 200, 1, 2000) == U_DESKTOP_LAYOUT_MISSING);
+	// It comes back at 11600 (the layout changes again): 2 s from THEN.
+	CHECK(u_desktop_layout_settle_step(&s, 11600, 300, 0, 2000) == 2000);
+	CHECK(u_desktop_layout_settle_step(&s, 12000, 300, 0, 2000) == 1600);
+	// Another change (a rect moves) restarts the wait.
+	CHECK(u_desktop_layout_settle_step(&s, 13000, 400, 0, 2000) == 2000);
+	CHECK(u_desktop_layout_settle_step(&s, 14999, 400, 0, 2000) == 1);
+	CHECK(u_desktop_layout_settle_step(&s, 15000, 400, 0, 2000) == 0);
+
+	// The monitor returns without the layout fingerprint moving: still 2 s from the return.
+	u_desktop_layout_settle_reset(&s, 500);
+	CHECK(u_desktop_layout_settle_step(&s, 20000, 500, 1, 2000) == U_DESKTOP_LAYOUT_MISSING);
+	CHECK(u_desktop_layout_settle_step(&s, 20400, 500, 0, 2000) == 2000);
+	CHECK(u_desktop_layout_settle_step(&s, 22400, 500, 0, 2000) == 0);
 }

@@ -1120,10 +1120,15 @@ portal_thread(void *arg)
 		if (p->session_open) {
 			pthread_mutex_lock(&p->lock);
 			bool have_token = p->have_token;
+			bool grabbing = p->cap.grabs > 0;
+			uint64_t last_use = p->last_use_ms;
 			pthread_mutex_unlock(&p->lock);
 			uint64_t now = gdbus_now_ms();
-			uint64_t idle = now - p->last_use_ms;
-			if (now < p->hold_until_ms) {
+			uint64_t idle = now > last_use ? now - last_use : 0;
+			if (grabbing) {
+				// A capture is reading the streams; its end wakes the thread.
+				timeout = 250;
+			} else if (now < p->hold_until_ms) {
 				// prepare_input asked to keep it (verification / idle wait in progress).
 				uint64_t left = p->hold_until_ms - now;
 				timeout = left < 250 ? (int)left + 1 : 250;

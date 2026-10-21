@@ -22,7 +22,10 @@
  *   desktop_backend_smoke target ID               (script) pin the guard's target; 0 = auto
  *   desktop_backend_smoke parent [HANDLE]         (script) the consent dialog's parent window for
  *                                                 request / request-scopes: wayland:H | x11:HEX
- *                                                 (unvalidated here); none = clear
+ *                                                 (unvalidated here); none = clear. A
+ *                                                 handle with spaces: "double-quote" it
+ *                                                 (in a script too); any bytes at all:
+ *   desktop_backend_smoke parent-hex HEX          (script) the same, hex of the string
  *   desktop_backend_smoke request-scopes control|capture|all[+again]   spec v2 consent (prompts!)
  *   desktop_backend_smoke monitors                every monitor, desktop coordinates
  *   desktop_backend_smoke capture X Y W H [OUT.ppm]  one still (native density); stats only,
@@ -39,6 +42,7 @@
 
 #include "u_desktop.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -375,7 +379,29 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		// Unvalidated on purpose: the backend is driven directly, so a stale or
 		// malformed handle can be fed to the portal to see it fall back.
 		snprintf(g_parent, sizeof(g_parent), "%s", argc >= 3 ? argv[2] : "");
-		printf("parent window: \"%s\"\n", g_parent);
+		printf("parent window: [%s] (%zu bytes)\n", g_parent, strlen(g_parent));
+	} else if (strcmp(cmd, "parent-hex") == 0 && argc >= 3) {
+		// Any handle round-trips this way, whatever it contains (mutter's handles are
+		// random printable ASCII: spaces, quotes, '#').
+		const char *h = argv[2];
+		size_t n = strlen(h), o = 0;
+		bool ok = n % 2 == 0 && n / 2 < sizeof(g_parent);
+		char tmp[U_DESKTOP_PARENT_WINDOW_SIZE];
+		for (size_t i = 0; ok && i < n; i += 2, o++) {
+			unsigned v = 0;
+			ok = sscanf(h + i, "%2x", &v) == 1 && isxdigit((unsigned char)h[i]) &&
+			     isxdigit((unsigned char)h[i + 1]);
+			tmp[o] = (char)v;
+		}
+		if (!ok) {
+			printf("parent-hex: not an even-length hex string (< %d bytes decoded)\n",
+			       U_DESKTOP_PARENT_WINDOW_SIZE);
+			rc = 1;
+		} else {
+			tmp[o] = '\0';
+			memcpy(g_parent, tmp, o + 1);
+			printf("parent window: [%s] (%zu bytes)\n", g_parent, o);
+		}
 	} else if (strcmp(cmd, "target") == 0 && argc >= 3) {
 		g_target = strtoull(argv[2], NULL, 10);
 		printf("target pinned: %llu (0 = auto)\n", (unsigned long long)g_target);

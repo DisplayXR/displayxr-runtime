@@ -435,7 +435,8 @@ typedef struct XrDesktopControlRequestScopeDXR {
 typedef struct XrDesktopControlParentWindowDXR {
     XrStructureType            type;         //!< XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR
     const void* XR_MAY_ALIAS   next;
-    const char*                parentWindow; //!< "wayland:<handle>" | "x11:<hex XID>" | "" / NULL
+    const char*                parentWindow; //!< "wayland:<handle>" (printable ASCII 0x20–0x7E, spaces
+                                             //!< included, verbatim) | "x11:<hex XID>" | "" / NULL
 } XrDesktopControlParentWindowDXR;
 
 typedef enum XrDesktopCaptureTargetDXR {
@@ -515,8 +516,12 @@ scopes. Rows 8–10 read that scope's own grant:
   xdg-desktop-portal `parent_window` convention verbatim: `"wayland:<handle>"`, the handle
   the app got from exporting its toplevel with the xdg-foreign protocol
   (`zxdg_exporter_v2`), or `"x11:<XID in hexadecimal>"` (an optional `0x` is tolerated).
-  Absent, `NULL` or `""` means no parent. Anything else — another prefix, an empty handle,
-  a space or control character, a non-hex XID, more than 16 hex digits, 256 bytes or
+  The Wayland handle is opaque and taken verbatim: any printable ASCII byte (0x20–0x7E)
+  is allowed, **the space included** — mutter's handles are 32 random printable
+  characters and roughly half of them contain a space, possibly leading or trailing, so
+  an app must not trim, quote or escape it. Absent, `NULL` or `""` means no parent.
+  Anything else — another prefix, an empty handle, a control character (below 0x20, or
+  0x7F) or a non-ASCII byte, a non-hex XID, more than 16 hex digits, 256 bytes or
   more — is `XR_ERROR_VALIDATION_FAILURE` and nothing is asked. It is a placement hint
   only: it never changes what is asked or granted, it applies to that request only (a
   later request without one has no parent), and a handle the OS cannot resolve (an
