@@ -147,6 +147,20 @@ enum u_desktop_caps
 //! Spec v3: the largest clipboard text read or written, in bytes (terminator excluded).
 #define U_DESKTOP_CLIPBOARD_MAX_BYTES (1u << 20)
 
+/*!
+ * Zero @p n bytes at @p p with volatile stores, which the compiler may not drop the way
+ * it may drop a memset right before free(). For text that must not outlive its use in
+ * freed memory: typed or clipboard text (spec v3 §11.6). NULL is a no-op.
+ */
+static inline void
+u_desktop_wipe(void *p, size_t n)
+{
+	volatile unsigned char *v = (volatile unsigned char *)p;
+	while (v != NULL && n-- > 0) {
+		*v++ = 0;
+	}
+}
+
 //! The consent scopes (spec v2, same bits as XrDesktopControlScopeFlagsDXR).
 enum u_desktop_scope
 {

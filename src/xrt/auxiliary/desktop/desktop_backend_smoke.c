@@ -541,7 +541,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			       show && text != NULL ? text : "", show ? "\"" : "");
 		}
 		if (text != NULL) {
-			memset(text, 0, len);
+			u_desktop_wipe(text, len);
 			free(text);
 		}
 		rc = done(r, msg);
