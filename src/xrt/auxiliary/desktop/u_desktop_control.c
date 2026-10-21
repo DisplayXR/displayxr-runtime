@@ -370,7 +370,11 @@ static void
 kill_switch_ends_grant_locked(struct u_desktop_control *c)
 {
 	uint64_t n = u_desktop_policy_kill_switch_count(c->policy);
-	if (n == c->kill_seen || u_desktop_policy_is_unreadable(c->policy)) {
+	// While the store says the kill switch is on, no grant may run, whatever the count:
+	// a store recreated over an unreadable one starts counting at 1 again, which this
+	// session may have seen already.
+	if ((n == c->kill_seen && !u_desktop_policy_is_suspended(c->policy)) ||
+	    u_desktop_policy_is_unreadable(c->policy)) {
 		return;
 	}
 	c->kill_seen = n;

@@ -1162,6 +1162,30 @@ TEST_CASE("desktop_safety: the kill switch ends the grant even when it is off ag
 	u_desktop_policy_destroy(&pol);
 }
 
+TEST_CASE("desktop_safety: a kill switch over an unreadable store ends a grant after an earlier kill switch",
+          "[desktop][safety]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	CHECK(h.state() == U_DESKTOP_STATE_DENIED); // the first kill switch ended it
+	h.grant();
+	REQUIRE(h.state() == U_DESKTOP_STATE_GRANTED);
+	{
+		std::ofstream f(dir.file("desktop_control.json"));
+		f << "not json at all";
+	}
+	// The kill switch moves the unreadable store aside, so its count starts at 1 again:
+	// the count this session has already seen.
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	std::remove(dir.file("desktop_control.json.corrupt").c_str());
+	CHECK(h.state() == U_DESKTOP_STATE_SUSPENDED);
+	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+}
+
 TEST_CASE("desktop_safety: lock screen and per-app deny refuse with their reason", "[desktop][safety]")
 {
 	TempDir dir;

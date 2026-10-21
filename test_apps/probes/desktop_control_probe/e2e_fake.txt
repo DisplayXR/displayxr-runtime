@@ -47,6 +47,9 @@ act key target=102 keys=ctrl+s
 expect XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
 expect-state SUSPENDED
 run displayxr-cli desktop resume
+# the kill switch ENDS the grant (ADR-056 Amendment 2): DENIED until a new request
+expect-state DENIED
+request so the probe can type for you
 expect-state GRANTED
 act key target=102 keys=ctrl+s
 expect XR_SUCCESS
@@ -59,6 +62,8 @@ run displayxr-cli desktop status
 run displayxr-cli desktop stop
 expect-state SUSPENDED
 run displayxr-cli desktop resume
+expect-state DENIED
+request so the probe can type for you
 expect-state GRANTED
 act key target=102 keys=ctrl+w
 expect XR_SUCCESS
@@ -91,7 +96,11 @@ capture desktop
 expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
 expect-capture-state SUSPENDED
 run displayxr-cli desktop resume
+expect-capture-state DENIED
+expect-state DENIED
+request-scopes all so the probe can type and see your screen
 expect-capture-state GRANTED
+expect-state GRANTED
 capture window 102 max=400x400
 expect-capture XR_SUCCESS
 run displayxr-cli desktop status
