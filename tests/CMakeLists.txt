@@ -453,6 +453,12 @@ target_include_directories(
 	)
 target_link_libraries(tests_oxr_layer_space PRIVATE aux_math)
 
+if(TARGET tests_desktop_control)
+	# The backend hears when the CONTROL grant begins and ends (grant_changed): on
+	# GNOME, window titles from the DisplayXR extension (v18) only while granted.
+	target_sources(tests_desktop_control PRIVATE tests_desktop_control_titles.cpp)
+endif()
+
 if(TARGET tests_oxr_view_config_views_change)
 	# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- the vendor plug-in's signing
 	# recipe builds this runtime as a sub-project (see tests_rig_composer).

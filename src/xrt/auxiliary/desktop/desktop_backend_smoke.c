@@ -209,6 +209,10 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			sleep_ms(100);
 		}
 		printf("access: %s\n", g_done ? access_str(g_access) : "no answer in 120 s");
+		// As the common layer does once GRANTED (GNOME: window titles, extension v18).
+		if (g_done && g_access == U_DESKTOP_ACCESS_GRANTED && b->grant_changed != NULL) {
+			b->grant_changed(b, true);
+		}
 	} else if (strcmp(cmd, "list") == 0) {
 		struct u_desktop_window ws[256];
 		uint32_t n = 0;
@@ -341,6 +345,9 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 		}
 		printf("access: control %s, capture %s\n", g_scopes_done ? access_str(g_ctl) : "no answer",
 		       g_scopes_done ? access_str(g_cap) : "no answer");
+		if (g_scopes_done && g_ctl == U_DESKTOP_ACCESS_GRANTED && b->grant_changed != NULL) {
+			b->grant_changed(b, true); // as after `request`
+		}
 		printf("now: control %s, capture %s\n", b->access_status ? access_str(b->access_status(b)) : "?",
 		       b->capture_access_status ? access_str(b->capture_access_status(b)) : "?");
 	} else if (strcmp(cmd, "monitors") == 0) {

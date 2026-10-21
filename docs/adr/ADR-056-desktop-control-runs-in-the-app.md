@@ -132,6 +132,14 @@ through the app's own portal session (user gestures today). If a cleaner primiti
 later, it must be gated on proof that the caller holds an approved RemoteDesktop session — see
 Open questions.
 
+**Window titles (extension v18, note).** Following the maintainer's direction on the plug-in's
+read-only desktop-info PR (DisplayXR/displayxr-unity#389), the extension stops handing other
+apps' window titles to callers that have not been authorised. A reply carries titles only to
+the bus connection the runtime authorises with `SetTitleAccess` while the app's CONTROL scope
+is GRANTED; the runtime takes it back when the grant ends (deny, OS revocation, kill switch,
+per-app switch, lock screen, session end). This is the runtime's statement, not proof of a
+portal session (open question 1 stands). Contract: wayland-window-geometry spec §12.5.
+
 ## Spatial-display use cases (why this is DisplayXR's job, not a generic library's)
 
 1. **The agent points in depth.** "Click here": a pointer floats over the real button at the

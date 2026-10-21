@@ -1677,7 +1677,8 @@ every client; GNOME's own `org.gnome.Shell.Introspect` is narrower (allow-listed
 callers only). A same-user process could poll it to follow the pointer. This is a
 deliberate choice for assistant apps; gating it (for example answering only callers
 that own the focused window) would defeat "what is under my mouse" while the app is
-in the background. Nothing is reported on the lock screen.
+in the background. Nothing is reported on the lock screen. From version 18 the
+window entry has no `title` unless the caller was authorised for titles (§12.5).
 
 ### 12.3 Verified (private headless GNOME Shell 50.1)
 
@@ -1696,7 +1697,8 @@ The extension reads other apps' windows and never changes them. This is a rule f
 every future version, not only a description of this one.
 
 - **Reading** other apps' windows: `GetWindows`, `WindowsChanged`, `GetAllWindows`,
-  `GetPointer`, `GetWindowAt`. They report; nothing else.
+  `GetPointer`, `GetWindowAt`. They report; nothing else. Their window titles go
+  only to a caller authorised for them (version 18, §12.5).
 - **Changing** a window: `MoveWindow` and the drag members (§7–§9),
   `CaptureExclusion1` (§6), `SetKeepAbove` / `ActivateWindow` / `SetMinimized` (§11).
   Each acts only on the caller's own window, found by the caller's PID from the bus
@@ -1724,3 +1726,106 @@ back through the read-only members above.
 **Changing the rule takes an ADR first.** The one open candidate is ADR-056 open
 question 1: a primitive gated on proof that the caller holds an approved
 RemoteDesktop session, which mutter cannot give today.
+
+### 12.5 Window titles go only to an authorised caller (extension version 18)
+
+This follows the maintainer's direction on the Unity plug-in's read-only
+desktop-info PR (DisplayXR/displayxr-unity#389): the GNOME extension stops handing
+window titles to callers that have not been authorised.
+
+**Why.** Everything else in a window entry is geometry and state. A title is
+content: a document name, a mail subject, who a chat is with. ADR-056 lists titles
+under *observe*, behind the user's desktop-control grant (on macOS reading them
+needs Screen Recording). Up to version 17 the extension gave every window's title to
+any session-bus client, in every reply and in every `WindowsChanged`.
+
+**D-Bus surface.** `SetTitleAccess(u pid, b allow) -> (b titles)` on
+`org.displayxr.WindowGeometry1`.
+
+- `pid` names the caller: 0 or its own PID, which the extension reads from the bus
+  daemon (`GetConnectionUnixProcessID`), as for every member of §11. Any other value,
+  or a caller whose PID the bus daemon cannot give, is refused.
+- The access is for the calling **bus connection** (its unique name), not for the
+  whole process. Other connections of the same process do not get titles.
+- `allow = true` is refused on the lock screen. `titles` is true when the
+  connection gets titles from now on.
+- It ends with `SetTitleAccess(…, false)`, when the connection closes (exit, crash,
+  a closed private connection) or when the extension is disabled. The extension
+  keeps nothing across a restart.
+- Both answers go through the PID lookup in the order they arrive, so a revoke never
+  overtakes the grant it follows.
+
+**What a reply carries.**
+
+| Member | Version 17 | Version 18 |
+|---|---|---|
+| `GetWindows`, `GetAllWindows`, `GetPointer`, `GetWindowAt` | `title` for every caller | `title` only for an authorised connection; for any other caller the key is absent |
+| `WindowsChanged` | `title` | never `title`: a signal reaches every listener |
+| `CaptureExclusion1.GetState` (`windows[]`) | `title` | as the getters |
+| Any of them while the screen is locked | `title` | no `title` for anyone |
+
+A withheld title is a missing key, never `""`. An authorised caller still reads `""`
+for a window that has no title. The schema stays `version: 1`: `title` keeps its
+meaning when present. The pure part is `TitleAccess` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_title_access.js`, which also checks that `lib.js`
+reads a window title in one place only.
+
+**Who calls it.** The runtime's GNOME desktop-control backend
+(`u_desktop_gnome.c`), on its private observation connection, the one that every
+window list, pick and pointer read goes through. The common layer
+(`u_desktop_control.c`) calls the backend's `grant_changed` when the CONTROL scope
+becomes GRANTED and when it stops being GRANTED: denied, revoked by the OS, the kill
+switch, the store's per-app switch, the lock screen, a new prompt, and before the
+session's backend is destroyed. It notices those changes on the next call into the
+object (the app's, or the worker's input guard), which is also when the app's state
+event fires. Until then the authorised connection is still the runtime's private
+one, and the runtime reads nothing through it while the state is not GRANTED. If a
+reply comes back without titles while the grant holds (the extension was disabled
+and enabled again), the backend asks once more, at most once a second.
+
+**Trust.** The extension cannot verify a desktop-control grant: mutter does not say
+which client holds a RemoteDesktop session (ADR-056 open question 1).
+`SetTitleAccess` is the runtime saying that the user granted it, and the runtime
+says so only while the grant lasts. A same-user process can call it for itself and
+get titles, just as it can read them from the accessibility bus. What version 18
+changes is that no client gets other apps' titles by default, including every
+`WindowsChanged` listener. A client has to ask for them explicitly, by name, on its
+own connection. Gating on proof of an approved portal session is still the open
+question.
+
+**Compatibility.**
+
+| Runtime \ extension | 17 or older | 18 |
+|---|---|---|
+| Without `SetTitleAccess` (v2.50.0 and older) | titles for everyone, as before | titles are withheld from the runtime too: `XR_DXR_desktop_control`'s window list, pick and pointer report empty titles, and the AT-SPI reads that find a window's frame by its title (text at a point, the paste check) come back empty or unverified. Update the runtime. |
+| With it | the call fails with `UnknownMethod`: logged once, nothing else changes (titles for everyone, as before) | titles only while the app holds the grant |
+
+No other consumer in this repository reads titles (the geometry provider
+`comp_vk_native_wl_geom` matches windows by PID), and the Unity plug-in's read-only
+desktop info (#389) leaves them out by design. A consumer that needs other apps'
+titles holds the user's desktop-control grant and reads them through
+`XR_DXR_desktop_control`.
+
+**Verified (private headless GNOME Shell 50.1, sim_display only).** Two test
+windows, one with capture exclusion. Each check is a fresh bus connection or the
+probe (`desktop_control_probe`, the runtime in its process):
+
+- With no grant, every member and every `WindowsChanged` emitted while a window
+  opened and closed had entries and no `title` key.
+- `SetTitleAccess` with another process's PID was refused; with 0 or the caller's
+  own PID it was granted. Only that one connection got titles (GetWindowAt and
+  GetState included); two other connections of the same process got none. A revoke
+  took effect at once, and closing the connection removed it.
+- On the lock screen the granted connection got entries without titles and a new
+  grant was refused. After unlock its titles were back without asking again.
+- The granted runtime listed the real titles and read the text at a point, while a
+  client in another process saw no title at any step. The extension listed exactly
+  one connection, the probe's, only while GRANTED: not after `desktop stop`, again
+  after `resume`, not after `desktop deny`, again after `forget`, and nobody after
+  the probe exited.
+- The extension was disabled and enabled while granted. The new instance had no
+  record of the grant; the runtime's next list asked again ("granted again") and
+  had the titles.
+- A v2.50 runtime against version 18 was GRANTED, listed every title empty and read
+  `""` at the point that this runtime read. This runtime against version 17 listed
+  the titles, logged the older extension once and logged no warning.

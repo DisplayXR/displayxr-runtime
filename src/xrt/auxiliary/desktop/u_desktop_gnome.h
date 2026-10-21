@@ -300,6 +300,11 @@ struct gnome_backend
 	DBusConnection *obs; //!< private; observation + own-window placement only
 
 	bool have_ext16;
+	//! Window titles (extension v18), under obs_lock: the CONTROL grant holds
+	//! (grant_changed), the extension has no SetTitleAccess (older than v18: it gives
+	//! titles to every client), and when titles were last asked for.
+	bool titles_want, titles_none;
+	uint64_t titles_asked_ms;
 	struct gnome_portal *portal; //!< NULL: no RemoteDesktop portal (no consent path)
 	struct gnome_atspi *atspi;   //!< NULL: no a11y bus
 	bool warned_schema;

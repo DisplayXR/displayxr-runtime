@@ -262,6 +262,14 @@ jobs:
         # no monitor, parent_id, and the reply (nothing while locked). Plain gjs.
         run: gjs scripts/test_gnome_extension_pointer.js
 
+      - name: Window-title access
+        # Unit test for TitleAccess in lib.js (extension version 18,
+        # WindowGeometry1.SetTitleAccess): the grant gate (the caller names
+        # itself, never on the lock screen), titles only to the granted bus
+        # connection and never while locked, the bookkeeping, a withheld title
+        # is a missing key, and lib.js reads a title in one place only. Plain gjs.
+        run: gjs scripts/test_gnome_extension_title_access.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:

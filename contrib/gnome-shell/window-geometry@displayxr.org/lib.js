@@ -43,6 +43,7 @@
 //     locked user can drive) — but not the version 15 requests (keep-above,
 //     activate, minimize), which are refused while locked, and not the
 //     version 16 GetPointer / GetWindowAt, which answer only {"locked": true},
+//     and no window title to anyone (version 18; SetTitleAccess is refused),
 //   * the WorkspaceHotkey1 D-Bus object (so a registered client is not lost).
 // What does NOT: the workspace hotkey's GRAB. Entering the lock screen
 // releases it and leaving it re-grabs (WorkspaceHotkey.wantGrab(…, locked)),
@@ -61,6 +62,11 @@
 // window, not even behind a flag: this extension answers every process of the
 // user, so such a member would skip the consent GNOME asks for. Desktop control
 // goes through XR_DXR_desktop_control (ADR-056) instead.
+//
+// Other apps' window TITLES are not read out to everyone either (version 18): a
+// reply carries "title" only to a bus connection that asked for titles with
+// SetTitleAccess — the DisplayXR runtime, while the user's desktop-control grant
+// lasts. See "Window titles" below.
 //
 // ── The D-Bus surface ───────────────────────────────────────────────────────
 //
@@ -84,7 +90,14 @@
 //   Method  GetAllWindows() -> (s)   (version 16) GetWindows' snapshot with the
 //           app's dialogs and utility windows too (a "Save changes?" dialog);
 //           every entry has "window_type".
+//   Method  SetTitleAccess(u pid, b allow) -> (b titles)   (version 18) let THIS
+//           bus connection see window titles (allow) or stop (false). pid names
+//           the caller (0 = "me"); refused on the lock screen. `titles`: this
+//           connection gets titles from now on. Lasts until revoked, until the
+//           connection goes away, or until the extension is disabled. See
+//           "Window titles".
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
+//           (version 18: never with titles — a signal reaches every listener)
 //
 // Service   : org.displayxr.WindowGeometry          (same bus name)
 // Object    : /org/displayxr/CaptureExclusion
@@ -221,7 +234,12 @@
 //                                           // popup, a dialog): the owner's id
 //       "pid": 1234,
 //       "app_id": "cube_handle_vk_linux",   // wm_class / Wayland app-id
-//       "title": "...",
+//       "title": "...",                     // ext v18+: ONLY to a connection
+//                                           // SetTitleAccess let in; for any
+//                                           // other caller, in every
+//                                           // WindowsChanged and while the
+//                                           // screen is locked, the key is
+//                                           // absent ("" = an untitled window)
 //       "focus": true,
 //       "xwayland": false,
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
@@ -1281,6 +1299,82 @@
         },
     };
 
+    /*
+     * ── Window titles: only for a connection that asked (version 18) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_title_access.js drives it.
+     *
+     * Everything else in a window entry is geometry and state. A TITLE is
+     * content (a document name, a mail subject, who a chat is with), so it
+     * sits behind the user's desktop-control consent (ADR-056 D5; spec
+     * §12.5). From version 18 a reply carries "title" only to a bus
+     * connection that called SetTitleAccess(pid, true):
+     *   * the caller names itself (pid 0 = "me"; the PID comes from the bus
+     *     daemon), like every member that acts for the caller;
+     *   * the grant is for that CONNECTION (its unique bus name), not for the
+     *     process: the DisplayXR runtime asks on the private connection its
+     *     desktop-control backend reads windows on, so no other code in the
+     *     app's process gets titles through it;
+     *   * it lasts until SetTitleAccess(pid, false), until that connection
+     *     goes away (exit, crash, a closed private connection) or until the
+     *     extension is disabled. It is refused on the lock screen, and no
+     *     title is served while the screen is locked, grant or not.
+     * Every other caller gets the same entries without the "title" key, so a
+     * reader can tell "withheld" from an untitled window (""). WindowsChanged
+     * is a broadcast that every listener receives, so it never has titles; a
+     * connection with the grant reads them with a method call.
+     *
+     * The extension cannot check the desktop-control grant itself (mutter does
+     * not say which client holds a RemoteDesktop session; ADR-056 open
+     * question 1). SetTitleAccess is the runtime saying that it holds one,
+     * and the runtime calls it only while the grant lasts. A process that
+     * calls it without a grant still gets titles (it could read them off the
+     * accessibility bus too), but only by asking for them explicitly, on its
+     * own connection. No client gets other apps' titles by default any more.
+     */
+    const TitleAccess = {
+        //! Bus unique name -> {pid, watchId} of each connection that gets titles.
+        newTracker() {
+            return new Map();
+        },
+
+        //! Whether SetTitleAccess(@p pid, true) from a caller whose PID is
+        //! @p senderPid (0: the bus daemon could not say) may grant.
+        mayGrant({senderPid, pid, locked}) {
+            return senderPid > 0 && (pid === 0 || pid === senderPid) && !locked;
+        },
+
+        //! Whether a reply to bus name @p sender may carry titles.
+        mayRead(tracker, sender, locked) {
+            return !locked && !!tracker && typeof sender === 'string' && tracker.has(sender);
+        },
+
+        //! Record @p sender (process @p pid). True when it is new: the caller
+        //! then watches its bus name, which drops it when the name goes away.
+        grant(tracker, sender, pid) {
+            const known = tracker.get(sender);
+            if (known) {
+                known.pid = pid;
+                return false;
+            }
+            tracker.set(sender, {pid, watchId: 0});
+            return true;
+        },
+
+        //! Forget @p sender. Returns its record (the caller unwatches it), or null.
+        revoke(tracker, sender) {
+            const known = tracker.get(sender) ?? null;
+            tracker.delete(sender);
+            return known;
+        },
+
+        //! The title part of a window entry: {title} with @p titles, else nothing
+        //! at all (the key is left out, never set to "").
+        field(win, titles) {
+            return titles ? {title: win.get_title() ?? ''} : {};
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -1303,6 +1397,8 @@
         OwnWindow,
         //! The pointer reply, exported for its unit test.
         PointerPick,
+        //! Who gets window titles, exported for its unit test.
+        TitleAccess,
     };
 
     function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
@@ -1346,6 +1442,11 @@
     </method>
     <method name="GetAllWindows">
       <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="SetTitleAccess">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="allow"/>
+      <arg type="b" direction="out" name="titles"/>
     </method>
     <signal name="WindowsChanged">
       <arg type="s" name="json"/>
@@ -1443,8 +1544,11 @@
         const CAPTURE_EXCLUSION_VERSION = 1;
 
         class CaptureExclusion {
-            constructor(onChanged) {
+            //! @p mayReadTitles(sender): whether a reply to that bus name may
+            //! carry window titles (version 18, see "Window titles").
+            constructor(onChanged, mayReadTitles = () => false) {
                 this._onChanged = onChanged;
+                this._mayReadTitles = mayReadTitles;
                 // bus unique name -> {pids: Set<number>, watchId}
                 this._clients = new Map();
                 this._stageSignals = [
@@ -1620,7 +1724,10 @@
                 });
             }
 
-            GetState() {
+            //! Version 18: an excluded window's title only for a caller that may
+            //! read titles (an async handler, for the caller's bus name).
+            GetStateAsync(_params, invocation) {
+                const titles = this._mayReadTitles(invocation.get_sender());
                 const clients = [];
                 for (const [sender, client] of this._clients)
                     clients.push({sender, pids: [...client.pids]});
@@ -1628,14 +1735,14 @@
                 for (const actor of global.get_window_actors()) {
                     if (actor.get_effect(EXCLUDE_EFFECT_NAME)) {
                         const win = actor.meta_window;
-                        windows.push({pid: win?.get_pid() ?? 0, title: win?.get_title() ?? ''});
+                        windows.push({pid: win?.get_pid() ?? 0, ...(win ? TitleAccess.field(win, titles) : {})});
                     }
                 }
-                return JSON.stringify({
+                invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
                     version: CAPTURE_EXCLUSION_VERSION,
                     clients, windows,
                     paints: {onscreen: excludeStats.onscreen, skipped: excludeStats.skipped},
-                });
+                })]));
             }
         }
 
@@ -3553,13 +3660,16 @@
                 this._windowSignals = new Map(); // Meta.Window -> [handler ids]
                 this._displaySignals = [];
                 this._emitQueued = false;
+                // Version 18: the connections that get window titles.
+                this._titleAccess = TitleAccess.newTracker();
 
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowGeometry');
                 // Both objects are exported BEFORE the name is requested, so a
                 // client that sees the name appear can always reach
                 // CaptureExclusion1.
-                this._captureExclusion = new CaptureExclusion(() => this._queueEmit());
+                this._captureExclusion = new CaptureExclusion(() => this._queueEmit(),
+                    sender => this._mayReadTitles(sender));
                 this._grabbedWindow = null;
                 // A pointer drag stands in for a grab (the window is `moving`,
                 // its drag table corrects every move, and it ends with a
@@ -3674,6 +3784,13 @@
                     this._workspaceHotkey = null;
                 }
                 this._grabbedWindow = null;
+                // Version 18: every title grant ends with the extension (a lookup
+                // still in flight finds no tracker and grants nothing).
+                if (this._titleAccess) {
+                    for (const sender of [...this._titleAccess.keys()])
+                        this._revokeTitles(sender);
+                    this._titleAccess = null;
+                }
 
                 if (this._nameId) {
                     Gio.DBus.session.unown_name(this._nameId);
@@ -3767,15 +3884,74 @@
             }
 
             _emit() {
+                // A signal reaches every listener on the bus: never with titles.
                 if (this._dbus) {
                     this._dbus.emit_signal(
                         'WindowsChanged',
-                        new GLib.Variant('(s)', [this._snapshotJson()]));
+                        new GLib.Variant('(s)', [this._snapshotJson(false, false)]));
                 }
             }
 
-            //! One window as the snapshot (and GetPointer) report it.
-            _windowEntry(win, focus, layout) {
+            /*
+             * ── Window titles (version 18; see "Window titles" near the top) ──
+             */
+
+            //! Whether a reply to bus name @p sender may carry window titles.
+            _mayReadTitles(sender) {
+                return TitleAccess.mayRead(this._titleAccess, sender, Main?.sessionMode?.isLocked === true);
+            }
+
+            _titlesFor(invocation) {
+                return this._mayReadTitles(invocation.get_sender());
+            }
+
+            _revokeTitles(sender) {
+                const known = this._titleAccess ? TitleAccess.revoke(this._titleAccess, sender) : null;
+                if (known?.watchId)
+                    Gio.bus_unwatch_name(known.watchId);
+                if (known && GLib.getenv('DISPLAYXR_DEBUG') === '1')
+                    log(`displayxr: window titles no longer go to ${sender} (pid ${known.pid})`);
+            }
+
+            //! SetTitleAccess(u pid, b allow) -> (b titles). Both answers go through
+            //! the PID lookup, so a revoke never overtakes the grant before it.
+            SetTitleAccessAsync([pid, allow], invocation) {
+                const sender = invocation.get_sender();
+                Gio.DBus.session.call(
+                    'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                    'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
+                    new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, 1000, null,
+                    (conn, res) => {
+                        let senderPid = 0;
+                        try {
+                            senderPid = conn.call_finish(res).deepUnpack()[0];
+                        } catch (e) {
+                            senderPid = 0; // the caller is gone, or the bus daemon cannot say
+                        }
+                        let titles = false;
+                        if (!allow) {
+                            this._revokeTitles(sender);
+                        } else if (this._titleAccess && TitleAccess.mayGrant({
+                            senderPid, pid, locked: Main?.sessionMode?.isLocked === true,
+                        })) {
+                            if (TitleAccess.grant(this._titleAccess, sender, senderPid)) {
+                                // Exactly as long as the caller's bus connection: an
+                                // exit, a crash or a closed private connection ends it.
+                                this._titleAccess.get(sender).watchId = Gio.bus_watch_name_on_connection(
+                                    Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE, null,
+                                    () => this._revokeTitles(sender));
+                                if (GLib.getenv('DISPLAYXR_DEBUG') === '1')
+                                    log(`displayxr: window titles go to ${sender} (pid ${senderPid})`);
+                            }
+                            titles = true;
+                        }
+                        invocation.return_value(new GLib.Variant('(b)', [titles]));
+                    });
+            }
+
+            //! One window as the snapshot (and GetPointer) report it; its title
+            //! only with @p titles (version 18).
+            _windowEntry(win, focus, layout, titles) {
                 const display = global.display;
                 const frame = win.get_frame_rect();
                 const buffer = win.get_buffer_rect();
@@ -3795,7 +3971,7 @@
                     id: Number(win.get_id()),
                     pid: win.get_pid(),
                     app_id: win.get_wm_class() ?? '',
-                    title: win.get_title() ?? '',
+                    ...TitleAccess.field(win, titles),
                     focus: win === focus,
                     xwayland: win.get_client_type() === Meta.WindowClientType.X11,
                     frame: [frame.x, frame.y, frame.width, frame.height],
@@ -3815,7 +3991,9 @@
 
             //! @p all: GetAllWindows (dialogs and utility windows too, each
             //! entry with its window_type), else GetWindows (normal only).
-            _snapshotJson(all = false) {
+            //! @p titles: with window titles (version 18: only for a caller
+            //! _mayReadTitles lets in).
+            _snapshotJson(all, titles) {
                 const focus = global.display.focus_window;
                 const windows = [];
                 const layout = currentLayoutMode();
@@ -3826,7 +4004,7 @@
                     const type = win.get_window_type();
                     if (all ? !PointerPick.inAllWindows(type, Meta) : type !== Meta.WindowType.NORMAL)
                         continue;
-                    const entry = this._windowEntry(win, focus, layout);
+                    const entry = this._windowEntry(win, focus, layout, titles);
                     if (all)
                         entry.window_type = type;
                     windows.push(entry);
@@ -3838,32 +4016,39 @@
                 return JSON.stringify(snapshot);
             }
 
-            GetWindows() {
-                return this._snapshotJson();
+            // The getters are async handlers (params, invocation) from version 18:
+            // only the invocation says who is asking, and so whether titles go in.
+            // Each still answers at once.
+            GetWindowsAsync(_params, invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._snapshotJson(false, this._titlesFor(invocation))]));
             }
 
             //! Version 16: with the app's dialogs and utility windows (GetWindows
             //! keeps to normal windows, which its consumers rely on).
-            GetAllWindows() {
-                return this._snapshotJson(true);
+            GetAllWindowsAsync(_params, invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._snapshotJson(true, this._titlesFor(invocation))]));
             }
 
             //! Version 16: where the pointer is and the window under it (see "The
             //! pointer"). The window is what mutter's pick finds there, so stacking,
             //! input regions (a click-through window is passed over) and shell UI
             //! on top are what the user's click would meet.
-            GetPointer() {
+            GetPointerAsync(_params, invocation) {
                 const [x, y] = global.get_pointer();
-                return this._pickJson(x, y);
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._pickJson(x, y, this._titlesFor(invocation))]));
             }
 
             //! Version 16: the same for any stage point (what a click at x, y
             //! would meet), e.g. to check a target before acting on it.
-            GetWindowAt(x, y) {
-                return this._pickJson(x, y);
+            GetWindowAtAsync([x, y], invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._pickJson(x, y, this._titlesFor(invocation))]));
             }
 
-            _pickJson(x, y) {
+            _pickJson(x, y, titles) {
                 if (Main?.sessionMode?.isLocked === true)
                     return JSON.stringify(PointerPick.reply({locked: true}));
                 const layout = currentLayoutMode();
@@ -3882,7 +4067,7 @@
                     over = 'desktop';
                 return JSON.stringify(PointerPick.reply({
                     x, y, layout, over,
-                    window: win ? this._windowEntry(win, display.focus_window, layout) : null,
+                    window: win ? this._windowEntry(win, display.focus_window, layout, titles) : null,
                     windowType: win ? win.get_window_type() : null,
                 }));
             }
