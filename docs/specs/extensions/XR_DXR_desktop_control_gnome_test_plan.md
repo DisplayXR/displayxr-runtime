@@ -206,6 +206,24 @@ $SMOKE type "Hello, 世界 — ünïcödé"        # into gedit
   | (c') copy after the key, during the ~1.2 s serve | D = 500–1500 ms | the clipboard afterwards is `USERTEXT`, never the previous text |
   | (N1) copy between reading the previous clipboard and our SetSelection (re-check 3: 9/185 at 10.4–12.5 ms after the command; refused correctly but the clipboard was left owned and EMPTY — reads unanswered for 3 s) | D ≈ 10–13 ms, 40× (log: `our offer replaced the user's copy; releasing`) | `refused — … the offer had already replaced what the user copied, which is gone (copy it again); the clipboard was released and is empty`; afterwards `wl-paste` returns at once with no owner / empty — never a 3 s hang, never the agent's text, never the previous text. `USERTEXT` is NOT expected: it is gone. This ~1.5 ms window is the one place "the clipboard is the user's afterwards" cannot hold |
   | nothing to restore | `wl-copy --clear` so the clipboard is empty, then `type "x"` | `ok`; afterwards `wl-paste` answers at once (empty, or "x" kept by mutter's clipboard keeper) — never a hang |
+- **What the app is told (through OpenXR).** The rows above quote the smoke tool, which prints
+  the backend's own message. An app gets the action-completed event, where text and chords
+  carry fixed strings only (spec §9, "Keyboard verdicts"): each paste outcome reaches the app
+  as its own verdict string — the same words — with the `XrResult` of its result. Re-run a
+  sample of the hand-over rows (the copy before the keystroke, N1, the copy after it) through
+  `desktop_control_probe` (`act type target=<id> text="agent text"`, the same timed
+  `wl-copy`) and check the `event: action N -> RESULT "message"` line:
+  | smoke tool | the app (probe event) |
+  |---|---|
+  | `ok` | `XR_SUCCESS "ok"` |
+  | `ok` + `unverified: …` | `XR_SUCCESS "ok (unverified: the window read the text after the paste, …)"` |
+  | `refused — the clipboard changed hands (the user copied something); nothing was pasted` | `XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR`, the same message (was `"focus moved"`) |
+  | `refused — … the offer had already replaced what the user copied …` (N1) | `XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR`, the same message (was `"focus moved"`) |
+  | `failed — … whatever the window pasted was the user's clipboard, not the agent's text …` | `XR_ERROR_RUNTIME_FAILURE`, the same message (was `"the input could not be delivered"`) |
+  | `failed — lost the clipboard during the paste … whether the text arrived is unknown …` | `XR_ERROR_RUNTIME_FAILURE`, the same message (was `"the input could not be delivered"`) |
+  | `failed — the focused window did not ask …` / `failed — the focused text field did not change …` | `XR_ERROR_RUNTIME_FAILURE`, the same message |
+  | `failed — the portal did not make this session the clipboard owner — not pasting` | `XR_ERROR_RUNTIME_FAILURE "the input could not be delivered"` (no verdict for it: unchanged) |
+  No event message ever contains the typed text or the clipboard's.
 
 ### 4b. Clicks with a moving pointer (re-run item 5)
 

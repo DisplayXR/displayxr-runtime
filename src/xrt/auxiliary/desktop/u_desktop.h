@@ -64,6 +64,13 @@
  * read from another app. Name the failure, not the data ("this layout has no key for
  * that character", not "no key for 'é'").
  *
+ * For text and chords the common layer goes further and never passes a backend's
+ * message on at all: the app gets a FIXED string per result. A backend that knows
+ * more than its result says (GNOME: the clipboard changed hands, the window was
+ * handed the user's clipboard, ...) names it with a verdict (enum
+ * u_desktop_input_verdict, through u_desktop_guard_set_verdict), and the app gets
+ * that verdict's fixed string instead.
+ *
  * ## Delivery guarantee (contract v2)
  *
  * The common layer verifies the target (spec §5 step 4) and then hands the action to
@@ -290,6 +297,64 @@ void
 u_desktop_image_free(struct u_desktop_image *img);
 
 /*!
+ * Why a keyboard action (type_text, key_chord) ended as it did, when the backend
+ * knows more than its result says (see "Privacy"). Each verdict belongs to ONE
+ * result: the backend returns that result and sets the verdict with
+ * u_desktop_guard_set_verdict; the app then gets the verdict's fixed message
+ * (U_DESKTOP_VERDICT_MSG_*) with that result's usual XrResult. A verdict that comes
+ * with any other result is ignored (the result's own fixed message stands), and so
+ * is NONE. The messages are part of the public contract (XR_DXR_desktop_control.md
+ * §9): change them only with it. Today only the GNOME clipboard paste sets one.
+ */
+enum u_desktop_input_verdict
+{
+	U_DESKTOP_VERDICT_NONE = 0, //!< nothing more to say: the result's fixed message
+	//! U_DESKTOP_OK: the text was read after the paste keystroke, nothing confirmed it arrived.
+	U_DESKTOP_VERDICT_UNVERIFIED_OK,
+	//! U_DESKTOP_ERR_REFUSED: the user copied before the paste keystroke; nothing was pasted.
+	U_DESKTOP_VERDICT_CLIPBOARD_CHANGED_HANDS,
+	//! U_DESKTOP_ERR_REFUSED: the user copied just as the agent's text was offered; the
+	//! offer replaced the user's copy (gone) and the clipboard was released.
+	U_DESKTOP_VERDICT_USER_COPY_LOST_RELEASED,
+	//! U_DESKTOP_ERR_FAILED: the user copied right after the keystroke and the agent's
+	//! text was never read: whatever the window pasted was the user's clipboard.
+	U_DESKTOP_VERDICT_PASTED_USER_CLIPBOARD,
+	//! U_DESKTOP_ERR_FAILED: the user copied during the paste; whether the text arrived is unknown.
+	U_DESKTOP_VERDICT_DELIVERY_UNKNOWN,
+	//! U_DESKTOP_ERR_FAILED: the focused window never asked for the pasted text.
+	U_DESKTOP_VERDICT_NOT_ASKED,
+	//! U_DESKTOP_ERR_FAILED: the focused text field did not change.
+	U_DESKTOP_VERDICT_NOT_DELIVERED,
+	U_DESKTOP_VERDICT_COUNT, //!< not a verdict
+};
+
+/*
+ * The verdicts' fixed messages: plain strings (no format specifiers) that never name
+ * any text. UNVERIFIED_OK completes "ok (unverified: <its message>)". The em dash is
+ * spelled as UTF-8 bytes so no compiler's source charset can change it.
+ */
+#define U_DESKTOP_EM_DASH "\xe2\x80\x94"
+#define U_DESKTOP_VERDICT_MSG_UNVERIFIED_OK \
+	"the window read the text after the paste, but no accessible text field confirmed it was inserted " \
+	"(a clipboard manager reads too)"
+#define U_DESKTOP_VERDICT_MSG_CLIPBOARD_CHANGED_HANDS \
+	"the clipboard changed hands (the user copied something); nothing was pasted"
+#define U_DESKTOP_VERDICT_MSG_USER_COPY_LOST_RELEASED \
+	"the clipboard changed hands (the user copied something) just as the agent's text was being offered " \
+	U_DESKTOP_EM_DASH " nothing was pasted, but the offer had already replaced what the user copied, which " \
+	"is gone (copy it again); the clipboard was released and is empty"
+#define U_DESKTOP_VERDICT_MSG_PASTED_USER_CLIPBOARD \
+	"the clipboard changed hands right after the paste keystroke (the user copied something) and the " \
+	"agent's text was never read " U_DESKTOP_EM_DASH " whatever the window pasted was the user's clipboard, " \
+	"not the agent's text; the user's clipboard was left as is"
+#define U_DESKTOP_VERDICT_MSG_DELIVERY_UNKNOWN \
+	"lost the clipboard during the paste (the user copied something) " U_DESKTOP_EM_DASH " whether the text " \
+	"arrived is unknown; the user's clipboard was left as is"
+#define U_DESKTOP_VERDICT_MSG_NOT_ASKED "the focused window did not ask for the pasted text (does it accept text?)"
+#define U_DESKTOP_VERDICT_MSG_NOT_DELIVERED \
+	"the focused text field did not change " U_DESKTOP_EM_DASH " the paste was not seen to arrive"
+
+/*!
  * Handed to every injecting backend call (see "Delivery guarantee").
  */
 struct u_desktop_input_guard
@@ -301,7 +366,19 @@ struct u_desktop_input_guard
 	//! before every injection batch. Never NULL.
 	bool (*still_allowed)(void *ctx);
 	void *ctx;
+	//! Where a keyboard action's verdict goes: set it with u_desktop_guard_set_verdict.
+	//! NULL when the caller collects none (the smoke tool).
+	enum u_desktop_input_verdict *verdict;
 };
+
+//! Report a keyboard action's verdict, with the result it belongs to (see the enum).
+static inline void
+u_desktop_guard_set_verdict(const struct u_desktop_input_guard *guard, enum u_desktop_input_verdict v)
+{
+	if (guard != NULL && guard->verdict != NULL) {
+		*guard->verdict = v;
+	}
+}
 
 struct u_desktop_backend
 {

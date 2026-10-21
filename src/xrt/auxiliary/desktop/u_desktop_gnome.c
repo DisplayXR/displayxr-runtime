@@ -1104,6 +1104,22 @@ is_terminal(const char *app_id)
 	return false;
 }
 
+/*!
+ * The portal refused the paste because the clipboard changed hands (the user
+ * copied): tell the app which way (u_desktop_paste_decide) — nothing was pasted;
+ * the user's copy stands, or our offer had already replaced it.
+ */
+static void
+paste_refused_verdict(const struct u_desktop_input_guard *guard,
+                      enum u_desktop_result r,
+                      const struct u_desktop_paste_obs *obs)
+{
+	if (r == U_DESKTOP_ERR_REFUSED && obs->lost_before_key) {
+		bool restore = false;
+		u_desktop_guard_set_verdict(guard, u_desktop_paste_input_verdict(u_desktop_paste_decide(obs, &restore)));
+	}
+}
+
 static enum u_desktop_result
 gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
 {
@@ -1155,10 +1171,12 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 			gnome_atspi_focused_text(g->atspi, fpid, ftitle, PASTE_ATSPI_BUDGET_MS, &before);
 		}
 		// 1. Take the clipboard (slow: read the old text, offer ours, wait to own it).
-		enum u_desktop_result r = gnome_portal_clip_take(g->portal, body, msg);
+		struct u_desktop_paste_obs obs;
+		enum u_desktop_result r = gnome_portal_clip_take(g->portal, body, &obs, msg);
 		memset(body, 0, len);
 		free(body);
 		if (r != U_DESKTOP_OK) {
+			paste_refused_verdict(guard, r, &obs);
 			return r;
 		}
 		// 2. Right before the paste keystroke: the guard, and the focus.
@@ -1169,9 +1187,9 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 		}
 		// 3. Paste (refused there if the clipboard changed hands meanwhile — the
 		// user copied: nothing pasted, the user's clipboard untouched).
-		struct u_desktop_paste_obs obs;
 		r = gnome_portal_clip_paste(g->portal, terminal, &obs, msg);
 		if (r != U_DESKTOP_OK) {
+			paste_refused_verdict(guard, r, &obs);
 			return r;
 		}
 		// 4. Did it arrive? The field must change (bounded poll: an app updates its
@@ -1193,6 +1211,9 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 		// never changed hands (the portal side re-checks that too).
 		gnome_portal_clip_restore(g->portal);
 		r = u_desktop_paste_result(v);
+		// What the app is told (a fixed string per verdict; the message below is
+		// for the smoke tool and is never passed on).
+		u_desktop_guard_set_verdict(guard, u_desktop_paste_input_verdict(v));
 		if (v != U_DESKTOP_PASTE_DELIVERED) {
 			gnome_set_msg(msg, "%s", u_desktop_paste_message(v));
 		}
@@ -1205,6 +1226,7 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 	for (uint32_t i = 0; i < enters; i++) {
 		enum u_desktop_result r = gnome_send_chord(g, guard, guard->target_id, 0, KEY_ENTER, 0, msg);
 		if (r != U_DESKTOP_OK) {
+			u_desktop_guard_set_verdict(guard, U_DESKTOP_VERDICT_NONE); // not the paste's outcome
 			return r;
 		}
 	}

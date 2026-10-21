@@ -1996,9 +1996,9 @@ TEST_CASE("polish11_mini: a full cache never overwrites an entry with a pin", "[
 
 namespace {
 u_desktop_paste_verdict
-decide(bool lost_before, bool lost_after, uint32_t writes, int text_check, bool *restore)
+decide(bool lost_before, bool lost_after, uint32_t writes, int text_check, bool *restore, bool replaced = false)
 {
-	u_desktop_paste_obs o = {lost_before, lost_after, writes, text_check};
+	u_desktop_paste_obs o = {lost_before, lost_after, writes, text_check, replaced};
 	return u_desktop_paste_decide(&o, restore);
 }
 } // namespace
@@ -2114,6 +2114,229 @@ TEST_CASE("gnome_paste: success message — plain ok, or ok (unverified: …)", 
 	CHECK(std::string(out) == "ok");
 	u_desktop_success_message(U_DESKTOP_MSG_UNVERIFIED "nothing confirmed it", out, sizeof(out));
 	CHECK(std::string(out) == "ok (unverified: nothing confirmed it)");
+}
+
+/*
+ *
+ * Keyboard-action verdicts: a backend's distinct outcome reaches the app as a
+ * FIXED string (u_desktop.h "Privacy", u_desktop_input_verdict). The strings are
+ * written out here on purpose: they are public contract (spec §9), and a change
+ * to one must show up as a test change.
+ *
+ */
+
+namespace {
+
+struct VerdictRow
+{
+	u_desktop_input_verdict v;
+	u_desktop_result belongs; //!< the one backend result it comes with
+	int32_t xr;
+	const char *msg;
+};
+
+const VerdictRow kVerdicts[] = {
+    {U_DESKTOP_VERDICT_UNVERIFIED_OK, U_DESKTOP_OK, U_DESKTOP_XR_SUCCESS,
+     "ok (unverified: the window read the text after the paste, but no accessible text field confirmed it was "
+     "inserted (a clipboard manager reads too))"},
+    {U_DESKTOP_VERDICT_CLIPBOARD_CHANGED_HANDS, U_DESKTOP_ERR_REFUSED, U_DESKTOP_XR_ERROR_REFUSED,
+     "the clipboard changed hands (the user copied something); nothing was pasted"},
+    {U_DESKTOP_VERDICT_USER_COPY_LOST_RELEASED, U_DESKTOP_ERR_REFUSED, U_DESKTOP_XR_ERROR_REFUSED,
+     "the clipboard changed hands (the user copied something) just as the agent's text was being offered \xe2\x80\x94 "
+     "nothing was pasted, but the offer had already replaced what the user copied, which is gone (copy it "
+     "again); the clipboard was released and is empty"},
+    {U_DESKTOP_VERDICT_PASTED_USER_CLIPBOARD, U_DESKTOP_ERR_FAILED, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE,
+     "the clipboard changed hands right after the paste keystroke (the user copied something) and the agent's "
+     "text was never read \xe2\x80\x94 whatever the window pasted was the user's clipboard, not the agent's text; the "
+     "user's clipboard was left as is"},
+    {U_DESKTOP_VERDICT_DELIVERY_UNKNOWN, U_DESKTOP_ERR_FAILED, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE,
+     "lost the clipboard during the paste (the user copied something) \xe2\x80\x94 whether the text arrived is "
+     "unknown; the user's clipboard was left as is"},
+    {U_DESKTOP_VERDICT_NOT_ASKED, U_DESKTOP_ERR_FAILED, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE,
+     "the focused window did not ask for the pasted text (does it accept text?)"},
+    {U_DESKTOP_VERDICT_NOT_DELIVERED, U_DESKTOP_ERR_FAILED, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE,
+     "the focused text field did not change \xe2\x80\x94 the paste was not seen to arrive"},
+};
+
+struct PlainRow
+{
+	u_desktop_result r;
+	int32_t xr;
+	const char *msg;
+};
+
+//! Every backend result with no verdict: the mapping from before verdicts existed.
+const PlainRow kPlain[] = {
+    {U_DESKTOP_OK, U_DESKTOP_XR_SUCCESS, "ok"},
+    {U_DESKTOP_ERR_REFUSED, U_DESKTOP_XR_ERROR_REFUSED, "focus moved"},
+    {U_DESKTOP_ERR_NOT_GRANTED, U_DESKTOP_XR_ERROR_NOT_GRANTED, "the OS refused: permission missing or revoked"},
+    {U_DESKTOP_ERR_UNSUPPORTED, U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED,
+     "this desktop backend cannot deliver this input"},
+    {U_DESKTOP_ERR_WINDOW_LOST, U_DESKTOP_XR_ERROR_WINDOW_LOST, "the target window no longer exists"},
+    {U_DESKTOP_ERR_TIMEOUT, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE, "the input could not be delivered"},
+    {U_DESKTOP_ERR_FAILED, U_DESKTOP_XR_ERROR_RUNTIME_FAILURE, "the input could not be delivered"},
+};
+
+std::string
+outcome_msg(u_desktop_result r, u_desktop_input_verdict v, int32_t *xr = nullptr)
+{
+	const char *m = nullptr;
+	int32_t x = u_desktop_control_keyboard_outcome(r, v, &m);
+	if (xr != nullptr) {
+		*xr = x;
+	}
+	REQUIRE(m != nullptr);
+	return m;
+}
+
+} // namespace
+
+TEST_CASE("keyboard_verdict: each verdict maps to its own fixed string and its result's XR code",
+          "[desktop][verdict]")
+{
+	// Every verdict has a row (a new verdict needs its string pinned here).
+	CHECK(sizeof(kVerdicts) / sizeof(kVerdicts[0]) == (size_t)(U_DESKTOP_VERDICT_COUNT - 1));
+	std::vector<std::string> seen;
+	for (const VerdictRow &row : kVerdicts) {
+		CAPTURE((int)row.v);
+		int32_t xr = 0;
+		const std::string m = outcome_msg(row.belongs, row.v, &xr);
+		CHECK(xr == row.xr);
+		CHECK(m == row.msg);
+		// A plain string: no format specifier, fits the event's message (terminator included).
+		CHECK(m.find('%') == std::string::npos);
+		CHECK(m.size() < U_DESKTOP_MSG_SIZE);
+		CHECK(m.size() < 256); // XR_MAX_DESKTOP_MESSAGE_SIZE_DXR
+		// Distinct from every other verdict and from the plain per-result strings.
+		for (const std::string &o : seen) {
+			CHECK(o != m);
+		}
+		for (const PlainRow &p : kPlain) {
+			CHECK(m != p.msg);
+		}
+		seen.push_back(m);
+	}
+	// The macros hold the same words (the GNOME backend's own messages use them).
+	CHECK(std::string("ok (unverified: " U_DESKTOP_VERDICT_MSG_UNVERIFIED_OK ")") == kVerdicts[0].msg);
+	CHECK(std::string(U_DESKTOP_VERDICT_MSG_USER_COPY_LOST_RELEASED) == kVerdicts[2].msg);
+}
+
+TEST_CASE("keyboard_verdict: no verdict, or one that belongs to another result, keeps the plain mapping",
+          "[desktop][verdict]")
+{
+	for (const PlainRow &p : kPlain) {
+		CAPTURE((int)p.r);
+		int32_t xr = 0;
+		CHECK(outcome_msg(p.r, U_DESKTOP_VERDICT_NONE, &xr) == p.msg);
+		CHECK(xr == p.xr);
+		// A value this layer does not know reads as none.
+		CHECK(outcome_msg(p.r, (u_desktop_input_verdict)15, &xr) == p.msg);
+		CHECK(outcome_msg(p.r, U_DESKTOP_VERDICT_COUNT, &xr) == p.msg);
+		for (const VerdictRow &row : kVerdicts) {
+			if (row.belongs == p.r) {
+				continue;
+			}
+			CAPTURE((int)row.v);
+			CHECK(outcome_msg(p.r, row.v, &xr) == p.msg);
+			CHECK(xr == p.xr); // the XR code is always the result's
+		}
+	}
+}
+
+TEST_CASE("keyboard_verdict: every GNOME paste verdict reaches the app as its own words", "[desktop][verdict][gnome]")
+{
+	std::vector<u_desktop_input_verdict> used;
+	for (int p = U_DESKTOP_PASTE_DELIVERED; p <= U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED; p++) {
+		CAPTURE(p);
+		const auto pv = (u_desktop_paste_verdict)p;
+		const u_desktop_input_verdict v = u_desktop_paste_input_verdict(pv);
+		const u_desktop_result r = u_desktop_paste_result(pv);
+		const std::string backend = u_desktop_paste_message(pv);
+		int32_t xr = 0;
+		const std::string app = outcome_msg(r, v, &xr);
+		if (pv == U_DESKTOP_PASTE_DELIVERED) {
+			CHECK(v == U_DESKTOP_VERDICT_NONE);
+			CHECK(app == "ok");
+			continue;
+		}
+		CHECK(v != U_DESKTOP_VERDICT_NONE);
+		for (u_desktop_input_verdict u : used) {
+			CHECK(u != v); // one app verdict per paste verdict
+		}
+		used.push_back(v);
+		if (pv == U_DESKTOP_PASTE_UNVERIFIED) {
+			// Exactly what the smoke tool's "unverified: …" used to become.
+			char ok[U_DESKTOP_MSG_SIZE];
+			u_desktop_success_message(backend.c_str(), ok, sizeof(ok));
+			CHECK(app == ok);
+			CHECK(xr == U_DESKTOP_XR_SUCCESS);
+		} else {
+			CHECK(app == backend); // the backend's words, as a fixed string
+			CHECK(xr == (r == U_DESKTOP_ERR_REFUSED ? U_DESKTOP_XR_ERROR_REFUSED
+			                                        : U_DESKTOP_XR_ERROR_RUNTIME_FAILURE));
+		}
+	}
+	// The N1 refusal is decided like the others now: lost before the key, our
+	// offer having replaced the user's copy.
+	bool restore = true;
+	CHECK(decide(true, false, 0, -1, &restore, true) == U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED);
+	CHECK_FALSE(restore);
+	CHECK(decide(true, true, 2, 1, &restore, true) == U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED);
+	// "replaced" alone (no loss before the key) means nothing.
+	CHECK(decide(false, false, 1, 1, &restore, true) == U_DESKTOP_PASTE_DELIVERED);
+	CHECK(restore);
+}
+
+TEST_CASE("keyboard_verdict: end to end, the verdict's string reaches the app and the audit, the backend's text never",
+          "[desktop][verdict][privacy]")
+{
+	TempDir dir;
+	Harness h(&kFast);
+	h.grant();
+	for (const VerdictRow &row : kVerdicts) {
+		CAPTURE((int)row.v);
+		u_desktop_fake_set_keyboard_verdict(h.fake, row.belongs, row.v);
+		auto r = h.run(type_text(101, "hunter2-password"));
+		CHECK(r.result == row.xr);
+		CHECK(r.message == row.msg);
+		CHECK(r.message.find("hunter2") == std::string::npos);
+		CHECK(r.message.find("fake") == std::string::npos);
+		auto k = h.run(chord(101, "ctrl+q"));
+		CHECK(k.result == row.xr);
+		CHECK(k.message == row.msg);
+	}
+	// The unverified success still typed the text.
+	CHECK(content(h.fake, 101).find("hunter2-password") != std::string::npos);
+
+	// No verdict: a success whose backend message starts "unverified: " and names
+	// the text is a plain "ok" (it used to pass the backend's words on).
+	u_desktop_fake_set_keyboard_verdict(h.fake, U_DESKTOP_OK, U_DESKTOP_VERDICT_NONE);
+	auto ok = h.run(type_text(101, "hunter2-again"));
+	CHECK(ok.result == U_DESKTOP_XR_SUCCESS);
+	CHECK(ok.message == "ok");
+	auto okk = h.run(chord(101, "ctrl+q"));
+	CHECK(okk.message == "ok");
+
+	// A verdict that comes with another result is ignored.
+	u_desktop_fake_set_keyboard_verdict(h.fake, U_DESKTOP_ERR_FAILED, U_DESKTOP_VERDICT_CLIPBOARD_CHANGED_HANDS);
+	auto mis = h.run(type_text(101, "hunter2-x"));
+	CHECK(mis.result == U_DESKTOP_XR_ERROR_RUNTIME_FAILURE);
+	CHECK(mis.message == "the input could not be delivered");
+	u_desktop_fake_set_keyboard_verdict(h.fake, U_DESKTOP_OK, U_DESKTOP_VERDICT_NOT_ASKED);
+	auto mis2 = h.run(type_text(101, "hunter2-y"));
+	CHECK(mis2.result == U_DESKTOP_XR_SUCCESS);
+	CHECK(mis2.message == "ok");
+	u_desktop_fake_set_keyboard_verdict(h.fake, U_DESKTOP_ERR_REFUSED, U_DESKTOP_VERDICT_NONE);
+	auto ref = h.run(type_text(101, "hunter2-z"));
+	CHECK(ref.result == U_DESKTOP_XR_ERROR_REFUSED);
+	CHECK(ref.message == "focus moved");
+
+	// The audit has the fixed failure strings, never the text.
+	std::string audit = slurp(dir.file("desktop_control_audit.jsonl"));
+	CHECK(audit.find("hunter2") == std::string::npos);
+	CHECK(audit.find("the clipboard changed hands (the user copied something); nothing was pasted") !=
+	      std::string::npos);
+	CHECK(audit.find("whatever the window pasted was the user's clipboard") != std::string::npos);
 }
 
 TEST_CASE("gnome_move: the drop waits >= 250 ms on the target monitor after the last crossing",

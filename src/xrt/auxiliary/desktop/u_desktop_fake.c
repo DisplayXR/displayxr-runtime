@@ -60,6 +60,10 @@ struct u_desktop_fake
 	char fail_op[24];
 	bool fail_any;
 	enum u_desktop_result fail_result;
+	//! u_desktop_fake_set_keyboard_verdict: how type_text / key_chord end, and their verdict
+	bool kb_set;
+	enum u_desktop_result kb_result;
+	enum u_desktop_input_verdict kb_verdict;
 	int32_t skew_x, skew_y;
 	uint64_t raise_on_move;
 
@@ -619,7 +623,18 @@ fake_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *
 		os_mutex_unlock(&f->mutex);
 		return r;
 	}
+	const bool kb_set = f->kb_set;
+	const enum u_desktop_result kb_result = f->kb_result;
+	const enum u_desktop_input_verdict kb_verdict = f->kb_verdict;
 	os_mutex_unlock(&f->mutex);
+	if (kb_set && kb_result != U_DESKTOP_OK) {
+		// Nothing typed; the verdict, and a careless message naming the text.
+		u_desktop_guard_set_verdict(guard, kb_verdict);
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "fake: verdict %d, not typed: \"%s\"", (int)kb_verdict, utf8);
+		}
+		return kb_result;
+	}
 
 	char delivered[FAKE_CONTENT_SIZE];
 	size_t dn = 0;
@@ -666,6 +681,13 @@ fake_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard *
 		log_line(f, "type %llu %s", (unsigned long long)guard->target_id, delivered);
 		os_mutex_unlock(&f->mutex);
 	}
+	if (r == U_DESKTOP_OK && kb_set) {
+		// Typed; the verdict, and an "unverified: " message naming the text.
+		u_desktop_guard_set_verdict(guard, kb_verdict);
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "unverified: fake typed \"%s\"", utf8);
+		}
+	}
 	return r;
 }
 
@@ -680,9 +702,20 @@ fake_key_chord(struct u_desktop_backend *b,
 	action_delay(f);
 	os_mutex_lock(&f->mutex);
 	enum u_desktop_result r = forced_failure(f, "key_chord", msg);
+	const bool kb_set = f->kb_set;
+	const enum u_desktop_result kb_result = f->kb_result;
+	const enum u_desktop_input_verdict kb_verdict = f->kb_verdict;
 	os_mutex_unlock(&f->mutex);
 	if (r != U_DESKTOP_OK) {
 		return r;
+	}
+	if (kb_set && kb_result != U_DESKTOP_OK) {
+		// Nothing pressed; the verdict, and a careless message naming the key.
+		u_desktop_guard_set_verdict(guard, kb_verdict);
+		if (msg != NULL) {
+			snprintf(msg, U_DESKTOP_MSG_SIZE, "fake: verdict %d, not pressed: %s", (int)kb_verdict, chord->key);
+		}
+		return kb_result;
 	}
 	// Key-downs: each modifier, then the key; each one is a batch.
 	uint32_t nd = 0;
@@ -711,6 +744,12 @@ fake_key_chord(struct u_desktop_backend *b,
 		u_desktop_chord_format(chord, s2, sizeof(s2));
 		log_line(f, "key %s", s2);
 		note_input_locked(f);
+		if (kb_set) {
+			u_desktop_guard_set_verdict(guard, kb_verdict);
+			if (msg != NULL) {
+				snprintf(msg, U_DESKTOP_MSG_SIZE, "unverified: fake pressed %s", s2);
+			}
+		}
 	} else if (pressed > 0) {
 		// A stop releases every key it pressed.
 		log_line(f, "keys released %u", pressed);
@@ -1310,6 +1349,16 @@ u_desktop_fake_set_action_result(struct u_desktop_fake *f, const char *op, enum 
 	f->fail_result = r;
 	f->fail_any = op == NULL;
 	snprintf(f->fail_op, sizeof(f->fail_op), "%s", op != NULL ? op : "");
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_keyboard_verdict(struct u_desktop_fake *f, enum u_desktop_result r, enum u_desktop_input_verdict v)
+{
+	os_mutex_lock(&f->mutex);
+	f->kb_set = true;
+	f->kb_result = r;
+	f->kb_verdict = v;
 	os_mutex_unlock(&f->mutex);
 }
 

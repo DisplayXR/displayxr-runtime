@@ -138,6 +138,17 @@ u_desktop_fake_set_action_delay_ms(struct u_desktop_fake *f, uint32_t ms);
 void
 u_desktop_fake_set_action_result(struct u_desktop_fake *f, const char *op, enum u_desktop_result r);
 
+/*!
+ * Make the next type_text and key_chord calls end with @p r and report verdict
+ * @p v through the guard (u_desktop_guard_set_verdict). @p r != OK: nothing is
+ * typed or pressed. @p r == OK: the input is delivered as usual, then the verdict
+ * is set. Either way the fake's own message is careless on purpose — it names the
+ * text or the key (and on success starts "unverified: "): the common layer must
+ * never pass it on. Off in a fresh fake; once set it stays set.
+ */
+void
+u_desktop_fake_set_keyboard_verdict(struct u_desktop_fake *f, enum u_desktop_result r, enum u_desktop_input_verdict v);
+
 //! pointer_move lands @p dx/dy away from where it was asked (0,0 = exact).
 void
 u_desktop_fake_set_pointer_skew(struct u_desktop_fake *f, int32_t dx, int32_t dy);

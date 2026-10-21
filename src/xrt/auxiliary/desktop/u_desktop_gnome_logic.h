@@ -31,6 +31,9 @@ struct u_desktop_paste_obs
 	bool lost_after_key;       //!< ... after it, while the paste was being served
 	uint32_t writes_after_key; //!< reads of the agent's text after the keystroke (any reader)
 	int text_check;
+	//! with lost_before_key: the user's copy landed between reading the previous
+	//! clipboard and our SetSelection, which replaced it (taking the clipboard)
+	bool replaced;
 };
 
 enum u_desktop_paste_verdict
@@ -74,16 +77,17 @@ u_desktop_fnv1a(const char *s, size_t len);
  * again: never once the selection changed hands — that would overwrite what the
  * user just copied.
  *
- * | lost      | writes | field    | verdict                         |
- * |-----------|--------|----------|---------------------------------|
- * | before    | any    | any      | CHANGED_HANDS (refused)         |
- * | after     | 0      | any      | LOST_NOT_SERVED (failed)        |
- * | after     | > 0    | changed  | DELIVERED                       |
- * | after     | > 0    | else     | LOST_UNCERTAIN (failed)         |
- * | no        | any    | changed  | DELIVERED                       |
- * | no        | 0      | else     | NOT_ASKED (failed)              |
- * | no        | > 0    | same     | FIELD_UNCHANGED (failed)        |
- * | no        | > 0    | no field | UNVERIFIED (ok, unverified)     |
+ * | lost             | writes | field    | verdict                          |
+ * |------------------|--------|----------|----------------------------------|
+ * | before, replaced | any    | any      | CHANGED_HANDS_REPLACED (refused) |
+ * | before           | any    | any      | CHANGED_HANDS (refused)          |
+ * | after            | 0      | any      | LOST_NOT_SERVED (failed)         |
+ * | after            | > 0    | changed  | DELIVERED                        |
+ * | after            | > 0    | else     | LOST_UNCERTAIN (failed)          |
+ * | no               | any    | changed  | DELIVERED                        |
+ * | no               | 0      | else     | NOT_ASKED (failed)               |
+ * | no               | > 0    | same     | FIELD_UNCHANGED (failed)         |
+ * | no               | > 0    | no field | UNVERIFIED (ok, unverified)      |
  */
 enum u_desktop_paste_verdict
 u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore);
@@ -112,9 +116,15 @@ enum u_desktop_result
 u_desktop_paste_result(enum u_desktop_paste_verdict v);
 
 //! The message of a verdict (never names any text). An UNVERIFIED delivery's
-//! message starts with U_DESKTOP_MSG_UNVERIFIED.
+//! message starts with U_DESKTOP_MSG_UNVERIFIED. The backend's own: the app gets
+//! the fixed message of u_desktop_paste_input_verdict(v) instead (same words).
 const char *
 u_desktop_paste_message(enum u_desktop_paste_verdict v);
+
+//! The keyboard-action verdict the app is told (u_desktop.h): one per paste
+//! verdict, NONE for a plain delivery.
+enum u_desktop_input_verdict
+u_desktop_paste_input_verdict(enum u_desktop_paste_verdict v);
 
 /*!
  * A backend that succeeded without being able to confirm the effect fills its

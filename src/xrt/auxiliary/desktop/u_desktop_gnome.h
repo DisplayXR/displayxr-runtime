@@ -202,10 +202,12 @@ gnome_chord_mod_codes(uint32_t mods, uint32_t *codes);
 
 /*!
  * Text, step 1: remember the current clipboard text, offer @p utf8 instead. OK
- * only once the portal confirmed this session OWNS the selection.
+ * only once the portal confirmed this session OWNS the selection. REFUSED
+ * (obs->lost_before_key, and obs->replaced when our offer had already replaced
+ * the user's copy) when the selection changed hands meanwhile — nothing pasted.
  */
 enum u_desktop_result
-gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg);
+gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, struct u_desktop_paste_obs *obs, char *msg);
 
 /*!
  * Text, step 2 (after the caller re-checked the guard): if we still own the

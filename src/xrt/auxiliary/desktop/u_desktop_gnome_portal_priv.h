@@ -59,7 +59,7 @@ struct gp_cmd
 	uint32_t out_mods, out_code; //!< resolved chord
 	struct u_desktop_rect mon[GNOME_MAX_MONITORS]; //!< monitors: the pointer's regions
 	uint32_t nmon;
-	struct u_desktop_paste_obs obs; //!< clip_paste: what the paste saw
+	struct u_desktop_paste_obs obs; //!< clip_take / clip_paste: what the paste saw
 	u_desktop_access_done_fn done;
 	void *done_ctx;
 	//! request / request_scopes: the consent dialog's parent window ("" = none).

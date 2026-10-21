@@ -693,6 +693,7 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 	gp_pump(p, 0);
 	if (clip_changed_hands(p)) {
 		clipboard_restore(p); // offers nothing: the selection is the user's
+		c->obs.lost_before_key = true;
 		gp_set_msg(c->msg, "%s", u_desktop_paste_message(U_DESKTOP_PASTE_CHANGED_HANDS));
 		return U_DESKTOP_ERR_REFUSED;
 	}
@@ -710,6 +711,8 @@ cmd_clip_take(struct gnome_portal *p, struct gp_cmd *c)
 		U_LOG_W("desktop/gnome: the clipboard changed hands while taking it — not pasting%s",
 		        replaced ? " (our offer replaced the user's copy; releasing)" : "");
 		clipboard_restore(p); // releases a selection we still hold
+		c->obs.lost_before_key = true;
+		c->obs.replaced = replaced;
 		gp_set_msg(c->msg, "%s",
 		           u_desktop_paste_message(replaced ? U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED
 		                                            : U_DESKTOP_PASTE_CHANGED_HANDS));
@@ -987,8 +990,10 @@ gnome_portal_resolve_chord(struct gnome_portal *p,
 }
 
 enum u_desktop_result
-gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg)
+gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, struct u_desktop_paste_obs *obs, char *msg)
 {
+	memset(obs, 0, sizeof(*obs));
+	obs->text_check = -1;
 	struct gp_cmd *c = gp_cmd_new(cmd_clip_take);
 	if (c == NULL) {
 		return U_DESKTOP_ERR_FAILED;
@@ -998,7 +1003,13 @@ gnome_portal_clip_take(struct gnome_portal *p, const char *utf8, char *msg)
 		gp_cmd_free(c);
 		return U_DESKTOP_ERR_FAILED;
 	}
-	return gp_run_sync(p, c, ACTION_TIMEOUT_MS, msg);
+	struct gp_cmd copy;
+	enum u_desktop_result r = gp_run_sync_keep(p, c, ACTION_TIMEOUT_MS, msg, &copy);
+	if (r == U_DESKTOP_ERR_REFUSED) {
+		obs->lost_before_key = copy.obs.lost_before_key;
+		obs->replaced = copy.obs.replaced;
+	}
+	return r;
 }
 
 enum u_desktop_result
