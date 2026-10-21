@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief XR_DXR_desktop_control spec version 3 (ADR-056 Amendment 3, proposed) — the
+ * @brief XR_DXR_desktop_control spec version 3 (ADR-056 Amendment 3) — the
  *        common layer over the in-memory fake backend: held keys and buttons
  *        (KEY_DOWN / KEY_UP / BUTTON_DOWN / BUTTON_UP), modifiers around a pointer
  *        action, and the automatic release of everything held.
