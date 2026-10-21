@@ -1169,9 +1169,13 @@ target is never an app window) all apply as for any target.
   switcher, the run dialog (Alt+F2) and panel menus grab the keyboard too, invisibly — keys
   verified against a window while one of those is up still go to it, as in version 2.
 - Text for the shell on GNOME is pasted like any text (§7 GNOME notes) but cannot be confirmed
-  over AT-SPI (no window's text field): a read of it succeeds as "ok (unverified: …)".
-- Typical sequences: `KEY_CHORD super` (shell) → the overview; `TYPE_TEXT "terminal\n"` (shell)
-  → search and launch; `CLICK` on the dock or the top bar (shell); a drag from a window
+  over AT-SPI (no window's text field): a read of it succeeds as "ok (unverified: …)". The
+  overview's search takes a paste only once it has the keyboard — after a typed letter, which
+  starts the search; a paste into a freshly opened overview is read by nobody and completes
+  `XR_ERROR_RUNTIME_FAILURE` "the input could not be delivered" (measured in the harness). So an
+  agent sends the first character as a key (`KEY_CHORD` "f", shell target), then the rest as text.
+- Typical sequences: `KEY_CHORD super` (shell) → the overview; `KEY_CHORD t` then
+  `TYPE_TEXT "erminal\n"` (shell) → search and launch; `CLICK` on the dock or the top bar (shell); a drag from a window
   (`BUTTON_DOWN` on the window) dropped on the desktop (`BUTTON_UP` with the shell target).
 
 ### 11.6 Clipboard text

@@ -543,19 +543,23 @@ in-process runtime with `DXR_PLUGIN_EXCLUSIVE=sim-display`, 2026-10-21 (`feat/de
 
 ### 12b. The shell target (§11.5)
 
-| # | Check | Expected |
-|---|---|---|
-| 12.20 | A window focused; `act key target=shell keys=super` (probe) | `REFUSED "an app window has keyboard focus (<app>) …"`, the overview stays closed |
-| 12.21 | Nothing focused (click the desktop first), `act key target=shell keys=super` | the overview opens |
-| 12.22 | Overview open: `act type target=shell text="Files"` then `act key target=shell keys=enter` | the search shows Files; Enter launches it; the type completes `ok (unverified: …)` |
-| 12.23 | Overview open: `act key target=<a window> keys=ctrl+a` | `REFUSED "… the shell holds the keyboard (the overview?)"` — nothing typed into the search (version 2 typed it there) |
-| 12.24 | Overview open: `act click target=shell` on a window preview | the window is activated, the overview closes |
-| 12.25 | `act click target=shell` on the top bar (the clock) and on the dash / dock (Ubuntu session, `DXRH_MODE=dxrubuntu`) | the calendar opens; the app launches / focuses |
-| 12.26 | The same clicks with a window target (or `target=<id>` of any window) | `REFUSED "target is not under the point (found the shell)"` — version 2's refusal stays without the shell target |
-| 12.27 | `act click target=shell` over an app window | `REFUSED "the shell is not under the point (found <app>: <title>)"`, no click |
-| 12.28 | `act move-pointer target=shell` to a gap between two monitors of different heights (`DXRH_MONITORS="1920x1200 1280x800"`) | verification passes (pick `outside`), the move fails (`(x,y) is on no monitor`), the pointer does not move |
-| 12.29 | Kill switch / lock while an action for the shell is queued | refused as for any target; the audit shows `"target":{"kind":"shell"}` |
-| 12.30 | Alt+Tab from a focused window: `act key-down target=<it> keys=alt`, `act key-down target=<it> keys=tab` × 2 (key-up between), `act key-up target=<it> keys=alt` | the switcher steps (mutter keeps the window focused while its switcher grab is up), the switch happens on the release |
+Observed: the same harness, Ubuntu session mode (top bar + dock), 1920x1080 + 1280x720 side by
+side, 2026-10-21.
+
+| # | Check | Expected | Observed (harness) |
+|---|---|---|---|
+| 12.20 | A window focused; `act key target=shell keys=super` (probe) | `REFUSED "an app window has keyboard focus (<app>) …"`, the overview stays closed | as expected (`(gjs)`), overview closed |
+| 12.21 | Nothing focused (the only window closed), `act key target=shell keys=super`; also `key-down` / `key-up super` | the overview opens | both open the overview (focus null) |
+| 12.22 | Overview open: `act type target=shell text=…` | the text reaches the search | a paste into a fresh overview is read by nobody: `RUNTIME_FAILURE "the input could not be delivered"`; after `act key target=shell keys=f` (starts the search) `act type target=shell text=iles` → `ok (unverified: …)` (the shell read it) |
+| 12.23 | Overview open: `act key target=<a window> keys=ctrl+a` | `REFUSED "… the shell holds the keyboard (the overview?)"` — nothing typed into the search (version 2 typed it there) | as expected |
+| 12.24 | Overview open: `act click target=shell` on a window preview | the window is activated, the overview closes | not run |
+| 12.25 | `act click target=shell` on the top bar (Activities) and on the dock (show apps) | the overview / the app grid opens | both open (`overview` true); Escape (shell target) closes them |
+| 12.26 | The same clicks with a window target | `REFUSED "target is not under the point (found the shell)"` — version 2's refusal stays without the shell target | as expected, overview stays closed |
+| 12.27 | `act click target=shell` over an app window | `REFUSED "the shell is not under the point (found <app>: <title>)"`, no click | `(found gjs: T-W1)` |
+| 12.28 | `act move-pointer target=shell` into the gap below the shorter monitor | verification passes (pick `outside`), the move fails, the pointer does not move | `REFUSED "(2500,950) is on no monitor"`; with a window target `REFUSED "… (found nothing: outside every monitor)"` |
+| 12.29 | Kill switch / lock while an action for the shell is queued | refused as for any target; the audit shows `"target":{"kind":"shell"}` | unit test (`v3_shell: held buttons … every other guard`); the audit shows `-> shell` |
+| 12.30 | Alt+Tab from a focused window with a window target | the switcher steps, the switch happens on the release | see 12.2 |
+| 12.31 | Escape for the shell after the app grid closed (the window has the keyboard again) | `REFUSED "an app window has keyboard focus …"` | as expected |
 
 ### 12c. Clipboard text (§11.6)
 
@@ -567,6 +571,6 @@ in-process runtime with `DXR_PLUGIN_EXCLUSIVE=sim-display`, 2026-10-21 (`feat/de
 | 12.43 | `act type target=<entry> text="typed"` then `act clip-get` with the clipboard holding "U" before | the type pastes "typed"; the GET returns "U" (the type's restore), never "typed" | PASS: the entry got `typed_by_agent`, the GET returned the SET before it (`AGENT_SET_1`) |
 | 12.44 | `act clip-set text="S"`, `act type …`, `act clip-get` (queued at once) | the type pastes its own text; the GET returns "S" (a SET is never overwritten by a type's restore, nor pastes into the type) | not run as one queue in the harness (unit test `v3_clipboard: in order with typing`) |
 | 12.45 | Empty clipboard / an image copied | `ok (the clipboard holds no text)`, fetched text "" | not run |
-| 12.46 | A 2 MiB text copied by the user | `XR_ERROR_LIMIT_REACHED`; nothing fetched | see §12d run |
+| 12.46 | A 2 MiB text copied by the user | `XR_ERROR_LIMIT_REACHED`; nothing fetched | `LIMIT_REACHED "the clipboard text is larger than 1048576 bytes"`; exactly 1 MiB: ok |
 | 12.47 | Kill switch on, `act clip-get` | refused (NOT_GRANTED at submit / REFUSED "kill switch" if it lands while queued) | not run (kill switch covered by 12.8; unit test for a GET) |
 | 12.48 | `grep` the runtime log (`XRT_LOG=debug`) and the audit for the clipboard text after 12.40–12.44 | absent | PASS: none of the clipboard or typed texts in the runtime log or the audit (`bytes` only) |
