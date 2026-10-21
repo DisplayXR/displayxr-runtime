@@ -1219,8 +1219,8 @@ gnome_key_event(struct u_desktop_backend *b,
 		}
 		code = mc[0];
 	} else {
-		code = named_key(key->key);
-		uint32_t ch = code == 0 ? char_key(key->key) : 0;
+		code = u_desktop_gnome_key_code(key->key);
+		uint32_t ch = code == 0 ? u_desktop_gnome_key_char(key->key) : 0;
 		if (code == 0 && ch == 0) {
 			gnome_set_msg(msg, "unknown key name"); // privacy: never echo the key
 			return U_DESKTOP_ERR_FAILED;
