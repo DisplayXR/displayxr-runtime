@@ -48,6 +48,10 @@ struct sim_input_controller_config
 	//! circle radius scale with (host `get_display_geometry`); <= 0 = the
 	//! script's fallback height.
 	float display_height_m;
+	//! Nominal viewer height / distance (metres, display-centre origin, host
+	//! `get_display_geometry`); viewer_z_m <= 0 = the script's fallback viewer.
+	float viewer_y_m;
+	float viewer_z_m;
 };
 
 /*!

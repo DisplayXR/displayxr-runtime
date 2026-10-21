@@ -50,9 +50,10 @@ tip_gap(const u_hand_tracking_curl_values &curls, xrt_hand hand, const xrt_space
 xrt_space_relation
 root_at(bool left, int64_t t_ns)
 {
-	const xrt_pose c = sim_input_hand_center(left, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f);
+	const xrt_pose c = sim_input_hand_center(left, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f, 0.0f, 0.0f);
 	xrt_space_relation r = {};
-	sim_input_hand_relation(&c, sim_input_hand_radius(0.0f), left ? M_PI : 0.0, t_ns, &r);
+	sim_input_hand_relation(&c, sim_input_hand_radius(0.0f, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f),
+	                        left ? M_PI : 0.0, t_ns, &r);
 	return r;
 }
 
@@ -97,39 +98,50 @@ TEST_CASE("HANDS / PINCH parse", "[sim_input][hands]")
 TEST_CASE("hands are placed in front of the display plane (#2191)", "[sim_input][hands]")
 {
 	// Display-plane frame: origin at the display centre, +Z toward the viewer.
-	// No display height (fallback 0.40 m) = the previous fixed placement.
-	const xrt_pose l = sim_input_hand_center(true, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f);
-	const xrt_pose r = sim_input_hand_center(false, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f);
-	CHECK(l.position.x == Catch::Approx(-0.12f));
-	CHECK(r.position.x == Catch::Approx(0.12f));
+	// No display height / viewer: fallback H = 0.40 m, viewer (0, 0.10, 0.60).
+	// The centre sits on the viewer's sightline to (±0.30 H, 0) on the plane,
+	// so at z = 0.25 it is pulled toward the eye by k = 0.35 / 0.60.
+	const float k = (0.60f - 0.25f) / 0.60f;
+	const xrt_pose l = sim_input_hand_center(true, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f, 0.0f, 0.0f);
+	const xrt_pose r = sim_input_hand_center(false, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f, 0.0f, 0.0f);
+	CHECK(l.position.x == Catch::Approx(-0.12f * k));
+	CHECK(r.position.x == Catch::Approx(0.12f * k));
+	CHECK(l.position.y == Catch::Approx(0.10f * (1.0f - k)));
 	CHECK(l.position.z == Catch::Approx(0.25f));
 	CHECK(r.position.z == Catch::Approx(0.25f));
-	CHECK(std::fabs(l.position.y) < 0.05f);
 	CHECK(l.position.y == r.position.y);
 
-	// HAND_DISTANCE_M moves the centre out of the glass; nonsense falls back.
-	CHECK(sim_input_hand_center(false, 0.4f, 0.0f).position.z == Catch::Approx(0.4f));
-	CHECK(sim_input_hand_center(false, 0.0f, 0.0f).position.z == Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
-	CHECK(sim_input_hand_center(false, -1.0f, 0.0f).position.z == Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
-	CHECK(sim_input_hand_center(false, NAN, 0.0f).position.z == Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
+	// HAND_DISTANCE_M moves the centre out of the glass; nonsense falls back,
+	// and a hand at or past the eye is capped at 0.8 of the viewer distance.
+	CHECK(sim_input_hand_center(false, 0.4f, 0.0f, 0.0f, 0.0f).position.z == Catch::Approx(0.4f));
+	CHECK(sim_input_hand_center(false, 0.0f, 0.0f, 0.0f, 0.0f).position.z ==
+	      Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
+	CHECK(sim_input_hand_center(false, -1.0f, 0.0f, 0.0f, 0.0f).position.z ==
+	      Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
+	CHECK(sim_input_hand_center(false, NAN, 0.0f, 0.0f, 0.0f).position.z ==
+	      Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
+	CHECK(sim_input_hand_center(false, 2.0f, 0.0f, 0.0f, 0.0f).position.z == Catch::Approx(0.48f));
 
-	// The root rides a 4 cm circle in the display plane's XY about that
-	// centre, a pure function of the timestamp, with the analytic velocity.
+	// The root rides a circle in the display plane's XY about that centre
+	// (4 cm projected, so 4 cm * k real), a pure function of the timestamp,
+	// with the analytic velocity.
+	const float rad = SIM_INPUT_CIRCLE_RADIUS_M * k;
+	CHECK(sim_input_hand_radius(0.0f, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, 0.0f) == Catch::Approx(rad));
 	for (int i = 0; i < 40; i++) {
 		const int64_t t = 1000 * kNsPerS + (int64_t)i * (kNsPerS / 10);
 		CAPTURE(i);
 		xrt_space_relation a = root_at(false, t);
 		xrt_space_relation b = root_at(false, t);
 		CHECK(a.pose.position.x == b.pose.position.x); // deterministic
-		CHECK(dist(a.pose.position, r.position) == Catch::Approx(SIM_INPUT_CIRCLE_RADIUS_M).margin(1e-4));
+		CHECK(dist(a.pose.position, r.position) == Catch::Approx(rad).margin(1e-4));
 		CHECK(a.pose.position.z == Catch::Approx(r.position.z));
 		const float speed =
 		    std::sqrt(a.linear_velocity.x * a.linear_velocity.x + a.linear_velocity.y * a.linear_velocity.y);
 		CHECK(speed ==
-		      Catch::Approx(2.0 * M_PI * SIM_INPUT_CIRCLE_RADIUS_M / SIM_INPUT_CIRCLE_PERIOD_S).margin(1e-4));
+		      Catch::Approx(2.0 * M_PI * rad / SIM_INPUT_CIRCLE_PERIOD_S).margin(1e-4));
 		// Both hands stay on their own side of the display centre.
-		CHECK(root_at(true, t).pose.position.x < -0.05f);
-		CHECK(a.pose.position.x > 0.05f);
+		CHECK(root_at(true, t).pose.position.x < -0.03f);
+		CHECK(a.pose.position.x > 0.03f);
 	}
 }
 
@@ -173,26 +185,33 @@ TEST_CASE("PINCH=hold keeps thumb and index tips together; wave and open do not 
 	}
 }
 
-TEST_CASE("placement scales with the physical display height", "[sim_input][hands]")
+TEST_CASE("placement keeps the hands in view from the nominal viewer", "[sim_input][hands]")
 {
-	// The Linux field panel: 0.30 x 0.19 m, nominal viewer (0, 0.1, 0.6). At
-	// z = 0.25 the viewer sees |x| < 0.15 * (0.6 - 0.25) / 0.6 = 0.0875 m; the
-	// old fixed ±0.12 m centres were off-screen.
-	const float h = 0.19f;
-	const xrt_pose l = sim_input_hand_center(true, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, h);
-	const xrt_pose r = sim_input_hand_center(false, SIM_INPUT_HAND_DISTANCE_DEFAULT_M, h);
-	CHECK(l.position.x == Catch::Approx(-0.30f * h));
-	CHECK(r.position.x == Catch::Approx(0.30f * h));
-	CHECK(l.position.y == Catch::Approx(-0.10f * h));
-	// HAND_DISTANCE_M stays metres — it is not scaled.
-	CHECK(r.position.z == Catch::Approx(SIM_INPUT_HAND_DISTANCE_DEFAULT_M));
-	// The whole circle stays inside the visible half-width.
-	const float radius = sim_input_hand_radius(h);
-	CHECK(radius == Catch::Approx(0.10f * h));
-	CHECK(r.position.x + radius < 0.0875f);
-
-	// A large panel caps the radius at 4 cm; nonsense heights fall back.
-	CHECK(sim_input_hand_radius(1.0f) == Catch::Approx(SIM_INPUT_CIRCLE_RADIUS_M));
-	CHECK(sim_input_hand_radius(-1.0f) == Catch::Approx(SIM_INPUT_CIRCLE_RADIUS_M));
-	CHECK(sim_input_hand_center(false, 0.25f, NAN).position.x == Catch::Approx(0.12f));
+	// The Linux field panel: 0.30 x 0.19 m, nominal viewer (0, 0.10, 0.60). The
+	// previous placement (y = -0.10 H at z = 0.25) projected onto the BOTTOM
+	// edge of the view (field run: wrist NDC y -1.0 to -1.44 in 5 of 7 runs).
+	const float w = 0.30f, h = 0.19f, vy = 0.10f, vz = 0.60f, z = SIM_INPUT_HAND_DISTANCE_DEFAULT_M;
+	const float radius = sim_input_hand_radius(h, z, vz);
+	for (int side = 0; side < 2; side++) {
+		const bool left = side == 0;
+		CAPTURE(left);
+		const xrt_pose c = sim_input_hand_center(left, z, h, vy, vz);
+		CHECK(c.position.z == Catch::Approx(z)); // HAND_DISTANCE_M stays metres
+		// Project the centre and the circle's extremes from the eye onto the
+		// display plane: all of it must land on the panel, and the centre at
+		// (±0.30 H, 0), i.e. vertically centred.
+		const float s = vz / (vz - z);
+		const float cx = c.position.x * s, cy = vy + (c.position.y - vy) * s;
+		CHECK(cx == Catch::Approx((left ? -0.30f : 0.30f) * h));
+		CHECK(cy == Catch::Approx(0.0f).margin(1e-6));
+		CHECK(std::fabs(cx) + radius * s < w * 0.5f);
+		CHECK(std::fabs(cy) + radius * s < h * 0.5f);
+	}
+	// Projected radius = min(0.10 H, 4 cm); a big panel caps it at 4 cm.
+	CHECK(radius * vz / (vz - z) == Catch::Approx(0.10f * h));
+	CHECK(sim_input_hand_radius(1.0f, z, vz) * vz / (vz - z) == Catch::Approx(SIM_INPUT_CIRCLE_RADIUS_M));
+	// Nonsense height or viewer falls back (H 0.40 m, viewer (0, 0.10, 0.60)).
+	CHECK(sim_input_hand_center(false, z, NAN, vy, vz).position.x == Catch::Approx(0.12f * (vz - z) / vz));
+	CHECK(sim_input_hand_center(false, z, h, NAN, -1.0f).position.y ==
+	      Catch::Approx(sim_input_hand_center(false, z, h, 0.10f, 0.60f).position.y));
 }

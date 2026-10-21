@@ -375,8 +375,11 @@ sim_input_create_controller(enum xrt_device_type type, const struct sim_input_co
 	// grip / aim / palm poses ride the same circle as the hand root, so
 	// marker cubes an app draws from the grip action land inside the hand.
 	const float display_h = config != NULL ? config->display_height_m : 0.0f;
-	sd->center = sim_input_hand_center(is_left, config != NULL ? config->hand_distance_m : 0.0f, display_h);
-	sd->radius_m = sim_input_hand_radius(display_h);
+	const float distance = config != NULL ? config->hand_distance_m : 0.0f;
+	const float viewer_y = config != NULL ? config->viewer_y_m : 0.0f;
+	const float viewer_z = config != NULL ? config->viewer_z_m : 0.0f;
+	sd->center = sim_input_hand_center(is_left, distance, display_h, viewer_y, viewer_z);
+	sd->radius_m = sim_input_hand_radius(display_h, distance, viewer_z);
 	sd->pinch = config != NULL ? config->pinch : SIM_INPUT_PINCH_WAVE;
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).

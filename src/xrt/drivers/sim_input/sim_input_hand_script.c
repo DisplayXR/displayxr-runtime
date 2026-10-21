@@ -95,26 +95,67 @@ display_height_or_fallback(float display_height_m)
 	return display_height_m;
 }
 
-struct xrt_pose
-sim_input_hand_center(bool left, float distance_m, float display_height_m)
+static void
+viewer_or_fallback(float *viewer_y_m, float *viewer_z_m)
+{
+	if (!(*viewer_z_m > 0.0f) || !isfinite(*viewer_z_m) || !isfinite(*viewer_y_m)) {
+		*viewer_y_m = SIM_INPUT_VIEWER_FALLBACK_Y_M;
+		*viewer_z_m = SIM_INPUT_VIEWER_FALLBACK_Z_M;
+	}
+}
+
+static float
+distance_or_default(float distance_m, float viewer_z_m)
 {
 	if (!(distance_m > 0.0f) || !isfinite(distance_m)) {
 		distance_m = SIM_INPUT_HAND_DISTANCE_DEFAULT_M;
 	}
+	// A hand at or behind the eye has no projection: keep it well in front.
+	const float cap = 0.8f * viewer_z_m;
+	return distance_m < cap ? distance_m : cap;
+}
+
+/*
+ * Perspective factor from the display plane to depth z, seen from an eye at
+ * depth viewer_z: a point at z on the eye->P line is eye + (P - eye) * k.
+ */
+static float
+perspective_k(float distance_m, float viewer_z_m)
+{
+	return (viewer_z_m - distance_m) / viewer_z_m;
+}
+
+struct xrt_pose
+sim_input_hand_center(bool left, float distance_m, float display_height_m, float viewer_y_m, float viewer_z_m)
+{
+	viewer_or_fallback(&viewer_y_m, &viewer_z_m);
+	const float z = distance_or_default(distance_m, viewer_z_m);
 	const float h = display_height_or_fallback(display_height_m);
-	const float lateral = SIM_INPUT_HAND_LATERAL_FRAC * h;
+	const float k = perspective_k(z, viewer_z_m);
+
+	// Target on the display plane, then back along the sightline to depth z.
+	// The viewer's x is ignored on purpose: the nominal viewer is centred,
+	// and the two hands stay symmetric about the display centre.
+	const float px = (left ? -1.0f : 1.0f) * SIM_INPUT_HAND_LATERAL_FRAC * h;
+	const float py = SIM_INPUT_HAND_HEIGHT_FRAC * h;
 	struct xrt_pose p = {
 	    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
-	    .position = {left ? -lateral : lateral, SIM_INPUT_HAND_HEIGHT_FRAC * h, distance_m},
+	    .position = {px * k, viewer_y_m + (py - viewer_y_m) * k, z},
 	};
 	return p;
 }
 
 float
-sim_input_hand_radius(float display_height_m)
+sim_input_hand_radius(float display_height_m, float distance_m, float viewer_z_m)
 {
-	const float r = SIM_INPUT_CIRCLE_RADIUS_FRAC * display_height_or_fallback(display_height_m);
-	return r < SIM_INPUT_CIRCLE_RADIUS_M ? r : SIM_INPUT_CIRCLE_RADIUS_M;
+	float viewer_y_m = 0.0f;
+	viewer_or_fallback(&viewer_y_m, &viewer_z_m);
+	const float z = distance_or_default(distance_m, viewer_z_m);
+	float r = SIM_INPUT_CIRCLE_RADIUS_FRAC * display_height_or_fallback(display_height_m);
+	if (r > SIM_INPUT_CIRCLE_RADIUS_M) {
+		r = SIM_INPUT_CIRCLE_RADIUS_M;
+	}
+	return r * perspective_k(z, viewer_z_m);
 }
 
 void
