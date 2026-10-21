@@ -81,6 +81,33 @@
  * pass reproduces the blit byte-for-byte.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(vk_force_compose_pass, "DXR_VK_FORCE_COMPOSE_PASS", false)
+DEBUG_GET_ONCE_OPTION(atlas_format, "DXR_ATLAS_FORMAT", NULL)
+
+/*!
+ * The atlas format. B8G8R8A8_UNORM unless DXR_ATLAS_FORMAT asks for a deeper one
+ * (experimental, 10-bit path to the panel): `rgb10a2` -> A2B10G10R10_UNORM_PACK32,
+ * `rgba16f` -> R16G16B16A16_SFLOAT. Every consumer reads r->format, and the DP is
+ * told it, so a deeper atlas reaches the weaver intact.
+ */
+static VkFormat
+atlas_format_from_env(void)
+{
+	const char *v = debug_get_option_atlas_format();
+	if (v == NULL || v[0] == '\0') {
+		return VK_FORMAT_B8G8R8A8_UNORM;
+	}
+	VkFormat f = VK_FORMAT_B8G8R8A8_UNORM;
+	if (strcmp(v, "rgb10a2") == 0) {
+		f = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+	} else if (strcmp(v, "rgba16f") == 0) {
+		f = VK_FORMAT_R16G16B16A16_SFLOAT;
+	} else {
+		U_LOG_W("DXR_ATLAS_FORMAT='%s' not recognised (rgb10a2 | rgba16f) - keeping B8G8R8A8", v);
+		return f;
+	}
+	U_LOG_W("DXR_ATLAS_FORMAT=%s: vk_native atlas format %d (experimental)", v, (int)f);
+	return f;
+}
 
 /*!
  * Blend STATES the pass needs — three, not four.
@@ -1011,7 +1038,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	u_color_log_state_once("vk_native");
 
 	r->vk = vk;
-	r->format = VK_FORMAT_B8G8R8A8_UNORM;
+	r->format = atlas_format_from_env();
 	r->tile_columns = 2;
 	r->tile_rows = 1;
 
@@ -3239,8 +3266,23 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		    .dstOffset = {0, 0, 0},
 		    .extent = {r->zone.compose_w, r->zone.compose_h, 1},
 		};
-		vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
-		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		if (r->format == VK_FORMAT_B8G8R8A8_UNORM) {
+			vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		} else {
+			// DXR_ATLAS_FORMAT: the compose target stays BGRA8, so a raw copy would
+			// reinterpret its bits. A UNORM -> UNORM/float blit converts the values
+			// without touching the encoding (no sRGB step on either side).
+			VkImageBlit blit = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .srcOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+			};
+			vk->vkCmdBlitImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			                   VK_FILTER_NEAREST);
+		}
 
 		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,

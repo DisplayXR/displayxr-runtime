@@ -1029,6 +1029,27 @@ d3d11_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_pr
 	}
 }
 
+/*!
+ * The format the DP is told for the SRV it weaves. Historically always RGBA8, and
+ * it stays that for every 8-bit SRV (a zero-copy BGRA / _SRGB app swapchain keeps
+ * the argument it always had). A deeper atlas (DXR_ATLAS_FORMAT) reports its real
+ * format, or the weaver would read 10-bit / float texels as RGBA8.
+ */
+static DXGI_FORMAT
+d3d11_dp_view_format(void *srv_ptr)
+{
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(srv_ptr);
+	if (srv == nullptr) {
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
+	srv->GetDesc(&d);
+	if (d.Format == DXGI_FORMAT_R10G10B10A2_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		return d.Format;
+	}
+	return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
 // #439 Phase 1 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined
 // near the bottom of the file alongside the comp_d3d11_compositor_zone_mask_*
 // entry points, called from the layer-commit paths + destroy above them.
@@ -3044,7 +3065,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	} else {
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
-		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
+		    tile_columns, tile_rows, d3d11_dp_view_format(atlas_srv), target_width, target_height,
 		    eff_canvas.valid ? eff_canvas.x : 0,
 		    eff_canvas.valid ? eff_canvas.y : 0,
 		    eff_canvas.valid ? eff_canvas.w : 0,
@@ -4718,7 +4739,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
-			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
+			    tile_columns, tile_rows, d3d11_dp_view_format(atlas_srv), dp_target_w, dp_target_h,
 			    eff_canvas.valid ? eff_canvas.x : 0,
 			    eff_canvas.valid ? eff_canvas.y : 0,
 			    eff_canvas.valid ? eff_canvas.w : 0,
