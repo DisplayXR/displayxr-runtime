@@ -560,3 +560,35 @@ user's keyboard broken); *releasing only the expired item* (releasing Alt while 
 changes the meaning of what remains — everything goes together); *an event per automatic
 release* (useful, but the completion of the app's next KEY_UP and of every dropped action
 already says what happened — left as an option, spec §11.10).
+
+### D11. Input for the desktop shell, only on explicit request
+
+Version 1's verification has one shape: input goes to a named window, and the pick at the point
+or the keyboard focus must be that window. That shape cannot express "click the dock", "press
+Super with nothing focused", "type into the overview's search" — there is no window to name, so
+every such action is refused. The agent's own helper did them freely.
+
+1. **A reserved target, not a weaker check.** `XR_DESKTOP_TARGET_SHELL_DXR` names the shell as
+   the action's target, and verification runs the other way round: the pick must NOT be an app
+   window, and no app window may hold the keyboard. So the shell target can never be used to
+   reach an app window without naming it — a popup that opens over the dock between the check
+   and the press is refused like any other change of target (the backend's re-check before the
+   press).
+2. **Opt-in per action.** Without the reserved target nothing changes: version 2's refusals stay.
+3. **Every other guard stays**: consent (CONTROL), the kill switch, the lock, the idle wait, the
+   input guard before every batch, the audit (`"target":{"kind":"shell"}`), and the read-only
+   rule — the shell target is input, never a window action.
+4. **The overview is shell, and the shell can hold the keyboard.** On GNOME the overview's
+   window previews are shell actors, and while it is open its search has the keyboard although
+   mutter still calls a window focused. The backend now reports that state (`OverviewActive`):
+   keys for the shell go there, keys for a window are refused instead of landing in the search.
+   Other shell grabs (the Alt+Tab switcher, the run dialog, panel menus) are invisible to a
+   client; they are listed as a known gap, unchanged from version 2.
+5. **A reserved id fails safe on an older runtime**: version 2 finds no window with that id and
+   completes `WINDOW_LOST`. A flag in a chained structure would be ignored by version 2, which
+   would then use whatever window id the app put next to it.
+
+Rejected: *dropping target verification when no window is under the point* (any popup or
+notification appearing there would take the click silently); *a per-app "shell allowed" grant*
+(a standing permission is broader than a per-action request, and nothing in the user's consent
+dialog distinguishes it).

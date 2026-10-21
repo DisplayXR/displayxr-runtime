@@ -751,10 +751,26 @@ gnome_pick(struct u_desktop_backend *b, int32_t x, int32_t y, struct u_desktop_p
 	return gnome_pick_msg(gnome(b), x, y, out, NULL);
 }
 
+bool
+gnome_shell_has_keyboard(struct gnome_backend *g)
+{
+	bool active = false;
+	pthread_mutex_lock(&g->obs_lock);
+	gdbus_get_prop_bool(g->obs, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell", "OverviewActive",
+	                    OBS_TIMEOUT_MS, &active);
+	pthread_mutex_unlock(&g->obs_lock);
+	return active;
+}
+
 enum u_desktop_result
 gnome_focused_window(struct u_desktop_backend *b, uint64_t *out_id)
 {
 	*out_id = 0;
+	if (gnome_shell_has_keyboard(gnome(b))) {
+		// Spec v3: the overview has the keyboard, whatever mutter's focus window is.
+		*out_id = U_DESKTOP_TARGET_SHELL;
+		return U_DESKTOP_OK;
+	}
 	struct u_desktop_window *ws;
 	uint32_t n;
 	enum u_desktop_result r = gnome_snapshot(gnome(b), &ws, &n, NULL);
@@ -906,11 +922,34 @@ gnome_guard_focus(struct gnome_backend *g, const struct u_desktop_input_guard *g
 		gnome_set_msg(msg, "no target window");
 		return U_DESKTOP_ERR_REFUSED;
 	}
+	// Spec v3: the overview holds the keyboard — keys go to its search, not to any
+	// window: right for the shell target, never for a window.
+	bool overview = gnome_shell_has_keyboard(g);
+	if (overview && target != U_DESKTOP_TARGET_SHELL) {
+		gnome_set_msg(msg, "focus moved — the overview is open (keys would go to the shell)");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (overview) {
+		return U_DESKTOP_OK;
+	}
 	struct u_desktop_window *ws;
 	uint32_t n;
 	enum u_desktop_result r = gnome_snapshot(g, &ws, &n, msg);
 	if (r != U_DESKTOP_OK) {
 		return r;
+	}
+	if (target == U_DESKTOP_TARGET_SHELL) {
+		// The shell target: no app window may hold the keyboard.
+		bool any = false;
+		for (uint32_t i = 0; i < n; i++) {
+			any = any || (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) != 0;
+		}
+		free(ws);
+		if (any) {
+			gnome_set_msg(msg, "focus moved — an app window has the keyboard, not the shell");
+			return U_DESKTOP_ERR_REFUSED;
+		}
+		return U_DESKTOP_OK;
 	}
 	bool ok = false;
 	for (uint32_t i = 0; i < n; i++) {
@@ -958,8 +997,7 @@ gnome_guard_point(struct gnome_backend *g,
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
-	if (target == 0 || pk.kind != U_DESKTOP_PICK_WINDOW ||
-	    (pk.window.id != target && pk.window.parent_id != target)) {
+	if (!u_desktop_pick_matches(&pk, target)) { // spec v3: the shell target = no app window there
 		gnome_set_msg(msg, "target no longer under the point");
 		return U_DESKTOP_ERR_REFUSED;
 	}
@@ -1322,7 +1360,9 @@ gnome_type_text(struct u_desktop_backend *b, const struct u_desktop_input_guard 
 		char ftitle[U_DESKTOP_TITLE_SIZE] = "";
 		struct u_desktop_window *ws;
 		uint32_t n;
-		if (gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
+		// Spec v3: text for the shell (the overview's search) is pasted with Ctrl+V and
+		// cannot be confirmed over AT-SPI from here (no window's text field).
+		if (guard->target_id != U_DESKTOP_TARGET_SHELL && gnome_snapshot(g, &ws, &n, NULL) == U_DESKTOP_OK) {
 			for (uint32_t i = 0; i < n; i++) {
 				if (ws[i].state & U_DESKTOP_WINDOW_FOCUSED) {
 					terminal = is_terminal(ws[i].app_id);

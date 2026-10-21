@@ -231,3 +231,6 @@ Needs Accessibility, like §4. Through `desktop_control_probe` against TextEdit 
 | H4 | `button-down` / `move-pointer` / `button-up` in a drawing canvas | a drag through the stops |
 | H5 | ctrl+scroll (`act scroll … sy=-3 mods=ctrl`) with Accessibility zoom on | the screen zooms (the scroll events carry the Control flag) |
 | H6 | kill switch / lock / user typing / 2 s idle / 10 s while a key is held | released each time (as the Windows plan §11) |
+| H7 | `act click target=shell` on a Dock icon and on the menu bar (Apple menu) | the app launches / the menu opens |
+| H8 | `act click target=shell` over a window | `REFUSED "the shell is not under the point (found …)"` |
+| H9 | `act key target=shell keys=super+space` | `FEATURE_UNSUPPORTED` (keys for the shell are not supported on macOS) |

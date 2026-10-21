@@ -242,6 +242,18 @@ Through `desktop_control_probe` (the safety layer) against Notepad (`NP`) unless
 | 11.8 | Elevated foreground (UIPI) and `key-down` | `REFUSED` (`target runs as administrator`), nothing pressed |
 | 11.9 | Kill the probe with a key held | the key stays logically down until pressed physically (an OS limitation: record it) — at most until the user presses it |
 
+### 11b. The shell target (§11.5)
+
+| # | Check | Expected |
+|---|---|---|
+| 11.20 | `act click target=shell` on the Start button / a pinned taskbar icon | Start opens / the app launches |
+| 11.21 | `act click target=shell` on the desktop (all windows minimized) | a click on the desktop (icon selected) |
+| 11.22 | `act click target=shell` over Notepad | `REFUSED "the shell is not under the point (found …)"` |
+| 11.23 | Click the taskbar first (the taskbar is the foreground), then `act key target=shell keys=super` | Start opens |
+| 11.24 | Notepad in the foreground, `act key target=shell keys=super` | `REFUSED "an app window has keyboard focus (notepad.exe) …"` |
+| 11.25 | The same with a Notepad target while the taskbar is the foreground | `REFUSED` (focus) — version 2's behaviour |
+| 11.26 | `act type target=shell text="notepad"` with Start open | typed into Start's search (record whether Start's search is the foreground root and which class it reports) |
+
 ## What to send back
 
 The full stdout of each step, the Windows build (`winver`), the per-monitor scale factors,

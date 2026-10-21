@@ -1636,6 +1636,24 @@ check_focus(const struct u_desktop_input_guard *guard, char *msg)
 		set_msg(msg, "no verified target");
 		return U_DESKTOP_ERR_REFUSED;
 	}
+	if (guard->target_id == U_DESKTOP_TARGET_SHELL) {
+		// Spec v3: keys for the shell go only where no app window has the keyboard —
+		// the taskbar, the desktop, a switcher. A foreground in transition (NULL) is
+		// not known to be the shell.
+		DpiScope dpi;
+		HWND fg = root_of(GetForegroundWindow());
+		if (fg == NULL) {
+			set_msg(msg, "cannot tell which window has the keyboard");
+			return U_DESKTOP_ERR_REFUSED;
+		}
+		wchar_t cls[128];
+		class_of(fg, cls, 128);
+		if (class_is_shell(cls) || class_is_desktop(cls) || !window_is_listable(fg)) {
+			return U_DESKTOP_OK;
+		}
+		set_msg(msg, "focus moved: an app window has the keyboard, not the shell");
+		return U_DESKTOP_ERR_REFUSED;
+	}
 	if (!is_target_or_dialog(root_of(GetForegroundWindow()), to_hwnd(guard->target_id))) {
 		set_msg(msg, "focus moved away from the target window");
 		return U_DESKTOP_ERR_REFUSED;
@@ -1663,6 +1681,16 @@ check_point(const struct u_desktop_input_guard *guard, int32_t x, int32_t y, cha
 	if (!GetCursorPos(&cur) || llabs((long long)cur.x - x) > 2 || llabs((long long)cur.y - y) > 2) {
 		set_msg(msg, "the pointer moved away from the verified point");
 		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (guard->target_id == U_DESKTOP_TARGET_SHELL) {
+		// Spec v3: the shell target — no app window at the point (taskbar, desktop).
+		struct u_desktop_pick p;
+		win32_pick(NULL, x, y, &p);
+		if (!u_desktop_pick_matches(&p, U_DESKTOP_TARGET_SHELL)) {
+			set_msg(msg, "target no longer under the point");
+			return U_DESKTOP_ERR_REFUSED;
+		}
+		return U_DESKTOP_OK;
 	}
 	POINT pt = {x, y};
 	HWND root = root_of(WindowFromPoint(pt));

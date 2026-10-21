@@ -105,6 +105,9 @@ struct u_desktop_fake
 	//! spec v3: like GNOME, a held non-modifier key is auto-repeated as input (every
 	//! repeat resets the idle counter) and holds_repeating_key says so.
 	bool key_repeat;
+	//! spec v3: the shell holds the keyboard (the GNOME overview): focused_window
+	//! reports U_DESKTOP_TARGET_SHELL.
+	bool shell_keyboard;
 };
 
 static struct u_desktop_fake *
@@ -322,27 +325,24 @@ count_call(struct u_desktop_fake *f)
 	os_mutex_unlock(&f->mutex);
 }
 
-//! Keyboard focus is the guard's target or a dialog of it (call with the mutex held).
+//! Keyboard focus is the guard's target or a dialog of it — for the shell target
+//! (spec v3), no app window has it (call with the mutex held).
 static bool
 focus_ok_locked(struct u_desktop_fake *f, uint64_t target)
 {
-	if (f->focus == 0) {
-		return false;
-	}
-	if (f->focus == target) {
-		return true;
-	}
-	int idx = find_index(f, f->focus);
-	return idx >= 0 && f->windows[idx].w.parent_id == target;
+	uint64_t focused = f->shell_keyboard ? U_DESKTOP_TARGET_SHELL : f->focus;
+	int idx = focused != U_DESKTOP_TARGET_SHELL && focused != 0 ? find_index(f, focused) : -1;
+	return u_desktop_focus_matches(target, focused, idx >= 0 ? f->windows[idx].w.parent_id : 0, idx >= 0);
 }
 
-//! The pick at (x, y) is the guard's target or a dialog of it (mutex held).
+//! The pick at (x, y) is the guard's target or a dialog of it — for the shell
+//! target (spec v3), no app window (mutex held).
 static bool
 pick_ok_locked(struct u_desktop_fake *f, uint64_t target, int32_t x, int32_t y)
 {
 	struct u_desktop_pick p;
 	pick_locked(f, x, y, &p);
-	return p.kind == U_DESKTOP_PICK_WINDOW && (p.window.id == target || p.window.parent_id == target);
+	return u_desktop_pick_matches(&p, target);
 }
 
 static const char *
@@ -496,7 +496,7 @@ fake_focused_window(struct u_desktop_backend *b, uint64_t *out_id)
 {
 	struct u_desktop_fake *f = fake(b);
 	os_mutex_lock(&f->mutex);
-	*out_id = f->focus;
+	*out_id = f->shell_keyboard ? U_DESKTOP_TARGET_SHELL : f->focus;
 	os_mutex_unlock(&f->mutex);
 	return U_DESKTOP_OK;
 }
@@ -1712,5 +1712,13 @@ u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat)
 {
 	os_mutex_lock(&f->mutex);
 	f->key_repeat = repeat;
+	os_mutex_unlock(&f->mutex);
+}
+
+void
+u_desktop_fake_set_shell_keyboard(struct u_desktop_fake *f, bool shell)
+{
+	os_mutex_lock(&f->mutex);
+	f->shell_keyboard = shell;
 	os_mutex_unlock(&f->mutex);
 }

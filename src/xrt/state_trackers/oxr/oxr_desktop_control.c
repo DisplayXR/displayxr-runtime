@@ -79,6 +79,7 @@ _Static_assert(U_DESKTOP_MOD_CTRL == 0x1 /* XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR
 _Static_assert(U_DESKTOP_MOD_SHIFT == 0x2 /* XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR */, "modifier mirror");
 _Static_assert(U_DESKTOP_MOD_ALT == 0x4 /* XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR */, "modifier mirror");
 _Static_assert(U_DESKTOP_MOD_SUPER == 0x8 /* XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR */, "modifier mirror");
+_Static_assert(U_DESKTOP_TARGET_SHELL == XR_DESKTOP_TARGET_SHELL_DXR, "shell target mirror");
 
 //! Largest text xrGetDesktopTextAtDXR returns (bytes incl. NUL); longer text is cut on a code point.
 #define TEXT_AT_MAX 16384

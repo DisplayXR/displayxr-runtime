@@ -2779,6 +2779,13 @@ check_focus(struct macos_backend *m, const struct u_desktop_input_guard *guard, 
 	if (r != U_DESKTOP_OK) {
 		return r;
 	}
+	if (guard->target_id == U_DESKTOP_TARGET_SHELL) {
+		// Spec v3: macOS always has a frontmost app taking the keys (Finder at least),
+		// and an unknown focus reads as no window here — keys for "the shell" could land
+		// in an app. Pointer input for the shell (Dock, menu bar, desktop) is supported.
+		set_msg(msg, "keys for the shell: not on macOS (the frontmost app takes them)");
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
 	if (!is_target_or_child(m, focused_wid_ax(m), guard->target_id)) {
 		set_msg(msg, "focus moved: the target window no longer has keyboard focus");
 		return U_DESKTOP_ERR_REFUSED;
@@ -2806,8 +2813,8 @@ check_point(struct macos_backend *m, const struct u_desktop_input_guard *guard, 
 		return U_DESKTOP_ERR_REFUSED;
 	}
 	struct u_desktop_pick p;
-	if (mac_pick(&m->base, x, y, &p) != U_DESKTOP_OK || p.kind != U_DESKTOP_PICK_WINDOW ||
-	    !(p.window.id == guard->target_id || (p.window.parent_id != 0 && p.window.parent_id == guard->target_id))) {
+	// Spec v3: u_desktop_pick_matches also takes the shell target (no app window there).
+	if (mac_pick(&m->base, x, y, &p) != U_DESKTOP_OK || !u_desktop_pick_matches(&p, guard->target_id)) {
 		set_msg(msg, "target no longer under the point");
 		return U_DESKTOP_ERR_REFUSED;
 	}

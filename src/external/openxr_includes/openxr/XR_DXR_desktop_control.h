@@ -54,7 +54,9 @@
  *
  * Spec version 3 (PROPOSED, ADR-056 Amendment 3) adds held input — KEY_DOWN / KEY_UP,
  * BUTTON_DOWN / BUTTON_UP and modifiers around a click, drag or scroll — with every
- * key and button the agent holds released automatically (spec §11). Apps check the
+ * key and button the agent holds released automatically, and input for the desktop
+ * shell itself (XR_DESKTOP_TARGET_SHELL_DXR: the top bar / taskbar, the dock, the
+ * desktop, the overview, keys with no app window focused) (spec §11). Apps check the
  * extension's specVersion before using any of it: a version 2 runtime refuses the new
  * action types, but ignores a chained XrDesktopActionModifiersDXR (OpenXR's rule for
  * unknown structures) and would click without the modifiers.
@@ -105,6 +107,20 @@ extern "C" {
 #define XR_MAX_DESKTOP_MESSAGE_SIZE_DXR 256
 //! Spec version 2: XrDesktopControlParentWindowDXR::parentWindow, terminator included.
 #define XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR 256
+
+/*!
+ * Spec version 3: the reserved XrDesktopActionDXR::targetWindowId of input meant for the
+ * desktop SHELL, not for an app window — the top bar / taskbar, the dock, the desktop
+ * background, the GNOME overview, keys with no app window focused (Super, shell
+ * shortcuts). Input actions only (pointer, keys, text). It is verified the other way
+ * round: the pick at the point must NOT be an app window (shell, desktop, or outside
+ * every monitor — a pointer that cannot get there fails to move), and for keys no app
+ * window may hold the keyboard (nothing focused, or the shell holds it: the overview).
+ * Without it, input where no app window is stays refused, as in version 2 — a version 2
+ * runtime finds no such window and completes the action with
+ * XR_ERROR_DESKTOP_WINDOW_LOST_DXR.
+ */
+#define XR_DESKTOP_TARGET_SHELL_DXR ((uint64_t)0xFFFFFFFFFFFFFFFFull)
 
 /*!
  * Where the app stands with desktop control. Only GRANTED allows operations.
@@ -260,7 +276,8 @@ typedef struct XrDesktopActionDXR {
     XrDesktopActionTypeDXR     actionType;
     //! The window this action is for. Window actions act on it; input actions are
     //! delivered only if it is the window under `point` (pointer actions) or has
-    //! keyboard focus (text / keys) at delivery time.
+    //! keyboard focus (text / keys) at delivery time. Spec version 3: or
+    //! XR_DESKTOP_TARGET_SHELL_DXR (input for the desktop shell, see there).
     uint64_t                   targetWindowId;
     XrRect2Di                  rect;       //!< MOVE_RESIZE
     XrOffset2Di                point;      //!< pointer actions

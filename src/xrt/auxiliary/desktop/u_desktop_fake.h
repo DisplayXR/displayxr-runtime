@@ -308,6 +308,18 @@ u_desktop_fake_set_key_event_supported(struct u_desktop_fake *f, bool supported)
 void
 u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat);
 
+// --- spec v3: the shell target ------------------------------------------------------
+//
+// The fake's shell is its 32 px panel on top (pick SHELL), the desktop is wherever no
+// window is (pick DESKTOP), outside the screen is OUTSIDE. Keys typed with no window
+// focused (u_desktop_fake_set_focus(f, 0)) or while the shell holds the keyboard go to
+// "the shell": the log names the target as 18446744073709551615 (UINT64_MAX).
+
+//! true: the shell holds the keyboard (the GNOME overview) — focused_window reports
+//! U_DESKTOP_TARGET_SHELL whatever window has focus.
+void
+u_desktop_fake_set_shell_keyboard(struct u_desktop_fake *f, bool shell);
+
 #ifdef __cplusplus
 }
 #endif
