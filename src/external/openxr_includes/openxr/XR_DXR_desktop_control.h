@@ -522,9 +522,11 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureImageDXR)(
 //! Spec version 3: the text a successful GET_CLIPBOARD_TEXT action read (two-call idiom,
 //! in bytes, the terminator included: countOutput = length + 1; "" when the clipboard
 //! held no text). Only the most recent successful GET is kept, until a call copies it
-//! out, the next GET completes, the session ends or 10 s pass; a size query or a
-//! too-small buffer (XR_ERROR_SIZE_INSUFFICIENT) keeps it. Any other id:
-//! XR_ERROR_VALIDATION_FAILURE. Clipboard text never reaches a log or the audit.
+//! out, the next GET completes, the session ends, 10 s pass or the state leaves
+//! GRANTED (kill switch, lock, deny, revocation: the text is wiped then, and not handed
+//! out when the grant is back); a size query or a too-small buffer
+//! (XR_ERROR_SIZE_INSUFFICIENT) keeps it. Any other id: XR_ERROR_VALIDATION_FAILURE.
+//! Clipboard text never reaches a log or the audit.
 typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopClipboardTextDXR)(
     XrSession  session,
     uint64_t   actionId,

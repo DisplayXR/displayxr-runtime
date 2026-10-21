@@ -1202,10 +1202,15 @@ paste and its clipboard hand-over (§7, GNOME) are over, and never fights it; a
   1 MiB: `XR_ERROR_LIMIT_REACHED` "the clipboard text is larger than 1048576 bytes" (never cut).
   Not valid UTF-8: `XR_ERROR_RUNTIME_FAILURE`. A NUL inside ends the text (it is a C string).
 - **Retention**, as for capture images (§10.3): only the most recent successful GET's text is
-  kept, until a call copies it out, the next GET completes, the session ends or 10 s pass; a
-  size query or a too-small buffer (`XR_ERROR_SIZE_INSUFFICIENT`) keeps it. Any other id, an
-  expired or an already copied one: `XR_ERROR_VALIDATION_FAILURE`. The memory is wiped when
-  retention ends, and so is a `SET`'s copy once it ran.
+  kept, until a call copies it out, the next GET completes, the session ends, 10 s pass, or the
+  CONTROL state leaves `GRANTED` — the kill switch, a lock, a deny, a revocation (by the OS or
+  the store), anything that ends or pauses the grant, the same events that release held input
+  (§11.3). The worker checks the state every 50 ms while a text is kept, and
+  `xrGetDesktopClipboardTextDXR` checks it before it looks. A size query or a too-small buffer
+  (`XR_ERROR_SIZE_INSUFFICIENT`) keeps it. Any other id, an expired or an already copied one, and
+  one wiped by the state (also after the grant is back): `XR_ERROR_VALIDATION_FAILURE`. The
+  memory is wiped (volatile stores the compiler cannot drop, before `free`) when retention ends,
+  and so is a `SET`'s copy once it ran.
 - **Privacy**: the text never reaches a log, a message or the audit. The audit records
   `clipboard_set` / `clipboard_get` with `bytes` (the size) and the result only; failures read
   as fixed strings ("the clipboard could not be read", …), never a backend's own message.
