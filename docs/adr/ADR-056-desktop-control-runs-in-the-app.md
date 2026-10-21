@@ -604,7 +604,8 @@ never fights a paste in flight and a GET after a user's copy reads the user's co
 
 1. **The text never reaches the audit or a log** — the record has `bytes` and the result; failure
    messages are fixed strings. The runtime keeps a GET's text only until the app copies it out
-   (10 s at most) and wipes it.
+   (10 s at most), never past the grant — the kill switch, a lock, a deny or a revocation wipes
+   it, as they release held input — and wipes it with stores the compiler cannot drop.
 2. **1 MiB, refused beyond, never cut.**
 3. **A SET waits for an idle user** like input does (it changes what the user would paste); a GET
    changes nothing and does not wait.

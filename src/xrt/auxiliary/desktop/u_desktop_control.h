@@ -378,9 +378,12 @@ u_desktop_control_set_hold_timing_for_tests(struct u_desktop_control *c, uint64_
  * xrGetDesktopClipboardTextDXR: the text a successful GET_CLIPBOARD_TEXT action @p id
  * read (two-call idiom, bytes, the terminator included: @p count = length + 1). Only
  * the most recent successful GET is kept, until a call copies it out, the next GET
- * completes, the session ends or 10 s pass; a size query or a too-small buffer
- * (SIZE_INSUFFICIENT) keeps it. Any other id: VALIDATION_FAILURE. The memory is wiped
- * when retention ends.
+ * completes, the session ends, 10 s pass or the CONTROL state leaves GRANTED (the kill
+ * switch, a lock, a deny, a revocation: whatever ends or pauses the grant — seen by
+ * the worker within one poll, and by this call before it looks); a size query or a
+ * too-small buffer (SIZE_INSUFFICIENT) keeps it. Any other id, and a text wiped by
+ * any of these (also once the grant is back): VALIDATION_FAILURE. The memory is wiped
+ * with volatile stores (u_desktop_wipe) before it is freed.
  */
 int32_t
 u_desktop_control_clipboard_text(struct u_desktop_control *c, uint64_t id, uint32_t cap, uint32_t *count, char *buf);
@@ -388,6 +391,21 @@ u_desktop_control_clipboard_text(struct u_desktop_control *c, uint64_t id, uint3
 //! Tests only: shorten the clipboard retention (the spec fixes it at 10 s). 0 keeps it.
 void
 u_desktop_control_set_clipboard_retention_for_tests(struct u_desktop_control *c, uint64_t retention_ns);
+
+//! Tests only: the size (terminator included) of the GET text kept now, 0 for none —
+//! read as it is, without evaluating the state (which may wipe it).
+uint32_t
+u_desktop_control_clipboard_kept_for_tests(struct u_desktop_control *c);
+
+//! Tests only: called with every clipboard text buffer the common layer frees, right
+//! after it was wiped and before free() (@p size bytes, the terminator included).
+typedef void (*u_desktop_clipboard_wipe_fn)(void *ctx, const char *buf, size_t size);
+
+//! Tests only: install @p fn (NULL removes it). Call before the first action.
+void
+u_desktop_control_set_clipboard_wipe_observer_for_tests(struct u_desktop_control *c,
+                                                        u_desktop_clipboard_wipe_fn fn,
+                                                        void *ctx);
 
 
 #ifdef __cplusplus

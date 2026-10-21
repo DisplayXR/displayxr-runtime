@@ -1230,6 +1230,207 @@ TEST_CASE("v3_clipboard: consent, the kill switch, the capability, the idle rule
 	}
 }
 
+namespace {
+
+//! Every clipboard text buffer the common layer wiped and freed (the wipe observer).
+struct WipeLog
+{
+	std::mutex m;
+	std::vector<std::pair<size_t, bool>> seen; //!< size, all zero when it was freed
+
+	static void
+	on_wipe(void *ctx, const char *buf, size_t size)
+	{
+		auto *w = static_cast<WipeLog *>(ctx);
+		bool zero = true;
+		for (size_t i = 0; i < size; i++) {
+			zero = zero && buf[i] == 0;
+		}
+		std::lock_guard<std::mutex> g(w->m);
+		w->seen.push_back({size, zero});
+	}
+
+	//! A buffer of @p size bytes was freed, and it was all zeros by then.
+	bool
+	wiped(size_t size)
+	{
+		std::lock_guard<std::mutex> g(m);
+		for (const auto &s : seen) {
+			if (s.first == size && s.second) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! Every buffer freed so far was all zeros.
+	bool
+	all_zero()
+	{
+		std::lock_guard<std::mutex> g(m);
+		for (const auto &s : seen) {
+			if (!s.second) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+
+//! Wait until no GET text is kept — WITHOUT a call that evaluates the state (that would
+//! wipe it too): the worker has to have done it on its own.
+bool
+kept_gone(u_desktop_control *c, std::chrono::milliseconds timeout = 1000ms)
+{
+	auto end = std::chrono::steady_clock::now() + timeout;
+	while (std::chrono::steady_clock::now() < end) {
+		if (u_desktop_control_clipboard_kept_for_tests(c) == 0) {
+			return true;
+		}
+		std::this_thread::sleep_for(2ms);
+	}
+	return u_desktop_control_clipboard_kept_for_tests(c) == 0;
+}
+
+} // namespace
+
+TEST_CASE("v3_clipboard: a kept text is wiped when the grant ends or pauses, never handed out after",
+          "[desktop][v3][clipboard][privacy]")
+{
+	TempDir dir;
+	Harness h;
+	WipeLog w;
+	u_desktop_control_set_clipboard_wipe_observer_for_tests(h.c, WipeLog::on_wipe, &w);
+	const char *secret = "the user's secret copy";
+	const size_t size = strlen(secret) + 1;
+	u_desktop_fake_set_clipboard(h.fake, secret);
+
+	auto get = [&]() {
+		auto r = h.run(clip_get());
+		REQUIRE(r.result == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_clipboard_kept_for_tests(h.c) == size);
+		return r.id;
+	};
+	// The worker wipes it on its own (no call from the app), zeros before free().
+	auto check_wiped = [&]() {
+		CHECK(kept_gone(h.c));
+		CHECK(w.wiped(size));
+		CHECK(w.all_zero());
+	};
+	// The grant coming back does not bring the text back. (A request first: a no-op
+	// while the grant is back by itself, and the way back where the event ended it.)
+	auto check_not_handed_out = [&](uint64_t id) {
+		REQUIRE(u_desktop_control_request(h.c, "tests") == U_DESKTOP_XR_SUCCESS);
+		REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
+		CHECK(fetch(h.c, id) == "<invalid>");
+		CHECK(u_desktop_control_clipboard_kept_for_tests(h.c) == 0);
+	};
+
+	SECTION("kill switch")
+	{
+		uint64_t id = get();
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		check_wiped();
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		check_not_handed_out(id);
+	}
+	SECTION("lock")
+	{
+		uint64_t id = get();
+		u_desktop_fake_set_locked(h.fake, true);
+		check_wiped();
+		u_desktop_fake_set_locked(h.fake, false);
+		check_not_handed_out(id);
+	}
+	SECTION("deny")
+	{
+		uint64_t id = get();
+		REQUIRE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_DENY, "test"));
+		check_wiped();
+		REQUIRE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_NONE, "test"));
+		check_not_handed_out(id);
+	}
+	SECTION("the OS revokes it")
+	{
+		uint64_t id = get();
+		u_desktop_fake_set_access(h.fake, U_DESKTOP_ACCESS_DENIED);
+		check_wiped();
+		u_desktop_fake_set_access(h.fake, U_DESKTOP_ACCESS_GRANTED);
+		check_not_handed_out(id);
+	}
+	SECTION("revoked mid-session (the backend says NOT_GRANTED)")
+	{
+		uint64_t id = get();
+		u_desktop_fake_set_action_result(h.fake, "type_text", U_DESKTOP_ERR_NOT_GRANTED);
+		u_desktop_action t = act(U_DESKTOP_ACTION_TYPE_TEXT, 101);
+		t.text = "x";
+		CHECK(h.run(t).result == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		u_desktop_fake_set_action_result(h.fake, nullptr, U_DESKTOP_OK);
+		CHECK(u_desktop_control_clipboard_kept_for_tests(h.c) == 0); // wiped as it was revoked
+		CHECK(w.wiped(size));
+		CHECK(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_DENIED);
+		CHECK(fetch(h.c, id) == "<invalid>");
+		check_not_handed_out(id);
+	}
+	SECTION("the store forgets it (a store-remembering backend: Windows)")
+	{
+		u_desktop_fake_set_remembers_in_store(h.fake, true);
+		REQUIRE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_ALLOW, "test"));
+		REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
+		uint64_t id = get();
+		REQUIRE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_NONE, "test"));
+		check_wiped();
+		REQUIRE(u_desktop_policy_set_app(kExe, U_DESKTOP_APP_ALLOW, "test"));
+		check_not_handed_out(id);
+	}
+	SECTION("the session ends")
+	{
+		get();
+		u_desktop_control_destroy(&h.c);
+		CHECK(w.wiped(size));
+		CHECK(w.all_zero());
+	}
+	SECTION("a fetch and the retention's end wipe it too")
+	{
+		uint64_t id = get();
+		CHECK(fetch(h.c, id) == secret);
+		CHECK(w.wiped(size));
+		u_desktop_control_set_clipboard_retention_for_tests(h.c, 100ull * 1000000ull);
+		get();
+		CHECK(kept_gone(h.c));
+		CHECK(w.all_zero());
+		std::lock_guard<std::mutex> g(w.m);
+		CHECK(w.seen.size() == 2);
+	}
+}
+
+TEST_CASE("v3_clipboard: the fetch checks the state itself, before the worker has looked",
+          "[desktop][v3][clipboard][privacy]")
+{
+	TempDir dir;
+	u_desktop_control_timing timing = kFast;
+	timing.idle_poll_ns = 60ull * 1000000000ull; // the worker would not look again for 10 s
+	Harness h(&timing);
+	WipeLog w;
+	u_desktop_control_set_clipboard_wipe_observer_for_tests(h.c, WipeLog::on_wipe, &w);
+	u_desktop_fake_set_clipboard(h.fake, "secret");
+	auto r = h.run(clip_get());
+	REQUIRE(r.result == U_DESKTOP_XR_SUCCESS);
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	std::this_thread::sleep_for(20ms);
+	REQUIRE(u_desktop_control_clipboard_kept_for_tests(h.c) == 7); // still there: nobody looked
+	uint32_t n = 99;
+	CHECK(u_desktop_control_clipboard_text(h.c, r.id, 0, &n, nullptr) == U_DESKTOP_XR_ERROR_VALIDATION_FAILURE);
+	CHECK(n == 0);
+	CHECK(u_desktop_control_clipboard_kept_for_tests(h.c) == 0);
+	CHECK(w.wiped(7));
+	CHECK(w.all_zero());
+	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	REQUIRE(u_desktop_control_request(h.c, "tests") == U_DESKTOP_XR_SUCCESS); // no-op if the grant is back
+	REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
+	CHECK(fetch(h.c, r.id) == "<invalid>");
+}
+
 TEST_CASE("v3_clipboard: the audit has sizes, never the text; backend messages never pass",
           "[desktop][v3][clipboard][audit][privacy]")
 {
