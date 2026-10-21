@@ -520,7 +520,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			b->prepare_input(b, msg);
 			msg[0] = '\0';
 		}
-		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL};
+		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL, NULL};
 		r = b->clipboard_set(b, &g, argv[2], msg);
 		rc = done(r, msg);
 	} else if (strcmp(cmd, "clip-get") == 0) {
@@ -531,7 +531,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			b->prepare_input(b, msg);
 			msg[0] = '\0';
 		}
-		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL};
+		struct u_desktop_input_guard g = {0, smoke_still_allowed, NULL, NULL};
 		char *text = NULL;
 		size_t len = 0;
 		r = b->clipboard_get(b, &g, &text, &len, msg);

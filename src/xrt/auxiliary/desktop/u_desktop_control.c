@@ -2043,7 +2043,7 @@ hold_release_all(struct u_desktop_control *c, const char *why, bool drop)
 	if (c->held_count == 0) {
 		return;
 	}
-	struct u_desktop_input_guard guard = {c->held[0].target, guard_release_ok, NULL};
+	struct u_desktop_input_guard guard = {c->held[0].target, guard_release_ok, NULL, NULL};
 	int32_t px = c->hold_px, py = c->hold_py;
 	if (c->b->get_pointer != NULL) {
 		// Release where the pointer IS: never drag the user's pointer back to ours.
@@ -2238,7 +2238,7 @@ run_key_up(struct u_desktop_control *c, const struct queued_action *qa, int32_t 
 		}
 		return STEP_FAIL;
 	}
-	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL};
+	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL, NULL};
 	uint64_t t0 = injection_begin();
 	enum u_desktop_result r = c->b->key_event(c->b, &guard, &qa->chord, false, false, msg);
 	injection_end(c, t0);
@@ -2270,7 +2270,7 @@ run_button_up(struct u_desktop_control *c, const struct queued_action *qa, int32
 		}
 		return STEP_FAIL;
 	}
-	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL};
+	struct u_desktop_input_guard guard = {c->held[idx].target, guard_release_ok, NULL, NULL};
 	int32_t rx = c->hold_px, ry = c->hold_py;
 	enum step_outcome so = verify_pointer_target(c, a->target_window_id, a->x, a->y, result, msg);
 	if (so == STEP_OK) {
@@ -2399,7 +2399,7 @@ release_mods(struct u_desktop_control *c, uint32_t pressed)
 {
 	static const uint32_t order[4] = {U_DESKTOP_MOD_SUPER, U_DESKTOP_MOD_ALT, U_DESKTOP_MOD_SHIFT,
 	                                  U_DESKTOP_MOD_CTRL};
-	struct u_desktop_input_guard guard = {1, guard_release_ok, NULL};
+	struct u_desktop_input_guard guard = {1, guard_release_ok, NULL, NULL};
 	for (int i = 0; i < 4; i++) {
 		if ((pressed & order[i]) == 0) {
 			continue;
@@ -2504,8 +2504,8 @@ run_clipboard(struct u_desktop_control *c,
 {
 	*no_text = false;
 	const struct u_desktop_action *a = &qa->a;
-	struct guard_ctx g = {c, false, R_OS_GRANTED, 0};
-	struct u_desktop_input_guard guard = {0, guard_still_allowed, &g};
+	struct guard_ctx g = {c, false, R_OS_GRANTED, 0, U_DESKTOP_VERDICT_NONE};
+	struct u_desktop_input_guard guard = {0, guard_still_allowed, &g, NULL};
 	enum u_desktop_result r;
 	*bytes = -1;
 	if (a->type == U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT) {
