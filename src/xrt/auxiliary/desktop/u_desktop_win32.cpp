@@ -687,6 +687,7 @@ struct win32_backend
 		struct u_desktop_chord key;
 		WORD vk;
 		HKL hkl;
+		bool ext; //!< sent with the E0 prefix (the keypad's Enter)
 	} held[16];
 	uint32_t nheld;
 };
@@ -2145,7 +2146,7 @@ win32_key_event(struct u_desktop_backend *b,
 			return U_DESKTOP_OK; // not held by us
 		}
 		INPUT in;
-		key_vk_hkl(&in, wb->held[slot].vk, wb->held[slot].hkl, true);
+		key_vk_hkl(&in, wb->held[slot].vk, wb->held[slot].hkl, true, wb->held[slot].ext);
 		wb->held[slot] = wb->held[--wb->nheld];
 		// Never gated: a release always goes out (retried once, like a chord's).
 		enum u_desktop_result r = send_inputs(&in, 1, msg);
@@ -2168,6 +2169,7 @@ win32_key_event(struct u_desktop_backend *b,
 	}
 	HKL hkl = GetKeyboardLayout(fg != NULL ? GetWindowThreadProcessId(fg, NULL) : 0);
 	WORD vk = 0;
+	bool ext = false;
 	if (key->key[0] == '\0') {
 		switch (key->mods) {
 		case U_DESKTOP_MOD_CTRL: vk = VK_LCONTROL; break;
@@ -2180,7 +2182,7 @@ win32_key_event(struct u_desktop_backend *b,
 		char name[sizeof(key->key) + 1];
 		snprintf(name, sizeof(name), "%.*s", (int)sizeof(key->key), key->key);
 		bool need_shift = false; // modifiers are explicit for a held key
-		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &need_shift, msg);
+		enum u_desktop_result r = resolve_chord_key(name, hkl, &vk, &ext, &need_shift, msg);
 		if (r != U_DESKTOP_OK) {
 			return r;
 		}
@@ -2194,12 +2196,13 @@ win32_key_event(struct u_desktop_backend *b,
 		return r;
 	}
 	INPUT in;
-	key_vk_hkl(&in, vk, hkl, false);
+	key_vk_hkl(&in, vk, hkl, false, ext);
 	r = send_inputs(&in, 1, msg);
 	if (r == U_DESKTOP_OK) {
 		wb->held[wb->nheld].key = *key;
 		wb->held[wb->nheld].vk = vk;
 		wb->held[wb->nheld].hkl = hkl;
+		wb->held[wb->nheld].ext = ext;
 		wb->nheld++;
 	}
 	return r;
@@ -2444,7 +2447,7 @@ win32_destroy(struct u_desktop_backend *b)
 	while (wb->nheld > 0) {
 		wb->nheld--;
 		INPUT in;
-		key_vk_hkl(&in, wb->held[wb->nheld].vk, wb->held[wb->nheld].hkl, true);
+		key_vk_hkl(&in, wb->held[wb->nheld].vk, wb->held[wb->nheld].hkl, true, wb->held[wb->nheld].ext);
 		SendInput(1, &in, sizeof(INPUT));
 	}
 
