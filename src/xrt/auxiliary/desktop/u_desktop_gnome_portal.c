@@ -537,6 +537,9 @@ ei_pump(struct gnome_portal *p)
 					p->devs[i].resumed = type == EIX_EVENT_DEVICE_RESUMED;
 					if (p->devs[i].resumed) {
 						g_ei.device_start_emulating(d, ++p->seq);
+						if (g_ei.device_has_capability(d, EIX_CAP_KEYBOARD)) {
+							p->kbd_resumed_ms = gdbus_now_ms();
+						}
 					}
 				}
 			}

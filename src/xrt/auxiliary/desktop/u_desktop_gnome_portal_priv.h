@@ -154,6 +154,8 @@ struct gnome_portal
 	//! prepare_input keeps the session open at least until then (the common
 	//! layer's verification and idle wait run between prepare and injection).
 	uint64_t hold_until_ms;
+	//! When a keyboard device was last resumed (gdbus_now_ms); 0 = none yet. See GNOME_KEYBOARD_SETTLE_MS.
+	uint64_t kbd_resumed_ms;
 
 	struct ei *ei;
 	bool ei_dead;
