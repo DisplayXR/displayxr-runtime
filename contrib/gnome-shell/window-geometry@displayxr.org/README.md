@@ -178,7 +178,10 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
 window acts on the caller's own window only, and no member that controls
 another app's window will be added — not even behind a flag. An app that must
 act on other windows uses `XR_DXR_desktop_control` (ADR-056), which asks the
-user through the RemoteDesktop portal. See the spec, §12.4.
+user through the RemoteDesktop portal. See the spec, §12.4. Since version 18
+other apps' window **titles** go only to a caller authorised for them (the
+DisplayXR runtime while the user's grant lasts); see version 18 below and the
+spec, §12.5.
 
 - Service `org.displayxr.WindowGeometry`, object
   `/org/displayxr/WindowGeometry`, interface `org.displayxr.WindowGeometry1`.
@@ -347,6 +350,25 @@ user through the RemoteDesktop portal. See the spec, §12.4.
   typed in another app. Not covered: an app summoned by a global shortcut while
   the user is in another app (the press is stamped on that app's window). Same
   method, no new capability bit. See the spec, §11.6.
+- Version 18, `WindowGeometry1`: **window titles only for an authorised
+  caller** — `SetTitleAccess(u pid, b allow) -> (b titles)`. Following the
+  maintainer's direction on DisplayXR/displayxr-unity#389, the extension stops
+  handing other apps' window titles to callers that have not been authorised.
+  `GetWindows`, `GetAllWindows`, `GetPointer`, `GetWindowAt` and
+  `CaptureExclusion1.GetState` put `title` in a window entry only for a bus
+  connection that called `SetTitleAccess(0, true)`; for every other caller the
+  key is absent (`""` still means an untitled window). `WindowsChanged` reaches
+  every listener, so it never carries titles, and no caller gets a title while
+  the screen is locked. `pid` names the caller (0 or its own PID, from the bus
+  daemon); the access is for that one connection, is refused on the lock
+  screen, and ends with `SetTitleAccess(0, false)`, with the connection or with
+  the extension. The DisplayXR runtime asks for it on its desktop-control
+  connection while the user's grant (`XR_DXR_desktop_control`) is GRANTED and
+  hands it back when the grant ends. **Behaviour change:** a runtime older than
+  this one never asks, so its desktop control sees no titles from this version
+  (and its text-at-a-point reads, which find a window by its title, come back
+  empty); an older extension simply has no `SetTitleAccess` and keeps giving
+  titles to everyone. See the spec, §12.5.
 
 Verify the extension survives the lock screen (version 14+): lock from another
 terminal (`loginctl lock-session`) or a remote shell, then
