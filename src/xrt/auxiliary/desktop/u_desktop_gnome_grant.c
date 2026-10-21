@@ -150,6 +150,17 @@ shape_ok(const struct u_desktop_gnome_grant *g)
 	return g->screencast ? (g->screens && !g->devices) : (g->devices || g->screens);
 }
 
+//! Zero memory that held a token. A memset() right before free() or before a buffer
+//! goes out of scope is a dead store the compiler may drop; volatile stores are kept.
+static void
+wipe(void *p, size_t n)
+{
+	volatile unsigned char *v = (volatile unsigned char *)p;
+	while (n-- > 0) {
+		*v++ = 0;
+	}
+}
+
 char *
 u_desktop_gnome_grant_encode(const char *key,
                              const struct u_desktop_gnome_grant *g,
@@ -194,7 +205,7 @@ u_desktop_gnome_grant_encode(const char *key,
 	// cJSON keeps its own copy of the token in the tree: wipe it before freeing.
 	cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
 	if (cJSON_IsString(tok) && tok->valuestring != NULL) {
-		memset(tok->valuestring, 0, strlen(tok->valuestring));
+		wipe(tok->valuestring, strlen(tok->valuestring));
 	}
 	cJSON_Delete(o);
 	if (txt == NULL) {
@@ -209,7 +220,7 @@ u_desktop_gnome_grant_encode(const char *key,
 		out[len] = '\n';
 		out[len + 1] = '\0';
 	}
-	memset(txt, 0, len);
+	wipe(txt, len);
 	cJSON_free(txt);
 	return out;
 }
@@ -293,10 +304,10 @@ u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop
 	st = U_DESKTOP_GNOME_GRANT_OK;
 done:
 	if (cJSON_IsString(tok) && tok->valuestring != NULL) {
-		memset(tok->valuestring, 0, strlen(tok->valuestring));
+		wipe(tok->valuestring, strlen(tok->valuestring));
 	}
 	cJSON_Delete(o);
-	memset(&g, 0, sizeof(g));
+	wipe(&g, sizeof(g));
 	return st;
 }
 
@@ -305,7 +316,7 @@ static void
 free_secret(char *s)
 {
 	if (s != NULL) {
-		memset(s, 0, strlen(s));
+		wipe(s, strlen(s));
 		free(s);
 	}
 }
@@ -361,7 +372,7 @@ u_desktop_gnome_grant_forget(const char *key, const char *token)
 	bool mine =
 	    u_desktop_gnome_grant_decode(txt, key, &g) == U_DESKTOP_GNOME_GRANT_OK && strcmp(g.token, token) == 0;
 	free_secret(txt);
-	memset(&g, 0, sizeof(g));
+	wipe(&g, sizeof(g));
 	return mine && u_desktop_grant_remove(key);
 }
 
@@ -390,7 +401,7 @@ read_info(const char *key, struct u_desktop_gnome_grant_info *info)
 	info->screencast = g.screencast;
 	info->devices = g.devices;
 	info->screens = g.screens;
-	memset(&g, 0, sizeof(g));
+	wipe(&g, sizeof(g));
 	cJSON *o = cJSON_Parse(txt);
 	free_secret(txt);
 	if (cJSON_IsObject(o)) {
@@ -401,7 +412,7 @@ read_info(const char *key, struct u_desktop_gnome_grant_info *info)
 		copy_str(o, "saved", info->saved, sizeof(info->saved));
 		cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
 		if (cJSON_IsString(tok) && tok->valuestring != NULL) {
-			memset(tok->valuestring, 0, strlen(tok->valuestring));
+			wipe(tok->valuestring, strlen(tok->valuestring));
 		}
 	}
 	cJSON_Delete(o);
