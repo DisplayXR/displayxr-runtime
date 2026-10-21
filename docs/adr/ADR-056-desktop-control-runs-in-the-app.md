@@ -94,7 +94,7 @@ Every operation is asynchronous and reports a result; every mutating operation n
 | macOS | AX API + `CGEvent` + ScreenCaptureKit | Accessibility + Screen Recording, granted to the app bundle in System Settings |
 
 The runtime never stores or forwards a grant. A session belongs to the process that opened it
-and dies with it. *(Amendment 2, proposed: on GNOME the runtime keeps the portal's restore token
+and dies with it. *(Amendment 2, accepted 2026-10-21: on GNOME the runtime keeps the portal's restore token
 for the same app across launches, in a private file of that app's; it never forwards it.)*
 
 ### D3. A DisplayXR safety layer, identical on every OS
@@ -404,10 +404,11 @@ on 2026-10-19.
    until one is specified any other prefix is refused, not ignored. The Unity plug-in gets the
    string from `displayxr_linux_window_handle` (displayxr-unity#385).
 
-## Amendment 2 — On GNOME the grant survives a restart of the app (PROPOSED, 2026-10-21)
+## Amendment 2 — On GNOME the grant survives a restart of the app (ACCEPTED, 2026-10-21)
 
-**Status:** Proposed — needs David's decision. Implemented on the branch
-`feat/desktop-control-persist-grant` (spec §6.4); nothing changes on Windows or macOS.
+**Status:** Accepted — David approved it on 2026-10-21, with the kill switch ending running
+grants on every OS (decision 6). Shipped in #2269 (spec §6.4); the saved grant itself changes
+nothing on Windows or macOS.
 
 ### Context
 
@@ -452,7 +453,7 @@ runtime made the product worse on exactly the OS where the dialog is the consent
    token).
 5. **Never forwarded.** The token is used only by the runtime inside the app's own process; it
    is never logged, never sent over IPC or MCP (D4), and each app has its own file.
-6. **The kill switch ends running grants too** (proposed; it was an open question). Turning it on
+6. **The kill switch ends running grants too** (accepted; it was an open question). Turning it on
    increments `kill_switch_count` in the store; every session that sees the count move — even
    after the switch is off again — revokes the scopes its app had requested (`DENIED` until a
    new request) and tells the backend to drop its OS grant (GNOME: close the portal session,
@@ -493,18 +494,17 @@ runtime made the product worse on exactly the OS where the dialog is the consent
 4. **The service keeps the token.** Routes the grant through `displayxr-service` — ruled out by
    D2 and open question 4.
 
-### Proposed in this amendment (were open questions; the maintainer may still change them)
+### Decided in this amendment (were open questions; accepted 2026-10-21)
 
 - The kill switch ends the grant of a process already running (decision 6), on every OS.
 - `displayxr-cli desktop forget <exe>` also removes the saved grants recorded for that
   executable, and `desktop status` lists the saved grants (decision 4).
 
-## Amendment 3 — Held input, the shell target and the clipboard (PROPOSED, 2026-10-21)
+## Amendment 3 — Held input, the shell target and the clipboard (ACCEPTED, 2026-10-21)
 
-**Status:** Proposed — spec version 3, not decided. Implemented on `feat/desktop-control-v3` for
-review (common layer, fake backend, probe, GNOME; Windows and macOS compiled, not yet run on
-hardware). Spec text:
-[`XR_DXR_desktop_control.md` §11](../specs/extensions/XR_DXR_desktop_control.md#11-spec-version-3-proposed).
+**Status:** Accepted — spec version 3, approved by David on 2026-10-21. Shipped in #2271 (common
+layer, fake backend, probe, GNOME; Windows and macOS compiled, not yet run on hardware). Spec
+text: [`XR_DXR_desktop_control.md` §11](../specs/extensions/XR_DXR_desktop_control.md#11-spec-version-3).
 
 **Why an amendment and not a new ADR.** D1 already lists "key chords, pointer
 move/click/drag/scroll" under *input*; what is new is that input can now outlive one action

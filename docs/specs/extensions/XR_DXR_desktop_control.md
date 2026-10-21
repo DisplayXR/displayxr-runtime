@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Name** | `XR_DXR_desktop_control` |
-| **Spec version** | 3 (PROPOSED: held input, the shell target and the clipboard, §11) — 2 (screen capture, §10) is the last decided version |
+| **Spec version** | 3 (held input, the shell target and the clipboard, §11; accepted 2026-10-21) |
 | **Status** | In development (ADR-056) — common layer, OpenXR entry points, `displayxr-cli desktop`, the fake backend and `desktop_control_probe` implemented; OS backends in progress (Windows / macOS / GNOME). Until a backend lands, its OS reports `UNSUPPORTED`. Screen capture (spec version 2, §10, ADR-056 Amendment 1): the common layer, the fake backend, the probe, the CLI and the **GNOME** backend are implemented; GNOME capture awaits its hardware run (gnome test plan §11). Windows and macOS report no CAPTURE capability yet (the CAPTURE scope is `UNSUPPORTED` there). |
 | **Header** | [`XR_DXR_desktop_control.h`](../../../src/external/openxr_includes/openxr/XR_DXR_desktop_control.h) |
 | **Decision** | [ADR-056](../../adr/ADR-056-desktop-control-runs-in-the-app.md) |
@@ -65,7 +65,7 @@ new user gesture.
 
 States 3–5 are re-evaluated at every call and before every action, and a change emits the
 state event, so a kill switch or a lock takes effect on the very next operation. The kill switch
-also **ends** the grant of every running session (§6.4, proposed with ADR-056 Amendment 2): once
+also **ends** the grant of every running session (§6.4, ADR-056 Amendment 2): once
 it is off again the app is `DENIED` until it requests access again.
 
 ## 4. Operations
@@ -239,7 +239,7 @@ app**, not once per launch (ADR-056 Amendment 2) — on every portal that issues
 | verified | the first request of a process that found a saved grant **restores it, with the dialog allowed**: silent where the portal honours the token, else the portal's dialog, whose answer is the request's (a new token replaces the saved one; Cancel removes it) |
 | written | after every successful `Start`, with the token it returned (the portal documents tokens as single use and may hand out a new one per `Start`; xdg-desktop-portal 1.21.1 handed back the same token on every restore in the headless run) |
 | removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant); `displayxr-cli desktop forget <exe>` (the grants recorded for that executable that cover a forgotten scope — one token holds both scopes, so the whole grant goes) |
-| kill switch | ends the grant of every **running** session too, on every OS (proposed): the store's `kill_switch_count` (incremented by every `stop`) moves, so a session sees it even when the switch is off again before it looks; each scope the app had requested is revoked (`DENIED` once the switch is off, until a new request) and the backend drops its OS grant (GNOME: closes the portal session, forgets the restore token). On Windows and macOS that new request is answered without a prompt (the store / the OS still says yes); on GNOME it shows the dialog (the saved grant is gone) |
+| kill switch | ends the grant of every **running** session too, on every OS (ADR-056 Amendment 2): the store's `kill_switch_count` (incremented by every `stop`) moves, so a session sees it even when the switch is off again before it looks; each scope the app had requested is revoked (`DENIED` once the switch is off, until a new request) and the backend drops its OS grant (GNOME: closes the portal session, forgets the restore token). On Windows and macOS that new request is answered without a prompt (the store / the OS still says yes); on GNOME it shows the dialog (the saved grant is gone) |
 
 **The portal stays the judge.** It honours a token only for the app id it bound it to: the
 registered id when the app registered, otherwise one it derives from the launch context — the
@@ -345,7 +345,7 @@ Decisions the sections above leave open, as implemented in `u_desktop_control.c`
   (and do not count as "requested" — after a kill switch is lifted the state is
   `NOT_REQUESTED`, not a stale grant); a remembered store grant announces `GRANTED`; a prompt
   announces `PENDING` and then its answer. A request while `PENDING` is a no-op (never two prompts).
-- The kill switch ends grants (§6.4, proposed): a session that sees the store's
+- The kill switch ends grants (§6.4, ADR-056 Amendment 2): a session that sees the store's
   `kill_switch_count` change marks every scope it had requested as revoked (row 10 `DENIED`
   once the switch is off — before row 8, so a Windows store `allow` does not bring it back
   without a request), audits `revoked` with reason `kill switch`, and calls the backend's
@@ -972,10 +972,10 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   592,704 withheld pixels; a region and the same rect cut from a desktop capture matched
   byte for byte, and so did `screencapture -R` of the same rect.
 
-## 11. Spec version 3 (PROPOSED)
+## 11. Spec version 3
 
-> **PROPOSED — not decided** ([ADR-056 Amendment 3](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-3--held-input-the-shell-target-and-the-clipboard-proposed-2026-10-21)).
-> Implemented on `feat/desktop-control-v3` so it can be reviewed and tried: the common layer,
+> **ACCEPTED 2026-10-21** ([ADR-056 Amendment 3](../../adr/ADR-056-desktop-control-runs-in-the-app.md#amendment-3--held-input-the-shell-target-and-the-clipboard-accepted-2026-10-21)).
+> Implemented (#2271): the common layer,
 > the fake backend, the probe, the smoke tool and the GNOME backend (run in the headless GNOME
 > harness, [GNOME test plan](XR_DXR_desktop_control_gnome_test_plan.md) §12); Windows and macOS
 > are implemented and compiled by CI but not run on hardware yet. §11.10 lists what needs the

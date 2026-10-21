@@ -52,7 +52,7 @@
  * CONTROL = everything in version 1): stills on request, never a stream, never
  * written to disk by the runtime, behind the same kill switch, lock check and audit log.
  *
- * Spec version 3 (PROPOSED, ADR-056 Amendment 3) adds held input — KEY_DOWN / KEY_UP,
+ * Spec version 3 (ADR-056 Amendment 3) adds held input — KEY_DOWN / KEY_UP,
  * BUTTON_DOWN / BUTTON_UP and modifiers around a click, drag or scroll — with every
  * key and button the agent holds released automatically, input for the desktop
  * shell itself (XR_DESKTOP_TARGET_SHELL_DXR: the top bar / taskbar, the dock, the
@@ -92,7 +92,7 @@ extern "C" {
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
 // Spec version 2, continued in a fresh decade (400–409 is full).
 #define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR            ((XrStructureType)1004999420)
-// Spec version 3 (spec §11, ADR-056 Amendment 3, proposed).
+// Spec version 3 (spec §11, ADR-056 Amendment 3).
 #define XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR                 ((XrStructureType)1004999421)
 
 //! The operation is refused by the safety layer (lock screen, kill switch, the
