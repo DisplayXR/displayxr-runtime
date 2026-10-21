@@ -45,7 +45,7 @@ u_desktop_paste_decide(const struct u_desktop_paste_obs *o, bool *restore)
 	bool lost = o->lost_before_key || o->lost_after_key;
 	*restore = !lost;
 	if (o->lost_before_key) {
-		return U_DESKTOP_PASTE_CHANGED_HANDS;
+		return o->replaced ? U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED : U_DESKTOP_PASTE_CHANGED_HANDS;
 	}
 	if (o->lost_after_key) {
 		// The user copied after the keystroke. A field that changed proves
@@ -95,31 +95,35 @@ u_desktop_paste_result(enum u_desktop_paste_verdict v)
 const char *
 u_desktop_paste_message(enum u_desktop_paste_verdict v)
 {
+	// The app's fixed messages (u_desktop.h), word for word: the smoke tool and
+	// the log show what the app is told.
 	switch (v) {
 	case U_DESKTOP_PASTE_DELIVERED: return "";
-	case U_DESKTOP_PASTE_UNVERIFIED:
-		return U_DESKTOP_MSG_UNVERIFIED
-		    "the window read the text after the paste, but no accessible text "
-		    "field confirmed it was inserted (a clipboard manager reads too)";
-	case U_DESKTOP_PASTE_CHANGED_HANDS:
-		return "the clipboard changed hands (the user copied something); nothing was pasted";
-	case U_DESKTOP_PASTE_LOST_UNCERTAIN:
-		return "lost the clipboard during the paste (the user copied something) — whether the text "
-		       "arrived is unknown; the user's clipboard was left as is";
-	case U_DESKTOP_PASTE_NOT_ASKED:
-		return "the focused window did not ask for the pasted text (does it accept text?)";
-	case U_DESKTOP_PASTE_FIELD_UNCHANGED:
-		return "the focused text field did not change — the paste was not seen to arrive";
-	case U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED:
-		return "the clipboard changed hands (the user copied something) just as the agent's text was "
-		       "being offered — nothing was pasted, but the offer had already replaced what the user "
-		       "copied, which is gone (copy it again); the clipboard was released and is empty";
-	case U_DESKTOP_PASTE_LOST_NOT_SERVED:
-		return "the clipboard changed hands right after the paste keystroke (the user copied something) "
-		       "and the agent's text was never read — whatever the window pasted was the user's "
-		       "clipboard, not the agent's text; the user's clipboard was left as is";
+	case U_DESKTOP_PASTE_UNVERIFIED: return U_DESKTOP_MSG_UNVERIFIED U_DESKTOP_VERDICT_MSG_UNVERIFIED_OK;
+	case U_DESKTOP_PASTE_CHANGED_HANDS: return U_DESKTOP_VERDICT_MSG_CLIPBOARD_CHANGED_HANDS;
+	case U_DESKTOP_PASTE_LOST_UNCERTAIN: return U_DESKTOP_VERDICT_MSG_DELIVERY_UNKNOWN;
+	case U_DESKTOP_PASTE_NOT_ASKED: return U_DESKTOP_VERDICT_MSG_NOT_ASKED;
+	case U_DESKTOP_PASTE_FIELD_UNCHANGED: return U_DESKTOP_VERDICT_MSG_NOT_DELIVERED;
+	case U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED: return U_DESKTOP_VERDICT_MSG_USER_COPY_LOST_RELEASED;
+	case U_DESKTOP_PASTE_LOST_NOT_SERVED: return U_DESKTOP_VERDICT_MSG_PASTED_USER_CLIPBOARD;
 	}
 	return "";
+}
+
+enum u_desktop_input_verdict
+u_desktop_paste_input_verdict(enum u_desktop_paste_verdict v)
+{
+	switch (v) {
+	case U_DESKTOP_PASTE_DELIVERED: return U_DESKTOP_VERDICT_NONE;
+	case U_DESKTOP_PASTE_UNVERIFIED: return U_DESKTOP_VERDICT_UNVERIFIED_OK;
+	case U_DESKTOP_PASTE_CHANGED_HANDS: return U_DESKTOP_VERDICT_CLIPBOARD_CHANGED_HANDS;
+	case U_DESKTOP_PASTE_LOST_UNCERTAIN: return U_DESKTOP_VERDICT_DELIVERY_UNKNOWN;
+	case U_DESKTOP_PASTE_NOT_ASKED: return U_DESKTOP_VERDICT_NOT_ASKED;
+	case U_DESKTOP_PASTE_FIELD_UNCHANGED: return U_DESKTOP_VERDICT_NOT_DELIVERED;
+	case U_DESKTOP_PASTE_CHANGED_HANDS_REPLACED: return U_DESKTOP_VERDICT_USER_COPY_LOST_RELEASED;
+	case U_DESKTOP_PASTE_LOST_NOT_SERVED: return U_DESKTOP_VERDICT_PASTED_USER_CLIPBOARD;
+	}
+	return U_DESKTOP_VERDICT_NONE;
 }
 
 void

@@ -131,7 +131,7 @@ guard_for_focus(struct u_desktop_backend *b)
 	if (id == 0 && b->focused_window) {
 		b->focused_window(b, &id);
 	}
-	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL, NULL};
 	return g;
 }
 static struct u_desktop_input_guard
@@ -142,7 +142,7 @@ guard_for_point(struct u_desktop_backend *b, int32_t x, int32_t y)
 	if (id == 0 && b->pick && b->pick(b, x, y, &p) == U_DESKTOP_OK && p.kind == U_DESKTOP_PICK_WINDOW) {
 		id = p.window.id;
 	}
-	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+	struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL, NULL};
 	return g;
 }
 
@@ -270,7 +270,7 @@ run_cmd(struct u_desktop_backend *b, int argc, char **argv)
 			rect.w = argc > 6 ? atoi(argv[6]) : 0;
 			rect.h = argc > 7 ? atoi(argv[7]) : 0;
 		}
-		struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL};
+		struct u_desktop_input_guard g = {id, smoke_still_allowed, NULL, NULL};
 		if (b->prepare_input) {
 			b->prepare_input(b, msg);
 		}

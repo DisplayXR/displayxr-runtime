@@ -240,7 +240,9 @@ agent's text was read). Delivery: when the focused window exposes a focused text
 over AT-SPI, the action succeeds only if that field changed; otherwise a read of the agent's
 text after the keystroke is the only evidence, and **a clipboard manager reads too** — so the
 action succeeds with the message `"ok (unverified: …)"` (same `XR_SUCCESS`; no new result
-code). No read at all fails ("the focused window did not ask for the pasted text").
+code). No read at all fails ("the focused window did not ask for the pasted text"). Each of
+these outcomes reaches the app as its own fixed message, word for word as quoted here (§9,
+"Keyboard verdicts").
 
 ## 8. Not in v1
 
@@ -326,7 +328,7 @@ code point; the common layer drops the incomplete tail (`u_desktop_utf8_trim_par
   `"target window does not have focus — ACTIVATE it first"`,
   `"the target window no longer exists"`; success is `"ok"`, or `"ok (unverified: <reason>)"`
 when the backend delivered but could not confirm the effect (today: GNOME text with no
-accessible text field). A state that is not
+accessible text field — a fixed string, see the verdict table below). A state that is not
   granted for any other reason completes with `XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR`
   `"desktop control is not granted (state <STATE>)"`.
 - Backend errors map to: `UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED`, `NOT_GRANTED` →
@@ -334,10 +336,28 @@ accessible text field). A state that is not
   `…_WINDOW_LOST_DXR`, `REFUSED` → `…_REFUSED_DXR`, `TIMEOUT` / `FAILED` →
   `XR_ERROR_RUNTIME_FAILURE`.
 - **Privacy:** for `TYPE_TEXT` and `KEY_CHORD` a backend's own message is never passed on.
-  Every outcome maps to a fixed string: `REFUSED` → `"focus moved"` (or the guard's reason),
-  `NOT_GRANTED` → `"the OS refused: permission missing or revoked"`, `UNSUPPORTED` →
-  `"this desktop backend cannot deliver this input"`, `WINDOW_LOST` →
+  Every outcome maps to a fixed string: `OK` → `"ok"`, `REFUSED` → `"focus moved"` (or the
+  guard's reason), `NOT_GRANTED` → `"the OS refused: permission missing or revoked"`,
+  `UNSUPPORTED` → `"this desktop backend cannot deliver this input"`, `WINDOW_LOST` →
   `"the target window no longer exists"`, anything else → `"the input could not be delivered"`.
+- **Keyboard verdicts.** A backend that knows more than its result says reports a *verdict*
+  with it (`enum u_desktop_input_verdict`, set through the input guard), and the action
+  completes with that verdict's own fixed string instead — the `XrResult` stays the result's.
+  These strings never contain any text, are stable, and an app may match them exactly. Each
+  verdict belongs to one result; one reported with any other result is ignored (the plain
+  string above stands). A guard stop still reads as its reason. Today only the GNOME paste
+  (§7) reports verdicts; Windows and macOS report none, so their text and chords complete
+  with the plain strings above.
+
+  | verdict | `XrResult` | message | what it tells the agent |
+  |---|---|---|---|
+  | `UNVERIFIED_OK` | `XR_SUCCESS` | `"ok (unverified: the window read the text after the paste, but no accessible text field confirmed it was inserted (a clipboard manager reads too))"` | probably arrived; look at the target if it matters |
+  | `CLIPBOARD_CHANGED_HANDS` | `…_REFUSED_DXR` | `"the clipboard changed hands (the user copied something); nothing was pasted"` | nothing pasted, the user's clipboard is theirs; retry later |
+  | `USER_COPY_LOST_RELEASED` | `…_REFUSED_DXR` | `"the clipboard changed hands (the user copied something) just as the agent's text was being offered — nothing was pasted, but the offer had already replaced what the user copied, which is gone (copy it again); the clipboard was released and is empty"` | nothing pasted; the user's last copy is gone — tell the user |
+  | `PASTED_USER_CLIPBOARD` | `XR_ERROR_RUNTIME_FAILURE` | `"the clipboard changed hands right after the paste keystroke (the user copied something) and the agent's text was never read — whatever the window pasted was the user's clipboard, not the agent's text; the user's clipboard was left as is"` | the target may now hold the user's clipboard, not the agent's text: check (undo) before retrying |
+  | `DELIVERY_UNKNOWN` | `XR_ERROR_RUNTIME_FAILURE` | `"lost the clipboard during the paste (the user copied something) — whether the text arrived is unknown; the user's clipboard was left as is"` | the text may or may not be there: check before retrying |
+  | `NOT_ASKED` | `XR_ERROR_RUNTIME_FAILURE` | `"the focused window did not ask for the pasted text (does it accept text?)"` | nothing arrived; the focused window takes no text |
+  | `NOT_DELIVERED` | `XR_ERROR_RUNTIME_FAILURE` | `"the focused text field did not change — the paste was not seen to arrive"` | the field did not change; retry or check |
 - On session destroy an action mid-flight finishes its current backend call and stops (audited
   as `aborted`, no event).
 

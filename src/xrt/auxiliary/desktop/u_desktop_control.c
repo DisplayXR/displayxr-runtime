@@ -1445,6 +1445,8 @@ struct guard_ctx
 	bool stopped;    //!< still_allowed returned false at least once
 	enum reason why; //!< ... and why
 	uint32_t calls;  //!< how often the backend asked (tests / diagnostics)
+	//! A keyboard action's verdict (u_desktop_input_guard::verdict points here).
+	enum u_desktop_input_verdict verdict;
 };
 
 //! Kill switch (store stamp), unreadable store, deny, lock, revocation, destroy.
@@ -1493,11 +1495,84 @@ guard_still_allowed(void *ctx)
 	return ok;
 }
 
+int32_t
+u_desktop_control_keyboard_outcome(enum u_desktop_result r, enum u_desktop_input_verdict v, const char **msg)
+{
+	// The result's own fixed message and XrResult.
+	const char *fixed;
+	int32_t x;
+	switch (r) {
+	case U_DESKTOP_OK:
+		fixed = "ok";
+		x = U_DESKTOP_XR_SUCCESS;
+		break;
+	case U_DESKTOP_ERR_REFUSED:
+		fixed = "focus moved";
+		x = U_DESKTOP_XR_ERROR_REFUSED;
+		break;
+	case U_DESKTOP_ERR_NOT_GRANTED:
+		fixed = "the OS refused: permission missing or revoked";
+		x = U_DESKTOP_XR_ERROR_NOT_GRANTED;
+		break;
+	case U_DESKTOP_ERR_UNSUPPORTED:
+		fixed = "this desktop backend cannot deliver this input";
+		x = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
+		break;
+	case U_DESKTOP_ERR_WINDOW_LOST:
+		fixed = "the target window no longer exists";
+		x = U_DESKTOP_XR_ERROR_WINDOW_LOST;
+		break;
+	default:
+		fixed = "the input could not be delivered";
+		x = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
+		break;
+	}
+	// The verdict's message instead, when the verdict belongs to this result
+	// (u_desktop.h). The XrResult stays the result's.
+	enum u_desktop_result belongs = U_DESKTOP_OK;
+	const char *vm = NULL;
+	switch (v) {
+	case U_DESKTOP_VERDICT_UNVERIFIED_OK:
+		belongs = U_DESKTOP_OK;
+		vm = "ok (unverified: " U_DESKTOP_VERDICT_MSG_UNVERIFIED_OK ")";
+		break;
+	case U_DESKTOP_VERDICT_CLIPBOARD_CHANGED_HANDS:
+		belongs = U_DESKTOP_ERR_REFUSED;
+		vm = U_DESKTOP_VERDICT_MSG_CLIPBOARD_CHANGED_HANDS;
+		break;
+	case U_DESKTOP_VERDICT_USER_COPY_LOST_RELEASED:
+		belongs = U_DESKTOP_ERR_REFUSED;
+		vm = U_DESKTOP_VERDICT_MSG_USER_COPY_LOST_RELEASED;
+		break;
+	case U_DESKTOP_VERDICT_PASTED_USER_CLIPBOARD:
+		belongs = U_DESKTOP_ERR_FAILED;
+		vm = U_DESKTOP_VERDICT_MSG_PASTED_USER_CLIPBOARD;
+		break;
+	case U_DESKTOP_VERDICT_DELIVERY_UNKNOWN:
+		belongs = U_DESKTOP_ERR_FAILED;
+		vm = U_DESKTOP_VERDICT_MSG_DELIVERY_UNKNOWN;
+		break;
+	case U_DESKTOP_VERDICT_NOT_ASKED:
+		belongs = U_DESKTOP_ERR_FAILED;
+		vm = U_DESKTOP_VERDICT_MSG_NOT_ASKED;
+		break;
+	case U_DESKTOP_VERDICT_NOT_DELIVERED:
+		belongs = U_DESKTOP_ERR_FAILED;
+		vm = U_DESKTOP_VERDICT_MSG_NOT_DELIVERED;
+		break;
+	default: break; // NONE, or a value this layer does not know: the result's message
+	}
+	*msg = vm != NULL && belongs == r ? vm : fixed;
+	return x;
+}
+
 /*!
  * Result of an injecting backend call, with a message the common layer chose.
  * For text and chords a backend's own message is never passed on (it could name
- * a character): every outcome maps to a fixed string. A guard stop always reads
- * as its reason ("kill switch", "screen locked", ...).
+ * a character): every outcome maps to a fixed string, the result's or that of the
+ * verdict the backend reported (u_desktop_control_keyboard_outcome). A guard stop
+ * always reads as its reason ("kill switch", "screen locked", ...). A success's
+ * message is run_action's (it is "ok" unless the backend said more).
  */
 static int32_t
 injection_result(
@@ -1522,29 +1597,8 @@ injection_result(
 	}
 	if (is_keyboard_action(type)) {
 		const char *fixed;
-		int32_t x;
-		switch (r) {
-		case U_DESKTOP_ERR_REFUSED:
-			fixed = "focus moved";
-			x = U_DESKTOP_XR_ERROR_REFUSED;
-			break;
-		case U_DESKTOP_ERR_NOT_GRANTED:
-			fixed = "the OS refused: permission missing or revoked";
-			x = U_DESKTOP_XR_ERROR_NOT_GRANTED;
-			break;
-		case U_DESKTOP_ERR_UNSUPPORTED:
-			fixed = "this desktop backend cannot deliver this input";
-			x = U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED;
-			break;
-		case U_DESKTOP_ERR_WINDOW_LOST:
-			fixed = "the target window no longer exists";
-			x = U_DESKTOP_XR_ERROR_WINDOW_LOST;
-			break;
-		default:
-			fixed = "the input could not be delivered";
-			x = U_DESKTOP_XR_ERROR_RUNTIME_FAILURE;
-			break;
-		}
+		enum u_desktop_input_verdict v = g != NULL ? g->verdict : U_DESKTOP_VERDICT_NONE;
+		int32_t x = u_desktop_control_keyboard_outcome(r, v, &fixed);
 		snprintf(msg, MSG_CAP, "%s", fixed);
 		return x;
 	}
@@ -1740,6 +1794,9 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 	struct u_desktop_window target_copy;
 	const struct u_desktop_window *target = NULL;
 	enum step_outcome so;
+	// The input guard's context (step 5); out here because a keyboard action's
+	// success message comes from its verdict (below, after "done").
+	struct guard_ctx g = {c, false, R_OS_GRANTED, 0, U_DESKTOP_VERDICT_NONE};
 
 	// 1. State.
 	so = check_state(c, &result, msg);
@@ -1822,8 +1879,7 @@ run_action(struct u_desktop_control *c, const struct queued_action *qa)
 
 	// 5. Execute, under the input guard: the backend repeats the verification
 	// and the kill-switch / lock check before every injection batch.
-	struct guard_ctx g = {c, false, R_OS_GRANTED, 0};
-	struct u_desktop_input_guard guard = {a->target_window_id, guard_still_allowed, &g};
+	struct u_desktop_input_guard guard = {a->target_window_id, guard_still_allowed, &g, &g.verdict};
 	msg[0] = '\0';
 	so = execute(c, qa, &guard, &g, &result, msg);
 
@@ -1835,9 +1891,17 @@ done:
 	}
 	if (result == U_DESKTOP_XR_SUCCESS) {
 		// "ok", or "ok (unverified: …)" when the backend could not confirm the
-		// effect (U_DESKTOP_MSG_UNVERIFIED) — same success code either way.
+		// effect — same success code either way. Text and chords: only from the
+		// verdict, a fixed string (a backend's message is never passed on);
+		// anything else: from the backend's U_DESKTOP_MSG_UNVERIFIED message.
 		char ok[sizeof(msg)];
-		u_desktop_success_message(msg, ok, sizeof(ok));
+		if (is_keyboard_action(a->type)) {
+			const char *fixed;
+			u_desktop_control_keyboard_outcome(U_DESKTOP_OK, g.verdict, &fixed);
+			snprintf(ok, sizeof(ok), "%s", fixed);
+		} else {
+			u_desktop_success_message(msg, ok, sizeof(ok));
+		}
 		snprintf(msg, sizeof(msg), "%s", ok);
 	}
 	os_mutex_lock(&c->mutex);

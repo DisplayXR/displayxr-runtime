@@ -242,6 +242,16 @@ bool
 u_desktop_control_validate(const struct u_desktop_action *a, char *why, size_t why_cap);
 
 /*!
+ * How a keyboard action (TYPE_TEXT, KEY_CHORD) completes when the backend returned
+ * @p r with verdict @p v: the XrResult (that of @p r) and, in @p msg, a FIXED message —
+ * never the backend's own (u_desktop.h "Privacy"). A verdict that does not belong to
+ * @p r, or NONE, leaves the result's plain message ("ok", "focus moved", ...). A guard
+ * stop (kill switch, lock, ...) is not decided here: it reads as its reason.
+ */
+int32_t
+u_desktop_control_keyboard_outcome(enum u_desktop_result r, enum u_desktop_input_verdict v, const char **msg);
+
+/*!
  * Length of @p s[0..len) without a trailing, incomplete UTF-8 sequence (a code
  * point cut by a full buffer). Never splits a complete code point.
  */
