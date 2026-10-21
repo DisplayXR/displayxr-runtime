@@ -1083,8 +1083,8 @@ TEST_CASE("v3_clipboard: validation", "[desktop][v3][clipboard][validate]")
 	CHECK_FALSE(valid(clip_set("")));
 	CHECK_FALSE(valid(clip_set(nullptr)));
 	CHECK_FALSE(valid(clip_set("bad \xff utf-8")));
-	std::string max(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'x');
-	CHECK(valid(clip_set(max.c_str())));
+	std::string at_limit(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'x');
+	CHECK(valid(clip_set(at_limit.c_str())));
 	std::string over(U_DESKTOP_CLIPBOARD_MAX_BYTES + 1, 'x');
 	CHECK_FALSE(valid(clip_set(over.c_str())));
 	// Every other action still needs a target.
@@ -1113,8 +1113,8 @@ TEST_CASE("v3_clipboard: set, get, the user's copy wins, the two-call fetch and 
 	uint32_t n = 0;
 	CHECK(u_desktop_control_clipboard_text(h.c, id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
 	CHECK(n == strlen("from the agent — ünïcode") + 1);
-	char small[4];
-	CHECK(u_desktop_control_clipboard_text(h.c, id, sizeof(small), &n, small) == U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT);
+	char tiny[4];
+	CHECK(u_desktop_control_clipboard_text(h.c, id, sizeof(tiny), &n, tiny) == U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT);
 	CHECK(fetch(h.c, id) == "from the agent — ünïcode");
 	CHECK(fetch(h.c, id) == "<invalid>");      // already copied out
 	CHECK(fetch(h.c, id + 100) == "<invalid>"); // never a GET
@@ -1150,8 +1150,8 @@ TEST_CASE("v3_clipboard: no text, too large, not UTF-8", "[desktop][v3][clipboar
 	CHECK(r.message == "ok (the clipboard holds no text)");
 	CHECK(fetch(h.c, id) == "");
 
-	std::string max(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'y');
-	u_desktop_fake_set_clipboard(h.fake, max.c_str());
+	std::string at_limit(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'y');
+	u_desktop_fake_set_clipboard(h.fake, at_limit.c_str());
 	id = h.submit(clip_get());
 	REQUIRE(h.rec.wait_done(2));
 	CHECK(h.rec.completion(id).result == U_DESKTOP_XR_SUCCESS);
