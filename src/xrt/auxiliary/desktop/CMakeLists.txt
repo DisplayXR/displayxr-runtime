@@ -25,6 +25,8 @@ add_library(
 	u_desktop_control.h
 	u_desktop_fake.c
 	u_desktop_fake.h
+	u_desktop_gnome_grant.c
+	u_desktop_gnome_grant.h
 	u_desktop_gnome_logic.c
 	u_desktop_gnome_logic.h
 	u_desktop_macos_logic.c

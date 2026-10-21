@@ -183,7 +183,43 @@ Typed text is **never** logged — only its length. Consent decisions (`request`
 
 `displayxr-cli desktop status | stop | resume | allow <exe> | deny <exe> | forget <exe> |
 audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `resume` flip
-`suspended` (the kill switch); a running session sees it on its next call.
+`suspended` (the kill switch); a running session sees it on its next call. `stop` also
+removes every saved OS grant (§6.4); `status` shows how many there are and where.
+
+### 6.4 Saved OS grants (GNOME)
+
+On GNOME the OS consent is the RemoteDesktop / ScreenCast portal dialog, and the portal hands
+the app a **restore token** for the grant (`persist_mode` 2). Passing it back restores the grant
+without the dialog. The GNOME backend saves that token so that the dialog appears **once per
+app**, not once per launch (ADR-056 Amendment 2):
+
+| | |
+|---|---|
+| what | the restore token and the grant's shape: which portal issued it (RemoteDesktop or a standalone ScreenCast), whether it covers input and the screens, and the connectors of the monitors it covered |
+| key | the app id that `org.freedesktop.host.portal.Registry.Register` **accepted** (from `DXR_DESKTOP_APP_ID`, else the basename of `GIO_LAUNCHED_DESKTOP_FILE`) — the id the portal binds the token to. xdg-desktop-portal accepts an id only when a `<app id>.desktop` file is installed (it looks up the app's info: "App info not found" otherwise) |
+| where | `$XDG_STATE_HOME/displayxr/desktop-control/<app id>.json` (default `~/.local/state/displayxr/desktop-control/`); `$DXR_DESKTOP_CONTROL_DIR/desktop-control/` when that override is set |
+| how | directory 0700 (tightened when looser), file 0600, written atomically (an `O_EXCL` temp file, `fsync`, `rename`); read only when it is a regular file of this user (not a symlink) with no group / other bits, in a directory nobody else can write; never logged |
+| read | at the app's first request or restore in a process; again before every later restore (another process of the same app may have renewed it, spending the old one) |
+| written | after every successful `Start`, with the token it returned (the portal documents tokens as single use and may hand out a new one per `Start`; xdg-desktop-portal 1.21.1 handed back the same token on every restore in the headless run) |
+| removed | the user declines a dialog that had no grant to keep; the user declines an `ASK_AGAIN` (§10.2); a restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant) |
+| not saved | without an app id the portal accepted (none set, no installed `.desktop` file for it, or xdg-desktop-portal < 1.19): the portal then attributes the session by the process's systemd scope — the terminal, IDE or launcher that started it (seen in the headless run: `com.microsoft.VSCode`) — or to no app, so the token is not the app's; nothing is saved and every new process asks again, as before |
+
+A process whose saved grant is removed under it (the kill switch, by hand) keeps its grant in
+memory until it exits, as before, but never writes the file again: after a kill switch the next
+**launch** of every app asks again. A request finds a saved grant without asking the portal, so
+an approval the user withdrew in GNOME Settings shows up at the first action: that restore is
+not silent, its dialog is closed at once, the action completes `NOT_GRANTED`, the file is
+removed, and the next request shows the dialog (exactly what happens in a process that already
+held the grant).
+
+**What a saved grant gives away.** The token on disk lets any process of the same user that can
+claim the same app id — call `Registry.Register` with it — restore the grant silently. The portal
+binds the token to that app id: a process registered under another id, a sandboxed app, or
+another user cannot use it. Same-user processes are not a security boundary on the desktop (they
+can read the app's files and, with `ptrace` permitted, its memory); the in-memory token of
+version 1 was safe from a same-user process only where Yama `ptrace_scope` ≥ 1 (Ubuntu's
+default). The kill switch, `ASK_AGAIN`, the indicator's Stop and GNOME Settings each end the
+grant.
 
 ## 7. Backends
 
@@ -195,7 +231,7 @@ audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `re
 | window ops | `SetForegroundWindow` (+ attach-input), `SetWindowPos`, `ShowWindow`, `WM_CLOSE` | AX raise / position / size / minimized / close button | portal input as the user would: Super+click to activate, mutter keybindings, Super+drag with read-back |
 | text | `SendInput` `KEYEVENTF_UNICODE` | `CGEventKeyboardSetUnicodeString` | portal clipboard + Ctrl+V (Ctrl+Shift+V in terminals) |
 | keys / pointer | `SendInput` | `CGEvent` | libei (from the portal's `ConnectToEIS`) |
-| consent | DisplayXR dialog (store) | `AXIsProcessTrustedWithOptions` + `CGRequestScreenCaptureAccess` | RemoteDesktop portal, `persist_mode` 2, restore token kept in memory per session |
+| consent | DisplayXR dialog (store) | `AXIsProcessTrustedWithOptions` + `CGRequestScreenCaptureAccess` | RemoteDesktop portal, `persist_mode` 2, restore token saved per registered app id (§6.4; in memory only without one) |
 | lock | `OpenInputDesktop` fails / WTS session locked | `CGSessionCopyCurrentDictionary` `CGSSessionScreenIsLocked` | `org.gnome.ScreenSaver.GetActive` |
 | idle | `GetLastInputInfo` | `CGEventSourceSecondsSinceLastEventType` | `org.gnome.Mutter.IdleMonitor.GetIdletime` |
 
@@ -358,9 +394,9 @@ accessible text field). A state that is not
   rename; the rename is still retried for up to ~1 s on a sharing violation / access denied
   (antivirus, indexers). `displayxr-cli desktop stop` exits non-zero with "could not save the
   kill switch — is the store locked?" if it still fails.
-- `DXR_DESKTOP_CONTROL_DIR` overrides both the store and the audit directory; the runtime logs a
-  WARN once per process when it does, and `desktop status` prints the override and the store
-  path in use.
+- `DXR_DESKTOP_CONTROL_DIR` overrides the store, the audit directory and the saved-grant
+  directory (`<dir>/desktop-control/`, §6.4); the runtime logs a WARN once per process when it
+  does, and `desktop status` prints the override and the paths in use.
 - Audit records: `t`, `exe`, `pid`, `action`, `target` (`id`, `app`, `title`), `x`/`y` for
   pointer actions, `chars` (code points) for `type_text`, `result`, `message` on failure,
   `reason` on `request`, and `by` + `subject` for store changes (`allow` / `deny` / `forget` /
@@ -536,7 +572,11 @@ scopes. Rows 8–10 read that scope's own grant:
   Asking for a scope later opens a **new** combined session, and the dialog asks about input
   again (a restore token cannot be widened). Apps that will capture should ask for both
   scopes in their first request. A silent restore that fails (revoked, or the shared
-  monitors changed) puts **both** scopes in `DENIED`, as in v1.
+  monitors changed) puts **both** scopes in `DENIED`, as in v1. A declined `ASK_AGAIN` (the
+  user cancels the dialog) is that answer: the grant it would have replaced is dropped (both of
+  its scopes `DENIED`, its saved copy removed, §6.4); a declined request that only **adds** a
+  scope keeps the old grant. The grant outlives the process for an app with a registered app
+  id (§6.4).
 - **Windows.** The existing consent MessageBox. Its text lists only the scopes asked for
   ("see your screen", "type and click in other apps"). The answer is stored per scope (§10.6).
 - **macOS.** CAPTURE's OS grant is Screen Recording (`CGPreflightScreenCaptureAccess`,
@@ -789,10 +829,15 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   (frame px ÷ stream size); lower-density monitors are sampled up (nearest).
 - **Never downgrade.** xdg-desktop-portal-gnome restores exactly the shape a token was issued
   for. A grant that covers the screens is restored with `SelectSources` every time — for input
-  actions too, and even in a process without libpipewire. A request that adds a scope (or
-  ASK_AGAIN) opens a new combined session interactively, asking for the screens again whenever
-  the old grant had them; the old token is not passed (so not consumed) and is put back if the
-  dialog fails.
+  actions too, and even in a process without libpipewire, and in a NEW process of the app (the
+  saved grant carries its shape, §6.4). A request that adds a scope (or ASK_AGAIN) opens a new
+  combined session interactively, asking for the screens again whenever the old grant had them;
+  the old token is not passed (so not consumed) and is put back if the dialog fails — except
+  after a declined ASK_AGAIN, whose answer replaces the grant (§10.2).
+- **Saved grant (§6.4).** Per registered app id, `u_desktop_gnome_grant.c` (the file format and
+  the keep / save / remove table, `u_desktop_gnome_grant_after_request`) over
+  `u_desktop_grant_*` in `u_desktop_policy.c` (the private, atomic file). The monitor-blink
+  guard below uses the saved connectors in a new process too.
 - **Monitor blink.** Before a silent restore of a grant that covers screens, the backend reads
   `org.gnome.Mutter.DisplayConfig.GetCurrentState`: it waits (at most 6 s) until the layout
   serial has been stable for 2 s and every monitor (connector) the grant covered is present,

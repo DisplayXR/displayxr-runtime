@@ -26,8 +26,15 @@
  * rotated to `.1` at 1 MiB. The record type has NO text field: typed text can
  * never reach the log, only its length (`chars`).
  *
- * `DXR_DESKTOP_CONTROL_DIR`, when set and non-empty, overrides BOTH
- * directories (tests, CI, a portable install).
+ * Saved OS grants — one private file per app id under `desktop-control/` next
+ * to the audit log (Linux: $XDG_STATE_HOME/displayxr/desktop-control/, default
+ * ~/.local/state/displayxr/desktop-control/). Only the GNOME backend saves one
+ * (its portal restore token, u_desktop_gnome_grant.h); the kill switch removes
+ * them all. See "Saved OS grants" below.
+ *
+ * `DXR_DESKTOP_CONTROL_DIR`, when set and non-empty, overrides ALL THREE
+ * locations (tests, CI, a portable install): the store and the audit log go in
+ * it, the saved grants in its `desktop-control/` subdirectory.
  *
  * Reads are cached: u_desktop_policy_refresh() re-reads the file only when its
  * stamp (mtime + size + file identity) changed. Writes are read-modify-write
@@ -165,9 +172,88 @@ u_desktop_policy_set_app(const char *exe, enum u_desktop_app_decision d, const c
 bool
 u_desktop_policy_set_app_scope(const char *exe, uint32_t scopes, enum u_desktop_app_decision d, const char *by);
 
-//! Flip the kill switch. Audited as "suspended" / "resumed".
+/*!
+ * Flip the kill switch. Audited as "suspended" / "resumed". Turning it ON also
+ * removes every saved OS grant (u_desktop_grant_remove_all), whether or not the
+ * store could be written: after a kill switch the next request of every app
+ * shows the OS consent dialog again (spec §6.4).
+ */
 bool
 u_desktop_policy_set_suspended(bool suspended, const char *by);
+
+
+/*
+ *
+ * Saved OS grants (spec §6.4, ADR-056 Amendment 2).
+ *
+ * One small file per key (an app id) that a backend writes so that the OS consent
+ * survives a restart of the app. Only the GNOME backend writes one today: the
+ * portal's restore token and what it covers (u_desktop_gnome_grant.h). This layer
+ * only stores bytes, privately:
+ *  - the directory `desktop-control/` (u_desktop_grant_dir) is created 0700 and
+ *    tightened to 0700 when it already exists; a directory that is a symlink, not
+ *    this user's or writable by others is never read or written;
+ *  - a file is written 0600, atomically (an O_EXCL temp file, fsync, rename);
+ *  - a file is read only when it is a regular file (not a symlink) of this user
+ *    with no group / other permission bits, at most U_DESKTOP_GRANT_MAX_BYTES.
+ *
+ * POSIX only. On Windows every call fails or finds nothing (no Windows backend
+ * saves a grant: the DisplayXR store is its consent).
+ *
+ */
+
+#define U_DESKTOP_GRANT_DIR_NAME "desktop-control"
+//! Longest key (an app id), terminator excluded.
+#define U_DESKTOP_GRANT_KEY_MAX 200
+//! Largest saved-grant file read back.
+#define U_DESKTOP_GRANT_MAX_BYTES (64u * 1024u)
+
+//! The saved-grant directory (not created).
+bool
+u_desktop_grant_dir(char *out, size_t cap);
+
+/*!
+ * True when @p key can name a saved grant: 1..U_DESKTOP_GRANT_KEY_MAX bytes of
+ * [A-Za-z0-9._-], not starting with '.' (an app id passes; a path never does).
+ */
+bool
+u_desktop_grant_key_valid(const char *key);
+
+//! `<grant dir>/<key>.json`. False for an invalid key.
+bool
+u_desktop_grant_path(const char *key, char *out, size_t cap);
+
+enum u_desktop_grant_read_result
+{
+	U_DESKTOP_GRANT_READ_NONE = 0, //!< no file (or no directory, or an invalid key)
+	U_DESKTOP_GRANT_READ_OK,       //!< *out_text is the content (malloc'd, NUL-terminated)
+	//! Not a private regular file of this user (a symlink, another owner, group /
+	//! other bits, too large) or its directory is not private: ignored, left alone.
+	U_DESKTOP_GRANT_READ_UNSAFE,
+};
+
+enum u_desktop_grant_read_result
+u_desktop_grant_read(const char *key, char **out_text);
+
+//! Replace the file for @p key with @p text (see the rules above).
+bool
+u_desktop_grant_write(const char *key, const char *text);
+
+//! Remove the file for @p key. True if a file was removed.
+bool
+u_desktop_grant_remove(const char *key);
+
+//! True when a file for @p key exists (whatever its content or permissions).
+bool
+u_desktop_grant_exists(const char *key);
+
+//! Remove every saved grant (the kill switch). Returns how many were removed.
+uint32_t
+u_desktop_grant_remove_all(void);
+
+//! How many saved grants there are.
+uint32_t
+u_desktop_grant_count(void);
 
 
 /*

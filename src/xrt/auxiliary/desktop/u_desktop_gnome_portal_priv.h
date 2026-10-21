@@ -12,7 +12,9 @@
 
 #include "u_desktop_gnome.h"
 #include "u_desktop_gnome_capture.h"
+#include "u_desktop_gnome_grant.h"
 #include "u_desktop_gnome_libs.h"
+#include "u_desktop_policy.h"
 
 #include <dbus/dbus.h>
 #include <pthread.h>
@@ -90,7 +92,9 @@ struct gnome_portal
 	bool pending;                 //!< an interactive request is in flight
 	bool session_open_shared;
 	bool have_token;
-	char token[1024];          //!< restore token — memory only, never written anywhere
+	//! The restore token. Saved for the next launch only through gp_grant_* (spec
+	//! §6.4: per registered app id, a private file); never logged.
+	char token[U_DESKTOP_GNOME_TOKEN_SIZE];
 	bool consent_only_granted; //!< !input: the user approved the dialog in this process
 
 	// ---- immutable ----
@@ -106,8 +110,27 @@ struct gnome_portal
 	DBusConnection *c;
 	char sender[128]; //!< unique name, ':' dropped and '.' → '_' (request paths)
 	bool registered_tried;
+	//! The app id org.freedesktop.host.portal.Registry accepted ("" = none: no app
+	//! id, or a portal < 1.19). The portal binds restore tokens to it.
+	char registered_id[U_DESKTOP_GRANT_KEY_MAX + 1];
 	uint32_t token_counter;
 	bool warned_no_token;
+
+	//! The saved grant (spec §6.4, u_desktop_gnome_grant.h): what this process
+	//! knows of the file. Its own token is p->token / p->cap.token_* as always.
+	struct
+	{
+		bool inited;                           //!< the first request / restore looked for it
+		char key[U_DESKTOP_GRANT_KEY_MAX + 1]; //!< registered_id; "" = nothing is saved
+		bool on_disk;                          //!< the file holds a grant this process loaded or wrote
+		//! That file was removed by someone else (the kill switch, the user) while
+		//! this process held its grant: the grant lives on in memory until the
+		//! process exits, but this process never writes the file again.
+		bool disowned;
+		char token[U_DESKTOP_GNOME_TOKEN_SIZE]; //!< the token in that file
+	} saved;
+	//! The last Start (RemoteDesktop or ScreenCast) was answered "Cancel" (response 1).
+	bool start_declined;
 
 	char session[512];
 	bool session_open;
@@ -278,6 +301,31 @@ gp_dict_add_bool(DBusMessageIter *dict, const char *key, bool val);
 //! Queue @p c (async: the thread frees it) and wake the thread. False when shutting down.
 bool
 gp_enqueue_async(struct gnome_portal *p, struct gp_cmd *c);
+
+/*
+ * The saved grant (spec §6.4). Portal thread only; file I/O never under p->lock.
+ */
+
+/*!
+ * Before a request or a restore: the first call registers the app id and loads
+ * the app's saved grant; later calls adopt one that another process of the same
+ * app saved since (the portal may issue a new token per Start, which spends the
+ * old one), and notice a file
+ * removed under us (the kill switch).
+ */
+void
+gp_grant_sync(struct gnome_portal *p);
+
+//! After a successful Start: save the grant now held (or remove the file when the portal returned no token).
+void
+gp_grant_save(struct gnome_portal *p);
+
+/*!
+ * Remove the saved grant if it still holds @p token (NULL: whatever it holds);
+ * @p why goes to the log. Call with the token the failed restore used.
+ */
+void
+gp_grant_forget(struct gnome_portal *p, const char *token, const char *why);
 
 //! u_desktop_gnome_input.c: drop the compiled keymap.
 void

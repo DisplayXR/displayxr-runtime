@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <io.h>
 #else
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -1006,6 +1007,15 @@ u_desktop_policy_set_app_scope(const char *exe, uint32_t scopes, enum u_desktop_
 bool
 u_desktop_policy_set_suspended(bool suspended, const char *by)
 {
+	if (suspended) {
+		// The kill switch ends every saved OS grant too (spec §6.4): the next request
+		// of every app shows the OS dialog again. Done first and whatever happens to
+		// the store below — a grant left on disk would outlive a "stop".
+		uint32_t n = u_desktop_grant_remove_all();
+		if (n > 0) {
+			U_LOG_W("desktop_control: kill switch - removed %u saved grant(s)", n);
+		}
+	}
 	char path[PATH_CAP];
 	if (!u_desktop_policy_store_path(path, sizeof(path))) {
 		return false;
@@ -1313,6 +1323,324 @@ u_desktop_audit_tail(uint32_t n, u_desktop_audit_line_fn fn, void *ctx)
 	free(r.lines);
 	return any;
 }
+
+
+/*
+ *
+ * Saved OS grants (spec §6.4). See u_desktop_policy.h.
+ *
+ */
+
+bool
+u_desktop_grant_dir(char *out, size_t cap)
+{
+	char dir[PATH_CAP];
+	// Next to the audit log: $XDG_STATE_HOME/displayxr on Linux (state, not
+	// configuration), the store directory elsewhere, the override when set.
+	return audit_dir(dir, sizeof(dir)) && join(out, cap, dir, U_DESKTOP_GRANT_DIR_NAME);
+}
+
+bool
+u_desktop_grant_key_valid(const char *key)
+{
+	if (key == NULL || key[0] == '\0' || key[0] == '.') {
+		return false;
+	}
+	size_t n = 0;
+	for (const char *p = key; *p != '\0'; p++, n++) {
+		char c = *p;
+		bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+		          c == '_' || c == '-';
+		if (!ok || n >= U_DESKTOP_GRANT_KEY_MAX) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+u_desktop_grant_path(const char *key, char *out, size_t cap)
+{
+	char dir[PATH_CAP];
+	if (!u_desktop_grant_key_valid(key) || !u_desktop_grant_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	int n = snprintf(out, cap, "%s%c%s.json", dir, SEP, key);
+	return n > 0 && (size_t)n < cap;
+}
+
+#ifndef XRT_OS_WINDOWS
+
+/*!
+ * The grant directory is usable: a real directory of this user that nobody else
+ * can write into. With @p create it is made (0700, parents too) when missing and
+ * tightened to 0700 when it has any group / other bits.
+ */
+static bool
+grant_dir_private(const char *dir, bool create)
+{
+	struct stat st;
+	if (lstat(dir, &st) != 0) {
+		if (!create || errno != ENOENT) {
+			return false;
+		}
+		char probe[PATH_CAP + 4];
+		snprintf(probe, sizeof(probe), "%s%cx", dir, SEP);
+		make_parent_dirs(probe); // mkdir -p, 0700 for what it creates
+		if (lstat(dir, &st) != 0) {
+			return false;
+		}
+	}
+	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid()) {
+		return false; // a symlink, a file, or someone else's directory
+	}
+	if ((st.st_mode & 077) != 0) {
+		if (!create) {
+			return (st.st_mode & 022) == 0; // readable as long as nobody else can write it
+		}
+		if (chmod(dir, 0700) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+enum u_desktop_grant_read_result
+u_desktop_grant_read(const char *key, char **out_text)
+{
+	*out_text = NULL;
+	char dir[PATH_CAP], path[PATH_CAP];
+	if (!u_desktop_grant_dir(dir, sizeof(dir)) || !u_desktop_grant_path(key, path, sizeof(path))) {
+		return U_DESKTOP_GRANT_READ_NONE;
+	}
+	struct stat dst;
+	if (lstat(dir, &dst) != 0) {
+		return U_DESKTOP_GRANT_READ_NONE; // nothing was ever saved here
+	}
+	if (!grant_dir_private(dir, false)) {
+		return U_DESKTOP_GRANT_READ_UNSAFE;
+	}
+	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0) {
+		return errno == ENOENT ? U_DESKTOP_GRANT_READ_NONE : U_DESKTOP_GRANT_READ_UNSAFE; // ELOOP: a symlink
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) != 0 ||
+	    st.st_size < 0 || (unsigned long long)st.st_size > U_DESKTOP_GRANT_MAX_BYTES) {
+		close(fd);
+		return U_DESKTOP_GRANT_READ_UNSAFE;
+	}
+	size_t want = (size_t)st.st_size;
+	char *buf = (char *)malloc(want + 1);
+	if (buf == NULL) {
+		close(fd);
+		return U_DESKTOP_GRANT_READ_NONE;
+	}
+	size_t got = 0;
+	while (got < want) {
+		ssize_t r = read(fd, buf + got, want - got);
+		if (r < 0 && errno == EINTR) {
+			continue;
+		}
+		if (r <= 0) {
+			break;
+		}
+		got += (size_t)r;
+	}
+	close(fd);
+	buf[got] = '\0';
+	*out_text = buf;
+	return U_DESKTOP_GRANT_READ_OK;
+}
+
+bool
+u_desktop_grant_write(const char *key, const char *text)
+{
+	char dir[PATH_CAP], path[PATH_CAP];
+	if (text == NULL || !u_desktop_grant_dir(dir, sizeof(dir)) || !u_desktop_grant_path(key, path, sizeof(path)) ||
+	    !grant_dir_private(dir, true)) {
+		return false;
+	}
+	char tmp[PATH_CAP + 32];
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%u", path, u_desktop_self_pid());
+	unlink(tmp); // a leftover of this pid's crash
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		return false;
+	}
+	size_t len = strlen(text), done = 0;
+	bool ok = true;
+	while (ok && done < len) {
+		ssize_t w = write(fd, text + done, len - done);
+		if (w < 0 && errno == EINTR) {
+			continue;
+		}
+		ok = w > 0;
+		done += ok ? (size_t)w : 0;
+	}
+	ok = ok && fsync(fd) == 0;
+	ok = close(fd) == 0 && ok;
+	if (!ok || rename(tmp, path) != 0) {
+		unlink(tmp);
+		return false;
+	}
+	return true;
+}
+
+//! @p dir is this user's real directory (not reached through a symlink of its own).
+static bool
+grant_dir_ours(const char *dir)
+{
+	struct stat st;
+	return lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid();
+}
+
+bool
+u_desktop_grant_remove(const char *key)
+{
+	char dir[PATH_CAP], path[PATH_CAP];
+	return u_desktop_grant_dir(dir, sizeof(dir)) && grant_dir_ours(dir) &&
+	       u_desktop_grant_path(key, path, sizeof(path)) && unlink(path) == 0;
+}
+
+bool
+u_desktop_grant_exists(const char *key)
+{
+	char path[PATH_CAP];
+	struct stat st;
+	return u_desktop_grant_path(key, path, sizeof(path)) && lstat(path, &st) == 0;
+}
+
+//! A saved grant ("<key>.json") or a writer's leftover ("<key>.json.tmp.<pid>").
+static bool
+grant_file_name(const char *name, bool *is_tmp)
+{
+	size_t len = strlen(name), klen = 0;
+	*is_tmp = false;
+	if (len > 5 && strcmp(name + len - 5, ".json") == 0) {
+		klen = len - 5;
+	} else {
+		// The LAST ".json.tmp." (a key may contain ".json"), followed by digits only.
+		const char *t = NULL;
+		for (const char *s = strstr(name, ".json.tmp."); s != NULL; s = strstr(s + 1, ".json.tmp.")) {
+			t = s;
+		}
+		if (t == NULL || t[10] == '\0') {
+			return false;
+		}
+		for (const char *d = t + 10; *d != '\0'; d++) {
+			if (*d < '0' || *d > '9') {
+				return false;
+			}
+		}
+		klen = (size_t)(t - name);
+		*is_tmp = true;
+	}
+	char key[U_DESKTOP_GRANT_KEY_MAX + 2];
+	if (klen == 0 || klen > U_DESKTOP_GRANT_KEY_MAX) {
+		return false;
+	}
+	memcpy(key, name, klen);
+	key[klen] = '\0';
+	return u_desktop_grant_key_valid(key);
+}
+
+//! Count (and with @p remove, unlink) the grant files: saved grants only are counted.
+static uint32_t
+grant_sweep(bool remove)
+{
+	char dir[PATH_CAP];
+	// This user's real directory (never through a symlink); removing works even
+	// where reading would be refused (a directory others can write into).
+	if (!u_desktop_grant_dir(dir, sizeof(dir)) || !grant_dir_ours(dir)) {
+		return 0;
+	}
+	DIR *d = opendir(dir);
+	if (d == NULL) {
+		return 0;
+	}
+	uint32_t n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL) {
+		bool is_tmp = false;
+		if (!grant_file_name(e->d_name, &is_tmp)) {
+			continue;
+		}
+		char path[PATH_CAP];
+		if (!join(path, sizeof(path), dir, e->d_name)) {
+			continue;
+		}
+		struct stat st;
+		if (lstat(path, &st) != 0 || S_ISDIR(st.st_mode)) {
+			continue;
+		}
+		if (!remove) {
+			n += is_tmp ? 0 : 1;
+		} else if (unlink(path) == 0 && !is_tmp) {
+			n++;
+		}
+	}
+	closedir(d);
+	return n;
+}
+
+uint32_t
+u_desktop_grant_remove_all(void)
+{
+	return grant_sweep(true);
+}
+
+uint32_t
+u_desktop_grant_count(void)
+{
+	return grant_sweep(false);
+}
+
+#else // XRT_OS_WINDOWS: no backend saves a grant there.
+
+enum u_desktop_grant_read_result
+u_desktop_grant_read(const char *key, char **out_text)
+{
+	(void)key;
+	*out_text = NULL;
+	return U_DESKTOP_GRANT_READ_NONE;
+}
+
+bool
+u_desktop_grant_write(const char *key, const char *text)
+{
+	(void)key;
+	(void)text;
+	return false;
+}
+
+bool
+u_desktop_grant_remove(const char *key)
+{
+	(void)key;
+	return false;
+}
+
+bool
+u_desktop_grant_exists(const char *key)
+{
+	(void)key;
+	return false;
+}
+
+uint32_t
+u_desktop_grant_remove_all(void)
+{
+	return 0;
+}
+
+uint32_t
+u_desktop_grant_count(void)
+{
+	return 0;
+}
+
+#endif
 
 
 /*

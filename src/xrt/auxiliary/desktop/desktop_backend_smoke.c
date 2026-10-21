@@ -34,9 +34,11 @@
  *                                                 one-shot SCStream, the macOS 12.3–13 path
  *   desktop_backend_smoke script < FILE           one command per line, ONE process (so an
  *                                                 OS grant from `request` lasts for the rest;
- *                                                 needed on GNOME, where the portal grant lives
- *                                                 in memory). Lines: the same commands, quotes
- *                                                 for spaces, `sleep MS`, `#` comments.
+ *                                                 needed on GNOME, where the portal grant
+ *                                                 outlives the process only for a registered
+ *                                                 app id — DXR_DESKTOP_APP_ID, spec §6.4).
+ *                                                 Lines: the same commands, quotes for
+ *                                                 spaces, `sleep MS`, `#` comments.
  *
  * It bypasses EVERY safety check of the common layer (consent, kill switch, idle
  * wait, target verification, audit): it is for the person sitting at the machine.

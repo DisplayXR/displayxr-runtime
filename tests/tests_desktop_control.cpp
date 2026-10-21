@@ -16,6 +16,7 @@
 #include "desktop/u_desktop_chord.h"
 #include "desktop/u_desktop_control.h"
 #include "desktop/u_desktop_fake.h"
+#include "desktop/u_desktop_gnome_grant.h"
 #include "desktop/u_desktop_gnome_logic.h"
 #include "desktop/u_desktop_mini_cache.h"
 #include "desktop/u_desktop_policy.h"
@@ -31,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -43,6 +45,7 @@
 #else
 #include <cerrno>
 #include <csignal>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -103,6 +106,23 @@ struct TempDir
 #ifdef _WIN32
 		RemoveDirectoryA(path.c_str());
 #else
+		// The saved-grant directory (spec §6.4) and whatever a test left in it.
+		std::string grants = file(U_DESKTOP_GRANT_DIR_NAME);
+		chmod(grants.c_str(), 0700);
+		if (DIR *d = opendir(grants.c_str())) {
+			while (struct dirent *e = readdir(d)) {
+				std::string n = e->d_name;
+				if (n == "." || n == "..") {
+					continue;
+				}
+				std::string fp = grants + "/" + n;
+				if (rmdir(fp.c_str()) != 0) {
+					unlink(fp.c_str());
+				}
+			}
+			closedir(d);
+		}
+		rmdir(grants.c_str());
 		rmdir(path.c_str());
 #endif
 		set_env(U_DESKTOP_POLICY_DIR_ENV, nullptr);
@@ -3243,3 +3263,506 @@ TEST_CASE("capture_macos: which windows a capture withholds", "[desktop][capture
 	w.frame.w = 0;
 	CHECK(!u_desktop_macos_capture_withholds(&w, me));
 }
+
+/*
+ *
+ * Saved OS grants (spec §6.4, ADR-056 Amendment 2): the GNOME portal grant kept
+ * across launches. POSIX only (no Windows backend saves a grant).
+ *
+ */
+
+#ifndef _WIN32
+namespace {
+
+const char *const kAppId = "org.displayxr.GrantTest";
+
+std::string
+grant_file(const TempDir &dir, const char *key = kAppId)
+{
+	return dir.file(U_DESKTOP_GRANT_DIR_NAME) + "/" + key + ".json";
+}
+
+mode_t
+mode_of(const std::string &path)
+{
+	struct stat st;
+	REQUIRE(lstat(path.c_str(), &st) == 0);
+	return st.st_mode & 07777;
+}
+
+void
+write_raw(const std::string &path, const std::string &text, mode_t mode)
+{
+	{
+		std::ofstream f(path, std::ios::binary | std::ios::trunc);
+		f << text;
+	}
+	REQUIRE(chmod(path.c_str(), mode) == 0);
+}
+
+u_desktop_gnome_grant
+make_grant(bool screencast,
+           bool devices,
+           bool screens,
+           std::vector<std::string> monitors = {},
+           const char *token = "6f1c2a9e-7d3b-4c55-9e0a-1b2c3d4e5f60")
+{
+	u_desktop_gnome_grant g;
+	memset(&g, 0, sizeof(g));
+	snprintf(g.token, sizeof(g.token), "%s", token);
+	g.screencast = screencast;
+	g.devices = devices;
+	g.screens = screens;
+	for (const auto &m : monitors) {
+		snprintf(g.monitors[g.nmonitors++], sizeof(g.monitors[0]), "%s", m.c_str());
+	}
+	return g;
+}
+
+//! The decode of @p json for kAppId.
+u_desktop_gnome_grant_status
+decode(const std::string &json, u_desktop_gnome_grant *out = nullptr)
+{
+	u_desktop_gnome_grant g{};
+	u_desktop_gnome_grant_status st = u_desktop_gnome_grant_decode(json.c_str(), kAppId, &g);
+	if (out != nullptr) {
+		*out = g;
+	}
+	return st;
+}
+
+//! A grant file's text with one field replaced (raw JSON value).
+std::string
+grant_json(const std::string &field = "", const std::string &value = "")
+{
+	std::map<std::string, std::string> f = {
+	    {"version", "1"},
+	    {"app_id", "\"org.displayxr.GrantTest\""},
+	    {"portal", "\"remote_desktop\""},
+	    {"restore_token", "\"0f8e3c1a-2b4d-4e6f-8a9b-0c1d2e3f4a5b\""},
+	    {"devices", "true"},
+	    {"screens", "true"},
+	    {"monitors", "[\"DP-1\", \"HDMI-1\"]"},
+	};
+	if (!field.empty()) {
+		if (value.empty()) {
+			f.erase(field);
+		} else {
+			f[field] = value;
+		}
+	}
+	std::string s = "{";
+	for (const auto &kv : f) {
+		s += (s.size() > 1 ? ", \"" : "\"") + kv.first + "\": " + kv.second;
+	}
+	return s + "}";
+}
+
+} // namespace
+
+TEST_CASE("desktop_grant: the directory follows DXR_DESKTOP_CONTROL_DIR; keys are app ids only", "[desktop][grant]")
+{
+	TempDir dir;
+	char p[1024];
+	REQUIRE(u_desktop_grant_dir(p, sizeof(p)));
+	CHECK(std::string(p) == dir.file(U_DESKTOP_GRANT_DIR_NAME));
+	REQUIRE(u_desktop_grant_path(kAppId, p, sizeof(p)));
+	CHECK(std::string(p) == grant_file(dir));
+
+	for (const char *ok : {"org.displayxr.Test", "a", "A_b-c.1", "com.example.My-App_2"}) {
+		INFO(ok);
+		CHECK(u_desktop_grant_key_valid(ok));
+	}
+	std::string k200(200, 'a'), k201(201, 'a');
+	CHECK(u_desktop_grant_key_valid(k200.c_str()));
+	CHECK_FALSE(u_desktop_grant_key_valid(k201.c_str()));
+	for (const char *bad : {"", ".hidden", "..", "a/b", "../x", "a b", "a\\b", "x\n", "caf\xc3\xa9", "a:b", "a*"}) {
+		INFO("key '" << bad << "'");
+		CHECK_FALSE(u_desktop_grant_key_valid(bad));
+		CHECK_FALSE(u_desktop_grant_path(bad, p, sizeof(p)));
+		CHECK_FALSE(u_desktop_grant_write(bad, "x"));
+	}
+	CHECK_FALSE(u_desktop_grant_key_valid(nullptr));
+	// Nothing saved yet: no directory is created by a read, a count or a remove.
+	char *txt = nullptr;
+	CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_NONE);
+	CHECK(txt == nullptr);
+	CHECK(u_desktop_grant_count() == 0);
+	CHECK(u_desktop_grant_remove_all() == 0);
+	CHECK_FALSE(u_desktop_grant_remove(kAppId));
+	CHECK_FALSE(exists(dir.file(U_DESKTOP_GRANT_DIR_NAME)));
+}
+
+TEST_CASE("desktop_grant: write / read — a 0700 directory, a 0600 file, atomic, whatever the umask", "[desktop][grant]")
+{
+	TempDir dir;
+	mode_t old_umask = umask(0); // the most permissive umask must not loosen anything
+	REQUIRE(u_desktop_grant_write(kAppId, "first"));
+	umask(old_umask);
+	CHECK(mode_of(dir.file(U_DESKTOP_GRANT_DIR_NAME)) == 0700);
+	CHECK(mode_of(grant_file(dir)) == 0600);
+	CHECK(u_desktop_grant_exists(kAppId));
+	CHECK(u_desktop_grant_count() == 1);
+
+	char *txt = nullptr;
+	REQUIRE(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_OK);
+	CHECK(std::string(txt) == "first");
+	free(txt);
+
+	// A rewrite replaces the file (a new inode: rename-over) and leaves no temp file.
+	struct stat before;
+	REQUIRE(stat(grant_file(dir).c_str(), &before) == 0);
+	REQUIRE(u_desktop_grant_write(kAppId, "second"));
+	struct stat after;
+	REQUIRE(stat(grant_file(dir).c_str(), &after) == 0);
+	CHECK(before.st_ino != after.st_ino);
+	CHECK(slurp(grant_file(dir)) == "second");
+	char tmpname[1100];
+	snprintf(tmpname, sizeof(tmpname), "%s.tmp.%u", grant_file(dir).c_str(), (unsigned)getpid());
+	CHECK_FALSE(exists(tmpname));
+
+	// A directory someone loosened is tightened back on the next write.
+	REQUIRE(chmod(dir.file(U_DESKTOP_GRANT_DIR_NAME).c_str(), 0755) == 0);
+	REQUIRE(u_desktop_grant_write(kAppId, "third"));
+	CHECK(mode_of(dir.file(U_DESKTOP_GRANT_DIR_NAME)) == 0700);
+
+	CHECK(u_desktop_grant_remove(kAppId));
+	CHECK_FALSE(u_desktop_grant_exists(kAppId));
+	CHECK_FALSE(u_desktop_grant_remove(kAppId)); // nothing left to remove
+	CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_NONE);
+}
+
+TEST_CASE("desktop_grant: a file that is not private to this user is never read", "[desktop][grant]")
+{
+	TempDir dir;
+	REQUIRE(u_desktop_grant_write(kAppId, "token"));
+	const std::string f = grant_file(dir);
+	char *txt = nullptr;
+
+	SECTION("group / other permission bits")
+	{
+		for (mode_t m : {0640, 0604, 0620, 0602, 0644, 0666}) {
+			INFO("mode " << std::oct << m);
+			REQUIRE(chmod(f.c_str(), m) == 0);
+			CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+			CHECK(txt == nullptr);
+		}
+		REQUIRE(chmod(f.c_str(), 0400) == 0); // read-only for the owner is fine
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_OK);
+		free(txt);
+	}
+	SECTION("a symlink in its place")
+	{
+		const std::string target = dir.file("elsewhere.json");
+		write_raw(target, "planted", 0600);
+		REQUIRE(unlink(f.c_str()) == 0);
+		REQUIRE(symlink(target.c_str(), f.c_str()) == 0);
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+		CHECK(txt == nullptr);
+		// A write replaces the link itself, never the file it points to.
+		REQUIRE(u_desktop_grant_write(kAppId, "mine"));
+		CHECK(slurp(target) == "planted");
+		CHECK(mode_of(f) == 0600);
+		std::remove(target.c_str());
+	}
+	SECTION("a directory in its place")
+	{
+		REQUIRE(unlink(f.c_str()) == 0);
+		REQUIRE(mkdir(f.c_str(), 0700) == 0);
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+		rmdir(f.c_str());
+	}
+	SECTION("too large")
+	{
+		write_raw(f, std::string(U_DESKTOP_GRANT_MAX_BYTES + 1, 'x'), 0600);
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+	}
+	SECTION("a directory others can write into")
+	{
+		REQUIRE(chmod(dir.file(U_DESKTOP_GRANT_DIR_NAME).c_str(), 0770) == 0);
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+		// Reading it does not change it; the next write tightens it.
+		CHECK(mode_of(dir.file(U_DESKTOP_GRANT_DIR_NAME)) == 0770);
+		REQUIRE(u_desktop_grant_write(kAppId, "token"));
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_OK);
+		free(txt);
+	}
+	SECTION("the directory is a symlink")
+	{
+		const std::string real = dir.file("real-grants");
+		const std::string link = dir.file(U_DESKTOP_GRANT_DIR_NAME);
+		REQUIRE(rename(link.c_str(), real.c_str()) == 0);
+		REQUIRE(symlink(real.c_str(), link.c_str()) == 0);
+		CHECK(u_desktop_grant_read(kAppId, &txt) == U_DESKTOP_GRANT_READ_UNSAFE);
+		CHECK_FALSE(u_desktop_grant_write(kAppId, "x"));
+		CHECK_FALSE(u_desktop_grant_remove(kAppId)); // never through the link
+		CHECK(u_desktop_grant_remove_all() == 0);
+		CHECK(exists(real + "/" + kAppId + ".json"));
+		unlink(link.c_str());
+		unlink((real + "/" + kAppId + ".json").c_str());
+		rmdir(real.c_str());
+	}
+}
+
+TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
+{
+	SECTION("RemoteDesktop: input + two monitors")
+	{
+		u_desktop_gnome_grant g = make_grant(false, true, true, {"DP-1", "HDMI-1"});
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		REQUIRE(txt != nullptr);
+		std::string json = txt;
+		free(txt);
+		CHECK(json.find("\"version\":\t1") != std::string::npos);
+		CHECK(json.find("\"portal\":\t\"remote_desktop\"") != std::string::npos);
+		CHECK(json.find("\"saved\":") != std::string::npos);
+		u_desktop_gnome_grant back{};
+		REQUIRE(decode(json, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		CHECK(std::string(back.token) == g.token);
+		CHECK_FALSE(back.screencast);
+		CHECK(back.devices);
+		CHECK(back.screens);
+		REQUIRE(back.nmonitors == 2);
+		CHECK(std::string(back.monitors[0]) == "DP-1");
+		CHECK(std::string(back.monitors[1]) == "HDMI-1");
+	}
+	SECTION("RemoteDesktop with remote interaction unticked: screens only")
+	{
+		u_desktop_gnome_grant g = make_grant(false, false, true, {"eDP-1"});
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		REQUIRE(txt != nullptr);
+		u_desktop_gnome_grant back{};
+		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		free(txt);
+		CHECK_FALSE(back.devices);
+		CHECK(back.screens);
+	}
+	SECTION("a standalone ScreenCast grant; input only drops the monitors")
+	{
+		u_desktop_gnome_grant g = make_grant(true, false, true, {"Meta-0"});
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		REQUIRE(txt != nullptr);
+		u_desktop_gnome_grant back{};
+		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		free(txt);
+		CHECK(back.screencast);
+		CHECK(back.nmonitors == 1);
+
+		g = make_grant(false, true, false, {"DP-1"});
+		txt = u_desktop_gnome_grant_encode(kAppId, &g);
+		REQUIRE(txt != nullptr);
+		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		free(txt);
+		CHECK(back.nmonitors == 0);
+	}
+	SECTION("nothing that cannot be restored is encoded")
+	{
+		u_desktop_gnome_grant g = make_grant(false, false, false); // covers nothing
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		g = make_grant(true, true, true); // a ScreenCast token cannot cover input
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		g = make_grant(false, true, true, {}, "");
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		g = make_grant(false, true, true, {}, "has space");
+		CHECK(u_desktop_gnome_grant_encode(kAppId, &g) == nullptr);
+		g = make_grant(false, true, true);
+		CHECK(u_desktop_gnome_grant_encode("not/an/app/id", &g) == nullptr);
+		CHECK(u_desktop_gnome_grant_encode(kAppId, nullptr) == nullptr);
+	}
+}
+
+TEST_CASE("desktop_gnome_grant: decode refuses anything it did not write", "[desktop][grant]")
+{
+	CHECK(decode(grant_json()) == U_DESKTOP_GNOME_GRANT_OK);
+	std::string long_token = "\"" + std::string(U_DESKTOP_GNOME_TOKEN_SIZE, 'a') + "\"";
+	const std::vector<std::pair<std::string, std::string>> corrupt = {
+	    {"version", "0"},
+	    {"version", "1.5"},
+	    {"version", "\"1\""},
+	    {"version", ""},
+	    {"app_id", "\"org.other.App\""}, // a file under our name that is not ours
+	    {"app_id", ""},
+	    {"portal", "\"screenshot\""},
+	    {"portal", ""},
+	    {"restore_token", "\"\""},
+	    {"restore_token", "\"has space\""},
+	    {"restore_token", "\"tab\\there\""},
+	    {"restore_token", "\"caf\\u00e9\""},
+	    {"restore_token", long_token},
+	    {"restore_token", "42"},
+	    {"restore_token", ""},
+	    {"devices", "\"yes\""},
+	    {"devices", ""},
+	    {"screens", "1"},
+	    {"monitors", "\"DP-1\""},
+	    {"monitors", "[1]"},
+	    {"monitors", "[\"has space\"]"},
+	    {"monitors", "[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]"},
+	};
+	for (const auto &c : corrupt) {
+		INFO(c.first << " = " << c.second);
+		CHECK(decode(grant_json(c.first, c.second)) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+	}
+	// Shapes no portal issues.
+	CHECK(decode(grant_json("devices", "false")) == U_DESKTOP_GNOME_GRANT_OK); // screens only
+	std::string none = grant_json("devices", "false");
+	none.replace(none.find("\"screens\": true"), 15, "\"screens\": false");
+	CHECK(decode(none) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+	CHECK(decode(grant_json("portal", "\"screencast\"")) == U_DESKTOP_GNOME_GRANT_CORRUPT); // with devices
+	std::string sc = grant_json("portal", "\"screencast\"");
+	sc.replace(sc.find("\"devices\": true"), 15, "\"devices\": false");
+	CHECK(decode(sc) == U_DESKTOP_GNOME_GRANT_OK);
+	// No monitors key is allowed (an input-only grant).
+	CHECK(decode(grant_json("monitors", "")) == U_DESKTOP_GNOME_GRANT_OK);
+	// A later format: left for the runtime that wrote it.
+	CHECK(decode(grant_json("version", "2")) == U_DESKTOP_GNOME_GRANT_NEWER);
+	// Not a grant at all.
+	for (const char *s : {"", "{", "[]", "null", "\"x\"", "{ not json"}) {
+		INFO(s);
+		CHECK(decode(s) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+	}
+	u_desktop_gnome_grant g;
+	CHECK(u_desktop_gnome_grant_decode(nullptr, kAppId, &g) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+	CHECK(u_desktop_gnome_grant_decode(grant_json().c_str(), nullptr, &g) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+	CHECK(g.token[0] == '\0');
+}
+
+TEST_CASE("desktop_gnome_grant: load / save / forget", "[desktop][grant]")
+{
+	TempDir dir;
+	u_desktop_gnome_grant g = make_grant(false, true, true, {"DP-1"}, "token-A");
+	u_desktop_gnome_grant out;
+
+	CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NONE);
+	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+	CHECK(mode_of(grant_file(dir)) == 0600);
+	REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(std::string(out.token) == "token-A");
+	CHECK(out.devices);
+	CHECK(out.screens);
+	REQUIRE(out.nmonitors == 1);
+	// Another app id never sees it.
+	CHECK(u_desktop_gnome_grant_load("org.displayxr.Other", &out) == U_DESKTOP_GNOME_GRANT_NONE);
+
+	SECTION("a renewed token replaces the old one")
+	{
+		g = make_grant(false, true, true, {"DP-1"}, "token-B");
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
+		CHECK(std::string(out.token) == "token-B");
+	}
+	SECTION("forget removes only the grant that failed")
+	{
+		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, "token-OTHER")); // another process renewed it
+		CHECK(exists(grant_file(dir)));
+		CHECK(u_desktop_gnome_grant_forget(kAppId, "token-A"));
+		CHECK_FALSE(exists(grant_file(dir)));
+		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, "token-A"));
+		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, nullptr));
+	}
+	SECTION("forget(NULL) removes whatever is there")
+	{
+		write_raw(grant_file(dir), "{ not json", 0600);
+		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, "token-A"));
+		CHECK(u_desktop_gnome_grant_forget(kAppId, nullptr));
+		CHECK_FALSE(exists(grant_file(dir)));
+	}
+	SECTION("a corrupt file is ignored and removed")
+	{
+		write_raw(grant_file(dir), "{ not json", 0600);
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+		CHECK(out.token[0] == '\0');
+		CHECK_FALSE(exists(grant_file(dir)));
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NONE);
+		write_raw(grant_file(dir), grant_json("app_id", "\"org.other.App\""), 0600);
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_CORRUPT);
+		CHECK_FALSE(exists(grant_file(dir)));
+	}
+	SECTION("a newer runtime's file and an unsafe file are ignored and kept")
+	{
+		std::string newer = grant_json("version", "2");
+		newer.replace(newer.find("org.displayxr.GrantTest"), 23, kAppId);
+		write_raw(grant_file(dir), newer, 0600);
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_NEWER);
+		CHECK(exists(grant_file(dir)));
+
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		REQUIRE(chmod(grant_file(dir).c_str(), 0644) == 0);
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_UNSAFE);
+		CHECK(out.token[0] == '\0');
+		CHECK(exists(grant_file(dir)));
+		CHECK_FALSE(u_desktop_gnome_grant_forget(kAppId, "token-A")); // unreadable: never "ours"
+		// The next grant replaces it, privately.
+		REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+		CHECK(mode_of(grant_file(dir)) == 0600);
+		CHECK(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
+	}
+	SECTION("an unsaveable grant leaves the old one")
+	{
+		u_desktop_gnome_grant bad = make_grant(false, false, false, {}, "token-C");
+		CHECK_FALSE(u_desktop_gnome_grant_save(kAppId, &bad));
+		REQUIRE(u_desktop_gnome_grant_load(kAppId, &out) == U_DESKTOP_GNOME_GRANT_OK);
+		CHECK(std::string(out.token) == "token-A");
+	}
+}
+
+TEST_CASE("desktop_gnome_grant: when a request keeps, saves or removes the saved grant", "[desktop][grant]")
+{
+	const auto KEEP = U_DESKTOP_GNOME_GRANT_KEEP, SAVE = U_DESKTOP_GNOME_GRANT_SAVE,
+	           FORGET = U_DESKTOP_GNOME_GRANT_FORGET;
+	// (granted, got_token, declined, ask_again, had_grant)
+	for (bool again : {false, true}) {
+		for (bool had : {false, true}) {
+			INFO("ask_again " << again << " had " << had);
+			CHECK(u_desktop_gnome_grant_after_request(true, true, false, again, had) == SAVE);
+			CHECK(u_desktop_gnome_grant_after_request(true, false, false, again, had) == FORGET);
+			// No answer / a portal error: whatever was there stays.
+			CHECK(u_desktop_gnome_grant_after_request(false, false, false, again, had) == KEEP);
+		}
+	}
+	// Declined ASK_AGAIN: the answer replaces the grant (spec §10.2).
+	CHECK(u_desktop_gnome_grant_after_request(false, false, true, true, true) == FORGET);
+	CHECK(u_desktop_gnome_grant_after_request(false, false, true, true, false) == FORGET);
+	// Declined first request: nothing to keep.
+	CHECK(u_desktop_gnome_grant_after_request(false, false, true, false, false) == FORGET);
+	// Declined added scope (CAPTURE after CONTROL): the old grant stays (gnome test plan 11.18).
+	CHECK(u_desktop_gnome_grant_after_request(false, false, true, false, true) == KEEP);
+}
+
+TEST_CASE("desktop_grant: the kill switch removes every saved grant, and only those", "[desktop][grant]")
+{
+	TempDir dir;
+	for (const char *k : {"org.a.One", "org.b.Two", "org.c.Three"}) {
+		u_desktop_gnome_grant g = make_grant(false, true, false);
+		REQUIRE(u_desktop_gnome_grant_save(k, &g));
+	}
+	const std::string gd = dir.file(U_DESKTOP_GRANT_DIR_NAME);
+	write_raw(gd + "/org.a.One.json.tmp.4242", "a writer's leftover", 0600);
+	write_raw(gd + "/README.txt", "not a grant", 0600);
+	write_raw(gd + "/.org.x.json", "not a key", 0600);
+	CHECK(u_desktop_grant_count() == 3);
+
+	u_desktop_policy *pol = u_desktop_policy_create();
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	u_desktop_policy_refresh(pol);
+	CHECK(u_desktop_policy_is_suspended(pol));
+	CHECK(u_desktop_grant_count() == 0);
+	CHECK_FALSE(exists(gd + "/org.a.One.json"));
+	CHECK_FALSE(exists(gd + "/org.a.One.json.tmp.4242"));
+	CHECK(exists(gd + "/README.txt"));
+	CHECK(exists(gd + "/.org.x.json"));
+
+	// Resuming brings nothing back; a later grant saves again.
+	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	CHECK(u_desktop_grant_count() == 0);
+	u_desktop_gnome_grant g = make_grant(false, true, false);
+	REQUIRE(u_desktop_gnome_grant_save(kAppId, &g));
+	CHECK(u_desktop_grant_count() == 1);
+	// A stop over an unreadable store (which it moves aside) still removes them.
+	write_raw(dir.file("desktop_control.json"), "{ not json", 0600);
+	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+	CHECK(u_desktop_grant_count() == 0);
+	std::remove(dir.file("desktop_control.json.corrupt").c_str());
+	u_desktop_policy_destroy(&pol);
+}
+#endif // !_WIN32

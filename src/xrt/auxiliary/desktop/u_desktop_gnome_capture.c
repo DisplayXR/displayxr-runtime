@@ -692,14 +692,21 @@ gp_cap_close_request(struct gnome_portal *p)
  *
  */
 
+//! The grant is gone (both scopes), and its saved copy with it (@p why: the log).
 static void
-cap_revoke(struct gnome_portal *p)
+cap_revoke(struct gnome_portal *p, const char *why)
 {
+	char used[U_DESKTOP_GNOME_TOKEN_SIZE];
 	pthread_mutex_lock(&p->lock);
+	snprintf(used, sizeof(used), "%s", p->have_token ? p->token : "");
 	p->have_token = false;
 	memset(p->token, 0, sizeof(p->token));
 	gp_cap_revoked_locked(p);
 	pthread_mutex_unlock(&p->lock);
+	if (used[0] != '\0') {
+		gp_grant_forget(p, used, why);
+	}
+	memset(used, 0, sizeof(used));
 }
 
 static enum u_desktop_result
@@ -715,6 +722,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 	}
 	gp_register_app(p);
 	gp_session_close(p);
+	p->start_declined = false;
 	if (!interactive) {
 		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
 		if (rr != U_DESKTOP_OK) {
@@ -801,17 +809,18 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 			gp_set_msg(msg, "no answer to the screen-sharing dialog");
 			return U_DESKTOP_ERR_TIMEOUT;
 		}
-		cap_revoke(p);
+		cap_revoke(p, "the portal no longer restores it silently");
 		gp_set_msg(msg,
 		           "the portal did not restore screen sharing silently (grant gone?) — request access again");
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
 	if (p->resp_code != 0) {
+		p->start_declined = p->resp_code == 1;
 		gp_set_msg(msg,
 		           p->resp_code == 1 ? "the user declined screen sharing" : "the portal refused the session");
 		gp_session_close(p);
 		if (!interactive) {
-			cap_revoke(p);
+			cap_revoke(p, "the portal refused to restore it");
 		}
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
@@ -820,6 +829,7 @@ open_sc_session(struct gnome_portal *p, bool interactive, char *msg)
 	snprintf(p->token, sizeof(p->token), "%s", p->resp_has_token ? p->resp_token : "");
 	pthread_mutex_unlock(&p->lock);
 	gp_cap_after_start(p);
+	gp_grant_save(p); // the renewed token (or none) for the next launch
 	p->last_use_ms = gdbus_now_ms();
 	if (p->cap.nstreams == 0) {
 		gp_set_msg(msg, "no screen was shared");
@@ -854,6 +864,57 @@ scopes_tramp(void *ctx, enum u_desktop_access a)
 	free(r);
 }
 
+/*!
+ * An interactive dialog that may replace the grant: what the old grant covered,
+ * and whether the user's answer dropped it.
+ */
+struct declined_grant
+{
+	bool had;     //!< a grant was set aside for this dialog
+	bool devices; //!< ... covering input
+	bool screens; //!< ... covering the screens
+	bool dropped; //!< the user declined an ASK_AGAIN: the old grant is not put back
+};
+
+static struct declined_grant
+declined_grant_begin(const struct gp_cap_saved *saved)
+{
+	struct declined_grant dg;
+	dg.had = saved->have_token;
+	dg.devices = saved->have_token && !saved->token_sc && saved->token_devices;
+	dg.screens = saved->have_token && saved->token_screens;
+	dg.dropped = false;
+	return dg;
+}
+
+/*!
+ * After the dialog, in place of gp_cap_end_upgrade: the grant follows
+ * u_desktop_gnome_grant_after_request (spec §6.4). A declined ASK_AGAIN is the
+ * user's answer and replaces the grant (spec §10.2): the old one is not put back,
+ * both of its scopes are revoked and its saved copy removed. A declined first
+ * request leaves nothing saved. A declined added scope keeps the old grant (gnome
+ * test plan 11.18), as does a dialog nobody answered or a portal error.
+ */
+static void
+declined_grant_end(
+    struct gnome_portal *p, struct declined_grant *dg, struct gp_cap_saved *saved, enum u_desktop_result r, bool reask)
+{
+	bool ok = r == U_DESKTOP_OK;
+	bool declined = !ok && p->start_declined;
+	bool forget = !ok && u_desktop_gnome_grant_after_request(false, false, declined, reask, dg->had) ==
+	                         U_DESKTOP_GNOME_GRANT_FORGET;
+	dg->dropped = forget && dg->had;
+	gp_cap_end_upgrade(p, saved, ok || dg->dropped);
+	if (dg->dropped) {
+		pthread_mutex_lock(&p->lock);
+		gp_cap_revoked_locked(p); // set aside, never passed: nothing to close at the portal
+		pthread_mutex_unlock(&p->lock);
+	}
+	if (forget) {
+		gp_grant_forget(p, NULL, reask ? "the user declined to share again" : "the user declined the dialog");
+	}
+}
+
 static enum u_desktop_result
 cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 {
@@ -865,6 +926,7 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 	bool want_ctl = (scopes & U_DESKTOP_SCOPE_CONTROL) != 0;
 	bool want_cap = (scopes & U_DESKTOP_SCOPE_CAPTURE) != 0;
 
+	gp_grant_sync(p); // the app's saved grant: no dialog for what it covers
 	pthread_mutex_lock(&p->lock);
 	bool ctl_now = gp_cap_control_granted_locked(p) || p->consent_only_granted;
 	bool cap_now = (p->have_token && p->cap.token_screens) || p->cap.open_streams;
@@ -885,9 +947,10 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 		p->cap.want_sources = want_cap || (reask && (p->cap.token_screens || p->cap.open_streams));
 		pthread_mutex_unlock(&p->lock);
 		gp_cap_begin_upgrade(p, &saved);
+		struct declined_grant dg = declined_grant_begin(&saved);
 		enum u_desktop_result r = gp_open_session(p, true, msg);
 		bool selected = p->cap.sources_selected;
-		gp_cap_end_upgrade(p, &saved, r == U_DESKTOP_OK);
+		declined_grant_end(p, &dg, &saved, r, reask);
 		if (r == U_DESKTOP_OK) {
 			pthread_mutex_lock(&p->lock);
 			ctl = gp_cap_control_granted_locked(p) ? U_DESKTOP_ACCESS_GRANTED : U_DESKTOP_ACCESS_DENIED;
@@ -895,8 +958,11 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 			               : (want_cap ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN);
 			pthread_mutex_unlock(&p->lock);
 		} else if (!gp_quitting(p)) {
-			ctl = want_ctl ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
-			cap = want_cap ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
+			// A declined ASK_AGAIN dropped the old grant: both of its scopes say so.
+			ctl =
+			    want_ctl || (dg.dropped && dg.devices) ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
+			cap =
+			    want_cap || (dg.dropped && dg.screens) ? U_DESKTOP_ACCESS_DENIED : U_DESKTOP_ACCESS_UNKNOWN;
 			U_LOG_W("desktop/gnome: access request: %s", msg);
 		}
 	} else {
@@ -904,8 +970,9 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 			// CAPTURE without CONTROL: a standalone ScreenCast session.
 			struct gp_cap_saved saved;
 			gp_cap_begin_upgrade(p, &saved);
+			struct declined_grant dg = declined_grant_begin(&saved);
 			enum u_desktop_result r = open_sc_session(p, true, msg);
-			gp_cap_end_upgrade(p, &saved, r == U_DESKTOP_OK);
+			declined_grant_end(p, &dg, &saved, r, reask);
 			cap = r == U_DESKTOP_OK ? U_DESKTOP_ACCESS_GRANTED
 			      : gp_quitting(p)  ? U_DESKTOP_ACCESS_UNKNOWN
 			                        : U_DESKTOP_ACCESS_DENIED;
@@ -954,6 +1021,7 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 {
 	struct gp_cap *cp = &p->cap;
 	if (!(p->session_open && cp->nstreams > 0)) {
+		gp_grant_sync(p); // a restore may follow: the saved grant (first use / renewed elsewhere)
 		pthread_mutex_lock(&p->lock);
 		bool tok = p->have_token && cp->token_screens;
 		bool sc = cp->token_sc;
@@ -967,7 +1035,7 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 			return r;
 		}
 		if (cp->nstreams == 0) {
-			cap_revoke(p);
+			cap_revoke(p, "the portal restored no screen");
 			gp_session_close(p);
 			gp_set_msg(c->msg, "the portal restored no screen — request access again");
 			return U_DESKTOP_ERR_NOT_GRANTED;
