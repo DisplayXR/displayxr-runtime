@@ -1002,7 +1002,12 @@ typedef enum XrDesktopActionTypeDXR {
     XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR      = 17, // release a held key
     XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR = 18, // press and hold `button` at `point`
     XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR   = 19, // release a held `button` at `point`
+    XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR = 20, // `text` becomes the clipboard's text
+    XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR = 21, // read it; fetch with xrGetDesktopClipboardTextDXR
 } XrDesktopActionTypeDXR;
+
+static const XrDesktopControlCapabilityFlagsDXR XR_DESKTOP_CONTROL_CAPABILITY_CLIPBOARD_BIT_DXR = 0x80;
+#define XR_MAX_DESKTOP_CLIPBOARD_TEXT_SIZE_DXR 1048576 // bytes of UTF-8, terminator excluded
 
 typedef XrFlags64 XrDesktopKeyModifierFlagsDXR;
 static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR  = 0x1;
@@ -1019,6 +1024,10 @@ typedef struct XrDesktopActionModifiersDXR {
 
 //! XrDesktopActionDXR::targetWindowId of input meant for the desktop shell (§11.5).
 #define XR_DESKTOP_TARGET_SHELL_DXR ((uint64_t)0xFFFFFFFFFFFFFFFFull)
+
+//! The text a successful GET_CLIPBOARD_TEXT read (two-call idiom, bytes incl. the NUL).
+XrResult xrGetDesktopClipboardTextDXR(XrSession session, uint64_t actionId,
+                                      uint32_t capacityInput, uint32_t* countOutput, char* buffer);
 ```
 
 `XrDesktopActionDXR` keeps its layout; `keys` also carries the one key of KEY_DOWN / KEY_UP.
@@ -1165,6 +1174,49 @@ target is never an app window) all apply as for any target.
   → search and launch; `CLICK` on the dock or the top bar (shell); a drag from a window
   (`BUTTON_DOWN` on the window) dropped on the desktop (`BUTTON_UP` with the shell target).
 
+### 11.6 Clipboard text
+
+Two action types, so the clipboard runs **in submission order with every other action** on the
+session's worker — a `SET_CLIPBOARD_TEXT` queued behind a `TYPE_TEXT` starts only after the
+paste and its clipboard hand-over (§7, GNOME) are over, and never fights it; a
+`GET_CLIPBOARD_TEXT` after it reads what the clipboard holds then.
+
+- **Consent**: the CONTROL scope (`GRANTED`), like every action; the kill switch, the lock, a
+  deny and revocation refuse it (§5 step 1, and the guard right before the backend reads or
+  writes). The capability is `XR_DESKTOP_CONTROL_CAPABILITY_CLIPBOARD_BIT_DXR` (else
+  `FEATURE_UNSUPPORTED` "this desktop backend has no clipboard access").
+- **Validation**: `targetWindowId` must be **0** (the clipboard is no window's); `SET` needs
+  `text`: non-empty, valid UTF-8, at most `XR_MAX_DESKTOP_CLIPBOARD_TEXT_SIZE_DXR` (1 MiB) bytes.
+- **`SET_CLIPBOARD_TEXT`**: the text becomes the clipboard's text for every app, as a copy
+  would, until something else is copied. It waits for the user to be idle (§5 step 2) — it
+  changes what the user would paste next. The completion is `ok`.
+- **`GET_CLIPBOARD_TEXT`**: reads the clipboard's text, whoever copied it — the user's copy is
+  what it returns after a user copy. It does **not** wait for the user (it changes nothing).
+  The completion carries no text; the app fetches it with `xrGetDesktopClipboardTextDXR(actionId)`
+  (two-call idiom, bytes with the terminator). No text on the clipboard (empty, or another type
+  only): `XR_SUCCESS`, message "ok (the clipboard holds no text)", the text `""`. Larger than
+  1 MiB: `XR_ERROR_LIMIT_REACHED` "the clipboard text is larger than 1048576 bytes" (never cut).
+  Not valid UTF-8: `XR_ERROR_RUNTIME_FAILURE`. A NUL inside ends the text (it is a C string).
+- **Retention**, as for capture images (§10.3): only the most recent successful GET's text is
+  kept, until a call copies it out, the next GET completes, the session ends or 10 s pass; a
+  size query or a too-small buffer (`XR_ERROR_SIZE_INSUFFICIENT`) keeps it. Any other id, an
+  expired or an already copied one: `XR_ERROR_VALIDATION_FAILURE`. The memory is wiped when
+  retention ends, and so is a `SET`'s copy once it ran.
+- **Privacy**: the text never reaches a log, a message or the audit. The audit records
+  `clipboard_set` / `clipboard_get` with `bytes` (the size) and the result only; failures read
+  as fixed strings ("the clipboard could not be read", …), never a backend's own message.
+- **GNOME** — the RemoteDesktop session's portal clipboard, the one typing already uses:
+  - GET: `SelectionRead` of `text/plain;charset=utf-8` from the selection's owner (the user's
+    app, or mutter's clipboard manager once it is gone), bounded (1 s for the reply, 1 s for the
+    data). The session's own selection (a SET, or the previous text offered again after a type)
+    is answered from memory: reading it through the portal would ask the portal thread to serve
+    itself. A copy announced before the read (`SelectionOwnerChanged`) is the user's and is read
+    from them; a copy whose signal has not reached the process yet is the residual race.
+  - SET: `SetSelection`, served until another client takes the selection; mutter's clipboard
+    manager reads a copy as soon as the session owns it, so the text outlives the session's
+    2 s idle close. A previous text queued for a type's restore is superseded.
+  - Works while the app is not focused: the portal clipboard needs no focus.
+
 ### 11.7 Version gating and errors
 
 - A version 2 runtime refuses `KEY_DOWN`, `KEY_UP`, `BUTTON_DOWN` and `BUTTON_UP` at submit
@@ -1174,6 +1226,9 @@ target is never an app window) all apply as for any target.
   use any of §11 only when it is 3 or more.
 - A version 2 runtime has no window with the id `XR_DESKTOP_TARGET_SHELL_DXR`: an action with the
   shell target completes `XR_ERROR_DESKTOP_WINDOW_LOST_DXR` there (§5 step 3), never delivered.
+- A version 2 runtime refuses `SET_CLIPBOARD_TEXT` / `GET_CLIPBOARD_TEXT` at submit
+  (`XR_ERROR_VALIDATION_FAILURE`), reports no `CLIPBOARD_BIT`, and has no
+  `xrGetDesktopClipboardTextDXR` (`xrGetInstanceProcAddr`: `XR_ERROR_FUNCTION_UNSUPPORTED`).
 - New completion results, all existing codes: `REFUSED` for the hold rules above, for every
   dropped action and for the shell target's verification; `FEATURE_UNSUPPORTED` "this desktop
   backend cannot hold keys" where a backend has no `key_event` (none today) and for keys for the
@@ -1187,6 +1242,8 @@ target is never an app window) all apply as for any target.
 - `click` / `drag` / `scroll` records carry their modifiers in `keys` ("ctrl+shift").
 - `button_down` / `button_up` carry `x` / `y` and the target like a click.
 - An action for the shell target names it as `"target":{"kind":"shell"}` (never the raw id).
+- `clipboard_set` / `clipboard_get` carry `bytes` (the text's size) and no target — never the
+  text: `{"action":"clipboard_get","bytes":42,"result":"ok"}`.
 - Every automatic release is one `release` record with `count` (items released) and the reason
   as `message`; the dropped actions are each audited `refused` with the drop message.
 
@@ -1200,6 +1257,7 @@ target is never an app window) all apply as for any target.
 | second line | keys / buttons libei holds are released before the portal session closes; the session is not closed idle while one is held | held keys released on destroy | held keys released on destroy |
 | shell target, pointer | the extension's pick: `shell` (top bar, dash / dock, overview, popups) or `desktop` (background, desktop icons) | `WindowFromPoint` root: `Shell_TrayWnd` & co. (taskbar), `Progman` / `WorkerW` (desktop) | CGWindowList layer > 0 (Dock, menu bar) or the desktop |
 | shell target, keys | no window has mutter's focus, or `org.gnome.Shell.OverviewActive` (the overview holds the keyboard) | the foreground root is the taskbar / desktop class or not a listed window; a `NULL` foreground is refused (in transition) | **UNSUPPORTED**: macOS always has a frontmost app taking the keys, and an unknown focus would read as none |
+| clipboard | the portal clipboard of the RemoteDesktop session (`SelectionRead` / `SetSelection`); needs the Clipboard portal and input (libei) — else no `CLIPBOARD_BIT` | `CF_UNICODETEXT` (`OpenClipboard`, retried ~0.5 s while another app holds it; a message-only window owns it while writing) | `NSPasteboard generalPasteboard`, `NSPasteboardTypeString` |
 
 ### 11.10 Needs the maintainer's decision
 
@@ -1224,3 +1282,12 @@ target is never an app window) all apply as for any target.
 8. **Window-targeted keys refused while the GNOME overview is open** (§11.5): a behaviour change
    for version 2 apps on GNOME, proposed as a fix (they went into the overview's search).
 9. **macOS keys for the shell** are UNSUPPORTED (§11.9); pointer input for the shell works.
+10. **The clipboard as two action types** (ordered with typing by construction, one validation,
+    consent and audit path, async like everything that may block) versus dedicated functions
+    (`xrSetDesktopClipboardTextDXR` / a get with its own event). Action types are proposed.
+11. **`SET` waits for the user to be idle, `GET` does not** — or neither / both.
+12. **1 MiB, never cut**: a larger clipboard text is refused (`LIMIT_REACHED`) rather than cut
+    (an agent acting on half a document is worse than one that knows it cannot read it).
+13. **Windows clipboard history**: an agent's `SET` goes into Windows' clipboard history (Win+V)
+    and cloud clipboard like a user's copy. Excluding it (`ExcludeClipboardContentFromMonitorProcessing`)
+    is possible; not done here.

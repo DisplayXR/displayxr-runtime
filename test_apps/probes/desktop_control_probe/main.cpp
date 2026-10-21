@@ -36,7 +36,9 @@
  *
  * act TYPE: activate | move | minimize | restore | maximize | close | type | key |
  *           move-pointer | click | drag | scroll
- *           spec v3: key-down | key-up (keys=ONE key or modifier) | button-down | button-up
+ *           spec v3: key-down | key-up (keys=ONE key or modifier) | button-down | button-up |
+ *                    clip-set (text=...) | clip-get (fetches the text: prints its size,
+ *                    and the text itself only with show=1)
  * act keys: target=ID|shell (spec v3: shell = XR_DESKTOP_TARGET_SHELL_DXR)  x=  y=  x2=  y2=
  *           rect=X,Y,W,H  button=left|right|middle
  *           count=N  sx=  sy=  text="..."  keys=ctrl+s
@@ -49,6 +51,7 @@
  *   expect RESULT               fail unless the last act ended with RESULT
  *                               (XR_SUCCESS, XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR, ...)
  *   expect-text X Y "TEXT"      fail unless the text at X Y is TEXT
+ *   expect-clipboard "TEXT"     spec v3: fail unless the last clip-get fetched TEXT (never printed)
  *   expect-rejected request...  fail unless that request / request-scopes is
  *                               XR_ERROR_VALIDATION_FAILURE (e.g. a bad --parent=)
  *   expect-capture-state STATE  fail unless xrGetDesktopCaptureStateDXR says STATE
@@ -98,6 +101,10 @@ PFN_xrSubmitDesktopActionDXR pSubmit;
 PFN_xrGetDesktopCaptureStateDXR pGetCaptureState;
 PFN_xrCaptureDesktopDXR pCapture;
 PFN_xrGetDesktopCaptureImageDXR pGetCaptureImage;
+PFN_xrGetDesktopClipboardTextDXR pGetClipText; //!< spec v3, NULL on an older runtime
+//! The last clip-get's text (spec v3) — compared by expect-clipboard, printed only with show=1.
+std::string g_clip;
+bool g_clip_valid = false;
 
 //! The last capture: its completion event and (when it succeeded) its image.
 struct LastCapture
@@ -285,6 +292,8 @@ parse_type(const std::string &t, XrDesktopActionTypeDXR *out)
 	    {"key-up", XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR},
 	    {"button-down", XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR},
 	    {"button-up", XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR},
+	    {"clip-set", XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR},
+	    {"clip-get", XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR},
 	};
 	for (const auto &e : table) {
 		if (t == e.n) {
@@ -311,6 +320,7 @@ cmd_act(const std::vector<std::string> &args)
 	bool have_text = false, have_keys = false;
 	XrDesktopActionModifiersDXR mods = {XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR};
 	bool have_mods = false;
+	bool show = false;
 	for (size_t i = 2; i < args.size(); i++) {
 		size_t eq = args[i].find('=');
 		if (eq == std::string::npos) {
@@ -350,6 +360,8 @@ cmd_act(const std::vector<std::string> &args)
 		} else if (k == "keys") {
 			keys = v;
 			have_keys = true;
+		} else if (k == "show") {
+			show = v == "1";
 		} else if (k == "mods") {
 			// "ctrl+shift" (or a number): chained XrDesktopActionModifiersDXR (spec v3).
 			have_mods = true;
@@ -390,6 +402,26 @@ cmd_act(const std::vector<std::string> &args)
 		return 1;
 	}
 	g_last_act = done;
+	if (a.actionType == XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR) {
+		g_clip_valid = false;
+		g_clip.clear();
+		if (done == XR_SUCCESS && pGetClipText != nullptr) {
+			uint32_t n = 0;
+			XrResult fr = pGetClipText(g_session, id, 0, &n, nullptr);
+			std::vector<char> buf(n > 0 ? n : 1);
+			if (XR_SUCCEEDED(fr)) {
+				fr = pGetClipText(g_session, id, n, &n, buf.data());
+			}
+			if (XR_SUCCEEDED(fr)) {
+				g_clip.assign(buf.data());
+				g_clip_valid = true;
+				printf("clipboard: %zu bytes%s%s%s\n", g_clip.size(), show ? " \"" : "",
+				       show ? g_clip.c_str() : "", show ? "\"" : "");
+			} else {
+				printf("clipboard: fetch -> %s\n", result_name(fr).c_str());
+			}
+		}
+	}
 	return g_in_script || done == XR_SUCCESS ? 0 : 1;
 }
 
@@ -883,6 +915,11 @@ run_command(const std::vector<std::string> &all_args)
 		printf("expect-rejected: %s (was %s)\n", ok ? "PASS" : "FAIL", result_name(g_last_act).c_str());
 		return ok ? 0 : 1;
 	}
+	if (c == "expect-clipboard") {
+		bool ok = args.size() > 1 && g_clip_valid && g_clip == args[1];
+		printf("expect-clipboard: %s (%zu bytes fetched)\n", ok ? "PASS" : "FAIL", g_clip.size());
+		return ok ? 0 : 1;
+	}
 	if (c == "expect-text") {
 		std::string t;
 		bool ok = args.size() > 3 && cmd_text(atoi(args[1].c_str()), atoi(args[2].c_str()), &t) == 0 &&
@@ -980,6 +1017,11 @@ setup()
 	GET(xrCaptureDesktopDXR, pCapture);
 	GET(xrGetDesktopCaptureImageDXR, pGetCaptureImage);
 #undef GET
+	// Spec v3 (optional: an older runtime has no clipboard function).
+	if (XR_FAILED(xrGetInstanceProcAddr(g_instance, "xrGetDesktopClipboardTextDXR",
+	                                    (PFN_xrVoidFunction *)&pGetClipText))) {
+		pGetClipText = nullptr;
+	}
 
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
 	sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;

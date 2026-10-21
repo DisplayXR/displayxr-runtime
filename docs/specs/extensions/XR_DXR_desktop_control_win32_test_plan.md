@@ -254,6 +254,16 @@ Through `desktop_control_probe` (the safety layer) against Notepad (`NP`) unless
 | 11.25 | The same with a Notepad target while the taskbar is the foreground | `REFUSED` (focus) — version 2's behaviour |
 | 11.26 | `act type target=shell text="notepad"` with Start open | typed into Start's search (record whether Start's search is the foreground root and which class it reports) |
 
+### 11c. Clipboard text (§11.6)
+
+| # | Check | Expected |
+|---|---|---|
+| 11.40 | `act clip-set text="héllo ✓"` with the probe unfocused, then Ctrl+V in Notepad by hand | `héllo ✓` |
+| 11.41 | Copy "X" in Notepad, `act clip-get` + `expect-clipboard "X"` | PASS |
+| 11.42 | Hold the clipboard open from another process (a PowerShell loop calling `OpenClipboard`) | `clip-get` / `clip-set` complete `XR_ERROR_RUNTIME_FAILURE` ("the clipboard did not answer in time") after ~0.5 s, no hang |
+| 11.43 | Copy an image only, `act clip-get` | `ok (the clipboard holds no text)`, "" |
+| 11.44 | Win+V after a `clip-set` | the agent's text is in the clipboard history (record it — spec §11.10 item 13) |
+
 ## What to send back
 
 The full stdout of each step, the Windows build (`winver`), the per-monitor scale factors,

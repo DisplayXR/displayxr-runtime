@@ -592,3 +592,35 @@ Rejected: *dropping target verification when no window is under the point* (any 
 notification appearing there would take the click silently); *a per-app "shell allowed" grant*
 (a standing permission is broader than a per-action request, and nothing in the user's consent
 dialog distinguishes it).
+
+### D12. Clipboard text, under CONTROL, ordered with typing
+
+`SET_CLIPBOARD_TEXT` and `GET_CLIPBOARD_TEXT` are actions: they need the CONTROL consent, stop
+at the kill switch and the lock, are audited, and run in submission order with the other
+actions. Ordering is the point: on GNOME typing itself goes through the clipboard (§7 of the
+spec), so a clipboard write from a second path could land between an agent's paste and its
+restore, and a read could return the agent's own text instead of the user's. As actions, a SET
+never fights a paste in flight and a GET after a user's copy reads the user's copy.
+
+1. **The text never reaches the audit or a log** — the record has `bytes` and the result; failure
+   messages are fixed strings. The runtime keeps a GET's text only until the app copies it out
+   (10 s at most) and wipes it.
+2. **1 MiB, refused beyond, never cut.**
+3. **A SET waits for an idle user** like input does (it changes what the user would paste); a GET
+   changes nothing and does not wait.
+4. **Honesty about strength**, as for capture (Amendment 1, D7): on Windows and macOS any app can
+   read the clipboard without asking; the CONTROL scope makes the agent's use visible and
+   stoppable, it is not an OS enforcement point. On GNOME it is enforced — the portal clipboard
+   is the app's consented path.
+
+Rejected: *the GNOME Clipboard portal outside the RemoteDesktop session* (it exists only inside
+one); *a synchronous get on the app's thread* (a hung clipboard owner would stall the app's
+frame; the read is bounded on the worker instead); *returning the first 1 MiB of a larger text*.
+
+### Open points for the maintainer (spec §11.10)
+
+The limits (10 s, 2 s, 8 keys, 1 MiB); dropping queued input after an automatic release;
+modifiers as a chained structure; SCROLL with modifiers; shell UI focus not being "away"; the
+shell target as a reserved id; text for the shell; refusing window keys while the GNOME overview
+is open (a behaviour change); macOS keys for the shell; the clipboard as actions; the idle rule
+for SET / GET; refusing a too-large clipboard; Windows clipboard history.

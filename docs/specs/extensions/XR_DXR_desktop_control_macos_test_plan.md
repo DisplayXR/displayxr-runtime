@@ -234,3 +234,5 @@ Needs Accessibility, like §4. Through `desktop_control_probe` against TextEdit 
 | H7 | `act click target=shell` on a Dock icon and on the menu bar (Apple menu) | the app launches / the menu opens |
 | H8 | `act click target=shell` over a window | `REFUSED "the shell is not under the point (found …)"` |
 | H9 | `act key target=shell keys=super+space` | `FEATURE_UNSUPPORTED` (keys for the shell are not supported on macOS) |
+| H10 | `act clip-set text="héllo ✓"`, then ⌘V in TextEdit by hand; copy "X" in TextEdit, `act clip-get` + `expect-clipboard "X"` | `héllo ✓`; PASS (no TCC prompt: the pasteboard needs none) |
+| H11 | Copy an image only, `act clip-get` | `ok (the clipboard holds no text)`, "" |

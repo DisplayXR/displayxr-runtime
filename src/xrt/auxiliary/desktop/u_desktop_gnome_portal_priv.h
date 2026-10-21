@@ -70,6 +70,10 @@ struct gp_cmd
 	// Result.
 	enum u_desktop_result result;
 	char msg[U_DESKTOP_MSG_SIZE];
+	//! Spec v3, clip_get: the clipboard text read (malloc'd; NOT freed by gp_cmd_free —
+	//! gp_run_sync_keep's copy takes it, and only clip_get sets it, always run that way).
+	char *out_text;
+	size_t out_len;
 
 	// Lifetime (under gnome_portal::lock).
 	bool async;     //!< nobody waits: the thread frees it

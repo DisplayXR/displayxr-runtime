@@ -141,7 +141,11 @@ enum u_desktop_caps
 	U_DESKTOP_CAP_WINDOW_ACTIONS = 0x10,
 	U_DESKTOP_CAP_INPUT = 0x20,
 	U_DESKTOP_CAP_CAPTURE = 0x40, //!< spec v2: screen stills (the `capture` op)
+	U_DESKTOP_CAP_CLIPBOARD = 0x80, //!< spec v3: clipboard text (clipboard_get / clipboard_set)
 };
+
+//! Spec v3: the largest clipboard text read or written, in bytes (terminator excluded).
+#define U_DESKTOP_CLIPBOARD_MAX_BYTES (1u << 20)
 
 //! The consent scopes (spec v2, same bits as XrDesktopControlScopeFlagsDXR).
 enum u_desktop_scope
@@ -591,6 +595,34 @@ struct u_desktop_backend
 	 * reading the idle counter as the user's while it is true (spec §11.3). Worker only.
 	 */
 	bool (*holds_repeating_key)(struct u_desktop_backend *b);
+
+	// ---- spec v3: clipboard text (worker thread only, in submission order with every
+	// ---- other action, so it never runs during a paste). Optional together: a backend
+	// ---- with both sets U_DESKTOP_CAP_CLIPBOARD. PRIVACY: the text never reaches a log,
+	// ---- a message or the audit (sizes only).
+
+	/*!
+	 * The clipboard's text as UTF-8: @p *out malloc'd and NUL-terminated (the caller
+	 * wipes and frees it), @p *len its length. At most U_DESKTOP_CLIPBOARD_MAX_BYTES + 1
+	 * bytes are returned: a longer text is cut there and the common layer refuses it.
+	 * OK with @p *out NULL: the clipboard holds no text (empty, or another type only).
+	 * Calls guard->still_allowed before it reads. Bounded (~1 s).
+	 */
+	enum u_desktop_result (*clipboard_get)(struct u_desktop_backend *b,
+	                                       const struct u_desktop_input_guard *guard,
+	                                       char **out,
+	                                       size_t *len,
+	                                       char *msg);
+
+	/*!
+	 * Make @p utf8 (valid, non-empty, at most U_DESKTOP_CLIPBOARD_MAX_BYTES) the
+	 * clipboard's text, as a copy would — for every app, until something else is
+	 * copied. Calls guard->still_allowed right before it writes. Bounded.
+	 */
+	enum u_desktop_result (*clipboard_set)(struct u_desktop_backend *b,
+	                                       const struct u_desktop_input_guard *guard,
+	                                       const char *utf8,
+	                                       char *msg);
 
 	// ---- spec v2: screen capture. All optional (NULL = no capture; then the backend
 	// ---- must not set U_DESKTOP_CAP_CAPTURE). See "Capture" below.

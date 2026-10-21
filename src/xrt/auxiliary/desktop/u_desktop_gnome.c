@@ -1252,6 +1252,43 @@ gnome_key_event(struct u_desktop_backend *b,
 	return r;
 }
 
+/*
+ * Spec v3: clipboard text, through the RemoteDesktop session's portal clipboard (the
+ * same one text typing uses — and the actions run in order, so never mid-paste).
+ */
+
+static enum u_desktop_result
+gnome_clipboard_get(struct u_desktop_backend *b,
+                    const struct u_desktop_input_guard *guard,
+                    char **out,
+                    size_t *len,
+                    char *msg)
+{
+	struct gnome_backend *g = gnome(b);
+	*out = NULL;
+	*len = 0;
+	if (!gnome_can_input(g, msg)) {
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	if (!guard_allows(guard, msg)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return gnome_portal_clip_get(g->portal, out, len, msg);
+}
+
+static enum u_desktop_result
+gnome_clipboard_set(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
+{
+	struct gnome_backend *g = gnome(b);
+	if (!gnome_can_input(g, msg)) {
+		return U_DESKTOP_ERR_UNSUPPORTED;
+	}
+	if (!guard_allows(guard, msg)) {
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	return gnome_portal_clip_set(g->portal, utf8, msg);
+}
+
 /*!
  * Spec v3: mutter auto-repeats a held key itself (for Clutter / the shell; Wayland
  * clients repeat on their own) and every repeat resets its IdleMonitor — measured in
@@ -1582,6 +1619,12 @@ u_desktop_backend_create_platform(void)
 	g->base.type_text = gnome_type_text;
 	g->base.key_event = gnome_key_event;
 	g->base.holds_repeating_key = gnome_holds_repeating_key;
+	if (input && have_clip) {
+		g->base.clipboard_get = gnome_clipboard_get; // spec v3
+		g->base.clipboard_set = gnome_clipboard_set;
+		caps |= U_DESKTOP_CAP_CLIPBOARD;
+		g->base.caps = caps;
+	}
 	g->base.key_chord = gnome_key_chord;
 	g->base.pointer_move = gnome_pointer_move;
 	g->base.pointer_button = gnome_pointer_button;

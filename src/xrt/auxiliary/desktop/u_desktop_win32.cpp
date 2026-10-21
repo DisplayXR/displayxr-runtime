@@ -2309,6 +2309,127 @@ win32_scroll(struct u_desktop_backend *b,
 
 /*
  *
+ * Spec v3: clipboard text (worker thread). CF_UNICODETEXT, converted to and from
+ * UTF-8. The text never reaches a log or a message.
+ *
+ */
+
+//! OpenClipboard, retried while another process holds it (~0.5 s).
+static bool
+clip_open(HWND owner)
+{
+	for (int i = 0; i < 25; i++) {
+		if (OpenClipboard(owner)) {
+			return true;
+		}
+		Sleep(20);
+	}
+	return false;
+}
+
+static enum u_desktop_result
+win32_clipboard_get(struct u_desktop_backend *b,
+                    const struct u_desktop_input_guard *guard,
+                    char **out,
+                    size_t *len,
+                    char *msg)
+{
+	(void)b;
+	*out = NULL;
+	*len = 0;
+	if (!guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+		return U_DESKTOP_OK; // no text on the clipboard (*out stays NULL)
+	}
+	if (!clip_open(NULL)) {
+		set_msg(msg, "another app holds the clipboard open");
+		return U_DESKTOP_ERR_TIMEOUT;
+	}
+	enum u_desktop_result r = U_DESKTOP_OK;
+	HANDLE h = GetClipboardData(CF_UNICODETEXT);
+	const wchar_t *w = h != NULL ? (const wchar_t *)GlobalLock(h) : NULL;
+	if (w != NULL) {
+		size_t wlen = wcsnlen(w, GlobalSize(h) / sizeof(wchar_t));
+		// Each UTF-16 unit is at least one UTF-8 byte: converting more than the limit + 1
+		// units cannot fit, and the common layer refuses anything over the limit.
+		size_t take = wlen > (size_t)U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 ? (size_t)U_DESKTOP_CLIPBOARD_MAX_BYTES + 1
+		                                                                : wlen;
+		int n = take > 0 ? WideCharToMultiByte(CP_UTF8, 0, w, (int)take, NULL, 0, NULL, NULL) : 0;
+		char *buf = (char *)malloc((size_t)(n > 0 ? n : 0) + 1);
+		if (buf == NULL) {
+			r = U_DESKTOP_ERR_FAILED;
+		} else {
+			if (n > 0) {
+				WideCharToMultiByte(CP_UTF8, 0, w, (int)take, buf, n, NULL, NULL);
+			}
+			buf[n > 0 ? n : 0] = '\0';
+			*out = buf;
+			*len = (size_t)(n > 0 ? n : 0);
+		}
+		GlobalUnlock(h);
+	}
+	CloseClipboard();
+	return r;
+}
+
+static enum u_desktop_result
+win32_clipboard_set(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
+{
+	(void)b;
+	std::wstring w = utf8_to_utf16(utf8);
+	size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+	HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+	void *dst = mem != NULL ? GlobalLock(mem) : NULL;
+	if (dst == NULL) {
+		if (mem != NULL) {
+			GlobalFree(mem);
+		}
+		set_msg(msg, "out of memory");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	memcpy(dst, w.c_str(), bytes);
+	GlobalUnlock(mem);
+	SecureZeroMemory(&w[0], w.size() * sizeof(wchar_t));
+	// A window of our own owns the clipboard while we write it: EmptyClipboard with a
+	// NULL owner makes SetClipboardData fail. Message-only, never shown; the data
+	// (not delay-rendered) stays on the clipboard after the window is gone.
+	HWND owner = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
+	enum u_desktop_result r = U_DESKTOP_OK;
+	if (!guard_allows(guard)) {
+		set_msg(msg, "%s", k_msg_stopped);
+		r = U_DESKTOP_ERR_REFUSED;
+	} else if (!clip_open(owner)) {
+		set_msg(msg, "another app holds the clipboard open");
+		r = U_DESKTOP_ERR_TIMEOUT;
+	} else {
+		EmptyClipboard();
+		if (SetClipboardData(CF_UNICODETEXT, mem) != NULL) {
+			mem = NULL; // the clipboard owns it now
+		} else {
+			set_msg(msg, "SetClipboardData failed (error %lu)", (unsigned long)GetLastError());
+			r = U_DESKTOP_ERR_FAILED;
+		}
+		CloseClipboard();
+	}
+	if (mem != NULL) {
+		void *p = GlobalLock(mem);
+		if (p != NULL) {
+			SecureZeroMemory(p, bytes);
+			GlobalUnlock(mem);
+		}
+		GlobalFree(mem);
+	}
+	if (owner != NULL) {
+		DestroyWindow(owner);
+	}
+	return r;
+}
+
+/*
+ *
  * Lifecycle.
  *
  */
@@ -2389,6 +2510,9 @@ u_desktop_backend_create_platform(void)
 	b->pointer_button = win32_pointer_button;
 	b->scroll = win32_scroll;
 	b->key_event = win32_key_event; // spec v3: KEY_DOWN / KEY_UP, modifiers around a pointer action
+	b->clipboard_get = win32_clipboard_get; // spec v3: clipboard text
+	b->clipboard_set = win32_clipboard_set;
+	b->caps |= U_DESKTOP_CAP_CLIPBOARD;
 	b->destroy = win32_destroy;
 	return b;
 }

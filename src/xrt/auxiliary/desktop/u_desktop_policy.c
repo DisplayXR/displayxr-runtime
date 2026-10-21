@@ -1206,6 +1206,9 @@ u_desktop_audit_append(const struct u_desktop_audit_record *r)
 	if (r->count > 0) {
 		cJSON_AddNumberToObject(o, "count", r->count);
 	}
+	if (r->has_bytes) {
+		cJSON_AddNumberToObject(o, "bytes", (double)r->bytes); // spec v3: a size, never the text
+	}
 	if (r->first_t != NULL) {
 		cJSON_AddStringToObject(o, "first", r->first_t);
 	}

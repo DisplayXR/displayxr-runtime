@@ -1029,3 +1029,249 @@ TEST_CASE("v3_shell: the user is waited for, the audit names the shell", "[deskt
 	CHECK(audit.find("\"target\":{\"kind\":\"shell\"}") != std::string::npos);
 	CHECK(audit.find("18446744073709551615") == std::string::npos); // never the raw id
 }
+
+
+/*
+ *
+ * Item 3: clipboard text (§11.6).
+ *
+ */
+
+namespace {
+
+u_desktop_action
+clip_set(const char *text)
+{
+	u_desktop_action a = act(U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT, 0);
+	a.text = text;
+	return a;
+}
+
+u_desktop_action
+clip_get()
+{
+	return act(U_DESKTOP_ACTION_GET_CLIPBOARD_TEXT, 0);
+}
+
+//! Fetch a GET's text with the two-call idiom; "<invalid>" when the id is refused.
+std::string
+fetch(u_desktop_control *c, uint64_t id)
+{
+	uint32_t n = 0;
+	if (u_desktop_control_clipboard_text(c, id, 0, &n, nullptr) != U_DESKTOP_XR_SUCCESS) {
+		return "<invalid>";
+	}
+	std::vector<char> buf(n);
+	REQUIRE(u_desktop_control_clipboard_text(c, id, n, &n, buf.data()) == U_DESKTOP_XR_SUCCESS);
+	return std::string(buf.data());
+}
+
+} // namespace
+
+TEST_CASE("v3_clipboard: validation", "[desktop][v3][clipboard][validate]")
+{
+	CHECK(valid(clip_set("hello")));
+	CHECK(valid(clip_get()));
+	char why[160];
+	u_desktop_action a = clip_set("hello");
+	a.target_window_id = 101;
+	CHECK_FALSE(u_desktop_control_validate(&a, why, sizeof(why)));
+	CHECK(std::string(why) == "targetWindowId must be 0 for a clipboard action");
+	a = clip_get();
+	a.target_window_id = U_DESKTOP_TARGET_SHELL;
+	CHECK_FALSE(valid(a));
+	CHECK_FALSE(valid(clip_set("")));
+	CHECK_FALSE(valid(clip_set(nullptr)));
+	CHECK_FALSE(valid(clip_set("bad \xff utf-8")));
+	std::string max(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'x');
+	CHECK(valid(clip_set(max.c_str())));
+	std::string over(U_DESKTOP_CLIPBOARD_MAX_BYTES + 1, 'x');
+	CHECK_FALSE(valid(clip_set(over.c_str())));
+	// Every other action still needs a target.
+	u_desktop_action t = act(U_DESKTOP_ACTION_TYPE_TEXT, 0);
+	t.text = "x";
+	CHECK_FALSE(u_desktop_control_validate(&t, why, sizeof(why)));
+	CHECK(std::string(why) == "targetWindowId is required");
+}
+
+TEST_CASE("v3_clipboard: set, get, the user's copy wins, the two-call fetch and its retention",
+          "[desktop][v3][clipboard]")
+{
+	TempDir dir;
+	Harness h;
+	auto r = h.run(clip_set("from the agent — ünïcode"));
+	CHECK(r.result == U_DESKTOP_XR_SUCCESS);
+	CHECK(r.message == "ok");
+	char buf[256];
+	REQUIRE(u_desktop_fake_clipboard(h.fake, buf, sizeof(buf)));
+	CHECK(std::string(buf) == "from the agent — ünïcode");
+
+	uint64_t id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(2));
+	CHECK(h.rec.completion(id).result == U_DESKTOP_XR_SUCCESS);
+	// The size query and a too-small buffer keep it; a copy ends it.
+	uint32_t n = 0;
+	CHECK(u_desktop_control_clipboard_text(h.c, id, 0, &n, nullptr) == U_DESKTOP_XR_SUCCESS);
+	CHECK(n == strlen("from the agent — ünïcode") + 1);
+	char small[4];
+	CHECK(u_desktop_control_clipboard_text(h.c, id, sizeof(small), &n, small) == U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT);
+	CHECK(fetch(h.c, id) == "from the agent — ünïcode");
+	CHECK(fetch(h.c, id) == "<invalid>");      // already copied out
+	CHECK(fetch(h.c, id + 100) == "<invalid>"); // never a GET
+
+	// The user copies afterwards: a GET returns the user's text.
+	u_desktop_fake_set_clipboard(h.fake, "the user's copy");
+	id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(3));
+	CHECK(fetch(h.c, id) == "the user's copy");
+
+	// Only the most recent GET is kept, and not past the retention.
+	uint64_t id1 = h.submit(clip_get());
+	uint64_t id2 = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(5));
+	CHECK(fetch(h.c, id1) == "<invalid>");
+	u_desktop_control_set_clipboard_retention_for_tests(h.c, 100ull * 1000000ull);
+	uint64_t id3 = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(6));
+	(void)id2;
+	std::this_thread::sleep_for(250ms);
+	CHECK(fetch(h.c, id3) == "<invalid>");
+}
+
+TEST_CASE("v3_clipboard: no text, too large, not UTF-8", "[desktop][v3][clipboard]")
+{
+	TempDir dir;
+	Harness h;
+	u_desktop_fake_set_clipboard(h.fake, nullptr);
+	uint64_t id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(1));
+	auto r = h.rec.completion(id);
+	CHECK(r.result == U_DESKTOP_XR_SUCCESS);
+	CHECK(r.message == "ok (the clipboard holds no text)");
+	CHECK(fetch(h.c, id) == "");
+
+	std::string max(U_DESKTOP_CLIPBOARD_MAX_BYTES, 'y');
+	u_desktop_fake_set_clipboard(h.fake, max.c_str());
+	id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(2));
+	CHECK(h.rec.completion(id).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(fetch(h.c, id).size() == U_DESKTOP_CLIPBOARD_MAX_BYTES);
+
+	std::string over(U_DESKTOP_CLIPBOARD_MAX_BYTES + 10, 'z');
+	u_desktop_fake_set_clipboard(h.fake, over.c_str());
+	id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(3));
+	r = h.rec.completion(id);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_LIMIT_REACHED);
+	CHECK(r.message == "the clipboard text is larger than 1048576 bytes");
+	CHECK(fetch(h.c, id) == "<invalid>");
+
+	u_desktop_fake_set_clipboard(h.fake, "latin-1 \xe9t\xe9");
+	id = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(4));
+	CHECK(h.rec.completion(id).result == U_DESKTOP_XR_ERROR_RUNTIME_FAILURE);
+	CHECK(h.rec.completion(id).message == "the clipboard text is not valid UTF-8");
+}
+
+TEST_CASE("v3_clipboard: consent, the kill switch, the capability, the idle rule", "[desktop][v3][clipboard]")
+{
+	TempDir dir;
+	SECTION("not granted: refused at submit")
+	{
+		u_desktop_backend *b = u_desktop_fake_create();
+		Recorder rec;
+		u_desktop_app_info app = {kExe, "agent-app", nullptr, nullptr};
+		u_desktop_control_callbacks cb = {Recorder::on_state, Recorder::on_done, &rec, nullptr, nullptr};
+		u_desktop_control *c = nullptr;
+		REQUIRE(u_desktop_control_create(b, &app, &cb, &kFast, &c) == 0);
+		uint64_t id = 0;
+		u_desktop_action g = clip_get();
+		CHECK(u_desktop_control_submit(c, &g, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		u_desktop_control_destroy(&c);
+	}
+	SECTION("kill switch between the submit and the read")
+	{
+		Harness h;
+		u_desktop_fake_set_clipboard(h.fake, "secret");
+		u_desktop_fake_set_batch_hook(
+		    h.fake, [](void *, const char *op, uint32_t) {
+			    if (strcmp(op, "clipboard") == 0) {
+				    u_desktop_policy_set_suspended(true, "test");
+			    }
+		    },
+		    nullptr);
+		uint64_t id = h.submit(clip_get());
+		REQUIRE(h.rec.wait_done(1));
+		u_desktop_fake_set_batch_hook(h.fake, nullptr, nullptr);
+		CHECK(h.rec.completion(id).result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(h.rec.completion(id).message == "kill switch");
+		CHECK(fetch(h.c, id) == "<invalid>");
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	}
+	SECTION("no clipboard on this backend")
+	{
+		Harness h;
+		u_desktop_fake_set_caps(h.fake, U_DESKTOP_CAP_LIST_WINDOWS | U_DESKTOP_CAP_PICK | U_DESKTOP_CAP_INPUT);
+		auto r = h.run(clip_get());
+		CHECK(r.result == U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED);
+		CHECK(r.message == "this desktop backend has no clipboard access");
+	}
+	SECTION("a SET waits for the user; a GET does not")
+	{
+		u_desktop_control_timing t = kFast;
+		t.idle_max_wait_ns = 120ull * 1000000ull;
+		Harness h(&t);
+		u_desktop_fake_set_user_active(h.fake, true);
+		auto r = h.run(clip_set("x"));
+		CHECK(r.result == U_DESKTOP_XR_ERROR_REFUSED);
+		CHECK(r.message == "the user is active");
+		CHECK(h.run(clip_get()).result == U_DESKTOP_XR_SUCCESS);
+		u_desktop_fake_set_user_active(h.fake, false);
+	}
+}
+
+TEST_CASE("v3_clipboard: the audit has sizes, never the text; backend messages never pass",
+          "[desktop][v3][clipboard][audit][privacy]")
+{
+	TempDir dir;
+	Harness h;
+	const char *secret = "hunter2-password";
+	CHECK(h.run(clip_set(secret)).result == U_DESKTOP_XR_SUCCESS);
+	CHECK(h.run(clip_get()).result == U_DESKTOP_XR_SUCCESS);
+	u_desktop_fake_set_action_result(h.fake, "clipboard_get", U_DESKTOP_ERR_FAILED);
+	auto r = h.run(clip_get());
+	u_desktop_fake_set_action_result(h.fake, nullptr, U_DESKTOP_OK);
+	CHECK(r.result == U_DESKTOP_XR_ERROR_RUNTIME_FAILURE);
+	CHECK(r.message == "the clipboard could not be read"); // never the backend's own message
+	std::string audit = dir.audit();
+	INFO(audit);
+	CHECK(audit.find("hunter2") == std::string::npos);
+	CHECK(lines_with(audit, "\"action\":\"clipboard_set\"").size() == 1);
+	CHECK(lines_with(audit, "\"action\":\"clipboard_get\"").size() == 2);
+	CHECK(audit.find("\"bytes\":16") != std::string::npos);
+	CHECK(audit.find("\"target\"") == std::string::npos);
+	CHECK(h.log().find("hunter2") == std::string::npos); // the fake's log too: sizes only
+}
+
+TEST_CASE("v3_clipboard: in order with typing — a SET never lands in the middle of a paste",
+          "[desktop][v3][clipboard]")
+{
+	TempDir dir;
+	Harness h;
+	// The actions run in submission order on one worker: a SET queued behind a
+	// TYPE_TEXT starts only once the text is in (on GNOME the paste and its
+	// clipboard hand-over are over by then), and a GET after it reads the SET.
+	u_desktop_fake_set_action_delay_ms(h.fake, 20);
+	u_desktop_action t = act(U_DESKTOP_ACTION_TYPE_TEXT, 101);
+	t.text = "typed";
+	uint64_t a = h.submit(t);
+	uint64_t b = h.submit(clip_set("set after typing"));
+	uint64_t c = h.submit(clip_get());
+	REQUIRE(h.rec.wait_done(3));
+	CHECK(h.rec.done[0].id == a);
+	CHECK(h.rec.done[1].id == b);
+	CHECK(h.rec.done[2].id == c);
+	CHECK(fetch(h.c, c) == "set after typing");
+	std::string log = h.log();
+	CHECK(log.find("type 101 typed") < log.find("clipboard set"));
+}

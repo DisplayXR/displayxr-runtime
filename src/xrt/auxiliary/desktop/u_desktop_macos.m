@@ -3157,6 +3157,72 @@ mac_scroll(struct u_desktop_backend *b,
 	return check_permission(msg);
 }
 
+/*
+ * Spec v3: clipboard text — the general pasteboard (NSPasteboardTypeString). Needs no
+ * TCC permission of its own; the CONTROL consent covers it (spec §11.6). The text
+ * never reaches a log or a message.
+ */
+
+static enum u_desktop_result
+mac_clipboard_get(struct u_desktop_backend *b,
+                  const struct u_desktop_input_guard *guard,
+                  char **out,
+                  size_t *len,
+                  char *msg)
+{
+	(void)b;
+	*out = NULL;
+	*len = 0;
+	if (guard == NULL || guard->still_allowed == NULL || !guard->still_allowed(guard->ctx)) {
+		set_msg(msg, "stopped: desktop control suspended, denied or screen locked");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	enum u_desktop_result r = U_DESKTOP_OK;
+	@autoreleasepool {
+		NSString *s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+		const char *u = s != nil ? [s UTF8String] : NULL;
+		if (u != NULL) {
+			size_t n = strlen(u);
+			// A text over the limit is cut at limit + 1 bytes: the common layer refuses it.
+			size_t take = n > (size_t)U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 ? (size_t)U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 : n;
+			char *buf = malloc(take + 1);
+			if (buf == NULL) {
+				r = U_DESKTOP_ERR_FAILED;
+			} else {
+				memcpy(buf, u, take);
+				buf[take] = '\0';
+				*out = buf;
+				*len = take;
+			}
+		}
+	}
+	return r;
+}
+
+static enum u_desktop_result
+mac_clipboard_set(struct u_desktop_backend *b, const struct u_desktop_input_guard *guard, const char *utf8, char *msg)
+{
+	(void)b;
+	if (guard == NULL || guard->still_allowed == NULL || !guard->still_allowed(guard->ctx)) {
+		set_msg(msg, "stopped: desktop control suspended, denied or screen locked");
+		return U_DESKTOP_ERR_REFUSED;
+	}
+	bool ok = false;
+	@autoreleasepool {
+		NSString *s = [NSString stringWithUTF8String:utf8];
+		if (s != nil) {
+			NSPasteboard *pb = [NSPasteboard generalPasteboard];
+			[pb clearContents];
+			ok = [pb setString:s forType:NSPasteboardTypeString];
+		}
+	}
+	if (!ok) {
+		set_msg(msg, "the pasteboard did not take the text");
+		return U_DESKTOP_ERR_FAILED;
+	}
+	return U_DESKTOP_OK;
+}
+
 /*!
  * Spec v3: one key down or up, left so (u_desktop.h key_event). A modifier's flag is
  * added to every event posted while it is held (chords, clicks, drags, scrolls), as
@@ -3490,6 +3556,9 @@ u_desktop_backend_create_platform(void)
 	b->pointer_button = mac_pointer_button;
 	b->scroll = mac_scroll;
 	b->key_event = mac_key_event; // spec v3: KEY_DOWN / KEY_UP, modifiers around a pointer action
+	b->clipboard_get = mac_clipboard_get; // spec v3: clipboard text
+	b->clipboard_set = mac_clipboard_set;
+	b->caps |= U_DESKTOP_CAP_CLIPBOARD;
 	b->destroy = mac_destroy;
 	// Spec v2: consent per scope (ASK_AGAIN opens System Settings) and the display
 	// layout always; screen capture only where ScreenCaptureKit exists (weak-linked).

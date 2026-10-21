@@ -80,6 +80,12 @@ _Static_assert(U_DESKTOP_MOD_SHIFT == 0x2 /* XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_D
 _Static_assert(U_DESKTOP_MOD_ALT == 0x4 /* XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR */, "modifier mirror");
 _Static_assert(U_DESKTOP_MOD_SUPER == 0x8 /* XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR */, "modifier mirror");
 _Static_assert(U_DESKTOP_TARGET_SHELL == XR_DESKTOP_TARGET_SHELL_DXR, "shell target mirror");
+_Static_assert((int)U_DESKTOP_ACTION_SET_CLIPBOARD_TEXT == (int)XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR,
+               "action mirror");
+_Static_assert((int)U_DESKTOP_ACTION_GET_CLIPBOARD_TEXT == (int)XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR,
+               "action mirror");
+_Static_assert(U_DESKTOP_CAP_CLIPBOARD == 0x80 /* XR_DESKTOP_CONTROL_CAPABILITY_CLIPBOARD_BIT_DXR */, "caps mirror");
+_Static_assert(U_DESKTOP_CLIPBOARD_MAX_BYTES == XR_MAX_DESKTOP_CLIPBOARD_TEXT_SIZE_DXR, "size mirror");
 
 //! Largest text xrGetDesktopTextAtDXR returns (bytes incl. NUL); longer text is cut on a code point.
 #define TEXT_AT_MAX 16384
@@ -603,6 +609,43 @@ oxr_xrGetDesktopCaptureImageDXR(
 		                 "(captureId) is not the most recent successful capture, or its image was "
 		                 "already fetched or expired (10 s)");
 	default: return oxr_error(&log, (XrResult)r, "desktop capture image failed");
+	}
+}
+
+
+
+/*
+ *
+ * Spec v3: clipboard text (§11.6).
+ *
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopClipboardTextDXR(
+    XrSession session, uint64_t actionId, uint32_t capacityInput, uint32_t *countOutput, char *buffer)
+{
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDesktopClipboardTextDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_desktop_control);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+	if (capacityInput > 0) {
+		OXR_VERIFY_ARG_NOT_NULL(&log, buffer);
+	}
+
+	struct u_desktop_control *dc = get_dc(sess);
+	if (dc == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "no clipboard text with that id");
+	}
+	int32_t r = u_desktop_control_clipboard_text(dc, actionId, capacityInput, countOutput, buffer);
+	switch (r) {
+	case U_DESKTOP_XR_SUCCESS: return XR_SUCCESS;
+	case U_DESKTOP_XR_ERROR_SIZE_INSUFFICIENT: return XR_ERROR_SIZE_INSUFFICIENT;
+	case U_DESKTOP_XR_ERROR_VALIDATION_FAILURE:
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(actionId) is not the most recent successful GET_CLIPBOARD_TEXT, or its text was "
+		                 "already fetched or expired (10 s)");
+	default: return oxr_error(&log, (XrResult)r, "desktop clipboard text failed");
 	}
 }
 

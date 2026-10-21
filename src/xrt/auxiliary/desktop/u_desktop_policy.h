@@ -316,6 +316,10 @@ struct u_desktop_audit_record
 	uint32_t count;      //!< captures in the burst (0: field absent)
 	const char *first_t; //!< UTC time of the burst's first / last capture
 	const char *last_t;
+
+	// ---- spec v3: clipboard text — its size, never its content.
+	bool has_bytes;
+	uint64_t bytes; //!< "bytes": clipboard text read / written (UTF-8)
 };
 
 //! Now, as the audit log writes it ("2026-10-16T18:02:11Z").

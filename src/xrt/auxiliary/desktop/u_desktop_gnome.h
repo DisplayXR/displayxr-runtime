@@ -238,6 +238,20 @@ gnome_portal_clip_paste(struct gnome_portal *p, bool terminal, struct u_desktop_
 void
 gnome_portal_clip_restore(struct gnome_portal *p);
 
+/*!
+ * Spec v3: the clipboard's text (SelectionRead of text/plain;charset=utf-8, at most
+ * U_DESKTOP_CLIPBOARD_MAX_BYTES + 1 bytes, ~1 s). Our own selection (a SET, or the
+ * previous text offered again after a type) is answered from memory. @p *out NULL:
+ * no text. Needs the session open (prepare_input).
+ */
+enum u_desktop_result
+gnome_portal_clip_get(struct gnome_portal *p, char **out, size_t *len, char *msg);
+
+//! Spec v3: make @p utf8 the clipboard's text (SetSelection, served until another
+//! client takes the selection; mutter's clipboard manager keeps a copy after the session).
+enum u_desktop_result
+gnome_portal_clip_set(struct gnome_portal *p, const char *utf8, char *msg);
+
 /*
  * AT-SPI (u_desktop_gnome_atspi.c)
  */

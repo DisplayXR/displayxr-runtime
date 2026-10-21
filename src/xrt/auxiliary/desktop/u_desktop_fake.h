@@ -320,6 +320,20 @@ u_desktop_fake_set_key_repeat(struct u_desktop_fake *f, bool repeat);
 void
 u_desktop_fake_set_shell_keyboard(struct u_desktop_fake *f, bool shell);
 
+// --- spec v3: the clipboard ---------------------------------------------------------
+//
+// clipboard_get / clipboard_set work on a string in memory; the log records sizes only
+// ("clipboard set 12 bytes"). Failures: u_desktop_fake_set_action_result with
+// "clipboard_get" / "clipboard_set"; the batch hook fires "clipboard" before each.
+
+//! The user copies @p text (NULL: the clipboard holds no text).
+void
+u_desktop_fake_set_clipboard(struct u_desktop_fake *f, const char *text);
+
+//! The clipboard's text into @p out; false when it holds none.
+bool
+u_desktop_fake_clipboard(struct u_desktop_fake *f, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
