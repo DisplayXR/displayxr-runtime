@@ -53,6 +53,19 @@
  * Extension v17 gives ActivateWindow focus only when the app had the user's
  * latest input; when it refuses, the agent falls back to a Super+click through
  * the portal, as for any other window (own_activate).
+ *
+ * ## Window titles
+ *
+ * Extension v18 gives other apps' window titles only to a bus connection that
+ * asked with WindowGeometry1.SetTitleAccess. The common layer calls grant_changed
+ * when the CONTROL grant begins and ends; this backend then asks on, or hands back
+ * for, its observation connection (`obs`), the one every window list, pick and
+ * pointer read goes through. Nothing else in the app's process gets titles that
+ * way. A reply that comes back without titles while the grant holds (the
+ * extension was disabled and enabled again) asks once more, at most once a
+ * second. An older extension has no SetTitleAccess and gives titles to everyone:
+ * nothing to ask (logged once). Titles matter beyond the list: the AT-SPI reads
+ * (text at a point, the paste check) find a window's frame by its title.
  */
 
 #include "u_desktop_gnome.h"
@@ -280,7 +293,7 @@ gnome_set_msg(char *msg, const char *fmt, ...)
 
 //! One extension call returning a JSON string, parsed. NULL on any failure (@p msg filled).
 static cJSON *
-ext_json(struct gnome_backend *g, const char *method, bool with_xy, int32_t x, int32_t y, char *msg)
+ext_json_once(struct gnome_backend *g, const char *method, bool with_xy, int32_t x, int32_t y, char *msg)
 {
 	dbus_int32_t ix = x, iy = y;
 	struct gdbus_err err;
@@ -317,6 +330,115 @@ ext_json(struct gnome_backend *g, const char *method, bool with_xy, int32_t x, i
 		gnome_set_msg(msg, "the GNOME extension's schema version %d is newer than this runtime", version);
 		cJSON_Delete(root);
 		return NULL;
+	}
+	return root;
+}
+
+/*
+ * Window titles (extension v18; see "Window titles" at the top)
+ */
+
+//! A grant that came back without titles is asked for again at most this often.
+#define TITLES_REASK_MS 1000
+
+/*!
+ * WindowGeometry1.SetTitleAccess(0 = this process, @p allow) on the observation
+ * connection. obs_lock held. True when the extension now gives this connection
+ * titles. An extension without the method (older than v18, which gives titles to
+ * every client) sets titles_none: there is nothing to ask for.
+ */
+static bool
+titles_set_locked(struct gnome_backend *g, bool allow)
+{
+	dbus_uint32_t pid = 0;
+	dbus_bool_t a = allow ? TRUE : FALSE;
+	struct gdbus_err err;
+	DBusMessage *reply = gdbus_call(g->obs, WLG_BUS, WLG_PATH, WLG_IFACE, "SetTitleAccess", OBS_TIMEOUT_MS, &err,
+	                                DBUS_TYPE_UINT32, &pid, DBUS_TYPE_BOOLEAN, &a, DBUS_TYPE_INVALID);
+	gdbus_drain(g->obs);
+	if (reply == NULL) {
+		if (strcmp(err.name, DBUS_ERROR_UNKNOWN_METHOD) == 0) {
+			g->titles_none = true;
+			U_LOG_I(
+			    "desktop/gnome: the DisplayXR GNOME extension is older than version 18 — it gives window "
+			    "titles to every client, so there is no access to ask for");
+		} else {
+			U_LOG_W("desktop/gnome: SetTitleAccess(%s) went unanswered (%s)", allow ? "true" : "false",
+			        err.name[0] ? err.name : "?");
+		}
+		return false;
+	}
+	dbus_bool_t titles = FALSE;
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &titles, DBUS_TYPE_INVALID)) {
+		titles = FALSE;
+	}
+	dbus_message_unref(reply);
+	return titles;
+}
+
+//! u_desktop_backend::grant_changed: ask for titles while the grant holds, hand them back after.
+static void
+gnome_grant_changed(struct u_desktop_backend *b, bool granted)
+{
+	struct gnome_backend *g = gnome(b);
+	if (!g->have_ext16) {
+		return; // no extension: nothing reads windows, so nothing to ask for
+	}
+	pthread_mutex_lock(&g->obs_lock);
+	g->titles_want = granted;
+	g->titles_asked_ms = gdbus_now_ms();
+	bool none = g->titles_none;
+	bool titles = none ? false : titles_set_locked(g, granted);
+	none = g->titles_none;
+	pthread_mutex_unlock(&g->obs_lock);
+	if (!none) {
+		U_LOG_I("desktop/gnome: window titles %s", !granted ? "handed back to the extension"
+		                                           : titles ? "granted by the extension"
+		                                                    : "refused by the extension (asked again on use)");
+	}
+}
+
+//! True when @p root (GetAllWindows / GetPointer / GetWindowAt) has a window entry
+//! without "title": the extension withheld titles from this connection.
+static bool
+titles_withheld(const cJSON *root)
+{
+	const cJSON *w = u_json_get(root, "window");
+	if (!cJSON_IsObject(w)) {
+		const cJSON *arr = u_json_get(root, "windows");
+		w = cJSON_IsArray(arr) ? cJSON_GetArrayItem(arr, 0) : NULL;
+	}
+	return cJSON_IsObject(w) && u_json_get(w, "title") == NULL;
+}
+
+//! The grant holds but a reply had no titles (the extension lost this connection's
+//! access: disabled and enabled again, or refused it on the lock screen). Ask again,
+//! at most once a second. True: the access is back, call again.
+static bool
+titles_reask(struct gnome_backend *g)
+{
+	bool again = false;
+	pthread_mutex_lock(&g->obs_lock);
+	uint64_t now = gdbus_now_ms();
+	if (g->titles_want && !g->titles_none && now - g->titles_asked_ms >= TITLES_REASK_MS) {
+		g->titles_asked_ms = now;
+		again = titles_set_locked(g, true);
+	}
+	pthread_mutex_unlock(&g->obs_lock);
+	if (again) {
+		U_LOG_I("desktop/gnome: window titles granted again by the extension");
+	}
+	return again;
+}
+
+//! ext_json_once, with the titles asked for again when the grant holds and they are missing.
+static cJSON *
+ext_json(struct gnome_backend *g, const char *method, bool with_xy, int32_t x, int32_t y, char *msg)
+{
+	cJSON *root = ext_json_once(g, method, with_xy, x, y, msg);
+	if (root != NULL && titles_withheld(root) && titles_reask(g)) {
+		cJSON_Delete(root);
+		root = ext_json_once(g, method, with_xy, x, y, msg);
 	}
 	return root;
 }
@@ -1282,6 +1404,7 @@ u_desktop_backend_create_platform(void)
 	g->base.remembers_in_store = false; // the portal owns consent
 	g->base.access_status = gnome_access_status;
 	g->base.request_access = gnome_request_access;
+	g->base.grant_changed = gnome_grant_changed; // window titles (extension v18)
 	g->base.is_locked = gnome_is_locked;
 	g->base.user_idle_ms = gnome_user_idle_ms;
 	g->base.list_windows = gnome_list_windows;

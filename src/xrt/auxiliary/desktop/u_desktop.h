@@ -410,6 +410,22 @@ struct u_desktop_backend
 	                       u_desktop_access_done_fn done,
 	                       void *ctx);
 
+	/*!
+	 * Optional (may be NULL). The CONTROL scope became GRANTED (@p granted true) or
+	 * stopped being GRANTED (false: denied, revoked by the OS, the kill switch, the
+	 * store's per-app switch, the lock screen, a new prompt, the session ending).
+	 * The common layer calls it only on a change, in order, from the thread that
+	 * noticed it, with its state mutex released (it holds only the lock that keeps
+	 * these calls in order: never call back into the control object from here), and
+	 * once with false before destroy when the last call said true. Bounded (an
+	 * observation-class call).
+	 * GNOME: the DisplayXR extension gives other apps' window titles only to a bus
+	 * connection that asked for them (extension v18, wayland-window-geometry spec
+	 * §12.5), so the backend asks on its observation connection while granted and
+	 * takes it back when not.
+	 */
+	void (*grant_changed)(struct u_desktop_backend *b, bool granted);
+
 	//! True while the session is locked / a secure desktop is up.
 	bool (*is_locked)(struct u_desktop_backend *b);
 

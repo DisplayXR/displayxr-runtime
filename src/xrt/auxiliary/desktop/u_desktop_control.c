@@ -11,7 +11,8 @@
  * with the mutex RELEASED and its answer stored in a snapshot the state machine
  * reads (see probe_locked), so a slow lock query never blocks the app thread's
  * observation calls. Backend ACTION calls and request_access are always made with
- * it released too.
+ * it released too. grant_changed is made with it released, under grant_mutex
+ * (taken first, never while holding the mutex), which keeps those calls in order.
  */
 
 #include "u_desktop_control.h"
@@ -140,6 +141,10 @@ struct u_desktop_control
 	char name[NAME_CAP];
 	struct u_desktop_control_callbacks cb;
 	struct u_desktop_control_timing timing;
+
+	//! Serialises backend->grant_changed (sync_grant): taken before mutex, never under it.
+	struct os_mutex grant_mutex;
+	bool grant_told; //!< under grant_mutex: what grant_changed last said (false at first)
 
 	struct os_mutex mutex;
 	struct os_cond cond;
@@ -506,6 +511,30 @@ probe_locked(struct u_desktop_control *c)
 	return locked;
 }
 
+/*!
+ * Tell the backend that the CONTROL grant began or ended (grant_changed, u_desktop.h):
+ * only when that differs from what it was last told, in order (grant_mutex), with
+ * the mutex released. It goes by the state the state machine evaluated last, so a
+ * change reaches the backend at the first call that notices it — when the app's
+ * state event fires. An object that is stopping is never granted.
+ */
+static void
+sync_grant(struct u_desktop_control *c)
+{
+	if (c->b == NULL || c->b->grant_changed == NULL) {
+		return;
+	}
+	os_mutex_lock(&c->grant_mutex);
+	os_mutex_lock(&c->mutex);
+	bool want = !c->stop && !c->dying && c->sc[SC_CONTROL].last_state == U_DESKTOP_STATE_GRANTED;
+	os_mutex_unlock(&c->mutex);
+	if (want != c->grant_told) {
+		c->grant_told = want;
+		c->b->grant_changed(c->b, want);
+	}
+	os_mutex_unlock(&c->grant_mutex);
+}
+
 static enum u_desktop_control_state
 update_state(struct u_desktop_control *c, enum reason *out_reason)
 {
@@ -513,6 +542,7 @@ update_state(struct u_desktop_control *c, enum reason *out_reason)
 	os_mutex_lock(&c->mutex);
 	enum u_desktop_control_state s = update_state_locked(c, out_reason, false);
 	os_mutex_unlock(&c->mutex);
+	sync_grant(c);
 	return s;
 }
 
@@ -526,6 +556,7 @@ update_capture_state(struct u_desktop_control *c, enum reason *out_reason)
 	update_scope_locked(c, SC_CONTROL, NULL, false);
 	enum u_desktop_control_state s = update_scope_locked(c, SC_CAPTURE, out_reason, false);
 	os_mutex_unlock(&c->mutex);
+	sync_grant(c);
 	return s;
 }
 
@@ -1255,6 +1286,7 @@ mark_revoked(struct u_desktop_control *c)
 	}
 	update_state_locked(c, NULL, false);
 	os_mutex_unlock(&c->mutex);
+	sync_grant(c);
 }
 
 enum step_outcome
@@ -1492,6 +1524,9 @@ guard_still_allowed(void *ctx)
 		update_state_locked(c, NULL, false); // announce the change mid-action
 	}
 	os_mutex_unlock(&c->mutex);
+	if (!ok) {
+		sync_grant(c); // the backend calls the guard with none of its locks held
+	}
 	return ok;
 }
 
@@ -2584,6 +2619,7 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->list_buf = (struct u_desktop_window *)calloc(c->list_cap, sizeof(struct u_desktop_window));
 
 	os_mutex_init(&c->mutex);
+	os_mutex_init(&c->grant_mutex);
 	os_cond_init(&c->cond);
 	os_cond_init(&c->cap_cond);
 
@@ -2645,6 +2681,8 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 	os_mutex_lock(&c->mutex);
 	c->dying = true;
 	os_mutex_unlock(&c->mutex);
+	// The grant ends with the session: the backend hears so before it goes.
+	sync_grant(c);
 
 	// ... and the backend's destroy must deliver (or cancel) any owed answer
 	// before it returns (u_desktop.h "Lifetime").
@@ -2665,6 +2703,7 @@ u_desktop_control_destroy(struct u_desktop_control **c_ptr)
 	u_desktop_policy_destroy(&c->policy);
 	os_cond_destroy(&c->cap_cond);
 	os_cond_destroy(&c->cond);
+	os_mutex_destroy(&c->grant_mutex);
 	os_mutex_destroy(&c->mutex);
 	free(c->list_buf);
 	free(c);
