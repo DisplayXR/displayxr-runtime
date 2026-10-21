@@ -64,7 +64,9 @@ own elsewhere. A refused request is not retried by the runtime; the app may call
 new user gesture.
 
 States 3–5 are re-evaluated at every call and before every action, and a change emits the
-state event, so a kill switch or a lock takes effect on the very next operation.
+state event, so a kill switch or a lock takes effect on the very next operation. The kill switch
+also **ends** the grant of every running session (§6.4, proposed with ADR-056 Amendment 2): once
+it is off again the app is `DENIED` until it requests access again.
 
 ## 4. Operations
 
@@ -157,6 +159,9 @@ One JSON file per user, read on every evaluation when its mtime changed:
   "apps": { "<executable full path>": "allow" | "deny" } }
 ```
 
+(Spec version 2 / §6.4 add `"kill_switch_count": <n>`, incremented by every `stop`; a reader
+that does not know it ignores it.)
+
 Writes are atomic (temp file + rename) and serialised across processes by an OS file lock
 on `desktop_control.json.lock` (`flock` / `LockFileEx`), with the read-modify-write done
 under the lock — so `displayxr-cli desktop stop` can never be overwritten by an app's
@@ -184,7 +189,10 @@ Typed text is **never** logged — only its length. Consent decisions (`request`
 `displayxr-cli desktop status | stop | resume | allow <exe> | deny <exe> | forget <exe> |
 audit [--tail N] [--json]` reads and writes the same store and log. `stop` / `resume` flip
 `suspended` (the kill switch); a running session sees it on its next call. `stop` also
-removes every saved OS grant (§6.4); `status` shows how many there are and where.
+removes every saved OS grant and ends the grants of running sessions (§6.4). `forget <exe>`
+also removes the saved grants recorded for that executable (§6.4). `status` lists the saved
+grants (key, what they cover, when saved, the executable, how the key was chosen); never the
+token.
 
 ### 6.4 Saved OS grants (GNOME)
 
@@ -203,7 +211,8 @@ app**, not once per launch (ADR-056 Amendment 2) — on every portal that issues
 | read | at the app's first request or restore in a process; again before every later restore (another process of the same app may have renewed it) |
 | verified | the first request of a process that found a saved grant **restores it, with the dialog allowed**: silent where the portal honours the token, else the portal's dialog, whose answer is the request's (a new token replaces the saved one; Cancel removes it) |
 | written | after every successful `Start`, with the token it returned (the portal documents tokens as single use and may hand out a new one per `Start`; xdg-desktop-portal 1.21.1 handed back the same token on every restore in the headless run) |
-| removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant) |
+| removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a screen grant; the kill switch (`displayxr-cli desktop stop` removes every saved grant); `displayxr-cli desktop forget <exe>` (the grants recorded for that executable that cover a forgotten scope — one token holds both scopes, so the whole grant goes) |
+| kill switch | ends the grant of every **running** session too, on every OS (proposed): the store's `kill_switch_count` (incremented by every `stop`) moves, so a session sees it even when the switch is off again before it looks; each scope the app had requested is revoked (`DENIED` once the switch is off, until a new request) and the backend drops its OS grant (GNOME: closes the portal session, forgets the restore token). On Windows and macOS that new request is answered without a prompt (the store / the OS still says yes); on GNOME it shows the dialog (the saved grant is gone) |
 
 **The portal stays the judge.** It honours a token only for the app id it bound it to: the
 registered id when the app registered, otherwise one it derives from the launch context — the
@@ -216,9 +225,8 @@ same way, ideally from its `.desktop` file, to avoid a second dialog.** Installi
 the app in its dialog and in Settings, and binds the approval to the app rather than to whatever
 launched it.
 
-A process whose saved grant is removed under it (the kill switch, by hand) keeps its grant in
-memory until it exits, as before, but never writes the file again: after a kill switch the next
-**launch** of every app asks again. An approval the user withdrew in GNOME Settings shows up at
+A process whose saved grant is removed by hand, or by `forget`, keeps its grant in memory until
+it exits but never writes the file again; the kill switch ends the running grant too (above). An approval the user withdrew in GNOME Settings shows up at
 the next request as the dialog (the verifying restore); in a process that skips the request
 (the smoke tool), at the first action: that restore is not silent, its dialog is closed at once,
 the action completes `NOT_GRANTED` and the file is removed.
@@ -308,6 +316,12 @@ Decisions the sections above leave open, as implemented in `u_desktop_control.c`
   (and do not count as "requested" — after a kill switch is lifted the state is
   `NOT_REQUESTED`, not a stale grant); a remembered store grant announces `GRANTED`; a prompt
   announces `PENDING` and then its answer. A request while `PENDING` is a no-op (never two prompts).
+- The kill switch ends grants (§6.4, proposed): a session that sees the store's
+  `kill_switch_count` change marks every scope it had requested as revoked (row 10 `DENIED`
+  once the switch is off — before row 8, so a Windows store `allow` does not bring it back
+  without a request), audits `revoked` with reason `kill switch`, and calls the backend's
+  optional `revoke_grant`, which must not block (GNOME posts the session close and the token
+  wipe to its portal thread). A session created after a stop is not affected.
 - Row 8 vs row 9: for a `remembers_in_store` backend (Windows) the **store is the only grant** —
   the backend's `access_status` is never consulted, so `forget` revokes at once. The in-memory
   answer counts only if writing it to the store failed.

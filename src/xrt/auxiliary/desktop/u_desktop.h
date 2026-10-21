@@ -452,6 +452,15 @@ struct u_desktop_backend
 	                                 struct u_desktop_image *img,
 	                                 char *msg);
 
+	/*!
+	 * Optional (may be NULL). The user's kill switch ended this app's grant (spec §6.4):
+	 * drop the OS grant this process holds — close any OS session, forget any token in
+	 * memory (and its saved copy) — so that nothing is restored until the app requests
+	 * access again. Called with the common layer's mutex held: must not block (post the
+	 * work to the backend's own thread).
+	 */
+	void (*revoke_grant)(struct u_desktop_backend *b);
+
 	//! See "Lifetime": never returns while a consent answer is owed.
 	void (*destroy)(struct u_desktop_backend *b);
 };

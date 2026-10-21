@@ -37,8 +37,9 @@
  * is not silent (the portal no longer honours the token) or is refused; when the
  * session is stopped from GNOME's indicator (any close that is not a lock, as
  * below); and by the kill switch (`displayxr-cli desktop stop` removes every saved
- * grant). A process whose file is removed under it keeps its grant in memory until
- * it exits but never writes the file again.
+ * grant; the common layer then ends the running grant too, through revoke_grant →
+ * cmd_revoke). A process whose file is removed any other way (by hand, `desktop
+ * forget`) keeps its grant in memory until it exits but never writes the file again.
  *
  * A session is opened per action burst and closed after 2 s without input, so
  * GNOME's remote-access indicator is up only while the agent acts. Re-opening
@@ -1317,6 +1318,40 @@ cmd_request(struct gnome_portal *p, struct gp_cmd *c)
 
 
 
+//! The kill switch ended the grant (spec §6.4): the session closed, the token and its
+//! saved copy forgotten. Nothing is restored until a new request (which asks).
+static enum u_desktop_result
+cmd_revoke(struct gnome_portal *p, struct gp_cmd *c)
+{
+	(void)c;
+	session_close(p); // the remote-access / screen-sharing indicator goes now
+	char used[U_DESKTOP_GNOME_TOKEN_SIZE];
+	pthread_mutex_lock(&p->lock);
+	snprintf(used, sizeof(used), "%s", p->have_token ? p->token : "");
+	p->have_token = false;
+	memset(p->token, 0, sizeof(p->token));
+	p->access = U_DESKTOP_ACCESS_DENIED;
+	p->consent_only_granted = false;
+	gp_cap_revoked_locked(p);
+	pthread_mutex_unlock(&p->lock);
+	p->saved.unverified = false;
+	if (used[0] != '\0') {
+		gp_grant_forget(p, used, "the kill switch"); // `desktop stop` removed it already, normally
+	}
+	memset(used, 0, sizeof(used));
+	U_LOG_W("desktop/gnome: the kill switch ended this app's grant — session closed, restore token forgotten");
+	return U_DESKTOP_OK;
+}
+
+//! An async command nobody waits for still gets a done callback if it is dropped at shutdown.
+static void
+revoke_done_nop(void *ctx, enum u_desktop_access a)
+{
+	(void)ctx;
+	(void)a;
+}
+
+
 /*
  * Thread
  */
@@ -1741,6 +1776,19 @@ gp_dict_add_bool(DBusMessageIter *dict, const char *key, bool val)
 {
 	dbus_bool_t b = val ? TRUE : FALSE;
 	dict_add_basic(dict, key, DBUS_TYPE_BOOLEAN, "b", &b);
+}
+
+void
+gnome_portal_revoke(struct gnome_portal *p)
+{
+	struct gp_cmd *c = gp_cmd_new(cmd_revoke);
+	if (c == NULL) {
+		return;
+	}
+	c->done = revoke_done_nop;
+	if (!gp_enqueue_async(p, c)) {
+		gp_cmd_free(c);
+	}
 }
 
 bool

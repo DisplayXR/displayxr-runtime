@@ -6,6 +6,7 @@
  */
 
 #include "u_desktop_gnome_grant.h"
+#include "u_desktop.h"
 #include "u_desktop_gnome_logic.h"
 #include "u_desktop_policy.h"
 
@@ -362,6 +363,100 @@ u_desktop_gnome_grant_forget(const char *key, const char *token)
 	free_secret(txt);
 	memset(&g, 0, sizeof(g));
 	return mine && u_desktop_grant_remove(key);
+}
+
+static void
+copy_str(const cJSON *o, const char *k, char *out, size_t cap)
+{
+	const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+	snprintf(out, cap, "%s", cJSON_IsString(v) && v->valuestring != NULL ? v->valuestring : "");
+}
+
+//! @p info for @p key, without the token and without removing anything.
+static void
+read_info(const char *key, struct u_desktop_gnome_grant_info *info)
+{
+	memset(info, 0, sizeof(*info));
+	info->key = key;
+	char *txt = NULL;
+	enum u_desktop_grant_read_result rr = u_desktop_grant_read(key, &txt);
+	if (rr != U_DESKTOP_GRANT_READ_OK) {
+		info->status =
+		    rr == U_DESKTOP_GRANT_READ_UNSAFE ? U_DESKTOP_GNOME_GRANT_UNSAFE : U_DESKTOP_GNOME_GRANT_NONE;
+		return;
+	}
+	struct u_desktop_gnome_grant g;
+	info->status = u_desktop_gnome_grant_decode(txt, key, &g);
+	info->screencast = g.screencast;
+	info->devices = g.devices;
+	info->screens = g.screens;
+	memset(&g, 0, sizeof(g));
+	cJSON *o = cJSON_Parse(txt);
+	free_secret(txt);
+	if (cJSON_IsObject(o)) {
+		copy_str(o, "key_source", info->key_source, sizeof(info->key_source));
+		copy_str(o, "portal_app_id", info->portal_app_id, sizeof(info->portal_app_id));
+		copy_str(o, "exe", info->exe, sizeof(info->exe));
+		copy_str(o, "launch_scope", info->launch_scope, sizeof(info->launch_scope));
+		copy_str(o, "saved", info->saved, sizeof(info->saved));
+		cJSON *tok = cJSON_GetObjectItemCaseSensitive(o, "restore_token");
+		if (cJSON_IsString(tok) && tok->valuestring != NULL) {
+			memset(tok->valuestring, 0, strlen(tok->valuestring));
+		}
+	}
+	cJSON_Delete(o);
+}
+
+struct list_ctx
+{
+	u_desktop_gnome_grant_info_fn fn;
+	void *ctx;
+	const char *exe;
+	uint32_t scopes;
+	uint32_t removed;
+};
+
+static void
+list_one(void *ctx, const char *key)
+{
+	struct list_ctx *l = (struct list_ctx *)ctx;
+	struct u_desktop_gnome_grant_info info;
+	read_info(key, &info);
+	if (l->fn != NULL) {
+		l->fn(l->ctx, &info);
+	}
+}
+
+uint32_t
+u_desktop_gnome_grant_list(u_desktop_gnome_grant_info_fn fn, void *ctx)
+{
+	struct list_ctx l = {fn, ctx, NULL, 0, 0};
+	return u_desktop_grant_for_each_key(list_one, &l);
+}
+
+static void
+forget_one(void *ctx, const char *key)
+{
+	struct list_ctx *l = (struct list_ctx *)ctx;
+	struct u_desktop_gnome_grant_info info;
+	read_info(key, &info);
+	bool covers = ((l->scopes & U_DESKTOP_SCOPE_CONTROL) != 0 && info.devices) ||
+	              ((l->scopes & U_DESKTOP_SCOPE_CAPTURE) != 0 && info.screens);
+	if (info.status == U_DESKTOP_GNOME_GRANT_OK && covers && info.exe[0] != '\0' &&
+	    u_desktop_policy_exe_equal(info.exe, l->exe) && u_desktop_grant_remove(key)) {
+		l->removed++;
+	}
+}
+
+uint32_t
+u_desktop_gnome_grant_forget_exe(const char *exe, uint32_t scopes)
+{
+	if (exe == NULL || exe[0] == '\0') {
+		return 0;
+	}
+	struct list_ctx l = {NULL, NULL, exe, scopes, 0};
+	u_desktop_grant_for_each_key(forget_one, &l);
+	return l.removed;
 }
 
 enum u_desktop_gnome_grant_action

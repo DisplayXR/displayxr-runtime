@@ -786,12 +786,15 @@ TEST_CASE("desktop_observe: every observation needs GRANTED; missing caps are FE
 	REQUIRE(u_desktop_control_text_at(h.c, 200, 200, text, sizeof(text)) == U_DESKTOP_XR_SUCCESS);
 	CHECK(std::string(text) == "notes.txt - Text Editor");
 
-	// The kill switch closes observation too, on the very next call.
+	// The kill switch closes observation too, on the very next call — and ends the grant
+	// (spec §6.4): after resume the app is DENIED until it requests access again.
 	REQUIRE(u_desktop_policy_set_suspended(true, "test"));
 	CHECK(u_desktop_control_list_windows(h.c, wins, 8, &n) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
 	CHECK(h.rec.wait_state(U_DESKTOP_STATE_SUSPENDED));
 	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
-	CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+	CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+	CHECK(u_desktop_control_list_windows(h.c, wins, 8, &n) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	h.grant();
 
 	u_desktop_fake_set_caps(h.fake, U_DESKTOP_CAP_LIST_WINDOWS);
 	CHECK(u_desktop_control_pick(h.c, 1, 1, &pick) == U_DESKTOP_XR_ERROR_FEATURE_UNSUPPORTED);
@@ -1087,10 +1090,76 @@ TEST_CASE("desktop_safety: kill switch mid-queue refuses the rest and announces 
 	u_desktop_action a = chord(101, "ctrl+s");
 	CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
 
-	// resume -> GRANTED again with no new prompt.
+	// resume -> DENIED until a new request: the kill switch ended the grant (spec §6.4),
+	// and the backend was told to drop its OS grant, once.
 	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
-	CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
-	CHECK(u_desktop_fake_request_count(h.fake) == 1);
+	CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+	CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+	char log[4096];
+	u_desktop_fake_log(h.fake, log, sizeof(log));
+	std::string l = log;
+	CHECK(l.find("revoke_grant") != std::string::npos);
+	CHECK(l.find("revoke_grant") == l.rfind("revoke_grant"));
+	h.grant(); // the app asks again (on Windows / macOS the OS or the store still says yes)
+	CHECK(u_desktop_fake_request_count(h.fake) == 2);
+	CHECK(h.run(chord(101, "ctrl+s")).result == U_DESKTOP_XR_SUCCESS);
+}
+
+TEST_CASE("desktop_safety: the kill switch ends the grant even when it is off again before the app looks",
+          "[desktop][safety]")
+{
+	TempDir dir;
+	u_desktop_policy *pol = u_desktop_policy_create();
+	CHECK(u_desktop_policy_kill_switch_count(pol) == 0);
+
+	SECTION("stop + resume between two calls: still revoked, the backend told once")
+	{
+		Harness h(&kFast);
+		h.grant();
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		u_desktop_policy_refresh(pol);
+		CHECK(u_desktop_policy_kill_switch_count(pol) == 1); // resume does not count
+		CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+		uint64_t id = 0;
+		u_desktop_action a = chord(101, "ctrl+s");
+		CHECK(u_desktop_control_submit(h.c, &a, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
+		char log[4096];
+		u_desktop_fake_log(h.fake, log, sizeof(log));
+		CHECK(std::string(log).find("revoke_grant") != std::string::npos);
+		// The audit says why.
+		CHECK(slurp(dir.file("desktop_control_audit.jsonl")).find("\"action\":\"revoked\"") !=
+		      std::string::npos);
+		h.grant();
+		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+		// A second stop counts again.
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		u_desktop_policy_refresh(pol);
+		CHECK(u_desktop_policy_kill_switch_count(pol) == 3);
+		CHECK(h.state() == U_DESKTOP_STATE_DENIED);
+	}
+	SECTION("a session that starts after the kill switch keeps its grant")
+	{
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		Harness h(&kFast);
+		h.grant();
+		CHECK(h.state() == U_DESKTOP_STATE_GRANTED);
+		CHECK(h.run(chord(101, "ctrl+s")).result == U_DESKTOP_XR_SUCCESS);
+	}
+	SECTION("nothing requested: nothing to end, the backend is not called")
+	{
+		Harness h(&kFast);
+		REQUIRE(u_desktop_policy_set_suspended(true, "test"));
+		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		CHECK(h.state() == U_DESKTOP_STATE_NOT_REQUESTED);
+		char log[4096];
+		u_desktop_fake_log(h.fake, log, sizeof(log));
+		CHECK(std::string(log).find("revoke_grant") == std::string::npos);
+	}
+	u_desktop_policy_destroy(&pol);
 }
 
 TEST_CASE("desktop_safety: lock screen and per-app deny refuse with their reason", "[desktop][safety]")
@@ -2972,6 +3041,8 @@ TEST_CASE("capture_safety: kill switch, lock and deny refuse; a frame finished a
 		CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
 		CHECK(h.rec.wait_capture_state(U_DESKTOP_STATE_SUSPENDED));
 		REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+		CHECK(u_desktop_control_get_capture_state(h.c) == U_DESKTOP_STATE_DENIED); // the grant ended
+		grant_capture(h);
 		u_desktop_fake_set_locked(h.fake, true);
 		CHECK(u_desktop_control_capture(h.c, &info, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
 		CHECK(u_desktop_fake_capture_count(h.fake) == 0);
@@ -3857,5 +3928,63 @@ TEST_CASE("desktop_gnome_grant: two executables keep two grants; diagnostics are
 	// Removing one app's grant leaves the other's.
 	CHECK(u_desktop_gnome_grant_forget(ka, "token-one"));
 	CHECK(u_desktop_gnome_grant_load(kb, &out) == U_DESKTOP_GNOME_GRANT_OK);
+}
+
+TEST_CASE("desktop_gnome_grant: status lists the saved grants; forget <exe> removes the ones recorded for it",
+          "[desktop][grant]")
+{
+	TempDir dir;
+	auto save = [](const char *key, const char *exe, bool devices, bool screens, const char *token) {
+		u_desktop_gnome_grant g =
+		    make_grant(false, devices, screens,
+		               screens ? std::vector<std::string>{"DP-1"} : std::vector<std::string>{}, token);
+		u_desktop_gnome_grant_origin o = {U_DESKTOP_GNOME_KEY_EXECUTABLE, "", exe, "app-x.scope"};
+		REQUIRE(u_desktop_gnome_grant_save(key, &g, &o));
+	};
+	save("exe-Agent-0000000000000001", "/opt/a/Agent", true, false, "t1");
+	save("org.example.Agent", "/opt/a/Agent", true, true, "t2"); // the same executable, registered
+	save("exe-Other-0000000000000002", "/opt/b/Other", true, true, "t3");
+	save("exe-Viewer-0000000000000003", "/opt/c/Viewer", false, true, "t4"); // screens only
+	write_raw(grant_file(dir, "org.broken.App"), "{ not json", 0600);
+
+	struct Row
+	{
+		std::string key, status, exe, source, saved;
+		bool devices, screens;
+	};
+	std::vector<Row> rows;
+	uint32_t n = u_desktop_gnome_grant_list(
+	    [](void *ctx, const u_desktop_gnome_grant_info *i) {
+		    static_cast<std::vector<Row> *>(ctx)->push_back(
+		        {i->key, u_desktop_gnome_grant_status_str(i->status), i->exe, i->key_source, i->saved,
+		         i->devices, i->screens});
+	    },
+	    &rows);
+	REQUIRE(n == 5);
+	REQUIRE(rows.size() == 5);
+	CHECK(rows[0].key == "exe-Agent-0000000000000001"); // sorted
+	CHECK(rows[0].status == "ok");
+	CHECK(rows[0].exe == "/opt/a/Agent");
+	CHECK(rows[0].source == "executable");
+	CHECK_FALSE(rows[0].saved.empty());
+	CHECK(rows[0].devices);
+	CHECK_FALSE(rows[0].screens);
+	CHECK(rows[3].key == "org.broken.App");
+	CHECK(rows[3].status == "corrupt");
+	CHECK(exists(grant_file(dir, "org.broken.App"))); // listing never removes anything
+
+	// forget --scope capture of a grant with no screens keeps it; with screens removes it.
+	CHECK(u_desktop_gnome_grant_forget_exe("/opt/c/Viewer", U_DESKTOP_SCOPE_CONTROL) == 0);
+	CHECK(u_desktop_gnome_grant_forget_exe("/opt/c/Viewer", U_DESKTOP_SCOPE_CAPTURE) == 1);
+	// forget (all) removes every grant recorded for that executable, whatever its key.
+	CHECK(u_desktop_gnome_grant_forget_exe("/opt/a/Agent", U_DESKTOP_SCOPE_CONTROL | U_DESKTOP_SCOPE_CAPTURE) == 2);
+	CHECK_FALSE(exists(grant_file(dir, "exe-Agent-0000000000000001")));
+	CHECK_FALSE(exists(grant_file(dir, "org.example.Agent")));
+	CHECK(exists(grant_file(dir, "exe-Other-0000000000000002")));
+	CHECK(exists(grant_file(dir, "org.broken.App"))); // unreadable: never matched
+	CHECK(u_desktop_gnome_grant_forget_exe("/opt/a/Agent/", U_DESKTOP_SCOPE_CONTROL) == 0);
+	CHECK(u_desktop_gnome_grant_forget_exe("", U_DESKTOP_SCOPE_CONTROL) == 0);
+	CHECK(u_desktop_gnome_grant_forget_exe(nullptr, U_DESKTOP_SCOPE_CONTROL) == 0);
+	CHECK(u_desktop_grant_count() == 2);
 }
 #endif // !_WIN32

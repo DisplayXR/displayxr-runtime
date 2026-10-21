@@ -15,7 +15,9 @@
  * object with one answer per scope. v1 files are read as is; every write
  * rewrites the file as version 2, and an entry with no CAPTURE answer is kept as
  * a plain string (so an older runtime reading the file still sees its CONTROL
- * deny). The kill switch covers both scopes.
+ * deny). The kill switch covers both scopes. `kill_switch_count` (incremented by
+ * every kill switch "on") lets a running session see that the kill switch happened
+ * even when it is off again (spec §6.4: the kill switch ends running grants).
  *
  *   Windows  %LOCALAPPDATA%\DisplayXR\
  *   macOS    ~/Library/Application Support/DisplayXR/
@@ -121,6 +123,15 @@ u_desktop_policy_is_unreadable(const struct u_desktop_policy *p);
 
 uint32_t
 u_desktop_policy_idle_ms(const struct u_desktop_policy *p);
+
+/*!
+ * How many times the kill switch was turned on (`kill_switch_count` in the store,
+ * 0 when absent). It only ever changes when it is turned on, so a session that sees
+ * it change knows the kill switch happened since — even if it was turned off again
+ * before the session looked (spec §6.4: the kill switch ends running grants).
+ */
+uint64_t
+u_desktop_policy_kill_switch_count(const struct u_desktop_policy *p);
 
 //! The CONTROL answer for @p exe (spec v1 meaning).
 enum u_desktop_app_decision
@@ -254,6 +265,12 @@ u_desktop_grant_remove_all(void);
 //! How many saved grants there are.
 uint32_t
 u_desktop_grant_count(void);
+
+typedef void (*u_desktop_grant_key_fn)(void *ctx, const char *key);
+
+//! Call @p fn with the key of every saved grant (sorted by name). Returns how many.
+uint32_t
+u_desktop_grant_for_each_key(u_desktop_grant_key_fn fn, void *ctx);
 
 
 /*

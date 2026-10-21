@@ -852,6 +852,23 @@ fake_scroll(struct u_desktop_backend *b,
  *
  */
 
+//! The kill switch ended the grant: the "OS" forgets the session's grant (as GNOME drops
+//! its in-memory token) and the call is logged.
+static void
+fake_revoke_grant(struct u_desktop_backend *b)
+{
+	struct u_desktop_fake *f = fake(b);
+	os_mutex_lock(&f->mutex);
+	if (f->access == U_DESKTOP_ACCESS_GRANTED) {
+		f->access = U_DESKTOP_ACCESS_UNKNOWN;
+	}
+	if (f->capture_access == U_DESKTOP_ACCESS_GRANTED) {
+		f->capture_access = U_DESKTOP_ACCESS_UNKNOWN;
+	}
+	log_line(f, "revoke_grant");
+	os_mutex_unlock(&f->mutex);
+}
+
 static enum u_desktop_access
 fake_capture_access_status(struct u_desktop_backend *b)
 {
@@ -1101,6 +1118,7 @@ u_desktop_fake_create(void)
 	f->base.request_scopes = fake_request_scopes;
 	f->base.monitors = fake_monitors;
 	f->base.capture = fake_capture;
+	f->base.revoke_grant = fake_revoke_grant;
 	f->base.destroy = fake_destroy;
 
 	f->access = U_DESKTOP_ACCESS_UNKNOWN;

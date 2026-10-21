@@ -163,6 +163,38 @@ bool
 u_desktop_gnome_grant_forget(const char *key, const char *token);
 
 /*
+ * For `displayxr-cli desktop status | forget` (spec §6.3): never the token.
+ */
+
+//! What a saved grant says about itself.
+struct u_desktop_gnome_grant_info
+{
+	const char *key;
+	enum u_desktop_gnome_grant_status status; //!< OK, or why it would be ignored (CORRUPT, NEWER, UNSAFE)
+	bool screencast, devices, screens;
+	char key_source[16];
+	char portal_app_id[256];
+	char exe[1024];
+	char launch_scope[256];
+	char saved[32]; //!< UTC, as the audit log writes it
+};
+
+typedef void (*u_desktop_gnome_grant_info_fn)(void *ctx, const struct u_desktop_gnome_grant_info *info);
+
+//! Every saved grant, sorted by key. Returns how many. Reads only; removes nothing.
+uint32_t
+u_desktop_gnome_grant_list(u_desktop_gnome_grant_info_fn fn, void *ctx);
+
+/*!
+ * `desktop forget <exe>`: remove every saved grant recorded for the executable
+ * @p exe (u_desktop_policy_exe_equal) that covers a scope in @p scopes (enum
+ * u_desktop_scope: CONTROL ↔ input, CAPTURE ↔ the screens; one token holds both, so
+ * the whole grant goes). Returns how many were removed.
+ */
+uint32_t
+u_desktop_gnome_grant_forget_exe(const char *exe, uint32_t scopes);
+
+/*
  * When the saved grant is kept, written or removed.
  */
 

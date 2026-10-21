@@ -520,7 +520,8 @@ struct u_desktop_policy
 	bool unreadable; //!< the file exists, cannot be parsed, and there is no good read to keep
 	bool suspended;
 	uint32_t idle_ms;
-	cJSON *apps; //!< owned object: exe -> "allow" | "deny"
+	uint64_t kill_count; //!< kill_switch_count: how many times the kill switch was turned on
+	cJSON *apps;         //!< owned object: exe -> "allow" | "deny"
 };
 
 static void
@@ -528,6 +529,7 @@ policy_defaults(struct u_desktop_policy *p)
 {
 	p->suspended = false;
 	p->idle_ms = U_DESKTOP_POLICY_DEFAULT_IDLE_MS;
+	p->kill_count = 0;
 	cJSON_Delete(p->apps);
 	p->apps = NULL;
 }
@@ -586,6 +588,10 @@ policy_from_json(struct u_desktop_policy *p, const cJSON *root)
 	if (cJSON_IsNumber(idle) && idle->valuedouble >= 0) {
 		double v = idle->valuedouble;
 		p->idle_ms = v > U_DESKTOP_POLICY_MAX_IDLE_MS ? U_DESKTOP_POLICY_MAX_IDLE_MS : (uint32_t)v;
+	}
+	const cJSON *kc = cJSON_GetObjectItemCaseSensitive(root, "kill_switch_count");
+	if (cJSON_IsNumber(kc) && kc->valuedouble >= 0) {
+		p->kill_count = (uint64_t)kc->valuedouble;
 	}
 	const cJSON *apps = cJSON_GetObjectItemCaseSensitive(root, "apps");
 	if (cJSON_IsObject(apps)) {
@@ -818,6 +824,12 @@ bool
 u_desktop_policy_is_unreadable(const struct u_desktop_policy *p)
 {
 	return p != NULL && p->unreadable;
+}
+
+uint64_t
+u_desktop_policy_kill_switch_count(const struct u_desktop_policy *p)
+{
+	return p->kill_count;
 }
 
 bool
@@ -1055,6 +1067,14 @@ u_desktop_policy_set_suspended(bool suspended, const char *by)
 	bool was = st == LOAD_CORRUPT ? false : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "suspended"));
 	cJSON_DeleteItemFromObjectCaseSensitive(root, "suspended");
 	cJSON_AddBoolToObject(root, "suspended", suspended);
+	if (suspended) {
+		// Every "on" counts (spec §6.4): a running session that sees the count change
+		// ends its grant, even if the switch is already off again when it looks.
+		const cJSON *kc = cJSON_GetObjectItemCaseSensitive(root, "kill_switch_count");
+		double n = cJSON_IsNumber(kc) && kc->valuedouble >= 0 ? kc->valuedouble : 0;
+		cJSON_DeleteItemFromObjectCaseSensitive(root, "kill_switch_count");
+		cJSON_AddNumberToObject(root, "kill_switch_count", n + 1);
+	}
 	bool ok = save_root_atomic(path, root);
 	cJSON_Delete(root);
 	store_unlock(lk);
@@ -1590,6 +1610,51 @@ u_desktop_grant_remove_all(void)
 	return grant_sweep(true);
 }
 
+static int
+cmp_str(const void *a, const void *b)
+{
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+uint32_t
+u_desktop_grant_for_each_key(u_desktop_grant_key_fn fn, void *ctx)
+{
+	char dir[PATH_CAP];
+	if (!u_desktop_grant_dir(dir, sizeof(dir)) || !grant_dir_ours(dir)) {
+		return 0;
+	}
+	DIR *d = opendir(dir);
+	if (d == NULL) {
+		return 0;
+	}
+	char *keys[256];
+	uint32_t n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) != NULL && n < 256) {
+		bool is_tmp = false;
+		if (!grant_file_name(e->d_name, &is_tmp) || is_tmp) {
+			continue;
+		}
+		size_t len = strlen(e->d_name) - 5; // ".json"
+		keys[n] = (char *)malloc(len + 1);
+		if (keys[n] == NULL) {
+			break;
+		}
+		memcpy(keys[n], e->d_name, len);
+		keys[n][len] = '\0';
+		n++;
+	}
+	closedir(d);
+	qsort(keys, n, sizeof(keys[0]), cmp_str);
+	for (uint32_t i = 0; i < n; i++) {
+		if (fn != NULL) {
+			fn(ctx, keys[i]);
+		}
+		free(keys[i]);
+	}
+	return n;
+}
+
 uint32_t
 u_desktop_grant_count(void)
 {
@@ -1637,6 +1702,14 @@ u_desktop_grant_remove_all(void)
 uint32_t
 u_desktop_grant_count(void)
 {
+	return 0;
+}
+
+uint32_t
+u_desktop_grant_for_each_key(u_desktop_grant_key_fn fn, void *ctx)
+{
+	(void)fn;
+	(void)ctx;
 	return 0;
 }
 

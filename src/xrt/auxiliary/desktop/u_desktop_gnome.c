@@ -684,6 +684,15 @@ gnome_access_status(struct u_desktop_backend *b)
 }
 
 static void
+gnome_revoke_grant(struct u_desktop_backend *b)
+{
+	struct gnome_backend *g = gnome(b);
+	if (g->portal != NULL) {
+		gnome_portal_revoke(g->portal);
+	}
+}
+
+static void
 gnome_request_access(struct u_desktop_backend *b,
                      const struct u_desktop_app_info *app,
                      u_desktop_access_done_fn done,
@@ -1351,6 +1360,7 @@ u_desktop_backend_create_platform(void)
 	g->base.pointer_move = gnome_pointer_move;
 	g->base.pointer_button = gnome_pointer_button;
 	g->base.scroll = gnome_scroll;
+	g->base.revoke_grant = gnome_revoke_grant;
 	g->base.destroy = gnome_destroy;
 
 	U_LOG_I("desktop/gnome: caps 0x%x (extension v16 %s, RemoteDesktop v%u, clipboard %s, libei %s, a11y %s)", caps,

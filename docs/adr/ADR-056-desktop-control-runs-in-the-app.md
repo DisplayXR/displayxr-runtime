@@ -439,10 +439,19 @@ runtime made the product worse on exactly the OS where the dialog is the consent
    spec §10.2 — the in-memory grant is dropped too, which also corrects the old behaviour of
    putting it back); a silent restore that is not silent or is refused (the portal no longer
    honours it); the session closed by anything but a lock (the indicator's Stop); the kill
-   switch, which removes every saved grant. A process whose file disappears keeps its in-memory
-   grant until it exits but never writes the file again.
+   switch, which removes every saved grant; `displayxr-cli desktop forget <exe>`, which removes
+   the grants recorded for that executable. `desktop status` lists the saved grants (never the
+   token).
 5. **Never forwarded.** The token is used only by the runtime inside the app's own process; it
    is never logged, never sent over IPC or MCP (D4), and each app has its own file.
+6. **The kill switch ends running grants too** (proposed; it was an open question). Turning it on
+   increments `kill_switch_count` in the store; every session that sees the count move — even
+   after the switch is off again — revokes the scopes its app had requested (`DENIED` until a
+   new request) and tells the backend to drop its OS grant (GNOME: close the portal session,
+   forget the restore token). This holds on every OS: on Windows and macOS the new request is
+   answered without a prompt (the store / the OS still says yes), on GNOME it shows the dialog
+   because the saved grant is gone. A process whose saved file is removed any other way (by
+   hand, `forget`) keeps its in-memory grant until it exits but never writes the file again.
 
 ### Consequences
 
@@ -476,9 +485,8 @@ runtime made the product worse on exactly the OS where the dialog is the consent
 4. **The service keeps the token.** Routes the grant through `displayxr-service` — ruled out by
    D2 and open question 4.
 
-### Open for the decision
+### Proposed in this amendment (were open questions; the maintainer may still change them)
 
-- Whether the kill switch should also drop the grant of a process already running when it is
-  set (today: that process keeps it in memory until it exits; only the file goes).
-- Whether `displayxr-cli desktop forget <exe>` should also remove a saved grant (the file
-  records the executable).
+- The kill switch ends the grant of a process already running (decision 6), on every OS.
+- `displayxr-cli desktop forget <exe>` also removes the saved grants recorded for that
+  executable, and `desktop status` lists the saved grants (decision 4).
