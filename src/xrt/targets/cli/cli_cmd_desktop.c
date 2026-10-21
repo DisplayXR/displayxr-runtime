@@ -6,8 +6,11 @@
  *         (ADR-056 D3, spec §6.3).
  *
  *   desktop status [--json]          kill switch, idle_ms, per-app decisions, paths
- *   desktop stop | resume            the kill switch (every session sees it on its next call)
+ *   desktop stop | resume            the kill switch (every session sees it on its next call);
+ *                                    stop also removes every saved OS grant (spec §6.4)
  *   desktop allow|deny|forget <exe> [--scope control|capture|all]
+ *                                    (forget also removes the saved OS grants recorded
+ *                                    for <exe>, spec §6.4)
  *                                    per-app decision (allow is meaningful on Windows,
  *                                    where DisplayXR's own prompt is the consent). Spec
  *                                    v2: one answer per scope; default `control` for
@@ -23,6 +26,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "desktop/u_desktop.h"
+#include "desktop/u_desktop_gnome_grant.h"
 #include "desktop/u_desktop_policy.h"
 #include "os/os_time.h"
 
@@ -120,12 +124,50 @@ json_app(void *ctx, const char *exe, enum u_desktop_app_decision control, enum u
 	}
 }
 
+static void
+print_grant(void *ctx, const struct u_desktop_gnome_grant_info *i)
+{
+	(void)ctx;
+	if (i->status != U_DESKTOP_GNOME_GRANT_OK) {
+		printf("  %-40s (%s: ignored)\n", i->key, u_desktop_gnome_grant_status_str(i->status));
+		return;
+	}
+	printf("  %-40s %s%s%s, saved %s\n", i->key, i->screencast ? "screen cast: " : "", i->devices ? "input" : "",
+	       i->screens ? (i->devices ? " + screens" : "screens") : "", i->saved[0] ? i->saved : "?");
+	printf("  %-40s key from %s%s%s%s%s\n", "", i->key_source[0] ? i->key_source : "?", i->exe[0] ? ", exe " : "",
+	       i->exe, i->portal_app_id[0] ? ", portal app id " : "", i->portal_app_id);
+}
+
+static void
+json_grant(void *ctx, const struct u_desktop_gnome_grant_info *i)
+{
+	cJSON *e = cJSON_CreateObject();
+	if (e == NULL) {
+		return;
+	}
+	cJSON_AddStringToObject(e, "key", i->key);
+	cJSON_AddStringToObject(e, "status", u_desktop_gnome_grant_status_str(i->status));
+	if (i->status == U_DESKTOP_GNOME_GRANT_OK) {
+		cJSON_AddStringToObject(e, "portal", i->screencast ? "screencast" : "remote_desktop");
+		cJSON_AddBoolToObject(e, "input", i->devices);
+		cJSON_AddBoolToObject(e, "screens", i->screens);
+	}
+	cJSON_AddStringToObject(e, "key_source", i->key_source);
+	cJSON_AddStringToObject(e, "exe", i->exe);
+	cJSON_AddStringToObject(e, "portal_app_id", i->portal_app_id);
+	cJSON_AddStringToObject(e, "launch_scope", i->launch_scope);
+	cJSON_AddStringToObject(e, "saved", i->saved);
+	cJSON_AddItemToArray((cJSON *)ctx, e);
+}
+
 static int
 cmd_status(bool json)
 {
-	char store[1024] = {0}, audit[1024] = {0};
+	char store[1024] = {0}, audit[1024] = {0}, grants[1024] = {0};
 	u_desktop_policy_store_path(store, sizeof(store));
 	u_desktop_policy_audit_path(audit, sizeof(audit));
+	u_desktop_grant_dir(grants, sizeof(grants));
+	uint32_t ngrants = u_desktop_grant_count();
 	struct u_desktop_policy *p = u_desktop_policy_create();
 	if (p == NULL) {
 		fprintf(stderr, "desktop: out of memory\n");
@@ -146,6 +188,10 @@ cmd_status(bool json)
 		u_desktop_policy_for_each_app_scopes(p, json_app, apps);
 		cJSON_AddStringToObject(o, "store", store);
 		cJSON_AddStringToObject(o, "audit", audit);
+		cJSON_AddStringToObject(o, "saved_grants_dir", grants);
+		cJSON_AddNumberToObject(o, "saved_grants", ngrants);
+		cJSON *gl = cJSON_AddArrayToObject(o, "saved_grant_list");
+		u_desktop_gnome_grant_list(json_grant, gl);
 		cJSON_AddBoolToObject(o, "env_disabled", env_off);
 		char *s = cJSON_Print(o);
 		printf("%s\n", s != NULL ? s : "{}");
@@ -173,6 +219,9 @@ cmd_status(bool json)
 		}
 		printf("  store:        %s\n", store);
 		printf("  audit log:    %s\n", audit);
+		printf("  saved grants: %u in %s (GNOME: an app's portal approval, kept across launches)\n", ngrants,
+		       grants);
+		u_desktop_gnome_grant_list(print_grant, NULL);
 		printf("  apps:\n");
 		u_desktop_policy_for_each_app_scopes(p, print_app, NULL);
 	}
@@ -185,6 +234,7 @@ cmd_suspend(bool suspended)
 {
 	// The kill switch must land: a store held open by another process can fail the
 	// rename (Windows), so `stop` retries a few times before giving up loudly.
+	uint32_t grants_before = suspended ? u_desktop_grant_count() : 0;
 	bool ok = false;
 	for (int attempt = 0; attempt < (suspended ? 3 : 1) && !ok; attempt++) {
 		if (attempt > 0) {
@@ -208,6 +258,10 @@ cmd_suspend(bool suspended)
 	}
 	printf(suspended ? "desktop control stopped for every app (kill switch on)\n"
 	                 : "desktop control resumed (kill switch off)\n");
+	if (suspended && grants_before > 0) {
+		printf("removed %u saved grant(s): those apps ask the OS for consent again on their next request\n",
+		       grants_before - u_desktop_grant_count());
+	}
 	return 0;
 }
 
@@ -250,6 +304,15 @@ cmd_app(const char *op, int argc, const char **argv)
 		return 1;
 	}
 	printf("%s (%s): %s\n", op, u_desktop_scope_str(scopes), exe);
+	if (d == U_DESKTOP_APP_NONE) {
+		// Forget means forget: the GNOME grant saved for this executable goes too (spec §6.4),
+		// so its next launch asks the OS again. (A running process keeps its grant until
+		// it exits; the kill switch ends that too.)
+		uint32_t n = u_desktop_gnome_grant_forget_exe(exe, scopes);
+		if (n > 0) {
+			printf("removed %u saved grant(s) recorded for it: its next request asks the OS again\n", n);
+		}
+	}
 	return 0;
 }
 

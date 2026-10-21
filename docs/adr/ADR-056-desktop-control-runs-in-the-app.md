@@ -94,7 +94,8 @@ Every operation is asynchronous and reports a result; every mutating operation n
 | macOS | AX API + `CGEvent` + ScreenCaptureKit | Accessibility + Screen Recording, granted to the app bundle in System Settings |
 
 The runtime never stores or forwards a grant. A session belongs to the process that opened it
-and dies with it.
+and dies with it. *(Amendment 2, proposed: on GNOME the runtime keeps the portal's restore token
+for the same app across launches, in a private file of that app's; it never forwards it.)*
 
 ### D3. A DisplayXR safety layer, identical on every OS
 
@@ -254,7 +255,7 @@ gesture. Per OS:
 
 | OS | what the user sees | asking for CAPTURE after CONTROL |
 |---|---|---|
-| GNOME | **One** portal dialog for both: a screen picker plus "allow remote interaction". The approval is remembered for the life of the process (the restore token stays in memory, as in v1). | A new dialog. A restore token cannot be widened, so the new combined session asks about input again. **Apps that will capture should ask for both scopes at once.** |
+| GNOME | **One** portal dialog for both: a screen picker plus "allow remote interaction". The approval is remembered for the life of the process (the restore token stays in memory, as in v1; Amendment 2 proposes keeping it per app across launches). | A new dialog. A restore token cannot be widened, so the new combined session asks about input again. **Apps that will capture should ask for both scopes at once.** |
 | Windows | DisplayXR's existing consent MessageBox, with text that names the scopes asked for ("see your screen", "type and click in other apps"). The answer is stored per scope. | A second, capture-only prompt. |
 | macOS | Screen Recording (TCC). v1 already requests it at `CONTROL` time (for window titles), so it is usually already granted. | Usually no prompt. |
 
@@ -402,3 +403,98 @@ on 2026-10-19.
    Windows ignore it today. A handle form of their own is reserved for a later revision, and
    until one is specified any other prefix is refused, not ignored. The Unity plug-in gets the
    string from `displayxr_linux_window_handle` (displayxr-unity#385).
+
+## Amendment 2 — On GNOME the grant survives a restart of the app (PROPOSED, 2026-10-21)
+
+**Status:** Proposed — needs David's decision. Implemented on the branch
+`feat/desktop-control-persist-grant` (spec §6.4); nothing changes on Windows or macOS.
+
+### Context
+
+D2 says the runtime never stores a grant. On Windows and macOS that costs nothing: the OS (or
+DisplayXR's store) remembers the answer, so an app asks once. On GNOME the portal hands the app a
+**restore token** (`persist_mode` 2) and remembers the approval under it, but only a process
+that passes the token back gets the silent restore. The runtime kept the token in memory, so
+**every launch of an agent app showed GNOME's dialog again**. The app-side helper that desktop
+control replaces stored the token itself (a 0600 file) and asked once, ever; moving to the
+runtime made the product worse on exactly the OS where the dialog is the consent.
+
+### Decision
+
+1. **Always save the restore token, per app.** After every successful `Start`, the GNOME
+   backend writes the token and the grant's shape (portal, input, screens, the covered
+   connectors — the shape decides what a restore asks for, and a downgraded restore is saved by
+   GNOME, D9) to `$XDG_STATE_HOME/displayxr/desktop-control/<key>.json`: directory 0700, file
+   0600, atomic. It is read at the app's first request or restore in a process. This holds on
+   every portal that issues restore tokens, Ubuntu 24.04's xdg-desktop-portal 1.18 (no host
+   registry) included.
+2. **The key is the app's own identity:** the app id
+   `org.freedesktop.host.portal.Registry.Register` accepted; else the app's own id
+   (`DXR_DESKTOP_APP_ID`, or the `.desktop` basename) even when registration failed or the
+   portal has no registry; else the executable (`exe-<basename>-<hash of the absolute path>`).
+   The file records, for diagnostics only, which id the portal used when known (the registered
+   one) and the systemd unit the process ran in.
+3. **The portal stays the judge.** It honours a token only for the app id it bound it to: the
+   registered id, or one derived from the launch context (the process's systemd scope — in the
+   headless run, the IDE that started the test, `com.microsoft.VSCode`). So the first request of
+   a process restores the saved grant with the dialog allowed: silent when the app is launched
+   as before; launched from another context, the portal shows its dialog once and its new token
+   replaces the saved one. The docs say: launch the app the same way, ideally from its `.desktop`
+   file. A `.desktop` file is not needed for "ask once"; registering makes GNOME name the app in
+   the dialog and in Settings.
+4. **Removed whenever the grant ends:** the user declines a dialog that had no grant to keep,
+   the dialog of that verifying restore, or an `ASK_AGAIN` (whose answer replaces the grant,
+   spec §10.2 — the in-memory grant is dropped too, which also corrects the old behaviour of
+   putting it back); a silent restore that is not silent or is refused (the portal no longer
+   honours it); the session closed by anything but a lock (the indicator's Stop); the kill
+   switch, which removes every saved grant; `displayxr-cli desktop forget <exe>`, which removes
+   the grants recorded for that executable. `desktop status` lists the saved grants (never the
+   token).
+5. **Never forwarded.** The token is used only by the runtime inside the app's own process; it
+   is never logged, never sent over IPC or MCP (D4), and each app has its own file.
+6. **The kill switch ends running grants too** (proposed; it was an open question). Turning it on
+   increments `kill_switch_count` in the store; every session that sees the count move — even
+   after the switch is off again — revokes the scopes its app had requested (`DENIED` until a
+   new request) and tells the backend to drop its OS grant (GNOME: close the portal session,
+   forget the restore token). This holds on every OS: on Windows and macOS the new request is
+   answered without a prompt (the store / the OS still says yes), on GNOME it shows the dialog
+   because the saved grant is gone. A process whose saved file is removed any other way (by
+   hand, `forget`) keeps its in-memory grant until it exits but never writes the file again.
+
+### Consequences
+
+- One dialog per app on GNOME, as on the other OSes (plus one more if the app is launched from a
+  different context); after a kill switch, a decline, a Stop or a withdrawn approval, the next
+  launch asks again.
+- **The token on disk is a capability.** The threat is a process of the same user that reads
+  the 0600 file and replays the token from a context the portal accepts — the same launch
+  context, or a process that registers the same app id, which any same-user process can do once
+  a `.desktop` file with that id exists. That exposure is the same whether or not the app
+  registered, and the same as every app that persists a portal restore token (OBS Studio, the
+  app-side helper this replaces). The portal still refuses the token to other app ids, sandboxed
+  apps and other users, and GNOME's indicator shows every session. Before, the token lived only
+  in the app's memory, and reading it needed `ptrace` on the app.
+- A new process's first request costs a restore (the remote-access indicator shows for ~2 s,
+  as after any action) instead of being answered from memory, so a withdrawn approval or a new
+  launch context surfaces at the request, as the dialog, not as a failed action.
+
+### Rejected alternatives
+
+1. **Keep the token in memory (status quo).** A dialog at every launch: the reason for this
+   amendment.
+2. **Save only for an app id the portal's registry accepted.** It leaves Ubuntu 24.04
+   (xdg-desktop-portal 1.18 has no registry) and every app without an installed `.desktop` file
+   with a dialog at every launch, and buys no security: registering an id needs only a
+   `.desktop` file, which a same-user process can install.
+3. **The Secret Service (gnome-keyring).** Encrypted at rest, but unlocked for the whole session
+   and readable by any same-user process through the same D-Bus API, so it adds no barrier
+   against the threat above; it adds a dependency and a failure mode (a locked or absent
+   keyring).
+4. **The service keeps the token.** Routes the grant through `displayxr-service` — ruled out by
+   D2 and open question 4.
+
+### Proposed in this amendment (were open questions; the maintainer may still change them)
+
+- The kill switch ends the grant of a process already running (decision 6), on every OS.
+- `displayxr-cli desktop forget <exe>` also removes the saved grants recorded for that
+  executable, and `desktop status` lists the saved grants (decision 4).

@@ -153,6 +153,9 @@ struct u_desktop_control
 	// --- under mutex ---
 	bool dying; //!< set before backend->destroy: consent answers are ignored from here on
 	struct u_desktop_policy *policy;
+	//! The store's kill_switch_count this session last saw: a change means the kill
+	//! switch was turned on since, which ends this app's grant (spec §6.4).
+	uint64_t kill_seen;
 	struct scope_state sc[SC_COUNT];
 	//! The app has touched the CAPTURE scope (asked, queried, captured): only then
 	//! are its state changes announced (a v1 app never sees a capture event).
@@ -357,6 +360,47 @@ scope_name(int idx)
 	return idx == SC_CAPTURE ? "capture" : "control";
 }
 
+static void
+audit_consent(struct u_desktop_control *c, const char *what, const char *reason, const char *scope);
+
+/*!
+ * The kill switch was turned on since this session last looked (the store's
+ * kill_switch_count moved — seen even when it is already off again): it ends the
+ * app's grant, not just pauses it (spec §6.4). Every scope the app had requested is
+ * revoked (DENIED once the switch is off, until the app requests access again) and
+ * the backend drops the OS grant it holds (GNOME: closes the portal session,
+ * forgets the restore token). Mutex held.
+ */
+static void
+kill_switch_ends_grant_locked(struct u_desktop_control *c)
+{
+	uint64_t n = u_desktop_policy_kill_switch_count(c->policy);
+	// While the store says the kill switch is on, no grant may run, whatever the count:
+	// a store recreated over an unreadable one starts counting at 1 again, which this
+	// session may have seen already.
+	if ((n == c->kill_seen && !u_desktop_policy_is_suspended(c->policy)) ||
+	    u_desktop_policy_is_unreadable(c->policy)) {
+		return;
+	}
+	c->kill_seen = n;
+	bool any = false;
+	for (int idx = 0; idx < SC_COUNT; idx++) {
+		if (c->sc[idx].requested && !c->sc[idx].revoked) {
+			c->sc[idx].revoked = true;
+			any = true;
+		}
+	}
+	if (!any) {
+		return;
+	}
+	U_LOG_W("desktop_control: the kill switch ended the desktop-control grant of %s — it must request access again",
+	        c->name);
+	audit_consent(c, "revoked", "kill switch", NULL);
+	if (c->b != NULL && c->b->revoke_grant != NULL) {
+		c->b->revoke_grant(c->b); // posts the work: never blocks
+	}
+}
+
 //! The §3 table for scope @p idx (spec v2 §10.2: rows 1–7 are the same checks; rows 4
 //! and 8–10 read that scope's own store answer and grant).
 static enum u_desktop_control_state
@@ -378,6 +422,7 @@ evaluate_scope_locked(struct u_desktop_control *c, int idx, enum reason *out_rea
 		goto out;
 	}
 	u_desktop_policy_refresh(c->policy);
+	kill_switch_ends_grant_locked(c);
 	if (u_desktop_policy_is_unreadable(c->policy)) { // 3, fail closed (spec §6.1)
 		r = R_STORE_UNREADABLE;
 		s = U_DESKTOP_STATE_SUSPENDED;
@@ -2615,6 +2660,8 @@ u_desktop_control_create(struct u_desktop_backend *backend,
 	c->sc[SC_CONTROL].req_result = U_DESKTOP_ACCESS_UNKNOWN;
 	c->sc[SC_CAPTURE].req_result = U_DESKTOP_ACCESS_UNKNOWN;
 	c->policy = u_desktop_policy_create();
+	// A kill switch before this session does not end a grant it has not made yet.
+	c->kill_seen = c->policy != NULL ? u_desktop_policy_kill_switch_count(c->policy) : 0;
 	c->list_cap = 64;
 	c->list_buf = (struct u_desktop_window *)calloc(c->list_cap, sizeof(struct u_desktop_window));
 

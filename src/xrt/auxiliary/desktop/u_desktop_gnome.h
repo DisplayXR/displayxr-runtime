@@ -132,6 +132,11 @@ gnome_portal_destroy(struct gnome_portal *p);
 enum u_desktop_access
 gnome_portal_access(struct gnome_portal *p);
 
+//! The kill switch ended the app's grant (spec §6.4): close the portal session and
+//! forget the restore token and its saved copy, on the portal thread. Never blocks.
+void
+gnome_portal_revoke(struct gnome_portal *p);
+
 //! Open a session interactively (the portal's dialog). Calls @p done once.
 //! @p parent_window: the dialog's parent ("wayland:…" / "x11:…"; NULL or "" = none).
 void
