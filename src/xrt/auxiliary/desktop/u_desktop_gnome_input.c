@@ -1010,11 +1010,15 @@ clipboard_read_text(struct gnome_portal *p, char **out, size_t *out_len, char *m
 			break;
 		}
 		if (len == cap) {
+			// Grow by copy, never realloc: realloc may free the old block unwiped.
 			size_t ncap = cap * 2 > limit ? limit : cap * 2;
-			char *nb = realloc(buf, ncap + 1);
+			char *nb = malloc(ncap + 1);
 			if (nb == NULL) {
 				break;
 			}
+			memcpy(nb, buf, len);
+			u_desktop_wipe(buf, len);
+			free(buf);
 			buf = nb;
 			cap = ncap;
 		}
@@ -1032,7 +1036,7 @@ clipboard_read_text(struct gnome_portal *p, char **out, size_t *out_len, char *m
 		return U_DESKTOP_ERR_FAILED;
 	}
 	if (!eof && len < limit) {
-		memset(buf, 0, len); // a partial read is never handed out
+		u_desktop_wipe(buf, len); // a partial read is never handed out
 		free(buf);
 		gp_set_msg(msg, "the clipboard owner did not finish sending the text");
 		return U_DESKTOP_ERR_TIMEOUT;
@@ -1337,7 +1341,7 @@ gnome_portal_clip_get(struct gnome_portal *p, char **out, size_t *len, char *msg
 		*out = copy.out_text;
 		*len = copy.out_len;
 	} else if (copy.out_text != NULL) {
-		memset(copy.out_text, 0, copy.out_len);
+		u_desktop_wipe(copy.out_text, copy.out_len);
 		free(copy.out_text);
 	}
 	return r;

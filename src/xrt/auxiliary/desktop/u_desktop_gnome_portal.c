@@ -1367,6 +1367,9 @@ revoke_done_nop(void *ctx, enum u_desktop_access a)
 void
 gp_cmd_free(struct gp_cmd *c)
 {
+	if (c->text != NULL) {
+		u_desktop_wipe(c->text, strlen(c->text)); // typed or clipboard text (spec v3 §11.6)
+	}
 	free(c->text);
 	free(c);
 }
