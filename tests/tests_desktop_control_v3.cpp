@@ -1003,6 +1003,9 @@ TEST_CASE("v3_shell: held buttons and drags to the shell; every other guard stil
 	u_desktop_action k = click(kShell, 500, 10);
 	CHECK(u_desktop_control_submit(h.c, &k, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
 	REQUIRE(u_desktop_policy_set_suspended(false, "test"));
+	// The kill switch ended the grant (ADR-056 Amendment 2): request it again.
+	CHECK(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_DENIED);
+	REQUIRE(u_desktop_control_request(h.c, "tests") == U_DESKTOP_XR_SUCCESS);
 	REQUIRE(u_desktop_control_get_state(h.c, nullptr) == U_DESKTOP_STATE_GRANTED);
 	u_desktop_fake_set_locked(h.fake, true);
 	CHECK(u_desktop_control_submit(h.c, &k, &id) == U_DESKTOP_XR_ERROR_NOT_GRANTED);
