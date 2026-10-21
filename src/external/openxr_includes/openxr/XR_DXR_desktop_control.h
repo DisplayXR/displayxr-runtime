@@ -271,7 +271,8 @@ typedef struct XrDesktopControlRequestScopeDXR {
  *
  * Format: the xdg-desktop-portal "parent_window" string convention, verbatim —
  * "wayland:<handle>" (a handle from the xdg-foreign protocol's zxdg_exporter_v2 export
- * of the app's toplevel) or "x11:<XID in hexadecimal>". At most
+ * of the app's toplevel, passed verbatim: any printable ASCII 0x20-0x7E, the SPACE
+ * included — mutter's handles often contain one) or "x11:<XID in hexadecimal>". At most
  * XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR - 1 bytes; anything else, including another
  * prefix, is XR_ERROR_VALIDATION_FAILURE. Used on GNOME / KDE (the RemoteDesktop and
  * ScreenCast portals' Start). Ignored elsewhere: the macOS prompt is System Settings and

@@ -176,6 +176,74 @@ u_desktop_cross_dwell_left_ms(uint64_t crossed_at_ms, uint64_t now_ms, uint32_t 
 bool
 u_desktop_shell_cover_appeared(const uint8_t *before, const uint8_t *after, uint32_t n);
 
+/*
+ * Portal probes at login: retried until they answer, a failure never cached.
+ */
+
+//! How often an unanswered portal probe is retried (the ScreenCast probe and the
+//! RemoteDesktop version read alike).
+#define U_DESKTOP_PORTAL_RETRY_MS 10000
+
+/*!
+ * A D-Bus error from reading a portal property: true when it means the portal
+ * has not answered (yet) — a timeout / no reply, the bus name not owned or not
+ * started, a dropped connection, an empty name — so the read must be retried;
+ * false when it IS the portal's answer (no such interface / property / object:
+ * this portal does not have it), which may be cached.
+ */
+bool
+u_desktop_dbus_error_is_no_answer(const char *error_name);
+
+//! A probe retried until it answers (never caching "no answer").
+struct u_desktop_retry
+{
+	bool known;       //!< it answered: never probed again
+	uint64_t next_ms; //!< the earliest next attempt (0 = now)
+};
+
+//! True when a probe should run now: not answered yet and the retry is due.
+bool
+u_desktop_retry_due(const struct u_desktop_retry *r, uint64_t now_ms);
+
+//! Record an attempt: @p answered → known for good; else the next try in @p period_ms.
+void
+u_desktop_retry_record(struct u_desktop_retry *r, bool answered, uint64_t now_ms, uint32_t period_ms);
+
+/*
+ * Restoring a screen grant: wait for a stable monitor layout.
+ */
+
+/*!
+ * The monitor layout as seen through repeated observations, for "restore only
+ * after the layout has been stable for settle_ms" (spec §10.5, the DS1's HDMI
+ * blink). Stability is measured from the LATER of: the last observed layout
+ * change (any change of @p fingerprint — serial, connectors, rects — not just
+ * mutter's serial), and the moment every monitor the grant covers was seen
+ * present again after one was seen missing.
+ */
+struct u_desktop_layout_settle
+{
+	uint64_t fingerprint; //!< the last layout seen (0 = none yet)
+	uint64_t changed_ms;  //!< when it last changed (0 = not seen changing)
+	uint64_t present_ms;  //!< when the covered monitors came back (0 = never seen missing)
+	bool was_missing;     //!< the last observation had a covered monitor missing
+};
+
+//! The layout the grant was made on: the baseline (nothing pending).
+void
+u_desktop_layout_settle_reset(struct u_desktop_layout_settle *s, uint64_t fingerprint);
+
+#define U_DESKTOP_LAYOUT_MISSING UINT32_MAX
+
+/*!
+ * Feed one observation: @p missing covered monitors absent. Returns the ms left
+ * until the layout counts as settled (0 = restore now), or
+ * U_DESKTOP_LAYOUT_MISSING while a covered monitor is absent.
+ */
+uint32_t
+u_desktop_layout_settle_step(
+    struct u_desktop_layout_settle *s, uint64_t now_ms, uint64_t fingerprint, uint32_t missing, uint32_t settle_ms);
+
 #ifndef _WIN32
 /*!
  * write(2) that cannot raise SIGPIPE: the clipboard reader may go away mid-write

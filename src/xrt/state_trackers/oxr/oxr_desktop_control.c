@@ -140,7 +140,7 @@ get_dc(struct oxr_session *sess)
 		if (!u_desktop_self_identity(exe, sizeof(exe), name, sizeof(name))) {
 			snprintf(name, sizeof(name), "this app");
 		}
-		struct u_desktop_app_info app = {exe, name, NULL};
+		struct u_desktop_app_info app = {.exe_path = exe, .display_name = name};
 		struct u_desktop_control_callbacks cb = {on_state_changed, on_action_completed, sess,
 		                                         on_capture_state_changed, on_capture_completed};
 		u_desktop_control_create(u_desktop_backend_create(), &app, &cb, NULL, &sess->desktop_control);
@@ -275,10 +275,12 @@ oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestI
 			have_parent = true;
 			const char *pw = ((const XrDesktopControlParentWindowDXR *)n)->parentWindow;
 			if (!u_desktop_parent_window_valid(pw)) {
-				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-				                 "(XrDesktopControlParentWindowDXR::parentWindow) must be \"\", "
-				                 "\"wayland:<handle>\" or \"x11:<hex>\", shorter than %d bytes",
-				                 XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR);
+				return oxr_error(
+				    &log, XR_ERROR_VALIDATION_FAILURE,
+				    "(XrDesktopControlParentWindowDXR::parentWindow) must be \"\", "
+				    "\"wayland:<printable ASCII handle, spaces allowed>\" or \"x11:<hex>\", "
+				    "shorter than %d bytes",
+				    XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR);
 			}
 			if (pw != NULL) {
 				snprintf(parent, sizeof(parent), "%s", pw);

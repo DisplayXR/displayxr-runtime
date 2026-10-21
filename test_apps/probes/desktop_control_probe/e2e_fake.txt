@@ -72,6 +72,12 @@ expect-rejected request-scopes capture --parent=wayland: so the probe can see yo
 expect-capture-state NOT_REQUESTED
 request-scopes capture --parent=x11:4a00007 so the probe can see your screen
 expect-capture-state GRANTED
+# a mutter handle is printable ASCII and often has spaces (leading / inner / trailing): accepted
+request-scopes capture --parent="wayland: Ab#c d\e " so the probe can see your screen
+expect XR_SUCCESS
+request-scopes capture --parent-hex=7761796c616e643a2022612062222020 so the probe can see your screen
+expect XR_SUCCESS
+expect-rejected request-scopes capture --parent-hex=7761796c616e643a0961 so the probe can see your screen
 expect-state GRANTED
 capture desktop max=960x960
 expect-capture XR_SUCCESS 960x540

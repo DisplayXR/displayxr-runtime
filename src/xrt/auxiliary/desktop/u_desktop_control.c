@@ -693,8 +693,12 @@ u_desktop_parent_window_valid(const char *pw)
 		if (*h == '\0') {
 			return false;
 		}
+		// Printable ASCII 0x20..0x7E, SPACE INCLUDED: mutter's xdg-foreign handles are
+		// 32 random printable characters and the space is one of them (half of the
+		// handles in the GNOME §11 run had one). Control characters and non-ASCII are
+		// refused.
 		for (; *h != '\0'; h++) {
-			if ((unsigned char)*h <= 0x20 || (unsigned char)*h >= 0x7f) {
+			if ((unsigned char)*h < 0x20 || (unsigned char)*h >= 0x7f) {
 				return false;
 			}
 		}

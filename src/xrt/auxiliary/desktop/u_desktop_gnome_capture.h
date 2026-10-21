@@ -40,6 +40,7 @@
 #pragma once
 
 #include "u_desktop.h"
+#include "u_desktop_gnome_logic.h"
 #include "u_desktop_gnome_pipewire.h"
 
 #include <stdbool.h>
@@ -74,8 +75,9 @@ struct gp_cap
 	// ---- monitors the screen grant covers (connectors) and layout changes ----
 	char covered[8][32];
 	uint32_t ncovered;
-	uint32_t dc_serial;     //!< DisplayConfig serial last seen
-	uint64_t dc_changed_ms; //!< when it last changed
+	//! The DisplayConfig layout as last seen, and when it last changed / the covered
+	//! monitors came back (u_desktop_gnome_logic.h).
+	struct u_desktop_layout_settle layout;
 	bool reask;             //!< the pending request asks again even if granted
 
 	// ---- shared, under gnome_portal::lock ----
@@ -86,6 +88,9 @@ struct gp_cap
 	bool open_devices;            //!< the open session has input devices
 	bool pending;                 //!< a CAPTURE request is in flight
 	enum u_desktop_access access; //!< CAPTURE's last outcome (when no token / session says more)
+	//! Captures between their prepare and the end of their grab: while non-zero the
+	//! session is never idle-closed (the grab reads its streams).
+	uint32_t grabs;
 	int handoff_fd;               //!< prepare → caller: a dup of the PipeWire remote (-1: none)
 	struct gnome_pw_stream handoff[8];
 	uint32_t handoff_n;
