@@ -21,9 +21,10 @@
  *   `H` the physical display height in metres. Anchor and gain are in DISPLAY
  *   HEIGHTS, so the hands feel the same on any panel size and nobody has to
  *   measure where the Leap sits. The defaults are the reference viewer app's
- *   scene: Leap origin on the display plane 0.20 H below the display centre,
- *   0.81 H per metre of hand motion — so a hand held ~25 cm above the device
- *   lands at the display centre. Joint radii (and linear velocities) scale by
+ *   scene (display rig virtual height 1.2 units, Leap root at y = -0.75 with
+ *   scale 3): Leap origin on the display plane 0.625 H below the display
+ *   centre (just under the bottom edge), 2.5 H per metre of hand motion — so a
+ *   hand held 25 cm above the device lands at the display centre. Joint radii (and linear velocities) scale by
  *   the same gain, so the hand is drawn at the scene's scale.
  * - `physical`: 1:1 metres, `p = mount_m + leap_m`, for a user who measured
  *   where the device sits relative to the display centre.
@@ -48,9 +49,9 @@ extern "C" {
 
 //! Relative-mapping defaults (the reference viewer app's scene, in display heights).
 #define UL_MAP_DEFAULT_ANCHOR_X_H 0.0f
-#define UL_MAP_DEFAULT_ANCHOR_Y_H -0.20f
+#define UL_MAP_DEFAULT_ANCHOR_Y_H -0.625f
 #define UL_MAP_DEFAULT_ANCHOR_Z_H 0.0f
-#define UL_MAP_DEFAULT_GAIN_H_PER_M 0.81f
+#define UL_MAP_DEFAULT_GAIN_H_PER_M 2.5f
 
 //! Physical-mapping defaults: device on the desk 15 cm below the display centre, 10 cm in front of the glass.
 #define UL_MAP_DEFAULT_MOUNT_X_M 0.0f

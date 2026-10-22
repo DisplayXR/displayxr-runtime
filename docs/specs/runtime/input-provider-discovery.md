@@ -904,10 +904,11 @@ p_display = H · anchor_h + H · gain_h_per_m · leap_m
 ```
 
 The defaults come from the reference viewer app's scene (a Leap desktop
-provider and its ghost hands parented to one root under a 60° 2D camera): the
-Leap origin sits **on the display plane, 0.20 H below the display centre**,
-and hand motion maps at **0.81 H per metre** — so a hand held ~25 cm above the
-device lands at the display centre. Joint radii and the palm's linear
+provider and its ghost hands parented to one root at y = −0.75, scale 3, under
+a display rig whose virtual height is 1.2 units, i.e. 1.2 units = H): the
+Leap origin sits **on the display plane, 0.625 H below the display centre**
+(just under the bottom edge), and hand motion maps at **2.5 H per metre** — so
+a hand held 25 cm above the device lands at the display centre. Joint radii and the palm's linear
 velocity scale by the same gain, so the hand is drawn at the scene's scale and
 prediction moves it at that scale. A user who has measured the setup can pick
 `physical` instead: 1:1 metres from an explicit mount, relative to the display
@@ -923,9 +924,9 @@ at `create_devices`, so a change applies to the next session):
 |---|---|---|---|
 | `MAPPING` | enum | `relative` | `relative` \| `physical` |
 | `ANCHOR_X_H` | float | `0.0` | relative: Leap origin right of the display centre, display heights |
-| `ANCHOR_Y_H` | float | `-0.20` | relative: Leap origin above the display centre, display heights |
+| `ANCHOR_Y_H` | float | `-0.625` | relative: Leap origin above the display centre, display heights |
 | `ANCHOR_Z_H` | float | `0.0` | relative: Leap origin in front of the glass, display heights (0 = on the plane) |
-| `GAIN_H_PER_M` | float | `0.81` | relative: display heights per metre of hand motion; ≤ 0 = default |
+| `GAIN_H_PER_M` | float | `2.5` | relative: display heights per metre of hand motion; ≤ 0 = default |
 | `MOUNT_X_M` / `MOUNT_Y_M` / `MOUNT_Z_M` | float | `0.0` / `-0.15` / `0.10` | physical: Leap origin relative to the display centre, metres |
 
 The provider owns only `L` (the display-plane pose); where the display plane
