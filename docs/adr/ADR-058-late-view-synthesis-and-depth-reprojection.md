@@ -115,7 +115,8 @@ on data the contract already carries.
    one pure placement module (`u_lift_reproject.{h,c}`: viewpoint delta, the correction limit,
    the per-texel transform composed from `depthToDisplay` and the current eyes) with a CPU
    reference used by the tests, the same split S5 uses today. No provider ABI change, no new
-   class, no app-API change for phases 1–2.
+   class, no app-API change for phase 1 (the present-owner repaint signal of Amendment 1 is an
+   additive `XR_DXR_weave` revision, not a lift change).
 
 ## Consequences
 
@@ -133,7 +134,8 @@ on data the contract already carries.
   *tracking → conversion → weave*: a sim provider at a forced 4 fps, a scripted eye path, and
   the post-weave capture compared against a direct synthesis at the frame's own eyes (same
   pixels within tolerance in phase 1; bounded error in phase 2). The capture trigger exists on
-  every route that weaves lifted rects (#2207 closed the POSIX gap).
+  the POSIX weave engines (#2207); the Windows present-owner weave route still needs its twin
+  before the browser case can be gated there (Amendment 1).
 - **Risk: double placement.** Views a provider already placed at explicit viewpoints must not
   be re-placed twice; the stage keys off the recorded viewpoints, not assumptions, and
   explicit-viewpoint streams (`XR_LIFT_OUTPUT_EXPLICIT_VIEWPOINTS_BIT_DXR`) are reprojected
@@ -158,3 +160,42 @@ on data the contract already carries.
   cannot see the display frame's eyes.
 - **Time-warp the woven output (HMD-style ATW).** A lenticular weave is not a projective image;
   warping after the weave breaks the view-to-subpixel mapping. Placement must happen before it.
+
+## Amendment 1 — scope, straddle and timing rules from the box reviews (2026-10-22)
+
+Folded in from the Windows and Linux reviews on PR #2283 and the first hardware data on #2286.
+
+1. **Two routes, two scopes.** The *compositor-presented* routes (in-process and IPC apps whose
+   frames the runtime presents) get late synthesis in phase 1 unconditionally: the runtime owns
+   the display frame. The *present-owner* route (`XR_DXR_weave`, the DisplayXR Browser) weaves
+   only on the caller's submit and never presents on its own. Phase 1 covers it **only while the
+   caller submits** — which the browser does today every vsync while a lifted rect is visible
+   (Windows, browser 1.8.0: 301 submits / 5 s on a static page; patch 0329/0423 full-page
+   damage). A static page that stops submitting gets no late placement. Removing that cost
+   (a full-page redraw per vsync to keep the weave alive) is a separate, additive
+   `XR_DXR_weave` revision — an advisory "input unchanged" submit flag with which the runtime
+   re-weaves the retained input at current eyes without a page redraw — tracked as its own phase
+   (1b) and its own proposal.
+2. **Straddling rects.** A lifted rect that spans screens is placed with the eyes of the screen
+   that contains the rect's centre, with the per-screen coverage dwell of #2256 as hysteresis;
+   per-segment placement is a later refinement. One DP, one eye sample, one placement per rect
+   per frame.
+3. **One eye sample per frame.** The late synthesis and the weave consume the **same**
+   target-time eye sample for that frame (the DP's target-time query); they must never sample
+   separately, or placement and weave disagree by a prediction step.
+4. **Inside the governor's span.** The late synthesis runs inside the late-weave governor's
+   measured span (ADR-047), so its cost moves the weave start like any other weave work instead
+   of silently eating the scanout margin.
+5. **Adapter-aware size.** The late output cap (`DXR_LIFT_LATE_VIEWSYN_MAX_EDGE`, default 960)
+   becomes adapter- or governor-driven: Intel ANV measured 2.30 ms (2 views) / 4.41 ms (4 views)
+   at 960, about 1.7–2.2× the M1; ~1 ms at 512. Integrated GPUs default lower (512) until the
+   governor sizes it from measured headroom.
+6. **Hybrid split.** Under the Windows weave-on-scanout split, a late synthesis per frame is one
+   cross-adapter copy per frame per rect; phase 1 is gated on a hybrid-box measurement as well.
+7. **Encoding and oracle.** The late output keeps the stream's declared encoding (no new format
+   or colour-space decision), and the conformance oracle on the boxes is the #2219 capture PNG.
+8. **A wasted re-conversion was found on the way:** on the Windows present-owner route an
+   unchanged still is re-snapshotted and re-converted every submit (76 s: 4471 submitted, 1839
+   converted, all the same picture) — the still de-duplication of #2030 did not engage. That is
+   independent of this ADR and tracked as #2287; fixing it is what makes the browser case
+   cheap.
