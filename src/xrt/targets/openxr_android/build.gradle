@@ -145,6 +145,13 @@ if (!(new File(project.file(project.eigenCMakeDir), "Eigen3Config.cmake")).exist
 // That is also why release tags must stay lightweight OR annotated purely as
 // a matter of taste now: the arithmetic below, not the tag type, is what
 // keeps the code in range.
+//
+// Both describes take canonical vX.Y.Z tags only: --match keeps the v-prefixed
+// ones and --exclude drops any with a character other than a digit or a dot
+// after the v (an rc, a -moved bookmark tag, ...). These are the patterns
+// cmake/DisplayXRVersion.cmake uses for the runtime's own version (#1790), so
+// an rc tag can never become the APK's versionName while the runtime reports
+// the release before it.
 
 // ---------------------------------------------------------------------------
 // versionCode scheme (#1379). Positional, NOT string concatenation:
@@ -223,13 +230,13 @@ def gitOrDie = { List<String> args, String what ->
 // versionCode, from `git describe --tags --long`.
 def getVersionCode = { ->
     def longOutput = gitOrDie(
-        ['git', 'describe', '--tags', '--long', '--match', 'v[0-9]*'],
+        ['git', 'describe', '--tags', '--long', '--match', 'v[0-9]*', '--exclude', 'v*[!0-9.]*'],
         'the Android versionCode')
 
     def matcher = longOutput =~ gitDescribeLongPattern
     if (!matcher.matches()) {
         throw new GradleException(
-            "openxr_android: `git describe --tags --long --match 'v[0-9]*'` returned '${longOutput}', " +
+            "openxr_android: `git describe --tags --long --match 'v[0-9]*' --exclude 'v*[!0-9.]*'` returned '${longOutput}', " +
             "which is not a vMAJOR.MINOR.PATCH-<commits>-g<sha>. Cannot derive a versionCode (#1379).")
     }
 
@@ -274,7 +281,7 @@ def getVersionCode = { ->
 // '-dirty' for an uncommitted tree, which is worth seeing on a dev pad.
 def getVersionString = { ->
     return gitOrDie(
-        ['git', 'describe', '--tags', '--dirty', '--match', 'v[0-9]*'],
+        ['git', 'describe', '--tags', '--dirty', '--match', 'v[0-9]*', '--exclude', 'v*[!0-9.]*'],
         'the Android versionName')
 }
 
