@@ -88,12 +88,12 @@ TEST_CASE("relative mapping: a hand 25 cm above the device lands at the display 
 		const ul_map m = resolve_defaults(h);
 		const xrt_vec3 p = map_pos(m, {0.f, 250.f, 0.f});
 
-		// anchor -0.20 H + 0.81 H/m * 0.25 m = +0.0025 H: the display centre
-		// to within half a percent of the panel height, on the glass.
+		// anchor -0.625 H + 2.5 H/m * 0.25 m = 0: the display centre, on the
+		// glass.
 		CHECK(std::fabs(p.x) < kEps);
 		CHECK(std::fabs(p.y) < 0.005f * h);
 		CHECK(std::fabs(p.z) < kEps);
-		CHECK(p.y == Catch::Approx(0.0025f * h).margin(kEps));
+		CHECK(p.y == Catch::Approx(0.f).margin(kEps));
 	}
 }
 
@@ -101,24 +101,24 @@ TEST_CASE("relative mapping: anchor and gain are in display heights", "[ultralea
 {
 	const ul_map m = resolve_defaults(kH156);
 
-	SECTION("the Leap origin sits on the display plane, 0.20 H below the centre")
+	SECTION("the Leap origin sits on the display plane, 0.625 H below the centre")
 	{
 		const xrt_vec3 o = map_pos(m, {0.f, 0.f, 0.f});
 		CHECK(o.x == Catch::Approx(0.f).margin(kEps));
-		CHECK(o.y == Catch::Approx(-0.20f * kH156).margin(kEps));
+		CHECK(o.y == Catch::Approx(-0.625f * kH156).margin(kEps));
 		CHECK(o.z == Catch::Approx(0.f).margin(kEps));
 	}
 
-	SECTION("0.81 H per metre along every axis, Leap axes = display-plane axes")
+	SECTION("2.5 H per metre along every axis, Leap axes = display-plane axes")
 	{
 		const xrt_vec3 o = map_pos(m, {0.f, 250.f, 0.f});
 		const xrt_vec3 r = map_pos(m, {100.f, 250.f, 0.f}); // 10 cm right
 		const xrt_vec3 u = map_pos(m, {0.f, 350.f, 0.f});   // 10 cm up
 		const xrt_vec3 t = map_pos(m, {0.f, 250.f, 100.f}); // 10 cm toward the user
-		CHECK(r.x - o.x == Catch::Approx(0.081f * kH156).margin(kEps));
-		CHECK(u.y - o.y == Catch::Approx(0.081f * kH156).margin(kEps));
+		CHECK(r.x - o.x == Catch::Approx(0.25f * kH156).margin(kEps));
+		CHECK(u.y - o.y == Catch::Approx(0.25f * kH156).margin(kEps));
 		CHECK(t.z - o.z ==
-		      Catch::Approx(0.081f * kH156).margin(kEps)); // +Z = out of the glass, toward the viewer
+		      Catch::Approx(0.25f * kH156).margin(kEps)); // +Z = out of the glass, toward the viewer
 		CHECK(r.y == Catch::Approx(o.y).margin(kEps));
 		CHECK(t.x == Catch::Approx(o.x).margin(kEps));
 	}
@@ -152,7 +152,7 @@ TEST_CASE("relative mapping: anchor and gain are in display heights", "[ultralea
 TEST_CASE("relative mapping: radii and linear velocities scale by the gain, rotations pass through", "[ultraleap_map]")
 {
 	const ul_map m = resolve_defaults(kH156);
-	const float gain_m_per_m = 0.81f * kH156;
+	const float gain_m_per_m = 2.5f * kH156;
 
 	// A 20 mm-wide bone: radius 10 mm in Leap space, scaled to the scene.
 	CHECK(ul_map_radius_from_width_mm(&m, 20.f) == Catch::Approx(0.010f * gain_m_per_m).margin(1e-7f));
