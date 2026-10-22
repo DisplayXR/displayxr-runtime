@@ -612,10 +612,49 @@ Verify:
 - Tag matches [FULL_TAG]
 - Asset list contains `DisplayXRSetup-*.exe` with non-zero size (Windows installer, hard requirement)
 - Asset list contains `DisplayXR-Installer-*.pkg` with non-zero size (macOS installer; warn but don't fail if the macOS run skipped it — flag in final report)
+- The `.pkg`'s Developer ID signature + notarization (Step 6.1) — warn on unsigned, never fail
 - Title is `DisplayXR Runtime [FULL_TAG]`
 - Body starts with `## Highlights`
 
 No local staging dir to clean up — the CI does all artifact handling.
+
+### Step 6.1: Check the macOS `.pkg` signature (#280) — warn, never fail
+`build-macos.yml` signs + notarizes the `.pkg` **in CI** on canonical `v*` tag
+builds when the org secrets are provisioned (`docs/specs/runtime/release-signing.md`
+§ *macOS track in CI*); otherwise, or if notarization failed, it ships the
+unsigned `.pkg` with a `::warning::`. Check what actually landed on the release —
+the asset, not the CI log — the same way Phase 4.5 checks Authenticode:
+
+```bash
+MAC_SIG="skipped — no .pkg on the release"
+PKG_NAME=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json assets \
+             --jq '.assets[].name | select(startswith("DisplayXR-Installer-") and endswith(".pkg"))' | head -1)
+if [ -n "$PKG_NAME" ]; then
+  D=$(mktemp -d)
+  gh release download [FULL_TAG] --repo DisplayXR/displayxr-runtime -p "$PKG_NAME" -D "$D"
+  if [ "$(uname)" = Darwin ]; then
+    if pkgutil --check-signature "$D/$PKG_NAME" | grep -q 'Developer ID Installer' \
+       && xcrun stapler validate "$D/$PKG_NAME" >/dev/null 2>&1 \
+       && spctl --assess --type install -vv "$D/$PKG_NAME" 2>&1 | grep -q 'source=Notarized Developer ID'; then
+      MAC_SIG="signed + notarized + stapled (spctl: Notarized Developer ID)"
+    elif pkgutil --check-signature "$D/$PKG_NAME" | grep -q 'Developer ID Installer'; then
+      MAC_SIG="⚠ SIGNED BUT NOT NOTARIZED — Gatekeeper will reject it"
+    else
+      MAC_SIG="⚠ UNSIGNED"
+    fi
+  else
+    # No pkgutil off-mac: read the CI job's verdict (its Signature summary step).
+    MAC_SIG="not checked locally (non-macOS box) — see the BuildInstaller job summary"
+  fi
+  rm -rf "$D"
+fi
+echo "macOS .pkg: $MAC_SIG"
+```
+**"UNSIGNED" is a warning, not a failure** — expected until the org secrets
+(`MACOS_APP_CERT_P12`, …, `APPLE_NOTARY_ISSUER_ID`) exist, and the documented
+fallback when notarization was down. If the secrets exist and it still came out
+unsigned, read the `BuildInstaller` job's `::warning::` and re-run that job on
+the tag (it replaces the asset). Never roll back a release over it.
 
 ### Notes template
 Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges` by prefix:
@@ -637,6 +676,7 @@ Signing:   [signed → "runtime installer built + signed on the signing runner (
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.exe (~N MB, signed — exactly one .exe)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]
+macOS sig: $MAC_SIG   [signed + notarized + stapled | ⚠ UNSIGNED (warning only) | ⚠ signed but not notarized]
 Commits:   N commits since $PREV_TAG
 
 Auto-bump:

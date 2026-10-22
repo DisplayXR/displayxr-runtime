@@ -145,13 +145,75 @@ jobs:
           BREW_PREFIX=$(brew --prefix)
           echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
 
-      # The .pkg is named after the version the runtime was built as (#1790):
-      # build_macos.sh reads it from the stamp cmake/DisplayXRVersion.cmake
-      # writes next to the build -- X.Y.Z on a v* tag, X.Y.Z+<n>.g<sha>
-      # otherwise (was 0.0.0-dev.<sha>, while the runtime inside said 1.6.0).
+      # ── Developer ID signing + notarization (#280) ─────────────────────
+      # Signs ONLY canonical-repo v* tag builds, and only when the org-level
+      # secrets exist. Everything else (PRs, forks, main pushes, tag builds
+      # before the secrets are provisioned) produces the same unsigned .pkg as
+      # always and stays green. Signing never gates publishing: any failure
+      # past this point ships the unsigned .pkg with a ::warning::.
+      #
+      # Org secrets (consumed by scripts/macos_sign_notarize.sh ci-keychain-setup):
+      #   MACOS_APP_CERT_P12 / MACOS_INSTALLER_CERT_P12   base64 of each .p12
+      #   MACOS_APP_CERT_PASSWORD / MACOS_INSTALLER_CERT_PASSWORD
+      #   APPLE_TEAM_ID                                   both identities must match
+      #   APPLE_NOTARY_KEY_P8                             raw AuthKey_*.p8 text
+      #   APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID    App Store Connect API key
+      - name: macOS signing gate (#280)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: signgate
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "DisplayXR/displayxr-runtime" ]; then
+            echo "::notice::macOS signing skipped — $GITHUB_REPOSITORY is not the canonical repo; the .pkg ships unsigned."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "macOS signing skipped — not a v* tag build ($GITHUB_REF); the .pkg ships unsigned."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Secrets enter the environment ONLY in this step, and only on an
+      # eligible tag build. The script never echoes them (no `set -x`).
+      - name: Import signing identities into a temporary keychain
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.signgate.outputs.eligible == 'true'
+        id: keychain
+        env:
+          MACOS_APP_CERT_P12: ${{ secrets.MACOS_APP_CERT_P12 }}
+          MACOS_APP_CERT_PASSWORD: ${{ secrets.MACOS_APP_CERT_PASSWORD }}
+          MACOS_INSTALLER_CERT_P12: ${{ secrets.MACOS_INSTALLER_CERT_P12 }}
+          MACOS_INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          if ! MISSING=$(./scripts/macos_sign_notarize.sh ci-secrets-check); then
+            echo "::notice::macOS signing skipped — org secrets not provisioned: $MISSING. The .pkg ships unsigned."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Writes DXR_MACOS_{KEYCHAIN,APP_IDENTITY,INSTALLER_IDENTITY} and
+          # DXR_NOTARY_KEY_{PATH,ID} / DXR_NOTARY_ISSUER into $GITHUB_ENV.
+          if ./scripts/macos_sign_notarize.sh ci-keychain-setup --env-out "$GITHUB_ENV"; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::macOS signing DISABLED — importing the signing identities failed (see log above). The .pkg ships UNSIGNED."
+            ./scripts/macos_sign_notarize.sh ci-keychain-teardown || true
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # With the keychain set up, build_installer.sh's sign-tree gives every
+      # payload Mach-O its Developer ID + hardened-runtime signature as the LAST
+      # step after all install_name_tool patching. DXR_MACOS_INSTALLER_IDENTITY
+      # is withheld here so the product archive comes out unsigned; it is
+      # signed + notarized in a separate step that can fall back to this
+      # unsigned .pkg without rebuilding.
       - name: Build runtime + test app + installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: ./scripts/build_macos.sh --installer
+        env:
+          DXR_MACOS_SIGN_FALLBACK: adhoc
+          DXR_MACOS_SIGN_STATUS_FILE: ${{ runner.temp }}/dxr-macos-sign-status
+        run: env -u DXR_MACOS_INSTALLER_IDENTITY ./scripts/build_macos.sh --installer
 
       # #1790: the runtime inside the .pkg reports the checkout's version, and
       # the .pkg is named after it (exactly the tag on a v* push).
@@ -219,6 +281,46 @@ jobs:
           fi
           echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent."
 
+      - name: Sign, notarize and staple the .pkg (#280)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.keychain.outputs.sign == 'true'
+        id: notarize
+        timeout-minutes: 45
+        env:
+          DXR_MACOS_SIGN_STATUS_FILE: ${{ runner.temp }}/dxr-macos-sign-status
+        run: |
+          set -uo pipefail
+          PKG=$(find _package -maxdepth 1 -name "DisplayXR-Installer-*.pkg" -type f | head -1)
+          [ -n "$PKG" ] || { echo "::error::no DisplayXR-Installer-*.pkg in _package/"; exit 1; }
+          if grep -q adhoc-fallback "$DXR_MACOS_SIGN_STATUS_FILE" 2>/dev/null; then
+            echo "::warning::macOS .pkg ships UNSIGNED — Developer ID signing of the payload failed and fell back to ad-hoc (see the build step)."
+            echo "result=unsigned (payload signing fell back to ad-hoc)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$PKG" "$RUNNER_TEMP/unsigned.pkg"
+          # finalize-pkg = productsign → notarytool submit --wait (30 min cap)
+          # → stapler staple; verify-pkg = pkgutil --check-signature +
+          # stapler validate + spctl --assess --type install "Notarized Developer ID".
+          if ./scripts/macos_sign_notarize.sh finalize-pkg "$PKG" \
+             && ./scripts/macos_sign_notarize.sh verify-pkg "$PKG"; then
+            echo "::notice::$(basename "$PKG") is Developer ID signed, notarized and stapled."
+            echo "result=signed + notarized + stapled" >> "$GITHUB_OUTPUT"
+          else
+            # Signing never gates publishing (docs/specs/runtime/release-signing.md).
+            echo "::warning::macOS .pkg ships UNSIGNED — productsign / notarization / stapling failed (see log above). Re-run this job to retry."
+            cp -f "$RUNNER_TEMP/unsigned.pkg" "$PKG"
+            echo "result=unsigned (sign/notarize failed)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Signature summary
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          RESULT: ${{ steps.notarize.outputs.result || 'unsigned (signing not enabled for this build)' }}
+        run: |
+          PKG=$(find _package -maxdepth 1 -name "DisplayXR-Installer-*.pkg" -type f | head -1)
+          echo "macOS installer: $(basename "$PKG") — $RESULT"
+          { echo "### macOS installer signature"; echo; echo "\`$(basename "$PKG")\`: **$RESULT**"; echo; echo '```'
+            pkgutil --check-signature "$PKG" 2>&1 | head -8 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload installer
         uses: actions/upload-artifact@v6
         if: needs.DetectChanges.outputs.docs_only != 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
@@ -244,3 +346,11 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+      # Always delete the temporary keychain + key files, whatever happened.
+      - name: Delete temporary signing keychain
+        if: always()
+        run: |
+          if [ -x scripts/macos_sign_notarize.sh ]; then
+            ./scripts/macos_sign_notarize.sh ci-keychain-teardown
+          fi
