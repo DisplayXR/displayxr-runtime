@@ -116,6 +116,8 @@ screen_for_top_left(NSRect content, NSWindow *win)
 
 	// ---- main thread only (event monitor, delegate proxy) ----
 	int gesture; //!< 0 none, 1 drag, 2 resize, 3 swallow until mouse-up (title double-click)
+	//! The gesture is a right-button drag of a BORDERLESS window (see handleEvent:).
+	bool gesture_right;
 	unsigned edges;
 	NSPoint mouse_start;   //!< global points
 	NSRect content_start;  //!< bottom-up points
@@ -598,8 +600,15 @@ replug_restore_disabled(void)
 	[self ensureProxy];
 
 	const NSEventType type = ev.type;
+	// A right-button gesture is driven by right-button events only, and a
+	// left-button one by left-button events only.
+	const bool right_ev = type == NSEventTypeRightMouseDown || type == NSEventTypeRightMouseDragged ||
+	                      type == NSEventTypeRightMouseUp;
+	if (gesture != 0 && right_ev != gesture_right) {
+		return ev;
+	}
 	if (gesture != 0) {
-		if (type == NSEventTypeLeftMouseDragged) {
+		if (type == NSEventTypeLeftMouseDragged || type == NSEventTypeRightMouseDragged) {
 			// The live cursor for the drag steps (as the verified recipe).
 			const NSPoint m = [NSEvent mouseLocation];
 			const CGFloat dx = m.x - mouse_start.x;
@@ -618,7 +627,7 @@ replug_restore_disabled(void)
 			}
 			return nil;
 		}
-		if (type == NSEventTypeLeftMouseUp) {
+		if (type == NSEventTypeLeftMouseUp || type == NSEventTypeRightMouseUp) {
 			if (trace_enabled() && gesture != 3) {
 				U_LOG_W("placement: %s end", gesture == 1 ? "drag" : "resize");
 			}
@@ -628,7 +637,7 @@ replug_restore_disabled(void)
 			pthread_mutex_unlock(&lock);
 			return nil;
 		}
-		if (type == NSEventTypeLeftMouseDown) {
+		if (type == NSEventTypeLeftMouseDown || type == NSEventTypeRightMouseDown) {
 			// A down without the up (lost while another app tracked):
 			// end the stale gesture and evaluate this one afresh.
 			gesture = 0;
@@ -637,12 +646,48 @@ replug_restore_disabled(void)
 		}
 	}
 
-	if (type != NSEventTypeLeftMouseDown || ev.window != win) {
+	if ((type != NSEventTypeLeftMouseDown && type != NSEventTypeRightMouseDown) || ev.window != win) {
 		return ev;
 	}
 	if ((win.styleMask & NSWindowStyleMaskFullScreen) != 0 || win.miniaturized) {
 		return ev;
 	}
+
+	/*
+	 * A BORDERLESS window has no title bar to grab, so a right-button drag
+	 * anywhere on it is the move gesture: the macOS twin of a title-bar drag,
+	 * snapped and atomic like one. It is what a transparent app shows (the
+	 * model viewer's transparent mode drops its decorations and moves on
+	 * RMB, as on Windows). Moving it from the app instead (setFrameOrigin)
+	 * slides a frame woven for the OLD origin and the 3D stutters. A titled
+	 * window keeps right-clicks for the app (context menus, camera input).
+	 */
+	if (type == NSEventTypeRightMouseDown) {
+		if ((win.styleMask & NSWindowStyleMaskTitled) != 0) {
+			return ev;
+		}
+		if (evicted) {
+			evicted = false;
+			home_uuid = nil;
+			U_LOG_W("macOS placement: window moved by the user while its screen is away — it will not be "
+			        "restored on replug");
+		}
+		mouse_start = [win convertPointToScreen:ev.locationInWindow];
+		content_start = [win contentRectForFrameRect:win.frame];
+		content_px(content_start, win.backingScaleFactor, &anchor_px_x, &anchor_px_y);
+		edges = 0;
+		gesture = 1;
+		gesture_right = true;
+		pthread_mutex_lock(&lock);
+		gesture_active = true;
+		pthread_mutex_unlock(&lock);
+		if (trace_enabled()) {
+			U_LOG_W("placement: borderless right-button drag start, content %.0fx%.0f at %d,%d px",
+			        content_start.size.width, content_start.size.height, anchor_px_x, anchor_px_y);
+		}
+		return nil;
+	}
+	gesture_right = false;
 
 	// Hit-test the EVENT's location: by the time a queued mouse-down is
 	// pumped the cursor may already have left the edge zone.
@@ -1028,7 +1073,8 @@ comp_metal_placement_create(void *ns_view, comp_metal_placement_snap_fn snap, vo
 		__weak DXRMetalPlacement *weak_pl = pl;
 		pl.monitor = [NSEvent
 		    addLocalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged |
-		                                          NSEventMaskLeftMouseUp)
+		                                          NSEventMaskLeftMouseUp | NSEventMaskRightMouseDown |
+		                                          NSEventMaskRightMouseDragged | NSEventMaskRightMouseUp)
 		                                 handler:^NSEvent *(NSEvent *ev) {
 			                                 DXRMetalPlacement *s = weak_pl;
 			                                 return s != nil ? [s handleEvent:ev] : ev;
