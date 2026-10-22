@@ -893,14 +893,20 @@ before launching the host process.
 **`sim_input` hands (#2191).** Each hand's root — and the grip / aim / palm
 poses, which ride the same circle so a marker drawn from the grip action lands
 inside the rendered hand — sweeps a circle (4 s period) in the display
-plane's XY, centred `HAND_DISTANCE_M` in front of the glass. The lateral and
-vertical offsets scale with the **physical display height H** so small panels
-still show both hands: centres at ±0.30·H left / right of the display centre
-and 0.10·H below it, radius 0.10·H capped at 4 cm. H is the panel height from
-`host->get_display_geometry` (§4b.6 — the display plug-in's
-`get_display_info`); a host that publishes none falls back to H = 0.40 m,
-which is the previous fixed placement (±12 cm, 4 cm circle). `HAND_DISTANCE_M`
-stays metres. The poses are published on a `RIG_LOCAL` origin, so they sit in
+plane's XY, centred `HAND_DISTANCE_M` in front of the glass. Placement is by
+**projection from the nominal viewer**: each centre sits on the viewer's
+sightline to the display-plane point (±0.30·H, 0), so it projects
+vertically centred and 0.30·H left / right of the display centre whatever the
+viewer height and hand distance; the circle's projected radius is 0.10·H
+capped at 4 cm. (Placing at a fixed height does not work: the nominal eye sits
+above the centre, so a point floating in front of the glass at the centre's
+height projects below it — the earlier −0.10·H placement landed on the bottom
+edge of the view on a 0.30 × 0.19 m panel. Same intent as the reference viewer
+app, whose Leap hands land centred on the display at a typical hand height.)
+H and the nominal viewer come from `host->get_display_geometry` (§4b.6 — the
+display plug-in's `get_display_info`); a host that publishes none falls back
+to H = 0.40 m and the viewer (0, 0.10, 0.60). `HAND_DISTANCE_M` stays metres
+and is capped at 0.8 of the viewer distance. The poses are published on a `RIG_LOCAL` origin, so they sit in
 front of the panel the session sees in every reference space (§4b.4).
 (Before #2191 a NAV-off run kept a stage-anchored circle that ended up 5 cm
 *behind* the glass on a headless sim-display system and far out of view on

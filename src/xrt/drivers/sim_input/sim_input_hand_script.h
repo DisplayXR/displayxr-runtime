@@ -50,8 +50,23 @@ extern "C" {
  */
 //! Circle centre's distance left/right of the display centre, as a fraction of H.
 #define SIM_INPUT_HAND_LATERAL_FRAC 0.30f
-//! Circle centre's height relative to the display centre, as a fraction of H: slightly below.
-#define SIM_INPUT_HAND_HEIGHT_FRAC (-0.10f)
+/*!
+ * Where each circle centre PROJECTS on the display plane, seen from the nominal
+ * viewer, as a fraction of H above the display centre: 0 = vertically centred.
+ * Placing the hands by their projection (not by a fixed height) keeps them in
+ * view for any viewer height and hand distance: the nominal eye sits above the
+ * centre, so a point floating in front of the glass at the centre's height
+ * projects BELOW it (Linux 0.30 x 0.19 m panel: y = -0.02 at z = 0.25 landed on
+ * the bottom edge of the view). Same intent as the reference viewer app, whose
+ * Leap hands land centred on the display at a typical hand height.
+ */
+#define SIM_INPUT_HAND_HEIGHT_FRAC 0.0f
+/*!
+ * Nominal viewer when the host publishes none (metres, display-centre origin,
+ * +Z toward the viewer). Matches sim-display's default nominal viewer.
+ */
+#define SIM_INPUT_VIEWER_FALLBACK_Y_M 0.10f
+#define SIM_INPUT_VIEWER_FALLBACK_Z_M 0.60f
 //! Circle radius as a fraction of H (capped at @ref SIM_INPUT_CIRCLE_RADIUS_M).
 #define SIM_INPUT_CIRCLE_RADIUS_FRAC 0.10f
 /*!
@@ -109,18 +124,26 @@ bool
 sim_input_hand_enabled(enum sim_input_hands_mode mode, bool left);
 
 /*!
- * The circle centre of one hand in the display-plane (RIG_LOCAL) frame:
- * ±@ref SIM_INPUT_HAND_LATERAL_FRAC · H to its side,
- * @ref SIM_INPUT_HAND_HEIGHT_FRAC · H up, @p distance_m out of the glass.
- * @p distance_m <= 0 or non-finite falls back to the default; so does
- * @p display_height_m (to @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M).
+ * The circle centre of one hand in the display-plane (RIG_LOCAL) frame,
+ * @p distance_m out of the glass, placed on the line from the nominal viewer
+ * (@p viewer_y_m, @p viewer_z_m) to the display-plane point
+ * (±@ref SIM_INPUT_HAND_LATERAL_FRAC · H, @ref SIM_INPUT_HAND_HEIGHT_FRAC · H),
+ * so it projects there whatever the viewer height. @p distance_m <= 0 or
+ * non-finite falls back to the default and is capped at 0.8 of the viewer
+ * distance; @p display_height_m falls back to
+ * @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M; a viewer with @p viewer_z_m <= 0 to
+ * @ref SIM_INPUT_VIEWER_FALLBACK_Y_M / @ref SIM_INPUT_VIEWER_FALLBACK_Z_M.
  */
 struct xrt_pose
-sim_input_hand_center(bool left, float distance_m, float display_height_m);
+sim_input_hand_center(bool left, float distance_m, float display_height_m, float viewer_y_m, float viewer_z_m);
 
-//! The circle radius for a display @p display_height_m tall (same fallback).
+/*!
+ * The circle radius: projected on the display plane it is
+ * min(@ref SIM_INPUT_CIRCLE_RADIUS_FRAC · H, @ref SIM_INPUT_CIRCLE_RADIUS_M),
+ * so the real radius shrinks by the same perspective factor as the centre.
+ */
 float
-sim_input_hand_radius(float display_height_m);
+sim_input_hand_radius(float display_height_m, float distance_m, float viewer_z_m);
 
 /*!
  * The scripted root/grip relation at @p at_timestamp_ns: @p center plus a

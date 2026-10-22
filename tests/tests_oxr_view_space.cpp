@@ -2158,10 +2158,11 @@ TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#219
 	std::printf("#2191 HANDS=right PINCH=hold: max thumb-index gap %.4f m, wrist x sweep %.3f..%.3f m\n", max_gap,
 	            min_x, max_x);
 	CHECK(max_gap < 0.015f);      // pinched the whole revolution
-	// ...while the root moves: a drag. The circle diameter is 0.20 x the
-	// display height, capped at 8 cm (sim_input_hand_radius), so > 2 cm on
-	// any panel taller than 0.10 m.
-	CHECK(max_x - min_x > 0.02f);
+	// ...while the root moves: a drag. The circle's PROJECTED diameter is 0.20 x
+	// the display height (capped at 8 cm); the real one shrinks by the
+	// perspective factor (0.35/0.60 at 25 cm in front of a 0.6 m viewer,
+	// sim_input_hand_radius), so > 1 cm on any panel taller than 0.10 m.
+	CHECK(max_x - min_x > 0.01f);
 	CHECK(min_x > 0.0f);          // on the right of the display centre
 
 	destroyTracker(trackers[0]);
