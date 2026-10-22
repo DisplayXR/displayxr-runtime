@@ -43,10 +43,12 @@ jobs:
           # (PR base lags main after a main push). Shallow clones miss
           # those refs and the diff fails with "fatal: bad object".
           fetch-depth: 0
-          # fetch-depth alone is not enough: actions/checkout fetches with
-          # --no-tags unless this is set, so `git describe --match 'v*'` could
-          # not see the very tag it was building. v2.14.1's APK reported
-          # versionName='v2.14.0-4-gd1b3c174c'.
+          # fetch-depth: 0 already fetches every tag, which the versionCode /
+          # versionName `git describe` needs, so fetch-tags is redundant with
+          # it. It is kept only as a guard if the clone is ever made shallow
+          # again (actions/checkout then fetches with --no-tags unless it is
+          # set). The v2.14.1 APK that reported versionName='v2.14.0-4-gd1b3c174c'
+          # (#1235) was built before describe took --tags (#1379).
           fetch-tags: true
       - id: filter
         run: |
