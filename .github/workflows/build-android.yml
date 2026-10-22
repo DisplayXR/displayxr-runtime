@@ -536,7 +536,10 @@ jobs:
             exit 1
           fi
 
-          describe=$(git describe --tags --long --match 'v[0-9]*')
+          # Same patterns as build.gradle and cmake/DisplayXRVersion.cmake:
+          # canonical vX.Y.Z tags only, or an rc tag would make the gate
+          # disagree with what the APK was stamped with.
+          describe=$(git describe --tags --long --match 'v[0-9]*' --exclude 'v*[!0-9.]*')
           want_code=$(python3 scripts/android_version_code.py --describe "$describe" --print code)
           want_name=$(python3 scripts/android_version_code.py --describe "$describe" --print name)
           echo "expected from '$describe': versionCode=$want_code versionName=$want_name"

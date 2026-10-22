@@ -72,7 +72,9 @@ FIELDS = (
     ("commits", 1, 9999),
 )
 
-# `git describe --tags --long --match 'v[0-9]*'` output.
+# `git describe --tags --long --match 'v[0-9]*' --exclude 'v*[!0-9.]*'` output
+# (canonical vX.Y.Z tags only -- the same patterns as build.gradle and
+# cmake/DisplayXRVersion.cmake).
 DESCRIBE_LONG_RE = re.compile(
     r"^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)-(?P<commits>\d+)-g(?P<hash>[0-9a-f]+)(?P<dirty>-dirty)?$"
 )
@@ -135,7 +137,8 @@ def version_name_from_describe(describe):
 
 def git_describe_long(repo):
     out = subprocess.check_output(
-        ["git", "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*"],
+        ["git", "describe", "--tags", "--long", "--dirty", "--match", "v[0-9]*",
+         "--exclude", "v*[!0-9.]*"],
         cwd=repo,
         text=True,
     ).strip()
