@@ -2871,8 +2871,14 @@ oxr_session_set_content_bounds(struct oxr_session *sess, float u0, float v0, flo
 		return;
 	}
 #endif
-	// GL, Metal and the IPC path run no policy (oxr_session.c's
-	// get_rear_budget returns false for them), so there is nothing to aim.
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_content_bounds(&sess->xcn->base, u0, v0, u1, v1, now_ns);
+		return;
+	}
+#endif
+	// GL and the IPC path run no policy (oxr_session.c's get_rear_budget
+	// returns false for them), so there is nothing to aim.
 }
 
 //! Parse, validate and forward the optional XrContentBoundsDXR on this frame.
@@ -2996,7 +3002,13 @@ oxr_session_set_content_mask(struct oxr_session *sess,
 		return;
 	}
 #endif
-	// GL, Metal and the IPC path run no policy, so there is nothing to aim.
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_content_mask(&sess->xcn->base, cells, w, h, stride, margin, now_ns);
+		return;
+	}
+#endif
+	// GL and the IPC path run no policy, so there is nothing to aim.
 }
 
 //! Parse, validate, COPY and forward the optional XrContentMaskDXR on this frame.

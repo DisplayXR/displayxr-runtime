@@ -99,6 +99,11 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	// Set system devices for qwerty driver support
 	comp_metal_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: the VK-via-Metal route runs comp_metal's policy.
+	comp_metal_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
+#endif
+
 	// Set system compositor info for display dimensions
 	if (sys->xsysc != NULL) {
 		comp_metal_compositor_set_sys_info(&xcn->base, &sys->xsysc->info);
