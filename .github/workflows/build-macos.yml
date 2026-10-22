@@ -209,6 +209,16 @@ jobs:
             echo "::error::com.displayxr.service.plist (service auto-start LaunchAgent) missing from .pkg payload (#61)."
             MISSING=1
           fi
+          # #2264: the desktop-capture helper + its on-demand LaunchAgent, or a
+          # transparent session on a weaving DP composes over black.
+          if ! grep -q 'DisplayXR/bin/DisplayXRDesktopCapture.app/Contents/MacOS/DisplayXRDesktopCapture' "$EXPAND_DIR/files"; then
+            echo "::error::DisplayXRDesktopCapture.app missing from .pkg payload — transparent sessions on a weaving DP would get no desktop backdrop (#2264)."
+            MISSING=1
+          fi
+          if ! grep -q 'LaunchAgents/com.displayxr.desktop-capture.plist' "$EXPAND_DIR/files"; then
+            echo "::error::com.displayxr.desktop-capture.plist (helper LaunchAgent) missing from .pkg payload (#2264)."
+            MISSING=1
+          fi
           if [ "$MISSING" -ne 0 ]; then
             echo "Payload listing:"
             cat "$EXPAND_DIR/files"

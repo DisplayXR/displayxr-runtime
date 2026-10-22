@@ -46,4 +46,21 @@ if [ -f "$AGENT" ]; then
     fi
 fi
 
+# Desktop-capture helper (#2264): load its on-demand agent into the console
+# user's GUI domain now so the Mach service exists without a logout. Loading
+# does not start the helper (no RunAtLoad), and so does not prompt for Screen
+# Recording; that happens only when a transparent session first needs it.
+CAPTURE_AGENT="/Library/LaunchAgents/com.displayxr.desktop-capture.plist"
+if [ -f "$CAPTURE_AGENT" ]; then
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+        if [ -n "$CONSOLE_UID" ]; then
+            launchctl bootout "gui/$CONSOLE_UID/com.displayxr.desktop-capture" 2>/dev/null || true
+            pkill -x DisplayXRDesktopCapture 2>/dev/null || true
+            launchctl bootstrap "gui/$CONSOLE_UID" "$CAPTURE_AGENT" 2>/dev/null || true
+        fi
+    fi
+fi
+
 exit 0

@@ -267,6 +267,59 @@ else
     echo "Note: displayxr-service not in artifact (non-SERVICE build); .pkg ships runtime only."
 fi
 
+# --- Desktop-capture helper + on-demand LaunchAgent (#2264) ---
+# DisplayXRDesktopCapture.app is the ONE DisplayXR process that holds the macOS
+# Screen Recording grant: a transparent session on a weaving DP (Leia) composes
+# the desktop behind its window, and the in-process Metal compositor gets those
+# frames from this helper over XPC (Mach service com.displayxr.desktop-capture).
+# Unlike the service it ships on every .pkg — an in-process app needs it too.
+#
+# The agent has NO RunAtLoad: launchd starts the helper only when a compositor
+# connects to the Mach service, and the helper exits by itself once the last
+# client leaves. Opaque sessions never contact it, so a user who never runs a
+# transparent app on a Leia panel never sees the permission prompt.
+#
+# Signing is load-bearing for the grant: macOS pins an ad-hoc signature's grant
+# to its cdhash, so an unsigned (CI/contributor) .pkg loses the grant on every
+# reinstall. The Developer ID signature from sign-tree below (when
+# DXR_MACOS_APP_IDENTITY is set) pins it to bundle id + team instead, so it
+# survives upgrades. The helper needs no entitlements: Screen Recording is a
+# TCC grant, not an entitlement.
+CAPTURE_SRC="$ARTIFACT_DIR/bin/DisplayXRDesktopCapture.app"
+if [ -d "$CAPTURE_SRC" ]; then
+    mkdir -p "$RUNTIME_ROOT/bin"
+    rm -rf "$RUNTIME_ROOT/bin/DisplayXRDesktopCapture.app"
+    cp -R "$CAPTURE_SRC" "$RUNTIME_ROOT/bin/"
+    LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
+    mkdir -p "$LAUNCHAGENT_DIR"
+    cat > "$LAUNCHAGENT_DIR/com.displayxr.desktop-capture.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.displayxr.desktop-capture</string>
+    <key>Program</key>
+    <string>$INSTALL_PREFIX/bin/DisplayXRDesktopCapture.app/Contents/MacOS/DisplayXRDesktopCapture</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.displayxr.desktop-capture</key>
+        <true/>
+    </dict>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/displayxr-desktop-capture.log</string>
+</dict>
+</plist>
+PLIST
+    echo "Staged DisplayXRDesktopCapture.app + on-demand LaunchAgent into the runtime payload."
+else
+    echo "Warning: DisplayXRDesktopCapture.app not in artifact; transparent sessions on a weaving DP will have no desktop backdrop."
+fi
+
 # --- 1b. Final code signature on the runtime payload (#280) ---
 # MUST stay the last thing that touches the payload's Mach-Os: every
 # install_name_tool above invalidated a signature (the ad-hoc re-signs only
@@ -297,7 +350,21 @@ fi
 
 # --- 2. Build runtime component pkg ---
 echo "--- Building runtime component ---"
+# pkgbuild marks every bundle under --root relocatable by default, and a
+# relocatable bundle is installed OVER any other copy of the same bundle id that
+# Installer finds on the disk (a dev build tree, a moved copy) instead of into
+# the payload path. DisplayXRDesktopCapture.app (#2264) is such a bundle and its
+# LaunchAgent names the payload path, so pin every bundle in place.
+COMPONENT_PLIST="$WORK_DIR/runtime-components.plist"
+pkgbuild --analyze --root "$WORK_DIR/payload-runtime" "$COMPONENT_PLIST" >/dev/null
+i=0
+while /usr/libexec/PlistBuddy -c "Print :$i" "$COMPONENT_PLIST" >/dev/null 2>&1; do
+    /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$COMPONENT_PLIST"
+    i=$((i + 1))
+done
+
 pkgbuild --root "$WORK_DIR/payload-runtime" \
+    --component-plist "$COMPONENT_PLIST" \
     --scripts "$SCRIPT_DIR/scripts/runtime" \
     --identifier com.displayxr.runtime \
     --version "$VERSION" \
