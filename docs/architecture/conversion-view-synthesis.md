@@ -5,7 +5,7 @@ explicit viewpoints. A pipeline **stage**, never a provider and never selectable
 ([ADR-053](../adr/ADR-053-conversion-providers.md) decision 3); `conv_pipeline` runs it for
 `VIEWS_FROM_DEPTH` and after any provider that outputs depth only (the `COMPOSED` bit). It is a
 port of the browser's `live-dibr.js` (displayxr-web-lift), hole-fill included, so the browser can
-delete its copy (roadmap P4). Code: `src/xrt/compositor/util/u_conv_viewsyn.{h,c}` (contract +
+delete its copy (roadmap P4). Code: `src/xrt/auxiliary/util/u_conv_viewsyn.{h,c}` (contract +
 pure math, C11) and `src/xrt/compositor/d3d11_service/d3d11_conv_viewsyn.{h,cpp}` +
 `d3d11_conv_viewsyn_shaders.h` (GPU). Tests: `tests_conv_viewsyn_math` (the JS math test, case
 for case), `tests_conv_viewsyn_d3d11` (WARP, step edge into 2 and 4 views).

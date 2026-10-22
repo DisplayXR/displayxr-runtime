@@ -846,6 +846,11 @@ TEST_CASE("composed binding: the depth stage's import kinds reach the allocator;
 		conv_stream_stats st{};
 		REQUIRE(conv_core_stream_get_stats(core, core_id, &st) == XRT_SUCCESS);
 		CHECK(st.composed);
+		// ADR-058's internal age split: placed at conversion today, so the
+		// placement is never older than the content (eyes are sampled after
+		// the submit) -- late placement will make it the younger of the two.
+		CHECK(st.content_age_ns > 0);
+		CHECK(st.placement_age_ns <= st.content_age_ns);
 
 		int inputs = 0, depths = 0, views = 0;
 		{

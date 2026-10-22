@@ -9,6 +9,7 @@
 #include "conv_core_internal.h"
 
 #include "os/os_time.h"
+#include "util/u_lift_reproject.h"
 #include "util/u_logging.h"
 
 #include <math.h>
@@ -822,6 +823,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	os_mutex_unlock(&core->streams_mtx);
 
 	const uint64_t t0 = now_ns();
+	uint64_t placed_eyes_ns = t0; // ADR-058: refined to the S3 eyes' sample time
 	struct conv_pipeline_frame *pf = (struct conv_pipeline_frame *)calloc(1, sizeof(*pf));
 	xrt_result_t pr = XRT_SUCCESS;
 	ok = ok && host != NULL && pf != NULL;
@@ -858,6 +860,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		if ((s.pipe.stages & CONV_STAGE_S3_POLICY) != 0) {
 			struct conv_eyes eyes;
 			conv_core_eyes_read(core, s.eyes_dp, t0, &eyes);
+			if (eyes.valid && eyes.timestamp_ns != 0) {
+				placed_eyes_ns = eyes.timestamp_ns;
+			}
 			struct conv_policy_view_in vin;
 			memset(&vin, 0, sizeof(vin));
 			vin.view_count = s.pipe.view_count;
@@ -1017,6 +1022,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			}
 			o->discontinuity = s.discont;
 			o->provisional = s.pipe.provisional;
+			o->placed_eyes_ns = placed_eyes_ns;
 			u_lift_mailbox_publish_output(&st->mb, out_slot, &meta, now_ns());
 			st->still.valid = still_key != 0;
 			if (st->still.valid) {
@@ -1751,6 +1757,15 @@ conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct co
 	out->rate_hz = u_lift_mailbox_rate_hz(&st->mb);
 	out->provisional = st->pipe.provisional;
 	out->unsatisfied = st->unsatisfied;
+	out->content_age_ns = 0;
+	out->placement_age_ns = 0;
+	if (st->mb.latest >= 0 && st->mb.latest < U_LIFT_RING_SIZE) {
+		struct u_lift_reproject_ages ages;
+		u_lift_reproject_compute_ages(now_ns(), st->mb.out_meta[st->mb.latest].submit_ns,
+		                              st->out[st->mb.latest].placed_eyes_ns, &ages);
+		out->content_age_ns = ages.content_age_ns;
+		out->placement_age_ns = ages.placement_age_ns;
+	}
 	os_mutex_lock(&core->registry_mtx);
 	out->row_state = conv_core_row_state_locked(core, st->bind.provider, st->bind.cap_id);
 	os_mutex_unlock(&core->registry_mtx);

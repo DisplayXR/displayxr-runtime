@@ -7,7 +7,7 @@
  * Every function here mirrors one in displayxr-web-lift `js/lift/live-dibr.js`
  * or one stage of its shaders, so the GPU port can be pinned host-side.
  *
- * @ingroup comp_util
+ * @ingroup aux_util
  */
 
 #include "u_conv_viewsyn.h"
@@ -355,6 +355,86 @@ u_conv_viewsyn_march(const struct u_conv_viewsyn_frame *f,
 	}
 	u_conv_viewsyn_src_uv(uv_out, q, view->eye, f->cam, f->aspect, out_src_uv);
 	return q;
+}
+
+struct ref_depth
+{
+	const struct xrt_conv_depth_info *info;
+	const float *px;
+	uint32_t w, h;
+	double lo, hi;
+};
+
+static double
+ref_depth_sample(void *user, double u, double v_up)
+{
+	const struct ref_depth *d = (const struct ref_depth *)user;
+	double fx = floor(u * (double)d->w);
+	double fy = floor((1.0 - v_up) * (double)d->h);
+	uint32_t x = (uint32_t)clampd(fx, 0.0, (double)(d->w - 1));
+	uint32_t y = (uint32_t)clampd(fy, 0.0, (double)(d->h - 1));
+	return u_conv_viewsyn_normalise(d->info, d->lo, d->hi, (double)d->px[(size_t)y * d->w + x]);
+}
+
+static void
+ref_color_sample(const float *c, uint32_t w, uint32_t h, const double uv[2], float out[4])
+{
+	double fx = uv[0] * (double)w - 0.5;
+	double fy = (1.0 - uv[1]) * (double)h - 0.5;
+	double x0f = floor(fx), y0f = floor(fy);
+	double tx = fx - x0f, ty = fy - y0f;
+	int x0 = (int)x0f, y0 = (int)y0f;
+	int xs[2] = {x0, x0 + 1}, ys[2] = {y0, y0 + 1};
+	for (int k = 0; k < 2; k++) {
+		xs[k] = xs[k] < 0 ? 0 : (xs[k] > (int)w - 1 ? (int)w - 1 : xs[k]);
+		ys[k] = ys[k] < 0 ? 0 : (ys[k] > (int)h - 1 ? (int)h - 1 : ys[k]);
+	}
+	for (int ch = 0; ch < 4; ch++) {
+		double a = c[((size_t)ys[0] * w + (size_t)xs[0]) * 4 + ch];
+		double b = c[((size_t)ys[0] * w + (size_t)xs[1]) * 4 + ch];
+		double e = c[((size_t)ys[1] * w + (size_t)xs[0]) * 4 + ch];
+		double f = c[((size_t)ys[1] * w + (size_t)xs[1]) * 4 + ch];
+		double top = a + (b - a) * tx;
+		double bot = e + (f - e) * tx;
+		out[ch] = (float)(top + (bot - top) * ty);
+	}
+}
+
+bool
+u_conv_viewsyn_ref_render(const struct u_conv_viewsyn_params *p,
+                          const float *color,
+                          uint32_t cw,
+                          uint32_t ch,
+                          const float *depth,
+                          uint32_t dw,
+                          uint32_t dh,
+                          uint32_t out_w,
+                          uint32_t out_h,
+                          float *out)
+{
+	if (p == NULL || color == NULL || depth == NULL || out == NULL || cw == 0 || ch == 0 || dw == 0 || dh == 0 ||
+	    out_w == 0 || out_h == 0) {
+		return false;
+	}
+	struct u_conv_viewsyn_frame f;
+	if (!u_conv_viewsyn_resolve(p, &f)) {
+		return false;
+	}
+	struct ref_depth d = {&p->depth, depth, dw, dh, f.near_lo, f.near_hi};
+	const size_t view_floats = (size_t)out_w * out_h * 4;
+	for (uint32_t i = 0; i < f.view_count; i++) {
+		float *o = out + view_floats * i;
+		for (uint32_t y = 0; y < out_h; y++) {
+			for (uint32_t x = 0; x < out_w; x++) {
+				const double uv[2] = {((double)x + 0.5) / (double)out_w,
+				                      1.0 - ((double)y + 0.5) / (double)out_h};
+				double s[2];
+				(void)u_conv_viewsyn_march(&f, &f.views[i], ref_depth_sample, &d, uv, s);
+				ref_color_sample(color, cw, ch, s, o + ((size_t)y * out_w + x) * 4);
+			}
+		}
+	}
+	return true;
 }
 
 static void

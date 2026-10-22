@@ -41,7 +41,7 @@
  * C11, no allocation, no graphics API; host-tested by
  * tests/tests_conv_viewsyn_math.cpp.
  *
- * @ingroup comp_util
+ * @ingroup aux_util
  */
 
 #pragma once
@@ -270,6 +270,35 @@ u_conv_viewsyn_march(const struct u_conv_viewsyn_frame *f,
                      const double uv_out[2],
                      double out_src_uv[2]);
 /*! @} */
+
+/*!
+ * CPU reference render of every view (ADR-058's late-synthesis reference and
+ * its conformance test): per output texel centre, u_conv_viewsyn_march over
+ * the RAW depth sampled at the nearest texel and normalised with
+ * u_conv_viewsyn_normalise, then the colour sampled bilinearly (clamp to edge)
+ * at the hit's source uv. It is the march the GPU stages are pinned to, on
+ * whole images; it does NOT run the upsample, edge snap, dilation or the
+ * disocclusion gather (the GPU goldens pin those), so compare it with itself
+ * or with the march, never pixel-for-pixel with a GPU stage.
+ *
+ * @param color   RGBA floats, @p cw x @p ch, row 0 = image top, tightly packed
+ * @param depth   raw samples (decoded with p->depth), @p dw x @p dh, row 0 = top
+ * @param out     p->view_count views of @p out_w x @p out_h RGBA floats,
+ *                view-major (view i at out + i * out_w * out_h * 4), row 0 = top
+ * @return false on invalid geometry (u_conv_viewsyn_resolve) or empty images;
+ *         @p out is then untouched.
+ */
+bool
+u_conv_viewsyn_ref_render(const struct u_conv_viewsyn_params *p,
+                          const float *color,
+                          uint32_t cw,
+                          uint32_t ch,
+                          const float *depth,
+                          uint32_t dw,
+                          uint32_t dh,
+                          uint32_t out_w,
+                          uint32_t out_h,
+                          float *out);
 
 /*! @name CPU references of the depth-res filters (the GPU pre-passes mirror them).
  * @{ */
