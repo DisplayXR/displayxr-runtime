@@ -424,6 +424,17 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -n "$HOST_BIN" ]; then
   echo "Staged displayxr-conversion-host into _package bin/"
 fi
 
+# #2264: the desktop-capture helper (the one process that holds the Screen
+# Recording grant; in-process Metal compositors reach it over XPC by Mach
+# service name, so it ships with or without the service). It links only system
+# frameworks — no rpath fixup. build_installer.sh adds its on-demand LaunchAgent.
+CAPTURE_APP="$BUILD_DIR/src/xrt/targets/desktop_capture_macos/DisplayXRDesktopCapture.app"
+if [ -d "$CAPTURE_APP" ]; then
+  rm -rf "$PKG_DIR/bin/DisplayXRDesktopCapture.app"
+  cp -R "$CAPTURE_APP" "$PKG_DIR/bin/"
+  echo "Staged DisplayXRDesktopCapture.app into _package bin/"
+fi
+
 # Create MoltenVK ICD manifest
 cat > "$PKG_DIR/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
 {
