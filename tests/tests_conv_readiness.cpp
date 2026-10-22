@@ -510,6 +510,70 @@ TEST_CASE("conv_readiness: a kill switch / module-declared ABSENT is terminal, n
 	CHECK(conv_legacy_v3_state(again, 1, true) == CONV_V3_STATE_ACTIVATING);
 }
 
+TEST_CASE("conv_readiness: a host failed terminally fails every live or cold row, never a retry loop (#2279)")
+{
+	// INSTALLED from the describe cache is the case that stuck: the host that
+	// would serve it declined its probe and will not respawn.
+	const uint32_t from[] = {XRT_CONV_STATE_UNKNOWN,     XRT_CONV_STATE_INSTALLED, XRT_CONV_STATE_EVICTED,
+	                         XRT_CONV_STATE_DOWNLOADING, XRT_CONV_STATE_WARMING,   XRT_CONV_STATE_READY};
+	for (uint32_t s : from) {
+		CAPTURE(s);
+		conv_readiness r = at(s);
+		CHECK((fire(r, ev(CONV_EV_HOST_FAILED, 1001 * S, 0, XRT_CONV_FAIL_LOAD)) & CONV_RD_CHANGED) != 0);
+		CHECK(r.state == XRT_CONV_STATE_FAILED);
+		CHECK(r.reason == XRT_CONV_FAIL_LOAD);
+		CHECK_FALSE(r.retryable);
+		CHECK(conv_readiness_next_deadline(&r) == 0);
+		const uint32_t states[] = {r.state};
+		CHECK(conv_legacy_v3_state(states, 1, true) == CONV_V3_STATE_UNAVAILABLE);
+		// Time passing does not retry it.
+		fire(r, ev(CONV_EV_TIMER, 9000 * S));
+		CHECK(r.state == XRT_CONV_STATE_FAILED);
+	}
+
+	// No reason given: LOAD.
+	conv_readiness r0 = at(XRT_CONV_STATE_INSTALLED);
+	fire(r0, ev(CONV_EV_HOST_FAILED, 1001 * S));
+	CHECK(r0.reason == XRT_CONV_FAIL_LOAD);
+
+	// A retryable FAILED (warm failure on its backoff) becomes the host's terminal one.
+	conv_readiness rf = at(XRT_CONV_STATE_WARMING);
+	fire(rf, ev(CONV_EV_WARM_FAILED, 1001 * S, 0, XRT_CONV_FAIL_MODEL, true));
+	REQUIRE(rf.retryable);
+	fire(rf, ev(CONV_EV_HOST_FAILED, 1002 * S, 0, XRT_CONV_FAIL_VERSION));
+	CHECK(rf.state == XRT_CONV_STATE_FAILED);
+	CHECK(rf.reason == XRT_CONV_FAIL_VERSION);
+	CHECK_FALSE(rf.retryable);
+	CHECK(conv_readiness_next_deadline(&rf) == 0);
+	// The same failure again is not a transition.
+	const uint64_t gen = rf.generation;
+	CHECK(fire(rf, ev(CONV_EV_HOST_FAILED, 1003 * S, 0, XRT_CONV_FAIL_VERSION)) == CONV_RD_IGNORED);
+	CHECK(rf.generation == gen);
+
+	// The other terminal states keep their own reason.
+	const uint32_t terminal[] = {XRT_CONV_STATE_DISABLED, XRT_CONV_STATE_ABSENT, XRT_CONV_STATE_INCOMPATIBLE,
+	                             XRT_CONV_STATE_UNLICENSED};
+	for (uint32_t s : terminal) {
+		CAPTURE(s);
+		conv_readiness r = at(s, 7);
+		CHECK(fire(r, ev(CONV_EV_HOST_FAILED, 1001 * S, 0, XRT_CONV_FAIL_LOAD)) == CONV_RD_IGNORED);
+		CHECK(r.state == s);
+		CHECK(r.reason == 7u);
+	}
+
+	// The configuration change is the way back: INSTALLED, v3 ACTIVATING, then READY.
+	conv_readiness rr = at(XRT_CONV_STATE_INSTALLED);
+	fire(rr, ev(CONV_EV_HOST_FAILED, 1001 * S, 0, XRT_CONV_FAIL_LOAD));
+	CHECK((fire(rr, ev(CONV_EV_REGISTRY_CHANGED, 1002 * S)) & CONV_RD_ACT_REDESCRIBE) != 0);
+	CHECK(rr.state == XRT_CONV_STATE_INSTALLED);
+	const uint32_t cold[] = {rr.state};
+	CHECK(conv_legacy_v3_state(cold, 1, true) == CONV_V3_STATE_ACTIVATING);
+	fire(rr, ev(CONV_EV_WARM_REQUESTED, 1003 * S));
+	fire(rr, ev(CONV_EV_WARM_OK, 1004 * S));
+	const uint32_t ready[] = {rr.state};
+	CHECK(conv_legacy_v3_state(ready, 1, true) == CONV_V3_STATE_READY);
+}
+
 TEST_CASE("conv_readiness: a disabled row ignores everything but enable")
 {
 	conv_readiness r = at(XRT_CONV_STATE_DISABLED);

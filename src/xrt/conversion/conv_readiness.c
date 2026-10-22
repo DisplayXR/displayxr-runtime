@@ -364,6 +364,20 @@ conv_readiness_apply(struct conv_readiness *r, const struct conv_readiness_event
 		}
 		return CONV_RD_IGNORED;
 
+	case CONV_EV_HOST_FAILED:
+		// #2279: a host that will not come back serves nothing, so a cold row
+		// (INSTALLED from the describe cache) is as dead as a warm one.
+		if (conv_state_is_waited(s) || s == XRT_CONV_STATE_READY || s == XRT_CONV_STATE_UNKNOWN ||
+		    s == XRT_CONV_STATE_FAILED) {
+			const uint32_t reason = ev->reason != 0 ? ev->reason : XRT_CONV_FAIL_LOAD;
+			if (s == XRT_CONV_STATE_FAILED && r->reason == reason && !r->retryable) {
+				return CONV_RD_IGNORED;
+			}
+			r->backoff_ns = 0;
+			return fail(r, reason, false, now);
+		}
+		return CONV_RD_IGNORED;
+
 	default: return CONV_RD_IGNORED;
 	}
 }

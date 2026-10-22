@@ -160,7 +160,7 @@ DEPTH → `DEPTH_VIDEO` (else `DEPTH_MONO`); SBS and NVIEW → `VIEWS_MONO`; GAU
 
 | Field | Value |
 |---|---|
-| `state` | **READY** when any advertised mode's backing task is READY ("any", not "all": a splat model downloading must not hold back live video). **ACTIVATING** otherwise while discovery has not settled (some registered provider is neither described nor terminal) **or** any backing task is in a waiting state — even before any mode bit is set. **UNAVAILABLE** otherwise |
+| `state` | **READY** when any advertised mode's backing task is READY ("any", not "all": a splat model downloading must not hold back live video). **ACTIVATING** otherwise while discovery has not settled (some registered provider is neither described nor terminal) **or** any backing task is in a waiting state — even before any mode bit is set. **UNAVAILABLE** otherwise — including when the only provider backing the tasks failed terminally (its host declined its probe, was ABI-rejected, ...): its tasks report FAILED, not their cached INSTALLED (#2279) |
 | `supportedModes` | every mode whose backing task is not terminal, waiting ones included; NVIEW only when `VIEWS_MONO`'s `maxViews > 2` |
 | `maxStreams`, `maxViews`, `backend`, `typicalLatency` | from `VIEWS_MONO`, else the depth task. `maxStreams` is that provider's per-task limit (§14.2 shift 1) |
 | `depthSemantics` | METRIC iff the depth task's preferred kind is metric |

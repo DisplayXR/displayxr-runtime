@@ -186,6 +186,14 @@ conv_core_request_warm_locked(struct conv_core *core, uint32_t provider, uint32_
 	if (ri < 0) {
 		return;
 	}
+	if (ev_type == CONV_EV_CREATE_REQUESTED && core->reg.rows[ri].rd.state == XRT_CONV_STATE_FAILED &&
+	    provider < core->reg.provider_count && core->reg.providers[provider].host_failed_reason != 0) {
+		// #2279: the "create for an unserved task" retry cannot help a row
+		// whose host is latched FAILED -- the supervisor does not respawn it
+		// until a configuration change, so the warm would sit in WARMING and
+		// the v3 state would read ACTIVATING again.
+		return;
+	}
 	struct conv_readiness_event ev = mk_ev(ev_type, now_ns());
 	apply_locked(core, (uint32_t)ri, &ev);
 	const uint32_t s = core->reg.rows[ri].rd.state;
@@ -370,6 +378,21 @@ conv_core_on_host_event(void *ud, struct conv_host *h, uint32_t ev, int32_t deta
 }
 
 //! Apply one lifecycle event (registry_mtx held).
+/*! #2279: drive every non-terminal row of @p provider (and any FAILED one) to
+ *  FAILED(@p reason), not retryable: its host failed terminally (registry_mtx held). */
+static void
+fail_provider_rows_locked(struct conv_core *core, uint32_t provider, uint32_t reason, uint64_t t)
+{
+	for (uint32_t i = 0; i < core->reg.row_count; i++) {
+		if (core->reg.rows[i].provider != provider) {
+			continue;
+		}
+		struct conv_readiness_event ev = mk_ev(CONV_EV_HOST_FAILED, t);
+		ev.reason = reason;
+		apply_locked(core, i, &ev);
+	}
+}
+
 static void
 host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, uint64_t t)
 {
@@ -391,8 +414,12 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 		hs->down = crash || update;
 		hs->rewarm = false;
 		hs->restarts++;
-		U_LOG_W("[conv] provider %s: host process exited (code %d%s); streams stay, outputs keep their last result",
-		        id, (int)e->detail, crash ? ", crash" : update ? ", closed for update" : "");
+		// A declined probe (exit 11) or an ABI reject (10) is not a crash (#2246).
+		const char *how = crash ? conv_host_exit_label(e->detail) : update ? "closed for update" : NULL;
+		U_LOG_W(
+		    "[conv] provider %s: host process exited (code %d%s%s); streams stay, outputs keep their last "
+		    "result",
+		    id, (int)e->detail, how != NULL ? ", " : "", how != NULL ? how : "");
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider != p) {
 				continue;
@@ -418,6 +445,7 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 	case CONV_HOST_EV_RESTORED:
 		hs->down = false;
 		hs->rewarm = true;
+		core->reg.providers[p].host_failed_reason = 0;
 		core->redescribe[p] = true; // the fresh process's describe, then the re-warm
 		U_LOG_W("[conv] provider %s: host process back (epoch %u); re-warming", id,
 		        conv_host_get_epoch(hs->host));
@@ -425,6 +453,7 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 	case CONV_HOST_EV_CRASH_LOOP:
 		hs->down = true;
 		hs->rewarm = false;
+		core->reg.providers[p].host_failed_reason = XRT_CONV_FAIL_CRASH_LOOP;
 		U_LOG_W("[conv] provider %s: host crash loop: FAILED(crash_loop) until a registry change", id);
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider == p) {
@@ -433,20 +462,21 @@ host_event_locked(struct conv_core *core, const struct conv_host_evq_entry *e, u
 			}
 		}
 		break;
-	case CONV_HOST_EV_FAILED:
+	case CONV_HOST_EV_FAILED: {
 		hs->down = true;
 		hs->rewarm = false;
+		const uint32_t reason = e->detail > 0 ? (uint32_t)e->detail : XRT_CONV_FAIL_LOAD;
 		U_LOG_W("[conv] provider %s: host failed terminally (%s); FAILED until a registry change", id,
-		        conv_reason_name((uint32_t)e->detail));
-		for (uint32_t i = 0; i < core->reg.row_count; i++) {
-			if (core->reg.rows[i].provider == p) {
-				struct conv_readiness_event ev = mk_ev(CONV_EV_RUNTIME_FAILED, t);
-				ev.reason = e->detail != 0 ? (uint32_t)e->detail : XRT_CONV_FAIL_LOAD;
-				ev.retryable = false;
-				apply_locked(core, i, &ev);
-			}
-		}
+		        conv_reason_name(reason));
+		// #2279: every row the provider backs goes FAILED(reason), cold
+		// INSTALLED rows from the describe cache included -- the host that
+		// would serve them is not coming back until a configuration change,
+		// so a spec-3 caller must read UNAVAILABLE, not ACTIVATING forever.
+		// The latch re-applies it to rows a later describe brings in.
+		core->reg.providers[p].host_failed_reason = reason;
+		fail_provider_rows_locked(core, p, reason, t);
 		break;
+	}
 	default: break;
 	}
 }
@@ -696,6 +726,14 @@ describe_locked(struct conv_core *core, uint32_t provider)
 	if (n >= 0) {
 		sync_states_locked(core, provider);
 	}
+	if (provider < core->reg.provider_count) {
+		// #2279: rows a describe brings in while the host is latched FAILED
+		// (the describe cache, a re-describe) are as dead as the old ones.
+		const uint32_t hf = core->reg.providers[provider].host_failed_reason;
+		if (hf != 0 && hf != XRT_CONV_FAIL_CRASH_LOOP) {
+			fail_provider_rows_locked(core, provider, hf, now_ns());
+		}
+	}
 	if (provider < CONV_REGISTRY_MAX_PROVIDERS) {
 		core->retrying[provider] = false;
 	}
@@ -848,6 +886,9 @@ conv_core_provider_changed(struct conv_core *core, const char *provider_id)
 		// surviving row's readiness, so an ABSENT row stayed UNAVAILABLE
 		// until restart (G5's shape, on the core).
 		const uint64_t t = now_ns();
+		// #2279: the change is what the latched host waits for; it respawns on
+		// the re-warm and re-latches if it fails again.
+		core->reg.providers[pi].host_failed_reason = 0;
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider == (uint32_t)pi) {
 				struct conv_readiness_event ev = mk_ev(CONV_EV_REGISTRY_CHANGED, t);
@@ -869,6 +910,9 @@ conv_core_set_provider_enabled(struct conv_core *core, const char *provider_id, 
 	const int32_t pi = conv_registry_find_provider(&core->reg, provider_id);
 	if (pi >= 0) {
 		core->reg.providers[pi].enabled = enabled;
+		if (enabled) {
+			core->reg.providers[pi].host_failed_reason = 0; // #2279: a configuration change
+		}
 		const uint64_t t = now_ns();
 		for (uint32_t i = 0; i < core->reg.row_count; i++) {
 			if (core->reg.rows[i].provider == (uint32_t)pi) {

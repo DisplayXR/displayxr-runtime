@@ -94,7 +94,7 @@ enum conv_readiness_event_type
 	//! Idle past keep-alive. flags & CONV_EVF_BOUND: a stream or job is bound,
 	//! so the event is refused.
 	CONV_EV_EVICTED,
-	CONV_EV_HOST_CRASH,       //!< abnormal host exit or watchdog kill
+	CONV_EV_HOST_CRASH, //!< abnormal host exit or watchdog kill
 	//! The satellite host closed for an update (exit 20): READY / WARMING ->
 	//! WARMING(updating). No crash record, no backoff; the respawn re-warms it.
 	CONV_EV_HOST_UPDATING,
@@ -123,6 +123,19 @@ enum conv_readiness_event_type
 	//! download (AllowDownloads = 0, a research-only model without the opt-in),
 	//! else XRT_CONV_FAIL_MODEL. From INSTALLED / EVICTED / WARMING / DOWNLOADING.
 	CONV_EV_MODEL_ABSENT,
+	/*!
+	 * The provider's host failed terminally (#2279): the satellite supervisor
+	 * latched FAILED -- negotiate failed (an opt-in provider whose probe
+	 * declined), ABI reject, licence, no device, binary missing -- and will
+	 * not respawn until a configuration change. Every row it backs goes
+	 * FAILED(reason) NOT retryable, from any live, cold or retrying state, so
+	 * a spec-3 caller reads UNAVAILABLE instead of ACTIVATING forever (a cold
+	 * INSTALLED row from the describe cache is not evidence anything can
+	 * serve it). reason = the host's XRT_CONV_FAIL_* (LOAD when 0).
+	 * DISABLED and the other terminal states keep their own reason; a
+	 * registry change (CONV_EV_REGISTRY_CHANGED) is the way back.
+	 */
+	CONV_EV_HOST_FAILED,
 };
 
 /*! @name Event flags (conv_readiness_event::flags) @{ */

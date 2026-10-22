@@ -2236,6 +2236,28 @@ struct FakeSat
 		conv_host_raise_event(&base, CONV_HOST_EV_CRASH_LOOP, 0);
 	}
 
+	//! The supervisor latched FAILED (#2279): a declined probe (exit 11), an
+	//! ABI reject, ... -- no respawn until a configuration change.
+	void
+	fail_terminally(int32_t reason)
+	{
+		{
+			std::lock_guard<std::mutex> lk(m);
+			epoch++;
+			down = true;
+		}
+		conv_host_raise_event(&base, CONV_HOST_EV_FAILED, reason);
+	}
+
+	//! The configuration change cleared the latch: the next demand spawns a
+	//! host that comes up (no RESTORED: nothing was running).
+	void
+	unlatch()
+	{
+		std::lock_guard<std::mutex> lk(m);
+		down = false;
+	}
+
 	bool
 	is_down()
 	{
@@ -2692,6 +2714,92 @@ TEST_CASE("satellite: an orderly (idle) exit is not a crash; describe goes throu
 		CHECK_FALSE(reg.rows[0].rd.restarting);
 	}
 	conv_fake_fini(&f);
+}
+
+TEST_CASE("satellite: a host failed terminally drives its cold rows FAILED, so v3 reads UNAVAILABLE (#2279)",
+          "[conv_lanes]")
+{
+	// The stock Linux install: sim-conversion is opt-in, its probe declines,
+	// the host exits 11 and the supervisor latches FAILED(load). The rows from
+	// the describe cache were INSTALLED -- non-terminal -- so before #2279 the
+	// v3 lift state stayed ACTIVATING forever and the browser kept offering
+	// "Convert to 3D".
+	conv_fake_provider f;
+	conv_fake_init(&f, "sat");
+	conv_fake_cap *c =
+	    conv_fake_add_cap(&f, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	c->warm_ms = 5; // cold: INSTALLED until something warms it
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, f, 100);
+		CHECK(views_state(core) == XRT_CONV_STATE_INSTALLED);
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_ACTIVATING);
+
+		sat->fail_terminally((int32_t)XRT_CONV_FAIL_LOAD);
+		REQUIRE(wait_until([&] { return row_state(core, 0, 4) == XRT_CONV_STATE_FAILED; }, 2000));
+		{
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			CHECK(reg.rows[0].rd.reason == XRT_CONV_FAIL_LOAD);
+			CHECK_FALSE(reg.rows[0].rd.retryable);
+			CHECK(conv_readiness_next_deadline(&reg.rows[0].rd) == 0u); // no backoff loop
+			CHECK(reg.providers[0].host_failed_reason == XRT_CONV_FAIL_LOAD);
+		}
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_UNAVAILABLE);
+		CHECK(conv_core_v3_state(core.c, 0, false) == CONV_V3_STATE_UNAVAILABLE);
+		xrt_conv_wire_task_desc d{};
+		REQUIRE(conv_core_get_task_desc(core.c, XRT_CONV_TASK_VIEWS_MONO, &d));
+		CHECK(d.state == XRT_CONV_STATE_FAILED); // the reason is app-visible
+		CHECK(d.failure_reason == XRT_CONV_FAIL_LOAD);
+		CHECK(core.saw_state(XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_STATE_FAILED));
+
+		// A configuration change (`conv set sim-conversion ENABLE 1`) clears
+		// the latch: the row is back to waited-for, v3 ACTIVATING ...
+		sat->unlatch();
+		conv_core_provider_changed(core.c, "sat");
+		REQUIRE(wait_until([&] { return row_state(core, 0, 4) != XRT_CONV_STATE_FAILED; }, 2000));
+		{
+			conv_registry reg;
+			conv_core_copy_registry(core.c, &reg);
+			CHECK(reg.providers[0].host_failed_reason == 0u);
+		}
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) != CONV_V3_STATE_UNAVAILABLE);
+		// ... and the warm the next client asks for brings it to READY.
+		CHECK(conv_core_warm_task(core.c, XRT_CONV_TASK_VIEWS_MONO) == XRT_SUCCESS);
+		REQUIRE(wait_until([&] { return views_state(core) == XRT_CONV_STATE_READY; }, 3000));
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_READY);
+
+		// Failing again re-latches, from READY too.
+		sat->fail_terminally((int32_t)XRT_CONV_FAIL_VERSION);
+		REQUIRE(wait_until([&] { return row_state(core, 0, 4) == XRT_CONV_STATE_FAILED; }, 2000));
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_UNAVAILABLE);
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("satellite: a failed host leaves tasks another live provider backs alone (#2279)", "[conv_lanes]")
+{
+	conv_fake_provider fa, fb;
+	conv_fake_init(&fa, "sat-a");
+	conv_fake_init(&fb, "inproc-b");
+	conv_fake_cap *ca =
+	    conv_fake_add_cap(&fa, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	ca->warm_ms = 5;
+	conv_fake_cap *cb =
+	    conv_fake_add_cap(&fb, 4, XRT_CONV_TASK_VIEWS_MONO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_VIEWS, 0);
+	cb->state = XRT_CONV_STATE_READY;
+	{
+		Core core(false);
+		FakeSat *sat = add_satellite(core, fa, 50);
+		REQUIRE(core.add(fb, 100) >= 0);
+		sat->fail_terminally((int32_t)XRT_CONV_FAIL_LOAD);
+		REQUIRE(wait_until([&] { return row_state(core, 0, 4) == XRT_CONV_STATE_FAILED; }, 2000));
+		CHECK(row_state(core, 1, 4) == XRT_CONV_STATE_READY);
+		CHECK(views_state(core) == XRT_CONV_STATE_READY);
+		CHECK(conv_core_v3_state(core.c, CONV_V3_MODE_SBS, false) == CONV_V3_STATE_READY);
+	}
+	conv_fake_fini(&fa);
+	conv_fake_fini(&fb);
 }
 
 TEST_CASE("stream: a discontinuity latest-wins skipped rides on the next result acquired", "[conv_lanes]")
