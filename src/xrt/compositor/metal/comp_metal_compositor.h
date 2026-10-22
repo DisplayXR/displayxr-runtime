@@ -20,6 +20,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_screen.h"
 #include "util/u_cursor_depth.h"
+#include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
 
 // Forward declarations
 struct xrt_system_devices;
@@ -371,6 +372,35 @@ comp_metal_compositor_set_cursor_measure_request(struct xrt_compositor *xc, cons
  */
 bool
 comp_metal_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
+/*!
+ * XR_DXR_depth_budget: latch the app's extension opt-in and arm the policy
+ * when the session is also transparent. Call right after
+ * comp_metal_compositor_create. The source is the runtime's own desktop
+ * capture (#2264), so the policy only has something to measure on a session
+ * that captures the desktop (a weaving DP that cannot present alpha).
+ */
+void
+comp_metal_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+//! XR_DXR_depth_budget v2: the app's XrContentBoundsDXR, window-normalised.
+void
+comp_metal_compositor_set_content_bounds(
+    struct xrt_compositor *xc, float u0, float v0, float u1, float v1, uint64_t now_ns);
+
+//! XR_DXR_depth_budget v3: the app's XrContentMaskDXR (copied by the runner).
+void
+comp_metal_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns);
+
+//! The latest published budget; false when this session never opted in.
+bool
+comp_metal_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
  * Get the MTLTexture (as void*) for a given swapchain image index.

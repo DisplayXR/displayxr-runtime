@@ -24,6 +24,8 @@
 #include "comp_metal_placement.h" // runtime-owned window placement (ADR-050)
 #include "comp_metal_desktop_bg.h" // live desktop behind a transparent window (#2264)
 #include "comp_metal_alpha_probe.h" // lazy transparency (#2264)
+#include "comp_metal_bg_preview.h" // rear depth budget source (#2264)
+#include "util/comp_rear_budget.h" // XR_DXR_depth_budget runner
 
 #include "util/comp_cursor_look.h"
 #include "util/comp_layer_accum.h"
@@ -387,6 +389,15 @@ struct comp_metal_compositor
 	uint32_t opaque_streak;
 	//! CGDirectDisplayID under the window's content (0 = unknown), per frame.
 	uint32_t desktop_display;
+	//! This frame's backdrop holds the live desktop (set by the flatten).
+	bool desktop_in_backdrop;
+
+	//! XR_DXR_depth_budget: the shared runner, fed from @ref bg_preview — a
+	//! downsample of the desktop crop above, since on macOS the runtime, not
+	//! the DP, owns the capture. NULL preview = no desktop source (the runner
+	//! then reports CLIPPED_NO_SOURCE, as before).
+	struct comp_rear_budget rear_budget;
+	struct comp_metal_bg_preview *bg_preview;
 
 	//! Pipelines for the Local2D flatten (premultiplied over / unpremultiplied
 	//! source) and the masked composite pass.
@@ -3381,6 +3392,7 @@ metal_desktop_bg_init(struct comp_metal_compositor *c)
 	}
 	c->desktop_bg = comp_metal_desktop_bg_create((__bridge void *)c->device);
 	c->alpha_probe = comp_metal_alpha_probe_create((__bridge void *)c->device);
+	c->bg_preview = comp_metal_bg_preview_create((__bridge void *)c->device);
 	U_LOG_W("desktop background: eligible (%s) — the live desktop behind the window is captured only while the "
 	        "content is transparent",
 	        forced_on ? "forced by DXR_MACOS_DESKTOP_BG=1" : "DP weaves without alpha");
@@ -3513,6 +3525,30 @@ metal_desktop_bg_crop(struct comp_metal_compositor *c,
 	return true;
 }
 
+/*!
+ * XR_DXR_depth_budget on macOS: one tick per APP frame (this compositor has no
+ * repaint path), after the flatten. Same shape as vk_rear_budget_tick, except
+ * that the preview comes from the runtime's own desktop capture instead of a
+ * DP slot — the Leia Metal DP captures nothing; the runtime does (#2264).
+ *
+ * No desktop in this frame's backdrop (content opaque, capture not up yet,
+ * window off every display) = no preview, which the runner reads as "no
+ * source" rather than as a neutral background.
+ */
+static void
+metal_rear_budget_tick(struct comp_metal_compositor *c)
+{
+	if (!comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct xrt_dp_background_preview pv;
+	xrt_dp_background_preview_init(&pv);
+	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
+	const bool got = polled && c->desktop_in_backdrop && comp_metal_bg_preview_get(c->bg_preview, &pv);
+	comp_rear_budget_tick(&c->rear_budget, got ? &pv : NULL, polled, c->transparent_background, now_ns);
+}
+
 // #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
 // projection in list order) into backdrop_scratch PRE-weave and return it (+
 // region dims) so the caller hands it to the DP via set_background_2d (the DP
@@ -3529,6 +3565,7 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 {
 	*out_w = 0;
 	*out_h = 0;
+	c->desktop_in_backdrop = false;
 	if (dst_w == 0 || dst_h == 0) {
 		return nil;
 	}
@@ -3598,6 +3635,13 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 		     destinationLevel:0
 		    destinationOrigin:desk_dst];
 		[blit endEncoding];
+		c->desktop_in_backdrop = true;
+		// Depth-budget source: the desktop alone, before any Local2D layer is
+		// drawn over it — what a DP preview is on the other platforms.
+		if (comp_rear_budget_is_running(&c->rear_budget)) {
+			comp_metal_bg_preview_record(c->bg_preview, (__bridge void *)cmd_buf,
+			                             (__bridge void *)c->backdrop_scratch, w, h);
+		}
 	}
 
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4538,6 +4582,56 @@ comp_metal_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struc
 	*out = c->cursor_measure.result;
 	os_mutex_unlock(&c->mutex);
 	return out->valid;
+}
+
+/*
+ * XR_DXR_depth_budget - thin wrappers over the shared runner, so oxr keeps
+ * calling one symbol per backend and knows nothing about comp_rear_budget.
+ */
+void
+comp_metal_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	comp_rear_budget_set_requested(&c->rear_budget, requested);
+	comp_rear_budget_arm(&c->rear_budget, c->transparent_background);
+}
+
+void
+comp_metal_compositor_set_content_bounds(
+    struct xrt_compositor *xc, float u0, float v0, float u1, float v1, uint64_t now_ns)
+{
+	if (xc == NULL) {
+		return;
+	}
+	comp_rear_budget_set_content_bounds(&metal_comp(xc)->rear_budget, u0, v0, u1, v1, now_ns);
+}
+
+void
+comp_metal_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns)
+{
+	if (xc == NULL) {
+		return;
+	}
+	comp_rear_budget_set_content_mask(&metal_comp(xc)->rear_budget, cells, w, h, stride, margin_normalized,
+	                                  now_ns);
+}
+
+bool
+comp_metal_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
+{
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	return comp_rear_budget_get(&metal_comp(xc)->rear_budget, out);
 }
 
 
@@ -6303,6 +6397,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			id<MTLTexture> bd_tex =
 			    metal_flatten_backdrop_2d(c, cmd_buf, dp_target_w, dp_target_h, &bd_w, &bd_h);
 			metal_backdrop_dump_if_triggered(c, cmd_buf, bd_tex, bd_w, bd_h);
+			metal_rear_budget_tick(c);
 			xrt_display_processor_metal_set_background_2d(c->display_processor,
 			                                              (__bridge void *)bd_tex, bd_w, bd_h);
 		}
@@ -6589,6 +6684,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// 3c. Live desktop background (#2264): drop the capture first.
 	comp_metal_desktop_bg_destroy(&c->desktop_bg);
 	comp_metal_alpha_probe_destroy(&c->alpha_probe);
+	comp_metal_bg_preview_destroy(&c->bg_preview);
+	comp_rear_budget_fini(&c->rear_budget);
 
 	// 4. Destroy display processor — first withdrawing this client's zone
 	// contribution from the vendor's union (#224 P4 clear-on-teardown edge).
@@ -7248,6 +7345,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("Display processor creation failed, continuing without it");
 		}
 	}
+	comp_rear_budget_init(&c->rear_budget, "metal");
 	metal_desktop_bg_init(c);
 	c->hardware_display_3d = true; // Start in 3D mode (session begin will confirm)
 
