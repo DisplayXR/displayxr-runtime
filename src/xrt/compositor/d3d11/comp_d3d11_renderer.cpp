@@ -472,6 +472,36 @@ renderer_refresh_atlas_share(struct comp_d3d11_renderer *r)
 	}
 }
 
+/*!
+ * The atlas format. R8G8B8A8_UNORM unless DXR_ATLAS_FORMAT asks for a deeper one
+ * (experimental, 10-bit path to the panel): `rgb10a2` -> R10G10B10A2_UNORM,
+ * `rgba16f` -> R16G16B16A16_FLOAT. The SRV/RTV follow the texture, and the DP is
+ * told the SRV's real format (d3d11_dp_view_format), so a deeper atlas reaches the
+ * weaver intact.
+ */
+static DXGI_FORMAT
+renderer_atlas_format(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("DXR_ATLAS_FORMAT");
+		cached = (int)DXGI_FORMAT_R8G8B8A8_UNORM;
+		if (v != nullptr && v[0] != 0) {
+			if (strcmp(v, "rgb10a2") == 0) {
+				cached = (int)DXGI_FORMAT_R10G10B10A2_UNORM;
+			} else if (strcmp(v, "rgba16f") == 0) {
+				cached = (int)DXGI_FORMAT_R16G16B16A16_FLOAT;
+			} else {
+				U_LOG_W("DXR_ATLAS_FORMAT='%s' not recognised (rgb10a2 | rgba16f) - keeping RGBA8", v);
+			}
+			if (cached != (int)DXGI_FORMAT_R8G8B8A8_UNORM) {
+				U_LOG_W("DXR_ATLAS_FORMAT=%s: d3d11 atlas format %d (experimental)", v, cached);
+			}
+		}
+	}
+	return (DXGI_FORMAT)cached;
+}
+
 static xrt_result_t
 create_resources(struct comp_d3d11_renderer *r)
 {
@@ -485,7 +515,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	texDesc.Height = r->texture_height;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
-	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.Format = renderer_atlas_format();
 	texDesc.SampleDesc.Count = 1;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -2873,7 +2903,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	texDesc.Height = grow_h;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
-	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.Format = renderer_atlas_format();
 	texDesc.SampleDesc.Count = 1;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;

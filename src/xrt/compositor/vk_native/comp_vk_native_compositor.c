@@ -4357,7 +4357,10 @@ vk_ensure_dp_input_image(struct comp_vk_native_compositor *c,
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    // The atlas's own format: the crop below is a raw vkCmdCopyImage, so any
+	    // other format reinterprets the bits (a 10-bit atlas reached the weaver
+	    // as garbage this way before this followed the atlas).
+	    .format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer),
 	    .extent = {content_w, content_h, 1},
 	    .mipLevels = 1,
 	    .arrayLayers = 1,
@@ -4415,7 +4418,7 @@ vk_ensure_dp_input_image(struct comp_vk_native_compositor *c,
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 	    .image = c->dp_input_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer),
 	    .subresourceRange = {
 	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	        .baseMipLevel = 0,
@@ -4615,6 +4618,12 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	    : comp_vk_native_renderer_get_format(c->renderer));
 	bool swap_bgra =
 	    (atlas_format == VK_FORMAT_B8G8R8A8_UNORM || atlas_format == VK_FORMAT_B8G8R8A8_SRGB);
+	if (!swap_bgra && atlas_format != VK_FORMAT_R8G8B8A8_UNORM && atlas_format != VK_FORMAT_R8G8B8A8_SRGB) {
+		// The staging buffer is 4 bytes per texel: a 16F atlas (DXR_ATLAS_FORMAT)
+		// would overrun it and a 10-bit one would come out as garbage.
+		U_LOG_W("[VK native] capture: atlas format %d is not 8-bit RGBA - skipped", (int)atlas_format);
+		return false;
+	}
 
 	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 	if (cmd_pool == VK_NULL_HANDLE) {

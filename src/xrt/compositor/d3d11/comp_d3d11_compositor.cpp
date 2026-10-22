@@ -1029,6 +1029,27 @@ d3d11_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_pr
 	}
 }
 
+/*!
+ * The format the DP is told for the SRV it weaves. Historically always RGBA8, and
+ * it stays that for every 8-bit SRV (a zero-copy BGRA / _SRGB app swapchain keeps
+ * the argument it always had). A deeper atlas (DXR_ATLAS_FORMAT) reports its real
+ * format, or the weaver would read 10-bit / float texels as RGBA8.
+ */
+static DXGI_FORMAT
+d3d11_dp_view_format(void *srv_ptr)
+{
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(srv_ptr);
+	if (srv == nullptr) {
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
+	srv->GetDesc(&d);
+	if (d.Format == DXGI_FORMAT_R10G10B10A2_UNORM || d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		return d.Format;
+	}
+	return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
 // #439 Phase 1 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined
 // near the bottom of the file alongside the comp_d3d11_compositor_zone_mask_*
 // entry points, called from the layer-commit paths + destroy above them.
@@ -1943,6 +1964,19 @@ d3d11_capture_texture_to_png(ID3D11Device *device,
 
 	D3D11_TEXTURE2D_DESC adesc;
 	atlas_tex->GetDesc(&adesc);
+	switch (adesc.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: break;
+	default:
+		// The repack below is 4 bytes of RGBA8 per texel; a 10-bit / 16F atlas
+		// (DXR_ATLAS_FORMAT) would come out as garbage, so say so instead.
+		U_LOG_W("capture: texture format %d is not 8-bit RGBA - skipped", (int)adesc.Format);
+		return false;
+	}
 	if (content_w > adesc.Width)  content_w = adesc.Width;
 	if (content_h > adesc.Height) content_h = adesc.Height;
 
@@ -3023,7 +3057,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.view_height = view_height;
 		sf.tile_columns = tile_columns;
 		sf.tile_rows = tile_rows;
-		sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		sf.src_format = (uint32_t)d3d11_dp_view_format(atlas_srv);
 		sf.target_rtv = comp_d3d11_target_get_rtv(c->target);
 		sf.target_width = target_width;
 		sf.target_height = target_height;
@@ -3044,7 +3078,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	} else {
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
-		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
+		    tile_columns, tile_rows, d3d11_dp_view_format(atlas_srv), target_width, target_height,
 		    eff_canvas.valid ? eff_canvas.x : 0,
 		    eff_canvas.valid ? eff_canvas.y : 0,
 		    eff_canvas.valid ? eff_canvas.w : 0,
@@ -4718,7 +4752,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
-			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
+			    tile_columns, tile_rows, d3d11_dp_view_format(atlas_srv), dp_target_w, dp_target_h,
 			    eff_canvas.valid ? eff_canvas.x : 0,
 			    eff_canvas.valid ? eff_canvas.y : 0,
 			    eff_canvas.valid ? eff_canvas.w : 0,
