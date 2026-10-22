@@ -1783,6 +1783,11 @@ target_link_libraries(tests_lift_abi PRIVATE xrt-external-openxr)
 # shared displayxr-common rig core xrLocateViews runs.
 target_link_libraries(tests_aux_lift_rig_depth PRIVATE displayxr::math_core)
 
+# ADR-058 conformance: the CPU reference AND the real ring + late stage
+# (conv_core with the depth-only fake provider, CPU glue).
+target_sources(tests_lift_late_viewsyn_conformance PRIVATE conv_fake_provider.c)
+target_link_libraries(tests_lift_late_viewsyn_conformance PRIVATE displayxr::conversion_runtime)
+
 # #1855: sim_display webcam eye tracking -- geometry, one-euro, timeout/collapse,
 # device/mode selection, and the worker end to end on the synthetic UVC backend
 # with a fake face estimator (no camera is ever opened).

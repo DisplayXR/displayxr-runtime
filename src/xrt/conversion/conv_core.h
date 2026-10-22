@@ -104,6 +104,12 @@ struct conv_core_config
 	bool recenter_off;        //!< DXR_LIFT_RECENTER=0
 	uint64_t eyes_max_age_ns; //!< older snapshots count as stale; 0 = no limit
 
+	/* ADR-058 late view synthesis (composed streams on the runtime-woven
+	 * paths; resolved by the caller from the environment). */
+	bool late_viewsyn_off;          //!< DXR_LIFT_LATE_VIEWSYN=0: S5 stays on the conversion thread
+	uint32_t late_viewsyn_max_edge; //!< DXR_LIFT_LATE_VIEWSYN_MAX_EDGE: per-view long edge; 0 = 960
+	float reproject_max_m;          //!< DXR_LIFT_REPROJECT_MAX_M; <= 0 = U_LIFT_REPROJECT_MAX_M_DEFAULT
+
 	/* Control thread. */
 	uint32_t tick_ms; //!< 0 = 100
 	//! Stall watchdog for stream calls: max(this, 20 × est_latency); 0 = 10 s.
@@ -466,6 +472,63 @@ conv_core_eyes_retire(struct conv_core *core, uint64_t dp_key);
  */
 xrt_result_t
 conv_core_stream_bind_eyes(struct conv_core *core, uint64_t stream_id, uint64_t dp_key);
+
+/*
+ *
+ * ADR-058 late view synthesis (phase 1: composed streams, runtime-woven paths).
+ *
+ */
+
+//! Default per-view long edge of a late synthesis, pixels.
+#define CONV_LATE_MAX_EDGE_DEFAULT 960u
+
+/*! The presenter's cache of its last late synthesis of one stream (one per
+ *  stream per consumer, zero-initialised; the consumer owns the views). */
+struct conv_late_cache
+{
+	bool valid;
+	uint64_t generation;
+	uint32_t view_count;
+	float viewpoints_m[XRT_CONV_MAX_VIEWS][3];
+	float ease;
+};
+
+/*! One display frame's late synthesis of a pinned result. Points into
+ *  itself: use in place, never copy. */
+struct conv_late_frame
+{
+	//! Re-synthesize into the consumer's views now; false = its cached views
+	//! (same content, an eye pair that moved less than the re-run rule) stand.
+	bool rerun;
+	struct xrt_conv_image color, depth; //!< the ring slot's source (valid while the result is pinned)
+	struct xrt_conv_depth_info depth_info;
+	struct conv_viewsyn_request req; //!< color / depth / depth_info point above; target NULL (the consumer's)
+	uint32_t view_w, view_h;         //!< per-view extent, long edge capped (late_viewsyn_max_edge)
+	uint64_t generation;             //!< content generation (a new result = a new value)
+	uint32_t verdict;                //!< enum u_lift_reproject_verdict
+	float ease;
+	float delta_m;    //!< largest viewpoint move since conversion
+	uint64_t eyes_ns; //!< sample time of the eyes it is placed for (0 = the nominal viewer)
+};
+
+/*!
+ * The late synthesis of the result pinned in @p ring_slot (conv_result::late)
+ * at the eyes of this display frame: @p eyes when the caller has the frame's
+ * own (its DP's target-time query), else the stream's bound eyes snapshot at
+ * @p now_ns. The eyes go through the stream's S3 viewpoint policy (on a copy
+ * of its state) and u_lift_reproject's correction limit; @p cache decides
+ * whether the consumer re-synthesizes (and is updated when it should).
+ *
+ * @return false when the pinned result is not a late source (use its views).
+ */
+bool
+conv_core_stream_late_prepare(struct conv_core *core,
+                              uint64_t stream_id,
+                              uint32_t ring_slot,
+                              const struct conv_eyes *eyes,
+                              uint64_t now_ns,
+                              struct conv_late_cache *cache,
+                              struct conv_late_frame *out);
 
 /*!
  * Read the eyes a stream bound to @p dp_key would use at @p now_ns. False

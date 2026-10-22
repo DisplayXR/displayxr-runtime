@@ -260,6 +260,35 @@ u_lift_reproject_render(const struct u_lift_reproject_policy *pol,
 
 /*
  *
+ * Re-run rule (the presenter's cache, ADR-058 phase 1).
+ *
+ */
+
+//! A view's offset from the viewpoints' midpoint moved this far (a head
+//! turn, an IPD / view-spread change): re-synthesize.
+#define U_LIFT_REPROJECT_RERUN_SPREAD_M 0.0005f
+//! The midpoint's distance from the glass moved this far: re-synthesize
+//! (the composed budget scales with 1 / distance).
+#define U_LIFT_REPROJECT_RERUN_DISTANCE_M 0.005f
+//! The easing factor moved this much: re-synthesize.
+#define U_LIFT_REPROJECT_RERUN_EASE 0.02f
+
+/*!
+ * Whether a late synthesis at @p cur (with ease @p cur_ease) would differ
+ * visibly from the cached one made at @p prev (@p prev_ease). A common (x, y)
+ * translation of viewpoints parallel to the glass never asks for one: both
+ * geometries are invariant under it (x_s = p' + (E - C) q), so the cached
+ * views are already right; with a turned head (views at different depths) it
+ * shifts each view by about move * (dz / z) * q, which is bounded by the
+ * spread threshold too. True for invalid input (re-synthesize when in doubt).
+ */
+bool
+u_lift_reproject_needs_rerun(
+    const float (*prev)[3], const float (*cur)[3], uint32_t view_count, float prev_ease, float cur_ease);
+
+
+/*
+ *
  * Result age (ADR-058 decision 4's stats split; internal until the
  * XrLiftStreamStatsDXR append lands with the ADR).
  *

@@ -299,6 +299,64 @@ u_lift_reproject_render(const struct u_lift_reproject_policy *pol,
 
 /*
  *
+ * Re-run rule.
+ *
+ */
+
+bool
+u_lift_reproject_needs_rerun(
+    const float (*prev)[3], const float (*cur)[3], uint32_t view_count, float prev_ease, float cur_ease)
+{
+	if (prev == NULL || cur == NULL || view_count == 0 || view_count > U_LIFT_REPROJECT_MAX_VIEWS ||
+	    !isfinite(prev_ease) || !isfinite(cur_ease)) {
+		return true;
+	}
+	if (fabs((double)cur_ease - (double)prev_ease) > (double)U_LIFT_REPROJECT_RERUN_EASE) {
+		return true;
+	}
+	double pc[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
+	for (uint32_t i = 0; i < view_count; i++) {
+		for (uint32_t k = 0; k < 3; k++) {
+			if (!isfinite(prev[i][k]) || !isfinite(cur[i][k])) {
+				return true;
+			}
+			pc[k] += prev[i][k];
+			cc[k] += cur[i][k];
+		}
+	}
+	for (uint32_t k = 0; k < 3; k++) {
+		pc[k] /= (double)view_count;
+		cc[k] /= (double)view_count;
+	}
+	if (fabs(cc[2] - pc[2]) > (double)U_LIFT_REPROJECT_RERUN_DISTANCE_M) {
+		return true;
+	}
+	const double thr = (double)U_LIFT_REPROJECT_RERUN_SPREAD_M;
+	double tilt = 0.0; // the largest view depth offset from the midpoint, over its distance
+	for (uint32_t i = 0; i < view_count; i++) {
+		double s = 0.0;
+		for (uint32_t k = 0; k < 3; k++) {
+			const double d = ((double)cur[i][k] - cc[k]) - ((double)prev[i][k] - pc[k]);
+			s += d * d;
+		}
+		if (s > thr * thr) {
+			return true;
+		}
+		if (cc[2] > 0.0) {
+			const double t = fabs((double)cur[i][2] - cc[2]) / cc[2];
+			tilt = t > tilt ? t : tilt;
+		}
+	}
+	// A common (x, y) move is exact only for a pair parallel to the glass: a
+	// turned head (views at different depths) shifts each view by about
+	// move * (dz / z) * q, q <= 1. Bound it by the same threshold.
+	const double lx = cc[0] - pc[0], ly = cc[1] - pc[1];
+	return sqrt(lx * lx + ly * ly) * tilt > thr;
+}
+
+
+/*
+ *
  * Ages.
  *
  */

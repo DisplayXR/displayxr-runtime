@@ -143,6 +143,35 @@ struct conv_viewsyn_ops
 	void *ud;
 };
 
+/*!
+ * ADR-058 late view synthesis: the S5 inputs of one composed result, kept in
+ * its ring slot instead of the views (the images live beside it). A backend
+ * re-runs S5 from it at the eyes of each display frame
+ * (conv_core_stream_late_prepare).
+ */
+struct conv_late_source
+{
+	struct xrt_conv_depth_info depth_info;
+	uint32_t view_count;
+	uint32_t layout;                           //!< XRT_CONV_VIEWS_*
+	float viewpoints_m[XRT_CONV_MAX_VIEWS][3]; //!< the RECORDED (conversion) viewpoints, rect-relative
+	float rect_width_m, rect_height_m;
+	float range_near, range_far;
+	float convergence;
+	float budget;
+	float rear_cap_m;
+};
+
+struct u_conv_viewsyn_params;
+
+/*!
+ * The one mapping of an S5 request onto the reference view synthesis'
+ * parameters (the GPU glues' and the late stage's): geometry, depth units
+ * and the policy's numbers; everything else at the shipping defaults.
+ */
+void
+conv_viewsyn_request_to_params(const struct conv_viewsyn_request *req, struct u_conv_viewsyn_params *out);
+
 /*! GPU depth → CPU samples for S6 / S7 (the CPU memory kind needs none). */
 struct conv_depth_readback_ops
 {
@@ -177,6 +206,9 @@ struct conv_pipeline_frame
 	float budget;                           //!< S3 decision (S5 reads it)
 	float rear_cap_m;
 	bool new_content;
+	//! ADR-058: build S5's request but do not render it (late view
+	//! synthesis): frame->late is filled instead and VIEWS is not written.
+	bool defer_s5;
 
 	/* Out. */
 	xrt_result_t provider_result;
@@ -184,6 +216,9 @@ struct conv_pipeline_frame
 	struct xrt_conv_frame_out result;  //!< what S8 publishes
 	struct conv_depth_samples samples; //!< S6's CPU view (for S7), until conv_pipeline_frame_release
 	bool samples_from_readback;
+	//! defer_s5: the S5 inputs, ready for a late synthesis.
+	struct conv_late_source late;
+	bool late_ready;
 };
 
 /*!
@@ -198,6 +233,16 @@ conv_pipeline_execute(const struct conv_pipeline *p,
                       const struct conv_viewsyn_ops *viewsyn,
                       const struct conv_depth_readback_ops *readback,
                       struct conv_pipeline_frame *frame);
+
+/*!
+ * A deferred frame (late_ready) that must be woven now after all (its depth
+ * is not usable later): run the S5 it skipped, into frame->views_target.
+ * Clears late_ready on success.
+ */
+bool
+conv_pipeline_render_deferred(const struct conv_pipeline *p,
+                              const struct conv_viewsyn_ops *viewsyn,
+                              struct conv_pipeline_frame *frame);
 
 //! Release S6's readback samples.
 void

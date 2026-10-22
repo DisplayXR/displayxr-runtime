@@ -474,3 +474,36 @@ TEST_CASE("lift reproject: content age vs placement age", "[lift_reproject]")
 	CHECK(a.content_age_ns == 0);
 	CHECK(a.placement_age_ns == 0);
 }
+
+TEST_CASE("lift reproject: the presenter's re-run rule", "[lift_reproject]")
+{
+	const float c[3] = {0.0f, 0.0f, 0.6f};
+	float base[2][3], cur[2][3];
+	eye_pair(c, base);
+	CHECK_FALSE(u_lift_reproject_needs_rerun(base, base, 2, 1.0f, 1.0f));
+	// A common lateral move of a pair parallel to the glass: nothing to redo.
+	std::memcpy(cur, base, sizeof(cur));
+	for (int i = 0; i < 2; i++) {
+		cur[i][0] += 0.05f;
+		cur[i][1] += 0.02f;
+	}
+	CHECK_FALSE(u_lift_reproject_needs_rerun(base, cur, 2, 1.0f, 1.0f));
+	// Distance past 5 mm, spread past 0.5 mm, ease past 0.02: redo.
+	std::memcpy(cur, base, sizeof(cur));
+	cur[0][2] += 0.006f;
+	cur[1][2] += 0.006f;
+	CHECK(u_lift_reproject_needs_rerun(base, cur, 2, 1.0f, 1.0f));
+	std::memcpy(cur, base, sizeof(cur));
+	cur[1][0] += 0.0012f; // each view 0.6 mm off the moved midpoint
+	CHECK(u_lift_reproject_needs_rerun(base, cur, 2, 1.0f, 1.0f));
+	CHECK(u_lift_reproject_needs_rerun(base, base, 2, 1.0f, 0.95f));
+	// A turned head moving sideways: the depth offset makes it matter.
+	float turned[2][3], moved[2][3];
+	eye_pair_yaw(c, 0.35, turned);
+	std::memcpy(moved, turned, sizeof(moved));
+	for (int i = 0; i < 2; i++) {
+		moved[i][0] += 0.05f;
+	}
+	CHECK(u_lift_reproject_needs_rerun(turned, moved, 2, 1.0f, 1.0f));
+	CHECK(u_lift_reproject_needs_rerun(nullptr, base, 2, 1.0f, 1.0f));
+}

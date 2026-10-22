@@ -59,6 +59,9 @@ extern "C" {
 #define CONV_IMAGE_USAGE_EXPORT (1u << 3)        //!< exported to clients (shared + fence)
 //! #2030: a GPU mirror of a CPU-memory provider result (conv_image_alloc_ops::upload)
 #define CONV_IMAGE_USAGE_MIRROR (1u << 4)
+//! ADR-058: a ring slot's copy of the converted input, which the presenter's
+//! late view synthesis samples (conv_image_alloc_ops::copy fills it)
+#define CONV_IMAGE_USAGE_LATE_SOURCE (1u << 5)
 /*! @} */
 
 //! A runtime-allocated image the core asks the GPU glue for.
@@ -91,6 +94,12 @@ struct conv_image_alloc_ops
 	 *  uploads each result into a per-ring-slot mirror and publishes the
 	 *  mirror. NULL = CPU results are published as they are. */
 	bool (*upload)(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst);
+	/*! Optional (ADR-058): copy @p src (a producer snapshot, CPU or this
+	 *  allocator's GPU image, honouring its sync) into @p dst, a
+	 *  CONV_IMAGE_USAGE_LATE_SOURCE image this allocator made with @p src's
+	 *  extent and format; complete when it returns. NULL = composed results
+	 *  keep their views (no late view synthesis). */
+	bool (*copy)(void *ud, const struct xrt_conv_image *src, const struct xrt_conv_image *dst);
 	void *ud;
 };
 
@@ -176,6 +185,9 @@ struct conv_result
 	bool discontinuity;  //!< first result after FRAME_RESET or a rebind
 	bool provisional;    //!< the stream's outputs were not refined yet
 	bool output_realloc; //!< an output target changed since this consumer's last acquire
+	/*! ADR-058: a composed result kept as its source (no views written): the
+	 *  presenter synthesizes the views late (conv_core_stream_late_prepare). */
+	bool late;
 };
 
 //! Stream statistics (INFO-logged, throttled; status snapshot).

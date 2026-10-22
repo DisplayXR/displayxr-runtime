@@ -172,6 +172,18 @@ struct lift_core_stream
 };
 
 //! A glue-allocated image on the SERVICE device.
+//! ADR-058: one stream's late views on the weave path (render thread only).
+struct d3d11_late_state
+{
+	struct conv_late_cache cache = {};
+	ID3D11Texture2D *tex = nullptr; //!< N views side by side, R8G8B8A8_UNORM
+	ID3D11ShaderResourceView *srv = nullptr;
+	uint32_t w = 0, h = 0;
+	bool written = false;
+	bool warned = false;
+	uint64_t used_ns = 0;
+};
+
 struct glue_img
 {
 	ID3D11Texture2D *tex = nullptr;
@@ -330,6 +342,13 @@ struct d3d11_lift
 	//! the replay touches the shared immediate context. nullptr = the device
 	//! refused one: S5 draws on the immediate context, as before.
 	ID3D11DeviceContext *viewsyn_deferred = nullptr;
+	//! ADR-058 late view synthesis on the weave path (render thread only,
+	//! under the service's immediate-context mutex the weave holds): its own
+	//! stage + deferred context, so the dispatcher's S5 is never shared.
+	d3d11_conv_viewsyn *late_vs = nullptr;
+	bool late_vs_tried = false;
+	ID3D11DeviceContext *late_deferred = nullptr;
+	std::map<uint64_t, struct d3d11_late_state> late_states; //!< core stream id ->
 	//! #2030: the still-image content check (its own device; created on the
 	//! first PHOTO submit, under glue_mtx).
 	struct d3d11_conv_content_check *content_check = nullptr;

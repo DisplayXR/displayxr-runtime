@@ -18,6 +18,7 @@
 
 #include "vk_conv_weave.h"
 #include "vk_conv_gpu.h"
+#include "vk_conv_viewsyn.h"
 
 #include "xrt/xrt_dp_lift.h"
 #include "xrt/xrt_conversion_plugin.h"
@@ -29,6 +30,7 @@
 
 #include "os/os_threading.h"
 #include "os/os_time.h"
+#include "util/u_conv_viewsyn.h"
 #include "util/u_lift_mailbox.h"
 #include "util/u_lift_rig.h"
 #include "util/u_lift_viewpoint.h"
@@ -111,6 +113,16 @@ struct vkcw_stream
 	//! Result staging, per result view.
 	struct vkcw_img res[XRT_CONV_MAX_VIEWS];
 
+	//! @name ADR-058 late view synthesis (composed results kept as their source)
+	//! @{
+	struct conv_late_cache late_cache;
+	struct vkcw_img late_img;          //!< record path: the views, N side by side (R8G8B8A8_UNORM)
+	bool late_img_general;             //!< late_img was left in GENERAL by a synthesis
+	bool late_unsubmitted;             //!< a synthesis was recorded into a weave not yet completed
+	struct xrt_conv_image late_target; //!< host path: a glue image the glue renders (IOSurface)
+	bool late_warned;
+	//! @}
+
 	//! @name Host client: the engine's own copies, valid from host_done to complete
 	//! @{
 	const void *host_snap;
@@ -139,6 +151,10 @@ struct vkcw_pin
 struct vk_conv_weave_client
 {
 	struct vk_conv_weave_client *next;
+	//! ADR-058: this engine's own reference view synthesis (record path), so
+	//! the conversion dispatcher's instance is never shared across threads.
+	struct vk_conv_viewsyn *late_vs;
+	bool late_vs_tried;
 	//! Created without a device: the engine records on another graphics API
 	//! (vk_conv_weave_host_plan / _host_done); never vk_conv_weave_record.
 	bool host;
@@ -725,8 +741,12 @@ pin_latest(struct vk_conv_weave *w,
 	if (conv_core_stream_acquire(b->core, core_id, false, out_res) != XRT_SUCCESS) {
 		return false;
 	}
-	// No GPU views (a CPU result the glue could not mirror, #2030): flat.
-	if ((out_res->written & XRT_CONV_OUT_VIEWS) == 0 || !vk_conv_gpu_lookup(w->glue, &out_res->views, out_ref)) {
+	// ADR-058: a late source has no views; the caller synthesizes them.
+	if (out_res->late) {
+		memset(out_ref, 0, sizeof(*out_ref));
+	} else if ((out_res->written & XRT_CONV_OUT_VIEWS) == 0 ||
+	           !vk_conv_gpu_lookup(w->glue, &out_res->views, out_ref)) {
+		// No GPU views (a CPU result the glue could not mirror, #2030): flat.
 		conv_core_stream_release(b->core, core_id, out_res->ring_slot);
 		return false;
 	}
@@ -915,6 +935,213 @@ draw_result(struct vk_conv_weave *w,
 
 /*
  *
+ * ADR-058 late view synthesis: a composed result kept as its source is
+ * synthesized at this display frame's eyes (the engine's own eye query
+ * publishes them to the core every weave, so the stream's snapshot is this
+ * frame's), at a capped per-view size, and only when the content changed or
+ * the eye pair moved in a way the synthesis depends on.
+ *
+ */
+
+//! Log once per stream why a late source was woven flat.
+static void
+late_warn(struct vkcw_stream *st, const char *why)
+{
+	if (!st->late_warned) {
+		st->late_warned = true;
+		U_LOG_W("[lift] stream 0x%llx: late view synthesis failed (%s); woven flat",
+		        (unsigned long long)st->wire, why);
+	}
+}
+
+/*!
+ * Record path: synthesize into the stream's late image on @p cmd (the
+ * engine's own command buffer) when the rule asks, then draw it like any
+ * result.
+ */
+static bool
+draw_late(struct vk_conv_weave *w,
+          struct vk_conv_weave_client *c,
+          struct vkcw_stream *st,
+          VkCommandBuffer cmd,
+          const struct vk_conv_weave_rect *r,
+          const struct vk_conv_weave_bridge *b,
+          uint64_t core_id,
+          const struct conv_result *res)
+{
+	struct vk_bundle *vk = w->vk;
+	struct conv_late_frame lf;
+	if (!conv_core_stream_late_prepare(b->core, core_id, res->ring_slot, NULL, os_monotonic_get_ns(),
+	                                   &st->late_cache, &lf)) {
+		late_warn(st, "prepare");
+		return false;
+	}
+	const uint32_t n = lf.req.view_count > 0 ? lf.req.view_count : 1;
+	const uint32_t tw = lf.view_w * n, th = lf.view_h;
+	const VkImage before = st->late_img.image;
+	if (!img_ensure(vk, &st->late_img, tw, th, VK_FORMAT_R8G8B8A8_UNORM)) {
+		late_warn(st, "target");
+		return false;
+	}
+	bool rerun = lf.rerun;
+	if (st->late_img.image != before) {
+		st->late_img_general = false;
+		rerun = true; // a new image holds nothing yet
+	}
+	if (rerun) {
+		struct vk_conv_gpu_image_ref cref, dref;
+		if (!vk_conv_gpu_lookup(w->glue, &lf.color, &cref) || !vk_conv_gpu_lookup(w->glue, &lf.depth, &dref) ||
+		    cref.view == VK_NULL_HANDLE || dref.view == VK_NULL_HANDLE) {
+			st->late_cache.valid = false;
+			late_warn(st, "source not a GPU image");
+			return false;
+		}
+		if (c->late_vs == NULL && !c->late_vs_tried) {
+			c->late_vs_tried = true;
+			c->late_vs = vk_conv_viewsyn_create(vk);
+		}
+		if (c->late_vs == NULL) {
+			st->late_cache.valid = false;
+			late_warn(st, "no view synthesis stage");
+			return false;
+		}
+		struct u_conv_viewsyn_params p;
+		conv_viewsyn_request_to_params(&lf.req, &p);
+		struct vk_conv_viewsyn_inputs in;
+		memset(&in, 0, sizeof(in));
+		in.color = cref.view;
+		in.color_width = cref.width;
+		in.color_height = cref.height;
+		in.depth = dref.view;
+		in.depth_width = dref.width;
+		in.depth_height = dref.height;
+		in.input_layout = VK_IMAGE_LAYOUT_GENERAL;
+		in.new_content = lf.req.new_content;
+		struct vk_conv_viewsyn_target tg;
+		memset(&tg, 0, sizeof(tg));
+		tg.image = st->late_img.image;
+		tg.format = st->late_img.format;
+		tg.width = tw;
+		tg.height = th;
+		tg.array_layers = 1;
+		tg.layout = st->late_img_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+		tg.layout_kind = XRT_CONV_VIEWS_ROW;
+		vk_conv_gpu_cmd_acquire(w->glue, cmd, &cref);
+		vk_conv_gpu_cmd_acquire(w->glue, cmd, &dref);
+		const bool ok = vk_conv_viewsyn_record(c->late_vs, cmd, &in, &p, &tg);
+		vk_conv_gpu_cmd_release(w->glue, cmd, &dref);
+		vk_conv_gpu_cmd_release(w->glue, cmd, &cref);
+		if (!ok) {
+			st->late_cache.valid = false;
+			late_warn(st, "record");
+			return false;
+		}
+		st->late_img_general = true;
+		st->late_unsubmitted = true;
+		// The synthesis' writes before the result copy below.
+		barrier_global(vk, cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+		               VK_PIPELINE_STAGE_TRANSFER_BIT,
+		               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+	}
+	if (!st->late_img_general) {
+		return false;
+	}
+	struct vk_conv_gpu_image_ref lref;
+	memset(&lref, 0, sizeof(lref));
+	lref.image = st->late_img.image;
+	lref.format = st->late_img.format;
+	lref.width = tw;
+	lref.height = th;
+	lref.layers = 1;
+	const bool woven = draw_result(w, st, cmd, r, res, &lref);
+	if (woven) {
+		log_woven(st, tw, th);
+	}
+	return woven;
+}
+
+/*!
+ * Host path (the Metal engine): the glue synthesizes into a glue-owned,
+ * IOSurface-exported image on its own queue (asynchronously, completing on
+ * its shared event), which the engine then samples like any result.
+ */
+static bool
+late_host_result(struct vk_conv_weave *w,
+                 struct vkcw_stream *st,
+                 const struct vk_conv_weave_bridge *b,
+                 uint64_t core_id,
+                 const struct conv_result *res,
+                 const struct xrt_conv_image **out_img,
+                 struct vk_conv_gpu_image_ref *out_ref)
+{
+	struct conv_late_frame lf;
+	if (!conv_core_stream_late_prepare(b->core, core_id, res->ring_slot, NULL, os_monotonic_get_ns(),
+	                                   &st->late_cache, &lf)) {
+		late_warn(st, "prepare");
+		return false;
+	}
+	const uint32_t n = lf.req.view_count > 0 ? lf.req.view_count : 1;
+	const uint32_t tw = lf.view_w * n, th = lf.view_h;
+	struct conv_image_alloc_ops alloc;
+	vk_conv_gpu_alloc_ops(w->glue, &alloc);
+	bool rerun = lf.rerun;
+	struct xrt_conv_image *t = &st->late_target;
+	if (t->memory_kind == 0 || t->width != tw || t->height != th) {
+		if (t->memory_kind != 0 && alloc.free != NULL) {
+			alloc.free(alloc.ud, t);
+		}
+		memset(t, 0, sizeof(*t));
+		struct conv_image_request req;
+		memset(&req, 0, sizeof(req));
+		req.width = tw;
+		req.height = th;
+		req.format = XRT_CONV_FMT_RGBA8_UNORM;
+		req.array_layers = 1;
+		req.role = XRT_CONV_OUT_VIEWS;
+		req.usage = CONV_IMAGE_USAGE_RENDER_TARGET | CONV_IMAGE_USAGE_EXPORT;
+		req.stream_id = core_id;
+		if (alloc.alloc == NULL || !alloc.alloc(alloc.ud, &req, t) || t->memory_kind == 0) {
+			memset(t, 0, sizeof(*t));
+			st->late_cache.valid = false;
+			late_warn(st, "target");
+			return false;
+		}
+		rerun = true;
+	}
+	if (rerun) {
+		struct conv_viewsyn_ops vs;
+		vk_conv_gpu_stage_ops(w->glue, &vs, NULL);
+		lf.req.target = t;
+		if (vs.render == NULL || !vs.render(vs.ud, &lf.req)) {
+			st->late_cache.valid = false;
+			late_warn(st, "render");
+			return false;
+		}
+	}
+	if (!vk_conv_gpu_lookup(w->glue, t, out_ref)) {
+		return false;
+	}
+	*out_img = t;
+	return true;
+}
+
+static void
+late_free(struct vk_conv_weave *w, struct vkcw_stream *st)
+{
+	img_free(w->vk, &st->late_img);
+	if (st->late_target.memory_kind != 0) {
+		struct conv_image_alloc_ops alloc;
+		vk_conv_gpu_alloc_ops(w->glue, &alloc);
+		if (alloc.free != NULL) {
+			alloc.free(alloc.ud, &st->late_target);
+		}
+		memset(&st->late_target, 0, sizeof(st->late_target));
+	}
+}
+
+
+/*
+ *
  * Ops.
  *
  */
@@ -957,8 +1184,10 @@ client_free(struct vk_conv_weave *w, struct vk_conv_weave_client *c, const struc
 	while (c->streams != NULL) {
 		struct vkcw_stream *st = c->streams;
 		c->streams = st->next;
+		late_free(w, st);
 		stream_free(w->vk, st);
 	}
+	vk_conv_viewsyn_destroy(&c->late_vs);
 	free(c);
 }
 
@@ -1000,6 +1229,15 @@ vk_conv_weave_begin(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		st->used_this_frame = false;
 		st->host_snap = NULL;
 		st->host_lines = NULL;
+		if (st->late_unsubmitted) {
+			// ADR-058: that synthesis never ran; the cache must not say it did.
+			st->late_unsubmitted = false;
+			st->late_cache.valid = false;
+			st->late_img_general = false;
+			if (c->late_vs != NULL) {
+				vk_conv_viewsyn_invalidate(c->late_vs);
+			}
+		}
 	}
 }
 
@@ -1062,11 +1300,14 @@ vk_conv_weave_record(struct vk_conv_weave *w,
 	memset(&res, 0, sizeof(res));
 	bool woven = false;
 	if (resolved && pin_latest(w, c, &b, core_id, &res, &ref)) {
-		woven = draw_result(w, st, cmd, &rc, &res, &ref);
+		woven = res.late ? draw_late(w, c, st, cmd, &rc, &b, core_id, &res)
+		                 : draw_result(w, st, cmd, &rc, &res, &ref);
 		if (woven) {
 			st->woven_result = true;
 			st->result_views = res.views_info.view_count != 0 ? res.views_info.view_count : 1;
-			log_woven(st, ref.width, ref.height);
+			if (!res.late) {
+				log_woven(st, ref.width, ref.height);
+			}
 		}
 	}
 	if (!woven && rc.batch) {
@@ -1204,11 +1445,13 @@ vk_conv_weave_complete(struct vk_conv_weave *w, struct vk_conv_weave_client *c)
 		st->used_this_frame = false;
 		st->host_snap = NULL;
 		st->host_lines = NULL;
+		st->late_unsubmitted = false; // the weave that recorded it was submitted
 
 		// A stream gone from the core, or idle for long, lets its images go
 		// (the GPU finished everything recorded for it).
 		if (!alive || ++st->idle > VKCW_IDLE_COMPLETES) {
 			*pp = st->next;
+			late_free(w, st);
 			stream_free(vk, st);
 			continue;
 		}
@@ -1295,7 +1538,10 @@ vk_conv_weave_host_plan(struct vk_conv_weave *w,
 	memset(&res, 0, sizeof(res));
 	if (resolved && pin_latest(w, c, &b, core_id, &res, &ref)) {
 		const struct xrt_conv_image *v = &res.views;
-		const bool exported = v->memory_kind == XRT_CONV_MEM_IOSURFACE && v->handle != 0 &&
+		if (res.late && !late_host_result(w, st, &b, core_id, &res, &v, &ref)) {
+			v = NULL;
+		}
+		const bool exported = v != NULL && v->memory_kind == XRT_CONV_MEM_IOSURFACE && v->handle != 0 &&
 		                      v->handle != VK_CONV_GPU_NO_HANDLE && ref.layers <= 1;
 		int32_t ax0, ay0, ax1, ay1;
 		if (!exported) {

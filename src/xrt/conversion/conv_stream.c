@@ -9,6 +9,7 @@
 #include "conv_core_internal.h"
 
 #include "os/os_time.h"
+#include "util/u_conv_viewsyn.h"
 #include "util/u_lift_reproject.h"
 #include "util/u_logging.h"
 
@@ -247,6 +248,7 @@ teardown(struct conv_core *core, struct conv_stream *st)
 			free_image(core, &st->out[i].targets[k]);
 			free_image(core, &st->out[i].mirror[k]);
 		}
+		free_image(core, &st->out[i].late_src);
 	}
 	if (st->has_observer && st->observer.ops != NULL && st->observer.ops->destroy != NULL) {
 		st->observer.ops->destroy(st->observer.ctx);
@@ -602,6 +604,78 @@ upload_mirror(struct conv_core *core,
 	return core->cfg.alloc.upload(core->cfg.alloc.ud, src, m);
 }
 
+/*
+ *
+ * ADR-058 late view synthesis: the conversion side.
+ *
+ */
+
+//! A composed weave-rect stream whose views the presenter can synthesize late.
+static bool
+late_eligible(const struct conv_core *core,
+              const struct conv_pipeline *p,
+              bool weave_rect,
+              const struct conv_frame_submit *fr,
+              bool s3_ran)
+{
+	return !core->cfg.late_viewsyn_off && core->cfg.alloc.copy != NULL && p->composed && weave_rect && s3_ran &&
+	       (p->stages & CONV_STAGE_S5_VIEWSYN) != 0 && fr->explicit_count == 0 && p->view_count > 0;
+}
+
+//! Copy the input the provider is about to convert into the slot's late source.
+static bool
+late_retain_input(struct conv_core *core,
+                  struct conv_stream *st,
+                  struct conv_ring_slot *o,
+                  const struct xrt_conv_image *in)
+{
+	if (in->memory_kind == 0 || in->width == 0 || in->height == 0) {
+		return false;
+	}
+	struct xrt_conv_image *d = &o->late_src;
+	if (d->memory_kind == 0 || d->width != in->width || d->height != in->height || d->format != in->format) {
+		free_image(core, d);
+		struct conv_image_request req;
+		memset(&req, 0, sizeof(req));
+		req.width = in->width;
+		req.height = in->height;
+		req.format = in->format;
+		req.array_layers = 1;
+		req.role = 0; // colour
+		req.usage = CONV_IMAGE_USAGE_LATE_SOURCE;
+		req.stream_id = st->id;
+		if (!core->cfg.alloc.alloc(core->cfg.alloc.ud, &req, d) || d->memory_kind == 0) {
+			memset(d, 0, sizeof(*d));
+			return false;
+		}
+	}
+	return core->cfg.alloc.copy(core->cfg.alloc.ud, in, d);
+}
+
+/*!
+ * The depth a late source keeps can be sampled at the presenter: no pending
+ * sync, and GPU memory when a GPU allocator exists (CPU depth is mirrored).
+ */
+static bool
+late_depth_usable(struct conv_core *core,
+                  struct conv_stream *st,
+                  struct conv_ring_slot *o,
+                  const struct xrt_conv_image *provider_depth)
+{
+	if (provider_depth->sync.kind != XRT_CONV_SYNC_NONE) {
+		return false;
+	}
+	const struct xrt_conv_image *d = &o->targets[CONV_RING_DEPTH];
+	if (d->memory_kind != XRT_CONV_MEM_CPU) {
+		return d->memory_kind != 0;
+	}
+	if (core->cfg.alloc.upload == NULL) {
+		return true; // CPU everywhere (tests, a CPU presenter)
+	}
+	o->mirrored[CONV_RING_DEPTH] = upload_mirror(core, st, o, CONV_RING_DEPTH, d, 1u);
+	return o->mirrored[CONV_RING_DEPTH];
+}
+
 static void
 provider_targets(struct conv_ring_slot *o, struct conv_host *host, struct xrt_conv_frame_out *out)
 {
@@ -804,6 +878,7 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 	s.reset = st->reset_pending;
 	s.discont = st->discontinuity_pending;
 	s.eyes_dp = st->opts.eyes_dp;
+	const bool weave_rect = st->opts.weave_rect_source;
 	s.latest_slot = -1;
 	if (st->mb.latest >= 0 && st->mb.latest < (int32_t)U_LIFT_RING_SIZE &&
 	    st->mb.out_state[st->mb.latest] == U_LIFT_OUT_READY) {
@@ -824,6 +899,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 
 	const uint64_t t0 = now_ns();
 	uint64_t placed_eyes_ns = t0; // ADR-058: refined to the S3 eyes' sample time
+	struct conv_policy_view_in late_vin; // ADR-058: S3's inputs, to place the result at later eyes
+	memset(&late_vin, 0, sizeof(late_vin));
+	bool late_vin_valid = false;
 	struct conv_pipeline_frame *pf = (struct conv_pipeline_frame *)calloc(1, sizeof(*pf));
 	xrt_result_t pr = XRT_SUCCESS;
 	ok = ok && host != NULL && pf != NULL;
@@ -883,6 +961,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			vin.eyes = &eyes;
 			vin.now_ns = t0;
 			conv_policy_viewpoints(&vin, &st->vstate, pa, NULL);
+			late_vin = vin;
+			late_vin.eyes = NULL;
+			late_vin_valid = true;
 
 			float obs = 0.0f;
 			const bool obs_valid = st->has_observer && st->observer.ops->value != NULL &&
@@ -951,9 +1032,21 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		provider_targets(o, host, &pf->provider_out);
 		pf->views_target = o->targets[CONV_RING_VIEWS];
 		pf->new_content = true;
+		// ADR-058: a composed weave-rect stream keeps its source and lets the
+		// presenter synthesize the views at each display frame's eyes.
+		pf->defer_s5 = late_eligible(core, &s.pipe, weave_rect, &s.frame, late_vin_valid) &&
+		               late_retain_input(core, st, o, &st->in[in_slot].images[0]);
 		const xrt_result_t r = conv_pipeline_execute(&s.pipe, &core->cfg.viewsyn, &core->cfg.readback, pf);
 		pr = pf->provider_result;
 		ok = r == XRT_SUCCESS;
+		if (ok && pf->late_ready && !late_depth_usable(core, st, o, &pf->result.depth)) {
+			// The depth cannot be sampled later (a sync the presenter does
+			// not wait on, or CPU memory with no GPU mirror): weave now.
+			ok = conv_pipeline_render_deferred(&s.pipe, &core->cfg.viewsyn, pf);
+			if (!ok) {
+				conv_pipeline_frame_release(&core->cfg.readback, pf);
+			}
+		}
 
 		// S7: observers, on the same inference only.
 		if (ok && (s.pipe.stages & CONV_STAGE_S7_OBSERVERS) != 0 && st->has_observer) {
@@ -973,9 +1066,11 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			o->mirrored[CONV_RING_VIEWS] =
 			    (pf->result.written & XRT_CONV_OUT_VIEWS) != 0 &&
 			    upload_mirror(core, st, o, CONV_RING_VIEWS, &pf->result.views, vl);
-			o->mirrored[CONV_RING_DEPTH] =
-			    (pf->result.written & XRT_CONV_OUT_DEPTH) != 0 &&
-			    upload_mirror(core, st, o, CONV_RING_DEPTH, &pf->result.depth, 1u);
+			if (!pf->late_ready) { // a late source mirrored its depth already (late_depth_usable)
+				o->mirrored[CONV_RING_DEPTH] =
+				    (pf->result.written & XRT_CONV_OUT_DEPTH) != 0 &&
+				    upload_mirror(core, st, o, CONV_RING_DEPTH, &pf->result.depth, 1u);
+			}
 		}
 	}
 
@@ -1023,6 +1118,20 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 			o->discontinuity = s.discont;
 			o->provisional = s.pipe.provisional;
 			o->placed_eyes_ns = placed_eyes_ns;
+			o->late_valid = pf->late_ready;
+			if (o->late_valid) {
+				o->late = pf->late;
+				o->late_vin = late_vin;
+				o->late_gen = ++st->late_gen;
+				if (!st->late_logged) {
+					st->late_logged = true;
+					U_LOG_W(
+					    "[conv] stream %llu: late view synthesis on (ADR-058; composed, woven by "
+					    "the "
+					    "presenter at each frame's eyes)",
+					    (unsigned long long)st->id);
+				}
+			}
 			u_lift_mailbox_publish_output(&st->mb, out_slot, &meta, now_ns());
 			st->still.valid = still_key != 0;
 			if (st->still.valid) {
@@ -1696,10 +1805,136 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	out->discontinuity = o->discontinuity || st->discontinuity_unread;
 	st->discontinuity_unread = false;
 	out->provisional = o->provisional;
+	out->late = o->late_valid;
 	out->output_realloc = o->alloc_gen != st->consumer_alloc_gen;
 	st->consumer_alloc_gen = o->alloc_gen;
 	os_mutex_unlock(&core->streams_mtx);
 	return XRT_SUCCESS;
+}
+
+bool
+conv_core_stream_late_prepare(struct conv_core *core,
+                              uint64_t stream_id,
+                              uint32_t ring_slot,
+                              const struct conv_eyes *eyes,
+                              uint64_t now,
+                              struct conv_late_cache *cache,
+                              struct conv_late_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (core == NULL || cache == NULL || ring_slot >= U_LIFT_RING_SIZE) {
+		return false;
+	}
+	struct conv_late_source rec;
+	struct conv_policy_view_in vin;
+	struct conv_policy_view_state vstate;
+	uint64_t eyes_dp = 0;
+	os_mutex_lock(&core->streams_mtx);
+	struct conv_stream *st = find_locked(core, stream_id);
+	const struct conv_ring_slot *o = st != NULL ? &st->out[ring_slot] : NULL;
+	// Only a result the caller pinned (its slot cannot be rewritten meanwhile).
+	const bool ok = o != NULL && st->mb.out_pins[ring_slot] > 0 && o->late_valid && o->late_src.memory_kind != 0;
+	if (ok) {
+		rec = o->late;
+		vin = o->late_vin;
+		vstate = st->vstate; // a copy: placing late never moves the stream's own recentering
+		eyes_dp = st->opts.eyes_dp;
+		out->color = o->late_src;
+		out->depth = o->mirrored[CONV_RING_DEPTH] ? o->mirror[CONV_RING_DEPTH] : o->targets[CONV_RING_DEPTH];
+		out->generation = o->late_gen;
+	}
+	os_mutex_unlock(&core->streams_mtx);
+	if (!ok) {
+		return false;
+	}
+
+	// The eyes of this display frame, through S3's own viewpoint policy.
+	struct conv_eyes e;
+	if (eyes != NULL) {
+		e = *eyes;
+	} else {
+		conv_core_eyes_read(core, eyes_dp, now, &e);
+	}
+	vin.eyes = &e;
+	vin.now_ns = now;
+	struct xrt_conv_params pa;
+	memset(&pa, 0, sizeof(pa));
+	pa.struct_size = (uint32_t)sizeof(pa);
+	pa.view_count = rec.view_count;
+	conv_policy_viewpoints(&vin, &vstate, &pa, NULL);
+	out->eyes_ns = e.valid ? e.timestamp_ns : 0;
+
+	// The recorded S5 request, then u_lift_reproject's late placement of it.
+	out->depth_info = rec.depth_info;
+	struct conv_viewsyn_request *r = &out->req;
+	memset(r, 0, sizeof(*r));
+	r->color = &out->color;
+	r->depth = &out->depth;
+	r->depth_info = &out->depth_info;
+	r->view_count = rec.view_count;
+	memcpy(r->viewpoints_m, rec.viewpoints_m, sizeof(r->viewpoints_m));
+	r->rect_width_m = rec.rect_width_m;
+	r->rect_height_m = rec.rect_height_m;
+	r->range_near = rec.range_near;
+	r->range_far = rec.range_far;
+	r->convergence = rec.convergence;
+	r->budget = rec.budget;
+	r->rear_cap_m = rec.rear_cap_m;
+	r->layout = XRT_CONV_VIEWS_ROW; // the consumer's views: N side by side
+	r->target = NULL;
+
+	struct u_lift_reproject_policy pol;
+	u_lift_reproject_policy_defaults(&pol);
+	(void)u_lift_reproject_policy_set_max_m(&pol, core->cfg.reproject_max_m);
+	struct u_lift_reproject_source src;
+	memset(&src, 0, sizeof(src));
+	src.geometry = U_LIFT_REPROJECT_COMPOSED;
+	conv_viewsyn_request_to_params(r, &src.params);
+	struct u_conv_viewsyn_params late;
+	struct u_lift_reproject_decision dec;
+	const uint32_t n = rec.view_count;
+	enum u_lift_reproject_verdict v = U_LIFT_REPROJECT_HOLD;
+	if (pa.viewpoint_count == n) {
+		v = u_lift_reproject_late_params(&pol, &src, (const float(*)[3])pa.viewpoints_xyz, n, &late, &dec);
+	}
+	if (v != U_LIFT_REPROJECT_HOLD) {
+		memcpy(r->viewpoints_m, late.viewpoints_m, sizeof(float) * 3 * n);
+		r->budget = late.budget;
+		out->ease = dec.ease;
+		out->delta_m = dec.delta.max_m;
+	} else {
+		out->ease = 1.0f; // as converted
+	}
+	out->verdict = (uint32_t)v;
+
+	// Capped extent: the per-view long edge (the rect input cap is 1920).
+	const uint32_t cap =
+	    core->cfg.late_viewsyn_max_edge != 0 ? core->cfg.late_viewsyn_max_edge : CONV_LATE_MAX_EDGE_DEFAULT;
+	u_conv_viewsyn_upsample_size(out->color.width, out->color.height, cap, &out->view_w, &out->view_h);
+
+	// The cache rule: new content, or an eye pair that moved in a way the
+	// synthesis depends on (spread / orientation / distance / easing).
+	const bool fresh = !cache->valid || cache->generation != out->generation || cache->view_count != n;
+	const bool rerun =
+	    fresh || u_lift_reproject_needs_rerun((const float(*)[3])cache->viewpoints_m,
+	                                          (const float(*)[3])r->viewpoints_m, n, cache->ease, out->ease);
+	r->new_content = !cache->valid || cache->generation != out->generation;
+	out->rerun = rerun;
+	if (rerun) {
+		cache->valid = true;
+		cache->generation = out->generation;
+		cache->view_count = n;
+		memcpy(cache->viewpoints_m, r->viewpoints_m, sizeof(cache->viewpoints_m));
+		cache->ease = out->ease;
+	}
+
+	os_mutex_lock(&core->streams_mtx);
+	st = find_locked(core, stream_id);
+	if (st != NULL) {
+		st->late_placed_ns = out->eyes_ns != 0 ? out->eyes_ns : now;
+	}
+	os_mutex_unlock(&core->streams_mtx);
+	return true;
 }
 
 void
@@ -1761,8 +1996,12 @@ conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct co
 	out->placement_age_ns = 0;
 	if (st->mb.latest >= 0 && st->mb.latest < U_LIFT_RING_SIZE) {
 		struct u_lift_reproject_ages ages;
-		u_lift_reproject_compute_ages(now_ns(), st->mb.out_meta[st->mb.latest].submit_ns,
-		                              st->out[st->mb.latest].placed_eyes_ns, &ages);
+		const struct conv_ring_slot *lo = &st->out[st->mb.latest];
+		uint64_t placed = lo->placed_eyes_ns;
+		if (lo->late_valid && st->late_placed_ns > placed) {
+			placed = st->late_placed_ns; // ADR-058: placed by the presenter since
+		}
+		u_lift_reproject_compute_ages(now_ns(), st->mb.out_meta[st->mb.latest].submit_ns, placed, &ages);
 		out->content_age_ns = ages.content_age_ns;
 		out->placement_age_ns = ages.placement_age_ns;
 	}
