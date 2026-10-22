@@ -47,6 +47,10 @@ cli_print_help(int argc, const char **argv)
 	P("                      'input use <id> [--machine]', 'input reset', 'input options <id> [--json]',\n");
 	P("                      'input set <id> <KEY> <value> [--machine]', 'input unset <id> <KEY>',\n");
 	P("                      'input haptic-test [seconds]'.\n");
+	P("  tracking <...>    - Viewer-tracking providers (ADR-054 N6; verbs mirror 'input').\n");
+	P("                      'tracking list [--json]', 'tracking enable|disable <id> [--machine]',\n");
+	P("                      'tracking use|prefer <id> [--machine]', 'tracking reset', 'tracking options <id>',\n");
+	P("                      'tracking set <id> <KEY> <value> [--machine]', 'tracking unset <id> <KEY>'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
 	P("                      'runtime status'   full loader precedence + conflicts,\n");
 	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");
@@ -123,6 +127,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "input") == 0) {
 		return cli_cmd_input(argc, argv);
+	}
+	if (strcmp(argv[1], "tracking") == 0) {
+		return cli_cmd_tracking(argc, argv);
 	}
 	if (strcmp(argv[1], "runtime") == 0) {
 		return cli_cmd_runtime(argc, argv);

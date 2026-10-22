@@ -1762,7 +1762,89 @@ struct xrt_plugin_iface
 	uint32_t (*get_claimed_cameras)(struct xrt_plugin_instance *inst,
 	                                uint32_t capacity,
 	                                char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]);
+
+	/*!
+	 * The display's VIEWER POLICY (ADR-054 §4.1 / N6 Part 2): may the views on
+	 * this display follow a viewer measured by someone else — a
+	 * viewer-tracking provider (`xrt_tracking_plugin.h`) — when the display
+	 * does not track the viewer itself? One of @ref xrt_plugin_viewer_policy:
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_OWN: the display tracks (or decides)
+	 *     the viewer itself; a provider is never used on it.
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK: when it does not track
+	 *     (`supported_eye_tracking_modes == 0`), the trunk may drive its views
+	 *     from the best enabled provider, and composes the advertised
+	 *     `XR_DXR_display_info` tracking capability accordingly.
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_FIXED: never viewer-coupled (an
+	 *     N-view panel whose optics supply the parallax); views stay nominal
+	 *     whatever providers are installed.
+	 * A display that DOES track always wins on its own screen, whatever this
+	 * slot says: the trunk never splices a second eye source into a screen
+	 * whose weave uses tracked eyes.
+	 *
+	 * @p display names the monitor (a descriptor the runtime built, as in
+	 * @ref get_display_info_for_monitor), or NULL for the plug-in's active
+	 * panel. Pure and cheap, any thread, @p inst may be NULL.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * reads as @ref XRT_PLUGIN_VIEWER_POLICY_FIXED, so no installed display
+	 * changes behaviour. An unknown return value reads as FIXED too. Appended
+	 * per ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after @ref get_claimed_cameras.
+	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY.
+	 */
+	uint32_t (*get_viewer_policy)(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display);
 };
+
+/*!
+ * Values of @ref xrt_plugin_iface::get_viewer_policy. Stable (they cross the
+ * plug-in ABI); 0 is deliberately not a value, so a zero-filled answer is
+ * "unknown" and reads as FIXED.
+ */
+enum xrt_plugin_viewer_policy
+{
+	XRT_PLUGIN_VIEWER_POLICY_OWN = 1,         //!< the display owns the viewer (it tracks)
+	XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK = 2, //!< views may follow a viewer-tracking provider's viewer
+	XRT_PLUGIN_VIEWER_POLICY_FIXED = 3,       //!< never viewer-coupled
+};
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_viewer_policy (ADR-054 N6 Part 2), so a plug-in built
+ * against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_viewer_policy (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_viewer_policy(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_viewer_policy) + sizeof(iface->get_viewer_policy) &&
+	       iface->get_viewer_policy != NULL;
+}
+
+/*!
+ * The viewer policy of @p iface for @p display (NULL = its active panel), with
+ * the absent-slot / unknown-value rule applied: FIXED unless the plug-in says
+ * OWN or EXTERNAL_OK.
+ */
+static inline uint32_t
+xrt_plugin_iface_viewer_policy(const struct xrt_plugin_iface *iface,
+                               struct xrt_plugin_instance *inst,
+                               const struct xrt_display_descriptor *display)
+{
+	if (!xrt_plugin_iface_has_viewer_policy(iface)) {
+		return XRT_PLUGIN_VIEWER_POLICY_FIXED;
+	}
+	const uint32_t p = iface->get_viewer_policy(inst, display);
+	return (p == XRT_PLUGIN_VIEWER_POLICY_OWN || p == XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK)
+	           ? p
+	           : (uint32_t)XRT_PLUGIN_VIEWER_POLICY_FIXED;
+}
 
 /*!
  * Defined when @ref xrt_plugin_iface carries @ref

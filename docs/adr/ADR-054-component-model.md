@@ -166,6 +166,20 @@ eyes into a display processor; a DP that weaves from eyes tracks them itself.
 > [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 > Part 2 (the tracking-provider class, `sim_tracking`) is still open (#2144).
 
+> **Implemented — N6 Part 2 (#2144).** The fourth class ships: contract `xrt/xrt_tracking_plugin.h`
+> (ABI 1; session-free providers on their own thread push capture-stamped display-space samples
+> into a sink the trunk rings and samples at the target time; an optional camera-space block for
+> the later camera-pose calibration), discovery `TrackingProviders\<id>` /
+> `NNN-<id>-tracking-provider.json` as a row on the shared loader (provenance gate, `Enabled`
+> overlay, `PreferredPlugin`), `displayxr-cli tracking list|enable|disable|use|prefer|reset|options|set|unset`,
+> the `sim_tracking` scripted reference provider, the DP viewer-policy slot
+> (`get_viewer_policy`: OWN / EXTERNAL_OK / FIXED; absent = FIXED), the trunk arbitration (DP eyes
+> when it tracks → best provider when EXTERNAL_OK → nominal), the composed `XR_DXR_display_info`
+> advertisement, and the per-screen viewer source in `status --json`. Hosted in-process, primary
+> screen only; per-screen routing via the segment DPs, service hosting, out-of-process hosting
+> and the camera-consumer path are follow-ups. Contract:
+> [tracking-provider-discovery.md](../specs/runtime/tracking-provider-discovery.md).
+
 **4.2 Display profile slot / reference weaver — NO, ever.** Pitch, slant and phase describe
 one lens family. Parallax barriers, directional backlights, glasses-based and volumetric
 displays have none of them, and a "reference weaver" in the trunk would be a lenticular
@@ -254,7 +268,7 @@ free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 ite
 | N4 | Per-class conformance in `displayxr-cli selftest` (sequence above) + the CI vendor-identifier guard widened from the runtime DLL's link line to every class loader | win |
 | N4b | Provenance gate at load: signed OR allowlisted; loud-logged dev override; no override on elevated hosts | win |
 | N5 | Licensing state for DP and input — when a paid plug-in exists | — |
-| N6 | Eye contract prep (target-time query, pair-relation history), then the tracking-provider class + `sim_tracking` | — |
+| N6 | Eye contract prep (target-time query, pair-relation history) — **done #2166**; then the tracking-provider class + `sim_tracking` — **Part 2 landed (#2144)**: in-process, primary screen; next: per-screen routing through segment DPs, service + out-of-process hosting, camera-consumer path, `sim_tracking` webcam mode, calibration | — |
 | N7 | `EmulatedControllers` gate + CLI/dashboard surface | — |
 | N8 | Pose-feed design note (seqlock page, consumer handshake, always-on tracking mode) | — |
 | N10 | Decode task family in the conversion contract; browser as first consumer | — |

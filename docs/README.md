@@ -162,7 +162,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-051](adr/ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
 - [ADR-052](adr/ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
 - [ADR-053](adr/ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
-- [ADR-054](adr/ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
+- [ADR-054](adr/ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs (the fourth class, viewer-tracking providers: [discovery contract](specs/runtime/tracking-provider-discovery.md))
 - [ADR-055](adr/ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
 - [ADR-056](adr/ADR-056-desktop-control-runs-in-the-app.md) — Desktop control is a first-class capability that runs in the app — the OS's consent belongs to the app, never to DisplayXR
 - [ADR-057](adr/ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block

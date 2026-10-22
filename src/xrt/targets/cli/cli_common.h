@@ -33,6 +33,10 @@ cli_cmd_perf(int argc, const char **argv);
 int
 cli_cmd_input(int argc, const char **argv);
 
+//! `tracking` - viewer-tracking providers (ADR-054 N6 Part 2).
+int
+cli_cmd_tracking(int argc, const char **argv);
+
 int
 cli_cmd_runtime(int argc, const char **argv);
 

@@ -354,6 +354,15 @@ struct xrt_status_eye_tracking
 	uint32_t default_mode;          //!< 0 MANAGED, 1 MANUAL (meaningful iff @ref supported).
 	enum xrt_status_tracking state; //!< Live state (phase 2; NO_DP headless).
 	uint32_t not_tracking_ms;       //!< How long @ref state has been NOT_TRACKING (phase 2; feeds TRACKER_DOWN).
+	/*!
+	 * ADR-054 N6 Part 2: whose eyes the views on this screen follow —
+	 * "dp" / "provider:<id>" / "nominal" ("" = not evaluated in the process
+	 * that built the snapshot).
+	 */
+	char viewer_source[XRT_STATUS_NAME_MAX];
+	//! Why, incl. why a provider is in standby ("display tracks the viewer on this screen", "display is FIXED", "no
+	//! source").
+	char viewer_reason[128];
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).

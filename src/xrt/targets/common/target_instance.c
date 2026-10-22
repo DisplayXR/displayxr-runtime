@@ -45,6 +45,7 @@
 #include "target_plugin_loader.h"
 #include "target_screens.h"
 #include "target_display_hotplug.h"
+#include "target_viewer_tracking.h"
 
 #include "target_instance_parts.h"
 
@@ -411,6 +412,14 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 			    any_tracked ? "at least one" : "no");
 		}
 	}
+
+	// ADR-054 N6 Part 2: whose eyes the views follow on this screen, and the
+	// composed XR_DXR_display_info advertisement that follows from it (a
+	// display without its own tracker, policy EXTERNAL_OK, and a viewer-
+	// tracking provider with a usable source → MANAGED|MANUAL + HAS_TRACKING
+	// on the 3D modes). Runs AFTER the #441 check above: that check is about
+	// the plug-in's own honesty, the composition is the trunk's.
+	target_viewer_tracking_apply(info, head, plugin, pdi);
 
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the
@@ -836,6 +845,8 @@ t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
 {
 	// Stop the sweep before the info it rewrites goes away.
 	target_display_hotplug_stop(&g_hotplug);
+	// ADR-054 N6 Part 2: stop the viewer-tracking provider (it restarts on demand for the next system).
+	target_viewer_tracking_shutdown();
 	if (g_display_info_mutex_initialized) {
 		os_mutex_lock(&g_display_info_mutex);
 	}
@@ -1282,6 +1293,10 @@ t_instance_create_system(struct xrt_instance *xinst,
 	}
 
 out:
+	// ADR-054 N6 Part 2: the viewer source for look-around eyes (decided when
+	// the display info is applied below; DP eyes until then).
+	xsysd->viewer_tracking = target_viewer_tracking_get_iface();
+
 	*out_xsys = &usys->base;
 	*out_xsysd = xsysd;
 	*out_xso = xso;

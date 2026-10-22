@@ -746,7 +746,8 @@ TEST_CASE("status: JSON has schema first and the §3 key set", "[status][json]")
 	CHECK(keys(cJSON_GetObjectItem(lay, "nominal_viewer_m")) == V{"x", "y", "z"});
 	CHECK(str(lay, "source") == "plugin");
 	const cJSON *et = cJSON_GetObjectItem(sc, "eye_tracking");
-	CHECK(keys(et) == V{"supported", "default", "state"});
+	// ADR-054 N6 Part 2: the viewer source (null when not evaluated in the builder's process).
+	CHECK(keys(et) == V{"supported", "default", "state", "viewer_source", "viewer_reason"});
 	CHECK(str_array(cJSON_GetObjectItem(et, "supported")) == V{"MANAGED"});
 	CHECK(str(et, "default") == "MANAGED");
 	CHECK(str(et, "state") == "TRACKING");

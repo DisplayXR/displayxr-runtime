@@ -75,7 +75,8 @@ extern "C" {
  * Which class a POSIX discovery-root file belongs to (ADR-053: "the suffix is
  * the router"). All classes share one directory, so every loader classifies
  * with this one function: `NNN-<id>-input-provider.json` is INPUT,
- * `NNN-<id>-conversion-provider.json` is CONVERSION, a `<pack>.models.json`
+ * `NNN-<id>-conversion-provider.json` is CONVERSION,
+ * `NNN-<id>-tracking-provider.json` is TRACKING (ADR-054 N6), a `<pack>.models.json`
  * model pack (ADR-053 P4, shipped beside its provider) is NONE, any other
  * `*.json` is DISPLAY, anything else is NONE. Pure, compiled on every
  * platform so it is unit-testable everywhere.
@@ -86,6 +87,7 @@ enum target_plugin_manifest_kind
 	TARGET_PLUGIN_MANIFEST_DISPLAY,
 	TARGET_PLUGIN_MANIFEST_INPUT,
 	TARGET_PLUGIN_MANIFEST_CONVERSION,
+	TARGET_PLUGIN_MANIFEST_TRACKING, //!< viewer-tracking providers (ADR-054 §4.1 / N6)
 };
 
 enum target_plugin_manifest_kind
@@ -104,10 +106,11 @@ enum target_component_class_id
 	TARGET_COMPONENT_CLASS_DISPLAY = 1,    //!< display processors (ADR-019/020)
 	TARGET_COMPONENT_CLASS_INPUT = 2,      //!< input providers (ADR-034)
 	TARGET_COMPONENT_CLASS_CONVERSION = 3, //!< conversion providers (ADR-053)
-	TARGET_COMPONENT_CLASS_COUNT = 4,      //!< one past the last valid id
+	TARGET_COMPONENT_CLASS_TRACKING = 4,   //!< viewer-tracking providers (ADR-054 §4.1 / N6)
+	TARGET_COMPONENT_CLASS_COUNT = 5,      //!< one past the last valid id
 };
 
-//! "display" / "input" / "conversion" / "none"; never NULL.
+//! "display" / "input" / "conversion" / "tracking" / "none"; never NULL.
 const char *
 target_component_class_id_str(uint32_t class_id);
 

@@ -210,6 +210,29 @@ else
   echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
 fi
 
+# Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer. The
+# `-tracking-provider.json` suffix routes it to the tracking loader. Safe to
+# stage: sim-tracking's probe() declines unless its ENABLE setting is on
+# (`displayxr-cli tracking set sim-tracking ENABLE 1`).
+SIMTRACK_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimTracking.dylib" -type f | head -1)
+if [ -n "$SIMTRACK_PLUGIN" ] && [ -f "$SIMTRACK_PLUGIN" ]; then
+  cp "$SIMTRACK_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/200-sim-tracking-tracking-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-tracking",
+        "display_name": "DisplayXR Sim Tracking",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+        "probe_order":  200
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimTracking.dylib" 2>/dev/null || true
+fi
+
 # Gamepad input provider (ADR-034 / ADR-054): GameController.framework on
 # macOS. Presence-gated — staging it changes nothing until a pad is paired,
 # then the pad takes the gamepad role, drives the rig and (by default) holds

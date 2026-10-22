@@ -583,6 +583,66 @@ else()
 		)
 endif()
 
+####
+# DisplayXR-SimTracking viewer-tracking provider plug-in (ADR-054 §4.1, N6
+# Part 2). The in-tree reference for the fourth class: a scripted viewer with
+# no camera (SCRIPT=sweep|offset), opt-in through its ENABLE setting. Same
+# build model as sim-input: XRT_USING_RUNTIME_DLL + the runtime import lib on
+# Windows/macOS, static aux + a single-symbol version script on ELF.
+# sim_tracking_script.c is pure and also compiled straight into the unit tests.
+if(XRT_FEATURE_OPENXR AND NOT ANDROID)
+add_library(drv_sim_tracking_plugin SHARED
+	sim_tracking/sim_tracking_plugin.c
+	sim_tracking/sim_tracking_script.c
+	sim_tracking/sim_tracking_script.h
+	)
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_sim_tracking_plugin PRIVATE xrt-interfaces aux_util aux_os drv_includes m)
+else()
+	target_compile_definitions(drv_sim_tracking_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_tracking_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_sim_tracking_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_sim_tracking_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+set_target_properties(drv_sim_tracking_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimTracking"
+	PREFIX ""
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+if(APPLE)
+	target_link_options(drv_sim_tracking_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtTrackingPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_tracking_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tracking_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_sim_tracking_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_tracking_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — DisplayXR-SimTracking block
+
 # Keep the dev plug-in staging dir fresh on every build (desktop Linux).
 #
 # Linux plug-in discovery is JSON-manifest driven, and scripts/build_linux.sh
@@ -598,7 +658,7 @@ endif()
 # copy_if_different keeps it a no-op when nothing changed. The manifests stay
 # the script's job — they carry absolute paths and never go stale.
 if(XRT_HAVE_LINUX AND NOT ANDROID)
-	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin)
+	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin drv_sim_tracking_plugin)
 		add_custom_command(
 			TARGET ${_dxr_staged_plugin}
 			POST_BUILD

@@ -40,6 +40,8 @@
 #include "target_plugin_loader.h"
 #include "target_screens.h"
 #include "target_input_plugin_loader.h"
+#include "target_tracking_plugin_loader.h"
+#include "target_viewer_tracking.h"
 #include "target_builder_input_provider.h"
 #include "target_input_arbiter.h"
 #include "target_conv_status.h" // ADR-053 selftest `conversion_providers` (#2006)
@@ -1127,6 +1129,49 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
  * profile flips the verdict — applied at the end of cli_query_fill so
  * display failures keep their more fundamental result codes.
  */
+/*!
+ * ADR-054 N6 Part 2: the tracking class's view — what is registered and
+ * resident, and the primary screen's viewer source as the trunk arbitrates it
+ * (the DP's policy slot, whether it tracks, the best resident provider).
+ * Headless: the provider is loaded and probed, never started.
+ */
+static void
+probe_tracking_providers(struct cli_query_result *r,
+                         const struct xrt_plugin_iface *iface,
+                         uint32_t dp_supported,
+                         uint32_t dp_default)
+{
+	struct target_viewer_decision d;
+	target_viewer_tracking_evaluate(iface, target_plugin_get_active_instance(), dp_supported, &d);
+	target_tracking_plugin_get_scan_result(&r->tracking_registered, &r->tracking_enabled,
+	                                       &r->tracking_scan_declined, &r->tracking_scan_failed,
+	                                       &r->tracking_scan_untrusted);
+	// A scan that did not run (the display tracks / is FIXED) still lists the rows.
+	if (r->tracking_registered == 0) {
+		struct target_tracking_plugin_desc descs[16];
+		const int n = target_tracking_plugin_enumerate(descs, 16);
+		r->tracking_registered = n;
+		r->tracking_enabled = 0;
+		for (int i = 0; i < n; i++) {
+			r->tracking_enabled += descs[i].enabled ? 1 : 0;
+		}
+	}
+	r->tracking_ranked_count = 0;
+	const int resident = target_tracking_plugin_get_count();
+	for (int i = 0; i < resident && r->tracking_ranked_count < 16; i++) {
+		snprintf(r->tracking_ranked[r->tracking_ranked_count++], sizeof(r->tracking_ranked[0]), "%s",
+		         target_tracking_plugin_get_row_id(i));
+	}
+	target_viewer_source_label(&d, r->tracking_viewer_source, sizeof(r->tracking_viewer_source));
+	snprintf(r->tracking_viewer_reason, sizeof(r->tracking_viewer_reason), "%s", d.reason);
+	snprintf(r->tracking_viewer_policy, sizeof(r->tracking_viewer_policy), "%s",
+	         target_viewer_policy_str(d.dp_policy));
+	uint32_t def = 0;
+	bool mark = false;
+	target_viewer_compose_advertisement(dp_supported, dp_default, &d, &r->tracking_composed_modes, &def, &mark);
+	r->tracking_evaluated = true;
+}
+
 static void
 probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 {
@@ -2064,6 +2109,10 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	}
 	r->display_info = info;
 	r->display_info_ok = true;
+
+	// ADR-054 N6 Part 2: the viewer-tracking class, as data (never a verdict:
+	// absence of a provider, or one in standby, is normal).
+	probe_tracking_providers(r, iface, info.supported_eye_tracking_modes, info.default_eye_tracking_mode);
 
 	// #1301 — resolve the full monitor rect apps are told to place their window
 	// in. Same resolver, same inputs as the runtime (origin, native pixel size
@@ -3672,6 +3721,26 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+	}
+	// ADR-054 N6 Part 2: the viewer-tracking class, as data (the N4 conformance
+	// cells read these fields; a provider in standby is not a fault).
+	{
+		cJSON *tp = cJSON_AddObjectToObject(root, "tracking_providers");
+		cJSON_AddNumberToObject(tp, "registered", (double)r->tracking_registered);
+		cJSON_AddNumberToObject(tp, "enabled", (double)r->tracking_enabled);
+		cJSON_AddNumberToObject(tp, "scan_declined", (double)r->tracking_scan_declined);
+		cJSON_AddNumberToObject(tp, "scan_failed", (double)r->tracking_scan_failed);
+		cJSON_AddNumberToObject(tp, "scan_untrusted", (double)r->tracking_scan_untrusted);
+		cJSON *rk = cJSON_AddArrayToObject(tp, "ranked");
+		for (int i = 0; i < r->tracking_ranked_count; i++) {
+			cJSON_AddItemToArray(rk, cJSON_CreateString(r->tracking_ranked[i]));
+		}
+		cJSON_AddStringToObject(tp, "active_id", r->tracking_ranked_count > 0 ? r->tracking_ranked[0] : "");
+		cJSON_AddBoolToObject(tp, "evaluated", r->tracking_evaluated);
+		cJSON_AddStringToObject(tp, "viewer_source", r->tracking_viewer_source);
+		cJSON_AddStringToObject(tp, "viewer_reason", r->tracking_viewer_reason);
+		cJSON_AddStringToObject(tp, "display_viewer_policy", r->tracking_viewer_policy);
+		cJSON_AddNumberToObject(tp, "composed_eye_tracking_modes", (double)r->tracking_composed_modes);
 	}
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
