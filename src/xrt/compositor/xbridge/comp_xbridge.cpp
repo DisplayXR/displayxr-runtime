@@ -937,7 +937,9 @@ xb_format_bpp(uint32_t fmt)
 	switch ((DXGI_FORMAT)fmt) {
 	case DXGI_FORMAT_R8_UNORM: return 1;
 	case DXGI_FORMAT_R8G8B8A8_UNORM:
-	case DXGI_FORMAT_B8G8R8A8_UNORM: return 4;
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
 	default: return 4;
 	}
 }
@@ -2115,11 +2117,20 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 	 * state one has no business sizing a heap.
 	 */
 	xb->fmt = (info->atlas_format != 0) ? (DXGI_FORMAT)info->atlas_format : XB_FORMAT_DEFAULT;
-	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+	/*
+	 * #2273 — the deep atlas formats (DXR_ATLAS_FORMAT) are carried too: every
+	 * ring is built in the caller's format and every copy is same-format, so
+	 * depth costs only bandwidth (`R16G16B16A16_FLOAT` is 8 bytes a pixel, which
+	 * the bandwidth gate sees through @ref xb_format_bpp). A GPU whose
+	 * cross-adapter ROW_MAJOR heap refuses the format fails the slot allocation
+	 * below, so Stage A fails and the session weaves on the render device.
+	 */
+	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM &&
+	    xb->fmt != DXGI_FORMAT_R10G10B10A2_UNORM && xb->fmt != DXGI_FORMAT_R16G16B16A16_FLOAT) {
 		U_LOG_E(
 		    "%s: unsupported atlas format %s (0x%x) — the bridge builds its ingress, cross-adapter and "
-		    "egress rings in the CALLER's format and only the 8-bit BGRA/RGBA UNORM pair is supported "
-		    "(#1178)",
+		    "egress rings in the CALLER's format and supports the 8-bit BGRA/RGBA UNORM pair plus "
+		    "R10G10B10A2_UNORM and R16G16B16A16_FLOAT (#1178, #2273)",
 		    XB_TAG(xb), xb_fmt_name(xb->fmt), (unsigned)xb->fmt);
 		*out_reason = "unsupported atlas format";
 		goto fail;
@@ -3791,6 +3802,14 @@ xb_content_probe(struct comp_xbridge *xb, int32_t slot)
 		return;
 	}
 	if (slot < 0 || slot >= XB_EGRESS_RING || xb->eg_tex[slot] == nullptr || xb->eg_seq[slot] == 0) {
+		return;
+	}
+	// #2273: the verdict below reads 8-bit RGBA bytes. A deep chain (10-bit,
+	// 16F) would be scored as garbage, so the probe latches off instead.
+	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+		xb->probe_on = false;
+		U_LOG_W("%s: content probe reads 8-bit RGBA only; the chain is %s - probe off (#2273)", XB_TAG(xb),
+		        xb_fmt_name(xb->fmt));
 		return;
 	}
 	// Only a slot whose consumer copy is CPU-verified complete: reading one the

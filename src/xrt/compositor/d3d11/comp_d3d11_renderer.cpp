@@ -502,6 +502,12 @@ renderer_atlas_format(void)
 	return (DXGI_FORMAT)cached;
 }
 
+uint32_t
+comp_d3d11_renderer_requested_atlas_format(void)
+{
+	return (uint32_t)renderer_atlas_format();
+}
+
 static xrt_result_t
 create_resources(struct comp_d3d11_renderer *r)
 {
