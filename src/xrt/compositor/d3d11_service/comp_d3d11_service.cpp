@@ -23463,21 +23463,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						        &disp_left, &disp_top) &&
 						    disp_px_w > 0 && disp_px_h > 0) {
 
-							// Compute base view dims from display pixel info using tile layout
-							uint32_t base_vw = disp_px_w / sys->tile_columns;
-							uint32_t base_vh = disp_px_h / sys->tile_rows;
-
-							// Scale view dims by window/display ratio
-							// This preserves aspect ratio during resize
-							float ratio = fminf(
-							    (float)client_width / (float)disp_px_w,
-							    (float)client_height / (float)disp_px_h);
-							if (ratio > 1.0f) {
-								ratio = 1.0f;  // Don't upscale beyond recommended
-							}
-
-							uint32_t new_view_w = (uint32_t)((float)base_vw * ratio);
-							uint32_t new_view_h = (uint32_t)((float)base_vh * ratio);
+							// Base view dims from display pixel info using tile layout,
+							// scaled by the window/display ratio (preserves aspect ratio
+							// during resize; never upscales beyond recommended). Never 0:
+							// a window under ~2 px used to scale to a 0x0 atlas, whose
+							// create fails and leaves this client with no atlas at all.
+							uint32_t new_view_w = 1;
+							uint32_t new_view_h = 1;
+							const float ratio = u_tiling_compute_window_scaled_view(
+							    disp_px_w, disp_px_h, sys->tile_columns, sys->tile_rows,
+							    client_width, client_height, &new_view_w, &new_view_h);
 							uint32_t new_atlas_w = sys->tile_columns * new_view_w;
 							uint32_t new_atlas_h = sys->tile_rows * new_view_h;
 

@@ -383,6 +383,148 @@ u_tiling_compute_canvas_view(const struct xrt_rendering_mode *mode,
 		*out_view_h = canvas_h;
 }
 
+/*!
+ * Where a compositor's create-time size came from — see
+ * u_tiling_pick_window_size().
+ */
+enum u_tiling_window_size_source
+{
+	//! The bound window's client rect: the normal case.
+	U_TILING_WINDOW_SIZE_CLIENT = 0,
+	//! The window is minimized. A minimized window reports an EMPTY client
+	//! rect, so its client size says nothing about the size it will have.
+	U_TILING_WINDOW_SIZE_ICONIC,
+	//! The client rect is empty (0 wide or 0 tall) but the window is not
+	//! minimized — typically a window that has not been sized yet.
+	U_TILING_WINDOW_SIZE_EMPTY,
+};
+
+//! Short log-friendly name of a u_tiling_window_size_source.
+static inline const char *
+u_tiling_window_size_source_str(enum u_tiling_window_size_source source)
+{
+	switch (source) {
+	case U_TILING_WINDOW_SIZE_CLIENT: return "client rect";
+	case U_TILING_WINDOW_SIZE_ICONIC: return "window is minimized";
+	case U_TILING_WINDOW_SIZE_EMPTY: return "client rect is empty";
+	}
+	return "unknown";
+}
+
+/*!
+ * Pick the size a compositor is CREATED at from its bound window.
+ *
+ * The create path used to take the window's client rect unconditionally. A
+ * minimized window (and one that has not been sized yet) reports an empty
+ * client rect, so the swapchain target and the atlas were created 0x0 and the
+ * atlas creation failed (E_INVALIDARG) — which fails xrCreateSession, so the
+ * app never gets a session at all. There is no size to follow yet in that
+ * case, so the caller's pre-window default (the display's pixel size) is used
+ * instead, and the per-frame resize path adopts the window's real size on the
+ * first frame it has one (it already ignores empty client rects).
+ *
+ * @param client_w    Client rect width (right - left); may be <= 0.
+ * @param client_h    Client rect height (bottom - top); may be <= 0.
+ * @param iconic      Whether the window is minimized (IsIconic).
+ * @param fallback_w  The pre-window default width.
+ * @param fallback_h  The pre-window default height.
+ * @param[out] out_w  The width to create at.
+ * @param[out] out_h  The height to create at.
+ * @return Which of the two was used, and why.
+ */
+static inline enum u_tiling_window_size_source
+u_tiling_pick_window_size(int32_t client_w,
+                          int32_t client_h,
+                          bool iconic,
+                          uint32_t fallback_w,
+                          uint32_t fallback_h,
+                          uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	enum u_tiling_window_size_source source = U_TILING_WINDOW_SIZE_CLIENT;
+	if (iconic) {
+		source = U_TILING_WINDOW_SIZE_ICONIC;
+	} else if (client_w <= 0 || client_h <= 0) {
+		source = U_TILING_WINDOW_SIZE_EMPTY;
+	}
+
+	if (source == U_TILING_WINDOW_SIZE_CLIENT) {
+		*out_w = (uint32_t)client_w;
+		*out_h = (uint32_t)client_h;
+	} else {
+		*out_w = fallback_w;
+		*out_h = fallback_h;
+	}
+	return source;
+}
+
+/*!
+ * The per-view size an atlas is CREATED at for a window.
+ *
+ * With display pixel info (@p disp_px_w and @p disp_px_h both > 0): the
+ * display's per-tile size (display / tiles), scaled by the window/display
+ * ratio min(win_w / disp_px_w, win_h / disp_px_h) clamped to 1 — the rule the
+ * D3D11, D3D12 and Vulkan create paths and the D3D11 service's resize path
+ * share. Without it: the window split into tiles.
+ *
+ * No dimension is ever 0. A window under ~2 px on either axis used to scale to
+ * a 0-sized view, and a 0-sized atlas fails to create (E_INVALIDARG on D3D) —
+ * at create time that fails the whole session. Such a view is clamped to 1;
+ * the per-frame resize path then grows it (with its own 64 px floor) once the
+ * window is real. Every non-degenerate input computes exactly what the inline
+ * copies this replaces computed.
+ *
+ * @param disp_px_w   Display width in pixels, or 0 when unknown.
+ * @param disp_px_h   Display height in pixels, or 0 when unknown.
+ * @param tile_cols   Tile columns of the atlas (0 is treated as 1).
+ * @param tile_rows   Tile rows of the atlas (0 is treated as 1).
+ * @param win_w       Window (canvas) width in pixels.
+ * @param win_h       Window (canvas) height in pixels.
+ * @param[out] out_view_w  Per-view width, >= 1.
+ * @param[out] out_view_h  Per-view height, >= 1.
+ * @return The window/display ratio applied; 1 when it was not (no display
+ *         info, or an empty window — nothing to scale by).
+ */
+static inline float
+u_tiling_compute_window_scaled_view(uint32_t disp_px_w,
+                                    uint32_t disp_px_h,
+                                    uint32_t tile_cols,
+                                    uint32_t tile_rows,
+                                    uint32_t win_w,
+                                    uint32_t win_h,
+                                    uint32_t *out_view_w,
+                                    uint32_t *out_view_h)
+{
+	if (tile_cols == 0)
+		tile_cols = 1;
+	if (tile_rows == 0)
+		tile_rows = 1;
+
+	float ratio = 1.0f;
+	uint32_t vw = 0;
+	uint32_t vh = 0;
+	if (disp_px_w > 0 && disp_px_h > 0) {
+		const uint32_t base_vw = disp_px_w / tile_cols;
+		const uint32_t base_vh = disp_px_h / tile_rows;
+		if (win_w > 0 && win_h > 0) {
+			const float rw = (float)win_w / (float)disp_px_w;
+			const float rh = (float)win_h / (float)disp_px_h;
+			ratio = rw < rh ? rw : rh;
+			if (ratio > 1.0f)
+				ratio = 1.0f;
+		}
+		vw = (uint32_t)((float)base_vw * ratio);
+		vh = (uint32_t)((float)base_vh * ratio);
+	} else {
+		vw = win_w / tile_cols;
+		vh = win_h / tile_rows;
+	}
+
+	*out_view_w = vw > 0 ? vw : 1;
+	*out_view_h = vh > 0 ? vh : 1;
+	return ratio;
+}
+
 #ifdef __cplusplus
 }
 #endif

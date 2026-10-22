@@ -82,6 +82,7 @@ set(tests
     tests_status_ipc
     tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
+    tests_aux_tiling_window_size
     tests_aux_window_replug
     tests_aux_wayland_geom
     tests_comp_wl_move_sync_tag
@@ -565,6 +566,11 @@ endif()
 # on every backend. The GL-vs-everyone-else disagreement was two lines of
 # integer arithmetic, so it is pinned on the host rather than on five GPUs.
 target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
+
+# A bound window with no size (minimized / not sized yet) must never become a
+# 0x0 atlas at compositor create -- that failed xrCreateSession. The create-size
+# pick and the window-scaled view are header arithmetic, pinned on the host.
+target_link_libraries(tests_aux_tiling_window_size PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 # part of #1633 -- u_grip_surface(), the one grip -> grip_surface transform.

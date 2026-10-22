@@ -13805,11 +13805,27 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 #ifdef XRT_OS_WINDOWS
+	// Unless the window has no size yet: a minimized (or not yet sized) window
+	// reports an empty client rect, and a 0x0 atlas fails xrCreateSession
+	// outright. Keep the display-sized default above, as the macOS and Linux
+	// branches below already do; begin_frame's window-follow adopts the real
+	// size on the first frame it has one (it skips empty client rects).
 	if (c->hwnd != NULL) {
 		RECT rect;
 		if (GetClientRect((HWND)c->hwnd, &rect)) {
-			c->settings.preferred.width = (uint32_t)(rect.right - rect.left);
-			c->settings.preferred.height = (uint32_t)(rect.bottom - rect.top);
+			const int32_t cw = (int32_t)(rect.right - rect.left);
+			const int32_t ch = (int32_t)(rect.bottom - rect.top);
+			const uint32_t fw = c->settings.preferred.width;
+			const uint32_t fh = c->settings.preferred.height;
+			const enum u_tiling_window_size_source src =
+			    u_tiling_pick_window_size(cw, ch, IsIconic((HWND)c->hwnd) != FALSE, fw, fh,
+			                              &c->settings.preferred.width, &c->settings.preferred.height);
+			if (src != U_TILING_WINDOW_SIZE_CLIENT) {
+				U_LOG_W("VK: bound window %p has no usable size at create (%s, client %dx%d) — "
+				        "creating at the pre-window default %ux%u (the display) instead of 0x0; "
+				        "the real size is adopted on the first frame it has one",
+				        c->hwnd, u_tiling_window_size_source_str(src), cw, ch, fw, fh);
+			}
 		}
 	}
 #endif
@@ -14378,9 +14394,12 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->dp_atlas_encoding_latched = -1; // #1484
 	}
 
-	// Determine view dimensions
-	uint32_t view_width = c->settings.preferred.width / 2;
-	uint32_t view_height = c->settings.preferred.height;
+	// Determine view dimensions (half width for a 2-view atlas), never 0 — a
+	// 0-sized atlas fails the renderer create, and with it the whole session.
+	uint32_t view_width = 1;
+	uint32_t view_height = 1;
+	u_tiling_compute_window_scaled_view(0, 0, 2, 1, c->settings.preferred.width, c->settings.preferred.height,
+	                                    &view_width, &view_height);
 
 	// If display processor is available, query display info for view dimensions
 	if (c->display_processor != NULL) {
@@ -14388,16 +14407,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		int32_t disp_left = 0, disp_top = 0;
 		if (vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top) && disp_px_w > 0 &&
 		    disp_px_h > 0) {
-			uint32_t base_vw = disp_px_w / 2;
-			uint32_t base_vh = disp_px_h;
-
-			float ratio = fminf(
-			    (float)c->settings.preferred.width / (float)disp_px_w,
-			    (float)c->settings.preferred.height / (float)disp_px_h);
-			if (ratio > 1.0f) ratio = 1.0f;
-
-			view_width = (uint32_t)((float)base_vw * ratio);
-			view_height = (uint32_t)((float)base_vh * ratio);
+			u_tiling_compute_window_scaled_view(disp_px_w, disp_px_h, 2, 1, c->settings.preferred.width,
+			                                    c->settings.preferred.height, &view_width, &view_height);
 		}
 	}
 
