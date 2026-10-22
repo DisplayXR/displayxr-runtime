@@ -4618,6 +4618,12 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	    : comp_vk_native_renderer_get_format(c->renderer));
 	bool swap_bgra =
 	    (atlas_format == VK_FORMAT_B8G8R8A8_UNORM || atlas_format == VK_FORMAT_B8G8R8A8_SRGB);
+	if (!swap_bgra && atlas_format != VK_FORMAT_R8G8B8A8_UNORM && atlas_format != VK_FORMAT_R8G8B8A8_SRGB) {
+		// The staging buffer is 4 bytes per texel: a 16F atlas (DXR_ATLAS_FORMAT)
+		// would overrun it and a 10-bit one would come out as garbage.
+		U_LOG_W("[VK native] capture: atlas format %d is not 8-bit RGBA - skipped", (int)atlas_format);
+		return false;
+	}
 
 	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 	if (cmd_pool == VK_NULL_HANDLE) {

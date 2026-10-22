@@ -1964,6 +1964,19 @@ d3d11_capture_texture_to_png(ID3D11Device *device,
 
 	D3D11_TEXTURE2D_DESC adesc;
 	atlas_tex->GetDesc(&adesc);
+	switch (adesc.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: break;
+	default:
+		// The repack below is 4 bytes of RGBA8 per texel; a 10-bit / 16F atlas
+		// (DXR_ATLAS_FORMAT) would come out as garbage, so say so instead.
+		U_LOG_W("capture: texture format %d is not 8-bit RGBA - skipped", (int)adesc.Format);
+		return false;
+	}
 	if (content_w > adesc.Width)  content_w = adesc.Width;
 	if (content_h > adesc.Height) content_h = adesc.Height;
 
@@ -3044,7 +3057,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		sf.view_height = view_height;
 		sf.tile_columns = tile_columns;
 		sf.tile_rows = tile_rows;
-		sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		sf.src_format = (uint32_t)d3d11_dp_view_format(atlas_srv);
 		sf.target_rtv = comp_d3d11_target_get_rtv(c->target);
 		sf.target_width = target_width;
 		sf.target_height = target_height;
