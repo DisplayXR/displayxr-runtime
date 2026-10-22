@@ -319,6 +319,13 @@ jobs:
       - name: Pin-bump gate unit tests
         run: python3 scripts/tests/test_downstream_pin_bump.py
 
+      - name: Runtime version derivation unit tests (#1790)
+        # Hermetic (throwaway git repos + `cmake -P`): tag build = exactly the
+        # tag, dev build = last release + describe, rc / bookmark tags ignored,
+        # git archive tarballs, the versions.json fallback, the override, and
+        # never a made-up number.
+        run: python3 scripts/tests/test_runtime_version.py
+
       - name: App-linter INV-4.6 colour-swapchain unit tests
         # Hermetic (synthetic app trees). Pins the per-leg _SRGB-first check that
         # would have caught the gauss demo's Android leg preferring UNORM after

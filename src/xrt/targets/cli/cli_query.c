@@ -1910,6 +1910,8 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	memset(r, 0, sizeof(*r));
 	memset(h, 0, sizeof(*h));
 	snprintf(r->runtime_description, sizeof(r->runtime_description), "%s", u_runtime_description);
+	snprintf(r->version, sizeof(r->version), "%u.%u.%u", (unsigned)u_version_major, (unsigned)u_version_minor,
+	         (unsigned)u_version_patch);
 	snprintf(r->git_tag, sizeof(r->git_tag), "%s", u_git_tag);
 	r->plugin_abi_version = (uint32_t)XRT_PLUGIN_API_VERSION_CURRENT;
 	r->result_code = CLI_SELFTEST_INIT_FAIL;
@@ -2438,6 +2440,7 @@ cli_query_print_info_text(const struct cli_query_result *r)
 {
 	P(" :: Runtime\n");
 	PT("description: '%s'\n", r->runtime_description);
+	PT("version:     %s\n", r->version);
 	PT("git-tag:     '%s'\n", r->git_tag);
 	PT("plug-in ABI: v%u (runtime speaks XRT_PLUGIN_API_VERSION_CURRENT)\n", (unsigned)r->plugin_abi_version);
 
@@ -2794,6 +2797,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 
 	cJSON *rt = cJSON_AddObjectToObject(root, "runtime");
 	cJSON_AddStringToObject(rt, "description", r->runtime_description);
+	cJSON_AddStringToObject(rt, "version", r->version);
 	cJSON_AddStringToObject(rt, "git_tag", r->git_tag);
 	cJSON_AddNumberToObject(rt, "plugin_abi_version", (double)r->plugin_abi_version);
 

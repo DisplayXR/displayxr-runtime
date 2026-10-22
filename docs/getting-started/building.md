@@ -394,6 +394,29 @@ register at `HKLM\Software\DisplayXR\DisplayProcessors\<id>`.
 |--------|-------------|
 | `XRT_FEATURE_SERVICE` | Out-of-process service mode (IPC) |
 | `BUILD_TESTING` | Build test suite |
+| `DXR_RUNTIME_VERSION_OVERRIDE` | Version for a tree with no git metadata (see below); normally unset |
+
+### Runtime version
+
+There is no version number in the tree. `cmake/DisplayXRVersion.cmake` derives it at
+configure time, the same way on every platform (#1790), and the configure log prints it
+(`-- DisplayXR runtime version 2.51.1 (v2.51.1-3-g1a2b3c4d5, from git)`):
+
+| Build of | `runtimeVersion` (`xrGetInstanceProperties`) | git tag (`runtimeName`, `displayxr-cli info`) | Installer / `.pkg` / `.deb` named |
+|---|---|---|---|
+| the `v2.51.1` tag | `2.51.1` | `v2.51.1` | `2.51.1` |
+| 3 commits after it (main, a PR, a local branch) | `2.51.1` | `v2.51.1-3-g<sha>` | `2.51.1+3.g<sha>` |
+
+The number of an untagged build is the release it descends from: never lower (a feature
+gate the release passes, the dev build passes too) and never a release that does not exist
+yet. The describe string next to it is what marks it as a dev build. It needs the
+checkout's history and tags (`git fetch --tags`; in CI `actions/checkout` with
+`fetch-depth: 0`). Without them the version comes from, in order: `.git_archival.txt`
+(filled in by `git archive`, so a GitHub "Source code" tarball knows its exact version),
+then `versions.json`'s `runtime` (the last release, with a CMake warning and a
+`-dev` tag). `-DDXR_RUNTIME_VERSION_OVERRIDE=X.Y.Z` overrides all of it. The resolved
+values are also written to `build/displayxr-version.txt`, which the packaging scripts
+read. After tagging the commit you have checked out, re-run CMake.
 
 ## Local Dev Iteration
 

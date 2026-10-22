@@ -1,0 +1,4 @@
+# git archive (and GitHub's "Source code" tarballs) fill in .git_archival.txt,
+# so a build from a tarball with no .git still knows its exact version (#1790,
+# cmake/DisplayXRVersion.cmake).
+.git_archival.txt export-subst

@@ -199,6 +199,8 @@ struct cli_query_result
 {
 	/* Runtime. */
 	char runtime_description[256];
+	//! "X.Y.Z" -- xrGetInstanceProperties' runtimeVersion (#1790).
+	char version[32];
 	char git_tag[128];
 	uint32_t plugin_abi_version; //!< XRT_PLUGIN_API_VERSION_CURRENT.
 

@@ -222,15 +222,37 @@ for f in $EXT_FILES; do
 done
 [ -f "$EXT_ENABLE" ] || { echo "error: missing $EXT_ENABLE" >&2; exit 1; }
 
-# --- Version: turn `git describe` into a Debian-legal upstream version. -----
-# v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123 ; dirty -> +dirty
-RAW="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo 0.0.0)"
-VERSION="$(echo "$RAW" | sed -e 's/^v//' -e 's/-dirty$/+dirty/' -e 's/-\([0-9]\+\)-g/+\1.g/')"
-# A Debian upstream version must start with a digit; fall back if we only had a hash.
+# --- Version: what the binaries in $BUILD_DIR were BUILT as (#1790). ---------
+# cmake/DisplayXRVersion.cmake derives it once per configure and writes it next
+# to the build; the .deb is named after that, so the package version and the
+# runtimeVersion the runtime reports cannot disagree. Already Debian-legal:
+# v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123. A tree with
+# uncommitted changes still gets +dirty (that is about the checkout NOW, which
+# the configure-time stamp cannot know).
+VERSION_FILE="$BUILD_DIR/displayxr-version.txt"
+[ -f "$VERSION_FILE" ] || {
+    echo "error: $VERSION_FILE missing -- the build predates #1790's version stamp; rebuild (drop --no-build)." >&2
+    exit 1
+}
+ver_field() { sed -n "s/^$1=//p" "$VERSION_FILE"; }
+RT_VERSION="$(ver_field DXR_RUNTIME_VERSION)"
+RT_DESCRIBE="$(ver_field DXR_RUNTIME_VERSION_DESCRIBE)"
+VERSION="$(ver_field DXR_RUNTIME_VERSION_PACKAGE)"
 case "$VERSION" in
-    [0-9]*) : ;;
-    *) VERSION="0.0.0+g$VERSION" ;;
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *) echo "error: $VERSION_FILE names no usable package version ('$VERSION')." >&2; exit 1 ;;
 esac
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    VERSION="$VERSION+dirty"
+fi
+# The runtime itself must carry the describe the package is named after: a
+# stale build dir (or a configure from another checkout) fails HERE rather
+# than shipping a .deb whose name and runtimeVersion disagree.
+if ! grep -qxF "$RT_DESCRIBE" <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO does not carry '$RT_DESCRIBE' (from $VERSION_FILE) -- stale build?" >&2
+    exit 1
+fi
+echo "==> Version $VERSION (runtime reports $RT_VERSION, '$RT_DESCRIBE')"
 # Derive the Debian arch from the build host so the label matches the binaries:
 # x86 CI / release boxes -> amd64; an arm64 dev box (e.g. Apple-silicon colima)
 # -> arm64. The runtime .deb targets whatever the build produced.

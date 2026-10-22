@@ -2,19 +2,27 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.22)
-# VERSION below is patched at build time by CI from the latest vX.Y.Z tag —
-# see .github/workflows/build-windows.yml ("Sync CMake VERSION from latest
-# vX.Y.Z tag" step) and build-macos.yml ("steps.version"). The /release skill
-# no longer touches this value; what's committed here is a historical
-# placeholder and may be stale on `main` between releases. Installer artifact
-# names and the runtime's reported version always come from the tag, not from
-# this line. Local-dev builds embed whatever was last committed.
+# The version is derived, never written here (#1790): the nearest vX.Y.Z tag
+# reachable from HEAD -- exactly the tag on a release build, the last release
+# on every commit after it (u_git_tag then says v2.51.1-3-g<sha>). One
+# derivation for every platform and every build (CI, /release, local): see
+# cmake/DisplayXRVersion.cmake for the scheme and the source-tarball fallbacks.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/DisplayXRVersion.cmake")
+dxr_runtime_version_resolve()
 project(
 	XRT
-	VERSION 1.6.0
+	VERSION ${DXR_RUNTIME_VERSION}
 	LANGUAGES C CXX
 	DESCRIPTION "DisplayXR Runtime (based on Monado/XRT)"
 	)
+message(
+	STATUS
+		"DisplayXR runtime version ${DXR_RUNTIME_VERSION} (${DXR_RUNTIME_VERSION_DESCRIBE}, from ${DXR_RUNTIME_VERSION_SOURCE})"
+	)
+# What the binaries in this tree were built as, for packaging scripts
+# (package_deb_linux.sh, build_macos.sh) that must name their output after it.
+dxr_runtime_version_lines(_dxr_version_lines)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/displayxr-version.txt" "${_dxr_version_lines}")
 
 if(APPLE)
 	enable_language(OBJC)
@@ -89,10 +97,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/sanitizers")
 include(OptionWithDeps)
 include(SPIR-V)
 include(GNUInstallDirs)
-if(NOT GIT_DESC)
-	include(GetGitRevisionDescription)
-	git_describe(GIT_DESC "--always")
-endif()
+# u_git_tag (runtimeName, `displayxr-cli info`, the IPC client<->service gate):
+# the same describe the version number above came from.
+set(GIT_DESC "${DXR_RUNTIME_VERSION_DESCRIBE}")
 if(NOT ${CMAKE_VERSION} VERSION_LESS 3.9)
 	include(CheckIPOSupported)
 	check_ipo_supported(RESULT HAS_IPO)

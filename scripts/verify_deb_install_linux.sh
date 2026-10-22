@@ -95,6 +95,21 @@ unset XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH
 displayxr-cli info || fail=1
 displayxr-cli selftest || { echo "error: displayxr-cli selftest failed on $PRETTY_NAME." >&2; fail=1; }
 
+# #1790: the installed runtime reports (xrGetInstanceProperties runtimeVersion,
+# printed by `info`) the version the package is named after -- X.Y.Z, or the
+# X.Y.Z of X.Y.Z+<n>.g<sha>. Every .deb before this reported 1.6.0 inside a
+# 2.x package, and apps gate features on that number.
+deb_ver="$(dpkg-query -W -f='${Version}' "$PKG")"
+info_out="$(displayxr-cli info 2>/dev/null || true)"
+rt_ver="$(sed -n 's/^[[:space:]]*version:[[:space:]]*//p' <<<"$info_out")"
+rt_ver="${rt_ver%%$'\n'*}"
+if [ -n "$rt_ver" ] && { [ "$deb_ver" = "$rt_ver" ] || [ "${deb_ver#"$rt_ver"+}" != "$deb_ver" ]; }; then
+    echo "    runtime reports $rt_ver, package is $deb_ver: ok"
+else
+    echo "error: the installed runtime reports version '$rt_ver' but the package is $deb_ver (#1790)." >&2
+    fail=1
+fi
+
 # --- VK_LAYER_DXR_queue_lock (#902 / #2036) ----------------------------------
 # Without it the #868 repaint is OFF for every Vulkan app on a single-graphics-
 # queue GPU (Intel), silently: the runtime retries instance creation without the

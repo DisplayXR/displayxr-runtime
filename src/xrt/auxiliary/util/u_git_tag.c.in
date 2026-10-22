@@ -9,11 +9,15 @@
 
 #include "util/u_git_tag.h"
 
+// Both from cmake/DisplayXRVersion.cmake (#1790): the number is the nearest
+// vX.Y.Z tag, GIT_DESC the describe it came from (vX.Y.Z on the tag itself).
+// Not CMAKE_PROJECT_VERSION_*: that is the TOP-LEVEL project's, which is not
+// the runtime's when a plug-in builds the runtime as a subproject.
 #define GIT_DESC "@GIT_DESC@"
 
-#define MAJOR_VERSION @CMAKE_PROJECT_VERSION_MAJOR@
-#define MINOR_VERSION @CMAKE_PROJECT_VERSION_MINOR@
-#define PATCH_VERSION @CMAKE_PROJECT_VERSION_PATCH@
+#define MAJOR_VERSION @DXR_RUNTIME_VERSION_MAJOR@
+#define MINOR_VERSION @DXR_RUNTIME_VERSION_MINOR@
+#define PATCH_VERSION @DXR_RUNTIME_VERSION_PATCH@
 #define RUNTIME_DESCRIPTION "@CMAKE_PROJECT_DESCRIPTION@"
 
 const char u_git_tag[] = GIT_DESC;

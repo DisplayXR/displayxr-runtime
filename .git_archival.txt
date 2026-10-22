@@ -1,0 +1,2 @@
+node: $Format:%H$
+describe-name: $Format:%(describe:tags=true,match=v[0-9]*,exclude=v*[!0-9.]*)$

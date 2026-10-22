@@ -38,8 +38,8 @@ version-spec:
   ├─ Pre-flight (clean tree, on main, tag not taken)
   ├─ Empty "Release vX.Y.Z" marker commit → push main → tag it → push tag
   │
-  │  (CI takes over here — build-windows.yml patches CMakeLists.txt
-  │   VERSION from the tag at build time per PR #353, then both
+  │  (CI takes over here — every build versions itself from the tag
+  │   via cmake/DisplayXRVersion.cmake (#1790), then both
   │   workflows attach their artifacts to the v* tag's release via
   │   softprops/action-gh-release@v2; first job to complete creates
   │   the release, others append.)
@@ -52,10 +52,15 @@ version-spec:
   └─ Report (includes auto-bump SHAs + any ABI-mismatch issue link)
 ```
 
-The skill never touches CMakeLists.txt — CI is authoritative for
-the source-tree VERSION (synced from `git describe --tags --abbrev=0`
-on every Windows build per PR #353; macOS derives version directly
-from `GITHUB_REF` in build-macos.yml). The old flow's "Release X.Y.Z"
+The skill never touches a version in the tree — there is none to touch.
+`cmake/DisplayXRVersion.cmake` derives it at configure time from
+`git describe` (#1790): exactly the tag on the tag build, on every
+platform (runtimeVersion, the installer / .pkg / .deb names); the last
+release + `-<n>-g<sha>` on any later commit. Each build workflow
+asserts that from its artifacts (`scripts/check_runtime_version.sh`).
+(Before #1790 only the Windows build patched a hard-coded VERSION, so
+Linux/macOS/Android and every untagged build reported 1.6.0.) The old
+flow's "Release X.Y.Z"
 *version-bump* commit was a drift vector if the bump was forgotten —
 that's exactly what landed PR #353 (after the in-tree value pinned at
 1.2.3 silently drifted for three releases past v1.3.0 in
@@ -140,8 +145,8 @@ The marker is an **empty** commit — it exists purely so `git log` /
 graph views show an obvious "Release vX.Y.Z" boundary on main (which
 release got which commits). It carries no version content, so the
 CMakeLists drift vector that killed the old version-bump commit
-(PR #353) does not apply — CI still patches VERSION from the tag at
-build time.
+(PR #353) does not apply — the build derives its version from the tag
+(`cmake/DisplayXRVersion.cmake`, #1790).
 
 ```bash
 git commit --allow-empty -m "Release [FULL_TAG]"
@@ -690,7 +695,7 @@ Report the error and that the tag has been deleted. STOP.
 /release v1.2.1
     → explicit version
     → empty "Release v1.2.1" marker commit on main, tagged v1.2.1
-    → push v1.2.1 → CI patches CMakeLists VERSION → builds installer
+    → push v1.2.1 → CI builds report 1.2.1 (from the tag) → builds installer
     → workflows attach installer to the GH release
 
 /release patch

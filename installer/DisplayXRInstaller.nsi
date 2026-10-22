@@ -4,11 +4,19 @@
 
 ;--------------------------------
 ; Build-time definitions (passed from CMake)
-; VERSION, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH
+; VERSION, VERSION_LABEL, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH
 ; BIN_DIR, SOURCE_DIR, OUTPUT_DIR
+;
+; VERSION is the plain X.Y.Z (registry Version, ARP DisplayVersion,
+; VIProductVersion -- other installers parse these). VERSION_LABEL is what the
+; installer is named after: X.Y.Z on a release tag, X.Y.Z+<n>.g<sha> on any
+; other commit (cmake/DisplayXRVersion.cmake, #1790).
 
 !ifndef VERSION
 	!define VERSION "25.0.0"
+!endif
+!ifndef VERSION_LABEL
+	!define VERSION_LABEL "${VERSION}"
 !endif
 !ifndef VERSION_MAJOR
 	!define VERSION_MAJOR "25"
@@ -58,13 +66,13 @@
 ;--------------------------------
 ; General Attributes
 
-Name "DisplayXR ${VERSION}"
+Name "DisplayXR ${VERSION_LABEL}"
 !ifdef INNER
 	; Throwaway inner installer: only emits the uninstaller to %TEMP%.
 	OutFile "$%TEMP%\DisplayXRSetup_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION_LABEL}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Runtime"
@@ -1856,4 +1864,4 @@ VIAddVersionKey "CompanyName" "DisplayXR"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2024-2026 DisplayXR"
 VIAddVersionKey "FileDescription" "DisplayXR OpenXR Runtime Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
-VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"

@@ -28,6 +28,12 @@ set(DISPLAYXR_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(DISPLAYXR_VERSION_MINOR ${PROJECT_VERSION_MINOR})
 set(DISPLAYXR_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(DISPLAYXR_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}")
+# What the installer is NAMED after (#1790): X.Y.Z on a release tag, else
+# X.Y.Z+<n>.g<sha> so a main/PR build can never pass for the release. Values
+# other tools parse as a version (HKLM ...\Runtime\Version, which the Leia
+# plug-in and browser installers gate on; ARP DisplayVersion; VIProductVersion)
+# keep the plain X.Y.Z above.
+set(DISPLAYXR_VERSION_LABEL "${DXR_RUNTIME_VERSION_PACKAGE}")
 
 # Build number (from CI or default to 0)
 if(NOT DEFINED BUILD_NUM)
@@ -87,6 +93,7 @@ add_custom_target(installer
 		-P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
 	COMMAND "${NSIS_EXECUTABLE}"
 		"/DVERSION=${DISPLAYXR_VERSION}"
+		"/DVERSION_LABEL=${DISPLAYXR_VERSION_LABEL}"
 		"/DVERSION_MAJOR=${DISPLAYXR_VERSION_MAJOR}"
 		"/DVERSION_MINOR=${DISPLAYXR_VERSION_MINOR}"
 		"/DVERSION_PATCH=${DISPLAYXR_VERSION_PATCH}"
