@@ -2665,6 +2665,30 @@ zones_handoff_draw(struct comp_vk_native_renderer *r, VkCommandBuffer cmd)
 	return true;
 }
 
+/*!
+ * Publish the zone composite into a DEEPER atlas (DXR_ATLAS_FORMAT, experimental).
+ *
+ * The compose target stays B8G8R8A8_UNORM storage, so a raw vkCmdCopyImage
+ * into an A2B10G10R10 / R16G16B16A16F atlas would reinterpret its bits. This
+ * blit reads the target through its UNORM storage format and writes the
+ * atlas's UNORM / float format: a value conversion with no sRGB step on either
+ * side, so the encode the _SRGB view applied on write is carried, not repeated.
+ * The 8-bit atlas never comes here — it keeps the raw copy.
+ */
+static void
+publish_compose_to_deep_atlas(struct comp_vk_native_renderer *r, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = r->vk;
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+	};
+	vk->vkCmdBlitImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+}
+
 //! Draw-based projection pass for zones frames: clear via loadOp, draw each
 //! zone's view tiles alpha-over in layer-list order, finish in
 //! SHADER_READ_ONLY. Mirrors comp_d3d11_renderer's zone branch.
@@ -3270,18 +3294,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			                   r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 		} else {
-			// DXR_ATLAS_FORMAT: the compose target stays BGRA8, so a raw copy would
-			// reinterpret its bits. A UNORM -> UNORM/float blit converts the values
-			// without touching the encoding (no sRGB step on either side).
-			VkImageBlit blit = {
-			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .srcOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
-			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .dstOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
-			};
-			vk->vkCmdBlitImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			                   r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-			                   VK_FILTER_NEAREST);
+			publish_compose_to_deep_atlas(r, cmd);
 		}
 
 		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

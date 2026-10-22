@@ -495,6 +495,19 @@ TEST_CASE("colour: the vk_native leg spells the same model in Vulkan (#1589/#161
 	     "UNORM interpretations and applies the encode a second time");
 	CHECK_FALSE(contains_in_code(pass, "vkCmdBlitImage("));
 
+	// DXR_ATLAS_FORMAT (experimental deeper atlas): the 8-bit compose target
+	// cannot be raw-copied into a 10-bit / 16F atlas, so that one case blits —
+	// in its own helper, through UNORM storage formats only, never an _SRGB one.
+	const std::string deep = function_body(src, "publish_compose_to_deep_atlas");
+	INFO("publish_compose_to_deep_atlas() must exist — the one converting publish, for a deeper atlas");
+	REQUIRE_FALSE(deep.empty());
+	CHECK(contains_in_code(deep, "vkCmdBlitImage("));
+	INFO("...and must not name an _SRGB format: the blit converts depth, never the encode");
+	CHECK(deep.find("_SRGB") == std::string::npos);
+	INFO("...and the compose pass reaches it only off the 8-bit atlas, which keeps the raw copy");
+	CHECK(contains_in_code(pass, "r->format == VK_FORMAT_B8G8R8A8_UNORM"));
+	CHECK(contains_in_code(pass, "publish_compose_to_deep_atlas("));
+
 	// The Vulkan analogue of the D3D12 direct-call count: the true-format
 	// view IS the decoding read, so it is bound in exactly one code line.
 	const size_t true_view = count_code_lines_with(src, "comp_vk_native_swapchain_get_true_image_view(");
