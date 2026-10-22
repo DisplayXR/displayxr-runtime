@@ -5344,12 +5344,27 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		c->settings.nominal_frame_interval_ns = (1000 * 1000 * 1000) / 60; // 60Hz default
 	}
 
-	// Get actual window size if we have a window
+	// Get actual window size if we have a window — unless it has none yet. A
+	// minimized (or not yet sized) window reports an empty client rect, and a
+	// 0x0 target + atlas fails xrCreateSession outright; keep the display-sized
+	// default above instead, and let begin_frame's resize adopt the window's
+	// real size on the first frame it has one.
 	if (c->hwnd != nullptr) {
 		RECT rect;
 		if (GetClientRect(c->hwnd, &rect)) {
-			c->settings.preferred.width = rect.right - rect.left;
-			c->settings.preferred.height = rect.bottom - rect.top;
+			const int32_t cw = static_cast<int32_t>(rect.right - rect.left);
+			const int32_t ch = static_cast<int32_t>(rect.bottom - rect.top);
+			const uint32_t fw = c->settings.preferred.width;
+			const uint32_t fh = c->settings.preferred.height;
+			const enum u_tiling_window_size_source src = u_tiling_pick_window_size(
+			    cw, ch, IsIconic(c->hwnd) != FALSE, fw, fh, &c->settings.preferred.width,
+			    &c->settings.preferred.height);
+			if (src != U_TILING_WINDOW_SIZE_CLIENT) {
+				U_LOG_W("D3D11: bound window %p has no usable size at create (%s, client %dx%d) — "
+				        "creating at the pre-window default %ux%u (the display) instead of 0x0; "
+				        "the real size is adopted on the first frame it has one",
+				        (void *)c->hwnd, u_tiling_window_size_source_str(src), cw, ch, fw, fh);
+			}
 		}
 	}
 
@@ -5923,9 +5938,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Determine view dimensions for the atlas texture.
-	// Default: derive from window size (half width for 2-view atlas)
-	uint32_t view_width = c->settings.preferred.width / 2;
-	uint32_t view_height = c->settings.preferred.height;
+	// Default: derive from window size (half width for 2-view atlas), never 0.
+	uint32_t view_width = 1;
+	uint32_t view_height = 1;
+	u_tiling_compute_window_scaled_view(0, 0, 2, 1, c->settings.preferred.width, c->settings.preferred.height,
+	                                    &view_width, &view_height);
 
 	/*
 	 * Create the display processor via the factory the target builder set at
@@ -5995,21 +6012,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		        &disp_left, &disp_top) &&
 		    disp_px_w > 0 && disp_px_h > 0) {
 			// Use half display width as base view dims
-			uint32_t base_vw = disp_px_w / 2;
-			uint32_t base_vh = disp_px_h;
-
 			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
-			        disp_px_w, disp_px_h, base_vw, base_vh);
+			        disp_px_w, disp_px_h, disp_px_w / 2, disp_px_h);
 
-			// Scale by window/display pixel ratio (same as resize path)
-			float ratio = fminf(
-			    (float)c->settings.preferred.width / (float)disp_px_w,
-			    (float)c->settings.preferred.height / (float)disp_px_h);
-			if (ratio > 1.0f) {
-				ratio = 1.0f;
-			}
-			view_width = (uint32_t)((float)base_vw * ratio);
-			view_height = (uint32_t)((float)base_vh * ratio);
+			// Scale by window/display pixel ratio (same as resize path). Never
+			// 0: a 0-sized atlas fails the renderer create, and with it the
+			// whole session.
+			const float ratio = u_tiling_compute_window_scaled_view(
+			    disp_px_w, disp_px_h, 2, 1, c->settings.preferred.width, c->settings.preferred.height,
+			    &view_width, &view_height);
 			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye", ratio, view_width, view_height);
 		}
 	}
