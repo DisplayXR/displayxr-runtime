@@ -333,7 +333,7 @@ comp_multi_weave_lift_rect_frame(struct multi_compositor *mc,
 
 /*
  *
- * ADR-058 Amendment 1: one eye sample per weave; per-rect placement.
+ * ADR-058 Amendment 1: one runtime-side eye sample per weave; per-rect placement.
  *
  */
 
@@ -393,7 +393,7 @@ comp_multi_weave_lift_rect_place(struct multi_compositor *mc,
 		r->eyes_mode = 0; // the stream's snapshot, as before
 		return;
 	}
-	r->eyes_mode = 1; // the frame's one sample
+	r->eyes_mode = 1; // the weave's one runtime-side sample
 	r->frame_eyes = l->frame_eyes;
 	(void)win_w;
 	(void)win_h;

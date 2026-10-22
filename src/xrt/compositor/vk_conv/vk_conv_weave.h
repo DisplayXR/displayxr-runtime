@@ -154,9 +154,11 @@ struct vk_conv_weave_rect
 	/*!
 	 * ADR-058 Amendment 1: how the late view synthesis places the rect this
 	 * frame. 0 = the stream's eyes snapshot (no engine sample); 1 = the
-	 * frame's ONE target-time sample @ref frame_eyes, the same the weave and
-	 * its reply consume; 2 = keep the conversion's viewpoints (a straddling
-	 * rect whose centre screen is not the sample's). = CONV_LATE_EYES_*.
+	 * weave's one runtime-side target-time sample from the DP @ref
+	 * frame_eyes, also the submit's reply eyes and the core's eye publish
+	 * (the vendor weaver's internal pose stays the DP's, ADR-033); 2 = keep
+	 * the conversion's viewpoints (a straddling rect whose centre screen is
+	 * not the sample's). = CONV_LATE_EYES_*.
 	 */
 	uint32_t eyes_mode;
 	struct xrt_eye_positions frame_eyes;

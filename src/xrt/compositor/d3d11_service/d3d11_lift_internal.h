@@ -351,7 +351,7 @@ struct d3d11_lift
 	bool late_vs_tried = false;
 	ID3D11DeviceContext *late_deferred = nullptr;
 	std::map<uint64_t, struct d3d11_late_state> late_states; //!< core stream id ->
-	bool late_have_eyes = false; //!< this weave's ONE sample (d3d11_lift_set_frame_place)
+	bool late_have_eyes = false; //!< this weave's one runtime-side sample (d3d11_lift_set_frame_place)
 	struct xrt_eye_positions late_eyes = {};
 	struct xrt_segment_metrics late_segs = {}; //!< this weave's segment table (count < 2 = one screen)
 	//! #2030: the still-image content check (its own device; created on the

@@ -69,10 +69,12 @@ struct comp_multi_weave_lift
 	//! host-frame count that clearing the ops waits on.
 	bool host_frame;
 
-	//! @name ADR-058 Amendment 1: this weave's ONE eye sample and per-rect placement
+	//! @name ADR-058 Amendment 1: this weave's one runtime-side eye sample and per-rect placement
 	//! @{
 	bool have_frame_eyes;
-	struct xrt_eye_positions frame_eyes; //!< the primary screen's target-time sample
+	//! The runtime-side target-time sample from the primary screen's DP (late
+	//! synthesis, reply eyes, core publish; not the weaver's internal pose).
+	struct xrt_eye_positions frame_eyes;
 	struct
 	{
 		uint64_t stream;
@@ -82,10 +84,12 @@ struct comp_multi_weave_lift
 };
 
 /*!
- * ADR-058 Amendment 1 item 3: take this weave's ONE eye sample — the engine
- * DP's target-time query at one refresh ahead (its "latest" answer when it
- * has no target-time slot) — before any lifted rect is recorded. The late
- * view synthesis of every rect and the submit's reply eyes both use it.
+ * ADR-058 Amendment 1 item 3: take this weave's one RUNTIME-side eye sample
+ * from the DP — its target-time query at one refresh ahead (its "latest"
+ * answer when it has no target-time slot) — before any lifted rect is
+ * recorded. The late view synthesis of every rect, the submit's reply eyes
+ * and the core's eye publish use it; the vendor weaver's internal pose is
+ * never exposed and stays the DP's (ADR-033).
  * False (and no sample) when the DP answers nothing.
  */
 bool

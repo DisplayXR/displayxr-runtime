@@ -1894,7 +1894,7 @@ conv_core_stream_late_prepare_ex(struct conv_core *core,
 	}
 
 	// The eyes of this display frame, through S3's own viewpoint policy:
-	// the frame's ONE sample (the weave's own), never a second one.
+	// the weave's one runtime-side sample from the DP, never a second one.
 	struct conv_eyes e;
 	memset(&e, 0, sizeof(e));
 	if (eyes_mode == CONV_LATE_EYES_SAMPLE && eyes != NULL) {

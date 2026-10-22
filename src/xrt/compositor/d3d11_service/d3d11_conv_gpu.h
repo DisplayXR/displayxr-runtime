@@ -282,9 +282,10 @@ d3d11_lift_pin_latest(struct d3d11_lift *lift, uint64_t owner, uint64_t id, stru
 
 /*!
  * ADR-058 Amendment 1, render thread, once per weave before any lifted rect:
- * this weave's ONE eye sample (@p eyes, the DP's target-time answer the
- * submit's reply also carries; NULL = none: rects read the stream's eyes
- * snapshot) and the window's segment table (@p segs, NULL / count < 2 = one
+ * this weave's one runtime-side target-time eye sample from the DP (@p eyes;
+ * the late synthesis, the submit's reply and the core's eye publish use it,
+ * the vendor weaver's internal pose stays the DP's; NULL = none: rects read
+ * the stream's eyes snapshot) and the window's segment table (@p segs, NULL / count < 2 = one
  * screen) for the straddle rule.
  */
 void

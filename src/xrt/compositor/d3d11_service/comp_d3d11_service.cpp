@@ -31295,10 +31295,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	struct comp_seg_rect seg_win = {};
 	const bool seg_split = !legacy_single_rect && weave_seg_update(sys, c, wnd, win_w, win_h, &seg_win);
 
-	// ADR-058 Amendment 1 item 3: ONE eye sample for this weave — the DP's
-	// target-time answer one refresh ahead (its "latest" without the slot) —
-	// taken before any lifted rect is placed; the reply below hands back the
-	// same one. Item 2: the segment table for the rect-centre straddle rule.
+	// ADR-058 Amendment 1 item 3: one runtime-side eye sample from the DP
+	// for this weave — its target-time answer one refresh ahead (its "latest"
+	// without the slot) — taken before any lifted rect is placed; the late
+	// synthesis, the reply below and the core's publish use it. The vendor
+	// weaver's internal pose is never exposed and stays the DP's (ADR-033). Item 2: the segment table for the
+	// rect-centre straddle rule.
 	struct xrt_eye_positions lift_eyes = {};
 	bool have_lift_eyes = false;
 	if (lift != nullptr && dp != nullptr) {

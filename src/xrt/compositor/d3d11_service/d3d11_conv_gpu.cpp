@@ -2332,7 +2332,7 @@ core_pin_late(
 			        (unsigned long long)core_id, why);
 		}
 	};
-	// ADR-058 Amendment 1: the weave's ONE sample; a rect centred (dwelled)
+	// ADR-058 Amendment 1: the weave's one runtime-side sample; a rect centred (dwelled)
 	// on another screen than the sample's keeps its conversion placement.
 	uint32_t mode = l->late_have_eyes ? CONV_LATE_EYES_SAMPLE : CONV_LATE_EYES_SNAPSHOT;
 	if (l->late_have_eyes && l->late_segs.count >= 2 && cx != INT32_MIN) {

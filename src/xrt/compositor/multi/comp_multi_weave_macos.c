@@ -822,8 +822,10 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		    .lift_owner = lift_owner,
 		    .lift_rects = lift_rects,
 		};
-		// ADR-058 Amendment 1: ONE eye sample for this weave, taken before
-		// any lifted rect is placed; the reply below hands back the same one.
+		// ADR-058 Amendment 1: one runtime-side eye sample from the DP for this
+		// weave, taken before any lifted rect is placed; the late synthesis,
+		// the reply below and the core's publish use it (the vendor weaver's
+		// internal pose stays the DP's).
 		struct xrt_eye_positions lift_eyes;
 		const bool have_lift_eyes = lift_count > 0 && comp_multi_weave_lift_sample_frame_eyes(mc, &lift_eyes);
 		if (!have_lift_eyes) {

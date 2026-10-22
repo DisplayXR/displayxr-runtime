@@ -506,8 +506,10 @@ conv_late_max_edge(uint32_t env_edge, uint32_t adapter_class);
 /*! @name How a late synthesis gets its eyes (conv_core_stream_late_prepare_ex) @{ */
 //! The stream's bound eyes snapshot at now (diagnostics and tests).
 #define CONV_LATE_EYES_SNAPSHOT 0u
-//! The frame's ONE target-time sample, the same the weave consumes (ADR-058
-//! Amendment 1 item 3): never a second sample.
+//! One RUNTIME-side target-time sample from the DP per weave, used by the late
+//! synthesis, the reply eyes and the core's eye publish (ADR-058 Amendment 1
+//! item 3); never a second runtime sample. The vendor weaver's internal pose
+//! is never exposed and stays the DP's (ADR-033).
 #define CONV_LATE_EYES_SAMPLE 1u
 //! The viewpoints the result was converted for (no re-placement this frame):
 //! a straddling rect whose centre screen's eyes are not in the rect's frame.
@@ -564,8 +566,8 @@ conv_core_stream_late_prepare(struct conv_core *core,
 
 /*!
  * conv_core_stream_late_prepare with an explicit eyes source
- * (CONV_LATE_EYES_*): SAMPLE needs @p eyes (the frame's one target-time
- * sample, the weave's own), SNAPSHOT ignores it, RECORDED keeps the
+ * (CONV_LATE_EYES_*): SAMPLE needs @p eyes (the weave's one runtime-side
+ * target-time sample from the DP), SNAPSHOT ignores it, RECORDED keeps the
  * conversion's viewpoints (out->verdict HOLD).
  */
 bool

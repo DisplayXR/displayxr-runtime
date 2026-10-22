@@ -2491,8 +2491,10 @@ weave_run_frame(struct vk_bundle *vk,
 	}
 	// XR_DXR_lift §6: lift this submit's rects (false = weave them as drawn).
 	const bool lifting = lift_requested && comp_multi_weave_lift_begin(&mc->weave.lift, vk, lift->count);
-	// ADR-058 Amendment 1: ONE eye sample for this weave, taken before any
-	// lifted rect is placed; the reply below hands back the same one.
+	// ADR-058 Amendment 1: one runtime-side eye sample from the DP for this
+	// weave, taken before any lifted rect is placed; the late synthesis, the
+	// reply below and the core's publish use it (the vendor weaver's internal
+	// pose stays the DP's).
 	struct xrt_eye_positions lift_eyes;
 	const bool have_lift_eyes = lifting && comp_multi_weave_lift_sample_frame_eyes(mc, &lift_eyes);
 	if (!have_lift_eyes) {

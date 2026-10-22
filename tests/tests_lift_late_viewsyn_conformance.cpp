@@ -727,7 +727,8 @@ TEST_CASE("ADR-058 conformance through the core: ring + late stage at 4 fps vs c
 	conv_fake_fini(&f);
 }
 
-TEST_CASE("ADR-058 Amendment 1: the late synthesis uses the frame's ONE eye sample", "[lift_late][core][amendment1]")
+TEST_CASE("ADR-058 Amendment 1: the late synthesis uses the weave's one runtime-side eye sample",
+          "[lift_late][core][amendment1]")
 {
 	conv_fake_provider f;
 	conv_fake_init(&f, "depth-fake");
