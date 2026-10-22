@@ -247,6 +247,51 @@ dc_release_in_flight(struct dc_client *cl)
 	cl->in_flight = false;
 }
 
+//! "name" or "ICC <n> bytes" for a colour space, for the first-frame log.
+static NSString *
+dc_colour_desc(CGColorSpaceRef cs)
+{
+	if (cs == NULL) {
+		return @"(untagged)";
+	}
+	CFStringRef nm = CGColorSpaceCopyName(cs);
+	if (nm != NULL) {
+		return (__bridge_transfer NSString *)nm;
+	}
+	CFDataRef icc = CGColorSpaceCopyICCData(cs);
+	NSString *d = [NSString stringWithFormat:@"ICC %ld bytes", icc != NULL ? (long)CFDataGetLength(icc) : 0L];
+	if (icc != NULL) {
+		CFRelease(icc);
+	}
+	return d;
+}
+
+static NSString *
+dc_buffer_colour_desc(CVPixelBufferRef pb)
+{
+	CFDictionaryRef att = CVBufferCopyAttachments(pb, kCVAttachmentMode_ShouldPropagate);
+	CGColorSpaceRef cs = att != NULL ? CVImageBufferCreateColorSpaceFromAttachments(att) : NULL;
+	NSString *d = dc_colour_desc(cs);
+	if (cs != NULL) {
+		CGColorSpaceRelease(cs);
+	}
+	if (att != NULL) {
+		CFRelease(att);
+	}
+	return d;
+}
+
+static NSString *
+dc_display_colour_desc(CGDirectDisplayID display)
+{
+	CGColorSpaceRef cs = CGDisplayCopyColorSpace(display);
+	NSString *d = dc_colour_desc(cs);
+	if (cs != NULL) {
+		CGColorSpaceRelease(cs);
+	}
+	return d;
+}
+
 @implementation DCStream
 
 - (void)stream:(SCStream *)stream
@@ -307,7 +352,8 @@ dc_release_in_flight(struct dc_client *cl)
 	self.width = w;
 	self.height = h;
 	if (self.seq == 1) {
-		dc_log(@"display %u: first frame %ux%u", self.display, w, h);
+		dc_log(@"display %u: first frame %ux%u, colour %@ (display's own: %@)", self.display, w, h,
+		       dc_buffer_colour_desc(pb), dc_display_colour_desc(self.display));
 	}
 	for (uint32_t i = 0; i < g_client_count; i++) {
 		struct dc_client *cl = &g_clients[i];
@@ -452,7 +498,21 @@ dc_refresh_display(CGDirectDisplayID display)
 			cfg.width = pw;
 			cfg.height = ph;
 			cfg.pixelFormat = kCVPixelFormatType_32BGRA;
-			cfg.colorSpaceName = kCGColorSpaceSRGB;
+			/*
+			 * Colour: the DISPLAY's own space, not sRGB. The weaving DP tags
+			 * its woven frame with the panel's colour space so WindowServer
+			 * leaves the weave alone (no colour matching). The backdrop is
+			 * woven into that frame, so its bytes must already be panel-
+			 * native, i.e. what the desktop looks like on that panel. An sRGB
+			 * capture shown as panel-native came out visibly washed out on
+			 * the Odyssey G90XF, whose EDID profile has no named space.
+			 * Unset = SCK's default; the first-frame log names what arrived.
+			 * DXR_DESKTOP_CAPTURE_SRGB=1 restores the sRGB request (A/B).
+			 */
+			const char *srgb_env = getenv("DXR_DESKTOP_CAPTURE_SRGB");
+			if (srgb_env != NULL && srgb_env[0] == '1') {
+				cfg.colorSpaceName = kCGColorSpaceSRGB;
+			}
 			cfg.showsCursor = NO;
 			cfg.minimumFrameInterval = CMTimeMake(1, (int32_t)(hz + 0.5));
 			cfg.queueDepth = 4;
