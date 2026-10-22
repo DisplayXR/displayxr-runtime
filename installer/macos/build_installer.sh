@@ -276,6 +276,25 @@ fi
 # contributor and fork-PR builds always had.
 SIGN="$REPO_ROOT/scripts/macos_sign_notarize.sh"
 
+# sign_tree <dir>: the final Mach-O signature. With DXR_MACOS_SIGN_FALLBACK=adhoc
+# (set by CI on signed tag builds) a failed Developer ID signature — typically
+# Apple's timestamp server being unreachable — degrades to the ad-hoc tree
+# instead of failing the build: signing never gates publishing. The fallback is
+# recorded in $DXR_MACOS_SIGN_STATUS_FILE so CI skips notarizing a tree that
+# can no longer pass it.
+sign_tree() {
+    if "$SIGN" sign-tree "$1" --entitlements-map "$SCRIPT_DIR/entitlements/map"; then
+        return 0
+    fi
+    if [ -n "${DXR_MACOS_APP_IDENTITY:-}" ] && [ "${DXR_MACOS_SIGN_FALLBACK:-}" = "adhoc" ]; then
+        echo "::warning::Developer ID signing of $(basename "$1") failed — falling back to ad-hoc; this .pkg will NOT be notarized"
+        [ -n "${DXR_MACOS_SIGN_STATUS_FILE:-}" ] && echo "adhoc-fallback" >> "$DXR_MACOS_SIGN_STATUS_FILE"
+        DXR_MACOS_APP_IDENTITY="" "$SIGN" sign-tree "$1" --entitlements-map "$SCRIPT_DIR/entitlements/map"
+        return $?
+    fi
+    return 1
+}
+
 # Every shipped Mach-O must resolve its deps on a Mac without Homebrew: an
 # absolute build-box path (Homebrew prefix, /usr/local, /tmp, a home dir)
 # loads on the build box and fails everywhere else. displayxr-conversion-host
@@ -292,8 +311,7 @@ if [ -n "$BAD_DEPS" ]; then
     exit 1
 fi
 
-"$SIGN" sign-tree "$WORK_DIR/payload-runtime" \
-    --entitlements-map "$SCRIPT_DIR/entitlements/map"
+sign_tree "$WORK_DIR/payload-runtime"
 
 # --- 2. Build runtime component pkg ---
 echo "--- Building runtime component ---"
@@ -309,8 +327,7 @@ echo "--- Building .app bundle ---"
 if [ -f "$ARTIFACT_DIR/bin/cube_handle_vk_macos" ]; then
     "$SCRIPT_DIR/create_app_bundle.sh" "$ARTIFACT_DIR" "$WORK_DIR/DisplayXRCube.app" cube_handle_vk_macos
     # Sign the bundle's nested Mach-Os, then the bundle itself (#280).
-    "$SIGN" sign-tree "$WORK_DIR/DisplayXRCube.app" \
-        --entitlements-map "$SCRIPT_DIR/entitlements/map"
+    sign_tree "$WORK_DIR/DisplayXRCube.app"
 
     # --- 4. Build test app component pkg ---
     echo "--- Building test app component ---"

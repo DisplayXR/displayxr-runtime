@@ -8,7 +8,9 @@ the signer is unavailable or changes. This is the contract the `/release`,
 
 - **Contributor / CI builds are unsigned, by design.** GitHub-hosted CI holds
   no certificate and no secret. Every PR, push, and even tag build produces
-  **unsigned** installers. Contributors never need signing access.
+  **unsigned** Windows installers. Contributors never need signing access.
+  (The macOS `.pkg` is the one exception: canonical-repo `v*` tag builds sign
+  and notarize it in CI from org-level secrets — see *macOS track in CI*.)
 - **Releases are signed by a signing provider** — a repo that owns the code-
   signing certificate on a self-hosted runner and exposes it through two
   `workflow_dispatch` workflows (below). The release skills dispatch it,
@@ -143,7 +145,8 @@ certificate or a key.
 
 Modes: `sign-tree <dir> [--entitlements-map <file>]`, `sign-pkg`, `notarize`,
 `staple`, `finalize-pkg` (sign-pkg → notarize → staple, each only when its
-credentials are present), `status`.
+credentials are present), `verify-pkg`, `status`, and the CI modes
+`ci-secrets-check`, `ci-keychain-setup`, `ci-keychain-teardown` (below).
 
 **Rules the script enforces** (each one cost a rejected notarization or a
 SIGKILL somewhere before):
@@ -182,3 +185,56 @@ export DXR_MACOS_INSTALLER_IDENTITY="Developer ID Installer: <Org> (<TEAM>)"
 export DXR_NOTARY_PROFILE=<profile>
 ./scripts/build_macos.sh --installer      # or: installer/macos/build_installer.sh <artifact-dir> <out.pkg>
 ```
+
+### macOS track in CI — signed on the tag build itself
+
+Unlike Windows (EV cert on a self-hosted box, so `/release` re-signs after CI),
+the macOS identities are ordinary `.p12` files plus an App Store Connect API
+key, so the **GitHub-hosted** `BuildInstaller` job in `build-macos.yml` signs
+and notarizes the release `.pkg` directly. No provider repo and no
+`DXR_SIGN_REPO` are involved.
+
+**Gate** — all three must hold, otherwise the job builds the unsigned `.pkg` it
+always did and stays green:
+1. `github.repository == DisplayXR/displayxr-runtime` (forks never sign);
+2. the ref is a `v*` tag (PRs and `main` pushes never sign);
+3. every org-level secret below is non-empty (`ci-secrets-check`; absence is a
+   `::notice::`, not a failure — they are being provisioned one by one).
+
+| Org secret | Format |
+|---|---|
+| `MACOS_APP_CERT_P12` / `MACOS_APP_CERT_PASSWORD` | base64 of the `Developer ID Application` `.p12` (`base64 -i app.p12`) / its export password |
+| `MACOS_INSTALLER_CERT_P12` / `MACOS_INSTALLER_CERT_PASSWORD` | base64 of the `Developer ID Installer` `.p12` / its export password |
+| `APPLE_TEAM_ID` | 10-char Team ID; both identities must carry `(<TEAM>)` |
+| `APPLE_NOTARY_KEY_P8` | the raw `AuthKey_<id>.p8` text, BEGIN/END lines included |
+| `APPLE_NOTARY_KEY_ID` / `APPLE_NOTARY_ISSUER_ID` | that API key's Key ID / the App Store Connect Issuer ID |
+
+**Flow** (`build-macos.yml`, `BuildInstaller`):
+1. `ci-keychain-setup --env-out "$GITHUB_ENV"` — a throwaway keychain under
+   `$RUNNER_TEMP` with a random password, both `.p12`s + Apple's Developer ID
+   intermediates imported, `set-key-partition-list` so codesign/productsign
+   need no prompt, the `.p8` written `0600`; exports the `DXR_*` variables of
+   the table above. The secrets are in the environment of this one step only.
+2. Build with `DXR_MACOS_INSTALLER_IDENTITY` withheld: `sign-tree` gives every
+   payload Mach-O its Developer ID + hardened-runtime signature as the last step
+   after all patching, and the product archive comes out unsigned.
+3. A separate step keeps a copy of that unsigned `.pkg`, runs `finalize-pkg`
+   (productsign → `notarytool submit --wait` with the API key → staple) and
+   `verify-pkg` (`pkgutil --check-signature`, `stapler validate`,
+   `spctl --assess --type install` = `source=Notarized Developer ID`).
+4. The upload + release-attach steps publish whatever `_package/` holds.
+5. `ci-keychain-teardown` (`if: always()`) restores the search list and
+   deletes the keychain and key files.
+
+**Fallback — signing never gates publishing.** If identity import fails, the
+job builds unsigned. If Developer ID signing of the payload fails (e.g. the
+timestamp server is unreachable), `build_installer.sh` falls back to the ad-hoc
+tree (`DXR_MACOS_SIGN_FALLBACK=adhoc`) and the notarize step is skipped. If
+productsign / notarization / stapling / verification fails, the saved unsigned
+`.pkg` is restored. Each of these emits a `::warning::` and the job stays green;
+the job summary states which `.pkg` shipped. To retry, re-run the macOS job on
+the tag; `softprops/action-gh-release` replaces a same-named asset. `/release` reports the outcome by checking the
+attached `.pkg` with `pkgutil --check-signature` (Phase 6).
+
+Rollout (#280): runtime first (this section), then the other `.pkg`-shipping
+repos (MCP, shell, demos) reuse the same script + secret names, bundle last.
