@@ -12363,7 +12363,11 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 	}
 	// `suspended` is the workspace-deactivate quiesce (Ctrl+Space) — same
 	// teardown, different trigger, and it already released the DP.
-	if (mc->suspended || mc->client_count != 0 || mc->capture_client_count != 0) {
+	// An active workspace controller is not in `clients[]` (it owns the
+	// workspace, it is not a slot in it), so a controller with no apps open
+	// would read as idle and freeze its own launcher/chrome after the grace
+	// period. The controller keeps the pipeline up while the workspace is on.
+	if (mc->suspended || sys->workspace_mode || mc->client_count != 0 || mc->capture_client_count != 0) {
 		mc->idle_since_ns = 0;
 		return false;
 	}
