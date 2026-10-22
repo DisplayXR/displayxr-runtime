@@ -68,6 +68,10 @@ struct conv_ring_slot
 	float rect_size[2];
 	bool discontinuity;
 	bool provisional;
+	//! ADR-058: when the eyes this result's views were placed for were
+	//! sampled (the S3 snapshot's timestamp; the conversion start for the
+	//! nominal viewer or a task without S3). Feeds the internal placement age.
+	uint64_t placed_eyes_ns;
 };
 
 struct conv_stream

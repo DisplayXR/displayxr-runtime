@@ -45,6 +45,8 @@ set(tests
     tests_conv_viewsyn_math
     tests_aux_lift_viewpoint
     tests_aux_lift_rig_depth
+    tests_aux_lift_reproject
+    tests_lift_late_viewsyn_conformance
     tests_space_overseer_rig
     tests_rig_composer
     tests_aux_x11_scale
@@ -1498,10 +1500,8 @@ add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURC
 					 ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared
 	)
 
-# ADR-053 S5: the reference view synthesis' pure math, compiled straight into
-# the unit (no graphics API), like tests_comp_rear_budget.
-target_sources(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/u_conv_viewsyn.c)
-target_include_directories(tests_conv_viewsyn_math PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# ADR-053 S5: the reference view synthesis' pure math lives in aux_util
+# (u_conv_viewsyn), which every unit links; no graphics API.
 if(TARGET tests_conv_host_lane_d3d11)
 	target_link_libraries(tests_conv_host_lane_d3d11 PRIVATE comp_d3d11_conv_host_lane d3d11 dxgi)
 endif()

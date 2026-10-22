@@ -27,14 +27,13 @@ add_custom_command(
 
 # ADR-053 S5: the reference view synthesis (port of the browser's live-dibr.js).
 # Its own small library so conv_pipeline and the WARP unit test link it without
-# the service compositor; the platform-neutral math (compositor/util) rides along.
+# the service compositor; the platform-neutral math is aux_util's u_conv_viewsyn
+# (shared with ADR-058's u_lift_reproject CPU reference).
 add_library(
 	comp_d3d11_conv_viewsyn STATIC
 	d3d11_conv_viewsyn.cpp
 	d3d11_conv_viewsyn.h
 	d3d11_conv_viewsyn_shaders.h
-	../util/u_conv_viewsyn.c
-	../util/u_conv_viewsyn.h
 	)
 target_include_directories(comp_d3d11_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(comp_d3d11_conv_viewsyn PUBLIC xrt-interfaces aux_util PRIVATE ${D3D11_LIBRARY} d3dcompiler)

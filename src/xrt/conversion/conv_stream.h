@@ -197,6 +197,14 @@ struct conv_stream_stats
 	bool composed;
 	char provider_id[64]; //!< diagnostics only, never the app API
 	uint32_t cap_id;
+	/*! ADR-058 decision 4, INTERNAL until the append-only XrLiftStreamStatsDXR
+	 *  change lands with the ADR (not on the wire): the latest result's content
+	 *  age (now - its frame's submit) and placement age (now - the eyes its
+	 *  views were placed for). Equal-ish today (placement happens at
+	 *  conversion); late placement makes the second one a display-frame age.
+	 *  0 / 0 before the first result. */
+	uint64_t content_age_ns;
+	uint64_t placement_age_ns;
 };
 
 //! Per-stream options the v3 handlers / service add to the wire descriptor.

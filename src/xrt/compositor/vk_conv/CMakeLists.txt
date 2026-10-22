@@ -20,20 +20,18 @@ spirv_shaders(
 	)
 
 # The stage on its own, so the conversion pipeline's tests link it without the
-# glue; the platform-neutral math (compositor/util) rides along, as it does in
+# glue; the platform-neutral math is aux_util's u_conv_viewsyn, as for
 # comp_d3d11_conv_viewsyn.
 add_library(
 	comp_vk_conv_viewsyn STATIC
 	${VK_CONV_SHADER_HEADERS}
 	vk_conv_viewsyn.c
 	vk_conv_viewsyn.h
-	../util/u_conv_viewsyn.c
-	../util/u_conv_viewsyn.h
 	)
 target_include_directories(comp_vk_conv_viewsyn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # Generated SPIR-V headers land under the binary dir mirroring shaders/.
 target_include_directories(comp_vk_conv_viewsyn PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(comp_vk_conv_viewsyn PUBLIC xrt-interfaces aux_vk PRIVATE aux_util)
+target_link_libraries(comp_vk_conv_viewsyn PUBLIC xrt-interfaces aux_vk aux_util)
 
 # Image allocation (exportable VkImages), CPU <-> image, S5 adapter, S6 readback.
 add_library(comp_vk_conv STATIC vk_conv_gpu.c vk_conv_gpu.h vk_conv_weave.c vk_conv_weave.h)

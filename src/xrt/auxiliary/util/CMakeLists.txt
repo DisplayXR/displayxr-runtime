@@ -26,6 +26,8 @@ add_library(
 	u_bg_neutrality.c
 	u_bg_neutrality.h
 	u_bitwise.c
+	u_conv_viewsyn.c
+	u_conv_viewsyn.h
 	u_cursor_depth.c
 	u_cursor_depth.h
 	u_lift_autoconv.c
@@ -36,6 +38,8 @@ add_library(
 	u_lift_depth.h
 	u_lift_mailbox.c
 	u_lift_mailbox.h
+	u_lift_reproject.c
+	u_lift_reproject.h
 	u_lift_rig.c
 	u_lift_rig.h
 	u_lift_viewpoint.c
