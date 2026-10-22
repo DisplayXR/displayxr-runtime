@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-10-22
 deciders: David Fattal
 issues: []
@@ -8,7 +8,7 @@ related: [ADR-042, ADR-048, ADR-053, ADR-054, ADR-057, ADR-047, ADR-055]
 
 # ADR-058: Late view synthesis and depth reprojection — converted content is placed at the eyes of the frame it is shown in, not the frame it was converted for
 
-**Status:** Proposed (2026-10-22) · builds on
+**Status:** Accepted (2026-10-22, owner go) · builds on
 [ADR-053](ADR-053-conversion-providers.md) (conversion providers, the composed pipeline S0–S8,
 latest-wins streams), [ADR-048](ADR-048-lift-viewpoint-policy.md) + Addendum A (viewpoint
 policy, auxiliary depth, `depthToDisplay`) and [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md)
