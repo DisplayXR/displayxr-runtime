@@ -261,6 +261,7 @@ jobs:
 
       - name: Runtime carries the checkout's version (#1790)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
         run: |
           ./scripts/check_runtime_version.sh --build-dir build \
             --binary build/src/xrt/targets/openxr/openxr_displayxr.so \
@@ -494,6 +495,7 @@ jobs:
       # tag on a v* push, which is the asset DebRelease attaches.
       - name: Runtime + .deb carry the checkout's version (#1790)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash # container jobs default to sh: no shopt / arrays
         run: |
           shopt -s nullglob
           debs=(dist/displayxr-runtime_*_amd64.deb)
