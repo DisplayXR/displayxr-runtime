@@ -180,9 +180,14 @@ Folded in from the Windows and Linux reviews on PR #2283 and the first hardware 
    that contains the rect's centre, with the per-screen coverage dwell of #2256 as hysteresis;
    per-segment placement is a later refinement. One DP, one eye sample, one placement per rect
    per frame.
-3. **One eye sample per frame.** The late synthesis and the weave consume the **same**
-   target-time eye sample for that frame (the DP's target-time query); they must never sample
-   separately, or placement and weave disagree by a prediction step.
+3. **One runtime-side eye sample per frame.** Each weave asks the display processor once for
+   the eyes at the frame's target time (the DP's target-time query, N6), and every runtime-side
+   consumer of that frame — the late synthesis, the eyes returned to the caller, the eyes the
+   conversion core publishes — uses that one answer; none samples separately. This does **not**
+   reach inside the weaver: a vendor weaver picks its own internal eye position for phase and
+   sub-pixel mapping and never exposes it (ADR-033: the weaver owns all phase). The residual
+   between the DP's target-time answer and the weaver's internal pose is the same one every
+   rendered app already has with the weaver; ADR-058 removes the conversion staleness, not that.
 4. **Inside the governor's span.** The late synthesis runs inside the late-weave governor's
    measured span (ADR-047), so its cost moves the weave start like any other weave work instead
    of silently eating the scanout margin.
