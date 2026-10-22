@@ -280,6 +280,12 @@ Phase 2.1) and bare `git describe` walks only *annotated* tags. Without it every
 APK from v2.14.5 to v2.16.14 named itself `v2.14.5-<n>-g<sha>` while being built
 from a v2.16.x commit.
 
+The runtime `.so` inside the APK reports the same release: its `runtimeName` tag
+is the same describe as `versionName` (minus `-dirty`), and its
+`xrGetInstanceProperties` `runtimeVersion` is that describe's `X.Y.Z`
+(`cmake/DisplayXRVersion.cmake`; before #1790 it said `1.6.0` in every APK).
+build-android.yml's "Inspect APK" step checks the `.so` for that string.
+
 **`versionCode`** is positional arithmetic over
 `git describe --tags --long`, *not* string concatenation:
 

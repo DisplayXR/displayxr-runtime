@@ -558,6 +558,20 @@ jobs:
           fi
           echo "  ok: versionCode=$vcode versionName=$vname (monotonic vs 214500291, matches $describe)"
 
+          # #1790: the runtime .so inside reports the same version. Its
+          # runtimeName tag is the same `git describe` as versionName (never
+          # -dirty), and cmake/DisplayXRVersion.cmake derives its runtimeVersion
+          # NUMBER from that one describe, so this string pins both. Before
+          # #1790 every APK's runtime reported 1.6.0 whatever versionName said.
+          # grep -c (not -q) reads to EOF: no SIGPIPE race under pipefail.
+          so_desc="${vname%-dirty}"
+          so_hits=$(unzip -p "$APK" lib/arm64-v8a/libopenxr_displayxr.so | strings -a | grep -cxF -- "$so_desc" || true)
+          if [ "${so_hits:-0}" -lt 1 ]; then
+            echo "::error::lib/arm64-v8a/libopenxr_displayxr.so does not carry '$so_desc' -- the runtime would report another version than the APK it ships in (#1790)."
+            exit 1
+          fi
+          echo "  ok: libopenxr_displayxr.so carries '$so_desc' (runtimeName / runtimeVersion)"
+
           need() {
             if ! grep -q "lib/arm64-v8a/$1" <<<"$APK_LIST"; then
               echo "::error::APK is missing lib/arm64-v8a/$1 — $2"

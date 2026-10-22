@@ -107,6 +107,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Install dependencies
         # GL/EGL dev libs flip XRT_HAVE_OPENGL/XRT_HAVE_EGL ON so CI configures
@@ -258,6 +259,14 @@ jobs:
           ./scripts/build_linux.sh --hybrid --no-test
           ./scripts/package_linux.sh --no-build
 
+      - name: Runtime carries the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --binary build/src/xrt/targets/openxr/openxr_displayxr.so \
+            --cli build/src/xrt/targets/cli/displayxr-cli
+
       - name: Install from tarball + selftest from installed paths
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
@@ -336,6 +345,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Build service + IPC-client runtime + headless selftest
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -355,6 +365,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Install dependencies
         # GL/EGL (+Xrandr/Xxf86vm) dev libs: same rationale as the Selftest
@@ -478,6 +489,20 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/package_deb_linux.sh
           echo "built:"; ls -lh dist/displayxr-runtime_*_amd64.deb
+
+      # #1790: the .deb's runtime reports the checkout's version (it said 1.6.0
+      # in every .deb up to here), and the .deb is named after it -- exactly the
+      # tag on a v* push, which is the asset DebRelease attaches.
+      - name: Runtime + .deb carry the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash # container jobs default to sh: no shopt / arrays
+        run: |
+          shopt -s nullglob
+          debs=(dist/displayxr-runtime_*_amd64.deb)
+          [ "${#debs[@]}" -eq 1 ] || { echo "::error::expected exactly one .deb, found: ${debs[*]:-none}"; exit 1; }
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --binary build/src/xrt/targets/openxr/openxr_displayxr.so \
+            --package "${debs[0]}"
 
       - name: Upload .deb artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'

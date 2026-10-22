@@ -140,7 +140,24 @@ done
     echo "error: missing scripts/linux/displayxr-gnome-extension-enable" >&2; exit 1
 }
 
-VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# The describe the binaries were BUILT with (cmake/DisplayXRVersion.cmake writes
+# it next to the build, #1790), so the tarball's name and VERSION file match
+# the runtimeVersion / git tag the runtime reports. -dirty is about the
+# checkout now, which the configure-time stamp cannot know.
+VERSION_FILE="$BUILD_DIR/displayxr-version.txt"
+[ -f "$VERSION_FILE" ] || {
+    echo "error: $VERSION_FILE missing -- the build predates #1790's version stamp; rebuild." >&2
+    exit 1
+}
+VERSION="$(sed -n 's/^DXR_RUNTIME_VERSION_DESCRIBE=//p' "$VERSION_FILE")"
+[ -n "$VERSION" ] || { echo "error: no DXR_RUNTIME_VERSION_DESCRIBE in $VERSION_FILE" >&2; exit 1; }
+if ! grep -qxF "$VERSION" <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO does not carry '$VERSION' (from $VERSION_FILE) -- stale build?" >&2
+    exit 1
+fi
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    VERSION="$VERSION-dirty"
+fi
 ARCH="$(uname -m)"
 NAME="displayxr-runtime-linux-$ARCH-$VERSION"
 STAGE="$DIST_DIR/$NAME"

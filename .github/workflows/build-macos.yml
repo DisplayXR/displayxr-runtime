@@ -79,6 +79,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+          # History + tags: the runtime versions itself from `git describe`
+          # (cmake/DisplayXRVersion.cmake, #1790).
+          fetch-depth: 0
 
       - name: Doc-only PR — skipping macOS build
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -126,6 +129,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+          # History + tags: the runtime AND the .pkg are versioned from `git
+          # describe` (cmake/DisplayXRVersion.cmake, #1790).
+          fetch-depth: 0
 
       - name: Doc-only PR — skipping installer build
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -139,32 +145,29 @@ jobs:
           BREW_PREFIX=$(brew --prefix)
           echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
 
-      - name: Derive installer version
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            # `v1.2.3` → `1.2.3` for productbuild's --version arg
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          else
-            # Untagged builds get a sha-suffixed dev string so the
-            # manifest's `version` field is at least traceable to the
-            # commit that produced the .pkg.
-            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building installer with VERSION=$VERSION"
-
+      # The .pkg is named after the version the runtime was built as (#1790):
+      # build_macos.sh reads it from the stamp cmake/DisplayXRVersion.cmake
+      # writes next to the build -- X.Y.Z on a v* tag, X.Y.Z+<n>.g<sha>
+      # otherwise (was 0.0.0-dev.<sha>, while the runtime inside said 1.6.0).
       - name: Build runtime + test app + installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        env:
-          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build_macos.sh --installer
+
+      # #1790: the runtime inside the .pkg reports the checkout's version, and
+      # the .pkg is named after it (exactly the tag on a v* push).
+      - name: Runtime + .pkg carry the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(_package/DisplayXR-Installer-*.pkg)
+          [ "${#pkgs[@]}" -eq 1 ] || { echo "::error::expected exactly one .pkg, found: ${pkgs[*]:-none}"; exit 1; }
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --binary build/src/xrt/targets/openxr/openxr_displayxr.dylib \
+            --package "${pkgs[0]}"
 
       - name: Assert .pkg payload includes plug-in + manifest (#274 regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        env:
-          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           # Filename is versioned post-PR #279

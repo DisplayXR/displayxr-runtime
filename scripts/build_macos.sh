@@ -589,16 +589,21 @@ chmod +x "$PKG_DIR/run_cube_hosted_legacy_vk.sh"
 
 
 # Step 5: Build .pkg installer (optional). Versioned filename mirrors
-# Windows' `DisplayXRSetup-X.Y.Z.NNN.exe`; DISPLAYXR_VERSION is also
-# baked into the .pkg's internal version + the sim-display manifest,
-# so it's the single source of truth across the artifact.
+# Windows' `DisplayXRSetup-X.Y.Z.exe`; the version is also baked into the
+# .pkg's internal version + the sim-display manifest.
 #
-# Falls back to a sha-suffixed dev string for local builds with no
-# explicit version set — matches build-macos.yml's BuildInstaller job.
+# The version is the one the runtime was BUILT with (#1790):
+# cmake/DisplayXRVersion.cmake writes it next to the build -- X.Y.Z on a
+# release tag, X.Y.Z+<n>.g<sha> on any other commit -- so the .pkg name and
+# the runtimeVersion the installed runtime reports cannot disagree. An explicit
+# DISPLAYXR_VERSION still wins (a caller that knows better).
 if [ "$BUILD_INSTALLER" = "ON" ]; then
   if [ -z "${DISPLAYXR_VERSION:-}" ]; then
-    GIT_SHA=$(git -C "$ROOT" rev-parse --short=8 HEAD 2>/dev/null || echo "local")
-    INSTALLER_VERSION="0.0.0-dev.$GIT_SHA"
+    INSTALLER_VERSION="$(sed -n 's/^DXR_RUNTIME_VERSION_PACKAGE=//p' "$BUILD_DIR/displayxr-version.txt" 2>/dev/null || true)"
+    if [ -z "$INSTALLER_VERSION" ]; then
+      echo "error: no DXR_RUNTIME_VERSION_PACKAGE in $BUILD_DIR/displayxr-version.txt (#1790)" >&2
+      exit 1
+    fi
   else
     INSTALLER_VERSION="$DISPLAYXR_VERSION"
   fi
