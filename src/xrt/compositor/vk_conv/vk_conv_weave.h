@@ -72,6 +72,7 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_lift.h"
 #include "xrt/xrt_conversion_plugin.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -149,6 +150,16 @@ struct vk_conv_weave_rect
 
 	//! Where the rect is (display space) and whose eyes its stream reads.
 	struct xrt_lift_rect_frame frame;
+
+	/*!
+	 * ADR-058 Amendment 1: how the late view synthesis places the rect this
+	 * frame. 0 = the stream's eyes snapshot (no engine sample); 1 = the
+	 * frame's ONE target-time sample @ref frame_eyes, the same the weave and
+	 * its reply consume; 2 = keep the conversion's viewpoints (a straddling
+	 * rect whose centre screen is not the sample's). = CONV_LATE_EYES_*.
+	 */
+	uint32_t eyes_mode;
+	struct xrt_eye_positions frame_eyes;
 };
 
 /*!

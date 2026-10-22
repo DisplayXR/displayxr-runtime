@@ -280,6 +280,28 @@ d3d11_lift_submit_srv_locked(struct d3d11_lift *lift,
 bool
 d3d11_lift_pin_latest(struct d3d11_lift *lift, uint64_t owner, uint64_t id, struct d3d11_lift_pin *out);
 
+/*!
+ * ADR-058 Amendment 1, render thread, once per weave before any lifted rect:
+ * this weave's ONE eye sample (@p eyes, the DP's target-time answer the
+ * submit's reply also carries; NULL = none: rects read the stream's eyes
+ * snapshot) and the window's segment table (@p segs, NULL / count < 2 = one
+ * screen) for the straddle rule.
+ */
+void
+d3d11_lift_set_frame_place(struct d3d11_lift *lift,
+                           const struct xrt_eye_positions *eyes,
+                           const struct xrt_segment_metrics *segs);
+
+/*!
+ * d3d11_lift_pin_latest for a lifted rect whose CENTRE is at window pixel
+ * (@p cx, @p cy): a late source is placed with the frame's sample, or keeps
+ * its conversion placement while that centre sits (with the #2256 dwell) on
+ * another screen than the sample's.
+ */
+bool
+d3d11_lift_pin_latest_at(
+    struct d3d11_lift *lift, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, struct d3d11_lift_pin *out);
+
 //! ADR-046 Amendment 1: also take the pinned result's depth map (its keyed
 //! mutex, without waiting). False = the result has none, or it is busy this
 //! frame. Released by d3d11_lift_unpin.

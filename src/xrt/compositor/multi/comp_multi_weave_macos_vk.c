@@ -1210,6 +1210,7 @@ vkb_lift_record_batch(struct multi_compositor *mc, VkCommandBuffer cmd, const st
 		r.tile_h = mc->weave.out_h;
 		r.batch = true;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, &r);
 		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
 	}
 }
@@ -1258,6 +1259,7 @@ vkb_lift_record_nview(struct multi_compositor *mc, VkCommandBuffer cmd, const st
 		r.tile_h = p->cvh;
 		r.batch = false;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, &r);
 		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
 	}
 }

@@ -2308,7 +2308,8 @@ core_weave_submit_locked(d3d11_lift *l,
  * and hand that texture out as the pin's views. False = weave flat.
  */
 static bool
-core_pin_late(d3d11_lift *l, conv_core *core, uint64_t core_id, const conv_result &r, d3d11_lift_pin *out)
+core_pin_late(
+    d3d11_lift *l, conv_core *core, uint64_t core_id, const conv_result &r, int32_t cx, int32_t cy, d3d11_lift_pin *out)
 {
 	const uint64_t now = os_monotonic_get_ns();
 	// Streams no longer woven let their views go (10 s unused).
@@ -2331,7 +2332,30 @@ core_pin_late(d3d11_lift *l, conv_core *core, uint64_t core_id, const conv_resul
 			        (unsigned long long)core_id, why);
 		}
 	};
-	if (!conv_core_stream_late_prepare(core, core_id, r.ring_slot, nullptr, now, &ls.cache, &lf)) {
+	// ADR-058 Amendment 1: the weave's ONE sample; a rect centred (dwelled)
+	// on another screen than the sample's keeps its conversion placement.
+	uint32_t mode = l->late_have_eyes ? CONV_LATE_EYES_SAMPLE : CONV_LATE_EYES_SNAPSHOT;
+	if (l->late_have_eyes && l->late_segs.count >= 2 && cx != INT32_MIN) {
+		uint64_t under = 0;
+		for (uint32_t i = 0; i < l->late_segs.count && i < XRT_MAX_SEGMENTS; i++) {
+			const xrt_segment_metric &s = l->late_segs.seg[i];
+			if (cx >= s.window_rect.offset.w && cx < s.window_rect.offset.w + s.window_rect.extent.w &&
+			    cy >= s.window_rect.offset.h && cy < s.window_rect.offset.h + s.window_rect.extent.h) {
+				under = s.screen_id != 0 ? s.screen_id : (uint64_t)i + 1u;
+				break;
+			}
+		}
+		const uint64_t at = u_lift_reproject_screen_dwell_update(&ls.straddle, under, now);
+		for (uint32_t i = 0; i < l->late_segs.count && i < XRT_MAX_SEGMENTS; i++) {
+			const xrt_segment_metric &s = l->late_segs.seg[i];
+			if ((s.screen_id != 0 ? s.screen_id : (uint64_t)i + 1u) == at && !s.is_primary) {
+				mode = CONV_LATE_EYES_RECORDED;
+			}
+		}
+	}
+	conv_eyes fe;
+	conv_eyes_from_xrt(&l->late_eyes, &fe);
+	if (!conv_core_stream_late_prepare_ex(core, core_id, r.ring_slot, mode, &fe, now, &ls.cache, &lf)) {
 		warn("prepare");
 		return false;
 	}
@@ -2439,7 +2463,7 @@ core_pin_late(d3d11_lift *l, conv_core *core, uint64_t core_id, const conv_resul
 }
 
 bool
-core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
+core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, d3d11_lift_pin *out)
 {
 	conv_core *core = nullptr;
 	uint64_t core_id = 0;
@@ -2455,7 +2479,7 @@ core_pin_latest(d3d11_lift *l, uint64_t owner, uint64_t id, d3d11_lift_pin *out)
 	glue_img vg, dg;
 	if (r.late) {
 		// ADR-058: a composed result kept as its source.
-		if (!core_pin_late(l, core, core_id, r, out)) {
+		if (!core_pin_late(l, core, core_id, r, cx, cy, out)) {
 			conv_core_stream_release(core, core_id, r.ring_slot);
 			glue_leave(l);
 			return false;
@@ -2596,7 +2620,31 @@ d3d11_lift_pin_latest(struct d3d11_lift *l, uint64_t owner, uint64_t id, struct 
 	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
 		return false;
 	}
-	return core_pin_latest(l, owner, id, out);
+	return core_pin_latest(l, owner, id, INT32_MIN, INT32_MIN, out);
+}
+
+void
+d3d11_lift_set_frame_place(struct d3d11_lift *l,
+                           const struct xrt_eye_positions *eyes,
+                           const struct xrt_segment_metrics *segs)
+{
+	if (l == nullptr) {
+		return;
+	}
+	l->late_have_eyes = eyes != nullptr && eyes->valid;
+	l->late_eyes = l->late_have_eyes ? *eyes : xrt_eye_positions{};
+	l->late_segs = segs != nullptr ? *segs : xrt_segment_metrics{};
+}
+
+bool
+d3d11_lift_pin_latest_at(
+    struct d3d11_lift *l, uint64_t owner, uint64_t id, int32_t cx, int32_t cy, struct d3d11_lift_pin *out)
+{
+	*out = d3d11_lift_pin{};
+	if (l == nullptr || (id & D3D11_LIFT_CORE_STREAM_TAG) == 0) {
+		return false;
+	}
+	return core_pin_latest(l, owner, id, cx, cy, out);
 }
 
 void

@@ -29069,7 +29069,9 @@ lift_weave_rect_batch(struct d3d11_service_system *sys,
 	const float atw = (float)(win_w * 2), ath = (float)win_h;
 
 	struct d3d11_lift_pin pin = {};
-	if (d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) && pin.view_count >= 1) {
+	if (d3d11_lift_pin_latest_at(lift, owner, b->stream_id, rect.offset.w + rect.extent.w / 2,
+	                             rect.offset.h + rect.extent.h / 2, &pin) &&
+	    pin.view_count >= 1) {
 		uint32_t vl = 0, vr = 0;
 		lift_pick_pair(pin.view_count, &vl, &vr);
 		const float vw = (float)pin.width / (float)pin.view_count;
@@ -29195,7 +29197,9 @@ lift_weave_rects_nview(struct d3d11_service_system *sys,
 		    b->rig.type != XRT_LIFT_RIG_NONE ? &b->rig : nullptr, &frame, &frame_id);
 
 		struct d3d11_lift_pin pin = {};
-		if (!d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) || pin.view_count == 0) {
+		if (!d3d11_lift_pin_latest_at(lift, owner, b->stream_id, r.offset.w + r.extent.w / 2,
+		                              r.offset.h + r.extent.h / 2, &pin) ||
+		    pin.view_count == 0) {
 			continue;
 		}
 		const float vw = (float)pin.width / (float)pin.view_count;
@@ -31290,6 +31294,31 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// anything else, so its submit is the single-DP one, byte for byte.
 	struct comp_seg_rect seg_win = {};
 	const bool seg_split = !legacy_single_rect && weave_seg_update(sys, c, wnd, win_w, win_h, &seg_win);
+
+	// ADR-058 Amendment 1 item 3: ONE eye sample for this weave — the DP's
+	// target-time answer one refresh ahead (its "latest" without the slot) —
+	// taken before any lifted rect is placed; the reply below hands back the
+	// same one. Item 2: the segment table for the rect-centre straddle rule.
+	struct xrt_eye_positions lift_eyes = {};
+	bool have_lift_eyes = false;
+	if (lift != nullptr && dp != nullptr) {
+		const float hz = sys->refresh_rate > 1.0f ? sys->refresh_rate : 60.0f;
+		const int64_t target = (int64_t)os_monotonic_get_ns() + (int64_t)(1e9 / hz);
+		have_lift_eyes = xrt_display_processor_d3d11_has_eye_positions_at(dp) &&
+		                 xrt_display_processor_d3d11_get_eye_positions_at(dp, target, &lift_eyes) &&
+		                 lift_eyes.valid;
+		if (!have_lift_eyes) {
+			have_lift_eyes =
+			    xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &lift_eyes) && lift_eyes.valid;
+		}
+		struct xrt_segment_metrics lift_segs = {};
+		if (seg_split && c->weave_segs != nullptr) {
+			const struct comp_seg_rect canvas = {0, 0, win_w, win_h};
+			(void)comp_d3d11_segments_get_metrics(c->weave_segs, &seg_win, &canvas, /*primary_has_dp*/ true,
+			                                      &lift_segs);
+		}
+		d3d11_lift_set_frame_place(lift, have_lift_eyes ? &lift_eyes : nullptr, &lift_segs);
+	}
 	bool clear_output = weave_frame_first;
 	if (weave_frame_first) {
 		c->render.weave_saw_frame_first = true;
@@ -31825,7 +31854,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// (look-around) projection for the NEXT pre-weave frame. The interlace
 	// itself is DP-internal — this is the only eye flow, and it's OUT.
 	if (out_eyes != nullptr) {
-		xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
+		if (have_lift_eyes) {
+			*out_eyes = lift_eyes; // the sample the lifted rects were placed with
+		} else {
+			xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
+		}
 	}
 	// #1884: and what this weave did per screen, with every screen's eyes,
 	// for the caller's XrWeaveOutputRectPartsDXR (weave_get_segments). A
@@ -38728,6 +38761,10 @@ comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3
 		if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
 		    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(&desc))) {
 			out->adapter_luid = (uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32 | desc.AdapterLuid.LowPart;
+			// An iGPU reports little or no dedicated memory (it borrows system RAM).
+			out->adapter_class = desc.DedicatedVideoMemory < (SIZE_T)512 * 1024 * 1024
+			                         ? CONV_ADAPTER_INTEGRATED
+			                         : CONV_ADAPTER_DISCRETE;
 		}
 	}
 	return true;

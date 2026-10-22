@@ -316,6 +316,7 @@ TEST_CASE("ADR-058 conformance: display-placed metric depth, 4 fps provider, swa
 #include "conversion/conv_core.h"
 #include "conversion/conv_stream.h"
 #include "conv_fake_provider.h"
+#include "xrt/xrt_display_metrics.h"
 #include "os/os_time.h"
 
 #include <atomic>
@@ -722,6 +723,135 @@ TEST_CASE("ADR-058 conformance through the core: ring + late stage at 4 fps vs c
 		CHECK_FALSE(conv_core_stream_late_prepare(off.c, off.sid, r.ring_slot, nullptr, os_monotonic_get_ns(),
 		                                          &cache, &lf));
 		conv_core_stream_release(off.c, off.sid, r.ring_slot);
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("ADR-058 Amendment 1: the late synthesis uses the frame's ONE eye sample", "[lift_late][core][amendment1]")
+{
+	conv_fake_provider f;
+	conv_fake_init(&f, "depth-fake");
+	conv_fake_cap *cap =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	cap->state = XRT_CONV_STATE_READY;
+	const std::vector<float> cf = make_color(kW, kH);
+	std::vector<uint8_t> rgba(cf.size());
+	for (size_t i = 0; i < cf.size(); i++) {
+		rgba[i] = (uint8_t)std::floor(cf[i] * 255.0f + 0.5f);
+	}
+	{
+		TestCore core(f, false, 0);
+		const float c0[3] = {0.0f, 0.0f, 0.6f};
+		float e0[2][3];
+		eye_pair(c0, e0);
+		core.eyes(e0);
+		REQUIRE(core.convert(rgba, kW, kH));
+		conv_result r{};
+		REQUIRE(conv_core_stream_acquire(core.c, core.sid, false, &r) == XRT_SUCCESS);
+		REQUIRE(r.late);
+
+		// The snapshot says A (turned one way); the weave's sample says B
+		// (turned the other way). SAMPLE must place at B, never re-read A.
+		float ea[2][3], eb[2][3];
+		eye_pair_yaw(c0, 0.3, ea);
+		eye_pair_yaw(c0, -0.3, eb);
+		core.eyes(ea);
+		xrt_eye_positions xb{};
+		xb.count = 2;
+		xb.valid = true;
+		xb.is_tracking = true;
+		xb.timestamp_ns = 123456789;
+		for (int i = 0; i < 2; i++) {
+			xb.eyes[i] = xrt_eye_position{eb[i][0], eb[i][1], eb[i][2]};
+		}
+		conv_eyes sb;
+		conv_eyes_from_xrt(&xb, &sb);
+		CHECK(sb.timestamp_ns == 123456789u);
+		CHECK(sb.count == 2u);
+
+		conv_late_cache cache{};
+		conv_late_frame from_sample, from_snapshot, recorded;
+		REQUIRE(conv_core_stream_late_prepare_ex(core.c, core.sid, r.ring_slot, CONV_LATE_EYES_SAMPLE, &sb,
+		                                         os_monotonic_get_ns(), &cache, &from_sample));
+		CHECK(from_sample.eyes_ns == 123456789u);
+		conv_late_cache cache2{};
+		REQUIRE(conv_core_stream_late_prepare_ex(core.c, core.sid, r.ring_slot, CONV_LATE_EYES_SNAPSHOT,
+		                                         nullptr, os_monotonic_get_ns(), &cache2, &from_snapshot));
+		// Publishing B as the snapshot gives exactly the SAMPLE placement.
+		core.eyes(eb);
+		conv_late_cache cache3{};
+		conv_late_frame snap_b;
+		REQUIRE(conv_core_stream_late_prepare_ex(core.c, core.sid, r.ring_slot, CONV_LATE_EYES_SNAPSHOT,
+		                                         nullptr, os_monotonic_get_ns(), &cache3, &snap_b));
+		for (int i = 0; i < 2; i++) {
+			for (int k = 0; k < 3; k++) {
+				CHECK(from_sample.req.viewpoints_m[i][k] == snap_b.req.viewpoints_m[i][k]);
+			}
+		}
+		// ... and differs from what the stale snapshot A would have said.
+		CHECK(std::fabs(from_sample.req.viewpoints_m[1][2] - from_snapshot.req.viewpoints_m[1][2]) > 0.005f);
+
+		// RECORDED keeps the conversion's viewpoints (a straddling rect).
+		conv_late_cache cache4{};
+		REQUIRE(conv_core_stream_late_prepare_ex(core.c, core.sid, r.ring_slot, CONV_LATE_EYES_RECORDED, &sb,
+		                                         os_monotonic_get_ns(), &cache4, &recorded));
+		CHECK(recorded.verdict == U_LIFT_REPROJECT_HOLD);
+		for (int i = 0; i < 2; i++) {
+			for (int k = 0; k < 3; k++) {
+				CHECK(recorded.req.viewpoints_m[i][k] == r.views_info.eye_xyz[i][k]);
+			}
+		}
+		conv_core_stream_release(core.c, core.sid, r.ring_slot);
+	}
+	conv_fake_fini(&f);
+}
+
+TEST_CASE("ADR-058 Amendment 1: adapter-aware late output size", "[lift_late][core][amendment1]")
+{
+	CHECK(conv_late_max_edge(0, CONV_ADAPTER_INTEGRATED) == 512u);
+	CHECK(conv_late_max_edge(0, CONV_ADAPTER_DISCRETE) == 960u);
+	CHECK(conv_late_max_edge(0, CONV_ADAPTER_APPLE) == 960u);
+	CHECK(conv_late_max_edge(0, CONV_ADAPTER_UNKNOWN) == 960u);
+	CHECK(conv_late_max_edge(640, CONV_ADAPTER_INTEGRATED) == 640u); // the environment wins
+	CHECK(conv_late_max_edge(1200, CONV_ADAPTER_DISCRETE) == 1200u);
+
+	// Through the core: the installed presenter's class sizes a 1280x720 rect.
+	conv_fake_provider f;
+	conv_fake_init(&f, "depth-fake");
+	conv_fake_cap *cap =
+	    conv_fake_add_cap(&f, 2, XRT_CONV_TASK_DEPTH_VIDEO, XRT_CONV_LANE_STREAM, XRT_CONV_OUT_DEPTH, 0);
+	cap->state = XRT_CONV_STATE_READY;
+	const uint32_t w = 1280, h = 720;
+	std::vector<uint8_t> rgba((size_t)w * h * 4, 0x80);
+	struct Case
+	{
+		uint32_t env, adapter, want_w, want_h;
+	} cases[] = {{0, CONV_ADAPTER_INTEGRATED, 512, 288},
+	             {0, CONV_ADAPTER_APPLE, 960, 540},
+	             {0, CONV_ADAPTER_DISCRETE, 960, 540},
+	             {640, CONV_ADAPTER_INTEGRATED, 640, 360}};
+	for (const Case &k : cases) {
+		TestCore core(f, false, k.env);
+		conv_core_gpu g{};
+		g.viewsyn.render = core_render;
+		g.adapter_class = k.adapter;
+		conv_core_set_gpu(core.c, &g);
+		const float c0[3] = {0.0f, 0.0f, 0.6f};
+		float e0[2][3];
+		eye_pair(c0, e0);
+		core.eyes(e0);
+		REQUIRE(core.convert(rgba, w, h));
+		conv_result r{};
+		REQUIRE(conv_core_stream_acquire(core.c, core.sid, false, &r) == XRT_SUCCESS);
+		REQUIRE(r.late);
+		conv_late_cache cache{};
+		conv_late_frame lf;
+		REQUIRE(conv_core_stream_late_prepare(core.c, core.sid, r.ring_slot, nullptr, os_monotonic_get_ns(),
+		                                      &cache, &lf));
+		INFO("env " << k.env << " adapter " << k.adapter);
+		CHECK(lf.view_w == k.want_w);
+		CHECK(lf.view_h == k.want_h);
+		conv_core_stream_release(core.c, core.sid, r.ring_slot);
 	}
 	conv_fake_fini(&f);
 }

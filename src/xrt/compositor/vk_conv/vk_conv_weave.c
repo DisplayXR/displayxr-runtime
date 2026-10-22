@@ -972,8 +972,10 @@ draw_late(struct vk_conv_weave *w,
 {
 	struct vk_bundle *vk = w->vk;
 	struct conv_late_frame lf;
-	if (!conv_core_stream_late_prepare(b->core, core_id, res->ring_slot, NULL, os_monotonic_get_ns(),
-	                                   &st->late_cache, &lf)) {
+	struct conv_eyes fe;
+	conv_eyes_from_xrt(&r->frame_eyes, &fe);
+	if (!conv_core_stream_late_prepare_ex(b->core, core_id, res->ring_slot, r->eyes_mode, &fe,
+	                                      os_monotonic_get_ns(), &st->late_cache, &lf)) {
 		late_warn(st, "prepare");
 		return false;
 	}
@@ -1069,6 +1071,7 @@ draw_late(struct vk_conv_weave *w,
 static bool
 late_host_result(struct vk_conv_weave *w,
                  struct vkcw_stream *st,
+                 const struct vk_conv_weave_rect *r,
                  const struct vk_conv_weave_bridge *b,
                  uint64_t core_id,
                  const struct conv_result *res,
@@ -1076,8 +1079,10 @@ late_host_result(struct vk_conv_weave *w,
                  struct vk_conv_gpu_image_ref *out_ref)
 {
 	struct conv_late_frame lf;
-	if (!conv_core_stream_late_prepare(b->core, core_id, res->ring_slot, NULL, os_monotonic_get_ns(),
-	                                   &st->late_cache, &lf)) {
+	struct conv_eyes fe;
+	conv_eyes_from_xrt(&r->frame_eyes, &fe);
+	if (!conv_core_stream_late_prepare_ex(b->core, core_id, res->ring_slot, r->eyes_mode, &fe,
+	                                      os_monotonic_get_ns(), &st->late_cache, &lf)) {
 		late_warn(st, "prepare");
 		return false;
 	}
@@ -1539,7 +1544,7 @@ vk_conv_weave_host_plan(struct vk_conv_weave *w,
 	memset(&res, 0, sizeof(res));
 	if (resolved && pin_latest(w, c, &b, core_id, &res, &ref)) {
 		const struct xrt_conv_image *v = &res.views;
-		if (res.late && !late_host_result(w, st, &b, core_id, &res, &v, &ref)) {
+		if (res.late && !late_host_result(w, st, &rc, &b, core_id, &res, &v, &ref)) {
 			v = NULL;
 		}
 		const bool exported = v != NULL && v->memory_kind == XRT_CONV_MEM_IOSURFACE && v->handle != 0 &&

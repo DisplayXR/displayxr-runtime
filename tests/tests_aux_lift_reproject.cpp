@@ -507,3 +507,20 @@ TEST_CASE("lift reproject: the presenter's re-run rule", "[lift_reproject]")
 	CHECK(u_lift_reproject_needs_rerun(turned, moved, 2, 1.0f, 1.0f));
 	CHECK(u_lift_reproject_needs_rerun(nullptr, base, 2, 1.0f, 1.0f));
 }
+
+TEST_CASE("lift reproject: straddling rect follows its centre screen with the #2256 dwell", "[lift_reproject]")
+{
+	u_lift_reproject_screen_dwell d;
+	u_lift_reproject_screen_dwell_init(&d, 0);
+	CHECK(d.hold_ns == U_LIFT_REPROJECT_SCREEN_HOLD_NS);
+	const uint64_t ms = 1000000ull;
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 7, 0) == 7u);        // first seen: at once
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 9, 10 * ms) == 7u);  // the centre crossed the seam
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 9, 400 * ms) == 7u); // still dwelling
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 7, 450 * ms) == 7u); // back: the dwell is cancelled
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 9, 460 * ms) == 7u); // a fresh dwell starts here
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 9, 900 * ms) == 7u); // 440 ms < 500 ms
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 9, 960 * ms) == 9u); // held 500 ms: it takes over
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 0, 970 * ms) == 9u); // unknown keeps the current
+	CHECK(u_lift_reproject_screen_dwell_update(&d, 7, 980 * ms) == 9u); // and the way back dwells too
+}

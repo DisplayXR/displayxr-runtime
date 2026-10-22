@@ -262,6 +262,7 @@ struct conv_validated
 struct conv_core
 {
 	struct conv_core_config cfg;
+	uint32_t late_adapter_class; //!< ADR-058: CONV_ADAPTER_* of the installed presenter (conv_core_set_gpu)
 	char preferred[XRT_CONV_TASK_RESERVED_FIRST][CONV_ID_MAX + 16];
 
 	/* registry_mtx: registry, readiness, generations, warm ops (leaf). */

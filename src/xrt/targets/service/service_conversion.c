@@ -1222,8 +1222,8 @@ service_conversion_start(void)
 		} else {
 			U_LOG_W(
 			    "[conv] late view synthesis ON (ADR-058): composed weave-rect views at each frame's "
-			    "eyes, per-view long edge %u, correction limit %.3f m",
-			    cfg.late_viewsyn_max_edge != 0 ? cfg.late_viewsyn_max_edge : CONV_LATE_MAX_EDGE_DEFAULT,
+			    "eyes, per-view long edge %s, correction limit %.3f m",
+			    cfg.late_viewsyn_max_edge != 0 ? me : "by adapter (960 discrete / Apple, 512 integrated)",
 			    cfg.reproject_max_m > 0.0f ? cfg.reproject_max_m : U_LIFT_REPROJECT_MAX_M_DEFAULT);
 		}
 	}

@@ -28,6 +28,7 @@
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_lift.h"
 
+#include "conversion/conv_core.h" // CONV_ADAPTER_*
 #include "conversion/conv_pipeline.h"
 #include "conversion/conv_provider_legacy_dp.h"
 #include "conversion/conv_stream.h"
@@ -112,6 +113,9 @@ struct comp_d3d11_conv_glue
 	//! LUID of the adapter the glue's images live on (the service's ingest
 	//! adapter); conversion-host satellites open their device on it (#2034).
 	uint64_t adapter_luid;
+	//! CONV_ADAPTER_* of that adapter (ADR-058 Amendment 1: the late output's
+	//! default size; integrated = under 512 MiB of dedicated video memory).
+	uint32_t adapter_class;
 };
 
 /*!

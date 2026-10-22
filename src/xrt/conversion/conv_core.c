@@ -1734,6 +1734,15 @@ conv_core_set_gpu(struct conv_core *core, const struct conv_core_gpu *gpu)
 		if (gpu->nominal_z_m > 0.0f) {
 			core->cfg.nominal_z_m = gpu->nominal_z_m;
 		}
+		core->late_adapter_class = gpu->adapter_class;
+		if (!core->cfg.late_viewsyn_off) {
+			static const char *names[] = {"unknown", "discrete", "integrated", "apple"};
+			U_LOG_W("[conv] late view synthesis: per-view long edge %u (%s; adapter %s)",
+			        conv_late_max_edge(core->cfg.late_viewsyn_max_edge, gpu->adapter_class),
+			        core->cfg.late_viewsyn_max_edge != 0 ? "DXR_LIFT_LATE_VIEWSYN_MAX_EDGE"
+			                                             : "adapter default",
+			        gpu->adapter_class < 4 ? names[gpu->adapter_class] : "unknown");
+		}
 	} else {
 		memset(&core->cfg.viewsyn, 0, sizeof(core->cfg.viewsyn));
 		memset(&core->cfg.readback, 0, sizeof(core->cfg.readback));

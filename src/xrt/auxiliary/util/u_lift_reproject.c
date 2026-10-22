@@ -357,6 +357,44 @@ u_lift_reproject_needs_rerun(
 
 /*
  *
+ * Straddling rects.
+ *
+ */
+
+void
+u_lift_reproject_screen_dwell_init(struct u_lift_reproject_screen_dwell *d, uint64_t hold_ns)
+{
+	memset(d, 0, sizeof(*d));
+	d->hold_ns = hold_ns != 0 ? hold_ns : U_LIFT_REPROJECT_SCREEN_HOLD_NS;
+}
+
+uint64_t
+u_lift_reproject_screen_dwell_update(struct u_lift_reproject_screen_dwell *d, uint64_t under_centre, uint64_t now_ns)
+{
+	if (d->hold_ns == 0) {
+		d->hold_ns = U_LIFT_REPROJECT_SCREEN_HOLD_NS;
+	}
+	if (under_centre == 0) {
+		return d->current;
+	}
+	if (d->current == 0 || under_centre == d->current) {
+		d->current = under_centre; // first seen, or back home: no dwell
+		d->candidate = 0;
+		return d->current;
+	}
+	if (under_centre != d->candidate) {
+		d->candidate = under_centre;
+		d->since_ns = now_ns;
+	} else if (now_ns - d->since_ns >= d->hold_ns) {
+		d->current = under_centre;
+		d->candidate = 0;
+	}
+	return d->current;
+}
+
+
+/*
+ *
  * Ages.
  *
  */

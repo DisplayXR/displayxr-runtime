@@ -37,6 +37,8 @@
 
 #include "vk_conv/vk_conv_weave.h"
 
+#include "util/u_lift_reproject.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -66,7 +68,47 @@ struct comp_multi_weave_lift
 	//! ... and it is a host engine's (Metal): counted in the process-wide
 	//! host-frame count that clearing the ops waits on.
 	bool host_frame;
+
+	//! @name ADR-058 Amendment 1: this weave's ONE eye sample and per-rect placement
+	//! @{
+	bool have_frame_eyes;
+	struct xrt_eye_positions frame_eyes; //!< the primary screen's target-time sample
+	struct
+	{
+		uint64_t stream;
+		struct u_lift_reproject_screen_dwell dwell;
+	} straddle[XRT_LIFT_WEAVE_RECTS_MAX];
+	//! @}
 };
+
+/*!
+ * ADR-058 Amendment 1 item 3: take this weave's ONE eye sample — the engine
+ * DP's target-time query at one refresh ahead (its "latest" answer when it
+ * has no target-time slot) — before any lifted rect is recorded. The late
+ * view synthesis of every rect and the submit's reply eyes both use it.
+ * False (and no sample) when the DP answers nothing.
+ */
+bool
+comp_multi_weave_lift_sample_frame_eyes(struct multi_compositor *mc, struct xrt_eye_positions *out);
+
+//! Clear this weave's sample (a weave without lifted rects, or after it).
+void
+comp_multi_weave_lift_clear_frame_eyes(struct comp_multi_weave_lift *l);
+
+/*!
+ * How lifted rect @p rect (window px of a @p win_w x @p win_h window) is
+ * placed this weave, into @p r->eyes_mode / @p r->frame_eyes: the frame's
+ * sample; a rect whose CENTRE sits on another screen than the sample's (the
+ * engine's segment table, with the #2256 dwell, Amendment 1 item 2) keeps its
+ * conversion placement this frame rather than mix two screens' spaces.
+ * Without a sample: the stream's eyes snapshot, as before.
+ */
+void
+comp_multi_weave_lift_rect_place(struct multi_compositor *mc,
+                                 const struct xrt_rect *rect,
+                                 uint32_t win_w,
+                                 uint32_t win_h,
+                                 struct vk_conv_weave_rect *r);
 
 /*!
  * Install (NULL: clear) the helper's ops, process-wide. Clearing waits for

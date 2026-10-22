@@ -651,6 +651,7 @@ ipc_server_conv_install_gpu(struct ipc_server_conv *sc, const struct ipc_server_
 		cg.viewsyn = gpu->viewsyn;
 		cg.readback = gpu->readback;
 		cg.nominal_z_m = gpu->nominal_z_m;
+		cg.adapter_class = gpu->adapter_class;
 		conv_core_set_gpu(sc->core, &cg);
 		if (hook != NULL) {
 			hook(hook_ud, gpu); // allocator + the dp-lift row

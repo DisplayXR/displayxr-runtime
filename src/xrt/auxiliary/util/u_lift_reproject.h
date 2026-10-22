@@ -289,6 +289,39 @@ u_lift_reproject_needs_rerun(
 
 /*
  *
+ * Straddling rects (ADR-058 Amendment 1 item 2).
+ *
+ */
+
+//! The #2256 coverage dwell (== COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS).
+#define U_LIFT_REPROJECT_SCREEN_HOLD_NS (500ull * 1000ull * 1000ull)
+
+/*!
+ * Which screen's eyes place a lifted rect: the screen under the rect's
+ * CENTRE, with the coverage dwell of #2256 as hysteresis -- a new screen
+ * takes over only once it has held the centre continuously for hold_ns; the
+ * first screen seen is taken at once. Keys are any non-zero screen identity
+ * (a screen id, a DP pointer); 0 = unknown (keeps the current one).
+ */
+struct u_lift_reproject_screen_dwell
+{
+	uint64_t hold_ns;
+	uint64_t current;   //!< the screen whose eyes place the rect (0 = none yet)
+	uint64_t candidate; //!< a different screen under the centre, dwell running
+	uint64_t since_ns;
+};
+
+//! @p hold_ns 0 = U_LIFT_REPROJECT_SCREEN_HOLD_NS.
+void
+u_lift_reproject_screen_dwell_init(struct u_lift_reproject_screen_dwell *d, uint64_t hold_ns);
+
+//! Advance with the screen under the centre this frame; returns the screen to place with.
+uint64_t
+u_lift_reproject_screen_dwell_update(struct u_lift_reproject_screen_dwell *d, uint64_t under_centre, uint64_t now_ns);
+
+
+/*
+ *
  * Result age (ADR-058 decision 4's stats split; internal until the
  * XrLiftStreamStatsDXR append lands with the ADR).
  *

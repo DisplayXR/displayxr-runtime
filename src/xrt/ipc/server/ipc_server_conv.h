@@ -235,6 +235,8 @@ struct ipc_server_conv_gpu
 	//! The adapter the allocator's images live on (packed LUID; 0 = unknown):
 	//! conversion-host satellites are spawned on it (--adapter-luid, #2034).
 	uint64_t adapter_luid;
+	//! CONV_ADAPTER_* of that adapter (ADR-058 Amendment 1: the late output's default size).
+	uint32_t adapter_class;
 };
 
 /*!

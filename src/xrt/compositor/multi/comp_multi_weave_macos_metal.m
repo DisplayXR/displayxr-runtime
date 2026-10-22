@@ -725,6 +725,7 @@ weave_metal_lift_record_batch(struct multi_compositor *mc,
 		r->batch = true;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp_metal,
 		                                 &r->frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, r);
 	}
 	const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
 	(void)comp_multi_weave_metal_lift_record(wm->lift, &pl, (void *)cmd, (void *)wm->in_tex, (void *)wm->sbs_tex,
@@ -781,6 +782,7 @@ weave_metal_lift_record_nview(struct multi_compositor *mc,
 		r->batch = false;
 		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp_metal,
 		                                 &r->frame);
+		comp_multi_weave_lift_rect_place(mc, rr, win_w, win_h, r);
 	}
 	const struct comp_multi_weave_metal_lift_planner pl = weave_metal_lift_planner(mc);
 	(void)comp_multi_weave_metal_lift_record(wm->lift, &pl, (void *)cmd, (void *)wm->crop_tex,

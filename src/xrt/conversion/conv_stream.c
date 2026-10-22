@@ -8,6 +8,8 @@
 
 #include "conv_core_internal.h"
 
+#include "xrt/xrt_display_metrics.h"
+
 #include "os/os_time.h"
 #include "util/u_conv_viewsyn.h"
 #include "util/u_lift_reproject.h"
@@ -1813,6 +1815,33 @@ conv_core_stream_acquire(struct conv_core *core, uint64_t stream_id, bool only_n
 	return XRT_SUCCESS;
 }
 
+uint32_t
+conv_late_max_edge(uint32_t env_edge, uint32_t adapter_class)
+{
+	if (env_edge != 0) {
+		return env_edge;
+	}
+	return adapter_class == CONV_ADAPTER_INTEGRATED ? CONV_LATE_MAX_EDGE_INTEGRATED : CONV_LATE_MAX_EDGE_DEFAULT;
+}
+
+void
+conv_eyes_from_xrt(const struct xrt_eye_positions *in, struct conv_eyes *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (in == NULL) {
+		return;
+	}
+	out->valid = in->valid;
+	out->is_tracking = in->is_tracking;
+	out->count = in->count > CONV_EYES_MAX ? CONV_EYES_MAX : in->count;
+	for (uint32_t i = 0; i < out->count; i++) {
+		out->xyz[i][0] = in->eyes[i].x;
+		out->xyz[i][1] = in->eyes[i].y;
+		out->xyz[i][2] = in->eyes[i].z;
+	}
+	out->timestamp_ns = in->timestamp_ns > 0 ? (uint64_t)in->timestamp_ns : 0;
+}
+
 bool
 conv_core_stream_late_prepare(struct conv_core *core,
                               uint64_t stream_id,
@@ -1821,6 +1850,21 @@ conv_core_stream_late_prepare(struct conv_core *core,
                               uint64_t now,
                               struct conv_late_cache *cache,
                               struct conv_late_frame *out)
+{
+	return conv_core_stream_late_prepare_ex(core, stream_id, ring_slot,
+	                                        eyes != NULL ? CONV_LATE_EYES_SAMPLE : CONV_LATE_EYES_SNAPSHOT, eyes,
+	                                        now, cache, out);
+}
+
+bool
+conv_core_stream_late_prepare_ex(struct conv_core *core,
+                                 uint64_t stream_id,
+                                 uint32_t ring_slot,
+                                 uint32_t eyes_mode,
+                                 const struct conv_eyes *eyes,
+                                 uint64_t now,
+                                 struct conv_late_cache *cache,
+                                 struct conv_late_frame *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (core == NULL || cache == NULL || ring_slot >= U_LIFT_RING_SIZE) {
@@ -1849,11 +1893,13 @@ conv_core_stream_late_prepare(struct conv_core *core,
 		return false;
 	}
 
-	// The eyes of this display frame, through S3's own viewpoint policy.
+	// The eyes of this display frame, through S3's own viewpoint policy:
+	// the frame's ONE sample (the weave's own), never a second one.
 	struct conv_eyes e;
-	if (eyes != NULL) {
+	memset(&e, 0, sizeof(e));
+	if (eyes_mode == CONV_LATE_EYES_SAMPLE && eyes != NULL) {
 		e = *eyes;
-	} else {
+	} else if (eyes_mode == CONV_LATE_EYES_SNAPSHOT) {
 		conv_core_eyes_read(core, eyes_dp, now, &e);
 	}
 	vin.eyes = &e;
@@ -1895,7 +1941,7 @@ conv_core_stream_late_prepare(struct conv_core *core,
 	struct u_lift_reproject_decision dec;
 	const uint32_t n = rec.view_count;
 	enum u_lift_reproject_verdict v = U_LIFT_REPROJECT_HOLD;
-	if (pa.viewpoint_count == n) {
+	if (eyes_mode != CONV_LATE_EYES_RECORDED && pa.viewpoint_count == n) {
 		v = u_lift_reproject_late_params(&pol, &src, (const float(*)[3])pa.viewpoints_xyz, n, &late, &dec);
 	}
 	if (v != U_LIFT_REPROJECT_HOLD) {
@@ -1909,8 +1955,7 @@ conv_core_stream_late_prepare(struct conv_core *core,
 	out->verdict = (uint32_t)v;
 
 	// Capped extent: the per-view long edge (the rect input cap is 1920).
-	const uint32_t cap =
-	    core->cfg.late_viewsyn_max_edge != 0 ? core->cfg.late_viewsyn_max_edge : CONV_LATE_MAX_EDGE_DEFAULT;
+	const uint32_t cap = conv_late_max_edge(core->cfg.late_viewsyn_max_edge, core->late_adapter_class);
 	u_conv_viewsyn_upsample_size(out->color.width, out->color.height, cap, &out->view_w, &out->view_h);
 
 	// The cache rule: new content, or an eye pair that moved in a way the
