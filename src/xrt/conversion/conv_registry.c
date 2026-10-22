@@ -144,7 +144,7 @@ conv_registry_discovery_settled(const struct conv_registry *reg)
 {
 	for (uint32_t i = 0; i < reg->provider_count; i++) {
 		const struct conv_provider *p = &reg->providers[i];
-		if (!p->described && p->enabled && p->usable) {
+		if (!p->described && p->enabled && p->usable && p->host_failed_reason == 0) {
 			return false;
 		}
 	}

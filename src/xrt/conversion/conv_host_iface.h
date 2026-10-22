@@ -138,6 +138,25 @@ conv_host_exit_is_crash(int32_t code)
 	return code != 0 && code != 20;
 }
 
+/*! How the service log names a host exit that counts as a crash (#2246 /
+ *  #2279). The host's own orderly refusals -- conv_host_wire.h's
+ *  CONV_HOST_EXIT_ABI_REJECT (10), _NEGOTIATE_FAILED (11: negotiate or probe
+ *  declined, e.g. an opt-in provider with ENABLE unset), _LICENCE (12),
+ *  _NO_DEVICE (13), _ELEVATED (14) -- are not crashes, whatever the crash-loop
+ *  accounting does with them; the supervisor latches them FAILED. */
+static inline const char *
+conv_host_exit_label(int32_t code)
+{
+	switch (code) {
+	case 10: return "ABI rejected";
+	case 11: return "declined: negotiate / probe failed";
+	case 12: return "licence refused";
+	case 13: return "no usable device";
+	case 14: return "refused to run elevated";
+	default: return "crash";
+	}
+}
+
 /*! Is @p code CONV_HOST_EXIT_UPDATE (20, "closed for update", roadmap §3.6)?
  *  The provider's tasks go WARMING(updating); the respawn waits for the
  *  maintenance mutex (or a registry change), never for a timer. */

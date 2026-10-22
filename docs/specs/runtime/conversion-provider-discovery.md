@@ -488,6 +488,8 @@ Readiness is per (provider, capability). The runtime keeps the FSM; the provider
 
 Golden test: properties queried on a cold boot before the first describe return ACTIVATING.
 
+A provider whose host failed terminally (the satellite supervisor latched FAILED: a declined probe / negotiate failure — e.g. the opt-in `sim-conversion` with `ENABLE` unset —, an ABI reject, a licence or device refusal) counts as terminal for discovery, and every task it backs goes `FAILED(<host reason>)`, not retryable — the cold `INSTALLED` rows from the describe cache included, since nothing can serve them — so a spec-3 caller reads UNAVAILABLE instead of ACTIVATING forever (#2279). Tasks another live provider backs are unaffected. A configuration change (`conv set` / `conv enable`, a registry edit) clears the latch: the rows go back to `INSTALLED` (ACTIVATING) and warm to READY.
+
 ### 4.4 In-service and satellite hosting
 
 Both hostings implement the same service-side **host interface** (describe, warm / evict, stream open / reset / close, submit, job submit / cancel, register image, heartbeat, shutdown; callbacks for state, completion, progress and log). The provider ABI cannot tell them apart.

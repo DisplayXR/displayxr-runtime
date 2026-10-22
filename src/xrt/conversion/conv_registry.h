@@ -113,6 +113,11 @@ struct conv_provider
 	//! reject, the registry on a PLATFORM_ABSENT / INCOMPATIBLE status.
 	bool usable;
 	uint32_t platform_state; //!< xrt_conv_provider_status::state
+	//! #2279: the satellite host failed terminally (CONV_HOST_EV_FAILED /
+	//! CRASH_LOOP): its XRT_CONV_FAIL_* reason, 0 = not failed. Set and cleared
+	//! by the core (a configuration change or the host's return clears it).
+	//! A failed provider counts as settled for discovery, described or not.
+	uint32_t host_failed_reason;
 
 	bool described;      //!< rows exist (live or from the cache)
 	bool from_cache;     //!< rows came from the describe cache, not a live describe
@@ -177,7 +182,7 @@ conv_cap_validate_state(const struct xrt_conv_state *st);
 bool
 conv_registry_is_hidden(const struct conv_registry *reg, uint32_t provider);
 
-/*! Every registered provider is described (live or cached) or terminal (disabled / unusable). */
+/*! Every registered provider is described (live or cached) or terminal (disabled / unusable / host failed). */
 bool
 conv_registry_discovery_settled(const struct conv_registry *reg);
 
