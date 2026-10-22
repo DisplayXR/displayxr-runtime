@@ -23,8 +23,8 @@ submitted**, then shown for as many display frames as the provider takes to prod
 one. With a fast provider that gap is one frame and nobody sees it. With a slow one — the open
 provider on Apple Silicon runs its composed path at 3–4 fps today, a remote provider adds a
 network round trip, and an interactive world model will be slower still — the picture is
-placed for eyes that have since moved, so the 3D image swims, lags head motion and breaks
-look-around on a tracked display. This ADR decouples the two rates. The runtime keeps the
+placed for eyes that have since moved, so the 3D image is placed for an eye pair the viewer no longer has: the stereo
+is wrong for a turned head and the depth budget is wrong for a viewer who leaned in or out. This ADR decouples the two rates. The runtime keeps the
 latest **source image and depth** from the provider and re-places them at the **current eye
 pose of every display frame**: for composed pipelines by re-running the runtime's own view
 synthesis late, just before the weave (*late view synthesis*); for providers that emit views
@@ -53,9 +53,16 @@ on data the contract already carries.
   scanout. That is the right moment to place converted content too.
 - **The measured gap.** macOS open provider, composed `views-mono`: 264–386 ms per frame on an
   M1 Pro (the provider's inference dominates). A remote splat or world-model endpoint is
-  hundreds of milliseconds to seconds. On a lenticular display with eye tracking, a viewer who
-  moves 5 cm during that interval sees the picture placed for the old position — exactly the
-  "swim" the runtime eliminated for rendered content by moving view placement to the weave.
+  hundreds of milliseconds to seconds.
+- **What a stale result actually gets wrong** (measured by the phase-1 conformance test, a sim
+  provider at 4 fps vs 60 Hz with results 250–483 ms old, against a direct synthesis at each
+  frame's own eyes). A purely **lateral** move of both eyes changes no synthesized view: the
+  synthesis places the source camera at the eye midpoint, so a sideways sway is already
+  absorbed — mean error 0.000 / 255, max 0.3. What a stale result misses is the **eye pair
+  itself**: a head turn (the spread and orientation of the pair) on every path, and the viewing
+  **distance** on the composed path, whose disparity budget scales with 1 / distance. On a
+  sway + lean + ±20° turn path, a stale result is off by up to 132/255 with 8.8 % of pixels
+  wrong per frame on average (12.8 % worst frame); late synthesis is exact.
 
 ## Decision
 
@@ -75,12 +82,15 @@ on data the contract already carries.
    a few milliseconds on the reference GPUs (Vulkan viewsyn golden test, D3D11 S5); bounded by
    the existing rect input cap (1920 long edge) and the per-screen period.
 
-3. **View-emitting providers: depth reprojection (phase 2).** When a provider emits views
+3. **View-emitting providers: depth re-placement (phase 2).** When a provider emits views
    itself (a vendor module, a world model), and the result carries aux depth with a valid
-   `depthToDisplay`, the runtime forward-warps the last views from their recorded viewpoints
-   to the current ones: per view, unproject with that view's depth to display space, project
-   from the current viewpoint, splat with depth test, fill holes from the nearest view in the
-   set (an N-view result is its own disocclusion source). Without metric depth, or with
+   `depthToDisplay`, the runtime re-places the result for the **current eye pair** under the
+   same camera model the synthesis uses — source camera at the current eye midpoint, views at
+   the current eyes — and warps the last views to those viewpoints (unproject with the depth,
+   re-project, depth test, fill holes from the nearest view in the set; an N-view result is its
+   own disocclusion source). It is **not** a world-fixed warp: re-projecting from a fixed world
+   camera would add look-around that a provider running with zero delay never shows, so the
+   target is always "what a zero-latency provider would have produced for these eyes". Without metric depth, or with
    `depthValid` false, the result is **held** as today (no reprojection) — the runtime never
    invents a scale. A provider that wants reprojection advertises aux metric depth; one that
    cannot is shown exactly as now.
