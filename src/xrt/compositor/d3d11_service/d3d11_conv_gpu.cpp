@@ -2236,6 +2236,7 @@ core_weave_submit_locked(d3d11_lift *l,
 		p = ws->last_params;
 	}
 	conv_frame_submit fr = {};
+	fr.weave_rect = true; // ADR-058: woven by this presenter (late view synthesis)
 	fr.source_time = source_time;
 	fr.frame_flags = p.inpaint != 0 ? XRT_CONV_FRAME_INPAINT : 0u;
 	uint32_t n = viewpoint_floats / 3;

@@ -37,6 +37,7 @@ struct sim_fake_eyes_params
 	float ipd_m;
 	float sway_m;           //!< Horizontal sway amplitude (metres); 0 = static.
 	int64_t sway_period_ns; //!< Period of the sway; ≤ 0 = static.
+	float turn_rad;         //!< Head-turn (yaw) amplitude on the same period; 0 = facing the glass.
 };
 
 /*!

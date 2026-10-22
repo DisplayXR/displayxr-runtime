@@ -486,6 +486,7 @@ frame_fill(struct vkcw_stream *st,
 	const struct xrt_lift_weave_rect *b = r->binding;
 	struct conv_frame_submit *fr = &st->fr;
 	memset(fr, 0, sizeof(*fr));
+	fr->weave_rect = true; // ADR-058: woven by this presenter (late view synthesis)
 	if (b->has_params) {
 		st->last_params = b->params;
 		st->has_last_params = true;

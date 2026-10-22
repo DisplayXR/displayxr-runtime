@@ -159,6 +159,9 @@ struct conv_frame_submit
 	 *  taken from (conv_core_stream_bind_eyes); false = keep the binding. */
 	bool eyes_dp_set;
 	uint64_t eyes_dp;
+	/*! ADR-058: a lifted weave rect's snapshot (the presenter weaves this
+	 *  frame's result itself): its views may be synthesized late. */
+	bool weave_rect;
 };
 
 //! A pinned result (conv_core_stream_acquire); release with its ring slot.
@@ -217,6 +220,10 @@ struct conv_stream_stats
 	 *  0 / 0 before the first result. */
 	uint64_t content_age_ns;
 	uint64_t placement_age_ns;
+	//! ADR-058: presenter frames that placed a late source, and how many of
+	//! them re-synthesized (the cache rule reused the views for the rest).
+	uint64_t late_prepares;
+	uint64_t late_reruns;
 };
 
 //! Per-stream options the v3 handlers / service add to the wire descriptor.

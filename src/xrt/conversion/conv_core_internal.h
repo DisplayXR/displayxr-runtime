@@ -121,6 +121,9 @@ struct conv_stream
 	uint64_t late_gen;       //!< ADR-058: last content generation published as a late source
 	uint64_t late_placed_ns; //!< ADR-058: eyes sample time of the newest late placement (stats)
 	bool late_logged;        //!< ADR-058: "late view synthesis on" logged for this stream
+	uint64_t late_prepares;  //!< ADR-058: presenter frames that placed a late source
+	uint64_t late_reruns;    //!< ADR-058: ... of which re-synthesized (the rest reused the cached views)
+	uint64_t late_log_ns;    //!< ADR-058: last counters line (INFO, once a second at most)
 	struct conv_observer observer;
 	bool has_observer;
 	struct xrt_conv_depth_info last_depth;

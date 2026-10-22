@@ -22,7 +22,8 @@
  *      red / cyan, dumps /tmp/weave_probe_macos_output.ppm, exits 0/1.
  *
  * Run (service already started with the sim display plug-in):
- *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=.../plugins displayxr-service &
+ *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=.../plugins
+ * displayxr-service &
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=build/openxr_displayxr-dev.json \
  *     ./weave_probe_vk_macos [--geometry ox,oy[,display]] [--snap [period]]
  *
@@ -30,8 +31,9 @@
  * first submit (engine not up) the snap must be the identity; after the
  * submits it must be the identity too unless [period] > 1 is given, which
  * asserts the snap of a vertical lattice of that period — set the SERVICE's
- * SIM_DISPLAY_METAL_SNAP_PERIOD to the same value and DXR_WEAVE_MAC_BACKEND=metal
- * (the vk backend never snaps on macOS, so pass no period there).
+ * SIM_DISPLAY_METAL_SNAP_PERIOD to the same value and
+ * DXR_WEAVE_MAC_BACKEND=metal (the vk backend never snaps on macOS, so pass no
+ * period there).
  *
  * --views <service-log> (needs --geometry): per-window OOP views for a weave
  * session. After the submits it locates views (PRIMARY_STEREO) with a chained
@@ -53,6 +55,9 @@
  * for "lift rect: stream" (the snapshot / woven lines). Both weave backends
  * lift (DXR_WEAVE_MAC_BACKEND=metal exercises the Metal path). The red reads
  * the same flat or woven; the service's "woven" line is what proves a result.
+ * --lift-frames N submits N lifted frames (default 90, ~16 ms apart): a slow
+ * provider (DXR_CONV_SIM_CONVERSION_LATENCY_MS=250) over a fake-tracked
+ * sway / head turn exercises ADR-058's late view synthesis and its re-run rule.
  *
  * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
  * (sim_display exports both DP families, so auto = vk); every check above holds
@@ -560,29 +565,36 @@ main(int argc, char **argv)
 	int snap_period = 0; // 0/1 = expect identity
 	const char *views_log = NULL; // --views <service log>
 	bool do_lift = false;         // --lift
-	for (int i = 1; i < argc; i++) {
+        int lift_frames = 90;         // --lift-frames N (~16 ms each)
+        for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--lift") == 0) {
 			do_lift = true;
-		} else if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
-			views_log = argv[++i];
-		} else if (strcmp(argv[i], "--snap") == 0) {
-			do_snap = true;
-			if (i + 1 < argc && argv[i + 1][0] != '-') {
-				snap_period = atoi(argv[++i]);
-			}
-		} else if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
-			int n = sscanf(argv[++i], "%d,%d,%d", &geom_x, &geom_y, &geom_display);
-			if (n < 2) {
-				LOG("bad --geometry '%s' (want ox,oy[,display])", argv[i]);
-				return 1;
-			}
-			have_geometry = true;
-		} else {
-			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>] [--lift]",
-			    argv[0]);
-			return 1;
-		}
-	}
+                } else if (strcmp(argv[i], "--lift-frames") == 0 &&
+                           i + 1 < argc) {
+                  lift_frames = atoi(argv[++i]);
+                  lift_frames = lift_frames < 1 ? 1 : lift_frames;
+                } else if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
+                  views_log = argv[++i];
+                } else if (strcmp(argv[i], "--snap") == 0) {
+                  do_snap = true;
+                  if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    snap_period = atoi(argv[++i]);
+                  }
+                } else if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
+                  int n = sscanf(argv[++i], "%d,%d,%d", &geom_x, &geom_y,
+                                 &geom_display);
+                  if (n < 2) {
+                    LOG("bad --geometry '%s' (want ox,oy[,display])", argv[i]);
+                    return 1;
+                  }
+                  have_geometry = true;
+                } else {
+                  LOG("usage: %s [--geometry ox,oy[,display]] [--snap "
+                      "[period]] [--views <service-log>] [--lift]",
+                      argv[0]);
+                  return 1;
+                }
+        }
 	if (views_log != NULL && !have_geometry) {
 		LOG("--views needs --geometry (the per-window Kooima keys on the bound window)");
 		return 1;
@@ -1120,19 +1132,23 @@ main(int argc, char **argv)
 			lsubmit.inputIsDxgi = XR_FALSE;
 			lsubmit.firstChunk = XR_TRUE;
 			IOSurfaceRef lout = NULL;
-			for (int frame = 0; frame < 90 && lift_ok; frame++) { // ~1.5 s: results land well before
-				XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
-				XrResult r = pfn_submit(session, &lsubmit, &out);
-				if (XR_FAILED(r)) {
-					LOG("lift FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
-					lift_ok = false;
-				}
-				if (out.weavedTexture != NULL && lout == NULL) {
-					lout = (IOSurfaceRef)out.weavedTexture;
-				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(16));
-			}
-			IOSurfaceRef sample_from = lout != NULL ? lout : output;
+                        for (int frame = 0; frame < lift_frames && lift_ok;
+                             frame++) { // default ~1.5 s
+                          XrWeaveOutputDXR out = {
+                              (XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+                          XrResult r = pfn_submit(session, &lsubmit, &out);
+                          if (XR_FAILED(r)) {
+                            LOG("lift FAIL: xrWeaveSubmitDXR frame %d -> %d",
+                                frame, (int)r);
+                            lift_ok = false;
+                          }
+                          if (out.weavedTexture != NULL && lout == NULL) {
+                            lout = (IOSurfaceRef)out.weavedTexture;
+                          }
+                          std::this_thread::sleep_for(
+                              std::chrono::milliseconds(16));
+                        }
+                        IOSurfaceRef sample_from = lout != NULL ? lout : output;
 			if (lift_ok) {
 				dump_ppm(sample_from, "/tmp/weave_probe_macos_lift_output.ppm");
 				const int qx = kRectA.offset.x + kRectA.extent.width / 4;

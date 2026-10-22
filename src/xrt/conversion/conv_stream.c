@@ -1034,8 +1034,9 @@ convert_one(struct conv_stream_lane *lane, struct conv_stream *st)
 		pf->new_content = true;
 		// ADR-058: a composed weave-rect stream keeps its source and lets the
 		// presenter synthesize the views at each display frame's eyes.
-		pf->defer_s5 = late_eligible(core, &s.pipe, weave_rect, &s.frame, late_vin_valid) &&
-		               late_retain_input(core, st, o, &st->in[in_slot].images[0]);
+		pf->defer_s5 =
+		    late_eligible(core, &s.pipe, weave_rect || s.frame.weave_rect, &s.frame, late_vin_valid) &&
+		    late_retain_input(core, st, o, &st->in[in_slot].images[0]);
 		const xrt_result_t r = conv_pipeline_execute(&s.pipe, &core->cfg.viewsyn, &core->cfg.readback, pf);
 		pr = pf->provider_result;
 		ok = r == XRT_SUCCESS;
@@ -1928,12 +1929,30 @@ conv_core_stream_late_prepare(struct conv_core *core,
 		cache->ease = out->ease;
 	}
 
+	bool log = false;
+	uint64_t prepares = 0, reruns = 0;
 	os_mutex_lock(&core->streams_mtx);
 	st = find_locked(core, stream_id);
 	if (st != NULL) {
 		st->late_placed_ns = out->eyes_ns != 0 ? out->eyes_ns : now;
+		st->late_prepares++;
+		st->late_reruns += rerun ? 1u : 0u;
+		prepares = st->late_prepares;
+		reruns = st->late_reruns;
+		if (now - st->late_log_ns >= 1000000000ull) {
+			st->late_log_ns = now;
+			log = true;
+		}
 	}
 	os_mutex_unlock(&core->streams_mtx);
+	if (log) {
+		U_LOG_I(
+		    "[conv] stream %llu: late view synthesis: %llu frames placed, %llu re-synthesized, %llu reused "
+		    "(gen %llu, %ux%u per view, delta %.1f mm, ease %.2f)",
+		    (unsigned long long)stream_id, (unsigned long long)prepares, (unsigned long long)reruns,
+		    (unsigned long long)(prepares - reruns), (unsigned long long)out->generation, out->view_w,
+		    out->view_h, out->delta_m * 1000.0f, out->ease);
+	}
 	return true;
 }
 
@@ -1994,6 +2013,8 @@ conv_core_stream_get_stats(struct conv_core *core, uint64_t stream_id, struct co
 	out->unsatisfied = st->unsatisfied;
 	out->content_age_ns = 0;
 	out->placement_age_ns = 0;
+	out->late_prepares = st->late_prepares;
+	out->late_reruns = st->late_reruns;
 	if (st->mb.latest >= 0 && st->mb.latest < U_LIFT_RING_SIZE) {
 		struct u_lift_reproject_ages ages;
 		const struct conv_ring_slot *lo = &st->out[st->mb.latest];
