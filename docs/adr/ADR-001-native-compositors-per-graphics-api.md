@@ -16,7 +16,7 @@ The original Monado architecture used a Vulkan server compositor as the single r
 Each graphics API gets its own native compositor implementation (D3D11, D3D12, Metal, OpenGL, Vulkan). No Vulkan intermediary. Each compositor directly manages swapchains and rendering in its native API.
 
 ## Consequences
-More compositor code to maintain (5 implementations vs 1), but each is simpler. Vendor display processors integrate natively. No interop overhead or texture copies. Each compositor follows the same vtable pattern via `comp_base`.
+More compositor code to maintain (5 implementations vs 1), but each is simpler. Vendor display processors integrate natively. No interop overhead or texture copies. Each compositor implements the same `xrt_compositor` vtable; the native compositors fill it by hand (as of 2026-10-23 `comp_base` is used only by `compositor/main/` and `compositor/null/`, not by the five native compositors).
 
 ### Why native wins beyond weaving compatibility
 Native was **not strictly gating**: the Leia SDK weaver already supports DX, OpenGL, and VK, and interop-weaving worked on nVidia dGPU — so no API *had* to be native just to weave. The five-way surface is justified instead by a stack of independent robustness, fidelity, **performance**, and **platform-reach** benefits:

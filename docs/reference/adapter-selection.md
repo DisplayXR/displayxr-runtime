@@ -211,14 +211,16 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 | In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `dp_refused_scanout` (the plug-in declined a weaver on the scanout adapter — asked inside Stage A, so the split never engages, ADR-037 §3a) · `killed_by_env` |
 | **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible,weave_on_ingest` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7, and its display processor follows it onto the render device, #1172) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
 | In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
-| In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
+| In-process **Vulkan** (Windows) | yes (#1178, v2.12.1/v2.13.0; `comp_vk_native_split.cpp`) — via a same-adapter D3D11 deposit the atlas renders into, then the ordinary cross-adapter bridge | `no_timeline_semaphore` (app's `VkDevice` lacks `VK_KHR_timeline_semaphore`) · `no_hwnd` · the common gate tokens; `api_unsupported` only on non-Windows builds (ADR-037 §3) |
 | In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
 | Metal / Android | n/a | single-adapter; the rule degenerates |
 
-Vulkan and OpenGL take rung 2 **unconditionally**, and neither can reach a
-half-engaged state: nothing in either compositor consults a scanout adapter,
-allocates a bridge, or creates a second device. They log the placement line and
-render exactly as before.
+OpenGL takes rung 2 **unconditionally** and cannot reach a half-engaged state:
+nothing in the GL compositor consults a scanout adapter, allocates a bridge, or
+creates a second device. It logs the placement line and renders exactly as
+before. Vulkan (Windows) has a split as of #1178 — see ADR-037 §3; the
+`DXR_VK_DEPOSIT` section below documents its first rung (VK-0) and predates the
+split, so its "Not a split" / `api_unsupported` wording describes that rung only.
 
 #### `DXR_VK_DEPOSIT` — the first rung of the Vulkan ladder (#1178, VK-0)
 
