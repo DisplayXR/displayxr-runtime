@@ -200,7 +200,52 @@ struct comp_hub_d3d11_info
 	//! The out-device swapchain's initial size.
 	uint32_t preferred_width;
 	uint32_t preferred_height;
+
+	/*!
+	 * #2317 P1b: the producer's atlas is ONE NT-shared texture, rendered on the
+	 * handoff's immediate context and re-created only on a generation bump (the
+	 * D3D11 tier's renderer atlas), not a per-frame ring slot.
+	 *
+	 * The hub then reads it IN PLACE. On the SAME adapter it opens the texture
+	 * on its own device and GPU-waits on the producer's shared fence: DIRECT
+	 * ingress, no transport copy at all (@ref comp_hub_d3d11_is_direct). Across
+	 * adapters it binds it as comp_xbridge ingress Option I, as the D3D11 tier's
+	 * own split does (two copies, no staging). Either way the producer must call
+	 * @ref comp_hub_d3d11_pre_render before it rewrites the atlas.
+	 *
+	 * False (every ring deposit: the VK and D3D12 tiers) keeps the forced staged
+	 * ingress exactly as before.
+	 */
+	bool stable_atlas;
 };
+
+/*!
+ * @name #2317 P1b: the `hub placement:` reason tokens
+ *
+ * The closed set the D3D11 tier's one-per-session `hub placement: hub=0
+ * reason=<token>` line names, beside the `COMP_SPLIT_REASON_*` tokens the hub's
+ * own Stage A can return (`killed_by_env`, `software_scanout`, `stage_a_failed`,
+ * `dp_refused_scanout`, ...). Fixed parse targets; never reformatted.
+ * @{
+ */
+//! `DXR_HUB` is not `1`: the tier runs its own legs (the default).
+#define COMP_HUB_REASON_NOT_REQUESTED "not_requested"
+//! The runtime owns the window (`_hosted`): its drag phase-snap provider is the
+//! tier's own display processor, which the hub would replace. Not carried yet.
+#define COMP_HUB_REASON_HOSTED_WINDOW "hosted_window"
+//! A transparent session (DComp chain + compose-under): not validated on the hub.
+#define COMP_HUB_REASON_TRANSPARENT "transparent_background"
+//! The producer could not create or share the atlas fence the hub waits on.
+#define COMP_HUB_REASON_NO_SHARED_FENCE "no_shared_fence"
+//! Stage A2 (bridge or direct wiring) failed after Stage A1 succeeded.
+#define COMP_HUB_REASON_WIRE_FAILED "wire_failed"
+//! Mid-session RETIRE: the frame carried an XR_DXR_local_3d_zone Local2D layer.
+#define COMP_HUB_REASON_LOCAL2D "local2d_layer"
+//! Mid-session RETIRE: the frame carried XR_DXR_display_zones zone layers.
+#define COMP_HUB_REASON_ZONES "zone_layer"
+//! Mid-session RETIRE: the session submitted an authored (Tier-3 / zones) mask.
+#define COMP_HUB_REASON_AUTHORED_MASK "authored_mask"
+/*! @} */
 
 /*!
  * **Stage A1** — decide, then stand up everything on the SCANOUT adapter that
@@ -699,6 +744,72 @@ comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode
  */
 bool
 comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_dp_background_preview *out_preview);
+/*! @} */
+
+/*!
+ * @name #2317 P1b: the stable-atlas producer (the D3D11 tier's shim)
+ * @{
+ */
+
+/*!
+ * True when the hub reads the producer's atlas DIRECTLY on its own device
+ * (same adapter, @ref comp_hub_d3d11_info::stable_atlas): no comp_xbridge, no
+ * transport copy. The producer must then signal the handoff's fence after the
+ * passes that write the atlas, and flush.
+ */
+bool
+comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split);
+
+/*!
+ * The producer's back-fence, called on the producer's thread before the first
+ * pass that rewrites the atlas. GPU-side only (`ID3D11DeviceContext4::Wait` on
+ * the producer's immediate context), never a CPU wait.
+ *
+ * DIRECT: waits for the hub's last READ of the atlas (every app weave and every
+ * repaint signals the hub's consumer fence once it has recorded the reads).
+ * Option I through comp_xbridge: @ref comp_xbridge_pre_render. A no-op for the
+ * ring deposits.
+ *
+ * The caller serialises this against @ref comp_hub_d3d11_weave_and_present (the
+ * compositor mutex), so the value waited for is the last one any weave recorded.
+ */
+void
+comp_hub_d3d11_pre_render(struct comp_hub_d3d11 *split);
+
+/*!
+ * The display period of the hub's target (the late-weave governor and the
+ * forward horizon), as the tier's own legs set it on their target. Optional: a
+ * caller that never sets it leaves the target on its default.
+ */
+void
+comp_hub_d3d11_set_display_period(struct comp_hub_d3d11 *split, uint64_t period_ns);
+
+/*!
+ * #867 forwarders on the hub's target, so a tier whose wait_frame used its own
+ * target's measured lookahead keeps doing so under the hub. 0 = no measurement.
+ */
+uint64_t
+comp_hub_d3d11_get_predicted_lookahead_ns(struct comp_hub_d3d11 *split);
+
+void
+comp_hub_d3d11_mark_wait_frame(struct comp_hub_d3d11 *split);
+
+//! Packed LUID (HighPart<<32 | LowPart) of the hub's own device, for the placement line.
+uint64_t
+comp_hub_d3d11_get_hub_luid(struct comp_hub_d3d11 *split);
+
+/*!
+ * Called on the weaving thread after every weave (app and repaint) and BEFORE
+ * the present, with the hub's device, immediate context and woven back buffer
+ * (`ID3D11Device *`, `ID3D11DeviceContext *`, `ID3D11Texture2D *`). For the
+ * tier's capture triggers, which need the post-weave pixels the hub owns. Keep
+ * it cheap: it runs at panel rate.
+ */
+typedef void (*comp_hub_d3d11_post_weave_fn)(
+    void *userdata, void *device, void *context, void *back_buffer, uint32_t width, uint32_t height, bool is_repaint);
+
+void
+comp_hub_d3d11_set_post_weave_hook(struct comp_hub_d3d11 *split, comp_hub_d3d11_post_weave_fn fn, void *userdata);
 /*! @} */
 
 /*!
