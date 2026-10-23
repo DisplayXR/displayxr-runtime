@@ -808,6 +808,17 @@ split_release_out(struct comp_hub_d3d11 *s)
 	 * would silently refuse the app-device create that follows a retire.
 	 */
 	xrt_display_processor_d3d11_destroy(&s->dp);
+	/*
+	 * #2317 review: unbind the back buffer and flush BEFORE the swapchain goes.
+	 * D3D11 defers a swapchain's teardown while its buffers are still bound to
+	 * a context, and the HWND stays claimed until then — so the target the
+	 * caller creates next on the same window (a retire, or a create-time
+	 * refusal after Stage A1) could be refused with E_ACCESSDENIED.
+	 */
+	if (s->out_ctx != NULL) {
+		s->out_ctx->ClearState();
+		s->out_ctx->Flush();
+	}
 	comp_d3d11_target_destroy(&s->target);
 	if (s->out_factory != NULL) {
 		s->out_factory->Release();
@@ -1362,7 +1373,7 @@ comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11
 	 */
 	if (s->stable_atlas && s->same_adapter && !split_direct_forced_off()) {
 		if (split_wire_direct(s, handoff)) {
-			U_LOG_W("VK output-device split: stage A2 (direct) took %.1f ms",
+			U_LOG_W("D3D11 hub: stage A2 (direct) took %.1f ms",
 			        (double)(os_monotonic_get_ns() - t0) / 1.0e6);
 			return true;
 		}
@@ -1525,7 +1536,7 @@ comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr)
 	*split_ptr = nullptr;
 
 	U_LOG_W(
-	    "VK output-device split: %llu frames bridged, %llu weaves with no usable slot, %llu stale-slot "
+	    "D3D11 hub: %llu frames bridged, %llu weaves with no usable slot, %llu stale-slot "
 	    "refusals, %llu in-flight (transition) weaves, %llu output-device crops, %llu composites, %llu "
 	    "composite bails (#918)",
 	    (unsigned long long)s->seq, (unsigned long long)s->no_slot, (unsigned long long)s->stale_refusals,
@@ -2680,7 +2691,7 @@ split_wire_direct(struct comp_hub_d3d11 *s, const struct comp_hub_d3d11_handoff 
 
 	d.active = true;
 	U_LOG_W(
-	    "VK output-device split ACTIVE: weave/repaint/present move to '%ls' LUID=%08lx:%08lx (app "
+	    "D3D11 hub ACTIVE: weave/repaint/present move to '%ls' LUID=%08lx:%08lx (app "
 	    "device on LUID=%08lx:%08lx); the producer's atlas is read IN PLACE on this device — DIRECT "
 	    "ingress, no transport copy (#2317 P1b)",
 	    s->out_desc, (unsigned long)s->out_luid.HighPart, (unsigned long)s->out_luid.LowPart,
@@ -2699,7 +2710,14 @@ split_submit_direct(struct comp_hub_d3d11 *s,
                     uint32_t content_h)
 {
 	auto &d = s->direct;
+	/*
+	 * #2317 review: the producer has ALREADY signalled this frame's value. Any
+	 * return below that does not nominate it must also drop the previous one —
+	 * a weave that kept it would wait only on the OLD value and read an atlas
+	 * the producer is rewriting.
+	 */
 	if (handoff->shared_handle == nullptr) {
+		d.have_frame = false;
 		return;
 	}
 	if (d.tex == nullptr || d.tex_gen != handoff->generation) {
@@ -2739,6 +2757,7 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 			d.srv = nullptr;
 			d.tex->Release();
 			d.tex = nullptr;
+			d.have_frame = false;
 			return;
 		}
 		d.tex_gen = handoff->generation;
@@ -2747,7 +2766,8 @@ split_submit_direct(struct comp_hub_d3d11 *s,
 		d.reopens++;
 	}
 	if (content_w > d.tex_w || content_h > d.tex_h) {
-		return; // never weave a box the texture does not hold
+		d.have_frame = false; // never weave a box the texture does not hold
+		return;
 	}
 	d.prod_value = handoff->fence_value;
 	d.content_w = content_w;
@@ -2786,6 +2806,17 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 		return false;
 	}
 
+	/*
+	 * #2317 review: acquire FIRST. Everything after the first read of the
+	 * producer's atlas (the crop below, or the weave) must reach the consumer
+	 * fence signal, and the acquire is the one step after it that can fail.
+	 */
+	uint32_t target_index = 0;
+	if (comp_d3d11_target_acquire(s->target, &target_index) != XRT_SUCCESS) {
+		s->no_slot++;
+		return false;
+	}
+
 	// THE ordering edge: GPU-side, this thread does not block.
 	if (d.prod_fence != nullptr && d.prod_value != 0) {
 		d.out_ctx4->Wait(d.prod_fence, d.prod_value);
@@ -2802,12 +2833,6 @@ split_weave_direct(struct comp_hub_d3d11 *s, bool is_repaint, const struct xrt_r
 			atlas_srv = split_crop_for_dp(s, atlas_srv, d.content_w, d.content_h);
 			d.cropped_value = (atlas_srv == s->dp_input_srv) ? d.prod_value : 0;
 		}
-	}
-
-	uint32_t target_index = 0;
-	if (comp_d3d11_target_acquire(s->target, &target_index) != XRT_SUCCESS) {
-		s->no_slot++;
-		return false;
 	}
 
 	uint32_t tgt_w = 0, tgt_h = 0;
@@ -3348,6 +3373,31 @@ comp_hub_d3d11_get_predicted_eye_positions(struct comp_hub_d3d11 *s, struct xrt_
 }
 
 extern "C" bool
+comp_hub_d3d11_has_eye_positions_at(struct comp_hub_d3d11 *s)
+{
+	if (s == nullptr) {
+		return false;
+	}
+	os_mutex_lock(&s->dp_mutex);
+	const bool has = s->dp != nullptr && xrt_display_processor_d3d11_has_eye_positions_at(s->dp);
+	os_mutex_unlock(&s->dp_mutex);
+	return has;
+}
+
+extern "C" bool
+comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *s, int64_t target_ns, struct xrt_eye_positions *out_eye_pos)
+{
+	if (s == nullptr) {
+		return false;
+	}
+	os_mutex_lock(&s->dp_mutex);
+	const bool ok =
+	    s->dp != nullptr && xrt_display_processor_d3d11_get_eye_positions_at(s->dp, target_ns, out_eye_pos);
+	os_mutex_unlock(&s->dp_mutex);
+	return ok;
+}
+
+extern "C" bool
 comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *s, float *out_width_m, float *out_height_m)
 {
 	if (s == nullptr) {
@@ -3749,6 +3799,24 @@ extern "C" bool
 comp_hub_d3d11_is_direct(struct comp_hub_d3d11 *split)
 {
 	(void)split;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_has_eye_positions_at(struct comp_hub_d3d11 *split)
+{
+	(void)split;
+	return false;
+}
+
+extern "C" bool
+comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *split,
+                                    int64_t target_ns,
+                                    struct xrt_eye_positions *out_eye_pos)
+{
+	(void)split;
+	(void)target_ns;
+	(void)out_eye_pos;
 	return false;
 }
 
