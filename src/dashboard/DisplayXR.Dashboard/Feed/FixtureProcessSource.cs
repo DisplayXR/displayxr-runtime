@@ -95,6 +95,10 @@ public sealed class FixtureProcessSource : IProcessSource
         return w;
     }
 
+    /// <summary>Every other stream (the calibration watch) goes to the real CLI.</summary>
+    public IWatchProcess StartStream(CliArgs args, Action<string> onLine, Action<int?> onExit, Action<string> onNote) =>
+        _real.StartStream(args, onLine, onExit, onNote);
+
     /// <summary>Overlay the simulated per-screen overrides onto a replayed line.</summary>
     private string Apply(string line)
     {

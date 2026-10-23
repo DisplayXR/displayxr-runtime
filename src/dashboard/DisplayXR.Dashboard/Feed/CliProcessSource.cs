@@ -109,13 +109,16 @@ public sealed class CliProcessSource : IProcessSource
         WorkingDirectory = Path.GetDirectoryName(CliPath) ?? AppContext.BaseDirectory,
     };
 
-    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote)
+    public IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote) =>
+        StartStream(CliArgs.Words("status --watch --json"), onLine, onExit, onNote);
+
+    public IWatchProcess StartStream(CliArgs args, Action<string> onLine, Action<int?> onExit, Action<string> onNote)
     {
         if (!CliExists) throw new FileNotFoundException($"{ExeName} not found (looked at {CliPath})");
-        var p = new Process { StartInfo = Info(CliArgs.Words("status --watch --json"), stdin: true), EnableRaisingEvents = false };
+        var p = new Process { StartInfo = Info(args, stdin: true), EnableRaisingEvents = false };
         p.Start();
         ChildJob.Add(p);
-        DashboardLog.Info($"status --watch started (pid {p.Id}, {CliPath})");
+        DashboardLog.Info($"{args} started (pid {p.Id}, {CliPath})");
         // stderr carries the plug-in WARN lines; drain it so the child never blocks on a full pipe.
         // The CLI's own notes ("displayxr-cli status: the service refused the status read …")
         // go to the feed: they are the only account of a child that is up but prints nothing.

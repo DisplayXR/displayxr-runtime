@@ -13,7 +13,7 @@ the sibling `displayxr-cli.exe`, rendering its JSON.
 | Home | the status feed; `info --json` once per show and on Refresh; `dp list --json` (each screen's effective DP, read-only); `selftest --json` on click | `runtime activate`, `dp reset` (only when a machine-wide override is set) |
 | Displays | the status feed (screens, desktop map); `dp list --json` for the per-screen selector (its options: that screen's `candidates`) | `dp use <id> --screen <key>`, `dp reset --screen <key>` |
 | Windows | the status feed (clients) | — |
-| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled (for tracking, the per-user Prefer / Reset too). **Tracking providers** (ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a disabled **Calibrate camera…** button on provider-served screens (the calibration window waits for `tracking calibrate`) |
+| Components | the status feed (clients by class; per screen `eye_tracking.viewer_source` / `viewer_reason` / `viewer_policy` for the tracking card); `info --json` (incl. `tracking_providers`: probe results, the primary screen's arbitration); `workspace list --json`; `dp\|input\|conv\|tracking list --json` (ADR-054 N3e: `enabled`, `enabled_source`, `preferred`, `provenance`, conv `built_in`, tracking `first`, `policy.policy_lock`) | `workspace set <id> --hotkey <combo>` / `--no-hotkey` / `--mode auto\|disabled`, `workspace launch <id>`; `dp\|input\|conv enable\|disable <id>`, `dp\|input use <id>` / `reset`, `input use <id> --app <exe>` / `input reset --app <exe>` (the Input card's **Per app** table, ADR-034 Am.5: each pinned or running app's pin per role family and its live holder from `input list --json` `per_app` + `holders`; per user only — no machine-wide per-app pin exists — and disabled under `Policy\Lock`), `conv use <task> <id>` / `conv reset <task>\|all` (per user; `--machine` only from an elevated dashboard, otherwise every control's `--machine` command — Enabled, Prefer, Reset — is shown for an administrator). No Enabled or Prefer on the built-in `dp-lift` row; under `Policy\Lock` the class shows "Locked by machine policy" and its per-user controls are disabled (for tracking, the per-user Prefer / Reset too). **Tracking providers** (ADR-054 N6): `tracking enable\|disable <id>`, `tracking use <id>` / `tracking reset` (then re-reads `tracking list --json` and `info --json`); per screen the viewer source and why (provider; standby: the display tracks; no source; source paused; FIXED / OWN) beside the display's viewer policy, and a **Calibrate camera…** button on provider-served screens that opens the calibration window (below): `tracking calibrate --screen <key> --watch --json` (long-lived), `tracking calibrate solve --in <tmp> --mode b --eye mid --reject-mm 5 --json`, `tracking calibrate apply --screen <key> --camera <key> --pose <setting> --provider <id> [--depth-scale <iris>] --json` (then re-reads `tracking list --json` and `info --json`) |
 | Performance | `perf list --json`, `info --json` (adapters) | `perf set` / `perf reset` |
 | Developer | `perf list --all --json` (the read-only Tier 1/2 lever list: only while "Developer settings" is expanded, and on Refresh; collapsed again on every launch); `dp list --json` (`preferred` only: a machine-wide override is shown as a notice) | `perf reset <name>` / `perf reset` (managed levers only; the rest are environment-only), `dp reset` (machine-wide; admin) |
 
@@ -30,6 +30,36 @@ providers with each task's readiness and selection (the status feed's `conv_prov
 `conv_tasks[]`, ADR-053; shown only when the CLI reports them), a stereo camera source (only when `info`
 reports one) and diagnostics clients. Names are shown verbatim from the components'
 own registration.
+
+## Camera calibration window
+
+Components → Tracking providers → **Calibrate camera…** (only on a screen whose viewer source is a
+provider) opens a borderless full-screen window on that screen (the monitor that best overlaps the
+screen's desktop rect from the status feed; a points-vs-pixels platform is matched at the feed's
+scale). Method: [tracking-provider-discovery.md §6](../../docs/specs/runtime/tracking-provider-discovery.md#camera-pose-calibration).
+
+- Black, a dim ring at the edges to light the face, a white cross on each target in turn: centre;
+  left, right, top, bottom at a 30 % inset; centre again, leaning back. A target's display-space
+  position is (pixel − screen centre) × pixel pitch, y up, on the screen's native grid; the metres
+  are the watch's `hello.display` (the provider's display space) on the runtime-default screen, else
+  the screen's layout metres, else its physical size.
+- One `tracking calibrate --screen <key> --watch --json` child for the window's life (stopped by
+  closing its stdin, killed after 1.5 s; Esc stops it at any time). Prompt: close the left eye, find
+  the closed eye's reflection with the right eye, put the cross on it, Space. Space captures at once
+  when the eye midpoint's camera-space direction has been still (< 0.3°) for 0.5 s, otherwise it
+  arms and captures as soon as it is (the ring round the cross brightens with the still run). The
+  captured line is recorded verbatim with its dot as `{dot_m, sample}`, `eye: "mid"`.
+- After the sixth target the pairs go to a temp file and `calibrate solve` (mode `b`, reject 5 mm).
+  The result shows RMS, max, iris scale, the pose and each sample's residual. R retakes the
+  flagged samples (the rejected ones; on RMS > 5 mm, those over 5 mm), A starts over; a refusal
+  (`ok: false`) shows the solver's reason.
+- Space: the live check. A green dot follows the eye midpoint's predicted foot, computed in the
+  Dashboard from each sample's camera block through the solved pose and iris scale
+  (`T + R · (iris · s̃ · u)`, what the provider will do once applied). Arrow keys nudge T_x / T_y by
+  1 mm. Enter runs `calibrate apply`; Backspace goes back to the result.
+- All of it is `Model/Calibration.cs` + `Model/CalibrationSession.cs` (pure: NDJSON, dot geometry,
+  stability, solve / apply parsing, the state machine); `Ui/CalibrationWindow.cs` only draws it.
+  Tests: `CalibrationTests` over fixtures captured from the CLI with sim-tracking `CAMERA=1`.
 
 ## Feed cadence (ADR-051 D5)
 
@@ -128,7 +158,8 @@ parts (the job object, raising the first instance) are no-ops there.
   optional), `StatusText` (every string a page shows), `DesktopMapGeometry`,
   `ComponentPolicy` (the per-class Enabled / Preferred rows of `dp|input|conv list --json`
   and the CLI lines the Components controls run — ADR-054 N3e), `Tracking` (the tracking card:
-  info's probe summary, each screen's viewer source / reason / policy — ADR-054 N6).
+  info's probe summary, each screen's viewer source / reason / policy — ADR-054 N6),
+  `Calibration` / `CalibrationSession` (the camera calibration window's model).
 - `Feed/` — `StatusFeed` (the state machine above, single-threaded on a scheduler),
   `CliProcessSource` (the real CLI), `FixtureProcessSource`, the job object, the vendor
   dashboard launcher (D7: the command line is never parsed).

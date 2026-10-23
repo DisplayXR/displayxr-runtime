@@ -337,6 +337,13 @@ authoritative.
   size against the landmarker's model, which removes the largest depth error. It is committed as
   `CAMERA_POSE_<n>_DEPTH_SCALE` (`--depth-scale`).
 
+**Dashboard.** Components → Tracking providers → **Calibrate camera…** on a provider-served screen
+opens the calibration window (`src/dashboard/README.md` § *Camera calibration window*): full screen on
+that screen, the six targets of design §10 (centre; left, right, top, bottom at a 30 % inset; centre
+leaning back), capture on Space once the eye midpoint has been still for 0.5 s, `solve` with mode `b`
+and `--reject-mm 5`, retake of the flagged samples, the live-check dot (computed client-side from the
+camera block through the solved pose and iris scale) with 1 mm arrow-key nudges, then `apply`.
+
 **CLI** (the Dashboard drives these; it links no runtime code, ADR-051 D4):
 
 ```
@@ -541,8 +548,8 @@ screen's own DP with the desktop-geometry mapping (§4b).
    screen, or a calibrated multi-screen rig): today every sample is in the primary's display space
    and the trunk maps it (§4b); a provider-supplied hint would bypass the mapping for its screen.
 4. **Camera-pose calibration** (§6): the solver, `tracking calibrate [solve|apply]`, `--watch
-   --json` and the `sim_tracking` camera test bed are **done**; open: the Dashboard window, the
-   service-side watch (read the service's running provider rather than hosting a second one),
+   --json`, the `sim_tracking` camera test bed and the Dashboard calibration window are **done**;
+   open: the service-side watch (read the service's running provider rather than hosting a second one),
    `_SCREEN` matching once providers are passed their screen key (item 3), and replacing the
    coplanar desktop-layout assumption of §4b with a per-screen pose.
 5. **Service live re-selection**: today a tracking policy change applies at the next service start

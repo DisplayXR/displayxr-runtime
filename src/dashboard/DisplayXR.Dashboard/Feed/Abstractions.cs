@@ -93,6 +93,13 @@ public interface IProcessSource
     /// </summary>
     IWatchProcess StartWatch(Action<string> onLine, Action<int?> onExit, Action<string> onNote);
 
+    /// <summary>
+    /// Start any other long-lived NDJSON verb (<c>tracking calibrate --watch --json</c>), with the
+    /// same contract as <see cref="StartWatch"/>: a line per stdout line, one exit, stop = stdin closed.
+    /// </summary>
+    IWatchProcess StartStream(CliArgs args, Action<string> onLine, Action<int?> onExit, Action<string> onNote) =>
+        throw new NotSupportedException("this process source runs no streams");
+
     /// <summary>Run one CLI verb to completion; <paramref name="args"/> is the argument vector, never a parsed string.</summary>
     Task<CliResult> RunAsync(CliArgs args, TimeSpan timeout, CancellationToken cancel = default);
 }

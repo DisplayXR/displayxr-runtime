@@ -1,0 +1,73 @@
+{
+	"ok":	true,
+	"status":	"ok",
+	"reason":	"",
+	"mode":	"b",
+	"eye":	"mid",
+	"camera_key":	"sim-tracking:webcam0",
+	"screen":	"DXR-0001-00000001",
+	"pose":	{
+		"t_m":	[0.034999999365687623, 0.18300000545285686, 0],
+		"q":	[0.078459033095635, 0, 0, 0.996917338662388],
+		"pitch_deg":	8.99999280068435,
+		"yaw_deg":	0,
+		"roll_deg":	0,
+		"focal_scale":	1,
+		"tz_observable":	false
+	},
+	"setting":	"0.035000,0.183000,0.000000,0.078459,0.000000,0.000000,0.996917",
+	"rms_mm":	3.94814748536916e-07,
+	"max_mm":	6.48714127981509e-07,
+	"iris_scale":	0.92592589235083322,
+	"params":	3,
+	"rank":	3,
+	"condition":	284.8196535668784,
+	"ill_conditioned":	false,
+	"iterations":	7,
+	"sample_count":	6,
+	"used_count":	5,
+	"distinct_dots":	4,
+	"samples":	[{
+			"index":	0,
+			"dot_m":	[0, 0],
+			"residual_mm":	2.90986169557237e-07,
+			"distance_m":	0.58070130356492877,
+			"estimated_distance_m":	0.62715741799618019,
+			"rejected":	false
+		}, {
+			"index":	1,
+			"dot_m":	[-0.060263, 0],
+			"residual_mm":	13.736826612696328,
+			"distance_m":	0.60281954330991983,
+			"estimated_distance_m":	0.63199030598567763,
+			"rejected":	true
+		}, {
+			"index":	2,
+			"dot_m":	[0.060263, 0],
+			"residual_mm":	1.5168340998055636e-07,
+			"distance_m":	0.58019583853888257,
+			"estimated_distance_m":	0.62661154663715868,
+			"rejected":	false
+		}, {
+			"index":	3,
+			"dot_m":	[0, 0.039146],
+			"residual_mm":	6.48714127981509e-07,
+			"distance_m":	0.56957790862849,
+			"estimated_distance_m":	0.615144143172077,
+			"rejected":	false
+		}, {
+			"index":	4,
+			"dot_m":	[0, -0.039146],
+			"residual_mm":	5.00881823119593e-07,
+			"distance_m":	0.59420018171113043,
+			"estimated_distance_m":	0.641736219518082,
+			"rejected":	false
+		}, {
+			"index":	5,
+			"dot_m":	[0, 0],
+			"residual_mm":	3.7736122208632861e-14,
+			"distance_m":	0.7727962038002657,
+			"estimated_distance_m":	0.834619952156549,
+			"rejected":	false
+		}]
+}
