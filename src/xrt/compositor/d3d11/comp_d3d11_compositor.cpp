@@ -359,6 +359,10 @@ struct comp_d3d11_compositor
 		void *dp_factory_d3d11;
 		//! The DP canvas the last app frame wove at; a repaint replays it.
 		struct xrt_rect canvas;
+		//! A retire owes this tier a target the create did not yet deliver;
+		//! retried every frame until it does (never a permanent black session).
+		bool target_owed;
+		uint32_t target_retries;
 	} hub;
 
 	//! Output target (DXGI swapchain).
@@ -4363,6 +4367,38 @@ d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
  * app device, the rung a failed split Stage A falls through to. Caller holds
  * c->mutex; the frame that triggered it is then composed natively.
  */
+/*!
+ * The retire's target, retried from layer_commit until it exists: a swapchain
+ * whose teardown the driver is still finishing can refuse the HWND for a frame.
+ * Caller holds c->mutex.
+ */
+static void
+d3d11_hub_ensure_native_target(struct comp_d3d11_compositor *c)
+{
+	if (!c->hub.target_owed || c->target != nullptr || c->hwnd == nullptr) {
+		return;
+	}
+	xrt_result_t xret =
+	    comp_d3d11_target_create(c, c->hwnd, c->device, c->context, c->dxgi_factory, c->settings.preferred.width,
+	                             c->settings.preferred.height, c->transparent_background, &c->target);
+	if (xret != XRT_SUCCESS || c->target == nullptr) {
+		c->target = nullptr;
+		c->hub.target_retries++;
+		if (c->hub.target_retries == 1 || (c->hub.target_retries % 120) == 0) {
+			U_LOG_W(
+			    "#2317 hub retire: the app-device target is not available yet (%d, attempt %u) — "
+			    "retrying next frame",
+			    (int)xret, c->hub.target_retries);
+		}
+		return;
+	}
+	c->hub.target_owed = false;
+	comp_d3d11_target_set_display_period(c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	if (c->hub.target_retries != 0) {
+		U_LOG_W("#2317 hub retire: app-device target created after %u retries", c->hub.target_retries);
+	}
+}
+
 static void
 d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 {
@@ -4370,6 +4406,16 @@ d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 	    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub does not carry this content yet; the "
 	    "tier's single-device legs take over for the rest of the session (#2317 P1b)",
 	    token);
+
+	/*
+	 * #2317 review: order THIS frame's atlas writes after the hub's last read of
+	 * it (the last app weave or repaint, on the hub's device). The passes below
+	 * run with the hub already gone, so this is the last chance to enqueue that
+	 * GPU-side wait; the flush submits it while the fence it waits on is alive.
+	 */
+	comp_hub_d3d11_pre_render(c->hub.split);
+	c->context->Flush();
+
 	{
 		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 		comp_hub_d3d11_retire(&c->hub.split, "the session submitted content the D3D11 hub does not carry yet",
@@ -4380,24 +4426,30 @@ d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
 	d3d11_hub_release_producer(c);
 	c->repaint.armed = false;
 
-	if (c->hwnd != nullptr) {
-		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, c->device, c->context, c->dxgi_factory,
-		                                             c->settings.preferred.width, c->settings.preferred.height,
-		                                             c->transparent_background, &c->target);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("#2317 hub retire: the app-device target could not be created (%d)", (int)xret);
-			c->target = nullptr;
-		} else {
-			comp_d3d11_target_set_display_period(c->target,
-			                                     (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-		}
-	}
+	c->hub.target_owed = (c->hwnd != nullptr);
+	d3d11_hub_ensure_native_target(c);
+
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 	if (!d3d11_make_dp(c, c->hub.dp_factory_d3d11, c->device, c->context, false)) {
 		U_LOG_W("#2317 hub retire: no display processor on the app device — continuing without");
-	} else if (c->eye_tracking_mode_set) {
-		xrt_display_processor_d3d11_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
+		return;
 	}
+	/*
+	 * #2317 review: the fresh DP has seen none of the session's state — re-send
+	 * it exactly as the ADR-047 swap path does (d3d11_segments_swap_primary_cb):
+	 * the lens wish (a session that ran 3D on the hub must stay 3D), eye
+	 * tracking, and the per-frame timing inputs.
+	 */
+	struct xrt_display_processor_d3d11 *dp = c->display_processor;
+	d3d11_seg_primary_lens(c, dp, true);
+	if (c->eye_tracking_mode_set) {
+		xrt_display_processor_d3d11_set_eye_tracking_mode(dp, c->eye_tracking_mode);
+	}
+	xrt_display_processor_d3d11_set_frame_timing(
+	    dp, c->target != nullptr ? comp_d3d11_target_get_measured_weave_ns(c->target) : 0,
+	    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	xrt_display_processor_d3d11_set_predicted_scanout(
+	    dp, c->target != nullptr ? comp_d3d11_target_predict_weave_to_scanout_ns(c->target) : 0);
 }
 
 /*!
@@ -4481,15 +4533,17 @@ d3d11_hub_commit(struct comp_d3d11_compositor *c,
 
 	// The DP canvas: the effective canvas sub-rect when one is active, else the
 	// full window — the answer the D3D12 reroute computes.
+	// #2317 review: no canvas = zeros, exactly as the tier's own weave passes it
+	// ("fills the full window/target"): a repaint between a resize and the next
+	// app frame then still fills the resized buffer.
+	(void)tgt_width;
+	(void)tgt_height;
 	struct xrt_rect cv = {};
 	if (eff_canvas->valid) {
 		cv.offset.w = eff_canvas->x;
 		cv.offset.h = eff_canvas->y;
 		cv.extent.w = (int32_t)eff_canvas->w;
 		cv.extent.h = (int32_t)eff_canvas->h;
-	} else {
-		cv.extent.w = (int32_t)tgt_width;
-		cv.extent.h = (int32_t)tgt_height;
 	}
 	c->hub.canvas = cv;
 
@@ -4548,6 +4602,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// early return can leak it; the lock is held throughout layer_commit, so no
 	// repaint can interleave with it regardless.
 	c->repaint.app_frame_in_progress = false;
+
+	// #2317 review: a hub retire whose target create was refused retries here.
+	d3d11_hub_ensure_native_target(c);
 
 	// Capture-intent poll — see u_capture_intent.h. Consumed at the
 	// projection-done boundary (PROJECTION_ONLY, once renderer split
@@ -5228,6 +5285,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 #endif
 
 	bool weaving_done = false;
+
+	// #2317 review: a retire still waiting for its target holds the panel's
+	// last frame for this one (the create is retried next frame) — it is NOT
+	// the offscreen shared-texture session the branch below serves.
+	if (c->target == nullptr && c->hub.target_owed) {
+		c->context->Flush();
+		return XRT_SUCCESS;
+	}
 
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
@@ -9700,10 +9765,18 @@ comp_d3d11_compositor_get_eye_positions_at(struct xrt_compositor *xc,
 	bool ok = false;
 	{
 		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
-		has = xrt_display_processor_d3d11_has_eye_positions_at(c->display_processor);
-		ok = has &&
-		     xrt_display_processor_d3d11_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
-		     out_eye_pos->valid;
+		if (c->hub.split != nullptr) {
+			// #2317 review: the hub's weaver is this session's.
+			has = comp_hub_d3d11_has_eye_positions_at(c->hub.split);
+			ok = has && comp_hub_d3d11_get_eye_positions_at(c->hub.split, target_ns, out_eye_pos) &&
+			     out_eye_pos->valid;
+		} else {
+			has = xrt_display_processor_d3d11_has_eye_positions_at(c->display_processor);
+			ok = has &&
+			     xrt_display_processor_d3d11_get_eye_positions_at(c->display_processor, target_ns,
+			                                                      out_eye_pos) &&
+			     out_eye_pos->valid;
+		}
 	}
 	if (ok) {
 		return true;

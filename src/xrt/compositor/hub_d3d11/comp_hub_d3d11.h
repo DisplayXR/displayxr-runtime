@@ -722,6 +722,15 @@ comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *split);
 bool
 comp_hub_d3d11_get_predicted_eye_positions(struct comp_hub_d3d11 *split, struct xrt_eye_positions *out_eye_pos);
 
+//! N6 Part 1 (#2144): the hub DP's target-time eye sampling slot, forwarded.
+bool
+comp_hub_d3d11_has_eye_positions_at(struct comp_hub_d3d11 *split);
+
+bool
+comp_hub_d3d11_get_eye_positions_at(struct comp_hub_d3d11 *split,
+                                    int64_t target_ns,
+                                    struct xrt_eye_positions *out_eye_pos);
+
 bool
 comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *split, float *out_width_m, float *out_height_m);
 

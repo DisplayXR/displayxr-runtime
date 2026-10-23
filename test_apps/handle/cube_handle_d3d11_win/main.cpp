@@ -462,7 +462,8 @@ static bool g_l2dPanel2 = false;
 static int g_l2dBackdropVariant = 0;
 static bool g_l2dActive = false; // set once panels (+ optional mask) are live
 static long g_l2dFrameCounter = 0;
-static const long g_l2dActivationFrame = 10;
+// DXR_LOCAL2D_ACTIVATION_FRAME=N overrides (#2317: a mid-session hub retire).
+static long g_l2dActivationFrame = 10;
 
 struct L2DPanel {
     XrSwapchain swapchain = XR_NULL_HANDLE;
@@ -2577,6 +2578,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
+        e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
+        if (e != nullptr && *e != 0) {
+          const long f = strtol(e, nullptr, 10);
+          if (f > 0) g_l2dActivationFrame = f;
+        }
         // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (variant 2); =2 ⟹
         // semi-transparent (variant 3, desktop shows through). Implies the panel path.
         e = getenv("DXR_LOCAL2D_BACKDROP");
