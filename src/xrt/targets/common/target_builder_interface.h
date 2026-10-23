@@ -17,13 +17,6 @@
  *
  */
 
-// Always enabled.
-#define T_BUILDER_LEGACY
-
-#if defined(XRT_BUILD_DRIVER_QWERTY) || defined(XRT_DOXYGEN)
-#define T_BUILDER_QWERTY
-#endif
-
 // Vendor builders (Leia SR, etc.) are no longer compiled into the
 // runtime DLL. The Leia plug-in (DisplayXR-LeiaSR.dll, shipped from
 // DisplayXR/displayxr-leia-plugin) is loaded by target_plugin_loader.c
@@ -39,22 +32,6 @@
  * Setter upper creation functions, sorted alphabetically.
  *
  */
-
-#ifdef T_BUILDER_LEGACY
-/*!
- * Builder used as a fallback for drivers not converted to builders yet.
- */
-struct xrt_builder *
-t_builder_legacy_create(void);
-#endif
-
-#ifdef T_BUILDER_QWERTY
-/*!
- * The qwerty driver builder.
- */
-struct xrt_builder *
-t_builder_qwerty_create(void);
-#endif
 
 #ifdef T_BUILDER_SIM_DISPLAY
 /*!

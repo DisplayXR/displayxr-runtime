@@ -94,8 +94,9 @@ cli_print_help(int argc, const char **argv)
 	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
 	P("                      'desktop allow|deny|forget <exe>', 'desktop audit [--tail N] [--json]'.\n");
 #endif
-	P("  test              - List found devices and role assignments, for prober testing.\n");
-	P("  probe             - Just probe and then exit.\n");
+	P("  devices           - Build the system headless (as selftest does) and list the builder, the\n");
+	P("                      active display plug-in and input provider, every device and the role\n");
+	P("                      assignments. 'probe' is an alias.\n");
 
 	return 1;
 }
@@ -149,11 +150,8 @@ main(int argc, const char **argv)
 	if (strcmp(argv[1], "workspace") == 0) {
 		return cli_cmd_workspace(argc, argv);
 	}
-	if (strcmp(argv[1], "test") == 0) {
-		return cli_cmd_test(argc, argv);
-	}
-	if (strcmp(argv[1], "probe") == 0) {
-		return cli_cmd_probe(argc, argv);
+	if (strcmp(argv[1], "devices") == 0 || strcmp(argv[1], "probe") == 0) {
+		return cli_cmd_devices(argc, argv);
 	}
 	if (strcmp(argv[1], "lift") == 0) {
 		return cli_cmd_lift(argc, argv);

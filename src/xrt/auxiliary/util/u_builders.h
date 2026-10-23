@@ -18,16 +18,9 @@
 extern "C" {
 #endif
 
-struct xrt_prober_device;
+struct xrt_frame_context;
+struct xrt_tracking_origin;
 struct u_builder_roles_helper;
-
-
-/*!
- * Max return of the number @ref xrt_prober_device.
- *
- * @ingroup aux_util
- */
-#define U_BUILDER_SEARCH_MAX (16) // 16 Vive trackers
 
 /*!
  * Argument to @ref u_builder_roles_helper_open_system and implemented by
@@ -47,32 +40,6 @@ typedef xrt_result_t (*u_builder_open_system_fn)(struct xrt_builder *xb,
                                                  struct xrt_system_devices *xsysd,
                                                  struct xrt_frame_context *xfctx,
                                                  struct u_builder_roles_helper *ubrh);
-
-/*!
- * A filter to match the against.
- *
- * @ingroup aux_util
- */
-struct u_builder_search_filter
-{
-	uint16_t vendor_id;
-	uint16_t product_id;
-	enum xrt_bus_type bus_type;
-};
-
-/*!
- * Results of a search of devices.
- *
- * @ingroup aux_util
- */
-struct u_builder_search_results
-{
-	//! Out field of found @ref xrt_prober_device.
-	struct xrt_prober_device *xpdevs[U_BUILDER_SEARCH_MAX];
-
-	//! Number of found devices.
-	size_t xpdev_count;
-};
 
 /*!
  * This small helper struct is for @ref u_builder_roles_helper_open_system,
@@ -145,32 +112,6 @@ struct u_builder
  * Functions.
  *
  */
-
-/*!
- * Find the first @ref xrt_prober_device in the prober list.
- *
- * @ingroup aux_util
- */
-struct xrt_prober_device *
-u_builder_find_prober_device(struct xrt_prober_device *const *xpdevs,
-                             size_t xpdev_count,
-                             uint16_t vendor_id,
-                             uint16_t product_id,
-                             enum xrt_bus_type bus_type);
-
-/*!
- * Find all of the @ref xrt_prober_device that matches any in the given list of
- * @ref u_builder_search_filter filters.
- *
- * @ingroup aux_util
- */
-void
-u_builder_search(struct xrt_prober *xp,
-                 struct xrt_prober_device *const *xpdevs,
-                 size_t xpdev_count,
-                 const struct u_builder_search_filter *filters,
-                 size_t filter_count,
-                 struct u_builder_search_results *results);
 
 /*!
  * Helper function for setting up tracking origins. Applies 3dof offsets for devices with XRT_TRACKING_TYPE_NONE.

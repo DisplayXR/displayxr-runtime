@@ -6,7 +6,7 @@
 #
 
 add_library(
-	target_lists STATIC target_builder_interface.h target_builder_legacy.c
+	target_lists STATIC target_builder_interface.h
 			    target_builder_input_provider.c target_builder_input_provider.h
 			    target_builder_qwerty_input.c target_builder_qwerty_input.h
 			    target_lists.c target_lists.h
@@ -55,11 +55,6 @@ endif()
 ###
 # Builders
 #
-
-if(XRT_BUILD_DRIVER_QWERTY)
-	target_sources(target_lists PRIVATE target_builder_qwerty.c)
-	target_link_libraries(target_lists PRIVATE drv_qwerty)
-endif()
 
 # Vendor drivers (Leia SR, etc.) are no longer linked into the runtime
 # DLL — ADR-019 / issues #256 & #263. They ship as plug-in DLLs from

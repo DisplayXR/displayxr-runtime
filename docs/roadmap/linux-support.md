@@ -215,7 +215,8 @@ display info `0.3440m x 0.1940m, 1920x1080 px`):
   gets Phase 0 green. Promote to a required PR check once stable.
 - `CMakeLists.txt` — (a) relaxed `find_package(udev REQUIRED)` → optional so a
   box without `libudev-dev` configures (`XRT_HAVE_LIBUDEV` just turns off; the DP
-  comes from the plug-in loader, not udev); (b) `CMAKE_POSITION_INDEPENDENT_CODE
+  comes from the plug-in loader, not udev — the udev prober, the option and
+  the `libudev-dev` dependency were later removed outright, #703); (b) `CMAKE_POSITION_INDEPENDENT_CODE
   ON` on Linux so static libs (incl. the FetchContent'd `displayxr_mcp`) link
   into the runtime `.so`.
 - `src/xrt/drivers/CMakeLists.txt` + `sim_display_plugin.c` — gate the desktop-GL

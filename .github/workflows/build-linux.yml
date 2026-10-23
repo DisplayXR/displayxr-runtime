@@ -123,7 +123,7 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
+            libeigen3-dev libcjson-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
@@ -229,7 +229,7 @@ jobs:
           $SUDO apt-get install -y \
             build-essential cmake ninja-build pkg-config git ca-certificates python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
+            libeigen3-dev libcjson-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
@@ -336,7 +336,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git ca-certificates python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
+            libeigen3-dev libcjson-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
@@ -376,7 +376,7 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
+            libeigen3-dev libcjson-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
@@ -460,7 +460,7 @@ jobs:
             build-essential cmake ninja-build pkg-config git ca-certificates \
             python3 file binutils \
             libvulkan-dev glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev \
+            libeigen3-dev libcjson-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libxrandr-dev \

@@ -146,8 +146,6 @@ add_library(
 	u_pretty_print.h
 	u_openxr_runtime.c
 	u_openxr_runtime.h
-	u_prober.c
-	u_prober.h
 	u_rear_budget.c
 	u_rear_budget.h
 	u_resampler.c

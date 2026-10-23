@@ -448,7 +448,6 @@ STABLE_SONAMES=(
     libvulkan.so.1                  # libvulkan1
     libcjson.so.1                   # libcjson1
     libdbus-1.so.3                  # libdbus-1-3
-    libudev.so.1                    # libudev1
     libX11.so.6 libX11-xcb.so.1     # libx11-6, libx11-xcb1
     libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
     libXrandr.so.2                  # libxrandr2

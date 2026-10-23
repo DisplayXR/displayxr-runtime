@@ -34,8 +34,6 @@
 #   # libx11-dev + libxrandr-dev also enable XRT_HAVE_XLIB_XRANDR → the optional
 #   # direct-scanout present path (DXR_LINUX_DIRECT_SCANOUT=1) that acquires the
 #   # 3D-panel connector as a VkDisplayKHR and bypasses Xorg/compositor (ST-5539).
-#   # optional (enables the legacy udev VR prober — NOT needed for selftest):
-#   sudo apt-get install -y libudev-dev
 #
 #   # CI PARITY — install these too if you want a local build to PREDICT CI.
 #   sudo apt-get install -y libgl-dev libegl-dev libglvnd-dev \

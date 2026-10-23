@@ -7,28 +7,30 @@ SPDX-License-Identifier: BSL-1.0
 
 ## Map
 
-The components you will be interacting with are the **prober** (`st_prober`) to
-find hardware devices and set up a working system, along with the **auxiliary**
-code (`aux`) that provides various helpers. You will actually be implementing the
-`xrt_device` interface by writing a driver. It is convention for interfaces to
-allow full, complete control of anything a device might want to modify/control,
-and to provide helper functionality in `aux` to simplify implementation of the
-most common cases.
+DisplayXR does not probe for hardware. A display reaches the runtime as a
+**display-processor plug-in** and input as an **input-provider plug-in**, both
+discovered at `xrCreateInstance` and wired into the system by the
+**sim_display builder** (`src/xrt/targets/common/target_builder_sim_display.c`),
+the only builder in `target_lists.c`. The prober (`st_prober`) that remains is
+just the builder selection plus the builders' lifetime; the Monado USB/HID
+entry lists, auto-probers and udev enumeration were removed (#703).
+
+You will actually be implementing the `xrt_device` interface. It is convention
+for interfaces to allow full, complete control of anything a device might want
+to modify/control, and to provide helper functionality in `aux` to simplify
+implementation of the most common cases.
 
 ## Getting started
 
-The easiest way to begin writing a driver is to start from a working example.
-The **sim_display** driver at `src/xrt/drivers/sim_display/` serves as a good
-starting template: it creates an HMD device with a custom `xrt_auto_prober`
-implementation for hardware discovery, display processor implementations for
-all graphics APIs, and simple display parameters that should be easy to modify.
+For a 3D display, do not write an in-tree driver: write a vendor plug-in. Start
+from [vendor-plugin-onboarding.md](vendor-plugin-onboarding.md) and the
+`sim_display` plug-in at `src/xrt/drivers/sim_display/`, which implements the
+display processor for every graphics API with simple display parameters that
+are easy to modify.
 
-Copy that directory and rename the files in it, then adapt the code to your
-device. You will want to go through each function, implement any missing
-functionality, and adapt any existing functionality to match your device. Refer
-to other drivers for additional guidance. Most drivers are fairly simple, as
-large or complex functionality in drivers is often factored out into separate
-auxiliary libraries.
+For an input device (controllers, hands, a gamepad), write an input-provider
+plug-in — see `docs/specs/runtime/input-provider-discovery.md` and the in-tree
+`sim_input/` reference.
 
 ## What to Implement
 
@@ -40,27 +42,9 @@ convention called `..._system`). Both are valid choices, and the right one to
 choose depends on which maps better to your underlying device or API you are
 connecting to. It is more common to have one `xrt_device` per piece of hardware.
 
-Depending on whether your device can be created from a detected USB HID device,
-you will also need to implement either `xrt_auto_prober` or a function
-matching `xrt_prober_found_func_t` which is the function pointer type of
-`xrt_prober_entry::found`. See below for more details.
-
-## Probing
-
-When should I implement the `xrt_auto_prober` interface? The answer is not too
-hard: you use the auto prober interface when the basic USB VID/PID-based
-interface is not sufficient for you to detect presence/absence of your device,
-or if you don't want to use the built-in HID support for some reason.
-
-If you can detect based on VID/PID, you will instead implement a function
-matching `xrt_prober_found_func_t` to perform detection of your device based
-on the USB HID.
-
-Either way, your device's detection details will need to be added to a list used
-by the prober at `xrt_instance` startup time. The stock lists are in
-`src/xrt/targets/common/target_lists.c`. These are shared by the various targets
-(OpenXR runtime shared library, service executable, utility executables) also
-found in `src/xrt/targets`.
+To see what the runtime built — the builder, the active display plug-in and
+input provider, every device and the role assignments — run
+`displayxr-cli devices`.
 
 ## Display Processor Integration
 

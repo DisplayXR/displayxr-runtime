@@ -219,12 +219,6 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	set(XRT_HAVE_LINUX YES)
-	# udev drives ONLY the legacy VR device prober (gated by XRT_HAVE_LIBUDEV,
-	# DEPENDS UDEV_FOUND below). A 3D-display runtime discovers its display
-	# processor through the plug-in loader, not udev, so a missing libudev must
-	# NOT fail configure — degrade to the no-udev prober path instead. Was
-	# `REQUIRED`; relaxed for the Linux bring-up. See docs/roadmap/linux-support.md.
-	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
 		# Xlib + Xrandr: only needed for the direct-scanout present path
@@ -286,7 +280,6 @@ option_with_deps(XRT_HAVE_WAYLAND "Enable Wayland app-surface present path (XR_D
 option_with_deps(XRT_HAVE_DBUS "Enable D-Bus (Wayland window-geometry provider)" DEPENDS DBUS_FOUND)
 
 # System deps to use (sorted)
-option_with_deps(XRT_HAVE_LIBUDEV "Enable libudev (used for device probing on Linux)" DEPENDS UDEV_FOUND)
 option_with_deps(XRT_HAVE_SYSTEMD "Enable systemd support" DEPENDS Systemd_FOUND)
 
 # Only use system cJSON if it includes https://github.com/DaveGamble/cJSON/pull/377

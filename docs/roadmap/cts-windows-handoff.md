@@ -410,9 +410,9 @@ Three known items flagged in the implementation to resolve against CTS output:
 
 1. **R1 — role ownership (verify first).** The oxr-level injection only surfaces
    if the **qwerty** device owns `/user/hand/left|right` under the CTS launch
-   config. `sim_display` claims only `head`, so qwerty's `certain.left/right`
-   (`target_builder_qwerty.c`) should win — but assert it (a `displayxr-cli`
-   line or log that L/R roles resolve to a Qwerty device). If a display plug-in
+   config. The sim_display builder adds the qwerty input devices
+   (`target_builder_qwerty_input.c`; the standalone qwerty builder was removed
+   in #703) — but assert it (`displayxr-cli devices` prints the L/R roles). If a display plug-in
    ever claims hand roles, the fallback is a dedicated `drv_conformance` device.
 2. **Device-inactive suppression.** `xrSetInputDeviceActiveEXT(false)` currently
    suppresses only *overridden* inputs, not un-overridden qwerty defaults. If

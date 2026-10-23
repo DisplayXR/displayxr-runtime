@@ -47,8 +47,9 @@ cli_cmd_runtime(int argc, const char **argv);
 int
 cli_cmd_displays(int argc, const char **argv);
 
+//! `devices` (alias `probe`) — the system's builder, plug-ins, devices and roles (#703).
 int
-cli_cmd_probe(int argc, const char **argv);
+cli_cmd_devices(int argc, const char **argv);
 
 //! `status [--json] [--watch [--interval ms]]` — the display status snapshot (ADR-051).
 int
@@ -118,9 +119,6 @@ cli_query_lift_caps_from_service(struct cli_query_result *r);
 //! `workspace list|set|reset|launch` — workspace controllers + launch settings (dashboard phase 8).
 int
 cli_cmd_workspace(int argc, const char **argv);
-
-int
-cli_cmd_test(int argc, const char **argv);
 
 //! `lift` — XR_DXR_lift (ADR-042): `lift caps`, `lift probe <image|dir>`.
 int

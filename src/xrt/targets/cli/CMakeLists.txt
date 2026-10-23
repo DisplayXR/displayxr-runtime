@@ -50,8 +50,7 @@ add_executable(
 	cli_cmd_runtime.c
 	cli_cmd_displays.c
 	cli_cmd_status.c
-	cli_cmd_probe.c
-	cli_cmd_test.c
+	cli_cmd_devices.c
 	cli_cmd_clients.c
 	cli_cmd_workspace.c
 	cli_cmd_lift.cpp
