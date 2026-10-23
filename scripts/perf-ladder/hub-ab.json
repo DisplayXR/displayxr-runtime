@@ -1,0 +1,67 @@
+{
+  "kit": "DXRHubAB",
+  "kitVersion": "0.1.0",
+  "issue": "#2317 P1d",
+  "windowSeconds": 20,
+  "warmupSeconds": 6,
+  "reps": 3,
+  "cooldownSeconds": 5,
+  "startupTimeoutSec": 60,
+  "noWitnessSettleSec": 12,
+  "appDir": "..\\..\\test_apps\\build\\bin",
+  "baseEnv": {
+    "DXR_FRAME_WITNESS": "5",
+    "VK_LOADER_LAYERS_DISABLE": "*"
+  },
+  "topologies": {
+    "default": {},
+    "same-adapter": {
+      "DXR_D3D_FORCE_GPU": "scanout",
+      "DXR_VK_FORCE_GPU": "scanout"
+    }
+  },
+  "paths": {
+    "native":    "per-API in-process compositor weaves + presents (no output-device split, no hub)",
+    "fill-arm":  "D3D11 fill arm (comp_vk_native_split): #1264 d3d12 reroute or the VK output-device split",
+    "own-split": "the API's own #918 output-device split (d3d12 own legs / d3d11 own split) - NOT the hub",
+    "hub":       "comp_hub_d3d11 in-process shim (DXR_HUB=1, P1b) - 'hub placement: hub=1'"
+  },
+  "apps": [
+    {
+      "name": "d3d11",
+      "exe": "cube_handle_d3d11_win.exe",
+      "nativeSite": "d3d11",
+      "arms": [
+        { "name": "native", "env": { "DXR_WEAVE_ON_SCANOUT": "0" }, "expectPath": "native" },
+        { "name": "hub",    "env": { "DXR_HUB": "1" },              "expectPath": "hub" }
+      ]
+    },
+    {
+      "name": "d3d12",
+      "exe": "cube_handle_d3d12_win.exe",
+      "nativeSite": "d3d12",
+      "arms": [
+        { "name": "native",    "env": { "DXR_WEAVE_ON_SCANOUT": "0" },  "expectPath": "native" },
+        { "name": "hub",       "env": {},                               "expectPath": "fill-arm" },
+        { "name": "own-split", "env": { "DXR_SPLIT_D3D12_ROUTE": "own" }, "expectPath": "own-split", "optional": true }
+      ]
+    },
+    {
+      "name": "vk",
+      "exe": "cube_handle_vk_win.exe",
+      "nativeSite": "vk",
+      "arms": [
+        { "name": "native", "env": { "DXR_WEAVE_ON_SCANOUT": "0" }, "expectPath": "native" },
+        { "name": "hub",    "env": {},                              "expectPath": "fill-arm" }
+      ]
+    },
+    {
+      "name": "gl",
+      "exe": "cube_handle_gl_win.exe",
+      "nativeSite": "gl",
+      "arms": [
+        { "name": "native", "env": {}, "expectPath": "native", "placementRequired": false, "witnessRequired": false }
+      ]
+    }
+  ]
+}
