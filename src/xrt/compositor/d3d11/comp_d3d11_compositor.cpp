@@ -364,6 +364,10 @@ struct comp_d3d11_compositor
 	//! its flatten mode (plugin #116 flattens the gate).
 	bool transparent_background;
 
+	//! #2273 DXR_ATLAS_ENCODING=pq: asked the DP once; true while it weaves PQ.
+	bool pq_atlas_checked = false;
+	bool pq_atlas_active = false;
+
 
 	//! Active authored zone mask (#439 Phase 1, XR_DXR_local_3d_zone). Set by
 	//! comp_d3d11_compositor_zone_mask_submit (sticky, last-submit-wins),
@@ -2485,6 +2489,46 @@ d3d11_projection_layer_view_count(const struct comp_layer_accum *layers)
 	return 0;
 }
 
+/*!
+ * #2273 — DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2):
+ * re-encode the composed atlas as PQ and declare it, but only to a DP that
+ * accepts PQ through the appended query slot. Anything else — unset knob, older
+ * DP, 8-bit/16F atlas — leaves the atlas and the declared encoding exactly as
+ * before, with one WARN saying why.
+ */
+static void
+d3d11_maybe_encode_atlas_pq(struct comp_d3d11_compositor *c)
+{
+	static int requested = -1;
+	if (requested < 0) {
+		const char *v = getenv("DXR_ATLAS_ENCODING");
+		requested = (v != nullptr && _stricmp(v, "pq") == 0) ? 1 : 0;
+	}
+	if (requested == 0 || c->display_processor == NULL) {
+		return;
+	}
+	if (!c->pq_atlas_checked) {
+		c->pq_atlas_checked = true;
+		c->pq_atlas_active =
+		    xrt_display_processor_d3d11_accepts_atlas_encoding(c->display_processor, XRT_ATLAS_ENCODING_PQ);
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2273, experimental): %s",
+		        c->pq_atlas_active ? "DP accepts PQ - weaving a PQ atlas"
+		                           : "DP does not accept PQ - keeping the sRGB atlas");
+		if (c->pq_atlas_active) {
+			xrt_display_processor_d3d11_set_atlas_encoding(c->display_processor, XRT_ATLAS_ENCODING_PQ);
+		}
+	}
+	if (!c->pq_atlas_active) {
+		return;
+	}
+	if (comp_d3d11_renderer_encode_atlas_pq(c->renderer) != XRT_SUCCESS) {
+		// Not a 10-bit atlas (or the pass failed): stop declaring PQ.
+		U_LOG_W("DXR_ATLAS_ENCODING=pq: atlas is not R10G10B10A2 (set DXR_ATLAS_FORMAT=rgb10a2) - PQ off");
+		c->pq_atlas_active = false;
+		xrt_display_processor_d3d11_set_atlas_encoding(c->display_processor, XRT_ATLAS_ENCODING_ENCODED);
+	}
+}
+
 static bool
 d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 {
@@ -4553,6 +4597,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			return xret;
 		}
 	}
+
+	// #2273 HDR10 (experimental): hand the DP a PQ atlas. Runs after the last
+	// pass that composes into the atlas and before anything reads it (bridge
+	// submit, weave), so both the split and the single-device path weave PQ.
+	d3d11_maybe_encode_atlas_pq(c);
 
 	/*
 	 * #875 DEPOSIT: resolve the mask and flatten the Local2D layers while the app

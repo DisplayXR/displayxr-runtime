@@ -114,6 +114,7 @@ set(tests
     tests_u_eye_history
     tests_sim_eyes
     tests_dp_eye_positions_at
+    tests_dp_atlas_encoding_query
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
@@ -554,6 +555,8 @@ target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
 # ... and the target-time slot on all five DP vtables: appended last, gated,
 # falling back to the vendor horizon.
 target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
+# ... and the D3D11 PQ atlas query (#2273): appended last, gated, false when absent.
+target_link_libraries(tests_dp_atlas_encoding_query PRIVATE xrt-interfaces)
 
 if(TARGET tests_sim_display_monitor_geometry)
 	# The pure pick is compiled straight in; the fixture path uses aux_os's

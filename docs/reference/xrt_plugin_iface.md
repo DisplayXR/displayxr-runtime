@@ -987,6 +987,18 @@ based on. The old slot keeps meaning "now + your default horizon". A DP without 
 today's latest-answer behaviour — every path returns its `get_predicted_eye_positions` answer
 unchanged; implementing the slot opts in to display-time sampling. Full contract: [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
 
+## PQ atlases: `accepts_atlas_encoding` (D3D11, #2273)
+
+`bool (*accepts_atlas_encoding)(xdp, enum xrt_atlas_encoding encoding)` — an optional slot appended to
+the D3D11 vtable after `get_eye_positions_at` (ADR-020, ABI unchanged, `#ifdef
+XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY`; helper `xrt_display_processor_d3d11_accepts_atlas_encoding()`,
+false for an absent slot or NULL). The runtime asks it before it sends any encoding beyond the
+ENCODED/LINEAR pair that `get_color_capability` negotiates; today that is `XRT_ATLAS_ENCODING_PQ` (SMPTE
+ST 2084 code values, 1.0 linear = 203 cd/m², primaries passed through), under the experimental
+`DXR_ATLAS_ENCODING=pq` + `DXR_ATLAS_FORMAT=rgb10a2` knobs. Keep reporting `get_color_capability` as
+before: the runtime compares it with `== XRT_DP_COLOR_EITHER`, which is why PQ is a query and not a
+new capability value.
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and
