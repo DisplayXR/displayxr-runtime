@@ -21,6 +21,9 @@
 #include "comp_d3d11_state_guard.h"
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
+// #2317 P1b: the D3D11 hub (DXR_HUB=1 shim).
+#include "hub_d3d11/comp_hub_d3d11.h"
+#include "hub_d3d11/comp_hub_d3d11_handoff.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -318,6 +321,45 @@ struct comp_d3d11_compositor
 	//! #918 review D4 — one WARN per session when the Local2D plane cannot be
 	//! bound, never one per frame.
 	bool local2d_plane_warned;
+
+	/*!
+	 * #2317 P1b: the D3D11 HUB SHIM, behind `DXR_HUB=1` (default OFF).
+	 *
+	 * When active this tier owns no display processor, no target and no split:
+	 * the renderer composes the atlas on the app device exactly as always, and the
+	 * atlas is handed to @ref comp_hub_d3d11 (the fill arm the VK and D3D12 tiers
+	 * already use), which weaves it on ITS OWN device and immediate context — on
+	 * the scanout adapter — and presents to the app's HWND. Same adapter: the hub
+	 * opens the atlas in place (DIRECT, ordered by @ref fence and the hub's own
+	 * consumer fence — no transport copy). Across adapters: comp_xbridge Option I,
+	 * the same two copies this tier's own split pays.
+	 *
+	 * Scope: plain projection (+ the window-space layers and the cursor the
+	 * renderer composes INTO the atlas). A frame carrying Local2D layers, zones or
+	 * an authored mask retires the hub for the rest of the session and rebuilds
+	 * this tier's single-device legs (@ref d3d11_hub_retire) BEFORE that frame is
+	 * composed, so nothing is ever rendered without them.
+	 *
+	 * `split` and `active` change only under BOTH c->mutex (the frame path) and
+	 * dp_swap_mutex (the app-thread forwarders), which read `split` under the
+	 * latter.
+	 */
+	struct
+	{
+		struct comp_hub_d3d11 *split;
+		bool active;
+		//! The producer fence (app device, NT-shared) the hub's DIRECT weave waits on.
+		ID3D11Fence *fence;
+		HANDLE fence_handle;
+		uint64_t fence_value;
+		ID3D11DeviceContext4 *ctx4;
+		//! Borrowed by the hub for the session (the handoff's dxgi_adapter).
+		IDXGIAdapter *adapter;
+		//! For the retire rebuild of the tier's own display processor.
+		void *dp_factory_d3d11;
+		//! The DP canvas the last app frame wove at; a repaint replays it.
+		struct xrt_rect canvas;
+	} hub;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
@@ -1254,6 +1296,13 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 			lookahead_ns = (int64_t)measured;
 		}
 		comp_d3d11_target_mark_wait_frame(c->target);
+	} else if (c->hub.active) {
+		// #2317 P1b: the same ledger, on the hub's target.
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->hub.split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->hub.split);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: panel period on purpose — see wait_frame's note on
@@ -1322,7 +1371,7 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// gate to DXR_SPLIT_SAME_ADAPTER's default by construction, exactly
 	// as the VK tier ships. In-process (split-off) sessions still refuse
 	// cleanly.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, c->split_active);
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, c->split_active || c->hub.active);
 	// #1482: republish the grid state to the target, which is where the
 	// app's frame-latency wait lives. When the grid is pacing, the target
 	// must not drain the surplus tokens (#868) — the drain cannot tell the
@@ -1351,6 +1400,15 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 			lookahead_ns = (int64_t)measured;
 		}
 		comp_d3d11_target_mark_wait_frame(c->target);
+	} else if (c->hub.active) {
+		// #2317 P1b: the same ledger and the same #1482 grid flag, on the
+		// hub's target (under the lock: the hub can retire mid-session).
+		comp_hub_d3d11_set_app_paced(c->hub.split, c->repaint.partition.next_release_ns != 0);
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->hub.split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->hub.split);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: deliberately still the PANEL period, never D x period
@@ -1400,7 +1458,19 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 		in_size_move = comp_d3d11_window_is_in_size_move(c->own_window);
 	}
 
-	if (c->hwnd != nullptr) {
+	// #2317 P1b: under the hub the swapchain is the hub's, on its own device —
+	// it follows the window there (no app-context lock: the app never touches it).
+	if (c->hub.active && c->hwnd != nullptr) {
+		RECT hrect;
+		if (GetClientRect(c->hwnd, &hrect)) {
+			const uint32_t hw = static_cast<uint32_t>(hrect.right - hrect.left);
+			const uint32_t hh = static_cast<uint32_t>(hrect.bottom - hrect.top);
+			if (hw > 0 && hh > 0 && comp_hub_d3d11_resize_target(c->hub.split, hw, hh)) {
+				c->settings.preferred.width = hw;
+				c->settings.preferred.height = hh;
+			}
+		}
+	} else if (c->hwnd != nullptr) {
 		RECT rect;
 		if (GetClientRect(c->hwnd, &rect)) {
 			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);
@@ -2108,8 +2178,10 @@ d3d11_rear_budget_tick(struct comp_d3d11_compositor *c)
 	struct xrt_dp_background_preview pv;
 	xrt_dp_background_preview_init(&pv);
 	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
+	// #2317 P1b: under the hub its weaver is the one capturing.
 	const bool got =
-	    polled && xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv);
+	    polled && (c->hub.active ? comp_hub_d3d11_get_background_preview(c->hub.split, &pv)
+	                             : xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv));
 
 	comp_rear_budget_tick(&c->rear_budget, got ? &pv : nullptr, polled, c->transparent_background, now_ns);
 }
@@ -3542,7 +3614,10 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// fraction of its slots. Under an ENGAGED partition the schedule
 		// IS the pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		if (c->repaint.partition.next_release_ns == 0) {
+		// #2317 P1b: under the hub there is no target on this side; the hub's
+		// flip chain and repaint_admit below are the throttle (the D3D12
+		// reroute's shape).
+		if (c->repaint.partition.next_release_ns == 0 && c->target != nullptr) {
 			comp_d3d11_target_repaint_pace(c->target);
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
@@ -3550,6 +3625,46 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 
 		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
+
+		/*
+		 * #2317 P1b: the replay is the hub's re-weave of the frame it last wove —
+		 * no app-device work at all, so neither mt_lock nor the app state guard.
+		 */
+		if (c->hub.active) {
+			if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
+			    c->repaint.app_frame_in_progress || !comp_hub_d3d11_has_weave_slot(c->hub.split)) {
+				c->repaint.bail_armed++;
+				u_repaint_trace_bail_armed(&c->repaint.trace);
+				continue;
+			}
+			if (c->repaint.force != 1 && !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(),
+			                                                  period_ns, &c->repaint.partition)) {
+				c->repaint.bail_race++;
+				u_repaint_trace_bail_race(&c->repaint.trace);
+				continue;
+			}
+			if (c->repaint.partition.next_release_ns == 0 && !comp_hub_d3d11_repaint_admit(c->hub.split)) {
+				c->repaint.bail_gate++;
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				continue;
+			}
+			const uint64_t hub_rp_start_ns = os_monotonic_get_ns();
+			comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/true, &c->hub.canvas);
+			c->repaint.count++;
+			const uint64_t hub_fire_t1 = os_monotonic_get_ns();
+			u_repaint_gate_note_repaint(&c->repaint.gate, hub_rp_start_ns);
+			u_repaint_trace_fire(&c->repaint.trace, fire_t0, hub_fire_t1);
+			u_fill_shed_note_fire(&c->repaint.shed, fire_t0, hub_fire_t1, period_ns);
+			static bool hub_logged = false;
+			if (!hub_logged) {
+				hub_logged = true;
+				U_LOG_W(
+				    "#868: repainting via the D3D11 hub at %.1f Hz while the app is between frames "
+				    "(#2317 P1b)",
+				    hz);
+			}
+			continue;
+		}
 
 		// app_frame_in_progress is load-bearing and is NOT bypassed by the
 		// force probe: replaying into a half-written layer_accum does not
@@ -4071,6 +4186,334 @@ comp_d3d11_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const s
 	c->cursor_draw.req = *req;
 }
 
+/*
+ *
+ * #2317 P1b: the D3D11 hub shim (DXR_HUB=1).
+ *
+ */
+
+static bool
+d3d11_make_dp(struct comp_d3d11_compositor *c,
+              void *dp_factory,
+              ID3D11Device *device,
+              ID3D11DeviceContext *context,
+              bool on_scanout);
+
+//! `DXR_HUB=1`, read once. Process-level env, like every in-process DXR_* knob.
+static bool
+d3d11_hub_requested(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_HUB");
+		on = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+//! The pure-D3D11 handoff for this tier's renderer atlas (the per-frame fields
+//! are filled by the caller).
+static void
+d3d11_hub_fill_handoff(struct comp_d3d11_compositor *c, struct comp_hub_d3d11_handoff *h)
+{
+	h->d3d11_device = c->device;
+	h->d3d11_context = c->context;
+	h->dxgi_adapter = c->hub.adapter;
+	h->fence = c->hub.fence;
+	h->fence_shared_handle = c->hub.fence_handle;
+	h->fence_value = c->hub.fence_value;
+	h->dxgi_format = comp_d3d11_renderer_requested_atlas_format();
+	h->width = c->settings.preferred.width;
+	h->height = c->settings.preferred.height;
+}
+
+static void
+d3d11_hub_release_producer(struct comp_d3d11_compositor *c)
+{
+	if (c->hub.ctx4 != nullptr) {
+		c->hub.ctx4->Release();
+		c->hub.ctx4 = nullptr;
+	}
+	if (c->hub.fence_handle != nullptr) {
+		CloseHandle(c->hub.fence_handle);
+		c->hub.fence_handle = nullptr;
+	}
+	if (c->hub.fence != nullptr) {
+		c->hub.fence->Release();
+		c->hub.fence = nullptr;
+	}
+	if (c->hub.adapter != nullptr) {
+		c->hub.adapter->Release();
+		c->hub.adapter = nullptr;
+	}
+}
+
+/*!
+ * Stage A of the shim: decide, stand the hub up (device + DP + swapchain on the
+ * scanout adapter, the gate's own ladder), create the producer fence, wire the
+ * ingress. Runs BEFORE this tier's own split Stage A, target and DP, so a
+ * refusal at any rung is just the stock path — nothing to unwind.
+ *
+ * @return NULL when the hub is active, else the canonical reason token.
+ */
+static const char *
+d3d11_hub_stage_a(struct comp_d3d11_compositor *c,
+                  struct xrt_device *xdev,
+                  void *dp_factory_d3d11,
+                  bool transparent_background,
+                  int32_t display_screen_left,
+                  int32_t display_screen_top)
+{
+	if (!d3d11_hub_requested()) {
+		return COMP_HUB_REASON_NOT_REQUESTED;
+	}
+	if (c->has_shared_texture) {
+		return COMP_SPLIT_REASON_SHARED_TEXTURE;
+	}
+	if (c->hwnd == nullptr) {
+		return COMP_SPLIT_REASON_NO_HWND;
+	}
+	if (c->owns_window) {
+		return COMP_HUB_REASON_HOSTED_WINDOW;
+	}
+	if (transparent_background) {
+		return COMP_HUB_REASON_TRANSPARENT;
+	}
+
+	uint64_t render_packed_luid = 0;
+	{
+		IDXGIDevice *dd = nullptr;
+		if (SUCCEEDED(c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dd))) &&
+		    dd != nullptr) {
+			dd->GetAdapter(&c->hub.adapter);
+			dd->Release();
+		}
+		DXGI_ADAPTER_DESC ad{};
+		if (c->hub.adapter != nullptr && SUCCEEDED(c->hub.adapter->GetDesc(&ad))) {
+			render_packed_luid = ((uint64_t)(uint32_t)ad.AdapterLuid.HighPart << 32) |
+			                     (uint64_t)(uint32_t)ad.AdapterLuid.LowPart;
+		}
+	}
+
+	struct comp_hub_d3d11_info si = {};
+	si.xdev = xdev;
+	si.hwnd = c->hwnd;
+	si.dp_factory_d3d11 = dp_factory_d3d11;
+	si.has_shared_texture = c->has_shared_texture;
+	si.transparent_background = transparent_background;
+	// The gate this bool exists for is Vulkan's; D3D11 fences always interop.
+	si.app_timeline_semaphores = true;
+	si.render_packed_luid = render_packed_luid;
+	si.display_screen_left = display_screen_left;
+	si.display_screen_top = display_screen_top;
+	si.preferred_width = c->settings.preferred.width;
+	si.preferred_height = c->settings.preferred.height;
+	si.stable_atlas = true;
+
+	const char *short_reason = nullptr;
+	if (comp_hub_d3d11_stage_a(&si, &c->hub.split, &short_reason) != XRT_SUCCESS || c->hub.split == nullptr) {
+		c->hub.split = nullptr;
+		d3d11_hub_release_producer(c);
+		return short_reason != nullptr ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+	}
+
+	// The producer fence: signalled on the app's immediate context after the
+	// passes, waited GPU-side by the hub's DIRECT weave.
+	{
+		ID3D11Device5 *d5 = nullptr;
+		HRESULT hr = c->device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&d5));
+		if (SUCCEEDED(hr) && d5 != nullptr) {
+			hr = d5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+			                     reinterpret_cast<void **>(&c->hub.fence));
+			d5->Release();
+		}
+		if (SUCCEEDED(hr) && c->hub.fence != nullptr) {
+			hr = c->hub.fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &c->hub.fence_handle);
+		}
+		if (SUCCEEDED(hr) && c->hub.fence_handle != nullptr) {
+			hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext4),
+			                                reinterpret_cast<void **>(&c->hub.ctx4));
+		}
+		if (FAILED(hr) || c->hub.fence_handle == nullptr || c->hub.ctx4 == nullptr) {
+			// Nothing has presented: a plain destroy, not a retire (no
+			// placement correction is owed for a line not yet printed).
+			comp_hub_d3d11_destroy(&c->hub.split);
+			d3d11_hub_release_producer(c);
+			return COMP_HUB_REASON_NO_SHARED_FENCE;
+		}
+	}
+
+	struct comp_hub_d3d11_handoff h = {};
+	d3d11_hub_fill_handoff(c, &h);
+	if (!comp_hub_d3d11_wire_bridge(c->hub.split, &h)) {
+		comp_hub_d3d11_destroy(&c->hub.split);
+		d3d11_hub_release_producer(c);
+		return COMP_HUB_REASON_WIRE_FAILED;
+	}
+
+	c->hub.active = true;
+	c->hub.dp_factory_d3d11 = dp_factory_d3d11;
+	return nullptr;
+}
+
+/*!
+ * Mid-session RETIRE: the session submitted content the hub does not carry yet.
+ * Tears the hub down (its RETIRED WARN and `weave placement: CHANGED` line) and
+ * rebuilds this tier's SINGLE-DEVICE legs — target + display processor on the
+ * app device, the rung a failed split Stage A falls through to. Caller holds
+ * c->mutex; the frame that triggered it is then composed natively.
+ */
+static void
+d3d11_hub_retire(struct comp_d3d11_compositor *c, const char *token)
+{
+	U_LOG_W(
+	    "hub placement: CHANGED hub=0 reason=%s — the D3D11 hub does not carry this content yet; the "
+	    "tier's single-device legs take over for the rest of the session (#2317 P1b)",
+	    token);
+	{
+		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
+		comp_hub_d3d11_retire(&c->hub.split, "the session submitted content the D3D11 hub does not carry yet",
+		                      token);
+		c->hub.split = nullptr;
+		c->hub.active = false;
+	}
+	d3d11_hub_release_producer(c);
+	c->repaint.armed = false;
+
+	if (c->hwnd != nullptr) {
+		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, c->device, c->context, c->dxgi_factory,
+		                                             c->settings.preferred.width, c->settings.preferred.height,
+		                                             c->transparent_background, &c->target);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("#2317 hub retire: the app-device target could not be created (%d)", (int)xret);
+			c->target = nullptr;
+		} else {
+			comp_d3d11_target_set_display_period(c->target,
+			                                     (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		}
+	}
+	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
+	if (!d3d11_make_dp(c, c->hub.dp_factory_d3d11, c->device, c->context, false)) {
+		U_LOG_W("#2317 hub retire: no display processor on the app device — continuing without");
+	} else if (c->eye_tracking_mode_set) {
+		xrt_display_processor_d3d11_set_eye_tracking_mode(c->display_processor, c->eye_tracking_mode);
+	}
+}
+
+/*!
+ * #2317 P1b: the post-weave capture under the hub — the same
+ * `%TEMP%\dxr_woven_trigger` -> `dxr_woven_{app,repaint}.png` contract the
+ * tier's own weave serves, read from the HUB's back buffer on the hub's device.
+ */
+static bool
+d3d11_capture_texture_to_png(ID3D11Device *device,
+                             ID3D11DeviceContext *context,
+                             ID3D11Texture2D *atlas_tex,
+                             uint32_t content_w,
+                             uint32_t content_h,
+                             uint32_t view_w,
+                             uint32_t view_h,
+                             const char *path);
+
+static void
+d3d11_hub_post_weave(
+    void *userdata, void *device, void *context, void *back_buffer, uint32_t width, uint32_t height, bool is_repaint)
+{
+	(void)userdata;
+	const char *tmp = getenv("TEMP");
+	if (tmp == nullptr || back_buffer == nullptr) {
+		return;
+	}
+	static bool want_app = false, want_repaint = false;
+	char trig[512];
+	snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
+	FILE *tf = fopen(trig, "rb");
+	if (tf != nullptr) {
+		fclose(tf);
+		remove(trig);
+		want_app = true;
+		want_repaint = true;
+	}
+	bool *want = is_repaint ? &want_repaint : &want_app;
+	if (!*want) {
+		return;
+	}
+	*want = false;
+	char out[512];
+	snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp, is_repaint ? "repaint" : "app");
+	const bool wok = d3d11_capture_texture_to_png(
+	    static_cast<ID3D11Device *>(device), static_cast<ID3D11DeviceContext *>(context),
+	    static_cast<ID3D11Texture2D *>(back_buffer), width, height, 0, 0, out);
+	U_LOG_W("#868 d3d11 woven capture (hub) %s -> %s", wok ? "OK" : "FAILED", out);
+}
+
+/*!
+ * The app frame under the hub: hand the composed atlas over, weave + present
+ * on the hub, arm the repaint replay. Caller holds c->mutex, after both
+ * renderer passes (and the PQ encode) have written the atlas.
+ */
+static xrt_result_t
+d3d11_hub_commit(struct comp_d3d11_compositor *c,
+                 const struct u_canvas_rect *eff_canvas,
+                 const struct xrt_eye_positions *eye_pos,
+                 uint32_t tgt_width,
+                 uint32_t tgt_height)
+{
+	struct comp_hub_d3d11_handoff h = {};
+	d3d11_hub_fill_handoff(c, &h);
+	h.texture = comp_d3d11_renderer_get_atlas_texture(c->renderer);
+	h.shared_handle = comp_d3d11_renderer_get_atlas_shared_handle(c->renderer);
+	h.generation = comp_d3d11_renderer_get_atlas_generation(c->renderer);
+
+	if (comp_hub_d3d11_is_direct(c->hub.split)) {
+		// The atlas is complete on this context; the hub's device waits for
+		// exactly this value. The flush is what lets another device's queue
+		// ever see the signal — not a wait, this thread does not block.
+		c->hub.fence_value++;
+		c->hub.ctx4->Signal(c->hub.fence, c->hub.fence_value);
+		c->context->Flush();
+		h.fence_value = c->hub.fence_value;
+	}
+
+	comp_hub_d3d11_stage_segment_content(c->hub.split, &c->seg_content);
+	comp_hub_d3d11_submit_atlas(c->hub.split, &h, c->eff_layout.cols, c->eff_layout.rows, c->eff_layout.tile_w,
+	                            c->eff_layout.tile_h);
+
+	// The DP canvas: the effective canvas sub-rect when one is active, else the
+	// full window — the answer the D3D12 reroute computes.
+	struct xrt_rect cv = {};
+	if (eff_canvas->valid) {
+		cv.offset.w = eff_canvas->x;
+		cv.offset.h = eff_canvas->y;
+		cv.extent.w = (int32_t)eff_canvas->w;
+		cv.extent.h = (int32_t)eff_canvas->h;
+	} else {
+		cv.extent.w = (int32_t)tgt_width;
+		cv.extent.h = (int32_t)tgt_height;
+	}
+	c->hub.canvas = cv;
+
+	const bool wove = comp_hub_d3d11_weave_and_present(c->hub.split, /*is_repaint=*/false, &cv);
+
+	// #868: arm the replay; a frame that wove nothing keeps the panel's last
+	// woven frame and stays disarmed.
+	c->repaint.canvas = *eff_canvas;
+	c->repaint.eye_pos = *eye_pos;
+	c->repaint.zero_copy = false;
+	c->repaint.zc_srv = nullptr;
+	c->repaint.armed = wove;
+	if (wove) {
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+	} else {
+		d3d11_split_note_skipped_present(c, "the app frame (hub)");
+	}
+
+	comp_hub_d3d11_render_diag(c->hub.split);
+	d3d11_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -4163,8 +4606,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Get predicted eye positions
 	struct xrt_eye_positions eye_pos = {};
-	if (c->display_processor != nullptr) {
-		xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, &eye_pos);
+	if (c->display_processor != nullptr || c->hub.active) {
+		if (c->hub.active) {
+			// #2317 P1b: the hub's weaver is this session's.
+			comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, &eye_pos);
+		} else {
+			xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, &eye_pos);
+		}
 		if (eye_pos.valid) {
 			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
 			// by the time it was asked.
@@ -4276,6 +4724,22 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// all read this under the same c->mutex hold.
 	c->zones_frame = zones_frame;
 
+	/*
+	 * #2317 P1b: the hub carries plain projection (and the window-space layers
+	 * and cursor the renderer composes INTO the atlas) — not the plane machinery.
+	 * A frame that needs it RETIRES the hub before anything below reads it, so the
+	 * frame that first needs it is composed natively, never without its planes.
+	 */
+	if (c->hub.active) {
+		const char *hub_why = have_local_2d                          ? COMP_HUB_REASON_LOCAL2D
+		                      : zones_frame                          ? COMP_HUB_REASON_ZONES
+		                      : d3d11_frame_authored_mask(c) != NULL ? COMP_HUB_REASON_AUTHORED_MASK
+		                                                             : NULL;
+		if (hub_why != NULL) {
+			d3d11_hub_retire(c, hub_why);
+		}
+	}
+
 	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the
 	// frame's 3D zones, from the same scan. Unconditional — a frame with no
 	// zones publishes none, which is what "the whole canvas is the 3D zone"
@@ -4342,7 +4806,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				uint32_t cur_vw, cur_vh;
 				comp_d3d11_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
 				if (cur_vw != new_vw || cur_vh != new_vh) {
-					uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : tgt_height;
+					uint32_t resize_target_h =
+					    (c->display_processor != NULL || c->hub.active) ? new_vh : tgt_height;
 					comp_d3d11_renderer_resize(
 					    c->renderer,
 					    new_vw,
@@ -4369,7 +4834,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// probe is skipped entirely rather than computed and discarded.
 	bool zero_copy = false;
 	void *zc_srv = nullptr;
-	if (!c->split_active) {
+	// #2317 P1b: nor under the hub — the hub opens the RENDERER atlas.
+	if (!c->split_active && !c->hub.active) {
 		const struct xrt_rendering_mode *mode = NULL;
 		if (c->xdev != NULL && c->xdev->hmd != NULL) {
 			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
@@ -4549,6 +5015,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 */
 		if (c->split_active) {
 			comp_xbridge_pre_render(c->xbridge);
+		}
+		// #2317 P1b: the hub's twin — its last read of the atlas retires first.
+		if (c->hub.active) {
+			comp_hub_d3d11_pre_render(c->hub.split);
 		}
 		/*
 		 * #1580: the canvas the quad/cylinder/equirect/cube camera is
@@ -4737,6 +5207,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
 			                    comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w, bridge_h);
 		}
+	}
+
+	// #2317 P1b: the hub weaves and presents; nothing below (offscreen path,
+	// this tier's target, DP, HUD) exists for this session.
+	if (c->hub.active) {
+		return d3d11_hub_commit(c, &eff_canvas, &eye_pos, tgt_width, tgt_height);
 	}
 
 #ifdef XRT_FEATURE_DEBUG_GUI
@@ -5058,6 +5534,12 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	c->seg_screens = nullptr;
 	free(c->seg_sys_info);
 	c->seg_sys_info = nullptr;
+
+	// #2317 P1b: the hub (its weaver, target and device), before the renderer
+	// whose atlas it opened. The repaint loop is already joined.
+	comp_hub_d3d11_destroy(&c->hub.split);
+	c->hub.active = false;
+	d3d11_hub_release_producer(c);
 
 	// Destroy display processor (handles all vendor cleanup internally)
 	xrt_display_processor_d3d11_destroy(&c->display_processor);
@@ -5504,7 +5986,34 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	 */
 	const char *split_off_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
 
-	if (debug_get_bool_option_weave_on_scanout()) {
+	/*
+	 * #2317 P1b — the D3D11 HUB, behind DXR_HUB=1, decided FIRST. When it
+	 * engages, this tier's own split, target and display processor are never
+	 * created; when it refuses, nothing was left behind and the stock ladder
+	 * below runs exactly as before. ONE `hub placement:` line per session.
+	 */
+	{
+		const char *hub_reason = d3d11_hub_stage_a(c, xdev, dp_factory_d3d11, transparent_background,
+		                                           display_screen_left, display_screen_top);
+		if (hub_reason == nullptr) {
+			const uint64_t hl = comp_hub_d3d11_get_hub_luid(c->hub.split);
+			IDXGIAdapter *ra = c->hub.adapter;
+			DXGI_ADAPTER_DESC rdesc = {};
+			if (ra != nullptr) {
+				ra->GetDesc(&rdesc);
+			}
+			U_LOG_W(
+			    "hub placement: hub=1 render=%08lx:%08lx hub_dev=%08lx:%08lx ingress=%s — weave/present "
+			    "on the D3D11 hub's own device (#2317 P1b; DXR_HUB=1)",
+			    (unsigned long)rdesc.AdapterLuid.HighPart, (unsigned long)rdesc.AdapterLuid.LowPart,
+			    (unsigned long)(uint32_t)(hl >> 32), (unsigned long)(uint32_t)hl,
+			    comp_hub_d3d11_is_direct(c->hub.split) ? "direct" : "xbridge");
+		} else {
+			U_LOG_W("hub placement: hub=0 reason=%s (#2317 P1b)", hub_reason);
+		}
+	}
+
+	if (!c->hub.active && debug_get_bool_option_weave_on_scanout()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
 		double stage_a_bridge_ms = 0.0;
 
@@ -5916,15 +6425,20 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 		const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
 		const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		// #2317 P1b: under the hub the weave is on the hub's device, the
+		// scanout adapter by the same gate this tier's split uses.
 		d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph,
-		                        c->split_active, split_off_reason);
+		                        c->split_active || c->hub.active, c->hub.active ? nullptr : split_off_reason);
 	}
 
 	// Create output target (DXGI swapchain) — skip if offscreen (no HWND).
 	// #918: under the split the swapchain, its waitable and its frame statistics
 	// all live on the SCANOUT adapter, which is what removes the cross-adapter
 	// present (~26 ms of the measured 42 ms present-to-display).
-	if (c->hwnd != nullptr) {
+	if (c->hub.active) {
+		// #2317 P1b: the hub's swapchain is the one on the HWND.
+		c->target = nullptr;
+	} else if (c->hwnd != nullptr) {
 		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, d3d11_out_device(c), d3d11_out_context(c),
 		                                             c->split_active ? c->out_factory : c->dxgi_factory,
 		                                             c->settings.preferred.width, c->settings.preferred.height,
@@ -5956,6 +6470,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	if (c->target != nullptr) {
 		comp_d3d11_target_set_display_period(
 		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
+	if (c->hub.active) {
+		comp_hub_d3d11_set_display_period(c->hub.split, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		comp_hub_d3d11_set_post_weave_hook(c->hub.split, d3d11_hub_post_weave, c);
 	}
 
 	/*
@@ -6021,7 +6539,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
 			        "rate. Correctness probe; it WILL cost frame rate.");
 		}
-		if (c->repaint.enabled == 1 && c->target != nullptr) {
+		if (c->repaint.enabled == 1 && (c->target != nullptr || c->hub.active)) {
 			c->repaint_quit.store(false);
 			c->repaint_thread = std::thread(d3d11_repaint_thread, c);
 		}
@@ -6049,7 +6567,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	 * the non-split path has always done, so the §3a fallback needs no code of
 	 * its own — the absence of a retire is the design, not a gap.
 	 */
-	if (c->display_processor != nullptr) {
+	if (c->hub.active) {
+		U_LOG_I("D3D11 display processor: the hub's, on its own device (#2317 P1b)");
+	} else if (c->display_processor != nullptr) {
 		U_LOG_I("D3D11 display processor already created on the scanout device by stage A (#918)");
 	} else if (dp_factory_d3d11 != NULL) {
 		// on_scanout=false: split_active is necessarily false here (see above),
@@ -6094,13 +6614,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// If display processor is available, query display pixel info to compute
 	// optimal view dimensions (scaled to window size).
-	if (c->display_processor != nullptr) {
+	if (c->display_processor != nullptr || c->hub.active) {
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_d3d11_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h,
-		        &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
+		const bool px_ok = c->hub.active
+		                       ? comp_hub_d3d11_get_display_pixel_info(c->hub.split, &disp_px_w, &disp_px_h,
+		                                                               &disp_left, &disp_top)
+		                       : xrt_display_processor_d3d11_get_display_pixel_info(
+		                             c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top);
+		if (px_ok && disp_px_w > 0 && disp_px_h > 0) {
 			// Use half display width as base view dims
 			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
 			        disp_px_w, disp_px_h, disp_px_w / 2, disp_px_h);
@@ -6123,11 +6645,13 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// window regardless of atlas texture height.
 	// NOTE: the per-frame resize path (renderer_resize) must apply the same guard —
 	// see resize_target_h in the mode-switch handler above.
-	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
+	uint32_t target_height =
+	    (c->display_processor != NULL || c->hub.active) ? view_height : c->settings.preferred.height;
 	// #918: only the split asks for an NT-shareable atlas. The non-split
 	// allocation shape is unchanged, byte for byte.
-	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, c->split_active,
-	                                               &c->renderer);
+	// #2317 P1b: the hub opens (or binds) the atlas, so it must be shareable too.
+	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height,
+	                                               c->split_active || c->hub.active, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
 		d3d11_compositor_destroy(&c->base.base);
@@ -9136,6 +9660,15 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
+	if (c->hub.split != nullptr) {
+		// #2317 P1b: the hub's weaver is this session's.
+		if (comp_hub_d3d11_get_predicted_eye_positions(c->hub.split, out_eye_pos) && out_eye_pos->valid) {
+			u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+			return true;
+		}
+		return false;
+	}
+
 	if (c->display_processor != nullptr) {
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
 		    out_eye_pos->valid) {
@@ -9186,6 +9719,9 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
+	if (c->hub.split != nullptr) {
+		return comp_hub_d3d11_get_display_dimensions(c->hub.split, out_width_m, out_height_m);
+	}
 	if (c->display_processor != nullptr) {
 		return xrt_display_processor_d3d11_get_display_dimensions(
 		    c->display_processor, out_width_m, out_height_m);
@@ -9273,16 +9809,17 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 	// display-scoped (#396 W7).
 	HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex); // ADR-047 Amendment 2 swap
-	if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
+	if ((c->display_processor == nullptr && c->hub.split == nullptr) || metrics_hwnd == nullptr) {
 		return false;
 	}
 
-	// Get display pixel info from display processor
+	// Get display pixel info from display processor (#2317 P1b: the hub's, under the hub)
 	uint32_t disp_px_w = 0, disp_px_h = 0;
 	int32_t disp_left = 0, disp_top = 0;
-	if (!xrt_display_processor_d3d11_get_display_pixel_info(
-	        c->display_processor, &disp_px_w, &disp_px_h,
-	        &disp_left, &disp_top)) {
+	if (c->hub.split != nullptr
+	        ? !comp_hub_d3d11_get_display_pixel_info(c->hub.split, &disp_px_w, &disp_px_h, &disp_left, &disp_top)
+	        : !xrt_display_processor_d3d11_get_display_pixel_info(c->display_processor, &disp_px_w, &disp_px_h,
+	                                                              &disp_left, &disp_top)) {
 		return false;
 	}
 
@@ -9292,8 +9829,9 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_w
 
 	// Get physical display dimensions from display processor
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!xrt_display_processor_d3d11_get_display_dimensions(
-	        c->display_processor, &disp_w_m, &disp_h_m)) {
+	if (c->hub.split != nullptr
+	        ? !comp_hub_d3d11_get_display_dimensions(c->hub.split, &disp_w_m, &disp_h_m)
+	        : !xrt_display_processor_d3d11_get_display_dimensions(c->display_processor, &disp_w_m, &disp_h_m)) {
 		return false;
 	}
 
@@ -9376,6 +9914,10 @@ comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
 
+	if (c->hub.split != nullptr) {
+		// #2317 P1b: the hub latches mode_3d and applies its own #2247 rule.
+		return comp_hub_d3d11_request_display_mode(c->hub.split, enable_3d);
+	}
 	if (c->display_processor != nullptr) {
 		// #2247: the primary screen stays 2D while the window has wholly left
 		// it; the weave restores c->hardware_display_3d when it returns.
@@ -9415,6 +9957,11 @@ comp_d3d11_compositor_set_screens(struct xrt_compositor *xc,
 	free(c->seg_sys_info);
 	c->seg_sys_info = info_copy;
 	c->seg_pinned_display_id = pinned_display_id;
+	// #2317 P1b: under the hub its own segment manager segments the window (the
+	// D3D12 reroute's shape); the copies above stay for a retire.
+	if (c->hub.split != nullptr) {
+		comp_hub_d3d11_set_screens(c->hub.split, copy, info_copy, pinned_display_id);
+	}
 	// ...and nothing may frame views from the old table meanwhile.
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
@@ -9431,6 +9978,12 @@ comp_d3d11_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_
 		return false;
 	}
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	{
+		std::lock_guard<std::mutex> dp_lock(c->dp_swap_mutex);
+		if (c->hub.split != nullptr) {
+			return comp_hub_d3d11_get_segment_metrics(c->hub.split, out) && out->count > 0;
+		}
+	}
 	std::lock_guard<std::mutex> seg_lock(c->seg_pub_mutex);
 	*out = c->seg_pub;
 	// The eyes are predicted NOW, per segment: the primary from the session's
@@ -9474,7 +10027,9 @@ comp_d3d11_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 
 	c->eye_tracking_mode_set = true;
 	c->eye_tracking_mode = mode;
-	if (c->display_processor != nullptr) {
+	if (c->hub.split != nullptr) {
+		comp_hub_d3d11_set_eye_tracking_mode(c->hub.split, mode);
+	} else if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d11_set_eye_tracking_mode(c->display_processor, mode);
 	}
 }
@@ -9523,7 +10078,8 @@ comp_d3d11_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 
 	// Fix view dims at the actual recommended size the app was told to render at.
 	if (legacy && c->renderer != nullptr && view_w > 0 && view_h > 0) {
-		uint32_t target_h = (c->display_processor != nullptr) ? view_h : c->settings.preferred.height;
+		uint32_t target_h =
+		    (c->display_processor != nullptr || c->hub.active) ? view_h : c->settings.preferred.height;
 		comp_d3d11_renderer_resize(c->renderer, view_w, view_h, target_h);
 	}
 }

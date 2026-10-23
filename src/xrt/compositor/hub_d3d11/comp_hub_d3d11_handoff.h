@@ -75,6 +75,15 @@ struct comp_hub_d3d11_handoff
 	 * rather than assume.
 	 */
 	uint32_t dxgi_format;
+
+	/*!
+	 * #2317 P1b: the producer atlas's GENERATION, for a producer whose atlas is
+	 * one stable texture re-created only on a resize or mode switch (the D3D11
+	 * tier's renderer atlas, @ref comp_hub_d3d11_info::stable_atlas). A change
+	 * tells the hub to re-open @ref shared_handle. 0 for the ring deposits, which
+	 * nominate a slot per frame instead.
+	 */
+	uint64_t generation;
 };
 
 #ifdef __cplusplus

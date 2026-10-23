@@ -62,6 +62,10 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			aux_d3d
 			comp_xbridge
 			comp_d3d11_segs
+			# #2317 P1b: the D3D11 hub the DXR_HUB=1 shim hands its atlas to. A
+			# static-library cycle (the hub links comp_d3d11 for comp_d3d11_target),
+			# which CMake resolves by repeating the pair on the link line.
+			comp_hub_d3d11
 			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look
 			comp_cursor_look
 			xrt-external-stb
