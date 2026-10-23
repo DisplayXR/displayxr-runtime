@@ -280,13 +280,20 @@ struct xrt_status_desktop
 //! How @ref xrt_status_native::is_native was decided.
 enum xrt_status_native_basis
 {
-	//! The desktop rect against the native mode (Windows, macOS, X11 without
-	//! a compositor that reports modes).
+	//! The desktop rect against the native mode (Windows, X11 without a
+	//! compositor that reports modes).
 	XRT_STATUS_NATIVE_BASIS_DESKTOP = 0,
-	//! The compositor's own facts: its current mode against its preferred
-	//! mode, both device pixels (desktop Linux, Mutter DisplayConfig). The
-	//! desktop rect is logical on a scaled desktop and is not consulted.
+	//! The compositor's/OS's own facts: its current mode against its
+	//! preferred (native) mode, both device pixels (desktop Linux, Mutter
+	//! DisplayConfig). The desktop rect is logical on a scaled desktop and is
+	//! not consulted.
 	XRT_STATUS_NATIVE_BASIS_COMPOSITOR = 1,
+	//! macOS: the current mode's BACKING store against the panel's native
+	//! pixel grid, both device pixels. Same comparison as @ref
+	//! XRT_STATUS_NATIVE_BASIS_COMPOSITOR; its own value only so the warning
+	//! can name the fix the OS offers (a scaled "Displays" resolution, not a
+	//! pixel size to type). The desktop rect is in points and not consulted.
+	XRT_STATUS_NATIVE_BASIS_BACKING = 2,
 };
 
 //! A screen's native mode.
@@ -298,7 +305,7 @@ struct xrt_status_native
 	bool is_native;       //!< The screen runs its native mode (false when unknown); see @ref basis.
 	//! How @ref is_native was decided (`enum xrt_status_native_basis`).
 	uint32_t basis;
-	//! COMPOSITOR basis: the compositor's current mode, device pixels (0 otherwise).
+	//! COMPOSITOR / BACKING basis: the current mode, device pixels (0 otherwise).
 	uint32_t current_width;
 	uint32_t current_height;
 };

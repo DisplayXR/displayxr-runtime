@@ -104,6 +104,20 @@ u_status_native_resolve(struct xrt_status_native *n,
                         uint32_t desktop_h);
 
 /*!
+ * macOS: decide a screen's native mode from the current mode's BACKING pixels
+ * (@p backing_w / @p backing_h, `CGDisplayModeGetPixelWidth`) against the
+ * panel's native pixel grid (@p panel_w / @p panel_h). `is_native` = they are
+ * equal — true in the default HiDPI mode (1512x982 points @2x = 3024x1964 on a
+ * 3024x1964 panel), false under "More Space" / "Larger Text". An unknown panel
+ * grid (0) leaves the native mode unknown (0x0), which never warns; the
+ * backing is still reported as `current_width/height`.
+ * `refresh_mhz` is left as the caller set it.
+ */
+void
+u_status_native_resolve_backing(
+    struct xrt_status_native *n, uint32_t backing_w, uint32_t backing_h, uint32_t panel_w, uint32_t panel_h);
+
+/*!
  * A screen's physical size: the claiming plug-in's metres (@p plugin_w_m /
  * @p plugin_h_m, 0 when the plug-in did not describe the screen) win only
  * under an EDID or VERIFIED claim (@p confidence); otherwise the EDID's mm

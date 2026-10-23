@@ -270,6 +270,68 @@ TEST_CASE("status: no compositor info keeps the desktop-rect rule", "[status][wa
 	      std::string::npos);
 }
 
+TEST_CASE("status: macOS backing rule — Retina default mode is native", "[status][warnings][native]")
+{
+	// 14" MacBook Pro default: looks like 1512x982 points @2x = 3024x1964
+	// backing on a 3024x1964 panel. The desktop rect is in points.
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 1512, 982, 2.0f};
+	u_status_native_resolve_backing(&s->screens[0].native, 3024, 1964, 3024, 1964);
+	CHECK(s->screens[0].native.is_native);
+	CHECK(s->screens[0].native.basis == XRT_STATUS_NATIVE_BASIS_BACKING);
+	CHECK(s->screens[0].native.width == 3024);
+	CHECK(s->screens[0].native.height == 1964);
+	CHECK(s->screens[0].native.current_width == 3024);
+	u_status_warnings_derive(s.get());
+	CHECK(screen_codes(*s, 0).empty());
+}
+
+TEST_CASE("status: macOS backing rule — More Space scaled mode warns", "[status][warnings][native]")
+{
+	// looks like 1800x1169 @2x = 3600x2338 backing, downsampled to the panel.
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 1800, 1169, 2.0f};
+	u_status_native_resolve_backing(&s->screens[0].native, 3600, 2338, 3024, 1964);
+	CHECK_FALSE(s->screens[0].native.is_native);
+	u_status_warnings_derive(s.get());
+	REQUIRE(screen_codes(*s, 0) == V{"NOT_NATIVE"});
+	const std::string t = s->screens[0].warnings[0].text;
+	CHECK(t ==
+	      "macOS 'Displays' is set to a scaled resolution (rendered 3600x2338, downsampled to the "
+	      "3024x1964 panel): choose Default.");
+	CHECK(t.find("Set this screen") == std::string::npos); // never "type a pixel size"
+	CHECK(s->screens[0].warnings[0].level == XRT_STATUS_LEVEL_CRITICAL);
+}
+
+TEST_CASE("status: macOS backing rule — Larger Text scaled mode warns", "[status][warnings][native]")
+{
+	// looks like 1280x831 @2x = 2560x1662 backing, upsampled to the panel.
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 1280, 831, 2.0f};
+	u_status_native_resolve_backing(&s->screens[0].native, 2560, 1662, 3024, 1964);
+	CHECK_FALSE(s->screens[0].native.is_native);
+	u_status_warnings_derive(s.get());
+	REQUIRE(screen_codes(*s, 0) == V{"NOT_NATIVE"});
+	CHECK(std::string(s->screens[0].warnings[0].text)
+	          .find("(rendered 2560x1662, upsampled to the 3024x1964 panel)") != std::string::npos);
+}
+
+TEST_CASE("status: macOS backing rule — unknown panel grid never warns", "[status][warnings][native]")
+{
+	auto s = healthy();
+	s->screens[0].desktop = {0, 0, 1512, 982, 2.0f};
+	u_status_native_resolve_backing(&s->screens[0].native, 3024, 1964, 0, 0);
+	CHECK(s->screens[0].native.width == 0);
+	CHECK(s->screens[0].native.current_width == 3024);
+	u_status_warnings_derive(s.get());
+	CHECK(screen_codes(*s, 0).empty());
+
+	// No mode at all either.
+	u_status_native_resolve_backing(&s->screens[0].native, 0, 0, 0, 0);
+	u_status_warnings_derive(s.get());
+	CHECK(screen_codes(*s, 0).empty());
+}
+
 TEST_CASE("status: CLAIM_FALLBACK needs an unhealthy vendor plug-in", "[status][warnings]")
 {
 	auto s = healthy();

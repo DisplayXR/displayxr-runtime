@@ -18,6 +18,10 @@
  *   same way it does on Windows and X11.
  * - `native_width/height`: the current mode's BACKING pixels — the space a
  *   plug-in reports panel dims in (`xrt_display_physical::native_pixel_width`).
+ * - `preferred_width/height`: the panel's native pixel grid (the mode flagged
+ *   native; see `os_display_desktop_macos.c`). Taken from CoreGraphics, not
+ *   the EDID's first detailed timing: the built-in panel publishes no EDID,
+ *   and the native flag is the window server's own answer.
  * - `output_name`: the display UUID, i.e. `os_display_desktop_info::device_name`,
  *   and the platform key of the monitor id, so the id survives reboots and
  *   rearrangement (a `CGDirectDisplayID` survives neither).
@@ -289,6 +293,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		m->pixel_height = desk.height;
 		m->native_width = desk.native_width;
 		m->native_height = desk.native_height;
+		m->preferred_width = desk.preferred_width;
+		m->preferred_height = desk.preferred_height;
 		m->refresh_hz = (desk.native_refresh_mhz + 500u) / 1000u;
 		m->is_primary = desk.is_primary;
 		m->platform_id = ids[i];
