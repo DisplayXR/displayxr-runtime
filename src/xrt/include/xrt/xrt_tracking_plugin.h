@@ -137,7 +137,7 @@ extern "C" {
 
 /*!
  * What a camera-based provider measured, in its CAMERA's frame, for one
- * capture. Input of the camera-pose calibration (spec §6, follow-up).
+ * capture. Input of the camera-pose calibration (spec §6, `math/m_mirror_calib.h`).
  *
  * Camera frame: origin at the optical centre, +X right in the image as the
  * USER sees it (un-mirrored), +Y up, +Z out of the lens toward the viewer.

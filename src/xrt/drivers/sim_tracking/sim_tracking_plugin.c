@@ -63,6 +63,15 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "> 0: tracking square-waves off for half of every period (exercises is_tracking edges + "
      "XrEventDataEyeTrackingStateChangedDXR); 0 = always tracking"},
     {"RATE_HZ", XRT_COMPONENT_SETTING_TYPE_INT, "60", "samples per second the provider thread pushes"},
+    {"CAMERA", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
+     "1: simulate a webcam (calibration test bed). The scripted eyes are MEASURED from CAMERA_TRUE_POSE "
+     "(camera-space samples, XRT_TRACKING_SAMPLE_CAMERA_VALID) and REPORTED through the calibrated "
+     "CAMERA_POSE_<n> for CAMERA_KEY, else the top-centre bezel prior"},
+    {"CAMERA_KEY", XRT_COMPONENT_SETTING_TYPE_STRING, "sim-tracking:webcam0", "the simulated camera's key"},
+    {"CAMERA_TRUE_POSE", XRT_COMPONENT_SETTING_TYPE_STRING, "",
+     "hidden ground truth \"tx,ty,tz,qx,qy,qz,qw\" (metres, display space); empty = the bezel prior"},
+    {"CAMERA_DEPTH_BIAS", XRT_COMPONENT_SETTING_TYPE_FLOAT, "1",
+     "reported distance = true distance x this (a simulated per-user iris-size error)"},
 };
 
 static const struct xrt_tracking_plugin_host_iface *g_host = NULL;
@@ -133,6 +142,9 @@ describe_settings(const struct xrt_component_setting_desc **out_descs)
 struct sim_tracking
 {
 	struct os_thread_helper oth;
+	bool camera_on;
+	char camera_key[XRT_TRACKING_CAMERA_KEY_MAX];
+	struct sim_tracking_camera cam;
 	bool oth_ready;
 	bool running;
 	const struct xrt_tracking_sink *sink;
@@ -141,6 +153,96 @@ struct sim_tracking
 };
 
 static struct sim_tracking g_st; // one per process: the runtime loads a provider once
+
+//! One sample at @p t_ns: the script, and (CAMERA=1) the camera's measurement + the eyes mapped back.
+static void
+make_sample(const struct sim_tracking *st, int64_t t_ns, struct xrt_tracking_viewer_sample *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->struct_size = (uint32_t)sizeof(*s);
+	s->capture_ns = t_ns;
+	float left[3], right[3], head[3];
+	const bool tracking = sim_tracking_script_eval(&st->script, t_ns, left, right, head);
+	s->head_orientation[3] = 1.0f;
+	s->flags = XRT_TRACKING_SAMPLE_EYES_VALID | XRT_TRACKING_SAMPLE_HEAD_POSE_VALID |
+	           (tracking ? XRT_TRACKING_SAMPLE_TRACKING : 0u);
+	s->confidence = tracking ? 1.0f : 0.0f;
+	if (!st->camera_on) {
+		memcpy(s->left_eye, left, sizeof(left));
+		memcpy(s->right_eye, right, sizeof(right));
+		memcpy(s->head_position, head, sizeof(head));
+		return;
+	}
+	struct xrt_tracking_camera_sample *c = &s->camera;
+	snprintf(c->camera_key, sizeof(c->camera_key), "%s", st->camera_key);
+	sim_tracking_camera_measure(&st->cam, left, c->left_dir, &c->left_distance_m);
+	sim_tracking_camera_measure(&st->cam, right, c->right_dir, &c->right_distance_m);
+	s->flags |= XRT_TRACKING_SAMPLE_CAMERA_VALID;
+	// What a camera provider reports: its measurements through the pose it BELIEVES.
+	sim_tracking_camera_to_display(&st->cam, c->left_dir, c->left_distance_m, s->left_eye);
+	sim_tracking_camera_to_display(&st->cam, c->right_dir, c->right_distance_m, s->right_eye);
+	for (int i = 0; i < 3; i++) {
+		s->head_position[i] = 0.5f * (s->left_eye[i] + s->right_eye[i]);
+	}
+}
+
+/*!
+ * The camera model from settings: the hidden true pose, and the believed pose
+ * — the `CAMERA_POSE_<n>` slot whose `_CAMERA` is this camera's key, else the
+ * prior. `_SCREEN` is recorded by the calibration but not matched here: the
+ * host does not pass the served screen's key yet (providers serve the primary
+ * screen only, spec §4), so the first slot for this camera wins.
+ */
+static void
+load_camera(struct sim_tracking *st, float display_height_m)
+{
+	st->camera_on = setting_on("CAMERA");
+	if (!setting("CAMERA_KEY", st->camera_key, sizeof(st->camera_key))) {
+		snprintf(st->camera_key, sizeof(st->camera_key), "%s", "sim-tracking:webcam0");
+	}
+	struct sim_tracking_camera *c = &st->cam;
+	memset(c, 0, sizeof(*c));
+	sim_tracking_camera_prior(display_height_m, c->true_t, c->true_q);
+	sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
+	c->depth_bias = setting_float("CAMERA_DEPTH_BIAS", 1.0f);
+	c->depth_scale = 1.0;
+	c->focal_scale = 1.0;
+	char v[256];
+	if (setting("CAMERA_TRUE_POSE", v, sizeof(v)) && !sim_tracking_parse_pose(v, c->true_t, c->true_q)) {
+		U_LOG_W("sim-tracking: CAMERA_TRUE_POSE='%s' is not \"tx,ty,tz,qx,qy,qz,qw\" - using the prior.", v);
+	}
+	if (!st->camera_on) {
+		return;
+	}
+	for (int n = 0; n < SIM_TRACKING_POSE_SLOTS; n++) {
+		char key[48], cam[XRT_TRACKING_CAMERA_KEY_MAX];
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_CAMERA", n);
+		if (!setting(key, cam, sizeof(cam)) || strcmp(cam, st->camera_key) != 0) {
+			continue;
+		}
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d", n);
+		if (!setting(key, v, sizeof(v)) || !sim_tracking_parse_pose(v, c->pose_t, c->pose_q)) {
+			U_LOG_W("sim-tracking: %s for camera '%s' is missing or malformed - using the prior.", key,
+			        cam);
+			sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
+			break;
+		}
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_DEPTH_SCALE", n);
+		c->depth_scale = setting_float(key, 1.0f);
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_FOCAL_SCALE", n);
+		c->focal_scale = setting_float(key, 1.0f);
+		U_LOG_W(
+		    "sim-tracking: camera '%s' calibrated pose CAMERA_POSE_%d = (%.4f, %.4f, %.4f) m, q (%.4f, %.4f, "
+		    "%.4f, %.4f), depth scale %.4f, focal scale %.4f.",
+		    cam, n, c->pose_t[0], c->pose_t[1], c->pose_t[2], c->pose_q[0], c->pose_q[1], c->pose_q[2],
+		    c->pose_q[3], c->depth_scale, c->focal_scale);
+		return;
+	}
+	U_LOG_W(
+	    "sim-tracking: camera '%s' has no CAMERA_POSE_<n> - reporting through the bezel prior (%.4f, %.4f, "
+	    "%.4f) m.",
+	    st->camera_key, c->pose_t[0], c->pose_t[1], c->pose_t[2]);
+}
 
 static void *
 run(void *ptr)
@@ -152,15 +254,7 @@ run(void *ptr)
 		os_thread_helper_unlock(&st->oth);
 
 		struct xrt_tracking_viewer_sample s;
-		memset(&s, 0, sizeof(s));
-		s.struct_size = (uint32_t)sizeof(s);
-		s.capture_ns = (int64_t)os_monotonic_get_ns();
-		const bool tracking =
-		    sim_tracking_script_eval(&st->script, s.capture_ns, s.left_eye, s.right_eye, s.head_position);
-		s.head_orientation[3] = 1.0f;
-		s.flags = XRT_TRACKING_SAMPLE_EYES_VALID | XRT_TRACKING_SAMPLE_HEAD_POSE_VALID |
-		          (tracking ? XRT_TRACKING_SAMPLE_TRACKING : 0u);
-		s.confidence = tracking ? 1.0f : 0.0f;
+		make_sample(st, (int64_t)os_monotonic_get_ns(), &s);
 		st->sink->push(st->sink, &s);
 
 		os_nanosleep(st->interval_ns);
@@ -192,13 +286,22 @@ sim_tracking_describe(struct xrt_tracking_plugin_instance *inst, struct xrt_trac
 	}
 	out->tracks = XRT_TRACKING_TRACKS_EYE_PAIR | XRT_TRACKING_TRACKS_HEAD_POSE;
 	out->typical_latency_ns = 0;
+	if (setting_on("CAMERA")) {
+		out->tracks |= XRT_TRACKING_TRACKS_CAMERA_SPACE;
+		if (out->struct_size >=
+		        offsetof(struct xrt_tracking_provider_info, camera_key) + sizeof(out->camera_key) &&
+		    !setting("CAMERA_KEY", out->camera_key, sizeof(out->camera_key))) {
+			snprintf(out->camera_key, sizeof(out->camera_key), "%s", "sim-tracking:webcam0");
+		}
+	}
 	char v[16];
 	enum sim_tracking_script_kind k = SIM_TRACKING_SCRIPT_SWEEP;
 	if (setting("SCRIPT", v, sizeof(v))) {
 		(void)sim_tracking_parse_script(v, &k);
 	}
-	snprintf(out->source, sizeof(out->source), "scripted %s (no camera)",
-	         k == SIM_TRACKING_SCRIPT_OFFSET ? "offset" : "sweep");
+	snprintf(out->source, sizeof(out->source), "scripted %s (%s)",
+	         k == SIM_TRACKING_SCRIPT_OFFSET ? "offset" : "sweep",
+	         setting_on("CAMERA") ? "simulated webcam" : "no camera");
 	return XRT_SUCCESS;
 }
 
@@ -224,6 +327,7 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 	sc->nominal[0] = 0.0f;
 	sc->nominal[1] = 0.0f;
 	sc->nominal[2] = 0.6f;
+	float display_height_m = 0.0f;
 	if (g_host != NULL &&
 	    g_host->struct_size >= offsetof(struct xrt_tracking_plugin_host_iface, get_display_geometry) +
 	                               sizeof(g_host->get_display_geometry) &&
@@ -231,6 +335,7 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 		struct xrt_tracking_host_display_geometry geo = {0};
 		geo.struct_size = (uint32_t)sizeof(geo);
 		if (g_host->get_display_geometry(&geo) == XRT_SUCCESS && geo.nominal_viewer_z_m > 0.0f) {
+			display_height_m = geo.display_height_m;
 			sc->nominal[0] = geo.nominal_viewer_x_m;
 			sc->nominal[1] = geo.nominal_viewer_y_m;
 			sc->nominal[2] = geo.nominal_viewer_z_m;
@@ -254,17 +359,12 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 	st->interval_ns = 1000000000LL / rate;
 	st->sink = sink;
 
+	load_camera(st, display_height_m);
+
 	// One sample synchronously, so the first locate after start() has data.
 	{
 		struct xrt_tracking_viewer_sample s;
-		memset(&s, 0, sizeof(s));
-		s.struct_size = (uint32_t)sizeof(s);
-		s.capture_ns = sc->epoch_ns;
-		const bool tracking =
-		    sim_tracking_script_eval(sc, s.capture_ns, s.left_eye, s.right_eye, s.head_position);
-		s.head_orientation[3] = 1.0f;
-		s.flags = XRT_TRACKING_SAMPLE_EYES_VALID | XRT_TRACKING_SAMPLE_HEAD_POSE_VALID |
-		          (tracking ? XRT_TRACKING_SAMPLE_TRACKING : 0u);
+		make_sample(st, sc->epoch_ns, &s);
 		sink->push(sink, &s);
 	}
 

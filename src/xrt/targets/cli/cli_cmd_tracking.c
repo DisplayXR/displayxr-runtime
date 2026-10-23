@@ -18,6 +18,8 @@
  *   tracking options <id> [--json] / set <id> <KEY> <value> [--machine] / unset <id> <KEY>
  *                                        The provider's settings (`DXR_TRACKING_<ID>_<KEY>` in
  *                                        the hosting process's environment always wins).
+ *   tracking calibrate [solve|apply] ...  Mirror-alignment camera-pose calibration
+ *                                        (cli_cmd_tracking_calibrate.c).
  *
  * Pickup: the viewer source and the composed `XR_DXR_display_info` advertisement are
  * static per instance, so every write applies at the next app launch (in-process).
@@ -448,7 +450,7 @@ cmd_options_verbs(int argc, const char **argv)
 static int
 print_usage(void)
 {
-	P("Usage: displayxr-cli tracking <list|enable|disable|use|prefer|reset|options|set|unset>\n");
+	P("Usage: displayxr-cli tracking <list|enable|disable|use|prefer|reset|options|set|unset|calibrate>\n");
 	P("  list [--json]                Registered viewer-tracking providers: ProbeOrder, Enabled (+ source),\n");
 	P("                               provenance, the PreferredPlugin override, the one ranked first ('*').\n");
 	P("  enable | disable <id> [--machine]\n");
@@ -456,6 +458,8 @@ print_usage(void)
 	P("                               machine-wide (HKLM, admin) with --machine; HKCU wins.\n");
 	P("  use | prefer <id> [--machine] PreferredPlugin override: <id> is ranked first, ahead of ProbeOrder.\n");
 	P("  reset [--machine]            Clear the PreferredPlugin override.\n");
+	P("  calibrate --screen <key> --watch --json | solve --in <f> | apply --screen <k> --camera <k> --pose <p>\n");
+	P("                               Camera-pose calibration (mirror alignment); 'tracking calibrate help'.\n");
 	cli_component_options_usage(&(const struct cli_component_class){
 	    .verb = "tracking", .noun = "viewer-tracking provider", .cls = target_tracking_plugin_component_class()});
 	P("A provider serves a screen only when that display does not track the viewer itself and declares\n");
@@ -492,6 +496,9 @@ cli_cmd_tracking(int argc, const char **argv)
 	}
 	if (strcmp(verb, "reset") == 0) {
 		return cmd_reset(machine);
+	}
+	if (strcmp(verb, "calibrate") == 0) {
+		return cli_cmd_tracking_calibrate(argc, argv);
 	}
 	const int rc = cmd_options_verbs(argc, argv);
 	if (rc >= 0) {
