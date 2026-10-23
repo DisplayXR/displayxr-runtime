@@ -18,7 +18,7 @@ namespace DisplayXR.Dashboard.Model;
 public sealed record InfoComponents(
     IReadOnlyList<RegisteredController> WorkspaceControllers, bool WorkspaceControllersKnown,
     IReadOnlyList<InputProviderRow> InputProviders, InputSummary? Input, RigRole? Rig,
-    LiftModule? Lift, IReadOnlyList<(string Key, string Value)>? StereoCamera)
+    LiftModule? Lift, IReadOnlyList<(string Key, string Value)>? StereoCamera, TrackingSummary? Tracking = null)
 {
     public static readonly InfoComponents Empty = new(Array.Empty<RegisteredController>(), false,
         Array.Empty<InputProviderRow>(), null, null, null, null);
@@ -68,7 +68,10 @@ public sealed record InfoComponents(
                .ToArray()
             : null;
 
-        return new InfoComponents(controllers, wcKnown, providers, input, rig, lift, camera);
+        // ADR-054 N6 Part 2: the viewer-tracking class (absent from a CLI that predates it).
+        var tracking = root.ValueKind == JsonValueKind.Object ? TrackingSummary.Read(root) : null;
+
+        return new InfoComponents(controllers, wcKnown, providers, input, rig, lift, camera, tracking);
     }
 }
 
@@ -192,6 +195,10 @@ public static class Components
         if (s is { ConvKnown: true }) list.Add(ConversionProviders(s, Of(policies, ComponentClass.Conversion)));
         // ADR-053 P4: the model store's packs (a CLI that predates the store sends none).
         if (s is { Packs.Count: > 0 }) list.Add(ModelPacks(s));
+        // ADR-054 N6 Part 2: only from a CLI that has the tracking class (`tracking list` or info's block).
+        // Shown beside the input providers: both feed the viewer / user into the runtime.
+        if (Tracking.Section(s, Of(policies, ComponentClass.Tracking), info.Tracking) is { } tr)
+            list.Insert(list.FindIndex(x => x.Id == "input_providers") + 1, tr);
         if (StereoCamera(info) is { } cam) list.Add(cam);
         list.Add(ByClass(s, "diagnostics", "Diagnostics clients", DiagClass,
             "Read-only status readers, such as this dashboard's own status feed and the CLI.", collapsed: true));

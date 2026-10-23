@@ -416,6 +416,8 @@ fill_viewer_source(struct xrt_status_screen *s)
 		s->eye_tracking.default_mode = def;
 		target_viewer_source_label(&d, s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source));
 		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason), "%s", d.reason);
+		snprintf(s->eye_tracking.viewer_policy, sizeof(s->eye_tracking.viewer_policy), "%s",
+		         target_viewer_policy_str(d.dp_policy));
 		return;
 	}
 	if (s->eye_tracking.supported != 0) {

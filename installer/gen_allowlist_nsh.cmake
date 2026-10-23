@@ -29,6 +29,9 @@ set(_shipped_plugins
 	"${BIN_DIR}/plugins/DisplayXR-SimInput.dll"
 	"${BIN_DIR}/plugins/DisplayXR-Gamepad.dll"
 	"${BIN_DIR}/plugins/DisplayXR-SimConversion.dll"
+	# Shipped unregistered (no TrackingProviders row): allowlisted so a row a
+	# developer adds by hand is admitted by the enforcing gate.
+	"${BIN_DIR}/plugins/DisplayXR-SimTracking.dll"
 )
 
 set(_write "")

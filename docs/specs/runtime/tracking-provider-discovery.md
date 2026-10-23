@@ -244,7 +244,9 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
   `composed_eye_tracking_modes`. Never a verdict: a provider in standby or absent is normal. The
   Windows N4 conformance step asserts selected / Enabled=0 falls back / Preferred wins / ABI
   fixture rejected / a tracking display wins.
-- `displayxr-cli status --json` → per screen `eye_tracking.viewer_source` + `viewer_reason`.
+- `displayxr-cli info --json` → the same `tracking_providers` object (the Dashboard's Components page reads it).
+- `displayxr-cli status --json` → per screen `eye_tracking.viewer_source` + `viewer_reason` + `viewer_policy`
+  (the display's policy where it was evaluated — today the primary screen; `null` elsewhere).
 - Logs: one WARN per process for the decision (`viewer tracking (ADR-054 N6): primary screen viewer
   source = ...`) and one when the provider starts on demand.
 
@@ -261,5 +263,6 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
 5. **Camera-pose calibration** (§6): `tracking calibrate --watch --json`, the solver, the Dashboard
    window.
 6. **`sim_tracking` SCRIPT=webcam**: move the #1855 webcam core out of `sim_display`.
-7. Dashboard tracking-provider card (the N3e shape), installer rows (the reference provider is not
-   registered by the runtime installer yet), `versions.json` for the open provider.
+7. Installer rows: the Windows runtime installer ships `DisplayXR-SimTracking.dll` (allowlisted, N4b)
+   but writes no `TrackingProviders` row yet; the Linux / macOS packages do not ship it yet.
+   `versions.json` for the open provider. (The Dashboard card landed: Components → Tracking providers.)

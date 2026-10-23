@@ -363,6 +363,12 @@ struct xrt_status_eye_tracking
 	//! Why, incl. why a provider is in standby ("display tracks the viewer on this screen", "display is FIXED", "no
 	//! source").
 	char viewer_reason[128];
+	/*!
+	 * The display's viewer policy on this screen as the arbitration read it:
+	 * "OWN" / "EXTERNAL_OK" / "FIXED" ("" = not evaluated for this screen —
+	 * today every screen but the primary one, tracking-provider-discovery §4).
+	 */
+	char viewer_policy[16];
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).

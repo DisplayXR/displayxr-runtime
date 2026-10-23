@@ -1,0 +1,54 @@
+{
+ "provider": {
+  "tracking_providers": {
+   "registered": 2,
+   "enabled": 1,
+   "scan_declined": 0,
+   "scan_failed": 0,
+   "scan_untrusted": 0,
+   "ranked": [
+    "sim-tracking"
+   ],
+   "active_id": "sim-tracking",
+   "evaluated": true,
+   "viewer_source": "provider:sim-tracking",
+   "viewer_reason": "",
+   "display_viewer_policy": "EXTERNAL_OK",
+   "composed_eye_tracking_modes": 3
+  }
+ },
+ "nosource": {
+  "tracking_providers": {
+   "registered": 2,
+   "enabled": 1,
+   "scan_declined": 1,
+   "scan_failed": 0,
+   "scan_untrusted": 0,
+   "ranked": [],
+   "active_id": "",
+   "evaluated": true,
+   "viewer_source": "nominal",
+   "viewer_reason": "no source",
+   "display_viewer_policy": "EXTERNAL_OK",
+   "composed_eye_tracking_modes": 0
+  }
+ },
+ "dp": {
+  "tracking_providers": {
+   "registered": 2,
+   "enabled": 1,
+   "scan_declined": 0,
+   "scan_failed": 0,
+   "scan_untrusted": 0,
+   "ranked": [
+    "sim-tracking"
+   ],
+   "active_id": "sim-tracking",
+   "evaluated": true,
+   "viewer_source": "dp",
+   "viewer_reason": "display tracks the viewer on this screen",
+   "display_viewer_policy": "EXTERNAL_OK",
+   "composed_eye_tracking_modes": 2
+  }
+ }
+}

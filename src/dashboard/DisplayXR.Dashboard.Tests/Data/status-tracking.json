@@ -1,0 +1,415 @@
+{
+ "provider": {
+  "schema": 1,
+  "source": "headless",
+  "generation": {
+   "topology": 0,
+   "status": 0,
+   "conversion": 0
+  },
+  "runtime": {
+   "version": "2.52.0",
+   "git_tag": "v2.52.0-7-g3ce7756c4",
+   "plugin_abi": 5,
+   "active_openxr_runtime": "/Library/Application Support/DisplayXR/openxr_displayxr.json"
+  },
+  "plugins": [
+   {
+    "id": "sim-display",
+    "name": "DisplayXR Sim Display",
+    "vendor": "DisplayXR",
+    "version": "dev",
+    "load": "ACTIVE",
+    "platform_state": "READY",
+    "hint": "",
+    "fallback": true,
+    "probe_order": 200
+   }
+  ],
+  "screens": [
+   {
+    "id": "0x0000000000000001",
+    "index": 0,
+    "device_name": "37D8832A-2D66-02CA-B9F7-8F30A301B230",
+    "friendly_name": "",
+    "key": null,
+    "edid": {
+     "manufacturer": "",
+     "product": "",
+     "serial": 0
+    },
+    "desktop": {
+     "left": 0,
+     "top": 0,
+     "width": 1512,
+     "height": 982,
+     "scale": 2
+    },
+    "native": {
+     "width": 3024,
+     "height": 1964,
+     "refresh_mhz": 0,
+     "is_native": false
+    },
+    "physical_mm": {
+     "width": 301,
+     "height": 196,
+     "source": "plugin"
+    },
+    "roles": {
+     "os_main": true,
+     "runtime_default": true,
+     "vendor_primary": false
+    },
+    "claim": {
+     "plugin_id": "sim-display",
+     "confidence": "NONE",
+     "confidence_value": 0,
+     "serial": "",
+     "apis": [],
+     "forced": false,
+     "preferred_plugin": null,
+     "preferred_source": null,
+     "apply": "next-session"
+    },
+    "layout": {
+     "width_m": 0.3012140989303589,
+     "height_m": 0.1956298053264618,
+     "nominal_viewer_m": {
+      "x": 0,
+      "y": 0.10000000149011612,
+      "z": 0.600000023841858
+     },
+     "source": "plugin"
+    },
+    "eye_tracking": {
+     "supported": [
+      "MANAGED",
+      "MANUAL"
+     ],
+     "default": "MANAGED",
+     "state": "NO_DP",
+     "viewer_source": "provider:sim-tracking",
+     "viewer_reason": null,
+     "viewer_policy": "EXTERNAL_OK"
+    },
+    "mode": null,
+    "dps": [],
+    "vendor": {
+     "present": false,
+     "ready": false,
+     "verified": false,
+     "calibrated": false,
+     "tracker": "UNKNOWN",
+     "lens": "UNKNOWN",
+     "model": "",
+     "serial": "",
+     "worst_warning": null,
+     "dashboard_command": null
+    },
+    "warnings": [
+     {
+      "code": "NOT_NATIVE",
+      "level": "critical",
+      "text": "Set this screen to its native 3024x1964 (now 1512x982): a 3D panel weaves correctly only at native resolution."
+     }
+    ]
+   }
+  ],
+  "clients": [],
+  "workspace": {
+   "enabled": false,
+   "controller": null,
+   "screens": []
+  },
+  "warnings": [
+   {
+    "code": "SERVICE_HEADLESS",
+    "level": "info",
+    "text": "No service reached: this is what a process starting now would get; live rows are absent."
+   }
+  ],
+  "conv_providers": [],
+  "conv_tasks": [],
+  "conv_model_store": {
+   "root": "/tmp/dxr/home/.local/share/displayxr/models",
+   "source": "$XDG_DATA_HOME"
+  },
+  "conv_packs": [],
+  "input_holders": []
+ },
+ "nosource": {
+  "schema": 1,
+  "source": "headless",
+  "generation": {
+   "topology": 0,
+   "status": 0,
+   "conversion": 0
+  },
+  "runtime": {
+   "version": "2.52.0",
+   "git_tag": "v2.52.0-7-g3ce7756c4",
+   "plugin_abi": 5,
+   "active_openxr_runtime": "/Library/Application Support/DisplayXR/openxr_displayxr.json"
+  },
+  "plugins": [
+   {
+    "id": "sim-display",
+    "name": "DisplayXR Sim Display",
+    "vendor": "DisplayXR",
+    "version": "dev",
+    "load": "ACTIVE",
+    "platform_state": "READY",
+    "hint": "",
+    "fallback": true,
+    "probe_order": 200
+   }
+  ],
+  "screens": [
+   {
+    "id": "0x0000000000000001",
+    "index": 0,
+    "device_name": "37D8832A-2D66-02CA-B9F7-8F30A301B230",
+    "friendly_name": "",
+    "key": null,
+    "edid": {
+     "manufacturer": "",
+     "product": "",
+     "serial": 0
+    },
+    "desktop": {
+     "left": 0,
+     "top": 0,
+     "width": 1512,
+     "height": 982,
+     "scale": 2
+    },
+    "native": {
+     "width": 3024,
+     "height": 1964,
+     "refresh_mhz": 0,
+     "is_native": false
+    },
+    "physical_mm": {
+     "width": 301,
+     "height": 196,
+     "source": "plugin"
+    },
+    "roles": {
+     "os_main": true,
+     "runtime_default": true,
+     "vendor_primary": false
+    },
+    "claim": {
+     "plugin_id": "sim-display",
+     "confidence": "NONE",
+     "confidence_value": 0,
+     "serial": "",
+     "apis": [],
+     "forced": false,
+     "preferred_plugin": null,
+     "preferred_source": null,
+     "apply": "next-session"
+    },
+    "layout": {
+     "width_m": 0.3012140989303589,
+     "height_m": 0.1956298053264618,
+     "nominal_viewer_m": {
+      "x": 0,
+      "y": 0.10000000149011612,
+      "z": 0.600000023841858
+     },
+     "source": "plugin"
+    },
+    "eye_tracking": {
+     "supported": [],
+     "default": null,
+     "state": "NO_DP",
+     "viewer_source": "nominal",
+     "viewer_reason": "no source",
+     "viewer_policy": "EXTERNAL_OK"
+    },
+    "mode": null,
+    "dps": [],
+    "vendor": {
+     "present": false,
+     "ready": false,
+     "verified": false,
+     "calibrated": false,
+     "tracker": "UNKNOWN",
+     "lens": "UNKNOWN",
+     "model": "",
+     "serial": "",
+     "worst_warning": null,
+     "dashboard_command": null
+    },
+    "warnings": [
+     {
+      "code": "NOT_NATIVE",
+      "level": "critical",
+      "text": "Set this screen to its native 3024x1964 (now 1512x982): a 3D panel weaves correctly only at native resolution."
+     }
+    ]
+   }
+  ],
+  "clients": [],
+  "workspace": {
+   "enabled": false,
+   "controller": null,
+   "screens": []
+  },
+  "warnings": [
+   {
+    "code": "SERVICE_HEADLESS",
+    "level": "info",
+    "text": "No service reached: this is what a process starting now would get; live rows are absent."
+   }
+  ],
+  "conv_providers": [],
+  "conv_tasks": [],
+  "conv_model_store": {
+   "root": "/tmp/dxr/home/.local/share/displayxr/models",
+   "source": "$XDG_DATA_HOME"
+  },
+  "conv_packs": [],
+  "input_holders": []
+ },
+ "dp": {
+  "schema": 1,
+  "source": "headless",
+  "generation": {
+   "topology": 0,
+   "status": 0,
+   "conversion": 0
+  },
+  "runtime": {
+   "version": "2.52.0",
+   "git_tag": "v2.52.0-7-g3ce7756c4",
+   "plugin_abi": 5,
+   "active_openxr_runtime": "/Library/Application Support/DisplayXR/openxr_displayxr.json"
+  },
+  "plugins": [
+   {
+    "id": "sim-display",
+    "name": "DisplayXR Sim Display",
+    "vendor": "DisplayXR",
+    "version": "dev",
+    "load": "ACTIVE",
+    "platform_state": "READY",
+    "hint": "",
+    "fallback": true,
+    "probe_order": 200
+   }
+  ],
+  "screens": [
+   {
+    "id": "0x0000000000000001",
+    "index": 0,
+    "device_name": "37D8832A-2D66-02CA-B9F7-8F30A301B230",
+    "friendly_name": "",
+    "key": null,
+    "edid": {
+     "manufacturer": "",
+     "product": "",
+     "serial": 0
+    },
+    "desktop": {
+     "left": 0,
+     "top": 0,
+     "width": 1512,
+     "height": 982,
+     "scale": 2
+    },
+    "native": {
+     "width": 3024,
+     "height": 1964,
+     "refresh_mhz": 0,
+     "is_native": false
+    },
+    "physical_mm": {
+     "width": 301,
+     "height": 196,
+     "source": "plugin"
+    },
+    "roles": {
+     "os_main": true,
+     "runtime_default": true,
+     "vendor_primary": false
+    },
+    "claim": {
+     "plugin_id": "sim-display",
+     "confidence": "NONE",
+     "confidence_value": 0,
+     "serial": "",
+     "apis": [],
+     "forced": false,
+     "preferred_plugin": null,
+     "preferred_source": null,
+     "apply": "next-session"
+    },
+    "layout": {
+     "width_m": 0.3012140989303589,
+     "height_m": 0.1956298053264618,
+     "nominal_viewer_m": {
+      "x": 0,
+      "y": 0.10000000149011612,
+      "z": 0.600000023841858
+     },
+     "source": "plugin"
+    },
+    "eye_tracking": {
+     "supported": [
+      "MANUAL"
+     ],
+     "default": "MANUAL",
+     "state": "NO_DP",
+     "viewer_source": "dp",
+     "viewer_reason": "display tracks the viewer on this screen",
+     "viewer_policy": "EXTERNAL_OK"
+    },
+    "mode": null,
+    "dps": [],
+    "vendor": {
+     "present": false,
+     "ready": false,
+     "verified": false,
+     "calibrated": false,
+     "tracker": "UNKNOWN",
+     "lens": "UNKNOWN",
+     "model": "",
+     "serial": "",
+     "worst_warning": null,
+     "dashboard_command": null
+    },
+    "warnings": [
+     {
+      "code": "NOT_NATIVE",
+      "level": "critical",
+      "text": "Set this screen to its native 3024x1964 (now 1512x982): a 3D panel weaves correctly only at native resolution."
+     }
+    ]
+   }
+  ],
+  "clients": [],
+  "workspace": {
+   "enabled": false,
+   "controller": null,
+   "screens": []
+  },
+  "warnings": [
+   {
+    "code": "SERVICE_HEADLESS",
+    "level": "info",
+    "text": "No service reached: this is what a process starting now would get; live rows are absent."
+   }
+  ],
+  "conv_providers": [],
+  "conv_tasks": [],
+  "conv_model_store": {
+   "root": "/tmp/dxr/home/.local/share/displayxr/models",
+   "source": "$XDG_DATA_HOME"
+  },
+  "conv_packs": [],
+  "input_holders": []
+ }
+}

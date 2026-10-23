@@ -90,7 +90,14 @@ public sealed record NominalViewer(double X, double Y, double Z);
 
 public sealed record ScreenLayout(double WidthM, double HeightM, NominalViewer Viewer, string Source);
 
-public sealed record EyeTracking(IReadOnlyList<string> Supported, string? Default, string State);
+/// <summary>
+/// A screen's eye tracking. ADR-054 N6 Part 2: <see cref="ViewerSource"/> is whose eyes the views
+/// follow (<c>dp</c> / <c>provider:&lt;id&gt;</c> / <c>nominal</c>), <see cref="ViewerReason"/> why,
+/// <see cref="ViewerPolicy"/> the display's viewer policy (OWN / EXTERNAL_OK / FIXED) where the
+/// snapshot's builder evaluated it. All null from a CLI that predates them, or where not evaluated.
+/// </summary>
+public sealed record EyeTracking(IReadOnlyList<string> Supported, string? Default, string State,
+                                 string? ViewerSource = null, string? ViewerReason = null, string? ViewerPolicy = null);
 
 public sealed record ScreenMode(int Index, string Name, int Views, bool Is3D);
 
@@ -264,7 +271,8 @@ public static class StatusSnapshotParser
                       claim.StrOrNull("preferred_plugin"), claim.StrOrNull("preferred_source"), claim.StrOrNull("apply")),
             new ScreenLayout(lay.Num("width_m"), lay.Num("height_m"),
                              new NominalViewer(viewer.Num("x"), viewer.Num("y"), viewer.Num("z")), lay.Str("source", "none")),
-            new EyeTracking(Strings(et, "supported"), et.StrOrNull("default"), et.Str("state", "UNKNOWN")),
+            new EyeTracking(Strings(et, "supported"), et.StrOrNull("default"), et.Str("state", "UNKNOWN"),
+                            et.StrOrNull("viewer_source"), et.StrOrNull("viewer_reason"), et.StrOrNull("viewer_policy")),
             mode is { } m ? new ScreenMode(m.Int("index"), m.Str("name"), m.Int("views"), m.Bool("is_3d")) : null,
             s.Arr("dps").Where(d => d.ValueKind == JsonValueKind.Object)
              .Select(d => new ScreenDp(d.Long("client_id"), d.Str("api", "?"), d.Str("kind", "primary"), d.Str("backend", "OK")))

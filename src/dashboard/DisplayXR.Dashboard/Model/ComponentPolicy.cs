@@ -9,27 +9,29 @@ using System.Text.Json;
 namespace DisplayXR.Dashboard.Model;
 
 // ADR-054 N3e (#2052): the per-class policy the Components page can change —
-// Enabled and Preferred for display processors, input providers and conversion
-// providers. The dashboard renders what `<class> list --json` returns and drives
+// Enabled and Preferred for display processors, input providers, conversion
+// providers and (N6 Part 2, #2144) viewer-tracking providers. The dashboard renders what `<class> list --json` returns and drives
 // every change through the CLI (ADR-051 D4, ADR-054 decision 6): no registry
 // access here, ever. Rows are read tolerantly: a CLI that predates a field
 // reads as "unknown", never as a crash.
 
-/// <summary>The three component classes with a policy store (ADR-054 §2).</summary>
+/// <summary>The component classes with a policy store (ADR-054 §2; tracking = §4.1, N6 Part 2).</summary>
 public enum ComponentClass
 {
     Display,
     Input,
     Conversion,
+    Tracking,
 }
 
 public static class ComponentClasses
 {
-    /// <summary>The CLI verb family: <c>dp</c>, <c>input</c>, <c>conv</c>.</summary>
+    /// <summary>The CLI verb family: <c>dp</c>, <c>input</c>, <c>conv</c>, <c>tracking</c>.</summary>
     public static string Verb(this ComponentClass c) => c switch
     {
         ComponentClass.Display => "dp",
         ComponentClass.Input => "input",
+        ComponentClass.Tracking => "tracking",
         _ => "conv",
     };
 
@@ -38,6 +40,7 @@ public static class ComponentClasses
     {
         ComponentClass.Display => "display processor",
         ComponentClass.Input => "input provider",
+        ComponentClass.Tracking => "viewer-tracking provider",
         _ => "conversion provider",
     };
 
@@ -46,6 +49,7 @@ public static class ComponentClasses
     {
         ComponentClass.Display => "display_processors",
         ComponentClass.Input => "input_providers",
+        ComponentClass.Tracking => "tracking_providers",
         _ => "conversion_providers",
     };
 
@@ -57,10 +61,13 @@ public static class ComponentClasses
     {
         ComponentClass.Display => "Applies now on secondary screens; the primary screen and in-process apps at the next session.",
         ComponentClass.Input => "Applies now when the service is running (providers are re-ranked live); otherwise at the next start.",
+        // tracking-provider-discovery.md §3: the viewer source is static per OpenXR instance.
+        ComponentClass.Tracking => "Applies at the next app launch: an app's viewer source is fixed for its session.",
         _ => "Applies to the next stream or job; a live stream never moves.",
     };
 
-    public static readonly ComponentClass[] All = { ComponentClass.Display, ComponentClass.Input, ComponentClass.Conversion };
+    public static readonly ComponentClass[] All =
+        { ComponentClass.Display, ComponentClass.Input, ComponentClass.Conversion, ComponentClass.Tracking };
 }
 
 /// <summary>
@@ -72,10 +79,14 @@ public static class ComponentClasses
 /// <see cref="BuiltIn"/>: the conversion class's built-in <c>dp-lift</c> adapter, which has
 /// no Enabled value and is never a provider to prefer (the CLI refuses
 /// <c>conv enable|disable dp-lift</c>).
+/// <see cref="RankedFirst"/>: <c>tracking list --json</c> <c>first</c> — the row the loader would
+/// rank first (a prediction from the registry; it serves a screen only where the display lets it).
+/// <see cref="Vendor"/> / <see cref="Version"/> / <see cref="ProbeOrder"/>: the registration, verbatim.
 /// </summary>
 public sealed record PolicyRow(ComponentClass Class, string Id, string Name, bool Enabled, string EnabledSource,
                                bool Preferred, bool Active, string Load, string Provenance, string? Signer,
-                               string? ProvenanceReason, bool Hidden = false, bool BuiltIn = false)
+                               string? ProvenanceReason, bool Hidden = false, bool BuiltIn = false,
+                               bool RankedFirst = false, string Vendor = "", string Version = "", int? ProbeOrder = null)
 {
     /// <summary>
     /// Whether the row has an Enabled value the CLI reported (older CLIs do not, and a
@@ -135,7 +146,7 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                                 IReadOnlyDictionary<string, string> PreferredByTask, IReadOnlyList<PolicyTask> Tasks,
                                 bool ForceQwerty = false, bool PolicyLock = false,
                                 IReadOnlyList<AppPin>? PerApp = null, IReadOnlyList<AppHolder>? Holders = null,
-                                double? ClientsDropped = null)
+                                double? ClientsDropped = null, bool DisabledByEnv = false)
 {
     /// <summary>The input role families, in display order: the <c>holders</c> keys and their labels.</summary>
     public static readonly (string Key, string Label)[] Families =
@@ -189,17 +200,20 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
         : null;
 
     /// <summary>
-    /// What the lock hides from a per-user write: every class's per-user Enabled, and for
+    /// What the lock hides from a per-user write: every class's per-user Enabled, for
     /// conversion also the per-user per-task preference (conversion-provider-discovery.md
-    /// §3.1). A display / input <c>PreferredPlugin</c> is not under the lock.
+    /// §3.1), and for tracking the per-user <c>PreferredPlugin</c> (tracking-provider-discovery.md
+    /// §3: "HKCU hidden under Policy\Lock"). A display / input <c>PreferredPlugin</c> is not under the lock.
     /// </summary>
     public bool LockHidesUserEnabled => PolicyLock;
-    public bool LockHidesUserPreference => PolicyLock && Class == ComponentClass.Conversion;
+    public bool LockHidesUserPreference => PolicyLock && Class is ComponentClass.Conversion or ComponentClass.Tracking;
 
     /// <summary>The section's "locked" line, or null when the class is not locked.</summary>
     public string? LockText => !PolicyLock ? null
         : Class == ComponentClass.Conversion
             ? "Locked by machine policy (HKLM Policy\\Lock): per-user Enabled values and per-task preferences are ignored. An administrator changes the machine-wide values (--machine)."
+        : Class == ComponentClass.Tracking
+            ? "Locked by machine policy (HKLM Policy\\Lock): per-user Enabled values and the per-user preference are ignored. An administrator changes the machine-wide values (--machine)."
             : "Locked by machine policy (HKLM Policy\\Lock): per-user Enabled values are ignored. An administrator changes the machine-wide value (--machine).";
 
     public PolicyRow? Row(string id) => Rows.FirstOrDefault(r => r.Id == id);
@@ -249,7 +263,9 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                     e.Bool("preferred"), e.Bool("active"), e.Str("load", e.Str("load_result")),
                     e.Str("provenance"), e.StrOrNull("signer"), e.StrOrNull("provenance_reason"), e.Bool("hidden"),
                     // `built_in` from a current CLI; the load verdict says the same on an older one.
-                    e.Bool("built_in") || string.Equals(e.Str("load"), "BUILT_IN", StringComparison.Ordinal)))
+                    e.Bool("built_in") || string.Equals(e.Str("load"), "BUILT_IN", StringComparison.Ordinal),
+                    e.Bool("first"), e.Str("vendor"), e.Str("version"),
+                    e.Has("probe_order") ? e.Int("probe_order") : null))
                 .ToArray();
             var byTask = new Dictionary<string, string>(StringComparer.Ordinal);
             var tasks = new List<PolicyTask>();
@@ -277,7 +293,7 @@ public sealed record PolicyList(ComponentClass Class, string? Preferred, IReadOn
                     dropped = d.GetDouble();
             }
             list = new PolicyList(cls, root.StrOrNull("preferred"), rows, byTask, tasks, root.Bool("force_qwerty"),
-                                  root.Obj("policy").Bool("policy_lock"), perApp, holders, dropped);
+                                  root.Obj("policy").Bool("policy_lock"), perApp, holders, dropped, root.Bool("disabled_by_env"));
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException) { return false; }

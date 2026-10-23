@@ -17,8 +17,9 @@ namespace DisplayXR.Dashboard.Pages;
 
 /// <summary>
 /// Components: what is plugged into the runtime, grouped by ROLE (display
-/// processors, workspace controller, present owners, input providers, the
-/// conversion module, a stereo camera source, diagnostics clients), never by
+/// processors, workspace controller, present owners, input providers,
+/// viewer-tracking providers, the conversion module, a stereo camera source,
+/// diagnostics clients), never by
 /// product. Clients come from the live feed; the rest from <c>info --json</c>,
 /// read once per show and on Refresh.
 /// </summary>
@@ -88,6 +89,8 @@ public sealed class ComponentsPage : Page
                 sb.Append(pl.PolicyLock).Append(string.Join(",", pl.PreferredByTask.Select(kv => kv.Key + "=" + kv.Value)));
             if (Ctx.LastActionArea == PolicyCommands.Area(c)) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed).Append(_policyActionRow);
         }
+        // ADR-054 N6 Part 2: the tracking card's per-screen viewer source (from the live feed).
+        foreach (var t in TrackingScreens()) sb.Append(t.ScreenId).Append(t.Kind).Append(t.ProviderId).Append(t.Reason).Append(t.Policy);
         // #2181: the per-app table's inputs.
         if (Ctx.Policies.TryGetValue(ComponentClass.Input, out var ip))
         {
@@ -156,7 +159,62 @@ public sealed class ComponentsPage : Page
         // ADR-034 Am.5 (#2181): per-app pins + who holds each role per app, under Input.
         if (s.Id == ComponentClass.Input.SectionId() && Ctx.Policies.TryGetValue(ComponentClass.Input, out var ipl) && ipl.HasPerApp)
             body.Children.Add(PerAppTable(ipl));
+        // ADR-054 N6 Part 2: per screen, whose eyes the views follow and the display's viewer policy.
+        if (s.Id == ComponentClass.Tracking.SectionId())
+            body.Children.Add(TrackingScreensTable());
         return U.Card(body);
+    }
+
+    private IReadOnlyList<TrackingScreen> TrackingScreens()
+    {
+        Ctx.Policies.TryGetValue(ComponentClass.Tracking, out var tl);
+        return Tracking.Screens(Ctx.Feed.Snapshot, Ctx.Info?.Components.Tracking,
+                                id => tl?.Row(id)?.Name is { Length: > 0 } n ? n : id);
+    }
+
+    /// <summary>
+    /// ADR-054 N6 Part 2 (#2144): one line per screen — the viewer source (display / provider /
+    /// nominal) and why, beside the display's viewer policy (OWN / EXTERNAL_OK / FIXED). The live
+    /// feed supplies it; a headless snapshot covers the runtime's default screen only.
+    /// </summary>
+    private Control TrackingScreensTable()
+    {
+        var col = U.VStack(8, U.Text("Per screen", "group"),
+            U.Wrapped("Whose eyes the views on each screen follow. A display that tracks the viewer always keeps its own eyes; a provider serves a screen only when its display allows an external viewer (policy EXTERNAL_OK).", "desc"));
+        var rows = TrackingScreens();
+        if (rows.Count == 0)
+            col.Children.Add(U.Wrapped("No screen reported yet.", "empty"));
+        foreach (var r in rows)
+        {
+            var head = U.Flow(10, 6, U.Dot(r.Level), U.Text(r.Name, "value"));
+            if (r.Primary) U.AddFlow(head, U.Chip("runtime default"), 10, 6);
+            U.AddFlow(head, U.Chip(r.Source, r.Kind == ViewerSourceKind.Provider ? Level.Ok : Level.Plain), 10, 6);
+            var (pt, pl) = r.PolicyChip;
+            U.AddFlow(head, U.Chip(pt, pl), 10, 6);
+            if (r.CanCalibrate)
+            {
+                // TODO(ADR-054 N6 follow-up 5, tracking-provider-discovery.md §6): the camera-pose
+                // calibration window. Design: displayxr-tracking-open docs/design.md §10 ("Where it
+                // lives") — a full-screen Dashboard window on THIS screen that streams
+                // `displayxr-cli tracking calibrate --screen <key> --watch --json` (NDJSON camera-space
+                // samples), runs `displayxr-cli tracking calibrate solve`, shows the per-sample
+                // residuals, and commits CAMERA_POSE_<n> / _CAMERA / _SCREEN as provider settings.
+                // Those verbs are being built on a parallel branch; enable this button when they land.
+                var calibrate = U.Button("Calibrate camera…", () => { }, "quiet", "sm");
+                calibrate.IsEnabled = false;
+                ToolTip.SetShowOnDisabled(calibrate, true);
+                ToolTip.SetTip(calibrate, "Camera calibration is coming: it will measure where the camera sits relative to this screen so the tracked viewer lines up with the display.");
+                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name} (coming soon)");
+                U.AddFlow(head, calibrate, 10, 6);
+            }
+            var block = U.VStack(4, head, U.Wrapped(r.Reason, "soft"));
+            var box = new Border { Child = block, Margin = new Thickness(0, 6, 0, 0) };
+            box.Classes.Add("field");
+            col.Children.Add(box);
+        }
+        if (Ctx.Info?.Components.Tracking is { } sum && sum.ScanLine is { Length: > 0 } scan)
+            col.Children.Add(U.Wrapped($"Probe (headless, from 'displayxr-cli info'): {scan}.", "meta"));
+        return col;
     }
 
     /// <summary>
@@ -240,6 +298,7 @@ public sealed class ComponentsPage : Page
         "input_providers" => "No input provider reported.",
         "conversion" => "No conversion module reported.",
         "conversion_providers" => "No conversion provider registered.",
+        "tracking_providers" => "No viewer-tracking provider registered: a display that does not track keeps the nominal viewer.",
         _ => "None.",
     };
 
@@ -425,19 +484,20 @@ public sealed class ComponentsPage : Page
         // (b) Preferred: global for display / input, per task for conversion.
         if (cls != ComponentClass.Conversion)
         {
+            // Tracking: Policy\Lock also hides the per-user PreferredPlugin (display / input: never locked).
             if (r.Preferred)
             {
                 U.AddFlow(row, U.Chip("preferred", Level.Info), 10, 6);
                 var reset = U.Button("Reset preference", () => Run(PolicyCommands.Reset(cls, machine)), "quiet", "sm");
-                reset.IsEnabled = !busy;
-                ToolTip.SetTip(reset, $"displayxr-cli {PolicyCommands.Reset(cls, machine)}");
+                reset.IsEnabled = !busy && !prefLocked;
+                ToolTip.SetTip(reset, prefLocked ? lockTip : $"displayxr-cli {PolicyCommands.Reset(cls, machine)}");
                 U.AddFlow(row, reset, 10, 6);
             }
             else
             {
                 var prefer = U.Button("Prefer", () => Run(PolicyCommands.Prefer(cls, r.Id, machine)), "quiet", "sm");
-                prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted;
-                ToolTip.SetTip(prefer, $"Rank this {cls.Noun()} first: displayxr-cli {PolicyCommands.Prefer(cls, r.Id, machine)}");
+                prefer.IsEnabled = !busy && r.Enabled && !r.Untrusted && !prefLocked;
+                ToolTip.SetTip(prefer, prefLocked ? lockTip : $"Rank this {cls.Noun()} first: displayxr-cli {PolicyCommands.Prefer(cls, r.Id, machine)}");
                 U.AddFlow(row, prefer, 10, 6);
             }
         }
