@@ -74,9 +74,9 @@ struct gp_cap
 	uint32_t cursor_mode; //!< HIDDEN if offered, else EMBEDDED, else 0 (not sent)
 	uint64_t sc_next_probe_ms;
 
-	// ---- monitors the screen grant covers (connectors) and layout changes ----
-	char covered[8][32];
-	uint32_t ncovered;
+	// ---- monitors the screen grant covers and layout changes ----
+	//! Real monitors by connector, screen-cast virtual ones by connector + serial.
+	struct u_desktop_gnome_covered covered;
 	//! The DisplayConfig layout as last seen, and when it last changed / the covered
 	//! monitors came back (u_desktop_gnome_logic.h).
 	struct u_desktop_layout_settle layout;
@@ -135,14 +135,42 @@ void
 gp_cap_end_upgrade(struct gnome_portal *p, struct gp_cap_saved *saved, bool ok);
 
 /*!
- * open_session, before a silent restore: when the grant covers screens, wait
- * (bounded) for the monitor layout to be stable 2 s and for every monitor the
- * grant covers to be present — restoring with one missing (an HDMI handshake
- * after boot) gives a session without it and GNOME saves that reduced approval.
- * TIMEOUT when it does not settle (nothing is restored, the grant is kept).
+ * open_session / open_sc_session, before a silent restore: when the grant covers
+ * screens, wait (bounded, 6 s) for the monitor layout to be stable 2 s and for
+ * every monitor the grant covers to be present. xdg-desktop-portal-gnome restores
+ * the screens all or nothing: with a covered monitor missing (an HDMI handshake
+ * after boot), a RemoteDesktop restore comes back with input only and GNOME saves
+ * that, a ScreenCast restore shows the dialog.
+ *
+ * OK, @p gone false: restore. OK, @p gone true: a covered monitor will not come
+ * back (a screen-cast virtual monitor that no longer exists, at once; a real one
+ * still missing after the wait), so the portal cannot restore the screens: @p msg
+ * says which, and the caller goes on with gp_cap_restore_gone. TIMEOUT: the
+ * layout kept changing (or the thread is quitting); nothing is restored, the
+ * grant is kept.
  */
 enum u_desktop_result
-gp_cap_before_restore(struct gnome_portal *p, char *msg);
+gp_cap_before_restore(struct gnome_portal *p, bool *gone, char *msg);
+
+/*!
+ * After gp_cap_before_restore said @p gone: true when the restore goes ahead —
+ * the token covers input (a RemoteDesktop grant: GNOME restores the input
+ * without the screens, gp_cap_after_start revokes CAPTURE and the grant is saved
+ * without them), or @p may_ask (a request's restore, whose dialog is allowed).
+ * Otherwise the grant covers the screens only and the portal would show its
+ * dialog to restore it: it is revoked here, its saved copy removed, and false
+ * returned with @p msg set (the caller returns NOT_GRANTED).
+ */
+bool
+gp_cap_restore_gone(struct gnome_portal *p, bool may_ask, char *msg);
+
+/*!
+ * A request for CAPTURE, before answering from memory: true when the screen grant
+ * covers a monitor that is gone (gp_cap_before_restore's wait included), so the
+ * portal can no longer restore its screens and the request must ask again.
+ */
+bool
+gp_cap_screens_gone(struct gnome_portal *p);
 
 //! A restore that is not silent shows GNOME's dialog: close the pending Request
 //! object (closing the session alone leaves the dialog up).

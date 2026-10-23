@@ -9,10 +9,11 @@
  * the user approved (`persist_mode` 2). Passing it back on the next session
  * restores the grant without the dialog. The GNOME backend saves the token with
  * the grant's SHAPE — which portal issued it, whether it covers input and the
- * screens, and which monitors (connectors) the screens grant covered — so that a
- * new process of the same app restores exactly what was granted (never a
- * downgrade: xdg-desktop-portal-gnome saves the shape a restore asked for) and
- * can keep the monitor-blink guard (a covered monitor missing at restore time).
+ * screens, and which monitors the screens grant covered (real ones by connector,
+ * mutter's screen-cast virtual monitors by connector and serial) — so that a new
+ * process of the same app restores exactly what was granted (never a downgrade:
+ * xdg-desktop-portal-gnome saves the shape a restore asked for) and can keep the
+ * monitor-blink guard (a covered monitor missing at restore time).
  *
  * One file per app (u_desktop_grant_*: private directory, 0600, atomic), keyed by
  * the app's own identity (u_desktop_gnome_grant_key): the app id the portal's host
@@ -27,12 +28,19 @@
  *       "key_source": "registered" | "app_id" | "executable",
  *       "portal": "remote_desktop" | "screencast",
  *       "restore_token": "…", "devices": true, "screens": true,
- *       "monitors": ["DP-1", "HDMI-1"], "saved": "2026-10-21T05:12:00Z",
+ *       "monitors": ["DP-1", "HDMI-1"],
+ *       "virtual_monitors": [{"connector": "Meta-2", "serial": "0x000003"}],
+ *       "saved": "2026-10-21T05:12:00Z",
  *       "portal_app_id": "org.example.Assistant",           (registered only)
  *       "exe": "/opt/example/Assistant", "launch_scope": "app-gnome-org.example.Assistant-4242.scope" }
  *
  * The last three are diagnostics only (which id the portal used, if known; what
  * launched the process): never read back as part of the grant.
+ *
+ * "virtual_monitors" (optional, absent when empty) lists the covered screen-cast
+ * virtual monitors (u_desktop_gnome_is_cast_virtual): never waited for, gone once
+ * that connector no longer shows that serial. They are kept out of "monitors" so
+ * an older runtime, which ignores the key, never waits for them either.
  *
  * Compiled on every OS so tests_desktop_control pins it; the GNOME backend is its
  * only caller. Never logs a token.
@@ -60,9 +68,15 @@ struct u_desktop_gnome_grant
 	bool screencast; //!< a standalone ScreenCast session's token (else RemoteDesktop)
 	bool devices;    //!< the grant covers input (RemoteDesktop only)
 	bool screens;    //!< the grant covers monitors
-	//! The connectors the screens grant covered (the monitor-blink guard).
+	//! The connectors of the real monitors the screens grant covered (the
+	//! monitor-blink guard waits for a missing one).
 	char monitors[U_DESKTOP_GNOME_GRANT_MONITORS][U_DESKTOP_GNOME_CONNECTOR_SIZE];
 	uint32_t nmonitors;
+	//! The screen-cast virtual monitors it covered: connector and serial (gone for
+	//! good once missing — never waited for).
+	char virtual_monitors[U_DESKTOP_GNOME_GRANT_MONITORS][U_DESKTOP_GNOME_CONNECTOR_SIZE];
+	char virtual_serials[U_DESKTOP_GNOME_GRANT_MONITORS][U_DESKTOP_GNOME_CONNECTOR_SIZE];
+	uint32_t nvirtual;
 };
 
 /*

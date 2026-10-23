@@ -775,13 +775,21 @@ grant_adopt_locked(struct gnome_portal *p, const struct u_desktop_gnome_grant *g
 static void
 grant_adopt_monitors(struct gnome_portal *p, const struct u_desktop_gnome_grant *g)
 {
+	struct u_desktop_gnome_covered *cov = &p->cap.covered;
+	memset(cov, 0, sizeof(*cov));
 	uint32_t n = g->screens ? g->nmonitors : 0;
-	const uint32_t cap = sizeof(p->cap.covered) / sizeof(p->cap.covered[0]);
-	n = n > cap ? cap : n;
+	n = n > U_DESKTOP_GNOME_COVERED_MAX ? U_DESKTOP_GNOME_COVERED_MAX : n;
 	for (uint32_t i = 0; i < n; i++) {
-		snprintf(p->cap.covered[i], sizeof(p->cap.covered[0]), "%s", g->monitors[i]);
+		snprintf(cov->conn[i], sizeof(cov->conn[0]), "%s", g->monitors[i]);
 	}
-	p->cap.ncovered = n;
+	cov->n = n;
+	uint32_t nv = g->screens ? g->nvirtual : 0;
+	nv = nv > U_DESKTOP_GNOME_COVERED_MAX ? U_DESKTOP_GNOME_COVERED_MAX : nv;
+	for (uint32_t i = 0; i < nv; i++) {
+		snprintf(cov->vconn[i], sizeof(cov->vconn[0]), "%s", g->virtual_monitors[i]);
+		snprintf(cov->vserial[i], sizeof(cov->vserial[0]), "%s", g->virtual_serials[i]);
+	}
+	cov->nv = nv;
 	// No layout change seen yet: restore as soon as every covered monitor is there.
 	memset(&p->cap.layout, 0, sizeof(p->cap.layout));
 }
@@ -919,10 +927,16 @@ gp_grant_save(struct gnome_portal *p)
 		return;
 	}
 	if (g.screens) {
+		const struct u_desktop_gnome_covered *cov = &p->cap.covered;
 		const uint32_t cap = sizeof(g.monitors) / sizeof(g.monitors[0]);
-		g.nmonitors = p->cap.ncovered > cap ? cap : p->cap.ncovered;
+		g.nmonitors = cov->n > cap ? cap : cov->n;
 		for (uint32_t i = 0; i < g.nmonitors; i++) {
-			snprintf(g.monitors[i], sizeof(g.monitors[0]), "%s", p->cap.covered[i]);
+			snprintf(g.monitors[i], sizeof(g.monitors[0]), "%s", cov->conn[i]);
+		}
+		g.nvirtual = cov->nv > cap ? cap : cov->nv;
+		for (uint32_t i = 0; i < g.nvirtual; i++) {
+			snprintf(g.virtual_monitors[i], sizeof(g.virtual_monitors[0]), "%s", cov->vconn[i]);
+			snprintf(g.virtual_serials[i], sizeof(g.virtual_serials[0]), "%s", cov->vserial[i]);
 		}
 	}
 	// Diagnostics in the file: whose key, which id the portal used (when known), what ran.
@@ -1027,11 +1041,17 @@ open_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 	session_close(p);
 	p->start_declined = false;
 	if (restoring) {
-		// Never restore a screen grant while a monitor it covers is missing or the
-		// layout just changed: GNOME would save the reduced approval.
-		enum u_desktop_result rr = gp_cap_before_restore(p, msg);
+		// Never restore a screen grant while a monitor it covers may still come back
+		// (a blink) or the layout just changed: GNOME restores the screens all or
+		// nothing and would save the reduced approval. One that is gone for good
+		// (gp_cap_before_restore): GNOME restores the input without the screens.
+		bool gone = false;
+		enum u_desktop_result rr = gp_cap_before_restore(p, &gone, msg);
 		if (rr != U_DESKTOP_OK) {
 			return rr;
+		}
+		if (gone && !gp_cap_restore_gone(p, mode == GP_OPEN_RESTORE_OR_ASK, msg)) {
+			return U_DESKTOP_ERR_NOT_GRANTED;
 		}
 	}
 
@@ -1174,6 +1194,7 @@ open_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 		return U_DESKTOP_ERR_NOT_GRANTED;
 	}
 	memset(restore, 0, sizeof(restore));
+	p->restore_fail[0] = '\0'; // a session is open again
 	p->clipboard_enabled = p->resp_clip;
 	pthread_mutex_lock(&p->lock);
 	// Tokens are single use: keep the new one, or none.
@@ -1254,10 +1275,22 @@ gp_ensure_session(struct gnome_portal *p, bool restore, char *msg)
 	if (!restore) {
 		// After verification: restoring here would put seconds between the
 		// check and the injection. prepare_input is where sessions are opened.
+		if (p->restore_fail[0] != '\0') {
+			// prepare_input's restore failed (and its caller went on): say why, not
+			// "closed mid-action".
+			gp_set_msg(msg, "the remote-desktop session is not open: its restore failed (%s)",
+			           p->restore_fail);
+			return p->restore_fail_result;
+		}
 		gp_set_msg(msg, "the remote-desktop session closed mid-action (screen lock?) — retry");
 		return U_DESKTOP_ERR_REFUSED;
 	}
-	return open_session(p, GP_OPEN_RESTORE, msg);
+	enum u_desktop_result r = open_session(p, GP_OPEN_RESTORE, msg);
+	if (r != U_DESKTOP_OK) {
+		snprintf(p->restore_fail, sizeof(p->restore_fail), "%s", msg != NULL ? msg : "");
+		p->restore_fail_result = r;
+	}
+	return r;
 }
 
 /*

@@ -3633,6 +3633,167 @@ TEST_CASE("layout settle: counts from the last change and from the monitors' ret
 	CHECK(u_desktop_layout_settle_step(&s, 22400, 500, 0, 2000) == 0);
 }
 
+namespace {
+
+u_desktop_gnome_monitor
+gmon(const char *conn, int32_t x, int32_t y, int32_t w, int32_t h, bool cast_virtual = false, const char *serial = "")
+{
+	u_desktop_gnome_monitor m;
+	memset(&m, 0, sizeof(m));
+	snprintf(m.conn, sizeof(m.conn), "%s", conn);
+	m.rect = {x, y, w, h};
+	m.cast_virtual = cast_virtual;
+	snprintf(m.serial, sizeof(m.serial), "%s", serial);
+	return m;
+}
+
+} // namespace
+
+// #2306: a screen-casting tool's virtual monitor (mutter ScreenCast RecordVirtual) is
+// told apart by its spec, not its "Meta-<n>" connector, which a headless session's
+// persistent --virtual-monitor monitors share.
+TEST_CASE("covered monitors: a screen-cast virtual monitor is recorded apart, by connector and serial",
+          "[desktop][capture]")
+{
+	// mutter 42.9 / 46.2 / 50.1: meta-screen-cast-virtual-stream-src.c vs meta-context-main.c.
+	CHECK(u_desktop_gnome_is_cast_virtual("MetaVendor", "Virtual remote monitor"));
+	CHECK_FALSE(u_desktop_gnome_is_cast_virtual("MetaVendor", "MetaVirtualMonitor")); // --virtual-monitor
+	CHECK_FALSE(u_desktop_gnome_is_cast_virtual("DEL", "DELL U2720Q"));
+	CHECK_FALSE(u_desktop_gnome_is_cast_virtual("unknown", "unknown")); // a VM's virtio output
+	CHECK_FALSE(u_desktop_gnome_is_cast_virtual(nullptr, "Virtual remote monitor"));
+	CHECK_FALSE(u_desktop_gnome_is_cast_virtual("MetaVendor", nullptr));
+
+	const u_desktop_gnome_monitor mons[] = {
+	    gmon("eDP-1", 0, 0, 1920, 1200),
+	    gmon("Meta-0", 1920, 0, 1280, 800, false, "0x00"),     // persistent: a real one here
+	    gmon("Meta-2", 3200, 0, 1920, 1080, true, "0x000003"), // the casting tool's
+	};
+	const u_desktop_rect streams[] = {
+	    {0, 1, 1921, 1200},    // eDP-1 (within 2 px)
+	    {3200, 0, 1920, 1080}, // Meta-2
+	    {1920, 0, 1280, 800},  // Meta-0
+	    {10000, 0, 640, 480},  // on no monitor: nothing
+	};
+	u_desktop_gnome_covered cov;
+	u_desktop_gnome_covered_from_streams(streams, 4, mons, 3, &cov);
+	REQUIRE(cov.n == 2);
+	CHECK(std::string(cov.conn[0]) == "eDP-1");
+	CHECK(std::string(cov.conn[1]) == "Meta-0");
+	REQUIRE(cov.nv == 1);
+	CHECK(std::string(cov.vconn[0]) == "Meta-2");
+	CHECK(std::string(cov.vserial[0]) == "0x000003");
+
+	uint32_t missing = 99, gone = 99;
+	char names[64];
+	u_desktop_gnome_covered_missing(&cov, mons, 3, &missing, &gone, names, sizeof(names));
+	CHECK(missing == 0);
+	CHECK(gone == 0);
+	CHECK(std::string(names).empty());
+
+	// The casting tool closes its display.
+	u_desktop_gnome_covered_missing(&cov, mons, 2, &missing, &gone, names, sizeof(names));
+	CHECK(missing == 0);
+	CHECK(gone == 1);
+	CHECK(std::string(names) == "Meta-2");
+
+	// ... and makes a new one, which takes the free connector: another monitor (serial).
+	const u_desktop_gnome_monitor again[] = {mons[0], mons[1],
+	                                         gmon("Meta-2", 3200, 0, 1920, 1080, true, "0x000004")};
+	u_desktop_gnome_covered_missing(&cov, again, 3, &missing, &gone, names, sizeof(names));
+	CHECK(gone == 1);
+
+	// The laptop panel is off (lid closed) and the casting display is gone: both named.
+	const u_desktop_gnome_monitor lid[] = {mons[1]};
+	u_desktop_gnome_covered_missing(&cov, lid, 1, &missing, &gone, names, sizeof(names));
+	CHECK(missing == 1);
+	CHECK(gone == 1);
+	CHECK(std::string(names) == "eDP-1, Meta-2");
+	u_desktop_gnome_covered_missing(&cov, lid, 1, &missing, &gone, nullptr, 0); // names optional
+	CHECK(missing == 1);
+
+	// Nothing covered: nothing missing.
+	u_desktop_gnome_covered none;
+	u_desktop_gnome_covered_from_streams(streams, 0, mons, 3, &none);
+	CHECK(none.n == 0);
+	CHECK(none.nv == 0);
+}
+
+// #2306: the restore guard. The DS1's HDMI blink is waited for exactly as before; a
+// covered monitor that will not come back ends the wait (GONE) instead of a TIMEOUT
+// that every later restore repeated, 6 s each, forever.
+TEST_CASE("restore guard: a blink restores as before; a monitor gone for good stops the wait", "[desktop][capture]")
+{
+	const uint32_t settle = 2000, wait_max = 6000;
+	u_desktop_layout_settle s;
+
+	SECTION("nothing changed since the grant: restore at once")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		CHECK(u_desktop_restore_guard_step(&s, 1000, 1000, 100, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_NOW);
+	}
+	SECTION("a blink: missing, back after 1.6 s, restored 2 s after its return")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		const uint64_t t0 = 10000;
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0, 200, 1, 0, settle, wait_max) == U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 1000, 200, 1, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 1600, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 3599, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 3600, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_NOW);
+	}
+	SECTION("a late blink (back at 5.5 s): not settled within the wait — kept, not gone")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		const uint64_t t0 = 10000;
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0, 200, 1, 0, settle, wait_max) == U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 5500, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_WAIT);
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + 6000, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_UNSETTLED);
+		// The next restore (a later action) restores it once settled.
+		CHECK(u_desktop_restore_guard_step(&s, t0 + 8000, t0 + 8000, 300, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_NOW);
+	}
+	SECTION("a real monitor gone for good: the wait ends GONE, not TIMEOUT")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		const uint64_t t0 = 10000;
+		for (uint64_t t = t0; t < t0 + wait_max; t += 100) {
+			INFO("t = " << t - t0);
+			REQUIRE(u_desktop_restore_guard_step(&s, t0, t, 200, 1, 0, settle, wait_max) ==
+			        U_DESKTOP_RESTORE_WAIT);
+		}
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + wait_max, 200, 1, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_GONE);
+	}
+	SECTION("a screen-cast virtual monitor gone: GONE at once, even mid-blink")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		CHECK(u_desktop_restore_guard_step(&s, 5000, 5000, 100, 0, 1, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_GONE);
+		u_desktop_layout_settle_reset(&s, 100);
+		CHECK(u_desktop_restore_guard_step(&s, 5000, 5000, 200, 1, 1, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_GONE);
+	}
+	SECTION("every covered monitor there but the layout keeps changing: UNSETTLED after the wait")
+	{
+		u_desktop_layout_settle_reset(&s, 100);
+		const uint64_t t0 = 10000;
+		uint64_t fp = 100;
+		for (uint64_t t = t0; t < t0 + wait_max; t += 1000) {
+			REQUIRE(u_desktop_restore_guard_step(&s, t0, t, ++fp, 0, 0, settle, wait_max) ==
+			        U_DESKTOP_RESTORE_WAIT);
+		}
+		CHECK(u_desktop_restore_guard_step(&s, t0, t0 + wait_max, ++fp, 0, 0, settle, wait_max) ==
+		      U_DESKTOP_RESTORE_UNSETTLED);
+	}
+}
+
 /*
  * macOS capture backend geometry (u_desktop_macos_logic.h) — pure, so pinned on every OS.
  */
@@ -4036,6 +4197,46 @@ TEST_CASE("desktop_gnome_grant: encode / decode round trip", "[desktop][grant]")
 		free(txt);
 		CHECK(back.nmonitors == 0);
 	}
+	SECTION("#2306: the covered screen-cast virtual monitors, by connector and serial, apart")
+	{
+		u_desktop_gnome_grant g = make_grant(false, true, true, {"eDP-1"});
+		snprintf(g.virtual_monitors[0], sizeof(g.virtual_monitors[0]), "Meta-2");
+		snprintf(g.virtual_serials[0], sizeof(g.virtual_serials[0]), "0x000003");
+		g.nvirtual = 1;
+		char *txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
+		REQUIRE(txt != nullptr);
+		std::string json = txt;
+		free(txt);
+		// Kept out of "monitors": an older runtime (which ignores the key) never waits for it.
+		CHECK(json.find("\"monitors\":\t[\"eDP-1\"]") != std::string::npos);
+		CHECK(json.find("\"virtual_monitors\"") != std::string::npos);
+		u_desktop_gnome_grant back{};
+		REQUIRE(decode(json, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		REQUIRE(back.nmonitors == 1);
+		CHECK(std::string(back.monitors[0]) == "eDP-1");
+		REQUIRE(back.nvirtual == 1);
+		CHECK(std::string(back.virtual_monitors[0]) == "Meta-2");
+		CHECK(std::string(back.virtual_serials[0]) == "0x000003");
+
+		// None: no key at all (what an older runtime writes and reads).
+		g.nvirtual = 0;
+		txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
+		REQUIRE(txt != nullptr);
+		CHECK(std::string(txt).find("virtual_monitors") == std::string::npos);
+		free(txt);
+
+		// An input-only grant keeps no monitor of either kind.
+		g = make_grant(false, true, false, {"DP-1"});
+		snprintf(g.virtual_monitors[0], sizeof(g.virtual_monitors[0]), "Meta-2");
+		snprintf(g.virtual_serials[0], sizeof(g.virtual_serials[0]), "0x000003");
+		g.nvirtual = 1;
+		txt = u_desktop_gnome_grant_encode(kAppId, &g, nullptr);
+		REQUIRE(txt != nullptr);
+		CHECK(decode(txt, &back) == U_DESKTOP_GNOME_GRANT_OK);
+		free(txt);
+		CHECK(back.nmonitors == 0);
+		CHECK(back.nvirtual == 0);
+	}
 	SECTION("nothing that cannot be restored is encoded")
 	{
 		u_desktop_gnome_grant g = make_grant(false, false, false); // covers nothing
@@ -4079,6 +4280,12 @@ TEST_CASE("desktop_gnome_grant: decode refuses anything it did not write", "[des
 	    {"monitors", "[1]"},
 	    {"monitors", "[\"has space\"]"},
 	    {"monitors", "[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]"},
+	    {"virtual_monitors", "{}"},
+	    {"virtual_monitors", "[\"Meta-2\"]"},
+	    {"virtual_monitors", "[{\"connector\": \"Meta-2\"}]"},
+	    {"virtual_monitors", "[{\"serial\": \"0x000003\"}]"},
+	    {"virtual_monitors", "[{\"connector\": \"Meta 2\", \"serial\": \"0x000003\"}]"},
+	    {"virtual_monitors", "[{\"connector\": \"Meta-2\", \"serial\": 3}]"},
 	};
 	for (const auto &c : corrupt) {
 		INFO(c.first << " = " << c.second);
@@ -4095,6 +4302,15 @@ TEST_CASE("desktop_gnome_grant: decode refuses anything it did not write", "[des
 	CHECK(decode(sc) == U_DESKTOP_GNOME_GRANT_OK);
 	// No monitors key is allowed (an input-only grant).
 	CHECK(decode(grant_json("monitors", "")) == U_DESKTOP_GNOME_GRANT_OK);
+	// #2306: the optional virtual_monitors key; a file without it (an older runtime's) is fine.
+	u_desktop_gnome_grant vg{};
+	CHECK(decode(grant_json("virtual_monitors", "[{\"connector\": \"Meta-2\", \"serial\": \"0x000003\"}]"),
+	             &vg) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(vg.nvirtual == 1);
+	CHECK(decode(grant_json("virtual_monitors", "[]"), &vg) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(vg.nvirtual == 0);
+	CHECK(decode(grant_json(), &vg) == U_DESKTOP_GNOME_GRANT_OK);
+	CHECK(vg.nvirtual == 0);
 	// A later format: left for the runtime that wrote it.
 	CHECK(decode(grant_json("version", "2")) == U_DESKTOP_GNOME_GRANT_NEWER);
 	// Not a grant at all.

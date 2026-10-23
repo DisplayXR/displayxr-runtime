@@ -373,6 +373,128 @@ u_desktop_layout_settle_step(
 }
 
 bool
+u_desktop_gnome_is_cast_virtual(const char *vendor, const char *product)
+{
+	// mutter's meta-screen-cast-virtual-stream-src.c (42.9 / 46.2 / 50.1).
+	return vendor != NULL && product != NULL && strcmp(vendor, "MetaVendor") == 0 &&
+	       strcmp(product, "Virtual remote monitor") == 0;
+}
+
+static int32_t
+iabs32(int32_t v)
+{
+	return v < 0 ? -v : v;
+}
+
+static bool
+rect_close(const struct u_desktop_rect *a, const struct u_desktop_rect *b)
+{
+	return iabs32(a->x - b->x) <= 2 && iabs32(a->y - b->y) <= 2 && iabs32(a->w - b->w) <= 2 &&
+	       iabs32(a->h - b->h) <= 2;
+}
+
+void
+u_desktop_gnome_covered_from_streams(const struct u_desktop_rect *streams,
+                                     uint32_t nstreams,
+                                     const struct u_desktop_gnome_monitor *mons,
+                                     uint32_t nmons,
+                                     struct u_desktop_gnome_covered *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (uint32_t i = 0; i < nstreams; i++) {
+		for (uint32_t k = 0; k < nmons; k++) {
+			const struct u_desktop_gnome_monitor *m = &mons[k];
+			if (!rect_close(&streams[i], &m->rect)) {
+				continue;
+			}
+			if (m->cast_virtual && out->nv < U_DESKTOP_GNOME_COVERED_MAX) {
+				snprintf(out->vconn[out->nv], sizeof(out->vconn[0]), "%s", m->conn);
+				snprintf(out->vserial[out->nv], sizeof(out->vserial[0]), "%s", m->serial);
+				out->nv++;
+			} else if (!m->cast_virtual && out->n < U_DESKTOP_GNOME_COVERED_MAX) {
+				snprintf(out->conn[out->n], sizeof(out->conn[0]), "%s", m->conn);
+				out->n++;
+			}
+			break;
+		}
+	}
+}
+
+static void
+names_add(char *names, size_t cap, const char *conn)
+{
+	if (names == NULL || cap == 0) {
+		return;
+	}
+	size_t len = strnlen(names, cap);
+	if (len + 1 >= cap) {
+		return;
+	}
+	snprintf(names + len, cap - len, "%s%s", len > 0 ? ", " : "", conn);
+}
+
+void
+u_desktop_gnome_covered_missing(const struct u_desktop_gnome_covered *cov,
+                                const struct u_desktop_gnome_monitor *mons,
+                                uint32_t nmons,
+                                uint32_t *missing,
+                                uint32_t *gone,
+                                char *names,
+                                size_t names_cap)
+{
+	*missing = 0;
+	*gone = 0;
+	if (names != NULL && names_cap > 0) {
+		names[0] = '\0';
+	}
+	for (uint32_t i = 0; i < cov->n; i++) {
+		bool found = false;
+		for (uint32_t k = 0; k < nmons && !found; k++) {
+			found = strcmp(mons[k].conn, cov->conn[i]) == 0;
+		}
+		if (!found) {
+			(*missing)++;
+			names_add(names, names_cap, cov->conn[i]);
+		}
+	}
+	for (uint32_t i = 0; i < cov->nv; i++) {
+		bool found = false;
+		for (uint32_t k = 0; k < nmons && !found; k++) {
+			found = mons[k].cast_virtual && strcmp(mons[k].conn, cov->vconn[i]) == 0 &&
+			        strcmp(mons[k].serial, cov->vserial[i]) == 0;
+		}
+		if (!found) {
+			(*gone)++;
+			names_add(names, names_cap, cov->vconn[i]);
+		}
+	}
+}
+
+enum u_desktop_restore_verdict
+u_desktop_restore_guard_step(struct u_desktop_layout_settle *s,
+                             uint64_t start_ms,
+                             uint64_t now_ms,
+                             uint64_t fingerprint,
+                             uint32_t missing,
+                             uint32_t gone,
+                             uint32_t settle_ms,
+                             uint32_t wait_max_ms)
+{
+	// The settle tracker is kept current either way (a later restore counts from here).
+	uint32_t left = u_desktop_layout_settle_step(s, now_ms, fingerprint, missing, settle_ms);
+	if (gone > 0) {
+		return U_DESKTOP_RESTORE_GONE; // never coming back: nothing to wait for
+	}
+	if (left == 0) {
+		return U_DESKTOP_RESTORE_NOW;
+	}
+	if (now_ms >= start_ms && now_ms - start_ms >= wait_max_ms) {
+		return missing > 0 ? U_DESKTOP_RESTORE_GONE : U_DESKTOP_RESTORE_UNSETTLED;
+	}
+	return U_DESKTOP_RESTORE_WAIT;
+}
+
+bool
 u_desktop_shell_cover_appeared(const uint8_t *before, const uint8_t *after, uint32_t n)
 {
 	for (uint32_t i = 0; i < n; i++) {

@@ -144,6 +144,11 @@ struct gnome_portal
 	} saved;
 	//! The last Start (RemoteDesktop or ScreenCast) was answered "Cancel" (response 1).
 	bool start_declined;
+	//! Why the last silent restore for input failed ("" once a session opens again),
+	//! and its result: what an injection that finds no session reports, instead of
+	//! guessing "closed mid-action".
+	char restore_fail[U_DESKTOP_MSG_SIZE];
+	enum u_desktop_result restore_fail_result;
 
 	char session[512];
 	bool session_open;
