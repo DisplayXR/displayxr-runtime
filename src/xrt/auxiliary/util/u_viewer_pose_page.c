@@ -27,23 +27,29 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 
+static inline void
+fence(void)
+{
+	volatile long dummy = 0;
+	(void)_InterlockedOr(&dummy, 0);
+}
+
+// A plain aligned 64-bit read between two full fences, never an interlocked
+// read-modify-write: readers map the page READ-ONLY, and a locked RMW on a
+// read-only view is an access violation.
 static inline uint64_t
 load64(const volatile uint64_t *p)
 {
-	return (uint64_t)_InterlockedOr64((volatile __int64 *)p, 0);
+	fence();
+	const uint64_t v = *p;
+	fence();
+	return v;
 }
 
 static inline void
 store64(volatile uint64_t *p, uint64_t v)
 {
 	(void)_InterlockedExchange64((volatile __int64 *)p, (__int64)v);
-}
-
-static inline void
-fence(void)
-{
-	volatile long dummy = 0;
-	(void)_InterlockedOr(&dummy, 0);
 }
 
 #elif defined(__GNUC__) || defined(__clang__)
