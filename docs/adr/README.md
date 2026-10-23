@@ -62,3 +62,4 @@
 - [ADR-056](ADR-056-desktop-control-runs-in-the-app.md) — Desktop control is a first-class capability that runs in the app — the OS's consent belongs to the app, never to DisplayXR
 - [ADR-057](ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
 - [ADR-058](ADR-058-late-view-synthesis-and-depth-reprojection.md) — Late view synthesis and depth reprojection — converted content is placed at the eyes of the frame it is shown in, not the frame it was converted for
+- [ADR-059](ADR-059-d3d11-hub-compositor-windows.md) — One D3D11 hub compositor on Windows — the per-API in-process compositors become import shims onto the fill arm that already weaves for Vulkan and D3D12; measured latency-neutral, default-off until the per-API gates pass
