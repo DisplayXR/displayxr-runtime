@@ -370,6 +370,8 @@ public sealed class DashboardContext
             {
                 await LoadPolicyAsync(c, force: true);
                 if (c == ComponentClass.Display) await LoadDpAsync(force: true);
+                // N6 Part 2: Enabled / Preferred change what the provider probe ranks (info's tracking block).
+                if (c == ComponentClass.Tracking) await LoadInfoAsync(force: true);
             }
         // #2181: a per-app pin write re-reads the input list (pins + live holders).
         if (area == PolicyCommands.AppArea) await LoadPolicyAsync(ComponentClass.Input, force: true);

@@ -1166,6 +1166,13 @@ client_dll_ok:
 	; controller pair. ProbeOrder 150: a real tracking vendor (50) outranks
 	; it, it outranks sim-input (200). Allowlisted below with the sims.
 	File "${BIN_DIR}\plugins\DisplayXR-Gamepad.dll"
+	; The viewer-tracking reference provider (ADR-054 N6, sim-tracking): the
+	; DLL is staged and allowlisted but deliberately NOT registered — no
+	; TrackingProviders row is written, so the tracking class stays empty
+	; and no screen changes behaviour (tracking-provider-discovery.md §10.7).
+	; A developer registers it by hand (row Binary = this path) and turns it
+	; on with `displayxr-cli tracking set sim-tracking ENABLE 1`.
+	File "${BIN_DIR}\plugins\DisplayXR-SimTracking.dll"
 	; ADR-053 P4 (#2108): the sim's fake model pack (its DOWNLOAD_MS knob
 	; drives the model store's write protocol through it).
 	File "${BIN_DIR}\plugins\sim-conversion.models.json"

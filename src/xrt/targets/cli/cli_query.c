@@ -2814,6 +2814,32 @@ add_input_emulated_json(cJSON *ip, const struct cli_query_result *r)
 	}
 }
 
+/*!
+ * ADR-054 N6 Part 2: the `tracking_providers` object of both `info --json`
+ * and `selftest --json` — what is registered and resident, and the primary
+ * screen's viewer source as the trunk arbitrates it. Data, never a verdict.
+ */
+static void
+add_tracking_providers_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *tp = cJSON_AddObjectToObject(root, "tracking_providers");
+	cJSON_AddNumberToObject(tp, "registered", (double)r->tracking_registered);
+	cJSON_AddNumberToObject(tp, "enabled", (double)r->tracking_enabled);
+	cJSON_AddNumberToObject(tp, "scan_declined", (double)r->tracking_scan_declined);
+	cJSON_AddNumberToObject(tp, "scan_failed", (double)r->tracking_scan_failed);
+	cJSON_AddNumberToObject(tp, "scan_untrusted", (double)r->tracking_scan_untrusted);
+	cJSON *rk = cJSON_AddArrayToObject(tp, "ranked");
+	for (int i = 0; i < r->tracking_ranked_count; i++) {
+		cJSON_AddItemToArray(rk, cJSON_CreateString(r->tracking_ranked[i]));
+	}
+	cJSON_AddStringToObject(tp, "active_id", r->tracking_ranked_count > 0 ? r->tracking_ranked[0] : "");
+	cJSON_AddBoolToObject(tp, "evaluated", r->tracking_evaluated);
+	cJSON_AddStringToObject(tp, "viewer_source", r->tracking_viewer_source);
+	cJSON_AddStringToObject(tp, "viewer_reason", r->tracking_viewer_reason);
+	cJSON_AddStringToObject(tp, "display_viewer_policy", r->tracking_viewer_policy);
+	cJSON_AddNumberToObject(tp, "composed_eye_tracking_modes", (double)r->tracking_composed_modes);
+}
+
 cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
 {
@@ -3109,6 +3135,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(ip, "ht_right_ok", r->input_ht_right_ok);
 		}
 	}
+
+	// ADR-054 N6 Part 2: the viewer-tracking class (the Dashboard's Components page).
+	add_tracking_providers_json(root, r);
 
 	// ADR-034 Amendment 4 / #1380 rig (navigation) role.
 	{
@@ -3724,24 +3753,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 	}
 	// ADR-054 N6 Part 2: the viewer-tracking class, as data (the N4 conformance
 	// cells read these fields; a provider in standby is not a fault).
-	{
-		cJSON *tp = cJSON_AddObjectToObject(root, "tracking_providers");
-		cJSON_AddNumberToObject(tp, "registered", (double)r->tracking_registered);
-		cJSON_AddNumberToObject(tp, "enabled", (double)r->tracking_enabled);
-		cJSON_AddNumberToObject(tp, "scan_declined", (double)r->tracking_scan_declined);
-		cJSON_AddNumberToObject(tp, "scan_failed", (double)r->tracking_scan_failed);
-		cJSON_AddNumberToObject(tp, "scan_untrusted", (double)r->tracking_scan_untrusted);
-		cJSON *rk = cJSON_AddArrayToObject(tp, "ranked");
-		for (int i = 0; i < r->tracking_ranked_count; i++) {
-			cJSON_AddItemToArray(rk, cJSON_CreateString(r->tracking_ranked[i]));
-		}
-		cJSON_AddStringToObject(tp, "active_id", r->tracking_ranked_count > 0 ? r->tracking_ranked[0] : "");
-		cJSON_AddBoolToObject(tp, "evaluated", r->tracking_evaluated);
-		cJSON_AddStringToObject(tp, "viewer_source", r->tracking_viewer_source);
-		cJSON_AddStringToObject(tp, "viewer_reason", r->tracking_viewer_reason);
-		cJSON_AddStringToObject(tp, "display_viewer_policy", r->tracking_viewer_policy);
-		cJSON_AddNumberToObject(tp, "composed_eye_tracking_modes", (double)r->tracking_composed_modes);
-	}
+	add_tracking_providers_json(root, r);
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 

@@ -1,0 +1,39 @@
+{
+ "preferred": null,
+ "policy": {
+  "policy_lock": false
+ },
+ "disabled_by_env": false,
+ "providers": [
+  {
+   "id": "sim-tracking",
+   "display_name": "DisplayXR Sim Tracking",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 200,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": true,
+   "enabled_source": "default",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "preferred": false,
+   "first": true
+  },
+  {
+   "id": "sim-tracking-b",
+   "display_name": "DisplayXR Sim Tracking B",
+   "vendor": "DisplayXR",
+   "version": "dev",
+   "probe_order": 210,
+   "binary_path": "/Users/dev/displayxr/_package/DisplayXR-macOS/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+   "enabled": false,
+   "enabled_source": "manifest",
+   "provenance": "unverified",
+   "provenance_reason": "unsigned and not allowlisted (to allow: Trust\\Allowlist\\c709663369f0190b1cf8b849a4b1eff9cf3c6f35da5b178233e51506d2760923)",
+   "signer": "",
+   "preferred": false,
+   "first": false
+  }
+ ]
+}

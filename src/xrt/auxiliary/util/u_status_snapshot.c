@@ -891,6 +891,12 @@ screen_to_cjson(const struct xrt_status_screen *s)
 		cJSON_AddNullToObject(et, "viewer_source");
 		cJSON_AddNullToObject(et, "viewer_reason");
 	}
+	// The display's viewer policy (OWN / EXTERNAL_OK / FIXED) where this process evaluated it.
+	if (s->eye_tracking.viewer_policy[0] != '\0') {
+		cJSON_AddStringToObject(et, "viewer_policy", s->eye_tracking.viewer_policy);
+	} else {
+		cJSON_AddNullToObject(et, "viewer_policy");
+	}
 
 	if (s->mode.valid) {
 		cJSON *mode = cJSON_AddObjectToObject(o, "mode");

@@ -153,8 +153,8 @@ public class ComponentPolicyTests
         Assert.Equal(V("input", "enable", "x", "--machine"), PolicyCommands.Toggle(ComponentClass.Input, "x", enabled: false, machine: true).Args);
         // The readable form (log pane, administrator hints).
         Assert.Equal("conv use depth-mono acme-conv/depth-a", PolicyCommands.PreferTask("depth-mono", "acme-conv/depth-a").ToString());
-        Assert.Equal(new[] { "policy-dp", "policy-input", "policy-conv" }, ComponentClasses.All.Select(PolicyCommands.Area));
-        Assert.Equal(new[] { "display processor", "input provider", "conversion provider" }, ComponentClasses.All.Select(c => c.Noun()));
+        Assert.Equal(new[] { "policy-dp", "policy-input", "policy-conv", "policy-tracking" }, ComponentClasses.All.Select(PolicyCommands.Area));
+        Assert.Equal(new[] { "display processor", "input provider", "conversion provider", "viewer-tracking provider" }, ComponentClasses.All.Select(c => c.Noun()));
     }
 
     [Theory]
