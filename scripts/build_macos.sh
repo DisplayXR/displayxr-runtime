@@ -447,6 +447,31 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -n "$HOST_BIN" ]; then
   echo "Staged displayxr-conversion-host into _package bin/"
 fi
 
+# Tracking-provider-discovery §4a: the viewer-tracking host ships beside the
+# service too (it spawns it from its own directory). A provider dylib imports
+# @rpath/openxr_displayxr.dylib, so the host needs @executable_path/../lib.
+TRACKHOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-tracking-host -type f 2>/dev/null | head -1 || true)"
+if [ "$SERVICE_MODE" = "ON" ] && [ -n "$TRACKHOST_BIN" ]; then
+  cp "$TRACKHOST_BIN" "$PKG_DIR/bin/displayxr-tracking-host"
+  chmod u+w "$PKG_DIR/bin/displayxr-tracking-host"
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-tracking-host" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  echo "Staged displayxr-tracking-host into _package bin/"
+fi
+
 # #2264: the desktop-capture helper (the one process that holds the Screen
 # Recording grant; in-process Metal compositors reach it over XPC by Mach
 # service name, so it ships with or without the service). It links only system

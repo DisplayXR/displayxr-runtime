@@ -420,6 +420,17 @@ fill_viewer_source(struct xrt_status_screen *s, const struct target_viewer_scree
 		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
 		         "provider source paused (no fresh samples): views hold the last known viewer");
 	}
+	if (sd->d.source == XRT_VIEWER_SOURCE_PROVIDER) {
+		// §4a: where it runs — the host's pid / state / restarts in the service.
+		struct target_viewer_hosting_info hi;
+		target_viewer_tracking_get_hosting(&hi);
+		snprintf(s->eye_tracking.viewer_hosting, sizeof(s->eye_tracking.viewer_hosting), "%s",
+		         hi.hosting[0] != '\0' ? hi.hosting : "in_process");
+		s->eye_tracking.viewer_host_pid = hi.host_pid;
+		snprintf(s->eye_tracking.viewer_host_state, sizeof(s->eye_tracking.viewer_host_state), "%s",
+		         hi.host_state);
+		s->eye_tracking.viewer_host_restarts = hi.restarts;
+	}
 }
 
 static void

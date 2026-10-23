@@ -215,6 +215,12 @@ if [ -f "$SERVICE_SRC" ]; then
         chmod 0755 "$RUNTIME_ROOT/bin/displayxr-conversion-host"
         codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-conversion-host" 2>/dev/null || true
     fi
+    # Tracking-provider-discovery §4a: the viewer-tracking host, spawned by the service from bin/.
+    if [ -f "$ARTIFACT_DIR/bin/displayxr-tracking-host" ]; then
+        cp "$ARTIFACT_DIR/bin/displayxr-tracking-host" "$RUNTIME_ROOT/bin/displayxr-tracking-host"
+        chmod 0755 "$RUNTIME_ROOT/bin/displayxr-tracking-host"
+        codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-tracking-host" 2>/dev/null || true
+    fi
 
     LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
     mkdir -p "$LAUNCHAGENT_DIR"

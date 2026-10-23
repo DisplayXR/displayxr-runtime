@@ -800,6 +800,9 @@ Function CloseRuntimeClients
 	; (KILL_ON_JOB_CLOSE); sweep a straggler so its exe can be replaced.
 	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
 	Pop $0
+	; The viewer-tracking host dies with the service's job object too.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
+	Pop $0
 
 	; The browser records its own root; a missing key just means not installed,
 	; and the empty entry is filtered out below.
@@ -1032,6 +1035,11 @@ client_dll_ok:
 	; conversion-provider DLL, from its own directory. /nonfatal: without it
 	; every provider is hosted in the service (the documented fallback).
 	File /nonfatal "${BIN_DIR}\displayxr-conversion-host.exe"
+
+	; The viewer-tracking host (tracking-provider-discovery §4a): the service
+	; runs the viewer-tracking provider in it, writing the shared pose page.
+	; /nonfatal: without it the provider is hosted in the service (fallback).
+	File /nonfatal "${BIN_DIR}\displayxr-tracking-host.exe"
 
 	; Install manifest. Staged next to DisplayXRClient.dll in ${BIN_DIR}
 	; (library_path ".\DisplayXRClient.dll", valid in this flat layout too);
@@ -1586,6 +1594,7 @@ Section "Uninstall"
 	DetailPrint "Stopping DisplayXR Service..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
 	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
+	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 	; Also clear the stale 32-bit (WOW6432Node) Run entry left by interim
 	; installers that wrote it before this section moved to SetRegView 64.
@@ -1740,6 +1749,7 @@ Section "Uninstall"
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
 	Delete "$INSTDIR\displayxr-conversion-host.exe"
+	Delete "$INSTDIR\displayxr-tracking-host.exe"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"

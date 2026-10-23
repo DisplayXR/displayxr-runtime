@@ -334,6 +334,29 @@ target_viewer_tracking_get_iface(void);
 bool
 target_viewer_tracking_provider_running(uint32_t *out_status);
 
+/*!
+ * The service calls this once, before creating its instance, with the
+ * absolute path of the sibling `displayxr-tracking-host` (NULL / "" = none:
+ * the provider is then hosted in the service, still writing the page). Only
+ * the service hosts out of process (tracking-provider-discovery.md §4a).
+ */
+void
+target_viewer_tracking_set_host_exe(const char *path);
+
+//! Where the provider runs, for status (`status --json` per screen `eye_tracking.viewer_hosting` / `host_*`).
+struct target_viewer_hosting_info
+{
+	//! "in_process" (loaded here), "host" (the service's displayxr-tracking-host), "service" (in the
+	//! service, no host binary), "page" (this process reads the service's page), "" (not resolved).
+	char hosting[16];
+	int64_t host_pid;    //!< the host (or hosting service) pid; 0 = none
+	char host_state[16]; //!< u_vpp_state_str: "idle" / "starting" / "running" / "backoff" / "failed" / "stopped"
+	uint32_t restarts;   //!< host restarts since the service started
+};
+
+void
+target_viewer_tracking_get_hosting(struct target_viewer_hosting_info *out);
+
 //! Stop the provider (system teardown). A later system starts it again on demand.
 void
 target_viewer_tracking_shutdown(void);

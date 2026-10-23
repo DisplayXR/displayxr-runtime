@@ -903,6 +903,20 @@ screen_to_cjson(const struct xrt_status_screen *s)
 	} else {
 		cJSON_AddNullToObject(et, "viewer_provider");
 	}
+	// Where the provider runs (§4a): {hosting, pid, state, restarts}; null when no provider serves here.
+	if (s->eye_tracking.viewer_hosting[0] != '\0') {
+		cJSON *vh = cJSON_AddObjectToObject(et, "viewer_host");
+		cJSON_AddStringToObject(vh, "hosting", s->eye_tracking.viewer_hosting);
+		cJSON_AddNumberToObject(vh, "pid", (double)s->eye_tracking.viewer_host_pid);
+		if (s->eye_tracking.viewer_host_state[0] != '\0') {
+			cJSON_AddStringToObject(vh, "state", s->eye_tracking.viewer_host_state);
+		} else {
+			cJSON_AddNullToObject(vh, "state");
+		}
+		cJSON_AddNumberToObject(vh, "restarts", (double)s->eye_tracking.viewer_host_restarts);
+	} else {
+		cJSON_AddNullToObject(et, "viewer_host");
+	}
 
 	if (s->mode.valid) {
 		cJSON *mode = cJSON_AddObjectToObject(o, "mode");

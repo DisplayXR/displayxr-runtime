@@ -7,8 +7,11 @@
  */
 
 #include "target_viewer_tracking.h"
+#include "target_viewer_host.h"
 #include "target_tracking_plugin_loader.h"
 #include "target_plugin_loader.h"
+
+#include "xrt/xrt_config_os.h"
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
@@ -18,9 +21,16 @@
 
 #include "util/u_eye_history.h"
 #include "util/u_logging.h"
+#include "util/u_viewer_pose_page.h"
 
 #include "os/os_threading.h"
 #include "os/os_time.h"
+
+#if !defined(XRT_OS_ANDROID)
+#define VT_HAVE_PAGE 1
+#include "os/os_process.h"
+#include "os/os_shm.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -342,6 +352,13 @@ static struct xrt_tracking_sink g_sink;
 static bool g_warned_start_failed = false;
 
 static void
+start_locked(void);
+#if !defined(XRT_OS_ANDROID)
+static void *
+inproc_thread_run(void *ptr);
+#endif
+
+static void
 lock_init_once(void)
 {
 	if (!g_mutex_ready) {
@@ -370,6 +387,213 @@ void
 target_viewer_tracking_set_service_process(bool service)
 {
 	g_service_process = service;
+}
+
+
+/*
+ *
+ * Hosting (tracking-provider-discovery.md §4a): where the provider runs and
+ * how this process gets its samples. Resolved once, the first time a screen
+ * can take a provider.
+ *
+ *  - LOCAL: the provider is loaded in this process and pushes into g_ring
+ *    (an in-process runtime with no service; the fallback everywhere).
+ *  - OWNER_HOST: the service. It creates the viewer pose page, probes and
+ *    runs the provider in `displayxr-tracking-host` (target_viewer_host.h)
+ *    and drains the page into g_ring like any reader.
+ *  - OWNER_INPROC: the service without the host binary: the provider runs in
+ *    the service, its sink writes the page (so in-process apps beside the
+ *    service still share it); a small thread beats the heartbeat and answers
+ *    readers' demand.
+ *  - READER: an in-process runtime that found a live page: it loads no
+ *    provider, posts demand on its first viewer request and drains the page.
+ *
+ */
+
+enum vt_hosting
+{
+	VT_HOSTING_UNRESOLVED = 0,
+	VT_HOSTING_LOCAL,
+	VT_HOSTING_OWNER_HOST,
+	VT_HOSTING_OWNER_INPROC,
+	VT_HOSTING_READER,
+};
+
+static enum vt_hosting g_hosting = VT_HOSTING_UNRESOLVED;
+static char g_host_exe[1024] = {0}; //!< service: the sibling displayxr-tracking-host ("" = none)
+static struct xrt_tracking_host_display_geometry g_geo;
+static bool g_have_geo = false;
+
+//! Page-mode result of the resolve (the provider the page names).
+static bool g_page_usable = false;
+static char g_page_provider[U_VPP_ID_MAX] = {0};
+
+#ifdef VT_HAVE_PAGE
+static char g_page_name[128] = {0};
+static struct os_shm g_shm; //!< the mapping (owner: created; reader: opened RW for demand)
+static struct target_viewer_host *g_host = NULL;
+static struct u_vpp_reader g_reader;            //!< this process's drain cursor
+static struct u_vpp_producer g_inproc_producer; //!< OWNER_INPROC: the sink's page writer
+static struct os_thread_helper g_inproc_thread;
+static bool g_inproc_thread_running = false;
+static int64_t g_last_demand_post_ns = 0;
+static int64_t g_last_live_check_ns = 0;
+static bool g_live_cached = false;
+static int64_t g_last_reattach_ns = 0;
+static int64_t g_owner_created_ns = 0;
+#endif
+
+void
+target_viewer_tracking_set_host_exe(const char *path)
+{
+	snprintf(g_host_exe, sizeof(g_host_exe), "%s", path != NULL ? path : "");
+}
+
+#ifdef VT_HAVE_PAGE
+
+static void
+write_owner_inproc(uint32_t state)
+{
+	struct u_vpp_owner_status o;
+	memset(&o, 0, sizeof(o));
+	o.state = state;
+	o.in_process = true;
+	o.host_pid = 0;
+	snprintf(o.provider_id, sizeof(o.provider_id), "%s", g_page_provider);
+	u_vpp_write_owner(g_shm.map, &o);
+}
+
+//! Service: create the page. false = no page (the caller hosts LOCAL).
+static bool
+owner_create_page(void)
+{
+	if (!target_viewer_page_name(g_page_name, sizeof(g_page_name))) {
+		return false;
+	}
+	if (os_shm_create(g_page_name, U_VPP_PAGE_BYTES, &g_shm) != 0) {
+		U_LOG_W(
+		    "viewer tracking: could not create the viewer pose page '%s' — the provider is hosted in the "
+		    "service only (in-process apps beside it load their own)",
+		    g_page_name);
+		return false;
+	}
+	if (!u_vpp_init(g_shm.map, g_shm.size, (int64_t)os_process_current_pid(), (int64_t)os_monotonic_get_ns())) {
+		os_shm_close(&g_shm);
+		return false;
+	}
+	memset(&g_reader, 0, sizeof(g_reader));
+	return true;
+}
+
+/*!
+ * Reader: is a live service page there, naming a provider? Maps it (RW: the
+ * demand word) and keeps it on success.
+ */
+static bool
+reader_attach(void)
+{
+	if (!target_viewer_page_name(g_page_name, sizeof(g_page_name))) {
+		return false;
+	}
+	struct os_shm shm;
+	if (os_shm_open(g_page_name, U_VPP_PAGE_BYTES, true, &shm) != 0) {
+		return false;
+	}
+	struct u_vpp_geometry geo;
+	struct u_vpp_owner_status o;
+	const bool ok = u_vpp_attach_check(shm.map, shm.size) && (u_vpp_read_geometry(shm.map, &geo), true) &&
+	                os_process_is_alive((long)geo.owner_pid) && u_vpp_read_owner(shm.map, &o) &&
+	                o.provider_id[0] != '\0' && o.state != U_VPP_STATE_NONE && o.state != U_VPP_STATE_STOPPED &&
+	                o.state != U_VPP_STATE_FAILED;
+	if (!ok) {
+		os_shm_close(&shm);
+		return false;
+	}
+	g_shm = shm;
+	g_owner_created_ns = geo.owner_created_ns;
+	snprintf(g_page_provider, sizeof(g_page_provider), "%s", o.provider_id);
+	memset(&g_reader, 0, sizeof(g_reader));
+	return true;
+}
+
+#endif // VT_HAVE_PAGE
+
+/*!
+ * Resolve the hosting, once (see the block comment). Takes the lock itself;
+ * the probe (a child process, ≤ 5 s) runs under it — it happens once, at
+ * system creation, before any view request.
+ */
+static enum vt_hosting
+resolve_hosting(void)
+{
+	lock();
+	if (g_hosting != VT_HOSTING_UNRESOLVED) {
+		const enum vt_hosting h = g_hosting;
+		unlock();
+		return h;
+	}
+	g_hosting = VT_HOSTING_LOCAL;
+#ifdef VT_HAVE_PAGE
+	if (target_tracking_plugin_disabled_by_env()) {
+		unlock();
+		return g_hosting;
+	}
+	if (g_service_process) {
+		if (owner_create_page()) {
+			bool ran = false;
+			if (g_host_exe[0] != '\0') {
+				g_page_usable =
+				    target_viewer_host_probe(g_host_exe, g_page_name, g_shm.map, -1, 5000,
+				                             g_page_provider, sizeof(g_page_provider), &ran);
+			}
+			if (ran) {
+				g_hosting = VT_HOSTING_OWNER_HOST;
+				if (g_page_usable) {
+					struct target_viewer_host_config cfg;
+					memset(&cfg, 0, sizeof(cfg));
+					cfg.host_exe = g_host_exe;
+					cfg.page_name = g_page_name;
+					cfg.page_mem = g_shm.map;
+					cfg.provider_id = g_page_provider;
+					cfg.geometry = g_geo;
+					cfg.have_geometry = g_have_geo;
+					cfg.trust_enforce = -1;
+					g_host = target_viewer_host_create(&cfg);
+					if (g_host == NULL) {
+						g_page_usable = false;
+					}
+				}
+				U_LOG_W("viewer tracking: provider hosting = out of process (%s): %s%s", g_host_exe,
+				        g_page_usable ? "provider " : "no usable provider",
+				        g_page_usable ? g_page_provider : "");
+			} else {
+				// No host binary (or it would not start): the provider runs
+				// here, its sink writes the page.
+				g_hosting = VT_HOSTING_OWNER_INPROC;
+				if (os_thread_helper_init(&g_inproc_thread) == 0 &&
+				    os_thread_helper_start(&g_inproc_thread, inproc_thread_run, NULL) == 0) {
+					g_inproc_thread_running = true;
+				}
+				U_LOG_W(
+				    "viewer tracking: %s — hosting the provider in the service (it still writes the "
+				    "pose page '%s' for in-process apps)",
+				    g_host_exe[0] != '\0' ? "the tracking host could not be started"
+				                          : "no displayxr-tracking-host beside the service",
+				    g_page_name);
+			}
+		}
+	} else if (reader_attach()) {
+		g_hosting = VT_HOSTING_READER;
+		g_page_usable = true;
+		U_LOG_W(
+		    "viewer tracking: reading the service's viewer pose page '%s' (provider '%s') — no provider "
+		    "loaded in this process",
+		    g_page_name, g_page_provider);
+	}
+#endif
+	const enum vt_hosting h = g_hosting;
+	unlock();
+	return h;
 }
 
 //! -1 = not counted yet; else whether an enabled provider row is registered (listed, never loaded).
@@ -405,9 +629,23 @@ provider_inputs(bool needed, bool count_rows, struct target_viewer_provider_in *
 {
 	memset(out, 0, sizeof(*out));
 	out->hosted = true; // in-process runtime and service both host (one provider per view-computing process)
-	if (needed && target_tracking_plugin_get_count() > 0) {
+	const enum vt_hosting h = needed ? resolve_hosting() : g_hosting;
+	if (needed && (h == VT_HOSTING_OWNER_HOST || h == VT_HOSTING_READER)) {
+		// The page's provider (probed by the host, or the service's): nothing loaded here.
+		out->usable = g_page_usable;
+		out->id = g_page_usable ? g_page_provider : NULL;
+	} else if (needed && target_tracking_plugin_get_count() > 0) {
 		out->usable = true;
 		out->id = target_tracking_plugin_get_row_id(0); // rank order: preferred, then ProbeOrder
+#ifdef VT_HAVE_PAGE
+		if (h == VT_HOSTING_OWNER_INPROC && !g_page_usable) {
+			lock();
+			g_page_usable = true;
+			snprintf(g_page_provider, sizeof(g_page_provider), "%s", out->id);
+			write_owner_inproc(U_VPP_STATE_IDLE);
+			unlock();
+		}
+#endif
 	}
 	out->enabled = out->usable || (count_rows && enabled_rows_exist(false));
 }
@@ -450,6 +688,8 @@ target_viewer_tracking_apply(struct xrt_system_compositor_info *info,
 	geo.nominal_viewer_y_m = pdi->nominal_viewer_y_m;
 	geo.nominal_viewer_z_m = pdi->nominal_viewer_z_m;
 	target_tracking_plugin_set_display_geometry(&geo);
+	g_geo = geo; // the host process gets it on its command line
+	g_have_geo = true;
 
 	struct target_viewer_decision d;
 	target_viewer_tracking_evaluate(plugin, target_plugin_get_active_instance(), pdi->supported_eye_tracking_modes,
@@ -731,10 +971,153 @@ sink_push(const struct xrt_tracking_sink *sink, const struct xrt_tracking_viewer
 	(void)u_eye_history_push(&g_ring, &e, s->capture_ns);
 }
 
+#ifdef VT_HAVE_PAGE
+
+//! OWNER_INPROC: the provider's sink writes the page (its own thread; one producer).
+static void
+sink_push_page(const struct xrt_tracking_sink *sink, const struct xrt_tracking_viewer_sample *s)
+{
+	(void)sink;
+	u_vpp_write_sample(&g_inproc_producer, s);
+}
+
+//! Copy the page's new samples into g_ring. Caller holds the lock.
+static void
+drain_page_locked(void)
+{
+	if (g_shm.map == NULL || !g_ring_ready) {
+		return;
+	}
+	struct xrt_tracking_viewer_sample buf[U_VPP_RING_SIZE];
+	const uint32_t n = u_vpp_read_new(g_shm.map, &g_reader, buf, U_VPP_RING_SIZE);
+	for (uint32_t i = 0; i < n; i++) {
+		sink_push(NULL, &buf[i]);
+	}
+}
+
+/*!
+ * Is somebody producing into the page? OWNER_INPROC: this process. Otherwise
+ * the owner (a reader: the service) must be alive and the producer's
+ * heartbeat fresh (its pid alive). Throttled to one OS liveness check per
+ * 250 ms. Caller holds the lock. A READER whose service went away re-opens
+ * the page by name at most once a second (a restarted service makes a new
+ * one).
+ */
+static bool
+page_live_locked(int64_t now)
+{
+	if (g_hosting == VT_HOSTING_OWNER_INPROC) {
+		return g_started;
+	}
+	if (g_shm.map == NULL) {
+		return false;
+	}
+	const int64_t hb = u_vpp_read_heartbeat(g_shm.map);
+	if (hb == 0 || now - hb > U_VPP_HEARTBEAT_STALE_NS) {
+		g_live_cached = false;
+	} else if (now - g_last_live_check_ns >= (int64_t)250 * 1000 * 1000) {
+		g_last_live_check_ns = now;
+		struct u_vpp_geometry geo;
+		struct u_vpp_producer_status ps;
+		u_vpp_read_geometry(g_shm.map, &geo);
+		g_live_cached = os_process_is_alive((long)geo.owner_pid) && u_vpp_read_producer(g_shm.map, &ps) &&
+		                ps.pid > 0 && os_process_is_alive((long)ps.pid);
+	}
+
+	if (!g_live_cached && g_hosting == VT_HOSTING_READER &&
+	    now - g_last_reattach_ns >= (int64_t)1000 * 1000 * 1000) {
+		g_last_reattach_ns = now;
+		struct u_vpp_geometry geo;
+		u_vpp_read_geometry(g_shm.map, &geo);
+		if (!os_process_is_alive((long)geo.owner_pid)) {
+			// The service went away: a new one makes a new page under the same name.
+			struct os_shm fresh;
+			if (os_shm_open(g_page_name, U_VPP_PAGE_BYTES, true, &fresh) == 0) {
+				struct u_vpp_geometry ng;
+				if (u_vpp_attach_check(fresh.map, fresh.size) &&
+				    (u_vpp_read_geometry(fresh.map, &ng), true) &&
+				    ng.owner_created_ns != g_owner_created_ns &&
+				    os_process_is_alive((long)ng.owner_pid)) {
+					os_shm_close(&g_shm);
+					g_shm = fresh;
+					g_owner_created_ns = ng.owner_created_ns;
+					memset(&g_reader, 0, sizeof(g_reader));
+					g_last_demand_post_ns = 0;
+					U_LOG_W(
+					    "viewer tracking: the service's viewer pose page was re-created — "
+					    "re-attached");
+				} else {
+					os_shm_close(&fresh);
+				}
+			}
+		}
+	}
+	return g_live_cached;
+}
+
+//! OWNER_INPROC: heartbeat, producer status and readers' demand, every 100 ms.
+static void *
+inproc_thread_run(void *ptr)
+{
+	(void)ptr;
+	os_thread_helper_lock(&g_inproc_thread);
+	while (os_thread_helper_is_running_locked(&g_inproc_thread)) {
+		os_thread_helper_unlock(&g_inproc_thread);
+		const int64_t now = (int64_t)os_monotonic_get_ns();
+		lock();
+		const int64_t d = u_vpp_read_demand(g_shm.map);
+		if (!g_started && d > 0 && now - d < U_VPP_DEMAND_FRESH_NS) {
+			start_locked(); // a reader beside the service needs a viewer
+		}
+		if (g_started) {
+			u_vpp_heartbeat(g_shm.map, now);
+		}
+		unlock();
+		os_nanosleep((int64_t)100 * 1000 * 1000);
+		os_thread_helper_lock(&g_inproc_thread);
+	}
+	os_thread_helper_unlock(&g_inproc_thread);
+	return NULL;
+}
+
+#endif // VT_HAVE_PAGE
+
 //! Caller holds the lock.
 static void
 start_locked(void)
 {
+	if (!g_ring_ready) {
+		u_eye_history_init(&g_ring);
+		g_ring_ready = true;
+	}
+#ifdef VT_HAVE_PAGE
+	if (g_hosting == VT_HOSTING_OWNER_HOST) {
+		if (!g_started && g_host != NULL) {
+			target_viewer_host_demand(g_host);
+			g_started = true;
+			U_LOG_W(
+			    "viewer tracking: provider '%s' requested on demand (first viewer request) — hosted in "
+			    "displayxr-tracking-host, one instance for every client and in-process app",
+			    g_page_provider);
+		}
+		return;
+	}
+	if (g_hosting == VT_HOSTING_READER) {
+		const int64_t now = (int64_t)os_monotonic_get_ns();
+		if (!g_started || now - g_last_demand_post_ns >= (int64_t)1000 * 1000 * 1000) {
+			u_vpp_post_demand(g_shm.map, now);
+			g_last_demand_post_ns = now;
+		}
+		if (!g_started) {
+			g_started = true;
+			U_LOG_W(
+			    "viewer tracking: provider '%s' requested from the service's pose page (first viewer "
+			    "request)",
+			    g_page_provider);
+		}
+		return;
+	}
+#endif
 	if (g_started || g_provider_index < 0) {
 		return;
 	}
@@ -742,13 +1125,15 @@ start_locked(void)
 	if (iface == NULL) {
 		return;
 	}
-	if (!g_ring_ready) {
-		u_eye_history_init(&g_ring);
-		g_ring_ready = true;
-	}
 	memset(&g_sink, 0, sizeof(g_sink));
 	g_sink.struct_size = (uint32_t)sizeof(g_sink);
 	g_sink.push = sink_push;
+#ifdef VT_HAVE_PAGE
+	if (g_hosting == VT_HOSTING_OWNER_INPROC) {
+		u_vpp_producer_begin(&g_inproc_producer, g_shm.map);
+		g_sink.push = sink_push_page;
+	}
+#endif
 	const xrt_result_t xret = iface->start(target_tracking_plugin_get_instance(g_provider_index), &g_sink);
 	if (xret != XRT_SUCCESS) {
 		if (!g_warned_start_failed) {
@@ -759,6 +1144,18 @@ start_locked(void)
 		return;
 	}
 	g_started = true;
+#ifdef VT_HAVE_PAGE
+	if (g_hosting == VT_HOSTING_OWNER_INPROC) {
+		struct u_vpp_producer_status ps;
+		memset(&ps, 0, sizeof(ps));
+		ps.pid = (int64_t)os_process_current_pid();
+		ps.provider_status = XRT_TRACKING_PROVIDER_STATUS_RUNNING;
+		snprintf(ps.provider_id, sizeof(ps.provider_id), "%s", g_page_provider);
+		u_vpp_write_producer(g_shm.map, &ps);
+		u_vpp_heartbeat(g_shm.map, (int64_t)os_monotonic_get_ns());
+		write_owner_inproc(U_VPP_STATE_RUNNING);
+	}
+#endif
 	U_LOG_W("viewer tracking: provider '%s' started on demand (first viewer request%s).",
 	        target_tracking_plugin_get_row_id(g_provider_index),
 	        g_service_process ? ", service: one instance for every IPC client" : "");
@@ -821,6 +1218,13 @@ vt_get_eyes_at(struct xrt_viewer_tracking *vt, uint64_t screen_id, int64_t targe
 	}
 	start_locked();
 	const bool started = g_started;
+	bool live = true;
+#ifdef VT_HAVE_PAGE
+	if (started && g_hosting != VT_HOSTING_LOCAL && g_hosting != VT_HOSTING_UNRESOLVED) {
+		drain_page_locked();
+		live = page_live_locked((int64_t)os_monotonic_get_ns());
+	}
+#endif
 	unlock();
 	if (!started) {
 		return false;
@@ -829,6 +1233,10 @@ vt_get_eyes_at(struct xrt_viewer_tracking *vt, uint64_t screen_id, int64_t targe
 	memset(&e, 0, sizeof(e));
 	if (u_eye_history_get(&g_ring, target_ns, &e) == U_EYE_HISTORY_RESULT_EMPTY) {
 		return false;
+	}
+	if (!live) {
+		// Producer gone (host crashed / restarting, service gone): last known, not tracking.
+		e.is_tracking = false;
 	}
 	// The samples are in the primary's display space; this screen's is offset.
 	for (uint32_t i = 0; i < e.count && i < XRT_MAX_VIEWS; i++) {
@@ -857,8 +1265,38 @@ target_viewer_tracking_provider_running(uint32_t *out_status)
 	lock();
 	const bool started = g_started;
 	const int idx = g_provider_index;
-	unlock();
+	const enum vt_hosting hosting = g_hosting;
 	uint32_t st = XRT_TRACKING_PROVIDER_STATUS_STOPPED;
+#ifdef VT_HAVE_PAGE
+	bool page_started = started;
+	if (hosting == VT_HOSTING_OWNER_HOST || hosting == VT_HOSTING_READER) {
+		// Started by anyone: this process's demand, or (the page is shared)
+		// another reader's — the host's / owner's state says.
+		struct u_vpp_owner_status o;
+		if (!page_started && g_shm.map != NULL && u_vpp_read_owner(g_shm.map, &o)) {
+			page_started = o.state == U_VPP_STATE_STARTING || o.state == U_VPP_STATE_RUNNING ||
+			               o.state == U_VPP_STATE_BACKOFF;
+		}
+	}
+	if (page_started && (hosting == VT_HOSTING_OWNER_HOST || hosting == VT_HOSTING_READER)) {
+		// What the producer says about itself, when it is there at all.
+		struct u_vpp_producer_status ps;
+		if (!g_ring_ready) {
+			u_eye_history_init(&g_ring);
+			g_ring_ready = true;
+		}
+		const bool live = page_live_locked((int64_t)os_monotonic_get_ns());
+		st = live && u_vpp_read_producer(g_shm.map, &ps) ? ps.provider_status
+		                                                 : (uint32_t)XRT_TRACKING_PROVIDER_STATUS_NO_SOURCE;
+		unlock();
+		if (out_status != NULL) {
+			*out_status = st;
+		}
+		return true;
+	}
+#endif
+	(void)hosting;
+	unlock();
 	if (started && idx >= 0) {
 		const struct xrt_tracking_plugin_iface *iface = target_tracking_plugin_get_iface(idx);
 		st = XRT_TRACKING_PLUGIN_IFACE_HAS(iface, get_status)
@@ -878,6 +1316,13 @@ target_viewer_tracking_provider_state(const struct target_viewer_decision *d)
 	const bool started = target_viewer_tracking_provider_running(&st);
 	bool producing = false;
 	if (started && st != XRT_TRACKING_PROVIDER_STATUS_NO_SOURCE && st != XRT_TRACKING_PROVIDER_STATUS_STOPPED) {
+#ifdef VT_HAVE_PAGE
+		lock();
+		if (g_hosting != VT_HOSTING_LOCAL && g_hosting != VT_HOSTING_UNRESOLVED) {
+			drain_page_locked();
+		}
+		unlock();
+#endif
 		// Fresh samples: the ring answers "now" without going stale.
 		struct xrt_eye_positions e;
 		memset(&e, 0, sizeof(e));
@@ -890,16 +1335,90 @@ target_viewer_tracking_provider_state(const struct target_viewer_decision *d)
 }
 
 void
+target_viewer_tracking_get_hosting(struct target_viewer_hosting_info *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	lock();
+	const enum vt_hosting h = g_hosting;
+	switch (h) {
+	case VT_HOSTING_LOCAL: snprintf(out->hosting, sizeof(out->hosting), "in_process"); break;
+	case VT_HOSTING_OWNER_HOST: snprintf(out->hosting, sizeof(out->hosting), "host"); break;
+	case VT_HOSTING_OWNER_INPROC: snprintf(out->hosting, sizeof(out->hosting), "service"); break;
+	case VT_HOSTING_READER: snprintf(out->hosting, sizeof(out->hosting), "page"); break;
+	case VT_HOSTING_UNRESOLVED:
+	default: break;
+	}
+#ifdef VT_HAVE_PAGE
+	struct target_viewer_host *host = g_host;
+	void *page = g_shm.map;
+	unlock();
+	if (h == VT_HOSTING_OWNER_HOST && host != NULL) {
+		struct target_viewer_host_status hs;
+		target_viewer_host_get_status(host, &hs);
+		out->host_pid = hs.pid;
+		out->restarts = hs.restarts;
+		snprintf(out->host_state, sizeof(out->host_state), "%s",
+		         u_vpp_state_str(target_vhost_sup_page_state(hs.state)));
+	} else if (h == VT_HOSTING_READER && page != NULL) {
+		struct u_vpp_owner_status o;
+		if (u_vpp_read_owner(page, &o)) {
+			out->host_pid = o.host_pid;
+			out->restarts = o.restarts;
+			snprintf(out->host_state, sizeof(out->host_state), "%s", u_vpp_state_str(o.state));
+		}
+	} else if (h == VT_HOSTING_OWNER_INPROC) {
+		out->host_pid = (int64_t)os_process_current_pid();
+		snprintf(out->host_state, sizeof(out->host_state), "%s", g_started ? "running" : "idle");
+	}
+#else
+	unlock();
+#endif
+}
+
+void
 target_viewer_tracking_shutdown(void)
 {
+#ifdef VT_HAVE_PAGE
+	// The host manager and the in-process page thread take the lock themselves.
 	lock();
-	if (g_started && g_provider_index >= 0) {
+	struct target_viewer_host *host = g_host;
+	g_host = NULL;
+	const bool inproc_thread = g_inproc_thread_running;
+	g_inproc_thread_running = false;
+	unlock();
+	if (host != NULL) {
+		target_viewer_host_destroy(&host);
+	}
+	if (inproc_thread) {
+		os_thread_helper_destroy(&g_inproc_thread);
+	}
+#endif
+	lock();
+	if (g_started && g_provider_index >= 0 && g_hosting != VT_HOSTING_OWNER_HOST &&
+	    g_hosting != VT_HOSTING_READER) {
 		const struct xrt_tracking_plugin_iface *iface = target_tracking_plugin_get_iface(g_provider_index);
 		if (iface != NULL) {
 			iface->stop(target_tracking_plugin_get_instance(g_provider_index));
 		}
-		g_started = false;
 	}
+	g_started = false;
+#ifdef VT_HAVE_PAGE
+	if (g_shm.map != NULL) {
+		if (g_hosting == VT_HOSTING_OWNER_INPROC) {
+			write_owner_inproc(U_VPP_STATE_STOPPED);
+		}
+		os_shm_close(&g_shm);
+	}
+	memset(&g_reader, 0, sizeof(g_reader));
+	g_last_demand_post_ns = 0;
+	g_live_cached = false;
+#endif
+	g_hosting = VT_HOSTING_UNRESOLVED;
+	g_page_usable = false;
+	g_page_provider[0] = '\0';
 	if (g_ring_ready) {
 		u_eye_history_clear(&g_ring);
 	}

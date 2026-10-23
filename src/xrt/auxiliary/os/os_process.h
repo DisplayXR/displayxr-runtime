@@ -176,6 +176,15 @@ long
 os_process_current_pid(void);
 
 /*!
+ * Does process @p pid exist (and has not exited)? Any process, not only a
+ * child: Windows OpenProcess + GetExitCodeProcess (access denied = it
+ * exists), POSIX kill(pid, 0) (EPERM = it exists). A recycled pid reads as
+ * alive — callers pair it with a heartbeat. false for pid <= 0.
+ */
+bool
+os_process_is_alive(long pid);
+
+/*!
  * Windows: true when the named mutex @p name exists and another process holds
  * it (opened with SYNCHRONIZE, probed with a zero wait and released at once
  * if it was free). The maintenance-mutex check of roadmap §3.6. POSIX: false.

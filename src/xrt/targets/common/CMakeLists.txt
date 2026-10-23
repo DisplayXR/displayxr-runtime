@@ -16,6 +16,7 @@ add_library(
 			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
 			    target_tracking_plugin_loader.c target_tracking_plugin_loader.h
 			    target_viewer_tracking.c target_viewer_tracking.h
+			    target_viewer_host.c target_viewer_host.h
 			    target_conv_status.c target_conv_status.h
 			    target_conv_store.c
 			    target_plugin_loader.c target_plugin_loader.h

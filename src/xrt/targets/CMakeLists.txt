@@ -45,6 +45,12 @@ if(XRT_FEATURE_SERVICE AND NOT ANDROID)
 	add_subdirectory(conversion_host)
 endif()
 
+# ADR-054 N8 / tracking-provider-discovery §4a: the viewer-tracking provider's
+# own host process, spawned and supervised by the service. Desktop only.
+if(XRT_FEATURE_SERVICE AND NOT ANDROID)
+	add_subdirectory(tracking_host)
+endif()
+
 # Android diagnostics dashboard JNI bridge (#558) — reuses the CLI's
 # query core, so it needs targets/cli configured.
 if(ANDROID AND XRT_MODULE_CLI)
