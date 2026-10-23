@@ -21,7 +21,7 @@ namespace DisplayXR.Dashboard.Ui;
 
 /// <summary>
 /// The camera-pose calibration window (tracking-provider-discovery.md §6, design §10): borderless
-/// and full screen on the target monitor, black, a dim ring at the edges to light the face, a white
+/// and full screen on the target monitor, black, a bright ring at the edges to light the face (+ / - adjust it), a white
 /// cross on each target in turn, the solve result, and the live-check dot. All the logic is in
 /// <see cref="CalibrationSession"/>; this class draws it, feeds it keys and the CLI's output, and owns
 /// the one long-lived <c>tracking calibrate --watch --json</c> child (stopped on Esc, on close and as
@@ -39,7 +39,9 @@ public sealed class CalibrationWindow : Window
     private bool _busy;
 
     private readonly Canvas _canvas = new();
-    private readonly Border _ring = new() { BorderBrush = new SolidColorBrush(Color.FromRgb(0x38, 0x38, 0x38)), IsHitTestVisible = false };
+    private readonly Border _ring = new() { IsHitTestVisible = false };
+    // The ring lights the face so its reflection is visible: bright by default, + / - to adjust.
+    private byte _ringLevel = 0xE0;
     private readonly Rectangle _crossH = new() { Fill = Brushes.White };
     private readonly Rectangle _crossV = new() { Fill = Brushes.White };
     private readonly Ellipse _hold = new() { Stroke = new SolidColorBrush(Color.FromRgb(0x50, 0x50, 0x50)), StrokeThickness = 1.5, Width = 34, Height = 34 };
@@ -84,6 +86,27 @@ public sealed class CalibrationWindow : Window
         Content = new Grid { Children = { _ring, _canvas, _textPanel, _review } };
 
         AddHandler(KeyDownEvent, OnKey, RoutingStrategies.Tunnel);
+        // macOS delivers no KeyDown for Space here (seen on a MacBook: every other key
+        // arrives, Space never does), but it does arrive as text input; take it there.
+        AddHandler(TextInputEvent, (_, e) =>
+        {
+            if (e.Text == " ")
+            {
+                DashboardLog.Info($"calibration: space via text input (phase {_session.Phase})");
+                e.Handled = true;
+                _session.Space();
+                Step();
+            }
+        }, RoutingStrategies.Tunnel);
+        // A click anywhere also captures: on macOS a full-screen window may not hold
+        // keyboard focus until it is clicked, and the click then also gives it focus.
+        PointerPressed += (_, _) =>
+        {
+            Activate();
+            Focus();
+            _session.Space();
+            Step();
+        };
         Opened += (_, _) => OnOpened();
         Closed += (_, _) => StopChild();
         SizeChanged += (_, _) => Render();
@@ -104,6 +127,10 @@ public sealed class CalibrationWindow : Window
         WindowState = WindowState.FullScreen;
         Activate();
         Focus();
+        // macOS animates a full-screen window into its own Space and the activation
+        // above is lost during that transition (the first key beeps). Take key focus
+        // again once it has settled.
+        DispatcherTimer.RunOnce(() => { Activate(); Focus(); }, TimeSpan.FromMilliseconds(600));
         try
         {
             _child = _cli.StartStream(CalibrationCommands.Watch(_session.ScreenKey),
@@ -139,6 +166,7 @@ public sealed class CalibrationWindow : Window
 
     private void OnKey(object? sender, KeyEventArgs e)
     {
+        DashboardLog.Info($"calibration: key {e.Key} (phase {_session.Phase}, stable {_session.Stable})");
         e.Handled = true;
         switch (e.Key)
         {
@@ -157,6 +185,8 @@ public sealed class CalibrationWindow : Window
         case Key.Right: _session.Nudge(1, 0); break;
         case Key.Up: _session.Nudge(0, 1); break;
         case Key.Down: _session.Nudge(0, -1); break;
+        case Key.OemPlus or Key.Add: _ringLevel = (byte)Math.Min(0xFF, _ringLevel + 0x20); break;
+        case Key.OemMinus or Key.Subtract: _ringLevel = (byte)Math.Max(0x20, _ringLevel - 0x20); break;
         default: e.Handled = false; return;
         }
         Step();
@@ -224,6 +254,7 @@ public sealed class CalibrationWindow : Window
         _ring.Margin = new Thickness(m * 0.02);
         _ring.BorderThickness = new Thickness(m * 0.05);
         _ring.CornerRadius = new CornerRadius(m * 0.06);
+        _ring.BorderBrush = new SolidColorBrush(Color.FromRgb(_ringLevel, _ringLevel, _ringLevel));
 
         var g = _session.Geometry;
         var dot = _session.CurrentDot;
