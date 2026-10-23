@@ -77,6 +77,14 @@ extern "C" {
 //! Default `HAND_DISTANCE_M`: circle centre's distance in front of the glass (metres, NOT scaled).
 #define SIM_INPUT_HAND_DISTANCE_DEFAULT_M 0.25f
 
+/*!
+ * Default `HAND_SCALE_H_PER_M`: display heights of hand per metre of real hand,
+ * the same gain the Ultraleap provider's relative mapping uses
+ * (`ultraleap_map.h`, `UL_MAP_DEFAULT_GAIN_H_PER_M` — the reference viewer
+ * app's scene). On a 0.194 m panel a 10 cm hand shows as 0.25 H = 4.9 cm.
+ */
+#define SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M 2.5f
+
 //! `HANDS` setting: which hands are tracked.
 enum sim_input_hands_mode
 {
@@ -144,6 +152,31 @@ sim_input_hand_center(bool left, float distance_m, float display_height_m, float
  */
 float
 sim_input_hand_radius(float display_height_m, float distance_m, float viewer_z_m);
+
+/*!
+ * The hand's size factor (metres of drawn hand per metre of real hand):
+ * @p gain_h_per_m · H, with H = @p display_height_m or
+ * @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M. @p gain_h_per_m <= 0 or
+ * non-finite = 1 (1:1 metres, the pre-gain behaviour).
+ *
+ * Display-metric on purpose: H is the PHYSICAL panel, never the window /
+ * canvas, so the hand's size does not follow the window — the same as a real
+ * Leap seen through the window as a portal.
+ */
+float
+sim_input_hand_scale(float gain_h_per_m, float display_height_m);
+
+/*!
+ * Scale a simulated joint set about its root (`hand_pose`, the circle point
+ * the grip / aim / palm poses ride — the wrist of `u_hand_simulation`'s hand)
+ * by @p scale. The joint relations are hand-local (the state tracker composes
+ * `hand_pose` onto them), so each joint's position, its linear velocity and
+ * its radius are multiplied. `hand_pose` itself — and so the circle centre
+ * and radius — is unchanged. @p scale <= 0
+ * or non-finite, or exactly 1, leaves the set untouched.
+ */
+void
+sim_input_hand_scale_joints(struct xrt_hand_joint_set *set, float scale);
 
 /*!
  * The scripted root/grip relation at @p at_timestamp_ns: @p center plus a

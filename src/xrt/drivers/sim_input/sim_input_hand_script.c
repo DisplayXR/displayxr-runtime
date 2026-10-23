@@ -158,6 +158,38 @@ sim_input_hand_radius(float display_height_m, float distance_m, float viewer_z_m
 	return r * perspective_k(z, viewer_z_m);
 }
 
+float
+sim_input_hand_scale(float gain_h_per_m, float display_height_m)
+{
+	if (!(gain_h_per_m > 0.0f) || !isfinite(gain_h_per_m)) {
+		return 1.0f;
+	}
+	return gain_h_per_m * display_height_or_fallback(display_height_m);
+}
+
+void
+sim_input_hand_scale_joints(struct xrt_hand_joint_set *set, float scale)
+{
+	if (set == NULL || !(scale > 0.0f) || !isfinite(scale) || scale == 1.0f) {
+		return;
+	}
+	// Joint relations are in the HAND frame (`hand_pose`, the root, is
+	// composed on by the state tracker), so scaling about the root is a plain
+	// multiply of the hand-local positions and linear velocities.
+	for (int i = 0; i < XRT_HAND_JOINT_COUNT; i++) {
+		struct xrt_hand_joint_value *j = &set->values.hand_joint_set_default[i];
+		struct xrt_vec3 *p = &j->relation.pose.position;
+		p->x *= scale;
+		p->y *= scale;
+		p->z *= scale;
+		struct xrt_vec3 *v = &j->relation.linear_velocity;
+		v->x *= scale;
+		v->y *= scale;
+		v->z *= scale;
+		j->radius *= scale;
+	}
+}
+
 void
 sim_input_hand_relation(const struct xrt_pose *center,
                         float radius_m,

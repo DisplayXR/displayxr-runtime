@@ -87,6 +87,9 @@ struct sim_input_device
 	//! Which hand this device serves (drives the simulated joint set).
 	enum xrt_hand hand;
 
+	//! `HAND_SCALE_H_PER_M`: joint offsets about the root and radii scale by this.
+	float hand_scale;
+
 	//! #2191 `PINCH`: what the fingers of the simulated hand do.
 	enum sim_input_pinch_mode pinch;
 
@@ -260,6 +263,11 @@ sim_input_get_hand_tracking(struct xrt_device *xdev,
 
 	u_hand_sim_simulate_for_valve_index_knuckles(&curls, sd->hand, &root, out_value);
 
+	// The hand's OWN size at the Leap gain (display heights per metre, like
+	// the Ultraleap provider's relative mapping): joints scale about the
+	// root, so the circle and the grip pose are unchanged.
+	sim_input_hand_scale_joints(out_value, sd->hand_scale);
+
 	return XRT_SUCCESS;
 }
 
@@ -381,6 +389,7 @@ sim_input_create_controller(enum xrt_device_type type, const struct sim_input_co
 	sd->center = sim_input_hand_center(is_left, distance, display_h, viewer_y, viewer_z);
 	sd->radius_m = sim_input_hand_radius(display_h, distance, viewer_z);
 	sd->pinch = config != NULL ? config->pinch : SIM_INPUT_PINCH_WAVE;
+	sd->hand_scale = config != NULL && config->hand_scale > 0.0f ? config->hand_scale : 1.0f;
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).
 	sd->phase_rad = is_left ? M_PI : 0.0;
@@ -392,6 +401,7 @@ sim_input_create_controller(enum xrt_device_type type, const struct sim_input_co
 	u_var_add_root(sd, sd->base.str, true);
 	u_var_add_pose(sd, &sd->center, "center");
 	u_var_add_bool(sd, &sd->active, "active");
+	u_var_add_f32(sd, &sd->hand_scale, "hand_scale");
 	u_var_add_ro_u64(sd, &sd->haptic_event_count, "haptic_event_count");
 	u_var_add_ro_f32(sd, &sd->last_haptic_amplitude, "last_haptic_amplitude");
 	u_var_add_ro_f32(sd, &sd->last_haptic_frequency, "last_haptic_frequency");

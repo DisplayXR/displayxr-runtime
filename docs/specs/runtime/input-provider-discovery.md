@@ -920,9 +920,18 @@ new):
 | `HANDS` | enum | `both` | `both` \| `left` \| `right` \| `none` — which hands track. A hand left out stays a device (roles unchanged) but is never active: invalid poses, `isActive` false. |
 | `PINCH` | enum | `wave` | `wave` — the #825 open→fist curl wave (3 s), both hands staggered half a cycle; `hold` — thumb and index tips held pinched (≈ 6.5 mm apart), other fingers relaxed; `open` — every finger relaxed, never a pinch. `HANDS=right PINCH=hold` is a single sustained pinch whose root moves on the circle: a one-hand drag. |
 | `HAND_DISTANCE_M` | float | `0.25` | distance of the circle centres in front of the glass, metres; ≤ 0 / unparseable = the default |
+| `HAND_SCALE_H_PER_M` | float | `2.5` | the hand's **own** size, in display heights per metre of real hand: joint offsets about the root (wrist / palm) and joint radii (and joint linear velocities relative to the root) scale by `gain·H`. The default is the Ultraleap provider's relative-mapping gain, so the sim hand is drawn the way the reference viewer app shows a Leap hand — a 10 cm hand on a 0.194 m panel shows as 0.25·H ≈ 4.9 cm. ≤ 0 = 1:1 metres (the pre-gain behaviour). The circle centres and radius are unchanged (the circle is already in display heights) |
+
+**The sim hands are display-metric and do not follow the window canvas.**
+`H` in the placement and in `HAND_SCALE_H_PER_M` is the PHYSICAL display
+height, never the window or canvas, so resizing or moving an app's window
+neither moves nor resizes the hands — the same as a real Leap seen through the
+window as a portal (the Ultraleap provider's relative mapping is display-metric
+in the same way).
 
 Pinned by `tests/tests_sim_input_hands.cpp` (the pure script: placement, the
-pinch-hold tip gap through the real `u_hand_simulation`) and end to end by the
+pinch-hold tip gap through the real `u_hand_simulation`, the hand scale — 0.25·H
+± 10% per 10 cm of real hand by default, 1:1 at 0) and end to end by the
 `[rig_hands]` / `[rig_hands_hold]` arms of `tests_oxr_view_space` (wrists
 located in LOCAL against the `displayPlanePose` `xrLocateViews` reports).
 
