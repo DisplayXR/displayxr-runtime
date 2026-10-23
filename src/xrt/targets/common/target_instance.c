@@ -1020,6 +1020,13 @@ resolve_render_adapter_luid(const struct xrt_plugin_display_info *pdi)
  * On a size match this function also becomes the AUTHORITY on the panel's
  * origin, overriding the plug-in's (0, 0) — see the comment at the assignment
  * for why a wrong origin is worse than an unknown one.
+ *
+ * Before any of that, the active plug-in's own per-monitor claim (the
+ * registry `build_dp_registry` just resolved) is consulted — the claim rule,
+ * displayxr-leia-plugin#430: a plug-in that identified its panel through
+ * `probe_displays` but could not report an origin from `get_display_info`
+ * used to get the primary monitor on Windows, which has no enumeration for
+ * the size rules. Callers must build the registry first.
  */
 static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info)
@@ -1048,7 +1055,25 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	    .height_m = info->display_height_m,
 	};
 
-	if (!os_display_desktop_info_for_panel(&hint, &desktop, &match)) {
+	// The claim rule first (displayxr-leia-plugin#430): the monitor the
+	// active plug-in's own probe_displays claimed — the per-screen registry
+	// every screen list, the Dashboard and the segment DPs are built from —
+	// resolved by OS identity. It fires when the plug-in reported no origin
+	// (which on Windows used to go straight to the primary monitor, since
+	// Windows has no enumeration for the size rules), or reported one that
+	// lands on none of its claimed monitors while one of them is VERIFIED.
+	// An origin that agrees with a claim keeps the origin rule untouched.
+	bool claim_overrides_origin = false;
+	bool resolved = false;
+	if (target_screens_panel_from_claims(&info->dp_registry, info->active_plugin_id, &hint, &desktop,
+	                                     &claim_overrides_origin)) {
+		match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
+		resolved = true;
+	} else {
+		resolved = os_display_desktop_info_for_panel(&hint, &desktop, &match);
+	}
+
+	if (!resolved) {
 		// No implementation on this platform, or the query failed. Leave the
 		// zeroed defaults, which XR_DXR_display_info defines as "unknown".
 		U_LOG_I("Panel desktop rect unavailable for origin (%d, %d); apps get 'unknown'.",
@@ -1100,9 +1125,13 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	// when that space is scaled — and an app that cannot weave there still
 	// belongs on the panel, not on the laptop.
 	const bool origin_from_plugin = match.rule == OS_DISPLAY_DESKTOP_RULE_ORIGIN;
+	//
+	// The claim rule earns it too, for the same reason as the connector rule:
+	// the monitor was identified (by the plug-in's own claim, resolved by OS
+	// identity), so its origin IS the panel's, whatever the plug-in reported.
 	const bool origin_from_size_match =
 	    (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel) ||
-	    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE;
+	    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE || match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM;
 
 	if (origin_from_size_match &&
 	    (desktop.left != info->display_screen_left || desktop.top != info->display_screen_top)) {
@@ -1112,7 +1141,12 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 		    "origin both follow the resolver.",
 		    (int)plugin_left, (int)plugin_top, (int)desktop.left, (int)desktop.top,
 		    desktop.device_name[0] != '\0' ? desktop.device_name : "?",
-		    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ? "its connector's mode" : "size");
+		    match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM
+		        ? (claim_overrides_origin ? "the plug-in's VERIFIED display claim (its origin is on no "
+		                                    "monitor it claims)"
+		                                  : "the plug-in's display claim")
+		    : match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ? "its connector's mode"
+		                                                           : "size");
 	}
 
 	if (origin_from_plugin || origin_from_size_match) {

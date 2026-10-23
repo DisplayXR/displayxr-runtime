@@ -383,9 +383,34 @@ os_display_edid_linux_join(const struct os_display_desktop_info *randr,
 	}
 
 	// Pass 3: device mode, only when exactly one unused enabled connector has it.
+	//
+	// A pixel mode is a coincidence, not an identity, so this pass only joins
+	// a RandR monitor that shows SOME physical evidence of being a real
+	// output: a physical size, or a DRM connector carrying its name. One with
+	// neither is a virtual monitor (an `xrandr --setmonitor` region, a
+	// VNC/RDP/headless dummy output: 0 x 0 mm, a name no connector has) and
+	// must never inherit a real connector's EDID — that would let a vendor
+	// plug-in claim it as its panel. Requiring BOTH (mm AND a name) would
+	// also drop every XWayland output (named XWAYLANDn, never a connector
+	// name) whose millimetres merely tied in pass 2, which is the case this
+	// pass exists for.
 	for (uint32_t i = 0; i < rn; i++) {
 		if (how[i] != OS_EDID_JOIN_NONE) {
 			continue;
+		}
+		if (randr[i].physical_width_mm == 0 || randr[i].physical_height_mm == 0) {
+			bool named = false;
+			for (uint32_t j = 0; j < drm_count && rname[i][0] != '\0'; j++) {
+				char dname[64];
+				drm_name_for_randr(&drm[j], dname, sizeof(dname));
+				if (strcmp(rname[i], dname) == 0) {
+					named = true;
+					break;
+				}
+			}
+			if (!named) {
+				continue;
+			}
 		}
 		uint32_t w = 0, h = 0;
 		randr_device_mode(&randr[i], &w, &h);

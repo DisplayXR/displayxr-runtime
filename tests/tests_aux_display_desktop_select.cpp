@@ -191,3 +191,115 @@ TEST_CASE("panel 1:1: rule names")
 	CHECK(std::strcmp(os_display_desktop_rule_str(OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE), "connector match") == 0);
 	CHECK(std::strcmp(os_display_desktop_rule_str(OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH), "size match") == 0);
 }
+
+/*
+ * The claim rule (displayxr-leia-plugin#430): the field box was a Windows
+ * laptop (primary 2560x1600 at 0,0) with a Lenovo 3D monitor on \\.\DISPLAY5 at
+ * (-3840, 0), SR-VERIFIED by the plug-in's probe_displays, while its
+ * get_display_info reported no origin — so the panel rect went to the laptop.
+ */
+namespace {
+
+os_display_panel_claim
+claim(int32_t left, uint32_t w, uint32_t h, bool verified, bool primary = false, int32_t top = 0)
+{
+	os_display_panel_claim c = {};
+	c.left = left;
+	c.top = top;
+	c.width = w;
+	c.height = h;
+	c.verified = verified;
+	c.is_primary = primary;
+	return c;
+}
+
+} // namespace
+
+TEST_CASE("claim select: #430 repro — no origin, one VERIFIED claim on a non-main monitor wins")
+{
+	const os_display_panel_claim claims[] = {claim(-3840, 3840, 2160, true)};
+	const os_display_panel_hint h = panel_hint();
+	bool overrides = true;
+	CHECK(os_display_desktop_select_claim(claims, 1, &h, &overrides) == 0);
+	CHECK_FALSE(overrides); // nothing was reported, so nothing is overridden
+}
+
+TEST_CASE("claim select: no origin, an EDID-level claim also wins (it beats the primary fallback)")
+{
+	const os_display_panel_claim claims[] = {claim(2560, 3840, 2160, false)};
+	const os_display_panel_hint h = panel_hint();
+	CHECK(os_display_desktop_select_claim(claims, 1, &h, nullptr) == 0);
+}
+
+TEST_CASE("claim select: no claims never fires")
+{
+	const os_display_panel_hint h = panel_hint();
+	bool overrides = true;
+	CHECK(os_display_desktop_select_claim(nullptr, 0, &h, &overrides) == -1);
+	CHECK_FALSE(overrides);
+}
+
+TEST_CASE("claim select: an origin INSIDE a claimed monitor leaves the origin rule in charge")
+{
+	const os_display_panel_claim claims[] = {claim(-3840, 3840, 2160, true)};
+	os_display_panel_hint h = panel_hint();
+	h.screen_left = -3840;
+	CHECK(os_display_desktop_select_claim(claims, 1, &h, nullptr) == -1);
+	h.screen_left = -1; // last column of the panel
+	h.screen_top = 2159;
+	CHECK(os_display_desktop_select_claim(claims, 1, &h, nullptr) == -1);
+}
+
+TEST_CASE("claim select: an origin on no claimed monitor yields to a VERIFIED claim only")
+{
+	os_display_panel_hint h = panel_hint();
+	h.screen_left = 2560; // a monitor the plug-in does not claim (stale / wrong DPI space)
+
+	const os_display_panel_claim verified[] = {claim(-3840, 3840, 2160, true)};
+	bool overrides = false;
+	CHECK(os_display_desktop_select_claim(verified, 1, &h, &overrides) == 0);
+	CHECK(overrides);
+
+	// An EDID-table match is no stronger than the origin the same plug-in
+	// computed: the origin rule keeps it.
+	const os_display_panel_claim edid_only[] = {claim(-3840, 3840, 2160, false)};
+	overrides = true;
+	CHECK(os_display_desktop_select_claim(edid_only, 1, &h, &overrides) == -1);
+	CHECK_FALSE(overrides);
+}
+
+TEST_CASE("claim select: several claims — verified, then the panel's size, then non-primary, then order")
+{
+	const os_display_panel_hint h = panel_hint();
+
+	const os_display_panel_claim by_verified[] = {claim(0, 3840, 2160, false), claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(by_verified, 2, &h, nullptr) == 1);
+
+	const os_display_panel_claim by_size[] = {claim(0, 2560, 1440, false), claim(2560, 3840, 2160, false)};
+	CHECK(os_display_desktop_select_claim(by_size, 2, &h, nullptr) == 1);
+
+	const os_display_panel_claim by_primary[] = {claim(0, 3840, 2160, false, true),
+	                                             claim(3840, 3840, 2160, false, false)};
+	CHECK(os_display_desktop_select_claim(by_primary, 2, &h, nullptr) == 1);
+
+	const os_display_panel_claim by_order[] = {claim(0, 3840, 2160, true), claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(by_order, 2, &h, nullptr) == 0);
+}
+
+TEST_CASE("claim select: an overriding origin only ever lands on a VERIFIED claim")
+{
+	os_display_panel_hint h = panel_hint();
+	h.screen_left = 9999;
+	// The EDID-level claim is the panel's size; the verified one is not. A
+	// contradicted origin is replaced by verified evidence, never by an
+	// EDID-table match.
+	const os_display_panel_claim claims[] = {claim(0, 3840, 2160, false), claim(3840, 2560, 1440, true)};
+	bool overrides = false;
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, &overrides) == 1);
+	CHECK(overrides);
+}
+
+TEST_CASE("claim rule: name")
+{
+	CHECK(std::strcmp(os_display_desktop_rule_str(OS_DISPLAY_DESKTOP_RULE_CLAIM), "plug-in claim") == 0);
+}

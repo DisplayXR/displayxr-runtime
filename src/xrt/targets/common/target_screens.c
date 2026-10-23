@@ -15,6 +15,7 @@
 #include "os/os_display_desktop.h"
 #include "util/u_screen_info.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -271,4 +272,97 @@ target_screens_build(const struct xrt_dp_factory_registry *reg,
 		build_from_entry(e, false, false, sys, desk, desk_count, &out->screens[n++]);
 	}
 	out->count = n;
+}
+
+
+/*
+ *
+ * The claim rule (displayxr-leia-plugin#430).
+ *
+ */
+
+//! Does @p iface implement `probe_displays` itself (vs the loader synthesizing its claim)?
+static bool
+iface_has_probe_displays(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, probe_displays) + sizeof(iface->probe_displays) &&
+	       iface->probe_displays != NULL;
+}
+
+uint32_t
+target_screens_collect_panel_claims(const struct xrt_dp_factory_registry *reg,
+                                    const char *active_plugin_id,
+                                    struct os_display_panel_claim *out_claims,
+                                    struct os_display_edid_monitor *out_mons,
+                                    uint32_t max)
+{
+	if (reg == NULL || out_claims == NULL || max == 0 || active_plugin_id == NULL || active_plugin_id[0] == '\0') {
+		return 0;
+	}
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES && n < max; i++) {
+		const struct xrt_dp_registry_entry *e = &reg->entries[i];
+		if (strcmp(e->plugin_id, active_plugin_id) != 0 || e->not_ready ||
+		    e->confidence < (uint32_t)XRT_DISPLAY_CLAIM_EDID ||
+		    !iface_has_probe_displays((const struct xrt_plugin_iface *)e->owning_iface)) {
+			continue;
+		}
+		struct os_display_edid_monitor mon;
+		memset(&mon, 0, sizeof(mon));
+		if (!target_plugin_get_monitor_record(e->monitor_id, NULL, &mon) || mon.origin_unknown ||
+		    mon.pixel_width == 0 || mon.pixel_height == 0) {
+			continue;
+		}
+		struct os_display_panel_claim *c = &out_claims[n];
+		memset(c, 0, sizeof(*c));
+		c->left = mon.screen_left;
+		c->top = mon.screen_top;
+		c->width = mon.pixel_width;
+		c->height = mon.pixel_height;
+		c->verified = e->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
+		c->is_primary = mon.is_primary;
+		if (out_mons != NULL) {
+			out_mons[n] = mon;
+		}
+		n++;
+	}
+	return n;
+}
+
+bool
+target_screens_panel_from_claims(const struct xrt_dp_factory_registry *reg,
+                                 const char *active_plugin_id,
+                                 const struct os_display_panel_hint *hint,
+                                 struct os_display_desktop_info *out_desktop,
+                                 bool *out_overrides_origin)
+{
+	if (out_overrides_origin != NULL) {
+		*out_overrides_origin = false;
+	}
+	if (out_desktop == NULL) {
+		return false;
+	}
+	struct os_display_panel_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
+	struct os_display_edid_monitor mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t n =
+	    target_screens_collect_panel_claims(reg, active_plugin_id, claims, mons, XRT_DP_REGISTRY_MAX_ENTRIES);
+	bool overrides = false;
+	const int32_t pick = os_display_desktop_select_claim(claims, n, hint, &overrides);
+	if (pick < 0) {
+		return false;
+	}
+	// By identity, never by the claim rect's coordinates: those are in the
+	// host's DPI space, the resolve is per-monitor-v2 (docs/reference/dpi-awareness.md).
+	// Windows: the HMONITOR. macOS / X11: the output name (display UUID /
+	// RandR output), which is os_display_desktop_info::device_name there.
+	const struct os_display_edid_monitor *m = &mons[pick];
+	if (!os_display_desktop_info_for_device(m->hmonitor, m->output_name, out_desktop)) {
+		return false;
+	}
+	if (out_overrides_origin != NULL) {
+		*out_overrides_origin = overrides;
+	}
+	return true;
 }

@@ -2127,7 +2127,17 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		    .width_m = info.display_width_m,
 		    .height_m = info.display_height_m,
 		};
-		r->desktop_info_ok = os_display_desktop_info_for_panel(&hint, &r->desktop_info, &r->desktop_match);
+		// The claim rule first, exactly as fill_display_desktop_info runs it
+		// (displayxr-leia-plugin#430), over the registry probe_dp_selection
+		// just resolved.
+		if (target_screens_panel_from_claims(&g_cli_dp_registry, iface->id, &hint, &r->desktop_info, NULL)) {
+			memset(&r->desktop_match, 0, sizeof(r->desktop_match));
+			r->desktop_match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
+			r->desktop_info_ok = true;
+		} else {
+			r->desktop_info_ok =
+			    os_display_desktop_info_for_panel(&hint, &r->desktop_info, &r->desktop_match);
+		}
 	}
 	// Caller-DPI space on both sides — the plug-in's dims are virtualised
 	// whenever this process is DPI-unaware, so the physical rect is the wrong
@@ -2560,7 +2570,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		const bool overridden =
 		    r->desktop_info_ok &&
 		    ((r->desktop_info_is_panel && r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH) ||
-		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
+		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ||
+		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM) &&
 		    (r->desktop_info.left != i->display_screen_left || r->desktop_info.top != i->display_screen_top);
 		if (overridden) {
 			PT("screen pos:   (%d, %d)  [runtime override by %s; plug-in reported "
@@ -2954,11 +2965,13 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		// True when the runtime publishes THIS rect's origin to apps in place
 		// of the (0, 0) the plug-in reported. `screen_pos` above stays the
 		// plug-in's raw answer.
-		cJSON_AddBoolToObject(dr, "origin_overrides_plugin",
-		                      r->desktop_info_ok && r->desktop_info_is_panel &&
-		                          r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
-		                          (r->desktop_info.left != i->display_screen_left ||
-		                           r->desktop_info.top != i->display_screen_top));
+		cJSON_AddBoolToObject(
+		    dr, "origin_overrides_plugin",
+		    r->desktop_info_ok &&
+		        ((r->desktop_info_is_panel && r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH) ||
+		         r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM) &&
+		        (r->desktop_info.left != i->display_screen_left ||
+		         r->desktop_info.top != i->display_screen_top));
 		cJSON *et = cJSON_AddObjectToObject(d, "eye_tracking");
 		cJSON_AddNumberToObject(et, "supported_modes", (double)i->supported_eye_tracking_modes);
 		cJSON_AddNumberToObject(et, "default_mode", (double)i->default_eye_tracking_mode);

@@ -231,6 +231,14 @@ enum os_display_desktop_rule
 	//! window-placement space is 1:1 there; @ref
 	//! os_display_desktop_info::width says that.
 	OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE,
+
+	//! The active plug-in's own per-monitor claim (`probe_displays`, the
+	//! registry every screen list is built from) named the monitor, and it
+	//! was resolved by OS identity (HMONITOR / output name), not by a point.
+	//! Taken when the plug-in reported no origin, or reported one that lands
+	//! on none of its claimed monitors while one of them is VERIFIED. See
+	//! @ref os_display_desktop_select_claim.
+	OS_DISPLAY_DESKTOP_RULE_CLAIM,
 };
 
 /*!
@@ -300,6 +308,9 @@ os_display_desktop_enumerate(struct os_display_desktop_info *out_infos, uint32_t
  *
  * Rules, in order:
  *
+ * 0. (Caller-side, before this function.) @ref OS_DISPLAY_DESKTOP_RULE_CLAIM
+ *    — the active plug-in's own per-monitor claim, which aux_os cannot see:
+ *    see @ref os_display_desktop_select_claim. This function never returns it.
  * 1. @ref OS_DISPLAY_DESKTOP_RULE_ORIGIN — the hint carries a non-(0,0)
  *    position. Trust it; this is the Windows path and it is unchanged.
  * 2. @ref OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE — a monitor's connector is
@@ -346,6 +357,72 @@ os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
                                   uint32_t count,
                                   const struct os_display_panel_hint *hint,
                                   struct os_display_panel_match *out_match);
+
+/*!
+ * One monitor the ACTIVE display-processor plug-in claimed through
+ * `probe_displays`, as the claim-rule selector sees it. The rect is the
+ * monitor's enumeration record — the same DPI space the plug-in reports its
+ * origin in (the host's), which is the only thing it is compared with.
+ */
+struct os_display_panel_claim
+{
+	int32_t left;
+	int32_t top;
+	uint32_t width;
+	uint32_t height;
+
+	//! The plug-in confirmed the panel with its vendor SDK / service
+	//! (`XRT_DISPLAY_CLAIM_VERIFIED`), not only by an EDID-table match.
+	bool verified;
+
+	bool is_primary;
+};
+
+/*!
+ * The claim rule (displayxr-leia-plugin#430): pick the
+ * monitor the active plug-in's own claim says its panel is on. Pure policy,
+ * exposed for host tests; the caller builds @p claims from the claim registry
+ * and resolves the pick by OS identity (@ref os_display_desktop_info_for_device).
+ *
+ * - No reported origin ((0, 0)): the claim wins over the size rules and the
+ *   primary fallback. Among several claims: a VERIFIED one, then one whose
+ *   rect is the panel's pixel size, then a non-primary one, then the first.
+ * - A reported origin INSIDE a claimed rect: -1, so the origin rule runs
+ *   exactly as before (the two agree).
+ * - A reported origin on NONE of the claimed monitors: the plug-in
+ *   contradicts itself. A VERIFIED claim wins (@p out_overrides_origin set):
+ *   it is an SDK handshake with that physical monitor, while an origin is one
+ *   coordinate that can be stale after an arrangement change or come from a
+ *   different DPI space. EDID-level claims only do not override (-1).
+ *
+ * @return index into @p claims, or -1 when the claim rule does not fire.
+ */
+int32_t
+os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
+                                uint32_t count,
+                                const struct os_display_panel_hint *hint,
+                                bool *out_overrides_origin);
+
+/*!
+ * Resolve one monitor by OS identity instead of by a point: the platform
+ * handle when there is one (Windows: the HMONITOR from the EDID enumeration,
+ * resolved under a pinned per-monitor-v2 context, so the rect is physical
+ * whatever the host's DPI awareness), else @p device_name against
+ * @ref os_display_desktop_enumerate (macOS display UUID, X11 output name).
+ *
+ * @return false when the monitor is gone or the platform cannot resolve it.
+ */
+bool
+os_display_desktop_info_for_device(void *platform_handle,
+                                   const char *device_name,
+                                   struct os_display_desktop_info *out_info);
+
+/*!
+ * Platform half of @ref os_display_desktop_info_for_device: resolve a
+ * platform monitor handle. Windows only; everywhere else returns false.
+ */
+bool
+os_display_desktop_info_for_handle(void *platform_handle, struct os_display_desktop_info *out_info);
 
 /*!
  * Is a window placed in this monitor's coordinate space presented to the

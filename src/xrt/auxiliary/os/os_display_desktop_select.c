@@ -127,6 +127,7 @@ os_display_desktop_rule_str(enum os_display_desktop_rule rule)
 	case OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE: return "connector match";
 	case OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH: return "size match";
 	case OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK: return "primary fallback";
+	case OS_DISPLAY_DESKTOP_RULE_CLAIM: return "plug-in claim";
 	case OS_DISPLAY_DESKTOP_RULE_UNRESOLVED:
 	default: return "unresolved";
 	}
@@ -204,6 +205,101 @@ os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
 		*out_match = match;
 	}
 	return (int32_t)pick;
+}
+
+static bool
+claim_contains(const struct os_display_panel_claim *c, int32_t x, int32_t y)
+{
+	return c->width > 0 && c->height > 0 && x >= c->left && y >= c->top &&
+	       (int64_t)x < (int64_t)c->left + (int64_t)c->width && (int64_t)y < (int64_t)c->top + (int64_t)c->height;
+}
+
+int32_t
+os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
+                                uint32_t count,
+                                const struct os_display_panel_hint *hint,
+                                bool *out_overrides_origin)
+{
+	if (out_overrides_origin != NULL) {
+		*out_overrides_origin = false;
+	}
+	if (claims == NULL || count == 0) {
+		return -1;
+	}
+
+	const bool have_origin = hint != NULL && (hint->screen_left != 0 || hint->screen_top != 0);
+	bool any_verified = false;
+	for (uint32_t i = 0; i < count; i++) {
+		any_verified = any_verified || claims[i].verified;
+		// The plug-in's origin is on a monitor it claims: the two sources
+		// agree, and the origin rule keeps the answer it always gave.
+		if (have_origin && claim_contains(&claims[i], hint->screen_left, hint->screen_top)) {
+			return -1;
+		}
+	}
+
+	// An origin on none of the claimed monitors is the plug-in contradicting
+	// itself. Only an SDK-verified claim outranks it; an EDID-table match is
+	// no stronger evidence than the origin the same plug-in computed.
+	if (have_origin && !any_verified) {
+		return -1;
+	}
+
+	// Several claimed monitors (two panels of one vendor): a verified one,
+	// then the panel's own pixel size, then the added (non-primary) monitor —
+	// a 3D panel is a second screen on every real rig — then registry order.
+	int32_t best = -1;
+	int best_score = -1;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct os_display_panel_claim *c = &claims[i];
+		if (have_origin && !c->verified) {
+			continue;
+		}
+		const bool size_match = hint != NULL && hint->pixel_width > 0 && hint->pixel_height > 0 &&
+		                        c->width == hint->pixel_width && c->height == hint->pixel_height;
+		const int score = (c->verified ? 4 : 0) + (size_match ? 2 : 0) + (!c->is_primary ? 1 : 0);
+		if (score > best_score) {
+			best = (int32_t)i;
+			best_score = score;
+		}
+	}
+
+	if (best >= 0 && have_origin && out_overrides_origin != NULL) {
+		*out_overrides_origin = true;
+	}
+	return best;
+}
+
+bool
+os_display_desktop_info_for_device(void *platform_handle,
+                                   const char *device_name,
+                                   struct os_display_desktop_info *out_info)
+{
+	if (out_info == NULL) {
+		return false;
+	}
+	memset(out_info, 0, sizeof(*out_info));
+
+	// The handle is the identity wherever the platform has one (Windows): it
+	// is the same monitor in every DPI context, where a coordinate is not.
+	if (platform_handle != NULL && os_display_desktop_info_for_handle(platform_handle, out_info)) {
+		return true;
+	}
+
+	if (device_name == NULL || device_name[0] == '\0') {
+		return false;
+	}
+
+	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	const uint32_t count = os_display_desktop_enumerate(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
+	for (uint32_t i = 0; i < count && i < OS_DISPLAY_DESKTOP_MAX_MONITORS; i++) {
+		if (strcmp(mons[i].device_name, device_name) == 0) {
+			*out_info = mons[i];
+			return true;
+		}
+	}
+	memset(out_info, 0, sizeof(*out_info));
+	return false;
 }
 
 bool
