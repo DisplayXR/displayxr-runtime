@@ -920,6 +920,11 @@ jobs:
             Expect ((ConvRow $o "abi-fixture-conv").load -eq "ABI_MISMATCH") "conversion: fixture recorded as ABI_MISMATCH"
             Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: fell through to sim-conversion"
             Expect ((Check $o "conversion_providers").ok) "conversion: the conversion_providers check stays ok"
+            # The DP fixture fails the self-test on purpose; remove the three
+            # fixtures so the tracking cells below start from a green baseline.
+            foreach ($k in @("$dpRoot\abi-fixture-dp", "$inRoot\abi-fixture-input", "$cvRoot\abi-fixture-conv")) {
+              reg delete $k /f 2>$null | Out-Null
+            }
 
             # 5. The viewer-tracking class (ADR-054 N6 Part 2), the same four cells.
             # sim-tracking declines unless its ENABLE setting is on (machine row
