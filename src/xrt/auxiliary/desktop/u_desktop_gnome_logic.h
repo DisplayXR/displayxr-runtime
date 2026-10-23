@@ -315,15 +315,29 @@ u_desktop_gnome_is_cast_virtual(const char *vendor, const char *product);
 struct u_desktop_gnome_covered
 {
 	//! Real monitors, by connector: one that is missing at a restore is waited for
-	//! (an HDMI blink).
+	//! (an HDMI blink), and still missing after the wait the restore is a TIMEOUT
+	//! with the grant kept (it may come back).
 	char conn[U_DESKTOP_GNOME_COVERED_MAX][U_DESKTOP_GNOME_MON_NAME];
 	uint32_t n;
 	//! Screen-cast virtual monitors, by connector AND serial: gone for good once
-	//! that monitor is not there (never waited for).
+	//! that monitor is not there (never waited for). An empty serial (a grant saved
+	//! by an older runtime, u_desktop_gnome_legacy_virtual) matches by connector.
 	char vconn[U_DESKTOP_GNOME_COVERED_MAX][U_DESKTOP_GNOME_MON_NAME];
 	char vserial[U_DESKTOP_GNOME_COVERED_MAX][U_DESKTOP_GNOME_MON_NAME];
 	uint32_t nv;
 };
+
+/*!
+ * A connector in a grant saved by an older runtime (no "virtual_monitors" key:
+ * it did not tell virtual monitors apart) that can only be a mutter virtual
+ * monitor: "Meta-<digits>". On a desktop session those are the screen-cast ones
+ * (a real connector is named after its DRM type: "DP-1", "eDP-1", "HDMI-A-1",
+ * "Virtual-1"); the persistent ones exist only in a headless session. Such a
+ * connector is treated as cast-virtual, so the grant an older runtime saved with
+ * a casting tool's monitor in it does not stall every restore forever.
+ */
+bool
+u_desktop_gnome_legacy_virtual(const char *conn);
 
 /*!
  * The monitors a session's screen streams show: for each stream rect (stage px),
@@ -357,13 +371,17 @@ enum u_desktop_restore_verdict
 {
 	//! The layout is settled and every covered monitor is there: restore.
 	U_DESKTOP_RESTORE_NOW = 0,
-	//! Keep waiting: a covered monitor is missing (a blink?), or the layout changed
-	//! less than settle_ms ago.
+	//! Keep waiting: a covered real monitor is missing (a blink?), or the layout
+	//! changed less than settle_ms ago.
 	U_DESKTOP_RESTORE_WAIT,
-	//! A covered monitor will not come back: a cast-virtual one is gone (at once),
-	//! or a real one is still missing after wait_max_ms. The portal restores the
-	//! screens all or nothing, so it cannot restore them now.
+	//! A covered cast-virtual monitor is gone (at once, never waited for): it will
+	//! not come back, and the portal restores the screens all or nothing, so it
+	//! cannot restore them any more.
 	U_DESKTOP_RESTORE_GONE,
+	//! A covered real monitor is still missing after wait_max_ms: no restore now
+	//! (TIMEOUT), the grant is kept — a slow HDMI handshake, a monitor that dropped
+	//! off the bus or a closed lid must not cost the grant; a later restore retries.
+	U_DESKTOP_RESTORE_MISSING,
 	//! Every covered monitor is there, but the layout kept changing for the whole wait.
 	U_DESKTOP_RESTORE_UNSETTLED,
 };
@@ -372,8 +390,9 @@ enum u_desktop_restore_verdict
  * One observation of the restore guard (spec §10.5): u_desktop_layout_settle_step
  * plus when to stop waiting. @p start_ms: when this restore began waiting;
  * @p missing / @p gone: from u_desktop_gnome_covered_missing. A real monitor back
- * within @p wait_max_ms is restored on settle_ms after it returned, exactly as
- * before (the DS1's HDMI blink).
+ * within @p wait_max_ms is restored on settle_ms after it returned, and one still
+ * missing then is MISSING (TIMEOUT, grant kept), exactly as before (the DS1's
+ * HDMI blink). Only a gone cast-virtual monitor ends the wait early (GONE).
  */
 enum u_desktop_restore_verdict
 u_desktop_restore_guard_step(struct u_desktop_layout_settle *s,

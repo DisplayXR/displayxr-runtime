@@ -543,8 +543,8 @@ gp_cap_after_start(struct gnome_portal *p)
 
 	if (had_screens && cp->sources_selected && !screens) {
 		// GNOME restores the screens all or nothing: a covered monitor that is gone
-		// drops them all, and the renewed token no longer covers them. CAPTURE is
-		// revoked; CONTROL (the input, if granted) stays.
+		// (a screen-cast virtual one) drops them all, and the renewed token no longer
+		// covers them. CAPTURE is revoked; CONTROL (the input, if granted) stays.
 		U_LOG_W(
 		    "desktop/gnome: the portal restored the session WITHOUT any screen (a monitor the grant covered is "
 		    "gone?) — screen capture is no longer granted; request it again");
@@ -666,18 +666,13 @@ gp_cap_before_restore(struct gnome_portal *p, bool *gone, char *msg)
 		}
 		if (v == U_DESKTOP_RESTORE_GONE) {
 			*gone = true;
-			if (vgone > 0) {
-				gp_set_msg(msg, "a screen-cast virtual monitor the screen grant covers is gone (%s)",
-				           names);
-			} else {
-				gp_set_msg(msg,
-				           "a monitor the screen grant covers is still missing after %u s (%s): "
-				           "gone, not a blink",
-				           LAYOUT_WAIT_MAX_MS / 1000, names);
-			}
+			gp_set_msg(msg, "a screen-cast virtual monitor the screen grant covers is gone (%s)", names);
 			return U_DESKTOP_OK;
 		}
-		if (v == U_DESKTOP_RESTORE_UNSETTLED || gp_quitting(p)) {
+		// A covered real monitor still missing after the wait (a slow HDMI handshake, a
+		// monitor off the bus, a closed lid): no restore now, the grant is kept for a
+		// later retry — never the screens' loss.
+		if (v == U_DESKTOP_RESTORE_MISSING || v == U_DESKTOP_RESTORE_UNSETTLED || gp_quitting(p)) {
 			gp_set_msg(msg,
 			           missing > 0
 			               ? "a monitor the screen grant covers is missing — not restoring (retry when "
@@ -695,15 +690,24 @@ gp_cap_screens_gone(struct gnome_portal *p)
 	pthread_mutex_lock(&p->lock);
 	bool check = p->have_token && p->cap.token_screens && !p->cap.open_streams;
 	pthread_mutex_unlock(&p->lock);
-	if (!check) {
+	// Only a covered screen-cast virtual monitor is ever "gone": one look, no wait.
+	if (!check || p->cap.covered.nv == 0 || p->c == NULL) {
 		return false;
 	}
-	bool gone = false;
-	char msg[U_DESKTOP_MSG_SIZE] = {0};
-	if (gp_cap_before_restore(p, &gone, msg) != U_DESKTOP_OK || !gone) {
+	struct dc_state dc;
+	if (!dc_read(p->c, &dc)) {
+		return false; // cannot tell: answered from the grant, as before
+	}
+	uint32_t missing = 0, vgone = 0;
+	char names[128];
+	u_desktop_gnome_covered_missing(&p->cap.covered, dc.m, dc.n, &missing, &vgone, names, sizeof(names));
+	if (vgone == 0) {
 		return false;
 	}
-	U_LOG_W("desktop/gnome: %s — GNOME cannot restore the grant's screens: the request asks again", msg);
+	U_LOG_W(
+	    "desktop/gnome: a screen-cast virtual monitor the screen grant covers is gone (%s) — GNOME cannot "
+	    "restore the grant's screens: the request asks again",
+	    names);
 	return true;
 }
 
@@ -769,7 +773,8 @@ gp_cap_restore_gone(struct gnome_portal *p, bool may_ask, char *msg)
 		return true;
 	}
 	// A screens-only grant: its restore would show GNOME's dialog in the middle of an
-	// action. Revoke it here instead (the app asks again when it wants to).
+	// action, and the monitor never comes back. Revoke it here instead (the app asks
+	// again when it wants to).
 	U_LOG_W("desktop/gnome: %s — the screen grant cannot be restored: revoked", why);
 	cap_revoke(p, "a monitor it covered is gone");
 	gp_set_msg(msg, "%s — the screen grant cannot be restored; request access again", why);
@@ -1022,8 +1027,9 @@ cmd_request_scopes(struct gnome_portal *p, struct gp_cmd *c)
 	pthread_mutex_lock(&p->lock);
 	bool reask = p->cap.reask;
 	pthread_mutex_unlock(&p->lock);
-	// A screen grant that covers a monitor that is gone cannot restore its screens
-	// (GNOME restores them all or nothing): never "granted" from memory — ask.
+	// A screen grant that covers a screen-cast virtual monitor that is gone cannot
+	// restore its screens (GNOME restores them all or nothing): never "granted" from
+	// memory — ask. (A missing real monitor may come back: answered as before.)
 	bool screens_gone = want_cap && !reask && gp_cap_screens_gone(p);
 	pthread_mutex_lock(&p->lock);
 	bool ctl_now = gp_cap_control_granted_locked(p) || p->consent_only_granted;
@@ -1156,8 +1162,8 @@ cmd_capture_prepare(struct gnome_portal *p, struct gp_cmd *c)
 			bool input = p->have_token && !cp->token_sc && cp->token_devices;
 			pthread_mutex_unlock(&p->lock);
 			if (input) {
-				// GNOME restored a combined grant with its input only (a monitor it
-				// covered is gone): CONTROL stays, CAPTURE is revoked
+				// GNOME restored a combined grant with its input only (a screen-cast
+				// virtual monitor it covered is gone): CONTROL stays, CAPTURE is revoked
 				// (gp_cap_after_start), the grant is saved without the screens.
 				gp_set_msg(c->msg,
 				           "the portal restored the grant without its screens (a monitor it covered is "

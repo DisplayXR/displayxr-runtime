@@ -37,16 +37,20 @@
  * The last three are diagnostics only (which id the portal used, if known; what
  * launched the process): never read back as part of the grant.
  *
- * "virtual_monitors" (optional, absent when empty) lists the covered screen-cast
- * virtual monitors (u_desktop_gnome_is_cast_virtual): never waited for, gone once
- * that connector no longer shows that serial. They are kept out of "monitors" so
- * an older runtime, which ignores the key, never waits for them either.
+ * "virtual_monitors" (written with every screens grant, empty or not) lists the
+ * covered screen-cast virtual monitors (u_desktop_gnome_is_cast_virtual): never
+ * waited for, gone once that connector no longer shows that serial. They are kept
+ * out of "monitors" so an older runtime, which ignores the key, never waits for
+ * them either. A file without the key is an older runtime's: its "Meta-<n>"
+ * connectors are taken as virtual (u_desktop_gnome_grant_covered).
  *
  * Compiled on every OS so tests_desktop_control pins it; the GNOME backend is its
  * only caller. Never logs a token.
  */
 
 #pragma once
+
+#include "u_desktop_gnome_logic.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -77,7 +81,19 @@ struct u_desktop_gnome_grant
 	char virtual_monitors[U_DESKTOP_GNOME_GRANT_MONITORS][U_DESKTOP_GNOME_CONNECTOR_SIZE];
 	char virtual_serials[U_DESKTOP_GNOME_GRANT_MONITORS][U_DESKTOP_GNOME_CONNECTOR_SIZE];
 	uint32_t nvirtual;
+	//! Decode: the file had "virtual_monitors" (this format); false = an older runtime's.
+	bool virtual_known;
 };
+
+/*!
+ * The monitors @p g covers, for the monitor-blink guard: "monitors" as real ones,
+ * "virtual_monitors" as cast-virtual ones. In a file an older runtime wrote (no
+ * "virtual_monitors"), a "Meta-<n>" connector (u_desktop_gnome_legacy_virtual)
+ * is cast-virtual with no serial (matched by connector). Nothing when @p g does
+ * not cover the screens.
+ */
+void
+u_desktop_gnome_grant_covered(const struct u_desktop_gnome_grant *g, struct u_desktop_gnome_covered *out);
 
 /*
  * The key: whose grant this is.

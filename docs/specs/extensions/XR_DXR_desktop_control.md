@@ -231,14 +231,14 @@ app**, not once per launch (ADR-056 Amendment 2) — on every portal that issues
 
 | | |
 |---|---|
-| what | the restore token and the grant's shape: which portal issued it (RemoteDesktop or a standalone ScreenCast), whether it covers input and the screens, and the monitors it covered: real ones by connector (`monitors`), a screen-casting tool's virtual monitors by connector and serial (`virtual_monitors`, optional, ignored by older runtimes; §10.5) |
+| what | the restore token and the grant's shape: which portal issued it (RemoteDesktop or a standalone ScreenCast), whether it covers input and the screens, and the monitors it covered: real ones by connector (`monitors`), a screen-casting tool's virtual monitors by connector and serial (`virtual_monitors`, written with every screens grant, ignored by older runtimes; a file without it is an older runtime's, whose `Meta-<n>` connectors are taken as virtual; §10.5) |
 | key | the app's own identity, first that applies: **(1)** the app id `org.freedesktop.host.portal.Registry.Register` accepted; **(2)** the app's own id (`DXR_DESKTOP_APP_ID`, else the basename of `GIO_LAUNCHED_DESKTOP_FILE`) when registration failed or the portal has no registry; **(3)** the executable: `exe-<basename>-<16 hex digits of a hash of its absolute path>` (two executables never share a grant) |
 | where | `$XDG_STATE_HOME/displayxr/desktop-control/<key>.json` (default `~/.local/state/displayxr/desktop-control/`); `$DXR_DESKTOP_CONTROL_DIR/desktop-control/` when that override is set |
 | how | directory 0700 (tightened when looser), file 0600, written atomically (an `O_EXCL` temp file, `fsync`, `rename`); read only when it is a regular file of this user (not a symlink) with no group / other bits, in a directory nobody else can write; never logged. Diagnostics next to the grant, never read back: `key_source`, `portal_app_id` (the id the portal bound the token to, when registration told us), `exe`, `launch_scope` (the systemd unit the process ran in) |
 | read | at the app's first request or restore in a process; again before every later restore (another process of the same app may have renewed it) |
 | verified | the first request of a process that found a saved grant **restores it, with the dialog allowed**: silent where the portal honours the token, else the portal's dialog, whose answer is the request's (a new token replaces the saved one; Cancel removes it) |
 | written | after every successful `Start`, with the token it returned (the portal documents tokens as single use and may hand out a new one per `Start`; xdg-desktop-portal 1.21.1 handed back the same token on every restore in the headless run) |
-| removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a grant that covers the screens only, or such a grant covers a monitor that is gone (§10.5; a grant that also covers input is instead saved again without the screens); the kill switch (`displayxr-cli desktop stop` removes every saved grant); `displayxr-cli desktop forget <exe>` (the grants recorded for that executable that cover a forgotten scope — one token holds both scopes, so the whole grant goes) |
+| removed | the user declines a dialog that had no grant to keep, the dialog of the verifying restore, or an `ASK_AGAIN` (§10.2); a silent restore that is not silent (the portal shows its dialog: it no longer honours the token) or is refused; the session closed by anything but a lock (the user's Stop in GNOME's indicator, as in version 1); the portal restored no screen for a grant that covers the screens only, or such a grant covers a screen-cast virtual monitor that is gone (§10.5; a grant that also covers input is instead saved again without the screens); the kill switch (`displayxr-cli desktop stop` removes every saved grant); `displayxr-cli desktop forget <exe>` (the grants recorded for that executable that cover a forgotten scope — one token holds both scopes, so the whole grant goes) |
 | kill switch | ends the grant of every **running** session too, on every OS (ADR-056 Amendment 2): the store's `kill_switch_count` (incremented by every `stop`) moves, so a session sees it even when the switch is off again before it looks; each scope the app had requested is revoked (`DENIED` once the switch is off, until a new request) and the backend drops its OS grant (GNOME: closes the portal session, forgets the restore token). On Windows and macOS that new request is answered without a prompt (the store / the OS still says yes); on GNOME it shows the dialog (the saved grant is gone) |
 
 **The portal stays the judge.** It honours a token only for the app id it bound it to: the
@@ -914,38 +914,39 @@ Decisions this section left open, as implemented in `u_desktop_control.c`,
   private, atomic file). A saved grant not yet used in the process is restored by the first
   request with the dialog allowed (`GP_OPEN_RESTORE_OR_ASK`); every other restore stays silent
   or fails. The monitor-blink guard below uses the saved connectors in a new process too.
-- **Monitor blink, and a monitor gone for good** (#2306). xdg-desktop-portal-gnome restores
-  the screens of a grant all or nothing, matching each monitor by vendor:product:serial. With
-  a covered monitor missing, a RemoteDesktop restore comes back with input only (and GNOME
-  saves that), and a ScreenCast restore shows the dialog. So before a silent restore of a grant
-  that covers screens, the backend reads `org.gnome.Mutter.DisplayConfig.GetCurrentState`:
-  - **A covered monitor briefly missing** (the DS1's HDMI handshake after boot): it waits (at
-    most 6 s) until the layout serial has been stable for 2 s and every monitor (connector)
-    the grant covered is present, then restores with it.
-  - **The layout keeps changing for the whole wait**, every covered monitor present: no
-    restore (`TIMEOUT`), the grant is kept.
-  - **A covered monitor that will not come back**: a real one still missing after the 6 s
-    (unplugged, a laptop panel off with the lid closed), or, at once, a covered **screen-cast
-    virtual monitor** that is no longer there with its serial. That is the monitor mutter
-    creates for a ScreenCast `RecordVirtual` stream, a screen-casting tool's extended display:
-    vendor `MetaVendor`, product `Virtual remote monitor`, connector `Meta-<n>` (mutter 42.9,
-    46.2 and 50.1; the persistent `--virtual-monitor` monitors of a headless session share the
-    connector name, so the name alone is not the marker). It never comes back as the same
-    monitor, since each one gets a new serial, so it is never waited for. Then:
-    - a grant that covers input is restored with its input only: CONTROL keeps working,
-      CAPTURE becomes `DENIED`, and the grant is saved again without the screens; a capture
-      completes `NOT_GRANTED` ("restored the grant without its screens");
+- **Monitor blink, and a casting tool's virtual monitor** (#2306). xdg-desktop-portal-gnome
+  restores the screens of a grant all or nothing, matching each monitor by
+  vendor:product:serial: with a covered monitor missing, a RemoteDesktop restore comes back with
+  input only (and GNOME saves that reduced approval), a ScreenCast restore shows the dialog. So
+  before a silent restore of a grant that covers screens, the backend reads
+  `org.gnome.Mutter.DisplayConfig.GetCurrentState`:
+  - **A covered real monitor missing** (the DS1's HDMI handshake after boot, a monitor that
+    dropped off the bus, a closed lid): it waits (at most 6 s) until the layout serial has been
+    stable for 2 s and every monitor (connector) the grant covered is present, then restores.
+    Still missing after the wait (or a layout that keeps changing): it does not restore
+    (`TIMEOUT`), and the grant is kept, screens included, for a later retry.
+  - **A covered screen-cast virtual monitor that is gone**: never waited for. That is the
+    monitor mutter creates for a ScreenCast `RecordVirtual` stream, a screen-casting tool's
+    extended display: vendor `MetaVendor`, product `Virtual remote monitor`, connector
+    `Meta-<n>` (mutter 42.9, 46.2 and 50.1; the persistent `--virtual-monitor` monitors of a
+    headless session share the connector name, so the name alone is not the marker). It never
+    comes back as the same monitor (each one gets a new serial), so it counts as present only
+    with the serial it had when the grant was made. Once it is gone:
+    - a grant that covers input is restored at once with its input only: CONTROL keeps
+      working, CAPTURE becomes `DENIED`, and the grant is saved again without the screens; a
+      capture completes `NOT_GRANTED` ("restored the grant without its screens");
     - a grant that covers the screens only is not restored (its dialog would appear in the
       middle of an action): it is revoked, its saved copy removed, `NOT_GRANTED`;
     - the first request of a process (the verifying restore, dialog allowed) goes ahead and
-      the portal's dialog answers it.
-  - **A request for CAPTURE** while the grant covers a monitor that is gone (the same wait) is
-    not answered from memory: it shows the dialog, whose answer replaces the grant.
-  Changes are detected by polling the serial at restore and request time, not by the
-  `MonitorsChanged` signal, so the polled CAPTURE state turns `DENIED` at the next restore, not
-  the moment the monitor goes. A grant saved by an older runtime lists a covered virtual monitor
-  among its connectors: its first restore waits the 6 s once, then the grant is handled as
-  above.
+      the portal's dialog answers it;
+    - a request for CAPTURE is not answered from memory: it shows the dialog, whose answer
+      replaces the grant.
+  - A grant saved by an older runtime has no `virtual_monitors`: its `Meta-<n>` connectors
+    (on a desktop session, only screen-cast virtual monitors are named so) are taken as
+    virtual, matched by connector.
+  Changes are detected by polling at restore and request time, not by the `MonitorsChanged`
+  signal, so the polled CAPTURE state turns `DENIED` at the next restore, not the moment the
+  virtual monitor goes.
 - A restore that is not silent within 5 s — a dialog — is closed with `Request.Close`, and the
   grant is treated as revoked (both scopes `DENIED`, as in version 1).
 - The user may untick remote interaction (`devices` 0): CONTROL `DENIED`, CAPTURE `GRANTED`,

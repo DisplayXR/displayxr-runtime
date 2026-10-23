@@ -142,12 +142,12 @@ gp_cap_end_upgrade(struct gnome_portal *p, struct gp_cap_saved *saved, bool ok);
  * after boot), a RemoteDesktop restore comes back with input only and GNOME saves
  * that, a ScreenCast restore shows the dialog.
  *
- * OK, @p gone false: restore. OK, @p gone true: a covered monitor will not come
- * back (a screen-cast virtual monitor that no longer exists, at once; a real one
- * still missing after the wait), so the portal cannot restore the screens: @p msg
- * says which, and the caller goes on with gp_cap_restore_gone. TIMEOUT: the
- * layout kept changing (or the thread is quitting); nothing is restored, the
- * grant is kept.
+ * OK, @p gone false: restore. OK, @p gone true: a covered screen-cast virtual
+ * monitor no longer exists (never waited for: it never comes back), so the portal
+ * cannot restore the screens: @p msg says which, and the caller goes on with
+ * gp_cap_restore_gone. TIMEOUT: a covered real monitor is still missing after
+ * the wait, or the layout kept changing (or the thread is quitting); nothing is
+ * restored, the grant is kept for a later retry.
  */
 enum u_desktop_result
 gp_cap_before_restore(struct gnome_portal *p, bool *gone, char *msg);
@@ -166,8 +166,9 @@ gp_cap_restore_gone(struct gnome_portal *p, bool may_ask, char *msg);
 
 /*!
  * A request for CAPTURE, before answering from memory: true when the screen grant
- * covers a monitor that is gone (gp_cap_before_restore's wait included), so the
- * portal can no longer restore its screens and the request must ask again.
+ * covers a screen-cast virtual monitor that is gone (one DisplayConfig read, no
+ * wait), so the portal can no longer restore its screens and the request must ask
+ * again. A missing real monitor is not "gone" (it may come back).
  */
 bool
 gp_cap_screens_gone(struct gnome_portal *p);

@@ -380,6 +380,20 @@ u_desktop_gnome_is_cast_virtual(const char *vendor, const char *product)
 	       strcmp(product, "Virtual remote monitor") == 0;
 }
 
+bool
+u_desktop_gnome_legacy_virtual(const char *conn)
+{
+	if (conn == NULL || strncmp(conn, "Meta-", 5) != 0 || conn[5] == '\0') {
+		return false;
+	}
+	for (const char *c = conn + 5; *c != '\0'; c++) {
+		if (*c < '0' || *c > '9') {
+			return false;
+		}
+	}
+	return true;
+}
+
 static int32_t
 iabs32(int32_t v)
 {
@@ -460,8 +474,12 @@ u_desktop_gnome_covered_missing(const struct u_desktop_gnome_covered *cov,
 	for (uint32_t i = 0; i < cov->nv; i++) {
 		bool found = false;
 		for (uint32_t k = 0; k < nmons && !found; k++) {
-			found = mons[k].cast_virtual && strcmp(mons[k].conn, cov->vconn[i]) == 0 &&
-			        strcmp(mons[k].serial, cov->vserial[i]) == 0;
+			if (cov->vserial[i][0] == '\0') {
+				found = strcmp(mons[k].conn, cov->vconn[i]) == 0; // an older runtime's grant
+			} else {
+				found = mons[k].cast_virtual && strcmp(mons[k].conn, cov->vconn[i]) == 0 &&
+				        strcmp(mons[k].serial, cov->vserial[i]) == 0;
+			}
 		}
 		if (!found) {
 			(*gone)++;
@@ -489,7 +507,7 @@ u_desktop_restore_guard_step(struct u_desktop_layout_settle *s,
 		return U_DESKTOP_RESTORE_NOW;
 	}
 	if (now_ms >= start_ms && now_ms - start_ms >= wait_max_ms) {
-		return missing > 0 ? U_DESKTOP_RESTORE_GONE : U_DESKTOP_RESTORE_UNSETTLED;
+		return missing > 0 ? U_DESKTOP_RESTORE_MISSING : U_DESKTOP_RESTORE_UNSETTLED;
 	}
 	return U_DESKTOP_RESTORE_WAIT;
 }

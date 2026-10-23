@@ -190,8 +190,9 @@ u_desktop_gnome_grant_encode(const char *key,
 			cJSON_AddItemToArray(mons, cJSON_CreateString(g->monitors[i]));
 		}
 	}
-	// Optional (an older runtime ignores it): the covered screen-cast virtual monitors.
-	cJSON *vmons = g->screens && g->nvirtual > 0 ? cJSON_AddArrayToObject(o, "virtual_monitors") : NULL;
+	// The covered screen-cast virtual monitors, written with every screens grant (even
+	// empty: its presence tells this format from an older runtime's, which ignores it).
+	cJSON *vmons = g->screens ? cJSON_AddArrayToObject(o, "virtual_monitors") : NULL;
 	for (uint32_t i = 0; vmons != NULL && i < g->nvirtual; i++) {
 		if (!connector_ok(g->virtual_monitors[i]) || !connector_ok(g->virtual_serials[i])) {
 			continue;
@@ -311,6 +312,7 @@ u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop
 		goto done;
 	}
 	if (vmons != NULL) {
+		g.virtual_known = true;
 		int n = cJSON_GetArraySize(vmons);
 		if (n > U_DESKTOP_GNOME_GRANT_MONITORS) {
 			goto done;
@@ -331,6 +333,7 @@ u_desktop_gnome_grant_decode(const char *json, const char *key, struct u_desktop
 	if (!g.screens) {
 		g.nmonitors = 0;
 		g.nvirtual = 0;
+		g.virtual_known = false;
 	}
 	if (!shape_ok(&g)) {
 		goto done;
@@ -345,6 +348,34 @@ done:
 	cJSON_Delete(o);
 	wipe(&g, sizeof(g));
 	return st;
+}
+
+void
+u_desktop_gnome_grant_covered(const struct u_desktop_gnome_grant *g, struct u_desktop_gnome_covered *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (g == NULL || !g->screens) {
+		return;
+	}
+	for (uint32_t i = 0; i < g->nmonitors && i < U_DESKTOP_GNOME_GRANT_MONITORS; i++) {
+		if (!g->virtual_known && u_desktop_gnome_legacy_virtual(g->monitors[i])) {
+			if (out->nv < U_DESKTOP_GNOME_COVERED_MAX) {
+				snprintf(out->vconn[out->nv], sizeof(out->vconn[0]), "%s", g->monitors[i]);
+				out->vserial[out->nv][0] = '\0'; // unknown: matched by connector
+				out->nv++;
+			}
+		} else if (out->n < U_DESKTOP_GNOME_COVERED_MAX) {
+			snprintf(out->conn[out->n], sizeof(out->conn[0]), "%s", g->monitors[i]);
+			out->n++;
+		}
+	}
+	for (uint32_t i = 0; i < g->nvirtual && i < U_DESKTOP_GNOME_GRANT_MONITORS; i++) {
+		if (out->nv < U_DESKTOP_GNOME_COVERED_MAX) {
+			snprintf(out->vconn[out->nv], sizeof(out->vconn[0]), "%s", g->virtual_monitors[i]);
+			snprintf(out->vserial[out->nv], sizeof(out->vserial[0]), "%s", g->virtual_serials[i]);
+			out->nv++;
+		}
+	}
 }
 
 //! Wipe and free a text that may hold a token.

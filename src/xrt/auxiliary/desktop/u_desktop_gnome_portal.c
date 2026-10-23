@@ -775,21 +775,9 @@ grant_adopt_locked(struct gnome_portal *p, const struct u_desktop_gnome_grant *g
 static void
 grant_adopt_monitors(struct gnome_portal *p, const struct u_desktop_gnome_grant *g)
 {
-	struct u_desktop_gnome_covered *cov = &p->cap.covered;
-	memset(cov, 0, sizeof(*cov));
-	uint32_t n = g->screens ? g->nmonitors : 0;
-	n = n > U_DESKTOP_GNOME_COVERED_MAX ? U_DESKTOP_GNOME_COVERED_MAX : n;
-	for (uint32_t i = 0; i < n; i++) {
-		snprintf(cov->conn[i], sizeof(cov->conn[0]), "%s", g->monitors[i]);
-	}
-	cov->n = n;
-	uint32_t nv = g->screens ? g->nvirtual : 0;
-	nv = nv > U_DESKTOP_GNOME_COVERED_MAX ? U_DESKTOP_GNOME_COVERED_MAX : nv;
-	for (uint32_t i = 0; i < nv; i++) {
-		snprintf(cov->vconn[i], sizeof(cov->vconn[0]), "%s", g->virtual_monitors[i]);
-		snprintf(cov->vserial[i], sizeof(cov->vserial[0]), "%s", g->virtual_serials[i]);
-	}
-	cov->nv = nv;
+	// Real ones by connector, screen-cast virtual ones by connector + serial (an older
+	// runtime's file: its "Meta-<n>" connectors, by connector).
+	u_desktop_gnome_grant_covered(g, &p->cap.covered);
 	// No layout change seen yet: restore as soon as every covered monitor is there.
 	memset(&p->cap.layout, 0, sizeof(p->cap.layout));
 }
@@ -1041,10 +1029,10 @@ open_session(struct gnome_portal *p, enum gp_open mode, char *msg)
 	session_close(p);
 	p->start_declined = false;
 	if (restoring) {
-		// Never restore a screen grant while a monitor it covers may still come back
-		// (a blink) or the layout just changed: GNOME restores the screens all or
-		// nothing and would save the reduced approval. One that is gone for good
-		// (gp_cap_before_restore): GNOME restores the input without the screens.
+		// Never restore a screen grant while a monitor it covers is missing or the
+		// layout just changed: GNOME restores the screens all or nothing and would
+		// save the reduced approval. A screen-cast virtual monitor that is gone never
+		// comes back (gp_cap_before_restore): GNOME restores the input without the screens.
 		bool gone = false;
 		enum u_desktop_result rr = gp_cap_before_restore(p, &gone, msg);
 		if (rr != U_DESKTOP_OK) {
