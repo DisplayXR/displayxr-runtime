@@ -2,35 +2,34 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the opt-in face estimator,
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the opt-in face estimator,
  *         YuNet run through ONNX Runtime on the CPU.
  *
  * Built only with -DXRT_SIM_WEBCAM_ESTIMATOR=onnx (the default build compiles
- * sim_display_face_estimator_none.c instead). That configure step fetches the
+ * sim_face_estimator_none.c instead). That configure step fetches the
  * ONNX Runtime prebuilt package and the YuNet model, both pinned by SHA256,
  * and copies the runtime library and the model next to the plug-in. See
- * src/xrt/drivers/sim_display/sim_webcam_onnx.cmake and
- * docs/vendors/sim_display/README.md § Webcam eye tracking.
+ * src/xrt/drivers/sim_tracking/sim_webcam_onnx.cmake and
+ * docs/specs/runtime/tracking-provider-discovery.md § sim_tracking.
  *
  * ONNX Runtime is loaded at run time, by full path from the plug-in's own
  * directory, never linked: the plug-in keeps loading when the library is
  * missing, and Windows' own System32\onnxruntime.dll (an older Windows ML
  * copy) can never be picked up instead. The model path can be overridden
- * with SIM_DISPLAY_WEBCAM_MODEL=<path>.
+ * with the host setting WEBCAM_MODEL=<path>.
  *
  * Logging: one WARN when the library or model is missing, one when either
  * fails to load, one if inference ever fails. Nothing per frame.
  *
- * @ingroup drv_sim_display
+ * @ingroup drv_sim_tracking
  */
 
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE // dladdr() + Dl_info on glibc
 #endif
 
-#include "sim_display_face_estimator.h"
-#include "sim_display_settings.h"
-#include "sim_display_face_yunet.h"
+#include "sim_face_estimator.h"
+#include "sim_face_yunet.h"
 
 #include "util/u_logging.h"
 #include "util/u_stereo_uvc.h"
@@ -168,15 +167,15 @@ file_exists(const path_char *p)
 
 //! The ORT library and model paths. Resolved once; never loads anything.
 static bool
-resolve_paths(path_char *lib, path_char *model, size_t cap)
+resolve_paths(const struct sim_webcam_settings *settings, path_char *lib, path_char *model, size_t cap)
 {
 	path_char dir[PATH_CAP];
 	if (!own_dir(dir, PATH_CAP) || !join(lib, cap, dir, SIM_ORT_LIB_NAME)) {
 		return false;
 	}
-	// WEBCAM_MODEL through the host iface (N3c; UTF-8, converted for the wide path on Windows).
+	// WEBCAM_MODEL through the host's settings callback (UTF-8, converted for the wide path on Windows).
 	char override[512];
-	if (sim_display_setting("WEBCAM_MODEL", override, sizeof(override))) {
+	if (sim_webcam_setting(settings, "WEBCAM_MODEL", override, sizeof(override))) {
 #ifdef _WIN32
 		return MultiByteToWideChar(CP_UTF8, 0, override, -1, model, (int)cap) > 0;
 #else
@@ -194,8 +193,14 @@ resolve_paths(path_char *lib, path_char *model, size_t cap)
  *
  */
 
+const char *
+sim_face_estimator_default_name(void)
+{
+	return "yunet-onnx";
+}
+
 bool
-sim_face_estimator_default_available(void)
+sim_face_estimator_default_available(const struct sim_webcam_settings *settings)
 {
 	// Idempotent, so a racing second caller only repeats the checks.
 	static int cached = -1;
@@ -204,18 +209,18 @@ sim_face_estimator_default_available(void)
 	}
 	path_char lib[PATH_CAP], model[PATH_CAP];
 	char u8[PATH_CAP];
-	bool ok = resolve_paths(lib, model, PATH_CAP);
+	bool ok = resolve_paths(settings, lib, model, PATH_CAP);
 	if (!ok) {
-		U_LOG_W("sim_display webcam tracking (#1855): could not resolve the ONNX estimator's paths");
+		U_LOG_W("webcam tracking (#1855): could not resolve the ONNX estimator's paths");
 	} else if (!file_exists(lib)) {
 		path_to_utf8(lib, u8, sizeof(u8));
-		U_LOG_W("sim_display webcam tracking (#1855): ONNX Runtime not found at '%s' - no face estimator", u8);
+		U_LOG_W("webcam tracking (#1855): ONNX Runtime not found at '%s' - no face estimator", u8);
 		ok = false;
 	} else if (!file_exists(model)) {
 		path_to_utf8(model, u8, sizeof(u8));
 		U_LOG_W(
-		    "sim_display webcam tracking (#1855): face model not found at '%s' (SIM_DISPLAY_WEBCAM_MODEL "
-		    "overrides) - no face estimator",
+		    "webcam tracking (#1855): face model not found at '%s' (the WEBCAM_MODEL "
+		    "setting overrides) - no face estimator",
 		    u8);
 		ok = false;
 	}
@@ -233,6 +238,10 @@ sim_face_estimator_default_available(void)
 struct onnx_est
 {
 	struct sim_face_estimator base;
+
+	//! The library + model paths, resolved on create (the host's settings are not kept).
+	path_char lib_path[PATH_CAP];
+	path_char model_path[PATH_CAP];
 
 	bool tried;      //!< load attempted (worker thread only)
 	bool ok;         //!< session usable
@@ -258,7 +267,7 @@ failed(struct onnx_est *e, OrtStatus *st, const char *what)
 	if (st == NULL) {
 		return false;
 	}
-	U_LOG_W("sim_display webcam tracking (#1855): ONNX Runtime %s failed: %s", what, e->api->GetErrorMessage(st));
+	U_LOG_W("webcam tracking (#1855): ONNX Runtime %s failed: %s", what, e->api->GetErrorMessage(st));
 	e->api->ReleaseStatus(st);
 	return true;
 }
@@ -266,11 +275,9 @@ failed(struct onnx_est *e, OrtStatus *st, const char *what)
 static bool
 load(struct onnx_est *e)
 {
-	path_char lib[PATH_CAP], model[PATH_CAP];
+	const path_char *lib = e->lib_path;
+	const path_char *model = e->model_path;
 	char u8[PATH_CAP];
-	if (!resolve_paths(lib, model, PATH_CAP)) {
-		return false;
-	}
 	path_to_utf8(lib, u8, sizeof(u8));
 
 	pfn_get_api_base get_base = NULL;
@@ -288,21 +295,18 @@ load(struct onnx_est *e)
 	}
 #endif
 	if (get_base == NULL) {
-		U_LOG_W(
-		    "sim_display webcam tracking (#1855): could not load ONNX Runtime from '%s' - no face estimates",
-		    u8);
+		U_LOG_W("webcam tracking (#1855): could not load ONNX Runtime from '%s' - no face estimates", u8);
 		return false;
 	}
 	const OrtApiBase *base = get_base();
 	e->api = base != NULL ? base->GetApi(ORT_API_VERSION) : NULL;
 	if (e->api == NULL) {
-		U_LOG_W("sim_display webcam tracking (#1855): '%s' does not offer ONNX Runtime C API %d", u8,
-		        ORT_API_VERSION);
+		U_LOG_W("webcam tracking (#1855): '%s' does not offer ONNX Runtime C API %d", u8, ORT_API_VERSION);
 		return false;
 	}
 
 	const OrtApi *a = e->api;
-	if (failed(e, a->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "sim_display_webcam", &e->env), "CreateEnv")) {
+	if (failed(e, a->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "sim_webcam", &e->env), "CreateEnv")) {
 		return false;
 	}
 	OrtStatus *tel = a->DisableTelemetryEvents(e->env); // best effort
@@ -328,8 +332,7 @@ load(struct onnx_est *e)
 	a->ReleaseSessionOptions(opts);
 	if (st != NULL) {
 		path_to_utf8(model, u8, sizeof(u8));
-		U_LOG_W("sim_display webcam tracking (#1855): could not load the face model '%s': %s", u8,
-		        a->GetErrorMessage(st));
+		U_LOG_W("webcam tracking (#1855): could not load the face model '%s': %s", u8, a->GetErrorMessage(st));
 		a->ReleaseStatus(st);
 		return false;
 	}
@@ -337,7 +340,7 @@ load(struct onnx_est *e)
 		return false;
 	}
 	path_to_utf8(model, u8, sizeof(u8));
-	U_LOG_W("sim_display webcam tracking (#1855): face estimator ready (YuNet via ONNX Runtime %s, model '%s')",
+	U_LOG_W("webcam tracking (#1855): face estimator ready (YuNet via ONNX Runtime %s, model '%s')",
 	        base->GetVersionString(), u8);
 	return true;
 }
@@ -404,14 +407,12 @@ run(struct onnx_est *e, const struct u_stereo_uvc_raw_frame *frame, struct sim_f
 		ok = shapes_ok && sim_yunet_decode(&e->plan, heads, SIM_YUNET_SCORE_MIN, out);
 		if (!ok && !e->warned_run) {
 			e->warned_run = true;
-			U_LOG_W(
-			    "sim_display webcam tracking (#1855): the face model's outputs do not have YuNet's shape");
+			U_LOG_W("webcam tracking (#1855): the face model's outputs do not have YuNet's shape");
 		}
 	} else {
 		if (!e->warned_run) {
 			e->warned_run = true;
-			U_LOG_W("sim_display webcam tracking (#1855): face inference failed: %s",
-			        a->GetErrorMessage(st));
+			U_LOG_W("webcam tracking (#1855): face inference failed: %s", a->GetErrorMessage(st));
 		}
 		a->ReleaseStatus(st);
 	}
@@ -467,14 +468,18 @@ onnx_destroy(struct sim_face_estimator *est)
 }
 
 struct sim_face_estimator *
-sim_face_estimator_create_default(void)
+sim_face_estimator_create_default(const struct sim_webcam_settings *settings)
 {
-	if (!sim_face_estimator_default_available()) {
+	if (!sim_face_estimator_default_available(settings)) {
 		return NULL;
 	}
 	// Cheap: the library and model load on the worker's first estimate().
 	struct onnx_est *e = (struct onnx_est *)calloc(1, sizeof(*e));
 	if (e == NULL) {
+		return NULL;
+	}
+	if (!resolve_paths(settings, e->lib_path, e->model_path, PATH_CAP)) {
+		free(e);
 		return NULL;
 	}
 	e->base.name = "yunet-onnx";

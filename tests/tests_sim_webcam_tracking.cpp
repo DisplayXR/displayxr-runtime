@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855) — everything but the face
- *         estimator and the real camera:
+ * @brief  The webcam eye tracker core (#1855; owned by sim_tracking, also
+ *         compiled into sim_display for its deprecated WEBCAM_TRACKING
+ *         alias) — everything but the face estimator and the real camera:
  *
  *  - geometry: hand-computed numbers for a known pinhole (90 deg over 640 px
  *    = f 320 px), the round trip through @ref sim_webcam_project for an
@@ -20,6 +21,10 @@
  *    estimator: frames flow at the camera rate, the known head comes back,
  *    "no face" never tracks, an unknown device never tracks, and destroy
  *    returns promptly. No real camera is ever opened;
+ *  - the camera-space measurement (the calibration input) by hand;
+ *  - the core through its host seam (@ref sim_webcam_settings): settings ->
+ *    config, the WEBCAM_ESTIMATOR choice, the claimed camera, and a source
+ *    built from settings tracking the known head on the synthetic camera;
  *  - the YuNet halves of the opt-in ONNX estimator that need no inference:
  *    frame -> tensor (reduction, luma pick, padding) and synthetic output
  *    tensors -> eye pixels in the source frame.
@@ -27,10 +32,11 @@
 
 #include "catch_amalgamated.hpp"
 
-#include "sim_display_face_estimator.h"
-#include "sim_display_face_yunet.h"
-#include "sim_display_webcam_tracker.h"
-#include "sim_display_webcam_tracking.h"
+#include "sim_face_estimator.h"
+#include "sim_face_yunet.h"
+#include "sim_webcam_source.h"
+#include "sim_webcam_tracker.h"
+#include "sim_webcam_tracking.h"
 
 #include "os/os_time.h"
 #include "util/u_stereo_uvc.h"
@@ -40,6 +46,8 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -112,6 +120,56 @@ TEST_CASE("webcam geometry: a known pinhole, by hand", "[sim_webcam]")
 	CHECK(o[0].x - e[0].x == Approx(0.010f).margin(1e-6));
 	CHECK(o[0].y - e[0].y == Approx(0.015f).margin(1e-6));
 	CHECK(o[0].z - e[0].z == Approx(-0.005f).margin(1e-6));
+}
+
+TEST_CASE("webcam geometry: the camera-space measurement", "[sim_webcam]")
+{
+	sim_webcam_config cfg;
+	sim_webcam_config_defaults(&cfg);
+	cfg.hfov_deg = 90.0f; // f = 320 px over 640 px
+
+	// Centred pupils 32 px apart: both eyes 0.63 m out, 31.5 mm either side.
+	sim_face_landmarks lm{};
+	lm.found = true;
+	lm.eye_px[0][0] = 336.0f; // image right first: the order must not matter
+	lm.eye_px[0][1] = 240.0f;
+	lm.eye_px[1][0] = 304.0f;
+	lm.eye_px[1][1] = 240.0f;
+	sim_webcam_camera_eyes c{};
+	REQUIRE(sim_webcam_landmarks_to_camera(&cfg, 640, 480, &lm, &c));
+	const float d = std::sqrt(0.0315f * 0.0315f + 0.63f * 0.63f);
+	for (int e = 0; e < 2; e++) {
+		CHECK(c.distance_m[e] == Approx(d).margin(1e-5));
+		const float n =
+		    std::sqrt(c.dir[e][0] * c.dir[e][0] + c.dir[e][1] * c.dir[e][1] + c.dir[e][2] * c.dir[e][2]);
+		CHECK(n == Approx(1.0f).margin(1e-5));
+		CHECK(c.dir[e][1] == Approx(0.0f).margin(1e-6));
+		CHECK(c.dir[e][2] == Approx(0.63f / d).margin(1e-5));
+	}
+	CHECK(c.dir[0][0] == Approx(-0.0315f / d).margin(1e-5)); // [0] = viewer's left (-X)
+	CHECK(c.dir[1][0] == Approx(0.0315f / d).margin(1e-5));
+
+	// Camera space is the display frame moved to the camera (no tilt in this
+	// model): camera position + distance * dir == the display-space eye.
+	for (int i = 0; i < 2; i++) {
+		lm.eye_px[i][0] += 40.0f;
+		lm.eye_px[i][1] -= 30.0f;
+	}
+	cfg.cam_offset_m[0] = 0.01f;
+	cfg.cam_offset_m[1] = 0.02f;
+	xrt_vec3 eyes[2];
+	REQUIRE(sim_webcam_landmarks_to_eyes(&cfg, kScreenH, 640, 480, &lm, eyes));
+	REQUIRE(sim_webcam_landmarks_to_camera(&cfg, 640, 480, &lm, &c));
+	const float cam[3] = {0.01f, kScreenH / 2 + 0.02f, 0.0f};
+	for (int e = 0; e < 2; e++) {
+		CHECK(cam[0] + c.distance_m[e] * c.dir[e][0] == Approx(eyes[e].x).margin(1e-5));
+		CHECK(cam[1] + c.distance_m[e] * c.dir[e][1] == Approx(eyes[e].y).margin(1e-5));
+		CHECK(cam[2] + c.distance_m[e] * c.dir[e][2] == Approx(eyes[e].z).margin(1e-5));
+	}
+
+	// Same usability rules as the display mapping.
+	lm.found = false;
+	CHECK_FALSE(sim_webcam_landmarks_to_camera(&cfg, 640, 480, &lm, &c));
 }
 
 TEST_CASE("webcam geometry: round trip for an off-axis head, any FOV", "[sim_webcam]")
@@ -439,12 +497,129 @@ TEST_CASE("webcam worker: synthetic camera + fake estimator, end to end", "[sim_
 
 TEST_CASE("webcam estimator: the default build ships none, so the camera stays shut", "[sim_webcam]")
 {
-	// The open question of #1855: until an estimator lands, the slot reports
-	// unavailable, and the glue then never advertises tracking or opens a
-	// camera. Compiled against the real stub. A build that adds an estimator
-	// flips both of these together.
-	CHECK_FALSE(sim_face_estimator_default_available());
-	CHECK(sim_face_estimator_create_default() == nullptr);
+	// The default build compiles the stub: the slot reports unavailable, and
+	// both hosts then never advertise tracking or open a camera. Compiled
+	// against the real stub. A build that adds an estimator flips these together.
+	CHECK_FALSE(sim_face_estimator_default_available(nullptr));
+	CHECK(sim_face_estimator_create_default(nullptr) == nullptr);
+	CHECK(std::string(sim_face_estimator_default_name()) == "none");
+}
+
+
+/*
+ * The core through its host seam: a map-backed sim_webcam_settings stands in
+ * for either host (sim_tracking's get_setting, sim_display's shim).
+ */
+
+struct map_settings
+{
+	std::map<std::string, std::string> kv;
+	std::atomic<int> reads{0};
+
+	sim_webcam_settings
+	iface()
+	{
+		return sim_webcam_settings{&map_settings::get, this};
+	}
+
+	static bool
+	get(void *ctx, const char *key, char *buf, size_t cap)
+	{
+		map_settings *m = static_cast<map_settings *>(ctx);
+		m->reads++;
+		auto it = m->kv.find(key);
+		if (it == m->kv.end()) {
+			buf[0] = '\0';
+			return false;
+		}
+		snprintf(buf, cap, "%s", it->second.c_str());
+		return true;
+	}
+};
+
+TEST_CASE("webcam core seam: settings -> config, estimator choice, claimed camera", "[sim_webcam]")
+{
+	map_settings m;
+	sim_webcam_settings s = m.iface();
+
+	SECTION("defaults when the host sets nothing")
+	{
+		sim_webcam_config cfg;
+		sim_webcam_config_from_settings(&s, &cfg);
+		CHECK(cfg.hfov_deg == Approx(SIM_WEBCAM_DEFAULT_HFOV_DEG));
+		CHECK(cfg.ipd_m == Approx(SIM_WEBCAM_DEFAULT_IPD_M));
+		CHECK_FALSE(cfg.mirrored);
+		CHECK(m.reads > 0); // read through the seam, not around it
+	}
+
+	SECTION("every camera-model knob is read by the shared key name")
+	{
+		m.kv["WEBCAM_HFOV_DEG"] = "90";
+		m.kv["WEBCAM_IPD_MM"] = "60";
+		m.kv["WEBCAM_OFFSET_MM"] = "10,-5,2";
+		m.kv["WEBCAM_MIRROR"] = "1";
+		sim_webcam_config cfg;
+		sim_webcam_config_from_settings(&s, &cfg);
+		CHECK(cfg.hfov_deg == Approx(90.0f));
+		CHECK(cfg.ipd_m == Approx(0.060f));
+		CHECK(cfg.cam_offset_m[0] == Approx(0.010f));
+		CHECK(cfg.cam_offset_m[1] == Approx(-0.005f));
+		CHECK(cfg.cam_offset_m[2] == Approx(0.002f));
+		CHECK(cfg.mirrored);
+	}
+
+	SECTION("out-of-range values keep the defaults")
+	{
+		m.kv["WEBCAM_HFOV_DEG"] = "500";
+		m.kv["WEBCAM_IPD_MM"] = "5";
+		m.kv["WEBCAM_MIRROR"] = "off";
+		sim_webcam_config cfg;
+		sim_webcam_config_from_settings(&s, &cfg);
+		CHECK(cfg.hfov_deg == Approx(SIM_WEBCAM_DEFAULT_HFOV_DEG));
+		CHECK(cfg.ipd_m == Approx(SIM_WEBCAM_DEFAULT_IPD_M));
+		CHECK_FALSE(cfg.mirrored);
+	}
+
+	SECTION("WEBCAM_ESTIMATOR: the stub build has nothing usable whatever is asked")
+	{
+		CHECK_FALSE(sim_webcam_estimator_usable(&s)); // auto -> the stub -> no
+		m.kv["WEBCAM_ESTIMATOR"] = "none";
+		CHECK_FALSE(sim_webcam_estimator_usable(&s));
+		m.kv["WEBCAM_ESTIMATOR"] = "yunet-onnx"; // not built in here
+		CHECK_FALSE(sim_webcam_estimator_usable(&s));
+	}
+
+	SECTION("a source built from settings refuses to run without an estimator")
+	{
+		sim_webcam_source_params p{};
+		p.settings = &s;
+		p.screen_h_m = kScreenH;
+		CHECK(sim_webcam_source_create(&p) == nullptr);
+		p.settings = nullptr;
+		CHECK(sim_webcam_source_create(&p) == nullptr);
+	}
+
+	SECTION("the claimed camera is WEBCAM_DEVICE's pick, by index or name")
+	{
+		u_stereo_uvc_fake_params params{};
+		params.pixel = U_STEREO_UVC_PIXEL_NV12;
+		params.fps = 30.0f;
+		u_stereo_uvc_backend backend;
+		u_stereo_uvc_fake_backend_init(&backend, &params);
+
+		sim_webcam_camera_info info{};
+		CHECK(sim_webcam_selected_camera(&s, &backend, &info) == 1); // unset = the first
+		CHECK(std::string(info.id) == "dxr-fake-uvc");
+		CHECK(std::string(info.key) == "dxr-fake-uvc"); // no VID:PID -> the OS id
+		m.kv["WEBCAM_DEVICE"] = "0";
+		CHECK(sim_webcam_selected_camera(&s, &backend, &info) == 1);
+		m.kv["WEBCAM_DEVICE"] = "SYNTHETIC";
+		CHECK(sim_webcam_selected_camera(&s, &backend, &info) == 1);
+		m.kv["WEBCAM_DEVICE"] = "1";
+		CHECK(sim_webcam_selected_camera(&s, &backend, &info) == 0);
+		m.kv["WEBCAM_DEVICE"] = "no such camera";
+		CHECK(sim_webcam_selected_camera(&s, &backend, nullptr) == 0);
+	}
 }
 
 TEST_CASE("webcam YuNet: frame -> tensor", "[sim_webcam]")
@@ -575,4 +750,78 @@ TEST_CASE("webcam YuNet: output tensors -> eye pixels", "[sim_webcam]")
 	heads[2].rows -= 1;
 	CHECK_FALSE(sim_yunet_decode(&plan, heads, SIM_YUNET_SCORE_MIN, &lm));
 	CHECK_FALSE(lm.found);
+}
+
+TEST_CASE("webcam core seam: a source from settings tracks the synthetic camera", "[sim_webcam]")
+{
+	u_stereo_uvc_fake_params params{};
+	params.pixel = U_STEREO_UVC_PIXEL_NV12;
+	params.fps = 120.0f;
+	u_stereo_uvc_backend backend;
+	u_stereo_uvc_fake_backend_init(&backend, &params);
+
+	map_settings m;
+	m.kv["WEBCAM_DEVICE"] = "synthetic";
+	m.kv["WEBCAM_HFOV_DEG"] = "80";
+	sim_webcam_settings s = m.iface();
+
+	sim_webcam_config cfg;
+	sim_webcam_config_from_settings(&s, &cfg);
+	fake_estimator est{};
+	est.base.name = "fake";
+	est.base.estimate = fake_estimate;
+	est.base.destroy = fake_destroy;
+	est.cfg = cfg; // the estimator projects with the SAME model the settings produce
+	est.head[0] = {0.04f - 0.0315f, -0.01f, 0.5f};
+	est.head[1] = {0.04f + 0.0315f, -0.01f, 0.5f};
+	est.face = true;
+
+	sim_webcam_source_params p{};
+	p.settings = &s;
+	p.screen_h_m = kScreenH;
+	p.backend = &backend;
+	p.estimator = &est.base; // borrowed
+	p.log_name = "test";
+	sim_webcam_source *src = sim_webcam_source_create(&p);
+	REQUIRE(src != nullptr);
+	sim_webcam_tracker *t = sim_webcam_source_tracker(src);
+	REQUIRE(t != nullptr);
+
+	const xrt_vec3 nominal[2] = {{-0.03f, 0.1f, 0.65f}, {0.03f, 0.1f, 0.65f}};
+	sim_webcam_eyes out;
+	REQUIRE(wait_until(
+	    [&] {
+		    sim_webcam_tracker_sample(t, nominal, os_monotonic_get_ns(), &out);
+		    return out.is_tracking && out.weight > 0.999f;
+	    },
+	    3000));
+	CHECK(sim_webcam_tracker_state(t) == SIM_WEBCAM_TRACKER_RUNNING);
+	for (int i = 0; i < 2; i++) {
+		CHECK(out.eyes[i].x == Approx(est.head[i].x).margin(1e-3));
+		CHECK(out.eyes[i].y == Approx(est.head[i].y).margin(1e-3));
+		CHECK(out.eyes[i].z == Approx(est.head[i].z).margin(1e-3));
+	}
+
+	// The camera-space block: the synthetic camera's key, and camera + distance
+	// * dir lands on the head (camera at the panel's top-centre, no offset).
+	sim_webcam_camera_eyes cam{};
+	uint64_t cam_ns = 0;
+	char key[128];
+	REQUIRE(sim_webcam_tracker_camera(t, os_monotonic_get_ns(), &cam, &cam_ns, key, sizeof(key)));
+	CHECK(std::string(key) == "dxr-fake-uvc");
+	CHECK(cam_ns > 0);
+	for (int e = 0; e < 2; e++) {
+		CHECK(0.0f + cam.distance_m[e] * cam.dir[e][0] == Approx(est.head[e].x).margin(1e-3));
+		CHECK(kScreenH / 2 + cam.distance_m[e] * cam.dir[e][1] == Approx(est.head[e].y).margin(1e-3));
+		CHECK(cam.distance_m[e] * cam.dir[e][2] == Approx(est.head[e].z).margin(1e-3));
+	}
+
+	// Face gone: no fresh camera measurement after the timeout.
+	est.face = false;
+	REQUIRE(wait_until(
+	    [&] { return !sim_webcam_tracker_camera(t, os_monotonic_get_ns(), &cam, nullptr, nullptr, 0); }, 2000));
+
+	sim_webcam_source_destroy(&src);
+	CHECK(src == nullptr);
+	CHECK(est.calls > 0); // the borrowed estimator was used, and not destroyed by the source
 }

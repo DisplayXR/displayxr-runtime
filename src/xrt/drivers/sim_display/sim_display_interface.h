@@ -198,8 +198,11 @@ sim_display_eyes_at(struct xrt_eye_positions *out,
                     bool *webcam_dp_ref);
 
 /*!
- * Webcam eye tracking (#1855), opt-in: `SIM_DISPLAY_WEBCAM_TRACKING=1`.
- * Was it asked for? (Cached env read; all of the below are no-ops without it.)
+ * Webcam eye tracking (#1855), opt-in: the `WEBCAM_TRACKING` setting
+ * (legacy env `SIM_DISPLAY_WEBCAM_TRACKING=1`). DEPRECATED for one release:
+ * the tracker moved to the sim-tracking provider (`SOURCE=webcam`); this
+ * alias runs the same core (sim_tracking/sim_webcam_source.h) and WARNs once.
+ * Was it asked for? (Cached setting read; all of the below are no-ops without it.)
  * @ingroup drv_sim_display
  */
 bool
@@ -208,7 +211,7 @@ sim_display_webcam_tracking_requested(void);
 /*!
  * Requested AND a face estimator is built in — only then does sim_display
  * advertise MANAGED tracking (and HAS_TRACKING on its 3D modes) and open a
- * camera. See sim_display_face_estimator.h.
+ * camera. See sim_tracking/sim_face_estimator.h.
  * @ingroup drv_sim_display
  */
 bool
@@ -259,7 +262,7 @@ sim_display_webcam_tracking_status(bool *out_tracking, uint64_t *out_edges);
 /*!
  * ADR-043 Amendment 5 (xrt_plugin_iface::get_claimed_cameras): the webcam
  * the opt-in eye tracker reads, so the service's UVC stereo source never
- * claims it. Requested tracking only (SIM_DISPLAY_WEBCAM_TRACKING); the
+ * claims it. Requested tracking only (WEBCAM_TRACKING); the
  * device is resolved by the tracker's own selection over an enumeration that
  * opens nothing. Writes the OS device id. @return the count (0 or 1).
  */

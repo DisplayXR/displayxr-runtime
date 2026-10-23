@@ -2,13 +2,21 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the process glue — env
- *         config, the refcounted tracker singleton the display processors
- *         share, the eye-position override and the advertised capability.
+ * @brief  sim_display webcam eye tracking (#1855) — the DEPRECATED alias.
+ *         The process glue only: the refcounted tracker singleton the
+ *         display processors share, the eye-position override and the
+ *         advertised capability.
  *
- * Opt-in only. With SIM_DISPLAY_WEBCAM_TRACKING unset every entry point is
- * one cached env check and nothing else: no thread, no camera, no Media
- * Foundation load (the plug-in delay-loads it).
+ * The tracker itself moved to sim_tracking (`SOURCE=webcam`, the viewer-
+ * tracking provider class). `WEBCAM_TRACKING=1` keeps today's behaviour for
+ * one release — sim_display tracks, OWN-like, and advertises MANAGED — by
+ * running the SAME core (sim_tracking/sim_webcam_source.h) with sim_display's
+ * settings shim behind its @ref sim_webcam_settings callback. Enabling it logs
+ * one WARN pointing to `sim-tracking SOURCE=webcam`.
+ *
+ * Opt-in only. With WEBCAM_TRACKING unset every entry point is one cached
+ * setting check and nothing else: no thread, no camera, no Media Foundation
+ * load (the plug-in delay-loads it).
  *
  * The tracker starts when the first session display processor asks for eye
  * positions (never at plug-in load or DP creation, so a process that never
@@ -21,17 +29,13 @@
 
 #include "sim_display_interface.h"
 #include "sim_display_settings.h"
-#include "sim_display_face_estimator.h"
-#include "sim_display_webcam_tracker.h"
-#include "sim_display_webcam_tracking.h"
+#include "sim_webcam_source.h"
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_eye_history.h"
 #include "util/u_logging.h"
-#include "util/u_stereo_uvc.h"
 #include "os/os_threading.h"
 #include "os/os_time.h"
-#include "os/os_uvc_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,16 +43,33 @@
 
 static pthread_mutex_t g_webcam_lock = PTHREAD_MUTEX_INITIALIZER;
 static int32_t g_webcam_refs = 0;                          // guarded
-static struct sim_webcam_tracker *g_webcam_tracker = NULL; // guarded
-static struct sim_face_estimator *g_webcam_est = NULL;     // guarded
-static bool g_webcam_warned_no_estimator = false;          // guarded
+static struct sim_webcam_source *g_webcam_src = NULL;      // guarded
 static struct u_eye_history g_webcam_hist;                 // guarded; lives with the tracker (N6 Part 1)
+
+//! The core's settings seam, satisfied by sim_display's shim (host iface + legacy SIM_DISPLAY_* names).
+static bool
+shim_get(void *ctx, const char *key, char *buf, size_t cap)
+{
+	(void)ctx;
+	return sim_display_setting(key, buf, cap);
+}
+
+static const struct sim_webcam_settings g_shim_settings = {shim_get, NULL};
 
 bool
 sim_display_webcam_tracking_requested(void)
 {
 	// Through the host iface (N3c, sim_display_settings.h; cached per process).
-	return sim_display_setting_on("WEBCAM_TRACKING");
+	const bool on = sim_display_setting_on("WEBCAM_TRACKING");
+	static bool warned = false; // one WARN per process; a racing repeat is harmless
+	if (on && !warned) {
+		warned = true;
+		U_LOG_W(
+		    "sim_display: WEBCAM_TRACKING is DEPRECATED (removed next release) - the webcam tracker moved to "
+		    "the sim-tracking viewer-tracking provider: 'displayxr-cli tracking set sim-tracking ENABLE 1' + "
+		    "'displayxr-cli tracking set sim-tracking SOURCE webcam' (WEBCAM_* settings carry over by name).");
+	}
+	return on;
 }
 
 uint32_t
@@ -57,108 +78,47 @@ sim_display_webcam_claimed_cameras(uint32_t capacity, char (*out_ids)[256])
 	if (!sim_display_webcam_tracking_requested()) {
 		return 0;
 	}
-	struct u_stereo_uvc_backend backend;
-	if (!os_uvc_capture_backend(&backend) || backend.enumerate == NULL) {
+	struct sim_webcam_camera_info cam;
+	if (sim_webcam_selected_camera(&g_shim_settings, NULL, &cam) == 0) {
 		return 0;
 	}
-	struct u_stereo_uvc_device *devs =
-	    (struct u_stereo_uvc_device *)calloc(U_STEREO_UVC_MAX_DEVICES, sizeof(*devs));
-	if (devs == NULL) {
-		return 0;
+	if (capacity > 0 && out_ids != NULL) {
+		snprintf(out_ids[0], 256, "%s", cam.id);
 	}
-	uint32_t n = backend.enumerate(backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES); // lists, opens nothing
-	n = n > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : n;
-	char device[256];
-	const char *sel = sim_display_setting("WEBCAM_DEVICE", device, sizeof(device)) ? device : NULL;
-	const int32_t idx = sim_webcam_select_device(devs, n, sel);
-	uint32_t count = 0;
-	if (idx >= 0 && devs[idx].id[0] != '\0') {
-		if (capacity > 0 && out_ids != NULL) {
-			snprintf(out_ids[0], 256, "%s", devs[idx].id);
-		}
-		count = 1;
-	}
-	free(devs);
-	return count;
+	return 1;
 }
 
 bool
 sim_display_webcam_tracking_enabled(void)
 {
-	return sim_display_webcam_tracking_requested() && sim_face_estimator_default_available();
+	return sim_display_webcam_tracking_requested() && sim_webcam_estimator_usable(&g_shim_settings);
 }
 
-//! The webcam knobs, through the host iface (N3c: `dp set sim-display WEBCAM_* ...`).
-static void
-config_from_settings(struct sim_webcam_config *cfg)
-{
-	sim_webcam_config_defaults(cfg);
-	char e[64];
-	if (sim_display_setting("WEBCAM_HFOV_DEG", e, sizeof(e))) {
-		const float v = (float)atof(e);
-		if (v > 10.0f && v < 170.0f) {
-			cfg->hfov_deg = v;
-		}
-	}
-	if (sim_display_setting("WEBCAM_IPD_MM", e, sizeof(e))) {
-		const float v = (float)atof(e);
-		if (v > 40.0f && v < 90.0f) {
-			cfg->ipd_m = v / 1000.0f;
-		}
-	}
-	if (sim_display_setting("WEBCAM_OFFSET_MM", e, sizeof(e)) &&
-	    !sim_webcam_parse_offset_mm(e, cfg->cam_offset_m)) {
-		U_LOG_W("sim_display webcam tracking: WEBCAM_OFFSET_MM='%s' is not \"x,y,z\" - ignored", e);
-	}
-	cfg->mirrored = sim_display_setting_on("WEBCAM_MIRROR");
-}
-
-//! Start the tracker (caller holds the lock). Leaves it NULL when it cannot run.
+//! Start the tracker (caller holds the lock). Leaves it NULL when it cannot run (the core WARNs why).
 static void
 start_locked(void)
 {
 	u_eye_history_init(&g_webcam_hist); // paired with stop_locked, whatever happens below
-	if (!sim_face_estimator_default_available()) {
-		if (!g_webcam_warned_no_estimator) {
-			g_webcam_warned_no_estimator = true;
-			U_LOG_W(
-			    "sim_display webcam tracking (#1855): SIM_DISPLAY_WEBCAM_TRACKING is set but this build "
-			    "has no face estimator - camera NOT opened, eye positions stay nominal");
-		}
-		return;
-	}
-	struct u_stereo_uvc_backend backend;
-	if (!os_uvc_capture_backend(&backend)) {
-		U_LOG_W(
-		    "sim_display webcam tracking (#1855): no camera capture backend on this platform - not tracking");
-		return;
-	}
-	g_webcam_est = sim_face_estimator_create_default();
-	if (g_webcam_est == NULL) {
-		U_LOG_W("sim_display webcam tracking (#1855): the face estimator failed to load - not tracking");
-		return;
-	}
-	struct sim_webcam_config cfg;
-	config_from_settings(&cfg);
 	float w_m = 0.0f, h_m = 0.0f;
 	uint32_t px_w = 0, px_h = 0;
 	sim_display_get_panel_metrics(&w_m, &h_m, &px_w, &px_h);
 	if (!(h_m > 0.0f)) {
 		sim_display_get_default_viewer(NULL, &h_m, NULL, NULL);
 	}
-	char device[256];
-	const char *device_name = sim_display_setting("WEBCAM_DEVICE", device, sizeof(device)) ? device : NULL;
-	g_webcam_tracker = sim_webcam_tracker_create(&cfg, &backend, device_name, g_webcam_est, h_m);
-	if (g_webcam_tracker == NULL) {
-		sim_face_estimator_destroy(&g_webcam_est);
-	}
+	const struct sim_webcam_source_params params = {
+	    .settings = &g_shim_settings,
+	    .screen_h_m = h_m,
+	    .backend = NULL,
+	    .estimator = NULL,
+	    .log_name = "sim_display (deprecated WEBCAM_TRACKING)",
+	};
+	g_webcam_src = sim_webcam_source_create(&params);
 }
 
 static void
 stop_locked(void)
 {
-	sim_webcam_tracker_destroy(&g_webcam_tracker); // joins: closes the camera
-	sim_face_estimator_destroy(&g_webcam_est);
+	sim_webcam_source_destroy(&g_webcam_src); // joins: closes the camera
 	u_eye_history_destroy(&g_webcam_hist);
 }
 
@@ -190,7 +150,7 @@ sim_display_webcam_tracking_apply_at(struct xrt_eye_positions *out,
 			start_locked();
 		}
 	}
-	struct sim_webcam_tracker *t = g_webcam_tracker;
+	struct sim_webcam_tracker *t = sim_webcam_source_tracker(g_webcam_src);
 	if (t == NULL) {
 		pthread_mutex_unlock(&g_webcam_lock);
 		return false;
@@ -261,10 +221,10 @@ sim_display_webcam_tracking_status(bool *out_tracking, uint64_t *out_edges)
 	bool tracking = false;
 	uint64_t edges = 0;
 	pthread_mutex_lock(&g_webcam_lock);
-	if (g_webcam_tracker != NULL) {
+	if (g_webcam_src != NULL) {
 		const struct xrt_vec3 zero[2] = {{0, 0, 0}, {0, 0, 0}};
 		struct sim_webcam_eyes eyes;
-		sim_webcam_tracker_sample(g_webcam_tracker, zero, os_monotonic_get_ns(), &eyes);
+		sim_webcam_tracker_sample(sim_webcam_source_tracker(g_webcam_src), zero, os_monotonic_get_ns(), &eyes);
 		tracking = eyes.is_tracking;
 		edges = eyes.edges;
 	}

@@ -4,9 +4,19 @@
  * @file
  * @brief  sim_tracking — the in-tree reference viewer-tracking provider (ADR-054 §4.1, N6 Part 2).
  *
- * Implements `xrt/xrt_tracking_plugin.h`. A scripted viewer with no camera:
- * the hardware-free source CI uses to prove that `xrLocateViews` follows a
- * provider on a display that does not track (sim_display, EXTERNAL_OK).
+ * Implements `xrt/xrt_tracking_plugin.h`, with two sources (`SOURCE`):
+ *  - `script` (default): a scripted viewer (`SCRIPT=sweep|offset`) — the
+ *    hardware-free source CI uses to prove that `xrLocateViews` follows a
+ *    provider on a display that does not track (sim_display, EXTERNAL_OK).
+ *    `CAMERA=1` adds a simulated webcam (the calibration test bed);
+ *  - `webcam`: the webcam eye tracker of #1855 (moved here from sim_display;
+ *    sim_tracking_webcam.h). Display-space eye samples plus the camera-space
+ *    block (camera key, per-eye direction + distance). Needs a face estimator
+ *    built in (`-DXRT_SIM_WEBCAM_ESTIMATOR=onnx`); the default build's probe
+ *    declines.
+ * Both camera sources report display eyes through the calibrated
+ * `CAMERA_POSE_<n>` for their camera key (R * cam + T) when one is set, else
+ * their own prior.
  *
  * **Opt-in.** `probe()` declines unless the `ENABLE` setting is 1 — being
  * registered is not enough (a scripted head sweeping the views with nothing
@@ -17,9 +27,9 @@
  *
  * Shape the class contract asks of every provider: session-free, its own
  * thread (started by `start()`, joined by `stop()`), samples pushed into the
- * runtime's sink stamped with their capture time. The webcam tracker core of
- * #1855 is still in sim_display (`SIM_DISPLAY_WEBCAM_TRACKING`); moving it in
- * here as `SCRIPT=webcam` is the follow-up (#2144 stack part 3).
+ * runtime's sink stamped with their capture time. sim_display's
+ * `WEBCAM_TRACKING` is the one-release deprecation alias of `SOURCE=webcam`
+ * and runs the same core (sim_webcam_source.h) through its own settings.
  *
  * @ingroup drv_sim_tracking
  */
@@ -32,6 +42,7 @@
 #include "util/u_logging.h"
 
 #include "sim_tracking_script.h"
+#include "sim_tracking_webcam.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +61,9 @@ static const struct xrt_component_setting_desc g_descs[] = {
     {"ENABLE", XRT_COMPONENT_SETTING_TYPE_BOOL, "0",
      "probe() declines unless 1: being registered is not enough (a scripted viewer would drive the views of "
      "every display that accepts an external viewer)"},
+    {"SOURCE", XRT_COMPONENT_SETTING_TYPE_ENUM, "script",
+     "script (a scripted viewer; see SCRIPT, CAMERA) | webcam (the webcam eye tracker; needs a face estimator "
+     "built in, -DXRT_SIM_WEBCAM_ESTIMATOR=onnx; see WEBCAM_*)"},
     {"SCRIPT", XRT_COMPONENT_SETTING_TYPE_ENUM, "sweep",
      "sweep (the head sweeps left-right, AMPLITUDE_M over PERIOD_MS) | offset (holds still at nominal + "
      "OFFSET_*_M)"},
@@ -72,6 +86,18 @@ static const struct xrt_component_setting_desc g_descs[] = {
      "hidden ground truth \"tx,ty,tz,qx,qy,qz,qw\" (metres, display space); empty = the bezel prior"},
     {"CAMERA_DEPTH_BIAS", XRT_COMPONENT_SETTING_TYPE_FLOAT, "1",
      "reported distance = true distance x this (a simulated per-user iris-size error)"},
+    {"WEBCAM_ESTIMATOR", XRT_COMPONENT_SETTING_TYPE_ENUM, "auto",
+     "SOURCE=webcam: auto (the built-in face estimator), none, or the built-in name (yunet-onnx)"},
+    {"WEBCAM_MODEL", XRT_COMPONENT_SETTING_TYPE_STRING, "",
+     "SOURCE=webcam: face model path (default: beside the plug-in)"},
+    {"WEBCAM_DEVICE", XRT_COMPONENT_SETTING_TYPE_STRING, "",
+     "SOURCE=webcam: camera index or a substring of its name (default: the first)"},
+    {"WEBCAM_HFOV_DEG", XRT_COMPONENT_SETTING_TYPE_FLOAT, "70", "SOURCE=webcam: horizontal field of view (10..170)"},
+    {"WEBCAM_IPD_MM", XRT_COMPONENT_SETTING_TYPE_FLOAT, "63", "SOURCE=webcam: IPD prior for depth (40..90)"},
+    {"WEBCAM_OFFSET_MM", XRT_COMPONENT_SETTING_TYPE_STRING, "0,0,0",
+     "SOURCE=webcam, uncalibrated: camera position from the panel's top-centre, \"x,y,z\" mm (a CAMERA_POSE_<n> "
+     "for the camera's key replaces this model)"},
+    {"WEBCAM_MIRROR", XRT_COMPONENT_SETTING_TYPE_BOOL, "0", "SOURCE=webcam: the source delivers a mirrored image"},
 };
 
 static const struct xrt_tracking_plugin_host_iface *g_host = NULL;
@@ -123,6 +149,33 @@ setting_ms(const char *key, int64_t fallback)
 	return (end != v && n >= 0) ? (int64_t)n : fallback;
 }
 
+//! The webcam core's settings seam, satisfied by the host iface.
+static bool
+webcam_get(void *ctx, const char *key, char *buf, size_t cap)
+{
+	(void)ctx;
+	return setting(key, buf, (uint32_t)cap);
+}
+
+static const struct sim_webcam_settings g_webcam_settings = {webcam_get, NULL};
+
+//! SOURCE=webcam? (anything else, unset included, is the script)
+static bool
+source_is_webcam(void)
+{
+	char v[16];
+	if (!setting("SOURCE", v, sizeof(v))) {
+		return false;
+	}
+	if (strcmp(v, "webcam") == 0) {
+		return true;
+	}
+	if (strcmp(v, "script") != 0) {
+		U_LOG_W("sim-tracking: SOURCE='%s' is not script|webcam - using script.", v);
+	}
+	return false;
+}
+
 static uint32_t
 describe_settings(const struct xrt_component_setting_desc **out_descs)
 {
@@ -147,6 +200,7 @@ struct sim_tracking
 	struct sim_tracking_camera cam;
 	bool oth_ready;
 	bool running;
+	struct sim_tracking_webcam *webcam; //!< SOURCE=webcam while started
 	const struct xrt_tracking_sink *sink;
 	struct sim_tracking_script script;
 	int64_t interval_ns;
@@ -187,6 +241,45 @@ make_sample(const struct sim_tracking *st, int64_t t_ns, struct xrt_tracking_vie
 }
 
 /*!
+ * The calibrated pose for @p camera_key: the first `CAMERA_POSE_<n>` slot whose
+ * `_CAMERA` is that key, into @p c's believed pose (+ depth / focal scale).
+ * @return true when a well-formed slot was found; false leaves @p c's pose as
+ * the caller set it (its prior).
+ */
+static bool
+load_calibrated_pose(const char *camera_key, struct sim_tracking_camera *c)
+{
+	char v[256];
+	for (int n = 0; n < SIM_TRACKING_POSE_SLOTS; n++) {
+		char key[48], cam[XRT_TRACKING_CAMERA_KEY_MAX];
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_CAMERA", n);
+		if (!setting(key, cam, sizeof(cam)) || strcmp(cam, camera_key) != 0) {
+			continue;
+		}
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d", n);
+		double t[3], q[4];
+		if (!setting(key, v, sizeof(v)) || !sim_tracking_parse_pose(v, t, q)) {
+			U_LOG_W("sim-tracking: %s for camera '%s' is missing or malformed - using the prior.", key,
+			        cam);
+			return false;
+		}
+		memcpy(c->pose_t, t, sizeof(t));
+		memcpy(c->pose_q, q, sizeof(q));
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_DEPTH_SCALE", n);
+		c->depth_scale = setting_float(key, 1.0f);
+		snprintf(key, sizeof(key), "CAMERA_POSE_%d_FOCAL_SCALE", n);
+		c->focal_scale = setting_float(key, 1.0f);
+		U_LOG_W(
+		    "sim-tracking: camera '%s' calibrated pose CAMERA_POSE_%d = (%.4f, %.4f, %.4f) m, q (%.4f, %.4f, "
+		    "%.4f, %.4f), depth scale %.4f, focal scale %.4f.",
+		    cam, n, c->pose_t[0], c->pose_t[1], c->pose_t[2], c->pose_q[0], c->pose_q[1], c->pose_q[2],
+		    c->pose_q[3], c->depth_scale, c->focal_scale);
+		return true;
+	}
+	return false;
+}
+
+/*!
  * The camera model from settings: the hidden true pose, and the believed pose
  * — the `CAMERA_POSE_<n>` slot whose `_CAMERA` is this camera's key, else the
  * prior. `_SCREEN` is recorded by the calibration but not matched here: the
@@ -214,30 +307,10 @@ load_camera(struct sim_tracking *st, float display_height_m)
 	if (!st->camera_on) {
 		return;
 	}
-	for (int n = 0; n < SIM_TRACKING_POSE_SLOTS; n++) {
-		char key[48], cam[XRT_TRACKING_CAMERA_KEY_MAX];
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d_CAMERA", n);
-		if (!setting(key, cam, sizeof(cam)) || strcmp(cam, st->camera_key) != 0) {
-			continue;
-		}
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d", n);
-		if (!setting(key, v, sizeof(v)) || !sim_tracking_parse_pose(v, c->pose_t, c->pose_q)) {
-			U_LOG_W("sim-tracking: %s for camera '%s' is missing or malformed - using the prior.", key,
-			        cam);
-			sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
-			break;
-		}
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d_DEPTH_SCALE", n);
-		c->depth_scale = setting_float(key, 1.0f);
-		snprintf(key, sizeof(key), "CAMERA_POSE_%d_FOCAL_SCALE", n);
-		c->focal_scale = setting_float(key, 1.0f);
-		U_LOG_W(
-		    "sim-tracking: camera '%s' calibrated pose CAMERA_POSE_%d = (%.4f, %.4f, %.4f) m, q (%.4f, %.4f, "
-		    "%.4f, %.4f), depth scale %.4f, focal scale %.4f.",
-		    cam, n, c->pose_t[0], c->pose_t[1], c->pose_t[2], c->pose_q[0], c->pose_q[1], c->pose_q[2],
-		    c->pose_q[3], c->depth_scale, c->focal_scale);
+	if (load_calibrated_pose(st->camera_key, c)) {
 		return;
 	}
+	sim_tracking_camera_prior(display_height_m, c->pose_t, c->pose_q);
 	U_LOG_W(
 	    "sim-tracking: camera '%s' has no CAMERA_POSE_<n> - reporting through the bezel prior (%.4f, %.4f, "
 	    "%.4f) m.",
@@ -274,6 +347,9 @@ sim_tracking_probe(struct xrt_tracking_plugin_instance **out_inst)
 		    "DXR_TRACKING_SIM_TRACKING_ENABLE=1 in the hosting process) enables the scripted viewer.");
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+	if (source_is_webcam() && !sim_tracking_webcam_probe(&g_webcam_settings)) {
+		return XRT_ERROR_PROBER_NOT_SUPPORTED; // probe must not say yes without a usable source
+	}
 	return XRT_SUCCESS;
 }
 
@@ -283,6 +359,10 @@ sim_tracking_describe(struct xrt_tracking_plugin_instance *inst, struct xrt_trac
 	(void)inst;
 	if (out == NULL || out->struct_size < offsetof(struct xrt_tracking_provider_info, camera_key)) {
 		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	if (source_is_webcam()) {
+		sim_tracking_webcam_describe(&g_webcam_settings, out);
+		return XRT_SUCCESS;
 	}
 	out->tracks = XRT_TRACKING_TRACKS_EYE_PAIR | XRT_TRACKING_TRACKS_HEAD_POSE;
 	out->typical_latency_ns = 0;
@@ -359,6 +439,32 @@ sim_tracking_start(struct xrt_tracking_plugin_instance *inst, const struct xrt_t
 	st->interval_ns = 1000000000LL / rate;
 	st->sink = sink;
 
+	if (source_is_webcam()) {
+		const float screen_h_m = display_height_m > 0.0f ? display_height_m : 0.194f; // sim default panel
+		// The calibration (CAMERA_POSE_<n> for this camera's key) replaces the bezel-offset model.
+		struct sim_tracking_camera pose;
+		memset(&pose, 0, sizeof(pose));
+		pose.depth_scale = 1.0;
+		pose.focal_scale = 1.0;
+		char key[XRT_TRACKING_CAMERA_KEY_MAX];
+		const bool calibrated = sim_tracking_webcam_camera_key(&g_webcam_settings, key, sizeof(key)) &&
+		                        load_calibrated_pose(key, &pose);
+		st->webcam = sim_tracking_webcam_start(&g_webcam_settings, screen_h_m, sc->nominal, sc->ipd_m,
+		                                       st->interval_ns, calibrated ? &pose : NULL, sink);
+		if (st->webcam == NULL) {
+			st->sink = NULL;
+			return XRT_ERROR_PROBER_NOT_SUPPORTED; // the core WARNed why
+		}
+		st->running = true;
+		U_LOG_W(
+		    "sim-tracking: started — WEBCAM viewer (nominal (%.3f, %.3f, %.3f) m, panel height %.3f m, %s, "
+		    "%lld "
+		    "Hz poll).",
+		    (double)sc->nominal[0], (double)sc->nominal[1], (double)sc->nominal[2], (double)screen_h_m,
+		    calibrated ? "calibrated CAMERA_POSE" : "uncalibrated bezel-offset model", (long long)rate);
+		return XRT_SUCCESS;
+	}
+
 	load_camera(st, display_height_m);
 
 	// One sample synchronously, so the first locate after start() has data.
@@ -394,6 +500,12 @@ sim_tracking_stop(struct xrt_tracking_plugin_instance *inst)
 	if (st == NULL || !st->running) {
 		return;
 	}
+	if (st->webcam != NULL) {
+		sim_tracking_webcam_stop(&st->webcam); // returns after the last push; closes the camera
+		st->running = false;
+		st->sink = NULL;
+		return;
+	}
 	os_thread_helper_stop_and_wait(&st->oth);
 	// A stopped helper cannot be restarted: re-init it for the next start().
 	os_thread_helper_destroy(&st->oth);
@@ -406,6 +518,9 @@ static enum xrt_tracking_provider_status
 sim_tracking_get_status(struct xrt_tracking_plugin_instance *inst)
 {
 	struct sim_tracking *st = (struct sim_tracking *)inst;
+	if (st != NULL && st->running && st->webcam != NULL) {
+		return sim_tracking_webcam_status(st->webcam);
+	}
 	return (st != NULL && st->running) ? XRT_TRACKING_PROVIDER_STATUS_RUNNING
 	                                   : XRT_TRACKING_PROVIDER_STATUS_STOPPED;
 }

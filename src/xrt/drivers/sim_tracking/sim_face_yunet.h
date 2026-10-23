@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  sim_display webcam eye tracking (#1855): the pure, inference-free
+ * @brief  webcam eye tracking (#1855, sim_tracking SOURCE=webcam): the pure, inference-free
  *         halves of the YuNet face detector: frame -> input tensor, and
  *         output tensors -> the two eye landmarks.
  *
@@ -16,15 +16,15 @@
  * ((kps[2n] + col) * s, (kps[2n+1] + row) * s).
  *
  * Kept free of ONNX Runtime so the default build compiles and unit-tests it:
- * only sim_display_face_estimator_onnx.c (XRT_SIM_WEBCAM_ESTIMATOR=onnx)
+ * only sim_face_estimator_onnx.c (XRT_SIM_WEBCAM_ESTIMATOR=onnx)
  * runs the network between these two calls.
  *
- * @ingroup drv_sim_display
+ * @ingroup drv_sim_tracking
  */
 
 #pragma once
 
-#include "sim_display_webcam_tracking.h"
+#include "sim_webcam_tracking.h"
 
 #include <stdbool.h>
 #include <stddef.h>
