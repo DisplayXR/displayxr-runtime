@@ -67,39 +67,48 @@ foreach ($g in $groups) {
 W ''
 W '## Verdict (interleaved pairs, R p50)'
 W ''
+$combos = @()
 foreach ($app in @($rows | ForEach-Object { $_.app } | Select-Object -Unique)) {
+    $others = @($rows | Where-Object { $_.app -eq $app -and $_.arm -ne 'native' } | ForEach-Object { $_.arm } | Select-Object -Unique)
+    if ($others.Count -eq 0) { $combos += ,@($app, '') } else { foreach ($o in $others) { $combos += ,@($app, $o) } }
+}
+foreach ($cb in $combos) {
+    $app = $cb[0]; $hubArm = $cb[1]
+    $lbl = $(if ($hubArm -ne '') { $app + ' ' + $hubArm + ' vs native' } else { $app })
     $nat = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'native' -and $_.status -eq 'OK' -and $_.r_p50 -ne '' })
-    $hub = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'hub' -and $_.status -eq 'OK' -and $_.r_p50 -ne '' })
-    if ($hub.Count -eq 0 -and @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'hub' }).Count -eq 0) {
-        W ('- **' + $app + '**: no hub arm (native only).'); continue
+    $hub = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq $hubArm -and $_.status -eq 'OK' -and $_.r_p50 -ne '' })
+    if ($hub.Count -eq 0 -and @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq $hubArm }).Count -eq 0) {
+        W ('- **' + $lbl + '**: no hub arm (native only).'); continue
     }
     $deltas = @()
     $pres = @()
     $gpus = @()
+    $p2d = @()
     foreach ($n in $nat) {
         $h = $hub | Where-Object { $_.rep -eq $n.rep } | Select-Object -First 1
         if ($h -ne $null) {
             $deltas += ([double]$h.r_p50 - [double]$n.r_p50)
             $pres += ([double]$h.present_s - [double]$n.present_s)
             if ($h.gpu_app_total -ne '' -and $n.gpu_app_total -ne '') { $gpus += ([double]$h.gpu_app_total - [double]$n.gpu_app_total) }
+            if ($h.pm_until_displayed_p50 -ne '' -and $n.pm_until_displayed_p50 -ne '') { $p2d += ([double]$h.pm_until_displayed_p50 - [double]$n.pm_until_displayed_p50) }
         }
     }
     if ($deltas.Count -eq 0) {
         # Fallback when one site writes no R (vknative needs VK_KHR_present_wait):
         # PresentMon present->display. A DIFFERENT metric, labelled as such.
         $natP = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'native' -and $_.status -eq 'OK' -and $_.pm_until_displayed_p50 -ne '' })
-        $hubP = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq 'hub' -and $_.status -eq 'OK' -and $_.pm_until_displayed_p50 -ne '' })
+        $hubP = @($rows | Where-Object { $_.app -eq $app -and $_.arm -eq $hubArm -and $_.status -eq 'OK' -and $_.pm_until_displayed_p50 -ne '' })
         $pd = @()
         foreach ($n in $natP) { $h = $hubP | Where-Object { $_.rep -eq $n.rep } | Select-Object -First 1
             if ($h -ne $null) { $pd += ([double]$h.pm_until_displayed_p50 - [double]$n.pm_until_displayed_p50) } }
-        if ($pd.Count -eq 0) { W ('- **' + $app + '**: no verified native/hub pair - no verdict (see refused runs).'); continue }
+        if ($pd.Count -eq 0) { W ('- **' + $lbl + '**: no verified native/hub pair - no verdict (see refused runs).'); continue }
         $nm = Get-TrueMedian @($natP | ForEach-Object { [double]$_.pm_until_displayed_p50 })
         $bd = [math]::Max($NoiseMs, $NoiseFrac * $nm); $pm = Get-TrueMedian $pd
         $v = 'within noise'
         if ($pm -le -$bd -and @($pd | Where-Object { $_ -lt 0 }).Count -eq $pd.Count) { $v = 'hub BETTER' }
         elseif ($pm -ge $bd -and @($pd | Where-Object { $_ -gt 0 }).Count -eq $pd.Count) { $v = 'hub WORSE' }
         W ('- **{0}**: {1} on PresentMon MsUntilDisplayed p50 (present->display; R unavailable on one arm) - hub-native median {2:+0.00;-0.00} ms over {3} pair(s), band +/-{4:0.00} ms{5}' -f `
-            $app, $v, $pm, $pd.Count, $bd, $(if ($pd.Count -lt 3) { ' (n<3: indicative only)' } else { '' }))
+            $lbl, $v, $pm, $pd.Count, $bd, $(if ($pd.Count -lt 3) { ' (n<3: indicative only)' } else { '' }))
         continue
     }
     $natMed = Get-TrueMedian @($nat | ForEach-Object { [double]$_.r_p50 })
@@ -111,9 +120,10 @@ foreach ($app in @($rows | ForEach-Object { $_.app } | Select-Object -Unique)) {
     elseif ($dm -ge $band -and $pos -eq $deltas.Count) { $v = 'hub WORSE' }
     $note = ''
     if ($deltas.Count -lt 3) { $note = ' (n=' + $deltas.Count + ' pair(s): indicative only)' }
-    W ('- **{0}**: {1} - R p50 hub-native median {2:+0.00;-0.00} ms over {3} pair(s) [{4}], band +/-{5:0.00} ms; present/s delta median {6:+0.0;-0.0}; app GPU busy delta median {7} points{8}' -f `
-        $app, $v, $dm, $deltas.Count, (($deltas | ForEach-Object { '{0:+0.00;-0.00}' -f $_ }) -join ', '), $band, (Get-TrueMedian $pres),
-        $(if ($gpus.Count -gt 0) { '{0:+0.0;-0.0}' -f (Get-TrueMedian $gpus) } else { '-' }), $note)
+    W ('- **{0}**: {1} - R p50 hub-native median {2:+0.00;-0.00} ms over {3} pair(s) [{4}], band +/-{5:0.00} ms; present/s delta median {6:+0.0;-0.0}; app GPU busy delta median {7} points; present->display delta median {9} ms{8}' -f `
+        $lbl, $v, $dm, $deltas.Count, (($deltas | ForEach-Object { '{0:+0.00;-0.00}' -f $_ }) -join ', '), $band, (Get-TrueMedian $pres),
+        $(if ($gpus.Count -gt 0) { '{0:+0.0;-0.0}' -f (Get-TrueMedian $gpus) } else { '-' }), $note,
+        $(if ($p2d.Count -gt 0) { '{0:+0.00;-0.00}' -f (Get-TrueMedian $p2d) } else { '-' }))
 }
 W ''
 W '## Placement evidence (verbatim, first run of each arm)'

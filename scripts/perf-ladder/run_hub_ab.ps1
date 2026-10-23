@@ -357,6 +357,7 @@ foreach ($app in $cfg.apps) {
     if (-not (Test-Path $exe)) { Log ('SKIP app ' + $app.name + ': ' + $exe + ' not found'); continue }
     foreach ($arm in $app.arms) {
         $opt = ($arm.PSObject.Properties['optional'] -ne $null -and $arm.optional)
+        if ($arm.PSObject.Properties['topologies'] -ne $null -and -not (@($arm.topologies) -contains $Topology)) { continue }
         if ($Arms.Count -gt 0) { if (-not ($Arms -contains $arm.name)) { continue } }
         elseif ($opt) { continue }
         $plan += New-Object PSObject -Property @{ app = $app; arm = $arm; exe = $exe }
@@ -527,6 +528,10 @@ function Invoke-Run {
     if ($placeReq -and $ev.placement -eq '') { $status = 'REFUSED'; $flags += 'NO_PLACEMENT_LINE' }
     if (-not $placeReq -and $ev.placement -eq '') { $flags += 'NO_PLACEMENT_LINE' }
     if ($expect -eq 'hub' -and $ev.hubPlacement -eq '') { $flags += 'NO_HUB_PLACEMENT_LINE' }
+    if ($arm.PSObject.Properties['expectLine'] -ne $null) {
+        $hit = @($logLines | Where-Object { $_ -match $arm.expectLine }).Count
+        if ($hit -eq 0) { $status = 'REFUSED'; $pathOk = $false; $flags += 'EXPECT_LINE_MISSING' }
+    }
     # Every run must load the SAME runtime + DP: a peer pushing a build or a
     # plug-in mid-campaign silently changes the subject (measured: one arm of a
     # validation pass loaded a different git tag than its sibling).
@@ -604,7 +609,7 @@ function Invoke-Run {
     Log ('  {0} path={1} (want {2}) site={3} present/s={4} R p50/p95={5}/{6} n={7} D n={8} gpu app={9}% fg={10} {11}' -f `
         $status, $ev.path, $expect, $witSite, $wp, $lat.r50, $lat.r95, $lat.rN, $lat.dN, $gt, $foreground, ($flags -join ';'))
     if ($status -eq 'REFUSED') { Log ('    placement: ' + $ev.placement); if ($ev.active.Count -gt 0) { Log ('    active: ' + ($ev.active -join ' | ')) } }
-    if ($status -eq 'REFUSED' -and ($foreground -ne 'yes' -or ($flags -match '^CONTENDED_')) -and $attempt -eq 1 -and $pathOk) { return 'REFUSED_FOCUS' }
+    if ($status -eq 'REFUSED' -and ($foreground -ne 'yes' -or ($flags -match '^CONTENDED_')) -and $pathOk) { return 'REFUSED_FOCUS' }
     return $status
 }
 
@@ -617,10 +622,16 @@ for ($rep = 1; $rep -le $reps; $rep++) {
         Log ('rep ' + $rep + ' ' + $item.app.name + '/' + $item.arm.name)
         $s = 'ERROR'
         try { $s = Invoke-Run -item $item -rep $rep } catch { Log ('  ERROR: ' + $_.Exception.Message + ' @ ' + $_.InvocationInfo.ScriptLineNumber) }
-        if ($s -eq 'REFUSED_FOCUS') {
-            Log '  focus lost - retrying this run once'
+        # Focus theft / a peer XR app is environmental, not the arm: retry so the
+        # interleaved pair survives. A path mismatch is deterministic - no retry.
+        $maxR = 1; if ($cfg.PSObject.Properties['maxRetries'] -ne $null) { $maxR = [int]$cfg.maxRetries }
+        $att = 1
+        while (($s -eq 'REFUSED_FOCUS' -or $s -eq 'APP_EXITED' -or $s -eq 'ERROR') -and $att -le $maxR) {
+            $att++
+            Log ('  environmental refusal (' + $s + ') - retry ' + ($att - 1) + '/' + $maxR)
             Start-Sleep -Seconds $coolSec
-            try { $s = Invoke-Run -item $item -rep $rep -attempt 2 } catch { Log ('  ERROR: ' + $_.Exception.Message) }
+            $s = 'ERROR'
+            try { $s = Invoke-Run -item $item -rep $rep -attempt $att } catch { Log ('  ERROR: ' + $_.Exception.Message) }
         }
         if ($s -eq 'ABORT') { $aborted = $true; break }
         Start-Sleep -Seconds $coolSec

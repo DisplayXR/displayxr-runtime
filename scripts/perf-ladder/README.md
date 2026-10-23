@@ -59,14 +59,20 @@ boxes; compare the derived deltas).
 A second harness in this kit, for the single-hub decision: it measures each
 per-API in-process compositor (`native`) against the D3D11 weave/present hub
 (`hub`) on `cube_handle_{d3d11,d3d12,vk,gl}_win`. An arm is a **name + an env
-map** (`hub-ab.json`), plus the path its own log must prove:
+map** (`hub-ab.json`), plus the path its own log must prove.
 
-| app | `native` | `hub` | hub's expected path |
+Arms are per app **and per topology** (`topologies` on an arm; `native` = the
+path `main` takes by default on that topology - VK's only non-hub path is the
+kill switch):
+
+| app | topology | `native` (expected path) | hub arm(s) (expected line) |
 |---|---|---|---|
-| d3d11 | `DXR_WEAVE_ON_SCANOUT=0` | `DXR_HUB=1` (P1b shim) | `hub placement: hub=1` |
-| d3d12 | `DXR_WEAVE_ON_SCANOUT=0` | default env | `#1264 heavy-d3d12 reroute ACTIVE` (d3d11 fill arm) |
-| vk    | `DXR_WEAVE_ON_SCANOUT=0` | default env | `VK output-device split ACTIVE` (d3d11 fill arm) |
-| gl    | default env | - (no hub arm yet) | - |
+| d3d11 | default | default env (own #918 split) | `hub`: `DXR_HUB=1` (`hub placement: hub=1 ... ingress=xbridge`) |
+| d3d11 | same-adapter | default env (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge` |
+| d3d12 | default | default env (own-legs split) | `hub` (optional): `DXR_SPLIT_D3D12_HYBRID_REROUTE=1` - the code gate also needs `DXR_APP_FRAME_DIVISOR>=2`, so it is not like-for-like |
+| d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`heavy-d3d12 reroute ACTIVE`) |
+| vk | both | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`VK output-device split ACTIVE`) |
+| gl | both | default env | - (reference row) |
 
 ```powershell
 .\run_hub_ab.ps1 -AppDir <repo>\test_apps\build\bin                      # all apps, n=3 x 20 s
@@ -87,9 +93,10 @@ map** (`hub-ab.json`), plus the path its own log must prove:
   log (`weave placement:` / `hub placement:` verbatim + the split/reroute ACTIVE
   lines) and cross-checked against the `[WITNESS]` site (`d3d11` for the fill
   arm/hub, the API's own site for native). A mismatch, a lost foreground, a
-  missing witness, or a runtime/DP different from the pinned one
+  missing witness, a missing `expectLine`, a peer XR app mid-window, or a runtime/DP different from the pinned one
   (`-ExpectRuntime`, default = the first run's) marks the run REFUSED: kept in
-  `runs.csv`, never counted. A focus-refused run is retried once.
+  `runs.csv`, never counted. Environmental refusals (focus, peer app, app exit) are retried up to
+  `maxRetries` so the interleaved pair survives; a path mismatch is not.
 - **R / D.** `DXR_WEAVE_LATENCY_CSV=<run dir>\wl` writes `wl.<site>.csv`; R is
   joined F->S exactly as `weave_latency.py` does (app frames only, window
   limited by QPC). D rows exist only where the site is handed
