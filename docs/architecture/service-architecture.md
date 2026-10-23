@@ -130,7 +130,9 @@ Windows only.
    │  capture/render thread (workspace mode only)                   comp_d3d11_service.cpp:6186│
    │  window-op worker (detached, never joined)                     comp_d3d11_service.cpp:1398│
    │  WinRT capture pool threads (2D window capture)               d3d11_capture.cpp:285   │
-   │  IN-PROCESS DLLs: vendor DP (leaked HMODULE), input providers (leaked), LeapC.dll     │
+   │  viewer-tracking provider thread (on demand, ADR-054 N6)      target_viewer_tracking.c│
+   │  IN-PROCESS DLLs: vendor DP (leaked HMODULE), input providers (leaked), LeapC.dll,    │
+   │    viewer-tracking providers (ADR-054 N6: one per service, shared by every client)    │
    └──┬──────────────────────┬────────────────────────────────────────────────────────────┘
       │ CreateProcessA
       ▼

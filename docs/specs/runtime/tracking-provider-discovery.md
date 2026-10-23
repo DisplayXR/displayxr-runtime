@@ -1,6 +1,6 @@
 # Viewer-Tracking Provider Discovery Contract
 
-**Status:** implemented (ADR-054 §4.1, N6 Part 2, #2144) — in-process hosting, primary screen.
+**Status:** implemented (ADR-054 §4.1, N6 Part 2, #2144) — in-process and service hosting (§4a), per-screen routing (§4b).
 **ABI:** `src/xrt/include/xrt/xrt_tracking_plugin.h`, major 1 (`XRT_TRACKING_PLUGIN_API_VERSION_CURRENT`).
 **Siblings:** [plugin-discovery.md](plugin-discovery.md) (display processors),
 [input-provider-discovery.md](input-provider-discovery.md),
@@ -103,9 +103,10 @@ ABI gate) and probed; every provider whose probe claims a usable source stays re
 **`PreferredPlugin` first, then ProbeOrder** (ties by id). The rank-0 provider serves the screen.
 `DXR_TRACKING_PROVIDERS=0` in the process skips the scan (CTS / test isolation).
 
-The viewer source is decided at system creation and is **static per instance**: a provider
-enabled, disabled or preferred later takes effect at the next app launch (the same rule as
-`dp set`). The chosen provider is started on the first viewer request and stopped at system
+The primary screen's viewer source is decided at system creation and is **static per instance**:
+a provider enabled, disabled or preferred later takes effect at the next app launch (the same rule
+as `dp set`) — in the service, at the next service start (§4a). Other screens follow the display
+topology (§4b). The chosen provider is started on the first viewer request and stopped at system
 teardown.
 
 ## 4. Arbitration (trunk policy)
@@ -132,22 +133,114 @@ a NULL slot, 0 or an unknown value read as **FIXED**, so no installed display ch
 `display` is a runtime-built descriptor, NULL = the plug-in's active panel. `sim_display` declares
 EXTERNAL_OK. Reference: `docs/reference/xrt_plugin_iface.md`.
 
-### Per screen: read the segment DP of THAT screen
+### 4a. Hosting: in-process and in the service
+
+The provider is hosted by **the process that computes the views**, once:
+
+| Process | Hosts? | What it does |
+|---|---|---|
+| In-process runtime (`_handle` / `_texture` / `_hosted`, no service involved) | yes | `oxr_session.c` splices the provider's eyes into `xrLocateViews` |
+| `displayxr-service` | **yes — one provider for every IPC client** | its own native system runs the same loader and the same arbitration (`target_viewer_tracking.c`); the IPC view paths splice the provider's eyes |
+| IPC client (any app under `XRT_FORCE_MODE=ipc`, a workspace session, a weave present-owner) | **never** | it never creates a native system, so `xrt_system_devices::viewer_tracking` is NULL and nothing is scanned or loaded; the service's answer is used as is |
+
+A hybrid runtime is therefore in-process when it has no service and an IPC client when it has
+one, and a provider is never loaded twice for one view path. (An in-process app running *beside*
+a service still hosts its own: the two are different view paths. Each starts its provider only
+on its first viewer request, so the second camera open happens only when both kinds of app run
+at once — see §10.)
+
+In the service, every place that hands an IPC client eyes **for its views** asks the arbitration
+(`ipc_viewer_override_eyes` → `xrt_viewer_tracking_override_eyes`, `ipc_server_handler.c`):
+
+- the locate — `ipc_try_get_sr_view_poses` (D3D11 service: the client's render pair and the
+  `XR_DXR_view_rig` raw channel) and `ipc_try_get_oop_view_poses` (macOS / desktop Linux / Android
+  null + comp_multi: the head set, DP or nominal, N-view shape kept and translated onto the pair);
+- the zone-scoped locate re-framed onto another screen (ADR-047 Amendment 4 addendum) — that
+  screen's id;
+- `compositor_get_predicted_eye_positions` — the live `isTracking` and the tracking-state event;
+- `compositor_get_segment_metrics` — the per-screen table an IPC client computes per-segment views
+  from (§4b). That message carries no target time: the splice samples at "now".
+
+The splice itself (`xrt_viewer_tracking_splice`, `xrt/xrt_viewer_tracking.h`) is shared with the
+in-process locate, so both paths produce identical views. A screen whose display tracks, or whose
+policy is not EXTERNAL_OK, answers false everywhere and the DP's eyes stand; the **weave** always
+keeps the DP's own eyes (ADR-033).
+
+The composed advertisement (§5) is composed in the service's own `xrt_system_compositor_info` and
+head rendering modes, which is exactly what `system_compositor_get_info` and the shared-memory head
+carry to every client — an IPC client sees MANAGED|MANUAL + HAS_TRACKING only because the service
+will deliver it.
+
+**Lifetime in the service.** The decision is made when the service creates its system and is
+static for that service run (the scan is one-shot per process; the advertisement every client
+reads is static per instance). The provider starts on the first IPC locate that needs it and stops
+at system teardown. The service subscribes the tracking class to its policy watch only to say,
+once, that a registration / preference change applies at the next service start.
+
+Not covered by the service splice yet: a workspace tile framed from **another presenter's** screen
+(`comp_d3d11_service_get_client_workspace_view_frame`, ADR-052 D2) keeps that presenter DP's eyes,
+and the `XR_DXR_weave` output eyes of a present-owner stay the DP's (they are weaving eyes).
+
+### 4b. Per screen: read the segment DP of THAT screen
 
 The arbitration is a per-screen question and its inputs are per-screen: *whether the display on
-this screen tracks* and *its viewer policy* must be read from **the display processor bound to that
-screen** — the segment DP the runtime created for it (multi-screen M3/M6, `create_dp_*_for_screen`,
-`get_display_info_for_monitor`, `get_viewer_policy(inst, <that screen's descriptor>)`) — never only
-from the primary DP. Two different vendors' displays on one desk (one tracking, one not) must get
-two different answers.
+this screen tracks* and *its viewer policy* are read from **the display processor bound to that
+screen** — the plug-in that won the monitor in the DP registry (`owning_iface` /
+`owning_instance`, the plug-in a segment DP is created from, which `dp use --screen` decides), its
+`get_viewer_policy(inst, <that monitor's descriptor>)`, and the screen info's
+`supported_eye_tracking_modes` (`get_display_info_for_monitor`). Two different vendors' displays on
+one desk (one tracking, one not) get two different answers.
 
-**This release** evaluates the **primary screen only** (the active plug-in's panel): the in-process
-`xrLocateViews` path that a single-screen window takes. A locate split across screens
-(`seg != NULL` in `oxr_session.c`) keeps each segment DP's own eyes, and the status snapshot reports
-every non-primary screen as "dp" when it tracks, else "nominal" with the reason "viewer-tracking
-providers serve the primary screen only (for now)". Per-screen routing through the segment DPs is
-the first follow-up (§9).
+`target_viewer_arbitrate_screens` (pure, `tests/tests_viewer_arbitration.cpp` `[per_screen]`)
+applies §4 to every screen with the one provider:
 
+- a provider serves **every** EXTERNAL_OK screen that has no tracking DP;
+- a tracking DP (or an OWN display) keeps its own screen — the provider is in **standby** there;
+- FIXED screens stay nominal; a plain monitor (no DP) is nominal ("no display processor on this
+  screen").
+
+**Display space of a non-primary screen.** A provider reports in the display space of the screen
+it is calibrated to — the **primary** screen: the host's `get_display_geometry` describes the
+active panel, and the camera-pose calibration (§6) is keyed by screen. Another screen receives the
+sample **translated** by the offset of the primary's centre in that screen's display space
+(`target_viewer_map_offset`): the vector between the two centres in desktop pixels, each screen's
+part of it read at that screen's own pixel pitch (`width_m / desktop_width`; a screen without a
+physical size borrows the other's), z unchanged. This is the workspace's one-layout model
+(ADR-052 D2, the same assumption `comp_ws_map_pose` makes): **exact for coplanar screens that abut
+the way the OS desktop says they do**, an approximation for angled or spaced screens. A screen that
+cannot be mapped (an empty desktop rect, no pitch anywhere) stays nominal with the reason "no
+desktop geometry to map the provider's samples onto this screen". The sample's `screen_hint` stays
+0 (= the calibrated screen); a provider that serves several screens natively is a follow-up.
+
+**When it is evaluated.** The primary screen's decision is the one made at system creation (§3,
+static per instance; it is the one the advertisement is composed from). Every other screen is
+re-evaluated each time the runtime **publishes a display topology** — system creation, a display
+hotplug sweep (ADR-047 Amendment 8), the service's display re-probe — in
+`target_instance.c::publish_screens_locked`, with one WARN per screen whose answer changed. The
+lazy scan runs then only if some screen can take a provider.
+
+**Where it is used.** `xrt_viewer_tracking::get_source / get_eyes_at` take a screen id
+(`XRT_VIEWER_SCREEN_PRIMARY` = 0, or a monitor id). In-process, a locate split across screens
+(`oxr_session_locate_views`, the segment table) splices each segment's eyes by its `screen_id`;
+over IPC the service splices the segment table it sends (§4a). The per-screen
+`xrEnumerateDisplaysDXR` capabilities stay what each screen's DP reports (only the session's
+advertisement is composed) — see §10.
+
+**Status.** `displayxr-cli status --json` reports, per screen, `eye_tracking.viewer_source`
+(`dp` / `provider:<id>` / `nominal`), `viewer_reason`, and **`viewer_provider`** — what the
+provider is doing for that screen:
+
+| `viewer_provider` | Meaning |
+|---|---|
+| `serving` | the views follow it and it produces fresh samples |
+| `idle` | chosen, not started yet (it starts on the first viewer request) |
+| `paused` | chosen and started, but its source is gone (`get_status` NO_SOURCE) or its samples are stale: the views hold the last known viewer, `isTracking` false |
+| `standby` | enabled but **outranked**: the display tracks (or owns) the viewer on this screen |
+| `no_source` | the screen would take one (EXTERNAL_OK, no tracker) but no provider is usable |
+| `none` | no provider involved (FIXED, no DP, nothing enabled) |
+
+"standby" is never "paused": the first is a display that tracks, the second a provider that lost
+its source.
 ## 5. The composed `XR_DXR_display_info` advertisement
 
 The display plug-in reports only what **it** does; `sim_display` stays honest (0 modes, no
@@ -166,8 +259,10 @@ When the composed answer comes from a provider the runtime reports
 rides `XrViewEyeTrackingStateDXR::isTracking` and `XrEventDataEyeTrackingStateChangedDXR`: no face,
 camera unplugged, provider stopped or samples older than 500 ms → `is_tracking` false.
 
-The service process does not host providers in this release (§9), so it never composes either —
-an IPC client is never told about tracking the service would not deliver.
+The service composes it too, in its own system compositor info, because it hosts the provider and
+splices its eyes into every IPC client's views (§4a) — an IPC client is told about tracking only
+because the service delivers it. The composed answer is the **primary** screen's; the per-screen
+`xrEnumerateDisplaysDXR` capabilities stay each screen's DP's own (§10).
 
 ## 6. Camera-space samples and camera-pose calibration (follow-up)
 
@@ -202,7 +297,7 @@ method and the solver belong to the class, not to a provider.
   permission and the runtime's tracker-camera denylist (ADR-043 Amendment 5: never a display's
   claimed tracker camera).
 - A provider on **the display's shared stereo camera** is an ADR-043 camera consumer (follow-up,
-  §9). Being a consumer does **not** keep the display's tracker running: the shared display stream
+  §10). Being a consumer does **not** keep the display's tracker running: the shared display stream
   carries frames **only while the display itself is tracking a viewer** (a 3D session on that
   screen). Such a provider therefore works only during 3D sessions on that screen — exactly where
   the display's own eyes win the viewer role anyway — unless the display vendor adds a camera-only
@@ -245,24 +340,38 @@ end-to-end arm is `tests_oxr_view_space_viewer_tracking`.
   Windows N4 conformance step asserts selected / Enabled=0 falls back / Preferred wins / ABI
   fixture rejected / a tracking display wins.
 - `displayxr-cli info --json` → the same `tracking_providers` object (the Dashboard's Components page reads it).
-- `displayxr-cli status --json` → per screen `eye_tracking.viewer_source` + `viewer_reason` + `viewer_policy`
-  (the display's policy where it was evaluated — today the primary screen; `null` elsewhere).
-- Logs: one WARN per process for the decision (`viewer tracking (ADR-054 N6): primary screen viewer
-  source = ...`) and one when the provider starts on demand.
+- `displayxr-cli status --json` → per screen `eye_tracking.viewer_source`, `viewer_reason`,
+  `viewer_policy` (the display's policy for that screen) and `viewer_provider` (§4b) — from the service over DIAG when it is reachable (its live provider
+  state), else headless (evaluated, nothing started).
+- Logs: one WARN per process for the primary decision (`viewer tracking (ADR-054 N6): primary screen
+  viewer source = ...`, plus "hosted in the service, shared by every IPC client" there), one WARN
+  per screen whose answer changed at a topology publish (`screen 0x... viewer source = ...`, with
+  the mapping offset for a non-primary screen), one when the provider starts on demand, and in the
+  service one the first time an IPC client's views come from it.
 
 ## 10. Follow-ups
 
-1. **Per-screen routing** through each screen's segment DP (§4), and a `screen_hint` contract for
-   providers that serve more than one screen.
-2. **Service hosting**: splice the provider into the service's view computation
-   (`ipc_try_get_sr_view_poses`) and then compose there; until then the service never loads one.
-3. **Out-of-process hosting** (ADR-053 §5 hosting contract): the sink becomes the N8 seqlock pose
-   page; the ABI does not change.
-4. **Provider as an ADR-043 camera consumer** (with the §7 constraint) — through a reserved host
+Done since the first release: **service hosting** (§4a) and **per-screen routing** through each
+screen's own DP with the desktop-geometry mapping (§4b).
+
+1. **Out-of-process hosting** (ADR-053 §5 hosting contract): the sink becomes the N8 seqlock pose
+   page; the ABI does not change. It also ends the "in-process app beside a service opens the
+   camera a second time" case (§4a).
+2. **Provider as an ADR-043 camera consumer** (with the §7 constraint) — through a reserved host
    slot.
-5. **Camera-pose calibration** (§6): `tracking calibrate --watch --json`, the solver, the Dashboard
-   window.
-6. **`sim_tracking` SCRIPT=webcam**: move the #1855 webcam core out of `sim_display`.
-7. Installer rows: the Windows runtime installer ships `DisplayXR-SimTracking.dll` (allowlisted, N4b)
+3. **`screen_hint` contract** for a provider that measures several screens natively (one camera per
+   screen, or a calibrated multi-screen rig): today every sample is in the primary's display space
+   and the trunk maps it (§4b); a provider-supplied hint would bypass the mapping for its screen.
+4. **Camera-pose calibration** (§6): `tracking calibrate --watch --json`, the solver, the Dashboard
+   window — per screen, which also replaces the coplanar desktop-layout assumption of §4b.
+5. **Service live re-selection**: today a tracking policy change applies at the next service start
+   (the scan is one-shot, the advertisement static per instance).
+6. **Per-screen composed `xrEnumerateDisplaysDXR` caps** for a non-primary screen a provider serves
+   (today only the session advertisement is composed; `XRT_SCREEN_FLAG_TRACKED` feeds workspace
+   policy, so composing it is a separate decision).
+7. **Workspace tiles on a secondary presenter** (`comp_d3d11_service_get_client_workspace_view_frame`)
+   and the controller's FRAME_TICK viewer: still the presenter DP's eyes.
+8. **`sim_tracking` SCRIPT=webcam**: move the #1855 webcam core out of `sim_display`.
+9. Installer rows: the Windows runtime installer ships `DisplayXR-SimTracking.dll` (allowlisted, N4b)
    but writes no `TrackingProviders` row yet; the Linux / macOS packages do not ship it yet.
    `versions.json` for the open provider. (The Dashboard card landed: Components → Tracking providers.)

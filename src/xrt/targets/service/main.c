@@ -56,7 +56,7 @@ workspace_launch_provider(const char *controller_id)
 #include "target_plugin_loader.h"       // #2250: screen-key re-key permission
 #include "target_component_loader.h"    // ADR-054: the component class ids
 #include "target_input_plugin_loader.h" // ADR-054 N3d: input policy re-read -> arbiter re-rank
-#include "target_viewer_tracking.h"     // ADR-054 N6 Part 2: no tracking providers hosted in the service yet
+#include "target_viewer_tracking.h"     // ADR-054 N6 Part 2: the service hosts the viewer-tracking provider
 #include "service_conversion.h"         // ADR-053: the conversion core
 #include "service_component_watch.h"    // ADR-054 N3d (#2051): the policy-store watch
 
@@ -150,6 +150,28 @@ on_input_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
 	(void)target_input_plugin_reread_policy();
 }
 
+/*
+ * ADR-054 N6 Part 2: the service hosts the viewer-tracking provider for every
+ * IPC client, chosen once per service instance (the tracking scan is one-shot
+ * per process, and the composed XR_DXR_display_info advertisement every client
+ * reads is static per instance). A policy change is therefore honoured at the
+ * next service start; say so once instead of pretending to re-select.
+ */
+static void
+on_tracking_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	(void)reason;
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W(
+		    "viewer tracking: a tracking-provider registration / preference changed — the service picks its "
+		    "provider once per run; it applies at the next service start.");
+	}
+}
+
 static xrt_result_t
 component_reselect_provider(uint32_t class_id)
 {
@@ -163,12 +185,13 @@ component_reselect_provider(uint32_t class_id)
 static void
 register_component_watch(void)
 {
-	// ADR-054 N6 Part 2: this process composes IPC clients' views itself, and
-	// the viewer-tracking provider is not spliced into that path yet — so it
-	// neither loads a provider nor composes the tracking advertisement.
+	// ADR-054 N6 Part 2: this process composes IPC clients' views itself, so
+	// it HOSTS the viewer-tracking provider (once, shared by every client)
+	// and composes the tracking advertisement the clients read.
 	target_viewer_tracking_set_service_process(true);
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_DISPLAY, on_display_policy_watch, NULL);
 	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_INPUT, on_input_policy_watch, NULL);
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_TRACKING, on_tracking_policy_watch, NULL);
 	ipc_server_set_component_reselect_provider(component_reselect_provider);
 	(void)service_component_watch_start();
 }

@@ -897,6 +897,12 @@ screen_to_cjson(const struct xrt_status_screen *s)
 	} else {
 		cJSON_AddNullToObject(et, "viewer_policy");
 	}
+	// "standby" (outranked: the display tracks) vs "paused" / "no_source" (no usable eyes from a provider).
+	if (s->eye_tracking.viewer_provider[0] != '\0') {
+		cJSON_AddStringToObject(et, "viewer_provider", s->eye_tracking.viewer_provider);
+	} else {
+		cJSON_AddNullToObject(et, "viewer_provider");
+	}
 
 	if (s->mode.valid) {
 		cJSON *mode = cJSON_AddObjectToObject(o, "mode");

@@ -385,59 +385,48 @@ fill_native(const struct xrt_screen *in, struct xrt_status_screen *s)
 }
 
 /*!
- * ADR-054 N6 Part 2: the screen's viewer source. The arbitration this process
- * recorded (in-process runtime, service, or a headless CLI evaluation) is for
- * the PRIMARY screen; a screen that advertises tracking itself reads "dp"; any
- * other screen keeps the nominal viewer — a provider is routed to the primary
- * screen only in this release (per-screen provider routing is a follow-up).
+ * ADR-054 N6 Part 2: the screen's viewer source, per screen — each screen's
+ * own DP read for its policy and tracking (target_viewer_tracking_screen_decisions:
+ * what this process arbitrated, or a fresh headless evaluation). @p sd NULL =
+ * not evaluated (fields stay "").
  */
 static void
-fill_viewer_source(struct xrt_status_screen *s)
+fill_viewer_source(struct xrt_status_screen *s, const struct target_viewer_screen_decision *sd)
 {
-	struct target_viewer_decision d;
-	bool have = target_viewer_tracking_get_decision(&d);
-	if (s->roles.runtime_default && !have) {
-		// Headless (the CLI's own process): arbitrate now, nothing started.
-		const struct xrt_plugin_iface *iface = target_plugin_get_active();
-		if (iface != NULL) {
-			target_viewer_tracking_evaluate(iface, target_plugin_get_active_instance(),
-			                                s->eye_tracking.supported, &d);
-			have = true;
-		}
+	if (sd == NULL) {
+		return;
 	}
-	if (s->roles.runtime_default && have) {
+	if (sd->is_primary) {
 		// The caps the app sees are the COMPOSED ones (idempotent when the
-		// screen info already carries them, as in-process).
+		// screen info already carries them, as in-process and in the service).
 		uint32_t sup = 0, def = 0;
 		bool mark = false;
-		target_viewer_compose_advertisement(s->eye_tracking.supported, s->eye_tracking.default_mode, &d, &sup,
-		                                    &def, &mark);
+		target_viewer_compose_advertisement(s->eye_tracking.supported, s->eye_tracking.default_mode, &sd->d,
+		                                    &sup, &def, &mark);
 		s->eye_tracking.supported = sup;
 		s->eye_tracking.default_mode = def;
-		target_viewer_source_label(&d, s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source));
-		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason), "%s", d.reason);
-		snprintf(s->eye_tracking.viewer_policy, sizeof(s->eye_tracking.viewer_policy), "%s",
-		         target_viewer_policy_str(d.dp_policy));
-		return;
 	}
-	if (s->eye_tracking.supported != 0) {
-		snprintf(s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source), "dp");
+	target_viewer_source_label(&sd->d, s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source));
+	snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason), "%s", sd->d.reason);
+	snprintf(s->eye_tracking.viewer_policy, sizeof(s->eye_tracking.viewer_policy), "%s",
+	         target_viewer_policy_str(sd->d.dp_policy));
+	const enum target_viewer_provider_state ps = target_viewer_tracking_provider_state(&sd->d);
+	snprintf(s->eye_tracking.viewer_provider, sizeof(s->eye_tracking.viewer_provider), "%s",
+	         target_viewer_provider_state_str(ps));
+	if (ps == TARGET_VIEWER_PROVIDER_STANDBY && sd->d.reason[0] == '\0') {
 		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
 		         "display tracks the viewer on this screen");
-		return;
+	} else if (ps == TARGET_VIEWER_PROVIDER_PAUSED) {
+		snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
+		         "provider source paused (no fresh samples): views hold the last known viewer");
 	}
-	if (s->roles.runtime_default) {
-		return; // no display processor in this process: not evaluated
-	}
-	snprintf(s->eye_tracking.viewer_source, sizeof(s->eye_tracking.viewer_source), "nominal");
-	snprintf(s->eye_tracking.viewer_reason, sizeof(s->eye_tracking.viewer_reason),
-	         "viewer-tracking providers serve the primary screen only (for now)");
 }
 
 static void
 fill_screen(const struct xrt_screen *in,
             uint32_t index,
             const struct xrt_dp_factory_registry *reg,
+            const struct target_viewer_screen_decision *viewer,
             struct xrt_status_screen *s)
 {
 	memset(s, 0, sizeof(*s));
@@ -534,7 +523,7 @@ fill_screen(const struct xrt_screen *in,
 	s->eye_tracking.default_mode = in->info.default_eye_tracking_mode;
 	s->eye_tracking.state = XRT_STATUS_TRACKING_NO_DP; // headless: nothing is bound
 
-	fill_viewer_source(s);
+	fill_viewer_source(s, viewer);
 }
 
 #ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
@@ -618,8 +607,18 @@ fill_screens(const struct xrt_screen_list *list,
              const struct xrt_dp_factory_registry *reg,
              struct xrt_status_snapshot *out)
 {
+	// ADR-054 N6 Part 2: every screen's viewer source, from its own DP.
+	struct target_viewer_screen_decision viewer[TARGET_VIEWER_MAX_SCREENS];
+	const uint32_t vn = target_viewer_tracking_screen_decisions(list, reg, viewer, TARGET_VIEWER_MAX_SCREENS);
 	for (uint32_t i = 0; i < list->count && i < XRT_STATUS_MAX_SCREENS; i++) {
-		fill_screen(&list->screens[i], i, reg, &out->screens[i]);
+		const struct target_viewer_screen_decision *vd = NULL;
+		for (uint32_t k = 0; k < vn; k++) {
+			if (viewer[k].screen_id == list->screens[i].id) {
+				vd = &viewer[k];
+				break;
+			}
+		}
+		fill_screen(&list->screens[i], i, reg, vd, &out->screens[i]);
 #ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
 		fill_vendor(reg, &out->screens[i]);
 #endif

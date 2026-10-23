@@ -175,8 +175,8 @@ eyes into a display processor; a DP that weaves from eyes tracks them itself.
 > the `sim_tracking` scripted reference provider, the DP viewer-policy slot
 > (`get_viewer_policy`: OWN / EXTERNAL_OK / FIXED; absent = FIXED), the trunk arbitration (DP eyes
 > when it tracks → best provider when EXTERNAL_OK → nominal), the composed `XR_DXR_display_info`
-> advertisement, and the per-screen viewer source in `status --json`. Hosted in-process, primary
-> screen only; per-screen routing via the segment DPs, service hosting, out-of-process hosting
+> advertisement, and the per-screen viewer source in `status --json`. Hosted in-process and in the
+> service (one provider for every IPC client), routed per screen through each screen's own DP; out-of-process hosting
 > and the camera-consumer path are follow-ups. Contract:
 > [tracking-provider-discovery.md](../specs/runtime/tracking-provider-discovery.md).
 
@@ -268,7 +268,7 @@ free; `ForceQwerty` stays where it is. Spec: input-provider-discovery.md §4 ite
 | N4 | Per-class conformance in `displayxr-cli selftest` (sequence above) + the CI vendor-identifier guard widened from the runtime DLL's link line to every class loader | win |
 | N4b | Provenance gate at load: signed OR allowlisted; loud-logged dev override; no override on elevated hosts | win |
 | N5 | Licensing state for DP and input — when a paid plug-in exists | — |
-| N6 | Eye contract prep (target-time query, pair-relation history) — **done #2166**; then the tracking-provider class + `sim_tracking` — **Part 2 landed (#2144)**: in-process, primary screen; next: per-screen routing through segment DPs, service + out-of-process hosting, camera-consumer path, `sim_tracking` webcam mode, calibration | — |
+| N6 | Eye contract prep (target-time query, pair-relation history) — **done #2166**; then the tracking-provider class + `sim_tracking` — **Part 2 landed (#2144)**, then service hosting + per-screen routing through each screen's DP; next: out-of-process hosting, camera-consumer path, `sim_tracking` webcam mode, calibration | — |
 | N7 | `EmulatedControllers` gate + CLI/dashboard surface | — |
 | N8 | Pose-feed design note (seqlock page, consumer handshake, always-on tracking mode) | — |
 | N10 | Decode task family in the conversion contract; browser as first consumer | — |

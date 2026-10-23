@@ -365,10 +365,19 @@ struct xrt_status_eye_tracking
 	char viewer_reason[128];
 	/*!
 	 * The display's viewer policy on this screen as the arbitration read it:
-	 * "OWN" / "EXTERNAL_OK" / "FIXED" ("" = not evaluated for this screen —
-	 * today every screen but the primary one, tracking-provider-discovery §4).
+	 * "OWN" / "EXTERNAL_OK" / "FIXED" ("" = not evaluated for this screen;
+	 * read from each screen's own DP, tracking-provider-discovery §4b).
 	 */
 	char viewer_policy[16];
+	/*!
+	 * What the viewer-tracking provider is doing for this screen: "serving"
+	 * (the views follow it, it is producing), "idle" (chosen, not started
+	 * yet), "paused" (chosen and started, its source gone or its samples
+	 * stale), "standby" (enabled but outranked: the display tracks / owns the
+	 * viewer here), "no_source" (the screen would take one; none is usable),
+	 * "none". "" = not evaluated.
+	 */
+	char viewer_provider[16];
 };
 
 //! The rendering mode a screen is in (phase 2; absent headless).

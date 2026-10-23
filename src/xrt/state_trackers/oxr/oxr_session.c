@@ -343,49 +343,6 @@ to_string(XrSessionState state)
 }
 
 /*!
- * ADR-054 N6 Part 2: lay a viewer-tracking provider's eye pair @p pe over the
- * DP's answer @p dp (which may be absent, @p have_dp false — a headless
- * session asks no compositor). The provider supplies a PAIR; the DP's answer
- * supplies the layout of the active mode:
- *  - no DP answer, or a 2-eye answer: the pair as is;
- *  - a 1-eye (2D) answer: the pair's midpoint;
- *  - an N > 2 answer: the DP's layout translated so its centroid sits on the
- *    pair's midpoint (the DP owns multi-view fill; the trunk never invents views).
- * Validity, tracking state and time are the provider's.
- */
-static void
-oxr_viewer_splice_provider_eyes(struct xrt_eye_positions *dp, bool have_dp, const struct xrt_eye_positions *pe)
-{
-	const struct xrt_eye_position l = pe->eyes[0];
-	const struct xrt_eye_position r = pe->eyes[1];
-	const struct xrt_eye_position mid = {(l.x + r.x) * 0.5f, (l.y + r.y) * 0.5f, (l.z + r.z) * 0.5f};
-	if (!have_dp || !dp->valid || dp->count == 0 || dp->count == 2 || dp->count > XRT_MAX_VIEWS) {
-		dp->count = 2;
-		dp->eyes[0] = l;
-		dp->eyes[1] = r;
-	} else if (dp->count == 1) {
-		dp->eyes[0] = mid;
-	} else {
-		struct xrt_eye_position c = {0, 0, 0};
-		for (uint32_t i = 0; i < dp->count; i++) {
-			c.x += dp->eyes[i].x;
-			c.y += dp->eyes[i].y;
-			c.z += dp->eyes[i].z;
-		}
-		const float inv = 1.0f / (float)dp->count;
-		const struct xrt_eye_position d = {mid.x - c.x * inv, mid.y - c.y * inv, mid.z - c.z * inv};
-		for (uint32_t i = 0; i < dp->count; i++) {
-			dp->eyes[i].x += d.x;
-			dp->eyes[i].y += d.y;
-			dp->eyes[i].z += d.z;
-		}
-	}
-	dp->valid = true;
-	dp->is_tracking = pe->is_tracking;
-	dp->timestamp_ns = pe->timestamp_ns;
-}
-
-/*!
  * Get the eye positions for @p target_ns from the session's compositor
  * (ADR-054 §4.1 / N6 Part 1, #2144): xrLocateViews passes the frame's
  * displayTime (monotonic), so the eyes the app renders for are the eyes at
@@ -3652,23 +3609,22 @@ locate_views_one(struct oxr_logger *log,
 		// viewer-tracking provider for this screen (the display does not
 		// track and declared EXTERNAL_OK) — a tracking display's eyes are
 		// never replaced. No sample yet → the DP's (nominal) answer stands.
+		// The primary screen: the session DP's panel. (An IPC client has no
+		// arbitration here — vt NULL — the service spliced its views.)
 		struct xrt_viewer_tracking *vt = sess->sys->xsysd != NULL ? sess->sys->xsysd->viewer_tracking : NULL;
-		if (xrt_viewer_tracking_get_source(vt) == XRT_VIEWER_SOURCE_PROVIDER) {
-			struct xrt_eye_positions pe = {0};
-			if (xrt_viewer_tracking_get_eyes_at(vt, (int64_t)xdisplay_time, &pe) && pe.count >= 2) {
-				oxr_viewer_splice_provider_eyes(&eye_pos, got_eye_positions, &pe);
-				got_eye_positions = true;
-				static bool logged_provider = false;
-				if (!logged_provider) {
-					logged_provider = true;
-					U_LOG_W(
-					    "N6: xrLocateViews eyes from the viewer-tracking provider: tracking=%d "
-					    "count=%u "
-					    "L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
-					    (int)eye_pos.is_tracking, (unsigned)eye_pos.count, eye_pos.eyes[0].x,
-					    eye_pos.eyes[0].y, eye_pos.eyes[0].z, eye_pos.eyes[1].x, eye_pos.eyes[1].y,
-					    eye_pos.eyes[1].z);
-				}
+		if (xrt_viewer_tracking_override_eyes(vt, XRT_VIEWER_SCREEN_PRIMARY, (int64_t)xdisplay_time, &eye_pos,
+		                                      got_eye_positions)) {
+			got_eye_positions = true;
+			static bool logged_provider = false;
+			if (!logged_provider) {
+				logged_provider = true;
+				U_LOG_W(
+				    "N6: xrLocateViews eyes from the viewer-tracking provider: tracking=%d "
+				    "count=%u "
+				    "L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
+				    (int)eye_pos.is_tracking, (unsigned)eye_pos.count, eye_pos.eyes[0].x,
+				    eye_pos.eyes[0].y, eye_pos.eyes[0].z, eye_pos.eyes[1].x, eye_pos.eyes[1].y,
+				    eye_pos.eyes[1].z);
 			}
 		}
 		static bool logged_target = false;
@@ -5170,6 +5126,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 			locate_fill_bindings(sess, viewState, &none);
 		}
 		return ret;
+	}
+
+	// ADR-054 N6 Part 2, per screen: a segment on a screen the arbitration
+	// routed to a viewer-tracking provider (its own DP does not track and
+	// declared EXTERNAL_OK) takes the provider's eyes, mapped into THAT
+	// screen's display space; a tracking DP keeps its own. In-process only:
+	// over IPC (`seg_ipc`) the service spliced the table it sent.
+	if (!sess->seg_ipc) {
+		struct xrt_viewer_tracking *vt = sess->sys->xsysd != NULL ? sess->sys->xsysd->viewer_tracking : NULL;
+		const int64_t t =
+		    (int64_t)time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, viewLocateInfo->displayTime);
+		for (uint32_t i = 0; vt != NULL && i < m.count && i < XRT_MAX_SEGMENTS; i++) {
+			if (xrt_viewer_tracking_override_eyes(vt, m.seg[i].screen_id, t, &m.seg[i].eyes,
+			                                      m.seg[i].have_eyes)) {
+				m.seg[i].have_eyes = true;
+			}
+		}
 	}
 
 	const uint32_t mj = oxr_segment_views_majority(&m);
