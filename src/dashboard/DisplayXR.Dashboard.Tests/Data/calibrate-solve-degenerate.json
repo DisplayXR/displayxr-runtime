@@ -1,0 +1,19 @@
+{
+	"ok":	false,
+	"status":	"degenerate",
+	"reason":	"all 3 samples are at one dot: the distance along the ray is unconstrained (scale ambiguity) - align at least 2 distinct dots",
+	"mode":	"b",
+	"eye":	"mid",
+	"camera_key":	"sim-tracking:webcam0",
+	"screen":	"DXR-0001-00000001",
+	"pose":	null,
+	"params":	0,
+	"rank":	0,
+	"condition":	0,
+	"ill_conditioned":	false,
+	"iterations":	0,
+	"sample_count":	3,
+	"used_count":	0,
+	"distinct_dots":	0,
+	"samples":	[]
+}

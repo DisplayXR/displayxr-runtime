@@ -1,0 +1,12 @@
+{
+	"ok":	true,
+	"provider":	"sim-tracking",
+	"slot":	0,
+	"store":	"/Users/me/Library/Application Support/DisplayXR/DisplayProcessors/sim-tracking.settings.json",
+	"keys":	{
+		"CAMERA_POSE_0":	"0.035000,0.183000,0.000000,0.078459,0.000000,0.000000,0.996917",
+		"CAMERA_POSE_0_CAMERA":	"sim-tracking:webcam0",
+		"CAMERA_POSE_0_SCREEN":	"DXR-0001-00000001",
+		"CAMERA_POSE_0_DEPTH_SCALE":	0.925926
+	}
+}

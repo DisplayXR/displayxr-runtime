@@ -98,7 +98,7 @@ public sealed class ComponentsPage : Page
             sb.Append(ip.ClientsDropped);
         }
         if (Ctx.LastActionArea == PolicyCommands.AppArea) sb.Append(Ctx.LastAction).Append(Ctx.LastActionFailed);
-        sb.Append(_machine).Append('|');
+        sb.Append(_machine).Append(_calibration is null).Append('|');
         foreach (var s in Sections())
         {
             sb.Append(s.Id).Append(s.Count).Append(s.Connected).Append(s.ConnectedLine);
@@ -193,18 +193,18 @@ public sealed class ComponentsPage : Page
             U.AddFlow(head, U.Chip(pt, pl), 10, 6);
             if (r.CanCalibrate)
             {
-                // TODO(ADR-054 N6 follow-up 5, tracking-provider-discovery.md §6): the camera-pose
-                // calibration window. Design: displayxr-tracking-open docs/design.md §10 ("Where it
-                // lives") — a full-screen Dashboard window on THIS screen that streams
-                // `displayxr-cli tracking calibrate --screen <key> --watch --json` (NDJSON camera-space
-                // samples), runs `displayxr-cli tracking calibrate solve`, shows the per-sample
-                // residuals, and commits CAMERA_POSE_<n> / _CAMERA / _SCREEN as provider settings.
-                // Those verbs are being built on a parallel branch; enable this button when they land.
-                var calibrate = U.Button("Calibrate camera…", () => { }, "quiet", "sm");
-                calibrate.IsEnabled = false;
+                // Camera-pose calibration (tracking-provider-discovery.md §6; design: displayxr-tracking-open
+                // docs/design.md §10): a full-screen window on THIS screen that streams
+                // `tracking calibrate --screen <key> --watch --json`, solves and applies.
+                var screen = Ctx.Feed.Snapshot?.ScreenById(r.ScreenId);
+                string key = screen?.Key is { Length: > 0 } k ? k : r.ScreenId;
+                var calibrate = U.Button("Calibrate camera…", () => OpenCalibration(key, screen, r.Name), "quiet", "sm");
+                calibrate.IsEnabled = _calibration is null;
                 ToolTip.SetShowOnDisabled(calibrate, true);
-                ToolTip.SetTip(calibrate, "Camera calibration is coming: it will measure where the camera sits relative to this screen so the tracked viewer lines up with the display.");
-                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name} (coming soon)");
+                ToolTip.SetTip(calibrate, _calibration is null
+                    ? "Measure where the camera sits relative to this screen, using the screen's reflection, so the tracked viewer lines up with the display."
+                    : "A calibration window is already open.");
+                Avalonia.Automation.AutomationProperties.SetName(calibrate, $"Calibrate camera for {r.Name}");
                 U.AddFlow(head, calibrate, 10, 6);
             }
             var block = U.VStack(4, head, U.Wrapped(r.Reason, "soft"));
@@ -215,6 +215,28 @@ public sealed class ComponentsPage : Page
         if (Ctx.Info?.Components.Tracking is { } sum && sum.ScanLine is { Length: > 0 } scan)
             col.Children.Add(U.Wrapped($"Probe (headless, from 'displayxr-cli info'): {scan}.", "meta"));
         return col;
+    }
+
+    private CalibrationWindow? _calibration;
+
+    /// <summary>
+    /// Open the calibration window for one provider-served screen (one at a time). After a successful
+    /// apply the tracking rows and info's tracking block are re-read.
+    /// </summary>
+    private void OpenCalibration(string screenKey, Screen? screen, string name)
+    {
+        if (_calibration is not null) { _calibration.Activate(); return; }
+        var w = new CalibrationWindow(Ctx.Cli, screenKey, screen, name, () =>
+        {
+            _ = Ctx.LoadPolicyAsync(ComponentClass.Tracking, force: true);
+            _ = Ctx.LoadInfoAsync(force: true);
+            Ctx.Toast($"Camera calibration saved for {name}.");
+        });
+        w.Closed += (_, _) => { _calibration = null; Update(); };
+        _calibration = w;
+        DashboardLog.Info($"calibration window opened for screen {screenKey}");
+        w.Show();
+        Update();
     }
 
     /// <summary>
