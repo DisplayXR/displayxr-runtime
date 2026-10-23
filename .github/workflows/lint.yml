@@ -270,6 +270,14 @@ jobs:
         # is a missing key, and lib.js reads a title in one place only. Plain gjs.
         run: gjs scripts/test_gnome_extension_title_access.js
 
+      - name: Monitor work area
+        # Unit test for WorkArea in lib.js (extension version 19,
+        # monitor.work_area): the window's own workspace else the active one,
+        # [x, y, w, h] from a Meta.Rectangle (GNOME 42-44) or an Mtk.Rectangle
+        # (45+), absent when it cannot be told, and the shipped wiring (the
+        # entry, the workareas-changed emit). Plain gjs.
+        run: gjs scripts/test_gnome_extension_work_area.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:
