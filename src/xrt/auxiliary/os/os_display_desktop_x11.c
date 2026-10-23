@@ -376,3 +376,15 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 
 	return true;
 }
+
+bool
+os_display_desktop_info_for_handle(void *platform_handle, struct os_display_desktop_info *out_info)
+{
+	// No monitor handle on this platform: identity is the device name, which
+	// os_display_desktop_info_for_device matches against the enumeration.
+	(void)platform_handle;
+	if (out_info != NULL) {
+		memset(out_info, 0, sizeof(*out_info));
+	}
+	return false;
+}

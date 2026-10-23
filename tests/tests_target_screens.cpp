@@ -21,6 +21,7 @@
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_screen.h"
 
+#include "os/os_display_desktop.h"
 #include "os/os_display_edid.h"
 
 #include "target_plugin_loader.h"
@@ -492,4 +493,112 @@ TEST_CASE("EDID carry: the pure rule, including the window")
 	lose_edid(blank);
 	cur = blank;
 	CHECK(target_plugin_edid_carry(&blank, t0, &cur, t0) == TARGET_EDID_CARRY_NONE);
+}
+
+/*
+ * The claim rule's input (displayxr-leia-plugin#430): which registry entries
+ * may name the panel's monitor. Never an unclaimed, synthesized, fallback,
+ * not-ready or position-less one.
+ */
+namespace {
+
+uint32_t
+fake_probe_displays(
+    struct xrt_plugin_instance *, const struct xrt_display_descriptor *, uint32_t, struct xrt_display_claim *, uint32_t)
+{
+	return 0;
+}
+
+} // namespace
+
+TEST_CASE("panel claims: only the active plug-in's own probe_displays claims, at EDID or above")
+{
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+	f.reg.entries[2].confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
+
+	os_display_panel_claim claims[8] = {};
+	os_display_edid_monitor mons[8] = {};
+	REQUIRE(target_screens_collect_panel_claims(&f.reg, "vendor", claims, mons, 8) == 2);
+	CHECK(claims[0].left == 2880);
+	CHECK(claims[0].width == 3840);
+	CHECK_FALSE(claims[0].verified);
+	CHECK_FALSE(claims[0].is_primary);
+	CHECK(std::strcmp(mons[0].output_name, "HDMI-1") == 0);
+	CHECK(claims[1].left == 6720);
+	CHECK(claims[1].verified);
+	CHECK(std::strcmp(mons[1].output_name, "DP-1") == 0);
+
+	// A capacity of one keeps the first.
+	CHECK(target_screens_collect_panel_claims(&f.reg, "vendor", claims, nullptr, 1) == 1);
+}
+
+TEST_CASE("panel claims: a FALLBACK claim (sim-display's 'anything unclaimed') is never one")
+{
+	fixture f;
+	f.fallback.probe_displays = fake_probe_displays;
+	os_display_panel_claim claims[8] = {};
+	CHECK(target_screens_collect_panel_claims(&f.reg, "fallback", claims, nullptr, 8) == 0);
+}
+
+TEST_CASE("panel claims: the loader's SYNTHESIZED claim (no probe_displays) is evidence of nothing")
+{
+	fixture f; // vendor has no probe_displays
+	os_display_panel_claim claims[8] = {};
+	CHECK(target_screens_collect_panel_claims(&f.reg, "vendor", claims, nullptr, 8) == 0);
+}
+
+TEST_CASE("panel claims: other plug-ins' and not-ready entries are skipped")
+{
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+	f.reg.entries[1].not_ready = true;
+	os_display_panel_claim claims[8] = {};
+	REQUIRE(target_screens_collect_panel_claims(&f.reg, "vendor", claims, nullptr, 8) == 1);
+	CHECK(claims[0].left == 6720);
+	CHECK(target_screens_collect_panel_claims(&f.reg, "someone-else", claims, nullptr, 8) == 0);
+	CHECK(target_screens_collect_panel_claims(&f.reg, "", claims, nullptr, 8) == 0);
+	CHECK(target_screens_collect_panel_claims(nullptr, "vendor", claims, nullptr, 8) == 0);
+}
+
+TEST_CASE("panel claims: a monitor with no desktop position (DRM-only record) is never one")
+{
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+
+	// Re-enumerate with the third monitor position-less, as a pure-Wayland
+	// DRM-only record is.
+	static os_display_edid_list edid;
+	std::memset(&edid, 0, sizeof(edid));
+	edid.count = 3;
+	for (uint32_t i = 0; i < 3; i++) {
+		REQUIRE(target_plugin_get_monitor_record(f.descs[i].monitor_id, nullptr, &edid.monitors[i]));
+	}
+	edid.monitors[2].origin_unknown = true;
+	xrt_display_descriptor descs[3]{};
+	REQUIRE(target_plugin_build_descriptors(&edid, descs, 3) == 3);
+	for (int i = 0; i < 3; i++) {
+		f.reg.entries[i].monitor_id = descs[i].monitor_id;
+	}
+
+	os_display_panel_claim claims[8] = {};
+	REQUIRE(target_screens_collect_panel_claims(&f.reg, "vendor", claims, nullptr, 8) == 1);
+	CHECK(claims[0].left == 2880);
+}
+
+TEST_CASE("panel from claims: a claim the OS cannot resolve by identity never fabricates a rect")
+{
+	// The fixture's output names do not exist on the test host, and there
+	// is no HMONITOR: the claim rule must decline (the caller then runs the
+	// origin / size / primary rules), not hand back the claim's coordinates.
+	fixture f;
+	f.vendor.probe_displays = fake_probe_displays;
+	os_display_panel_hint h = {};
+	h.pixel_width = 3840;
+	h.pixel_height = 2160;
+	os_display_desktop_info d = {};
+	bool overrides = true;
+	CHECK_FALSE(target_screens_panel_from_claims(&f.reg, "vendor", &h, &d, &overrides));
+	CHECK_FALSE(overrides);
+	CHECK(d.width == 0);
 }

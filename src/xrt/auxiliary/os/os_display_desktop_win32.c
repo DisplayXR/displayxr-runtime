@@ -148,6 +148,72 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 	return ok;
 }
 
+bool
+os_display_desktop_info_for_handle(void *platform_handle, struct os_display_desktop_info *out_info)
+{
+	if (out_info == NULL) {
+		return false;
+	}
+	memset(out_info, 0, sizeof(*out_info));
+	if (platform_handle == NULL) {
+		return false;
+	}
+	HMONITOR mon = (HMONITOR)platform_handle;
+
+	// An HMONITOR is the same monitor in every DPI context, so this is the
+	// one resolve that cannot land on the wrong monitor under a DPI-unaware
+	// host: no coordinate crosses a context. The rect itself is read pinned
+	// to per-monitor-v2 (physical), exactly as os_display_desktop_info_at does.
+	pfn_set_thread_dpi_awareness_context set_ctx = get_set_thread_dpi_awareness_context();
+	os_dpi_context_t prev_ctx = NULL;
+	if (set_ctx != NULL) {
+		prev_ctx = set_ctx(OS_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+	}
+
+	bool ok = false;
+	MONITORINFOEXW mi;
+	memset(&mi, 0, sizeof(mi));
+	mi.cbSize = sizeof(mi);
+	// Fails on a handle that went stale (the monitor was unplugged since the
+	// enumeration): the caller then falls through to the other rules.
+	if (GetMonitorInfoW(mon, (LPMONITORINFO)&mi)) {
+		out_info->left = (int32_t)mi.rcMonitor.left;
+		out_info->top = (int32_t)mi.rcMonitor.top;
+		out_info->width = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
+		out_info->height = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+		out_info->is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+		int written = WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, out_info->device_name,
+		                                  (int)sizeof(out_info->device_name), NULL, NULL);
+		if (written <= 0) {
+			out_info->device_name[0] = '\0';
+		}
+		ok = true;
+	}
+
+	if (set_ctx != NULL && prev_ctx != NULL) {
+		set_ctx(prev_ctx);
+	}
+
+	// The same monitor in the CALLER's DPI space — the comparison basis for
+	// the plug-in's (host-space) panel dims. Same handle, so the same monitor.
+	if (ok) {
+		out_info->width_in_caller_dpi = out_info->width;
+		out_info->height_in_caller_dpi = out_info->height;
+		MONITORINFO mi_caller;
+		memset(&mi_caller, 0, sizeof(mi_caller));
+		mi_caller.cbSize = sizeof(mi_caller);
+		if (GetMonitorInfoW(mon, &mi_caller)) {
+			out_info->width_in_caller_dpi =
+			    (uint32_t)(mi_caller.rcMonitor.right - mi_caller.rcMonitor.left);
+			out_info->height_in_caller_dpi =
+			    (uint32_t)(mi_caller.rcMonitor.bottom - mi_caller.rcMonitor.top);
+		}
+	} else {
+		memset(out_info, 0, sizeof(*out_info));
+	}
+	return ok;
+}
+
 /*
  * Enumeration is unimplemented here ON PURPOSE — see the rule list on
  * @ref os_display_desktop_info_for_panel. The Windows plug-in reads the panel's

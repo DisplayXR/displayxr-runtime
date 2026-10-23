@@ -250,8 +250,11 @@ TEST_CASE("join: unrelated output names fall back to physical size")
 	CHECK(out[1].manufacturer_id == ACR_RAW);
 }
 
-TEST_CASE("join: no names and no mm fall back to the pixel mode")
+TEST_CASE("join: no name and no mm is no physical evidence - a pixel mode alone never joins")
 {
+	// Was the pixel-mode fallback. A monitor with neither a physical size nor
+	// a connector name is indistinguishable from a virtual one, and a mode
+	// coincidence must not hand it a real connector's EDID.
 	os_display_desktop_info randr[2];
 	box_randr(randr, "XWAYLAND0", "XWAYLAND1");
 	for (auto &m : randr) {
@@ -263,10 +266,54 @@ TEST_CASE("join: no names and no mm fall back to the pixel mode")
 
 	os_display_edid_monitor out[2] = {};
 	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
-	CHECK(out[0].join == OS_EDID_JOIN_MODE); // device mode 2880x1800
-	CHECK(out[0].manufacturer_id == SDC_RAW);
+	CHECK(out[0].join == OS_EDID_JOIN_NONE);
+	CHECK(out[0].manufacturer_id == 0);
+	CHECK(out[1].join == OS_EDID_JOIN_NONE);
+	CHECK(out[1].manufacturer_id == 0);
+	CHECK(out[1].pixel_width == 3840); // still listed, with its placement
+}
+
+TEST_CASE("join: a virtual RandR monitor never inherits the panel's EDID by mode")
+{
+	// The laptop joins by name. The DS1 is lit on HDMI-A-1 but its RandR
+	// output is not in the list (e.g. disabled in X), and a VNC-style virtual
+	// monitor runs the panel's 3840x2160: before the hardening it was
+	// mode-joined to HDMI-A-1, and a vendor plug-in then claimed a monitor
+	// that does not exist as its panel.
+	os_display_desktop_info randr[2];
+	box_randr(randr);
+	randr[1] = randr_mon("VIRTUAL1", 3456, 3840, 2160, 0, 0, false);
+	os_display_drm_connector drm[2];
+	box_drm(drm);
+
+	os_display_edid_monitor out[2] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
+	CHECK(out[0].join == OS_EDID_JOIN_NAME);
+	CHECK(out[1].join == OS_EDID_JOIN_NONE);
+	CHECK(out[1].manufacturer_id == 0);
+	CHECK(out[1].connector[0] == '\0');
+}
+
+TEST_CASE("join: XWayland outputs whose mm tie still join by their device mode")
+{
+	// Same physical size on both outputs (pass 2 is ambiguous), different
+	// device modes: the mode pass settles it — physical size is evidence
+	// enough that these are real outputs.
+	os_display_desktop_info randr[2] = {
+	    randr_mon("XWAYLAND0", 0, 3840, 2160, 340, 190, true),
+	    randr_mon("XWAYLAND1", 3840, 2560, 1440, 340, 190, false),
+	};
+	os_display_drm_connector drm[2] = {
+	    drm_conn("card1-HDMI-A-1", DS1_EDID, sizeof(DS1_EDID), 3840, 2160),
+	    drm_conn("card1-DP-1", DS1_EDID, sizeof(DS1_EDID), 2560, 1440),
+	};
+
+	os_display_edid_monitor out[2] = {};
+	REQUIRE(os_display_edid_linux_join(randr, nullptr, 2, drm, 2, out, 2) == 2);
+	CHECK(out[0].join == OS_EDID_JOIN_MODE);
+	CHECK(std::strcmp(out[0].connector, "card1-HDMI-A-1") == 0);
 	CHECK(out[1].join == OS_EDID_JOIN_MODE);
-	CHECK(out[1].manufacturer_id == ACR_RAW);
+	CHECK(std::strcmp(out[1].connector, "card1-DP-1") == 0);
 }
 
 TEST_CASE("join: two identical panels with no name match stay unjoined, never guessed")

@@ -87,6 +87,56 @@ target_screens_build(const struct xrt_dp_factory_registry *reg,
                      const struct target_screens_system *sys,
                      struct xrt_screen_list *out);
 
+struct os_display_panel_claim;
+struct os_display_panel_hint;
+struct os_display_desktop_info;
+struct os_display_edid_monitor;
+
+/*!
+ * The active plug-in's REAL claims in the per-monitor registry, as input to
+ * the claim rule (`os_display_desktop_select_claim`, displayxr-leia-plugin#430).
+ *
+ * Only entries the active plug-in WON through its own `probe_displays`, at
+ * `XRT_DISPLAY_CLAIM_EDID` or above, on a monitor with a known desktop
+ * position. Excluded, so this path can never select an unclaimed or virtual
+ * monitor: FALLBACK claims (sim-display's "anything unclaimed"),
+ * PRESENT_NOT_READY ones, the claim the loader SYNTHESIZES for a plug-in
+ * without `probe_displays` (it is always the primary — evidence of nothing),
+ * other plug-ins' entries, and DRM-only records whose origin is unknown.
+ *
+ * @p out_mons (parallel to @p out_claims, may be NULL) receives each claim's
+ * enumeration record — the HMONITOR / output name the pick is resolved by.
+ * Reads the loader's monitor side table, so it must run after the registry
+ * was built in this process.
+ *
+ * @return the number of claims written (<= @p max).
+ */
+uint32_t
+target_screens_collect_panel_claims(const struct xrt_dp_factory_registry *reg,
+                                    const char *active_plugin_id,
+                                    struct os_display_panel_claim *out_claims,
+                                    struct os_display_edid_monitor *out_mons,
+                                    uint32_t max);
+
+/*!
+ * The claim rule, end to end: collect (@ref target_screens_collect_panel_claims),
+ * select (`os_display_desktop_select_claim`) and resolve the pick by OS
+ * identity (`os_display_desktop_info_for_device`). Shared by the runtime's
+ * panel rect (`fill_display_desktop_info`) and `displayxr-cli info`, so both
+ * report the same monitor.
+ *
+ * @param[out] out_overrides_origin  Optional; set when the pick contradicts
+ *             an origin the plug-in did report (a VERIFIED claim won).
+ * @return true when the claim rule fired and the monitor resolved; false
+ *         leaves the caller on the origin / size / primary rules.
+ */
+bool
+target_screens_panel_from_claims(const struct xrt_dp_factory_registry *reg,
+                                 const char *active_plugin_id,
+                                 const struct os_display_panel_hint *hint,
+                                 struct os_display_desktop_info *out_desktop,
+                                 bool *out_overrides_origin);
+
 #ifdef __cplusplus
 }
 #endif
