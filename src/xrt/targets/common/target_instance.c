@@ -730,6 +730,8 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 		pthread_mutex_lock(&g_generation_lock);
 		g_display_generation = 1;
 		pthread_mutex_unlock(&g_generation_lock);
+		// ADR-054 N6 Part 2: the per-screen viewer sources of the as-created table.
+		target_viewer_tracking_update_screens(now, &info->dp_registry);
 	} else {
 		struct target_screens_change c;
 		changed = target_screens_compare(&g_published_screens, now, &c);
@@ -755,6 +757,10 @@ publish_screens_locked(const struct xrt_system_compositor_info *info, bool initi
 				    (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0 ? " (system default)" : "");
 			}
 			g_published_screens = *now;
+			// ADR-054 N6 Part 2: a new topology re-routes the viewer source
+			// per screen (a hotplugged EXTERNAL_OK screen takes the provider,
+			// a tracking one keeps its own; the primary stays as created).
+			target_viewer_tracking_update_screens(now, &info->dp_registry);
 		} else if (c.metadata_changed != 0) {
 			// Only an EDID physical size was refined (macOS: IOKit publishes
 			// the EDID blob ~0.5-1 s after CoreGraphics lists the monitor).

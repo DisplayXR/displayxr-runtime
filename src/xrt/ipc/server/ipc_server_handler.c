@@ -104,6 +104,50 @@ multi_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #include "qwerty_interface.h"
 #endif
 
+#include "xrt/xrt_system.h"
+#include "xrt/xrt_viewer_tracking.h" // ADR-054 N6 Part 2: the service hosts the viewer-tracking provider
+
+
+/*
+ *
+ * Viewer tracking (ADR-054 N6 Part 2, service hosting).
+ *
+ * The service's own native system arbitrates the viewer per screen exactly
+ * as an in-process runtime does (target_viewer_tracking.c) and hosts the one
+ * chosen provider for every IPC client: every place below that hands an IPC
+ * client eyes for its VIEWS (locate, the raw rig channel, the tracking state,
+ * the per-screen segment table) asks it here. A screen whose display tracks
+ * — or whose policy is not EXTERNAL_OK — answers false and the DP's eyes
+ * stand. The weave keeps the DP's eyes always (ADR-033).
+ *
+ */
+
+/*!
+ * Splice the provider's eyes for @p screen_id (XRT_VIEWER_SCREEN_PRIMARY or a
+ * monitor id) at @p target_ns over @p inout when the service's arbitration
+ * routed that screen to a provider. False = untouched.
+ */
+XRT_MAYBE_UNUSED static bool
+ipc_viewer_override_eyes(volatile struct ipc_client_state *ics,
+                         uint64_t screen_id,
+                         int64_t target_ns,
+                         struct xrt_eye_positions *inout,
+                         bool have_dp)
+{
+	struct ipc_server *s = ics != NULL ? ics->server : NULL;
+	struct xrt_viewer_tracking *vt = (s != NULL && s->xsysd != NULL) ? s->xsysd->viewer_tracking : NULL;
+	const bool spliced = xrt_viewer_tracking_override_eyes(vt, screen_id, target_ns, inout, have_dp);
+	static bool logged = false;
+	if (spliced && !logged) {
+		logged = true;
+		IPC_WARN(s,
+		         "viewer tracking (ADR-054 N6): IPC client views from the service-hosted provider "
+		         "(screen 0x%016llx, tracking=%d)",
+		         (unsigned long long)screen_id, (int)inout->is_tracking);
+	}
+	return spliced;
+}
+
 
 /*
  *
@@ -709,14 +753,31 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// static, symmetric frustum with the rig and zone rect ignored.
 		// xc == NULL (headless relay) keeps the previous behaviour.
 		// N6 Part 1 (#2144): at the locate's display time, not "latest".
-		if (!comp_d3d11_service_get_predicted_eye_positions_for_client_at(s->xsysc, xc, at_timestamp_ns,
-		                                                                  &left_eye, &right_eye)) {
+		const bool have_dp_pair = comp_d3d11_service_get_predicted_eye_positions_for_client_at(
+		    s->xsysc, xc, at_timestamp_ns, &left_eye, &right_eye);
+		// ADR-054 N6 Part 2: the primary screen's viewer source — the
+		// service-hosted provider when the arbitration chose one (the DP
+		// does not track, policy EXTERNAL_OK), else the DP's pair unchanged.
+		struct xrt_eye_positions pair = {0};
+		if (have_dp_pair) {
+			pair.count = 2;
+			pair.valid = true;
+			pair.eyes[0] = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			pair.eyes[1] = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
+		}
+		const bool spliced =
+		    ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &pair, have_dp_pair);
+		if (!have_dp_pair && !spliced) {
 			static bool logged_no_eye_pos = false;
 			if (!logged_no_eye_pos) {
 				logged_no_eye_pos = true;
 				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_predicted_eye_positions FAILED, skipping");
 			}
 			return false;
+		}
+		if (spliced) {
+			left_eye = (struct xrt_vec3){pair.eyes[0].x, pair.eyes[0].y, pair.eyes[0].z};
+			right_eye = (struct xrt_vec3){pair.eyes[1].x, pair.eyes[1].y, pair.eyes[1].z};
 		}
 		raw_eyes[0] = left_eye;
 		if (eye_count > 1) raw_eyes[1] = right_eye;
@@ -735,9 +796,16 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (ws_framed) {
 			full_eyes = ws_eyes; // the framing screen's set (ADR-052 D2)
 		}
-		if ((ws_framed || comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
-		                      s->xsysc, xc, at_timestamp_ns, &full_eyes)) &&
-		    full_eyes.valid) {
+		bool have_full = ws_framed || comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		                                  s->xsysc, xc, at_timestamp_ns, &full_eyes);
+		// ADR-054 N6 Part 2: the raw channel reports the eyes the views
+		// follow — the provider's on a screen routed to it (primary only
+		// here; a workspace tile framed on another screen keeps its DP's).
+		if (!ws_framed && ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &full_eyes,
+		                                           have_full && full_eyes.valid)) {
+			have_full = true;
+		}
+		if (have_full && full_eyes.valid) {
 			uint32_t raw_n = full_eyes.count;
 			if (raw_n > XRT_MAX_VIEWS) {
 				raw_n = XRT_MAX_VIEWS;
@@ -937,6 +1005,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// screen's (that screen's display space, the frame wm now describes), both
 	// for the render pair and the raw channel.
 	if (zone_reframed) {
+		// ADR-054 N6 Part 2: that screen's viewer source — the provider,
+		// mapped into its display space, when the arbitration routed it there.
+		(void)ipc_viewer_override_eyes(ics, zone_screen.screen_id, at_timestamp_ns, &zone_screen.eyes, true);
 		const struct xrt_eye_positions *ze = &zone_screen.eyes;
 		const uint32_t zn = ze->count < XRT_MAX_VIEWS ? ze->count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < eye_count; i++) {
@@ -1883,6 +1954,30 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 				head_eyes[i] =
 				    (struct xrt_vec3){nx + ((i & 1u) ? ipd * 0.5f : -ipd * 0.5f), ny, nz};
 			}
+		}
+	}
+
+	// ADR-054 N6 Part 2: the primary screen's viewer source. When the
+	// service's arbitration routed it to a viewer-tracking provider (the DP
+	// does not track, policy EXTERNAL_OK), the provider's pair replaces the
+	// head set above — the DP's or the nominal layout, whose N-view shape is
+	// kept and translated onto the pair (xrt_viewer_tracking_splice). A
+	// tracking DP's eyes are never replaced (the call answers false).
+	{
+		struct xrt_eye_positions cur = {0};
+		cur.count = head_eye_count;
+		cur.valid = head_eye_count > 0;
+		for (uint32_t i = 0; i < head_eye_count && i < XRT_MAX_VIEWS; i++) {
+			cur.eyes[i] = (struct xrt_eye_position){head_eyes[i].x, head_eyes[i].y, head_eyes[i].z};
+		}
+		if (ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &cur, cur.valid)) {
+			head_eye_count = cur.count < XRT_MAX_VIEWS ? cur.count : XRT_MAX_VIEWS;
+			for (uint32_t i = 0; i < head_eye_count; i++) {
+				head_eyes[i] = (struct xrt_vec3){cur.eyes[i].x, cur.eyes[i].y, cur.eyes[i].z};
+			}
+			is_tracking = cur.is_tracking;
+			sample_time_ns = cur.timestamp_ns;
+			have_dp_eyes = true;
 		}
 	}
 
@@ -3398,8 +3493,13 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		// query would report isTracking=false for it (or another app's state)
 		// even while its own located views are tracked. N6 Part 1 (#2144):
 		// at the client's target time (its frame's displayTime).
-		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		const bool have_dp = comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
 		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, target_ns, &eyes);
+		// ADR-054 N6 Part 2: on a screen routed to the service-hosted
+		// provider, the live tracking state is the provider's (its lock, its
+		// staleness) — the eyes the views follow, not a display that does
+		// not track.
+		(void)ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, target_ns, &eyes, have_dp && eyes.valid);
 
 		// ADR-047 Amendment 7: the session is tracked when ANY DP presenting
 		// for it sees a viewer — its own (above), or a segment DP / workspace
@@ -3418,7 +3518,9 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 	// located views and the weave itself tracked the head.
 	if (ics->xc != NULL) {
 		// N6 Part 1 (#2144): at the client's target time.
-		(void)multi_compositor_get_eye_positions_at(multi_compositor(ics->xc), target_ns, &eyes);
+		const bool have_dp = multi_compositor_get_eye_positions_at(multi_compositor(ics->xc), target_ns, &eyes);
+		// ADR-054 N6 Part 2: the service-hosted provider's state when it serves the screen.
+		(void)ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, target_ns, &eyes, have_dp && eyes.valid);
 	}
 #else
 	(void)ics;
@@ -3482,6 +3584,18 @@ ipc_handle_compositor_get_segment_metrics(volatile struct ipc_client_state *ics,
 	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
 		(void)comp_d3d11_service_get_client_segment_metrics(ics->server->xsysc,
 		                                                    (struct xrt_compositor *)ics->xc, out_metrics);
+		// ADR-054 N6 Part 2, per screen: the client computes each segment's
+		// views from this table, so the service splices the provider's eyes
+		// (mapped into each routed screen's display space) here. The message
+		// carries no target time: "now" — the ring extrapolates a bounded
+		// distance, the same horizon the DP's own "latest" answer has.
+		const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		for (uint32_t i = 0; i < out_metrics->count && i < XRT_MAX_SEGMENTS; i++) {
+			if (ipc_viewer_override_eyes(ics, out_metrics->seg[i].screen_id, now_ns,
+			                             &out_metrics->seg[i].eyes, out_metrics->seg[i].have_eyes)) {
+				out_metrics->seg[i].have_eyes = true;
+			}
+		}
 	}
 #else
 	(void)ics;
