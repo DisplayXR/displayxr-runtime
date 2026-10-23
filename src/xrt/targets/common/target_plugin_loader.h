@@ -626,7 +626,7 @@ target_plugin_release_claim_sources(void);
  * plug-in and it alone decided the last resolve (#1874), and before the first
  * resolve (which collects from scratch).
  *
- * macOS/Linux. Windows and Android: returns 0 (TODO, ADR-047 Amendment 8).
+ * macOS, Linux and Windows (#2305). Android: returns 0 (one plug-in).
  *
  * @return the number of plug-ins newly added as claim sources.
  */

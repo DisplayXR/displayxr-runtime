@@ -303,3 +303,36 @@ TEST_CASE("claim rule: name")
 {
 	CHECK(std::strcmp(os_display_desktop_rule_str(OS_DISPLAY_DESKTOP_RULE_CLAIM), "plug-in claim") == 0);
 }
+
+/*
+ * #2305: on a hotplug re-resolve the monitor the panel rect is already on
+ * (the incumbent) stays the pick while it is still claimed — a second
+ * claimed panel, even a VERIFIED one of the panel's own size, never moves the
+ * rect off the monitor a live session's DP weaves.
+ */
+TEST_CASE("claim select: the incumbent outranks verified, size and non-primary")
+{
+	os_display_panel_hint h = {};
+	h.pixel_width = 3840;
+	h.pixel_height = 2160;
+
+	os_display_panel_claim claims[] = {claim(0, 2560, 1440, false, true), claim(3840, 3840, 2160, true)};
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == 1);
+	claims[0].incumbent = true;
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == 0);
+
+	// A virtual monitor is never a claim, so it never reaches this list; the
+	// incumbent stays the pick whatever else is listed.
+	os_display_panel_claim one[] = {claim(-3840, 3840, 2160, true)};
+	one[0].incumbent = true;
+	CHECK(os_display_desktop_select_claim(one, 1, &h, nullptr) == 0);
+}
+
+TEST_CASE("claim select: an incumbent does not override an origin the plug-in reports inside a claim")
+{
+	os_display_panel_hint h = {};
+	h.screen_left = 3900; // inside the second claim
+	os_display_panel_claim claims[] = {claim(0, 3840, 2160, true), claim(3840, 3840, 2160, true)};
+	claims[0].incumbent = true;
+	CHECK(os_display_desktop_select_claim(claims, 2, &h, nullptr) == -1); // origin rule, as before
+}
