@@ -663,6 +663,17 @@ bool
 comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *split, bool is_repaint, const struct xrt_rect *canvas);
 
 /*!
+ * #2317 P1c: the predicted display time xrWaitFrame handed the app for the
+ * frame about to be woven (the tier's `last_display_time_ns`). Call before
+ * the APP weave; the weave hands it to the target's weave mark, which is what
+ * makes the `DXR_WEAVE_LATENCY_CSV` site emit D (prediction error) rows —
+ * the same rows the tiers' own sites emit, so native and hub arms compare.
+ * Repaints never carry one (they are not the frame the app was promised).
+ */
+void
+comp_hub_d3d11_set_predicted_display_time(struct comp_hub_d3d11 *split, uint64_t predicted_display_time_ns);
+
+/*!
  * True when the last app frame published a slot a repaint could replay. The
  * repaint tick tests this BEFORE acquiring, so a warmup tick costs no acquire.
  */

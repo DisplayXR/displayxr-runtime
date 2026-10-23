@@ -12141,6 +12141,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		}
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
+		// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise.
+		comp_hub_d3d11_set_predicted_display_time(c->split, c->last_display_time_ns);
 		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
 
 		/*
