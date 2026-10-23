@@ -50,7 +50,7 @@ extern "C" {
  *                          (#918) or reroute (#1264) session. The tier's own
  *                          `display_processor` is NULL whenever this is true, so
  *                          its answer describes nothing.
- * @param arm_consumes      The ARM's answer (`comp_vk_split_zone_dp_supported`).
+ * @param arm_consumes      The ARM's answer (`comp_hub_d3d11_zone_dp_supported`).
  *                          Only meaningful when @p weaver_on_arm.
  * @param own_dp_consumes   The tier's OWN display processor's answer. Only
  *                          meaningful when the tier owns its weaver.

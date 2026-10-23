@@ -53,14 +53,13 @@ if(WIN32 AND XRT_HAVE_D3D12)
 
 	target_include_directories(comp_d3d12 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-	# #1264 heavy-d3d12 reroute: the same-adapter fill arm IS comp_vk_split —
-	# Vulkan-free, self-contained D3D11 code that happens to live in the
-	# comp_vk_native library (it consumes only the pure-D3D11 handoff struct).
-	# Guarded on the same condition vk_native itself builds under on Windows;
-	# without Vulkan the reroute code compiles out and the tier keeps its
-	# own-legs arm.
-	if(XRT_HAVE_VULKAN)
-		target_link_libraries(comp_d3d12 PRIVATE comp_vk_native)
+	# #1264 heavy-d3d12 reroute: the same-adapter fill arm is comp_hub_d3d11 —
+	# Vulkan-free, self-contained D3D11 code that consumes only the pure-D3D11
+	# handoff struct. It lived in comp_vk_native until #2317 P1a, so the reroute
+	# used to compile out of Vulkan-less builds; it now needs only D3D11, which
+	# is what the hub itself needs.
+	if(TARGET comp_hub_d3d11 AND XRT_HAVE_D3D11)
+		target_link_libraries(comp_d3d12 PRIVATE comp_hub_d3d11)
 		target_compile_definitions(comp_d3d12 PRIVATE COMP_D3D12_HAVE_D3D11_FILL_ARM)
 	endif()
 

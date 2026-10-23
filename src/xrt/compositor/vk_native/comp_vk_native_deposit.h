@@ -76,6 +76,8 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_vulkan_includes.h"
 
+#include "hub_d3d11/comp_hub_d3d11_handoff.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -101,60 +103,11 @@ extern "C" {
 bool
 comp_vk_deposit_requested(void);
 
-/*!
- * Everything a D3D consumer (VK-1's @ref comp_xbridge wiring) needs to pick the
- * deposit up. Pointers are BORROWED — the deposit owns them and outlives no
- * caller.
+/*
+ * The handoff (formerly `struct comp_vk_deposit_handoff`) is the hub's contract,
+ * not the deposit's: it moved to hub_d3d11/comp_hub_d3d11_handoff.h (#2317 P1a)
+ * so the hub and the D3D12 reroute build without Vulkan headers.
  */
-struct comp_vk_deposit_handoff
-{
-	void *d3d11_device;  //!< `ID3D11Device *` the deposit textures live on.
-	void *d3d11_context; //!< `ID3D11DeviceContext *`, its immediate context.
-	void *dxgi_adapter;  //!< `IDXGIAdapter *` — the VkDevice's adapter, LUID-matched.
-
-	void *texture;       //!< `ID3D11Texture2D *` — the slot Vulkan last wrote.
-	void *shared_handle; //!< `HANDLE` — NT share of @ref texture.
-
-	/*!
-	 * `IDXGIKeyedMutex *` of @ref texture, or NULL in fence mode. Non-NULL
-	 * means the deposit is in KEYED-MUTEX mode (no D3D12_FENCE import on this
-	 * driver — ADR-039 Phase A): @ref fence is NULL, and the consumer MUST
-	 * bracket its read with `AcquireSync(0, bounded_timeout)` /
-	 * `ReleaseSync(0)` — key 0, and SKIP the frame on timeout rather than
-	 * wait. The rationale for key 0 both sides (mutual exclusion, never a 0/1
-	 * ready-handshake) lives at the mode selection in
-	 * @ref comp_vk_deposit_create.
-	 */
-	void *keyed_mutex;
-
-	void *fence;               //!< `ID3D11Fence *` Vulkan signals from the atlas submit.
-	void *fence_shared_handle; //!< `HANDLE` — NT share of @ref fence.
-
-	/*!
-	 * The value @ref fence reaches once Vulkan's write to @ref texture has
-	 * completed on the GPU. A consumer waits for exactly this:
-	 * `ctx4->Wait(fence, fence_value)`. Zero before the first atlas submit.
-	 */
-	uint64_t fence_value;
-
-	uint64_t adapter_luid; //!< Packed LUID (HighPart<<32 | LowPart) of the shared adapter.
-	uint32_t width;
-	uint32_t height;
-	uint32_t slot; //!< Ring index of @ref texture.
-	/*!
-	 * The `DXGI_FORMAT` of @ref texture, as an integer so this header stays
-	 * free of `dxgi.h`.
-	 *
-	 * Published because a CONSUMER's copy of this texture is format-checked,
-	 * not merely size-checked: `ID3D11DeviceContext::CopySubresourceRegion`
-	 * requires source and destination to share a typeless family, and
-	 * `B8G8R8A8` and `R8G8B8A8` do not. A cross-family copy is not an error the
-	 * API reports — it is dropped, and the destination keeps whatever it held
-	 * (#1178). Consumers must compare this against their own chain's format
-	 * rather than assume.
-	 */
-	uint32_t dxgi_format;
-};
 
 /*!
  * Stand the deposit up: LUID-match a D3D11 device to @p vk, allocate the
@@ -304,7 +257,7 @@ comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep);
  * @return false if the deposit is not active.
  */
 bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out);
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out);
 
 /*!
  * @name VK-1b (#1178) — the PLANE deposits.

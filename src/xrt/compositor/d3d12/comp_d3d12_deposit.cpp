@@ -390,7 +390,7 @@ comp_d3d12_deposit_signal(struct comp_d3d12_deposit *dep, void *app_queue)
 }
 
 extern "C" bool
-comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_vk_deposit_handoff *out)
+comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d3d11_handoff *out)
 {
 	if (dep == NULL || out == NULL || dep->dx == NULL) {
 		return false;

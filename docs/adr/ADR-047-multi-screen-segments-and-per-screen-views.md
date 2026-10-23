@@ -531,9 +531,9 @@ and DWM composes its present instead of flipping it (#2245 has the measurement).
   on the render device (`:19380`) and their DP through `create_dp_d3d11_for_screen` (`:19481`).
 - In-process #918 Stage A resolves the scanout adapter from the session's display rect the same way
   (`d3d11/comp_d3d11_compositor.cpp:5408`, `d3d12/comp_d3d12_compositor.cpp:2164`,
-  `vk_native/comp_vk_native_split.cpp:1032`) and creates the segment managers on that output device
+  `vk_native/hub_d3d11/comp_hub_d3d11.cpp:1032`) and creates the segment managers on that output device
   (`comp_d3d11_compositor.cpp:2893`, `comp_d3d12_compositor.cpp:4038`,
-  `comp_vk_native_split.cpp:831`).
+  `hub_d3d11/comp_hub_d3d11.cpp:831`).
 
 ### Rule
 

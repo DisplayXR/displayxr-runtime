@@ -2,8 +2,16 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  VK-1 — the in-process Vulkan output-device split (#918 / #1178).
- * @ingroup comp_vk_native
+ * @brief  The D3D11 hub (fill arm): weave + present on a D3D11 device for any producer.
+ * @ingroup comp_hub_d3d11
+ *
+ * Born as VK-1, the in-process Vulkan output-device split (#918 / #1178), in
+ * comp_vk_native (as comp_vk_native_split.h); extracted into its own library by
+ * #2317 P1a because it was never Vulkan code: it consumes only the pure-D3D11
+ * @ref comp_hub_d3d11_handoff (comp_hub_d3d11_handoff.h). Today's producers are
+ * the Vulkan deposit (VK-0) and the D3D12 tier's #1264 same-adapter reroute.
+ * Symbols renamed comp_vk_split_* -> comp_hub_d3d11_*; the design prose below
+ * is the VK-1 original and still describes the mechanism.
  *
  * ## What this is
  *
@@ -76,7 +84,7 @@
  * immediate context is what writes their scratch. Here the plane is written by
  * the **Vulkan queue**, which that wait does not order at all.
  *
- * @ref comp_vk_split_submit_atlas therefore takes the bridge's wait and then
+ * @ref comp_hub_d3d11_submit_atlas therefore takes the bridge's wait and then
  * signals the deposit's shared fence on that same immediate context, so the value
  * is unreachable until the producer's read has resolved; Vulkan's next flatten
  * waits for it on the timeline. One queued signal, one queued wait, no deeper
@@ -119,12 +127,12 @@
 #include <stdbool.h>
 
 struct xrt_device;
-struct comp_vk_split;
+struct comp_hub_d3d11;
 struct xrt_screen_list;
 struct xrt_segment_metrics;
 struct xrt_system_compositor_info;
 struct comp_segments_content;
-struct comp_vk_deposit_handoff;
+struct comp_hub_d3d11_handoff;
 //! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
 struct xrt_dp_background_preview;
 
@@ -154,7 +162,7 @@ extern "C" {
  * Everything Stage A needs. All pointers are borrowed; the split AddRefs what it
  * keeps and never outlives its creator.
  */
-struct comp_vk_split_info
+struct comp_hub_d3d11_info
 {
 	struct xrt_device *xdev;
 
@@ -210,8 +218,8 @@ struct comp_vk_split_info
  *
  * A2 failing is therefore **not** a weaker guarantee than the D3D legs': nothing
  * has been submitted or presented at that point, so
- * @ref comp_vk_split_retire restores exactly the state A1 skipped, through the
- * same single recovery path. See @ref comp_vk_split_wire_bridge.
+ * @ref comp_hub_d3d11_retire restores exactly the state A1 skipped, through the
+ * same single recovery path. See @ref comp_hub_d3d11_wire_bridge.
  *
  * @param out_split On success, the active split. NULL on every other outcome.
  * @param out_short_reason ALWAYS set: one of the canonical `COMP_SPLIT_REASON_*`
@@ -224,9 +232,9 @@ struct comp_vk_split_info
  *         ever fatal to the session.
  */
 xrt_result_t
-comp_vk_split_stage_a(const struct comp_vk_split_info *info,
-                      struct comp_vk_split **out_split,
-                      const char **out_short_reason);
+comp_hub_d3d11_stage_a(const struct comp_hub_d3d11_info *info,
+                       struct comp_hub_d3d11 **out_split,
+                       const char **out_short_reason);
 
 /*!
  * **Stage A2** — wire @ref comp_xbridge between the deposit and the output
@@ -238,14 +246,14 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
  *
  * @param handoff The deposit's app end (device, immediate context, adapter). The
  *        split keeps the device/context/adapter, not the per-slot texture — the
- *        slot is nominated per frame by @ref comp_vk_split_submit_atlas.
+ *        slot is nominated per frame by @ref comp_hub_d3d11_submit_atlas.
  *
  * @return true when the bridge is live. On false the caller must
- *         @ref comp_vk_split_retire immediately; nothing has presented yet, so
+ *         @ref comp_hub_d3d11_retire immediately; nothing has presented yet, so
  *         that is a cold recovery.
  */
 bool
-comp_vk_split_wire_bridge(struct comp_vk_split *split, const struct comp_vk_deposit_handoff *handoff);
+comp_hub_d3d11_wire_bridge(struct comp_hub_d3d11 *split, const struct comp_hub_d3d11_handoff *handoff);
 
 /*!
  * Release everything, in the reverse of the create order, and NULL the caller's
@@ -253,7 +261,7 @@ comp_vk_split_wire_bridge(struct comp_vk_split *split, const struct comp_vk_depo
  * its egress slots are what the display processor is still sampling.
  */
 void
-comp_vk_split_destroy(struct comp_vk_split **split_ptr);
+comp_hub_d3d11_destroy(struct comp_hub_d3d11 **split_ptr);
 
 /*!
  * ADR-037 §3 — give the scanout adapter back and move the weave home for the
@@ -271,7 +279,7 @@ comp_vk_split_destroy(struct comp_vk_split **split_ptr);
  * @param short_reason The canonical token for the correction line.
  */
 void
-comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const char *short_reason);
+comp_hub_d3d11_retire(struct comp_hub_d3d11 **split_ptr, const char *why, const char *short_reason);
 
 /*!
  * Hand this app frame's deposit slot to the bridge.
@@ -286,7 +294,7 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
  * bridge delivers CROPPED pixels; the compositor's own `vk_crop_atlas_for_dp`
  * scratch is not involved and must not run. Only when the R2 resize hysteresis is
  * holding a worst-case ring does a crop remain owed, and that one runs on the
- * OUTPUT device inside @ref comp_vk_split_weave_and_present.
+ * OUTPUT device inside @ref comp_hub_d3d11_weave_and_present.
  *
  * @param handoff This frame's deposit slot, after `comp_vk_deposit_advance`.
  * @param cols,rows,view_w,view_h The frame's effective tile layout. A change in
@@ -295,17 +303,17 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
  *        refusal test.
  */
 void
-comp_vk_split_submit_atlas(struct comp_vk_split *split,
-                           const struct comp_vk_deposit_handoff *handoff,
-                           uint32_t cols,
-                           uint32_t rows,
-                           uint32_t view_w,
-                           uint32_t view_h);
+comp_hub_d3d11_submit_atlas(struct comp_hub_d3d11 *split,
+                            const struct comp_hub_d3d11_handoff *handoff,
+                            uint32_t cols,
+                            uint32_t rows,
+                            uint32_t view_w,
+                            uint32_t view_h);
 
 /*!
  * VK-1b (#1178) — publish this frame's 2D-under BACKDROP plane.
  *
- * Call once per app frame, BEFORE @ref comp_vk_split_submit_atlas: that call
+ * Call once per app frame, BEFORE @ref comp_hub_d3d11_submit_atlas: that call
  * stamps the slot's recipe, and the recipe carries the backdrop's own extent.
  *
  * The plane's SOURCE is a deposit-backed surface — an NT-shared `ID3D11Texture2D`
@@ -329,18 +337,18 @@ comp_vk_split_submit_atlas(struct comp_vk_split *split,
  *        clears the display processor's background.
  */
 void
-comp_vk_split_stage_backdrop(struct comp_vk_split *split,
-                             void *nt_handle,
-                             uint64_t generation,
-                             uint32_t alloc_w,
-                             uint32_t alloc_h,
-                             uint64_t content_seq,
-                             int32_t dirty_x,
-                             int32_t dirty_y,
-                             uint32_t dirty_w,
-                             uint32_t dirty_h,
-                             uint32_t bd_w,
-                             uint32_t bd_h);
+comp_hub_d3d11_stage_backdrop(struct comp_hub_d3d11 *split,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t alloc_w,
+                              uint32_t alloc_h,
+                              uint64_t content_seq,
+                              int32_t dirty_x,
+                              int32_t dirty_y,
+                              uint32_t dirty_w,
+                              uint32_t dirty_h,
+                              uint32_t bd_w,
+                              uint32_t bd_h);
 
 /*!
  * @name VK-1b-2 — the output-device masked composite.
@@ -354,14 +362,14 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *split,
  * @{
  */
 //! No mask this frame — the composite runs Phase 0's analytic canvas-rect path.
-#define COMP_VK_SPLIT_MASK_NONE 0u
+#define COMP_HUB_D3D11_MASK_NONE 0u
 //! #439 — M=1 everywhere, M=0 inside the OVER Local2D rects (ALPHA_OVER).
-#define COMP_VK_SPLIT_MASK_IMPLICIT 1u
+#define COMP_HUB_D3D11_MASK_IMPLICIT 1u
 //! ADR-027 auto wish — M=0 everywhere, M=1 inside each zone rect. ALSO the
 //! published wish: cosmetics never enter it (#800/#801).
-#define COMP_VK_SPLIT_MASK_ZONE_BINARY 2u
+#define COMP_HUB_D3D11_MASK_ZONE_BINARY 2u
 //! #803 per-zone opt-in inward ramp. COMPOSITE-only; the wish stays binary.
-#define COMP_VK_SPLIT_MASK_ZONE_FEATHER 3u
+#define COMP_HUB_D3D11_MASK_ZONE_FEATHER 3u
 
 /*!
  * Raster this app frame's zone/Local2D mask **on the scanout device**.
@@ -376,7 +384,7 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *split,
  * because it records into a command list and `layer_commit` `Reset()`s the
  * out-device list *after* the deposit half runs, so the work would be thrown
  * away; hence its `out_mask_req`. This leg's out device is a **D3D11 device with
- * an immediate context** (@ref comp_vk_split_stage_a creates it), so work is
+ * an immediate context** (@ref comp_hub_d3d11_stage_a creates it), so work is
  * submitted as it is written and there is no Reset to lose it to. The raster runs
  * inline, exactly as the shipped D3D11 leg's does. Do not "align" this with the
  * D3D12 shape — the difference is real and it is on this side.
@@ -389,21 +397,21 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *split,
  * @return true when a mask is available for this frame's composite.
  */
 bool
-comp_vk_split_raster_mask(struct comp_vk_split *split,
-                          uint32_t kind,
-                          const struct xrt_rect *rects,
-                          const float *feather_px,
-                          uint32_t rect_count,
-                          uint32_t region_w,
-                          uint32_t region_h);
+comp_hub_d3d11_raster_mask(struct comp_hub_d3d11 *split,
+                           uint32_t kind,
+                           const struct xrt_rect *rects,
+                           const float *feather_px,
+                           uint32_t rect_count,
+                           uint32_t region_w,
+                           uint32_t region_h);
 
 /*!
  * VK-1b-2 — publish this frame's LOCAL2D plane and the COMPOSITE recipe.
  *
  * Call once per app frame from the deposit half, before
- * @ref comp_vk_split_submit_atlas. @p nt_handle / @p generation / @p content_seq
+ * @ref comp_hub_d3d11_submit_atlas. @p nt_handle / @p generation / @p content_seq
  * and the dirty box carry the meanings documented on
- * @ref comp_vk_split_stage_backdrop.
+ * @ref comp_hub_d3d11_stage_backdrop.
  *
  * The rest is the recipe (#1140): the consume half reads every composite
  * parameter FROM THE SLOT, never from live CPU state, because the slot it is
@@ -417,25 +425,25 @@ comp_vk_split_raster_mask(struct comp_vk_split *split,
  *        zone raster.
  */
 void
-comp_vk_split_stage_local2d(struct comp_vk_split *split,
-                            void *nt_handle,
-                            uint64_t generation,
-                            uint32_t alloc_w,
-                            uint32_t alloc_h,
-                            uint64_t content_seq,
-                            int32_t dirty_x,
-                            int32_t dirty_y,
-                            uint32_t dirty_w,
-                            uint32_t dirty_h,
-                            uint32_t region_w,
-                            uint32_t region_h,
-                            int32_t cx,
-                            int32_t cy,
-                            uint32_t cw,
-                            uint32_t ch,
-                            uint32_t composite_mode,
-                            bool opaque_present,
-                            bool mask_is_plane);
+comp_hub_d3d11_stage_local2d(struct comp_hub_d3d11 *split,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t region_w,
+                             uint32_t region_h,
+                             int32_t cx,
+                             int32_t cy,
+                             uint32_t cw,
+                             uint32_t ch,
+                             uint32_t composite_mode,
+                             bool opaque_present,
+                             bool mask_is_plane);
 
 /*!
  * This frame runs NO composite. Stamps `composite=false` on the slot and
@@ -443,7 +451,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *split,
  * a composite it has no pixels for.
  */
 void
-comp_vk_split_stage_no_composite(struct comp_vk_split *split);
+comp_hub_d3d11_stage_no_composite(struct comp_hub_d3d11 *split);
 
 /*!
  * #1264 — declare the DXGI format of the caller's 2D plane surfaces (Local2D +
@@ -451,12 +459,12 @@ comp_vk_split_stage_no_composite(struct comp_vk_split *split);
  * cross-family copy is DROPPED in silence, which is why the bind refuses
  * instead. Default (never calling this) is `DXGI_FORMAT_B8G8R8A8_UNORM`, the
  * VK deposit's family; the d3d12 reroute passes `R8G8B8A8`. Call once, after
- * @ref comp_vk_split_wire_bridge and BEFORE the first backdrop/Local2D stage —
+ * @ref comp_hub_d3d11_wire_bridge and BEFORE the first backdrop/Local2D stage —
  * changing an already-bound chain's family is not supported. The mask plane is
  * R8 regardless.
  */
 void
-comp_vk_split_set_plane_format(struct comp_vk_split *split, uint32_t dxgi_format);
+comp_hub_d3d11_set_plane_format(struct comp_hub_d3d11 *split, uint32_t dxgi_format);
 
 /*!
  * True when the scanout-adapter display processor advertises hardware zone
@@ -464,10 +472,10 @@ comp_vk_split_set_plane_format(struct comp_vk_split *split, uint32_t dxgi_format
  * which is why the compositor cannot answer it for a split session.
  */
 bool
-comp_vk_split_zone_dp_supported(struct comp_vk_split *split);
+comp_hub_d3d11_zone_dp_supported(struct comp_hub_d3d11 *split);
 
 /*!
- * ADR-027 P4 — publish the last @ref COMP_VK_SPLIT_MASK_ZONE_BINARY raster as
+ * ADR-027 P4 — publish the last @ref COMP_HUB_D3D11_MASK_ZONE_BINARY raster as
  * this client's hardware zone WISH, screen-anchored to the split's own HWND.
  *
  * The BINARY raster, never the feather one: feather is a cosmetic composite
@@ -482,11 +490,11 @@ comp_vk_split_zone_dp_supported(struct comp_vk_split *split);
  *        as an anchor-only update.
  */
 void
-comp_vk_split_publish_zone_wish(struct comp_vk_split *split, uint64_t seq);
+comp_hub_d3d11_publish_zone_wish(struct comp_hub_d3d11 *split, uint64_t seq);
 
 /*! Withdraw this client's zone contribution (the clear edge). */
 void
-comp_vk_split_clear_zone_wish(struct comp_vk_split *split);
+comp_hub_d3d11_clear_zone_wish(struct comp_hub_d3d11 *split);
 
 /*!
  * VK-1b-3 — bind the app-AUTHORED (Tier-3) zone mask's transport.
@@ -514,8 +522,8 @@ comp_vk_split_clear_zone_wish(struct comp_vk_split *split);
  * @return false only when a bind that was ASKED FOR could not be made.
  */
 bool
-comp_vk_split_bind_mask_plane(
-    struct comp_vk_split *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h);
+comp_hub_d3d11_bind_mask_plane(
+    struct comp_hub_d3d11 *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h);
 
 /*!
  * VK-1b-3 — stage the authored mask plane for the next submit.
@@ -536,7 +544,7 @@ comp_vk_split_bind_mask_plane(
  *        stamps it invalid rather than lending an older frame's pixels.
  */
 void
-comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq, uint32_t w, uint32_t h);
+comp_hub_d3d11_stage_mask_plane(struct comp_hub_d3d11 *split, uint64_t content_seq, uint32_t w, uint32_t h);
 
 /*!
  * VK-1b-2 — hand the split this frame's diagnostic HUD bitmap.
@@ -552,7 +560,7 @@ comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq
  * @param dirty The bitmap changed since the last call and must be re-uploaded.
  */
 void
-comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t w, uint32_t h, bool dirty);
+comp_hub_d3d11_set_hud(struct comp_hub_d3d11 *split, const void *pixels, uint32_t w, uint32_t h, bool dirty);
 /*! @} */
 
 /*!
@@ -566,7 +574,7 @@ comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t 
  * @param plane A `COMP_XBRIDGE_PLANE_*` index.
  */
 void
-comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane);
+comp_hub_d3d11_invalidate_plane(struct comp_hub_d3d11 *split, uint32_t plane);
 
 /*!
  * #1178 — make the scanout swapchain follow the window.
@@ -583,7 +591,7 @@ comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane);
  * @return true when the chain is at @p width x @p height afterwards.
  */
 bool
-comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_t height);
+comp_hub_d3d11_resize_target(struct comp_hub_d3d11 *split, uint32_t width, uint32_t height);
 
 /*!
  * Weave one frame on the scanout adapter and present it.
@@ -607,14 +615,14 @@ comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_
  * @return true when a frame was woven and presented.
  */
 bool
-comp_vk_split_weave_and_present(struct comp_vk_split *split, bool is_repaint, const struct xrt_rect *canvas);
+comp_hub_d3d11_weave_and_present(struct comp_hub_d3d11 *split, bool is_repaint, const struct xrt_rect *canvas);
 
 /*!
  * True when the last app frame published a slot a repaint could replay. The
  * repaint tick tests this BEFORE acquiring, so a warmup tick costs no acquire.
  */
 bool
-comp_vk_split_has_weave_slot(struct comp_vk_split *split);
+comp_hub_d3d11_has_weave_slot(struct comp_hub_d3d11 *split);
 
 /*!
  * #1339: @ref comp_d3d11_target_repaint_admit on the arm's own target — the
@@ -622,7 +630,7 @@ comp_vk_split_has_weave_slot(struct comp_vk_split *split);
  * repaint must not deepen. false = skip this repaint tick.
  */
 bool
-comp_vk_split_repaint_admit(struct comp_vk_split *split);
+comp_hub_d3d11_repaint_admit(struct comp_hub_d3d11 *split);
 
 /*!
  * #1482: @ref comp_d3d11_target_set_app_paced on the arm's own target — the
@@ -632,7 +640,7 @@ comp_vk_split_repaint_admit(struct comp_vk_split *split);
  * keyed on the same compositor's own grid.
  */
 void
-comp_vk_split_set_app_paced(struct comp_vk_split *split, bool paced);
+comp_hub_d3d11_set_app_paced(struct comp_hub_d3d11 *split, bool paced);
 
 /*!
  * The once-every-10-s `[RENDER] split=… xb_kb=… ingress=… ing_leak=…` line, in
@@ -640,7 +648,7 @@ comp_vk_split_set_app_paced(struct comp_vk_split *split, bool paced);
  * Cheap to call every frame; rate-limits itself.
  */
 void
-comp_vk_split_render_diag(struct comp_vk_split *split);
+comp_hub_d3d11_render_diag(struct comp_hub_d3d11 *split);
 
 /*!
  * @name Display-processor forwarding
@@ -656,23 +664,20 @@ comp_vk_split_render_diag(struct comp_vk_split *split);
  * @{
  */
 bool
-comp_vk_split_get_predicted_eye_positions(struct comp_vk_split *split, struct xrt_eye_positions *out_eye_pos);
+comp_hub_d3d11_get_predicted_eye_positions(struct comp_hub_d3d11 *split, struct xrt_eye_positions *out_eye_pos);
 
 bool
-comp_vk_split_get_display_dimensions(struct comp_vk_split *split, float *out_width_m, float *out_height_m);
+comp_hub_d3d11_get_display_dimensions(struct comp_hub_d3d11 *split, float *out_width_m, float *out_height_m);
 
 bool
-comp_vk_split_get_display_pixel_info(struct comp_vk_split *split,
-                                     uint32_t *out_width_px,
-                                     uint32_t *out_height_px,
-                                     int32_t *out_left,
-                                     int32_t *out_top);
+comp_hub_d3d11_get_display_pixel_info(
+    struct comp_hub_d3d11 *split, uint32_t *out_width_px, uint32_t *out_height_px, int32_t *out_left, int32_t *out_top);
 
 bool
-comp_vk_split_request_display_mode(struct comp_vk_split *split, bool enable_3d);
+comp_hub_d3d11_request_display_mode(struct comp_hub_d3d11 *split, bool enable_3d);
 
 void
-comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode);
+comp_hub_d3d11_set_eye_tracking_mode(struct comp_hub_d3d11 *split, uint32_t mode);
 
 /*!
  * XR_DXR_depth_budget - one background preview from the split's weaver.
@@ -693,7 +698,7 @@ comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode);
  *         the conservative case.
  */
 bool
-comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_background_preview *out_preview);
+comp_hub_d3d11_get_background_preview(struct comp_hub_d3d11 *split, struct xrt_dp_background_preview *out_preview);
 /*! @} */
 
 /*!
@@ -720,10 +725,10 @@ comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_
  *                           session is never segmented).
  */
 void
-comp_vk_split_set_screens(struct comp_vk_split *split,
-                          const struct xrt_screen_list *list,
-                          const struct xrt_system_compositor_info *info,
-                          uint64_t pinned_display_id);
+comp_hub_d3d11_set_screens(struct comp_hub_d3d11 *split,
+                           const struct xrt_screen_list *list,
+                           const struct xrt_system_compositor_info *info,
+                           uint64_t pinned_display_id);
 
 /*!
  * The segment table the last weave took, as per-segment view metrics, with
@@ -733,17 +738,17 @@ comp_vk_split_set_screens(struct comp_vk_split *split,
  * @return false when the last weave did not split the window.
  */
 bool
-comp_vk_split_get_segment_metrics(struct comp_vk_split *split, struct xrt_segment_metrics *out);
+comp_hub_d3d11_get_segment_metrics(struct comp_hub_d3d11 *split, struct xrt_segment_metrics *out);
 
 /*!
  * #1883: the segment partition the atlas about to be submitted was PAINTED
  * with (the renderer's per-segment mosaic; NULL / count 0 = unrouted). Call
- * right before @ref comp_vk_split_submit_atlas: the submit records it under the
+ * right before @ref comp_hub_d3d11_submit_atlas: the submit records it under the
  * slot's sequence, so the weave crops each segment's views out of the egress
  * slot where THAT frame painted them — the slot lags the committed frame.
  */
 void
-comp_vk_split_stage_segment_content(struct comp_vk_split *split, const struct comp_segments_content *content);
+comp_hub_d3d11_stage_segment_content(struct comp_hub_d3d11 *split, const struct comp_segments_content *content);
 /*! @} */
 
 #ifdef __cplusplus

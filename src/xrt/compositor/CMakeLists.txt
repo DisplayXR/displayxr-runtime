@@ -517,6 +517,17 @@ if(WIN32 AND XRT_HAVE_D3D11)
 endif()
 
 ###
+# The D3D11 hub (#2317): the Vulkan-free D3D11 fill arm that weaves + presents
+# for the Vulkan split, the D3D12 reroute and (behind DXR_HUB=1) the D3D11 tier.
+# Declared before d3d12 and vk_native so their `if(TARGET comp_hub_d3d11)` sees
+# it. Built wherever a consumer exists; off Windows it is the stub TU the Vulkan
+# compositor calls.
+#
+if((WIN32 AND XRT_HAVE_D3D11) OR ((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE_VULKAN))
+	add_subdirectory(hub_d3d11)
+endif()
+
+###
 # Native D3D12 compositor (bypasses Vulkan entirely)
 #
 if(WIN32 AND XRT_HAVE_D3D12)

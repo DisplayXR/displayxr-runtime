@@ -273,7 +273,7 @@ on where the weave runs, which the Vulkan #918 output-device split (#1178) decid
   made on the output device, DPs from `create_dp_d3d11_for_screen`, the egress slot cropped per
   segment, flat 2D through the split's output composite unit, the hand-off swapping the split's
   own DP (`split_seg_swap_primary_cb`, guarded by the split's `dp_mutex`). It runs in
-  `comp_vk_split_weave_and_present` right after the swapchain image is acquired and before any
+  `comp_hub_d3d11_weave_and_present` right after the swapchain image is acquired and before any
   per-frame DP input, so a hand-off's new DP gets them all. One WARN when the manager is made:
   `segments: under the VK #918 output-device split — segment DPs are created on the OUTPUT device …`.
   `comp_vk_native_compositor_set_screens` forwards the list to the split; a split that retires
@@ -293,8 +293,8 @@ on where the weave runs, which the Vulkan #918 output-device split (#1178) decid
   the live seam. Off the split the partition is set with `eff_layout`'s routing
   (`comp_vk_native_compositor::seg_content`, so a repaint replays it with its atlas) and handed to
   `comp_vk_native_segments_frame::content` — which also fixes the Linux M2/M3 path, the same
-  module; under the split the compositor stages it before every `comp_vk_split_submit_atlas`
-  (`comp_vk_split_stage_segment_content`), the split records it under the bridge sequence and the
+  module; under the split the compositor stages it before every `comp_hub_d3d11_submit_atlas`
+  (`comp_hub_d3d11_stage_segment_content`), the split records it under the bridge sequence and the
   weave looks up the woven slot's own partition (`comp_xbridge_slot_seq`), exactly the D3D11
   split's ring.
 
